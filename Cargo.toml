@@ -1,0 +1,13 @@
+# banto-industrial workspace. Members are added milestone by milestone
+# (I1: banto-tags, I2: banto-slmp, I3: banto-collect, I4: banto-tsquery
+# - see docs/plan.md). banto crates are consumed via git-tag references
+# (banto docs/publishing.md).
+[workspace]
+resolver = "2"
+members = []
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "LicenseRef-Proprietary"
+publish = false
