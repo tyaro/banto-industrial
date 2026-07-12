@@ -5,8 +5,8 @@
 ドメイン寄りの共通資産（タグレジストリ・PLC通信・時系列収集/読み出し）と
 それを使う製品アプリ（記録計ほか）を蓄積する。
 
-- 計画: [docs/plan.md](docs/plan.md)（I系 = 資産クレート、R系 = 記録計）
-- 記録計 要件定義: [docs/recorder-requirements.md](docs/recorder-requirements.md)
+- 計画: [docs/plan.md](docs/plan.md)（I系 = 資産クレート、R系 = 記録計 **ChronoGazer**）
+- ChronoGazer（記録計）要件定義: [docs/recorder-requirements.md](docs/recorder-requirements.md)
 - banto 側のスコープ整理: banto リポジトリの docs/template-scope.md
 
 ## 構成（予定）
@@ -18,7 +18,7 @@ crates/
   banto-collect/     I3: 収集エンジン + 時系列ストレージ
   banto-tsquery/     I4: 期間クエリ + サーバ側間引き
 apps/
-  recorder/          R系: デジタル記録計（Tauri + LAN、banto テンプレート由来）
+  chronogazer/       R系: デジタル記録計 ChronoGazer（Tauri + LAN、banto テンプレート由来）
 ```
 
 banto のパッケージ/クレートの消費は **両方とも git タグ参照**
