@@ -14,7 +14,7 @@
 ```
 crates/
   banto-tags/        I1: タグレジストリ（定義・型・スケーリング）
-  banto-slmp/        I2: MELSEC MC/SLMP クライアント（読み取り専用）
+  banto-plc/         I2: PLC通信（読み取り専用。trait + Modbus TCP 先行、MC/SLMP 続行）
   banto-collect/     I3: 収集エンジン + 時系列ストレージ
   banto-tsquery/     I4: 期間クエリ + サーバ側間引き
 apps/
