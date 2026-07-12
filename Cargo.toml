@@ -4,7 +4,7 @@
 # (banto docs/publishing.md).
 [workspace]
 resolver = "2"
-members = ["crates/banto-tags"]
+members = ["crates/banto-tags", "crates/banto-plc"]
 
 [workspace.package]
 version = "0.1.0"

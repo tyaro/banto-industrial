@@ -34,6 +34,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "banto-plc"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "banto-storage"
 version = "0.1.0"
 source = "git+https://github.com/tyaro/banto.git?tag=v0.1.0#da46cee3fb223340e9d58f815f9ed154099867f2"
