@@ -16,7 +16,7 @@ crates/
   banto-tags/        I1: タグレジストリ（PLC接続/収集グループ/タグの定義・型・スケーリング）実装済み
   banto-plc/         I2: PLC通信（読み取り専用。trait + Modbus TCP 実装済み、MC/SLMP 続行）実装済み
   banto-tstore/      I3a: 時系列ストレージ（日次ファイル+スキーマ凍結の自己記述的SQLite）実装済み
-  banto-collect/     I3b: 収集エンジン（PLC定期読み出し→banto-tstore書き込み）予定
+  banto-collect/     I3b: 収集エンジン（PLC定期読み出し→banto-tstore書き込み、現在値・イベント供給）実装済み
   banto-tsquery/     I4: 期間クエリ + サーバ側間引き 予定
 apps/
   chronogazer/       R系: デジタル記録計 ChronoGazer（Tauri + LAN、banto テンプレート由来）予定
@@ -86,6 +86,35 @@ CRUD/一覧サービス + スケーリング純関数（`scale_raw`/`unscale`）
   参照）
 
 詳細は [crates/banto-tstore/src/lib.rs](crates/banto-tstore/src/lib.rs) の
+モジュールドキュメントを参照。
+
+### `banto-collect`（I3b）
+
+収集エンジン。I1/I2/I3a を束ねる初のクレート: タグレジストリから
+**有効な構成のスナップショット**（[`build_config`](crates/banto-collect/src/config.rs)
+→ `CollectorConfig`）を組み立て、PLC 接続毎に1タスクを起動して
+グループ周期で一括読み出し → スケーリング適用 → `banto-tstore` へ追記する。
+UI と独立に 24/365 自走し（recorder-requirements.md §4）、停止指示
+（`Collector::stop`、writer flush 保証付き）まで回り続ける。
+
+- **並行構造**: 接続毎に1タスクがソケットを専有（`Box<dyn PlcClient>`、
+  プロトコル分岐は factory 関数に隔離）。グループ周期の多重化はタスク内の
+  最小デッドライン方式で、発火後の次回は常に「今 + 周期」— 追い付き連射を
+  しない（取りこぼしは gap として記録されるのが記録計として正しい）
+- **断絶時挙動**: PLC 断でも周期ティックは止めず**全NULL行を記録し続け**、
+  接続は別サブタスクで指数バックオフ（1s→2s→…上限30s、成功でリセット）
+  再接続。`plc_disconnected`/`plc_reconnected` イベント発行
+- **現在値キャッシュ**（[`CurrentValuesHandle`](crates/banto-collect/src/current.rs)）:
+  タグ毎の最新値 + 品質。Good/Bad は格納、**Stale は読み出し時判定**
+  （最終更新から周期×2.5超）— R1 のデジタル/バー/計器・ヘルス表示が消費
+- **イベント2系統**（[`EventSink`](crates/banto-collect/src/event.rs)）:
+  `tokio::broadcast` によるライブ配信 + `collect_events` テーブルへの永続化
+  （収集開始/停止・PLC断/復旧・しきい値 entered/cleared。しきい値は
+  スケーリング後の値の状態変化エッジのみ — ACK等のアラーム管理は非スコープ §7）
+- テストは `banto-plc` の `simulator` feature を再利用（結合11件 +
+  100ms×3グループのミニソーク + `#[ignore]` の60秒版 = 将来の72hソークの雛形）
+
+詳細は [crates/banto-collect/src/lib.rs](crates/banto-collect/src/lib.rs) の
 モジュールドキュメントを参照。
 
 banto のパッケージ/クレートの消費は **両方とも git タグ参照**

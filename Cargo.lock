@@ -24,6 +24,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "banto-collect"
+version = "0.1.0"
+dependencies = [
+ "banto-core",
+ "banto-plc",
+ "banto-storage",
+ "banto-tags",
+ "banto-tstore",
+ "serde",
+ "sqlx",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "banto-core"
 version = "0.1.0"
 source = "git+https://github.com/tyaro/banto.git?tag=v0.1.0#da46cee3fb223340e9d58f815f9ed154099867f2"
