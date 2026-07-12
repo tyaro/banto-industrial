@@ -17,7 +17,7 @@ crates/
   banto-plc/         I2: PLC通信（読み取り専用。trait + Modbus TCP 実装済み、MC/SLMP 続行）実装済み
   banto-tstore/      I3a: 時系列ストレージ（日次ファイル+スキーマ凍結の自己記述的SQLite）実装済み
   banto-collect/     I3b: 収集エンジン（PLC定期読み出し→banto-tstore書き込み、現在値・イベント供給）実装済み
-  banto-tsquery/     I4: 期間クエリ + サーバ側間引き 予定
+  banto-tsquery/     I4: 期間クエリ + サーバ側 min/max 間引き（read_range/read_decimated/aggregate/catalog）実装済み
 apps/
   chronogazer/       R系: デジタル記録計 ChronoGazer（Tauri + LAN、banto テンプレート由来）予定
 ```
@@ -115,6 +115,41 @@ UI と独立に 24/365 自走し（recorder-requirements.md §4）、停止指�
   100ms×3グループのミニソーク + `#[ignore]` の60秒版 = 将来の72hソークの雛形）
 
 詳細は [crates/banto-collect/src/lib.rs](crates/banto-collect/src/lib.rs) の
+モジュールドキュメントを参照。
+
+### `banto-tsquery`（I4）
+
+時系列クエリ層。`banto-tstore`（I3a）のデータディレクトリを、タグレジストリ
+（I1）に接続せず自己記述的メタデータだけで読む点は banto-tstore と同じ設計。
+4つのクエリを提供する `TsQuery`:
+
+- `read_range`: 生データ範囲取得（CSV出力向け）。行数上限（既定10万行）を
+  超えるとエラーで `read_decimated` の利用を促す
+- `read_decimated`: サーバ側 **min/maxエンベロープ間引き**（トレンド用）。
+  各ビンは平均ではなく実際の min/max を返す — 瞬間スパイクを潰さない設計
+  （記録計の存在意義）。間引きはファイル毎に SQLite の `GROUP BY` で実行し、
+  Rust側は複数ファイルの結果を時刻順マージするのみ（大範囲でも生データ行を
+  Rust側に吸い上げない）。ビン幅はグループの `period_ms`（ファイル間で
+  異なる場合は最大値）未満に細かくならないようクランプし、クランプが効いて
+  なお実データ点数が少ない場合はビン境界に丸めず実サンプル時刻をそのまま
+  返す最適化（ズームイン時の階段状表示を回避）付き
+- `aggregate`: 期間集計（日報用）。タグ毎 min/max/avg/count（NULL除外）
+- `catalog`: 利用可能なグループ/タグ/データ期間の一覧（UIの期間選択初期化用）
+
+**欠測（gap）は隠さない**: ビン内の有効サンプル数が0のタグ、またはビンに
+行が1つも無い区間（収集停止等）は `BinValue::Gap` として明示的に返す
+（フロントが線を切れるように）。ファイルを跨ぐ範囲（日次ローテーション、
+タグ構成変更による強制ローテーション）では `tag_key` でマッチし、
+あるファイルに存在しないタグは gap になる。
+
+`TsReader`（I3a）の `SqlitePool` は非公開のため、`read_decimated`/
+`aggregate`/`catalog` はカスタム集計SQLを実行できない - この crate は
+対象ファイルを自前で読み取り専用オープンし、`tstore_groups`/
+`tstore_columns` を直接読む（`read_range` のみ `TsReader::read_range` に
+委譲 - カスタムSQL不要なため）。テーブル名/列名はメタテーブルから読み戻した
+値を SQL識別子として使う前に形式検証する防御的実装（`plan.rs`）。
+
+詳細は [crates/banto-tsquery/src/lib.rs](crates/banto-tsquery/src/lib.rs) の
 モジュールドキュメントを参照。
 
 banto のパッケージ/クレートの消費は **両方とも git タグ参照**

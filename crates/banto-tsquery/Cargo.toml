@@ -1,0 +1,31 @@
+[package]
+name = "banto-tsquery"
+description = "I4: 時系列クエリ層 - 期間クエリ + サーバ側 min/max 間引き (docs/plan.md I4, docs/recorder-requirements.md §3.3/§3.5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# I3a: file enumeration (`list_data_files`/`DataFileInfo`/`LocalDate`) and the
+# single-file raw reader (`TsReader`) - reused as-is for `read_range` (small
+# ranges, CSV export: no reason to duplicate its already-correct per-file
+# range query). `read_decimated`/`aggregate`/`catalog` cannot go through
+# `TsReader` (its `SqlitePool` is private and it only ever returns fully
+# materialized rows, never a `GROUP BY` aggregate) - those open their own
+# read-only connections instead (see `plan.rs`'s module doc for why that is
+# a deliberate, documented duplication rather than a change to
+# `banto-tstore` itself, which is out of this crate's scope).
+banto-tstore = { path = "../banto-tstore" }
+thiserror = { workspace = true }
+# Only "sqlite" (this crate never touches Postgres/MySQL) + "runtime-tokio"
+# (async pool, matching banto-tstore's own choice) - no `macros`/`migrate`:
+# every query here is a runtime-built string (bin width, column list vary
+# per file/group), never a fixed compile-time-checkable one.
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
+
+[dev-dependencies]
+# Test data is generated through banto-tstore's own `TsWriter`/`ManualClock`
+# (not hand-written SQL) so fixtures stay faithful to what a real collector
+# (I3b) produces - see `tests/` module docs.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

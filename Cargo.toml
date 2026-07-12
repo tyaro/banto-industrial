@@ -1,10 +1,16 @@
 # banto-industrial workspace. Members are added milestone by milestone
-# (I1: banto-tags, I2: banto-plc, I3a: banto-tstore, I3b: banto-collect
-# (pending), I4: banto-tsquery - see docs/plan.md). banto crates are
+# (I1: banto-tags, I2: banto-plc, I3a: banto-tstore, I3b: banto-collect,
+# I4: banto-tsquery - see docs/plan.md). banto crates are
 # consumed via git-tag references (banto docs/publishing.md).
 [workspace]
 resolver = "2"
-members = ["crates/banto-tags", "crates/banto-plc", "crates/banto-tstore", "crates/banto-collect"]
+members = [
+    "crates/banto-tags",
+    "crates/banto-plc",
+    "crates/banto-tstore",
+    "crates/banto-collect",
+    "crates/banto-tsquery",
+]
 
 [workspace.package]
 version = "0.1.0"
