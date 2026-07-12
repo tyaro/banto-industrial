@@ -9,17 +9,27 @@
 - ChronoGazer（記録計）要件定義: [docs/recorder-requirements.md](docs/recorder-requirements.md)
 - banto 側のスコープ整理: banto リポジトリの docs/template-scope.md
 
-## 構成（予定）
+## 構成
 
 ```
 crates/
-  banto-tags/        I1: タグレジストリ（定義・型・スケーリング）
-  banto-plc/         I2: PLC通信（読み取り専用。trait + Modbus TCP 先行、MC/SLMP 続行）
-  banto-collect/     I3: 収集エンジン + 時系列ストレージ
-  banto-tsquery/     I4: 期間クエリ + サーバ側間引き
+  banto-tags/        I1: タグレジストリ（PLC接続/収集グループ/タグの定義・型・スケーリング）実装済み
+  banto-plc/         I2: PLC通信（読み取り専用。trait + Modbus TCP 先行、MC/SLMP 続行）予定
+  banto-collect/     I3: 収集エンジン + 時系列ストレージ 予定
+  banto-tsquery/     I4: 期間クエリ + サーバ側間引き 予定
 apps/
-  chronogazer/       R系: デジタル記録計 ChronoGazer（Tauri + LAN、banto テンプレート由来）
+  chronogazer/       R系: デジタル記録計 ChronoGazer（Tauri + LAN、banto テンプレート由来）予定
 ```
+
+### `banto-tags`（I1）
+
+3層のエンティティモデル（`PlcConnection` → `CollectionGroup` → `Tag`）+
+CRUD/一覧サービス + スケーリング純関数（`scale_raw`/`unscale`）。
+マイグレーションはクレート内 `migrations/` に同梱し、消費側が
+`banto_tags::migrate(&pool)` を起動時に呼んで適用する
+（`apps/admin-template/core/src/db.rs` の方式を踏襲）。
+詳細は [crates/banto-tags/src/lib.rs](crates/banto-tags/src/lib.rs) の
+モジュールドキュメントを参照。
 
 banto のパッケージ/クレートの消費は **両方とも git タグ参照**
 （2026-07-12 決定。GitHub 組織名 banto が取得不能だったため
