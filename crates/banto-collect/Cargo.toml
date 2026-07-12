@@ -1,0 +1,49 @@
+[package]
+name = "banto-collect"
+description = "I3b: 収集エンジン - タグレジストリのスナップショットから PLC 群を周期収集し banto-tstore へ書き込み、現在値とイベントを供給 (docs/plan.md I3b, docs/recorder-requirements.md §3.1/§3.5/§4)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# I1: build_config reads the tag registry (services + scale_raw/Scaling) to
+# assemble a CollectorConfig snapshot. This is the one crate that bridges
+# I1/I2/I3a (see plan.md's dependency graph: I3b depends on I1, I2, I3a).
+banto-tags = { path = "../banto-tags" }
+# I2: PlcClient trait + Modbus TCP client + address/type parsing. The
+# `simulator` feature is a *dev*-dependency only (see below) - production
+# collection just uses ModbusTcpClient against a real device.
+banto-plc = { path = "../banto-plc" }
+# I3a: the time-series sink (TsWriter) + its Clock seam + StoreConfig shapes.
+banto-tstore = { path = "../banto-tstore" }
+# build_config surfaces registry read failures as BantoError (the type
+# banto-tags services already return), folded into CollectError via `From`.
+banto-core = { workspace = true }
+serde = { workspace = true }
+# collect_events persistence. No `macros`/`migrate`: this crate creates its
+# one table with an idempotent `CREATE TABLE IF NOT EXISTS` rather than
+# sqlx::migrate! - the consuming app shares ONE SQLite database across I1's
+# migrator and this crate, and two independent `sqlx::migrate!` sets would
+# collide on the shared `_sqlx_migrations` bookkeeping table (see lib.rs's
+# `migrate` doc comment for the full reasoning - this is the one deliberate
+# deviation from "banto-tags の migrate 方式に倣う").
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
+thiserror = { workspace = true }
+# The concurrent collection engine itself: one spawned task per connection
+# (`rt`), per-group interval scheduling + reconnect backoff timers (`time`),
+# the live-event broadcast channel + stop signal + current-value cache locks
+# (`sync`), and `tokio::select!` in the per-connection loop (`macros`).
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+
+[dev-dependencies]
+# Pull banto-plc's in-process Modbus TCP simulator into this crate's tests
+# (the I3 reuse the simulator was made public for - see
+# banto-plc/src/modbus/simulator.rs's module doc). Enabling it here also
+# means `cargo clippy --workspace --all-targets` and `cargo test --workspace`
+# both compile the simulator-feature code path.
+banto-plc = { path = "../banto-plc", features = ["simulator"] }
+# `test-util` enables tokio::time::pause for the virtual-time backoff tests;
+# `rt-multi-thread`/`macros` for #[tokio::test].
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
+banto-storage = { workspace = true, features = ["sqlite"] }

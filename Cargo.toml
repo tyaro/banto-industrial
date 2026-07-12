@@ -4,7 +4,7 @@
 # consumed via git-tag references (banto docs/publishing.md).
 [workspace]
 resolver = "2"
-members = ["crates/banto-tags", "crates/banto-plc", "crates/banto-tstore"]
+members = ["crates/banto-tags", "crates/banto-plc", "crates/banto-tstore", "crates/banto-collect"]
 
 [workspace.package]
 version = "0.1.0"
