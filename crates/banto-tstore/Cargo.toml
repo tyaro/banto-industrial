@@ -1,0 +1,36 @@
+[package]
+name = "banto-tstore"
+description = "I3a: 時系列ストレージ - 日次ファイル+スキーマ凍結の自己記述的SQLite (docs/plan.md I3, docs/recorder-requirements.md §3.4)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+# runtime-only (no `macros`/`migrate` - this crate builds its own DDL/DML at
+# runtime per data file rather than using sqlx's compile-time macros or a
+# migrator, since each file's schema is generated from a `StoreConfig`
+# snapshot rather than a fixed set of `.sql` files - see `schema.rs`).
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
+# Only `sync` (the writer's internal `tokio::sync::Mutex` serializing
+# append/flush/rotation) - no `rt`/`macros`: like banto-plc, this crate never
+# spawns tasks or defines its own runtime: buffering thresholds are checked
+# inline on `append`/`flush` rather than via a background timer task (see
+# `writer.rs`'s module doc), so no `time` (tokio) feature is needed either.
+tokio = { workspace = true, features = ["sync"] }
+# Local-midnight rotation boundary (recorder-requirements.md §3.4) needs the
+# OS's current UTC offset, which plain `std` cannot provide (no timezone
+# database access). `time`'s `local-offset` feature is unsound to call after
+# other threads have started *on Unix* (reads `TZ`/libc state that is not
+# thread-safe there) - but this product targets Windows only
+# (recorder-requirements.md §1 "OS Windows 10/11"), where that restriction
+# does not apply, so `SystemClock` (clock.rs) calls it directly. Chose `time`
+# over `chrono` because it is the smaller/more focused dependency and this
+# crate only needs the current offset, not general calendar arithmetic (the
+# UTC-epoch-ms <-> proleptic-Gregorian-date conversion itself is done with
+# plain integer math in `date.rs`, no crate needed for that part).
+time = { version = "0.3", default-features = false, features = ["local-offset"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
