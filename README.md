@@ -14,7 +14,7 @@
 ```
 crates/
   banto-tags/        I1: タグレジストリ（PLC接続/収集グループ/タグの定義・型・スケーリング）実装済み
-  banto-plc/         I2: PLC通信（読み取り専用。trait + Modbus TCP 先行、MC/SLMP 続行）予定
+  banto-plc/         I2: PLC通信（読み取り専用。trait + Modbus TCP 実装済み、MC/SLMP 続行）実装済み
   banto-collect/     I3: 収集エンジン + 時系列ストレージ 予定
   banto-tsquery/     I4: 期間クエリ + サーバ側間引き 予定
 apps/
@@ -29,6 +29,31 @@ CRUD/一覧サービス + スケーリング純関数（`scale_raw`/`unscale`）
 `banto_tags::migrate(&pool)` を起動時に呼んで適用する
 （`apps/admin-template/core/src/db.rs` の方式を踏襲）。
 詳細は [crates/banto-tags/src/lib.rs](crates/banto-tags/src/lib.rs) の
+モジュールドキュメントを参照。
+
+### `banto-plc`（I2）
+
+読み取り専用・一括読み出しの PLC 通信クライアント。プロトコル差し替えの
+境界は [`PlcClient`](crates/banto-plc/src/client.rs) trait（`dyn` 互換に
+手書き - I3 が `Box<dyn PlcClient>` で複数 PLC を並行保持する前提）。
+先行実装は Modbus TCP（[`ModbusTcpClient`](crates/banto-plc/src/modbus/mod.rs)、
+外部 `modbus` クレート不使用の自前実装、FC1-4 のみ）。MELSEC MC/SLMP は
+同 trait の実装として後続追加予定（docs/plan.md I2）。
+
+- アドレス表記（`crates/banto-plc/src/address.rs`）: 計装の参照番号方式
+  （`0/1/3/4` + 4or5桁、`40001` → 保持レジスタ offset 0）を純関数でパース
+- 要求プランニング（`crates/banto-plc/src/planning.rs`）: 近接タグを1回の
+  FC 要求へ結合（間隙許容・Modbus上限で分割）、応答→各タグへの逆写像まで
+  純関数で設計。256タグ/100ms 収集の実現可否はここが握る
+- デコード（`crates/banto-plc/src/decode.rs`）: i16/u16/i32/u32/f32 +
+  32bit ワード順（HighLow既定/LowHigh）
+- シミュレータ（`simulator` feature、`crates/banto-plc/src/modbus/simulator.rs`）:
+  in-process Modbus TCP テストダブル。I3 の結合テストや R4 の72hソークでも
+  再利用予定
+- 性能スモーク実測（ループバック、256タグ×3往復/回・1000回平均）:
+  約0.4ms/回 - 100ms/周期目標に対し十分な余裕（実PLC相手の実測はI3で再検証）
+
+詳細は [crates/banto-plc/src/lib.rs](crates/banto-plc/src/lib.rs) の
 モジュールドキュメントを参照。
 
 banto のパッケージ/クレートの消費は **両方とも git タグ参照**
