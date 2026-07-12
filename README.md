@@ -21,8 +21,17 @@ apps/
   recorder/          R系: デジタル記録計（Tauri + LAN、banto テンプレート由来）
 ```
 
-banto のパッケージ/クレートを消費する側: `@banto/*` は GitHub Packages、
-クレートは git タグ参照（banto の docs/publishing.md 参照）。
+banto のパッケージ/クレートの消費は **両方とも git タグ参照**
+（2026-07-12 決定。GitHub 組織名 banto が取得不能だったため
+レジストリ発行は棚上げ。banto の docs/publishing.md 参照）:
+
+```sh
+pnpm add "github:tyaro/banto#v0.1.0&path:packages/admin-core"
+```
+
+```toml
+banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v0.1.0" }
+```
 
 ## 権利
 
