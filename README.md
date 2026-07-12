@@ -15,7 +15,8 @@
 crates/
   banto-tags/        I1: タグレジストリ（PLC接続/収集グループ/タグの定義・型・スケーリング）実装済み
   banto-plc/         I2: PLC通信（読み取り専用。trait + Modbus TCP 実装済み、MC/SLMP 続行）実装済み
-  banto-collect/     I3: 収集エンジン + 時系列ストレージ 予定
+  banto-tstore/      I3a: 時系列ストレージ（日次ファイル+スキーマ凍結の自己記述的SQLite）実装済み
+  banto-collect/     I3b: 収集エンジン（PLC定期読み出し→banto-tstore書き込み）予定
   banto-tsquery/     I4: 期間クエリ + サーバ側間引き 予定
 apps/
   chronogazer/       R系: デジタル記録計 ChronoGazer（Tauri + LAN、banto テンプレート由来）予定
@@ -54,6 +55,37 @@ CRUD/一覧サービス + スケーリング純関数（`scale_raw`/`unscale`）
   約0.4ms/回 - 100ms/周期目標に対し十分な余裕（実PLC相手の実測はI3で再検証）
 
 詳細は [crates/banto-plc/src/lib.rs](crates/banto-plc/src/lib.rs) の
+モジュールドキュメントを参照。
+
+### `banto-tstore`（I3a）
+
+時系列データの保存層。**日次ファイル + スキーマ凍結**方式
+（2026-07-12 決定、docs/recorder-requirements.md §8）:
+データファイル（SQLite、`YYYYMMDD-NNN.sqlite3`）は作成時にスキーマが
+確定し以後変更しない。収集グループ/タグの構成が変わっても既存ファイルは
+`ALTER` せず、新しい連番ファイルへローテーションする。`banto-tags`/
+`banto-plc` と異なり **タグレジストリ（I1）に一切依存しない** - 各
+ファイルは `tstore_meta`/`tstore_groups`/`tstore_columns` テーブルを
+同梱する自己記述的な構造で、後続の I4（クエリ層）はレジストリ DB へ
+接続しなくてもファイル単体を解釈できる。
+
+- [`config::StoreConfig`](crates/banto-tstore/src/config.rs): ファイル
+  生成に使う構成スナップショット（I3b がタグレジストリの行から組み立てる）
+- [`writer::TsWriter`](crates/banto-tstore/src/writer.rs): 追記 +
+  バッファリング（既定 1秒/500行、`WriterOptions` で調整可）+
+  ローカル深夜0時での自動ローテーション（[`clock::Clock`](crates/banto-tstore/src/clock.rs)
+  trait 経由でテスト注入可能）
+- [`reader::TsReader`](crates/banto-tstore/src/reader.rs): 1ファイル
+  単位の最小限の読み出し（範囲クエリ・間引きは I4 の仕事）
+- [`files`](crates/banto-tstore/src/files.rs): `list_data_files`/
+  `prune_files`（保持期限超過ファイルの自動削除、当日は対象外）
+- ローカル暦日変換（[`date::LocalDate`](crates/banto-tstore/src/date.rs)）は
+  Howard Hinnant の暦日アルゴリズムを純整数演算で実装し、追加の日付
+  クレートに依存しない。OS のローカル UTC オフセット取得のみ `time`
+  クレートを使用（Windows 専用製品という前提での判断 - `Cargo.toml`
+  参照）
+
+詳細は [crates/banto-tstore/src/lib.rs](crates/banto-tstore/src/lib.rs) の
 モジュールドキュメントを参照。
 
 banto のパッケージ/クレートの消費は **両方とも git タグ参照**
