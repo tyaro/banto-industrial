@@ -10,24 +10,12 @@ jobs:
     name: Rust (fmt / clippy / check / test)
     runs-on: windows-latest
     # banto-tags (and every later I-series crate) depends on banto-core /
-    # banto-storage via a git tag reference into the private tyaro/banto
-    # repository (see crates/banto-tags/Cargo.toml, banto's
-    # docs/publishing.md). Cargo's default git fetcher has no credentials
-    # for that repo, so this job needs:
-    #   1. a repository secret BANTO_READ_TOKEN - a GitHub PAT with `read`
-    #      access to tyaro/banto (classic PAT with `repo` scope, or a fine-
-    #      grained PAT scoped to that repo) - set it under this repository's
-    #      Settings > Secrets and variables > Actions
-    #   2. the git-credential rewrite + CARGO_NET_GIT_FETCH_WITH_CLI below,
-    #      so `cargo build`/`test`/`clippy` shell out to the `git` CLI
-    #      (which honors the rewritten URL) instead of Cargo's built-in
-    #      (unauthenticated) git fetcher
-    env:
-      CARGO_NET_GIT_FETCH_WITH_CLI: true
+    # banto-storage via a git tag reference into tyaro/banto (see
+    # crates/banto-tags/Cargo.toml, banto's docs/publishing.md). banto went
+    # PUBLIC on 2026-07-12, so Cargo's default git fetcher resolves it with
+    # no credentials - no token or insteadOf rewrite is needed here.
     steps:
       - uses: actions/checkout@v4
-      - name: configure git credentials for private banto dependency
-        run: git config --global url."https://x-access-token:${{ secrets.BANTO_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
