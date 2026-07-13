@@ -27,4 +27,14 @@ gen/
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 
+# Playwright (R1-A e2e/). `outputDir`/the HTML reporter's `outputFolder` are
+# pinned under e2e/ in playwright.config.ts, but Playwright always writes its
+# own `.last-run.json` relative to the process cwd regardless - `pnpm e2e`
+# runs from the repo root, so a root-level `/test-results/` also needs
+# ignoring.
+e2e/test-results/
+e2e/playwright-report/
+e2e/.cache/
+/test-results/
+
 # pnpm-lock.yaml is intentionally NOT ignored - the lockfile is committed
