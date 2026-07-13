@@ -1,0 +1,7 @@
+CREATE TABLE items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    price INTEGER NOT NULL,
+    stock INTEGER NOT NULL,
+    updated_at TEXT NOT NULL
+);
