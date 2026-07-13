@@ -186,7 +186,7 @@
     `tauri dev` / `vite dev` だけが失敗する、という分かりにくい形で発症。
   - 対応: `apps/chronogazer/vite.config.ts` に
     `optimizeDeps.exclude: ['@banto/admin-core', '@banto/charts',
-    '@banto/forms', '@banto/grid-svelte', '@banto/theme']` を追加して解消。
+'@banto/forms', '@banto/grid-svelte', '@banto/theme']` を追加して解消。
   - banto へのフィードバック案: 各 `packages/*/package.json` に
     `"svelte"` フィールド（例: `"svelte": "./src/index.ts"`）を追加すれば
     vite-plugin-svelte が Svelte ライブラリとして認識し消費側の設定不要で

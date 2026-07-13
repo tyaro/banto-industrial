@@ -9,7 +9,13 @@ export default defineConfig({
 	// their uncompiled .svelte/.svelte.ts sources and fails. Exclude them so
 	// the Svelte plugin compiles them, same as workspace links in banto itself.
 	optimizeDeps: {
-		exclude: ['@banto/admin-core', '@banto/charts', '@banto/forms', '@banto/grid-svelte', '@banto/theme']
+		exclude: [
+			'@banto/admin-core',
+			'@banto/charts',
+			'@banto/forms',
+			'@banto/grid-svelte',
+			'@banto/theme'
+		]
 	},
 	// Fixed port so tauri.conf.json's devUrl always matches.
 	server: {
