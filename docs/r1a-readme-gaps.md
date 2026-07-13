@@ -199,6 +199,44 @@
     今回は変更しなかった（動作に支障は無いが、ブランディングとしては
     `chronogazer-serve` 等への改名が自然かもしれない）。
 
+- [ ] **クレートのリネームで rustfmt の import 並び順が変わり、
+      `cargo fmt --check` が事後に落ちる**
+  - `admin_template_core` → `chronogazer_core` のリネームで、
+    `use` 群のアルファベット順の位置が `banto_*` クレートと入れ替わる
+    （`a...` は `banto_*` より前、`c...` は後）。コピー直後のソースは
+    旧名基準の並びのままなので、`cargo fmt --all --check` が
+    `banto-serve.rs`・`src-tauri/src/lib.rs` で失敗する。
+    README §1 のリネーム手順には「リネーム後に `cargo fmt --all` を
+    掛け直す」旨の記載が無い。
+  - 同様に、items デモ削除（§3相当）で `rest.rs` のテストモジュールの
+    import（`FilterOp`/`FilterState`/`Pagination`/`SortDirection`/
+    `SortState`）が未使用のまま残り、`cargo clippy -D warnings` で落ちる
+    （`cargo test` だけでは unused-imports は warning 止まりなので、
+    CI に clippy を足すまで顕在化しない）。
+  - 対応: R1-A の CI ジョブ追加時に `cargo fmt --all` を適用し、
+    未使用 import を削除した（コミット「R1-A: add frontend and E2E jobs
+    to CI」）。
+  - banto へのフィードバック案: README のコピー/デモ削除手順の最後に
+    「`cargo fmt --all` と `cargo clippy --all-targets -- -D warnings` を
+    一度通す」チェック項目を足すと、この種の残骸を機械的に拾える。
+
+- [ ] **banto の e2e スイートは README のコピー手順の対象に含まれないが、
+      config はほぼそのまま流用できる（spec 側に1つ落とし穴）**
+  - `e2e/playwright.config.ts`・`global-teardown.ts`・`tsconfig.json` は
+    ポート番号・クレート名（`-p chronogazer-core`）・temp DB の
+    プレフィックスの差し替えだけで cross-repo コピーがそのまま動いた
+    （`PORT`/`BANTO_DB`/`BANTO_ALLOW_SETUP` の env 契約は
+    `banto-serve.rs` 側がテンプレート由来で同一のため）。
+  - 落とし穴は spec 側: banto の `smoke.spec.ts` の
+    `getByRole('heading', { name: 'ダッシュボード' })` パターンは、実は
+    Header.svelte が描画するページタイトルの `<h1>` にマッチしている
+    （banto のダッシュボードページ自体は同名の `<h2>` を持たない）。
+    ページ本体が Header と同じテキストの `<h2>` を持つ画面
+    （chronogazer の 監視/ヒストリカル/イベント プレースホルダ）では
+    `<h1>`/`<h2>` の2要素にマッチして strict mode violation になる。
+    `{ level: 2, name: ... }` で本体側見出しに限定して解消した
+    （`e2e/tests/smoke.spec.ts`）。
+
 ## 実施箇所への参照（本リポジトリ側）
 
 - `apps/chronogazer/core/src/db.rs`: migrate!衝突の回避（冪等DDL化）
@@ -220,11 +258,14 @@
 
 - アイコン（`src-tauri/icons/icon.ico`/`icon.png`）は banto テンプレートの
   ままで未再生成（`pnpm --filter chronogazer tauri icon <画像>` は未実施）。
-- `docs/plan.md`・`docs/recorder-requirements.md`・`README.md`・
-  `.github/workflows/ci.yml` は prettier 未整形のまま（R1-A の範囲外。
-  別コミットで `pnpm format` を適用すべき）。
-- `cargo check`/`cargo test --workspace`/`pnpm check`/`pnpm lint`/
-  `pnpm format:check`（chronogazer関連ファイルに限定）はすべて green。
+- ~~`docs/plan.md`・`docs/recorder-requirements.md`・`README.md`・
+  `.github/workflows/ci.yml` は prettier 未整形のまま~~ → 対応済み
+  （2026-07-13、コミット「R1-A: format pre-existing docs and CI config
+  with prettier」。差分は markdown テーブルの列幅揃えのみで意味変更なし。
+  以後 `pnpm format:check` はリポジトリ全体で green）。
+- `cargo test --workspace`/`pnpm check`/`pnpm lint`/`pnpm format:check`/
+  `pnpm e2e`（Playwright smoke 4本、Windows ローカル）はすべて green
+  （2026-07-13）。
 - LAN モード検証済み（2026-07-13）: `pnpm build` →
   `cargo run -p chronogazer-core --bin banto-serve --features embed-ui` で
   初回セットアップ → ログイン → `/monitor` の空状態表示・
