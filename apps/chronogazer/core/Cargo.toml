@@ -1,0 +1,53 @@
+[package]
+name = "chronogazer-core"
+description = "ChronoGazer domain/service layer: shared by Tauri commands now, REST in M6"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# Embeds the SvelteKit static build (`apps/chronogazer/build`, gitignored)
+# into the binary via rust-embed. Off by default so the workspace builds on
+# a fresh clone without requiring `pnpm --filter chronogazer build` to
+# have been run first (spec §11.1).
+embed-ui = ["dep:rust-embed"]
+
+[dependencies]
+banto-core = { workspace = true }
+banto-storage = { workspace = true, features = ["sqlite"] }
+banto-server = { workspace = true }
+# I-series crates (docs/r1-plan.md R1-A): not wired into any Tauri command or
+# REST route yet - that lands in R1-B (registry CRUD)/R1-C (collector
+# runtime)/R1-D (monitor screens). Added now as path deps so the workspace
+# member graph and Cargo.lock settle in R1-A rather than shifting again on
+# every later phase.
+banto-tags = { path = "../../../crates/banto-tags" }
+banto-plc = { path = "../../../crates/banto-plc" }
+banto-tstore = { path = "../../../crates/banto-tstore" }
+banto-collect = { path = "../../../crates/banto-collect" }
+banto-tsquery = { path = "../../../crates/banto-tsquery" }
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+axum = { workspace = true }
+# `fs` (spec M17): `crate::backup::BackupService` reads/writes `backups/`
+# and the pending-restore file directly via `tokio::fs`. Cargo's feature
+# unification already pulls this in transitively via `sqlx`'s
+# `runtime-tokio` feature, but naming it explicitly here means this crate
+# does not silently depend on another dependency's feature choices.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal", "fs"] }
+rust-embed = { workspace = true, optional = true }
+argon2 = { workspace = true }
+password-hash = { workspace = true }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+tower = { workspace = true, features = ["util"] }
+tempfile = { workspace = true }
+
+[[bin]]
+name = "banto-serve"
+path = "src/bin/banto-serve.rs"

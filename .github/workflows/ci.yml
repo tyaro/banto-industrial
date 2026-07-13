@@ -5,10 +5,57 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  frontend:
+    name: Frontend (check / test / build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # apps/chronogazer's @banto/* dependencies are git subdirectory refs
+    # into tyaro/banto (github:tyaro/banto#v0.1.1&path:packages/...). banto
+    # went PUBLIC on 2026-07-12, so pnpm's default git fetcher resolves them
+    # with no credentials - no token setup is needed here (same reasoning as
+    # the rust job's banto-core/-storage/-server git-tag deps).
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Version is intentionally omitted: pnpm/action-setup resolves it from
+      # the "packageManager" field in the root package.json (pnpm@10.33.0).
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint (ESLint)
+        run: pnpm lint
+
+      - name: Format check (Prettier)
+        run: pnpm format:check
+
+      - name: Type check (svelte-check + tsc)
+        run: pnpm check
+
+      - name: Test
+        run: pnpm --recursive --if-present test
+
+      - name: Build
+        run: pnpm build
+
   rust:
-    name: Rust (fmt / clippy / check / test)
+    name: Rust (fmt / clippy / test)
     runs-on: windows-latest
+    timeout-minutes: 30
     # banto-tags (and every later I-series crate) depends on banto-core /
     # banto-storage via a git tag reference into tyaro/banto (see
     # crates/banto-tags/Cargo.toml, banto's docs/publishing.md). banto went
@@ -20,9 +67,70 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # rustfmt only parses/reformats - no compilation, so unlike the steps
+      # below it can safely cover every workspace member (including the
+      # `chronogazer` src-tauri crate) without needing its native deps built.
       - name: fmt
         run: cargo fmt --all --check
+      # Scope: every crate EXCEPT `chronogazer` (apps/chronogazer/src-tauri).
+      # Same reasoning as banto's own CI: the Tauri crate pulls in heavy
+      # native/webview dependencies, so it is intentionally excluded from
+      # this pipeline to keep it fast; add it back with the appropriate
+      # tauri-action setup once native builds are needed in CI. R1-A adds
+      # `chronogazer-core` here (the headless service layer + banto-serve
+      # binary), which has no such native deps.
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy -p banto-tags -p banto-plc -p banto-tstore -p banto-collect -p banto-tsquery -p chronogazer-core --all-targets -- -D warnings
       - name: test
-        run: cargo test --workspace
+        run: cargo test -p banto-tags -p banto-plc -p banto-tstore -p banto-collect -p banto-tsquery -p chronogazer-core
+
+  e2e:
+    name: E2E (Playwright smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Produces apps/chronogazer/build - the static SvelteKit output
+      # `--features embed-ui` (below) embeds into the server binary
+      # (apps/chronogazer/core/src/assets.rs).
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      # e2e/playwright.config.ts's webServer launches this binary directly
+      # (not `cargo run`) - it must already exist before `pnpm e2e` below.
+      - name: Build banto-serve (embed-ui)
+        run: cargo build -p chronogazer-core --bin banto-serve --features embed-ui
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run E2E smoke suite
+        run: pnpm e2e
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: e2e/playwright-report/
+          retention-days: 7
