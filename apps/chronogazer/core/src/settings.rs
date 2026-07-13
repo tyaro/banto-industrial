@@ -178,12 +178,12 @@ impl Default for AuditSettings {
 }
 
 /// Generic key/value settings store, backed by the `settings` table
-/// (migration `0002_settings.sql`). Shares the same sqlite pool as
-/// [`crate::items::ItemsService`] (spec §12.1: app settings live in the
-/// local SQLite settings DB alongside/instead of a separate file).
+/// (migration `0001_settings.sql`). Shares the same sqlite pool as every
+/// other service in this crate (spec §12.1: app settings live in the local
+/// SQLite settings DB alongside/instead of a separate file).
 ///
 /// `Clone` is cheap (`SqlitePool` is an `Arc`-backed handle), matching
-/// `ItemsService`/`UsersService` - needed since M12, when the REST layer's
+/// `UsersService` - needed since M12, when the REST layer's
 /// `/api/ui-settings/*` router started carrying its own handle.
 #[derive(Clone)]
 pub struct SettingsService {

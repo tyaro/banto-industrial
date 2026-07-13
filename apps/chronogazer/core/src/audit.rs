@@ -1,8 +1,8 @@
 //! Audit trail service (spec M14, `docs/roadmap.md`): who did what, when,
 //! over which transport, and whether it was allowed. Backed by the
-//! `audit_log` table (migration `0005_audit_log.sql`), same service-layer
-//! pattern as [`crate::items::ItemsService`]/[`crate::users::UsersService`] -
-//! testable in a plain `cargo test`, no `tauri`/`axum` dependency.
+//! `audit_log` table (migration `0004_audit_log.sql`), same service-layer
+//! pattern as [`crate::users::UsersService`] - testable in a plain `cargo
+//! test`, no `tauri`/`axum` dependency.
 //!
 //! **This service does not know about actors, RBAC, or HTTP** - it only
 //! knows how to store/list/prune rows. Every REST handler and Tauri command
@@ -94,7 +94,7 @@ fn column_map() -> ColumnMap {
 /// paginated read (admin-only viewer), and retention-based pruning.
 ///
 /// `Clone` is cheap (`SqlitePool` is an `Arc`-backed handle), matching
-/// `ItemsService`/`UsersService`/`SettingsService`.
+/// `UsersService`/`SettingsService`.
 #[derive(Clone)]
 pub struct AuditLogService {
     pool: SqlitePool,
@@ -154,12 +154,12 @@ impl AuditLogService {
         }
     }
 
-    /// Filtered/sorted/paginated read (spec M14's admin-only viewer),
-    /// same `banto_storage::list_query` pattern as
-    /// [`crate::items::ItemsService::list`]. Deliberately called only from
-    /// the admin-gated `/api/audit-log/list` route / `audit_log_list`
-    /// command - this service itself has no RBAC awareness (see this
-    /// module's doc comment).
+    /// Filtered/sorted/paginated read (spec M14's admin-only viewer), using
+    /// the same `banto_storage::list_query` pattern every other listable
+    /// service in this crate does. Deliberately called only from the
+    /// admin-gated `/api/audit-log/list` route / `audit_log_list` command -
+    /// this service itself has no RBAC awareness (see this module's doc
+    /// comment).
     pub async fn list(&self, params: ListParams) -> Result<ListResult<AuditLogEntry>, BantoError> {
         let columns = column_map();
 

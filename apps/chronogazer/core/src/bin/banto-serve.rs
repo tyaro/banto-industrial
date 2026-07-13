@@ -34,7 +34,6 @@ use chronogazer_core::audit::{AuditEntry, AuditLogService};
 use chronogazer_core::backup::BackupService;
 use chronogazer_core::db::init_db;
 use chronogazer_core::events::event_channel;
-use chronogazer_core::items::ItemsService;
 use chronogazer_core::rest::{api_router, audited_credential_verifier};
 use chronogazer_core::settings::SettingsService;
 use chronogazer_core::users::UsersService;
@@ -77,7 +76,6 @@ async fn main() {
     let pool = init_db(&db_path).await.expect("init_db should succeed");
 
     let events = event_channel();
-    let items = ItemsService::new(pool.clone()).with_events(events.clone());
     let users = UsersService::new(pool.clone());
     let settings = SettingsService::new(pool.clone());
     let backup = BackupService::new(db_path_buf, pool.clone());
@@ -129,17 +127,8 @@ async fn main() {
         Err(err) => eprintln!("banto-serve: 監査ログの保持設定の読み取りに失敗しました: {err}"),
     }
 
-    let app = api_router(
-        items,
-        users,
-        settings,
-        audit,
-        backup,
-        auth,
-        events,
-        allow_setup,
-    )
-    .merge(static_router::<FrontendAssets>());
+    let app = api_router(users, settings, audit, backup, auth, events, allow_setup)
+        .merge(static_router::<FrontendAssets>());
 
     let server = start(ServerConfig { bind, port }, app)
         .await

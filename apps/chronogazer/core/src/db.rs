@@ -1,160 +1,159 @@
-//! Database bootstrap for the chronogazer app (spec §12): connect,
-//! run embedded migrations, seed demo data on first run.
+//! Database bootstrap for the chronogazer app (spec §12): connect, apply
+//! this app's own schema, then `banto_tags::migrate` (I1's PLC connection/
+//! collection group/tag registry tables) against the SAME pool -
+//! ChronoGazer shares one SQLite database across the app's own tables
+//! (settings/users/audit_log) and every I-series crate's tables (plan.md
+//! §5: "single app-data file"), so this is the one place that bootstraps
+//! the whole schema.
+//!
+//! This app's own tables are applied as plain **idempotent DDL**
+//! (`CREATE TABLE IF NOT EXISTS` etc.) rather than through `sqlx::migrate!`
+//! - unlike the banto template (`apps/admin-template/core/src/db.rs`,
+//! which this module started from), this app is NOT the only thing
+//! running a `sqlx::migrate!`-based migrator against its pool:
+//! `banto_tags::migrate` below runs its OWN embedded `sqlx::migrate!` on
+//! the identical database. `sqlx`'s migration bookkeeping table
+//! (`_sqlx_migrations`) is a single, database-wide table with no way to
+//! namespace it per crate (`sqlx` 0.8 has no `Migrator::set_table_name`),
+//! so two independent `sqlx::migrate!` sources sharing one pool collide on
+//! overlapping version numbers - empirically confirmed here as
+//! `MigrateError::VersionMismatch`/`VersionMissing` on every single
+//! `init_db`/`init_db_memory` call once `banto_tags::migrate` was wired
+//! in. `crates/banto-collect/Cargo.toml` documents the identical
+//! constraint (its `collect_events` table for the same reason); this
+//! module is the app-level version of that same deviation - see
+//! `docs/r1a-readme-gaps.md` for the full writeup. The `migrations/*.sql`
+//! files in this crate remain as schema documentation/history; they are
+//! no longer executed by `sqlx::migrate!` - [`apply_app_schema`] below is
+//! the actual source of truth and must be kept in sync with them by hand.
 
 use banto_core::BantoError;
 use sqlx::SqlitePool;
 
-const SEED_ROW_COUNT: usize = 1_000;
-
-/// Connect to the SQLite database at `path`, run migrations, and seed demo
-/// data if the `items` table is empty. Used by the `src-tauri` adapter with
-/// a path under the app's data directory.
+/// Connect to the SQLite database at `path` and apply the full schema (this
+/// app's own, then `banto_tags`'s). Used by the `src-tauri` adapter with a
+/// path under the app's data directory.
 pub async fn init_db(path: impl AsRef<std::path::Path>) -> Result<SqlitePool, BantoError> {
     let pool = banto_storage::connect_sqlite(path).await?;
-    run_migrations_and_seed(&pool).await?;
+    run_migrations(&pool).await?;
     Ok(pool)
 }
 
 /// Same as [`init_db`] but against a private in-memory database. Used by
-/// tests so each test gets an isolated, migrated, seeded database.
+/// tests so each test gets an isolated, fully-migrated database.
 pub async fn init_db_memory() -> Result<SqlitePool, BantoError> {
     let pool = banto_storage::connect_sqlite_memory().await?;
-    run_migrations_and_seed(&pool).await?;
+    run_migrations(&pool).await?;
     Ok(pool)
 }
 
-/// A migrated but *unseeded* in-memory database. Used by `items` service
-/// tests that need full control over which rows exist (e.g. asserting a
-/// specific id is absent), where the 1,000-row demo seed from
-/// [`init_db_memory`] would collide with test fixture ids.
+/// Same as [`init_db_memory`], `pub(crate)` for `rest.rs`'s test module -
+/// kept as a separate name (rather than just reusing `init_db_memory`
+/// directly) since it predates this app's own migrations being the only
+/// thing seeded here and several call sites already spell it this way.
 #[cfg(test)]
 pub(crate) async fn migrate_memory() -> Result<SqlitePool, BantoError> {
     let pool = banto_storage::connect_sqlite_memory().await?;
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .map_err(|err| BantoError::Storage(err.to_string()))?;
+    run_migrations(&pool).await?;
     Ok(pool)
 }
 
-async fn run_migrations_and_seed(pool: &SqlitePool) -> Result<(), BantoError> {
-    sqlx::migrate!("./migrations")
-        .run(pool)
-        .await
-        .map_err(|err| BantoError::Storage(err.to_string()))?;
-    seed_if_empty(pool).await?;
+async fn run_migrations(pool: &SqlitePool) -> Result<(), BantoError> {
+    apply_app_schema(pool).await?;
+    // I1 (docs/plan.md): banto-tags owns its own migrations/ directory and
+    // is applied here, right after this app's own schema, so every caller
+    // of init_db/init_db_memory gets the full schema in one call - see
+    // banto_tags::migrate's doc comment for why it is designed to be
+    // called this way, and this module's own doc comment for why THIS
+    // app's half is deliberately NOT also a `sqlx::migrate!` source.
+    banto_tags::migrate(pool).await?;
     Ok(())
 }
 
-async fn seed_if_empty(pool: &SqlitePool) -> Result<(), BantoError> {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items")
-        .fetch_one(pool)
+/// This app's own tables, applied as idempotent DDL - see this module's
+/// doc comment for why. Mirrors `migrations/0001_settings.sql` through
+/// `migrations/0004_audit_log.sql` exactly; update both together.
+async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
+    // 0001_settings.sql
+    sqlx::query("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        .execute(pool)
         .await
         .map_err(banto_storage::storage_error)?;
-    if count > 0 {
-        return Ok(());
-    }
 
-    let rows = generate_sample_items(SEED_ROW_COUNT);
-    let mut tx = pool.begin().await.map_err(banto_storage::storage_error)?;
-    for row in &rows {
+    // 0002_users.sql
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+
+    // 0003_user_roles.sql: SQLite has no `ADD COLUMN IF NOT EXISTS`, so
+    // check `pragma_table_info` first - the idempotent equivalent.
+    let has_role_column: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'role'")
+            .fetch_one(pool)
+            .await
+            .map_err(banto_storage::storage_error)?;
+    if has_role_column == 0 {
         sqlx::query(
-            "INSERT INTO items (id, name, price, stock, updated_at) VALUES (?, ?, ?, ?, ?)",
+            "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin' \
+             CHECK (role IN ('admin','editor','viewer'))",
         )
-        .bind(row.id)
-        .bind(&row.name)
-        .bind(row.price)
-        .bind(row.stock)
-        .bind(&row.updated_at)
-        .execute(&mut *tx)
+        .execute(pool)
         .await
         .map_err(banto_storage::storage_error)?;
     }
-    tx.commit().await.map_err(banto_storage::storage_error)?;
+
+    // 0004_audit_log.sql
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS audit_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts TEXT NOT NULL DEFAULT (datetime('now')),
+          actor_username TEXT,
+          actor_role TEXT,
+          action TEXT NOT NULL,
+          resource TEXT NOT NULL,
+          entity_id TEXT,
+          detail TEXT,
+          origin TEXT NOT NULL,
+          result TEXT NOT NULL DEFAULT 'ok'
+        )",
+    )
+    .execute(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts)")
+        .execute(pool)
+        .await
+        .map_err(banto_storage::storage_error)?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor_username)")
+        .execute(pool)
+        .await
+        .map_err(banto_storage::storage_error)?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_audit_log_resource ON audit_log(resource, entity_id)",
+    )
+    .execute(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+
     Ok(())
 }
-
-struct SeedItem {
-    id: i64,
-    name: String,
-    price: i64,
-    stock: i64,
-    updated_at: String,
-}
-
-/// mulberry32: small, fast, deterministic PRNG (no runtime dependency).
-/// Ported 1:1 from `apps/chronogazer/src/lib/banto/sampleData.ts` so the
-/// two seed generators (TS `InMemoryDataProvider` seed data, Rust SQLite
-/// seed data) use the exact same algorithm and per-row draw order - only
-/// the row count and destination differ.
-struct Mulberry32 {
-    state: u32,
-}
-
-impl Mulberry32 {
-    fn new(seed: u32) -> Self {
-        Self { state: seed }
-    }
-
-    /// Returns a float in `[0, 1)`, matching the TS implementation's
-    /// `>>> 0) / 4294967296` normalization.
-    fn next(&mut self) -> f64 {
-        self.state = self.state.wrapping_add(0x6d2b79f5);
-        let mut t = self.state;
-        t = (t ^ (t >> 15)).wrapping_mul(t | 1);
-        t ^= t.wrapping_add((t ^ (t >> 7)).wrapping_mul(t | 61));
-        ((t ^ (t >> 14)) as f64) / 4294967296.0
-    }
-}
-
-const PRODUCT_BASES: [&str; 12] = [
-    "緑茶",
-    "ほうじ茶",
-    "麦茶",
-    "烏龍茶",
-    "紅茶",
-    "コーヒー",
-    "抹茶ラテ",
-    "レモネード",
-    "炭酸水",
-    "スポーツドリンク",
-    "オレンジジュース",
-    "アップルジュース",
-];
-
-const PRODUCT_SIZES: [&str; 6] = ["280ml", "350ml", "500ml", "600ml", "1L", "2L"];
-
-fn base_unit_price(base: &str) -> i64 {
-    match base {
-        "緑茶" => 140,
-        "ほうじ茶" => 140,
-        "麦茶" => 120,
-        "烏龍茶" => 150,
-        "紅茶" => 160,
-        "コーヒー" => 130,
-        "抹茶ラテ" => 220,
-        "レモネード" => 180,
-        "炭酸水" => 110,
-        "スポーツドリンク" => 170,
-        "オレンジジュース" => 190,
-        "アップルジュース" => 190,
-        _ => unreachable!("all PRODUCT_BASES entries are covered above"),
-    }
-}
-
-const SEED: u32 = 0x8a17c05;
-// Fixed "today" for deterministic output regardless of when the app runs
-// (matches sampleData.ts's UPDATED_AT_END = Date.UTC(2026, 6, 2)).
-const UPDATED_AT_END_DAYS_SINCE_EPOCH: i64 = 20636; // 2026-07-02 UTC
-const UPDATED_AT_SPAN_DAYS: i64 = 900; // ~2.5 years of history
 
 /// Days-since-epoch (1970-01-01) -> `YYYY-MM-DD`, using Howard Hinnant's
 /// `civil_from_days` algorithm (http://howardhinnant.github.io/date_algorithms.html).
 /// No date/time crate dependency for one small conversion.
 ///
 /// `pub(crate)` (not private) since `crate::backup` (spec M17) reuses this to
-/// turn a backup file's filesystem mtime into an ISO date for display,
-/// rather than duplicating the same algorithm a second time.
+/// turn a backup file's filesystem mtime into an ISO date for display.
 pub(crate) fn iso_date_from_days_since_epoch(days: i64) -> String {
     let z = days + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
@@ -169,46 +168,6 @@ pub(crate) fn iso_date_from_days_since_epoch(days: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// Port of `generateSampleItems` (`apps/chronogazer/src/lib/banto/sampleData.ts`):
-/// same PRNG, same product tables, same per-row draw order, so the first
-/// `count` rows are identical to the TS dataset's first `count` rows.
-fn generate_sample_items(count: usize) -> Vec<SeedItem> {
-    let mut random = Mulberry32::new(SEED);
-    let mut rows = Vec::with_capacity(count);
-
-    for i in 0..count {
-        let id = (i + 1) as i64;
-        let base = PRODUCT_BASES[(random.next() * PRODUCT_BASES.len() as f64).floor() as usize];
-        let size = PRODUCT_SIZES[(random.next() * PRODUCT_SIZES.len() as f64).floor() as usize];
-        let lot = random.next();
-        let name = if lot < 0.15 {
-            format!("{base} {size} 数量限定")
-        } else {
-            format!("{base} {size}")
-        };
-
-        let unit_price = base_unit_price(base);
-        let price_jitter = ((random.next() * 40.0 - 20.0) / 10.0).round() as i64 * 10; // -20..+20, rounded to 10
-        let price = (unit_price + price_jitter).max(50);
-
-        let stock = (random.next() * 500.0).floor() as i64;
-
-        let days_ago = (random.next() * UPDATED_AT_SPAN_DAYS as f64).floor() as i64;
-        let updated_at_days = UPDATED_AT_END_DAYS_SINCE_EPOCH - days_ago;
-        let updated_at = iso_date_from_days_since_epoch(updated_at_days);
-
-        rows.push(SeedItem {
-            id,
-            name,
-            price,
-            stock,
-            updated_at,
-        });
-    }
-
-    rows
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,58 +177,55 @@ mod tests {
         assert_eq!(iso_date_from_days_since_epoch(0), "1970-01-01");
         assert_eq!(iso_date_from_days_since_epoch(1), "1970-01-02");
         assert_eq!(iso_date_from_days_since_epoch(-1), "1969-12-31");
-        // 2026-07-02 is the fixed "today" used by the seed generator.
-        assert_eq!(
-            iso_date_from_days_since_epoch(UPDATED_AT_END_DAYS_SINCE_EPOCH),
-            "2026-07-02"
-        );
     }
 
-    #[test]
-    fn generate_sample_items_is_deterministic() {
-        let a = generate_sample_items(50);
-        let b = generate_sample_items(50);
-        assert_eq!(a.len(), 50);
-        for (x, y) in a.iter().zip(b.iter()) {
-            assert_eq!(x.id, y.id);
-            assert_eq!(x.name, y.name);
-            assert_eq!(x.price, y.price);
-            assert_eq!(x.stock, y.stock);
-            assert_eq!(x.updated_at, y.updated_at);
-        }
-    }
-
-    #[test]
-    fn generate_sample_items_produces_plausible_rows() {
-        let rows = generate_sample_items(200);
-        for row in &rows {
-            assert!(row.price >= 50);
-            assert!(row.stock >= 0 && row.stock < 500);
-            assert_eq!(row.updated_at.len(), 10); // YYYY-MM-DD
-        }
-    }
-
+    /// End-to-end proof that `init_db_memory` applies BOTH this app's own
+    /// schema (`settings`/`users`/`audit_log`, including the `role` column)
+    /// AND `banto_tags`'s (`plc_connections`/`collection_groups`/`tags`)
+    /// against the same pool - the R1-A integration point this module
+    /// exists to wire up.
     #[tokio::test]
-    async fn init_db_memory_migrates_and_seeds_exactly_once() {
+    async fn init_db_memory_applies_both_this_apps_and_banto_tags_schema() {
         let pool = init_db_memory()
             .await
             .expect("init_db_memory should succeed");
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items")
-            .fetch_one(&pool)
+        for table in [
+            "settings",
+            "users",
+            "audit_log",
+            "plc_connections",
+            "collection_groups",
+            "tags",
+        ] {
+            let exists: Option<String> = sqlx::query_scalar(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            )
+            .bind(table)
+            .fetch_optional(&pool)
             .await
             .unwrap();
-        assert_eq!(count, SEED_ROW_COUNT as i64);
+            assert!(exists.is_some(), "expected table '{table}' to exist");
+        }
+
+        let has_role_column: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'role'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(has_role_column, 1, "expected users.role to exist");
     }
 
+    /// Running schema application twice against the same pool must not
+    /// error and must not duplicate the `role` column - both this app's
+    /// idempotent DDL and `banto_tags::migrate`'s own bookkeeping table
+    /// tolerate being called again, so a second `init_db`-style call (e.g.
+    /// a future feature that re-checks schema on every launch) is always
+    /// safe.
     #[tokio::test]
-    async fn seeding_is_idempotent_across_two_inits_on_the_same_db() {
+    async fn schema_application_is_idempotent_across_two_runs_on_the_same_db() {
         let pool = banto_storage::connect_sqlite_memory().await.unwrap();
-        run_migrations_and_seed(&pool).await.unwrap();
-        run_migrations_and_seed(&pool).await.unwrap(); // second init: must not double-seed
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(count, SEED_ROW_COUNT as i64);
+        run_migrations(&pool).await.unwrap();
+        run_migrations(&pool).await.unwrap(); // second run: must not error
     }
 }

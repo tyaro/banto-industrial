@@ -25,7 +25,6 @@ use chronogazer_core::audit::{AuditEntry, AuditLogEntry, AuditLogService};
 use chronogazer_core::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 use chronogazer_core::db::init_db;
 use chronogazer_core::events::event_channel;
-use chronogazer_core::items::{ImportResult, Item, ItemImportRow, ItemInput, ItemsService};
 use chronogazer_core::rest::{api_router, audited_credential_verifier};
 use chronogazer_core::settings::{AuditSettings, AuthSettings, ServerSettings, SettingsService};
 use chronogazer_core::users::{Role, UserIdentity, UserSummary, UsersService};
@@ -43,7 +42,6 @@ use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
 /// App-wide state managed by Tauri (spec §10, §11).
 struct AppState {
-    items: ItemsService,
     /// The webview window's own session identity, set by `auth_login`/
     /// `auth_setup` and cleared by `auth_logout` - all called directly via
     /// `invoke()`, never through `/api/auth/login`. `Some` means logged in;
@@ -59,8 +57,8 @@ struct AppState {
     /// App settings (spec §12.1), including the embedded-server config
     /// (spec §11.2/§11.4's enabled/bind/port).
     settings: SettingsService,
-    /// App-wide resource-change/notice broadcast (spec §3.5): every
-    /// `ItemsService` mutation feeds this, and it is fanned out two ways -
+    /// App-wide resource-change/notice broadcast (spec §3.5): future
+    /// mutating services (R1-B) feed this, and it is fanned out two ways -
     /// to the webview via the `banto://event` forwarding task spawned in
     /// `setup()`, and (only while the embedded server is running) to LAN
     /// browser clients via `GET /api/events` (`banto_server::sse_route`).
@@ -82,12 +80,12 @@ struct AppState {
     /// `login`/`login_failed`/`logout`/`setup` entry here (`origin:
     /// "tauri"`) once it has already succeeded, and [`require_role`] records
     /// `denied` when an active session's role is too low. Shares the same
-    /// pool as `items`/`users`/`settings` (all four are `Clone` handles onto
+    /// pool as `users`/`settings` (all three are `Clone` handles onto
     /// the one on-disk SQLite DB, see `run()`'s `setup()`).
     audit: AuditLogService,
     /// Backup/restore (spec M17): `VACUUM INTO` snapshots into `backups/`
     /// next to the DB file, plus the restore staging flow. Shares the same
-    /// pool as `items`/`users`/`settings`/`audit` - only its `db_path` is
+    /// pool as `users`/`settings`/`audit` - only its `db_path` is
     /// unique to this service (needed to resolve `backups/` and
     /// `restore-pending.sqlite3`'s location, see `crate::backup`'s doc
     /// comment).
@@ -184,144 +182,6 @@ async fn require_role(
 #[tauri::command]
 fn ping() -> &'static str {
     concat!("banto ", env!("CARGO_PKG_VERSION"))
-}
-
-/// Read-only (spec M10 RBAC): any authenticated role (`viewer` and up), so
-/// `require_role`'s floor is the least-privileged role.
-#[tauri::command]
-async fn items_list(
-    state: State<'_, AppState>,
-    params: ListParams,
-) -> Result<ListResult<Item>, BantoError> {
-    require_role(&state, Role::Viewer, "items").await?;
-    state.items.list(params).await
-}
-
-#[tauri::command]
-async fn items_get(state: State<'_, AppState>, id: i64) -> Result<Item, BantoError> {
-    require_role(&state, Role::Viewer, "items").await?;
-    state.items.get(id).await
-}
-
-#[tauri::command]
-async fn items_create(state: State<'_, AppState>, values: ItemInput) -> Result<Item, BantoError> {
-    let actor = require_role(&state, Role::Editor, "items").await?;
-    let item = state.items.create(values).await?;
-    state
-        .audit
-        .record(AuditEntry {
-            actor_username: Some(&actor.username),
-            actor_role: Some(actor.role.as_str()),
-            action: "create",
-            resource: "items",
-            entity_id: Some(&item.id.to_string()),
-            detail: Some(serde_json::json!({ "name": item.name })),
-            origin: "tauri",
-            result: "ok",
-        })
-        .await;
-    Ok(item)
-}
-
-#[tauri::command]
-async fn items_update(
-    state: State<'_, AppState>,
-    id: i64,
-    values: ItemInput,
-) -> Result<Item, BantoError> {
-    let actor = require_role(&state, Role::Editor, "items").await?;
-    let item = state.items.update(id, values).await?;
-    state
-        .audit
-        .record(AuditEntry {
-            actor_username: Some(&actor.username),
-            actor_role: Some(actor.role.as_str()),
-            action: "update",
-            resource: "items",
-            entity_id: Some(&item.id.to_string()),
-            detail: Some(serde_json::json!({ "name": item.name })),
-            origin: "tauri",
-            result: "ok",
-        })
-        .await;
-    Ok(item)
-}
-
-#[tauri::command]
-async fn items_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoError> {
-    let actor = require_role(&state, Role::Editor, "items").await?;
-    state.items.delete(id).await?;
-    state
-        .audit
-        .record(AuditEntry {
-            actor_username: Some(&actor.username),
-            actor_role: Some(actor.role.as_str()),
-            action: "delete",
-            resource: "items",
-            entity_id: Some(&id.to_string()),
-            detail: None,
-            origin: "tauri",
-            result: "ok",
-        })
-        .await;
-    Ok(())
-}
-
-/// Body of [`items_import`], split out the same way [`change_own_password`]
-/// is (spec M14 pattern) so the audit-recording behavior is testable with a
-/// plain `&AppState` in this crate's own `cargo test` - `tauri::State`
-/// cannot be constructed outside a running tauri app, but it derefs to
-/// `&AppState`, so the command below is a one-line adapter.
-///
-/// Unlike `items_create`/`update`/`delete` above, [`ItemsService::import`]
-/// itself never fails on bad ROW data - an all-or-nothing rollback comes
-/// back as `Ok(ImportResult)` with `errors` populated (spec M15 design
-/// decision, see that method's doc comment) - so this always records
-/// exactly one `action: "import"` entry: `result: "ok"` with a
-/// `{created,updated}` summary when `errors` is empty, `result: "failed"`
-/// with an `{errorCount}` summary when the batch was rolled back. It only
-/// skips the write the way every other command here does: when the service
-/// call returns `Err` outright (e.g. the row-count limit), which `?`
-/// propagates before this function's audit code runs.
-async fn items_import_body(
-    state: &AppState,
-    rows: Vec<ItemImportRow>,
-) -> Result<ImportResult, BantoError> {
-    let actor = require_role(state, Role::Editor, "items").await?;
-    let result = state.items.import(rows).await?;
-    let (result_tag, detail) = if result.errors.is_empty() {
-        (
-            "ok",
-            serde_json::json!({ "created": result.created, "updated": result.updated }),
-        )
-    } else {
-        (
-            "failed",
-            serde_json::json!({ "errorCount": result.errors.len() }),
-        )
-    };
-    state
-        .audit
-        .record(AuditEntry {
-            actor_username: Some(&actor.username),
-            actor_role: Some(actor.role.as_str()),
-            action: "import",
-            resource: "items",
-            entity_id: None,
-            detail: Some(detail),
-            origin: "tauri",
-            result: result_tag,
-        })
-        .await;
-    Ok(result)
-}
-
-#[tauri::command]
-async fn items_import(
-    state: State<'_, AppState>,
-    rows: Vec<ItemImportRow>,
-) -> Result<ImportResult, BantoError> {
-    items_import_body(&state, rows).await
 }
 
 /// `GET`-ish command: has an account been created yet (spec §3.3/§8.2)? The
@@ -752,7 +612,6 @@ fn build_status(config: &ServerSettings, running: bool) -> ServerStatusResult {
 // bundle them into for a single call site.
 #[allow(clippy::too_many_arguments)]
 async fn start_embedded_server(
-    items: ItemsService,
     users: UsersService,
     settings: SettingsService,
     audit: AuditLogService,
@@ -765,7 +624,7 @@ async fn start_embedded_server(
     // the `auth_setup` command above (`invoke()`, no network involved), not
     // this REST endpoint. Only `banto-serve` (this repo's Tauri-free dev
     // vehicle) opts into `POST /api/auth/setup` via `BANTO_ALLOW_SETUP=1`.
-    let router = api_router(items, users, settings, audit, backup, auth, events, false)
+    let router = api_router(users, settings, audit, backup, auth, events, false)
         .merge(static_router::<FrontendAssets>());
     start(config, router).await
 }
@@ -809,7 +668,6 @@ async fn server_apply(
     let started = if config.enabled {
         Some(
             start_embedded_server(
-                state.items.clone(),
                 state.users.clone(),
                 state.settings.clone(),
                 state.audit.clone(),
@@ -1249,10 +1107,10 @@ async fn audit_config_apply(
 
 // --- M17: SQLite backup/restore ---------------------------------------------
 
-/// Body of [`backups_create`], split out the same way [`change_own_password`]/
-/// [`items_import_body`] are (spec M14 pattern) so the audit-recording
-/// behavior is testable with a plain `&AppState` in this crate's own `cargo
-/// test` - `tauri::State` cannot be constructed outside a running tauri app.
+/// Body of [`backups_create`], split out the same way [`change_own_password`]
+/// is (spec M14 pattern) so the audit-recording behavior is testable with a
+/// plain `&AppState` in this crate's own `cargo test` - `tauri::State`
+/// cannot be constructed outside a running tauri app.
 async fn backups_create_body(state: &AppState) -> Result<BackupInfo, BantoError> {
     let actor = require_role(state, Role::Admin, "backups").await?;
     let info = state.backup.create().await?;
@@ -1399,61 +1257,6 @@ async fn backups_cancel_restore(state: State<'_, AppState>) -> Result<(), BantoE
     backups_cancel_restore_body(&state).await
 }
 
-/// Pop a dock panel out into a REAL native window (spec §5.3 v2 - the
-/// "ウィンドウ分離" mode the v1 doc comment left as a future extension
-/// point). Thin by design: this is the ONLY Tauri-aware half of the pop-out
-/// feature - everything else (deciding when to call it, restoring the panel
-/// to the dock afterward) lives in testable frontend layers
-/// (`packages/dock-svelte`, `apps/chronogazer/src/lib/banto/popout.ts`).
-///
-/// One native window per panel id, labeled `panel-{id}` - calling this again
-/// for an already-open panel just focuses the existing window instead of
-/// opening a second one. `WebviewUrl::App("panel/{id}")` points at the
-/// standalone `routes/panel/[id]` SvelteKit route (no sidebar/header shell,
-/// its own auth check - see that route's doc comment), the SAME static
-/// build the main window's webview loads (spec §8.1's `adapter-static` SPA
-/// build).
-///
-/// On close (`WindowEvent::Destroyed`), emits `banto://panel-closed` to the
-/// main window with the panel id so the dashboard can `dock.open(id)` it
-/// back into view (`popout.ts::listenPanelClosed`) - the other half of this
-/// round trip.
-#[tauri::command]
-async fn panel_open(app: tauri::AppHandle, id: String, title: String) -> Result<(), BantoError> {
-    let label = format!("panel-{id}");
-
-    if let Some(window) = app.get_webview_window(&label) {
-        let _ = window.set_focus();
-        return Ok(());
-    }
-
-    let window = tauri::WebviewWindowBuilder::new(
-        &app,
-        label.clone(),
-        tauri::WebviewUrl::App(format!("panel/{id}").into()),
-    )
-    .title(title)
-    .inner_size(560.0, 420.0)
-    .min_inner_size(320.0, 240.0)
-    .build()
-    .map_err(|err| BantoError::Other(err.to_string()))?;
-
-    // Cloned into the closure: `on_window_event`'s handler is `'static`, so
-    // it cannot borrow `app`/`id` from this function's stack frame.
-    let app_for_event = app.clone();
-    let closed_id = id.clone();
-    window.on_window_event(move |event| {
-        if let tauri::WindowEvent::Destroyed = event {
-            // Best-effort: the main window may already be gone (app
-            // shutting down) - nothing useful to do with an emit failure
-            // here either way.
-            let _ = app_for_event.emit_to("main", "banto://panel-closed", closed_id.clone());
-        }
-    });
-
-    Ok(())
-}
-
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -1484,7 +1287,6 @@ pub fn run() {
                 tauri::async_runtime::block_on(init_db(&db_path)).expect("init_db should succeed");
 
             let events = event_channel();
-            let items = ItemsService::new(pool.clone()).with_events(events.clone());
             let users = UsersService::new(pool.clone());
             let settings = SettingsService::new(pool.clone());
             let backup = BackupService::new(db_path.clone(), pool.clone());
@@ -1686,7 +1488,6 @@ pub fn run() {
                     port: server_config.port,
                 };
                 match tauri::async_runtime::block_on(start_embedded_server(
-                    items.clone(),
                     users.clone(),
                     settings.clone(),
                     audit.clone(),
@@ -1745,7 +1546,6 @@ pub fn run() {
             }
 
             app.manage(AppState {
-                items,
                 auth: Mutex::new(initial_auth),
                 users,
                 settings,
@@ -1760,12 +1560,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             ping,
-            items_list,
-            items_get,
-            items_create,
-            items_update,
-            items_delete,
-            items_import,
             auth_status,
             auth_setup,
             auth_login,
@@ -1799,7 +1593,6 @@ pub fn run() {
             backups_stage_restore,
             backups_pending,
             backups_cancel_restore,
-            panel_open,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1819,7 +1612,6 @@ mod tests {
             .expect("init_db_memory");
         let events = event_channel();
         AppState {
-            items: ItemsService::new(pool.clone()).with_events(events.clone()),
             auth: Mutex::new(None),
             users: UsersService::new(pool.clone()),
             settings: SettingsService::new(pool.clone()),
@@ -1851,7 +1643,6 @@ mod tests {
             .expect("init_db");
         let events = event_channel();
         let state = AppState {
-            items: ItemsService::new(pool.clone()).with_events(events.clone()),
             auth: Mutex::new(None),
             users: UsersService::new(pool.clone()),
             settings: SettingsService::new(pool.clone()),
@@ -1931,187 +1722,6 @@ mod tests {
             result.rows.iter().all(|r| r.action != "password_change"),
             "a failed change must not be recorded as password_change: {:?}",
             result.rows
-        );
-    }
-
-    // --- M15: CSV import -----------------------------------------------------
-
-    /// `editor` can import; a mixed create+update batch succeeds and is
-    /// recorded as exactly ONE `action: "import"` audit entry (spec M15:
-    /// "件数サマリ付き1件記録"), with a `{created,updated}` summary detail
-    /// and no `entityId`.
-    #[tokio::test]
-    async fn items_import_records_one_audit_entry_on_success() {
-        let state = app_state().await;
-        let editor = state
-            .users
-            .create_user("editor", "password123", "編集者", Role::Editor)
-            .await
-            .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
-
-        let existing = state
-            .items
-            .create(ItemInput {
-                name: "Existing".to_string(),
-                price: 10,
-                stock: 1,
-            })
-            .await
-            .expect("seed create");
-
-        let result = items_import_body(
-            &state,
-            vec![
-                ItemImportRow {
-                    id: Some(existing.id),
-                    name: "Updated".to_string(),
-                    price: 20,
-                    stock: 2,
-                },
-                ItemImportRow {
-                    id: None,
-                    name: "Brand New".to_string(),
-                    price: 30,
-                    stock: 3,
-                },
-            ],
-        )
-        .await
-        .expect("items_import_body should succeed");
-        assert_eq!(result.created, 1);
-        assert_eq!(result.updated, 1);
-        assert!(result.errors.is_empty());
-
-        let audit = state
-            .audit
-            .list(ListParams::default())
-            .await
-            .expect("audit list");
-        let entries: Vec<_> = audit.rows.iter().filter(|r| r.action == "import").collect();
-        assert_eq!(
-            entries.len(),
-            1,
-            "expected exactly one import entry, got {:?}",
-            audit.rows
-        );
-        let entry = entries[0];
-        assert_eq!(entry.actor_username.as_deref(), Some("editor"));
-        assert_eq!(entry.actor_role.as_deref(), Some("editor"));
-        assert_eq!(entry.resource, "items");
-        assert_eq!(entry.entity_id, None);
-        assert_eq!(entry.origin, "tauri");
-        assert_eq!(entry.result, "ok");
-        let detail: serde_json::Value =
-            serde_json::from_str(entry.detail.as_deref().expect("detail should be set")).unwrap();
-        assert_eq!(detail, serde_json::json!({ "created": 1, "updated": 1 }));
-    }
-
-    /// A per-row validation error rolls the whole batch back - including the
-    /// otherwise-valid row in the same batch - and is recorded as a single
-    /// `result: "failed"` entry summarizing the error count (spec M15).
-    #[tokio::test]
-    async fn items_import_validation_error_rolls_back_and_is_recorded_as_failed() {
-        let state = app_state().await;
-        let editor = state
-            .users
-            .create_user("editor", "password123", "編集者", Role::Editor)
-            .await
-            .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
-
-        // `app_state()` is backed by `init_db_memory` (spec §12), which
-        // seeds 1,000 demo rows - capture that baseline rather than
-        // asserting an absolute `0` below, since this test cares about "did
-        // the import add anything", not "is the table empty".
-        let before = state
-            .items
-            .list(ListParams::default())
-            .await
-            .expect("list")
-            .total_count;
-
-        let result = items_import_body(
-            &state,
-            vec![
-                ItemImportRow {
-                    id: None,
-                    name: "Valid".to_string(),
-                    price: 10,
-                    stock: 1,
-                },
-                ItemImportRow {
-                    id: None,
-                    name: "".to_string(), // fails validation
-                    price: 1,
-                    stock: 1,
-                },
-            ],
-        )
-        .await
-        .expect("items_import_body should return Ok with row errors, not Err");
-        assert_eq!(result.created, 0);
-        assert_eq!(result.updated, 0);
-        assert_eq!(result.errors.len(), 1);
-
-        let list = state.items.list(ListParams::default()).await.expect("list");
-        assert_eq!(
-            list.total_count, before,
-            "a rolled-back import must not leave partial rows"
-        );
-
-        let audit = state
-            .audit
-            .list(ListParams::default())
-            .await
-            .expect("audit list");
-        let entry = audit
-            .rows
-            .iter()
-            .find(|r| r.action == "import")
-            .unwrap_or_else(|| panic!("expected an import entry, got {:?}", audit.rows));
-        assert_eq!(entry.result, "failed");
-        assert_eq!(entry.actor_username.as_deref(), Some("editor"));
-        let detail: serde_json::Value =
-            serde_json::from_str(entry.detail.as_deref().expect("detail should be set")).unwrap();
-        assert_eq!(detail, serde_json::json!({ "errorCount": 1 }));
-    }
-
-    /// `viewer` cannot import (spec M15: editor+ only, same `require_role`
-    /// floor as `items_create`/`update`/`delete`).
-    #[tokio::test]
-    async fn viewer_cannot_import_items() {
-        let state = app_state().await;
-        let viewer = state
-            .users
-            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
-            .await
-            .expect("create_user");
-        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
-        let before = state
-            .items
-            .list(ListParams::default())
-            .await
-            .expect("list")
-            .total_count;
-
-        let err = items_import_body(
-            &state,
-            vec![ItemImportRow {
-                id: None,
-                name: "Nope".to_string(),
-                price: 1,
-                stock: 1,
-            }],
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(err, BantoError::Forbidden));
-
-        let list = state.items.list(ListParams::default()).await.expect("list");
-        assert_eq!(
-            list.total_count, before,
-            "a forbidden import must not touch the table"
         );
     }
 

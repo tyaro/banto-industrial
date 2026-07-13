@@ -8,7 +8,7 @@ CREATE TABLE audit_log (
   actor_username TEXT,          -- NULL = unauthenticated (e.g. a login failure before any session exists)
   actor_role TEXT,               -- role AT THE TIME of the action, not looked up later
   action TEXT NOT NULL,          -- 'create'|'update'|'delete'|'login'|'login_failed'|'logout'|'setup'|'password_reset'|'settings_change'|'denied' etc.
-  resource TEXT NOT NULL,        -- 'items'|'users'|'settings'|'auth' etc.
+  resource TEXT NOT NULL,        -- 'users'|'settings'|'auth'|'backups' etc.
   entity_id TEXT,                -- target id as text, NULL if not applicable
   detail TEXT,                   -- JSON summary (changed field names, new role, etc.) - never full field values
   origin TEXT NOT NULL,           -- 'rest'|'tauri'

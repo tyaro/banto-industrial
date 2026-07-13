@@ -1,9 +1,9 @@
 //! Resource-change event plumbing (spec §3.5 `EventProvider`, §11.3).
 //!
 //! `banto-server::ServerEvent` is the wire type; this module just owns the
-//! app-wide broadcast channel that feeds it, so `ItemsService` (and any
-//! future resource service) and the SSE route
-//! (`banto_server::events::sse_route`) share one sender.
+//! app-wide broadcast channel that feeds it, so future resource services
+//! (R1-B) and the SSE route (`banto_server::events::sse_route`) share one
+//! sender.
 
 use banto_server::ServerEvent;
 use tokio::sync::broadcast;

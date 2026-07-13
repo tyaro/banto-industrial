@@ -49,13 +49,15 @@ const BACKUPS_DIR_NAME: &str = "backups";
 const PENDING_RESTORE_FILE_NAME: &str = "restore-pending.sqlite3";
 
 /// Tables a file must have to be accepted as a restorable ChronoGazer
-/// database (spec M17 "スキーマ妥当性: 必須テーブル（items, settings, users,
-/// audit_log）が存在すること" - inherited from the banto template).
-/// Deliberately does not check COLUMNS, only table presence - a coarse but
+/// database (spec M17 "スキーマ妥当性: 必須テーブル（settings, users,
+/// audit_log）が存在すること" - adapted from the banto template's own
+/// items/settings/users/audit_log list once the `items` demo resource was
+/// removed, R1-A). Deliberately does not check COLUMNS, only table
+/// presence - a coarse but
 /// cheap sanity check that this is a ChronoGazer DB at all (not, say, a
 /// random unrelated `.sqlite3` file), not a full schema migration
 /// compatibility check.
-const REQUIRED_TABLES: [&str; 4] = ["items", "settings", "users", "audit_log"];
+const REQUIRED_TABLES: [&str; 3] = ["settings", "users", "audit_log"];
 
 /// One backup file, as listed/created by [`BackupService::list`]/
 /// [`BackupService::create`]. `created_at` for [`BackupService::create`]
@@ -646,13 +648,11 @@ mod tests {
     /// this codebase's tests. Production code never hits this: `db_path` in
     /// `src-tauri`/`bin/banto-serve.rs` is always a real on-disk file.
     async fn migrated_file_db(path: &Path) -> SqlitePool {
-        let pool = banto_storage::connect_sqlite(path)
-            .await
-            .expect("connect_sqlite");
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("migrate");
+        // `crate::db::init_db` (not a raw `sqlx::migrate!` call here) - see
+        // that module's doc comment for why this app's own schema is NOT
+        // applied via `sqlx::migrate!` (it would collide with
+        // `banto_tags::migrate`'s own bookkeeping on this same pool).
+        let pool = crate::db::init_db(path).await.expect("init_db");
         // Force the migration's schema writes out of the WAL and into the
         // main file, so a plain `tokio::fs::read(path)` afterward (as every
         // test fixture below does, to get "the bytes of a valid backup"
@@ -901,10 +901,10 @@ mod tests {
         let db_path = dir.path().join("chronogazer.sqlite3");
 
         // A real "current" db on disk, distinguishable from the restore
-        // payload by row content.
-        let pool = banto_storage::connect_sqlite(&db_path).await.unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        sqlx::query("INSERT INTO items (id, name, price, stock, updated_at) VALUES (1, 'OLD', 1, 1, '2026-01-01')")
+        // payload by row content (`settings` is the simplest required
+        // table to seed a single distinguishable row into).
+        let pool = crate::db::init_db(&db_path).await.unwrap();
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('marker', 'OLD')")
             .execute(&pool)
             .await
             .unwrap();
@@ -922,7 +922,7 @@ mod tests {
         );
         let staged_path = dir.path().join("staged-source.sqlite3");
         let restore_pool = migrated_file_db(&staged_path).await;
-        sqlx::query("INSERT INTO items (id, name, price, stock, updated_at) VALUES (1, 'NEW', 2, 2, '2026-02-02')")
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('marker', 'NEW')")
             .execute(&restore_pool)
             .await
             .unwrap();
@@ -946,11 +946,11 @@ mod tests {
 
         // The live db_path now contains the RESTORED content.
         let after_pool = banto_storage::connect_sqlite(&db_path).await.unwrap();
-        let name: String = sqlx::query_scalar("SELECT name FROM items WHERE id = 1")
+        let value: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'marker'")
             .fetch_one(&after_pool)
             .await
             .unwrap();
-        assert_eq!(name, "NEW");
+        assert_eq!(value, "NEW");
         after_pool.close().await;
 
         // The pre-restore safety backup preserves the OLD content.
@@ -960,11 +960,12 @@ mod tests {
             .join(&applied.pre_restore_backup_file_name);
         assert!(backup_path.exists());
         let backup_pool = banto_storage::connect_sqlite(&backup_path).await.unwrap();
-        let old_name: String = sqlx::query_scalar("SELECT name FROM items WHERE id = 1")
-            .fetch_one(&backup_pool)
-            .await
-            .unwrap();
-        assert_eq!(old_name, "OLD");
+        let old_value: String =
+            sqlx::query_scalar("SELECT value FROM settings WHERE key = 'marker'")
+                .fetch_one(&backup_pool)
+                .await
+                .unwrap();
+        assert_eq!(old_value, "OLD");
         backup_pool.close().await;
     }
 

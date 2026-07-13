@@ -40,18 +40,11 @@ import {
 	createTauriUiSettings,
 	initBanto
 } from '@banto/admin-core';
-import type {
-	AuthProvider,
-	Notifier,
-	ResourceDefinition,
-	UiSettingsProvider
-} from '@banto/admin-core';
-import type { FormSchema } from '@banto/forms';
+import type { AuthProvider, Notifier, UiSettingsProvider } from '@banto/admin-core';
 // Safe to import in a plain browser (no Tauri runtime): only ever *called*
 // when isTauri() is true.
 import { invoke } from '@tauri-apps/api/core';
 import { toastStore } from '$lib/toast.svelte';
-import { sampleItems } from './sampleData';
 
 const AUTH_KEY = 'banto.auth.demo';
 
@@ -118,48 +111,6 @@ async function isEmbeddedServer(): Promise<boolean> {
 	}
 }
 
-// Rust's ItemInput.price/.stock (apps/admin-template/core/src/items.rs) are
-// `i64`, so a fractional value must be rejected client-side too (not just
-// bounds-checked) - otherwise it passes here and only fails after a round
-// trip to the real backend. `validateField` (packages/forms/src/
-// validate.ts) runs required, then min/max, then this `validate` in that
-// order, so the built-in required/min/max checks still run first; this only
-// adds an extra integer check on top.
-const integerValidate = (value: unknown): string | null =>
-	Number.isInteger(Number(value)) ? null : '整数で入力してください';
-
-const itemsSchema: FormSchema = {
-	fields: [
-		{ name: 'name', label: '商品名', type: 'text', required: true, min: 1, max: 40 },
-		{
-			name: 'price',
-			label: '価格',
-			type: 'number',
-			required: true,
-			min: 0,
-			max: 99999,
-			validate: integerValidate
-		},
-		{
-			name: 'stock',
-			label: '在庫',
-			type: 'number',
-			required: true,
-			min: 0,
-			validate: integerValidate
-		},
-		{ name: 'updatedAt', label: '更新日', type: 'date', readonly: true }
-	]
-};
-
-const itemsResource: ResourceDefinition = {
-	name: 'items',
-	label: '商品',
-	icon: '📦',
-	schema: itemsSchema,
-	capabilities: { list: true, create: true, edit: true, delete: true }
-};
-
 const notifier: Notifier = { notify: (kind, message) => toastStore.push(kind, message) };
 
 function isSessionAuthed(): boolean {
@@ -225,7 +176,7 @@ export const bantoReady: Promise<void> = (async () => {
 		const dataProvider = createTauriDataProvider({ invoke });
 		const authProvider = createTauriAuthProvider({ invoke });
 		uiSettings = createTauriUiSettings({ invoke });
-		initBanto({ dataProvider, authProvider, notifier, resources: [itemsResource] });
+		initBanto({ dataProvider, authProvider, notifier, resources: [] });
 
 		// Dynamic import: @tauri-apps/api/event's `listen` talks to a real
 		// Tauri IPC channel that does not exist outside the webview, so it must
@@ -240,17 +191,20 @@ export const bantoReady: Promise<void> = (async () => {
 		const authProvider = createHttpAuthProvider();
 		const dataProvider = createHttpDataProvider({ getToken: authProvider.getToken });
 		uiSettings = createHttpUiSettings({ getToken: authProvider.getToken });
-		initBanto({ dataProvider, authProvider, notifier, resources: [itemsResource] });
+		initBanto({ dataProvider, authProvider, notifier, resources: [] });
 		connectEvents(createSseEventProvider({ getToken: authProvider.getToken }));
 		return;
 	}
 
 	// Plain `vite dev`/`vite preview`: no Banto backend at all, no EventProvider.
+	// No resources registered yet (R1-B adds the first real ones - PLC
+	// connections/collection groups/tags/display groups); an empty seed is a
+	// valid InMemoryDataProvider input.
 	bantoMode = 'demo';
 	initBanto({
-		dataProvider: createInMemoryDataProvider({ items: { rows: sampleItems } }),
+		dataProvider: createInMemoryDataProvider({}),
 		authProvider: demoAuthProvider,
 		notifier,
-		resources: [itemsResource]
+		resources: []
 	});
 })();

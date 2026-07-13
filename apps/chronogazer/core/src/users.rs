@@ -32,7 +32,7 @@ const MIN_PASSWORD_LEN: usize = 8;
 /// Account role (spec M10 RBAC, `docs/roadmap.md`): three fixed levels,
 /// `viewer` < `editor` < `admin`, each a superset of the previous one's
 /// permissions. Stored as lowercase TEXT in the `users.role` column
-/// (migration `0004_user_roles.sql`, which also `CHECK`s the DB-side set of
+/// (migration `0003_user_roles.sql`, which also `CHECK`s the DB-side set of
 /// allowed values) and travels over the wire the same way (`#[serde(rename_all
 /// = "lowercase")]`), so this is the single place both the DB round-trip and
 /// the JSON wire shape agree on.
@@ -193,11 +193,11 @@ pub struct UserSummary {
 }
 
 /// Local credential store (spec §8.2): argon2id password hashes in the
-/// `users` table (migration `0003_users.sql`). No seed user - the app starts
+/// `users` table (migration `0002_users.sql`). No seed user - the app starts
 /// "uninitialized" and the first run walks through `setup_first_user`.
 ///
 /// `Clone` is cheap (`SqlitePool` is an `Arc`-backed handle), matching
-/// `ItemsService`/`SettingsService`.
+/// `SettingsService`.
 #[derive(Clone)]
 pub struct UsersService {
     pool: SqlitePool,

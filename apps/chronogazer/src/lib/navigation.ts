@@ -14,8 +14,9 @@ export interface NavItem {
 }
 
 export const navItems: NavItem[] = [
-	{ path: '/dashboard', label: 'ダッシュボード', icon: '📊' },
-	{ path: '/items', label: '商品', icon: '📦' },
+	{ path: '/monitor', label: '監視', icon: '📈' },
+	{ path: '/historical', label: 'ヒストリカル', icon: '🕰️' },
+	{ path: '/events', label: 'イベント', icon: '🔔' },
 	{ path: '/users', label: 'ユーザー管理', icon: '👤', adminOnly: true },
 	{ path: '/audit-log', label: '監査ログ', icon: '🧾', adminOnly: true },
 	{ path: '/settings', label: '設定', icon: '⚙️' }
@@ -25,5 +26,5 @@ export function pageTitle(pathname: string): string {
 	const item = navItems.find(
 		(entry) => pathname === entry.path || pathname.startsWith(entry.path + '/')
 	);
-	return item?.label ?? 'Banto';
+	return item?.label ?? 'ChronoGazer';
 }

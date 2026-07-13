@@ -1,0 +1,4 @@
+# pnpm lockfile - generated, and reformatting it produces enormous,
+# unreviewable diffs for no benefit (mirrors eslint.config.js's own
+# ignores: entry for this file).
+pnpm-lock.yaml

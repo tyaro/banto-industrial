@@ -52,7 +52,7 @@
 			if (showRemember && remember) params.remember = true;
 			const result = await getAuthProvider().login(params);
 			if (result.success) {
-				goto('/dashboard');
+				goto('/monitor');
 			} else {
 				error = result.error ?? 'ログインに失敗しました';
 			}
@@ -83,7 +83,7 @@
 			}
 			const result = await setup({ username, password, displayName });
 			if (result.success) {
-				goto('/dashboard');
+				goto('/monitor');
 			} else {
 				error = result.error ?? 'セットアップに失敗しました';
 			}

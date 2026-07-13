@@ -3,7 +3,7 @@ import { isAdmin } from '$lib/permissions';
 import { sessionStore } from '$lib/session.svelte';
 
 /**
- * `admin`-only page (spec M14): non-admins are sent to the dashboard rather
+ * `admin`-only page (spec M14): non-admins are sent to `/monitor` rather
  * than shown a 403 screen - same "hidden by navigation" philosophy as
  * `routes/(app)/users/+page.ts` (spec M10), which this mirrors exactly.
  *
@@ -15,6 +15,6 @@ import { sessionStore } from '$lib/session.svelte';
 export async function load({ parent }) {
 	await parent();
 	if (!isAdmin(sessionStore.role)) {
-		redirect(307, '/dashboard');
+		redirect(307, '/monitor');
 	}
 }

@@ -9,7 +9,6 @@ pub mod audit;
 pub mod backup;
 pub mod db;
 pub mod events;
-pub mod items;
 pub mod rest;
 pub mod settings;
 pub mod users;

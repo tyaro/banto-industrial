@@ -3,7 +3,7 @@ import { isAdmin } from '$lib/permissions';
 import { sessionStore } from '$lib/session.svelte';
 
 /**
- * `admin`-only page (spec M10 RBAC): non-admins are sent to the dashboard
+ * `admin`-only page (spec M10 RBAC): non-admins are sent to `/monitor`
  * rather than shown a 403 screen - "hidden by navigation", same philosophy
  * as the sidebar not listing this entry for them (spec §11.3's capability
  * judgement, extended to roles).
@@ -17,6 +17,6 @@ import { sessionStore } from '$lib/session.svelte';
 export async function load({ parent }) {
 	await parent();
 	if (!isAdmin(sessionStore.role)) {
-		redirect(307, '/dashboard');
+		redirect(307, '/monitor');
 	}
 }
