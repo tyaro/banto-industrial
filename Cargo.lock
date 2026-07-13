@@ -80,6 +80,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "banto-tsquery"
+version = "0.1.0"
+dependencies = [
+ "banto-tstore",
+ "sqlx",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "banto-tstore"
 version = "0.1.0"
 dependencies = [
