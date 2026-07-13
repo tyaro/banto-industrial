@@ -1191,7 +1191,7 @@ mod tests {
     use crate::db::migrate_memory;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
-    use banto_core::{BantoError, FilterOp, FilterState, Pagination, SortDirection, SortState};
+    use banto_core::BantoError;
     use serde_json::json;
     use std::path::PathBuf;
     use tempfile::tempdir;
@@ -1550,7 +1550,15 @@ mod tests {
         let audit = AuditLogService::new(pool);
         let auth = AuthState::new(audited_credential_verifier(users.clone(), audit.clone()));
         (
-            api_router(users, settings, audit.clone(), backup, auth, tx, allow_setup),
+            api_router(
+                users,
+                settings,
+                audit.clone(),
+                backup,
+                auth,
+                tx,
+                allow_setup,
+            ),
             audit,
         )
     }

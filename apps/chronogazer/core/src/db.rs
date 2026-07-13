@@ -7,9 +7,10 @@
 //! the whole schema.
 //!
 //! This app's own tables are applied as plain **idempotent DDL**
-//! (`CREATE TABLE IF NOT EXISTS` etc.) rather than through `sqlx::migrate!`
-//! - unlike the banto template (`apps/admin-template/core/src/db.rs`,
-//! which this module started from), this app is NOT the only thing
+//! (`CREATE TABLE IF NOT EXISTS` etc.) rather than through
+//! `sqlx::migrate!` - unlike the banto template
+//! (`apps/admin-template/core/src/db.rs`, which this module started
+//! from), this app is NOT the only thing
 //! running a `sqlx::migrate!`-based migrator against its pool:
 //! `banto_tags::migrate` below runs its OWN embedded `sqlx::migrate!` on
 //! the identical database. `sqlx`'s migration bookkeeping table

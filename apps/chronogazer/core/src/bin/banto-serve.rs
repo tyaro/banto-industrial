@@ -29,6 +29,7 @@
 //! §8.2 - the Tauri app never sets this, since desktop first-run goes
 //! through the `auth_setup` command instead).
 
+use banto_server::{lan_urls, start, static_router, AuthState, ServerConfig};
 use chronogazer_core::assets::FrontendAssets;
 use chronogazer_core::audit::{AuditEntry, AuditLogService};
 use chronogazer_core::backup::BackupService;
@@ -37,7 +38,6 @@ use chronogazer_core::events::event_channel;
 use chronogazer_core::rest::{api_router, audited_credential_verifier};
 use chronogazer_core::settings::SettingsService;
 use chronogazer_core::users::UsersService;
-use banto_server::{lan_urls, start, static_router, AuthState, ServerConfig};
 use std::path::PathBuf;
 
 const DEFAULT_PORT: u16 = 8721;
