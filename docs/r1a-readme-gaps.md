@@ -173,6 +173,26 @@
   - 対応: `tauri.conf.json` の新 `identifier`（`dev.tyaro.chronogazer`）に
     合わせて手動で `"dev.tyaro.chronogazer"` に変更した。
 
+- [ ] **git 依存で導入した `@banto/*` は Vite の依存事前バンドルに
+      衝突し、`vite dev`（= `tauri dev`）が起動時にエラーになる**
+  - banto モノレポ内では `@banto/*` は `workspace:*` リンクのため Vite の
+    dep optimizer（esbuild による事前バンドル）から自動除外される。
+    git 依存に切り替えると実パッケージ（`node_modules/.pnpm/...`）扱いに
+    なり事前バンドル対象となるが、`@banto/*` はソース配布
+    （`.svelte`/`.svelte.ts` を含む未コンパイルの TS）のため
+    `vite-plugin-svelte-module:optimize-svelte` の処理でパースエラー
+    （`js_parse_error`、`import` の先頭1文字が欠けた表示）になる。
+    実測: `pnpm build`（本番ビルド）と `pnpm check` は通るのに
+    `tauri dev` / `vite dev` だけが失敗する、という分かりにくい形で発症。
+  - 対応: `apps/chronogazer/vite.config.ts` に
+    `optimizeDeps.exclude: ['@banto/admin-core', '@banto/charts',
+    '@banto/forms', '@banto/grid-svelte', '@banto/theme']` を追加して解消。
+  - banto へのフィードバック案: 各 `packages/*/package.json` に
+    `"svelte"` フィールド（例: `"svelte": "./src/index.ts"`）を追加すれば
+    vite-plugin-svelte が Svelte ライブラリとして認識し消費側の設定不要で
+    自動除外される見込み。少なくとも README のコピー手順に
+    optimizeDeps.exclude の必要性を明記すべき。
+
 - [ ] **`banto-serve` バイナリ名は README のリネーム対象に含まれない**
   - `core/Cargo.toml` の `[[bin]] name = "banto-serve"` はテンプレート名の
     ままで良いのか、リネームすべきかが README から読み取れない。
@@ -203,7 +223,14 @@
 - `docs/plan.md`・`docs/recorder-requirements.md`・`README.md`・
   `.github/workflows/ci.yml` は prettier 未整形のまま（R1-A の範囲外。
   別コミットで `pnpm format` を適用すべき）。
-- `tauri dev`（デスクトップウィンドウでの実機起動）・LAN モード
-  （`banto-serve`相当のブラウザアクセス）は未検証。`cargo check`/
-  `cargo test --workspace`/`pnpm check`/`pnpm lint`/`pnpm format:check`
-  （chronogazer関連ファイルに限定）はすべて green。
+- `cargo check`/`cargo test --workspace`/`pnpm check`/`pnpm lint`/
+  `pnpm format:check`（chronogazer関連ファイルに限定）はすべて green。
+- LAN モード検証済み（2026-07-13）: `pnpm build` →
+  `cargo run -p chronogazer-core --bin banto-serve --features embed-ui` で
+  初回セットアップ → ログイン → `/monitor` の空状態表示・
+  `/historical`/`/events` プレースホルダ表示をブラウザ実機で確認。
+  コンソールエラーなし。
+- `tauri dev` 検証済み（2026-07-13）: 上記 optimizeDeps 修正後、
+  `chronogazer.exe` が起動し vite dev ログにエラーなし
+  （デスクトップウィンドウ内でのログイン操作の目視確認は未実施 —
+  UI 自体は LAN モードと同一ビルド）。
