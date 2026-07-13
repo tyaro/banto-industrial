@@ -7,3 +7,24 @@ build/
 *.sqlite3-wal
 *.sqlite3-shm
 .DS_Store
+
+# Tauri generated schemas (apps/chronogazer/src-tauri/gen)
+gen/
+
+# TypeScript / eslint caches
+*.tsbuildinfo
+.eslintcache
+
+# dotenv environment variable files
+.env
+.env.*
+!.env.example
+
+# Editor settings (personal)
+.vscode/
+
+# Vite files
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+
+# pnpm-lock.yaml is intentionally NOT ignored - the lockfile is committed
