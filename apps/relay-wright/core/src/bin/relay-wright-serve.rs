@@ -38,6 +38,8 @@ use relay_wright_core::events::event_channel;
 use relay_wright_core::rest::{api_router, audited_credential_verifier};
 use relay_wright_core::settings::SettingsService;
 use relay_wright_core::users::UsersService;
+use relay_wright_core::write_rules::WriteRuleService;
+use relay_wright_core::write_targets::WriteTargetService;
 use std::path::PathBuf;
 
 const DEFAULT_PORT: u16 = 8721;
@@ -79,6 +81,8 @@ async fn main() {
     let users = UsersService::new(pool.clone());
     let settings = SettingsService::new(pool.clone());
     let backup = BackupService::new(db_path_buf, pool.clone());
+    let write_targets = WriteTargetService::new(pool.clone());
+    let write_rules = WriteRuleService::new(pool.clone());
     let audit = AuditLogService::new(pool);
     // Credential verifier from `relay_wright_core::rest` (spec §8.2),
     // backed by `UsersService`'s argon2id-hashed accounts - replaces the old
@@ -129,8 +133,18 @@ async fn main() {
         }
     }
 
-    let app = api_router(users, settings, audit, backup, auth, events, allow_setup)
-        .merge(static_router::<FrontendAssets>());
+    let app = api_router(
+        users,
+        settings,
+        audit,
+        backup,
+        write_targets,
+        write_rules,
+        auth,
+        events,
+        allow_setup,
+    )
+    .merge(static_router::<FrontendAssets>());
 
     let server = start(ServerConfig { bind, port }, app)
         .await

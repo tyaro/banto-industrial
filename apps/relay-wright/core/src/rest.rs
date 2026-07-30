@@ -123,6 +123,8 @@ use crate::audit::{AuditEntry, AuditLogService};
 use crate::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 use crate::settings::{AuditSettings, SettingsService};
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
+use crate::write_rules::{WriteRuleDetail, WriteRuleInput, WriteRuleService};
+use crate::write_targets::{WriteTarget, WriteTargetInput, WriteTargetService};
 
 /// Request-body size cap for `POST /api/backups/restore` (spec M17: "サイズ
 /// 上限（例256MB）を設ける"). Applied via `DefaultBodyLimit` on
@@ -1131,13 +1133,314 @@ fn backups_router(backup: BackupService, audit: AuditLogService, auth: AuthState
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
 
+// --- W2: write registry/rule CRUD -------------------------------------------
+
+/// Resolve the caller's identity and require role >= `editor` (spec M10:
+/// resources are viewer-read / editor-write). Records a `denied` audit entry
+/// (mirroring [`require_role_at_least`]) when an AUTHENTICATED caller's role
+/// is too low, and returns `BantoError::Forbidden`; no valid session at all
+/// returns `BantoError::Unauthorized` (deliberately NOT audited, same
+/// reasoning as the RBAC middleware: nothing resembling a real user to
+/// attribute a denial to). Used inline by the write handlers of
+/// [`write_registry_router`], which - unlike the admin-only routers - cannot
+/// use a single-floor `RoleGuard` middleware because their GET routes are
+/// only `require_auth` (viewer+), so read and write share a path but need
+/// different floors. This is the REST twin of `src-tauri`'s `require_role`.
+async fn require_editor(
+    auth: &AuthState,
+    audit: &AuditLogService,
+    headers: &HeaderMap,
+    resource: &'static str,
+    method: &str,
+    path: &str,
+) -> Result<(), BantoError> {
+    match actor_identity(headers, auth) {
+        Some(identity)
+            if Role::from_str(&identity.role)
+                .map(|role| role.at_least(Role::Editor))
+                .unwrap_or(false) =>
+        {
+            Ok(())
+        }
+        Some(identity) => {
+            audit
+                .record(AuditEntry {
+                    actor_username: Some(&identity.id),
+                    actor_role: Some(&identity.role),
+                    action: "denied",
+                    resource,
+                    entity_id: None,
+                    detail: Some(json!({ "method": method, "path": path })),
+                    origin: "rest",
+                    result: "denied",
+                })
+                .await;
+            Err(BantoError::Forbidden)
+        }
+        None => Err(BantoError::Unauthorized),
+    }
+}
+
+/// State for the `/api/write-targets/*` and `/api/write-rules/*` handlers
+/// (spec §1 両経路対称): both services plus `AuthState`/`AuditLogService` so
+/// each mutation can editor-gate ([`require_editor`]) and audit exactly as
+/// the Tauri commands do.
+#[derive(Clone)]
+struct WriteRegistryState {
+    targets: WriteTargetService,
+    rules: WriteRuleService,
+    auth: AuthState,
+    audit: AuditLogService,
+}
+
+async fn write_targets_list(
+    State(state): State<WriteRegistryState>,
+) -> Result<Json<Vec<WriteTarget>>, ApiError> {
+    Ok(Json(state.targets.list(ListParams::default()).await?.rows))
+}
+
+async fn write_targets_get(
+    State(state): State<WriteRegistryState>,
+    Path(id): Path<i64>,
+) -> Result<Json<WriteTarget>, ApiError> {
+    Ok(Json(state.targets.get(id).await?))
+}
+
+async fn write_targets_create(
+    State(state): State<WriteRegistryState>,
+    headers: HeaderMap,
+    Json(input): Json<WriteTargetInput>,
+) -> Result<Json<WriteTarget>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "write_targets",
+        "POST",
+        "/api/write-targets",
+    )
+    .await?;
+    let created = state.targets.create(input).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "create",
+        "write_targets",
+        &created.id.to_string(),
+        Some(json!({ "name": created.name })),
+    )
+    .await;
+    Ok(Json(created))
+}
+
+async fn write_targets_update(
+    State(state): State<WriteRegistryState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(input): Json<WriteTargetInput>,
+) -> Result<Json<WriteTarget>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "write_targets",
+        "PUT",
+        "/api/write-targets/{id}",
+    )
+    .await?;
+    let updated = state.targets.update(id, input).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "update",
+        "write_targets",
+        &id.to_string(),
+        Some(json!({ "name": updated.name })),
+    )
+    .await;
+    Ok(Json(updated))
+}
+
+async fn write_targets_delete(
+    State(state): State<WriteRegistryState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "write_targets",
+        "DELETE",
+        "/api/write-targets/{id}",
+    )
+    .await?;
+    state.targets.delete(id).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "delete",
+        "write_targets",
+        &id.to_string(),
+        None,
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn write_rules_list(
+    State(state): State<WriteRegistryState>,
+) -> Result<Json<Vec<WriteRuleDetail>>, ApiError> {
+    Ok(Json(state.rules.list(ListParams::default()).await?.rows))
+}
+
+async fn write_rules_get(
+    State(state): State<WriteRegistryState>,
+    Path(id): Path<i64>,
+) -> Result<Json<WriteRuleDetail>, ApiError> {
+    Ok(Json(state.rules.get(id).await?))
+}
+
+async fn write_rules_create(
+    State(state): State<WriteRegistryState>,
+    headers: HeaderMap,
+    Json(input): Json<WriteRuleInput>,
+) -> Result<Json<WriteRuleDetail>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "write_rules",
+        "POST",
+        "/api/write-rules",
+    )
+    .await?;
+    let created = state.rules.create(input).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "create",
+        "write_rules",
+        &created.rule.id.to_string(),
+        Some(json!({ "name": created.rule.name, "enabled": created.rule.enabled })),
+    )
+    .await;
+    Ok(Json(created))
+}
+
+async fn write_rules_update(
+    State(state): State<WriteRegistryState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(input): Json<WriteRuleInput>,
+) -> Result<Json<WriteRuleDetail>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "write_rules",
+        "PUT",
+        "/api/write-rules/{id}",
+    )
+    .await?;
+    let updated = state.rules.update(id, input).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "update",
+        "write_rules",
+        &id.to_string(),
+        Some(json!({ "name": updated.rule.name, "enabled": updated.rule.enabled })),
+    )
+    .await;
+    Ok(Json(updated))
+}
+
+async fn write_rules_delete(
+    State(state): State<WriteRegistryState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "write_rules",
+        "DELETE",
+        "/api/write-rules/{id}",
+    )
+    .await?;
+    state.rules.delete(id).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "delete",
+        "write_rules",
+        &id.to_string(),
+        None,
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `/api/write-targets/*` + `/api/write-rules/*` (spec §1 両経路対称, plan
+/// W2): viewer-read / editor-write. Guarded by `require_auth` for the whole
+/// router (any authenticated role may read); each write handler additionally
+/// calls [`require_editor`]. This split - rather than the admin routers'
+/// single-floor `RoleGuard` middleware - is what lets GET and POST/PUT/DELETE
+/// share a path with different role floors.
+fn write_registry_router(
+    targets: WriteTargetService,
+    rules: WriteRuleService,
+    audit: AuditLogService,
+    auth: AuthState,
+) -> Router {
+    let state = WriteRegistryState {
+        targets,
+        rules,
+        auth: auth.clone(),
+        audit,
+    };
+    Router::new()
+        .route(
+            "/api/write-targets",
+            get(write_targets_list).post(write_targets_create),
+        )
+        .route(
+            "/api/write-targets/{id}",
+            get(write_targets_get)
+                .put(write_targets_update)
+                .delete(write_targets_delete),
+        )
+        .route(
+            "/api/write-rules",
+            get(write_rules_list).post(write_rules_create),
+        )
+        .route(
+            "/api/write-rules/{id}",
+            get(write_rules_get)
+                .put(write_rules_update)
+                .delete(write_rules_delete),
+        )
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(auth, require_auth))
+}
+
 /// Compose the full `/api/*` router (spec §11.1): auth routes (login/
 /// logout/check/identity from `banto_server` - wrapped with an audit-log
 /// hook for `logout`, spec M14 - plus status/setup/change-password here
 /// since those need `UsersService`), SSE events, the `admin`-only `users`
 /// management routes (spec M10), the `admin`-only `audit-log` viewer (spec
-/// M14), the `admin`-only `backups` routes (spec M17), and the per-user
-/// `ui-settings` routes (spec M12), all behind the CSRF header check. Mount
+/// M14), the `admin`-only `backups` routes (spec M17), the viewer-read/
+/// editor-write `write-targets`/`write-rules` registry (plan W2), and the
+/// per-user `ui-settings` routes (spec M12), all behind the CSRF header
+/// check. Mount
 /// the result *before* `banto_server::static_files::static_router` so
 /// `/api/*` takes priority over the SPA fallback. Future resources (R1-B:
 /// PLC connections/collection groups/tags/display groups) get their own
@@ -1153,6 +1456,8 @@ pub fn api_router(
     settings: SettingsService,
     audit: AuditLogService,
     backup: BackupService,
+    write_targets: WriteTargetService,
+    write_rules: WriteRuleService,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
     allow_setup: bool,
@@ -1178,6 +1483,12 @@ pub fn api_router(
         .merge(audit_log_router(
             audit.clone(),
             settings.clone(),
+            auth.clone(),
+        ))
+        .merge(write_registry_router(
+            write_targets,
+            write_rules,
+            audit.clone(),
             auth.clone(),
         ))
         .merge(backups_router(backup, audit, auth.clone()))
@@ -1245,7 +1556,9 @@ mod tests {
         let users = UsersService::new(pool.clone());
         let settings = SettingsService::new(pool.clone());
         let backup = unused_backup_service(pool.clone());
-        let audit = AuditLogService::new(pool);
+        let audit = AuditLogService::new(pool.clone());
+        let write_targets = WriteTargetService::new(pool.clone());
+        let write_rules = WriteRuleService::new(pool);
 
         users
             .setup_first_user("admin", "password123", "管理者")
@@ -1288,7 +1601,17 @@ mod tests {
             .await
             .expect("viewer login");
         (
-            api_router(users, settings, audit, backup, auth, tx, false),
+            api_router(
+                users,
+                settings,
+                audit,
+                backup,
+                write_targets,
+                write_rules,
+                auth,
+                tx,
+                false,
+            ),
             admin_token,
             editor_token,
             viewer_token,
@@ -1301,14 +1624,26 @@ mod tests {
         let users = UsersService::new(pool.clone());
         let settings = SettingsService::new(pool.clone());
         let backup = unused_backup_service(pool.clone());
-        let audit = AuditLogService::new(pool);
+        let audit = AuditLogService::new(pool.clone());
+        let write_targets = WriteTargetService::new(pool.clone());
+        let write_rules = WriteRuleService::new(pool);
         let auth = demo_auth();
         let token = auth
             .login("admin", "admin")
             .await
             .expect("login should succeed");
         (
-            api_router(users, settings, audit, backup, auth, tx, false),
+            api_router(
+                users,
+                settings,
+                audit,
+                backup,
+                write_targets,
+                write_rules,
+                auth,
+                tx,
+                false,
+            ),
             token,
         )
     }
@@ -1356,9 +1691,21 @@ mod tests {
         let users = UsersService::new(pool.clone());
         let settings = SettingsService::new(pool.clone());
         let backup = unused_backup_service(pool.clone());
-        let audit = AuditLogService::new(pool);
+        let audit = AuditLogService::new(pool.clone());
+        let write_targets = WriteTargetService::new(pool.clone());
+        let write_rules = WriteRuleService::new(pool);
         let auth = demo_auth();
-        api_router(users, settings, audit, backup, auth, tx, allow_setup)
+        api_router(
+            users,
+            settings,
+            audit,
+            backup,
+            write_targets,
+            write_rules,
+            auth,
+            tx,
+            allow_setup,
+        )
     }
 
     fn get(path: &str) -> HttpRequest<Body> {
@@ -1547,7 +1894,9 @@ mod tests {
         let users = UsersService::new(pool.clone());
         let settings = SettingsService::new(pool.clone());
         let backup = unused_backup_service(pool.clone());
-        let audit = AuditLogService::new(pool);
+        let audit = AuditLogService::new(pool.clone());
+        let write_targets = WriteTargetService::new(pool.clone());
+        let write_rules = WriteRuleService::new(pool);
         let auth = AuthState::new(audited_credential_verifier(users.clone(), audit.clone()));
         (
             api_router(
@@ -1555,6 +1904,8 @@ mod tests {
                 settings,
                 audit.clone(),
                 backup,
+                write_targets,
+                write_rules,
                 auth,
                 tx,
                 allow_setup,
@@ -1885,7 +2236,9 @@ mod tests {
         let users = UsersService::new(pool.clone());
         let settings = SettingsService::new(pool.clone());
         let backup = unused_backup_service(pool.clone());
-        let audit = AuditLogService::new(pool);
+        let audit = AuditLogService::new(pool.clone());
+        let write_targets = WriteTargetService::new(pool.clone());
+        let write_rules = WriteRuleService::new(pool);
 
         users
             .setup_first_user("admin", "password123", "管理者")
@@ -1914,7 +2267,17 @@ mod tests {
             .await
             .expect("viewer login");
 
-        let router = api_router(users, settings, audit.clone(), backup, auth, tx, false);
+        let router = api_router(
+            users,
+            settings,
+            audit.clone(),
+            backup,
+            write_targets,
+            write_rules,
+            auth,
+            tx,
+            false,
+        );
         (router, audit, admin_token, editor_token, viewer_token)
     }
 
@@ -1945,7 +2308,9 @@ mod tests {
         let users = UsersService::new(pool.clone());
         let settings = SettingsService::new(pool.clone());
         let backup = BackupService::new(db_path, pool.clone());
-        let audit = AuditLogService::new(pool);
+        let audit = AuditLogService::new(pool.clone());
+        let write_targets = WriteTargetService::new(pool.clone());
+        let write_rules = WriteRuleService::new(pool);
 
         users
             .setup_first_user("admin", "password123", "管理者")
@@ -1974,7 +2339,17 @@ mod tests {
             .await
             .expect("viewer login");
 
-        let router = api_router(users, settings, audit, backup, auth, tx, false);
+        let router = api_router(
+            users,
+            settings,
+            audit,
+            backup,
+            write_targets,
+            write_rules,
+            auth,
+            tx,
+            false,
+        );
         (router, dir, admin_token, editor_token, viewer_token)
     }
 
@@ -2542,5 +2917,146 @@ mod tests {
                 .any(|r| r["action"] == "restore_cancelled" && r["resource"] == "backups"),
             "expected a restore_cancelled entry, got {rows:?}"
         );
+    }
+
+    // --- W2: write registry dual-path symmetry ------------------------------
+
+    /// Router with a seeded PLC connection (so a write target can be created),
+    /// real admin/editor/viewer accounts + tokens, and the shared audit
+    /// service/pool exposed so the W2 dual-path tests can assert both the
+    /// write result AND the audit trail (spec §1 両経路対称: the REST path
+    /// must produce the same authz + audit as the Tauri path).
+    async fn write_registry_router_test() -> (Router, AuditLogService, i64, String, String) {
+        use banto_tags::{PlcConnectionInput, PlcConnectionService};
+
+        let pool = migrate_memory().await.expect("migrate_memory");
+        let (tx, _rx) = broadcast::channel(16);
+        let users = UsersService::new(pool.clone());
+        let settings = SettingsService::new(pool.clone());
+        let backup = unused_backup_service(pool.clone());
+        let audit = AuditLogService::new(pool.clone());
+        let write_targets = WriteTargetService::new(pool.clone());
+        let write_rules = WriteRuleService::new(pool.clone());
+
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(PlcConnectionInput {
+                name: "PLC1".to_string(),
+                protocol: "modbus-tcp".to_string(),
+                host: "10.0.0.1".to_string(),
+                port: 502,
+                unit_id: 1,
+                enabled: true,
+            })
+            .await
+            .expect("seed plc connection");
+
+        users
+            .setup_first_user("admin", "password123", "管理者")
+            .await
+            .expect("setup_first_user");
+        users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create editor");
+        users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create viewer");
+
+        let auth = AuthState::new(audited_credential_verifier(users.clone(), audit.clone()));
+        let editor_token = auth
+            .login("editor", "password123")
+            .await
+            .expect("editor login");
+        let viewer_token = auth
+            .login("viewer", "password123")
+            .await
+            .expect("viewer login");
+
+        let router = api_router(
+            users,
+            settings,
+            audit.clone(),
+            backup,
+            write_targets,
+            write_rules,
+            auth,
+            tx,
+            false,
+        );
+        (router, audit, conn.id, editor_token, viewer_token)
+    }
+
+    /// An `editor` can create a write target over REST, and the mutation is
+    /// recorded to the audit log with `origin: "rest"` - the REST half of the
+    /// dual-path create+audit symmetry (the Tauri half is asserted in
+    /// `src-tauri`'s own tests).
+    #[tokio::test]
+    async fn rest_editor_can_create_write_target_and_it_is_audited() {
+        let (router, audit, plc_id, editor, _viewer) = write_registry_router_test().await;
+        let response = router
+            .oneshot(post_json_auth(
+                "/api/write-targets",
+                &editor,
+                json!({
+                    "name": "WT1",
+                    "plcConnectionId": plc_id,
+                    "address": "D100",
+                    "dataType": "i16"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = body_json(response).await;
+        assert_eq!(created["name"], "WT1");
+
+        let entries = audit.list(ListParams::default()).await.unwrap();
+        let entry = entries
+            .rows
+            .iter()
+            .find(|r| r.action == "create" && r.resource == "write_targets")
+            .expect("expected a write_targets create audit entry");
+        assert_eq!(entry.origin, "rest");
+        assert_eq!(entry.result, "ok");
+        assert_eq!(entry.actor_username.as_deref(), Some("editor"));
+    }
+
+    /// A `viewer` is denied (403) when trying to create a write target, and
+    /// the denial is recorded (`action: "denied"`, `origin: "rest"`) - proving
+    /// `require_editor` gates writes and audits the denial exactly as the
+    /// admin `RoleGuard`/Tauri `require_role` do.
+    #[tokio::test]
+    async fn rest_viewer_cannot_create_write_target_and_denial_is_audited() {
+        let (router, audit, plc_id, _editor, viewer) = write_registry_router_test().await;
+        let response = router
+            .oneshot(post_json_auth(
+                "/api/write-targets",
+                &viewer,
+                json!({
+                    "name": "WT1",
+                    "plcConnectionId": plc_id,
+                    "address": "D100",
+                    "dataType": "i16"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let entries = audit.list(ListParams::default()).await.unwrap();
+        assert!(
+            entries
+                .rows
+                .iter()
+                .any(|r| r.action == "denied" && r.resource == "write_targets"),
+            "expected a denied entry for write_targets, got {:?}",
+            entries.rows
+        );
+        // And nothing was actually created.
+        assert!(!entries
+            .rows
+            .iter()
+            .any(|r| r.action == "create" && r.resource == "write_targets"));
     }
 }
