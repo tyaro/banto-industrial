@@ -198,8 +198,21 @@
 
 	const columns: GridColumn<WriteTarget>[] = [
 		{ id: 'id', header: 'ID', accessor: 'id', width: 60, align: 'right' },
-		{ id: 'name', header: '名前', accessor: 'name', width: 160, filterable: true, filterType: 'text' },
-		{ id: 'plcConnectionId', header: 'PLC接続', accessor: 'plcConnectionId', width: 90, align: 'right' },
+		{
+			id: 'name',
+			header: '名前',
+			accessor: 'name',
+			width: 160,
+			filterable: true,
+			filterType: 'text'
+		},
+		{
+			id: 'plcConnectionId',
+			header: 'PLC接続',
+			accessor: 'plcConnectionId',
+			width: 90,
+			align: 'right'
+		},
 		{ id: 'address', header: 'アドレス', accessor: 'address', width: 110 },
 		{ id: 'dataType', header: '型', accessor: 'dataType', width: 70 },
 		{ id: 'unit', header: '単位', accessor: 'unit', width: 80 },
@@ -233,7 +246,8 @@
 					<label class="field">
 						PLC接続ID
 						<input type="number" bind:value={createForm.plcConnectionId} />
-						{#if createErrors.plcConnectionId}<span class="err">{createErrors.plcConnectionId}</span>{/if}
+						{#if createErrors.plcConnectionId}<span class="err">{createErrors.plcConnectionId}</span
+							>{/if}
 					</label>
 					<label class="field">
 						アドレス
@@ -287,7 +301,9 @@
 		<section class="list">
 			<h3>一覧</h3>
 			<p class="note">
-				{canWrite ? '行をクリックすると下に編集パネルが表示されます。' : '閲覧のみ（編集には編集者以上の権限が必要です）。'}
+				{canWrite
+					? '行をクリックすると下に編集パネルが表示されます。'
+					: '閲覧のみ（編集には編集者以上の権限が必要です）。'}
 			</p>
 			{#if loading && targets.length === 0}
 				<p class="loading">読み込み中…</p>
@@ -315,7 +331,8 @@
 					<label class="field">
 						PLC接続ID
 						<input type="number" bind:value={editForm.plcConnectionId} />
-						{#if editErrors.plcConnectionId}<span class="err">{editErrors.plcConnectionId}</span>{/if}
+						{#if editErrors.plcConnectionId}<span class="err">{editErrors.plcConnectionId}</span
+							>{/if}
 					</label>
 					<label class="field">
 						アドレス

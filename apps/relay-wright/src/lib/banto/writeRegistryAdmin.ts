@@ -61,15 +61,7 @@ export interface WriteTargetInput {
 
 export type EdgeMode = 'rising' | 'falling' | 'change';
 export type WriteValueMode = 'constant' | 'copy_from_source';
-export type ConditionOperator =
-	| 'eq'
-	| 'neq'
-	| 'gt'
-	| 'gte'
-	| 'lt'
-	| 'lte'
-	| 'between'
-	| 'bit_is';
+export type ConditionOperator = 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte' | 'between' | 'bit_is';
 
 /** Mirrors `relay_wright_core::write_rule_conditions::WriteRuleCondition`. */
 export interface WriteRuleCondition {
@@ -226,10 +218,7 @@ export async function createWriteTarget(input: WriteTargetInput): Promise<WriteT
 	return httpRequest<WriteTarget>('/api/write-targets', { method: 'POST', body: input });
 }
 
-export async function updateWriteTarget(
-	id: number,
-	input: WriteTargetInput
-): Promise<WriteTarget> {
+export async function updateWriteTarget(id: number, input: WriteTargetInput): Promise<WriteTarget> {
 	if (!isWriteRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		return invokeCommand<WriteTarget>('write_targets_update', { id, input });
@@ -262,10 +251,7 @@ export async function createWriteRule(input: WriteRuleInput): Promise<WriteRuleD
 	return httpRequest<WriteRuleDetail>('/api/write-rules', { method: 'POST', body: input });
 }
 
-export async function updateWriteRule(
-	id: number,
-	input: WriteRuleInput
-): Promise<WriteRuleDetail> {
+export async function updateWriteRule(id: number, input: WriteRuleInput): Promise<WriteRuleDetail> {
 	if (!isWriteRegistryAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		return invokeCommand<WriteRuleDetail>('write_rules_update', { id, input });

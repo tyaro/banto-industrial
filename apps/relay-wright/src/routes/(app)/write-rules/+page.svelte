@@ -284,7 +284,14 @@
 
 	const columns: GridColumn<WriteRuleDetail>[] = [
 		{ id: 'id', header: 'ID', accessor: 'id', width: 60, align: 'right' },
-		{ id: 'name', header: '名前', accessor: 'name', width: 150, filterable: true, filterType: 'text' },
+		{
+			id: 'name',
+			header: '名前',
+			accessor: 'name',
+			width: 150,
+			filterable: true,
+			filterType: 'text'
+		},
 		{
 			id: 'enabled',
 			header: '有効',
