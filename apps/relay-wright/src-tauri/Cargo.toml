@@ -1,0 +1,66 @@
+[package]
+name = "relay-wright"
+description = "RelayWright Tauri app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "relay_wright_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+default = []
+# Passthrough to relay-wright-core's own `embed-ui` feature (spec §11.1).
+# OFF by default so a fresh clone's `cargo build`/`tauri dev` never requires
+# `pnpm --filter relay-wright build` to have already run - without it, the
+# embedded server (when LAN access is enabled) serves the small built-in
+# placeholder page instead of the real SvelteKit build. Build with
+# `tauri build --features embed-ui` (or `cargo build -p relay-wright
+# --features embed-ui`) AFTER `pnpm --filter relay-wright build` to embed
+# the real frontend so LAN clients get the actual UI, not the placeholder.
+embed-ui = ["relay-wright-core/embed-ui"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+banto-core = { workspace = true }
+banto-server = { workspace = true }
+relay-wright-core = { path = "../core" }
+tauri = { version = "2", features = [] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Only for naming `tokio::sync::broadcast::Sender<ServerEvent>` /
+# `tokio::sync::Mutex<Option<RunningServer>>` as AppState field types (spec
+# §3.5, §11.4) - tokio is already pulled in transitively via `tauri` and
+# `relay-wright-core`; this just makes a couple of its types nameable in
+# this crate's own source.
+tokio = { workspace = true, features = ["sync"] }
+qrcode = { workspace = true }
+futures-util = { workspace = true }
+# OS keyring storage for the auto-login credential (spec M11). See the
+# workspace `Cargo.toml`'s comment on this dependency for why it lives only
+# here and not on `relay-wright-core`.
+keyring = { workspace = true }
+
+# `#[tokio::test]` for this crate's own unit tests (spec M14: the
+# `change_own_password` audit-recording test) - the runtime/macros features
+# are test-only so the production dependency above stays "sync"-only.
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+# Spec M17 backup tests: `BackupService::create`'s `VACUUM INTO` needs a
+# real on-disk pool (see `relay-wright-core::backup`'s test module doc
+# comment for why `:memory:` does not work), so these tests cannot reuse
+# `app_state()`'s in-memory `init_db_memory()` - see `app_state_with_tempdir`.
+tempfile = { workspace = true }
+
+# Real window translucency for the glass theme (spec M12): Windows Acrylic
+# via `window_vibrancy::apply_acrylic`/`clear_acrylic`. Windows-only by
+# decision (docs/roadmap.md §6: macOS vibrancy は非スコープ), hence a
+# target-specific dependency table rather than a crate feature - non-Windows
+# builds never even compile the crate, and the `vibrancy_*` commands in
+# `src/lib.rs` `#[cfg]`-degrade to "not supported" there.
+[target.'cfg(target_os = "windows")'.dependencies]
+window-vibrancy = { workspace = true }

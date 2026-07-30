@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="ja">
+	<head>
+		<meta charset="utf-8" />
+		<link rel="icon" href="%sveltekit.assets%/favicon.svg" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<script>
+			// Apply the persisted theme + preset before first paint to avoid a
+			// flash. Storage keys must match src/lib/settings.svelte.ts.
+			(function () {
+				try {
+					var mode = localStorage.getItem('banto.theme') || 'system';
+					var dark =
+						mode === 'dark' ||
+						(mode === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
+					document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+					var preset = localStorage.getItem('banto.preset');
+					document.documentElement.dataset.bantoPreset = preset === 'glass' ? 'glass' : 'standard';
+				} catch (_) {
+					document.documentElement.dataset.theme = 'light';
+					document.documentElement.dataset.bantoPreset = 'standard';
+				}
+			})();
+		</script>
+		%sveltekit.head%
+	</head>
+	<body data-sveltekit-preload-data="hover">
+		<div style="display: contents">%sveltekit.body%</div>
+	</body>
+</html>

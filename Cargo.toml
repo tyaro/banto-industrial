@@ -1,8 +1,9 @@
 # banto-industrial workspace. Members are added milestone by milestone
 # (I1: banto-tags, I2: banto-plc, I3a: banto-tstore, I3b: banto-collect,
-# I4: banto-tsquery, R1-A: apps/chronogazer/{core,src-tauri} - see
-# docs/plan.md / docs/r1-plan.md). banto crates are consumed via git-tag
-# references (banto docs/publishing.md).
+# I4: banto-tsquery, R1-A: apps/chronogazer/{core,src-tauri}, W1:
+# apps/relay-wright/{core,src-tauri} - see docs/plan.md / docs/r1-plan.md /
+# the relay-wright plan `luminous-discovering-goblet.md`). banto crates are
+# consumed via git-tag references (banto docs/publishing.md).
 [workspace]
 resolver = "2"
 members = [
@@ -13,6 +14,8 @@ members = [
     "crates/banto-tsquery",
     "apps/chronogazer/core",
     "apps/chronogazer/src-tauri",
+    "apps/relay-wright/core",
+    "apps/relay-wright/src-tauri",
 ]
 
 [workspace.package]
@@ -56,10 +59,11 @@ rust-embed = "8"
 argon2 = "0.5"
 password-hash = { version = "0.5", features = ["getrandom"] }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
-# Desktop-only (apps/chronogazer/src-tauri, mirrors banto's own M11/M12
-# reasoning): OS keyring storage for auto-login + real window translucency.
-# Referenced only from src-tauri (not chronogazer-core), same CI/build
-# reasoning as banto's own workspace Cargo.toml comment on these two.
+# Desktop-only (apps/chronogazer/src-tauri and apps/relay-wright/src-tauri,
+# mirrors banto's own M11/M12 reasoning): OS keyring storage for auto-login
+# + real window translucency. Referenced only from src-tauri crates (not
+# their -core crates), same CI/build reasoning as banto's own workspace
+# Cargo.toml comment on these two.
 keyring = { version = "3", features = ["windows-native", "apple-native", "sync-secret-service"] }
 window-vibrancy = "0.6"
 # Dev-only: isolated temp dirs for filesystem-touching tests (backup
