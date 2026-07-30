@@ -124,7 +124,9 @@ async fn main() {
                 eprintln!("relay-wright-serve: 起動時の監査ログの剪定に失敗しました: {err}");
             }
         }
-        Err(err) => eprintln!("relay-wright-serve: 監査ログの保持設定の読み取りに失敗しました: {err}"),
+        Err(err) => {
+            eprintln!("relay-wright-serve: 監査ログの保持設定の読み取りに失敗しました: {err}")
+        }
     }
 
     let app = api_router(users, settings, audit, backup, auth, events, allow_setup)

@@ -391,11 +391,10 @@ mod tests {
         let pool = init_db_memory()
             .await
             .expect("init_db_memory should succeed");
-        let rows: Vec<(i64, i64)> =
-            sqlx::query_as("SELECT id, armed_persisted FROM armed_state")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        let rows: Vec<(i64, i64)> = sqlx::query_as("SELECT id, armed_persisted FROM armed_state")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 1, "expected exactly one armed_state row");
         assert_eq!(rows[0], (1, 0), "expected the seeded row to be disarmed");
     }

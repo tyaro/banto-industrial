@@ -24,6 +24,8 @@ use banto_core::{BantoError, FieldError, ListParams, ListResult};
 use banto_server::{
     lan_urls, start, static_router, AuthState, RunningServer, ServerConfig, ServerEvent,
 };
+use qrcode::render::svg;
+use qrcode::QrCode;
 use relay_wright_core::assets::FrontendAssets;
 use relay_wright_core::audit::{AuditEntry, AuditLogEntry, AuditLogService};
 use relay_wright_core::backup::{BackupInfo, BackupService, PendingRestoreInfo};
@@ -32,8 +34,6 @@ use relay_wright_core::events::event_channel;
 use relay_wright_core::rest::{api_router, audited_credential_verifier};
 use relay_wright_core::settings::{AuditSettings, AuthSettings, ServerSettings, SettingsService};
 use relay_wright_core::users::{Role, UserIdentity, UserSummary, UsersService};
-use qrcode::render::svg;
-use qrcode::QrCode;
 use serde::Serialize;
 use std::str::FromStr;
 use std::sync::Mutex;
