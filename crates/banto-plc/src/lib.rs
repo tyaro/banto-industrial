@@ -9,21 +9,30 @@
 //!
 //! ## Module map
 //!
-//! - [`address`]: PLC reference-number address parsing (`"40001"` ->
-//!   holding register offset 0), pure and thoroughly tested in isolation
+//! - [`address`]: the [`address::Address`] sum type and both notations'
+//!   parsers - Modbus reference numbers (`"40001"` -> holding register offset
+//!   0) and MELSEC device codes (`"D100"`) - pure and thoroughly tested in
+//!   isolation
 //! - [`types`]: the request/result/value shapes that cross the
 //!   `PlcClient` boundary
 //! - [`client`]: the `PlcClient` trait itself
 //! - [`planning`]: turns a flat tag list into the minimal set of wire reads
 //!   (register/coil grouping within Modbus's quantity limits) - this is
 //!   what makes 256-tag/100ms cycles (recorder-requirements.md §3.1)
-//!   feasible
+//!   feasible. [`slmp::planning`] is its MELSEC counterpart.
 //! - [`decode`]: raw register window -> typed value, including the
-//!   per-device word-order switch for 32-bit types
+//!   per-device word-order switch for 32-bit types. Shared by both protocol
+//!   implementations, which is why SLMP word groups are fetched as raw `u16`
+//!   windows rather than pre-typed by the wrapped crate.
 //! - [`modbus`]: the first protocol implementation
 //!   ([`modbus::ModbusTcpClient`]), chosen to go first for debuggability
-//!   (recorder-requirements.md §1); MELSEC MC/SLMP is the eventual primary
-//!   target and will land as a sibling module behind the same trait
+//!   (recorder-requirements.md §1)
+//! - [`slmp`]: the MELSEC MC/SLMP implementation ([`slmp::SlmpClient`], I2a) -
+//!   the eventual primary target, a sibling behind the same trait. Unlike
+//!   `modbus`, it wraps an external crate for the wire framing rather than
+//!   hand-implementing it; see its module doc for why, and for where the
+//!   connection-fatal/per-request line falls once someone else owns the
+//!   socket.
 //! - [`error`]: [`error::PlcError`], the one error type spanning both
 //!   whole-call (`Err`) and per-request (`ReadResult::Bad`) failures
 //!
@@ -33,7 +42,11 @@
 //!   out of scope for the recorder product (docs/recorder-requirements.md
 //!   §7) and a future write-capable client (e.g. for a recipe-download app,
 //!   docs/plan.md §3) should be its own trait/crate rather than an unused
-//!   footgun on every read-only consumer.
+//!   footgun on every read-only consumer. This holds even though the `slmp`
+//!   crate I2a added as a dependency implements write commands too: they are
+//!   simply not called from here, and I5's plan puts the write client in a
+//!   separate `banto-plc-write` crate with its own `PlcWriteClient` trait for
+//!   exactly this reason.
 //! - **No reconnect loop.** A connection-fatal error leaves the client in a
 //!   disconnected state (`PlcClient::read_batch` returns `Err`, further
 //!   calls return `PlcError::NotConnected`) and stays there until the
@@ -50,6 +63,7 @@ pub mod decode;
 pub mod error;
 pub mod modbus;
 pub mod planning;
+pub mod slmp;
 pub mod types;
 
 pub use address::{Address, AddressArea};
@@ -58,4 +72,7 @@ pub use decode::WordOrder;
 pub use error::PlcError;
 pub use modbus::{ModbusTcpClient, ModbusTcpConfig};
 pub use planning::{plan_requests, MappedRequest, PlanOutcome, PlannedRead};
+pub use slmp::address::{SlmpAccess, SlmpDevice};
+pub use slmp::planning::{plan_slmp_requests, SlmpMappedRequest, SlmpPlanOutcome, SlmpPlannedRead};
+pub use slmp::{SlmpClient, SlmpConfig, SlmpCpu};
 pub use types::{DataType, ReadRequest, ReadResult, TagValue};

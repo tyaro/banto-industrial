@@ -46,10 +46,24 @@ pub enum PlcError {
     #[error("応答タイムアウト")]
     ResponseTimeout,
 
-    /// [`crate::address::Address::parse`] rejected the given text (docs/plan.md
-    /// I2 §3: reference-number notation `0/1/3/4` + 4 or 5 digits).
+    /// [`crate::address::Address::parse`] or
+    /// [`crate::address::Address::parse_slmp`] rejected the given text
+    /// (docs/plan.md I2 §3: reference-number notation `0/1/3/4` + 4 or 5
+    /// digits; I2a: MELSEC device notation such as `D100`/`X1A`).
     #[error("アドレス形式が不正です: {0}")]
     InvalidAddress(String),
+
+    /// A [`crate::types::ReadRequest`] carries an address written in a
+    /// different protocol's notation than the client it was handed to speaks -
+    /// e.g. an [`crate::address::Address::Slmp`] address in a batch given to
+    /// [`crate::modbus::ModbusTcpClient`]. Means the `PlcConnection`'s
+    /// `protocol` column and the tag's `address` column disagree, so it is a
+    /// configuration error, resolved before any wire traffic and reported as a
+    /// per-request `ReadResult::Bad` exactly like
+    /// [`Self::UnsupportedCombination`] - one mis-configured tag must not cost
+    /// its batch-mates their reading.
+    #[error("アドレス表記 {actual} は {expected} クライアントでは扱えません")]
+    AddressProtocolMismatch { expected: String, actual: String },
 
     /// A [`crate::types::ReadRequest`]'s `data_type` cannot live in its
     /// `address`'s area - e.g. `DataType::F32` at a coil address, or
@@ -84,6 +98,21 @@ pub enum PlcError {
         code: u8,
         message: String,
     },
+
+    /// The MELSEC CPU answered one bulk read with a well-formed SLMP response
+    /// frame carrying a non-zero end code - e.g. `0xC059` (wrong command) or
+    /// `0xCEE1` (request too long) because a tag names a device number the CPU
+    /// does not have. The SLMP analogue of [`Self::ModbusException`], and
+    /// non-fatal for the same reason: the response was complete and
+    /// length-consistent (the wrapped `slmp` crate validates the frame's
+    /// declared data length against what arrived *before* it looks at the end
+    /// code), so the byte stream is still aligned to a request boundary and
+    /// every other group in the same `read_batch` call still gets its chance.
+    ///
+    /// See `src/slmp/mod.rs`'s module doc for how this is told apart from a
+    /// framing failure, which is fatal.
+    #[error("PLC異常応答: SLMP終了コード=0x{code:04X} ({message})")]
+    SlmpEndCode { code: u16, message: String },
 }
 
 impl PlcError {
@@ -91,14 +120,79 @@ impl PlcError {
     /// trusted" (docs/plan.md I2 §2: "再接続ループは持たない" - this crate
     /// does not reconnect itself, but it does need to know when *not* to
     /// keep using a stream, and to say so unambiguously to the caller so I3
-    /// knows a fresh `connect()` is required). [`Self::ModbusException`] and
-    /// [`Self::UnsupportedCombination`] are deliberately excluded - both are
-    /// per-request outcomes that leave the connection perfectly usable for
-    /// the next request/group.
+    /// knows a fresh `connect()` is required). The exclusions are exactly the
+    /// per-request outcomes, which leave the connection perfectly usable for
+    /// the next request/group: [`Self::ModbusException`] and
+    /// [`Self::SlmpEndCode`] (the device refused one specific read but
+    /// answered in full), plus [`Self::UnsupportedCombination`] and
+    /// [`Self::AddressProtocolMismatch`] (configuration errors resolved before
+    /// any wire traffic).
+    ///
+    /// Note the default is *fatal*: a variant added later is treated as
+    /// "stop using this socket" until someone deliberately lists it here,
+    /// which is the safe direction to be wrong in - a needless reconnect costs
+    /// one poll cycle, whereas decoding a desynchronized stream produces
+    /// plausible-looking wrong readings.
     pub(crate) fn is_connection_fatal(&self) -> bool {
         !matches!(
             self,
-            PlcError::ModbusException { .. } | PlcError::UnsupportedCombination { .. }
+            PlcError::ModbusException { .. }
+                | PlcError::SlmpEndCode { .. }
+                | PlcError::UnsupportedCombination { .. }
+                | PlcError::AddressProtocolMismatch { .. }
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`PlcError::is_connection_fatal`] is the single switch deciding whether
+    /// a failure costs one tag its reading or costs the whole connection, so
+    /// every variant's classification is pinned down explicitly rather than
+    /// left to the `!matches!` default.
+    #[test]
+    fn per_request_variants_are_not_connection_fatal() {
+        let per_request = [
+            PlcError::ModbusException {
+                function: 0x03,
+                code: 0x02,
+                message: "illegal data address".to_string(),
+            },
+            PlcError::SlmpEndCode {
+                code: 0xC059,
+                message: "WrongCommand".to_string(),
+            },
+            PlcError::UnsupportedCombination {
+                area: "holding_register".to_string(),
+                data_type: "bit".to_string(),
+            },
+            PlcError::AddressProtocolMismatch {
+                expected: "modbus-tcp".to_string(),
+                actual: "slmp".to_string(),
+            },
+        ];
+        for err in per_request {
+            assert!(
+                !err.is_connection_fatal(),
+                "{err:?} must stay a per-request Bad, not tear the connection down"
+            );
+        }
+    }
+
+    #[test]
+    fn connection_level_variants_are_connection_fatal() {
+        let fatal = [
+            PlcError::ConnectTimeout("host:502".to_string()),
+            PlcError::Connection("connection reset".to_string()),
+            PlcError::NotConnected,
+            PlcError::ResponseTimeout,
+            PlcError::Protocol("truncated frame".to_string()),
+            PlcError::InvalidAddress("bogus".to_string()),
+        ];
+        for err in fatal {
+            assert!(err.is_connection_fatal(), "{err:?} should be fatal");
+        }
     }
 }
