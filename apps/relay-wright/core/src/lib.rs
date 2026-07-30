@@ -11,4 +11,10 @@ pub mod db;
 pub mod events;
 pub mod rest;
 pub mod settings;
+// Crate-internal validation/error helpers shared by the write_* service
+// modules (not part of the public API - see `support.rs`'s doc comment).
+mod support;
 pub mod users;
+pub mod write_rule_conditions;
+pub mod write_rules;
+pub mod write_targets;

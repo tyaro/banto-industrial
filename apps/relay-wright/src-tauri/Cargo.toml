@@ -55,6 +55,13 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 # comment for why `:memory:` does not work), so these tests cannot reuse
 # `app_state()`'s in-memory `init_db_memory()` - see `app_state_with_tempdir`.
 tempfile = { workspace = true }
+# Plan W2 write-registry dual-path tests only: seed a `plc_connections` row
+# (via banto-tags' own service) that a write target must reference, and name
+# the shared `SqlitePool` type in a test helper. Both crates are already in
+# the workspace graph via `relay-wright-core`, so this adds nothing new to
+# `Cargo.lock`.
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
+banto-tags = { path = "../../../crates/banto-tags" }
 
 # Real window translucency for the glass theme (spec M12): Windows Acrylic
 # via `window_vibrancy::apply_acrylic`/`clear_acrylic`. Windows-only by

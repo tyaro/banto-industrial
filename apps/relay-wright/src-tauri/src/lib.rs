@@ -34,6 +34,8 @@ use relay_wright_core::events::event_channel;
 use relay_wright_core::rest::{api_router, audited_credential_verifier};
 use relay_wright_core::settings::{AuditSettings, AuthSettings, ServerSettings, SettingsService};
 use relay_wright_core::users::{Role, UserIdentity, UserSummary, UsersService};
+use relay_wright_core::write_rules::{WriteRuleDetail, WriteRuleInput, WriteRuleService};
+use relay_wright_core::write_targets::{WriteTarget, WriteTargetInput, WriteTargetService};
 use serde::Serialize;
 use std::str::FromStr;
 use std::sync::Mutex;
@@ -90,6 +92,13 @@ struct AppState {
     /// `restore-pending.sqlite3`'s location, see `crate::backup`'s doc
     /// comment).
     backup: BackupService,
+    /// Write-target registry (plan W2): the PLC devices this app may write
+    /// to. Same shared pool; viewer-read / editor-write, audited on both
+    /// paths (this Tauri path and `crate::rest`'s REST path).
+    write_targets: WriteTargetService,
+    /// Write-rule registry + its inline conditions (plan W2), with the
+    /// write-loop cycle-detection guard on save. Same shared pool.
+    write_rules: WriteRuleService,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -616,6 +625,8 @@ async fn start_embedded_server(
     settings: SettingsService,
     audit: AuditLogService,
     backup: BackupService,
+    write_targets: WriteTargetService,
+    write_rules: WriteRuleService,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
     config: ServerConfig,
@@ -624,8 +635,18 @@ async fn start_embedded_server(
     // the `auth_setup` command above (`invoke()`, no network involved), not
     // this REST endpoint. Only `relay-wright-serve` (this repo's Tauri-free dev
     // vehicle) opts into `POST /api/auth/setup` via `BANTO_ALLOW_SETUP=1`.
-    let router = api_router(users, settings, audit, backup, auth, events, false)
-        .merge(static_router::<FrontendAssets>());
+    let router = api_router(
+        users,
+        settings,
+        audit,
+        backup,
+        write_targets,
+        write_rules,
+        auth,
+        events,
+        false,
+    )
+    .merge(static_router::<FrontendAssets>());
     start(config, router).await
 }
 
@@ -672,6 +693,8 @@ async fn server_apply(
                 state.settings.clone(),
                 state.audit.clone(),
                 state.backup.clone(),
+                state.write_targets.clone(),
+                state.write_rules.clone(),
                 state.rest_auth.clone(),
                 state.events.clone(),
                 ServerConfig {
@@ -1257,6 +1280,232 @@ async fn backups_cancel_restore(state: State<'_, AppState>) -> Result<(), BantoE
     backups_cancel_restore_body(&state).await
 }
 
+// --- W2: write registry/rule CRUD -------------------------------------------
+//
+// The Tauri half of the dual-path (invariant §1 両経路対称): every mutation
+// below applies the SAME authorization floor (editor-write / viewer-read) and
+// the SAME audit entry (`origin: "tauri"`) as `crate::rest`'s REST handlers.
+// Reads use `require_role(Viewer, ..)` (any authenticated role); writes use
+// `require_role(Editor, ..)` and `record` a create/update/delete entry once
+// the underlying service call has already succeeded, exactly as the users
+// commands do. Each write body is split into a `*_body(&AppState, ..)` helper
+// so the audit behavior is testable with a plain `&AppState` in this crate's
+// own `cargo test` (see `change_own_password`'s precedent).
+
+/// `viewer`+ (spec M10): list write targets. Reads are never audited.
+#[tauri::command]
+async fn write_targets_list(state: State<'_, AppState>) -> Result<Vec<WriteTarget>, BantoError> {
+    require_role(&state, Role::Viewer, "write_targets").await?;
+    Ok(state.write_targets.list(ListParams::default()).await?.rows)
+}
+
+/// `viewer`+ (spec M10): fetch one write target.
+#[tauri::command]
+async fn write_targets_get(state: State<'_, AppState>, id: i64) -> Result<WriteTarget, BantoError> {
+    require_role(&state, Role::Viewer, "write_targets").await?;
+    state.write_targets.get(id).await
+}
+
+async fn write_targets_create_body(
+    state: &AppState,
+    input: WriteTargetInput,
+) -> Result<WriteTarget, BantoError> {
+    let actor = require_role(state, Role::Editor, "write_targets").await?;
+    let created = state.write_targets.create(input).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "create",
+            resource: "write_targets",
+            entity_id: Some(&created.id.to_string()),
+            detail: Some(serde_json::json!({ "name": created.name })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(created)
+}
+
+/// `editor`+ (spec M10): create a write target.
+#[tauri::command]
+async fn write_targets_create(
+    state: State<'_, AppState>,
+    input: WriteTargetInput,
+) -> Result<WriteTarget, BantoError> {
+    write_targets_create_body(&state, input).await
+}
+
+async fn write_targets_update_body(
+    state: &AppState,
+    id: i64,
+    input: WriteTargetInput,
+) -> Result<WriteTarget, BantoError> {
+    let actor = require_role(state, Role::Editor, "write_targets").await?;
+    let updated = state.write_targets.update(id, input).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "update",
+            resource: "write_targets",
+            entity_id: Some(&id.to_string()),
+            detail: Some(serde_json::json!({ "name": updated.name })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(updated)
+}
+
+/// `editor`+ (spec M10): update a write target.
+#[tauri::command]
+async fn write_targets_update(
+    state: State<'_, AppState>,
+    id: i64,
+    input: WriteTargetInput,
+) -> Result<WriteTarget, BantoError> {
+    write_targets_update_body(&state, id, input).await
+}
+
+async fn write_targets_delete_body(state: &AppState, id: i64) -> Result<(), BantoError> {
+    let actor = require_role(state, Role::Editor, "write_targets").await?;
+    state.write_targets.delete(id).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "delete",
+            resource: "write_targets",
+            entity_id: Some(&id.to_string()),
+            detail: None,
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(())
+}
+
+/// `editor`+ (spec M10): delete a write target. Refuses when a rule still
+/// targets it (`WriteTargetService::delete`'s guard).
+#[tauri::command]
+async fn write_targets_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoError> {
+    write_targets_delete_body(&state, id).await
+}
+
+/// `viewer`+ (spec M10): list write rules (each with its conditions).
+#[tauri::command]
+async fn write_rules_list(state: State<'_, AppState>) -> Result<Vec<WriteRuleDetail>, BantoError> {
+    require_role(&state, Role::Viewer, "write_rules").await?;
+    Ok(state.write_rules.list(ListParams::default()).await?.rows)
+}
+
+/// `viewer`+ (spec M10): fetch one write rule with its conditions.
+#[tauri::command]
+async fn write_rules_get(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<WriteRuleDetail, BantoError> {
+    require_role(&state, Role::Viewer, "write_rules").await?;
+    state.write_rules.get(id).await
+}
+
+async fn write_rules_create_body(
+    state: &AppState,
+    input: WriteRuleInput,
+) -> Result<WriteRuleDetail, BantoError> {
+    let actor = require_role(state, Role::Editor, "write_rules").await?;
+    let created = state.write_rules.create(input).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "create",
+            resource: "write_rules",
+            entity_id: Some(&created.rule.id.to_string()),
+            detail: Some(
+                serde_json::json!({ "name": created.rule.name, "enabled": created.rule.enabled }),
+            ),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(created)
+}
+
+/// `editor`+ (spec M10): create a write rule (with the write-loop cycle guard).
+#[tauri::command]
+async fn write_rules_create(
+    state: State<'_, AppState>,
+    input: WriteRuleInput,
+) -> Result<WriteRuleDetail, BantoError> {
+    write_rules_create_body(&state, input).await
+}
+
+async fn write_rules_update_body(
+    state: &AppState,
+    id: i64,
+    input: WriteRuleInput,
+) -> Result<WriteRuleDetail, BantoError> {
+    let actor = require_role(state, Role::Editor, "write_rules").await?;
+    let updated = state.write_rules.update(id, input).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "update",
+            resource: "write_rules",
+            entity_id: Some(&id.to_string()),
+            detail: Some(
+                serde_json::json!({ "name": updated.rule.name, "enabled": updated.rule.enabled }),
+            ),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(updated)
+}
+
+/// `editor`+ (spec M10): update a write rule (with the write-loop cycle guard).
+#[tauri::command]
+async fn write_rules_update(
+    state: State<'_, AppState>,
+    id: i64,
+    input: WriteRuleInput,
+) -> Result<WriteRuleDetail, BantoError> {
+    write_rules_update_body(&state, id, input).await
+}
+
+async fn write_rules_delete_body(state: &AppState, id: i64) -> Result<(), BantoError> {
+    let actor = require_role(state, Role::Editor, "write_rules").await?;
+    state.write_rules.delete(id).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "delete",
+            resource: "write_rules",
+            entity_id: Some(&id.to_string()),
+            detail: None,
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(())
+}
+
+/// `editor`+ (spec M10): delete a write rule (its conditions cascade).
+#[tauri::command]
+async fn write_rules_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoError> {
+    write_rules_delete_body(&state, id).await
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -1290,6 +1539,8 @@ pub fn run() {
             let users = UsersService::new(pool.clone());
             let settings = SettingsService::new(pool.clone());
             let backup = BackupService::new(db_path.clone(), pool.clone());
+            let write_targets = WriteTargetService::new(pool.clone());
+            let write_rules = WriteRuleService::new(pool.clone());
             let audit = AuditLogService::new(pool);
             // Records `login`/`login_failed` audit entries (spec M14) from
             // inside the verifier itself - see
@@ -1492,6 +1743,8 @@ pub fn run() {
                     settings.clone(),
                     audit.clone(),
                     backup.clone(),
+                    write_targets.clone(),
+                    write_rules.clone(),
                     rest_auth.clone(),
                     events.clone(),
                     runtime_config,
@@ -1554,6 +1807,8 @@ pub fn run() {
                 server: AsyncMutex::new(initial_server),
                 audit,
                 backup,
+                write_targets,
+                write_rules,
             });
 
             Ok(())
@@ -1593,6 +1848,16 @@ pub fn run() {
             backups_stage_restore,
             backups_pending,
             backups_cancel_restore,
+            write_targets_list,
+            write_targets_get,
+            write_targets_create,
+            write_targets_update,
+            write_targets_delete,
+            write_rules_list,
+            write_rules_get,
+            write_rules_create,
+            write_rules_update,
+            write_rules_delete,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1623,8 +1888,10 @@ mod tests {
             audit: AuditLogService::new(pool.clone()),
             backup: BackupService::new(
                 PathBuf::from("unused-in-tests").join("relay-wright.sqlite3"),
-                pool,
+                pool.clone(),
             ),
+            write_targets: WriteTargetService::new(pool.clone()),
+            write_rules: WriteRuleService::new(pool),
         }
     }
 
@@ -1652,7 +1919,9 @@ mod tests {
             }),
             server: AsyncMutex::new(None),
             audit: AuditLogService::new(pool.clone()),
-            backup: BackupService::new(db_path, pool),
+            backup: BackupService::new(db_path, pool.clone()),
+            write_targets: WriteTargetService::new(pool.clone()),
+            write_rules: WriteRuleService::new(pool),
         };
         (state, dir)
     }
@@ -1839,6 +2108,140 @@ mod tests {
                 .any(|r| r.action == "restore_cancelled"),
             "expected a restore_cancelled entry, got {:?}",
             audit_after_cancel.rows
+        );
+    }
+
+    // --- W2: write registry dual-path symmetry (Tauri half) -----------------
+
+    /// The Tauri half of the W2 create+audit symmetry (its REST twin is
+    /// `relay_wright_core::rest`'s `rest_editor_can_create_write_target_and_it_is_audited`):
+    /// an `editor` session can create a write target via the command body,
+    /// and it is recorded to the SAME audit log with `origin: "tauri"`.
+    /// Like [`app_state`], but returns the shared pool too, so a test can
+    /// seed cross-lineage rows (e.g. a `plc_connections` row a write target
+    /// must reference) that no command exposes a way to create.
+    async fn app_state_with_pool() -> (AppState, sqlx::SqlitePool) {
+        let pool = relay_wright_core::db::init_db_memory()
+            .await
+            .expect("init_db_memory");
+        let events = event_channel();
+        let state = AppState {
+            auth: Mutex::new(None),
+            users: UsersService::new(pool.clone()),
+            settings: SettingsService::new(pool.clone()),
+            events,
+            rest_auth: AuthState::new(|_u: String, _p: String| {
+                Box::pin(async { None::<banto_server::Identity> })
+            }),
+            server: AsyncMutex::new(None),
+            audit: AuditLogService::new(pool.clone()),
+            backup: BackupService::new(
+                PathBuf::from("unused-in-tests").join("relay-wright.sqlite3"),
+                pool.clone(),
+            ),
+            write_targets: WriteTargetService::new(pool.clone()),
+            write_rules: WriteRuleService::new(pool.clone()),
+        };
+        (state, pool)
+    }
+
+    #[tokio::test]
+    async fn write_targets_create_is_recorded_with_tauri_origin() {
+        use banto_tags::{PlcConnectionInput, PlcConnectionService};
+
+        let (state, pool) = app_state_with_pool().await;
+        // A PLC connection for the target to reference (validated at the
+        // service layer since it is a cross-lineage reference).
+        let conn = PlcConnectionService::new(pool)
+            .create(PlcConnectionInput {
+                name: "PLC1".to_string(),
+                protocol: "modbus-tcp".to_string(),
+                host: "10.0.0.1".to_string(),
+                port: 502,
+                unit_id: 1,
+                enabled: true,
+            })
+            .await
+            .expect("seed plc connection");
+
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create editor");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+
+        let created = write_targets_create_body(
+            &state,
+            WriteTargetInput {
+                name: "WT1".to_string(),
+                plc_connection_id: conn.id,
+                address: "D100".to_string(),
+                data_type: "i16".to_string(),
+                raw_lo: None,
+                raw_hi: None,
+                eng_lo: None,
+                eng_hi: None,
+                unit: None,
+                decimals: 0,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("editor create should succeed");
+        assert_eq!(created.name, "WT1");
+
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        let entry = entries
+            .rows
+            .iter()
+            .find(|r| r.action == "create" && r.resource == "write_targets")
+            .expect("expected a write_targets create audit entry");
+        assert_eq!(entry.origin, "tauri");
+        assert_eq!(entry.result, "ok");
+        assert_eq!(entry.actor_username.as_deref(), Some("editor"));
+    }
+
+    /// A `viewer` session is denied (and the denial audited) when creating a
+    /// write target - the Tauri twin of the REST `require_editor` denial.
+    #[tokio::test]
+    async fn write_targets_create_denies_viewer_and_audits_it() {
+        let state = app_state().await;
+        let viewer = state
+            .users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create viewer");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+
+        let err = write_targets_create_body(
+            &state,
+            WriteTargetInput {
+                name: "WT1".to_string(),
+                plc_connection_id: 1,
+                address: "D100".to_string(),
+                data_type: "i16".to_string(),
+                raw_lo: None,
+                raw_hi: None,
+                eng_lo: None,
+                eng_hi: None,
+                unit: None,
+                decimals: 0,
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, BantoError::Forbidden));
+
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        assert!(
+            entries
+                .rows
+                .iter()
+                .any(|r| r.action == "denied" && r.resource == "write_targets"),
+            "expected a denied entry, got {:?}",
+            entries.rows
         );
     }
 }
