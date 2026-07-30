@@ -22,6 +22,13 @@
 //! restriction: bit types only in coil/discrete-input areas, everything
 //! else only in register areas - docs/plan.md I2 §4) never reach the wire at
 //! all: they are resolved immediately into [`PlanOutcome::immediate_bad`].
+//! Since I2a the same is true of a request carrying a non-Modbus
+//! [`crate::address::Address`] variant: this planner only understands
+//! reference-number addressing, so an SLMP address here means the tag and its
+//! `PlcConnection`'s protocol disagree, and it becomes an immediate
+//! [`PlcError::AddressProtocolMismatch`] rather than being coerced into some
+//! register offset. [`crate::slmp::planning::plan_slmp_requests`] is the
+//! mirror-image function for the other variant.
 
 use std::collections::BTreeMap;
 
@@ -135,18 +142,31 @@ pub fn plan_requests(requests: &[ReadRequest]) -> PlanOutcome {
     // BTreeMap (not HashMap) so areas - and therefore the resulting
     // `reads` order - come out deterministic, which keeps tests and any
     // future request-count metrics stable across runs.
-    let mut by_area: BTreeMap<AddressArea, Vec<(usize, &ReadRequest)>> = BTreeMap::new();
+    // `(index, offset, data_type)` per area: the offset is resolved up front
+    // so the sort below (and the grouping loop) never has to re-match on the
+    // `Address` variant it has already proven is `ModbusRef`.
+    let mut by_area: BTreeMap<AddressArea, Vec<(usize, u16, DataType)>> = BTreeMap::new();
     for (index, req) in requests.iter().enumerate() {
-        if is_compatible(req.address.area, req.data_type) {
+        let Some((area, offset)) = req.address.as_modbus_ref() else {
+            immediate_bad.push((
+                index,
+                PlcError::AddressProtocolMismatch {
+                    expected: "modbus-tcp".to_string(),
+                    actual: req.address.notation().to_string(),
+                },
+            ));
+            continue;
+        };
+        if is_compatible(area, req.data_type) {
             by_area
-                .entry(req.address.area)
+                .entry(area)
                 .or_default()
-                .push((index, req));
+                .push((index, offset, req.data_type));
         } else {
             immediate_bad.push((
                 index,
                 PlcError::UnsupportedCombination {
-                    area: req.address.area.to_string(),
+                    area: area.to_string(),
                     data_type: req.data_type.to_string(),
                 },
             ));
@@ -155,13 +175,13 @@ pub fn plan_requests(requests: &[ReadRequest]) -> PlanOutcome {
 
     let mut reads = Vec::new();
     for (area, mut items) in by_area {
-        items.sort_by_key(|(_, req)| req.address.offset);
+        items.sort_by_key(|(_, offset, _)| *offset);
         let max_count = max_count_for(area) as u32;
         let mut current: Option<Building> = None;
 
-        for (index, req) in items {
-            let span = req.data_type.register_span() as u32;
-            let start = req.address.offset as u32;
+        for (index, offset, data_type) in items {
+            let span = data_type.register_span() as u32;
+            let start = offset as u32;
             let end = start + span;
 
             let fits_current = current
@@ -186,7 +206,7 @@ pub fn plan_requests(requests: &[ReadRequest]) -> PlanOutcome {
             group.mapping.push(MappedRequest {
                 request_index: index,
                 offset_in_read: (start - group.start) as u16,
-                data_type: req.data_type,
+                data_type,
             });
         }
 
@@ -208,7 +228,7 @@ mod tests {
 
     fn req(area: AddressArea, offset: u16, data_type: DataType) -> ReadRequest {
         ReadRequest {
-            address: Address { area, offset },
+            address: Address::ModbusRef { area, offset },
             data_type,
         }
     }
@@ -420,6 +440,35 @@ mod tests {
         let outcome = plan_requests(&[]);
         assert!(outcome.reads.is_empty());
         assert!(outcome.immediate_bad.is_empty());
+    }
+
+    /// I2a: an SLMP address can now reach this Modbus-only planner if a
+    /// connection's `protocol` and a tag's `address` disagree. It must be
+    /// resolved here, without wire traffic, and without taking its
+    /// batch-mates down with it.
+    #[test]
+    fn an_slmp_address_is_immediately_bad_for_the_modbus_planner() {
+        let requests = [
+            ReadRequest {
+                address: Address::parse_slmp("D100").unwrap(),
+                data_type: DataType::U16,
+            },
+            req(AddressArea::HoldingRegister, 0, DataType::I16),
+        ];
+        let outcome = plan_requests(&requests);
+
+        assert_eq!(outcome.immediate_bad.len(), 1);
+        assert_eq!(outcome.immediate_bad[0].0, 0);
+        match &outcome.immediate_bad[0].1 {
+            PlcError::AddressProtocolMismatch { expected, actual } => {
+                assert_eq!(expected, "modbus-tcp");
+                assert_eq!(actual, "slmp");
+            }
+            other => panic!("expected AddressProtocolMismatch, got {other:?}"),
+        }
+
+        assert_eq!(outcome.reads.len(), 1);
+        assert_eq!(outcome.reads[0].mapping[0].request_index, 1);
     }
 
     #[test]

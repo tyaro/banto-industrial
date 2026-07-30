@@ -1,11 +1,26 @@
 //! PLC connection (recorder-requirements.md §1 "対象環境"): one PLC endpoint
-//! that a [`crate::collection_group::CollectionGroup`] reads from. v1 only
-//! ever creates `protocol = "modbus-tcp"` rows (Modbus TCP chosen first for
-//! debuggability - plan.md §3's I2 decision); the column is `TEXT` + `CHECK`
-//! (migration `0001_plc_connections.sql`) rather than a Rust enum so adding
-//! `"slmp"` (MELSEC MC protocol, the eventual primary target) later only
-//! needs a migration + widening [`ALLOWED_PROTOCOLS`], not a schema type
-//! change.
+//! that a [`crate::collection_group::CollectionGroup`] reads from.
+//!
+//! `protocol` is `TEXT` + `CHECK` rather than a Rust enum precisely so that
+//! adding a protocol is a migration plus a widened [`ALLOWED_PROTOCOLS`], not
+//! a schema type change - and I2a is that prediction coming true: `"slmp"`
+//! (MELSEC MC protocol, the eventual primary target -
+//! `banto_plc::slmp::SlmpClient`) joined `"modbus-tcp"` (chosen first for
+//! debuggability, plan.md §3's I2 decision) in migration
+//! `0004_plc_connections_allow_slmp.sql`. That migration is worth reading
+//! before adding a third: SQLite cannot `ALTER` a `CHECK`, so widening it means
+//! rebuilding the table, and the ordering constraints there are not obvious.
+//!
+//! Which protocol a row names determines how its tags' `address` text is
+//! parsed - `banto_plc::Address::parse` for `"modbus-tcp"` (`"40001"`),
+//! `banto_plc::Address::parse_slmp` for `"slmp"` (`"D100"`). The two notations
+//! do not overlap, so a mismatch surfaces as a per-tag error rather than a
+//! misdirected read.
+//!
+//! [`PlcConnection::unit_id`] is Modbus-specific (a slave id inherited from
+//! RTU gateways). SLMP has no equivalent single byte - its station addressing
+//! is the network/PC/IO/area access route in `banto_plc::slmp::SlmpConfig` - so
+//! `"slmp"` rows simply carry the column's default.
 
 use banto_core::{BantoError, FieldError, ListParams, ListResult};
 use banto_storage::ColumnMap;
@@ -14,11 +29,14 @@ use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
 use crate::support::{map_write_error, max_length_message, range_message, required_message};
 
-/// Protocols accepted in `plc_connections.protocol` today (mirrors the SQL
-/// `CHECK` in `migrations/0001_plc_connections.sql`) - kept in Rust too so
-/// [`validate_plc_connection_input`] produces a friendly `FieldError`
-/// instead of surfacing the raw SQLite CHECK constraint violation.
-pub const ALLOWED_PROTOCOLS: &[&str] = &["modbus-tcp"];
+/// Protocols accepted in `plc_connections.protocol` today. Mirrors the SQL
+/// `CHECK` - as widened by `migrations/0004_plc_connections_allow_slmp.sql`,
+/// not `0001`'s original - and is kept in Rust too so
+/// [`validate_plc_connection_input`] produces a friendly `FieldError` instead
+/// of surfacing the raw SQLite CHECK constraint violation. The two must be
+/// changed together; `every_allowed_protocol_is_accepted_by_the_sql_check` is
+/// the tripwire if they drift.
+pub const ALLOWED_PROTOCOLS: &[&str] = &["modbus-tcp", "slmp"];
 
 const MAX_NAME_LEN: usize = 100;
 const MIN_PORT: i64 = 1;
@@ -357,11 +375,16 @@ mod tests {
         }
     }
 
+    /// Used `"slmp"` as its example of a not-yet-allowed value until I2a made
+    /// `"slmp"` valid; `"ethernet-ip"` stands in now. Deliberately a protocol
+    /// that plausibly *could* be added one day (rather than a nonsense string),
+    /// so this keeps testing the real failure mode - a protocol nobody has
+    /// implemented yet - and will need the same flip if EtherNet/IP ever lands.
     #[tokio::test]
     async fn create_rejects_unknown_protocol() {
         let svc = service().await;
         let mut input = sample_input("X");
-        input.protocol = "slmp".to_string();
+        input.protocol = "ethernet-ip".to_string();
         let err = svc.create(input).await.unwrap_err();
         match err {
             BantoError::Validation { field_errors } => {
@@ -369,6 +392,250 @@ mod tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
+    }
+
+    /// I2a: `"slmp"` is now a real protocol (`banto_plc::slmp::SlmpClient`), so
+    /// it must survive both the Rust validation *and* the SQL `CHECK` - which
+    /// only a round trip through the database can prove, since the two are
+    /// separate declarations of the same rule.
+    #[tokio::test]
+    async fn create_accepts_slmp() {
+        let svc = service().await;
+        let mut input = sample_input("MELSEC Line2");
+        input.protocol = "slmp".to_string();
+        input.port = 5007;
+        let created = svc
+            .create(input)
+            .await
+            .expect("slmp should be accepted since migration 0004");
+        assert_eq!(created.protocol, "slmp");
+
+        let fetched = svc.get(created.id).await.expect("get should succeed");
+        assert_eq!(fetched.protocol, "slmp");
+    }
+
+    #[tokio::test]
+    async fn update_can_switch_a_connection_between_protocols() {
+        let svc = service().await;
+        let created = svc.create(sample_input("Switcher")).await.unwrap();
+        assert_eq!(created.protocol, "modbus-tcp");
+
+        let mut input = sample_input("Switcher");
+        input.protocol = "slmp".to_string();
+        let updated = svc.update(created.id, input).await.expect("update to slmp");
+        assert_eq!(updated.protocol, "slmp");
+
+        let mut back = sample_input("Switcher");
+        back.protocol = "modbus-tcp".to_string();
+        let updated = svc
+            .update(created.id, back)
+            .await
+            .expect("update back to modbus-tcp");
+        assert_eq!(updated.protocol, "modbus-tcp");
+    }
+
+    /// [`ALLOWED_PROTOCOLS`] and the SQL `CHECK` are two hand-written copies of
+    /// one rule. This is the tripwire for them drifting: it inserts every
+    /// allowed protocol through the service (so both copies are exercised), and
+    /// fails if the Rust list has grown past what the schema accepts.
+    #[tokio::test]
+    async fn every_allowed_protocol_is_accepted_by_the_sql_check() {
+        let svc = service().await;
+        for (i, protocol) in ALLOWED_PROTOCOLS.iter().enumerate() {
+            let mut input = sample_input(&format!("conn{i}"));
+            input.protocol = (*protocol).to_string();
+            let created = svc.create(input).await.unwrap_or_else(|e| {
+                panic!("{protocol} is in ALLOWED_PROTOCOLS but the SQL CHECK rejected it: {e:?}")
+            });
+            assert_eq!(&created.protocol, protocol);
+        }
+    }
+
+    /// The reverse direction: a protocol the SQL `CHECK` would accept must not
+    /// be missing from [`ALLOWED_PROTOCOLS`], or callers would get SQLite's raw
+    /// constraint-violation text instead of a field-level message. Bypasses the
+    /// service layer deliberately - that is the only way to ask the schema
+    /// directly what it allows.
+    #[tokio::test]
+    async fn the_sql_check_accepts_nothing_beyond_allowed_protocols() {
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect_sqlite_memory");
+        migrate(&pool).await.expect("migrate");
+
+        for protocol in ["ethernet-ip", "opc-ua", "", "MODBUS-TCP", "SLMP"] {
+            let result = sqlx::query(
+                "INSERT INTO plc_connections (name, protocol, host, port) VALUES (?, ?, '1.2.3.4', 502)",
+            )
+            .bind(protocol)
+            .bind(protocol)
+            .execute(&pool)
+            .await;
+            assert!(
+                result.is_err(),
+                "the SQL CHECK accepted {protocol:?}, which is not in ALLOWED_PROTOCOLS"
+            );
+        }
+    }
+
+    /// Migration 0004 rebuilds `plc_connections` (SQLite cannot `ALTER` a
+    /// `CHECK`), and every other test in this crate only ever runs it against an
+    /// *empty* database - where a broken rebuild passes unnoticed, because with
+    /// no rows there are no foreign keys to violate. This is the test that
+    /// actually exercises it: a hand-built copy of the pre-0004 schema, seeded
+    /// with a `plc_connections` row, a `collection_groups` row referencing it,
+    /// and a `tags` row referencing *that*, so both `ON DELETE RESTRICT` links
+    /// the migration has to work around are live.
+    ///
+    /// Faithfulness matters more than convenience here, since 0004's whole shape
+    /// is dictated by the environment sqlx runs it in (see the migration's
+    /// header). So it is applied the way `Migrate::apply` in sqlx-sqlite applies
+    /// it: the entire file, as one multi-statement `execute`, on a single pinned
+    /// connection, inside one transaction. Running it statement-by-statement off
+    /// the pool would be *easier* and would prove nothing - a `SqlitePool` hands
+    /// out different connections per call, so connection-scoped state would not
+    /// carry over.
+    ///
+    /// The SQL comes from `include_str!` rather than being restated, so this
+    /// cannot drift into passing against a stale copy.
+    #[tokio::test]
+    async fn migration_0004_preserves_rows_and_foreign_keys_on_a_populated_database() {
+        use sqlx::{Acquire, Executor};
+
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect_sqlite_memory");
+        let mut conn = pool.acquire().await.expect("acquire one pinned connection");
+
+        // The schema as of 0003, i.e. what a deployed v1 database looks like.
+        for (label, sql) in [
+            ("0001", include_str!("../migrations/0001_plc_connections.sql")),
+            (
+                "0002",
+                include_str!("../migrations/0002_collection_groups.sql"),
+            ),
+            ("0003", include_str!("../migrations/0003_tags.sql")),
+        ] {
+            conn.execute(sql)
+                .await
+                .unwrap_or_else(|e| panic!("pre-0004 migration {label} failed: {e}"));
+        }
+
+        // Non-default values throughout, so a column dropped or transposed by
+        // the rebuild shows up as a mismatch rather than coinciding with a
+        // default.
+        conn.execute(
+            "INSERT INTO plc_connections (id, name, protocol, host, port, unit_id, enabled) \
+             VALUES (7, 'Line1 PLC', 'modbus-tcp', '192.168.1.10', 502, 3, 0)",
+        )
+        .await
+        .expect("seed connection");
+        conn.execute(
+            "INSERT INTO collection_groups (id, name, plc_connection_id, period_ms, enabled) \
+             VALUES (4, 'G1', 7, 1000, 1)",
+        )
+        .await
+        .expect("seed collection group");
+        conn.execute(
+            "INSERT INTO tags (id, name, collection_group_id, address, data_type, \
+             raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, threshold_h, enabled) \
+             VALUES (9, 'T1', 4, '40001', 'i16', 0, 100, 0, 50, 'degC', 2, 45, 1)",
+        )
+        .await
+        .expect("seed tag");
+
+        let migration = include_str!("../migrations/0004_plc_connections_allow_slmp.sql");
+        let mut tx = conn.begin().await.expect("begin, as the migrator does");
+        tx.execute(migration).await.expect("0004 should apply");
+        tx.commit().await.expect("0004 should commit");
+
+        // Every column of the existing connection survived, values and all.
+        let row: (i64, String, String, String, i64, i64, bool) = sqlx::query_as(
+            "SELECT id, name, protocol, host, port, unit_id, enabled FROM plc_connections",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the seeded connection should have been copied across");
+        assert_eq!(
+            row,
+            (
+                7,
+                "Line1 PLC".to_string(),
+                "modbus-tcp".to_string(),
+                "192.168.1.10".to_string(),
+                502,
+                3,
+                false
+            )
+        );
+
+        // Both descendant rows are back, unchanged, with their foreign keys
+        // resolving - this is what 0004's park-and-restore ordering protects.
+        let group: (i64, String, i64, i64, bool) = sqlx::query_as(
+            "SELECT id, name, plc_connection_id, period_ms, enabled FROM collection_groups",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the collection group should survive");
+        assert_eq!(group, (4, "G1".to_string(), 7, 1000, true));
+
+        let tag: (i64, String, i64, String, String, Option<f64>, i64) = sqlx::query_as(
+            "SELECT id, name, collection_group_id, address, data_type, threshold_h, decimals \
+             FROM tags",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the tag should survive");
+        assert_eq!(
+            tag,
+            (
+                9,
+                "T1".to_string(),
+                4,
+                "40001".to_string(),
+                "i16".to_string(),
+                Some(45.0),
+                2
+            )
+        );
+
+        let violations: Vec<(String,)> = sqlx::query_as("PRAGMA foreign_key_check")
+            .fetch_all(&mut *conn)
+            .await
+            .expect("foreign_key_check");
+        assert!(
+            violations.is_empty(),
+            "the rebuild left dangling foreign keys: {violations:?}"
+        );
+
+        // Foreign keys are still *enforced*, not merely currently consistent.
+        assert!(
+            sqlx::query(
+                "INSERT INTO collection_groups (name, plc_connection_id, period_ms) \
+                 VALUES ('orphan', 999, 1000)",
+            )
+            .execute(&mut *conn)
+            .await
+            .is_err(),
+            "foreign keys should still be enforced after the migration"
+        );
+
+        // The point of the whole exercise: 'slmp' is now insertable, and
+        // nothing else new is.
+        sqlx::query(
+            "INSERT INTO plc_connections (name, protocol, host, port) \
+             VALUES ('MELSEC', 'slmp', '192.168.1.20', 5007)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("slmp should be accepted after the rebuild");
+        assert!(sqlx::query(
+            "INSERT INTO plc_connections (name, protocol, host, port) \
+             VALUES ('Nope', 'ethernet-ip', '192.168.1.30', 44818)",
+        )
+        .execute(&mut *conn)
+        .await
+        .is_err());
     }
 
     #[tokio::test]

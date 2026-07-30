@@ -14,7 +14,7 @@
 ```
 crates/
   banto-tags/        I1: タグレジストリ（PLC接続/収集グループ/タグの定義・型・スケーリング）実装済み
-  banto-plc/         I2: PLC通信（読み取り専用。trait + Modbus TCP 実装済み、MC/SLMP 続行）実装済み
+  banto-plc/         I2/I2a: PLC通信（読み取り専用。trait + Modbus TCP + MELSEC MC/SLMP）実装済み
   banto-tstore/      I3a: 時系列ストレージ（日次ファイル+スキーマ凍結の自己記述的SQLite）実装済み
   banto-collect/     I3b: 収集エンジン（PLC定期読み出し→banto-tstore書き込み、現在値・イベント供給）実装済み
   banto-tsquery/     I4: 期間クエリ + サーバ側 min/max 間引き（read_range/read_decimated/aggregate/catalog）実装済み
@@ -32,27 +32,42 @@ CRUD/一覧サービス + スケーリング純関数（`scale_raw`/`unscale`）
 詳細は [crates/banto-tags/src/lib.rs](crates/banto-tags/src/lib.rs) の
 モジュールドキュメントを参照。
 
-### `banto-plc`（I2）
+### `banto-plc`（I2 / I2a）
 
 読み取り専用・一括読み出しの PLC 通信クライアント。プロトコル差し替えの
 境界は [`PlcClient`](crates/banto-plc/src/client.rs) trait（`dyn` 互換に
 手書き - I3 が `Box<dyn PlcClient>` で複数 PLC を並行保持する前提）。
-先行実装は Modbus TCP（[`ModbusTcpClient`](crates/banto-plc/src/modbus/mod.rs)、
-外部 `modbus` クレート不使用の自前実装、FC1-4 のみ）。MELSEC MC/SLMP は
-同 trait の実装として後続追加予定（docs/plan.md I2）。
+同 trait の実装が2本ある:
 
-- アドレス表記（`crates/banto-plc/src/address.rs`）: 計装の参照番号方式
-  （`0/1/3/4` + 4or5桁、`40001` → 保持レジスタ offset 0）を純関数でパース
-- 要求プランニング（`crates/banto-plc/src/planning.rs`）: 近接タグを1回の
-  FC 要求へ結合（間隙許容・Modbus上限で分割）、応答→各タグへの逆写像まで
-  純関数で設計。256タグ/100ms 収集の実現可否はここが握る
+- **Modbus TCP**（[`ModbusTcpClient`](crates/banto-plc/src/modbus/mod.rs)、I2）:
+  外部 `modbus` クレート不使用の自前実装、FC1-4 のみ。デバッグ容易性を
+  優先して先行実装（docs/plan.md I2）
+- **MELSEC MC/SLMP**（[`SlmpClient`](crates/banto-plc/src/slmp/mod.rs)、I2a）:
+  本命ターゲット。フレーミングは承認済み外部クレート `slmp`（MIT）を
+  ラップし、この crate 側は「何を読むか」（プランニング）と「どう失敗した
+  か」（エラー翻訳）だけを持つ。Modbus 側と方針が異なる理由は
+  `slmp/mod.rs` のモジュールドキュメント
+
+- アドレス表記（`crates/banto-plc/src/address.rs`）: `Address` は2表記の
+  sum type。計装の参照番号方式（`0/1/3/4` + 4or5桁、`40001` → 保持レジスタ
+  offset 0）と MELSEC デバイス方式（`D100`/`M50`/`X1A`、デバイス毎に
+  10進/16進が決まる - `slmp/address.rs`）をそれぞれ純関数でパース。
+  どちらを使うかは `PlcConnection.protocol` が決め、テキストからの推測は
+  しない（2表記は重複しないので、プロトコル設定ミスは個別タグの Bad として
+  露出する）
+- 要求プランニング（`planning.rs` / `slmp/planning.rs`）: 近接タグを1回の
+  要求へ結合（間隙許容・プロトコル毎の上限で分割）、応答→各タグへの逆写像
+  まで純関数で設計。256タグ/100ms 収集の実現可否はここが握る
 - デコード（`crates/banto-plc/src/decode.rs`）: i16/u16/i32/u32/f32 +
-  32bit ワード順（HighLow既定/LowHigh）
-- シミュレータ（`simulator` feature、`crates/banto-plc/src/modbus/simulator.rs`）:
-  in-process Modbus TCP テストダブル。I3 の結合テストや R4 の72hソークでも
-  再利用予定
-- 性能スモーク実測（ループバック、256タグ×3往復/回・1000回平均）:
-  約0.4ms/回 - 100ms/周期目標に対し十分な余裕（実PLC相手の実測はI3で再検証）
+  32bit ワード順。両プロトコルで共用するが既定値が異なる
+  （Modbus=HighLow / SLMP=LowHigh - MELSEC は下位ワードが先）
+- シミュレータ（`simulator` feature、`modbus/simulator.rs` /
+  `slmp/simulator.rs`）: in-process テストダブル。SLMP 側は実バイト列で
+  4E バイナリフレームを話す（ラップ先クレートの内部を通すため）。I3 の
+  結合テストや R4 の72hソークでも再利用予定
+- 性能スモーク実測（ループバック、256タグ・1000回平均）: Modbus は
+  3往復/回で約0.4ms/回、SLMP は1往復/回。いずれも 100ms/周期目標に対し
+  十分な余裕（実PLC相手の実測はI3で再検証）
 
 詳細は [crates/banto-plc/src/lib.rs](crates/banto-plc/src/lib.rs) の
 モジュールドキュメントを参照。

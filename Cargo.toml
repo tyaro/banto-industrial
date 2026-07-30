@@ -33,6 +33,22 @@ serde_json = "1"
 thiserror = "2"
 sqlx = { version = "0.8", default-features = false }
 tokio = { version = "1" }
+# I2a (docs/plan.md「条件付き自動書き込みアプリ」I2a): MELSEC MC protocol
+# (SLMP) framing, wrapped by `banto-plc`'s `slmp` module. MIT, tokio-async,
+# read + write commands - the write half stays unused until I5's separate
+# `banto-plc-write` crate. Declared here (not per-crate) like every other
+# shared dependency so I5 picks up the same version by construction rather
+# than by remembering to match it.
+#
+# Caveat worth knowing before bumping: `banto-plc`'s SLMP error
+# classification reads this crate's `std::io::Error` *message text* to tell a
+# device-side end-code response (per-tag `Bad`) from a framing failure
+# (connection-fatal) - the crate does not expose the end code any other way.
+# `slmp_end_code_is_bad_not_fatal` in `banto-plc/src/slmp/integration_tests.rs`
+# is the tripwire for that coupling: it drives a real end-code response
+# through the real crate, so a message-format change in a future 0.1.x fails
+# that test loudly instead of silently reclassifying device errors as fatal.
+slmp = "0.1.23"
 axum = { version = "0.8", default-features = true, features = ["json"] }
 tower = "0.5"
 futures-util = "0.3"
