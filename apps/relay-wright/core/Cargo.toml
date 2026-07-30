@@ -1,0 +1,52 @@
+[package]
+name = "relay-wright-core"
+description = "RelayWright domain/service layer: shared by Tauri commands now, REST in M6"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# Embeds the SvelteKit static build (`apps/relay-wright/build`, gitignored)
+# into the binary via rust-embed. Off by default so the workspace builds on
+# a fresh clone without requiring `pnpm --filter relay-wright build` to
+# have been run first (spec §11.1).
+embed-ui = ["dep:rust-embed"]
+
+[dependencies]
+banto-core = { workspace = true }
+banto-storage = { workspace = true, features = ["sqlite"] }
+banto-server = { workspace = true }
+# banto-tags/banto-plc (plan W1, luminous-discovering-goblet.md): not wired
+# into any Tauri command or REST route yet - CRUD lands in W2, PLC read/write
+# wiring in W3's engine. Added now as path deps so the workspace member graph
+# and Cargo.lock settle in W1 rather than shifting again on every later
+# milestone. Deliberately NOT banto-tstore/banto-collect/banto-tsquery (this
+# app has no historian requirement per the plan's Context section) and NOT
+# banto-plc-write (does not exist yet - that crate is milestone I5).
+banto-tags = { path = "../../../crates/banto-tags" }
+banto-plc = { path = "../../../crates/banto-plc" }
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+axum = { workspace = true }
+# `fs` (spec M17): `crate::backup::BackupService` reads/writes `backups/`
+# and the pending-restore file directly via `tokio::fs`. Cargo's feature
+# unification already pulls this in transitively via `sqlx`'s
+# `runtime-tokio` feature, but naming it explicitly here means this crate
+# does not silently depend on another dependency's feature choices.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal", "fs"] }
+rust-embed = { workspace = true, optional = true }
+argon2 = { workspace = true }
+password-hash = { workspace = true }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+tower = { workspace = true, features = ["util"] }
+tempfile = { workspace = true }
+
+[[bin]]
+name = "relay-wright-serve"
+path = "src/bin/relay-wright-serve.rs"
