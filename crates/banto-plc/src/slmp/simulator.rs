@@ -143,7 +143,11 @@ impl Simulator {
             super::SlmpAccess::Word,
             "{device} is a bit device - use set_bit"
         );
-        self.state.lock().unwrap().words.insert((device, number), value);
+        self.state
+            .lock()
+            .unwrap()
+            .words
+            .insert((device, number), value);
     }
 
     /// Set consecutive word devices starting at `start`.
@@ -161,7 +165,11 @@ impl Simulator {
             super::SlmpAccess::Bit,
             "{device} is a word device - use set_word"
         );
-        self.state.lock().unwrap().bits.insert((device, number), value);
+        self.state
+            .lock()
+            .unwrap()
+            .bits
+            .insert((device, number), value);
     }
 
     /// Every request whose group *starts* at `(device, start_number)` gets this
@@ -312,8 +320,7 @@ fn parse_bulk_read(command: &[u8]) -> Option<BulkRead> {
 
     let start = u32::from_le_bytes([body[0], body[1], body[2], 0]);
     let device = device_from_wire_code(body[device_code_index])?;
-    let count =
-        u16::from_le_bytes([body[device_field_len], body[device_field_len + 1]]) as usize;
+    let count = u16::from_le_bytes([body[device_field_len], body[device_field_len + 1]]) as usize;
 
     Some(BulkRead {
         device,
@@ -355,10 +362,7 @@ fn build_response(state: &Arc<Mutex<State>>, route: &Route, command: &[u8]) -> V
                 let point = pair_index * 2 + nibble;
                 if point < request.count {
                     let number = request.start + point as u32;
-                    let set = *state
-                        .bits
-                        .get(&(request.device, number))
-                        .unwrap_or(&false);
+                    let set = *state.bits.get(&(request.device, number)).unwrap_or(&false);
                     if set {
                         byte |= 1 << shift;
                     }

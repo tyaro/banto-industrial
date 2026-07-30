@@ -395,7 +395,8 @@ mod tests {
     fn every_device_mnemonic_round_trips_through_parse() {
         for device in DEVICE_TABLE {
             let text = format!("{}0", device.mnemonic());
-            let (parsed, number) = parse(&text).unwrap_or_else(|e| panic!("{text} should parse: {e}"));
+            let (parsed, number) =
+                parse(&text).unwrap_or_else(|e| panic!("{text} should parse: {e}"));
             assert_eq!(parsed, *device, "{text} parsed as the wrong device");
             assert_eq!(number, 0);
         }
@@ -523,10 +524,7 @@ mod tests {
         assert_eq!(parse(&ok).unwrap(), (SlmpDevice::D, MAX_DEVICE_NUMBER));
 
         let too_big = format!("D{}", MAX_DEVICE_NUMBER + 1);
-        assert!(matches!(
-            parse(&too_big),
-            Err(PlcError::InvalidAddress(_))
-        ));
+        assert!(matches!(parse(&too_big), Err(PlcError::InvalidAddress(_))));
     }
 
     /// A number wide enough to overflow `u32` must be rejected the same way

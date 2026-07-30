@@ -359,7 +359,11 @@ impl SlmpClient {
         // i16/u32/f32 tags in a single round trip. Letting the crate do the
         // typing would need one request per data type.
         let data = match group.device.access() {
-            SlmpAccess::Bit => client.bulk_read(start, expected, slmp::DataType::Bool).await,
+            SlmpAccess::Bit => {
+                client
+                    .bulk_read(start, expected, slmp::DataType::Bool)
+                    .await
+            }
             SlmpAccess::Word => client.bulk_read(start, expected, slmp::DataType::U16).await,
         }
         .map_err(|e| classify_io_error(&e))?;
@@ -370,7 +374,9 @@ impl SlmpClient {
         if data.len() != expected {
             return Err(PlcError::Protocol(format!(
                 "SLMP bulk read of {}{} returned {} point(s), expected {expected}",
-                group.device, group.start, data.len()
+                group.device,
+                group.start,
+                data.len()
             )));
         }
 
@@ -651,9 +657,9 @@ mod tests {
         for text in [
             "Received Invalid Data Frame",
             "Received Invalid Length Data",
-            "SLMP Returns Error: WrongCommand",  // no code
+            "SLMP Returns Error: WrongCommand",          // no code
             "SLMP Returns Error: WrongCommand (0xZZZZ)", // not hex
-            "SLMP Returns Error: WrongCommand (0xC059", // unterminated
+            "SLMP Returns Error: WrongCommand (0xC059",  // unterminated
             "",
         ] {
             assert_eq!(parse_end_code(text), None, "{text:?} should not parse");

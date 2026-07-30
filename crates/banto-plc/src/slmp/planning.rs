@@ -259,8 +259,7 @@ mod tests {
 
     fn req(raw: &str, data_type: DataType) -> ReadRequest {
         ReadRequest {
-            address: Address::parse_slmp(raw)
-                .unwrap_or_else(|e| panic!("{raw} should parse: {e}")),
+            address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw} should parse: {e}")),
             data_type,
         }
     }
@@ -298,7 +297,11 @@ mod tests {
             req("D0", DataType::U16),
             req(&format!("D{}", 1 + MAX_GAP), DataType::U16),
         ]);
-        assert_eq!(outcome.reads.len(), 1, "gap of exactly MAX_GAP should merge");
+        assert_eq!(
+            outcome.reads.len(),
+            1,
+            "gap of exactly MAX_GAP should merge"
+        );
         assert_eq!(outcome.reads[0].count, 2 + MAX_GAP);
     }
 
@@ -566,7 +569,10 @@ mod tests {
         let raw = format!("D{}", super::super::address::MAX_DEVICE_NUMBER);
         let outcome = plan_slmp_requests(&[req(&raw, DataType::U32)]);
         assert_eq!(outcome.reads.len(), 1);
-        assert_eq!(outcome.reads[0].start, super::super::address::MAX_DEVICE_NUMBER);
+        assert_eq!(
+            outcome.reads[0].start,
+            super::super::address::MAX_DEVICE_NUMBER
+        );
         assert_eq!(outcome.reads[0].count, 2);
     }
 }

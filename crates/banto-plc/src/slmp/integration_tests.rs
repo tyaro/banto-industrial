@@ -47,7 +47,7 @@ async fn normal_batch_reads_every_data_type_correctly() {
     let sim = Simulator::start().await;
     sim.set_word(SlmpDevice::D, 0, 42); // u16
     sim.set_word(SlmpDevice::D, 1, 0xFFFF); // i16 == -1
-    // MELSEC stores 32-bit values low word first, so D2 is the low half.
+                                            // MELSEC stores 32-bit values low word first, so D2 is the low half.
     sim.set_words(SlmpDevice::D, 2, &[0x0002, 0x0001]); // u32 == 0x0001_0002
     sim.set_word(SlmpDevice::R, 0, 100);
     sim.set_bit(SlmpDevice::M, 0, true);
@@ -89,7 +89,10 @@ async fn default_low_high_word_order_matches_melsec_storage() {
 
     let mut client = SlmpClient::new(fast_config(&sim));
     client.connect().await.unwrap();
-    let results = client.read_batch(&[req("D0", DataType::F32)]).await.unwrap();
+    let results = client
+        .read_batch(&[req("D0", DataType::F32)])
+        .await
+        .unwrap();
     assert_eq!(results[0], ReadResult::Value(TagValue::F64(1.5)));
 
     // Same bytes, opposite configured order, must *not* decode to 1.5 - proving
@@ -250,7 +253,10 @@ async fn slmp_end_code_is_bad_not_fatal() {
     // point of calling it non-fatal.
     sim.clear_end_code(SlmpDevice::D, 0);
     sim.set_word(SlmpDevice::D, 0, 9);
-    let results = client.read_batch(&[req("D0", DataType::I16)]).await.unwrap();
+    let results = client
+        .read_batch(&[req("D0", DataType::I16)])
+        .await
+        .unwrap();
     assert_eq!(results[0], ReadResult::Value(TagValue::F64(9.0)));
 }
 
@@ -422,10 +428,7 @@ async fn connect_to_a_closed_port_fails_without_hanging() {
         .await
         .expect_err("connecting to a dead listener should fail");
     assert!(
-        matches!(
-            err,
-            PlcError::Connection(_) | PlcError::ConnectTimeout(_)
-        ),
+        matches!(err, PlcError::Connection(_) | PlcError::ConnectTimeout(_)),
         "got {err:?}"
     );
     assert!(matches!(
@@ -441,7 +444,10 @@ async fn disconnect_then_read_is_not_connected() {
 
     let mut client = SlmpClient::new(fast_config(&sim));
     client.connect().await.unwrap();
-    client.read_batch(&[req("D0", DataType::U16)]).await.unwrap();
+    client
+        .read_batch(&[req("D0", DataType::U16)])
+        .await
+        .unwrap();
 
     client.disconnect().await;
     assert!(matches!(
@@ -451,7 +457,10 @@ async fn disconnect_then_read_is_not_connected() {
 
     // ...and reconnecting on the same instance works.
     client.connect().await.expect("reconnect should succeed");
-    let results = client.read_batch(&[req("D0", DataType::U16)]).await.unwrap();
+    let results = client
+        .read_batch(&[req("D0", DataType::U16)])
+        .await
+        .unwrap();
     assert_eq!(results[0], ReadResult::Value(TagValue::F64(5.0)));
 }
 

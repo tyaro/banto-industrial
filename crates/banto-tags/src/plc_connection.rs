@@ -509,7 +509,10 @@ mod tests {
 
         // The schema as of 0003, i.e. what a deployed v1 database looks like.
         for (label, sql) in [
-            ("0001", include_str!("../migrations/0001_plc_connections.sql")),
+            (
+                "0001",
+                include_str!("../migrations/0001_plc_connections.sql"),
+            ),
             (
                 "0002",
                 include_str!("../migrations/0002_collection_groups.sql"),
