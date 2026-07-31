@@ -92,7 +92,11 @@ pub struct AuditRow {
 impl AuditRow {
     /// Start a row for `action`/`result`. `rule_name_snapshot` is NOT NULL in
     /// the schema; non-rule actions pass a short label (e.g. the action name).
-    pub fn new(action: AuditAction, result: AuditResult, rule_name_snapshot: impl Into<String>) -> Self {
+    pub fn new(
+        action: AuditAction,
+        result: AuditResult,
+        rule_name_snapshot: impl Into<String>,
+    ) -> Self {
         Self {
             action,
             result,
@@ -273,7 +277,10 @@ mod tests {
     #[tokio::test]
     async fn armed_state_persists_but_load_is_informational() {
         let pool = init_db_memory().await.unwrap();
-        assert!(!load_persisted_armed(&pool).await.unwrap(), "seeded disarmed");
+        assert!(
+            !load_persisted_armed(&pool).await.unwrap(),
+            "seeded disarmed"
+        );
         persist_armed(&pool, true, Some("alice")).await.unwrap();
         assert!(load_persisted_armed(&pool).await.unwrap());
         let by: Option<String> =

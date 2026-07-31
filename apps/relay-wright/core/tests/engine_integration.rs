@@ -8,12 +8,12 @@
 //! ## Anti-hang discipline (W3-A lesson)
 //!
 //! Every wait for an asynchronous outcome is bounded by [`wait_until`]'s
-//! deadline, and [`Engine::shutdown`] is exercised under a `tokio::time::timeout`
-//! - a bug produces a fast assertion failure, never an infinite hang. These use
-//! REAL time with short intervals (the broker does real loopback I/O to the
-//! simulator, so paused virtual time is not appropriate here - the same choice
-//! the broker's own network tests make; the deterministic virtual-time coverage
-//! lives in the pure unit tests).
+//! deadline, and [`Engine::shutdown`] is exercised under a `tokio::time::timeout`,
+//! so a bug produces a fast assertion failure rather than an infinite hang.
+//! These tests use REAL time with short intervals because the broker does real
+//! loopback I/O to the simulator, so paused virtual time is not appropriate here
+//! (the same choice the broker's own network tests make). The deterministic
+//! virtual-time coverage lives in the pure unit tests.
 
 use std::time::Duration;
 
@@ -25,8 +25,8 @@ use banto_tags::{
 };
 use relay_wright_core::db::init_db_memory;
 use relay_wright_core::engine::rate_limiter::RateLimitConfig;
-use relay_wright_core::write_rules::{WriteRuleInput, WriteRuleService};
 use relay_wright_core::write_rule_conditions::WriteRuleConditionInput;
+use relay_wright_core::write_rules::{WriteRuleInput, WriteRuleService};
 use relay_wright_core::write_targets::{WriteTargetInput, WriteTargetService};
 use relay_wright_core::{Engine, EngineConfig};
 use sqlx::SqlitePool;
@@ -247,10 +247,18 @@ async fn rising_edge_writes_exactly_once_and_does_not_refire_while_held() {
     // Cross the threshold -> exactly one write should land.
     f.sim.set_word(SlmpDevice::D, 100, 500);
     assert!(
-        wait_until(Duration::from_secs(5), || f.sim.get_word(SlmpDevice::D, 200) == 777).await,
+        wait_until(Duration::from_secs(5), || f
+            .sim
+            .get_word(SlmpDevice::D, 200)
+            == 777)
+        .await,
         "the rising edge should have written 777 to the target"
     );
-    assert_eq!(count(&f.pool, "rule_fire", "ok").await, 1, "exactly one physical write");
+    assert_eq!(
+        count(&f.pool, "rule_fire", "ok").await,
+        1,
+        "exactly one physical write"
+    );
 
     // Held true: reset the device and confirm no second write occurs.
     f.sim.set_word(SlmpDevice::D, 200, 0);
@@ -260,7 +268,11 @@ async fn rising_edge_writes_exactly_once_and_does_not_refire_while_held() {
         0,
         "a held-true condition must not re-fire"
     );
-    assert_eq!(count(&f.pool, "rule_fire", "ok").await, 1, "still exactly one write");
+    assert_eq!(
+        count(&f.pool, "rule_fire", "ok").await,
+        1,
+        "still exactly one write"
+    );
 
     tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
         .await
@@ -325,7 +337,14 @@ async fn disarmed_suppresses_the_write_but_logs_it() {
 
     f.sim.set_word(SlmpDevice::D, 100, 500);
     assert!(
-        wait_for_count(&f.pool, "rule_fire", "suppressed_disarmed", 1, Duration::from_secs(5)).await,
+        wait_for_count(
+            &f.pool,
+            "rule_fire",
+            "suppressed_disarmed",
+            1,
+            Duration::from_secs(5)
+        )
+        .await,
         "a disarmed engine must audit the suppressed write"
     );
     assert_eq!(
@@ -333,7 +352,11 @@ async fn disarmed_suppresses_the_write_but_logs_it() {
         0,
         "a disarmed engine must NOT physically write"
     );
-    assert_eq!(count(&f.pool, "rule_fire", "ok").await, 0, "no ok write while disarmed");
+    assert_eq!(
+        count(&f.pool, "rule_fire", "ok").await,
+        0,
+        "no ok write while disarmed"
+    );
 
     tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
         .await
@@ -361,7 +384,14 @@ async fn dry_run_suppresses_the_write_but_logs_it() {
 
     f.sim.set_word(SlmpDevice::D, 100, 500);
     assert!(
-        wait_for_count(&f.pool, "rule_fire", "suppressed_dry_run", 1, Duration::from_secs(5)).await,
+        wait_for_count(
+            &f.pool,
+            "rule_fire",
+            "suppressed_dry_run",
+            1,
+            Duration::from_secs(5)
+        )
+        .await,
         "dry-run must audit the would-be write"
     );
     assert_eq!(
@@ -369,7 +399,11 @@ async fn dry_run_suppresses_the_write_but_logs_it() {
         0,
         "dry-run must NOT physically write"
     );
-    assert_eq!(count(&f.pool, "rule_fire", "ok").await, 0, "no ok write in dry-run");
+    assert_eq!(
+        count(&f.pool, "rule_fire", "ok").await,
+        0,
+        "no ok write in dry-run"
+    );
 
     tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
         .await
@@ -388,9 +422,12 @@ async fn rate_limit_storm_trips_breaker_and_auto_disarms() {
     // Five independent rules, all writing to the same connection.
     let mut sources = Vec::new();
     for i in 0..5 {
-        let src = f.source_tag(&format!("Src{i}"), &format!("D{}", 100 + i)).await;
+        let src = f
+            .source_tag(&format!("Src{i}"), &format!("D{}", 100 + i))
+            .await;
         let tgt = f.target(&format!("Tgt{i}"), &format!("D{}", 200 + i)).await;
-        f.rule(&format!("R{i}"), "rising", src, 100.0, tgt, 777.0).await;
+        f.rule(&format!("R{i}"), "rising", src, 100.0, tgt, 777.0)
+            .await;
         sources.push(100 + i as u32);
         f.sim.set_word(SlmpDevice::D, 100 + i as u32, 0);
     }
@@ -419,7 +456,14 @@ async fn rate_limit_storm_trips_breaker_and_auto_disarms() {
 
     // The breaker must trip and auto-disarm.
     assert!(
-        wait_for_count(&f.pool, "rate_limit_tripped", "suppressed_rate_limited", 1, Duration::from_secs(5)).await,
+        wait_for_count(
+            &f.pool,
+            "rate_limit_tripped",
+            "suppressed_rate_limited",
+            1,
+            Duration::from_secs(5)
+        )
+        .await,
         "the storm should have tripped the rate-limit breaker"
     );
     assert!(
@@ -462,7 +506,11 @@ async fn falling_edge_fires_on_true_to_false() {
     // Drop below threshold -> falling edge -> one write.
     f.sim.set_word(SlmpDevice::D, 100, 0);
     assert!(
-        wait_until(Duration::from_secs(5), || f.sim.get_word(SlmpDevice::D, 200) == 777).await,
+        wait_until(Duration::from_secs(5), || f
+            .sim
+            .get_word(SlmpDevice::D, 200)
+            == 777)
+        .await,
         "falling edge should write on true->false"
     );
     assert_eq!(count(&f.pool, "rule_fire", "ok").await, 1);

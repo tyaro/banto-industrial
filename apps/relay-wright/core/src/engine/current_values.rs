@@ -64,14 +64,17 @@ impl CurrentValues {
 
     /// Record a freshly-read good value for `tag_id`.
     pub fn set_good(&self, tag_id: i64, value: TagValue, at: Instant) {
-        self.inner.write().expect("current-values lock poisoned").insert(
-            tag_id,
-            CachedValue {
-                value,
-                quality: Quality::Good,
-                at,
-            },
-        );
+        self.inner
+            .write()
+            .expect("current-values lock poisoned")
+            .insert(
+                tag_id,
+                CachedValue {
+                    value,
+                    quality: Quality::Good,
+                    at,
+                },
+            );
     }
 
     /// Downgrade `tag_id` to [`Quality::Bad`] (a failed read this cycle). If the

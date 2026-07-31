@@ -344,12 +344,19 @@ mod tests {
     #[test]
     fn rising_edge_fires_exactly_once_and_not_while_held() {
         let cache = CurrentValues::new();
-        let mut engine = RuleEngine::new(vec![rule(1, EdgeMode::Rising, vec![cond(1, Operator::Gt, 10.0)])]);
+        let mut engine = RuleEngine::new(vec![rule(
+            1,
+            EdgeMode::Rising,
+            vec![cond(1, Operator::Gt, 10.0)],
+        )]);
         let now = t0();
 
         // Poll 1: below threshold -> seeds `false`, no fire.
         cache.set_good(1, TagValue::F64(0.0), now);
-        assert!(engine.evaluate(&cache, now).is_empty(), "first poll only seeds");
+        assert!(
+            engine.evaluate(&cache, now).is_empty(),
+            "first poll only seeds"
+        );
 
         // Poll 2: crosses threshold -> rising edge, one write.
         cache.set_good(1, TagValue::F64(20.0), now);
@@ -370,7 +377,11 @@ mod tests {
     #[test]
     fn condition_clears_then_retriggers_gives_a_second_write() {
         let cache = CurrentValues::new();
-        let mut engine = RuleEngine::new(vec![rule(1, EdgeMode::Rising, vec![cond(1, Operator::Gt, 10.0)])]);
+        let mut engine = RuleEngine::new(vec![rule(
+            1,
+            EdgeMode::Rising,
+            vec![cond(1, Operator::Gt, 10.0)],
+        )]);
         let now = t0();
 
         cache.set_good(1, TagValue::F64(0.0), now);
@@ -378,18 +389,31 @@ mod tests {
         cache.set_good(1, TagValue::F64(20.0), now);
         assert_eq!(engine.evaluate(&cache, now).len(), 1, "first rising edge");
         cache.set_good(1, TagValue::F64(0.0), now);
-        assert!(engine.evaluate(&cache, now).is_empty(), "back below: no fire on rising mode");
+        assert!(
+            engine.evaluate(&cache, now).is_empty(),
+            "back below: no fire on rising mode"
+        );
         cache.set_good(1, TagValue::F64(20.0), now);
-        assert_eq!(engine.evaluate(&cache, now).len(), 1, "re-trigger fires again");
+        assert_eq!(
+            engine.evaluate(&cache, now).len(),
+            1,
+            "re-trigger fires again"
+        );
     }
 
     #[test]
     fn falling_and_change_modes() {
         let cache = CurrentValues::new();
-        let mut falling =
-            RuleEngine::new(vec![rule(1, EdgeMode::Falling, vec![cond(1, Operator::Gt, 10.0)])]);
-        let mut change =
-            RuleEngine::new(vec![rule(2, EdgeMode::Change, vec![cond(1, Operator::Gt, 10.0)])]);
+        let mut falling = RuleEngine::new(vec![rule(
+            1,
+            EdgeMode::Falling,
+            vec![cond(1, Operator::Gt, 10.0)],
+        )]);
+        let mut change = RuleEngine::new(vec![rule(
+            2,
+            EdgeMode::Change,
+            vec![cond(1, Operator::Gt, 10.0)],
+        )]);
         let now = t0();
 
         cache.set_good(1, TagValue::F64(20.0), now); // true
@@ -397,15 +421,27 @@ mod tests {
         assert!(change.evaluate(&cache, now).is_empty(), "seed true");
 
         cache.set_good(1, TagValue::F64(0.0), now); // -> false
-        assert_eq!(falling.evaluate(&cache, now).len(), 1, "falling fires on true->false");
-        assert_eq!(change.evaluate(&cache, now).len(), 1, "change fires on any transition");
+        assert_eq!(
+            falling.evaluate(&cache, now).len(),
+            1,
+            "falling fires on true->false"
+        );
+        assert_eq!(
+            change.evaluate(&cache, now).len(),
+            1,
+            "change fires on any transition"
+        );
 
         cache.set_good(1, TagValue::F64(20.0), now); // -> true
         assert!(
             falling.evaluate(&cache, now).is_empty(),
             "falling must not fire on false->true"
         );
-        assert_eq!(change.evaluate(&cache, now).len(), 1, "change fires on the reverse transition too");
+        assert_eq!(
+            change.evaluate(&cache, now).len(),
+            1,
+            "change fires on the reverse transition too"
+        );
     }
 
     #[test]
@@ -421,17 +457,28 @@ mod tests {
         // Seed: only the first condition holds -> met=false.
         cache.set_good(1, TagValue::F64(20.0), now);
         cache.set_good(2, TagValue::F64(9.0), now);
-        assert!(engine.evaluate(&cache, now).is_empty(), "seed false (2nd cond fails)");
+        assert!(
+            engine.evaluate(&cache, now).is_empty(),
+            "seed false (2nd cond fails)"
+        );
 
         // Second condition now also holds -> AND true -> rising edge.
         cache.set_good(2, TagValue::F64(1.0), now);
-        assert_eq!(engine.evaluate(&cache, now).len(), 1, "fires only when both hold");
+        assert_eq!(
+            engine.evaluate(&cache, now).len(),
+            1,
+            "fires only when both hold"
+        );
     }
 
     #[test]
     fn indeterminate_source_never_fires_and_preserves_state() {
         let cache = CurrentValues::new();
-        let mut engine = RuleEngine::new(vec![rule(1, EdgeMode::Falling, vec![cond(1, Operator::Gt, 10.0)])]);
+        let mut engine = RuleEngine::new(vec![rule(
+            1,
+            EdgeMode::Falling,
+            vec![cond(1, Operator::Gt, 10.0)],
+        )]);
         let now = t0();
 
         cache.set_good(1, TagValue::F64(20.0), now); // true
@@ -439,7 +486,10 @@ mod tests {
 
         // Source goes bad: must NOT manufacture a true->false falling edge.
         cache.mark_bad(1, now);
-        assert!(engine.evaluate(&cache, now).is_empty(), "bad source is indeterminate, no fire");
+        assert!(
+            engine.evaluate(&cache, now).is_empty(),
+            "bad source is indeterminate, no fire"
+        );
 
         // Recovers still-true: no transition happened while it was bad.
         cache.set_good(1, TagValue::F64(20.0), now);
@@ -463,7 +513,11 @@ mod tests {
         cache.set_good(1, TagValue::F64(20.0), now); // trigger
         let fired = engine.evaluate(&cache, now);
         assert_eq!(fired.len(), 1);
-        assert_eq!(fired[0].value, TagValue::F64(123.0), "writes the copied source value");
+        assert_eq!(
+            fired[0].value,
+            TagValue::F64(123.0),
+            "writes the copied source value"
+        );
     }
 
     #[test]
@@ -479,7 +533,10 @@ mod tests {
         cache.set_good(1, TagValue::F64(0.0), now);
         engine.evaluate(&cache, now);
         cache.set_good(1, TagValue::F64(20.0), now);
-        assert!(engine.evaluate(&cache, now).is_empty(), "no copy value -> no fire");
+        assert!(
+            engine.evaluate(&cache, now).is_empty(),
+            "no copy value -> no fire"
+        );
     }
 
     #[test]
@@ -500,7 +557,9 @@ mod tests {
         engine.evaluate(&cache, base + Duration::from_secs(1));
         cache.set_good(1, TagValue::F64(20.0), base + Duration::from_secs(3));
         assert!(
-            engine.evaluate(&cache, base + Duration::from_secs(3)).is_empty(),
+            engine
+                .evaluate(&cache, base + Duration::from_secs(3))
+                .is_empty(),
             "re-fire within cooldown is suppressed"
         );
 
@@ -509,7 +568,9 @@ mod tests {
         engine.evaluate(&cache, base + Duration::from_secs(12));
         cache.set_good(1, TagValue::F64(20.0), base + Duration::from_secs(15));
         assert_eq!(
-            engine.evaluate(&cache, base + Duration::from_secs(15)).len(),
+            engine
+                .evaluate(&cache, base + Duration::from_secs(15))
+                .len(),
             1,
             "fire allowed once cooldown elapsed"
         );
@@ -519,7 +580,10 @@ mod tests {
     fn between_and_bit_is_operators() {
         assert!(Operator::Between.eval(TagValue::F64(5.0), 1.0, Some(10.0)));
         assert!(!Operator::Between.eval(TagValue::F64(50.0), 1.0, Some(10.0)));
-        assert!(!Operator::Between.eval(TagValue::F64(5.0), 1.0, None), "between needs an upper bound");
+        assert!(
+            !Operator::Between.eval(TagValue::F64(5.0), 1.0, None),
+            "between needs an upper bound"
+        );
         assert!(Operator::BitIs.eval(TagValue::Bit(true), 1.0, None));
         assert!(!Operator::BitIs.eval(TagValue::Bit(true), 0.0, None));
         assert!(Operator::BitIs.eval(TagValue::Bit(false), 0.0, None));

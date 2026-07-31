@@ -84,7 +84,11 @@ impl Writer {
     /// Process one write intent through the full safety gate. Errors here are
     /// only *infrastructure* failures (e.g. the audit DB is unreachable);
     /// business suppression is not an error - it is an audited outcome.
-    pub async fn process(&mut self, pending: PendingWrite, now: Instant) -> Result<(), banto_core::BantoError> {
+    pub async fn process(
+        &mut self,
+        pending: PendingWrite,
+        now: Instant,
+    ) -> Result<(), banto_core::BantoError> {
         // Snapshot fields shared by every audit row for this intent.
         let written_f64 = tag_value_as_f64(pending.value);
         let base = |result: AuditResult| {

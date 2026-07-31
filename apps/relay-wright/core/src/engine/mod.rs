@@ -125,7 +125,8 @@ impl EngineControl {
     pub async fn arm(&self, actor: Option<&str>) -> Result<(), BantoError> {
         self.arming.arm();
         persist_armed(&self.pool, true, actor).await?;
-        self.audit_toggle(AuditAction::Arm, actor, "engine armed").await
+        self.audit_toggle(AuditAction::Arm, actor, "engine armed")
+            .await
     }
 
     /// Disarm the engine (suppress all physical writes). Persists + audits.
@@ -140,7 +141,11 @@ impl EngineControl {
     /// persisted armed state).
     pub async fn set_dry_run(&self, on: bool, actor: Option<&str>) -> Result<(), BantoError> {
         self.arming.set_dry_run(on);
-        let detail = if on { "dry-run enabled" } else { "dry-run disabled" };
+        let detail = if on {
+            "dry-run enabled"
+        } else {
+            "dry-run disabled"
+        };
         self.audit_toggle(AuditAction::DryRunToggle, actor, detail)
             .await
     }
@@ -304,6 +309,20 @@ async fn run_engine_loop(
     }
 }
 
+/// One `write_rules` row as loaded by [`compile_rules`]: `(id, name, edge_mode,
+/// cooldown_ms, write_target_id, write_value_mode, write_constant_value,
+/// write_source_tag_id)`.
+type RuleRow = (
+    i64,
+    String,
+    String,
+    Option<i64>,
+    i64,
+    String,
+    Option<f64>,
+    Option<i64>,
+);
+
 /// The compiled output of [`compile_rules`].
 struct Compiled {
     rules: Vec<CompiledRule>,
@@ -316,24 +335,20 @@ struct Compiled {
 /// rule is DROPPED (with a warning) if any of its references cannot be resolved
 /// to a managed SLMP connection or its address/type does not parse - a
 /// half-resolvable rule must never partially run.
-async fn compile_rules(
-    pool: &SqlitePool,
-    managed: &HashSet<i64>,
-) -> Result<Compiled, BantoError> {
+async fn compile_rules(pool: &SqlitePool, managed: &HashSet<i64>) -> Result<Compiled, BantoError> {
     let mut rules = Vec::new();
     let mut targets: HashMap<i64, ResolvedTarget> = HashMap::new();
     let mut sources_by_conn: HashMap<i64, Vec<ResolvedSource>> = HashMap::new();
     let mut polled: HashSet<i64> = HashSet::new();
 
-    let rows: Vec<(i64, String, String, Option<i64>, i64, String, Option<f64>, Option<i64>)> =
-        sqlx::query_as(
-            "SELECT id, name, edge_mode, cooldown_ms, write_target_id, \
+    let rows: Vec<RuleRow> = sqlx::query_as(
+        "SELECT id, name, edge_mode, cooldown_ms, write_target_id, \
                 write_value_mode, write_constant_value, write_source_tag_id \
              FROM write_rules WHERE enabled = 1 ORDER BY id",
-        )
-        .fetch_all(pool)
-        .await
-        .map_err(banto_storage::storage_error)?;
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
 
     for (id, name, edge_mode, cooldown_ms, write_target_id, value_mode, constant, source_tag) in
         rows
@@ -368,7 +383,9 @@ async fn compile_rules(
                 }
             },
             other => {
-                eprintln!("relay-wright engine: rule {id} ({name}) bad write_value_mode {other}; skipped");
+                eprintln!(
+                    "relay-wright engine: rule {id} ({name}) bad write_value_mode {other}; skipped"
+                );
                 continue;
             }
         };
@@ -427,7 +444,10 @@ async fn compile_rules(
         targets.insert(write_target_id, target.clone());
         for src in resolved_sources {
             if polled.insert(src.tag_id) {
-                sources_by_conn.entry(src.connection_id).or_default().push(src);
+                sources_by_conn
+                    .entry(src.connection_id)
+                    .or_default()
+                    .push(src);
             }
         }
         rules.push(CompiledRule {
@@ -458,12 +478,13 @@ async fn resolve_target(
     write_target_id: i64,
     managed: &HashSet<i64>,
 ) -> Result<Option<ResolvedTarget>, BantoError> {
-    let row: Option<(i64, String, String)> =
-        sqlx::query_as("SELECT plc_connection_id, address, data_type FROM write_targets WHERE id = ?")
-            .bind(write_target_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(banto_storage::storage_error)?;
+    let row: Option<(i64, String, String)> = sqlx::query_as(
+        "SELECT plc_connection_id, address, data_type FROM write_targets WHERE id = ?",
+    )
+    .bind(write_target_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
     let Some((connection_id, address, data_type)) = row else {
         return Ok(None);
     };
