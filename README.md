@@ -179,8 +179,19 @@ pnpm add "github:tyaro/banto#v0.1.0&path:packages/admin-core"
 banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v0.1.0" }
 ```
 
-## 権利
+## ライセンス
 
-本リポジトリは自社著作物（All rights reserved）。案件アプリへは
-依存ライブラリとして利用許諾で提供し、譲渡対象に含めない
-（docs/plan.md §2）。
+本リポジトリは **MIT ライセンス**（[LICENSE](LICENSE)）。ライブラリ・
+アプリともに自由に利用・改変・再配布・販売できる（docs/plan.md §2）。
+
+商用のシステム構築（導入支援・カスタム開発・保守）は tyaro が有償で
+提供する。
+
+### relay-wright（PLC自動書き込み）に関する安全上の注意
+
+`apps/relay-wright` は設定されたルールに基づき **稼働中のPLCへ自動的に
+値を書き込む**アプリケーション。設定ミスや不具合は意図しない機器動作を
+引き起こす可能性がある。MIT ライセンスにより**無保証（AS IS）**で提供
+されるため、安全な導入（実機投入前の検証・アーミング/インターロック/
+非常停止の確保・適用法令の遵守）は利用者の責任で行うこと。
+詳細は [apps/relay-wright/README.md](apps/relay-wright/README.md) を参照。

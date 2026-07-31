@@ -23,7 +23,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "LicenseRef-Proprietary"
+license = "MIT"
 publish = false
 
 # Shared across every crate in this workspace (I1..I4, apps/chronogazer) so
