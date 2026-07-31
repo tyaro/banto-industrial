@@ -3157,6 +3157,7 @@ dependencies = [
  "axum",
  "banto-core",
  "banto-plc",
+ "banto-plc-write",
  "banto-server",
  "banto-storage",
  "banto-tags",
@@ -3165,8 +3166,10 @@ dependencies = [
  "rust-embed",
  "serde",
  "serde_json",
+ "slmp",
  "sqlx",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tower",
 ]

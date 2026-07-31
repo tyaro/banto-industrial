@@ -88,7 +88,7 @@ use crate::error::PlcError;
 use crate::types::{ReadRequest, ReadResult, TagValue};
 
 use address::{SlmpAccess, SlmpDevice};
-use planning::{plan_slmp_requests, SlmpPlannedRead};
+use planning::{plan_slmp_requests, SlmpPlanOutcome, SlmpPlannedRead};
 
 /// MELSEC CPU series, which SLMP frames differ by: Q and L serialize a device
 /// address in 4 bytes and use subcommand `0x0000`/`0x0001`, R uses 6 bytes and
@@ -109,7 +109,12 @@ pub enum SlmpCpu {
 }
 
 impl SlmpCpu {
-    fn to_wire(self) -> slmp::CPU {
+    /// Map onto the wrapped crate's `CPU`. `pub` (was `pub(crate)`) so the W3
+    /// broker in relay-wright can build a bare `slmp::SLMPClient` from an
+    /// [`SlmpConfig`] via [`SlmpConfig::to_wire_props`] without re-deriving the
+    /// mapping (which is what `banto-plc-write` had to do while this was
+    /// private - a duplication a later cleanup can now remove).
+    pub fn to_wire(self) -> slmp::CPU {
         match self {
             SlmpCpu::Q => slmp::CPU::Q,
             SlmpCpu::R => slmp::CPU::R,
@@ -128,7 +133,13 @@ impl SlmpDevice {
     /// mapping is total and one-for-one; `slmp_device_wire_codes_match_the_wrapped_crate`
     /// proves it agrees with the crate on every device's actual wire code, so a
     /// mis-typed arm here cannot silently read the wrong device.
-    pub(crate) fn to_wire(self) -> slmp::DeviceType {
+    ///
+    /// `pub` (was `pub(crate)`) alongside [`SlmpCpu::to_wire`] and
+    /// [`SlmpConfig::to_wire_props`] so a later cleanup can drop
+    /// `banto-plc-write`'s duplicated copy of this table. Not used by the W3
+    /// broker itself (device mapping happens inside [`execute_slmp_reads`] /
+    /// `banto_plc_write::execute_slmp_writes`), only exposed for that cleanup.
+    pub fn to_wire(self) -> slmp::DeviceType {
         use slmp::DeviceType as W;
         match self {
             SlmpDevice::X => W::X,
@@ -247,7 +258,14 @@ impl Default for SlmpConfig {
 }
 
 impl SlmpConfig {
-    fn to_wire_props(&self) -> slmp::SLMP4EConnectionProps {
+    /// Build the wrapped crate's connection props. `pub` (was private) because
+    /// the W3 broker (relay-wright) owns a bare `slmp::SLMPClient` per CPU and
+    /// needs to construct it from an [`SlmpConfig`] to drive both
+    /// [`execute_slmp_reads`] and `banto_plc_write::execute_slmp_writes` over the
+    /// one shared session - the whole point of the broker. Exposing the assembly
+    /// here (rather than each caller re-deriving it, as `banto-plc-write` still
+    /// does internally) keeps the single source of truth in this crate.
+    pub fn to_wire_props(&self) -> slmp::SLMP4EConnectionProps {
         slmp::SLMP4EConnectionProps {
             ip: self.host.clone(),
             port: self.port,
@@ -333,84 +351,167 @@ impl SlmpClient {
             inner: None,
         }
     }
+}
 
-    /// Issue one bulk read for `group` and return its decoded window.
-    ///
-    /// `Err(PlcError::SlmpEndCode { .. })` is the only non-fatal outcome (see
-    /// this module's doc comment); every other `Err` means the session is no
-    /// longer trustworthy.
-    async fn execute_one(
-        client: &mut slmp::SLMPClient,
-        group: &SlmpPlannedRead,
-    ) -> Result<GroupValues, PlcError> {
-        let start = slmp::Device {
-            device_type: group.device.to_wire(),
-            address: group.start as usize,
-        };
-        let expected = group.count as usize;
+/// Issue one bulk read for `group` and return its decoded window.
+///
+/// `Err(PlcError::SlmpEndCode { .. })` is the only non-fatal outcome (see
+/// this module's doc comment); every other `Err` means the session is no
+/// longer trustworthy. A free function (rather than a `SlmpClient` method) so
+/// both the owned-socket [`SlmpClient::read_batch`] and the borrowed-socket
+/// [`execute_slmp_reads`] share the one per-group read implementation and
+/// cannot drift.
+async fn execute_one(
+    client: &mut slmp::SLMPClient,
+    group: &SlmpPlannedRead,
+) -> Result<GroupValues, PlcError> {
+    let start = slmp::Device {
+        device_type: group.device.to_wire(),
+        address: group.start as usize,
+    };
+    let expected = group.count as usize;
 
-        // Bit devices take a bit-unit bulk read (SLMP subcommand
-        // `0x0001`/`0x0003`, two points per response byte), word devices a
-        // word-unit one. `slmp::DataType::U16` is used for *every* word group
-        // regardless of the tags' own types on purpose: it makes the crate hand
-        // back the raw register window, which `decode.rs::decode_register_value`
-        // then interprets - so the 32-bit word-order handling is shared with
-        // Modbus rather than reimplemented, and one group can serve a mix of
-        // i16/u32/f32 tags in a single round trip. Letting the crate do the
-        // typing would need one request per data type.
-        let data = match group.device.access() {
-            SlmpAccess::Bit => {
-                client
-                    .bulk_read(start, expected, slmp::DataType::Bool)
-                    .await
-            }
-            SlmpAccess::Word => client.bulk_read(start, expected, slmp::DataType::U16).await,
+    // Bit devices take a bit-unit bulk read (SLMP subcommand
+    // `0x0001`/`0x0003`, two points per response byte), word devices a
+    // word-unit one. `slmp::DataType::U16` is used for *every* word group
+    // regardless of the tags' own types on purpose: it makes the crate hand
+    // back the raw register window, which `decode.rs::decode_register_value`
+    // then interprets - so the 32-bit word-order handling is shared with
+    // Modbus rather than reimplemented, and one group can serve a mix of
+    // i16/u32/f32 tags in a single round trip. Letting the crate do the
+    // typing would need one request per data type.
+    let data = match group.device.access() {
+        SlmpAccess::Bit => {
+            client
+                .bulk_read(start, expected, slmp::DataType::Bool)
+                .await
         }
-        .map_err(|e| classify_io_error(&e))?;
+        SlmpAccess::Word => client.bulk_read(start, expected, slmp::DataType::U16).await,
+    }
+    .map_err(|e| classify_io_error(&e))?;
 
-        // A response carrying fewer (or more) points than were asked for means
-        // the crate's frame accounting and ours disagree - the stream is not
-        // where we think it is, so this is fatal, not a per-tag problem.
-        if data.len() != expected {
-            return Err(PlcError::Protocol(format!(
-                "SLMP bulk read of {}{} returned {} point(s), expected {expected}",
-                group.device,
-                group.start,
-                data.len()
-            )));
-        }
+    // A response carrying fewer (or more) points than were asked for means
+    // the crate's frame accounting and ours disagree - the stream is not
+    // where we think it is, so this is fatal, not a per-tag problem.
+    if data.len() != expected {
+        return Err(PlcError::Protocol(format!(
+            "SLMP bulk read of {}{} returned {} point(s), expected {expected}",
+            group.device,
+            group.start,
+            data.len()
+        )));
+    }
 
-        match group.device.access() {
-            SlmpAccess::Bit => {
-                let mut bits = Vec::with_capacity(expected);
-                for d in &data {
-                    match d.data {
-                        slmp::TypedData::Bool(b) => bits.push(b),
-                        other => {
-                            return Err(PlcError::Protocol(format!(
-                                "SLMP bit read returned a non-bool point: {other:?}"
-                            )))
-                        }
+    match group.device.access() {
+        SlmpAccess::Bit => {
+            let mut bits = Vec::with_capacity(expected);
+            for d in &data {
+                match d.data {
+                    slmp::TypedData::Bool(b) => bits.push(b),
+                    other => {
+                        return Err(PlcError::Protocol(format!(
+                            "SLMP bit read returned a non-bool point: {other:?}"
+                        )))
                     }
                 }
-                Ok(GroupValues::Bits(bits))
             }
-            SlmpAccess::Word => {
-                let mut words = Vec::with_capacity(expected);
-                for d in &data {
-                    match d.data {
-                        slmp::TypedData::U16(w) => words.push(w),
-                        other => {
-                            return Err(PlcError::Protocol(format!(
-                                "SLMP word read returned a non-u16 point: {other:?}"
-                            )))
-                        }
+            Ok(GroupValues::Bits(bits))
+        }
+        SlmpAccess::Word => {
+            let mut words = Vec::with_capacity(expected);
+            for d in &data {
+                match d.data {
+                    slmp::TypedData::U16(w) => words.push(w),
+                    other => {
+                        return Err(PlcError::Protocol(format!(
+                            "SLMP word read returned a non-u16 point: {other:?}"
+                        )))
                     }
                 }
-                Ok(GroupValues::Words(words))
+            }
+            Ok(GroupValues::Words(words))
+        }
+    }
+}
+
+/// Execute a planned batch of reads on a **borrowed** `slmp::SLMPClient`, the
+/// reusable core the W3 broker calls directly on its shared per-CPU session -
+/// the read twin of `banto_plc_write::execute_slmp_writes`. Fills
+/// `outcome.immediate_bad` in by index, issues one bulk read per group in
+/// `outcome.reads`, and returns a `Vec<ReadResult>` of length `total_requests`
+/// in original request order.
+///
+/// `word_order` is the one shape difference from the write twin: a write bakes
+/// the 32-bit word order into its payload at plan time
+/// (`plan_slmp_writes(requests, word_order)`), so `execute_slmp_writes` needs no
+/// such argument; a read *decodes* the fetched register window here, after the
+/// wire round trip, so the order has to arrive with the call. `plan_slmp_requests`
+/// (unlike its write sibling) is therefore pure of it.
+///
+/// `Err` is reserved for a connection-fatal failure (the caller must drop the
+/// session and reconnect); a device-side end code becomes a per-request `Bad`
+/// for that group's requests and the loop continues. Does not own or reconnect
+/// the socket - lifecycle is the caller's ([`SlmpClient`] for the standalone
+/// form, the broker for the shared one).
+pub async fn execute_slmp_reads(
+    client: &mut slmp::SLMPClient,
+    outcome: &SlmpPlanOutcome,
+    total_requests: usize,
+    word_order: WordOrder,
+) -> Result<Vec<ReadResult>, PlcError> {
+    let mut results: Vec<Option<ReadResult>> = vec![None; total_requests];
+    for (index, reason) in &outcome.immediate_bad {
+        results[*index] = Some(ReadResult::Bad(reason.clone()));
+    }
+
+    for group in &outcome.reads {
+        match execute_one(client, group).await {
+            Ok(values) => {
+                for m in &group.mapping {
+                    let value = match &values {
+                        GroupValues::Bits(bits) => TagValue::Bit(bits[m.offset_in_read as usize]),
+                        GroupValues::Words(words) => {
+                            match decode_register_value(
+                                words,
+                                m.offset_in_read as usize,
+                                m.data_type,
+                                word_order,
+                            ) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    results[m.request_index] = Some(ReadResult::Bad(e));
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+                    results[m.request_index] = Some(ReadResult::Value(value));
+                }
+            }
+            Err(err) if !err.is_connection_fatal() => {
+                // SLMP end code: the CPU refused this one group but answered in
+                // full, so only these requests are bad.
+                for m in &group.mapping {
+                    results[m.request_index] = Some(ReadResult::Bad(err.clone()));
+                }
+            }
+            Err(err) => {
+                // Connection-fatal: hand the error up. Dropping/reconnecting the
+                // session is the caller's job.
+                return Err(err);
             }
         }
     }
+
+    Ok(results
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            r.unwrap_or_else(|| {
+                panic!("plan_slmp_requests must account for every input index, missing {i}")
+            })
+        })
+        .collect())
 }
 
 enum GroupValues {
@@ -463,74 +564,25 @@ impl PlcClient for SlmpClient {
             }
 
             let outcome = plan_slmp_requests(requests);
-            let mut results: Vec<Option<ReadResult>> = vec![None; requests.len()];
-            for (index, reason) in outcome.immediate_bad {
-                results[index] = Some(ReadResult::Bad(reason));
-            }
-
-            // Copied out before the loop so the `&mut self.inner` borrow below
-            // does not conflict with reading config - same shape as
-            // `modbus/mod.rs`'s read_batch.
             let word_order = self.config.word_order;
 
-            for group in &outcome.reads {
-                // Guaranteed `Some`: the only place that clears it is the
-                // fatal-error branch below, which returns immediately after.
-                let client = self
-                    .inner
-                    .as_mut()
-                    .expect("checked Some above, only cleared on early return");
+            // Thin wrapper over the shared execute function (the read twin of
+            // `SlmpWriteClient::write_batch`): run it on our own socket, and on
+            // a fatal error drop the session so the next call is `NotConnected`.
+            // The broker does the equivalent for its own borrowed socket, so the
+            // owned and borrowed paths cannot drift.
+            let client = self
+                .inner
+                .as_mut()
+                .expect("checked Some above, only cleared on the fatal branch below");
 
-                match Self::execute_one(client, group).await {
-                    Ok(values) => {
-                        for m in &group.mapping {
-                            let value = match &values {
-                                GroupValues::Bits(bits) => {
-                                    TagValue::Bit(bits[m.offset_in_read as usize])
-                                }
-                                GroupValues::Words(words) => {
-                                    match decode_register_value(
-                                        words,
-                                        m.offset_in_read as usize,
-                                        m.data_type,
-                                        word_order,
-                                    ) {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            results[m.request_index] = Some(ReadResult::Bad(e));
-                                            continue;
-                                        }
-                                    }
-                                }
-                            };
-                            results[m.request_index] = Some(ReadResult::Value(value));
-                        }
-                    }
-                    Err(err) if !err.is_connection_fatal() => {
-                        // SLMP end code: the CPU refused this one group but
-                        // answered in full, so only these requests are bad.
-                        for m in &group.mapping {
-                            results[m.request_index] = Some(ReadResult::Bad(err.clone()));
-                        }
-                    }
-                    Err(err) => {
-                        // Connection-fatal: drop the session and hand the
-                        // error up. Reconnecting is the caller's (I3's) job.
-                        self.inner = None;
-                        return Err(err);
-                    }
+            match execute_slmp_reads(client, &outcome, requests.len(), word_order).await {
+                Ok(results) => Ok(results),
+                Err(err) => {
+                    self.inner = None;
+                    Err(err)
                 }
             }
-
-            Ok(results
-                .into_iter()
-                .enumerate()
-                .map(|(i, r)| {
-                    r.unwrap_or_else(|| {
-                        panic!("plan_slmp_requests must account for every input index, missing {i}")
-                    })
-                })
-                .collect())
         })
     }
 

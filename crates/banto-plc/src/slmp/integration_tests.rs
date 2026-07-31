@@ -520,6 +520,54 @@ async fn an_empty_batch_is_ok_and_empty() {
     assert!(client.read_batch(&[]).await.unwrap().is_empty());
 }
 
+/// The broker-sharing seam (W3): [`super::execute_slmp_reads`] runs against a
+/// **borrowed** `slmp::SLMPClient` the caller owns, so the W3 broker can drive
+/// reads over the *same* session it also writes on (via
+/// `banto_plc_write::execute_slmp_writes`). Here we stand up a bare
+/// `slmp::SLMPClient` - exactly what the broker owns per CPU - plan, and execute,
+/// with no `SlmpClient` wrapper involved. The read twin of
+/// `banto-plc-write`'s `execute_slmp_writes_runs_on_a_borrowed_client_for_the_broker`.
+#[tokio::test]
+async fn execute_slmp_reads_runs_on_a_borrowed_client_for_the_broker() {
+    let sim = Simulator::start().await;
+    sim.set_word(SlmpDevice::D, 0, 11);
+    sim.set_word(SlmpDevice::D, 1, 22);
+    sim.set_bit(SlmpDevice::M, 0, true);
+
+    // A bare wrapped client, exactly what the W3 broker will own per CPU.
+    let props = slmp::SLMP4EConnectionProps {
+        ip: sim.addr.ip().to_string(),
+        port: sim.addr.port(),
+        cpu: slmp::CPU::R,
+        serial_id: 0x0001,
+        network_id: 0x00,
+        pc_id: 0xFF,
+        io_id: 0x03FF,
+        area_id: 0x00,
+        cpu_timer: 0x0010,
+    };
+    let mut shared = slmp::SLMPClient::new(props);
+    shared.set_send_timeout(Duration::from_millis(100));
+    shared.set_recv_timeout(Duration::from_millis(100));
+    shared.connect().await.expect("shared connect");
+
+    let requests = [
+        req("D0", DataType::U16),
+        req("D1", DataType::U16),
+        req("M0", DataType::Bit),
+    ];
+    let outcome = super::planning::plan_slmp_requests(&requests);
+    let results =
+        super::execute_slmp_reads(&mut shared, &outcome, requests.len(), WordOrder::LowHigh)
+            .await
+            .expect("execute on borrowed client");
+    assert_eq!(results[0], ReadResult::Value(TagValue::F64(11.0)));
+    assert_eq!(results[1], ReadResult::Value(TagValue::F64(22.0)));
+    assert_eq!(results[2], ReadResult::Value(TagValue::Bit(true)));
+
+    shared.close().await;
+}
+
 /// Performance smoke test, the SLMP twin of `modbus/integration_tests.rs`'s
 /// (docs/plan.md I2 §7): 256 tags across consecutive `D` registers, realistic
 /// for a single collection group near the v1 tag-count target

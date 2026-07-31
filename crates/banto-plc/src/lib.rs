@@ -74,5 +74,5 @@ pub use modbus::{ModbusTcpClient, ModbusTcpConfig};
 pub use planning::{plan_requests, MappedRequest, PlanOutcome, PlannedRead};
 pub use slmp::address::{SlmpAccess, SlmpDevice};
 pub use slmp::planning::{plan_slmp_requests, SlmpMappedRequest, SlmpPlanOutcome, SlmpPlannedRead};
-pub use slmp::{SlmpClient, SlmpConfig, SlmpCpu};
+pub use slmp::{execute_slmp_reads, SlmpClient, SlmpConfig, SlmpCpu};
 pub use types::{DataType, ReadRequest, ReadResult, TagValue};

@@ -27,6 +27,16 @@ banto-server = { workspace = true }
 # banto-plc-write (does not exist yet - that crate is milestone I5).
 banto-tags = { path = "../../../crates/banto-tags" }
 banto-plc = { path = "../../../crates/banto-plc" }
+# W3-A (luminous-discovering-goblet.md): the PLC access broker
+# (`src/engine/broker.rs`) owns one bare `slmp::SLMPClient` per SLMP CPU and
+# drives BOTH reads (`banto_plc::execute_slmp_reads`) and writes
+# (`banto_plc_write::execute_slmp_writes`) over that single shared session, so it
+# needs the write crate and the wrapped framing crate directly. The auto-write
+# ENGINE (poller/rule_engine/writer, arming, rate-limiting) is W3-B; this crate
+# only gains the broker infrastructure in W3-A.
+banto-plc-write = { path = "../../../crates/banto-plc-write" }
+slmp = { workspace = true }
+thiserror = { workspace = true }
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -36,16 +46,21 @@ axum = { workspace = true }
 # unification already pulls this in transitively via `sqlx`'s
 # `runtime-tokio` feature, but naming it explicitly here means this crate
 # does not silently depend on another dependency's feature choices.
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal", "fs"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal", "fs", "time"] }
 rust-embed = { workspace = true, optional = true }
 argon2 = { workspace = true }
 password-hash = { workspace = true }
 futures-util = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util", "sync"] }
 tower = { workspace = true, features = ["util"] }
 tempfile = { workspace = true }
+# The broker's tests drive it against `banto-plc-write`'s in-process SLMP
+# simulator, which answers BOTH bulk read (0x0401) and bulk write (0x1401) - so
+# one fake-CPU endpoint proves read-after-write over the broker's single shared
+# session. Enabled only for tests (it opens a real loopback listener).
+banto-plc-write = { path = "../../../crates/banto-plc-write", features = ["simulator"] }
 
 [[bin]]
 name = "relay-wright-serve"
