@@ -8,6 +8,12 @@ pub mod assets;
 pub mod audit;
 pub mod backup;
 pub mod db;
+// W3-A (luminous-discovering-goblet.md): the PLC access broker - one live SLMP
+// session per CPU, request-driven, serializing reads and writes onto a single
+// socket. Infrastructure only: no arming, rate-limiting, rule evaluation, or
+// write auditing (that is W3-B's auto-write engine, which will hold the
+// broker's handles).
+pub mod engine;
 pub mod events;
 pub mod rest;
 pub mod settings;
