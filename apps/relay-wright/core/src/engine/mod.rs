@@ -24,6 +24,4 @@
 
 pub mod broker;
 
-pub use broker::{
-    BackoffConfig, BrokerError, BrokerHandle, BrokerSupervisor, ReadOnlyHandle,
-};
+pub use broker::{BackoffConfig, BrokerError, BrokerHandle, BrokerSupervisor, ReadOnlyHandle};
