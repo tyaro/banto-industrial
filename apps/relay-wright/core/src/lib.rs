@@ -17,7 +17,7 @@ pub mod engine;
 
 // The auto-write engine's public surface (W3-B): the running engine, its safe
 // arm/disarm/dry-run control handle, its config, and a status snapshot.
-pub use engine::{Engine, EngineConfig, EngineControl, EngineStatus};
+pub use engine::{Engine, EngineConfig, EngineControl, EngineStatus, SharedEngineControl};
 pub mod events;
 pub mod rest;
 pub mod settings;

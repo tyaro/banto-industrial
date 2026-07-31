@@ -34,6 +34,7 @@ use relay_wright_core::assets::FrontendAssets;
 use relay_wright_core::audit::{AuditEntry, AuditLogService};
 use relay_wright_core::backup::BackupService;
 use relay_wright_core::db::init_db;
+use relay_wright_core::engine::{Engine, EngineConfig, SharedEngineControl};
 use relay_wright_core::events::event_channel;
 use relay_wright_core::rest::{api_router, audited_credential_verifier};
 use relay_wright_core::settings::SettingsService;
@@ -41,6 +42,8 @@ use relay_wright_core::users::UsersService;
 use relay_wright_core::write_rules::WriteRuleService;
 use relay_wright_core::write_targets::WriteTargetService;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 const DEFAULT_PORT: u16 = 8721;
 const DEFAULT_BIND: &str = "0.0.0.0";
@@ -83,7 +86,9 @@ async fn main() {
     let backup = BackupService::new(db_path_buf, pool.clone());
     let write_targets = WriteTargetService::new(pool.clone());
     let write_rules = WriteRuleService::new(pool.clone());
-    let audit = AuditLogService::new(pool);
+    // Cloned (not moved) so the pool stays available for the W3-B2 engine start
+    // below.
+    let audit = AuditLogService::new(pool.clone());
     // Credential verifier from `relay_wright_core::rest` (spec §8.2),
     // backed by `UsersService`'s argon2id-hashed accounts - replaces the old
     // fixed admin/admin check that used to live here directly. Also records
@@ -133,6 +138,21 @@ async fn main() {
         }
     }
 
+    // W3-B2: start the auto-write engine so `/api/engine/*` is live in this
+    // standalone REST vehicle too (and exercisable end-to-end without Tauri).
+    // Non-fatal: on failure the routes report "not started". Starts DISARMED
+    // (invariant §1) and returns promptly even if a PLC is unreachable. The
+    // `Engine` is kept alive for the process lifetime and shut down at Ctrl-C
+    // below; its control slot is handed to the router.
+    let (engine, engine_control): (Option<Engine>, SharedEngineControl) =
+        match Engine::start_from_db(pool, EngineConfig::default()).await {
+            Ok((engine, control)) => (Some(engine), Arc::new(Mutex::new(Some(control)))),
+            Err(err) => {
+                eprintln!("relay-wright-serve: 自動書き込みエンジンの起動に失敗しました: {err}");
+                (None, Arc::new(Mutex::new(None)))
+            }
+        };
+
     let app = api_router(
         users,
         settings,
@@ -140,6 +160,7 @@ async fn main() {
         backup,
         write_targets,
         write_rules,
+        engine_control,
         auth,
         events,
         allow_setup,
@@ -169,4 +190,9 @@ async fn main() {
         .expect("failed to listen for ctrl-c");
     println!("relay-wright-serve: shutting down");
     server.stop().await;
+    // W3-B2: stop the auto-write engine cleanly (flips the broker/poller/writer
+    // shutdown signal and awaits the tasks - never hangs, per the W3-A design).
+    if let Some(engine) = engine {
+        engine.shutdown().await;
+    }
 }

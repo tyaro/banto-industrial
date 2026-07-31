@@ -46,6 +46,12 @@
 use banto_core::BantoError;
 use sqlx::SqlitePool;
 
+/// The one SQLite pool type every service in this crate is built over,
+/// re-exported so downstream crates (notably `src-tauri`, whose invariant is
+/// to add NO new dependencies) can name it - e.g. to hold the pool in their
+/// own app state - without taking a direct `sqlx` dependency of their own.
+pub type DbPool = SqlitePool;
+
 /// Connect to the SQLite database at `path` and apply the full schema (this
 /// app's own, then `banto_tags`'s). Used by the `src-tauri` adapter with a
 /// path under the app's data directory.

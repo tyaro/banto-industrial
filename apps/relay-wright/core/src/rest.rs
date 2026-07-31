@@ -121,6 +121,7 @@ use tokio::sync::broadcast;
 
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::backup::{BackupInfo, BackupService, PendingRestoreInfo};
+use crate::engine::{EngineControl, EngineStatus, SharedEngineControl};
 use crate::settings::{AuditSettings, SettingsService};
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
 use crate::write_rules::{WriteRuleDetail, WriteRuleInput, WriteRuleService};
@@ -1432,6 +1433,189 @@ fn write_registry_router(
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
 
+// --- W3-B2: auto-write engine control ---------------------------------------
+
+/// Resolve the caller's identity and require role >= `min` for an engine
+/// control route (invariant §1 両経路対称: the SAME floors as `src-tauri`'s
+/// `engine_*` commands - arm/disarm = admin, dry-run = editor). Returns the
+/// caller's USERNAME on success (`Identity.id` IS the username, spec
+/// convention) so it can be threaded into [`EngineControl`], whose own
+/// `write_audit_log` row is then attributed to the right actor - the ONLY
+/// audit either path writes for arm/disarm/dry-run (this layer must not add a
+/// second). Records a `denied` entry (`resource: "engine"`) for an
+/// authenticated-but-underprivileged caller and returns `Forbidden`; no valid
+/// session returns `Unauthorized` (not audited - same reasoning as
+/// [`require_editor`]). The engine router as a whole sits behind `require_auth`,
+/// so `engine_status` (viewer+) needs no inline check - any authenticated role
+/// passes it.
+async fn require_engine_role(
+    auth: &AuthState,
+    audit: &AuditLogService,
+    headers: &HeaderMap,
+    min: Role,
+    method: &str,
+    path: &str,
+) -> Result<String, BantoError> {
+    match actor_identity(headers, auth) {
+        Some(identity)
+            if Role::from_str(&identity.role)
+                .map(|role| role.at_least(min))
+                .unwrap_or(false) =>
+        {
+            Ok(identity.id)
+        }
+        Some(identity) => {
+            audit
+                .record(AuditEntry {
+                    actor_username: Some(&identity.id),
+                    actor_role: Some(&identity.role),
+                    action: "denied",
+                    resource: "engine",
+                    entity_id: None,
+                    detail: Some(json!({ "method": method, "path": path })),
+                    origin: "rest",
+                    result: "denied",
+                })
+                .await;
+            Err(BantoError::Forbidden)
+        }
+        None => Err(BantoError::Unauthorized),
+    }
+}
+
+/// State for `/api/engine/*` (invariant §1 両経路対称, plan W3-B2): the SHARED
+/// swappable [`SharedEngineControl`] slot the desktop app also holds (so both
+/// paths act on the same live engine, and a Tauri-side `engine_reload` that
+/// swaps the slot is seen here automatically), plus `AuthState`/
+/// `AuditLogService` for the same RBAC gate + denial audit the Tauri commands
+/// apply. The arm/disarm/dry-run AUDIT itself is written INSIDE `EngineControl`
+/// (to `write_audit_log`), so these handlers add ONLY authorization + actor
+/// resolution - never a second audit.
+#[derive(Clone)]
+struct EngineState {
+    control: SharedEngineControl,
+    auth: AuthState,
+    audit: AuditLogService,
+}
+
+/// The current control handle, or a clear error if the engine never started
+/// (the same message the Tauri side uses). `None` is not an expected path once
+/// the app/server has launched an engine.
+async fn engine_control_now(state: &EngineState) -> Result<EngineControl, BantoError> {
+    state
+        .control
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| BantoError::Other("自動書き込みエンジンが起動していません".to_string()))
+}
+
+/// `POST /api/engine/arm` (admin): arm the engine (enable live physical
+/// writes). Audited by `EngineControl` with the resolved actor.
+async fn engine_arm(
+    State(state): State<EngineState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let actor = require_engine_role(
+        &state.auth,
+        &state.audit,
+        &headers,
+        Role::Admin,
+        "POST",
+        "/api/engine/arm",
+    )
+    .await?;
+    engine_control_now(&state).await?.arm(Some(&actor)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/engine/disarm` (admin): disarm the engine (suppress all physical
+/// writes). Kept at `admin` to match arm and keep the two paths' RBAC table
+/// symmetric (see `src-tauri`'s `engine_disarm`).
+async fn engine_disarm(
+    State(state): State<EngineState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let actor = require_engine_role(
+        &state.auth,
+        &state.audit,
+        &headers,
+        Role::Admin,
+        "POST",
+        "/api/engine/disarm",
+    )
+    .await?;
+    engine_control_now(&state)
+        .await?
+        .disarm(Some(&actor))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DryRunRequest {
+    on: bool,
+}
+
+/// `POST /api/engine/dry-run` (editor): turn dry-run on/off. Lower floor than
+/// arm/disarm because dry-run can only make the engine safer.
+async fn engine_dry_run(
+    State(state): State<EngineState>,
+    headers: HeaderMap,
+    Json(body): Json<DryRunRequest>,
+) -> Result<StatusCode, ApiError> {
+    let actor = require_engine_role(
+        &state.auth,
+        &state.audit,
+        &headers,
+        Role::Editor,
+        "POST",
+        "/api/engine/dry-run",
+    )
+    .await?;
+    engine_control_now(&state)
+        .await?
+        .set_dry_run(body.on, Some(&actor))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/engine/status` (viewer+): the engine's arm/dry-run snapshot.
+/// Read-only, so not audited (any authenticated role - the router's
+/// `require_auth` is the only gate).
+async fn engine_status(State(state): State<EngineState>) -> Result<Json<EngineStatus>, ApiError> {
+    Ok(Json(engine_control_now(&state).await?.status()))
+}
+
+/// `/api/engine/*` (invariant §1 両経路対称, plan W3-B2): arm/disarm (admin),
+/// dry-run (editor), status (viewer+). Guarded by `require_auth` for the whole
+/// router (status needs no more); the mutating handlers each additionally call
+/// [`require_engine_role`] with their floor - the same read/write floor split
+/// as [`write_registry_router`].
+///
+/// There is deliberately NO `POST /api/engine/reload` here: reload must tear
+/// down and rebuild the `Engine` object itself, which is owned by the desktop
+/// app's `AppState` (not reachable from this crate's REST state). The REST path
+/// instead SHARES the control slot, so a Tauri-side `engine_reload` is
+/// transparently reflected by every route above (arm/disarm/dry-run/status act
+/// on the rebuilt engine with no REST change). Exposing reload over REST is
+/// left to a later milestone if a headless deployment ever needs it.
+fn engine_router(control: SharedEngineControl, audit: AuditLogService, auth: AuthState) -> Router {
+    let state = EngineState {
+        control,
+        auth: auth.clone(),
+        audit,
+    };
+    Router::new()
+        .route("/api/engine/arm", post(engine_arm))
+        .route("/api/engine/disarm", post(engine_disarm))
+        .route("/api/engine/dry-run", post(engine_dry_run))
+        .route("/api/engine/status", get(engine_status))
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(auth, require_auth))
+}
+
 /// Compose the full `/api/*` router (spec §11.1): auth routes (login/
 /// logout/check/identity from `banto_server` - wrapped with an audit-log
 /// hook for `logout`, spec M14 - plus status/setup/change-password here
@@ -1458,6 +1642,7 @@ pub fn api_router(
     backup: BackupService,
     write_targets: WriteTargetService,
     write_rules: WriteRuleService,
+    engine_control: SharedEngineControl,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
     allow_setup: bool,
@@ -1491,6 +1676,7 @@ pub fn api_router(
             audit.clone(),
             auth.clone(),
         ))
+        .merge(engine_router(engine_control, audit.clone(), auth.clone()))
         .merge(backups_router(backup, audit, auth.clone()))
         .merge(ui_settings_router(settings, auth))
         .layer(middleware::from_fn(require_banto_client_header))
@@ -1523,6 +1709,16 @@ mod tests {
             PathBuf::from("unused-in-tests").join("relay-wright.sqlite3"),
             pool,
         )
+    }
+
+    /// A shared engine-control slot for router helpers that do NOT exercise
+    /// `/api/engine/*` - the engine never started, so it holds `None`. The
+    /// engine routes would report "not started", but these tests never hit
+    /// them. Tests that DO exercise `/api/engine/*` use
+    /// [`router_with_role_tokens_and_engine`] instead, which starts a real
+    /// (idle) engine over the router's own pool.
+    fn no_engine_control() -> SharedEngineControl {
+        std::sync::Arc::new(tokio::sync::Mutex::new(None))
     }
 
     fn demo_auth() -> AuthState {
@@ -1608,6 +1804,7 @@ mod tests {
                 backup,
                 write_targets,
                 write_rules,
+                no_engine_control(),
                 auth,
                 tx,
                 false,
@@ -1640,6 +1837,7 @@ mod tests {
                 backup,
                 write_targets,
                 write_rules,
+                no_engine_control(),
                 auth,
                 tx,
                 false,
@@ -1702,6 +1900,7 @@ mod tests {
             backup,
             write_targets,
             write_rules,
+            no_engine_control(),
             auth,
             tx,
             allow_setup,
@@ -1906,6 +2105,7 @@ mod tests {
                 backup,
                 write_targets,
                 write_rules,
+                no_engine_control(),
                 auth,
                 tx,
                 allow_setup,
@@ -2274,6 +2474,7 @@ mod tests {
             backup,
             write_targets,
             write_rules,
+            no_engine_control(),
             auth,
             tx,
             false,
@@ -2346,6 +2547,7 @@ mod tests {
             backup,
             write_targets,
             write_rules,
+            no_engine_control(),
             auth,
             tx,
             false,
@@ -2980,6 +3182,7 @@ mod tests {
             backup,
             write_targets,
             write_rules,
+            no_engine_control(),
             auth,
             tx,
             false,
@@ -3058,5 +3261,189 @@ mod tests {
             .rows
             .iter()
             .any(|r| r.action == "create" && r.resource == "write_targets"));
+    }
+
+    // --- W3-B2: engine control dual-path symmetry (REST half) ---------------
+
+    /// Router with real admin/editor/viewer accounts + tokens AND a real
+    /// (idle) auto-write engine started over the router's own pool, so the
+    /// `/api/engine/*` tests can assert both the HTTP result AND the
+    /// `write_audit_log` row `EngineControl` writes. Returns the shared pool
+    /// for those audit-table assertions. Zero connections/rules -> the engine
+    /// is idle, which is all these RBAC/audit tests need.
+    async fn router_with_role_tokens_and_engine(
+    ) -> (Router, sqlx::SqlitePool, String, String, String) {
+        let pool = migrate_memory().await.expect("migrate_memory");
+        let (tx, _rx) = broadcast::channel(16);
+        let users = UsersService::new(pool.clone());
+        let settings = SettingsService::new(pool.clone());
+        let backup = unused_backup_service(pool.clone());
+        let audit = AuditLogService::new(pool.clone());
+        let write_targets = WriteTargetService::new(pool.clone());
+        let write_rules = WriteRuleService::new(pool.clone());
+
+        users
+            .setup_first_user("admin", "password123", "管理者")
+            .await
+            .expect("setup_first_user");
+        users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create editor");
+        users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create viewer");
+
+        let auth = AuthState::new(audited_credential_verifier(users.clone(), audit.clone()));
+        let admin_token = auth
+            .login("admin", "password123")
+            .await
+            .expect("admin login");
+        let editor_token = auth
+            .login("editor", "password123")
+            .await
+            .expect("editor login");
+        let viewer_token = auth
+            .login("viewer", "password123")
+            .await
+            .expect("viewer login");
+
+        // A real (idle) engine over the SAME pool, so the arm/dry-run
+        // `write_audit_log` rows land where these tests can query them. The
+        // `Engine` object itself is not needed after this - the shared control
+        // holds its own arming state + pool handle (dropping the engine leaves
+        // arm/disarm/dry-run fully functional).
+        let (_engine, control) = crate::engine::Engine::start(
+            pool.clone(),
+            Vec::new(),
+            crate::engine::EngineConfig::default(),
+        )
+        .await
+        .expect("idle engine start");
+        let engine_control: SharedEngineControl =
+            std::sync::Arc::new(tokio::sync::Mutex::new(Some(control)));
+
+        let router = api_router(
+            users,
+            settings,
+            audit,
+            backup,
+            write_targets,
+            write_rules,
+            engine_control,
+            auth,
+            tx,
+            false,
+        );
+        (router, pool, admin_token, editor_token, viewer_token)
+    }
+
+    async fn write_audit_count(pool: &sqlx::SqlitePool, action: &str, result: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM write_audit_log WHERE action = ? AND result = ?")
+            .bind(action)
+            .bind(result)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// An `admin` can arm the engine over REST (204), the flip is written to
+    /// `write_audit_log` exactly once (by `EngineControl`, not double-audited
+    /// by the route), and `GET /api/engine/status` then reports `armed: true` -
+    /// the REST half of the arm+audit symmetry (its Tauri twin lives in
+    /// `src-tauri`'s tests).
+    #[tokio::test]
+    async fn rest_admin_can_arm_over_rest_and_it_is_audited() {
+        let (router, pool, admin, _editor, _viewer) = router_with_role_tokens_and_engine().await;
+
+        let response = router
+            .clone()
+            .oneshot(post_json_auth("/api/engine/arm", &admin, json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        assert_eq!(
+            write_audit_count(&pool, "arm", "ok").await,
+            1,
+            "exactly one arm row (the route must not double-audit)"
+        );
+
+        let status = router
+            .oneshot(get_auth("/api/engine/status", &admin))
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        assert_eq!(body_json(status).await["armed"], true);
+    }
+
+    /// An `editor` is denied (403) arming over REST - arm requires `admin` - and
+    /// the denial is recorded (`action: "denied"`, `resource: "engine"`,
+    /// `origin: "rest"`), matching the Tauri `require_role` denial audit.
+    #[tokio::test]
+    async fn rest_editor_cannot_arm_and_denial_is_audited() {
+        let (router, pool, _admin, editor, _viewer) = router_with_role_tokens_and_engine().await;
+
+        let response = router
+            .oneshot(post_json_auth("/api/engine/arm", &editor, json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Nothing armed.
+        assert_eq!(write_audit_count(&pool, "arm", "ok").await, 0);
+        // The RBAC denial IS recorded to the M14 audit log.
+        let entries = AuditLogService::new(pool)
+            .list(ListParams::default())
+            .await
+            .unwrap();
+        assert!(
+            entries
+                .rows
+                .iter()
+                .any(|r| r.action == "denied" && r.resource == "engine"),
+            "expected a denied engine entry, got {:?}",
+            entries.rows
+        );
+    }
+
+    /// An `editor` CAN toggle dry-run over REST (204, lower floor than
+    /// arm/disarm), it is written to `write_audit_log`, and status reflects it.
+    #[tokio::test]
+    async fn rest_editor_can_toggle_dry_run() {
+        let (router, pool, _admin, editor, _viewer) = router_with_role_tokens_and_engine().await;
+
+        let response = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/engine/dry-run",
+                &editor,
+                json!({ "on": true }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(write_audit_count(&pool, "dry_run_toggle", "ok").await, 1);
+
+        let status = router
+            .oneshot(get_auth("/api/engine/status", &editor))
+            .await
+            .unwrap();
+        assert_eq!(body_json(status).await["dryRun"], true);
+    }
+
+    /// A `viewer` can read the engine status over REST (200) - status is
+    /// viewer+ (the router's `require_auth` is the only gate).
+    #[tokio::test]
+    async fn rest_viewer_can_read_engine_status() {
+        let (router, _pool, _admin, _editor, viewer) = router_with_role_tokens_and_engine().await;
+
+        let response = router
+            .oneshot(get_auth("/api/engine/status", &viewer))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["armed"], false);
     }
 }

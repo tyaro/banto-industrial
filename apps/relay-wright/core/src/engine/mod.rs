@@ -179,6 +179,14 @@ impl EngineControl {
     }
 }
 
+/// A shared, swappable slot for the live [`EngineControl`], so W3-B2's two
+/// wiring paths (the Tauri commands and the REST routes) act on the SAME
+/// control handle and an `engine_reload` that rebuilds the engine is seen by
+/// both automatically. `None` before the engine has started (or if it failed
+/// to start at launch); the arm/disarm/dry-run/status layer surfaces that as a
+/// plain "engine not running" error rather than panicking.
+pub type SharedEngineControl = std::sync::Arc<tokio::sync::Mutex<Option<EngineControl>>>;
+
 /// The running engine: owns the broker and the two spawned tasks, and the
 /// shutdown trigger that stops all of them.
 pub struct Engine {
@@ -267,6 +275,29 @@ impl Engine {
             engine_task,
         };
         Ok((engine, control))
+    }
+
+    /// Build and start the engine straight from the current DB state (W3-B2's
+    /// wiring layer): loads every ENABLED [`PlcConnection`] (only the SLMP ones
+    /// are actually managed - [`Engine::start`] filters and warns on the rest)
+    /// and every ENABLED rule (compiled inside [`Engine::start`]), then starts
+    /// the poller/writer tasks. Like every other entry point it starts
+    /// **disarmed** (the in-memory armed flag is always `false` at startup,
+    /// invariant §1) and returns promptly even if a PLC is unreachable (the
+    /// broker reconnects in the background). A convenience over [`Engine::start`]
+    /// so the Tauri/REST layer never has to know how to enumerate connections.
+    pub async fn start_from_db(
+        pool: SqlitePool,
+        config: EngineConfig,
+    ) -> Result<(Engine, EngineControl), BantoError> {
+        let connections: Vec<PlcConnection> = banto_tags::PlcConnectionService::new(pool.clone())
+            .list(banto_core::ListParams::default())
+            .await?
+            .rows
+            .into_iter()
+            .filter(|c| c.enabled)
+            .collect();
+        Engine::start(pool, connections, config).await
     }
 
     /// Stop the engine cleanly and promptly. Flips the shared shutdown signal so
