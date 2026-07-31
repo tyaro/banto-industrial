@@ -218,6 +218,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "banto-plc-write"
+version = "0.1.0"
+dependencies = [
+ "banto-plc",
+ "slmp",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "banto-server"
 version = "0.1.0"
 source = "git+https://github.com/tyaro/banto.git?tag=v0.1.1#314c03a907ed4d515842e49496d2849b49a4ccbe"

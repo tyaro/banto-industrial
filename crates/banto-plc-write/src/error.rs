@@ -1,0 +1,200 @@
+//! [`PlcWriteError`]: every failure mode a [`crate::client::PlcWriteClient`]
+//! can report. The write-side twin of `banto_plc::PlcError` (which this crate
+//! deliberately does not reuse: a write has failure modes a read does not - a
+//! value that will not fit its target register - and reusing the read type
+//! would either force those into an ill-fitting variant or grow the read type
+//! with write-only cases, exactly the coupling I5 exists to avoid).
+//!
+//! Same two-bucket split as the read side (see `banto-plc/src/error.rs`'s
+//! module doc): a whole-call failure returned as `Err(PlcWriteError)` from
+//! `connect`/`write_batch` (connection-level - the socket is unusable), versus
+//! a single request's reason inside [`crate::types::WriteResult::Bad`]
+//! (per-request - the connection is fine, only this one write failed). The
+//! `is_connection_fatal` switch below is what decides which bucket a failure
+//! lands in, and it defaults to *fatal* for the same safety reason the read
+//! side does.
+
+use thiserror::Error;
+
+/// All fields are owned (`String`/`u16`) and never wrap a non-`Clone`
+/// `std::io::Error`, so one `PlcWriteError` can be cloned into every
+/// [`crate::types::WriteResult::Bad`] entry a failed group's requests share and
+/// tests can assert on it with `==` - identical reasoning to
+/// `banto_plc::PlcError`.
+#[derive(Debug, Clone, PartialEq, Error)]
+pub enum PlcWriteError {
+    /// TCP connect did not complete within the configured connect timeout.
+    /// Connection-fatal.
+    #[error("接続タイムアウト: {0}")]
+    ConnectTimeout(String),
+
+    /// A TCP-level failure (refused, reset, broken pipe, unexpected EOF, DNS
+    /// failure). The `String` is the underlying `std::io::Error`'s `Display`
+    /// text. Connection-fatal.
+    #[error("接続エラー: {0}")]
+    Connection(String),
+
+    /// `write_batch`/`disconnect` called before a successful `connect`, or
+    /// after a connection-level failure already tore the socket down.
+    /// Connection-fatal.
+    #[error("未接続です。connect() を先に呼んでください")]
+    NotConnected,
+
+    /// The CPU did not answer a write within the configured response timeout.
+    /// Connection-fatal for the same reason it is on the read side: a
+    /// late/never response leaves the byte stream desynchronized for whatever
+    /// comes next, so the whole call fails and the socket is torn down rather
+    /// than risk reading a stale reply as the next write's acknowledgement.
+    #[error("応答タイムアウト")]
+    ResponseTimeout,
+
+    /// The response frame did not parse as valid SLMP: bad response code,
+    /// serial-id/route mismatch, truncated or length-inconsistent frame.
+    /// Connection-fatal (a malformed frame means the client can no longer
+    /// trust its position in the byte stream).
+    #[error("プロトコルエラー: {0}")]
+    Protocol(String),
+
+    /// A [`crate::types::WriteRequest`] carries an address written in a
+    /// different protocol's notation than the client speaks - e.g. a Modbus
+    /// reference number handed to the SLMP write planner. A configuration
+    /// error, resolved before any wire traffic and reported as a per-request
+    /// `Bad` so one mis-configured target never costs its batch-mates their
+    /// write. The write-side analogue of `banto_plc::PlcError::AddressProtocolMismatch`.
+    #[error("アドレス表記 {actual} は {expected} クライアントでは扱えません")]
+    AddressProtocolMismatch { expected: String, actual: String },
+
+    /// A [`crate::types::WriteRequest`]'s `data_type` cannot live at its
+    /// address's device - a `bit` type at a word device or a numeric type at a
+    /// bit device. Resolved by [`crate::slmp::planning::plan_slmp_writes`]
+    /// before any wire traffic, so it only ever appears as a per-request `Bad`.
+    #[error("データ型 {data_type} はデバイス {area} と組み合わせられません")]
+    UnsupportedCombination { area: String, data_type: String },
+
+    /// The [`banto_plc::TagValue`] handed in does not match the kind its
+    /// `data_type` needs - a [`banto_plc::TagValue::Bit`] for a numeric
+    /// data type, or a [`banto_plc::TagValue::F64`] for `bit`. A caller mistake
+    /// (the read path never produces a mismatched pair, but a rule engine
+    /// building a write from a constant can), caught before any wire traffic,
+    /// so it is a per-request `Bad`. Write-only: the read side never carries a
+    /// value *in*, so it has no equivalent.
+    #[error("書き込み値 {value_kind} はデータ型 {data_type} と一致しません")]
+    ValueTypeMismatch {
+        data_type: String,
+        value_kind: String,
+    },
+
+    /// The numeric value cannot be represented in its target register width -
+    /// out of range (e.g. 70000 into a `u16`) or non-integral into an integer
+    /// type (e.g. 1.5 into an `i16`). Caught before any wire traffic - writing
+    /// a silently-truncated value to a PLC output is exactly the kind of
+    /// destructive surprise this crate's safety posture exists to prevent - so
+    /// it is a per-request `Bad`. Write-only: decoding a read *widens* into
+    /// `f64` and can never overflow, so there is no read-side twin.
+    #[error("書き込み値 {value} はデータ型 {data_type} で表現できません: {detail}")]
+    ValueOutOfRange {
+        data_type: String,
+        value: String,
+        detail: String,
+    },
+
+    /// The MELSEC CPU answered a bulk write with a well-formed SLMP response
+    /// frame carrying a non-zero end code - e.g. `0xC059` (wrong command) or
+    /// `0xC061` (wrong length), or a device-protection/latch refusal. The write
+    /// analogue of `banto_plc::PlcError::SlmpEndCode`, and non-fatal for the
+    /// same reason: the wrapped `slmp` crate validates the frame's declared
+    /// data length against what arrived *before* it looks at the end code, so
+    /// reaching an end code proves a complete, length-consistent frame and the
+    /// byte stream is still aligned to a request boundary. Every other group in
+    /// the same `write_batch` call still gets its chance.
+    ///
+    /// See `src/slmp/mod.rs`'s module doc for how this is told apart from a
+    /// framing failure, which is fatal.
+    #[error("PLC異常応答: SLMP終了コード=0x{code:04X} ({message})")]
+    SlmpEndCode { code: u16, message: String },
+}
+
+impl PlcWriteError {
+    /// True for the variants that mean "the socket/framing can no longer be
+    /// trusted", so the owner must drop the session and the caller must
+    /// `connect()` again. Mirrors `banto_plc::PlcError::is_connection_fatal`
+    /// exactly, including the *fatal-by-default* posture: a variant added later
+    /// is treated as connection-fatal until someone deliberately lists it among
+    /// the per-request exclusions here, because a needless reconnect costs one
+    /// cycle whereas trusting a desynchronized stream after a write could
+    /// acknowledge a write that never landed.
+    ///
+    /// The per-request exclusions are exactly the outcomes that leave the
+    /// connection perfectly usable for the next group: a device-side
+    /// [`Self::SlmpEndCode`] (the CPU refused one write but answered in full),
+    /// and the four configuration/value errors resolved before any wire
+    /// traffic ([`Self::AddressProtocolMismatch`],
+    /// [`Self::UnsupportedCombination`], [`Self::ValueTypeMismatch`],
+    /// [`Self::ValueOutOfRange`]).
+    pub fn is_connection_fatal(&self) -> bool {
+        !matches!(
+            self,
+            PlcWriteError::SlmpEndCode { .. }
+                | PlcWriteError::AddressProtocolMismatch { .. }
+                | PlcWriteError::UnsupportedCombination { .. }
+                | PlcWriteError::ValueTypeMismatch { .. }
+                | PlcWriteError::ValueOutOfRange { .. }
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`PlcWriteError::is_connection_fatal`] is the single switch deciding
+    /// whether a failure costs one target its write or costs the whole
+    /// connection, so every variant is pinned down explicitly rather than left
+    /// to the `!matches!` default - same test shape as the read side.
+    #[test]
+    fn per_request_variants_are_not_connection_fatal() {
+        let per_request = [
+            PlcWriteError::SlmpEndCode {
+                code: 0xC059,
+                message: "WrongCommand".to_string(),
+            },
+            PlcWriteError::AddressProtocolMismatch {
+                expected: "slmp".to_string(),
+                actual: "modbus-ref".to_string(),
+            },
+            PlcWriteError::UnsupportedCombination {
+                area: "D (word_device)".to_string(),
+                data_type: "bit".to_string(),
+            },
+            PlcWriteError::ValueTypeMismatch {
+                data_type: "u16".to_string(),
+                value_kind: "bit".to_string(),
+            },
+            PlcWriteError::ValueOutOfRange {
+                data_type: "u16".to_string(),
+                value: "70000".to_string(),
+                detail: "out of range".to_string(),
+            },
+        ];
+        for err in per_request {
+            assert!(
+                !err.is_connection_fatal(),
+                "{err:?} must stay a per-request Bad, not tear the connection down"
+            );
+        }
+    }
+
+    #[test]
+    fn connection_level_variants_are_connection_fatal() {
+        let fatal = [
+            PlcWriteError::ConnectTimeout("host:5007".to_string()),
+            PlcWriteError::Connection("connection reset".to_string()),
+            PlcWriteError::NotConnected,
+            PlcWriteError::ResponseTimeout,
+            PlcWriteError::Protocol("truncated frame".to_string()),
+        ];
+        for err in fatal {
+            assert!(err.is_connection_fatal(), "{err:?} should be fatal");
+        }
+    }
+}

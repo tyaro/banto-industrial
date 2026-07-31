@@ -1,6 +1,7 @@
 # banto-industrial workspace. Members are added milestone by milestone
-# (I1: banto-tags, I2: banto-plc, I3a: banto-tstore, I3b: banto-collect,
-# I4: banto-tsquery, R1-A: apps/chronogazer/{core,src-tauri}, W1:
+# (I1: banto-tags, I2: banto-plc, I2a: SLMP read in banto-plc, I5:
+# banto-plc-write (SLMP write, separate trait/crate), I3a: banto-tstore,
+# I3b: banto-collect, I4: banto-tsquery, R1-A: apps/chronogazer/{core,src-tauri}, W1:
 # apps/relay-wright/{core,src-tauri} - see docs/plan.md / docs/r1-plan.md /
 # the relay-wright plan `luminous-discovering-goblet.md`). banto crates are
 # consumed via git-tag references (banto docs/publishing.md).
@@ -9,6 +10,7 @@ resolver = "2"
 members = [
     "crates/banto-tags",
     "crates/banto-plc",
+    "crates/banto-plc-write",
     "crates/banto-tstore",
     "crates/banto-collect",
     "crates/banto-tsquery",
