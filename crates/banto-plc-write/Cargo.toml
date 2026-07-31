@@ -1,0 +1,45 @@
+# I5 (docs/plan.md / the relay-wright plan `luminous-discovering-goblet.md`):
+# the *write* primitive for MELSEC SLMP, deliberately a separate crate from the
+# read-only `banto-plc` rather than a method on its `PlcClient` trait - see
+# `banto-plc/src/client.rs`'s module doc for why a write must never sit unused
+# on every read-only consumer (ChronoGazer, banto-collect). This crate DEPENDS
+# ON `banto-plc` to reuse its shared vocabulary (`Address`, `DataType`,
+# `TagValue`, `WordOrder`, `SlmpDevice`, `SlmpConfig`, ...) rather than
+# duplicating it.
+[package]
+name = "banto-plc-write"
+description = "I5: MELSEC MC (SLMP) 書き込みクライアント - 読み取り専用 banto-plc とは別 trait/別クレート (docs/plan.md I5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+# Shared read-side vocabulary this crate builds on (Address/DataType/TagValue/
+# WordOrder/SlmpDevice/SlmpAccess/SlmpConfig/SlmpCpu/BoxFuture). The whole point
+# of I5 being a separate crate is that this dependency runs one way only: the
+# read crate never depends on the write crate.
+banto-plc = { path = "../banto-plc" }
+# Same wrapped MELSEC framing crate the read side uses (I2a), pinned once in the
+# workspace Cargo.toml. Here it is the *write* commands (`bulk_write`) that are
+# called instead of the read ones.
+slmp = { workspace = true }
+# Only the pieces this crate's own code touches: TCP connect/response timeouts
+# (`time`). Frame I/O happens inside the wrapped `slmp` crate, not here. No
+# "rt"/"macros" - this crate never spawns tasks or defines its own runtime;
+# that is the consuming app's (or the tests') job. (Cargo feature-unification
+# still hands this crate full tokio via `slmp`'s own `features = ["full"]`, same
+# as banto-plc - the narrow list is a statement of what this crate's code uses.)
+tokio = { workspace = true, features = ["time"] }
+
+# Exposes the in-process SLMP read+write simulator beyond this crate's own tests,
+# so W3's engine integration tests can drive writes-then-read-back against a fake
+# CPU without standing up their own. Not enabled by default (it opens a real
+# loopback TCP listener). Pulls in tokio's "rt" for the accept/handler tasks the
+# simulator spawns, mirroring banto-plc's own `simulator` feature.
+[features]
+simulator = ["tokio/rt"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
