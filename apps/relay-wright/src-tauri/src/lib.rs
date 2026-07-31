@@ -30,6 +30,9 @@ use relay_wright_core::assets::FrontendAssets;
 use relay_wright_core::audit::{AuditEntry, AuditLogEntry, AuditLogService};
 use relay_wright_core::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 use relay_wright_core::db::init_db;
+use relay_wright_core::engine::{
+    Engine, EngineConfig, EngineControl, EngineStatus, SharedEngineControl,
+};
 use relay_wright_core::events::event_channel;
 use relay_wright_core::rest::{api_router, audited_credential_verifier};
 use relay_wright_core::settings::{AuditSettings, AuthSettings, ServerSettings, SettingsService};
@@ -99,6 +102,30 @@ struct AppState {
     /// Write-rule registry + its inline conditions (plan W2), with the
     /// write-loop cycle-detection guard on save. Same shared pool.
     write_rules: WriteRuleService,
+    /// The one shared SQLite pool (same on-disk DB as every service above).
+    /// Held directly - not just via the service handles - so `engine_reload`
+    /// can hand it to `Engine::start_from_db` to rebuild the engine from the
+    /// current connections/rules (plan W3-B2). Named via `relay_wright_core`'s
+    /// [`relay_wright_core::db::DbPool`] alias so this crate keeps its
+    /// no-new-dependencies invariant (no direct `sqlx` dependency).
+    pool: relay_wright_core::db::DbPool,
+    /// The running auto-write engine (plan W3-B2): owns the poller/writer
+    /// tasks and the PLC broker. `Option` so `engine_reload` (and app exit)
+    /// can `.take()` it to call `Engine::shutdown`, which consumes it; `None`
+    /// only in the (in practice unreachable) case that the engine failed to
+    /// start at launch. Behind an async mutex so a reload holds the slot
+    /// exclusively across its teardown+rebuild await points.
+    engine: AsyncMutex<Option<Engine>>,
+    /// The engine's arm/disarm/dry-run control handle (plan W3-B2), in a
+    /// SHARED swappable slot ([`SharedEngineControl`]) whose Arc is also cloned
+    /// into the embedded REST server's router state - so both wiring paths act
+    /// on the SAME control and `engine_reload` (which swaps this slot) is seen
+    /// by both (invariant §1 dual-path symmetry). The four engine commands
+    /// clone the current control out from under the lock and call it;
+    /// arm/disarm/set_dry_run already persist + write a `write_audit_log` row
+    /// with the passed actor, so this layer adds only authorization + actor
+    /// resolution - never a second audit.
+    engine_control: SharedEngineControl,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -627,6 +654,7 @@ async fn start_embedded_server(
     backup: BackupService,
     write_targets: WriteTargetService,
     write_rules: WriteRuleService,
+    engine_control: SharedEngineControl,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
     config: ServerConfig,
@@ -635,6 +663,8 @@ async fn start_embedded_server(
     // the `auth_setup` command above (`invoke()`, no network involved), not
     // this REST endpoint. Only `relay-wright-serve` (this repo's Tauri-free dev
     // vehicle) opts into `POST /api/auth/setup` via `BANTO_ALLOW_SETUP=1`.
+    // `engine_control` is the SAME shared slot the Tauri engine commands use
+    // (invariant §1 dual-path symmetry) - see `AppState::engine_control`.
     let router = api_router(
         users,
         settings,
@@ -642,6 +672,7 @@ async fn start_embedded_server(
         backup,
         write_targets,
         write_rules,
+        engine_control,
         auth,
         events,
         false,
@@ -695,6 +726,7 @@ async fn server_apply(
                 state.backup.clone(),
                 state.write_targets.clone(),
                 state.write_rules.clone(),
+                state.engine_control.clone(),
                 state.rest_auth.clone(),
                 state.events.clone(),
                 ServerConfig {
@@ -1506,6 +1538,130 @@ async fn write_rules_delete(state: State<'_, AppState>, id: i64) -> Result<(), B
     write_rules_delete_body(&state, id).await
 }
 
+// --- W3-B2: auto-write engine control ---------------------------------------
+//
+// The Tauri half of the engine's dual-path (invariant §1 両経路対称): the same
+// authorization floors and the same audit as `crate::rest`'s `/api/engine/*`
+// routes. arm/disarm require `admin` (arming enables LIVE physical writes to
+// industrial equipment - the strongest gate, per plan W3-B2's safety notes);
+// dry-run toggle requires `editor`; `engine_status` is a `viewer`+ read.
+//
+// The arm/disarm/dry-run AUDIT is written INSIDE `EngineControl` (to the
+// `write_audit_log` table, with the actor resolved below), so this layer must
+// NOT `state.audit.record` a second entry - it adds ONLY the RBAC gate and the
+// actor username. A role DENIAL is still recorded by `require_role` to the
+// M14 audit log, exactly as every other command here.
+
+/// Clone the current [`EngineControl`] out from under the lock so the actual
+/// arm/disarm/dry-run/status call does not hold the `AppState` engine lock
+/// across its own await points (and so it cannot deadlock a concurrent
+/// `engine_reload`, which is the only path that swaps the handle). `None` -
+/// the engine failed to start at launch - is surfaced as a plain error rather
+/// than panicking.
+async fn current_engine_control(state: &AppState) -> Result<EngineControl, BantoError> {
+    state
+        .engine_control
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| BantoError::Other("自動書き込みエンジンが起動していません".to_string()))
+}
+
+/// Body of [`engine_arm`], split out so the role gate + state flip is testable
+/// with a plain `&AppState` (spec M14 split-function pattern).
+async fn engine_arm_body(state: &AppState) -> Result<(), BantoError> {
+    let actor = require_role(state, Role::Admin, "engine").await?;
+    current_engine_control(state)
+        .await?
+        .arm(Some(&actor.username))
+        .await
+}
+
+/// `admin`-only (plan W3-B2): arm the engine (enable live physical writes).
+#[tauri::command]
+async fn engine_arm(state: State<'_, AppState>) -> Result<(), BantoError> {
+    engine_arm_body(&state).await
+}
+
+/// Body of [`engine_disarm`] (see [`engine_arm_body`]).
+async fn engine_disarm_body(state: &AppState) -> Result<(), BantoError> {
+    let actor = require_role(state, Role::Admin, "engine").await?;
+    current_engine_control(state)
+        .await?
+        .disarm(Some(&actor.username))
+        .await
+}
+
+/// `admin`-only (plan W3-B2): disarm the engine (suppress all physical
+/// writes). Disarm is safety-positive and could defensibly be `editor`, but it
+/// is kept at `admin` to match arm and keep the two paths' RBAC table
+/// symmetric (invariant §1) - one role governs the arm/disarm pair.
+#[tauri::command]
+async fn engine_disarm(state: State<'_, AppState>) -> Result<(), BantoError> {
+    engine_disarm_body(&state).await
+}
+
+/// Body of [`engine_set_dry_run`] (see [`engine_arm_body`]).
+async fn engine_set_dry_run_body(state: &AppState, on: bool) -> Result<(), BantoError> {
+    let actor = require_role(state, Role::Editor, "engine").await?;
+    current_engine_control(state)
+        .await?
+        .set_dry_run(on, Some(&actor.username))
+        .await
+}
+
+/// `editor`+ (plan W3-B2): turn dry-run on/off (evaluate + audit would-be
+/// writes, but never touch the PLC). Lower floor than arm/disarm because
+/// dry-run can only make the engine SAFER, never enable a physical write.
+#[tauri::command]
+async fn engine_set_dry_run(state: State<'_, AppState>, on: bool) -> Result<(), BantoError> {
+    engine_set_dry_run_body(&state, on).await
+}
+
+/// `viewer`+ (plan W3-B2): read the engine's arm/dry-run snapshot. Read-only,
+/// so not audited (same convention as every other read command here).
+#[tauri::command]
+async fn engine_status(state: State<'_, AppState>) -> Result<EngineStatus, BantoError> {
+    require_role(&state, Role::Viewer, "engine").await?;
+    Ok(current_engine_control(&state).await?.status())
+}
+
+/// Body of [`engine_reload`] (see [`engine_arm_body`]).
+async fn engine_reload_body(state: &AppState) -> Result<EngineStatus, BantoError> {
+    let actor = require_role(state, Role::Admin, "engine").await?;
+    // Serialize the whole rebuild on the engine slot: hold it for the entire
+    // disarm -> shutdown -> rebuild -> store sequence so two concurrent
+    // reloads (or a reload racing app-exit shutdown) cannot interleave.
+    let mut engine_slot = state.engine.lock().await;
+    // Disarm the outgoing engine first (safety-positive; audited by the
+    // control itself). Best-effort - a disarm error must not block the
+    // teardown that follows.
+    if let Some(control) = state.engine_control.lock().await.clone() {
+        let _ = control.disarm(Some(&actor.username)).await;
+    }
+    if let Some(old) = engine_slot.take() {
+        old.shutdown().await;
+    }
+    // Rebuild from the CURRENT DB (enabled connections + rules). The rebuilt
+    // engine always starts DISARMED - never auto-re-arm (invariant §1).
+    let (engine, control) =
+        Engine::start_from_db(state.pool.clone(), EngineConfig::default()).await?;
+    let status = control.status();
+    *state.engine_control.lock().await = Some(control);
+    *engine_slot = Some(engine);
+    Ok(status)
+}
+
+/// `admin`-only (plan W3-B2): rebuild the engine from the current DB so rule
+/// edits made via the W2 CRUD take effect (rules are compiled once at
+/// `Engine::start`). Disarms and tears down the running engine, then starts a
+/// fresh one from the enabled connections/rules - the rebuilt engine is always
+/// **disarmed**. Returns the new (disarmed) status.
+#[tauri::command]
+async fn engine_reload(state: State<'_, AppState>) -> Result<EngineStatus, BantoError> {
+    engine_reload_body(&state).await
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -1541,7 +1697,10 @@ pub fn run() {
             let backup = BackupService::new(db_path.clone(), pool.clone());
             let write_targets = WriteTargetService::new(pool.clone());
             let write_rules = WriteRuleService::new(pool.clone());
-            let audit = AuditLogService::new(pool);
+            // Cloned (not moved) into `audit` so the pool stays available for
+            // the W3-B2 auto-write engine start below and `AppState.pool`
+            // (which `engine_reload` needs to rebuild the engine from the DB).
+            let audit = AuditLogService::new(pool.clone());
             // Records `login`/`login_failed` audit entries (spec M14) from
             // inside the verifier itself - see
             // `relay_wright_core::rest::audited_credential_verifier`'s doc
@@ -1712,6 +1871,36 @@ pub fn run() {
                 None
             };
 
+            // W3-B2: build and START the auto-write engine from the current DB
+            // (enabled SLMP connections + enabled rules), BEFORE the LAN server
+            // auto-start below - the embedded server shares this engine's
+            // control slot (invariant §1 dual-path symmetry). It starts
+            // DISARMED (invariant §1 - startup never auto-arms) and returns
+            // promptly even if a PLC is unreachable (the broker reconnects/backs
+            // off in its own tasks). Zero connections/rules -> a clean idle
+            // engine. A start failure is NON-FATAL: the desktop app still runs
+            // (with no engine until the next restart or `engine_reload`); the
+            // engine commands/routes then surface a clear "not started" error.
+            let (initial_engine, initial_engine_control) =
+                match tauri::async_runtime::block_on(Engine::start_from_db(
+                    pool.clone(),
+                    EngineConfig::default(),
+                )) {
+                    Ok((engine, control)) => (Some(engine), Some(control)),
+                    Err(err) => {
+                        eprintln!(
+                            "banto: 自動書き込みエンジンの起動に失敗しました（アプリは続行します）: {err}"
+                        );
+                        (None, None)
+                    }
+                };
+            // The shared, swappable control slot. Its Arc is cloned into the
+            // embedded REST server (below and in `server_apply`) so both wiring
+            // paths act on the SAME engine, and `engine_reload` (which swaps the
+            // inner control) is seen by both automatically.
+            let engine_control: SharedEngineControl =
+                std::sync::Arc::new(AsyncMutex::new(initial_engine_control));
+
             // If LAN access was left enabled on a previous run, start the
             // server immediately (spec §11.4) - from here on, the settings
             // screen only needs to *change* state via `server_apply`.
@@ -1745,6 +1934,7 @@ pub fn run() {
                     backup.clone(),
                     write_targets.clone(),
                     write_rules.clone(),
+                    engine_control.clone(),
                     rest_auth.clone(),
                     events.clone(),
                     runtime_config,
@@ -1809,6 +1999,9 @@ pub fn run() {
                 backup,
                 write_targets,
                 write_rules,
+                pool,
+                engine: AsyncMutex::new(initial_engine),
+                engine_control,
             });
 
             Ok(())
@@ -1858,9 +2051,31 @@ pub fn run() {
             write_rules_create,
             write_rules_update,
             write_rules_delete,
+            engine_arm,
+            engine_disarm,
+            engine_set_dry_run,
+            engine_status,
+            engine_reload,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // W3-B2: stop the auto-write engine cleanly when the app's event
+            // loop is exiting - flips the broker/poller/writer shutdown signal
+            // and awaits the tasks (the W3-A watch-signal design guarantees
+            // this returns promptly, never hangs). Mirrors relying on the
+            // process teardown for the LAN server, but done explicitly here so
+            // the engine's live PLC sockets close cleanly. Best-effort: if the
+            // engine never started (`None`), there is nothing to stop.
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app_handle.try_state::<AppState>() {
+                    let engine = tauri::async_runtime::block_on(state.engine.lock()).take();
+                    if let Some(engine) = engine {
+                        tauri::async_runtime::block_on(engine.shutdown());
+                    }
+                }
+            }
+        });
 }
 
 #[cfg(test)]
@@ -1891,7 +2106,13 @@ mod tests {
                 pool.clone(),
             ),
             write_targets: WriteTargetService::new(pool.clone()),
-            write_rules: WriteRuleService::new(pool),
+            write_rules: WriteRuleService::new(pool.clone()),
+            pool,
+            // Engine-less: the command-body tests that use this helper only
+            // exercise the RBAC gate, which rejects before ever touching the
+            // control (see the engine denial tests).
+            engine: AsyncMutex::new(None),
+            engine_control: std::sync::Arc::new(AsyncMutex::new(None)),
         }
     }
 
@@ -1921,7 +2142,10 @@ mod tests {
             audit: AuditLogService::new(pool.clone()),
             backup: BackupService::new(db_path, pool.clone()),
             write_targets: WriteTargetService::new(pool.clone()),
-            write_rules: WriteRuleService::new(pool),
+            write_rules: WriteRuleService::new(pool.clone()),
+            pool,
+            engine: AsyncMutex::new(None),
+            engine_control: std::sync::Arc::new(AsyncMutex::new(None)),
         };
         (state, dir)
     }
@@ -2141,6 +2365,45 @@ mod tests {
             ),
             write_targets: WriteTargetService::new(pool.clone()),
             write_rules: WriteRuleService::new(pool.clone()),
+            pool: pool.clone(),
+            engine: AsyncMutex::new(None),
+            engine_control: std::sync::Arc::new(AsyncMutex::new(None)),
+        };
+        (state, pool)
+    }
+
+    /// Like [`app_state`], but with a REAL (idle) engine started over the
+    /// in-memory pool - zero connections/rules, so the poller/writer tasks run
+    /// but do nothing. Enough to exercise the permitted arm/dry-run flip and
+    /// the `write_audit_log` row `EngineControl` writes. Returns the shared
+    /// pool too so a test can query that audit table directly.
+    async fn app_state_with_engine() -> (AppState, sqlx::SqlitePool) {
+        let pool = relay_wright_core::db::init_db_memory()
+            .await
+            .expect("init_db_memory");
+        let events = event_channel();
+        let (engine, control) = Engine::start(pool.clone(), Vec::new(), EngineConfig::default())
+            .await
+            .expect("idle engine start");
+        let state = AppState {
+            auth: Mutex::new(None),
+            users: UsersService::new(pool.clone()),
+            settings: SettingsService::new(pool.clone()),
+            events,
+            rest_auth: AuthState::new(|_u: String, _p: String| {
+                Box::pin(async { None::<banto_server::Identity> })
+            }),
+            server: AsyncMutex::new(None),
+            audit: AuditLogService::new(pool.clone()),
+            backup: BackupService::new(
+                PathBuf::from("unused-in-tests").join("relay-wright.sqlite3"),
+                pool.clone(),
+            ),
+            write_targets: WriteTargetService::new(pool.clone()),
+            write_rules: WriteRuleService::new(pool.clone()),
+            pool: pool.clone(),
+            engine: AsyncMutex::new(Some(engine)),
+            engine_control: std::sync::Arc::new(AsyncMutex::new(Some(control))),
         };
         (state, pool)
     }
@@ -2241,6 +2504,127 @@ mod tests {
                 .iter()
                 .any(|r| r.action == "denied" && r.resource == "write_targets"),
             "expected a denied entry, got {:?}",
+            entries.rows
+        );
+    }
+
+    // --- W3-B2: engine control dual-path (Tauri half) -----------------------
+
+    async fn write_audit_count(pool: &sqlx::SqlitePool, action: &str, result: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM write_audit_log WHERE action = ? AND result = ?")
+            .bind(action)
+            .bind(result)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// arm/disarm require `admin`: an `editor` (one rung below) is denied, the
+    /// engine is NOT armed, and the denial is recorded to the M14 audit log
+    /// with `resource: "engine"` - the Tauri twin of the REST `/api/engine/arm`
+    /// admin gate.
+    #[tokio::test]
+    async fn engine_arm_denies_editor_and_audits_it() {
+        let (state, pool) = app_state_with_engine().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create editor");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+
+        let err = engine_arm_body(&state).await.unwrap_err();
+        assert!(matches!(err, BantoError::Forbidden));
+
+        // Nothing armed, nothing written to the engine's own audit table.
+        assert!(!current_engine_control(&state).await.unwrap().is_armed());
+        assert_eq!(write_audit_count(&pool, "arm", "ok").await, 0);
+
+        // The RBAC denial IS recorded to the M14 audit log.
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        assert!(
+            entries
+                .rows
+                .iter()
+                .any(|r| r.action == "denied" && r.resource == "engine"),
+            "expected a denied engine entry, got {:?}",
+            entries.rows
+        );
+    }
+
+    /// An `admin` can arm: the state flips to armed AND `EngineControl` writes
+    /// exactly one `arm`/`ok` row to `write_audit_log` with the acting actor -
+    /// and this layer does NOT double-audit (no second entry).
+    #[tokio::test]
+    async fn engine_admin_can_arm_and_it_flips_state_and_audits() {
+        let (state, pool) = app_state_with_engine().await;
+        let admin = state
+            .users
+            .create_user("admin", "password123", "管理者", Role::Admin)
+            .await
+            .expect("create admin");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(admin);
+
+        engine_arm_body(&state)
+            .await
+            .expect("admin arm should succeed");
+
+        assert!(current_engine_control(&state).await.unwrap().is_armed());
+        assert_eq!(
+            write_audit_count(&pool, "arm", "ok").await,
+            1,
+            "exactly one arm row (no double-audit from the command layer)"
+        );
+
+        // And `engine_status`'s snapshot reflects the flip.
+        let status = current_engine_control(&state).await.unwrap().status();
+        assert!(status.armed);
+        assert!(!status.dry_run);
+    }
+
+    /// dry-run toggle requires only `editor` (safety-positive): an editor can
+    /// enable it, the snapshot reflects it, and a `dry_run_toggle`/`ok` row is
+    /// written by `EngineControl`.
+    #[tokio::test]
+    async fn engine_editor_can_toggle_dry_run() {
+        let (state, pool) = app_state_with_engine().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create editor");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+
+        engine_set_dry_run_body(&state, true)
+            .await
+            .expect("editor dry-run toggle should succeed");
+
+        assert!(current_engine_control(&state).await.unwrap().is_dry_run());
+        assert_eq!(write_audit_count(&pool, "dry_run_toggle", "ok").await, 1);
+    }
+
+    /// `engine_status` is a `viewer`+ read: a viewer can read the (disarmed)
+    /// snapshot, and it records nothing.
+    #[tokio::test]
+    async fn engine_status_permits_viewer_and_is_not_audited() {
+        let (state, _pool) = app_state_with_engine().await;
+        let viewer = state
+            .users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create viewer");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+
+        let status = current_engine_control(&state).await.unwrap().status();
+        require_role(&state, Role::Viewer, "engine")
+            .await
+            .expect("viewer may read status");
+        assert!(!status.armed);
+
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        assert!(
+            entries.rows.iter().all(|r| r.resource != "engine"),
+            "a status read must not record any engine audit entry, got {:?}",
             entries.rows
         );
     }
