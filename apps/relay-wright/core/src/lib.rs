@@ -8,12 +8,16 @@ pub mod assets;
 pub mod audit;
 pub mod backup;
 pub mod db;
-// W3-A (luminous-discovering-goblet.md): the PLC access broker - one live SLMP
-// session per CPU, request-driven, serializing reads and writes onto a single
-// socket. Infrastructure only: no arming, rate-limiting, rule evaluation, or
-// write auditing (that is W3-B's auto-write engine, which will hold the
-// broker's handles).
+// W3 (luminous-discovering-goblet.md): the PLC access broker (W3-A) plus the
+// auto-write engine (W3-B) built on it - condition polling, edge-triggered rule
+// evaluation, arming, rate-limiting, and log-before-write auditing. The
+// `Engine`/`EngineControl` handles here are what W3-B2's Tauri commands / REST
+// routes will wire up.
 pub mod engine;
+
+// The auto-write engine's public surface (W3-B): the running engine, its safe
+// arm/disarm/dry-run control handle, its config, and a status snapshot.
+pub use engine::{Engine, EngineConfig, EngineControl, EngineStatus};
 pub mod events;
 pub mod rest;
 pub mod settings;
