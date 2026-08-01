@@ -420,11 +420,33 @@ async function main() {
 		await page.getByText('ライン1 PLC').waitFor();
 		await shot('plc-connections.png', { fullPage: true });
 
-		// タグ登録（R1-B。収集グループセクション + 新規作成フォーム + 一覧3行）。
+		// タグ登録（リストメイン。ツールバー + 一覧3行。グループ名は一覧の
+		// 収集グループ列に出る）。
 		await page.goto(`${BASE_URL}/tags`);
 		await page.getByText('温度センサ').first().waitFor();
 		await page.getByText('ライン1 収集グループ').first().waitFor();
 		await shot('tags.png', { fullPage: true });
+
+		// 一括登録（貼り付け）モーダル: グループを選び、Excel風（タブ区切り）
+		// 2行 + CSV風（カンマ区切り）1行のデモを貼り付けてプレビューを出した
+		// 状態。3行目はデータ型が無効（word）で、行別検証エラーの表示例を兼ねる。
+		// オーバーレイは fixed なので fullPage ではなくビューポートで撮る。
+		await page.getByRole('button', { name: '一括登録（貼り付け）' }).click();
+		// モーダル内は select / textarea が各1つなので要素ロケーターで十分
+		// （ラベルは <label> 内包型で、アクセシブルネーム計算に頼らない）。
+		const bulkDialog = page.getByRole('dialog', { name: '一括登録（貼り付け）' });
+		await bulkDialog
+			.locator('select')
+			.selectOption({ label: 'ライン1 収集グループ（ライン1 PLC）' });
+		await bulkDialog
+			.locator('textarea')
+			.fill(
+				'流量センサ\tD120\ti32\tL/min\t1\n稼働カウンタ\tD130\tu32\t回\t\n異常コード,D140,word,,0'
+			);
+		await bulkDialog.getByText('3件中2件登録可能').waitFor();
+		await shot('tags-bulk-paste.png');
+		// 撮影のみ（登録はしない）— Esc でモーダルを閉じて次の画面へ。
+		await page.keyboard.press('Escape');
 
 		// 書き込み先（グリッドに2行）。
 		await page.goto(`${BASE_URL}/write-targets`);
