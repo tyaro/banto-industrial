@@ -34,9 +34,10 @@ use relay_wright_core::engine::{
     Engine, EngineConfig, EngineControl, EngineStatus, SharedEngineControl,
 };
 use relay_wright_core::events::event_channel;
+use relay_wright_core::qr_strings::{QrString, QrStringInput, QrStringService};
 use relay_wright_core::rest::{
     api_router, audited_credential_verifier, CollectionGroupPayload, PlcConnectionPayload,
-    TagPayload,
+    QrStringsReorderPayload, TagPayload,
 };
 use relay_wright_core::settings::{AuditSettings, AuthSettings, ServerSettings, SettingsService};
 use relay_wright_core::users::{Role, UserIdentity, UserSummary, UsersService};
@@ -129,6 +130,10 @@ struct AppState {
     collection_groups: CollectionGroupService,
     /// タグ registry (R1-B): same dual-path treatment.
     tags: TagService,
+    /// QR文字列リスト（デバッグ支援, /qr-codes 画面）: タッチパネルのQR
+    /// リーダーに読ませる文字列とそのSVG。Same dual-path treatment
+    /// (viewer-read / editor-write, audited on both paths).
+    qr_strings: QrStringService,
     /// The one shared SQLite pool (same on-disk DB as every service above).
     /// Held directly - not just via the service handles - so `engine_reload`
     /// can hand it to `Engine::start_from_db` to rebuild the engine from the
@@ -685,6 +690,7 @@ async fn start_embedded_server(
     plc_connections: PlcConnectionService,
     collection_groups: CollectionGroupService,
     tags: TagService,
+    qr_strings: QrStringService,
     engine_control: SharedEngineControl,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
@@ -707,6 +713,7 @@ async fn start_embedded_server(
         plc_connections,
         collection_groups,
         tags,
+        qr_strings,
         engine_control,
         auth,
         events,
@@ -765,6 +772,7 @@ async fn server_apply(
                 state.plc_connections.clone(),
                 state.collection_groups.clone(),
                 state.tags.clone(),
+                state.qr_strings.clone(),
                 state.engine_control.clone(),
                 state.rest_auth.clone(),
                 state.events.clone(),
@@ -1932,6 +1940,148 @@ async fn tags_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoErr
     tags_delete_body(&state, id).await
 }
 
+// --- QR文字列リスト（デバッグ支援, /qr-codes 画面, spec §1 両経路対称） -----
+// The Tauri twins of `relay_wright_core::rest`'s `/api/qr-strings/*` routes,
+// with the same `*_body(&AppState, ..)` split for testability and the same
+// viewer-read / editor-write / audited-mutation treatment as the registries
+// above.
+
+/// `viewer`+ (spec M10): list QR strings in display order, each with its
+/// server-rendered SVG. Reads are never audited.
+#[tauri::command]
+async fn qr_strings_list(state: State<'_, AppState>) -> Result<Vec<QrString>, BantoError> {
+    require_role(&state, Role::Viewer, "qr_strings").await?;
+    state.qr_strings.list().await
+}
+
+/// `viewer`+ (spec M10): fetch one QR string.
+#[tauri::command]
+async fn qr_strings_get(state: State<'_, AppState>, id: i64) -> Result<QrString, BantoError> {
+    require_role(&state, Role::Viewer, "qr_strings").await?;
+    state.qr_strings.get(id).await
+}
+
+async fn qr_strings_create_body(
+    state: &AppState,
+    input: QrStringInput,
+) -> Result<QrString, BantoError> {
+    let actor = require_role(state, Role::Editor, "qr_strings").await?;
+    let created = state.qr_strings.create(input).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "create",
+            resource: "qr_strings",
+            entity_id: Some(&created.id.to_string()),
+            detail: Some(serde_json::json!({ "label": created.label, "text": created.text })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(created)
+}
+
+/// `editor`+ (spec M10): create a QR string (appended to the end of the list).
+#[tauri::command]
+async fn qr_strings_create(
+    state: State<'_, AppState>,
+    input: QrStringInput,
+) -> Result<QrString, BantoError> {
+    qr_strings_create_body(&state, input).await
+}
+
+async fn qr_strings_update_body(
+    state: &AppState,
+    id: i64,
+    input: QrStringInput,
+) -> Result<QrString, BantoError> {
+    let actor = require_role(state, Role::Editor, "qr_strings").await?;
+    let updated = state.qr_strings.update(id, input).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "update",
+            resource: "qr_strings",
+            entity_id: Some(&id.to_string()),
+            detail: Some(serde_json::json!({ "label": updated.label, "text": updated.text })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(updated)
+}
+
+/// `editor`+ (spec M10): update a QR string's label/text.
+#[tauri::command]
+async fn qr_strings_update(
+    state: State<'_, AppState>,
+    id: i64,
+    input: QrStringInput,
+) -> Result<QrString, BantoError> {
+    qr_strings_update_body(&state, id, input).await
+}
+
+async fn qr_strings_delete_body(state: &AppState, id: i64) -> Result<(), BantoError> {
+    let actor = require_role(state, Role::Editor, "qr_strings").await?;
+    state.qr_strings.delete(id).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "delete",
+            resource: "qr_strings",
+            entity_id: Some(&id.to_string()),
+            detail: None,
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(())
+}
+
+/// `editor`+ (spec M10): delete a QR string.
+#[tauri::command]
+async fn qr_strings_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoError> {
+    qr_strings_delete_body(&state, id).await
+}
+
+async fn qr_strings_reorder_body(
+    state: &AppState,
+    input: QrStringsReorderPayload,
+) -> Result<Vec<QrString>, BantoError> {
+    let actor = require_role(state, Role::Editor, "qr_strings").await?;
+    let reordered = state.qr_strings.reorder(input.ids.clone()).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "reorder",
+            resource: "qr_strings",
+            entity_id: Some("-"),
+            detail: Some(serde_json::json!({ "ids": input.ids })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(reordered)
+}
+
+/// `editor`+ (spec M10): bulk-set the display order (ids in new order) and
+/// return the reordered list.
+#[tauri::command]
+async fn qr_strings_reorder(
+    state: State<'_, AppState>,
+    input: QrStringsReorderPayload,
+) -> Result<Vec<QrString>, BantoError> {
+    qr_strings_reorder_body(&state, input).await
+}
+
 // --- W3-B2: auto-write engine control ---------------------------------------
 //
 // The Tauri half of the engine's dual-path (invariant §1 両経路対称): the same
@@ -2096,6 +2246,8 @@ pub fn run() {
             let plc_connections = PlcConnectionService::new(pool.clone());
             let collection_groups = CollectionGroupService::new(pool.clone());
             let tags = TagService::new(pool.clone());
+            // QR文字列リスト（/qr-codes 画面のデバッグ支援）。
+            let qr_strings = QrStringService::new(pool.clone());
             // Cloned (not moved) into `audit` so the pool stays available for
             // the W3-B2 auto-write engine start below and `AppState.pool`
             // (which `engine_reload` needs to rebuild the engine from the DB).
@@ -2337,6 +2489,7 @@ pub fn run() {
                     plc_connections.clone(),
                     collection_groups.clone(),
                     tags.clone(),
+                    qr_strings.clone(),
                     engine_control.clone(),
                     rest_auth.clone(),
                     events.clone(),
@@ -2406,6 +2559,7 @@ pub fn run() {
                 plc_connections,
                 collection_groups,
                 tags,
+                qr_strings,
                 pool,
                 engine: AsyncMutex::new(initial_engine),
                 engine_control,
@@ -2473,6 +2627,12 @@ pub fn run() {
             tags_create,
             tags_update,
             tags_delete,
+            qr_strings_list,
+            qr_strings_get,
+            qr_strings_create,
+            qr_strings_update,
+            qr_strings_delete,
+            qr_strings_reorder,
             write_audit_log_list,
             engine_arm,
             engine_disarm,
@@ -2534,6 +2694,7 @@ mod tests {
             plc_connections: PlcConnectionService::new(pool.clone()),
             collection_groups: CollectionGroupService::new(pool.clone()),
             tags: TagService::new(pool.clone()),
+            qr_strings: QrStringService::new(pool.clone()),
             pool,
             // Engine-less: the command-body tests that use this helper only
             // exercise the RBAC gate, which rejects before ever touching the
@@ -2574,6 +2735,7 @@ mod tests {
             plc_connections: PlcConnectionService::new(pool.clone()),
             collection_groups: CollectionGroupService::new(pool.clone()),
             tags: TagService::new(pool.clone()),
+            qr_strings: QrStringService::new(pool.clone()),
             pool,
             engine: AsyncMutex::new(None),
             engine_control: std::sync::Arc::new(AsyncMutex::new(None)),
@@ -2800,6 +2962,7 @@ mod tests {
             plc_connections: PlcConnectionService::new(pool.clone()),
             collection_groups: CollectionGroupService::new(pool.clone()),
             tags: TagService::new(pool.clone()),
+            qr_strings: QrStringService::new(pool.clone()),
             pool: pool.clone(),
             engine: AsyncMutex::new(None),
             engine_control: std::sync::Arc::new(AsyncMutex::new(None)),
@@ -2840,6 +3003,7 @@ mod tests {
             plc_connections: PlcConnectionService::new(pool.clone()),
             collection_groups: CollectionGroupService::new(pool.clone()),
             tags: TagService::new(pool.clone()),
+            qr_strings: QrStringService::new(pool.clone()),
             pool: pool.clone(),
             engine: AsyncMutex::new(Some(engine)),
             engine_control: std::sync::Arc::new(AsyncMutex::new(Some(control))),
@@ -2943,6 +3107,88 @@ mod tests {
             "expected a denied entry, got {:?}",
             entries.rows
         );
+    }
+
+    // --- QR文字列 dual-path symmetry (Tauri half) -----------------------------
+
+    /// The Tauri half of the qr_strings create+audit symmetry (its REST twin
+    /// is `relay_wright_core::rest`'s
+    /// `rest_editor_can_create_qr_string_and_it_is_audited`): an `editor`
+    /// session can create a QR string via the command body (the response
+    /// carrying the server-rendered SVG), recorded with `origin: "tauri"`.
+    #[tokio::test]
+    async fn qr_strings_create_is_recorded_with_tauri_origin() {
+        let state = app_state().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create editor");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+
+        let created = qr_strings_create_body(
+            &state,
+            QrStringInput {
+                label: "開始".to_string(),
+                text: "START".to_string(),
+            },
+        )
+        .await
+        .expect("editor create should succeed");
+        assert_eq!(created.text, "START");
+        assert!(
+            created.svg.contains("<svg"),
+            "expected a rendered SVG, got: {}",
+            created.svg
+        );
+
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        let entry = entries
+            .rows
+            .iter()
+            .find(|r| r.action == "create" && r.resource == "qr_strings")
+            .expect("expected a qr_strings create audit entry");
+        assert_eq!(entry.origin, "tauri");
+        assert_eq!(entry.result, "ok");
+        assert_eq!(entry.actor_username.as_deref(), Some("editor"));
+    }
+
+    /// A `viewer` session is denied (and the denial audited) when creating a
+    /// QR string - the Tauri twin of the REST `require_editor` denial.
+    #[tokio::test]
+    async fn qr_strings_create_denies_viewer_and_audits_it() {
+        let state = app_state().await;
+        let viewer = state
+            .users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create viewer");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+
+        let err = qr_strings_create_body(
+            &state,
+            QrStringInput {
+                label: String::new(),
+                text: "START".to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, BantoError::Forbidden));
+
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        assert!(
+            entries
+                .rows
+                .iter()
+                .any(|r| r.action == "denied" && r.resource == "qr_strings"),
+            "expected a denied entry, got {:?}",
+            entries.rows
+        );
+        assert!(!entries
+            .rows
+            .iter()
+            .any(|r| r.action == "create" && r.resource == "qr_strings"));
     }
 
     // --- R1-B: tag registry dual-path symmetry (Tauri half) -----------------
