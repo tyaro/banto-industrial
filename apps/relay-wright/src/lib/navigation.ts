@@ -11,8 +11,15 @@
  * and write-rules (書き込みルール). Both are editor-write/viewer-read (spec
  * M10), same as the rest of this list, so they are NOT `adminOnly` - the
  * page itself hides create/edit/delete controls for a viewer
- * (`canWriteResources`, see the two routes' `+page.svelte`). Monitoring/
- * operation screens remain W4.
+ * (`canWriteResources`, see the two routes' `+page.svelte`).
+ *
+ * W4 adds the monitoring/operation screens: engine (エンジン制御・監視) near
+ * the top since it is the operator's primary control surface, and
+ * write-audit-log (書き込み監査ログ) alongside the other log/監査 screens.
+ * Both are viewer+ reachable (status/log are viewer-readable) - the engine
+ * page role-gates its arm/disarm/dry-run/reload controls internally
+ * (`isAdmin`/`canWriteResources`, backend also enforces), so neither is
+ * `adminOnly` here.
  */
 import { APP_NAME } from '$lib/appName';
 
@@ -26,9 +33,11 @@ export interface NavItem {
 }
 
 export const navItems: NavItem[] = [
+	{ path: '/engine', label: 'エンジン制御・監視', icon: '🕹️' },
 	{ path: '/settings', label: '設定', icon: '⚙️' },
 	{ path: '/write-targets', label: '書き込み先', icon: '🎯' },
 	{ path: '/write-rules', label: '書き込みルール', icon: '🧮' },
+	{ path: '/write-audit-log', label: '書き込み監査ログ', icon: '📝' },
 	{ path: '/users', label: 'ユーザー管理', icon: '👤', adminOnly: true },
 	{ path: '/audit-log', label: '監査ログ', icon: '🧾', adminOnly: true }
 ];
