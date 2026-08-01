@@ -26,6 +26,11 @@
  * sit ABOVE 書き込み先/書き込みルール so the registry reads top-down in
  * setup order: 接続 → タグ → 書き込み先 → ルール. Same viewer-read/
  * editor-write split as the W2 screens, so not `adminOnly`.
+ *
+ * qr-codes (QRコード) is a debug utility: 画面に表示したQRコードをタッチ
+ * パネル（HMI）のQRリーダーでスキャンするための文字列リスト+表示画面。
+ * PLC/レジストリ系とは独立なので、ログ系の下（管理者専用画面の手前）に
+ * 置く。viewer は表示（スキャン）可能なので not `adminOnly`.
  */
 import { APP_NAME } from '$lib/appName';
 
@@ -46,6 +51,7 @@ export const navItems: NavItem[] = [
 	{ path: '/write-targets', label: '書き込み先', icon: '🎯' },
 	{ path: '/write-rules', label: '書き込みルール', icon: '🧮' },
 	{ path: '/write-audit-log', label: '書き込み監査ログ', icon: '📝' },
+	{ path: '/qr-codes', label: 'QRコード', icon: '🔳' },
 	{ path: '/users', label: 'ユーザー管理', icon: '👤', adminOnly: true },
 	{ path: '/audit-log', label: '監査ログ', icon: '🧾', adminOnly: true }
 ];
