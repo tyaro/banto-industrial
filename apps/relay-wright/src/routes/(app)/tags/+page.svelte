@@ -9,6 +9,11 @@
 	 * - 「一括登録（貼り付け）」→ Excel/CSV から貼り付けたテキストを解析して
 	 *   プレビューし、既存の createTag を1行ずつ呼ぶ一括登録モーダル
 	 *   （1件ずつ個別に監査される。バックエンド変更なし）。
+	 * - 「連続登録」→ 開始デバイス（SLMP 記法）と件数から連番アドレスを生成
+	 *   して登録するモーダル。名前はアドレス文字列そのものを自動割り付け
+	 *   （例: D100）。デバイス記法の解釈は $lib/slmpDevice.ts
+	 *   （crates/banto-plc/src/slmp/address.rs のミラー）に依存。登録の実行は
+	 *   一括貼り付けと同じ runCreateLoop（1行ずつ createTag・失敗行は続行）。
 	 * - 「収集グループ管理」→ 収集グループの一覧＋作成・編集・削除のモーダル
 	 *   （グループはタグの実装詳細であり独立画面にしない方針は維持しつつ、
 	 *   リストメイン化のため常時表示セクションからモーダルへ移動）。
@@ -64,6 +69,12 @@
 		type CollectionGroupInput,
 		type PlcConnection
 	} from '$lib/banto/tagRegistryAdmin';
+	import {
+		parseSlmpDevice,
+		formatSlmpDevice,
+		SLMP_MAX_DEVICE_NUMBER,
+		type SlmpDeviceInfo
+	} from '$lib/slmpDevice';
 
 	const dataTypeOptions: TagDataType[] = ['bit', 'i16', 'u16', 'i32', 'u32', 'f32'];
 
@@ -489,27 +500,51 @@
 		};
 	}
 
+	/** 行別の登録結果（キー = 行番号 / 連番 index）。 */
+	type RowResult = { ok: boolean; message: string };
+
+	/**
+	 * 1行ずつ既存の createTag を呼ぶ共通ループ（一括貼り付け・連続登録で
+	 * 共用。各行が個別に監査される）。失敗（バックエンドの重複名エラー等）
+	 * は記録して残りの行を続行し、進捗が見えるよう1行ごとに publish で
+	 * 行別結果マップを反映する。
+	 */
+	async function runCreateLoop<T>(
+		rows: readonly T[],
+		keyOf: (row: T) => number,
+		inputOf: (row: T) => TagInput,
+		initialStatus: Record<number, RowResult>,
+		publish: (status: Record<number, RowResult>) => void
+	): Promise<{ okCount: number; failCount: number }> {
+		let okCount = 0;
+		let failCount = 0;
+		const status = { ...initialStatus };
+		for (const row of rows) {
+			try {
+				await createTag(inputOf(row));
+				okCount++;
+				status[keyOf(row)] = { ok: true, message: '登録しました' };
+			} catch (err) {
+				failCount++;
+				status[keyOf(row)] = { ok: false, message: errorMessage(err) };
+			}
+			publish({ ...status });
+		}
+		return { okCount, failCount };
+	}
+
 	async function runBulkCreate(): Promise<void> {
 		if (bulkGroupId === '' || bulkPendingRows.length === 0) return;
 		const collectionGroupId = Number(bulkGroupId);
 		bulkRunning = true;
-		let okCount = 0;
-		let failCount = 0;
-		const status: Record<number, { ok: boolean; message: string }> = { ...bulkRowStatus };
 		try {
-			// 1行ずつ既存の createTag を呼ぶ（各行が個別に監査される）。失敗
-			// （バックエンドの重複名エラー等）は記録して残りの行を続行する。
-			for (const row of bulkPendingRows) {
-				try {
-					await createTag(bulkRowToInput(row, collectionGroupId));
-					okCount++;
-					status[row.line] = { ok: true, message: '登録しました' };
-				} catch (err) {
-					failCount++;
-					status[row.line] = { ok: false, message: errorMessage(err) };
-				}
-				bulkRowStatus = { ...status };
-			}
+			const { okCount, failCount } = await runCreateLoop(
+				bulkPendingRows,
+				(row) => row.line,
+				(row) => bulkRowToInput(row, collectionGroupId),
+				bulkRowStatus,
+				(status) => (bulkRowStatus = status)
+			);
 			toastStore.push(
 				failCount === 0 ? 'success' : 'error',
 				`一括登録: 成功${okCount}件・失敗${failCount}件`
@@ -525,10 +560,188 @@
 		}
 	}
 
+	// --- sequential registration (連続登録) ------------------------------
+	/**
+	 * 一度に登録できる件数の上限。SLMP 上は先のアドレスまでいくらでも
+	 * 生成できてしまうが、タイプミス（件数欄に桁を1つ多く入れる等）で
+	 * 数千件を誤登録すると片付けが大変なので、1回の操作は256件までに制限
+	 * する（それ以上は複数回に分ける）。
+	 */
+	const SEQ_MAX_COUNT = 256;
+	/** 32ビット型は連続する2ワードを占有するため、アドレスを2番地刻みで生成する。 */
+	const SEQ_STEP2_TYPES: readonly TagDataType[] = ['i32', 'u32', 'f32'];
+
+	/** 生成される1タグ（名前 = アドレス文字列の自動割り付け）。 */
+	interface SeqRow {
+		/** 0始まりの連番（行別結果の対応付けキー）。 */
+		index: number;
+		name: string;
+		address: string;
+		/** 既存タグと同名（サーバー側で重複エラーになる見込み）の警告。 */
+		duplicate: boolean;
+	}
+
+	let seqModalOpen = $state(false);
+	let seqGroupId = $state('');
+	let seqStart = $state('');
+	/** type="number" の bind:value は入力後 number | null を書き戻す（numOrNull 参照）。 */
+	let seqCount: string | number | null = $state('10');
+	let seqDataType: TagDataType = $state('i16');
+	let seqUnit = $state('');
+	let seqDecimals: string | number | null = $state('0');
+	let seqEnabled = $state(true);
+	let seqRunning = $state(false);
+	/** 直近の連続登録の行別結果（キー = SeqRow.index）。一括貼り付けと同運用。 */
+	let seqRowStatus: Record<number, RowResult> = $state({});
+
+	function openSeqModal(): void {
+		seqGroupId = '';
+		seqStart = '';
+		seqCount = '10';
+		seqDataType = 'i16';
+		seqUnit = '';
+		seqDecimals = '0';
+		seqEnabled = true;
+		seqRowStatus = {};
+		seqModalOpen = true;
+	}
+
+	function closeSeqModal(): void {
+		seqModalOpen = false;
+	}
+
+	/** 入力を変えると連番と行の対応が崩れるため、行別結果をクリアする。 */
+	function resetSeqStatus(): void {
+		seqRowStatus = {};
+	}
+
+	const existingTagNames = $derived(new Set(tags.map((t) => t.name)));
+
+	const seqPlan = $derived.by(
+		(): {
+			rows: SeqRow[];
+			step: 1 | 2;
+			device: SlmpDeviceInfo | null;
+			/** 生成をブロックするエラー（null = 生成可能）。 */
+			error: string | null;
+		} => {
+			const step: 1 | 2 = SEQ_STEP2_TYPES.includes(seqDataType) ? 2 : 1;
+			const none = { rows: [], step, device: null };
+			if (seqStart.trim() === '') return { ...none, error: null };
+			const parsed = parseSlmpDevice(seqStart);
+			if (!parsed) {
+				return {
+					...none,
+					error: '開始デバイスを解釈できません（SLMP 記法。例: D100 / M10 / X1A）'
+				};
+			}
+			const { device, number } = parsed;
+			// データ型とデバイス種別の整合（サーバー側プランナーと同じ規則を
+			// 先出しで検証。最終判定はサーバー）。
+			if (device.access === 'bit' && seqDataType !== 'bit') {
+				return {
+					...none,
+					device,
+					error: `${device.mnemonic} はビットデバイスのため、データ型は bit を選択してください`
+				};
+			}
+			if (device.access === 'word' && seqDataType === 'bit') {
+				return {
+					...none,
+					device,
+					error: `${device.mnemonic} はワードデバイスのため、データ型 bit は使用できません`
+				};
+			}
+			const count = numOrNull(seqCount);
+			if (count === null || !Number.isInteger(count) || count < 1 || count > SEQ_MAX_COUNT) {
+				return { ...none, device, error: `件数は 1〜${SEQ_MAX_COUNT} の整数で入力してください` };
+			}
+			const last = number + (count - 1) * step;
+			if (last > SLMP_MAX_DEVICE_NUMBER) {
+				return {
+					...none,
+					device,
+					error: `最終デバイス番号が SLMP の上限（${formatSlmpDevice(device, SLMP_MAX_DEVICE_NUMBER)}）を超えます`
+				};
+			}
+			const rows: SeqRow[] = [];
+			for (let i = 0; i < count; i++) {
+				const address = formatSlmpDevice(device, number + i * step);
+				// 名前はアドレス文字列そのものを自動割り付け（デバイス名 = 名称）。
+				rows.push({ index: i, name: address, address, duplicate: existingTagNames.has(address) });
+			}
+			return { rows, step, device, error: null };
+		}
+	);
+
+	const seqDuplicateCount = $derived(seqPlan.rows.filter((r) => r.duplicate).length);
+	/** 登録済み（ok）を除いた、今回の「登録」で実際に送信される行。 */
+	const seqPendingRows = $derived(seqPlan.rows.filter((r) => !seqRowStatus[r.index]?.ok));
+
+	/**
+	 * プレビューの表示行: 件数が多いときは 先頭10件 + 「… 他N件」 + 最終1件
+	 * に省略する。ただし登録失敗した行はエラーメッセージを確認できるよう
+	 * 省略対象から外して必ず表示する。
+	 */
+	const seqDisplay = $derived.by((): { rows: SeqRow[]; hiddenCount: number } => {
+		const rows = seqPlan.rows;
+		if (rows.length <= 20) return { rows, hiddenCount: 0 };
+		const shown = rows.filter(
+			(r, i) => i < 10 || i === rows.length - 1 || seqRowStatus[r.index]?.ok === false
+		);
+		return { rows: shown, hiddenCount: rows.length - shown.length };
+	});
+
+	const seqSummary = $derived.by((): string | null => {
+		const rows = seqPlan.rows;
+		if (rows.length === 0) return null;
+		return `${rows[0].address} 〜 ${rows[rows.length - 1].address}（${seqDataType}, step${seqPlan.step}, ${rows.length}件）を登録します`;
+	});
+
+	async function runSeqCreate(): Promise<void> {
+		if (seqGroupId === '' || seqPlan.error !== null || seqPendingRows.length === 0) return;
+		const collectionGroupId = Number(seqGroupId);
+		const dataType = seqDataType;
+		const unit = seqUnit.trim() === '' ? null : seqUnit;
+		const decimals = numOrNull(seqDecimals) ?? 0;
+		const enabled = seqEnabled;
+		seqRunning = true;
+		try {
+			const { okCount, failCount } = await runCreateLoop(
+				seqPendingRows,
+				(row) => row.index,
+				(row) => ({
+					name: row.name,
+					collectionGroupId,
+					address: row.address,
+					dataType,
+					unit,
+					decimals,
+					enabled
+				}),
+				seqRowStatus,
+				(status) => (seqRowStatus = status)
+			);
+			toastStore.push(
+				failCount === 0 ? 'success' : 'error',
+				`連続登録: 成功${okCount}件・失敗${failCount}件`
+			);
+			await reload();
+			// 全行成功なら閉じる。失敗行はメッセージ付きでプレビューに残り、
+			// 再実行では未登録の行だけが送信される（登録済みはスキップ）。
+			if (failCount === 0) closeSeqModal();
+		} finally {
+			seqRunning = false;
+		}
+	}
+
 	// --- modal escape handling (CommandPalette と同じく Esc で閉じる) ---
 	function handleWindowKeydown(event: KeyboardEvent): void {
 		if (event.key !== 'Escape') return;
-		if (bulkModalOpen) {
+		if (seqModalOpen) {
+			if (!seqRunning) closeSeqModal();
+			event.preventDefault();
+		} else if (bulkModalOpen) {
 			if (!bulkRunning) closeBulkModal();
 			event.preventDefault();
 		} else if (tagModalOpen) {
@@ -672,6 +885,7 @@
 			{#if canWrite}
 				<button type="button" onclick={openCreateModal}>新規作成</button>
 				<button type="button" class="ghost" onclick={openBulkModal}>一括登録（貼り付け）</button>
+				<button type="button" class="ghost" onclick={openSeqModal}>連続登録</button>
 			{/if}
 			<button type="button" class="ghost" onclick={openGroupModal}>収集グループ管理</button>
 			<span class="toolbar-note">
@@ -825,6 +1039,149 @@
 					{bulkRunning ? '登録中…' : `登録（${bulkPendingRows.length}件）`}
 				</button>
 				<button type="button" class="ghost" onclick={closeBulkModal} disabled={bulkRunning}>
+					閉じる
+				</button>
+			</div>
+		</div>
+	</div>
+{/if}
+
+{#if seqModalOpen}
+	<div class="overlay">
+		<div class="modal" role="dialog" aria-modal="true" aria-label="連続登録" use:focusFirstField>
+			<div class="modal-head">
+				<h3>連続登録</h3>
+				<button
+					type="button"
+					class="close"
+					aria-label="閉じる"
+					onclick={closeSeqModal}
+					disabled={seqRunning}>×</button
+				>
+			</div>
+			<p class="note">
+				開始デバイスから連番でタグをまとめて登録します。<strong
+					>名前はデバイス名（アドレス文字列）で自動割り付け</strong
+				>されます（例: D100）。単位・小数桁・有効は全行に適用されます。
+			</p>
+			<div class="form-grid">
+				<label class="field">
+					収集グループ（全行に適用）
+					<select bind:value={seqGroupId} disabled={seqRunning}>
+						<option value="">選択してください</option>
+						{#each groups as g (g.id)}
+							<option value={String(g.id)}>{groupLabel(g)}</option>
+						{/each}
+					</select>
+				</label>
+				<label class="field">
+					開始デバイス
+					<input
+						type="text"
+						bind:value={seqStart}
+						oninput={resetSeqStatus}
+						placeholder="D100"
+						disabled={seqRunning}
+					/>
+					<span class="hint">SLMP 記法（例: D100 / M10 / X1A）。X/Y/B/W/SB/SW は16進表記</span>
+				</label>
+				<label class="field">
+					件数
+					<input
+						type="number"
+						min="1"
+						max={SEQ_MAX_COUNT}
+						bind:value={seqCount}
+						oninput={resetSeqStatus}
+						disabled={seqRunning}
+					/>
+					<span class="hint"
+						>最大 {SEQ_MAX_COUNT} 件（誤操作で一度に大量登録し過ぎないための上限）</span
+					>
+				</label>
+				<label class="field">
+					データ型（全行に適用）
+					<select bind:value={seqDataType} onchange={resetSeqStatus} disabled={seqRunning}>
+						{#each dataTypeOptions as dt (dt)}
+							<option value={dt}>{dt}</option>
+						{/each}
+					</select>
+				</label>
+				<label class="field">
+					単位
+					<input type="text" bind:value={seqUnit} disabled={seqRunning} />
+				</label>
+				<label class="field">
+					小数桁
+					<input type="number" min="0" max="6" bind:value={seqDecimals} disabled={seqRunning} />
+				</label>
+				<label class="field checkbox">
+					<input type="checkbox" bind:checked={seqEnabled} disabled={seqRunning} />
+					有効
+				</label>
+			</div>
+			{#if seqPlan.error !== null}
+				<p class="err">{seqPlan.error}</p>
+			{:else if seqPlan.rows.length > 0}
+				<p class="bulk-summary">{seqSummary}</p>
+				{#if seqPlan.step === 2}
+					<p class="note">32bit型（i32/u32/f32）は2ワードを占有するため、2番地刻みで生成します。</p>
+				{/if}
+				{#if seqDuplicateCount > 0}
+					<p class="err">
+						既存タグと同名の行が{seqDuplicateCount}件あります（該当行はサーバー側で重複エラーになります）。
+					</p>
+				{/if}
+				<div class="bulk-preview-wrap">
+					<table class="bulk-preview">
+						<thead>
+							<tr>
+								<th>#</th>
+								<th>名前</th>
+								<th>アドレス</th>
+								<th>状態</th>
+							</tr>
+						</thead>
+						<tbody>
+							{#each seqDisplay.rows as row, i (row.index)}
+								{@const result = seqRowStatus[row.index]}
+								{#if seqDisplay.hiddenCount > 0 && i === seqDisplay.rows.length - 1}
+									<tr>
+										<td class="num">…</td>
+										<td colspan="3">他{seqDisplay.hiddenCount}件</td>
+									</tr>
+								{/if}
+								<tr class:invalid={result?.ok === false}>
+									<td class="num">{row.index + 1}</td>
+									<td>{row.name}</td>
+									<td>{row.address}</td>
+									<td>
+										{#if result}
+											<span class={result.ok ? 'ok' : 'err'}>{result.message}</span>
+										{:else if row.duplicate}
+											<span class="err">既存タグと同名</span>
+										{:else}
+											<span class="ok">登録可能</span>
+										{/if}
+									</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+				</div>
+			{/if}
+			<div class="actions">
+				<button
+					type="button"
+					onclick={runSeqCreate}
+					disabled={seqRunning ||
+						seqGroupId === '' ||
+						seqPlan.error !== null ||
+						seqPendingRows.length === 0}
+				>
+					{seqRunning ? '登録中…' : `登録（${seqPendingRows.length}件）`}
+				</button>
+				<button type="button" class="ghost" onclick={closeSeqModal} disabled={seqRunning}>
 					閉じる
 				</button>
 			</div>
