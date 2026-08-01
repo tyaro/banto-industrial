@@ -13,13 +13,12 @@
 	 *    `conditions: WriteRuleConditionInput[]` としてまとめて送る
 	 *    （`{#snippet conditionsEditor}` を create/edit 両フォームで共用）。
 	 * 2. 書き込み先（writeTargetId）は同じW2で追加された /api/write-targets
-	 *    一覧APIがあるのでプルダウンにする。一方 source_tag_id /
-	 *    writeSourceTagId が参照する banto-tags の `tags` テーブルには、この
-	 *    アプリのフロント/REST/Tauri面にまだ一覧APIが無い（バックエンドの
-	 *    write_rules.rs 側は存在チェックのみ行う）。そのため write-targets の
-	 *    plcConnectionId と同じ考え方で、数値ID直接入力のフォールバックにして
-	 *    いる（存在しないIDはサーバー側の分かりやすいバリデーションエラーで
-	 *    弾かれる）。タグ一覧APIが追加され次第プルダウン化するのはW3以降。
+	 *    一覧APIがあるのでプルダウン。source_tag_id / writeSourceTagId が参照
+	 *    する banto-tags の `tags` も、R1-B でタグ登録画面（/tags）と一覧API
+	 *    （tagRegistryAdmin.ts）が入ったのでプルダウン化した（かつては数値ID
+	 *    直接入力のフォールバックだった）。選択肢のラベルは
+	 *    「ID: 名前（アドレス）」— 監査ログの detail が ID ベースなので、
+	 *    数値IDを画面から突き合わせられるように残している。
 	 *
 	 * 書き込みループ検出（サービス層のcheck_no_write_cycle）が弾いた場合は
 	 * `enabled` フィールドのバリデーションエラーとして返るので、フォーム全体の
@@ -46,6 +45,7 @@
 		type WriteValueMode,
 		type ConditionOperator
 	} from '$lib/banto/writeRegistryAdmin';
+	import { listTags, type Tag } from '$lib/banto/tagRegistryAdmin';
 
 	const edgeModeOptions: { value: EdgeMode; label: string }[] = [
 		{ value: 'rising', label: '立ち上がり' },
@@ -146,7 +146,15 @@
 		};
 	}
 
-	function numOrNull(value: string): number | null {
+	/**
+	 * 空欄 = 未設定（null）。フォーム状態は初期値こそ文字列だが、Svelte 5 の
+	 * `bind:value` は `type="number"` の入力後に number（空欄は null）を書き
+	 * 戻すため、実行時には string | number | null が混在する — string 前提で
+	 * `.trim()` すると入力後の保存が TypeError で落ちる（実バグだった）。
+	 */
+	function numOrNull(value: string | number | null): number | null {
+		if (typeof value === 'number') return Number.isNaN(value) ? null : value;
+		if (value === null) return null;
 		const trimmed = value.trim();
 		return trimmed === '' ? null : Number(trimmed);
 	}
@@ -184,19 +192,31 @@
 
 	let rules: WriteRuleDetail[] = $state([]);
 	let targets: WriteTarget[] = $state([]);
+	let sourceTags: Tag[] = $state([]);
 	let loading = $state(false);
 
 	function targetName(id: number): string {
 		return targets.find((t) => t.id === id)?.name ?? `#${id}`;
 	}
 
+	/** Option label: keep the numeric ID visible so audit rows (detail is
+	 *  ID-based) remain interpretable against the UI. */
+	function tagLabel(t: Tag): string {
+		return `${t.id}: ${t.name}（${t.address}）`;
+	}
+
 	async function reload(): Promise<void> {
 		if (!available) return;
 		loading = true;
 		try {
-			const [ruleList, targetList] = await Promise.all([listWriteRules(), listWriteTargets()]);
+			const [ruleList, targetList, tagList] = await Promise.all([
+				listWriteRules(),
+				listWriteTargets(),
+				listTags()
+			]);
 			rules = ruleList;
 			targets = targetList;
+			sourceTags = tagList;
 		} catch (err) {
 			toastStore.push('error', errorMessage(err));
 		} finally {
@@ -339,8 +359,13 @@
 		{#each form.conditions as condition, i (i)}
 			<div class="condition-row">
 				<label class="field">
-					ソースタグID
-					<input type="number" bind:value={condition.sourceTagId} />
+					ソースタグ
+					<select bind:value={condition.sourceTagId}>
+						<option value="">選択してください</option>
+						{#each sourceTags as t (t.id)}
+							<option value={String(t.id)}>{tagLabel(t)}</option>
+						{/each}
+					</select>
 					{#if errors[`conditions.${i}.sourceTagId`]}<span class="err"
 							>{errors[`conditions.${i}.sourceTagId`]}</span
 						>{/if}
@@ -433,8 +458,13 @@
 			</label>
 		{:else}
 			<label class="field">
-				参照元タグID
-				<input type="number" bind:value={form.writeSourceTagId} />
+				参照元タグ
+				<select bind:value={form.writeSourceTagId}>
+					<option value="">選択してください</option>
+					{#each sourceTags as t (t.id)}
+						<option value={String(t.id)}>{tagLabel(t)}</option>
+					{/each}
+				</select>
 				{#if errors.writeSourceTagId}<span class="err">{errors.writeSourceTagId}</span>{/if}
 			</label>
 		{/if}

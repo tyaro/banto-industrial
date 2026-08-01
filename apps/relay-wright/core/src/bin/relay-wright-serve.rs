@@ -36,12 +36,14 @@ use relay_wright_core::backup::BackupService;
 use relay_wright_core::db::init_db;
 use relay_wright_core::engine::{Engine, EngineConfig, SharedEngineControl};
 use relay_wright_core::events::event_channel;
+use relay_wright_core::qr_strings::QrStringService;
 use relay_wright_core::rest::{api_router, audited_credential_verifier};
 use relay_wright_core::settings::SettingsService;
 use relay_wright_core::users::UsersService;
 use relay_wright_core::write_audit_query::WriteAuditLogService;
 use relay_wright_core::write_rules::WriteRuleService;
 use relay_wright_core::write_targets::WriteTargetService;
+use relay_wright_core::{CollectionGroupService, PlcConnectionService, TagService};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -88,6 +90,14 @@ async fn main() {
     let write_targets = WriteTargetService::new(pool.clone());
     let write_rules = WriteRuleService::new(pool.clone());
     let write_audit_log = WriteAuditLogService::new(pool.clone());
+    // R1-B: banto-tags' registry services over the same shared pool, so the
+    // standalone REST vehicle exposes /api/plc-connections|collection-groups|
+    // tags exactly as the Tauri app's embedded server does.
+    let plc_connections = PlcConnectionService::new(pool.clone());
+    let collection_groups = CollectionGroupService::new(pool.clone());
+    let tags = TagService::new(pool.clone());
+    // QR文字列リスト（/qr-codes 画面のデバッグ支援）。
+    let qr_strings = QrStringService::new(pool.clone());
     // Cloned (not moved) so the pool stays available for the W3-B2 engine start
     // below.
     let audit = AuditLogService::new(pool.clone());
@@ -163,6 +173,10 @@ async fn main() {
         write_targets,
         write_rules,
         write_audit_log,
+        plc_connections,
+        collection_groups,
+        tags,
+        qr_strings,
         engine_control,
         auth,
         events,
