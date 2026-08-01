@@ -65,7 +65,8 @@
 
 	const ARM_CONFIRM =
 		'アームすると、条件成立時に実PLCへ自動的に値が書き込まれます。本当にアームしますか？';
-	const DISARM_CONFIRM = 'エンジンをディスアームします（以後の物理書き込みを抑止します）。よろしいですか？';
+	const DISARM_CONFIRM =
+		'エンジンをディスアームします（以後の物理書き込みを抑止します）。よろしいですか？';
 
 	async function handleArm(): Promise<void> {
 		// 危険操作: 必ず明示的な確認ダイアログの後にのみ実行する（安全設計）。
@@ -102,7 +103,10 @@
 		acting = true;
 		try {
 			await setDryRun(next);
-			toastStore.push('success', next ? 'ドライランを有効にしました' : 'ドライランを無効にしました');
+			toastStore.push(
+				'success',
+				next ? 'ドライランを有効にしました' : 'ドライランを無効にしました'
+			);
 		} catch (err) {
 			toastStore.push('error', errorMessage(err));
 		} finally {
@@ -112,7 +116,11 @@
 	}
 
 	async function handleReload(): Promise<void> {
-		if (!window.confirm('現在のDB内容（有効な接続・ルール）でエンジンを再構築します。再構築後は必ず非アームで開始します。よろしいですか？')) {
+		if (
+			!window.confirm(
+				'現在のDB内容（有効な接続・ルール）でエンジンを再構築します。再構築後は必ず非アームで開始します。よろしいですか？'
+			)
+		) {
 			return;
 		}
 		acting = true;
@@ -149,7 +157,9 @@
 				<div class="badges">
 					<div class="badge" class:armed={status.armed} class:disarmed={!status.armed}>
 						<span class="badge-label">状態</span>
-						<span class="badge-value">{status.armed ? 'ARMED（アーム中）' : 'DISARMED（非アーム）'}</span>
+						<span class="badge-value"
+							>{status.armed ? 'ARMED（アーム中）' : 'DISARMED（非アーム）'}</span
+						>
 						<span class="badge-sub">
 							{status.armed
 								? '条件成立時に実PLCへ自動書き込みが行われます'

@@ -200,13 +200,7 @@
 			<p class="loading">読み込み中…</p>
 		{:else}
 			<section class="grid-wrap">
-				<BantoGrid
-					rows={rows}
-					{columns}
-					getRowId={(row) => row.id}
-					{rowClass}
-					onRowClick={selectRow}
-				/>
+				<BantoGrid {rows} {columns} getRowId={(row) => row.id} {rowClass} onRowClick={selectRow} />
 			</section>
 		{/if}
 
@@ -221,7 +215,11 @@
 					<dt>結果</dt>
 					<dd class={`result-${resultKind(selected.result)}`}>{resultLabel(selected.result)}</dd>
 					<dt>ルール</dt>
-					<dd>{selected.ruleNameSnapshot}{selected.writeRuleId !== null ? `（#${selected.writeRuleId}）` : ''}</dd>
+					<dd>
+						{selected.ruleNameSnapshot}{selected.writeRuleId !== null
+							? `（#${selected.writeRuleId}）`
+							: ''}
+					</dd>
 					<dt>ソース</dt>
 					<dd>{sourceCell(selected)}</dd>
 					<dt>書き込み先</dt>
