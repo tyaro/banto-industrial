@@ -407,6 +407,11 @@
 	let bulkGroupId = $state('');
 	let bulkText = $state('');
 	let bulkRunning = $state(false);
+	// placeholder はタブ/改行のエスケープを含むため属性リテラルでは書けず、
+	// テンプレート内の `{'...'}` は svelte/no-useless-mustaches に当たる。
+	// script 側の定数にして参照する。
+	const BULK_PLACEHOLDER =
+		'温度センサ\tD100\ti16\t℃\t1\n運転状態\tM10\tbit\n圧力センサ,D110,i16,kPa,0';
 	/**
 	 * 直近の一括登録の行別結果（キー = BulkRow.line）。ok=true は登録済み
 	 * （再実行時はスキップ）、ok=false はバックエンドエラー（メッセージを
@@ -766,8 +771,7 @@
 					bind:value={bulkText}
 					oninput={() => (bulkRowStatus = {})}
 					disabled={bulkRunning}
-					placeholder={'温度センサ\tD100\ti16\t℃\t1\n運転状態\tM10\tbit\n圧力センサ,D110,i16,kPa,0'}
-				></textarea>
+					placeholder={BULK_PLACEHOLDER}></textarea>
 			</label>
 			{#if bulkParse.rows.length > 0 || bulkParse.headerSkipped}
 				<p class="bulk-summary">
