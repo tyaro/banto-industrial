@@ -37,6 +37,7 @@ use relay_wright_core::events::event_channel;
 use relay_wright_core::rest::{api_router, audited_credential_verifier};
 use relay_wright_core::settings::{AuditSettings, AuthSettings, ServerSettings, SettingsService};
 use relay_wright_core::users::{Role, UserIdentity, UserSummary, UsersService};
+use relay_wright_core::write_audit_query::WriteAuditLogService;
 use relay_wright_core::write_rules::{WriteRuleDetail, WriteRuleInput, WriteRuleService};
 use relay_wright_core::write_targets::{WriteTarget, WriteTargetInput, WriteTargetService};
 use serde::Serialize;
@@ -654,6 +655,7 @@ async fn start_embedded_server(
     backup: BackupService,
     write_targets: WriteTargetService,
     write_rules: WriteRuleService,
+    write_audit_log: WriteAuditLogService,
     engine_control: SharedEngineControl,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
@@ -672,6 +674,7 @@ async fn start_embedded_server(
         backup,
         write_targets,
         write_rules,
+        write_audit_log,
         engine_control,
         auth,
         events,
