@@ -1798,7 +1798,8 @@ mod tests {
         let backup = unused_backup_service(pool.clone());
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
-        let write_rules = WriteRuleService::new(pool);
+        let write_rules = WriteRuleService::new(pool.clone());
+        let write_audit_log = WriteAuditLogService::new(pool);
 
         users
             .setup_first_user("admin", "password123", "管理者")
@@ -1848,6 +1849,7 @@ mod tests {
                 backup,
                 write_targets,
                 write_rules,
+                write_audit_log,
                 no_engine_control(),
                 auth,
                 tx,
@@ -1867,7 +1869,8 @@ mod tests {
         let backup = unused_backup_service(pool.clone());
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
-        let write_rules = WriteRuleService::new(pool);
+        let write_rules = WriteRuleService::new(pool.clone());
+        let write_audit_log = WriteAuditLogService::new(pool);
         let auth = demo_auth();
         let token = auth
             .login("admin", "admin")
@@ -1881,6 +1884,7 @@ mod tests {
                 backup,
                 write_targets,
                 write_rules,
+                write_audit_log,
                 no_engine_control(),
                 auth,
                 tx,
@@ -1935,7 +1939,8 @@ mod tests {
         let backup = unused_backup_service(pool.clone());
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
-        let write_rules = WriteRuleService::new(pool);
+        let write_rules = WriteRuleService::new(pool.clone());
+        let write_audit_log = WriteAuditLogService::new(pool);
         let auth = demo_auth();
         api_router(
             users,
@@ -1944,6 +1949,7 @@ mod tests {
             backup,
             write_targets,
             write_rules,
+            write_audit_log,
             no_engine_control(),
             auth,
             tx,
@@ -2139,7 +2145,8 @@ mod tests {
         let backup = unused_backup_service(pool.clone());
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
-        let write_rules = WriteRuleService::new(pool);
+        let write_rules = WriteRuleService::new(pool.clone());
+        let write_audit_log = WriteAuditLogService::new(pool);
         let auth = AuthState::new(audited_credential_verifier(users.clone(), audit.clone()));
         (
             api_router(
@@ -2149,6 +2156,7 @@ mod tests {
                 backup,
                 write_targets,
                 write_rules,
+                write_audit_log,
                 no_engine_control(),
                 auth,
                 tx,
@@ -2482,7 +2490,8 @@ mod tests {
         let backup = unused_backup_service(pool.clone());
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
-        let write_rules = WriteRuleService::new(pool);
+        let write_rules = WriteRuleService::new(pool.clone());
+        let write_audit_log = WriteAuditLogService::new(pool);
 
         users
             .setup_first_user("admin", "password123", "管理者")
@@ -2518,6 +2527,7 @@ mod tests {
             backup,
             write_targets,
             write_rules,
+            write_audit_log,
             no_engine_control(),
             auth,
             tx,
@@ -2555,7 +2565,8 @@ mod tests {
         let backup = BackupService::new(db_path, pool.clone());
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
-        let write_rules = WriteRuleService::new(pool);
+        let write_rules = WriteRuleService::new(pool.clone());
+        let write_audit_log = WriteAuditLogService::new(pool);
 
         users
             .setup_first_user("admin", "password123", "管理者")
@@ -2591,6 +2602,7 @@ mod tests {
             backup,
             write_targets,
             write_rules,
+            write_audit_log,
             no_engine_control(),
             auth,
             tx,
@@ -3183,6 +3195,7 @@ mod tests {
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
         let write_rules = WriteRuleService::new(pool.clone());
+        let write_audit_log = WriteAuditLogService::new(pool.clone());
 
         let conn = PlcConnectionService::new(pool.clone())
             .create(PlcConnectionInput {
@@ -3226,6 +3239,7 @@ mod tests {
             backup,
             write_targets,
             write_rules,
+            write_audit_log,
             no_engine_control(),
             auth,
             tx,
@@ -3325,6 +3339,7 @@ mod tests {
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
         let write_rules = WriteRuleService::new(pool.clone());
+        let write_audit_log = WriteAuditLogService::new(pool.clone());
 
         users
             .setup_first_user("admin", "password123", "管理者")
@@ -3375,6 +3390,7 @@ mod tests {
             backup,
             write_targets,
             write_rules,
+            write_audit_log,
             engine_control,
             auth,
             tx,

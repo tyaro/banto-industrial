@@ -37,7 +37,7 @@ use relay_wright_core::events::event_channel;
 use relay_wright_core::rest::{api_router, audited_credential_verifier};
 use relay_wright_core::settings::{AuditSettings, AuthSettings, ServerSettings, SettingsService};
 use relay_wright_core::users::{Role, UserIdentity, UserSummary, UsersService};
-use relay_wright_core::write_audit_query::WriteAuditLogService;
+use relay_wright_core::write_audit_query::{WriteAuditLogRow, WriteAuditLogService};
 use relay_wright_core::write_rules::{WriteRuleDetail, WriteRuleInput, WriteRuleService};
 use relay_wright_core::write_targets::{WriteTarget, WriteTargetInput, WriteTargetService};
 use serde::Serialize;
@@ -103,6 +103,11 @@ struct AppState {
     /// Write-rule registry + its inline conditions (plan W2), with the
     /// write-loop cycle-detection guard on save. Same shared pool.
     write_rules: WriteRuleService,
+    /// Read-only view of the `write_audit_log` table (plan W4): the write-audit
+    /// trail the monitoring UI displays. Same shared pool; viewer+ read on both
+    /// paths (this Tauri path and `crate::rest`'s REST path). The engine owns
+    /// all writes to this table - this service never mutates it.
+    write_audit_log: WriteAuditLogService,
     /// The one shared SQLite pool (same on-disk DB as every service above).
     /// Held directly - not just via the service handles - so `engine_reload`
     /// can hand it to `Engine::start_from_db` to rebuild the engine from the
@@ -729,6 +734,7 @@ async fn server_apply(
                 state.backup.clone(),
                 state.write_targets.clone(),
                 state.write_rules.clone(),
+                state.write_audit_log.clone(),
                 state.engine_control.clone(),
                 state.rest_auth.clone(),
                 state.events.clone(),
@@ -1448,6 +1454,30 @@ async fn write_rules_get(
     state.write_rules.get(id).await
 }
 
+/// Body of [`write_audit_log_list`], split out so tests can drive the role
+/// gate + list read without a `tauri::State` (mirrors the `*_body` convention
+/// the mutating commands use above).
+async fn write_audit_log_list_body(
+    state: &AppState,
+    params: ListParams,
+) -> Result<ListResult<WriteAuditLogRow>, BantoError> {
+    require_role(state, Role::Viewer, "write_audit_log").await?;
+    state.write_audit_log.list(params).await
+}
+
+/// `viewer`+ (spec M10 / plan W4): filtered/sorted/paginated read of the
+/// write-audit trail for the monitoring UI. Read-only and unaudited (reading is
+/// not a mutation - same convention as `audit_log_list`); the engine is the
+/// only writer of this table. Server-side filter/sort/paginate via `ListParams`
+/// so the grid never has to pull the whole table.
+#[tauri::command]
+async fn write_audit_log_list(
+    state: State<'_, AppState>,
+    params: ListParams,
+) -> Result<ListResult<WriteAuditLogRow>, BantoError> {
+    write_audit_log_list_body(&state, params).await
+}
+
 async fn write_rules_create_body(
     state: &AppState,
     input: WriteRuleInput,
@@ -1700,6 +1730,7 @@ pub fn run() {
             let backup = BackupService::new(db_path.clone(), pool.clone());
             let write_targets = WriteTargetService::new(pool.clone());
             let write_rules = WriteRuleService::new(pool.clone());
+            let write_audit_log = WriteAuditLogService::new(pool.clone());
             // Cloned (not moved) into `audit` so the pool stays available for
             // the W3-B2 auto-write engine start below and `AppState.pool`
             // (which `engine_reload` needs to rebuild the engine from the DB).
@@ -1937,6 +1968,7 @@ pub fn run() {
                     backup.clone(),
                     write_targets.clone(),
                     write_rules.clone(),
+                    write_audit_log.clone(),
                     engine_control.clone(),
                     rest_auth.clone(),
                     events.clone(),
@@ -2002,6 +2034,7 @@ pub fn run() {
                 backup,
                 write_targets,
                 write_rules,
+                write_audit_log,
                 pool,
                 engine: AsyncMutex::new(initial_engine),
                 engine_control,
@@ -2054,6 +2087,7 @@ pub fn run() {
             write_rules_create,
             write_rules_update,
             write_rules_delete,
+            write_audit_log_list,
             engine_arm,
             engine_disarm,
             engine_set_dry_run,
@@ -2110,6 +2144,7 @@ mod tests {
             ),
             write_targets: WriteTargetService::new(pool.clone()),
             write_rules: WriteRuleService::new(pool.clone()),
+            write_audit_log: WriteAuditLogService::new(pool.clone()),
             pool,
             // Engine-less: the command-body tests that use this helper only
             // exercise the RBAC gate, which rejects before ever touching the
@@ -2146,6 +2181,7 @@ mod tests {
             backup: BackupService::new(db_path, pool.clone()),
             write_targets: WriteTargetService::new(pool.clone()),
             write_rules: WriteRuleService::new(pool.clone()),
+            write_audit_log: WriteAuditLogService::new(pool.clone()),
             pool,
             engine: AsyncMutex::new(None),
             engine_control: std::sync::Arc::new(AsyncMutex::new(None)),
@@ -2368,6 +2404,7 @@ mod tests {
             ),
             write_targets: WriteTargetService::new(pool.clone()),
             write_rules: WriteRuleService::new(pool.clone()),
+            write_audit_log: WriteAuditLogService::new(pool.clone()),
             pool: pool.clone(),
             engine: AsyncMutex::new(None),
             engine_control: std::sync::Arc::new(AsyncMutex::new(None)),
@@ -2404,6 +2441,7 @@ mod tests {
             ),
             write_targets: WriteTargetService::new(pool.clone()),
             write_rules: WriteRuleService::new(pool.clone()),
+            write_audit_log: WriteAuditLogService::new(pool.clone()),
             pool: pool.clone(),
             engine: AsyncMutex::new(Some(engine)),
             engine_control: std::sync::Arc::new(AsyncMutex::new(Some(control))),
@@ -2628,6 +2666,50 @@ mod tests {
         assert!(
             entries.rows.iter().all(|r| r.resource != "engine"),
             "a status read must not record any engine audit entry, got {:?}",
+            entries.rows
+        );
+    }
+
+    /// `write_audit_log_list` is a `viewer`+ read (plan W4): an unauthenticated
+    /// caller is denied, a viewer may read a seeded row back, and - being a
+    /// read - it records nothing to the M14 audit log for this resource.
+    #[tokio::test]
+    async fn write_audit_log_list_permits_viewer_and_denies_unauthenticated() {
+        let (state, pool) = app_state_with_engine().await;
+
+        // No session yet -> denied before any read happens.
+        let err = write_audit_log_list_body(&state, ListParams::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BantoError::Unauthorized));
+
+        // Seed one engine-shaped row directly in the shared table.
+        sqlx::query(
+            "INSERT INTO write_audit_log (ts, rule_name_snapshot, action, result) \
+             VALUES ('2026-01-01 00:00:01', 'R1', 'rule_fire', 'ok')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let viewer = state
+            .users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create viewer");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+
+        let result = write_audit_log_list_body(&state, ListParams::default())
+            .await
+            .expect("viewer may list");
+        assert_eq!(result.total_count, 1);
+        assert_eq!(result.rows[0].rule_name_snapshot, "R1");
+
+        // Read-only: no `write_audit_log` resource entry in the M14 audit log.
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        assert!(
+            entries.rows.iter().all(|r| r.resource != "write_audit_log"),
+            "a write-audit-log read must not record an audit entry, got {:?}",
             entries.rows
         );
     }
