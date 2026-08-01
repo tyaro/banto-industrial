@@ -114,6 +114,10 @@ use banto_server::{
     auth_routes, require_auth, require_banto_client_header, sse_route, ApiError, AuthState,
     Identity, ServerEvent,
 };
+use banto_tags::{
+    CollectionGroup, CollectionGroupInput, CollectionGroupService, PlcConnection,
+    PlcConnectionInput, PlcConnectionService, Tag, TagInput, TagService,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::str::FromStr;
@@ -1434,6 +1438,511 @@ fn write_registry_router(
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
 
+// --- R1-B: PLC connection / collection group / tag registry CRUD ------------
+
+fn default_payload_enabled() -> bool {
+    true
+}
+
+fn default_plc_protocol() -> String {
+    "modbus-tcp".to_string()
+}
+
+fn default_plc_unit_id() -> i64 {
+    1
+}
+
+fn default_tag_decimals() -> i64 {
+    0
+}
+
+/// Wire-shaped (camelCase) create/update payload for `plc_connections`.
+///
+/// banto-tags' own `PlcConnectionInput`/`CollectionGroupInput`/`TagInput`
+/// deserialize snake_case (they predate any JSON exposure and banto-tags must
+/// not be modified from this app), while this app's entire wire contract is
+/// camelCase (`WriteTargetInput` etc.). These three payload DTOs own the
+/// camelCase wire shape for BOTH transport paths - the REST handlers here and
+/// `src-tauri`'s `plc_connections_*`/`collection_groups_*`/`tags_*` commands
+/// (invariant §1 両経路対称: one payload type, so the two paths cannot drift) -
+/// and convert into the service-layer inputs via `From`. The `#[serde(default)]`
+/// choices mirror banto-tags' own defaults field for field.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlcConnectionPayload {
+    pub name: String,
+    #[serde(default = "default_plc_protocol")]
+    pub protocol: String,
+    pub host: String,
+    pub port: i64,
+    #[serde(default = "default_plc_unit_id")]
+    pub unit_id: i64,
+    #[serde(default = "default_payload_enabled")]
+    pub enabled: bool,
+}
+
+impl From<PlcConnectionPayload> for PlcConnectionInput {
+    fn from(payload: PlcConnectionPayload) -> Self {
+        Self {
+            name: payload.name,
+            protocol: payload.protocol,
+            host: payload.host,
+            port: payload.port,
+            unit_id: payload.unit_id,
+            enabled: payload.enabled,
+        }
+    }
+}
+
+/// Wire-shaped (camelCase) create/update payload for `collection_groups` -
+/// see [`PlcConnectionPayload`]'s doc comment for why these DTOs exist.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionGroupPayload {
+    pub name: String,
+    pub plc_connection_id: i64,
+    pub period_ms: i64,
+    #[serde(default = "default_payload_enabled")]
+    pub enabled: bool,
+}
+
+impl From<CollectionGroupPayload> for CollectionGroupInput {
+    fn from(payload: CollectionGroupPayload) -> Self {
+        Self {
+            name: payload.name,
+            plc_connection_id: payload.plc_connection_id,
+            period_ms: payload.period_ms,
+            enabled: payload.enabled,
+        }
+    }
+}
+
+/// Wire-shaped (camelCase) create/update payload for `tags` - see
+/// [`PlcConnectionPayload`]'s doc comment for why these DTOs exist.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagPayload {
+    pub name: String,
+    pub collection_group_id: i64,
+    pub address: String,
+    pub data_type: String,
+    #[serde(default)]
+    pub raw_lo: Option<f64>,
+    #[serde(default)]
+    pub raw_hi: Option<f64>,
+    #[serde(default)]
+    pub eng_lo: Option<f64>,
+    #[serde(default)]
+    pub eng_hi: Option<f64>,
+    #[serde(default)]
+    pub unit: Option<String>,
+    #[serde(default = "default_tag_decimals")]
+    pub decimals: i64,
+    #[serde(default)]
+    pub threshold_h: Option<f64>,
+    #[serde(default)]
+    pub threshold_hh: Option<f64>,
+    #[serde(default)]
+    pub threshold_l: Option<f64>,
+    #[serde(default)]
+    pub threshold_ll: Option<f64>,
+    #[serde(default = "default_payload_enabled")]
+    pub enabled: bool,
+}
+
+impl From<TagPayload> for TagInput {
+    fn from(payload: TagPayload) -> Self {
+        Self {
+            name: payload.name,
+            collection_group_id: payload.collection_group_id,
+            address: payload.address,
+            data_type: payload.data_type,
+            raw_lo: payload.raw_lo,
+            raw_hi: payload.raw_hi,
+            eng_lo: payload.eng_lo,
+            eng_hi: payload.eng_hi,
+            unit: payload.unit,
+            decimals: payload.decimals,
+            threshold_h: payload.threshold_h,
+            threshold_hh: payload.threshold_hh,
+            threshold_l: payload.threshold_l,
+            threshold_ll: payload.threshold_ll,
+            enabled: payload.enabled,
+        }
+    }
+}
+
+/// State for the `/api/plc-connections/*`, `/api/collection-groups/*` and
+/// `/api/tags/*` handlers (invariant §1 両経路対称): banto-tags' three
+/// registry services plus `AuthState`/`AuditLogService` so each mutation can
+/// editor-gate ([`require_editor`]) and audit exactly as the Tauri commands
+/// do - the same shape (and the same viewer-read / editor-write floor split)
+/// as [`WriteRegistryState`].
+#[derive(Clone)]
+struct TagRegistryState {
+    plc_connections: PlcConnectionService,
+    collection_groups: CollectionGroupService,
+    tags: TagService,
+    auth: AuthState,
+    audit: AuditLogService,
+}
+
+async fn plc_connections_list(
+    State(state): State<TagRegistryState>,
+) -> Result<Json<Vec<PlcConnection>>, ApiError> {
+    Ok(Json(
+        state
+            .plc_connections
+            .list(ListParams::default())
+            .await?
+            .rows,
+    ))
+}
+
+async fn plc_connections_get(
+    State(state): State<TagRegistryState>,
+    Path(id): Path<i64>,
+) -> Result<Json<PlcConnection>, ApiError> {
+    Ok(Json(state.plc_connections.get(id).await?))
+}
+
+async fn plc_connections_create(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Json(input): Json<PlcConnectionPayload>,
+) -> Result<Json<PlcConnection>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "plc_connections",
+        "POST",
+        "/api/plc-connections",
+    )
+    .await?;
+    let created = state.plc_connections.create(input.into()).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "create",
+        "plc_connections",
+        &created.id.to_string(),
+        Some(json!({ "name": created.name, "enabled": created.enabled })),
+    )
+    .await;
+    Ok(Json(created))
+}
+
+async fn plc_connections_update(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(input): Json<PlcConnectionPayload>,
+) -> Result<Json<PlcConnection>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "plc_connections",
+        "PUT",
+        "/api/plc-connections/{id}",
+    )
+    .await?;
+    let updated = state.plc_connections.update(id, input.into()).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "update",
+        "plc_connections",
+        &id.to_string(),
+        Some(json!({ "name": updated.name, "enabled": updated.enabled })),
+    )
+    .await;
+    Ok(Json(updated))
+}
+
+async fn plc_connections_delete(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "plc_connections",
+        "DELETE",
+        "/api/plc-connections/{id}",
+    )
+    .await?;
+    state.plc_connections.delete(id).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "delete",
+        "plc_connections",
+        &id.to_string(),
+        None,
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn collection_groups_list(
+    State(state): State<TagRegistryState>,
+) -> Result<Json<Vec<CollectionGroup>>, ApiError> {
+    Ok(Json(
+        state
+            .collection_groups
+            .list(ListParams::default())
+            .await?
+            .rows,
+    ))
+}
+
+async fn collection_groups_get(
+    State(state): State<TagRegistryState>,
+    Path(id): Path<i64>,
+) -> Result<Json<CollectionGroup>, ApiError> {
+    Ok(Json(state.collection_groups.get(id).await?))
+}
+
+async fn collection_groups_create(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Json(input): Json<CollectionGroupPayload>,
+) -> Result<Json<CollectionGroup>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "collection_groups",
+        "POST",
+        "/api/collection-groups",
+    )
+    .await?;
+    let created = state.collection_groups.create(input.into()).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "create",
+        "collection_groups",
+        &created.id.to_string(),
+        Some(json!({ "name": created.name, "enabled": created.enabled })),
+    )
+    .await;
+    Ok(Json(created))
+}
+
+async fn collection_groups_update(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(input): Json<CollectionGroupPayload>,
+) -> Result<Json<CollectionGroup>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "collection_groups",
+        "PUT",
+        "/api/collection-groups/{id}",
+    )
+    .await?;
+    let updated = state.collection_groups.update(id, input.into()).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "update",
+        "collection_groups",
+        &id.to_string(),
+        Some(json!({ "name": updated.name, "enabled": updated.enabled })),
+    )
+    .await;
+    Ok(Json(updated))
+}
+
+async fn collection_groups_delete(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "collection_groups",
+        "DELETE",
+        "/api/collection-groups/{id}",
+    )
+    .await?;
+    state.collection_groups.delete(id).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "delete",
+        "collection_groups",
+        &id.to_string(),
+        None,
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn tags_list(State(state): State<TagRegistryState>) -> Result<Json<Vec<Tag>>, ApiError> {
+    Ok(Json(state.tags.list(ListParams::default()).await?.rows))
+}
+
+async fn tags_get(
+    State(state): State<TagRegistryState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Tag>, ApiError> {
+    Ok(Json(state.tags.get(id).await?))
+}
+
+async fn tags_create(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Json(input): Json<TagPayload>,
+) -> Result<Json<Tag>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "tags",
+        "POST",
+        "/api/tags",
+    )
+    .await?;
+    let created = state.tags.create(input.into()).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "create",
+        "tags",
+        &created.id.to_string(),
+        Some(json!({ "name": created.name, "enabled": created.enabled })),
+    )
+    .await;
+    Ok(Json(created))
+}
+
+async fn tags_update(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(input): Json<TagPayload>,
+) -> Result<Json<Tag>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "tags",
+        "PUT",
+        "/api/tags/{id}",
+    )
+    .await?;
+    let updated = state.tags.update(id, input.into()).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "update",
+        "tags",
+        &id.to_string(),
+        Some(json!({ "name": updated.name, "enabled": updated.enabled })),
+    )
+    .await;
+    Ok(Json(updated))
+}
+
+async fn tags_delete(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "tags",
+        "DELETE",
+        "/api/tags/{id}",
+    )
+    .await?;
+    state.tags.delete(id).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "delete",
+        "tags",
+        &id.to_string(),
+        None,
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `/api/plc-connections/*` + `/api/collection-groups/*` + `/api/tags/*`
+/// (invariant §1 両経路対称, R1-B): viewer-read / editor-write, exactly the
+/// same floor split (router-wide `require_auth` for reads, inline
+/// [`require_editor`] per write handler) as [`write_registry_router`]. The
+/// services are banto-tags' own - delete guards ("still referenced by N
+/// groups/tags") and all input validation live there, shared verbatim with
+/// the Tauri commands (`plc_connections_*`/`collection_groups_*`/`tags_*` in
+/// `src-tauri`).
+fn tag_registry_router(
+    plc_connections: PlcConnectionService,
+    collection_groups: CollectionGroupService,
+    tags: TagService,
+    audit: AuditLogService,
+    auth: AuthState,
+) -> Router {
+    let state = TagRegistryState {
+        plc_connections,
+        collection_groups,
+        tags,
+        auth: auth.clone(),
+        audit,
+    };
+    Router::new()
+        .route(
+            "/api/plc-connections",
+            get(plc_connections_list).post(plc_connections_create),
+        )
+        .route(
+            "/api/plc-connections/{id}",
+            get(plc_connections_get)
+                .put(plc_connections_update)
+                .delete(plc_connections_delete),
+        )
+        .route(
+            "/api/collection-groups",
+            get(collection_groups_list).post(collection_groups_create),
+        )
+        .route(
+            "/api/collection-groups/{id}",
+            get(collection_groups_get)
+                .put(collection_groups_update)
+                .delete(collection_groups_delete),
+        )
+        .route("/api/tags", get(tags_list).post(tags_create))
+        .route(
+            "/api/tags/{id}",
+            get(tags_get).put(tags_update).delete(tags_delete),
+        )
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(auth, require_auth))
+}
+
 // --- W4: write-audit-log viewer (read-only) ---------------------------------
 
 /// State for `GET /api/write-audit-log` (plan W4): just the read-only
@@ -1664,14 +2173,13 @@ fn engine_router(control: SharedEngineControl, audit: AuditLogService, auth: Aut
 /// since those need `UsersService`), SSE events, the `admin`-only `users`
 /// management routes (spec M10), the `admin`-only `audit-log` viewer (spec
 /// M14), the `admin`-only `backups` routes (spec M17), the viewer-read/
-/// editor-write `write-targets`/`write-rules` registry (plan W2), and the
-/// per-user `ui-settings` routes (spec M12), all behind the CSRF header
-/// check. Mount
+/// editor-write `write-targets`/`write-rules` registry (plan W2), the
+/// viewer-read/editor-write `plc-connections`/`collection-groups`/`tags`
+/// registry (R1-B, [`tag_registry_router`] over banto-tags' own services),
+/// and the per-user `ui-settings` routes (spec M12), all behind the CSRF
+/// header check. Mount
 /// the result *before* `banto_server::static_files::static_router` so
-/// `/api/*` takes priority over the SPA fallback. Future resources (R1-B:
-/// PLC connections/collection groups/tags/display groups) get their own
-/// RBAC-split read/write routers merged in here the same way the banto
-/// template's `items_router` used to.
+/// `/api/*` takes priority over the SPA fallback.
 // Each parameter is a distinct, already-cloneable service handle threaded
 // through from `main()`/tests (no natural subset to bundle into a struct
 // without adding an indirection layer with a single call site); simpler to
@@ -1685,6 +2193,9 @@ pub fn api_router(
     write_targets: WriteTargetService,
     write_rules: WriteRuleService,
     write_audit_log: WriteAuditLogService,
+    plc_connections: PlcConnectionService,
+    collection_groups: CollectionGroupService,
+    tags: TagService,
     engine_control: SharedEngineControl,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
@@ -1716,6 +2227,13 @@ pub fn api_router(
         .merge(write_registry_router(
             write_targets,
             write_rules,
+            audit.clone(),
+            auth.clone(),
+        ))
+        .merge(tag_registry_router(
+            plc_connections,
+            collection_groups,
+            tags,
             audit.clone(),
             auth.clone(),
         ))
@@ -1799,6 +2317,9 @@ mod tests {
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
         let write_rules = WriteRuleService::new(pool.clone());
+        let plc_connections = PlcConnectionService::new(pool.clone());
+        let collection_groups = CollectionGroupService::new(pool.clone());
+        let tags = TagService::new(pool.clone());
         let write_audit_log = WriteAuditLogService::new(pool);
 
         users
@@ -1850,6 +2371,9 @@ mod tests {
                 write_targets,
                 write_rules,
                 write_audit_log,
+                plc_connections,
+                collection_groups,
+                tags,
                 no_engine_control(),
                 auth,
                 tx,
@@ -1870,6 +2394,9 @@ mod tests {
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
         let write_rules = WriteRuleService::new(pool.clone());
+        let plc_connections = PlcConnectionService::new(pool.clone());
+        let collection_groups = CollectionGroupService::new(pool.clone());
+        let tags = TagService::new(pool.clone());
         let write_audit_log = WriteAuditLogService::new(pool);
         let auth = demo_auth();
         let token = auth
@@ -1885,6 +2412,9 @@ mod tests {
                 write_targets,
                 write_rules,
                 write_audit_log,
+                plc_connections,
+                collection_groups,
+                tags,
                 no_engine_control(),
                 auth,
                 tx,
@@ -1940,6 +2470,9 @@ mod tests {
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
         let write_rules = WriteRuleService::new(pool.clone());
+        let plc_connections = PlcConnectionService::new(pool.clone());
+        let collection_groups = CollectionGroupService::new(pool.clone());
+        let tags = TagService::new(pool.clone());
         let write_audit_log = WriteAuditLogService::new(pool);
         let auth = demo_auth();
         api_router(
@@ -1950,6 +2483,9 @@ mod tests {
             write_targets,
             write_rules,
             write_audit_log,
+            plc_connections,
+            collection_groups,
+            tags,
             no_engine_control(),
             auth,
             tx,
@@ -2146,6 +2682,9 @@ mod tests {
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
         let write_rules = WriteRuleService::new(pool.clone());
+        let plc_connections = PlcConnectionService::new(pool.clone());
+        let collection_groups = CollectionGroupService::new(pool.clone());
+        let tags = TagService::new(pool.clone());
         let write_audit_log = WriteAuditLogService::new(pool);
         let auth = AuthState::new(audited_credential_verifier(users.clone(), audit.clone()));
         (
@@ -2157,6 +2696,9 @@ mod tests {
                 write_targets,
                 write_rules,
                 write_audit_log,
+                plc_connections,
+                collection_groups,
+                tags,
                 no_engine_control(),
                 auth,
                 tx,
@@ -2491,6 +3033,9 @@ mod tests {
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
         let write_rules = WriteRuleService::new(pool.clone());
+        let plc_connections = PlcConnectionService::new(pool.clone());
+        let collection_groups = CollectionGroupService::new(pool.clone());
+        let tags = TagService::new(pool.clone());
         let write_audit_log = WriteAuditLogService::new(pool);
 
         users
@@ -2528,6 +3073,9 @@ mod tests {
             write_targets,
             write_rules,
             write_audit_log,
+            plc_connections,
+            collection_groups,
+            tags,
             no_engine_control(),
             auth,
             tx,
@@ -2566,6 +3114,9 @@ mod tests {
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
         let write_rules = WriteRuleService::new(pool.clone());
+        let plc_connections = PlcConnectionService::new(pool.clone());
+        let collection_groups = CollectionGroupService::new(pool.clone());
+        let tags = TagService::new(pool.clone());
         let write_audit_log = WriteAuditLogService::new(pool);
 
         users
@@ -2603,6 +3154,9 @@ mod tests {
             write_targets,
             write_rules,
             write_audit_log,
+            plc_connections,
+            collection_groups,
+            tags,
             no_engine_control(),
             auth,
             tx,
@@ -3185,8 +3739,6 @@ mod tests {
     /// write result AND the audit trail (spec §1 両経路対称: the REST path
     /// must produce the same authz + audit as the Tauri path).
     async fn write_registry_router_test() -> (Router, AuditLogService, i64, String, String) {
-        use banto_tags::{PlcConnectionInput, PlcConnectionService};
-
         let pool = migrate_memory().await.expect("migrate_memory");
         let (tx, _rx) = broadcast::channel(16);
         let users = UsersService::new(pool.clone());
@@ -3195,6 +3747,9 @@ mod tests {
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
         let write_rules = WriteRuleService::new(pool.clone());
+        let plc_connections = PlcConnectionService::new(pool.clone());
+        let collection_groups = CollectionGroupService::new(pool.clone());
+        let tags = TagService::new(pool.clone());
         let write_audit_log = WriteAuditLogService::new(pool.clone());
 
         let conn = PlcConnectionService::new(pool.clone())
@@ -3240,6 +3795,9 @@ mod tests {
             write_targets,
             write_rules,
             write_audit_log,
+            plc_connections,
+            collection_groups,
+            tags,
             no_engine_control(),
             auth,
             tx,
@@ -3321,6 +3879,192 @@ mod tests {
             .any(|r| r.action == "create" && r.resource == "write_targets"));
     }
 
+    // --- R1-B: tag registry dual-path symmetry (REST half) ------------------
+
+    /// Router with a seeded PLC connection + collection group (so a tag can be
+    /// created), real editor/viewer tokens, and the shared audit service - the
+    /// R1-B twin of [`write_registry_router_test`]. Only the `tags` resource
+    /// gets the full authz+audit assertions below (the three resources share
+    /// one router/one `require_editor` path, and banto-tags itself already
+    /// tests all the service-layer validation); the other two get a viewer
+    /// list smoke test.
+    async fn tag_registry_router_test() -> (Router, AuditLogService, i64, String, String) {
+        let pool = migrate_memory().await.expect("migrate_memory");
+        let (tx, _rx) = broadcast::channel(16);
+        let users = UsersService::new(pool.clone());
+        let settings = SettingsService::new(pool.clone());
+        let backup = unused_backup_service(pool.clone());
+        let audit = AuditLogService::new(pool.clone());
+        let write_targets = WriteTargetService::new(pool.clone());
+        let write_rules = WriteRuleService::new(pool.clone());
+        let plc_connections = PlcConnectionService::new(pool.clone());
+        let collection_groups = CollectionGroupService::new(pool.clone());
+        let tags = TagService::new(pool.clone());
+        let write_audit_log = WriteAuditLogService::new(pool.clone());
+
+        let conn = plc_connections
+            .create(PlcConnectionInput {
+                name: "PLC1".to_string(),
+                protocol: "slmp".to_string(),
+                host: "10.0.0.1".to_string(),
+                port: 5007,
+                unit_id: 1,
+                enabled: true,
+            })
+            .await
+            .expect("seed plc connection");
+        let group = collection_groups
+            .create(banto_tags::CollectionGroupInput {
+                name: "G1".to_string(),
+                plc_connection_id: conn.id,
+                period_ms: 1_000,
+                enabled: true,
+            })
+            .await
+            .expect("seed collection group");
+
+        users
+            .setup_first_user("admin", "password123", "管理者")
+            .await
+            .expect("setup_first_user");
+        users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create editor");
+        users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create viewer");
+
+        let auth = AuthState::new(audited_credential_verifier(users.clone(), audit.clone()));
+        let editor_token = auth
+            .login("editor", "password123")
+            .await
+            .expect("editor login");
+        let viewer_token = auth
+            .login("viewer", "password123")
+            .await
+            .expect("viewer login");
+
+        let router = api_router(
+            users,
+            settings,
+            audit.clone(),
+            backup,
+            write_targets,
+            write_rules,
+            write_audit_log,
+            plc_connections,
+            collection_groups,
+            tags,
+            no_engine_control(),
+            auth,
+            tx,
+            false,
+        );
+        (router, audit, group.id, editor_token, viewer_token)
+    }
+
+    /// An `editor` can create a tag over REST, and the mutation is recorded to
+    /// the audit log with `origin: "rest"` / `resource: "tags"` - the REST half
+    /// of the R1-B create+audit symmetry (the Tauri half is asserted in
+    /// `src-tauri`'s own tests).
+    #[tokio::test]
+    async fn rest_editor_can_create_tag_and_it_is_audited() {
+        let (router, audit, group_id, editor, _viewer) = tag_registry_router_test().await;
+        let response = router
+            .oneshot(post_json_auth(
+                "/api/tags",
+                &editor,
+                json!({
+                    "name": "温度センサ",
+                    "collectionGroupId": group_id,
+                    "address": "D100",
+                    "dataType": "i16"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = body_json(response).await;
+        assert_eq!(created["name"], "温度センサ");
+
+        let entries = audit.list(ListParams::default()).await.unwrap();
+        let entry = entries
+            .rows
+            .iter()
+            .find(|r| r.action == "create" && r.resource == "tags")
+            .expect("expected a tags create audit entry");
+        assert_eq!(entry.origin, "rest");
+        assert_eq!(entry.result, "ok");
+        assert_eq!(entry.actor_username.as_deref(), Some("editor"));
+    }
+
+    /// A `viewer` is denied (403) when trying to create a tag, and the denial
+    /// is recorded (`action: "denied"`, `resource: "tags"`, `origin: "rest"`) -
+    /// [`require_editor`] gates the tag registry writes exactly as it does the
+    /// W2 write registry's.
+    #[tokio::test]
+    async fn rest_viewer_cannot_create_tag_and_denial_is_audited() {
+        let (router, audit, group_id, _editor, viewer) = tag_registry_router_test().await;
+        let response = router
+            .oneshot(post_json_auth(
+                "/api/tags",
+                &viewer,
+                json!({
+                    "name": "温度センサ",
+                    "collectionGroupId": group_id,
+                    "address": "D100",
+                    "dataType": "i16"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let entries = audit.list(ListParams::default()).await.unwrap();
+        assert!(
+            entries
+                .rows
+                .iter()
+                .any(|r| r.action == "denied" && r.resource == "tags"),
+            "expected a denied entry for tags, got {:?}",
+            entries.rows
+        );
+        // And nothing was actually created.
+        assert!(!entries
+            .rows
+            .iter()
+            .any(|r| r.action == "create" && r.resource == "tags"));
+    }
+
+    /// Smoke: a `viewer` can list all three tag-registry resources (the whole
+    /// router sits behind `require_auth` alone for reads), and the seeded
+    /// connection/group rows come back.
+    #[tokio::test]
+    async fn rest_viewer_can_list_all_three_tag_registry_resources() {
+        let (router, _audit, _group_id, _editor, viewer) = tag_registry_router_test().await;
+
+        for (path, expected_rows) in [
+            ("/api/plc-connections", 1),
+            ("/api/collection-groups", 1),
+            ("/api/tags", 0),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(get_auth(path, &viewer))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "GET {path}");
+            let rows = body_json(response).await;
+            assert_eq!(
+                rows.as_array().expect("array body").len(),
+                expected_rows,
+                "GET {path} row count"
+            );
+        }
+    }
+
     // --- W3-B2: engine control dual-path symmetry (REST half) ---------------
 
     /// Router with real admin/editor/viewer accounts + tokens AND a real
@@ -3339,6 +4083,9 @@ mod tests {
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
         let write_rules = WriteRuleService::new(pool.clone());
+        let plc_connections = PlcConnectionService::new(pool.clone());
+        let collection_groups = CollectionGroupService::new(pool.clone());
+        let tags = TagService::new(pool.clone());
         let write_audit_log = WriteAuditLogService::new(pool.clone());
 
         users
@@ -3391,6 +4138,9 @@ mod tests {
             write_targets,
             write_rules,
             write_audit_log,
+            plc_connections,
+            collection_groups,
+            tags,
             engine_control,
             auth,
             tx,

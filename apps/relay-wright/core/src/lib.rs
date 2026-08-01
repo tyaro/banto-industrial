@@ -18,6 +18,19 @@ pub mod engine;
 // The auto-write engine's public surface (W3-B): the running engine, its safe
 // arm/disarm/dry-run control handle, its config, and a status snapshot.
 pub use engine::{Engine, EngineConfig, EngineControl, EngineStatus, SharedEngineControl};
+
+// R1-B (PLC接続/収集グループ/タグ登録画面): banto-tags' three registry
+// services and their row types, re-exported so `src-tauri` (whose invariant
+// is to add NO new dependencies of its own - see `db::DbPool`'s precedent)
+// can name them for `AppState` fields and command signatures. The services
+// themselves are banto-tags' finished building blocks; this app only wires
+// them to its two transport paths (`rest::api_router` + the Tauri commands).
+// The camelCase create/update wire payloads live in `rest`
+// (`rest::PlcConnectionPayload` etc.), shared by both paths - banto-tags' own
+// `*Input` structs deserialize snake_case and never cross a wire here.
+pub use banto_tags::{
+    CollectionGroup, CollectionGroupService, PlcConnection, PlcConnectionService, Tag, TagService,
+};
 pub mod events;
 pub mod rest;
 pub mod settings;
