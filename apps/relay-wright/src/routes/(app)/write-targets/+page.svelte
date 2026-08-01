@@ -5,9 +5,11 @@
 	 * （backend も同じ権限で二経路対称 — REST/Tauri）。デモモード（バックエンド
 	 * なし）ではレジストリDBが無いため案内文のみ表示する。
 	 *
-	 * PLC接続ID/スケーリングは Tag フォームと同じ構造。PLC接続やタグの一覧取得
-	 * APIはこのアプリにまだ無いため、plcConnectionId は数値入力とする（存在
-	 * チェックはサーバー側で行い、無ければ分かりやすいエラーを返す）。
+	 * PLC接続は R1-B の PLC接続画面（/plc-connections）で登録されたものを
+	 * プルダウンで選択する（かつては一覧APIが無く数値ID直接入力だった）。
+	 * 選択肢のラベルには数値IDも含める（監査ログの entityId/detail が ID
+	 * ベースなので、突き合わせられるように）。エンジンが実際に書き込むのは
+	 * SLMP 接続のみのため、ラベルにプロトコルを表示して正直に示す。
 	 */
 	import { BantoGrid, type GridColumn } from '@banto/grid-svelte';
 	import { isProviderError } from '@banto/admin-core';
@@ -25,6 +27,7 @@
 		type WriteTargetInput,
 		type WriteDataType
 	} from '$lib/banto/writeRegistryAdmin';
+	import { listPlcConnections, type PlcConnection } from '$lib/banto/tagRegistryAdmin';
 
 	const dataTypeOptions: WriteDataType[] = ['bit', 'i16', 'u16', 'i32', 'u32', 'f32'];
 
@@ -104,13 +107,30 @@
 	}
 
 	let targets: WriteTarget[] = $state([]);
+	let connections: PlcConnection[] = $state([]);
 	let loading = $state(false);
+
+	/** Option label: keep the numeric ID visible so audit rows (entityId/
+	 *  detail are ID-based) remain interpretable against the UI. */
+	function connectionLabel(c: PlcConnection): string {
+		return `${c.id}: ${c.name}（${c.protocol}）`;
+	}
+
+	function connectionName(id: number): string {
+		const c = connections.find((entry) => entry.id === id);
+		return c ? `${c.name}（${c.protocol}）` : `#${id}`;
+	}
 
 	async function reload(): Promise<void> {
 		if (!available) return;
 		loading = true;
 		try {
-			targets = await listWriteTargets();
+			const [targetList, connectionList] = await Promise.all([
+				listWriteTargets(),
+				listPlcConnections()
+			]);
+			targets = targetList;
+			connections = connectionList;
 		} catch (err) {
 			toastStore.push('error', errorMessage(err));
 		} finally {
@@ -209,9 +229,8 @@
 		{
 			id: 'plcConnectionId',
 			header: 'PLC接続',
-			accessor: 'plcConnectionId',
-			width: 90,
-			align: 'right'
+			accessor: (t) => connectionName(t.plcConnectionId),
+			width: 150
 		},
 		{ id: 'address', header: 'アドレス', accessor: 'address', width: 110 },
 		{ id: 'dataType', header: '型', accessor: 'dataType', width: 70 },
@@ -244,8 +263,14 @@
 						{#if createErrors.name}<span class="err">{createErrors.name}</span>{/if}
 					</label>
 					<label class="field">
-						PLC接続ID
-						<input type="number" bind:value={createForm.plcConnectionId} />
+						PLC接続
+						<select bind:value={createForm.plcConnectionId}>
+							<option value="">選択してください</option>
+							{#each connections as c (c.id)}
+								<option value={String(c.id)}>{connectionLabel(c)}</option>
+							{/each}
+						</select>
+						<span class="hint">エンジンが書き込むのは SLMP 接続のみです。</span>
 						{#if createErrors.plcConnectionId}<span class="err">{createErrors.plcConnectionId}</span
 							>{/if}
 					</label>
@@ -329,8 +354,14 @@
 						{#if editErrors.name}<span class="err">{editErrors.name}</span>{/if}
 					</label>
 					<label class="field">
-						PLC接続ID
-						<input type="number" bind:value={editForm.plcConnectionId} />
+						PLC接続
+						<select bind:value={editForm.plcConnectionId}>
+							<option value="">選択してください</option>
+							{#each connections as c (c.id)}
+								<option value={String(c.id)}>{connectionLabel(c)}</option>
+							{/each}
+						</select>
+						<span class="hint">エンジンが書き込むのは SLMP 接続のみです。</span>
 						{#if editErrors.plcConnectionId}<span class="err">{editErrors.plcConnectionId}</span
 							>{/if}
 					</label>
@@ -458,6 +489,11 @@
 
 	.field.checkbox input {
 		width: auto;
+	}
+
+	.hint {
+		font-size: 0.7rem;
+		color: var(--banto-text-muted);
 	}
 
 	.err {
