@@ -254,6 +254,15 @@ async fn rising_edge_writes_exactly_once_and_does_not_refire_while_held() {
         .await,
         "the rising edge should have written 777 to the target"
     );
+    // The simulator's device value becomes visible mid-`Writer::process`
+    // (log-before-write inserts the audit row first, but its result is set to
+    // `ok` only AFTER the broker write returns), so bound-wait for the row
+    // instead of asserting the count immediately - the gap is tiny but real
+    // under CPU load.
+    assert!(
+        wait_for_count(&f.pool, "rule_fire", "ok", 1, Duration::from_secs(5)).await,
+        "the rising-edge write must be audited ok"
+    );
     assert_eq!(
         count(&f.pool, "rule_fire", "ok").await,
         1,
@@ -512,6 +521,12 @@ async fn falling_edge_fires_on_true_to_false() {
             == 777)
         .await,
         "falling edge should write on true->false"
+    );
+    // Same audit-row race as the rising-edge test: the device value is
+    // observable before `set_result` commits `ok`, so bound-wait for the row.
+    assert!(
+        wait_for_count(&f.pool, "rule_fire", "ok", 1, Duration::from_secs(5)).await,
+        "the falling-edge write must be audited ok"
     );
     assert_eq!(count(&f.pool, "rule_fire", "ok").await, 1);
 
