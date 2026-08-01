@@ -252,7 +252,16 @@
 		};
 	}
 
-	function numOrNull(value: string): number | null {
+	/**
+	 * 空欄 = 未設定（null）。フォーム状態は初期値こそ文字列だが、Svelte 5 の
+	 * `bind:value` は `type="number"` の入力後に number（空欄は null）を書き
+	 * 戻すため、実行時には string | number | null が混在する — string 前提で
+	 * `.trim()` すると入力後の保存が TypeError で落ちる（write-targets/
+	 * write-rules に元からあった実バグと同型。3画面とも同修正）。
+	 */
+	function numOrNull(value: string | number | null): number | null {
+		if (typeof value === 'number') return Number.isNaN(value) ? null : value;
+		if (value === null) return null;
 		const trimmed = value.trim();
 		return trimmed === '' ? null : Number(trimmed);
 	}
