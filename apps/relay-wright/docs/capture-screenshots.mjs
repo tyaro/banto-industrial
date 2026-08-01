@@ -396,6 +396,16 @@ async function main() {
 			}
 		});
 
+		// QRコード画面のデモ文字列（タッチパネル読み取りデバッグ支援）。
+		for (const [label, text] of [
+			['開始', 'START'],
+			['停止', 'STOP'],
+			['リセット', 'RESET'],
+			['デバッグモード', 'MODE:DEBUG']
+		]) {
+			await api('POST', '/api/qr-strings', { token, body: { label, text } });
+		}
+
 		// ---- Screens.
 		// login.png: セットアップ済みDBなので通常のログインフォームが出る。
 		await page.goto(`${BASE_URL}/login`);
@@ -486,6 +496,13 @@ async function main() {
 		await page.goto(`${BASE_URL}/write-audit-log`);
 		await page.getByText('レート制限トリップ').first().waitFor();
 		await shot('write-audit-log.png');
+
+		// QRコード（デバッグ支援）。管理リストとQRタイルグリッドの両方が
+		// 入るよう fullPage で撮る（SVGはサーバー生成なので待つのは描画のみ）。
+		await page.goto(`${BASE_URL}/qr-codes`);
+		await page.getByText('デバッグモード').first().waitFor();
+		await page.locator('.qr-svg svg').first().waitFor();
+		await shot('qr-codes.png', { fullPage: true });
 
 		// 操作監査ログ（M14）。Header の h1 も同じ「監査ログ」を描画するので
 		// level: 2 でページ本体の h2 に絞る（chronogazer smoke.spec.ts と同じ理由）。
