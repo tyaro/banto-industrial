@@ -448,6 +448,22 @@ async function main() {
 		// 撮影のみ（登録はしない）— Esc でモーダルを閉じて次の画面へ。
 		await page.keyboard.press('Escape');
 
+		// 連続登録モーダル: グループを選び、開始 D200・件数8・i16（既定）で
+		// 連番プレビュー（D200〜D207・名前=アドレス自動割り付け）を出した状態。
+		await page.getByRole('button', { name: '連続登録' }).click();
+		const seqDialog = page.getByRole('dialog', { name: '連続登録' });
+		await seqDialog
+			.locator('select')
+			.first()
+			.selectOption({ label: 'ライン1 収集グループ（ライン1 PLC）' });
+		// 開始デバイスは placeholder で特定（type="text" は単位欄と2つある）。
+		await seqDialog.getByPlaceholder('D100').fill('D200');
+		await seqDialog.locator('input[type="number"]').first().fill('8');
+		await seqDialog.getByText('D200 〜 D207（i16, step1, 8件）を登録します').waitFor();
+		await shot('tags-sequential.png');
+		// 撮影のみ（登録はしない）。
+		await page.keyboard.press('Escape');
+
 		// 書き込み先（グリッドに2行）。
 		await page.goto(`${BASE_URL}/write-targets`);
 		await page.getByText('冷却バルブ指令').waitFor();
