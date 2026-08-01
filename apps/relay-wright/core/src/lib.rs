@@ -25,6 +25,7 @@ pub mod settings;
 // modules (not part of the public API - see `support.rs`'s doc comment).
 mod support;
 pub mod users;
+pub mod write_audit_query;
 pub mod write_rule_conditions;
 pub mod write_rules;
 pub mod write_targets;
