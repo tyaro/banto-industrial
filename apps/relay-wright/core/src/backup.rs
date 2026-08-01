@@ -689,7 +689,16 @@ mod tests {
 
         let listed = svc.list().await.expect("list should succeed");
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0], created);
+        assert_eq!(listed[0].file_name, created.file_name);
+        assert_eq!(listed[0].size_bytes, created.size_bytes);
+        // Deliberately NOT `assert_eq!(listed[0], created)`: the two
+        // `created_at`s come from different clocks - `create()` snapshots the
+        // DB's `datetime('now')` BEFORE the `VACUUM INTO`, while `list()`
+        // derives it from the file's mtime (set when the vacuum finishes
+        // writing). Crossing a second boundary between those two moments makes
+        // them differ by one second, which made exact equality a rare but real
+        // flake under parallel test load (slower vacuum = wider race window).
+        assert!(!listed[0].created_at.is_empty());
 
         let bytes = svc
             .read(&created.file_name)
