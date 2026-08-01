@@ -3163,6 +3163,7 @@ dependencies = [
  "banto-tags",
  "futures-util",
  "password-hash",
+ "qrcode",
  "rust-embed",
  "serde",
  "serde_json",
