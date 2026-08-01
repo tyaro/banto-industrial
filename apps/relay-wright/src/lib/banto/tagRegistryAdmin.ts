@@ -71,9 +71,7 @@ export interface CollectionGroupInput {
  * `banto_tags::ALLOWED_PERIOD_MS` (the backend rejects anything else with a
  * field-level validation error, so the UI only ever offers these).
  */
-export const ALLOWED_PERIOD_MS: readonly number[] = [
-	100, 200, 500, 1000, 2000, 5000, 10000, 60000
-];
+export const ALLOWED_PERIOD_MS: readonly number[] = [100, 200, 500, 1000, 2000, 5000, 10000, 60000];
 
 export type TagDataType = 'bit' | 'i16' | 'u16' | 'i32' | 'u32' | 'f32';
 

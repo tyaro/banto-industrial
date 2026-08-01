@@ -454,8 +454,8 @@
 		</label>
 	</div>
 	<p class="note">
-		スケーリング（raw/eng の上下限）は 4 つすべて入力するか、すべて空にしてください
-		（空 = スケーリングなし）。しきい値は LL ≤ L ≤ H ≤ HH の順（設定した項目のみ比較）。
+		スケーリング（raw/eng の上下限）は 4 つすべて入力するか、すべて空にしてください （空 =
+		スケーリングなし）。しきい値は LL ≤ L ≤ H ≤ HH の順（設定した項目のみ比較）。
 	</p>
 	{#if errors.scaling}<p class="err">{errors.scaling}</p>{/if}
 {/snippet}
@@ -506,11 +506,7 @@
 										<button type="button" class="small" onclick={() => startEditGroup(g)}>
 											編集
 										</button>
-										<button
-											type="button"
-											class="small danger"
-											onclick={() => handleDeleteGroup(g)}
-										>
+										<button type="button" class="small danger" onclick={() => handleDeleteGroup(g)}>
 											削除
 										</button>
 									</td>
@@ -539,8 +535,7 @@
 									<option value={String(c.id)}>{c.name}（{c.protocol}）</option>
 								{/each}
 							</select>
-							{#if groupErrors.plcConnectionId}<span class="err"
-									>{groupErrors.plcConnectionId}</span
+							{#if groupErrors.plcConnectionId}<span class="err">{groupErrors.plcConnectionId}</span
 								>{/if}
 						</label>
 						<label class="field">
