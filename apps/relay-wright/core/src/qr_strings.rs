@@ -242,8 +242,9 @@ impl QrStringService {
             return Err(BantoError::Validation {
                 field_errors: vec![FieldError {
                     field: "ids".to_string(),
-                    message: "並び替え対象が現在のリストと一致しません（画面を再読み込みしてください）"
-                        .to_string(),
+                    message:
+                        "並び替え対象が現在のリストと一致しません（画面を再読み込みしてください）"
+                            .to_string(),
                 }],
             });
         }

@@ -1613,7 +1613,10 @@ fn qr_strings_router(
             "/api/qr-strings",
             get(qr_strings_list).post(qr_strings_create),
         )
-        .route("/api/qr-strings/reorder", axum::routing::put(qr_strings_reorder))
+        .route(
+            "/api/qr-strings/reorder",
+            axum::routing::put(qr_strings_reorder),
+        )
         .route(
             "/api/qr-strings/{id}",
             get(qr_strings_get)
