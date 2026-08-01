@@ -142,15 +142,99 @@ function seedDatabase() {
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 		);
 		const rows = [
-			['2026-07-30 08:55:12', null, '-', null, null, null, null, 'admin', 'dry_run_toggle', 'ok', '{"dryRun":true}'],
+			[
+				'2026-07-30 08:55:12',
+				null,
+				'-',
+				null,
+				null,
+				null,
+				null,
+				'admin',
+				'dry_run_toggle',
+				'ok',
+				'{"dryRun":true}'
+			],
 			['2026-07-30 09:00:00', null, '-', null, null, null, null, 'admin', 'arm', 'ok', null],
-			['2026-07-30 09:02:31', 1, '高温時冷却バルブON', 1, 81.5, 1, 1, null, 'rule_fire', 'suppressed_dry_run', null],
-			['2026-07-30 09:05:10', null, '-', null, null, null, null, 'admin', 'dry_run_toggle', 'ok', '{"dryRun":false}'],
-			['2026-07-30 09:12:44', 1, '高温時冷却バルブON', 1, 82.5, 1, 1, null, 'rule_fire', 'ok', null],
+			[
+				'2026-07-30 09:02:31',
+				1,
+				'高温時冷却バルブON',
+				1,
+				81.5,
+				1,
+				1,
+				null,
+				'rule_fire',
+				'suppressed_dry_run',
+				null
+			],
+			[
+				'2026-07-30 09:05:10',
+				null,
+				'-',
+				null,
+				null,
+				null,
+				null,
+				'admin',
+				'dry_run_toggle',
+				'ok',
+				'{"dryRun":false}'
+			],
+			[
+				'2026-07-30 09:12:44',
+				1,
+				'高温時冷却バルブON',
+				1,
+				82.5,
+				1,
+				1,
+				null,
+				'rule_fire',
+				'ok',
+				null
+			],
 			['2026-07-30 09:13:02', 2, '停止中の警報リセット', 2, 0, 2, 1, null, 'rule_fire', 'ok', null],
-			['2026-07-30 09:20:18', 1, '高温時冷却バルブON', 1, 85.1, 1, 1, null, 'rule_fire', 'failed', 'PLC connection lost mid-write'],
-			['2026-07-30 09:25:40', 1, '高温時冷却バルブON', 1, 86.0, 1, 1, null, 'rate_limit_tripped', 'suppressed_rate_limited', 'rate limit exceeded; breaker tripped and engine auto-disarmed'],
-			['2026-07-30 09:25:41', 1, '高温時冷却バルブON', 1, 86.2, 1, 1, null, 'rule_fire', 'suppressed_disarmed', null],
+			[
+				'2026-07-30 09:20:18',
+				1,
+				'高温時冷却バルブON',
+				1,
+				85.1,
+				1,
+				1,
+				null,
+				'rule_fire',
+				'failed',
+				'PLC connection lost mid-write'
+			],
+			[
+				'2026-07-30 09:25:40',
+				1,
+				'高温時冷却バルブON',
+				1,
+				86.0,
+				1,
+				1,
+				null,
+				'rate_limit_tripped',
+				'suppressed_rate_limited',
+				'rate limit exceeded; breaker tripped and engine auto-disarmed'
+			],
+			[
+				'2026-07-30 09:25:41',
+				1,
+				'高温時冷却バルブON',
+				1,
+				86.2,
+				1,
+				1,
+				null,
+				'rule_fire',
+				'suppressed_disarmed',
+				null
+			],
 			['2026-07-30 09:30:00', null, '-', null, null, null, null, 'admin', 'disarm', 'ok', null]
 		];
 		for (const r of rows) audit.run(...r);
@@ -257,9 +341,7 @@ async function main() {
 				writeValueMode: 'constant',
 				writeConstantValue: 1,
 				writeSourceTagId: null,
-				conditions: [
-					{ sourceTagId: 1, operator: 'gt', thresholdValue: 80, thresholdValue2: null }
-				]
+				conditions: [{ sourceTagId: 1, operator: 'gt', thresholdValue: 80, thresholdValue2: null }]
 			}
 		});
 		await api('POST', '/api/write-rules', {
