@@ -166,3 +166,132 @@ impl Writer {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use banto_plc::TagValue;
+    use sqlx::SqlitePool;
+
+    use super::*;
+    use crate::db::init_db_memory;
+    use crate::engine::broker::spawn_test_handle_answering_ok;
+    use crate::engine::rate_limiter::RateLimitConfig;
+
+    fn pending(rule_id: i64, value: f64) -> PendingWrite {
+        PendingWrite {
+            rule_id,
+            rule_name: format!("R{rule_id}"),
+            write_target_id: 1,
+            source_tag_id: Some(10),
+            source_value: Some(1.0),
+            value: TagValue::F64(value),
+        }
+    }
+
+    async fn count(pool: &SqlitePool, action: &str, result: &str) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM write_audit_log WHERE action = ? AND result = ?")
+            .bind(action)
+            .bind(result)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The plan's W5 deterministic window-timing test (the writer-level twin
+    /// of `rate_limiter.rs`'s unit tests and the real-time storm test in
+    /// `tests/engine_integration.rs`): a storm through [`Writer::process`]
+    /// proving trip → auto-disarm → manual-re-arm-is-not-enough → window
+    /// slide re-opens the budget, with every audit row checked.
+    ///
+    /// Determinism comes from the same seam the rate limiter itself uses: the
+    /// writer takes an explicit `now: Instant`, so the test builds an
+    /// `Instant` ladder with plain `Duration` arithmetic - no wall clock in
+    /// the assertions at all. (`tokio::time::pause` would NOT help here:
+    /// pausing virtualizes `tokio::time::Instant`, but the rate window runs
+    /// on injected `std::time::Instant`s, which is strictly more
+    /// deterministic - the same reasoning as banto-collect's
+    /// `backoff_ladder_advances_virtual_time_deterministically`, adapted to
+    /// an injected-clock design.) The broker is a no-network test fake, so
+    /// the only I/O is the in-memory audit DB.
+    #[tokio::test]
+    async fn storm_trips_breaker_and_only_rearm_plus_window_slide_recovers() {
+        let pool = init_db_memory().await.expect("in-memory db");
+        let arming = Arc::new(ArmingState::new(false));
+        arming.arm();
+        let (handle, _broker_task) = spawn_test_handle_answering_ok(1);
+        let target = ResolvedTarget {
+            connection_id: 1,
+            address: Address::parse_slmp("D200").expect("valid address"),
+            data_type: DataType::U16,
+        };
+        let mut writer = Writer::new(
+            pool.clone(),
+            arming.clone(),
+            RateLimiter::new(RateLimitConfig {
+                window: Duration::from_secs(60),
+                global_max: 1000,
+                per_connection_max: 2,
+            }),
+            HashMap::from([(1, handle)]),
+            HashMap::from([(1, target)]),
+        );
+
+        // Two writes fit the per-connection budget of 2.
+        let t0 = Instant::now();
+        writer.process(pending(1, 100.0), t0).await.unwrap();
+        writer
+            .process(pending(2, 101.0), t0 + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(count(&pool, "rule_fire", "ok").await, 2);
+        assert!(arming.is_armed(), "clean writes must not disarm");
+
+        // The third within the window trips the breaker and auto-disarms.
+        writer
+            .process(pending(3, 102.0), t0 + Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&pool, "rate_limit_tripped", "suppressed_rate_limited").await,
+            1
+        );
+        assert!(!arming.is_armed(), "tripping must auto-disarm");
+
+        // Still disarmed: the next intent is suppressed as disarmed (gate #2
+        // fires before the rate gate), not tripped again.
+        writer
+            .process(pending(4, 103.0), t0 + Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(count(&pool, "rule_fire", "suppressed_disarmed").await, 1);
+
+        // Manual re-arm alone is NOT enough while the window is still full:
+        // the very next intent inside the window trips the breaker again.
+        arming.arm();
+        writer
+            .process(pending(5, 104.0), t0 + Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(
+            count(&pool, "rate_limit_tripped", "suppressed_rate_limited").await,
+            2
+        );
+        assert!(!arming.is_armed(), "re-tripping must auto-disarm again");
+
+        // Re-arm AND slide the window past both recorded writes (at t0 and
+        // t0+1s; both are >= 60s old at t0+62s): the write goes through.
+        arming.arm();
+        writer
+            .process(pending(6, 105.0), t0 + Duration::from_secs(62))
+            .await
+            .unwrap();
+        assert_eq!(count(&pool, "rule_fire", "ok").await, 3);
+        assert!(
+            arming.is_armed(),
+            "a clean write after recovery stays armed"
+        );
+    }
+}

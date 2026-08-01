@@ -277,6 +277,32 @@ impl ReadOnlyHandle {
     }
 }
 
+/// Test-only fake broker: a [`BrokerHandle`] backed by a task that answers
+/// every job successfully with no network and no clock - reads with an empty
+/// result set, writes with all-[`WriteResult::Ok`]. Lets sibling modules'
+/// unit tests (e.g. `writer.rs`'s rate-limit gate test) drive code that
+/// requires a write-capable handle fully deterministically.
+#[cfg(test)]
+pub(crate) fn spawn_test_handle_answering_ok(connection_id: i64) -> (BrokerHandle, JoinHandle<()>) {
+    let (tx, mut rx) = mpsc::channel::<Job>(JOB_CHANNEL_CAPACITY);
+    let task = tokio::spawn(async move {
+        while let Some(job) = rx.recv().await {
+            match job {
+                Job::Read { respond_to, .. } => {
+                    let _ = respond_to.send(Ok(Vec::new()));
+                }
+                Job::Write {
+                    requests,
+                    respond_to,
+                } => {
+                    let _ = respond_to.send(Ok(requests.iter().map(|_| WriteResult::Ok).collect()));
+                }
+            }
+        }
+    });
+    (BrokerHandle { connection_id, tx }, task)
+}
+
 /// Spawns and owns one broker task per SLMP [`PlcConnection`], and hands out
 /// [`BrokerHandle`]s keyed by connection id.
 pub struct BrokerSupervisor {

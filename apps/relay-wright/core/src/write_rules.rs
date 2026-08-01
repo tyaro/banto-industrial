@@ -311,6 +311,16 @@ impl WriteRuleService {
     /// through the other enabled rules' edges. `exclude_rule_id` is the row
     /// being updated (its OLD version in the DB is ignored so an in-place edit
     /// is judged against its NEW shape, not both).
+    ///
+    /// `write_source_tag_id` (copy_from_source's value source) is deliberately
+    /// NOT an edge: a rule only *fires* when a condition device changes, so
+    /// only condition→target edges can propagate a trigger. A loop that exists
+    /// solely through the copy-value channel (A copied to B by one rule, B
+    /// copied back to A by another) cannot re-trigger itself - every lap
+    /// around it requires an independent condition edge, which this graph
+    /// already models. Treating copy sources as edges would reject those
+    /// bounded configurations without making anything safer (pinned by
+    /// `copy_from_source_value_channel_alone_is_not_a_feedback_edge` below).
     async fn check_no_write_cycle(
         &self,
         input: &WriteRuleInput,
@@ -1215,5 +1225,205 @@ mod tests {
             .update(created.rule.id, input)
             .await
             .expect("editing an enabled non-cyclic rule stays allowed");
+    }
+
+    #[tokio::test]
+    async fn long_five_rule_chain_cycle_is_rejected() {
+        // X→Y→Z→W→V, then V→X closes a five-hop loop: the DFS must find
+        // cycles of arbitrary length, not just the 2/3-rule shapes.
+        let f = Fixture::new().await;
+        let devices = ["D10", "D20", "D30", "D40", "D50"];
+        let mut tags = Vec::new();
+        let mut targets = Vec::new();
+        for (i, addr) in devices.iter().enumerate() {
+            tags.push(f.tag(&format!("T{i}"), addr).await);
+            targets.push(f.target(&format!("W{i}"), addr).await);
+        }
+        for i in 0..4 {
+            f.rules
+                .create(rule_input(&format!("R{i}"), true, tags[i], targets[i + 1]))
+                .await
+                .unwrap_or_else(|e| panic!("R{i} (link {i}->{}) should be allowed: {e:?}", i + 1));
+        }
+        // R4 reads V (D50) and writes X (D10) -> closes the loop.
+        match f
+            .rules
+            .create(rule_input("R4", true, tags[4], targets[0]))
+            .await
+            .unwrap_err()
+        {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "enabled");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn any_one_of_several_conditions_can_close_a_cycle() {
+        // A multi-condition rule contributes one edge PER condition source;
+        // the cycle check must catch a loop through any of them, not just the
+        // first.
+        let f = Fixture::new().await;
+        let x_tag = f.tag("Xr", "D10").await;
+        let y_tag = f.tag("Yr", "D20").await;
+        let unrelated = f.tag("Ur", "D90").await;
+        let tgt_x = f.target("Xw", "D10").await;
+        let tgt_y = f.target("Yw", "D20").await;
+
+        f.rules
+            .create(rule_input("R1", true, x_tag, tgt_y))
+            .await
+            .expect("R1: X->Y");
+
+        // R2's FIRST condition is harmless; its SECOND reads Y and the target
+        // writes X -> the loop closes through condition #2 only.
+        let mut input = rule_input("R2", true, unrelated, tgt_x);
+        input.conditions.push(WriteRuleConditionInput {
+            source_tag_id: y_tag,
+            operator: "gt".to_string(),
+            threshold_value: 10.0,
+            threshold_value_2: None,
+        });
+        match f.rules.create(input).await.unwrap_err() {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "enabled");
+                assert!(field_errors[0].message.contains("R1"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_that_retargets_an_enabled_rule_into_a_cycle_is_rejected() {
+        // Not just the enabled flag: an in-place edit that REDIRECTS an
+        // enabled rule's target can also close a loop and must be rejected
+        // (the update path re-runs the check against the NEW shape).
+        let f = Fixture::new().await;
+        let x_tag = f.tag("Xr", "D10").await;
+        let y_tag = f.tag("Yr", "D20").await;
+        let tgt_x = f.target("Xw", "D10").await;
+        let tgt_y = f.target("Yw", "D20").await;
+        let tgt_z = f.target("Zw", "D30").await;
+
+        f.rules
+            .create(rule_input("R1", true, x_tag, tgt_y))
+            .await
+            .expect("R1: X->Y");
+        let r2 = f
+            .rules
+            .create(rule_input("R2", true, y_tag, tgt_z))
+            .await
+            .expect("R2: Y->Z, no cycle");
+
+        // Retarget R2 from Z to X: Y->X + existing X->Y closes the loop.
+        match f
+            .rules
+            .update(r2.rule.id, rule_input("R2", true, y_tag, tgt_x))
+            .await
+            .unwrap_err()
+        {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "enabled");
+                assert!(field_errors[0].message.contains("R1"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn same_address_on_a_different_connection_is_a_different_device() {
+        // Device identity is (plc_connection_id, address): "D10" on PLC2 is
+        // NOT the same node as "D10" on PLC1, so writing it closes no loop.
+        let f = Fixture::new().await;
+        let plc2 = PlcConnectionService::new(f.pool.clone())
+            .create(PlcConnectionInput {
+                name: "PLC2".to_string(),
+                protocol: "modbus-tcp".to_string(),
+                host: "10.0.0.2".to_string(),
+                port: 502,
+                unit_id: 1,
+                enabled: true,
+            })
+            .await
+            .unwrap();
+
+        let x_tag = f.tag("Xr", "D10").await; // PLC1 D10
+        let y_tag = f.tag("Yr", "D20").await; // PLC1 D20
+        let tgt_y = f.target("Yw", "D20").await; // PLC1 D20
+        let tgt_x2 = f
+            .targets
+            .create(WriteTargetInput {
+                name: "Xw2".to_string(),
+                plc_connection_id: plc2.id,
+                address: "D10".to_string(), // same address, OTHER connection
+                data_type: "i16".to_string(),
+                raw_lo: None,
+                raw_hi: None,
+                eng_lo: None,
+                eng_hi: None,
+                unit: None,
+                decimals: 0,
+                enabled: true,
+            })
+            .await
+            .unwrap()
+            .id;
+
+        f.rules
+            .create(rule_input("R1", true, x_tag, tgt_y))
+            .await
+            .expect("R1: PLC1:D10 -> PLC1:D20");
+        // R2 reads PLC1:D20 and writes PLC2:D10 - would be the two-rule cycle
+        // if connections were ignored, but PLC2:D10 is a distinct node.
+        f.rules
+            .create(rule_input("R2", true, y_tag, tgt_x2))
+            .await
+            .expect(
+                "R2 must be allowed - same address on another connection is a different device",
+            );
+    }
+
+    #[tokio::test]
+    async fn copy_from_source_value_channel_alone_is_not_a_feedback_edge() {
+        // Pins the deliberate model choice documented on
+        // `check_no_write_cycle`: copy_from_source's value source is not an
+        // edge because it cannot cause a fire. Here values circulate A→B (R1)
+        // and B→A (R2), but each rule triggers only on its own independent
+        // condition device (C / D), so the loop cannot self-sustain and both
+        // saves are allowed.
+        let f = Fixture::new().await;
+        let a_tag = f.tag("Ar", "D10").await;
+        let b_tag = f.tag("Br", "D20").await;
+        let c_tag = f.tag("Cr", "D40").await;
+        let d_tag = f.tag("Dr", "D50").await;
+        let tgt_a = f.target("Aw", "D10").await;
+        let tgt_b = f.target("Bw", "D20").await;
+
+        let copy_rule = |name: &str, cond_tag: i64, from_tag: i64, target: i64| WriteRuleInput {
+            name: name.to_string(),
+            enabled: true,
+            edge_mode: "rising".to_string(),
+            cooldown_ms: None,
+            write_target_id: target,
+            write_value_mode: "copy_from_source".to_string(),
+            write_constant_value: None,
+            write_source_tag_id: Some(from_tag),
+            conditions: vec![WriteRuleConditionInput {
+                source_tag_id: cond_tag,
+                operator: "gt".to_string(),
+                threshold_value: 10.0,
+                threshold_value_2: None,
+            }],
+        };
+
+        f.rules
+            .create(copy_rule("R1", c_tag, a_tag, tgt_b))
+            .await
+            .expect("R1: on C, copy A -> B");
+        f.rules
+            .create(copy_rule("R2", d_tag, b_tag, tgt_a))
+            .await
+            .expect("R2: on D, copy B -> A (copy-only loop is allowed by design)");
     }
 }

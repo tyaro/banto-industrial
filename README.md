@@ -5,7 +5,8 @@
 ドメイン寄りの共通資産（タグレジストリ・PLC通信・時系列収集/読み出し）と
 それを使う製品アプリ（記録計ほか）を蓄積する。
 
-- 計画: [docs/plan.md](docs/plan.md)（I系 = 資産クレート、R系 = 記録計 **ChronoGazer**）
+- 計画: [docs/plan.md](docs/plan.md)（I系 = 資産クレート、R系 = 記録計 **ChronoGazer**、
+  W系 = 自動書き込みアプリ **relay-wright**）
 - ChronoGazer（記録計）要件定義: [docs/recorder-requirements.md](docs/recorder-requirements.md)
 - banto 側のスコープ整理: banto リポジトリの docs/template-scope.md
 
@@ -18,8 +19,10 @@ crates/
   banto-tstore/      I3a: 時系列ストレージ（日次ファイル+スキーマ凍結の自己記述的SQLite）実装済み
   banto-collect/     I3b: 収集エンジン（PLC定期読み出し→banto-tstore書き込み、現在値・イベント供給）実装済み
   banto-tsquery/     I4: 期間クエリ + サーバ側 min/max 間引き（read_range/read_decimated/aggregate/catalog）実装済み
+  banto-plc-write/   I5: PLC書き込み（SLMP一括書き込み。読み取り側と分離した専用trait）実装済み
 apps/
-  chronogazer/       R系: デジタル記録計 ChronoGazer（Tauri + LAN、banto テンプレート由来）予定
+  chronogazer/       R系: デジタル記録計 ChronoGazer（Tauri + LAN、banto テンプレート由来）
+  relay-wright/      W系: 条件付きPLC自動書き込みアプリ（Tauri、W1〜W5 実装済み・実機検証残）安全上の注意は同README参照
 ```
 
 ### `banto-tags`（I1）
@@ -166,6 +169,34 @@ UI と独立に 24/365 自走し（recorder-requirements.md §4）、停止指�
 
 詳細は [crates/banto-tsquery/src/lib.rs](crates/banto-tsquery/src/lib.rs) の
 モジュールドキュメントを参照。
+
+### `banto-plc-write`（I5）
+
+PLC **書き込み**クライアント。`banto-plc`（読み取り）とは**別クレート・
+別 trait**（[`PlcWriteClient`](crates/banto-plc-write/src/client.rs)）に
+分離してあり、読み取り専用の消費者（ChronoGazer、banto-collect）は
+書き込み API を一切リンクしない — 書き込めるのは意図してこの crate を
+依存に加えたアプリ（relay-wright）だけ。SLMP 一括書き込み
+（`slmp/planning.rs` で read 側と対称の要求結合）、`TagValue` → レジスタ/
+ビット列エンコード（read 側 `decode` の逆写像、32bit ワード順対応）、
+read/write 両対応のシミュレータ拡張を持つ。`Address`/`DataType`/
+`SlmpConfig` 等の語彙は `banto-plc` から再利用し、依存は
+banto-plc-write → banto-plc の一方向のみ。
+
+詳細は [crates/banto-plc-write/src/lib.rs](crates/banto-plc-write/src/lib.rs) の
+モジュールドキュメントを参照。
+
+### `apps/relay-wright`（W系）
+
+条件付き PLC 自動書き込みアプリ（Tauri + banto テンプレート由来、
+docs/plan.md §4b）。タグレジストリの読み取り値を条件に、設定ルールに
+従って別の PLC デバイスへ値を自動書き込みする。アーミング（再起動で
+必ず disarmed に戻る）・dry-run・レート制限ブレーカ（トリップで自動
+ディスアーム）・log-before-write・書き込みループのサイクル検出という
+安全機構をエンジン（`apps/relay-wright/core/src/engine/`）に持つ。
+**稼働中の実 PLC へ自動書き込みするアプリ**であるため、導入前に必ず
+[apps/relay-wright/README.md](apps/relay-wright/README.md) の安全上の
+注意を読むこと（下記「ライセンス」節にも要旨あり）。
 
 banto のパッケージ/クレートの消費は **両方とも git タグ参照**
 （2026-07-12 決定。GitHub 組織名 banto が取得不能だったため
