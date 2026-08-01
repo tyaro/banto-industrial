@@ -39,6 +39,7 @@ use relay_wright_core::events::event_channel;
 use relay_wright_core::rest::{api_router, audited_credential_verifier};
 use relay_wright_core::settings::SettingsService;
 use relay_wright_core::users::UsersService;
+use relay_wright_core::write_audit_query::WriteAuditLogService;
 use relay_wright_core::write_rules::WriteRuleService;
 use relay_wright_core::write_targets::WriteTargetService;
 use std::path::PathBuf;
@@ -86,6 +87,7 @@ async fn main() {
     let backup = BackupService::new(db_path_buf, pool.clone());
     let write_targets = WriteTargetService::new(pool.clone());
     let write_rules = WriteRuleService::new(pool.clone());
+    let write_audit_log = WriteAuditLogService::new(pool.clone());
     // Cloned (not moved) so the pool stays available for the W3-B2 engine start
     // below.
     let audit = AuditLogService::new(pool.clone());
@@ -160,6 +162,7 @@ async fn main() {
         backup,
         write_targets,
         write_rules,
+        write_audit_log,
         engine_control,
         auth,
         events,

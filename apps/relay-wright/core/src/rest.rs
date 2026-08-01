@@ -124,6 +124,7 @@ use crate::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 use crate::engine::{EngineControl, EngineStatus, SharedEngineControl};
 use crate::settings::{AuditSettings, SettingsService};
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
+use crate::write_audit_query::{WriteAuditLogRow, WriteAuditLogService};
 use crate::write_rules::{WriteRuleDetail, WriteRuleInput, WriteRuleService};
 use crate::write_targets::{WriteTarget, WriteTargetInput, WriteTargetService};
 
@@ -1433,6 +1434,47 @@ fn write_registry_router(
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
 
+// --- W4: write-audit-log viewer (read-only) ---------------------------------
+
+/// State for `GET /api/write-audit-log` (plan W4): just the read-only
+/// [`WriteAuditLogService`]. No `AuditLogService`/`AuthState` here - reading
+/// this trail is never itself audited (a read is not a mutation, same
+/// convention as `write_*_list`/`audit_log_list`), and the whole router sits
+/// behind `require_auth` so any authenticated role (viewer+) may read.
+#[derive(Clone)]
+struct WriteAuditLogState {
+    write_audit_log: WriteAuditLogService,
+}
+
+/// `GET /api/write-audit-log` (viewer+): the write-audit trail, newest-first
+/// (the service's default sort). Mirrors how `write_rules_list`/
+/// `write_targets_list` are exposed (a viewer+ GET behind the router's
+/// `require_auth`, minus the mutations), but returns the whole
+/// [`ListResult`] - the same wire shape the `write_audit_log_list` Tauri
+/// command returns (invariant §1 両経路対称). Server-side filter/sort/paginate
+/// via `ListParams` is available at the service + Tauri layers; this GET reads
+/// with the default params (all rows, newest-first) and the browser grid does
+/// its own filter/sort/paginate over them, exactly as the W2 registry grids
+/// do over their GET-all lists.
+async fn write_audit_log_list(
+    State(state): State<WriteAuditLogState>,
+) -> Result<Json<ListResult<WriteAuditLogRow>>, ApiError> {
+    Ok(Json(
+        state.write_audit_log.list(ListParams::default()).await?,
+    ))
+}
+
+/// `/api/write-audit-log` (plan W4): viewer+ read-only. Guarded by
+/// `require_auth` for the whole router (any authenticated role may read),
+/// with no editor/admin floor and no mutations at all.
+fn write_audit_log_router(write_audit_log: WriteAuditLogService, auth: AuthState) -> Router {
+    let state = WriteAuditLogState { write_audit_log };
+    Router::new()
+        .route("/api/write-audit-log", get(write_audit_log_list))
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(auth, require_auth))
+}
+
 // --- W3-B2: auto-write engine control ---------------------------------------
 
 /// Resolve the caller's identity and require role >= `min` for an engine
@@ -1642,6 +1684,7 @@ pub fn api_router(
     backup: BackupService,
     write_targets: WriteTargetService,
     write_rules: WriteRuleService,
+    write_audit_log: WriteAuditLogService,
     engine_control: SharedEngineControl,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
@@ -1676,6 +1719,7 @@ pub fn api_router(
             audit.clone(),
             auth.clone(),
         ))
+        .merge(write_audit_log_router(write_audit_log, auth.clone()))
         .merge(engine_router(engine_control, audit.clone(), auth.clone()))
         .merge(backups_router(backup, audit, auth.clone()))
         .merge(ui_settings_router(settings, auth))
@@ -1754,7 +1798,8 @@ mod tests {
         let backup = unused_backup_service(pool.clone());
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
-        let write_rules = WriteRuleService::new(pool);
+        let write_rules = WriteRuleService::new(pool.clone());
+        let write_audit_log = WriteAuditLogService::new(pool);
 
         users
             .setup_first_user("admin", "password123", "管理者")
@@ -1804,6 +1849,7 @@ mod tests {
                 backup,
                 write_targets,
                 write_rules,
+                write_audit_log,
                 no_engine_control(),
                 auth,
                 tx,
@@ -1823,7 +1869,8 @@ mod tests {
         let backup = unused_backup_service(pool.clone());
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
-        let write_rules = WriteRuleService::new(pool);
+        let write_rules = WriteRuleService::new(pool.clone());
+        let write_audit_log = WriteAuditLogService::new(pool);
         let auth = demo_auth();
         let token = auth
             .login("admin", "admin")
@@ -1837,6 +1884,7 @@ mod tests {
                 backup,
                 write_targets,
                 write_rules,
+                write_audit_log,
                 no_engine_control(),
                 auth,
                 tx,
@@ -1891,7 +1939,8 @@ mod tests {
         let backup = unused_backup_service(pool.clone());
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
-        let write_rules = WriteRuleService::new(pool);
+        let write_rules = WriteRuleService::new(pool.clone());
+        let write_audit_log = WriteAuditLogService::new(pool);
         let auth = demo_auth();
         api_router(
             users,
@@ -1900,6 +1949,7 @@ mod tests {
             backup,
             write_targets,
             write_rules,
+            write_audit_log,
             no_engine_control(),
             auth,
             tx,
@@ -2095,7 +2145,8 @@ mod tests {
         let backup = unused_backup_service(pool.clone());
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
-        let write_rules = WriteRuleService::new(pool);
+        let write_rules = WriteRuleService::new(pool.clone());
+        let write_audit_log = WriteAuditLogService::new(pool);
         let auth = AuthState::new(audited_credential_verifier(users.clone(), audit.clone()));
         (
             api_router(
@@ -2105,6 +2156,7 @@ mod tests {
                 backup,
                 write_targets,
                 write_rules,
+                write_audit_log,
                 no_engine_control(),
                 auth,
                 tx,
@@ -2438,7 +2490,8 @@ mod tests {
         let backup = unused_backup_service(pool.clone());
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
-        let write_rules = WriteRuleService::new(pool);
+        let write_rules = WriteRuleService::new(pool.clone());
+        let write_audit_log = WriteAuditLogService::new(pool);
 
         users
             .setup_first_user("admin", "password123", "管理者")
@@ -2474,6 +2527,7 @@ mod tests {
             backup,
             write_targets,
             write_rules,
+            write_audit_log,
             no_engine_control(),
             auth,
             tx,
@@ -2511,7 +2565,8 @@ mod tests {
         let backup = BackupService::new(db_path, pool.clone());
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
-        let write_rules = WriteRuleService::new(pool);
+        let write_rules = WriteRuleService::new(pool.clone());
+        let write_audit_log = WriteAuditLogService::new(pool);
 
         users
             .setup_first_user("admin", "password123", "管理者")
@@ -2547,6 +2602,7 @@ mod tests {
             backup,
             write_targets,
             write_rules,
+            write_audit_log,
             no_engine_control(),
             auth,
             tx,
@@ -3139,6 +3195,7 @@ mod tests {
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
         let write_rules = WriteRuleService::new(pool.clone());
+        let write_audit_log = WriteAuditLogService::new(pool.clone());
 
         let conn = PlcConnectionService::new(pool.clone())
             .create(PlcConnectionInput {
@@ -3182,6 +3239,7 @@ mod tests {
             backup,
             write_targets,
             write_rules,
+            write_audit_log,
             no_engine_control(),
             auth,
             tx,
@@ -3281,6 +3339,7 @@ mod tests {
         let audit = AuditLogService::new(pool.clone());
         let write_targets = WriteTargetService::new(pool.clone());
         let write_rules = WriteRuleService::new(pool.clone());
+        let write_audit_log = WriteAuditLogService::new(pool.clone());
 
         users
             .setup_first_user("admin", "password123", "管理者")
@@ -3331,6 +3390,7 @@ mod tests {
             backup,
             write_targets,
             write_rules,
+            write_audit_log,
             engine_control,
             auth,
             tx,
