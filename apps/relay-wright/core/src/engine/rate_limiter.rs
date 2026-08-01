@@ -161,4 +161,45 @@ mod tests {
             "old writes should have slid out of the window"
         );
     }
+
+    #[test]
+    fn window_boundary_is_inclusive_a_write_exactly_window_old_stops_counting() {
+        // Pins `prune`'s `>= window` comparison: at exactly t0+60s a write
+        // recorded at t0 has left the 60s window (one second earlier it still
+        // counts). A `>` there would silently widen every window by an instant.
+        let mut rl = RateLimiter::new(cfg(100, 1));
+        let t0 = Instant::now();
+        rl.record(1, t0);
+        assert!(
+            rl.would_exceed(1, t0 + Duration::from_secs(59)),
+            "at 59s the write is still inside the window"
+        );
+        assert!(
+            !rl.would_exceed(1, t0 + Duration::from_secs(60)),
+            "at exactly 60s the write has aged out"
+        );
+    }
+
+    #[test]
+    fn partial_slide_frees_exactly_the_aged_out_slots() {
+        // Writes staggered across the window age out one at a time, not as a
+        // block: sliding past the first write alone re-opens exactly one slot.
+        let mut rl = RateLimiter::new(cfg(100, 2));
+        let t0 = Instant::now();
+        rl.record(1, t0);
+        rl.record(1, t0 + Duration::from_secs(30));
+        assert!(
+            rl.would_exceed(1, t0 + Duration::from_secs(59)),
+            "both in window"
+        );
+
+        // At t0+61 only the t0 write has aged out: one slot free.
+        let t1 = t0 + Duration::from_secs(61);
+        assert!(!rl.would_exceed(1, t1), "one slot freed by the slide");
+        rl.record(1, t1);
+        assert!(
+            rl.would_exceed(1, t1),
+            "consuming the freed slot fills the window again (t0+30s write still counts)"
+        );
+    }
 }
