@@ -32,6 +32,12 @@
 //! | POST   | `/api/backups/{fileName}/restore` | -   | 204 (admin)             |
 //! | GET    | `/api/backups/pending-restore` | -      | `PendingRestoreInfo \| null` (admin) |
 //! | DELETE | `/api/backups/pending-restore` | -      | 204 (admin)             |
+//! | GET    | `/api/qr-strings`     | -              | `QrString[]`（svg 込み・表示順, viewer+） |
+//! | POST   | `/api/qr-strings`     | `{label?,text}` | `QrString` (editor+)   |
+//! | PUT    | `/api/qr-strings/reorder` | `{ids}`    | `QrString[]`（新しい表示順, editor+） |
+//! | GET    | `/api/qr-strings/{id}` | -             | `QrString` (viewer+)    |
+//! | PUT    | `/api/qr-strings/{id}` | `{label?,text}` | `QrString` (editor+)  |
+//! | DELETE | `/api/qr-strings/{id}` | -             | 204 (editor+)           |
 //!
 //! `/api/ui-settings/*` (spec M12 SettingsProvider migration): per-user UI
 //! settings (theme/preset/dock layout), namespaced by the caller's own
@@ -126,6 +132,7 @@ use tokio::sync::broadcast;
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 use crate::engine::{EngineControl, EngineStatus, SharedEngineControl};
+use crate::qr_strings::{QrString, QrStringInput, QrStringService};
 use crate::settings::{AuditSettings, SettingsService};
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
 use crate::write_audit_query::{WriteAuditLogRow, WriteAuditLogService};
@@ -1438,6 +1445,185 @@ fn write_registry_router(
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
 
+// --- QR文字列リスト（デバッグ支援, /qr-codes 画面） -------------------------
+
+/// State for the `/api/qr-strings/*` handlers (spec §1 両経路対称): the
+/// service plus `AuthState`/`AuditLogService` so each mutation can
+/// editor-gate ([`require_editor`]) and audit exactly as the Tauri commands
+/// do - the same shape as [`WriteRegistryState`].
+#[derive(Clone)]
+struct QrStringsState {
+    qr_strings: QrStringService,
+    auth: AuthState,
+    audit: AuditLogService,
+}
+
+/// Reorder payload for `PUT /api/qr-strings/reorder` - shared with
+/// `src-tauri`'s `qr_strings_reorder` command so the two paths' wire shape
+/// cannot drift (same reasoning as [`PlcConnectionPayload`]).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QrStringsReorderPayload {
+    pub ids: Vec<i64>,
+}
+
+async fn qr_strings_list(
+    State(state): State<QrStringsState>,
+) -> Result<Json<Vec<QrString>>, ApiError> {
+    Ok(Json(state.qr_strings.list().await?))
+}
+
+async fn qr_strings_get(
+    State(state): State<QrStringsState>,
+    Path(id): Path<i64>,
+) -> Result<Json<QrString>, ApiError> {
+    Ok(Json(state.qr_strings.get(id).await?))
+}
+
+async fn qr_strings_create(
+    State(state): State<QrStringsState>,
+    headers: HeaderMap,
+    Json(input): Json<QrStringInput>,
+) -> Result<Json<QrString>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "qr_strings",
+        "POST",
+        "/api/qr-strings",
+    )
+    .await?;
+    let created = state.qr_strings.create(input).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "create",
+        "qr_strings",
+        &created.id.to_string(),
+        Some(json!({ "label": created.label, "text": created.text })),
+    )
+    .await;
+    Ok(Json(created))
+}
+
+async fn qr_strings_update(
+    State(state): State<QrStringsState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(input): Json<QrStringInput>,
+) -> Result<Json<QrString>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "qr_strings",
+        "PUT",
+        "/api/qr-strings/{id}",
+    )
+    .await?;
+    let updated = state.qr_strings.update(id, input).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "update",
+        "qr_strings",
+        &id.to_string(),
+        Some(json!({ "label": updated.label, "text": updated.text })),
+    )
+    .await;
+    Ok(Json(updated))
+}
+
+async fn qr_strings_delete(
+    State(state): State<QrStringsState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "qr_strings",
+        "DELETE",
+        "/api/qr-strings/{id}",
+    )
+    .await?;
+    state.qr_strings.delete(id).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "delete",
+        "qr_strings",
+        &id.to_string(),
+        None,
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn qr_strings_reorder(
+    State(state): State<QrStringsState>,
+    headers: HeaderMap,
+    Json(payload): Json<QrStringsReorderPayload>,
+) -> Result<Json<Vec<QrString>>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "qr_strings",
+        "PUT",
+        "/api/qr-strings/reorder",
+    )
+    .await?;
+    let reordered = state.qr_strings.reorder(payload.ids.clone()).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "reorder",
+        "qr_strings",
+        "-",
+        Some(json!({ "ids": payload.ids })),
+    )
+    .await;
+    Ok(Json(reordered))
+}
+
+/// `/api/qr-strings/*` (spec §1 両経路対称): viewer-read / editor-write, the
+/// same `require_auth`-router + per-write [`require_editor`] split as
+/// [`write_registry_router`]. `/api/qr-strings/reorder` is registered as its
+/// own static route alongside `/{id}` - axum matches static segments before
+/// captures, so `reorder` never parses as an id.
+fn qr_strings_router(
+    qr_strings: QrStringService,
+    audit: AuditLogService,
+    auth: AuthState,
+) -> Router {
+    let state = QrStringsState {
+        qr_strings,
+        auth: auth.clone(),
+        audit,
+    };
+    Router::new()
+        .route(
+            "/api/qr-strings",
+            get(qr_strings_list).post(qr_strings_create),
+        )
+        .route("/api/qr-strings/reorder", axum::routing::put(qr_strings_reorder))
+        .route(
+            "/api/qr-strings/{id}",
+            get(qr_strings_get)
+                .put(qr_strings_update)
+                .delete(qr_strings_delete),
+        )
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(auth, require_auth))
+}
+
 // --- R1-B: PLC connection / collection group / tag registry CRUD ------------
 
 fn default_payload_enabled() -> bool {
@@ -2176,8 +2362,9 @@ fn engine_router(control: SharedEngineControl, audit: AuditLogService, auth: Aut
 /// editor-write `write-targets`/`write-rules` registry (plan W2), the
 /// viewer-read/editor-write `plc-connections`/`collection-groups`/`tags`
 /// registry (R1-B, [`tag_registry_router`] over banto-tags' own services),
-/// and the per-user `ui-settings` routes (spec M12), all behind the CSRF
-/// header check. Mount
+/// the viewer-read/editor-write `qr-strings` list ([`qr_strings_router`],
+/// QRコード画面), and the per-user `ui-settings` routes (spec M12), all
+/// behind the CSRF header check. Mount
 /// the result *before* `banto_server::static_files::static_router` so
 /// `/api/*` takes priority over the SPA fallback.
 // Each parameter is a distinct, already-cloneable service handle threaded
@@ -2196,6 +2383,7 @@ pub fn api_router(
     plc_connections: PlcConnectionService,
     collection_groups: CollectionGroupService,
     tags: TagService,
+    qr_strings: QrStringService,
     engine_control: SharedEngineControl,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
@@ -2237,6 +2425,7 @@ pub fn api_router(
             audit.clone(),
             auth.clone(),
         ))
+        .merge(qr_strings_router(qr_strings, audit.clone(), auth.clone()))
         .merge(write_audit_log_router(write_audit_log, auth.clone()))
         .merge(engine_router(engine_control, audit.clone(), auth.clone()))
         .merge(backups_router(backup, audit, auth.clone()))
@@ -2320,6 +2509,7 @@ mod tests {
         let plc_connections = PlcConnectionService::new(pool.clone());
         let collection_groups = CollectionGroupService::new(pool.clone());
         let tags = TagService::new(pool.clone());
+        let qr_strings = QrStringService::new(pool.clone());
         let write_audit_log = WriteAuditLogService::new(pool);
 
         users
@@ -2374,6 +2564,7 @@ mod tests {
                 plc_connections,
                 collection_groups,
                 tags,
+                qr_strings,
                 no_engine_control(),
                 auth,
                 tx,
@@ -2397,6 +2588,7 @@ mod tests {
         let plc_connections = PlcConnectionService::new(pool.clone());
         let collection_groups = CollectionGroupService::new(pool.clone());
         let tags = TagService::new(pool.clone());
+        let qr_strings = QrStringService::new(pool.clone());
         let write_audit_log = WriteAuditLogService::new(pool);
         let auth = demo_auth();
         let token = auth
@@ -2415,6 +2607,7 @@ mod tests {
                 plc_connections,
                 collection_groups,
                 tags,
+                qr_strings,
                 no_engine_control(),
                 auth,
                 tx,
@@ -2473,6 +2666,7 @@ mod tests {
         let plc_connections = PlcConnectionService::new(pool.clone());
         let collection_groups = CollectionGroupService::new(pool.clone());
         let tags = TagService::new(pool.clone());
+        let qr_strings = QrStringService::new(pool.clone());
         let write_audit_log = WriteAuditLogService::new(pool);
         let auth = demo_auth();
         api_router(
@@ -2486,6 +2680,7 @@ mod tests {
             plc_connections,
             collection_groups,
             tags,
+            qr_strings,
             no_engine_control(),
             auth,
             tx,
@@ -2685,6 +2880,7 @@ mod tests {
         let plc_connections = PlcConnectionService::new(pool.clone());
         let collection_groups = CollectionGroupService::new(pool.clone());
         let tags = TagService::new(pool.clone());
+        let qr_strings = QrStringService::new(pool.clone());
         let write_audit_log = WriteAuditLogService::new(pool);
         let auth = AuthState::new(audited_credential_verifier(users.clone(), audit.clone()));
         (
@@ -2699,6 +2895,7 @@ mod tests {
                 plc_connections,
                 collection_groups,
                 tags,
+                qr_strings,
                 no_engine_control(),
                 auth,
                 tx,
@@ -3036,6 +3233,7 @@ mod tests {
         let plc_connections = PlcConnectionService::new(pool.clone());
         let collection_groups = CollectionGroupService::new(pool.clone());
         let tags = TagService::new(pool.clone());
+        let qr_strings = QrStringService::new(pool.clone());
         let write_audit_log = WriteAuditLogService::new(pool);
 
         users
@@ -3076,6 +3274,7 @@ mod tests {
             plc_connections,
             collection_groups,
             tags,
+            qr_strings,
             no_engine_control(),
             auth,
             tx,
@@ -3117,6 +3316,7 @@ mod tests {
         let plc_connections = PlcConnectionService::new(pool.clone());
         let collection_groups = CollectionGroupService::new(pool.clone());
         let tags = TagService::new(pool.clone());
+        let qr_strings = QrStringService::new(pool.clone());
         let write_audit_log = WriteAuditLogService::new(pool);
 
         users
@@ -3157,6 +3357,7 @@ mod tests {
             plc_connections,
             collection_groups,
             tags,
+            qr_strings,
             no_engine_control(),
             auth,
             tx,
@@ -3750,6 +3951,7 @@ mod tests {
         let plc_connections = PlcConnectionService::new(pool.clone());
         let collection_groups = CollectionGroupService::new(pool.clone());
         let tags = TagService::new(pool.clone());
+        let qr_strings = QrStringService::new(pool.clone());
         let write_audit_log = WriteAuditLogService::new(pool.clone());
 
         let conn = PlcConnectionService::new(pool.clone())
@@ -3798,6 +4000,7 @@ mod tests {
             plc_connections,
             collection_groups,
             tags,
+            qr_strings,
             no_engine_control(),
             auth,
             tx,
@@ -3879,6 +4082,145 @@ mod tests {
             .any(|r| r.action == "create" && r.resource == "write_targets"));
     }
 
+    // --- QR文字列 dual-path symmetry (REST half) ------------------------------
+
+    /// Router with real editor/viewer tokens and the shared audit service -
+    /// the qr_strings twin of [`write_registry_router_test`] (no PLC seed
+    /// needed: qr_strings references no other table).
+    async fn qr_strings_router_test() -> (Router, AuditLogService, String, String) {
+        let pool = migrate_memory().await.expect("migrate_memory");
+        let (tx, _rx) = broadcast::channel(16);
+        let users = UsersService::new(pool.clone());
+        let settings = SettingsService::new(pool.clone());
+        let backup = unused_backup_service(pool.clone());
+        let audit = AuditLogService::new(pool.clone());
+        let write_targets = WriteTargetService::new(pool.clone());
+        let write_rules = WriteRuleService::new(pool.clone());
+        let plc_connections = PlcConnectionService::new(pool.clone());
+        let collection_groups = CollectionGroupService::new(pool.clone());
+        let tags = TagService::new(pool.clone());
+        let qr_strings = QrStringService::new(pool.clone());
+        let write_audit_log = WriteAuditLogService::new(pool);
+
+        users
+            .setup_first_user("admin", "password123", "管理者")
+            .await
+            .expect("setup_first_user");
+        users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create editor");
+        users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create viewer");
+
+        let auth = AuthState::new(audited_credential_verifier(users.clone(), audit.clone()));
+        let editor_token = auth
+            .login("editor", "password123")
+            .await
+            .expect("editor login");
+        let viewer_token = auth
+            .login("viewer", "password123")
+            .await
+            .expect("viewer login");
+
+        let router = api_router(
+            users,
+            settings,
+            audit.clone(),
+            backup,
+            write_targets,
+            write_rules,
+            write_audit_log,
+            plc_connections,
+            collection_groups,
+            tags,
+            qr_strings,
+            no_engine_control(),
+            auth,
+            tx,
+            false,
+        );
+        (router, audit, editor_token, viewer_token)
+    }
+
+    /// An `editor` can create a QR string over REST (audited, `origin:
+    /// "rest"`), and the list route returns it WITH a server-rendered SVG -
+    /// the REST half of the dual-path create+audit symmetry (the Tauri half
+    /// is asserted in `src-tauri`'s own tests).
+    #[tokio::test]
+    async fn rest_editor_can_create_qr_string_and_it_is_audited() {
+        let (router, audit, editor, _viewer) = qr_strings_router_test().await;
+        let response = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/qr-strings",
+                &editor,
+                json!({ "label": "開始", "text": "START" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = body_json(response).await;
+        assert_eq!(created["label"], "開始");
+        assert_eq!(created["text"], "START");
+        assert!(
+            created["svg"].as_str().unwrap_or("").contains("<svg"),
+            "expected a rendered SVG in the create response, got {created}"
+        );
+
+        // Any authenticated role may read; the list carries the SVG per row.
+        let response = router
+            .oneshot(get_auth("/api/qr-strings", &editor))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let listed = body_json(response).await;
+        assert_eq!(listed[0]["text"], "START");
+        assert!(listed[0]["svg"].as_str().unwrap_or("").contains("<svg"));
+
+        let entries = audit.list(ListParams::default()).await.unwrap();
+        let entry = entries
+            .rows
+            .iter()
+            .find(|r| r.action == "create" && r.resource == "qr_strings")
+            .expect("expected a qr_strings create audit entry");
+        assert_eq!(entry.origin, "rest");
+        assert_eq!(entry.result, "ok");
+        assert_eq!(entry.actor_username.as_deref(), Some("editor"));
+    }
+
+    /// A `viewer` is denied (403) when trying to create a QR string, and the
+    /// denial is recorded (`action: "denied"`, `origin: "rest"`).
+    #[tokio::test]
+    async fn rest_viewer_cannot_create_qr_string_and_denial_is_audited() {
+        let (router, audit, _editor, viewer) = qr_strings_router_test().await;
+        let response = router
+            .oneshot(post_json_auth(
+                "/api/qr-strings",
+                &viewer,
+                json!({ "label": "", "text": "START" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let entries = audit.list(ListParams::default()).await.unwrap();
+        assert!(
+            entries
+                .rows
+                .iter()
+                .any(|r| r.action == "denied" && r.resource == "qr_strings"),
+            "expected a denied entry for qr_strings, got {:?}",
+            entries.rows
+        );
+        assert!(!entries
+            .rows
+            .iter()
+            .any(|r| r.action == "create" && r.resource == "qr_strings"));
+    }
+
     // --- R1-B: tag registry dual-path symmetry (REST half) ------------------
 
     /// Router with a seeded PLC connection + collection group (so a tag can be
@@ -3900,6 +4242,7 @@ mod tests {
         let plc_connections = PlcConnectionService::new(pool.clone());
         let collection_groups = CollectionGroupService::new(pool.clone());
         let tags = TagService::new(pool.clone());
+        let qr_strings = QrStringService::new(pool.clone());
         let write_audit_log = WriteAuditLogService::new(pool.clone());
 
         let conn = plc_connections
@@ -3957,6 +4300,7 @@ mod tests {
             plc_connections,
             collection_groups,
             tags,
+            qr_strings,
             no_engine_control(),
             auth,
             tx,
@@ -4086,6 +4430,7 @@ mod tests {
         let plc_connections = PlcConnectionService::new(pool.clone());
         let collection_groups = CollectionGroupService::new(pool.clone());
         let tags = TagService::new(pool.clone());
+        let qr_strings = QrStringService::new(pool.clone());
         let write_audit_log = WriteAuditLogService::new(pool.clone());
 
         users
@@ -4141,6 +4486,7 @@ mod tests {
             plc_connections,
             collection_groups,
             tags,
+            qr_strings,
             engine_control,
             auth,
             tx,

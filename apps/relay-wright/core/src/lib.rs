@@ -32,6 +32,9 @@ pub use banto_tags::{
     CollectionGroup, CollectionGroupService, PlcConnection, PlcConnectionService, Tag, TagService,
 };
 pub mod events;
+// QR文字列リスト（デバッグ支援）: タッチパネルのQRリーダーに画面から読ませる
+// 文字列の登録・並び替えと、そのQRコードSVGのサーバー側生成（/qr-codes 画面）。
+pub mod qr_strings;
 pub mod rest;
 pub mod settings;
 // Crate-internal validation/error helpers shared by the write_* service

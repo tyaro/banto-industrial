@@ -94,7 +94,7 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), BantoError> {
 
 /// This app's own tables, applied as idempotent DDL - see this module's
 /// doc comment for why. Mirrors `migrations/0001_settings.sql` through
-/// `migrations/0004_audit_log.sql` exactly; update both together.
+/// `migrations/0010_qr_strings.sql` exactly; update both together.
 async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
     // 0001_settings.sql
     sqlx::query("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -308,6 +308,25 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
     .await
     .map_err(banto_storage::storage_error)?;
 
+    // 0010_qr_strings.sql: QR文字列リスト（タッチパネル読み取りデバッグ支援、
+    // /qr-codes 画面）。他テーブルへの参照を持たない独立ユーティリティ。
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS qr_strings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label TEXT NOT NULL DEFAULT '',
+            text TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_qr_strings_sort_order ON qr_strings (sort_order)")
+        .execute(pool)
+        .await
+        .map_err(banto_storage::storage_error)?;
+
     Ok(())
 }
 
@@ -363,6 +382,7 @@ mod tests {
             "write_rule_conditions",
             "write_audit_log",
             "armed_state",
+            "qr_strings",
             "plc_connections",
             "collection_groups",
             "tags",
