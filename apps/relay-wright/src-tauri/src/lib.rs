@@ -3586,4 +3586,117 @@ mod tests {
             entries.rows
         );
     }
+
+    // --- project file export/import dual-path (Tauri half) ------------------
+
+    /// A minimal valid (empty) project file - enough to exercise the import
+    /// authz/arm-guard/audit paths without seeding a config.
+    fn empty_project() -> ProjectFile {
+        ProjectFile {
+            format: "relay-wright-project".to_string(),
+            version: 1,
+            exported_at: None,
+            app_version: None,
+            plc_connections: vec![],
+            collection_groups: vec![],
+            tags: vec![],
+            write_targets: vec![],
+            write_rules: vec![],
+            qr_strings: vec![],
+        }
+    }
+
+    /// Import requires `admin`: an `editor` is denied (`Forbidden`), nothing is
+    /// imported, and the denial is recorded with `resource: "project"` - the
+    /// Tauri twin of the REST `/api/project/import` admin gate.
+    #[tokio::test]
+    async fn project_import_denies_editor_and_audits_it() {
+        let (state, _pool) = app_state_with_pool().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create editor");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+
+        let err = project_import_body(&state, empty_project())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BantoError::Forbidden));
+
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        assert!(
+            entries
+                .rows
+                .iter()
+                .any(|r| r.action == "denied" && r.resource == "project"),
+            "expected a denied project entry, got {:?}",
+            entries.rows
+        );
+        assert!(
+            !entries.rows.iter().any(|r| r.action == "project_import"),
+            "no import should have been recorded"
+        );
+    }
+
+    /// An `admin` can import: it succeeds and records a `project_import` entry
+    /// (`resource: "project"`, `origin: "tauri"`) with the per-table counts.
+    #[tokio::test]
+    async fn project_admin_can_import_and_it_is_audited() {
+        let (state, _pool) = app_state_with_pool().await;
+        let admin = state
+            .users
+            .create_user("admin", "password123", "管理者", Role::Admin)
+            .await
+            .expect("create admin");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(admin);
+
+        let summary = project_import_body(&state, empty_project())
+            .await
+            .expect("admin import should succeed");
+        assert_eq!(summary.plc_connections, 0);
+
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        let entry = entries
+            .rows
+            .iter()
+            .find(|r| r.action == "project_import")
+            .unwrap_or_else(|| panic!("expected a project_import entry, got {:?}", entries.rows));
+        assert_eq!(entry.resource, "project");
+        assert_eq!(entry.origin, "tauri");
+        assert_eq!(entry.actor_username.as_deref(), Some("admin"));
+    }
+
+    /// Import is refused while the engine is ARMED (the safety guard): arm as
+    /// admin, then even an admin import is rejected with the arm message and no
+    /// `project_import` is recorded.
+    #[tokio::test]
+    async fn project_import_refused_while_engine_armed() {
+        let (state, _pool) = app_state_with_engine().await;
+        let admin = state
+            .users
+            .create_user("admin", "password123", "管理者", Role::Admin)
+            .await
+            .expect("create admin");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(admin);
+
+        engine_arm_body(&state).await.expect("admin arm");
+
+        let err = project_import_body(&state, empty_project())
+            .await
+            .unwrap_err();
+        match err {
+            BantoError::Other(message) => assert!(
+                message.contains("アーム"),
+                "expected the arm-guard message, got {message:?}"
+            ),
+            other => panic!("expected Other(arm message), got {other:?}"),
+        }
+
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        assert!(
+            !entries.rows.iter().any(|r| r.action == "project_import"),
+            "a refused import must not be recorded"
+        );
+    }
 }
