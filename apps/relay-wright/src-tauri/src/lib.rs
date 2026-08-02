@@ -3252,6 +3252,7 @@ mod tests {
                 threshold_hh: None,
                 threshold_l: None,
                 threshold_ll: None,
+                string_length: None,
                 enabled: true,
             },
         )
@@ -3302,6 +3303,7 @@ mod tests {
                 threshold_hh: None,
                 threshold_l: None,
                 threshold_ll: None,
+                string_length: None,
                 enabled: true,
             },
         )

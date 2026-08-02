@@ -1735,6 +1735,12 @@ pub struct TagPayload {
     pub threshold_l: Option<f64>,
     #[serde(default)]
     pub threshold_ll: Option<f64>,
+    // S1 (文字列タグ対応): データ型 "string" のときの占有ワード数。数値型では
+    // None 必須（banto-tags 側で検証）。UI からの入力導線は S2 で追加するが、
+    // ワイヤ形状は S1 時点から受け付けておく（REST/Tauri が同じ Payload を
+    // 共有しているので、ここに載せるだけで両経路が対応する）。
+    #[serde(default)]
+    pub string_length: Option<i64>,
     #[serde(default = "default_payload_enabled")]
     pub enabled: bool,
 }
@@ -1756,6 +1762,7 @@ impl From<TagPayload> for TagInput {
             threshold_hh: payload.threshold_hh,
             threshold_l: payload.threshold_l,
             threshold_ll: payload.threshold_ll,
+            string_length: payload.string_length,
             enabled: payload.enabled,
         }
     }
