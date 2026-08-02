@@ -50,8 +50,11 @@ pub struct QrString {
     pub sort_order: i64,
     pub created_at: String,
     /// Inline SVG of `text`'s QR code (see the module doc's §security note).
-    /// Filled after fetch by [`with_svg`]; not a DB column.
+    /// Filled after fetch by [`with_svg`]; not a DB column. `#[serde(default)]`
+    /// so a project file (`crate::project`) that omits the regenerated-anyway
+    /// SVG still deserializes - on import only `label`/`text` are used.
     #[sqlx(default)]
+    #[serde(default)]
     pub svg: String,
 }
 

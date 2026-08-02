@@ -131,7 +131,9 @@ use tokio::sync::broadcast;
 
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::backup::{BackupInfo, BackupService, PendingRestoreInfo};
+use crate::db::DbPool;
 use crate::engine::{EngineControl, EngineStatus, SharedEngineControl};
+use crate::project::{export_project, import_project, ImportSummary, ProjectFile};
 use crate::qr_strings::{QrString, QrStringInput, QrStringService};
 use crate::settings::{AuditSettings, SettingsService};
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
@@ -2363,6 +2365,160 @@ fn engine_router(control: SharedEngineControl, audit: AuditLogService, auth: Aut
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
 
+// --- project file export/import (feature/project-file) ----------------------
+//
+// The dual-path (invariant §1 両経路対称) surface for saving/loading the whole
+// configuration registry as a versioned JSON project file. Export is a read
+// (editor+, since the config contains host/port but NO secrets) and is NOT
+// audited (same "reads are never audited" convention as every list route);
+// import is destructive AND safety-relevant, so it is admin-only, refuses while
+// the engine is ARMED, and is audited (`action: "project_import"`, `resource:
+// "project"`). The heavy lifting (validation, atomic replace) lives in
+// `crate::project`; this layer adds ONLY authorization + the arm guard + audit.
+
+/// Resolve the caller and require role >= `admin` for a project route,
+/// returning the caller's [`Identity`] so the audit entry can attribute the
+/// import. Records a `denied` entry for an authenticated-but-underprivileged
+/// caller (mirrors [`require_editor`]); no session at all returns
+/// `Unauthorized` (not audited, same reasoning as [`require_editor`]).
+async fn require_admin(
+    auth: &AuthState,
+    audit: &AuditLogService,
+    headers: &HeaderMap,
+    resource: &'static str,
+    method: &str,
+    path: &str,
+) -> Result<Identity, BantoError> {
+    match actor_identity(headers, auth) {
+        Some(identity)
+            if Role::from_str(&identity.role)
+                .map(|role| role.at_least(Role::Admin))
+                .unwrap_or(false) =>
+        {
+            Ok(identity)
+        }
+        Some(identity) => {
+            audit
+                .record(AuditEntry {
+                    actor_username: Some(&identity.id),
+                    actor_role: Some(&identity.role),
+                    action: "denied",
+                    resource,
+                    entity_id: None,
+                    detail: Some(json!({ "method": method, "path": path })),
+                    origin: "rest",
+                    result: "denied",
+                })
+                .await;
+            Err(BantoError::Forbidden)
+        }
+        None => Err(BantoError::Unauthorized),
+    }
+}
+
+/// State for `/api/project/*`: the shared pool (`export_project`/
+/// `import_project` build the registry services from it), the SHARED engine
+/// control slot (for the import arm guard - the SAME slot the desktop app and
+/// `/api/engine/*` hold, invariant §1), plus `AuthState`/`AuditLogService` for
+/// the RBAC gate + denial/import audit.
+#[derive(Clone)]
+struct ProjectState {
+    pool: DbPool,
+    control: SharedEngineControl,
+    auth: AuthState,
+    audit: AuditLogService,
+}
+
+/// `GET /api/project/export` (editor+): the whole configuration as a project
+/// file. A read, so not audited.
+async fn project_export_handler(
+    State(state): State<ProjectState>,
+    headers: HeaderMap,
+) -> Result<Json<ProjectFile>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "project",
+        "GET",
+        "/api/project/export",
+    )
+    .await?;
+    Ok(Json(export_project(&state.pool).await?))
+}
+
+/// `POST /api/project/import` (admin): REPLACE the whole configuration with the
+/// posted project file. Refuses while the engine is ARMED (importing changes
+/// what the engine would write), then applies atomically and audits the
+/// per-table counts. The engine must be RELOADED for imported rules to take
+/// effect - the REST layer cannot rebuild the desktop app's `Engine` (it only
+/// shares the control slot), so the caller is told to reload via the engine
+/// screen (see the frontend).
+async fn project_import_handler(
+    State(state): State<ProjectState>,
+    headers: HeaderMap,
+    Json(project): Json<ProjectFile>,
+) -> Result<Json<ImportSummary>, ApiError> {
+    require_admin(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "project",
+        "POST",
+        "/api/project/import",
+    )
+    .await?;
+
+    // Arm guard: refuse while the engine is live. No engine started -> nothing
+    // is armed, so import is allowed.
+    let armed = match state.control.lock().await.clone() {
+        Some(control) => control.status().armed,
+        None => false,
+    };
+    if armed {
+        return Err(ApiError(BantoError::Other(
+            "エンジンがアーム中です。インポート前にディスアームしてください".to_string(),
+        )));
+    }
+
+    let summary = import_project(&state.pool, project).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "project_import",
+        "project",
+        "-",
+        Some(serde_json::to_value(&summary).unwrap_or_else(|_| json!({}))),
+    )
+    .await;
+    Ok(Json(summary))
+}
+
+/// `/api/project/*` (invariant §1 両経路対称, feature/project-file): export
+/// editor+ (read), import admin-only. Same read/write floor split as
+/// [`write_registry_router`] - the whole router is behind `require_auth`, and
+/// each handler applies its own floor inline (so the two share a base path with
+/// different floors).
+fn project_router(
+    pool: DbPool,
+    control: SharedEngineControl,
+    audit: AuditLogService,
+    auth: AuthState,
+) -> Router {
+    let state = ProjectState {
+        pool,
+        control,
+        auth: auth.clone(),
+        audit,
+    };
+    Router::new()
+        .route("/api/project/export", get(project_export_handler))
+        .route("/api/project/import", post(project_import_handler))
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(auth, require_auth))
+}
+
 /// Compose the full `/api/*` router (spec §11.1): auth routes (login/
 /// logout/check/identity from `banto_server` - wrapped with an audit-log
 /// hook for `logout`, spec M14 - plus status/setup/change-password here
@@ -2398,6 +2554,11 @@ pub fn api_router(
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
     allow_setup: bool,
+    // The shared SQLite pool, threaded through for `/api/project/*`
+    // (export/import build the registry services from it, and the import arm
+    // guard reuses `engine_control`). Kept last so the pre-existing call sites
+    // only append one argument.
+    pool: DbPool,
 ) -> Router {
     let audited_auth_routes = auth_routes(auth.clone()).layer(middleware::from_fn_with_state(
         LogoutAuditState {
@@ -2437,7 +2598,17 @@ pub fn api_router(
         ))
         .merge(qr_strings_router(qr_strings, audit.clone(), auth.clone()))
         .merge(write_audit_log_router(write_audit_log, auth.clone()))
-        .merge(engine_router(engine_control, audit.clone(), auth.clone()))
+        .merge(engine_router(
+            engine_control.clone(),
+            audit.clone(),
+            auth.clone(),
+        ))
+        .merge(project_router(
+            pool,
+            engine_control,
+            audit.clone(),
+            auth.clone(),
+        ))
         .merge(backups_router(backup, audit, auth.clone()))
         .merge(ui_settings_router(settings, auth))
         .layer(middleware::from_fn(require_banto_client_header))
@@ -2520,7 +2691,7 @@ mod tests {
         let collection_groups = CollectionGroupService::new(pool.clone());
         let tags = TagService::new(pool.clone());
         let qr_strings = QrStringService::new(pool.clone());
-        let write_audit_log = WriteAuditLogService::new(pool);
+        let write_audit_log = WriteAuditLogService::new(pool.clone());
 
         users
             .setup_first_user("admin", "password123", "管理者")
@@ -2579,6 +2750,7 @@ mod tests {
                 auth,
                 tx,
                 false,
+                pool.clone(),
             ),
             admin_token,
             editor_token,
@@ -2599,7 +2771,7 @@ mod tests {
         let collection_groups = CollectionGroupService::new(pool.clone());
         let tags = TagService::new(pool.clone());
         let qr_strings = QrStringService::new(pool.clone());
-        let write_audit_log = WriteAuditLogService::new(pool);
+        let write_audit_log = WriteAuditLogService::new(pool.clone());
         let auth = demo_auth();
         let token = auth
             .login("admin", "admin")
@@ -2622,6 +2794,7 @@ mod tests {
                 auth,
                 tx,
                 false,
+                pool.clone(),
             ),
             token,
         )
@@ -2677,7 +2850,7 @@ mod tests {
         let collection_groups = CollectionGroupService::new(pool.clone());
         let tags = TagService::new(pool.clone());
         let qr_strings = QrStringService::new(pool.clone());
-        let write_audit_log = WriteAuditLogService::new(pool);
+        let write_audit_log = WriteAuditLogService::new(pool.clone());
         let auth = demo_auth();
         api_router(
             users,
@@ -2695,6 +2868,7 @@ mod tests {
             auth,
             tx,
             allow_setup,
+            pool.clone(),
         )
     }
 
@@ -2891,7 +3065,7 @@ mod tests {
         let collection_groups = CollectionGroupService::new(pool.clone());
         let tags = TagService::new(pool.clone());
         let qr_strings = QrStringService::new(pool.clone());
-        let write_audit_log = WriteAuditLogService::new(pool);
+        let write_audit_log = WriteAuditLogService::new(pool.clone());
         let auth = AuthState::new(audited_credential_verifier(users.clone(), audit.clone()));
         (
             api_router(
@@ -2910,6 +3084,7 @@ mod tests {
                 auth,
                 tx,
                 allow_setup,
+                pool.clone(),
             ),
             audit,
         )
@@ -3244,7 +3419,7 @@ mod tests {
         let collection_groups = CollectionGroupService::new(pool.clone());
         let tags = TagService::new(pool.clone());
         let qr_strings = QrStringService::new(pool.clone());
-        let write_audit_log = WriteAuditLogService::new(pool);
+        let write_audit_log = WriteAuditLogService::new(pool.clone());
 
         users
             .setup_first_user("admin", "password123", "管理者")
@@ -3289,6 +3464,7 @@ mod tests {
             auth,
             tx,
             false,
+            pool.clone(),
         );
         (router, audit, admin_token, editor_token, viewer_token)
     }
@@ -3327,7 +3503,7 @@ mod tests {
         let collection_groups = CollectionGroupService::new(pool.clone());
         let tags = TagService::new(pool.clone());
         let qr_strings = QrStringService::new(pool.clone());
-        let write_audit_log = WriteAuditLogService::new(pool);
+        let write_audit_log = WriteAuditLogService::new(pool.clone());
 
         users
             .setup_first_user("admin", "password123", "管理者")
@@ -3372,6 +3548,7 @@ mod tests {
             auth,
             tx,
             false,
+            pool.clone(),
         );
         (router, dir, admin_token, editor_token, viewer_token)
     }
@@ -4015,6 +4192,7 @@ mod tests {
             auth,
             tx,
             false,
+            pool.clone(),
         );
         (router, audit, conn.id, editor_token, viewer_token)
     }
@@ -4110,7 +4288,7 @@ mod tests {
         let collection_groups = CollectionGroupService::new(pool.clone());
         let tags = TagService::new(pool.clone());
         let qr_strings = QrStringService::new(pool.clone());
-        let write_audit_log = WriteAuditLogService::new(pool);
+        let write_audit_log = WriteAuditLogService::new(pool.clone());
 
         users
             .setup_first_user("admin", "password123", "管理者")
@@ -4151,6 +4329,7 @@ mod tests {
             auth,
             tx,
             false,
+            pool.clone(),
         );
         (router, audit, editor_token, viewer_token)
     }
@@ -4315,6 +4494,7 @@ mod tests {
             auth,
             tx,
             false,
+            pool.clone(),
         );
         (router, audit, group.id, editor_token, viewer_token)
     }
@@ -4501,6 +4681,7 @@ mod tests {
             auth,
             tx,
             false,
+            pool.clone(),
         );
         (router, pool, admin_token, editor_token, viewer_token)
     }
@@ -4611,5 +4792,116 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_json(response).await["armed"], false);
+    }
+
+    // --- project file export/import dual-path (feature/project-file) ---------
+
+    /// A minimal valid (empty) project file body - enough to exercise the
+    /// import authz/arm-guard/audit paths without seeding a config.
+    fn empty_project_body() -> serde_json::Value {
+        json!({
+            "format": "relay-wright-project",
+            "version": 1,
+            "plcConnections": [],
+            "collectionGroups": [],
+            "tags": [],
+            "writeTargets": [],
+            "writeRules": [],
+            "qrStrings": []
+        })
+    }
+
+    /// Export is editor+ (a read of non-secret config): an `editor` gets the
+    /// project JSON (200, right format/version), a `viewer` is denied (403).
+    #[tokio::test]
+    async fn rest_editor_can_export_project_but_viewer_cannot() {
+        let (router, _audit, _admin, editor, viewer) = router_with_role_tokens_and_audit().await;
+
+        let ok = router
+            .clone()
+            .oneshot(get_auth("/api/project/export", &editor))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let body = body_json(ok).await;
+        assert_eq!(body["format"], "relay-wright-project");
+        assert_eq!(body["version"], 1);
+
+        let denied = router
+            .oneshot(get_auth("/api/project/export", &viewer))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Import is admin-only and audited: an `editor` is denied (403, denial
+    /// recorded), an `admin` succeeds (200, `project_import` recorded).
+    #[tokio::test]
+    async fn rest_admin_can_import_project_and_editor_is_denied_and_audited() {
+        let (router, audit, admin, editor, _viewer) = router_with_role_tokens_and_audit().await;
+
+        let denied = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/project/import",
+                &editor,
+                empty_project_body(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let ok = router
+            .oneshot(post_json_auth(
+                "/api/project/import",
+                &admin,
+                empty_project_body(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(body_json(ok).await["plcConnections"], 0);
+
+        let rows = audit.list(ListParams::default()).await.unwrap().rows;
+        assert!(
+            rows.iter()
+                .any(|r| r.action == "project_import" && r.resource == "project"),
+            "expected a project_import entry, got {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.action == "denied" && r.resource == "project"),
+            "expected a denied project entry, got {rows:?}"
+        );
+    }
+
+    /// Import is refused while the engine is ARMED (the safety guard): arm as
+    /// admin, then even an admin import is rejected with the arm message and
+    /// nothing is applied.
+    #[tokio::test]
+    async fn rest_import_is_refused_while_engine_armed() {
+        let (router, _pool, admin, _editor, _viewer) = router_with_role_tokens_and_engine().await;
+
+        let armed = router
+            .clone()
+            .oneshot(post_json_auth("/api/engine/arm", &admin, json!({})))
+            .await
+            .unwrap();
+        assert_eq!(armed.status(), StatusCode::NO_CONTENT);
+
+        let refused = router
+            .oneshot(post_json_auth(
+                "/api/project/import",
+                &admin,
+                empty_project_body(),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(refused.status(), StatusCode::OK);
+        let body = body_json(refused).await;
+        assert!(
+            body["message"].as_str().unwrap_or("").contains("アーム"),
+            "expected the arm-guard message, got {body:?}"
+        );
     }
 }

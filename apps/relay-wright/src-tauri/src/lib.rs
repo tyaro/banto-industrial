@@ -34,6 +34,7 @@ use relay_wright_core::engine::{
     Engine, EngineConfig, EngineControl, EngineStatus, SharedEngineControl,
 };
 use relay_wright_core::events::event_channel;
+use relay_wright_core::project::{export_project, import_project, ImportSummary, ProjectFile};
 use relay_wright_core::qr_strings::{QrString, QrStringInput, QrStringService};
 use relay_wright_core::rest::{
     api_router, audited_credential_verifier, CollectionGroupPayload, PlcConnectionPayload,
@@ -694,6 +695,10 @@ async fn start_embedded_server(
     engine_control: SharedEngineControl,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
+    // The shared pool, forwarded to `api_router` for `/api/project/*`
+    // (export/import). Named via `relay_wright_core`'s `DbPool` alias so this
+    // crate keeps its no-new-dependencies invariant.
+    pool: relay_wright_core::db::DbPool,
     config: ServerConfig,
 ) -> Result<RunningServer, BantoError> {
     // `allow_setup: false` - the Tauri app's first-run setup goes through
@@ -718,6 +723,7 @@ async fn start_embedded_server(
         auth,
         events,
         false,
+        pool,
     )
     .merge(static_router::<FrontendAssets>());
     start(config, router).await
@@ -776,6 +782,7 @@ async fn server_apply(
                 state.engine_control.clone(),
                 state.rest_auth.clone(),
                 state.events.clone(),
+                state.pool.clone(),
                 ServerConfig {
                     bind: config.bind.clone(),
                     port: config.port,
@@ -2206,6 +2213,90 @@ async fn engine_reload(state: State<'_, AppState>) -> Result<EngineStatus, Banto
     engine_reload_body(&state).await
 }
 
+// --- project file export/import (feature/project-file) ----------------------
+//
+// The Tauri half of the dual path (invariant §1 両経路対称): export editor+ (a
+// read of non-secret config), import admin-only + arm-guarded + audited, with
+// the same `resource: "project"` audit as `crate::rest`'s `/api/project/*`
+// routes. After a successful import the engine is RELOADED (best-effort) so the
+// imported rules take effect - rules compile at engine start/reload.
+
+/// `editor`+ (feature/project-file): export the whole configuration registry
+/// (PLC接続/収集グループ/タグ/書き込み先/書き込みルール/QR文字列) as a project
+/// file. A read, so not audited (same convention as the list commands).
+#[tauri::command]
+async fn project_export(state: State<'_, AppState>) -> Result<ProjectFile, BantoError> {
+    require_role(&state, Role::Editor, "project").await?;
+    export_project(&state.pool).await
+}
+
+/// Body of [`project_import`], split out so the arm-guard/audit/reload behavior
+/// is testable with a plain `&AppState` in this crate's own `cargo test`
+/// (mirrors the `*_body` convention the mutating commands use).
+async fn project_import_body(
+    state: &AppState,
+    project: ProjectFile,
+) -> Result<ImportSummary, BantoError> {
+    let actor = require_role(state, Role::Admin, "project").await?;
+
+    // Safety guard (plan): refuse while the engine is ARMED - importing
+    // replaces what the engine would write. No engine started -> nothing armed
+    // -> import is allowed. The control is cloned out from under the lock so
+    // this does not hold the engine lock across the import.
+    let armed = match state.engine_control.lock().await.clone() {
+        Some(control) => control.status().armed,
+        None => false,
+    };
+    if armed {
+        return Err(BantoError::Other(
+            "エンジンがアーム中です。インポート前にディスアームしてください".to_string(),
+        ));
+    }
+
+    let summary = import_project(&state.pool, project).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "project_import",
+            resource: "project",
+            entity_id: Some("-"),
+            detail: Some(serde_json::json!({
+                "plcConnections": summary.plc_connections,
+                "collectionGroups": summary.collection_groups,
+                "tags": summary.tags,
+                "writeTargets": summary.write_targets,
+                "writeRules": summary.write_rules,
+                "writeRuleConditions": summary.write_rule_conditions,
+                "qrStrings": summary.qr_strings,
+            })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+
+    // Rebuild the engine from the just-imported DB so the imported rules go
+    // live (they are compiled at engine start/reload; the rebuilt engine always
+    // starts DISARMED). Best-effort: the import is already committed + audited,
+    // so a reload failure must not turn a successful import into an error - the
+    // frontend also tells the user a reload/restart is needed.
+    let _ = engine_reload_body(state).await;
+
+    Ok(summary)
+}
+
+/// `admin`-only (feature/project-file): REPLACE the whole configuration with
+/// the posted project file. Refuses while the engine is armed, applies
+/// atomically, audits the per-table counts, and reloads the engine.
+#[tauri::command]
+async fn project_import(
+    state: State<'_, AppState>,
+    project: ProjectFile,
+) -> Result<ImportSummary, BantoError> {
+    project_import_body(&state, project).await
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -2493,6 +2584,7 @@ pub fn run() {
                     engine_control.clone(),
                     rest_auth.clone(),
                     events.clone(),
+                    pool.clone(),
                     runtime_config,
                 )) {
                     Ok(server) => Some(server),
@@ -2639,6 +2731,8 @@ pub fn run() {
             engine_set_dry_run,
             engine_status,
             engine_reload,
+            project_export,
+            project_import,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -3490,6 +3584,119 @@ mod tests {
             entries.rows.iter().all(|r| r.resource != "write_audit_log"),
             "a write-audit-log read must not record an audit entry, got {:?}",
             entries.rows
+        );
+    }
+
+    // --- project file export/import dual-path (Tauri half) ------------------
+
+    /// A minimal valid (empty) project file - enough to exercise the import
+    /// authz/arm-guard/audit paths without seeding a config.
+    fn empty_project() -> ProjectFile {
+        ProjectFile {
+            format: "relay-wright-project".to_string(),
+            version: 1,
+            exported_at: None,
+            app_version: None,
+            plc_connections: vec![],
+            collection_groups: vec![],
+            tags: vec![],
+            write_targets: vec![],
+            write_rules: vec![],
+            qr_strings: vec![],
+        }
+    }
+
+    /// Import requires `admin`: an `editor` is denied (`Forbidden`), nothing is
+    /// imported, and the denial is recorded with `resource: "project"` - the
+    /// Tauri twin of the REST `/api/project/import` admin gate.
+    #[tokio::test]
+    async fn project_import_denies_editor_and_audits_it() {
+        let (state, _pool) = app_state_with_pool().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create editor");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+
+        let err = project_import_body(&state, empty_project())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BantoError::Forbidden));
+
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        assert!(
+            entries
+                .rows
+                .iter()
+                .any(|r| r.action == "denied" && r.resource == "project"),
+            "expected a denied project entry, got {:?}",
+            entries.rows
+        );
+        assert!(
+            !entries.rows.iter().any(|r| r.action == "project_import"),
+            "no import should have been recorded"
+        );
+    }
+
+    /// An `admin` can import: it succeeds and records a `project_import` entry
+    /// (`resource: "project"`, `origin: "tauri"`) with the per-table counts.
+    #[tokio::test]
+    async fn project_admin_can_import_and_it_is_audited() {
+        let (state, _pool) = app_state_with_pool().await;
+        let admin = state
+            .users
+            .create_user("admin", "password123", "管理者", Role::Admin)
+            .await
+            .expect("create admin");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(admin);
+
+        let summary = project_import_body(&state, empty_project())
+            .await
+            .expect("admin import should succeed");
+        assert_eq!(summary.plc_connections, 0);
+
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        let entry = entries
+            .rows
+            .iter()
+            .find(|r| r.action == "project_import")
+            .unwrap_or_else(|| panic!("expected a project_import entry, got {:?}", entries.rows));
+        assert_eq!(entry.resource, "project");
+        assert_eq!(entry.origin, "tauri");
+        assert_eq!(entry.actor_username.as_deref(), Some("admin"));
+    }
+
+    /// Import is refused while the engine is ARMED (the safety guard): arm as
+    /// admin, then even an admin import is rejected with the arm message and no
+    /// `project_import` is recorded.
+    #[tokio::test]
+    async fn project_import_refused_while_engine_armed() {
+        let (state, _pool) = app_state_with_engine().await;
+        let admin = state
+            .users
+            .create_user("admin", "password123", "管理者", Role::Admin)
+            .await
+            .expect("create admin");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(admin);
+
+        engine_arm_body(&state).await.expect("admin arm");
+
+        let err = project_import_body(&state, empty_project())
+            .await
+            .unwrap_err();
+        match err {
+            BantoError::Other(message) => assert!(
+                message.contains("アーム"),
+                "expected the arm-guard message, got {message:?}"
+            ),
+            other => panic!("expected Other(arm message), got {other:?}"),
+        }
+
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        assert!(
+            !entries.rows.iter().any(|r| r.action == "project_import"),
+            "a refused import must not be recorded"
         );
     }
 }

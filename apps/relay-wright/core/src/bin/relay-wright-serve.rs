@@ -157,7 +157,7 @@ async fn main() {
     // `Engine` is kept alive for the process lifetime and shut down at Ctrl-C
     // below; its control slot is handed to the router.
     let (engine, engine_control): (Option<Engine>, SharedEngineControl) =
-        match Engine::start_from_db(pool, EngineConfig::default()).await {
+        match Engine::start_from_db(pool.clone(), EngineConfig::default()).await {
             Ok((engine, control)) => (Some(engine), Arc::new(Mutex::new(Some(control)))),
             Err(err) => {
                 eprintln!("relay-wright-serve: 自動書き込みエンジンの起動に失敗しました: {err}");
@@ -181,6 +181,7 @@ async fn main() {
         auth,
         events,
         allow_setup,
+        pool,
     )
     .merge(static_router::<FrontendAssets>());
 

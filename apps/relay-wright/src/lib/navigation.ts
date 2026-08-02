@@ -31,6 +31,12 @@
  * パネル（HMI）のQRリーダーでスキャンするための文字列リスト+表示画面。
  * PLC/レジストリ系とは独立なので、ログ系の下（管理者専用画面の手前）に
  * 置く。viewer は表示（スキャン）可能なので not `adminOnly`.
+ *
+ * project (プロジェクト, feature/project-file) は設定レジストリ全体を1つの
+ * JSONプロジェクトファイルとして保存・読み込みする画面。エクスポートは
+ * editor+、インポートは admin（画面側で権限に応じて操作を出し分け、backend も
+ * 二経路対称に強制）なので、editor もエクスポート導線を見られるよう
+ * `adminOnly` にはせず、管理者系の手前に置く。
  */
 import { APP_NAME } from '$lib/appName';
 
@@ -52,6 +58,7 @@ export const navItems: NavItem[] = [
 	{ path: '/write-rules', label: '書き込みルール', icon: '🧮' },
 	{ path: '/write-audit-log', label: '書き込み監査ログ', icon: '📝' },
 	{ path: '/qr-codes', label: 'QRコード', icon: '🔳' },
+	{ path: '/project', label: 'プロジェクト', icon: '💾' },
 	{ path: '/users', label: 'ユーザー管理', icon: '👤', adminOnly: true },
 	{ path: '/audit-log', label: '監査ログ', icon: '🧾', adminOnly: true }
 ];

@@ -504,6 +504,15 @@ async function main() {
 		await page.locator('.qr-svg svg').first().waitFor();
 		await shot('qr-codes.png', { fullPage: true });
 
+		// プロジェクト（設定の保存・読み込み, feature/project-file）。エクスポート
+		// 導線と、管理者に見えるインポート節（ファイル選択・置換警告）。
+		await page.goto(`${BASE_URL}/project`);
+		// Header と本文の両方が h1「プロジェクト」を描画するため main に絞る
+		// （他画面の audit-log と同じ理由）。
+		await page.getByRole('main').getByRole('heading', { name: 'プロジェクト' }).waitFor();
+		await page.getByRole('button', { name: 'エクスポート' }).waitFor();
+		await shot('project.png', { fullPage: true });
+
 		// 操作監査ログ（M14）。Header の h1 も同じ「監査ログ」を描画するので
 		// level: 2 でページ本体の h2 に絞る（chronogazer smoke.spec.ts と同じ理由）。
 		await page.goto(`${BASE_URL}/audit-log`);
