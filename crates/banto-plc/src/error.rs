@@ -75,6 +75,15 @@ pub enum PlcError {
     #[error("データ型 {data_type} はアドレス領域 {area} と組み合わせられません")]
     UnsupportedCombination { area: String, data_type: String },
 
+    /// A [`crate::types::StringReadRequest`]'s word span cannot be served:
+    /// zero words, or more words than one SLMP bulk read carries (the
+    /// registry caps `string_length` at 128, well under the wire cap, so
+    /// reaching this means a caller bypassed `banto-tags` validation).
+    /// Resolved by the planner before any wire traffic - a per-request
+    /// `Bad`, never a whole-call `Err` and never a panic.
+    #[error("文字列長 {words} 語は扱えません（1〜{max} 語）")]
+    StringSpanUnsupported { words: u16, max: u16 },
+
     /// The response frame does not parse as valid Modbus: unexpected
     /// protocol id, transaction id mismatch, truncated/oversized payload,
     /// unexpected function code. Always connection-level (a malformed frame
@@ -140,6 +149,7 @@ impl PlcError {
                 | PlcError::SlmpEndCode { .. }
                 | PlcError::UnsupportedCombination { .. }
                 | PlcError::AddressProtocolMismatch { .. }
+                | PlcError::StringSpanUnsupported { .. }
         )
     }
 }
@@ -171,6 +181,10 @@ mod tests {
             PlcError::AddressProtocolMismatch {
                 expected: "modbus-tcp".to_string(),
                 actual: "slmp".to_string(),
+            },
+            PlcError::StringSpanUnsupported {
+                words: 481,
+                max: 480,
             },
         ];
         for err in per_request {

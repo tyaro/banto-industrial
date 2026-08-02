@@ -34,7 +34,7 @@ use std::collections::BTreeMap;
 
 use crate::address::AddressArea;
 use crate::error::PlcError;
-use crate::types::{DataType, ReadRequest};
+use crate::types::{BatchReadRequest, DataType, ReadRequest};
 
 /// Gap tolerance, in the area's own element unit (registers for
 /// input/holding-register areas, bits for coil/discrete-input areas): two
@@ -219,6 +219,50 @@ pub fn plan_requests(requests: &[ReadRequest]) -> PlanOutcome {
         reads,
         immediate_bad,
     }
+}
+
+/// The mixed-batch front door for the Modbus planner (S1 文字列タグ). String
+/// support on Modbus is **out of scope for S1** - MELSEC string devices are an
+/// SLMP concept, and no Modbus device profile has asked for one - so every
+/// [`BatchReadRequest::String`] resolves to a per-request
+/// [`PlcError::UnsupportedCombination`] `Bad` (mirroring how a bit tag at a
+/// register address is handled: before any wire traffic, without taking its
+/// numeric batch-mates down). Numeric entries are planned by
+/// [`plan_requests`] unchanged, with their outcome indices mapped back to the
+/// mixed batch's positions.
+pub fn plan_batch_requests(requests: &[BatchReadRequest]) -> PlanOutcome {
+    let mut immediate_bad = Vec::new();
+    let mut numeric = Vec::with_capacity(requests.len());
+    let mut numeric_to_original = Vec::with_capacity(requests.len());
+
+    for (index, req) in requests.iter().enumerate() {
+        match req {
+            BatchReadRequest::Numeric(r) => {
+                numeric.push(*r);
+                numeric_to_original.push(index);
+            }
+            BatchReadRequest::String(_) => immediate_bad.push((
+                index,
+                PlcError::UnsupportedCombination {
+                    area: "modbus-tcp".to_string(),
+                    data_type: "string".to_string(),
+                },
+            )),
+        }
+    }
+
+    let mut outcome = plan_requests(&numeric);
+    for read in &mut outcome.reads {
+        for m in &mut read.mapping {
+            m.request_index = numeric_to_original[m.request_index];
+        }
+    }
+    for (index, _) in &mut outcome.immediate_bad {
+        *index = numeric_to_original[*index];
+    }
+    outcome.immediate_bad.extend(immediate_bad);
+
+    outcome
 }
 
 #[cfg(test)]
@@ -465,6 +509,49 @@ mod tests {
                 assert_eq!(actual, "slmp");
             }
             other => panic!("expected AddressProtocolMismatch, got {other:?}"),
+        }
+
+        assert_eq!(outcome.reads.len(), 1);
+        assert_eq!(outcome.reads[0].mapping[0].request_index, 1);
+    }
+
+    /// S1: string is not supported on Modbus - a string entry in a mixed
+    /// batch is a per-request `Bad` with the same unsupported-combination
+    /// shape as a bit-at-register mismatch, and its numeric batch-mates are
+    /// still planned with their original indices.
+    #[test]
+    fn a_string_request_is_immediately_bad_on_modbus_without_blocking_batch_mates() {
+        use crate::types::{BatchReadRequest, StringReadRequest};
+
+        let requests = [
+            BatchReadRequest::String(StringReadRequest {
+                address: Address::ModbusRef {
+                    area: AddressArea::HoldingRegister,
+                    offset: 0,
+                },
+                words: 4,
+            }),
+            BatchReadRequest::Numeric(req(AddressArea::HoldingRegister, 10, DataType::I16)),
+            BatchReadRequest::Numeric(req(AddressArea::HoldingRegister, 0, DataType::Bit)), // bad
+        ];
+        let outcome = plan_batch_requests(&requests);
+
+        let mut bad_indices: Vec<usize> =
+            outcome.immediate_bad.iter().map(|(i, _)| *i).collect();
+        bad_indices.sort();
+        assert_eq!(bad_indices, vec![0, 2]);
+        let string_bad = outcome
+            .immediate_bad
+            .iter()
+            .find(|(i, _)| *i == 0)
+            .map(|(_, e)| e)
+            .unwrap();
+        match string_bad {
+            PlcError::UnsupportedCombination { area, data_type } => {
+                assert_eq!(area, "modbus-tcp");
+                assert_eq!(data_type, "string");
+            }
+            other => panic!("expected UnsupportedCombination, got {other:?}"),
         }
 
         assert_eq!(outcome.reads.len(), 1);

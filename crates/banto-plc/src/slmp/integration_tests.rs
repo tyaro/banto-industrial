@@ -614,3 +614,170 @@ async fn performance_smoke_256_tags_x_1000_read_batch_calls() {
          (100ms/cycle target, recorder-requirements.md §3.1)"
     );
 }
+
+// --- string reads (S1 文字列タグ) -------------------------------------------
+
+/// ASCII, multi-byte SJIS, and a full-to-the-brim span, seeded via the
+/// simulator's `set_string` and read back through the real wire path in one
+/// mixed batch alongside numeric and bit tags - proving one `read_batch_mixed`
+/// call serves all three kinds in a single planning pass.
+#[tokio::test]
+async fn read_batch_mixed_reads_strings_and_numerics_in_one_call() {
+    use crate::types::{BatchReadRequest, BatchReadResult, PlcValue, StringReadRequest};
+
+    let sim = Simulator::start().await;
+    sim.set_string(SlmpDevice::D, 0, 4, "ABC"); // padded with NULs
+    sim.set_string(SlmpDevice::D, 100, 4, "テスト"); // 6 SJIS bytes in 8
+    sim.set_string(SlmpDevice::D, 200, 2, "ABCD"); // exactly 2L bytes, no NUL
+    sim.set_word(SlmpDevice::D, 4, 42);
+    sim.set_bit(SlmpDevice::M, 0, true);
+
+    let mut client = SlmpClient::new(fast_config(&sim));
+    client.connect().await.expect("connect");
+
+    let sreq = |raw: &str, words: u16| {
+        BatchReadRequest::String(StringReadRequest {
+            address: Address::parse_slmp(raw).unwrap(),
+            words,
+        })
+    };
+    let requests = [
+        sreq("D0", 4),
+        BatchReadRequest::Numeric(req("D4", DataType::U16)), // adjacent: same group as D0..D3
+        sreq("D100", 4),
+        sreq("D200", 2),
+        BatchReadRequest::Numeric(req("M0", DataType::Bit)),
+    ];
+    let results = client
+        .read_batch_mixed(&requests)
+        .await
+        .expect("read_batch_mixed ok");
+
+    assert_eq!(results.len(), requests.len());
+    assert_eq!(
+        results[0],
+        BatchReadResult::Value(PlcValue::Str("ABC".to_string())),
+        "trailing NUL padding must be trimmed"
+    );
+    assert_eq!(results[1], BatchReadResult::Value(PlcValue::F64(42.0)));
+    assert_eq!(
+        results[2],
+        BatchReadResult::Value(PlcValue::Str("テスト".to_string()))
+    );
+    assert_eq!(
+        results[3],
+        BatchReadResult::Value(PlcValue::Str("ABCD".to_string())),
+        "a full span with no terminator is the whole 2L bytes"
+    );
+    assert_eq!(results[4], BatchReadResult::Value(PlcValue::Bit(true)));
+}
+
+/// An embedded NUL cuts the string there, even mid-span.
+#[tokio::test]
+async fn read_batch_mixed_trims_at_an_embedded_nul() {
+    use crate::types::{BatchReadRequest, BatchReadResult, PlcValue, StringReadRequest};
+
+    let sim = Simulator::start().await;
+    // Bytes [0x41, 0x42, 0x00, 0x43] = "AB", NUL, "C" - seeded as raw words
+    // (set_string cannot express an embedded NUL, which is the point).
+    sim.set_words(SlmpDevice::D, 0, &[0x4241, 0x4300]);
+
+    let mut client = SlmpClient::new(fast_config(&sim));
+    client.connect().await.unwrap();
+
+    let results = client
+        .read_batch_mixed(&[BatchReadRequest::String(StringReadRequest {
+            address: Address::parse_slmp("D0").unwrap(),
+            words: 2,
+        })])
+        .await
+        .unwrap();
+    assert_eq!(
+        results[0],
+        BatchReadResult::Value(PlcValue::Str("AB".to_string()))
+    );
+}
+
+/// Two wide strings whose combined span exceeds the single-read word cap are
+/// split into two wire reads by the planner and both still decode correctly -
+/// the string case of "a read spanning the batching boundary", proven over the
+/// real wire path rather than only at plan level.
+#[tokio::test]
+async fn string_reads_spanning_the_batching_boundary_split_and_still_decode() {
+    use crate::types::{BatchReadRequest, BatchReadResult, PlcValue, StringReadRequest};
+
+    let sim = Simulator::start().await;
+    // 300 + 300 words > 480 (the single-bulk-read cap), so the planner must
+    // split. Each string's text sits at the start of its span, NUL-padded.
+    sim.set_string(SlmpDevice::D, 0, 300, "FIRST");
+    sim.set_string(SlmpDevice::D, 300, 300, "SECOND");
+
+    let mut client = SlmpClient::new(fast_config(&sim));
+    client.connect().await.unwrap();
+
+    let sreq = |raw: &str, words: u16| {
+        BatchReadRequest::String(StringReadRequest {
+            address: Address::parse_slmp(raw).unwrap(),
+            words,
+        })
+    };
+    let results = client
+        .read_batch_mixed(&[sreq("D0", 300), sreq("D300", 300)])
+        .await
+        .unwrap();
+    assert_eq!(
+        results[0],
+        BatchReadResult::Value(PlcValue::Str("FIRST".to_string()))
+    );
+    assert_eq!(
+        results[1],
+        BatchReadResult::Value(PlcValue::Str("SECOND".to_string()))
+    );
+}
+
+/// A string span the wire cannot serve is a per-request Bad through the full
+/// client path too - its batch-mates still read.
+#[tokio::test]
+async fn an_over_cap_string_is_bad_through_the_client_without_blocking_batch_mates() {
+    use crate::types::{BatchReadRequest, BatchReadResult, PlcValue, StringReadRequest};
+
+    let sim = Simulator::start().await;
+    sim.set_word(SlmpDevice::D, 0, 7);
+
+    let mut client = SlmpClient::new(fast_config(&sim));
+    client.connect().await.unwrap();
+
+    let results = client
+        .read_batch_mixed(&[
+            BatchReadRequest::String(StringReadRequest {
+                address: Address::parse_slmp("D1000").unwrap(),
+                words: 481,
+            }),
+            BatchReadRequest::Numeric(req("D0", DataType::U16)),
+        ])
+        .await
+        .unwrap();
+    assert!(matches!(
+        results[0],
+        BatchReadResult::Bad(PlcError::StringSpanUnsupported { words: 481, .. })
+    ));
+    assert_eq!(results[1], BatchReadResult::Value(PlcValue::F64(7.0)));
+}
+
+#[tokio::test]
+async fn read_batch_mixed_before_connect_is_not_connected() {
+    use crate::types::{BatchReadRequest, StringReadRequest};
+
+    let mut client = SlmpClient::new(SlmpConfig {
+        host: "127.0.0.1".to_string(),
+        ..Default::default()
+    });
+    let requests = [BatchReadRequest::String(StringReadRequest {
+        address: Address::parse_slmp("D0").unwrap(),
+        words: 4,
+    })];
+    assert!(matches!(
+        client.read_batch_mixed(&requests).await,
+        Err(PlcError::NotConnected)
+    ));
+}
