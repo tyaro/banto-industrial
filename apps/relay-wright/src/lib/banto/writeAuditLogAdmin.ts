@@ -41,7 +41,10 @@ export interface WriteAuditLogRow {
 	writeTargetId: number | null;
 	targetValueWritten: number | null;
 	actorUsername: string | null;
-	/** One of `rule_fire`/`arm`/`disarm`/`dry_run_toggle`/`rate_limit_tripped`. */
+	/**
+	 * One of `rule_fire`/`arm`/`disarm`/`dry_run_toggle`/`rate_limit_tripped`/
+	 * `manual_write`（タグモニタのワンショット手動書き込み, feature/tag-monitor）.
+	 */
 	action: string;
 	/**
 	 * One of `ok`/`failed`/`suppressed_disarmed`/`suppressed_rate_limited`/

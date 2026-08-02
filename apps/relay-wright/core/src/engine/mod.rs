@@ -44,6 +44,9 @@
 pub mod arming;
 pub mod broker;
 pub mod current_values;
+// タグモニタ (feature/tag-monitor): the monitor read/manual-write surface on
+// `EngineControl`, reusing the broker's one-session-per-CPU tasks.
+pub mod monitor;
 pub mod poller;
 pub mod rate_limiter;
 pub mod rule_engine;
@@ -59,7 +62,10 @@ use sqlx::SqlitePool;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-pub use broker::{BackoffConfig, BrokerError, BrokerHandle, BrokerSupervisor, ReadOnlyHandle};
+pub use broker::{
+    BackoffConfig, BrokerError, BrokerHandle, BrokerSupervisor, ReadOnlyHandle, SessionDirectory,
+};
+pub use monitor::MonitorValue;
 
 use arming::ArmingState;
 use current_values::CurrentValues;
@@ -119,6 +125,14 @@ pub struct EngineStatus {
 pub struct EngineControl {
     pool: SqlitePool,
     arming: std::sync::Arc<ArmingState>,
+    /// The broker's shared session directory (feature/tag-monitor): the
+    /// タグモニタ read/manual-write surface (`engine::monitor`, implemented
+    /// as further methods on this type) reaches the engine's
+    /// one-session-per-CPU broker tasks through this - never a second SLMP
+    /// client (the real R08ENCPU accepts only one session). Carried here so
+    /// both wiring paths (Tauri commands + REST routes) get it for free via
+    /// the existing [`SharedEngineControl`] slot.
+    sessions: broker::SessionDirectory,
 }
 
 impl EngineControl {
@@ -268,7 +282,11 @@ impl Engine {
             shutdown_rx,
         ));
 
-        let control = EngineControl { pool, arming };
+        let control = EngineControl {
+            pool,
+            arming,
+            sessions: broker.directory(),
+        };
         let engine = Engine {
             broker,
             shutdown_tx,

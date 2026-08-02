@@ -311,18 +311,126 @@ pub(crate) fn spawn_test_handle_answering_ok(connection_id: i64) -> (BrokerHandl
     (BrokerHandle { connection_id, tx }, task)
 }
 
+/// A shared, growable directory of live broker sessions - the seam the
+/// タグモニタ (tag monitor, feature/tag-monitor) uses to reach the SAME
+/// one-session-per-CPU broker tasks the engine itself reads/writes through.
+///
+/// ## Why this exists (hard constraint: one SLMP session per CPU)
+///
+/// The real R08ENCPU accepts only ONE concurrent SLMP TCP connection (verified
+/// on hardware: a second connect times out), so the monitor must never open
+/// its own `SlmpClient` - every monitor read AND manual write goes through the
+/// broker task that already owns that CPU's single session.
+///
+/// ## On-demand sessions
+///
+/// [`BrokerSupervisor::spawn`] seeds this directory with one task per
+/// connection the ENGINE manages (every enabled SLMP connection at engine
+/// start). The monitor, however, may legitimately ask for a connection the
+/// engine has no task for - one created/enabled AFTER the engine started, or
+/// one on an engine built with an explicit connection subset.
+/// [`SessionDirectory::ensure_connection`] spawns a broker task for such a
+/// connection ON FIRST USE and keeps it (an idle task is one parked socket +
+/// a reconnect loop - cheap), so subsequent monitor polls reuse the session
+/// exactly like the engine's own poller does.
+///
+/// ## Lifecycle
+///
+/// All spawned tasks - seeded and on-demand alike - share the supervisor's
+/// one shutdown `watch`, so [`BrokerSupervisor::shutdown`] stops every task
+/// this directory ever created (the tasks vector is shared; shutdown drains
+/// and awaits it). Clones of this directory held past shutdown (e.g. by an
+/// `EngineControl` a caller kept) simply get [`BrokerError::TaskGone`] /
+/// closed-channel errors - never a new session on a dead engine's watch,
+/// because `ensure_connection` on a shut-down directory spawns a task whose
+/// `shutdown_rx` already reads `true`, which exits immediately.
+#[derive(Clone)]
+pub struct SessionDirectory {
+    handles: std::sync::Arc<std::sync::Mutex<HashMap<i64, BrokerHandle>>>,
+    tasks: std::sync::Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
+    backoff: BackoffConfig,
+    /// Shared (via `Arc`) with [`BrokerSupervisor`] so on-demand tasks
+    /// subscribe to the SAME shutdown trigger as the seeded ones.
+    shutdown_tx: std::sync::Arc<watch::Sender<bool>>,
+}
+
+impl SessionDirectory {
+    fn new(backoff: BackoffConfig, shutdown_tx: std::sync::Arc<watch::Sender<bool>>) -> Self {
+        Self {
+            handles: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            tasks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            backoff,
+            shutdown_tx,
+        }
+    }
+
+    /// The handle for one connection, if a task is already running for it.
+    pub fn handle(&self, connection_id: i64) -> Option<BrokerHandle> {
+        self.handles
+            .lock()
+            .expect("session directory poisoned")
+            .get(&connection_id)
+            .cloned()
+    }
+
+    /// The handle for `conn`, spawning its broker task first if none is
+    /// running yet (see the struct doc's on-demand policy). Rejects non-SLMP
+    /// connections with [`BrokerError::UnsupportedProtocol`] - this broker
+    /// (and therefore the monitor) is SLMP-only.
+    pub fn ensure_connection(&self, conn: &PlcConnection) -> Result<BrokerHandle, BrokerError> {
+        if conn.protocol != SLMP_PROTOCOL {
+            return Err(BrokerError::UnsupportedProtocol {
+                connection_id: conn.id,
+                protocol: conn.protocol.clone(),
+            });
+        }
+        let port = u16::try_from(conn.port).map_err(|_| BrokerError::InvalidPort {
+            connection_id: conn.id,
+            port: conn.port,
+        })?;
+
+        let mut handles = self.handles.lock().expect("session directory poisoned");
+        if let Some(handle) = handles.get(&conn.id) {
+            return Ok(handle.clone());
+        }
+
+        let config = SlmpConfig {
+            host: conn.host.clone(),
+            port,
+            ..SlmpConfig::default()
+        };
+        let (handle, task) =
+            spawn_task(conn.id, config, self.backoff, self.shutdown_tx.subscribe());
+        handles.insert(conn.id, handle.clone());
+        self.tasks
+            .lock()
+            .expect("session directory poisoned")
+            .push(task);
+        Ok(handle)
+    }
+
+    /// How many broker tasks have been spawned (seeded + on-demand). Mainly a
+    /// test/diagnostic helper.
+    pub fn connection_count(&self) -> usize {
+        self.tasks.lock().expect("session directory poisoned").len()
+    }
+}
+
 /// Spawns and owns one broker task per SLMP [`PlcConnection`], and hands out
-/// [`BrokerHandle`]s keyed by connection id.
+/// [`BrokerHandle`]s keyed by connection id. The handle/task bookkeeping
+/// lives in a [`SessionDirectory`] (shared, so the tag monitor can add
+/// on-demand sessions that this supervisor still shuts down - see that
+/// struct's doc).
 pub struct BrokerSupervisor {
-    handles: HashMap<i64, BrokerHandle>,
-    tasks: Vec<JoinHandle<()>>,
+    directory: SessionDirectory,
     /// Out-of-band shutdown trigger shared with every task via a cloned
     /// [`watch::Receiver`] - see [`Self::shutdown`]. Independent of the job
     /// mpsc: a task must stop even while a [`BrokerHandle`] (and therefore a
     /// live `Sender`) is still held by some caller (a poller/writer that
     /// outlives the supervisor by design in W3-B), which the mpsc-closes path
-    /// alone can never signal.
-    shutdown_tx: watch::Sender<bool>,
+    /// alone can never signal. `Arc`-shared with the directory so on-demand
+    /// tasks subscribe to the same trigger.
+    shutdown_tx: std::sync::Arc<watch::Sender<bool>>,
 }
 
 impl BrokerSupervisor {
@@ -332,55 +440,44 @@ impl BrokerSupervisor {
     /// variant's doc for why a reject-the-batch policy beats silently
     /// skipping). Tasks already spawned for earlier connections in the slice
     /// are simply dropped in that case: nothing has been handed out yet
-    /// (`Self` is only returned on full success), so their mpsc receivers
-    /// drop with them and they exit immediately - no explicit cleanup needed.
+    /// (`Self` is only returned on full success), so the directory's Arcs -
+    /// including the shutdown `Sender` - drop with it, every task's
+    /// `shutdown_rx.changed()` resolves `Err`, and they exit immediately -
+    /// no explicit cleanup needed.
     pub fn spawn(
         connections: &[PlcConnection],
         backoff: BackoffConfig,
     ) -> Result<Self, BrokerError> {
-        let mut handles = HashMap::with_capacity(connections.len());
-        let mut tasks = Vec::with_capacity(connections.len());
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        let shutdown_tx = std::sync::Arc::new(shutdown_tx);
+        let directory = SessionDirectory::new(backoff, shutdown_tx.clone());
 
         for conn in connections {
-            if conn.protocol != SLMP_PROTOCOL {
-                return Err(BrokerError::UnsupportedProtocol {
-                    connection_id: conn.id,
-                    protocol: conn.protocol.clone(),
-                });
-            }
-            let port = u16::try_from(conn.port).map_err(|_| BrokerError::InvalidPort {
-                connection_id: conn.id,
-                port: conn.port,
-            })?;
-            let config = SlmpConfig {
-                host: conn.host.clone(),
-                port,
-                ..SlmpConfig::default()
-            };
-
-            let (handle, task) = spawn_task(conn.id, config, backoff, shutdown_rx.clone());
-            tasks.push(task);
-            handles.insert(conn.id, handle);
+            directory.ensure_connection(conn)?;
         }
 
         Ok(Self {
-            handles,
-            tasks,
+            directory,
             shutdown_tx,
         })
     }
 
     /// The handle for one connection, if it was among those `spawn` started a
-    /// task for.
+    /// task for (or one the [`SessionDirectory`] has since added on demand).
     pub fn handle(&self, connection_id: i64) -> Option<BrokerHandle> {
-        self.handles.get(&connection_id).cloned()
+        self.directory.handle(connection_id)
+    }
+
+    /// A clone of the shared session directory - the monitor-facing seam
+    /// carried inside `EngineControl` (see [`SessionDirectory`]).
+    pub fn directory(&self) -> SessionDirectory {
+        self.directory.clone()
     }
 
     /// How many broker tasks are currently spawned. Mainly a test/diagnostic
     /// helper.
     pub fn connection_count(&self) -> usize {
-        self.tasks.len()
+        self.directory.connection_count()
     }
 
     /// Clean shutdown: flip the shared shutdown trigger so every task breaks
@@ -390,17 +487,30 @@ impl BrokerSupervisor {
     /// The mpsc `Sender` a `BrokerHandle` holds only closes (`rx.recv() ==
     /// None`) once *all* clones are gone, but a realistic caller (W3-B's
     /// poller/writer) holds a handle for the whole app lifetime - dropping
-    /// only `self.handles` would leave that `Sender` alive and the task
+    /// only the handle map would leave that `Sender` alive and the task
     /// blocked in `rx.recv()` forever. The `watch` signal is out-of-band from
     /// that mpsc entirely, so it stops the task regardless of how many
-    /// `BrokerHandle`s are still outstanding elsewhere. `self.handles` is
-    /// still dropped afterward so any `BrokerHandle` clones this supervisor
-    /// itself owned release their `Sender`s too, though the task no longer
-    /// depends on that to exit.
+    /// `BrokerHandle`s are still outstanding elsewhere. The directory's
+    /// handle map is cleared too so `BrokerHandle` clones the directory
+    /// itself owned release their `Sender`s, though the tasks no longer
+    /// depend on that to exit. On-demand tasks the [`SessionDirectory`]
+    /// added after spawn share the same tasks vector, so they are awaited
+    /// here exactly like the seeded ones.
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
-        drop(self.handles);
-        for task in self.tasks {
+        self.directory
+            .handles
+            .lock()
+            .expect("session directory poisoned")
+            .clear();
+        let tasks: Vec<JoinHandle<()>> = std::mem::take(
+            &mut self
+                .directory
+                .tasks
+                .lock()
+                .expect("session directory poisoned"),
+        );
+        for task in tasks {
             let _ = task.await;
         }
     }

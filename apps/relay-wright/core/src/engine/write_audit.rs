@@ -17,8 +17,9 @@
 //! ## Actor
 //!
 //! Automatic `rule_fire`/`rate_limit_tripped` rows have no human actor
-//! (`actor_username` is `NULL`). `arm`/`disarm`/`dry_run_toggle` rows carry the
-//! username of whoever flipped the switch, threaded in by the wiring layer.
+//! (`actor_username` is `NULL`). `arm`/`disarm`/`dry_run_toggle`/`manual_write`
+//! rows carry the username of whoever flipped the switch (or clicked the
+//! monitor's value cell), threaded in by the wiring layer.
 
 use banto_core::BantoError;
 use sqlx::SqlitePool;
@@ -32,6 +33,13 @@ pub enum AuditAction {
     Disarm,
     DryRunToggle,
     RateLimitTripped,
+    /// A one-shot manual write from the タグモニタ screen
+    /// (feature/tag-monitor, `crate::engine::monitor`). Unlike `rule_fire`
+    /// it always carries an `actor_username` (a human clicked it) and is
+    /// NOT gated by arming/rate-limit/dry-run - this is a debug app and the
+    /// user explicitly relaxed those for manual writes; the audit row is the
+    /// safety net that remains.
+    ManualWrite,
 }
 
 impl AuditAction {
@@ -42,6 +50,7 @@ impl AuditAction {
             AuditAction::Disarm => "disarm",
             AuditAction::DryRunToggle => "dry_run_toggle",
             AuditAction::RateLimitTripped => "rate_limit_tripped",
+            AuditAction::ManualWrite => "manual_write",
         }
     }
 }

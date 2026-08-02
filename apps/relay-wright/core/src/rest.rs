@@ -132,7 +132,7 @@ use tokio::sync::broadcast;
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 use crate::db::DbPool;
-use crate::engine::{EngineControl, EngineStatus, SharedEngineControl};
+use crate::engine::{EngineControl, EngineStatus, MonitorValue, SharedEngineControl};
 use crate::project::{export_project, import_project, ImportSummary, ProjectFile};
 use crate::qr_strings::{QrString, QrStringInput, QrStringService};
 use crate::settings::{AuditSettings, SettingsService};
@@ -2186,22 +2186,24 @@ fn write_audit_log_router(write_audit_log: WriteAuditLogService, auth: AuthState
 
 /// Resolve the caller's identity and require role >= `min` for an engine
 /// control route (invariant §1 両経路対称: the SAME floors as `src-tauri`'s
-/// `engine_*` commands - arm/disarm = admin, dry-run = editor). Returns the
-/// caller's USERNAME on success (`Identity.id` IS the username, spec
-/// convention) so it can be threaded into [`EngineControl`], whose own
-/// `write_audit_log` row is then attributed to the right actor - the ONLY
-/// audit either path writes for arm/disarm/dry-run (this layer must not add a
-/// second). Records a `denied` entry (`resource: "engine"`) for an
+/// `engine_*` commands - arm/disarm = admin, dry-run = editor; the monitor's
+/// manual write = editor, `resource: "monitor"`). Returns the caller's
+/// USERNAME on success (`Identity.id` IS the username, spec convention) so it
+/// can be threaded into [`EngineControl`], whose own `write_audit_log` row is
+/// then attributed to the right actor - the ONLY audit either path writes for
+/// arm/disarm/dry-run/manual-write (this layer must not add a second).
+/// Records a `denied` entry (under `resource`) for an
 /// authenticated-but-underprivileged caller and returns `Forbidden`; no valid
 /// session returns `Unauthorized` (not audited - same reasoning as
-/// [`require_editor`]). The engine router as a whole sits behind `require_auth`,
-/// so `engine_status` (viewer+) needs no inline check - any authenticated role
-/// passes it.
+/// [`require_editor`]). The engine/monitor routers as a whole sit behind
+/// `require_auth`, so the viewer+ reads (`engine_status`, `monitor_read`)
+/// need no inline check - any authenticated role passes.
 async fn require_engine_role(
     auth: &AuthState,
     audit: &AuditLogService,
     headers: &HeaderMap,
     min: Role,
+    resource: &'static str,
     method: &str,
     path: &str,
 ) -> Result<String, BantoError> {
@@ -2219,7 +2221,7 @@ async fn require_engine_role(
                     actor_username: Some(&identity.id),
                     actor_role: Some(&identity.role),
                     action: "denied",
-                    resource: "engine",
+                    resource,
                     entity_id: None,
                     detail: Some(json!({ "method": method, "path": path })),
                     origin: "rest",
@@ -2270,6 +2272,7 @@ async fn engine_arm(
         &state.audit,
         &headers,
         Role::Admin,
+        "engine",
         "POST",
         "/api/engine/arm",
     )
@@ -2290,6 +2293,7 @@ async fn engine_disarm(
         &state.audit,
         &headers,
         Role::Admin,
+        "engine",
         "POST",
         "/api/engine/disarm",
     )
@@ -2319,6 +2323,7 @@ async fn engine_dry_run(
         &state.audit,
         &headers,
         Role::Editor,
+        "engine",
         "POST",
         "/api/engine/dry-run",
     )
@@ -2361,6 +2366,90 @@ fn engine_router(control: SharedEngineControl, audit: AuditLogService, auth: Aut
         .route("/api/engine/disarm", post(engine_disarm))
         .route("/api/engine/dry-run", post(engine_dry_run))
         .route("/api/engine/status", get(engine_status))
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(auth, require_auth))
+}
+
+// --- タグモニタ (feature/tag-monitor) ----------------------------------------
+//
+// The dual-path surface for the monitor screen: per-group realtime reads
+// (viewer+ - it is a read, though carried as POST since it takes a body and
+// touches the PLC) and one-shot manual tag writes (editor+ - the user
+// explicitly relaxed this debug screen's safety, so editor rather than admin,
+// with NO arm gate; every write is audited by `EngineControl::monitor_write`
+// under `action: 'manual_write'`). Reuses [`EngineState`] - the SAME shared
+// control slot as `/api/engine/*`, so monitor traffic rides the engine
+// broker's one-session-per-CPU tasks (hard constraint: the R08ENCPU accepts
+// only one SLMP session).
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MonitorReadRequest {
+    collection_group_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MonitorWriteRequest {
+    tag_id: i64,
+    value: String,
+}
+
+/// `POST /api/monitor/read` (viewer+): the selected 収集グループ's tags as
+/// display-ready realtime values (scaling + decimals applied; per-tag
+/// quality). Read-only, so not audited - the router's `require_auth` is the
+/// only gate, same convention as `engine_status`.
+async fn monitor_read(
+    State(state): State<EngineState>,
+    Json(body): Json<MonitorReadRequest>,
+) -> Result<Json<Vec<MonitorValue>>, ApiError> {
+    Ok(Json(
+        engine_control_now(&state)
+            .await?
+            .monitor_group_read(body.collection_group_id)
+            .await?,
+    ))
+}
+
+/// `POST /api/monitor/write` (editor+): one-shot manual write to a tag's
+/// device. NO arm gate / rate limit / dry-run (the user's explicit relaxation
+/// for this debug screen); the write itself is audited by `EngineControl`
+/// (`write_audit_log`, `action: 'manual_write'`, actor attributed) - this
+/// layer adds only authorization + actor resolution, never a second audit.
+async fn monitor_write(
+    State(state): State<EngineState>,
+    headers: HeaderMap,
+    Json(body): Json<MonitorWriteRequest>,
+) -> Result<StatusCode, ApiError> {
+    let actor = require_engine_role(
+        &state.auth,
+        &state.audit,
+        &headers,
+        Role::Editor,
+        "monitor",
+        "POST",
+        "/api/monitor/write",
+    )
+    .await?;
+    engine_control_now(&state)
+        .await?
+        .monitor_tag_write(body.tag_id, &body.value, Some(&actor))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `/api/monitor/*` (invariant §1 両経路対称, feature/tag-monitor): read
+/// viewer+, write editor+. Same [`EngineState`]/`require_auth` shape as
+/// [`engine_router`]; the write handler applies its own floor inline.
+fn monitor_router(control: SharedEngineControl, audit: AuditLogService, auth: AuthState) -> Router {
+    let state = EngineState {
+        control,
+        auth: auth.clone(),
+        audit,
+    };
+    Router::new()
+        .route("/api/monitor/read", post(monitor_read))
+        .route("/api/monitor/write", post(monitor_write))
         .with_state(state)
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
@@ -2599,6 +2688,11 @@ pub fn api_router(
         .merge(qr_strings_router(qr_strings, audit.clone(), auth.clone()))
         .merge(write_audit_log_router(write_audit_log, auth.clone()))
         .merge(engine_router(
+            engine_control.clone(),
+            audit.clone(),
+            auth.clone(),
+        ))
+        .merge(monitor_router(
             engine_control.clone(),
             audit.clone(),
             auth.clone(),
@@ -4792,6 +4886,172 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_json(response).await["armed"], false);
+    }
+
+    // --- タグモニタ dual-path (feature/tag-monitor) ---------------------------
+
+    /// Seed one SLMP connection (pointed at `sim`) + collection group + u16
+    /// tag through the real registry services, returning `(group_id,
+    /// tag_id)`. The engine the router helper started manages NO connections,
+    /// so these tests also exercise the SessionDirectory's on-demand spawn.
+    async fn seed_monitor_fixture(
+        pool: &sqlx::SqlitePool,
+        sim: &banto_plc_write::slmp::simulator::Simulator,
+    ) -> (i64, i64) {
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(banto_tags::PlcConnectionInput {
+                name: "CPU1".to_string(),
+                protocol: "slmp".to_string(),
+                host: sim.addr.ip().to_string(),
+                port: sim.addr.port() as i64,
+                unit_id: 1,
+                enabled: true,
+            })
+            .await
+            .expect("create slmp connection");
+        let group = CollectionGroupService::new(pool.clone())
+            .create(banto_tags::CollectionGroupInput {
+                name: "G1".to_string(),
+                plc_connection_id: conn.id,
+                period_ms: 1000,
+                enabled: true,
+            })
+            .await
+            .expect("create collection group");
+        let tag = TagService::new(pool.clone())
+            .create(banto_tags::TagInput {
+                name: "温度".to_string(),
+                collection_group_id: group.id,
+                address: "D100".to_string(),
+                data_type: "u16".to_string(),
+                string_length: None,
+                raw_lo: None,
+                raw_hi: None,
+                eng_lo: None,
+                eng_hi: None,
+                unit: None,
+                decimals: 0,
+                threshold_h: None,
+                threshold_hh: None,
+                threshold_l: None,
+                threshold_ll: None,
+                enabled: true,
+            })
+            .await
+            .expect("create tag");
+        (group.id, tag.id)
+    }
+
+    /// `POST /api/monitor/read` is viewer+ (a read): the viewer gets the
+    /// group's display-ready values over the engine broker's session (spawned
+    /// on demand - the router's engine manages no connections).
+    #[tokio::test]
+    async fn rest_viewer_can_read_monitor_values() {
+        let (router, pool, _admin, _editor, viewer) = router_with_role_tokens_and_engine().await;
+        let sim = banto_plc_write::slmp::simulator::Simulator::start().await;
+        let (group_id, tag_id) = seed_monitor_fixture(&pool, &sim).await;
+        sim.set_word(banto_plc::SlmpDevice::D, 100, 42);
+
+        // Poll until the on-demand session connects (fail-fast policy: a read
+        // during the connect window reports the tags as bad, not an error).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let body = loop {
+            let response = router
+                .clone()
+                .oneshot(post_json_auth(
+                    "/api/monitor/read",
+                    &viewer,
+                    json!({ "collectionGroupId": group_id }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response).await;
+            if body[0]["quality"] == "good" {
+                break body;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "value never became good: {body:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(body[0]["tagId"], tag_id);
+        assert_eq!(body[0]["tagName"], "温度");
+        assert_eq!(body[0]["address"], "D100");
+        assert_eq!(body[0]["value"], 42.0);
+    }
+
+    /// `POST /api/monitor/write` is editor-gated: a `viewer` is denied (403,
+    /// `denied` recorded under `resource: "monitor"`), an `editor` lands the
+    /// write in the simulator with NO arm required (the engine stays
+    /// disarmed) and the `manual_write` audit row attributes them.
+    #[tokio::test]
+    async fn rest_monitor_write_is_editor_gated_and_audited() {
+        let (router, pool, _admin, editor, viewer) = router_with_role_tokens_and_engine().await;
+        let sim = banto_plc_write::slmp::simulator::Simulator::start().await;
+        let (_group_id, tag_id) = seed_monitor_fixture(&pool, &sim).await;
+
+        // Viewer: denied + audited.
+        let denied = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/monitor/write",
+                &viewer,
+                json!({ "tagId": tag_id, "value": "1" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let entries = AuditLogService::new(pool.clone())
+            .list(ListParams::default())
+            .await
+            .unwrap();
+        assert!(
+            entries.rows.iter().any(|r| r.action == "denied"
+                && r.resource == "monitor"
+                && r.actor_username.as_deref() == Some("viewer")),
+            "expected a denied monitor entry, got {:?}",
+            entries.rows
+        );
+
+        // Editor: retried through the connect window, then 204 + the write
+        // physically lands - while the engine is DISARMED (no arm gate on
+        // manual writes; the user's explicit relaxation).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let response = router
+                .clone()
+                .oneshot(post_json_auth(
+                    "/api/monitor/write",
+                    &editor,
+                    json!({ "tagId": tag_id, "value": "777" }),
+                ))
+                .await
+                .unwrap();
+            if response.status() == StatusCode::NO_CONTENT {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "write never succeeded: {:?}",
+                body_json(response).await
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(sim.get_word(banto_plc::SlmpDevice::D, 100), 777);
+
+        let (actor, result): (Option<String>, String) = sqlx::query_as(
+            "SELECT actor_username, result FROM write_audit_log \
+             WHERE action = 'manual_write' AND result = 'ok' ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("a manual_write ok row must exist");
+        assert_eq!(actor.as_deref(), Some("editor"));
+        assert_eq!(result, "ok");
+        // The route layer never double-audits: no armed flip happened either.
+        assert_eq!(write_audit_count(&pool, "arm", "ok").await, 0);
     }
 
     // --- project file export/import dual-path (feature/project-file) ---------
