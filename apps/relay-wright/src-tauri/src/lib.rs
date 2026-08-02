@@ -3609,6 +3609,162 @@ mod tests {
         );
     }
 
+    // --- タグモニタ dual-path (Tauri half, feature/tag-monitor) --------------
+
+    /// Seed one SLMP connection + collection group + u16 tag through the real
+    /// registry services, pointed at a loopback port that is REAL but closed
+    /// (bind then drop), so monitor calls resolve the registry and reach the
+    /// broker without any live PLC. Returns `(group_id, tag_id)`.
+    async fn seed_monitor_fixture(pool: &sqlx::SqlitePool) -> (i64, i64) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("local_addr").port();
+        drop(listener);
+
+        let conn = banto_tags::PlcConnectionService::new(pool.clone())
+            .create(banto_tags::PlcConnectionInput {
+                name: "CPU1".to_string(),
+                protocol: "slmp".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: port as i64,
+                unit_id: 1,
+                enabled: true,
+            })
+            .await
+            .expect("create slmp connection");
+        let group = banto_tags::CollectionGroupService::new(pool.clone())
+            .create(banto_tags::CollectionGroupInput {
+                name: "G1".to_string(),
+                plc_connection_id: conn.id,
+                period_ms: 1000,
+                enabled: true,
+            })
+            .await
+            .expect("create collection group");
+        let tag = banto_tags::TagService::new(pool.clone())
+            .create(banto_tags::TagInput {
+                name: "温度".to_string(),
+                collection_group_id: group.id,
+                address: "D100".to_string(),
+                data_type: "u16".to_string(),
+                string_length: None,
+                raw_lo: None,
+                raw_hi: None,
+                eng_lo: None,
+                eng_hi: None,
+                unit: None,
+                decimals: 0,
+                threshold_h: None,
+                threshold_hh: None,
+                threshold_l: None,
+                threshold_ll: None,
+                enabled: true,
+            })
+            .await
+            .expect("create tag");
+        (group.id, tag.id)
+    }
+
+    /// `monitor_group_read` is a `viewer`+ read: a viewer gets the group's
+    /// values (quality `bad` here - the fixture's port is closed, and the
+    /// monitor degrades to per-tag bad rather than erroring), and nothing is
+    /// recorded for a read.
+    #[tokio::test]
+    async fn monitor_group_read_permits_viewer_and_degrades_to_bad_quality() {
+        let (state, pool) = app_state_with_engine().await;
+        let (group_id, tag_id) = seed_monitor_fixture(&pool).await;
+        let viewer = state
+            .users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create viewer");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+
+        let values = monitor_group_read_body(&state, group_id)
+            .await
+            .expect("viewer may read monitor values");
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].tag_id, tag_id);
+        assert_eq!(values[0].quality, "bad");
+
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        assert!(
+            entries.rows.iter().all(|r| r.resource != "monitor"),
+            "a monitor read must not record any audit entry, got {:?}",
+            entries.rows
+        );
+    }
+
+    /// `monitor_tag_write` requires `editor`: a viewer is denied before any
+    /// registry/broker work, the denial is recorded with `resource:
+    /// "monitor"`, and no `manual_write` row appears.
+    #[tokio::test]
+    async fn monitor_tag_write_denies_viewer_and_audits_it() {
+        let (state, pool) = app_state_with_engine().await;
+        let (_group_id, tag_id) = seed_monitor_fixture(&pool).await;
+        let viewer = state
+            .users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create viewer");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+
+        let err = monitor_tag_write_body(&state, tag_id, "1").await.unwrap_err();
+        assert!(matches!(err, BantoError::Forbidden));
+
+        assert_eq!(write_audit_count(&pool, "manual_write", "ok").await, 0);
+        assert_eq!(write_audit_count(&pool, "manual_write", "failed").await, 0);
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        assert!(
+            entries
+                .rows
+                .iter()
+                .any(|r| r.action == "denied" && r.resource == "monitor"),
+            "expected a denied monitor entry, got {:?}",
+            entries.rows
+        );
+    }
+
+    /// An `editor`'s manual write is audited on the Tauri path with the actor
+    /// attributed - even when the session is down (the fixture's port is
+    /// closed): the attempt errors, and the log-before-write `manual_write`
+    /// row is left `failed` (evidence a write was in flight - debug history).
+    /// No arm is required or touched at any point.
+    #[tokio::test]
+    async fn monitor_tag_write_is_audited_with_the_actor_on_the_tauri_path() {
+        let (state, pool) = app_state_with_engine().await;
+        let (_group_id, tag_id) = seed_monitor_fixture(&pool).await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create editor");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+
+        assert!(
+            !current_engine_control(&state).await.unwrap().is_armed(),
+            "the engine stays disarmed - manual writes need no arm"
+        );
+        let err = monitor_tag_write_body(&state, tag_id, "42").await.unwrap_err();
+        assert!(
+            err.to_string().contains("未接続"),
+            "closed port -> the broker's fail-fast disconnect error, got {err}"
+        );
+
+        let (actor, action, result): (Option<String>, String, String) = sqlx::query_as(
+            "SELECT actor_username, action, result FROM write_audit_log \
+             WHERE action = 'manual_write' ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("a manual_write row must exist");
+        assert_eq!(actor.as_deref(), Some("editor"));
+        assert_eq!(action, "manual_write");
+        assert_eq!(result, "failed");
+        assert_eq!(write_audit_count(&pool, "arm", "ok").await, 0);
+    }
+
     /// `write_audit_log_list` is a `viewer`+ read (plan W4): an unauthenticated
     /// caller is denied, a viewer may read a seeded row back, and - being a
     /// read - it records nothing to the M14 audit log for this resource.

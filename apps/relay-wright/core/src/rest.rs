@@ -4888,6 +4888,175 @@ mod tests {
         assert_eq!(body_json(response).await["armed"], false);
     }
 
+    // --- タグモニタ dual-path (feature/tag-monitor) ---------------------------
+
+    /// Seed one SLMP connection (pointed at `sim`) + collection group + u16
+    /// tag through the real registry services, returning `(group_id,
+    /// tag_id)`. The engine the router helper started manages NO connections,
+    /// so these tests also exercise the SessionDirectory's on-demand spawn.
+    async fn seed_monitor_fixture(
+        pool: &sqlx::SqlitePool,
+        sim: &banto_plc_write::slmp::simulator::Simulator,
+    ) -> (i64, i64) {
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(banto_tags::PlcConnectionInput {
+                name: "CPU1".to_string(),
+                protocol: "slmp".to_string(),
+                host: sim.addr.ip().to_string(),
+                port: sim.addr.port() as i64,
+                unit_id: 1,
+                enabled: true,
+            })
+            .await
+            .expect("create slmp connection");
+        let group = CollectionGroupService::new(pool.clone())
+            .create(banto_tags::CollectionGroupInput {
+                name: "G1".to_string(),
+                plc_connection_id: conn.id,
+                period_ms: 1000,
+                enabled: true,
+            })
+            .await
+            .expect("create collection group");
+        let tag = TagService::new(pool.clone())
+            .create(banto_tags::TagInput {
+                name: "温度".to_string(),
+                collection_group_id: group.id,
+                address: "D100".to_string(),
+                data_type: "u16".to_string(),
+                string_length: None,
+                raw_lo: None,
+                raw_hi: None,
+                eng_lo: None,
+                eng_hi: None,
+                unit: None,
+                decimals: 0,
+                threshold_h: None,
+                threshold_hh: None,
+                threshold_l: None,
+                threshold_ll: None,
+                enabled: true,
+            })
+            .await
+            .expect("create tag");
+        (group.id, tag.id)
+    }
+
+    /// `POST /api/monitor/read` is viewer+ (a read): the viewer gets the
+    /// group's display-ready values over the engine broker's session (spawned
+    /// on demand - the router's engine manages no connections).
+    #[tokio::test]
+    async fn rest_viewer_can_read_monitor_values() {
+        let (router, pool, _admin, _editor, viewer) = router_with_role_tokens_and_engine().await;
+        let sim = banto_plc_write::slmp::simulator::Simulator::start().await;
+        let (group_id, tag_id) = seed_monitor_fixture(&pool, &sim).await;
+        sim.set_word(banto_plc::SlmpDevice::D, 100, 42);
+
+        // Poll until the on-demand session connects (fail-fast policy: a read
+        // during the connect window reports the tags as bad, not an error).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let body = loop {
+            let response = router
+                .clone()
+                .oneshot(post_json_auth(
+                    "/api/monitor/read",
+                    &viewer,
+                    json!({ "collectionGroupId": group_id }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response).await;
+            if body[0]["quality"] == "good" {
+                break body;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "value never became good: {body:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        assert_eq!(body[0]["tagId"], tag_id);
+        assert_eq!(body[0]["tagName"], "温度");
+        assert_eq!(body[0]["address"], "D100");
+        assert_eq!(body[0]["value"], 42.0);
+    }
+
+    /// `POST /api/monitor/write` is editor-gated: a `viewer` is denied (403,
+    /// `denied` recorded under `resource: "monitor"`), an `editor` lands the
+    /// write in the simulator with NO arm required (the engine stays
+    /// disarmed) and the `manual_write` audit row attributes them.
+    #[tokio::test]
+    async fn rest_monitor_write_is_editor_gated_and_audited() {
+        let (router, pool, _admin, editor, viewer) = router_with_role_tokens_and_engine().await;
+        let sim = banto_plc_write::slmp::simulator::Simulator::start().await;
+        let (_group_id, tag_id) = seed_monitor_fixture(&pool, &sim).await;
+
+        // Viewer: denied + audited.
+        let denied = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/monitor/write",
+                &viewer,
+                json!({ "tagId": tag_id, "value": "1" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        let entries = AuditLogService::new(pool.clone())
+            .list(ListParams::default())
+            .await
+            .unwrap();
+        assert!(
+            entries
+                .rows
+                .iter()
+                .any(|r| r.action == "denied"
+                    && r.resource == "monitor"
+                    && r.actor_username.as_deref() == Some("viewer")),
+            "expected a denied monitor entry, got {:?}",
+            entries.rows
+        );
+
+        // Editor: retried through the connect window, then 204 + the write
+        // physically lands - while the engine is DISARMED (no arm gate on
+        // manual writes; the user's explicit relaxation).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let response = router
+                .clone()
+                .oneshot(post_json_auth(
+                    "/api/monitor/write",
+                    &editor,
+                    json!({ "tagId": tag_id, "value": "777" }),
+                ))
+                .await
+                .unwrap();
+            if response.status() == StatusCode::NO_CONTENT {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "write never succeeded: {:?}",
+                body_json(response).await
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(sim.get_word(banto_plc::SlmpDevice::D, 100), 777);
+
+        let (actor, result): (Option<String>, String) = sqlx::query_as(
+            "SELECT actor_username, result FROM write_audit_log \
+             WHERE action = 'manual_write' AND result = 'ok' ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("a manual_write ok row must exist");
+        assert_eq!(actor.as_deref(), Some("editor"));
+        assert_eq!(result, "ok");
+        // The route layer never double-audits: no armed flip happened either.
+        assert_eq!(write_audit_count(&pool, "arm", "ok").await, 0);
+    }
+
     // --- project file export/import dual-path (feature/project-file) ---------
 
     /// A minimal valid (empty) project file body - enough to exercise the

@@ -27,6 +27,12 @@
  * setup order: 接続 → タグ → 書き込み先 → ルール. Same viewer-read/
  * editor-write split as the W2 screens, so not `adminOnly`.
  *
+ * feature/tag-monitor adds monitor (モニタ) directly below エンジン制御:
+ * 接続→収集グループのツリー + 選択グループのタグのリアルタイム値（約1秒
+ * 更新）+ 値セルクリックの即時手動書き込み（デバッグ用途・確認ダイアログ
+ * なし。バックエンドで editor+ ゲート & manual_write 監査）。viewer は
+ * 閲覧のみ（画面内で編集を出し分け）なので not `adminOnly`.
+ *
  * qr-codes (QRコード) is a debug utility: 画面に表示したQRコードをタッチ
  * パネル（HMI）のQRリーダーでスキャンするための文字列リスト+表示画面。
  * PLC/レジストリ系とは独立なので、ログ系の下（管理者専用画面の手前）に
@@ -51,6 +57,7 @@ export interface NavItem {
 
 export const navItems: NavItem[] = [
 	{ path: '/engine', label: 'エンジン制御・監視', icon: '🕹️' },
+	{ path: '/monitor', label: 'モニタ', icon: '📟' },
 	{ path: '/settings', label: '設定', icon: '⚙️' },
 	{ path: '/plc-connections', label: 'PLC接続', icon: '🔌' },
 	{ path: '/tags', label: 'タグ登録', icon: '🏷️' },
