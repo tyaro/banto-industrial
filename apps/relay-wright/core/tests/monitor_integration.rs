@@ -27,7 +27,6 @@ use sqlx::SqlitePool;
 struct Fixture {
     pool: SqlitePool,
     sim: Simulator,
-    conn_id: i64,
     group_id: i64,
     tags: TagService,
 }
@@ -65,7 +64,6 @@ impl Fixture {
             tags: TagService::new(pool.clone()),
             pool,
             sim,
-            conn_id: conn.id,
             group_id: group.id,
         }
     }
@@ -121,9 +119,8 @@ impl Fixture {
 /// deadline elapses; panics with the last snapshot on timeout.
 async fn read_group_until_good(control: &EngineControl, group_id: i64) -> Vec<MonitorValue> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut last: Vec<MonitorValue> = Vec::new();
     loop {
-        last = control
+        let last = control
             .monitor_group_read(group_id)
             .await
             .expect("monitor_group_read");
@@ -159,7 +156,14 @@ async fn write_until_ok(control: &EngineControl, tag_id: i64, value: &str, actor
 
 async fn audit_rows(
     pool: &SqlitePool,
-) -> Vec<(String, String, Option<String>, Option<i64>, Option<f64>, Option<String>)> {
+) -> Vec<(
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<f64>,
+    Option<String>,
+)> {
     sqlx::query_as(
         "SELECT action, result, actor_username, source_tag_id, target_value_written, detail \
          FROM write_audit_log ORDER BY id",
@@ -192,13 +196,16 @@ async fn monitor_group_read_returns_display_ready_values_over_the_engine_session
     let plain = f.tag("生値", "D110", "u16", None, None, None, 0).await;
     // ビット, 文字列 (4 words = 8 SJIS bytes).
     let bit = f.tag("運転", "M10", "bit", None, None, None, 0).await;
-    let text = f.tag("状態", "D300", "string", Some(4), None, None, 0).await;
+    let text = f
+        .tag("状態", "D300", "string", Some(4), None, None, 0)
+        .await;
 
     f.sim.set_word(SlmpDevice::D, 100, 2000);
     f.sim.set_word(SlmpDevice::D, 110, 1234);
     f.sim.set_bit(SlmpDevice::M, 10, true);
     // "OK" in SJIS, low byte first within the word: 0x4B4F.
-    f.sim.set_word(SlmpDevice::D, 300, u16::from_le_bytes([b'O', b'K']));
+    f.sim
+        .set_word(SlmpDevice::D, 300, u16::from_le_bytes([b'O', b'K']));
 
     let (engine, control) = Engine::start(
         f.pool.clone(),
@@ -278,7 +285,9 @@ async fn manual_write_lands_while_disarmed_and_is_audited() {
             1,
         )
         .await;
-    let text = f.tag("文字", "D310", "string", Some(4), None, None, 0).await;
+    let text = f
+        .tag("文字", "D310", "string", Some(4), None, None, 0)
+        .await;
     let bit = f.tag("ビット", "M20", "bit", None, None, None, 0).await;
 
     let (engine, control) = Engine::start(
@@ -443,7 +452,9 @@ async fn invalid_manual_write_values_error_and_are_audited_failed() {
     let f = Fixture::new().await;
     let numeric = f.tag("数値", "D600", "u16", None, None, None, 0).await;
     let bit = f.tag("ビット", "M30", "bit", None, None, None, 0).await;
-    let text = f.tag("文字", "D610", "string", Some(2), None, None, 0).await;
+    let text = f
+        .tag("文字", "D610", "string", Some(2), None, None, 0)
+        .await;
 
     let (engine, control) = Engine::start(f.pool.clone(), Vec::new(), EngineConfig::default())
         .await
@@ -483,7 +494,10 @@ async fn invalid_manual_write_values_error_and_are_audited_failed() {
     // reaches the broker, comes back per-request Bad, and errors clearly.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let range_err = loop {
-        match control.monitor_tag_write(numeric, "70000", Some("debugger")).await {
+        match control
+            .monitor_tag_write(numeric, "70000", Some("debugger"))
+            .await
+        {
             Ok(()) => panic!("out-of-range write must not land"),
             Err(e) if e.to_string().contains("未接続") => {
                 assert!(
@@ -518,8 +532,7 @@ async fn invalid_manual_write_values_error_and_are_audited_failed() {
         "parse failures + the range rejection must all be audited: {rows:?}"
     );
     assert!(
-        rows.iter()
-            .all(|r| !(r.0 == "manual_write" && r.1 == "ok")),
+        rows.iter().all(|r| !(r.0 == "manual_write" && r.1 == "ok")),
         "no manual write ever succeeded here: {rows:?}"
     );
 

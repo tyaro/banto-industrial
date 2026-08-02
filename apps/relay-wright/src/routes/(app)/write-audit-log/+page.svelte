@@ -40,7 +40,9 @@
 		arm: 'アーム',
 		disarm: 'ディスアーム',
 		dry_run_toggle: 'ドライラン切替',
-		rate_limit_tripped: 'レート制限トリップ'
+		rate_limit_tripped: 'レート制限トリップ',
+		// feature/tag-monitor: モニタ画面からのワンショット手動書き込み。
+		manual_write: '手動書き込み'
 	};
 
 	const resultLabels: Record<string, string> = {

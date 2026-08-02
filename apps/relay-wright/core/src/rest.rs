@@ -5008,12 +5008,9 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            entries
-                .rows
-                .iter()
-                .any(|r| r.action == "denied"
-                    && r.resource == "monitor"
-                    && r.actor_username.as_deref() == Some("viewer")),
+            entries.rows.iter().any(|r| r.action == "denied"
+                && r.resource == "monitor"
+                && r.actor_username.as_deref() == Some("viewer")),
             "expected a denied monitor entry, got {:?}",
             entries.rows
         );

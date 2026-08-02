@@ -75,7 +75,17 @@
 	});
 
 	function errorMessage(err: unknown): string {
-		return isProviderError(err) ? err.message : String(err);
+		if (isProviderError(err)) {
+			// A validation error's useful text lives in the field errors (the
+			// generic message is just "validation failed") - the backend puts
+			// the parse/range/SJIS reason there for manual writes.
+			if (err.body.kind === 'validation') {
+				const messages = err.body.field_errors.map((f) => f.message).filter(Boolean);
+				if (messages.length > 0) return messages.join(' / ');
+			}
+			return err.message;
+		}
+		return String(err);
 	}
 
 	// ツリー（接続・グループ一覧）の読み込み。1回だけ。

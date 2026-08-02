@@ -399,7 +399,8 @@ impl SessionDirectory {
             port,
             ..SlmpConfig::default()
         };
-        let (handle, task) = spawn_task(conn.id, config, self.backoff, self.shutdown_tx.subscribe());
+        let (handle, task) =
+            spawn_task(conn.id, config, self.backoff, self.shutdown_tx.subscribe());
         handles.insert(conn.id, handle.clone());
         self.tasks
             .lock()

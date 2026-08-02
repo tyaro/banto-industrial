@@ -937,21 +937,28 @@ mod tests {
         )
         .execute(&pool)
         .await;
-        assert!(rejected.is_err(), "pre-upgrade CHECK must reject manual_write");
+        assert!(
+            rejected.is_err(),
+            "pre-upgrade CHECK must reject manual_write"
+        );
 
         run_migrations(&pool).await.expect("upgrade should apply");
 
         // Every row survived, ids and ts intact.
-        let rows: Vec<(i64, String, String, String)> = sqlx::query_as(
-            "SELECT id, ts, action, result FROM write_audit_log ORDER BY id",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+        let rows: Vec<(i64, String, String, String)> =
+            sqlx::query_as("SELECT id, ts, action, result FROM write_audit_log ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(
             rows[0],
-            (5, "2026-01-02 03:04:05".into(), "rule_fire".into(), "ok".into())
+            (
+                5,
+                "2026-01-02 03:04:05".into(),
+                "rule_fire".into(),
+                "ok".into()
+            )
         );
         assert_eq!(rows[1].0, 9);
         assert_eq!(rows[1].2, "arm");
@@ -968,7 +975,10 @@ mod tests {
         .expect("'manual_write' must pass the rebuilt CHECK");
 
         // Both indexes were recreated under their original names.
-        for index in ["idx_write_audit_log_ts", "idx_write_audit_log_write_rule_id"] {
+        for index in [
+            "idx_write_audit_log_ts",
+            "idx_write_audit_log_write_rule_id",
+        ] {
             let exists: Option<String> = sqlx::query_scalar(
                 "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
             )

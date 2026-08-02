@@ -421,6 +421,21 @@ async function main() {
 		await page.goto(`${BASE_URL}/engine`);
 		await page.getByText('DISARMED（非アーム）').waitFor();
 		await shot('engine.png');
+
+		// モニタ（タグモニタ, feature/tag-monitor）: 接続→収集グループの
+		// ツリーからグループを選択し、タグ一覧が出た状態。デモ用 PLC
+		// （192.0.2.10）は実在しないため現在値は BAD（未接続）表示になる —
+		// SLMPシミュレータはテスト専用クレート機能で serve バイナリからは
+		// 使えないため、オフライン状態での撮影とし manual.md にその旨を
+		// 記載している。エンジンのルールがこの接続を参照していなくても、
+		// モニタ要求時にセッションがオンデマンドで張られる（その検証は
+		// core/tests/monitor_integration.rs）。
+		await page.goto(`${BASE_URL}/monitor`);
+		await page.getByRole('button', { name: 'ライン1 収集グループ' }).click();
+		await page.getByText('温度センサ').waitFor();
+		// 最初のポーリング（約1秒周期）で BAD バッジが出るまで待つ。
+		await page.getByText('BAD').first().waitFor();
+		await shot('monitor.png');
 		// アーム確認ダイアログ（window.confirm）はネイティブダイアログのため
 		// Playwright では撮影不可 -> engine-arm-confirm.png はスキップし、
 		// manual.md に文言を記載する。

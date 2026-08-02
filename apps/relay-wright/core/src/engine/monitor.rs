@@ -14,6 +14,11 @@
 //! after engine start, or on an engine built with a connection subset) gets
 //! one spawned ON DEMAND and kept - see `SessionDirectory::ensure_connection`.
 //!
+//! A session's host/port are captured when its task spawns, so EDITING a
+//! connection's host/port does not re-dial an already-spawned session - the
+//! same "compiled at engine start" semantics every other connection consumer
+//! has. An engine reload (or app restart) picks up the new coordinates.
+//!
 //! ## Deliberately relaxed safety (debug app - user's explicit choice)
 //!
 //! Manual writes have NO arm gate, NO rate limiter, and NO dry-run
@@ -208,10 +213,14 @@ impl EngineControl {
             BatchWriteRequest::String(_) => None,
         };
 
-        let row = AuditRow::new(AuditAction::ManualWrite, AuditResult::Failed, MANUAL_WRITE_LABEL)
-            .with_source(source_tag_id, None)
-            .with_actor(actor)
-            .with_detail(detail.to_string());
+        let row = AuditRow::new(
+            AuditAction::ManualWrite,
+            AuditResult::Failed,
+            MANUAL_WRITE_LABEL,
+        )
+        .with_source(source_tag_id, None)
+        .with_actor(actor)
+        .with_detail(detail.to_string());
         let row = AuditRow {
             target_value_written: written_f64,
             ..row
@@ -313,8 +322,7 @@ impl EngineControl {
         }
 
         if !readable.is_empty() {
-            let requests: Vec<BatchReadRequest> =
-                readable.iter().map(|(_, _, req)| *req).collect();
+            let requests: Vec<BatchReadRequest> = readable.iter().map(|(_, _, req)| *req).collect();
             let handle = self
                 .sessions
                 .ensure_connection(&connection)
@@ -381,8 +389,17 @@ impl EngineControl {
         .fetch_optional(&self.pool)
         .await
         .map_err(banto_storage::storage_error)?;
-        let Some((name, address_raw, data_type, string_length, raw_lo, raw_hi, eng_lo, eng_hi, connection_id)) =
-            row
+        let Some((
+            name,
+            address_raw,
+            data_type,
+            string_length,
+            raw_lo,
+            raw_hi,
+            eng_lo,
+            eng_hi,
+            connection_id,
+        )) = row
         else {
             return Err(BantoError::NotFound {
                 resource: "tags".to_string(),
@@ -426,10 +443,8 @@ impl EngineControl {
                         "0" | "false" | "off" => false,
                         "1" | "true" | "on" => true,
                         _ => {
-                            return Err(
-                                "bit タグには 0/1（または true/false）を入力してください"
-                                    .to_string(),
-                            )
+                            return Err("bit タグには 0/1（または true/false）を入力してください"
+                                .to_string())
                         }
                     };
                     Ok(BatchWriteRequest::Numeric(WriteRequest {
@@ -456,8 +471,7 @@ impl EngineControl {
                             let raw = unscale(eng, s);
                             if !raw.is_finite() {
                                 return Err(
-                                    "スケーリングの工業値スパンが0のため書き込めません"
-                                        .to_string(),
+                                    "スケーリングの工業値スパンが0のため書き込めません".to_string()
                                 );
                             }
                             raw

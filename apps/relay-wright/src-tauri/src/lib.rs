@@ -3710,7 +3710,9 @@ mod tests {
             .expect("create viewer");
         *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
 
-        let err = monitor_tag_write_body(&state, tag_id, "1").await.unwrap_err();
+        let err = monitor_tag_write_body(&state, tag_id, "1")
+            .await
+            .unwrap_err();
         assert!(matches!(err, BantoError::Forbidden));
 
         assert_eq!(write_audit_count(&pool, "manual_write", "ok").await, 0);
@@ -3746,7 +3748,9 @@ mod tests {
             !current_engine_control(&state).await.unwrap().is_armed(),
             "the engine stays disarmed - manual writes need no arm"
         );
-        let err = monitor_tag_write_body(&state, tag_id, "42").await.unwrap_err();
+        let err = monitor_tag_write_body(&state, tag_id, "42")
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("未接続"),
             "closed port -> the broker's fail-fast disconnect error, got {err}"
