@@ -754,6 +754,7 @@ mod tests {
                     collection_group_id: self.group_id,
                     address: address.to_string(),
                     data_type: "i16".to_string(),
+                    string_length: None,
                     raw_lo: None,
                     raw_hi: None,
                     eng_lo: None,

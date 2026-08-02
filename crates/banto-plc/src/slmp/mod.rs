@@ -85,9 +85,7 @@ use std::time::Duration;
 use crate::client::{BoxFuture, PlcClient};
 use crate::decode::{decode_register_value, decode_string_value, WordOrder};
 use crate::error::PlcError;
-use crate::types::{
-    BatchReadRequest, BatchReadResult, PlcValue, ReadRequest, ReadResult, TagValue,
-};
+use crate::types::{BatchReadRequest, BatchReadResult, PlcValue, ReadRequest, ReadResult};
 
 use address::{SlmpAccess, SlmpDevice};
 use planning::{plan_slmp_batch, plan_slmp_requests, ReadKind, SlmpPlanOutcome, SlmpPlannedRead};
