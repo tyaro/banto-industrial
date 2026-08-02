@@ -698,7 +698,18 @@ mod tests {
         // writing). Crossing a second boundary between those two moments makes
         // them differ by one second, which made exact equality a rare but real
         // flake under parallel test load (slower vacuum = wider race window).
-        assert!(!listed[0].created_at.is_empty());
+        // Both stamps DO come from the same host clock though, and the mtime
+        // is always set after the snapshot, so ordering is deterministic
+        // (ISO "YYYY-MM-DD HH:MM:SS" compares lexicographically ==
+        // chronologically) - this still catches `list()` regressing to a
+        // garbage timestamp (e.g. its `unwrap_or(UNIX_EPOCH)` mtime fallback
+        // kicking in would yield "1970-01-01 ...").
+        assert!(
+            listed[0].created_at >= created.created_at,
+            "list()'s mtime-derived created_at ({}) predates create()'s DB snapshot ({})",
+            listed[0].created_at,
+            created.created_at
+        );
 
         let bytes = svc
             .read(&created.file_name)
