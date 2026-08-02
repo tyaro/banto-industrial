@@ -73,7 +73,7 @@ export interface CollectionGroupInput {
  */
 export const ALLOWED_PERIOD_MS: readonly number[] = [100, 200, 500, 1000, 2000, 5000, 10000, 60000];
 
-export type TagDataType = 'bit' | 'i16' | 'u16' | 'i32' | 'u32' | 'f32';
+export type TagDataType = 'bit' | 'i16' | 'u16' | 'i32' | 'u32' | 'f32' | 'string';
 
 /** Mirrors `banto_tags::Tag`. */
 export interface Tag {
@@ -82,6 +82,12 @@ export interface Tag {
 	collectionGroupId: number;
 	address: string;
 	dataType: TagDataType;
+	/**
+	 * Consecutive 16-bit word devices a `string` tag occupies (SJIS capacity =
+	 * 2 bytes/word); `Some(1..=128)` iff `dataType === 'string'`, `null`
+	 * otherwise (S2 文字列タグ).
+	 */
+	stringLength: number | null;
 	rawLo: number | null;
 	rawHi: number | null;
 	engLo: number | null;
@@ -101,6 +107,7 @@ export interface TagInput {
 	collectionGroupId: number;
 	address: string;
 	dataType: TagDataType;
+	stringLength?: number | null;
 	rawLo?: number | null;
 	rawHi?: number | null;
 	engLo?: number | null;
@@ -113,6 +120,10 @@ export interface TagInput {
 	thresholdLl?: number | null;
 	enabled: boolean;
 }
+
+/** `string` tag `stringLength` bounds — mirrors the backend CHECK/validation. */
+export const MIN_STRING_LENGTH = 1;
+export const MAX_STRING_LENGTH = 128;
 
 // --- environment/error plumbing (mirrors writeRegistryAdmin.ts) -------------
 

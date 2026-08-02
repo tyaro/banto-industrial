@@ -3163,6 +3163,7 @@ dependencies = [
  "banto-server",
  "banto-storage",
  "banto-tags",
+ "encoding_rs",
  "futures-util",
  "password-hash",
  "qrcode",

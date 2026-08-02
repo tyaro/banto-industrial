@@ -30,19 +30,37 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use banto_plc::{Address, DataType, ReadRequest, ReadResult};
+use banto_plc::{Address, BatchReadRequest, BatchReadResult, ReadRequest, StringReadRequest};
 use tokio::sync::watch;
 
 use super::broker::ReadOnlyHandle;
 use super::current_values::CurrentValues;
+use super::rule_engine::WireShape;
 
-/// A source tag resolved to its wire coordinates.
+/// A source tag resolved to its wire coordinates - numeric or, since S2
+/// 文字列タグ, string ([`WireShape`] carries which, plus a string's word span).
 #[derive(Debug, Clone)]
 pub struct ResolvedSource {
     pub tag_id: i64,
     pub connection_id: i64,
     pub address: Address,
-    pub data_type: DataType,
+    pub shape: WireShape,
+}
+
+impl ResolvedSource {
+    /// The (numeric or string) batch read request this source turns into.
+    fn to_request(&self) -> BatchReadRequest {
+        match self.shape {
+            WireShape::Numeric(data_type) => BatchReadRequest::Numeric(ReadRequest {
+                address: self.address,
+                data_type,
+            }),
+            WireShape::Str { words } => BatchReadRequest::String(StringReadRequest {
+                address: self.address,
+                words,
+            }),
+        }
+    }
 }
 
 /// Read every source once and fold the results into `cache`. Reads are grouped
@@ -63,13 +81,7 @@ pub async fn poll_once(
             continue;
         };
 
-        let requests: Vec<ReadRequest> = sources
-            .iter()
-            .map(|s| ReadRequest {
-                address: s.address,
-                data_type: s.data_type,
-            })
-            .collect();
+        let requests: Vec<BatchReadRequest> = sources.iter().map(|s| s.to_request()).collect();
 
         match handle.read(requests).await {
             Ok(results) => {
@@ -77,8 +89,8 @@ pub async fn poll_once(
                 // The broker preserves request order in its results.
                 for (src, result) in sources.iter().zip(results.into_iter()) {
                     match result {
-                        ReadResult::Value(value) => cache.set_good(src.tag_id, value, now),
-                        ReadResult::Bad(_) => cache.mark_bad(src.tag_id, now),
+                        BatchReadResult::Value(value) => cache.set_good(src.tag_id, value, now),
+                        BatchReadResult::Bad(_) => cache.mark_bad(src.tag_id, now),
                     }
                 }
             }

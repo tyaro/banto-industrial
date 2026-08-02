@@ -45,6 +45,14 @@ axum = { workspace = true }
 # workspace 既存の依存（src-tauri の LAN アクセス QR と同じクレート/機能）で、
 # 新規依存は増やさない。
 qrcode = { workspace = true }
+# S2 文字列タグ: 条件しきい値テキスト／文字列定数の保存時検証（Shift-JIS で
+# 表現可能か・エンコード後バイト数が 2×string_length に収まるか）に使う。
+# banto-plc/-write が既に使っている workspace 依存（slmp 経由で元々ツリーに
+# あった版に固定）で、Cargo.lock に新規ノードは増えない — qrcode と同じ
+# 理由付け。判定自体は banto-plc-write の encode_string_value と同一だが、
+# あちらは pub(crate)（ワイヤ層の内部）なので、保存時のフィールドエラー用に
+# support.rs::sjis_text_error で最小限を再実装する。
+encoding_rs = { workspace = true }
 # `fs` (spec M17): `crate::backup::BackupService` reads/writes `backups/`
 # and the pending-restore file directly via `tokio::fs`. Cargo's feature
 # unification already pulls this in transitively via `sqlx`'s

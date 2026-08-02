@@ -25,13 +25,14 @@
 	 * 閉じない（明示的な ✕ / キャンセル / Esc のみ）。
 	 *
 	 * 一括貼り付けの解析ルール（manual.md §4.3 に同文を記載）:
-	 * - 1行 = 1タグ。列順は 名前, アドレス, データ型, 単位, 小数桁。
+	 * - 1行 = 1タグ。列順は 名前, アドレス, データ型, 単位, 小数桁, 文字列長。
 	 * - 区切りは行ごとに自動判定: タブを含む行はタブ区切り（Excel からの
 	 *   コピー）、含まない行はカンマ区切り（CSV）。
-	 * - 先頭行のデータ型セルが有効値（bit/i16/u16/i32/u32/f32）でない場合は
-	 *   ヘッダー行とみなして読み飛ばす。
+	 * - 先頭行のデータ型セルが有効値（bit/i16/u16/i32/u32/f32/string）でない
+	 *   場合はヘッダー行とみなして読み飛ばす。
 	 * - 名前・アドレス・データ型は必須。単位は空欄可（空 = 単位なし）、
-	 *   小数桁は空欄 = 0（入力時は 0〜6 の整数）。
+	 *   小数桁は空欄 = 0（入力時は 0〜6 の整数）。文字列長（6列目）は string
+	 *   型のとき必須（1〜128 語）・数値型では空欄。
 	 * - スケーリング・しきい値は一括登録では設定しない（登録後に行クリックで
 	 *   編集）。
 	 *
@@ -61,6 +62,8 @@
 		listPlcConnections,
 		isTagRegistryAvailable,
 		ALLOWED_PERIOD_MS,
+		MIN_STRING_LENGTH,
+		MAX_STRING_LENGTH,
 		DEMO_MODE_MESSAGE,
 		type Tag,
 		type TagInput,
@@ -76,7 +79,12 @@
 		type SlmpDeviceInfo
 	} from '$lib/slmpDevice';
 
-	const dataTypeOptions: TagDataType[] = ['bit', 'i16', 'u16', 'i32', 'u32', 'f32'];
+	const dataTypeOptions: TagDataType[] = ['bit', 'i16', 'u16', 'i32', 'u32', 'f32', 'string'];
+
+	/** A `string` tag has a word-length instead of scaling/thresholds (S2 文字列タグ). */
+	function isStringType(dataType: TagDataType): boolean {
+		return dataType === 'string';
+	}
 
 	function periodLabel(ms: number): string {
 		if (ms < 1000) return `${ms}ms`;
@@ -250,6 +258,7 @@
 		collectionGroupId: string;
 		address: string;
 		dataType: TagDataType;
+		stringLength: string;
 		unit: string;
 		decimals: string;
 		rawLo: string;
@@ -269,6 +278,7 @@
 			collectionGroupId: '',
 			address: '',
 			dataType: 'i16',
+			stringLength: '',
 			unit: '',
 			decimals: '0',
 			rawLo: '',
@@ -289,6 +299,7 @@
 			collectionGroupId: String(t.collectionGroupId),
 			address: t.address,
 			dataType: t.dataType,
+			stringLength: t.stringLength === null ? '' : String(t.stringLength),
 			unit: t.unit ?? '',
 			decimals: String(t.decimals),
 			rawLo: t.rawLo === null ? '' : String(t.rawLo),
@@ -318,21 +329,27 @@
 	}
 
 	function toInput(form: FormState): TagInput {
+		const string = isStringType(form.dataType);
+		// A string tag carries a word-length and neither scaling nor thresholds
+		// (a raw/eng mapping or a numeric alarm over SJIS text is meaningless);
+		// send NULL for the fields the backend forbids for the type so a stray
+		// value never trips validation.
 		return {
 			name: form.name,
 			collectionGroupId: Number(form.collectionGroupId),
 			address: form.address,
 			dataType: form.dataType,
+			stringLength: string ? numOrNull(form.stringLength) : null,
 			unit: form.unit.trim() === '' ? null : form.unit,
 			decimals: Number(form.decimals),
-			rawLo: numOrNull(form.rawLo),
-			rawHi: numOrNull(form.rawHi),
-			engLo: numOrNull(form.engLo),
-			engHi: numOrNull(form.engHi),
-			thresholdLl: numOrNull(form.thresholdLl),
-			thresholdL: numOrNull(form.thresholdL),
-			thresholdH: numOrNull(form.thresholdH),
-			thresholdHh: numOrNull(form.thresholdHh),
+			rawLo: string ? null : numOrNull(form.rawLo),
+			rawHi: string ? null : numOrNull(form.rawHi),
+			engLo: string ? null : numOrNull(form.engLo),
+			engHi: string ? null : numOrNull(form.engHi),
+			thresholdLl: string ? null : numOrNull(form.thresholdLl),
+			thresholdL: string ? null : numOrNull(form.thresholdL),
+			thresholdH: string ? null : numOrNull(form.thresholdH),
+			thresholdHh: string ? null : numOrNull(form.thresholdHh),
 			enabled: form.enabled
 		};
 	}
@@ -410,6 +427,8 @@
 		dataTypeRaw: string;
 		unit: string;
 		decimalsRaw: string;
+		/** 文字列型の占有ワード数セル（S2 文字列タグ。6列目、数値型では空）。 */
+		stringLengthRaw: string;
 		/** クライアント側検証エラー（空 = 登録可能）。 */
 		errors: string[];
 	}
@@ -422,7 +441,7 @@
 	// テンプレート内の `{'...'}` は svelte/no-useless-mustaches に当たる。
 	// script 側の定数にして参照する。
 	const BULK_PLACEHOLDER =
-		'温度センサ\tD100\ti16\t℃\t1\n運転状態\tM10\tbit\n圧力センサ,D110,i16,kPa,0';
+		'温度センサ\tD100\ti16\t℃\t1\n運転状態\tM10\tbit\n品番\tD300\tstring\t\t\t4\n圧力センサ,D110,i16,kPa,0';
 	/**
 	 * 直近の一括登録の行別結果（キー = BulkRow.line）。ok=true は登録済み
 	 * （再実行時はスキップ）、ok=false はバックエンドエラー（メッセージを
@@ -459,7 +478,14 @@
 		for (let i = 0; i < lines.length; i++) {
 			if (lines[i].trim() === '') continue;
 			const cells = splitBulkLine(lines[i]);
-			const [name = '', address = '', dataTypeRaw = '', unit = '', decimalsRaw = ''] = cells;
+			const [
+				name = '',
+				address = '',
+				dataTypeRaw = '',
+				unit = '',
+				decimalsRaw = '',
+				stringLengthRaw = ''
+			] = cells;
 			const dataType = dataTypeRaw.toLowerCase();
 			if (firstDataLine) {
 				firstDataLine = false;
@@ -474,12 +500,36 @@
 			if (name === '') errors.push('名前は必須です');
 			if (address === '') errors.push('アドレスは必須です');
 			if (!isValidDataType(dataType)) {
-				errors.push('データ型は bit / i16 / u16 / i32 / u32 / f32 のいずれかです');
+				errors.push('データ型は bit / i16 / u16 / i32 / u32 / f32 / string のいずれかです');
 			}
 			if (decimalsRaw !== '' && !/^[0-6]$/.test(decimalsRaw)) {
 				errors.push('小数桁は 0〜6 の整数です');
 			}
-			rows.push({ line: i + 1, name, address, dataTypeRaw, unit, decimalsRaw, errors });
+			// 文字列型は 6 列目に文字列長（1〜128 語）が必須。数値型では空欄に
+			// する（バックエンドが数値型の string_length を拒否するため）。
+			if (dataType === 'string') {
+				const len = Number(stringLengthRaw);
+				if (
+					stringLengthRaw === '' ||
+					!Number.isInteger(len) ||
+					len < MIN_STRING_LENGTH ||
+					len > MAX_STRING_LENGTH
+				) {
+					errors.push(`文字列長は ${MIN_STRING_LENGTH}〜${MAX_STRING_LENGTH} の整数です（6列目）`);
+				}
+			} else if (stringLengthRaw !== '') {
+				errors.push('文字列長は string 型でのみ設定できます（6列目）');
+			}
+			rows.push({
+				line: i + 1,
+				name,
+				address,
+				dataTypeRaw,
+				unit,
+				decimalsRaw,
+				stringLengthRaw,
+				errors
+			});
 		}
 		return { rows, headerSkipped };
 	});
@@ -489,11 +539,13 @@
 	const bulkPendingRows = $derived(bulkValidRows.filter((r) => !bulkRowStatus[r.line]?.ok));
 
 	function bulkRowToInput(row: BulkRow, collectionGroupId: number): TagInput {
+		const dataType = row.dataTypeRaw.toLowerCase() as TagDataType;
 		return {
 			name: row.name,
 			collectionGroupId,
 			address: row.address,
-			dataType: row.dataTypeRaw.toLowerCase() as TagDataType,
+			dataType,
+			stringLength: dataType === 'string' ? Number(row.stringLengthRaw) : null,
 			unit: row.unit === '' ? null : row.unit,
 			decimals: row.decimalsRaw === '' ? 0 : Number(row.decimalsRaw),
 			enabled: true
@@ -587,6 +639,8 @@
 	/** type="number" の bind:value は入力後 number | null を書き戻す（numOrNull 参照）。 */
 	let seqCount: string | number | null = $state('10');
 	let seqDataType: TagDataType = $state('i16');
+	/** 文字列型の占有ワード数（S2 文字列タグ。アドレスの刻み幅にもなる）。 */
+	let seqStringLength: string | number | null = $state('4');
 	let seqUnit = $state('');
 	let seqDecimals: string | number | null = $state('0');
 	let seqEnabled = $state(true);
@@ -599,6 +653,7 @@
 		seqStart = '';
 		seqCount = '10';
 		seqDataType = 'i16';
+		seqStringLength = '4';
 		seqUnit = '';
 		seqDecimals = '0';
 		seqEnabled = true;
@@ -620,27 +675,52 @@
 	const seqPlan = $derived.by(
 		(): {
 			rows: SeqRow[];
-			step: 1 | 2;
+			step: number;
+			/** 文字列型の占有ワード数（生成タグに渡す）。数値型では null。 */
+			stringLength: number | null;
 			device: SlmpDeviceInfo | null;
 			/** 生成をブロックするエラー（null = 生成可能）。 */
 			error: string | null;
 		} => {
-			const step: 1 | 2 = SEQ_STEP2_TYPES.includes(seqDataType) ? 2 : 1;
-			const none = { rows: [], step, device: null };
-			if (seqStart.trim() === '') return { ...none, error: null };
+			const isString = seqDataType === 'string';
+			// アドレスの刻み幅: 文字列型は占有ワード数、32ビット型は 2、他は 1。
+			let step = SEQ_STEP2_TYPES.includes(seqDataType) ? 2 : 1;
+			let stringLength: number | null = null;
+			const none = { rows: [], step, stringLength, device: null };
+			if (isString) {
+				const len = numOrNull(seqStringLength);
+				if (
+					len === null ||
+					!Number.isInteger(len) ||
+					len < MIN_STRING_LENGTH ||
+					len > MAX_STRING_LENGTH
+				) {
+					return {
+						...none,
+						error: `文字列長は ${MIN_STRING_LENGTH}〜${MAX_STRING_LENGTH} の整数で入力してください`
+					};
+				}
+				stringLength = len;
+				step = len;
+			}
+			if (seqStart.trim() === '') return { ...none, stringLength, step, error: null };
 			const parsed = parseSlmpDevice(seqStart);
 			if (!parsed) {
 				return {
 					...none,
+					stringLength,
+					step,
 					error: '開始デバイスを解釈できません（SLMP 記法。例: D100 / M10 / X1A）'
 				};
 			}
 			const { device, number } = parsed;
 			// データ型とデバイス種別の整合（サーバー側プランナーと同じ規則を
-			// 先出しで検証。最終判定はサーバー）。
+			// 先出しで検証。最終判定はサーバー）。文字列型はワードデバイス扱い。
 			if (device.access === 'bit' && seqDataType !== 'bit') {
 				return {
 					...none,
+					stringLength,
+					step,
 					device,
 					error: `${device.mnemonic} はビットデバイスのため、データ型は bit を選択してください`
 				};
@@ -648,18 +728,28 @@
 			if (device.access === 'word' && seqDataType === 'bit') {
 				return {
 					...none,
+					stringLength,
+					step,
 					device,
 					error: `${device.mnemonic} はワードデバイスのため、データ型 bit は使用できません`
 				};
 			}
 			const count = numOrNull(seqCount);
 			if (count === null || !Number.isInteger(count) || count < 1 || count > SEQ_MAX_COUNT) {
-				return { ...none, device, error: `件数は 1〜${SEQ_MAX_COUNT} の整数で入力してください` };
+				return {
+					...none,
+					stringLength,
+					step,
+					device,
+					error: `件数は 1〜${SEQ_MAX_COUNT} の整数で入力してください`
+				};
 			}
 			const last = number + (count - 1) * step;
 			if (last > SLMP_MAX_DEVICE_NUMBER) {
 				return {
 					...none,
+					stringLength,
+					step,
 					device,
 					error: `最終デバイス番号が SLMP の上限（${formatSlmpDevice(device, SLMP_MAX_DEVICE_NUMBER)}）を超えます`
 				};
@@ -670,7 +760,7 @@
 				// 名前はアドレス文字列そのものを自動割り付け（デバイス名 = 名称）。
 				rows.push({ index: i, name: address, address, duplicate: existingTagNames.has(address) });
 			}
-			return { rows, step, device, error: null };
+			return { rows, step, stringLength, device, error: null };
 		}
 	);
 
@@ -702,6 +792,7 @@
 		if (seqGroupId === '' || seqPlan.error !== null || seqPendingRows.length === 0) return;
 		const collectionGroupId = Number(seqGroupId);
 		const dataType = seqDataType;
+		const stringLength = seqPlan.stringLength;
 		const unit = seqUnit.trim() === '' ? null : seqUnit;
 		const decimals = numOrNull(seqDecimals) ?? 0;
 		const enabled = seqEnabled;
@@ -715,6 +806,7 @@
 					collectionGroupId,
 					address: row.address,
 					dataType,
+					stringLength,
 					unit,
 					decimals,
 					enabled
@@ -771,6 +863,13 @@
 		},
 		{ id: 'address', header: 'アドレス', accessor: 'address', width: 100 },
 		{ id: 'dataType', header: '型', accessor: 'dataType', width: 70 },
+		{
+			id: 'stringLength',
+			header: '文字列長',
+			accessor: (t) => (t.stringLength === null ? '—' : `${t.stringLength}語`),
+			width: 80,
+			align: 'right'
+		},
 		{ id: 'unit', header: '単位', accessor: 'unit', width: 80 },
 		{
 			id: 'enabled',
@@ -811,11 +910,24 @@
 			データ型
 			<select bind:value={form.dataType}>
 				{#each dataTypeOptions as dt (dt)}
-					<option value={dt}>{dt}</option>
+					<option value={dt}>{dt === 'string' ? '文字列(string)' : dt}</option>
 				{/each}
 			</select>
 			{#if errors.dataType}<span class="err">{errors.dataType}</span>{/if}
 		</label>
+		{#if isStringType(form.dataType)}
+			<label class="field">
+				文字列長（{MIN_STRING_LENGTH}〜{MAX_STRING_LENGTH}ワード）
+				<input
+					type="number"
+					min={MIN_STRING_LENGTH}
+					max={MAX_STRING_LENGTH}
+					bind:value={form.stringLength}
+				/>
+				<span class="hint">1ワード = 2バイト（Shift-JIS）。</span>
+				{#if errors.stringLength}<span class="err">{errors.stringLength}</span>{/if}
+			</label>
+		{/if}
 		<label class="field">
 			単位
 			<input type="text" bind:value={form.unit} />
@@ -825,51 +937,57 @@
 			<input type="number" min="0" max="6" bind:value={form.decimals} />
 			{#if errors.decimals}<span class="err">{errors.decimals}</span>{/if}
 		</label>
-		<label class="field">
-			raw下限
-			<input type="number" bind:value={form.rawLo} />
-		</label>
-		<label class="field">
-			raw上限
-			<input type="number" bind:value={form.rawHi} />
-		</label>
-		<label class="field">
-			eng下限
-			<input type="number" bind:value={form.engLo} />
-		</label>
-		<label class="field">
-			eng上限
-			<input type="number" bind:value={form.engHi} />
-		</label>
-		<label class="field">
-			しきい値LL
-			<input type="number" bind:value={form.thresholdLl} />
-			{#if errors.thresholdLl}<span class="err">{errors.thresholdLl}</span>{/if}
-		</label>
-		<label class="field">
-			しきい値L
-			<input type="number" bind:value={form.thresholdL} />
-			{#if errors.thresholdL}<span class="err">{errors.thresholdL}</span>{/if}
-		</label>
-		<label class="field">
-			しきい値H
-			<input type="number" bind:value={form.thresholdH} />
-			{#if errors.thresholdH}<span class="err">{errors.thresholdH}</span>{/if}
-		</label>
-		<label class="field">
-			しきい値HH
-			<input type="number" bind:value={form.thresholdHh} />
-			{#if errors.thresholdHh}<span class="err">{errors.thresholdHh}</span>{/if}
-		</label>
+		{#if !isStringType(form.dataType)}
+			<label class="field">
+				raw下限
+				<input type="number" bind:value={form.rawLo} />
+			</label>
+			<label class="field">
+				raw上限
+				<input type="number" bind:value={form.rawHi} />
+			</label>
+			<label class="field">
+				eng下限
+				<input type="number" bind:value={form.engLo} />
+			</label>
+			<label class="field">
+				eng上限
+				<input type="number" bind:value={form.engHi} />
+			</label>
+			<label class="field">
+				しきい値LL
+				<input type="number" bind:value={form.thresholdLl} />
+				{#if errors.thresholdLl}<span class="err">{errors.thresholdLl}</span>{/if}
+			</label>
+			<label class="field">
+				しきい値L
+				<input type="number" bind:value={form.thresholdL} />
+				{#if errors.thresholdL}<span class="err">{errors.thresholdL}</span>{/if}
+			</label>
+			<label class="field">
+				しきい値H
+				<input type="number" bind:value={form.thresholdH} />
+				{#if errors.thresholdH}<span class="err">{errors.thresholdH}</span>{/if}
+			</label>
+			<label class="field">
+				しきい値HH
+				<input type="number" bind:value={form.thresholdHh} />
+				{#if errors.thresholdHh}<span class="err">{errors.thresholdHh}</span>{/if}
+			</label>
+		{/if}
 		<label class="field checkbox">
 			<input type="checkbox" bind:checked={form.enabled} />
 			有効
 		</label>
 	</div>
-	<p class="note">
-		スケーリング（raw/eng の上下限）は 4 つすべて入力するか、すべて空にしてください （空 =
-		スケーリングなし）。しきい値は LL ≤ L ≤ H ≤ HH の順（設定した項目のみ比較）。
-	</p>
+	{#if isStringType(form.dataType)}
+		<p class="note">文字列型ではスケーリング・しきい値は設定できません（SJIS テキストのため）。</p>
+	{:else}
+		<p class="note">
+			スケーリング（raw/eng の上下限）は 4 つすべて入力するか、すべて空にしてください （空 =
+			スケーリングなし）。しきい値は LL ≤ L ≤ H ≤ HH の順（設定した項目のみ比較）。
+		</p>
+	{/if}
 	{#if errors.scaling}<p class="err">{errors.scaling}</p>{/if}
 {/snippet}
 
@@ -966,8 +1084,9 @@
 			</div>
 			<p class="note">
 				Excel（タブ区切り）や CSV（カンマ区切り）からコピーした行を貼り付けます。 列の順は
-				<strong>名前, アドレス, データ型, 単位, 小数桁</strong>
-				（名前・アドレス・データ型は必須。単位は空欄可、小数桁は空欄 = 0）。 先頭行のデータ型セルが有効値でない場合はヘッダー行として読み飛ばします。
+				<strong>名前, アドレス, データ型, 単位, 小数桁, 文字列長</strong>
+				（名前・アドレス・データ型は必須。単位は空欄可、小数桁は空欄 = 0。 文字列長は string 型のとき
+				6 列目に必須、数値型では空欄）。 先頭行のデータ型セルが有効値でない場合はヘッダー行として読み飛ばします。
 			</p>
 			<label class="field">
 				収集グループ（貼り付けた全行に適用）
@@ -1002,6 +1121,7 @@
 								<th>データ型</th>
 								<th>単位</th>
 								<th>小数桁</th>
+								<th>文字列長</th>
 								<th>状態</th>
 							</tr>
 						</thead>
@@ -1015,6 +1135,7 @@
 									<td>{row.dataTypeRaw}</td>
 									<td>{row.unit}</td>
 									<td>{row.decimalsRaw === '' ? '0（既定）' : row.decimalsRaw}</td>
+									<td>{row.stringLengthRaw === '' ? '—' : row.stringLengthRaw}</td>
 									<td>
 										{#if result}
 											<span class={result.ok ? 'ok' : 'err'}>{result.message}</span>
@@ -1103,10 +1224,24 @@
 					データ型（全行に適用）
 					<select bind:value={seqDataType} onchange={resetSeqStatus} disabled={seqRunning}>
 						{#each dataTypeOptions as dt (dt)}
-							<option value={dt}>{dt}</option>
+							<option value={dt}>{dt === 'string' ? '文字列(string)' : dt}</option>
 						{/each}
 					</select>
 				</label>
+				{#if seqDataType === 'string'}
+					<label class="field">
+						文字列長（{MIN_STRING_LENGTH}〜{MAX_STRING_LENGTH}ワード）
+						<input
+							type="number"
+							min={MIN_STRING_LENGTH}
+							max={MAX_STRING_LENGTH}
+							bind:value={seqStringLength}
+							oninput={resetSeqStatus}
+							disabled={seqRunning}
+						/>
+						<span class="hint">占有ワード数ぶんアドレスを刻んで生成します。</span>
+					</label>
+				{/if}
 				<label class="field">
 					単位
 					<input type="text" bind:value={seqUnit} disabled={seqRunning} />
@@ -1124,7 +1259,11 @@
 				<p class="err">{seqPlan.error}</p>
 			{:else if seqPlan.rows.length > 0}
 				<p class="bulk-summary">{seqSummary}</p>
-				{#if seqPlan.step === 2}
+				{#if seqDataType === 'string'}
+					<p class="note">
+						文字列型は {seqPlan.stringLength} ワードを占有するため、{seqPlan.step}番地刻みで生成します。
+					</p>
+				{:else if seqPlan.step === 2}
 					<p class="note">32bit型（i32/u32/f32）は2ワードを占有するため、2番地刻みで生成します。</p>
 				{/if}
 				{#if seqDuplicateCount > 0}

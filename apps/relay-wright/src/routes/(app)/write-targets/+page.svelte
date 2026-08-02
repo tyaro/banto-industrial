@@ -23,13 +23,20 @@
 		deleteWriteTarget,
 		isWriteRegistryAvailable,
 		DEMO_MODE_MESSAGE,
+		MIN_STRING_LENGTH,
+		MAX_STRING_LENGTH,
 		type WriteTarget,
 		type WriteTargetInput,
 		type WriteDataType
 	} from '$lib/banto/writeRegistryAdmin';
 	import { listPlcConnections, type PlcConnection } from '$lib/banto/tagRegistryAdmin';
 
-	const dataTypeOptions: WriteDataType[] = ['bit', 'i16', 'u16', 'i32', 'u32', 'f32'];
+	const dataTypeOptions: WriteDataType[] = ['bit', 'i16', 'u16', 'i32', 'u32', 'f32', 'string'];
+
+	/** A `string` target has a word-length instead of scaling (S2 文字列タグ). */
+	function isStringType(dataType: WriteDataType): boolean {
+		return dataType === 'string';
+	}
 
 	const available = isWriteRegistryAvailable();
 	const canWrite = $derived(canWriteResources(sessionStore.role));
@@ -44,6 +51,7 @@
 		plcConnectionId: string;
 		address: string;
 		dataType: WriteDataType;
+		stringLength: string;
 		unit: string;
 		decimals: string;
 		rawLo: string;
@@ -59,6 +67,7 @@
 			plcConnectionId: '',
 			address: '',
 			dataType: 'i16',
+			stringLength: '',
 			unit: '',
 			decimals: '0',
 			rawLo: '',
@@ -75,6 +84,7 @@
 			plcConnectionId: String(t.plcConnectionId),
 			address: t.address,
 			dataType: t.dataType,
+			stringLength: t.stringLength === null ? '' : String(t.stringLength),
 			unit: t.unit ?? '',
 			decimals: String(t.decimals),
 			rawLo: t.rawLo === null ? '' : String(t.rawLo),
@@ -99,17 +109,22 @@
 	}
 
 	function toInput(form: FormState): WriteTargetInput {
+		const string = isStringType(form.dataType);
+		// A string target carries a word-length and no scaling; a numeric target
+		// the reverse. Send exactly the fields the backend accepts for the type,
+		// so the other side is never a stray non-null the validator rejects.
 		return {
 			name: form.name,
 			plcConnectionId: Number(form.plcConnectionId),
 			address: form.address,
 			dataType: form.dataType,
+			stringLength: string ? numOrNull(form.stringLength) : null,
 			unit: form.unit.trim() === '' ? null : form.unit,
 			decimals: Number(form.decimals),
-			rawLo: numOrNull(form.rawLo),
-			rawHi: numOrNull(form.rawHi),
-			engLo: numOrNull(form.engLo),
-			engHi: numOrNull(form.engHi),
+			rawLo: string ? null : numOrNull(form.rawLo),
+			rawHi: string ? null : numOrNull(form.rawHi),
+			engLo: string ? null : numOrNull(form.engLo),
+			engHi: string ? null : numOrNull(form.engHi),
 			enabled: form.enabled
 		};
 	}
@@ -242,6 +257,13 @@
 		},
 		{ id: 'address', header: 'アドレス', accessor: 'address', width: 110 },
 		{ id: 'dataType', header: '型', accessor: 'dataType', width: 70 },
+		{
+			id: 'stringLength',
+			header: '文字列長',
+			accessor: (t) => (t.stringLength === null ? '—' : `${t.stringLength}語`),
+			width: 80,
+			align: 'right'
+		},
 		{ id: 'unit', header: '単位', accessor: 'unit', width: 80 },
 		{
 			id: 'enabled',
@@ -291,11 +313,25 @@
 						データ型
 						<select bind:value={createForm.dataType}>
 							{#each dataTypeOptions as dt (dt)}
-								<option value={dt}>{dt}</option>
+								<option value={dt}>{dt === 'string' ? '文字列(string)' : dt}</option>
 							{/each}
 						</select>
 						{#if createErrors.dataType}<span class="err">{createErrors.dataType}</span>{/if}
 					</label>
+					{#if isStringType(createForm.dataType)}
+						<label class="field">
+							文字列長（{MIN_STRING_LENGTH}〜{MAX_STRING_LENGTH}ワード）
+							<input
+								type="number"
+								min={MIN_STRING_LENGTH}
+								max={MAX_STRING_LENGTH}
+								bind:value={createForm.stringLength}
+							/>
+							<span class="hint">1ワード = 2バイト（Shift-JIS）。</span>
+							{#if createErrors.stringLength}<span class="err">{createErrors.stringLength}</span
+								>{/if}
+						</label>
+					{/if}
 					<label class="field">
 						単位
 						<input type="text" bind:value={createForm.unit} />
@@ -305,22 +341,26 @@
 						<input type="number" min="0" max="6" bind:value={createForm.decimals} />
 						{#if createErrors.decimals}<span class="err">{createErrors.decimals}</span>{/if}
 					</label>
-					<label class="field">
-						raw下限
-						<input type="number" bind:value={createForm.rawLo} />
-					</label>
-					<label class="field">
-						raw上限
-						<input type="number" bind:value={createForm.rawHi} />
-					</label>
-					<label class="field">
-						eng下限
-						<input type="number" bind:value={createForm.engLo} />
-					</label>
-					<label class="field">
-						eng上限
-						<input type="number" bind:value={createForm.engHi} />
-					</label>
+					{#if isStringType(createForm.dataType)}
+						<p class="hint scaling-note">文字列型ではスケーリングを設定できません。</p>
+					{:else}
+						<label class="field">
+							raw下限
+							<input type="number" bind:value={createForm.rawLo} />
+						</label>
+						<label class="field">
+							raw上限
+							<input type="number" bind:value={createForm.rawHi} />
+						</label>
+						<label class="field">
+							eng下限
+							<input type="number" bind:value={createForm.engLo} />
+						</label>
+						<label class="field">
+							eng上限
+							<input type="number" bind:value={createForm.engHi} />
+						</label>
+					{/if}
 					<label class="field checkbox">
 						<input type="checkbox" bind:checked={createForm.enabled} />
 						有効
@@ -382,10 +422,23 @@
 						データ型
 						<select bind:value={editForm.dataType}>
 							{#each dataTypeOptions as dt (dt)}
-								<option value={dt}>{dt}</option>
+								<option value={dt}>{dt === 'string' ? '文字列(string)' : dt}</option>
 							{/each}
 						</select>
 					</label>
+					{#if isStringType(editForm.dataType)}
+						<label class="field">
+							文字列長（{MIN_STRING_LENGTH}〜{MAX_STRING_LENGTH}ワード）
+							<input
+								type="number"
+								min={MIN_STRING_LENGTH}
+								max={MAX_STRING_LENGTH}
+								bind:value={editForm.stringLength}
+							/>
+							<span class="hint">1ワード = 2バイト（Shift-JIS）。</span>
+							{#if editErrors.stringLength}<span class="err">{editErrors.stringLength}</span>{/if}
+						</label>
+					{/if}
 					<label class="field">
 						単位
 						<input type="text" bind:value={editForm.unit} />
@@ -395,22 +448,26 @@
 						<input type="number" min="0" max="6" bind:value={editForm.decimals} />
 						{#if editErrors.decimals}<span class="err">{editErrors.decimals}</span>{/if}
 					</label>
-					<label class="field">
-						raw下限
-						<input type="number" bind:value={editForm.rawLo} />
-					</label>
-					<label class="field">
-						raw上限
-						<input type="number" bind:value={editForm.rawHi} />
-					</label>
-					<label class="field">
-						eng下限
-						<input type="number" bind:value={editForm.engLo} />
-					</label>
-					<label class="field">
-						eng上限
-						<input type="number" bind:value={editForm.engHi} />
-					</label>
+					{#if isStringType(editForm.dataType)}
+						<p class="hint scaling-note">文字列型ではスケーリングを設定できません。</p>
+					{:else}
+						<label class="field">
+							raw下限
+							<input type="number" bind:value={editForm.rawLo} />
+						</label>
+						<label class="field">
+							raw上限
+							<input type="number" bind:value={editForm.rawHi} />
+						</label>
+						<label class="field">
+							eng下限
+							<input type="number" bind:value={editForm.engLo} />
+						</label>
+						<label class="field">
+							eng上限
+							<input type="number" bind:value={editForm.engHi} />
+						</label>
+					{/if}
 					<label class="field checkbox">
 						<input type="checkbox" bind:checked={editForm.enabled} />
 						有効
@@ -502,6 +559,11 @@
 	.hint {
 		font-size: 0.7rem;
 		color: var(--banto-text-muted);
+	}
+
+	.scaling-note {
+		grid-column: 1 / -1;
+		margin: 0;
 	}
 
 	.err {

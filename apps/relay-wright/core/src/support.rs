@@ -25,6 +25,33 @@ pub(crate) fn range_message(min: i64, max: i64) -> String {
     format!("{min}〜{max}の範囲で入力してください")
 }
 
+/// Validate free text bound for a `words`-word MELSEC string device (S2
+/// 文字列タグ): returns `Some(message)` when the text cannot be written -
+/// either it contains a character Shift-JIS cannot represent, or its encoded
+/// bytes exceed the span's `2 * words` capacity. `None` = writable.
+///
+/// This is the SAVE-TIME twin of `banto_plc_write::encode::encode_string_value`
+/// (`pub(crate)` there - wire-layer internal), re-implemented minimally here
+/// so the write-rule/condition services can reject an unwritable comparand or
+/// constant with a field-level message instead of letting it fail only at
+/// write time on a live PLC. The two rejections and their thresholds are kept
+/// identical to the encoder's, so a value this function accepts always
+/// encodes.
+pub(crate) fn sjis_text_error(text: &str, words: i64) -> Option<String> {
+    let (bytes, _, had_errors) = encoding_rs::SHIFT_JIS.encode(text);
+    if had_errors {
+        return Some("Shift-JIS で表現できない文字を含みます".to_string());
+    }
+    let capacity = (words as usize).saturating_mul(2);
+    if bytes.len() > capacity {
+        return Some(format!(
+            "Shift-JIS で {} バイトになり、{words} 語（{capacity} バイト）に収まりません",
+            bytes.len()
+        ));
+    }
+    None
+}
+
 /// Map a write-time `sqlx::Error` into a friendly `BantoError::Validation`
 /// for the two constraint violations this app's write_* schema can hit: a
 /// UNIQUE violation on `name` (every entity's `name` column is `UNIQUE`), and

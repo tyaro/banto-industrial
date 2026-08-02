@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-use banto_plc::TagValue;
+use banto_plc::PlcValue;
 
 /// Whether a cached reading reflects a value the poller actually confirmed this
 /// cycle ([`Quality::Good`]) or a failed/absent read ([`Quality::Bad`]).
@@ -38,11 +38,16 @@ pub enum Quality {
 }
 
 /// One tag's latest cached reading.
-#[derive(Debug, Clone, Copy)]
+///
+/// Carries a [`PlcValue`] (the string-capable superset of `TagValue`, S2
+/// 文字列タグ), so a `string` source tag caches its text just like a numeric
+/// tag caches its `F64`. `PlcValue::Str` owns a `String`, so this is `Clone`
+/// but no longer `Copy`.
+#[derive(Debug, Clone)]
 pub struct CachedValue {
     /// The most recent value seen. For a [`Quality::Bad`] entry this is the
     /// last *good* value (kept only as history); the rule engine ignores it.
-    pub value: TagValue,
+    pub value: PlcValue,
     pub quality: Quality,
     /// When this entry was last written (monotonic). Not used for staleness
     /// enforcement in W3-B1 (deferred to W5); kept for diagnostics/UI.
@@ -63,7 +68,7 @@ impl CurrentValues {
     }
 
     /// Record a freshly-read good value for `tag_id`.
-    pub fn set_good(&self, tag_id: i64, value: TagValue, at: Instant) {
+    pub fn set_good(&self, tag_id: i64, value: PlcValue, at: Instant) {
         self.inner
             .write()
             .expect("current-values lock poisoned")
@@ -98,13 +103,13 @@ impl CurrentValues {
             .read()
             .expect("current-values lock poisoned")
             .get(&tag_id)
-            .copied()
+            .cloned()
     }
 
     /// The tag's value **only if it is currently `Good`** - the exact question
     /// the rule engine asks. `None` for a missing or `Bad` tag (both
     /// indeterminate).
-    pub fn good_value(&self, tag_id: i64) -> Option<TagValue> {
+    pub fn good_value(&self, tag_id: i64) -> Option<PlcValue> {
         self.get(tag_id).and_then(|entry| match entry.quality {
             Quality::Good => Some(entry.value),
             Quality::Bad => None,
@@ -122,8 +127,8 @@ mod tests {
         let now = Instant::now();
         assert_eq!(cache.good_value(1), None, "absent tag is indeterminate");
 
-        cache.set_good(1, TagValue::F64(42.0), now);
-        assert_eq!(cache.good_value(1), Some(TagValue::F64(42.0)));
+        cache.set_good(1, PlcValue::F64(42.0), now);
+        assert_eq!(cache.good_value(1), Some(PlcValue::F64(42.0)));
 
         cache.mark_bad(1, now);
         assert_eq!(cache.good_value(1), None, "bad tag is indeterminate");
@@ -131,11 +136,21 @@ mod tests {
         assert!(matches!(
             cache.get(1),
             Some(CachedValue {
-                value: TagValue::F64(v),
+                value: PlcValue::F64(v),
                 quality: Quality::Bad,
                 ..
             }) if v == 42.0
         ));
+    }
+
+    #[test]
+    fn a_string_value_round_trips_and_invalidates_like_a_numeric_one() {
+        let cache = CurrentValues::new();
+        let now = Instant::now();
+        cache.set_good(1, PlcValue::Str("OK".to_string()), now);
+        assert_eq!(cache.good_value(1), Some(PlcValue::Str("OK".to_string())));
+        cache.mark_bad(1, now);
+        assert_eq!(cache.good_value(1), None, "bad string tag is indeterminate");
     }
 
     #[test]

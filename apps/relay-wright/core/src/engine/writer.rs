@@ -32,25 +32,32 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use banto_plc::{Address, DataType};
-use banto_plc_write::WriteRequest;
+use banto_plc::{Address, PlcValue};
+use banto_plc_write::{BatchWriteRequest, StringWriteRequest, WriteRequest};
 use sqlx::SqlitePool;
 
 use super::arming::ArmingState;
 use super::broker::BrokerHandle;
 use super::rate_limiter::RateLimiter;
-use super::rule_engine::{tag_value_as_f64, PendingWrite};
+use super::rule_engine::{plc_value_as_f64, PendingWrite, WireShape};
 use super::write_audit::{
     insert_pending_fire, insert_row, set_result, AuditAction, AuditResult, AuditRow,
 };
 
+/// How many characters of a string source/written value are kept in the audit
+/// detail JSON (S2 文字列タグ) - enough to identify a recipe/status string
+/// without unbounded audit rows. Counted in `char`s, so multibyte SJIS text is
+/// never cut mid-character.
+const MAX_AUDIT_TEXT_CHARS: usize = 100;
+
 /// A write target resolved to everything the writer needs to issue a write:
-/// which connection's broker handle, and the wire address/type.
+/// which connection's broker handle, the wire address, and its shape (numeric
+/// or, since S2, a string device's word span).
 #[derive(Debug, Clone)]
 pub struct ResolvedTarget {
     pub connection_id: i64,
     pub address: Address,
-    pub data_type: DataType,
+    pub shape: WireShape,
 }
 
 /// The writer: the sole holder of write-capable broker handles.
@@ -89,13 +96,24 @@ impl Writer {
         pending: PendingWrite,
         now: Instant,
     ) -> Result<(), banto_core::BantoError> {
-        // Snapshot fields shared by every audit row for this intent.
-        let written_f64 = tag_value_as_f64(pending.value);
+        // Snapshot fields shared by every audit row for this intent. A string
+        // write leaves the numeric `target_value_written` column NULL and
+        // carries its text in the detail JSON instead (S2 文字列タグ); a
+        // numeric write is the reverse.
+        let written_f64: Option<f64> = match &pending.value {
+            PlcValue::Str(_) => None,
+            other => Some(plc_value_as_f64(other)),
+        };
+        let detail = string_write_detail(&pending);
         let base = |result: AuditResult| {
-            AuditRow::new(AuditAction::RuleFire, result, pending.rule_name.clone())
+            let mut row = AuditRow::new(AuditAction::RuleFire, result, pending.rule_name.clone())
                 .with_rule(pending.rule_id)
                 .with_source(pending.source_tag_id, pending.source_value)
-                .with_target(pending.write_target_id, Some(written_f64))
+                .with_target(pending.write_target_id, written_f64);
+            if let Some(detail) = &detail {
+                row = row.with_detail(detail.clone());
+            }
+            row
         };
 
         // (1) Resolve the target.
@@ -133,7 +151,7 @@ impl Writer {
             )
             .with_rule(pending.rule_id)
             .with_source(pending.source_tag_id, pending.source_value)
-            .with_target(pending.write_target_id, Some(written_f64))
+            .with_target(pending.write_target_id, written_f64)
             .with_detail("rate limit exceeded; breaker tripped and engine auto-disarmed");
             insert_row(&self.pool, &tripped).await?;
             return Ok(());
@@ -145,17 +163,26 @@ impl Writer {
             return Ok(());
         }
 
+        // Build the wire request first: a value whose kind cannot match the
+        // target's shape (save-time-prevented, but defended here) is audited
+        // `failed` with no physical write and no rate-limiter charge.
+        let Some(request) = build_request(&target, &pending.value) else {
+            insert_row(
+                &self.pool,
+                &base(AuditResult::Failed)
+                    .with_detail("write value type does not match the target"),
+            )
+            .await?;
+            return Ok(());
+        };
+
         // (5) Log-before-write.
         let audit_id = insert_pending_fire(&self.pool, &base(AuditResult::Ok)).await?;
         // Count this real write against the rate windows (only reached on the
-        // true write path, so a dry-run never consumes budget).
+        // true write path, so a dry-run never consumes budget). A string write
+        // is one request, so it counts as one exactly like a numeric write.
         self.rate_limiter.record(target.connection_id, now);
 
-        let request = WriteRequest {
-            address: target.address,
-            data_type: target.data_type,
-            value: pending.value,
-        };
         let result = handle.write(vec![request]).await;
 
         let final_result = match &result {
@@ -167,12 +194,69 @@ impl Writer {
     }
 }
 
+/// Turn a resolved target and the value to write into the (numeric or string)
+/// batch write request. `None` when the value's kind cannot match the target's
+/// shape - a numeric target handed a string, or a string target handed a
+/// non-string (both save-time-prevented; defended here rather than panicking).
+fn build_request(target: &ResolvedTarget, value: &PlcValue) -> Option<BatchWriteRequest> {
+    match target.shape {
+        WireShape::Numeric(data_type) => value.as_tag_value().map(|value| {
+            BatchWriteRequest::Numeric(WriteRequest {
+                address: target.address,
+                data_type,
+                value,
+            })
+        }),
+        WireShape::Str { words } => match value {
+            PlcValue::Str(text) => Some(BatchWriteRequest::String(StringWriteRequest {
+                address: target.address,
+                words,
+                value: text.clone(),
+            })),
+            _ => None,
+        },
+    }
+}
+
+/// The audit detail JSON for a write that touches string text (S2 文字列タグ):
+/// `{"sourceText":..,"writtenText":..}` with each side present only when it is
+/// a string, and each truncated to [`MAX_AUDIT_TEXT_CHARS`]. `None` for a
+/// purely numeric write, so numeric audit rows keep their `detail` NULL exactly
+/// as before.
+fn string_write_detail(pending: &PendingWrite) -> Option<String> {
+    let written_text = match &pending.value {
+        PlcValue::Str(s) => Some(s.as_str()),
+        _ => None,
+    };
+    let source_text = pending.source_text.as_deref();
+    if written_text.is_none() && source_text.is_none() {
+        return None;
+    }
+    let mut obj = serde_json::Map::new();
+    if let Some(s) = source_text {
+        obj.insert("sourceText".to_string(), truncate_text(s).into());
+    }
+    if let Some(s) = written_text {
+        obj.insert("writtenText".to_string(), truncate_text(s).into());
+    }
+    Some(serde_json::Value::Object(obj).to_string())
+}
+
+/// Truncate to [`MAX_AUDIT_TEXT_CHARS`] on a `char` boundary (never mid-byte).
+fn truncate_text(s: &str) -> String {
+    if s.chars().count() <= MAX_AUDIT_TEXT_CHARS {
+        s.to_string()
+    } else {
+        s.chars().take(MAX_AUDIT_TEXT_CHARS).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use banto_plc::TagValue;
+    use banto_plc::DataType;
     use sqlx::SqlitePool;
 
     use super::*;
@@ -187,7 +271,8 @@ mod tests {
             write_target_id: 1,
             source_tag_id: Some(10),
             source_value: Some(1.0),
-            value: TagValue::F64(value),
+            source_text: None,
+            value: PlcValue::F64(value),
         }
     }
 
@@ -225,7 +310,7 @@ mod tests {
         let target = ResolvedTarget {
             connection_id: 1,
             address: Address::parse_slmp("D200").expect("valid address"),
-            data_type: DataType::U16,
+            shape: WireShape::Numeric(DataType::U16),
         };
         let mut writer = Writer::new(
             pool.clone(),
@@ -293,5 +378,52 @@ mod tests {
             arming.is_armed(),
             "a clean write after recovery stays armed"
         );
+    }
+
+    /// A STRING write (S2 文字列タグ): the numeric `target_value_written` column
+    /// stays NULL and the source/written text lands in the detail JSON.
+    #[tokio::test]
+    async fn string_write_audits_text_in_detail_and_leaves_numeric_columns_null() {
+        let pool = init_db_memory().await.expect("in-memory db");
+        let arming = Arc::new(ArmingState::new(false));
+        arming.arm();
+        let (handle, _broker_task) = spawn_test_handle_answering_ok(1);
+        let target = ResolvedTarget {
+            connection_id: 1,
+            address: Address::parse_slmp("D300").expect("valid address"),
+            shape: WireShape::Str { words: 4 },
+        };
+        let mut writer = Writer::new(
+            pool.clone(),
+            arming.clone(),
+            RateLimiter::new(RateLimitConfig::default()),
+            HashMap::from([(1, handle)]),
+            HashMap::from([(1, target)]),
+        );
+
+        let pending = PendingWrite {
+            rule_id: 1,
+            rule_name: "SR".to_string(),
+            write_target_id: 1,
+            source_tag_id: Some(10),
+            source_value: None,
+            source_text: Some("OK".to_string()),
+            value: PlcValue::Str("NG".to_string()),
+        };
+        writer.process(pending, Instant::now()).await.unwrap();
+
+        assert_eq!(count(&pool, "rule_fire", "ok").await, 1);
+        let (written, detail): (Option<f64>, Option<String>) = sqlx::query_as(
+            "SELECT target_value_written, detail FROM write_audit_log \
+             WHERE action = 'rule_fire' AND result = 'ok'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(written, None, "string write leaves the numeric column NULL");
+        let detail = detail.expect("string write records a detail JSON");
+        let parsed: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        assert_eq!(parsed["sourceText"], "OK");
+        assert_eq!(parsed["writtenText"], "NG");
     }
 }

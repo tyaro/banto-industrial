@@ -36,6 +36,7 @@
 		deleteWriteRule,
 		listWriteTargets,
 		isWriteRegistryAvailable,
+		STRING_CONDITION_OPERATORS,
 		DEMO_MODE_MESSAGE,
 		type WriteRuleDetail,
 		type WriteRuleInput,
@@ -69,6 +70,11 @@
 		{ value: 'bit_is', label: 'ビット値 (bit_is)' }
 	];
 
+	/** The operator options a string source may use (eq/neq only, S2 文字列タグ). */
+	const stringOperatorOptions = operatorOptions.filter((o) =>
+		STRING_CONDITION_OPERATORS.includes(o.value)
+	);
+
 	function edgeModeLabel(v: EdgeMode): string {
 		return edgeModeOptions.find((o) => o.value === v)?.label ?? v;
 	}
@@ -90,10 +96,18 @@
 		operator: ConditionOperator;
 		thresholdValue: string;
 		thresholdValue2: string;
+		/** The text comparand for a STRING source (S2 文字列タグ); ignored otherwise. */
+		thresholdText: string;
 	}
 
 	function blankCondition(): ConditionFormState {
-		return { sourceTagId: '', operator: 'gt', thresholdValue: '', thresholdValue2: '' };
+		return {
+			sourceTagId: '',
+			operator: 'gt',
+			thresholdValue: '',
+			thresholdValue2: '',
+			thresholdText: ''
+		};
 	}
 
 	/** Editable form state (shared by create + edit). */
@@ -105,6 +119,8 @@
 		writeTargetId: string;
 		writeValueMode: WriteValueMode;
 		writeConstantValue: string;
+		/** The text constant for a STRING write target (S2 文字列タグ). */
+		writeConstantText: string;
 		writeSourceTagId: string;
 		conditions: ConditionFormState[];
 	}
@@ -118,6 +134,7 @@
 			writeTargetId: '',
 			writeValueMode: 'constant',
 			writeConstantValue: '',
+			writeConstantText: '',
 			writeSourceTagId: '',
 			conditions: [blankCondition()]
 		};
@@ -133,17 +150,64 @@
 			writeValueMode: detail.writeValueMode,
 			writeConstantValue:
 				detail.writeConstantValue === null ? '' : String(detail.writeConstantValue),
+			writeConstantText: detail.writeConstantText ?? '',
 			writeSourceTagId: detail.writeSourceTagId === null ? '' : String(detail.writeSourceTagId),
 			conditions:
 				detail.conditions.length > 0
 					? detail.conditions.map((c) => ({
 							sourceTagId: String(c.sourceTagId),
 							operator: c.operator,
-							thresholdValue: String(c.thresholdValue),
-							thresholdValue2: c.thresholdValue2 === null ? '' : String(c.thresholdValue2)
+							thresholdValue: c.thresholdValue === null ? '' : String(c.thresholdValue),
+							thresholdValue2: c.thresholdValue2 === null ? '' : String(c.thresholdValue2),
+							thresholdText: c.thresholdText ?? ''
 						}))
 					: [blankCondition()]
 		};
+	}
+
+	// --- type lookups for string-aware fields (S2 文字列タグ) ------------------
+
+	/** The source tag behind a condition row, if resolvable. */
+	function tagOf(sourceTagId: string): Tag | undefined {
+		const id = Number(sourceTagId);
+		return Number.isNaN(id) ? undefined : sourceTags.find((t) => t.id === id);
+	}
+
+	/** Whether a condition's source tag is a string tag. */
+	function isStringSource(condition: ConditionFormState): boolean {
+		return tagOf(condition.sourceTagId)?.dataType === 'string';
+	}
+
+	/** A string source's registered word length (for the byte-budget hint). */
+	function sourceStringLength(condition: ConditionFormState): number | null {
+		return tagOf(condition.sourceTagId)?.stringLength ?? null;
+	}
+
+	/** The write target a form points at, if resolvable. */
+	function targetOf(writeTargetId: string): WriteTarget | undefined {
+		const id = Number(writeTargetId);
+		return Number.isNaN(id) ? undefined : targets.find((t) => t.id === id);
+	}
+
+	/** Whether the form's write target is a string device. */
+	function isStringTarget(form: FormState): boolean {
+		return targetOf(form.writeTargetId)?.dataType === 'string';
+	}
+
+	/** The string target's registered word length (for the byte-budget hint). */
+	function targetStringLength(form: FormState): number | null {
+		return targetOf(form.writeTargetId)?.stringLength ?? null;
+	}
+
+	/**
+	 * When a condition's source becomes a string tag, coerce an incompatible
+	 * numeric operator (gt/between/…) to `eq` so the restricted operator select
+	 * always has a matching option and the payload stays valid.
+	 */
+	function onConditionSourceChange(condition: ConditionFormState): void {
+		if (isStringSource(condition) && !STRING_CONDITION_OPERATORS.includes(condition.operator)) {
+			condition.operator = 'eq';
+		}
 	}
 
 	/**
@@ -160,12 +224,32 @@
 	}
 
 	function toInput(form: FormState): WriteRuleInput {
-		const conditions: WriteRuleConditionInput[] = form.conditions.map((c) => ({
-			sourceTagId: Number(c.sourceTagId),
-			operator: c.operator,
-			thresholdValue: Number(c.thresholdValue),
-			thresholdValue2: c.operator === 'between' ? numOrNull(c.thresholdValue2) : null
-		}));
+		// Per condition, send the comparand its source type needs: a string
+		// source carries `thresholdText` (numeric fields null); a numeric source
+		// the reverse. So a stray value on the other side never trips the
+		// backend's exactly-one-side validation (S2 文字列タグ).
+		const conditions: WriteRuleConditionInput[] = form.conditions.map((c) => {
+			if (isStringSource(c)) {
+				return {
+					sourceTagId: Number(c.sourceTagId),
+					operator: c.operator,
+					thresholdValue: null,
+					thresholdValue2: null,
+					thresholdText: c.thresholdText
+				};
+			}
+			return {
+				sourceTagId: Number(c.sourceTagId),
+				operator: c.operator,
+				thresholdValue: Number(c.thresholdValue),
+				thresholdValue2: c.operator === 'between' ? numOrNull(c.thresholdValue2) : null,
+				thresholdText: null
+			};
+		});
+		// A string write target's constant lives in `writeConstantText`; a
+		// numeric target's in `writeConstantValue`. Send only the matching one.
+		const constant = form.writeValueMode === 'constant';
+		const stringTarget = isStringTarget(form);
 		return {
 			name: form.name,
 			enabled: form.enabled,
@@ -173,8 +257,13 @@
 			cooldownMs: numOrNull(form.cooldownMs),
 			writeTargetId: Number(form.writeTargetId),
 			writeValueMode: form.writeValueMode,
-			writeConstantValue:
-				form.writeValueMode === 'constant' ? numOrNull(form.writeConstantValue) : null,
+			writeConstantValue: constant && !stringTarget ? numOrNull(form.writeConstantValue) : null,
+			writeConstantText:
+				constant && stringTarget
+					? form.writeConstantText === ''
+						? null
+						: form.writeConstantText
+					: null,
 			writeSourceTagId:
 				form.writeValueMode === 'copy_from_source' ? numOrNull(form.writeSourceTagId) : null,
 			conditions
@@ -360,7 +449,10 @@
 			<div class="condition-row">
 				<label class="field">
 					ソースタグ
-					<select bind:value={condition.sourceTagId}>
+					<select
+						bind:value={condition.sourceTagId}
+						onchange={() => onConditionSourceChange(condition)}
+					>
 						<option value="">選択してください</option>
 						{#each sourceTags as t (t.id)}
 							<option value={String(t.id)}>{tagLabel(t)}</option>
@@ -373,7 +465,7 @@
 				<label class="field">
 					演算子
 					<select bind:value={condition.operator}>
-						{#each operatorOptions as op (op.value)}
+						{#each isStringSource(condition) ? stringOperatorOptions : operatorOptions as op (op.value)}
 							<option value={op.value}>{op.label}</option>
 						{/each}
 					</select>
@@ -381,21 +473,34 @@
 							>{errors[`conditions.${i}.operator`]}</span
 						>{/if}
 				</label>
-				<label class="field">
-					しきい値
-					<input type="number" bind:value={condition.thresholdValue} />
-					{#if errors[`conditions.${i}.thresholdValue`]}<span class="err"
-							>{errors[`conditions.${i}.thresholdValue`]}</span
-						>{/if}
-				</label>
-				{#if condition.operator === 'between'}
+				{#if isStringSource(condition)}
 					<label class="field">
-						上限値
-						<input type="number" bind:value={condition.thresholdValue2} />
-						{#if errors[`conditions.${i}.thresholdValue2`]}<span class="err"
-								>{errors[`conditions.${i}.thresholdValue2`]}</span
+						しきい値（テキスト）
+						<input type="text" bind:value={condition.thresholdText} />
+						<span class="hint"
+							>最大 {2 * (sourceStringLength(condition) ?? 0)} バイト・Shift-JIS</span
+						>
+						{#if errors[`conditions.${i}.thresholdText`]}<span class="err"
+								>{errors[`conditions.${i}.thresholdText`]}</span
 							>{/if}
 					</label>
+				{:else}
+					<label class="field">
+						しきい値
+						<input type="number" bind:value={condition.thresholdValue} />
+						{#if errors[`conditions.${i}.thresholdValue`]}<span class="err"
+								>{errors[`conditions.${i}.thresholdValue`]}</span
+							>{/if}
+					</label>
+					{#if condition.operator === 'between'}
+						<label class="field">
+							上限値
+							<input type="number" bind:value={condition.thresholdValue2} />
+							{#if errors[`conditions.${i}.thresholdValue2`]}<span class="err"
+									>{errors[`conditions.${i}.thresholdValue2`]}</span
+								>{/if}
+						</label>
+					{/if}
 				{/if}
 				<button
 					type="button"
@@ -451,11 +556,20 @@
 			{#if errors.writeValueMode}<span class="err">{errors.writeValueMode}</span>{/if}
 		</label>
 		{#if form.writeValueMode === 'constant'}
-			<label class="field">
-				定数値
-				<input type="number" bind:value={form.writeConstantValue} />
-				{#if errors.writeConstantValue}<span class="err">{errors.writeConstantValue}</span>{/if}
-			</label>
+			{#if isStringTarget(form)}
+				<label class="field">
+					定数（テキスト）
+					<input type="text" bind:value={form.writeConstantText} />
+					<span class="hint">最大 {2 * (targetStringLength(form) ?? 0)} バイト・Shift-JIS</span>
+					{#if errors.writeConstantText}<span class="err">{errors.writeConstantText}</span>{/if}
+				</label>
+			{:else}
+				<label class="field">
+					定数値
+					<input type="number" bind:value={form.writeConstantValue} />
+					{#if errors.writeConstantValue}<span class="err">{errors.writeConstantValue}</span>{/if}
+				</label>
+			{/if}
 		{:else}
 			<label class="field">
 				参照元タグ
@@ -603,6 +717,11 @@
 	.err {
 		color: var(--banto-danger);
 		font-size: 0.75rem;
+	}
+
+	.hint {
+		font-size: 0.7rem;
+		color: var(--banto-text-muted);
 	}
 
 	.cycle-err {
