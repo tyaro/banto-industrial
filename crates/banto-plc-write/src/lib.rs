@@ -51,9 +51,11 @@ pub mod types;
 
 pub use client::PlcWriteClient;
 pub use error::PlcWriteError;
-pub use slmp::planning::{plan_slmp_writes, SlmpPlannedWrite, SlmpWritePlanOutcome, WritePayload};
+pub use slmp::planning::{
+    plan_slmp_write_batch, plan_slmp_writes, SlmpPlannedWrite, SlmpWritePlanOutcome, WritePayload,
+};
 pub use slmp::{execute_slmp_writes, SlmpWriteClient};
-pub use types::{WriteRequest, WriteResult};
+pub use types::{BatchWriteRequest, StringWriteRequest, WriteRequest, WriteResult};
 
 // Re-exported for callers building requests, so they need only depend on this
 // crate for a basic write. The canonical definitions stay in `banto-plc`.

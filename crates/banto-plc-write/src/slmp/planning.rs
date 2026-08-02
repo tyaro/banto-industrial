@@ -28,9 +28,9 @@ use std::collections::BTreeMap;
 
 use banto_plc::{DataType, SlmpAccess, SlmpDevice, WordOrder};
 
-use crate::encode::{encode_bit_value, encode_word_value};
+use crate::encode::{encode_bit_value, encode_string_value, encode_word_value};
 use crate::error::PlcWriteError;
-use crate::types::WriteRequest;
+use crate::types::{BatchWriteRequest, WriteRequest};
 
 /// SLMP bulk-write word-unit cap, from the MELSEC MC protocol reference (bulk
 /// write allows up to 960 words per request). Unlike the read planner's cap -
@@ -143,6 +143,36 @@ struct BuildingBits {
 /// A target whose *device number* does not exist on the CPU cannot be caught
 /// here; that returns a [`PlcWriteError::SlmpEndCode`] `Bad` at write time.
 pub fn plan_slmp_writes(requests: &[WriteRequest], word_order: WordOrder) -> SlmpWritePlanOutcome {
+    // A thin wrapper over the mixed planner (a `WriteRequest` is just the
+    // `Numeric` case), so the two cannot drift - same shape as the read side's
+    // `plan_slmp_requests`.
+    let batch: Vec<BatchWriteRequest> = requests
+        .iter()
+        .map(|r| BatchWriteRequest::Numeric(*r))
+        .collect();
+    plan_slmp_write_batch(&batch, word_order)
+}
+
+/// Plan wire-level bulk writes for a mixed numeric + string batch (S1
+/// 文字列タグ). Same contract and same rejections as [`plan_slmp_writes`],
+/// plus the string-specific ones:
+///
+/// - a string at a bit device ([`PlcWriteError::UnsupportedCombination`])
+/// - a span of zero words or wider than one bulk write
+///   ([`PlcWriteError::StringSpanUnsupported`])
+/// - text that will not fit `2 * words` Shift-JIS bytes, or that Shift-JIS
+///   cannot represent ([`PlcWriteError::ValueOutOfRange`]) - rejected here,
+///   before grouping, so **nothing** of a too-long string is ever written
+///   (no truncation, no partial span)
+///
+/// An encodable string becomes an ordinary `words`-long word payload
+/// (0x00-padded to its full span), so the gap-0 grouping below extends to L-word
+/// spans with no special casing: an exactly-adjacent numeric target still
+/// merges into the same `bulk_write`, and a gap still splits.
+pub fn plan_slmp_write_batch(
+    requests: &[BatchWriteRequest],
+    word_order: WordOrder,
+) -> SlmpWritePlanOutcome {
     let mut immediate_bad = Vec::new();
 
     // BTreeMap for deterministic device (and therefore `writes`) ordering, same
@@ -150,43 +180,85 @@ pub fn plan_slmp_writes(requests: &[WriteRequest], word_order: WordOrder) -> Slm
     let mut by_device: BTreeMap<SlmpDevice, Vec<(usize, u32, ItemPayload)>> = BTreeMap::new();
 
     for (index, req) in requests.iter().enumerate() {
-        let Some((device, number)) = req.address.as_slmp() else {
+        let address = match req {
+            BatchWriteRequest::Numeric(r) => r.address,
+            BatchWriteRequest::String(s) => s.address,
+        };
+        let Some((device, number)) = address.as_slmp() else {
             immediate_bad.push((
                 index,
                 PlcWriteError::AddressProtocolMismatch {
                     expected: "slmp".to_string(),
-                    actual: req.address.notation().to_string(),
+                    actual: address.notation().to_string(),
                 },
             ));
             continue;
         };
 
-        if !is_compatible(device.access(), req.data_type) {
-            immediate_bad.push((
-                index,
-                PlcWriteError::UnsupportedCombination {
-                    area: format!("{device} ({})", device.access()),
-                    data_type: req.data_type.to_string(),
-                },
-            ));
-            continue;
-        }
-
-        let item = match device.access() {
-            SlmpAccess::Bit => match encode_bit_value(req.value) {
-                Ok(b) => ItemPayload::Bit(b),
-                Err(e) => {
-                    immediate_bad.push((index, e));
+        let item = match req {
+            BatchWriteRequest::Numeric(r) => {
+                if !is_compatible(device.access(), r.data_type) {
+                    immediate_bad.push((
+                        index,
+                        PlcWriteError::UnsupportedCombination {
+                            area: format!("{device} ({})", device.access()),
+                            data_type: r.data_type.to_string(),
+                        },
+                    ));
                     continue;
                 }
-            },
-            SlmpAccess::Word => match encode_word_value(req.value, req.data_type, word_order) {
-                Ok(words) => ItemPayload::Words(words),
-                Err(e) => {
-                    immediate_bad.push((index, e));
+                match device.access() {
+                    SlmpAccess::Bit => match encode_bit_value(r.value) {
+                        Ok(b) => ItemPayload::Bit(b),
+                        Err(e) => {
+                            immediate_bad.push((index, e));
+                            continue;
+                        }
+                    },
+                    SlmpAccess::Word => {
+                        match encode_word_value(r.value, r.data_type, word_order) {
+                            Ok(words) => ItemPayload::Words(words),
+                            Err(e) => {
+                                immediate_bad.push((index, e));
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            BatchWriteRequest::String(s) => {
+                // Strings live in word devices only, same v1 rule as reads.
+                if device.access() != SlmpAccess::Word {
+                    immediate_bad.push((
+                        index,
+                        PlcWriteError::UnsupportedCombination {
+                            area: format!("{device} ({})", device.access()),
+                            data_type: "string".to_string(),
+                        },
+                    ));
                     continue;
                 }
-            },
+                // A span one bulk write cannot carry is a per-request Bad -
+                // never a panic, and never split across two writes (a string
+                // torn across a group boundary could be observed half-written).
+                if s.words == 0 || s.words as u32 > MAX_WRITE_WORDS {
+                    immediate_bad.push((
+                        index,
+                        PlcWriteError::StringSpanUnsupported {
+                            words: s.words,
+                            max: MAX_WRITE_WORDS as u16,
+                        },
+                    ));
+                    continue;
+                }
+                match encode_string_value(&s.value, s.words) {
+                    Ok(words) => ItemPayload::Words(words),
+                    Err(e) => {
+                        immediate_bad.push((index, e));
+                        continue;
+                    }
+                }
+            }
         };
 
         by_device
@@ -628,6 +700,140 @@ mod tests {
             .collect();
         seen.sort();
         assert_eq!(seen, (0..requests.len()).collect::<Vec<_>>());
+    }
+
+    // --- string writes (S1 文字列タグ) -------------------------------------
+
+    use crate::types::{BatchWriteRequest, StringWriteRequest};
+
+    fn sreq(raw: &str, words: u16, value: &str) -> BatchWriteRequest {
+        BatchWriteRequest::String(StringWriteRequest {
+            address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw} should parse: {e}")),
+            words,
+            value: value.to_string(),
+        })
+    }
+
+    fn nreq(req: WriteRequest) -> BatchWriteRequest {
+        BatchWriteRequest::Numeric(req)
+    }
+
+    /// A string becomes its full padded span in the group payload, and an
+    /// exactly-adjacent numeric target merges into the same write - the L-word
+    /// generalization of the 32-bit span case above.
+    #[test]
+    fn a_string_spans_its_padded_word_count_and_merges_with_an_adjacent_numeric() {
+        let outcome = plan_slmp_write_batch(
+            &[sreq("D0", 4, "ABC"), nreq(word("D4", DataType::U16, 9.0))],
+            LH,
+        );
+        assert!(outcome.immediate_bad.is_empty());
+        assert_eq!(outcome.writes.len(), 1);
+        let g = &outcome.writes[0];
+        assert_eq!(g.start, 0);
+        // "ABC" -> [0x4241, 0x0043, 0, 0] (low byte first, NUL-padded), then 9.
+        assert_eq!(
+            g.payload,
+            WritePayload::Words(vec![0x4241, 0x0043, 0x0000, 0x0000, 0x0009])
+        );
+        assert_eq!(g.request_indices, vec![0, 1]);
+    }
+
+    /// The write-safety rule holds for strings too: a gap after the string's
+    /// span splits the write, so the in-between device is never touched.
+    #[test]
+    fn a_string_never_merges_across_a_gap() {
+        let outcome = plan_slmp_write_batch(
+            &[sreq("D0", 2, "AB"), nreq(word("D3", DataType::U16, 1.0))],
+            LH,
+        );
+        assert_eq!(outcome.writes.len(), 2, "D2 must never be written");
+    }
+
+    /// Text longer than the span is rejected outright - per-item Bad, nothing
+    /// grouped, batch-mates unaffected. The "no silent truncation" guarantee
+    /// at the planner level.
+    #[test]
+    fn an_overlong_string_is_immediately_bad_and_nothing_of_it_is_planned() {
+        let outcome = plan_slmp_write_batch(
+            &[
+                sreq("D0", 2, "ABCDE"), // 5 bytes > 4-byte capacity
+                nreq(word("D10", DataType::U16, 5.0)),
+            ],
+            LH,
+        );
+        assert_eq!(outcome.immediate_bad.len(), 1);
+        assert_eq!(outcome.immediate_bad[0].0, 0);
+        assert!(matches!(
+            outcome.immediate_bad[0].1,
+            PlcWriteError::ValueOutOfRange { .. }
+        ));
+        assert_eq!(outcome.writes.len(), 1);
+        assert_eq!(outcome.writes[0].start, 10);
+        assert_eq!(outcome.writes[0].request_indices, vec![1]);
+    }
+
+    #[test]
+    fn a_string_at_a_bit_device_is_immediately_bad() {
+        let outcome = plan_slmp_write_batch(&[sreq("M0", 4, "AB")], LH);
+        assert!(outcome.writes.is_empty());
+        assert_eq!(outcome.immediate_bad.len(), 1);
+        match &outcome.immediate_bad[0].1 {
+            PlcWriteError::UnsupportedCombination { area, data_type } => {
+                assert!(area.contains('M'));
+                assert_eq!(data_type, "string");
+            }
+            other => panic!("expected UnsupportedCombination, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_and_over_cap_string_spans_are_immediately_bad_not_a_panic() {
+        for words in [0u16, (MAX_WRITE_WORDS + 1) as u16] {
+            let outcome = plan_slmp_write_batch(&[sreq("D0", words, "")], LH);
+            assert!(outcome.writes.is_empty(), "words={words}");
+            assert!(matches!(
+                outcome.immediate_bad[0].1,
+                PlcWriteError::StringSpanUnsupported { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn a_modbus_address_on_a_string_write_is_immediately_bad() {
+        let outcome = plan_slmp_write_batch(
+            &[BatchWriteRequest::String(StringWriteRequest {
+                address: Address::parse("40001").unwrap(),
+                words: 4,
+                value: "AB".to_string(),
+            })],
+            LH,
+        );
+        assert!(matches!(
+            outcome.immediate_bad[0].1,
+            PlcWriteError::AddressProtocolMismatch { .. }
+        ));
+    }
+
+    /// The numeric-only wrapper and the batch planner agree exactly - the
+    /// tripwire that keeps `plan_slmp_writes` from drifting now that it
+    /// delegates.
+    #[test]
+    fn plan_slmp_writes_matches_the_batch_planner_on_numeric_input() {
+        let numeric = [
+            word("D0", DataType::U16, 1.0),
+            word("D1", DataType::F32, 1.5),
+            bit("M0", true),
+            word("D100", DataType::U16, 70000.0), // immediate bad
+        ];
+        let batch: Vec<BatchWriteRequest> = numeric
+            .iter()
+            .map(|r| BatchWriteRequest::Numeric(*r))
+            .collect();
+        assert_eq!(
+            plan_slmp_writes(&numeric, LH),
+            plan_slmp_write_batch(&batch, LH)
+        );
     }
 
     /// A 32-bit target at the very top of the device space must not overflow

@@ -98,6 +98,16 @@ pub enum PlcWriteError {
         detail: String,
     },
 
+    /// A [`crate::types::StringWriteRequest`]'s word span cannot be served:
+    /// zero words, or more words than one SLMP bulk write carries. The write
+    /// twin of `banto_plc::PlcError::StringSpanUnsupported`; resolved by the
+    /// planner before any wire traffic, so a per-request `Bad`, never a
+    /// panic. (The registry caps `string_length` at 128, far under the wire
+    /// cap, so reaching this means a caller bypassed `banto-tags`
+    /// validation.)
+    #[error("文字列長 {words} 語は扱えません（1〜{max} 語）")]
+    StringSpanUnsupported { words: u16, max: u16 },
+
     /// The MELSEC CPU answered a bulk write with a well-formed SLMP response
     /// frame carrying a non-zero end code - e.g. `0xC059` (wrong command) or
     /// `0xC061` (wrong length), or a device-protection/latch refusal. The write
@@ -139,6 +149,7 @@ impl PlcWriteError {
                 | PlcWriteError::UnsupportedCombination { .. }
                 | PlcWriteError::ValueTypeMismatch { .. }
                 | PlcWriteError::ValueOutOfRange { .. }
+                | PlcWriteError::StringSpanUnsupported { .. }
         )
     }
 }
@@ -174,6 +185,10 @@ mod tests {
                 data_type: "u16".to_string(),
                 value: "70000".to_string(),
                 detail: "out of range".to_string(),
+            },
+            PlcWriteError::StringSpanUnsupported {
+                words: 961,
+                max: 960,
             },
         ];
         for err in per_request {
