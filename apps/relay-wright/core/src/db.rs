@@ -94,7 +94,12 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), BantoError> {
 
 /// This app's own tables, applied as idempotent DDL - see this module's
 /// doc comment for why. Mirrors `migrations/0001_settings.sql` through
-/// `migrations/0010_qr_strings.sql` exactly; update both together.
+/// `migrations/0013_write_rules_constant_text.sql` exactly; update both
+/// together. The `CREATE TABLE IF NOT EXISTS` statements below carry the
+/// LATEST schema (so a fresh database is right immediately); the
+/// S2 文字列タグ upgrade steps at the end of this function bring an
+/// existing pre-S2 database up to the same shape (see
+/// [`upgrade_write_targets_for_string`] and friends).
 async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
     // 0001_settings.sql
     sqlx::query("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -167,14 +172,19 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
     .await
     .map_err(banto_storage::storage_error)?;
 
-    // 0005_write_targets.sql
+    // 0005_write_targets.sql + 0011_write_targets_allow_string.sql (S2
+    // 文字列タグ): the CHECK includes 'string' and the companion
+    // `string_length` column (1..=128 words iff data_type='string', enforced
+    // at the service layer like banto-tags' 0005 - the SQL CHECK below is
+    // defense-in-depth only).
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS write_targets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
             plc_connection_id INTEGER NOT NULL,
             address TEXT NOT NULL,
-            data_type TEXT NOT NULL CHECK (data_type IN ('bit', 'i16', 'u16', 'i32', 'u32', 'f32')),
+            data_type TEXT NOT NULL CHECK (data_type IN ('bit', 'i16', 'u16', 'i32', 'u32', 'f32', 'string')),
+            string_length INTEGER CHECK (string_length IS NULL OR string_length BETWEEN 1 AND 128),
             raw_lo REAL,
             raw_hi REAL,
             eng_lo REAL,
@@ -195,7 +205,10 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
     .await
     .map_err(banto_storage::storage_error)?;
 
-    // 0006_write_rules.sql
+    // 0006_write_rules.sql + 0013_write_rules_constant_text.sql (S2
+    // 文字列タグ): `write_constant_text` carries the constant for a STRING
+    // write target (`write_constant_value` stays NULL then); exactly one of
+    // the two is set for constant-mode rules, enforced at the service layer.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS write_rules (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -206,6 +219,7 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
             write_target_id INTEGER NOT NULL REFERENCES write_targets(id) ON DELETE RESTRICT,
             write_value_mode TEXT NOT NULL CHECK (write_value_mode IN ('constant', 'copy_from_source')),
             write_constant_value REAL,
+            write_constant_text TEXT,
             write_source_tag_id INTEGER
         )",
     )
@@ -219,7 +233,13 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
     .await
     .map_err(banto_storage::storage_error)?;
 
-    // 0007_write_rule_conditions.sql
+    // 0007_write_rule_conditions.sql +
+    // 0012_write_rule_conditions_threshold_text.sql (S2 文字列タグ):
+    // `threshold_value` is now nullable and `threshold_text` added - a
+    // condition on a STRING source tag carries its eq/neq comparand as text
+    // (numeric threshold columns NULL), a numeric condition the reverse;
+    // which side must be set is enforced at the service layer (it depends on
+    // the source tag's data type, which lives in banto-tags' `tags` table).
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS write_rule_conditions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -228,8 +248,9 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
             operator TEXT NOT NULL CHECK (
                 operator IN ('eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'between', 'bit_is')
             ),
-            threshold_value REAL NOT NULL,
-            threshold_value_2 REAL
+            threshold_value REAL,
+            threshold_value_2 REAL,
+            threshold_text TEXT
         )",
     )
     .execute(pool)
@@ -327,7 +348,197 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
         .await
         .map_err(banto_storage::storage_error)?;
 
+    // --- S2 文字列タグ schema upgrades for PRE-S2 databases ---------------
+    //
+    // The `CREATE TABLE IF NOT EXISTS` statements above already carry the
+    // final schema, so a fresh database needs none of this. An existing
+    // database is detected column-by-column via `pragma_table_info` (the
+    // same idempotent trick 0003's `users.role` uses) and upgraded in place.
+    // Each step is one transaction, so a crash mid-upgrade leaves the
+    // database either fully before or fully after that step and this
+    // function simply resumes on the next launch.
+
+    // 0011_write_targets_allow_string.sql: widen data_type's CHECK + add
+    // string_length. SQLite cannot ALTER a CHECK constraint, so the table is
+    // rebuilt - and since `write_rules` REFERENCES write_targets with
+    // ON DELETE RESTRICT, the rebuild needs banto-tags' 0004 park-and-restore
+    // dance, not 0005's simpler leaf pattern (see the migration file's doc
+    // comment for the full constraint story).
+    let has_string_length: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('write_targets') WHERE name = 'string_length'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+    if has_string_length == 0 {
+        upgrade_write_targets_for_string(pool).await?;
+    }
+
+    // 0012_write_rule_conditions_threshold_text.sql: threshold_value loses
+    // its NOT NULL (a string condition has no numeric threshold) and
+    // threshold_text is added. NOT NULL cannot be dropped by ALTER either,
+    // so this is also a rebuild - but write_rule_conditions is a LEAF table
+    // (nothing references it), so banto-tags' 0005 leaf pattern applies.
+    let has_threshold_text: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('write_rule_conditions') \
+         WHERE name = 'threshold_text'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+    if has_threshold_text == 0 {
+        upgrade_write_rule_conditions_for_string(pool).await?;
+    }
+
+    // 0013_write_rules_constant_text.sql: plain nullable column, so the
+    // simple ADD COLUMN path (0003's users.role precedent) suffices.
+    let has_constant_text: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('write_rules') WHERE name = 'write_constant_text'",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+    if has_constant_text == 0 {
+        sqlx::query("ALTER TABLE write_rules ADD COLUMN write_constant_text TEXT")
+            .execute(pool)
+            .await
+            .map_err(banto_storage::storage_error)?;
+    }
+
     Ok(())
+}
+
+/// Rebuild `write_targets` with the S2 string-capable schema (mirrors
+/// `migrations/0011_write_targets_allow_string.sql`; see that file for the
+/// full rationale). Runs in ONE transaction on ONE pooled connection - both
+/// matter: the transaction makes the rebuild atomic, and the temporary
+/// parking tables are per-connection so every statement must share the
+/// connection the transaction holds.
+///
+/// `write_targets` is a REFERENCED table (`write_rules.write_target_id`,
+/// ON DELETE RESTRICT), so this mirrors banto-tags' 0004 park-and-restore
+/// dance rather than 0005's leaf rebuild: with foreign keys enforced
+/// (banto-storage connects with `foreign_keys(true)`), `DROP TABLE
+/// write_targets` performs an implicit `DELETE FROM`, which trips the
+/// children's RESTRICT the moment any rule exists - and renaming the OLD
+/// table out of the way instead would drag `write_rules`' REFERENCES clause
+/// along with the rename. So: park the descendant rows (write_rule_conditions
+/// first - it cascades from write_rules - then write_rules), delete them,
+/// rebuild write_targets, rename the NEW table into the vacated name (nothing
+/// references `write_targets_new`, so that rename rewrites nothing), then
+/// restore the parked rows shallowest-first.
+///
+/// A database that needs this upgrade is pre-S2 by construction, so the
+/// parked `write_rules` rows still have the OLD column set (no
+/// `write_constant_text` - step 0013 runs after this one) and the explicit
+/// column lists below name exactly that old shape.
+async fn upgrade_write_targets_for_string(pool: &SqlitePool) -> Result<(), BantoError> {
+    let mut tx = pool.begin().await.map_err(banto_storage::storage_error)?;
+
+    for sql in [
+        // Park the descendants, deepest first.
+        "CREATE TEMPORARY TABLE _u0011_write_rule_conditions AS SELECT * FROM write_rule_conditions",
+        "CREATE TEMPORARY TABLE _u0011_write_rules AS SELECT * FROM write_rules",
+        "DELETE FROM write_rule_conditions",
+        "DELETE FROM write_rules",
+        // Rebuild write_targets with the widened CHECK + string_length.
+        "CREATE TABLE write_targets_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            plc_connection_id INTEGER NOT NULL,
+            address TEXT NOT NULL,
+            data_type TEXT NOT NULL CHECK (data_type IN ('bit', 'i16', 'u16', 'i32', 'u32', 'f32', 'string')),
+            string_length INTEGER CHECK (string_length IS NULL OR string_length BETWEEN 1 AND 128),
+            raw_lo REAL,
+            raw_hi REAL,
+            eng_lo REAL,
+            eng_hi REAL,
+            unit TEXT,
+            decimals INTEGER NOT NULL DEFAULT 0 CHECK (decimals BETWEEN 0 AND 6),
+            enabled INTEGER NOT NULL DEFAULT 1
+        )",
+        "INSERT INTO write_targets_new (
+            id, name, plc_connection_id, address, data_type,
+            raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, enabled
+        )
+        SELECT
+            id, name, plc_connection_id, address, data_type,
+            raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, enabled
+        FROM write_targets",
+        "DROP TABLE write_targets",
+        "ALTER TABLE write_targets_new RENAME TO write_targets",
+        // 0005's index does not survive the rebuild (indexes belong to the
+        // dropped table), so it is recreated under its original name.
+        "CREATE INDEX idx_write_targets_plc_connection_id ON write_targets (plc_connection_id)",
+        // Put the descendants back, shallowest first (old column shape - see
+        // the function doc comment).
+        "INSERT INTO write_rules (
+            id, name, enabled, edge_mode, cooldown_ms, write_target_id,
+            write_value_mode, write_constant_value, write_source_tag_id
+        )
+        SELECT
+            id, name, enabled, edge_mode, cooldown_ms, write_target_id,
+            write_value_mode, write_constant_value, write_source_tag_id
+        FROM _u0011_write_rules",
+        "INSERT INTO write_rule_conditions (
+            id, write_rule_id, source_tag_id, operator, threshold_value, threshold_value_2
+        )
+        SELECT
+            id, write_rule_id, source_tag_id, operator, threshold_value, threshold_value_2
+        FROM _u0011_write_rule_conditions",
+        "DROP TABLE _u0011_write_rules",
+        "DROP TABLE _u0011_write_rule_conditions",
+    ] {
+        sqlx::query(sql)
+            .execute(&mut *tx)
+            .await
+            .map_err(banto_storage::storage_error)?;
+    }
+
+    tx.commit().await.map_err(banto_storage::storage_error)
+}
+
+/// Rebuild `write_rule_conditions` with the S2 string-capable schema
+/// (mirrors `migrations/0012_write_rule_conditions_threshold_text.sql`):
+/// `threshold_value` drops NOT NULL and `threshold_text` is added. This is a
+/// LEAF table - nothing references it - so banto-tags' 0005 leaf-rebuild
+/// pattern applies verbatim: the implicit `DELETE FROM` of `DROP TABLE` only
+/// deletes CHILD rows of write_rules (ON DELETE CASCADE restricts nothing),
+/// and renaming `write_rule_conditions_new` rewrites no other table's schema
+/// while keeping its own REFERENCES write_rules(id) clause intact.
+async fn upgrade_write_rule_conditions_for_string(pool: &SqlitePool) -> Result<(), BantoError> {
+    let mut tx = pool.begin().await.map_err(banto_storage::storage_error)?;
+
+    for sql in [
+        "CREATE TABLE write_rule_conditions_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            write_rule_id INTEGER NOT NULL REFERENCES write_rules(id) ON DELETE CASCADE,
+            source_tag_id INTEGER NOT NULL,
+            operator TEXT NOT NULL CHECK (
+                operator IN ('eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'between', 'bit_is')
+            ),
+            threshold_value REAL,
+            threshold_value_2 REAL,
+            threshold_text TEXT
+        )",
+        "INSERT INTO write_rule_conditions_new (
+            id, write_rule_id, source_tag_id, operator, threshold_value, threshold_value_2
+        )
+        SELECT
+            id, write_rule_id, source_tag_id, operator, threshold_value, threshold_value_2
+        FROM write_rule_conditions",
+        "DROP TABLE write_rule_conditions",
+        "ALTER TABLE write_rule_conditions_new RENAME TO write_rule_conditions",
+        "CREATE INDEX idx_write_rule_conditions_write_rule_id \
+         ON write_rule_conditions (write_rule_id)",
+    ] {
+        sqlx::query(sql)
+            .execute(&mut *tx)
+            .await
+            .map_err(banto_storage::storage_error)?;
+    }
+
+    tx.commit().await.map_err(banto_storage::storage_error)
 }
 
 /// Days-since-epoch (1970-01-01) -> `YYYY-MM-DD`, using Howard Hinnant's
@@ -436,5 +647,156 @@ mod tests {
         let pool = banto_storage::connect_sqlite_memory().await.unwrap();
         run_migrations(&pool).await.unwrap();
         run_migrations(&pool).await.unwrap(); // second run: must not error
+    }
+
+    /// Hand-build the PRE-S2 shape of the three write_* tables (byte-for-byte
+    /// the DDL this module carried before the 0011-0013 upgrades) and
+    /// populate them with a referencing chain
+    /// (target ← rule ← condition), so the upgrade test below runs against
+    /// the exact schema a production pre-S2 database has - foreign keys
+    /// enforced, RESTRICT in place.
+    async fn seed_pre_s2_write_tables(pool: &SqlitePool) {
+        for sql in [
+            "CREATE TABLE write_targets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                plc_connection_id INTEGER NOT NULL,
+                address TEXT NOT NULL,
+                data_type TEXT NOT NULL CHECK (data_type IN ('bit', 'i16', 'u16', 'i32', 'u32', 'f32')),
+                raw_lo REAL,
+                raw_hi REAL,
+                eng_lo REAL,
+                eng_hi REAL,
+                unit TEXT,
+                decimals INTEGER NOT NULL DEFAULT 0 CHECK (decimals BETWEEN 0 AND 6),
+                enabled INTEGER NOT NULL DEFAULT 1
+            )",
+            "CREATE INDEX idx_write_targets_plc_connection_id \
+             ON write_targets (plc_connection_id)",
+            "CREATE TABLE write_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                edge_mode TEXT NOT NULL CHECK (edge_mode IN ('rising', 'falling', 'change')),
+                cooldown_ms INTEGER,
+                write_target_id INTEGER NOT NULL REFERENCES write_targets(id) ON DELETE RESTRICT,
+                write_value_mode TEXT NOT NULL CHECK (write_value_mode IN ('constant', 'copy_from_source')),
+                write_constant_value REAL,
+                write_source_tag_id INTEGER
+            )",
+            "CREATE INDEX idx_write_rules_write_target_id ON write_rules (write_target_id)",
+            "CREATE TABLE write_rule_conditions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                write_rule_id INTEGER NOT NULL REFERENCES write_rules(id) ON DELETE CASCADE,
+                source_tag_id INTEGER NOT NULL,
+                operator TEXT NOT NULL CHECK (
+                    operator IN ('eq', 'neq', 'gt', 'gte', 'lt', 'lte', 'between', 'bit_is')
+                ),
+                threshold_value REAL NOT NULL,
+                threshold_value_2 REAL
+            )",
+            "CREATE INDEX idx_write_rule_conditions_write_rule_id \
+             ON write_rule_conditions (write_rule_id)",
+            "INSERT INTO write_targets (id, name, plc_connection_id, address, data_type, decimals, enabled) \
+             VALUES (7, 'WT7', 1, 'D200', 'u16', 2, 1)",
+            "INSERT INTO write_rules (id, name, enabled, edge_mode, write_target_id, \
+                write_value_mode, write_constant_value) \
+             VALUES (3, 'R3', 1, 'rising', 7, 'constant', 42.5)",
+            "INSERT INTO write_rule_conditions (id, write_rule_id, source_tag_id, operator, threshold_value) \
+             VALUES (9, 3, 11, 'gt', 100.0)",
+        ] {
+            sqlx::query(sql).execute(pool).await.unwrap();
+        }
+    }
+
+    /// The S2 upgrade path against a POPULATED pre-S2 database: the
+    /// write_targets rebuild (park-and-restore across the RESTRICT foreign
+    /// key), the write_rule_conditions leaf rebuild, and the write_rules
+    /// ADD COLUMN must all apply without losing a row, the widened CHECK
+    /// must accept 'string' afterward, no foreign key may be left dangling,
+    /// and a second run must be a no-op.
+    #[tokio::test]
+    async fn s2_upgrade_preserves_rows_and_foreign_keys_on_a_populated_pre_s2_db() {
+        let pool = banto_storage::connect_sqlite_memory().await.unwrap();
+        seed_pre_s2_write_tables(&pool).await;
+
+        run_migrations(&pool).await.expect("upgrade should apply");
+
+        // New columns exist.
+        for (table, column) in [
+            ("write_targets", "string_length"),
+            ("write_rule_conditions", "threshold_text"),
+            ("write_rules", "write_constant_text"),
+        ] {
+            let count: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{column}'"
+            ))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(count, 1, "expected {table}.{column} to exist");
+        }
+
+        // Every row survived, ids and values intact.
+        let target: (i64, String, String, Option<i64>, i64) = sqlx::query_as(
+            "SELECT id, name, data_type, string_length, decimals FROM write_targets",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(target, (7, "WT7".into(), "u16".into(), None, 2));
+        let rule: (i64, String, i64, Option<f64>, Option<String>) = sqlx::query_as(
+            "SELECT id, name, write_target_id, write_constant_value, write_constant_text \
+             FROM write_rules",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rule, (3, "R3".into(), 7, Some(42.5), None));
+        let condition: (i64, i64, String, Option<f64>, Option<String>) = sqlx::query_as(
+            "SELECT id, write_rule_id, operator, threshold_value, threshold_text \
+             FROM write_rule_conditions",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(condition, (9, 3, "gt".into(), Some(100.0), None));
+
+        // The widened CHECK accepts a string write target now.
+        sqlx::query(
+            "INSERT INTO write_targets (name, plc_connection_id, address, data_type, string_length) \
+             VALUES ('WTS', 1, 'D300', 'string', 4)",
+        )
+        .execute(&pool)
+        .await
+        .expect("'string' must pass the rebuilt CHECK");
+        // ...and a string condition can carry text with NULL numeric fields.
+        sqlx::query(
+            "INSERT INTO write_rule_conditions (write_rule_id, source_tag_id, operator, threshold_text) \
+             VALUES (3, 12, 'eq', 'OK')",
+        )
+        .execute(&pool)
+        .await
+        .expect("nullable threshold_value + threshold_text must be accepted");
+
+        // No dangling foreign keys after the park-and-restore dance.
+        let violations: Vec<(String, i64)> =
+            sqlx::query_as("SELECT \"table\", rowid FROM pragma_foreign_key_check")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(violations.is_empty(), "foreign_key_check: {violations:?}");
+
+        // The RESTRICT relation still works against the rebuilt table.
+        let delete = sqlx::query("DELETE FROM write_targets WHERE id = 7")
+            .execute(&pool)
+            .await;
+        assert!(
+            delete.is_err(),
+            "deleting a target still referenced by a rule must trip RESTRICT"
+        );
+
+        // Second run: all three upgrades detect their columns and no-op.
+        run_migrations(&pool).await.expect("re-run must be a no-op");
     }
 }

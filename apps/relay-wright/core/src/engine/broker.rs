@@ -91,9 +91,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use banto_plc::{
-    execute_slmp_reads, plan_slmp_requests, PlcError, ReadRequest, ReadResult, SlmpConfig,
+    execute_slmp_batch_reads, plan_slmp_batch, BatchReadRequest, BatchReadResult, PlcError,
+    SlmpConfig,
 };
-use banto_plc_write::{execute_slmp_writes, plan_slmp_writes, WriteRequest, WriteResult};
+use banto_plc_write::{execute_slmp_writes, plan_slmp_write_batch, BatchWriteRequest, WriteResult};
 use banto_tags::PlcConnection;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -192,11 +193,11 @@ pub enum BrokerError {
 /// a [`ReadOnlyHandle`] can never construct a `Write` job.
 enum Job {
     Read {
-        requests: Vec<ReadRequest>,
-        respond_to: oneshot::Sender<Result<Vec<ReadResult>, BrokerError>>,
+        requests: Vec<BatchReadRequest>,
+        respond_to: oneshot::Sender<Result<Vec<BatchReadResult>, BrokerError>>,
     },
     Write {
-        requests: Vec<WriteRequest>,
+        requests: Vec<BatchWriteRequest>,
         respond_to: oneshot::Sender<Result<Vec<WriteResult>, BrokerError>>,
     },
 }
@@ -214,10 +215,14 @@ pub struct BrokerHandle {
 }
 
 impl BrokerHandle {
-    /// Submit a read batch and await its result. Fails fast with
-    /// [`BrokerError::Disconnected`] if the session is down - see the module
-    /// doc's queued-request-while-down policy.
-    pub async fn read(&self, requests: Vec<ReadRequest>) -> Result<Vec<ReadResult>, BrokerError> {
+    /// Submit a (possibly mixed numeric + string, S2 文字列タグ) read batch
+    /// and await its result. Fails fast with [`BrokerError::Disconnected`] if
+    /// the session is down - see the module doc's queued-request-while-down
+    /// policy.
+    pub async fn read(
+        &self,
+        requests: Vec<BatchReadRequest>,
+    ) -> Result<Vec<BatchReadResult>, BrokerError> {
         let (respond_to, rx) = oneshot::channel();
         self.tx
             .send(Job::Read {
@@ -233,11 +238,11 @@ impl BrokerHandle {
         })?
     }
 
-    /// Submit a write batch and await its result. Same fail-fast-when-down
-    /// policy as [`Self::read`].
+    /// Submit a (possibly mixed numeric + string) write batch and await its
+    /// result. Same fail-fast-when-down policy as [`Self::read`].
     pub async fn write(
         &self,
-        requests: Vec<WriteRequest>,
+        requests: Vec<BatchWriteRequest>,
     ) -> Result<Vec<WriteResult>, BrokerError> {
         let (respond_to, rx) = oneshot::channel();
         self.tx
@@ -272,7 +277,10 @@ pub struct ReadOnlyHandle {
 
 impl ReadOnlyHandle {
     /// Identical to [`BrokerHandle::read`].
-    pub async fn read(&self, requests: Vec<ReadRequest>) -> Result<Vec<ReadResult>, BrokerError> {
+    pub async fn read(
+        &self,
+        requests: Vec<BatchReadRequest>,
+    ) -> Result<Vec<BatchReadResult>, BrokerError> {
         self.inner.read(requests).await
     }
 }
@@ -558,10 +566,10 @@ async fn run_broker_task(
                         // `state`) mirrors banto-collect's task.rs: it keeps
                         // the borrow of `state` from ending mid-await from
                         // ever overlapping with the reassignment below.
-                        let outcome: Option<Result<Vec<ReadResult>, PlcError>> = match &mut state {
+                        let outcome: Option<Result<Vec<BatchReadResult>, PlcError>> = match &mut state {
                             ConnState::Connected(client) => {
-                                let plan = plan_slmp_requests(&requests);
-                                Some(execute_slmp_reads(client, &plan, requests.len(), word_order).await)
+                                let plan = plan_slmp_batch(&requests);
+                                Some(execute_slmp_batch_reads(client, &plan, requests.len(), word_order).await)
                             }
                             _ => None,
                         };
@@ -586,7 +594,7 @@ async fn run_broker_task(
                         let outcome: Option<Result<Vec<WriteResult>, banto_plc_write::PlcWriteError>> =
                             match &mut state {
                                 ConnState::Connected(client) => {
-                                    let plan = plan_slmp_writes(&requests, word_order);
+                                    let plan = plan_slmp_write_batch(&requests, word_order);
                                     Some(execute_slmp_writes(client, &plan, requests.len()).await)
                                 }
                                 _ => None,
@@ -622,8 +630,9 @@ async fn run_broker_task(
 mod tests {
     use std::time::Duration;
 
-    use banto_plc::{Address, DataType, TagValue};
+    use banto_plc::{Address, DataType, PlcValue, ReadRequest, StringReadRequest, TagValue};
     use banto_plc_write::slmp::simulator::Simulator;
+    use banto_plc_write::{StringWriteRequest, WriteRequest};
     use futures_util::future::join_all;
 
     use super::*;
@@ -653,19 +662,37 @@ mod tests {
         }
     }
 
-    fn rreq(raw: &str, data_type: DataType) -> ReadRequest {
-        ReadRequest {
+    /// A numeric read request wrapped as the `Numeric` case of the mixed batch
+    /// the broker now speaks (S2 文字列タグ).
+    fn rreq(raw: &str, data_type: DataType) -> BatchReadRequest {
+        BatchReadRequest::Numeric(ReadRequest {
             address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw}: {e}")),
             data_type,
-        }
+        })
     }
 
-    fn wreq(raw: &str, data_type: DataType, value: TagValue) -> WriteRequest {
-        WriteRequest {
+    /// A string read request, the `String` case of the mixed batch.
+    fn sreq(raw: &str, words: u16) -> BatchReadRequest {
+        BatchReadRequest::String(StringReadRequest {
+            address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw}: {e}")),
+            words,
+        })
+    }
+
+    fn wreq(raw: &str, data_type: DataType, value: TagValue) -> BatchWriteRequest {
+        BatchWriteRequest::Numeric(WriteRequest {
             address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw}: {e}")),
             data_type,
             value,
-        }
+        })
+    }
+
+    fn swreq(raw: &str, words: u16, value: &str) -> BatchWriteRequest {
+        BatchWriteRequest::String(StringWriteRequest {
+            address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw}: {e}")),
+            words,
+            value: value.to_string(),
+        })
     }
 
     /// Poll `handle.read` until the session comes up (real time - connecting
@@ -674,8 +701,8 @@ mod tests {
     /// starts in the background the instant a broker is spawned.
     async fn read_once_connected(
         handle: &BrokerHandle,
-        requests: Vec<ReadRequest>,
-    ) -> Vec<ReadResult> {
+        requests: Vec<BatchReadRequest>,
+    ) -> Vec<BatchReadResult> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             match handle.read(requests.clone()).await {
@@ -766,7 +793,7 @@ mod tests {
         let handle = supervisor.handle(1).expect("handle");
 
         let results = read_once_connected(&handle, vec![rreq("D100", DataType::U16)]).await;
-        assert_eq!(results, vec![ReadResult::Value(TagValue::F64(4321.0))]);
+        assert_eq!(results, vec![BatchReadResult::Value(PlcValue::F64(4321.0))]);
 
         supervisor.shutdown().await;
     }
@@ -800,7 +827,42 @@ mod tests {
             .read(vec![rreq("D200", DataType::U16)])
             .await
             .expect("read should succeed");
-        assert_eq!(read_results, vec![ReadResult::Value(TagValue::F64(777.0))]);
+        assert_eq!(
+            read_results,
+            vec![BatchReadResult::Value(PlcValue::F64(777.0))]
+        );
+
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn string_write_then_read_round_trips_over_the_single_session() {
+        // S2 文字列タグ: a mixed-batch string write lands in the simulator and
+        // reads back as the same text (NUL-trimmed), proving the broker speaks
+        // the string path end to end.
+        let sim = Simulator::start().await;
+        let connections = [conn(1, "slmp", "127.0.0.1", sim.addr.port())];
+        let supervisor =
+            BrokerSupervisor::spawn(&connections, BackoffConfig::default()).expect("spawn");
+        let handle = supervisor.handle(1).expect("handle");
+
+        // Wait for the session, then write a 4-word (8-byte) string to D300.
+        let _ = read_once_connected(&handle, vec![sreq("D300", 4)]).await;
+
+        let write_results = handle
+            .write(vec![swreq("D300", 4, "OK")])
+            .await
+            .expect("string write should succeed");
+        assert_eq!(write_results, vec![WriteResult::Ok]);
+
+        let read_results = handle
+            .read(vec![sreq("D300", 4)])
+            .await
+            .expect("string read should succeed");
+        assert_eq!(
+            read_results,
+            vec![BatchReadResult::Value(PlcValue::Str("OK".to_string()))]
+        );
 
         supervisor.shutdown().await;
     }
@@ -854,7 +916,7 @@ mod tests {
             let expected = 1000.0 + i as f64;
             assert_eq!(
                 result,
-                vec![ReadResult::Value(TagValue::F64(expected))],
+                vec![BatchReadResult::Value(PlcValue::F64(expected))],
                 "device D{} should hold this task's own value, not another's",
                 300 + i
             );
@@ -939,7 +1001,7 @@ mod tests {
         sim.stop_hanging();
         sim.set_word(banto_plc::SlmpDevice::D, 400, 55);
         let recovered = read_once_connected(&handle, vec![rreq("D400", DataType::U16)]).await;
-        assert_eq!(recovered, vec![ReadResult::Value(TagValue::F64(55.0))]);
+        assert_eq!(recovered, vec![BatchReadResult::Value(PlcValue::F64(55.0))]);
 
         drop(handle);
         let _ = task.await;

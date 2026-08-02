@@ -29,6 +29,11 @@ use crate::support::{map_write_error, max_length_message, range_message, require
 const MAX_NAME_LEN: usize = 100;
 const MIN_DECIMALS: i64 = 0;
 const MAX_DECIMALS: i64 = 6;
+/// `string_length` bounds in 16-bit words - mirrors banto-tags'
+/// `MIN_STRING_LENGTH`/`MAX_STRING_LENGTH` (crate-private there) and the SQL
+/// CHECK in `0011_write_targets_allow_string.sql`; change together.
+const MIN_STRING_LENGTH: i64 = 1;
+const MAX_STRING_LENGTH: i64 = 128;
 
 fn default_decimals() -> i64 {
     0
@@ -48,6 +53,11 @@ pub struct WriteTarget {
     pub plc_connection_id: i64,
     pub address: String,
     pub data_type: String,
+    /// Consecutive 16-bit word devices a STRING target occupies (SJIS
+    /// capacity = 2 bytes per word). `Some(1..=128)` iff
+    /// `data_type == "string"`, `None` otherwise - the same wire rule as
+    /// `banto_tags::Tag::string_length`.
+    pub string_length: Option<i64>,
     pub raw_lo: Option<f64>,
     pub raw_hi: Option<f64>,
     pub eng_lo: Option<f64>,
@@ -82,6 +92,8 @@ pub struct WriteTargetInput {
     pub plc_connection_id: i64,
     pub address: String,
     pub data_type: String,
+    #[serde(default)]
+    pub string_length: Option<i64>,
     #[serde(default)]
     pub raw_lo: Option<f64>,
     #[serde(default)]
@@ -135,17 +147,18 @@ fn collect_errors(input: &WriteTargetInput) -> (Vec<FieldError>, Normalized) {
         });
     }
 
-    // Reuse banto-tags' canonical *numeric* data-type list so the two never
-    // drift (this app's SQL CHECK in 0005 is the same set). NUMERIC_DATA_TYPES,
-    // not ALLOWED_DATA_TYPES: the tag registry gained "string" in S1, but
-    // write targets stay numeric-only until the S2 engine work - the numeric
-    // subset is exactly the pre-S1 list, so validation behavior is unchanged.
-    if !banto_tags::NUMERIC_DATA_TYPES.contains(&input.data_type.as_str()) {
+    // Reuse banto-tags' canonical data-type list so the two never drift
+    // (this app's SQL CHECK in 0011 is the same set). Back to the FULL
+    // ALLOWED_DATA_TYPES: S1 held write targets at the numeric subset until
+    // the engine could actually write strings; S2 is that engine work, so
+    // "string" is accepted here again, with the same companion-column rules
+    // as `banto_tags::tag::validate_tag_input`.
+    if !banto_tags::ALLOWED_DATA_TYPES.contains(&input.data_type.as_str()) {
         errors.push(FieldError {
             field: "dataType".to_string(),
             message: format!(
                 "対応データ型は {} のいずれかです",
-                banto_tags::NUMERIC_DATA_TYPES.join(", ")
+                banto_tags::ALLOWED_DATA_TYPES.join(", ")
             ),
         });
     }
@@ -157,14 +170,54 @@ fn collect_errors(input: &WriteTargetInput) -> (Vec<FieldError>, Normalized) {
         });
     }
 
-    if let Err(BantoError::Validation { field_errors }) = banto_tags::Scaling::from_parts(
-        input.raw_lo,
-        input.raw_hi,
-        input.eng_lo,
-        input.eng_hi,
-        "scaling",
-    ) {
-        errors.extend(field_errors);
+    // S2 string targets: `string_length` is mandatory (1..=128 words) for
+    // data_type "string" and forbidden otherwise, and a string target has no
+    // scaling story (a raw/eng mapping over SJIS text is meaningless) - the
+    // same rules, messages, and skip-the-numeric-checks shape as
+    // `banto_tags::tag::validate_tag_input`.
+    let is_string = input.data_type == banto_tags::STRING_DATA_TYPE;
+    if is_string {
+        match input.string_length {
+            None => errors.push(FieldError {
+                field: "stringLength".to_string(),
+                message: required_message(),
+            }),
+            Some(len) if !(MIN_STRING_LENGTH..=MAX_STRING_LENGTH).contains(&len) => {
+                errors.push(FieldError {
+                    field: "stringLength".to_string(),
+                    message: range_message(MIN_STRING_LENGTH, MAX_STRING_LENGTH),
+                })
+            }
+            Some(_) => {}
+        }
+
+        if input.raw_lo.is_some()
+            || input.raw_hi.is_some()
+            || input.eng_lo.is_some()
+            || input.eng_hi.is_some()
+        {
+            errors.push(FieldError {
+                field: "scaling".to_string(),
+                message: "string 型ではスケーリングを設定できません".to_string(),
+            });
+        }
+    } else if input.string_length.is_some() {
+        errors.push(FieldError {
+            field: "stringLength".to_string(),
+            message: "string 型でのみ設定できます".to_string(),
+        });
+    }
+
+    if !is_string {
+        if let Err(BantoError::Validation { field_errors }) = banto_tags::Scaling::from_parts(
+            input.raw_lo,
+            input.raw_hi,
+            input.eng_lo,
+            input.eng_hi,
+            "scaling",
+        ) {
+            errors.extend(field_errors);
+        }
     }
 
     let unit = input
@@ -191,6 +244,7 @@ fn column_map() -> ColumnMap {
         .column("plcConnectionId", "plc_connection_id")
         .column("address", "address")
         .column("dataType", "data_type")
+        .column("stringLength", "string_length")
         .column("rawLo", "raw_lo")
         .column("rawHi", "raw_hi")
         .column("engLo", "eng_lo")
@@ -201,7 +255,7 @@ fn column_map() -> ColumnMap {
 }
 
 const RESOURCE: &str = "write_targets";
-const COLUMNS: &str = "id, name, plc_connection_id, address, data_type, \
+const COLUMNS: &str = "id, name, plc_connection_id, address, data_type, string_length, \
      raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, enabled";
 const PLC_FK_MESSAGE: &str = "指定されたPLC接続が見つかりません";
 
@@ -285,14 +339,15 @@ impl WriteTargetService {
 
         sqlx::query_as::<_, WriteTarget>(&format!(
             "INSERT INTO write_targets (\
-                name, plc_connection_id, address, data_type, \
+                name, plc_connection_id, address, data_type, string_length, \
                 raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, enabled\
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
         ))
         .bind(&normalized.name)
         .bind(input.plc_connection_id)
         .bind(&normalized.address)
         .bind(&input.data_type)
+        .bind(input.string_length)
         .bind(input.raw_lo)
         .bind(input.raw_hi)
         .bind(input.eng_lo)
@@ -325,7 +380,7 @@ impl WriteTargetService {
 
         sqlx::query_as::<_, WriteTarget>(&format!(
             "UPDATE write_targets SET \
-                name = ?, plc_connection_id = ?, address = ?, data_type = ?, \
+                name = ?, plc_connection_id = ?, address = ?, data_type = ?, string_length = ?, \
                 raw_lo = ?, raw_hi = ?, eng_lo = ?, eng_hi = ?, unit = ?, decimals = ?, enabled = ? \
              WHERE id = ? RETURNING {COLUMNS}"
         ))
@@ -333,6 +388,7 @@ impl WriteTargetService {
         .bind(input.plc_connection_id)
         .bind(&normalized.address)
         .bind(&input.data_type)
+        .bind(input.string_length)
         .bind(input.raw_lo)
         .bind(input.raw_hi)
         .bind(input.eng_lo)
@@ -424,6 +480,7 @@ mod tests {
             plc_connection_id,
             address: "D100".to_string(),
             data_type: "i16".to_string(),
+            string_length: None,
             raw_lo: None,
             raw_hi: None,
             eng_lo: None,
@@ -561,12 +618,99 @@ mod tests {
     #[tokio::test]
     async fn create_accepts_every_allowed_data_type() {
         let (svc, plc) = setup().await;
-        for (i, dt) in banto_tags::NUMERIC_DATA_TYPES.iter().enumerate() {
+        for (i, dt) in banto_tags::ALLOWED_DATA_TYPES.iter().enumerate() {
             let mut input = sample(&format!("T{i}"), plc);
             input.data_type = dt.to_string();
+            // "string" carries its mandatory companion length (S2).
+            input.string_length = (*dt == banto_tags::STRING_DATA_TYPE).then_some(8);
             svc.create(input)
                 .await
                 .unwrap_or_else(|e| panic!("data_type {dt} should be accepted: {e:?}"));
+        }
+    }
+
+    // --- S2 string targets --------------------------------------------------
+
+    fn string_input(name: &str, plc: i64, string_length: Option<i64>) -> WriteTargetInput {
+        let mut input = sample(name, plc);
+        input.data_type = banto_tags::STRING_DATA_TYPE.to_string();
+        input.string_length = string_length;
+        input
+    }
+
+    #[tokio::test]
+    async fn create_accepts_a_string_target_and_round_trips_string_length() {
+        let (svc, plc) = setup().await;
+        let created = svc
+            .create(string_input("WS", plc, Some(16)))
+            .await
+            .expect("string target");
+        assert_eq!(created.data_type, "string");
+        assert_eq!(created.string_length, Some(16));
+        assert_eq!(svc.get(created.id).await.unwrap(), created);
+    }
+
+    #[tokio::test]
+    async fn create_accepts_string_length_boundaries() {
+        let (svc, plc) = setup().await;
+        for (i, len) in [MIN_STRING_LENGTH, MAX_STRING_LENGTH]
+            .into_iter()
+            .enumerate()
+        {
+            svc.create(string_input(&format!("WS{i}"), plc, Some(len)))
+                .await
+                .unwrap_or_else(|e| panic!("string_length {len} should be accepted: {e:?}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_string_without_length_and_out_of_range_length() {
+        let (svc, plc) = setup().await;
+        for (i, len) in [None, Some(0), Some(129)].into_iter().enumerate() {
+            match svc
+                .create(string_input(&format!("WS{i}"), plc, len))
+                .await
+                .unwrap_err()
+            {
+                BantoError::Validation { field_errors } => {
+                    assert_eq!(field_errors[0].field, "stringLength", "case {len:?}")
+                }
+                other => panic!("expected Validation for {len:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_scaling_on_a_string_target() {
+        let (svc, plc) = setup().await;
+        let mut input = string_input("WS", plc, Some(8));
+        input.raw_lo = Some(0.0);
+        input.raw_hi = Some(100.0);
+        input.eng_lo = Some(0.0);
+        input.eng_hi = Some(1.0);
+        match svc.create(input).await.unwrap_err() {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "scaling");
+                assert_eq!(
+                    field_errors[0].message,
+                    "string 型ではスケーリングを設定できません"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_string_length_on_a_numeric_target() {
+        let (svc, plc) = setup().await;
+        let mut input = sample("X", plc);
+        input.string_length = Some(8);
+        match svc.create(input).await.unwrap_err() {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "stringLength");
+                assert_eq!(field_errors[0].message, "string 型でのみ設定できます");
+            }
+            other => panic!("expected Validation, got {other:?}"),
         }
     }
 

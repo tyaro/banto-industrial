@@ -67,6 +67,7 @@ use poller::{run_poller, ResolvedSource};
 use rate_limiter::{RateLimitConfig, RateLimiter};
 use rule_engine::{
     CompiledCondition, CompiledRule, EdgeMode, Operator, PendingWrite, RuleEngine, ValueMode,
+    WireShape,
 };
 use write_audit::{
     insert_row, load_persisted_armed, persist_armed, AuditAction, AuditResult, AuditRow,
@@ -342,7 +343,8 @@ async fn run_engine_loop(
 
 /// One `write_rules` row as loaded by [`compile_rules`]: `(id, name, edge_mode,
 /// cooldown_ms, write_target_id, write_value_mode, write_constant_value,
-/// write_source_tag_id)`.
+/// write_constant_text, write_source_tag_id)`. `write_constant_text` (S2
+/// 文字列タグ) carries a string target's constant.
 type RuleRow = (
     i64,
     String,
@@ -351,8 +353,16 @@ type RuleRow = (
     i64,
     String,
     Option<f64>,
+    Option<String>,
     Option<i64>,
 );
+
+/// One `write_rule_conditions` row as loaded by [`compile_rules`]:
+/// `(source_tag_id, operator, threshold_value, threshold_value_2,
+/// threshold_text)`. `threshold_value` and `threshold_text` are both nullable
+/// since S2 文字列タグ (a numeric condition sets the former, a string condition
+/// the latter).
+type ConditionRow = (i64, String, Option<f64>, Option<f64>, Option<String>);
 
 /// The compiled output of [`compile_rules`].
 struct Compiled {
@@ -374,15 +384,24 @@ async fn compile_rules(pool: &SqlitePool, managed: &HashSet<i64>) -> Result<Comp
 
     let rows: Vec<RuleRow> = sqlx::query_as(
         "SELECT id, name, edge_mode, cooldown_ms, write_target_id, \
-                write_value_mode, write_constant_value, write_source_tag_id \
+                write_value_mode, write_constant_value, write_constant_text, write_source_tag_id \
              FROM write_rules WHERE enabled = 1 ORDER BY id",
     )
     .fetch_all(pool)
     .await
     .map_err(banto_storage::storage_error)?;
 
-    for (id, name, edge_mode, cooldown_ms, write_target_id, value_mode, constant, source_tag) in
-        rows
+    for (
+        id,
+        name,
+        edge_mode,
+        cooldown_ms,
+        write_target_id,
+        value_mode,
+        constant,
+        constant_text,
+        source_tag,
+    ) in rows
     {
         let Some(edge_mode) = EdgeMode::parse(&edge_mode) else {
             eprintln!("relay-wright engine: rule {id} ({name}) has bad edge_mode; skipped");
@@ -397,14 +416,24 @@ async fn compile_rules(pool: &SqlitePool, managed: &HashSet<i64>) -> Result<Comp
             continue;
         };
 
-        // Resolve the value mode.
+        // Resolve the value mode. A constant into a STRING target uses the
+        // text column (S2 文字列タグ); into a numeric target, the numeric one.
         let value_mode = match value_mode.as_str() {
-            "constant" => match constant {
-                Some(v) => ValueMode::Constant(v),
-                None => {
-                    eprintln!("relay-wright engine: rule {id} ({name}) constant mode without value; skipped");
-                    continue;
-                }
+            "constant" => match target.shape {
+                WireShape::Str { .. } => match constant_text {
+                    Some(t) => ValueMode::ConstantText(t),
+                    None => {
+                        eprintln!("relay-wright engine: rule {id} ({name}) string constant mode without text; skipped");
+                        continue;
+                    }
+                },
+                WireShape::Numeric(_) => match constant {
+                    Some(v) => ValueMode::Constant(v),
+                    None => {
+                        eprintln!("relay-wright engine: rule {id} ({name}) constant mode without value; skipped");
+                        continue;
+                    }
+                },
             },
             "copy_from_source" => match source_tag {
                 Some(tag_id) => ValueMode::CopyFromSource(tag_id),
@@ -422,9 +451,12 @@ async fn compile_rules(pool: &SqlitePool, managed: &HashSet<i64>) -> Result<Comp
         };
 
         // Resolve the conditions. Any unresolved source drops the whole rule.
-        let condition_rows: Vec<(i64, String, f64, Option<f64>)> = sqlx::query_as(
-            "SELECT source_tag_id, operator, threshold_value, threshold_value_2 \
-             FROM write_rule_conditions WHERE write_rule_id = ? ORDER BY id",
+        // `threshold_value` is nullable since S2 (a string condition compares
+        // `threshold_text` instead), so the numeric comparand defaults to 0.0
+        // and is simply unused when the runtime value is a string.
+        let condition_rows: Vec<ConditionRow> = sqlx::query_as(
+            "SELECT source_tag_id, operator, threshold_value, threshold_value_2, threshold_text \
+                 FROM write_rule_conditions WHERE write_rule_id = ? ORDER BY id",
         )
         .bind(id)
         .fetch_all(pool)
@@ -434,7 +466,7 @@ async fn compile_rules(pool: &SqlitePool, managed: &HashSet<i64>) -> Result<Comp
         let mut conditions = Vec::with_capacity(condition_rows.len());
         let mut resolved_sources: Vec<ResolvedSource> = Vec::new();
         let mut ok = true;
-        for (source_tag_id, operator, threshold, threshold_2) in condition_rows {
+        for (source_tag_id, operator, threshold, threshold_2, threshold_text) in condition_rows {
             let Some(operator) = Operator::parse(&operator) else {
                 eprintln!("relay-wright engine: rule {id} ({name}) bad operator; skipped");
                 ok = false;
@@ -451,8 +483,9 @@ async fn compile_rules(pool: &SqlitePool, managed: &HashSet<i64>) -> Result<Comp
             conditions.push(CompiledCondition {
                 source_tag_id,
                 operator,
-                threshold,
+                threshold: threshold.unwrap_or(0.0),
                 threshold_2,
+                threshold_text,
             });
         }
         if !ok || conditions.is_empty() {
@@ -489,7 +522,7 @@ async fn compile_rules(pool: &SqlitePool, managed: &HashSet<i64>) -> Result<Comp
                 .filter(|&ms| ms > 0)
                 .map(|ms| Duration::from_millis(ms as u64)),
             write_target_id,
-            target_data_type: target.data_type,
+            target_shape: target.shape,
             value_mode,
             conditions,
         });
@@ -502,6 +535,36 @@ async fn compile_rules(pool: &SqlitePool, managed: &HashSet<i64>) -> Result<Comp
     })
 }
 
+/// Bounds for a string tag's word span - mirrors the service-layer
+/// `MIN_STRING_LENGTH`/`MAX_STRING_LENGTH` and the SQL CHECK; a row outside
+/// this range (impossible for one that passed its own validation) is dropped
+/// rather than trusted.
+const MIN_STRING_LENGTH: i64 = 1;
+const MAX_STRING_LENGTH: i64 = 128;
+
+/// Turn a row's `(data_type, string_length)` into the engine's [`WireShape`],
+/// or `None` if it will not resolve to a wire read/write: an unparseable
+/// numeric type, or a `string` type whose `string_length` is missing or out of
+/// range (1..=128 words). Logs the string-length case since it is the one a
+/// stale/corrupt row could plausibly hit.
+fn wire_shape(data_type: &str, string_length: Option<i64>, what: &str) -> Option<WireShape> {
+    if data_type == banto_tags::STRING_DATA_TYPE {
+        match string_length {
+            Some(len) if (MIN_STRING_LENGTH..=MAX_STRING_LENGTH).contains(&len) => {
+                Some(WireShape::Str { words: len as u16 })
+            }
+            other => {
+                eprintln!(
+                    "relay-wright engine: {what} string tag has invalid string_length {other:?} (need 1..=128); dropped"
+                );
+                None
+            }
+        }
+    } else {
+        banto_plc::DataType::parse(data_type).map(WireShape::Numeric)
+    }
+}
+
 /// Resolve a write target id to its wire coordinates, or `None` if it does not
 /// exist, is on an unmanaged connection, or its address/type will not parse.
 async fn resolve_target(
@@ -509,29 +572,30 @@ async fn resolve_target(
     write_target_id: i64,
     managed: &HashSet<i64>,
 ) -> Result<Option<ResolvedTarget>, BantoError> {
-    let row: Option<(i64, String, String)> = sqlx::query_as(
-        "SELECT plc_connection_id, address, data_type FROM write_targets WHERE id = ?",
+    let row: Option<(i64, String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT plc_connection_id, address, data_type, string_length \
+         FROM write_targets WHERE id = ?",
     )
     .bind(write_target_id)
     .fetch_optional(pool)
     .await
     .map_err(banto_storage::storage_error)?;
-    let Some((connection_id, address, data_type)) = row else {
+    let Some((connection_id, address, data_type, string_length)) = row else {
         return Ok(None);
     };
     if !managed.contains(&connection_id) {
         return Ok(None);
     }
-    let (Ok(address), Some(data_type)) = (
+    let (Ok(address), Some(shape)) = (
         banto_plc::Address::parse_slmp(&address),
-        banto_plc::DataType::parse(&data_type),
+        wire_shape(&data_type, string_length, "write target"),
     ) else {
         return Ok(None);
     };
     Ok(Some(ResolvedTarget {
         connection_id,
         address,
-        data_type,
+        shape,
     }))
 }
 
@@ -542,8 +606,8 @@ async fn resolve_source(
     tag_id: i64,
     managed: &HashSet<i64>,
 ) -> Result<Option<ResolvedSource>, BantoError> {
-    let row: Option<(i64, String, String)> = sqlx::query_as(
-        "SELECT cg.plc_connection_id, t.address, t.data_type \
+    let row: Option<(i64, String, String, Option<i64>)> = sqlx::query_as(
+        "SELECT cg.plc_connection_id, t.address, t.data_type, t.string_length \
          FROM tags t JOIN collection_groups cg ON t.collection_group_id = cg.id \
          WHERE t.id = ?",
     )
@@ -551,15 +615,15 @@ async fn resolve_source(
     .fetch_optional(pool)
     .await
     .map_err(banto_storage::storage_error)?;
-    let Some((connection_id, address, data_type)) = row else {
+    let Some((connection_id, address, data_type, string_length)) = row else {
         return Ok(None);
     };
     if !managed.contains(&connection_id) {
         return Ok(None);
     }
-    let (Ok(address), Some(data_type)) = (
+    let (Ok(address), Some(shape)) = (
         banto_plc::Address::parse_slmp(&address),
-        banto_plc::DataType::parse(&data_type),
+        wire_shape(&data_type, string_length, "source"),
     ) else {
         return Ok(None);
     };
@@ -567,6 +631,6 @@ async fn resolve_source(
         tag_id,
         connection_id,
         address,
-        data_type,
+        shape,
     }))
 }

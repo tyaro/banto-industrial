@@ -178,6 +178,7 @@ impl Fixture {
                 plc_connection_id: self.conn_id,
                 address: address.to_string(),
                 data_type: "u16".to_string(),
+                string_length: None,
                 raw_lo: None,
                 raw_hi: None,
                 eng_lo: None,
@@ -189,6 +190,88 @@ impl Fixture {
             .await
             .unwrap()
             .id
+    }
+
+    /// A STRING source tag (`length` words) at `address`.
+    async fn string_source_tag(&self, name: &str, address: &str, length: i64) -> i64 {
+        self.tags
+            .create(TagInput {
+                name: name.to_string(),
+                collection_group_id: self.group_id,
+                address: address.to_string(),
+                data_type: "string".to_string(),
+                string_length: Some(length),
+                raw_lo: None,
+                raw_hi: None,
+                eng_lo: None,
+                eng_hi: None,
+                unit: None,
+                decimals: 0,
+                threshold_h: None,
+                threshold_hh: None,
+                threshold_l: None,
+                threshold_ll: None,
+                enabled: true,
+            })
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// A STRING write target (`length` words) at `address`.
+    async fn string_target(&self, name: &str, address: &str, length: i64) -> i64 {
+        self.targets
+            .create(WriteTargetInput {
+                name: name.to_string(),
+                plc_connection_id: self.conn_id,
+                address: address.to_string(),
+                data_type: "string".to_string(),
+                string_length: Some(length),
+                raw_lo: None,
+                raw_hi: None,
+                eng_lo: None,
+                eng_hi: None,
+                unit: None,
+                decimals: 0,
+                enabled: true,
+            })
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// A rule: when string `source` `eq threshold_text`, write the string
+    /// constant `constant_text` to a string `target`, on `edge_mode`.
+    async fn string_rule(
+        &self,
+        name: &str,
+        edge_mode: &str,
+        source_tag_id: i64,
+        threshold_text: &str,
+        target_id: i64,
+        constant_text: &str,
+    ) {
+        self.rules
+            .create(WriteRuleInput {
+                name: name.to_string(),
+                enabled: true,
+                edge_mode: edge_mode.to_string(),
+                cooldown_ms: None,
+                write_target_id: target_id,
+                write_value_mode: "constant".to_string(),
+                write_constant_value: None,
+                write_constant_text: Some(constant_text.to_string()),
+                write_source_tag_id: None,
+                conditions: vec![WriteRuleConditionInput {
+                    source_tag_id,
+                    operator: "eq".to_string(),
+                    threshold_value: None,
+                    threshold_value_2: None,
+                    threshold_text: Some(threshold_text.to_string()),
+                }],
+            })
+            .await
+            .expect("create string rule");
     }
 
     /// A rule: when `source` (u16) `> threshold`, write the constant `value` to
@@ -211,12 +294,14 @@ impl Fixture {
                 write_target_id: target_id,
                 write_value_mode: "constant".to_string(),
                 write_constant_value: Some(value),
+                write_constant_text: None,
                 write_source_tag_id: None,
                 conditions: vec![WriteRuleConditionInput {
                     source_tag_id,
                     operator: "gt".to_string(),
-                    threshold_value: threshold,
+                    threshold_value: Some(threshold),
                     threshold_value_2: None,
+                    threshold_text: None,
                 }],
             })
             .await
@@ -558,6 +643,147 @@ async fn shutdown_returns_promptly_while_running() {
     tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
         .await
         .expect("shutdown must not hang even with tasks and a control handle live");
+}
+
+// ---------------------------------------------------------------------------
+// S2 文字列タグ: a string eq rule writes a string constant that lands in the
+// simulator, fires exactly once on the edge, and audits the text; disarmed
+// suppresses the physical write while still auditing the text.
+// ---------------------------------------------------------------------------
+
+/// Pack ASCII `text` into `words` consecutive D-registers at `number`
+/// (low-byte-first per word, NUL-padded) - the wire layout S1's decoder reads
+/// back. ASCII-only keeps the test independent of an SJIS encoder.
+fn seed_string(f: &Fixture, number: u32, words: u32, text: &str) {
+    let bytes = text.as_bytes();
+    for w in 0..words {
+        let lo = bytes.get((w * 2) as usize).copied().unwrap_or(0) as u16;
+        let hi = bytes.get((w * 2 + 1) as usize).copied().unwrap_or(0) as u16;
+        f.sim.set_word(SlmpDevice::D, number + w, (hi << 8) | lo);
+    }
+}
+
+/// The inverse of [`seed_string`]: read `words` registers, low-byte-first, and
+/// trim at the first NUL - what the engine's string write leaves behind.
+fn read_string(f: &Fixture, number: u32, words: u32) -> String {
+    let mut bytes = Vec::new();
+    for w in 0..words {
+        let word = f.sim.get_word(SlmpDevice::D, number + w);
+        bytes.push((word & 0xFF) as u8);
+        bytes.push((word >> 8) as u8);
+    }
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).to_string()
+}
+
+async fn ok_detail(pool: &SqlitePool) -> serde_json::Value {
+    let detail: Option<String> = sqlx::query_scalar(
+        "SELECT detail FROM write_audit_log WHERE action = 'rule_fire' AND result = 'ok' LIMIT 1",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    serde_json::from_str(&detail.expect("string write records a detail JSON")).unwrap()
+}
+
+#[tokio::test]
+async fn string_eq_writes_once_lands_in_sim_and_audits_the_text() {
+    let f = Fixture::new().await;
+    let src = f.string_source_tag("Src", "D100", 4).await;
+    let tgt = f.string_target("Tgt", "D200", 4).await;
+    f.string_rule("SR", "rising", src, "OK", tgt, "NG").await;
+
+    seed_string(&f, 100, 4, "NG"); // start not-matching
+
+    let (engine, control) = Engine::start(f.pool.clone(), connections(&f).await, fast_config())
+        .await
+        .expect("engine start");
+    control.arm(Some("tester")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    // Match the comparand -> rising edge -> the string constant lands.
+    seed_string(&f, 100, 4, "OK");
+    assert!(
+        wait_until(Duration::from_secs(5), || read_string(&f, 200, 4) == "NG").await,
+        "the string rule should have written 'NG' to the target"
+    );
+    assert!(
+        wait_for_count(&f.pool, "rule_fire", "ok", 1, Duration::from_secs(5)).await,
+        "the string write must be audited ok"
+    );
+    // The numeric snapshot column is NULL; the text lives in the detail JSON.
+    let (src_val, tgt_val): (Option<f64>, Option<f64>) = sqlx::query_as(
+        "SELECT source_value_snapshot, target_value_written FROM write_audit_log \
+         WHERE action = 'rule_fire' AND result = 'ok' LIMIT 1",
+    )
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!((src_val, tgt_val), (None, None));
+    let detail = ok_detail(&f.pool).await;
+    assert_eq!(detail["sourceText"], "OK");
+    assert_eq!(detail["writtenText"], "NG");
+
+    // Held true: clear the target and confirm no second write.
+    seed_string(&f, 200, 4, ""); // zero it out
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        read_string(&f, 200, 4),
+        "",
+        "a held-true match must not re-fire"
+    );
+    assert_eq!(count(&f.pool, "rule_fire", "ok").await, 1);
+
+    tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
+        .await
+        .expect("shutdown must not hang");
+}
+
+#[tokio::test]
+async fn string_write_disarmed_is_suppressed_but_audited() {
+    let f = Fixture::new().await;
+    let src = f.string_source_tag("Src", "D100", 4).await;
+    let tgt = f.string_target("Tgt", "D200", 4).await;
+    f.string_rule("SR", "rising", src, "OK", tgt, "NG").await;
+
+    seed_string(&f, 100, 4, "NG");
+    // NOTE: never armed - default disarmed.
+    let (engine, _control) = Engine::start(f.pool.clone(), connections(&f).await, fast_config())
+        .await
+        .expect("engine start");
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    seed_string(&f, 100, 4, "OK");
+    assert!(
+        wait_for_count(
+            &f.pool,
+            "rule_fire",
+            "suppressed_disarmed",
+            1,
+            Duration::from_secs(5)
+        )
+        .await,
+        "a disarmed engine must audit the suppressed string write"
+    );
+    assert_eq!(
+        read_string(&f, 200, 4),
+        "",
+        "a disarmed engine must NOT physically write the string"
+    );
+    // Even suppressed, the audited row carries the string context.
+    let detail: Option<String> = sqlx::query_scalar(
+        "SELECT detail FROM write_audit_log \
+         WHERE action = 'rule_fire' AND result = 'suppressed_disarmed' LIMIT 1",
+    )
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&detail.expect("detail present")).unwrap();
+    assert_eq!(parsed["writtenText"], "NG");
+
+    tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
+        .await
+        .expect("shutdown must not hang");
 }
 
 // --- helpers ---------------------------------------------------------------

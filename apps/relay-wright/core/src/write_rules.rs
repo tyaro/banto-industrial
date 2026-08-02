@@ -35,9 +35,9 @@ use banto_storage::ColumnMap;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
-use crate::support::{map_write_error, max_length_message, required_message};
+use crate::support::{map_write_error, max_length_message, required_message, sjis_text_error};
 use crate::write_rule_conditions::{
-    validate_condition_input, WriteRuleCondition, WriteRuleConditionInput,
+    validate_condition_input, SourceTagKind, WriteRuleCondition, WriteRuleConditionInput,
 };
 
 const MAX_NAME_LEN: usize = 100;
@@ -63,6 +63,10 @@ pub struct WriteRule {
     pub write_target_id: i64,
     pub write_value_mode: String,
     pub write_constant_value: Option<f64>,
+    /// The constant for a STRING write target (S2 文字列タグ) - exactly one
+    /// of `write_constant_value`/`write_constant_text` is set for a
+    /// constant-mode rule, decided by the target's data type.
+    pub write_constant_text: Option<String>,
     pub write_source_tag_id: Option<i64>,
 }
 
@@ -90,6 +94,8 @@ pub struct WriteRuleInput {
     #[serde(default)]
     pub write_constant_value: Option<f64>,
     #[serde(default)]
+    pub write_constant_text: Option<String>,
+    #[serde(default)]
     pub write_source_tag_id: Option<i64>,
     #[serde(default)]
     pub conditions: Vec<WriteRuleConditionInput>,
@@ -99,6 +105,25 @@ pub struct WriteRuleInput {
 /// referencing the same device (whether one reads it and the other writes it)
 /// meet at the same node of the write-loop graph.
 type Device = (i64, String);
+
+/// A write target's or source tag's `(data_type, string_length)` as resolved
+/// at save time (S2 文字列タグ) - the inputs to [`kind_of`].
+type TypeMeta = (String, Option<i64>);
+
+/// Collapse a resolved [`TypeMeta`] to the shape validation cares about. A
+/// string row whose `string_length` is somehow NULL (impossible for a row
+/// that passed its own registry validation - defensive only) gets length 0,
+/// which every non-empty comparand/constant then fails against loudly rather
+/// than silently passing.
+fn kind_of(meta: &TypeMeta) -> SourceTagKind {
+    if meta.0 == banto_tags::STRING_DATA_TYPE {
+        SourceTagKind::Str {
+            length: meta.1.unwrap_or(0),
+        }
+    } else {
+        SourceTagKind::Numeric
+    }
+}
 
 fn column_map() -> ColumnMap {
     ColumnMap::new()
@@ -110,12 +135,13 @@ fn column_map() -> ColumnMap {
         .column("writeTargetId", "write_target_id")
         .column("writeValueMode", "write_value_mode")
         .column("writeConstantValue", "write_constant_value")
+        .column("writeConstantText", "write_constant_text")
         .column("writeSourceTagId", "write_source_tag_id")
 }
 
 const RESOURCE: &str = "write_rules";
 const COLUMNS: &str = "id, name, enabled, edge_mode, cooldown_ms, write_target_id, \
-     write_value_mode, write_constant_value, write_source_tag_id";
+     write_value_mode, write_constant_value, write_constant_text, write_source_tag_id";
 const TARGET_FK_MESSAGE: &str = "指定された書き込み先が見つかりません";
 
 /// Aggregate service for the `write_rules` resource and its condition rows.
@@ -129,24 +155,30 @@ impl WriteRuleService {
         Self { pool }
     }
 
-    // --- existence checks (cross-lineage refs, no SQL FK) -------------------
+    // --- existence/type checks (cross-lineage refs, no SQL FK) --------------
 
-    async fn write_target_exists(&self, id: i64) -> Result<bool, BantoError> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM write_targets WHERE id = ?")
+    /// The write target's `(data_type, string_length)`, or `None` if the row
+    /// does not exist. S2: type resolution replaces the old bare existence
+    /// check because the constant/copy value fields' validity now depends on
+    /// the TARGET's type (see [`Self::collect_errors`]).
+    async fn target_meta(&self, id: i64) -> Result<Option<TypeMeta>, BantoError> {
+        sqlx::query_as("SELECT data_type, string_length FROM write_targets WHERE id = ?")
             .bind(id)
-            .fetch_one(&self.pool)
+            .fetch_optional(&self.pool)
             .await
-            .map_err(banto_storage::storage_error)?;
-        Ok(count > 0)
+            .map_err(banto_storage::storage_error)
     }
 
-    async fn tag_exists(&self, id: i64) -> Result<bool, BantoError> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags WHERE id = ?")
+    /// A source tag's `(data_type, string_length)` from banto-tags' `tags`
+    /// table, or `None` if the row does not exist - resolved at save time
+    /// exactly like [`Self::tag_device`] already resolves addresses for the
+    /// write-cycle check.
+    async fn tag_meta(&self, id: i64) -> Result<Option<TypeMeta>, BantoError> {
+        sqlx::query_as("SELECT data_type, string_length FROM tags WHERE id = ?")
             .bind(id)
-            .fetch_one(&self.pool)
+            .fetch_optional(&self.pool)
             .await
-            .map_err(banto_storage::storage_error)?;
-        Ok(count > 0)
+            .map_err(banto_storage::storage_error)
     }
 
     // --- validation ---------------------------------------------------------
@@ -188,29 +220,115 @@ impl WriteRuleService {
             }
         }
 
-        // Write value mode + its dependent field.
+        // Resolve the target's type first: the constant/copy value fields'
+        // validity depends on it (S2 文字列タグ).
+        let target_meta = self.target_meta(input.write_target_id).await?;
+        if target_meta.is_none() {
+            errors.push(FieldError {
+                field: "writeTargetId".to_string(),
+                message: TARGET_FK_MESSAGE.to_string(),
+            });
+        }
+        let target_kind = target_meta.as_ref().map(kind_of);
+
+        // Write value mode + its dependent fields. The type-dependent checks
+        // run only when the target resolved - an unresolved target already
+        // produced its own error above, and guessing its type would only
+        // stack a confusing second message on the same save.
         match input.write_value_mode.as_str() {
-            "constant" => {
-                if input.write_constant_value.is_none() {
-                    errors.push(FieldError {
-                        field: "writeConstantValue".to_string(),
-                        message: "定数書き込みには書き込む値が必要です".to_string(),
-                    });
+            "constant" => match target_kind {
+                Some(SourceTagKind::Str { length }) => {
+                    // A STRING target's constant lives in write_constant_text
+                    // (validated against the TARGET's byte budget); a numeric
+                    // constant on it is meaningless and rejected, not
+                    // silently dropped.
+                    if input.write_constant_value.is_some() {
+                        errors.push(FieldError {
+                            field: "writeConstantValue".to_string(),
+                            message: "文字列書き込み先には数値定数は設定できません".to_string(),
+                        });
+                    }
+                    match input.write_constant_text.as_deref() {
+                        None | Some("") => errors.push(FieldError {
+                            field: "writeConstantText".to_string(),
+                            message: "定数書き込みには書き込む文字列が必要です".to_string(),
+                        }),
+                        Some(text) => {
+                            if let Some(message) = sjis_text_error(text, length) {
+                                errors.push(FieldError {
+                                    field: "writeConstantText".to_string(),
+                                    message,
+                                });
+                            }
+                        }
+                    }
                 }
-            }
+                Some(SourceTagKind::Numeric) => {
+                    if input.write_constant_text.is_some() {
+                        errors.push(FieldError {
+                            field: "writeConstantText".to_string(),
+                            message: "数値書き込み先には文字列定数は設定できません".to_string(),
+                        });
+                    }
+                    if input.write_constant_value.is_none() {
+                        errors.push(FieldError {
+                            field: "writeConstantValue".to_string(),
+                            message: "定数書き込みには書き込む値が必要です".to_string(),
+                        });
+                    }
+                }
+                None => {}
+            },
             "copy_from_source" => match input.write_source_tag_id {
                 None => errors.push(FieldError {
                     field: "writeSourceTagId".to_string(),
                     message: "ソース値のコピーには参照元タグが必要です".to_string(),
                 }),
-                Some(tag_id) => {
-                    if !self.tag_exists(tag_id).await? {
-                        errors.push(FieldError {
-                            field: "writeSourceTagId".to_string(),
-                            message: "指定された参照元タグが見つかりません".to_string(),
-                        });
+                Some(tag_id) => match self.tag_meta(tag_id).await? {
+                    None => errors.push(FieldError {
+                        field: "writeSourceTagId".to_string(),
+                        message: "指定された参照元タグが見つかりません".to_string(),
+                    }),
+                    Some(source_meta) => {
+                        // S2: string⇔numeric copies cannot be represented on
+                        // the wire; string→string additionally needs the
+                        // target span to hold the source's worst case
+                        // (target length ≥ source length), else a full-length
+                        // source value would fail at write time forever.
+                        match (kind_of(&source_meta), target_kind) {
+                            (
+                                SourceTagKind::Str { length: src_len },
+                                Some(SourceTagKind::Str { length: tgt_len }),
+                            ) => {
+                                if tgt_len < src_len {
+                                    errors.push(FieldError {
+                                        field: "writeSourceTagId".to_string(),
+                                        message: format!(
+                                            "コピー先の文字列長（{tgt_len}語）がコピー元（{src_len}語）より短いため、コピーできません"
+                                        ),
+                                    });
+                                }
+                            }
+                            (SourceTagKind::Str { .. }, Some(SourceTagKind::Numeric)) => {
+                                errors.push(FieldError {
+                                    field: "writeSourceTagId".to_string(),
+                                    message: "文字列タグの値を数値書き込み先へはコピーできません"
+                                        .to_string(),
+                                });
+                            }
+                            (SourceTagKind::Numeric, Some(SourceTagKind::Str { .. })) => {
+                                errors.push(FieldError {
+                                    field: "writeSourceTagId".to_string(),
+                                    message: "数値タグの値を文字列書き込み先へはコピーできません"
+                                        .to_string(),
+                                });
+                            }
+                            // numeric→numeric (any width combo): allowed, as
+                            // before. Unresolved target: covered above.
+                            (SourceTagKind::Numeric, Some(SourceTagKind::Numeric)) | (_, None) => {}
+                        }
                     }
-                }
+                },
             },
             _ => errors.push(FieldError {
                 field: "writeValueMode".to_string(),
@@ -221,14 +339,9 @@ impl WriteRuleService {
             }),
         }
 
-        if !self.write_target_exists(input.write_target_id).await? {
-            errors.push(FieldError {
-                field: "writeTargetId".to_string(),
-                message: TARGET_FK_MESSAGE.to_string(),
-            });
-        }
-
-        // Conditions: at least one, each valid, each source tag existing.
+        // Conditions: at least one, each valid (against its source tag's
+        // resolved type - see write_rule_conditions.rs), each source tag
+        // existing.
         if input.conditions.is_empty() {
             errors.push(FieldError {
                 field: "conditions".to_string(),
@@ -236,13 +349,18 @@ impl WriteRuleService {
             });
         }
         for (i, condition) in input.conditions.iter().enumerate() {
-            errors.extend(validate_condition_input(condition, i));
-            if !self.tag_exists(condition.source_tag_id).await? {
+            let source_meta = self.tag_meta(condition.source_tag_id).await?;
+            if source_meta.is_none() {
                 errors.push(FieldError {
                     field: format!("conditions.{i}.sourceTagId"),
                     message: "指定されたソースタグが見つかりません".to_string(),
                 });
             }
+            errors.extend(validate_condition_input(
+                condition,
+                i,
+                source_meta.as_ref().map(kind_of),
+            ));
         }
 
         Ok(errors)
@@ -449,7 +567,8 @@ impl WriteRuleService {
 
     async fn conditions_for(&self, rule_id: i64) -> Result<Vec<WriteRuleCondition>, BantoError> {
         sqlx::query_as::<_, WriteRuleCondition>(
-            "SELECT id, write_rule_id, source_tag_id, operator, threshold_value, threshold_value_2 \
+            "SELECT id, write_rule_id, source_tag_id, operator, threshold_value, \
+                    threshold_value_2, threshold_text \
              FROM write_rule_conditions WHERE write_rule_id = ? ORDER BY id",
         )
         .bind(rule_id)
@@ -489,8 +608,8 @@ impl WriteRuleService {
         let rule = sqlx::query_as::<_, WriteRule>(&format!(
             "INSERT INTO write_rules (\
                 name, enabled, edge_mode, cooldown_ms, write_target_id, \
-                write_value_mode, write_constant_value, write_source_tag_id\
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
+                write_value_mode, write_constant_value, write_constant_text, write_source_tag_id\
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
         ))
         .bind(input.name.trim())
         .bind(input.enabled)
@@ -499,6 +618,7 @@ impl WriteRuleService {
         .bind(input.write_target_id)
         .bind(&input.write_value_mode)
         .bind(normalized.constant_value)
+        .bind(&normalized.constant_text)
         .bind(normalized.source_tag_id)
         .fetch_one(&mut *tx)
         .await
@@ -534,7 +654,8 @@ impl WriteRuleService {
         let rule = sqlx::query_as::<_, WriteRule>(&format!(
             "UPDATE write_rules SET \
                 name = ?, enabled = ?, edge_mode = ?, cooldown_ms = ?, write_target_id = ?, \
-                write_value_mode = ?, write_constant_value = ?, write_source_tag_id = ? \
+                write_value_mode = ?, write_constant_value = ?, write_constant_text = ?, \
+                write_source_tag_id = ? \
              WHERE id = ? RETURNING {COLUMNS}"
         ))
         .bind(input.name.trim())
@@ -544,6 +665,7 @@ impl WriteRuleService {
         .bind(input.write_target_id)
         .bind(&input.write_value_mode)
         .bind(normalized.constant_value)
+        .bind(&normalized.constant_text)
         .bind(normalized.source_tag_id)
         .bind(id)
         .fetch_one(&mut *tx)
@@ -588,11 +710,14 @@ impl WriteRuleService {
     }
 }
 
-/// Normalized value-mode-dependent fields: only the column that matches the
-/// selected `write_value_mode` is persisted; the other is forced to NULL so a
-/// stale constant/source-tag never lingers after a mode switch.
+/// Normalized value-mode-dependent fields: only the columns that match the
+/// selected `write_value_mode` are persisted; the others are forced to NULL
+/// so a stale constant/source-tag never lingers after a mode switch. (Which
+/// ONE of value/text is set in constant mode is enforced by validation
+/// against the target's type - both cannot survive to here.)
 struct Normalized {
     constant_value: Option<f64>,
+    constant_text: Option<String>,
     source_tag_id: Option<i64>,
 }
 
@@ -600,15 +725,18 @@ fn normalize(input: &WriteRuleInput) -> Normalized {
     match input.write_value_mode.as_str() {
         "constant" => Normalized {
             constant_value: input.write_constant_value,
+            constant_text: input.write_constant_text.clone(),
             source_tag_id: None,
         },
         "copy_from_source" => Normalized {
             constant_value: None,
+            constant_text: None,
             source_tag_id: input.write_source_tag_id,
         },
-        // Unreachable for a validated input; keep both to be safe.
+        // Unreachable for a validated input; keep all to be safe.
         _ => Normalized {
             constant_value: input.write_constant_value,
+            constant_text: input.write_constant_text.clone(),
             source_tag_id: input.write_source_tag_id,
         },
     }
@@ -628,14 +756,16 @@ async fn insert_conditions(
         };
         sqlx::query(
             "INSERT INTO write_rule_conditions \
-                (write_rule_id, source_tag_id, operator, threshold_value, threshold_value_2) \
-             VALUES (?, ?, ?, ?, ?)",
+                (write_rule_id, source_tag_id, operator, threshold_value, threshold_value_2, \
+                 threshold_text) \
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(rule_id)
         .bind(condition.source_tag_id)
         .bind(&condition.operator)
         .bind(condition.threshold_value)
         .bind(upper)
+        .bind(&condition.threshold_text)
         .execute(&mut **tx)
         .await
         .map_err(banto_storage::storage_error)?;
@@ -780,6 +910,55 @@ mod tests {
                     plc_connection_id: self.plc_id,
                     address: address.to_string(),
                     data_type: "i16".to_string(),
+                    string_length: None,
+                    raw_lo: None,
+                    raw_hi: None,
+                    eng_lo: None,
+                    eng_hi: None,
+                    unit: None,
+                    decimals: 0,
+                    enabled: true,
+                })
+                .await
+                .unwrap()
+                .id
+        }
+
+        /// A STRING source tag (`length` words) at `address`.
+        async fn string_tag(&self, name: &str, address: &str, length: i64) -> i64 {
+            self.tags
+                .create(TagInput {
+                    name: name.to_string(),
+                    collection_group_id: self.group_id,
+                    address: address.to_string(),
+                    data_type: "string".to_string(),
+                    string_length: Some(length),
+                    raw_lo: None,
+                    raw_hi: None,
+                    eng_lo: None,
+                    eng_hi: None,
+                    unit: None,
+                    decimals: 0,
+                    threshold_h: None,
+                    threshold_hh: None,
+                    threshold_l: None,
+                    threshold_ll: None,
+                    enabled: true,
+                })
+                .await
+                .unwrap()
+                .id
+        }
+
+        /// A STRING write target (`length` words) at `address`.
+        async fn string_target(&self, name: &str, address: &str, length: i64) -> i64 {
+            self.targets
+                .create(WriteTargetInput {
+                    name: name.to_string(),
+                    plc_connection_id: self.plc_id,
+                    address: address.to_string(),
+                    data_type: "string".to_string(),
+                    string_length: Some(length),
                     raw_lo: None,
                     raw_hi: None,
                     eng_lo: None,
@@ -808,12 +987,44 @@ mod tests {
             write_target_id,
             write_value_mode: "constant".to_string(),
             write_constant_value: Some(1.0),
+            write_constant_text: None,
             write_source_tag_id: None,
             conditions: vec![WriteRuleConditionInput {
                 source_tag_id,
                 operator: "gt".to_string(),
-                threshold_value: 10.0,
+                threshold_value: Some(10.0),
                 threshold_value_2: None,
+                threshold_text: None,
+            }],
+        }
+    }
+
+    /// A rule whose single condition is `string source eq/neq text` and whose
+    /// action writes `constant_text` to a (string) target.
+    fn string_rule_input(
+        name: &str,
+        source_tag_id: i64,
+        operator: &str,
+        threshold_text: &str,
+        write_target_id: i64,
+        constant_text: &str,
+    ) -> WriteRuleInput {
+        WriteRuleInput {
+            name: name.to_string(),
+            enabled: false,
+            edge_mode: "rising".to_string(),
+            cooldown_ms: None,
+            write_target_id,
+            write_value_mode: "constant".to_string(),
+            write_constant_value: None,
+            write_constant_text: Some(constant_text.to_string()),
+            write_source_tag_id: None,
+            conditions: vec![WriteRuleConditionInput {
+                source_tag_id,
+                operator: operator.to_string(),
+                threshold_value: None,
+                threshold_value_2: None,
+                threshold_text: Some(threshold_text.to_string()),
             }],
         }
     }
@@ -858,8 +1069,9 @@ mod tests {
         input.conditions.push(WriteRuleConditionInput {
             source_tag_id: tag_a,
             operator: "between".to_string(),
-            threshold_value: 0.0,
+            threshold_value: Some(0.0),
             threshold_value_2: Some(5.0),
+            threshold_text: None,
         });
         let updated = f
             .rules
@@ -1221,7 +1433,7 @@ mod tests {
             .unwrap();
 
         let mut input = rule_input("R1", true, x_tag, tgt_y);
-        input.conditions[0].threshold_value = 99.0;
+        input.conditions[0].threshold_value = Some(99.0);
         f.rules
             .update(created.rule.id, input)
             .await
@@ -1283,8 +1495,9 @@ mod tests {
         input.conditions.push(WriteRuleConditionInput {
             source_tag_id: y_tag,
             operator: "gt".to_string(),
-            threshold_value: 10.0,
+            threshold_value: Some(10.0),
             threshold_value_2: None,
+            threshold_text: None,
         });
         match f.rules.create(input).await.unwrap_err() {
             BantoError::Validation { field_errors } => {
@@ -1359,6 +1572,7 @@ mod tests {
                 plc_connection_id: plc2.id,
                 address: "D10".to_string(), // same address, OTHER connection
                 data_type: "i16".to_string(),
+                string_length: None,
                 raw_lo: None,
                 raw_hi: None,
                 eng_lo: None,
@@ -1409,12 +1623,14 @@ mod tests {
             write_target_id: target,
             write_value_mode: "copy_from_source".to_string(),
             write_constant_value: None,
+            write_constant_text: None,
             write_source_tag_id: Some(from_tag),
             conditions: vec![WriteRuleConditionInput {
                 source_tag_id: cond_tag,
                 operator: "gt".to_string(),
-                threshold_value: 10.0,
+                threshold_value: Some(10.0),
                 threshold_value_2: None,
+                threshold_text: None,
             }],
         };
 
@@ -1426,5 +1642,254 @@ mod tests {
             .create(copy_rule("R2", d_tag, b_tag, tgt_a))
             .await
             .expect("R2: on D, copy B -> A (copy-only loop is allowed by design)");
+    }
+
+    // --- S2 string rules ----------------------------------------------------
+
+    /// Extract every violated field name from a Validation error.
+    fn violated_fields(err: BantoError) -> Vec<String> {
+        match err {
+            BantoError::Validation { field_errors } => {
+                field_errors.into_iter().map(|e| e.field).collect()
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn string_rule_round_trips_text_threshold_and_text_constant() {
+        let f = Fixture::new().await;
+        let src = f.string_tag("Sr", "D300", 4).await;
+        let tgt = f.string_target("Sw", "D310", 4).await;
+
+        let created = f
+            .rules
+            .create(string_rule_input("SR", src, "eq", "OK", tgt, "NG"))
+            .await
+            .expect("string rule should save");
+        assert_eq!(created.rule.write_constant_value, None);
+        assert_eq!(created.rule.write_constant_text.as_deref(), Some("NG"));
+        assert_eq!(created.conditions.len(), 1);
+        assert_eq!(created.conditions[0].operator, "eq");
+        assert_eq!(created.conditions[0].threshold_value, None);
+        assert_eq!(created.conditions[0].threshold_text.as_deref(), Some("OK"));
+
+        let fetched = f.rules.get(created.rule.id).await.expect("get");
+        assert_eq!(fetched, created);
+    }
+
+    #[tokio::test]
+    async fn string_condition_rejects_ordering_operators() {
+        let f = Fixture::new().await;
+        let src = f.string_tag("Sr", "D300", 4).await;
+        let tgt = f.string_target("Sw", "D310", 4).await;
+        for op in ["gt", "gte", "lt", "lte", "between", "bit_is"] {
+            let err = f
+                .rules
+                .create(string_rule_input(
+                    &format!("SR-{op}"),
+                    src,
+                    op,
+                    "OK",
+                    tgt,
+                    "NG",
+                ))
+                .await
+                .unwrap_err();
+            assert!(
+                violated_fields(err).contains(&"conditions.0.operator".to_string()),
+                "operator {op} must be rejected on a string source"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn string_condition_requires_text_and_rejects_numeric_threshold() {
+        let f = Fixture::new().await;
+        let src = f.string_tag("Sr", "D300", 4).await;
+        let tgt = f.string_target("Sw", "D310", 4).await;
+
+        // Missing text.
+        let mut input = string_rule_input("SR1", src, "eq", "x", tgt, "NG");
+        input.conditions[0].threshold_text = None;
+        assert!(violated_fields(f.rules.create(input).await.unwrap_err())
+            .contains(&"conditions.0.thresholdText".to_string()));
+
+        // Empty text.
+        let mut input = string_rule_input("SR2", src, "eq", "", tgt, "NG");
+        input.conditions[0].threshold_text = Some(String::new());
+        assert!(violated_fields(f.rules.create(input).await.unwrap_err())
+            .contains(&"conditions.0.thresholdText".to_string()));
+
+        // Numeric threshold on a string source.
+        let mut input = string_rule_input("SR3", src, "eq", "OK", tgt, "NG");
+        input.conditions[0].threshold_value = Some(1.0);
+        assert!(violated_fields(f.rules.create(input).await.unwrap_err())
+            .contains(&"conditions.0.thresholdValue".to_string()));
+    }
+
+    #[tokio::test]
+    async fn string_condition_rejects_overlong_and_unencodable_text() {
+        let f = Fixture::new().await;
+        let src = f.string_tag("Sr", "D300", 2).await; // 2 words = 4 SJIS bytes
+        let tgt = f.string_target("Sw", "D310", 4).await;
+
+        // 5 ASCII bytes into a 4-byte budget.
+        let err = f
+            .rules
+            .create(string_rule_input("SR1", src, "eq", "ABCDE", tgt, "NG"))
+            .await
+            .unwrap_err();
+        assert!(violated_fields(err).contains(&"conditions.0.thresholdText".to_string()));
+
+        // Not representable in Shift-JIS.
+        let err = f
+            .rules
+            .create(string_rule_input("SR2", src, "eq", "😀", tgt, "NG"))
+            .await
+            .unwrap_err();
+        assert!(violated_fields(err).contains(&"conditions.0.thresholdText".to_string()));
+    }
+
+    #[tokio::test]
+    async fn numeric_condition_rejects_text_threshold() {
+        let f = Fixture::new().await;
+        let num = f.tag("Nr", "D10").await;
+        let tgt = f.target("Nw", "D20").await;
+        let mut input = rule_input("R1", false, num, tgt);
+        input.conditions[0].threshold_text = Some("OK".to_string());
+        assert!(violated_fields(f.rules.create(input).await.unwrap_err())
+            .contains(&"conditions.0.thresholdText".to_string()));
+    }
+
+    #[tokio::test]
+    async fn string_target_constant_requires_text_and_rejects_numeric_constant() {
+        let f = Fixture::new().await;
+        let src = f.string_tag("Sr", "D300", 4).await;
+        let tgt = f.string_target("Sw", "D310", 2).await; // 2 words = 4 bytes
+
+        // Numeric constant on a string target.
+        let mut input = string_rule_input("SR1", src, "eq", "OK", tgt, "NG");
+        input.write_constant_value = Some(1.0);
+        assert!(violated_fields(f.rules.create(input).await.unwrap_err())
+            .contains(&"writeConstantValue".to_string()));
+
+        // Missing text constant.
+        let mut input = string_rule_input("SR2", src, "eq", "OK", tgt, "NG");
+        input.write_constant_text = None;
+        assert!(violated_fields(f.rules.create(input).await.unwrap_err())
+            .contains(&"writeConstantText".to_string()));
+
+        // Over-long text constant vs the TARGET's budget (4 bytes).
+        let err = f
+            .rules
+            .create(string_rule_input("SR3", src, "eq", "OK", tgt, "ABCDE"))
+            .await
+            .unwrap_err();
+        assert!(violated_fields(err).contains(&"writeConstantText".to_string()));
+    }
+
+    #[tokio::test]
+    async fn numeric_target_rejects_text_constant() {
+        let f = Fixture::new().await;
+        let num = f.tag("Nr", "D10").await;
+        let tgt = f.target("Nw", "D20").await;
+        let mut input = rule_input("R1", false, num, tgt);
+        input.write_constant_text = Some("NG".to_string());
+        assert!(violated_fields(f.rules.create(input).await.unwrap_err())
+            .contains(&"writeConstantText".to_string()));
+    }
+
+    #[tokio::test]
+    async fn copy_string_to_string_requires_target_at_least_source_length() {
+        let f = Fixture::new().await;
+        let cond = f.tag("Cr", "D40").await;
+        let src4 = f.string_tag("Sr4", "D300", 4).await;
+        let tgt2 = f.string_target("Sw2", "D310", 2).await;
+        let tgt4 = f.string_target("Sw4", "D320", 4).await;
+
+        let copy_rule = |name: &str, from: i64, target: i64| WriteRuleInput {
+            name: name.to_string(),
+            enabled: false,
+            edge_mode: "rising".to_string(),
+            cooldown_ms: None,
+            write_target_id: target,
+            write_value_mode: "copy_from_source".to_string(),
+            write_constant_value: None,
+            write_constant_text: None,
+            write_source_tag_id: Some(from),
+            conditions: vec![WriteRuleConditionInput {
+                source_tag_id: cond,
+                operator: "gt".to_string(),
+                threshold_value: Some(10.0),
+                threshold_value_2: None,
+                threshold_text: None,
+            }],
+        };
+
+        // Target shorter than source: rejected with the length message.
+        match f
+            .rules
+            .create(copy_rule("C1", src4, tgt2))
+            .await
+            .unwrap_err()
+        {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "writeSourceTagId");
+                assert!(
+                    field_errors[0].message.contains("2語"),
+                    "message should name the lengths: {}",
+                    field_errors[0].message
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+
+        // Equal length: allowed.
+        f.rules
+            .create(copy_rule("C2", src4, tgt4))
+            .await
+            .expect("string→string copy with target length ≥ source length");
+    }
+
+    #[tokio::test]
+    async fn copy_between_string_and_numeric_is_rejected_both_ways() {
+        let f = Fixture::new().await;
+        let cond = f.tag("Cr", "D40").await;
+        let num_src = f.tag("Nr", "D10").await;
+        let str_src = f.string_tag("Sr", "D300", 4).await;
+        let num_tgt = f.target("Nw", "D20").await;
+        let str_tgt = f.string_target("Sw", "D310", 4).await;
+
+        let copy_rule = |name: &str, from: i64, target: i64| WriteRuleInput {
+            name: name.to_string(),
+            enabled: false,
+            edge_mode: "rising".to_string(),
+            cooldown_ms: None,
+            write_target_id: target,
+            write_value_mode: "copy_from_source".to_string(),
+            write_constant_value: None,
+            write_constant_text: None,
+            write_source_tag_id: Some(from),
+            conditions: vec![WriteRuleConditionInput {
+                source_tag_id: cond,
+                operator: "gt".to_string(),
+                threshold_value: Some(10.0),
+                threshold_value_2: None,
+                threshold_text: None,
+            }],
+        };
+
+        for (name, from, target) in [("S2N", str_src, num_tgt), ("N2S", num_src, str_tgt)] {
+            let err = f
+                .rules
+                .create(copy_rule(name, from, target))
+                .await
+                .unwrap_err();
+            assert!(
+                violated_fields(err).contains(&"writeSourceTagId".to_string()),
+                "{name}: string⇔numeric copy must be rejected"
+            );
+        }
     }
 }
