@@ -73,6 +73,53 @@ pub(crate) fn decode_register_value(
     Ok(TagValue::F64(value))
 }
 
+/// Decode the MELSEC string at `regs[start..start + words]` into a Rust
+/// `String` (S1 文字列タグ).
+///
+/// Byte order within each word is **low byte first**: a MELSEC string is the
+/// SJIS byte stream laid into consecutive word devices two bytes at a time,
+/// and on the wire each word travels little-endian - the wrapped `slmp` crate
+/// itself builds its string type by taking the wire bytes verbatim
+/// (`TypedData::from` in slmp-0.1.23's `data/mod.rs`:
+/// `DataType::String(n) => PLCString::from_shift_jis_bytes(bytes, n)`, with
+/// `DataType::U16` decoding the *same* stream via `u16::from_le_bytes`). So
+/// word `w` contributes `w.to_le_bytes()` = `[low, high]`, and `"AB"` stored
+/// at `D0` is the single word `0x4241`.
+///
+/// The byte stream is cut at the first NUL (0x00) - MELSEC's terminator
+/// convention, and the same rule the wrapped crate's `PLCString` applies -
+/// which also removes any trailing 0x00 padding of the fixed span. The
+/// remainder is Shift-JIS decoded via `encoding_rs`; bytes that are not valid
+/// SJIS are a per-request decode error (delivered as `Bad` by the executor,
+/// like any other decode failure) rather than silently replaced text - a
+/// mangled recipe string that still "reads fine" is worse than a Bad quality.
+pub(crate) fn decode_string_value(
+    regs: &[u16],
+    start: usize,
+    words: usize,
+) -> Result<String, PlcError> {
+    let window = regs.get(start..start + words).ok_or_else(|| {
+        PlcError::Protocol(format!(
+            "string window out of bounds: start={start} words={words} len={}",
+            regs.len()
+        ))
+    })?;
+
+    let mut bytes = Vec::with_capacity(words * 2);
+    for w in window {
+        bytes.extend_from_slice(&w.to_le_bytes()); // low byte first
+    }
+    let end = bytes.iter().position(|&b| b == 0x00).unwrap_or(bytes.len());
+
+    let (text, _, had_errors) = encoding_rs::SHIFT_JIS.decode(&bytes[..end]);
+    if had_errors {
+        return Err(PlcError::Protocol(format!(
+            "文字列デバイスの内容が Shift-JIS として不正です ({end} バイト)"
+        )));
+    }
+    Ok(text.into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +211,77 @@ mod tests {
     fn decoding_bit_type_here_is_a_protocol_error_not_a_panic() {
         let regs = [0x0001u16];
         let err = decode_register_value(&regs, 0, DataType::Bit, WordOrder::HighLow).unwrap_err();
+        assert!(matches!(err, PlcError::Protocol(_)));
+    }
+
+    // --- decode_string_value (S1 文字列タグ) -------------------------------
+
+    /// The load-bearing byte-order case, exact words spelled out: "AB" =
+    /// SJIS/ASCII [0x41, 0x42], low byte first within the word -> 0x4241
+    /// (NOT 0x4142).
+    #[test]
+    fn decodes_ascii_string_low_byte_first_within_each_word() {
+        let regs = [0x4241u16, 0x4443u16]; // "ABCD"
+        assert_eq!(decode_string_value(&regs, 0, 2).unwrap(), "ABCD");
+    }
+
+    /// Multi-byte SJIS: "テスト" = [0x83, 0x65, 0x83, 0x58, 0x83, 0x67],
+    /// packed low-first into three words.
+    #[test]
+    fn decodes_multibyte_sjis_string() {
+        let regs = [0x6583u16, 0x5883u16, 0x6783u16];
+        assert_eq!(decode_string_value(&regs, 0, 3).unwrap(), "テスト");
+    }
+
+    /// The stream is cut at the *first* NUL: an embedded terminator hides
+    /// everything after it, including non-NUL bytes.
+    #[test]
+    fn trims_at_the_first_nul_terminator() {
+        // "AB" + NUL + "C" -> bytes [0x41, 0x42, 0x00, 0x43].
+        let regs = [0x4241u16, 0x4300u16];
+        assert_eq!(decode_string_value(&regs, 0, 2).unwrap(), "AB");
+    }
+
+    /// Trailing NUL padding of the fixed span never reaches the value.
+    #[test]
+    fn trims_trailing_nul_padding() {
+        let regs = [0x4241u16, 0x0000u16, 0x0000u16]; // "AB" in a 3-word span
+        assert_eq!(decode_string_value(&regs, 0, 3).unwrap(), "AB");
+    }
+
+    /// A span filled to the brim (no terminator anywhere) is legal - the
+    /// whole 2×words bytes are the string.
+    #[test]
+    fn decodes_a_full_span_with_no_terminator() {
+        let regs = [0x4241u16, 0x4443u16]; // "ABCD", exactly 2L bytes
+        assert_eq!(decode_string_value(&regs, 0, 2).unwrap(), "ABCD");
+    }
+
+    #[test]
+    fn respects_a_nonzero_start_offset() {
+        let regs = [0xDEADu16, 0x4241u16]; // window starts at 1
+        assert_eq!(decode_string_value(&regs, 1, 1).unwrap(), "AB");
+    }
+
+    #[test]
+    fn empty_string_decodes_as_empty() {
+        let regs = [0x0000u16];
+        assert_eq!(decode_string_value(&regs, 0, 1).unwrap(), "");
+    }
+
+    /// Invalid SJIS bytes are an error, not silently-substituted text
+    /// (0xFF is not a legal Shift-JIS lead byte).
+    #[test]
+    fn invalid_sjis_bytes_are_a_decode_error_not_replacement_text() {
+        let regs = [0x00FFu16]; // bytes [0xFF, 0x00] -> trimmed to [0xFF]
+        let err = decode_string_value(&regs, 0, 1).unwrap_err();
+        assert!(matches!(err, PlcError::Protocol(_)));
+    }
+
+    #[test]
+    fn out_of_bounds_string_window_is_a_protocol_error_not_a_panic() {
+        let regs = [0x4241u16];
+        let err = decode_string_value(&regs, 0, 2).unwrap_err();
         assert!(matches!(err, PlcError::Protocol(_)));
     }
 }

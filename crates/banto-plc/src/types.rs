@@ -100,6 +100,91 @@ pub enum ReadResult {
     Bad(crate::error::PlcError),
 }
 
+// --- S1 string tags: the mixed (numeric + string) batch vocabulary ---------
+//
+// Why these are *parallel* types rather than a `TagValue::Str` variant and a
+// new `ReadRequest` field: `TagValue`/`ReadRequest`/`WriteRequest` are `Copy`
+// and are matched exhaustively / constructed as full struct literals by
+// existing consumers (relay-wright's engine, banto-collect) whose behavior S1
+// must leave untouched. A `String`-carrying variant would remove `Copy` and
+// break every exhaustive `match` downstream, forcing app-side changes that
+// belong to S2. So strings enter through a superset layer - [`BatchReadRequest`]
+// / [`PlcValue`] / [`BatchReadResult`] - that wraps the existing numeric types
+// unchanged; the numeric-only API keeps its exact shape and the S2 broker can
+// move to the batch API to mix numeric and string reads in one call.
+
+/// One MELSEC string tag to read: where, and how many consecutive 16-bit word
+/// devices it occupies (`banto-tags::Tag::string_length`; SJIS capacity =
+/// 2 bytes per word). Decoding is fixed - Shift-JIS, low byte of each word
+/// first, trimmed at the first NUL - see `decode.rs::decode_string_value`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StringReadRequest {
+    pub address: Address,
+    /// Consecutive word devices to read (1..=480 servable in one SLMP bulk
+    /// read; the registry caps it at 128). Out-of-range values become a
+    /// per-request `Bad`, never a panic.
+    pub words: u16,
+}
+
+/// One entry of a mixed batch: either an ordinary numeric/bit read (the
+/// existing [`ReadRequest`], unchanged) or a string read. This is the
+/// request type the S2 broker passes to `plan_slmp_batch` /
+/// `SlmpClient::read_batch_mixed` so one wire round trip can serve both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BatchReadRequest {
+    Numeric(ReadRequest),
+    String(StringReadRequest),
+}
+
+impl From<ReadRequest> for BatchReadRequest {
+    fn from(request: ReadRequest) -> Self {
+        BatchReadRequest::Numeric(request)
+    }
+}
+
+/// A decoded reading that can also carry a string - the string-capable
+/// superset of [`TagValue`], used by the mixed-batch API only. Not `Copy`
+/// (a `String` cannot be), which is exactly why it is a separate type; see
+/// the module-level note above.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlcValue {
+    Bit(bool),
+    F64(f64),
+    /// Shift-JIS text decoded from the tag's word span, trimmed at the first
+    /// NUL terminator (so trailing 0x00 padding never survives into the
+    /// value).
+    Str(String),
+}
+
+impl From<TagValue> for PlcValue {
+    fn from(value: TagValue) -> Self {
+        match value {
+            TagValue::Bit(b) => PlcValue::Bit(b),
+            TagValue::F64(v) => PlcValue::F64(v),
+        }
+    }
+}
+
+impl PlcValue {
+    /// The numeric/bit projection, `None` for a string - the bridge back to
+    /// the legacy [`TagValue`]-shaped API where a string can never appear.
+    pub fn as_tag_value(&self) -> Option<TagValue> {
+        match self {
+            PlcValue::Bit(b) => Some(TagValue::Bit(*b)),
+            PlcValue::F64(v) => Some(TagValue::F64(*v)),
+            PlcValue::Str(_) => None,
+        }
+    }
+}
+
+/// The outcome for one [`BatchReadRequest`] within a mixed batch - the
+/// string-capable twin of [`ReadResult`], with the identical `Bad` semantics.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BatchReadResult {
+    Value(PlcValue),
+    Bad(crate::error::PlcError),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

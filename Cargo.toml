@@ -54,6 +54,17 @@ tokio = { version = "1" }
 # through the real crate, so a message-format change in a future 0.1.x fails
 # that test loudly instead of silently reclassifying device errors as fatal.
 slmp = "0.1.23"
+# S1 (relay-wright plan, 文字列タグ): Shift-JIS encode/decode for MELSEC string
+# devices - banto-plc's string read decode and banto-plc-write's string write
+# encode. Pinned to the exact version the `slmp` crate above already depends on
+# (0.8.35), so declaring it here adds no new node to Cargo.lock: it was already
+# in the tree transitively. The `slmp` crate's own `PLCString` type is
+# deliberately NOT reused for this - it hard-caps strings at 64 bytes
+# (32 words), while the tag registry allows `string_length` up to 128 words -
+# so banto-plc/-write do their own words<->bytes<->SJIS conversion with this
+# crate directly (byte order verified against `slmp`'s wire handling; see
+# banto-plc/src/decode.rs).
+encoding_rs = "0.8.35"
 axum = { version = "0.8", default-features = true, features = ["json"] }
 tower = "0.5"
 futures-util = "0.3"

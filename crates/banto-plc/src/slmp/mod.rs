@@ -83,12 +83,12 @@ use std::io::ErrorKind;
 use std::time::Duration;
 
 use crate::client::{BoxFuture, PlcClient};
-use crate::decode::{decode_register_value, WordOrder};
+use crate::decode::{decode_register_value, decode_string_value, WordOrder};
 use crate::error::PlcError;
-use crate::types::{ReadRequest, ReadResult, TagValue};
+use crate::types::{BatchReadRequest, BatchReadResult, PlcValue, ReadRequest, ReadResult};
 
 use address::{SlmpAccess, SlmpDevice};
-use planning::{plan_slmp_requests, SlmpPlanOutcome, SlmpPlannedRead};
+use planning::{plan_slmp_batch, plan_slmp_requests, ReadKind, SlmpPlanOutcome, SlmpPlannedRead};
 
 /// MELSEC CPU series, which SLMP frames differ by: Q and L serialize a device
 /// address in 4 bytes and use subcommand `0x0000`/`0x0001`, R uses 6 bytes and
@@ -351,6 +351,38 @@ impl SlmpClient {
             inner: None,
         }
     }
+
+    /// Read a mixed numeric + string batch in one call (S1 文字列タグ) - the
+    /// owned-socket form of [`plan_slmp_batch`] + [`execute_slmp_batch_reads`],
+    /// with exactly [`PlcClient::read_batch`]'s connection semantics: `Err`
+    /// only for connection-fatal failures (which drop the session, so the next
+    /// call is `NotConnected`), per-request `Bad` for everything else. An
+    /// inherent method rather than part of the [`PlcClient`] trait: the trait's
+    /// consumers (banto-collect) are numeric-only by design and must stay
+    /// unable to request a string read.
+    pub async fn read_batch_mixed(
+        &mut self,
+        requests: &[BatchReadRequest],
+    ) -> Result<Vec<BatchReadResult>, PlcError> {
+        if self.inner.is_none() {
+            return Err(PlcError::NotConnected);
+        }
+
+        let outcome = plan_slmp_batch(requests);
+        let word_order = self.config.word_order;
+        let client = self
+            .inner
+            .as_mut()
+            .expect("checked Some above, only cleared on the fatal branch below");
+
+        match execute_slmp_batch_reads(client, &outcome, requests.len(), word_order).await {
+            Ok(results) => Ok(results),
+            Err(err) => {
+                self.inner = None;
+                Err(err)
+            }
+        }
+    }
 }
 
 /// Issue one bulk read for `group` and return its decoded window.
@@ -459,9 +491,50 @@ pub async fn execute_slmp_reads(
     total_requests: usize,
     word_order: WordOrder,
 ) -> Result<Vec<ReadResult>, PlcError> {
-    let mut results: Vec<Option<ReadResult>> = vec![None; total_requests];
+    // Delegate to the string-capable executor and narrow the results back to
+    // the numeric-only shape. A `Str` value cannot occur for an outcome built
+    // by `plan_slmp_requests` (its input type cannot express a string); if a
+    // caller hands this legacy entry point a *batch*-planned outcome anyway,
+    // the string becomes a per-request `Bad` rather than a panic - the value
+    // simply does not fit this function's return type.
+    let results = execute_slmp_batch_reads(client, outcome, total_requests, word_order).await?;
+    Ok(results
+        .into_iter()
+        .map(|r| match r {
+            BatchReadResult::Value(value) => match value.as_tag_value() {
+                Some(v) => ReadResult::Value(v),
+                None => ReadResult::Bad(PlcError::Protocol(
+                    "文字列読み出しは execute_slmp_batch_reads を使ってください".to_string(),
+                )),
+            },
+            BatchReadResult::Bad(e) => ReadResult::Bad(e),
+        })
+        .collect())
+}
+
+/// The string-capable twin of [`execute_slmp_reads`], executing an outcome of
+/// [`plan_slmp_batch`] (numeric and string spans mixed in the same groups) on
+/// a **borrowed** `slmp::SLMPClient` - the entry point the S2 broker uses for
+/// mixed batches. Identical contract: `Err` is connection-fatal only, a
+/// device-side end code becomes a per-request `Bad` for its group, and every
+/// input index is answered exactly once, in original request order.
+///
+/// String spans are fetched exactly like numeric ones - the group is one raw
+/// `u16` window on the wire - and only the scatter step differs: a
+/// [`ReadKind::Str`] span goes through `decode.rs::decode_string_value`
+/// (low-byte-first per word, Shift-JIS, NUL-trimmed) into
+/// [`PlcValue::Str`]. `word_order` applies to 32-bit *numeric* decoding only;
+/// a string's byte order is fixed by MELSEC's storage convention, not
+/// configurable per device family.
+pub async fn execute_slmp_batch_reads(
+    client: &mut slmp::SLMPClient,
+    outcome: &SlmpPlanOutcome,
+    total_requests: usize,
+    word_order: WordOrder,
+) -> Result<Vec<BatchReadResult>, PlcError> {
+    let mut results: Vec<Option<BatchReadResult>> = vec![None; total_requests];
     for (index, reason) in &outcome.immediate_bad {
-        results[*index] = Some(ReadResult::Bad(reason.clone()));
+        results[*index] = Some(BatchReadResult::Bad(reason.clone()));
     }
 
     for group in &outcome.reads {
@@ -469,30 +542,40 @@ pub async fn execute_slmp_reads(
             Ok(values) => {
                 for m in &group.mapping {
                     let value = match &values {
-                        GroupValues::Bits(bits) => TagValue::Bit(bits[m.offset_in_read as usize]),
+                        GroupValues::Bits(bits) => PlcValue::Bit(bits[m.offset_in_read as usize]),
                         GroupValues::Words(words) => {
-                            match decode_register_value(
-                                words,
-                                m.offset_in_read as usize,
-                                m.data_type,
-                                word_order,
-                            ) {
+                            let decoded = match m.kind {
+                                ReadKind::Numeric(data_type) => decode_register_value(
+                                    words,
+                                    m.offset_in_read as usize,
+                                    data_type,
+                                    word_order,
+                                )
+                                .map(PlcValue::from),
+                                ReadKind::Str { words: span } => decode_string_value(
+                                    words,
+                                    m.offset_in_read as usize,
+                                    span as usize,
+                                )
+                                .map(PlcValue::Str),
+                            };
+                            match decoded {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    results[m.request_index] = Some(ReadResult::Bad(e));
+                                    results[m.request_index] = Some(BatchReadResult::Bad(e));
                                     continue;
                                 }
                             }
                         }
                     };
-                    results[m.request_index] = Some(ReadResult::Value(value));
+                    results[m.request_index] = Some(BatchReadResult::Value(value));
                 }
             }
             Err(err) if !err.is_connection_fatal() => {
                 // SLMP end code: the CPU refused this one group but answered in
                 // full, so only these requests are bad.
                 for m in &group.mapping {
-                    results[m.request_index] = Some(ReadResult::Bad(err.clone()));
+                    results[m.request_index] = Some(BatchReadResult::Bad(err.clone()));
                 }
             }
             Err(err) => {
@@ -508,7 +591,7 @@ pub async fn execute_slmp_reads(
         .enumerate()
         .map(|(i, r)| {
             r.unwrap_or_else(|| {
-                panic!("plan_slmp_requests must account for every input index, missing {i}")
+                panic!("plan_slmp_batch must account for every input index, missing {i}")
             })
         })
         .collect())

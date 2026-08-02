@@ -144,6 +144,52 @@ pub(crate) fn encode_bit_value(value: TagValue) -> Result<bool, PlcWriteError> {
     }
 }
 
+/// Encode a string bound for a `words`-word span of a word device (S1
+/// 文字列タグ): Shift-JIS bytes, 0x00-padded to exactly `2 * words` bytes,
+/// packed **low byte first** into each word - the exact inverse of
+/// `banto-plc/src/decode.rs::decode_string_value` (see there for the wire
+/// evidence from the wrapped `slmp` crate), so a write→read round trip is
+/// byte-for-byte. Note [`banto_plc::WordOrder`] plays no part here: it orders
+/// the two words of a 32-bit *numeric* value, whereas a string's byte order
+/// within each word is fixed by MELSEC's storage convention.
+///
+/// Two rejections, both per-request `Bad`s and both about never mangling text
+/// onto a live PLC:
+/// - a character with no Shift-JIS representation
+///   ([`PlcWriteError::ValueOutOfRange`]) rather than encoding_rs's HTML
+///   escape substitution
+/// - encoded bytes longer than the span's `2 * words` capacity
+///   ([`PlcWriteError::ValueOutOfRange`]) rather than silent truncation - a
+///   cut-off recipe string is a real hazard
+pub(crate) fn encode_string_value(value: &str, words: u16) -> Result<Vec<u16>, PlcWriteError> {
+    let (bytes, _, had_errors) = encoding_rs::SHIFT_JIS.encode(value);
+    if had_errors {
+        return Err(PlcWriteError::ValueOutOfRange {
+            data_type: "string".to_string(),
+            value: value.to_string(),
+            detail: "Shift-JIS で表現できない文字を含みます".to_string(),
+        });
+    }
+    let capacity = words as usize * 2;
+    if bytes.len() > capacity {
+        return Err(PlcWriteError::ValueOutOfRange {
+            data_type: "string".to_string(),
+            value: value.to_string(),
+            detail: format!(
+                "Shift-JIS で {} バイトになり、{words} 語（{capacity} バイト）に収まりません",
+                bytes.len()
+            ),
+        });
+    }
+
+    let mut padded = bytes.into_owned();
+    padded.resize(capacity, 0x00);
+    Ok(padded
+        .chunks_exact(2)
+        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,6 +315,79 @@ mod tests {
     fn rejects_a_numeric_value_at_a_bit_device() {
         let err = encode_bit_value(TagValue::F64(1.0)).unwrap_err();
         assert!(matches!(err, PlcWriteError::ValueTypeMismatch { .. }));
+    }
+
+    // --- encode_string_value (S1 文字列タグ) -------------------------------
+
+    /// The load-bearing byte-order case: "AB" = [0x41, 0x42], low byte first
+    /// within the word -> 0x4241 (NOT 0x4142) - the mirror of decode.rs's
+    /// test of the same name.
+    #[test]
+    fn encodes_ascii_low_byte_first_within_each_word() {
+        assert_eq!(
+            encode_string_value("ABCD", 2).unwrap(),
+            vec![0x4241, 0x4443]
+        );
+    }
+
+    #[test]
+    fn pads_the_remainder_of_the_span_with_nul() {
+        // "ABC" = 3 bytes into a 4-word (8-byte) span: [0x41,0x42,0x43,0,0,0,0,0].
+        assert_eq!(
+            encode_string_value("ABC", 4).unwrap(),
+            vec![0x4241, 0x0043, 0x0000, 0x0000]
+        );
+    }
+
+    /// Multi-byte SJIS: "テスト" = [0x83, 0x65, 0x83, 0x58, 0x83, 0x67].
+    #[test]
+    fn encodes_multibyte_sjis() {
+        assert_eq!(
+            encode_string_value("テスト", 4).unwrap(),
+            vec![0x6583, 0x5883, 0x6783, 0x0000]
+        );
+    }
+
+    #[test]
+    fn a_string_of_exactly_the_span_capacity_is_accepted_unpadded() {
+        assert_eq!(encode_string_value("AB", 1).unwrap(), vec![0x4241]);
+    }
+
+    /// One byte over capacity is rejected outright - never truncated.
+    #[test]
+    fn rejects_a_string_longer_than_the_span_without_truncating() {
+        let err = encode_string_value("ABC", 1).unwrap_err();
+        match err {
+            PlcWriteError::ValueOutOfRange {
+                data_type, value, ..
+            } => {
+                assert_eq!(data_type, "string");
+                assert_eq!(value, "ABC");
+            }
+            other => panic!("expected ValueOutOfRange, got {other:?}"),
+        }
+    }
+
+    /// Multi-byte overflow: "テスト" is 6 SJIS bytes, over a 2-word span.
+    #[test]
+    fn rejects_multibyte_overflow() {
+        assert!(matches!(
+            encode_string_value("テスト", 2),
+            Err(PlcWriteError::ValueOutOfRange { .. })
+        ));
+    }
+
+    /// A character outside Shift-JIS is rejected rather than substituted
+    /// (encoding_rs would otherwise emit an HTML numeric escape).
+    #[test]
+    fn rejects_characters_not_representable_in_shift_jis() {
+        let err = encode_string_value("🚀", 8).unwrap_err();
+        assert!(matches!(err, PlcWriteError::ValueOutOfRange { .. }));
+    }
+
+    #[test]
+    fn empty_string_becomes_an_all_nul_span() {
+        assert_eq!(encode_string_value("", 2).unwrap(), vec![0x0000, 0x0000]);
     }
 
     #[test]

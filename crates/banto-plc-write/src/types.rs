@@ -56,3 +56,45 @@ impl WriteResult {
         matches!(self, WriteResult::Ok)
     }
 }
+
+// --- S1 string tags: the mixed (numeric + string) write batch ---------------
+//
+// Same reasoning as `banto_plc::BatchReadRequest` (see banto-plc/src/types.rs):
+// `WriteRequest`/`TagValue` are `Copy` and consumed as-is by relay-wright's
+// engine, so a `String`-carrying value cannot be folded into them without
+// app-side changes that belong to S2. Strings enter through a parallel layer
+// that wraps the numeric type unchanged.
+
+/// One MELSEC string target to write: where, the fixed span in consecutive
+/// 16-bit word devices (`banto-tags::Tag::string_length`), and the text.
+///
+/// The encoded Shift-JIS bytes must fit `2 * words` bytes; anything longer is
+/// a per-request [`crate::error::PlcWriteError::ValueOutOfRange`] and nothing
+/// is written - **never** a silent truncation, because a recipe string cut
+/// mid-way is a real hazard on a live PLC. Shorter strings are padded with
+/// 0x00 to the full span, so a longer previous value can never bleed through
+/// the tail of the window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StringWriteRequest {
+    pub address: Address,
+    /// Consecutive word devices the string occupies (the registry caps this
+    /// at 128; the wire itself at 960 per bulk write). The whole span is
+    /// always written: encoded bytes first, 0x00 padding to the end.
+    pub words: u16,
+    pub value: String,
+}
+
+/// One entry of a mixed write batch: an ordinary numeric/bit write (the
+/// existing [`WriteRequest`], unchanged) or a string write. The request type
+/// for `plan_slmp_write_batch` / `SlmpWriteClient::write_batch_mixed`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BatchWriteRequest {
+    Numeric(WriteRequest),
+    String(StringWriteRequest),
+}
+
+impl From<WriteRequest> for BatchWriteRequest {
+    fn from(request: WriteRequest) -> Self {
+        BatchWriteRequest::Numeric(request)
+    }
+}

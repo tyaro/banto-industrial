@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 
 use super::address::{SlmpAccess, SlmpDevice};
 use crate::error::PlcError;
-use crate::types::{DataType, ReadRequest};
+use crate::types::{BatchReadRequest, DataType, ReadRequest};
 
 /// Gap tolerance, in the device's own element unit (words for word devices,
 /// bits for bit devices). Same rule and same reasoning as
@@ -88,10 +88,22 @@ fn is_compatible(access: SlmpAccess, data_type: DataType) -> bool {
     }
 }
 
-/// Where one original [`ReadRequest`] lands within a [`SlmpPlannedRead`]'s
-/// response window. The SLMP twin of [`crate::planning::MappedRequest`],
-/// differing only in `offset_in_read`'s width (`u32`, to match MELSEC's
-/// address space).
+/// How to interpret one mapped span of a group's response window: a numeric
+/// value of the given [`DataType`], or a Shift-JIS string occupying `words`
+/// consecutive words (S1 文字列タグ). This is what lets one bulk read serve a
+/// mix of numeric and string tags - the span logic is shared, only the
+/// decode-scatter step branches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadKind {
+    Numeric(DataType),
+    Str { words: u16 },
+}
+
+/// Where one original request lands within a [`SlmpPlannedRead`]'s response
+/// window. The SLMP twin of [`crate::planning::MappedRequest`], differing in
+/// `offset_in_read`'s width (`u32`, to match MELSEC's address space) and in
+/// carrying a [`ReadKind`] rather than a bare [`DataType`] so string spans can
+/// be expressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlmpMappedRequest {
     pub request_index: usize,
@@ -99,7 +111,7 @@ pub struct SlmpMappedRequest {
     /// (words for word devices, bits for bit devices). Indexes directly into
     /// the decoded word/bit window returned for this group.
     pub offset_in_read: u32,
-    pub data_type: DataType,
+    pub kind: ReadKind,
 }
 
 /// One physical SLMP bulk read: `slmp/mod.rs` issues exactly one
@@ -146,7 +158,22 @@ impl Building {
     }
 }
 
-/// Plan wire-level bulk reads for `requests`.
+/// Plan wire-level bulk reads for a numeric-only batch - the original I2a
+/// entry point, kept with its exact signature (the W3 broker and
+/// `SlmpClient::read_batch` call it). Since S1 it is a thin wrapper over
+/// [`plan_slmp_batch`]: a [`ReadRequest`] is just the `Numeric` case of a
+/// [`BatchReadRequest`], so the two planners cannot drift.
+pub fn plan_slmp_requests(requests: &[ReadRequest]) -> SlmpPlanOutcome {
+    let batch: Vec<BatchReadRequest> = requests
+        .iter()
+        .map(|&r| BatchReadRequest::Numeric(r))
+        .collect();
+    plan_slmp_batch(&batch)
+}
+
+/// Plan wire-level bulk reads for a mixed numeric + string batch (S1
+/// 文字列タグ) - one read can serve both, which is what lets the S2 broker
+/// batch a rule's numeric sources and string sources in a single round trip.
 ///
 /// Requests that cannot reach the wire at all are resolved into
 /// [`SlmpPlanOutcome::immediate_bad`] rather than attempted and failed:
@@ -154,45 +181,87 @@ impl Building {
 /// - a non-[`crate::address::Address::Slmp`] address
 ///   ([`PlcError::AddressProtocolMismatch`]) - the tag's notation and its
 ///   connection's `protocol` disagree
-/// - a `bit` tag at a word device or vice versa
-///   ([`PlcError::UnsupportedCombination`]) - see [`is_compatible`]
+/// - a `bit` tag at a word device or vice versa, or a *string* tag at a bit
+///   device ([`PlcError::UnsupportedCombination`]) - see [`is_compatible`]
+/// - a string span of zero words or more than one bulk read can carry
+///   ([`PlcError::StringSpanUnsupported`]) - a per-request `Bad`, never a
+///   panic, even though registry-validated tags (1..=128 words) can never
+///   trigger it
 ///
 /// A tag whose *device number* does not exist on the CPU cannot be caught
 /// here (only the CPU knows its own catalogue); that one comes back as a
 /// [`PlcError::SlmpEndCode`] `Bad` for its group at read time.
-pub fn plan_slmp_requests(requests: &[ReadRequest]) -> SlmpPlanOutcome {
+pub fn plan_slmp_batch(requests: &[BatchReadRequest]) -> SlmpPlanOutcome {
     let mut immediate_bad = Vec::new();
 
     // BTreeMap (not HashMap) so devices - and therefore the resulting `reads`
     // order - come out deterministic, keeping tests and any future
     // request-count metrics stable across runs. Same choice, same reason, as
     // the Modbus planner.
-    let mut by_device: BTreeMap<SlmpDevice, Vec<(usize, u32, DataType)>> = BTreeMap::new();
+    let mut by_device: BTreeMap<SlmpDevice, Vec<(usize, u32, ReadKind)>> = BTreeMap::new();
     for (index, req) in requests.iter().enumerate() {
-        let Some((device, number)) = req.address.as_slmp() else {
+        let (address, kind) = match req {
+            BatchReadRequest::Numeric(r) => (r.address, ReadKind::Numeric(r.data_type)),
+            BatchReadRequest::String(s) => (s.address, ReadKind::Str { words: s.words }),
+        };
+        let Some((device, number)) = address.as_slmp() else {
             immediate_bad.push((
                 index,
                 PlcError::AddressProtocolMismatch {
                     expected: "slmp".to_string(),
-                    actual: req.address.notation().to_string(),
+                    actual: address.notation().to_string(),
                 },
             ));
             continue;
         };
-        if is_compatible(device.access(), req.data_type) {
-            by_device
-                .entry(device)
-                .or_default()
-                .push((index, number, req.data_type));
-        } else {
-            immediate_bad.push((
-                index,
-                PlcError::UnsupportedCombination {
-                    area: format!("{device} ({})", device.access()),
-                    data_type: req.data_type.to_string(),
-                },
-            ));
+
+        match kind {
+            ReadKind::Numeric(data_type) => {
+                if !is_compatible(device.access(), data_type) {
+                    immediate_bad.push((
+                        index,
+                        PlcError::UnsupportedCombination {
+                            area: format!("{device} ({})", device.access()),
+                            data_type: data_type.to_string(),
+                        },
+                    ));
+                    continue;
+                }
+            }
+            ReadKind::Str { words } => {
+                // Strings live in word devices only - same v1 rule as every
+                // non-bit numeric type.
+                if device.access() != SlmpAccess::Word {
+                    immediate_bad.push((
+                        index,
+                        PlcError::UnsupportedCombination {
+                            area: format!("{device} ({})", device.access()),
+                            data_type: "string".to_string(),
+                        },
+                    ));
+                    continue;
+                }
+                // A span the wire cannot serve in one bulk read is a
+                // per-request Bad - the group-building loop below must never
+                // see an item wider than max_count, or the cap arithmetic
+                // would produce an oversized read the crate rejects fatally.
+                if words == 0 || words as u32 > MAX_WORDS_PER_READ {
+                    immediate_bad.push((
+                        index,
+                        PlcError::StringSpanUnsupported {
+                            words,
+                            max: MAX_WORDS_PER_READ as u16,
+                        },
+                    ));
+                    continue;
+                }
+            }
         }
+
+        by_device
+            .entry(device)
+            .or_default()
+            .push((index, number, kind));
     }
 
     let mut reads = Vec::new();
@@ -201,16 +270,19 @@ pub fn plan_slmp_requests(requests: &[ReadRequest]) -> SlmpPlanOutcome {
         let max_count = max_count_for(device.access()) as u64;
         let mut current: Option<Building> = None;
 
-        for (index, number, data_type) in items {
+        for (index, number, kind) in items {
             // Bit devices are read one point at a time regardless of the tag's
             // width (a `bit` tag is the only thing that can live there), so the
-            // span is 1; word devices span one or two words per
-            // `DataType::register_span`. `register_span` is reused verbatim
-            // from the Modbus side because "how many 16-bit words does an i32
-            // occupy" has no protocol in it.
+            // span is 1; word devices span 1-2 words per
+            // `DataType::register_span` (reused verbatim from the Modbus side
+            // because "how many 16-bit words does an i32 occupy" has no
+            // protocol in it), or the string's own word count.
             let span = match device.access() {
                 SlmpAccess::Bit => 1u64,
-                SlmpAccess::Word => data_type.register_span() as u64,
+                SlmpAccess::Word => match kind {
+                    ReadKind::Numeric(data_type) => data_type.register_span() as u64,
+                    ReadKind::Str { words } => words as u64,
+                },
             };
             let start = number as u64;
             let end = start + span;
@@ -237,7 +309,7 @@ pub fn plan_slmp_requests(requests: &[ReadRequest]) -> SlmpPlanOutcome {
             group.mapping.push(SlmpMappedRequest {
                 request_index: index,
                 offset_in_read: (start - group.start) as u32,
-                data_type,
+                kind,
             });
         }
 
@@ -558,6 +630,135 @@ mod tests {
             .collect();
         seen.sort();
         assert_eq!(seen, (0..requests.len()).collect::<Vec<_>>());
+    }
+
+    // --- string spans (S1 文字列タグ) --------------------------------------
+
+    use crate::types::{BatchReadRequest, StringReadRequest};
+
+    fn sreq(raw: &str, words: u16) -> BatchReadRequest {
+        BatchReadRequest::String(StringReadRequest {
+            address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw} should parse: {e}")),
+            words,
+        })
+    }
+
+    fn nreq(raw: &str, data_type: DataType) -> BatchReadRequest {
+        BatchReadRequest::Numeric(req(raw, data_type))
+    }
+
+    /// A string occupies its full `words` span in the mapping, and an exactly
+    /// adjacent numeric tag merges into the same read.
+    #[test]
+    fn a_string_spans_its_word_count_and_merges_with_an_adjacent_numeric() {
+        let outcome = plan_slmp_batch(&[sreq("D0", 4), nreq("D4", DataType::U16)]);
+        assert!(outcome.immediate_bad.is_empty());
+        assert_eq!(outcome.reads.len(), 1);
+        let g = &outcome.reads[0];
+        assert_eq!(g.start, 0);
+        assert_eq!(g.count, 5); // D0..D3 (string) + D4 (u16)
+        assert_eq!(g.mapping[0].kind, ReadKind::Str { words: 4 });
+        assert_eq!(g.mapping[0].offset_in_read, 0);
+        assert_eq!(g.mapping[1].kind, ReadKind::Numeric(DataType::U16));
+        assert_eq!(g.mapping[1].offset_in_read, 4);
+    }
+
+    /// A string wider than one bulk read can carry is a per-request Bad, not a
+    /// panic, and its batch-mates still get planned.
+    #[test]
+    fn an_over_cap_string_is_immediately_bad_without_blocking_batch_mates() {
+        let too_long = (MAX_WORDS_PER_READ + 1) as u16;
+        let outcome = plan_slmp_batch(&[sreq("D0", too_long), nreq("D0", DataType::U16)]);
+        assert_eq!(outcome.immediate_bad.len(), 1);
+        assert_eq!(outcome.immediate_bad[0].0, 0);
+        match &outcome.immediate_bad[0].1 {
+            PlcError::StringSpanUnsupported { words, max } => {
+                assert_eq!(*words, too_long);
+                assert_eq!(*max as u32, MAX_WORDS_PER_READ);
+            }
+            other => panic!("expected StringSpanUnsupported, got {other:?}"),
+        }
+        assert_eq!(outcome.reads.len(), 1);
+        assert_eq!(outcome.reads[0].mapping[0].request_index, 1);
+    }
+
+    /// A string of exactly the cap still fits one read.
+    #[test]
+    fn a_string_of_exactly_the_word_cap_is_planned_in_one_read() {
+        let outcome = plan_slmp_batch(&[sreq("D0", MAX_WORDS_PER_READ as u16)]);
+        assert!(outcome.immediate_bad.is_empty());
+        assert_eq!(outcome.reads.len(), 1);
+        assert_eq!(outcome.reads[0].count, MAX_WORDS_PER_READ);
+    }
+
+    #[test]
+    fn a_zero_word_string_is_immediately_bad() {
+        let outcome = plan_slmp_batch(&[sreq("D0", 0)]);
+        assert!(outcome.reads.is_empty());
+        assert_eq!(outcome.immediate_bad.len(), 1);
+        assert!(matches!(
+            outcome.immediate_bad[0].1,
+            PlcError::StringSpanUnsupported { words: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn a_string_at_a_bit_device_is_immediately_bad() {
+        let outcome = plan_slmp_batch(&[sreq("M0", 4)]);
+        assert!(outcome.reads.is_empty());
+        assert_eq!(outcome.immediate_bad.len(), 1);
+        match &outcome.immediate_bad[0].1 {
+            PlcError::UnsupportedCombination { area, data_type } => {
+                assert!(area.contains('M'), "message should name the device: {area}");
+                assert_eq!(data_type, "string");
+            }
+            other => panic!("expected UnsupportedCombination, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_modbus_address_on_a_string_request_is_immediately_bad() {
+        let outcome = plan_slmp_batch(&[BatchReadRequest::String(StringReadRequest {
+            address: Address::parse("40001").unwrap(),
+            words: 4,
+        })]);
+        assert!(outcome.reads.is_empty());
+        assert!(matches!(
+            outcome.immediate_bad[0].1,
+            PlcError::AddressProtocolMismatch { .. }
+        ));
+    }
+
+    /// Two strings whose combined span exceeds the cap split into two reads -
+    /// the string case of "a read spanning the batching boundary".
+    #[test]
+    fn strings_split_when_their_combined_span_exceeds_the_word_cap() {
+        let half = (MAX_WORDS_PER_READ / 2 + 10) as u16;
+        let outcome = plan_slmp_batch(&[sreq("D0", half), sreq(&format!("D{half}"), half)]);
+        assert!(outcome.immediate_bad.is_empty());
+        assert_eq!(outcome.reads.len(), 2);
+        for g in &outcome.reads {
+            assert!(g.count <= MAX_WORDS_PER_READ);
+            assert_eq!(g.count, half as u32);
+        }
+    }
+
+    /// The numeric-only wrapper and the batch planner agree exactly - the
+    /// tripwire that keeps `plan_slmp_requests` from drifting now that it
+    /// delegates.
+    #[test]
+    fn plan_slmp_requests_matches_the_batch_planner_on_numeric_input() {
+        let numeric = [
+            req("D0", DataType::U16),
+            req("D2", DataType::F32),
+            req("M0", DataType::Bit),
+            req("D0", DataType::Bit), // immediate bad
+        ];
+        let batch: Vec<BatchReadRequest> = numeric
+            .iter()
+            .map(|&r| BatchReadRequest::Numeric(r))
+            .collect();
+        assert_eq!(plan_slmp_requests(&numeric), plan_slmp_batch(&batch));
     }
 
     /// A group at the very top of the device space must not overflow while

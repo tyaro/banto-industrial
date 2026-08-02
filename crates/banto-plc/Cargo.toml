@@ -27,6 +27,11 @@ tokio = { workspace = true, features = ["net", "time", "io-util"] }
 # kept as a statement of what *this crate's own code* uses, which is what
 # makes it reviewable - it is no longer a build-level guarantee.
 slmp = { workspace = true }
+# S1 (relay-wright plan, 文字列タグ): Shift-JIS decode for MELSEC string-device
+# reads (`decode.rs::decode_string_value`) and SJIS seeding in the SLMP
+# simulator's `set_string`. Same version the `slmp` crate uses - see the
+# workspace Cargo.toml note on why its PLCString type is not reused.
+encoding_rs = { workspace = true }
 
 # Exposes `simulator` (in-process Modbus TCP and SLMP test doubles, §6) beyond
 # this crate's own tests - so I3's integration tests and R1/R4's soak-test

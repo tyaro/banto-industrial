@@ -565,3 +565,176 @@ async fn execute_slmp_writes_runs_on_a_borrowed_client_for_the_broker() {
 
     shared.close().await;
 }
+
+// --- string write/read round trips (S1 文字列タグ) --------------------------
+//
+// The load-bearing proof for string support: written through the real write
+// path (`write_batch_mixed` -> wrapped crate -> real SLMP bytes) and read back
+// through the real read path (`SlmpClient::read_batch_mixed`), so byte order,
+// SJIS encoding, NUL padding and NUL trimming are proven as one system rather
+// than each side merely agreeing with itself.
+
+use banto_plc::{BatchReadRequest, BatchReadResult, PlcValue, StringReadRequest};
+
+use crate::types::{BatchWriteRequest, StringWriteRequest};
+
+fn swreq(raw: &str, words: u16, value: &str) -> BatchWriteRequest {
+    BatchWriteRequest::String(StringWriteRequest {
+        address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw} should parse: {e}")),
+        words,
+        value: value.to_string(),
+    })
+}
+
+fn srreq(raw: &str, words: u16) -> BatchReadRequest {
+    BatchReadRequest::String(StringReadRequest {
+        address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw} should parse: {e}")),
+        words,
+    })
+}
+
+/// ASCII, multi-byte SJIS, and an exactly-full span, all written in one batch
+/// and read back equal (with the short ones NUL-trimmed).
+#[tokio::test]
+async fn string_write_then_read_back_round_trips_ascii_sjis_and_full_spans() {
+    let sim = Simulator::start().await;
+    let mut writer = SlmpWriteClient::new(fast_config(&sim));
+    writer.connect().await.expect("connect");
+
+    let results = writer
+        .write_batch_mixed(&[
+            swreq("D0", 4, "ABC"),      // ASCII, padded
+            swreq("D100", 4, "テスト"), // multi-byte SJIS (6 bytes in 8)
+            swreq("D200", 2, "ABCD"),   // exactly 2L bytes, no room for NUL
+        ])
+        .await
+        .expect("write_batch_mixed ok");
+    assert!(results.iter().all(|r| *r == WriteResult::Ok), "{results:?}");
+
+    let mut reader = connected_reader(&sim).await;
+    let read_back = reader
+        .read_batch_mixed(&[srreq("D0", 4), srreq("D100", 4), srreq("D200", 2)])
+        .await
+        .expect("read back");
+    assert_eq!(
+        read_back[0],
+        BatchReadResult::Value(PlcValue::Str("ABC".to_string())),
+        "NUL padding must be trimmed on the way back"
+    );
+    assert_eq!(
+        read_back[1],
+        BatchReadResult::Value(PlcValue::Str("テスト".to_string()))
+    );
+    assert_eq!(
+        read_back[2],
+        BatchReadResult::Value(PlcValue::Str("ABCD".to_string()))
+    );
+}
+
+/// The wire-level byte-order pin: after writing "AB", the device word must be
+/// 0x4241 (low byte = first character), observed directly in the simulator's
+/// state rather than through the (matching) read path - so a symmetric
+/// encode/decode bug cannot cancel itself out. Also pins that the padding
+/// actually landed as 0x0000 words on the device.
+#[tokio::test]
+async fn string_write_lands_low_byte_first_with_nul_padding_on_the_device() {
+    let sim = Simulator::start().await;
+    let mut writer = SlmpWriteClient::new(fast_config(&sim));
+    writer.connect().await.unwrap();
+
+    // Seed the span with junk first, proving the padding overwrites it.
+    sim.set_word(SlmpDevice::D, 1, 0xDEAD);
+    sim.set_word(SlmpDevice::D, 2, 0xBEEF);
+
+    let results = writer
+        .write_batch_mixed(&[swreq("D0", 3, "AB")])
+        .await
+        .unwrap();
+    assert_eq!(results, vec![WriteResult::Ok]);
+
+    assert_eq!(sim.get_word(SlmpDevice::D, 0), 0x4241, "low byte first");
+    assert_eq!(sim.get_word(SlmpDevice::D, 1), 0x0000, "padding overwrites");
+    assert_eq!(sim.get_word(SlmpDevice::D, 2), 0x0000, "padding overwrites");
+}
+
+/// A string over its span's capacity is a per-request Bad and NOTHING of it is
+/// written - the whole span stays untouched (no truncated prefix), while a
+/// numeric batch-mate still lands.
+#[tokio::test]
+async fn an_overlong_string_writes_nothing_and_spares_its_batch_mates() {
+    let sim = Simulator::start().await;
+    let mut writer = SlmpWriteClient::new(fast_config(&sim));
+    writer.connect().await.unwrap();
+
+    let results = writer
+        .write_batch_mixed(&[
+            swreq("D0", 2, "ABCDE"), // 5 SJIS bytes > 4-byte capacity
+            BatchWriteRequest::Numeric(word("D10", DataType::U16, 77.0)),
+        ])
+        .await
+        .expect("the batch call itself succeeds");
+
+    assert!(
+        matches!(
+            &results[0],
+            WriteResult::Bad(PlcWriteError::ValueOutOfRange { data_type, .. })
+                if data_type == "string"
+        ),
+        "{results:?}"
+    );
+    assert_eq!(results[1], WriteResult::Ok);
+
+    // Nothing of the rejected string reached the device - not even a prefix.
+    assert_eq!(sim.get_word(SlmpDevice::D, 0), 0);
+    assert_eq!(sim.get_word(SlmpDevice::D, 1), 0);
+    assert_eq!(sim.get_word(SlmpDevice::D, 10), 77);
+}
+
+/// Numeric and string writes mix in one batch call, and numeric and string
+/// reads mix in one batch call - the full S2-broker-shaped round trip,
+/// including an exactly-adjacent numeric+string pair that shares one wire
+/// write group.
+#[tokio::test]
+async fn mixed_numeric_and_string_batch_round_trips_in_single_calls() {
+    let sim = Simulator::start().await;
+    let mut writer = SlmpWriteClient::new(fast_config(&sim));
+    writer.connect().await.unwrap();
+
+    let results = writer
+        .write_batch_mixed(&[
+            swreq("D0", 4, "OK"),                                          // D0..D3
+            BatchWriteRequest::Numeric(word("D4", DataType::U16, 1234.0)), // adjacent: same group
+            BatchWriteRequest::Numeric(bit("M0", true)),
+        ])
+        .await
+        .unwrap();
+    assert!(results.iter().all(|r| *r == WriteResult::Ok), "{results:?}");
+
+    let mut reader = connected_reader(&sim).await;
+    let read_back = reader
+        .read_batch_mixed(&[
+            srreq("D0", 4),
+            BatchReadRequest::Numeric(rreq("D4", DataType::U16)),
+            BatchReadRequest::Numeric(rreq("M0", DataType::Bit)),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        read_back[0],
+        BatchReadResult::Value(PlcValue::Str("OK".to_string()))
+    );
+    assert_eq!(read_back[1], BatchReadResult::Value(PlcValue::F64(1234.0)));
+    assert_eq!(read_back[2], BatchReadResult::Value(PlcValue::Bit(true)));
+}
+
+#[tokio::test]
+async fn write_batch_mixed_before_connect_is_not_connected() {
+    let mut client = SlmpWriteClient::new(SlmpConfig {
+        host: "127.0.0.1".to_string(),
+        ..Default::default()
+    });
+    assert!(matches!(
+        client.write_batch_mixed(&[swreq("D0", 4, "AB")]).await,
+        Err(PlcWriteError::NotConnected)
+    ));
+}

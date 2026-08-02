@@ -220,6 +220,19 @@ pub async fn build_config(pool: &SqlitePool) -> Result<CollectorConfig, CollectE
             let mut store_columns = Vec::with_capacity(group_tags.len());
 
             for tag in group_tags {
+                // S1 (relay-wright 文字列タグ): "string" is registry-legal
+                // vocabulary that the recorder pipeline must NEVER see - the
+                // banto-tstore schema is frozen numeric-only, and there is no
+                // meaningful sample for a string anyway. Skip such tags
+                // entirely, exactly like a disabled tag: never read, never a
+                // store column, and the rest of the group still collects.
+                // This must happen *before* build_request, whose
+                // DataType::parse would otherwise fail the whole config build
+                // over a tag that belongs to a different app (relay-wright's
+                // S2 engine is the consumer of string tags).
+                if tag.data_type == banto_tags::STRING_DATA_TYPE {
+                    continue;
+                }
                 let request = build_request(tag)?;
                 requests.push(request);
                 tag_plans.push(TagPlan {
@@ -385,6 +398,7 @@ mod tests {
             collection_group_id: group_id,
             address: address.to_string(),
             data_type: "i16".to_string(),
+            string_length: None,
             raw_lo: None,
             raw_hi: None,
             eng_lo: None,
@@ -521,6 +535,55 @@ mod tests {
         assert_eq!(group.requests[0].data_type, DataType::I16);
         assert!(group.tags[1].scaling.is_none());
         assert_eq!(group.requests[1].data_type, DataType::Bit);
+    }
+
+    /// The S1 hard constraint (ChronoGazer safety): a `"string"` tag in the
+    /// shared registry is *skipped* by this recorder pipeline - never read,
+    /// never a tstore column - and the rest of its group still collects.
+    /// The string tag deliberately carries a MELSEC-notation address
+    /// (`D100`) that `Address::parse` (Modbus) would reject: if the skip ever
+    /// moved after `build_request`, this test would fail with the config
+    /// error instead of passing, proving the tag is skipped *before* any
+    /// parsing, not merely tolerated.
+    #[tokio::test]
+    async fn a_string_tag_is_skipped_and_the_rest_of_the_group_still_collects() {
+        let pool = registry().await;
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(conn_input("PLC1", 502))
+            .await
+            .unwrap();
+        let group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", conn.id, 1_000))
+            .await
+            .unwrap();
+        let tag_svc = TagService::new(pool.clone());
+        let numeric = tag_svc
+            .create(tag_input("Numeric", group.id, "40001"))
+            .await
+            .unwrap();
+        let mut string_tag = tag_input("Recipe", group.id, "D100");
+        string_tag.data_type = "string".to_string();
+        string_tag.string_length = Some(16);
+        tag_svc.create(string_tag).await.unwrap();
+
+        let config = build_config(&pool)
+            .await
+            .expect("a string tag must not fail the recorder's config build");
+
+        // Only the numeric tag is collected...
+        assert_eq!(config.group_count(), 1);
+        assert_eq!(config.tag_count(), 1, "the string tag must be skipped");
+        let g = &config.connections[0].groups[0];
+        assert_eq!(g.requests.len(), 1);
+        assert_eq!(g.tags[0].key, format!("tag:{}", numeric.id));
+
+        // ...and the frozen numeric store schema never sees the string:
+        // exactly one column, and no "string" data type anywhere.
+        assert_eq!(config.store_config.groups.len(), 1);
+        let columns = &config.store_config.groups[0].tags;
+        assert_eq!(columns.len(), 1);
+        assert_eq!(columns[0].name, "Numeric");
+        assert!(columns.iter().all(|c| c.data_type != "string"));
     }
 
     #[tokio::test]

@@ -61,7 +61,7 @@ use crate::client::PlcWriteClient;
 use crate::error::PlcWriteError;
 use crate::types::{WriteRequest, WriteResult};
 
-use planning::{plan_slmp_writes, SlmpWritePlanOutcome, WritePayload};
+use planning::{plan_slmp_write_batch, plan_slmp_writes, SlmpWritePlanOutcome, WritePayload};
 
 /// Map [`banto_plc::SlmpCpu`] onto the wrapped crate's `CPU`. Re-derived here
 /// (rather than reusing `banto-plc`'s mapping, which is private) for the same
@@ -258,6 +258,35 @@ impl SlmpWriteClient {
         Self {
             config,
             inner: None,
+        }
+    }
+
+    /// Write a mixed numeric + string batch in one call (S1 文字列タグ) - the
+    /// owned-socket form of [`plan_slmp_write_batch`] + [`execute_slmp_writes`],
+    /// with exactly [`PlcWriteClient::write_batch`]'s connection semantics.
+    /// An inherent method rather than part of the trait for the same reason
+    /// `SlmpClient::read_batch_mixed` is: existing trait consumers stay
+    /// numeric-only.
+    pub async fn write_batch_mixed(
+        &mut self,
+        requests: &[crate::types::BatchWriteRequest],
+    ) -> Result<Vec<WriteResult>, PlcWriteError> {
+        if self.inner.is_none() {
+            return Err(PlcWriteError::NotConnected);
+        }
+
+        let outcome = plan_slmp_write_batch(requests, self.config.word_order);
+        let client = self
+            .inner
+            .as_mut()
+            .expect("checked Some above, only cleared on the fatal branch below");
+
+        match execute_slmp_writes(client, &outcome, requests.len()).await {
+            Ok(results) => Ok(results),
+            Err(err) => {
+                self.inner = None;
+                Err(err)
+            }
         }
     }
 }

@@ -157,6 +157,33 @@ impl Simulator {
         }
     }
 
+    /// Seed a MELSEC string (S1 文字列タグ): Shift-JIS-encode `s`, pad with
+    /// 0x00 to exactly `words` word devices (2 bytes each), and lay the bytes
+    /// in low-byte-first per word - the storage convention
+    /// `decode.rs::decode_string_value` documents. Panics if `s` cannot be
+    /// SJIS-encoded or exceeds `2 * words` bytes: that is a mistake in the
+    /// *test*, not a condition worth simulating (same stance as
+    /// [`Simulator::set_word`] on a bit device).
+    pub fn set_string(&self, device: SlmpDevice, start: u32, words: u16, s: &str) {
+        let (bytes, _, had_errors) = encoding_rs::SHIFT_JIS.encode(s);
+        assert!(!had_errors, "{s:?} is not representable in Shift-JIS");
+        let capacity = words as usize * 2;
+        assert!(
+            bytes.len() <= capacity,
+            "{s:?} is {} SJIS bytes, over the {capacity}-byte capacity of {words} words",
+            bytes.len()
+        );
+        let mut padded = bytes.into_owned();
+        padded.resize(capacity, 0x00);
+        for (i, chunk) in padded.chunks_exact(2).enumerate() {
+            self.set_word(
+                device,
+                start + i as u32,
+                u16::from_le_bytes([chunk[0], chunk[1]]),
+            );
+        }
+    }
+
     /// Set one bit device (`M`/`X`/`Y`/...). Panics on a word device, mirroring
     /// [`Simulator::set_word`].
     pub fn set_bit(&self, device: SlmpDevice, number: u32, value: bool) {
