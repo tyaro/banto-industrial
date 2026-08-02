@@ -32,6 +32,10 @@ pub use banto_tags::{
     CollectionGroup, CollectionGroupService, PlcConnection, PlcConnectionService, Tag, TagService,
 };
 pub mod events;
+// Project file export/import (feature/project-file): save the whole
+// configuration registry to a versioned JSON project file and load it back.
+// Composes the existing registry services; no new dependency (invariant).
+pub mod project;
 // QR文字列リスト（デバッグ支援）: タッチパネルのQRリーダーに画面から読ませる
 // 文字列の登録・並び替えと、そのQRコードSVGのサーバー側生成（/qr-codes 画面）。
 pub mod qr_strings;

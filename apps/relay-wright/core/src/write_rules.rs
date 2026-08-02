@@ -71,8 +71,11 @@ pub struct WriteRule {
 }
 
 /// A rule plus its AND-combined conditions - the shape every read/write on
-/// this aggregate returns.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// this aggregate returns. `Deserialize` (alongside `Serialize`) so the
+/// project export/import (`crate::project`) can round-trip this exact wire
+/// bundle back through a project file - the `flatten`ed `WriteRule` and the
+/// `WriteRuleCondition` rows are both already `Deserialize`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WriteRuleDetail {
     #[serde(flatten)]
     pub rule: WriteRule,

@@ -34,6 +34,7 @@ use relay_wright_core::engine::{
     Engine, EngineConfig, EngineControl, EngineStatus, SharedEngineControl,
 };
 use relay_wright_core::events::event_channel;
+use relay_wright_core::project::{export_project, import_project, ImportSummary, ProjectFile};
 use relay_wright_core::qr_strings::{QrString, QrStringInput, QrStringService};
 use relay_wright_core::rest::{
     api_router, audited_credential_verifier, CollectionGroupPayload, PlcConnectionPayload,
@@ -694,6 +695,10 @@ async fn start_embedded_server(
     engine_control: SharedEngineControl,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
+    // The shared pool, forwarded to `api_router` for `/api/project/*`
+    // (export/import). Named via `relay_wright_core`'s `DbPool` alias so this
+    // crate keeps its no-new-dependencies invariant.
+    pool: relay_wright_core::db::DbPool,
     config: ServerConfig,
 ) -> Result<RunningServer, BantoError> {
     // `allow_setup: false` - the Tauri app's first-run setup goes through
@@ -718,6 +723,7 @@ async fn start_embedded_server(
         auth,
         events,
         false,
+        pool,
     )
     .merge(static_router::<FrontendAssets>());
     start(config, router).await
@@ -776,6 +782,7 @@ async fn server_apply(
                 state.engine_control.clone(),
                 state.rest_auth.clone(),
                 state.events.clone(),
+                state.pool.clone(),
                 ServerConfig {
                     bind: config.bind.clone(),
                     port: config.port,
@@ -2206,6 +2213,90 @@ async fn engine_reload(state: State<'_, AppState>) -> Result<EngineStatus, Banto
     engine_reload_body(&state).await
 }
 
+// --- project file export/import (feature/project-file) ----------------------
+//
+// The Tauri half of the dual path (invariant §1 両経路対称): export editor+ (a
+// read of non-secret config), import admin-only + arm-guarded + audited, with
+// the same `resource: "project"` audit as `crate::rest`'s `/api/project/*`
+// routes. After a successful import the engine is RELOADED (best-effort) so the
+// imported rules take effect - rules compile at engine start/reload.
+
+/// `editor`+ (feature/project-file): export the whole configuration registry
+/// (PLC接続/収集グループ/タグ/書き込み先/書き込みルール/QR文字列) as a project
+/// file. A read, so not audited (same convention as the list commands).
+#[tauri::command]
+async fn project_export(state: State<'_, AppState>) -> Result<ProjectFile, BantoError> {
+    require_role(&state, Role::Editor, "project").await?;
+    export_project(&state.pool).await
+}
+
+/// Body of [`project_import`], split out so the arm-guard/audit/reload behavior
+/// is testable with a plain `&AppState` in this crate's own `cargo test`
+/// (mirrors the `*_body` convention the mutating commands use).
+async fn project_import_body(
+    state: &AppState,
+    project: ProjectFile,
+) -> Result<ImportSummary, BantoError> {
+    let actor = require_role(state, Role::Admin, "project").await?;
+
+    // Safety guard (plan): refuse while the engine is ARMED - importing
+    // replaces what the engine would write. No engine started -> nothing armed
+    // -> import is allowed. The control is cloned out from under the lock so
+    // this does not hold the engine lock across the import.
+    let armed = match state.engine_control.lock().await.clone() {
+        Some(control) => control.status().armed,
+        None => false,
+    };
+    if armed {
+        return Err(BantoError::Other(
+            "エンジンがアーム中です。インポート前にディスアームしてください".to_string(),
+        ));
+    }
+
+    let summary = import_project(&state.pool, project).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "project_import",
+            resource: "project",
+            entity_id: Some("-"),
+            detail: Some(serde_json::json!({
+                "plcConnections": summary.plc_connections,
+                "collectionGroups": summary.collection_groups,
+                "tags": summary.tags,
+                "writeTargets": summary.write_targets,
+                "writeRules": summary.write_rules,
+                "writeRuleConditions": summary.write_rule_conditions,
+                "qrStrings": summary.qr_strings,
+            })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+
+    // Rebuild the engine from the just-imported DB so the imported rules go
+    // live (they are compiled at engine start/reload; the rebuilt engine always
+    // starts DISARMED). Best-effort: the import is already committed + audited,
+    // so a reload failure must not turn a successful import into an error - the
+    // frontend also tells the user a reload/restart is needed.
+    let _ = engine_reload_body(state).await;
+
+    Ok(summary)
+}
+
+/// `admin`-only (feature/project-file): REPLACE the whole configuration with
+/// the posted project file. Refuses while the engine is armed, applies
+/// atomically, audits the per-table counts, and reloads the engine.
+#[tauri::command]
+async fn project_import(
+    state: State<'_, AppState>,
+    project: ProjectFile,
+) -> Result<ImportSummary, BantoError> {
+    project_import_body(&state, project).await
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -2493,6 +2584,7 @@ pub fn run() {
                     engine_control.clone(),
                     rest_auth.clone(),
                     events.clone(),
+                    pool.clone(),
                     runtime_config,
                 )) {
                     Ok(server) => Some(server),
@@ -2639,6 +2731,8 @@ pub fn run() {
             engine_set_dry_run,
             engine_status,
             engine_reload,
+            project_export,
+            project_import,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
