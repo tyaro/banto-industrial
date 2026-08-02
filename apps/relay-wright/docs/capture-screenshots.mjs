@@ -507,7 +507,9 @@ async function main() {
 		// プロジェクト（設定の保存・読み込み, feature/project-file）。エクスポート
 		// 導線と、管理者に見えるインポート節（ファイル選択・置換警告）。
 		await page.goto(`${BASE_URL}/project`);
-		await page.getByRole('heading', { name: 'プロジェクト' }).waitFor();
+		// Header と本文の両方が h1「プロジェクト」を描画するため main に絞る
+		// （他画面の audit-log と同じ理由）。
+		await page.getByRole('main').getByRole('heading', { name: 'プロジェクト' }).waitFor();
 		await page.getByRole('button', { name: 'エクスポート' }).waitFor();
 		await shot('project.png', { fullPage: true });
 
