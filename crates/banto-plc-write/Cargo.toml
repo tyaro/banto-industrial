@@ -25,6 +25,10 @@ banto-plc = { path = "../banto-plc" }
 # workspace Cargo.toml. Here it is the *write* commands (`bulk_write`) that are
 # called instead of the read ones.
 slmp = { workspace = true }
+# S1 (relay-wright plan, 文字列タグ): Shift-JIS encode for MELSEC string-device
+# writes (`encode.rs::encode_string_value`). Same version the `slmp` crate
+# uses - see the workspace Cargo.toml note on why its PLCString is not reused.
+encoding_rs = { workspace = true }
 # Only the pieces this crate's own code touches: TCP connect/response timeouts
 # (`time`). Frame I/O happens inside the wrapped `slmp` crate, not here. No
 # "rt"/"macros" - this crate never spawns tasks or defines its own runtime;

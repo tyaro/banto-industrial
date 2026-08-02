@@ -212,6 +212,7 @@ dependencies = [
 name = "banto-plc"
 version = "0.1.0"
 dependencies = [
+ "encoding_rs",
  "slmp",
  "thiserror 2.0.18",
  "tokio",
@@ -222,6 +223,7 @@ name = "banto-plc-write"
 version = "0.1.0"
 dependencies = [
  "banto-plc",
+ "encoding_rs",
  "slmp",
  "thiserror 2.0.18",
  "tokio",
