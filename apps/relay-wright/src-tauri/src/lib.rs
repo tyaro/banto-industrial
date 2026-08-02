@@ -2177,6 +2177,70 @@ async fn engine_status(state: State<'_, AppState>) -> Result<EngineStatus, Banto
     Ok(current_engine_control(&state).await?.status())
 }
 
+// --- タグモニタ (feature/tag-monitor) ----------------------------------------
+//
+// The Tauri half of the monitor's dual path (invariant §1 両経路対称): read =
+// viewer+, manual write = editor+ (the user explicitly relaxed this DEBUG
+// screen's safety - no arm gate, no confirm; editor rather than admin), with
+// the same audit split as the engine commands: the manual-write audit row
+// (`write_audit_log`, `action: 'manual_write'`) is written INSIDE
+// `EngineControl::monitor_write`, so this layer adds ONLY the RBAC gate and
+// the actor username - never a second entry. Both commands ride the SAME
+// shared control slot as `/api/monitor/*`, so all monitor traffic goes
+// through the engine broker's one-session-per-CPU tasks (the R08ENCPU accepts
+// only one SLMP session).
+
+/// Body of [`monitor_group_read`] (see [`engine_arm_body`] for the split
+/// pattern).
+async fn monitor_group_read_body(
+    state: &AppState,
+    collection_group_id: i64,
+) -> Result<Vec<relay_wright_core::engine::MonitorValue>, BantoError> {
+    require_role(state, Role::Viewer, "monitor").await?;
+    current_engine_control(state)
+        .await?
+        .monitor_group_read(collection_group_id)
+        .await
+}
+
+/// `viewer`+ (feature/tag-monitor): the selected 収集グループ's tags as
+/// display-ready realtime values (scaling + decimals applied, per-tag
+/// quality). Read-only, so not audited.
+#[tauri::command]
+async fn monitor_group_read(
+    state: State<'_, AppState>,
+    collection_group_id: i64,
+) -> Result<Vec<relay_wright_core::engine::MonitorValue>, BantoError> {
+    monitor_group_read_body(&state, collection_group_id).await
+}
+
+/// Body of [`monitor_tag_write`] (see [`engine_arm_body`] for the split
+/// pattern).
+async fn monitor_tag_write_body(
+    state: &AppState,
+    tag_id: i64,
+    value: &str,
+) -> Result<(), BantoError> {
+    let actor = require_role(state, Role::Editor, "monitor").await?;
+    current_engine_control(state)
+        .await?
+        .monitor_tag_write(tag_id, value, Some(&actor.username))
+        .await
+}
+
+/// `editor`+ (feature/tag-monitor): one-shot manual write to a tag's device.
+/// NO arm gate / rate limit / dry-run interception (the user's explicit
+/// relaxation for this debug screen); audited by `EngineControl` as
+/// `manual_write` with the caller attributed.
+#[tauri::command]
+async fn monitor_tag_write(
+    state: State<'_, AppState>,
+    tag_id: i64,
+    value: String,
+) -> Result<(), BantoError> {
+    monitor_tag_write_body(&state, tag_id, &value).await
+}
+
 /// Body of [`engine_reload`] (see [`engine_arm_body`]).
 async fn engine_reload_body(state: &AppState) -> Result<EngineStatus, BantoError> {
     let actor = require_role(state, Role::Admin, "engine").await?;
@@ -2731,6 +2795,8 @@ pub fn run() {
             engine_set_dry_run,
             engine_status,
             engine_reload,
+            monitor_group_read,
+            monitor_tag_write,
             project_export,
             project_import,
         ])

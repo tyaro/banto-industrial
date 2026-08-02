@@ -49,7 +49,9 @@ pub struct ResolvedSource {
 
 impl ResolvedSource {
     /// The (numeric or string) batch read request this source turns into.
-    fn to_request(&self) -> BatchReadRequest {
+    /// `pub(super)` since the タグモニタ (`super::monitor`) builds its group
+    /// reads through the same resolution.
+    pub(super) fn to_request(&self) -> BatchReadRequest {
         match self.shape {
             WireShape::Numeric(data_type) => BatchReadRequest::Numeric(ReadRequest {
                 address: self.address,

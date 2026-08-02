@@ -132,7 +132,7 @@ use tokio::sync::broadcast;
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 use crate::db::DbPool;
-use crate::engine::{EngineControl, EngineStatus, SharedEngineControl};
+use crate::engine::{EngineControl, EngineStatus, MonitorValue, SharedEngineControl};
 use crate::project::{export_project, import_project, ImportSummary, ProjectFile};
 use crate::qr_strings::{QrString, QrStringInput, QrStringService};
 use crate::settings::{AuditSettings, SettingsService};
@@ -2186,22 +2186,24 @@ fn write_audit_log_router(write_audit_log: WriteAuditLogService, auth: AuthState
 
 /// Resolve the caller's identity and require role >= `min` for an engine
 /// control route (invariant §1 両経路対称: the SAME floors as `src-tauri`'s
-/// `engine_*` commands - arm/disarm = admin, dry-run = editor). Returns the
-/// caller's USERNAME on success (`Identity.id` IS the username, spec
-/// convention) so it can be threaded into [`EngineControl`], whose own
-/// `write_audit_log` row is then attributed to the right actor - the ONLY
-/// audit either path writes for arm/disarm/dry-run (this layer must not add a
-/// second). Records a `denied` entry (`resource: "engine"`) for an
+/// `engine_*` commands - arm/disarm = admin, dry-run = editor; the monitor's
+/// manual write = editor, `resource: "monitor"`). Returns the caller's
+/// USERNAME on success (`Identity.id` IS the username, spec convention) so it
+/// can be threaded into [`EngineControl`], whose own `write_audit_log` row is
+/// then attributed to the right actor - the ONLY audit either path writes for
+/// arm/disarm/dry-run/manual-write (this layer must not add a second).
+/// Records a `denied` entry (under `resource`) for an
 /// authenticated-but-underprivileged caller and returns `Forbidden`; no valid
 /// session returns `Unauthorized` (not audited - same reasoning as
-/// [`require_editor`]). The engine router as a whole sits behind `require_auth`,
-/// so `engine_status` (viewer+) needs no inline check - any authenticated role
-/// passes it.
+/// [`require_editor`]). The engine/monitor routers as a whole sit behind
+/// `require_auth`, so the viewer+ reads (`engine_status`, `monitor_read`)
+/// need no inline check - any authenticated role passes.
 async fn require_engine_role(
     auth: &AuthState,
     audit: &AuditLogService,
     headers: &HeaderMap,
     min: Role,
+    resource: &'static str,
     method: &str,
     path: &str,
 ) -> Result<String, BantoError> {
@@ -2219,7 +2221,7 @@ async fn require_engine_role(
                     actor_username: Some(&identity.id),
                     actor_role: Some(&identity.role),
                     action: "denied",
-                    resource: "engine",
+                    resource,
                     entity_id: None,
                     detail: Some(json!({ "method": method, "path": path })),
                     origin: "rest",
@@ -2270,6 +2272,7 @@ async fn engine_arm(
         &state.audit,
         &headers,
         Role::Admin,
+        "engine",
         "POST",
         "/api/engine/arm",
     )
@@ -2290,6 +2293,7 @@ async fn engine_disarm(
         &state.audit,
         &headers,
         Role::Admin,
+        "engine",
         "POST",
         "/api/engine/disarm",
     )
@@ -2319,6 +2323,7 @@ async fn engine_dry_run(
         &state.audit,
         &headers,
         Role::Editor,
+        "engine",
         "POST",
         "/api/engine/dry-run",
     )
@@ -2361,6 +2366,90 @@ fn engine_router(control: SharedEngineControl, audit: AuditLogService, auth: Aut
         .route("/api/engine/disarm", post(engine_disarm))
         .route("/api/engine/dry-run", post(engine_dry_run))
         .route("/api/engine/status", get(engine_status))
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(auth, require_auth))
+}
+
+// --- タグモニタ (feature/tag-monitor) ----------------------------------------
+//
+// The dual-path surface for the monitor screen: per-group realtime reads
+// (viewer+ - it is a read, though carried as POST since it takes a body and
+// touches the PLC) and one-shot manual tag writes (editor+ - the user
+// explicitly relaxed this debug screen's safety, so editor rather than admin,
+// with NO arm gate; every write is audited by `EngineControl::monitor_write`
+// under `action: 'manual_write'`). Reuses [`EngineState`] - the SAME shared
+// control slot as `/api/engine/*`, so monitor traffic rides the engine
+// broker's one-session-per-CPU tasks (hard constraint: the R08ENCPU accepts
+// only one SLMP session).
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MonitorReadRequest {
+    collection_group_id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MonitorWriteRequest {
+    tag_id: i64,
+    value: String,
+}
+
+/// `POST /api/monitor/read` (viewer+): the selected 収集グループ's tags as
+/// display-ready realtime values (scaling + decimals applied; per-tag
+/// quality). Read-only, so not audited - the router's `require_auth` is the
+/// only gate, same convention as `engine_status`.
+async fn monitor_read(
+    State(state): State<EngineState>,
+    Json(body): Json<MonitorReadRequest>,
+) -> Result<Json<Vec<MonitorValue>>, ApiError> {
+    Ok(Json(
+        engine_control_now(&state)
+            .await?
+            .monitor_group_read(body.collection_group_id)
+            .await?,
+    ))
+}
+
+/// `POST /api/monitor/write` (editor+): one-shot manual write to a tag's
+/// device. NO arm gate / rate limit / dry-run (the user's explicit relaxation
+/// for this debug screen); the write itself is audited by `EngineControl`
+/// (`write_audit_log`, `action: 'manual_write'`, actor attributed) - this
+/// layer adds only authorization + actor resolution, never a second audit.
+async fn monitor_write(
+    State(state): State<EngineState>,
+    headers: HeaderMap,
+    Json(body): Json<MonitorWriteRequest>,
+) -> Result<StatusCode, ApiError> {
+    let actor = require_engine_role(
+        &state.auth,
+        &state.audit,
+        &headers,
+        Role::Editor,
+        "monitor",
+        "POST",
+        "/api/monitor/write",
+    )
+    .await?;
+    engine_control_now(&state)
+        .await?
+        .monitor_tag_write(body.tag_id, &body.value, Some(&actor))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `/api/monitor/*` (invariant §1 両経路対称, feature/tag-monitor): read
+/// viewer+, write editor+. Same [`EngineState`]/`require_auth` shape as
+/// [`engine_router`]; the write handler applies its own floor inline.
+fn monitor_router(control: SharedEngineControl, audit: AuditLogService, auth: AuthState) -> Router {
+    let state = EngineState {
+        control,
+        auth: auth.clone(),
+        audit,
+    };
+    Router::new()
+        .route("/api/monitor/read", post(monitor_read))
+        .route("/api/monitor/write", post(monitor_write))
         .with_state(state)
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
@@ -2599,6 +2688,11 @@ pub fn api_router(
         .merge(qr_strings_router(qr_strings, audit.clone(), auth.clone()))
         .merge(write_audit_log_router(write_audit_log, auth.clone()))
         .merge(engine_router(
+            engine_control.clone(),
+            audit.clone(),
+            auth.clone(),
+        ))
+        .merge(monitor_router(
             engine_control.clone(),
             audit.clone(),
             auth.clone(),

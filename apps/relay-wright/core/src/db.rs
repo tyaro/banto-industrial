@@ -94,7 +94,7 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), BantoError> {
 
 /// This app's own tables, applied as idempotent DDL - see this module's
 /// doc comment for why. Mirrors `migrations/0001_settings.sql` through
-/// `migrations/0013_write_rules_constant_text.sql` exactly; update both
+/// `migrations/0014_write_audit_log_manual_write.sql` exactly; update both
 /// together. The `CREATE TABLE IF NOT EXISTS` statements below carry the
 /// LATEST schema (so a fresh database is right immediately); the
 /// S2 文字列タグ upgrade steps at the end of this function bring an
@@ -264,7 +264,9 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
     .await
     .map_err(banto_storage::storage_error)?;
 
-    // 0008_write_audit_log.sql
+    // 0008_write_audit_log.sql + 0014_write_audit_log_manual_write.sql
+    // (feature/tag-monitor): the action CHECK includes 'manual_write' (the
+    // タグモニタ screen's one-shot debug writes are audited under it).
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS write_audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -277,7 +279,8 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
             target_value_written REAL,
             actor_username TEXT,
             action TEXT NOT NULL CHECK (
-                action IN ('rule_fire', 'arm', 'disarm', 'dry_run_toggle', 'rate_limit_tripped')
+                action IN ('rule_fire', 'arm', 'disarm', 'dry_run_toggle', 'rate_limit_tripped',
+                           'manual_write')
             ),
             result TEXT NOT NULL CHECK (
                 result IN (
@@ -405,7 +408,84 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
             .map_err(banto_storage::storage_error)?;
     }
 
+    // 0014_write_audit_log_manual_write.sql (feature/tag-monitor): widen
+    // write_audit_log's action CHECK with 'manual_write'. No column changes,
+    // so `pragma_table_info` cannot detect it - the idempotent detection
+    // reads the table's own DDL out of sqlite_master instead (the CHECK's
+    // literal is part of the stored CREATE TABLE text). SQLite cannot ALTER
+    // a CHECK, so a pre-monitor database gets the leaf-rebuild treatment
+    // (write_audit_log is referenced by nothing).
+    let create_sql: Option<String> = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'write_audit_log'",
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+    let needs_manual_write = create_sql
+        .map(|sql| !sql.contains("manual_write"))
+        .unwrap_or(false);
+    if needs_manual_write {
+        upgrade_write_audit_log_for_manual_write(pool).await?;
+    }
+
     Ok(())
+}
+
+/// Rebuild `write_audit_log` with the manual_write-capable action CHECK
+/// (mirrors `migrations/0014_write_audit_log_manual_write.sql`). A LEAF
+/// rebuild - nothing references `write_audit_log` - so banto-tags' 0005 leaf
+/// pattern applies verbatim (same as
+/// [`upgrade_write_rule_conditions_for_string`]): copy every row (audit
+/// history must survive the upgrade byte-for-byte, `ts` included - no DEFAULT
+/// re-evaluation because `ts` is copied explicitly), drop, rename, recreate
+/// both indexes under their original names. One transaction, so a crash
+/// mid-upgrade leaves the database fully before or fully after.
+async fn upgrade_write_audit_log_for_manual_write(pool: &SqlitePool) -> Result<(), BantoError> {
+    let mut tx = pool.begin().await.map_err(banto_storage::storage_error)?;
+
+    for sql in [
+        "CREATE TABLE write_audit_log_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL DEFAULT (datetime('now')),
+            write_rule_id INTEGER,
+            rule_name_snapshot TEXT NOT NULL,
+            source_tag_id INTEGER,
+            source_value_snapshot REAL,
+            write_target_id INTEGER,
+            target_value_written REAL,
+            actor_username TEXT,
+            action TEXT NOT NULL CHECK (
+                action IN ('rule_fire', 'arm', 'disarm', 'dry_run_toggle', 'rate_limit_tripped',
+                           'manual_write')
+            ),
+            result TEXT NOT NULL CHECK (
+                result IN (
+                    'ok', 'failed', 'suppressed_disarmed', 'suppressed_rate_limited',
+                    'suppressed_dry_run'
+                )
+            ),
+            detail TEXT
+        )",
+        "INSERT INTO write_audit_log_new (
+            id, ts, write_rule_id, rule_name_snapshot, source_tag_id, source_value_snapshot,
+            write_target_id, target_value_written, actor_username, action, result, detail
+        )
+        SELECT
+            id, ts, write_rule_id, rule_name_snapshot, source_tag_id, source_value_snapshot,
+            write_target_id, target_value_written, actor_username, action, result, detail
+        FROM write_audit_log",
+        "DROP TABLE write_audit_log",
+        "ALTER TABLE write_audit_log_new RENAME TO write_audit_log",
+        "CREATE INDEX idx_write_audit_log_ts ON write_audit_log (ts)",
+        "CREATE INDEX idx_write_audit_log_write_rule_id ON write_audit_log (write_rule_id)",
+    ] {
+        sqlx::query(sql)
+            .execute(&mut *tx)
+            .await
+            .map_err(banto_storage::storage_error)?;
+    }
+
+    tx.commit().await.map_err(banto_storage::storage_error)
 }
 
 /// Rebuild `write_targets` with the S2 string-capable schema (mirrors
