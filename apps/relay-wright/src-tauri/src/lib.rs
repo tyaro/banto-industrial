@@ -34,12 +34,24 @@ use relay_wright_core::engine::{
     Engine, EngineConfig, EngineControl, EngineStatus, SharedEngineControl,
 };
 use relay_wright_core::events::event_channel;
-use relay_wright_core::rest::{api_router, audited_credential_verifier};
+use relay_wright_core::qr_strings::{QrString, QrStringInput, QrStringService};
+use relay_wright_core::rest::{
+    api_router, audited_credential_verifier, CollectionGroupPayload, PlcConnectionPayload,
+    QrStringsReorderPayload, TagPayload,
+};
 use relay_wright_core::settings::{AuditSettings, AuthSettings, ServerSettings, SettingsService};
 use relay_wright_core::users::{Role, UserIdentity, UserSummary, UsersService};
 use relay_wright_core::write_audit_query::{WriteAuditLogRow, WriteAuditLogService};
 use relay_wright_core::write_rules::{WriteRuleDetail, WriteRuleInput, WriteRuleService};
 use relay_wright_core::write_targets::{WriteTarget, WriteTargetInput, WriteTargetService};
+// R1-B: banto-tags' registry services/row types, re-exported by
+// relay-wright-core (this crate's invariant is to add NO dependencies of its
+// own - see `relay_wright_core::db::DbPool`'s precedent). The camelCase
+// create/update payloads (`*Payload`, imported from `rest` above) are shared
+// with the REST handlers so the two paths' wire shape cannot drift.
+use relay_wright_core::{
+    CollectionGroup, CollectionGroupService, PlcConnection, PlcConnectionService, Tag, TagService,
+};
 use serde::Serialize;
 use std::str::FromStr;
 use std::sync::Mutex;
@@ -108,6 +120,20 @@ struct AppState {
     /// paths (this Tauri path and `crate::rest`'s REST path). The engine owns
     /// all writes to this table - this service never mutates it.
     write_audit_log: WriteAuditLogService,
+    /// PLC接続 registry (R1-B): banto-tags' own service over the same shared
+    /// pool. Viewer-read / editor-write, audited on both paths, exactly as
+    /// `write_targets`/`write_rules` above.
+    plc_connections: PlcConnectionService,
+    /// 収集グループ registry (R1-B): same dual-path treatment. Managed from
+    /// within the タグ登録 screen (groups are an implementation detail of
+    /// tags, not their own top-level screen).
+    collection_groups: CollectionGroupService,
+    /// タグ registry (R1-B): same dual-path treatment.
+    tags: TagService,
+    /// QR文字列リスト（デバッグ支援, /qr-codes 画面）: タッチパネルのQR
+    /// リーダーに読ませる文字列とそのSVG。Same dual-path treatment
+    /// (viewer-read / editor-write, audited on both paths).
+    qr_strings: QrStringService,
     /// The one shared SQLite pool (same on-disk DB as every service above).
     /// Held directly - not just via the service handles - so `engine_reload`
     /// can hand it to `Engine::start_from_db` to rebuild the engine from the
@@ -661,6 +687,10 @@ async fn start_embedded_server(
     write_targets: WriteTargetService,
     write_rules: WriteRuleService,
     write_audit_log: WriteAuditLogService,
+    plc_connections: PlcConnectionService,
+    collection_groups: CollectionGroupService,
+    tags: TagService,
+    qr_strings: QrStringService,
     engine_control: SharedEngineControl,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
@@ -680,6 +710,10 @@ async fn start_embedded_server(
         write_targets,
         write_rules,
         write_audit_log,
+        plc_connections,
+        collection_groups,
+        tags,
+        qr_strings,
         engine_control,
         auth,
         events,
@@ -735,6 +769,10 @@ async fn server_apply(
                 state.write_targets.clone(),
                 state.write_rules.clone(),
                 state.write_audit_log.clone(),
+                state.plc_connections.clone(),
+                state.collection_groups.clone(),
+                state.tags.clone(),
+                state.qr_strings.clone(),
                 state.engine_control.clone(),
                 state.rest_auth.clone(),
                 state.events.clone(),
@@ -1571,6 +1609,479 @@ async fn write_rules_delete(state: State<'_, AppState>, id: i64) -> Result<(), B
     write_rules_delete_body(&state, id).await
 }
 
+// --- R1-B: PLC connection / collection group / tag registry CRUD ------------
+//
+// The Tauri half of the tag registry's dual path (invariant §1 両経路対称):
+// the same viewer-read / editor-write floors and the same audit rows
+// (`resource: "plc_connections"/"collection_groups"/"tags"`, `origin:
+// "tauri"`) as `crate::rest`'s `tag_registry_router`. The services are
+// banto-tags' finished building blocks (validation, friendly delete guards) -
+// this layer adds ONLY authorization + audit, exactly like the W2 commands
+// above, including the `*_body(&AppState, ..)` split for testability.
+
+/// `viewer`+ (spec M10): list PLC connections. Reads are never audited.
+#[tauri::command]
+async fn plc_connections_list(
+    state: State<'_, AppState>,
+) -> Result<Vec<PlcConnection>, BantoError> {
+    require_role(&state, Role::Viewer, "plc_connections").await?;
+    Ok(state
+        .plc_connections
+        .list(ListParams::default())
+        .await?
+        .rows)
+}
+
+/// `viewer`+ (spec M10): fetch one PLC connection.
+#[tauri::command]
+async fn plc_connections_get(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<PlcConnection, BantoError> {
+    require_role(&state, Role::Viewer, "plc_connections").await?;
+    state.plc_connections.get(id).await
+}
+
+async fn plc_connections_create_body(
+    state: &AppState,
+    input: PlcConnectionPayload,
+) -> Result<PlcConnection, BantoError> {
+    let actor = require_role(state, Role::Editor, "plc_connections").await?;
+    let created = state.plc_connections.create(input.into()).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "create",
+            resource: "plc_connections",
+            entity_id: Some(&created.id.to_string()),
+            detail: Some(serde_json::json!({ "name": created.name, "enabled": created.enabled })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(created)
+}
+
+/// `editor`+ (spec M10): create a PLC connection.
+#[tauri::command]
+async fn plc_connections_create(
+    state: State<'_, AppState>,
+    input: PlcConnectionPayload,
+) -> Result<PlcConnection, BantoError> {
+    plc_connections_create_body(&state, input).await
+}
+
+async fn plc_connections_update_body(
+    state: &AppState,
+    id: i64,
+    input: PlcConnectionPayload,
+) -> Result<PlcConnection, BantoError> {
+    let actor = require_role(state, Role::Editor, "plc_connections").await?;
+    let updated = state.plc_connections.update(id, input.into()).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "update",
+            resource: "plc_connections",
+            entity_id: Some(&id.to_string()),
+            detail: Some(serde_json::json!({ "name": updated.name, "enabled": updated.enabled })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(updated)
+}
+
+/// `editor`+ (spec M10): update a PLC connection.
+#[tauri::command]
+async fn plc_connections_update(
+    state: State<'_, AppState>,
+    id: i64,
+    input: PlcConnectionPayload,
+) -> Result<PlcConnection, BantoError> {
+    plc_connections_update_body(&state, id, input).await
+}
+
+async fn plc_connections_delete_body(state: &AppState, id: i64) -> Result<(), BantoError> {
+    let actor = require_role(state, Role::Editor, "plc_connections").await?;
+    state.plc_connections.delete(id).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "delete",
+            resource: "plc_connections",
+            entity_id: Some(&id.to_string()),
+            detail: None,
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(())
+}
+
+/// `editor`+ (spec M10): delete a PLC connection. Refuses (friendly
+/// Validation error) when a collection group still references it
+/// (`PlcConnectionService::delete`'s guard).
+#[tauri::command]
+async fn plc_connections_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoError> {
+    plc_connections_delete_body(&state, id).await
+}
+
+/// `viewer`+ (spec M10): list collection groups.
+#[tauri::command]
+async fn collection_groups_list(
+    state: State<'_, AppState>,
+) -> Result<Vec<CollectionGroup>, BantoError> {
+    require_role(&state, Role::Viewer, "collection_groups").await?;
+    Ok(state
+        .collection_groups
+        .list(ListParams::default())
+        .await?
+        .rows)
+}
+
+/// `viewer`+ (spec M10): fetch one collection group.
+#[tauri::command]
+async fn collection_groups_get(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<CollectionGroup, BantoError> {
+    require_role(&state, Role::Viewer, "collection_groups").await?;
+    state.collection_groups.get(id).await
+}
+
+async fn collection_groups_create_body(
+    state: &AppState,
+    input: CollectionGroupPayload,
+) -> Result<CollectionGroup, BantoError> {
+    let actor = require_role(state, Role::Editor, "collection_groups").await?;
+    let created = state.collection_groups.create(input.into()).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "create",
+            resource: "collection_groups",
+            entity_id: Some(&created.id.to_string()),
+            detail: Some(serde_json::json!({ "name": created.name, "enabled": created.enabled })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(created)
+}
+
+/// `editor`+ (spec M10): create a collection group.
+#[tauri::command]
+async fn collection_groups_create(
+    state: State<'_, AppState>,
+    input: CollectionGroupPayload,
+) -> Result<CollectionGroup, BantoError> {
+    collection_groups_create_body(&state, input).await
+}
+
+async fn collection_groups_update_body(
+    state: &AppState,
+    id: i64,
+    input: CollectionGroupPayload,
+) -> Result<CollectionGroup, BantoError> {
+    let actor = require_role(state, Role::Editor, "collection_groups").await?;
+    let updated = state.collection_groups.update(id, input.into()).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "update",
+            resource: "collection_groups",
+            entity_id: Some(&id.to_string()),
+            detail: Some(serde_json::json!({ "name": updated.name, "enabled": updated.enabled })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(updated)
+}
+
+/// `editor`+ (spec M10): update a collection group.
+#[tauri::command]
+async fn collection_groups_update(
+    state: State<'_, AppState>,
+    id: i64,
+    input: CollectionGroupPayload,
+) -> Result<CollectionGroup, BantoError> {
+    collection_groups_update_body(&state, id, input).await
+}
+
+async fn collection_groups_delete_body(state: &AppState, id: i64) -> Result<(), BantoError> {
+    let actor = require_role(state, Role::Editor, "collection_groups").await?;
+    state.collection_groups.delete(id).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "delete",
+            resource: "collection_groups",
+            entity_id: Some(&id.to_string()),
+            detail: None,
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(())
+}
+
+/// `editor`+ (spec M10): delete a collection group. Refuses (friendly
+/// Validation error) when a tag still references it
+/// (`CollectionGroupService::delete`'s guard).
+#[tauri::command]
+async fn collection_groups_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoError> {
+    collection_groups_delete_body(&state, id).await
+}
+
+/// `viewer`+ (spec M10): list tags.
+#[tauri::command]
+async fn tags_list(state: State<'_, AppState>) -> Result<Vec<Tag>, BantoError> {
+    require_role(&state, Role::Viewer, "tags").await?;
+    Ok(state.tags.list(ListParams::default()).await?.rows)
+}
+
+/// `viewer`+ (spec M10): fetch one tag.
+#[tauri::command]
+async fn tags_get(state: State<'_, AppState>, id: i64) -> Result<Tag, BantoError> {
+    require_role(&state, Role::Viewer, "tags").await?;
+    state.tags.get(id).await
+}
+
+async fn tags_create_body(state: &AppState, input: TagPayload) -> Result<Tag, BantoError> {
+    let actor = require_role(state, Role::Editor, "tags").await?;
+    let created = state.tags.create(input.into()).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "create",
+            resource: "tags",
+            entity_id: Some(&created.id.to_string()),
+            detail: Some(serde_json::json!({ "name": created.name, "enabled": created.enabled })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(created)
+}
+
+/// `editor`+ (spec M10): create a tag.
+#[tauri::command]
+async fn tags_create(state: State<'_, AppState>, input: TagPayload) -> Result<Tag, BantoError> {
+    tags_create_body(&state, input).await
+}
+
+async fn tags_update_body(state: &AppState, id: i64, input: TagPayload) -> Result<Tag, BantoError> {
+    let actor = require_role(state, Role::Editor, "tags").await?;
+    let updated = state.tags.update(id, input.into()).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "update",
+            resource: "tags",
+            entity_id: Some(&id.to_string()),
+            detail: Some(serde_json::json!({ "name": updated.name, "enabled": updated.enabled })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(updated)
+}
+
+/// `editor`+ (spec M10): update a tag.
+#[tauri::command]
+async fn tags_update(
+    state: State<'_, AppState>,
+    id: i64,
+    input: TagPayload,
+) -> Result<Tag, BantoError> {
+    tags_update_body(&state, id, input).await
+}
+
+async fn tags_delete_body(state: &AppState, id: i64) -> Result<(), BantoError> {
+    let actor = require_role(state, Role::Editor, "tags").await?;
+    state.tags.delete(id).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "delete",
+            resource: "tags",
+            entity_id: Some(&id.to_string()),
+            detail: None,
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(())
+}
+
+/// `editor`+ (spec M10): delete a tag.
+#[tauri::command]
+async fn tags_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoError> {
+    tags_delete_body(&state, id).await
+}
+
+// --- QR文字列リスト（デバッグ支援, /qr-codes 画面, spec §1 両経路対称） -----
+// The Tauri twins of `relay_wright_core::rest`'s `/api/qr-strings/*` routes,
+// with the same `*_body(&AppState, ..)` split for testability and the same
+// viewer-read / editor-write / audited-mutation treatment as the registries
+// above.
+
+/// `viewer`+ (spec M10): list QR strings in display order, each with its
+/// server-rendered SVG. Reads are never audited.
+#[tauri::command]
+async fn qr_strings_list(state: State<'_, AppState>) -> Result<Vec<QrString>, BantoError> {
+    require_role(&state, Role::Viewer, "qr_strings").await?;
+    state.qr_strings.list().await
+}
+
+/// `viewer`+ (spec M10): fetch one QR string.
+#[tauri::command]
+async fn qr_strings_get(state: State<'_, AppState>, id: i64) -> Result<QrString, BantoError> {
+    require_role(&state, Role::Viewer, "qr_strings").await?;
+    state.qr_strings.get(id).await
+}
+
+async fn qr_strings_create_body(
+    state: &AppState,
+    input: QrStringInput,
+) -> Result<QrString, BantoError> {
+    let actor = require_role(state, Role::Editor, "qr_strings").await?;
+    let created = state.qr_strings.create(input).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "create",
+            resource: "qr_strings",
+            entity_id: Some(&created.id.to_string()),
+            detail: Some(serde_json::json!({ "label": created.label, "text": created.text })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(created)
+}
+
+/// `editor`+ (spec M10): create a QR string (appended to the end of the list).
+#[tauri::command]
+async fn qr_strings_create(
+    state: State<'_, AppState>,
+    input: QrStringInput,
+) -> Result<QrString, BantoError> {
+    qr_strings_create_body(&state, input).await
+}
+
+async fn qr_strings_update_body(
+    state: &AppState,
+    id: i64,
+    input: QrStringInput,
+) -> Result<QrString, BantoError> {
+    let actor = require_role(state, Role::Editor, "qr_strings").await?;
+    let updated = state.qr_strings.update(id, input).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "update",
+            resource: "qr_strings",
+            entity_id: Some(&id.to_string()),
+            detail: Some(serde_json::json!({ "label": updated.label, "text": updated.text })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(updated)
+}
+
+/// `editor`+ (spec M10): update a QR string's label/text.
+#[tauri::command]
+async fn qr_strings_update(
+    state: State<'_, AppState>,
+    id: i64,
+    input: QrStringInput,
+) -> Result<QrString, BantoError> {
+    qr_strings_update_body(&state, id, input).await
+}
+
+async fn qr_strings_delete_body(state: &AppState, id: i64) -> Result<(), BantoError> {
+    let actor = require_role(state, Role::Editor, "qr_strings").await?;
+    state.qr_strings.delete(id).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "delete",
+            resource: "qr_strings",
+            entity_id: Some(&id.to_string()),
+            detail: None,
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(())
+}
+
+/// `editor`+ (spec M10): delete a QR string.
+#[tauri::command]
+async fn qr_strings_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoError> {
+    qr_strings_delete_body(&state, id).await
+}
+
+async fn qr_strings_reorder_body(
+    state: &AppState,
+    input: QrStringsReorderPayload,
+) -> Result<Vec<QrString>, BantoError> {
+    let actor = require_role(state, Role::Editor, "qr_strings").await?;
+    let reordered = state.qr_strings.reorder(input.ids.clone()).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "reorder",
+            resource: "qr_strings",
+            entity_id: Some("-"),
+            detail: Some(serde_json::json!({ "ids": input.ids })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(reordered)
+}
+
+/// `editor`+ (spec M10): bulk-set the display order (ids in new order) and
+/// return the reordered list.
+#[tauri::command]
+async fn qr_strings_reorder(
+    state: State<'_, AppState>,
+    input: QrStringsReorderPayload,
+) -> Result<Vec<QrString>, BantoError> {
+    qr_strings_reorder_body(&state, input).await
+}
+
 // --- W3-B2: auto-write engine control ---------------------------------------
 //
 // The Tauri half of the engine's dual-path (invariant §1 両経路対称): the same
@@ -1731,6 +2242,12 @@ pub fn run() {
             let write_targets = WriteTargetService::new(pool.clone());
             let write_rules = WriteRuleService::new(pool.clone());
             let write_audit_log = WriteAuditLogService::new(pool.clone());
+            // R1-B: banto-tags' registry services over the same shared pool.
+            let plc_connections = PlcConnectionService::new(pool.clone());
+            let collection_groups = CollectionGroupService::new(pool.clone());
+            let tags = TagService::new(pool.clone());
+            // QR文字列リスト（/qr-codes 画面のデバッグ支援）。
+            let qr_strings = QrStringService::new(pool.clone());
             // Cloned (not moved) into `audit` so the pool stays available for
             // the W3-B2 auto-write engine start below and `AppState.pool`
             // (which `engine_reload` needs to rebuild the engine from the DB).
@@ -1969,6 +2486,10 @@ pub fn run() {
                     write_targets.clone(),
                     write_rules.clone(),
                     write_audit_log.clone(),
+                    plc_connections.clone(),
+                    collection_groups.clone(),
+                    tags.clone(),
+                    qr_strings.clone(),
                     engine_control.clone(),
                     rest_auth.clone(),
                     events.clone(),
@@ -2035,6 +2556,10 @@ pub fn run() {
                 write_targets,
                 write_rules,
                 write_audit_log,
+                plc_connections,
+                collection_groups,
+                tags,
+                qr_strings,
                 pool,
                 engine: AsyncMutex::new(initial_engine),
                 engine_control,
@@ -2087,6 +2612,27 @@ pub fn run() {
             write_rules_create,
             write_rules_update,
             write_rules_delete,
+            plc_connections_list,
+            plc_connections_get,
+            plc_connections_create,
+            plc_connections_update,
+            plc_connections_delete,
+            collection_groups_list,
+            collection_groups_get,
+            collection_groups_create,
+            collection_groups_update,
+            collection_groups_delete,
+            tags_list,
+            tags_get,
+            tags_create,
+            tags_update,
+            tags_delete,
+            qr_strings_list,
+            qr_strings_get,
+            qr_strings_create,
+            qr_strings_update,
+            qr_strings_delete,
+            qr_strings_reorder,
             write_audit_log_list,
             engine_arm,
             engine_disarm,
@@ -2145,6 +2691,10 @@ mod tests {
             write_targets: WriteTargetService::new(pool.clone()),
             write_rules: WriteRuleService::new(pool.clone()),
             write_audit_log: WriteAuditLogService::new(pool.clone()),
+            plc_connections: PlcConnectionService::new(pool.clone()),
+            collection_groups: CollectionGroupService::new(pool.clone()),
+            tags: TagService::new(pool.clone()),
+            qr_strings: QrStringService::new(pool.clone()),
             pool,
             // Engine-less: the command-body tests that use this helper only
             // exercise the RBAC gate, which rejects before ever touching the
@@ -2182,6 +2732,10 @@ mod tests {
             write_targets: WriteTargetService::new(pool.clone()),
             write_rules: WriteRuleService::new(pool.clone()),
             write_audit_log: WriteAuditLogService::new(pool.clone()),
+            plc_connections: PlcConnectionService::new(pool.clone()),
+            collection_groups: CollectionGroupService::new(pool.clone()),
+            tags: TagService::new(pool.clone()),
+            qr_strings: QrStringService::new(pool.clone()),
             pool,
             engine: AsyncMutex::new(None),
             engine_control: std::sync::Arc::new(AsyncMutex::new(None)),
@@ -2405,6 +2959,10 @@ mod tests {
             write_targets: WriteTargetService::new(pool.clone()),
             write_rules: WriteRuleService::new(pool.clone()),
             write_audit_log: WriteAuditLogService::new(pool.clone()),
+            plc_connections: PlcConnectionService::new(pool.clone()),
+            collection_groups: CollectionGroupService::new(pool.clone()),
+            tags: TagService::new(pool.clone()),
+            qr_strings: QrStringService::new(pool.clone()),
             pool: pool.clone(),
             engine: AsyncMutex::new(None),
             engine_control: std::sync::Arc::new(AsyncMutex::new(None)),
@@ -2442,6 +3000,10 @@ mod tests {
             write_targets: WriteTargetService::new(pool.clone()),
             write_rules: WriteRuleService::new(pool.clone()),
             write_audit_log: WriteAuditLogService::new(pool.clone()),
+            plc_connections: PlcConnectionService::new(pool.clone()),
+            collection_groups: CollectionGroupService::new(pool.clone()),
+            tags: TagService::new(pool.clone()),
+            qr_strings: QrStringService::new(pool.clone()),
             pool: pool.clone(),
             engine: AsyncMutex::new(Some(engine)),
             engine_control: std::sync::Arc::new(AsyncMutex::new(Some(control))),
@@ -2451,13 +3013,11 @@ mod tests {
 
     #[tokio::test]
     async fn write_targets_create_is_recorded_with_tauri_origin() {
-        use banto_tags::{PlcConnectionInput, PlcConnectionService};
-
         let (state, pool) = app_state_with_pool().await;
         // A PLC connection for the target to reference (validated at the
         // service layer since it is a cross-lineage reference).
         let conn = PlcConnectionService::new(pool)
-            .create(PlcConnectionInput {
+            .create(banto_tags::PlcConnectionInput {
                 name: "PLC1".to_string(),
                 protocol: "modbus-tcp".to_string(),
                 host: "10.0.0.1".to_string(),
@@ -2547,6 +3107,221 @@ mod tests {
             "expected a denied entry, got {:?}",
             entries.rows
         );
+    }
+
+    // --- QR文字列 dual-path symmetry (Tauri half) -----------------------------
+
+    /// The Tauri half of the qr_strings create+audit symmetry (its REST twin
+    /// is `relay_wright_core::rest`'s
+    /// `rest_editor_can_create_qr_string_and_it_is_audited`): an `editor`
+    /// session can create a QR string via the command body (the response
+    /// carrying the server-rendered SVG), recorded with `origin: "tauri"`.
+    #[tokio::test]
+    async fn qr_strings_create_is_recorded_with_tauri_origin() {
+        let state = app_state().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create editor");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+
+        let created = qr_strings_create_body(
+            &state,
+            QrStringInput {
+                label: "開始".to_string(),
+                text: "START".to_string(),
+            },
+        )
+        .await
+        .expect("editor create should succeed");
+        assert_eq!(created.text, "START");
+        assert!(
+            created.svg.contains("<svg"),
+            "expected a rendered SVG, got: {}",
+            created.svg
+        );
+
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        let entry = entries
+            .rows
+            .iter()
+            .find(|r| r.action == "create" && r.resource == "qr_strings")
+            .expect("expected a qr_strings create audit entry");
+        assert_eq!(entry.origin, "tauri");
+        assert_eq!(entry.result, "ok");
+        assert_eq!(entry.actor_username.as_deref(), Some("editor"));
+    }
+
+    /// A `viewer` session is denied (and the denial audited) when creating a
+    /// QR string - the Tauri twin of the REST `require_editor` denial.
+    #[tokio::test]
+    async fn qr_strings_create_denies_viewer_and_audits_it() {
+        let state = app_state().await;
+        let viewer = state
+            .users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create viewer");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+
+        let err = qr_strings_create_body(
+            &state,
+            QrStringInput {
+                label: String::new(),
+                text: "START".to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, BantoError::Forbidden));
+
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        assert!(
+            entries
+                .rows
+                .iter()
+                .any(|r| r.action == "denied" && r.resource == "qr_strings"),
+            "expected a denied entry, got {:?}",
+            entries.rows
+        );
+        assert!(!entries
+            .rows
+            .iter()
+            .any(|r| r.action == "create" && r.resource == "qr_strings"));
+    }
+
+    // --- R1-B: tag registry dual-path symmetry (Tauri half) -----------------
+
+    /// The Tauri half of the R1-B create+audit symmetry (its REST twin is
+    /// `relay_wright_core::rest`'s `rest_editor_can_create_tag_and_it_is_audited`):
+    /// an `editor` session can create a tag via the command body, and it is
+    /// recorded to the SAME audit log with `origin: "tauri"` /
+    /// `resource: "tags"`. The PLC connection + collection group the tag needs
+    /// are seeded through the state's own services (they exist as commands now,
+    /// unlike W2's cross-lineage seed).
+    #[tokio::test]
+    async fn tags_create_is_recorded_with_tauri_origin() {
+        let (state, _pool) = app_state_with_pool().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create editor");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+
+        let conn = plc_connections_create_body(
+            &state,
+            PlcConnectionPayload {
+                name: "PLC1".to_string(),
+                protocol: "slmp".to_string(),
+                host: "10.0.0.1".to_string(),
+                port: 5007,
+                unit_id: 1,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("editor create plc connection should succeed");
+        let group = collection_groups_create_body(
+            &state,
+            CollectionGroupPayload {
+                name: "G1".to_string(),
+                plc_connection_id: conn.id,
+                period_ms: 1_000,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("editor create collection group should succeed");
+
+        let created = tags_create_body(
+            &state,
+            TagPayload {
+                name: "温度センサ".to_string(),
+                collection_group_id: group.id,
+                address: "D100".to_string(),
+                data_type: "i16".to_string(),
+                raw_lo: None,
+                raw_hi: None,
+                eng_lo: None,
+                eng_hi: None,
+                unit: None,
+                decimals: 0,
+                threshold_h: None,
+                threshold_hh: None,
+                threshold_l: None,
+                threshold_ll: None,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("editor create tag should succeed");
+        assert_eq!(created.name, "温度センサ");
+
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        for resource in ["plc_connections", "collection_groups", "tags"] {
+            let entry = entries
+                .rows
+                .iter()
+                .find(|r| r.action == "create" && r.resource == resource)
+                .unwrap_or_else(|| panic!("expected a {resource} create audit entry"));
+            assert_eq!(entry.origin, "tauri");
+            assert_eq!(entry.result, "ok");
+            assert_eq!(entry.actor_username.as_deref(), Some("editor"));
+        }
+    }
+
+    /// A `viewer` session is denied (and the denial audited with
+    /// `resource: "tags"`) when creating a tag - the Tauri twin of the REST
+    /// `require_editor` denial for the tag registry.
+    #[tokio::test]
+    async fn tags_create_denies_viewer_and_audits_it() {
+        let state = app_state().await;
+        let viewer = state
+            .users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create viewer");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+
+        let err = tags_create_body(
+            &state,
+            TagPayload {
+                name: "温度センサ".to_string(),
+                collection_group_id: 1,
+                address: "D100".to_string(),
+                data_type: "i16".to_string(),
+                raw_lo: None,
+                raw_hi: None,
+                eng_lo: None,
+                eng_hi: None,
+                unit: None,
+                decimals: 0,
+                threshold_h: None,
+                threshold_hh: None,
+                threshold_l: None,
+                threshold_ll: None,
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, BantoError::Forbidden));
+
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        assert!(
+            entries
+                .rows
+                .iter()
+                .any(|r| r.action == "denied" && r.resource == "tags"),
+            "expected a denied entry, got {:?}",
+            entries.rows
+        );
+        assert!(!entries
+            .rows
+            .iter()
+            .any(|r| r.action == "create" && r.resource == "tags"));
     }
 
     // --- W3-B2: engine control dual-path (Tauri half) -----------------------

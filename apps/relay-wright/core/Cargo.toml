@@ -41,6 +41,10 @@ sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros", "mig
 serde = { workspace = true }
 serde_json = { workspace = true }
 axum = { workspace = true }
+# QR文字列画面（qr_strings.rs）: 登録された文字列をサーバー側で SVG に描画する。
+# workspace 既存の依存（src-tauri の LAN アクセス QR と同じクレート/機能）で、
+# 新規依存は増やさない。
+qrcode = { workspace = true }
 # `fs` (spec M17): `crate::backup::BackupService` reads/writes `backups/`
 # and the pending-restore file directly via `tokio::fs`. Cargo's feature
 # unification already pulls this in transitively via `sqlx`'s
