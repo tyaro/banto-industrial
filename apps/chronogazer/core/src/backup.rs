@@ -689,7 +689,27 @@ mod tests {
 
         let listed = svc.list().await.expect("list should succeed");
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0], created);
+        assert_eq!(listed[0].file_name, created.file_name);
+        assert_eq!(listed[0].size_bytes, created.size_bytes);
+        // Deliberately NOT `assert_eq!(listed[0], created)`: the two
+        // `created_at`s come from different clocks - `create()` snapshots the
+        // DB's `datetime('now')` BEFORE the `VACUUM INTO`, while `list()`
+        // derives it from the file's mtime (set when the vacuum finishes
+        // writing). Crossing a second boundary between those two moments makes
+        // them differ by one second, which made exact equality a rare but real
+        // flake under parallel test load (slower vacuum = wider race window).
+        // Both stamps DO come from the same host clock though, and the mtime
+        // is always set after the snapshot, so ordering is deterministic
+        // (ISO "YYYY-MM-DD HH:MM:SS" compares lexicographically ==
+        // chronologically) - this still catches `list()` regressing to a
+        // garbage timestamp (e.g. its `unwrap_or(UNIX_EPOCH)` mtime fallback
+        // kicking in would yield "1970-01-01 ...").
+        assert!(
+            listed[0].created_at >= created.created_at,
+            "list()'s mtime-derived created_at ({}) predates create()'s DB snapshot ({})",
+            listed[0].created_at,
+            created.created_at
+        );
 
         let bytes = svc
             .read(&created.file_name)
