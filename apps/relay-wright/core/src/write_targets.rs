@@ -135,14 +135,17 @@ fn collect_errors(input: &WriteTargetInput) -> (Vec<FieldError>, Normalized) {
         });
     }
 
-    // Reuse banto-tags' canonical data-type list so the two never drift
-    // (this app's SQL CHECK in 0005 is the same set).
-    if !banto_tags::ALLOWED_DATA_TYPES.contains(&input.data_type.as_str()) {
+    // Reuse banto-tags' canonical *numeric* data-type list so the two never
+    // drift (this app's SQL CHECK in 0005 is the same set). NUMERIC_DATA_TYPES,
+    // not ALLOWED_DATA_TYPES: the tag registry gained "string" in S1, but
+    // write targets stay numeric-only until the S2 engine work - the numeric
+    // subset is exactly the pre-S1 list, so validation behavior is unchanged.
+    if !banto_tags::NUMERIC_DATA_TYPES.contains(&input.data_type.as_str()) {
         errors.push(FieldError {
             field: "dataType".to_string(),
             message: format!(
                 "対応データ型は {} のいずれかです",
-                banto_tags::ALLOWED_DATA_TYPES.join(", ")
+                banto_tags::NUMERIC_DATA_TYPES.join(", ")
             ),
         });
     }
@@ -558,7 +561,7 @@ mod tests {
     #[tokio::test]
     async fn create_accepts_every_allowed_data_type() {
         let (svc, plc) = setup().await;
-        for (i, dt) in banto_tags::ALLOWED_DATA_TYPES.iter().enumerate() {
+        for (i, dt) in banto_tags::NUMERIC_DATA_TYPES.iter().enumerate() {
             let mut input = sample(&format!("T{i}"), plc);
             input.data_type = dt.to_string();
             svc.create(input)

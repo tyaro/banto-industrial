@@ -24,6 +24,14 @@ use crate::support::{map_write_error, max_length_message, range_message, require
 /// string tags through `banto_plc`'s batch API using [`Tag::string_length`].
 pub const ALLOWED_DATA_TYPES: &[&str] = &["bit", "i16", "u16", "i32", "u32", "f32", "string"];
 
+/// The numeric/bit subset of [`ALLOWED_DATA_TYPES`] - i.e. the pre-S1 list.
+/// For consumers whose own schema is numeric-only and must NOT widen with the
+/// tag registry: relay-wright's `write_targets` validation (its SQL `CHECK`
+/// has no `'string'`; string write targets are S2 work) and any similar
+/// resource that borrowed the tag vocabulary. `allowed_is_numeric_plus_string`
+/// below pins the relationship so the two lists cannot drift apart silently.
+pub const NUMERIC_DATA_TYPES: &[&str] = &["bit", "i16", "u16", "i32", "u32", "f32"];
+
 /// The one data type with a mandatory companion column (`string_length`) and
 /// no scaling/threshold story. Kept as a named constant so the validation
 /// below and any consumer reads as prose.
@@ -777,6 +785,15 @@ mod tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
+    }
+
+    /// The relationship [`NUMERIC_DATA_TYPES`]'s doc comment promises:
+    /// exactly [`ALLOWED_DATA_TYPES`] minus `"string"`, in the same order.
+    #[test]
+    fn allowed_is_numeric_plus_string() {
+        let mut expected: Vec<&str> = NUMERIC_DATA_TYPES.to_vec();
+        expected.push(STRING_DATA_TYPE);
+        assert_eq!(ALLOWED_DATA_TYPES, expected.as_slice());
     }
 
     // --- validation: string tags (S1) -----------------------------------

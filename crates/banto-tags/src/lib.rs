@@ -42,7 +42,9 @@ pub use plc_connection::{
     PlcConnection, PlcConnectionInput, PlcConnectionService, ALLOWED_PROTOCOLS,
 };
 pub use scaling::{scale_raw, unscale, Scaling};
-pub use tag::{Tag, TagInput, TagService, ALLOWED_DATA_TYPES, STRING_DATA_TYPE};
+pub use tag::{
+    Tag, TagInput, TagService, ALLOWED_DATA_TYPES, NUMERIC_DATA_TYPES, STRING_DATA_TYPE,
+};
 
 use banto_core::BantoError;
 use sqlx::SqlitePool;
