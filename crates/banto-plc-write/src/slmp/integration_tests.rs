@@ -603,9 +603,9 @@ async fn string_write_then_read_back_round_trips_ascii_sjis_and_full_spans() {
 
     let results = writer
         .write_batch_mixed(&[
-            swreq("D0", 4, "ABC"),        // ASCII, padded
-            swreq("D100", 4, "テスト"),   // multi-byte SJIS (6 bytes in 8)
-            swreq("D200", 2, "ABCD"),     // exactly 2L bytes, no room for NUL
+            swreq("D0", 4, "ABC"),      // ASCII, padded
+            swreq("D100", 4, "テスト"), // multi-byte SJIS (6 bytes in 8)
+            swreq("D200", 2, "ABCD"),   // exactly 2L bytes, no room for NUL
         ])
         .await
         .expect("write_batch_mixed ok");
@@ -702,7 +702,7 @@ async fn mixed_numeric_and_string_batch_round_trips_in_single_calls() {
 
     let results = writer
         .write_batch_mixed(&[
-            swreq("D0", 4, "OK"),                                  // D0..D3
+            swreq("D0", 4, "OK"),                                          // D0..D3
             BatchWriteRequest::Numeric(word("D4", DataType::U16, 1234.0)), // adjacent: same group
             BatchWriteRequest::Numeric(bit("M0", true)),
         ])

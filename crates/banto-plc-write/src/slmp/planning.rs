@@ -215,15 +215,13 @@ pub fn plan_slmp_write_batch(
                             continue;
                         }
                     },
-                    SlmpAccess::Word => {
-                        match encode_word_value(r.value, r.data_type, word_order) {
-                            Ok(words) => ItemPayload::Words(words),
-                            Err(e) => {
-                                immediate_bad.push((index, e));
-                                continue;
-                            }
+                    SlmpAccess::Word => match encode_word_value(r.value, r.data_type, word_order) {
+                        Ok(words) => ItemPayload::Words(words),
+                        Err(e) => {
+                            immediate_bad.push((index, e));
+                            continue;
                         }
-                    }
+                    },
                 }
             }
             BatchWriteRequest::String(s) => {

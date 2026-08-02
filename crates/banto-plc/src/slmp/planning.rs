@@ -754,8 +754,10 @@ mod tests {
             req("M0", DataType::Bit),
             req("D0", DataType::Bit), // immediate bad
         ];
-        let batch: Vec<BatchReadRequest> =
-            numeric.iter().map(|&r| BatchReadRequest::Numeric(r)).collect();
+        let batch: Vec<BatchReadRequest> = numeric
+            .iter()
+            .map(|&r| BatchReadRequest::Numeric(r))
+            .collect();
         assert_eq!(plan_slmp_requests(&numeric), plan_slmp_batch(&batch));
     }
 

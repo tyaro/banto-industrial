@@ -536,8 +536,7 @@ mod tests {
         ];
         let outcome = plan_batch_requests(&requests);
 
-        let mut bad_indices: Vec<usize> =
-            outcome.immediate_bad.iter().map(|(i, _)| *i).collect();
+        let mut bad_indices: Vec<usize> = outcome.immediate_bad.iter().map(|(i, _)| *i).collect();
         bad_indices.sort();
         assert_eq!(bad_indices, vec![0, 2]);
         let string_bad = outcome

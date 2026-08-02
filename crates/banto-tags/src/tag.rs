@@ -812,7 +812,10 @@ mod tests {
     #[tokio::test]
     async fn create_accepts_string_length_boundaries() {
         let (svc, group_id) = setup().await;
-        for (i, len) in [MIN_STRING_LENGTH, MAX_STRING_LENGTH].into_iter().enumerate() {
+        for (i, len) in [MIN_STRING_LENGTH, MAX_STRING_LENGTH]
+            .into_iter()
+            .enumerate()
+        {
             svc.create(string_input(&format!("S{i}"), group_id, Some(len)))
                 .await
                 .unwrap_or_else(|e| panic!("string_length {len} should be accepted: {e:?}"));
@@ -923,8 +926,7 @@ mod tests {
         let err = svc.create(input).await.unwrap_err();
         match err {
             BantoError::Validation { field_errors } => {
-                let fields: Vec<&str> =
-                    field_errors.iter().map(|e| e.field.as_str()).collect();
+                let fields: Vec<&str> = field_errors.iter().map(|e| e.field.as_str()).collect();
                 assert_eq!(fields, vec!["thresholdH", "thresholdLl"]);
                 for e in &field_errors {
                     assert_eq!(e.message, "string 型ではしきい値を設定できません");
