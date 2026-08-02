@@ -26,7 +26,11 @@ import { CSRF_HEADER, getBantoMode } from './setup';
 
 // --- wire types (camelCase, matching the Rust serde shapes) -----------------
 
-export type WriteDataType = 'bit' | 'i16' | 'u16' | 'i32' | 'u32' | 'f32';
+export type WriteDataType = 'bit' | 'i16' | 'u16' | 'i32' | 'u32' | 'f32' | 'string';
+
+/** `string` write-target `stringLength` bounds — mirrors the backend. */
+export const MIN_STRING_LENGTH = 1;
+export const MAX_STRING_LENGTH = 128;
 
 /** Mirrors `relay_wright_core::write_targets::WriteTarget`. */
 export interface WriteTarget {
@@ -35,6 +39,12 @@ export interface WriteTarget {
 	plcConnectionId: number;
 	address: string;
 	dataType: WriteDataType;
+	/**
+	 * Consecutive 16-bit word devices a `string` write target occupies;
+	 * `Some(1..=128)` iff `dataType === 'string'`, `null` otherwise (S2
+	 * 文字列タグ). A string target has no scaling.
+	 */
+	stringLength: number | null;
 	rawLo: number | null;
 	rawHi: number | null;
 	engLo: number | null;
@@ -50,6 +60,7 @@ export interface WriteTargetInput {
 	plcConnectionId: number;
 	address: string;
 	dataType: WriteDataType;
+	stringLength?: number | null;
 	rawLo?: number | null;
 	rawHi?: number | null;
 	engLo?: number | null;
@@ -63,22 +74,31 @@ export type EdgeMode = 'rising' | 'falling' | 'change';
 export type WriteValueMode = 'constant' | 'copy_from_source';
 export type ConditionOperator = 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte' | 'between' | 'bit_is';
 
-/** Mirrors `relay_wright_core::write_rule_conditions::WriteRuleCondition`. */
+/** Operators legal for a STRING source condition (S2 文字列タグ). */
+export const STRING_CONDITION_OPERATORS: readonly ConditionOperator[] = ['eq', 'neq'];
+
+/**
+ * Mirrors `relay_wright_core::write_rule_conditions::WriteRuleCondition`.
+ * Exactly one comparand side is set: `thresholdValue` (+`thresholdValue2` for
+ * `between`) for a numeric source, `thresholdText` for a string source.
+ */
 export interface WriteRuleCondition {
 	id: number;
 	writeRuleId: number;
 	sourceTagId: number;
 	operator: ConditionOperator;
-	thresholdValue: number;
+	thresholdValue: number | null;
 	thresholdValue2: number | null;
+	thresholdText: string | null;
 }
 
 /** Mirrors `WriteRuleConditionInput`. */
 export interface WriteRuleConditionInput {
 	sourceTagId: number;
 	operator: ConditionOperator;
-	thresholdValue: number;
+	thresholdValue?: number | null;
 	thresholdValue2?: number | null;
+	thresholdText?: string | null;
 }
 
 /** Mirrors `relay_wright_core::write_rules::WriteRuleDetail` (flat rule + conditions). */
@@ -91,6 +111,8 @@ export interface WriteRuleDetail {
 	writeTargetId: number;
 	writeValueMode: WriteValueMode;
 	writeConstantValue: number | null;
+	/** The constant for a STRING write target (S2 文字列タグ); `null` otherwise. */
+	writeConstantText: string | null;
 	writeSourceTagId: number | null;
 	conditions: WriteRuleCondition[];
 }
@@ -104,6 +126,7 @@ export interface WriteRuleInput {
 	writeTargetId: number;
 	writeValueMode: WriteValueMode;
 	writeConstantValue?: number | null;
+	writeConstantText?: string | null;
 	writeSourceTagId?: number | null;
 	conditions: WriteRuleConditionInput[];
 }
