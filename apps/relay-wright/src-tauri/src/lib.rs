@@ -3793,12 +3793,9 @@ mod tests {
             .unwrap();
         assert_eq!(count, 2, "nothing may be deleted on a denial");
         let entries = state.audit.list(ListParams::default()).await.unwrap();
-        assert!(entries
-            .rows
-            .iter()
-            .any(|r| r.action == "denied"
-                && r.resource == "plc_connections"
-                && r.actor_username.as_deref() == Some("viewer")));
+        assert!(entries.rows.iter().any(|r| r.action == "denied"
+            && r.resource == "plc_connections"
+            && r.actor_username.as_deref() == Some("viewer")));
         assert!(!entries
             .rows
             .iter()

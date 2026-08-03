@@ -4870,10 +4870,22 @@ mod tests {
         assert_eq!(summary["groups"], 1);
         assert_eq!(summary["tags"], 1);
 
-        for path in ["/api/plc-connections", "/api/collection-groups", "/api/tags"] {
-            let response = router.clone().oneshot(get_auth(path, &editor)).await.unwrap();
+        for path in [
+            "/api/plc-connections",
+            "/api/collection-groups",
+            "/api/tags",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(get_auth(path, &editor))
+                .await
+                .unwrap();
             let rows = body_json(response).await;
-            assert_eq!(rows.as_array().unwrap().len(), 0, "GET {path} after cascade");
+            assert_eq!(
+                rows.as_array().unwrap().len(),
+                0,
+                "GET {path} after cascade"
+            );
         }
 
         let entries = audit.list(ListParams::default()).await.unwrap();
@@ -4944,7 +4956,11 @@ mod tests {
             ("/api/collection-groups", 0),
             ("/api/tags", 0),
         ] {
-            let response = router.clone().oneshot(get_auth(path, &editor)).await.unwrap();
+            let response = router
+                .clone()
+                .oneshot(get_auth(path, &editor))
+                .await
+                .unwrap();
             let rows = body_json(response).await;
             assert_eq!(rows.as_array().unwrap().len(), expected, "GET {path}");
         }

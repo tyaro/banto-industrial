@@ -196,12 +196,14 @@ pub async fn cascade_delete_plc_connection(
         return Err(not_found(CONNECTION_RESOURCE, id));
     }
 
-    let tags = sqlx::query(&format!("DELETE FROM tags WHERE id IN {TAGS_OF_CONNECTION}"))
-        .bind(id)
-        .execute(&mut *tx)
-        .await
-        .map_err(banto_storage::storage_error)?
-        .rows_affected();
+    let tags = sqlx::query(&format!(
+        "DELETE FROM tags WHERE id IN {TAGS_OF_CONNECTION}"
+    ))
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .map_err(banto_storage::storage_error)?
+    .rows_affected();
     let groups = sqlx::query("DELETE FROM collection_groups WHERE plc_connection_id = ?")
         .bind(id)
         .execute(&mut *tx)
@@ -288,7 +290,11 @@ mod tests {
         }
 
         let mut group_ids = Vec::new();
-        for (name, conn_id) in [("G1", conn_ids[0]), ("G2", conn_ids[0]), ("G3", conn_ids[1])] {
+        for (name, conn_id) in [
+            ("G1", conn_ids[0]),
+            ("G2", conn_ids[0]),
+            ("G3", conn_ids[1]),
+        ] {
             let group = groups
                 .create(CollectionGroupInput {
                     name: name.to_string(),
@@ -381,7 +387,10 @@ mod tests {
             .await,
             1
         );
-        assert_eq!(count(&pool, "SELECT COUNT(*) FROM collection_groups").await, 1);
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM collection_groups").await,
+            1
+        );
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM tags").await, 1);
         // Nothing dangling.
         let violations: Vec<(String,)> = sqlx::query_as("PRAGMA foreign_key_check")
@@ -541,8 +550,14 @@ mod tests {
         );
 
         // Nothing was deleted by either preview.
-        assert_eq!(count(&pool, "SELECT COUNT(*) FROM plc_connections").await, 2);
-        assert_eq!(count(&pool, "SELECT COUNT(*) FROM collection_groups").await, 3);
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM plc_connections").await,
+            2
+        );
+        assert_eq!(
+            count(&pool, "SELECT COUNT(*) FROM collection_groups").await,
+            3
+        );
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM tags").await, 4);
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM write_targets").await, 3);
         assert_eq!(count(&pool, "SELECT COUNT(*) FROM write_rules").await, 3);
@@ -583,7 +598,9 @@ mod tests {
     async fn missing_ids_are_not_found_everywhere() {
         let (pool, _c1, _c2, _g1, _g2, _tags) = seeded().await;
         for err in [
-            cascade_preview_plc_connection(&pool, 999).await.unwrap_err(),
+            cascade_preview_plc_connection(&pool, 999)
+                .await
+                .unwrap_err(),
             cascade_delete_plc_connection(&pool, 999).await.unwrap_err(),
         ] {
             assert!(
