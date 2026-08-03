@@ -39,6 +39,11 @@ pub mod project;
 // QR文字列リスト（デバッグ支援）: タッチパネルのQRリーダーに画面から読ませる
 // 文字列の登録・並び替えと、そのQRコードSVGのサーバー側生成（/qr-codes 画面）。
 pub mod qr_strings;
+// feature/easy-delete: cascade delete for the tag registry (connection →
+// groups → tags in one transaction) plus the preview counts the confirm
+// dialogs show. Lives HERE - not in banto-tags, whose guarded deletes are
+// shared semantics other apps rely on and must stay untouched.
+pub mod registry_cascade;
 pub mod rest;
 pub mod settings;
 // Crate-internal validation/error helpers shared by the write_* service
