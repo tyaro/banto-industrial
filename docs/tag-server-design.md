@@ -56,6 +56,29 @@ banto-industrial の資産で実現し、外部公開インターフェースと
   `signal-porter` / `tag-warden`。**オーナー決定待ち**（§10-1）。以下本文書では
   「タグサーバー」と呼ぶ。
 
+### 1.1 FA-Server との概念対応（マニュアル調査 2026-08-04）
+
+FA-Server は**タグ・イベント・アクション・ビュー・インターフェース**の
+5概念で構成され、タグは **Unit / Folder / Tag の3層構造**を持つ
+（[基礎知識 > 通信機能とタグ](https://docs.roboticsware.com/ja/6.0.16/fa-server/contents/knowledge_tag.html)、
+[タグ編 > タグの基本](https://docs.roboticsware.com/ja/6.0.15/fa-server/contents/cmn_tag_overview.html)）。
+本設計との対応:
+
+| FA-Server | 本製品群 | 備考 |
+| --- | --- | --- |
+| Unit / Folder / Tag | `PlcConnection` / `CollectionGroup` / `Tag`（I1） | 3層構造が偶然一致 — 外部名 `{connection}.{group}.{tag}`（§4）は業界慣行と整合 |
+| タグ（PLC通信タグ） | タグ空間 = `CurrentValuesHandle` | §3.2 |
+| タグ（内部演算ワークエリア） | **未対応** | 内部タグ（§10-12） |
+| ネットワークタグ（ノード間連携） | 非スコープ | 複数サーバー構成が必要になったら検討 |
+| イベント | `CollectEvent` + WS/gRPC/MQTT 配信 | §5 |
+| アクション（スクリプト・メール等） | **アプリ分担で置換**: 自動書き込みは relay-wright、通知は非スコープ | モノリスにしない方針（§2） |
+| ビュー | **アプリ分担で置換**: 記録・トレンドは ChronoGazer、監視画面は将来の SCADA | 同上 |
+| インターフェース（OPC DA / DDE / Panel IF） | REST / WebSocket / MQTT / gRPC | OPC **UA** を将来枠に（DA/DDE はレガシーのため追わない）。FA-Client が Panel IF で FA-Server のタグへバインドする構図は §7 の (A) データプレーンクライアントと同型 |
+
+FA-Server が1製品に統合している機能群を、本製品群は「タグサーバー +
+ChronoGazer + relay-wright + 将来の SCADA」に分割して受け持つ — 各アプリの
+スコープの護り（§2）はこの分担の裏返しである。
+
 ## 2. スコープ / 非スコープ（v1）
 
 ### スコープ
@@ -436,3 +459,9 @@ T0/T1 だけでも「読み取り専用タグサーバー」として出荷可�
     やめるか
 11. **`banto-tagclient`（クライアント SDK クレート）**の起票時期（§7）:
     SCADA 計画が具体化する前に T1 完了時点で先行着手するか
+12. **内部タグ（メモリタグ）**: FA-Server の「内部演算ワークエリア」相当 —
+    PLC に紐づかず、タグ空間上にだけ存在する書き込み可能なタグ（§1.1）。
+    SCADA の設定値・アプリ間の状態共有に欲しくなる可能性が高い。
+    アーキテクチャ上は安い（収集タスクの裏付けがない `CurrentValuesHandle`
+    エントリ + 永続化）が I1 スキーマに触る（`address` を optional にするか
+    タグ種別列を足すか）。SCADA 要件が見えた時点で判断、v1 は見送り
