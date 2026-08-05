@@ -35,6 +35,11 @@ banto-tstore = { path = "../../../crates/banto-tstore" }
 # I3b: the collection engine itself - hub.rs::CollectorManager owns its
 # lifecycle (start at boot, full rebuild on registry writes).
 banto-collect = { path = "../../../crates/banto-collect" }
+# I6 (T2-2, docs/tag-server-design.md §6-5): the PLC access broker -
+# broker_glue.rs wraps it as the SLMP-side banto_collect::PlcClient the
+# ClientFactory injection seam hands out, and HubSessions owns the session
+# directory outside CollectorManager.
+banto-broker = { path = "../../../crates/banto-broker" }
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

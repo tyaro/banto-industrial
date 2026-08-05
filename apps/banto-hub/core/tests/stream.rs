@@ -199,11 +199,15 @@ async fn test_app(label: &str) -> TestApp {
         .await
         .expect("admin login");
 
+    let sessions = std::sync::Arc::new(banto_hub_core::broker_glue::HubSessions::new(
+        banto_broker::BackoffConfig::default(),
+    ));
     let manager = std::sync::Arc::new(CollectorManager::new(
         pool.clone(),
         env.data_dir(),
         std::sync::Arc::new(SystemClock),
         fast_options(),
+        sessions,
     ));
     manager.rebuild().await.expect("initial rebuild");
 

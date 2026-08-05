@@ -53,6 +53,7 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use banto_broker::BrokerConnectionStatus;
 use banto_collect::ConnectionStatus;
 use banto_core::{BantoError, ErrorBody, ListParams, ListResult};
 use banto_server::{
@@ -1579,6 +1580,15 @@ struct StatusResponse {
 /// "connections": [...] }` (design §5.1's route table). Connection names
 /// come from the registry directly (not the catalog) so a connection with
 /// zero tags still appears.
+///
+/// T2-2 (docs/tag-server-design.md §6-5, 2026-08-05 決定): an SLMP
+/// connection's status comes from
+/// [`crate::hub::CollectorManager::broker_status`] (the broker's own
+/// `ConnState`) instead of `banto_collect`'s own status map - see
+/// `crate::broker_glue`'s module doc ("The two-backoff double bookkeeping")
+/// for why the broker's answer is the one that reflects whether the physical
+/// session is actually up for a broker-managed connection. Modbus connections
+/// are unaffected and keep reading from `banto_collect::Collector::status`.
 #[utoipa::path(
     get,
     path = "/api/v1/status",
@@ -1598,19 +1608,33 @@ async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResp
     let entries: Vec<ConnectionStatusEntry> = connections
         .into_iter()
         .map(|conn| {
-            let key = format!("conn:{}", conn.id);
-            let (status_str, attempt) = match statuses.get(&key) {
-                Some(ConnectionStatus::Connected) => ("connected", None),
-                Some(ConnectionStatus::Reconnecting { attempt }) => {
-                    ("reconnecting", Some(*attempt))
+            let (status_str, attempt) = if conn.protocol == "slmp" {
+                match state.manager.broker_status(conn.id) {
+                    Some(BrokerConnectionStatus::Connected) => ("connected", None),
+                    Some(BrokerConnectionStatus::Reconnecting { attempt }) => {
+                        ("reconnecting", Some(attempt))
+                    }
+                    // "stopped" also covers "no broker session yet" (no
+                    // rebuild has run, or this connection is currently
+                    // disabled) - same rounding banto_collect's own
+                    // ConnectionStatus branch below uses.
+                    Some(BrokerConnectionStatus::Stopped) | None => ("stopped", None),
                 }
-                // "stopped" also covers "never started" (e.g. this
-                // connection - or everything - is currently disabled, or no
-                // rebuild has run yet) - the design's ConnectionStatus enum
-                // has no fourth "never seen" variant, and "stopped" reads
-                // correctly for all of those (design: 決定事項なし → 妥当な
-                // 解釈として Stopped に丸める).
-                Some(ConnectionStatus::Stopped) | None => ("stopped", None),
+            } else {
+                let key = format!("conn:{}", conn.id);
+                match statuses.get(&key) {
+                    Some(ConnectionStatus::Connected) => ("connected", None),
+                    Some(ConnectionStatus::Reconnecting { attempt }) => {
+                        ("reconnecting", Some(*attempt))
+                    }
+                    // "stopped" also covers "never started" (e.g. this
+                    // connection - or everything - is currently disabled, or no
+                    // rebuild has run yet) - the design's ConnectionStatus enum
+                    // has no fourth "never seen" variant, and "stopped" reads
+                    // correctly for all of those (design: 決定事項なし → 妥当な
+                    // 解釈として Stopped に丸める).
+                    Some(ConnectionStatus::Stopped) | None => ("stopped", None),
+                }
             };
             ConnectionStatusEntry {
                 name: conn.name,
@@ -1968,11 +1992,15 @@ mod tests {
     /// needs a `data_dir`, even if `rebuild` is never called in a given test.
     fn test_manager(pool: sqlx::SqlitePool) -> (Arc<CollectorManager>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
+        let sessions = Arc::new(crate::broker_glue::HubSessions::new(
+            banto_broker::BackoffConfig::default(),
+        ));
         let manager = CollectorManager::new(
             pool,
             dir.path().join("data"),
             Arc::new(SystemClock),
             CollectorOptions::default(),
+            sessions,
         );
         (Arc::new(manager), dir)
     }

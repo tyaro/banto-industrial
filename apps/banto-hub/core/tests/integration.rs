@@ -14,6 +14,7 @@ use axum::Router;
 use banto_collect::{BackoffConfig, CollectorOptions};
 use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::audit::AuditLogService;
+use banto_hub_core::broker_glue::HubSessions;
 use banto_hub_core::db::init_db;
 use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::rest::api_router;
@@ -167,6 +168,12 @@ struct TestApp {
     token: String,
     pool: SqlitePool,
     manager: Arc<CollectorManager>,
+    /// T2-2 (docs/tag-server-design.md §6-5): the broker session directory
+    /// `manager` was built with - exposed so a test can inspect broker-side
+    /// state directly (e.g. `sessions.status_watch`) without going through
+    /// REST, the way `e2e_slmp_session_survives_a_rebuild_via_broker` below
+    /// does.
+    sessions: Arc<HubSessions>,
     _env: TempEnv,
 }
 
@@ -200,11 +207,13 @@ async fn test_app(label: &str) -> TestApp {
         .await
         .expect("admin login");
 
+    let sessions = Arc::new(HubSessions::new(banto_broker::BackoffConfig::default()));
     let manager = Arc::new(CollectorManager::new(
         pool.clone(),
         env.data_dir(),
         Arc::new(SystemClock),
         fast_options(),
+        sessions.clone(),
     ));
     manager.rebuild().await.expect("initial rebuild");
 
@@ -227,6 +236,7 @@ async fn test_app(label: &str) -> TestApp {
         token,
         pool,
         manager,
+        sessions,
         _env: env,
     }
 }
@@ -373,6 +383,105 @@ async fn e2e_read_slmp_via_rest_after_rebuild() {
     assert_eq!(json["tag"], "line1.fast.temp01");
     assert_eq!(json["v"], 4321.0);
     assert_eq!(json["q"], "good");
+
+    sim.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 1c. E2E ブローカーセッション維持 (T2-2, docs/tag-server-design.md §6-5):
+//     SLMP 接続の読み取りが banto-broker 経由であることと、rebuild を跨いでも
+//     同じセッション（同じ broker タスク）が維持されることを検証する。
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_slmp_session_survives_a_rebuild_via_broker() {
+    let app = test_app("e2e-slmp-broker-session").await;
+    let sim = SlmpSimulator::start().await;
+    sim.set_word(SlmpDevice::D, 100, 111);
+
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(slmp_conn_input("line1", sim.addr.port()))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("t1", group.id, "D100", "u16"))
+        .await
+        .unwrap();
+
+    app.manager.rebuild().await.expect("first rebuild");
+
+    // The value is readable through REST - proof the read actually went
+    // through the broker-backed `BrokerReadClient`
+    // (`CollectorManager::rebuild`'s client factory routes every SLMP
+    // connection through `banto_broker` - see hub.rs's doc comment).
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            let (status, body) =
+                get_json(&app.router, "/api/v1/values/line1.fast.t1", &app.token).await;
+            status == StatusCode::OK && body["v"] == 111.0
+        })
+        .await,
+        "t1 should read 111 through the broker-backed SLMP session"
+    );
+
+    // Exactly one broker session exists for this connection.
+    assert_eq!(app.sessions.connection_count(), 1);
+    let mut status = app
+        .sessions
+        .status_watch(conn.id)
+        .expect("a broker session should exist for this connection");
+    status
+        .wait_for(|s| *s == banto_broker::BrokerConnectionStatus::Connected)
+        .await
+        .expect("broker session should report Connected");
+
+    // Simulate an unrelated registry edit (a second tag added to the SAME
+    // connection's group) and rebuild again - the whole point of T2-2 is
+    // that this must NOT reopen the SLMP session.
+    sim.set_word(SlmpDevice::D, 102, 222);
+    TagService::new(app.pool.clone())
+        .create(tag_input("t2", group.id, "D102", "u16"))
+        .await
+        .unwrap();
+    app.manager.rebuild().await.expect("second rebuild");
+
+    // Still exactly one broker session: `ensure_connection` reused the
+    // existing task instead of spawning a second one for the same
+    // connection id (`HubSessions`'s "Session sync policy" doc comment).
+    assert_eq!(
+        app.sessions.connection_count(),
+        1,
+        "the SLMP session must survive the rebuild, not be reopened"
+    );
+
+    // Value continuity through the surviving session: both the pre-existing
+    // tag and the newly-added one read correctly after the rebuild.
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            let (s1, b1) = get_json(&app.router, "/api/v1/values/line1.fast.t1", &app.token).await;
+            let (s2, b2) = get_json(&app.router, "/api/v1/values/line1.fast.t2", &app.token).await;
+            s1 == StatusCode::OK && b1["v"] == 111.0 && s2 == StatusCode::OK && b2["v"] == 222.0
+        })
+        .await,
+        "both tags should read correctly after the rebuild - the session never dropped"
+    );
+
+    // `/api/v1/status` sources an SLMP connection's status from the broker
+    // (rest.rs's `v1_status` doc comment) and reports it connected
+    // throughout, matching the session continuity proven above.
+    let (status_code, status_json) = get_json(&app.router, "/api/v1/status", &app.token).await;
+    assert_eq!(status_code, StatusCode::OK);
+    let entry = status_json["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == conn.id)
+        .expect("connection should appear in /api/v1/status");
+    assert_eq!(entry["status"], "connected");
 
     sim.stop();
 }

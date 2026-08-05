@@ -47,3 +47,8 @@ banto-plc = { path = "../banto-plc", features = ["simulator"] }
 # `rt-multi-thread`/`macros` for #[tokio::test].
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }
 banto-storage = { workspace = true, features = ["sqlite"] }
+# T2-2 (docs/tag-server-design.md §6-5): collector.rs's client-factory
+# injection unit test needs a throwaway `data_dir` for `TsWriter::open` (no
+# real PLC socket involved - the injected fake client never touches disk
+# beyond the store itself).
+tempfile = { workspace = true }

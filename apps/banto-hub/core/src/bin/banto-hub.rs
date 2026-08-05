@@ -3,10 +3,22 @@
 //! アプリのプレビュー用ではなく banto-hub 自身の**唯一の**起動経路である
 //! （設計 §3.1: 「Tauri は使わない」）。
 //!
-//! 起動シーケンス: init_db → 各サービス構築 →
+//! 起動シーケンス: init_db → 各サービス構築 → `HubSessions` 構築（T2-2、設計
+//! §6-5。`CollectorManager` の外で生存するブローカーセッション directory）→
 //! `CollectorManager::rebuild()`（起動時1回、設計 §4.3）→ tstore 剪定
 //! （起動時1回 + 24h 周期、設計 §3.3・保持既定7日）→ axum サーバー起動 →
-//! Ctrl-C 待機 → Collector 停止（flush）→ サーバー停止。
+//! Ctrl-C 待機 → Collector 停止（flush）→ ブローカーセッション停止 →
+//! サーバー停止。
+//!
+//! ## シャットダウン順序（T2-2、設計 §6-5）
+//!
+//! `manager.shutdown()`（`Collector` 停止・tstore flush）を必ず
+//! `sessions.shutdown()`（broker タスク停止）より先に呼ぶ。逆順だと
+//! broker セッションが消えた後もまだ実行中の収集タスクが
+//! `BrokerReadClient::read_batch` を呼び、`BrokerError::TaskGone` 由来の
+//! `PlcError` を毎回受け取ってから初めて停止することになる（実害はない、
+//! 既存の read_batch エラー処理がそのまま吸収する、が無駄な1サイクル分の
+//! エラー往復を避けるため、この順序を守る）。
 //!
 //! 環境変数: `PORT`（既定は settings の `server.port`、さらに未設定なら
 //! 8722）、`BANTO_BIND`（既定は settings の `server.bind`、さらに未設定なら
@@ -23,6 +35,7 @@ use banto_collect::CollectorOptions;
 use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::assets::FrontendAssets;
 use banto_hub_core::audit::AuditLogService;
+use banto_hub_core::broker_glue::HubSessions;
 use banto_hub_core::db::init_db;
 use banto_hub_core::events::event_channel;
 use banto_hub_core::hub::CollectorManager;
@@ -72,11 +85,19 @@ async fn main() {
     let data_dir = PathBuf::from(std::env::var("BANTO_HUB_DATA").unwrap_or(store_config.data_dir));
 
     let clock = Arc::new(SystemClock);
+    // T2-2 (docs/tag-server-design.md §6-5): constructed here, OUTSIDE
+    // `CollectorManager`, so an SLMP broker session survives every
+    // `CollectorManager::rebuild` - see `HubSessions`'s doc comment. Held as
+    // its own `Arc` (not only the clone `CollectorManager` gets) so this
+    // binary can call `sessions.shutdown()` after `manager.shutdown()` on the
+    // way out - see this module's doc comment ("シャットダウン順序").
+    let sessions = Arc::new(HubSessions::new(banto_broker::BackoffConfig::default()));
     let manager = Arc::new(CollectorManager::new(
         pool.clone(),
         data_dir.clone(),
         clock.clone(),
         CollectorOptions::default(),
+        sessions.clone(),
     ));
 
     // Startup rebuild (design §4.3: T0 は起動時に1回). A failure here (e.g.
@@ -146,6 +167,7 @@ async fn main() {
         .expect("failed to listen for ctrl-c");
     println!("banto-hub: shutting down");
     manager.shutdown().await;
+    sessions.shutdown().await;
     server.stop().await;
 }
 

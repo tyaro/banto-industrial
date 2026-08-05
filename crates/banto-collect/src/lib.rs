@@ -35,7 +35,10 @@
 //! - `task` (private): the per-connection collection loop - the crate's core
 //!   concurrency design (one task per connection, in-task min-deadline
 //!   scheduler, non-blocking reconnect). [`BackoffConfig`] and
-//!   [`ConnectionStatus`] are its public surface.
+//!   [`ConnectionStatus`] are its public surface, plus (T2-2,
+//!   docs/tag-server-design.md §6-5) the [`ClientFactory`]/[`ClientSpec`]/
+//!   [`ClientProtocol`] client-construction injection seam and its
+//!   [`default_client_factory`].
 //!
 //! ## Why `migrate` is not `sqlx::migrate!`
 //!
@@ -63,7 +66,10 @@ pub use error::CollectError;
 pub use event::{
     CollectEvent, EventKind, EventSink, ThresholdLevel, DEFAULT_EVENT_CHANNEL_CAPACITY,
 };
-pub use task::{BackoffConfig, ConnectionStatus};
+pub use task::{
+    default_client_factory, BackoffConfig, ClientFactory, ClientProtocol, ClientSpec,
+    ConnectionStatus,
+};
 
 use sqlx::SqlitePool;
 

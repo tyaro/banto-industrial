@@ -29,6 +29,11 @@
 //!   ローカルアカウント（RBAC: admin/editor/viewer）と監査ログ
 //! - [`assets`]: 管理 UI 静的ファイルの埋め込み枠（`embed-ui` feature）。
 //!   T0 では中身（フロントエンド）は作らない — 枠だけ用意する
+//! - [`broker_glue`]: T2-2（設計 §6-5）。SLMP 接続の収集読み取りを
+//!   `banto-broker`（I6）経由にするアダプタ（[`broker_glue::BrokerReadClient`]）
+//!   と、`CollectorManager` の外で生存するブローカーセッション directory
+//!   （[`broker_glue::HubSessions`]）。Modbus 接続は現行の直接クライアントの
+//!   まま
 //! - [`events`]: 管理 UI の SSE 用 `banto_server::ServerEvent` チャンネル。
 //!   `banto_collect::CollectEvent` とは別物（そちらは `/api/v1/events` が
 //!   `collect_events` テーブルを直接読む）
@@ -57,6 +62,7 @@
 pub mod api_keys;
 pub mod assets;
 pub mod audit;
+pub mod broker_glue;
 pub mod db;
 pub mod events;
 pub mod hub;
