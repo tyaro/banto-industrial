@@ -2,9 +2,11 @@
 # (I1: banto-tags, I2: banto-plc, I2a: SLMP read in banto-plc, I5:
 # banto-plc-write (SLMP write, separate trait/crate), I3a: banto-tstore,
 # I3b: banto-collect, I4: banto-tsquery, R1-A: apps/chronogazer/{core,src-tauri}, W1:
-# apps/relay-wright/{core,src-tauri} - see docs/plan.md / docs/r1-plan.md /
-# the relay-wright plan `luminous-discovering-goblet.md`). banto crates are
-# consumed via git-tag references (banto docs/publishing.md).
+# apps/relay-wright/{core,src-tauri}, T0: apps/banto-hub/core (headless タグ
+# サーバー、docs/tag-server-design.md) - see docs/plan.md / docs/r1-plan.md /
+# the relay-wright plan `luminous-discovering-goblet.md` /
+# docs/tag-server-design.md. banto crates are consumed via git-tag references
+# (banto docs/publishing.md).
 [workspace]
 resolver = "2"
 members = [
@@ -18,6 +20,7 @@ members = [
     "apps/chronogazer/src-tauri",
     "apps/relay-wright/core",
     "apps/relay-wright/src-tauri",
+    "apps/banto-hub/core",
 ]
 
 [workspace.package]
@@ -82,6 +85,30 @@ window-vibrancy = "0.6"
 # Dev-only: isolated temp dirs for filesystem-touching tests (backup
 # service, etc. - mirrors banto's own reasoning for this dependency).
 tempfile = "3"
+# T0-2 (docs/tag-server-design.md §5.6): API キーの secret 部分(32バイト)を
+# 生成する CSPRNG。`password-hash`(上の行、`getrandom` feature 有効)は既に
+# `rand_core` 0.6.4 経由で `getrandom` 0.2.17 を木に持っているので、ここも
+# 同じ 0.2 系に揃えて Cargo.lock に新しいメジャーバージョンの `getrandom`
+# ノードを増やさない。`apps/banto-hub/core::api_keys` のみが使う。
+getrandom = "0.2"
+# T0-2: API キーの照合用ハッシュ(SHA-256)。argon2 は低エントロピーな
+# パスワード用に意図的に遅く、毎リクエスト照合する高エントロピーな
+# ランダムキーには不向き(理由は `apps/banto-hub/core/src/api_keys.rs` の
+# モジュール doc 参照)。`sqlx-core` 等が既に 0.10 系を木に持っているので
+# 新規ノードは増えない。
+sha2 = "0.10"
+# T0-2: SHA-256 ダイジェストの hex エンコード表示・DB 保存用。既に
+# `sqlx-core` 等が同じ 0.4 系を木に持っている。
+hex = "0.4"
+# T0-2: API キーの prefix/secret を base64url(パディングなし)で表現するため
+# の汎用エンコーダ。`sqlx-core` 等が既に 0.22 系を木に持っている。
+base64 = "0.22"
+# T0-2 / 設計 §5.1・§10-6: `/api/v1/openapi.json` の自動生成(utoipa 採用は
+# 2026-08-04 オーナー決定 - docs/tag-server-design.md §10 の6番)。catalog が
+# クライアントとの互換性契約(§4.1)であるため、コードとスキーマを単一
+# ソース化する。axum 統合は使わず(パラメータは `#[utoipa::path]` に手で
+# 記述する)最小構成で導入 - `apps/banto-hub/core` のみが使う。
+utoipa = "5"
 banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v0.1.1" }
 banto-storage = { git = "https://github.com/tyaro/banto.git", tag = "v0.1.1" }
 banto-server = { git = "https://github.com/tyaro/banto.git", tag = "v0.1.1" }
