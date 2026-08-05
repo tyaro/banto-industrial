@@ -69,6 +69,22 @@ utoipa = { workspace = true }
 # T3（docs/tag-server-design.md §5.3）: mqtt.rs の MqttPublisher が使う MQTT
 # クライアント。
 rumqttc = { workspace = true }
+# T4（docs/tag-server-design.md §5.4）: grpc.rs の tonic サーバー + build.rs
+# が生成する型のランタイム依存（tonic-prost はコーデック、prost はメッセージ
+# 型そのもの）。
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+tokio-stream = { workspace = true }
+
+[build-dependencies]
+# T4（docs/tag-server-design.md §5.4）: build.rs が proto/tagserver/v1/*.proto
+# をビルド時にコード生成する（生成先は OUT_DIR、リポジトリにはコミットしない
+# - 実装指示どおり）。
+tonic-prost-build = { workspace = true }
+# システム protoc に依存しない自己完結ビルドのため（workspace Cargo.toml の
+# コメント参照）。
+protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
 # T3（docs/tag-server-design.md §5.3）: `net`は tests/mqtt.rs のポート探索

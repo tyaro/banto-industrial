@@ -20,6 +20,11 @@
 		saveMqttSettings,
 		type MqttSettings
 	} from '$lib/banto/mqttSettingsAdmin';
+	import {
+		getGrpcSettings,
+		saveGrpcSettings,
+		type GrpcSettings
+	} from '$lib/banto/grpcSettingsAdmin';
 
 	function errorMessage(err: unknown): string {
 		if (isProviderError(err)) {
@@ -182,6 +187,61 @@
 			mqttSaving = false;
 		}
 	}
+
+	// --- gRPC（T4、設計 §5.4、admin 限定） -----------------------------------
+	//
+	// 保存は `PUT /api/grpc-settings` を叩くだけで即時適用される(実装指示
+	// 「保存で即時適用」- サーバー側が保存直後に `GrpcServer::apply` を
+	// 呼ぶので、ここでは保存 API を呼んで結果を反映するだけでよい)。MQTT と
+	// 違いパスワード等の秘匿情報を持たないため、フォームは常に現在値を
+	// そのまま表示する。
+
+	const canManageGrpc = $derived(isAdmin(sessionStore.role));
+
+	let grpcEnabled = $state(false);
+	let grpcPort = $state(50051);
+
+	let grpcLoaded = $state(false);
+	let grpcSaving = $state(false);
+	let grpcError: string | null = $state(null);
+
+	function applyGrpcSettings(loaded: GrpcSettings): void {
+		grpcEnabled = loaded.enabled;
+		grpcPort = loaded.port;
+	}
+
+	$effect(() => {
+		if (!canManageGrpc) return;
+		let cancelled = false;
+		(async () => {
+			try {
+				const loaded = await getGrpcSettings();
+				if (!cancelled) applyGrpcSettings(loaded);
+			} catch (err) {
+				if (!cancelled) grpcError = errorMessage(err);
+			} finally {
+				if (!cancelled) grpcLoaded = true;
+			}
+		})();
+		return () => {
+			cancelled = true;
+		};
+	});
+
+	async function submitGrpcSettings(event: SubmitEvent): Promise<void> {
+		event.preventDefault();
+		grpcError = null;
+		grpcSaving = true;
+		try {
+			const saved = await saveGrpcSettings({ enabled: grpcEnabled, port: grpcPort });
+			applyGrpcSettings(saved);
+			toastStore.push('success', 'gRPC 設定を保存しました(即時適用されます)');
+		} catch (err) {
+			grpcError = errorMessage(err);
+		} finally {
+			grpcSaving = false;
+		}
+	}
 </script>
 
 <div class="sections">
@@ -321,6 +381,42 @@
 					<p class="note">
 						トピックは <code>{'{prefix}/{connection}/{group}/{tag}'}</code> の形式で発行されます。パスワードは
 						サーバーに平文で保存されます(閉域 LAN 前提)。
+					</p>
+				</form>
+			{:else}
+				<p class="note">読み込み中...</p>
+			{/if}
+		</section>
+	{/if}
+
+	{#if canManageGrpc}
+		<section>
+			<h2>
+				gRPC
+				<span class="status-pill" class:ok={grpcEnabled} class:bad={!grpcEnabled}>
+					{grpcEnabled ? '有効' : '無効'}
+				</span>
+			</h2>
+			{#if grpcLoaded}
+				<form onsubmit={submitGrpcSettings}>
+					<label class="field checkbox">
+						<input type="checkbox" bind:checked={grpcEnabled} />
+						gRPC サーバーを有効にする
+					</label>
+
+					<label class="field">
+						ポート
+						<input type="number" min="1" max="65535" bind:value={grpcPort} />
+					</label>
+
+					{#if grpcError}
+						<p class="error">{grpcError}</p>
+					{/if}
+
+					<button type="submit" disabled={grpcSaving}>保存(即時適用)</button>
+					<p class="note">
+						REST/WebSocket とは別ポートで listen します(既定 50051)。無効化中はこのポートで一切
+						listen しません。
 					</p>
 				</form>
 			{:else}

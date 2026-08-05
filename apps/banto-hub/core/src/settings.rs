@@ -17,6 +17,13 @@
 //! を追加した。`mqtt.password` は**平文保存** — §5.6「v1 では平文 + 閉域
 //! LAN 前提」と同じ線引きで、[`MqttSettings`] のフィールド doc comment に
 //! 判断根拠を記す。
+//!
+//! T4（docs/tag-server-design.md §5.4）で `grpc.*`（2キー、
+//! [`GrpcSettings`]）を追加した。`grpc.enabled` の既定は `false`（設計
+//! 「grpc.enabled(既定 false)」）- REST/WS と違い gRPC は既定で listen
+//! しない、管理 UI で明示的に有効化する形（`WriteControl` の「起動時
+//! disabled」ほど安全上の意味はないが、既定で新しいポートを勝手に開けない
+//! という運用上の配慮）。
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -38,6 +45,9 @@ const KEY_MQTT_PREFIX: &str = "mqtt.prefix";
 const KEY_MQTT_QOS: &str = "mqtt.qos";
 const KEY_MQTT_MIN_INTERVAL_MS: &str = "mqtt.min_interval_ms";
 
+const KEY_GRPC_ENABLED: &str = "grpc.enabled";
+const KEY_GRPC_PORT: &str = "grpc.port";
+
 /// hub の既定ポート（docs/tag-server-design.md §8: 「管理 UI + REST + WS =
 /// 8722」）。
 pub const DEFAULT_PORT: u16 = 8722;
@@ -54,6 +64,9 @@ pub const DEFAULT_MQTT_PREFIX: &str = "banto";
 pub const DEFAULT_MQTT_QOS: u8 = 1;
 /// 最短発行間隔スロットルの既定値（実装指示: 「既定 1000」）。
 pub const DEFAULT_MQTT_MIN_INTERVAL_MS: i64 = 1000;
+
+/// gRPC の既定ポート（設計 §5.4/§8「既定: REST 880x 系 / gRPC 50051」）。
+pub const DEFAULT_GRPC_PORT: u16 = 50051;
 
 /// hub サーバー本体の bind/port（設計 §8）。ChronoGazer の
 /// `ServerSettings` と違い `enabled` は持たない - hub は常時サーバーで
@@ -130,6 +143,23 @@ impl Default for MqttSettings {
             prefix: DEFAULT_MQTT_PREFIX.to_string(),
             qos: DEFAULT_MQTT_QOS,
             min_interval_ms: DEFAULT_MQTT_MIN_INTERVAL_MS,
+        }
+    }
+}
+
+/// T4（docs/tag-server-design.md §5.4）: gRPC サーバーの設定。REST とは
+/// 別ポートで listen する（設計「ポートは REST と分離」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GrpcSettings {
+    pub enabled: bool,
+    pub port: u16,
+}
+
+impl Default for GrpcSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: DEFAULT_GRPC_PORT,
         }
     }
 }
@@ -286,6 +316,33 @@ impl SettingsService {
         .await?;
         Ok(())
     }
+
+    /// T4（設計 §5.4）: gRPC 設定、未設定キーは [`GrpcSettings::default`]
+    /// にフォールバック（既定 `enabled: false`）。
+    pub async fn grpc_config(&self) -> Result<GrpcSettings, BantoError> {
+        let defaults = GrpcSettings::default();
+        let enabled = self
+            .get(KEY_GRPC_ENABLED)
+            .await?
+            .map(|value| value == "true")
+            .unwrap_or(defaults.enabled);
+        let port = self
+            .get(KEY_GRPC_PORT)
+            .await?
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(defaults.port);
+        Ok(GrpcSettings { enabled, port })
+    }
+
+    pub async fn set_grpc_config(&self, config: &GrpcSettings) -> Result<(), BantoError> {
+        self.set(
+            KEY_GRPC_ENABLED,
+            if config.enabled { "true" } else { "false" },
+        )
+        .await?;
+        self.set(KEY_GRPC_PORT, &config.port.to_string()).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -398,5 +455,25 @@ mod tests {
         let read_back = svc.mqtt_config().await.unwrap();
         assert_eq!(read_back.username, None);
         assert_eq!(read_back.password, None);
+    }
+
+    #[tokio::test]
+    async fn grpc_config_defaults_when_unset() {
+        let svc = service().await;
+        let config = svc.grpc_config().await.unwrap();
+        assert_eq!(config, GrpcSettings::default());
+        assert!(!config.enabled);
+        assert_eq!(config.port, 50051);
+    }
+
+    #[tokio::test]
+    async fn grpc_config_round_trips_through_set() {
+        let svc = service().await;
+        let config = GrpcSettings {
+            enabled: true,
+            port: 51000,
+        };
+        svc.set_grpc_config(&config).await.unwrap();
+        assert_eq!(svc.grpc_config().await.unwrap(), config);
     }
 }

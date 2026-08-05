@@ -77,7 +77,7 @@
 //! **subscribe 時点で1回だけ**計算し、購読の生存期間中は固定する
 //! （動的に変えると「一定間隔で届く」というクライアント側の期待を壊す）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -91,14 +91,13 @@ use sqlx::SqlitePool;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::MissedTickBehavior;
 
-use banto_collect::{CollectEvent, Quality};
+use banto_collect::CollectEvent;
 
-use crate::hub::{effective_sample, quality_str, CollectorManager, TagEntry, TagMap};
+use crate::hub::{quality_str, CollectorManager};
 use crate::rest::TagSpaceState;
-
-/// 評価タイマの固定周期。このモジュールの doc comment「on_change の評価
-/// 方式」参照。
-const EVAL_TICK_MS: i64 = 250;
+use crate::subscribe_core::{
+    self, interval_floor_ms, Mode, ResolvedValue, Subscription, TagPattern, EVAL_TICK_MS,
+};
 
 /// 送信キュー容量（設計 §5.2 要件6「送信キュー(mpsc、容量 256 程度)」）。
 const OUTBOUND_QUEUE_CAPACITY: usize = 256;
@@ -215,93 +214,11 @@ async fn writer_task(
 }
 
 // --- 購読状態 ----------------------------------------------------------------
-
-/// 1つの `subscribe` の購読対象パターン（設計 §5.2「ワイルドカード `*` は
-/// 末尾のみ...全タグ購読は `*` 単独」）。
-#[derive(Debug, Clone)]
-enum TagPattern {
-    /// 具体名。subscribe 時点で catalog に存在することを検証する。
-    Exact(String),
-    /// `{connection}.{group}.*`。
-    GroupWildcard { connection: String, group: String },
-    /// `*` 単独 - 全タグ。
-    All,
-}
-
-impl TagPattern {
-    fn parse(raw: &str) -> Result<Self, String> {
-        if raw == "*" {
-            return Ok(TagPattern::All);
-        }
-        if let Some(prefix) = raw.strip_suffix(".*") {
-            let segments: Vec<&str> = prefix.split('.').collect();
-            if segments.len() == 2 && segments.iter().all(|s| !s.is_empty()) {
-                return Ok(TagPattern::GroupWildcard {
-                    connection: segments[0].to_string(),
-                    group: segments[1].to_string(),
-                });
-            }
-            return Err(format!(
-                "ワイルドカードは {{connection}}.{{group}}.* か * 単独のみ許可されています: {raw}"
-            ));
-        }
-        if raw.contains('*') {
-            return Err(format!("不正なワイルドカード指定です: {raw}"));
-        }
-        if raw.is_empty() {
-            return Err("タグ名が空です".to_string());
-        }
-        Ok(TagPattern::Exact(raw.to_string()))
-    }
-
-    fn matches(&self, entry: &TagEntry) -> bool {
-        match self {
-            TagPattern::Exact(name) => entry.external_name == *name,
-            TagPattern::GroupWildcard { connection, group } => {
-                &entry.connection == connection && &entry.group == group
-            }
-            TagPattern::All => true,
-        }
-    }
-}
-
-/// 現在の `TagMap` に対して `patterns` にマッチする全エントリ - **評価の
-/// たびに**呼ぶ（このモジュールの doc comment「評価時に TagMap へ照合」）。
-fn resolve<'a>(patterns: &[TagPattern], map: &'a TagMap) -> Vec<&'a TagEntry> {
-    map.iter()
-        .filter(|entry| patterns.iter().any(|p| p.matches(entry)))
-        .collect()
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Mode {
-    OnChange,
-    Interval { interval_ms: i64 },
-}
-
-struct Subscription {
-    patterns: Vec<TagPattern>,
-    mode: Mode,
-    /// on_change の diff 基準（外部名 → 直近の値/品質）。interval モードの
-    /// 購読でも維持はするが参照しない（diff しないため）。
-    last: HashMap<String, (Option<f64>, Quality)>,
-    /// interval モードのみ意味を持つ: 次回送信予定の epoch ms。
-    next_due_ms: i64,
-}
-
-/// interval の下限クランプ値（このモジュールの doc comment「interval の
-/// 下限クランプ」参照）: マッチしたタグが属するグループの `period_ms` の
-/// 最小値と、評価ループ自体の周期([`EVAL_TICK_MS`])の大きい方。マッチが
-/// 0件（ワイルドカードで今は何も無い等）ならグループ周期側の制約はなく、
-/// 評価ループの周期だけが下限になる。
-fn interval_floor_ms(patterns: &[TagPattern], map: &TagMap) -> i64 {
-    resolve(patterns, map)
-        .iter()
-        .map(|entry| entry.period_ms)
-        .min()
-        .unwrap_or(EVAL_TICK_MS)
-        .max(EVAL_TICK_MS)
-}
+//
+// T4（設計 §5.4）: `TagPattern`/`resolve`/`Mode`/`Subscription`/
+// `interval_floor_ms`/評価本体は `crate::subscribe_core` へ抽出した
+// （gRPC の `StreamValues` と共有 - モジュール doc comment参照）。以下は
+// WebSocket 固有のワイヤ形式（`ValueWire` 等）への変換のみを行う。
 
 // --- クライアント → サーバー のメッセージ -----------------------------------
 
@@ -468,23 +385,8 @@ async fn handle_subscribe(
 
     let now_ms = manager.clock().now_ms();
     let current = manager.current_values();
-    let matched = resolve(&patterns, &map);
-
-    let mut last = HashMap::with_capacity(matched.len());
-    let values: Vec<ValueWire> = matched
-        .into_iter()
-        .map(|entry| {
-            let sample = current.as_ref().and_then(|c| c.get(&entry.tag_key));
-            let (v, q, t) = effective_sample(entry, sample, now_ms);
-            last.insert(entry.external_name.clone(), (v, q));
-            ValueWire {
-                tag: entry.external_name.clone(),
-                v,
-                q: quality_str(q),
-                t,
-            }
-        })
-        .collect();
+    let (initial, last) = subscribe_core::initial_values(&patterns, &map, current.as_ref(), now_ms);
+    let values: Vec<ValueWire> = initial.into_iter().map(ValueWire::from).collect();
 
     let next_due_ms = match mode {
         Mode::Interval { interval_ms } => now_ms + interval_ms,
@@ -508,8 +410,9 @@ async fn handle_subscribe(
 }
 
 /// 250ms ごとの評価タイマ本体。全購読を1回ずつ評価し、on_change の diff
-/// 検出 と interval の期限到来判定を行う。戻り値はコネクションを維持して
-/// よいか（バックプレッシャ切断で `false`）。
+/// 検出と interval の期限到来判定を行う（本体は `crate::subscribe_core::evaluate`。
+/// このモジュールの doc comment「購読状態」参照）。戻り値はコネクションを
+/// 維持してよいか（バックプレッシャ切断で `false`）。
 fn evaluate(
     manager: &CollectorManager,
     subscriptions: &mut HashMap<i64, Subscription>,
@@ -525,66 +428,10 @@ fn evaluate(
     let current = manager.current_values();
 
     for (&id, sub) in subscriptions.iter_mut() {
-        let matched = resolve(&sub.patterns, &map);
-
-        match sub.mode {
-            Mode::OnChange => {
-                let mut changed_values = Vec::new();
-                let mut still_present: HashSet<&str> = HashSet::with_capacity(matched.len());
-                for entry in &matched {
-                    let sample = current.as_ref().and_then(|c| c.get(&entry.tag_key));
-                    let (v, q, t) = effective_sample(entry, sample, now_ms);
-                    still_present.insert(entry.external_name.as_str());
-
-                    let changed = match sub.last.get(entry.external_name.as_str()) {
-                        Some((prev_v, prev_q)) => *prev_v != v || *prev_q != q,
-                        // 新規にマッチしたタグ（ワイルドカード購読が
-                        // config_changed 後に拾った新タグ等）は初回として
-                        // 必ず1回送る。
-                        None => true,
-                    };
-                    if changed {
-                        sub.last.insert(entry.external_name.clone(), (v, q));
-                        changed_values.push(ValueWire {
-                            tag: entry.external_name.clone(),
-                            v,
-                            q: quality_str(q),
-                            t,
-                        });
-                    }
-                }
-                // マッチしなくなったタグの diff 基準は捨てる - プロトコル
-                // に「消えた」通知はないので、単に追跡をやめるだけ
-                // （戻ってきたら新規扱いで再送される）。
-                sub.last
-                    .retain(|name, _| still_present.contains(name.as_str()));
-
-                if !changed_values.is_empty()
-                    && !send_data(id, now_ms, changed_values, data_tx, close_tx)
-                {
-                    return false;
-                }
-            }
-            Mode::Interval { interval_ms } => {
-                if now_ms >= sub.next_due_ms {
-                    let values: Vec<ValueWire> = matched
-                        .iter()
-                        .map(|entry| {
-                            let sample = current.as_ref().and_then(|c| c.get(&entry.tag_key));
-                            let (v, q, t) = effective_sample(entry, sample, now_ms);
-                            ValueWire {
-                                tag: entry.external_name.clone(),
-                                v,
-                                q: quality_str(q),
-                                t,
-                            }
-                        })
-                        .collect();
-                    sub.next_due_ms = now_ms + interval_ms;
-                    if !send_data(id, now_ms, values, data_tx, close_tx) {
-                        return false;
-                    }
-                }
+        if let Some(values) = subscribe_core::evaluate(sub, &map, current.as_ref(), now_ms) {
+            let values: Vec<ValueWire> = values.into_iter().map(ValueWire::from).collect();
+            if !send_data(id, now_ms, values, data_tx, close_tx) {
+                return false;
             }
         }
     }
@@ -599,6 +446,20 @@ struct ValueWire {
     v: Option<f64>,
     q: &'static str,
     t: i64,
+}
+
+/// `crate::subscribe_core::ResolvedValue`(transport 非依存)から WS の
+/// ワイヤ表現への変換 - T4 で `crate::subscribe_core` へ評価ロジックを
+/// 抽出した後、このモジュールに残る唯一の「値」変換点。
+impl From<ResolvedValue> for ValueWire {
+    fn from(value: ResolvedValue) -> Self {
+        ValueWire {
+            tag: value.tag,
+            v: value.v,
+            q: quality_str(value.q),
+            t: value.t,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -695,7 +556,10 @@ fn send_error(
 /// 反映しないため、タグ0件の接続の断イベントを引けない - レジストリ直読み
 /// のほうが正しい）。見つからなければ（削除された接続の残留イベント等）
 /// `None` のまま送る - `EventWire::connection` は `skip_serializing_if`。
-async fn resolve_connection_name(pool: &SqlitePool, connection_key: &str) -> Option<String> {
+pub(crate) async fn resolve_connection_name(
+    pool: &SqlitePool,
+    connection_key: &str,
+) -> Option<String> {
     let id: i64 = connection_key.strip_prefix("conn:")?.parse().ok()?;
     sqlx::query_scalar("SELECT name FROM plc_connections WHERE id = ?")
         .bind(id)
