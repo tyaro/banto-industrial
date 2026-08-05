@@ -193,7 +193,9 @@
 			<dl class="summary">
 				<dt>現在の状態</dt>
 				<dd class={status.write_enabled ? 'write-on' : 'write-off'}>
-					{status.write_enabled ? '有効（書き込みを受け付けています）' : '無効（書き込みを拒否しています）'}
+					{status.write_enabled
+						? '有効（書き込みを受け付けています）'
+						: '無効（書き込みを拒否しています）'}
 				</dd>
 				<dt>再起動前の状態</dt>
 				<dd>{status.write_was_enabled_before_restart ? '有効だった' : '無効だった'}</dd>
