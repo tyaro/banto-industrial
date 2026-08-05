@@ -37,7 +37,7 @@
 //! scheduler) with exponential backoff (1s, 2s, 4s ... capped at 30s),
 //! reset to immediate on a fresh drop and on any success.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -99,9 +99,30 @@ pub enum ConnectionStatus {
 /// current-value cache (short, non-async critical sections; sync readers).
 pub(crate) type StatusMap = Arc<RwLock<HashMap<String, ConnectionStatus>>>;
 
+/// Drop every status entry whose key is not in `keys` - the [`StatusMap`]
+/// twin of [`crate::current::CurrentValuesHandle::retain`] (T7-1,
+/// docs/tag-server-design.md §4.3: a connection removed by
+/// [`crate::collector::Collector::apply_config`] must not leave a stale
+/// `Stopped`/`Reconnecting` entry behind forever).
+pub(crate) fn retain_status(status: &StatusMap, keys: &HashSet<String>) {
+    status
+        .write()
+        .expect("status map lock poisoned")
+        .retain(|k, _| keys.contains(k));
+}
+
 /// Everything one connection task shares with the rest of the engine.
 pub(crate) struct TaskContext {
-    pub writer: Arc<TsWriter>,
+    /// The *current* writer, read fresh on every append via `borrow().clone()`
+    /// rather than held for the task's lifetime (T7-1, docs/tag-server-design.md
+    /// §4.3): [`crate::collector::Collector::apply_config`] can rotate the
+    /// writer (a config change that alters the collected tag/group set - and
+    /// therefore the frozen `StoreConfig` schema - forces a fresh file) while
+    /// this connection's task keeps running untouched. A `watch` channel
+    /// (not a `Mutex<Arc<TsWriter>>`) because the update is a simple
+    /// broadcast-the-latest-value, not a read-modify-write. See
+    /// `collector.rs`'s module doc for the full picture.
+    pub writer_rx: watch::Receiver<Arc<TsWriter>>,
     pub clock: Arc<dyn Clock>,
     pub current: CurrentValuesHandle,
     pub events: EventSink,
@@ -548,7 +569,13 @@ async fn record_group(
     // in-memory cache and live events still flow). A persistent failure
     // (e.g. disk full) is an operational condition surfaced elsewhere, not a
     // reason to kill this connection's collection.
-    let _ = ctx.writer.append(&group.key, ptime_ms, &values).await;
+    //
+    // Re-borrowed fresh on every call (T7-1: `apply_config` may have rotated
+    // the writer since the last tick) - the `Ref` guard from `borrow()` is
+    // dropped at the end of this statement, before the `.await`, so it never
+    // needs to be `Send` across an await point.
+    let writer = ctx.writer_rx.borrow().clone();
+    let _ = writer.append(&group.key, ptime_ms, &values).await;
 }
 
 /// Classify a scaled value against a tag's H/HH/L/LL limits. High bands take

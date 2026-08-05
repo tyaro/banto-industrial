@@ -185,33 +185,39 @@ impl PlcClient for BrokerReadClient {
 /// `crate::hub::CollectorManager` (session sync on every `rebuild`, status
 /// lookups for `/api/v1/status`).
 ///
-/// ## Session sync policy: `ensure_connection`-only, no removal (2026-08-05
-/// 判断記録)
+/// ## Session sync policy: additive + removal (T7-2, 2026-08-05 更新)
 ///
-/// [`banto_broker::SessionDirectory`]/[`BrokerSupervisor`] expose no "stop
-/// this one connection's task" API (only whole-supervisor
-/// [`BrokerSupervisor::shutdown`]) - by design, per that crate's own doc
-/// comment, a broker session is meant to be a long-lived shared asset, not
-/// something callers churn. So `CollectorManager::rebuild`'s SLMP session sync
-/// (T2-2 instructions: "レジストリの SLMP 接続集合と broker のセッション集合を
-/// 同期") is one-directional: every enabled SLMP connection the registry
-/// currently has gets [`HubSessions::ensure_connection`]'d (spawns a fresh
-/// broker task on first sight, returns the existing handle - and therefore
-/// the existing live session - on every later rebuild for the same
-/// connection id, which is exactly the "維持" §6-5 requires). A connection
-/// that is deleted or disabled leaves its broker task **running, parked,
-/// idle** (still holding its socket and retrying its own backoff loop
-/// forever) rather than being torn down - a known, accepted resource-leak
-/// limitation until either an operator restarts banto-hub or
-/// `banto-broker`/`SessionDirectory` grows a removal API (I7/I9-adjacent
-/// backlog, not in T2-2's scope). This is the "不要分の放置" option T2-2's
-/// instructions call out as acceptable when the shared crate's API does not
-/// support anything better; it was chosen over "stop everything and respawn"
-/// specifically because a full stop-and-respawn would re-open every SLMP
-/// session on *every* rebuild, defeating the entire point of T2-2 (SLMP
-/// session continuity across registry writes, §6-5's "構成再構築を跨いで SLMP
-/// セッションを維持する（T0 既知の「再構築時の二重接続窓」も SLMP については
-/// 解消）").
+/// T2-2 originally left this one-directional (`ensure_connection`-only, see
+/// this struct's git history / docs/tag-server-design.md §6-5's "不要分の
+/// 放置" note for the original 2026-08-05 判断記録): every enabled SLMP
+/// connection the registry currently has gets [`HubSessions::ensure_connection`]'d
+/// (spawns a fresh broker task on first sight, returns the existing handle -
+/// and therefore the existing live session - on every later rebuild for the
+/// same connection id, which is exactly the "維持" §6-5 requires), but a
+/// connection that was deleted or disabled left its broker task running,
+/// parked, idle forever - an accepted resource leak at the time because
+/// [`banto_broker::SessionDirectory`] had no removal API at all.
+///
+/// **T7-2 closes that gap**: `SessionDirectory` now has
+/// [`banto_broker::SessionDirectory::remove`] (see that crate's own doc
+/// comment for the exact mechanism and its explicit non-guarantee), so
+/// `crate::hub::CollectorManager::rebuild` now performs a full sync each
+/// call - `ensure_connection` for every currently-enabled SLMP connection
+/// (unchanged, additive), THEN [`HubSessions::remove`] for every connection
+/// id this directory still tracks (via
+/// [`banto_broker::SessionDirectory::connection_ids`]) that is no longer in
+/// that enabled-SLMP set (deleted from the registry, disabled, or changed
+/// away from `protocol == "slmp"`). The removal step runs strictly AFTER the
+/// collector-side commit that stops the corresponding collect task (if any)
+/// succeeds - see `CollectorManager::rebuild`'s own doc comment for why that
+/// ordering matters (a `BrokerReadClient` must never outlive the session it
+/// reads through). This was chosen over "stop everything and respawn"
+/// (which would re-open every SLMP session on every rebuild, defeating the
+/// whole point of session continuity across registry writes) and over a full
+/// `SessionDirectory` rebuild-from-scratch (same problem) - a targeted
+/// per-connection `remove` for exactly the ids that fell out of the wanted
+/// set is the minimal change that actually reclaims resources without ever
+/// touching a session nothing asked to remove.
 pub struct HubSessions {
     directory: SessionDirectory,
     /// `Some` until [`Self::shutdown`] consumes it (`BrokerSupervisor::shutdown`
@@ -260,15 +266,37 @@ impl HubSessions {
         self.directory.status_watch(connection_id)
     }
 
-    /// How many broker tasks have been spawned so far (seeded-empty +
-    /// every later `ensure_connection`, including ones for connections since
-    /// deleted/disabled - see this struct's "Session sync policy" doc
-    /// section). Mainly a test/diagnostic helper - proxies
-    /// [`SessionDirectory::connection_count`] - the test suite uses it to
-    /// assert a rebuild reused an existing session rather than spawning a
-    /// second one for the same connection id.
+    /// How many broker sessions are currently tracked (seeded-empty + every
+    /// later `ensure_connection`, minus anything [`Self::remove`]d since -
+    /// see this struct's "Session sync policy" doc section). Mainly a
+    /// test/diagnostic helper - proxies [`SessionDirectory::connection_count`] -
+    /// the test suite uses it to assert a rebuild reused an existing session
+    /// rather than spawning a second one for the same connection id, and (T7-2)
+    /// that a deleted connection's session was actually untracked.
     pub fn connection_count(&self) -> usize {
         self.directory.connection_count()
+    }
+
+    /// Every connection id this directory currently tracks a session for -
+    /// proxies [`SessionDirectory::connection_ids`]. `CollectorManager::rebuild`
+    /// (T7-2) diffs this against the registry's current enabled-SLMP-connection
+    /// set to find which ids to [`Self::remove`].
+    pub fn connection_ids(&self) -> Vec<i64> {
+        self.directory.connection_ids()
+    }
+
+    /// Untrack the session for `connection_id`, if one is tracked - proxies
+    /// [`SessionDirectory::remove`] (see that method's doc comment for the
+    /// exact mechanism and its explicit non-guarantee: this drops OUR clone
+    /// of the `BrokerHandle`, but the broker task only exits once every
+    /// clone anywhere is gone). Returns `true` if a session was tracked and
+    /// is now untracked.
+    ///
+    /// **Caller must call this only after the corresponding collect task (if
+    /// any) has already stopped** - see this struct's "Session sync policy"
+    /// doc section for why the ordering matters.
+    pub fn remove(&self, connection_id: i64) -> bool {
+        self.directory.remove(connection_id)
     }
 
     /// Stop every broker task this directory ever spawned (seeded-empty +

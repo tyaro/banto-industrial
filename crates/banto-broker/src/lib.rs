@@ -148,6 +148,19 @@
 //! [`Job`] is accepted, queued, or rejected. relay-wright does not read this
 //! watch today (its own arm/disarm/rate-limiter state is unrelated); it is
 //! wired for banto-hub's T2-2 slice.
+//!
+//! ## Session removal (T7-2 backlog item, 2026-08-05)
+//!
+//! [`SessionDirectory::remove`] completes the session-sync contract T2-2
+//! originally left one-directional (see [`SessionDirectory`]'s own doc
+//! comment, "Removal", for the full mechanism and its explicit non-guarantee:
+//! a broker task only exits once *every* clone of its handle is dropped, and
+//! `remove` only ever accounts for this directory's own clone). relay-wright
+//! does not call `remove` (its own session set only ever grows for the
+//! process lifetime, §6-5/T2-2's original design); it is wired for
+//! banto-hub's T7-2 slice (banto-hub's `CollectorManager::rebuild` diffs
+//! [`SessionDirectory::connection_ids`] against the registry's current
+//! enabled-SLMP-connection set to find what to remove).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -454,17 +467,40 @@ pub fn spawn_test_handle_answering_ok(connection_id: i64) -> (BrokerHandle, Join
 ///
 /// All spawned tasks - seeded and on-demand alike - share the supervisor's
 /// one shutdown `watch`, so [`BrokerSupervisor::shutdown`] stops every task
-/// this directory ever created (the tasks vector is shared; shutdown drains
+/// this directory ever created (the tasks map is shared; shutdown drains
 /// and awaits it). Clones of this directory held past shutdown (e.g. by a
 /// caller-defined control handle kept around) simply get
 /// [`BrokerError::TaskGone`] / closed-channel errors - never a new session on
 /// a dead engine's watch, because `ensure_connection` on a shut-down
 /// directory spawns a task whose `shutdown_rx` already reads `true`, which
 /// exits immediately.
+///
+/// ## Removal ([`Self::remove`], T7-2 backlog item, 2026-08-05)
+///
+/// T2-2 originally left session sync one-directional (`ensure_connection`
+/// only - see banto-hub's `broker_glue` module doc for that history).
+/// [`Self::remove`] completes it: it drops this directory's own
+/// [`BrokerHandle`] clone (and forgets, without `.await`ing, the tracked
+/// [`JoinHandle`]) for one connection id. A broker task exits when *every*
+/// clone of its handle - wherever else a caller may have stashed one, e.g.
+/// captured inside a long-lived `ClientFactory` closure - has been dropped
+/// (see `run_broker_task`'s `rx.recv() == None` branch); this directory's own
+/// clone is necessary but not always sufficient for that, so a caller with
+/// other long-lived handle owners is responsible for releasing those
+/// promptly too if it wants removal to actually free the task's resources in
+/// a timely manner. We deliberately do not await the removed `JoinHandle`
+/// here: by the time a caller like banto-hub's rebuild calls `remove`, its
+/// OWN other references are typically already gone (it orders its collector
+/// reconfiguration - which stops the connection's collect task - before
+/// calling this), but nothing in this crate can prove that generically for
+/// every caller, so blocking on the join here would risk hanging
+/// indefinitely rather than trading away a small, bounded resource leak - a
+/// worse failure mode than a task that simply finishes a little later in the
+/// background.
 #[derive(Clone)]
 pub struct SessionDirectory {
     handles: std::sync::Arc<std::sync::Mutex<HashMap<i64, BrokerHandle>>>,
-    tasks: std::sync::Arc<std::sync::Mutex<Vec<JoinHandle<()>>>>,
+    tasks: std::sync::Arc<std::sync::Mutex<HashMap<i64, JoinHandle<()>>>>,
     backoff: BackoffConfig,
     /// Shared (via `Arc`) with [`BrokerSupervisor`] so on-demand tasks
     /// subscribe to the SAME shutdown trigger as the seeded ones.
@@ -475,7 +511,7 @@ impl SessionDirectory {
     fn new(backoff: BackoffConfig, shutdown_tx: std::sync::Arc<watch::Sender<bool>>) -> Self {
         Self {
             handles: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-            tasks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            tasks: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             backoff,
             shutdown_tx,
         }
@@ -534,14 +570,48 @@ impl SessionDirectory {
         self.tasks
             .lock()
             .expect("session directory poisoned")
-            .push(task);
+            .insert(conn.id, task);
         Ok(handle)
     }
 
-    /// How many broker tasks have been spawned (seeded + on-demand). Mainly a
-    /// test/diagnostic helper.
+    /// How many broker sessions are currently tracked (seeded + on-demand,
+    /// minus anything [`Self::remove`]d since). Mainly a test/diagnostic
+    /// helper - banto-hub's T7-2 E2E suite uses it to confirm a deleted
+    /// connection's session was actually untracked.
     pub fn connection_count(&self) -> usize {
         self.tasks.lock().expect("session directory poisoned").len()
+    }
+
+    /// Every connection id currently tracked (seeded + on-demand, minus
+    /// anything [`Self::remove`]d since) - the set a caller like banto-hub's
+    /// `CollectorManager::rebuild` diffs against the registry's current
+    /// enabled-SLMP-connection set to find sessions to [`Self::remove`].
+    pub fn connection_ids(&self) -> Vec<i64> {
+        self.handles
+            .lock()
+            .expect("session directory poisoned")
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// Drop this directory's own [`BrokerHandle`] (and tracked [`JoinHandle`])
+    /// for `connection_id`, if one is currently tracked - see this struct's
+    /// "Removal" doc section for exactly what this does and does not
+    /// guarantee. Returns `true` if a session was tracked and is now
+    /// untracked, `false` if none was (already removed, or never added).
+    pub fn remove(&self, connection_id: i64) -> bool {
+        let had_handle = self
+            .handles
+            .lock()
+            .expect("session directory poisoned")
+            .remove(&connection_id)
+            .is_some();
+        self.tasks
+            .lock()
+            .expect("session directory poisoned")
+            .remove(&connection_id);
+        had_handle
     }
 }
 
@@ -624,8 +694,13 @@ impl BrokerSupervisor {
     /// directory's handle map is cleared too so `BrokerHandle` clones the
     /// directory itself owned release their `Sender`s, though the tasks no
     /// longer depend on that to exit. On-demand tasks the [`SessionDirectory`]
-    /// added after spawn share the same tasks vector, so they are awaited
-    /// here exactly like the seeded ones.
+    /// added after spawn share the same tasks map, so they are awaited here
+    /// exactly like the seeded ones. A connection [`SessionDirectory::remove`]d
+    /// before shutdown is no longer in the map (`remove` forgets its
+    /// `JoinHandle` without awaiting it - see that method's doc) so this loop
+    /// does not wait on it specifically, but the task still receives the same
+    /// `shutdown_tx` signal every other task does (subscribed independently
+    /// of whether this directory still tracks it) and exits on its own.
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
         self.directory
@@ -633,14 +708,14 @@ impl BrokerSupervisor {
             .lock()
             .expect("session directory poisoned")
             .clear();
-        let tasks: Vec<JoinHandle<()>> = std::mem::take(
+        let tasks: HashMap<i64, JoinHandle<()>> = std::mem::take(
             &mut self
                 .directory
                 .tasks
                 .lock()
                 .expect("session directory poisoned"),
         );
-        for task in tasks {
+        for task in tasks.into_values() {
             let _ = task.await;
         }
     }
@@ -1040,6 +1115,66 @@ mod tests {
         assert_eq!(supervisor.connection_count(), 1);
         assert!(supervisor.handle(7).is_some());
         assert!(supervisor.handle(999).is_none());
+        supervisor.shutdown().await;
+    }
+
+    // -----------------------------------------------------------------
+    // Session removal (T7-2 backlog item, 2026-08-05)
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn remove_untracks_a_connection() {
+        let sim = Simulator::start().await;
+        let connections = [conn(7, "slmp", "127.0.0.1", sim.addr.port())];
+        let supervisor = BrokerSupervisor::spawn(&connections, BackoffConfig::default())
+            .expect("all-slmp connections should spawn");
+        let directory = supervisor.directory();
+        assert_eq!(directory.connection_ids(), vec![7]);
+
+        assert!(
+            directory.remove(7),
+            "removing a tracked connection should report true"
+        );
+        assert_eq!(supervisor.connection_count(), 0);
+        assert!(
+            directory.handle(7).is_none(),
+            "a removed connection's handle should no longer be reachable via the directory"
+        );
+
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn remove_is_false_and_idempotent_for_an_untracked_connection() {
+        let directory = SessionDirectory::new(
+            BackoffConfig::default(),
+            std::sync::Arc::new(watch::channel(false).0),
+        );
+        assert!(!directory.remove(42), "nothing was ever tracked for id 42");
+        assert!(!directory.remove(42), "removing twice is still just false");
+    }
+
+    #[tokio::test]
+    async fn ensure_connection_after_remove_spawns_a_fresh_session() {
+        let sim = Simulator::start().await;
+        let connections = [conn(7, "slmp", "127.0.0.1", sim.addr.port())];
+        let supervisor = BrokerSupervisor::spawn(&connections, BackoffConfig::default())
+            .expect("all-slmp connections should spawn");
+        let directory = supervisor.directory();
+
+        directory.remove(7);
+        assert_eq!(directory.connection_count(), 0);
+
+        // ensure_connection does not remember that id 7 ever existed -
+        // removal is a real forget, not a soft-delete - so this spawns a
+        // brand new session exactly like the very first ensure_connection
+        // did.
+        let fresh = directory
+            .ensure_connection(&conn(7, "slmp", "127.0.0.1", sim.addr.port()))
+            .expect("re-ensuring a removed connection should spawn a fresh session");
+        assert_eq!(directory.connection_count(), 1);
+        let _ = read_once_connected(&fresh, vec![rreq("D0", DataType::U16)]).await;
+
         supervisor.shutdown().await;
     }
 

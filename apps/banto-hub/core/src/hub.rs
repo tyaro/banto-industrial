@@ -2,32 +2,85 @@
 //! §3.2/§4.3）と [`TagMap`]（外部名 catalog のスナップショット、設計
 //! §4/§4.1）。
 //!
-//! ## `CollectorManager`: T0 は「全体再構築」（設計 §4.3 最終段落）
+//! ## `CollectorManager`: T7 で「部分適用」に卒業（設計 §4.3、2026-08-05）
 //!
-//! T0 は接続単位の部分再構成（I7、設計 §4.3 表の (c)）を実装せず、
-//! レジストリが変わるたびに `banto_collect::Collector` をまるごと作り直す
-//! （ChronoGazer と同型）。外部契約（`revision` + `last_error`、設計 §4.1）が
-//! 実装差を吸収するので、I7 を後から入れてもクライアント非互換にならない
-//! — 外部から見える差は「変更時に他接続の値まで一瞬 Bad になるか否か」だけ
-//! （設計 §4.3）。
+//! T0〜T6 は接続単位の部分再構成（I7、設計 §4.3 表の (c)）を実装せず、
+//! レジストリが変わるたびに `banto_collect::Collector` をまるごと作り直して
+//! いた（ChronoGazer と同型）。**T7 でこれを卒業**し、既に稼働中の
+//! `Collector` があるときは [`banto_collect::Collector::apply_config`]
+//! （T7-1、差分適用・`ApplyReport` 返却）を呼ぶよう [`CollectorManager::rebuild`]
+//! を書き換えた。段階実装の狙いどおり、外部契約（`revision`・`config_changed`・
+//! `last_error`、設計 §4.1）はこの移行の前後でまったく変わっていない —
+//! クライアントは何も気付かずに「変更時に他接続の値まで一瞬 Bad になっていた
+//! (T0〜T6) → ならなくなった (T7)」という体験の向上だけを受け取る（設計 §4.3
+//! 冒頭の見込みどおり）。`Collector` がまだ無い場合（起動直後の初回成功、
+//! または空構成から復帰する場合）は従来どおり
+//! [`banto_collect::Collector::start_with_client_factory`] で新規起動する
+//! （差し替える対象が無いので部分適用の出番がない）。
 //!
-//! ## all-or-nothing の実現（設計 §4.3 最終段落）
+//! ### `apply_config` 呼び出し時の読み取り整合性（T7 追加の設計判断）
+//!
+//! `apply_config` は `&mut Collector` を要求する（内部の `tasks` マップを
+//! 直接入れ替えるため）。一方 [`CollectorManager::connection_status`] は
+//! 同じ `Collector` から `&self` で読む。この排他性の衝突を吸収するため、
+//! T7 で `Collector` 本体の保護を `std::sync::Mutex`（`inner` の一部）から
+//! **`tokio::sync::Mutex`**（`CollectorManager::collector` フィールド）へ
+//! 切り替えた - `apply_config`/`start_with_client_factory` の `.await` を
+//! またいでロックを保持する必要があるため（このモジュールのもう一つの
+//! ロック `rebuild_lock` と同じ理由）。この結果 `connection_status` は
+//! `async fn` になったが、**`current_values` は非同期化していない**:
+//! `banto_collect::Collector::current_values` が返す
+//! `CurrentValuesHandle` はそれ自体 `Arc` ベースの安定した参照であり、
+//! `apply_config` はこのハンドルの「中身」を書き換える(`retain`)だけで
+//! **ハンドルの実体そのものを差し替えることはない**（`Collector` の
+//! `current` フィールドは `apply_config` の全ステップを通じて同一インス
+//! タンス）。そこで `CollectorManager` は `current_values()` が返す値を
+//! `inner`（`std::sync::Mutex`、短時間保持のまま）に**キャッシュ**し、
+//! `Collector` を新規作成した瞬間（起動時 / 空構成からの復帰時）だけ
+//! 更新する。`apply_config` 実行中でも `current_values()` は一切ブロック
+//! されず、常に最新の（かつ正しい）ハンドルを返す — 「無関係な接続 A の値が
+//! rebuild 中も途切れない」という T7 の対外的要件を、REST/WS/gRPC/MQTT の
+//! 呼び出し側コードを一切変更せずに満たす（`connection_status` はブロック
+//! される可能性があるが、そのブロックは「待てば正しい最新状態が返る」だけで
+//! 「間違った/空の状態が返る」ことは決してない - 遅延であって不整合ではない）。
+//!
+//! ## SLMP broker セッションの削除同期（T7-2、2026-08-05）
+//!
+//! T2-2 は broker セッションの同期を `ensure_connection` のみ（追加専用）と
+//! していた（`crate::broker_glue::HubSessions` のモジュール doc「Session
+//! sync policy」参照）。T7-2 で `banto_broker::SessionDirectory::remove` が
+//! 追加されたことを受け、[`CollectorManager::rebuild`] は毎回「追加 +
+//! 削除」の完全同期を行う: レジストリの現在の有効 SLMP 接続集合を
+//! `ensure_connection`（従来どおり）した後、**Collector 側のコミットが
+//! 成功した後で**（= 削除対象接続の collect タスクが既に停止済みである
+//! ことが保証された後で）、`HubSessions` が保持している接続 ID のうち
+//! この集合に無いものを `HubSessions::remove` する。この順序
+//! （collect タスク停止 → broker セッション削除）が逆転すると、まだ
+//! `read_batch` を呼んでいる `BrokerReadClient` の下でセッションが消える
+//! 危険がある - 詳細は `crate::broker_glue` のモジュール doc参照。
+//!
+//! ## all-or-nothing の実現（設計 §4.3 最終段落、T7 で `apply_config` にも
+//! 継承）
 //!
 //! [`CollectorManager::rebuild`] は `build_config`（純粋な読み取り、
-//! 副作用なし）→ `Collector::start`（新しい方を先に起動）→ 成功したら
-//! 旧 `Collector` を stop、という順序を守る。**新しい方を先に起動する**のが
-//! 肝: `build_config` は非同期リストア取得のみで失敗しても何も変更しない
-//! （不変条件は自動的に守られる）が、`Collector::start` の失敗
-//! （tstore を開けない等）まで「旧 Collector と旧 TagMap を維持」を保証
-//! するには、旧 Collector を stop する前に新 Collector の起動成功を
-//! 確認しなければならない。
+//! 副作用なし）→ Collector 側の適用（`apply_config` または
+//! `start_with_client_factory` - どちらも「失敗したら呼び出し前の状態を
+//! 完全に維持する」契約を持つ）→ 成功して初めて `map`/`revision`/
+//! `last_error`/`last_apply` を commit、という順序を守る。Collector 側が
+//! `Err` を返した場合（`apply_config` の失敗要因は tstore の writer を
+//! 開けない場合のみ - banto-collect 側のモジュール doc 参照）は
+//! `last_error` に記録するだけで catalog/`Collector`/`last_apply` は
+//! 一切進めない。
 //!
-//! **既知の制約（T0 で未解決 — 完了報告に記載）**: 上記の順序により、
-//! レジストリが同じ接続を指したまま構成が変わった場合（例: 既存タグの
-//! 追加編集）、新旧 `Collector` が短時間だけ同じ PLC へ同時にソケットを
-//! 張る瞬間がありうる（設計冒頭の「PLC セッションの重複」問題そのもの）。
-//! 接続単位の部分再構成（I7、T7）が入るまでの間、T0 の「全体再構築」方式に
-//! 内在する制約として許容する。
+//! **既知の制約は T7 で解消（旧 T0〜T6 の記述を更新）**: 従来の全体再構築
+//! 方式では、レジストリが同じ接続を指したまま構成が変わった場合（例:
+//! 既存タグの追加編集）、新旧 `Collector` が短時間だけ同じ PLC へ同時に
+//! ソケットを張る瞬間がありえた。T7 の部分適用では変更のあった接続だけが
+//! 「旧タスクを stop してから新タスクを spawn」する順序で扱われる
+//! （`banto_collect::Collector::apply_config` 自身のモジュール doc 参照）
+//! ため、この「二重接続窓」はもう発生しない - 新旧 Collector という概念
+//! 自体が存在しない（同一の `Collector` インスタンスを in-place で
+//! 書き換えるだけ）。
 //!
 //! ## `rebuild` は直列化されている（監査レビュー指摘・2026-08-05 対応）
 //!
@@ -54,9 +107,11 @@
 //! 送信元）と [`CollectorManager::subscribe_events`]（`CollectEvent` の
 //! 中継元）。後者は `events` フィールド（[`EventSink`]、設計 §3.2/§4.1
 //! ドキュメントどおり「manager が1個保有し再構築を跨いで不変」）から直接
-//! subscribe する - 実行中の `Collector`（`inner.collector`）から取ると、
-//! rebuild で `Collector` が丸ごと入れ替わった瞬間に古い方の受信側が孤立
-//! するため。
+//! subscribe する - 実行中の `Collector`（`CollectorManager::collector`）
+//! から取ると、`Collector` が丸ごと新規作成される瞬間（起動時 / 空構成
+//! からの復帰時）に古い方の受信側が孤立するため（T7 の部分適用が
+//! 既存 `Collector` を in-place で書き換える経路ではこの懸念自体が
+//! 発生しない）。
 //!
 //! ## T2-2: SLMP 接続は broker 経由（設計 §6-5、2026-08-05 決定）
 //!
@@ -66,17 +121,16 @@
 //! 切れない。`rebuild` は毎回 [`CollectorManager::sync_slmp_sessions`] で
 //! レジストリの現在の SLMP 接続集合を `sessions` に
 //! `ensure_connection`（新規なら起動・既存ならそのまま）し、得た
-//! ハンドル群を `crate::broker_glue::hub_client_factory` に渡して
-//! `Collector::start_with_client_factory` を呼ぶ - SLMP 接続は
+//! ハンドル群を `crate::broker_glue::hub_client_factory` に渡す - SLMP 接続は
 //! [`crate::broker_glue::BrokerReadClient`]、Modbus 接続は従来どおりの
-//! 直接クライアントで読む。これにより「既知の制約」節が挙げていた
-//! 「新旧 `Collector` が同じ PLC へ同時にソケットを張る瞬間」は **SLMP に
-//! ついては解消**する（broker セッションは新旧どちらの `Collector` からも
-//! 同じ1本を指すため、新 `Collector` 起動時点で既に確立済みか、
-//! `ensure_connection` が同じセッションを返す）。Modbus はこの解消の対象外
-//! （設計 §6 item 7: 書き込み手段が存在しないため共有の必要がない）。
+//! 直接クライアントで読む。旧 T0〜T6 の全体再構築方式では「新旧 `Collector`
+//! が同じ PLC へ同時にソケットを張る瞬間」を SLMP について解消する役目も
+//! 兼ねていたが、T7 の部分適用移行後は新旧 `Collector` という概念自体が
+//! 無くなったため、この節の主眼は「broker セッションの追加+削除の完全同期」
+//! に移った - このモジュールの doc 冒頭「SLMP broker セッションの削除同期
+//! （T7-2）」参照。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -85,8 +139,8 @@ use tokio::sync::{broadcast, watch};
 
 use banto_broker::{BrokerConnectionStatus, BrokerError, BrokerHandle, ReadOnlyHandle};
 use banto_collect::{
-    build_config, CollectEvent, Collector, CollectorOptions, ConnectionStatus, CurrentSample,
-    CurrentValuesHandle, EventSink, Quality,
+    build_config, ApplyReport, CollectEvent, Collector, CollectorOptions, ConnectionStatus,
+    CurrentSample, CurrentValuesHandle, EventSink, Quality,
 };
 use banto_core::ListParams;
 use banto_tags::{CollectionGroupService, PlcConnection, PlcConnectionService, Tag, TagService};
@@ -365,22 +419,43 @@ async fn build_catalog(pool: &SqlitePool) -> Result<TagMap, banto_core::BantoErr
     })
 }
 
-/// Mutable state behind [`CollectorManager`]'s lock: the currently running
-/// `Collector` (`None` when nothing is enabled to collect - a normal state,
-/// not an error, see [`CollectorManager::rebuild`]), the current catalog
-/// snapshot, the generation counter, and the last rebuild failure (if any).
+/// Mutable state behind [`CollectorManager`]'s `inner` (`std::sync::Mutex`,
+/// short-held, never across an `.await` - unchanged discipline from before
+/// T7): the current catalog snapshot, the generation counter, the last
+/// rebuild failure (if any), the cached [`CurrentValuesHandle`] (T7 - see
+/// this module's doc comment, "`apply_config` 呼び出し時の読み取り整合性",
+/// for why this is cached here instead of read through
+/// [`CollectorManager::collector`] on every call), and the most recent
+/// [`ApplyReport`] (T7-2, surfaced at `/api/v1/status`).
+///
+/// The running [`Collector`] itself is **not** in here - see
+/// [`CollectorManager::collector`]'s own field doc comment for why it needs a
+/// different (async-aware) lock.
 struct Inner {
-    collector: Option<Collector>,
     map: Arc<TagMap>,
     revision: u64,
     last_error: Option<String>,
+    /// `None` when no `Collector` is running (nothing enabled, or before the
+    /// first successful rebuild) - mirrors the old
+    /// `inner.collector.as_ref().map(Collector::current_values)` exactly,
+    /// just computed once at the moment a `Collector` is created/replaced
+    /// instead of on every read (see this module's doc comment for why that
+    /// is safe: the handle's identity never changes across an `apply_config`
+    /// call on the same `Collector`).
+    current: Option<CurrentValuesHandle>,
+    /// The most recent `apply_config` call's report, or `None` if the last
+    /// successful rebuild did not go through `apply_config` (a fresh
+    /// `Collector` start, or a transition to the empty state - see
+    /// [`CollectorManager::rebuild`]'s doc comment). Cleared together with
+    /// `current` whenever a rebuild does not call `apply_config`.
+    last_apply: Option<ApplyReport>,
 }
 
 /// Owns the running [`Collector`]'s lifecycle end to end (design §3.2 table
 /// "構成変更の扱いも banto-collect の司令塔決定に従う"): start once at boot,
-/// rebuild from scratch on every registry write, expose the read handles the
-/// REST layer needs (`current_values`/`connection_status`/`tag_map`/
-/// `revision`/`last_error`).
+/// reconfigure (in place, T7) on every registry write, expose the read
+/// handles the REST layer needs (`current_values`/`connection_status`/
+/// `tag_map`/`revision`/`last_error`).
 ///
 /// Shared behind `Arc` by the REST layer (cloning a `CollectorManager`
 /// itself is deliberately not supported - a `Collector` is not `Clone` and
@@ -416,6 +491,19 @@ pub struct CollectorManager {
     /// 影響半径 = 触ったものだけ" - a bad computed-tag expression must leave
     /// the entire rebuild, not just the computed engine, on the old state).
     computed: Arc<ComputedEngine>,
+    /// The running `Collector` itself (`None` when nothing is enabled to
+    /// collect - a normal state, not an error, see
+    /// [`CollectorManager::rebuild`]). **`tokio::sync::Mutex`, not
+    /// `std::sync::Mutex`** (T7): [`Collector::apply_config`] needs `&mut
+    /// Collector` held across several `.await` points (stopping/joining
+    /// changed tasks, possibly reopening the tstore writer), which a std
+    /// lock must never be held across (this module's doc comment on
+    /// `rebuild_lock` states the same discipline for `inner`). See this
+    /// module's doc comment ("`apply_config` 呼び出し時の読み取り整合性") for
+    /// why [`CollectorManager::connection_status`] (the one reader that goes
+    /// through this lock) is `async` while [`CollectorManager::current_values`]
+    /// is not.
+    collector: AsyncMutex<Option<Collector>>,
     inner: Mutex<Inner>,
     /// Serializes the whole body of [`CollectorManager::rebuild`] - see this
     /// module's doc comment ("`rebuild` は直列化されている") for why a plain
@@ -464,11 +552,13 @@ impl CollectorManager {
             events,
             sessions,
             computed,
+            collector: AsyncMutex::new(None),
             inner: Mutex::new(Inner {
-                collector: None,
                 map: Arc::new(TagMap::empty()),
                 revision: 0,
                 last_error: None,
+                current: None,
+                last_apply: None,
             }),
             rebuild_lock: AsyncMutex::new(()),
             revision_tx,
@@ -506,30 +596,33 @@ impl CollectorManager {
         self.clock.clone()
     }
 
-    /// Rebuild the catalog and the `Collector` from the current registry
-    /// state (design §4.3: T0's "全体再構築"). Called once at boot and after
-    /// every I1 CRUD write that succeeds.
+    /// Rebuild the catalog and reconfigure the `Collector` from the current
+    /// registry state (design §4.3, T7: "部分適用"). Called once at boot and
+    /// after every I1 CRUD write that succeeds.
     ///
     /// On success: `revision` advances by exactly 1, `last_error` clears,
-    /// and the new catalog/`Collector` (or no `Collector` at all, if nothing
-    /// is enabled - see below) are live.
+    /// and the new catalog/`Collector` state (or no `Collector` at all, if
+    /// nothing is enabled - see below) are live.
     ///
     /// On failure (registry read error, a config-level problem
     /// `build_config` catches - e.g. an unparsable address - or a
-    /// `Collector::start` lifecycle failure): the OLD catalog and OLD
-    /// `Collector` are left completely untouched, `revision` does not
-    /// advance, and `last_error` is set to the failure message. The caller
-    /// (an I1 CRUD handler) must NOT treat this `Err` as its own failure -
-    /// the write itself already succeeded; only the collector's view is
-    /// stale until the registry is fixed and rebuilt again (design's T0-1
-    /// instructions: "rebuild 失敗は CRUD 自体の失敗にしない").
+    /// `Collector` lifecycle failure, from either `apply_config` or
+    /// `start_with_client_factory`): the OLD catalog and OLD `Collector`
+    /// state are left completely untouched, `revision` does not advance, and
+    /// `last_error` is set to the failure message. The caller (an I1 CRUD
+    /// handler) must NOT treat this `Err` as its own failure - the write
+    /// itself already succeeded; only the collector's view is stale until
+    /// the registry is fixed and rebuilt again (design's T0-1 instructions:
+    /// "rebuild 失敗は CRUD 自体の失敗にしない").
     ///
     /// A registry with nothing enabled (`build_config` returns zero
-    /// connections) is NOT a failure: `Collector::start` itself refuses to
-    /// run with zero connections, so this stops any previously-running
-    /// `Collector`, commits an empty (or whatever it resolves to) catalog,
-    /// and still advances `revision` - a legitimate "collecting nothing"
-    /// state, not an error (design's instructions: "タグが0件でも正常起動")．
+    /// connections) is NOT a failure: this stops any previously-running
+    /// `Collector` outright (see this module's doc comment - the T7-2
+    /// instructions keep this branch as the pre-T7 "stop" path rather than
+    /// routing it through `apply_config`), commits an empty (or whatever it
+    /// resolves to) catalog, and still advances `revision` - a legitimate
+    /// "collecting nothing" state, not an error (design's instructions: "タグ
+    /// が0件でも正常起動")．
     ///
     /// **Serialized**: concurrent callers queue on `rebuild_lock` and run one
     /// at a time, each reading the registry fresh after acquiring the lock -
@@ -574,34 +667,39 @@ impl CollectorManager {
             }
         };
 
-        // T2-2 (docs/tag-server-design.md §6-5): sync the broker's SLMP
-        // session set against the registry BEFORE building the client
-        // factory below - see `Self::sync_slmp_sessions`'s doc comment for
-        // the sync policy. Deliberately unconditional (runs even when
+        // T2-2/T7-2 (docs/tag-server-design.md §6-5/§4.3): additive
+        // ensure_connection (unchanged from T2-2) plus the set of tracked
+        // ids that are no longer wanted - see `Self::sync_slmp_sessions`'s
+        // doc comment. Deliberately unconditional (runs even when
         // `config.group_count() == 0` just below) - a connection can be
         // enabled with no collectible groups yet and still deserve a live
         // broker session ready for T2-4's write path, and this step never
-        // touches `inner`/`revision` so it carries no all-or-nothing risk
-        // either way.
-        let slmp_handles = self.sync_slmp_sessions().await;
+        // touches `inner`/`collector` so it carries no all-or-nothing risk
+        // either way. `stale_slmp_ids` is only actually removed AFTER a
+        // successful commit below - see `Self::remove_stale_slmp_sessions`'s
+        // doc comment for why the ordering matters.
+        let (slmp_handles, stale_slmp_ids) = self.sync_slmp_sessions().await;
 
         // `CollectorConfig`'s internals are `pub(crate)` to banto-collect, so
         // `group_count() == 0` is the public equivalent of "nothing
         // collectible" - `build_config` already drops any connection with
         // zero collectible groups (see its own doc comment), so this is
-        // exactly the same condition `Collector::start`'s own
-        // `connections.is_empty()` check would use.
+        // exactly the same condition `Collector::start_with_client_factory`'s
+        // own `connections.is_empty()` check would use.
         if config.group_count() == 0 {
             // T6-2: commit the validated computed-tag plan in the same
             // all-or-nothing step as the catalog swap below - see
             // `computed_plan`'s own comment above.
             self.computed.commit(computed_plan);
-            let (old, new_revision) = {
+            let old_collector = self.collector.lock().await.take();
+            let new_revision = {
                 let mut inner = self.inner.lock().expect("hub state lock poisoned");
                 inner.map = Arc::new(new_map);
                 inner.revision += 1;
                 inner.last_error = None;
-                (inner.collector.take(), inner.revision)
+                inner.current = None;
+                inner.last_apply = None;
+                inner.revision
             };
             // Sent while still holding `rebuild_lock` (not `inner`'s lock,
             // already released above) - see this struct's `revision_tx` doc
@@ -609,51 +707,85 @@ impl CollectorManager {
             // serialization is what keeps a `watch::Receiver` from ever
             // observing a value older than what `revision()` already reports.
             let _ = self.revision_tx.send(new_revision);
-            if let Some(collector) = old {
+            if let Some(collector) = old_collector {
                 let _ = collector.stop().await;
             }
+            self.remove_stale_slmp_sessions(&stale_slmp_ids);
             return Ok(());
         }
 
-        // Start the new Collector BEFORE touching the old one - see this
-        // module's doc comment for why the ordering matters (preserving the
-        // old Collector/TagMap on failure requires it). T2-2: the client
+        // T7 (docs/tag-server-design.md §4.3): reconfigure the already-running
+        // `Collector` in place via `apply_config` if one exists, otherwise
+        // start a fresh one - see this module's doc comment for the full
+        // derivation. Either path leaves `self.collector`/`self.inner`
+        // completely untouched on `Err` (preserving the old Collector/TagMap
+        // on failure), matching the pre-T7 "start the new one before
+        // touching the old one" discipline - `apply_config` and
+        // `start_with_client_factory` both carry that same "no partial
+        // effect on failure" contract themselves now. T2-2: the client
         // factory routes SLMP connections through the broker sessions just
         // synced above and leaves Modbus connections on the default direct
         // client (`crate::broker_glue::hub_client_factory`'s doc comment).
-        let new_collector = match Collector::start_with_client_factory(
-            config,
-            &self.data_dir,
-            self.clock.clone(),
-            self.events.clone(),
-            self.options,
-            hub_client_factory(Arc::new(slmp_handles)),
-        )
-        .await
-        {
-            Ok(collector) => collector,
-            Err(err) => {
-                let message = err.to_string();
+        let factory = hub_client_factory(Arc::new(slmp_handles));
+        let mut collector_guard = self.collector.lock().await;
+        let commit: Result<(Option<ApplyReport>, CurrentValuesHandle), String> =
+            if let Some(collector) = collector_guard.as_mut() {
+                match collector.apply_config(config, factory).await {
+                    Ok(report) => Ok((Some(report), collector.current_values())),
+                    Err(err) => Err(err.to_string()),
+                }
+            } else {
+                match Collector::start_with_client_factory(
+                    config,
+                    &self.data_dir,
+                    self.clock.clone(),
+                    self.events.clone(),
+                    self.options,
+                    factory,
+                )
+                .await
+                {
+                    Ok(collector) => {
+                        let handle = collector.current_values();
+                        *collector_guard = Some(collector);
+                        Ok((None, handle))
+                    }
+                    Err(err) => Err(err.to_string()),
+                }
+            };
+        drop(collector_guard);
+
+        let (apply_report, current_handle) = match commit {
+            Ok(pair) => pair,
+            Err(message) => {
                 self.set_last_error(message.clone());
                 return Err(message);
             }
         };
 
-        // T6-2: commit alongside the catalog/`Collector` swap - same
+        if let Some(report) = &apply_report {
+            eprintln!(
+                "banto-hub: rebuild (部分適用) added={:?} removed={:?} replaced={:?} unchanged={:?} writer_rotated={}",
+                report.added, report.removed, report.replaced, report.unchanged, report.writer_rotated,
+            );
+        }
+
+        // T6-2: commit alongside the catalog/`Collector` state - same
         // reasoning as the `group_count() == 0` branch above.
         self.computed.commit(computed_plan);
-        let (old, new_revision) = {
+        let new_revision = {
             let mut inner = self.inner.lock().expect("hub state lock poisoned");
-            let old = inner.collector.replace(new_collector);
             inner.map = Arc::new(new_map);
             inner.revision += 1;
             inner.last_error = None;
-            (old, inner.revision)
+            inner.current = Some(current_handle);
+            inner.last_apply = apply_report;
+            inner.revision
         };
         let _ = self.revision_tx.send(new_revision);
-        if let Some(collector) = old {
-            let _ = collector.stop().await;
-        }
+
+        self.remove_stale_slmp_sessions(&stale_slmp_ids);
+
         Ok(())
     }
 
@@ -664,24 +796,36 @@ impl CollectorManager {
             .last_error = Some(message);
     }
 
-    /// T2-2 (docs/tag-server-design.md §6-5): sync `self.sessions`'s broker
-    /// tasks against the registry's current enabled-SLMP-connection set and
-    /// return the `"conn:{id}"`-keyed handle map
-    /// [`crate::broker_glue::hub_client_factory`] needs. See
-    /// `crate::broker_glue::HubSessions`'s doc comment ("Session sync
-    /// policy") for why this is `ensure_connection`-only (additive) with no
-    /// removal step for connections that were deleted/disabled since the
-    /// last rebuild.
+    /// T2-2/T7-2 (docs/tag-server-design.md §6-5/§4.3): additive
+    /// `ensure_connection` (unchanged from T2-2) over `self.sessions`'s
+    /// broker tasks against the registry's current enabled-SLMP-connection
+    /// set, returning both the `"conn:{id}"`-keyed handle map
+    /// [`crate::broker_glue::hub_client_factory`] needs AND the connection
+    /// ids `self.sessions` still tracks that are NOT in that set (deleted
+    /// from the registry, disabled, or no longer `protocol == "slmp"`) -
+    /// see `crate::broker_glue::HubSessions`'s doc comment ("Session sync
+    /// policy") for the full T7-2 policy this implements.
+    ///
+    /// The stale ids are returned, not removed here - [`Self::rebuild`]
+    /// only calls [`Self::remove_stale_slmp_sessions`] with them AFTER the
+    /// collector-side commit for this same rebuild has succeeded (so any
+    /// collect task reading through that connection's session is already
+    /// confirmed stopped - see this module's doc comment "SLMP broker
+    /// セッションの削除同期").
     ///
     /// A registry read failure here is logged and treated as "no SLMP
-    /// connections this rebuild" (an empty map - every SLMP connection falls
-    /// back to `banto_collect::default_client_factory` for this one rebuild,
-    /// per `hub_client_factory`'s defensive fallback) rather than failing the
-    /// whole `rebuild` - this sync step is additive/best-effort infrastructure
-    /// wiring, not a correctness precondition for the collector build that
-    /// follows it (unlike `build_catalog`/`build_config`, whose failures
-    /// `rebuild` does propagate).
-    async fn sync_slmp_sessions(&self) -> HashMap<String, ReadOnlyHandle> {
+    /// connections this rebuild, nothing stale either" (empty on both
+    /// counts: every SLMP connection falls back to
+    /// `banto_collect::default_client_factory` for this one rebuild, per
+    /// `hub_client_factory`'s defensive fallback, and no session is removed
+    /// on a registry hiccup) rather than failing the whole `rebuild` - this
+    /// sync step is additive/best-effort infrastructure wiring, not a
+    /// correctness precondition for the collector build that follows it
+    /// (unlike `build_catalog`/`build_config`, whose failures `rebuild` does
+    /// propagate). Treating a read failure as "nothing stale" specifically
+    /// avoids tearing down a session that is still wanted just because the
+    /// registry could not be read this one time.
+    async fn sync_slmp_sessions(&self) -> (HashMap<String, ReadOnlyHandle>, Vec<i64>) {
         let connections: Vec<PlcConnection> = match PlcConnectionService::new(self.pool.clone())
             .list(ListParams::default())
             .await
@@ -691,15 +835,17 @@ impl CollectorManager {
                 eprintln!(
                     "banto-hub: SLMP セッション同期のための接続一覧取得に失敗しました: {err}"
                 );
-                return HashMap::new();
+                return (HashMap::new(), Vec::new());
             }
         };
 
         let mut handles = HashMap::new();
+        let mut wanted_ids: HashSet<i64> = HashSet::new();
         for conn in connections
             .iter()
             .filter(|c| c.enabled && c.protocol == "slmp")
         {
+            wanted_ids.insert(conn.id);
             match self.sessions.ensure_connection(conn) {
                 Ok(handle) => {
                     handles.insert(format!("conn:{}", conn.id), handle.read_only());
@@ -718,7 +864,27 @@ impl CollectorManager {
                 }
             }
         }
-        handles
+
+        let stale_ids: Vec<i64> = self
+            .sessions
+            .connection_ids()
+            .into_iter()
+            .filter(|id| !wanted_ids.contains(id))
+            .collect();
+
+        (handles, stale_ids)
+    }
+
+    /// T7-2: [`crate::broker_glue::HubSessions::remove`] every id in `stale`.
+    /// Must only be called AFTER the collector-side commit for the same
+    /// rebuild has succeeded (see [`Self::rebuild`]/[`Self::sync_slmp_sessions`]'s
+    /// doc comments) - by then, `apply_config`/the pre-commit `Collector`
+    /// stop has already stopped any collect task that was reading through
+    /// one of these connections' broker sessions.
+    fn remove_stale_slmp_sessions(&self, stale: &[i64]) {
+        for &connection_id in stale {
+            self.sessions.remove(connection_id);
+        }
     }
 
     /// T2-2 (docs/tag-server-design.md §6-5): the broker's own connection
@@ -787,13 +953,34 @@ impl CollectorManager {
     /// タグは 404 にせず bad を返す) - the REST layer distinguishes "no
     /// current sample for this tag" from "tag is undefined" using the
     /// catalog, not this handle.
+    ///
+    /// **Deliberately synchronous, and deliberately NOT read through
+    /// [`Self::collector`]** (T7) - see this module's doc comment
+    /// ("`apply_config` 呼び出し時の読み取り整合性") for why a cached clone in
+    /// `inner` is both safe and necessary: reading straight through the
+    /// `Collector`'s own async lock would make this `async` and would block
+    /// (or worse, read a torn `None`, if implemented naively) while an
+    /// unrelated connection's `apply_config` is in flight - exactly the
+    /// "other connections blip" regression T7 exists to remove.
     pub fn current_values(&self) -> Option<CurrentValuesHandle> {
         self.inner
             .lock()
             .expect("hub state lock poisoned")
-            .collector
-            .as_ref()
-            .map(Collector::current_values)
+            .current
+            .clone()
+    }
+
+    /// The most recent `apply_config` call's [`ApplyReport`] (T7-2, design
+    /// §4.3), or `None` if the last successful rebuild did not go through
+    /// `apply_config` (a fresh `Collector` start, or a transition to the
+    /// empty state - see [`Self::rebuild`]'s doc comment). Surfaced at
+    /// `/api/v1/status` as `last_apply`.
+    pub fn last_apply(&self) -> Option<ApplyReport> {
+        self.inner
+            .lock()
+            .expect("hub state lock poisoned")
+            .last_apply
+            .clone()
     }
 
     /// T1 (docs/tag-server-design.md §5.2 要件7「イベント中継」): subscribe a
@@ -820,11 +1007,19 @@ impl CollectorManager {
 
     /// Per-connection status (`"conn:{id}"` keys, matching
     /// `banto_collect`'s own convention), empty when nothing is running.
-    pub fn connection_status(&self) -> HashMap<String, ConnectionStatus> {
-        self.inner
+    ///
+    /// **`async`, unlike [`Self::current_values`]** (T7) - `banto_collect`
+    /// has no public way to obtain a cacheable handle onto its internal
+    /// status map (unlike [`CurrentValuesHandle`], `banto_collect::StatusMap`
+    /// is `pub(crate)`), so this must call through [`Self::collector`]'s
+    /// async lock on every call. This only ever *waits* for a concurrent
+    /// `apply_config`/start to finish (never returns a stale/empty snapshot
+    /// while one is in flight) - a latency cost, not a correctness one - see
+    /// this module's doc comment for the full reasoning.
+    pub async fn connection_status(&self) -> HashMap<String, ConnectionStatus> {
+        self.collector
             .lock()
-            .expect("hub state lock poisoned")
-            .collector
+            .await
             .as_ref()
             .map(Collector::status)
             .unwrap_or_default()
@@ -833,15 +1028,13 @@ impl CollectorManager {
     /// Stop the running `Collector` cleanly (flushes tstore), if any. Called
     /// once at process shutdown (`bin/banto-hub.rs`).
     pub async fn shutdown(&self) {
-        let old = self
-            .inner
-            .lock()
-            .expect("hub state lock poisoned")
-            .collector
-            .take();
+        let old = self.collector.lock().await.take();
         if let Some(collector) = old {
             let _ = collector.stop().await;
         }
+        let mut inner = self.inner.lock().expect("hub state lock poisoned");
+        inner.current = None;
+        inner.last_apply = None;
     }
 }
 
