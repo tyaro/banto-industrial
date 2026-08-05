@@ -64,6 +64,13 @@
 		thresholdL: string;
 		thresholdLl: string;
 		enabled: boolean;
+		/**
+		 * 書き込み可（T2-3、docs/tag-server-design.md §6 item 1）。既定 off -
+		 * 明示的に opt-in させたタグだけを書き込み対象にする設計（per-tag
+		 * opt-in）に合わせる。`tagKind`/`expression`/`retain` はこの画面には
+		 * 出さない（T6 まで）。
+		 */
+		writable: boolean;
 	}
 
 	function blankForm(): FormState {
@@ -83,7 +90,8 @@
 			thresholdHh: '',
 			thresholdL: '',
 			thresholdLl: '',
-			enabled: true
+			enabled: true,
+			writable: false
 		};
 	}
 
@@ -108,7 +116,8 @@
 			thresholdHh: numOrEmpty(t.thresholdHh),
 			thresholdL: numOrEmpty(t.thresholdL),
 			thresholdLl: numOrEmpty(t.thresholdLl),
-			enabled: t.enabled
+			enabled: t.enabled,
+			writable: t.writable
 		};
 	}
 
@@ -134,7 +143,8 @@
 			thresholdHh: optNum(form.thresholdHh),
 			thresholdL: optNum(form.thresholdL),
 			thresholdLl: optNum(form.thresholdLl),
-			enabled: form.enabled
+			enabled: form.enabled,
+			writable: form.writable
 		};
 	}
 
@@ -259,6 +269,13 @@
 			accessor: 'enabled',
 			width: 70,
 			format: (v) => (v ? 'はい' : 'いいえ')
+		},
+		{
+			id: 'writable',
+			header: '書き込み可',
+			accessor: 'writable',
+			width: 90,
+			format: (v) => (v ? 'はい' : 'いいえ')
 		}
 	];
 </script>
@@ -361,6 +378,10 @@
 		<label class="field checkbox">
 			<input type="checkbox" bind:checked={form.enabled} />
 			有効
+		</label>
+		<label class="field checkbox">
+			<input type="checkbox" bind:checked={form.writable} />
+			書き込み可（writable）
 		</label>
 	</div>
 {/snippet}

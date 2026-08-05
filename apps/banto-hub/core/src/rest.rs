@@ -836,6 +836,13 @@ fn default_tag_decimals() -> i64 {
     0
 }
 
+/// T2-3: mirrors `banto_tags::tag`'s own `default_tag_kind` (not reused
+/// directly - that one is private to `banto-tags`) so a `TagPayload` missing
+/// `tagKind` builds the same `"plc"` `TagInput` an old client always got.
+fn default_tag_kind() -> String {
+    "plc".to_string()
+}
+
 /// Wire-shaped (camelCase) create/update payload for `plc_connections` -
 /// copied from relay-wright's `PlcConnectionPayload` (invariant across every
 /// app that exposes I1 over REST: one payload shape).
@@ -918,6 +925,19 @@ pub struct TagPayload {
     pub threshold_ll: Option<f64>,
     #[serde(default)]
     pub enabled: bool,
+    /// T2-3 (docs/tag-server-design.md §10-2/§6 item 1): `#[serde(default)]`
+    /// (= `false`) so an existing API client's payload (written before this
+    /// field existed) still deserializes and creates a non-writable tag,
+    /// exactly the pre-T2 behaviour (design §10-2: "既存の API クライアント
+    /// のペイロードは無変更で通る").
+    #[serde(default)]
+    pub writable: bool,
+    #[serde(default = "default_tag_kind")]
+    pub tag_kind: String,
+    #[serde(default)]
+    pub expression: Option<String>,
+    #[serde(default)]
+    pub retain: bool,
 }
 
 impl From<TagPayload> for TagInput {
@@ -939,6 +959,10 @@ impl From<TagPayload> for TagInput {
             threshold_l: payload.threshold_l,
             threshold_ll: payload.threshold_ll,
             enabled: payload.enabled,
+            writable: payload.writable,
+            tag_kind: payload.tag_kind,
+            expression: payload.expression,
+            retain: payload.retain,
         }
     }
 }

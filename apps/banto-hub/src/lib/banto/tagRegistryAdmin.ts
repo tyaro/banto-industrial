@@ -93,6 +93,14 @@ export interface Tag {
 	thresholdL: number | null;
 	thresholdLl: number | null;
 	enabled: boolean;
+	/**
+	 * Per-tag write opt-in (T2-3, docs/tag-server-design.md §6 item 1).
+	 * `tagKind`/`expression`/`retain` also exist on the backend row from T2-3
+	 * onward, but stay unexposed here — the admin UI only ever writes
+	 * `tagKind: "plc"` implicitly (the server default), and there is nothing
+	 * for this screen to show until T6 defines computed/internal tags.
+	 */
+	writable: boolean;
 }
 
 /** Mirrors `banto_hub_core::rest::TagPayload`. */
@@ -113,6 +121,11 @@ export interface TagInput {
 	thresholdL?: number | null;
 	thresholdLl?: number | null;
 	enabled: boolean;
+	/** T2-3: `#[serde(default)]` on the backend - omitting this still creates
+	 * a non-writable tag, so existing callers of `createTag`/`updateTag` are
+	 * unaffected. The admin UI (this app's tags page) always sends it
+	 * explicitly from its new checkbox. */
+	writable?: boolean;
 }
 
 /** `string` tag `stringLength` bounds — mirrors the backend CHECK/validation. */

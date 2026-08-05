@@ -899,6 +899,10 @@ mod tests {
                     threshold_l: None,
                     threshold_ll: None,
                     enabled: true,
+                    writable: false,
+                    tag_kind: "plc".to_string(),
+                    expression: None,
+                    retain: false,
                 })
                 .await
                 .unwrap()
@@ -947,6 +951,10 @@ mod tests {
                     threshold_l: None,
                     threshold_ll: None,
                     enabled: true,
+                    writable: false,
+                    tag_kind: "plc".to_string(),
+                    expression: None,
+                    retain: false,
                 })
                 .await
                 .unwrap()

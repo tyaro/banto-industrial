@@ -130,6 +130,10 @@ fn tag_input(name: &str, group_id: i64, address: &str, data_type: &str) -> TagIn
         threshold_l: None,
         threshold_ll: None,
         enabled: true,
+        writable: false,
+        tag_kind: "plc".to_string(),
+        expression: None,
+        retain: false,
     }
 }
 

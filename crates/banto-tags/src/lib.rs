@@ -43,7 +43,8 @@ pub use plc_connection::{
 };
 pub use scaling::{scale_raw, unscale, Scaling};
 pub use tag::{
-    Tag, TagInput, TagService, ALLOWED_DATA_TYPES, NUMERIC_DATA_TYPES, STRING_DATA_TYPE,
+    Tag, TagInput, TagService, ALLOWED_DATA_TYPES, ALLOWED_TAG_KINDS, NUMERIC_DATA_TYPES,
+    PLC_TAG_KIND, STRING_DATA_TYPE,
 };
 
 use banto_core::BantoError;

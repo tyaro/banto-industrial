@@ -190,6 +190,16 @@ pub struct TagEntry {
     pub decimals: i64,
     pub period_ms: i64,
     pub enabled: bool,
+    /// Write opt-in (design §4 "メタデータ: ...書き込み可否(§6)を catalog 系
+    /// API で公開", §6 item 1). `tag_kind`/`expression`/`retain` are
+    /// deliberately NOT added to the catalog alongside this - the design
+    /// instructions single out `writable` as the one T2-relevant piece of
+    /// write metadata a catalog client needs (can I target this tag for a
+    /// write), while `tag_kind`/`expression`/`retain` describe T6 tag
+    /// species that stay unused (and, per T2's validation, unreachable -
+    /// `tag_kind` is always `"plc"` today) until T6 lands its own catalog
+    /// exposure decision.
+    pub writable: bool,
 }
 
 /// Immutable snapshot of the external-name catalog, rebuilt from scratch on
@@ -278,6 +288,7 @@ async fn build_catalog(pool: &SqlitePool) -> Result<TagMap, banto_core::BantoErr
             decimals: tag.decimals,
             period_ms: group.period_ms,
             enabled: conn.enabled && group.enabled && tag.enabled,
+            writable: tag.writable,
         });
     }
 
@@ -794,6 +805,10 @@ mod tests {
                 threshold_l: None,
                 threshold_ll: None,
                 enabled: false,
+                writable: false,
+                tag_kind: "plc".to_string(),
+                expression: None,
+                retain: false,
             })
             .await
             .unwrap();
@@ -861,6 +876,10 @@ mod tests {
                 threshold_l: None,
                 threshold_ll: None,
                 enabled: true,
+                writable: false,
+                tag_kind: "plc".to_string(),
+                expression: None,
+                retain: false,
             })
             .await
             .unwrap();

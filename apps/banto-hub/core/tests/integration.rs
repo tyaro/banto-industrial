@@ -136,6 +136,10 @@ fn tag_input(name: &str, group_id: i64, address: &str, data_type: &str) -> TagIn
         threshold_l: None,
         threshold_ll: None,
         enabled: true,
+        writable: false,
+        tag_kind: "plc".to_string(),
+        expression: None,
+        retain: false,
     }
 }
 
@@ -522,6 +526,10 @@ async fn catalog_exposes_external_name_address_and_stable_ids() {
     assert_eq!(entry["address"], "40001");
     assert_eq!(entry["ids"], serde_json::json!([conn.id, group.id, tag.id]));
     assert_eq!(entry["enabled"], true);
+    // T2-3 (docs/tag-server-design.md §4/§6 item 1): catalog exposes
+    // per-tag write opt-in - `tag_input()`'s fixture defaults to
+    // `writable: false`, same pre-T2 behaviour as every other catalog field.
+    assert_eq!(entry["writable"], false);
 
     sim.stop();
 }
@@ -631,6 +639,118 @@ async fn creating_a_tag_via_rest_bumps_revision_and_appears_in_catalog() {
         .map(|t| t["external_name"].as_str().unwrap())
         .collect();
     assert!(names.contains(&"line1.fast.temp01"));
+
+    sim.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 4b. T2-3: writable フラグの REST 経由の作成・catalog 反映・既存ペイロード互換
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn creating_a_tag_with_writable_true_appears_writable_in_catalog() {
+    let app = test_app("crud-writable").await;
+    let sim = Simulator::start().await;
+
+    let (_, conn_json) = write_json(
+        &app.router,
+        "POST",
+        "/api/plc-connections",
+        &app.token,
+        serde_json::json!({ "name": "line1", "host": "127.0.0.1", "port": sim.addr.port() }),
+    )
+    .await;
+    let conn_id = conn_json["id"].as_i64().unwrap();
+
+    let (_, group_json) = write_json(
+        &app.router,
+        "POST",
+        "/api/collection-groups",
+        &app.token,
+        serde_json::json!({ "name": "fast", "plcConnectionId": conn_id, "periodMs": 100 }),
+    )
+    .await;
+    let group_id = group_json["id"].as_i64().unwrap();
+
+    // Explicit `"writable": true` - the opt-in this endpoint's `TagPayload`
+    // added in T2-3 (design §6 item 1/§10-2).
+    let (status, tag_json) = write_json(
+        &app.router,
+        "POST",
+        "/api/tags",
+        &app.token,
+        serde_json::json!({
+            "name": "setpoint01",
+            "collectionGroupId": group_id,
+            "address": "40001",
+            "dataType": "i16",
+            "writable": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tag_json:?}");
+    assert_eq!(tag_json["writable"], true);
+
+    let (status, tags) = get_json(&app.router, "/api/v1/tags", &app.token).await;
+    assert_eq!(status, StatusCode::OK);
+    let entry = tags["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["external_name"] == "line1.fast.setpoint01")
+        .expect("the writable tag should appear in the catalog");
+    assert_eq!(
+        entry["writable"], true,
+        "catalog should surface the writable flag (design §4)"
+    );
+
+    sim.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn creating_a_tag_with_a_pre_t2_payload_still_works_and_defaults_writable_to_false() {
+    let app = test_app("crud-legacy-payload").await;
+    let sim = Simulator::start().await;
+
+    let (_, conn_json) = write_json(
+        &app.router,
+        "POST",
+        "/api/plc-connections",
+        &app.token,
+        serde_json::json!({ "name": "line1", "host": "127.0.0.1", "port": sim.addr.port() }),
+    )
+    .await;
+    let conn_id = conn_json["id"].as_i64().unwrap();
+
+    let (_, group_json) = write_json(
+        &app.router,
+        "POST",
+        "/api/collection-groups",
+        &app.token,
+        serde_json::json!({ "name": "fast", "plcConnectionId": conn_id, "periodMs": 100 }),
+    )
+    .await;
+    let group_id = group_json["id"].as_i64().unwrap();
+
+    // Design §10-2: "既存の API クライアントのペイロードは無変更で通る" - no
+    // `writable`/`tagKind`/`expression`/`retain` field at all, exactly what a
+    // pre-T2-3 client still sends.
+    let (status, tag_json) = write_json(
+        &app.router,
+        "POST",
+        "/api/tags",
+        &app.token,
+        serde_json::json!({
+            "name": "temp01",
+            "collectionGroupId": group_id,
+            "address": "40001",
+            "dataType": "i16",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tag_json:?}");
+    assert_eq!(tag_json["writable"], false);
+    assert_eq!(tag_json["tagKind"], "plc");
 
     sim.stop();
 }
