@@ -35,6 +35,17 @@ banto-tstore = { path = "../../../crates/banto-tstore" }
 # I3b: the collection engine itself - hub.rs::CollectorManager owns its
 # lifecycle (start at boot, full rebuild on registry writes).
 banto-collect = { path = "../../../crates/banto-collect" }
+# I6 (T2-2, docs/tag-server-design.md §6-5): the PLC access broker -
+# broker_glue.rs wraps it as the SLMP-side banto_collect::PlcClient the
+# ClientFactory injection seam hands out, and HubSessions owns the session
+# directory outside CollectorManager.
+banto-broker = { path = "../../../crates/banto-broker" }
+# I5 (T2-4, docs/tag-server-design.md §6): the write primitive - rest.rs's
+# POST /api/v1/values/{tag} builds a banto_plc_write::BatchWriteRequest and
+# submits it through banto_broker::BrokerHandle::write (which itself depends
+# on banto-plc-write internally, but the wire types cross this crate's own
+# public API too, so a direct dependency is needed here as well).
+banto-plc-write = { path = "../../../crates/banto-plc-write" }
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -69,6 +80,10 @@ tokio-tungstenite = { workspace = true }
 # banto-collect's own integration tests already exercise (banto-plc's
 # `simulator` feature, made public for exactly this).
 banto-plc = { path = "../../../crates/banto-plc", features = ["simulator"] }
+# T2-4: the read+write SLMP simulator used by tests/write.rs's E2E test
+# (write through the broker, then read the value back through the same
+# session - see that test's module doc).
+banto-plc-write = { path = "../../../crates/banto-plc-write", features = ["simulator"] }
 
 [[bin]]
 name = "banto-hub"

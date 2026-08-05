@@ -113,11 +113,17 @@ MQTT set なし）。I1 `tags` 列追加1回（`writable`/`tag_kind`/`expression
 tstore 保持7日。既定ポート: banto-hub = **8722**（UI/REST/WS）+ gRPC 50051。
 ※既存2アプリの LAN モード既定はどちらも 8721 で重複（両方既定無効のため
 実害未発生）— どちらかの既定変更を W 系/M 系バックログとする。
-※T0 実装時の発見（2026-08-05）: banto-collect の `build_config` は現状
-**modbus-tcp のみ対応**（slmp 接続は構成エラー）。banto-plc には SLMP
-読み取りクライアント（I2a）が既にあるため、**I8 = banto-collect の SLMP
-対応**を I 系バックログとする。banto-hub で MELSEC 収集を謳うには I8 が
-前提（ChronoGazer が collect を配線する際も同様）。
+※T0 実装時の発見（2026-08-05）: banto-collect の `build_config` は当時
+modbus-tcp のみ対応だった（slmp 接続は構成エラー）→ **I8 = banto-collect の
+SLMP 対応として T2-0 で実装済み**（2026-08-05。既知の制約: SLMP の CPU
+種別・アクセスルート・word order はレジストリから設定できず banto-plc の
+既定値 — 必要になったら I1 列追加）。
+※T2 安全設計レビュー（2026-08-05 オーナー承認）: **I8 は T2 の前提スライス
+（T2-0）として実施**。書き込み第一弾は SLMP（書き込みスタックが SLMP 専用
+のため）。**I9 = Modbus 書き込み**（banto-plc-write への FC5/6/15/16 追加 +
+broker のプロトコル抽象化）を新規バックログとする。broker 統合方式は
+「SLMP 接続のみブローカー管理・PlcClient アダプタ注入・broker は
+CollectorManager の外で生存」（tag-server-design.md §6-5）。
 
 | #   | 内容                                                                                         | 依存    | 備考                             |
 | --- | -------------------------------------------------------------------------------------------- | ------- | -------------------------------- |

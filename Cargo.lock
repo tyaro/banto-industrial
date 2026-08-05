@@ -187,6 +187,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "banto-broker"
+version = "0.1.0"
+dependencies = [
+ "banto-plc",
+ "banto-plc-write",
+ "banto-tags",
+ "futures-util",
+ "slmp",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "banto-collect"
 version = "0.1.0"
 dependencies = [
@@ -197,6 +210,7 @@ dependencies = [
  "banto-tstore",
  "serde",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -217,9 +231,11 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "axum",
+ "banto-broker",
  "banto-collect",
  "banto-core",
  "banto-plc",
+ "banto-plc-write",
  "banto-server",
  "banto-storage",
  "banto-tags",
@@ -3225,6 +3241,7 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "axum",
+ "banto-broker",
  "banto-core",
  "banto-plc",
  "banto-plc-write",

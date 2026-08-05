@@ -57,6 +57,24 @@
 //! subscribe する - 実行中の `Collector`（`inner.collector`）から取ると、
 //! rebuild で `Collector` が丸ごと入れ替わった瞬間に古い方の受信側が孤立
 //! するため。
+//!
+//! ## T2-2: SLMP 接続は broker 経由（設計 §6-5、2026-08-05 決定）
+//!
+//! [`CollectorManager`] は [`crate::broker_glue::HubSessions`]（`sessions`
+//! フィールド）を保持する - **`CollectorManager` の外**（`bin/banto-hub.rs`）
+//! で構築・生存する共有 `Arc` で、`rebuild` を跨いでも SLMP セッションが
+//! 切れない。`rebuild` は毎回 [`CollectorManager::sync_slmp_sessions`] で
+//! レジストリの現在の SLMP 接続集合を `sessions` に
+//! `ensure_connection`（新規なら起動・既存ならそのまま）し、得た
+//! ハンドル群を `crate::broker_glue::hub_client_factory` に渡して
+//! `Collector::start_with_client_factory` を呼ぶ - SLMP 接続は
+//! [`crate::broker_glue::BrokerReadClient`]、Modbus 接続は従来どおりの
+//! 直接クライアントで読む。これにより「既知の制約」節が挙げていた
+//! 「新旧 `Collector` が同じ PLC へ同時にソケットを張る瞬間」は **SLMP に
+//! ついては解消**する（broker セッションは新旧どちらの `Collector` からも
+//! 同じ1本を指すため、新 `Collector` 起動時点で既に確立済みか、
+//! `ensure_connection` が同じセッションを返す）。Modbus はこの解消の対象外
+//! （設計 §6 item 7: 書き込み手段が存在しないため共有の必要がない）。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -65,16 +83,19 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::{broadcast, watch};
 
+use banto_broker::{BrokerConnectionStatus, BrokerError, BrokerHandle, ReadOnlyHandle};
 use banto_collect::{
     build_config, CollectEvent, Collector, CollectorOptions, ConnectionStatus, CurrentSample,
     CurrentValuesHandle, EventSink, Quality,
 };
 use banto_core::ListParams;
-use banto_tags::{CollectionGroupService, PlcConnectionService, Tag, TagService};
+use banto_tags::{CollectionGroupService, PlcConnection, PlcConnectionService, Tag, TagService};
 use banto_tstore::Clock;
 use serde::Serialize;
 use sqlx::SqlitePool;
 use utoipa::ToSchema;
+
+use crate::broker_glue::{hub_client_factory, HubSessions};
 
 /// The effective `(value, quality, timestamp_ms)` triple for one catalog
 /// entry - shared by `crate::rest`'s `/api/v1/values*` and `crate::stream`'s
@@ -169,6 +190,16 @@ pub struct TagEntry {
     pub decimals: i64,
     pub period_ms: i64,
     pub enabled: bool,
+    /// Write opt-in (design §4 "メタデータ: ...書き込み可否(§6)を catalog 系
+    /// API で公開", §6 item 1). `tag_kind`/`expression`/`retain` are
+    /// deliberately NOT added to the catalog alongside this - the design
+    /// instructions single out `writable` as the one T2-relevant piece of
+    /// write metadata a catalog client needs (can I target this tag for a
+    /// write), while `tag_kind`/`expression`/`retain` describe T6 tag
+    /// species that stay unused (and, per T2's validation, unreachable -
+    /// `tag_kind` is always `"plc"` today) until T6 lands its own catalog
+    /// exposure decision.
+    pub writable: bool,
 }
 
 /// Immutable snapshot of the external-name catalog, rebuilt from scratch on
@@ -257,6 +288,7 @@ async fn build_catalog(pool: &SqlitePool) -> Result<TagMap, banto_core::BantoErr
             decimals: tag.decimals,
             period_ms: group.period_ms,
             enabled: conn.enabled && group.enabled && tag.enabled,
+            writable: tag.writable,
         });
     }
 
@@ -311,6 +343,12 @@ pub struct CollectorManager {
     /// collector-internal event flow (`plc_connected`/threshold edges/etc.)
     /// still needs a stable sink to persist to.)
     events: EventSink,
+    /// T2-2 (docs/tag-server-design.md §6-5): the broker session directory,
+    /// owned OUTSIDE this manager (`bin/banto-hub.rs` constructs it and holds
+    /// its own `Arc` clone for final shutdown) so an SLMP session survives a
+    /// `rebuild` - see `crate::broker_glue::HubSessions`'s doc comment for
+    /// the full rationale and the session-sync policy `rebuild` follows.
+    sessions: Arc<HubSessions>,
     inner: Mutex<Inner>,
     /// Serializes the whole body of [`CollectorManager::rebuild`] - see this
     /// module's doc comment ("`rebuild` は直列化されている") for why a plain
@@ -336,12 +374,17 @@ pub struct CollectorManager {
 impl CollectorManager {
     /// `clock` is shared with the store (rotation) and the current-value
     /// cache (staleness) - pass `Arc::new(SystemClock)` in production, a
-    /// `ManualClock` in tests, same contract as `Collector::start`.
+    /// `ManualClock` in tests, same contract as `Collector::start`. `sessions`
+    /// is the broker session directory (T2-2, §6-5) - constructed and owned
+    /// by the caller (`bin/banto-hub.rs`) so it outlives every
+    /// `CollectorManager::rebuild`; see [`CollectorManager`]'s `sessions`
+    /// field doc comment.
     pub fn new(
         pool: SqlitePool,
         data_dir: PathBuf,
         clock: Arc<dyn Clock>,
         options: CollectorOptions,
+        sessions: Arc<HubSessions>,
     ) -> Self {
         let events = EventSink::new(pool.clone());
         let (revision_tx, _revision_rx) = watch::channel(0);
@@ -351,6 +394,7 @@ impl CollectorManager {
             clock,
             options,
             events,
+            sessions,
             inner: Mutex::new(Inner {
                 collector: None,
                 map: Arc::new(TagMap::empty()),
@@ -429,6 +473,17 @@ impl CollectorManager {
             }
         };
 
+        // T2-2 (docs/tag-server-design.md §6-5): sync the broker's SLMP
+        // session set against the registry BEFORE building the client
+        // factory below - see `Self::sync_slmp_sessions`'s doc comment for
+        // the sync policy. Deliberately unconditional (runs even when
+        // `config.group_count() == 0` just below) - a connection can be
+        // enabled with no collectible groups yet and still deserve a live
+        // broker session ready for T2-4's write path, and this step never
+        // touches `inner`/`revision` so it carries no all-or-nothing risk
+        // either way.
+        let slmp_handles = self.sync_slmp_sessions().await;
+
         // `CollectorConfig`'s internals are `pub(crate)` to banto-collect, so
         // `group_count() == 0` is the public equivalent of "nothing
         // collectible" - `build_config` already drops any connection with
@@ -457,13 +512,17 @@ impl CollectorManager {
 
         // Start the new Collector BEFORE touching the old one - see this
         // module's doc comment for why the ordering matters (preserving the
-        // old Collector/TagMap on failure requires it).
-        let new_collector = match Collector::start(
+        // old Collector/TagMap on failure requires it). T2-2: the client
+        // factory routes SLMP connections through the broker sessions just
+        // synced above and leaves Modbus connections on the default direct
+        // client (`crate::broker_glue::hub_client_factory`'s doc comment).
+        let new_collector = match Collector::start_with_client_factory(
             config,
             &self.data_dir,
             self.clock.clone(),
             self.events.clone(),
             self.options,
+            hub_client_factory(Arc::new(slmp_handles)),
         )
         .await
         {
@@ -495,6 +554,96 @@ impl CollectorManager {
             .lock()
             .expect("hub state lock poisoned")
             .last_error = Some(message);
+    }
+
+    /// T2-2 (docs/tag-server-design.md §6-5): sync `self.sessions`'s broker
+    /// tasks against the registry's current enabled-SLMP-connection set and
+    /// return the `"conn:{id}"`-keyed handle map
+    /// [`crate::broker_glue::hub_client_factory`] needs. See
+    /// `crate::broker_glue::HubSessions`'s doc comment ("Session sync
+    /// policy") for why this is `ensure_connection`-only (additive) with no
+    /// removal step for connections that were deleted/disabled since the
+    /// last rebuild.
+    ///
+    /// A registry read failure here is logged and treated as "no SLMP
+    /// connections this rebuild" (an empty map - every SLMP connection falls
+    /// back to `banto_collect::default_client_factory` for this one rebuild,
+    /// per `hub_client_factory`'s defensive fallback) rather than failing the
+    /// whole `rebuild` - this sync step is additive/best-effort infrastructure
+    /// wiring, not a correctness precondition for the collector build that
+    /// follows it (unlike `build_catalog`/`build_config`, whose failures
+    /// `rebuild` does propagate).
+    async fn sync_slmp_sessions(&self) -> HashMap<String, ReadOnlyHandle> {
+        let connections: Vec<PlcConnection> = match PlcConnectionService::new(self.pool.clone())
+            .list(ListParams::default())
+            .await
+        {
+            Ok(result) => result.rows,
+            Err(err) => {
+                eprintln!(
+                    "banto-hub: SLMP セッション同期のための接続一覧取得に失敗しました: {err}"
+                );
+                return HashMap::new();
+            }
+        };
+
+        let mut handles = HashMap::new();
+        for conn in connections
+            .iter()
+            .filter(|c| c.enabled && c.protocol == "slmp")
+        {
+            match self.sessions.ensure_connection(conn) {
+                Ok(handle) => {
+                    handles.insert(format!("conn:{}", conn.id), handle.read_only());
+                }
+                Err(err) => {
+                    // Should not happen given the protocol filter above
+                    // (UnsupportedProtocol) and banto-tags' own port
+                    // validation (InvalidPort) - logged and skipped rather
+                    // than failing the rebuild, matching this fn's doc
+                    // comment. `hub_client_factory`'s defensive fallback
+                    // covers this connection for the current rebuild.
+                    eprintln!(
+                        "banto-hub: SLMP ブローカーセッションの起動に失敗しました (接続 {}): {err}",
+                        conn.id
+                    );
+                }
+            }
+        }
+        handles
+    }
+
+    /// T2-2 (docs/tag-server-design.md §6-5): the broker's own connection
+    /// status for an SLMP connection, or `None` if no broker session has ever
+    /// been started for it (never SLMP, or no rebuild has run yet). Used by
+    /// `crate::rest`'s `/api/v1/status` handler in place of
+    /// [`Self::connection_status`] for connections whose `protocol ==
+    /// "slmp"` - see `crate::broker_glue`'s module doc ("The two-backoff
+    /// double bookkeeping") for why the broker's status, not
+    /// banto-collect's own, is the one that answers "is the physical session
+    /// up".
+    pub fn broker_status(&self, connection_id: i64) -> Option<BrokerConnectionStatus> {
+        self.sessions
+            .status_watch(connection_id)
+            .map(|watch| *watch.borrow())
+    }
+
+    /// T2-4（docs/tag-server-design.md §6 item 5「読み書き単一セッション」）:
+    /// `conn`（SLMP 接続）の書き込み可能な [`BrokerHandle`] を取得する。
+    /// `crate::rest` の書き込みハンドラの唯一の入口 - `self.sessions`
+    /// （`Self::sync_slmp_sessions`が rebuild の度に確保する broker セッション
+    /// directory）に委譲するだけで、`Self::sync_slmp_sessions`が読み取り専用
+    /// ハンドルへ絞る（`ReadOnlyHandle`、`banto_collect::PlcClient` 経由）のと
+    /// 対称的に、こちらは書き込み可能なフル `BrokerHandle` をそのまま返す
+    /// （収集と書き込みが同じ物理セッションを通る、というのがこの broker
+    /// 統合方針の核心 - 設計 §6 item 5）。
+    ///
+    /// `HubSessions::ensure_connection` は冪等（既存セッションがあれば
+    /// それをそのまま返す）なので、直近の `rebuild` が既に確保済みの
+    /// セッションと同じものが返る。`rebuild` と競合しても安全（同じ
+    /// セッションに収束する）。
+    pub fn write_broker_handle(&self, conn: &PlcConnection) -> Result<BrokerHandle, BrokerError> {
+        self.sessions.ensure_connection(conn)
     }
 
     /// Current catalog snapshot. Cheap (`Arc` clone) - safe to call once per
@@ -607,6 +756,7 @@ mod tests {
         let db_path = dir.path().join("registry.sqlite3");
         let pool = init_db(&db_path).await.expect("init_db");
         let data_dir = dir.path().join("data");
+        let sessions = Arc::new(HubSessions::new(banto_broker::BackoffConfig::default()));
         let manager = CollectorManager::new(
             pool.clone(),
             data_dir,
@@ -616,6 +766,7 @@ mod tests {
                 response_timeout: Duration::from_millis(200),
                 ..CollectorOptions::default()
             },
+            sessions,
         );
         (pool, dir, manager)
     }
@@ -672,6 +823,10 @@ mod tests {
                 threshold_l: None,
                 threshold_ll: None,
                 enabled: false,
+                writable: false,
+                tag_kind: "plc".to_string(),
+                expression: None,
+                retain: false,
             })
             .await
             .unwrap();
@@ -739,6 +894,10 @@ mod tests {
                 threshold_l: None,
                 threshold_ll: None,
                 enabled: true,
+                writable: false,
+                tag_kind: "plc".to_string(),
+                expression: None,
+                retain: false,
             })
             .await
             .unwrap();

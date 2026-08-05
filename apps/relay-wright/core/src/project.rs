@@ -294,6 +294,10 @@ async fn validate_by_replay(project: &ProjectFile) -> Result<(), BantoError> {
                 threshold_l: t.threshold_l,
                 threshold_ll: t.threshold_ll,
                 enabled: t.enabled,
+                writable: t.writable,
+                tag_kind: t.tag_kind.clone(),
+                expression: t.expression.clone(),
+                retain: t.retain,
             })
             .await?;
         tag_map.insert(t.id, created.id);
@@ -752,6 +756,10 @@ mod tests {
             threshold_l: None,
             threshold_ll: None,
             enabled: true,
+            writable: false,
+            tag_kind: "plc".to_string(),
+            expression: None,
+            retain: false,
         }
     }
 

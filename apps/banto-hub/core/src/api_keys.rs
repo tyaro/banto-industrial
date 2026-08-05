@@ -55,6 +55,20 @@
 //! スコープはワイルドカード不可・3セグメントちょうど・各セグメント非空を
 //! 発行時に検証するが、**実際の書き込み検査（T2）はここでは行わない**
 //! （書き込み API 自体が T0-2 の時点でまだ存在しない）。
+//!
+//! ## トリップ（T2-4、設計 §6-4・2026-08-05 決定）
+//!
+//! `tripped_at` は `revoked_at`（T0-2、不可逆の失効）とは**別の解除可能な
+//! 状態**。書き込みレート制限（`crate::write_rate`）を超過したキーは
+//! `crate::rest` の書き込みハンドラが [`ApiKeysService::trip`] を呼んで
+//! トリップさせ、admin が管理 UI から [`ApiKeysService::clear_trip`] で
+//! 手動解除する。[`ApiKeysService::lookup`] の判定順は
+//! **ハッシュ一致 → revoked → tripped**（この節見出しの上、「照合の
+//! タイミングについて」の情報漏洩防止の理由付けと同じ順序 - T0-2 の
+//! revoked チェックがハッシュ一致より先に来てはならないのと同じ理由で、
+//! tripped チェックも revoked の後段に置く）。トリップ中のキーは
+//! read/write いずれの `/api/v1/*` リクエストも拒否される
+//! （`crate::rest::require_tag_space_auth` 参照）。
 
 use banto_core::{BantoError, FieldError};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -236,6 +250,10 @@ pub struct ApiKeySummary {
     pub created_at: String,
     pub last_used_at: Option<i64>,
     pub revoked_at: Option<String>,
+    /// T2-4（設計 §6-4）: このキーが現在トリップ中か、その日時
+    /// （ISO 文字列、`datetime('now')` そのまま）。`revoked_at` とは別の
+    /// 解除可能な状態 - このモジュールの doc comment「トリップ」参照。
+    pub tripped_at: Option<String>,
 }
 
 /// [`ApiKeysService::lookup`] が有効なキーに対して返す文脈情報 -
@@ -256,20 +274,41 @@ impl ApiKeyContext {
     pub fn has_read_scope(&self) -> bool {
         self.scopes.iter().any(|scope| scope == "read")
     }
+
+    /// T2-4（設計 §6 実装指示 §5「認証」）: `POST /api/v1/values/{tag}` は
+    /// `write:{external_name}` の**完全一致**が必須（ワイルドカードは
+    /// 発行時点で拒否済み、`validate_scope` 参照）。`read` スコープでは
+    /// 書けない。
+    pub fn has_write_scope(&self, external_name: &str) -> bool {
+        let needle = format!("write:{external_name}");
+        self.scopes.iter().any(|scope| scope == &needle)
+    }
 }
 
-/// [`ApiKeysService::lookup`] の結果。`Revoked` を `NotFound` と分けるのは
-/// 「失効済みキーでのアクセス試行は audit_log に記録する」（設計 T0-2 実装
-/// 指示）ため — 呼び出し元（`crate::rest`）がこの2つを区別して扱う。
+/// [`ApiKeysService::lookup`] の結果。`Revoked`/`Tripped` を `NotFound` と
+/// 分けるのは「失効済み/トリップ中のキーでのアクセス試行は audit_log に
+/// 記録する」（設計 T0-2 実装指示、T2-4 で `Tripped` にも同じ扱いを拡張）
+/// ため — 呼び出し元（`crate::rest`）がこれらを区別して扱う。
 ///
-/// ハッシュが一致しない場合は revoked かどうかに関わらず常に `NotFound`
-/// を返す（`Revoked` を返してしまうと、secret を知らない攻撃者に
-/// 「このプレフィックスは存在し、かつ失効済みだ」という情報を漏らすことに
-/// なるため — [`ApiKeysService::lookup`] の実装コメント参照）。
+/// ハッシュが一致しない場合は revoked/tripped かどうかに関わらず常に
+/// `NotFound` を返す（`Revoked`/`Tripped` を返してしまうと、secret を
+/// 知らない攻撃者に「このプレフィックスは存在し、かつ失効済み/トリップ
+/// 中だ」という情報を漏らすことになるため — [`ApiKeysService::lookup`]
+/// の実装コメント参照）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApiKeyLookup {
     Valid(ApiKeyContext),
-    Revoked { id: i64, name: String },
+    Revoked {
+        id: i64,
+        name: String,
+    },
+    /// T2-4（設計 §6-4・2026-08-05 決定）: レート制限ブレーカがトリップ
+    /// させた状態。`revoked_at` と違い、admin が
+    /// [`ApiKeysService::clear_trip`] で解除できる。
+    Tripped {
+        id: i64,
+        name: String,
+    },
     NotFound,
 }
 
@@ -290,16 +329,25 @@ type ApiKeyRow = (
     String,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 /// [`ApiKeysService::lookup`]'s row shape: `(id, name, key_hash, scopes,
-/// last_used_at, revoked_at)` - deliberately not [`ApiKeyRow`] (which also
-/// carries `prefix`/`created_at` instead of `key_hash`); the two queries
-/// select different columns for different purposes.
-type LookupRow = (i64, String, String, String, Option<String>, Option<String>);
+/// last_used_at, revoked_at, tripped_at)` - deliberately not [`ApiKeyRow`]
+/// (which also carries `prefix`/`created_at` instead of `key_hash`); the two
+/// queries select different columns for different purposes.
+type LookupRow = (
+    i64,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 fn row_to_summary(row: ApiKeyRow) -> Result<ApiKeySummary, BantoError> {
-    let (id, name, prefix, scopes_json, created_at, last_used_at, revoked_at) = row;
+    let (id, name, prefix, scopes_json, created_at, last_used_at, revoked_at, tripped_at) = row;
     let scopes: Vec<String> = serde_json::from_str(&scopes_json).map_err(|err| {
         BantoError::Other(format!("スコープのデシリアライズに失敗しました: {err}"))
     })?;
@@ -311,6 +359,7 @@ fn row_to_summary(row: ApiKeyRow) -> Result<ApiKeySummary, BantoError> {
         created_at,
         last_used_at: last_used_at.and_then(|value| value.parse::<i64>().ok()),
         revoked_at,
+        tripped_at,
     })
 }
 
@@ -389,7 +438,7 @@ impl ApiKeysService {
     /// `key_hash` は返さない）。作成順。
     pub async fn list(&self) -> Result<Vec<ApiKeySummary>, BantoError> {
         let rows: Vec<ApiKeyRow> = sqlx::query_as(
-            "SELECT id, name, prefix, scopes, created_at, last_used_at, revoked_at \
+            "SELECT id, name, prefix, scopes, created_at, last_used_at, revoked_at, tripped_at \
              FROM api_keys ORDER BY id",
         )
         .fetch_all(&self.pool)
@@ -413,8 +462,46 @@ impl ApiKeysService {
         .await
         .map_err(banto_storage::storage_error)?;
 
+        self.fetch_summary(id).await
+    }
+
+    /// T2-4（設計 §6-4）: `id` をトリップさせる（`tripped_at` を立てる -
+    /// `revoked_at` と同じパターンだが別の列・別の解除経路）。**冪等**:
+    /// 既にトリップ中なら何もしない。`crate::rest` の書き込みハンドラが
+    /// レート制限超過時に呼ぶ。
+    pub async fn trip(&self, id: i64) -> Result<ApiKeySummary, BantoError> {
+        sqlx::query(
+            "UPDATE api_keys SET tripped_at = datetime('now') \
+             WHERE id = ? AND tripped_at IS NULL",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(banto_storage::storage_error)?;
+
+        self.fetch_summary(id).await
+    }
+
+    /// T2-4（設計 §6-4）: `id` のトリップを解除する（`tripped_at` を
+    /// `NULL` に戻す）。**冪等**: トリップしていなければ何もしない。
+    /// `crate::rest` の `POST /api/api-keys/{id}/clear-trip`（admin 限定）
+    /// から呼ぶ。
+    pub async fn clear_trip(&self, id: i64) -> Result<ApiKeySummary, BantoError> {
+        sqlx::query("UPDATE api_keys SET tripped_at = NULL WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(banto_storage::storage_error)?;
+
+        self.fetch_summary(id).await
+    }
+
+    /// [`Self::revoke`]/[`Self::trip`]/[`Self::clear_trip`] 共通の
+    /// 「更新後の行を読み直して `ApiKeySummary` にする」処理。`id` が
+    /// 存在しない場合のみ `NotFound`。
+    async fn fetch_summary(&self, id: i64) -> Result<ApiKeySummary, BantoError> {
         let row: Option<ApiKeyRow> = sqlx::query_as(
-            "SELECT id, name, prefix, scopes, created_at, last_used_at, revoked_at \
+            "SELECT id, name, prefix, scopes, created_at, last_used_at, revoked_at, tripped_at \
              FROM api_keys WHERE id = ?",
         )
         .bind(id)
@@ -434,17 +521,20 @@ impl ApiKeysService {
     /// `Authorization: Bearer <token>` から渡された `bh_...` トークンを
     /// 照合する。`crate::rest` の `/api/v1/*` ミドルウェアの唯一の入口。
     ///
-    /// **ハッシュ一致を revoked チェックより先に行う**: prefix だけ一致
-    /// して secret（＝ハッシュ）が一致しない場合は、そのキーが失効済みか
-    /// 有効かに関わらず常に [`ApiKeyLookup::NotFound`] を返す
-    /// ([`ApiKeyLookup`] の doc comment 参照 - 情報漏洩防止)。
+    /// **ハッシュ一致を revoked/tripped チェックより先に行う**: prefix
+    /// だけ一致して secret（＝ハッシュ）が一致しない場合は、そのキーが
+    /// 失効済み/トリップ中か有効かに関わらず常に [`ApiKeyLookup::NotFound`]
+    /// を返す（[`ApiKeyLookup`] の doc comment 参照 - 情報漏洩防止)。
+    /// 判定順は **ハッシュ一致 → revoked → tripped**
+    /// （このモジュールの doc comment「トリップ」参照 - T0-2 と同じ順序の
+    /// 規律）。
     pub async fn lookup(&self, full_key: &str) -> Result<ApiKeyLookup, BantoError> {
         let Some((prefix, _secret)) = parse_key(full_key) else {
             return Ok(ApiKeyLookup::NotFound);
         };
 
         let row: Option<LookupRow> = sqlx::query_as(
-            "SELECT id, name, key_hash, scopes, last_used_at, revoked_at \
+            "SELECT id, name, key_hash, scopes, last_used_at, revoked_at, tripped_at \
              FROM api_keys WHERE prefix = ?",
         )
         .bind(prefix)
@@ -452,7 +542,8 @@ impl ApiKeysService {
         .await
         .map_err(banto_storage::storage_error)?;
 
-        let Some((id, name, key_hash, scopes_json, last_used_at, revoked_at)) = row else {
+        let Some((id, name, key_hash, scopes_json, last_used_at, revoked_at, tripped_at)) = row
+        else {
             return Ok(ApiKeyLookup::NotFound);
         };
 
@@ -463,6 +554,10 @@ impl ApiKeysService {
 
         if revoked_at.is_some() {
             return Ok(ApiKeyLookup::Revoked { id, name });
+        }
+
+        if tripped_at.is_some() {
+            return Ok(ApiKeyLookup::Tripped { id, name });
         }
 
         let scopes: Vec<String> = serde_json::from_str(&scopes_json).map_err(|err| {
@@ -794,5 +889,164 @@ mod tests {
         let moved = svc.list().await.unwrap();
         let entry = moved.iter().find(|k| k.id == issued.id).unwrap();
         assert_eq!(entry.last_used_at, Some(1_061_000));
+    }
+
+    // --- T2-4: has_write_scope --------------------------------------------
+
+    #[test]
+    fn has_write_scope_requires_an_exact_match() {
+        let ctx = ApiKeyContext {
+            id: 1,
+            name: "k".to_string(),
+            scopes: vec!["write:line1.fast.temp01".to_string()],
+            last_used_at_ms: None,
+        };
+        assert!(ctx.has_write_scope("line1.fast.temp01"));
+        assert!(!ctx.has_write_scope("line1.fast.temp02"));
+        assert!(!ctx.has_write_scope("line1.fast"));
+    }
+
+    #[test]
+    fn has_write_scope_is_false_for_a_read_only_key() {
+        let ctx = ApiKeyContext {
+            id: 1,
+            name: "k".to_string(),
+            scopes: vec!["read".to_string()],
+            last_used_at_ms: None,
+        };
+        assert!(!ctx.has_write_scope("line1.fast.temp01"));
+    }
+
+    // --- T2-4: trip/clear_trip/lookup ordering -----------------------------
+
+    #[tokio::test]
+    async fn trip_then_lookup_reports_tripped_not_valid_or_not_found() {
+        let svc = service().await;
+        let issued = svc
+            .issue("writer", vec!["write:line1.fast.temp01".to_string()])
+            .await
+            .unwrap();
+
+        let summary = svc.trip(issued.id).await.expect("trip should succeed");
+        assert!(summary.tripped_at.is_some());
+        assert!(summary.revoked_at.is_none(), "trip must not revoke");
+
+        let lookup = svc.lookup(&issued.key).await.unwrap();
+        match lookup {
+            ApiKeyLookup::Tripped { id, name } => {
+                assert_eq!(id, issued.id);
+                assert_eq!(name, "writer");
+            }
+            other => panic!("expected Tripped, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn trip_is_idempotent_and_keeps_the_first_timestamp() {
+        let svc = service().await;
+        let issued = svc
+            .issue("idempotent-trip", vec!["read".to_string()])
+            .await
+            .unwrap();
+
+        let first = svc.trip(issued.id).await.unwrap();
+        let second = svc.trip(issued.id).await.unwrap();
+        assert_eq!(first.tripped_at, second.tripped_at);
+    }
+
+    #[tokio::test]
+    async fn clear_trip_restores_valid_lookup() {
+        let svc = service().await;
+        let issued = svc
+            .issue("clear-me", vec!["read".to_string()])
+            .await
+            .unwrap();
+        svc.trip(issued.id).await.unwrap();
+
+        let cleared = svc
+            .clear_trip(issued.id)
+            .await
+            .expect("clear_trip should succeed");
+        assert!(cleared.tripped_at.is_none());
+
+        let lookup = svc.lookup(&issued.key).await.unwrap();
+        match lookup {
+            ApiKeyLookup::Valid(ctx) => assert_eq!(ctx.id, issued.id),
+            other => panic!("expected Valid after clear_trip, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_trip_is_idempotent() {
+        let svc = service().await;
+        let issued = svc
+            .issue("clear-idempotent", vec!["read".to_string()])
+            .await
+            .unwrap();
+
+        // Clearing a key that was never tripped must not error.
+        let cleared = svc
+            .clear_trip(issued.id)
+            .await
+            .expect("clear_trip should succeed");
+        assert!(cleared.tripped_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn revoked_key_is_reported_as_revoked_even_if_also_tripped() {
+        // 判定順: ハッシュ一致 -> revoked -> tripped. A revoked-and-tripped
+        // key must report Revoked, matching the doc comment's ordering.
+        let svc = service().await;
+        let issued = svc
+            .issue("revoked-and-tripped", vec!["read".to_string()])
+            .await
+            .unwrap();
+        svc.trip(issued.id).await.unwrap();
+        svc.revoke(issued.id).await.unwrap();
+
+        let lookup = svc.lookup(&issued.key).await.unwrap();
+        match lookup {
+            ApiKeyLookup::Revoked { id, .. } => assert_eq!(id, issued.id),
+            other => panic!("expected Revoked, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_secret_against_a_tripped_key_is_still_not_found() {
+        // Same info-leak guard as the revoked case (this module's doc
+        // comment): a forged secret against a tripped key's prefix must not
+        // distinguish itself from any other forged secret.
+        let svc = service().await;
+        let issued = svc
+            .issue("tripped-forged", vec!["read".to_string()])
+            .await
+            .unwrap();
+        svc.trip(issued.id).await.unwrap();
+
+        let (prefix, _secret) = parse_key(&issued.key).unwrap();
+        let forged = format!("bh_{prefix}_{}", generate_secret());
+        let lookup = svc.lookup(&forged).await.unwrap();
+        assert_eq!(lookup, ApiKeyLookup::NotFound);
+    }
+
+    #[tokio::test]
+    async fn trip_unknown_id_is_not_found() {
+        let svc = service().await;
+        let err = svc.trip(999).await.unwrap_err();
+        assert!(matches!(err, BantoError::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn list_reflects_tripped_state() {
+        let svc = service().await;
+        let a = svc.issue("a", vec!["read".to_string()]).await.unwrap();
+        svc.issue("b", vec!["read".to_string()]).await.unwrap();
+        svc.trip(a.id).await.unwrap();
+
+        let listed = svc.list().await.unwrap();
+        let a = listed.iter().find(|k| k.name == "a").unwrap();
+        assert!(a.tripped_at.is_some());
+        let b = listed.iter().find(|k| k.name == "b").unwrap();
+        assert!(b.tripped_at.is_none());
     }
 }

@@ -99,6 +99,10 @@ impl Fixture {
                 threshold_l: None,
                 threshold_ll: None,
                 enabled: true,
+                writable: false,
+                tag_kind: "plc".to_string(),
+                expression: None,
+                retain: false,
             })
             .await
             .unwrap()
@@ -407,6 +411,10 @@ async fn monitor_rejects_a_modbus_connection_with_a_clear_error() {
             threshold_l: None,
             threshold_ll: None,
             enabled: true,
+            writable: false,
+            tag_kind: "plc".to_string(),
+            expression: None,
+            retain: false,
         })
         .await
         .unwrap()

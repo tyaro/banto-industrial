@@ -56,6 +56,27 @@ fn default_enabled() -> bool {
     true
 }
 
+fn default_tag_kind() -> String {
+    PLC_TAG_KIND.to_string()
+}
+
+/// Full `tag_kind` vocabulary from design §4.2's table (`plc` / `computed` /
+/// `internal`) - mirrors the SQL `CHECK` added in
+/// `migrations/0006_tags_writable_kind.sql`. Not every value here is accepted
+/// by [`validate_tag_input`] yet; see [`PLC_TAG_KIND`]'s doc comment for the
+/// T2-vs-T6 staging (design §6 item 9, 2026-08-05 decision).
+pub const ALLOWED_TAG_KINDS: &[&str] = &["plc", "computed", "internal"];
+
+/// The one `tag_kind` this crate's service layer accepts as of T2 (design §6
+/// item 9: "tag_kind は T2 時点で plc のみ受理し、computed/internal の受理は
+/// T6 で解禁"). `"computed"`/`"internal"` are legal per the SQL `CHECK` (the
+/// column already carries the full §4.2 vocabulary so T6 needs no further
+/// migration) but [`validate_tag_input`] rejects them with a forward-looking
+/// "T6 で対応予定" message, distinct from the generic "invalid value" message
+/// a typo'd `tag_kind` gets - so a caller reaching for `computed`/`internal`
+/// today is told this is a matter of timing, not a mistake.
+pub const PLC_TAG_KIND: &str = "plc";
+
 /// A row of the `tags` table, wire-shaped (camelCase) for a future settings
 /// grid (recorder-requirements.md §6 "タグ設定" screen).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
@@ -82,6 +103,28 @@ pub struct Tag {
     pub threshold_l: Option<f64>,
     pub threshold_ll: Option<f64>,
     pub enabled: bool,
+    /// Per-tag write opt-in (design §6 item 1: "per-tag opt-in"). Whether a
+    /// `writable` tag can actually be *targeted* by a write (e.g. "is this
+    /// tag's connection an SLMP connection under broker management") is not
+    /// checked here - see this struct's module-level validation doc comment
+    /// on [`validate_tag_input`] for why that question belongs to the write
+    /// stack (T2-4), not the registry.
+    pub writable: bool,
+    /// One of [`ALLOWED_TAG_KINDS`] (design §4.2). T2's service layer only
+    /// ever persists `"plc"` (see [`PLC_TAG_KIND`]) - the column carries the
+    /// full T6 vocabulary already so no further migration is needed when
+    /// `computed`/`internal` are unlocked.
+    pub tag_kind: String,
+    /// Computed-tag formula source (design §4.2, T6). Always `None` for a
+    /// `tag_kind = "plc"` row - [`validate_tag_input`] enforces that a `plc`
+    /// tag never carries an expression, since an address-driven tag's value
+    /// is never derived from one.
+    pub expression: Option<String>,
+    /// Internal-tag "restore last value on restart" flag (design §4.2, T6).
+    /// Accepted and persisted from T2 onward but not yet interpreted by any
+    /// consumer - `tag_kind` staying `"plc"`-only until T6 means no row can
+    /// reach the internal-tag code path that would read it.
+    pub retain: bool,
 }
 
 impl Tag {
@@ -136,6 +179,21 @@ pub struct TagInput {
     pub threshold_ll: Option<f64>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// `#[serde(default)]` (= `false`): an existing API client's payload
+    /// (written before this field existed) still deserializes and creates a
+    /// non-writable tag, exactly the pre-T2 behaviour (design §10-2:
+    /// "既存の API クライアントのペイロードは無変更で通る").
+    #[serde(default)]
+    pub writable: bool,
+    /// `#[serde(default = "default_tag_kind")]` (= `"plc"`) for the same
+    /// reason as `writable` above - an existing payload with no `tagKind`
+    /// field still creates the same `plc` tag it always did.
+    #[serde(default = "default_tag_kind")]
+    pub tag_kind: String,
+    #[serde(default)]
+    pub expression: Option<String>,
+    #[serde(default)]
+    pub retain: bool,
 }
 
 /// Normalized, validated fields extracted from a [`TagInput`]: trimmed
@@ -194,6 +252,21 @@ fn validate_thresholds(
 /// `items::validate_item_input`'s "report everything, not just the first"
 /// convention in the banto template repo). On success, returns the trimmed
 /// `name`/`address` and normalized `unit` for the caller to bind directly.
+///
+/// **`writable` gets no validation here beyond accepting the bool as-is.**
+/// Design §6 item 1 makes `writable` a per-tag opt-in, and item 7 restricts
+/// which *connections* can actually be targeted for a write ("writable に
+/// できるのは SLMP 接続配下のタグのみ"). That second rule is deliberately NOT
+/// enforced in this crate: `banto-tags` (I1) is the registry and knows a
+/// tag's protocol only indirectly (via its `PlcConnection`'s `protocol`
+/// column), but "is this protocol part of the write stack" is a question
+/// about `banto-plc-write`/`banto-broker`'s capabilities, not about registry
+/// integrity - a `writable` Modbus tag is a perfectly well-formed *row* (I1's
+/// own invariants all hold), it is simply not usable for a write today. That
+/// check belongs to the app layer that owns the write path (T2-4), which can
+/// reject or warn on `writable` + non-SLMP without I1 having to know the
+/// write stack's protocol coverage at all - keeping the two concerns (row
+/// validity vs. write-path capability) from being entangled in one crate.
 fn validate_tag_input(input: &TagInput) -> Result<ValidatedTag, BantoError> {
     let mut errors: Vec<FieldError> = Vec::new();
 
@@ -228,6 +301,37 @@ fn validate_tag_input(input: &TagInput) -> Result<ValidatedTag, BantoError> {
                 "対応データ型は {} のいずれかです",
                 ALLOWED_DATA_TYPES.join(", ")
             ),
+        });
+    }
+
+    // T2 accepts only `tag_kind = "plc"` (design §6 item 9, 2026-08-05
+    // decision - see PLC_TAG_KIND's doc comment). A value from the wider §4.2
+    // vocabulary gets a distinct "not yet" message from an outright-invalid
+    // one, same "report everything, tell the caller exactly what's wrong"
+    // spirit as every other field here.
+    if input.tag_kind != PLC_TAG_KIND {
+        if ALLOWED_TAG_KINDS.contains(&input.tag_kind.as_str()) {
+            errors.push(FieldError {
+                field: "tagKind".to_string(),
+                message: "T6 で対応予定です（現時点は plc のみ受理します）".to_string(),
+            });
+        } else {
+            errors.push(FieldError {
+                field: "tagKind".to_string(),
+                message: format!("tagKind は {} のいずれかです", ALLOWED_TAG_KINDS.join(", ")),
+            });
+        }
+    }
+
+    // design §4.2's table: a `plc` tag's value always comes from the
+    // collection task, never a formula - `expression` only has meaning for
+    // `computed` (T6). Checked regardless of whether `tag_kind` itself just
+    // failed above, so a `plc` payload that also sets `expression` sees both
+    // problems in one response.
+    if input.tag_kind == PLC_TAG_KIND && input.expression.is_some() {
+        errors.push(FieldError {
+            field: "expression".to_string(),
+            message: "plc タグには expression を設定できません".to_string(),
         });
     }
 
@@ -355,12 +459,17 @@ fn column_map() -> ColumnMap {
         .column("thresholdL", "threshold_l")
         .column("thresholdLl", "threshold_ll")
         .column("enabled", "enabled")
+        .column("writable", "writable")
+        .column("tagKind", "tag_kind")
+        .column("expression", "expression")
+        .column("retain", "retain")
 }
 
 const RESOURCE: &str = "tags";
 const COLUMNS: &str = "id, name, collection_group_id, address, data_type, string_length, \
      raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, \
-     threshold_h, threshold_hh, threshold_l, threshold_ll, enabled";
+     threshold_h, threshold_hh, threshold_l, threshold_ll, enabled, \
+     writable, tag_kind, expression, retain";
 const FK_MESSAGE: &str = "指定された収集グループが見つかりません";
 
 /// Service layer for the `tags` resource. No delete guard is needed here
@@ -422,8 +531,10 @@ impl TagService {
             "INSERT INTO tags (\
                 name, collection_group_id, address, data_type, string_length, \
                 raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, \
-                threshold_h, threshold_hh, threshold_l, threshold_ll, enabled\
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
+                threshold_h, threshold_hh, threshold_l, threshold_ll, enabled, \
+                writable, tag_kind, expression, retain\
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             RETURNING {COLUMNS}"
         ))
         .bind(&validated.name)
         .bind(input.collection_group_id)
@@ -441,6 +552,10 @@ impl TagService {
         .bind(input.threshold_l)
         .bind(input.threshold_ll)
         .bind(input.enabled)
+        .bind(input.writable)
+        .bind(&input.tag_kind)
+        .bind(&input.expression)
+        .bind(input.retain)
         .fetch_one(&self.pool)
         .await
         .map_err(|err| map_write_error(err, "name", "collectionGroupId", FK_MESSAGE))
@@ -453,7 +568,8 @@ impl TagService {
                 name = ?, collection_group_id = ?, address = ?, data_type = ?, \
                 string_length = ?, \
                 raw_lo = ?, raw_hi = ?, eng_lo = ?, eng_hi = ?, unit = ?, decimals = ?, \
-                threshold_h = ?, threshold_hh = ?, threshold_l = ?, threshold_ll = ?, enabled = ? \
+                threshold_h = ?, threshold_hh = ?, threshold_l = ?, threshold_ll = ?, enabled = ?, \
+                writable = ?, tag_kind = ?, expression = ?, retain = ? \
              WHERE id = ? RETURNING {COLUMNS}"
         ))
         .bind(&validated.name)
@@ -472,6 +588,10 @@ impl TagService {
         .bind(input.threshold_l)
         .bind(input.threshold_ll)
         .bind(input.enabled)
+        .bind(input.writable)
+        .bind(&input.tag_kind)
+        .bind(&input.expression)
+        .bind(input.retain)
         .bind(id)
         .fetch_one(&self.pool)
         .await
@@ -560,6 +680,10 @@ mod tests {
             threshold_l: None,
             threshold_ll: None,
             enabled: true,
+            writable: false,
+            tag_kind: PLC_TAG_KIND.to_string(),
+            expression: None,
+            retain: false,
         }
     }
 
@@ -1131,6 +1255,176 @@ mod tests {
         svc.create(input).await.expect("single threshold ok");
     }
 
+    // --- writable / tag_kind / expression / retain (T2-3, migration 0006) --
+
+    /// The 4 new columns round-trip through create/get, including a
+    /// `writable = true` tag - default() elsewhere in this test module
+    /// (`sample_input`) always sets `writable: false`, so this is the one
+    /// test that proves the opt-in flag itself persists.
+    #[tokio::test]
+    async fn create_then_get_round_trips_writable_and_kind_columns() {
+        let (svc, group_id) = setup().await;
+        let mut input = sample_input("X", group_id);
+        input.writable = true;
+        input.retain = true;
+        let created = svc.create(input).await.expect("create should succeed");
+        assert!(created.writable);
+        assert_eq!(created.tag_kind, "plc");
+        assert_eq!(created.expression, None);
+        assert!(created.retain);
+
+        let fetched = svc.get(created.id).await.expect("get should succeed");
+        assert_eq!(fetched, created);
+
+        // Wire shape: camelCase like every other column.
+        let json = serde_json::to_value(&fetched).expect("serialize");
+        assert_eq!(json["writable"], json!(true));
+        assert_eq!(json["tagKind"], json!("plc"));
+        assert_eq!(json["expression"], json!(null));
+        assert_eq!(json["retain"], json!(true));
+    }
+
+    /// An existing API client's payload (no `writable`/`tagKind`/`expression`/
+    /// `retain` fields at all) must still deserialize and create the exact
+    /// pre-T2 tag - design §10-2's "既存の API クライアントのペイロードは
+    /// 無変更で通る" backward-compatibility guarantee, exercised at the
+    /// `TagInput` deserialization boundary rather than through the Rust
+    /// struct literal every other test uses.
+    #[tokio::test]
+    async fn create_accepts_a_pre_t2_payload_missing_the_new_fields() {
+        let (svc, group_id) = setup().await;
+        // `TagInput` itself is snake_case on the wire (no `rename_all` - the
+        // camelCase translation lives one layer up, in each app's own
+        // `TagPayload`/`From<TagPayload> for TagInput`; see `rest.rs` in
+        // banto-hub/relay-wright). This test targets `TagInput`'s own
+        // deserialization boundary directly.
+        let payload = json!({
+            "name": "Legacy",
+            "collection_group_id": group_id,
+            "address": "40001",
+            "data_type": "i16",
+        });
+        let input: TagInput = serde_json::from_value(payload).expect("legacy payload deserializes");
+        let created = svc.create(input).await.expect("create should succeed");
+        assert!(!created.writable);
+        assert_eq!(created.tag_kind, "plc");
+        assert_eq!(created.expression, None);
+        assert!(!created.retain);
+    }
+
+    #[tokio::test]
+    async fn create_accepts_tag_kind_plc() {
+        let (svc, group_id) = setup().await;
+        let mut input = sample_input("X", group_id);
+        input.tag_kind = "plc".to_string();
+        svc.create(input)
+            .await
+            .expect("tag_kind plc should be accepted in T2");
+    }
+
+    /// `computed`/`internal` are legal per [`ALLOWED_TAG_KINDS`] (and the SQL
+    /// `CHECK`) but not yet accepted by the T2 service layer (design §6 item
+    /// 9) - the rejection message must say "T6", not the generic
+    /// invalid-value message [`create_rejects_an_unknown_tag_kind`] checks
+    /// for.
+    #[tokio::test]
+    async fn create_rejects_computed_and_internal_with_a_t6_message() {
+        let (svc, group_id) = setup().await;
+        for kind in ["computed", "internal"] {
+            let mut input = sample_input(&format!("K-{kind}"), group_id);
+            input.tag_kind = kind.to_string();
+            let err = svc.create(input).await.unwrap_err();
+            match err {
+                BantoError::Validation { field_errors } => {
+                    assert_eq!(field_errors[0].field, "tagKind", "kind={kind}");
+                    assert_eq!(
+                        field_errors[0].message, "T6 で対応予定です（現時点は plc のみ受理します）",
+                        "kind={kind}"
+                    );
+                }
+                other => panic!("expected Validation for kind={kind}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_an_unknown_tag_kind() {
+        let (svc, group_id) = setup().await;
+        let mut input = sample_input("X", group_id);
+        input.tag_kind = "bogus".to_string();
+        let err = svc.create(input).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "tagKind");
+                assert_eq!(
+                    field_errors[0].message,
+                    format!("tagKind は {} のいずれかです", ALLOWED_TAG_KINDS.join(", "))
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// design §4.2: a `plc` tag's value always comes from the collection
+    /// task, never a formula - setting `expression` on a `plc` tag is
+    /// rejected even though `tag_kind` itself is valid.
+    #[tokio::test]
+    async fn create_rejects_expression_on_a_plc_tag() {
+        let (svc, group_id) = setup().await;
+        let mut input = sample_input("X", group_id);
+        input.expression = Some("a + b".to_string());
+        let err = svc.create(input).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "expression");
+                assert_eq!(
+                    field_errors[0].message,
+                    "plc タグには expression を設定できません"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// The SQL `CHECK` on `tag_kind` (migration 0006) must agree with
+    /// [`ALLOWED_TAG_KINDS`] in the rejection direction, bypassing
+    /// `validate_tag_input` entirely - same style as
+    /// `the_sql_check_accepts_nothing_beyond_allowed_data_types` above.
+    #[tokio::test]
+    async fn the_sql_check_accepts_nothing_beyond_allowed_tag_kinds() {
+        let (svc, group_id) = setup().await;
+        for tag_kind in ["computed", "internal"] {
+            let result = sqlx::query(
+                "INSERT INTO tags (name, collection_group_id, address, data_type, tag_kind) \
+                 VALUES (?, ?, '40001', 'i16', ?)",
+            )
+            .bind(format!("raw-{tag_kind}"))
+            .bind(group_id)
+            .bind(tag_kind)
+            .execute(&svc.pool)
+            .await;
+            assert!(
+                result.is_ok(),
+                "the SQL CHECK should accept {tag_kind:?} (T6 vocabulary): {result:?}"
+            );
+        }
+        for tag_kind in ["bogus", "PLC", ""] {
+            let result = sqlx::query(
+                "INSERT INTO tags (name, collection_group_id, address, data_type, tag_kind) \
+                 VALUES (?, ?, '40001', 'i16', ?)",
+            )
+            .bind(format!("raw-{tag_kind}"))
+            .bind(group_id)
+            .bind(tag_kind)
+            .execute(&svc.pool)
+            .await;
+            assert!(
+                result.is_err(),
+                "the SQL CHECK accepted {tag_kind:?}, which is not in ALLOWED_TAG_KINDS"
+            );
+        }
+    }
+
     // --- migration 0005 (table rebuild) -----------------------------------
 
     /// Migration 0005 rebuilds `tags` (SQLite cannot `ALTER` a `CHECK`), and
@@ -1294,6 +1588,112 @@ mod tests {
         assert!(sqlx::query(
             "INSERT INTO tags (name, collection_group_id, address, data_type, string_length) \
              VALUES ('TooLong', 4, 'D400', 'string', 129)",
+        )
+        .execute(&mut *conn)
+        .await
+        .is_err());
+    }
+
+    // --- migration 0006 (plain ADD COLUMN) ---------------------------------
+
+    /// Migration 0006's idempotency across app restarts is already covered by
+    /// `migrate_is_idempotent` (crate root) - this test instead exercises the
+    /// scenario that matters for a *deployed* database: applying 0006 against
+    /// a database that already has real rows from 0001-0005 (i.e. an
+    /// upgrade), the same "populated database" style as
+    /// `migration_0005_preserves_rows_and_foreign_keys_on_a_populated_database`
+    /// above. Unlike 0005, this migration is a plain `ADD COLUMN` (no table
+    /// rebuild), so the existing row's id/values are trivially preserved by
+    /// SQLite itself - what this test actually proves is that the new
+    /// columns backfill to their documented defaults (`writable`/`retain` =
+    /// false, `tag_kind` = `'plc'`, `expression` = NULL) on a row that predates
+    /// them, and that the migration can be applied a second time consistent
+    /// with `sqlx`'s own bookkeeping (via `migrate_is_idempotent`) without
+    /// erroring on the already-added columns.
+    #[tokio::test]
+    async fn migration_0006_backfills_defaults_on_a_populated_database() {
+        use sqlx::{Acquire, Executor};
+
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect_sqlite_memory");
+        let mut conn = pool.acquire().await.expect("acquire one pinned connection");
+
+        // The schema as of 0005, i.e. what a deployed pre-writable/kind
+        // database looks like.
+        for (label, sql) in [
+            (
+                "0001",
+                include_str!("../migrations/0001_plc_connections.sql"),
+            ),
+            (
+                "0002",
+                include_str!("../migrations/0002_collection_groups.sql"),
+            ),
+            ("0003", include_str!("../migrations/0003_tags.sql")),
+            (
+                "0004",
+                include_str!("../migrations/0004_plc_connections_allow_slmp.sql"),
+            ),
+            (
+                "0005",
+                include_str!("../migrations/0005_tags_allow_string.sql"),
+            ),
+        ] {
+            conn.execute(sql)
+                .await
+                .unwrap_or_else(|e| panic!("pre-0006 migration {label} failed: {e}"));
+        }
+
+        conn.execute(
+            "INSERT INTO plc_connections (id, name, protocol, host, port, unit_id, enabled) \
+             VALUES (7, 'Line1 PLC', 'slmp', '192.168.1.10', 5007, 3, 0)",
+        )
+        .await
+        .expect("seed connection");
+        conn.execute(
+            "INSERT INTO collection_groups (id, name, plc_connection_id, period_ms, enabled) \
+             VALUES (4, 'G1', 7, 1000, 1)",
+        )
+        .await
+        .expect("seed collection group");
+        conn.execute(
+            "INSERT INTO tags (id, name, collection_group_id, address, data_type, enabled) \
+             VALUES (9, 'T1', 4, 'D100', 'i16', 1)",
+        )
+        .await
+        .expect("seed tag");
+
+        let migration = include_str!("../migrations/0006_tags_writable_kind.sql");
+        let mut tx = conn.begin().await.expect("begin, as the migrator does");
+        tx.execute(migration).await.expect("0006 should apply");
+        tx.commit().await.expect("0006 should commit");
+
+        #[allow(clippy::type_complexity)]
+        let row: (i64, String, bool, String, Option<String>, bool) = sqlx::query_as(
+            "SELECT id, name, writable, tag_kind, expression, retain FROM tags WHERE id = 9",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the pre-existing tag should have survived with backfilled defaults");
+        assert_eq!(
+            row,
+            (9, "T1".to_string(), false, "plc".to_string(), None, false)
+        );
+
+        // The point of the exercise: the new columns are now writable and
+        // enforce their own CHECK.
+        sqlx::query(
+            "INSERT INTO tags (name, collection_group_id, address, data_type, writable, \
+             tag_kind, expression, retain) \
+             VALUES ('T2', 4, 'D200', 'i16', 1, 'internal', NULL, 1)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("a full new-shape row should be accepted after the migration");
+        assert!(sqlx::query(
+            "INSERT INTO tags (name, collection_group_id, address, data_type, tag_kind) \
+             VALUES ('Bad', 4, 'D300', 'i16', 'bogus')",
         )
         .execute(&mut *conn)
         .await

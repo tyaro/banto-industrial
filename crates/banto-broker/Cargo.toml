@@ -1,0 +1,54 @@
+# I6 (docs/tag-server-design.md §6-5「読み書き単一セッション」、2026-08-04/
+# 2026-08-05 決定): relay-wright W3-A の PLC access broker
+# (`apps/relay-wright/core/src/engine/broker.rs`) を共有クレートへ抽出した
+# もの。relay-wright とタグサーバー(banto-hub、T2-2 で配線)の両方が、同じ
+# 「読み書きは同一 PLC セッションを通す」構造保証を使う。挙動は抽出前と
+# 不変 - relay-wright 側の既存テストが回帰網（詳細は src/lib.rs 冒頭 doc）。
+[package]
+name = "banto-broker"
+description = "I6: PLC access broker（read/write 単一セッション・SLMP専用）- relay-wright W3-A から抽出、banto-hub T2-2 と共用 (docs/tag-server-design.md §6-5)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# `test-util`: フェイクブローカー `spawn_test_handle_answering_ok`（ネットワーク
+# なし・即時応答）をこのクレート外にも公開するゲート。relay-wright の
+# engine 側テスト（writer.rs のレート制限テスト等）が W3-A から引き続き使う
+# ため dev-dependencies で有効化する。将来 banto-hub 側のテストが同種の
+# フェイクを要る場合も同じ口を使う想定。既定オフ（本番ビルドでは公開しない）。
+[features]
+test-util = []
+
+[dependencies]
+# 唯一の relay-wright 固有ではない共通依存: 接続定義の型
+# (`banto_tags::PlcConnection`)。banto-tags は共通クレートなのでここから
+# 依存してよい（DB・ログ・監査・エンジン設定への依存はゼロ）。
+banto-tags = { path = "../banto-tags" }
+# read 経路（plan_slmp_batch/execute_slmp_batch_reads）。
+banto-plc = { path = "../banto-plc" }
+# write 経路（plan_slmp_write_batch/execute_slmp_writes）。broker は読み書き
+# 両方を同じ `slmp::SLMPClient` セッション上で駆動するので、read 専用の
+# banto-plc に加えてこちらにも依存する（banto-plc-write 自身が banto-plc に
+# 依存する片方向の関係はそのまま - 循環はない）。
+banto-plc-write = { path = "../banto-plc-write" }
+# bare `slmp::SLMPClient` を直接保持・再接続する（`banto_plc::SlmcClient` は
+# 私有ソケットに read/write 両方を通す継ぎ目を持たないため - 詳細は
+# src/lib.rs 冒頭 doc の「なぜ connect を再実装するか」節）。
+slmp = { workspace = true }
+thiserror = { workspace = true }
+# 接続毎に1タスク(`spawn`)、mpsc でジョブを直列化(`sync`)、バックオフの
+# タイマ・接続/応答タイムアウト(`time`)。banto-collect の task.rs と同じ
+# 最小構成（"rt-multi-thread"/"macros" はここでは不要 - 実行環境は呼び出し側
+# アプリが用意する）。
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util", "sync"] }
+# ユニットテストの並行書き込みバーストで `join_all` を使う（旧 broker.rs の
+# テストと同じ理由）。
+futures-util = { workspace = true }
+# ブローカーの単体テストは banto-plc-write の in-process SLMP シミュレータ
+# （読み書き両対応）を相手にする。旧 broker.rs のテストがそうしていたのを
+# そのまま移設。
+banto-plc-write = { path = "../banto-plc-write", features = ["simulator"] }

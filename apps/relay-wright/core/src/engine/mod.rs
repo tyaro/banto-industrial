@@ -2,10 +2,13 @@
 //!
 //! ## Layers
 //!
-//! - [`broker`] (W3-A): the PLC access broker. One live SLMP session per CPU;
-//!   every read and write to that CPU passes through it, serialized on one
-//!   socket. Infrastructure only - it has no notion of rules, arming, or
-//!   auditing.
+//! - `banto_broker` (W3-A, extracted to the shared `banto-broker` crate as I6
+//!   on 2026-08-05 - see that crate's `src/lib.rs` doc for the extraction
+//!   history and design): the PLC access broker. One live SLMP session per
+//!   CPU; every read and write to that CPU passes through it, serialized on
+//!   one socket. Infrastructure only - it has no notion of rules, arming, or
+//!   auditing. This module re-exports its relay-wright-facing types below so
+//!   the rest of this crate is unaffected by the extraction.
 //! - The **W3-B auto-write engine** (this module plus [`current_values`],
 //!   [`poller`], [`rule_engine`], [`arming`], [`rate_limiter`], [`writer`],
 //!   [`write_audit`]): watches source tags, evaluates condition→action rules,
@@ -19,7 +22,7 @@
 //!    only as informational history. A restart never resumes live writing.
 //! 2. **Structural eval/exec separation** - [`rule_engine`] cannot write (it
 //!    never imports a broker handle); only [`writer::Writer`] holds a
-//!    write-capable [`broker::BrokerHandle`].
+//!    write-capable [`banto_broker::BrokerHandle`].
 //! 3. **Edge-triggered** - [`rule_engine::RuleEngine::evaluate`] fires on a
 //!    state transition, seeding (not firing) on first observation, so a
 //!    held-true condition writes exactly once.
@@ -42,7 +45,6 @@
 //! caller still holds handles.
 
 pub mod arming;
-pub mod broker;
 pub mod current_values;
 // タグモニタ (feature/tag-monitor): the monitor read/manual-write surface on
 // `EngineControl`, reusing the broker's one-session-per-CPU tasks.
@@ -62,8 +64,14 @@ use sqlx::SqlitePool;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-pub use broker::{
-    BackoffConfig, BrokerError, BrokerHandle, BrokerSupervisor, ReadOnlyHandle, SessionDirectory,
+// I6 (2026-08-05): the broker moved to the shared `banto-broker` crate
+// (`crates/banto-broker`, relay-wright W3-A extracted verbatim - see its
+// `src/lib.rs` doc). Re-exported here under the same names so the rest of
+// this crate (and anything outside it importing `relay_wright_core::engine::*`)
+// is unaffected by the move.
+pub use banto_broker::{
+    BackoffConfig, BrokerConnectionStatus, BrokerError, BrokerHandle, BrokerSupervisor,
+    ReadOnlyHandle, SessionDirectory,
 };
 pub use monitor::MonitorValue;
 
@@ -132,7 +140,7 @@ pub struct EngineControl {
     /// client (the real R08ENCPU accepts only one session). Carried here so
     /// both wiring paths (Tauri commands + REST routes) get it for free via
     /// the existing [`SharedEngineControl`] slot.
-    sessions: broker::SessionDirectory,
+    sessions: SessionDirectory,
 }
 
 impl EngineControl {

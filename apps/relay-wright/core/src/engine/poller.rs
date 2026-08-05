@@ -33,9 +33,9 @@ use std::time::Instant;
 use banto_plc::{Address, BatchReadRequest, BatchReadResult, ReadRequest, StringReadRequest};
 use tokio::sync::watch;
 
-use super::broker::ReadOnlyHandle;
 use super::current_values::CurrentValues;
 use super::rule_engine::WireShape;
+use banto_broker::ReadOnlyHandle;
 
 /// A source tag resolved to its wire coordinates - numeric or, since S2
 /// 文字列タグ, string ([`WireShape`] carries which, plus a string's word span).

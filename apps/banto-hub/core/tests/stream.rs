@@ -130,6 +130,10 @@ fn tag_input(name: &str, group_id: i64, address: &str, data_type: &str) -> TagIn
         threshold_l: None,
         threshold_ll: None,
         enabled: true,
+        writable: false,
+        tag_kind: "plc".to_string(),
+        expression: None,
+        retain: false,
     }
 }
 
@@ -199,16 +203,25 @@ async fn test_app(label: &str) -> TestApp {
         .await
         .expect("admin login");
 
+    let sessions = std::sync::Arc::new(banto_hub_core::broker_glue::HubSessions::new(
+        banto_broker::BackoffConfig::default(),
+    ));
     let manager = std::sync::Arc::new(CollectorManager::new(
         pool.clone(),
         env.data_dir(),
         std::sync::Arc::new(SystemClock),
         fast_options(),
+        sessions,
     ));
     manager.rebuild().await.expect("initial rebuild");
 
     let api_keys = ApiKeysService::new(pool.clone());
     let (events_tx, _rx) = broadcast::channel(16);
+    // T2-4: WriteControl always constructs disabled (docs/tag-server-design.md
+    // §6-6) - not exercised by these WebSocket-subscription tests.
+    let write_control =
+        std::sync::Arc::new(banto_hub_core::write_control::WriteControl::new(false));
+    let write_audit = banto_hub_core::write_audit::WriteAuditService::new(pool.clone());
     let router: Router = api_router(
         users,
         audit,
@@ -220,6 +233,8 @@ async fn test_app(label: &str) -> TestApp {
         auth,
         events_tx,
         false,
+        write_control,
+        write_audit,
     );
 
     let server = start(

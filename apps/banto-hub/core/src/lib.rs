@@ -29,6 +29,11 @@
 //!   ローカルアカウント（RBAC: admin/editor/viewer）と監査ログ
 //! - [`assets`]: 管理 UI 静的ファイルの埋め込み枠（`embed-ui` feature）。
 //!   T0 では中身（フロントエンド）は作らない — 枠だけ用意する
+//! - [`broker_glue`]: T2-2（設計 §6-5）。SLMP 接続の収集読み取りを
+//!   `banto-broker`（I6）経由にするアダプタ（[`broker_glue::BrokerReadClient`]）
+//!   と、`CollectorManager` の外で生存するブローカーセッション directory
+//!   （[`broker_glue::HubSessions`]）。Modbus 接続は現行の直接クライアントの
+//!   まま
 //! - [`events`]: 管理 UI の SSE 用 `banto_server::ServerEvent` チャンネル。
 //!   `banto_collect::CollectEvent` とは別物（そちらは `/api/v1/events` が
 //!   `collect_events` テーブルを直接読む）
@@ -48,15 +53,23 @@
 //!   購読の状態機械・250ms 評価ループ。`hub::CollectorManager` の
 //!   `current_values`/`tag_map`/`subscribe_events`/`subscribe_revision` を
 //!   読むだけの消費者で、収集エンジンには一切書き込まない
+//! - [`write_control`]: T2-4（設計 §6-6）。書き込み受付の起動時
+//!   disabled フラグ（relay-wright の arming 同型）
+//! - [`write_rate`]: T2-4（設計 §6-4）。タグ毎 + 全体の2段書き込み
+//!   レート制限（relay-wright の rate_limiter をタグ単位に読み替え）
+//! - [`write_audit`]: T2-4（設計 §6-3）。`hub_write_audit` の
+//!   log-before-write アクセス経路
 //!
 //! T0/T1 のスコープ外（設計冒頭の指示どおり実装しない）: MQTT、gRPC、
-//! 書き込み経路（`write:` スコープの受理・保存は T0-2 で実装済みだが
-//! 検証・使用は T2）、管理 UI フロントエンドの中身、演算タグ、接続単位の
-//! 部分再構成。
+//! 管理 UI フロントエンドの中身の一部、演算タグ、接続単位の部分再構成。
+//! 書き込み経路（`write:` スコープの受理・保存は T0-2 で実装済み、
+//! 実際の書き込みエンドポイントと安全ゲート一式は T2-4 で実装した -
+//! `crate::rest` の `POST /api/v1/values/{tag}` と上記3モジュール）。
 
 pub mod api_keys;
 pub mod assets;
 pub mod audit;
+pub mod broker_glue;
 pub mod db;
 pub mod events;
 pub mod hub;
@@ -64,3 +77,6 @@ pub mod rest;
 pub mod settings;
 pub mod stream;
 pub mod users;
+pub mod write_audit;
+pub mod write_control;
+pub mod write_rate;

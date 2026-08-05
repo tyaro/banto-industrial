@@ -1,14 +1,55 @@
-//! The PLC access broker's implementation (W3-A). See `engine/mod.rs`'s
-//! module doc for the why; this doc covers the how - the exact concurrency
-//! design, and the two policies a reviewer needs to know are deliberate
-//! choices rather than gaps.
+//! `banto-broker`: the PLC access broker (I6, docs/tag-server-design.md
+//! §6-5). One live SLMP session per PLC CPU ([`BrokerSupervisor::spawn`]
+//! spawns one [`tokio::task`] per [`banto_tags::PlcConnection`]), and every
+//! read/write caller reaches it through this crate so that a read and a
+//! write to the same CPU can never interleave on the wire - see "Message
+//! shape and how serialization is guaranteed" below for exactly how that is
+//! a structural property, not a lock.
+//!
+//! ## Extraction history (I6, 2026-08-05)
+//!
+//! This crate *is* `apps/relay-wright/core/src/engine/broker.rs` (W3-A, 1119
+//! 行) - extracted verbatim (same types, same field names, same policies, no
+//! logic changes) so a second consumer (banto-hub's write path, wired in
+//! T2-2) can reuse the exact "read/write serialized on one socket" guarantee
+//! instead of re-implementing it and risking the two copies drifting apart -
+//! the motivating risk docs/tag-server-design.md §10 item 3 records: "同型
+//! 再実装は2実装の乖離リスクが最悪". Relay-wright's own behavior is
+//! unchanged by the move: `apps/relay-wright/core/src/engine/mod.rs` still
+//! documents the *why* of this module from inside relay-wright's W3 engine
+//! (safety invariant #2, "structural eval/exec separation" - only
+//! `writer::Writer` holds a write-capable [`BrokerHandle`]); this crate's doc
+//! is this module's *how*, now portable to any caller rather than
+//! relay-wright-specific. Relay-wright's pre-extraction test suite (`cargo
+//! test -p relay-wright-core`) is the regression net for the move: every
+//! relay-wright caller now reaches these types via `banto_broker::` instead
+//! of `crate::engine::broker::`, with zero behavioral change.
+//!
+//! ## Why SLMP-only (and not a protocol-agnostic broker)
+//!
+//! This crate speaks MELSEC SLMP exclusively ([`SLMP_PROTOCOL`], enforced by
+//! [`BrokerSupervisor::spawn`]/[`SessionDirectory::ensure_connection`]
+//! rejecting anything else with [`BrokerError::UnsupportedProtocol`]) because
+//! every caller that exists today - relay-wright's write engine, and
+//! banto-hub's upcoming write path (docs/tag-server-design.md §6 item 7) -
+//! writes MELSEC only; Modbus TCP has no write primitive anywhere in this
+//! workspace yet (`banto-plc-write`, the crate this broker drives writes
+//! through, is SLMP-only). Generalizing this broker to be protocol-agnostic
+//! (an abstraction over "read+write share one session" that a future Modbus
+//! write stack could plug into) is deliberately out of scope for this
+//! extraction - it is tracked as **I9** (docs/tag-server-design.md §6 item 7:
+//! "Modbus 書き込み（banto-plc-write への FC5/6/15/16 追加 + broker の
+//! プロトコル抽象化）は I9 バックログ"). Extracting the crate now, ahead of
+//! I9, means that abstraction only has to be designed once - against a
+//! shared crate both apps already depend on - rather than twice against two
+//! diverging copies.
 //!
 //! ## Message shape and how serialization is guaranteed
 //!
-//! One [`tokio::task`] is spawned per SLMP [`banto_tags::PlcConnection`]
-//! ([`BrokerSupervisor::spawn`]). Each task owns exactly one bare
-//! `slmp::SLMPClient` and a `tokio::sync::mpsc::Receiver<Job>`. [`Job`] has
-//! two variants - `Read`/`Write` - each carrying its owned request `Vec` and a
+//! Each connection's task ([`BrokerSupervisor::spawn`] / the internal
+//! `spawn_task`) owns exactly one bare `slmp::SLMPClient` and a
+//! `tokio::sync::mpsc::Receiver<Job>`. [`Job`] has two variants -
+//! `Read`/`Write` - each carrying its owned request `Vec` and a
 //! `tokio::sync::oneshot::Sender` for the reply. The task's main loop takes
 //! jobs off the channel **one at a time** and `.await`s the whole read/write
 //! before looking at the next one; there is exactly one mutable borrow of the
@@ -21,10 +62,11 @@
 //! client.
 //!
 //! [`BrokerHandle`] is the clonable submission point (holds the mpsc
-//! `Sender`); many callers (a future poller and a future writer) can hold
-//! clones and submit concurrently - the mpsc channel is what serializes their
-//! requests onto the one task, in arrival order, with no corruption possible
-//! because the task itself is the only thing touching the client.
+//! `Sender`); many callers (a poller and a writer, in either consuming app)
+//! can hold clones and submit concurrently - the mpsc channel is what
+//! serializes their requests onto the one task, in arrival order, with no
+//! corruption possible because the task itself is the only thing touching
+//! the client.
 //!
 //! ## Reconnect / backoff policy
 //!
@@ -50,7 +92,7 @@
 //! private `Option<slmp::SLMPClient>` with no seam to hand that socket to
 //! `banto_plc_write::execute_slmp_writes` afterward, so the broker cannot
 //! reuse it and still keep read and write on one shared session - the whole
-//! point of this module. Reconnecting a bare client is the smallest amount of
+//! point of this crate. Reconnecting a bare client is the smallest amount of
 //! code that lets both `execute_slmp_reads` and `execute_slmp_writes` borrow
 //! the *same* `slmp::SLMPClient`.
 //!
@@ -60,13 +102,15 @@
 //! None` arm below covers both `Backoff` (including "never connected yet")
 //! and `Connecting`, and answers immediately with
 //! [`BrokerError::Disconnected`] rather than buffering the request until a
-//! session comes back. A condition poller or auto-writer (W3-B) must be able
-//! to tell "the session is down right now" apart from "this one request
+//! session comes back. A caller (a condition poller or auto-writer in
+//! relay-wright, or a write request handler in banto-hub) must be able to
+//! tell "the session is down right now" apart from "this one request
 //! failed", and a request that silently blocked until the next successful
 //! reconnect (which may be 30s away under the backoff cap) would be
 //! indistinguishable from a hang to its caller. Fail-fast keeps that decision
 //! (retry now, retry later, or give up) with the caller, which is where
-//! W3-B's rate limiting and edge-trigger logic actually lives.
+//! relay-wright's rate limiting and edge-trigger logic (and banto-hub's own
+//! write-path policy) actually lives.
 //!
 //! When a request that *was* running against a live session hits a
 //! connection-fatal error mid-flight, that one request's oneshot is failed
@@ -85,7 +129,25 @@
 //! step to perform, and (incidentally) `banto_plc::PlcError::is_connection_fatal`
 //! is `pub(crate)` there and not reachable from this crate anyway.
 //! `banto_plc_write::PlcWriteError::is_connection_fatal` *is* `pub`, but this
-//! module still never needs to call it for the same reason.
+//! crate still never needs to call it for the same reason.
+//!
+//! ## Connection status observability (I6 T2-1 addition, 2026-08-05)
+//!
+//! [`BrokerConnectionStatus`] plus [`BrokerHandle::status_watch`] /
+//! [`SessionDirectory::status_watch`] expose the same `ConnState` lifecycle
+//! the previous sections describe as a `tokio::sync::watch` value external
+//! code can observe: banto-hub's `/api/v1/status` (docs/tag-server-design.md
+//! §8) needs to report whether each managed connection is up, and banto-hub's
+//! PLC断/再接続 event generation needs a transition to fire on - both need to
+//! see this broker's connection state from *outside* the task. This is a
+//! purely additive extension: the watch `send`s happen at the same state
+//! transitions `run_broker_task` already performs (entering `Connected`,
+//! entering `Backoff` - whether from a failed connect or a mid-flight fatal
+//! request error, and task shutdown), so they ride along with the existing
+//! job-processing and fail-fast-policy code without changing when or how a
+//! [`Job`] is accepted, queued, or rejected. relay-wright does not read this
+//! watch today (its own arm/disarm/rate-limiter state is unrelated); it is
+//! wired for banto-hub's T2-2 slice.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -100,13 +162,14 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-/// SLMP is the only protocol this broker speaks (this app writes MELSEC).
+/// SLMP is the only protocol this broker speaks (see the module doc's "Why
+/// SLMP-only" section).
 const SLMP_PROTOCOL: &str = "slmp";
 
 /// Default channel depth for one connection's job queue. Generous relative to
-/// the request sizes this app deals with (a handful of write targets / source
-/// tags per cycle); the fail-fast-when-down policy is what actually bounds
-/// caller latency, not this number.
+/// the request sizes either consuming app deals with per cycle; the
+/// fail-fast-when-down policy is what actually bounds caller latency, not
+/// this number.
 const JOB_CHANNEL_CAPACITY: usize = 32;
 
 /// Reconnect backoff bounds and growth factor. Mirrors
@@ -146,7 +209,7 @@ fn backoff_delay(attempt: u32, cfg: BackoffConfig) -> Duration {
 
 /// Everything a [`BrokerHandle`]/[`ReadOnlyHandle`] request can fail with.
 /// Deliberately small and non-exhaustive-friendly: this is infrastructure
-/// (W3-A), not the auto-write engine's richer failure vocabulary.
+/// (W3-A / I6), not a richer application-level failure vocabulary.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum BrokerError {
     /// The session for this connection is not currently up (never connected
@@ -169,11 +232,11 @@ pub enum BrokerError {
     TaskGone { connection_id: i64 },
 
     /// [`BrokerSupervisor::spawn`] was given a connection whose
-    /// `protocol` is not `"slmp"`. This broker is SLMP-only (relay-wright
-    /// writes MELSEC); a Modbus TCP (or any other protocol) connection is
-    /// rejected outright rather than silently skipped, so a caller relying on
-    /// `.handle(id)` finds out immediately at startup rather than discovering
-    /// a missing handle later as an unexplained `None`.
+    /// `protocol` is not `"slmp"`. This broker is SLMP-only; a Modbus TCP (or
+    /// any other protocol) connection is rejected outright rather than
+    /// silently skipped, so a caller relying on `.handle(id)` finds out
+    /// immediately at startup rather than discovering a missing handle later
+    /// as an unexplained `None`.
     #[error("接続 {connection_id} は SLMP ではありません（protocol={protocol}）。ブローカーは SLMP 専用です")]
     UnsupportedProtocol {
         connection_id: i64,
@@ -188,8 +251,8 @@ pub enum BrokerError {
 }
 
 /// One thing a broker task can be asked to do, paired with where to send the
-/// result. Exactly two variants - this *is* the read/write safety boundary
-/// the module doc and `engine/mod.rs` describe: a caller that only ever gets
+/// result. Exactly two variants - this *is* the read/write safety boundary a
+/// caller like relay-wright's engine relies on: a caller that only ever gets
 /// a [`ReadOnlyHandle`] can never construct a `Write` job.
 enum Job {
     Read {
@@ -202,16 +265,37 @@ enum Job {
     },
 }
 
+/// Observable connection state for one broker task's session (I6 T2-1
+/// addition, 2026-08-05) - see the module doc's "Connection status
+/// observability" section for the full why. Same three-state shape as
+/// `banto_collect::ConnectionStatus` by design (both track the same kind of
+/// connect/backoff/stopped lifecycle) but **independently defined here**:
+/// this crate must not gain a dependency on `banto-collect` (that dependency
+/// would run backwards from every other dependency this crate has, and
+/// banto-collect's own SLMP collection tasks are unrelated to - and unaware
+/// of - this broker's sessions). `attempt` is the connect attempt currently
+/// in flight or scheduled (1-based, matching [`BackoffConfig`]'s own
+/// numbering).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerConnectionStatus {
+    Connected,
+    Reconnecting { attempt: u32 },
+    Stopped,
+}
+
 /// A clonable submission point for one PLC connection's broker task. Exposes
 /// both [`BrokerHandle::read`] and [`BrokerHandle::write`]; see
-/// [`BrokerHandle::read_only`] for the read-only subset. W3-B's design keeps
-/// this held only by `writer.rs`, handing `poller.rs` a [`ReadOnlyHandle`]
-/// instead - a compile-time guarantee that only one module can ever submit a
-/// write, enforced entirely by which handle type a function accepts.
+/// [`BrokerHandle::read_only`] for the read-only subset. relay-wright's W3-B
+/// design keeps this held only by its `writer` module, handing its `poller`
+/// module a [`ReadOnlyHandle`] instead - a compile-time guarantee that only
+/// one module can ever submit a write, enforced entirely by which handle type
+/// a function accepts.
 #[derive(Clone)]
 pub struct BrokerHandle {
     connection_id: i64,
     tx: mpsc::Sender<Job>,
+    /// See [`Self::status_watch`].
+    status_rx: watch::Receiver<BrokerConnectionStatus>,
 }
 
 impl BrokerHandle {
@@ -261,11 +345,21 @@ impl BrokerHandle {
 
     /// A read-only view of this handle - clonable, structurally incapable of
     /// submitting a write (there is no `write` method on [`ReadOnlyHandle`]
-    /// at all). W3-B hands this to `poller.rs`.
+    /// at all). relay-wright's W3-B hands this to its `poller` module.
     pub fn read_only(&self) -> ReadOnlyHandle {
         ReadOnlyHandle {
             inner: self.clone(),
         }
+    }
+
+    /// A live view of this connection's session state - see
+    /// [`BrokerConnectionStatus`] and the module doc's "Connection status
+    /// observability" section for why this exists and who consumes it.
+    /// Cloning the returned [`watch::Receiver`] (as this method does
+    /// internally) is cheap and every clone tracks the same underlying value
+    /// independently - standard `tokio::sync::watch` semantics.
+    pub fn status_watch(&self) -> watch::Receiver<BrokerConnectionStatus> {
+        self.status_rx.clone()
     }
 }
 
@@ -283,16 +377,30 @@ impl ReadOnlyHandle {
     ) -> Result<Vec<BatchReadResult>, BrokerError> {
         self.inner.read(requests).await
     }
+
+    /// Identical to [`BrokerHandle::status_watch`].
+    pub fn status_watch(&self) -> watch::Receiver<BrokerConnectionStatus> {
+        self.inner.status_watch()
+    }
 }
 
 /// Test-only fake broker: a [`BrokerHandle`] backed by a task that answers
 /// every job successfully with no network and no clock - reads with an empty
-/// result set, writes with all-[`WriteResult::Ok`]. Lets sibling modules'
-/// unit tests (e.g. `writer.rs`'s rate-limit gate test) drive code that
-/// requires a write-capable handle fully deterministically.
-#[cfg(test)]
-pub(crate) fn spawn_test_handle_answering_ok(connection_id: i64) -> (BrokerHandle, JoinHandle<()>) {
+/// result set, writes with all-[`WriteResult::Ok`]. Lets a caller's own unit
+/// tests (e.g. relay-wright's `writer.rs` rate-limit gate test) drive code
+/// that requires a write-capable handle fully deterministically, without
+/// standing up a real (simulated) PLC session.
+///
+/// `pub` behind the `test-util` feature (rather than `pub(crate)`, as it was
+/// pre-extraction) so a consumer's own test code can reach it too - this is
+/// the whole reason the feature exists (see the crate's `[features]` doc in
+/// `Cargo.toml`). The returned handle's [`BrokerHandle::status_watch`]
+/// reports [`BrokerConnectionStatus::Connected`] once and never changes: this
+/// fake never disconnects, so there is nothing to transition to.
+#[cfg(any(test, feature = "test-util"))]
+pub fn spawn_test_handle_answering_ok(connection_id: i64) -> (BrokerHandle, JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<Job>(JOB_CHANNEL_CAPACITY);
+    let (_status_tx, status_rx) = watch::channel(BrokerConnectionStatus::Connected);
     let task = tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
             match job {
@@ -308,42 +416,51 @@ pub(crate) fn spawn_test_handle_answering_ok(connection_id: i64) -> (BrokerHandl
             }
         }
     });
-    (BrokerHandle { connection_id, tx }, task)
+    (
+        BrokerHandle {
+            connection_id,
+            tx,
+            status_rx,
+        },
+        task,
+    )
 }
 
-/// A shared, growable directory of live broker sessions - the seam the
-/// タグモニタ (tag monitor, feature/tag-monitor) uses to reach the SAME
-/// one-session-per-CPU broker tasks the engine itself reads/writes through.
+/// A shared, growable directory of live broker sessions - the seam a caller
+/// like relay-wright's タグモニタ (tag monitor, feature/tag-monitor) uses to
+/// reach the SAME one-session-per-CPU broker tasks the engine itself
+/// reads/writes through.
 ///
 /// ## Why this exists (hard constraint: one SLMP session per CPU)
 ///
 /// The real R08ENCPU accepts only ONE concurrent SLMP TCP connection (verified
-/// on hardware: a second connect times out), so the monitor must never open
-/// its own `SlmpClient` - every monitor read AND manual write goes through the
-/// broker task that already owns that CPU's single session.
+/// on hardware: a second connect times out), so a monitor-style caller must
+/// never open its own `SlmpClient` - every such read AND manual write goes
+/// through the broker task that already owns that CPU's single session.
 ///
 /// ## On-demand sessions
 ///
 /// [`BrokerSupervisor::spawn`] seeds this directory with one task per
-/// connection the ENGINE manages (every enabled SLMP connection at engine
-/// start). The monitor, however, may legitimately ask for a connection the
-/// engine has no task for - one created/enabled AFTER the engine started, or
-/// one on an engine built with an explicit connection subset.
-/// [`SessionDirectory::ensure_connection`] spawns a broker task for such a
-/// connection ON FIRST USE and keeps it (an idle task is one parked socket +
-/// a reconnect loop - cheap), so subsequent monitor polls reuse the session
-/// exactly like the engine's own poller does.
+/// connection the caller's engine manages (e.g. every enabled SLMP connection
+/// at relay-wright's engine start). A secondary caller (relay-wright's
+/// monitor) may legitimately ask for a connection the engine has no task for:
+/// one created/enabled AFTER the engine started, or one on an engine built
+/// with an explicit connection subset. [`SessionDirectory::ensure_connection`]
+/// spawns a broker task for such a connection ON FIRST USE and keeps it (an
+/// idle task is one parked socket + a reconnect loop - cheap), so subsequent
+/// polls reuse the session exactly like the engine's own poller does.
 ///
 /// ## Lifecycle
 ///
 /// All spawned tasks - seeded and on-demand alike - share the supervisor's
 /// one shutdown `watch`, so [`BrokerSupervisor::shutdown`] stops every task
 /// this directory ever created (the tasks vector is shared; shutdown drains
-/// and awaits it). Clones of this directory held past shutdown (e.g. by an
-/// `EngineControl` a caller kept) simply get [`BrokerError::TaskGone`] /
-/// closed-channel errors - never a new session on a dead engine's watch,
-/// because `ensure_connection` on a shut-down directory spawns a task whose
-/// `shutdown_rx` already reads `true`, which exits immediately.
+/// and awaits it). Clones of this directory held past shutdown (e.g. by a
+/// caller-defined control handle kept around) simply get
+/// [`BrokerError::TaskGone`] / closed-channel errors - never a new session on
+/// a dead engine's watch, because `ensure_connection` on a shut-down
+/// directory spawns a task whose `shutdown_rx` already reads `true`, which
+/// exits immediately.
 #[derive(Clone)]
 pub struct SessionDirectory {
     handles: std::sync::Arc<std::sync::Mutex<HashMap<i64, BrokerHandle>>>,
@@ -373,10 +490,22 @@ impl SessionDirectory {
             .cloned()
     }
 
+    /// The connection-status watch for `connection_id`, if a task is already
+    /// running for it - see [`BrokerHandle::status_watch`]. A convenience
+    /// wrapper (`handle(id).map(BrokerHandle::status_watch)`) for a caller
+    /// (banto-hub's `/api/v1/status`, T2-2) that holds a [`SessionDirectory`]
+    /// rather than an individual [`BrokerHandle`].
+    pub fn status_watch(
+        &self,
+        connection_id: i64,
+    ) -> Option<watch::Receiver<BrokerConnectionStatus>> {
+        self.handle(connection_id).map(|h| h.status_watch())
+    }
+
     /// The handle for `conn`, spawning its broker task first if none is
     /// running yet (see the struct doc's on-demand policy). Rejects non-SLMP
-    /// connections with [`BrokerError::UnsupportedProtocol`] - this broker
-    /// (and therefore the monitor) is SLMP-only.
+    /// connections with [`BrokerError::UnsupportedProtocol`] - this broker is
+    /// SLMP-only.
     pub fn ensure_connection(&self, conn: &PlcConnection) -> Result<BrokerHandle, BrokerError> {
         if conn.protocol != SLMP_PROTOCOL {
             return Err(BrokerError::UnsupportedProtocol {
@@ -418,18 +547,18 @@ impl SessionDirectory {
 
 /// Spawns and owns one broker task per SLMP [`PlcConnection`], and hands out
 /// [`BrokerHandle`]s keyed by connection id. The handle/task bookkeeping
-/// lives in a [`SessionDirectory`] (shared, so the tag monitor can add
-/// on-demand sessions that this supervisor still shuts down - see that
-/// struct's doc).
+/// lives in a [`SessionDirectory`] (shared, so a secondary caller like
+/// relay-wright's tag monitor can add on-demand sessions that this supervisor
+/// still shuts down - see that struct's doc).
 pub struct BrokerSupervisor {
     directory: SessionDirectory,
     /// Out-of-band shutdown trigger shared with every task via a cloned
     /// [`watch::Receiver`] - see [`Self::shutdown`]. Independent of the job
     /// mpsc: a task must stop even while a [`BrokerHandle`] (and therefore a
     /// live `Sender`) is still held by some caller (a poller/writer that
-    /// outlives the supervisor by design in W3-B), which the mpsc-closes path
-    /// alone can never signal. `Arc`-shared with the directory so on-demand
-    /// tasks subscribe to the same trigger.
+    /// outlives the supervisor by design), which the mpsc-closes path alone
+    /// can never signal. `Arc`-shared with the directory so on-demand tasks
+    /// subscribe to the same trigger.
     shutdown_tx: std::sync::Arc<watch::Sender<bool>>,
 }
 
@@ -468,8 +597,9 @@ impl BrokerSupervisor {
         self.directory.handle(connection_id)
     }
 
-    /// A clone of the shared session directory - the monitor-facing seam
-    /// carried inside `EngineControl` (see [`SessionDirectory`]).
+    /// A clone of the shared session directory - the seam a caller like
+    /// relay-wright's monitor carries alongside its own control handle (see
+    /// [`SessionDirectory`]).
     pub fn directory(&self) -> SessionDirectory {
         self.directory.clone()
     }
@@ -485,15 +615,15 @@ impl BrokerSupervisor {
     ///
     /// This does *not* rely on every [`BrokerHandle`] having been dropped.
     /// The mpsc `Sender` a `BrokerHandle` holds only closes (`rx.recv() ==
-    /// None`) once *all* clones are gone, but a realistic caller (W3-B's
-    /// poller/writer) holds a handle for the whole app lifetime - dropping
-    /// only the handle map would leave that `Sender` alive and the task
-    /// blocked in `rx.recv()` forever. The `watch` signal is out-of-band from
-    /// that mpsc entirely, so it stops the task regardless of how many
-    /// `BrokerHandle`s are still outstanding elsewhere. The directory's
-    /// handle map is cleared too so `BrokerHandle` clones the directory
-    /// itself owned release their `Sender`s, though the tasks no longer
-    /// depend on that to exit. On-demand tasks the [`SessionDirectory`]
+    /// None`) once *all* clones are gone, but a realistic caller (a
+    /// long-lived poller/writer) holds a handle for the whole app lifetime -
+    /// dropping only the handle map would leave that `Sender` alive and the
+    /// task blocked in `rx.recv()` forever. The `watch` signal is
+    /// out-of-band from that mpsc entirely, so it stops the task regardless
+    /// of how many `BrokerHandle`s are still outstanding elsewhere. The
+    /// directory's handle map is cleared too so `BrokerHandle` clones the
+    /// directory itself owned release their `Sender`s, though the tasks no
+    /// longer depend on that to exit. On-demand tasks the [`SessionDirectory`]
     /// added after spawn share the same tasks vector, so they are awaited
     /// here exactly like the seeded ones.
     pub async fn shutdown(self) {
@@ -532,14 +662,27 @@ fn spawn_task(
     shutdown_rx: watch::Receiver<bool>,
 ) -> (BrokerHandle, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(JOB_CHANNEL_CAPACITY);
+    // Initial value mirrors `banto_collect::task::run_connection`'s own
+    // startup send: the task's `ConnState` starts at `Backoff { at: now }`
+    // (immediate first attempt), i.e. attempt 1 is about to fire.
+    let (status_tx, status_rx) =
+        watch::channel(BrokerConnectionStatus::Reconnecting { attempt: 1 });
     let task = tokio::spawn(run_broker_task(
         connection_id,
         config,
         backoff,
         rx,
         shutdown_rx,
+        status_tx,
     ));
-    (BrokerHandle { connection_id, tx }, task)
+    (
+        BrokerHandle {
+            connection_id,
+            tx,
+            status_rx,
+        },
+        task,
+    )
 }
 
 /// Connection lifecycle state within one broker task. Structurally identical
@@ -613,13 +756,17 @@ async fn connect_attempt(config: SlmpConfig) -> (Box<slmp::SLMPClient>, Result<(
 /// [`BrokerSupervisor::shutdown`] for why the latter is needed: a `Job`
 /// sender clone can legitimately outlive the supervisor (a poller/writer
 /// holding a [`BrokerHandle`] for the app's lifetime), so the mpsc alone
-/// cannot be relied on to ever close.
+/// cannot be relied on to ever close. `status_tx` is sent to at every
+/// `ConnState` transition (see the module doc's "Connection status
+/// observability" section) - purely observational, it influences no control
+/// flow here.
 async fn run_broker_task(
     connection_id: i64,
     config: SlmpConfig,
     backoff_cfg: BackoffConfig,
     mut rx: mpsc::Receiver<Job>,
     mut shutdown_rx: watch::Receiver<bool>,
+    status_tx: watch::Sender<BrokerConnectionStatus>,
 ) {
     let word_order = config.word_order;
     let mut attempt: u32 = 0;
@@ -641,24 +788,28 @@ async fn run_broker_task(
                 match conn_event {
                     ConnEvent::Due => {
                         attempt += 1;
+                        let _ = status_tx.send(BrokerConnectionStatus::Reconnecting { attempt });
                         let handle = tokio::spawn(connect_attempt(config.clone()));
                         state = ConnState::Connecting(handle);
                     }
                     ConnEvent::Finished(client, Ok(())) => {
                         attempt = 0;
                         state = ConnState::Connected(client);
+                        let _ = status_tx.send(BrokerConnectionStatus::Connected);
                     }
                     ConnEvent::Finished(_client, Err(_err)) => {
                         let delay = backoff_delay(attempt, backoff_cfg);
                         state = ConnState::Backoff {
                             at: Instant::now() + delay,
                         };
+                        let _ = status_tx.send(BrokerConnectionStatus::Reconnecting { attempt: attempt + 1 });
                     }
                     ConnEvent::JoinError => {
                         let delay = backoff_delay(attempt, backoff_cfg);
                         state = ConnState::Backoff {
                             at: Instant::now() + delay,
                         };
+                        let _ = status_tx.send(BrokerConnectionStatus::Reconnecting { attempt: attempt + 1 });
                     }
                 }
             }
@@ -694,6 +845,7 @@ async fn run_broker_task(
                                 }));
                                 state = ConnState::Backoff { at: Instant::now() };
                                 attempt = 0;
+                                let _ = status_tx.send(BrokerConnectionStatus::Reconnecting { attempt: 1 });
                             }
                             None => {
                                 let _ = respond_to.send(Err(BrokerError::Disconnected { connection_id }));
@@ -720,6 +872,7 @@ async fn run_broker_task(
                                 }));
                                 state = ConnState::Backoff { at: Instant::now() };
                                 attempt = 0;
+                                let _ = status_tx.send(BrokerConnectionStatus::Reconnecting { attempt: 1 });
                             }
                             None => {
                                 let _ = respond_to.send(Err(BrokerError::Disconnected { connection_id }));
@@ -734,6 +887,7 @@ async fn run_broker_task(
     if let ConnState::Connected(client) = state {
         client.close().await;
     }
+    let _ = status_tx.send(BrokerConnectionStatus::Stopped);
 }
 
 #[cfg(test)]
@@ -773,7 +927,7 @@ mod tests {
     }
 
     /// A numeric read request wrapped as the `Numeric` case of the mixed batch
-    /// the broker now speaks (S2 文字列タグ).
+    /// the broker speaks (S2 文字列タグ).
     fn rreq(raw: &str, data_type: DataType) -> BatchReadRequest {
         BatchReadRequest::Numeric(ReadRequest {
             address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw}: {e}")),
@@ -1115,5 +1269,70 @@ mod tests {
 
         drop(handle);
         let _ = task.await;
+    }
+
+    // -----------------------------------------------------------------
+    // Connection status observability (I6 T2-1 addition)
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn status_watch_observes_connected_then_reconnecting_after_stop() {
+        // spawn_task (not BrokerSupervisor) so `fast_config` timeouts apply -
+        // `BrokerSupervisor`/`SessionDirectory::ensure_connection` always
+        // build `SlmpConfig::default()` internally, which is fine for the
+        // other tests but would make this one wait out the default 1s
+        // response_timeout if the severed connection ever needed it.
+        let sim = Simulator::start().await;
+        let config = fast_config(&sim);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (handle, task) = spawn_task(1, config, BackoffConfig::default(), shutdown_rx);
+        let mut status = handle.status_watch();
+
+        // Wait for the session to come up (via a read, like the other tests)
+        // and confirm the watch agrees.
+        let _ = read_once_connected(&handle, vec![rreq("D0", DataType::U16)]).await;
+        status
+            .wait_for(|s| *s == BrokerConnectionStatus::Connected)
+            .await
+            .expect("status watch should report Connected once the session is up");
+
+        // Sever the simulator's listener/connections entirely (unlike
+        // `hang()`, this closes the socket outright) - the in-flight read
+        // below must fail connection-fatally, dropping the task into
+        // Backoff/Reconnecting, which the watch must reflect.
+        sim.stop();
+
+        let _ = handle.read(vec![rreq("D0", DataType::U16)]).await;
+        status
+            .wait_for(|s| matches!(s, BrokerConnectionStatus::Reconnecting { .. }))
+            .await
+            .expect("status watch should report Reconnecting after the session drops");
+
+        drop(handle);
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn status_watch_observes_stopped_on_shutdown() {
+        let sim = Simulator::start().await;
+        let connections = [conn(1, "slmp", "127.0.0.1", sim.addr.port())];
+        let supervisor =
+            BrokerSupervisor::spawn(&connections, BackoffConfig::default()).expect("spawn");
+        let handle = supervisor.handle(1).expect("handle");
+        let mut status = handle.status_watch();
+
+        let _ = read_once_connected(&handle, vec![rreq("D0", DataType::U16)]).await;
+        status
+            .wait_for(|s| *s == BrokerConnectionStatus::Connected)
+            .await
+            .expect("status watch should report Connected once the session is up");
+
+        drop(handle);
+        supervisor.shutdown().await;
+
+        // `wait_for` returns `Err` once the Sender side has dropped along
+        // with the task exiting, but the last value it ever sent - Stopped -
+        // is still readable via `borrow()`.
+        assert_eq!(*status.borrow(), BrokerConnectionStatus::Stopped);
     }
 }

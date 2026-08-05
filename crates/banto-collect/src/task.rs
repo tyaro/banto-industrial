@@ -41,14 +41,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use banto_plc::{ModbusTcpClient, PlcClient, PlcError, ReadResult, TagValue};
+use banto_plc::{ModbusTcpClient, PlcClient, PlcError, ReadResult, SlmpClient, TagValue};
 use banto_tags::scale_raw;
 use banto_tstore::{Clock, TsWriter};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::config::{ConnectionPlan, GroupPlan, Protocol};
+use crate::config::{ConnectionPlan, GroupPlan, ProtocolConfig};
 use crate::current::{CurrentValuesHandle, Quality};
 use crate::event::{CollectEvent, EventKind, EventSink, ThresholdLevel};
 
@@ -107,15 +107,119 @@ pub(crate) struct TaskContext {
     pub events: EventSink,
     pub status: StatusMap,
     pub backoff: BackoffConfig,
+    /// See [`ClientFactory`]'s doc comment.
+    pub factory: ClientFactory,
 }
 
-/// Build the protocol-specific client for a connection. The one place
-/// protocol dispatch happens (design: "プロトコル分岐は factory 関数に隔離") -
-/// a new protocol is one new match arm here plus one `Protocol` variant.
-fn build_client(plan: &ConnectionPlan) -> Box<dyn PlcClient> {
-    match plan.protocol {
-        Protocol::ModbusTcp => Box::new(ModbusTcpClient::new(plan.modbus.clone())),
+/// The wire protocol one [`ClientSpec`] describes - the public twin of
+/// `crate::config::Protocol` (that one is `pub(crate)`, tied to the registry
+/// parsing step; this one is the minimal vocabulary a factory outside this
+/// crate needs to dispatch on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientProtocol {
+    ModbusTcp,
+    Slmp,
+}
+
+/// A connection's client-construction parameters, exposed as a thin `pub`
+/// projection of the crate-private [`ConnectionPlan`]/[`ProtocolConfig`] (T2-2,
+/// docs/tag-server-design.md §6-5) - a [`ClientFactory`] outside this crate
+/// (banto-hub's broker adapter) cannot see those `pub(crate)` types, so this
+/// carries everything [`default_client_factory`] needs to reproduce the exact
+/// client the old hardcoded `build_client` built: not just "host/port" but
+/// every field that actually varies a constructed client's behavior
+/// (`unit_id` for Modbus, and the per-[`crate::collector::CollectorOptions`]
+/// timeout overrides [`crate::collector::Collector::start_with_client_factory`]
+/// already folded into `plan.config` before this is derived). `unit_id` is
+/// meaningless for SLMP and always `0` there (SLMP has no such concept - see
+/// `crate::config::slmp_config_for`'s doc comment).
+#[derive(Debug, Clone)]
+pub struct ClientSpec {
+    /// `"conn:{id}"` - matches [`ConnectionPlan::key`] and every other
+    /// `conn:`-keyed surface this crate exposes (status map, events).
+    pub connection_key: String,
+    pub protocol: ClientProtocol,
+    pub host: String,
+    pub port: u16,
+    pub unit_id: u8,
+    pub connect_timeout: Duration,
+    pub response_timeout: Duration,
+}
+
+/// A caller-supplied seam for building the `PlcClient` a connection task
+/// reconnects with (T2-2, docs/tag-server-design.md §6-5 「broker の読み取り
+/// ハンドルを PlcClient trait のアダプタで包んでクライアント生成の差し替え口
+/// (新設)から注入する」). [`crate::collector::Collector::start`] delegates to
+/// [`crate::collector::Collector::start_with_client_factory`] with
+/// [`default_client_factory`] - the same `ModbusTcpClient`/`SlmpClient`
+/// construction the old hardcoded `build_client` did, byte-for-byte (every
+/// field [`ClientSpec`] carries was already a field `build_client` read off
+/// `plan.config`). banto-hub's own factory calls this crate's default for
+/// Modbus connections and swaps in a `banto_broker`-backed adapter for SLMP
+/// ones - see `apps/banto-hub/core/src/broker_glue.rs`'s module doc.
+///
+/// Called once per connect attempt (same call site `build_client` used to
+/// occupy, inside `run_connection`'s `ConnEvent::Due` arm) - a factory may
+/// freely return a fresh client every time, or close over shared state (e.g.
+/// a `banto_broker::BrokerHandle` clone) to hand back an adapter around a
+/// session that outlives any single attempt.
+pub type ClientFactory = Arc<dyn Fn(&ClientSpec) -> Box<dyn PlcClient> + Send + Sync>;
+
+/// Project a [`ConnectionPlan`]'s protocol config down to the public
+/// [`ClientSpec`] a [`ClientFactory`] receives. Computed once per task start
+/// (the plan is immutable for the task's lifetime), not per connect attempt.
+fn client_spec(plan: &ConnectionPlan) -> ClientSpec {
+    match &plan.config {
+        ProtocolConfig::ModbusTcp(cfg) => ClientSpec {
+            connection_key: plan.key.clone(),
+            protocol: ClientProtocol::ModbusTcp,
+            host: cfg.host.clone(),
+            port: cfg.port,
+            unit_id: cfg.unit_id,
+            connect_timeout: cfg.connect_timeout,
+            response_timeout: cfg.response_timeout,
+        },
+        ProtocolConfig::Slmp(cfg) => ClientSpec {
+            connection_key: plan.key.clone(),
+            protocol: ClientProtocol::Slmp,
+            host: cfg.host.clone(),
+            port: cfg.port,
+            unit_id: 0,
+            connect_timeout: cfg.connect_timeout,
+            response_timeout: cfg.response_timeout,
+        },
     }
+}
+
+/// The [`ClientFactory`] [`crate::collector::Collector::start`] uses -
+/// reproduces the pre-T2-2 hardcoded `build_client` dispatch (design:
+/// "プロトコル分岐は factory 関数に隔離") exactly, just re-homed behind the
+/// public seam so `start` stays behaviorally unchanged for every existing
+/// caller (T2-2 instructions: "既存呼び出し互換維持"). A new protocol is
+/// still one new match arm here plus one `Protocol`/`ProtocolConfig`/
+/// `ClientProtocol` variant.
+pub fn default_client_factory() -> ClientFactory {
+    Arc::new(|spec: &ClientSpec| -> Box<dyn PlcClient> {
+        match spec.protocol {
+            ClientProtocol::ModbusTcp => {
+                Box::new(ModbusTcpClient::new(banto_plc::ModbusTcpConfig {
+                    host: spec.host.clone(),
+                    port: spec.port,
+                    unit_id: spec.unit_id,
+                    connect_timeout: spec.connect_timeout,
+                    response_timeout: spec.response_timeout,
+                    ..banto_plc::ModbusTcpConfig::default()
+                }))
+            }
+            ClientProtocol::Slmp => Box::new(SlmpClient::new(banto_plc::SlmpConfig {
+                host: spec.host.clone(),
+                port: spec.port,
+                connect_timeout: spec.connect_timeout,
+                response_timeout: spec.response_timeout,
+                ..banto_plc::SlmpConfig::default()
+            })),
+        }
+    })
 }
 
 /// `(client, connect result)` handed back from a spawned connect attempt -
@@ -178,6 +282,9 @@ pub(crate) async fn run_connection(
 ) {
     let conn_key = plan.key.clone();
     let group_count = plan.groups.len();
+    // Computed once - the plan (and therefore the spec derived from it) is
+    // immutable for the task's lifetime; see `ClientSpec`'s doc comment.
+    let spec = client_spec(&plan);
 
     // Per-group next-fire deadlines (all "now" => every group fires
     // immediately on entry) and per-group per-tag active threshold levels.
@@ -230,7 +337,7 @@ pub(crate) async fn run_connection(
                             &conn_key,
                             ConnectionStatus::Reconnecting { attempt },
                         );
-                        let mut client = build_client(&plan);
+                        let mut client = (ctx.factory)(&spec);
                         let handle = tokio::spawn(async move {
                             let result = client.connect().await;
                             (client, result)

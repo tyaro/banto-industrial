@@ -7,14 +7,11 @@
 	 * デモモードが無い（`tagRegistryAdmin.ts` 参照）ので、その分岐は持たない。
 	 *
 	 * プロトコルは "slmp" と "modbus-tcp" の select（banto-tags のレジストリ
-	 * としては両方正当）。ただし現時点（T0）で banto-collect の
-	 * `build_config`（crates/banto-collect/src/config.rs の `parse_protocol`）
-	 * が実際に収集を組み立てられるのは modbus-tcp のみ - slmp を選んで
-	 * 登録すると REST 自体は成功するが収集再構築が
-	 * 「プロトコル slmp は未対応です」で失敗し、`/status` 画面にエラーが
-	 * 出る（レジストリとしては正当な値のため拒否まではしない）。初見の罠に
-	 * ならないよう、既定値は modbus-tcp にし、slmp の選択肢ラベルには
-	 * 未対応である旨を明記する（監査レビュー指摘、2026-08-05）。
+	 * としては両方正当）。banto-collect の `build_config`
+	 * （crates/banto-collect/src/config.rs の `parse_protocol`）は
+	 * I8（2026-08-05実装）で両方とも実際に収集を組み立てられるようになった -
+	 * slmp を選んで登録すればそのまま収集される。既定値は modbus-tcp のまま
+	 * （デバッグしやすさを優先した既存の選定 - docs/plan.md I2 の判断を参照）。
 	 *
 	 * 削除は、収集グループが参照している場合にサービス層の Validation
 	 * エラー（「…収集グループが N 件あるため削除できません」）で拒否されるので、
@@ -37,9 +34,7 @@
 
 	const protocolOptions: { value: PlcProtocol; label: string }[] = [
 		{ value: 'modbus-tcp', label: 'Modbus TCP' },
-		// banto-collect が未対応（上の doc comment 参照）: 選択肢としては残すが
-		// 収集は動かないことをラベルで明示する。
-		{ value: 'slmp', label: 'SLMP（MELSEC）— 収集は未対応（banto-collect 拡張待ち）' }
+		{ value: 'slmp', label: 'SLMP（MELSEC）' }
 	];
 
 	const canWrite = $derived(canWriteResources(sessionStore.role));
@@ -62,8 +57,7 @@
 		return {
 			name: '',
 			// バックエンドの既定（PlcConnectionPayload の default_plc_protocol）
-			// と一致させる。かつ現状収集できるのは modbus-tcp のみ（上の doc
-			// comment 参照）。
+			// と一致させる。
 			protocol: 'modbus-tcp',
 			host: '',
 			port: '502',

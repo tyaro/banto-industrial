@@ -160,6 +160,104 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
     .await
     .map_err(banto_storage::storage_error)?;
 
+    // T2-4 (docs/tag-server-design.md §6-4「レート制限ブレーカ」・2026-08-05
+    // 決定): `tripped_at` はキーの「トリップ」状態 - `revoked_at`(不可逆・
+    // T0-2 の失効設計)とは別の**解除可能な**状態。`api_keys` は T0-2 で
+    // 既に `CREATE TABLE IF NOT EXISTS` 済みなので、新しい列は
+    // `ALTER TABLE ... ADD COLUMN` で後追いする必要がある - SQLite の
+    // `ADD COLUMN` には `IF NOT EXISTS` 相当の構文がないため、
+    // [`add_column_if_missing`] で `PRAGMA table_info` を見て「無ければ
+    // 足す」形の冪等処理にしている(2回目以降の起動で列が既にあれば
+    // 何もしない)。
+    add_column_if_missing(pool, "api_keys", "tripped_at", "TEXT").await?;
+
+    // T2-4 (docs/tag-server-design.md §6-6「再起動での安全側復帰」):
+    // 書き込み受付フラグの永続値(表示専用 - `crate::write_control` の
+    // モジュール doc 参照。**ライブフラグは常に起動時 disabled** で、この
+    // テーブルは `was_enabled_before_restart` の履歴表示にしか使わない)。
+    // `armed_state`(relay-wright)と同じ id=1 単一行パターン。
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS write_control_state (
+          id INTEGER PRIMARY KEY CHECK (id = 1),
+          enabled_persisted INTEGER NOT NULL DEFAULT 0,
+          last_changed_at TEXT,
+          last_changed_by TEXT
+        )",
+    )
+    .execute(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+    sqlx::query("INSERT OR IGNORE INTO write_control_state (id, enabled_persisted) VALUES (1, 0)")
+        .execute(pool)
+        .await
+        .map_err(banto_storage::storage_error)?;
+
+    // T2-4 (docs/tag-server-design.md §6-3「log-before-write」): 書き込み
+    // 監査ログ。列の意味・log-before-write の2段挿入パターンは
+    // `crate::write_audit` のモジュール doc 参照。`action`/`result` の
+    // 許容値は同モジュールの `WriteAuditAction`/`WriteAuditResult` の
+    // `CHECK` 制約と一致させる。
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS hub_write_audit (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts TEXT NOT NULL DEFAULT (datetime('now')),
+          api_key_id INTEGER NOT NULL,
+          api_key_name_snapshot TEXT NOT NULL,
+          tag_id INTEGER NOT NULL,
+          external_name_snapshot TEXT NOT NULL,
+          value_requested REAL,
+          action TEXT NOT NULL CHECK (action IN ('write', 'rate_limit_tripped')),
+          result TEXT NOT NULL CHECK (
+            result IN ('ok', 'failed', 'suppressed_disabled', 'suppressed_rate_limited')
+          ),
+          detail TEXT
+        )",
+    )
+    .execute(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_hub_write_audit_ts ON hub_write_audit(ts)")
+        .execute(pool)
+        .await
+        .map_err(banto_storage::storage_error)?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_hub_write_audit_tag ON hub_write_audit(tag_id)")
+        .execute(pool)
+        .await
+        .map_err(banto_storage::storage_error)?;
+
+    Ok(())
+}
+
+/// `table` に `column` 列が無ければ `ddl_type` で `ALTER TABLE ... ADD
+/// COLUMN` する冪等ヘルパー(この関数の呼び出し元 doc comment 参照: SQLite
+/// の `ADD COLUMN` には `IF NOT EXISTS` が無いため、`PRAGMA table_info` で
+/// 列の存在を見てから判断する)。`table`/`column`/`ddl_type` は呼び出し元が
+/// 埋め込む固定のスキーマ定数のみを渡す想定(ユーザー入力を通さない)。
+async fn add_column_if_missing(
+    pool: &SqlitePool,
+    table: &str,
+    column: &str,
+    ddl_type: &str,
+) -> Result<(), BantoError> {
+    use sqlx::Row;
+
+    let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+        .fetch_all(pool)
+        .await
+        .map_err(banto_storage::storage_error)?;
+    let exists = rows.iter().any(|row| {
+        row.try_get::<String, _>("name")
+            .map(|name| name == column)
+            .unwrap_or(false)
+    });
+    if !exists {
+        sqlx::query(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"
+        ))
+        .execute(pool)
+        .await
+        .map_err(banto_storage::storage_error)?;
+    }
     Ok(())
 }
 
@@ -184,6 +282,8 @@ mod tests {
             "tags",
             "collect_events",
             "api_keys",
+            "write_control_state",
+            "hub_write_audit",
         ] {
             let exists: Option<String> = sqlx::query_scalar(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -205,5 +305,44 @@ mod tests {
         let pool = banto_storage::connect_sqlite_memory().await.unwrap();
         run_migrations(&pool).await.unwrap();
         run_migrations(&pool).await.unwrap();
+    }
+
+    /// T2-4: `api_keys.tripped_at` は `ALTER TABLE ADD COLUMN` の冪等ヘルパー
+    /// ([`add_column_if_missing`]) 経由で足される。列が存在すること、かつ
+    /// 二回目の `run_migrations` で `ALTER TABLE` エラー(重複列)を起こさない
+    /// ことの両方を確認する。
+    #[tokio::test]
+    async fn api_keys_tripped_at_column_is_added_idempotently() {
+        let pool = banto_storage::connect_sqlite_memory().await.unwrap();
+        run_migrations(&pool).await.unwrap();
+
+        use sqlx::Row;
+        let rows = sqlx::query("PRAGMA table_info(api_keys)")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row.get::<String, _>("name") == "tripped_at"),
+            "api_keys should gain a tripped_at column"
+        );
+
+        // Second run must not error (ALTER TABLE ADD COLUMN on an existing
+        // column would fail if add_column_if_missing's check were skipped).
+        run_migrations(&pool).await.unwrap();
+    }
+
+    /// T2-4 (§6-6): `write_control_state` は起動時に id=1 の1行を必ず seed し、
+    /// `enabled_persisted = 0` から始まる - `crate::write_control::WriteControl`
+    /// が「再起動は常に disabled」を守るための前提。
+    #[tokio::test]
+    async fn write_control_state_seeds_a_single_disabled_row() {
+        let pool = init_db_memory().await.unwrap();
+        let enabled: i64 =
+            sqlx::query_scalar("SELECT enabled_persisted FROM write_control_state WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(enabled, 0);
     }
 }

@@ -1651,6 +1651,13 @@ fn default_tag_decimals() -> i64 {
     0
 }
 
+/// T2-3: mirrors `banto_tags::tag`'s own (private) `default_tag_kind` so a
+/// `TagPayload` missing `tagKind` builds the same `"plc"` `TagInput` an old
+/// client always got.
+fn default_tag_kind() -> String {
+    "plc".to_string()
+}
+
 /// Wire-shaped (camelCase) create/update payload for `plc_connections`.
 ///
 /// banto-tags' own `PlcConnectionInput`/`CollectionGroupInput`/`TagInput`
@@ -1749,6 +1756,22 @@ pub struct TagPayload {
     pub string_length: Option<i64>,
     #[serde(default = "default_payload_enabled")]
     pub enabled: bool,
+    // T2-3 (docs/tag-server-design.md §10-2): banto-tags' `TagInput` grew 4
+    // columns (writable/tagKind/expression/retain, I1 スキーマ拡張). relay-wright
+    // does not use `writable` (its write path is write_targets/write_rules,
+    // not I1's per-tag opt-in - design §7's "書き込みセッションは
+    // relay-wright 専有を維持") and has no UI for any of the 4, but the wire
+    // payload still needs the fields (with defaults) so an existing client's
+    // payload keeps deserializing unchanged (§10-2's compatibility
+    // guarantee) and so this app compiles against the wider `TagInput`.
+    #[serde(default)]
+    pub writable: bool,
+    #[serde(default = "default_tag_kind")]
+    pub tag_kind: String,
+    #[serde(default)]
+    pub expression: Option<String>,
+    #[serde(default)]
+    pub retain: bool,
 }
 
 impl From<TagPayload> for TagInput {
@@ -1770,6 +1793,10 @@ impl From<TagPayload> for TagInput {
             threshold_ll: payload.threshold_ll,
             string_length: payload.string_length,
             enabled: payload.enabled,
+            writable: payload.writable,
+            tag_kind: payload.tag_kind,
+            expression: payload.expression,
+            retain: payload.retain,
         }
     }
 }
@@ -5260,6 +5287,10 @@ mod tests {
                 threshold_l: None,
                 threshold_ll: None,
                 enabled: true,
+                writable: false,
+                tag_kind: "plc".to_string(),
+                expression: None,
+                retain: false,
             })
             .await
             .expect("create tag");
