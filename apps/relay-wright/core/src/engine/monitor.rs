@@ -9,7 +9,7 @@
 //! second connect times out - verified on hardware), so this module NEVER
 //! opens its own `SlmpClient`. Every monitor read and every manual write goes
 //! through the engine broker's per-CPU task, reached via the
-//! [`crate::engine::broker::SessionDirectory`] carried inside
+//! [`banto_broker::SessionDirectory`] carried inside
 //! [`EngineControl`]. A connection the engine has no session for yet (created
 //! after engine start, or on an engine built with a connection subset) gets
 //! one spawned ON DEMAND and kept - see `SessionDirectory::ensure_connection`.

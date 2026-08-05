@@ -36,8 +36,9 @@ use banto_plc::{Address, PlcValue};
 use banto_plc_write::{BatchWriteRequest, StringWriteRequest, WriteRequest};
 use sqlx::SqlitePool;
 
+use banto_broker::BrokerHandle;
+
 use super::arming::ArmingState;
-use super::broker::BrokerHandle;
 use super::rate_limiter::RateLimiter;
 use super::rule_engine::{plc_value_as_f64, PendingWrite, WireShape};
 use super::write_audit::{
@@ -261,7 +262,8 @@ mod tests {
 
     use super::*;
     use crate::db::init_db_memory;
-    use crate::engine::broker::spawn_test_handle_answering_ok;
+    use banto_broker::spawn_test_handle_answering_ok;
+
     use crate::engine::rate_limiter::RateLimitConfig;
 
     fn pending(rule_id: i64, value: f64) -> PendingWrite {

@@ -27,13 +27,17 @@ banto-server = { workspace = true }
 # banto-plc-write (does not exist yet - that crate is milestone I5).
 banto-tags = { path = "../../../crates/banto-tags" }
 banto-plc = { path = "../../../crates/banto-plc" }
-# W3-A (luminous-discovering-goblet.md): the PLC access broker
-# (`src/engine/broker.rs`) owns one bare `slmp::SLMPClient` per SLMP CPU and
-# drives BOTH reads (`banto_plc::execute_slmp_reads`) and writes
-# (`banto_plc_write::execute_slmp_writes`) over that single shared session, so it
-# needs the write crate and the wrapped framing crate directly. The auto-write
-# ENGINE (poller/rule_engine/writer, arming, rate-limiting) is W3-B; this crate
-# only gains the broker infrastructure in W3-A.
+# W3-A: the PLC access broker used to live at `src/engine/broker.rs`; it was
+# extracted to the shared `crates/banto-broker` crate as I6 (2026-08-05,
+# docs/tag-server-design.md §6-5) so banto-hub's write path (T2-2) can reuse
+# the same read/write-single-session guarantee. This crate now depends on it
+# by path instead of containing the module - see `banto-broker/src/lib.rs`'s
+# doc for the extraction history. `banto-plc-write`/`slmp` stay direct
+# dependencies too: monitor.rs's manual-write wire-shape layer
+# (`WriteRequest`/`StringWriteRequest`) and writer.rs build
+# `banto_plc_write`/`banto_plc` request types that the broker consumes, even
+# though the broker itself now owns the actual client/session.
+banto-broker = { path = "../../../crates/banto-broker" }
 banto-plc-write = { path = "../../../crates/banto-plc-write" }
 slmp = { workspace = true }
 thiserror = { workspace = true }
@@ -68,10 +72,15 @@ futures-util = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util", "sync"] }
 tower = { workspace = true, features = ["util"] }
 tempfile = { workspace = true }
-# The broker's tests drive it against `banto-plc-write`'s in-process SLMP
-# simulator, which answers BOTH bulk read (0x0401) and bulk write (0x1401) - so
-# one fake-CPU endpoint proves read-after-write over the broker's single shared
-# session. Enabled only for tests (it opens a real loopback listener).
+# The broker's own unit/integration tests (read-after-write over its single
+# shared session, backoff/reconnect, ...) moved with it to `banto-broker`'s
+# own test suite (I6, 2026-08-05). This crate's dev-deps below now only need
+# what its OWN tests use: `banto-broker`'s `test-util` feature for
+# `spawn_test_handle_answering_ok` (writer.rs's rate-limit gate test needs a
+# write-capable fake handle with no network), and `banto-plc-write`'s
+# `simulator` feature for monitor.rs's manual-write/read integration tests
+# (mixed numeric + string batches against a fake CPU).
+banto-broker = { path = "../../../crates/banto-broker", features = ["test-util"] }
 banto-plc-write = { path = "../../../crates/banto-plc-write", features = ["simulator"] }
 
 [[bin]]
