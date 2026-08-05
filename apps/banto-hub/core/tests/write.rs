@@ -229,6 +229,7 @@ async fn test_app(label: &str) -> TestApp {
     // the REST enable endpoint directly, see `rest_enable_disable_round_trip`).
     let write_control = Arc::new(WriteControl::new(false));
     let write_audit = WriteAuditService::new(pool.clone());
+    let mqtt = Arc::new(banto_hub_core::mqtt::MqttPublisher::new(manager.clone()));
 
     let router = api_router(
         users,
@@ -243,6 +244,7 @@ async fn test_app(label: &str) -> TestApp {
         false,
         write_control.clone(),
         write_audit,
+        mqtt,
     );
 
     TestApp {

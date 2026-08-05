@@ -59,12 +59,17 @@
 //!   レート制限（relay-wright の rate_limiter をタグ単位に読み替え）
 //! - [`write_audit`]: T2-4（設計 §6-3）。`hub_write_audit` の
 //!   log-before-write アクセス経路
+//! - [`mqtt`]: T3（設計 §5.3）。外部 MQTT ブローカーへ接続するクライアント
+//!   モードの発行機能（rumqttc）。[`hub::CollectorManager`] を読むだけの
+//!   消費者（設計 §3.4「収集に背圧をかけない」） - `crate::stream`と同じ
+//!   立ち位置
 //!
-//! T0/T1 のスコープ外（設計冒頭の指示どおり実装しない）: MQTT、gRPC、
-//! 管理 UI フロントエンドの中身の一部、演算タグ、接続単位の部分再構成。
-//! 書き込み経路（`write:` スコープの受理・保存は T0-2 で実装済み、
-//! 実際の書き込みエンドポイントと安全ゲート一式は T2-4 で実装した -
-//! `crate::rest` の `POST /api/v1/values/{tag}` と上記3モジュール）。
+//! T0/T1 のスコープ外（設計冒頭の指示どおり実装しない）: gRPC、管理 UI
+//! フロントエンドの中身の一部、演算タグ、接続単位の部分再構成。書き込み
+//! 経路（`write:` スコープの受理・保存は T0-2 で実装済み、実際の書き込み
+//! エンドポイントと安全ゲート一式は T2-4 で実装した - `crate::rest` の
+//! `POST /api/v1/values/{tag}` と上記3モジュール）。MQTT publish は T3 で
+//! 実装済み（[`mqtt`]）。
 
 pub mod api_keys;
 pub mod assets;
@@ -73,6 +78,7 @@ pub mod broker_glue;
 pub mod db;
 pub mod events;
 pub mod hub;
+pub mod mqtt;
 pub mod rest;
 pub mod settings;
 pub mod stream;

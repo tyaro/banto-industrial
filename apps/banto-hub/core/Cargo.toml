@@ -66,9 +66,16 @@ hex = { workspace = true }
 base64 = { workspace = true }
 # T0-2 / §10-6: /api/v1/openapi.json の自動生成。
 utoipa = { workspace = true }
+# T3（docs/tag-server-design.md §5.3）: mqtt.rs の MqttPublisher が使う MQTT
+# クライアント。
+rumqttc = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros", "time"] }
+# T3（docs/tag-server-design.md §5.3）: `net`は tests/mqtt.rs のポート探索
+# （空きポートへ bind → drop → その番号で rumqttd を起動）と起動確認用の
+# TCP プローブ接続のため - `axum`側の推移的依存で実質的にはこれまでも
+# unify されていたが、明示しておく。
+tokio = { workspace = true, features = ["rt", "macros", "time", "net"] }
 tower = { workspace = true, features = ["util"] }
 tempfile = { workspace = true }
 # T1: `/api/v1/stream` の統合テスト用 WebSocket クライアント
@@ -84,6 +91,13 @@ banto-plc = { path = "../../../crates/banto-plc", features = ["simulator"] }
 # (write through the broker, then read the value back through the same
 # session - see that test's module doc).
 banto-plc-write = { path = "../../../crates/banto-plc-write", features = ["simulator"] }
+# T3（docs/tag-server-design.md §5.3）: tests/mqtt.rs が in-process ブローカー
+# として起動する組み込み MQTT ブローカー。rumqttc と同じ bytebeamio/rumqtt
+# リポジトリ・同時期リリースの系列（0.25.x クライアント / 0.20.x ブローカー）
+# を選び、Cargo.lock に無関係な世代を増やさない。`banto-hub-core` のテストの
+# みが使う - 本番の `bin/banto-hub.rs` は外部ブローカーへ接続するクライアント
+# モードのみ（組み込みブローカーは §10-4 の判断待ち、実装しない）。
+rumqttd = { version = "0.20", default-features = false }
 
 [[bin]]
 name = "banto-hub"

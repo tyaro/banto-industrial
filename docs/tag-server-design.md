@@ -468,6 +468,39 @@ axum の `ws` アップグレードで `/api/v1/stream`。メッセージは JSO
   書き込み受付は REST / gRPC の2経路に固定、§6。ブローカー介在では
   認証主体の特定・監査・結果応答が §6 のモデルに乗らない）
 
+**T3 実装状況（2026-08-05、`apps/banto-hub/core/src/mqtt.rs`）**:
+
+- **タグ毎の発行モード設定は T3 では未実装**: 上記「発行モードはタグ毎に
+  on_change / interval を設定」は per-tag 設定ストレージ（I1 スキーマ
+  拡張）が要るため T3 では見送り、**全タグ一律 on_change +
+  `min_interval_ms` スロットル**を既定動作として先行実装した。per-tag 化
+  はバックログ（実装する場合は `tags` テーブルへの列追加と管理 UI・
+  catalog 露出が必要）
+- **削除されたタグの retain クリアはやらない**: catalog から消えたタグの
+  古い retain メッセージが MQTT ブローカー側に残り続ける既知の制約。
+  トピックは catalog の `{connection}/{group}/{tag}` から機械的に決まる
+  ため、購読側は `GET /api/v1/tags` の現行 catalog と突き合わせれば
+  「もう存在しないトピック」を判別できる
+- **設定は settings テーブルに保存**（`mqtt.enabled`/`mqtt.host`/
+  `mqtt.port`/`mqtt.client_id`/`mqtt.username`/`mqtt.password`/
+  `mqtt.prefix`/`mqtt.qos`/`mqtt.min_interval_ms`、既定値は本節どおり）。
+  **`mqtt.password` は平文保存** — §5.6「v1 では平文 + 閉域 LAN 前提」と
+  同じ線引き（ブローカーへの認証情報はクライアントへ渡す時点でどのみち
+  平文に戻す必要があり、ハッシュ化しても保護にならない）
+- 管理 REST: `GET/PUT /api/mqtt-settings`（admin 限定、CSRF 必須）。
+  `GET` は `password` を一切返さない。`PUT` の `password` は**空文字を
+  「変更なし」**として扱う。保存成功で `MqttPublisher::apply` を呼び
+  **即時適用**する（`CollectorManager::rebuild` と同じ「古いタスクを
+  止めて新しいタスクを起動」パターン）
+- `GET /api/v1/status` に `mqtt: { "enabled": bool, "connected": bool }`
+  を追加（`enabled` は設定値、`connected` は実際にブローカーへ接続できて
+  いるかのライブ状態 - 両者は独立）
+- 依存クレート: `rumqttc`（クライアント、既定 feature `use-rustls` を
+  落として平文接続のみに絞る）。テスト用に `rumqttd`（in-process ブロー
+  カー、`banto-hub-core` の dev-dependency のみ）を追加し、
+  `apps/banto-hub/core/tests/mqtt.rs` で E2E（発行・retain・`$state`・
+  スロットル・enabled 切替）を検証する
+
 ### 5.4 gRPC（T4）
 
 tonic + prost。ポートは REST と分離（既定: REST 880x 系 / gRPC 50051、§8）。
