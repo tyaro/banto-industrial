@@ -227,13 +227,33 @@ async fn test_app(label: &str) -> TestApp {
     let write_control = Arc::new(banto_hub_core::write_control::WriteControl::new(false));
     let write_audit = banto_hub_core::write_audit::WriteAuditService::new(pool.clone());
     let mqtt = Arc::new(banto_hub_core::mqtt::MqttPublisher::new(manager.clone()));
+    let api_keys = ApiKeysService::new(pool.clone());
+    // T4: this file exercises T0/T1 REST/WS behaviour only (`tests/grpc.rs`
+    // covers gRPC) - `api_router`'s T4 arguments (the REST/gRPC-shared
+    // rate_limiter and `GrpcServer`) are still required, so construct them
+    // without ever calling `apply` (never binds a port).
+    let rate_limiter = Arc::new(tokio::sync::Mutex::new(
+        banto_hub_core::write_rate::WriteRateLimiter::new(
+            banto_hub_core::write_rate::WriteRateLimitConfig::default(),
+        ),
+    ));
+    let grpc_service = banto_hub_core::grpc::GrpcService::new(
+        manager.clone(),
+        api_keys.clone(),
+        audit.clone(),
+        write_audit.clone(),
+        write_control.clone(),
+        rate_limiter.clone(),
+        events_tx.clone(),
+    );
+    let grpc_server = Arc::new(banto_hub_core::grpc::GrpcServer::new(grpc_service));
     let router = api_router(
         users,
         audit,
         PlcConnectionService::new(pool.clone()),
         CollectionGroupService::new(pool.clone()),
         TagService::new(pool.clone()),
-        ApiKeysService::new(pool.clone()),
+        api_keys,
         manager.clone(),
         auth,
         events_tx,
@@ -241,6 +261,8 @@ async fn test_app(label: &str) -> TestApp {
         write_control,
         write_audit,
         mqtt,
+        grpc_server,
+        rate_limiter,
     );
 
     TestApp {

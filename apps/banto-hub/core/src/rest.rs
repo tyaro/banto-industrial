@@ -46,7 +46,6 @@
 //! catalog に定義そのものが存在しない外部名だけ。
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -57,17 +56,13 @@ use axum::{Json, Router};
 use banto_broker::BrokerConnectionStatus;
 use banto_collect::ConnectionStatus;
 use banto_core::{BantoError, ErrorBody, FieldError, ListParams, ListResult};
-use banto_plc::{Address, DataType, TagValue};
-use banto_plc_write::{
-    BatchWriteRequest, WriteRequest as PlcWriteRequest, WriteResult as PlcWriteResult,
-};
 use banto_server::{
     auth_routes, require_auth, require_banto_client_header, sse_route, ApiError, AuthState,
     Identity, ServerEvent,
 };
 use banto_tags::{
-    unscale, CollectionGroup, CollectionGroupInput, CollectionGroupService, PlcConnection,
-    PlcConnectionInput, PlcConnectionService, Scaling, Tag, TagInput, TagService, STRING_DATA_TYPE,
+    CollectionGroup, CollectionGroupInput, CollectionGroupService, PlcConnection,
+    PlcConnectionInput, PlcConnectionService, Tag, TagInput, TagService,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -82,11 +77,9 @@ use crate::hub::{CollectorManager, TagEntry};
 use crate::mqtt::MqttPublisher;
 use crate::settings::{MqttSettings, SettingsService};
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
-use crate::write_audit::{
-    WriteAuditAction, WriteAuditEntry, WriteAuditResult, WriteAuditRow, WriteAuditService,
-};
+use crate::write_audit::{WriteAuditEntry, WriteAuditService};
 use crate::write_control::WriteControl;
-use crate::write_rate::{WriteRateLimitConfig, WriteRateLimiter};
+use crate::write_rate::WriteRateLimiter;
 
 // --- shared helpers (users/audit/RBAC - copied from chronogazer/relay-wright's rest.rs) ---
 
@@ -1207,6 +1200,125 @@ fn mqtt_settings_router(
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
 
+// --- gRPC 設定 (T4、設計 §5.4): admin 限定、CSRF + bearer -------------------
+//
+// `GET/PUT /api/grpc-settings`（実装指示どおり）。`mqtt_settings_router` と
+// 同型: admin ロール限定 + CSRF + `PUT` 成功で `crate::grpc::GrpcServer::apply`
+// を呼んで即時適用する（実装指示「保存で即時適用 - MqttPublisher と同じ
+// 再起動可能マネージャパターン」）。MQTT と違い認証情報(パスワード等)を
+// 持たないため、`MqttSettingsRequest`ほど複雑な「変更なし」フィールドの
+// 扱いは不要 - `enabled`/`port` の2値をそのまま読み書きする。
+
+#[derive(Clone)]
+struct GrpcSettingsAdminState {
+    manager: Arc<CollectorManager>,
+    grpc_server: Arc<crate::grpc::GrpcServer>,
+    auth: AuthState,
+    audit: AuditLogService,
+    events: broadcast::Sender<ServerEvent>,
+}
+
+/// `GET/PUT /api/grpc-settings`の request/response body。
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct GrpcSettingsBody {
+    enabled: bool,
+    port: u16,
+}
+
+impl From<crate::settings::GrpcSettings> for GrpcSettingsBody {
+    fn from(config: crate::settings::GrpcSettings) -> Self {
+        Self {
+            enabled: config.enabled,
+            port: config.port,
+        }
+    }
+}
+
+async fn grpc_settings_get(
+    State(state): State<GrpcSettingsAdminState>,
+) -> Result<Json<GrpcSettingsBody>, ApiError> {
+    let config = SettingsService::new(state.manager.pool())
+        .grpc_config()
+        .await?;
+    Ok(Json(config.into()))
+}
+
+async fn grpc_settings_put(
+    State(state): State<GrpcSettingsAdminState>,
+    headers: HeaderMap,
+    Json(body): Json<GrpcSettingsBody>,
+) -> Result<Json<GrpcSettingsBody>, ApiError> {
+    if body.port == 0 {
+        return Err(ApiError(BantoError::Validation {
+            field_errors: vec![FieldError {
+                field: "port".to_string(),
+                message: "port は 1〜65535 で指定してください".to_string(),
+            }],
+        }));
+    }
+
+    let settings_service = SettingsService::new(state.manager.pool());
+    let config = crate::settings::GrpcSettings {
+        enabled: body.enabled,
+        port: body.port,
+    };
+    settings_service.set_grpc_config(&config).await?;
+
+    // 実装指示「保存で即時適用」- `crate::mqtt::MqttPublisher::apply` と
+    // 同じ「古いタスクを止めて新しいタスク」パターン（`crate::grpc`の
+    // モジュール doc comment参照）。
+    state.grpc_server.apply(&config).await;
+
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "update",
+        "grpc_settings",
+        "1",
+        Some(json!({ "enabled": config.enabled, "port": config.port })),
+    )
+    .await;
+    let _ = state.events.send(ServerEvent::ResourceChanged {
+        resource: "grpc_settings".to_string(),
+    });
+
+    Ok(Json(config.into()))
+}
+
+fn grpc_settings_router(
+    manager: Arc<CollectorManager>,
+    grpc_server: Arc<crate::grpc::GrpcServer>,
+    audit: AuditLogService,
+    auth: AuthState,
+    events: broadcast::Sender<ServerEvent>,
+) -> Router {
+    let state = GrpcSettingsAdminState {
+        manager,
+        grpc_server,
+        auth: auth.clone(),
+        audit: audit.clone(),
+        events,
+    };
+    Router::new()
+        .route(
+            "/api/grpc-settings",
+            get(grpc_settings_get).put(grpc_settings_put),
+        )
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            RoleGuard {
+                auth: auth.clone(),
+                min: Role::Admin,
+                resource: "grpc_settings",
+                audit,
+            },
+            require_role_at_least,
+        ))
+        .layer(middleware::from_fn_with_state(auth, require_auth))
+}
+
 // --- 書き込み監査の閲覧 (T2-4、設計 §6-3): admin 限定、CSRF + bearer -------
 
 #[derive(Clone)]
@@ -2034,6 +2146,17 @@ struct MqttStatusEntry {
     connected: bool,
 }
 
+/// `GET /api/v1/status` の `grpc`（T4、設計実装指示「`/api/v1/status` に
+/// `grpc: { enabled, port }` を追加」）。MQTT と違い「実際に接続できて
+/// いるか」のライブ状態は持たない - gRPC サーバーは外部へ接続しに行く
+/// クライアントではなく listen するだけなので、設定値がそのまま意図した
+/// 状態を表す(`crate::grpc::GrpcServer`のモジュール doc comment参照)。
+#[derive(Debug, Serialize, ToSchema)]
+struct GrpcStatusEntry {
+    enabled: bool,
+    port: u16,
+}
+
 /// `GET /api/v1/status` の応答。
 #[derive(Debug, Serialize, ToSchema)]
 struct StatusResponse {
@@ -2049,6 +2172,8 @@ struct StatusResponse {
     write_was_enabled_before_restart: bool,
     /// T3（設計 §5.3）: MQTT publish の設定/接続状態。
     mqtt: MqttStatusEntry,
+    /// T4（設計 §5.4）: gRPC サーバーの設定。
+    grpc: GrpcStatusEntry,
 }
 
 /// `GET /api/v1/status` - `{ "version", "revision", "last_config_error",
@@ -2081,6 +2206,9 @@ async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResp
         .rows;
     let mqtt_settings = SettingsService::new(state.manager.pool())
         .mqtt_config()
+        .await?;
+    let grpc_settings = SettingsService::new(state.manager.pool())
+        .grpc_config()
         .await?;
 
     let entries: Vec<ConnectionStatusEntry> = connections
@@ -2133,6 +2261,10 @@ async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResp
         mqtt: MqttStatusEntry {
             enabled: mqtt_settings.enabled,
             connected: state.mqtt.connected(),
+        },
+        grpc: GrpcStatusEntry {
+            enabled: grpc_settings.enabled,
+            port: grpc_settings.port,
         },
     }))
 }
@@ -2228,22 +2360,28 @@ async fn v1_events(
 // --- 書き込みエンドポイント (T2-4、設計 §5.1「POST /api/v1/values/{tag}」・
 // §6 全体) -------------------------------------------------------------
 //
-// これがこの実装スライスの主役。ゲート順・監査・レート制限・受付トグルの
-// 規律は relay-wright の `engine/writer.rs` を直接の下敷きにしている
-// （§6 実装指示: 「参考実装は relay-wright の engine/{writer,rate_limiter,
-// arming,write_audit}.rs（設計は流用、コードは hub 語彙で書き直し）」）。
-// hub 固有の差分は主に3点:
+// ゲート順・監査・レート制限・受付トグルの規律は relay-wright の
+// `engine/writer.rs` を直接の下敷きにしている（§6 実装指示: 「参考実装は
+// relay-wright の engine/{writer,rate_limiter,arming,write_audit}.rs（設計は
+// 流用、コードは hub 語彙で書き直し）」）。hub 固有の差分は主に3点:
 // - relay-wright の `Writer` はルールエンジンが生成する `PendingWrite` を
-//   1タスクが順に処理する専有構造だが、hub は複数の REST リクエストが
+//   1タスクが順に処理する専有構造だが、hub は複数の REST/gRPC リクエストが
 //   並行に飛んでくるので、[`WriteRateLimiter`] を `tokio::sync::Mutex` で
 //   包んで共有する（peek→exceed 判定→(ゲート通過なら)record を1つの
 //   ロック区間に収めず、ロックは短時間だけ握って離す - 詳細は
-//   [`v1_write_value`] 本体のコメント参照）。
+//   `crate::write_path::execute_write` 本体のコメント参照）。
 // - relay-wright の disarm は「ルールエンジン全体」を止めるが、hub の
-//   `WriteControl` は `/api/v1/values/{tag}` という1エンドポイントの
-//   受付可否のみを制御する（収集自体は止めない）。
+//   `WriteControl` は書き込みエンドポイントの受付可否のみを制御する
+//   （収集自体は止めない）。
 // - 認証主体が「ルール」ではなく「API キー」なので、監査行の主語も
 //   `api_key_id`/`api_key_name_snapshot`（`crate::write_audit` 参照）。
+//
+// **T4（設計 §5.4）でゲート1〜8の本体を `crate::write_path::execute_write`
+// へ抽出した** - gRPC の `WriteValue`（`crate::grpc`）が REST と同一の
+// ゲート・監査・レート制限を通る必要があり（実装指示「二重実装は絶対に
+// 不可」）、以降このモジュールに残るのは REST 固有の前段（セッション token
+// 拒否・JSON body のパース）と、`WriteRejection` を HTTP ステータス + JSON
+// へ変換する [`write_rejection_response`] のみ。
 
 /// `POST /api/v1/values/{tag}` の request body（設計 §5.1「body
 /// `{ "v": <number|bool> }`」）。`v` は `serde_json::Value` のまま保持し、
@@ -2260,7 +2398,8 @@ struct WriteValueRequest {
 }
 
 /// `POST /api/v1/values/{tag}` の成功応答（設計 §6 実装指示 §5「応答
-/// `{ "tag", "result": "ok" }`」）。
+/// `{ "tag", "result": "ok" }`」）。gRPC の `WriteValueResponse`
+/// （`crate::grpc`）も同じ2フィールドの型付き版。
 #[derive(Debug, Serialize, ToSchema)]
 struct WriteValueResponse {
     tag: String,
@@ -2269,7 +2408,10 @@ struct WriteValueResponse {
 
 /// リクエスト body の `v` を工学値の `f64` に正規化する。`bool` は
 /// `1.0`/`0.0`、数値はそのまま。文字列・配列・オブジェクト・`null` は
-/// `None`（呼び出し元が 422 `unsupported_value_type` を返す）。
+/// `None`（呼び出し元が 422 `unsupported_value_type` を返す）。REST 固有の
+/// wire 形式（JSON の `v`）からの変換であり、gRPC 側は `oneof num|bool` を
+/// 直接分解するだけで済むため、この関数は `crate::write_path` へは移して
+/// いない。
 fn parse_requested_value(v: &serde_json::Value) -> Option<f64> {
     if let Some(b) = v.as_bool() {
         Some(if b { 1.0 } else { 0.0 })
@@ -2278,44 +2420,42 @@ fn parse_requested_value(v: &serde_json::Value) -> Option<f64> {
     }
 }
 
-/// 値変換ゲート(§6 実装指示 §5の7番「範囲チェックで422」)の数値範囲検査。
-/// `banto_plc_write::encode`(`encode_word_value`)と同じ境界値を意図的に
-/// ここで独立に再現している - その関数は `pub(crate)` でこの crate から
-/// 呼べないため。物理書き込み自体は broker 内部でもう一度
-/// `banto_plc_write::encode` を通るので二重チェックになるが、ここでの
-/// チェックには「範囲外の値を write_audit に一切残さず(gate 8 の
-/// log-before-write に到達する前に)弾ける」という利点がある - 明確な
-/// クライアントエラーであり、監査すべき「試行」には当たらない、という
-/// 判断（§6 実装指示: 「値の全量は入れない」と同じ、無駄な監査行を
-/// 増やさない方針の踏襲）。`DataType::Bit` はこの関数の呼び出し元
-/// ([`v1_write_value`])で既に分岐済みなので扱わない。
-fn validate_numeric_range(data_type: DataType, x: f64) -> Result<(), String> {
-    if !x.is_finite() {
-        return Err("値が有限ではありません".to_string());
+/// [`crate::write_path::WriteRejection`] を REST の HTTP ステータス + JSON
+/// 本文へ変換する（gRPC 側の対応物は `crate::grpc::write_rejection_status`）。
+/// `NotFound`（404）だけは特別扱いする - `crate::write_path` は transport に
+/// 依存しない設計上、`banto_core::BantoError`/`ApiError` を一切知らないため、
+/// ここで `ApiError(BantoError::NotFound { .. })` へ組み立て直す。それ以外は
+/// `WriteRejection::rest_error_code`/`detail`（gate の意味論のみを持つ純粋な
+/// 情報）から機械的に HTTP ステータスを割り当てる - 対応表は
+/// `crate::write_path::WriteRejection` の doc comment に列挙したものと一致
+/// させる。
+fn write_rejection_response(tag: String, rejection: crate::write_path::WriteRejection) -> Response {
+    use crate::write_path::WriteRejection;
+
+    if matches!(rejection, WriteRejection::NotFound) {
+        return ApiError(BantoError::NotFound {
+            resource: "tags".to_string(),
+            id: tag,
+        })
+        .into_response();
     }
-    let integral_in_range = |lo: f64, hi: f64| -> Result<(), String> {
-        if x.fract() != 0.0 {
-            return Err("整数ではありません".to_string());
+
+    let status = match &rejection {
+        WriteRejection::NotFound => unreachable!("上で特別扱い済み"),
+        WriteRejection::NotWritable => StatusCode::FORBIDDEN,
+        WriteRejection::TagDisabled => StatusCode::CONFLICT,
+        WriteRejection::UnsupportedProtocol => StatusCode::NOT_IMPLEMENTED,
+        WriteRejection::WritesDisabled => StatusCode::SERVICE_UNAVAILABLE,
+        WriteRejection::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+        WriteRejection::UnsupportedValueType(_)
+        | WriteRejection::ValueOutOfRange(_)
+        | WriteRejection::InvalidAddress(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        WriteRejection::WriteFailed(_) => StatusCode::BAD_GATEWAY,
+        WriteRejection::AuditWriteFailed | WriteRejection::Internal(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
         }
-        if x < lo || x > hi {
-            return Err(format!("範囲 [{lo}, {hi}] の外です"));
-        }
-        Ok(())
     };
-    match data_type {
-        DataType::U16 => integral_in_range(0.0, u16::MAX as f64),
-        DataType::I16 => integral_in_range(i16::MIN as f64, i16::MAX as f64),
-        DataType::U32 => integral_in_range(0.0, u32::MAX as f64),
-        DataType::I32 => integral_in_range(i32::MIN as f64, i32::MAX as f64),
-        DataType::F32 => {
-            if (x as f32).is_finite() {
-                Ok(())
-            } else {
-                Err("f32 で表現するには大きすぎます".to_string())
-            }
-        }
-        DataType::Bit => Ok(()),
-    }
+    (status, Json(rejection.to_json())).into_response()
 }
 
 /// [`v1_write_value`] とその周辺(レート制限・受付・監査)が必要とする状態
@@ -2325,6 +2465,12 @@ fn validate_numeric_range(data_type: DataType, x: f64) -> Result<(), String> {
 /// ルーターとこの `WriteState` のルーターを別々に組み立てて `.merge`
 /// する(同じパス `/api/v1/values/{tag}` に GET/POST 両方が乗るのは axum
 /// の `MethodRouter::merge_for_path` がそのまま面倒を見る)。
+///
+/// T4: 各フィールドは `crate::write_path::WriteDeps` へそのまま borrow
+/// できる形にしてある - `crate::grpc::GrpcService` も同じ形のフィールドを
+/// 持ち、両者がここから `WriteDeps` を組み立てて
+/// `crate::write_path::execute_write` を呼ぶ(このファイル冒頭「書き込み
+/// エンドポイント」節の doc comment参照)。
 #[derive(Clone)]
 struct WriteState {
     manager: Arc<CollectorManager>,
@@ -2335,16 +2481,15 @@ struct WriteState {
     /// 飛んでくるため`tokio::sync::Mutex`で包んで共有する - relay-wright
     /// の `Writer` が単一タスク専有だったのと違い、hub はこの1個の
     /// リミッタを複数リクエストが取り合う。ロックは「peek」「record」の
-    /// 各操作の間だけ短時間握る(§6 実装指示: 「record はゲート通過後・
-    /// 物理書き込み前」の意味論はロックの外で守る - [`v1_write_value`]
-    /// 本体参照)。
+    /// 各操作の間だけ短時間握る(`crate::write_path::execute_write` 本体の
+    /// コメント参照)。
     rate_limiter: Arc<AsyncMutex<WriteRateLimiter>>,
     events: broadcast::Sender<ServerEvent>,
 }
 
 /// `POST /api/v1/values/{tag}` - 書き込み(設計 §5.1・§6 全体)。
 ///
-/// ## ゲート順(§6 実装指示 §5、relay-wright `engine/writer.rs` のゲート順を踏襲)
+/// このハンドラ自身が担うのは REST 固有の前段だけ:
 ///
 /// 事前段(番号なし、§6-8「認証」): `crate::rest::require_tag_space_auth`
 /// を通過した時点で「有効な `bh_` API キー」であることは確定しているが、
@@ -2352,27 +2497,13 @@ struct WriteState {
 /// (ミドルウェア側で弾く - `ctx` extension が無ければ 403)、(b)
 /// `write:{tag}` スコープの完全一致、の2つを検査する。
 ///
-/// 1. catalog 解決(未定義 404)
-/// 2. `writable == false` → 403 `not_writable`(監査不要 - 定義上の拒否)
-/// 3. 実効 enabled == false → 409 `tag_disabled`
-/// 4. Modbus 接続配下 → 501 `write_unsupported_protocol`(§6-7: v1 の
-///    書き込みは SLMP のみ)
-/// 5. write_enabled(受付)off → 503 `writes_disabled` + write_audit に
-///    suppressed_disabled
-/// 6. レート制限 would_exceed → 429 + キー trip + rate_limit_tripped 記録
-/// 7. 値変換: 工学値 → `banto_tags::unscale`(スケーリング設定があれば)
-///    → data_type に応じた `TagValue`(bit は bool、数値は範囲チェックで
-///    422)。文字列タグ(`data_type == "string"`)は 422 で拒否(収集も
-///    文字列を扱っていない - T2 では書き込み側も同じ線を引く)
-/// 8. **log-before-write** → `CollectorManager::write_broker_handle`
-///    経由の `BrokerHandle::write`(1タグ=1リクエスト)→ set_result →
-///    応答 `{ "tag", "result": "ok" }` または 502 `write_failed`
-///
-/// gate 6 の「would_exceed」判定(peek)と、gate 8 直前の実際の
-/// `record`(消費)は別々のロック区間 - 「ゲート通過後・物理書き込み前」
-/// (relay-wright と同じ「試行を数える」意味論、`crate::write_rate` の
-/// モジュール doc comment 参照)を守るため、gate 7(値変換・422になり
-/// うる)の**後**、gate 8 の broker 呼び出しの**前**に record する。
+/// body の `v` を [`parse_requested_value`] で工学値へ正規化した後は、
+/// ゲート1〜8の本体(catalog 解決・writable・実効 enabled・プロトコル対応・
+/// 受付トグル・レート制限・値変換・log-before-write)を
+/// `crate::write_path::execute_write` へそのまま委譲する(T4、実装指示
+/// 「二重実装は絶対に不可」) - 結果を [`write_rejection_response`] で
+/// HTTP ステータス + JSON へ変換するだけ。ゲートの詳細な番号・意味論は
+/// `crate::write_path::execute_write` の doc comment を参照。
 #[utoipa::path(
     post,
     path = "/api/v1/values/{tag}",
@@ -2408,286 +2539,23 @@ async fn v1_write_value(
         return missing_write_scope_response();
     }
 
-    // gate 1: catalog 解決
-    let map = state.manager.tag_map();
-    let Some(entry) = map.get(&tag).cloned() else {
-        return ApiError(BantoError::NotFound {
-            resource: "tags".to_string(),
-            id: tag,
+    let requested = parse_requested_value(&body.v);
+    let deps = crate::write_path::WriteDeps {
+        manager: state.manager.as_ref(),
+        api_keys: &state.api_keys,
+        write_audit: &state.write_audit,
+        write_control: state.write_control.as_ref(),
+        rate_limiter: state.rate_limiter.as_ref(),
+        events: &state.events,
+    };
+
+    match crate::write_path::execute_write(&deps, &ctx, &tag, requested).await {
+        Ok(ok) => Json(WriteValueResponse {
+            tag: ok.tag,
+            result: "ok".to_string(),
         })
-        .into_response();
-    };
-
-    // gate 2: writable opt-in
-    if !entry.writable {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({ "error": "not_writable" })),
-        )
-            .into_response();
-    }
-
-    // gate 3: 実効 enabled(接続・グループ・タグいずれかが無効なら false)
-    if !entry.enabled {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({ "error": "tag_disabled" })),
-        )
-            .into_response();
-    }
-
-    let (connection_id, _group_id, tag_id) = entry.ids;
-    let conn = match PlcConnectionService::new(state.manager.pool())
-        .get(connection_id)
-        .await
-    {
-        Ok(conn) => conn,
-        Err(err) => return ApiError(err).into_response(),
-    };
-
-    // gate 4: Modbus 接続配下は非対応(§6-7: v1 の書き込みは SLMP のみ)
-    if conn.protocol != "slmp" {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            Json(json!({ "error": "write_unsupported_protocol" })),
-        )
-            .into_response();
-    }
-
-    // body の `v` を工学値へ正規化(パース自体はどのゲートにも属さないが、
-    // gate 5/6 の監査行に value_requested として残すため先に済ませる)。
-    let Some(requested) = parse_requested_value(&body.v) else {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({ "error": "unsupported_value_type" })),
-        )
-            .into_response();
-    };
-
-    // gate 5: 書き込み受付(WriteControl)が off
-    if !state.write_control.is_enabled() {
-        let row = WriteAuditRow::new(
-            ctx.id,
-            ctx.name.clone(),
-            tag_id,
-            tag.clone(),
-            WriteAuditAction::Write,
-            WriteAuditResult::SuppressedDisabled,
-        )
-        .with_value_requested(requested);
-        if let Err(err) = state.write_audit.insert_row(&row).await {
-            eprintln!("banto-hub: 書き込み監査(suppressed_disabled)の記録に失敗しました: {err}");
-        }
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": "writes_disabled" })),
-        )
-            .into_response();
-    }
-
-    // gate 6: レート制限(peek のみ - 実際の消費は gate 7 通過後)
-    let now = Instant::now();
-    let would_exceed = {
-        let mut limiter = state.rate_limiter.lock().await;
-        limiter.would_exceed(tag_id, now)
-    };
-    if would_exceed {
-        let trip_result = state.api_keys.trip(ctx.id).await;
-        let detail = match trip_result {
-            Ok(_) => "レート制限を超過したため API キーをトリップしました".to_string(),
-            Err(err) => {
-                format!("レート制限を超過しましたが、API キーのトリップに失敗しました: {err}")
-            }
-        };
-        let row = WriteAuditRow::new(
-            ctx.id,
-            ctx.name.clone(),
-            tag_id,
-            tag.clone(),
-            WriteAuditAction::RateLimitTripped,
-            WriteAuditResult::SuppressedRateLimited,
-        )
-        .with_value_requested(requested)
-        .with_detail(detail);
-        if let Err(err) = state.write_audit.insert_row(&row).await {
-            eprintln!("banto-hub: 書き込み監査(rate_limit_tripped)の記録に失敗しました: {err}");
-        }
-        // collect_events には書かない(設計判断、このセクション冒頭の
-        // モジュール doc comment 参照) - 管理 UI 向けの SSE のみで通知する。
-        let _ = state.events.send(ServerEvent::Notice {
-            level: "warning".to_string(),
-            message: format!(
-                "書き込みレート制限を超過したため API キー '{}' をトリップしました(タグ: {tag})",
-                ctx.name
-            ),
-        });
-        let _ = state.events.send(ServerEvent::ResourceChanged {
-            resource: "api_keys".to_string(),
-        });
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({ "error": "rate_limited" })),
-        )
-            .into_response();
-    }
-
-    // gate 7: 値変換 - 文字列タグは拒否
-    if entry.data_type == STRING_DATA_TYPE {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({
-                "error": "unsupported_value_type",
-                "detail": "文字列タグへの書き込みは T2 では未対応です"
-            })),
-        )
-            .into_response();
-    }
-    let Some(data_type) = DataType::parse(&entry.data_type) else {
-        // catalog に載っている時点で banto-tags の CHECK 制約を通過済みの
-        // はずなので実運用では到達しない防御的分岐。
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({ "error": "unsupported_value_type" })),
-        )
-            .into_response();
-    };
-
-    let tag_row = match TagService::new(state.manager.pool()).get(tag_id).await {
-        Ok(tag_row) => tag_row,
-        Err(err) => return ApiError(err).into_response(),
-    };
-    // スケーリング設定があれば工学値→raw に unscale する(無ければ工学値
-    // そのものが raw)。`Scaling::from_parts` は永続化済みの行に対しては
-    // 到達不能な Err のみを返す(banto-tags の validate_tag_input が保存時
-    // に「4列すべて or 全部NULL」「raw_lo != raw_hi」を強制済み) - 防御的
-    // に no-scaling へフォールバックする。
-    let scaling = Scaling::from_parts(
-        tag_row.raw_lo,
-        tag_row.raw_hi,
-        tag_row.eng_lo,
-        tag_row.eng_hi,
-        "scaling",
-    )
-    .unwrap_or(None);
-    let raw = match scaling {
-        Some(scaling) => unscale(requested, &scaling),
-        None => requested,
-    };
-
-    let tag_value = if data_type == DataType::Bit {
-        TagValue::Bit(raw != 0.0)
-    } else {
-        match validate_numeric_range(data_type, raw) {
-            Ok(()) => TagValue::F64(raw),
-            Err(detail) => {
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(json!({ "error": "value_out_of_range", "detail": detail })),
-                )
-                    .into_response();
-            }
-        }
-    };
-
-    let address = match Address::parse_slmp(&entry.address) {
-        Ok(address) => address,
-        Err(err) => {
-            // catalog のアドレスは登録時に banto-tags で検証済みのはずの
-            // 防御的分岐(§6-7: writable にできるのは SLMP 接続配下のタグ
-            // のみなので、ここに来る時点でアドレスは SLMP 表記のはず)。
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({ "error": "invalid_address", "detail": err.to_string() })),
-            )
-                .into_response();
-        }
-    };
-
-    // gate 8: log-before-write
-    let pending_row = WriteAuditRow::new(
-        ctx.id,
-        ctx.name.clone(),
-        tag_id,
-        tag.clone(),
-        WriteAuditAction::Write,
-        WriteAuditResult::Ok,
-    )
-    .with_value_requested(requested);
-    let audit_id = match state.write_audit.insert_pending(&pending_row).await {
-        Ok(id) => id,
-        Err(err) => {
-            eprintln!("banto-hub: 書き込み監査(log-before-write)の記録に失敗しました: {err}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "audit_write_failed" })),
-            )
-                .into_response();
-        }
-    };
-
-    // record はゲート通過後・物理書き込み前(§6 実装指示、
-    // `crate::write_rate` のモジュール doc comment 参照)。
-    {
-        let mut limiter = state.rate_limiter.lock().await;
-        limiter.record(tag_id, now);
-    }
-
-    let handle = match state.manager.write_broker_handle(&conn) {
-        Ok(handle) => handle,
-        Err(err) => {
-            if let Err(update_err) = state
-                .write_audit
-                .set_result(audit_id, WriteAuditResult::Failed)
-                .await
-            {
-                eprintln!("banto-hub: 書き込み監査の確定に失敗しました: {update_err}");
-            }
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": "write_failed", "detail": err.to_string() })),
-            )
-                .into_response();
-        }
-    };
-
-    let request = BatchWriteRequest::Numeric(PlcWriteRequest {
-        address,
-        data_type,
-        value: tag_value,
-    });
-    let write_outcome = handle.write(vec![request]).await;
-
-    let final_result = match &write_outcome {
-        Ok(results) if results.first().is_some_and(PlcWriteResult::is_ok) => WriteAuditResult::Ok,
-        _ => WriteAuditResult::Failed,
-    };
-    if let Err(err) = state.write_audit.set_result(audit_id, final_result).await {
-        eprintln!("banto-hub: 書き込み監査の確定に失敗しました: {err}");
-    }
-
-    match write_outcome {
-        Ok(results) => match results.into_iter().next() {
-            Some(PlcWriteResult::Ok) => Json(WriteValueResponse {
-                tag,
-                result: "ok".to_string(),
-            })
-            .into_response(),
-            Some(PlcWriteResult::Bad(write_err)) => (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": "write_failed", "detail": write_err.to_string() })),
-            )
-                .into_response(),
-            None => (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": "write_failed", "detail": "broker から応答がありませんでした" })),
-            )
-                .into_response(),
-        },
-        Err(err) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({ "error": "write_failed", "detail": err.to_string() })),
-        )
-            .into_response(),
+        .into_response(),
+        Err(rejection) => write_rejection_response(tag, rejection),
     }
 }
 
@@ -2721,6 +2589,7 @@ async fn v1_write_value(
         ValuesResponse,
         ConnectionStatusEntry,
         MqttStatusEntry,
+        GrpcStatusEntry,
         StatusResponse,
         EventEntry,
         EventsResponse,
@@ -2890,6 +2759,14 @@ fn tag_space_router(
     write_audit: WriteAuditService,
     events: broadcast::Sender<ServerEvent>,
     mqtt: Arc<MqttPublisher>,
+    // T4（設計 §5.4 実装指示「二重実装は絶対に不可」）: `crate::grpc::GrpcService`
+    // と**同じ** `Arc` を受け取る - ここで新規に構築しない。書き込みゲート
+    // (`crate::write_path::execute_write`)を REST/gRPC で共有していても、
+    // レート制限のバジェット(`crate::write_rate::WriteRateLimiter`)が別
+    // インスタンスなら「タグ毎+全体の書き込み上限」が実質2倍緩む抜け道に
+    // なる - 呼び出し元（[`api_router`]）が1個だけ構築し、REST・gRPC 両方の
+    // `WriteState`/`GrpcService` へ同じ `Arc` を配る。
+    rate_limiter: Arc<AsyncMutex<WriteRateLimiter>>,
 ) -> Router {
     let state = TagSpaceState {
         manager: manager.clone(),
@@ -2907,9 +2784,7 @@ fn tag_space_router(
         api_keys,
         write_audit,
         write_control,
-        rate_limiter: Arc::new(AsyncMutex::new(WriteRateLimiter::new(
-            WriteRateLimitConfig::default(),
-        ))),
+        rate_limiter,
         events,
     };
 
@@ -2972,6 +2847,15 @@ pub fn api_router(
     // テストのセットアップで一度だけ構築し、ここに注入する（上記2引数と
     // 同じ規約）。
     mqtt: Arc<MqttPublisher>,
+    // T4（設計 §5.4）: gRPC サーバー - 上記と同じ規約（`bin/banto-hub.rs`
+    // または各テストのセットアップで一度だけ構築する）。`/api/grpc-settings`
+    // の `PUT` がこの `GrpcServer::apply` を呼んで即時適用する。
+    grpc_server: Arc<crate::grpc::GrpcServer>,
+    // T4（実装指示「二重実装は絶対に不可」）: `crate::grpc::GrpcService` の
+    // 構築にも**同じ** `Arc` を渡すこと(呼び出し元の責務) -
+    // `tag_space_router` のフィールド doc comment参照。ここで新規に
+    // 構築すると REST/gRPC でレート制限のバジェットが分裂してしまう。
+    rate_limiter: Arc<AsyncMutex<WriteRateLimiter>>,
 ) -> Router {
     let audited_auth_routes = auth_routes(auth.clone()).layer(middleware::from_fn_with_state(
         LogoutAuditState {
@@ -3025,6 +2909,13 @@ pub fn api_router(
             auth.clone(),
             events.clone(),
         ))
+        .merge(grpc_settings_router(
+            manager.clone(),
+            grpc_server,
+            audit.clone(),
+            auth.clone(),
+            events.clone(),
+        ))
         .layer(middleware::from_fn(require_banto_client_header));
 
     admin
@@ -3037,6 +2928,7 @@ pub fn api_router(
             write_audit,
             events,
             mqtt,
+            rate_limiter,
         ))
         .merge(openapi_router())
 }
@@ -3134,6 +3026,22 @@ mod tests {
         let write_control = Arc::new(crate::write_control::WriteControl::new(false));
         let write_audit = crate::write_audit::WriteAuditService::new(pool.clone());
         let mqtt = Arc::new(crate::mqtt::MqttPublisher::new(manager.clone()));
+        // T4: REST/gRPC で共有する1個の rate_limiter（`tag_space_router`の
+        // フィールド doc comment参照）と `GrpcServer`（`crate::grpc`のテストで
+        // 直接叩かない限り listen はしない - `apply`を呼ばないため）。
+        let rate_limiter = Arc::new(AsyncMutex::new(WriteRateLimiter::new(
+            crate::write_rate::WriteRateLimitConfig::default(),
+        )));
+        let grpc_service = crate::grpc::GrpcService::new(
+            manager.clone(),
+            api_keys.clone(),
+            audit.clone(),
+            write_audit.clone(),
+            write_control.clone(),
+            rate_limiter.clone(),
+            tx.clone(),
+        );
+        let grpc_server = Arc::new(crate::grpc::GrpcServer::new(grpc_service));
         let router = api_router(
             users,
             audit,
@@ -3148,6 +3056,8 @@ mod tests {
             write_control,
             write_audit,
             mqtt,
+            grpc_server,
+            rate_limiter,
         );
         TestEnv {
             router,

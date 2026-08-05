@@ -128,3 +128,30 @@ banto-server = { git = "https://github.com/tyaro/banto.git", tag = "v0.1.1" }
 # 閉域 LAN 前提」（TLS 終端はリバースプロキシに委譲）で TLS 接続はスコープ外
 # のため、rustls 一式を Cargo.lock の依存木に増やさない。
 rumqttc = { version = "0.25", default-features = false }
+# T4（docs/tag-server-design.md §5.4）: gRPC タグ空間 API。tonic 0.13 以降は
+# prost 統合が本体から `tonic-prost`（実行時コーデック）/
+# `tonic-prost-build`（ビルド時コード生成）へ分離されたため、この2つと
+# `prost`（メッセージ型のランタイム）を個別に宣言する。既定 feature
+# （`router`/`transport`/`codegen` - `transport` は `server`/`channel` を含む）
+# のまま使う: サーバー（`grpc.rs`）とテスト用クライアント（`tonic` 本体の
+# `Channel` - dev-dependency は増やさない、実装指示「tonic クライアントで
+# （dev-dep 不要）」）の両方に必要。`apps/banto-hub/core` のみが使う。
+tonic = { version = "0.14" }
+tonic-prost = "0.14"
+prost = "0.14"
+# ビルド時コード生成専用（`apps/banto-hub/core/build.rs` の
+# build-dependencies）。
+tonic-prost-build = "0.14"
+# `protoc` バイナリをこのクレートにベンダリングする - このコンテナ・CI
+# （GitHub Actions ubuntu）のどちらにもシステム `protoc` が入っている保証が
+# ないため、`tonic-prost-build`（内部は `prost-build`）に
+# `Config::protoc_executable` で渡す自己完結パスとして使う（`build.rs` の
+# doc comment参照）。ビルド時にネットワークへ問い合わせない（クレート内に
+# 各 OS/アーキテクチャ向けの protoc 実行体を静的に同梱している）ため、
+# オフラインの CI ランナーでも再現性がある。
+protoc-bin-vendored = "3"
+# `crate::grpc` の StreamValues/StreamEvents ハンドラが `tokio::sync::mpsc`
+# の受信端を `futures_core::Stream` へ橋渡しするための薄いラッパー
+# （`ReceiverStream`）。tonic 自身が `server`/`transport` feature 経由で
+# 既に木に持っている 0.1 系と同じバージョンを明示する。
+tokio-stream = "0.1"

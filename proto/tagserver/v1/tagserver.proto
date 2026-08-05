@@ -1,0 +1,174 @@
+// banto-hub タグ空間 gRPC API (T4, docs/tag-server-design.md §5.4)。
+//
+// 外部クライアント SDK の生成元としてリポジトリ内で版管理する(§5.4「proto は
+// proto/tagserver/v1/ にリポジトリ内で管理し...」)。意味論は §4(タグ空間の
+// セマンティクス)・§5.2(WebSocket 購読)・§6(書き込み経路の安全設計)と
+// **完全に同一** - この proto は REST/WebSocket が JSON で果たす役割の
+// 型付き版であり、独自の意味論は一切持たない。実装側
+// (apps/banto-hub/core/src/grpc.rs)は REST(rest.rs)/WS(stream.rs)と同じ
+// 状態(`hub::CollectorManager`)を読み、書き込みは `write_path::execute_write`
+// を経由して REST と完全に同一のゲート列を通す(二重実装しない、実装指示
+// §1「WriteValue」参照)。
+syntax = "proto3";
+
+package tagserver.v1;
+
+// --- サービス定義 ------------------------------------------------------------
+
+service TagService {
+  // catalog スナップショット(設計 §4.1「catalog はバインディング契約」)。
+  rpc GetCatalog(GetCatalogRequest) returns (GetCatalogResponse);
+  // 現在値スナップショット(`GET /api/v1/values` の型付き版)。
+  rpc ReadValues(ReadValuesRequest) returns (ReadValuesResponse);
+  // 購読(WebSocket `/api/v1/stream` の `subscribe` と同意味論 - 設計 §5.2)。
+  rpc StreamValues(StreamValuesRequest) returns (stream ValueBatch);
+  // `CollectEvent` の中継(PLC 断/復旧・しきい値等)。
+  rpc StreamEvents(StreamEventsRequest) returns (stream Event);
+  // 書き込み(§6 と同一経路・同一ゲート - `POST /api/v1/values/{tag}` の型付き版)。
+  rpc WriteValue(WriteValueRequest) returns (WriteValueResponse);
+}
+
+// --- 共通型 -------------------------------------------------------------------
+
+// タグ品質の3値(設計 §4「品質は Good/Bad/Stale の3値...品質なしの値は
+// 返さない」)。`GOOD = 0` は proto3 の「フィールド省略時のゼロ値」の慣行に
+// あえて反する(通常は `_UNSPECIFIED = 0` を置く)が、設計のメッセージ
+// スケッチ(§5.4)が「GOOD / BAD / STALE」の3値のみを明記しており、この
+// フィールドは(REST/WS 同様)値と必ず対で送られるため「未設定」状態を
+// 区別する必要がない。
+enum Quality {
+  GOOD = 0;
+  BAD = 1;
+  STALE = 2;
+}
+
+// 1タグの現在値(設計 §5.4 のメッセージ設計をそのまま採用)。
+//
+// `value` oneof が両方とも未設定(REST の `v: null` に相当)なのは
+// 「品質が Good でない、または該当タグに一度もサンプルが届いていない」場合
+// (`crate::hub::effective_sample` が `None` を返すケースと同一 - 欠測を
+// 隠さない、設計 §4)。`str` は将来の文字列タグ向けの予約(design のメッセージ
+// スケッチに倣う)だが、T4 時点では `banto_collect::CurrentSample::value` が
+// 常に `Option<f64>` であるため実際に送られるのは `num` のみ(REST の
+// `ValueEntry.v: Option<f64>` と同じ制約 - 意味論の完全一致)。
+message TagValue {
+  string tag = 1;
+  oneof value {
+    double num = 2;
+    string str = 3;
+  }
+  Quality quality = 4;
+  int64 timestamp_ms = 5;
+}
+
+// catalog 1エントリ(`crate::hub::TagEntry` の型付き版、設計 §4.1)。
+message TagEntry {
+  string external_name = 1;
+  // 安定 ID 3層(設計 §4.1「バインディングキー...安定 ID」)。
+  int64 connection_id = 2;
+  int64 group_id = 3;
+  int64 tag_id = 4;
+  string connection = 5;
+  string group = 6;
+  string name = 7;
+  string address = 8;
+  string data_type = 9;
+  optional string unit = 10;
+  int64 decimals = 11;
+  int64 period_ms = 12;
+  bool enabled = 13;
+  bool writable = 14;
+}
+
+// --- GetCatalog ---------------------------------------------------------------
+
+// `GET /api/v1/tags?connection=&group=` と同じフィルタ(空文字列 = フィルタ
+// なし)。
+message GetCatalogRequest {
+  string connection = 1;
+  string group = 2;
+}
+
+message GetCatalogResponse {
+  uint64 revision = 1;
+  repeated TagEntry tags = 2;
+}
+
+// --- ReadValues -----------------------------------------------------------
+
+// `tags` 省略(空)= 全タグ。未知のタグ名が1つでも混ざっていたら
+// `INVALID_ARGUMENT` で**全体を拒否**する(設計「未知タグは REST 同様
+// INVALID_ARGUMENT で全体拒否(部分成功で誤解させない)」)。
+message ReadValuesRequest {
+  repeated string tags = 1;
+}
+
+message ReadValuesResponse {
+  uint64 revision = 1;
+  int64 timestamp_ms = 2;
+  repeated TagValue values = 3;
+}
+
+// --- StreamValues (WS subscribe と同意味論、設計 §5.2) -----------------------
+
+enum SubscribeMode {
+  // 未設定は明示エラー(`INVALID_ARGUMENT`) - JSON 版の `mode` が必須
+  // フィールドであることをそのまま型で表す。
+  SUBSCRIBE_MODE_UNSPECIFIED = 0;
+  ON_CHANGE = 1;
+  INTERVAL = 2;
+}
+
+// `tags`: ワイルドカード可(`{connection}.{group}.*` / `*` 単独、設計
+// §5.2 要件4)。`interval_ms`: `mode == INTERVAL` のとき必須(下限は
+// マッチしたタグのグループ周期と評価ループ周期の大きい方にクランプされる -
+// `crate::stream`/`crate::subscribe_core` と同じ規律)。
+message StreamValuesRequest {
+  repeated string tags = 1;
+  SubscribeMode mode = 2;
+  int64 interval_ms = 3;
+}
+
+// 1回の送信(初期スナップショット必須・250ms 評価・スロットルなし - 設計
+// §5.2/§5.4「初期スナップショット必須・250ms 評価・スロットルなし・
+// バックプレッシャは送信バッファ満杯で切断」)。
+message ValueBatch {
+  int64 timestamp_ms = 1;
+  repeated TagValue values = 2;
+}
+
+// --- StreamEvents -------------------------------------------------------------
+
+message StreamEventsRequest {}
+
+// `CollectEvent` の中継(設計「kind/connection(外部名)/tag_key/level/value/
+// detail/ts_ms」)。`connection`/`tag_key`/`level`/`value`/`detail` は
+// `optional`(WS の `EventWire` が `skip_serializing_if` で省略するのと同じ
+// 「無ければ送らない」を型で表す)。
+message Event {
+  string kind = 1;
+  optional string connection = 2;
+  optional string tag_key = 3;
+  optional string level = 4;
+  optional double value = 5;
+  optional string detail = 6;
+  int64 timestamp_ms = 7;
+}
+
+// --- WriteValue (§6 と同一経路) ------------------------------------------------
+
+// `tag`: 外部名。`value`: 工学値(`num`)、または bit タグ向けの真偽値
+// (`flag` - REST の `bool` → 1.0/0.0 正規化と同じ扱い、設計「external_name +
+// oneof value(num|bool)」)。
+message WriteValueRequest {
+  string tag = 1;
+  oneof value {
+    double num = 2;
+    bool flag = 3;
+  }
+}
+
+message WriteValueResponse {
+  string tag = 1;
+  string result = 2;
+}

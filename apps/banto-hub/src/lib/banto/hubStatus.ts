@@ -28,6 +28,16 @@ export interface MqttStatusEntry {
 	connected: boolean;
 }
 
+/**
+ * `GET /api/v1/status` の `grpc`（T4、設計 §5.4）。MQTT と違い「実際に
+ * 接続できているか」のライブ状態は持たない - gRPC サーバーは listen する
+ * だけなので、設定値がそのまま意図した状態を表す。
+ */
+export interface GrpcStatusEntry {
+	enabled: boolean;
+	port: number;
+}
+
 /** `GET /api/v1/status` の応答。 */
 export interface StatusResponse {
 	version: string;
@@ -40,6 +50,8 @@ export interface StatusResponse {
 	write_was_enabled_before_restart: boolean;
 	/** T3（設計 §5.3）: MQTT publish の設定/接続状態。 */
 	mqtt: MqttStatusEntry;
+	/** T4（設計 §5.4）: gRPC サーバーの設定。 */
+	grpc: GrpcStatusEntry;
 }
 
 /** `GET /api/v1/values` の1タグ分（`{ tag, v, q, t }`）。 */

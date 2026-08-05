@@ -8,21 +8,25 @@
 //! `CollectorManager::rebuild()`（起動時1回、設計 §4.3）→ tstore 剪定
 //! （起動時1回 + 24h 周期、設計 §3.3・保持既定7日）→ `MqttPublisher`構築 +
 //! settings の永続値を`apply`（T3、設計 §5.3。`mqtt.enabled=false`なら
-//! 何も起動しない）→ axum サーバー起動 → Ctrl-C 待機 → MQTT 停止 →
-//! Collector 停止（flush）→ ブローカーセッション停止 → サーバー停止。
+//! 何も起動しない）→ `GrpcServer`構築 + settings の永続値を`apply`（T4、
+//! 設計 §5.4。`grpc.enabled=false`(既定)なら bind しない）→ axum サーバー
+//! 起動 → Ctrl-C 待機 → MQTT 停止 → gRPC 停止 → Collector 停止（flush）→
+//! ブローカーセッション停止 → サーバー停止。
 //!
-//! ## シャットダウン順序（T2-2、設計 §6-5 / T3、設計 §5.3）
+//! ## シャットダウン順序（T2-2、設計 §6-5 / T3、設計 §5.3 / T4、設計 §5.4）
 //!
-//! `mqtt.shutdown()`（MQTT publish タスク停止）→ `manager.shutdown()`
-//! （`Collector` 停止・tstore flush）→ `sessions.shutdown()`（broker タスク
-//! 停止）の順を守る。`manager`→`sessions`の順が先に必要な理由（逆順だと
-//! broker セッションが消えた後もまだ実行中の収集タスクが
-//! `BrokerReadClient::read_batch` を呼び、`BrokerError::TaskGone` 由来の
-//! `PlcError` を毎回受け取ってから初めて停止することになる - 実害はない、
-//! 既存の read_batch エラー処理がそのまま吸収する、が無駄な1サイクル分の
-//! エラー往復を避けるため、この順序を守る）に加え、`mqtt`は`manager`の
-//! `tag_map`/`current_values`を読むだけの消費者（`crate::mqtt`のモジュール
-//! doc comment参照）なので、依存する側（`mqtt`）を先に止める。
+//! `mqtt.shutdown()`（MQTT publish タスク停止）→ `grpc_server.shutdown()`
+//! （gRPC サーバータスク停止）→ `manager.shutdown()`（`Collector` 停止・
+//! tstore flush）→ `sessions.shutdown()`（broker タスク停止）の順を守る。
+//! `manager`→`sessions`の順が先に必要な理由（逆順だと broker セッションが
+//! 消えた後もまだ実行中の収集タスクが `BrokerReadClient::read_batch` を
+//! 呼び、`BrokerError::TaskGone` 由来の `PlcError` を毎回受け取ってから
+//! 初めて停止することになる - 実害はない、既存の read_batch エラー処理が
+//! そのまま吸収する、が無駄な1サイクル分のエラー往復を避けるため、この
+//! 順序を守る）に加え、`mqtt`/gRPC はどちらも`manager`の
+//! `tag_map`/`current_values`を読むだけの消費者（`crate::mqtt`/`crate::grpc`
+//! のモジュール doc comment参照）なので、依存する側（`mqtt`/gRPC）を先に
+//! 止める（両者間の順序自体はどちらが先でもよい - 独立した消費者）。
 //!
 //! 環境変数: `PORT`（既定は settings の `server.port`、さらに未設定なら
 //! 8722）、`BANTO_BIND`（既定は settings の `server.bind`、さらに未設定なら
@@ -42,6 +46,7 @@ use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::HubSessions;
 use banto_hub_core::db::init_db;
 use banto_hub_core::events::event_channel;
+use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::mqtt::MqttPublisher;
 use banto_hub_core::rest::{api_router, audited_credential_verifier};
@@ -49,9 +54,11 @@ use banto_hub_core::settings::SettingsService;
 use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
 use banto_hub_core::write_control::{load_persisted_enabled, WriteControl};
+use banto_hub_core::write_rate::{WriteRateLimitConfig, WriteRateLimiter};
 use banto_server::{lan_urls, start, static_router, AuthState, ServerConfig};
 use banto_tags::{CollectionGroupService, PlcConnectionService, TagService};
 use banto_tstore::{LocalDate, SystemClock};
+use tokio::sync::Mutex as AsyncMutex;
 
 const DEFAULT_DB_PATH: &str = "./banto-hub.sqlite3";
 const PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -163,6 +170,31 @@ async fn main() {
     });
     mqtt.apply(&mqtt_settings).await;
 
+    // T4 (docs/tag-server-design.md §5.4): gRPC は既定 disabled(§8「grpc.enabled
+    // (既定 false)」) - MqttPublisher と同じ「停止状態で構築 → 永続設定を
+    // apply」パターン。`rate_limiter` は REST の書き込みハンドラ
+    // (`crate::rest::WriteState`)と**同一の** `Arc` を共有する必要がある
+    // (`crate::rest::tag_space_router`のフィールド doc comment参照 - 別
+    // インスタンスだとタグ毎+全体のレート制限バジェットが実質2倍緩む)。
+    let rate_limiter = Arc::new(AsyncMutex::new(WriteRateLimiter::new(
+        WriteRateLimitConfig::default(),
+    )));
+    let grpc_service = GrpcService::new(
+        manager.clone(),
+        api_keys.clone(),
+        audit.clone(),
+        write_audit.clone(),
+        write_control.clone(),
+        rate_limiter.clone(),
+        events.clone(),
+    );
+    let grpc_server = Arc::new(GrpcServer::new(grpc_service));
+    let grpc_settings = settings.grpc_config().await.unwrap_or_else(|err| {
+        eprintln!("banto-hub: gRPC 設定の読み取りに失敗しました: {err}");
+        banto_hub_core::settings::GrpcSettings::default()
+    });
+    grpc_server.apply(&grpc_settings).await;
+
     let app = api_router(
         users,
         audit,
@@ -177,6 +209,8 @@ async fn main() {
         write_control,
         write_audit,
         mqtt.clone(),
+        grpc_server.clone(),
+        rate_limiter,
     )
     .merge(static_router::<FrontendAssets>());
 
@@ -189,6 +223,16 @@ async fn main() {
     println!("banto-hub: listening at:");
     for url in lan_urls(server.local_addr().port()) {
         println!("  {url}");
+    }
+    if grpc_settings.enabled {
+        println!(
+            "banto-hub: gRPC (docs/tag-server-design.md §5.4) listening on port {}",
+            grpc_settings.port
+        );
+    } else {
+        println!(
+            "banto-hub: gRPC is DISABLED - enable it from the admin UI settings page (PUT /api/grpc-settings)"
+        );
     }
     if allow_setup {
         println!("banto-hub: first-run setup is ENABLED (BANTO_ALLOW_SETUP=1) - POST /api/auth/setup will create the first account");
@@ -208,6 +252,9 @@ async fn main() {
     // `manager.shutdown()` before `sessions.shutdown()` below (stop the
     // dependent first, then the thing it depends on).
     mqtt.shutdown().await;
+    // T4: gRPC サーバーも `manager` の消費者(read-only)なので、mqtt と同じ
+    // 理由で `manager.shutdown()` より先に止める。
+    grpc_server.shutdown().await;
     manager.shutdown().await;
     sessions.shutdown().await;
     server.stop().await;

@@ -528,6 +528,76 @@ message TagValue {
 バックプレッシャ切断）。REST/WS が JSON で果たす役割の型付き版であり、
 主用途は .NET / Java / Python 製の上位システム連携。
 
+**T4 実装状況（2026-08-05、`apps/banto-hub/core/src/grpc.rs`）**:
+
+- **proto ビルドは自己完結**: `protoc-bin-vendored`（Google 配布の `protoc`
+  実行体をクレートに静的同梱、ビルド時ネットワーク不要）を
+  `apps/banto-hub/core/build.rs` の build-dependency にし、
+  `prost_build::Config::protoc_executable` へ明示的に渡す。システム
+  `protoc` の有無に依存しない - このコンテナにも GitHub Actions
+  `ubuntu-latest` にも system `protoc` は入っていない前提で選んだ（`apt-get`
+  でのインストールをビルド前提に持ち込まない）。tonic は 0.13 以降 prost
+  統合が `tonic-prost`（コーデック）/`tonic-prost-build`（コード生成）へ
+  分離されているため、この2つと `prost` を個別に依存宣言している
+  （最新安定系 0.14）。生成コードは `OUT_DIR` 方式でリポジトリにはコミット
+  しない。
+- **書き込みゲートは `write_path.rs` へ完全抽出**: T2-4 で
+  `crate::rest::v1_write_value` に直接実装されていたゲート1〜8
+  （catalog 解決・writable・実効 enabled・プロトコル対応・受付トグル・
+  レート制限・値変換・log-before-write）を `crate::write_path::execute_write`
+  へ切り出し、REST/gRPC の両方がこれを呼ぶ。両者の差分は「この関数に来る
+  前の transport 固有の前段」（REST: セッション token 拒否・JSON body
+  パース。gRPC: metadata の bearer 認証・`oneof num|bool` 分解）と、
+  `WriteRejection` を自分のワイヤ表現（HTTP ステータス+JSON / tonic::Status）
+  へ変換する最後の1ステップのみ。**レート制限器（`WriteRateLimiter`）も
+  REST/gRPC で1個の `Arc` を共有する**よう `crate::rest::api_router`/
+  `tag_space_router` のシグネチャを変更した（呼び出し元が1個だけ構築して
+  両方へ配る）- ゲート実装を共有しても状態(バジェット)が別インスタンスだと
+  「タグ毎+全体の書き込み上限」が実質2倍緩む抜け道になるため。
+- **購読ロジックは `subscribe_core.rs` へ抽出**: `TagPattern`（ワイルドカード
+  パース・マッチ）・`resolve`・`Mode`・`interval_floor_ms`・`Subscription`・
+  on_change diff/interval 評価の本体を `crate::stream`（WS）から
+  `crate::subscribe_core` へ切り出し、`crate::grpc`の`StreamValues`が同じ
+  関数群を呼ぶ。250ms 評価・初期スナップショット必須・ワイルドカードの
+  評価時再解決という意味論は構造的に一致する。**唯一の意味論差**: gRPC の
+  `StreamValues` は明示的な `config_changed` 相当のフレームを送らない
+  （proto のメッセージ設計が `TagValue`/`ValueBatch` 中心で、その専用型を
+  持たないため）。新規タグの出現自体は WS と同じ仕組み（250ms ごとの
+  `TagMap` 再照合）で暗黙に処理されるので、ワイルドカード購読者は新しい
+  `ValueBatch` を受け取れる - 変わるのは「構成が変わったこと自体の明示通知」
+  の有無のみ。
+- **認証は各ハンドラ冒頭方式**（interceptor ではなく）: 設計は
+  「interceptor または各ハンドラ冒頭」のどちらも許容していたが、
+  `WriteValue` だけ `read` スコープ不要・`write:{tag}` は body を見ないと
+  判定できないという非対称性があり、tonic の `Interceptor`（`Request<()>`
+  の段階でメソッド名の判別が REST のパスベース判定より複雑）より、
+  `GrpcService::authenticate(&self, &Request<T>, RequireScope)` を各
+  ハンドラの冒頭で呼ぶ方式の方が REST の `require_tag_space_auth` +
+  `v1_write_value` 自身のスコープ検査という既存の非対称構造と揃う。
+  `Revoked`/`Tripped`/未認証は REST と同じく `audit_log` に `origin: "grpc"`
+  で記録する。
+- **設定・起動制御**: `settings` テーブルに `grpc.enabled`（既定
+  `false`）/`grpc.port`（既定 `50051`）を追加。`GrpcServer`は
+  `MqttPublisher`と同じ「停止状態で構築 → `apply(&settings)`で再起動可能な
+  マネージャ」パターン（ただし停止は `JoinHandle::abort` — `GrpcService`
+  自体は状態を持たない読み取り専用ハンドルの束なので、グレースフル
+  シャットダウンを待つ理由がない）。管理 REST `GET/PUT
+  /api/grpc-settings`（admin 限定、CSRF 必須、保存で即時適用）と管理 UI の
+  設定ページに gRPC セクションを追加。`GET /api/v1/status` に
+  `grpc: { enabled, port }` を追加（MQTT と違い「実際に接続できているか」
+  のライブ状態は持たない — gRPC は listen するだけのサーバーで、設定値が
+  そのまま意図した状態を表すため）。
+- **エラー写像**: 404→NOT_FOUND、403→PERMISSION_DENIED、
+  409→FAILED_PRECONDITION、422→INVALID_ARGUMENT、429→RESOURCE_EXHAUSTED、
+  501→UNIMPLEMENTED、502→UNAVAILABLE、503→FAILED_PRECONDITION（`message`に
+  `"{元の REST エラーコード名}: {detail}"`の形で併記）。ゲート抽出時に
+  生じた `Internal`（レジストリ再読み込み失敗等の防御的分岐）は
+  `INTERNAL`/REST 500 に丸めた（表に無い追加区分だが、両実装とも到達しない
+  想定の分岐）。
+- **未解決事項**: OpenAPI 相当のスキーマ配信（gRPC reflection サービス）は
+  T4 スコープ外 - proto ファイル自体をリポジトリ内で版管理し、SDK 生成元
+  とする方針（本節冒頭）で足りるとした。
+
 ### 5.5 OPC UA（後回し — 判断の記録)
 
 FA-Server との比較で最も見劣りする欠落だが、v1 から外す:

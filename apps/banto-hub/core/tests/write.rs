@@ -28,11 +28,13 @@ use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::HubSessions;
 use banto_hub_core::db::init_db;
+use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::rest::api_router;
 use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
 use banto_hub_core::write_control::WriteControl;
+use banto_hub_core::write_rate::{WriteRateLimitConfig, WriteRateLimiter};
 use banto_plc::slmp::address::SlmpDevice;
 use banto_plc_write::slmp::simulator::Simulator;
 use banto_server::{AuthState, Identity};
@@ -230,6 +232,24 @@ async fn test_app(label: &str) -> TestApp {
     let write_control = Arc::new(WriteControl::new(false));
     let write_audit = WriteAuditService::new(pool.clone());
     let mqtt = Arc::new(banto_hub_core::mqtt::MqttPublisher::new(manager.clone()));
+    let api_keys = ApiKeysService::new(pool.clone());
+    // T4: `tests/grpc.rs` が gRPC 経由の書き込みゲートを検証するので、この
+    // ファイルは REST 経路のみ - ただし `api_router` の T4 引数（REST/gRPC
+    // で共有する rate_limiter・`GrpcServer`)は必須のため構築だけする
+    // (`apply`は呼ばない = listen しない)。
+    let rate_limiter = Arc::new(tokio::sync::Mutex::new(WriteRateLimiter::new(
+        WriteRateLimitConfig::default(),
+    )));
+    let grpc_service = GrpcService::new(
+        manager.clone(),
+        api_keys.clone(),
+        audit.clone(),
+        write_audit.clone(),
+        write_control.clone(),
+        rate_limiter.clone(),
+        events_tx.clone(),
+    );
+    let grpc_server = Arc::new(GrpcServer::new(grpc_service));
 
     let router = api_router(
         users,
@@ -237,7 +257,7 @@ async fn test_app(label: &str) -> TestApp {
         PlcConnectionService::new(pool.clone()),
         CollectionGroupService::new(pool.clone()),
         TagService::new(pool.clone()),
-        ApiKeysService::new(pool.clone()),
+        api_keys,
         manager.clone(),
         auth,
         events_tx,
@@ -245,6 +265,8 @@ async fn test_app(label: &str) -> TestApp {
         write_control.clone(),
         write_audit,
         mqtt,
+        grpc_server,
+        rate_limiter,
     );
 
     TestApp {
