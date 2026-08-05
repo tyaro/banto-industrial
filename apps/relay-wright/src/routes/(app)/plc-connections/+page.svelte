@@ -10,11 +10,15 @@
 	 * するのは SLMP 接続だけ（modbus-tcp 行は登録できるがこのアプリでは無視
 	 * される）なので、その旨をヘルプテキストで正直に示す。
 	 *
-	 * 削除は、収集グループが参照している場合にサービス層の分かりやすい
-	 * Validation エラー（「…収集グループが N 件あるため削除できません」）で
-	 * 拒否されるので、それをトーストで表示する。
+	 * 削除は**カスケード削除**（feature/easy-delete）: まず cascade-preview で
+	 * 巻き添えの件数（収集グループ・タグ、および参照が外れる書き込み先・
+	 * ルール）を取得して確認ダイアログに表示し、OK なら 1 トランザクションで
+	 * まとめて削除する。子が無い接続では通常削除と同じ挙動。編集パネル内の
+	 * 削除ボタンに加え、一覧の各行にも「削除」列を置く（BantoGrid はボタン
+	 * セルを持たないため、`data-cell-field` を使ったラッパーの capture
+	 * ハンドラで行クリック（編集パネル）より先に拾う）。
 	 */
-	import { BantoGrid, type GridColumn } from '@banto/grid-svelte';
+	import { BantoGrid, GridState, filterRows, sortRows, type GridColumn } from '@banto/grid-svelte';
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '$lib/toast.svelte';
 	import { sessionStore } from '$lib/session.svelte';
@@ -23,11 +27,13 @@
 		listPlcConnections,
 		createPlcConnection,
 		updatePlcConnection,
-		deletePlcConnection,
+		previewPlcConnectionCascade,
+		cascadeDeletePlcConnection,
 		isTagRegistryAvailable,
 		DEMO_MODE_MESSAGE,
 		type PlcConnection,
 		type PlcConnectionInput,
+		type PlcConnectionCascadePreview,
 		type PlcProtocol
 	} from '$lib/banto/tagRegistryAdmin';
 
@@ -166,20 +172,58 @@
 		}
 	}
 
-	async function handleDelete(): Promise<void> {
-		if (!selected) return;
-		if (!window.confirm(`${selected.name} を削除しますか？`)) return;
+	/** カスケード削除の確認ダイアログ文言（プレビュー件数入り）。 */
+	function cascadeConfirmText(name: string, preview: PlcConnectionCascadePreview): string {
+		if (preview.groups === 0 && preview.tags === 0 && preview.writeTargets === 0) {
+			return `${name} を削除しますか？`;
+		}
+		const lines = [
+			`${name} を削除すると、収集グループ ${preview.groups} 件・タグ ${preview.tags} 件も削除されます。`
+		];
+		if (preview.writeTargets > 0 || preview.writeRules > 0) {
+			lines.push(
+				`この接続を参照する書き込み先 ${preview.writeTargets} 件（および関連ルール ${preview.writeRules} 件）は参照先を失い無効になります（書き込み先・ルール自体は削除されません）。`
+			);
+		}
+		lines.push('エンジン再構築までは既存のコンパイル済みルールには影響しません。');
+		lines.push('削除しますか？');
+		return lines.join('\n');
+	}
+
+	/** カスケード削除の共通フロー（編集パネルの削除ボタン・行の削除列で共用）。 */
+	async function deleteConnection(target: PlcConnection): Promise<void> {
+		let preview: PlcConnectionCascadePreview;
 		try {
-			await deletePlcConnection(selected.id);
-			toastStore.push('success', '削除しました');
-			selected = null;
+			preview = await previewPlcConnectionCascade(target.id);
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+			return;
+		}
+		if (!window.confirm(cascadeConfirmText(target.name, preview))) return;
+		try {
+			const summary = await cascadeDeletePlcConnection(target.id);
+			toastStore.push(
+				'success',
+				summary.groups > 0 || summary.tags > 0
+					? `削除しました（収集グループ${summary.groups}件・タグ${summary.tags}件を含む）`
+					: '削除しました'
+			);
+			if (selected?.id === target.id) selected = null;
 			await reload();
 		} catch (err) {
-			// 収集グループが参照している場合はサービス層の分かりやすい
-			// Validation エラー（件数入り）がここに来る。
 			toastStore.push('error', errorMessage(err));
 		}
 	}
+
+	async function handleDelete(): Promise<void> {
+		if (!selected) return;
+		await deleteConnection(selected);
+	}
+
+	// 一覧の各行に「削除」列を出すのは編集者以上のみ。role は (app) レイアウトの
+	// load() が解決してからページがマウントされるため、初期化時点で確定している
+	// （sessionStore.svelte.ts の Ordering note 参照）。
+	const showRowActions = canWriteResources(sessionStore.role);
 
 	const columns: GridColumn<PlcConnection>[] = [
 		{ id: 'id', header: 'ID', accessor: 'id', width: 60, align: 'right' },
@@ -201,8 +245,46 @@
 			accessor: 'enabled',
 			width: 70,
 			format: (v) => (v ? 'はい' : 'いいえ')
-		}
+		},
+		...(showRowActions
+			? [
+					{
+						id: '_delete',
+						header: '削除',
+						accessor: () => '削除',
+						width: 70,
+						align: 'center',
+						sortable: false,
+						resizable: false
+					} satisfies GridColumn<PlcConnection>
+				]
+			: [])
 	];
+
+	// BantoGrid のフィルタ／ソート状態を自前でも参照するため外部 GridState を
+	// 渡す。capture ハンドラの data-cell-row（表示行 index）を実データへ写像
+	// するのに、グリッドと同一の filterRows→sortRows パイプラインを再現する
+	// （BantoGrid.svelte のクライアントモードと同式。groupBy は未使用）。
+	const gridState = new GridState<PlcConnection>(columns);
+	const viewConnections = $derived(
+		sortRows(filterRows(connections, gridState.filters, columns), gridState.sort, columns)
+	);
+
+	/**
+	 * BantoGrid はボタンセルを持たないため、「削除」列は format のテキスト
+	 * セルとして描画し、ラッパー要素の capture フェーズでクリックを先取り
+	 * する（stopPropagation でセル自身の onclick = onRowClick（編集パネル
+	 * オープン）を抑止）。セルの DOM には data-cell-field / data-cell-row が
+	 * 付いているのでそれで判定する。
+	 */
+	function handleGridClickCapture(event: MouseEvent): void {
+		const target = event.target instanceof HTMLElement ? event.target : null;
+		const cell = target?.closest<HTMLElement>('[data-cell-field="_delete"]');
+		if (!cell || cell.dataset.cellRow === undefined) return;
+		event.stopPropagation();
+		const row = viewConnections[Number(cell.dataset.cellRow)];
+		if (row) void deleteConnection(row);
+	}
 </script>
 
 {#snippet connectionFields(form: FormState, errors: Record<string, string>)}
@@ -268,16 +350,20 @@
 			<h3>一覧</h3>
 			<p class="note">
 				{canWrite
-					? '行をクリックすると下に編集パネルが表示されます。'
+					? '行をクリックすると下に編集パネルが表示されます。「削除」列で行ごとに削除できます（収集グループ・タグも一緒に削除されます）。'
 					: '閲覧のみ（編集には編集者以上の権限が必要です）。'}
 			</p>
 			{#if loading && connections.length === 0}
 				<p class="loading">読み込み中…</p>
 			{:else}
-				<div class="grid-wrap">
+				<!-- capture で「削除」列のクリックを onRowClick（編集パネル）より
+				     先に拾う（script 側 handleGridClickCapture 参照）。キーボード
+				     操作はグリッド本体が担うため、このラッパー自体は素通し。 -->
+				<div class="grid-wrap" onclickcapture={handleGridClickCapture}>
 					<BantoGrid
 						rows={connections}
 						{columns}
+						state={gridState}
 						getRowId={(c) => c.id}
 						onRowClick={canWrite ? selectConnection : undefined}
 					/>
@@ -335,6 +421,19 @@
 
 	.grid-wrap {
 		height: 320px;
+	}
+
+	/* 行の「削除」列（テキストセル）をボタン風に見せる。BantoGrid のセル DOM
+	   （data-cell-field 属性）に :global で当てる。 */
+	.grid-wrap :global([data-cell-field='_delete']) {
+		color: var(--banto-danger);
+		font-weight: 600;
+		cursor: pointer;
+		user-select: none;
+	}
+
+	.grid-wrap :global([data-cell-field='_delete']:hover) {
+		text-decoration: underline;
 	}
 
 	.form-grid {

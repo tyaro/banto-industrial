@@ -258,6 +258,94 @@ export async function deletePlcConnection(id: number): Promise<void> {
 	});
 }
 
+// --- cascade delete (feature/easy-delete) -----------------------------------
+// banto-tags' plain deletes refuse while children exist; these wire the
+// relay-wright-side cascade (`registry_cascade` in relay-wright-core):
+// preview returns the would-be counts (shown in the confirm dialog,
+// including write-side references that will be left dangling), the cascade
+// deletes tags → groups → connection in one transaction and returns what it
+// removed.
+
+/** Mirrors `relay_wright_core::registry_cascade::ConnectionCascadePreview`. */
+export interface PlcConnectionCascadePreview {
+	/** Collection groups that will be deleted with the connection. */
+	groups: number;
+	/** Tags that will be deleted with those groups. */
+	tags: number;
+	/** Write targets on this connection - left dangling (warned, not deleted). */
+	writeTargets: number;
+	/** Write rules referencing the doomed tags - left dangling (warned, not deleted). */
+	writeRules: number;
+}
+
+/** Mirrors `relay_wright_core::registry_cascade::ConnectionCascadeSummary`. */
+export interface PlcConnectionCascadeSummary {
+	groups: number;
+	tags: number;
+}
+
+/** Mirrors `relay_wright_core::registry_cascade::GroupCascadePreview`. */
+export interface CollectionGroupCascadePreview {
+	tags: number;
+	writeRules: number;
+}
+
+/** Mirrors `relay_wright_core::registry_cascade::GroupCascadeSummary`. */
+export interface CollectionGroupCascadeSummary {
+	tags: number;
+}
+
+export async function previewPlcConnectionCascade(
+	id: number
+): Promise<PlcConnectionCascadePreview> {
+	if (!isTagRegistryAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri') {
+		return invokeCommand<PlcConnectionCascadePreview>('plc_connections_cascade_preview', { id });
+	}
+	return httpRequest<PlcConnectionCascadePreview>(`/api/plc-connections/${id}/cascade-preview`, {
+		method: 'GET'
+	});
+}
+
+export async function cascadeDeletePlcConnection(id: number): Promise<PlcConnectionCascadeSummary> {
+	if (!isTagRegistryAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri') {
+		return invokeCommand<PlcConnectionCascadeSummary>('plc_connections_cascade_delete', { id });
+	}
+	return httpRequest<PlcConnectionCascadeSummary>(`/api/plc-connections/${id}/cascade`, {
+		method: 'DELETE'
+	});
+}
+
+export async function previewCollectionGroupCascade(
+	id: number
+): Promise<CollectionGroupCascadePreview> {
+	if (!isTagRegistryAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri') {
+		return invokeCommand<CollectionGroupCascadePreview>('collection_groups_cascade_preview', {
+			id
+		});
+	}
+	return httpRequest<CollectionGroupCascadePreview>(
+		`/api/collection-groups/${id}/cascade-preview`,
+		{ method: 'GET' }
+	);
+}
+
+export async function cascadeDeleteCollectionGroup(
+	id: number
+): Promise<CollectionGroupCascadeSummary> {
+	if (!isTagRegistryAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri') {
+		return invokeCommand<CollectionGroupCascadeSummary>('collection_groups_cascade_delete', {
+			id
+		});
+	}
+	return httpRequest<CollectionGroupCascadeSummary>(`/api/collection-groups/${id}/cascade`, {
+		method: 'DELETE'
+	});
+}
+
 // --- collection groups ------------------------------------------------------
 
 export async function listCollectionGroups(): Promise<CollectionGroup[]> {

@@ -36,6 +36,14 @@ use relay_wright_core::engine::{
 use relay_wright_core::events::event_channel;
 use relay_wright_core::project::{export_project, import_project, ImportSummary, ProjectFile};
 use relay_wright_core::qr_strings::{QrString, QrStringInput, QrStringService};
+// feature/easy-delete: cascade delete for the tag registry (this app's own
+// wiring-layer semantics - banto-tags' guarded deletes stay untouched). The
+// Tauri commands below are the dual-path twins of `rest`'s
+// `/api/*/{id}/cascade[-preview]` routes.
+use relay_wright_core::registry_cascade::{
+    self, ConnectionCascadePreview, ConnectionCascadeSummary, GroupCascadePreview,
+    GroupCascadeSummary,
+};
 use relay_wright_core::rest::{
     api_router, audited_credential_verifier, CollectionGroupPayload, PlcConnectionPayload,
     QrStringsReorderPayload, TagPayload,
@@ -1854,6 +1862,111 @@ async fn collection_groups_delete(state: State<'_, AppState>, id: i64) -> Result
     collection_groups_delete_body(&state, id).await
 }
 
+// --- feature/easy-delete: cascade delete (connection → groups → tags) -------
+//
+// The plain delete commands above keep banto-tags' guarded semantics for API
+// compatibility; these are the one-confirm debug-tool path, the Tauri twins
+// of `rest`'s `/api/*/{id}/cascade[-preview]` routes (invariant §1
+// 両経路対称): previews are viewer+ reads (never audited), cascades are
+// editor+ and audited with the name snapshot + counts in `detail`.
+
+/// `viewer`+ (spec M10): would-be counts for cascade-deleting a PLC
+/// connection (groups/tags to delete, write targets/rules left dangling).
+/// A read - deletes nothing, never audited.
+#[tauri::command]
+async fn plc_connections_cascade_preview(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<ConnectionCascadePreview, BantoError> {
+    require_role(&state, Role::Viewer, "plc_connections").await?;
+    registry_cascade::cascade_preview_plc_connection(&state.pool, id).await
+}
+
+async fn plc_connections_cascade_delete_body(
+    state: &AppState,
+    id: i64,
+) -> Result<ConnectionCascadeSummary, BantoError> {
+    let actor = require_role(state, Role::Editor, "plc_connections").await?;
+    // Name snapshot for the audit detail, taken before the row disappears.
+    let doomed = state.plc_connections.get(id).await?;
+    let summary = registry_cascade::cascade_delete_plc_connection(&state.pool, id).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "delete",
+            resource: "plc_connections",
+            entity_id: Some(&id.to_string()),
+            detail: Some(serde_json::json!({
+                "name": doomed.name,
+                "cascade": { "groups": summary.groups, "tags": summary.tags },
+            })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(summary)
+}
+
+/// `editor`+ (spec M10): delete a PLC connection AND its collection groups
+/// and tags in one transaction (`registry_cascade`), returning the counts.
+#[tauri::command]
+async fn plc_connections_cascade_delete(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<ConnectionCascadeSummary, BantoError> {
+    plc_connections_cascade_delete_body(&state, id).await
+}
+
+/// `viewer`+ (spec M10): would-be counts for cascade-deleting a collection
+/// group (tags to delete, write rules left dangling). A read - deletes
+/// nothing, never audited.
+#[tauri::command]
+async fn collection_groups_cascade_preview(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<GroupCascadePreview, BantoError> {
+    require_role(&state, Role::Viewer, "collection_groups").await?;
+    registry_cascade::cascade_preview_collection_group(&state.pool, id).await
+}
+
+async fn collection_groups_cascade_delete_body(
+    state: &AppState,
+    id: i64,
+) -> Result<GroupCascadeSummary, BantoError> {
+    let actor = require_role(state, Role::Editor, "collection_groups").await?;
+    let doomed = state.collection_groups.get(id).await?;
+    let summary = registry_cascade::cascade_delete_collection_group(&state.pool, id).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "delete",
+            resource: "collection_groups",
+            entity_id: Some(&id.to_string()),
+            detail: Some(serde_json::json!({
+                "name": doomed.name,
+                "cascade": { "tags": summary.tags },
+            })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(summary)
+}
+
+/// `editor`+ (spec M10): delete a collection group AND its tags in one
+/// transaction (`registry_cascade`), returning the counts.
+#[tauri::command]
+async fn collection_groups_cascade_delete(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<GroupCascadeSummary, BantoError> {
+    collection_groups_cascade_delete_body(&state, id).await
+}
+
 /// `viewer`+ (spec M10): list tags.
 #[tauri::command]
 async fn tags_list(state: State<'_, AppState>) -> Result<Vec<Tag>, BantoError> {
@@ -2773,11 +2886,15 @@ pub fn run() {
             plc_connections_create,
             plc_connections_update,
             plc_connections_delete,
+            plc_connections_cascade_preview,
+            plc_connections_cascade_delete,
             collection_groups_list,
             collection_groups_get,
             collection_groups_create,
             collection_groups_update,
             collection_groups_delete,
+            collection_groups_cascade_preview,
+            collection_groups_cascade_delete,
             tags_list,
             tags_get,
             tags_create,
@@ -3486,6 +3603,203 @@ mod tests {
             .rows
             .iter()
             .any(|r| r.action == "create" && r.resource == "tags"));
+    }
+
+    /// feature/easy-delete: seed connection → group → 2 tags through the
+    /// command bodies (editor session already installed) and return the
+    /// (connection id, group id).
+    async fn seed_registry_subtree(state: &AppState) -> (i64, i64) {
+        let conn = plc_connections_create_body(
+            state,
+            PlcConnectionPayload {
+                name: "PLC1".to_string(),
+                protocol: "slmp".to_string(),
+                host: "10.0.0.1".to_string(),
+                port: 5007,
+                unit_id: 1,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("seed plc connection");
+        let group = collection_groups_create_body(
+            state,
+            CollectionGroupPayload {
+                name: "G1".to_string(),
+                plc_connection_id: conn.id,
+                period_ms: 1_000,
+                enabled: true,
+            },
+        )
+        .await
+        .expect("seed collection group");
+        for (name, address) in [("T1", "D100"), ("T2", "D101")] {
+            tags_create_body(
+                state,
+                TagPayload {
+                    name: name.to_string(),
+                    collection_group_id: group.id,
+                    address: address.to_string(),
+                    data_type: "i16".to_string(),
+                    raw_lo: None,
+                    raw_hi: None,
+                    eng_lo: None,
+                    eng_hi: None,
+                    unit: None,
+                    decimals: 0,
+                    threshold_h: None,
+                    threshold_hh: None,
+                    threshold_l: None,
+                    threshold_ll: None,
+                    string_length: None,
+                    enabled: true,
+                },
+            )
+            .await
+            .expect("seed tag");
+        }
+        (conn.id, group.id)
+    }
+
+    /// feature/easy-delete (Tauri half; its REST twin is
+    /// `rest_editor_can_cascade_delete_a_plc_connection_and_it_is_audited`):
+    /// an `editor` session can cascade-delete a connection via the command
+    /// body - the whole subtree goes in one call, the counts come back, and
+    /// the audit entry carries `origin: "tauri"` + name/counts in `detail`.
+    #[tokio::test]
+    async fn plc_connections_cascade_delete_removes_subtree_and_is_audited() {
+        let (state, pool) = app_state_with_pool().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create editor");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+        let (conn_id, _group_id) = seed_registry_subtree(&state).await;
+
+        // The preview counts first, without deleting.
+        let preview = registry_cascade::cascade_preview_plc_connection(&pool, conn_id)
+            .await
+            .expect("preview");
+        assert_eq!(preview.groups, 1);
+        assert_eq!(preview.tags, 2);
+
+        let summary = plc_connections_cascade_delete_body(&state, conn_id)
+            .await
+            .expect("cascade should succeed");
+        assert_eq!(summary.groups, 1);
+        assert_eq!(summary.tags, 2);
+
+        for table in ["plc_connections", "collection_groups", "tags"] {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(count, 0, "{table} should be empty after the cascade");
+        }
+
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        let entry = entries
+            .rows
+            .iter()
+            .find(|r| r.action == "delete" && r.resource == "plc_connections")
+            .expect("expected a plc_connections delete audit entry");
+        assert_eq!(entry.origin, "tauri");
+        assert_eq!(entry.actor_username.as_deref(), Some("editor"));
+        let detail: serde_json::Value =
+            serde_json::from_str(entry.detail.as_deref().expect("detail")).unwrap();
+        assert_eq!(detail["name"], "PLC1");
+        assert_eq!(detail["cascade"]["groups"], 1);
+        assert_eq!(detail["cascade"]["tags"], 2);
+    }
+
+    /// feature/easy-delete: the group-cascade Tauri twin - its tags go with
+    /// it, the parent connection survives, audited with counts.
+    #[tokio::test]
+    async fn collection_groups_cascade_delete_removes_tags_and_is_audited() {
+        let (state, pool) = app_state_with_pool().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create editor");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+        let (conn_id, group_id) = seed_registry_subtree(&state).await;
+
+        let summary = collection_groups_cascade_delete_body(&state, group_id)
+            .await
+            .expect("group cascade should succeed");
+        assert_eq!(summary.tags, 2);
+
+        let groups: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM collection_groups")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(groups, 0);
+        let tags: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(tags, 0);
+        let connections: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM plc_connections WHERE id = ?")
+                .bind(conn_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(connections, 1, "the parent connection must survive");
+
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        let entry = entries
+            .rows
+            .iter()
+            .find(|r| r.action == "delete" && r.resource == "collection_groups")
+            .expect("expected a collection_groups delete audit entry");
+        assert_eq!(entry.origin, "tauri");
+        let detail: serde_json::Value =
+            serde_json::from_str(entry.detail.as_deref().expect("detail")).unwrap();
+        assert_eq!(detail["name"], "G1");
+        assert_eq!(detail["cascade"]["tags"], 2);
+    }
+
+    /// feature/easy-delete: a `viewer` session is denied the cascade (denial
+    /// audited) and nothing is deleted - the Tauri twin of the REST 403.
+    #[tokio::test]
+    async fn plc_connections_cascade_delete_denies_viewer_and_audits_it() {
+        let (state, pool) = app_state_with_pool().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create editor");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+        let (conn_id, _group_id) = seed_registry_subtree(&state).await;
+
+        let viewer = state
+            .users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create viewer");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+
+        let err = plc_connections_cascade_delete_body(&state, conn_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BantoError::Forbidden));
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2, "nothing may be deleted on a denial");
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        assert!(entries.rows.iter().any(|r| r.action == "denied"
+            && r.resource == "plc_connections"
+            && r.actor_username.as_deref() == Some("viewer")));
+        assert!(!entries
+            .rows
+            .iter()
+            .any(|r| r.action == "delete" && r.resource == "plc_connections"));
     }
 
     // --- W3-B2: engine control dual-path (Tauri half) -----------------------

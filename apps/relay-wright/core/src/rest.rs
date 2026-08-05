@@ -135,6 +135,10 @@ use crate::db::DbPool;
 use crate::engine::{EngineControl, EngineStatus, MonitorValue, SharedEngineControl};
 use crate::project::{export_project, import_project, ImportSummary, ProjectFile};
 use crate::qr_strings::{QrString, QrStringInput, QrStringService};
+use crate::registry_cascade::{
+    self, ConnectionCascadePreview, ConnectionCascadeSummary, GroupCascadePreview,
+    GroupCascadeSummary,
+};
 use crate::settings::{AuditSettings, SettingsService};
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
 use crate::write_audit_query::{WriteAuditLogRow, WriteAuditLogService};
@@ -1783,6 +1787,10 @@ struct TagRegistryState {
     tags: TagService,
     auth: AuthState,
     audit: AuditLogService,
+    /// The shared SQLite pool, for the cascade-delete routes
+    /// (`crate::registry_cascade` works on the pool directly - the cascade is
+    /// this app's own wiring-layer semantics, not banto-tags').
+    pool: DbPool,
 }
 
 async fn plc_connections_list(
@@ -1993,6 +2001,98 @@ async fn collection_groups_delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// --- feature/easy-delete: cascade delete (connection → groups → tags) -------
+//
+// The plain DELETE routes above keep banto-tags' guarded semantics (refuse
+// while children exist) for API compatibility; these routes are the
+// one-confirm debug-tool path. Previews are reads (viewer+, never audited -
+// module convention); the cascades are editor-gated and audited with the
+// deleted-row name snapshot plus the counts, so the trail says exactly how
+// much one click removed.
+
+async fn plc_connections_cascade_preview(
+    State(state): State<TagRegistryState>,
+    Path(id): Path<i64>,
+) -> Result<Json<ConnectionCascadePreview>, ApiError> {
+    Ok(Json(
+        registry_cascade::cascade_preview_plc_connection(&state.pool, id).await?,
+    ))
+}
+
+async fn plc_connections_cascade_delete(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<ConnectionCascadeSummary>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "plc_connections",
+        "DELETE",
+        "/api/plc-connections/{id}/cascade",
+    )
+    .await?;
+    // Name snapshot for the audit detail, taken before the row disappears.
+    let doomed = state.plc_connections.get(id).await?;
+    let summary = registry_cascade::cascade_delete_plc_connection(&state.pool, id).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "delete",
+        "plc_connections",
+        &id.to_string(),
+        Some(json!({
+            "name": doomed.name,
+            "cascade": { "groups": summary.groups, "tags": summary.tags },
+        })),
+    )
+    .await;
+    Ok(Json(summary))
+}
+
+async fn collection_groups_cascade_preview(
+    State(state): State<TagRegistryState>,
+    Path(id): Path<i64>,
+) -> Result<Json<GroupCascadePreview>, ApiError> {
+    Ok(Json(
+        registry_cascade::cascade_preview_collection_group(&state.pool, id).await?,
+    ))
+}
+
+async fn collection_groups_cascade_delete(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<GroupCascadeSummary>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "collection_groups",
+        "DELETE",
+        "/api/collection-groups/{id}/cascade",
+    )
+    .await?;
+    let doomed = state.collection_groups.get(id).await?;
+    let summary = registry_cascade::cascade_delete_collection_group(&state.pool, id).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "delete",
+        "collection_groups",
+        &id.to_string(),
+        Some(json!({
+            "name": doomed.name,
+            "cascade": { "tags": summary.tags },
+        })),
+    )
+    .await;
+    Ok(Json(summary))
+}
+
 async fn tags_list(State(state): State<TagRegistryState>) -> Result<Json<Vec<Tag>>, ApiError> {
     Ok(Json(state.tags.list(ListParams::default()).await?.rows))
 }
@@ -2103,6 +2203,7 @@ fn tag_registry_router(
     tags: TagService,
     audit: AuditLogService,
     auth: AuthState,
+    pool: DbPool,
 ) -> Router {
     let state = TagRegistryState {
         plc_connections,
@@ -2110,6 +2211,7 @@ fn tag_registry_router(
         tags,
         auth: auth.clone(),
         audit,
+        pool,
     };
     Router::new()
         .route(
@@ -2123,6 +2225,14 @@ fn tag_registry_router(
                 .delete(plc_connections_delete),
         )
         .route(
+            "/api/plc-connections/{id}/cascade-preview",
+            get(plc_connections_cascade_preview),
+        )
+        .route(
+            "/api/plc-connections/{id}/cascade",
+            axum::routing::delete(plc_connections_cascade_delete),
+        )
+        .route(
             "/api/collection-groups",
             get(collection_groups_list).post(collection_groups_create),
         )
@@ -2131,6 +2241,14 @@ fn tag_registry_router(
             get(collection_groups_get)
                 .put(collection_groups_update)
                 .delete(collection_groups_delete),
+        )
+        .route(
+            "/api/collection-groups/{id}/cascade-preview",
+            get(collection_groups_cascade_preview),
+        )
+        .route(
+            "/api/collection-groups/{id}/cascade",
+            axum::routing::delete(collection_groups_cascade_delete),
         )
         .route("/api/tags", get(tags_list).post(tags_create))
         .route(
@@ -2645,8 +2763,9 @@ pub fn api_router(
     allow_setup: bool,
     // The shared SQLite pool, threaded through for `/api/project/*`
     // (export/import build the registry services from it, and the import arm
-    // guard reuses `engine_control`). Kept last so the pre-existing call sites
-    // only append one argument.
+    // guard reuses `engine_control`) and for the tag registry's cascade-delete
+    // routes (`crate::registry_cascade`). Kept last so the pre-existing call
+    // sites only append one argument.
     pool: DbPool,
 ) -> Router {
     let audited_auth_routes = auth_routes(auth.clone()).layer(middleware::from_fn_with_state(
@@ -2684,6 +2803,7 @@ pub fn api_router(
             tags,
             audit.clone(),
             auth.clone(),
+            pool.clone(),
         ))
         .merge(qr_strings_router(qr_strings, audit.clone(), auth.clone()))
         .merge(write_audit_log_router(write_audit_log, auth.clone()))
@@ -4691,6 +4811,210 @@ mod tests {
                 "GET {path} row count"
             );
         }
+    }
+
+    /// feature/easy-delete: an `editor` can cascade-preview then
+    /// cascade-delete a PLC connection over REST. The preview deletes
+    /// nothing; the cascade removes the seeded group + a tag with it, returns
+    /// the counts, and is audited with the name snapshot + counts in
+    /// `detail`.
+    #[tokio::test]
+    async fn rest_editor_can_cascade_delete_a_plc_connection_and_it_is_audited() {
+        let (router, audit, group_id, editor, _viewer) = tag_registry_router_test().await;
+
+        // Seed one tag under the seeded group so the cascade has a subtree.
+        let response = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/tags",
+                &editor,
+                json!({
+                    "name": "T1",
+                    "collectionGroupId": group_id,
+                    "address": "D100",
+                    "dataType": "i16"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Preview: counts only, nothing deleted (connection id is 1 - the
+        // helper seeds exactly one).
+        let response = router
+            .clone()
+            .oneshot(get_auth("/api/plc-connections/1/cascade-preview", &editor))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let preview = body_json(response).await;
+        assert_eq!(preview["groups"], 1);
+        assert_eq!(preview["tags"], 1);
+        assert_eq!(preview["writeTargets"], 0);
+        assert_eq!(preview["writeRules"], 0);
+        let still_there = router
+            .clone()
+            .oneshot(get_auth("/api/plc-connections/1", &editor))
+            .await
+            .unwrap();
+        assert_eq!(still_there.status(), StatusCode::OK);
+
+        // Cascade: everything under the connection goes, counts come back.
+        let response = router
+            .clone()
+            .oneshot(delete_auth("/api/plc-connections/1/cascade", &editor))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let summary = body_json(response).await;
+        assert_eq!(summary["groups"], 1);
+        assert_eq!(summary["tags"], 1);
+
+        for path in [
+            "/api/plc-connections",
+            "/api/collection-groups",
+            "/api/tags",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(get_auth(path, &editor))
+                .await
+                .unwrap();
+            let rows = body_json(response).await;
+            assert_eq!(
+                rows.as_array().unwrap().len(),
+                0,
+                "GET {path} after cascade"
+            );
+        }
+
+        let entries = audit.list(ListParams::default()).await.unwrap();
+        let entry = entries
+            .rows
+            .iter()
+            .find(|r| r.action == "delete" && r.resource == "plc_connections")
+            .expect("expected a plc_connections delete audit entry");
+        assert_eq!(entry.origin, "rest");
+        assert_eq!(entry.actor_username.as_deref(), Some("editor"));
+        let detail: serde_json::Value =
+            serde_json::from_str(entry.detail.as_deref().expect("detail")).unwrap();
+        assert_eq!(detail["name"], "PLC1");
+        assert_eq!(detail["cascade"]["groups"], 1);
+        assert_eq!(detail["cascade"]["tags"], 1);
+    }
+
+    /// feature/easy-delete: the group-cascade REST twin - preview counts,
+    /// cascade removes the group's tag with it, audited with counts.
+    #[tokio::test]
+    async fn rest_editor_can_cascade_delete_a_collection_group_and_it_is_audited() {
+        let (router, audit, group_id, editor, _viewer) = tag_registry_router_test().await;
+
+        let response = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/tags",
+                &editor,
+                json!({
+                    "name": "T1",
+                    "collectionGroupId": group_id,
+                    "address": "D100",
+                    "dataType": "i16"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = router
+            .clone()
+            .oneshot(get_auth(
+                &format!("/api/collection-groups/{group_id}/cascade-preview"),
+                &editor,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let preview = body_json(response).await;
+        assert_eq!(preview["tags"], 1);
+        assert_eq!(preview["writeRules"], 0);
+
+        let response = router
+            .clone()
+            .oneshot(delete_auth(
+                &format!("/api/collection-groups/{group_id}/cascade"),
+                &editor,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let summary = body_json(response).await;
+        assert_eq!(summary["tags"], 1);
+
+        // The group and its tag are gone; the connection survives.
+        for (path, expected) in [
+            ("/api/plc-connections", 1),
+            ("/api/collection-groups", 0),
+            ("/api/tags", 0),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(get_auth(path, &editor))
+                .await
+                .unwrap();
+            let rows = body_json(response).await;
+            assert_eq!(rows.as_array().unwrap().len(), expected, "GET {path}");
+        }
+
+        let entries = audit.list(ListParams::default()).await.unwrap();
+        let entry = entries
+            .rows
+            .iter()
+            .find(|r| r.action == "delete" && r.resource == "collection_groups")
+            .expect("expected a collection_groups delete audit entry");
+        assert_eq!(entry.origin, "rest");
+        let detail: serde_json::Value =
+            serde_json::from_str(entry.detail.as_deref().expect("detail")).unwrap();
+        assert_eq!(detail["name"], "G1");
+        assert_eq!(detail["cascade"]["tags"], 1);
+    }
+
+    /// feature/easy-delete: a `viewer` may read the cascade PREVIEW (it is a
+    /// read, like every other GET here) but is denied the cascade DELETE
+    /// (403, denial audited) - and nothing is deleted.
+    #[tokio::test]
+    async fn rest_viewer_can_preview_but_not_cascade_delete_and_denial_is_audited() {
+        let (router, audit, _group_id, _editor, viewer) = tag_registry_router_test().await;
+
+        let response = router
+            .clone()
+            .oneshot(get_auth("/api/plc-connections/1/cascade-preview", &viewer))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = router
+            .clone()
+            .oneshot(delete_auth("/api/plc-connections/1/cascade", &viewer))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // The connection is still there and the denial is on the trail.
+        let response = router
+            .clone()
+            .oneshot(get_auth("/api/plc-connections/1", &viewer))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let entries = audit.list(ListParams::default()).await.unwrap();
+        assert!(entries
+            .rows
+            .iter()
+            .any(|r| r.action == "denied" && r.resource == "plc_connections"));
+        assert!(!entries
+            .rows
+            .iter()
+            .any(|r| r.action == "delete" && r.resource == "plc_connections"));
     }
 
     // --- W3-B2: engine control dual-path symmetry (REST half) ---------------

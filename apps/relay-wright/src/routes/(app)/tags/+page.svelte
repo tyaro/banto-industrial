@@ -16,7 +16,15 @@
 	 *   一括貼り付けと同じ runCreateLoop（1行ずつ createTag・失敗行は続行）。
 	 * - 「収集グループ管理」→ 収集グループの一覧＋作成・編集・削除のモーダル
 	 *   （グループはタグの実装詳細であり独立画面にしない方針は維持しつつ、
-	 *   リストメイン化のため常時表示セクションからモーダルへ移動）。
+	 *   リストメイン化のため常時表示セクションからモーダルへ移動）。グループの
+	 *   削除は**カスケード**（feature/easy-delete）: 所属タグごと1トランザク
+	 *   ションで削除し、確認ダイアログに巻き添え件数を出す。
+	 * - 一覧グリッドに「選択」（チェックボックス風の複数選択）と「削除」
+	 *   （行ごとの1クリック削除）の列（feature/easy-delete）。選択中はツール
+	 *   バーに「選択削除（N件）」が現れ、confirm 1回で deleteTag を1件ずつ
+	 *   呼ぶ（各件が個別に監査され、失敗行があっても続行）。BantoGrid は
+	 *   ボタンセルを持たないため実装はテキストセル + capture 委譲
+	 *   （script 側 handleGridClickCapture のコメント参照）。
 	 *
 	 * モーダルの作法は CommandPalette.svelte（本アプリ唯一の既存オーバーレイ）
 	 * に合わせる: `{#if}` でマウントするたび新品インスタンス・
@@ -45,7 +53,8 @@
 	 * 入力するか、全て空にするか」の all-or-nothing。しきい値は
 	 * LL ≤ L ≤ H ≤ HH（設定されたもの同士のみ比較）。
 	 */
-	import { BantoGrid, type GridColumn } from '@banto/grid-svelte';
+	import { BantoGrid, GridState, filterRows, sortRows, type GridColumn } from '@banto/grid-svelte';
+	import { SvelteSet } from 'svelte/reactivity';
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '$lib/toast.svelte';
 	import { sessionStore } from '$lib/session.svelte';
@@ -58,7 +67,8 @@
 		listCollectionGroups,
 		createCollectionGroup,
 		updateCollectionGroup,
-		deleteCollectionGroup,
+		previewCollectionGroupCascade,
+		cascadeDeleteCollectionGroup,
 		listPlcConnections,
 		isTagRegistryAvailable,
 		ALLOWED_PERIOD_MS,
@@ -149,6 +159,11 @@
 			tags = tagList;
 			groups = groupList;
 			connections = connectionList;
+			// 消えたタグを選択集合から掃除する（削除・他クライアントの変更後）。
+			const alive = new Set(tagList.map((t) => t.id));
+			for (const id of [...selectedIds]) {
+				if (!alive.has(id)) selectedIds.delete(id);
+			}
 		} catch (err) {
 			toastStore.push('error', errorMessage(err));
 		} finally {
@@ -238,15 +253,46 @@
 		}
 	}
 
+	/**
+	 * グループ削除はカスケード（feature/easy-delete）: 所属タグごと 1 トラン
+	 * ザクションで削除する。事前に cascade-preview で巻き添え件数（タグ、
+	 * および参照が外れる書き込みルール）を取得して確認ダイアログに出す。
+	 */
 	async function handleDeleteGroup(g: CollectionGroup): Promise<void> {
-		if (!window.confirm(`収集グループ ${g.name} を削除しますか？`)) return;
+		let tagCount: number;
+		let ruleCount: number;
 		try {
-			await deleteCollectionGroup(g.id);
-			toastStore.push('success', '収集グループを削除しました');
+			const preview = await previewCollectionGroupCascade(g.id);
+			tagCount = preview.tags;
+			ruleCount = preview.writeRules;
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+			return;
+		}
+		const lines =
+			tagCount > 0
+				? [
+						`収集グループ ${g.name} を削除すると、所属タグ ${tagCount} 件も削除されます。`,
+						...(ruleCount > 0
+							? [
+									`これらのタグを参照する書き込みルール ${ruleCount} 件は参照先を失い無効になります（ルール自体は削除されません）。`
+								]
+							: []),
+						'削除しますか？'
+					].join('\n')
+				: `収集グループ ${g.name} を削除しますか？`;
+		if (!window.confirm(lines)) return;
+		try {
+			const summary = await cascadeDeleteCollectionGroup(g.id);
+			toastStore.push(
+				'success',
+				summary.tags > 0
+					? `収集グループを削除しました（タグ${summary.tags}件を含む）`
+					: '収集グループを削除しました'
+			);
 			if (editingGroup?.id === g.id) cancelEditGroup();
 			await reload();
 		} catch (err) {
-			// タグが所属している場合はサービス層の件数入り Validation エラー。
 			toastStore.push('error', errorMessage(err));
 		}
 	}
@@ -845,7 +891,89 @@
 		}
 	}
 
+	// --- row delete + checkbox multi-select (feature/easy-delete) -----------
+	//
+	// BantoGrid はボタン／チェックボックスのセルを持たない（`cell` はテキスト
+	// リンクのみ）ため、選択列（☑/☐）と「削除」列は format のテキストセルと
+	// して描画し、ラッパー要素の capture フェーズでクリックを先取りする
+	// （stopPropagation でセル自身の onclick = onRowClick（編集モーダル）を
+	// 抑止）。セル DOM の data-cell-field / data-cell-row 属性で判定し、表示
+	// 行 index はグリッドと同じ filterRows→sortRows パイプラインで実データへ
+	// 写像する（BantoGrid.svelte クライアントモードと同式。groupBy 未使用）。
+	// ヘッダーはボタン化できないため「全選択（表示中）」はツールバーに置く。
+
+	/** 選択中のタグ id（SvelteSet: add/delete のミューテーションが通知される）。 */
+	const selectedIds = new SvelteSet<number>();
+
+	// 選択・削除列を出すのは編集者以上のみ。role は (app) レイアウトの load()
+	// が解決してからページがマウントされるため、初期化時点で確定している
+	// （session.svelte.ts の Ordering note 参照）。
+	const showRowActions = canWriteResources(sessionStore.role);
+
+	/** 行ごとの削除ボタン（「削除」列）: 軽い confirm 1回で1タグ削除。 */
+	async function deleteTagRow(t: Tag): Promise<void> {
+		if (!window.confirm(`タグ ${t.name} を削除しますか？`)) return;
+		try {
+			await deleteTag(t.id);
+			toastStore.push('success', '削除しました');
+			selectedIds.delete(t.id);
+			await reload();
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		}
+	}
+
+	let selectedDeleting = $state(false);
+
+	/**
+	 * 選択削除: confirm 1回 → 既存の deleteTag を1件ずつ呼ぶ（各件が個別に
+	 * 監査される）。失敗行があっても残りを続行し、成功／失敗件数をトーストで
+	 * まとめる（runCreateLoop と同運用の削除版）。
+	 */
+	async function runSelectedDelete(): Promise<void> {
+		const ids = [...selectedIds];
+		if (ids.length === 0 || selectedDeleting) return;
+		if (!window.confirm(`選択した ${ids.length} 件のタグを削除しますか？`)) return;
+		selectedDeleting = true;
+		let okCount = 0;
+		let failCount = 0;
+		let firstError = '';
+		try {
+			for (const id of ids) {
+				try {
+					await deleteTag(id);
+					okCount++;
+					selectedIds.delete(id);
+				} catch (err) {
+					failCount++;
+					if (firstError === '') firstError = errorMessage(err);
+				}
+			}
+			toastStore.push(
+				failCount === 0 ? 'success' : 'error',
+				`選択削除: 成功${okCount}件・失敗${failCount}件${firstError === '' ? '' : `（${firstError}）`}`
+			);
+			await reload();
+		} finally {
+			selectedDeleting = false;
+		}
+	}
+
 	const columns: GridColumn<Tag>[] = [
+		...(showRowActions
+			? [
+					{
+						id: '_select',
+						header: '選択',
+						accessor: (t: Tag) => selectedIds.has(t.id),
+						width: 60,
+						align: 'center',
+						sortable: false,
+						resizable: false,
+						format: (v: unknown) => (v ? '☑' : '☐')
+					} satisfies GridColumn<Tag>
+				]
+			: []),
 		{ id: 'id', header: 'ID', accessor: 'id', width: 60, align: 'right' },
 		{
 			id: 'name',
@@ -877,8 +1005,57 @@
 			accessor: 'enabled',
 			width: 70,
 			format: (v) => (v ? 'はい' : 'いいえ')
-		}
+		},
+		...(showRowActions
+			? [
+					{
+						id: '_delete',
+						header: '削除',
+						accessor: () => '削除',
+						width: 70,
+						align: 'center',
+						sortable: false,
+						resizable: false
+					} satisfies GridColumn<Tag>
+				]
+			: [])
 	];
+
+	const gridState = new GridState<Tag>(columns);
+	/** グリッドの表示順（フィルタ＋ソート適用後）の行。capture ハンドラの
+	 * data-cell-row 写像と「全選択（表示中）」の対象。 */
+	const viewTags = $derived(
+		sortRows(filterRows(tags, gridState.filters, columns), gridState.sort, columns)
+	);
+	const allViewSelected = $derived(
+		viewTags.length > 0 && viewTags.every((t) => selectedIds.has(t.id))
+	);
+
+	/** ツールバーの「全選択（表示中）」/「全解除」トグル。 */
+	function toggleSelectAllInView(): void {
+		if (allViewSelected) {
+			for (const t of viewTags) selectedIds.delete(t.id);
+		} else {
+			for (const t of viewTags) selectedIds.add(t.id);
+		}
+	}
+
+	function handleGridClickCapture(event: MouseEvent): void {
+		const target = event.target instanceof HTMLElement ? event.target : null;
+		const cell = target?.closest<HTMLElement>(
+			'[data-cell-field="_select"], [data-cell-field="_delete"]'
+		);
+		if (!cell || cell.dataset.cellRow === undefined) return;
+		event.stopPropagation();
+		const row = viewTags[Number(cell.dataset.cellRow)];
+		if (!row) return;
+		if (cell.dataset.cellField === '_select') {
+			if (selectedIds.has(row.id)) selectedIds.delete(row.id);
+			else selectedIds.add(row.id);
+		} else {
+			void deleteTagRow(row);
+		}
+	}
 </script>
 
 <svelte:window onkeydown={handleWindowKeydown} />
@@ -1006,9 +1183,24 @@
 				<button type="button" class="ghost" onclick={openSeqModal}>連続登録</button>
 			{/if}
 			<button type="button" class="ghost" onclick={openGroupModal}>収集グループ管理</button>
+			{#if canWrite && tags.length > 0}
+				<button type="button" class="ghost" onclick={toggleSelectAllInView}>
+					{allViewSelected ? '全解除' : '全選択（表示中）'}
+				</button>
+			{/if}
+			{#if canWrite && selectedIds.size > 0}
+				<button
+					type="button"
+					class="danger"
+					onclick={runSelectedDelete}
+					disabled={selectedDeleting}
+				>
+					{selectedDeleting ? '削除中…' : `選択削除（${selectedIds.size}件）`}
+				</button>
+			{/if}
 			<span class="toolbar-note">
 				{canWrite
-					? '行をクリックすると編集ポップアップが開きます。'
+					? '行をクリックすると編集ポップアップが開きます。「選択」列で複数選択、「削除」列で行ごとに削除できます。'
 					: '閲覧のみ（編集には編集者以上の権限が必要です）。'}
 			</span>
 		</div>
@@ -1023,10 +1215,15 @@
 			{#if loading && tags.length === 0}
 				<p class="loading">読み込み中…</p>
 			{:else}
-				<div class="grid-wrap">
+				<!-- capture で「選択」「削除」列のクリックを onRowClick（編集
+				     モーダル）より先に拾う（script 側 handleGridClickCapture
+				     参照）。キーボード操作はグリッド本体が担うため、この
+				     ラッパー自体は素通し。 -->
+				<div class="grid-wrap" onclickcapture={handleGridClickCapture}>
 					<BantoGrid
 						rows={tags}
 						{columns}
+						state={gridState}
 						getRowId={(t) => t.id}
 						onRowClick={canWrite ? openEditModal : undefined}
 					/>
@@ -1486,6 +1683,25 @@
 
 	.grid-wrap {
 		height: 480px;
+	}
+
+	/* 「選択」（☑/☐）と「削除」列（テキストセル）をボタン風に見せる。
+	   BantoGrid のセル DOM（data-cell-field 属性）に :global で当てる。 */
+	.grid-wrap :global([data-cell-field='_select']) {
+		cursor: pointer;
+		user-select: none;
+		font-size: 1rem;
+	}
+
+	.grid-wrap :global([data-cell-field='_delete']) {
+		color: var(--banto-danger);
+		font-weight: 600;
+		cursor: pointer;
+		user-select: none;
+	}
+
+	.grid-wrap :global([data-cell-field='_delete']:hover) {
+		text-decoration: underline;
 	}
 
 	/* --- modal chrome (CommandPalette.svelte のオーバーレイと同作法) --- */
