@@ -17,7 +17,7 @@
   },
   "scripts": {
     "dev": "pnpm --filter chronogazer dev",
-    "build": "pnpm --filter chronogazer build",
+    "build": "pnpm --recursive --if-present build",
     "check": "pnpm --recursive --if-present check",
     "test": "pnpm --recursive --if-present test",
     "format": "prettier --write .",

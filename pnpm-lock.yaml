@@ -39,23 +39,69 @@ importers:
         specifier: ^8.63.0
         version: 8.63.0(eslint@10.7.0(jiti@2.7.0))(typescript@5.9.3)
 
+  apps/banto-hub:
+    dependencies:
+      '@banto/admin-core':
+        specifier: github:tyaro/banto#v0.1.1&path:packages/admin-core
+        version: git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/admin-core
+      '@banto/charts':
+        specifier: github:tyaro/banto#v0.1.1&path:packages/charts
+        version: git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/charts
+      '@banto/forms':
+        specifier: github:tyaro/banto#v0.1.1&path:packages/forms
+        version: git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/forms
+      '@banto/grid-svelte':
+        specifier: github:tyaro/banto#v0.1.1&path:packages/grid-svelte
+        version: git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/grid-svelte
+      '@banto/theme':
+        specifier: github:tyaro/banto#v0.1.1&path:packages/theme
+        version: git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/theme
+    devDependencies:
+      '@sveltejs/adapter-static':
+        specifier: ^3.0.8
+        version: 3.0.10(@sveltejs/kit@2.69.2(@sveltejs/vite-plugin-svelte@5.1.1(svelte@5.56.4(@typescript-eslint/types@8.63.0))(vite@6.4.3(jiti@2.7.0)(lightningcss@1.32.0)))(svelte@5.56.4(@typescript-eslint/types@8.63.0))(typescript@5.9.3)(vite@6.4.3(jiti@2.7.0)(lightningcss@1.32.0)))
+      '@sveltejs/kit':
+        specifier: ^2.22.0
+        version: 2.69.2(@sveltejs/vite-plugin-svelte@5.1.1(svelte@5.56.4(@typescript-eslint/types@8.63.0))(vite@6.4.3(jiti@2.7.0)(lightningcss@1.32.0)))(svelte@5.56.4(@typescript-eslint/types@8.63.0))(typescript@5.9.3)(vite@6.4.3(jiti@2.7.0)(lightningcss@1.32.0))
+      '@sveltejs/vite-plugin-svelte':
+        specifier: ^5.0.0
+        version: 5.1.1(svelte@5.56.4(@typescript-eslint/types@8.63.0))(vite@6.4.3(jiti@2.7.0)(lightningcss@1.32.0))
+      '@tailwindcss/vite':
+        specifier: ^4.1.0
+        version: 4.3.2(vite@6.4.3(jiti@2.7.0)(lightningcss@1.32.0))
+      svelte:
+        specifier: ^5.30.0
+        version: 5.56.4(@typescript-eslint/types@8.63.0)
+      svelte-check:
+        specifier: ^4.2.0
+        version: 4.7.2(picomatch@4.0.5)(svelte@5.56.4(@typescript-eslint/types@8.63.0))(typescript@5.9.3)
+      tailwindcss:
+        specifier: ^4.1.0
+        version: 4.3.2
+      typescript:
+        specifier: ^5.8.0
+        version: 5.9.3
+      vite:
+        specifier: ^6.3.0
+        version: 6.4.3(jiti@2.7.0)(lightningcss@1.32.0)
+
   apps/chronogazer:
     dependencies:
       '@banto/admin-core':
         specifier: github:tyaro/banto#v0.1.1&path:packages/admin-core
-        version: https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe#path:packages/admin-core
+        version: git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/admin-core
       '@banto/charts':
         specifier: github:tyaro/banto#v0.1.1&path:packages/charts
-        version: https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe#path:packages/charts
+        version: git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/charts
       '@banto/forms':
         specifier: github:tyaro/banto#v0.1.1&path:packages/forms
-        version: https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe#path:packages/forms
+        version: git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/forms
       '@banto/grid-svelte':
         specifier: github:tyaro/banto#v0.1.1&path:packages/grid-svelte
-        version: https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe#path:packages/grid-svelte
+        version: git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/grid-svelte
       '@banto/theme':
         specifier: github:tyaro/banto#v0.1.1&path:packages/theme
-        version: https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe#path:packages/theme
+        version: git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/theme
       '@tauri-apps/api':
         specifier: ^2.5.0
         version: 2.11.1
@@ -95,19 +141,19 @@ importers:
     dependencies:
       '@banto/admin-core':
         specifier: github:tyaro/banto#v0.1.1&path:packages/admin-core
-        version: https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe#path:packages/admin-core
+        version: git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/admin-core
       '@banto/charts':
         specifier: github:tyaro/banto#v0.1.1&path:packages/charts
-        version: https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe#path:packages/charts
+        version: git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/charts
       '@banto/forms':
         specifier: github:tyaro/banto#v0.1.1&path:packages/forms
-        version: https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe#path:packages/forms
+        version: git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/forms
       '@banto/grid-svelte':
         specifier: github:tyaro/banto#v0.1.1&path:packages/grid-svelte
-        version: https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe#path:packages/grid-svelte
+        version: git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/grid-svelte
       '@banto/theme':
         specifier: github:tyaro/banto#v0.1.1&path:packages/theme
-        version: https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe#path:packages/theme
+        version: git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/theme
       '@tauri-apps/api':
         specifier: ^2.5.0
         version: 2.11.1
@@ -145,24 +191,24 @@ importers:
 
 packages:
 
-  '@banto/admin-core@https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe#path:packages/admin-core':
-    resolution: {path: packages/admin-core, tarball: https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe}
+  '@banto/admin-core@git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/admin-core':
+    resolution: {commit: 314c03a907ed4d515842e49496d2849b49a4ccbe, path: packages/admin-core, repo: git@github.com:tyaro/banto.git, type: git}
     version: 0.1.0
 
-  '@banto/charts@https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe#path:packages/charts':
-    resolution: {path: packages/charts, tarball: https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe}
+  '@banto/charts@git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/charts':
+    resolution: {commit: 314c03a907ed4d515842e49496d2849b49a4ccbe, path: packages/charts, repo: git@github.com:tyaro/banto.git, type: git}
     version: 0.1.0
 
-  '@banto/forms@https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe#path:packages/forms':
-    resolution: {path: packages/forms, tarball: https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe}
+  '@banto/forms@git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/forms':
+    resolution: {commit: 314c03a907ed4d515842e49496d2849b49a4ccbe, path: packages/forms, repo: git@github.com:tyaro/banto.git, type: git}
     version: 0.1.0
 
-  '@banto/grid-svelte@https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe#path:packages/grid-svelte':
-    resolution: {path: packages/grid-svelte, tarball: https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe}
+  '@banto/grid-svelte@git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/grid-svelte':
+    resolution: {commit: 314c03a907ed4d515842e49496d2849b49a4ccbe, path: packages/grid-svelte, repo: git@github.com:tyaro/banto.git, type: git}
     version: 0.1.0
 
-  '@banto/theme@https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe#path:packages/theme':
-    resolution: {path: packages/theme, tarball: https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe}
+  '@banto/theme@git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/theme':
+    resolution: {commit: 314c03a907ed4d515842e49496d2849b49a4ccbe, path: packages/theme, repo: git@github.com:tyaro/banto.git, type: git}
     version: 0.1.0
 
   '@esbuild/aix-ppc64@0.25.12':
@@ -1486,15 +1532,15 @@ packages:
 
 snapshots:
 
-  '@banto/admin-core@https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe#path:packages/admin-core': {}
+  '@banto/admin-core@git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/admin-core': {}
 
-  '@banto/charts@https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe#path:packages/charts': {}
+  '@banto/charts@git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/charts': {}
 
-  '@banto/forms@https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe#path:packages/forms': {}
+  '@banto/forms@git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/forms': {}
 
-  '@banto/grid-svelte@https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe#path:packages/grid-svelte': {}
+  '@banto/grid-svelte@git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/grid-svelte': {}
 
-  '@banto/theme@https://codeload.github.com/tyaro/banto/tar.gz/314c03a907ed4d515842e49496d2849b49a4ccbe#path:packages/theme': {}
+  '@banto/theme@git+https://git@github.com:tyaro/banto.git#314c03a907ed4d515842e49496d2849b49a4ccbe&path:packages/theme': {}
 
   '@esbuild/aix-ppc64@0.25.12':
     optional: true

@@ -624,6 +624,13 @@ relay-wright の専管）。
 | T6 | 演算タグ・内部タグ（§4.2: タグ種別 = I1 拡張、式評価器、DAG 検証、`calc`/`mem` 名前空間） | T0 | 依存は T0 のみ — SCADA 計画次第で T1 直後へ前倒し可 |
 | T7 | オンライン部分再構成（§4.3(c): I7 = 接続単位の入れ替え。それまでは全体再構築で代替） | T0, I7 | 外部契約（revision/config_changed）は不変のため後入れ可能 |
 
+**T0 実装時の発見（2026-08-05）**: banto-collect の `build_config` は現状
+modbus-tcp のみ対応で、SLMP 接続は構成エラーになる（banto-plc の
+SLMP クライアント I2a は存在するが collect 側が未配線）。§1 の図が謳う
+MELSEC SLMP 収集には **I8（banto-collect の SLMP 対応、I 系バックログ）**が
+必要。それまで banto-hub の収集は Modbus TCP のみ（管理 UI は SLMP 選択肢に
+未対応の旨を注記済み）。
+
 T0/T1 だけでも「読み取り専用タグサーバー」として出荷可能な形を保つ
 （書き込み・MQTT・gRPC は積み増し）。**実機なしで進められる範囲が広い**のが
 本計画の狙い: I 系のシミュレータ（Modbus/SLMP、in-process + 実バイト列）が
