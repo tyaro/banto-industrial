@@ -143,6 +143,18 @@ axum が配信する（ChronoGazer / relay-wright の LAN モードと同じ構�
 `banto_server` の auth / CSRF / SSE をそのまま使う）。デスクトップ窓が
 不要なサーバー用途なので、Tauri シェルを省くことで配布物が単純になる。
 
+**管理 UI の共通利用（2026-08-05 オーナー決定）**: 管理 UI の実体は
+banto-hub が配信する1つだけとし、ChronoGazer / relay-wright には
+「タグサーバー管理」メニューを追加して、設定に保存した hub URL
+（`http://<host>:8722`）を **Tauri の WebviewWindow で開く**。これで
+どのアプリからも同一の管理画面に入れる。アプリへの UI コンポーネント
+組み込みは行わない — アプリ同梱 UI と稼働中 hub の API のバージョンずれを
+構造的に排除するため（UI とサーバーは同じ exe に同梱され常に一致）。
+認証は hub 側の bearer セッションログインを窓内でそのまま使う。
+管理 UI を触るのは管理者のみという運用前提。将来の SCADA の catalog
+ブラウズ/バインド画面はこれとは別物で、`banto-tagclient` SDK（§7）による
+アプリ内統合の領分。
+
 ### 3.2 内部構造 — 「タグ空間」は新規実装しない
 
 FA-Server の「タグ空間」に相当するものは **`banto-collect` の
@@ -179,7 +191,39 @@ FA-Server の「タグ空間」に相当するものは **`banto-collect` の
   小改修（I 系バックログ）。ディスク書き込みゼロが要件の現場向け。v1 では
   やらず、(a) の保持期間短縮で代替する。
 
-### 3.4 スレッド/タスク構造
+### 3.4 PLC 通信ドライバとの関係
+
+FA-Server の「通信ドライバ」に相当するのは `banto-plc`（I2/I2a）の
+プロトコル実装であり、**hub のバイナリにコンパイル時に同梱される Rust
+クレート**（プラグインや別プロセスではない）。関係は次の一方向の層構造:
+
+```
+banto-hub ──> banto-collect (I3b) ──> banto-plc (I2)  ──> ワイヤ
+ タグ空間      接続毎1タスク・周期      PlcClient trait
+ 外部IF        再接続・品質判定         ├ ModbusTcpClient
+ 管理UI        読み取り計画の実行       ├ SlmpClient (I2a)
+                                       └ シミュレータ（テスト用）
+```
+
+- **hub はドライバを直接呼ばない**: hub が見るのは `CurrentValuesHandle` と
+  `CollectEvent` だけ。プロトコルの違いは `PlcClient` trait の背後に隠れ、
+  banto-collect さえもワイヤプロトコルを知らない
+- **ドライバの選択はデータ駆動**: I1 の `PlcConnection` が持つプロトコル種別・
+  接続設定から `build_config` がスナップショットを作り、接続毎タスクが
+  対応するクライアント実装を起動する（FA-Server で Unit がドライバを
+  選ぶのと同じ構図）
+- **役割分担は既存設計のまま**: banto-plc は読み取り専用・一括読み・
+  再接続なし（アドレスパース・読み取り計画・デコードは純関数）。再接続
+  ループ・バックオフ・品質判定は banto-collect の責務。書き込みは別クレート
+  `banto-plc-write`（I5）の `PlcWriteClient` trait で、T2 で broker（I6）が
+  読み書きを単一セッションに直列化する
+- **対応プロトコルの拡張**: 新メーカー対応（例: オムロン FINS）は
+  banto-plc への trait 実装追加 + I1 のプロトコル種別追加であり、hub 側の
+  変更は不要。追加すれば ChronoGazer / relay-wright にも同時に行き渡る
+  （ドライバはアプリ資産でなく I 系共有資産）。FA-Server の「100機種」に
+  対する現在の対応は Modbus TCP / MELSEC SLMP の2系統 + シミュレータ
+
+### 3.5 スレッド/タスク構造
 
 ```
 main ──┬── Collector（banto-collect: PLC接続毎に1タスク、既存設計のまま）
