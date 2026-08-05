@@ -184,7 +184,11 @@ impl SlmpDevice {
 /// MELSEC capability, deliberately left as configuration rather than modelled,
 /// because nothing in recorder-requirements.md asks for it and a wrong value
 /// here fails loudly (the CPU rejects the frame) rather than silently.
-#[derive(Debug, Clone)]
+/// `PartialEq` (T7-1, docs/tag-server-design.md §4.3): same reasoning as
+/// [`crate::modbus::ModbusTcpConfig`]'s derive - lets `banto-collect` diff a
+/// connection's config across a config reload. No `f64` field here either,
+/// so the derived structural comparison is exact.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SlmpConfig {
     pub host: String,
     /// No universal default exists: SLMP's port is whatever the Ethernet

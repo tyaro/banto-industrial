@@ -69,7 +69,13 @@ pub(crate) enum Protocol {
 /// [`crate::collector::Collector::start`]'s per-option-timeout override
 /// (`connect_timeout`/`response_timeout`) has one `match` to update instead
 /// of two independently-fallible `Option` unwraps.
-#[derive(Debug, Clone)]
+/// `PartialEq` (T7-1, docs/tag-server-design.md §4.3): built from
+/// [`ModbusTcpConfig`]/[`SlmpConfig`]'s own derives, so two connections'
+/// protocol configs compare structurally - the building block
+/// [`crate::collector::Collector::apply_config`] uses to tell "this
+/// connection's settings changed" from "byte-for-byte identical, leave its
+/// task alone".
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ProtocolConfig {
     ModbusTcp(ModbusTcpConfig),
     Slmp(SlmpConfig),
@@ -97,7 +103,11 @@ impl Thresholds {
 /// Everything a collection task needs about one tag, resolved once at
 /// build time so the hot loop never re-parses an address or re-validates a
 /// scaling.
-#[derive(Debug, Clone)]
+/// `PartialEq` (T7-1, docs/tag-server-design.md §4.3): [`Scaling`] and
+/// [`Thresholds`] are already structurally comparable, so this derive is
+/// exact - part of the [`crate::collector::Collector::apply_config`] diff
+/// chain (`TagPlan` -> [`GroupPlan`] -> [`ConnectionPlan`]).
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TagPlan {
     pub key: String,
     /// `None` = no scaling (raw passes through); applied via
@@ -112,7 +122,15 @@ pub(crate) struct TagPlan {
 }
 
 /// One collection group: a shared-period batch read against its connection.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` (T7-1, docs/tag-server-design.md §4.3): compares `requests`
+/// (already `PartialEq`/`Eq` on [`ReadRequest`]) and `tags` positionally, so
+/// two `GroupPlan`s are equal iff every wire read and every resolved tag
+/// (scaling, thresholds) is identical - any address/type/scaling/threshold
+/// edit inside a group makes its owning [`ConnectionPlan`] compare unequal,
+/// which is exactly the "this connection changed" signal
+/// [`crate::collector::Collector::apply_config`] diffs on.
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct GroupPlan {
     pub key: String,
     pub period: Duration,
@@ -124,7 +142,18 @@ pub(crate) struct GroupPlan {
 }
 
 /// One PLC connection and the groups collected over its single socket.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` (T7-1, docs/tag-server-design.md §4.3): the load-bearing
+/// derive for [`crate::collector::Collector::apply_config`]'s diff - two
+/// `ConnectionPlan`s with the same `key` compare equal iff their protocol
+/// config *and* every group/tag are identical, which is precisely "nothing
+/// about this connection's task needs to change". A `ProtocolConfig`-only
+/// difference (host/port edited, same groups/tags) still compares unequal
+/// here, so the connection is classified "replaced" even though the derived
+/// `StoreConfig` (schema) is unaffected - see `apply_config`'s doc comment
+/// for why those two facts (connection replaced vs. writer rotated) are
+/// deliberately independent.
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ConnectionPlan {
     pub key: String,
     pub config: ProtocolConfig,
@@ -135,7 +164,13 @@ pub(crate) struct ConnectionPlan {
 /// Opaque by design: build it with [`build_config`] and hand it to `start`;
 /// its internals (the per-connection plans and the derived tstore
 /// [`StoreConfig`]) are this crate's concern.
-#[derive(Debug, Clone)]
+/// `PartialEq` (T7-1, docs/tag-server-design.md §4.3): a convenience derive
+/// over the now-`PartialEq` `ConnectionPlan`/`StoreConfig` fields -
+/// [`crate::collector::Collector::apply_config`] itself diffs
+/// connection-by-connection (see `ConnectionPlan`'s doc comment) rather than
+/// comparing whole configs, but this derive costs nothing and lets tests
+/// assert "the applied config is exactly X" directly.
+#[derive(Debug, Clone, PartialEq)]
 pub struct CollectorConfig {
     pub(crate) connections: Vec<ConnectionPlan>,
     /// The frozen-schema store shape derived from the same filtered group/tag

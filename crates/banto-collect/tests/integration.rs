@@ -20,7 +20,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use banto_collect::{
-    build_config, BackoffConfig, Collector, CollectorOptions, ConnectionStatus, EventSink, Quality,
+    build_config, default_client_factory, BackoffConfig, CollectError, Collector, CollectorOptions,
+    ConnectionStatus, EventSink, Quality,
 };
 use banto_plc::modbus::simulator::Simulator;
 use banto_plc::slmp::address::SlmpDevice;
@@ -1284,4 +1285,664 @@ async fn long_soak_sixty_seconds() {
     );
     // No unexpected gaps: every recorded value is the configured register.
     assert!(rows.iter().filter_map(|r| r.values[0]).all(|v| v == 1.0));
+}
+
+// ---------------------------------------------------------------------------
+// T7-1 (docs/tag-server-design.md §4.3): online partial reconfiguration -
+// `Collector::apply_config`. Every test below drives the real engine (real
+// sockets, real `Collector::start`) and proves the core claim: the influence
+// radius of a config change is exactly the connections that changed - an
+// unchanged connection's task is never restarted and never loses a tick, no
+// matter what else in the config changes around it.
+// ---------------------------------------------------------------------------
+
+async fn count_events_for_connection(pool: &SqlitePool, kind: &str, conn_key: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM collect_events WHERE kind = ? AND connection_key = ?")
+        .bind(kind)
+        .bind(conn_key)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0)
+}
+
+/// One connection (A), one group, one `i16` tag on its own simulator -
+/// already running under a `Collector`. The minimal fixture for the
+/// "connection added" test.
+struct OneConnEnv {
+    env: TempEnv,
+    pool: SqlitePool,
+    sim_a: Simulator,
+    group_a_id: i64,
+    conn_a_key: String,
+    tag_a_key: String,
+    collector: Collector,
+}
+
+async fn one_conn_setup(label: &str) -> OneConnEnv {
+    let env = TempEnv::new(label);
+    let sim_a = Simulator::start().await;
+    sim_a.set_holding_register(0, 11);
+
+    let pool = open_registry(&env).await;
+    let conn_a = PlcConnectionService::new(pool.clone())
+        .create(conn_input("A", sim_a.addr.port()))
+        .await
+        .unwrap();
+    let group_a = CollectionGroupService::new(pool.clone())
+        .create(group_input("Ga", conn_a.id, 100))
+        .await
+        .unwrap();
+    let tag_a = TagService::new(pool.clone())
+        .create(tag_input("t1", group_a.id, "40001", "i16"))
+        .await
+        .unwrap();
+
+    let config = build_config(&pool).await.unwrap();
+    let collector = Collector::start(
+        config,
+        &env.data_dir(),
+        Arc::new(SystemClock),
+        EventSink::new(pool.clone()),
+        fast_options(),
+    )
+    .await
+    .unwrap();
+
+    let current = collector.current_values();
+    let tag_a_key = format!("tag:{}", tag_a.id);
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            current.get(&tag_a_key).map(|s| s.value) == Some(Some(11.0))
+        })
+        .await,
+        "A should read its initial value before any apply_config"
+    );
+
+    OneConnEnv {
+        env,
+        pool,
+        sim_a,
+        group_a_id: group_a.id,
+        conn_a_key: format!("conn:{}", conn_a.id),
+        tag_a_key,
+        collector,
+    }
+}
+
+/// Two independent connections (A/B), each one group with one `i16` tag on
+/// its own in-process Modbus simulator - already running under a
+/// `Collector`. The shared fixture for every T7-1 test that needs to prove
+/// "A never notices what happens to B".
+struct TwoConnEnv {
+    env: TempEnv,
+    pool: SqlitePool,
+    sim_a: Simulator,
+    sim_b: Simulator,
+    group_a_id: i64,
+    group_b_id: i64,
+    conn_b_id: i64,
+    tag_a_key: String,
+    tag_b_key: String,
+    conn_a_key: String,
+    conn_b_key: String,
+    collector: Collector,
+}
+
+async fn two_conn_setup(label: &str) -> TwoConnEnv {
+    let env = TempEnv::new(label);
+    let sim_a = Simulator::start().await;
+    let sim_b = Simulator::start().await;
+    sim_a.set_holding_register(0, 11);
+    sim_b.set_holding_register(0, 22);
+
+    let pool = open_registry(&env).await;
+    let conn_a = PlcConnectionService::new(pool.clone())
+        .create(conn_input("A", sim_a.addr.port()))
+        .await
+        .unwrap();
+    let group_a = CollectionGroupService::new(pool.clone())
+        .create(group_input("Ga", conn_a.id, 100))
+        .await
+        .unwrap();
+    let tag_a = TagService::new(pool.clone())
+        .create(tag_input("t1", group_a.id, "40001", "i16"))
+        .await
+        .unwrap();
+
+    let conn_b = PlcConnectionService::new(pool.clone())
+        .create(conn_input("B", sim_b.addr.port()))
+        .await
+        .unwrap();
+    let group_b = CollectionGroupService::new(pool.clone())
+        .create(group_input("Gb", conn_b.id, 100))
+        .await
+        .unwrap();
+    let tag_b = TagService::new(pool.clone())
+        // Tag names are unique registry-wide (not per-group - see
+        // banto-tags's own validation), so this cannot reuse A's "t1".
+        .create(tag_input("b1", group_b.id, "40001", "i16"))
+        .await
+        .unwrap();
+
+    let config = build_config(&pool).await.unwrap();
+    let collector = Collector::start(
+        config,
+        &env.data_dir(),
+        Arc::new(SystemClock),
+        EventSink::new(pool.clone()),
+        fast_options(),
+    )
+    .await
+    .unwrap();
+
+    let current = collector.current_values();
+    let tag_a_key = format!("tag:{}", tag_a.id);
+    let tag_b_key = format!("tag:{}", tag_b.id);
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            current.get(&tag_a_key).map(|s| s.value) == Some(Some(11.0))
+        })
+        .await,
+        "A should read its initial value before any apply_config"
+    );
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            current.get(&tag_b_key).map(|s| s.value) == Some(Some(22.0))
+        })
+        .await,
+        "B should read its initial value before any apply_config"
+    );
+
+    TwoConnEnv {
+        env,
+        pool,
+        sim_a,
+        sim_b,
+        group_a_id: group_a.id,
+        group_b_id: group_b.id,
+        conn_b_id: conn_b.id,
+        tag_a_key,
+        tag_b_key,
+        conn_a_key: format!("conn:{}", conn_a.id),
+        conn_b_key: format!("conn:{}", conn_b.id),
+        collector,
+    }
+}
+
+/// Test 1 (task instructions §テスト-1): "無停止の実証" - while A/B both run,
+/// adding a tag to B's existing group must not touch A's task at all: no
+/// `plc_connected`/`plc_disconnected` event for A, and A's cache keeps
+/// advancing throughout. B ends up collecting the new tag too, and the
+/// writer rotates (the aggregate collected tag set changed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn apply_config_adding_a_tag_to_b_never_restarts_a() {
+    let mut setup = two_conn_setup("apply-no-restart").await;
+    let current = setup.collector.current_values();
+
+    let a_connected_before =
+        count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_a_key).await;
+    assert_eq!(
+        a_connected_before, 1,
+        "A should have connected exactly once so far"
+    );
+    let a_ptime_before = current.get(&setup.tag_a_key).unwrap().ptime_ms;
+
+    // Add a second tag to B's existing group.
+    setup.sim_b.set_holding_register(1, 99);
+    let tag_b2 = TagService::new(setup.pool.clone())
+        .create(tag_input("t2", setup.group_b_id, "40002", "i16"))
+        .await
+        .unwrap();
+    let tag_b2_key = format!("tag:{}", tag_b2.id);
+
+    let new_config = build_config(&setup.pool).await.unwrap();
+    let report = setup
+        .collector
+        .apply_config(new_config, default_client_factory())
+        .await
+        .expect("apply_config should succeed");
+
+    assert!(
+        report.writer_rotated,
+        "the collected tag set changed, so the writer must rotate"
+    );
+    assert!(
+        report.unchanged.contains(&setup.conn_a_key),
+        "A's plan did not change, so it must be classified unchanged: {report:?}"
+    );
+    assert!(
+        !report.removed.contains(&setup.conn_a_key) && !report.replaced.contains(&setup.conn_a_key),
+        "A must never be stopped/replaced by a change scoped to B: {report:?}"
+    );
+
+    // A must keep ticking with no reconnect anywhere in its history.
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            current.get(&setup.tag_a_key).map(|s| s.ptime_ms) > Some(a_ptime_before)
+        })
+        .await,
+        "A's cache should keep advancing after apply_config"
+    );
+    assert_eq!(
+        count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_a_key).await,
+        a_connected_before,
+        "A must not have reconnected - its task was never touched"
+    );
+    assert_eq!(
+        count_events_for_connection(&setup.pool, "plc_disconnected", &setup.conn_a_key).await,
+        0,
+        "A must never have disconnected"
+    );
+
+    // B collects the new tag too.
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            current.get(&tag_b2_key).map(|s| s.value) == Some(Some(99.0))
+        })
+        .await,
+        "B should collect its newly added tag"
+    );
+
+    setup.collector.stop().await.unwrap();
+    setup.sim_a.stop();
+    setup.sim_b.stop();
+}
+
+/// Test 2 (task instructions §テスト-2): adding a brand-new connection must
+/// not disturb an already-running one, and the new connection starts
+/// collecting with `report.added` naming it and the writer rotating (a whole
+/// new group appeared).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn apply_config_adding_a_connection_leaves_the_existing_one_untouched() {
+    let mut setup = one_conn_setup("apply-add-connection").await;
+    let current = setup.collector.current_values();
+
+    let a_connected_before =
+        count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_a_key).await;
+    let a_ptime_before = current.get(&setup.tag_a_key).unwrap().ptime_ms;
+
+    let sim_b = Simulator::start().await;
+    sim_b.set_holding_register(0, 33);
+    let conn_b = PlcConnectionService::new(setup.pool.clone())
+        .create(conn_input("B", sim_b.addr.port()))
+        .await
+        .unwrap();
+    let group_b = CollectionGroupService::new(setup.pool.clone())
+        .create(group_input("Gb", conn_b.id, 100))
+        .await
+        .unwrap();
+    let tag_b = TagService::new(setup.pool.clone())
+        // Registry-wide unique tag name - A already owns "t1".
+        .create(tag_input("b1", group_b.id, "40001", "i16"))
+        .await
+        .unwrap();
+    let tag_b_key = format!("tag:{}", tag_b.id);
+    let conn_b_key = format!("conn:{}", conn_b.id);
+
+    let new_config = build_config(&setup.pool).await.unwrap();
+    let report = setup
+        .collector
+        .apply_config(new_config, default_client_factory())
+        .await
+        .expect("apply_config should succeed");
+
+    assert!(report.writer_rotated, "a whole new group appeared");
+    assert!(
+        report.added.contains(&conn_b_key),
+        "B should be classified added: {report:?}"
+    );
+    assert!(
+        report.unchanged.contains(&setup.conn_a_key),
+        "A should be classified unchanged: {report:?}"
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            current.get(&setup.tag_a_key).map(|s| s.ptime_ms) > Some(a_ptime_before)
+        })
+        .await,
+        "A should keep ticking"
+    );
+    assert_eq!(
+        count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_a_key).await,
+        a_connected_before,
+        "A must not have reconnected"
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            current.get(&tag_b_key).map(|s| s.value) == Some(Some(33.0))
+        })
+        .await,
+        "the newly added connection B should start collecting"
+    );
+
+    setup.collector.stop().await.unwrap();
+    setup.sim_a.stop();
+    sim_b.stop();
+}
+
+/// Test 3 (task instructions §テスト-3): disabling (removing from the
+/// collected set) a connection must stop only its task and clean up after
+/// it - `retain` removes its tag(s) from the current-value snapshot and its
+/// key from the status map - while leaving the other connection untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn apply_config_removing_a_connection_retains_the_rest() {
+    let mut setup = two_conn_setup("apply-remove-connection").await;
+    let current = setup.collector.current_values();
+
+    let a_connected_before =
+        count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_a_key).await;
+    let a_ptime_before = current.get(&setup.tag_a_key).unwrap().ptime_ms;
+
+    // Disable B - build_config excludes it exactly like a deletion would.
+    let mut disabled = conn_input("B", 1); // port irrelevant once disabled
+    disabled.enabled = false;
+    PlcConnectionService::new(setup.pool.clone())
+        .update(setup.conn_b_id, disabled)
+        .await
+        .unwrap();
+
+    let new_config = build_config(&setup.pool).await.unwrap();
+    let report = setup
+        .collector
+        .apply_config(new_config, default_client_factory())
+        .await
+        .expect("apply_config should succeed");
+
+    assert!(
+        report.removed.contains(&setup.conn_b_key),
+        "B should be classified removed: {report:?}"
+    );
+    assert!(
+        report.unchanged.contains(&setup.conn_a_key),
+        "A should be classified unchanged: {report:?}"
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            current.get(&setup.tag_a_key).map(|s| s.ptime_ms) > Some(a_ptime_before)
+        })
+        .await,
+        "A should keep ticking"
+    );
+    assert_eq!(
+        count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_a_key).await,
+        a_connected_before,
+        "A must not have reconnected"
+    );
+
+    // B's tag must be gone from the snapshot (retain) and B's key gone from
+    // status (retain_status) - both checked a moment later so a
+    // just-removed task has had time to actually join.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !current.snapshot().contains_key(&setup.tag_b_key),
+        "B's tag must be retained out of the current-value cache"
+    );
+    assert!(
+        !setup.collector.status().contains_key(&setup.conn_b_key),
+        "B's connection must be retained out of the status map"
+    );
+
+    setup.collector.stop().await.unwrap();
+    setup.sim_a.stop();
+    setup.sim_b.stop();
+}
+
+/// Test 4 (task instructions §テスト-4): a settings-only edit to a
+/// connection (its target port, standing in for "host changed" - same
+/// `ProtocolConfig` field) must replace only that connection's task, with
+/// **no** writer rotation (the collected tag/group set is byte-for-byte the
+/// same), and must leave every other connection untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn apply_config_settings_only_change_does_not_rotate_the_writer() {
+    let mut setup = two_conn_setup("apply-settings-only").await;
+    let current = setup.collector.current_values();
+
+    let a_connected_before =
+        count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_a_key).await;
+    let a_ptime_before = current.get(&setup.tag_a_key).unwrap().ptime_ms;
+
+    // Point B at a *different* simulator instance (same group/tag shape) -
+    // the connection-settings-only edit this test is about.
+    let sim_b2 = Simulator::start().await;
+    sim_b2.set_holding_register(0, 77);
+    let mut moved = conn_input("B", sim_b2.addr.port());
+    moved.name = "B".to_string();
+    PlcConnectionService::new(setup.pool.clone())
+        .update(setup.conn_b_id, moved)
+        .await
+        .unwrap();
+
+    let new_config = build_config(&setup.pool).await.unwrap();
+    let report = setup
+        .collector
+        .apply_config(new_config, default_client_factory())
+        .await
+        .expect("apply_config should succeed");
+
+    assert!(
+        !report.writer_rotated,
+        "a host/port-only change must not rotate the writer: {report:?}"
+    );
+    assert!(
+        report.replaced.contains(&setup.conn_b_key),
+        "B's protocol config changed, so it must be classified replaced: {report:?}"
+    );
+    assert!(
+        report.unchanged.contains(&setup.conn_a_key),
+        "A should be classified unchanged: {report:?}"
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            current.get(&setup.tag_a_key).map(|s| s.ptime_ms) > Some(a_ptime_before)
+        })
+        .await,
+        "A should keep ticking"
+    );
+    assert_eq!(
+        count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_a_key).await,
+        a_connected_before,
+        "A must not have reconnected"
+    );
+
+    // B must actually be talking to the *new* target now.
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            current.get(&setup.tag_b_key).map(|s| s.value) == Some(Some(77.0))
+        })
+        .await,
+        "B should now read from the new target simulator"
+    );
+
+    setup.collector.stop().await.unwrap();
+    setup.sim_a.stop();
+    setup.sim_b.stop();
+    sim_b2.stop();
+}
+
+/// Test 5 (task instructions §テスト-5): if opening the rotated writer fails,
+/// `apply_config` must return `Err` with absolutely nothing changed - no task
+/// stopped, no config adopted, the old writer still the live one. Forced by
+/// pre-creating a *directory* at the exact path the rotation would try to
+/// open as a SQLite file (a type mismatch that fails regardless of process
+/// privilege, unlike a permission-based sabotage).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn apply_config_writer_open_failure_is_all_or_nothing() {
+    let mut setup = two_conn_setup("apply-writer-open-fail").await;
+    let current = setup.collector.current_values();
+
+    let a_connected_before =
+        count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_a_key).await;
+    let b_connected_before =
+        count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_b_key).await;
+
+    // Sabotage the exact path the next rotation would try to open.
+    let files = banto_tstore::list_data_files(&setup.env.data_dir()).unwrap();
+    assert_eq!(files.len(), 1, "exactly one file before any apply_config");
+    let sabotage_name = format!(
+        "{}-{:03}.sqlite3",
+        files[0].date.to_yyyymmdd(),
+        files[0].seq + 1
+    );
+    let sabotage_path = setup.env.data_dir().join(&sabotage_name);
+    std::fs::create_dir(&sabotage_path).expect("create sabotage directory");
+
+    // A change that requires a writer rotation (a new tag on A's group).
+    setup.sim_a.set_holding_register(1, 55);
+    TagService::new(setup.pool.clone())
+        .create(tag_input("t2", setup.group_a_id, "40002", "i16"))
+        .await
+        .unwrap();
+    let failing_config = build_config(&setup.pool).await.unwrap();
+
+    let err = setup
+        .collector
+        .apply_config(failing_config, default_client_factory())
+        .await
+        .expect_err("opening the rotated writer must fail");
+    assert!(
+        matches!(err, CollectError::Tstore(_)),
+        "expected a Tstore error, got {err:?}"
+    );
+
+    // Nothing must have changed: no reconnects, both connections still
+    // ticking on their original tasks.
+    assert_eq!(
+        count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_a_key).await,
+        a_connected_before,
+        "A must be completely untouched by the failed apply_config"
+    );
+    assert_eq!(
+        count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_b_key).await,
+        b_connected_before,
+        "B must be completely untouched by the failed apply_config"
+    );
+    let a_ptime_after_failure = current.get(&setup.tag_a_key).unwrap().ptime_ms;
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            current.get(&setup.tag_a_key).map(|s| s.ptime_ms) > Some(a_ptime_after_failure)
+        })
+        .await,
+        "A should still be collecting normally after the failed apply_config"
+    );
+
+    // Remove the sabotage and retry with a freshly built config - the
+    // collector must still be in a perfectly usable state.
+    std::fs::remove_dir(&sabotage_path).expect("remove sabotage directory");
+    let retry_config = build_config(&setup.pool).await.unwrap();
+    let report = setup
+        .collector
+        .apply_config(retry_config, default_client_factory())
+        .await
+        .expect("retry after removing the sabotage should succeed");
+    assert!(report.writer_rotated);
+    assert_eq!(
+        count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_a_key).await,
+        a_connected_before,
+        "A must still never have reconnected, even across the failed + retried apply_config"
+    );
+
+    setup.collector.stop().await.unwrap();
+    setup.sim_a.stop();
+    setup.sim_b.stop();
+}
+
+/// Test 6 (task instructions §テスト-6): after a writer rotation, the old
+/// file must hold exactly what was flushed before rotation (nothing lost),
+/// and the new file must hold real rows for the newly-added group (nothing
+/// silently swallowed by the "unknown group" path - constraint 3 in the
+/// task instructions: the writer must be distributed before the new task is
+/// spawned).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn apply_config_writer_rotation_preserves_old_and_new_data() {
+    let mut setup = one_conn_setup("apply-rotation-integrity").await;
+
+    // Let a few real rows land on A before rotating.
+    let current = setup.collector.current_values();
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            current.get(&setup.tag_a_key).map(|s| s.value) == Some(Some(11.0))
+        })
+        .await
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let sim_b = Simulator::start().await;
+    sim_b.set_holding_register(0, 66);
+    let conn_b = PlcConnectionService::new(setup.pool.clone())
+        .create(conn_input("B", sim_b.addr.port()))
+        .await
+        .unwrap();
+    let group_b = CollectionGroupService::new(setup.pool.clone())
+        .create(group_input("Gb", conn_b.id, 100))
+        .await
+        .unwrap();
+    let tag_b = TagService::new(setup.pool.clone())
+        // Registry-wide unique tag name - A already owns "t1".
+        .create(tag_input("b1", group_b.id, "40001", "i16"))
+        .await
+        .unwrap();
+    let group_b_key = format!("grp:{}", group_b.id);
+    let tag_b_key = format!("tag:{}", tag_b.id);
+
+    let new_config = build_config(&setup.pool).await.unwrap();
+    let report = setup
+        .collector
+        .apply_config(new_config, default_client_factory())
+        .await
+        .expect("apply_config should succeed");
+    assert!(report.writer_rotated);
+
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            current.get(&tag_b_key).map(|s| s.value) == Some(Some(66.0))
+        })
+        .await,
+        "B should collect real values into the rotated file"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    setup.collector.stop().await.unwrap();
+    setup.sim_a.stop();
+    sim_b.stop();
+
+    let files = banto_tstore::list_data_files(&setup.env.data_dir()).unwrap();
+    assert_eq!(
+        files.len(),
+        2,
+        "the rotation should have produced a second file"
+    );
+    assert_eq!(files[0].seq, 1);
+    assert_eq!(files[1].seq, 2);
+
+    // Old file: A's pre-rotation rows must still be there (flushed, not
+    // lost - this is the file that was open before rotation).
+    let old_group_a_key = format!("grp:{}", setup.group_a_id);
+    let old_reader = TsReader::open(&files[0].path).await.unwrap();
+    let old_rows = old_reader
+        .read_range(&old_group_a_key, 0, i64::MAX)
+        .await
+        .unwrap();
+    assert!(
+        old_rows.iter().any(|r| r.values[0] == Some(11.0)),
+        "the pre-rotation file should retain A's real values"
+    );
+
+    // New file: B's group must have real rows recorded after rotation.
+    let new_reader = TsReader::open(&files[1].path).await.unwrap();
+    assert!(
+        new_reader.groups().iter().any(|g| g.key == group_b_key),
+        "the rotated file should describe B's new group"
+    );
+    let new_rows = new_reader
+        .read_range(&group_b_key, 0, i64::MAX)
+        .await
+        .unwrap();
+    assert!(
+        new_rows.iter().any(|r| r.values[0] == Some(66.0)),
+        "the rotated file should hold B's real recorded value"
+    );
 }

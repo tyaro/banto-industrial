@@ -21,7 +21,7 @@
 //! sections inside the collection tasks - an async lock would buy nothing and
 //! force every reader to be async.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use banto_tstore::Clock;
@@ -168,6 +168,21 @@ impl CurrentValuesHandle {
             .map(|(k, entry)| (k.clone(), Self::derive(entry, now_ms)))
             .collect()
     }
+
+    /// Drop every cached entry whose key is not in `keys` (T7-1,
+    /// docs/tag-server-design.md §4.3: after [`crate::collector::Collector::apply_config`]
+    /// adopts a new config, a tag removed from the registry - or one whose
+    /// owning connection was removed - must not linger in the snapshot
+    /// forever with a slowly-staling last value). Keys are `tag_key`s
+    /// (`"tag:<id>"`), the same identity `Self::set`/[`Self::get`] use.
+    /// One write-lock pass, same cost class as a single `Self::set` call.
+    pub fn retain(&self, keys: &HashSet<String>) {
+        let mut map = self
+            .map
+            .write()
+            .expect("current-value cache lock poisoned (a writer panicked)");
+        map.retain(|k, _| keys.contains(k));
+    }
 }
 
 #[cfg(test)]
@@ -237,6 +252,19 @@ mod tests {
         assert_eq!(snap["fresh"].quality, Quality::Stale);
         assert_eq!(snap["old"].quality, Quality::Stale);
         assert_eq!(snap["bad"].quality, Quality::Bad);
+    }
+
+    #[test]
+    fn retain_drops_entries_not_in_the_given_key_set() {
+        let (handle, _clock) = handle_at(0);
+        handle.set("keep", Some(1.0), 0, Quality::Good, 1_000);
+        handle.set("drop", Some(2.0), 0, Quality::Good, 1_000);
+
+        let keep: std::collections::HashSet<String> = ["keep".to_string()].into_iter().collect();
+        handle.retain(&keep);
+
+        assert!(handle.get("keep").is_some());
+        assert!(handle.get("drop").is_none());
     }
 
     #[test]

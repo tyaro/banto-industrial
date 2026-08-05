@@ -49,7 +49,14 @@ use frame::{
 };
 
 /// Everything needed to reach and speak to one Modbus TCP device.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` (T7-1, docs/tag-server-design.md §4.3): lets `banto-collect`
+/// diff a connection's config across a config reload (`Collector::apply_config`)
+/// to tell "settings-only change" (host/port edited, same tags/groups - the
+/// writer stays open) from "no change at all" (skip the connection's task
+/// entirely). `f64` appears nowhere in this struct, so a derived structural
+/// `PartialEq` is exact, not an approximation.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModbusTcpConfig {
     pub host: String,
     pub port: u16,

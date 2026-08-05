@@ -3,9 +3,118 @@
 //! current-value cache, per-connection status, and the live event stream -
 //! plus a clean [`Collector::stop`] that drains every task and flushes the
 //! writer so no buffered row is lost.
+//!
+//! ## T7-1: online partial reconfiguration (docs/tag-server-design.md §4.3)
+//!
+//! > 実現の土台は現行アーキテクチャに既にある: `banto-collect` は**接続毎に
+//! > 1タスク**なので、(c) の「接続単位の入れ替え」は自然な粒度。必要なのは
+//! > Collector 全体でなく**接続単位の部分再構成 API**... 適用は**編集
+//! > トランザクション単位の all-or-nothing**: 検証を通った変更だけが
+//! > revision を進める。中途半端な構成が外部へ見える瞬間を作らない。
+//!
+//! [`Collector::apply_config`] is that API. Its contract is "the influence
+//! radius of a config change is exactly the connections that changed" - an
+//! unchanged connection's task is never stopped, never respawned, and its
+//! collection never so much as blips, no matter what else in the config
+//! changed. Three structural changes make that possible, each mirroring a
+//! constraint discovered while auditing the pre-T7-1 code (see this task's
+//! completion report for the full derivation):
+//!
+//! 1. **Per-connection stop, not a shared one.** `Collector::tasks`
+//!    is keyed by connection key, each entry owning its own
+//!    `watch::Sender<bool>` - stopping connection B can never touch A's
+//!    channel. [`Collector::stop`] simply signals and joins every entry.
+//! 2. **The writer is a `watch` channel, not a bare `Arc`.** Every task holds
+//!    a `watch::Receiver<Arc<TsWriter>>` (via `TaskContext::writer_rx`) and
+//!    re-borrows it fresh on every append (`task.rs::record_group`) instead
+//!    of caching the `Arc` for its lifetime. This is what lets `apply_config`
+//!    rotate the writer - which it must do whenever the *aggregate* collected
+//!    tag/group set changes, because `banto-tstore`'s frozen-schema design
+//!    means any such change needs a new file - **without stopping a single
+//!    task**: every live task (changed or not) simply starts writing to the
+//!    new file on its very next tick.
+//! 3. **`Collector` retains the [`CollectorConfig`] it is currently running**,
+//!    so a later `apply_config` call has something to diff the caller's new
+//!    snapshot against. The stored config is the *pristine* one the caller
+//!    passed in - never the per-run [`CollectorOptions`] timeout overrides
+//!    `plan_for_task` bakes into the plan a task actually runs with. Baking
+//!    those in before storing would make an otherwise-untouched connection
+//!    compare unequal on the next call (a freshly rebuilt `CollectorConfig`
+//!    never carries them), spuriously reclassifying it as "changed" and
+//!    defeating the entire point of the diff.
+//!
+//! ### Why the steps inside `apply_config` run in this exact order
+//!
+//! 1. **Diff first** (pure, no side effects) - classifies every connection
+//!    key into added/removed/replaced/unchanged by comparing
+//!    `crate::config::ConnectionPlan` equality (now `PartialEq` end to end
+//!    - see `config.rs`).
+//! 2. **Open the new writer, if needed, before touching anything else.**
+//!    This is the all-or-nothing anchor: `TsWriter::open_with_options` either
+//!    succeeds (and every later step proceeds) or fails and returns `Err`
+//!    immediately, with not one task stopped and `self.config` untouched -
+//!    the caller sees the collector in exactly the state it was in before
+//!    calling. Every step after this point is expected to succeed (stopping
+//!    an already-running task, spawning a new one) and is not wrapped in the
+//!    same "roll everything back on failure" discipline; the design's
+//!    all-or-nothing guarantee is specifically about the storage-schema
+//!    commit point, not the whole operation being transactional in the
+//!    database-ACID sense.
+//! 3. **Stop and join removed/replaced connections' tasks.** Done before the
+//!    writer is redistributed so that a connection whose *plan* changed
+//!    never gets a chance to read stale data with its old task.
+//! 4. **Distribute the new writer, then retire the old one.** Must happen
+//!    *before* step 5 (spawning new tasks): `TsWriter::append`'s
+//!    unknown-group error is silently swallowed by the hot loop
+//!    (`task.rs::record_group`), so a newly spawned task reading a brand-new
+//!    group must never see the *old* writer, which has no schema for that
+//!    group at all - every row it tried to write would vanish with no error
+//!    surfaced anywhere. Retiring the old writer reuses `stop`'s own
+//!    `Arc::try_unwrap`-or-flush fallback (`close_or_flush_writer`): an
+//!    unchanged connection may be mid-append on the old writer at the exact
+//!    moment of rotation, so failing to get sole ownership here is an
+//!    expected occasional outcome, not a bug - either branch guarantees no
+//!    buffered row is silently dropped, which is the invariant that matters.
+//! 5. **Spawn tasks for added/replaced connections** - now guaranteed to
+//!    subscribe to a writer that already knows about every group they read.
+//! 6. **`retain` the current-value cache and status map** down to the new
+//!    config's live tag/connection keys, so a removed tag or connection does
+//!    not linger forever with a slowly-staling last-known value.
+//! 7. **Adopt `new_config` as `self.config`** - the point of no return, done
+//!    last so every earlier step could still consult the *old* config.
+//!
+//! Deliberately unchanged connections are never touched by any of steps
+//! 2-6 above other than the writer broadcast in step 4, which they observe
+//! passively (re-borrowing on their own next tick) - this is the whole
+//! mechanism that keeps their collection running without interruption.
+//!
+//! ### Why no `collection_started`/`collection_stopped` event
+//!
+//! Those two [`EventKind`] variants mean "the whole engine started/stopped"
+//! (docs/recorder-requirements.md §3.5) - `apply_config` is neither; it is a
+//! reconfiguration of a collector that is already running and remains
+//! running. Emitting either would mislead a UI/audit log into thinking
+//! collection paused. The connection-scoped lifecycle events
+//! (`plc_connected`/`plc_disconnected`/`plc_reconnected`) still flow
+//! naturally from whichever tasks actually get spawned/stopped - those are a
+//! true per-connection fact, not a synthetic signal this method needs to
+//! fabricate.
+//!
+//! ### The empty-config case
+//!
+//! `apply_config` never rejects `new_config.connections.is_empty()` as an
+//! error the way [`Collector::start_with_client_factory`] does - a running
+//! collector must be able to shrink to nothing without the caller having to
+//! special-case "was this the last connection, so call `stop()` instead".
+//! Every existing task is classified `removed` and stopped/joined normally;
+//! no new writer is opened (there is nothing to open one *for* - a
+//! `StoreConfig` with zero groups fails `TsWriter`'s own validation, and
+//! rightly so), and the still-open writer is flushed (not closed - the
+//! collector may still be `apply_config`'d back to a non-empty state later)
+//! once no task remains to trigger a flush on its own.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -13,13 +122,13 @@ use banto_tstore::{Clock, TsWriter, WriterOptions};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
-use crate::config::{CollectorConfig, ProtocolConfig};
+use crate::config::{CollectorConfig, ConnectionPlan, ProtocolConfig};
 use crate::current::CurrentValuesHandle;
 use crate::error::CollectError;
 use crate::event::{CollectEvent, EventKind, EventSink};
 use crate::task::{
-    default_client_factory, run_connection, BackoffConfig, ClientFactory, ConnectionStatus,
-    StatusMap, TaskContext,
+    default_client_factory, retain_status, run_connection, BackoffConfig, ClientFactory,
+    ConnectionStatus, StatusMap, TaskContext,
 };
 
 /// Tunables for [`Collector::start`]. `Default` matches the product defaults
@@ -49,19 +158,66 @@ impl Default for CollectorOptions {
     }
 }
 
+/// One running connection's task handle plus the stop channel that only it
+/// listens to (T7-1: replaces the old single collector-wide `stop_tx`, which
+/// made a connection-scoped stop structurally impossible).
+struct ConnectionTask {
+    handle: JoinHandle<()>,
+    stop_tx: watch::Sender<bool>,
+}
+
+/// What changed in one [`Collector::apply_config`] call - connection keys
+/// grouped by how they were classified, plus whether the tstore writer
+/// rotated to a new file. Every `Vec<String>` is sorted for deterministic
+/// assertions in tests and stable logging.
+#[derive(Debug, Clone, Default)]
+pub struct ApplyReport {
+    /// Connection keys present in the new config but not the old one - a new
+    /// task was spawned for each.
+    pub added: Vec<String>,
+    /// Connection keys present in the old config but not the new one - each
+    /// had its task stopped and joined.
+    pub removed: Vec<String>,
+    /// Connection keys present in both, but whose `crate::config::ConnectionPlan`
+    /// differs (protocol config and/or groups/tags) - each had its old task
+    /// stopped and joined, then a fresh task spawned from the new plan.
+    pub replaced: Vec<String>,
+    /// Connection keys present in both configs with byte-for-byte identical
+    /// plans - their tasks were never touched.
+    pub unchanged: Vec<String>,
+    /// Whether the collected tag/group set changed enough to require a fresh
+    /// `banto-tstore` file (a new `TsWriter` was opened and distributed via
+    /// [`Collector`]'s writer `watch` channel). Independent of the
+    /// added/removed/replaced/unchanged classification above - see
+    /// `apply_config`'s doc comment (settings-only connection edits, e.g. a
+    /// host/port change, replace the connection but never rotate the
+    /// writer).
+    pub writer_rotated: bool,
+}
+
 /// A running collection engine. Self-driving after [`Collector::start`]
 /// (recorder-requirements.md §4: runs independently of the UI); hold it for
 /// the process lifetime and call [`Collector::stop`] to shut down cleanly.
 pub struct Collector {
-    // `Option` so `stop` can take sole ownership of the writer Arc to close
-    // it (every task holds a clone until it exits).
-    writer: Option<Arc<TsWriter>>,
+    /// The live writer, broadcast to every connection task (T7-1: see this
+    /// module's doc comment for why a `watch` channel rather than a bare
+    /// `Arc<TsWriter>` field).
+    writer_tx: watch::Sender<Arc<TsWriter>>,
     current: CurrentValuesHandle,
     status: StatusMap,
     events: EventSink,
     clock: Arc<dyn Clock>,
-    stop_tx: watch::Sender<bool>,
-    tasks: Vec<JoinHandle<()>>,
+    /// Needed by [`Collector::apply_config`] to reopen a rotated writer at
+    /// the same location `start_with_client_factory` originally used.
+    data_dir: PathBuf,
+    /// Retained so `apply_config` can spawn added/replaced connections with
+    /// the exact same backoff/timeout/buffering tuning `start` was called
+    /// with, without the caller having to pass it again on every call.
+    options: CollectorOptions,
+    /// The pristine [`CollectorConfig`] currently applied - `apply_config`'s
+    /// diff base. "Pristine" matters: see this module's doc comment point 3.
+    config: CollectorConfig,
+    tasks: HashMap<String, ConnectionTask>,
 }
 
 impl Collector {
@@ -131,10 +287,10 @@ impl Collector {
             )
             .await?,
         );
+        let (writer_tx, _writer_rx) = watch::channel(writer);
 
         let current = CurrentValuesHandle::new(clock.clone());
         let status: StatusMap = Arc::new(RwLock::new(HashMap::new()));
-        let (stop_tx, stop_rx) = watch::channel(false);
 
         events
             .emit(CollectEvent::lifecycle(
@@ -143,24 +299,10 @@ impl Collector {
             ))
             .await;
 
-        let mut tasks = Vec::with_capacity(config.connections.len());
-        for mut plan in config.connections {
-            // Apply the option timeouts to this connection's client config -
-            // one match arm per protocol (I8: SLMP joins Modbus TCP), same
-            // uniform override either way.
-            match &mut plan.config {
-                ProtocolConfig::ModbusTcp(cfg) => {
-                    cfg.connect_timeout = options.connect_timeout;
-                    cfg.response_timeout = options.response_timeout;
-                }
-                ProtocolConfig::Slmp(cfg) => {
-                    cfg.connect_timeout = options.connect_timeout;
-                    cfg.response_timeout = options.response_timeout;
-                }
-            }
-
+        let mut tasks = HashMap::with_capacity(config.connections.len());
+        for plan in &config.connections {
             let ctx = TaskContext {
-                writer: writer.clone(),
+                writer_rx: writer_tx.subscribe(),
                 clock: clock.clone(),
                 current: current.clone(),
                 events: events.clone(),
@@ -168,18 +310,179 @@ impl Collector {
                 backoff: options.backoff,
                 factory: factory.clone(),
             };
-            let stop_rx = stop_rx.clone();
-            tasks.push(tokio::spawn(run_connection(plan, ctx, stop_rx)));
+            let (stop_tx, stop_rx) = watch::channel(false);
+            let handle = tokio::spawn(run_connection(plan_for_task(plan, &options), ctx, stop_rx));
+            tasks.insert(plan.key.clone(), ConnectionTask { handle, stop_tx });
         }
 
         Ok(Self {
-            writer: Some(writer),
+            writer_tx,
             current,
             status,
             events,
             clock,
-            stop_tx,
+            data_dir: data_dir.to_path_buf(),
+            options,
+            config,
             tasks,
+        })
+    }
+
+    /// Apply a new configuration to an already-running collector, touching
+    /// only what changed (T7-1, docs/tag-server-design.md §4.3 - "変更の
+    /// 影響半径 = 触ったものだけ"). See this module's doc comment for the full
+    /// safety derivation; in short:
+    ///
+    /// - An unchanged connection's task is never stopped or respawned, and
+    ///   never observes so much as a blip - not even if the tstore writer
+    ///   rotates underneath it.
+    /// - The tstore writer only rotates (a fresh file) when the *aggregate*
+    ///   collected tag/group set actually changes - a connection whose only
+    ///   edit is host/port (or any other setting that does not touch its
+    ///   groups/tags) is replaced without a writer rotation.
+    /// - Opening the new writer (when one is needed) is attempted *before*
+    ///   any task is touched, so a failure here (e.g. an unwritable
+    ///   `data_dir`) leaves the collector in exactly its prior state -
+    ///   `self.config` unchanged, every task still running, `Err` returned.
+    /// - `factory` is used only for tasks this call spawns (added/replaced
+    ///   connections); already-running unchanged tasks keep whatever factory
+    ///   they were originally spawned with.
+    pub async fn apply_config(
+        &mut self,
+        new_config: CollectorConfig,
+        factory: ClientFactory,
+    ) -> Result<ApplyReport, CollectError> {
+        // --- 1. Diff (pure - no side effects yet) ---------------------------
+        let current_map: HashMap<&str, &ConnectionPlan> = self
+            .config
+            .connections
+            .iter()
+            .map(|c| (c.key.as_str(), c))
+            .collect();
+        let new_map: HashMap<&str, &ConnectionPlan> = new_config
+            .connections
+            .iter()
+            .map(|c| (c.key.as_str(), c))
+            .collect();
+
+        let mut added: Vec<String> = Vec::new();
+        let mut replaced: Vec<String> = Vec::new();
+        let mut unchanged: Vec<String> = Vec::new();
+        for (key, new_plan) in &new_map {
+            match current_map.get(key) {
+                None => added.push((*key).to_string()),
+                Some(cur_plan) => {
+                    if cur_plan == new_plan {
+                        unchanged.push((*key).to_string());
+                    } else {
+                        replaced.push((*key).to_string());
+                    }
+                }
+            }
+        }
+        let mut removed: Vec<String> = current_map
+            .keys()
+            .filter(|key| !new_map.contains_key(*key))
+            .map(|key| (*key).to_string())
+            .collect();
+        added.sort();
+        replaced.sort();
+        unchanged.sort();
+        removed.sort();
+
+        // --- 2. Writer rotation gate (all-or-nothing anchor) ---------------
+        // A `StoreConfig` with zero groups fails `TsWriter`'s own validation
+        // (and rightly so - there is nothing to open a schema *for*), which
+        // is exactly the empty-config case this method must accept rather
+        // than error on (see this module's doc comment). Skip attempting to
+        // open in that case; the still-open old writer is flushed near the
+        // end of this method once no task remains to use it.
+        let writer_rotated = !new_config.store_config.groups.is_empty()
+            && new_config.store_config != self.config.store_config;
+        let new_writer = if writer_rotated {
+            Some(Arc::new(
+                TsWriter::open_with_options(
+                    &self.data_dir,
+                    new_config.store_config.clone(),
+                    self.clock.clone(),
+                    self.options.writer_options,
+                )
+                .await?,
+            ))
+        } else {
+            None
+        };
+
+        // --- 3. Stop + join removed/replaced connections' tasks only -------
+        for key in removed.iter().chain(replaced.iter()) {
+            if let Some(task) = self.tasks.remove(key) {
+                let _ = task.stop_tx.send(true);
+                let _ = task.handle.await;
+            }
+        }
+
+        // --- 4. Distribute the new writer, then retire the old one ---------
+        if let Some(new_writer) = new_writer {
+            let old_writer = self.writer_tx.borrow().clone();
+            let _ = self.writer_tx.send(new_writer);
+            close_or_flush_writer(old_writer).await?;
+        }
+
+        // --- 5. Spawn tasks for added/replaced connections ------------------
+        for key in added.iter().chain(replaced.iter()) {
+            let plan = new_map[key.as_str()];
+            let ctx = TaskContext {
+                writer_rx: self.writer_tx.subscribe(),
+                clock: self.clock.clone(),
+                current: self.current.clone(),
+                events: self.events.clone(),
+                status: self.status.clone(),
+                backoff: self.options.backoff,
+                factory: factory.clone(),
+            };
+            let (stop_tx, stop_rx) = watch::channel(false);
+            let handle = tokio::spawn(run_connection(
+                plan_for_task(plan, &self.options),
+                ctx,
+                stop_rx,
+            ));
+            self.tasks
+                .insert(key.clone(), ConnectionTask { handle, stop_tx });
+        }
+
+        // --- 6. Retain cache/status down to the new config's live keys ------
+        let live_tag_keys: HashSet<String> = new_config
+            .connections
+            .iter()
+            .flat_map(|c| c.groups.iter())
+            .flat_map(|g| g.tags.iter())
+            .map(|t| t.key.clone())
+            .collect();
+        self.current.retain(&live_tag_keys);
+        let live_conn_keys: HashSet<String> = new_config
+            .connections
+            .iter()
+            .map(|c| c.key.clone())
+            .collect();
+        retain_status(&self.status, &live_conn_keys);
+
+        // Nothing left running to ever flush again on its own - push
+        // whatever is buffered to disk now rather than leaving it stranded
+        // (the empty-config case from this module's doc comment).
+        if self.tasks.is_empty() {
+            let writer = self.writer_tx.borrow().clone();
+            writer.flush().await?;
+        }
+
+        // --- 7. Adopt the new config (point of no return) -------------------
+        self.config = new_config;
+
+        Ok(ApplyReport {
+            added,
+            removed,
+            replaced,
+            unchanged,
+            writer_rotated,
         })
     }
 
@@ -211,25 +514,21 @@ impl Collector {
     /// `self`.
     pub async fn stop(mut self) -> Result<(), CollectError> {
         // Signal, then drain every task. Each task closes its own socket and
-        // marks itself Stopped on the way out, releasing its writer Arc clone.
-        let _ = self.stop_tx.send(true);
-        for task in self.tasks.drain(..) {
-            let _ = task.await;
+        // marks itself Stopped on the way out, releasing its writer_rx (and
+        // any transient per-append writer clone) with it.
+        for (_key, task) in self.tasks.drain() {
+            let _ = task.stop_tx.send(true);
+            let _ = task.handle.await;
         }
 
-        // Every task has now dropped its writer clone, so we hold the sole
-        // reference - unwrap it and close (final flush) exactly once.
-        if let Some(writer) = self.writer.take() {
-            match Arc::try_unwrap(writer) {
-                Ok(writer) => writer.close().await?,
-                Err(still_shared) => {
-                    // Should be unreachable (all tasks joined above). Flush at
-                    // least, so buffered rows are not lost even if some clone
-                    // unexpectedly outlived its task.
-                    still_shared.flush().await?;
-                }
-            }
-        }
+        // Every task has now dropped its writer handle. Grab our own clone of
+        // the current writer, then drop the `Sender` itself (the last
+        // remaining holder of the channel's internal copy) so `writer` below
+        // is - barring an unexpected straggler, see `close_or_flush_writer`'s
+        // doc comment - the sole reference.
+        let writer = self.writer_tx.borrow().clone();
+        drop(self.writer_tx);
+        close_or_flush_writer(writer).await?;
 
         self.events
             .emit(CollectEvent::lifecycle(
@@ -238,6 +537,46 @@ impl Collector {
             ))
             .await;
         Ok(())
+    }
+}
+
+/// Clone `plan` and apply this run's uniform connect/response-timeout
+/// overrides (`options`) to its protocol config - the same per-protocol
+/// `match` [`Collector::start_with_client_factory`] always applied inline,
+/// extracted so [`Collector::apply_config`] can build an identical
+/// "task-ready" plan for a newly added/replaced connection without mutating
+/// the pristine plan [`Collector::config`] stores for future diffing (see
+/// this module's doc comment, point 3, for why that distinction matters).
+fn plan_for_task(plan: &ConnectionPlan, options: &CollectorOptions) -> ConnectionPlan {
+    let mut plan = plan.clone();
+    match &mut plan.config {
+        ProtocolConfig::ModbusTcp(cfg) => {
+            cfg.connect_timeout = options.connect_timeout;
+            cfg.response_timeout = options.response_timeout;
+        }
+        ProtocolConfig::Slmp(cfg) => {
+            cfg.connect_timeout = options.connect_timeout;
+            cfg.response_timeout = options.response_timeout;
+        }
+    }
+    plan
+}
+
+/// Retire one writer `Arc`: close (final flush + pool shutdown) if we hold
+/// the sole reference, otherwise fall back to a bare flush - the same
+/// `Arc::try_unwrap`-or-flush fallback [`Collector::stop`] has always used
+/// ("Should be unreachable... every task joined above"), reused here for
+/// writer rotation inside [`Collector::apply_config`]: an unchanged
+/// connection's task may be mid-`append` on the *old* writer at the exact
+/// moment of rotation (it re-borrows fresh every tick, but a borrow already
+/// in flight holds its clone until that one `append` call returns), so
+/// failing to unwrap here is an expected occasional outcome, not a bug.
+/// Either branch guarantees no buffered row is silently lost, which is the
+/// invariant that matters - which branch runs is secondary.
+async fn close_or_flush_writer(writer: Arc<TsWriter>) -> Result<(), CollectError> {
+    match Arc::try_unwrap(writer) {
+        Ok(writer) => writer.close().await.map_err(CollectError::from),
+        Err(still_shared) => still_shared.flush().await.map_err(CollectError::from),
     }
 }
 

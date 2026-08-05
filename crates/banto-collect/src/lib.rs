@@ -24,8 +24,11 @@
 //! - [`config`]: [`CollectorConfig`] + [`build_config`] - the registry ->
 //!   snapshot step (I1 -> I3b bridge), plus the derived `banto-tstore`
 //!   [`StoreConfig`](banto_tstore::StoreConfig).
-//! - [`collector`]: [`Collector`] - lifecycle (`start`/`stop`) and the UI's
-//!   read handles (`current_values`/`status`/`subscribe_events`).
+//! - [`collector`]: [`Collector`] - lifecycle (`start`/`stop`), the UI's read
+//!   handles (`current_values`/`status`/`subscribe_events`), and (T7-1,
+//!   docs/tag-server-design.md §4.3) [`Collector::apply_config`] - online
+//!   partial reconfiguration that touches only the connections that actually
+//!   changed. See `collector.rs`'s module doc for the safety derivation.
 //! - [`current`]: [`CurrentValuesHandle`]/[`CurrentSample`]/[`Quality`] - the
 //!   latest-value cache with read-time Stale derivation.
 //! - [`event`]: [`CollectEvent`]/[`EventKind`]/[`EventSink`] - the two-output
@@ -59,7 +62,7 @@ pub mod error;
 pub mod event;
 mod task;
 
-pub use collector::{Collector, CollectorOptions};
+pub use collector::{ApplyReport, Collector, CollectorOptions};
 pub use config::{build_config, CollectorConfig};
 pub use current::{CurrentSample, CurrentValuesHandle, Quality, STALE_PERIOD_FACTOR};
 pub use error::CollectError;
