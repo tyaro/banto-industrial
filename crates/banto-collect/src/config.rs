@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use banto_core::ListParams;
-use banto_plc::{Address, DataType, ModbusTcpConfig, ReadRequest, WordOrder};
+use banto_plc::{Address, DataType, ModbusTcpConfig, ReadRequest, SlmpConfig, WordOrder};
 use banto_tags::{
     scaling::Scaling, CollectionGroup, CollectionGroupService, PlcConnection, PlcConnectionService,
     Tag, TagService,
@@ -49,12 +49,30 @@ fn tag_key(id: i64) -> String {
 
 /// The wire protocol a connection speaks. An enum (not the raw string) so
 /// protocol dispatch is a single exhaustive `match` in the client factory
-/// (`task.rs`) - the design's "プロトコル分岐は factory 関数に隔離". v1 has
-/// exactly one variant; MELSEC MC/SLMP adds a sibling here and one factory
-/// arm, nothing else.
+/// (`task.rs`) - the design's "プロトコル分岐は factory 関数に隔離". Also
+/// decides which address notation a tag's `address` column is parsed under
+/// ([`build_request`]) - `Address::parse` (Modbus reference numbers) for
+/// [`Protocol::ModbusTcp`], `Address::parse_slmp` (MELSEC device codes, e.g.
+/// `D100`) for [`Protocol::Slmp`] (I8, 2026-08-05: `banto-plc`'s SLMP client
+/// wired into collection).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Protocol {
     ModbusTcp,
+    Slmp,
+}
+
+/// The protocol-specific client configuration for one connection - exactly
+/// one variant per [`Protocol`], carrying the config [`crate::task::build_client`]
+/// hands to the matching `PlcClient` constructor. An enum (rather than two
+/// separate `Option` fields on [`ConnectionPlan`]) so a connection can never
+/// end up with a config for the wrong protocol, or none at all, and
+/// [`crate::collector::Collector::start`]'s per-option-timeout override
+/// (`connect_timeout`/`response_timeout`) has one `match` to update instead
+/// of two independently-fallible `Option` unwraps.
+#[derive(Debug, Clone)]
+pub(crate) enum ProtocolConfig {
+    ModbusTcp(ModbusTcpConfig),
+    Slmp(SlmpConfig),
 }
 
 /// A tag's fixed H/HH/L/LL limits (any subset may be set), compared against
@@ -109,8 +127,7 @@ pub(crate) struct GroupPlan {
 #[derive(Debug, Clone)]
 pub(crate) struct ConnectionPlan {
     pub key: String,
-    pub protocol: Protocol,
-    pub modbus: ModbusTcpConfig,
+    pub config: ProtocolConfig,
     pub groups: Vec<GroupPlan>,
 }
 
@@ -204,7 +221,10 @@ pub async fn build_config(pool: &SqlitePool) -> Result<CollectorConfig, CollectE
 
     for conn in enabled_connections {
         let protocol = parse_protocol(&conn.protocol, &conn.name)?;
-        let modbus = modbus_config_for(conn)?;
+        let client_config = match protocol {
+            Protocol::ModbusTcp => ProtocolConfig::ModbusTcp(modbus_config_for(conn)?),
+            Protocol::Slmp => ProtocolConfig::Slmp(slmp_config_for(conn)?),
+        };
 
         let mut conn_groups = groups_by_connection.remove(&conn.id).unwrap_or_default();
         conn_groups.sort_by_key(|g| g.id);
@@ -233,7 +253,7 @@ pub async fn build_config(pool: &SqlitePool) -> Result<CollectorConfig, CollectE
                 if tag.data_type == banto_tags::STRING_DATA_TYPE {
                     continue;
                 }
-                let request = build_request(tag)?;
+                let request = build_request(tag, protocol)?;
                 requests.push(request);
                 tag_plans.push(TagPlan {
                     key: tag_key(tag.id),
@@ -289,8 +309,7 @@ pub async fn build_config(pool: &SqlitePool) -> Result<CollectorConfig, CollectE
         store_groups.extend(conn_store_groups);
         connection_plans.push(ConnectionPlan {
             key: connection_key(conn.id),
-            protocol,
-            modbus,
+            config: client_config,
             groups: group_plans,
         });
     }
@@ -306,8 +325,9 @@ pub async fn build_config(pool: &SqlitePool) -> Result<CollectorConfig, CollectE
 fn parse_protocol(protocol: &str, conn_name: &str) -> Result<Protocol, CollectError> {
     match protocol {
         "modbus-tcp" => Ok(Protocol::ModbusTcp),
+        "slmp" => Ok(Protocol::Slmp),
         other => Err(CollectError::Config(format!(
-            "接続 {conn_name} のプロトコル {other} は未対応です（v1 は modbus-tcp のみ）"
+            "接続 {conn_name} のプロトコル {other} は未対応です（modbus-tcp / slmp のみ対応）"
         ))),
     }
 }
@@ -337,16 +357,54 @@ fn modbus_config_for(conn: &PlcConnection) -> Result<ModbusTcpConfig, CollectErr
     })
 }
 
-/// Parse a tag's address + data type into a wire [`ReadRequest`]. A malformed
-/// address or unknown data type is a `CollectError::Config` - caught here, not
+/// I8 (2026-08-05): build an [`SlmpConfig`] from a `"slmp"`-protocol
+/// [`PlcConnection`] row. Only `host`/`port` come from the registry -
+/// `banto-tags::PlcConnection` has no columns for SLMP's CPU series, access
+/// route (network/PC/IO/area id), or word order (`unit_id` is Modbus-only and
+/// is not read here), so every other field falls back to
+/// [`SlmpConfig::default`] (R series CPU, the CPU-on-the-other-end access
+/// route, MELSEC's low-word-first order). **Known limitation**: a device
+/// that needs a non-default CPU series or a routed (not-directly-connected)
+/// access route cannot be configured through the registry today - adding
+/// those would need new `plc_connections` columns, deliberately out of scope
+/// for I8 (task instructions: "新しい I1 列は追加しない").
+/// `connect_timeout`/`response_timeout` are overridden uniformly by
+/// [`crate::collector::Collector::start`] from [`crate::collector::CollectorOptions`],
+/// exactly like [`modbus_config_for`]'s.
+fn slmp_config_for(conn: &PlcConnection) -> Result<SlmpConfig, CollectError> {
+    let port = u16::try_from(conn.port).map_err(|_| {
+        CollectError::Config(format!(
+            "接続 {} のポート番号が不正です: {}",
+            conn.name, conn.port
+        ))
+    })?;
+    Ok(SlmpConfig {
+        host: conn.host.clone(),
+        port,
+        ..SlmpConfig::default()
+    })
+}
+
+/// Parse a tag's address + data type into a wire [`ReadRequest`]. `protocol`
+/// selects the address notation - `Address::parse` (Modbus reference
+/// numbers, e.g. `40001`) for [`Protocol::ModbusTcp`], `Address::parse_slmp`
+/// (MELSEC device codes, e.g. `D100`) for [`Protocol::Slmp`] - so a tag's
+/// stored text is validated under the rules its own connection's protocol
+/// actually speaks, never guessed at (mirrors `banto_plc::address`'s own
+/// module doc: "never inferred from the address text"). A malformed address
+/// or unknown data type is a `CollectError::Config` - caught here, not
 /// folded into a runtime `Bad`, because it is a configuration mistake the
 /// operator must fix, not a transient PLC condition. (An address that parses
 /// but whose area/type combination the wire cannot serve - e.g. a bit at a
 /// register address - is *not* rejected here: `banto-plc`'s planner turns
 /// that into a per-tick `ReadResult::Bad`, which the loop already records as
 /// Bad quality.)
-fn build_request(tag: &Tag) -> Result<ReadRequest, CollectError> {
-    let address = Address::parse(&tag.address).map_err(|err| {
+fn build_request(tag: &Tag, protocol: Protocol) -> Result<ReadRequest, CollectError> {
+    let address = match protocol {
+        Protocol::ModbusTcp => Address::parse(&tag.address),
+        Protocol::Slmp => Address::parse_slmp(&tag.address),
+    }
+    .map_err(|err| {
         CollectError::Config(format!(
             "タグ {} のアドレス {} が不正です: {err}",
             tag.name, tag.address
@@ -450,9 +508,13 @@ mod tests {
 
         let c = &config.connections[0];
         assert_eq!(c.key, format!("conn:{}", conn.id));
-        assert_eq!(c.protocol, Protocol::ModbusTcp);
-        assert_eq!(c.modbus.host, "127.0.0.1");
-        assert_eq!(c.modbus.port, 502);
+        match &c.config {
+            ProtocolConfig::ModbusTcp(modbus) => {
+                assert_eq!(modbus.host, "127.0.0.1");
+                assert_eq!(modbus.port, 502);
+            }
+            ProtocolConfig::Slmp(_) => panic!("expected ModbusTcp config"),
+        }
         assert_eq!(c.groups[0].requests.len(), 2);
 
         // Derived store config mirrors the group/tag shape.
@@ -601,6 +663,68 @@ mod tests {
         // non-empty check but fails Address::parse.
         TagService::new(pool.clone())
             .create(tag_input("Bad", group.id, "99999"))
+            .await
+            .unwrap();
+        let err = build_config(&pool).await.unwrap_err();
+        assert!(matches!(err, CollectError::Config(_)));
+    }
+
+    fn conn_input_slmp(name: &str, port: i64) -> PlcConnectionInput {
+        PlcConnectionInput {
+            protocol: "slmp".to_string(),
+            ..conn_input(name, port)
+        }
+    }
+
+    /// I8 (2026-08-05): `"slmp"` is no longer an unsupported-protocol config
+    /// error, and its tag addresses are parsed under MELSEC device-code
+    /// notation (`D100`), not Modbus reference numbers.
+    #[tokio::test]
+    async fn slmp_connection_builds_with_melsec_addresses() {
+        let pool = registry().await;
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(conn_input_slmp("PLC1", 5007))
+            .await
+            .unwrap();
+        let group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", conn.id, 1_000))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input("T1", group.id, "D100"))
+            .await
+            .unwrap();
+
+        let config = build_config(&pool).await.expect("slmp config should build");
+        assert_eq!(config.connections.len(), 1);
+        let c = &config.connections[0];
+        match &c.config {
+            ProtocolConfig::Slmp(slmp) => {
+                assert_eq!(slmp.host, "127.0.0.1");
+                assert_eq!(slmp.port, 5007);
+            }
+            ProtocolConfig::ModbusTcp(_) => panic!("expected Slmp config"),
+        }
+        assert_eq!(c.groups[0].requests.len(), 1);
+    }
+
+    /// A Modbus-notation address on an `"slmp"` connection must be rejected
+    /// at config-build time (`Address::parse_slmp` does not understand
+    /// `"40001"`), mirroring `invalid_address_is_a_config_error` for the
+    /// Modbus side.
+    #[tokio::test]
+    async fn a_modbus_address_on_an_slmp_connection_is_a_config_error() {
+        let pool = registry().await;
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(conn_input_slmp("PLC1", 5007))
+            .await
+            .unwrap();
+        let group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", conn.id, 1_000))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input("Bad", group.id, "40001"))
             .await
             .unwrap();
         let err = build_config(&pool).await.unwrap_err();

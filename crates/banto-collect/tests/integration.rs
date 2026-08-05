@@ -23,6 +23,8 @@ use banto_collect::{
     build_config, BackoffConfig, Collector, CollectorOptions, ConnectionStatus, EventSink, Quality,
 };
 use banto_plc::modbus::simulator::Simulator;
+use banto_plc::slmp::address::SlmpDevice;
+use banto_plc::slmp::simulator::Simulator as SlmpSimulator;
 use banto_tags::{
     CollectionGroupInput, CollectionGroupService, PlcConnectionInput, PlcConnectionService,
     TagInput, TagService,
@@ -110,6 +112,18 @@ fn conn_input(name: &str, port: u16) -> PlcConnectionInput {
         port: port as i64,
         unit_id: 1,
         enabled: true,
+    }
+}
+
+/// I8 (2026-08-05): the `"slmp"` twin of [`conn_input`] - same shape, just
+/// `protocol` and a port from [`SlmpSimulator`] instead of the Modbus one.
+/// `unit_id` is carried over unused (SLMP has no such concept; `banto-tags`
+/// still requires the column, and `banto-collect`'s `slmp_config_for` simply
+/// never reads it).
+fn slmp_conn_input(name: &str, port: u16) -> PlcConnectionInput {
+    PlcConnectionInput {
+        protocol: "slmp".to_string(),
+        ..conn_input(name, port)
     }
 }
 
@@ -517,6 +531,224 @@ async fn auto_reconnects_and_values_resume_after_recovery() {
         })
         .await,
         "values should resume Good after reconnect"
+    );
+
+    collector.stop().await.unwrap();
+    sim.stop();
+}
+
+// ---------------------------------------------------------------------------
+// SLMP (I8, 2026-08-05: banto-collect の SLMP 対応)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slmp_collects_values_and_writes_to_tstore() {
+    let env = TempEnv::new("slmp-values");
+    let sim = SlmpSimulator::start().await;
+    sim.set_word(SlmpDevice::D, 100, 4321);
+
+    let pool = open_registry(&env).await;
+    let conn = PlcConnectionService::new(pool.clone())
+        .create(slmp_conn_input("PLC1", sim.addr.port()))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(pool.clone())
+        .create(group_input("G1", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(pool.clone())
+        .create(tag_input("t1", group.id, "D100", "i16"))
+        .await
+        .unwrap();
+
+    let config = build_config(&pool).await.unwrap();
+    let collector = Collector::start(
+        config,
+        &env.data_dir(),
+        Arc::new(SystemClock),
+        EventSink::new(pool.clone()),
+        fast_options(),
+    )
+    .await
+    .unwrap();
+
+    let current = collector.current_values();
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            current.get("tag:1").map(|s| s.value) == Some(Some(4321.0))
+        })
+        .await,
+        "t1 should read the MELSEC device value via SLMP"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    collector.stop().await.unwrap();
+    sim.stop();
+
+    let rows = read_single_group_rows(&env.data_dir()).await;
+    assert!(
+        rows.iter().any(|r| r.values[0] == Some(4321.0)),
+        "tstore should have recorded the SLMP-read value"
+    );
+}
+
+/// PLC 断 (`sim.stop()` - the SLMP twin of
+/// `hard_drop_keeps_appending_null_rows_and_marks_reconnecting`): severing
+/// every open session and closing the listener must flip the connection to
+/// Reconnecting, keep ticking (all-NULL rows), and drive the cache Bad -
+/// without tearing the collection loop down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slmp_hard_drop_keeps_appending_null_rows_and_marks_reconnecting() {
+    let env = TempEnv::new("slmp-drop");
+    let sim = SlmpSimulator::start().await;
+    sim.set_word(SlmpDevice::D, 0, 7);
+
+    let pool = open_registry(&env).await;
+    let conn = PlcConnectionService::new(pool.clone())
+        .create(slmp_conn_input("PLC1", sim.addr.port()))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(pool.clone())
+        .create(group_input("G1", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(pool.clone())
+        .create(tag_input("t1", group.id, "D0", "i16"))
+        .await
+        .unwrap();
+
+    let config = build_config(&pool).await.unwrap();
+    let conn_key = format!("conn:{}", conn.id);
+    let collector = Collector::start(
+        config,
+        &env.data_dir(),
+        Arc::new(SystemClock),
+        EventSink::new(pool.clone()),
+        fast_options(),
+    )
+    .await
+    .unwrap();
+
+    let current = collector.current_values();
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            current.get("tag:1").map(|s| s.value) == Some(Some(7.0))
+        })
+        .await,
+        "should read a real value over SLMP before the drop"
+    );
+
+    // Kill the PLC entirely (listener + live sessions severed).
+    sim.stop();
+
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            count_events(&pool, "plc_disconnected").await >= 1
+        })
+        .await,
+        "expected plc_disconnected"
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            matches!(
+                collector.status().get(&conn_key),
+                Some(ConnectionStatus::Reconnecting { .. })
+            )
+        })
+        .await,
+        "expected Reconnecting status while the SLMP PLC is down"
+    );
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            current.get("tag:1").map(|s| s.quality) == Some(Quality::Bad)
+        })
+        .await,
+        "cache should go Bad while disconnected"
+    );
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    collector.stop().await.unwrap();
+
+    let rows = read_single_group_rows(&env.data_dir()).await;
+    assert!(
+        rows.iter().any(|r| r.values[0] == Some(7.0)),
+        "should have real values from before the drop"
+    );
+    assert!(
+        rows.iter().any(|r| r.values[0].is_none()),
+        "should have NULL rows recorded while disconnected"
+    );
+}
+
+/// 復旧 (the SLMP twin of `auto_reconnects_and_values_resume_after_recovery`):
+/// an unresponsive PLC (`sim.hang()`) times out the in-flight read
+/// (connection-fatal for SLMP too, same as Modbus), and the backoff loop
+/// must notice on its own and resume Good reads once the CPU answers again -
+/// no outside intervention, same `Collector`/socket the whole time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slmp_auto_reconnects_and_values_resume_after_recovery() {
+    let env = TempEnv::new("slmp-reconnect");
+    let sim = SlmpSimulator::start().await;
+    sim.set_word(SlmpDevice::D, 0, 55);
+    let pool = open_registry(&env).await;
+    let conn = PlcConnectionService::new(pool.clone())
+        .create(slmp_conn_input("PLC1", sim.addr.port()))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(pool.clone())
+        .create(group_input("G1", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(pool.clone())
+        .create(tag_input("t1", group.id, "D0", "i16"))
+        .await
+        .unwrap();
+
+    let config = build_config(&pool).await.unwrap();
+    let collector = Collector::start(
+        config,
+        &env.data_dir(),
+        Arc::new(SystemClock),
+        EventSink::new(pool.clone()),
+        fast_options(),
+    )
+    .await
+    .unwrap();
+    let current = collector.current_values();
+
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            current.get("tag:1").map(|s| s.value) == Some(Some(55.0))
+        })
+        .await,
+        "should read Good initially over SLMP"
+    );
+
+    // Make the PLC unresponsive: reads time out (connection-fatal) but the
+    // listener stays up.
+    sim.hang();
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            count_events(&pool, "plc_disconnected").await >= 1
+        })
+        .await,
+        "hang should cause a disconnect over SLMP"
+    );
+
+    // Recover: the PLC answers again.
+    sim.stop_hanging();
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            count_events(&pool, "plc_reconnected").await >= 1
+        })
+        .await,
+        "expected plc_reconnected after SLMP recovery"
+    );
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            current.get("tag:1").map(|s| (s.value, s.quality)) == Some((Some(55.0), Quality::Good))
+        })
+        .await,
+        "values should resume Good after SLMP reconnect"
     );
 
     collector.stop().await.unwrap();

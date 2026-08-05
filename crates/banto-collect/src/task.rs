@@ -41,14 +41,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use banto_plc::{ModbusTcpClient, PlcClient, PlcError, ReadResult, TagValue};
+use banto_plc::{ModbusTcpClient, PlcClient, PlcError, ReadResult, SlmpClient, TagValue};
 use banto_tags::scale_raw;
 use banto_tstore::{Clock, TsWriter};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::config::{ConnectionPlan, GroupPlan, Protocol};
+use crate::config::{ConnectionPlan, GroupPlan, ProtocolConfig};
 use crate::current::{CurrentValuesHandle, Quality};
 use crate::event::{CollectEvent, EventKind, EventSink, ThresholdLevel};
 
@@ -111,10 +111,12 @@ pub(crate) struct TaskContext {
 
 /// Build the protocol-specific client for a connection. The one place
 /// protocol dispatch happens (design: "プロトコル分岐は factory 関数に隔離") -
-/// a new protocol is one new match arm here plus one `Protocol` variant.
+/// a new protocol is one new match arm here plus one `Protocol`/`ProtocolConfig`
+/// variant. I8 (2026-08-05): SLMP joins Modbus TCP.
 fn build_client(plan: &ConnectionPlan) -> Box<dyn PlcClient> {
-    match plan.protocol {
-        Protocol::ModbusTcp => Box::new(ModbusTcpClient::new(plan.modbus.clone())),
+    match &plan.config {
+        ProtocolConfig::ModbusTcp(cfg) => Box::new(ModbusTcpClient::new(cfg.clone())),
+        ProtocolConfig::Slmp(cfg) => Box::new(SlmpClient::new(cfg.clone())),
     }
 }
 

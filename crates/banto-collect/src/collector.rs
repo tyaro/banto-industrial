@@ -13,7 +13,7 @@ use banto_tstore::{Clock, TsWriter, WriterOptions};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
-use crate::config::CollectorConfig;
+use crate::config::{CollectorConfig, ProtocolConfig};
 use crate::current::CurrentValuesHandle;
 use crate::error::CollectError;
 use crate::event::{CollectEvent, EventKind, EventSink};
@@ -107,9 +107,19 @@ impl Collector {
 
         let mut tasks = Vec::with_capacity(config.connections.len());
         for mut plan in config.connections {
-            // Apply the option timeouts to this connection's client config.
-            plan.modbus.connect_timeout = options.connect_timeout;
-            plan.modbus.response_timeout = options.response_timeout;
+            // Apply the option timeouts to this connection's client config -
+            // one match arm per protocol (I8: SLMP joins Modbus TCP), same
+            // uniform override either way.
+            match &mut plan.config {
+                ProtocolConfig::ModbusTcp(cfg) => {
+                    cfg.connect_timeout = options.connect_timeout;
+                    cfg.response_timeout = options.response_timeout;
+                }
+                ProtocolConfig::Slmp(cfg) => {
+                    cfg.connect_timeout = options.connect_timeout;
+                    cfg.response_timeout = options.response_timeout;
+                }
+            }
 
             let ctx = TaskContext {
                 writer: writer.clone(),

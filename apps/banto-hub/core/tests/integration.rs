@@ -20,6 +20,8 @@ use banto_hub_core::rest::api_router;
 use banto_hub_core::settings::{SettingsService, DEFAULT_PORT, DEFAULT_RETENTION_DAYS};
 use banto_hub_core::users::UsersService;
 use banto_plc::modbus::simulator::Simulator;
+use banto_plc::slmp::address::SlmpDevice;
+use banto_plc::slmp::simulator::Simulator as SlmpSimulator;
 use banto_server::{AuthState, Identity};
 use banto_tags::{
     CollectionGroupInput, CollectionGroupService, PlcConnectionInput, PlcConnectionService,
@@ -94,6 +96,15 @@ fn conn_input(name: &str, port: u16) -> PlcConnectionInput {
         port: port as i64,
         unit_id: 1,
         enabled: true,
+    }
+}
+
+/// I8 (2026-08-05, crates/banto-collect の SLMP 対応): the `"slmp"` twin of
+/// [`conn_input`], used by [`e2e_read_slmp_via_rest_after_rebuild`].
+fn slmp_conn_input(name: &str, port: u16) -> PlcConnectionInput {
+    PlcConnectionInput {
+        protocol: "slmp".to_string(),
+        ..conn_input(name, port)
     }
 }
 
@@ -312,6 +323,55 @@ async fn e2e_read_via_rest_after_rebuild() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["tag"], "line1.fast.temp01");
     assert_eq!(json["v"], 1234.0);
+    assert_eq!(json["q"], "good");
+
+    sim.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 1b. E2E 読み取り (SLMP, I8): シミュレータ -> レジストリ -> rebuild ->
+//     /api/v1/values/{tag} - the SLMP twin of `e2e_read_via_rest_after_rebuild`,
+//     proving banto-collect's SLMP wiring reaches all the way through the hub.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_read_slmp_via_rest_after_rebuild() {
+    let app = test_app("e2e-read-slmp").await;
+    let sim = SlmpSimulator::start().await;
+    sim.set_word(SlmpDevice::D, 100, 4321);
+
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(slmp_conn_input("line1", sim.addr.port()))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group.id, "D100", "i16"))
+        .await
+        .unwrap();
+
+    app.manager.rebuild().await.expect("rebuild after seeding");
+
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            app.manager
+                .current_values()
+                .and_then(|c| c.get("tag:1"))
+                .map(|s| s.value)
+                == Some(Some(4321.0))
+        })
+        .await,
+        "collector should observe the SLMP simulator value"
+    );
+
+    let (status, json) =
+        get_json(&app.router, "/api/v1/values/line1.fast.temp01", &app.token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["tag"], "line1.fast.temp01");
+    assert_eq!(json["v"], 4321.0);
     assert_eq!(json["q"], "good");
 
     sim.stop();
