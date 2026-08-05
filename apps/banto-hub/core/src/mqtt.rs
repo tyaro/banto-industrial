@@ -80,7 +80,7 @@ use tokio::time::MissedTickBehavior;
 
 use banto_collect::Quality;
 
-use crate::hub::{effective_sample, quality_str, CollectorManager, TagEntry};
+use crate::hub::{quality_str, read_current, CollectorManager, TagEntry};
 use crate::settings::MqttSettings;
 
 /// 評価タイマの固定周期 - `crate::stream::EVAL_TICK_MS` と同じ値・同じ理由
@@ -391,10 +391,10 @@ async fn publish_changed(
     let map = manager.tag_map();
     let now_ms = manager.clock().now_ms();
     let current = manager.current_values();
+    let server_store = manager.server_store();
 
     for entry in map.iter() {
-        let sample = current.as_ref().and_then(|c| c.get(&entry.tag_key));
-        let (value, quality, ts_ms) = effective_sample(entry, sample, now_ms);
+        let (value, quality, ts_ms) = read_current(entry, current.as_ref(), &server_store, now_ms);
 
         let due = match last.get(entry.external_name.as_str()) {
             // 初出のタグ(このインスタンスでまだ一度も発行していない) -
@@ -440,10 +440,10 @@ async fn publish_all(
     let map = manager.tag_map();
     let now_ms = manager.clock().now_ms();
     let current = manager.current_values();
+    let server_store = manager.server_store();
 
     for entry in map.iter() {
-        let sample = current.as_ref().and_then(|c| c.get(&entry.tag_key));
-        let (value, quality, ts_ms) = effective_sample(entry, sample, now_ms);
+        let (value, quality, ts_ms) = read_current(entry, current.as_ref(), &server_store, now_ms);
         publish_one(client, prefix, qos, entry, value, quality, ts_ms).await;
         last.insert(
             entry.external_name.clone(),
@@ -503,6 +503,9 @@ mod tests {
             period_ms: 100,
             enabled: true,
             writable: false,
+            tag_kind: "plc".to_string(),
+            expression: None,
+            retain: false,
         };
         assert_eq!(topic_for("banto", &entry), "banto/line1/fast/temp01");
     }
@@ -531,12 +534,16 @@ mod tests {
         let sessions = Arc::new(crate::broker_glue::HubSessions::new(
             banto_broker::BackoffConfig::default(),
         ));
+        let computed = Arc::new(crate::computed::ComputedEngine::new(Arc::new(
+            crate::computed::ServerTagStore::new(),
+        )));
         let manager = Arc::new(CollectorManager::new(
             pool,
             dir.path().join("data"),
             Arc::new(banto_tstore::SystemClock),
             banto_collect::CollectorOptions::default(),
             sessions,
+            computed,
         ));
         let publisher = MqttPublisher::new(manager);
         assert!(!publisher.connected());

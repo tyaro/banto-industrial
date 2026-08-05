@@ -46,6 +46,11 @@ banto-broker = { path = "../../../crates/banto-broker" }
 # on banto-plc-write internally, but the wire types cross this crate's own
 # public API too, so a direct dependency is needed here as well).
 banto-plc-write = { path = "../../../crates/banto-plc-write" }
+# T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): computed.rs's ComputedEngine
+# compiles/evaluates computed-tag expressions with this crate (T6-1) - the
+# expression engine itself has no registry/tokio dependency, hub wires it to
+# the tag space.
+banto-expr = { path = "../../../crates/banto-expr" }
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

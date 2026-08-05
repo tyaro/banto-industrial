@@ -5,7 +5,9 @@
 # read/write 単一セッション、relay-wright W3-A から抽出), R1-A:
 # apps/chronogazer/{core,src-tauri}, W1: apps/relay-wright/{core,src-tauri},
 # T0: apps/banto-hub/core (headless タグサーバー、
-# docs/tag-server-design.md) - see docs/plan.md / docs/r1-plan.md /
+# docs/tag-server-design.md), T6-1: crates/banto-expr (演算タグの式評価
+# エンジン、依存ゼロの純粋クレート。hub への配線は T6-2) - see docs/plan.md /
+# docs/r1-plan.md /
 # the relay-wright plan `luminous-discovering-goblet.md` /
 # docs/tag-server-design.md. banto crates are consumed via git-tag references
 # (banto docs/publishing.md).
@@ -19,6 +21,7 @@ members = [
     "crates/banto-collect",
     "crates/banto-tsquery",
     "crates/banto-broker",
+    "crates/banto-expr",
     "apps/chronogazer/core",
     "apps/chronogazer/src-tauri",
     "apps/relay-wright/core",

@@ -27,6 +27,7 @@ use banto_collect::{BackoffConfig, CollectorOptions};
 use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::HubSessions;
+use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
 use banto_hub_core::db::init_db;
 use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
@@ -215,12 +216,14 @@ async fn test_app(label: &str) -> TestApp {
         .expect("admin login");
 
     let sessions = Arc::new(HubSessions::new(banto_broker::BackoffConfig::default()));
+    let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
     let manager = Arc::new(CollectorManager::new(
         pool.clone(),
         env.data_dir(),
         Arc::new(SystemClock),
         fast_options(),
         sessions,
+        computed,
     ));
     manager.rebuild().await.expect("initial rebuild");
 

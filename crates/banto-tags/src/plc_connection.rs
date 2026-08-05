@@ -21,6 +21,37 @@
 //! RTU gateways). SLMP has no equivalent single byte - its station addressing
 //! is the network/PC/IO/area access route in `banto_plc::slmp::SlmpConfig` - so
 //! `"slmp"` rows simply carry the column's default.
+//!
+//! ## `"virtual"` (T6-2, docs/tag-server-design.md §4.2/§4.3(a))
+//!
+//! A third protocol joined the other two in migration
+//! `0007_plc_connections_allow_virtual.sql`: `"virtual"` names a connection
+//! that speaks no wire protocol at all - it exists purely to give computed/
+//! internal tags (design §4.2's `tag_kind = "computed"`/`"internal"`) a place
+//! in the existing 3-tier `connection → group → tag` structure, so their
+//! external name's reserved first segment (`calc`/`mem`) is realized as an
+//! ordinary connection row rather than inventing a parallel namespace
+//! mechanism. `banto-hub` auto-provisions exactly two such rows at startup
+//! (named [`CALC_CONNECTION_NAME`]/[`MEM_CONNECTION_NAME`], created if
+//! missing) - the registry's own `UNIQUE` constraint on `name` is what
+//! prevents a user from ever creating a second connection also named `calc`
+//! or `mem` (design's "予約は registry の UNIQUE 制約が自然に担保" - no
+//! separate reservation table or special-cased CRUD guard needed). Which
+//! `tag_kind` may live under a `"virtual"` connection - and specifically
+//! under `calc` vs `mem` - is enforced by
+//! [`crate::tag::TagService`] (it, not this module, can join a tag's group
+//! back to its connection - see that service's own doc comment for why the
+//! check lives there).
+//!
+//! `"virtual"` rows never reach a socket (`banto_collect::build_config`
+//! excludes them from collection entirely; see that crate's own doc
+//! comment), so [`validate_plc_connection_input`] relaxes `host`/`port` for
+//! them: `host` may be empty (there is no host to dial) and `port` may be
+//! `0` (there is no port to dial either) - both values that plc/slmp
+//! connections still reject. No SQL-level relaxation was needed for this
+//! (`host`/`port` were always plain `NOT NULL` columns with no `CHECK`, see
+//! migration `0007`'s own header), so this is purely an application-layer
+//! rule.
 
 use banto_core::{BantoError, FieldError, ListParams, ListResult};
 use banto_storage::ColumnMap;
@@ -36,7 +67,23 @@ use crate::support::{map_write_error, max_length_message, range_message, require
 /// of surfacing the raw SQLite CHECK constraint violation. The two must be
 /// changed together; `every_allowed_protocol_is_accepted_by_the_sql_check` is
 /// the tripwire if they drift.
-pub const ALLOWED_PROTOCOLS: &[&str] = &["modbus-tcp", "slmp"];
+pub const ALLOWED_PROTOCOLS: &[&str] = &["modbus-tcp", "slmp", "virtual"];
+
+/// The one non-wire protocol (T6-2, this module's doc comment). Used both by
+/// [`validate_plc_connection_input`] (relaxed host/port) and by
+/// [`crate::tag::TagService`]'s `calc`/`mem` placement check.
+pub const VIRTUAL_PROTOCOL: &str = "virtual";
+
+/// The reserved connection name for computed tags (design §4.2's `calc`
+/// external-name segment). `banto-hub` auto-provisions a `"virtual"`-protocol
+/// row with this exact name at startup; [`crate::tag::TagService`] requires
+/// every `tag_kind = "computed"` tag's group to live under it.
+pub const CALC_CONNECTION_NAME: &str = "calc";
+
+/// The reserved connection name for internal tags (design §4.2's `mem`
+/// external-name segment) - the `internal`-tag sibling of
+/// [`CALC_CONNECTION_NAME`].
+pub const MEM_CONNECTION_NAME: &str = "mem";
 
 const MAX_NAME_LEN: usize = 100;
 const MIN_PORT: i64 = 1;
@@ -122,14 +169,20 @@ fn validate_plc_connection_input(input: &PlcConnectionInput) -> Result<(), Banto
         });
     }
 
-    if input.host.trim().is_empty() {
+    // T6-2 (this module's doc comment "virtual"): a virtual connection dials
+    // nothing, so `host`/`port` are meaningless - both checks are skipped for
+    // it (host may be empty, port may be 0/anything), while every other
+    // protocol keeps the original required-host / 1..=65535-port rules.
+    let is_virtual = input.protocol == VIRTUAL_PROTOCOL;
+
+    if !is_virtual && input.host.trim().is_empty() {
         errors.push(FieldError {
             field: "host".to_string(),
             message: required_message(),
         });
     }
 
-    if !(MIN_PORT..=MAX_PORT).contains(&input.port) {
+    if !is_virtual && !(MIN_PORT..=MAX_PORT).contains(&input.port) {
         errors.push(FieldError {
             field: "port".to_string(),
             message: range_message(MIN_PORT, MAX_PORT),
@@ -237,12 +290,32 @@ impl PlcConnectionService {
         .map_err(|err| map_write_error(err, "name", "", ""))
     }
 
+    /// **T6-2 addition**: a `"virtual"`-protocol connection cannot be edited
+    /// either (same reservation as [`Self::delete`] - the admin UI shows
+    /// `calc`/`mem` as read-only rows, this is the API-layer enforcement of
+    /// that "編集・削除不可" decision, this module's doc comment).
     pub async fn update(
         &self,
         id: i64,
         input: PlcConnectionInput,
     ) -> Result<PlcConnection, BantoError> {
         validate_plc_connection_input(&input)?;
+
+        let existing_protocol: Option<String> =
+            sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(banto_storage::storage_error)?;
+        if existing_protocol.as_deref() == Some(VIRTUAL_PROTOCOL) {
+            return Err(BantoError::Validation {
+                field_errors: vec![FieldError {
+                    field: "id".to_string(),
+                    message: "予約接続（calc/mem）は編集できません".to_string(),
+                }],
+            });
+        }
+
         sqlx::query_as::<_, PlcConnection>(&format!(
             "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ? \
              WHERE id = ? RETURNING {COLUMNS}"
@@ -272,7 +345,35 @@ impl PlcConnectionService {
     /// the error message can say exactly how many groups are in the way
     /// rather than just repeating the opaque FOREIGN KEY constraint failure
     /// `ON DELETE RESTRICT` would otherwise surface.
+    ///
+    /// **T6-2 addition**: a `"virtual"`-protocol connection ([`CALC_CONNECTION_NAME`]/
+    /// [`MEM_CONNECTION_NAME`], this module's doc comment) can never be
+    /// deleted through this method, regardless of whether any group
+    /// currently references it - unlike the in-use guard below, which only
+    /// bites once something is attached. Without this, an operator could
+    /// delete an empty `calc`/`mem` row (e.g. right after `banto-hub`
+    /// auto-provisions it, before any computed/internal tag exists) and the
+    /// reserved namespace would be gone until the next process restart
+    /// re-provisions it - this rejects that path outright rather than
+    /// relying on self-healing at the next boot (design test plan #6:
+    /// "通常 CRUD で calc の削除が拒否されるか...実装した保護レベルをテスト
+    /// で固定").
     pub async fn delete(&self, id: i64) -> Result<(), BantoError> {
+        let protocol: Option<String> =
+            sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(banto_storage::storage_error)?;
+        if protocol.as_deref() == Some(VIRTUAL_PROTOCOL) {
+            return Err(BantoError::Validation {
+                field_errors: vec![FieldError {
+                    field: "id".to_string(),
+                    message: "予約接続（calc/mem）は削除できません".to_string(),
+                }],
+            });
+        }
+
         let group_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM collection_groups WHERE plc_connection_id = ?",
         )
@@ -632,6 +733,276 @@ mod tests {
         .execute(&mut *conn)
         .await
         .expect("slmp should be accepted after the rebuild");
+        assert!(sqlx::query(
+            "INSERT INTO plc_connections (name, protocol, host, port) \
+             VALUES ('Nope', 'ethernet-ip', '192.168.1.30', 44818)",
+        )
+        .execute(&mut *conn)
+        .await
+        .is_err());
+    }
+
+    // --- T6-2: "virtual" protocol (migration 0007) ------------------------
+
+    /// The application-layer half of the "virtual" relaxation (this module's
+    /// doc comment): empty `host` and `port = 0` are accepted for a
+    /// `"virtual"` connection, where every other protocol would reject both.
+    #[tokio::test]
+    async fn virtual_connection_accepts_empty_host_and_zero_port() {
+        let svc = service().await;
+        let created = svc
+            .create(PlcConnectionInput {
+                name: CALC_CONNECTION_NAME.to_string(),
+                protocol: VIRTUAL_PROTOCOL.to_string(),
+                host: String::new(),
+                port: 0,
+                unit_id: 1,
+                enabled: true,
+            })
+            .await
+            .expect("a virtual connection should accept empty host / port 0");
+        assert_eq!(created.host, "");
+        assert_eq!(created.port, 0);
+    }
+
+    /// A non-virtual protocol must keep rejecting empty host / port 0 - the
+    /// relaxation is specific to `"virtual"`, not a general loosening.
+    #[tokio::test]
+    async fn a_non_virtual_connection_still_rejects_empty_host_and_zero_port() {
+        let svc = service().await;
+        let mut input = sample_input("X");
+        input.host = String::new();
+        input.port = 0;
+        let err = svc.create(input).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                let fields: Vec<&str> = field_errors.iter().map(|e| e.field.as_str()).collect();
+                assert!(fields.contains(&"host"));
+                assert!(fields.contains(&"port"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// T6-2 test plan #6: a `"virtual"` connection cannot be deleted through
+    /// the normal CRUD path, even when it has zero groups attached (unlike
+    /// the generic in-use guard, which only bites once something
+    /// references it).
+    #[tokio::test]
+    async fn delete_refuses_a_virtual_connection_even_with_no_groups_attached() {
+        let svc = service().await;
+        let calc = svc
+            .create(PlcConnectionInput {
+                name: CALC_CONNECTION_NAME.to_string(),
+                protocol: VIRTUAL_PROTOCOL.to_string(),
+                host: String::new(),
+                port: 0,
+                unit_id: 1,
+                enabled: true,
+            })
+            .await
+            .unwrap();
+
+        let err = svc.delete(calc.id).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "id");
+                assert!(field_errors[0].message.contains("予約接続"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        // Still there.
+        svc.get(calc.id).await.expect("calc should survive");
+    }
+
+    /// The API-layer twin: a `"virtual"` connection also cannot be edited.
+    #[tokio::test]
+    async fn update_refuses_a_virtual_connection() {
+        let svc = service().await;
+        let mem = svc
+            .create(PlcConnectionInput {
+                name: MEM_CONNECTION_NAME.to_string(),
+                protocol: VIRTUAL_PROTOCOL.to_string(),
+                host: String::new(),
+                port: 0,
+                unit_id: 1,
+                enabled: true,
+            })
+            .await
+            .unwrap();
+
+        let err = svc
+            .update(mem.id, sample_input("renamed"))
+            .await
+            .unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "id");
+                assert!(field_errors[0].message.contains("予約接続"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// A non-virtual connection is unaffected by the new guards (delete
+    /// still only cares about in-use groups, update still succeeds).
+    #[tokio::test]
+    async fn delete_and_update_are_unaffected_for_non_virtual_connections() {
+        let svc = service().await;
+        let conn = svc.create(sample_input("Ordinary")).await.unwrap();
+        svc.update(conn.id, sample_input("Renamed"))
+            .await
+            .expect("update should still work for a non-virtual connection");
+        svc.delete(conn.id)
+            .await
+            .expect("delete should still work for a non-virtual connection");
+    }
+
+    /// Migration 0007 rebuilds `plc_connections` again (SQLite cannot `ALTER`
+    /// a `CHECK`) - the direct sibling of
+    /// `migration_0004_preserves_rows_and_foreign_keys_on_a_populated_database`,
+    /// but against the FULL post-0006 `tags` shape (string_length/writable/
+    /// tag_kind/expression/retain all present) - a stale column list here
+    /// would silently truncate every existing tag row, exactly the risk this
+    /// migration's own header warns about.
+    #[tokio::test]
+    async fn migration_0007_preserves_rows_and_foreign_keys_on_a_populated_database() {
+        use sqlx::{Acquire, Executor};
+
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect_sqlite_memory");
+        let mut conn = pool.acquire().await.expect("acquire one pinned connection");
+
+        for (label, sql) in [
+            (
+                "0001",
+                include_str!("../migrations/0001_plc_connections.sql"),
+            ),
+            (
+                "0002",
+                include_str!("../migrations/0002_collection_groups.sql"),
+            ),
+            ("0003", include_str!("../migrations/0003_tags.sql")),
+            (
+                "0004",
+                include_str!("../migrations/0004_plc_connections_allow_slmp.sql"),
+            ),
+            (
+                "0005",
+                include_str!("../migrations/0005_tags_allow_string.sql"),
+            ),
+            (
+                "0006",
+                include_str!("../migrations/0006_tags_writable_kind.sql"),
+            ),
+        ] {
+            conn.execute(sql)
+                .await
+                .unwrap_or_else(|e| panic!("pre-0007 migration {label} failed: {e}"));
+        }
+
+        conn.execute(
+            "INSERT INTO plc_connections (id, name, protocol, host, port, unit_id, enabled) \
+             VALUES (7, 'Line1 PLC', 'slmp', '192.168.1.10', 5007, 3, 0)",
+        )
+        .await
+        .expect("seed connection");
+        conn.execute(
+            "INSERT INTO collection_groups (id, name, plc_connection_id, period_ms, enabled) \
+             VALUES (4, 'G1', 7, 1000, 1)",
+        )
+        .await
+        .expect("seed collection group");
+        conn.execute(
+            "INSERT INTO tags (\
+                id, name, collection_group_id, address, data_type, string_length, \
+                raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, threshold_h, enabled, \
+                writable, tag_kind, expression, retain\
+             ) VALUES (\
+                9, 'T1', 4, 'D100', 'i16', NULL, \
+                0, 100, 0, 50, 'degC', 2, 45, 1, \
+                1, 'plc', NULL, 0\
+             )",
+        )
+        .await
+        .expect("seed tag");
+
+        let migration = include_str!("../migrations/0007_plc_connections_allow_virtual.sql");
+        let mut tx = conn.begin().await.expect("begin, as the migrator does");
+        tx.execute(migration).await.expect("0007 should apply");
+        tx.commit().await.expect("0007 should commit");
+
+        let row: (i64, String, String, String, i64, i64, bool) = sqlx::query_as(
+            "SELECT id, name, protocol, host, port, unit_id, enabled FROM plc_connections",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the seeded connection should have been copied across");
+        assert_eq!(
+            row,
+            (
+                7,
+                "Line1 PLC".to_string(),
+                "slmp".to_string(),
+                "192.168.1.10".to_string(),
+                5007,
+                3,
+                false
+            )
+        );
+
+        #[allow(clippy::type_complexity)]
+        let tag: (i64, String, i64, String, bool, String, Option<String>, bool) = sqlx::query_as(
+            "SELECT id, name, collection_group_id, address, writable, tag_kind, expression, \
+             retain FROM tags",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the seeded tag should survive with every T2/T6 column intact");
+        assert_eq!(
+            tag,
+            (
+                9,
+                "T1".to_string(),
+                4,
+                "D100".to_string(),
+                true,
+                "plc".to_string(),
+                None,
+                false
+            )
+        );
+
+        let violations: Vec<(String,)> = sqlx::query_as("PRAGMA foreign_key_check")
+            .fetch_all(&mut *conn)
+            .await
+            .expect("foreign_key_check");
+        assert!(
+            violations.is_empty(),
+            "the rebuild left dangling foreign keys: {violations:?}"
+        );
+
+        assert!(
+            sqlx::query(
+                "INSERT INTO collection_groups (name, plc_connection_id, period_ms) \
+                 VALUES ('orphan', 999, 1000)",
+            )
+            .execute(&mut *conn)
+            .await
+            .is_err(),
+            "foreign keys should still be enforced after the migration"
+        );
+
+        // The point of the whole exercise: 'virtual' (with empty host/port 0)
+        // is now insertable.
+        sqlx::query(
+            "INSERT INTO plc_connections (name, protocol, host, port) \
+             VALUES ('calc', 'virtual', '', 0)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("virtual should be accepted after the rebuild");
         assert!(sqlx::query(
             "INSERT INTO plc_connections (name, protocol, host, port) \
              VALUES ('Nope', 'ethernet-ip', '192.168.1.30', 44818)",

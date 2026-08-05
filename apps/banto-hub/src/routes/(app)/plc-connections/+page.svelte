@@ -16,6 +16,15 @@
 	 * 削除は、収集グループが参照している場合にサービス層の Validation
 	 * エラー（「…収集グループが N 件あるため削除できません」）で拒否されるので、
 	 * それをトーストで表示する。
+	 *
+	 * T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): `calc`/`mem` は
+	 * `banto-hub` が起動時に自動プロビジョニングする予約接続
+	 * （`protocol: "virtual"`）。バックエンドは編集・削除そのものを拒否する
+	 * （`PlcConnectionService::update`/`delete`）ため、このページは一覧に
+	 * 出しつつ行クリックでの編集パネルを開かせず、その理由をトーストで示す
+	 * （実装指示「一覧に出すが編集・削除不可の表示」）。新規作成フォームの
+	 * プロトコル選択肢にも `"virtual"` を含めない — ユーザーが独自の
+	 * virtual 接続を作る導線ではない。
 	 */
 	import { BantoGrid, type GridColumn } from '@banto/grid-svelte';
 	import { isProviderError } from '@banto/admin-core';
@@ -27,11 +36,15 @@
 		createPlcConnection,
 		updatePlcConnection,
 		deletePlcConnection,
+		isVirtualConnection,
 		type PlcConnection,
 		type PlcConnectionInput,
 		type PlcProtocol
 	} from '$lib/banto/tagRegistryAdmin';
 
+	// "virtual" is intentionally NOT offered here (this module's doc comment)
+	// - the two virtual connections are auto-provisioned by the backend, not
+	// created through this form.
 	const protocolOptions: { value: PlcProtocol; label: string }[] = [
 		{ value: 'modbus-tcp', label: 'Modbus TCP' },
 		{ value: 'slmp', label: 'SLMP（MELSEC）' }
@@ -144,6 +157,13 @@
 	let saving = $state(false);
 
 	function selectConnection(c: PlcConnection): void {
+		if (isVirtualConnection(c)) {
+			toastStore.push(
+				'error',
+				`${c.name} は自動プロビジョニングされた予約接続のため編集・削除できません`
+			);
+			return;
+		}
 		selected = c;
 		editForm = formFromConnection(c);
 		editErrors = {};
@@ -192,7 +212,13 @@
 			filterable: true,
 			filterType: 'text'
 		},
-		{ id: 'protocol', header: 'プロトコル', accessor: 'protocol', width: 110 },
+		{
+			id: 'protocol',
+			header: 'プロトコル',
+			accessor: 'protocol',
+			width: 110,
+			format: (v) => (v === 'virtual' ? 'virtual（予約）' : String(v))
+		},
 		{ id: 'host', header: 'ホスト', accessor: 'host', width: 140 },
 		{ id: 'port', header: 'ポート', accessor: 'port', width: 80, align: 'right' },
 		{ id: 'unitId', header: 'ユニットID', accessor: 'unitId', width: 90, align: 'right' },
@@ -202,6 +228,12 @@
 			accessor: 'enabled',
 			width: 70,
 			format: (v) => (v ? 'はい' : 'いいえ')
+		},
+		{
+			id: 'editable',
+			header: '編集',
+			accessor: (row) => (isVirtualConnection(row) ? '不可（自動）' : '可'),
+			width: 100
 		}
 	];
 </script>
@@ -262,6 +294,9 @@
 			{canWrite
 				? '行をクリックすると下に編集パネルが表示されます。'
 				: '閲覧のみ（編集には編集者以上の権限が必要です）。'}
+		</p>
+		<p class="note">
+			calc/mem は演算タグ・内部タグ用にサーバーが自動作成する予約接続です（編集・削除不可）。
 		</p>
 		{#if loading && connections.length === 0}
 			<p class="loading">読み込み中…</p>

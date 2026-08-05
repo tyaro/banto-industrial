@@ -385,7 +385,9 @@ async fn handle_subscribe(
 
     let now_ms = manager.clock().now_ms();
     let current = manager.current_values();
-    let (initial, last) = subscribe_core::initial_values(&patterns, &map, current.as_ref(), now_ms);
+    let server_store = manager.server_store();
+    let (initial, last) =
+        subscribe_core::initial_values(&patterns, &map, current.as_ref(), &server_store, now_ms);
     let values: Vec<ValueWire> = initial.into_iter().map(ValueWire::from).collect();
 
     let next_due_ms = match mode {
@@ -426,9 +428,12 @@ fn evaluate(
     let map = manager.tag_map();
     let now_ms = manager.clock().now_ms();
     let current = manager.current_values();
+    let server_store = manager.server_store();
 
     for (&id, sub) in subscriptions.iter_mut() {
-        if let Some(values) = subscribe_core::evaluate(sub, &map, current.as_ref(), now_ms) {
+        if let Some(values) =
+            subscribe_core::evaluate(sub, &map, current.as_ref(), &server_store, now_ms)
+        {
             let values: Vec<ValueWire> = values.into_iter().map(ValueWire::from).collect();
             if !send_data(id, now_ms, values, data_tx, close_tx) {
                 return false;

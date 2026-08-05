@@ -96,6 +96,7 @@ use sqlx::SqlitePool;
 use utoipa::ToSchema;
 
 use crate::broker_glue::{hub_client_factory, HubSessions};
+use crate::computed::{self, ComputedEngine, ServerTagStore};
 
 /// The effective `(value, quality, timestamp_ms)` triple for one catalog
 /// entry - shared by `crate::rest`'s `/api/v1/values*` and `crate::stream`'s
@@ -124,6 +125,36 @@ pub fn effective_sample(
             None => (None, Quality::Bad, now_ms),
         }
     }
+}
+
+/// T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): the single read-path
+/// unification point every IF (REST `values`/`status`, WS, MQTT, gRPC) must
+/// call through instead of reading [`CurrentValuesHandle`] directly - the
+/// T6-2 implementation instructions asked for exactly this ("既存の
+/// hub::effective_sample / TagMap 参照箇所を...共通ヘルパに集約...個別 IF に
+/// 分岐を撒かない"). `entry.tag_kind` decides the source: `"plc"` reads
+/// `collect` ([`CurrentValuesHandle`], written by `banto-collect`'s
+/// collection tasks); `"computed"`/`"internal"` read `server_store`
+/// ([`ServerTagStore`], written by [`ComputedEngine`]'s evaluation loop /
+/// `crate::write_path::execute_write`'s internal-tag branch) - both keyed by
+/// the same `entry.tag_key` (`"tag:{id}"`) convention, so a rename never
+/// loses the current value either way (`TagEntry::tag_key`'s own doc
+/// comment). Delegates entirely to [`effective_sample`] once the right
+/// `Option<CurrentSample>` is in hand, so the `!entry.enabled` /
+/// missing-sample rules stay defined in exactly one place regardless of
+/// `tag_kind`.
+pub fn read_current(
+    entry: &TagEntry,
+    collect: Option<&CurrentValuesHandle>,
+    server_store: &ServerTagStore,
+    now_ms: i64,
+) -> (Option<f64>, Quality, i64) {
+    let sample = if entry.tag_kind == banto_tags::PLC_TAG_KIND {
+        collect.and_then(|c| c.get(&entry.tag_key))
+    } else {
+        server_store.get(&entry.tag_key)
+    };
+    effective_sample(entry, sample, now_ms)
 }
 
 /// The wire string for a [`Quality`] - `"good"`/`"bad"`/`"stale"`, identical
@@ -191,15 +222,25 @@ pub struct TagEntry {
     pub period_ms: i64,
     pub enabled: bool,
     /// Write opt-in (design §4 "メタデータ: ...書き込み可否(§6)を catalog 系
-    /// API で公開", §6 item 1). `tag_kind`/`expression`/`retain` are
-    /// deliberately NOT added to the catalog alongside this - the design
-    /// instructions single out `writable` as the one T2-relevant piece of
-    /// write metadata a catalog client needs (can I target this tag for a
-    /// write), while `tag_kind`/`expression`/`retain` describe T6 tag
-    /// species that stay unused (and, per T2's validation, unreachable -
-    /// `tag_kind` is always `"plc"` today) until T6 lands its own catalog
-    /// exposure decision.
+    /// API で公開", §6 item 1).
     pub writable: bool,
+    /// One of `banto_tags::ALLOWED_TAG_KINDS` (`"plc"`/`"computed"`/
+    /// `"internal"`, design §4.2). T2-3 deferred exposing this in the catalog
+    /// ("T6 まで非公開" - `tag_kind` was always `"plc"` back then, so there
+    /// was nothing to distinguish); **T6-2 lifts that now that all three
+    /// species exist** (catalog exposure decision, this field). This is also
+    /// the field [`crate::hub::read_current`] branches on - no other IF
+    /// should re-derive "is this tag PLC-backed" from anything else.
+    pub tag_kind: String,
+    /// Computed-tag formula source (design §4.2, T6-2). `Some` only for
+    /// `tag_kind == "computed"` - `None` for `"plc"`/`"internal"` (mirrors
+    /// `banto_tags::Tag::expression`'s own invariant, enforced at
+    /// registration by `banto_tags::tag::validate_tag_input`).
+    pub expression: Option<String>,
+    /// Internal-tag "restore last value on restart" flag (design §4.2,
+    /// T6-2). Meaningless for `"plc"`/`"computed"` tags (always `false` for
+    /// them - mirrors `banto_tags::Tag::retain`).
+    pub retain: bool,
 }
 
 /// Immutable snapshot of the external-name catalog, rebuilt from scratch on
@@ -240,6 +281,18 @@ impl TagMap {
 
     pub fn is_empty(&self) -> bool {
         self.ordered.is_empty()
+    }
+
+    /// Test-only builder helper: insert one entry directly, bypassing
+    /// `build_catalog`'s registry read. `crate::computed`'s unit tests use
+    /// this to build a `TagMap` in-memory (no SQLite registry needed) for
+    /// `computed::build_plan`/`ComputedEngine::evaluate_tick` scenarios -
+    /// `TagMap` otherwise has no public constructor from a plain entry list
+    /// (production code only ever builds one from the registry).
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&mut self, entry: TagEntry) {
+        self.ordered.push(entry.external_name.clone());
+        self.by_external.insert(entry.external_name.clone(), entry);
     }
 }
 
@@ -289,6 +342,9 @@ async fn build_catalog(pool: &SqlitePool) -> Result<TagMap, banto_core::BantoErr
             period_ms: group.period_ms,
             enabled: conn.enabled && group.enabled && tag.enabled,
             writable: tag.writable,
+            tag_kind: tag.tag_kind.clone(),
+            expression: tag.expression.clone(),
+            retain: tag.retain,
         });
     }
 
@@ -349,6 +405,17 @@ pub struct CollectorManager {
     /// `rebuild` - see `crate::broker_glue::HubSessions`'s doc comment for
     /// the full rationale and the session-sync policy `rebuild` follows.
     sessions: Arc<HubSessions>,
+    /// T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): owned OUTSIDE this
+    /// manager for the same reason `sessions` is (`bin/banto-hub.rs`
+    /// constructs it and keeps its own `Arc` clone so `ServerTagStore`'s
+    /// retained values and the running evaluation loop both outlive any
+    /// single `rebuild`). [`CollectorManager::rebuild`] calls
+    /// [`ComputedEngine`]'s pure `crate::computed::build_plan` against the
+    /// freshly-built catalog and commits the result in the SAME
+    /// all-or-nothing step as the catalog/`Collector` swap (§4.3(a): "変更の
+    /// 影響半径 = 触ったものだけ" - a bad computed-tag expression must leave
+    /// the entire rebuild, not just the computed engine, on the old state).
+    computed: Arc<ComputedEngine>,
     inner: Mutex<Inner>,
     /// Serializes the whole body of [`CollectorManager::rebuild`] - see this
     /// module's doc comment ("`rebuild` は直列化されている") for why a plain
@@ -385,6 +452,7 @@ impl CollectorManager {
         clock: Arc<dyn Clock>,
         options: CollectorOptions,
         sessions: Arc<HubSessions>,
+        computed: Arc<ComputedEngine>,
     ) -> Self {
         let events = EventSink::new(pool.clone());
         let (revision_tx, _revision_rx) = watch::channel(0);
@@ -395,6 +463,7 @@ impl CollectorManager {
             options,
             events,
             sessions,
+            computed,
             inner: Mutex::new(Inner {
                 collector: None,
                 map: Arc::new(TagMap::empty()),
@@ -404,6 +473,22 @@ impl CollectorManager {
             rebuild_lock: AsyncMutex::new(()),
             revision_tx,
         }
+    }
+
+    /// T6-2: the shared computed/internal-tag current-value store - the
+    /// non-PLC counterpart to [`Self::current_values`]. Every read IF should
+    /// reach this only through [`read_current`] (this module's function),
+    /// never call [`ServerTagStore::get`] directly.
+    pub fn server_store(&self) -> Arc<ServerTagStore> {
+        self.computed.server_store()
+    }
+
+    /// T6-2: the shared [`ComputedEngine`] - `bin/banto-hub.rs` clones this
+    /// to hand to the background 250ms evaluation loop task (this struct's
+    /// `computed` field doc comment: the engine's plan/state must outlive any
+    /// single `rebuild`, but the tick loop itself is not part of `rebuild`).
+    pub fn computed_engine(&self) -> Arc<ComputedEngine> {
+        self.computed.clone()
     }
 
     /// The shared registry pool - handed to callers (e.g. `rest.rs`'s
@@ -464,6 +549,22 @@ impl CollectorManager {
             }
         };
 
+        // T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): compile every
+        // `computed` tag's expression against `new_map` and validate the DAG
+        // - pure computation, no mutation of `self.computed` yet (mirrors
+        // `build_catalog`/`build_config` just above: a failure here must
+        // leave EVERYTHING - catalog, `Collector`, and the computed engine's
+        // plan - on the old state, §4.3(a)'s all-or-nothing). Committed only
+        // at the same point the catalog/`Collector` swap happens, below.
+        let computed_plan = match computed::build_plan(&new_map) {
+            Ok(plan) => plan,
+            Err(err) => {
+                let message = format!("演算タグの検証に失敗しました: {err}");
+                self.set_last_error(message.clone());
+                return Err(message);
+            }
+        };
+
         let config = match build_config(&self.pool).await {
             Ok(config) => config,
             Err(err) => {
@@ -491,6 +592,10 @@ impl CollectorManager {
         // exactly the same condition `Collector::start`'s own
         // `connections.is_empty()` check would use.
         if config.group_count() == 0 {
+            // T6-2: commit the validated computed-tag plan in the same
+            // all-or-nothing step as the catalog swap below - see
+            // `computed_plan`'s own comment above.
+            self.computed.commit(computed_plan);
             let (old, new_revision) = {
                 let mut inner = self.inner.lock().expect("hub state lock poisoned");
                 inner.map = Arc::new(new_map);
@@ -534,6 +639,9 @@ impl CollectorManager {
             }
         };
 
+        // T6-2: commit alongside the catalog/`Collector` swap - same
+        // reasoning as the `group_count() == 0` branch above.
+        self.computed.commit(computed_plan);
         let (old, new_revision) = {
             let mut inner = self.inner.lock().expect("hub state lock poisoned");
             let old = inner.collector.replace(new_collector);
@@ -757,6 +865,7 @@ mod tests {
         let pool = init_db(&db_path).await.expect("init_db");
         let data_dir = dir.path().join("data");
         let sessions = Arc::new(HubSessions::new(banto_broker::BackoffConfig::default()));
+        let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
         let manager = CollectorManager::new(
             pool.clone(),
             data_dir,
@@ -767,6 +876,7 @@ mod tests {
                 ..CollectorOptions::default()
             },
             sessions,
+            computed,
         );
         (pool, dir, manager)
     }

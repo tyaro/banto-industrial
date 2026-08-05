@@ -225,6 +225,28 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
         .await
         .map_err(banto_storage::storage_error)?;
 
+    // T6-2 (docs/tag-server-design.md §4.2「retain フラグで再起動時の最終値
+    // 復元」): `retain = true` の内部タグの最終値。`tag_id` を主キーにする
+    // （`crate::computed::ServerTagStore`のキー`"tag:{id}"`と同じidを使う -
+    // `crate::computed::upsert_retained_value`/`load_retained_values`
+    // 参照）。**`tags(id)` への FOREIGN KEY は張らない** - このテーブルは
+    // `apply_app_schema`（このモジュール）の一部として
+    // `banto_tags::migrate`（`tags` テーブルを作る側）より**先に**走る
+    // (`run_migrations`のこのモジュール冒頭の doc comment参照) ため、その
+    // 時点では参照先テーブルがまだ存在しない。タグ削除時に古い行が残っても
+    // 実害はない(ロード時に該当 `tag_id` が catalog に無ければ
+    // `ServerTagStore` へは書かれず、単に無視される)。
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS hub_retained_values (
+          tag_id INTEGER PRIMARY KEY,
+          value REAL NOT NULL,
+          ptime_ms INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+
     Ok(())
 }
 
@@ -284,6 +306,7 @@ mod tests {
             "api_keys",
             "write_control_state",
             "hub_write_audit",
+            "hub_retained_values",
         ] {
             let exists: Option<String> = sqlx::query_scalar(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
