@@ -217,6 +217,11 @@ async fn test_app(label: &str) -> TestApp {
 
     let api_keys = ApiKeysService::new(pool.clone());
     let (events_tx, _rx) = broadcast::channel(16);
+    // T2-4: WriteControl always constructs disabled (docs/tag-server-design.md
+    // §6-6) - not exercised by these WebSocket-subscription tests.
+    let write_control =
+        std::sync::Arc::new(banto_hub_core::write_control::WriteControl::new(false));
+    let write_audit = banto_hub_core::write_audit::WriteAuditService::new(pool.clone());
     let router: Router = api_router(
         users,
         audit,
@@ -228,6 +233,8 @@ async fn test_app(label: &str) -> TestApp {
         auth,
         events_tx,
         false,
+        write_control,
+        write_audit,
     );
 
     let server = start(

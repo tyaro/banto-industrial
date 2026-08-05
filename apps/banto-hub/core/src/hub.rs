@@ -83,7 +83,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::{broadcast, watch};
 
-use banto_broker::{BrokerConnectionStatus, ReadOnlyHandle};
+use banto_broker::{BrokerConnectionStatus, BrokerError, BrokerHandle, ReadOnlyHandle};
 use banto_collect::{
     build_config, CollectEvent, Collector, CollectorOptions, ConnectionStatus, CurrentSample,
     CurrentValuesHandle, EventSink, Quality,
@@ -626,6 +626,24 @@ impl CollectorManager {
         self.sessions
             .status_watch(connection_id)
             .map(|watch| *watch.borrow())
+    }
+
+    /// T2-4（docs/tag-server-design.md §6 item 5「読み書き単一セッション」）:
+    /// `conn`（SLMP 接続）の書き込み可能な [`BrokerHandle`] を取得する。
+    /// `crate::rest` の書き込みハンドラの唯一の入口 - `self.sessions`
+    /// （`Self::sync_slmp_sessions`が rebuild の度に確保する broker セッション
+    /// directory）に委譲するだけで、`Self::sync_slmp_sessions`が読み取り専用
+    /// ハンドルへ絞る（`ReadOnlyHandle`、`banto_collect::PlcClient` 経由）のと
+    /// 対称的に、こちらは書き込み可能なフル `BrokerHandle` をそのまま返す
+    /// （収集と書き込みが同じ物理セッションを通る、というのがこの broker
+    /// 統合方針の核心 - 設計 §6 item 5）。
+    ///
+    /// `HubSessions::ensure_connection` は冪等（既存セッションがあれば
+    /// それをそのまま返す）なので、直近の `rebuild` が既に確保済みの
+    /// セッションと同じものが返る。`rebuild` と競合しても安全（同じ
+    /// セッションに収束する）。
+    pub fn write_broker_handle(&self, conn: &PlcConnection) -> Result<BrokerHandle, BrokerError> {
+        self.sessions.ensure_connection(conn)
     }
 
     /// Current catalog snapshot. Cheap (`Arc` clone) - safe to call once per

@@ -15,6 +15,8 @@
 	 */
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '$lib/toast.svelte';
+	import { sessionStore } from '$lib/session.svelte';
+	import { isAdmin } from '$lib/permissions';
 	import {
 		getHubStatus,
 		getHubValues,
@@ -23,6 +25,9 @@
 		type ValueEntry,
 		type ValuesResponse
 	} from '$lib/banto/hubStatus';
+	import { enableWriteControl, disableWriteControl } from '$lib/banto/writeControlAdmin';
+
+	const canManageWriteControl = $derived(isAdmin(sessionStore.role));
 
 	const POLL_INTERVAL_MS = 3000;
 
@@ -105,6 +110,35 @@
 	function connectionRowClass(conn: ConnectionStatusEntry): string {
 		return `status-${statusClass(conn.status)}`;
 	}
+
+	// --- 書き込み受付トグル (T2-4、設計 §6-6、admin 限定) --------------------
+	let writeControlBusy = $state(false);
+
+	async function handleEnableWrites(): Promise<void> {
+		writeControlBusy = true;
+		try {
+			await enableWriteControl();
+			toastStore.push('success', '書き込み受付を有効化しました');
+			await poll();
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			writeControlBusy = false;
+		}
+	}
+
+	async function handleDisableWrites(): Promise<void> {
+		writeControlBusy = true;
+		try {
+			await disableWriteControl();
+			toastStore.push('success', '書き込み受付を無効化しました');
+			await poll();
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			writeControlBusy = false;
+		}
+	}
 </script>
 
 <div class="page">
@@ -148,6 +182,41 @@
 			{/if}
 		{/if}
 	</section>
+
+	{#if status && canManageWriteControl}
+		<section>
+			<h2>書き込み受付（管理者限定）</h2>
+			<p class="note">
+				プロセス再起動時は必ず無効化されます（安全側の既定 - 明示的に有効化するまで
+				<code>POST /api/v1/values/&#123;tag&#125;</code> は 503 を返します）。
+			</p>
+			<dl class="summary">
+				<dt>現在の状態</dt>
+				<dd class={status.write_enabled ? 'write-on' : 'write-off'}>
+					{status.write_enabled ? '有効（書き込みを受け付けています）' : '無効（書き込みを拒否しています）'}
+				</dd>
+				<dt>再起動前の状態</dt>
+				<dd>{status.write_was_enabled_before_restart ? '有効だった' : '無効だった'}</dd>
+			</dl>
+			<div class="write-control-actions">
+				<button
+					type="button"
+					onclick={handleEnableWrites}
+					disabled={writeControlBusy || status.write_enabled}
+				>
+					有効化する
+				</button>
+				<button
+					type="button"
+					class="danger"
+					onclick={handleDisableWrites}
+					disabled={writeControlBusy || !status.write_enabled}
+				>
+					無効化する
+				</button>
+			</div>
+		</section>
+	{/if}
 
 	<section>
 		<h2>タグ現在値</h2>
@@ -293,5 +362,42 @@
 
 	.quality-stale {
 		color: var(--banto-text-muted);
+	}
+
+	.write-on {
+		color: var(--banto-text);
+		font-weight: 600;
+	}
+
+	.write-off {
+		color: var(--banto-text-muted);
+	}
+
+	.write-control-actions {
+		display: flex;
+		gap: 0.5rem;
+		margin-top: 0.75rem;
+	}
+
+	.write-control-actions button {
+		padding: 0.5rem 1rem;
+		border: none;
+		border-radius: var(--banto-radius);
+		background: var(--banto-primary);
+		color: var(--banto-text-inverse);
+		font-weight: 600;
+		cursor: pointer;
+	}
+
+	.write-control-actions button:disabled {
+		opacity: 0.6;
+		cursor: not-allowed;
+	}
+
+	.write-control-actions button.danger {
+		background: transparent;
+		border: 1px solid var(--banto-danger);
+		color: var(--banto-danger);
+		font-weight: 400;
 	}
 </style>

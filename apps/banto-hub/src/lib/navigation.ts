@@ -2,7 +2,7 @@
  * サイドバーナビゲーション定義。relay-wright/chronogazer の navigation.ts
  * と同型だが、項目は banto-hub 独自（実装指示: 状態(/status)・PLC接続・
  * 収集グループ・タグ登録・APIキー(admin限定)・ユーザー管理(admin限定)・
- * 監査ログ(admin限定)・設定）を書き下ろし。
+ * 監査ログ(admin限定)・書き込み監査(admin限定、T2-4)・設定）を書き下ろし。
  *
  * 状態モニタ(/status)を先頭に置くのは、このアプリの主用途が「タグサーバー
  * が正しく収集できているかを見る」ことだからで、ルート `/` からの
@@ -27,6 +27,7 @@ export const navItems: NavItem[] = [
 	{ path: '/api-keys', label: 'APIキー', icon: '🔑', adminOnly: true },
 	{ path: '/users', label: 'ユーザー管理', icon: '👤', adminOnly: true },
 	{ path: '/audit-log', label: '監査ログ', icon: '🧾', adminOnly: true },
+	{ path: '/write-audit', label: '書き込み監査', icon: '✍️', adminOnly: true },
 	{ path: '/settings', label: '設定', icon: '⚙️' }
 ];
 

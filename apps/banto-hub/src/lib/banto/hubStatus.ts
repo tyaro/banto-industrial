@@ -28,6 +28,10 @@ export interface StatusResponse {
 	revision: number;
 	last_config_error: string | null;
 	connections: ConnectionStatusEntry[];
+	/** T2-4（設計 §6-6）: 書き込み受付のライブフラグ（起動時は必ず false）。 */
+	write_enabled: boolean;
+	/** T2-4（設計 §6-6）: プロセス再起動前は有効だったか（表示専用の履歴）。 */
+	write_was_enabled_before_restart: boolean;
 }
 
 /** `GET /api/v1/values` の1タグ分（`{ tag, v, q, t }`）。 */

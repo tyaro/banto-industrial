@@ -22,6 +22,7 @@
 		listApiKeys,
 		createApiKey,
 		revokeApiKey,
+		clearTripApiKey,
 		type ApiKeySummary,
 		type IssuedApiKey
 	} from '$lib/banto/apiKeysAdmin';
@@ -137,6 +138,22 @@
 		}
 	}
 
+	// --- clear-trip (T2-4、設計 §6-4: レート制限ブレーカのトリップ解除) ---
+	let clearingTripId: number | null = $state(null);
+
+	async function handleClearTrip(key: ApiKeySummary): Promise<void> {
+		clearingTripId = key.id;
+		try {
+			await clearTripApiKey(key.id);
+			toastStore.push('success', 'トリップを解除しました');
+			await reload();
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			clearingTripId = null;
+		}
+	}
+
 	function formatLastUsed(ms: number | null): string {
 		return ms === null ? '未使用' : new Date(ms).toLocaleString('ja-JP');
 	}
@@ -207,12 +224,13 @@
 						<th>作成日時</th>
 						<th>最終使用</th>
 						<th>状態</th>
+						<th>トリップ</th>
 						<th></th>
 					</tr>
 				</thead>
 				<tbody>
 					{#each keys as key (key.id)}
-						<tr class:revoked={key.revokedAt !== null}>
+						<tr class:revoked={key.revokedAt !== null} class:tripped={key.trippedAt !== null}>
 							<td>{key.name}</td>
 							<td><code>{key.prefix}</code></td>
 							<td>{key.scopes.join(', ')}</td>
@@ -220,6 +238,23 @@
 							<td>{formatLastUsed(key.lastUsedAt)}</td>
 							<td>{key.revokedAt === null ? '有効' : `失効済み（${key.revokedAt}）`}</td>
 							<td>
+								{#if key.trippedAt === null}
+									-
+								{:else}
+									<span class="trip-badge">トリップ中（{key.trippedAt}）</span>
+								{/if}
+							</td>
+							<td class="actions">
+								{#if key.trippedAt !== null}
+									<button
+										type="button"
+										class="secondary"
+										onclick={() => handleClearTrip(key)}
+										disabled={clearingTripId === key.id}
+									>
+										トリップ解除
+									</button>
+								{/if}
 								{#if key.revokedAt === null}
 									<button
 										type="button"
@@ -375,6 +410,19 @@
 
 	tr.revoked td {
 		color: var(--banto-text-muted);
+	}
+
+	tr.tripped td {
+		color: var(--banto-danger);
+	}
+
+	.trip-badge {
+		font-weight: 600;
+	}
+
+	td.actions {
+		display: flex;
+		gap: 0.4rem;
 	}
 
 	button {

@@ -42,6 +42,8 @@ use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::rest::{api_router, audited_credential_verifier};
 use banto_hub_core::settings::SettingsService;
 use banto_hub_core::users::UsersService;
+use banto_hub_core::write_audit::WriteAuditService;
+use banto_hub_core::write_control::{load_persisted_enabled, WriteControl};
 use banto_server::{lan_urls, start, static_router, AuthState, ServerConfig};
 use banto_tags::{CollectionGroupService, PlcConnectionService, TagService};
 use banto_tstore::{LocalDate, SystemClock};
@@ -127,7 +129,20 @@ async fn main() {
     let plc_connections = PlcConnectionService::new(pool.clone());
     let collection_groups = CollectionGroupService::new(pool.clone());
     let tags = TagService::new(pool.clone());
-    let api_keys = ApiKeysService::new(pool);
+    let api_keys = ApiKeysService::new(pool.clone());
+
+    // T2-4 (docs/tag-server-design.md §6-6): the live write-acceptance flag
+    // ALWAYS constructs disabled, no matter what was persisted - only
+    // `was_enabled_before_restart` (display-only, `/api/v1/status`) reads
+    // the persisted value. See `WriteControl`'s module doc for the one rule
+    // this exists to enforce (a restart must never silently resume write
+    // acceptance).
+    let write_was_enabled_persisted = load_persisted_enabled(&pool).await.unwrap_or_else(|err| {
+        eprintln!("banto-hub: 書き込み受付の永続状態の読み取りに失敗しました: {err}");
+        false
+    });
+    let write_control = Arc::new(WriteControl::new(write_was_enabled_persisted));
+    let write_audit = WriteAuditService::new(pool.clone());
 
     let app = api_router(
         users,
@@ -140,6 +155,8 @@ async fn main() {
         auth,
         events,
         allow_setup,
+        write_control,
+        write_audit,
     )
     .merge(static_router::<FrontendAssets>());
 

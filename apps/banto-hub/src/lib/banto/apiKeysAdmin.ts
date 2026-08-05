@@ -8,6 +8,11 @@
  * （`apps/banto-hub/core/src/api_keys.rs` の doc comment 参照 - DB には
  * ハッシュしか保存されない）。DELETE ルートは存在しない（失効履歴を残す
  * 設計のため revoke のみ、設計 §5.6）。
+ *
+ * T2-4（設計 §6-4）: `trippedAt`/`clearTripApiKey` はレート制限ブレーカが
+ * トリップさせたキーの状態と手動解除 - `revoke`（不可逆）とは別の
+ * 解除可能な状態（`apps/banto-hub/core/src/api_keys.rs` のモジュール doc
+ * comment「トリップ」参照）。
  */
 import { getAuthProvider, ProviderError, type ErrorBody } from '@banto/admin-core';
 import { CSRF_HEADER } from './setup';
@@ -21,6 +26,8 @@ export interface ApiKeySummary {
 	createdAt: string;
 	lastUsedAt: number | null;
 	revokedAt: string | null;
+	/** T2-4: レート制限超過でトリップした日時（ISO 文字列）、未トリップは null。 */
+	trippedAt: string | null;
 }
 
 export interface CreateApiKeyInput {
@@ -114,4 +121,9 @@ export async function createApiKey(input: CreateApiKeyInput): Promise<IssuedApiK
 /** 失効（冪等）。DELETE は無い - 失効履歴は revokedAt として残る。 */
 export async function revokeApiKey(id: number): Promise<ApiKeySummary> {
 	return httpRequest<ApiKeySummary>(`/api/api-keys/${id}/revoke`, { method: 'POST' });
+}
+
+/** T2-4: トリップ解除（冪等）。`revoke` と違い再び通常どおり使えるようになる。 */
+export async function clearTripApiKey(id: number): Promise<ApiKeySummary> {
+	return httpRequest<ApiKeySummary>(`/api/api-keys/${id}/clear-trip`, { method: 'POST' });
 }

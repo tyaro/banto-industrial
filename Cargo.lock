@@ -235,6 +235,7 @@ dependencies = [
  "banto-collect",
  "banto-core",
  "banto-plc",
+ "banto-plc-write",
  "banto-server",
  "banto-storage",
  "banto-tags",

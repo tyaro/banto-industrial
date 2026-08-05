@@ -222,6 +222,10 @@ async fn test_app(label: &str) -> TestApp {
     manager.rebuild().await.expect("initial rebuild");
 
     let (events_tx, _rx) = broadcast::channel(16);
+    // T2-4: WriteControl always constructs disabled (docs/tag-server-design.md
+    // §6-6) - no persisted state to read for a fresh test DB either way.
+    let write_control = Arc::new(banto_hub_core::write_control::WriteControl::new(false));
+    let write_audit = banto_hub_core::write_audit::WriteAuditService::new(pool.clone());
     let router = api_router(
         users,
         audit,
@@ -233,6 +237,8 @@ async fn test_app(label: &str) -> TestApp {
         auth,
         events_tx,
         false,
+        write_control,
+        write_audit,
     );
 
     TestApp {

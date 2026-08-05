@@ -46,9 +46,10 @@
 //! catalog に定義そのものが存在しない外部名だけ。
 
 use std::sync::Arc;
+use std::time::Instant;
 
-use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Extension, Path, Query, State};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -56,24 +57,34 @@ use axum::{Json, Router};
 use banto_broker::BrokerConnectionStatus;
 use banto_collect::ConnectionStatus;
 use banto_core::{BantoError, ErrorBody, ListParams, ListResult};
+use banto_plc::{Address, DataType, TagValue};
+use banto_plc_write::{
+    BatchWriteRequest, WriteRequest as PlcWriteRequest, WriteResult as PlcWriteResult,
+};
 use banto_server::{
     auth_routes, require_auth, require_banto_client_header, sse_route, ApiError, AuthState,
     Identity, ServerEvent,
 };
 use banto_tags::{
-    CollectionGroup, CollectionGroupInput, CollectionGroupService, PlcConnection,
-    PlcConnectionInput, PlcConnectionService, Tag, TagInput, TagService,
+    unscale, CollectionGroup, CollectionGroupInput, CollectionGroupService, PlcConnection,
+    PlcConnectionInput, PlcConnectionService, Scaling, Tag, TagInput, TagService, STRING_DATA_TYPE,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::str::FromStr;
 use tokio::sync::broadcast;
+use tokio::sync::Mutex as AsyncMutex;
 use utoipa::{OpenApi, ToSchema};
 
-use crate::api_keys::{ApiKeyLookup, ApiKeysService, IssuedApiKey};
+use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService, IssuedApiKey};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::hub::{CollectorManager, TagEntry};
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
+use crate::write_audit::{
+    WriteAuditAction, WriteAuditEntry, WriteAuditResult, WriteAuditRow, WriteAuditService,
+};
+use crate::write_control::WriteControl;
+use crate::write_rate::{WriteRateLimitConfig, WriteRateLimiter};
 
 // --- shared helpers (users/audit/RBAC - copied from chronogazer/relay-wright's rest.rs) ---
 
@@ -131,6 +142,42 @@ struct RoleGuard {
 
 fn forbidden_response() -> Response {
     (StatusCode::FORBIDDEN, Json(ErrorBody::Forbidden)).into_response()
+}
+
+/// T2-4（設計 §6-4「トリップ」）: トリップ中の API キーでの
+/// `/api/v1/*` アクセス - read/write いずれも 403。
+/// `crate::rest::require_tag_space_auth` から呼ぶ。
+fn key_tripped_response() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "error": "key_tripped" })),
+    )
+        .into_response()
+}
+
+/// T2-4（設計 §6-8、実装指示 §5「認証」）: `POST /api/v1/values/{tag}` を
+/// セッション token で叩いた場合の明示的な 403（§6-8: 「セッション token
+/// では書けない」）。
+fn session_token_cannot_write_response() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "session_token_cannot_write",
+            "message": "書き込みは write:{tag} スコープを持つ API キーでのみ可能です。管理 UI のセッション token では書き込めません。"
+        })),
+    )
+        .into_response()
+}
+
+/// T2-4（実装指示 §5「認証」）: `write:{tag}` スコープの完全一致を持たない
+/// API キー（`read` のみ、または別タグの `write:` スコープ）での書き込み
+/// 試行。
+fn missing_write_scope_response() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "error": "missing_write_scope" })),
+    )
+        .into_response()
 }
 
 async fn require_role_at_least(
@@ -789,6 +836,29 @@ async fn api_keys_revoke(
     Ok(Json(summary))
 }
 
+/// `POST /api/api-keys/{id}/clear-trip` - トリップ解除（冪等、T2-4・
+/// 設計 §6-4「復帰は管理 UI から手動」）。`revoke` と違い `tripped_at` は
+/// `NULL` に戻せる - `crate::api_keys` のモジュール doc comment「トリップ」
+/// 参照。
+async fn api_keys_clear_trip(
+    State(state): State<ApiKeysAdminState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::api_keys::ApiKeySummary>, ApiError> {
+    let summary = state.api_keys.clear_trip(id).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "clear_trip",
+        "api_keys",
+        &id.to_string(),
+        None,
+    )
+    .await;
+    Ok(Json(summary))
+}
+
 /// `/api/api-keys/*`（設計 §5.6・T0-2 実装指示: 「管理系ルーターに追加 —
 /// CSRF + bearer + RBAC admin 限定」）。T0-2 実装指示は発行/一覧/失効
 /// いずれも admin 限定と明記しているため、[`require_editor`]（editor 以上）
@@ -805,12 +875,162 @@ fn api_keys_router(api_keys: ApiKeysService, audit: AuditLogService, auth: AuthS
     Router::new()
         .route("/api/api-keys", get(api_keys_list).post(api_keys_create))
         .route("/api/api-keys/{id}/revoke", post(api_keys_revoke))
+        .route("/api/api-keys/{id}/clear-trip", post(api_keys_clear_trip))
         .with_state(state)
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
                 min: Role::Admin,
                 resource: "api_keys",
+                audit,
+            },
+            require_role_at_least,
+        ))
+        .layer(middleware::from_fn_with_state(auth, require_auth))
+}
+
+// --- 書き込み受付トグル (T2-4、設計 §6-6): admin 限定、CSRF + bearer -------
+//
+// `POST /api/write-control/enable`/`disable` は
+// `crate::write_control::WriteControl`（ライブフラグ、起動時 disabled）を
+// 切り替え、`crate::write_control::persist_enabled` で表示専用の永続値も
+// 更新する（`WriteControl` のモジュール doc comment 参照 - 永続値は次回
+// 起動時のライブフラグには一切影響しない）。
+
+#[derive(Clone)]
+struct WriteControlAdminState {
+    write_control: Arc<WriteControl>,
+    manager: Arc<CollectorManager>,
+    auth: AuthState,
+    audit: AuditLogService,
+    events: broadcast::Sender<ServerEvent>,
+}
+
+/// `GET /api/v1/status` の `write_enabled`/`write_was_enabled_before_restart`
+/// と同じ形の応答（`POST /api/write-control/enable|disable` の応答）。
+#[derive(Debug, Serialize, ToSchema)]
+struct WriteControlStatusResponse {
+    write_enabled: bool,
+    write_was_enabled_before_restart: bool,
+}
+
+async fn write_control_set(
+    state: &WriteControlAdminState,
+    headers: &HeaderMap,
+    enabled: bool,
+    action: &str,
+) -> Json<WriteControlStatusResponse> {
+    if enabled {
+        state.write_control.enable();
+    } else {
+        state.write_control.disable();
+    }
+
+    let identity = actor_identity(headers, &state.auth);
+    if let Err(err) = crate::write_control::persist_enabled(
+        &state.manager.pool(),
+        enabled,
+        identity.as_ref().map(|i| i.id.as_str()),
+    )
+    .await
+    {
+        eprintln!("banto-hub: 書き込み受付状態の永続化に失敗しました: {err}");
+    }
+
+    record_write(
+        &state.audit,
+        &state.auth,
+        headers,
+        action,
+        "write_control",
+        "1",
+        Some(json!({ "enabled": enabled })),
+    )
+    .await;
+    let _ = state.events.send(ServerEvent::ResourceChanged {
+        resource: "write_control".to_string(),
+    });
+
+    Json(WriteControlStatusResponse {
+        write_enabled: state.write_control.is_enabled(),
+        write_was_enabled_before_restart: state.write_control.was_enabled_before_restart(),
+    })
+}
+
+async fn write_control_enable(
+    State(state): State<WriteControlAdminState>,
+    headers: HeaderMap,
+) -> Json<WriteControlStatusResponse> {
+    write_control_set(&state, &headers, true, "enable").await
+}
+
+async fn write_control_disable(
+    State(state): State<WriteControlAdminState>,
+    headers: HeaderMap,
+) -> Json<WriteControlStatusResponse> {
+    write_control_set(&state, &headers, false, "disable").await
+}
+
+fn write_control_router(
+    write_control: Arc<WriteControl>,
+    manager: Arc<CollectorManager>,
+    audit: AuditLogService,
+    auth: AuthState,
+    events: broadcast::Sender<ServerEvent>,
+) -> Router {
+    let state = WriteControlAdminState {
+        write_control,
+        manager,
+        auth: auth.clone(),
+        audit: audit.clone(),
+        events,
+    };
+    Router::new()
+        .route("/api/write-control/enable", post(write_control_enable))
+        .route("/api/write-control/disable", post(write_control_disable))
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            RoleGuard {
+                auth: auth.clone(),
+                min: Role::Admin,
+                resource: "write_control",
+                audit,
+            },
+            require_role_at_least,
+        ))
+        .layer(middleware::from_fn_with_state(auth, require_auth))
+}
+
+// --- 書き込み監査の閲覧 (T2-4、設計 §6-3): admin 限定、CSRF + bearer -------
+
+#[derive(Clone)]
+struct WriteAuditAdminState {
+    write_audit: WriteAuditService,
+}
+
+async fn write_audit_list(
+    State(state): State<WriteAuditAdminState>,
+    Json(params): Json<ListParams>,
+) -> Result<Json<ListResult<WriteAuditEntry>>, ApiError> {
+    Ok(Json(state.write_audit.list(params).await?))
+}
+
+/// `/api/write-audit/list`（`crate::audit`の `audit_log_router` と同型:
+/// admin 限定、ページング付き POST 1本）。
+fn write_audit_router(
+    write_audit: WriteAuditService,
+    audit: AuditLogService,
+    auth: AuthState,
+) -> Router {
+    let state = WriteAuditAdminState { write_audit };
+    Router::new()
+        .route("/api/write-audit/list", post(write_audit_list))
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            RoleGuard {
+                auth: auth.clone(),
+                min: Role::Admin,
+                resource: "write_audit",
                 audit,
             },
             require_role_at_least,
@@ -1379,6 +1599,9 @@ fn tag_registry_router(
 #[derive(Clone)]
 pub(crate) struct TagSpaceState {
     pub(crate) manager: Arc<CollectorManager>,
+    /// T2-4（設計 §6-6）: `GET /api/v1/status` の `write_enabled`/
+    /// `write_was_enabled_before_restart` のため。
+    pub(crate) write_control: Arc<WriteControl>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1598,6 +1821,12 @@ struct StatusResponse {
     revision: u64,
     last_config_error: Option<String>,
     connections: Vec<ConnectionStatusEntry>,
+    /// T2-4（設計 §6-6）: 書き込み受付が今いま有効かどうか(ライブフラグ)。
+    write_enabled: bool,
+    /// T2-4（設計 §6-6）: プロセス再起動前は有効だったか(表示専用の履歴 -
+    /// `crate::write_control::WriteControl` のモジュール doc comment
+    /// 参照。ライブの `write_enabled` には一切影響しない)。
+    write_was_enabled_before_restart: bool,
 }
 
 /// `GET /api/v1/status` - `{ "version", "revision", "last_config_error",
@@ -1674,6 +1903,8 @@ async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResp
         revision,
         last_config_error,
         connections: entries,
+        write_enabled: state.write_control.is_enabled(),
+        write_was_enabled_before_restart: state.write_control.was_enabled_before_restart(),
     }))
 }
 
@@ -1765,6 +1996,472 @@ async fn v1_events(
     Ok(Json(EventsResponse { events }))
 }
 
+// --- 書き込みエンドポイント (T2-4、設計 §5.1「POST /api/v1/values/{tag}」・
+// §6 全体) -------------------------------------------------------------
+//
+// これがこの実装スライスの主役。ゲート順・監査・レート制限・受付トグルの
+// 規律は relay-wright の `engine/writer.rs` を直接の下敷きにしている
+// （§6 実装指示: 「参考実装は relay-wright の engine/{writer,rate_limiter,
+// arming,write_audit}.rs（設計は流用、コードは hub 語彙で書き直し）」）。
+// hub 固有の差分は主に3点:
+// - relay-wright の `Writer` はルールエンジンが生成する `PendingWrite` を
+//   1タスクが順に処理する専有構造だが、hub は複数の REST リクエストが
+//   並行に飛んでくるので、[`WriteRateLimiter`] を `tokio::sync::Mutex` で
+//   包んで共有する（peek→exceed 判定→(ゲート通過なら)record を1つの
+//   ロック区間に収めず、ロックは短時間だけ握って離す - 詳細は
+//   [`v1_write_value`] 本体のコメント参照）。
+// - relay-wright の disarm は「ルールエンジン全体」を止めるが、hub の
+//   `WriteControl` は `/api/v1/values/{tag}` という1エンドポイントの
+//   受付可否のみを制御する（収集自体は止めない）。
+// - 認証主体が「ルール」ではなく「API キー」なので、監査行の主語も
+//   `api_key_id`/`api_key_name_snapshot`（`crate::write_audit` 参照）。
+
+/// `POST /api/v1/values/{tag}` の request body（設計 §5.1「body
+/// `{ "v": <number|bool> }`」）。`v` は `serde_json::Value` のまま保持し、
+/// [`parse_requested_value`] で数値/真偽値のみを受理する（文字列・配列・
+/// オブジェクトは 422）— `bool` と `number` を1つの Rust 型に素直に
+/// マップする serde 表現がなく、utoipa の untagged enum サポートも弱いため、
+/// 検証はハンドラ内で行う。
+#[derive(Debug, Deserialize, ToSchema)]
+struct WriteValueRequest {
+    /// 書き込む工学値。数値、または bit タグ向けの真偽値
+    /// （真偽値は 1.0/0.0 として扱う）。
+    #[schema(value_type = f64, example = 1)]
+    v: serde_json::Value,
+}
+
+/// `POST /api/v1/values/{tag}` の成功応答（設計 §6 実装指示 §5「応答
+/// `{ "tag", "result": "ok" }`」）。
+#[derive(Debug, Serialize, ToSchema)]
+struct WriteValueResponse {
+    tag: String,
+    result: String,
+}
+
+/// リクエスト body の `v` を工学値の `f64` に正規化する。`bool` は
+/// `1.0`/`0.0`、数値はそのまま。文字列・配列・オブジェクト・`null` は
+/// `None`（呼び出し元が 422 `unsupported_value_type` を返す）。
+fn parse_requested_value(v: &serde_json::Value) -> Option<f64> {
+    if let Some(b) = v.as_bool() {
+        Some(if b { 1.0 } else { 0.0 })
+    } else {
+        v.as_f64()
+    }
+}
+
+/// 値変換ゲート(§6 実装指示 §5の7番「範囲チェックで422」)の数値範囲検査。
+/// `banto_plc_write::encode`(`encode_word_value`)と同じ境界値を意図的に
+/// ここで独立に再現している - その関数は `pub(crate)` でこの crate から
+/// 呼べないため。物理書き込み自体は broker 内部でもう一度
+/// `banto_plc_write::encode` を通るので二重チェックになるが、ここでの
+/// チェックには「範囲外の値を write_audit に一切残さず(gate 8 の
+/// log-before-write に到達する前に)弾ける」という利点がある - 明確な
+/// クライアントエラーであり、監査すべき「試行」には当たらない、という
+/// 判断（§6 実装指示: 「値の全量は入れない」と同じ、無駄な監査行を
+/// 増やさない方針の踏襲）。`DataType::Bit` はこの関数の呼び出し元
+/// ([`v1_write_value`])で既に分岐済みなので扱わない。
+fn validate_numeric_range(data_type: DataType, x: f64) -> Result<(), String> {
+    if !x.is_finite() {
+        return Err("値が有限ではありません".to_string());
+    }
+    let integral_in_range = |lo: f64, hi: f64| -> Result<(), String> {
+        if x.fract() != 0.0 {
+            return Err("整数ではありません".to_string());
+        }
+        if x < lo || x > hi {
+            return Err(format!("範囲 [{lo}, {hi}] の外です"));
+        }
+        Ok(())
+    };
+    match data_type {
+        DataType::U16 => integral_in_range(0.0, u16::MAX as f64),
+        DataType::I16 => integral_in_range(i16::MIN as f64, i16::MAX as f64),
+        DataType::U32 => integral_in_range(0.0, u32::MAX as f64),
+        DataType::I32 => integral_in_range(i32::MIN as f64, i32::MAX as f64),
+        DataType::F32 => {
+            if (x as f32).is_finite() {
+                Ok(())
+            } else {
+                Err("f32 で表現するには大きすぎます".to_string())
+            }
+        }
+        DataType::Bit => Ok(()),
+    }
+}
+
+/// [`v1_write_value`] とその周辺(レート制限・受付・監査)が必要とする状態
+/// 一式。`TagSpaceState`とは別の型にしているのは、axum のルーターは
+/// 1つの `State<T>` にしか `.with_state` できないため -
+/// [`tag_space_router`] は GET 系ハンドラ用の `TagSpaceState` の
+/// ルーターとこの `WriteState` のルーターを別々に組み立てて `.merge`
+/// する(同じパス `/api/v1/values/{tag}` に GET/POST 両方が乗るのは axum
+/// の `MethodRouter::merge_for_path` がそのまま面倒を見る)。
+#[derive(Clone)]
+struct WriteState {
+    manager: Arc<CollectorManager>,
+    api_keys: ApiKeysService,
+    write_audit: WriteAuditService,
+    write_control: Arc<WriteControl>,
+    /// タグ毎+全体の2段レート制限(設計 §6-4)。複数リクエストが並行して
+    /// 飛んでくるため`tokio::sync::Mutex`で包んで共有する - relay-wright
+    /// の `Writer` が単一タスク専有だったのと違い、hub はこの1個の
+    /// リミッタを複数リクエストが取り合う。ロックは「peek」「record」の
+    /// 各操作の間だけ短時間握る(§6 実装指示: 「record はゲート通過後・
+    /// 物理書き込み前」の意味論はロックの外で守る - [`v1_write_value`]
+    /// 本体参照)。
+    rate_limiter: Arc<AsyncMutex<WriteRateLimiter>>,
+    events: broadcast::Sender<ServerEvent>,
+}
+
+/// `POST /api/v1/values/{tag}` - 書き込み(設計 §5.1・§6 全体)。
+///
+/// ## ゲート順(§6 実装指示 §5、relay-wright `engine/writer.rs` のゲート順を踏襲)
+///
+/// 事前段(番号なし、§6-8「認証」): `crate::rest::require_tag_space_auth`
+/// を通過した時点で「有効な `bh_` API キー」であることは確定しているが、
+/// このハンドラ自身がさらに (a) セッション token では到達できない
+/// (ミドルウェア側で弾く - `ctx` extension が無ければ 403)、(b)
+/// `write:{tag}` スコープの完全一致、の2つを検査する。
+///
+/// 1. catalog 解決(未定義 404)
+/// 2. `writable == false` → 403 `not_writable`(監査不要 - 定義上の拒否)
+/// 3. 実効 enabled == false → 409 `tag_disabled`
+/// 4. Modbus 接続配下 → 501 `write_unsupported_protocol`(§6-7: v1 の
+///    書き込みは SLMP のみ)
+/// 5. write_enabled(受付)off → 503 `writes_disabled` + write_audit に
+///    suppressed_disabled
+/// 6. レート制限 would_exceed → 429 + キー trip + rate_limit_tripped 記録
+/// 7. 値変換: 工学値 → `banto_tags::unscale`(スケーリング設定があれば)
+///    → data_type に応じた `TagValue`(bit は bool、数値は範囲チェックで
+///    422)。文字列タグ(`data_type == "string"`)は 422 で拒否(収集も
+///    文字列を扱っていない - T2 では書き込み側も同じ線を引く)
+/// 8. **log-before-write** → `CollectorManager::write_broker_handle`
+///    経由の `BrokerHandle::write`(1タグ=1リクエスト)→ set_result →
+///    応答 `{ "tag", "result": "ok" }` または 502 `write_failed`
+///
+/// gate 6 の「would_exceed」判定(peek)と、gate 8 直前の実際の
+/// `record`(消費)は別々のロック区間 - 「ゲート通過後・物理書き込み前」
+/// (relay-wright と同じ「試行を数える」意味論、`crate::write_rate` の
+/// モジュール doc comment 参照)を守るため、gate 7(値変換・422になり
+/// うる)の**後**、gate 8 の broker 呼び出しの**前**に record する。
+#[utoipa::path(
+    post,
+    path = "/api/v1/values/{tag}",
+    params(("tag" = String, Path, description = "外部名 {connection}.{group}.{tag}")),
+    request_body = WriteValueRequest,
+    responses(
+        (status = 200, description = "書き込み成功", body = WriteValueResponse),
+        (status = 403, description = "not_writable / missing_write_scope / session_token_cannot_write / key_tripped"),
+        (status = 404, description = "catalog に存在しない外部名"),
+        (status = 409, description = "tag_disabled"),
+        (status = 422, description = "unsupported_value_type / value_out_of_range"),
+        (status = 429, description = "rate_limited"),
+        (status = 501, description = "write_unsupported_protocol"),
+        (status = 502, description = "write_failed"),
+        (status = 503, description = "writes_disabled"),
+    ),
+    tag = "tag-space",
+)]
+async fn v1_write_value(
+    State(state): State<WriteState>,
+    Path(tag): Path<String>,
+    ctx: Option<Extension<ApiKeyContext>>,
+    Json(body): Json<WriteValueRequest>,
+) -> Response {
+    // 事前段(a): セッション token では書けない(§6-8) - require_tag_space_auth
+    // は API キー・セッション token どちらでもここまで到達させるので、
+    // ここで ApiKeyContext extension の有無により再確認する。
+    let Some(Extension(ctx)) = ctx else {
+        return session_token_cannot_write_response();
+    };
+    // 事前段(b): write:{tag} スコープの完全一致(read スコープでは書けない)。
+    if !ctx.has_write_scope(&tag) {
+        return missing_write_scope_response();
+    }
+
+    // gate 1: catalog 解決
+    let map = state.manager.tag_map();
+    let Some(entry) = map.get(&tag).cloned() else {
+        return ApiError(BantoError::NotFound {
+            resource: "tags".to_string(),
+            id: tag,
+        })
+        .into_response();
+    };
+
+    // gate 2: writable opt-in
+    if !entry.writable {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({ "error": "not_writable" })),
+        )
+            .into_response();
+    }
+
+    // gate 3: 実効 enabled(接続・グループ・タグいずれかが無効なら false)
+    if !entry.enabled {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "tag_disabled" })),
+        )
+            .into_response();
+    }
+
+    let (connection_id, _group_id, tag_id) = entry.ids;
+    let conn = match PlcConnectionService::new(state.manager.pool())
+        .get(connection_id)
+        .await
+    {
+        Ok(conn) => conn,
+        Err(err) => return ApiError(err).into_response(),
+    };
+
+    // gate 4: Modbus 接続配下は非対応(§6-7: v1 の書き込みは SLMP のみ)
+    if conn.protocol != "slmp" {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({ "error": "write_unsupported_protocol" })),
+        )
+            .into_response();
+    }
+
+    // body の `v` を工学値へ正規化(パース自体はどのゲートにも属さないが、
+    // gate 5/6 の監査行に value_requested として残すため先に済ませる)。
+    let Some(requested) = parse_requested_value(&body.v) else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": "unsupported_value_type" })),
+        )
+            .into_response();
+    };
+
+    // gate 5: 書き込み受付(WriteControl)が off
+    if !state.write_control.is_enabled() {
+        let row = WriteAuditRow::new(
+            ctx.id,
+            ctx.name.clone(),
+            tag_id,
+            tag.clone(),
+            WriteAuditAction::Write,
+            WriteAuditResult::SuppressedDisabled,
+        )
+        .with_value_requested(requested);
+        if let Err(err) = state.write_audit.insert_row(&row).await {
+            eprintln!("banto-hub: 書き込み監査(suppressed_disabled)の記録に失敗しました: {err}");
+        }
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "writes_disabled" })),
+        )
+            .into_response();
+    }
+
+    // gate 6: レート制限(peek のみ - 実際の消費は gate 7 通過後)
+    let now = Instant::now();
+    let would_exceed = {
+        let mut limiter = state.rate_limiter.lock().await;
+        limiter.would_exceed(tag_id, now)
+    };
+    if would_exceed {
+        let trip_result = state.api_keys.trip(ctx.id).await;
+        let detail = match trip_result {
+            Ok(_) => "レート制限を超過したため API キーをトリップしました".to_string(),
+            Err(err) => {
+                format!("レート制限を超過しましたが、API キーのトリップに失敗しました: {err}")
+            }
+        };
+        let row = WriteAuditRow::new(
+            ctx.id,
+            ctx.name.clone(),
+            tag_id,
+            tag.clone(),
+            WriteAuditAction::RateLimitTripped,
+            WriteAuditResult::SuppressedRateLimited,
+        )
+        .with_value_requested(requested)
+        .with_detail(detail);
+        if let Err(err) = state.write_audit.insert_row(&row).await {
+            eprintln!("banto-hub: 書き込み監査(rate_limit_tripped)の記録に失敗しました: {err}");
+        }
+        // collect_events には書かない(設計判断、このセクション冒頭の
+        // モジュール doc comment 参照) - 管理 UI 向けの SSE のみで通知する。
+        let _ = state.events.send(ServerEvent::Notice {
+            level: "warning".to_string(),
+            message: format!(
+                "書き込みレート制限を超過したため API キー '{}' をトリップしました(タグ: {tag})",
+                ctx.name
+            ),
+        });
+        let _ = state.events.send(ServerEvent::ResourceChanged {
+            resource: "api_keys".to_string(),
+        });
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "rate_limited" })),
+        )
+            .into_response();
+    }
+
+    // gate 7: 値変換 - 文字列タグは拒否
+    if entry.data_type == STRING_DATA_TYPE {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "unsupported_value_type",
+                "detail": "文字列タグへの書き込みは T2 では未対応です"
+            })),
+        )
+            .into_response();
+    }
+    let Some(data_type) = DataType::parse(&entry.data_type) else {
+        // catalog に載っている時点で banto-tags の CHECK 制約を通過済みの
+        // はずなので実運用では到達しない防御的分岐。
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": "unsupported_value_type" })),
+        )
+            .into_response();
+    };
+
+    let tag_row = match TagService::new(state.manager.pool()).get(tag_id).await {
+        Ok(tag_row) => tag_row,
+        Err(err) => return ApiError(err).into_response(),
+    };
+    // スケーリング設定があれば工学値→raw に unscale する(無ければ工学値
+    // そのものが raw)。`Scaling::from_parts` は永続化済みの行に対しては
+    // 到達不能な Err のみを返す(banto-tags の validate_tag_input が保存時
+    // に「4列すべて or 全部NULL」「raw_lo != raw_hi」を強制済み) - 防御的
+    // に no-scaling へフォールバックする。
+    let scaling = Scaling::from_parts(
+        tag_row.raw_lo,
+        tag_row.raw_hi,
+        tag_row.eng_lo,
+        tag_row.eng_hi,
+        "scaling",
+    )
+    .unwrap_or(None);
+    let raw = match scaling {
+        Some(scaling) => unscale(requested, &scaling),
+        None => requested,
+    };
+
+    let tag_value = if data_type == DataType::Bit {
+        TagValue::Bit(raw != 0.0)
+    } else {
+        match validate_numeric_range(data_type, raw) {
+            Ok(()) => TagValue::F64(raw),
+            Err(detail) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({ "error": "value_out_of_range", "detail": detail })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    let address = match Address::parse_slmp(&entry.address) {
+        Ok(address) => address,
+        Err(err) => {
+            // catalog のアドレスは登録時に banto-tags で検証済みのはずの
+            // 防御的分岐(§6-7: writable にできるのは SLMP 接続配下のタグ
+            // のみなので、ここに来る時点でアドレスは SLMP 表記のはず)。
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error": "invalid_address", "detail": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    // gate 8: log-before-write
+    let pending_row = WriteAuditRow::new(
+        ctx.id,
+        ctx.name.clone(),
+        tag_id,
+        tag.clone(),
+        WriteAuditAction::Write,
+        WriteAuditResult::Ok,
+    )
+    .with_value_requested(requested);
+    let audit_id = match state.write_audit.insert_pending(&pending_row).await {
+        Ok(id) => id,
+        Err(err) => {
+            eprintln!("banto-hub: 書き込み監査(log-before-write)の記録に失敗しました: {err}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "audit_write_failed" })),
+            )
+                .into_response();
+        }
+    };
+
+    // record はゲート通過後・物理書き込み前(§6 実装指示、
+    // `crate::write_rate` のモジュール doc comment 参照)。
+    {
+        let mut limiter = state.rate_limiter.lock().await;
+        limiter.record(tag_id, now);
+    }
+
+    let handle = match state.manager.write_broker_handle(&conn) {
+        Ok(handle) => handle,
+        Err(err) => {
+            if let Err(update_err) = state
+                .write_audit
+                .set_result(audit_id, WriteAuditResult::Failed)
+                .await
+            {
+                eprintln!("banto-hub: 書き込み監査の確定に失敗しました: {update_err}");
+            }
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": "write_failed", "detail": err.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let request = BatchWriteRequest::Numeric(PlcWriteRequest {
+        address,
+        data_type,
+        value: tag_value,
+    });
+    let write_outcome = handle.write(vec![request]).await;
+
+    let final_result = match &write_outcome {
+        Ok(results) if results.first().is_some_and(PlcWriteResult::is_ok) => WriteAuditResult::Ok,
+        _ => WriteAuditResult::Failed,
+    };
+    if let Err(err) = state.write_audit.set_result(audit_id, final_result).await {
+        eprintln!("banto-hub: 書き込み監査の確定に失敗しました: {err}");
+    }
+
+    match write_outcome {
+        Ok(results) => match results.into_iter().next() {
+            Some(PlcWriteResult::Ok) => Json(WriteValueResponse {
+                tag,
+                result: "ok".to_string(),
+            })
+            .into_response(),
+            Some(PlcWriteResult::Bad(write_err)) => (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": "write_failed", "detail": write_err.to_string() })),
+            )
+                .into_response(),
+            None => (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": "write_failed", "detail": "broker から応答がありませんでした" })),
+            )
+                .into_response(),
+        },
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": "write_failed", "detail": err.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 // --- OpenAPI 自動生成（設計 §5.1・§10-6、2026-08-04 決定） ------------------
 //
 // catalog（`/api/v1/tags`）はクライアントとの互換性契約（設計 §4.1）なので、
@@ -1778,9 +2475,16 @@ async fn v1_events(
     info(
         title = "banto-hub タグ空間 API",
         version = "v1",
-        description = "banto-hub の /api/v1/* 読み取り API（docs/tag-server-design.md §5.1）。catalog（/api/v1/tags）はクライアントとの互換性契約である（§4.1）: 外部名・安定 ID・revision を用いたバインディングを前提に、フィールド名や JSON 形はこのスキーマとコードが常に一致するよう utoipa で自動生成している。"
+        description = "banto-hub の /api/v1/* API（docs/tag-server-design.md §5.1）。catalog（/api/v1/tags）はクライアントとの互換性契約である（§4.1）: 外部名・安定 ID・revision を用いたバインディングを前提に、フィールド名や JSON 形はこのスキーマとコードが常に一致するよう utoipa で自動生成している。書き込み（POST /api/v1/values/{tag}、T2-4・§6）は writable タグのみ・write:{tag} スコープの API キー限定。"
     ),
-    paths(v1_tags, v1_values, v1_value_single, v1_status, v1_events),
+    paths(
+        v1_tags,
+        v1_values,
+        v1_value_single,
+        v1_write_value,
+        v1_status,
+        v1_events,
+    ),
     components(schemas(
         TagEntry,
         CatalogResponse,
@@ -1790,6 +2494,8 @@ async fn v1_events(
         StatusResponse,
         EventEntry,
         EventsResponse,
+        WriteValueRequest,
+        WriteValueResponse,
     ))
 )]
 struct ApiDoc;
@@ -1821,34 +2527,53 @@ struct TagSpaceAuthState {
 /// - `Authorization` ヘッダがない、または `Bearer ` で始まらない → 401
 /// - 値が `bh_` で始まる → API キーとして
 ///   [`crate::api_keys::ApiKeysService::lookup`] で照合:
-///   - [`ApiKeyLookup::Valid`] だが `read` スコープを持たない（`write:` の
-///     みのキー等）→ 403（認証はできたが権限がない、という区別のため
-///     401 ではなく 403 - `banto_core::BantoError::Forbidden` と同じ規約）
-///   - [`ApiKeyLookup::Valid`] かつ `read` スコープあり → 通過。
+///   - [`ApiKeyLookup::Valid`] → `POST /api/v1/values/{tag}`（書き込み、
+///     T2-4）以外は `read` スコープを要求する（`write:` のみのキー等は
+///     403 - 認証はできたが権限がない、という区別のため 401 ではなく
+///     403）。書き込みルートは `read` を要求せず、代わりに
+///     [`v1_write_value`] 自身が `write:{tag}` の完全一致を検査する
+///     （リクエスト path の `{tag}` はここではまだ分からないため）。
+///     いずれの場合も通過時は [`ApiKeyContext`] をリクエスト
+///     extensions に載せて次段へ渡す（[`v1_write_value`] がスコープ
+///     検査と監査行の `api_key_id`/`api_key_name_snapshot` に使う）。
 ///     `last_used_at` を60秒スロットルで更新（[`crate::api_keys::should_touch_last_used`]）
 ///   - [`ApiKeyLookup::Revoked`] → 401 + audit_log に
 ///     `action: "denied", resource: "api_keys"` を記録（設計 T0-2 実装
 ///     指示: 「失効済みキーでのアクセス試行は audit_log に記録する」）
+///   - [`ApiKeyLookup::Tripped`]（T2-4、設計 §6-4）→ 403
+///     `{ "error": "key_tripped" }` + audit_log に同様の `denied` 記録
+///     （read/write いずれのリクエストも拒否 - `crate::api_keys` の
+///     モジュール doc comment「トリップ」参照）
 ///   - [`ApiKeyLookup::NotFound`] → 401（監査記録しない - 存在しない/
 ///     偽造されたキーは「誰が」を特定できないただのノイズであり、
 ///     revoked の場合と違って「元は正規に発行されたキーが使われた」という
 ///     実害のシグナルがない）
 /// - それ以外（`bh_` で始まらない）→ 従来どおり `AuthState` のセッション
 ///   token として照合（管理 UI からの利用互換のため - このモジュールの
-///   doc comment参照）
+///   doc comment参照）。ただし書き込みルートに限っては 403
+///   `session_token_cannot_write` を返す（設計 §6-8: 「セッション token
+///   では書けない」）
 async fn require_tag_space_auth(
     State(state): State<TagSpaceAuthState>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let Some(token) = bearer_token(req.headers()) else {
+    let Some(token) = bearer_token(req.headers()).map(str::to_string) else {
         return unauthorized_response();
     };
 
+    // T2-4（設計 §6-8）: `POST /api/v1/values/{tag}` だけ認証規律が違う
+    // （read スコープ不要・write:{tag} は `v1_write_value` 自身が検査・
+    // セッション token 不可）- パスは `/api/v1/values/{tag}` の
+    // ちょうど1階層下なので、`/api/v1/values`（一括スナップショット）や
+    // `/api/v1/values/{tag}` への GET とは POST であることで区別する。
+    let is_write_route =
+        req.method() == Method::POST && req.uri().path().starts_with("/api/v1/values/");
+
     if token.starts_with("bh_") {
-        match state.api_keys.lookup(token).await {
+        match state.api_keys.lookup(&token).await {
             Ok(ApiKeyLookup::Valid(ctx)) => {
-                if !ctx.has_read_scope() {
+                if !is_write_route && !ctx.has_read_scope() {
                     return forbidden_response();
                 }
                 let now_ms = state.manager.clock().now_ms();
@@ -1859,6 +2584,7 @@ async fn require_tag_space_auth(
                 {
                     eprintln!("banto-hub: API キーの last_used_at 更新に失敗しました: {err}");
                 }
+                req.extensions_mut().insert(ctx);
                 next.run(req).await
             }
             Ok(ApiKeyLookup::Revoked { id, name }) => {
@@ -1879,13 +2605,34 @@ async fn require_tag_space_auth(
                     .await;
                 unauthorized_response()
             }
+            Ok(ApiKeyLookup::Tripped { id, name }) => {
+                let method = req.method().as_str().to_string();
+                let path = req.uri().path().to_string();
+                state
+                    .audit
+                    .record(AuditEntry {
+                        actor_username: None,
+                        actor_role: None,
+                        action: "denied",
+                        resource: "api_keys",
+                        entity_id: Some(&id.to_string()),
+                        detail: Some(json!({ "reason": "tripped", "name": name, "method": method, "path": path })),
+                        origin: "rest",
+                        result: "denied",
+                    })
+                    .await;
+                key_tripped_response()
+            }
             Ok(ApiKeyLookup::NotFound) => unauthorized_response(),
             Err(err) => {
                 eprintln!("banto-hub: API キー照合に失敗しました: {err}");
                 unauthorized_response()
             }
         }
-    } else if state.auth.verify(token) {
+    } else if state.auth.verify(&token) {
+        if is_write_route {
+            return session_token_cannot_write_response();
+        }
         next.run(req).await
     } else {
         unauthorized_response()
@@ -1896,22 +2643,45 @@ async fn require_tag_space_auth(
 /// セッション bearer 併用）を全ルートに適用する。`GET /api/v1/openapi.json`
 /// は別ルーター（`openapi_router`、`crate::rest::api_router` 参照）に分けて
 /// あり、この認証層を通らない。
+///
+/// T2-4: GET 系ハンドラ（[`TagSpaceState`]）と書き込みハンドラ
+/// （[`WriteState`]）は状態型が違うため axum の `Router` を分けて組み立て、
+/// `.merge()` してから認証レイヤーを1枚だけ被せる（同じ
+/// `/api/v1/values/{tag}` パスに GET/POST が同居するのは axum の
+/// `MethodRouter` マージがそのまま面倒を見る - `WriteState`のモジュール
+/// doc comment参照）。
+#[allow(clippy::too_many_arguments)]
 fn tag_space_router(
     manager: Arc<CollectorManager>,
     auth: AuthState,
     api_keys: ApiKeysService,
     audit: AuditLogService,
+    write_control: Arc<WriteControl>,
+    write_audit: WriteAuditService,
+    events: broadcast::Sender<ServerEvent>,
 ) -> Router {
     let state = TagSpaceState {
         manager: manager.clone(),
+        write_control: write_control.clone(),
     };
     let auth_state = TagSpaceAuthState {
-        auth,
-        api_keys,
+        auth: auth.clone(),
+        api_keys: api_keys.clone(),
         audit,
-        manager,
+        manager: manager.clone(),
     };
-    Router::new()
+    let write_state = WriteState {
+        manager: manager.clone(),
+        api_keys,
+        write_audit,
+        write_control,
+        rate_limiter: Arc::new(AsyncMutex::new(WriteRateLimiter::new(
+            WriteRateLimitConfig::default(),
+        ))),
+        events,
+    };
+
+    let read_router = Router::new()
         .route("/api/v1/tags", get(v1_tags))
         .route("/api/v1/values", get(v1_values))
         .route("/api/v1/values/{tag}", get(v1_value_single))
@@ -1922,7 +2692,14 @@ fn tag_space_router(
         // リクエスト自体が普通の HTTP GET なので、この `.layer` がそのまま
         // 効く（`crate::stream` 側の doc comment 参照）。
         .route("/api/v1/stream", get(crate::stream::ws_upgrade))
-        .with_state(state)
+        .with_state(state);
+
+    let write_router = Router::new()
+        .route("/api/v1/values/{tag}", post(v1_write_value))
+        .with_state(write_state);
+
+    read_router
+        .merge(write_router)
         .layer(middleware::from_fn_with_state(
             auth_state,
             require_tag_space_auth,
@@ -1953,6 +2730,12 @@ pub fn api_router(
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
     allow_setup: bool,
+    // T2-4（設計 §6）: 書き込み受付の起動時 disabled フラグと書き込み監査
+    // サービス - どちらも `bin/banto-hub.rs`（本番）または各テストの
+    // セットアップで一度だけ構築し、ここに注入する（`ApiKeysService` 等の
+    // 他サービスと同じ規約）。
+    write_control: Arc<WriteControl>,
+    write_audit: WriteAuditService,
 ) -> Router {
     let audited_auth_routes = auth_routes(auth.clone()).layer(middleware::from_fn_with_state(
         LogoutAuditState {
@@ -1985,12 +2768,32 @@ pub fn api_router(
             audit.clone(),
             auth.clone(),
             manager.clone(),
-            events,
+            events.clone(),
+        ))
+        .merge(write_control_router(
+            write_control.clone(),
+            manager.clone(),
+            audit.clone(),
+            auth.clone(),
+            events.clone(),
+        ))
+        .merge(write_audit_router(
+            write_audit.clone(),
+            audit.clone(),
+            auth.clone(),
         ))
         .layer(middleware::from_fn(require_banto_client_header));
 
     admin
-        .merge(tag_space_router(manager, auth, api_keys, audit))
+        .merge(tag_space_router(
+            manager,
+            auth,
+            api_keys,
+            audit,
+            write_control,
+            write_audit,
+            events,
+        ))
         .merge(openapi_router())
 }
 
@@ -2084,6 +2887,8 @@ mod tests {
             .await
             .expect("viewer login");
 
+        let write_control = Arc::new(crate::write_control::WriteControl::new(false));
+        let write_audit = crate::write_audit::WriteAuditService::new(pool.clone());
         let router = api_router(
             users,
             audit,
@@ -2095,6 +2900,8 @@ mod tests {
             auth,
             tx,
             false,
+            write_control,
+            write_audit,
         );
         TestEnv {
             router,
