@@ -6,19 +6,23 @@
 //! 起動シーケンス: init_db → 各サービス構築 → `HubSessions` 構築（T2-2、設計
 //! §6-5。`CollectorManager` の外で生存するブローカーセッション directory）→
 //! `CollectorManager::rebuild()`（起動時1回、設計 §4.3）→ tstore 剪定
-//! （起動時1回 + 24h 周期、設計 §3.3・保持既定7日）→ axum サーバー起動 →
-//! Ctrl-C 待機 → Collector 停止（flush）→ ブローカーセッション停止 →
-//! サーバー停止。
+//! （起動時1回 + 24h 周期、設計 §3.3・保持既定7日）→ `MqttPublisher`構築 +
+//! settings の永続値を`apply`（T3、設計 §5.3。`mqtt.enabled=false`なら
+//! 何も起動しない）→ axum サーバー起動 → Ctrl-C 待機 → MQTT 停止 →
+//! Collector 停止（flush）→ ブローカーセッション停止 → サーバー停止。
 //!
-//! ## シャットダウン順序（T2-2、設計 §6-5）
+//! ## シャットダウン順序（T2-2、設計 §6-5 / T3、設計 §5.3）
 //!
-//! `manager.shutdown()`（`Collector` 停止・tstore flush）を必ず
-//! `sessions.shutdown()`（broker タスク停止）より先に呼ぶ。逆順だと
+//! `mqtt.shutdown()`（MQTT publish タスク停止）→ `manager.shutdown()`
+//! （`Collector` 停止・tstore flush）→ `sessions.shutdown()`（broker タスク
+//! 停止）の順を守る。`manager`→`sessions`の順が先に必要な理由（逆順だと
 //! broker セッションが消えた後もまだ実行中の収集タスクが
 //! `BrokerReadClient::read_batch` を呼び、`BrokerError::TaskGone` 由来の
-//! `PlcError` を毎回受け取ってから初めて停止することになる（実害はない、
+//! `PlcError` を毎回受け取ってから初めて停止することになる - 実害はない、
 //! 既存の read_batch エラー処理がそのまま吸収する、が無駄な1サイクル分の
-//! エラー往復を避けるため、この順序を守る）。
+//! エラー往復を避けるため、この順序を守る）に加え、`mqtt`は`manager`の
+//! `tag_map`/`current_values`を読むだけの消費者（`crate::mqtt`のモジュール
+//! doc comment参照）なので、依存する側（`mqtt`）を先に止める。
 //!
 //! 環境変数: `PORT`（既定は settings の `server.port`、さらに未設定なら
 //! 8722）、`BANTO_BIND`（既定は settings の `server.bind`、さらに未設定なら
@@ -39,6 +43,7 @@ use banto_hub_core::broker_glue::HubSessions;
 use banto_hub_core::db::init_db;
 use banto_hub_core::events::event_channel;
 use banto_hub_core::hub::CollectorManager;
+use banto_hub_core::mqtt::MqttPublisher;
 use banto_hub_core::rest::{api_router, audited_credential_verifier};
 use banto_hub_core::settings::SettingsService;
 use banto_hub_core::users::UsersService;
@@ -144,6 +149,20 @@ async fn main() {
     let write_control = Arc::new(WriteControl::new(write_was_enabled_persisted));
     let write_audit = WriteAuditService::new(pool.clone());
 
+    // T3 (docs/tag-server-design.md §5.3): construct stopped, then apply the
+    // persisted settings - same "constructed disabled, then explicitly
+    // brought up" shape as `WriteControl` above, but here `enabled` itself
+    // (not just a display-only history flag) comes straight from settings -
+    // MQTT publish has no "restart always disables" safety rule like the
+    // write path does (design has no such requirement for T3; publishing is
+    // read-only against the tag space).
+    let mqtt = Arc::new(MqttPublisher::new(manager.clone()));
+    let mqtt_settings = settings.mqtt_config().await.unwrap_or_else(|err| {
+        eprintln!("banto-hub: MQTT 設定の読み取りに失敗しました: {err}");
+        banto_hub_core::settings::MqttSettings::default()
+    });
+    mqtt.apply(&mqtt_settings).await;
+
     let app = api_router(
         users,
         audit,
@@ -157,6 +176,7 @@ async fn main() {
         allow_setup,
         write_control,
         write_audit,
+        mqtt.clone(),
     )
     .merge(static_router::<FrontendAssets>());
 
@@ -183,6 +203,11 @@ async fn main() {
         .await
         .expect("failed to listen for ctrl-c");
     println!("banto-hub: shutting down");
+    // T3: stop the MQTT publisher (a consumer of `manager`) before
+    // `manager.shutdown()` - same dependency-order reasoning as
+    // `manager.shutdown()` before `sessions.shutdown()` below (stop the
+    // dependent first, then the thing it depends on).
+    mqtt.shutdown().await;
     manager.shutdown().await;
     sessions.shutdown().await;
     server.stop().await;

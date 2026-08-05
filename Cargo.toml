@@ -120,3 +120,11 @@ tokio-tungstenite = "0.29"
 banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v0.1.1" }
 banto-storage = { git = "https://github.com/tyaro/banto.git", tag = "v0.1.1" }
 banto-server = { git = "https://github.com/tyaro/banto.git", tag = "v0.1.1" }
+# T3（docs/tag-server-design.md §5.3）: banto-hub の MQTT publish（外部ブロー
+# カーへ接続するクライアントモードのみ - 組み込みブローカーは §10-4 の判断
+# 待ち）。plan.md §3 で保留になっていた「MQTT クライアント（rumqttc +
+# タグバインド）」行をここで回収する。`apps/banto-hub/core` のみが使う。
+# 既定 feature `use-rustls`（TLS）は落とす - 設計 §5.6「v1 では平文 +
+# 閉域 LAN 前提」（TLS 終端はリバースプロキシに委譲）で TLS 接続はスコープ外
+# のため、rustls 一式を Cargo.lock の依存木に増やさない。
+rumqttc = { version = "0.25", default-features = false }

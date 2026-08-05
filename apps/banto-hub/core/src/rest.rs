@@ -56,7 +56,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use banto_broker::BrokerConnectionStatus;
 use banto_collect::ConnectionStatus;
-use banto_core::{BantoError, ErrorBody, ListParams, ListResult};
+use banto_core::{BantoError, ErrorBody, FieldError, ListParams, ListResult};
 use banto_plc::{Address, DataType, TagValue};
 use banto_plc_write::{
     BatchWriteRequest, WriteRequest as PlcWriteRequest, WriteResult as PlcWriteResult,
@@ -79,6 +79,8 @@ use utoipa::{OpenApi, ToSchema};
 use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService, IssuedApiKey};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::hub::{CollectorManager, TagEntry};
+use crate::mqtt::MqttPublisher;
+use crate::settings::{MqttSettings, SettingsService};
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
 use crate::write_audit::{
     WriteAuditAction, WriteAuditEntry, WriteAuditResult, WriteAuditRow, WriteAuditService,
@@ -1001,6 +1003,210 @@ fn write_control_router(
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
 
+// --- MQTT 設定 (T3、設計 §5.3): admin 限定、CSRF + bearer -------------------
+//
+// `GET/PUT /api/mqtt-settings`（実装指示どおり）。`write_control_router`と
+// 同型: admin ロール限定 + CSRF(`require_banto_client_header`は`api_router`
+// 側で管理系ルーター全体に一括で被せる) + `PUT`成功で
+// `crate::mqtt::MqttPublisher::apply`を呼んで即時適用する（実装指示「保存で
+// 即時適用」）。
+
+#[derive(Clone)]
+struct MqttSettingsAdminState {
+    manager: Arc<CollectorManager>,
+    mqtt: Arc<MqttPublisher>,
+    auth: AuthState,
+    audit: AuditLogService,
+    events: broadcast::Sender<ServerEvent>,
+}
+
+/// `GET/PUT /api/mqtt-settings`の request/response body。admin-UI 向け
+/// リソースの流儀（`ApiKeySummary`等）に合わせて camelCase。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MqttSettingsRequest {
+    enabled: bool,
+    host: String,
+    port: u16,
+    client_id: String,
+    #[serde(default)]
+    username: Option<String>,
+    /// 空文字は「変更なし」（既存のパスワードを維持）- 実装指示どおり
+    /// （`crate::settings::MqttSettings`のフィールド doc comment参照）。
+    /// `GET`はパスワードを一切返さないので、UI が「今の値」を知らずに
+    /// フォームを保存しても上書きされない。
+    #[serde(default)]
+    password: Option<String>,
+    prefix: String,
+    qos: u8,
+    min_interval_ms: i64,
+}
+
+/// `password`フィールドが**存在しない**- 実装指示「password は GET で
+/// 返さない」をレスポンス型そのもので保証する（`serde`のシリアライズ対象
+/// フィールドに含めていないので、実装ミスで漏らしようがない）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MqttSettingsResponse {
+    enabled: bool,
+    host: String,
+    port: u16,
+    client_id: String,
+    username: Option<String>,
+    prefix: String,
+    qos: u8,
+    min_interval_ms: i64,
+}
+
+impl From<MqttSettings> for MqttSettingsResponse {
+    fn from(config: MqttSettings) -> Self {
+        Self {
+            enabled: config.enabled,
+            host: config.host,
+            port: config.port,
+            client_id: config.client_id,
+            username: config.username,
+            prefix: config.prefix,
+            qos: config.qos,
+            min_interval_ms: config.min_interval_ms,
+        }
+    }
+}
+
+async fn mqtt_settings_get(
+    State(state): State<MqttSettingsAdminState>,
+) -> Result<Json<MqttSettingsResponse>, ApiError> {
+    let config = SettingsService::new(state.manager.pool())
+        .mqtt_config()
+        .await?;
+    Ok(Json(config.into()))
+}
+
+/// 入力検証（設計 §5.3 の制約をそのまま反映）:
+/// - `qos`は0/1のみ（「2は使わない」）
+/// - `min_interval_ms`は0以上
+/// - `enabled=true`のときは`host`必須（無効化するだけなら未入力のままでよい）
+fn validate_mqtt_settings_request(body: &MqttSettingsRequest) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+    if body.qos > 1 {
+        errors.push(FieldError {
+            field: "qos".to_string(),
+            message: "qos は 0 または 1 のみ対応しています(2 は使いません)".to_string(),
+        });
+    }
+    if body.min_interval_ms < 0 {
+        errors.push(FieldError {
+            field: "minIntervalMs".to_string(),
+            message: "minIntervalMs は 0 以上である必要があります".to_string(),
+        });
+    }
+    if body.enabled && body.host.trim().is_empty() {
+        errors.push(FieldError {
+            field: "host".to_string(),
+            message: "MQTT を有効にする場合は host が必須です".to_string(),
+        });
+    }
+    if body.client_id.trim().is_empty() {
+        errors.push(FieldError {
+            field: "clientId".to_string(),
+            message: "clientId は必須です".to_string(),
+        });
+    }
+    if body.prefix.trim().is_empty() {
+        errors.push(FieldError {
+            field: "prefix".to_string(),
+            message: "prefix は必須です".to_string(),
+        });
+    }
+    errors
+}
+
+async fn mqtt_settings_put(
+    State(state): State<MqttSettingsAdminState>,
+    headers: HeaderMap,
+    Json(body): Json<MqttSettingsRequest>,
+) -> Result<Json<MqttSettingsResponse>, ApiError> {
+    let field_errors = validate_mqtt_settings_request(&body);
+    if !field_errors.is_empty() {
+        return Err(ApiError(BantoError::Validation { field_errors }));
+    }
+
+    let settings_service = SettingsService::new(state.manager.pool());
+    // 空文字パスワードは「変更なし」- 現在の永続値を読んでフォールバック
+    // する（`MqttSettingsRequest::password`のdoc comment参照）。
+    let existing = settings_service.mqtt_config().await?;
+    let password = match body.password.as_deref() {
+        Some(value) if !value.is_empty() => Some(value.to_string()),
+        _ => existing.password,
+    };
+
+    let config = MqttSettings {
+        enabled: body.enabled,
+        host: body.host,
+        port: body.port,
+        client_id: body.client_id,
+        username: body.username.filter(|value| !value.is_empty()),
+        password,
+        prefix: body.prefix,
+        qos: body.qos,
+        min_interval_ms: body.min_interval_ms,
+    };
+    settings_service.set_mqtt_config(&config).await?;
+
+    // 実装指示「保存で即時適用」- CollectorManager::rebuild と同じ「古い
+    // タスクを止めて新しいタスク」パターン（`crate::mqtt`のモジュール doc
+    // comment参照）。
+    state.mqtt.apply(&config).await;
+
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "update",
+        "mqtt_settings",
+        "1",
+        Some(json!({ "enabled": config.enabled })),
+    )
+    .await;
+    let _ = state.events.send(ServerEvent::ResourceChanged {
+        resource: "mqtt_settings".to_string(),
+    });
+
+    Ok(Json(config.into()))
+}
+
+fn mqtt_settings_router(
+    manager: Arc<CollectorManager>,
+    mqtt: Arc<MqttPublisher>,
+    audit: AuditLogService,
+    auth: AuthState,
+    events: broadcast::Sender<ServerEvent>,
+) -> Router {
+    let state = MqttSettingsAdminState {
+        manager,
+        mqtt,
+        auth: auth.clone(),
+        audit: audit.clone(),
+        events,
+    };
+    Router::new()
+        .route(
+            "/api/mqtt-settings",
+            get(mqtt_settings_get).put(mqtt_settings_put),
+        )
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            RoleGuard {
+                auth: auth.clone(),
+                min: Role::Admin,
+                resource: "mqtt_settings",
+                audit,
+            },
+            require_role_at_least,
+        ))
+        .layer(middleware::from_fn_with_state(auth, require_auth))
+}
+
 // --- 書き込み監査の閲覧 (T2-4、設計 §6-3): admin 限定、CSRF + bearer -------
 
 #[derive(Clone)]
@@ -1602,6 +1808,8 @@ pub(crate) struct TagSpaceState {
     /// T2-4（設計 §6-6）: `GET /api/v1/status` の `write_enabled`/
     /// `write_was_enabled_before_restart` のため。
     pub(crate) write_control: Arc<WriteControl>,
+    /// T3（設計 §5.3）: `GET /api/v1/status` の `mqtt.connected` のため。
+    pub(crate) mqtt: Arc<MqttPublisher>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1814,6 +2022,18 @@ struct ConnectionStatusEntry {
     attempt: Option<u32>,
 }
 
+/// `GET /api/v1/status` の `mqtt`（T3、設計実装指示「`/api/v1/status` に
+/// `mqtt: { "enabled": bool, "connected": bool }` を追加」）。`enabled` は
+/// 設定値（settings テーブルの `mqtt.enabled`）、`connected` は
+/// [`crate::mqtt::MqttPublisher::connected`]（実際に MQTT ブローカーへ接続
+/// できているかのライブ状態）- 両者は独立: `enabled=true` でもブローカー
+/// 不通なら `connected=false` になる。
+#[derive(Debug, Serialize, ToSchema)]
+struct MqttStatusEntry {
+    enabled: bool,
+    connected: bool,
+}
+
 /// `GET /api/v1/status` の応答。
 #[derive(Debug, Serialize, ToSchema)]
 struct StatusResponse {
@@ -1827,6 +2047,8 @@ struct StatusResponse {
     /// `crate::write_control::WriteControl` のモジュール doc comment
     /// 参照。ライブの `write_enabled` には一切影響しない)。
     write_was_enabled_before_restart: bool,
+    /// T3（設計 §5.3）: MQTT publish の設定/接続状態。
+    mqtt: MqttStatusEntry,
 }
 
 /// `GET /api/v1/status` - `{ "version", "revision", "last_config_error",
@@ -1857,6 +2079,9 @@ async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResp
         .list(ListParams::default())
         .await?
         .rows;
+    let mqtt_settings = SettingsService::new(state.manager.pool())
+        .mqtt_config()
+        .await?;
 
     let entries: Vec<ConnectionStatusEntry> = connections
         .into_iter()
@@ -1905,6 +2130,10 @@ async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResp
         connections: entries,
         write_enabled: state.write_control.is_enabled(),
         write_was_enabled_before_restart: state.write_control.was_enabled_before_restart(),
+        mqtt: MqttStatusEntry {
+            enabled: mqtt_settings.enabled,
+            connected: state.mqtt.connected(),
+        },
     }))
 }
 
@@ -2491,6 +2720,7 @@ async fn v1_write_value(
         ValueEntry,
         ValuesResponse,
         ConnectionStatusEntry,
+        MqttStatusEntry,
         StatusResponse,
         EventEntry,
         EventsResponse,
@@ -2659,10 +2889,12 @@ fn tag_space_router(
     write_control: Arc<WriteControl>,
     write_audit: WriteAuditService,
     events: broadcast::Sender<ServerEvent>,
+    mqtt: Arc<MqttPublisher>,
 ) -> Router {
     let state = TagSpaceState {
         manager: manager.clone(),
         write_control: write_control.clone(),
+        mqtt,
     };
     let auth_state = TagSpaceAuthState {
         auth: auth.clone(),
@@ -2736,6 +2968,10 @@ pub fn api_router(
     // 他サービスと同じ規約）。
     write_control: Arc<WriteControl>,
     write_audit: WriteAuditService,
+    // T3（設計 §5.3）: MQTT publish - `bin/banto-hub.rs`（本番）または各
+    // テストのセットアップで一度だけ構築し、ここに注入する（上記2引数と
+    // 同じ規約）。
+    mqtt: Arc<MqttPublisher>,
 ) -> Router {
     let audited_auth_routes = auth_routes(auth.clone()).layer(middleware::from_fn_with_state(
         LogoutAuditState {
@@ -2782,6 +3018,13 @@ pub fn api_router(
             audit.clone(),
             auth.clone(),
         ))
+        .merge(mqtt_settings_router(
+            manager.clone(),
+            mqtt.clone(),
+            audit.clone(),
+            auth.clone(),
+            events.clone(),
+        ))
         .layer(middleware::from_fn(require_banto_client_header));
 
     admin
@@ -2793,6 +3036,7 @@ pub fn api_router(
             write_control,
             write_audit,
             events,
+            mqtt,
         ))
         .merge(openapi_router())
 }
@@ -2889,6 +3133,7 @@ mod tests {
 
         let write_control = Arc::new(crate::write_control::WriteControl::new(false));
         let write_audit = crate::write_audit::WriteAuditService::new(pool.clone());
+        let mqtt = Arc::new(crate::mqtt::MqttPublisher::new(manager.clone()));
         let router = api_router(
             users,
             audit,
@@ -2902,6 +3147,7 @@ mod tests {
             false,
             write_control,
             write_audit,
+            mqtt,
         );
         TestEnv {
             router,

@@ -12,6 +12,14 @@
 	import { getAuthProvider, isProviderError } from '@banto/admin-core';
 	import { settings } from '$lib/settings.svelte';
 	import { toastStore } from '$lib/toast.svelte';
+	import { sessionStore } from '$lib/session.svelte';
+	import { isAdmin } from '$lib/permissions';
+	import { getHubStatus } from '$lib/banto/hubStatus';
+	import {
+		getMqttSettings,
+		saveMqttSettings,
+		type MqttSettings
+	} from '$lib/banto/mqttSettingsAdmin';
 
 	function errorMessage(err: unknown): string {
 		if (isProviderError(err)) {
@@ -71,6 +79,107 @@
 			passwordError = errorMessage(err);
 		} finally {
 			changingPassword = false;
+		}
+	}
+
+	// --- MQTT 発行（T3、設計 §5.3、admin 限定） -------------------------------
+	//
+	// 保存は `PUT /api/mqtt-settings` を叩くだけで即時適用される(実装指示
+	// 「保存で即時適用」- サーバー側が保存直後に `MqttPublisher::apply` を
+	// 呼ぶので、ここでは保存 API を呼んで結果を反映するだけでよい)。
+	// `password` は空欄のまま保存すると「変更なし」として扱われる
+	// (`mqttSettingsAdmin.ts` の doc comment参照) - フォームには常に空欄で
+	// 表示し、入力があった場合だけ送る。
+
+	const canManageMqtt = $derived(isAdmin(sessionStore.role));
+
+	const mqttQosOptions: { value: 0 | 1; label: string }[] = [
+		{ value: 0, label: '0（At most once）' },
+		{ value: 1, label: '1（At least once）' }
+	];
+
+	let mqttEnabled = $state(false);
+	let mqttHost = $state('');
+	let mqttPort = $state(1883);
+	let mqttClientId = $state('banto-hub');
+	let mqttUsername = $state('');
+	let mqttPassword = $state('');
+	let mqttPrefix = $state('banto');
+	let mqttQos: 0 | 1 = $state(1);
+	let mqttMinIntervalMs = $state(1000);
+
+	let mqttLoaded = $state(false);
+	let mqttSaving = $state(false);
+	let mqttError: string | null = $state(null);
+	let mqttConnected = $state(false);
+
+	function applyMqttSettings(loaded: MqttSettings): void {
+		mqttEnabled = loaded.enabled;
+		mqttHost = loaded.host;
+		mqttPort = loaded.port;
+		mqttClientId = loaded.clientId;
+		mqttUsername = loaded.username ?? '';
+		mqttPrefix = loaded.prefix;
+		mqttQos = loaded.qos === 0 ? 0 : 1;
+		mqttMinIntervalMs = loaded.minIntervalMs;
+		// password は常に空欄のまま(サーバーは返さない - このセクションの
+		// doc comment参照)。
+	}
+
+	async function loadMqttStatus(): Promise<void> {
+		try {
+			const status = await getHubStatus();
+			mqttConnected = status.mqtt.connected;
+		} catch {
+			// 状態表示だけの補助情報 - 取得失敗はエラー表示せず黙って保持する。
+		}
+	}
+
+	$effect(() => {
+		if (!canManageMqtt) return;
+		let cancelled = false;
+		(async () => {
+			try {
+				const loaded = await getMqttSettings();
+				if (!cancelled) applyMqttSettings(loaded);
+			} catch (err) {
+				if (!cancelled) mqttError = errorMessage(err);
+			} finally {
+				if (!cancelled) mqttLoaded = true;
+			}
+			await loadMqttStatus();
+		})();
+		const interval = setInterval(() => void loadMqttStatus(), 5000);
+		return () => {
+			cancelled = true;
+			clearInterval(interval);
+		};
+	});
+
+	async function submitMqttSettings(event: SubmitEvent): Promise<void> {
+		event.preventDefault();
+		mqttError = null;
+		mqttSaving = true;
+		try {
+			const saved = await saveMqttSettings({
+				enabled: mqttEnabled,
+				host: mqttHost,
+				port: mqttPort,
+				clientId: mqttClientId,
+				username: mqttUsername.trim() === '' ? null : mqttUsername,
+				password: mqttPassword,
+				prefix: mqttPrefix,
+				qos: mqttQos,
+				minIntervalMs: mqttMinIntervalMs
+			});
+			applyMqttSettings(saved);
+			mqttPassword = '';
+			toastStore.push('success', 'MQTT 設定を保存しました(即時適用されます)');
+			await loadMqttStatus();
+		} catch (err) {
+			mqttError = errorMessage(err);
+		} finally {
+			mqttSaving = false;
 		}
 	}
 </script>
@@ -138,6 +247,87 @@
 			<p class="note">この環境ではパスワード変更に対応していません。</p>
 		{/if}
 	</section>
+
+	{#if canManageMqtt}
+		<section>
+			<h2>
+				MQTT 発行
+				<span class="status-pill" class:ok={mqttConnected} class:bad={!mqttConnected}>
+					{mqttConnected ? '接続中' : '未接続'}
+				</span>
+			</h2>
+			{#if mqttLoaded}
+				<form onsubmit={submitMqttSettings}>
+					<label class="field checkbox">
+						<input type="checkbox" bind:checked={mqttEnabled} />
+						MQTT 発行を有効にする
+					</label>
+
+					<label class="field">
+						ブローカーホスト
+						<input type="text" bind:value={mqttHost} placeholder="例: 192.168.1.10" />
+					</label>
+					<label class="field">
+						ポート
+						<input type="number" min="1" max="65535" bind:value={mqttPort} />
+					</label>
+					<label class="field">
+						クライアント ID
+						<input type="text" bind:value={mqttClientId} />
+					</label>
+					<label class="field">
+						ユーザー名（任意）
+						<input type="text" bind:value={mqttUsername} autocomplete="off" />
+					</label>
+					<label class="field">
+						パスワード（変更する場合のみ入力。空欄なら現在の値を維持）
+						<input
+							type="password"
+							bind:value={mqttPassword}
+							autocomplete="new-password"
+							placeholder="変更しない場合は空欄のまま"
+						/>
+					</label>
+					<label class="field">
+						トピック prefix
+						<input type="text" bind:value={mqttPrefix} />
+					</label>
+
+					<h3>QoS</h3>
+					<div class="options" role="radiogroup" aria-label="MQTT QoS">
+						{#each mqttQosOptions as option (option.value)}
+							<label class:selected={mqttQos === option.value}>
+								<input
+									type="radio"
+									name="mqtt-qos"
+									checked={mqttQos === option.value}
+									onchange={() => (mqttQos = option.value)}
+								/>
+								{option.label}
+							</label>
+						{/each}
+					</div>
+
+					<label class="field">
+						最短発行間隔（ミリ秒）
+						<input type="number" min="0" bind:value={mqttMinIntervalMs} />
+					</label>
+
+					{#if mqttError}
+						<p class="error">{mqttError}</p>
+					{/if}
+
+					<button type="submit" disabled={mqttSaving}>保存(即時適用)</button>
+					<p class="note">
+						トピックは <code>{'{prefix}/{connection}/{group}/{tag}'}</code> の形式で発行されます。パスワードは
+						サーバーに平文で保存されます(閉域 LAN 前提)。
+					</p>
+				</form>
+			{:else}
+				<p class="note">読み込み中...</p>
+			{/if}
+		</section>
+	{/if}
 </div>
 
 <style>
@@ -160,6 +350,9 @@
 	h2 {
 		margin: 0 0 0.75rem;
 		font-size: 1rem;
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
 	}
 
 	h3 {
@@ -248,5 +441,40 @@
 		margin: 0.75rem 0 0;
 		color: var(--banto-text-muted);
 		font-size: 0.8rem;
+	}
+
+	.note code {
+		background: var(--banto-bg);
+		border: 1px solid var(--banto-border);
+		border-radius: 4px;
+		padding: 0.05rem 0.3rem;
+		font-size: 0.75rem;
+	}
+
+	.status-pill {
+		font-size: 0.7rem;
+		font-weight: 600;
+		padding: 0.15rem 0.55rem;
+		border-radius: 999px;
+	}
+
+	.status-pill.ok {
+		color: var(--banto-success, #1a7f37);
+		background: color-mix(in srgb, var(--banto-success, #1a7f37) 15%, transparent);
+	}
+
+	.status-pill.bad {
+		color: var(--banto-text-muted);
+		background: color-mix(in srgb, var(--banto-text-muted) 15%, transparent);
+	}
+
+	.field.checkbox {
+		flex-direction: row;
+		align-items: center;
+		gap: 0.5rem;
+	}
+
+	.field.checkbox input {
+		width: auto;
 	}
 </style>

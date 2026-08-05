@@ -222,6 +222,7 @@ async fn test_app(label: &str) -> TestApp {
     let write_control =
         std::sync::Arc::new(banto_hub_core::write_control::WriteControl::new(false));
     let write_audit = banto_hub_core::write_audit::WriteAuditService::new(pool.clone());
+    let mqtt = std::sync::Arc::new(banto_hub_core::mqtt::MqttPublisher::new(manager.clone()));
     let router: Router = api_router(
         users,
         audit,
@@ -235,6 +236,7 @@ async fn test_app(label: &str) -> TestApp {
         false,
         write_control,
         write_audit,
+        mqtt,
     );
 
     let server = start(

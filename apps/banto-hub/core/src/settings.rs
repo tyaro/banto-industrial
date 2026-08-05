@@ -12,6 +12,11 @@
 //!   設計 §8「banto-hub = 8722」）
 //! - `data.dir`（既定 `"./data"`）: tstore ファイルの出力先
 //! - `retention.days`（既定 `7`、設計 §3.3 (a) 決定）: tstore 保持期間
+//!
+//! T3（docs/tag-server-design.md §5.3）で `mqtt.*`（9キー、[`MqttSettings`]）
+//! を追加した。`mqtt.password` は**平文保存** — §5.6「v1 では平文 + 閉域
+//! LAN 前提」と同じ線引きで、[`MqttSettings`] のフィールド doc comment に
+//! 判断根拠を記す。
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -23,11 +28,32 @@ const KEY_SERVER_PORT: &str = "server.port";
 const KEY_DATA_DIR: &str = "data.dir";
 const KEY_RETENTION_DAYS: &str = "retention.days";
 
+const KEY_MQTT_ENABLED: &str = "mqtt.enabled";
+const KEY_MQTT_HOST: &str = "mqtt.host";
+const KEY_MQTT_PORT: &str = "mqtt.port";
+const KEY_MQTT_CLIENT_ID: &str = "mqtt.client_id";
+const KEY_MQTT_USERNAME: &str = "mqtt.username";
+const KEY_MQTT_PASSWORD: &str = "mqtt.password";
+const KEY_MQTT_PREFIX: &str = "mqtt.prefix";
+const KEY_MQTT_QOS: &str = "mqtt.qos";
+const KEY_MQTT_MIN_INTERVAL_MS: &str = "mqtt.min_interval_ms";
+
 /// hub の既定ポート（docs/tag-server-design.md §8: 「管理 UI + REST + WS =
 /// 8722」）。
 pub const DEFAULT_PORT: u16 = 8722;
 /// tstore 保持期間の既定日数（§3.3 (a) 決定: 「保持期間は既定7日」）。
 pub const DEFAULT_RETENTION_DAYS: i64 = 7;
+
+/// MQTT ブローカーの既定ポート（設計 §5.3）。
+pub const DEFAULT_MQTT_PORT: u16 = 1883;
+/// MQTT クライアント ID の既定値（設計 §5.3）。
+pub const DEFAULT_MQTT_CLIENT_ID: &str = "banto-hub";
+/// トピック prefix の既定値（設計 §5.3「prefix 既定 `banto`」）。
+pub const DEFAULT_MQTT_PREFIX: &str = "banto";
+/// QoS の既定値（設計 §5.3「既定 1」）。
+pub const DEFAULT_MQTT_QOS: u8 = 1;
+/// 最短発行間隔スロットルの既定値（実装指示: 「既定 1000」）。
+pub const DEFAULT_MQTT_MIN_INTERVAL_MS: i64 = 1000;
 
 /// hub サーバー本体の bind/port（設計 §8）。ChronoGazer の
 /// `ServerSettings` と違い `enabled` は持たない - hub は常時サーバーで
@@ -60,6 +86,50 @@ impl Default for StoreSettings {
         Self {
             data_dir: "./data".to_string(),
             retention_days: DEFAULT_RETENTION_DAYS,
+        }
+    }
+}
+
+/// T3（docs/tag-server-design.md §5.3）: MQTT publish の接続/発行設定。
+///
+/// `password` は settings テーブルに**平文で保存**する（実装指示「settings
+/// テーブルに平文保存 — 閉域 LAN 前提 §5.6 の範囲。doc に明記」）。判断
+/// 根拠: ブローカー自体が同一閉域 LAN 内にある前提（§5.6「v1 では平文 +
+/// 閉域 LAN 前提」）で、TLS 終端も導入するならリバースプロキシに委譲する
+/// 設計（同節）と同じ線引き — ハッシュ化してもクライアントへ渡す瞬間に
+/// 平文へ復元する必要があるため保護にならない（api_keys.rs のキーとは
+/// 性質が違う: あちらは照合用のワンウェイハッシュで足りるが、こちらは
+/// ブローカーへの認証情報そのものを送信する必要がある）。
+///
+/// `GET /api/mqtt-settings` は `password` を一切返さない
+/// （`crate::rest::MqttSettingsResponse` にフィールド自体が無い）。
+/// `PUT` の `password` は空文字を「変更なし」として扱う
+/// （`crate::rest::mqtt_settings_put` 参照）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MqttSettings {
+    pub enabled: bool,
+    pub host: String,
+    pub port: u16,
+    pub client_id: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub prefix: String,
+    pub qos: u8,
+    pub min_interval_ms: i64,
+}
+
+impl Default for MqttSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: String::new(),
+            port: DEFAULT_MQTT_PORT,
+            client_id: DEFAULT_MQTT_CLIENT_ID.to_string(),
+            username: None,
+            password: None,
+            prefix: DEFAULT_MQTT_PREFIX.to_string(),
+            qos: DEFAULT_MQTT_QOS,
+            min_interval_ms: DEFAULT_MQTT_MIN_INTERVAL_MS,
         }
     }
 }
@@ -139,6 +209,83 @@ impl SettingsService {
             .await?;
         Ok(())
     }
+
+    /// T3（設計 §5.3）: MQTT publish 設定、未設定キーは
+    /// [`MqttSettings::default`] にフォールバック。`username`/`password` は
+    /// 空文字を「未設定」（`None`）に丸める — `set_mqtt_config` が空文字を
+    /// そのまま書く経路（`crate::rest::mqtt_settings_put` の「host 必須で
+    /// なければ空でも保存してよい」入力）と対称にするため。
+    pub async fn mqtt_config(&self) -> Result<MqttSettings, BantoError> {
+        let defaults = MqttSettings::default();
+        let enabled = self
+            .get(KEY_MQTT_ENABLED)
+            .await?
+            .map(|value| value == "true")
+            .unwrap_or(defaults.enabled);
+        let host = self.get(KEY_MQTT_HOST).await?.unwrap_or(defaults.host);
+        let port = self
+            .get(KEY_MQTT_PORT)
+            .await?
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(defaults.port);
+        let client_id = self
+            .get(KEY_MQTT_CLIENT_ID)
+            .await?
+            .unwrap_or(defaults.client_id);
+        let username = self
+            .get(KEY_MQTT_USERNAME)
+            .await?
+            .filter(|value| !value.is_empty());
+        let password = self
+            .get(KEY_MQTT_PASSWORD)
+            .await?
+            .filter(|value| !value.is_empty());
+        let prefix = self.get(KEY_MQTT_PREFIX).await?.unwrap_or(defaults.prefix);
+        let qos = self
+            .get(KEY_MQTT_QOS)
+            .await?
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or(defaults.qos);
+        let min_interval_ms = self
+            .get(KEY_MQTT_MIN_INTERVAL_MS)
+            .await?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(defaults.min_interval_ms);
+        Ok(MqttSettings {
+            enabled,
+            host,
+            port,
+            client_id,
+            username,
+            password,
+            prefix,
+            qos,
+            min_interval_ms,
+        })
+    }
+
+    pub async fn set_mqtt_config(&self, config: &MqttSettings) -> Result<(), BantoError> {
+        self.set(
+            KEY_MQTT_ENABLED,
+            if config.enabled { "true" } else { "false" },
+        )
+        .await?;
+        self.set(KEY_MQTT_HOST, &config.host).await?;
+        self.set(KEY_MQTT_PORT, &config.port.to_string()).await?;
+        self.set(KEY_MQTT_CLIENT_ID, &config.client_id).await?;
+        self.set(KEY_MQTT_USERNAME, config.username.as_deref().unwrap_or(""))
+            .await?;
+        self.set(KEY_MQTT_PASSWORD, config.password.as_deref().unwrap_or(""))
+            .await?;
+        self.set(KEY_MQTT_PREFIX, &config.prefix).await?;
+        self.set(KEY_MQTT_QOS, &config.qos.to_string()).await?;
+        self.set(
+            KEY_MQTT_MIN_INTERVAL_MS,
+            &config.min_interval_ms.to_string(),
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -202,5 +349,54 @@ mod tests {
         };
         svc.set_store_config(&config).await.unwrap();
         assert_eq!(svc.store_config().await.unwrap(), config);
+    }
+
+    #[tokio::test]
+    async fn mqtt_config_defaults_when_unset() {
+        let svc = service().await;
+        let config = svc.mqtt_config().await.unwrap();
+        assert_eq!(config, MqttSettings::default());
+        assert!(!config.enabled);
+        assert_eq!(config.port, 1883);
+        assert_eq!(config.client_id, "banto-hub");
+        assert_eq!(config.prefix, "banto");
+        assert_eq!(config.qos, 1);
+        assert_eq!(config.min_interval_ms, 1000);
+        assert_eq!(config.username, None);
+        assert_eq!(config.password, None);
+    }
+
+    #[tokio::test]
+    async fn mqtt_config_round_trips_through_set() {
+        let svc = service().await;
+        let config = MqttSettings {
+            enabled: true,
+            host: "broker.local".to_string(),
+            port: 8883,
+            client_id: "hub-1".to_string(),
+            username: Some("user1".to_string()),
+            password: Some("s3cret".to_string()),
+            prefix: "factory1".to_string(),
+            qos: 0,
+            min_interval_ms: 500,
+        };
+        svc.set_mqtt_config(&config).await.unwrap();
+        assert_eq!(svc.mqtt_config().await.unwrap(), config);
+    }
+
+    /// `username`/`password` は空文字で保存すると「未設定」（`None`）として
+    /// 読み戻る（このモジュールの doc comment「`mqtt_config`」参照）。
+    #[tokio::test]
+    async fn mqtt_config_empty_username_and_password_read_back_as_none() {
+        let svc = service().await;
+        let config = MqttSettings {
+            username: Some(String::new()),
+            password: Some(String::new()),
+            ..MqttSettings::default()
+        };
+        svc.set_mqtt_config(&config).await.unwrap();
+        let read_back = svc.mqtt_config().await.unwrap();
+        assert_eq!(read_back.username, None);
+        assert_eq!(read_back.password, None);
     }
 }

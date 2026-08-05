@@ -22,6 +22,12 @@ export interface ConnectionStatusEntry {
 	attempt: number | null;
 }
 
+/** `GET /api/v1/status` の `mqtt`（T3、設計 §5.3）。 */
+export interface MqttStatusEntry {
+	enabled: boolean;
+	connected: boolean;
+}
+
 /** `GET /api/v1/status` の応答。 */
 export interface StatusResponse {
 	version: string;
@@ -32,6 +38,8 @@ export interface StatusResponse {
 	write_enabled: boolean;
 	/** T2-4（設計 §6-6）: プロセス再起動前は有効だったか（表示専用の履歴）。 */
 	write_was_enabled_before_restart: boolean;
+	/** T3（設計 §5.3）: MQTT publish の設定/接続状態。 */
+	mqtt: MqttStatusEntry;
 }
 
 /** `GET /api/v1/values` の1タグ分（`{ tag, v, q, t }`）。 */
