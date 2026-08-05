@@ -4,18 +4,24 @@
 //! ## 二系統に分かれたルーター
 //!
 //! - **管理系**（`/api/auth/*`・`/api/users/*`・`/api/audit-log/*`・
-//!   `/api/plc-connections|collection-groups|tags/*`・`/api/events`）:
-//!   `apps/chronogazer/core` / `apps/relay-wright/core` と同型 —
-//!   `require_banto_client_header`（CSRF）をルーター全体に適用し、
+//!   `/api/plc-connections|collection-groups|tags/*`・`/api/api-keys/*`・
+//!   `/api/events`）: `apps/chronogazer/core` / `apps/relay-wright/core` と
+//!   同型 — `require_banto_client_header`（CSRF）をルーター全体に適用し、
 //!   ブラウザ管理 UI 用の bearer セッション + RBAC（viewer 読み取り /
-//!   editor 書き込み / admin 限定）で保護する。
+//!   editor 書き込み / admin 限定）で保護する。`/api/api-keys/*`（API キー
+//!   の発行・一覧・失効、設計 §5.6・T0-2）は admin ロール限定。
 //! - **タグ空間 API**（`/api/v1/*`）: 機械クライアント向け別ルーター
 //!   （設計 §5.1/§5.6）。CSRF ヘッダは要求しない — ブラウザ CSRF 対策は
 //!   「JS からしか付けられない独自ヘッダ」が前提だが、機械クライアントは
 //!   そもそも任意ヘッダを付けられるので CSRF の脅威モデルに乗らない。
-//!   認証は `require_auth`（bearer セッション）のみを適用する。
-//!   **T0-2 で API キー認証（設計 §5.6 のスコープ）に置き換える予定** —
-//!   T0-1 時点では管理 UI と同じ bearer トークンを共用する暫定実装。
+//!   **認証は API キー + セッション bearer の併用**（T0-2、設計 §5.6）:
+//!   `Authorization: Bearer <value>` の `<value>` が `bh_` で始まれば
+//!   `crate::api_keys::ApiKeysService` で照合（`read` スコープ必須、
+//!   失効済みなら 401 + audit_log 記録）、それ以外は従来どおり
+//!   `AuthState` のセッション token として照合する（管理 UI からの直接
+//!   利用互換のため）。`GET /api/v1/openapi.json` だけは認証不要 -
+//!   スキーマ自体は秘密ではないため（`openapi_json` 関数の doc comment
+//!   参照）。
 //!
 //! ## I1 CRUD 書き込み後の再構築（設計 §4.3）
 //!
@@ -60,7 +66,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::str::FromStr;
 use tokio::sync::broadcast;
+use utoipa::{OpenApi, ToSchema};
 
+use crate::api_keys::{ApiKeyLookup, ApiKeysService, IssuedApiKey};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::hub::{CollectorManager, TagEntry};
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
@@ -72,6 +80,13 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
+}
+
+/// `banto_server::require_auth`'s own 401 body, reproduced here for
+/// `require_tag_space_auth` (T0-2's `/api/v1/*` auth middleware below) since
+/// that middleware replaces `require_auth` entirely rather than wrapping it.
+fn unauthorized_response() -> Response {
+    (StatusCode::UNAUTHORIZED, Json(ErrorBody::Unauthorized)).into_response()
 }
 
 fn actor_identity(headers: &HeaderMap, auth: &AuthState) -> Option<Identity> {
@@ -674,6 +689,133 @@ fn audit_log_router(audit: AuditLogService, auth: AuthState) -> Router {
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
 
+// --- API キー管理 (docs/tag-server-design.md §5.6・T0-2 実装指示 §1「管理
+// REST」): admin ロール限定、CSRF + bearer セッション（このルーター自体は
+// `crate::api_keys::ApiKeysService`（発行される bh_ キー）を消費する側では
+// なく、管理 UI セッションから叩く前提 - `/api/v1/*` の API キー認証とは
+// 別物）。---------------------------------------------------------------------
+
+#[derive(Clone)]
+struct ApiKeysAdminState {
+    api_keys: ApiKeysService,
+    auth: AuthState,
+    audit: AuditLogService,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateApiKeyRequest {
+    name: String,
+    scopes: Vec<String>,
+}
+
+/// `POST /api/api-keys` の応答 - `IssuedApiKey` をそのまま返すと `key`
+/// フィールド名がスネークケースのままになる（`crate::api_keys` は機械
+/// クライアント向け `/api/v1/*` と同じ snake_case 規約）ので、それに
+/// 合わせてここでも変換なしでそのまま公開する（T0-2 実装指示の応答例
+/// `{ "id", "name", "prefix", "scopes", "key": "bh_..." }` と一致）。
+#[derive(Debug, Serialize, ToSchema)]
+struct IssuedApiKeyResponse {
+    id: i64,
+    name: String,
+    prefix: String,
+    scopes: Vec<String>,
+    /// 平文キー全体。この応答限りでしか手に入らない（設計: 「key はこの
+    /// 応答限り」）。
+    key: String,
+}
+
+impl From<IssuedApiKey> for IssuedApiKeyResponse {
+    fn from(issued: IssuedApiKey) -> Self {
+        Self {
+            id: issued.id,
+            name: issued.name,
+            prefix: issued.prefix,
+            scopes: issued.scopes,
+            key: issued.key,
+        }
+    }
+}
+
+/// `POST /api/api-keys` - 発行。監査ログには **キー平文・ハッシュを
+/// 含めない**（設計 T0-2 実装指示: 「監査ログに record_write — ただし
+/// キー平文・ハッシュは監査 detail に入れない」）。
+async fn api_keys_create(
+    State(state): State<ApiKeysAdminState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateApiKeyRequest>,
+) -> Result<(StatusCode, Json<IssuedApiKeyResponse>), ApiError> {
+    let issued = state.api_keys.issue(&body.name, body.scopes).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "create",
+        "api_keys",
+        &issued.id.to_string(),
+        Some(json!({ "name": issued.name, "scopes": issued.scopes })),
+    )
+    .await;
+    Ok((StatusCode::CREATED, Json(issued.into())))
+}
+
+/// `GET /api/api-keys` - 一覧（`key_hash` は含まない、設計: 「key_hash は
+/// 返さない」）。
+async fn api_keys_list(
+    State(state): State<ApiKeysAdminState>,
+) -> Result<Json<Vec<crate::api_keys::ApiKeySummary>>, ApiError> {
+    Ok(Json(state.api_keys.list().await?))
+}
+
+/// `POST /api/api-keys/{id}/revoke` - 失効（冪等、設計: 「DELETE は設けない
+/// （失効履歴を残す方針）」）。
+async fn api_keys_revoke(
+    State(state): State<ApiKeysAdminState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::api_keys::ApiKeySummary>, ApiError> {
+    let summary = state.api_keys.revoke(id).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "revoke",
+        "api_keys",
+        &id.to_string(),
+        None,
+    )
+    .await;
+    Ok(Json(summary))
+}
+
+/// `/api/api-keys/*`（設計 §5.6・T0-2 実装指示: 「管理系ルーターに追加 —
+/// CSRF + bearer + RBAC admin 限定」）。T0-2 実装指示は発行/一覧/失効
+/// いずれも admin 限定と明記しているため、[`require_editor`]（editor 以上）
+/// ではなく [`RoleGuard`]（admin ちょうど）をルーター全体に掛ける -
+/// `users_router`/`audit_log_router` と同型（ハンドラ内で個別に role
+/// チェックし直さない: 到達した時点で呼び出し元は admin であることが
+/// ルーター層で保証済み）。
+fn api_keys_router(api_keys: ApiKeysService, audit: AuditLogService, auth: AuthState) -> Router {
+    let state = ApiKeysAdminState {
+        api_keys,
+        auth: auth.clone(),
+        audit: audit.clone(),
+    };
+    Router::new()
+        .route("/api/api-keys", get(api_keys_list).post(api_keys_create))
+        .route("/api/api-keys/{id}/revoke", post(api_keys_revoke))
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            RoleGuard {
+                auth: auth.clone(),
+                min: Role::Admin,
+                resource: "api_keys",
+                audit,
+            },
+            require_role_at_least,
+        ))
+        .layer(middleware::from_fn_with_state(auth, require_auth))
+}
+
 // --- I1 CRUD (viewer-read / editor-write) + collector rebuild -------------
 
 fn default_payload_enabled() -> bool {
@@ -1193,6 +1335,15 @@ fn tag_registry_router(
 }
 
 // --- /api/v1/* タグ空間 API（設計 §5.1） ------------------------------------
+//
+// T0-2（設計 §10-6、utoipa 採用 2026-08-04 決定）: 以下の応答型はすべて
+// `Serialize` + `utoipa::ToSchema` を derive し、`#[utoipa::path]` で
+// `ApiDoc`（このセクション末尾）にまとめて `GET /api/v1/openapi.json` で
+// 配信する。**wire 形式（フィールド名・JSON 形）は T0-1 から一切変えて
+// いない** - 型を導入しただけで、実際に流れる JSON は
+// `apps/banto-hub/core/tests/integration.rs` の T0-1 時点のアサーションと
+// 完全に同じ（このセクションの各関数 doc comment に旧来の json! リテラルの
+// 形を残してあるのはそのため）。
 
 #[derive(Clone)]
 struct TagSpaceState {
@@ -1213,16 +1364,33 @@ struct TagsQuery {
     group: Option<String>,
 }
 
+/// `GET /api/v1/tags` の応答: `{ "revision", "tags": [TagEntry...] }`。
+#[derive(Debug, Serialize, ToSchema)]
+struct CatalogResponse {
+    revision: u64,
+    tags: Vec<TagEntry>,
+}
+
 /// `GET /api/v1/tags` - catalog: `{ "revision", "tags": [TagEntry...] }`,
 /// optionally filtered by `?connection=`/`?group=` (matched against the
 /// entry's connection/group *name*, design §5.1's route table).
+#[utoipa::path(
+    get,
+    path = "/api/v1/tags",
+    params(
+        ("connection" = Option<String>, Query, description = "接続名で絞り込む"),
+        ("group" = Option<String>, Query, description = "収集グループ名で絞り込む"),
+    ),
+    responses((status = 200, description = "catalog スナップショット", body = CatalogResponse)),
+    tag = "tag-space",
+)]
 async fn v1_tags(
     State(state): State<TagSpaceState>,
     Query(query): Query<TagsQuery>,
-) -> Json<serde_json::Value> {
+) -> Json<CatalogResponse> {
     let map = state.manager.tag_map();
     let revision = state.manager.revision();
-    let tags: Vec<&TagEntry> = map
+    let tags: Vec<TagEntry> = map
         .iter()
         .filter(|entry| {
             query
@@ -1238,18 +1406,27 @@ async fn v1_tags(
                 .map(|g| g == entry.group)
                 .unwrap_or(true)
         })
+        .cloned()
         .collect();
-    Json(json!({ "revision": revision, "tags": tags }))
+    Json(CatalogResponse { revision, tags })
 }
 
 /// One `/api/v1/values*` entry's wire shape (design §5.1's route table:
 /// `{ "tag", "v", "q", "t" }`).
-fn value_json(
+#[derive(Debug, Clone, Serialize, ToSchema)]
+struct ValueEntry {
+    tag: String,
+    v: Option<f64>,
+    q: String,
+    t: i64,
+}
+
+fn value_entry(
     external_name: &str,
     entry: &TagEntry,
     sample: Option<banto_collect::CurrentSample>,
     now_ms: i64,
-) -> serde_json::Value {
+) -> ValueEntry {
     // A disabled tag (its own flag, or its group's/connection's) always
     // reads bad/null regardless of what a stale cached sample says (design
     // §4: 欠測を隠さない - a client must not be able to mistake "this was
@@ -1262,12 +1439,25 @@ fn value_json(
             None => (None, "bad", now_ms),
         }
     };
-    json!({ "tag": external_name, "v": v, "q": q, "t": t })
+    ValueEntry {
+        tag: external_name.to_string(),
+        v,
+        q: q.to_string(),
+        t,
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct ValuesQuery {
     tags: Option<String>,
+}
+
+/// `GET /api/v1/values` の応答: `{ "revision", "t", "values": [ValueEntry...] }`。
+#[derive(Debug, Serialize, ToSchema)]
+struct ValuesResponse {
+    revision: u64,
+    t: i64,
+    values: Vec<ValueEntry>,
 }
 
 /// `GET /api/v1/values` - full or partial (`?tags=a,b,c`) snapshot.
@@ -1276,7 +1466,21 @@ struct ValuesQuery {
 /// (design instructions: 「未知の名前が混ざったら...部分成功で誤解させない」),
 /// never a per-row `bad`/`unknown_tag` - the request as a whole is rejected
 /// so the caller cannot mistake "misspelled tag" for "tag exists but is
-/// currently bad".
+/// currently bad". (This error body stays a raw `serde_json::Value` - only
+/// the *successful* `/api/v1/*` bodies were in scope for the T0-2 typed-struct
+/// conversion.)
+#[utoipa::path(
+    get,
+    path = "/api/v1/values",
+    params(
+        ("tags" = Option<String>, Query, description = "カンマ区切りの外部名。省略時は全タグ"),
+    ),
+    responses(
+        (status = 200, description = "現在値スナップショット", body = ValuesResponse),
+        (status = 400, description = "?tags= に未知の外部名が含まれる"),
+    ),
+    tag = "tag-space",
+)]
 async fn v1_values(
     State(state): State<TagSpaceState>,
     Query(query): Query<ValuesQuery>,
@@ -1314,26 +1518,41 @@ async fn v1_values(
         }
     }
 
-    let values: Vec<serde_json::Value> = names
+    let values: Vec<ValueEntry> = names
         .iter()
         .filter_map(|name| map.get(name).map(|entry| (name, entry)))
         .map(|(name, entry)| {
             let sample = current.as_ref().and_then(|c| c.get(&entry.tag_key));
-            value_json(name, entry, sample, now_ms)
+            value_entry(name, entry, sample, now_ms)
         })
         .collect();
 
-    Json(json!({ "revision": revision, "t": now_ms, "values": values })).into_response()
+    Json(ValuesResponse {
+        revision,
+        t: now_ms,
+        values,
+    })
+    .into_response()
 }
 
 /// `GET /api/v1/values/{tag}` - single tag. `404` only when the external
 /// name is not in the catalog at all (design: 「404 になるのは定義が存在
 /// しない外部名のみ」) - an undefined-but-uncollected tag is `200` with
 /// `q: "bad"`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/values/{tag}",
+    params(("tag" = String, Path, description = "外部名 {connection}.{group}.{tag}")),
+    responses(
+        (status = 200, description = "単一タグの現在値", body = ValueEntry),
+        (status = 404, description = "catalog に存在しない外部名"),
+    ),
+    tag = "tag-space",
+)]
 async fn v1_value_single(
     State(state): State<TagSpaceState>,
     Path(tag): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<ValueEntry>, ApiError> {
     let map = state.manager.tag_map();
     let Some(entry) = map.get(&tag) else {
         return Err(ApiError(BantoError::NotFound {
@@ -1344,16 +1563,38 @@ async fn v1_value_single(
     let now_ms = state.manager.clock().now_ms();
     let current = state.manager.current_values();
     let sample = current.as_ref().and_then(|c| c.get(&entry.tag_key));
-    Ok(Json(value_json(&tag, entry, sample, now_ms)))
+    Ok(Json(value_entry(&tag, entry, sample, now_ms)))
+}
+
+/// `GET /api/v1/status` の `connections` 配列1件分。
+#[derive(Debug, Serialize, ToSchema)]
+struct ConnectionStatusEntry {
+    name: String,
+    id: i64,
+    status: String,
+    attempt: Option<u32>,
+}
+
+/// `GET /api/v1/status` の応答。
+#[derive(Debug, Serialize, ToSchema)]
+struct StatusResponse {
+    version: String,
+    revision: u64,
+    last_config_error: Option<String>,
+    connections: Vec<ConnectionStatusEntry>,
 }
 
 /// `GET /api/v1/status` - `{ "version", "revision", "last_config_error",
 /// "connections": [...] }` (design §5.1's route table). Connection names
 /// come from the registry directly (not the catalog) so a connection with
 /// zero tags still appears.
-async fn v1_status(
-    State(state): State<TagSpaceState>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+#[utoipa::path(
+    get,
+    path = "/api/v1/status",
+    responses((status = 200, description = "サーバー状態", body = StatusResponse)),
+    tag = "tag-space",
+)]
+async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResponse>, ApiError> {
     let revision = state.manager.revision();
     let last_config_error = state.manager.last_error();
     let statuses = state.manager.connection_status();
@@ -1363,7 +1604,7 @@ async fn v1_status(
         .await?
         .rows;
 
-    let entries: Vec<serde_json::Value> = connections
+    let entries: Vec<ConnectionStatusEntry> = connections
         .into_iter()
         .map(|conn| {
             let key = format!("conn:{}", conn.id);
@@ -1380,21 +1621,21 @@ async fn v1_status(
                 // 解釈として Stopped に丸める).
                 Some(ConnectionStatus::Stopped) | None => ("stopped", None),
             };
-            json!({
-                "name": conn.name,
-                "id": conn.id,
-                "status": status_str,
-                "attempt": attempt,
-            })
+            ConnectionStatusEntry {
+                name: conn.name,
+                id: conn.id,
+                status: status_str.to_string(),
+                attempt,
+            }
         })
         .collect();
 
-    Ok(Json(json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "revision": revision,
-        "last_config_error": last_config_error,
-        "connections": entries,
-    })))
+    Ok(Json(StatusResponse {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        revision,
+        last_config_error,
+        connections: entries,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1404,14 +1645,44 @@ struct EventsQuery {
     limit: Option<i64>,
 }
 
-/// `GET /api/v1/events` - range query over `collect_events`
-/// (`crates/banto-collect/migrations/0001_collect_events.sql`'s columns),
-/// newest first, default `limit` 100 (clamped to a sane range so a
-/// misbehaving client cannot force an unbounded scan).
+/// `GET /api/v1/events` の `events` 配列1件分
+/// (`crates/banto-collect/migrations/0001_collect_events.sql`'s columns)。
+#[derive(Debug, Serialize, ToSchema)]
+struct EventEntry {
+    id: i64,
+    ts: i64,
+    kind: String,
+    connection_key: Option<String>,
+    tag_key: Option<String>,
+    level: Option<String>,
+    value: Option<f64>,
+    detail: Option<String>,
+}
+
+/// `GET /api/v1/events` の応答。
+#[derive(Debug, Serialize, ToSchema)]
+struct EventsResponse {
+    events: Vec<EventEntry>,
+}
+
+/// `GET /api/v1/events` - range query over `collect_events`, newest first,
+/// default `limit` 100 (clamped to a sane range so a misbehaving client
+/// cannot force an unbounded scan).
+#[utoipa::path(
+    get,
+    path = "/api/v1/events",
+    params(
+        ("from_ms" = Option<i64>, Query, description = "範囲の下限（epoch ms、既定 0）"),
+        ("to_ms" = Option<i64>, Query, description = "範囲の上限（epoch ms、既定は無制限）"),
+        ("limit" = Option<i64>, Query, description = "最大件数（既定 100、1〜1000 にクランプ）"),
+    ),
+    responses((status = 200, description = "collect_events の範囲クエリ結果", body = EventsResponse)),
+    tag = "tag-space",
+)]
 async fn v1_events(
     State(state): State<TagSpaceState>,
     Query(query): Query<EventsQuery>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<EventsResponse>, ApiError> {
     let from_ms = query.from_ms.unwrap_or(0);
     let to_ms = query.to_ms.unwrap_or(i64::MAX);
     let limit = query.limit.unwrap_or(100).clamp(1, 1000);
@@ -1427,8 +1698,7 @@ async fn v1_events(
         Option<f64>,
         Option<String>,
     )> = sqlx::query_as(
-        "SELECT id, ts, kind, connection_key, tag_key, level, value, detail \
-         FROM collect_events WHERE ts >= ? AND ts <= ? ORDER BY ts DESC, id DESC LIMIT ?",
+        "SELECT id, ts, kind, connection_key, tag_key, level, value, detail          FROM collect_events WHERE ts >= ? AND ts <= ? ORDER BY ts DESC, id DESC LIMIT ?",
     )
     .bind(from_ms)
     .bind(to_ms)
@@ -1437,31 +1707,171 @@ async fn v1_events(
     .await
     .map_err(banto_storage::storage_error)?;
 
-    let events: Vec<serde_json::Value> = rows
+    let events: Vec<EventEntry> = rows
         .into_iter()
         .map(
-            |(id, ts, kind, connection_key, tag_key, level, value, detail)| {
-                json!({
-                    "id": id,
-                    "ts": ts,
-                    "kind": kind,
-                    "connection_key": connection_key,
-                    "tag_key": tag_key,
-                    "level": level,
-                    "value": value,
-                    "detail": detail,
-                })
+            |(id, ts, kind, connection_key, tag_key, level, value, detail)| EventEntry {
+                id,
+                ts,
+                kind,
+                connection_key,
+                tag_key,
+                level,
+                value,
+                detail,
             },
         )
         .collect();
 
-    Ok(Json(json!({ "events": events })))
+    Ok(Json(EventsResponse { events }))
 }
 
-/// `/api/v1/*` (design §5.1/§5.6): `require_auth` only, no CSRF header - see
-/// this module's doc comment.
-fn tag_space_router(manager: Arc<CollectorManager>, auth: AuthState) -> Router {
-    let state = TagSpaceState { manager };
+// --- OpenAPI 自動生成（設計 §5.1・§10-6、2026-08-04 決定） ------------------
+//
+// catalog（`/api/v1/tags`）はクライアントとの互換性契約（設計 §4.1）なので、
+// コードとスキーマを単一ソース化する目的で utoipa を採用した。
+// `ApiDoc::openapi()` は上の各ハンドラの `#[utoipa::path]` とこのファイルの
+// 各応答型の `ToSchema` から機械的に構築される - ハンドラのシグネチャや
+// 応答型を変えれば `/api/v1/openapi.json` も自動で追従する。
+
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "banto-hub タグ空間 API",
+        version = "v1",
+        description = "banto-hub の /api/v1/* 読み取り API（docs/tag-server-design.md §5.1）。catalog（/api/v1/tags）はクライアントとの互換性契約である（§4.1）: 外部名・安定 ID・revision を用いたバインディングを前提に、フィールド名や JSON 形はこのスキーマとコードが常に一致するよう utoipa で自動生成している。"
+    ),
+    paths(v1_tags, v1_values, v1_value_single, v1_status, v1_events),
+    components(schemas(
+        TagEntry,
+        CatalogResponse,
+        ValueEntry,
+        ValuesResponse,
+        ConnectionStatusEntry,
+        StatusResponse,
+        EventEntry,
+        EventsResponse,
+    ))
+)]
+struct ApiDoc;
+
+/// `GET /api/v1/openapi.json` - **認証不要**（T0-2 実装指示: 「このエンド
+/// ポイント自体は認証不要でよい」）。判断理由: OpenAPI スキーマはフィールド
+/// 名・型・パスの一覧であって値そのものではなく、秘匿すべき情報を含まない。
+/// 逆に、スキーマを見るために API キーを要求すると「まずキーを発行して
+/// もらわないとどんな API か分からない」という鶏卵になり、外部連携の
+/// 導入コストを不必要に上げる。
+async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
+    Json(ApiDoc::openapi())
+}
+
+// --- /api/v1/* 認証: API キー + セッション bearer 併用（設計 §5.6・T0-2） ---
+
+#[derive(Clone)]
+struct TagSpaceAuthState {
+    auth: AuthState,
+    api_keys: ApiKeysService,
+    audit: AuditLogService,
+    manager: Arc<CollectorManager>,
+}
+
+/// `/api/v1/*`（`GET /api/v1/openapi.json` を除く）の認証ミドルウェア -
+/// T0-1 の `require_auth`（セッション bearer のみ）を置き換える（このモジュール
+/// の doc comment 参照）。
+///
+/// - `Authorization` ヘッダがない、または `Bearer ` で始まらない → 401
+/// - 値が `bh_` で始まる → API キーとして
+///   [`crate::api_keys::ApiKeysService::lookup`] で照合:
+///   - [`ApiKeyLookup::Valid`] だが `read` スコープを持たない（`write:` の
+///     みのキー等）→ 403（認証はできたが権限がない、という区別のため
+///     401 ではなく 403 - `banto_core::BantoError::Forbidden` と同じ規約）
+///   - [`ApiKeyLookup::Valid`] かつ `read` スコープあり → 通過。
+///     `last_used_at` を60秒スロットルで更新（[`crate::api_keys::should_touch_last_used`]）
+///   - [`ApiKeyLookup::Revoked`] → 401 + audit_log に
+///     `action: "denied", resource: "api_keys"` を記録（設計 T0-2 実装
+///     指示: 「失効済みキーでのアクセス試行は audit_log に記録する」）
+///   - [`ApiKeyLookup::NotFound`] → 401（監査記録しない - 存在しない/
+///     偽造されたキーは「誰が」を特定できないただのノイズであり、
+///     revoked の場合と違って「元は正規に発行されたキーが使われた」という
+///     実害のシグナルがない）
+/// - それ以外（`bh_` で始まらない）→ 従来どおり `AuthState` のセッション
+///   token として照合（管理 UI からの利用互換のため - このモジュールの
+///   doc comment参照）
+async fn require_tag_space_auth(
+    State(state): State<TagSpaceAuthState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Some(token) = bearer_token(req.headers()) else {
+        return unauthorized_response();
+    };
+
+    if token.starts_with("bh_") {
+        match state.api_keys.lookup(token).await {
+            Ok(ApiKeyLookup::Valid(ctx)) => {
+                if !ctx.has_read_scope() {
+                    return forbidden_response();
+                }
+                let now_ms = state.manager.clock().now_ms();
+                if let Err(err) = state
+                    .api_keys
+                    .touch_last_used(ctx.id, now_ms, ctx.last_used_at_ms)
+                    .await
+                {
+                    eprintln!("banto-hub: API キーの last_used_at 更新に失敗しました: {err}");
+                }
+                next.run(req).await
+            }
+            Ok(ApiKeyLookup::Revoked { id, name }) => {
+                let method = req.method().as_str().to_string();
+                let path = req.uri().path().to_string();
+                state
+                    .audit
+                    .record(AuditEntry {
+                        actor_username: None,
+                        actor_role: None,
+                        action: "denied",
+                        resource: "api_keys",
+                        entity_id: Some(&id.to_string()),
+                        detail: Some(json!({ "reason": "revoked", "name": name, "method": method, "path": path })),
+                        origin: "rest",
+                        result: "denied",
+                    })
+                    .await;
+                unauthorized_response()
+            }
+            Ok(ApiKeyLookup::NotFound) => unauthorized_response(),
+            Err(err) => {
+                eprintln!("banto-hub: API キー照合に失敗しました: {err}");
+                unauthorized_response()
+            }
+        }
+    } else if state.auth.verify(token) {
+        next.run(req).await
+    } else {
+        unauthorized_response()
+    }
+}
+
+/// `/api/v1/*`（design §5.1/§5.6）: `require_tag_space_auth`（API キー +
+/// セッション bearer 併用）を全ルートに適用する。`GET /api/v1/openapi.json`
+/// は別ルーター（`openapi_router`、`crate::rest::api_router` 参照）に分けて
+/// あり、この認証層を通らない。
+fn tag_space_router(
+    manager: Arc<CollectorManager>,
+    auth: AuthState,
+    api_keys: ApiKeysService,
+    audit: AuditLogService,
+) -> Router {
+    let state = TagSpaceState {
+        manager: manager.clone(),
+    };
+    let auth_state = TagSpaceAuthState {
+        auth,
+        api_keys,
+        audit,
+        manager,
+    };
     Router::new()
         .route("/api/v1/tags", get(v1_tags))
         .route("/api/v1/values", get(v1_values))
@@ -1469,14 +1879,24 @@ fn tag_space_router(manager: Arc<CollectorManager>, auth: AuthState) -> Router {
         .route("/api/v1/status", get(v1_status))
         .route("/api/v1/events", get(v1_events))
         .with_state(state)
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            auth_state,
+            require_tag_space_auth,
+        ))
+}
+
+/// `GET /api/v1/openapi.json` 専用ルーター - 認証層を一切通さない
+/// （`openapi_json`関数の doc comment 参照）。
+fn openapi_router() -> Router {
+    Router::new().route("/api/v1/openapi.json", get(openapi_json))
 }
 
 // --- composition ------------------------------------------------------------
 
 /// Compose the full router: the admin surface (auth/users/audit-log/I1 CRUD/
-/// SSE, all behind CSRF + bearer auth) merged with the tag-space API
-/// (bearer auth only, no CSRF - see this module's doc comment).
+/// api-keys/SSE, all behind CSRF + bearer auth) merged with the tag-space API
+/// (API キー + セッション bearer 併用、CSRF なし - see this module's doc
+/// comment) and the unauthenticated `/api/v1/openapi.json`.
 #[allow(clippy::too_many_arguments)]
 pub fn api_router(
     users: UsersService,
@@ -1484,6 +1904,7 @@ pub fn api_router(
     plc_connections: PlcConnectionService,
     collection_groups: CollectionGroupService,
     tags: TagService,
+    api_keys: ApiKeysService,
     manager: Arc<CollectorManager>,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
@@ -1508,23 +1929,31 @@ pub fn api_router(
         .merge(sse_route(auth.clone(), events.clone()))
         .merge(users_router(users, audit.clone(), auth.clone()))
         .merge(audit_log_router(audit.clone(), auth.clone()))
+        .merge(api_keys_router(
+            api_keys.clone(),
+            audit.clone(),
+            auth.clone(),
+        ))
         .merge(tag_registry_router(
             plc_connections,
             collection_groups,
             tags,
-            audit,
+            audit.clone(),
             auth.clone(),
             manager.clone(),
             events,
         ))
         .layer(middleware::from_fn(require_banto_client_header));
 
-    admin.merge(tag_space_router(manager, auth))
+    admin
+        .merge(tag_space_router(manager, auth, api_keys, audit))
+        .merge(openapi_router())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api_keys::ApiKeysService;
     use crate::db::migrate_memory;
     use crate::hub::CollectorManager;
     use axum::body::Body;
@@ -1552,7 +1981,20 @@ mod tests {
         (Arc::new(manager), dir)
     }
 
-    async fn router_with_token() -> (Router, String, tempfile::TempDir) {
+    /// Everything a T0-2 test needs: the assembled router, an admin session
+    /// token, a viewer session token (RBAC-negative tests, e.g. "viewer may
+    /// not issue API keys"), the `ApiKeysService` (so a test can seed/inspect
+    /// keys directly instead of only through REST), and the owning temp dir.
+    struct TestEnv {
+        router: Router,
+        admin_token: String,
+        viewer_token: String,
+        api_keys: ApiKeysService,
+        pool: sqlx::SqlitePool,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn test_env() -> TestEnv {
         let pool = migrate_memory().await.expect("migrate_memory");
         let (tx, _rx) = tokio_broadcast::channel(16);
         let users = UsersService::new(pool.clone());
@@ -1560,12 +2002,17 @@ mod tests {
         let plc_connections = PlcConnectionService::new(pool.clone());
         let collection_groups = CollectionGroupService::new(pool.clone());
         let tags = TagService::new(pool.clone());
-        let (manager, dir) = test_manager(pool);
+        let api_keys = ApiKeysService::new(pool.clone());
+        let (manager, dir) = test_manager(pool.clone());
 
         users
             .setup_first_user("admin", "password123", "管理者")
             .await
             .expect("setup_first_user");
+        users
+            .create_user("viewer1", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create_user viewer");
         let verify_users = users.clone();
         let auth = AuthState::new(move |u: String, p: String| {
             let users = verify_users.clone();
@@ -1580,10 +2027,14 @@ mod tests {
                 }
             })
         });
-        let token = auth
+        let admin_token = auth
             .login("admin", "password123")
             .await
             .expect("admin login");
+        let viewer_token = auth
+            .login("viewer1", "password123")
+            .await
+            .expect("viewer login");
 
         let router = api_router(
             users,
@@ -1591,12 +2042,59 @@ mod tests {
             plc_connections,
             collection_groups,
             tags,
+            api_keys.clone(),
             manager,
             auth,
             tx,
             false,
         );
-        (router, token, dir)
+        TestEnv {
+            router,
+            admin_token,
+            viewer_token,
+            api_keys,
+            pool,
+            _dir: dir,
+        }
+    }
+
+    /// Backward-compatible shim for the pre-T0-2 tests below that only need
+    /// an admin session token.
+    async fn router_with_token() -> (Router, String, tempfile::TempDir) {
+        let env = test_env().await;
+        (env.router, env.admin_token, env._dir)
+    }
+
+    /// `POST /api/api-keys` through the admin surface (bearer + CSRF +
+    /// admin RBAC). Returns the parsed JSON body (`{ id, name, prefix,
+    /// scopes, key }` on success).
+    async fn issue_api_key(
+        router: &Router,
+        token: &str,
+        name: &str,
+        scopes: &[&str],
+    ) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/api-keys")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "name": name, "scopes": scopes }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
     }
 
     #[tokio::test]
@@ -1716,5 +2214,218 @@ mod tests {
         assert_eq!(json["revision"], 1);
         assert!(json["last_config_error"].is_null());
         assert_eq!(json["connections"].as_array().unwrap().len(), 1);
+    }
+
+    // --- T0-2: API キー基盤 ------------------------------------------------
+
+    /// 発行 → そのキーで `/api/v1/tags` が読める（E2E、実装指示 §3の1件目）。
+    #[tokio::test]
+    async fn issued_api_key_can_read_api_v1_tags() {
+        let env = test_env().await;
+        let (status, issued) =
+            issue_api_key(&env.router, &env.admin_token, "mes-gateway", &["read"]).await;
+        assert_eq!(status, StatusCode::CREATED, "{issued:?}");
+        let key = issued["key"].as_str().expect("key should be present");
+        assert!(key.starts_with("bh_"));
+        assert_eq!(issued["scopes"], serde_json::json!(["read"]));
+
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/v1/tags")
+                    .header("Authorization", format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// 失効済みキーでのアクセスは 401 + audit_log に "denied"/"api_keys" が
+    /// 記録される（実装指示 §3の2件目 + §1「失効済みキーでのアクセス試行は
+    /// audit_log に記録する」）。
+    #[tokio::test]
+    async fn revoked_api_key_is_401_and_audited() {
+        let env = test_env().await;
+        let (_status, issued) =
+            issue_api_key(&env.router, &env.admin_token, "revoke-me", &["read"]).await;
+        let key = issued["key"].as_str().unwrap().to_string();
+        let id = issued["id"].as_i64().unwrap();
+
+        let revoke = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/api-keys/{id}/revoke"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoke.status(), StatusCode::OK);
+
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/v1/tags")
+                    .header("Authorization", format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let audit = AuditLogService::new(env.pool.clone());
+        let entries = audit.list(ListParams::default()).await.unwrap();
+        let denied = entries
+            .rows
+            .iter()
+            .find(|row| row.action == "denied" && row.resource == "api_keys")
+            .expect("a denied/api_keys audit row should exist");
+        assert_eq!(denied.entity_id.as_deref(), Some(id.to_string().as_str()));
+    }
+
+    /// `write:` のみのスコープを持つキーで `/api/v1/*`（read 専用エンド
+    /// ポイント）にアクセスすると 403（実装指示 §3の3件目）。
+    #[tokio::test]
+    async fn write_only_scope_key_reading_api_v1_is_403() {
+        let env = test_env().await;
+        let (status, issued) = issue_api_key(
+            &env.router,
+            &env.admin_token,
+            "writer-only",
+            &["write:line1.fast.temp01"],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{issued:?}");
+        let key = issued["key"].as_str().unwrap();
+
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/v1/tags")
+                    .header("Authorization", format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// 不正なスコープ構文（ワイルドカード）での発行は 400 相当
+    /// （`BantoError::Validation` → `422`。実装指示 §3の5件目 - `ApiError`
+    /// は `Validation` を `422 UNPROCESSABLE_ENTITY` にマップする、
+    /// `banto_server::response::status_for` 参照。本テストは "400 系" の
+    /// 実体であるこのステータスを確認する）。
+    #[tokio::test]
+    async fn issuing_with_invalid_scope_syntax_is_rejected() {
+        let env = test_env().await;
+        let (status, body) = issue_api_key(
+            &env.router,
+            &env.admin_token,
+            "bad-scope",
+            &["write:line1.fast.*"],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+        assert_eq!(body["kind"], "validation");
+    }
+
+    /// viewer ロールで `POST /api/api-keys` すると 403（admin 限定、
+    /// 実装指示 §3の6件目）。
+    #[tokio::test]
+    async fn viewer_role_cannot_issue_api_keys() {
+        let env = test_env().await;
+        let (status, _body) =
+            issue_api_key(&env.router, &env.viewer_token, "should-fail", &["read"]).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// `GET /api/v1/openapi.json` は認証不要で 200、`/api/v1/values` 等の
+    /// パスを含む（実装指示 §3の7件目）。
+    #[tokio::test]
+    async fn openapi_json_is_public_and_lists_tag_space_paths() {
+        let env = test_env().await;
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/v1/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let paths = json["paths"].as_object().expect("paths object");
+        for path in [
+            "/api/v1/tags",
+            "/api/v1/values",
+            "/api/v1/values/{tag}",
+            "/api/v1/status",
+            "/api/v1/events",
+        ] {
+            assert!(paths.contains_key(path), "missing path: {path}");
+        }
+    }
+
+    /// セッション token でも引き続き `/api/v1/*` が読める（設計 T0-1 からの
+    /// 互換維持、実装指示 §3の4件目）- API キーが未発行でも管理 UI の
+    /// bearer セッションだけで動くことを、`test_env` が発行済みキーを
+    /// 一切作らないまま確認する。
+    #[tokio::test]
+    async fn session_token_still_reads_api_v1() {
+        let env = test_env().await;
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/v1/status")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// `last_used_at` が実際の HTTP リクエスト経由で更新されることの
+    /// REST レベルの確認（60秒スロットルの純粋関数単体テストは
+    /// `crate::api_keys` 側にある - 実装指示 §3の8件目）。
+    #[tokio::test]
+    async fn last_used_at_is_populated_after_a_request() {
+        let env = test_env().await;
+        let (_status, issued) =
+            issue_api_key(&env.router, &env.admin_token, "touch-me", &["read"]).await;
+        let key = issued["key"].as_str().unwrap();
+        let id = issued["id"].as_i64().unwrap();
+
+        let before = env.api_keys.list().await.unwrap();
+        let before_entry = before.iter().find(|k| k.id == id).unwrap();
+        assert_eq!(before_entry.last_used_at, None);
+
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/v1/tags")
+                    .header("Authorization", format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let after = env.api_keys.list().await.unwrap();
+        let after_entry = after.iter().find(|k| k.id == id).unwrap();
+        assert!(after_entry.last_used_at.is_some());
     }
 }

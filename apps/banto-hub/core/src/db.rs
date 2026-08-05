@@ -138,6 +138,28 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
     .await
     .map_err(banto_storage::storage_error)?;
 
+    // T0-2 (docs/tag-server-design.md §5.6): /api/v1/* の機械クライアント
+    // 認証用 API キー。列の意味は `crate::api_keys` のモジュール doc 参照
+    // (特に `last_used_at` の保存形式は同モジュールの判断で epoch ミリ秒の
+    // 10進文字列 - `created_at`/`revoked_at` の ISO 日時文字列とは異なる)。
+    // 失効は物理削除でなく `revoked_at` を立てるだけ(履歴を残す方針、同
+    // モジュール参照)。
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS api_keys (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL UNIQUE,
+          prefix TEXT NOT NULL UNIQUE,
+          key_hash TEXT NOT NULL,
+          scopes TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          last_used_at TEXT,
+          revoked_at TEXT
+        )",
+    )
+    .execute(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+
     Ok(())
 }
 
@@ -161,6 +183,7 @@ mod tests {
             "collection_groups",
             "tags",
             "collect_events",
+            "api_keys",
         ] {
             let exists: Option<String> = sqlx::query_scalar(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",

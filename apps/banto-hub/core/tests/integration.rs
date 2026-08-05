@@ -12,6 +12,7 @@ use axum::body::Body;
 use axum::http::{Request as HttpRequest, StatusCode};
 use axum::Router;
 use banto_collect::{BackoffConfig, CollectorOptions};
+use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::db::init_db;
 use banto_hub_core::hub::CollectorManager;
@@ -203,6 +204,7 @@ async fn test_app(label: &str) -> TestApp {
         PlcConnectionService::new(pool.clone()),
         CollectionGroupService::new(pool.clone()),
         TagService::new(pool.clone()),
+        ApiKeysService::new(pool.clone()),
         manager.clone(),
         auth,
         events_tx,

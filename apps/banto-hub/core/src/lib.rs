@@ -36,14 +36,20 @@
 //!   （起動時1回 + レジストリ書き込み後の全体再構築、設計 §4.3 の
 //!   「T0 は全体再構築で開始してよい」に従う）と revision カウンタを持ち、
 //!   [`hub::TagMap`] が外部名 catalog のスナップショットを保持する
-//! - [`rest`]: `api_router` - 管理系（auth/users/audit/I1 CRUD、CSRF 必須）
-//!   と `/api/v1/*` タグ空間 API（機械クライアント向け、CSRF 不要、
-//!   設計 §5.1）の2系統
+//! - [`rest`]: `api_router` - 管理系（auth/users/audit/I1 CRUD/api-keys、
+//!   CSRF 必須）と `/api/v1/*` タグ空間 API（機械クライアント向け、CSRF
+//!   不要、設計 §5.1/§5.6。API キー + セッション bearer の併用認証、
+//!   `/api/v1/openapi.json` は認証不要）の2系統
+//! - [`api_keys`]: `/api/v1/*` 用のスコープ付き API キー基盤（設計
+//!   §5.6、T0-2）。発行・一覧・失効の service 層と、キー生成/ハッシュ/
+//!   スコープ構文検証の純関数群
 //!
 //! T0 のスコープ外（設計冒頭の指示どおり実装しない）: WebSocket、MQTT、
-//! gRPC、書き込み経路、API キー認証、utoipa、管理 UI フロントエンドの
-//! 中身、演算タグ、接続単位の部分再構成。
+//! gRPC、書き込み経路（`write:` スコープの受理・保存は T0-2 で実装済みだが
+//! 検証・使用は T2）、管理 UI フロントエンドの中身、演算タグ、接続単位の
+//! 部分再構成。
 
+pub mod api_keys;
 pub mod assets;
 pub mod audit;
 pub mod db;

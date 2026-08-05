@@ -44,6 +44,13 @@ rust-embed = { workspace = true, optional = true }
 argon2 = { workspace = true }
 password-hash = { workspace = true }
 futures-util = { workspace = true }
+# T0-2 (docs/tag-server-design.md §5.6): api_keys.rs のキー生成・ハッシュ照合。
+getrandom = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+# T0-2 / §10-6: /api/v1/openapi.json の自動生成。
+utoipa = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time"] }

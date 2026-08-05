@@ -60,6 +60,7 @@ use banto_tags::{CollectionGroupService, PlcConnectionService, Tag, TagService};
 use banto_tstore::Clock;
 use serde::Serialize;
 use sqlx::SqlitePool;
+use utoipa::ToSchema;
 
 /// `tag:{id}` - must stay byte-for-byte identical to `banto_collect`'s own
 /// (private) key derivation (`crates/banto-collect/src/config.rs::tag_key`,
@@ -90,12 +91,21 @@ fn tag_key(id: i64) -> String {
 /// machine-client-facing (design §5.1/§5.6) and the design doc's own
 /// examples for sibling `/api/v1/*` payloads (`t`, `v`, `q`,
 /// `last_config_error`) are snake_case, not camelCase.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
 pub struct TagEntry {
     pub external_name: String,
     pub tag_key: String,
     /// Stable `(connection_id, group_id, tag_id)` - the "同じ ID なら
     /// リネームされた/消えたら削除された" signal design §4.1 calls for.
+    ///
+    /// `#[schema(value_type = Vec<i64>)]` (T0-2, docs/tag-server-design.md
+    /// §10-6 utoipa 採用): utoipa's `ToSchema` derive has no blanket impl for
+    /// arbitrary tuples, so the OpenAPI schema for this field is declared as
+    /// a 3-element JSON array of integers instead - this is a schema-only
+    /// annotation, it does not touch how `serde` actually serializes the
+    /// tuple (still a bare `[id, id, id]` JSON array either way, so the wire
+    /// format this crate's tests assert on is unchanged).
+    #[schema(value_type = Vec<i64>)]
     pub ids: (i64, i64, i64),
     pub connection: String,
     pub group: String,

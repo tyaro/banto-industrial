@@ -12,16 +12,15 @@
 //! 8722）、`BANTO_BIND`（既定は settings の `server.bind`、さらに未設定なら
 //! `127.0.0.1`）、`BANTO_DB`（既定 `./banto-hub.sqlite3`）、`BANTO_HUB_DATA`
 //! （tstore データディレクトリ。**port/bind と同じ層構造**: env
-//! `BANTO_HUB_DATA` > settings の `data.dir` > 既定 `"./data"` - settings で
-//! `data.dir` を変更しても bin 側が拾わない「死に設定」だった問題を
-//! 監査レビューで指摘され修正、2026-08-05）、`BANTO_ALLOW_SETUP`（`1` で
-//! `POST /api/auth/setup` を許可）。
+//! `BANTO_HUB_DATA` > settings の `data.dir` > 既定 `"./data"`）、
+//! `BANTO_ALLOW_SETUP`（`1` で `POST /api/auth/setup` を許可）。
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use banto_collect::CollectorOptions;
+use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::assets::FrontendAssets;
 use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::db::init_db;
@@ -106,7 +105,8 @@ async fn main() {
 
     let plc_connections = PlcConnectionService::new(pool.clone());
     let collection_groups = CollectionGroupService::new(pool.clone());
-    let tags = TagService::new(pool);
+    let tags = TagService::new(pool.clone());
+    let api_keys = ApiKeysService::new(pool);
 
     let app = api_router(
         users,
@@ -114,6 +114,7 @@ async fn main() {
         plc_connections,
         collection_groups,
         tags,
+        api_keys,
         manager.clone(),
         auth,
         events,
