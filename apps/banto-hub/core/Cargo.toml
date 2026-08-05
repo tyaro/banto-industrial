@@ -1,0 +1,60 @@
+[package]
+name = "banto-hub-core"
+description = "banto-hub domain/service layer (docs/tag-server-design.md T0): headless axum tag server - registry (I1) + collector (I3b) lifecycle + REST read API, no Tauri shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# Embeds the SvelteKit static build (`apps/banto-hub/build`, gitignored) into
+# the binary via rust-embed. Off by default, same reasoning as chronogazer/
+# relay-wright's `embed-ui`: the workspace must build on a fresh clone
+# without requiring `pnpm --filter banto-hub build` to have run first. T0
+# ships no admin-UI frontend yet (docs/tag-server-design.md T0 scope) - this
+# feature flag/`assets.rs` module is only the placeholder wiring for when one
+# lands.
+embed-ui = ["dep:rust-embed"]
+
+[dependencies]
+banto-core = { workspace = true }
+banto-storage = { workspace = true, features = ["sqlite"] }
+banto-server = { workspace = true }
+# I1: tag registry (PlcConnection/CollectionGroup/Tag) - hub's own SQLite
+# DB doubles as the registry DB (docs/tag-server-design.md §3.2 table).
+banto-tags = { path = "../../../crates/banto-tags" }
+# I2: only pulled in transitively via banto-collect in production builds;
+# named directly here too since `hub.rs`'s doc comments reference its
+# PlcClient boundary. No `simulator` feature at the non-dev level - hub talks
+# to real PLCs; the simulator is dev-only (see [dev-dependencies]).
+banto-plc = { path = "../../../crates/banto-plc" }
+# I3a: local tstore recording (§3.3 決定: 記録あり・既定7日保持) + prune_files
+# for the retention sweep.
+banto-tstore = { path = "../../../crates/banto-tstore" }
+# I3b: the collection engine itself - hub.rs::CollectorManager owns its
+# lifecycle (start at boot, full rebuild on registry writes).
+banto-collect = { path = "../../../crates/banto-collect" }
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
+rust-embed = { workspace = true, optional = true }
+argon2 = { workspace = true }
+password-hash = { workspace = true }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tower = { workspace = true, features = ["util"] }
+tempfile = { workspace = true }
+# Modbus TCP simulator for the T0 E2E integration test
+# (apps/banto-hub/core/tests/integration.rs) - same reuse chain
+# banto-collect's own integration tests already exercise (banto-plc's
+# `simulator` feature, made public for exactly this).
+banto-plc = { path = "../../../crates/banto-plc", features = ["simulator"] }
+
+[[bin]]
+name = "banto-hub"
+path = "src/bin/banto-hub.rs"

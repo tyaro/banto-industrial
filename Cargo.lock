@@ -209,6 +209,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "banto-hub-core"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "axum",
+ "banto-collect",
+ "banto-core",
+ "banto-plc",
+ "banto-server",
+ "banto-storage",
+ "banto-tags",
+ "banto-tstore",
+ "futures-util",
+ "password-hash",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "banto-plc"
 version = "0.1.0"
 dependencies = [

@@ -2,9 +2,11 @@
 # (I1: banto-tags, I2: banto-plc, I2a: SLMP read in banto-plc, I5:
 # banto-plc-write (SLMP write, separate trait/crate), I3a: banto-tstore,
 # I3b: banto-collect, I4: banto-tsquery, R1-A: apps/chronogazer/{core,src-tauri}, W1:
-# apps/relay-wright/{core,src-tauri} - see docs/plan.md / docs/r1-plan.md /
-# the relay-wright plan `luminous-discovering-goblet.md`). banto crates are
-# consumed via git-tag references (banto docs/publishing.md).
+# apps/relay-wright/{core,src-tauri}, T0: apps/banto-hub/core (headless タグ
+# サーバー、docs/tag-server-design.md) - see docs/plan.md / docs/r1-plan.md /
+# the relay-wright plan `luminous-discovering-goblet.md` /
+# docs/tag-server-design.md. banto crates are consumed via git-tag references
+# (banto docs/publishing.md).
 [workspace]
 resolver = "2"
 members = [
@@ -18,6 +20,7 @@ members = [
     "apps/chronogazer/src-tauri",
     "apps/relay-wright/core",
     "apps/relay-wright/src-tauri",
+    "apps/banto-hub/core",
 ]
 
 [workspace.package]
