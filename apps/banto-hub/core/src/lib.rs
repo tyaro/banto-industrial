@@ -39,13 +39,18 @@
 //! - [`rest`]: `api_router` - 管理系（auth/users/audit/I1 CRUD/api-keys、
 //!   CSRF 必須）と `/api/v1/*` タグ空間 API（機械クライアント向け、CSRF
 //!   不要、設計 §5.1/§5.6。API キー + セッション bearer の併用認証、
-//!   `/api/v1/openapi.json` は認証不要）の2系統
+//!   `/api/v1/openapi.json` は認証不要）の2系統。`GET /api/v1/stream`
+//!   （[`stream`] の WebSocket アップグレード）もこの認証層の下で公開する
 //! - [`api_keys`]: `/api/v1/*` 用のスコープ付き API キー基盤（設計
 //!   §5.6、T0-2）。発行・一覧・失効の service 層と、キー生成/ハッシュ/
 //!   スコープ構文検証の純関数群
+//! - [`stream`]: T1（設計 §5.2）。`/api/v1/stream` の WebSocket ハンドラ・
+//!   購読の状態機械・250ms 評価ループ。`hub::CollectorManager` の
+//!   `current_values`/`tag_map`/`subscribe_events`/`subscribe_revision` を
+//!   読むだけの消費者で、収集エンジンには一切書き込まない
 //!
-//! T0 のスコープ外（設計冒頭の指示どおり実装しない）: WebSocket、MQTT、
-//! gRPC、書き込み経路（`write:` スコープの受理・保存は T0-2 で実装済みだが
+//! T0/T1 のスコープ外（設計冒頭の指示どおり実装しない）: MQTT、gRPC、
+//! 書き込み経路（`write:` スコープの受理・保存は T0-2 で実装済みだが
 //! 検証・使用は T2）、管理 UI フロントエンドの中身、演算タグ、接続単位の
 //! 部分再構成。
 
@@ -57,4 +62,5 @@ pub mod events;
 pub mod hub;
 pub mod rest;
 pub mod settings;
+pub mod stream;
 pub mod users;

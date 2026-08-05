@@ -11,7 +11,8 @@
 //!   editor 書き込み / admin 限定）で保護する。`/api/api-keys/*`（API キー
 //!   の発行・一覧・失効、設計 §5.6・T0-2）は admin ロール限定。
 //! - **タグ空間 API**（`/api/v1/*`）: 機械クライアント向け別ルーター
-//!   （設計 §5.1/§5.6）。CSRF ヘッダは要求しない — ブラウザ CSRF 対策は
+//!   （設計 §5.1/§5.6。`GET /api/v1/stream` の WebSocket 購読は T1、
+//!   `crate::stream` 参照）。CSRF ヘッダは要求しない — ブラウザ CSRF 対策は
 //!   「JS からしか付けられない独自ヘッダ」が前提だが、機械クライアントは
 //!   そもそも任意ヘッダを付けられるので CSRF の脅威モデルに乗らない。
 //!   **認証は API キー + セッション bearer の併用**（T0-2、設計 §5.6）:
@@ -1345,17 +1346,14 @@ fn tag_registry_router(
 // 完全に同じ（このセクションの各関数 doc comment に旧来の json! リテラルの
 // 形を残してあるのはそのため）。
 
+/// `pub(crate)` (not private): `crate::stream`'s `GET /api/v1/stream` handler
+/// is mounted directly onto [`tag_space_router`]'s `Router` (same
+/// `require_tag_space_auth` layer, no separate router/state - T1 実装指示
+/// §9「既存の require_tag_space_auth を /api/v1/stream にも適用」の最も
+/// 単純な実現), so it needs this state type too.
 #[derive(Clone)]
-struct TagSpaceState {
-    manager: Arc<CollectorManager>,
-}
-
-fn quality_str(quality: banto_collect::Quality) -> &'static str {
-    match quality {
-        banto_collect::Quality::Good => "good",
-        banto_collect::Quality::Bad => "bad",
-        banto_collect::Quality::Stale => "stale",
-    }
+pub(crate) struct TagSpaceState {
+    pub(crate) manager: Arc<CollectorManager>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1421,28 +1419,21 @@ struct ValueEntry {
     t: i64,
 }
 
+/// Thin wire-formatting wrapper over [`crate::hub::effective_sample`] (see
+/// its doc comment - this is the "same v/q/t semantics as `crate::stream`'s
+/// `data` messages" helper the T1 実装指示 asked to share rather than
+/// duplicate).
 fn value_entry(
     external_name: &str,
     entry: &TagEntry,
     sample: Option<banto_collect::CurrentSample>,
     now_ms: i64,
 ) -> ValueEntry {
-    // A disabled tag (its own flag, or its group's/connection's) always
-    // reads bad/null regardless of what a stale cached sample says (design
-    // §4: 欠測を隠さない - a client must not be able to mistake "this was
-    // last collected while still enabled" for "this is currently good").
-    let (v, q, t) = if !entry.enabled {
-        (None, "bad", sample.map(|s| s.ptime_ms).unwrap_or(now_ms))
-    } else {
-        match sample {
-            Some(s) => (s.value, quality_str(s.quality), s.ptime_ms),
-            None => (None, "bad", now_ms),
-        }
-    };
+    let (v, q, t) = crate::hub::effective_sample(entry, sample, now_ms);
     ValueEntry {
         tag: external_name.to_string(),
         v,
-        q: q.to_string(),
+        q: crate::hub::quality_str(q).to_string(),
         t,
     }
 }
@@ -1878,6 +1869,11 @@ fn tag_space_router(
         .route("/api/v1/values/{tag}", get(v1_value_single))
         .route("/api/v1/status", get(v1_status))
         .route("/api/v1/events", get(v1_events))
+        // T1（設計 §5.2・§5.6の9番）: 認証は他の /api/v1/* と同一の
+        // require_tag_space_auth（read スコープ必須）- アップグレード
+        // リクエスト自体が普通の HTTP GET なので、この `.layer` がそのまま
+        // 効く（`crate::stream` 側の doc comment 参照）。
+        .route("/api/v1/stream", get(crate::stream::ws_upgrade))
         .with_state(state)
         .layer(middleware::from_fn_with_state(
             auth_state,
