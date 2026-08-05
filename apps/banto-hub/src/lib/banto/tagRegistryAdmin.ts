@@ -21,7 +21,7 @@ import { CSRF_HEADER } from './setup';
 
 // --- wire types (camelCase, matching the Rust serde shapes) -----------------
 
-export type PlcProtocol = 'modbus-tcp' | 'slmp';
+export type PlcProtocol = 'modbus-tcp' | 'slmp' | 'virtual';
 
 /** Mirrors `banto_tags::PlcConnection`. */
 export interface PlcConnection {
@@ -32,6 +32,25 @@ export interface PlcConnection {
 	port: number;
 	unitId: number;
 	enabled: boolean;
+}
+
+/**
+ * T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): the two reserved
+ * `protocol: "virtual"` connections `banto-hub` auto-provisions at startup
+ * (`bin/banto-hub.rs::ensure_virtual_connection`) — `calc` hosts every
+ * `tagKind: "computed"` tag's group, `mem` hosts every `"internal"` tag's
+ * group. Mirrors `banto_tags::{CALC_CONNECTION_NAME, MEM_CONNECTION_NAME}`.
+ * The backend also refuses to edit/delete a `"virtual"` connection
+ * (`PlcConnectionService::update`/`delete`) — the plc-connections page uses
+ * these names to show that row as read-only rather than letting the user
+ * discover the 403 by trying.
+ */
+export const CALC_CONNECTION_NAME = 'calc';
+export const MEM_CONNECTION_NAME = 'mem';
+
+/** True for the two reserved auto-provisioned connections (see above). */
+export function isVirtualConnection(conn: Pick<PlcConnection, 'protocol'>): boolean {
+	return conn.protocol === 'virtual';
 }
 
 /** Mirrors `banto_hub_core::rest::PlcConnectionPayload`. */
@@ -70,6 +89,31 @@ export const ALLOWED_PERIOD_MS: readonly number[] = [100, 200, 500, 1000, 2000, 
 
 export type TagDataType = 'bit' | 'i16' | 'u16' | 'i32' | 'u32' | 'f32' | 'string';
 
+/**
+ * Tag species (T6-2, docs/tag-server-design.md §4.2's table) — mirrors
+ * `banto_tags::ALLOWED_TAG_KINDS`.
+ *
+ * - `plc` (default/existing): value from the collection task, `address`
+ *   required, `expression` forbidden.
+ * - `computed`: value from evaluating `expression` (banto-expr); `address`
+ *   forbidden, `expression` required, `writable` forced false server-side
+ *   (write attempts always 403 — "値は式が決める").
+ * - `internal`: value from client writes, held entirely in the tag space
+ *   (never sent to a PLC); `address`/`expression` both forbidden, `retain`
+ *   selects restart persistence.
+ *
+ * Placement is enforced server-side (`banto_tags::tag::validate_tag_kind_placement`):
+ * `computed` only under the `calc` connection, `internal` only under `mem`,
+ * `plc` under neither.
+ */
+export type TagKind = 'plc' | 'computed' | 'internal';
+
+export const TAG_KIND_OPTIONS: { value: TagKind; label: string }[] = [
+	{ value: 'plc', label: 'plc（PLC 収集）' },
+	{ value: 'computed', label: 'computed（演算タグ）' },
+	{ value: 'internal', label: 'internal（内部タグ）' }
+];
+
 /** Mirrors `banto_tags::Tag`. */
 export interface Tag {
 	id: number;
@@ -93,14 +137,14 @@ export interface Tag {
 	thresholdL: number | null;
 	thresholdLl: number | null;
 	enabled: boolean;
-	/**
-	 * Per-tag write opt-in (T2-3, docs/tag-server-design.md §6 item 1).
-	 * `tagKind`/`expression`/`retain` also exist on the backend row from T2-3
-	 * onward, but stay unexposed here — the admin UI only ever writes
-	 * `tagKind: "plc"` implicitly (the server default), and there is nothing
-	 * for this screen to show until T6 defines computed/internal tags.
-	 */
+	/** Per-tag write opt-in (T2-3, docs/tag-server-design.md §6 item 1). */
 	writable: boolean;
+	/** T6-2: tag species — see {@link TagKind}. */
+	tagKind: TagKind;
+	/** T6-2: computed-tag formula source, only set when `tagKind === 'computed'`. */
+	expression: string | null;
+	/** T6-2: internal-tag restart-persistence flag. */
+	retain: boolean;
 }
 
 /** Mirrors `banto_hub_core::rest::TagPayload`. */
@@ -126,6 +170,12 @@ export interface TagInput {
 	 * unaffected. The admin UI (this app's tags page) always sends it
 	 * explicitly from its new checkbox. */
 	writable?: boolean;
+	/** T6-2: `#[serde(default)]` (= `"plc"`) on the backend. */
+	tagKind?: TagKind;
+	/** T6-2: required when `tagKind === 'computed'`, otherwise omitted. */
+	expression?: string | null;
+	/** T6-2: `#[serde(default)]` (= `false`) on the backend. */
+	retain?: boolean;
 }
 
 /** `string` tag `stringLength` bounds — mirrors the backend CHECK/validation. */

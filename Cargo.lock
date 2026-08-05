@@ -375,6 +375,7 @@ dependencies = [
  "banto-broker",
  "banto-collect",
  "banto-core",
+ "banto-expr",
  "banto-plc",
  "banto-plc-write",
  "banto-server",

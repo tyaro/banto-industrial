@@ -62,7 +62,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use banto_collect::{CurrentSample, Quality};
+use banto_collect::Quality;
 use banto_server::ServerEvent;
 use serde_json::json;
 use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex};
@@ -75,7 +75,8 @@ use tonic::{Request, Response, Status};
 
 use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService};
 use crate::audit::{AuditEntry, AuditLogService};
-use crate::hub::{effective_sample, CollectorManager, TagEntry};
+use crate::computed::ServerTagStore;
+use crate::hub::{read_current, CollectorManager, TagEntry};
 use crate::settings::GrpcSettings;
 use crate::subscribe_core::{
     self, interval_floor_ms, Mode, Subscription, TagPattern, EVAL_TICK_MS,
@@ -131,6 +132,9 @@ fn to_proto_tag_entry(entry: &TagEntry) -> ProtoTagEntry {
         period_ms: entry.period_ms,
         enabled: entry.enabled,
         writable: entry.writable,
+        tag_kind: entry.tag_kind.clone(),
+        expression: entry.expression.clone(),
+        retain: entry.retain,
     }
 }
 
@@ -142,10 +146,11 @@ fn to_proto_tag_entry(entry: &TagEntry) -> ProtoTagEntry {
 fn tag_value_from_sample(
     external_name: &str,
     entry: &TagEntry,
-    sample: Option<CurrentSample>,
+    collect: Option<&banto_collect::CurrentValuesHandle>,
+    server_store: &ServerTagStore,
     now_ms: i64,
 ) -> ProtoTagValue {
-    let (v, q, t) = effective_sample(entry, sample, now_ms);
+    let (v, q, t) = read_current(entry, collect, server_store, now_ms);
     ProtoTagValue {
         tag: external_name.to_string(),
         value: v.map(tag_value::Value::Num),
@@ -403,6 +408,7 @@ impl TagServiceTrait for GrpcService {
         let revision = self.manager.revision();
         let now_ms = self.manager.clock().now_ms();
         let current = self.manager.current_values();
+        let server_store = self.manager.server_store();
 
         let names: Vec<String> = if req.tags.is_empty() {
             map.iter()
@@ -432,8 +438,7 @@ impl TagServiceTrait for GrpcService {
             .iter()
             .filter_map(|name| map.get(name).map(|entry| (name, entry)))
             .map(|(name, entry)| {
-                let sample = current.as_ref().and_then(|c| c.get(&entry.tag_key));
-                tag_value_from_sample(name, entry, sample, now_ms)
+                tag_value_from_sample(name, entry, current.as_ref(), &server_store, now_ms)
             })
             .collect();
 
@@ -498,8 +503,14 @@ impl TagServiceTrait for GrpcService {
 
         let now_ms = self.manager.clock().now_ms();
         let current = self.manager.current_values();
-        let (initial, last) =
-            subscribe_core::initial_values(&patterns, &map, current.as_ref(), now_ms);
+        let server_store = self.manager.server_store();
+        let (initial, last) = subscribe_core::initial_values(
+            &patterns,
+            &map,
+            current.as_ref(),
+            &server_store,
+            now_ms,
+        );
         let next_due_ms = match mode {
             Mode::Interval { interval_ms } => now_ms + interval_ms,
             Mode::OnChange => 0,
@@ -529,9 +540,14 @@ impl TagServiceTrait for GrpcService {
                 let map = manager.tag_map();
                 let now_ms = manager.clock().now_ms();
                 let current = manager.current_values();
-                if let Some(values) =
-                    subscribe_core::evaluate(&mut subscription, &map, current.as_ref(), now_ms)
-                {
+                let server_store = manager.server_store();
+                if let Some(values) = subscribe_core::evaluate(
+                    &mut subscription,
+                    &map,
+                    current.as_ref(),
+                    &server_store,
+                    now_ms,
+                ) {
                     // 設計「バックプレッシャは送信バッファ満杯で切断」-
                     // `try_send` が `Full`(または受信側 drop 済みの
                     // `Closed`)ならこのタスクを畳む = ストリーム終了。

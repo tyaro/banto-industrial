@@ -78,6 +78,15 @@ message TagEntry {
   int64 period_ms = 12;
   bool enabled = 13;
   bool writable = 14;
+  // T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): タグ種別
+  // (`"plc"`/`"computed"`/`"internal"`)。REST の `TagEntry.tag_kind`
+  // （snake_case）と同一の文字列語彙。後方互換のフィールド追加のみ
+  // （既存クライアントは新フィールドを無視するだけで動き続ける）。
+  string tag_kind = 15;
+  // 演算タグの式ソース（`tag_kind == "computed"` のときのみ設定）。
+  optional string expression = 16;
+  // 内部タグの再起動時復元フラグ。
+  bool retain = 17;
 }
 
 // --- GetCatalog ---------------------------------------------------------------

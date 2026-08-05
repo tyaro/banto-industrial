@@ -40,11 +40,12 @@ pub use collection_group::{
 };
 pub use plc_connection::{
     PlcConnection, PlcConnectionInput, PlcConnectionService, ALLOWED_PROTOCOLS,
+    CALC_CONNECTION_NAME, MEM_CONNECTION_NAME, VIRTUAL_PROTOCOL,
 };
 pub use scaling::{scale_raw, unscale, Scaling};
 pub use tag::{
-    Tag, TagInput, TagService, ALLOWED_DATA_TYPES, ALLOWED_TAG_KINDS, NUMERIC_DATA_TYPES,
-    PLC_TAG_KIND, STRING_DATA_TYPE,
+    Tag, TagInput, TagService, ALLOWED_DATA_TYPES, ALLOWED_TAG_KINDS, COMPUTED_TAG_KIND,
+    INTERNAL_TAG_KIND, NUMERIC_DATA_TYPES, PLC_TAG_KIND, STRING_DATA_TYPE,
 };
 
 use banto_core::BantoError;

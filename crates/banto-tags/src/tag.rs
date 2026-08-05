@@ -8,6 +8,7 @@ use banto_storage::ColumnMap;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
+use crate::plc_connection::{CALC_CONNECTION_NAME, MEM_CONNECTION_NAME, VIRTUAL_PROTOCOL};
 use crate::scaling::Scaling;
 use crate::support::{map_write_error, max_length_message, range_message, required_message};
 
@@ -62,20 +63,37 @@ fn default_tag_kind() -> String {
 
 /// Full `tag_kind` vocabulary from design §4.2's table (`plc` / `computed` /
 /// `internal`) - mirrors the SQL `CHECK` added in
-/// `migrations/0006_tags_writable_kind.sql`. Not every value here is accepted
-/// by [`validate_tag_input`] yet; see [`PLC_TAG_KIND`]'s doc comment for the
-/// T2-vs-T6 staging (design §6 item 9, 2026-08-05 decision).
+/// `migrations/0006_tags_writable_kind.sql`. All three are accepted by
+/// [`validate_tag_input`] as of T6-2 (design §6 item 9's "computed/internal
+/// の受理は T6 で解禁" is now in effect) - see [`PLC_TAG_KIND`]/
+/// [`COMPUTED_TAG_KIND`]/[`INTERNAL_TAG_KIND`] for each species' own rules.
 pub const ALLOWED_TAG_KINDS: &[&str] = &["plc", "computed", "internal"];
 
-/// The one `tag_kind` this crate's service layer accepts as of T2 (design §6
-/// item 9: "tag_kind は T2 時点で plc のみ受理し、computed/internal の受理は
-/// T6 で解禁"). `"computed"`/`"internal"` are legal per the SQL `CHECK` (the
-/// column already carries the full §4.2 vocabulary so T6 needs no further
-/// migration) but [`validate_tag_input`] rejects them with a forward-looking
-/// "T6 で対応予定" message, distinct from the generic "invalid value" message
-/// a typo'd `tag_kind` gets - so a caller reaching for `computed`/`internal`
-/// today is told this is a matter of timing, not a mistake.
+/// A collection-driven tag (design §4.2's table): value comes from the
+/// collection task, `address` is required, `expression` must be absent.
+/// Placement: any connection EXCEPT the reserved `calc`/`mem` virtual ones
+/// (T6-2 - see [`validate_tag_kind_placement`]).
 pub const PLC_TAG_KIND: &str = "plc";
+
+/// A computed tag (design §4.2's table, T6-2): value comes from evaluating
+/// `expression` (`banto_expr::compile`, wired at the hub layer -
+/// `apps/banto-hub/core/src/computed.rs`), so `address` must be absent and
+/// `expression` is required. Placement: the tag's group must live under the
+/// reserved `"virtual"` connection named
+/// [`crate::plc_connection::CALC_CONNECTION_NAME`] (`"calc"`) - enforced by
+/// [`validate_tag_kind_placement`], not the SQL schema (see that function's
+/// doc comment for why the check needs a connection join and therefore
+/// cannot live in [`validate_tag_input`] alone).
+pub const COMPUTED_TAG_KIND: &str = "computed";
+
+/// An internal tag (design §4.2's table, T6-2): value comes from client
+/// writes and is held entirely in the hub's tag space (never sent to a PLC).
+/// `address` must be absent like `computed`, but `expression` must ALSO be
+/// absent (an internal tag's value is not derived - it is written).
+/// Placement: the tag's group must live under the reserved `"virtual"`
+/// connection named [`crate::plc_connection::MEM_CONNECTION_NAME`] (`"mem"`)
+/// - same enforcement point as [`COMPUTED_TAG_KIND`].
+pub const INTERNAL_TAG_KIND: &str = "internal";
 
 /// A row of the `tags` table, wire-shaped (camelCase) for a future settings
 /// grid (recorder-requirements.md §6 "タグ設定" screen).
@@ -285,9 +303,12 @@ fn validate_tag_input(input: &TagInput) -> Result<ValidatedTag, BantoError> {
 
     // Address format is protocol-dependent and deliberately left to I2 -
     // only non-empty is enforced here (see this module's doc comment and
-    // migrations/0003_tags.sql).
+    // migrations/0003_tags.sql). This applies to `plc` tags only (T6-2):
+    // `computed`/`internal` tags have no PLC address at all (design §4.2's
+    // table - "address なし") and must instead leave it blank, checked in the
+    // `tag_kind`-specific block below.
     let trimmed_address = input.address.trim();
-    if trimmed_address.is_empty() {
+    if input.tag_kind == PLC_TAG_KIND && trimmed_address.is_empty() {
         errors.push(FieldError {
             field: "address".to_string(),
             message: required_message(),
@@ -304,35 +325,96 @@ fn validate_tag_input(input: &TagInput) -> Result<ValidatedTag, BantoError> {
         });
     }
 
-    // T2 accepts only `tag_kind = "plc"` (design §6 item 9, 2026-08-05
-    // decision - see PLC_TAG_KIND's doc comment). A value from the wider §4.2
-    // vocabulary gets a distinct "not yet" message from an outright-invalid
-    // one, same "report everything, tell the caller exactly what's wrong"
-    // spirit as every other field here.
-    if input.tag_kind != PLC_TAG_KIND {
-        if ALLOWED_TAG_KINDS.contains(&input.tag_kind.as_str()) {
-            errors.push(FieldError {
-                field: "tagKind".to_string(),
-                message: "T6 で対応予定です（現時点は plc のみ受理します）".to_string(),
-            });
-        } else {
-            errors.push(FieldError {
-                field: "tagKind".to_string(),
-                message: format!("tagKind は {} のいずれかです", ALLOWED_TAG_KINDS.join(", ")),
-            });
-        }
+    // `tag_kind` itself (design §4.2's table). All three species are accepted
+    // as of T6-2 (design §6 item 9's staging is now lifted) - an outright
+    // unknown value still gets the generic "must be one of" message.
+    if !ALLOWED_TAG_KINDS.contains(&input.tag_kind.as_str()) {
+        errors.push(FieldError {
+            field: "tagKind".to_string(),
+            message: format!("tagKind は {} のいずれかです", ALLOWED_TAG_KINDS.join(", ")),
+        });
     }
 
-    // design §4.2's table: a `plc` tag's value always comes from the
-    // collection task, never a formula - `expression` only has meaning for
-    // `computed` (T6). Checked regardless of whether `tag_kind` itself just
-    // failed above, so a `plc` payload that also sets `expression` sees both
-    // problems in one response.
-    if input.tag_kind == PLC_TAG_KIND && input.expression.is_some() {
-        errors.push(FieldError {
-            field: "expression".to_string(),
-            message: "plc タグには expression を設定できません".to_string(),
-        });
+    // design §4.2's table, per species (checked regardless of whether
+    // `tag_kind` itself just failed above, so a bad payload sees every
+    // problem in one response):
+    // - `plc`: `address` required (checked above), `expression` forbidden -
+    //   its value always comes from the collection task, never a formula.
+    // - `computed`: `address` forbidden (there is no PLC address - the
+    //   external name's `calc` prefix is a virtual connection, not a real
+    //   one), `expression` required - its value always comes from evaluating
+    //   the formula (banto-expr, wired at the hub layer, T6-2).
+    // - `internal`: `address` forbidden (same reasoning as `computed` - the
+    //   `mem` prefix is virtual too), `expression` ALSO forbidden - unlike
+    //   `computed`, an internal tag's value is written by a client, not
+    //   derived from a formula.
+    match input.tag_kind.as_str() {
+        PLC_TAG_KIND => {
+            if input.expression.is_some() {
+                errors.push(FieldError {
+                    field: "expression".to_string(),
+                    message: "plc タグには expression を設定できません".to_string(),
+                });
+            }
+        }
+        COMPUTED_TAG_KIND => {
+            if !trimmed_address.is_empty() {
+                errors.push(FieldError {
+                    field: "address".to_string(),
+                    message: "computed タグには address を設定できません".to_string(),
+                });
+            }
+            match input.expression.as_deref().map(str::trim) {
+                None | Some("") => errors.push(FieldError {
+                    field: "expression".to_string(),
+                    message: required_message(),
+                }),
+                Some(_) => {}
+            }
+            if input.data_type == STRING_DATA_TYPE {
+                errors.push(FieldError {
+                    field: "dataType".to_string(),
+                    message: "string 型は computed タグに設定できません".to_string(),
+                });
+            }
+            // design §4.2's table: a computed tag's value is always decided
+            // by its expression, never accepted from a client write - forcing
+            // `writable == false` here (rather than special-casing tag_kind
+            // in the write path) is what makes the write path's existing
+            // gate 2 (`writable == false` -> 403) already the "computed タグ
+            // への書き込みは常に403" rule from the T6-2 implementation
+            // instructions, with no extra branch needed there.
+            if input.writable {
+                errors.push(FieldError {
+                    field: "writable".to_string(),
+                    message: "computed タグは writable にできません（値は式が決まります）"
+                        .to_string(),
+                });
+            }
+        }
+        INTERNAL_TAG_KIND => {
+            if !trimmed_address.is_empty() {
+                errors.push(FieldError {
+                    field: "address".to_string(),
+                    message: "internal タグには address を設定できません".to_string(),
+                });
+            }
+            if input.expression.is_some() {
+                errors.push(FieldError {
+                    field: "expression".to_string(),
+                    message: "internal タグには expression を設定できません".to_string(),
+                });
+            }
+            if input.data_type == STRING_DATA_TYPE {
+                errors.push(FieldError {
+                    field: "dataType".to_string(),
+                    message: "string 型は internal タグに設定できません".to_string(),
+                });
+            }
+        }
+        // Unknown tag_kind: already reported above; no species-specific rule
+        // applies.
+        _ => {}
     }
 
     if !(MIN_DECIMALS..=MAX_DECIMALS).contains(&input.decimals) {
@@ -440,6 +522,89 @@ fn validate_tag_input(input: &TagInput) -> Result<ValidatedTag, BantoError> {
     })
 }
 
+/// Cross-table placement check (T6-2, design §4.2's reserved `calc`/`mem`
+/// namespace): `tag_kind` alone (checked in [`validate_tag_input`], which has
+/// no database access) cannot tell whether a tag's group sits under the
+/// reserved `"virtual"` connections - that requires joining
+/// `collection_groups` to `plc_connections`, i.e. a query. This function is
+/// therefore a separate, `async`, pool-taking step run by
+/// [`TagService::create`]/[`TagService::update`] AFTER
+/// [`validate_tag_input`] passes.
+///
+/// **Why here and not in `apps/banto-hub` (hub layer)**: the T6-2
+/// implementation instructions leave the placement open between `TagService`
+/// and the hub layer, recommending `TagService` "レジストリの整合性制約として
+/// 全アプリ共通であるべき" - `banto-tags` is shared by ChronoGazer /
+/// relay-wright / banto-hub alike, and "a `computed` tag must live under
+/// `calc`, an `internal` tag under `mem`, a `plc` tag under neither" is a
+/// registry-integrity invariant (same category as the existing "収集グループ
+/// は必ず実在する PLC 接続を指す" `FOREIGN KEY` check), not a hub-specific
+/// business rule - every consumer of this crate should get it enforced
+/// uniformly rather than only banto-hub bothering to check.
+///
+/// A `collection_group_id` that does not resolve to any row is reported by
+/// the `FOREIGN KEY` failure at INSERT/UPDATE time
+/// ([`crate::support::map_write_error`]) instead - this function returns
+/// `Ok(())` for that case rather than manufacturing a second, duplicate
+/// error for the same underlying problem.
+async fn validate_tag_kind_placement(
+    pool: &SqlitePool,
+    collection_group_id: i64,
+    tag_kind: &str,
+) -> Result<(), BantoError> {
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT pc.name, pc.protocol FROM collection_groups cg \
+         JOIN plc_connections pc ON pc.id = cg.plc_connection_id \
+         WHERE cg.id = ?",
+    )
+    .bind(collection_group_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+
+    let Some((conn_name, protocol)) = row else {
+        return Ok(());
+    };
+    let is_virtual = protocol == VIRTUAL_PROTOCOL;
+
+    let placement_error = |message: String| -> Result<(), BantoError> {
+        Err(BantoError::Validation {
+            field_errors: vec![FieldError {
+                field: "tagKind".to_string(),
+                message,
+            }],
+        })
+    };
+
+    match tag_kind {
+        PLC_TAG_KIND => {
+            if is_virtual {
+                return placement_error(
+                    "plc タグは予約接続（calc/mem）配下に作成できません".to_string(),
+                );
+            }
+        }
+        COMPUTED_TAG_KIND => {
+            if !is_virtual || conn_name != CALC_CONNECTION_NAME {
+                return placement_error(format!(
+                    "computed タグは予約接続 {CALC_CONNECTION_NAME} 配下にのみ作成できます"
+                ));
+            }
+        }
+        INTERNAL_TAG_KIND => {
+            if !is_virtual || conn_name != MEM_CONNECTION_NAME {
+                return placement_error(format!(
+                    "internal タグは予約接続 {MEM_CONNECTION_NAME} 配下にのみ作成できます"
+                ));
+            }
+        }
+        // Unknown tag_kind is already rejected by validate_tag_input; no
+        // placement rule to apply.
+        _ => {}
+    }
+    Ok(())
+}
+
 fn column_map() -> ColumnMap {
     ColumnMap::new()
         .column("id", "id")
@@ -527,6 +692,7 @@ impl TagService {
 
     pub async fn create(&self, input: TagInput) -> Result<Tag, BantoError> {
         let validated = validate_tag_input(&input)?;
+        validate_tag_kind_placement(&self.pool, input.collection_group_id, &input.tag_kind).await?;
         sqlx::query_as::<_, Tag>(&format!(
             "INSERT INTO tags (\
                 name, collection_group_id, address, data_type, string_length, \
@@ -563,6 +729,7 @@ impl TagService {
 
     pub async fn update(&self, id: i64, input: TagInput) -> Result<Tag, BantoError> {
         let validated = validate_tag_input(&input)?;
+        validate_tag_kind_placement(&self.pool, input.collection_group_id, &input.tag_kind).await?;
         sqlx::query_as::<_, Tag>(&format!(
             "UPDATE tags SET \
                 name = ?, collection_group_id = ?, address = ?, data_type = ?, \
@@ -1322,28 +1489,241 @@ mod tests {
             .expect("tag_kind plc should be accepted in T2");
     }
 
-    /// `computed`/`internal` are legal per [`ALLOWED_TAG_KINDS`] (and the SQL
-    /// `CHECK`) but not yet accepted by the T2 service layer (design §6 item
-    /// 9) - the rejection message must say "T6", not the generic
-    /// invalid-value message [`create_rejects_an_unknown_tag_kind`] checks
-    /// for.
+    /// Test helper (T6-2): create a `"virtual"`-protocol connection named
+    /// `conn_name` (e.g. [`CALC_CONNECTION_NAME`]/[`MEM_CONNECTION_NAME`])
+    /// plus one collection group under it, and return the group's id - the
+    /// shape [`validate_tag_kind_placement`] requires for `computed`/
+    /// `internal` tags. Mirrors what `banto-hub` auto-provisions at startup
+    /// (T6-2 architecture decision), but built directly here since this
+    /// crate's tests do not depend on the hub layer.
+    async fn virtual_group(pool: &sqlx::SqlitePool, conn_name: &str) -> i64 {
+        let plc_svc = PlcConnectionService::new(pool.clone());
+        let conn = plc_svc
+            .create(PlcConnectionInput {
+                name: conn_name.to_string(),
+                protocol: VIRTUAL_PROTOCOL.to_string(),
+                host: String::new(),
+                port: 0,
+                unit_id: 1,
+                enabled: true,
+            })
+            .await
+            .expect("virtual connection should be creatable");
+        let group_svc = CollectionGroupService::new(pool.clone());
+        let group = group_svc
+            .create(CollectionGroupInput {
+                name: format!("{conn_name}-group"),
+                plc_connection_id: conn.id,
+                period_ms: 1_000,
+                enabled: true,
+            })
+            .await
+            .expect("group under a virtual connection should be creatable");
+        group.id
+    }
+
+    /// design §4.2's reserved namespace (T6-2): a `computed` tag must live
+    /// under the `calc` virtual connection, and must supply `expression`
+    /// with a blank `address`.
     #[tokio::test]
-    async fn create_rejects_computed_and_internal_with_a_t6_message() {
-        let (svc, group_id) = setup().await;
-        for kind in ["computed", "internal"] {
-            let mut input = sample_input(&format!("K-{kind}"), group_id);
+    async fn create_accepts_a_computed_tag_under_calc() {
+        let (svc, _plc_group_id) = setup().await;
+        let calc_group = virtual_group(&svc.pool, CALC_CONNECTION_NAME).await;
+
+        let mut input = sample_input("avg", calc_group);
+        input.tag_kind = COMPUTED_TAG_KIND.to_string();
+        input.address = String::new();
+        input.expression = Some("(a + b) / 2".to_string());
+        let created = svc
+            .create(input)
+            .await
+            .expect("a computed tag under calc should be accepted");
+        assert_eq!(created.tag_kind, "computed");
+        assert_eq!(created.address, "");
+        assert_eq!(created.expression.as_deref(), Some("(a + b) / 2"));
+    }
+
+    /// The `internal` sibling: must live under `mem`, forbids `expression`,
+    /// and may set `retain`.
+    #[tokio::test]
+    async fn create_accepts_an_internal_tag_under_mem() {
+        let (svc, _plc_group_id) = setup().await;
+        let mem_group = virtual_group(&svc.pool, MEM_CONNECTION_NAME).await;
+
+        let mut input = sample_input("setpoint1", mem_group);
+        input.tag_kind = INTERNAL_TAG_KIND.to_string();
+        input.address = String::new();
+        input.writable = true;
+        input.retain = true;
+        let created = svc
+            .create(input)
+            .await
+            .expect("an internal tag under mem should be accepted");
+        assert_eq!(created.tag_kind, "internal");
+        assert_eq!(created.address, "");
+        assert_eq!(created.expression, None);
+        assert!(created.retain);
+        assert!(created.writable);
+    }
+
+    /// A `computed`/`internal` tag whose group sits under an ordinary (non-
+    /// virtual) connection is rejected - the reserved namespace is not
+    /// optional.
+    #[tokio::test]
+    async fn create_rejects_computed_and_internal_outside_their_reserved_connection() {
+        let (svc, plc_group_id) = setup().await;
+        for kind in [COMPUTED_TAG_KIND, INTERNAL_TAG_KIND] {
+            let mut input = sample_input(&format!("K-{kind}"), plc_group_id);
             input.tag_kind = kind.to_string();
+            input.address = String::new();
+            if kind == COMPUTED_TAG_KIND {
+                input.expression = Some("1 + 1".to_string());
+            }
             let err = svc.create(input).await.unwrap_err();
             match err {
                 BantoError::Validation { field_errors } => {
                     assert_eq!(field_errors[0].field, "tagKind", "kind={kind}");
-                    assert_eq!(
-                        field_errors[0].message, "T6 で対応予定です（現時点は plc のみ受理します）",
-                        "kind={kind}"
+                    assert!(
+                        field_errors[0].message.contains("予約接続"),
+                        "kind={kind} message={:?}",
+                        field_errors[0].message
                     );
                 }
                 other => panic!("expected Validation for kind={kind}, got {other:?}"),
             }
+        }
+    }
+
+    /// The reverse direction: a `plc` tag cannot be placed under either
+    /// reserved virtual connection.
+    #[tokio::test]
+    async fn create_rejects_a_plc_tag_under_a_virtual_connection() {
+        let (svc, _plc_group_id) = setup().await;
+        let calc_group = virtual_group(&svc.pool, CALC_CONNECTION_NAME).await;
+        let input = sample_input("X", calc_group);
+        let err = svc.create(input).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "tagKind");
+                assert!(field_errors[0].message.contains("予約接続"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// `computed`/`internal` reject a non-empty `address` even when placed
+    /// correctly under `calc`/`mem` - design §4.2's table ("address なし").
+    #[tokio::test]
+    async fn create_rejects_a_non_empty_address_on_computed_and_internal() {
+        let (svc, _plc_group_id) = setup().await;
+        let calc_group = virtual_group(&svc.pool, CALC_CONNECTION_NAME).await;
+        let mut input = sample_input("X", calc_group);
+        input.tag_kind = COMPUTED_TAG_KIND.to_string();
+        input.expression = Some("1 + 1".to_string());
+        // sample_input's default address ("40001") is left as-is.
+        let err = svc.create(input).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert!(field_errors.iter().any(|e| e.field == "address"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// `computed` requires `expression`; omitting it (even with everything
+    /// else correct) is rejected.
+    #[tokio::test]
+    async fn create_rejects_a_computed_tag_without_an_expression() {
+        let (svc, _plc_group_id) = setup().await;
+        let calc_group = virtual_group(&svc.pool, CALC_CONNECTION_NAME).await;
+        let mut input = sample_input("X", calc_group);
+        input.tag_kind = COMPUTED_TAG_KIND.to_string();
+        input.address = String::new();
+        let err = svc.create(input).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert!(field_errors.iter().any(|e| e.field == "expression"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// `internal` forbids `expression` even under the correct `mem` group.
+    #[tokio::test]
+    async fn create_rejects_an_internal_tag_with_an_expression() {
+        let (svc, _plc_group_id) = setup().await;
+        let mem_group = virtual_group(&svc.pool, MEM_CONNECTION_NAME).await;
+        let mut input = sample_input("X", mem_group);
+        input.tag_kind = INTERNAL_TAG_KIND.to_string();
+        input.address = String::new();
+        input.expression = Some("1 + 1".to_string());
+        let err = svc.create(input).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "expression");
+                assert_eq!(
+                    field_errors[0].message,
+                    "internal タグには expression を設定できません"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// design §4.2's table: a computed tag's value is always the expression
+    /// result, never a client write - `writable` is forced false at
+    /// registration so the write path's existing "writable == false -> 403"
+    /// gate already covers "computed タグへの書き込みは常に403" with no
+    /// special-casing in the write path itself.
+    #[tokio::test]
+    async fn create_rejects_a_writable_computed_tag() {
+        let (svc, _plc_group_id) = setup().await;
+        let calc_group = virtual_group(&svc.pool, CALC_CONNECTION_NAME).await;
+        let mut input = sample_input("X", calc_group);
+        input.tag_kind = COMPUTED_TAG_KIND.to_string();
+        input.address = String::new();
+        input.expression = Some("1 + 1".to_string());
+        input.writable = true;
+        let err = svc.create(input).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "writable");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// `string` data type makes no sense for a computed/internal tag (their
+    /// value is always numeric - banto-expr's own type system, and
+    /// `ServerTagStore`'s value slot, are both `f64`-only).
+    #[tokio::test]
+    async fn create_rejects_string_data_type_on_computed_and_internal() {
+        let (svc, _plc_group_id) = setup().await;
+        let calc_group = virtual_group(&svc.pool, CALC_CONNECTION_NAME).await;
+        let mut computed = sample_input("X", calc_group);
+        computed.tag_kind = COMPUTED_TAG_KIND.to_string();
+        computed.address = String::new();
+        computed.expression = Some("1 + 1".to_string());
+        computed.data_type = STRING_DATA_TYPE.to_string();
+        let err = svc.create(computed).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert!(field_errors.iter().any(|e| e.field == "dataType"));
+            }
+            other => panic!("expected Validation for computed, got {other:?}"),
+        }
+
+        let mem_group = virtual_group(&svc.pool, MEM_CONNECTION_NAME).await;
+        let mut internal = sample_input("Y", mem_group);
+        internal.tag_kind = INTERNAL_TAG_KIND.to_string();
+        internal.address = String::new();
+        internal.data_type = STRING_DATA_TYPE.to_string();
+        let err = svc.create(internal).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert!(field_errors.iter().any(|e| e.field == "dataType"));
+            }
+            other => panic!("expected Validation for internal, got {other:?}"),
         }
     }
 

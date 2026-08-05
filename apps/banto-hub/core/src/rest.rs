@@ -1987,17 +1987,19 @@ struct ValueEntry {
     t: i64,
 }
 
-/// Thin wire-formatting wrapper over [`crate::hub::effective_sample`] (see
-/// its doc comment - this is the "same v/q/t semantics as `crate::stream`'s
+/// Thin wire-formatting wrapper over [`crate::hub::read_current`] (see its
+/// doc comment - this is the "same v/q/t semantics as `crate::stream`'s
 /// `data` messages" helper the T1 実装指示 asked to share rather than
-/// duplicate).
+/// duplicate; T6-2 widened it to also cover computed/internal tags via
+/// `read_current` instead of calling `effective_sample` directly).
 fn value_entry(
     external_name: &str,
     entry: &TagEntry,
-    sample: Option<banto_collect::CurrentSample>,
+    current: Option<&banto_collect::CurrentValuesHandle>,
+    server_store: &crate::computed::ServerTagStore,
     now_ms: i64,
 ) -> ValueEntry {
-    let (v, q, t) = crate::hub::effective_sample(entry, sample, now_ms);
+    let (v, q, t) = crate::hub::read_current(entry, current, server_store, now_ms);
     ValueEntry {
         tag: external_name.to_string(),
         v,
@@ -2048,6 +2050,7 @@ async fn v1_values(
     let revision = state.manager.revision();
     let now_ms = state.manager.clock().now_ms();
     let current = state.manager.current_values();
+    let server_store = state.manager.server_store();
 
     let names: Vec<String> = match &query.tags {
         Some(raw) => raw
@@ -2080,10 +2083,7 @@ async fn v1_values(
     let values: Vec<ValueEntry> = names
         .iter()
         .filter_map(|name| map.get(name).map(|entry| (name, entry)))
-        .map(|(name, entry)| {
-            let sample = current.as_ref().and_then(|c| c.get(&entry.tag_key));
-            value_entry(name, entry, sample, now_ms)
-        })
+        .map(|(name, entry)| value_entry(name, entry, current.as_ref(), &server_store, now_ms))
         .collect();
 
     Json(ValuesResponse {
@@ -2121,8 +2121,14 @@ async fn v1_value_single(
     };
     let now_ms = state.manager.clock().now_ms();
     let current = state.manager.current_values();
-    let sample = current.as_ref().and_then(|c| c.get(&entry.tag_key));
-    Ok(Json(value_entry(&tag, entry, sample, now_ms)))
+    let server_store = state.manager.server_store();
+    Ok(Json(value_entry(
+        &tag,
+        entry,
+        current.as_ref(),
+        &server_store,
+        now_ms,
+    )))
 }
 
 /// `GET /api/v1/status` の `connections` 配列1件分。
@@ -2958,12 +2964,16 @@ mod tests {
         let sessions = Arc::new(crate::broker_glue::HubSessions::new(
             banto_broker::BackoffConfig::default(),
         ));
+        let computed = Arc::new(crate::computed::ComputedEngine::new(Arc::new(
+            crate::computed::ServerTagStore::new(),
+        )));
         let manager = CollectorManager::new(
             pool,
             dir.path().join("data"),
             Arc::new(SystemClock),
             CollectorOptions::default(),
             sessions,
+            computed,
         );
         (Arc::new(manager), dir)
     }

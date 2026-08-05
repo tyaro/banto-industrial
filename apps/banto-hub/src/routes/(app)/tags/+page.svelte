@@ -23,12 +23,18 @@
 		updateTag,
 		deleteTag,
 		listCollectionGroups,
+		listPlcConnections,
 		MIN_STRING_LENGTH,
 		MAX_STRING_LENGTH,
+		TAG_KIND_OPTIONS,
+		CALC_CONNECTION_NAME,
+		MEM_CONNECTION_NAME,
 		type Tag,
 		type TagInput,
 		type TagDataType,
-		type CollectionGroup
+		type TagKind,
+		type CollectionGroup,
+		type PlcConnection
 	} from '$lib/banto/tagRegistryAdmin';
 
 	const dataTypeOptions: { value: TagDataType; label: string }[] = [
@@ -67,10 +73,16 @@
 		/**
 		 * 書き込み可（T2-3、docs/tag-server-design.md §6 item 1）。既定 off -
 		 * 明示的に opt-in させたタグだけを書き込み対象にする設計（per-tag
-		 * opt-in）に合わせる。`tagKind`/`expression`/`retain` はこの画面には
-		 * 出さない（T6 まで）。
+		 * opt-in）に合わせる。`computed` タグではこのチェックボックス自体を
+		 * 隠す（送信時に強制 false - サーバー側も writable=true を拒否する）。
 		 */
 		writable: boolean;
+		/** T6-2: タグ種別。既定は既存どおり `plc`。 */
+		tagKind: TagKind;
+		/** T6-2: 演算タグの式ソース（`tagKind === 'computed'` のときのみ表示・送信）。 */
+		expression: string;
+		/** T6-2: 内部タグの再起動時復元フラグ（`tagKind === 'internal'` のときのみ表示）。 */
+		retain: boolean;
 	}
 
 	function blankForm(): FormState {
@@ -91,7 +103,10 @@
 			thresholdL: '',
 			thresholdLl: '',
 			enabled: true,
-			writable: false
+			writable: false,
+			tagKind: 'plc',
+			expression: '',
+			retain: false
 		};
 	}
 
@@ -117,7 +132,10 @@
 			thresholdL: numOrEmpty(t.thresholdL),
 			thresholdLl: numOrEmpty(t.thresholdLl),
 			enabled: t.enabled,
-			writable: t.writable
+			writable: t.writable,
+			tagKind: t.tagKind,
+			expression: t.expression ?? '',
+			retain: t.retain
 		};
 	}
 
@@ -126,11 +144,20 @@
 		return s === '' ? undefined : Number(s);
 	}
 
+	/**
+	 * T6-2 (docs/tag-server-design.md §4.2's table): `computed`/`internal`
+	 * tags carry no PLC address at all — send an empty string regardless of
+	 * whatever the (hidden) address field still holds from a prior `plc`
+	 * selection, so switching `tagKind` in the form can never leak a stale
+	 * address into a payload the backend would reject.
+	 */
 	function toInput(form: FormState): TagInput {
+		const isPlc = form.tagKind === 'plc';
+		const isComputed = form.tagKind === 'computed';
 		return {
 			name: form.name,
 			collectionGroupId: Number(form.collectionGroupId),
-			address: form.address,
+			address: isPlc ? form.address : '',
 			dataType: form.dataType,
 			stringLength: form.dataType === 'string' ? optNum(form.stringLength) : undefined,
 			rawLo: optNum(form.rawLo),
@@ -144,11 +171,17 @@
 			thresholdL: optNum(form.thresholdL),
 			thresholdLl: optNum(form.thresholdLl),
 			enabled: form.enabled,
-			writable: form.writable
+			// computed タグは常に writable=false（値は式が決める、§4.2表）-
+			// フォーム自体もこのチェックボックスを隠すが、送信直前にも強制する。
+			writable: isComputed ? false : form.writable,
+			tagKind: form.tagKind,
+			expression: isComputed ? form.expression : undefined,
+			retain: form.tagKind === 'internal' ? form.retain : false
 		};
 	}
 
 	let groups: CollectionGroup[] = $state([]);
+	let connections: PlcConnection[] = $state([]);
 	let tags: Tag[] = $state([]);
 	let loading = $state(false);
 
@@ -156,10 +189,33 @@
 		return groups.find((g) => g.id === id)?.name ?? `#${id}`;
 	}
 
+	function connectionName(id: number): string | undefined {
+		return connections.find((c) => c.id === id)?.name;
+	}
+
+	/**
+	 * T6-2: groups の候補をタグ種別で絞り込む — `computed` は `calc` 接続
+	 * 配下、`internal` は `mem` 接続配下、`plc` はそのどちらでもない接続配下
+	 * のみ（`banto_tags::tag::validate_tag_kind_placement` と同じ規則）。
+	 * サーバー側検証の先取りであって、これ自体が正の唯一の判定源ではない。
+	 */
+	function groupsFor(kind: TagKind): CollectionGroup[] {
+		return groups.filter((g) => {
+			const name = connectionName(g.plcConnectionId);
+			if (kind === 'computed') return name === CALC_CONNECTION_NAME;
+			if (kind === 'internal') return name === MEM_CONNECTION_NAME;
+			return name !== CALC_CONNECTION_NAME && name !== MEM_CONNECTION_NAME;
+		});
+	}
+
 	async function reload(): Promise<void> {
 		loading = true;
 		try {
-			[groups, tags] = await Promise.all([listCollectionGroups(), listTags()]);
+			[groups, connections, tags] = await Promise.all([
+				listCollectionGroups(),
+				listPlcConnections(),
+				listTags()
+			]);
 		} catch (err) {
 			toastStore.push('error', errorMessage(err));
 		} finally {
@@ -264,6 +320,12 @@
 		{ id: 'address', header: 'アドレス', accessor: 'address', width: 100 },
 		{ id: 'dataType', header: '型', accessor: 'dataType', width: 80 },
 		{
+			id: 'tagKind',
+			header: '種別',
+			accessor: 'tagKind',
+			width: 90
+		},
+		{
 			id: 'enabled',
 			header: '有効',
 			accessor: 'enabled',
@@ -291,17 +353,56 @@
 			収集グループ
 			<select bind:value={form.collectionGroupId}>
 				<option value="" disabled>選択してください</option>
-				{#each groups as group (group.id)}
+				{#each groupsFor(form.tagKind) as group (group.id)}
 					<option value={String(group.id)}>{group.name}</option>
 				{/each}
 			</select>
+			{#if form.tagKind === 'computed'}
+				<span class="hint">{CALC_CONNECTION_NAME} 接続配下のグループのみ選択できます。</span>
+			{:else if form.tagKind === 'internal'}
+				<span class="hint">{MEM_CONNECTION_NAME} 接続配下のグループのみ選択できます。</span>
+			{/if}
 			{#if errors.collectionGroupId}<span class="err">{errors.collectionGroupId}</span>{/if}
 		</label>
 		<label class="field">
-			アドレス
-			<input type="text" bind:value={form.address} placeholder="D100" />
-			{#if errors.address}<span class="err">{errors.address}</span>{/if}
+			タグ種別
+			<select
+				bind:value={form.tagKind}
+				onchange={() => {
+					// タグ種別を切り替えたら、もう選択できないグループ ID は
+					// クリアする（`groupsFor` の絞り込みと矛盾する選択を残さない）。
+					if (!groupsFor(form.tagKind).some((g) => String(g.id) === form.collectionGroupId)) {
+						form.collectionGroupId = '';
+					}
+				}}
+			>
+				{#each TAG_KIND_OPTIONS as opt (opt.value)}
+					<option value={opt.value}>{opt.label}</option>
+				{/each}
+			</select>
+			{#if errors.tagKind}<span class="err">{errors.tagKind}</span>{/if}
 		</label>
+		{#if form.tagKind === 'plc'}
+			<label class="field">
+				アドレス
+				<input type="text" bind:value={form.address} placeholder="D100" />
+				{#if errors.address}<span class="err">{errors.address}</span>{/if}
+			</label>
+		{/if}
+		{#if form.tagKind === 'computed'}
+			<label class="field wide">
+				式（expression）
+				<textarea
+					bind:value={form.expression}
+					rows="2"
+					placeholder="(line1.fast.a + line1.fast.b) / 2"></textarea>
+				<span class="hint"
+					>四則・比較・論理・if(c,a,b)・min/max/abs/round/clamp/bit(tag,n)。参照する外部名は他タグ
+					（plc/computed/internal）の完全名。</span
+				>
+				{#if errors.expression}<span class="err">{errors.expression}</span>{/if}
+			</label>
+		{/if}
 		<label class="field">
 			データ型
 			<select bind:value={form.dataType}>
@@ -379,10 +480,18 @@
 			<input type="checkbox" bind:checked={form.enabled} />
 			有効
 		</label>
-		<label class="field checkbox">
-			<input type="checkbox" bind:checked={form.writable} />
-			書き込み可（writable）
-		</label>
+		{#if form.tagKind !== 'computed'}
+			<label class="field checkbox">
+				<input type="checkbox" bind:checked={form.writable} />
+				書き込み可（writable）
+			</label>
+		{/if}
+		{#if form.tagKind === 'internal'}
+			<label class="field checkbox">
+				<input type="checkbox" bind:checked={form.retain} />
+				retain（再起動時に最終値を復元）
+			</label>
+		{/if}
 	</div>
 {/snippet}
 
@@ -495,13 +604,23 @@
 		gap: 0.4rem;
 	}
 
+	.field.wide {
+		grid-column: 1 / -1;
+	}
+
 	.field input,
-	.field select {
+	.field select,
+	.field textarea {
 		padding: 0.4rem 0.5rem;
 		border: 1px solid var(--banto-border);
 		border-radius: var(--banto-radius);
 		background: var(--banto-bg);
 		color: var(--banto-text);
+		font-family: inherit;
+	}
+
+	.field textarea {
+		resize: vertical;
 	}
 
 	.field.checkbox input {

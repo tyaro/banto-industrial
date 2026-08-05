@@ -39,11 +39,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use banto_collect::CollectorOptions;
+use banto_collect::{CollectorOptions, Quality};
 use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::assets::FrontendAssets;
 use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::HubSessions;
+use banto_hub_core::computed::{load_retained_values, ComputedEngine, ServerTagStore};
 use banto_hub_core::db::init_db;
 use banto_hub_core::events::event_channel;
 use banto_hub_core::grpc::{GrpcServer, GrpcService};
@@ -51,14 +52,20 @@ use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::mqtt::MqttPublisher;
 use banto_hub_core::rest::{api_router, audited_credential_verifier};
 use banto_hub_core::settings::SettingsService;
+use banto_hub_core::subscribe_core::EVAL_TICK_MS;
 use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
 use banto_hub_core::write_control::{load_persisted_enabled, WriteControl};
 use banto_hub_core::write_rate::{WriteRateLimitConfig, WriteRateLimiter};
 use banto_server::{lan_urls, start, static_router, AuthState, ServerConfig};
-use banto_tags::{CollectionGroupService, PlcConnectionService, TagService};
+use banto_tags::{
+    CollectionGroupService, PlcConnectionInput, PlcConnectionService, TagService,
+    CALC_CONNECTION_NAME, MEM_CONNECTION_NAME, VIRTUAL_PROTOCOL,
+};
 use banto_tstore::{LocalDate, SystemClock};
+use sqlx::SqlitePool;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::MissedTickBehavior;
 
 const DEFAULT_DB_PATH: &str = "./banto-hub.sqlite3";
 const PRUNE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -71,6 +78,15 @@ async fn main() {
         .unwrap_or(false);
 
     let pool = init_db(&db_path).await.expect("init_db should succeed");
+
+    // T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): auto-provision the
+    // reserved `calc`/`mem` virtual connections BEFORE the first rebuild
+    // below, so an operator can start creating computed/internal tags
+    // immediately - the registry's own `UNIQUE` constraint on `name` is what
+    // then protects both names from ever being claimed by a real connection
+    // (`banto_tags::plc_connection`'s module doc "virtual" section).
+    ensure_virtual_connection(&pool, CALC_CONNECTION_NAME).await;
+    ensure_virtual_connection(&pool, MEM_CONNECTION_NAME).await;
 
     let events = event_channel();
     let users = UsersService::new(pool.clone());
@@ -106,12 +122,45 @@ async fn main() {
     // binary can call `sessions.shutdown()` after `manager.shutdown()` on the
     // way out - see this module's doc comment ("シャットダウン順序").
     let sessions = Arc::new(HubSessions::new(banto_broker::BackoffConfig::default()));
+
+    // T6-2 (docs/tag-server-design.md §4.2): constructed here, OUTSIDE
+    // `CollectorManager`, for the same reason `sessions` is - the computed
+    // engine's plan and `ServerTagStore`'s values must outlive every single
+    // `rebuild`, and the background evaluation loop below needs its own
+    // `Arc` clone independent of `CollectorManager`'s lifecycle.
+    let server_store = Arc::new(ServerTagStore::new());
+    let computed_engine = Arc::new(ComputedEngine::new(server_store.clone()));
+
+    // T6-2 (design §4.2 "retain フラグで再起動時の最終値復元"): seed every
+    // persisted internal-tag value BEFORE the startup rebuild/eval loop
+    // start touching the store - quality Good, timestamp = the time it was
+    // saved (design: "起動時にロードして ServerTagStore を初期化(品質 Good・
+    // 時刻は保存時刻)"). A tag_id with no persisted row here simply stays
+    // absent from the store, which `hub::read_current` already reads as Bad
+    // (design: "retain=false は起動時 Bad") - no special-casing needed.
+    match load_retained_values(&pool).await {
+        Ok(rows) => {
+            for (tag_id, value, ptime_ms) in rows {
+                server_store.set(
+                    &format!("tag:{tag_id}"),
+                    Some(value),
+                    Quality::Good,
+                    ptime_ms,
+                );
+            }
+        }
+        Err(err) => {
+            eprintln!("banto-hub: retain 値の復元に失敗しました: {err}");
+        }
+    }
+
     let manager = Arc::new(CollectorManager::new(
         pool.clone(),
         data_dir.clone(),
         clock.clone(),
         CollectorOptions::default(),
         sessions.clone(),
+        computed_engine.clone(),
     ));
 
     // Startup rebuild (design §4.3: T0 は起動時に1回). A failure here (e.g.
@@ -121,6 +170,28 @@ async fn main() {
     // later CRUD write.
     if let Err(err) = manager.rebuild().await {
         eprintln!("banto-hub: 起動時の collector 構築に失敗しました: {err}");
+    }
+
+    // T6-2 (design §4.2「評価タイミング」): the computed-tag 250ms
+    // evaluation loop - same fixed tick (`EVAL_TICK_MS`,
+    // `crate::subscribe_core`) the WS/gRPC subscription evaluators use.
+    // Runs for the process lifetime (no graceful shutdown handle, same as
+    // the retention-sweep task below - both are read-only background loops
+    // that simply stop existing when the process exits).
+    {
+        let eval_manager = manager.clone();
+        let eval_engine = computed_engine.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(EVAL_TICK_MS as u64));
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let map = eval_manager.tag_map();
+                let now_ms = eval_manager.clock().now_ms();
+                let current = eval_manager.current_values();
+                eval_engine.evaluate_tick(&map, current.as_ref(), now_ms);
+            }
+        });
     }
 
     // Retention sweep (design §3.3: 既定7日、起動時+日次). Best-effort: a
@@ -258,6 +329,46 @@ async fn main() {
     manager.shutdown().await;
     sessions.shutdown().await;
     server.stop().await;
+}
+
+/// T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): create the reserved
+/// `"virtual"`-protocol connection named `name` if no connection with that
+/// name exists yet - idempotent across restarts (checked by name first
+/// rather than relying on the registry's `UNIQUE` constraint to reject a
+/// duplicate `create`, so a normal restart never even attempts - and logs -
+/// a doomed insert). `host`/`port` are left at their virtual-protocol
+/// defaults (empty/`0` - `banto_tags::plc_connection`'s relaxed validation
+/// for `"virtual"`). A failure here (e.g. a corrupt registry) is logged and
+/// never fatal - same "must not prevent the server from starting" posture
+/// as the startup rebuild just above.
+async fn ensure_virtual_connection(pool: &SqlitePool, name: &str) {
+    let already_exists: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM plc_connections WHERE name = ?")
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .unwrap_or_else(|err| {
+                eprintln!("banto-hub: 予約接続 {name} の存在確認に失敗しました: {err}");
+                0
+            });
+    if already_exists > 0 {
+        return;
+    }
+
+    let svc = PlcConnectionService::new(pool.clone());
+    if let Err(err) = svc
+        .create(PlcConnectionInput {
+            name: name.to_string(),
+            protocol: VIRTUAL_PROTOCOL.to_string(),
+            host: String::new(),
+            port: 0,
+            unit_id: 1,
+            enabled: true,
+        })
+        .await
+    {
+        eprintln!("banto-hub: 予約接続 {name} の自動プロビジョニングに失敗しました: {err}");
+    }
 }
 
 /// One retention sweep (design §3.3): read the configured retention days

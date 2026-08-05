@@ -57,18 +57,22 @@
 
 use std::time::Instant;
 
+use banto_collect::Quality;
 use banto_core::BantoError;
 use banto_plc::{Address, DataType, TagValue as PlcTagValue};
 use banto_plc_write::{
     BatchWriteRequest, WriteRequest as PlcWriteRequest, WriteResult as PlcWriteResult,
 };
 use banto_server::ServerEvent;
-use banto_tags::{unscale, PlcConnectionService, Scaling, TagService, STRING_DATA_TYPE};
+use banto_tags::{
+    unscale, PlcConnectionService, Scaling, TagService, PLC_TAG_KIND, STRING_DATA_TYPE,
+};
 use serde_json::json;
 use tokio::sync::broadcast;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::api_keys::{ApiKeyContext, ApiKeysService};
+use crate::computed::upsert_retained_value;
 use crate::hub::CollectorManager;
 use crate::write_audit::{WriteAuditAction, WriteAuditResult, WriteAuditRow, WriteAuditService};
 use crate::write_control::WriteControl;
@@ -211,15 +215,32 @@ pub async fn execute_write(
     }
 
     let (connection_id, _group_id, tag_id) = entry.ids;
-    let conn = PlcConnectionService::new(deps.manager.pool())
-        .get(connection_id)
-        .await
-        .map_err(map_registry_error)?;
 
-    // gate 4: Modbus 接続配下は非対応(§6-7: v1 の書き込みは SLMP のみ)
-    if conn.protocol != "slmp" {
-        return Err(WriteRejection::UnsupportedProtocol);
-    }
+    // gate 4: Modbus 接続配下は非対応(§6-7: v1 の書き込みは SLMP のみ)。
+    //
+    // T6-2 決定(docs/tag-server-design.md §4.2「internal タグ...PLC へ送ら
+    // ない」): `internal` タグは PLC 接続を一切経由しないため、このプロト
+    // コルゲート自体を丸ごとスキップする(接続行を読みにいく必要すらない)。
+    // `computed` タグはそもそもここへ到達しない - gate 2 の
+    // `writable == false` が、banto_tags 側で computed タグには常に
+    // `writable = false` を強制する登録時検証と噛み合って、§4.2 表の
+    // 「書き込み: 不可(値は式が決まる)」を特別扱いなしに成立させている。
+    // writable opt-in・write スコープ・レート制限・write_enabled・監査は
+    // `internal` タグにもそのまま一様に適用する - タグ種別で緩めない保守的
+    // な一様ルール(SLMP プロトコルゲートだけがタグ種別で分岐する唯一の
+    // 例外)。
+    let conn = if entry.tag_kind == PLC_TAG_KIND {
+        let conn = PlcConnectionService::new(deps.manager.pool())
+            .get(connection_id)
+            .await
+            .map_err(map_registry_error)?;
+        if conn.protocol != "slmp" {
+            return Err(WriteRejection::UnsupportedProtocol);
+        }
+        Some(conn)
+    } else {
+        None
+    };
 
     // body/request の値の型検査(このモジュールの doc comment 参照 - gate
     // 5 の前段、独自の番号は持たない)。
@@ -289,7 +310,7 @@ pub async fn execute_write(
     // gate 7: 値変換 - 文字列タグは拒否
     if entry.data_type == STRING_DATA_TYPE {
         return Err(WriteRejection::UnsupportedValueType(Some(
-            "文字列タグへの書き込みは T2 では未対応です".to_string(),
+            "文字列タグへの書き込みは対応していません".to_string(),
         )));
     }
     let Some(data_type) = DataType::parse(&entry.data_type) else {
@@ -302,6 +323,63 @@ pub async fn execute_write(
         .get(tag_id)
         .await
         .map_err(map_registry_error)?;
+
+    // gate 8: log-before-write(PLC/internal 共通 - 実行前に必ず監査行を
+    // 先に作る、§6-3)。
+    let pending_row = WriteAuditRow::new(
+        ctx.id,
+        ctx.name.clone(),
+        tag_id,
+        tag.to_string(),
+        WriteAuditAction::Write,
+        WriteAuditResult::Ok,
+    )
+    .with_value_requested(requested);
+    let audit_id = match deps.write_audit.insert_pending(&pending_row).await {
+        Ok(id) => id,
+        Err(err) => {
+            eprintln!("banto-hub: 書き込み監査(log-before-write)の記録に失敗しました: {err}");
+            return Err(WriteRejection::AuditWriteFailed);
+        }
+    };
+
+    // record はゲート通過後・物理書き込み前(§6 実装指示、
+    // `crate::write_rate` のモジュール doc comment 参照)。
+    {
+        let mut limiter = deps.rate_limiter.lock().await;
+        limiter.record(tag_id, now);
+    }
+
+    let outcome = if let Some(conn) = conn {
+        write_plc_tag(deps, &conn, &entry, data_type, &tag_row, requested).await
+    } else {
+        write_internal_tag(deps, &entry, tag_id, data_type, tag_row.retain, requested).await
+    };
+
+    let final_result = match &outcome {
+        Ok(()) => WriteAuditResult::Ok,
+        Err(_) => WriteAuditResult::Failed,
+    };
+    if let Err(err) = deps.write_audit.set_result(audit_id, final_result).await {
+        eprintln!("banto-hub: 書き込み監査の確定に失敗しました: {err}");
+    }
+
+    outcome.map(|()| WriteOk {
+        tag: tag.to_string(),
+    })
+}
+
+/// gate 8 の PLC タグ分岐: 従来どおり `banto_tags::unscale` → SLMP
+/// アドレス解決 → `BrokerHandle::write`。`execute_write` から抽出しただけで
+/// 挙動は変えていない(T6-2 前の唯一の書き込み経路そのもの)。
+async fn write_plc_tag(
+    deps: &WriteDeps<'_>,
+    conn: &banto_tags::PlcConnection,
+    entry: &crate::hub::TagEntry,
+    data_type: DataType,
+    tag_row: &banto_tags::Tag,
+    requested: f64,
+) -> Result<(), WriteRejection> {
     // スケーリング設定があれば工学値→raw に unscale する(無ければ工学値
     // そのものが raw)。`Scaling::from_parts` は永続化済みの行に対しては
     // 到達不能な Err のみを返す - 防御的に no-scaling へフォールバックする。
@@ -337,65 +415,19 @@ pub async fn execute_write(
         }
     };
 
-    // gate 8: log-before-write
-    let pending_row = WriteAuditRow::new(
-        ctx.id,
-        ctx.name.clone(),
-        tag_id,
-        tag.to_string(),
-        WriteAuditAction::Write,
-        WriteAuditResult::Ok,
-    )
-    .with_value_requested(requested);
-    let audit_id = match deps.write_audit.insert_pending(&pending_row).await {
-        Ok(id) => id,
-        Err(err) => {
-            eprintln!("banto-hub: 書き込み監査(log-before-write)の記録に失敗しました: {err}");
-            return Err(WriteRejection::AuditWriteFailed);
-        }
-    };
-
-    // record はゲート通過後・物理書き込み前(§6 実装指示、
-    // `crate::write_rate` のモジュール doc comment 参照)。
-    {
-        let mut limiter = deps.rate_limiter.lock().await;
-        limiter.record(tag_id, now);
-    }
-
-    let handle = match deps.manager.write_broker_handle(&conn) {
-        Ok(handle) => handle,
-        Err(err) => {
-            if let Err(update_err) = deps
-                .write_audit
-                .set_result(audit_id, WriteAuditResult::Failed)
-                .await
-            {
-                eprintln!("banto-hub: 書き込み監査の確定に失敗しました: {update_err}");
-            }
-            return Err(WriteRejection::WriteFailed(err.to_string()));
-        }
-    };
+    let handle = deps
+        .manager
+        .write_broker_handle(conn)
+        .map_err(|err| WriteRejection::WriteFailed(err.to_string()))?;
 
     let request = BatchWriteRequest::Numeric(PlcWriteRequest {
         address,
         data_type,
         value: tag_value,
     });
-    let write_outcome = handle.write(vec![request]).await;
-
-    let final_result = match &write_outcome {
-        Ok(results) if results.first().is_some_and(PlcWriteResult::is_ok) => WriteAuditResult::Ok,
-        _ => WriteAuditResult::Failed,
-    };
-    if let Err(err) = deps.write_audit.set_result(audit_id, final_result).await {
-        eprintln!("banto-hub: 書き込み監査の確定に失敗しました: {err}");
-    }
-
-    match write_outcome {
+    match handle.write(vec![request]).await {
         Ok(results) => match results.into_iter().next() {
-            Some(PlcWriteResult::Ok) => Ok(WriteOk {
-                tag: tag.to_string(),
-            }),
+            Some(PlcWriteResult::Ok) => Ok(()),
             Some(PlcWriteResult::Bad(write_err)) => {
                 Err(WriteRejection::WriteFailed(write_err.to_string()))
             }
@@ -405,6 +437,46 @@ pub async fn execute_write(
         },
         Err(err) => Err(WriteRejection::WriteFailed(err.to_string())),
     }
+}
+
+/// gate 8 の internal タグ分岐(T6-2、docs/tag-server-design.md §4.2「内部
+/// タグ...タグ空間内で完結」): PLC アドレス・スケーリングは一切関与せず、
+/// `crate::hub::CollectorManager::server_store` へ工学値をそのまま書くだけ
+/// (banto-collect の収集タスクが `CurrentValuesHandle` へ書く値も既にスケー
+/// ル済みの工学値なので、対称性を保つため raw への変換をしない)。
+/// `retain == true` なら書き込み成功時に `hub_retained_values` へ upsert
+/// する(§4.2「retain フラグで再起動時の最終値復元」、`crate::computed`の
+/// モジュール doc comment参照)。
+async fn write_internal_tag(
+    deps: &WriteDeps<'_>,
+    entry: &crate::hub::TagEntry,
+    tag_id: i64,
+    data_type: DataType,
+    retain: bool,
+    requested: f64,
+) -> Result<(), WriteRejection> {
+    if data_type != DataType::Bit {
+        if let Err(detail) = validate_numeric_range(data_type, requested) {
+            return Err(WriteRejection::ValueOutOfRange(detail));
+        }
+    }
+
+    let now_ms = deps.manager.clock().now_ms();
+    let server_store = deps.manager.server_store();
+    server_store.set(&entry.tag_key, Some(requested), Quality::Good, now_ms);
+
+    if retain {
+        if let Err(err) =
+            upsert_retained_value(&deps.manager.pool(), tag_id, requested, now_ms).await
+        {
+            eprintln!("banto-hub: retain 値の永続化に失敗しました(tag_id={tag_id}): {err}");
+            // 永続化の失敗は書き込み自体の失敗にしない(ライブの
+            // ServerTagStore への書き込みは既に成功している - 次回再起動
+            // までの間、値はタグ空間上は正しく見える。再起動時にだけ古い
+            // 値へ戻る可能性がある、という劣化に留める)。
+        }
+    }
+    Ok(())
 }
 
 /// REST 応答用の `(error, detail?)` 文字列ペア - `crate::rest` がこれを

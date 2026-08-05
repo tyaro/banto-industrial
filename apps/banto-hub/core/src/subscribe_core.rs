@@ -40,7 +40,8 @@ use std::collections::{HashMap, HashSet};
 
 use banto_collect::{CurrentValuesHandle, Quality};
 
-use crate::hub::{effective_sample, TagEntry, TagMap};
+use crate::computed::ServerTagStore;
+use crate::hub::{read_current, TagEntry, TagMap};
 
 /// 評価タイマの固定周期(設計 §5.2/§5.4「250ms 評価」)。`crate::stream`/
 /// `crate::grpc` の両方がこの値で `tokio::time::interval` を作る。
@@ -162,6 +163,7 @@ pub fn initial_values(
     patterns: &[TagPattern],
     map: &TagMap,
     current: Option<&CurrentValuesHandle>,
+    server_store: &ServerTagStore,
     now_ms: i64,
 ) -> (Vec<ResolvedValue>, DiffBaseline) {
     let matched = resolve(patterns, map);
@@ -169,8 +171,7 @@ pub fn initial_values(
     let values = matched
         .into_iter()
         .map(|entry| {
-            let sample = current.and_then(|c| c.get(&entry.tag_key));
-            let (v, q, t) = effective_sample(entry, sample, now_ms);
+            let (v, q, t) = read_current(entry, current, server_store, now_ms);
             last.insert(entry.external_name.clone(), (v, q));
             ResolvedValue {
                 tag: entry.external_name.clone(),
@@ -192,6 +193,7 @@ pub fn evaluate(
     sub: &mut Subscription,
     map: &TagMap,
     current: Option<&CurrentValuesHandle>,
+    server_store: &ServerTagStore,
     now_ms: i64,
 ) -> Option<Vec<ResolvedValue>> {
     let matched = resolve(&sub.patterns, map);
@@ -201,8 +203,7 @@ pub fn evaluate(
             let mut changed_values = Vec::new();
             let mut still_present: HashSet<String> = HashSet::with_capacity(matched.len());
             for entry in &matched {
-                let sample = current.and_then(|c| c.get(&entry.tag_key));
-                let (v, q, t) = effective_sample(entry, sample, now_ms);
+                let (v, q, t) = read_current(entry, current, server_store, now_ms);
                 still_present.insert(entry.external_name.clone());
 
                 let changed = match sub.last.get(entry.external_name.as_str()) {
@@ -237,8 +238,7 @@ pub fn evaluate(
                 let values = matched
                     .iter()
                     .map(|entry| {
-                        let sample = current.and_then(|c| c.get(&entry.tag_key));
-                        let (v, q, t) = effective_sample(entry, sample, now_ms);
+                        let (v, q, t) = read_current(entry, current, server_store, now_ms);
                         ResolvedValue {
                             tag: entry.external_name.clone(),
                             v,

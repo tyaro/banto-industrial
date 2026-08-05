@@ -212,8 +212,22 @@ pub async fn build_config(pool: &SqlitePool) -> Result<CollectorConfig, CollectE
 
     // Deterministic order everywhere (by id) so the derived StoreConfig - and
     // therefore its config hash - is stable across restarts.
-    let mut enabled_connections: Vec<&PlcConnection> =
-        connections.iter().filter(|c| c.enabled).collect();
+    //
+    // T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): a `"virtual"` connection
+    // (banto-hub's auto-provisioned `calc`/`mem` reserved namespace for
+    // computed/internal tags) is excluded from collection here, not treated
+    // as a config error - it never has a socket to open, so silently
+    // contributing nothing is the correct behaviour for a connection that by
+    // design has no wire protocol at all (unlike an actually-unsupported
+    // protocol string, which `parse_protocol` below still rejects). Any tags
+    // registered under it (computed/internal, per banto-tags' own
+    // `calc`/`mem` placement rule) are evaluated/stored entirely by
+    // `apps/banto-hub/core/src/computed.rs`'s `ComputedEngine`/
+    // `ServerTagStore`, never by this recorder pipeline.
+    let mut enabled_connections: Vec<&PlcConnection> = connections
+        .iter()
+        .filter(|c| c.enabled && c.protocol != "virtual")
+        .collect();
     enabled_connections.sort_by_key(|c| c.id);
 
     let mut connection_plans = Vec::new();
@@ -733,6 +747,63 @@ mod tests {
             .unwrap();
         let err = build_config(&pool).await.unwrap_err();
         assert!(matches!(err, CollectError::Config(_)));
+    }
+
+    /// T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): a `"virtual"` connection
+    /// (banto-hub's reserved `calc`/`mem` namespace) contributes nothing to
+    /// collection - excluded, not a config error - while an ordinary
+    /// connection alongside it still collects normally.
+    #[tokio::test]
+    async fn a_virtual_connection_is_excluded_from_collection_without_erroring() {
+        let pool = registry().await;
+        let plc_svc = PlcConnectionService::new(pool.clone());
+        let real_conn = plc_svc.create(conn_input("PLC1", 502)).await.unwrap();
+        let group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", real_conn.id, 1_000))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input("T1", group.id, "40001"))
+            .await
+            .unwrap();
+
+        // A virtual connection (host/port left blank, like banto-hub's
+        // auto-provisioned "calc") with its own group and tag - if this were
+        // NOT excluded, build_config would fail (parse_protocol rejects
+        // "virtual", and Address::parse would reject an empty address).
+        let virtual_conn = plc_svc
+            .create(PlcConnectionInput {
+                name: "calc".to_string(),
+                protocol: "virtual".to_string(),
+                host: String::new(),
+                port: 0,
+                unit_id: 1,
+                enabled: true,
+            })
+            .await
+            .unwrap();
+        let virtual_group = CollectionGroupService::new(pool.clone())
+            .create(group_input("calc-group", virtual_conn.id, 1_000))
+            .await
+            .unwrap();
+        let mut computed_tag = tag_input("avg", virtual_group.id, "");
+        computed_tag.tag_kind = "computed".to_string();
+        computed_tag.expression = Some("1 + 1".to_string());
+        TagService::new(pool.clone())
+            .create(computed_tag)
+            .await
+            .unwrap();
+
+        let config = build_config(&pool)
+            .await
+            .expect("a virtual connection must not fail config build");
+        assert_eq!(
+            config.connections.len(),
+            1,
+            "only the real connection should be collected"
+        );
+        assert_eq!(config.tag_count(), 1);
+        assert_eq!(config.connections[0].key, format!("conn:{}", real_conn.id));
     }
 
     #[tokio::test]

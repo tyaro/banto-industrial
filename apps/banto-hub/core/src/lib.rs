@@ -29,6 +29,11 @@
 //!   ローカルアカウント（RBAC: admin/editor/viewer）と監査ログ
 //! - [`assets`]: 管理 UI 静的ファイルの埋め込み枠（`embed-ui` feature）。
 //!   T0 では中身（フロントエンド）は作らない — 枠だけ用意する
+//! - [`computed`]: T6-2（設計 §4.2/§4.3(a)）。演算タグ・内部タグの評価
+//!   エンジン（[`computed::ComputedEngine`]）とタグ空間ストア
+//!   （[`computed::ServerTagStore`]）。`hub::CollectorManager::rebuild` が
+//!   catalog/`Collector` と同じ all-or-nothing で式のコンパイル・DAG 検証
+//!   結果を commit する
 //! - [`broker_glue`]: T2-2（設計 §6-5）。SLMP 接続の収集読み取りを
 //!   `banto-broker`（I6）経由にするアダプタ（[`broker_glue::BrokerReadClient`]）
 //!   と、`CollectorManager` の外で生存するブローカーセッション directory
@@ -75,6 +80,7 @@ pub mod api_keys;
 pub mod assets;
 pub mod audit;
 pub mod broker_glue;
+pub mod computed;
 pub mod db;
 pub mod events;
 pub mod grpc;
