@@ -27,6 +27,10 @@
 ## 開発規約
 
 - コミットメッセージは日本語・Conventional Commits 風（既存履歴に合わせる）
+- **Markdown（docs/ 含む）や TS/Svelte を編集したら、コミット前に必ず
+  `pnpm exec prettier --write <対象ファイル>` を実行する**（CI の
+  format:check が prettier 準拠を強制している。docs の表編集は特に
+  引っかかりやすい）
 - 設計判断はオーナー決定として docs に日付付きで記録する
 - コードのコメント・ドキュメントの流儀は既存クレートに合わせる
   （クレートの lib.rs 冒頭に設計意図を記述するスタイル）

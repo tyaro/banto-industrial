@@ -582,7 +582,7 @@ message TagValue {
   マネージャ」パターン（ただし停止は `JoinHandle::abort` — `GrpcService`
   自体は状態を持たない読み取り専用ハンドルの束なので、グレースフル
   シャットダウンを待つ理由がない）。管理 REST `GET/PUT
-  /api/grpc-settings`（admin 限定、CSRF 必須、保存で即時適用）と管理 UI の
+/api/grpc-settings`（admin 限定、CSRF 必須、保存で即時適用）と管理 UI の
   設定ページに gRPC セクションを追加。`GET /api/v1/status` に
   `grpc: { enabled, port }` を追加（MQTT と違い「実際に接続できているか」
   のライブ状態は持たない — gRPC は listen するだけのサーバーで、設定値が
