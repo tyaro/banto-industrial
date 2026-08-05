@@ -577,32 +577,19 @@ async fn validate_tag_kind_placement(
     };
 
     match tag_kind {
-        PLC_TAG_KIND => {
-            if is_virtual {
-                return placement_error(
-                    "plc タグは予約接続（calc/mem）配下に作成できません".to_string(),
-                );
-            }
+        PLC_TAG_KIND if is_virtual => {
+            placement_error("plc タグは予約接続（calc/mem）配下に作成できません".to_string())
         }
-        COMPUTED_TAG_KIND => {
-            if !is_virtual || conn_name != CALC_CONNECTION_NAME {
-                return placement_error(format!(
-                    "computed タグは予約接続 {CALC_CONNECTION_NAME} 配下にのみ作成できます"
-                ));
-            }
-        }
-        INTERNAL_TAG_KIND => {
-            if !is_virtual || conn_name != MEM_CONNECTION_NAME {
-                return placement_error(format!(
-                    "internal タグは予約接続 {MEM_CONNECTION_NAME} 配下にのみ作成できます"
-                ));
-            }
-        }
+        COMPUTED_TAG_KIND if !is_virtual || conn_name != CALC_CONNECTION_NAME => placement_error(
+            format!("computed タグは予約接続 {CALC_CONNECTION_NAME} 配下にのみ作成できます"),
+        ),
+        INTERNAL_TAG_KIND if !is_virtual || conn_name != MEM_CONNECTION_NAME => placement_error(
+            format!("internal タグは予約接続 {MEM_CONNECTION_NAME} 配下にのみ作成できます"),
+        ),
         // Unknown tag_kind is already rejected by validate_tag_input; no
         // placement rule to apply.
-        _ => {}
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 fn column_map() -> ColumnMap {
