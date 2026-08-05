@@ -38,7 +38,11 @@ banto-collect = { path = "../../../crates/banto-collect" }
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
-axum = { workspace = true }
+# T1（docs/tag-server-design.md §5.2）: `GET /api/v1/stream` の WebSocket
+# アップグレード(`axum::extract::ws`)。workspace 既定の axum features に
+# `ws` を足すだけで新規依存は増えない(axum が既に `dep:tokio-tungstenite`
+# を optional で持っている - `ws` はそれを有効化するだけ)。
+axum = { workspace = true, features = ["ws"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
 rust-embed = { workspace = true, optional = true }
 argon2 = { workspace = true }
@@ -56,6 +60,10 @@ utoipa = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
 tower = { workspace = true, features = ["util"] }
 tempfile = { workspace = true }
+# T1: `/api/v1/stream` の統合テスト用 WebSocket クライアント
+# (tests/stream.rs)。サーバー側は axum 自身の `ws` feature(上の
+# [dependencies] 参照)で完結するので、これは test コードのみが使う。
+tokio-tungstenite = { workspace = true }
 # Modbus TCP simulator for the T0 E2E integration test
 # (apps/banto-hub/core/tests/integration.rs) - same reuse chain
 # banto-collect's own integration tests already exercise (banto-plc's

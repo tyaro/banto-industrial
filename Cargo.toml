@@ -109,6 +109,11 @@ base64 = "0.22"
 # ソース化する。axum 統合は使わず(パラメータは `#[utoipa::path]` に手で
 # 記述する)最小構成で導入 - `apps/banto-hub/core` のみが使う。
 utoipa = "5"
+# T1（docs/tag-server-design.md §5.2）: `GET /api/v1/stream` の WS 統合テスト
+# 用クライアント（dev-dependency のみ - サーバー側は axum 自身の `ws`
+# feature で足りる）。axum 0.8.9 が内部で使っているのと同じ 0.29 系を選び、
+# Cargo.lock に無関係な第2系統を増やさない。
+tokio-tungstenite = "0.29"
 banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v0.1.1" }
 banto-storage = { git = "https://github.com/tyaro/banto.git", tag = "v0.1.1" }
 banto-server = { git = "https://github.com/tyaro/banto.git", tag = "v0.1.1" }

@@ -45,15 +45,29 @@
 //! 呼ばれた rebuild は必ず先行 rebuild の commit 後の状態を見る）。
 //! `inner` を保護する `std::sync::Mutex` は従来どおり短時間保持のまま
 //! （await をまたがせない）— 直列化の役目は `rebuild_lock` だけが持つ。
+//!
+//! ## T1: `revision` watch と `subscribe_events`（設計 §4.1/§5.2）
+//!
+//! `crate::stream`（WebSocket 購読）が使う2つの購読口をここに足した:
+//! [`CollectorManager::subscribe_revision`]（`rebuild` が commit する
+//! たびに新しい revision を流す `watch` チャンネル - `config_changed` の
+//! 送信元）と [`CollectorManager::subscribe_events`]（`CollectEvent` の
+//! 中継元）。後者は `events` フィールド（[`EventSink`]、設計 §3.2/§4.1
+//! ドキュメントどおり「manager が1個保有し再構築を跨いで不変」）から直接
+//! subscribe する - 実行中の `Collector`（`inner.collector`）から取ると、
+//! rebuild で `Collector` が丸ごと入れ替わった瞬間に古い方の受信側が孤立
+//! するため。
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{broadcast, watch};
 
 use banto_collect::{
-    build_config, Collector, CollectorOptions, ConnectionStatus, CurrentValuesHandle, EventSink,
+    build_config, CollectEvent, Collector, CollectorOptions, ConnectionStatus, CurrentSample,
+    CurrentValuesHandle, EventSink, Quality,
 };
 use banto_core::ListParams;
 use banto_tags::{CollectionGroupService, PlcConnectionService, Tag, TagService};
@@ -61,6 +75,45 @@ use banto_tstore::Clock;
 use serde::Serialize;
 use sqlx::SqlitePool;
 use utoipa::ToSchema;
+
+/// The effective `(value, quality, timestamp_ms)` triple for one catalog
+/// entry - shared by `crate::rest`'s `/api/v1/values*` and `crate::stream`'s
+/// `data` messages so the two read paths (poll vs. push) can never drift on
+/// what "the current value of a tag" means (T1 実装指示: 「wire 形式は REST
+/// /api/v1/values と同じ...共通ヘルパへの整理は可」).
+///
+/// A disabled tag (its own flag, or its group's/connection's) always reads
+/// `(None, Quality::Bad, ...)` regardless of what a stale cached sample says
+/// (design §4: 欠測を隠さない - see [`TagEntry`]'s own doc comment for the
+/// same reasoning `rest.rs`'s original `value_entry` carried).
+pub fn effective_sample(
+    entry: &TagEntry,
+    sample: Option<CurrentSample>,
+    now_ms: i64,
+) -> (Option<f64>, Quality, i64) {
+    if !entry.enabled {
+        (
+            None,
+            Quality::Bad,
+            sample.map(|s| s.ptime_ms).unwrap_or(now_ms),
+        )
+    } else {
+        match sample {
+            Some(s) => (s.value, s.quality, s.ptime_ms),
+            None => (None, Quality::Bad, now_ms),
+        }
+    }
+}
+
+/// The wire string for a [`Quality`] - `"good"`/`"bad"`/`"stale"`, identical
+/// across every `/api/v1/*` surface (REST and WebSocket).
+pub fn quality_str(quality: Quality) -> &'static str {
+    match quality {
+        Quality::Good => "good",
+        Quality::Bad => "bad",
+        Quality::Stale => "stale",
+    }
+}
 
 /// `tag:{id}` - must stay byte-for-byte identical to `banto_collect`'s own
 /// (private) key derivation (`crates/banto-collect/src/config.rs::tag_key`,
@@ -264,6 +317,20 @@ pub struct CollectorManager {
     /// `inner` lock alone is not enough (it is only held across the short
     /// commit step, not across the registry read that precedes it).
     rebuild_lock: AsyncMutex<()>,
+    /// T1 (docs/tag-server-design.md §4.1「構成変更通知」・§5.2の
+    /// `config_changed`): the current `revision`, mirrored onto a
+    /// `watch` channel so `crate::stream`'s per-connection tasks can await
+    /// "revision changed" without polling. Sent from inside the same
+    /// `inner` critical section that advances `revision` (see
+    /// [`CollectorManager::rebuild`]), so a `watch::Receiver` never observes
+    /// a `revision()` that is stale relative to what it already saw here -
+    /// only ever the same value or a later one. A `watch` channel coalesces
+    /// rapid updates (a receiver that is not actively awaiting only ever
+    /// sees the *latest* value, not every intermediate one) - harmless here
+    /// because `config_changed`'s contract is "re-fetch the catalog", and
+    /// re-fetching once at the latest revision is equivalent to re-fetching
+    /// once per intermediate revision.
+    revision_tx: watch::Sender<u64>,
 }
 
 impl CollectorManager {
@@ -277,6 +344,7 @@ impl CollectorManager {
         options: CollectorOptions,
     ) -> Self {
         let events = EventSink::new(pool.clone());
+        let (revision_tx, _revision_rx) = watch::channel(0);
         Self {
             pool,
             data_dir,
@@ -290,6 +358,7 @@ impl CollectorManager {
                 last_error: None,
             }),
             rebuild_lock: AsyncMutex::new(()),
+            revision_tx,
         }
     }
 
@@ -367,13 +436,19 @@ impl CollectorManager {
         // exactly the same condition `Collector::start`'s own
         // `connections.is_empty()` check would use.
         if config.group_count() == 0 {
-            let old = {
+            let (old, new_revision) = {
                 let mut inner = self.inner.lock().expect("hub state lock poisoned");
                 inner.map = Arc::new(new_map);
                 inner.revision += 1;
                 inner.last_error = None;
-                inner.collector.take()
+                (inner.collector.take(), inner.revision)
             };
+            // Sent while still holding `rebuild_lock` (not `inner`'s lock,
+            // already released above) - see this struct's `revision_tx` doc
+            // comment for why serializing the send against `rebuild`'s own
+            // serialization is what keeps a `watch::Receiver` from ever
+            // observing a value older than what `revision()` already reports.
+            let _ = self.revision_tx.send(new_revision);
             if let Some(collector) = old {
                 let _ = collector.stop().await;
             }
@@ -400,14 +475,15 @@ impl CollectorManager {
             }
         };
 
-        let old = {
+        let (old, new_revision) = {
             let mut inner = self.inner.lock().expect("hub state lock poisoned");
             let old = inner.collector.replace(new_collector);
             inner.map = Arc::new(new_map);
             inner.revision += 1;
             inner.last_error = None;
-            old
+            (old, inner.revision)
         };
+        let _ = self.revision_tx.send(new_revision);
         if let Some(collector) = old {
             let _ = collector.stop().await;
         }
@@ -461,6 +537,28 @@ impl CollectorManager {
             .collector
             .as_ref()
             .map(Collector::current_values)
+    }
+
+    /// T1 (docs/tag-server-design.md §5.2 要件7「イベント中継」): subscribe a
+    /// live [`CollectEvent`] consumer. Deliberately goes through
+    /// `self.events` (the one [`EventSink`] this manager builds once in
+    /// [`CollectorManager::new`] and hands to every `Collector::start` call)
+    /// rather than `self.inner.collector.subscribe_events()` - the running
+    /// `Collector` is replaced wholesale on every [`CollectorManager::rebuild`]
+    /// (this module's doc comment, "T0 は「全体再構築」"), which would orphan
+    /// a receiver obtained from the old one. `EventSink` itself is `Arc`-backed
+    /// and stays the same value across every rebuild (see its field doc
+    /// comment above), so a WS connection's subscription survives a collector
+    /// rebuild transparently - no re-subscribe needed after `config_changed`.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<CollectEvent> {
+        self.events.subscribe()
+    }
+
+    /// T1 (docs/tag-server-design.md §4.1/§5.2「構成変更通知」): subscribe to
+    /// `revision` changes without polling - see [`CollectorManager`]'s
+    /// `revision_tx` field doc comment for the coalescing/ordering contract.
+    pub fn subscribe_revision(&self) -> watch::Receiver<u64> {
+        self.revision_tx.subscribe()
     }
 
     /// Per-connection status (`"conn:{id}"` keys, matching
