@@ -217,7 +217,7 @@
 			header: 'プロトコル',
 			accessor: 'protocol',
 			width: 110,
-			format: (v) => (v === 'virtual' ? 'virtual（予約）' : v)
+			format: (v) => (v === 'virtual' ? 'virtual（予約）' : String(v))
 		},
 		{ id: 'host', header: 'ホスト', accessor: 'host', width: 140 },
 		{ id: 'port', header: 'ポート', accessor: 'port', width: 80, align: 'right' },
