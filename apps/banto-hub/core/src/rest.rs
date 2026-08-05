@@ -54,7 +54,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use banto_broker::BrokerConnectionStatus;
-use banto_collect::ConnectionStatus;
+use banto_collect::{ApplyReport, ConnectionStatus};
 use banto_core::{BantoError, ErrorBody, FieldError, ListParams, ListResult};
 use banto_server::{
     auth_routes, require_auth, require_banto_client_header, sse_route, ApiError, AuthState,
@@ -2163,6 +2163,33 @@ struct GrpcStatusEntry {
     port: u16,
 }
 
+/// `GET /api/v1/status` の `last_apply`（T7-2、設計 §4.3実装指示「ApplyReport
+/// の内容を...`/api/v1/status` に出す」）: 直近の `apply_config` 呼び出しの
+/// 結果 - どの接続が追加/削除/入れ替え/無変更だったか、tstore writer が
+/// ローテートしたか。[`banto_collect::ApplyReport`] のワイヤ表現（同クレート
+/// 側は `ToSchema`/`Serialize` を持たない内部型のため、ここで DTO 化する -
+/// このファイルの他の DTO（[`ConnectionStatusEntry`] 等）と同じ流儀）。
+#[derive(Debug, Serialize, ToSchema)]
+struct LastApplyEntry {
+    added: Vec<String>,
+    removed: Vec<String>,
+    replaced: Vec<String>,
+    unchanged: Vec<String>,
+    writer_rotated: bool,
+}
+
+impl From<ApplyReport> for LastApplyEntry {
+    fn from(report: ApplyReport) -> Self {
+        Self {
+            added: report.added,
+            removed: report.removed,
+            replaced: report.replaced,
+            unchanged: report.unchanged,
+            writer_rotated: report.writer_rotated,
+        }
+    }
+}
+
 /// `GET /api/v1/status` の応答。
 #[derive(Debug, Serialize, ToSchema)]
 struct StatusResponse {
@@ -2180,6 +2207,11 @@ struct StatusResponse {
     mqtt: MqttStatusEntry,
     /// T4（設計 §5.4）: gRPC サーバーの設定。
     grpc: GrpcStatusEntry,
+    /// T7-2（設計 §4.3）: 直近の `apply_config` 呼び出しの結果。最後に成功
+    /// した rebuild が `apply_config` を経由しなかった場合（起動直後の初回
+    /// 成功、または空構成への遷移）は `null`
+    /// (`crate::hub::CollectorManager::last_apply` のドキュメント参照)。
+    last_apply: Option<LastApplyEntry>,
 }
 
 /// `GET /api/v1/status` - `{ "version", "revision", "last_config_error",
@@ -2204,7 +2236,7 @@ struct StatusResponse {
 async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResponse>, ApiError> {
     let revision = state.manager.revision();
     let last_config_error = state.manager.last_error();
-    let statuses = state.manager.connection_status();
+    let statuses = state.manager.connection_status().await;
 
     let connections = PlcConnectionService::new(state.manager.pool())
         .list(ListParams::default())
@@ -2272,6 +2304,7 @@ async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResp
             enabled: grpc_settings.enabled,
             port: grpc_settings.port,
         },
+        last_apply: state.manager.last_apply().map(LastApplyEntry::from),
     }))
 }
 
