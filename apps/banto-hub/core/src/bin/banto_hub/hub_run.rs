@@ -398,6 +398,7 @@ async fn ensure_virtual_connection(pool: &SqlitePool, name: &str) {
             port: 0,
             unit_id: 1,
             enabled: true,
+            simulation: false,
         })
         .await
     {

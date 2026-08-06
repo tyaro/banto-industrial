@@ -3301,6 +3301,7 @@ mod tests {
                 port: 502,
                 unit_id: 1,
                 enabled: true,
+                simulation: false,
             })
             .await
             .expect("seed plc connection");
@@ -3956,6 +3957,7 @@ mod tests {
                 port: port as i64,
                 unit_id: 1,
                 enabled: true,
+                simulation: false,
             })
             .await
             .expect("create slmp connection");

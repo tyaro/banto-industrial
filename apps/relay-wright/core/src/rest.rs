@@ -1692,6 +1692,12 @@ impl From<PlcConnectionPayload> for PlcConnectionInput {
             port: payload.port,
             unit_id: payload.unit_id,
             enabled: payload.enabled,
+            // T9-1 (banto-industrial docs/ux-plan.md §1): `simulation` is a
+            // banto-hub feature (in-process simulator substitution lives in
+            // banto-collect, wired up for banto-hub's REST surface in T9-2).
+            // relay-wright never sets it - every connection this app
+            // creates/updates keeps the database default (`false`).
+            simulation: false,
         }
     }
 }
@@ -4390,6 +4396,7 @@ mod tests {
                 port: 502,
                 unit_id: 1,
                 enabled: true,
+                simulation: false,
             })
             .await
             .expect("seed plc connection");
@@ -4683,6 +4690,7 @@ mod tests {
                 port: 5007,
                 unit_id: 1,
                 enabled: true,
+                simulation: false,
             })
             .await
             .expect("seed plc connection");
@@ -5257,6 +5265,7 @@ mod tests {
                 port: sim.addr.port() as i64,
                 unit_id: 1,
                 enabled: true,
+                simulation: false,
             })
             .await
             .expect("create slmp connection");

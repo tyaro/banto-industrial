@@ -798,6 +798,7 @@ mod tests {
                 port: 502,
                 unit_id: 1,
                 enabled: true,
+                simulation: false,
             })
             .await
             .unwrap();
@@ -1493,6 +1494,7 @@ mod tests {
                 port: 0,
                 unit_id: 1,
                 enabled: true,
+                simulation: false,
             })
             .await
             .expect("virtual connection should be creatable");

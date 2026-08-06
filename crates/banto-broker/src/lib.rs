@@ -985,6 +985,7 @@ mod tests {
             port: port as i64,
             unit_id: 1,
             enabled: true,
+            simulation: false,
         }
     }
 

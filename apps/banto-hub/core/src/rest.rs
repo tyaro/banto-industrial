@@ -1407,6 +1407,14 @@ impl From<PlcConnectionPayload> for PlcConnectionInput {
             port: payload.port,
             unit_id: payload.unit_id,
             enabled: payload.enabled,
+            // T9-1 (docs/ux-plan.md §1): `simulation` is not part of the wire
+            // payload yet - exposing it over REST (create/update + status/
+            // catalog) is T9-2 scope. Every connection created/updated
+            // through this endpoint today keeps its existing simulation flag
+            // untouched at the database default (`false`) until T9-2 adds a
+            // `simulation` field to `PlcConnectionPayload` and threads it
+            // through here.
+            simulation: false,
         }
     }
 }

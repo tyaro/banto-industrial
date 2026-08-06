@@ -1096,6 +1096,7 @@ mod tests {
                 port: 15020,
                 unit_id: 1,
                 enabled: true,
+                simulation: false,
             })
             .await
             .unwrap();
@@ -1156,6 +1157,7 @@ mod tests {
                 port: 15021,
                 unit_id: 1,
                 enabled: true,
+                simulation: false,
             })
             .await
             .unwrap();
