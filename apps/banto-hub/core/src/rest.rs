@@ -123,15 +123,14 @@ fn actor_identity(headers: &HeaderMap, auth: &AuthState) -> Option<Identity> {
 /// auth behavior changes - every other machine client (Rust tests, API-key
 /// clients) can and does set `Authorization` directly.
 ///
-/// Note: [`crate::stream::ws_upgrade`] deliberately does **not** echo
-/// `"bearer"` back via `WebSocketUpgrade::protocols(...)`. Per RFC 6455, a
-/// server-selected subprotocol the client never offered fails the handshake
-/// for spec-compliant clients - and this repo's own WS tests
-/// (`tokio-tungstenite`) plus existing machine clients connect with no
-/// subprotocol offer at all (they use `Authorization` instead), so
-/// unconditionally selecting `"bearer"` would break them. Leaving the
-/// upgrade response's subprotocol unset is spec-legal; browsers simply see
-/// `.protocol === ""`, which the admin UI's WS client never reads.
+/// Note: [`crate::stream::ws_upgrade`] calls
+/// `WebSocketUpgrade::protocols(["bearer"])`, which only selects/echoes
+/// `"bearer"` back in the response if the client actually offered it in its
+/// own `Sec-WebSocket-Protocol` request header - so machine clients that
+/// authenticate via `Authorization` and never offer a subprotocol are
+/// unaffected. See that function's doc comment for the full rationale
+/// (`tokio-tungstenite`'s client-side handshake validation requires the echo
+/// when the client does offer a subprotocol).
 fn extract_ws_protocol_token(path: &str, headers: &HeaderMap) -> Option<String> {
     if path != "/api/v1/stream" {
         return None;
