@@ -1370,6 +1370,14 @@ fn default_plc_unit_id() -> i64 {
     1
 }
 
+/// T9-2 (docs/ux-plan.md §1): a `PlcConnectionPayload` missing `simulation`
+/// (an old client, or a create/update that never mentions it) keeps the
+/// existing safe default - a connection is never accidentally simulated by
+/// omission.
+fn default_plc_simulation() -> bool {
+    false
+}
+
 fn default_tag_decimals() -> i64 {
     0
 }
@@ -1396,6 +1404,14 @@ pub struct PlcConnectionPayload {
     pub unit_id: i64,
     #[serde(default = "default_payload_enabled")]
     pub enabled: bool,
+    /// T9-2 (docs/ux-plan.md §1, 「接続単位のシミュレーションモード」): opts
+    /// this connection into an in-process simulator instead of a real PLC -
+    /// see `banto_tags::PlcConnection::simulation`'s doc comment for what
+    /// this actually does at collection time
+    /// (`crates/banto-collect/src/simulation.rs`) and, for broker-routed SLMP
+    /// connections specifically, `crate::broker_glue::SlmpSimRegistry`.
+    #[serde(default = "default_plc_simulation")]
+    pub simulation: bool,
 }
 
 impl From<PlcConnectionPayload> for PlcConnectionInput {
@@ -1407,14 +1423,9 @@ impl From<PlcConnectionPayload> for PlcConnectionInput {
             port: payload.port,
             unit_id: payload.unit_id,
             enabled: payload.enabled,
-            // T9-1 (docs/ux-plan.md §1): `simulation` is not part of the wire
-            // payload yet - exposing it over REST (create/update + status/
-            // catalog) is T9-2 scope. Every connection created/updated
-            // through this endpoint today keeps its existing simulation flag
-            // untouched at the database default (`false`) until T9-2 adds a
-            // `simulation` field to `PlcConnectionPayload` and threads it
-            // through here.
-            simulation: false,
+            // T9-2: wired through - see `PlcConnectionPayload::simulation`'s
+            // doc comment.
+            simulation: payload.simulation,
         }
     }
 }
@@ -2146,6 +2157,10 @@ struct ConnectionStatusEntry {
     id: i64,
     status: String,
     attempt: Option<u32>,
+    /// T9-2 (docs/ux-plan.md §1): mirrors `banto_tags::PlcConnection::simulation` -
+    /// lets a monitoring client (or the admin UI) flag a connection whose
+    /// live values are synthetic, not from a real PLC.
+    simulation: bool,
 }
 
 /// `GET /api/v1/status` の `mqtt`（T3、設計実装指示「`/api/v1/status` に
@@ -2293,6 +2308,7 @@ async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResp
                 id: conn.id,
                 status: status_str.to_string(),
                 attempt,
+                simulation: conn.simulation,
             }
         })
         .collect();
@@ -3010,6 +3026,7 @@ mod tests {
         let sessions = Arc::new(crate::broker_glue::HubSessions::new(
             banto_broker::BackoffConfig::default(),
         ));
+        let sim_registry = Arc::new(crate::broker_glue::SlmpSimRegistry::new());
         let computed = Arc::new(crate::computed::ComputedEngine::new(Arc::new(
             crate::computed::ServerTagStore::new(),
         )));
@@ -3019,6 +3036,7 @@ mod tests {
             Arc::new(SystemClock),
             CollectorOptions::default(),
             sessions,
+            sim_registry,
             computed,
         );
         (Arc::new(manager), dir)

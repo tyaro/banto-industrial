@@ -59,6 +59,42 @@
 //! `read_batch` を呼んでいる `BrokerReadClient` の下でセッションが消える
 //! 危険がある - 詳細は `crate::broker_glue` のモジュール doc参照。
 //!
+//! ## SLMP 接続単位のシミュレーションモード（T9-2、2026-08-06/07）
+//!
+//! `crate::broker_glue::SlmpSimRegistry`（`sim_registry` フィールド）は
+//! `sessions`（`HubSessions`）と対の、`CollectorManager` の外で構築・生存する
+//! `Arc` - broker 経由 SLMP 接続の `simulation = true` を実際に有効化する
+//! T9-2 の実装本体（詳しくは `SlmpSimRegistry` 自身の doc comment、および
+//! `crate::broker_glue` のモジュール doc「T9-1/T9-2 note」節を参照）。
+//! [`CollectorManager::sync_slmp_sessions`] は `ensure_connection` を呼ぶ前に
+//! 接続ごとに `SlmpSimRegistry::resolve` を呼び、シミュレーション中なら実際の
+//! ダイヤル先をシミュレータの loopback アドレスへ差し替え、宛先が変わって
+//! いれば（`changed == true`）`HubSessions::remove` してから
+//! `ensure_connection` して古いセッションの使い回しを防ぐ。[`Self::rebuild`]
+//! はさらに、この rebuild で broker が担当した SLMP 接続キー集合を
+//! `banto_collect::CollectorConfig::suppress_simulation_for` に渡し、
+//! `Collector` 自身が同じ接続に対して二重にシミュレータを起動しないようにする
+//! （`crates/banto-collect/src/config.rs`の`suppress_simulation_for`の doc
+//! comment参照）。
+//!
+//! **ここまでだけでは実は不十分**（自前の E2E テスト
+//! `apps/banto-hub/core/tests/t9_simulation.rs`で発覚）: `simulation`を
+//! 常に`false`へ強制すると、broker 経由 SLMP 接続の`ConnectionPlan`は
+//! トグル前後で構造的に同一と比較され、`Collector::apply_config`はそれを
+//! 「unchanged」と分類してその接続の収集タスクに一切手を触れない -
+//! ところがタスクが起動時に捕まえた`ClientFactory`（そのクロージャが閉じる
+//! `ReadOnlyHandle`）はタスクの生存期間を通じて固定なので、rebuild の度に
+//! 新しく組み立てる`hub_client_factory`はタスクへ届かない。結果、broker
+//! セッションが`SlmpSimRegistry::resolve`の`changed`検出で実際には
+//! 入れ替わっていても、動き続けている収集タスクは古い（既に directory
+//! から外れた）セッションを黙って読み続けてしまう。そこで`Self::rebuild`は
+//! `sync_slmp_sessions`が返す解決済みダイヤル先を
+//! `banto_collect::CollectorConfig::set_broker_dial_target`で該当接続の
+//! plan に書き戻す - `ProtocolConfig`（実際の接続には使われない、diff 専用の
+//! 値）が変わることで`apply_config`が正しく「replaced」に分類し、新しい
+//! `ClientFactory`を伴ってタスクを再起動する（`set_broker_dial_target`の
+//! doc comment参照）。
+//!
 //! ## all-or-nothing の実現（設計 §4.3 最終段落、T7 で `apply_config` にも
 //! 継承）
 //!
@@ -149,7 +185,7 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use utoipa::ToSchema;
 
-use crate::broker_glue::{hub_client_factory, HubSessions};
+use crate::broker_glue::{hub_client_factory, HubSessions, SlmpSimRegistry};
 use crate::computed::{self, ComputedEngine, ServerTagStore};
 
 /// The effective `(value, quality, timestamp_ms)` triple for one catalog
@@ -295,6 +331,15 @@ pub struct TagEntry {
     /// T6-2). Meaningless for `"plc"`/`"computed"` tags (always `false` for
     /// them - mirrors `banto_tags::Tag::retain`).
     pub retain: bool,
+    /// T9-2 (docs/ux-plan.md §1, accident-prevention requirement (b)):
+    /// mirrors the tag's *owning connection's* `simulation` flag
+    /// (`banto_tags::PlcConnection::simulation`), not the tag's own row -
+    /// tags have no such column of their own. External clients (and the
+    /// future T10 tag monitor) need this to tell that a tag's live value is
+    /// synthetic (produced by an in-process simulator,
+    /// `banto_collect::simulation`/`crate::broker_glue::SlmpSimRegistry`),
+    /// not read from a real PLC.
+    pub simulation: bool,
 }
 
 /// Immutable snapshot of the external-name catalog, rebuilt from scratch on
@@ -399,6 +444,7 @@ async fn build_catalog(pool: &SqlitePool) -> Result<TagMap, banto_core::BantoErr
             tag_kind: tag.tag_kind.clone(),
             expression: tag.expression.clone(),
             retain: tag.retain,
+            simulation: conn.simulation,
         });
     }
 
@@ -480,6 +526,18 @@ pub struct CollectorManager {
     /// `rebuild` - see `crate::broker_glue::HubSessions`'s doc comment for
     /// the full rationale and the session-sync policy `rebuild` follows.
     sessions: Arc<HubSessions>,
+    /// T9-2 (docs/ux-plan.md §1): the SLMP simulator registry, owned OUTSIDE
+    /// this manager for exactly the same reason `sessions` is - it must
+    /// survive every `rebuild` (a simulator started for a connection stays
+    /// up across rebuilds that leave it `simulation = true`, mirroring how a
+    /// broker session stays up), and `bin/banto_hub` needs its own `Arc`
+    /// clone to call `SlmpSimRegistry::shutdown` at the correct point in
+    /// process shutdown (after `sessions.shutdown()` - simulators must
+    /// outlive the broker sessions that dial them). See
+    /// `crate::broker_glue::SlmpSimRegistry`'s doc comment for the full
+    /// mechanism, and this module's doc comment ("SLMP 接続単位の
+    /// シミュレーションモード") for how `rebuild` uses it.
+    sim_registry: Arc<SlmpSimRegistry>,
     /// T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): owned OUTSIDE this
     /// manager for the same reason `sessions` is (`bin/banto-hub.rs`
     /// constructs it and keeps its own `Arc` clone so `ServerTagStore`'s
@@ -533,13 +591,16 @@ impl CollectorManager {
     /// is the broker session directory (T2-2, §6-5) - constructed and owned
     /// by the caller (`bin/banto-hub.rs`) so it outlives every
     /// `CollectorManager::rebuild`; see [`CollectorManager`]'s `sessions`
-    /// field doc comment.
+    /// field doc comment. `sim_registry` (T9-2) is the SLMP simulator
+    /// registry, constructed and owned the same way - see
+    /// [`CollectorManager`]'s `sim_registry` field doc comment.
     pub fn new(
         pool: SqlitePool,
         data_dir: PathBuf,
         clock: Arc<dyn Clock>,
         options: CollectorOptions,
         sessions: Arc<HubSessions>,
+        sim_registry: Arc<SlmpSimRegistry>,
         computed: Arc<ComputedEngine>,
     ) -> Self {
         let events = EventSink::new(pool.clone());
@@ -551,6 +612,7 @@ impl CollectorManager {
             options,
             events,
             sessions,
+            sim_registry,
             computed,
             collector: AsyncMutex::new(None),
             inner: Mutex::new(Inner {
@@ -658,7 +720,7 @@ impl CollectorManager {
             }
         };
 
-        let config = match build_config(&self.pool).await {
+        let mut config = match build_config(&self.pool).await {
             Ok(config) => config,
             Err(err) => {
                 let message = err.to_string();
@@ -678,7 +740,34 @@ impl CollectorManager {
         // either way. `stale_slmp_ids` is only actually removed AFTER a
         // successful commit below - see `Self::remove_stale_slmp_sessions`'s
         // doc comment for why the ordering matters.
-        let (slmp_handles, stale_slmp_ids) = self.sync_slmp_sessions().await;
+        let (slmp_handles, stale_slmp_ids, resolved_slmp_targets) = self.sync_slmp_sessions().await;
+
+        // T9-2: every key in `slmp_handles` is, by construction, a
+        // broker-routed enabled SLMP connection whose dial target
+        // `Self::sync_slmp_sessions` already resolved (simulator substitution
+        // included, via `SlmpSimRegistry::resolve`) before `ensure_connection`
+        // ran. Telling `Collector` to treat these as `simulation = false`
+        // stops it from starting a second, redundant in-process simulator for
+        // a connection `SlmpSimRegistry` already simulates - see
+        // `CollectorConfig::suppress_simulation_for`'s doc comment
+        // (`crates/banto-collect/src/config.rs`) and this module's doc
+        // comment ("SLMP 接続単位のシミュレーションモード").
+        config.suppress_simulation_for(&slmp_handles.keys().cloned().collect());
+
+        // T9-2: also stamp each broker-routed SLMP plan with the SAME
+        // resolved dial target `sync_slmp_sessions` just used, so a
+        // simulation toggle (or a simulator restart, or an in-place host/port
+        // edit) that actually moved the broker session makes `apply_config`'s
+        // `PartialEq` diff notice and respawn that connection's task with a
+        // fresh `ClientFactory` - suppressing `simulation` alone leaves the
+        // plan otherwise byte-for-byte identical across such a toggle, which
+        // would classify the connection "unchanged" and leave its running
+        // task wired to a now-superseded broker session forever. See
+        // `CollectorConfig::set_broker_dial_target`'s doc comment
+        // (`crates/banto-collect/src/config.rs`) for the full derivation.
+        for (key, (host, port)) in &resolved_slmp_targets {
+            config.set_broker_dial_target(key, host.clone(), *port);
+        }
 
         // `CollectorConfig`'s internals are `pub(crate)` to banto-collect, so
         // `group_count() == 0` is the public equivalent of "nothing
@@ -710,7 +799,8 @@ impl CollectorManager {
             if let Some(collector) = old_collector {
                 let _ = collector.stop().await;
             }
-            self.remove_stale_slmp_sessions(&stale_slmp_ids);
+            self.remove_stale_slmp_sessions(&stale_slmp_ids).await;
+            self.log_simulation_warnings().await;
             return Ok(());
         }
 
@@ -784,7 +874,8 @@ impl CollectorManager {
         };
         let _ = self.revision_tx.send(new_revision);
 
-        self.remove_stale_slmp_sessions(&stale_slmp_ids);
+        self.remove_stale_slmp_sessions(&stale_slmp_ids).await;
+        self.log_simulation_warnings().await;
 
         Ok(())
     }
@@ -796,15 +887,34 @@ impl CollectorManager {
             .last_error = Some(message);
     }
 
-    /// T2-2/T7-2 (docs/tag-server-design.md §6-5/§4.3): additive
-    /// `ensure_connection` (unchanged from T2-2) over `self.sessions`'s
-    /// broker tasks against the registry's current enabled-SLMP-connection
-    /// set, returning both the `"conn:{id}"`-keyed handle map
-    /// [`crate::broker_glue::hub_client_factory`] needs AND the connection
-    /// ids `self.sessions` still tracks that are NOT in that set (deleted
-    /// from the registry, disabled, or no longer `protocol == "slmp"`) -
-    /// see `crate::broker_glue::HubSessions`'s doc comment ("Session sync
-    /// policy") for the full T7-2 policy this implements.
+    /// T2-2/T7-2/T9-2 (docs/tag-server-design.md §6-5/§4.3, docs/ux-plan.md
+    /// §1): additive `ensure_connection` (unchanged from T2-2) over
+    /// `self.sessions`'s broker tasks against the registry's current
+    /// enabled-SLMP-connection set, returning both the `"conn:{id}"`-keyed
+    /// handle map [`crate::broker_glue::hub_client_factory`] needs AND the
+    /// connection ids `self.sessions` still tracks that are NOT in that set
+    /// (deleted from the registry, disabled, or no longer `protocol ==
+    /// "slmp"`) - see `crate::broker_glue::HubSessions`'s doc comment
+    /// ("Session sync policy") for the full T7-2 policy this implements.
+    ///
+    /// **T9-2 addition**: before calling `ensure_connection` for a
+    /// connection, this now calls `self.sim_registry.resolve(conn)` to get
+    /// the *effective* `(host, port)` to dial - the connection's own
+    /// host/port unless `conn.simulation` is true, in which case it is the
+    /// address of an in-process simulator `SlmpSimRegistry` starts/reuses on
+    /// this connection's behalf (see `SlmpSimRegistry::resolve`'s doc
+    /// comment). `ensure_connection` itself is called against a `PlcConnection`
+    /// copy with only `host`/`port` swapped for the resolved values (`..conn.clone()`
+    /// keeps everything else - id/name/protocol/enabled/unit_id/simulation -
+    /// as the registry's own truth) - `banto_broker::SessionDirectory::ensure_connection`
+    /// reuses a session purely by connection id, so if `resolve` reports the
+    /// dial target *changed* since the last rebuild (simulation toggled,
+    /// simulator restarted, or - incidentally - a real connection's host/port
+    /// was edited in place), `self.sessions.remove(conn.id)` is called FIRST
+    /// so `ensure_connection` is forced to spawn a fresh session against the
+    /// new target instead of silently keeping the stale one alive forever -
+    /// see `SlmpSimRegistry::resolve`'s doc comment for the full derivation
+    /// of why this matters.
     ///
     /// The stale ids are returned, not removed here - [`Self::rebuild`]
     /// only calls [`Self::remove_stale_slmp_sessions`] with them AFTER the
@@ -825,7 +935,33 @@ impl CollectorManager {
     /// propagate). Treating a read failure as "nothing stale" specifically
     /// avoids tearing down a session that is still wanted just because the
     /// registry could not be read this one time.
-    async fn sync_slmp_sessions(&self) -> (HashMap<String, ReadOnlyHandle>, Vec<i64>) {
+    ///
+    /// **T9-2 third return value**: `resolved_targets` (`"conn:{id}"` ->
+    /// `(host, port)`) carries the SAME resolved dial target `resolve` just
+    /// computed for every broker-routed SLMP connection, regardless of
+    /// whether it changed. [`Self::rebuild`] feeds every entry into
+    /// `banto_collect::CollectorConfig::set_broker_dial_target` - necessary
+    /// because `SlmpSimRegistry::resolve`'s `changed`-triggered
+    /// `sessions.remove` + re-`ensure_connection` swaps the broker session
+    /// underneath a connection, but does NOT by itself make the running
+    /// collect task notice: `Collector::apply_config` only rebuilds a
+    /// connection's task (and therefore its captured `ClientFactory`/handle)
+    /// when that connection's whole `ConnectionPlan` compares unequal to the
+    /// previous one, and neither `ConnectionPlan::simulation` (unconditionally
+    /// forced `false` for broker-routed connections by
+    /// `suppress_simulation_for`) nor its `ProtocolConfig`(mirrors the
+    /// registry row verbatim, not the resolved target) reflects a
+    /// simulation toggle or a simulator restart on its own - see
+    /// `CollectorConfig::set_broker_dial_target`'s own doc comment for the
+    /// full derivation (found necessary by this crate's own E2E coverage of
+    /// the toggle path, `apps/banto-hub/core/tests/t9_simulation.rs`).
+    async fn sync_slmp_sessions(
+        &self,
+    ) -> (
+        HashMap<String, ReadOnlyHandle>,
+        Vec<i64>,
+        HashMap<String, (String, i64)>,
+    ) {
         let connections: Vec<PlcConnection> = match PlcConnectionService::new(self.pool.clone())
             .list(ListParams::default())
             .await
@@ -835,20 +971,39 @@ impl CollectorManager {
                 eprintln!(
                     "banto-hub: SLMP セッション同期のための接続一覧取得に失敗しました: {err}"
                 );
-                return (HashMap::new(), Vec::new());
+                return (HashMap::new(), Vec::new(), HashMap::new());
             }
         };
 
         let mut handles = HashMap::new();
+        let mut resolved_targets = HashMap::new();
         let mut wanted_ids: HashSet<i64> = HashSet::new();
         for conn in connections
             .iter()
             .filter(|c| c.enabled && c.protocol == "slmp")
         {
             wanted_ids.insert(conn.id);
-            match self.sessions.ensure_connection(conn) {
+
+            // T9-2: resolve the effective dial target (simulator address if
+            // `conn.simulation`, else the connection's own host/port) BEFORE
+            // ensure_connection - see this fn's own doc comment and
+            // `SlmpSimRegistry::resolve`'s doc comment for why the ordering
+            // and the `changed`-triggered `sessions.remove` matter.
+            let (host, port, changed) = self.sim_registry.resolve(conn).await;
+            if changed {
+                self.sessions.remove(conn.id);
+            }
+            let key = format!("conn:{}", conn.id);
+            resolved_targets.insert(key.clone(), (host.clone(), port));
+            let dial_conn = PlcConnection {
+                host,
+                port,
+                ..conn.clone()
+            };
+
+            match self.sessions.ensure_connection(&dial_conn) {
                 Ok(handle) => {
-                    handles.insert(format!("conn:{}", conn.id), handle.read_only());
+                    handles.insert(key, handle.read_only());
                 }
                 Err(err) => {
                     // Should not happen given the protocol filter above
@@ -872,18 +1027,66 @@ impl CollectorManager {
             .filter(|id| !wanted_ids.contains(id))
             .collect();
 
-        (handles, stale_ids)
+        (handles, stale_ids, resolved_targets)
     }
 
-    /// T7-2: [`crate::broker_glue::HubSessions::remove`] every id in `stale`.
-    /// Must only be called AFTER the collector-side commit for the same
-    /// rebuild has succeeded (see [`Self::rebuild`]/[`Self::sync_slmp_sessions`]'s
-    /// doc comments) - by then, `apply_config`/the pre-commit `Collector`
-    /// stop has already stopped any collect task that was reading through
-    /// one of these connections' broker sessions.
-    fn remove_stale_slmp_sessions(&self, stale: &[i64]) {
+    /// T7-2/T9-2: [`crate::broker_glue::HubSessions::remove`] and
+    /// [`crate::broker_glue::SlmpSimRegistry::remove`] for every id in
+    /// `stale`. Must only be called AFTER the collector-side commit for the
+    /// same rebuild has succeeded (see
+    /// [`Self::rebuild`]/[`Self::sync_slmp_sessions`]'s doc comments) - by
+    /// then, `apply_config`/the pre-commit `Collector` stop has already
+    /// stopped any collect task that was reading through one of these
+    /// connections' broker sessions. `async` (T9-2: `SlmpSimRegistry::remove`
+    /// is `.await`-heavy, stopping a simulator's ramp task) - was sync before.
+    async fn remove_stale_slmp_sessions(&self, stale: &[i64]) {
         for &connection_id in stale {
             self.sessions.remove(connection_id);
+            self.sim_registry.remove(connection_id).await;
+        }
+    }
+
+    /// T9-2 accident-prevention (c): a one-line warning listing every
+    /// enabled `simulation = true` connection, printed after every
+    /// successful `rebuild` commit (both the empty-config early return and
+    /// the normal path) so an operator watching hub's stdout is reminded a
+    /// simulated connection is live - simulation mode is a dev/test
+    /// convenience (docs/ux-plan.md §1) and must never silently persist into
+    /// production use unnoticed. Uses plain `println!`, not
+    /// `bin/banto_hub`'s `hub_log` module - that module lives in the binary
+    /// crate (`src/bin/banto_hub/`), unreachable from this library crate
+    /// (`banto-hub-core`); this file already has exactly this precedent (the
+    /// `eprintln!` "banto-hub: rebuild (部分適用) ..." diagnostic a few lines
+    /// above [`Self::rebuild`] uses plain `eprintln!` for the same reason).
+    /// A registry read failure here is logged (`eprintln!`) and otherwise
+    /// ignored - this is a diagnostic, never a reason to fail the rebuild
+    /// that already committed successfully.
+    async fn log_simulation_warnings(&self) {
+        let connections = match PlcConnectionService::new(self.pool.clone())
+            .list(ListParams::default())
+            .await
+        {
+            Ok(result) => result.rows,
+            Err(err) => {
+                eprintln!(
+                    "banto-hub: シミュレーション接続の確認のための接続一覧取得に失敗しました: {err}"
+                );
+                return;
+            }
+        };
+
+        let names: Vec<String> = connections
+            .iter()
+            .filter(|c| c.enabled && c.simulation)
+            .map(|c| format!("{} (id={})", c.name, c.id))
+            .collect();
+
+        if !names.is_empty() {
+            println!(
+                "banto-hub: [注意] シミュレーションモードの接続が {} 件あります: {} - 本番運用では無効化してください",
+                names.len(),
+                names.join(", "),
+            );
         }
     }
 
@@ -1058,6 +1261,7 @@ mod tests {
         let pool = init_db(&db_path).await.expect("init_db");
         let data_dir = dir.path().join("data");
         let sessions = Arc::new(HubSessions::new(banto_broker::BackoffConfig::default()));
+        let sim_registry = Arc::new(SlmpSimRegistry::new());
         let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
         let manager = CollectorManager::new(
             pool.clone(),
@@ -1069,6 +1273,7 @@ mod tests {
                 ..CollectorOptions::default()
             },
             sessions,
+            sim_registry,
             computed,
         );
         (pool, dir, manager)

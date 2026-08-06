@@ -32,6 +32,11 @@ export interface PlcConnection {
 	port: number;
 	unitId: number;
 	enabled: boolean;
+	/**
+	 * T9-2 (docs/ux-plan.md §1): 接続単位のシミュレーションモード。true の間、
+	 * 実PLCの代わりに内蔵シミュレータへ接続する（開発・検証用、本番非推奨）。
+	 */
+	simulation: boolean;
 }
 
 /**
@@ -61,6 +66,8 @@ export interface PlcConnectionInput {
 	port: number;
 	unitId: number;
 	enabled: boolean;
+	/** T9-2 (docs/ux-plan.md §1). See {@link PlcConnection.simulation}. */
+	simulation: boolean;
 }
 
 /** Mirrors `banto_tags::CollectionGroup`. */

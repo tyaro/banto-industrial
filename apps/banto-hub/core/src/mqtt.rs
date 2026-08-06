@@ -506,6 +506,7 @@ mod tests {
             tag_kind: "plc".to_string(),
             expression: None,
             retain: false,
+            simulation: false,
         };
         assert_eq!(topic_for("banto", &entry), "banto/line1/fast/temp01");
     }
@@ -534,6 +535,7 @@ mod tests {
         let sessions = Arc::new(crate::broker_glue::HubSessions::new(
             banto_broker::BackoffConfig::default(),
         ));
+        let sim_registry = Arc::new(crate::broker_glue::SlmpSimRegistry::new());
         let computed = Arc::new(crate::computed::ComputedEngine::new(Arc::new(
             crate::computed::ServerTagStore::new(),
         )));
@@ -543,6 +545,7 @@ mod tests {
             Arc::new(banto_tstore::SystemClock),
             banto_collect::CollectorOptions::default(),
             sessions,
+            sim_registry,
             computed,
         ));
         let publisher = MqttPublisher::new(manager);

@@ -444,6 +444,7 @@ mod tests {
             tag_kind: PLC_TAG_KIND.to_string(),
             expression: None,
             retain: false,
+            simulation: false,
         }
     }
 
@@ -465,6 +466,7 @@ mod tests {
             tag_kind: COMPUTED_TAG_KIND.to_string(),
             expression: Some(expression.to_string()),
             retain: false,
+            simulation: false,
         }
     }
 

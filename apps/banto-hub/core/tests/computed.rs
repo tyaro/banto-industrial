@@ -305,6 +305,7 @@ async fn test_app(label: &str) -> TestApp {
     let sessions = Arc::new(banto_hub_core::broker_glue::HubSessions::new(
         banto_broker::BackoffConfig::default(),
     ));
+    let sim_registry = Arc::new(banto_hub_core::broker_glue::SlmpSimRegistry::new());
     let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
     let manager = Arc::new(CollectorManager::new(
         pool.clone(),
@@ -312,6 +313,7 @@ async fn test_app(label: &str) -> TestApp {
         Arc::new(SystemClock),
         fast_options(),
         sessions,
+        sim_registry,
         computed,
     ));
 
@@ -843,12 +845,14 @@ async fn retain_true_restores_the_value_across_a_restart_and_retain_false_starts
     let fresh_sessions = Arc::new(banto_hub_core::broker_glue::HubSessions::new(
         banto_broker::BackoffConfig::default(),
     ));
+    let fresh_sim_registry = Arc::new(banto_hub_core::broker_glue::SlmpSimRegistry::new());
     let fresh_manager = Arc::new(CollectorManager::new(
         app.pool.clone(),
         app._env.data_dir(),
         Arc::new(SystemClock),
         fast_options(),
         fresh_sessions,
+        fresh_sim_registry,
         fresh_computed,
     ));
     fresh_manager.rebuild().await.expect("post-restart rebuild");

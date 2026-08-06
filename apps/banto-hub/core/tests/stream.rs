@@ -208,6 +208,7 @@ async fn test_app(label: &str) -> TestApp {
     let sessions = std::sync::Arc::new(banto_hub_core::broker_glue::HubSessions::new(
         banto_broker::BackoffConfig::default(),
     ));
+    let sim_registry = std::sync::Arc::new(banto_hub_core::broker_glue::SlmpSimRegistry::new());
     let computed = std::sync::Arc::new(ComputedEngine::new(std::sync::Arc::new(
         ServerTagStore::new(),
     )));
@@ -217,6 +218,7 @@ async fn test_app(label: &str) -> TestApp {
         std::sync::Arc::new(SystemClock),
         fast_options(),
         sessions,
+        sim_registry,
         computed,
     ));
     manager.rebuild().await.expect("initial rebuild");

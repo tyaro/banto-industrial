@@ -20,6 +20,8 @@
 //!
 //! init_db → 各サービス構築 → `HubSessions` 構築（T2-2、設計 §6-5。
 //! `CollectorManager` の外で生存するブローカーセッション directory）→
+//! `SlmpSimRegistry` 構築（T9-2、docs/ux-plan.md §1。同じく
+//! `CollectorManager` の外で生存する SLMP シミュレータ registry）→
 //! `CollectorManager::rebuild()`（起動時1回、設計 §4.3）→ tstore 剪定
 //! （起動時1回 + 24h 周期、設計 §3.3・保持既定7日）→ `MqttPublisher`構築 +
 //! settings の永続値を`apply`（T3、設計 §5.3。`mqtt.enabled=false`なら
@@ -32,7 +34,8 @@
 //!
 //! `mqtt.shutdown()`（MQTT publish タスク停止）→ `grpc_server.shutdown()`
 //! （gRPC サーバータスク停止）→ `manager.shutdown()`（`Collector` 停止・
-//! tstore flush）→ `sessions.shutdown()`（broker タスク停止）の順を守る。
+//! tstore flush）→ `sessions.shutdown()`（broker タスク停止）→
+//! `sim_registry.shutdown()`（T9-2、SLMP シミュレータ停止）の順を守る。
 //! `manager`→`sessions`の順が先に必要な理由（逆順だと broker セッションが
 //! 消えた後もまだ実行中の収集タスクが `BrokerReadClient::read_batch` を
 //! 呼び、`BrokerError::TaskGone` 由来の `PlcError` を毎回受け取ってから
@@ -42,6 +45,12 @@
 //! `tag_map`/`current_values`を読むだけの消費者（`crate::mqtt`/`crate::grpc`
 //! のモジュール doc comment参照）なので、依存する側（`mqtt`/gRPC）を先に
 //! 止める（両者間の順序自体はどちらが先でもよい - 独立した消費者）。
+//! `sessions`→`sim_registry`の順が最後に必要な理由（T9-2）: broker が
+//! ダイヤルしている先がシミュレータのことがある（`SlmpSimRegistry`が
+//! アドレスを差し替えた broker 経由 SLMP 接続）ので、シミュレータを broker
+//! セッションより先に止めると、まだ止まりきっていない broker タスクが
+//! 存在しない相手へ接続しようとする無駄が起きうる - シミュレータは
+//! それをダイヤルする broker セッションより長生きしなければならない。
 //!
 //! 環境変数: `PORT`（既定は settings の `server.port`、さらに未設定なら
 //! 8722）、`BANTO_BIND`（既定は settings の `server.bind`、さらに未設定なら
@@ -58,7 +67,7 @@ use banto_collect::{CollectorOptions, Quality};
 use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::assets::FrontendAssets;
 use banto_hub_core::audit::AuditLogService;
-use banto_hub_core::broker_glue::HubSessions;
+use banto_hub_core::broker_glue::{HubSessions, SlmpSimRegistry};
 use banto_hub_core::computed::{load_retained_values, ComputedEngine, ServerTagStore};
 use banto_hub_core::db::init_db;
 use banto_hub_core::events::event_channel;
@@ -144,6 +153,15 @@ pub async fn run(shutdown: impl std::future::Future<Output = ()>) {
     // way out - see this module's doc comment ("シャットダウン順序").
     let sessions = Arc::new(HubSessions::new(banto_broker::BackoffConfig::default()));
 
+    // T9-2 (docs/ux-plan.md §1): constructed here, OUTSIDE `CollectorManager`,
+    // for the same reason `sessions` is - a simulator started for a
+    // `simulation = true` broker-routed SLMP connection must survive every
+    // `CollectorManager::rebuild` (see `SlmpSimRegistry`'s doc comment).
+    // Held as its own `Arc` so this binary can call `sim_registry.shutdown()`
+    // at the correct point on the way out - see this module's doc comment
+    // ("シャットダウン順序") for why that is AFTER `sessions.shutdown()`.
+    let sim_registry = Arc::new(SlmpSimRegistry::new());
+
     // T6-2 (docs/tag-server-design.md §4.2): constructed here, OUTSIDE
     // `CollectorManager`, for the same reason `sessions` is - the computed
     // engine's plan and `ServerTagStore`'s values must outlive every single
@@ -181,6 +199,7 @@ pub async fn run(shutdown: impl std::future::Future<Output = ()>) {
         clock.clone(),
         CollectorOptions::default(),
         sessions.clone(),
+        sim_registry.clone(),
         computed_engine.clone(),
     ));
 
@@ -188,7 +207,11 @@ pub async fn run(shutdown: impl std::future::Future<Output = ()>) {
     // a stray invalid tag left over from a hand-edited DB) must not prevent
     // the server from starting - it surfaces via `/api/v1/status`'s
     // `last_config_error` instead, exactly like a rebuild triggered by a
-    // later CRUD write.
+    // later CRUD write. T9-2: the "simulation 接続あり" startup diagnostic
+    // (docs/ux-plan.md §1, accident-prevention (c)) is emitted from inside
+    // `CollectorManager::rebuild` itself (`println!`, since that library
+    // crate cannot reach this binary crate's `hub_log` module) - this call
+    // already covers "hub 起動時" logging, nothing further is needed here.
     if let Err(err) = manager.rebuild().await {
         log_err_line(&format!(
             "banto-hub: 起動時の collector 構築に失敗しました: {err}"
@@ -360,6 +383,10 @@ pub async fn run(shutdown: impl std::future::Future<Output = ()>) {
     grpc_server.shutdown().await;
     manager.shutdown().await;
     sessions.shutdown().await;
+    // T9-2: simulators must outlive both the collector's tasks (`manager`)
+    // and the broker sessions that may be dialing them (`sessions`), so they
+    // are stopped last - see this module's doc comment ("シャットダウン順序").
+    sim_registry.shutdown().await;
     server.stop().await;
 }
 
