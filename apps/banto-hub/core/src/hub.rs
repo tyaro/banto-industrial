@@ -187,6 +187,7 @@ use utoipa::ToSchema;
 
 use crate::broker_glue::{hub_client_factory, HubSessions, SlmpSimRegistry};
 use crate::computed::{self, ComputedEngine, ServerTagStore};
+use crate::diag_log::DiagLog;
 
 /// The effective `(value, quality, timestamp_ms)` triple for one catalog
 /// entry - shared by `crate::rest`'s `/api/v1/values*` and `crate::stream`'s
@@ -582,6 +583,14 @@ pub struct CollectorManager {
     /// re-fetching once at the latest revision is equivalent to re-fetching
     /// once per intermediate revision.
     revision_tx: watch::Sender<u64>,
+    /// T9-2 フォローアップ（2026-08-06、`crate::diag_log` モジュール doc
+    /// 参照）: `rebuild`/`sync_slmp_sessions`/`log_simulation_warnings` の
+    /// 診断ログの出力先。[`Self::new`] では [`DiagLog::default`]（素の
+    /// `println!`/`eprintln!` と同じ）で初期化され、[`Self::with_diag_log`]
+    /// を呼んだ場合のみ差し替わる - `bin/banto_hub` はここへ
+    /// `hub_log::log_line`/`log_err_line` を配線し、Windows サービスモード
+    /// でもこれらの診断がサービスログファイルに届くようにする。
+    diag_log: DiagLog,
 }
 
 impl CollectorManager {
@@ -624,7 +633,20 @@ impl CollectorManager {
             }),
             rebuild_lock: AsyncMutex::new(()),
             revision_tx,
+            diag_log: DiagLog::default(),
         }
+    }
+
+    /// T9-2 フォローアップ (2026-08-06): この manager の診断ログ
+    /// （`rebuild`/`sync_slmp_sessions`/`log_simulation_warnings`）を
+    /// `hub_log::log_line`/`log_err_line` 経由にルーティングし、Windows
+    /// サービスモードでもサービスログファイルへ届くようにする - `bin/
+    /// banto_hub` が呼ぶ。これを呼ばなければ既定の素の
+    /// `println!`/`eprintln!` 相当のまま（`crate::diag_log` モジュール doc
+    /// 参照）。
+    pub fn with_diag_log(mut self, diag_log: DiagLog) -> Self {
+        self.diag_log = diag_log;
+        self
     }
 
     /// T6-2: the shared computed/internal-tag current-value store - the
@@ -854,10 +876,10 @@ impl CollectorManager {
         };
 
         if let Some(report) = &apply_report {
-            eprintln!(
+            self.diag_log.err_line(&format!(
                 "banto-hub: rebuild (部分適用) added={:?} removed={:?} replaced={:?} unchanged={:?} writer_rotated={}",
                 report.added, report.removed, report.replaced, report.unchanged, report.writer_rotated,
-            );
+            ));
         }
 
         // T6-2: commit alongside the catalog/`Collector` state - same
@@ -968,9 +990,9 @@ impl CollectorManager {
         {
             Ok(result) => result.rows,
             Err(err) => {
-                eprintln!(
+                self.diag_log.err_line(&format!(
                     "banto-hub: SLMP セッション同期のための接続一覧取得に失敗しました: {err}"
-                );
+                ));
                 return (HashMap::new(), Vec::new(), HashMap::new());
             }
         };
@@ -1012,10 +1034,10 @@ impl CollectorManager {
                     // than failing the rebuild, matching this fn's doc
                     // comment. `hub_client_factory`'s defensive fallback
                     // covers this connection for the current rebuild.
-                    eprintln!(
+                    self.diag_log.err_line(&format!(
                         "banto-hub: SLMP ブローカーセッションの起動に失敗しました (接続 {}): {err}",
                         conn.id
-                    );
+                    ));
                 }
             }
         }
@@ -1052,13 +1074,15 @@ impl CollectorManager {
     /// the normal path) so an operator watching hub's stdout is reminded a
     /// simulated connection is live - simulation mode is a dev/test
     /// convenience (docs/ux-plan.md §1) and must never silently persist into
-    /// production use unnoticed. Uses plain `println!`, not
-    /// `bin/banto_hub`'s `hub_log` module - that module lives in the binary
-    /// crate (`src/bin/banto_hub/`), unreachable from this library crate
-    /// (`banto-hub-core`); this file already has exactly this precedent (the
-    /// `eprintln!` "banto-hub: rebuild (部分適用) ..." diagnostic a few lines
-    /// above [`Self::rebuild`] uses plain `eprintln!` for the same reason).
-    /// A registry read failure here is logged (`eprintln!`) and otherwise
+    /// production use unnoticed. Routed through `self.diag_log` (T9-2
+    /// フォローアップ 2026-08-06、`crate::diag_log` モジュール doc 参照) so
+    /// this warning reaches `bin/banto_hub`'s `hub_log` service log file
+    /// (and therefore an operator running as a Windows service, not just a
+    /// console) whenever `CollectorManager::with_diag_log` has been called -
+    /// this is the main diagnostic the T9-2 followup fix targets. Anything
+    /// that never calls `with_diag_log` keeps the default plain
+    /// `println!`/`eprintln!` behavior ([`DiagLog::default`]). A registry
+    /// read failure here is logged (`self.diag_log.err_line`) and otherwise
     /// ignored - this is a diagnostic, never a reason to fail the rebuild
     /// that already committed successfully.
     async fn log_simulation_warnings(&self) {
@@ -1068,9 +1092,9 @@ impl CollectorManager {
         {
             Ok(result) => result.rows,
             Err(err) => {
-                eprintln!(
+                self.diag_log.err_line(&format!(
                     "banto-hub: シミュレーション接続の確認のための接続一覧取得に失敗しました: {err}"
-                );
+                ));
                 return;
             }
         };
@@ -1082,11 +1106,11 @@ impl CollectorManager {
             .collect();
 
         if !names.is_empty() {
-            println!(
+            self.diag_log.line(&format!(
                 "banto-hub: [注意] シミュレーションモードの接続が {} 件あります: {} - 本番運用では無効化してください",
                 names.len(),
                 names.join(", "),
-            );
+            ));
         }
     }
 
@@ -1421,6 +1445,44 @@ mod tests {
         assert_eq!(manager.revision(), 1);
         assert_eq!(manager.last_error(), Some(err));
         assert!(manager.tag_map().is_empty());
+    }
+
+    /// T9-2 フォローアップ (2026-08-06): `log_simulation_warnings`（この
+    /// テストでは `rebuild` 経由で間接的に呼ばれる）が実際に注入された
+    /// `DiagLog` を経由すること - 素の `println!` に黙って落ちないことの
+    /// 回帰確認（`crate::diag_log` モジュール doc「PR #43 監査指摘」参照）。
+    #[tokio::test]
+    async fn rebuild_routes_the_simulation_warning_through_the_injected_diag_log() {
+        let (pool, _dir, manager) = manager_env().await;
+        let lines: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = lines.clone();
+        let manager = manager.with_diag_log(DiagLog::new(
+            move |msg| captured.lock().unwrap().push(msg.to_string()),
+            |_msg| {},
+        ));
+
+        PlcConnectionService::new(pool.clone())
+            .create(PlcConnectionInput {
+                name: "simline".to_string(),
+                protocol: "modbus-tcp".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 15023,
+                unit_id: 1,
+                enabled: true,
+                simulation: true,
+            })
+            .await
+            .unwrap();
+
+        manager.rebuild().await.expect("rebuild should be Ok");
+
+        let captured_lines = lines.lock().unwrap();
+        assert!(
+            captured_lines
+                .iter()
+                .any(|line| line.contains("simline") && line.contains("シミュレーション")),
+            "expected a simulation warning line, got: {captured_lines:?}"
+        );
     }
 
     /// Two concurrent `rebuild()` calls must not panic (no double-lock /

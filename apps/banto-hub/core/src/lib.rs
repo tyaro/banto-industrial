@@ -82,6 +82,7 @@ pub mod audit;
 pub mod broker_glue;
 pub mod computed;
 pub mod db;
+pub mod diag_log;
 pub mod events;
 pub mod grpc;
 pub mod hub;

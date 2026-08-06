@@ -70,6 +70,7 @@ use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::{HubSessions, SlmpSimRegistry};
 use banto_hub_core::computed::{load_retained_values, ComputedEngine, ServerTagStore};
 use banto_hub_core::db::init_db;
+use banto_hub_core::diag_log::DiagLog;
 use banto_hub_core::events::event_channel;
 use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
@@ -193,15 +194,18 @@ pub async fn run(shutdown: impl std::future::Future<Output = ()>) {
         }
     }
 
-    let manager = Arc::new(CollectorManager::new(
-        pool.clone(),
-        data_dir.clone(),
-        clock.clone(),
-        CollectorOptions::default(),
-        sessions.clone(),
-        sim_registry.clone(),
-        computed_engine.clone(),
-    ));
+    let manager = Arc::new(
+        CollectorManager::new(
+            pool.clone(),
+            data_dir.clone(),
+            clock.clone(),
+            CollectorOptions::default(),
+            sessions.clone(),
+            sim_registry.clone(),
+            computed_engine.clone(),
+        )
+        .with_diag_log(DiagLog::new(log_line, log_err_line)),
+    );
 
     // Startup rebuild (design §4.3: T0 は起動時に1回). A failure here (e.g.
     // a stray invalid tag left over from a hand-edited DB) must not prevent
@@ -209,9 +213,11 @@ pub async fn run(shutdown: impl std::future::Future<Output = ()>) {
     // `last_config_error` instead, exactly like a rebuild triggered by a
     // later CRUD write. T9-2: the "simulation 接続あり" startup diagnostic
     // (docs/ux-plan.md §1, accident-prevention (c)) is emitted from inside
-    // `CollectorManager::rebuild` itself (`println!`, since that library
-    // crate cannot reach this binary crate's `hub_log` module) - this call
-    // already covers "hub 起動時" logging, nothing further is needed here.
+    // `CollectorManager::rebuild` itself - it now routes through
+    // `with_diag_log` (just above) to `hub_log::log_line`, so it reaches the
+    // Windows service log file too (T9-2 フォローアップ 2026-08-06,
+    // `banto_hub_core::diag_log` モジュール doc 参照) - this call already
+    // covers "hub 起動時" logging, nothing further is needed here.
     if let Err(err) = manager.rebuild().await {
         log_err_line(&format!(
             "banto-hub: 起動時の collector 構築に失敗しました: {err}"
