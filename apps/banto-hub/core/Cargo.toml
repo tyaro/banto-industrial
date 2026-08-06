@@ -120,6 +120,18 @@ banto-plc-write = { path = "../../../crates/banto-plc-write", features = ["simul
 # モードのみ（組み込みブローカーは §10-4 の判断待ち、実装しない）。
 rumqttd = { version = "0.20", default-features = false }
 
+# T5-4（docs/t5-handoff.md §3「ソークテスト」）: tests/soak.rs の RSS
+# サンプリング（`GetProcessMemoryInfo`）専用。新規の依存ノードは増えない -
+# tokio/mio/tempfile 等が既に windows-sys 0.61 系を依存木に持っている
+# （Cargo.lock 参照）ので、同じバージョン系列を明示するだけ。テストコードの
+# みが使うので dev-dependency。
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
 [[bin]]
 name = "banto-hub"
 path = "src/bin/banto-hub.rs"
