@@ -42,16 +42,21 @@
 //! タグはこの最小実装のスコープ外とした。将来必要になれば`set_string`で
 //! 追加できる)。
 //!
-//! ## SLMP + banto-hub の broker 経路について(T9-2 への申し送り)
+//! ## SLMP + banto-hub の broker 経路について(T9-2 で実装済み)
 //!
-//! `apps/banto-hub/core/src/broker_glue.rs`の module doc（「SLMP broker 経路」
-//! 節）に、この節と対になる申し送りを書いた - 要約すると、hub の
-//! broker 経由 SLMP 接続(`HubSessions::ensure_connection`)は
+//! T9-1 の時点でこのモジュールがカバーしていたのは(1)Modbus 接続
+//! (常に直接クライアント、broker を経由しない)と(2)banto-hub の broker を
+//! 経由しない SLMP 接続(このクレート単体・将来の非 hub コンシューマ)のみで、
+//! hub の broker 経由 SLMP 接続(`HubSessions::ensure_connection`)は
 //! `CollectorManager::rebuild`の中で`Collector::apply_config`より*前*に
 //! セッションを確立するため、この`Collector`が起動するシミュレータの
-//! アドレスをまだ知りえない。T9-1 がカバーするのは(1)Modbus 接続
-//! (常に直接クライアント、broker を経由しない)と(2)banto-hub の broker を
-//! 経由しない SLMP 接続(このクレート単体・将来の非 hub コンシューマ)。
+//! アドレスをまだ知りえない、という申し送りが残っていた。
+//!
+//! T9-2 で解消済み: `apps/banto-hub/core/src/broker_glue.rs`の
+//! `SlmpSimRegistry`が、この`start`/[`SimulatorHandle`]をそのまま再利用して
+//! `ensure_connection`より前にシミュレータを起動・アドレス解決する - 詳細は
+//! `SlmpSimRegistry`自身の doc comment（および同ファイルの module doc
+//! 「T9-1/T9-2 note」節）を参照。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -73,8 +78,11 @@ const RAMP_ADDRESS_COUNT: u16 = 16;
 
 /// 起動中の1シミュレータインスタンス - 対応するランプ波生成タスクとその
 /// 停止チャネルを束ねる。`crate::collector::Collector` が接続キー
-/// (`"conn:{id}"`)ごとに1個保持する。
-pub(crate) struct SimulatorHandle {
+/// (`"conn:{id}"`)ごとに1個保持する。T9-2: `apps/banto-hub/core/src/broker_glue.rs`
+/// の`SlmpSimRegistry`も、broker 経由 SLMP 接続1本ごとに1個保持する
+/// (`Collector`とは別の、独立したライフサイクル - このモジュールの
+/// 「SLMP + banto-hub の broker 経路について」参照)ため`pub`。
+pub struct SimulatorHandle {
     addr: SocketAddr,
     ramp_stop: watch::Sender<bool>,
     ramp_task: JoinHandle<()>,
@@ -89,8 +97,9 @@ enum SimulatorInner {
 impl SimulatorHandle {
     /// 接続タスクが実際に宛先とする loopback アドレス -
     /// `crate::collector::Collector`はこれで`ConnectionPlan`(のタスク用
-    /// コピー)の host/port を上書きする。
-    pub(crate) fn addr(&self) -> SocketAddr {
+    /// コピー)の host/port を上書きする。T9-2: `SlmpSimRegistry`も同様に、
+    /// broker セッションの実際の宛先としてこれを使う。
+    pub fn addr(&self) -> SocketAddr {
         self.addr
     }
 
@@ -102,7 +111,7 @@ impl SimulatorHandle {
     /// (`close_or_flush_writer`)と同種の「所有権を取り戻してから閉じる」
     /// パターンだが、そちらと違って参照元が構造的に2つしかないため
     /// フォールバック分岐は不要)。
-    pub(crate) async fn stop(self) {
+    pub async fn stop(self) {
         let _ = self.ramp_stop.send(true);
         let _ = self.ramp_task.await;
         match self.inner {
@@ -118,8 +127,10 @@ impl SimulatorHandle {
 
 /// `protocol` に応じたシミュレータを loopback の空きポートで起動し、ランプ波/
 /// トグル生成タスクを spawn する。呼び出し元は返った [`SimulatorHandle::addr`]
-/// を接続先として使う。
-pub(crate) async fn start(protocol: Protocol) -> SimulatorHandle {
+/// を接続先として使う。`pub`: `crate::collector::Collector`自身に加え、T9-2の
+/// `apps/banto-hub/core/src/broker_glue.rs`の`SlmpSimRegistry`もこれを直接
+/// 呼ぶ(このモジュールの「SLMP + banto-hub の broker 経路について」参照)。
+pub async fn start(protocol: Protocol) -> SimulatorHandle {
     match protocol {
         Protocol::ModbusTcp => start_modbus().await,
         Protocol::Slmp => start_slmp().await,

@@ -60,15 +60,19 @@ pub mod config;
 pub mod current;
 pub mod error;
 pub mod event;
-// T9-1 (docs/ux-plan.md §1): in-process simulator lifecycle for
-// `simulation = true` connections - purely an internal implementation
-// detail of `crate::collector::Collector`, nothing here is part of this
-// crate's public API.
-mod simulation;
+// T9-1/T9-2 (docs/ux-plan.md §1): in-process simulator lifecycle for
+// `simulation = true` connections. Started life as a pure implementation
+// detail of `crate::collector::Collector`; T9-2 (apps/banto-hub/core's
+// broker-routed SLMP path - see this module's own doc comment, "SLMP +
+// banto-hub の broker 経路について") needs to start/reuse/stop a simulator
+// itself, so `start`/`SimulatorHandle` are now public. Everything else in
+// this module (the ramp/toggle generation tasks, the Modbus/SLMP-specific
+// startup helpers) stays crate-private.
+pub mod simulation;
 mod task;
 
 pub use collector::{ApplyReport, Collector, CollectorOptions};
-pub use config::{build_config, CollectorConfig};
+pub use config::{build_config, CollectorConfig, Protocol};
 pub use current::{CurrentSample, CurrentValuesHandle, Quality, STALE_PERIOD_FACTOR};
 pub use error::CollectError;
 pub use event::{

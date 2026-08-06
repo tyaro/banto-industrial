@@ -64,6 +64,7 @@
 		port: string;
 		unitId: string;
 		enabled: boolean;
+		simulation: boolean;
 	}
 
 	function blankForm(): FormState {
@@ -75,7 +76,8 @@
 			host: '',
 			port: '502',
 			unitId: '1',
-			enabled: true
+			enabled: true,
+			simulation: false
 		};
 	}
 
@@ -86,7 +88,8 @@
 			host: c.host,
 			port: String(c.port),
 			unitId: String(c.unitId),
-			enabled: c.enabled
+			enabled: c.enabled,
+			simulation: c.simulation
 		};
 	}
 
@@ -97,7 +100,8 @@
 			host: form.host,
 			port: Number(form.port),
 			unitId: Number(form.unitId),
-			enabled: form.enabled
+			enabled: form.enabled,
+			simulation: form.simulation
 		};
 	}
 
@@ -230,12 +234,39 @@
 			format: (v) => (v ? 'はい' : 'いいえ')
 		},
 		{
+			// T9-2 (docs/ux-plan.md §1): シミュレーションモードは事故防止の
+			// 最優先項目 - 一覧で一目で気づけることが要件。GridColumn.format は
+			// プレーンテキストしか返せない（@banto/grid-svelte の types.ts
+			// 参照、cellClass 相当のフックは無い）ので、テキスト自体に警告記号を
+			// 入れつつ、行全体の強調は BantoGrid の rowClass（下記
+			// connectionRowClass）+ 呼び出し側 :global() スタイルで行う -
+			// audit-log ページの `audit-row-alert` と同じパターン。
+			// virtual（calc/mem）は simulation が常に false だが「該当なし」を
+			// 「明示的にオフ」と区別するため空欄にする。
+			id: 'simulation',
+			header: 'シミュレーション',
+			accessor: 'simulation',
+			width: 130,
+			format: (v, row) => {
+				if (isVirtualConnection(row)) return '';
+				return v ? '⚠ シミュレーション中' : '—';
+			}
+		},
+		{
 			id: 'editable',
 			header: '編集',
 			accessor: (row) => (isVirtualConnection(row) ? '不可（自動）' : '可'),
 			width: 100
 		}
 	];
+
+	/**
+	 * T9-2: simulation=true の実接続行を BantoGrid の rowClass 経由で強調する
+	 * （spec M14 の audit-log と同じ仕組み。上の `simulation` 列コメント参照）。
+	 */
+	function connectionRowClass(c: PlcConnection): string | undefined {
+		return c.simulation && !isVirtualConnection(c) ? 'sim-row' : undefined;
+	}
 </script>
 
 {#snippet connectionFields(form: FormState, errors: Record<string, string>)}
@@ -274,6 +305,13 @@
 			<input type="checkbox" bind:checked={form.enabled} />
 			有効
 		</label>
+		<label class="field checkbox">
+			<input type="checkbox" bind:checked={form.simulation} />
+			シミュレーションモード
+		</label>
+		<span class="hint sim-hint">
+			実PLCの代わりに内蔵シミュレータに接続します（開発・検証用）。本番運用では有効にしないでください。
+		</span>
 	</div>
 {/snippet}
 
@@ -306,6 +344,7 @@
 					rows={connections}
 					{columns}
 					getRowId={(c) => c.id}
+					rowClass={connectionRowClass}
 					onRowClick={canWrite ? selectConnection : undefined}
 				/>
 			</div>
@@ -402,9 +441,40 @@
 		color: var(--banto-text-muted);
 	}
 
+	/* T9-2: シミュレーションモードのチェックボックス直下の注意書き。フォーム
+	   グリッドの1マスに収まる長さではないので全幅を使う。 */
+	.sim-hint {
+		grid-column: 1 / -1;
+		margin-top: -0.4rem;
+		color: var(--banto-warning);
+	}
+
 	.err {
 		color: var(--banto-danger);
 		font-size: 0.75rem;
+	}
+
+	/*
+	 * T9-2 (docs/ux-plan.md §1): シミュレーション中の接続行を一覧で一目で
+	 * 気づけるよう強調する。@banto/grid-svelte の BantoGrid.svelte 内部
+	 * コメント（spec M14）が明示する使い方どおり、rowClass で付与した
+	 * `.sim-row` を呼び出し側の :global() セレクタで直接スタイリングする
+	 * （grid 内部の DOM は Svelte のスコープドCSSがこのコンポーネントの外
+	 * なので :global が必要）。監査ログページの `.audit-row-alert`（境界線の
+	 * みで --banto-danger）より一段強く、背景色も付けて誤操作防止の
+	 * 最優先項目として目立たせる。--banto-danger ではなく --banto-warning
+	 * を使うのは、この状態が「エラー」ではなく「注意すべき設定」であるため
+	 * （status ページの config-error/quality-bad は danger を使っており、
+	 * 意味を分けるためにここは warning にした）。
+	 */
+	:global(.row.sim-row) {
+		background: color-mix(in srgb, var(--banto-warning) 12%, transparent);
+		border-left: 3px solid var(--banto-warning);
+	}
+
+	:global(.row.sim-row .cell[data-cell-field='simulation']) {
+		color: var(--banto-warning);
+		font-weight: 600;
 	}
 
 	.actions {

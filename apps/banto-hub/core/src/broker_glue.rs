@@ -69,14 +69,14 @@
 //! so `/api/v1/status` surfaces the broker's answer for SLMP connections,
 //! per the design decision this module implements.
 //!
-//! ## T9-1/T9-2 note: SLMP simulation mode is not wired up here yet
+//! ## T9-1/T9-2 note: SLMP simulation mode, wired via [`SlmpSimRegistry`]
 //!
 //! docs/ux-plan.md §1 (2026-08-06, 「接続単位のシミュレーションモード」) adds
 //! `banto_tags::PlcConnection::simulation`; for `simulation = true` Modbus
 //! connections and for SLMP connections that bypass this broker entirely,
-//! `banto_collect::Collector` now starts an in-process simulator and
-//! substitutes its loopback address for the connection's real host/port
-//! itself, at task-spawn time (`crates/banto-collect/src/simulation.rs` and
+//! `banto_collect::Collector` starts an in-process simulator and substitutes
+//! its loopback address for the connection's real host/port itself, at
+//! task-spawn time (`crates/banto-collect/src/simulation.rs` and
 //! `crates/banto-collect/src/collector.rs`'s "T9-1 addendum" doc section) -
 //! no change needed in this module for those.
 //!
@@ -86,29 +86,33 @@
 //! *before* building the [`hub_client_factory`] it hands to
 //! `Collector::apply_config` - i.e. the broker session for an SLMP connection
 //! is already established by the time `Collector` would otherwise decide to
-//! start that connection's simulator. So a simulated broker-managed SLMP
-//! connection today would have its broker session dial the *real* (and, in
-//! dev/test use, generally unreachable) host/port unchanged - simulation mode
-//! silently does not take effect for it.
+//! start that connection's simulator. So, unmodified, a simulated
+//! broker-managed SLMP connection would have its broker session dial the
+//! *real* (and, in dev/test use, generally unreachable) host/port -
+//! simulation mode would silently not take effect for it.
 //!
-//! The natural substitution point, once T9-2 wires this up: `rebuild` must
-//! know the simulator's address *before* calling `ensure_connection`, which
-//! means the simulator for such a connection cannot be owned by `Collector`
-//! (whose simulator only exists once its task spawns, which is necessarily
-//! later in the same `rebuild` call). The two options considered: (a) give
-//! `CollectorManager` its own simulator registry, sibling to [`HubSessions`],
-//! keyed by connection id, consulted before `ensure_connection` for any
-//! enabled `simulation = true` SLMP connection (and torn down on the same
-//! removal sweep this struct's "Session sync policy" section already
-//! performs) - `Collector` would then see `simulation = false` effectively
-//! for broker-routed connections and simply not start a second, redundant
+//! The natural substitution point: `rebuild` must know the simulator's
+//! address *before* calling `ensure_connection`, which means the simulator
+//! for such a connection cannot be owned by `Collector` (whose simulator only
+//! exists once its task spawns, which is necessarily later in the same
+//! `rebuild` call). Two options were considered: (a) give `CollectorManager`
+//! its own simulator registry, sibling to [`HubSessions`], keyed by
+//! connection id, consulted before `ensure_connection` for any enabled
+//! `simulation = true` SLMP connection (and torn down on the same removal
+//! sweep this struct's "Session sync policy" section already performs) -
+//! `Collector` would then see `simulation = false` effectively for
+//! broker-routed connections and simply not start a second, redundant
 //! simulator; or (b) reorder `rebuild` so session sync runs *after*
 //! `Collector::apply_config`, threading the address `Collector` already
 //! assigned back into `ensure_connection` - rejected as the bigger change,
 //! since every other ordering constraint this struct documents (the T7-2
 //! "Session sync policy" section, and `CollectorManager::rebuild`'s own doc
-//! comment) is built around sync-then-apply. (a) is the smaller, more
-//! surgical change and is the one T9-2 should implement.
+//! comment) is built around sync-then-apply. (a) was the smaller, more
+//! surgical change and is what T9-2 implemented, as [`SlmpSimRegistry`] -
+//! see that struct's own doc comment for the concrete mechanism, and
+//! `CollectorConfig::suppress_simulation_for`
+//! (`crates/banto-collect/src/config.rs`) for how `Collector` is told to
+//! stand down for connections `SlmpSimRegistry` already handles.
 //!
 //! ## Value type coverage: numeric/bit only
 //!
@@ -352,6 +356,160 @@ impl HubSessions {
         if let Some(supervisor) = supervisor {
             supervisor.shutdown().await;
         }
+    }
+}
+
+/// T9-2 (docs/ux-plan.md §1, 2026-08-06 オーナー決定): broker 経由 SLMP 接続の
+/// シミュレーションモードを実現するレジストリ - この module doc の
+/// 「T9-1/T9-2 note」節で説明した設計 (a) の実体。[`HubSessions`] と対の
+/// ライフサイクル(`bin/banto_hub`が構築し、`CollectorManager`の外で
+/// `rebuild`を跨いで生存させ、プロセス終了時に一度だけ [`Self::shutdown`])
+/// を持つが、責務は独立: `HubSessions`は broker セッション自体を保持し、
+/// `SlmpSimRegistry`は「その broker セッションが実際にダイヤルすべき
+/// (host, port)」を、必要ならシミュレータを起動して差し替える。
+///
+/// ## なぜ`ensure_connection`より前に必要か
+///
+/// `banto_broker::SessionDirectory::ensure_connection`
+/// (`crates/banto-broker/src/lib.rs`)は接続 id だけで既存セッションを
+/// 再利用する - `conn.host`/`conn.port`を毎回読み直しはしない。したがって
+/// `simulation = true`への切り替えでシミュレータの実アドレスを知るのは
+/// `ensure_connection`を呼ぶ*前*でなければならない。`crate::hub::CollectorManager::sync_slmp_sessions`
+/// は接続ごとに [`Self::resolve`] を先に呼び、その結果(シミュレータの
+/// loopback アドレス、または実接続の host/port そのまま)を
+/// `ensure_connection`に渡す`banto_tags::PlcConnection`のコピーへ差し込む。
+pub struct SlmpSimRegistry {
+    /// `simulation = true` として現在起動中のシミュレータ - 接続 id ごとに
+    /// 高々1個。[`Self::resolve`]が simulation フラグの on/off に応じて
+    /// 起動・停止する。
+    simulators: tokio::sync::Mutex<HashMap<i64, banto_collect::simulation::SimulatorHandle>>,
+    /// 各接続 id について直近に「実際にダイヤルした(host, port)」を記録する -
+    /// [`Self::resolve`]が「宛先が変わったか」を判定するための唯一の情報源。
+    /// エントリなし(`None`)は「初回」を意味し、常に "changed" 扱いになる。
+    last_target: tokio::sync::Mutex<HashMap<i64, (String, i64)>>,
+}
+
+impl SlmpSimRegistry {
+    /// 空のレジストリで開始する - `CollectorManager`の最初の`rebuild`が
+    /// SLMP 接続を見つけるたびに [`Self::resolve`] 経由で育つ
+    /// ([`HubSessions::new`]と同じ「起動時は空、後から育つ」設計)。
+    pub fn new() -> Self {
+        Self {
+            simulators: tokio::sync::Mutex::new(HashMap::new()),
+            last_target: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `conn`(SLMP 接続)が実際にダイヤルすべき`(host, port)`を解決する。
+    ///
+    /// - `conn.simulation == true` の場合: `conn.id`用のシミュレータが
+    ///   既に起動中ならそれを再利用し(`addr()`を返す)、なければ
+    ///   `banto_collect::simulation::start(banto_collect::Protocol::Slmp)`で
+    ///   新規に起動して登録する。
+    /// - `conn.simulation == false` の場合: `conn.id`用のシミュレータが
+    ///   まだ追跡されていれば取り除いて停止する(もう不要なので)。
+    ///
+    /// いずれの場合も、有効な宛先を`crates/banto-collect/src/collector.rs`の
+    /// `plan_for_task`が使うのと同じ規約
+    /// (`cfg.host = addr.ip().to_string(); cfg.port = addr.port();`、ここでは
+    /// `PlcConnection::port`が`i64`であることに合わせてキャストする)で
+    /// 計算し、`last_target`に記録されている直前の値(`conn.id`が未記録なら
+    /// `None` = 常に「変わった」扱い)と比較して`changed`を求め、
+    /// `last_target`をこの新しい値で更新してから`(host, port, changed)`を
+    /// 返す。
+    ///
+    /// ## `changed`が重要な理由(ここが本体)
+    ///
+    /// `banto_broker::SessionDirectory::ensure_connection`
+    /// (`crates/banto-broker/src/lib.rs`、545行目付近)は接続 id だけで
+    /// 既存セッションを再利用する実装になっている
+    /// (`if let Some(handle) = handles.get(&conn.id) { return Ok(handle.clone()); }`) -
+    /// 既にその id のセッションが生きていれば、host/port が変わっていても
+    /// 再ダイヤルも検知もしない。したがって呼び出し側
+    /// (`CollectorManager::sync_slmp_sessions`)は、`resolve`が
+    /// `changed == true`を返すたびに、`ensure_connection`を呼ぶ*前*に必ず
+    /// [`HubSessions::remove`]`(conn.id)`を呼ばなければならない - そうしな
+    /// ければ`ensure_connection`は同じ id の古いセッション(シミュレーション
+    /// を切ったあとの実ホスト、あるいは前回のシミュレータインスタンスの
+    /// アドレスなど)へ黙って接続し続けてしまう。
+    ///
+    /// **これだけでは実は不十分**(`crate::hub`のモジュール doc「SLMP 接続
+    /// 単位のシミュレーションモード」節参照、自前の E2E テストで発覚): broker
+    /// セッションを`HubSessions::remove`+`ensure_connection`で入れ替えても、
+    /// 既に動いている`banto_collect`側の収集タスクはその変化に気づかない
+    /// (タスクが起動時に捕まえた`ClientFactory`はタスクの生存期間を通じて
+    /// 固定 - `crate::hub::CollectorManager`は追加で
+    /// `banto_collect::CollectorConfig::set_broker_dial_target`を呼び、
+    /// `Collector::apply_config`がこの接続を「replaced」に分類してタスクごと
+    /// 再起動するよう仕向けている。詳細は`set_broker_dial_target`自身の doc
+    /// comment、および`crate::hub`のモジュール doc参照)。
+    ///
+    /// この仕組みはシミュレーションに限らない副次効果を持つ: 従来、同じ
+    /// 接続行の host/port を実際に編集しても(接続 id は変わらないので)
+    /// broker セッションは古いアドレスへ接続したまま再ダイヤルされない、
+    /// という既存の潜在的な不具合があった - 「直前のダイヤル先」を接続 id
+    /// ごとに記録・比較するこの仕組みは、その不具合も副次的に(正しく)
+    /// 修正する。これは回帰リスクではない:
+    /// `apps/banto-hub/core/tests/integration.rs`には「同じ接続の別グループ
+    /// へのタグ追加のような無関係な編集ではセッションを再生成しない」ことを
+    /// 保証するテストが既にあり、ダイヤル先が実際に変わっていない限り
+    /// `changed`は`false`のままであることを、この T9-2 のテスト
+    /// (`apps/banto-hub/core/tests/t9_simulation.rs`)でも同様に確認する。
+    pub async fn resolve(&self, conn: &PlcConnection) -> (String, i64, bool) {
+        let mut simulators = self.simulators.lock().await;
+        let target = if conn.simulation {
+            let addr = match simulators.get(&conn.id) {
+                Some(handle) => handle.addr(),
+                None => {
+                    let handle =
+                        banto_collect::simulation::start(banto_collect::Protocol::Slmp).await;
+                    let addr = handle.addr();
+                    simulators.insert(conn.id, handle);
+                    addr
+                }
+            };
+            (addr.ip().to_string(), addr.port() as i64)
+        } else {
+            if let Some(handle) = simulators.remove(&conn.id) {
+                handle.stop().await;
+            }
+            (conn.host.clone(), conn.port)
+        };
+        drop(simulators);
+
+        let mut last_target = self.last_target.lock().await;
+        let changed = last_target.get(&conn.id) != Some(&target);
+        last_target.insert(conn.id, target.clone());
+        (target.0, target.1, changed)
+    }
+
+    /// `connection_id`用に追跡しているシミュレータ(あれば)を停止・忘却し、
+    /// `last_target`のエントリも忘れる。有効な SLMP 集合から外れた接続
+    /// (削除・無効化・プロトコル変更)の掃除ステップから呼ばれる -
+    /// [`HubSessions::remove`]と同じタイミング保証: **対応する収集タスクが
+    /// 既に停止した後にのみ**呼び出すこと。
+    pub async fn remove(&self, connection_id: i64) {
+        if let Some(handle) = self.simulators.lock().await.remove(&connection_id) {
+            handle.stop().await;
+        }
+        self.last_target.lock().await.remove(&connection_id);
+    }
+
+    /// 追跡中の全シミュレータを停止する。`bin/banto_hub`のシャットダウン
+    /// シーケンスから一度だけ呼ばれる - [`HubSessions::shutdown`]より
+    /// *後*に呼ぶこと(シミュレータは、それをダイヤルする broker セッション
+    /// より長生きしなければならない)。
+    pub async fn shutdown(&self) {
+        let mut simulators = self.simulators.lock().await;
+        for (_, handle) in simulators.drain() {
+            handle.stop().await;
+        }
+    }
+}
+
+impl Default for SlmpSimRegistry {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

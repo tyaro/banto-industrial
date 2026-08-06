@@ -55,8 +55,15 @@ fn tag_key(id: i64) -> String {
 /// [`Protocol::ModbusTcp`], `Address::parse_slmp` (MELSEC device codes, e.g.
 /// `D100`) for [`Protocol::Slmp`] (I8, 2026-08-05: `banto-plc`'s SLMP client
 /// wired into collection).
+///
+/// T9-2 (apps/banto-hub/core's broker-routed SLMP path): also `pub` (not
+/// `pub(crate)`) because `banto_hub_core::broker_glue::SlmpSimRegistry` needs
+/// to pass `Protocol::Slmp` to `crate::simulation::start` when it starts an
+/// in-process SLMP simulator ahead of establishing a broker session (see
+/// `crate::simulation`'s module doc, "SLMP + banto-hub の broker 経路
+/// について").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Protocol {
+pub enum Protocol {
     ModbusTcp,
     Slmp,
 }
@@ -212,6 +219,87 @@ impl CollectorConfig {
             .flat_map(|c| c.groups.iter())
             .map(|g| g.tags.len())
             .sum()
+    }
+
+    /// T9-2 (docs/ux-plan.md §1 / apps/banto-hub/core/src/broker_glue.rs's
+    /// "T9-1/T9-2 note", option (a)): force `ConnectionPlan::simulation =
+    /// false` for every connection whose key is in `connection_keys` -
+    /// banto-hub's `CollectorManager` calls this after `build_config` to
+    /// stop `Collector` from starting a second, unused in-process simulator
+    /// for a broker-managed SLMP connection whose dial address
+    /// `CollectorManager`'s own `SlmpSimRegistry` has already substituted
+    /// before the broker session was established (`Collector`'s own
+    /// simulator substitution happens too late in that path - see
+    /// `crate::simulation`'s module doc). A key not present in
+    /// `self.connections` is silently ignored (e.g. a connection with zero
+    /// collectible groups was already dropped by `build_config`).
+    pub fn suppress_simulation_for(&mut self, connection_keys: &std::collections::HashSet<String>) {
+        for conn in &mut self.connections {
+            if connection_keys.contains(&conn.key) {
+                conn.simulation = false;
+            }
+        }
+    }
+
+    /// T9-2 (found necessary by this crate's own E2E coverage of the T9-2
+    /// simulation-toggle path, `apps/banto-hub/core/tests/t9_simulation.rs`):
+    /// overwrite the `host`/`port` of the SLMP connection plan keyed by
+    /// `key` (no-op if `key` is absent, or present but not an SLMP plan).
+    ///
+    /// This is purely a *diffing* signal for [`crate::Collector::apply_config`],
+    /// not a real dial instruction - a broker-routed SLMP connection is never
+    /// actually dialed from this `SlmpConfig` (its `banto_collect::PlcClient`
+    /// is always the injected `BrokerReadClient`, wrapping a
+    /// `banto_broker::ReadOnlyHandle` banto-hub already resolved - see
+    /// `crate::task::ClientFactory`/`apps/banto-hub/core/src/broker_glue.rs`'s
+    /// `hub_client_factory`). But `apply_config`'s diff is *only*
+    /// `ConnectionPlan == ConnectionPlan` (see that struct's own `PartialEq`
+    /// doc comment) - a connection whose plan compares equal to its previous
+    /// one is classified "unchanged" and its already-running task is left
+    /// completely untouched, **including the `ClientFactory` closure it
+    /// captured at spawn time** (`crate::task::run_connection`'s `ctx.factory`
+    /// is fixed for the task's whole lifetime; a factory rebuilt on a later
+    /// rebuild is simply never seen by an "unchanged" task).
+    ///
+    /// For a broker-routed SLMP connection, `ConnectionPlan::simulation` is
+    /// unconditionally forced `false` by [`Self::suppress_simulation_for`]
+    /// (both before and after any simulation toggle), and this plan's
+    /// `ProtocolConfig::Slmp` `host`/`port` otherwise mirror the registry row
+    /// verbatim (`crate::config::slmp_config_for`) - neither field reflects
+    /// the *actual resolved dial target* a broker-routed connection uses,
+    /// which lives entirely outside this plan (`apps/banto-hub/core/src/broker_glue.rs`'s
+    /// `SlmpSimRegistry`). So toggling `simulation` on/off (or editing the
+    /// connection's real host/port while it stays broker-routed) can leave
+    /// this plan comparing byte-for-byte equal across rebuilds even though
+    /// the broker session actually moved underneath it - "unchanged" would
+    /// then leave the running task's `ClientFactory` wired to a
+    /// `ReadOnlyHandle` for a broker session `HubSessions::remove` +
+    /// `ensure_connection` has already superseded, silently reading a stale
+    /// or dead session forever.
+    ///
+    /// banto-hub's `CollectorManager` calls this with the SAME resolved
+    /// `(host, port)` `SlmpSimRegistry::resolve` just computed for every
+    /// broker-routed SLMP connection (regardless of whether `resolve`
+    /// reported `changed` - applying it unconditionally is harmless: for an
+    /// unchanged target the value written back is identical to what was
+    /// already there, so the plan still compares equal and the connection
+    /// stays correctly classified "unchanged"). When the resolved target DID
+    /// change, this now makes the plan compare unequal, so `apply_config`
+    /// classifies the connection "replaced" - stopping the stale task and
+    /// spawning a fresh one with the freshly-built `ClientFactory`
+    /// (`CollectorManager::rebuild` builds it from this same rebuild's
+    /// `slmp_handles`, i.e. the NEW broker session) - exactly the "this
+    /// connection's task gets stopped and respawned" path `SlmpSimRegistry::resolve`'s
+    /// own doc comment relies on to make the swap actually observable.
+    pub fn set_broker_dial_target(&mut self, key: &str, host: String, port: i64) {
+        if let Some(conn) = self.connections.iter_mut().find(|c| c.key == key) {
+            if let ProtocolConfig::Slmp(cfg) = &mut conn.config {
+                cfg.host = host;
+                if let Ok(port) = u16::try_from(port) {
+                    cfg.port = port;
+                }
+            }
+        }
     }
 }
 
@@ -1043,5 +1131,132 @@ mod tests {
         let a = build_config(&pool).await.unwrap();
         let b = build_config(&pool).await.unwrap();
         assert_eq!(a.store_config, b.store_config);
+    }
+
+    /// T9-2: `suppress_simulation_for` forces `simulation = false` for every
+    /// connection whose key is in the given set, and leaves every other
+    /// connection's `simulation` flag untouched - the mechanism
+    /// `CollectorManager::rebuild` (apps/banto-hub/core) uses to prevent
+    /// `Collector` from starting a redundant simulator for a broker-routed
+    /// SLMP connection that `SlmpSimRegistry` already simulates itself.
+    #[tokio::test]
+    async fn suppress_simulation_for_forces_flag_off_only_for_matching_keys() {
+        let pool = registry().await;
+        let plc_svc = PlcConnectionService::new(pool.clone());
+
+        let mut sim_input = conn_input("Suppressed", 502);
+        sim_input.simulation = true;
+        let suppressed_conn = plc_svc.create(sim_input).await.unwrap();
+        let suppressed_group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", suppressed_conn.id, 1_000))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input("T1", suppressed_group.id, "40001"))
+            .await
+            .unwrap();
+
+        let mut other_input = conn_input("StillSimulated", 503);
+        other_input.simulation = true;
+        let other_conn = plc_svc.create(other_input).await.unwrap();
+        let other_group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G2", other_conn.id, 1_000))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input("T2", other_group.id, "40001"))
+            .await
+            .unwrap();
+
+        let mut config = build_config(&pool).await.unwrap();
+        let mut keys = std::collections::HashSet::new();
+        keys.insert(format!("conn:{}", suppressed_conn.id));
+        // A key with no matching connection must be silently ignored.
+        keys.insert("conn:999999".to_string());
+        config.suppress_simulation_for(&keys);
+
+        let suppressed_plan = config
+            .connections
+            .iter()
+            .find(|c| c.key == format!("conn:{}", suppressed_conn.id))
+            .unwrap();
+        assert!(
+            !suppressed_plan.simulation,
+            "connection in the set must have simulation forced off"
+        );
+
+        let other_plan = config
+            .connections
+            .iter()
+            .find(|c| c.key == format!("conn:{}", other_conn.id))
+            .unwrap();
+        assert!(
+            other_plan.simulation,
+            "connection not in the set must be untouched"
+        );
+    }
+
+    /// T9-2: `set_broker_dial_target` overwrites an SLMP plan's `host`/`port`
+    /// (used purely so `Collector::apply_config`'s `PartialEq` diff notices a
+    /// resolved-target change and respawns the connection's task with a
+    /// fresh `ClientFactory` - see the method's own doc comment for the full
+    /// derivation), leaves a non-matching key and a non-SLMP plan untouched,
+    /// and is a silent no-op for an absent key.
+    #[tokio::test]
+    async fn set_broker_dial_target_overwrites_only_the_matching_slmp_plan() {
+        let pool = registry().await;
+        let plc_svc = PlcConnectionService::new(pool.clone());
+
+        let slmp_conn = plc_svc.create(conn_input_slmp("PLC1", 5007)).await.unwrap();
+        let slmp_group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", slmp_conn.id, 1_000))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input("T1", slmp_group.id, "D100"))
+            .await
+            .unwrap();
+
+        let modbus_conn = plc_svc.create(conn_input("PLC2", 502)).await.unwrap();
+        let modbus_group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G2", modbus_conn.id, 1_000))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input("T2", modbus_group.id, "40001"))
+            .await
+            .unwrap();
+
+        let mut config = build_config(&pool).await.unwrap();
+        let slmp_key = format!("conn:{}", slmp_conn.id);
+        let modbus_key = format!("conn:{}", modbus_conn.id);
+
+        config.set_broker_dial_target(&slmp_key, "127.0.0.1".to_string(), 19999);
+        // A non-SLMP plan and an absent key must both be silent no-ops.
+        config.set_broker_dial_target(&modbus_key, "127.0.0.1".to_string(), 19998);
+        config.set_broker_dial_target("conn:999999", "127.0.0.1".to_string(), 1);
+
+        let slmp_plan = config
+            .connections
+            .iter()
+            .find(|c| c.key == slmp_key)
+            .unwrap();
+        match &slmp_plan.config {
+            ProtocolConfig::Slmp(cfg) => assert_eq!(cfg.port, 19999),
+            ProtocolConfig::ModbusTcp(_) => panic!("expected Slmp config"),
+        }
+
+        let modbus_plan = config
+            .connections
+            .iter()
+            .find(|c| c.key == modbus_key)
+            .unwrap();
+        match &modbus_plan.config {
+            ProtocolConfig::ModbusTcp(cfg) => assert_eq!(
+                cfg.port, 502,
+                "a Modbus plan must be untouched by an SLMP-only target overwrite"
+            ),
+            ProtocolConfig::Slmp(_) => panic!("expected ModbusTcp config"),
+        }
     }
 }
