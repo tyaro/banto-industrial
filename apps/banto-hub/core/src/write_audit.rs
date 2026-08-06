@@ -205,14 +205,22 @@ impl WriteAuditService {
     }
 
     /// [`Self::insert_pending`] した行の `result` を確定させる
-    /// (`broker.write` 成功なら `Ok`、それ以外は `Failed`)。
+    /// (`broker.write` 成功なら `Ok`、それ以外は `Failed`)。`detail` は
+    /// 失敗理由の説明文(T8-2、docs/tag-server-design.md §6.1、
+    /// 2026-08-06: 例えば T8 の RMW 確認読み不一致
+    /// `PlcWriteError::BitWriteVerificationFailed` の
+    /// 「書き戻し競合の可能性があります」)- `crate::write_path::execute_write`
+    /// は成功時に `None`、失敗時に `WriteRejection::detail()` をそのまま渡す
+    /// (REST/gRPC の応答本文と同じ文言を監査行にも残す)。
     pub async fn set_result(
         &self,
         audit_id: i64,
         result: WriteAuditResult,
+        detail: Option<&str>,
     ) -> Result<(), BantoError> {
-        sqlx::query("UPDATE hub_write_audit SET result = ? WHERE id = ?")
+        sqlx::query("UPDATE hub_write_audit SET result = ?, detail = ? WHERE id = ?")
             .bind(result.as_str())
+            .bind(detail)
             .bind(audit_id)
             .execute(&self.pool)
             .await
@@ -312,13 +320,41 @@ mod tests {
             .unwrap();
         assert_eq!(before, "failed", "pending row is provisionally failed");
 
-        svc.set_result(id, WriteAuditResult::Ok).await.unwrap();
+        svc.set_result(id, WriteAuditResult::Ok, None)
+            .await
+            .unwrap();
         let after: String = sqlx::query_scalar("SELECT result FROM hub_write_audit WHERE id = ?")
             .bind(id)
             .fetch_one(&svc.pool)
             .await
             .unwrap();
         assert_eq!(after, "ok");
+    }
+
+    /// T8-2 (docs/tag-server-design.md §6.1, 2026-08-06): `set_result` also
+    /// records a failure detail, so a T8 RMW confirmation-read mismatch's
+    /// 「書き戻し競合の可能性があります」ends up on the confirmed audit row,
+    /// not just the pending one this test's sibling
+    /// (`pending_write_left_failed_if_never_confirmed`) leaves blank.
+    #[tokio::test]
+    async fn set_result_records_a_failure_detail() {
+        let svc = service().await;
+        let id = svc.insert_pending(&sample_row()).await.unwrap();
+
+        svc.set_result(
+            id,
+            WriteAuditResult::Failed,
+            Some("ビット書き込みの確認読みで不一致を検出しました。書き戻し競合の可能性があります"),
+        )
+        .await
+        .unwrap();
+
+        let result = svc.list(ListParams::default()).await.unwrap();
+        assert_eq!(result.rows[0].result, "failed");
+        assert_eq!(
+            result.rows[0].detail.as_deref(),
+            Some("ビット書き込みの確認読みで不一致を検出しました。書き戻し競合の可能性があります")
+        );
     }
 
     #[tokio::test]

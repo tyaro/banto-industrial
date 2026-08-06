@@ -789,6 +789,129 @@ async fn gate_mismatched_write_scope_is_403() {
     sim.stop();
 }
 
+/// 監査レビュー指摘(2026-08-06)への対応: gate 7 は data_type と
+/// リクエスト値の型の対称性を検査する - 暗黙の型変換はしない
+/// (`crate::write_path`のモジュール doc comment 参照)。bit タグへ数値を
+/// 書く要求(旧実装は `raw != 0.0` で暗黙に bool 化していた)は 422。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gate_numeric_value_to_a_bit_tag_is_422() {
+    let app = test_app("gate-num-to-bit").await;
+    let sim = Simulator::start().await;
+    let (_tag_id, external_name) = make_tag(
+        &app,
+        "line1",
+        "slmp",
+        sim.addr.port(),
+        "flag",
+        "M50",
+        "bit",
+        true,
+        true,
+    )
+    .await;
+    app.write_control.enable();
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:line1.fast.flag"],
+    )
+    .await;
+
+    let (status, body) = v1_post(
+        &app.router,
+        &format!("/api/v1/values/{external_name}"),
+        &key,
+        json!({ "v": 1 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert_eq!(body["error"], "unsupported_value_type");
+    assert_eq!(body["detail"], "bit タグには true/false を指定してください");
+    sim.stop();
+}
+
+/// 上のペア: 数値タグへ真偽値を書く要求も同様に 422(型の対称性)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gate_bool_value_to_a_numeric_tag_is_422() {
+    let app = test_app("gate-bool-to-num").await;
+    let sim = Simulator::start().await;
+    let (_tag_id, external_name) = make_tag(
+        &app,
+        "line1",
+        "slmp",
+        sim.addr.port(),
+        "temp01",
+        "D100",
+        "u16",
+        true,
+        true,
+    )
+    .await;
+    app.write_control.enable();
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:line1.fast.temp01"],
+    )
+    .await;
+
+    let (status, body) = v1_post(
+        &app.router,
+        &format!("/api/v1/values/{external_name}"),
+        &key,
+        json!({ "v": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert_eq!(body["error"], "unsupported_value_type");
+    assert_eq!(
+        body["detail"],
+        "数値タグに真偽値は指定できません。数値を指定してください"
+    );
+    sim.stop();
+}
+
+/// bit タグへ真偽値を書く要求は引き続き成功する(型が一致する正常系)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gate_bool_value_to_a_bit_tag_is_ok() {
+    let app = test_app("gate-bool-to-bit").await;
+    let sim = Simulator::start().await;
+    let (_tag_id, external_name) = make_tag(
+        &app,
+        "line1",
+        "slmp",
+        sim.addr.port(),
+        "flag",
+        "M50",
+        "bit",
+        true,
+        true,
+    )
+    .await;
+    app.write_control.enable();
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:line1.fast.flag"],
+    )
+    .await;
+
+    let (status, body) = v1_post(
+        &app.router,
+        &format!("/api/v1/values/{external_name}"),
+        &key,
+        json!({ "v": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"], "ok");
+    assert!(sim.get_bit(SlmpDevice::M, 50), "the bit should be set");
+    sim.stop();
+}
+
 // ---------------------------------------------------------------------------
 // 3. レート制限
 // ---------------------------------------------------------------------------

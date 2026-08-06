@@ -385,7 +385,12 @@
 		{#if form.tagKind === 'plc'}
 			<label class="field">
 				アドレス
-				<input type="text" bind:value={form.address} placeholder="D100" />
+				<input type="text" bind:value={form.address} placeholder="D100（ビット: D100.5）" />
+				<span class="hint"
+					>ワードデバイスの特定ビットを読み書きするときは「D100.5」のように「.」+ビット位置（0〜15、Modbus
+					は「40001.3」）を付けます。「D100.5」でワードの5ビット目。ビット指定アドレスは data_type =
+					bit のタグでのみ使えます。</span
+				>
 				{#if errors.address}<span class="err">{errors.address}</span>{/if}
 			</label>
 		{/if}

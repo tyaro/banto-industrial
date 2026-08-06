@@ -448,6 +448,25 @@ fn slmp_config_for(conn: &PlcConnection) -> Result<SlmpConfig, CollectError> {
 /// register address - is *not* rejected here: `banto-plc`'s planner turns
 /// that into a per-tick `ReadResult::Bad`, which the loop already records as
 /// Bad quality.)
+///
+/// T8-2 (docs/tag-server-design.md §6.1, 2026-08-06): a T8 bit-in-word
+/// address (`"D100.5"` / `"40001.3"`, parsed into `Address::{Slmp,
+/// ModbusRef}`'s `bit: Some(_)`) only ever decodes/encodes to a single
+/// `bool` (`decode_register_bit`/`banto-plc-write`'s RMW both work in terms
+/// of one bit), so it is meaningless on any tag whose `data_type` is not
+/// `"bit"` - a `data_type = "i16"` tag at `"D100.5"` would otherwise silently
+/// collect nothing but a truncated 1-bit reading of the word. This is
+/// rejected here as a `CollectError::Config`, not left for `banto-plc`'s
+/// planner to fail per-tick, so the mistake surfaces at config-build time
+/// exactly like every other address/data-type mismatch this function already
+/// catches (a malformed address, an unknown data type). `banto-tags` (I1)
+/// deliberately does not validate this at registration time (address format
+/// is I2/I3b's concern, per this function's own doc comment above) - this is
+/// the one place it is caught, and `CollectorManager::rebuild`
+/// (`apps/banto-hub/core/src/hub.rs`) already treats any `CollectError::Config`
+/// from `build_config` as an all-or-nothing failure that keeps the previous
+/// catalog/`Collector` running (`last_config_error`), so a tag registered
+/// this way simply never reaches the live catalog until fixed.
 fn build_request(tag: &Tag, protocol: Protocol) -> Result<ReadRequest, CollectError> {
     let address = match protocol {
         Protocol::ModbusTcp => Address::parse(&tag.address),
@@ -465,6 +484,19 @@ fn build_request(tag: &Tag, protocol: Protocol) -> Result<ReadRequest, CollectEr
             tag.name, tag.data_type
         ))
     })?;
+
+    let is_bit_qualified = match address {
+        Address::ModbusRef { bit, .. } => bit.is_some(),
+        Address::Slmp { bit, .. } => bit.is_some(),
+    };
+    if is_bit_qualified && data_type != DataType::Bit {
+        return Err(CollectError::Config(format!(
+            "タグ {} のアドレス {} はビット指定アドレスです。ビット指定アドレスは \
+             data_type=bit のタグでのみ使えます（現在のデータ型: {}）",
+            tag.name, tag.address, tag.data_type
+        )));
+    }
+
     Ok(ReadRequest { address, data_type })
 }
 
@@ -720,6 +752,77 @@ mod tests {
             .unwrap();
         let err = build_config(&pool).await.unwrap_err();
         assert!(matches!(err, CollectError::Config(_)));
+    }
+
+    /// T8-2 (docs/tag-server-design.md §6.1, 2026-08-06): a bit-in-word
+    /// address (`"40001.3"`) on a tag whose `data_type` is not `"bit"` is a
+    /// config error, not silently accepted as a truncated numeric reading.
+    #[tokio::test]
+    async fn a_bit_qualified_modbus_address_on_a_non_bit_tag_is_a_config_error() {
+        let pool = registry().await;
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(conn_input("PLC1", 502))
+            .await
+            .unwrap();
+        let group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", conn.id, 1_000))
+            .await
+            .unwrap();
+        // tag_input defaults data_type to "i16" - "40001.3" is a bit-in-word
+        // address, which is only meaningful for a "bit" tag.
+        TagService::new(pool.clone())
+            .create(tag_input("Bad", group.id, "40001.3"))
+            .await
+            .unwrap();
+        let err = build_config(&pool).await.unwrap_err();
+        assert!(matches!(err, CollectError::Config(_)));
+    }
+
+    /// The SLMP-notation counterpart of the above (`"D100.5"`).
+    #[tokio::test]
+    async fn a_bit_qualified_slmp_address_on_a_non_bit_tag_is_a_config_error() {
+        let pool = registry().await;
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(conn_input_slmp("PLC1", 5007))
+            .await
+            .unwrap();
+        let group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", conn.id, 1_000))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input("Bad", group.id, "D100.5"))
+            .await
+            .unwrap();
+        let err = build_config(&pool).await.unwrap_err();
+        assert!(matches!(err, CollectError::Config(_)));
+    }
+
+    /// A bit-in-word address paired with `data_type = "bit"` builds cleanly -
+    /// the config error above is specific to the data-type mismatch, not to
+    /// bit-in-word notation itself.
+    #[tokio::test]
+    async fn a_bit_qualified_address_with_a_bit_data_type_builds() {
+        let pool = registry().await;
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(conn_input_slmp("PLC1", 5007))
+            .await
+            .unwrap();
+        let group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", conn.id, 1_000))
+            .await
+            .unwrap();
+        let mut bit_tag = tag_input("Ok", group.id, "D100.5");
+        bit_tag.data_type = "bit".to_string();
+        TagService::new(pool.clone()).create(bit_tag).await.unwrap();
+        let config = build_config(&pool)
+            .await
+            .expect("a bit-in-word address on a bit tag must build");
+        assert_eq!(config.tag_count(), 1);
+        assert_eq!(
+            config.connections[0].groups[0].requests[0].data_type,
+            DataType::Bit
+        );
     }
 
     fn conn_input_slmp(name: &str, port: i64) -> PlcConnectionInput {

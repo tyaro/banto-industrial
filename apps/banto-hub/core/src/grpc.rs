@@ -30,7 +30,9 @@
 //!   に**完全に**委譲する(REST の `POST /api/v1/values/{tag}` と1つの
 //!   実装を共有 - 実装指示「二重実装は絶対に不可」)。このモジュールが
 //!   独自に持つのは (a) 認証(後述)、(b) `write:{tag}` スコープの完全一致
-//!   検査、(c) proto の `oneof num|bool` から `f64` への正規化、
+//!   検査、(c) proto の `oneof num|bool` から
+//!   `crate::write_path::RequestedValue` への正規化(型は潰さない - gate 7
+//!   が data_type との対称性を検査するため)、
 //!   (d) [`write_rejection_status`] による `tonic::Status` への変換、の4つ
 //!   だけ。
 //!
@@ -609,9 +611,14 @@ impl TagServiceTrait for GrpcService {
             return Err(Status::permission_denied("missing_write_scope"));
         }
 
+        // `oneof num|bool` を型情報を保ったまま `RequestedValue` へ - REST の
+        // `parse_requested_value`(`crate::rest`)と同じく、ここで `f64` へ
+        // 潰さない(2026-08-06 変更)。gate 7(`write_path::execute_write`)が
+        // data_type との対称性(bit タグには bool のみ、数値タグには数値の
+        // み)を検査する。
         let requested = match req.value {
-            Some(write_value_request::Value::Num(n)) => Some(n),
-            Some(write_value_request::Value::Flag(b)) => Some(if b { 1.0 } else { 0.0 }),
+            Some(write_value_request::Value::Num(n)) => Some(write_path::RequestedValue::Num(n)),
+            Some(write_value_request::Value::Flag(b)) => Some(write_path::RequestedValue::Bool(b)),
             None => None,
         };
 
