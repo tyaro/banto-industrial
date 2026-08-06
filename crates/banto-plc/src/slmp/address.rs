@@ -286,7 +286,11 @@ impl std::fmt::Display for SlmpDevice {
     }
 }
 
-/// Parse MELSEC device notation into `(device, number)`.
+/// Largest bit position accepted by the `.N` bit-in-word suffix (§6.1) -
+/// MELSEC words are 16 bits, positions `0..=15`.
+pub const MAX_BIT_POSITION: u8 = 15;
+
+/// Parse MELSEC device notation into `(device, number, bit)`.
 ///
 /// Accepts leading/trailing whitespace (trimmed, same as
 /// [`crate::address::Address::parse`] and for the same reason - `banto-tags`
@@ -299,13 +303,41 @@ impl std::fmt::Display for SlmpDevice {
 ///   [`SlmpDevice::radix`] - so `"X1A"` is `X` number 26 while `"M1A"` is
 ///   rejected outright rather than quietly read as `M1`
 /// - a number no greater than [`MAX_DEVICE_NUMBER`]
+/// - optionally, a bit-in-word suffix: `.` followed by 1-2 **decimal**
+///   digits naming a bit position `0..=15` (T8, docs/tag-server-design.md
+///   §6.1) - `"D100.5"` is word device `D100`, bit 5
 ///
-/// Deliberately *not* accepted in v1, all for the same reason the Modbus
-/// parser has no equivalent: bit-within-word notation (`"D100.5"`), digit
-/// designation (`"K4M0"`), and module-qualified notation (`"U3E0\\G100"`).
+/// ## Why the bit suffix is decimal-only, even at a hex-numbered device
+///
+/// [`SlmpDevice::radix`] governs how the *device number* is written (`X1A` is
+/// hex), but the bit-in-word suffix is a separate axis: MELSEC engineering
+/// tools always write the bit-within-word position in decimal, and `docs/
+/// tag-server-design.md` §6.1 records the reasoning for rejecting a hex
+/// spelling here even though it would be unambiguous: `"D100.A"` reads as
+/// "device D, number 100, hex digit A" to nobody's actual MELSEC tooling, and
+/// allowing it would invite exactly that misreading next to Modbus's
+/// register+bit notation (`"40001.3"`), which is decimal for the same
+/// human-convention reason. So the suffix is validated with
+/// [`char::is_ascii_digit`], never against `device.radix()`.
+///
+/// ## Why only word devices accept the suffix
+///
+/// A bit device (`M`/`X`/`Y`/...) already *is* one bit - `"M50.0"` would be a
+/// bit position on something that has no further bits to select, so it is
+/// rejected exactly like an unknown mnemonic rather than silently accepted as
+/// a redundant `.0`. This is what routes a bit-typed tag to the right read
+/// strategy one layer up ([`super::planning`]): a `bit` tag with no suffix
+/// addresses a bit device via the existing bit-unit bulk read, unchanged; a
+/// `bit` tag *with* a suffix addresses a word device and folds into that
+/// word's ordinary word-unit bulk read (decoded down to one bit) - see this
+/// module's sibling `super::planning` module doc for the "why fold into the
+/// existing word read" reasoning.
+///
+/// Deliberately *not* accepted in v1, for the same reason as before T8: digit
+/// designation (`"K4M0"`) and module-qualified notation (`"U3E0\\G100"`).
 /// Each is a real MELSEC form, and each needs a matching read strategy in
 /// [`super::planning`] before the parser should start promising it works.
-pub(crate) fn parse(raw: &str) -> Result<(SlmpDevice, u32), PlcError> {
+pub(crate) fn parse(raw: &str) -> Result<(SlmpDevice, u32, Option<u8>), PlcError> {
     let trimmed = raw.trim();
     let invalid = || PlcError::InvalidAddress(raw.to_string());
 
@@ -314,13 +346,37 @@ pub(crate) fn parse(raw: &str) -> Result<(SlmpDevice, u32), PlcError> {
     // non-ASCII address fails the digit check further down.
     let upper = trimmed.to_ascii_uppercase();
 
+    // Split off the optional bit-in-word suffix first: `split_once` finds the
+    // *first* '.', so a malformed multi-dot string (`"D100.3.4"`) leaves a
+    // non-digit remainder that the digit check below rejects, rather than
+    // being silently reinterpreted.
+    let (base, bit) = match upper.split_once('.') {
+        Some((base, bit_text)) => {
+            if bit_text.is_empty()
+                || bit_text.len() > 2
+                || !bit_text.chars().all(|c| c.is_ascii_digit())
+            {
+                return Err(invalid());
+            }
+            // Safe: 1-2 ASCII digits parse as a `u8` with room to spare
+            // (max 99), so this can only fail to construct a value that the
+            // MAX_BIT_POSITION check immediately below rejects anyway.
+            let bit: u8 = bit_text.parse().map_err(|_| invalid())?;
+            if bit > MAX_BIT_POSITION {
+                return Err(invalid());
+            }
+            (base, Some(bit))
+        }
+        None => (upper.as_str(), None),
+    };
+
     let device = DEVICE_TABLE
         .iter()
         .copied()
-        .find(|d| upper.starts_with(d.mnemonic()))
+        .find(|d| base.starts_with(d.mnemonic()))
         .ok_or_else(invalid)?;
 
-    let digits = &upper[device.mnemonic().len()..];
+    let digits = &base[device.mnemonic().len()..];
     if digits.is_empty() {
         return Err(invalid());
     }
@@ -337,23 +393,47 @@ pub(crate) fn parse(raw: &str) -> Result<(SlmpDevice, u32), PlcError> {
         return Err(invalid());
     }
 
-    Ok((device, number))
+    // A bit suffix only makes sense on a word device (see this function's
+    // doc comment) - a bit device is rejected here rather than by a separate
+    // caller-side check, so "M50.0 is nonsense" is a parse error at the same
+    // layer as every other notation mistake.
+    if bit.is_some() && device.access() != SlmpAccess::Word {
+        return Err(invalid());
+    }
+
+    Ok((device, number, bit))
 }
 
-/// Render `(device, number)` back into the notation [`parse`] accepts. Used
-/// by error messages (and by [`crate::address::Address`]'s
+/// Render `(device, number, bit)` back into the notation [`parse`] accepts.
+/// Used by error messages (and by [`crate::address::Address`]'s
 /// [`Display`](std::fmt::Display)) so a rejected tag is reported in the same
 /// spelling the operator configured, not as a debug dump.
-pub(crate) fn format(device: SlmpDevice, number: u32) -> String {
-    match device.radix() {
+pub(crate) fn format(device: SlmpDevice, number: u32, bit: Option<u8>) -> String {
+    let base = match device.radix() {
         16 => format!("{device}{number:X}"),
         _ => format!("{device}{number}"),
+    };
+    match bit {
+        Some(b) => format!("{base}.{b}"),
+        None => base,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parse and assert no bit suffix was present, returning the pre-T8
+    /// `(device, number)` shape - keeps every pre-existing assertion below
+    /// exactly as readable as it was before `parse` grew a third return
+    /// value, while still proving that a plain (unqualified) address is
+    /// unaffected by T8's bit notation.
+    fn p(raw: &str) -> (SlmpDevice, u32) {
+        let (device, number, bit) =
+            parse(raw).unwrap_or_else(|e| panic!("{raw} should parse: {e}"));
+        assert_eq!(bit, None, "{raw} should not carry a bit suffix");
+        (device, number)
+    }
 
     /// The whole parser rests on [`DEVICE_TABLE`]'s ordering (see its doc
     /// comment); this proves the ordering rather than trusting the literal.
@@ -395,8 +475,7 @@ mod tests {
     fn every_device_mnemonic_round_trips_through_parse() {
         for device in DEVICE_TABLE {
             let text = format!("{}0", device.mnemonic());
-            let (parsed, number) =
-                parse(&text).unwrap_or_else(|e| panic!("{text} should parse: {e}"));
+            let (parsed, number) = p(&text);
             assert_eq!(parsed, *device, "{text} parsed as the wrong device");
             assert_eq!(number, 0);
         }
@@ -404,79 +483,79 @@ mod tests {
 
     #[test]
     fn parses_the_common_word_devices() {
-        assert_eq!(parse("D100").unwrap(), (SlmpDevice::D, 100));
-        assert_eq!(parse("R1000").unwrap(), (SlmpDevice::R, 1000));
-        assert_eq!(parse("ZR32768").unwrap(), (SlmpDevice::ZR, 32768));
-        assert_eq!(parse("SD0").unwrap(), (SlmpDevice::SD, 0));
+        assert_eq!(p("D100"), (SlmpDevice::D, 100));
+        assert_eq!(p("R1000"), (SlmpDevice::R, 1000));
+        assert_eq!(p("ZR32768"), (SlmpDevice::ZR, 32768));
+        assert_eq!(p("SD0"), (SlmpDevice::SD, 0));
     }
 
     #[test]
     fn parses_the_common_bit_devices() {
-        assert_eq!(parse("M50").unwrap(), (SlmpDevice::M, 50));
-        assert_eq!(parse("SM400").unwrap(), (SlmpDevice::SM, 400));
-        assert_eq!(parse("L0").unwrap(), (SlmpDevice::L, 0));
+        assert_eq!(p("M50"), (SlmpDevice::M, 50));
+        assert_eq!(p("SM400"), (SlmpDevice::SM, 400));
+        assert_eq!(p("L0"), (SlmpDevice::L, 0));
     }
 
     /// The single most consequential rule in this module: the same digits
     /// mean different numbers at a hex device and a decimal device.
     #[test]
     fn hexadecimal_devices_parse_their_number_as_hex() {
-        assert_eq!(parse("X1A").unwrap(), (SlmpDevice::X, 0x1A));
-        assert_eq!(parse("Y20").unwrap(), (SlmpDevice::Y, 0x20));
-        assert_eq!(parse("B3F").unwrap(), (SlmpDevice::B, 0x3F));
-        assert_eq!(parse("W1FF").unwrap(), (SlmpDevice::W, 0x1FF));
-        assert_eq!(parse("SW100").unwrap(), (SlmpDevice::SW, 0x100));
-        assert_eq!(parse("DX10").unwrap(), (SlmpDevice::DX, 0x10));
+        assert_eq!(p("X1A"), (SlmpDevice::X, 0x1A));
+        assert_eq!(p("Y20"), (SlmpDevice::Y, 0x20));
+        assert_eq!(p("B3F"), (SlmpDevice::B, 0x3F));
+        assert_eq!(p("W1FF"), (SlmpDevice::W, 0x1FF));
+        assert_eq!(p("SW100"), (SlmpDevice::SW, 0x100));
+        assert_eq!(p("DX10"), (SlmpDevice::DX, 0x10));
     }
 
     #[test]
     fn decimal_devices_parse_their_number_as_decimal() {
-        assert_eq!(parse("M20").unwrap(), (SlmpDevice::M, 20));
-        assert_eq!(parse("D20").unwrap(), (SlmpDevice::D, 20));
+        assert_eq!(p("M20"), (SlmpDevice::M, 20));
+        assert_eq!(p("D20"), (SlmpDevice::D, 20));
         // Same digits as Y20 above, deliberately - Y20 is 32, M20 is 20.
-        assert_ne!(parse("M20").unwrap().1, parse("Y20").unwrap().1);
+        assert_ne!(p("M20").1, p("Y20").1);
     }
 
     /// Longest-first matching, stated as the cases that would break under
     /// shortest-first matching.
     #[test]
     fn two_character_mnemonics_win_over_their_one_character_prefixes() {
-        assert_eq!(parse("SD100").unwrap().0, SlmpDevice::SD);
-        assert_eq!(parse("SM100").unwrap().0, SlmpDevice::SM);
-        assert_eq!(parse("SS100").unwrap().0, SlmpDevice::SS);
-        assert_eq!(parse("DX100").unwrap().0, SlmpDevice::DX);
-        assert_eq!(parse("DY100").unwrap().0, SlmpDevice::DY);
-        assert_eq!(parse("ZR100").unwrap().0, SlmpDevice::ZR);
-        assert_eq!(parse("CN100").unwrap().0, SlmpDevice::CN);
-        assert_eq!(parse("TN100").unwrap().0, SlmpDevice::TN);
+        assert_eq!(p("SD100").0, SlmpDevice::SD);
+        assert_eq!(p("SM100").0, SlmpDevice::SM);
+        assert_eq!(p("SS100").0, SlmpDevice::SS);
+        assert_eq!(p("DX100").0, SlmpDevice::DX);
+        assert_eq!(p("DY100").0, SlmpDevice::DY);
+        assert_eq!(p("ZR100").0, SlmpDevice::ZR);
+        assert_eq!(p("CN100").0, SlmpDevice::CN);
+        assert_eq!(p("TN100").0, SlmpDevice::TN);
     }
 
     /// ...and the reverse: a one-character device followed by digits that
     /// merely *look* like the tail of a two-character mnemonic.
     #[test]
     fn one_character_mnemonics_still_parse_when_no_longer_match_exists() {
-        assert_eq!(parse("S100").unwrap(), (SlmpDevice::S, 100));
-        assert_eq!(parse("D100").unwrap(), (SlmpDevice::D, 100));
-        assert_eq!(parse("Z9").unwrap(), (SlmpDevice::Z, 9));
+        assert_eq!(p("S100"), (SlmpDevice::S, 100));
+        assert_eq!(p("D100"), (SlmpDevice::D, 100));
+        assert_eq!(p("Z9"), (SlmpDevice::Z, 9));
     }
 
     #[test]
     fn accepts_lowercase_and_mixed_case() {
-        assert_eq!(parse("d100").unwrap(), (SlmpDevice::D, 100));
-        assert_eq!(parse("zr5").unwrap(), (SlmpDevice::ZR, 5));
-        assert_eq!(parse("x1a").unwrap(), (SlmpDevice::X, 0x1A));
-        assert_eq!(parse("Sd7").unwrap(), (SlmpDevice::SD, 7));
+        assert_eq!(p("d100"), (SlmpDevice::D, 100));
+        assert_eq!(p("zr5"), (SlmpDevice::ZR, 5));
+        assert_eq!(p("x1a"), (SlmpDevice::X, 0x1A));
+        assert_eq!(p("Sd7"), (SlmpDevice::SD, 7));
     }
 
     #[test]
     fn trims_surrounding_whitespace() {
-        assert_eq!(parse("  D100  ").unwrap(), (SlmpDevice::D, 100));
+        assert_eq!(p("  D100  "), (SlmpDevice::D, 100));
     }
 
     #[test]
     fn accepts_leading_zeros() {
-        assert_eq!(parse("X0010").unwrap(), (SlmpDevice::X, 0x10));
-        assert_eq!(parse("D0000").unwrap(), (SlmpDevice::D, 0));
+        assert_eq!(p("X0010"), (SlmpDevice::X, 0x10));
+        assert_eq!(p("D0000"), (SlmpDevice::D, 0));
     }
 
     /// A hex digit at a decimal device is a mistake worth surfacing, not a
@@ -512,19 +591,81 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bit_within_word_and_digit_designation_notation() {
-        // v1 restriction, see `parse`'s doc comment.
-        assert!(matches!(parse("D100.5"), Err(PlcError::InvalidAddress(_))));
+    fn rejects_digit_designation_notation() {
+        // Still not accepted in v1, see `parse`'s doc comment.
         assert!(matches!(parse("K4M0"), Err(PlcError::InvalidAddress(_))));
     }
 
     #[test]
     fn rejects_a_number_past_the_three_byte_wire_ceiling() {
         let ok = format!("D{MAX_DEVICE_NUMBER}");
-        assert_eq!(parse(&ok).unwrap(), (SlmpDevice::D, MAX_DEVICE_NUMBER));
+        assert_eq!(p(&ok), (SlmpDevice::D, MAX_DEVICE_NUMBER));
 
         let too_big = format!("D{}", MAX_DEVICE_NUMBER + 1);
         assert!(matches!(parse(&too_big), Err(PlcError::InvalidAddress(_))));
+    }
+
+    // --- T8, docs/tag-server-design.md §6.1: bit-in-word notation ----------
+
+    /// The load-bearing new case: a word device with a decimal bit suffix
+    /// parses to `(device, number, Some(bit))`.
+    #[test]
+    fn parses_bit_in_word_notation_at_a_word_device() {
+        assert_eq!(parse("D100.5").unwrap(), (SlmpDevice::D, 100, Some(5)));
+        assert_eq!(parse("W10.0").unwrap(), (SlmpDevice::W, 0x10, Some(0)));
+        assert_eq!(parse("ZR5.15").unwrap(), (SlmpDevice::ZR, 5, Some(15)));
+    }
+
+    /// §6.1's decision, stated as a test: the bit position is always decimal,
+    /// even at a hex-numbered device like `W`/`X`/`Y` - `.A` is never a valid
+    /// bit position, only `.10`.
+    #[test]
+    fn bit_suffix_is_decimal_only_even_at_a_hex_numbered_device() {
+        assert!(matches!(parse("W10.A"), Err(PlcError::InvalidAddress(_))));
+        assert!(matches!(parse("X0.F"), Err(PlcError::InvalidAddress(_))));
+    }
+
+    /// §6.1: bit devices already address one bit, so a `.N` suffix on one is
+    /// a parse error rather than a redundant no-op.
+    #[test]
+    fn rejects_a_bit_suffix_on_a_bit_device() {
+        for text in ["M50.0", "X1A.3", "Y0.15", "TS0.0"] {
+            assert!(
+                matches!(parse(text), Err(PlcError::InvalidAddress(_))),
+                "{text} should be rejected: bit devices are already bit-granular"
+            );
+        }
+    }
+
+    /// Bit position `0..=15` is the whole legal range (a MELSEC word is 16
+    /// bits); `16` and above must be rejected, not wrapped or truncated.
+    #[test]
+    fn rejects_a_bit_position_past_fifteen() {
+        assert_eq!(parse("D0.15").unwrap().2, Some(15));
+        assert!(matches!(parse("D0.16"), Err(PlcError::InvalidAddress(_))));
+        assert!(matches!(parse("D0.99"), Err(PlcError::InvalidAddress(_))));
+    }
+
+    #[test]
+    fn rejects_a_malformed_bit_suffix() {
+        for text in ["D0.", "D0..5", "D0.5.6", "D0.-1"] {
+            assert!(
+                matches!(parse(text), Err(PlcError::InvalidAddress(_))),
+                "{text} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn bit_in_word_notation_round_trips_through_format() {
+        for (device, number, bit) in [
+            (SlmpDevice::D, 100u32, 5u8),
+            (SlmpDevice::W, 0x10, 0),
+            (SlmpDevice::ZR, 5, 15),
+        ] {
+            let text = format(device, number, Some(bit));
+            assert_eq!(parse(&text).unwrap(), (device, number, Some(bit)));
+        }
     }
 
     /// A number wide enough to overflow `u32` must be rejected the same way
@@ -625,9 +766,9 @@ mod tests {
     #[test]
     fn format_round_trips_through_parse_in_both_radixes() {
         for text in ["D100", "M50", "X1A", "W1FF", "ZR32768", "SM400", "DY3F"] {
-            let (device, number) = parse(text).unwrap();
+            let (device, number, bit) = parse(text).unwrap();
             assert_eq!(
-                format(device, number),
+                format(device, number, bit),
                 text,
                 "{text} should survive a parse/format round trip"
             );

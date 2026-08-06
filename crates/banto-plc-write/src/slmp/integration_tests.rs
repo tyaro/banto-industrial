@@ -738,3 +738,280 @@ async fn write_batch_mixed_before_connect_is_not_connected() {
         Err(PlcWriteError::NotConnected)
     ));
 }
+
+// --- T8, docs/tag-server-design.md §6.1: bit-in-word RMW writes ------------
+//
+// End-to-end through a real `SlmpWriteClient` + wire round trip against
+// `Simulator`, proving the read/modify/write/confirm sequence actually lands
+// the right bit without disturbing its word-mates - the scenarios a
+// hand-built plan (already covered in `planning.rs`'s unit tests) cannot
+// exercise: real bulk_read/bulk_write commands, and the simulator's own
+// device state as the independent oracle for "did the other 15 bits survive".
+
+fn bwreq(raw: &str, value: bool) -> BatchWriteRequest {
+    BatchWriteRequest::BitInWord {
+        address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw}: {e}")),
+        value,
+    }
+}
+
+/// 0x1234's bit positions, spelled out once and reused by every test below -
+/// bits 2, 4, 5, 9, 12 are set; every other position in 0..=15 is clear.
+const SEED_WORD: u16 = 0x1234;
+const SEED_SET_BITS: [u8; 5] = [2, 4, 5, 9, 12];
+
+fn assert_word_matches_seed_except(
+    sim: &Simulator,
+    device: SlmpDevice,
+    number: u32,
+    changed_bit: u8,
+    new_value: bool,
+) {
+    let word = sim.get_word(device, number);
+    for bit in 0..=15u8 {
+        let expected = if bit == changed_bit {
+            new_value
+        } else {
+            SEED_SET_BITS.contains(&bit)
+        };
+        assert_eq!(
+            (word >> bit) & 1 == 1,
+            expected,
+            "bit {bit} of {device}{number} (0x{word:04X}) should be {expected}"
+        );
+    }
+}
+
+/// Single-bit set: the target bit (currently clear in the seed word) flips
+/// to 1, and every other bit is provably untouched.
+#[tokio::test]
+async fn single_bit_set_via_rmw_leaves_other_bits_unchanged() {
+    let sim = Simulator::start().await;
+    sim.set_word(SlmpDevice::D, 100, SEED_WORD);
+    let mut client = SlmpWriteClient::new(fast_config(&sim));
+    client.connect().await.expect("connect");
+
+    // bit 0 is clear in the seed word (0x1234).
+    let results = client
+        .write_batch_mixed(&[bwreq("D100.0", true)])
+        .await
+        .expect("write_batch_mixed ok");
+    assert_eq!(results, vec![WriteResult::Ok]);
+
+    assert_eq!(sim.get_word(SlmpDevice::D, 100), 0x1235);
+    assert_word_matches_seed_except(&sim, SlmpDevice::D, 100, 0, true);
+}
+
+/// Single-bit clear: the target bit (currently set in the seed word) flips
+/// to 0, and every other bit is provably untouched.
+#[tokio::test]
+async fn single_bit_clear_via_rmw_leaves_other_bits_unchanged() {
+    let sim = Simulator::start().await;
+    sim.set_word(SlmpDevice::D, 100, SEED_WORD);
+    let mut client = SlmpWriteClient::new(fast_config(&sim));
+    client.connect().await.expect("connect");
+
+    // bit 5 is set in the seed word (0x1234).
+    let results = client
+        .write_batch_mixed(&[bwreq("D100.5", false)])
+        .await
+        .expect("write_batch_mixed ok");
+    assert_eq!(results, vec![WriteResult::Ok]);
+
+    assert_eq!(sim.get_word(SlmpDevice::D, 100), 0x1214);
+    assert_word_matches_seed_except(&sim, SlmpDevice::D, 100, 5, false);
+}
+
+/// Every bit position 0..=15, both directions (set on a zeroed word, clear on
+/// an all-ones word) - full coverage, not just a couple of hand-picked bits.
+#[tokio::test]
+async fn all_sixteen_bit_positions_set_and_clear_correctly() {
+    for bit in 0..=15u8 {
+        // Set, starting from all-zero.
+        let sim = Simulator::start().await;
+        sim.set_word(SlmpDevice::D, 400, 0x0000);
+        let mut client = SlmpWriteClient::new(fast_config(&sim));
+        client.connect().await.expect("connect");
+        let results = client
+            .write_batch_mixed(&[bwreq(&format!("D400.{bit}"), true)])
+            .await
+            .expect("write ok");
+        assert_eq!(results, vec![WriteResult::Ok], "set bit {bit}");
+        assert_eq!(
+            sim.get_word(SlmpDevice::D, 400),
+            1u16 << bit,
+            "setting bit {bit} of an all-zero word"
+        );
+
+        // Clear, starting from all-ones.
+        let sim = Simulator::start().await;
+        sim.set_word(SlmpDevice::D, 400, 0xFFFF);
+        let mut client = SlmpWriteClient::new(fast_config(&sim));
+        client.connect().await.expect("connect");
+        let results = client
+            .write_batch_mixed(&[bwreq(&format!("D400.{bit}"), false)])
+            .await
+            .expect("write ok");
+        assert_eq!(results, vec![WriteResult::Ok], "clear bit {bit}");
+        assert_eq!(
+            sim.get_word(SlmpDevice::D, 400),
+            !(1u16 << bit),
+            "clearing bit {bit} of an all-ones word"
+        );
+    }
+}
+
+/// §6.1's mask-composition property, proven at the wire level: three bits of
+/// the same word in one batch cost exactly **one** bulk write and **two**
+/// bulk reads (initial + confirmation) - not three of each.
+#[tokio::test]
+async fn mask_composed_bits_of_one_word_cost_exactly_one_wire_write() {
+    let sim = Simulator::start().await;
+    sim.set_word(SlmpDevice::D, 100, SEED_WORD);
+    let mut client = SlmpWriteClient::new(fast_config(&sim));
+    client.connect().await.expect("connect");
+
+    let results = client
+        .write_batch_mixed(&[
+            bwreq("D100.0", true),  // clear -> set
+            bwreq("D100.5", false), // set -> clear
+            bwreq("D100.15", true), // clear -> set
+        ])
+        .await
+        .expect("write_batch_mixed ok");
+    assert!(results.iter().all(|r| *r == WriteResult::Ok), "{results:?}");
+
+    assert_eq!(
+        sim.write_command_count(),
+        1,
+        "one RMW write, however many bits"
+    );
+    assert_eq!(
+        sim.read_command_count(),
+        2,
+        "one initial read + one confirmation read, however many bits"
+    );
+
+    let word = sim.get_word(SlmpDevice::D, 100);
+    assert_eq!(word & 1, 1, "bit 0 set");
+    assert_eq!((word >> 5) & 1, 0, "bit 5 cleared");
+    assert_eq!((word >> 15) & 1, 1, "bit 15 set");
+    // Every bit not named in this batch survives from the seed word.
+    for bit in [2u8, 4, 9, 12] {
+        assert_eq!(
+            (word >> bit) & 1,
+            1,
+            "seed bit {bit} should survive untouched"
+        );
+    }
+}
+
+/// §6.1's confirmation-read verification, proven with a deterministic
+/// injected race (see [`Simulator::corrupt_after_next_write`]): the RMW's
+/// own read/write sequence succeeds, but the confirmation read observes a
+/// word that disagrees with what was just written - exactly as if the PLC's
+/// own scan had clobbered the bit between our write and our confirmation
+/// read - and the affected request comes back `Bad`.
+#[tokio::test]
+async fn confirmation_mismatch_is_reported_as_bad_with_a_race_hint() {
+    let sim = Simulator::start().await;
+    sim.set_word(SlmpDevice::D, 100, 0x0000);
+    // The instant our write-back lands, flip bit 5 right back off again -
+    // simulating a competing write that landed in between our write and our
+    // confirmation read.
+    sim.corrupt_after_next_write(SlmpDevice::D, 100, 1 << 5);
+
+    let mut client = SlmpWriteClient::new(fast_config(&sim));
+    client.connect().await.expect("connect");
+
+    let results = client
+        .write_batch_mixed(&[bwreq("D100.5", true)])
+        .await
+        .expect("the wire call itself succeeds - this is a per-request Bad");
+    assert_eq!(results.len(), 1);
+    match &results[0] {
+        WriteResult::Bad(PlcWriteError::BitWriteVerificationFailed { area, bit }) => {
+            assert_eq!(area, "D100");
+            assert_eq!(*bit, 5);
+        }
+        other => panic!("expected BitWriteVerificationFailed, got {other:?}"),
+    }
+}
+
+/// The mismatch above is per-request, not per-word: a batch-mate bit in the
+/// same RMW that *does* land correctly is still reported `Ok`.
+#[tokio::test]
+async fn confirmation_mismatch_on_one_bit_does_not_fail_its_batch_mates() {
+    let sim = Simulator::start().await;
+    sim.set_word(SlmpDevice::D, 100, 0x0000);
+    // Corrupt only bit 5 after the write; bit 0 is unaffected by the
+    // injected XOR mask and should verify cleanly.
+    sim.corrupt_after_next_write(SlmpDevice::D, 100, 1 << 5);
+
+    let mut client = SlmpWriteClient::new(fast_config(&sim));
+    client.connect().await.expect("connect");
+
+    let results = client
+        .write_batch_mixed(&[bwreq("D100.0", true), bwreq("D100.5", true)])
+        .await
+        .expect("the wire call itself succeeds");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0], WriteResult::Ok, "bit 0 landed correctly");
+    assert!(
+        matches!(
+            &results[1],
+            WriteResult::Bad(PlcWriteError::BitWriteVerificationFailed { bit, .. }) if *bit == 5
+        ),
+        "bit 5 was corrupted after the write: {:?}",
+        results[1]
+    );
+}
+
+/// Different words in one batch never merge into one RMW - each gets its own
+/// independent read/write/confirm sequence and its own correct result.
+#[tokio::test]
+async fn bit_writes_to_different_words_are_independent() {
+    let sim = Simulator::start().await;
+    sim.set_word(SlmpDevice::D, 100, 0x0000);
+    sim.set_word(SlmpDevice::D, 101, 0xFFFF);
+    let mut client = SlmpWriteClient::new(fast_config(&sim));
+    client.connect().await.expect("connect");
+
+    let results = client
+        .write_batch_mixed(&[bwreq("D100.0", true), bwreq("D101.0", false)])
+        .await
+        .expect("write_batch_mixed ok");
+    assert!(results.iter().all(|r| *r == WriteResult::Ok), "{results:?}");
+
+    assert_eq!(sim.get_word(SlmpDevice::D, 100), 0x0001);
+    assert_eq!(sim.get_word(SlmpDevice::D, 101), 0xFFFE);
+    assert_eq!(
+        sim.write_command_count(),
+        2,
+        "two words, two independent writes"
+    );
+}
+
+/// An ordinary word write and a bit-in-word write coexisting in one batch
+/// both land correctly - the planner keeps them fully independent (see
+/// `planning.rs`'s `ordinary_and_bit_in_word_writes_coexist_in_one_batch`);
+/// this is the wire-level confirmation that the executor does too.
+#[tokio::test]
+async fn ordinary_write_and_bit_in_word_write_coexist_in_one_batch() {
+    let sim = Simulator::start().await;
+    sim.set_word(SlmpDevice::D, 100, 0x0000);
+    let mut client = SlmpWriteClient::new(fast_config(&sim));
+    client.connect().await.expect("connect");
+
+    let results = client
+        .write_batch_mixed(&[
+            BatchWriteRequest::Numeric(word("D200", DataType::U16, 42.0)),
+            bwreq("D100.5", true),
+        ])
+        .await
+        .expect("write_batch_mixed ok");
+    assert!(results.iter().all(|r| *r == WriteResult::Ok), "{results:?}");
+
+    assert_eq!(sim.get_word(SlmpDevice::D, 200), 42);
+    assert_eq!(sim.get_word(SlmpDevice::D, 100), 1 << 5);
+}

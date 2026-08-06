@@ -122,6 +122,35 @@ pub enum PlcWriteError {
     /// framing failure, which is fatal.
     #[error("PLC異常応答: SLMP終了コード=0x{code:04X} ({message})")]
     SlmpEndCode { code: u16, message: String },
+
+    /// T8 (docs/tag-server-design.md §6.1): two `BitInWord` requests in the
+    /// same batch target the same bit of the same word with conflicting
+    /// values (one `true`, one `false`). RMW cannot satisfy both, and
+    /// picking a winner would be a silent, order-dependent behavior (which
+    /// request "wins" would depend on iteration order, not anything the
+    /// caller controls) - so both requests are rejected before any wire
+    /// traffic instead. A per-request `Bad`, never a whole-batch failure:
+    /// every *other* bit of the same word (and every other word entirely)
+    /// still proceeds.
+    #[error(
+        "ワード {area} のビット {bit} に競合する書き込み要求があります（true と false が同時に指定されています）"
+    )]
+    ConflictingBitWrite { area: String, bit: u8 },
+
+    /// T8 (docs/tag-server-design.md §6.1): the RMW confirmation read showed
+    /// this bit did not land as written. The read/modify/write cycle itself
+    /// succeeded (no wire-level error) - the CPU's own scan wrote the same
+    /// word between our read and our write is the most likely explanation,
+    /// which is exactly the race §6.1 documents as un-preventable and only
+    /// detectable (see `slmp::mod`'s module doc: "外部から書くビットを含む
+    /// ワードは PLC 側から書かない" is the operational mitigation, this
+    /// error is the detection). A per-request `Bad`: every other bit written
+    /// in the same RMW is checked independently, so one bit's mismatch does
+    /// not invalidate its batch-mates' successful writes.
+    #[error(
+        "ビット書き込みの確認読みで不一致を検出しました（デバイス={area}, ビット={bit}）。書き戻し競合の可能性があります"
+    )]
+    BitWriteVerificationFailed { area: String, bit: u8 },
 }
 
 impl PlcWriteError {
@@ -137,10 +166,15 @@ impl PlcWriteError {
     /// The per-request exclusions are exactly the outcomes that leave the
     /// connection perfectly usable for the next group: a device-side
     /// [`Self::SlmpEndCode`] (the CPU refused one write but answered in full),
-    /// and the four configuration/value errors resolved before any wire
+    /// the four configuration/value errors resolved before any wire
     /// traffic ([`Self::AddressProtocolMismatch`],
     /// [`Self::UnsupportedCombination`], [`Self::ValueTypeMismatch`],
-    /// [`Self::ValueOutOfRange`]).
+    /// [`Self::ValueOutOfRange`]), and T8's two RMW-specific outcomes
+    /// ([`Self::ConflictingBitWrite`], resolved before any wire traffic like
+    /// the other configuration errors; [`Self::BitWriteVerificationFailed`],
+    /// which by construction only occurs *after* a complete, successful RMW
+    /// read/write/confirm cycle - the connection is unquestionably fine, only
+    /// the PLC-side race the confirmation read exists to catch happened).
     pub fn is_connection_fatal(&self) -> bool {
         !matches!(
             self,
@@ -150,6 +184,8 @@ impl PlcWriteError {
                 | PlcWriteError::ValueTypeMismatch { .. }
                 | PlcWriteError::ValueOutOfRange { .. }
                 | PlcWriteError::StringSpanUnsupported { .. }
+                | PlcWriteError::ConflictingBitWrite { .. }
+                | PlcWriteError::BitWriteVerificationFailed { .. }
         )
     }
 }
@@ -189,6 +225,14 @@ mod tests {
             PlcWriteError::StringSpanUnsupported {
                 words: 961,
                 max: 960,
+            },
+            PlcWriteError::ConflictingBitWrite {
+                area: "D100".to_string(),
+                bit: 5,
+            },
+            PlcWriteError::BitWriteVerificationFailed {
+                area: "D100".to_string(),
+                bit: 5,
             },
         ];
         for err in per_request {

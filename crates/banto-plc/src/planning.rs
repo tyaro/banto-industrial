@@ -67,9 +67,12 @@ fn max_count_for(area: AddressArea) -> u16 {
 
 /// v1 restriction (docs/plan.md I2 §4): bit tags only address coil/
 /// discrete-input areas; every other data type only addresses register
-/// areas. There is no such thing as "read one bit out of a holding
-/// register" in this crate yet (real need, deferred to whenever I3/a real
-/// device profile asks for it).
+/// areas. "Read one bit out of a holding register" is now real (T8,
+/// docs/tag-server-design.md §6.1) but is handled as a *separate* case in
+/// [`plan_requests`]'s per-request match, not folded in here - see that
+/// function's comment for why this function's contract stays exactly what
+/// it was pre-T8: `is_compatible(area, data_type)` alone still means "does
+/// this data type live in this area with **no** bit qualifier".
 fn is_compatible(area: AddressArea, data_type: DataType) -> bool {
     match area {
         AddressArea::Coil | AddressArea::DiscreteInput => data_type == DataType::Bit,
@@ -87,6 +90,14 @@ pub struct MappedRequest {
     /// register/bit window returned for this group.
     pub offset_in_read: u16,
     pub data_type: DataType,
+    /// `Some(0..=15)` for a T8 bit-in-word request (§6.1: `"40001.3"`) - the
+    /// bit position `modbus/mod.rs` must extract from the register window at
+    /// `offset_in_read` instead of decoding the whole register as
+    /// `data_type` (which is always [`DataType::Bit`] whenever this is
+    /// `Some`, but the register itself holds 16 bits' worth of unrelated
+    /// tags, not a bool). `None` for every pre-T8 request, register or coil
+    /// alike.
+    pub bit: Option<u8>,
 }
 
 /// One physical Modbus request: `modbus/mod.rs` issues exactly one FC1/2/3/4
@@ -136,18 +147,47 @@ impl Building {
 /// Plan wire-level reads for `requests`. See this module's doc comment for
 /// the grouping rule and `error.rs` for why area/data-type mismatches are
 /// resolved here rather than surfacing as a Modbus exception later.
+///
+/// ## T8 bit-in-word requests (docs/tag-server-design.md §6.1)
+///
+/// A request whose address carries a bit position (`"40001.3"`,
+/// [`crate::address::Address::as_modbus_ref`]'s third element) is *not* a new
+/// wire operation: it still reads the whole register at `offset` via the
+/// area's ordinary FC3/FC4 group (the same [`PlannedRead`] a plain numeric
+/// tag at that offset would use, and it happily shares a group with one -
+/// the planner's existing adjacency/gap merging does not need to know a bit
+/// is being extracted). Only the *decode* step differs, which is why the
+/// bit position rides along on [`MappedRequest::bit`] rather than
+/// influencing anything above (`span`, grouping, `max_count`): `DataType::Bit`
+/// occupies exactly one register just like an `i16`/`u16`
+/// ([`DataType::register_span`]), so no arithmetic in this function needed
+/// to change. This is also what gives "duplicate bit tags on the same
+/// register never cost an extra read" for free: two bit-in-word requests at
+/// the same offset land in the same group exactly as two plain numeric
+/// duplicates already did (`duplicate_addresses_both_map_into_the_same_group`).
+///
+/// A bit-in-word request is only valid at a register area
+/// ([`AddressArea::InputRegister`]/[`AddressArea::HoldingRegister`]) with
+/// `data_type == DataType::Bit` - the combination [`crate::address::Address::parse`] already
+/// restricts the *address* text to, but `data_type` is a separate column
+/// (`banto-tags::Tag::data_type`) that a misconfigured tag could still
+/// disagree with (e.g. address `"40001.3"` with `data_type = "u16"`), so it
+/// is re-checked here and rejected as [`PlcError::UnsupportedCombination`]
+/// exactly like every other area/data-type mismatch this function resolves.
 pub fn plan_requests(requests: &[ReadRequest]) -> PlanOutcome {
     let mut immediate_bad = Vec::new();
 
     // BTreeMap (not HashMap) so areas - and therefore the resulting
     // `reads` order - come out deterministic, which keeps tests and any
     // future request-count metrics stable across runs.
-    // `(index, offset, data_type)` per area: the offset is resolved up front
-    // so the sort below (and the grouping loop) never has to re-match on the
-    // `Address` variant it has already proven is `ModbusRef`.
-    let mut by_area: BTreeMap<AddressArea, Vec<(usize, u16, DataType)>> = BTreeMap::new();
+    // `(index, offset, data_type, bit)` per area: the offset is resolved up
+    // front so the sort below (and the grouping loop) never has to re-match
+    // on the `Address` variant it has already proven is `ModbusRef`. `bit` is
+    // the T8 bit-in-word position (§6.1), `None` for a plain request.
+    type AreaItem = (usize, u16, DataType, Option<u8>);
+    let mut by_area: BTreeMap<AddressArea, Vec<AreaItem>> = BTreeMap::new();
     for (index, req) in requests.iter().enumerate() {
-        let Some((area, offset)) = req.address.as_modbus_ref() else {
+        let Some((area, offset, bit)) = req.address.as_modbus_ref() else {
             immediate_bad.push((
                 index,
                 PlcError::AddressProtocolMismatch {
@@ -157,11 +197,24 @@ pub fn plan_requests(requests: &[ReadRequest]) -> PlanOutcome {
             ));
             continue;
         };
-        if is_compatible(area, req.data_type) {
+
+        let accepted = match bit {
+            // T8 bit-in-word: only a register area, only a `bit` tag.
+            Some(_) => {
+                matches!(
+                    area,
+                    AddressArea::InputRegister | AddressArea::HoldingRegister
+                ) && req.data_type == DataType::Bit
+            }
+            // Pre-T8 shape, unchanged.
+            None => is_compatible(area, req.data_type),
+        };
+
+        if accepted {
             by_area
                 .entry(area)
                 .or_default()
-                .push((index, offset, req.data_type));
+                .push((index, offset, req.data_type, bit));
         } else {
             immediate_bad.push((
                 index,
@@ -175,11 +228,11 @@ pub fn plan_requests(requests: &[ReadRequest]) -> PlanOutcome {
 
     let mut reads = Vec::new();
     for (area, mut items) in by_area {
-        items.sort_by_key(|(_, offset, _)| *offset);
+        items.sort_by_key(|(_, offset, _, _)| *offset);
         let max_count = max_count_for(area) as u32;
         let mut current: Option<Building> = None;
 
-        for (index, offset, data_type) in items {
+        for (index, offset, data_type, bit) in items {
             let span = data_type.register_span() as u32;
             let start = offset as u32;
             let end = start + span;
@@ -207,6 +260,7 @@ pub fn plan_requests(requests: &[ReadRequest]) -> PlanOutcome {
                 request_index: index,
                 offset_in_read: (start - group.start) as u16,
                 data_type,
+                bit,
             });
         }
 
@@ -272,8 +326,25 @@ mod tests {
 
     fn req(area: AddressArea, offset: u16, data_type: DataType) -> ReadRequest {
         ReadRequest {
-            address: Address::ModbusRef { area, offset },
+            address: Address::ModbusRef {
+                area,
+                offset,
+                bit: None,
+            },
             data_type,
+        }
+    }
+
+    /// T8 (docs/tag-server-design.md §6.1): a bit-in-word request at a
+    /// register area.
+    fn bit_in_word_req(area: AddressArea, offset: u16, bit: u8) -> ReadRequest {
+        ReadRequest {
+            address: Address::ModbusRef {
+                area,
+                offset,
+                bit: Some(bit),
+            },
+            data_type: DataType::Bit,
         }
     }
 
@@ -528,6 +599,7 @@ mod tests {
                 address: Address::ModbusRef {
                     area: AddressArea::HoldingRegister,
                     offset: 0,
+                    bit: None,
                 },
                 words: 4,
             }),
@@ -567,5 +639,118 @@ mod tests {
         let outcome = plan_requests(&requests);
         assert_eq!(outcome.reads.len(), 1);
         assert_eq!(outcome.reads[0].count, 3);
+    }
+
+    // --- T8, docs/tag-server-design.md §6.1: bit-in-word requests ----------
+
+    /// The core §6.1 property: a bit-in-word request folds into the
+    /// register's existing word read rather than spending a wire operation
+    /// of its own - `count` stays 1, not 2, for two bit tags on the same
+    /// register.
+    #[test]
+    fn bit_in_word_request_folds_into_the_ordinary_register_read() {
+        let outcome = plan_requests(&[bit_in_word_req(AddressArea::HoldingRegister, 0, 5)]);
+        assert!(outcome.immediate_bad.is_empty());
+        assert_eq!(outcome.reads.len(), 1);
+        let g = &outcome.reads[0];
+        assert_eq!(g.area, AddressArea::HoldingRegister);
+        assert_eq!(g.start_offset, 0);
+        assert_eq!(
+            g.count, 1,
+            "one bit-in-word tag must cost exactly one register"
+        );
+        assert_eq!(g.mapping[0].bit, Some(5));
+        assert_eq!(g.mapping[0].data_type, DataType::Bit);
+    }
+
+    /// Two bit tags on the *same* register must not duplicate the read - the
+    /// planner's existing "duplicate addresses share a group" dedup already
+    /// covers this because both requests present the same `offset`; T8 adds
+    /// no new dedup mechanism.
+    #[test]
+    fn multiple_bits_of_the_same_register_share_one_read() {
+        let outcome = plan_requests(&[
+            bit_in_word_req(AddressArea::HoldingRegister, 100, 0),
+            bit_in_word_req(AddressArea::HoldingRegister, 100, 5),
+            bit_in_word_req(AddressArea::HoldingRegister, 100, 15),
+        ]);
+        assert!(outcome.immediate_bad.is_empty());
+        assert_eq!(
+            outcome.reads.len(),
+            1,
+            "one register, one read, however many bits"
+        );
+        let g = &outcome.reads[0];
+        assert_eq!(g.count, 1);
+        assert_eq!(g.mapping.len(), 3);
+        let bits: Vec<u8> = g.mapping.iter().map(|m| m.bit.unwrap()).collect();
+        assert_eq!(bits, vec![0, 5, 15]);
+    }
+
+    /// A bit-in-word tag alongside a plain numeric tag at an adjacent
+    /// register still merges into one read (the ordinary adjacency rule),
+    /// unaffected by the bit qualifier.
+    #[test]
+    fn bit_in_word_request_merges_with_an_adjacent_plain_register_request() {
+        let outcome = plan_requests(&[
+            bit_in_word_req(AddressArea::HoldingRegister, 0, 3),
+            req(AddressArea::HoldingRegister, 1, DataType::U16),
+        ]);
+        assert_eq!(outcome.reads.len(), 1);
+        assert_eq!(outcome.reads[0].count, 2);
+    }
+
+    /// §6.1: a coil/discrete-input area is already bit-granular, so a
+    /// bit-in-word request there is rejected rather than silently accepted -
+    /// this exercises the planner's own defense in depth even though
+    /// `Address::parse` already refuses to produce such an address.
+    #[test]
+    fn bit_in_word_request_at_a_bit_area_is_immediately_bad() {
+        let outcome = plan_requests(&[bit_in_word_req(AddressArea::Coil, 0, 0)]);
+        assert!(outcome.reads.is_empty());
+        assert_eq!(outcome.immediate_bad.len(), 1);
+        assert!(matches!(
+            outcome.immediate_bad[0].1,
+            PlcError::UnsupportedCombination { .. }
+        ));
+    }
+
+    /// A tag whose `address` names a bit position but whose `data_type`
+    /// column disagrees (not `bit`) is a per-request configuration error,
+    /// not a silent whole-register read.
+    #[test]
+    fn bit_in_word_address_with_a_non_bit_data_type_is_immediately_bad() {
+        let requests = [ReadRequest {
+            address: Address::ModbusRef {
+                area: AddressArea::HoldingRegister,
+                offset: 0,
+                bit: Some(3),
+            },
+            data_type: DataType::U16,
+        }];
+        let outcome = plan_requests(&requests);
+        assert!(outcome.reads.is_empty());
+        assert_eq!(outcome.immediate_bad.len(), 1);
+        assert!(matches!(
+            outcome.immediate_bad[0].1,
+            PlcError::UnsupportedCombination { .. }
+        ));
+    }
+
+    /// Existing (non-bit-qualified) behavior must be completely unchanged:
+    /// this is the exact pre-T8 grouping test, re-run to pin down that
+    /// `bit: None` requests take the same path they always did.
+    #[test]
+    fn pre_t8_requests_are_unaffected_by_the_bit_in_word_addition() {
+        let requests = [
+            req(AddressArea::HoldingRegister, 0, DataType::I16),
+            req(AddressArea::HoldingRegister, 1, DataType::I16),
+        ];
+        let outcome = plan_requests(&requests);
+        assert_eq!(outcome.reads.len(), 1);
+        assert_eq!(outcome.reads[0].count, 2);
+        for m in &outcome.reads[0].mapping {
+            assert_eq!(m.bit, None);
+        }
     }
 }

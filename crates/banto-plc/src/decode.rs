@@ -73,6 +73,33 @@ pub(crate) fn decode_register_value(
     Ok(TagValue::F64(value))
 }
 
+/// Decode a single bit out of the word at `regs[start]` (T8, docs/tag-server-design.md
+/// §6.1: "D100.5" - a bit-in-word address, folded into the word's ordinary
+/// bulk read rather than requiring a dedicated wire operation). `bit` is
+/// `0..=15`, already range-checked by [`crate::address::Address::parse`]/
+/// [`crate::slmp::address::parse`] at tag-definition time, so this never
+/// shifts out of a `u16`'s range; it is not re-validated here, matching
+/// [`decode_register_value`]'s own trust of `start`/`span` having already
+/// been proven safe by the planner.
+///
+/// Shares this module's bounds-checking style with [`decode_register_value`]:
+/// an out-of-bounds `start` is a planning bug (never seen in practice, since
+/// the planner always sizes the response window to cover every mapped
+/// request), reported as [`PlcError::Protocol`] rather than a panic.
+pub(crate) fn decode_register_bit(
+    regs: &[u16],
+    start: usize,
+    bit: u8,
+) -> Result<TagValue, PlcError> {
+    let word = *regs.get(start).ok_or_else(|| {
+        PlcError::Protocol(format!(
+            "register window out of bounds: start={start} span=1 len={}",
+            regs.len()
+        ))
+    })?;
+    Ok(TagValue::Bit((word >> bit) & 1 != 0))
+}
+
 /// Decode the MELSEC string at `regs[start..start + words]` into a Rust
 /// `String` (S1 文字列タグ).
 ///
@@ -211,6 +238,44 @@ mod tests {
     fn decoding_bit_type_here_is_a_protocol_error_not_a_panic() {
         let regs = [0x0001u16];
         let err = decode_register_value(&regs, 0, DataType::Bit, WordOrder::HighLow).unwrap_err();
+        assert!(matches!(err, PlcError::Protocol(_)));
+    }
+
+    // --- decode_register_bit (T8, docs/tag-server-design.md §6.1) ---------
+
+    #[test]
+    fn decodes_every_bit_position_of_a_word() {
+        // 0x1234 = 0b0001_0010_0011_0100 - bit 2, bit 4, bit 5, bit 9,
+        // bit 12 are set; every other position in 0..=15 is clear.
+        let regs = [0x1234u16];
+        let set_bits = [2u8, 4, 5, 9, 12];
+        for bit in 0..=15u8 {
+            let expected = set_bits.contains(&bit);
+            assert_eq!(
+                decode_register_bit(&regs, 0, bit).unwrap(),
+                TagValue::Bit(expected),
+                "bit {bit} of 0x1234 should be {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_register_bit_respects_a_nonzero_start_offset() {
+        let regs = [0x0000u16, 0xFFFFu16];
+        assert_eq!(
+            decode_register_bit(&regs, 1, 0).unwrap(),
+            TagValue::Bit(true)
+        );
+        assert_eq!(
+            decode_register_bit(&regs, 0, 0).unwrap(),
+            TagValue::Bit(false)
+        );
+    }
+
+    #[test]
+    fn decode_register_bit_out_of_bounds_window_is_a_protocol_error_not_a_panic() {
+        let regs: [u16; 0] = [];
+        let err = decode_register_bit(&regs, 0, 0).unwrap_err();
         assert!(matches!(err, PlcError::Protocol(_)));
     }
 

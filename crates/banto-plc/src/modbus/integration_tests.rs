@@ -16,7 +16,11 @@ use crate::types::{DataType, ReadRequest, ReadResult, TagValue};
 
 fn req(area: AddressArea, offset: u16, data_type: DataType) -> ReadRequest {
     ReadRequest {
-        address: Address::ModbusRef { area, offset },
+        address: Address::ModbusRef {
+            area,
+            offset,
+            bit: None,
+        },
         data_type,
     }
 }

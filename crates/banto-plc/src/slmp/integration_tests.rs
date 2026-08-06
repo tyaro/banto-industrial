@@ -78,6 +78,60 @@ async fn normal_batch_reads_every_data_type_correctly() {
     assert_eq!(results[5], ReadResult::Value(TagValue::Bit(false)));
 }
 
+/// T8 (docs/tag-server-design.md §6.1), end-to-end through a real `SLMPClient`
+/// + wire round trip: `D100.5` reads the same word `D100` an ordinary numeric
+/// tag would, decoded down to one bit - and a plain numeric read of the same
+/// register (the regression half of this test) is completely unaffected by a
+/// bit-in-word tag sharing its group.
+#[tokio::test]
+async fn bit_in_word_tag_shares_the_ordinary_word_read_and_extracts_its_bit() {
+    let sim = Simulator::start().await;
+    // 0x1234 = 0b0001_0010_0011_0100 - bit 2, 4, 5, 9, 12 set.
+    sim.set_word(SlmpDevice::D, 100, 0x1234);
+
+    let mut client = SlmpClient::new(fast_config(&sim));
+    client.connect().await.expect("connect should succeed");
+
+    let requests = [
+        req("D100.5", DataType::Bit),  // set
+        req("D100.0", DataType::Bit),  // clear
+        req("D100.15", DataType::Bit), // clear (top bit)
+        req("D100", DataType::U16),    // plain numeric read of the same word
+    ];
+    let results = client.read_batch(&requests).await.expect("read_batch ok");
+
+    assert_eq!(results.len(), requests.len());
+    assert_eq!(results[0], ReadResult::Value(TagValue::Bit(true)));
+    assert_eq!(results[1], ReadResult::Value(TagValue::Bit(false)));
+    assert_eq!(results[2], ReadResult::Value(TagValue::Bit(false)));
+    assert_eq!(results[3], ReadResult::Value(TagValue::F64(0x1234 as f64)));
+}
+
+/// Every bit position 0..=15 decodes correctly, not just a couple of
+/// hand-picked ones - the full-coverage complement to the test above.
+#[tokio::test]
+async fn bit_in_word_tag_decodes_every_bit_position() {
+    let sim = Simulator::start().await;
+    sim.set_word(SlmpDevice::D, 200, 0b1010_1010_1010_1010);
+
+    let mut client = SlmpClient::new(fast_config(&sim));
+    client.connect().await.expect("connect should succeed");
+
+    let requests: Vec<ReadRequest> = (0..=15)
+        .map(|bit| req(&format!("D200.{bit}"), DataType::Bit))
+        .collect();
+    let results = client.read_batch(&requests).await.expect("read_batch ok");
+
+    for (bit, result) in results.iter().enumerate() {
+        let expected = bit % 2 == 1; // 0b1010_1010_1010_1010: odd bits set
+        assert_eq!(
+            *result,
+            ReadResult::Value(TagValue::Bit(expected)),
+            "bit {bit} should decode to {expected}"
+        );
+    }
+}
+
 /// The default word order is the one thing most likely to be silently wrong
 /// against real hardware, so it gets its own end-to-end case in both
 /// directions: the same two devices must decode to different numbers.

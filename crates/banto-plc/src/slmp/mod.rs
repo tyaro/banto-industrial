@@ -83,7 +83,7 @@ use std::io::ErrorKind;
 use std::time::Duration;
 
 use crate::client::{BoxFuture, PlcClient};
-use crate::decode::{decode_register_value, decode_string_value, WordOrder};
+use crate::decode::{decode_register_bit, decode_register_value, decode_string_value, WordOrder};
 use crate::error::PlcError;
 use crate::types::{BatchReadRequest, BatchReadResult, PlcValue, ReadRequest, ReadResult};
 
@@ -562,6 +562,13 @@ pub async fn execute_slmp_batch_reads(
                                     span as usize,
                                 )
                                 .map(PlcValue::Str),
+                                // T8 (docs/tag-server-design.md §6.1): one
+                                // bit out of the fetched word, not the whole
+                                // word as a number.
+                                ReadKind::BitInWord { bit } => {
+                                    decode_register_bit(words, m.offset_in_read as usize, bit)
+                                        .map(PlcValue::from)
+                                }
                             };
                             match decoded {
                                 Ok(v) => v,
@@ -736,7 +743,7 @@ mod tests {
         assert_eq!(expected.len(), 28);
 
         for (mnemonic, code) in expected {
-            let (device, _) = address::parse(&format!("{mnemonic}0"))
+            let (device, _, _) = address::parse(&format!("{mnemonic}0"))
                 .unwrap_or_else(|e| panic!("{mnemonic}0 should parse: {e}"));
             assert_eq!(device.mnemonic(), *mnemonic);
             assert_eq!(

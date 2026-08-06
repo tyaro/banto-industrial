@@ -42,6 +42,20 @@
 //!   standalone, owns-its-socket form) plus [`slmp::plan_slmp_writes`] and
 //!   [`slmp::execute_slmp_writes`], the pure-planner / borrowed-client pair the
 //!   W3 broker calls to write over its *shared* single-session-per-CPU socket.
+//!
+//! ## T8: bit-in-word writes (docs/tag-server-design.md §6.1, 2026-08-06)
+//!
+//! [`BatchWriteRequest::BitInWord`] sets or clears a single bit of a *word*
+//! device (`"D100.5"`) without a dedicated SLMP write command for it - SLMP
+//! only writes whole words. `slmp::planning` plans this as a
+//! [`SlmpPlannedBitWrite`] (a mask-composed *recipe*, not a ready payload,
+//! since the word's other 15 bits are unknown until read), and
+//! [`slmp::execute_slmp_writes`] carries it out as a
+//! read-modify-write-**confirm** sequence on the broker's single shared
+//! session - see that function's and `slmp::planning`'s module docs for the
+//! full RMW design (mask composition, the gap-tolerance-zero rule extended to
+//! "different words never merge", and why this needed zero `banto-broker`
+//! changes).
 
 pub mod client;
 pub mod encode;
@@ -52,7 +66,8 @@ pub mod types;
 pub use client::PlcWriteClient;
 pub use error::PlcWriteError;
 pub use slmp::planning::{
-    plan_slmp_write_batch, plan_slmp_writes, SlmpPlannedWrite, SlmpWritePlanOutcome, WritePayload,
+    plan_slmp_write_batch, plan_slmp_writes, BitWriteMapping, SlmpPlannedBitWrite,
+    SlmpPlannedWrite, SlmpWritePlanOutcome, WritePayload,
 };
 pub use slmp::{execute_slmp_writes, SlmpWriteClient};
 pub use types::{BatchWriteRequest, StringWriteRequest, WriteRequest, WriteResult};

@@ -211,6 +211,17 @@ impl EngineControl {
                 TagValue::F64(v) => v,
             }),
             BatchWriteRequest::String(_) => None,
+            // T8 (docs/tag-server-design.md §6.1): bit-in-word RMW writes.
+            // `monitor_write` is a generic low-level entry point that
+            // forwards whatever `BatchWriteRequest` it is handed to the
+            // broker (this match only decides the audit row's numeric
+            // column), so it is exhaustiveness-complete for the new variant
+            // even though the tag monitor's manual-write UI
+            // (`monitor_tag_write`'s `build()`, below) does not yet
+            // construct one - wiring `.N` bit-in-word tags into relay-wright's
+            // own UI is a separate slice, not part of T8-1's driver-layer
+            // scope. Same 1.0/0.0 convention as `TagValue::Bit` above.
+            BatchWriteRequest::BitInWord { value, .. } => Some(if *value { 1.0 } else { 0.0 }),
         };
 
         let row = AuditRow::new(

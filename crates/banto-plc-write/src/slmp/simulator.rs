@@ -20,6 +20,20 @@
 //! The frame layout is the 4E binary request/response pair as the wrapped
 //! `slmp` crate builds and validates it: a 15-byte prefix, a 2-byte end code (on
 //! responses), then payload.
+//!
+//! ## T8 additions (docs/tag-server-design.md §6.1, RMW bit-in-word writes)
+//!
+//! [`Simulator::write_command_count`]/[`Simulator::read_command_count`] let a
+//! test assert on the *number* of wire operations an RMW issued (one write
+//! however many bits were mask-composed into it; two reads - initial +
+//! confirmation), and [`Simulator::corrupt_after_next_write`] deterministically
+//! simulates the PLC-side race `execute_slmp_writes`'s confirmation read
+//! exists to catch: a real "another controller wrote the same word between
+//! our write and our confirmation read" race cannot be reproduced on demand
+//! by timing alone, but its observable effect - the confirmation read
+//! disagreeing with what was just written - can be, by having the simulator
+//! itself apply the corruption at the one moment that matters (right after
+//! the write it followed commits, before any later read observes it).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -52,6 +66,19 @@ struct State {
     end_codes: HashMap<(SlmpDevice, u32), u16>,
     malformed: bool,
     hang: bool,
+    /// T8 (docs/tag-server-design.md §6.1) RMW test support: how many bulk
+    /// read/write commands this simulator has served, for tests that assert
+    /// a mask-composed RMW costs exactly one wire write (not one per bit) -
+    /// see `write_command_count`/`read_command_count`.
+    read_commands: usize,
+    write_commands: usize,
+    /// T8 RMW race simulation: a one-shot XOR mask applied to `(device,
+    /// number)`'s word immediately after the *next* write that lands there
+    /// completes - simulating a PLC scan clobbering a bit between our write
+    /// and our confirmation read, deterministically rather than by racing
+    /// real wall-clock timing. Consumed (removed) the first time it fires -
+    /// see `corrupt_after_next_write`.
+    corrupt_after_write: HashMap<(SlmpDevice, u32), u16>,
 }
 
 /// A running simulator instance. Dropping this does not stop the server; call
@@ -168,6 +195,40 @@ impl Simulator {
             .unwrap()
             .end_codes
             .remove(&(device, start_number));
+    }
+
+    /// How many bulk *write* commands this simulator has served since it
+    /// started - T8 (docs/tag-server-design.md §6.1) test support for
+    /// asserting an RMW with several composed bits still costs exactly one
+    /// wire write, not one per bit.
+    pub fn write_command_count(&self) -> usize {
+        self.state.lock().unwrap().write_commands
+    }
+
+    /// How many bulk *read* commands this simulator has served - the T8 RMW
+    /// twin of [`Self::write_command_count`] (an RMW issues exactly two:
+    /// the initial read and the confirmation read).
+    pub fn read_command_count(&self) -> usize {
+        self.state.lock().unwrap().read_commands
+    }
+
+    /// T8 (docs/tag-server-design.md §6.1) RMW race test support: XOR
+    /// `xor_mask` into `(device, number)`'s word immediately after the next
+    /// write that lands there completes, simulating the PLC's own scan
+    /// clobbering a bit between our write-back and our confirmation read.
+    /// One-shot - consumed the first time a matching write occurs, so a test
+    /// arms it once per RMW it wants to corrupt. Deterministic (no reliance
+    /// on real timing), which is what makes
+    /// `execute_slmp_writes`'s confirmation-read verification testable at
+    /// all: a real PLC-scan race cannot be reproduced on demand, but its
+    /// *observable effect* - the confirmation read disagreeing with what we
+    /// just wrote - can.
+    pub fn corrupt_after_next_write(&self, device: SlmpDevice, number: u32, xor_mask: u16) {
+        self.state
+            .lock()
+            .unwrap()
+            .corrupt_after_write
+            .insert((device, number), xor_mask);
     }
 
     /// Answer with a frame whose declared data length disagrees with its actual
@@ -288,8 +349,14 @@ fn build_response(state: &Arc<Mutex<State>>, route: &Route, command: &[u8]) -> V
     let code = u16::from_le_bytes([command[0], command[1]]);
 
     match code {
-        COMMAND_BULK_READ => build_read_response(&state, route, command),
-        COMMAND_BULK_WRITE => build_write_response(&mut state, route, command),
+        COMMAND_BULK_READ => {
+            state.read_commands += 1;
+            build_read_response(&state, route, command)
+        }
+        COMMAND_BULK_WRITE => {
+            state.write_commands += 1;
+            build_write_response(&mut state, route, command)
+        }
         _ => frame(route, END_CODE_WRONG_COMMAND, &[], state.malformed),
     }
 }
@@ -388,6 +455,18 @@ fn build_write_response(state: &mut State, route: &Route, command: &[u8]) -> Vec
             let word = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
             let number = field.start + i as u32;
             state.words.insert((field.device, number), word);
+
+            // T8 (docs/tag-server-design.md §6.1) RMW race simulation: if a
+            // test armed a corruption for this exact (device, number) via
+            // `corrupt_after_next_write`, apply it now - immediately after
+            // committing the caller's own write, one-shot - so the *next*
+            // read (the RMW's confirmation read) observes a word that no
+            // longer matches what was just written, exactly as a PLC scan
+            // landing between our write and our confirmation read would.
+            if let Some(xor_mask) = state.corrupt_after_write.remove(&(field.device, number)) {
+                let corrupted = word ^ xor_mask;
+                state.words.insert((field.device, number), corrupted);
+            }
         }
     }
 
