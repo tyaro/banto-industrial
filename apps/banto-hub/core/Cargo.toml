@@ -123,3 +123,16 @@ rumqttd = { version = "0.20", default-features = false }
 [[bin]]
 name = "banto-hub"
 path = "src/bin/banto-hub.rs"
+
+# T5-1（docs/tag-server-design.md §8「常駐」・docs/t5-handoff.md §3）:
+# banto-hub を Windows サービスとして常駐実行するための SCM 連携
+# （service_manager でのインストール/アンインストール・
+# service_dispatcher/service_control_handler での起動・停止制御）。
+# banto-hub は Windows 専用前提（tstore と同じ）だが、このワークスペース
+# 自体は `cargo check --workspace --all-targets` を他プラットフォーム
+# （CI）でも通す必要があるため、`[target]` セクションで Windows 限定の
+# 依存にする - Linux 上ではこの依存自体が存在しないので、これを使う
+# コード側は必ず `#[cfg(windows)]` で追加ガードすること
+# （`src/bin/win_service.rs` 参照）。
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8.1"
