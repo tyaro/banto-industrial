@@ -22,6 +22,7 @@ REST / WebSocket / MQTT / gRPC の4経路で外部へ公開する「タグサー
 8. [gRPC 設定](#8-grpc-設定)
 9. [死活監視](#9-死活監視)
 10. [Windows サービス化（常駐）](#10-windows-サービス化常駐)
+11. [インストーラ](#11-インストーラ)
 
 ## 1. 起動・環境変数
 
@@ -547,3 +548,108 @@ DB（`banto-hub.sqlite3`）・データディレクトリ・サービスログ�
 WebSocket の 8722 番、gRPC を有効化した場合は 50051 番）。コンソール
 モードとサービスモードでリスニングするポート・プロトコルに違いは
 ありません。
+
+## 11. インストーラ
+
+T5-2（docs/t5-handoff.md §3「インストーラ（既存2アプリのインストーラ
+構成を踏襲）」）。banto-hub は Tauri アプリではない（`src-tauri` を
+持たない、T0 決定）ため `cargo tauri build` は使えないが、既存2アプリ
+（ChronoGazer / relay-wright）と同じ NSIS 形式のインストーラを、
+`tauri-bundler` クレートを単体ライブラリとして呼び出す専用ツール
+（`apps/banto-hub/installer/`）で生成する。本節はこのインストーラを
+オーナーが実際にビルド・入手する手順と、インストール時の挙動を
+まとめたものです。
+
+### ビルド手順
+
+```powershell
+# 1. banto-hub.exe をリリースビルド（§1 と同じ、既存の標準手順）
+pnpm --filter banto-hub build
+cargo build -p banto-hub-core --bin banto-hub --features embed-ui --release
+
+# 2. インストーラを生成（既定で target/release/banto-hub.exe を対象にする）
+cargo run --manifest-path apps/banto-hub/installer/Cargo.toml --release
+```
+
+生成物は `target/release/bundle/nsis/BantoHub_<version>_x64-setup.exe`
+です。`apps/banto-hub/installer/` はルートの `banto-industrial`
+ワークスペースの member ではなく（独立した Cargo ワークスペース -
+`apps/banto-hub/installer/Cargo.toml` のコメント参照）、
+`cargo check --workspace --all-targets`（CI が ubuntu-latest 上で回す
+コマンド）には一切含まれません。このインストーラのビルドは Windows
+上でのパッケージング専用の作業であり、Windows 実機でのみ実行します。
+
+初回ビルド時、NSIS ツールセットがローカルにキャッシュされていない場合は
+自動的にダウンロードされます（インターネット接続が必要 -
+`%LOCALAPPDATA%\tauri\NSIS` にキャッシュされ、2回目以降はオフラインで
+ビルドできます）。
+
+### インストール時の挙動
+
+- **インストールモード**: 「全ユーザー（PerMachine、`C:\Program
+Files\BantoHub\`）」固定です。ChronoGazer/relay-wright の既定
+  （ユーザー単位インストールも選べる `Both` モード）とは異なり、
+  banto-hub は Windows サービスとして常駐させる前提のアプリのため、
+  インストーラ自体を管理者権限で実行する必要があります（UAC
+  プロンプトが出ます）。
+- **Windows サービスの自動登録**: インストール完了時（post-install
+  フック）に `banto-hub.exe install`（§10 参照）が自動的に実行され、
+  `BantoHub` サービスが登録されます。登録に失敗した場合（例:
+  既に同名サービスが存在する等）もインストーラ自体は中断せず、
+  進捗画面に案内メッセージを表示するだけに留まります - 失敗した場合は
+  §10「サービスの登録（install）」の手順で手動登録してください。
+  同様に、アンインストール開始時（pre-uninstall フック）には
+  `banto-hub.exe uninstall` が自動的に実行され、サービス登録を解除します。
+  サービスの**起動**（`Start-Service BantoHub`）はインストーラの範囲外
+  です - §10「起動確認」の手順で別途行ってください（起動種別が
+  「自動（遅延開始）」のため、OS 再起動でも自動的に立ち上がります）。
+- **「インストール後に BantoHub を実行する」チェックボックス（既知の
+  制約）**: tauri-bundler の NSIS テンプレートには、GUI アプリを前提と
+  した「完了ページでアプリを起動する」チェックボックスが標準で
+  含まれており、banto-hub 向けにこれを消す設定項目は tauri-bundler
+  側に用意されていません（`NsisSettings` を調査済み - 完全に消すには
+  テンプレート全体を独自の `.nsi` に差し替える必要があり、T5-2 の
+  スコープでは見送った）。**このチェックボックスをオンのまま完了すると、
+  `banto-hub.exe` がコンソール無しの前面プロセスとして直接起動します**
+  （サービス経由ではない）。既にサービスが起動している状態でこれを行うと
+  ポート（既定 8722）の二重 bind で失敗します。インストール完了画面では
+  **このチェックボックスを外す**ことを推奨します。誤って起動してしまった
+  場合は、そのプロセスを終了してから `Start-Service BantoHub`
+  でサービス経由に切り替えてください。
+- 環境変数（`PORT`/`BANTO_BIND`等）はサービス登録後のプロセスには
+  引き継がれません（§10 に記載の制約と同じ）。固定したい場合は
+  インストール前に OS のシステム環境変数として設定しておいてください。
+
+### アンインストール
+
+「アプリと機能」（Windows 設定）または `C:\Program
+Files\BantoHub\uninstall.exe` からアンインストールできます。
+前述のとおり、アンインストール開始時に自動的に `banto-hub.exe
+uninstall`（サービス登録解除）が実行されます。DB
+（`banto-hub.sqlite3`）・データディレクトリ・サービスログファイルは
+削除されません（§10「アンインストール」と同じ - 必要ならファイル自体を
+手動で削除してください）。
+
+### 既知の制約（tauri-bundler 単体利用について）
+
+- `apps/banto-hub/installer/` は完全な Tauri アプリ（`src-tauri`）を
+  作らず、`tauri_bundler::{SettingsBuilder, bundle_project}` を直接
+  呼び出す小さな Rust バイナリです。`tauri-bundler` クレートの安定な
+  公開 API（`Settings`/`SettingsBuilder`/`BundleSettings`/
+  `WindowsSettings`/`NsisSettings`/`PackageType`/`BundleBinary`/
+  `bundle_project`）だけで完結しており、`tauri.conf.json` や
+  `cargo tauri` CLI は一切経由しません。
+- `WindowsSettings::webview_install_mode`/`NsisSettings::install_mode`
+  の型（`WebviewInstallMode`/`NSISInstallerMode`）は `tauri-bundler`
+  のクレートルートからは再エクスポートされていないため、`tauri-utils`
+  （tauri-bundler 2.9.4 が実際に依存している 2.9.3 系）を直接の依存に
+  追加する必要があった。
+- NSIS の post-install/pre-uninstall フックへのカスタムスクリプト差し込み
+  （`NsisSettings::installer_hooks`）は tauri-bundler が公式にサポートする
+  拡張点で、`${MAINBINARYNAME}`/`$INSTDIR` 変数がその時点で参照できる
+  （`apps/banto-hub/installer/hooks/service-hooks.nsh` 参照）。この機構の
+  おかげで T5-1 の `install`/`uninstall` サブコマンドとの連携が実装できた
+  （上記「Windows サービスの自動登録」）。
+- 前述の「インストール後に実行」チェックボックスのように、GUI
+  アプリ前提の挙動を完全には消せない拡張点も存在する（`installer_hooks`
+  は4つの固定フックポイントのみで、任意の UI 変更はできない）。
