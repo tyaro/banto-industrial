@@ -472,6 +472,28 @@ axum の `ws` アップグレードで `/api/v1/stream`。メッセージは JSO
   ライブラリなしに購読できること自体が IPLink（ActiveX = Windows +
   COM 前提）に対する明確な差別化になる
 
+**ブラウザ WS クライアントの認証（T10、判断の記録、2026-08-07）**:
+本節冒頭の「アップグレードリクエストの Authorization ヘッダで検証」
+（§5.6）は機械クライアントを想定した書きぶりで、ブラウザ組み込みの
+`WebSocket` コンストラクタが `Authorization` 等の任意ヘッダを送れない
+という制約を考慮していなかった。T10（管理 UI のライブタグモニタ）が
+初めてブラウザから直接 `/api/v1/stream` へ接続するクライアントになった
+ため、この欠落を埋める必要が生じた。`?token=` のようなクエリパラメータ
+方式は採用しない（トークンがサーバーのアクセスログやブラウザ履歴に残る）。
+代わりに `Sec-WebSocket-Protocol` ヘッダをトークンの運び役に使う
+（`new WebSocket(url, ['bearer', token])` と書くとブラウザが
+`Sec-WebSocket-Protocol: bearer, <token>` を自動送信する、AWS IoT の
+ブラウザ MQTT-over-WS SDK 等でも使われる標準的な回避策）。`GET
+/api/v1/stream` 1ルートのみのフォールバックとし、他の `/api/v1/*` は
+一切影響を受けない（実装は `apps/banto-hub/core/src/rest.rs` の
+`extract_ws_protocol_token`、`require_tag_space_auth` からの呼び出し
+参照）。あわせて `ws_upgrade`（`apps/banto-hub/core/src/stream.rs`）は
+`WebSocketUpgrade::protocols(["bearer"])` でクライアントが実際に
+`bearer` をオファーした場合のみ応答へ選択結果を返す（オファーされて
+いないサブプロトコルを一方的に選択しないという RFC 6455 の規律どおり
+で、`Authorization` ヘッダのみで接続する既存の機械クライアントには
+一切影響しない）。
+
 ### 5.3 MQTT publish（T3）
 
 **外部ブローカーへ接続するクライアント**として実装する（rumqttc）。
@@ -836,7 +858,7 @@ relay-wright の専管）。
 | T7  | オンライン部分再構成（§4.3(c): I7 = 接続単位の入れ替え。それまでは全体再構築で代替）                                                            | T0, I7  | 外部契約（revision/config_changed）は不変のため後入れ可能。**実装済み（T7-1/T7-2、2026-08-05）** |
 | T8  | ワードデバイスのビットアクセス（§6.1: `D100.5` 記法、RMW + 確認読み）                                                                           | T2      | **実装済み（T8-1/T8-2、2026-08-06）**                                                            |
 | T9  | 接続単位のシミュレーションモード（[ux-plan.md](ux-plan.md) §1）                                                                                 | T0      | UX 改善第1弾（2026-08-06 オーナー決定）。**実装済み（T9-1/T9-2、2026-08-07）**                   |
-| T10 | ライブタグモニタ（[ux-plan.md](ux-plan.md) §2）                                                                                                 | T1      | T9 との相乗効果のため T9 の直後                                                                  |
+| T10 | ライブタグモニタ（[ux-plan.md](ux-plan.md) §2）                                                                                                 | T1      | T9 との相乗効果のため T9 の直後。**実装済み（2026-08-07）**                                      |
 | T11 | タグ定義の CSV インポート/エクスポート（[ux-plan.md](ux-plan.md) §3）                                                                           | T0      |                                                                                                  |
 | T12 | PLC 接続テストボタン（[ux-plan.md](ux-plan.md) §4）                                                                                             | T0      |                                                                                                  |
 

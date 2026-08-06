@@ -24,6 +24,7 @@ export const navItems: NavItem[] = [
 	{ path: '/plc-connections', label: 'PLC接続', icon: '🔌' },
 	{ path: '/collection-groups', label: '収集グループ', icon: '🗂️' },
 	{ path: '/tags', label: 'タグ登録', icon: '🏷️' },
+	{ path: '/monitor', label: 'タグモニタ', icon: '📈' },
 	{ path: '/api-keys', label: 'APIキー', icon: '🔑', adminOnly: true },
 	{ path: '/users', label: 'ユーザー管理', icon: '👤', adminOnly: true },
 	{ path: '/audit-log', label: '監査ログ', icon: '🧾', adminOnly: true },

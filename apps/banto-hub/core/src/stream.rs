@@ -119,7 +119,28 @@ pub(crate) async fn ws_upgrade(
     State(state): State<TagSpaceState>,
 ) -> Response {
     let manager = state.manager;
-    ws.on_upgrade(move |socket| handle_socket(socket, manager))
+    // T10（判断の記録、2026-08-07、`rest.rs::extract_ws_protocol_token` の
+    // doc comment も参照）: `.protocols(["bearer"])` は**選択**であって
+    // **無条件エコー**ではない - axum の実装（`WebSocketUpgrade::protocols`）
+    // はクライアントが実際にリクエストへ `Sec-WebSocket-Protocol` を含めて
+    // いた場合に限り、その中に "bearer" があれば応答へエコーする。
+    // クライアントが何もオファーしていなければ（`Authorization` ヘッダで
+    // 認証する既存の Rust テスト・API キークライアントは何もオファーし
+    // ない）応答は素のままで、RFC 6455 が禁じる「オファーされていない
+    // サブプロトコルの一方的な選択」には当たらない。
+    //
+    // これが要る理由: このリポジトリのテストクライアント
+    // `tokio-tungstenite`（`tungstenite` 0.29）は、クライアントが
+    // `Sec-WebSocket-Protocol` をオファーしたにもかかわらず応答に同ヘッダが
+    // 一切無いと、ハンドシェイク自体をクライアント側で `NoSubProtocol`
+    // エラーとして拒否する（RFC 6455 の文言そのものはここまで厳格ではない
+    // が、`tungstenite::handshake::client` の実装がそう検証している - 実測
+    // 済み）。ブラウザはこのケースでもエラーにせず `.protocol` が空文字に
+    // なるだけなので、この変更はブラウザ向けの動作を壊さず、むしろ
+    // `Sec-WebSocket-Protocol` 認証を使う全クライアント（ブラウザ・この
+    // テストスイート）でハンドシェイクが一貫して成功するようにする。
+    ws.protocols(["bearer"])
+        .on_upgrade(move |socket| handle_socket(socket, manager))
 }
 
 async fn handle_socket(socket: WebSocket, manager: Arc<CollectorManager>) {
