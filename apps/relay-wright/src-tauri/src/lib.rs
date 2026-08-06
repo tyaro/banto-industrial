@@ -3533,6 +3533,10 @@ mod tests {
                 threshold_ll: None,
                 string_length: None,
                 enabled: true,
+                writable: false,
+                tag_kind: "plc".to_string(),
+                expression: None,
+                retain: false,
             },
         )
         .await
@@ -3584,6 +3588,10 @@ mod tests {
                 threshold_ll: None,
                 string_length: None,
                 enabled: true,
+                writable: false,
+                tag_kind: "plc".to_string(),
+                expression: None,
+                retain: false,
             },
         )
         .await
@@ -3653,6 +3661,10 @@ mod tests {
                     threshold_ll: None,
                     string_length: None,
                     enabled: true,
+                    writable: false,
+                    tag_kind: "plc".to_string(),
+                    expression: None,
+                    retain: false,
                 },
             )
             .await
