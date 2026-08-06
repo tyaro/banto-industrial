@@ -244,6 +244,7 @@ async fn validate_by_replay(project: &ProjectFile) -> Result<(), BantoError> {
                 port: c.port,
                 unit_id: c.unit_id,
                 enabled: c.enabled,
+                simulation: false,
             })
             .await?;
         conn_map.insert(c.id, created.id);
@@ -663,6 +664,7 @@ mod tests {
                 port: 502,
                 unit_id: 1,
                 enabled: true,
+                simulation: false,
             })
             .await
             .unwrap();
@@ -900,6 +902,7 @@ mod tests {
                 port: 502,
                 unit_id: 1,
                 enabled: true,
+                simulation: false,
             })
             .await
             .unwrap();

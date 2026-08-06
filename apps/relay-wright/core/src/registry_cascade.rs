@@ -283,6 +283,7 @@ mod tests {
                     port: 5007,
                     unit_id: 1,
                     enabled: true,
+                    simulation: false,
                 })
                 .await
                 .expect("seed connection");

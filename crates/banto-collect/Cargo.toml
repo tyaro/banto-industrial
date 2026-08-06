@@ -11,10 +11,19 @@ publish.workspace = true
 # assemble a CollectorConfig snapshot. This is the one crate that bridges
 # I1/I2/I3a (see plan.md's dependency graph: I3b depends on I1, I2, I3a).
 banto-tags = { path = "../banto-tags" }
-# I2: PlcClient trait + Modbus TCP client + address/type parsing. The
-# `simulator` feature is a *dev*-dependency only (see below) - production
-# collection just uses ModbusTcpClient against a real device.
-banto-plc = { path = "../banto-plc" }
+# I2: PlcClient trait + Modbus TCP client + address/type parsing.
+#
+# T9-1 (docs/ux-plan.md §1, 2026-08-06 オーナー決定): the `simulator` feature
+# used to be a *dev*-dependency only ("production collection just uses
+# ModbusTcpClient against a real device"). That stopped being true with
+# 「接続単位のシミュレーションモード」: a `plc_connections.simulation = true`
+# row now makes `crate::simulation` spin up an in-process Modbus/SLMP
+# simulator at *runtime*, in every build, not just under `cfg(test)` - so the
+# feature moved here, to the non-dev dependency. This does cost every
+# consumer of this crate a real (loopback-only) TCP listener capability they
+# didn't previously link in, but that is exactly the point: simulation mode
+# is now a shipped product feature (ux-plan.md §1), not test infrastructure.
+banto-plc = { path = "../banto-plc", features = ["simulator"] }
 # I3a: the time-series sink (TsWriter) + its Clock seam + StoreConfig shapes.
 banto-tstore = { path = "../banto-tstore" }
 # build_config surfaces registry read failures as BantoError (the type
@@ -37,12 +46,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 
 [dev-dependencies]
-# Pull banto-plc's in-process Modbus TCP simulator into this crate's tests
-# (the I3 reuse the simulator was made public for - see
-# banto-plc/src/modbus/simulator.rs's module doc). Enabling it here also
-# means `cargo clippy --workspace --all-targets` and `cargo test --workspace`
-# both compile the simulator-feature code path.
-banto-plc = { path = "../banto-plc", features = ["simulator"] }
 # `test-util` enables tokio::time::pause for the virtual-time backoff tests;
 # `rt-multi-thread`/`macros` for #[tokio::test].
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util"] }

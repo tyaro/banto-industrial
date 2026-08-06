@@ -52,6 +52,33 @@
 //! (`host`/`port` were always plain `NOT NULL` columns with no `CHECK`, see
 //! migration `0007`'s own header), so this is purely an application-layer
 //! rule.
+//!
+//! ## `simulation` (T9-1, docs/ux-plan.md §1, 2026-08-06 オーナー決定)
+//!
+//! Migration `0008_plc_connections_add_simulation.sql` adds a `simulation`
+//! column (`INTEGER NOT NULL DEFAULT 0`), surfaced as [`PlcConnection::simulation`]/
+//! [`PlcConnectionInput::simulation`]. This is a per-connection flag
+//! *independent of* `protocol` - the owner explicitly rejected a
+//! `protocol = "simulation"` alternative because the whole point is
+//! "開発→実機の切り替えがチェックボックス1つ" (flip one checkbox, keep every
+//! other setting - name, groups, tags - untouched). When set,
+//! `banto_collect` (not this crate) substitutes an in-process simulator's
+//! loopback address for the connection's real `host`/`port` at collection
+//! time; this crate only stores and validates the flag.
+//!
+//! **Interaction with `"virtual"` (this module's doc comment above)**:
+//! [`validate_plc_connection_input`] rejects `simulation = true` combined
+//! with `protocol = "virtual"` as a `FieldError` on `simulation`, rather than
+//! silently ignoring the flag. A `"virtual"` connection dials nothing at all
+//! (no socket, ever - see above), so "simulate this connection" is not
+//! merely redundant for it, it is a category error: there is no real
+//! connection for a simulator to stand in for. Rejecting outright (instead
+//! of the alternative considered - silently treating `simulation` as a
+//! no-op for `"virtual"` rows) follows this module's existing precedent for
+//! `"virtual"`-specific illegal states (compare `update`/`delete`'s explicit
+//! `FieldError`s for editing/deleting a reserved connection): a clear
+//! validation error at write time is more honest than a flag that is
+//! silently truthy in the database but never observed by anything.
 
 use banto_core::{BantoError, FieldError, ListParams, ListResult};
 use banto_storage::ColumnMap;
@@ -105,6 +132,14 @@ fn default_enabled() -> bool {
     true
 }
 
+/// T9-1: a `PlcConnectionInput` missing `simulation` (an old client, or a
+/// direct Rust construction predating this field) builds as "not simulated" -
+/// the same backward-compatible stance migration `0008`'s column default
+/// takes (this module's doc comment, "simulation" section).
+fn default_simulation() -> bool {
+    false
+}
+
 /// A row of the `plc_connections` table, wire-shaped (camelCase) for a
 /// future settings grid (docs/recorder-requirements.md §6 "タグ設定"
 /// screen: "PLC 接続設定含む").
@@ -118,6 +153,8 @@ pub struct PlcConnection {
     pub port: i64,
     pub unit_id: i64,
     pub enabled: bool,
+    /// T9-1 (this module's doc comment, "simulation" section).
+    pub simulation: bool,
 }
 
 /// Create/update payload. `protocol`/`unit_id`/`enabled` default (spec:
@@ -136,6 +173,9 @@ pub struct PlcConnectionInput {
     pub unit_id: i64,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// T9-1 (this module's doc comment, "simulation" section).
+    #[serde(default = "default_simulation")]
+    pub simulation: bool,
 }
 
 /// Validate a [`PlcConnectionInput`]: `name`/`host` trimmed non-empty (name
@@ -196,6 +236,17 @@ fn validate_plc_connection_input(input: &PlcConnectionInput) -> Result<(), Banto
         });
     }
 
+    // T9-1 (this module's doc comment, "simulation" section): a "virtual"
+    // connection dials nothing, so "simulate this connection" is a category
+    // error, not a redundant-but-harmless flag - reject rather than silently
+    // ignore it.
+    if input.simulation && is_virtual {
+        errors.push(FieldError {
+            field: "simulation".to_string(),
+            message: "予約接続（calc/mem）はシミュレーションモードにできません".to_string(),
+        });
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -214,10 +265,11 @@ fn column_map() -> ColumnMap {
         .column("port", "port")
         .column("unitId", "unit_id")
         .column("enabled", "enabled")
+        .column("simulation", "simulation")
 }
 
 const RESOURCE: &str = "plc_connections";
-const COLUMNS: &str = "id, name, protocol, host, port, unit_id, enabled";
+const COLUMNS: &str = "id, name, protocol, host, port, unit_id, enabled, simulation";
 
 /// Service layer for the `plc_connections` resource. `Clone` is cheap
 /// (`SqlitePool` is `Arc`-backed), matching the pattern of every resource
@@ -276,8 +328,8 @@ impl PlcConnectionService {
     pub async fn create(&self, input: PlcConnectionInput) -> Result<PlcConnection, BantoError> {
         validate_plc_connection_input(&input)?;
         sqlx::query_as::<_, PlcConnection>(&format!(
-            "INSERT INTO plc_connections (name, protocol, host, port, unit_id, enabled) \
-             VALUES (?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
+            "INSERT INTO plc_connections (name, protocol, host, port, unit_id, enabled, simulation) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
         ))
         .bind(input.name.trim())
         .bind(&input.protocol)
@@ -285,6 +337,7 @@ impl PlcConnectionService {
         .bind(input.port)
         .bind(input.unit_id)
         .bind(input.enabled)
+        .bind(input.simulation)
         .fetch_one(&self.pool)
         .await
         .map_err(|err| map_write_error(err, "name", "", ""))
@@ -317,7 +370,7 @@ impl PlcConnectionService {
         }
 
         sqlx::query_as::<_, PlcConnection>(&format!(
-            "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ? \
+            "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ?, simulation = ? \
              WHERE id = ? RETURNING {COLUMNS}"
         ))
         .bind(input.name.trim())
@@ -326,6 +379,7 @@ impl PlcConnectionService {
         .bind(input.port)
         .bind(input.unit_id)
         .bind(input.enabled)
+        .bind(input.simulation)
         .bind(id)
         .fetch_one(&self.pool)
         .await
@@ -430,6 +484,7 @@ mod tests {
             port: 502,
             unit_id: 1,
             enabled: true,
+            simulation: false,
         }
     }
 
@@ -758,6 +813,7 @@ mod tests {
                 port: 0,
                 unit_id: 1,
                 enabled: true,
+                simulation: false,
             })
             .await
             .expect("a virtual connection should accept empty host / port 0");
@@ -799,6 +855,7 @@ mod tests {
                 port: 0,
                 unit_id: 1,
                 enabled: true,
+                simulation: false,
             })
             .await
             .unwrap();
@@ -827,6 +884,7 @@ mod tests {
                 port: 0,
                 unit_id: 1,
                 enabled: true,
+                simulation: false,
             })
             .await
             .unwrap();
@@ -1010,6 +1068,89 @@ mod tests {
         .execute(&mut *conn)
         .await
         .is_err());
+    }
+
+    // --- T9-1: "simulation" column (migration 0008) ------------------------
+
+    /// A `PlcConnectionInput` built with `simulation: false` (this file's
+    /// `sample_input`) round-trips as `false` - the baseline every other test
+    /// in this module already exercises implicitly, stated explicitly here as
+    /// the counterpart to `simulation_flag_round_trips_through_update`.
+    #[tokio::test]
+    async fn simulation_defaults_to_false_and_round_trips() {
+        let svc = service().await;
+        let created = svc.create(sample_input("Sim1")).await.unwrap();
+        assert!(!created.simulation);
+
+        let fetched = svc.get(created.id).await.unwrap();
+        assert!(!fetched.simulation);
+    }
+
+    /// `simulation: true` is accepted for an ordinary (non-`"virtual"`)
+    /// connection and persists through both `create` and a later `update`.
+    #[tokio::test]
+    async fn simulation_flag_round_trips_through_update() {
+        let svc = service().await;
+        let mut input = sample_input("Sim2");
+        input.simulation = true;
+        let created = svc.create(input).await.unwrap();
+        assert!(created.simulation);
+        assert!(svc.get(created.id).await.unwrap().simulation);
+
+        let mut off = sample_input("Sim2");
+        off.simulation = false;
+        let updated = svc.update(created.id, off).await.unwrap();
+        assert!(!updated.simulation);
+    }
+
+    /// This module's doc comment ("simulation" section): `simulation = true`
+    /// combined with `protocol = "virtual"` is a category error (a virtual
+    /// connection dials nothing for a simulator to stand in for) and is
+    /// rejected as a `FieldError` on `simulation`, not silently accepted.
+    #[tokio::test]
+    async fn create_rejects_simulation_on_a_virtual_connection() {
+        let svc = service().await;
+        let err = svc
+            .create(PlcConnectionInput {
+                name: CALC_CONNECTION_NAME.to_string(),
+                protocol: VIRTUAL_PROTOCOL.to_string(),
+                host: String::new(),
+                port: 0,
+                unit_id: 1,
+                enabled: true,
+                simulation: true,
+            })
+            .await
+            .unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "simulation");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// The reverse combination (`simulation: false`, `protocol: "virtual"`)
+    /// stays accepted - this is exactly `virtual_connection_accepts_empty_host_and_zero_port`
+    /// above, restated to pin down that the new check is specific to
+    /// `simulation = true`, not a general tightening of virtual-connection
+    /// validation.
+    #[tokio::test]
+    async fn a_non_simulated_virtual_connection_is_still_accepted() {
+        let svc = service().await;
+        let created = svc
+            .create(PlcConnectionInput {
+                name: MEM_CONNECTION_NAME.to_string(),
+                protocol: VIRTUAL_PROTOCOL.to_string(),
+                host: String::new(),
+                port: 0,
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+            })
+            .await
+            .expect("simulation: false must not be affected by the new check");
+        assert!(!created.simulation);
     }
 
     #[tokio::test]

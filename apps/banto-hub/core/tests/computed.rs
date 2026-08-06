@@ -121,6 +121,7 @@ fn modbus_conn_input(name: &str, port: u16) -> PlcConnectionInput {
         port: port as i64,
         unit_id: 1,
         enabled: true,
+        simulation: false,
     }
 }
 
@@ -132,6 +133,7 @@ fn virtual_conn_input(name: &str) -> PlcConnectionInput {
         port: 0,
         unit_id: 1,
         enabled: true,
+        simulation: false,
     }
 }
 

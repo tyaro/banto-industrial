@@ -120,6 +120,7 @@ impl Fixture {
                 port: sim.addr.port() as i64,
                 unit_id: 1,
                 enabled: true,
+                simulation: false,
             })
             .await
             .expect("create slmp connection");

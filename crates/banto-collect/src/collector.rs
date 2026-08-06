@@ -88,6 +88,23 @@
 //! passively (re-borrowing on their own next tick) - this is the whole
 //! mechanism that keeps their collection running without interruption.
 //!
+//! ### T9-1 addendum: simulated connections (docs/ux-plan.md §1)
+//!
+//! A connection whose [`crate::config::ConnectionPlan::simulation`] is `true`
+//! gets an in-process simulator ([`crate::simulation`]) instead of dialing
+//! its real host/port - started/stopped in exact lockstep with that
+//! connection's task, at every point this module already stops or spawns
+//! one: step 3 above (stop removed/replaced) also stops that connection's
+//! simulator if it has one, and step 5 (spawn added/replaced) also starts
+//! one before spawning if the *new* plan wants simulation. Because
+//! `simulation` participates in `ConnectionPlan`'s `PartialEq`, flipping it
+//! on or off with nothing else changed already makes the diff in step 1
+//! classify the connection "replaced" - no separate branch was needed
+//! anywhere in this method for "did simulation just turn on/off", the
+//! ordinary stop-then-spawn path *is* the simulator's stop-then-start. See
+//! `crate::simulation`'s module doc for why the address substitution itself
+//! happens here (at task-spawn time) rather than in `crate::config::build_config`.
+//!
 //! ### Why no `collection_started`/`collection_stopped` event
 //!
 //! Those two [`EventKind`] variants mean "the whole engine started/stopped"
@@ -114,6 +131,7 @@
 //! once no task remains to trigger a flush on its own.
 
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -122,10 +140,11 @@ use banto_tstore::{Clock, TsWriter, WriterOptions};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
-use crate::config::{CollectorConfig, ConnectionPlan, ProtocolConfig};
+use crate::config::{CollectorConfig, ConnectionPlan, Protocol, ProtocolConfig};
 use crate::current::CurrentValuesHandle;
 use crate::error::CollectError;
 use crate::event::{CollectEvent, EventKind, EventSink};
+use crate::simulation::{self, SimulatorHandle};
 use crate::task::{
     default_client_factory, retain_status, run_connection, BackoffConfig, ClientFactory,
     ConnectionStatus, StatusMap, TaskContext,
@@ -218,6 +237,13 @@ pub struct Collector {
     /// diff base. "Pristine" matters: see this module's doc comment point 3.
     config: CollectorConfig,
     tasks: HashMap<String, ConnectionTask>,
+    /// T9-1 (this module's doc comment, "T9-1 addendum"): one entry per
+    /// connection key currently running with `simulation = true`, owning that
+    /// connection's in-process simulator + ramp-wave generator task. Kept in
+    /// lockstep with `tasks` - never touched for a connection classified
+    /// "unchanged" by `apply_config`'s diff, added/removed/replaced exactly
+    /// when the corresponding task is.
+    simulators: HashMap<String, SimulatorHandle>,
 }
 
 impl Collector {
@@ -300,7 +326,16 @@ impl Collector {
             .await;
 
         let mut tasks = HashMap::with_capacity(config.connections.len());
+        let mut simulators: HashMap<String, SimulatorHandle> = HashMap::new();
         for plan in &config.connections {
+            let sim_addr = if plan.simulation {
+                let sim = simulation::start(protocol_of(plan)).await;
+                let addr = sim.addr();
+                simulators.insert(plan.key.clone(), sim);
+                Some(addr)
+            } else {
+                None
+            };
             let ctx = TaskContext {
                 writer_rx: writer_tx.subscribe(),
                 clock: clock.clone(),
@@ -311,7 +346,11 @@ impl Collector {
                 factory: factory.clone(),
             };
             let (stop_tx, stop_rx) = watch::channel(false);
-            let handle = tokio::spawn(run_connection(plan_for_task(plan, &options), ctx, stop_rx));
+            let handle = tokio::spawn(run_connection(
+                plan_for_task(plan, &options, sim_addr),
+                ctx,
+                stop_rx,
+            ));
             tasks.insert(plan.key.clone(), ConnectionTask { handle, stop_tx });
         }
 
@@ -325,6 +364,7 @@ impl Collector {
             options,
             config,
             tasks,
+            simulators,
         })
     }
 
@@ -414,10 +454,17 @@ impl Collector {
         };
 
         // --- 3. Stop + join removed/replaced connections' tasks only -------
+        // T9-1: a removed/replaced connection's simulator (if any) is stopped
+        // right alongside its task - see this module's doc comment, "T9-1
+        // addendum". Stopped after the task itself (the task may still be
+        // mid-`read_batch` against it up to the moment it joins).
         for key in removed.iter().chain(replaced.iter()) {
             if let Some(task) = self.tasks.remove(key) {
                 let _ = task.stop_tx.send(true);
                 let _ = task.handle.await;
+            }
+            if let Some(sim) = self.simulators.remove(key) {
+                sim.stop().await;
             }
         }
 
@@ -429,8 +476,19 @@ impl Collector {
         }
 
         // --- 5. Spawn tasks for added/replaced connections ------------------
+        // T9-1: start a fresh simulator first (if the new plan wants one) so
+        // its address is ready before the task that will read from it spawns
+        // - see this module's doc comment, "T9-1 addendum".
         for key in added.iter().chain(replaced.iter()) {
             let plan = new_map[key.as_str()];
+            let sim_addr = if plan.simulation {
+                let sim = simulation::start(protocol_of(plan)).await;
+                let addr = sim.addr();
+                self.simulators.insert(key.clone(), sim);
+                Some(addr)
+            } else {
+                None
+            };
             let ctx = TaskContext {
                 writer_rx: self.writer_tx.subscribe(),
                 clock: self.clock.clone(),
@@ -442,7 +500,7 @@ impl Collector {
             };
             let (stop_tx, stop_rx) = watch::channel(false);
             let handle = tokio::spawn(run_connection(
-                plan_for_task(plan, &self.options),
+                plan_for_task(plan, &self.options, sim_addr),
                 ctx,
                 stop_rx,
             ));
@@ -521,6 +579,14 @@ impl Collector {
             let _ = task.handle.await;
         }
 
+        // T9-1: every remaining simulator goes down after its task (this
+        // module's doc comment, "T9-1 addendum") - by construction there is
+        // one entry here only for a connection that was still running with
+        // simulation=true.
+        for (_key, sim) in self.simulators.drain() {
+            sim.stop().await;
+        }
+
         // Every task has now dropped its writer handle. Grab our own clone of
         // the current writer, then drop the `Sender` itself (the last
         // remaining holder of the channel's internal copy) so `writer` below
@@ -547,19 +613,54 @@ impl Collector {
 /// "task-ready" plan for a newly added/replaced connection without mutating
 /// the pristine plan [`Collector::config`] stores for future diffing (see
 /// this module's doc comment, point 3, for why that distinction matters).
-fn plan_for_task(plan: &ConnectionPlan, options: &CollectorOptions) -> ConnectionPlan {
+///
+/// T9-1: `sim_addr` is `Some` exactly when `plan.simulation` is true (the
+/// caller already started the simulator to get this address) - when present,
+/// it overrides `host`/`port` in the returned plan's protocol config, same as
+/// the timeout override above. The pristine `plan` passed in is never
+/// mutated, for the same reason the timeout override isn't baked into it
+/// either (this module's doc comment, point 3): a freshly rebuilt
+/// `CollectorConfig` always carries the registry's real host/port, so if the
+/// substituted address leaked into `self.config`, an otherwise-untouched
+/// simulated connection would spuriously compare unequal on the next
+/// `apply_config` call.
+fn plan_for_task(
+    plan: &ConnectionPlan,
+    options: &CollectorOptions,
+    sim_addr: Option<SocketAddr>,
+) -> ConnectionPlan {
     let mut plan = plan.clone();
     match &mut plan.config {
         ProtocolConfig::ModbusTcp(cfg) => {
             cfg.connect_timeout = options.connect_timeout;
             cfg.response_timeout = options.response_timeout;
+            if let Some(addr) = sim_addr {
+                cfg.host = addr.ip().to_string();
+                cfg.port = addr.port();
+            }
         }
         ProtocolConfig::Slmp(cfg) => {
             cfg.connect_timeout = options.connect_timeout;
             cfg.response_timeout = options.response_timeout;
+            if let Some(addr) = sim_addr {
+                cfg.host = addr.ip().to_string();
+                cfg.port = addr.port();
+            }
         }
     }
     plan
+}
+
+/// Project a [`ConnectionPlan`]'s protocol config down to the
+/// [`crate::config::Protocol`] [`crate::simulation::start`] dispatches on -
+/// the two are always in lockstep (`ProtocolConfig::ModbusTcp` iff
+/// `Protocol::ModbusTcp`, built from the same `build_config` match arm), so
+/// this is a plain projection, never a guess.
+fn protocol_of(plan: &ConnectionPlan) -> Protocol {
+    match &plan.config {
+        ProtocolConfig::ModbusTcp(_) => Protocol::ModbusTcp,
+        ProtocolConfig::Slmp(_) => Protocol::Slmp,
+    }
 }
 
 /// Retire one writer `Arc`: close (final flush + pool shutdown) if we hold
@@ -658,6 +759,7 @@ mod tests {
                 ..ModbusTcpConfig::default()
             }),
             groups: vec![group],
+            simulation: false,
         };
         CollectorConfig {
             connections: vec![conn],
@@ -730,6 +832,135 @@ mod tests {
             reads.load(Ordering::SeqCst) > 0,
             "the factory's FakeClient should have served at least one read_batch call"
         );
+
+        collector.stop().await.expect("stop should succeed");
+    }
+
+    /// Same shape as [`one_tag_config`], but `simulation: true` and pointed at
+    /// a host/port nothing could ever answer on (`203.0.113.1` is a
+    /// TEST-NET-3 address, RFC 5737 - guaranteed unroutable, not merely
+    /// "nothing listens here"). If `Collector` did not substitute the
+    /// simulator's loopback address for this before spawning the task, the
+    /// connect attempt would simply never succeed within the test's
+    /// deadline - the same proof-by-unreachable-address technique
+    /// `start_with_client_factory_uses_the_injected_client` uses for the
+    /// `ClientFactory` seam, applied here to the T9-1 substitution instead.
+    fn one_tag_config_simulated() -> CollectorConfig {
+        let mut config = one_tag_config();
+        let conn = &mut config.connections[0];
+        conn.simulation = true;
+        match &mut conn.config {
+            ProtocolConfig::ModbusTcp(cfg) => {
+                cfg.host = "203.0.113.1".to_string();
+                cfg.port = 502;
+            }
+            ProtocolConfig::Slmp(_) => unreachable!("one_tag_config always builds ModbusTcp"),
+        }
+        config
+    }
+
+    /// T9-1 (docs/ux-plan.md §1) end to end: a `simulation: true` connection,
+    /// started through the *default* client factory (real `ModbusTcpClient`,
+    /// no injected fake - unlike the test above), still collects live,
+    /// changing values - proof that `Collector` actually started an
+    /// in-process simulator and pointed the task at it, and that the
+    /// ramp-wave generator (`crate::simulation`) is really mutating its
+    /// registers over time, not just seeding a fixed value once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_simulated_connection_collects_live_changing_values() {
+        let dir = tempdir().expect("tempdir");
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect sqlite memory");
+        let collector = Collector::start(
+            one_tag_config_simulated(),
+            dir.path(),
+            Arc::new(SystemClock),
+            EventSink::new(pool),
+            CollectorOptions {
+                connect_timeout: Duration::from_millis(300),
+                response_timeout: Duration::from_millis(300),
+                ..CollectorOptions::default()
+            },
+        )
+        .await
+        .expect("start should succeed against the substituted simulator address");
+
+        let current = collector.current_values();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let first_value = loop {
+            if let Some(sample) = current.get("tag:1") {
+                if sample.quality == crate::current::Quality::Good {
+                    if let Some(v) = sample.value {
+                        break v;
+                    }
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no Good reading ever showed up - the connection never reached the \
+                 simulator, so the host/port substitution must not have happened"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        // The ramp-wave generator (100ms period) must move the value on -
+        // proof this is a live simulator, not a static seeded register.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(sample) = current.get("tag:1") {
+                if sample.value.is_some_and(|v| v != first_value) {
+                    break;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the simulated register never changed - the ramp-wave generator task \
+                 must not be running"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        collector.stop().await.expect("stop should succeed");
+    }
+
+    /// T9-1: toggling only `simulation` (everything else on the connection
+    /// unchanged) must still make `apply_config`'s diff classify the
+    /// connection "replaced", not "unchanged" - the mechanism this module's
+    /// doc comment ("T9-1 addendum") relies on to piggyback the simulator's
+    /// stop/start onto the ordinary stop-then-spawn path, with no dedicated
+    /// branch of its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn toggling_simulation_alone_is_classified_as_replaced() {
+        let dir = tempdir().expect("tempdir");
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect sqlite memory");
+        let options = CollectorOptions {
+            connect_timeout: Duration::from_millis(200),
+            response_timeout: Duration::from_millis(200),
+            ..CollectorOptions::default()
+        };
+
+        let mut collector = Collector::start(
+            one_tag_config(),
+            dir.path(),
+            Arc::new(SystemClock),
+            EventSink::new(pool),
+            options,
+        )
+        .await
+        .expect("start should succeed");
+
+        let simulated = one_tag_config_simulated();
+        let report = collector
+            .apply_config(simulated, default_client_factory())
+            .await
+            .expect("apply_config should succeed");
+        assert_eq!(report.added, Vec::<String>::new());
+        assert_eq!(report.removed, Vec::<String>::new());
+        assert_eq!(report.replaced, vec!["conn:1".to_string()]);
+        assert_eq!(report.unchanged, Vec::<String>::new());
 
         collector.stop().await.expect("stop should succeed");
     }

@@ -69,6 +69,47 @@
 //! so `/api/v1/status` surfaces the broker's answer for SLMP connections,
 //! per the design decision this module implements.
 //!
+//! ## T9-1/T9-2 note: SLMP simulation mode is not wired up here yet
+//!
+//! docs/ux-plan.md §1 (2026-08-06, 「接続単位のシミュレーションモード」) adds
+//! `banto_tags::PlcConnection::simulation`; for `simulation = true` Modbus
+//! connections and for SLMP connections that bypass this broker entirely,
+//! `banto_collect::Collector` now starts an in-process simulator and
+//! substitutes its loopback address for the connection's real host/port
+//! itself, at task-spawn time (`crates/banto-collect/src/simulation.rs` and
+//! `crates/banto-collect/src/collector.rs`'s "T9-1 addendum" doc section) -
+//! no change needed in this module for those.
+//!
+//! A broker-managed SLMP connection is different: [`HubSessions::ensure_connection`]
+//! dials `conn.host`/`conn.port` straight from the `banto_tags::PlcConnection`
+//! row, and `crate::hub::CollectorManager::rebuild` calls it (session sync)
+//! *before* building the [`hub_client_factory`] it hands to
+//! `Collector::apply_config` - i.e. the broker session for an SLMP connection
+//! is already established by the time `Collector` would otherwise decide to
+//! start that connection's simulator. So a simulated broker-managed SLMP
+//! connection today would have its broker session dial the *real* (and, in
+//! dev/test use, generally unreachable) host/port unchanged - simulation mode
+//! silently does not take effect for it.
+//!
+//! The natural substitution point, once T9-2 wires this up: `rebuild` must
+//! know the simulator's address *before* calling `ensure_connection`, which
+//! means the simulator for such a connection cannot be owned by `Collector`
+//! (whose simulator only exists once its task spawns, which is necessarily
+//! later in the same `rebuild` call). The two options considered: (a) give
+//! `CollectorManager` its own simulator registry, sibling to [`HubSessions`],
+//! keyed by connection id, consulted before `ensure_connection` for any
+//! enabled `simulation = true` SLMP connection (and torn down on the same
+//! removal sweep this struct's "Session sync policy" section already
+//! performs) - `Collector` would then see `simulation = false` effectively
+//! for broker-routed connections and simply not start a second, redundant
+//! simulator; or (b) reorder `rebuild` so session sync runs *after*
+//! `Collector::apply_config`, threading the address `Collector` already
+//! assigned back into `ensure_connection` - rejected as the bigger change,
+//! since every other ordering constraint this struct documents (the T7-2
+//! "Session sync policy" section, and `CollectorManager::rebuild`'s own doc
+//! comment) is built around sync-then-apply. (a) is the smaller, more
+//! surgical change and is the one T9-2 should implement.
+//!
 //! ## Value type coverage: numeric/bit only
 //!
 //! [`BrokerReadClient::read_batch`] only ever needs to translate

@@ -113,6 +113,7 @@ fn conn_input(name: &str, port: u16) -> PlcConnectionInput {
         port: port as i64,
         unit_id: 1,
         enabled: true,
+        simulation: false,
     }
 }
 

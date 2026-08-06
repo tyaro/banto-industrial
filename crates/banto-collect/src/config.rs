@@ -158,6 +158,23 @@ pub(crate) struct ConnectionPlan {
     pub key: String,
     pub config: ProtocolConfig,
     pub groups: Vec<GroupPlan>,
+    /// T9-1 (docs/ux-plan.md §1, 2026-08-06 オーナー決定): mirrors
+    /// `banto_tags::PlcConnection::simulation`. Carried on the plan (not just
+    /// consulted once during `build_config`) for two reasons: (1) it must
+    /// participate in this struct's `PartialEq` so toggling simulation on/off
+    /// with every other setting unchanged still makes `apply_config` (T7-1)
+    /// classify the connection "replaced" - the ordinary "this connection's
+    /// task gets stopped and respawned" path is exactly what starting/
+    /// stopping the in-process simulator needs to piggyback on (see
+    /// `crate::collector`'s module doc, T9-1 addendum); (2)
+    /// `crate::collector::Collector` reads it at task-spawn time to decide
+    /// whether to start a simulator and substitute its loopback address for
+    /// `config`'s real host/port before the task ever sees the plan - see
+    /// `crate::simulation`'s module doc for why that substitution happens
+    /// there and not here (this function keeps producing the DB-truth plan;
+    /// `Collector` is what needs a stable address across repeated
+    /// `apply_config` calls to diff against).
+    pub simulation: bool,
 }
 
 /// The immutable configuration snapshot [`crate::Collector::start`] consumes.
@@ -360,6 +377,7 @@ pub async fn build_config(pool: &SqlitePool) -> Result<CollectorConfig, CollectE
             key: connection_key(conn.id),
             config: client_config,
             groups: group_plans,
+            simulation: conn.simulation,
         });
     }
 
@@ -519,6 +537,7 @@ mod tests {
             port,
             unit_id: 1,
             enabled: true,
+            simulation: false,
         }
     }
 
@@ -593,6 +612,7 @@ mod tests {
 
         let c = &config.connections[0];
         assert_eq!(c.key, format!("conn:{}", conn.id));
+        assert!(!c.simulation, "conn_input defaults to simulation: false");
         match &c.config {
             ProtocolConfig::ModbusTcp(modbus) => {
                 assert_eq!(modbus.host, "127.0.0.1");
@@ -864,6 +884,60 @@ mod tests {
         assert_eq!(c.groups[0].requests.len(), 1);
     }
 
+    /// T9-1 (docs/ux-plan.md §1): `PlcConnection::simulation` carries through
+    /// unchanged into `ConnectionPlan::simulation` - `build_config` itself
+    /// never starts a simulator or touches host/port (`ConnectionPlan`'s own
+    /// doc comment: that substitution is `crate::collector::Collector`'s job,
+    /// done at task-spawn time, not here) - this just pins down that the flag
+    /// is not dropped along the way.
+    #[tokio::test]
+    async fn simulation_flag_is_carried_into_the_connection_plan() {
+        let pool = registry().await;
+        let plc_svc = PlcConnectionService::new(pool.clone());
+        let mut sim_input = conn_input("Simulated", 502);
+        sim_input.simulation = true;
+        let sim_conn = plc_svc.create(sim_input).await.unwrap();
+        let sim_group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", sim_conn.id, 1_000))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input("T1", sim_group.id, "40001"))
+            .await
+            .unwrap();
+
+        let real_conn = plc_svc.create(conn_input("Real", 503)).await.unwrap();
+        let real_group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G2", real_conn.id, 1_000))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input("T2", real_group.id, "40001"))
+            .await
+            .unwrap();
+
+        let config = build_config(&pool).await.unwrap();
+        assert_eq!(config.connections.len(), 2);
+        let sim_plan = config
+            .connections
+            .iter()
+            .find(|c| c.key == format!("conn:{}", sim_conn.id))
+            .expect("simulated connection should be in the config");
+        assert!(sim_plan.simulation);
+        // build_config never rewrites host/port for a simulated connection -
+        // that is Collector's job (see ConnectionPlan's doc comment).
+        match &sim_plan.config {
+            ProtocolConfig::ModbusTcp(modbus) => assert_eq!(modbus.port, 502),
+            ProtocolConfig::Slmp(_) => panic!("expected ModbusTcp config"),
+        }
+        let real_plan = config
+            .connections
+            .iter()
+            .find(|c| c.key == format!("conn:{}", real_conn.id))
+            .expect("real connection should be in the config");
+        assert!(!real_plan.simulation);
+    }
+
     /// A Modbus-notation address on an `"slmp"` connection must be rejected
     /// at config-build time (`Address::parse_slmp` does not understand
     /// `"40001"`), mirroring `invalid_address_is_a_config_error` for the
@@ -917,6 +991,7 @@ mod tests {
                 port: 0,
                 unit_id: 1,
                 enabled: true,
+                simulation: false,
             })
             .await
             .unwrap();

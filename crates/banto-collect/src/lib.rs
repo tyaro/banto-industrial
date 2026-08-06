@@ -60,6 +60,11 @@ pub mod config;
 pub mod current;
 pub mod error;
 pub mod event;
+// T9-1 (docs/ux-plan.md §1): in-process simulator lifecycle for
+// `simulation = true` connections - purely an internal implementation
+// detail of `crate::collector::Collector`, nothing here is part of this
+// crate's public API.
+mod simulation;
 mod task;
 
 pub use collector::{ApplyReport, Collector, CollectorOptions};

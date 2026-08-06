@@ -45,6 +45,7 @@ impl Fixture {
                 port: sim.addr.port() as i64,
                 unit_id: 1,
                 enabled: true,
+                simulation: false,
             })
             .await
             .expect("create slmp connection");
@@ -380,6 +381,7 @@ async fn monitor_rejects_a_modbus_connection_with_a_clear_error() {
             port: 502,
             unit_id: 1,
             enabled: true,
+            simulation: false,
         })
         .await
         .expect("create modbus connection");
