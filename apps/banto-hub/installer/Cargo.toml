@@ -1,0 +1,47 @@
+[package]
+name = "banto-hub-installer"
+description = "banto-hub 用 Windows インストーラ生成ツール（T5-2、docs/t5-handoff.md §3）。tauri-bundler をライブラリとして単体呼び出しし、リリースビルド済み banto-hub.exe を NSIS インストーラに包む。フル Tauri アプリ化はしない（T0 決定）ので `cargo tauri build` は使えず、このバイナリが xtask 的な代替になる。"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# このパッケージは意図的にルートの `banto-industrial` ワークスペースの
+# member にしない（T5-2 タスク指示）。banto-hub インストーラのビルドは
+# Windows 上でのパッケージング専用作業で、ルート `Cargo.toml` の
+# `[workspace] members` に加えると `cargo check --workspace --all-targets`
+# （このリポジトリの CI は ubuntu-latest 上でこれを回している）が
+# tauri-bundler 一式（Windows 専用のバンドル処理を含む）まで巻き込んでしまう。
+# ここで空の `[workspace]` テーブルを宣言してこのディレクトリ自体を
+# 独立したワークスペースルートにすることで、cargo が上位ディレクトリの
+# `banto-industrial` ワークスペースを探しにいかなくなる（ルート
+# `Cargo.toml` の `[workspace] exclude` を触る必要がない — cargo は
+# 通常「ワークスペースの一部だと思っているが member/exclude どちらにも
+# 無い」場合にエラーを出すが、ここに `[workspace]` があるとその探索が
+# ここで止まる）。呼び出しは
+# `cargo run --manifest-path apps/banto-hub/installer/Cargo.toml -- <banto-hub.exeのパス>`
+# のように独立して行う。
+[workspace]
+
+[dependencies]
+# tauri-cli 2.9.4（このマシンに既に導入済み、`cargo tauri --version`で確認）
+# と揃うバージョン系。フル Tauri アプリ（src-tauri）を作らずに、この
+# クレートが内部で使っている NSIS バンドラだけを直接呼び出す
+# （オーナー決定 2026-08-06、docs/t5-handoff.md §3）。ソースは
+# https://github.com/tauri-apps/tauri のタグ `tauri-bundler-v2.9.4`
+# （モノレポ全体のタグ `tauri-v2.9.4` は別物 - tauri 本体クレートの
+# バージョンで、当時の tauri-bundler は 2.7.4 だった。要調査・要確認）。
+tauri-bundler = "2.9.4"
+# `WindowsSettings::webview_install_mode` / `NsisSettings::install_mode` /
+# `NsisSettings::compression` の型（`WebviewInstallMode`/
+# `NSISInstallerMode`/`NsisCompression`）は tauri-bundler のクレートルート
+# からは再エクスポートされていない（`bundle.rs`の`pub use`一覧に無い -
+# ソース確認済み）ため、tauri-bundler 2.9.4 が実際に依存している
+# tauri-utils 2.9.3 と同じバージョンを直接指定する。
+tauri-utils = "2.9.3"
+anyhow = "1"
+# tauri-bundler は `log` クレートのマクロで進捗（NSIS ツールセットの
+# 検証・生成物パス等）を出す。バックエンドが無いと何も表示されないため、
+# 簡易ロガーを繋ぐ（このバイナリ専用、他クレートには影響しない）。
+env_logger = "0.11"
+log = "0.4"
