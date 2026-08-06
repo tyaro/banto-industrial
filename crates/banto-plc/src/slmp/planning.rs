@@ -75,12 +75,14 @@ fn max_count_for(access: SlmpAccess) -> u32 {
 }
 
 /// v1 restriction, deliberately identical in shape to the Modbus planner's
-/// (docs/plan.md I2 §4): a `bit` tag addresses a bit device, every other data
-/// type addresses a word device. "One bit out of a `D` register" (`D100.5`) is
-/// a real MELSEC form and a real eventual need, but it needs a read strategy
-/// here and a bit-offset field on [`crate::address::Address`] before the
-/// parser should start accepting it - see [`super::address::parse`]'s doc
-/// comment.
+/// (docs/plan.md I2 §4): a `bit` tag with **no** bit-in-word qualifier
+/// addresses a bit device, every other unqualified data type addresses a
+/// word device. This is exactly the pre-T8 shape - a bit-in-word request
+/// (`D100.5`, T8, docs/tag-server-design.md §6.1) is a *different*
+/// combination handled separately in [`plan_slmp_batch`]'s per-request match,
+/// not folded into this function, so `is_compatible`'s contract never had to
+/// change: it still means "does this data type live at this device with no
+/// bit qualifier".
 fn is_compatible(access: SlmpAccess, data_type: DataType) -> bool {
     match access {
         SlmpAccess::Bit => data_type == DataType::Bit,
@@ -96,7 +98,22 @@ fn is_compatible(access: SlmpAccess, data_type: DataType) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadKind {
     Numeric(DataType),
-    Str { words: u16 },
+    Str {
+        words: u16,
+    },
+    /// A single bit of a *word* device (T8, docs/tag-server-design.md §6.1:
+    /// `"D100.5"`) - the group is still an ordinary word-unit bulk read
+    /// (`span` is 1 register, exactly like [`ReadKind::Numeric`] with a
+    /// 16-bit type), only the decode step differs: `slmp/mod.rs` extracts
+    /// bit `bit` of the fetched word instead of interpreting the whole word
+    /// as a number. Never appears for a *bit device* read (`M`/`X`/`Y`/...) -
+    /// those still decode via [`ReadKind::Numeric`]`(DataType::Bit)`
+    /// exactly as before T8, because their `GroupValues::Bits` response
+    /// never reaches the `kind` match at all (see `slmp/mod.rs`'s
+    /// `execute_slmp_batch_reads`).
+    BitInWord {
+        bit: u8,
+    },
 }
 
 /// Where one original request lands within a [`SlmpPlannedRead`]'s response
@@ -191,6 +208,26 @@ pub fn plan_slmp_requests(requests: &[ReadRequest]) -> SlmpPlanOutcome {
 /// A tag whose *device number* does not exist on the CPU cannot be caught
 /// here (only the CPU knows its own catalogue); that one comes back as a
 /// [`PlcError::SlmpEndCode`] `Bad` for its group at read time.
+///
+/// ## T8 bit-in-word requests (docs/tag-server-design.md §6.1)
+///
+/// A [`BatchReadRequest::Numeric`] whose address carries a bit position
+/// (`address.as_slmp()`'s third element) is accepted only at a **word**
+/// device with `data_type == DataType::Bit` - the exact combination
+/// [`super::address::parse`] already restricts the address text to, but
+/// `data_type` is a separate `banto-tags::Tag` column that a misconfigured
+/// tag could still disagree with, so it is re-validated here and rejected as
+/// [`PlcError::UnsupportedCombination`] like any other mismatch this
+/// function resolves. Once accepted, it becomes [`ReadKind::BitInWord`] and
+/// is grouped by `(device, number)` exactly like a plain 16-bit numeric tag
+/// at that same device/number - one word, `span` 1 - so it shares a group
+/// (and therefore a wire round trip) with every other tag on that word,
+/// bit-qualified or not, via the same adjacency/gap merging below. This is
+/// what makes "16 bit tags on one `D` register cost one read, not sixteen"
+/// true without any dedicated dedup logic: the existing
+/// `duplicate_addresses_both_map_into_the_same_group` mechanism already
+/// covers same-address duplicates, and different-bit requests at the same
+/// `(device, number)` are just more entries in that same group's `mapping`.
 pub fn plan_slmp_batch(requests: &[BatchReadRequest]) -> SlmpPlanOutcome {
     let mut immediate_bad = Vec::new();
 
@@ -200,11 +237,11 @@ pub fn plan_slmp_batch(requests: &[BatchReadRequest]) -> SlmpPlanOutcome {
     // the Modbus planner.
     let mut by_device: BTreeMap<SlmpDevice, Vec<(usize, u32, ReadKind)>> = BTreeMap::new();
     for (index, req) in requests.iter().enumerate() {
-        let (address, kind) = match req {
+        let (address, mut kind) = match req {
             BatchReadRequest::Numeric(r) => (r.address, ReadKind::Numeric(r.data_type)),
             BatchReadRequest::String(s) => (s.address, ReadKind::Str { words: s.words }),
         };
-        let Some((device, number)) = address.as_slmp() else {
+        let Some((device, number, bit_pos)) = address.as_slmp() else {
             immediate_bad.push((
                 index,
                 PlcError::AddressProtocolMismatch {
@@ -216,8 +253,22 @@ pub fn plan_slmp_batch(requests: &[BatchReadRequest]) -> SlmpPlanOutcome {
         };
 
         match kind {
-            ReadKind::Numeric(data_type) => {
-                if !is_compatible(device.access(), data_type) {
+            ReadKind::Numeric(data_type) => match (device.access(), data_type, bit_pos) {
+                // T8: a bit-in-word request at a word device folds into the
+                // ordinary word read (see this function's doc comment).
+                (SlmpAccess::Word, DataType::Bit, Some(bit)) => {
+                    kind = ReadKind::BitInWord { bit };
+                }
+                // Pre-T8 shape: no bit qualifier, ordinary compatibility
+                // check unchanged.
+                (access, dt, None) if is_compatible(access, dt) => {}
+                // Every other combination is a mismatch: `bit` data type at
+                // a word device with no bit position (still ambiguous,
+                // unchanged from pre-T8), a bit-in-word address whose
+                // `data_type` is not `bit`, or a bit qualifier that reached
+                // here on a bit device (defensive only - `super::address::parse`
+                // already refuses to produce that address).
+                _ => {
                     immediate_bad.push((
                         index,
                         PlcError::UnsupportedCombination {
@@ -227,11 +278,13 @@ pub fn plan_slmp_batch(requests: &[BatchReadRequest]) -> SlmpPlanOutcome {
                     ));
                     continue;
                 }
-            }
+            },
             ReadKind::Str { words } => {
                 // Strings live in word devices only - same v1 rule as every
-                // non-bit numeric type.
-                if device.access() != SlmpAccess::Word {
+                // non-bit numeric type - and never carry a bit qualifier of
+                // their own (a string occupies a whole span of words, not
+                // one bit of one).
+                if device.access() != SlmpAccess::Word || bit_pos.is_some() {
                     immediate_bad.push((
                         index,
                         PlcError::UnsupportedCombination {
@@ -255,6 +308,16 @@ pub fn plan_slmp_batch(requests: &[BatchReadRequest]) -> SlmpPlanOutcome {
                     ));
                     continue;
                 }
+            }
+            // `kind` is only ever constructed as `Numeric`/`Str` a few lines
+            // above (from `req`'s own two variants) - the `Numeric` arm
+            // above may *reassign* it to `BitInWord`, but the value being
+            // matched here is always the freshly-constructed one, so this
+            // arm can never actually run. Kept instead of a wildcard so a
+            // future third `BatchReadRequest` variant cannot silently fall
+            // through this match unnoticed.
+            ReadKind::BitInWord { .. } => {
+                unreachable!("BitInWord is only produced inside the Numeric arm above")
             }
         }
 
@@ -282,6 +345,10 @@ pub fn plan_slmp_batch(requests: &[BatchReadRequest]) -> SlmpPlanOutcome {
                 SlmpAccess::Word => match kind {
                     ReadKind::Numeric(data_type) => data_type.register_span() as u64,
                     ReadKind::Str { words } => words as u64,
+                    // T8: one bit out of one word is still exactly one
+                    // register - the same span a plain 16-bit numeric tag
+                    // would occupy at this device/number.
+                    ReadKind::BitInWord { .. } => 1u64,
                 },
             };
             let start = number as u64;
@@ -630,6 +697,85 @@ mod tests {
             .collect();
         seen.sort();
         assert_eq!(seen, (0..requests.len()).collect::<Vec<_>>());
+    }
+
+    // --- T8, docs/tag-server-design.md §6.1: bit-in-word requests ----------
+
+    /// The core §6.1 property: a bit-in-word request folds into the ordinary
+    /// word read - `count` stays 1, not 2, for a single `D100.5` tag.
+    #[test]
+    fn bit_in_word_request_folds_into_the_ordinary_word_read() {
+        let outcome = plan_slmp_requests(&[req("D100.5", DataType::Bit)]);
+        assert!(outcome.immediate_bad.is_empty());
+        assert_eq!(outcome.reads.len(), 1);
+        let g = &outcome.reads[0];
+        assert_eq!(g.device, SlmpDevice::D);
+        assert_eq!(g.start, 100);
+        assert_eq!(g.count, 1, "one bit-in-word tag must cost exactly one word");
+        assert_eq!(g.mapping[0].kind, ReadKind::BitInWord { bit: 5 });
+    }
+
+    /// Many bits of the *same* word must not duplicate the read - they all
+    /// land in the one group's `mapping`, exactly like duplicate plain
+    /// addresses already do.
+    #[test]
+    fn all_sixteen_bit_positions_of_one_word_share_a_single_read() {
+        let requests: Vec<ReadRequest> = (0..=15)
+            .map(|bit| req(&format!("D200.{bit}"), DataType::Bit))
+            .collect();
+        let outcome = plan_slmp_requests(&requests);
+        assert!(outcome.immediate_bad.is_empty());
+        assert_eq!(outcome.reads.len(), 1, "16 bits of one word, one read");
+        let g = &outcome.reads[0];
+        assert_eq!(g.count, 1);
+        assert_eq!(g.mapping.len(), 16);
+        let mut bits: Vec<u8> = g
+            .mapping
+            .iter()
+            .map(|m| match m.kind {
+                ReadKind::BitInWord { bit } => bit,
+                other => panic!("expected BitInWord, got {other:?}"),
+            })
+            .collect();
+        bits.sort();
+        assert_eq!(bits, (0..=15).collect::<Vec<u8>>());
+    }
+
+    /// A bit-in-word tag alongside a plain numeric tag at the next word still
+    /// merges into one read via the ordinary adjacency rule, unaffected by
+    /// the bit qualifier.
+    #[test]
+    fn bit_in_word_request_merges_with_an_adjacent_plain_numeric_request() {
+        let outcome = plan_slmp_requests(&[req("D0.3", DataType::Bit), req("D1", DataType::U16)]);
+        assert_eq!(outcome.reads.len(), 1);
+        assert_eq!(outcome.reads[0].count, 2);
+    }
+
+    /// A tag whose address names a bit position but whose `data_type` column
+    /// disagrees (not `bit`) is a per-request configuration error, not a
+    /// silent whole-word read.
+    #[test]
+    fn bit_in_word_address_with_a_non_bit_data_type_is_immediately_bad() {
+        let outcome = plan_slmp_requests(&[req("D0.5", DataType::U16)]);
+        assert!(outcome.reads.is_empty());
+        assert_eq!(outcome.immediate_bad.len(), 1);
+        assert!(matches!(
+            outcome.immediate_bad[0].1,
+            PlcError::UnsupportedCombination { .. }
+        ));
+    }
+
+    /// Existing (non-bit-qualified) behavior must be completely unchanged -
+    /// re-running representative pre-T8 cases through the same function
+    /// pins that down.
+    #[test]
+    fn pre_t8_requests_are_unaffected_by_the_bit_in_word_addition() {
+        let outcome = plan_slmp_requests(&[req("D0", DataType::U16), req("D1", DataType::U16)]);
+        assert_eq!(outcome.reads.len(), 1);
+        assert_eq!(outcome.reads[0].count, 2);
+        for m in &outcome.reads[0].mapping {
+            assert_eq!(m.kind, ReadKind::Numeric(DataType::U16));
+        }
     }
 
     // --- string spans (S1 文字列タグ) --------------------------------------

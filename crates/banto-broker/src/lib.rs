@@ -1034,6 +1034,14 @@ mod tests {
         })
     }
 
+    /// T8 (docs/tag-server-design.md §6.1) bit-in-word write request.
+    fn bwreq(raw: &str, value: bool) -> BatchWriteRequest {
+        BatchWriteRequest::BitInWord {
+            address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw}: {e}")),
+            value,
+        }
+    }
+
     /// Poll `handle.read` until the session comes up (real time - connecting
     /// to a loopback simulator settles in low single-digit milliseconds) or a
     /// generous deadline elapses, so tests don't race the connect task that
@@ -1229,6 +1237,55 @@ mod tests {
         assert_eq!(
             read_results,
             vec![BatchReadResult::Value(PlcValue::F64(777.0))]
+        );
+
+        supervisor.shutdown().await;
+    }
+
+    /// T8 E2E (docs/tag-server-design.md §6.1): a `BitInWord` write submitted
+    /// through `BrokerHandle::write` - exactly the same entry point
+    /// `write_then_read_reflects_the_write_over_the_single_session` above
+    /// uses for an ordinary write - runs its full read/modify/write/confirm
+    /// RMW sequence inside the one `Job::Write` this broker already knows how
+    /// to service, and the result is visible to a normal follow-up read. This
+    /// is the "broker needs no code changes" claim (§6.1, this crate's own
+    /// module doc's "Why SLMP-only" section) demonstrated rather than merely
+    /// asserted: `banto-broker`'s source has not changed to make this pass -
+    /// only `banto-plc-write`'s planner/executor did.
+    #[tokio::test]
+    async fn bit_in_word_write_through_the_broker_lands_and_reads_back() {
+        let sim = Simulator::start().await;
+        sim.set_word(banto_plc::SlmpDevice::D, 300, 0x1234);
+        let connections = [conn(1, "slmp", "127.0.0.1", sim.addr.port())];
+        let supervisor =
+            BrokerSupervisor::spawn(&connections, BackoffConfig::default()).expect("spawn");
+        let handle = supervisor.handle(1).expect("handle");
+
+        // Wait for the session to come up, same as the ordinary-write test.
+        let _ = read_once_connected(&handle, vec![rreq("D300", DataType::U16)]).await;
+
+        // bit 0 is clear in the seed word (0x1234) - set it.
+        let write_results = handle
+            .write(vec![bwreq("D300.0", true)])
+            .await
+            .expect("bit-in-word write should succeed");
+        assert_eq!(write_results, vec![WriteResult::Ok]);
+
+        // The bit landed, and every other bit of the seed word survived -
+        // read back both as a whole word and as the individual bit tag.
+        let read_results = handle
+            .read(vec![
+                rreq("D300", DataType::U16),
+                rreq("D300.0", DataType::Bit),
+            ])
+            .await
+            .expect("read should succeed");
+        assert_eq!(
+            read_results,
+            vec![
+                BatchReadResult::Value(PlcValue::F64(0x1235 as f64)),
+                BatchReadResult::Value(PlcValue::Bit(true)),
+            ]
         );
 
         supervisor.shutdown().await;

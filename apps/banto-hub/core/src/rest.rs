@@ -2430,8 +2430,9 @@ async fn v1_events(
 /// 検証はハンドラ内で行う。
 #[derive(Debug, Deserialize, ToSchema)]
 struct WriteValueRequest {
-    /// 書き込む工学値。数値、または bit タグ向けの真偽値
-    /// （真偽値は 1.0/0.0 として扱う）。
+    /// 書き込む工学値。数値タグには数値、bit タグには真偽値
+    /// （2026-08-06〜: 型が data_type と一致しない場合は 422
+    /// `unsupported_value_type` - 暗黙の型変換はしない）。
     #[schema(value_type = f64, example = 1)]
     v: serde_json::Value,
 }
@@ -2445,17 +2446,21 @@ struct WriteValueResponse {
     result: String,
 }
 
-/// リクエスト body の `v` を工学値の `f64` に正規化する。`bool` は
-/// `1.0`/`0.0`、数値はそのまま。文字列・配列・オブジェクト・`null` は
-/// `None`（呼び出し元が 422 `unsupported_value_type` を返す）。REST 固有の
-/// wire 形式（JSON の `v`）からの変換であり、gRPC 側は `oneof num|bool` を
-/// 直接分解するだけで済むため、この関数は `crate::write_path` へは移して
-/// いない。
-fn parse_requested_value(v: &serde_json::Value) -> Option<f64> {
+/// リクエスト body の `v` を [`crate::write_path::RequestedValue`] に正規化
+/// する。`bool` は [`RequestedValue::Bool`]、数値は [`RequestedValue::Num`]。
+/// どちらの型が来たかは gate 7（`crate::write_path::execute_write`）が
+/// data_type との対称性検査に使うので、ここで `f64` へ潰さない（2026-08-06
+/// 変更: 従来は `bool` を `1.0`/`0.0` に潰して数値と区別せずに渡していた）。
+/// 文字列・配列・オブジェクト・`null` は `None`（呼び出し元が 422
+/// `unsupported_value_type` を返す）。REST 固有の wire 形式（JSON の `v`）
+/// からの変換であり、gRPC 側は `oneof num|bool` を直接分解するだけで
+/// 済むため、この関数は `crate::write_path` へは移していない。
+fn parse_requested_value(v: &serde_json::Value) -> Option<crate::write_path::RequestedValue> {
+    use crate::write_path::RequestedValue;
     if let Some(b) = v.as_bool() {
-        Some(if b { 1.0 } else { 0.0 })
+        Some(RequestedValue::Bool(b))
     } else {
-        v.as_f64()
+        v.as_f64().map(RequestedValue::Num)
     }
 }
 

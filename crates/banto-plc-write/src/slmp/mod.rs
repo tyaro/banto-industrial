@@ -44,6 +44,56 @@
 //! 2. **Planning never coalesces across a gap** - a write has a side effect, so
 //!    [`planning`] merges only exactly-adjacent targets (the read planner
 //!    tolerates a small gap to save round trips). See its module doc.
+//!
+//! ## T8 bit-in-word RMW (docs/tag-server-design.md §6.1)
+//!
+//! [`execute_slmp_writes`] additionally runs every [`planning::SlmpPlannedBitWrite`]
+//! in `outcome.bit_writes` as a **read → modify → write → confirm** sequence
+//! against the same borrowed `slmp::SLMPClient` its ordinary writes use -
+//! four wire operations per RMW group (one word each way, twice), all
+//! sequential `.await`s on the one session this function is handed. This is
+//! precisely what makes the RMW race-free with respect to *this crate's own*
+//! concurrent callers without any new locking: `execute_slmp_writes` is
+//! always called from inside one broker job
+//! (`banto_broker::run_broker_task`'s `Job::Write` arm), and a broker task
+//! services jobs strictly one at a time off its mpsc queue (see
+//! `banto-broker`'s own module doc, "Message shape and how serialization is
+//! guaranteed") - so no other read or write against the same CPU can land on
+//! the wire between this RMW's read and its write-back. **No `banto-broker`
+//! code changed to get this property**: the broker already treats a write
+//! job as "call `execute_slmp_writes` and await the whole thing", so an RMW
+//! sequence hiding behind that one call is invisible to it.
+//!
+//! What the RMW *cannot* defend against - and is not asked to, per §6.1's
+//! explicit decision to accept the race and only detect it - is the target
+//! PLC's own scan writing the same word between our read and our write-back.
+//! The **confirmation read** exists
+//! to *detect* that (never to retry or resolve it): after the write-back,
+//! every bit-write group's word is read back once more, and each
+//! [`planning::BitWriteMapping`] entry's own bit is checked independently
+//! against its own requested value - a mismatch becomes
+//! [`crate::error::PlcWriteError::BitWriteVerificationFailed`] for that one
+//! request while every other bit written in the same RMW (and every other
+//! group entirely) is judged on its own merits. The operational mitigation
+//! (§6.1: an externally-writable bit's word must not also be written by PLC
+//! ladder logic) lives in the deployment runbook, not in this code.
+//!
+//! **Execution order between ordinary writes and bit-in-word writes**
+//! (docs/tag-server-design.md §6.1's "同一バッチ内...順序・独立性"): every
+//! [`planning::SlmpPlannedWrite`] in `outcome.writes` runs to completion
+//! before the first [`planning::SlmpPlannedBitWrite`] in `outcome.bit_writes`
+//! starts. This is the plainest implementation of "independent execution"
+//! the planner's own separation (see `planning`'s module doc: the two never
+//! share a group, ever) allows for - the alternative (interleaving both
+//! kinds by original request index so a `BitInWord` request submitted
+//! *before* an ordinary write to the same word executes first) would need a
+//! third, order-preserving data structure threading both plan vectors
+//! together for a benefit that only matters when a caller mixes an ordinary
+//! whole-word write and a targeted bit write to the *very same word* in one
+//! batch - an unusual pattern to begin with, and one where the caller can
+//! always avoid the ambiguity by splitting it across two `write`/`write_batch_mixed`
+//! calls if the order matters to them. Recorded here as the T8 judgment call
+//! rather than left implicit.
 
 pub mod planning;
 
@@ -61,7 +111,10 @@ use crate::client::PlcWriteClient;
 use crate::error::PlcWriteError;
 use crate::types::{WriteRequest, WriteResult};
 
-use planning::{plan_slmp_write_batch, plan_slmp_writes, SlmpWritePlanOutcome, WritePayload};
+use planning::{
+    plan_slmp_write_batch, plan_slmp_writes, SlmpPlannedBitWrite, SlmpWritePlanOutcome,
+    WritePayload,
+};
 
 /// Map [`banto_plc::SlmpCpu`] onto the wrapped crate's `CPU`. Re-derived here
 /// (rather than reusing `banto-plc`'s mapping, which is private) for the same
@@ -173,15 +226,22 @@ fn classify_io_error(err: &std::io::Error) -> PlcWriteError {
 /// Execute a planned batch of writes on a **borrowed** `slmp::SLMPClient`, the
 /// reusable core the W3 broker calls directly on its shared per-CPU session (see
 /// this module's doc comment). Issues one `bulk_write` per group in
-/// `outcome.writes`, folds `outcome.immediate_bad` in by index, and returns a
-/// `Vec<WriteResult>` of length `total_requests` in original request order.
+/// `outcome.writes`, then one RMW (read/modify/write/confirm) sequence per
+/// group in `outcome.bit_writes` (T8, docs/tag-server-design.md §6.1 - see
+/// this module's doc comment for the ordering rationale and the broker-job
+/// framing that makes the RMW race-free with respect to this crate's own
+/// concurrent callers), folds `outcome.immediate_bad` in by index, and
+/// returns a `Vec<WriteResult>` of length `total_requests` in original
+/// request order.
 ///
 /// `Err` is reserved for a connection-fatal failure (the caller must drop the
 /// session and reconnect); a device-side end code becomes a per-request `Bad`
-/// for that group's requests and the loop continues. On a fatal `Err`, any
-/// groups already written have landed on the PLC - a partial batch - exactly as
-/// the read side discards partial results on `Err`; the caller decides how to
-/// recover.
+/// for that group's requests and the loop continues (an RMW's own end code,
+/// wherever in its four-operation sequence it occurs, is exactly the same
+/// per-request `Bad`, not a whole-call failure). On a fatal `Err`, any
+/// groups already written (and any RMWs already completed) have landed on
+/// the PLC - a partial batch - exactly as the read side discards partial
+/// results on `Err`; the caller decides how to recover.
 ///
 /// Does not own or reconnect the socket: connection lifecycle is the caller's
 /// ([`SlmpWriteClient`] for the standalone form, the broker for the shared one).
@@ -229,6 +289,19 @@ pub async fn execute_slmp_writes(
         }
     }
 
+    // T8: ordinary writes above always finish before any RMW starts here -
+    // see this module's doc comment for why that ordering (rather than
+    // interleaving by original request index) is the recorded judgment call.
+    for group in &outcome.bit_writes {
+        if let Some(fatal) = execute_one_bit_write(client, group, &mut results).await {
+            // `execute_one_bit_write` only returns `Some` for a connection-
+            // fatal failure partway through its own read/write/confirm
+            // sequence - propagate exactly like an ordinary group's fatal
+            // branch above.
+            return Err(fatal);
+        }
+    }
+
     Ok(results
         .into_iter()
         .enumerate()
@@ -238,6 +311,121 @@ pub async fn execute_slmp_writes(
             })
         })
         .collect())
+}
+
+/// Read the current value of a single word device via one `bulk_read`, for
+/// [`execute_one_bit_write`]'s read and confirmation steps. Returns
+/// `Ok(word)` on a clean single-word response; otherwise `Err` carries
+/// whatever [`classify_io_error`] produced (fatal or per-request), and the
+/// caller tells the two apart via [`PlcWriteError::is_connection_fatal`] -
+/// the same contract every other fallible step in this module already uses,
+/// so callers do not need a second, RMW-specific error shape.
+async fn read_one_word(
+    client: &mut slmp::SLMPClient,
+    device: SlmpDevice,
+    number: u32,
+) -> Result<u16, PlcWriteError> {
+    let target = slmp::Device {
+        device_type: device_to_wire(device),
+        address: number as usize,
+    };
+    let data = client
+        .bulk_read(target, 1, slmp::DataType::U16)
+        .await
+        .map_err(|e| classify_io_error(&e))?;
+    match data.first().map(|d| &d.data) {
+        Some(slmp::TypedData::U16(word)) => Ok(*word),
+        other => Err(PlcWriteError::Protocol(format!(
+            "RMW 読み出し {device}{number} が想定外の応答を返しました: {other:?}"
+        ))),
+    }
+}
+
+/// Run one [`SlmpPlannedBitWrite`]'s read/modify/write/confirm sequence (T8,
+/// docs/tag-server-design.md §6.1) against `client`, writing every mapped
+/// request's outcome into `results`.
+///
+/// Returns `None` when the whole sequence completed: every mapped request's
+/// slot in `results` has been filled - `Ok`, or a per-request `Bad` for a
+/// device-side end code (at the read, write-back, or confirmation step) or a
+/// [`PlcWriteError::BitWriteVerificationFailed`] mismatch. None of those
+/// abort the sequence early, because each is per-request by construction -
+/// by the time this function can report one, it has already established the
+/// connection itself is fine.
+///
+/// Returns `Some(err)` when a connection-fatal failure occurred at some step
+/// (initial read, write-back, or confirmation read) and the sequence stopped
+/// immediately; the caller propagates `err` via `Err` from
+/// [`execute_slmp_writes`], exactly mirroring how an ordinary group's fatal
+/// branch works. `results` is left with this group's mapped requests
+/// unfilled in that case - harmless, since `execute_slmp_writes` never reads
+/// `results` back out once it has decided to return `Err`.
+async fn execute_one_bit_write(
+    client: &mut slmp::SLMPClient,
+    group: &SlmpPlannedBitWrite,
+    results: &mut [Option<WriteResult>],
+) -> Option<PlcWriteError> {
+    // Step 1: read the word's current value.
+    let current = match read_one_word(client, group.device, group.number).await {
+        Ok(word) => word,
+        Err(err) if err.is_connection_fatal() => return Some(err),
+        Err(err) => {
+            for m in &group.mapping {
+                results[m.request_index] = Some(WriteResult::Bad(err.clone()));
+            }
+            return None;
+        }
+    };
+
+    // Step 2: apply the mask and write the whole word back. `set_mask` and
+    // `clear_mask` are disjoint by construction (see `SlmpPlannedBitWrite`'s
+    // doc comment), so this is unambiguous: force `set_mask` bits to 1,
+    // `clear_mask` bits to 0, leave every other bit exactly as read.
+    let new_word = (current & !(group.set_mask | group.clear_mask)) | group.set_mask;
+    let start_device = slmp::Device {
+        device_type: device_to_wire(group.device),
+        address: group.number as usize,
+    };
+    if let Err(e) = client
+        .bulk_write(start_device, &[slmp::TypedData::U16(new_word)])
+        .await
+    {
+        let err = classify_io_error(&e);
+        if err.is_connection_fatal() {
+            return Some(err);
+        }
+        for m in &group.mapping {
+            results[m.request_index] = Some(WriteResult::Bad(err.clone()));
+        }
+        return None;
+    }
+
+    // Step 3: confirmation read (§6.1 - mandatory, same job, same socket).
+    let confirmed = match read_one_word(client, group.device, group.number).await {
+        Ok(word) => word,
+        Err(err) if err.is_connection_fatal() => return Some(err),
+        Err(err) => {
+            for m in &group.mapping {
+                results[m.request_index] = Some(WriteResult::Bad(err.clone()));
+            }
+            return None;
+        }
+    };
+
+    // Step 4: verify each request's own bit independently - one request's
+    // mismatch never marks a batch-mate's correctly-landed bit as Bad.
+    for m in &group.mapping {
+        let landed = (confirmed >> m.bit) & 1 == 1;
+        results[m.request_index] = Some(if landed == m.value {
+            WriteResult::Ok
+        } else {
+            WriteResult::Bad(PlcWriteError::BitWriteVerificationFailed {
+                area: format!("{}{}", group.device, group.number),
+                bit: m.bit,
+            })
+        });
+    }
+    None
 }
 
 /// The standalone [`PlcWriteClient`] for MELSEC MC / SLMP. Owns its own socket -

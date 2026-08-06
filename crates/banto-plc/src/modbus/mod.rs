@@ -38,7 +38,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::client::{BoxFuture, PlcClient};
-use crate::decode::{decode_register_value, WordOrder};
+use crate::decode::{decode_register_bit, decode_register_value, WordOrder};
 use crate::error::PlcError;
 use crate::planning::{plan_requests, PlannedRead};
 use crate::types::{ReadRequest, ReadResult, TagValue};
@@ -257,12 +257,29 @@ impl PlcClient for ModbusTcpClient {
                                     TagValue::Bit(bits[m.offset_in_read as usize])
                                 }
                                 GroupValues::Registers(regs) => {
-                                    match decode_register_value(
-                                        regs,
-                                        m.offset_in_read as usize,
-                                        m.data_type,
-                                        word_order,
-                                    ) {
+                                    // T8 (docs/tag-server-design.md §6.1): a
+                                    // bit-in-word request decodes one bit out
+                                    // of the register window instead of the
+                                    // whole register as `m.data_type` -
+                                    // `m.bit` is `Some` only when the
+                                    // planner already proved `m.data_type ==
+                                    // DataType::Bit`, so there is no
+                                    // possibility of decoding the wrong shape
+                                    // here.
+                                    let decoded = match m.bit {
+                                        Some(bit) => decode_register_bit(
+                                            regs,
+                                            m.offset_in_read as usize,
+                                            bit,
+                                        ),
+                                        None => decode_register_value(
+                                            regs,
+                                            m.offset_in_read as usize,
+                                            m.data_type,
+                                            word_order,
+                                        ),
+                                    };
+                                    match decoded {
                                         Ok(v) => v,
                                         Err(e) => {
                                             results[m.request_index] = Some(ReadResult::Bad(e));

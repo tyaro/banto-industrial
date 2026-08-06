@@ -23,8 +23,67 @@
 //! ready-to-serialize and means the wire path only ever handles values already
 //! proven encodable, so a bad value costs one target its write, never its
 //! batch-mates theirs (and never reaches the CPU as a truncated number).
+//!
+//! ## T8 bit-in-word writes (docs/tag-server-design.md §6.1)
+//!
+//! [`BatchWriteRequest::BitInWord`] cannot be planned as an ordinary word
+//! write: SLMP has no bit-in-word write command, so the *value* to put on
+//! the wire (a whole word) is not knowable at plan time - it depends on
+//! whatever the other 15 bits of that word hold at execute time, which this
+//! pure, no-I/O module cannot see. So a `BitInWord` request produces a
+//! **plan**, not a payload: [`SlmpPlannedBitWrite`] carries a `set_mask`/
+//! `clear_mask` pair (which bits to force to 1, which to force to 0 - always
+//! disjoint by construction) and a `mapping` of which request wants which
+//! bit at which value, for `slmp/mod.rs`'s [`crate::execute_slmp_writes`] to
+//! turn into an actual read/modify/write/verify sequence against a live
+//! session. This is exactly the same plan/execute split the rest of this
+//! crate already has (pure planner vs I/O executor) - T8 only adds a case
+//! where the planner's output is a *recipe* rather than a ready-to-serialize
+//! payload.
+//!
+//! **Grouping is exact-word, not gap-based, and never merges across words**:
+//! every `BitInWord` request is grouped by `(device, number)` - the *word*
+//! address - with no adjacency/gap logic at all (there is nothing to merge
+//! across; a bit position is not a wire offset). Two requests naming the
+//! same word compose into one [`SlmpPlannedBitWrite`] (mask OR-composition,
+//! §6.1: "同一バッチ内の同一ワード宛てビット書き込みはマスク合成して1回の
+//! RMW"); two requests naming *different* words always produce two separate
+//! plans, full stop - there is no cap or threshold at which they would
+//! merge, preserving the gap-tolerance-zero write-safety discipline this
+//! module's other section documents (writing a word nobody asked about is
+//! never acceptable, and merging two RMWs into one wire operation would mean
+//! writing back a *different* word than either caller named). See
+//! `different_words_never_merge_into_one_bit_write` for the tripwire.
+//!
+//! **Conflicting requests for the same bit are rejected, not resolved by
+//! last-write-wins**: if two requests in the batch ask for the same
+//! `(device, number, bit)` with different values (one `true`, one `false`),
+//! silently picking one would make the outcome depend on iteration/insertion
+//! order rather than anything the caller controls - a nondeterminism this
+//! crate's whole safety posture (encode failures and address mismatches are
+//! *rejected*, never guessed at) argues against. Both conflicting requests
+//! become [`PlcWriteError::ConflictingBitWrite`] `Bad`s instead, and every
+//! *other*, non-conflicting bit of the same word still proceeds normally
+//! (duplicate requests for the same bit with the *same* value are fine and
+//! simply both ride along in one `mapping`, mirroring the read planner's
+//! `duplicate_addresses_both_map_into_the_same_group`).
+//!
+//! **Ordinary writes and bit-in-word writes never share a group, by
+//! construction**: a `BitInWord` request is filtered into its own
+//! `bit_writes` bucket before the ordinary `by_device`/`plan_word_device`
+//! grouping ever sees it, so a plain word write to `D100` and a bit write to
+//! `D100.5` in the same batch are always two independent operations, never
+//! coalesced into one. Execution order between the two kinds when they
+//! target the very same word (docs/tag-server-design.md §6.1: "通常のワード
+//! 書き込みとビット書き込みが同一バッチに混在した場合の順序・独立性") is
+//! the plainest possible answer given that independence: `execute_slmp_writes`
+//! runs every ordinary [`SlmpPlannedWrite`] first, then every
+//! [`SlmpPlannedBitWrite`] - see that function's doc comment for why this
+//! (rather than interleaving by original request index) is the judgment call
+//! T8 recorded, and for the resulting caveat (an ordinary write and an RMW to
+//! the very same word in one batch always resolves ordinary-first).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use banto_plc::{DataType, SlmpAccess, SlmpDevice, WordOrder};
 
@@ -94,12 +153,52 @@ pub struct SlmpPlannedWrite {
     pub request_indices: Vec<usize>,
 }
 
+/// One request's contribution to a [`SlmpPlannedBitWrite`]: which bit of the
+/// group's word it wants, and at what value - the RMW twin of the read
+/// side's `SlmpMappedRequest`, and what lets `execute_slmp_writes`'s
+/// confirmation read verify (and report) each request's own bit
+/// independently of its batch-mates (T8, docs/tag-server-design.md §6.1:
+/// "確認値の該当ビットが期待値なら Ok、不一致なら該当要求 WriteResult::Bad").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BitWriteMapping {
+    pub request_index: usize,
+    pub bit: u8,
+    pub value: bool,
+}
+
+/// One planned RMW operation (T8, docs/tag-server-design.md §6.1): read the
+/// word at `device`/`number`, apply `set_mask`/`clear_mask`, write it back,
+/// then confirm. `set_mask`/`clear_mask` are always disjoint (a bit is never
+/// in both - see [`plan_slmp_write_batch`]'s conflict handling, which routes
+/// a bit with contradictory requested values to `immediate_bad` instead of
+/// ever reaching here), so the new word is simply
+/// `(current & !(set_mask | clear_mask)) | set_mask`.
+///
+/// Unlike [`SlmpPlannedWrite`] (whose `payload` is already the exact bytes to
+/// put on the wire), this plan carries no ready-made payload at all - the
+/// value to write depends on a runtime read `slmp/mod.rs` has not done yet.
+/// That is the fundamental reason bit-in-word writes are a separate type
+/// rather than another [`WritePayload`] variant.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlmpPlannedBitWrite {
+    pub device: SlmpDevice,
+    pub number: u32,
+    pub set_mask: u16,
+    pub clear_mask: u16,
+    pub mapping: Vec<BitWriteMapping>,
+}
+
 /// [`plan_slmp_writes`]'s full result. Same contract as the read planner's
-/// outcome: every input index appears exactly once, either inside some group's
-/// `request_indices` or in `immediate_bad`.
+/// outcome: every input index appears exactly once, either inside some
+/// [`SlmpPlannedWrite`]'s `request_indices`, some [`SlmpPlannedBitWrite`]'s
+/// `mapping`, or in `immediate_bad`. `bit_writes` is always populated
+/// independently of `writes` - see this module's doc comment ("Ordinary
+/// writes and bit-in-word writes never share a group") for why the two never
+/// interact during planning.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SlmpWritePlanOutcome {
     pub writes: Vec<SlmpPlannedWrite>,
+    pub bit_writes: Vec<SlmpPlannedBitWrite>,
     pub immediate_bad: Vec<(usize, PlcWriteError)>,
 }
 
@@ -108,6 +207,10 @@ enum ItemPayload {
     Words(Vec<u16>),
     Bit(bool),
 }
+
+/// One `BitInWord` request awaiting composition into a word's
+/// [`SlmpPlannedBitWrite`]: `(request_index, bit, value)`.
+type BitItem = (usize, u8, bool);
 
 /// A word group under construction. `u64` bounds so a 32-bit target at the very
 /// top of the device space cannot overflow while `end` is computed, matching
@@ -169,6 +272,18 @@ pub fn plan_slmp_writes(requests: &[WriteRequest], word_order: WordOrder) -> Slm
 /// (0x00-padded to its full span), so the gap-0 grouping below extends to L-word
 /// spans with no special casing: an exactly-adjacent numeric target still
 /// merges into the same `bulk_write`, and a gap still splits.
+///
+/// ## T8 bit-in-word requests (docs/tag-server-design.md §6.1)
+///
+/// A [`BatchWriteRequest::BitInWord`] is validated here exactly like every
+/// other request (address must be SLMP, device must be a **word** device,
+/// the address must actually carry a bit position - plain `"D100"` in a
+/// `BitInWord` request is rejected as [`PlcWriteError::UnsupportedCombination`]
+/// just as surely as `"D100.5"` would be for an ordinary [`WriteRequest`]),
+/// but it is never encoded or placed in `by_device`/`writes` - see this
+/// module's doc comment for why it becomes a [`SlmpPlannedBitWrite`] in
+/// `outcome.bit_writes` instead, mask-composed per `(device, number)` with
+/// same-bit conflicts rejected into `immediate_bad`.
 pub fn plan_slmp_write_batch(
     requests: &[BatchWriteRequest],
     word_order: WordOrder,
@@ -179,12 +294,19 @@ pub fn plan_slmp_write_batch(
     // reason as the read planner.
     let mut by_device: BTreeMap<SlmpDevice, Vec<(usize, u32, ItemPayload)>> = BTreeMap::new();
 
+    // T8: bit-in-word requests never enter `by_device` - they are collected
+    // here, per exact `(device, number)` word address, and turned into
+    // `SlmpPlannedBitWrite`s in a separate pass below (see this module's doc
+    // comment for why the two families can never share a group).
+    let mut bit_items: BTreeMap<(SlmpDevice, u32), Vec<BitItem>> = BTreeMap::new();
+
     for (index, req) in requests.iter().enumerate() {
         let address = match req {
             BatchWriteRequest::Numeric(r) => r.address,
             BatchWriteRequest::String(s) => s.address,
+            BatchWriteRequest::BitInWord { address, .. } => *address,
         };
-        let Some((device, number)) = address.as_slmp() else {
+        let Some((device, number, bit_pos)) = address.as_slmp() else {
             immediate_bad.push((
                 index,
                 PlcWriteError::AddressProtocolMismatch {
@@ -197,7 +319,12 @@ pub fn plan_slmp_write_batch(
 
         let item = match req {
             BatchWriteRequest::Numeric(r) => {
-                if !is_compatible(device.access(), r.data_type) {
+                // A bit-qualified address (`"D100.5"`) on a plain numeric
+                // write is a configuration mistake, not a whole-register
+                // write of some sort - T8 introduced the qualifier
+                // specifically to route through `BitInWord`'s RMW path
+                // instead.
+                if bit_pos.is_some() || !is_compatible(device.access(), r.data_type) {
                     immediate_bad.push((
                         index,
                         PlcWriteError::UnsupportedCombination {
@@ -225,8 +352,10 @@ pub fn plan_slmp_write_batch(
                 }
             }
             BatchWriteRequest::String(s) => {
-                // Strings live in word devices only, same v1 rule as reads.
-                if device.access() != SlmpAccess::Word {
+                // Strings live in word devices only, same v1 rule as reads,
+                // and never carry a bit qualifier (a string occupies a whole
+                // span of words, not one bit of one).
+                if device.access() != SlmpAccess::Word || bit_pos.is_some() {
                     immediate_bad.push((
                         index,
                         PlcWriteError::UnsupportedCombination {
@@ -257,6 +386,34 @@ pub fn plan_slmp_write_batch(
                     }
                 }
             }
+            BatchWriteRequest::BitInWord { value, .. } => {
+                let Some(bit) = bit_pos else {
+                    immediate_bad.push((
+                        index,
+                        PlcWriteError::UnsupportedCombination {
+                            area: format!("{device}{number}"),
+                            data_type: "bit_in_word（アドレスに .N ビット位置がありません）"
+                                .to_string(),
+                        },
+                    ));
+                    continue;
+                };
+                if device.access() != SlmpAccess::Word {
+                    immediate_bad.push((
+                        index,
+                        PlcWriteError::UnsupportedCombination {
+                            area: format!("{device} ({})", device.access()),
+                            data_type: "bit_in_word".to_string(),
+                        },
+                    ));
+                    continue;
+                }
+                bit_items
+                    .entry((device, number))
+                    .or_default()
+                    .push((index, bit, *value));
+                continue;
+            }
         };
 
         by_device
@@ -274,9 +431,91 @@ pub fn plan_slmp_write_batch(
         }
     }
 
+    // T8: one SlmpPlannedBitWrite per distinct (device, number) - never
+    // merged across words (see this module's doc comment), mask-composed
+    // within a word, with same-bit conflicts rejected rather than guessed at.
+    let mut bit_writes = Vec::new();
+    for ((device, number), items) in bit_items {
+        plan_bit_in_word_group(device, number, items, &mut immediate_bad, &mut bit_writes);
+    }
+
     SlmpWritePlanOutcome {
         writes,
+        bit_writes,
         immediate_bad,
+    }
+}
+
+/// Compose one word's worth of `BitInWord` requests into (at most) one
+/// [`SlmpPlannedBitWrite`], per this module's doc comment's "T8 bit-in-word
+/// writes" section.
+///
+/// A bit named by two requests with the *same* value is fine - both simply
+/// ride along in `mapping` (mirroring the read planner's duplicate-address
+/// handling); a bit named with *conflicting* values rejects every request
+/// naming that particular bit as [`PlcWriteError::ConflictingBitWrite`] and
+/// excludes it from the mask entirely, while every other, non-conflicting
+/// bit of the same word still proceeds normally in the returned group (if
+/// any bits remain - a word whose every request conflicts produces no
+/// [`SlmpPlannedBitWrite`] at all, only `immediate_bad` entries).
+fn plan_bit_in_word_group(
+    device: SlmpDevice,
+    number: u32,
+    items: Vec<BitItem>,
+    immediate_bad: &mut Vec<(usize, PlcWriteError)>,
+    out: &mut Vec<SlmpPlannedBitWrite>,
+) {
+    // First pass: which bit positions have more than one distinct requested
+    // value. `BTreeMap`/`BTreeSet` (not `HashMap`/`HashSet`) so a conflict
+    // report and the final mapping order are deterministic across runs.
+    let mut seen_value: BTreeMap<u8, bool> = BTreeMap::new();
+    let mut conflicted_bits: BTreeSet<u8> = BTreeSet::new();
+    for &(_, bit, value) in &items {
+        match seen_value.get(&bit) {
+            Some(&existing) if existing != value => {
+                conflicted_bits.insert(bit);
+            }
+            Some(_) => {} // consistent duplicate, not a conflict
+            None => {
+                seen_value.insert(bit, value);
+            }
+        }
+    }
+
+    let mut set_mask = 0u16;
+    let mut clear_mask = 0u16;
+    let mut mapping = Vec::new();
+    for (index, bit, value) in items {
+        if conflicted_bits.contains(&bit) {
+            immediate_bad.push((
+                index,
+                PlcWriteError::ConflictingBitWrite {
+                    area: format!("{device}{number}"),
+                    bit,
+                },
+            ));
+            continue;
+        }
+        if value {
+            set_mask |= 1 << bit;
+        } else {
+            clear_mask |= 1 << bit;
+        }
+        mapping.push(BitWriteMapping {
+            request_index: index,
+            bit,
+            value,
+        });
+    }
+
+    if !mapping.is_empty() {
+        out.push(SlmpPlannedBitWrite {
+            device,
+            number,
+            set_mask,
+            clear_mask,
+            mapping,
+        });
     }
 }
 
@@ -694,6 +933,238 @@ mod tests {
             .writes
             .iter()
             .flat_map(|g| g.request_indices.iter().copied())
+            .chain(outcome.immediate_bad.iter().map(|(i, _)| *i))
+            .collect();
+        seen.sort();
+        assert_eq!(seen, (0..requests.len()).collect::<Vec<_>>());
+    }
+
+    // --- T8, docs/tag-server-design.md §6.1: bit-in-word RMW planning ------
+
+    fn bwreq(raw: &str, value: bool) -> BatchWriteRequest {
+        BatchWriteRequest::BitInWord {
+            address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw}: {e}")),
+            value,
+        }
+    }
+
+    #[test]
+    fn single_bit_in_word_request_becomes_one_planned_bit_write() {
+        let outcome = plan_slmp_write_batch(&[bwreq("D100.5", true)], LH);
+        assert!(outcome.immediate_bad.is_empty());
+        assert!(
+            outcome.writes.is_empty(),
+            "must not become an ordinary write"
+        );
+        assert_eq!(outcome.bit_writes.len(), 1);
+        let g = &outcome.bit_writes[0];
+        assert_eq!(g.device, SlmpDevice::D);
+        assert_eq!(g.number, 100);
+        assert_eq!(g.set_mask, 1 << 5);
+        assert_eq!(g.clear_mask, 0);
+        assert_eq!(
+            g.mapping,
+            vec![BitWriteMapping {
+                request_index: 0,
+                bit: 5,
+                value: true
+            }]
+        );
+    }
+
+    #[test]
+    fn a_clear_request_sets_the_clear_mask_not_the_set_mask() {
+        let outcome = plan_slmp_write_batch(&[bwreq("D100.5", false)], LH);
+        let g = &outcome.bit_writes[0];
+        assert_eq!(g.set_mask, 0);
+        assert_eq!(g.clear_mask, 1 << 5);
+    }
+
+    /// §6.1's core mask-composition property: several bits of the *same*
+    /// word in one batch compose into a single [`SlmpPlannedBitWrite`], not
+    /// one per bit.
+    #[test]
+    fn multiple_bits_of_the_same_word_compose_into_one_planned_bit_write() {
+        let outcome = plan_slmp_write_batch(
+            &[
+                bwreq("D100.0", true),
+                bwreq("D100.5", false),
+                bwreq("D100.15", true),
+            ],
+            LH,
+        );
+        assert!(outcome.immediate_bad.is_empty());
+        assert_eq!(
+            outcome.bit_writes.len(),
+            1,
+            "one word, one RMW, however many bits"
+        );
+        let g = &outcome.bit_writes[0];
+        assert_eq!(g.set_mask, (1 << 0) | (1 << 15));
+        assert_eq!(g.clear_mask, 1 << 5);
+        assert_eq!(g.mapping.len(), 3);
+    }
+
+    /// The write-safety discipline this whole crate exists for, restated for
+    /// RMW: two *different* words must never be combined into one
+    /// [`SlmpPlannedBitWrite`], however adjacent their numbers are.
+    #[test]
+    fn different_words_never_merge_into_one_bit_write() {
+        let outcome = plan_slmp_write_batch(&[bwreq("D100.0", true), bwreq("D101.0", true)], LH);
+        assert!(outcome.immediate_bad.is_empty());
+        assert_eq!(
+            outcome.bit_writes.len(),
+            2,
+            "adjacent words must still be two independent RMWs"
+        );
+        let numbers: Vec<u32> = outcome.bit_writes.iter().map(|g| g.number).collect();
+        assert_eq!(numbers, vec![100, 101]);
+    }
+
+    /// Two requests naming the *same* bit with the *same* value are not a
+    /// conflict - both simply ride along in `mapping` (harmless duplication,
+    /// same precedent as the read planner's duplicate-address handling).
+    #[test]
+    fn duplicate_same_value_bit_requests_are_not_a_conflict() {
+        let outcome = plan_slmp_write_batch(&[bwreq("D100.5", true), bwreq("D100.5", true)], LH);
+        assert!(outcome.immediate_bad.is_empty());
+        assert_eq!(outcome.bit_writes.len(), 1);
+        assert_eq!(outcome.bit_writes[0].mapping.len(), 2);
+        assert_eq!(outcome.bit_writes[0].set_mask, 1 << 5);
+    }
+
+    /// Two requests naming the same bit with *conflicting* values are both
+    /// rejected - RMW cannot satisfy both, and guessing a winner would be a
+    /// silent, order-dependent behavior.
+    #[test]
+    fn conflicting_bit_requests_are_both_rejected() {
+        let outcome = plan_slmp_write_batch(
+            &[
+                bwreq("D100.5", true),
+                bwreq("D100.5", false),
+                bwreq("D100.6", true), // unaffected, non-conflicting bit
+            ],
+            LH,
+        );
+        assert_eq!(outcome.immediate_bad.len(), 2);
+        for (index, err) in &outcome.immediate_bad {
+            assert!(*index == 0 || *index == 1, "unexpected bad index {index}");
+            assert!(matches!(err, PlcWriteError::ConflictingBitWrite { bit, .. } if *bit == 5));
+        }
+        // The non-conflicting bit still gets planned.
+        assert_eq!(outcome.bit_writes.len(), 1);
+        assert_eq!(outcome.bit_writes[0].set_mask, 1 << 6);
+        assert_eq!(
+            outcome.bit_writes[0].mapping,
+            vec![BitWriteMapping {
+                request_index: 2,
+                bit: 6,
+                value: true,
+            }]
+        );
+    }
+
+    /// A word whose *every* bit request conflicts produces no
+    /// `SlmpPlannedBitWrite` at all - nothing left to compose.
+    #[test]
+    fn a_word_with_only_conflicting_requests_produces_no_planned_write() {
+        let outcome = plan_slmp_write_batch(&[bwreq("D100.5", true), bwreq("D100.5", false)], LH);
+        assert_eq!(outcome.immediate_bad.len(), 2);
+        assert!(outcome.bit_writes.is_empty());
+    }
+
+    #[test]
+    fn a_modbus_address_on_a_bit_in_word_write_is_immediately_bad() {
+        let outcome = plan_slmp_write_batch(
+            &[BatchWriteRequest::BitInWord {
+                address: Address::parse("40001.3").unwrap(),
+                value: true,
+            }],
+            LH,
+        );
+        assert!(outcome.bit_writes.is_empty());
+        assert!(matches!(
+            outcome.immediate_bad[0].1,
+            PlcWriteError::AddressProtocolMismatch { .. }
+        ));
+    }
+
+    /// A `BitInWord` request whose address carries no bit position at all
+    /// (`"M50"`, not `"M50.N"` - and MELSEC notation has no `.N` suffix for
+    /// bit devices in the first place, so this is also the only way a bit
+    /// device ever reaches this match arm) is rejected rather than treated
+    /// as targeting bit 0 or some other guessed position.
+    #[test]
+    fn bit_in_word_request_with_no_bit_position_is_immediately_bad() {
+        let outcome = plan_slmp_write_batch(&[bwreq("M50", true)], LH);
+        assert!(outcome.bit_writes.is_empty());
+        assert_eq!(outcome.immediate_bad.len(), 1);
+        assert!(matches!(
+            outcome.immediate_bad[0].1,
+            PlcWriteError::UnsupportedCombination { .. }
+        ));
+    }
+
+    /// A plain numeric write whose address happens to carry a bit position
+    /// (`"D100.5"`) is rejected rather than silently treated as a
+    /// whole-register write - the qualifier means "use `BitInWord`".
+    #[test]
+    fn a_bit_qualified_address_on_a_plain_numeric_write_is_immediately_bad() {
+        let outcome = plan_slmp_writes(&[word("D100.5", DataType::U16, 1.0)], LH);
+        assert!(outcome.writes.is_empty());
+        assert_eq!(outcome.immediate_bad.len(), 1);
+        assert!(matches!(
+            outcome.immediate_bad[0].1,
+            PlcWriteError::UnsupportedCombination { .. }
+        ));
+    }
+
+    /// Ordinary writes and bit-in-word writes to unrelated words in the same
+    /// batch are fully independent: an ordinary `D200` write is unaffected
+    /// by a `D100.5` bit write sharing the batch.
+    #[test]
+    fn ordinary_and_bit_in_word_writes_coexist_in_one_batch() {
+        let outcome = plan_slmp_write_batch(
+            &[
+                nreq(word("D200", DataType::U16, 42.0)),
+                bwreq("D100.5", true),
+            ],
+            LH,
+        );
+        assert!(outcome.immediate_bad.is_empty());
+        assert_eq!(outcome.writes.len(), 1);
+        assert_eq!(outcome.writes[0].request_indices, vec![0]);
+        assert_eq!(outcome.bit_writes.len(), 1);
+        assert_eq!(outcome.bit_writes[0].mapping[0].request_index, 1);
+    }
+
+    /// Every input index is accounted for exactly once even with `BitInWord`
+    /// requests mixed in - the same contract `every_input_index_is_accounted_for_exactly_once`
+    /// pins down for the pre-T8 request kinds.
+    #[test]
+    fn every_input_index_is_accounted_for_exactly_once_with_bit_in_word_requests() {
+        let requests = [
+            nreq(word("D0", DataType::U16, 1.0)),
+            bwreq("D100.5", true),
+            bwreq("D100.5", false), // conflicts with the previous one
+            BatchWriteRequest::BitInWord {
+                address: Address::parse("40001.3").unwrap(), // bad: modbus
+                value: true,
+            },
+            bwreq("D200.0", true),
+        ];
+        let outcome = plan_slmp_write_batch(&requests, LH);
+
+        let mut seen: Vec<usize> = outcome
+            .writes
+            .iter()
+            .flat_map(|g| g.request_indices.iter().copied())
+            .chain(
+                outcome
+                    .bit_writes
+                    .iter()
+                    .flat_map(|g| g.mapping.iter().map(|m| m.request_index)),
+            )
             .chain(outcome.immediate_bad.iter().map(|(i, _)| *i))
             .collect();
         seen.sort();

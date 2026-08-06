@@ -9,6 +9,20 @@
 //! - **MELSEC device codes** ([`Address::parse_slmp`], I2a) - `D100`, `M50`,
 //!   `X1A`, `ZR0`. Parsed by [`crate::slmp::address`], which also owns the
 //!   bit-vs-word and decimal-vs-hex rules that notation needs.
+//! - **Bit-in-word notation** (T8, docs/tag-server-design.md §6.1) - a single
+//!   bit of a *word* device/area, named as a `.N` suffix on either notation
+//!   above: `D100.5` (SLMP) or `40001.3` (Modbus holding register), `N` in
+//!   `0..=15`, always decimal (see [`crate::slmp::address::parse`]'s doc
+//!   comment for why, even at a hex-numbered SLMP device). Rejected outright
+//!   on a device/area that is already bit-granular (`M50.0`, `00001.0`) -
+//!   see [`Address::ModbusRef`]/[`Address::Slmp`]'s field docs. This is
+//!   deliberately an *address*-level notation, not a tag-name suffix: a tag
+//!   still gets one ordinary `data_type = "bit"` row in `banto-tags`, so it
+//!   appears in catalog listings exactly like any other tag (§6.1's decision
+//!   against a `"hoge.0"`-style tag-name suffix, which would create a
+//!   derived name catalog never lists - see §4.1's "catalog is a binding
+//!   contract" and its rejection of FA-Server's アクティブタグ for the same
+//!   reason).
 //!
 //! Deliberately pure functions with no PLC/IO dependency: `banto-tags`'s
 //! `Tag::address` column is free-text precisely because this crate, not I1,
@@ -80,16 +94,36 @@ pub enum Address {
     /// [`Address::parse`] is the only constructor and it rejects anything that
     /// would not fit (reference numbers above `xxxxx6` = offset 65536 do not
     /// exist in Modbus's 16-bit address space).
-    ModbusRef { area: AddressArea, offset: u16 },
+    ///
+    /// `bit` (T8, docs/tag-server-design.md §6.1) is `Some(0..=15)` for the
+    /// `"40001.3"` bit-in-word notation - a single bit within the register at
+    /// `offset`, valid only for [`AddressArea::InputRegister`]/
+    /// [`AddressArea::HoldingRegister`] (a coil/discrete-input address is
+    /// already bit-granular, so [`Address::parse`] never produces `Some`
+    /// there). `None` is the pre-T8 shape and every pre-T8 caller's behavior.
+    ModbusRef {
+        area: AddressArea,
+        offset: u16,
+        bit: Option<u8>,
+    },
     /// MELSEC device-code notation: a device type plus its number. `number`
     /// is `u32` rather than `u16` because MELSEC address spaces genuinely
     /// exceed 65,535 (`ZR`/`D` on the R series run into the millions), and is
     /// capped at [`crate::slmp::address::MAX_DEVICE_NUMBER`] - SLMP's 3-byte
     /// wire field - by [`Address::parse_slmp`].
     ///
-    /// Bit-vs-word is *not* a field here: it is a property of `device`
-    /// ([`SlmpDevice::access`]), so the two can never disagree.
-    Slmp { device: SlmpDevice, number: u32 },
+    /// Bit-vs-word is *not* a field here for the *device*: it is a property
+    /// of `device` ([`SlmpDevice::access`]), so the two can never disagree.
+    /// `bit` (T8, docs/tag-server-design.md §6.1) is the separate, optional
+    /// bit-*in-word* notation (`"D100.5"`) - `Some(0..=15)` naming one bit of
+    /// the word at `number`, valid only when `device` is a word device
+    /// ([`crate::slmp::address::parse`] rejects a `.N` suffix on a bit device
+    /// outright, since it is already one bit). `None` is the pre-T8 shape.
+    Slmp {
+        device: SlmpDevice,
+        number: u32,
+        bit: Option<u8>,
+    },
 }
 
 impl Address {
@@ -112,16 +146,48 @@ impl Address {
     /// contract: `banto-collect`'s `config::build_request` calls this, and a
     /// rename would be a breaking change to a crate I2a does not otherwise
     /// touch, bought with nothing but tidiness.
+    ///
+    /// T8 (docs/tag-server-design.md §6.1) additionally accepts an optional
+    /// bit-in-word suffix: `.` followed by 1-2 **decimal** digits naming a
+    /// bit position `0..=15` (`"40001.3"`). The suffix is only meaningful at
+    /// [`AddressArea::InputRegister`]/[`AddressArea::HoldingRegister`] - a
+    /// coil/discrete-input reference number is already one bit, so a `.N`
+    /// there is rejected the same way an unknown area prefix is, rather than
+    /// silently accepted as a redundant no-op. See
+    /// [`crate::slmp::address::parse`]'s doc comment for why the suffix is
+    /// decimal-only even though nothing else about Modbus reference numbers
+    /// is - the same §6.1 reasoning applies to both notations.
     pub fn parse(raw: &str) -> Result<Self, PlcError> {
         let trimmed = raw.trim();
         let invalid = || PlcError::InvalidAddress(raw.to_string());
 
-        let len = trimmed.chars().count();
-        if (len != 5 && len != 6) || !trimmed.chars().all(|c| c.is_ascii_digit()) {
+        // Split off the optional bit-in-word suffix first, exactly like
+        // `crate::slmp::address::parse` - `split_once` takes the *first*
+        // '.', so a malformed multi-dot string leaves a non-digit remainder
+        // that the digit check just below rejects.
+        let (base, bit) = match trimmed.split_once('.') {
+            Some((base, bit_text)) => {
+                if bit_text.is_empty()
+                    || bit_text.len() > 2
+                    || !bit_text.chars().all(|c| c.is_ascii_digit())
+                {
+                    return Err(invalid());
+                }
+                let bit: u8 = bit_text.parse().map_err(|_| invalid())?;
+                if bit > crate::slmp::address::MAX_BIT_POSITION {
+                    return Err(invalid());
+                }
+                (base, Some(bit))
+            }
+            None => (trimmed, None),
+        };
+
+        let len = base.chars().count();
+        if (len != 5 && len != 6) || !base.chars().all(|c| c.is_ascii_digit()) {
             return Err(invalid());
         }
 
-        let mut chars = trimmed.chars();
+        let mut chars = base.chars();
         let area = match chars.next().expect("len checked above, at least 5 chars") {
             '0' => AddressArea::Coil,
             '1' => AddressArea::DiscreteInput,
@@ -140,7 +206,15 @@ impl Address {
 
         // Safe: 1 <= number <= 65_536, so 0 <= number - 1 <= 65_535 = u16::MAX.
         let offset = (number - 1) as u16;
-        Ok(Address::ModbusRef { area, offset })
+
+        // A bit suffix only makes sense on a register area - a coil/
+        // discrete-input reference is already bit-granular (see this
+        // method's doc comment).
+        if bit.is_some() && matches!(area, AddressArea::Coil | AddressArea::DiscreteInput) {
+            return Err(invalid());
+        }
+
+        Ok(Address::ModbusRef { area, offset, bit })
     }
 
     /// Parse MELSEC device-code notation (SLMP, I2a). See
@@ -148,8 +222,12 @@ impl Address {
     /// mnemonic table, the per-device decimal-vs-hexadecimal rule, and what
     /// v1 deliberately does not accept.
     pub fn parse_slmp(raw: &str) -> Result<Self, PlcError> {
-        let (device, number) = slmp_address::parse(raw)?;
-        Ok(Address::Slmp { device, number })
+        let (device, number, bit) = slmp_address::parse(raw)?;
+        Ok(Address::Slmp {
+            device,
+            number,
+            bit,
+        })
     }
 
     /// The notation family this address is written in (`"modbus-ref"` /
@@ -167,17 +245,26 @@ impl Address {
     /// ([`crate::planning::plan_requests`]). `None` means "this address is
     /// some other protocol's", which is a per-request configuration error, not
     /// a reason to fail a batch - see this module's doc comment.
-    pub fn as_modbus_ref(&self) -> Option<(AddressArea, u16)> {
+    ///
+    /// The third element is the T8 bit-in-word position (§6.1), `None` for a
+    /// plain reference number - see [`Address::ModbusRef`]'s doc comment.
+    pub fn as_modbus_ref(&self) -> Option<(AddressArea, u16, Option<u8>)> {
         match *self {
-            Address::ModbusRef { area, offset } => Some((area, offset)),
+            Address::ModbusRef { area, offset, bit } => Some((area, offset, bit)),
             _ => None,
         }
     }
 
-    /// The SLMP half of the sum type, mirroring [`Address::as_modbus_ref`].
-    pub fn as_slmp(&self) -> Option<(SlmpDevice, u32)> {
+    /// The SLMP half of the sum type, mirroring [`Address::as_modbus_ref`]
+    /// (including its third, T8 bit-in-word element - see [`Address::Slmp`]'s
+    /// doc comment).
+    pub fn as_slmp(&self) -> Option<(SlmpDevice, u32, Option<u8>)> {
         match *self {
-            Address::Slmp { device, number } => Some((device, number)),
+            Address::Slmp {
+                device,
+                number,
+                bit,
+            } => Some((device, number, bit)),
             _ => None,
         }
     }
@@ -191,16 +278,23 @@ impl Address {
 impl std::fmt::Display for Address {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
-            Address::ModbusRef { area, offset } => {
+            Address::ModbusRef { area, offset, bit } => {
                 let prefix = match area {
                     AddressArea::Coil => '0',
                     AddressArea::DiscreteInput => '1',
                     AddressArea::InputRegister => '3',
                     AddressArea::HoldingRegister => '4',
                 };
-                write!(f, "{prefix}{:05}", offset as u32 + 1)
+                match bit {
+                    Some(b) => write!(f, "{prefix}{:05}.{b}", offset as u32 + 1),
+                    None => write!(f, "{prefix}{:05}", offset as u32 + 1),
+                }
             }
-            Address::Slmp { device, number } => f.write_str(&slmp_address::format(device, number)),
+            Address::Slmp {
+                device,
+                number,
+                bit,
+            } => f.write_str(&slmp_address::format(device, number, bit)),
         }
     }
 }
@@ -225,28 +319,32 @@ mod tests {
             Address::parse("00001").unwrap(),
             Address::ModbusRef {
                 area: AddressArea::Coil,
-                offset: 0
+                offset: 0,
+                bit: None
             }
         );
         assert_eq!(
             Address::parse("10001").unwrap(),
             Address::ModbusRef {
                 area: AddressArea::DiscreteInput,
-                offset: 0
+                offset: 0,
+                bit: None
             }
         );
         assert_eq!(
             Address::parse("30001").unwrap(),
             Address::ModbusRef {
                 area: AddressArea::InputRegister,
-                offset: 0
+                offset: 0,
+                bit: None
             }
         );
         assert_eq!(
             Address::parse("40001").unwrap(),
             Address::ModbusRef {
                 area: AddressArea::HoldingRegister,
-                offset: 0
+                offset: 0,
+                bit: None
             }
         );
     }
@@ -353,7 +451,8 @@ mod tests {
             Address::parse("  40001  ").unwrap(),
             Address::ModbusRef {
                 area: AddressArea::HoldingRegister,
-                offset: 0
+                offset: 0,
+                bit: None
             }
         );
     }
@@ -381,7 +480,8 @@ mod tests {
             Address::parse_slmp("D100").unwrap(),
             Address::Slmp {
                 device: SlmpDevice::D,
-                number: 100
+                number: 100,
+                bit: None
             }
         );
         assert_eq!(Address::parse_slmp("D100").unwrap().notation(), "slmp");
@@ -411,11 +511,11 @@ mod tests {
 
         assert_eq!(
             modbus.as_modbus_ref(),
-            Some((AddressArea::HoldingRegister, 9))
+            Some((AddressArea::HoldingRegister, 9, None))
         );
         assert_eq!(modbus.as_slmp(), None);
 
-        assert_eq!(slmp.as_slmp(), Some((SlmpDevice::D, 100)));
+        assert_eq!(slmp.as_slmp(), Some((SlmpDevice::D, 100, None)));
         assert_eq!(slmp.as_modbus_ref(), None);
     }
 
@@ -444,6 +544,78 @@ mod tests {
         for raw in ["D100", "M50", "X1A", "ZR32768"] {
             let addr = Address::parse_slmp(raw).unwrap();
             assert_eq!(Address::parse_slmp(&addr.to_string()).unwrap(), addr);
+        }
+    }
+
+    // --- T8, docs/tag-server-design.md §6.1: Modbus bit-in-word notation --
+
+    #[test]
+    fn parses_bit_in_word_notation_at_a_register_area() {
+        assert_eq!(
+            Address::parse("40001.3").unwrap(),
+            Address::ModbusRef {
+                area: AddressArea::HoldingRegister,
+                offset: 0,
+                bit: Some(3)
+            }
+        );
+        assert_eq!(
+            Address::parse("30001.15").unwrap(),
+            Address::ModbusRef {
+                area: AddressArea::InputRegister,
+                offset: 0,
+                bit: Some(15)
+            }
+        );
+    }
+
+    /// §6.1: a coil/discrete-input reference is already bit-granular, so a
+    /// `.N` suffix there is rejected rather than accepted as a no-op.
+    #[test]
+    fn rejects_a_bit_suffix_on_a_coil_or_discrete_input() {
+        assert!(matches!(
+            Address::parse("00001.0"),
+            Err(PlcError::InvalidAddress(_))
+        ));
+        assert!(matches!(
+            Address::parse("10001.0"),
+            Err(PlcError::InvalidAddress(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_a_modbus_bit_position_past_fifteen() {
+        assert!(matches!(
+            Address::parse("40001.16"),
+            Err(PlcError::InvalidAddress(_))
+        ));
+    }
+
+    #[test]
+    fn as_modbus_ref_carries_the_bit_position() {
+        let addr = Address::parse("40001.3").unwrap();
+        assert_eq!(
+            addr.as_modbus_ref(),
+            Some((AddressArea::HoldingRegister, 0, Some(3)))
+        );
+    }
+
+    #[test]
+    fn display_and_parse_round_trip_bit_in_word_notation() {
+        for raw in ["400001.3", "300001.15", "D100.5", "W10.0"] {
+            let is_slmp = raw.starts_with(['D', 'W']);
+            let addr = if is_slmp {
+                Address::parse_slmp(raw).unwrap()
+            } else {
+                Address::parse(raw).unwrap()
+            };
+            let rendered = addr.to_string();
+            let reparsed = if is_slmp {
+                Address::parse_slmp(&rendered).unwrap()
+            } else {
+                Address::parse(&rendered).unwrap()
+            };
+            assert_eq!(reparsed, addr, "{raw} should survive a round trip");
         }
     }
 }

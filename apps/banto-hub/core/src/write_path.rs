@@ -26,8 +26,9 @@
 //!   を各ハンドラの冒頭で呼ぶ)。
 //! - **body/request のワイヤ形式からの値抽出**(REST の JSON
 //!   `{"v": <number|bool>}` パース、gRPC の `oneof num|bool` 分解)は
-//!   呼び出し元が済ませ、正規化後の `Option<f64>`(`None` = 型として
-//!   受理できない値 - REST の 422 `unsupported_value_type` に相当)を渡す。
+//!   呼び出し元が済ませ、型情報を保った [`RequestedValue`] に正規化した
+//!   `Option<RequestedValue>`(`None` = 型として受理できない値 - REST の
+//!   422 `unsupported_value_type` に相当)を渡す。
 //!
 //! ## ゲート順(§6 実装指示 §5、relay-wright `engine/writer.rs` のゲート順を踏襲)
 //!
@@ -41,9 +42,14 @@
 //!    write_audit に `suppressed_disabled`
 //! 6. レート制限 would_exceed → [`WriteRejection::RateLimited`] + キー
 //!    trip + `rate_limit_tripped` 記録
-//! 7. 値変換: 工学値 → `banto_tags::unscale`(スケーリング設定があれば)
-//!    → data_type に応じた `banto_plc::TagValue`(bit は bool、数値は
-//!    範囲チェックで [`WriteRejection::ValueOutOfRange`])。文字列タグは
+//! 7. 値変換: まず [`RequestedValue`] の種別と data_type の対称性を検査する
+//!    (bit タグには bool のみ、数値タグには数値のみ - 暗黙の型変換はしない。
+//!    2026-08-06 追加、§4.2 の「タグ種別を跨いだ暗黙変換をしない」設計思想を
+//!    書き込み経路にも適用した)。一致しなければ
+//!    [`WriteRejection::UnsupportedValueType`]。一致すれば工学値 →
+//!    `banto_tags::unscale`(スケーリング設定があれば) → data_type に応じた
+//!    `banto_plc::TagValue`(数値は範囲チェックで
+//!    [`WriteRejection::ValueOutOfRange`])。文字列タグは
 //!    [`WriteRejection::UnsupportedValueType`] で拒否
 //! 8. **log-before-write** → `CollectorManager::write_broker_handle`
 //!    経由の `BrokerHandle::write`(1タグ=1リクエスト)→ set_result →
@@ -77,6 +83,41 @@ use crate::hub::CollectorManager;
 use crate::write_audit::{WriteAuditAction, WriteAuditResult, WriteAuditRow, WriteAuditService};
 use crate::write_control::WriteControl;
 use crate::write_rate::WriteRateLimiter;
+
+/// transport から正規化された、書き込みリクエストの値 - `f64` 1本に
+/// 潰す前の型情報を持たせる(2026-08-06 追加)。REST の JSON `{"v":
+/// <number|bool>}` パース・gRPC の `oneof num|bool` 分解は、それぞれ
+/// [`RequestedValue::Num`]/[`RequestedValue::Bool`] を素直に組み立てるだけ。
+/// どちらの型が来たかを潰さずに [`execute_write`] まで運び、gate 7 で
+/// data_type との対称性(bit タグには bool のみ、数値タグには数値のみ)を
+/// 検査するために存在する。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RequestedValue {
+    /// 数値タグ向け。
+    Num(f64),
+    /// bit タグ向け(ビットデバイス・T8 のビット付きアドレスとも共通)。
+    Bool(bool),
+}
+
+impl RequestedValue {
+    /// gate 7 の対称性検査を通過した後、以降の工学値パイプライン
+    /// (`unscale`・範囲チェック・監査行の `value_requested` 列)が
+    /// 引き続き `f64` 1本で扱えるようにする変換。`Bool` は
+    /// `true` → `1.0` / `false` → `0.0`(相互変換の唯一の場所 - gate 7 通過後
+    /// はこの1回だけ `f64` へ潰す)。
+    fn as_f64(self) -> f64 {
+        match self {
+            RequestedValue::Num(v) => v,
+            RequestedValue::Bool(b) => {
+                if b {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+}
 
 /// 書き込み成功時の結果 - `tag` は呼び出し元がそのままエコーバックできる
 /// よう外部名を持つ(REST の `WriteValueResponse`/gRPC の
@@ -187,16 +228,18 @@ fn map_registry_error(err: BantoError) -> WriteRejection {
 /// 書き込みゲート1〜8の本体(このモジュールの doc comment 参照)。
 ///
 /// `requested`: 呼び出し元が transport 固有の表現(REST の JSON `v`、gRPC の
-/// `oneof num|bool`)から正規化した工学値。`None` は「型として受理できない
-/// 値」(REST の 422 `unsupported_value_type` に相当)を意味し、gate 4 の
-/// **後**(REST の元実装と同じ位置 - プロトコル非対応の 501 を型エラーの
-/// 422 より先に返す)で [`WriteRejection::UnsupportedValueType`] として
-/// 拒否する。
+/// `oneof num|bool`)から正規化した [`RequestedValue`]。`None` は「型として
+/// 受理できない値」(REST の 422 `unsupported_value_type` に相当)を意味し、
+/// gate 4 の**後**(REST の元実装と同じ位置 - プロトコル非対応の 501 を
+/// 型エラーの 422 より先に返す)で [`WriteRejection::UnsupportedValueType`]
+/// として拒否する。`Some` の場合も、gate 7 で data_type との対称性
+/// (`RequestedValue::Bool` は bit タグのみ、`RequestedValue::Num` は
+/// 数値タグのみ)をさらに検査する - このモジュールの doc comment参照。
 pub async fn execute_write(
     deps: &WriteDeps<'_>,
     ctx: &ApiKeyContext,
     tag: &str,
-    requested: Option<f64>,
+    requested: Option<RequestedValue>,
 ) -> Result<WriteOk, WriteRejection> {
     // gate 1: catalog 解決
     let map = deps.manager.tag_map();
@@ -258,7 +301,7 @@ pub async fn execute_write(
             WriteAuditAction::Write,
             WriteAuditResult::SuppressedDisabled,
         )
-        .with_value_requested(requested);
+        .with_value_requested(requested.as_f64());
         if let Err(err) = deps.write_audit.insert_row(&row).await {
             eprintln!("banto-hub: 書き込み監査(suppressed_disabled)の記録に失敗しました: {err}");
         }
@@ -287,7 +330,7 @@ pub async fn execute_write(
             WriteAuditAction::RateLimitTripped,
             WriteAuditResult::SuppressedRateLimited,
         )
-        .with_value_requested(requested)
+        .with_value_requested(requested.as_f64())
         .with_detail(detail);
         if let Err(err) = deps.write_audit.insert_row(&row).await {
             eprintln!("banto-hub: 書き込み監査(rate_limit_tripped)の記録に失敗しました: {err}");
@@ -317,6 +360,25 @@ pub async fn execute_write(
         // catalog に載っている時点で banto-tags の CHECK 制約を通過済みの
         // はずなので実運用では到達しない防御的分岐。
         return Err(WriteRejection::UnsupportedValueType(None));
+    };
+
+    // gate 7(続き、2026-08-06 追加): data_type と RequestedValue の種別の
+    // 対称性を検査する - 暗黙の型変換はしない(§4.2 の設計思想を書き込み
+    // 経路にも適用)。bit タグへの数値書き込み(旧実装は `raw != 0.0` で
+    // 暗黙に bool 化していた)、および数値タグへの bool 書き込みは、
+    // どちらも 422 として拒否する。
+    let requested = match (data_type, requested) {
+        (DataType::Bit, RequestedValue::Num(_)) => {
+            return Err(WriteRejection::UnsupportedValueType(Some(
+                "bit タグには true/false を指定してください".to_string(),
+            )));
+        }
+        (dt, RequestedValue::Bool(_)) if dt != DataType::Bit => {
+            return Err(WriteRejection::UnsupportedValueType(Some(
+                "数値タグに真偽値は指定できません。数値を指定してください".to_string(),
+            )));
+        }
+        (_, value) => value.as_f64(),
     };
 
     let tag_row = TagService::new(deps.manager.pool())
@@ -360,7 +422,20 @@ pub async fn execute_write(
         Ok(()) => WriteAuditResult::Ok,
         Err(_) => WriteAuditResult::Failed,
     };
-    if let Err(err) = deps.write_audit.set_result(audit_id, final_result).await {
+    // T8-2 (docs/tag-server-design.md §6.1, 2026-08-06): carry the
+    // rejection's detail (e.g. `PlcWriteError::BitWriteVerificationFailed`'s
+    // 「書き戻し競合の可能性があります」for a T8 RMW confirmation-read
+    // mismatch) into the confirmed audit row, reusing exactly the same
+    // `WriteRejection::detail()` the REST/gRPC response bodies already show
+    // the caller - so the write_audit record and the failed response always
+    // agree on why. `Ok(())` has no detail (`None`), matching every other
+    // successful write's audit row before this change.
+    let failure_detail = outcome.as_ref().err().and_then(WriteRejection::detail);
+    if let Err(err) = deps
+        .write_audit
+        .set_result(audit_id, final_result, failure_detail.as_deref())
+        .await
+    {
         eprintln!("banto-hub: 書き込み監査の確定に失敗しました: {err}");
     }
 
@@ -420,11 +495,45 @@ async fn write_plc_tag(
         .write_broker_handle(conn)
         .map_err(|err| WriteRejection::WriteFailed(err.to_string()))?;
 
-    let request = BatchWriteRequest::Numeric(PlcWriteRequest {
-        address,
-        data_type,
-        value: tag_value,
-    });
+    // T8-2 (docs/tag-server-design.md §6.1, 2026-08-06): a bit-in-word
+    // address (`Address::Slmp { bit: Some(_), .. }`, i.e. the catalog
+    // address was registered as `"D100.5"`) goes through the driver's RMW
+    // path (`BatchWriteRequest::BitInWord`) instead of an ordinary word
+    // write - `banto-collect`'s `build_config` (crates/banto-collect/src/
+    // config.rs's `build_request`) already refuses to build a config where a
+    // bit-qualified address is paired with a non-`bit` `data_type`, and that
+    // refusal keeps the whole catalog (including this write path's `entry`)
+    // on its previous state (`CollectorManager::rebuild`'s all-or-nothing
+    // commit, `apps/banto-hub/core/src/hub.rs`'s module doc), so reaching
+    // here with `data_type == DataType::Bit` false and a bit-qualified
+    // address is not reachable in practice - the `matches!` below only ever
+    // fires for `DataType::Bit`, but is written independently of `data_type`
+    // for the same defense-in-depth reason `Address::parse_slmp`'s error
+    // above is handled rather than `unwrap`ped. A genuine bit-*device*
+    // address (`"M50"`, no `.N` suffix) still takes the `Numeric` branch
+    // exactly as before T8 - only a word device's bit-in-word notation does.
+    let is_bit_in_word = matches!(address, Address::Slmp { bit: Some(_), .. });
+    let request = if is_bit_in_word {
+        let PlcTagValue::Bit(value) = tag_value else {
+            // Unreachable: `is_bit_in_word` can only be true when `address`
+            // parsed a `.N` suffix, which `Address::parse_slmp`
+            // (`banto-plc`'s `slmp::address::parse`) only accepts on a word
+            // device - and this write path's `data_type` for a word-device
+            // tag with such an address is `DataType::Bit` by the config-build
+            // guarantee documented just above, which is exactly the branch
+            // that produces `PlcTagValue::Bit` a few lines up.
+            return Err(WriteRejection::WriteFailed(
+                "内部エラー: ビット指定アドレスの値が bool ではありません".to_string(),
+            ));
+        };
+        BatchWriteRequest::BitInWord { address, value }
+    } else {
+        BatchWriteRequest::Numeric(PlcWriteRequest {
+            address,
+            data_type,
+            value: tag_value,
+        })
+    };
     match handle.write(vec![request]).await {
         Ok(results) => match results.into_iter().next() {
             Some(PlcWriteResult::Ok) => Ok(()),

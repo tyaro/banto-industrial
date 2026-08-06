@@ -85,12 +85,32 @@ pub struct StringWriteRequest {
 }
 
 /// One entry of a mixed write batch: an ordinary numeric/bit write (the
-/// existing [`WriteRequest`], unchanged) or a string write. The request type
-/// for `plan_slmp_write_batch` / `SlmpWriteClient::write_batch_mixed`.
+/// existing [`WriteRequest`], unchanged), a string write, or a T8 bit-in-word
+/// RMW write (docs/tag-server-design.md §6.1). The request type for
+/// `plan_slmp_write_batch` / `SlmpWriteClient::write_batch_mixed` - and, via
+/// `banto-broker`'s `Job::Write`, the type every broker-mediated write
+/// speaks, unchanged since T2 (adding this variant required no broker code
+/// change - see `slmp::planning`'s and `slmp::mod`'s module docs for why).
 #[derive(Debug, Clone, PartialEq)]
 pub enum BatchWriteRequest {
     Numeric(WriteRequest),
     String(StringWriteRequest),
+    /// Set or clear a single bit of a *word* device without disturbing its
+    /// other 15 bits (§6.1: SLMP has no dedicated bit-in-word write command,
+    /// unlike Modbus's FC22 Mask Write Register - see `slmp::planning`'s
+    /// module doc for why this is therefore a read/modify/write/verify
+    /// sequence rather than one wire operation).
+    ///
+    /// `address` must carry a bit position ([`banto_plc::Address::as_slmp`]'s
+    /// third element - i.e. parsed from `"D100.5"` notation, not a plain
+    /// `"D100"`) naming a **word** device; anything else is a per-request
+    /// [`crate::error::PlcWriteError::UnsupportedCombination`], resolved
+    /// before any wire traffic exactly like every other address/data-type
+    /// mismatch this crate rejects.
+    BitInWord {
+        address: Address,
+        value: bool,
+    },
 }
 
 impl From<WriteRequest> for BatchWriteRequest {

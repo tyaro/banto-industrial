@@ -704,6 +704,69 @@ relay-wright の専管）。
    T2 時点で `plc` のみ受理し、`computed`/`internal` の受理は T6 で解禁
    （2026-08-05 決定）
 
+### 6.1 ワードデバイスのビットアクセス（T8、2026-08-06 オーナー決定）
+
+ワードデバイス（SLMP の D 等 / Modbus 保持レジスタ）の個別ビットを
+タグとして読み書きする。
+
+- **名前づけはアドレス側のビット記法で行う**: タグ定義のアドレスに
+  `D100.5`（Modbus は `40001.3`）を許し、data_type=bit の通常タグとして
+  登録する。`hoge.0` のような**タグ名の後置記法は不採用** — catalog に
+  列挙されない派生名はバインディング契約（§4.1）を壊し、意図的に
+  非対応としたアクティブタグ（§1.1)と同じ構図になるため。ビットには
+  意味のある名前（例: `line1.status.running`）を付けて catalog に載せる
+- **読み取り**: 収集は元々ワード単位の一括読みなので、同一ワードの
+  16 ビットを何タグ定義しても PLC 負荷は不変（デコード時にビット抽出）
+- **書き込みはドライバ層の RMW**（2026-08-06 決定）: SLMP はワード
+  デバイスへのビット単位書き込みコマンドを持たないため、
+  banto-plc-write が「ワード読み → ビット変更 → 書き戻し → **確認読み**」
+  を1手順として実装する。これを **broker の1ジョブ内で実行**することで、
+  hub / relay-wright 側の並行書き込みとの競合はワイヤ上あり得ない
+  （W3-A の one-socket-at-a-time がジョブ粒度で効く — broker 本体の
+  変更は不要）。同一バッチ内で同じワードを狙うビット書き込みはマスク
+  合成で1回の RMW にまとめる（異なるワードは結合しない — 書き込み
+  プランナの gap-tolerance-zero 規律を維持）
+- **PLC 側との競合は原理的に防げない**（オーナー了承済み）: RMW の
+  読みと書きの間に PLC スキャンが同じワードの別ビットを書くと書き戻しで
+  潰れる。確認読みで**検出**して該当要求を Bad + 詳細記録とし、
+  **外部から書くビットを含むワードは PLC 側から書かない**（ハンド
+  シェイク領域の専有）を運用ガイドの規約とする
+- Modbus 書き込み（I9）実装時は FC22（Mask Write Register）が
+  アトミックなため RMW 自体が不要になる — I9 の設計材料として記録
+
+**T8 実装済み（2026-08-06）**: 2スライスに分割して実装した。
+
+- **T8-1（ドライバ層）**: `banto-plc` の `Address` にビット付きアドレス記法
+  （`D100.5`/`40001.3`、`Address::Slmp`/`Address::ModbusRef` の
+  `bit: Option<u8>` フィールド）を追加し、読み取り側（`decode`/`planning`）
+  が同一ワードの複数ビットタグを1回のワード読みに折り込む。
+  `banto-plc-write` に `BatchWriteRequest::BitInWord` を追加し、SLMP の
+  読み・変更・書き戻し・**確認読み**（RMW）を broker の1ジョブ内で実行する
+  （broker 本体は無変更）。確認読み不一致は
+  `PlcWriteError::BitWriteVerificationFailed` として per-request `Bad` になる。
+  **既知事項**: relay-wright のタグモニタ（手動書き込み）UI は、
+  `monitor_write` 自体は `BatchWriteRequest::BitInWord` を受け取れるが、
+  UI 側（`monitor_tag_write` の request 組み立て）は `.N` ビット付き
+  アドレスのタグをまだ配線していない（従来のフルワード/ビットデバイス
+  書き込みのみ対応）。必要になったら別スライスで対応する
+  （`apps/relay-wright/core/src/engine/monitor.rs` のコメント参照）。
+- **T8-2（hub 配線）**: `banto-collect::config::build_request` が、ビット付き
+  アドレスと `data_type != bit` の組み合わせを構成エラーとして拒否する。
+  `CollectorManager::rebuild` の all-or-nothing により、このエラーは
+  `last_config_error` に現れ、旧構成が維持される。`banto-hub` の書き込み
+  ゲート7（`write_path::execute_write` の `write_plc_tag`）は、対象
+  アドレスがビット付き（`Address::Slmp` の `bit` フィールドが `Some`）なら
+  `BatchWriteRequest::BitInWord` へ、それ以外（通常のワード/ビット
+  デバイス）は従来どおり `BatchWriteRequest::Numeric` へ変換する。確認読み
+  不一致による `WriteResult::Bad` は 502 `write_failed` として応答し、
+  `write_audit` の `detail` にも同じ理由文言（「書き戻し競合の可能性が
+  あります」）を記録する（`WriteAuditService::set_result` が `detail`
+  引数を取るよう拡張）。banto-tags（I1）はアドレス書式を引き続き検証しない
+  （既存方針どおり、address format は I2/I3b の関心事）。タグ登録フォームの
+  アドレス欄にビット記法のヘルプ文言を追記した。E2E は
+  `apps/banto-hub/core/tests/t8_bit_access.rs`（収集の共有読み・書き込み
+  RMW・構成エラー・確認読み不一致の4本）。
+
 ## 7. アプリ群の中でのタグサーバー — 中央レジストリ構想と移行ロードマップ
 
 **方針（2026-08-04 オーナー決定）**: タグサーバーは製品群の**タグ定義の
