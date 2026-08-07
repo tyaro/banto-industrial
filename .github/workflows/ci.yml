@@ -55,7 +55,7 @@ jobs:
   rust:
     name: Rust (fmt / clippy / test)
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     # banto-tags (and every later I-series crate) depends on banto-core /
     # banto-storage via a git tag reference into tyaro/banto (see
     # crates/banto-tags/Cargo.toml, banto's docs/publishing.md). banto went
@@ -69,25 +69,34 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # rustfmt only parses/reformats - no compilation, so unlike the steps
       # below it can safely cover every workspace member (including the
-      # `chronogazer` src-tauri crate) without needing its native deps built.
+      # `chronogazer`/`relay-wright` src-tauri crates) without needing their
+      # native deps built.
       - name: fmt
         run: cargo fmt --all --check
-      # Scope: every crate EXCEPT `chronogazer` (apps/chronogazer/src-tauri).
-      # Same reasoning as banto's own CI: the Tauri crate pulls in heavy
-      # native/webview dependencies, so it is intentionally excluded from
-      # this pipeline to keep it fast; add it back with the appropriate
-      # tauri-action setup once native builds are needed in CI. R1-A adds
-      # `chronogazer-core` here (the headless service layer + banto-serve
-      # binary), which has no such native deps.
+      # Scope: every workspace member EXCEPT the two Tauri src-tauri crates
+      # (`chronogazer`, `relay-wright`). This is `--workspace --exclude`
+      # rather than an explicit `-p` allowlist so that new workspace members
+      # are covered automatically instead of silently being skipped by CI
+      # (see git history for the drift this caused). The exclusion itself is
+      # no longer about native/webview deps being unbuildable here - this
+      # job runs on windows-latest, so wry/WebView2 do build - it's purely to
+      # keep the job fast: pulling in the full Tauri + WebView2 toolchain for
+      # both apps would add significant build time for no test coverage
+      # (src-tauri is a thin shell over `chronogazer-core`/`relay-wright-core`,
+      # which ARE covered). Revisit if src-tauri ever grows logic worth
+      # testing directly.
       - name: clippy
-        run: cargo clippy -p banto-tags -p banto-plc -p banto-tstore -p banto-collect -p banto-tsquery -p chronogazer-core --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude chronogazer --exclude relay-wright --all-targets -- -D warnings
       - name: test
-        run: cargo test -p banto-tags -p banto-plc -p banto-tstore -p banto-collect -p banto-tsquery -p chronogazer-core
+        run: cargo test --workspace --exclude chronogazer --exclude relay-wright
 
   e2e:
     name: E2E (Playwright smoke)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Known gap: this only covers apps/chronogazer. apps/banto-hub has no
+    # Playwright e2e config yet (docs/t5-handoff.md §2) - add a parallel job
+    # here once one exists.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
