@@ -3,12 +3,15 @@
 //! (the Tauri commands and the REST routes) get it for free through the
 //! existing [`crate::engine::SharedEngineControl`] slot.
 //!
-//! ## The one hard constraint: one SLMP session per CPU
+//! ## The one hard constraint: one SLMP session per connected port
 //!
-//! The real R08ENCPU accepts only ONE concurrent SLMP TCP connection (a
-//! second connect times out - verified on hardware), so this module NEVER
-//! opens its own `SlmpClient`. Every monitor read and every manual write goes
-//! through the engine broker's per-CPU task, reached via the
+//! The real R08ENCPU accepts only ONE concurrent SLMP TCP connection **per
+//! port** (a second connect to a port that already has a live session times
+//! out - verified on hardware 2026-08-07; a second port opened via the CPU's
+//! own parameters carries its own simultaneous session fine), so this module
+//! NEVER opens its own `SlmpClient` against a connection the engine broker
+//! already manages. Every monitor read and every manual write goes through
+//! the engine broker's per-connection task, reached via the
 //! [`banto_broker::SessionDirectory`] carried inside
 //! [`EngineControl`]. A connection the engine has no session for yet (created
 //! after engine start, or on an engine built with a connection subset) gets

@@ -11,9 +11,10 @@
  *   call rejects with `DEMO_MODE_MESSAGE`; `isMonitorAvailable()` lets the
  *   page show the note up front.
  *
- * Both paths ride the engine broker's one-session-per-CPU SLMP tasks (the
- * real R08ENCPU accepts only ONE concurrent SLMP connection - the monitor
- * never opens its own), so values here are read over the SAME socket the
+ * Both paths ride the engine broker's one-session-per-connection SLMP tasks
+ * (the real R08ENCPU accepts only ONE concurrent SLMP connection per
+ * connected port - the monitor never opens a second one of its own), so
+ * values here are read over the SAME socket the
  * auto-write engine polls through.
  *
  * RBAC (invariant §1 両経路対称, backend is the authority): read = viewer+,

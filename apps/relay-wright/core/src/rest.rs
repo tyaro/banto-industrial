@@ -2530,8 +2530,8 @@ fn engine_router(control: SharedEngineControl, audit: AuditLogService, auth: Aut
 // with NO arm gate; every write is audited by `EngineControl::monitor_write`
 // under `action: 'manual_write'`). Reuses [`EngineState`] - the SAME shared
 // control slot as `/api/engine/*`, so monitor traffic rides the engine
-// broker's one-session-per-CPU tasks (hard constraint: the R08ENCPU accepts
-// only one SLMP session).
+// broker's one-session-per-connection tasks (hard constraint: the R08ENCPU
+// accepts only one SLMP session per connected port).
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
