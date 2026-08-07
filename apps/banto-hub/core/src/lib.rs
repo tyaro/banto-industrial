@@ -91,6 +91,8 @@ pub mod rest;
 pub mod settings;
 pub mod stream;
 pub mod subscribe_core;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod users;
 pub mod write_audit;
 pub mod write_control;

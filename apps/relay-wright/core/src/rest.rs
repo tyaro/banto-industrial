@@ -2870,7 +2870,6 @@ mod tests {
     use banto_core::BantoError;
     use serde_json::json;
     use std::path::PathBuf;
-    use tempfile::tempdir;
     use tower::ServiceExt;
 
     const CLIENT_HEADER: (&str, &str) = ("X-Banto-Client", "banto");
@@ -3054,7 +3053,7 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn missing_csrf_header_is_forbidden_even_with_a_token() {
         let (router, token) = router_with_token().await;
         let response = router
@@ -3134,7 +3133,7 @@ mod tests {
             .unwrap()
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn auth_status_reports_uninitialized_before_any_setup() {
         let router = router_with_setup(true).await;
         let response = router.oneshot(get("/api/auth/status")).await.unwrap();
@@ -3143,7 +3142,7 @@ mod tests {
         assert_eq!(json["initialized"], false);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn auth_status_needs_no_bearer_token() {
         // Same assertion as above, phrased to make explicit that omitting
         // Authorization entirely (not just an invalid token) still gets a
@@ -3158,7 +3157,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn auth_setup_is_forbidden_when_allow_setup_is_false() {
         let router = router_with_setup(false).await;
         let response = router
@@ -3171,7 +3170,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn auth_setup_creates_account_and_the_token_works_for_guarded_routes() {
         let router = router_with_setup(true).await;
 
@@ -3206,7 +3205,7 @@ mod tests {
         assert_eq!(identity_response.status(), StatusCode::OK);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn auth_setup_rejects_short_password_with_422_validation() {
         let router = router_with_setup(true).await;
         let response = router
@@ -3222,7 +3221,7 @@ mod tests {
         assert_eq!(json["field_errors"][0]["field"], "password");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn auth_setup_second_call_returns_success_false_already_initialized() {
         let router = router_with_setup(true).await;
         let first = post_json(
@@ -3257,7 +3256,7 @@ mod tests {
             .to_string()
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn auth_change_password_requires_a_bearer_token() {
         let router = router_with_setup(true).await;
         setup_and_get_token(&router).await;
@@ -3272,7 +3271,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn auth_change_password_rejects_wrong_current_password() {
         let router = router_with_setup(true).await;
         let token = setup_and_get_token(&router).await;
@@ -3337,7 +3336,7 @@ mod tests {
         )
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn auth_change_password_success_then_relogin_with_new_password() {
         let (router, _audit) = router_with_real_login(true).await;
         let token = setup_and_get_token(&router).await;
@@ -3415,7 +3414,7 @@ mod tests {
             .unwrap()
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn only_admin_can_list_users() {
         let (router, admin, editor, viewer) = router_with_role_tokens().await;
 
@@ -3433,7 +3432,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn non_admin_users_write_routes_are_forbidden_with_forbidden_kind() {
         let (router, _admin, editor, _viewer) = router_with_role_tokens().await;
 
@@ -3455,7 +3454,7 @@ mod tests {
         assert_eq!(json["kind"], "forbidden");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn admin_can_create_list_update_reset_password_and_delete_users() {
         let (router, admin, _editor, _viewer) = router_with_role_tokens().await;
 
@@ -3517,7 +3516,7 @@ mod tests {
         assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn users_routes_are_unauthorized_without_a_token() {
         let (router, _admin, _editor, _viewer) = router_with_role_tokens().await;
         let response = router.oneshot(get("/api/users")).await.unwrap();
@@ -3534,7 +3533,7 @@ mod tests {
         )
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ui_settings_round_trip_via_rest() {
         let (router, _admin, _editor, viewer) = router_with_role_tokens().await;
 
@@ -3565,7 +3564,7 @@ mod tests {
         assert_eq!(body_json(response).await["value"], "glass");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ui_settings_are_isolated_per_user() {
         let (router, admin, editor, _viewer) = router_with_role_tokens().await;
 
@@ -3594,7 +3593,7 @@ mod tests {
         assert_eq!(body_json(response).await["value"], "glass");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ui_settings_reject_an_invalid_key_with_422_validation() {
         let (router, _admin, _editor, viewer) = router_with_role_tokens().await;
 
@@ -3616,7 +3615,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ui_settings_routes_are_unauthorized_without_a_token() {
         let (router, _admin, _editor, _viewer) = router_with_role_tokens().await;
 
@@ -3726,12 +3725,23 @@ mod tests {
     ///   `BackupService::create` uses) silently writes nothing when its
     ///   SOURCE connection is `:memory:` (see `crate::backup`'s test module
     ///   doc comment for the empirically-verified reason).
-    /// - The returned `tempfile::TempDir` guard must be kept alive by the
-    ///   caller for as long as the router is in use - dropping it deletes
-    ///   the directory `backups/`/`restore-pending.sqlite3` live in.
+    /// - The returned `crate::test_support::TempDir` guard must be kept
+    ///   alive by the caller for as long as the router is in use - dropping
+    ///   it deletes the directory `backups/`/`restore-pending.sqlite3` live
+    ///   in.
+    ///
+    /// Returns `(dir, router, admin, editor, viewer)` - **dir first,
+    /// router second** - not the more natural-looking `(router, dir, ...)`.
+    /// See `crate::test_support`'s module doc for why: every call site
+    /// destructures this directly, and a tuple's bindings from one `let`
+    /// pattern drop in *reverse* of how they're listed - `router` (which
+    /// holds the pool via its cloned service state) must be listed AFTER
+    /// `dir` so it drops before `dir`'s cleanup runs. Getting this order
+    /// backwards silently leaks the temp dir on every run (measured before
+    /// this fix).
     async fn router_with_role_tokens_and_backup(
-    ) -> (Router, tempfile::TempDir, String, String, String) {
-        let dir = tempdir().expect("tempdir");
+    ) -> (crate::test_support::TempDir, Router, String, String, String) {
+        let dir = crate::test_support::TempDir::new();
         let db_path = dir.path().join("relay-wright.sqlite3");
         // `crate::db::init_db` (not a raw `sqlx::migrate!` call here) - see
         // that module's doc comment for why this app's own schema is NOT
@@ -3797,12 +3807,12 @@ mod tests {
             false,
             pool.clone(),
         );
-        (router, dir, admin_token, editor_token, viewer_token)
+        (dir, router, admin_token, editor_token, viewer_token)
     }
 
     /// (a) `/api/audit-log/list` is admin-only: 200 for admin, 403 for
     /// editor/viewer.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn audit_log_list_is_admin_only() {
         let (router, _audit, admin, editor, viewer) = router_with_role_tokens_and_audit().await;
 
@@ -3835,7 +3845,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn audit_log_list_requires_a_token() {
         let (router, _audit, _admin, _editor, _viewer) = router_with_role_tokens_and_audit().await;
         let response = router
@@ -3850,7 +3860,7 @@ mod tests {
 
     /// `GET /api/audit-log/config` is admin-only: 200 (with the default
     /// retention policy) for admin, 403 for editor/viewer.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn audit_config_get_is_admin_only() {
         let (router, _audit, admin, editor, viewer) = router_with_role_tokens_and_audit().await;
 
@@ -3883,7 +3893,7 @@ mod tests {
     /// entry (spec M14: settings mutations are audited, unlike the read-only
     /// `GET`). `editor`/`viewer` are rejected with 403 and the policy is left
     /// untouched.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn audit_config_apply_persists_and_is_admin_only() {
         let (router, _audit, admin, editor, viewer) = router_with_role_tokens_and_audit().await;
 
@@ -3947,7 +3957,7 @@ mod tests {
     }
 
     /// (c) A viewer's rejected write is recorded as `denied`.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn viewer_write_denial_is_recorded_as_denied() {
         let (router, _audit, admin, _editor, viewer) = router_with_role_tokens_and_audit().await;
 
@@ -3994,7 +4004,7 @@ mod tests {
     /// `users` create/reset-password entries must never leak the plaintext
     /// password into `detail` (spec M14's hard rule - see
     /// `crate::audit`'s module doc comment).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn users_create_audit_entry_never_contains_the_password() {
         let (router, _audit, admin, _editor, _viewer) = router_with_role_tokens_and_audit().await;
 
@@ -4040,7 +4050,7 @@ mod tests {
     /// `router_with_real_login` (not `router_with_role_tokens_and_audit`)
     /// since it wires `/api/auth/login` through the same
     /// `audited_credential_verifier` production code path.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn login_failure_is_recorded_as_login_failed() {
         let (router, audit) = router_with_real_login(true).await;
         setup_and_get_token(&router).await; // creates the "owner" admin account
@@ -4065,7 +4075,7 @@ mod tests {
         assert_eq!(entry.result, "failed");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn login_success_is_recorded_as_login() {
         let (router, audit) = router_with_real_login(true).await;
         setup_and_get_token(&router).await;
@@ -4090,7 +4100,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn logout_is_recorded() {
         let (router, audit) = router_with_real_login(true).await;
         let token = setup_and_get_token(&router).await;
@@ -4117,7 +4127,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn setup_is_recorded() {
         let (router, audit) = router_with_real_login(true).await;
         setup_and_get_token(&router).await;
@@ -4136,7 +4146,7 @@ mod tests {
     /// Spec M14 (coordinator review): a self-service password change is a
     /// security event and must be recorded as `password_change` (actor =
     /// entity = the caller) - and the entry must never carry the password.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn change_password_is_recorded_as_password_change() {
         let (router, audit) = router_with_real_login(true).await;
         let token = setup_and_get_token(&router).await;
@@ -4190,9 +4200,9 @@ mod tests {
     /// admin can create a backup, see it in the list, and download the exact
     /// same bytes back (spec M17: "バックアップファイルが作成・ダウンロード
     /// でき"). `POST /api/backups` is recorded as `action: "backup"`.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn admin_can_create_list_and_download_backups() {
-        let (router, _dir, admin, _editor, _viewer) = router_with_role_tokens_and_backup().await;
+        let (_dir, router, admin, _editor, _viewer) = router_with_role_tokens_and_backup().await;
 
         let create_response = router
             .clone()
@@ -4235,9 +4245,9 @@ mod tests {
     /// `editor`/`viewer` cannot reach ANY `/api/backups/*` route (spec M17:
     /// "admin以外は全API 403") - checked against both a read route (`GET
     /// /api/backups`) and a write route (`POST /api/backups`).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn editor_and_viewer_cannot_access_backups_routes() {
-        let (router, _dir, _admin, editor, viewer) = router_with_role_tokens_and_backup().await;
+        let (_dir, router, _admin, editor, viewer) = router_with_role_tokens_and_backup().await;
 
         for token in [&editor, &viewer] {
             let list_response = router
@@ -4262,9 +4272,9 @@ mod tests {
     /// (spec M17: "壊れたファイルのリストアが検証で拒否される") - `Validation`
     /// maps to `422` (`banto_server::response::status_for`), and no pending
     /// restore is left staged.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn restore_upload_of_garbage_bytes_is_rejected_as_validation() {
-        let (router, _dir, admin, _editor, _viewer) = router_with_role_tokens_and_backup().await;
+        let (_dir, router, admin, _editor, _viewer) = router_with_role_tokens_and_backup().await;
 
         let response = router
             .clone()
@@ -4289,9 +4299,9 @@ mod tests {
     /// Full stage-from-existing-backup -> cancel round trip (spec M17),
     /// asserting both the `pending-restore` status endpoint AND the
     /// `restore_staged`/`restore_cancelled` audit entries it records.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stage_restore_from_existing_backup_then_cancel_is_recorded_in_the_audit_log() {
-        let (router, _dir, admin, _editor, _viewer) = router_with_role_tokens_and_backup().await;
+        let (_dir, router, admin, _editor, _viewer) = router_with_role_tokens_and_backup().await;
 
         let create_response = router
             .clone()
@@ -4449,7 +4459,7 @@ mod tests {
     /// recorded to the audit log with `origin: "rest"` - the REST half of the
     /// dual-path create+audit symmetry (the Tauri half is asserted in
     /// `src-tauri`'s own tests).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rest_editor_can_create_write_target_and_it_is_audited() {
         let (router, audit, plc_id, editor, _viewer) = write_registry_router_test().await;
         let response = router
@@ -4484,7 +4494,7 @@ mod tests {
     /// the denial is recorded (`action: "denied"`, `origin: "rest"`) - proving
     /// `require_editor` gates writes and audits the denial exactly as the
     /// admin `RoleGuard`/Tauri `require_role` do.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rest_viewer_cannot_create_write_target_and_denial_is_audited() {
         let (router, audit, plc_id, _editor, viewer) = write_registry_router_test().await;
         let response = router
@@ -4586,7 +4596,7 @@ mod tests {
     /// "rest"`), and the list route returns it WITH a server-rendered SVG -
     /// the REST half of the dual-path create+audit symmetry (the Tauri half
     /// is asserted in `src-tauri`'s own tests).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rest_editor_can_create_qr_string_and_it_is_audited() {
         let (router, audit, editor, _viewer) = qr_strings_router_test().await;
         let response = router
@@ -4630,7 +4640,7 @@ mod tests {
 
     /// A `viewer` is denied (403) when trying to create a QR string, and the
     /// denial is recorded (`action: "denied"`, `origin: "rest"`).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rest_viewer_cannot_create_qr_string_and_denial_is_audited() {
         let (router, audit, _editor, viewer) = qr_strings_router_test().await;
         let response = router
@@ -4752,7 +4762,7 @@ mod tests {
     /// the audit log with `origin: "rest"` / `resource: "tags"` - the REST half
     /// of the R1-B create+audit symmetry (the Tauri half is asserted in
     /// `src-tauri`'s own tests).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rest_editor_can_create_tag_and_it_is_audited() {
         let (router, audit, group_id, editor, _viewer) = tag_registry_router_test().await;
         let response = router
@@ -4787,7 +4797,7 @@ mod tests {
     /// is recorded (`action: "denied"`, `resource: "tags"`, `origin: "rest"`) -
     /// [`require_editor`] gates the tag registry writes exactly as it does the
     /// W2 write registry's.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rest_viewer_cannot_create_tag_and_denial_is_audited() {
         let (router, audit, group_id, _editor, viewer) = tag_registry_router_test().await;
         let response = router
@@ -4824,7 +4834,7 @@ mod tests {
     /// Smoke: a `viewer` can list all three tag-registry resources (the whole
     /// router sits behind `require_auth` alone for reads), and the seeded
     /// connection/group rows come back.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rest_viewer_can_list_all_three_tag_registry_resources() {
         let (router, _audit, _group_id, _editor, viewer) = tag_registry_router_test().await;
 
@@ -4853,7 +4863,7 @@ mod tests {
     /// nothing; the cascade removes the seeded group + a tag with it, returns
     /// the counts, and is audited with the name snapshot + counts in
     /// `detail`.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rest_editor_can_cascade_delete_a_plc_connection_and_it_is_audited() {
         let (router, audit, group_id, editor, _viewer) = tag_registry_router_test().await;
 
@@ -4940,7 +4950,7 @@ mod tests {
 
     /// feature/easy-delete: the group-cascade REST twin - preview counts,
     /// cascade removes the group's tag with it, audited with counts.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rest_editor_can_cascade_delete_a_collection_group_and_it_is_audited() {
         let (router, audit, group_id, editor, _viewer) = tag_registry_router_test().await;
 
@@ -5016,7 +5026,7 @@ mod tests {
     /// feature/easy-delete: a `viewer` may read the cascade PREVIEW (it is a
     /// read, like every other GET here) but is denied the cascade DELETE
     /// (403, denial audited) - and nothing is deleted.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rest_viewer_can_preview_but_not_cascade_delete_and_denial_is_audited() {
         let (router, audit, _group_id, _editor, viewer) = tag_registry_router_test().await;
 
@@ -5153,7 +5163,7 @@ mod tests {
     /// by the route), and `GET /api/engine/status` then reports `armed: true` -
     /// the REST half of the arm+audit symmetry (its Tauri twin lives in
     /// `src-tauri`'s tests).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rest_admin_can_arm_over_rest_and_it_is_audited() {
         let (router, pool, admin, _editor, _viewer) = router_with_role_tokens_and_engine().await;
 
@@ -5181,7 +5191,7 @@ mod tests {
     /// An `editor` is denied (403) arming over REST - arm requires `admin` - and
     /// the denial is recorded (`action: "denied"`, `resource: "engine"`,
     /// `origin: "rest"`), matching the Tauri `require_role` denial audit.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rest_editor_cannot_arm_and_denial_is_audited() {
         let (router, pool, _admin, editor, _viewer) = router_with_role_tokens_and_engine().await;
 
@@ -5210,7 +5220,7 @@ mod tests {
 
     /// An `editor` CAN toggle dry-run over REST (204, lower floor than
     /// arm/disarm), it is written to `write_audit_log`, and status reflects it.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rest_editor_can_toggle_dry_run() {
         let (router, pool, _admin, editor, _viewer) = router_with_role_tokens_and_engine().await;
 
@@ -5235,7 +5245,7 @@ mod tests {
 
     /// A `viewer` can read the engine status over REST (200) - status is
     /// viewer+ (the router's `require_auth` is the only gate).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rest_viewer_can_read_engine_status() {
         let (router, _pool, _admin, _editor, viewer) = router_with_role_tokens_and_engine().await;
 
@@ -5309,7 +5319,7 @@ mod tests {
     /// `POST /api/monitor/read` is viewer+ (a read): the viewer gets the
     /// group's display-ready values over the engine broker's session (spawned
     /// on demand - the router's engine manages no connections).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rest_viewer_can_read_monitor_values() {
         let (router, pool, _admin, _editor, viewer) = router_with_role_tokens_and_engine().await;
         let sim = banto_plc_write::slmp::simulator::Simulator::start().await;
@@ -5350,7 +5360,7 @@ mod tests {
     /// `denied` recorded under `resource: "monitor"`), an `editor` lands the
     /// write in the simulator with NO arm required (the engine stays
     /// disarmed) and the `manual_write` audit row attributes them.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rest_monitor_write_is_editor_gated_and_audited() {
         let (router, pool, _admin, editor, viewer) = router_with_role_tokens_and_engine().await;
         let sim = banto_plc_write::slmp::simulator::Simulator::start().await;
@@ -5437,7 +5447,7 @@ mod tests {
 
     /// Export is editor+ (a read of non-secret config): an `editor` gets the
     /// project JSON (200, right format/version), a `viewer` is denied (403).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rest_editor_can_export_project_but_viewer_cannot() {
         let (router, _audit, _admin, editor, viewer) = router_with_role_tokens_and_audit().await;
 
@@ -5460,7 +5470,7 @@ mod tests {
 
     /// Import is admin-only and audited: an `editor` is denied (403, denial
     /// recorded), an `admin` succeeds (200, `project_import` recorded).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rest_admin_can_import_project_and_editor_is_denied_and_audited() {
         let (router, audit, admin, editor, _viewer) = router_with_role_tokens_and_audit().await;
 
@@ -5502,7 +5512,7 @@ mod tests {
     /// Import is refused while the engine is ARMED (the safety guard): arm as
     /// admin, then even an admin import is rejected with the arm message and
     /// nothing is applied.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rest_import_is_refused_while_engine_armed() {
         let (router, _pool, admin, _editor, _viewer) = router_with_role_tokens_and_engine().await;
 

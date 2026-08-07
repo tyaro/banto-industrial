@@ -1603,6 +1603,50 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// A retry-cleanup temp dir wrapper - see `chronogazer_core::backup`'s
+    /// `crate::test_support` module doc (this crate's `AppState` tests hit
+    /// the exact same Windows WAL-close-timing leak: measured, one
+    /// `cargo test -p chronogazer --lib` run left directories behind, one
+    /// per [`app_state_with_tempdir`] call). Plain `tempfile::TempDir`'s
+    /// single, non-retrying `remove_dir_all` (which also silently swallows
+    /// its error) cannot reliably clean up here. Requires a multi-thread
+    /// tokio runtime with >= 2 workers, same reasoning as that module.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir").keep();
+            Self(dir)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    const TEMP_DIR_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+    const TEMP_DIR_MAX_ATTEMPTS: u32 = 40;
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            for attempt in 1..=TEMP_DIR_MAX_ATTEMPTS {
+                match std::fs::remove_dir_all(&self.0) {
+                    Ok(()) => return,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+                    Err(_) if attempt < TEMP_DIR_MAX_ATTEMPTS => {
+                        std::thread::sleep(TEMP_DIR_RETRY_DELAY);
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "TempDir: giving up removing {:?} after {attempt} attempts: {err}",
+                            self.0
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// A minimal [`AppState`] over an in-memory DB, no running server, and a
     /// dummy REST verifier - just enough state to exercise command bodies
     /// (like [`change_own_password`]) that only touch the service handles.
@@ -1635,8 +1679,16 @@ mod tests {
     /// `chronogazer_core::backup`'s test module doc comment for the
     /// empirically-verified reason). The returned `TempDir` guard must be
     /// kept alive by the caller for as long as `AppState` is still in use.
-    async fn app_state_with_tempdir() -> (AppState, tempfile::TempDir) {
-        let dir = tempfile::tempdir().expect("tempdir");
+    ///
+    /// Returns `(dir, state)` - **dir first, state last** - not the more
+    /// natural-looking `(state, dir)`. Every call site destructures this
+    /// directly, and a tuple's bindings from one `let` pattern drop in
+    /// *reverse* of how they're listed - `state` (which holds the pool)
+    /// must be listed last so it drops before `dir`'s cleanup runs. Getting
+    /// this order backwards silently leaks the temp dir on every run
+    /// (measured before this fix).
+    async fn app_state_with_tempdir() -> (TempDir, AppState) {
+        let dir = TempDir::new();
         let db_path = dir.path().join("chronogazer.sqlite3");
         let pool = chronogazer_core::db::init_db(&db_path)
             .await
@@ -1654,13 +1706,13 @@ mod tests {
             audit: AuditLogService::new(pool.clone()),
             backup: BackupService::new(db_path, pool),
         };
-        (state, dir)
+        (dir, state)
     }
 
     /// Spec M14: the Tauri-side self-service password change must be
     /// recorded as `password_change` (actor = entity = the caller), and the
     /// entry's `detail` must never carry the password.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn change_own_password_is_recorded_as_password_change() {
         let state = app_state().await;
         let owner = state
@@ -1699,7 +1751,7 @@ mod tests {
 
     /// A FAILED password change (wrong current password) must record
     /// nothing - only the success path is a completed security event.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_change_own_password_records_nothing() {
         let state = app_state().await;
         let owner = state
@@ -1729,9 +1781,9 @@ mod tests {
 
     /// `admin` can create a backup, and it is recorded as `action: "backup"`
     /// with `entityId` = the created file name (spec M17).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn backups_create_records_a_backup_audit_entry() {
-        let (state, _dir) = app_state_with_tempdir().await;
+        let (_dir, state) = app_state_with_tempdir().await;
         let admin = state
             .users
             .create_user("admin", "password123", "管理者", Role::Admin)
@@ -1768,9 +1820,9 @@ mod tests {
 
     /// A `viewer` cannot create a backup (spec M17: "admin以外は全API 403"
     /// on the Tauri side too).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn viewer_cannot_create_backups() {
-        let (state, _dir) = app_state_with_tempdir().await;
+        let (_dir, state) = app_state_with_tempdir().await;
         let viewer = state
             .users
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
@@ -1787,9 +1839,9 @@ mod tests {
     /// pending - the round trip `backups_create` -> `backups_stage_restore`
     /// -> `backups_pending` (spec M17), plus the `restore_staged` audit
     /// entry.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stage_restore_then_pending_reports_it() {
-        let (state, _dir) = app_state_with_tempdir().await;
+        let (_dir, state) = app_state_with_tempdir().await;
         let admin = state
             .users
             .create_user("admin", "password123", "管理者", Role::Admin)

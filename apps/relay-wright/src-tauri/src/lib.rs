@@ -2943,6 +2943,50 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// A retry-cleanup temp dir wrapper - see `relay_wright_core::backup`'s
+    /// `crate::test_support` module doc (this crate's `AppState` tests hit
+    /// the exact same Windows WAL-close-timing leak: measured, one
+    /// `cargo test -p relay-wright --lib` run left 3 directories behind,
+    /// one per [`app_state_with_tempdir`] call). Plain `tempfile::TempDir`'s
+    /// single, non-retrying `remove_dir_all` (which also silently swallows
+    /// its error) cannot reliably clean up here. Requires a multi-thread
+    /// tokio runtime with >= 2 workers, same reasoning as that module.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir").keep();
+            Self(dir)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    const TEMP_DIR_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+    const TEMP_DIR_MAX_ATTEMPTS: u32 = 40;
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            for attempt in 1..=TEMP_DIR_MAX_ATTEMPTS {
+                match std::fs::remove_dir_all(&self.0) {
+                    Ok(()) => return,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+                    Err(_) if attempt < TEMP_DIR_MAX_ATTEMPTS => {
+                        std::thread::sleep(TEMP_DIR_RETRY_DELAY);
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "TempDir: giving up removing {:?} after {attempt} attempts: {err}",
+                            self.0
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// A minimal [`AppState`] over an in-memory DB, no running server, and a
     /// dummy REST verifier - just enough state to exercise command bodies
     /// (like [`change_own_password`]) that only touch the service handles.
@@ -2988,8 +3032,16 @@ mod tests {
     /// `relay_wright_core::backup`'s test module doc comment for the
     /// empirically-verified reason). The returned `TempDir` guard must be
     /// kept alive by the caller for as long as `AppState` is still in use.
-    async fn app_state_with_tempdir() -> (AppState, tempfile::TempDir) {
-        let dir = tempfile::tempdir().expect("tempdir");
+    ///
+    /// Returns `(dir, state)` - **dir first, state last** - not the more
+    /// natural-looking `(state, dir)`. Every call site destructures this
+    /// directly, and a tuple's bindings from one `let` pattern drop in
+    /// *reverse* of how they're listed - `state` (which holds the pool)
+    /// must be listed last so it drops before `dir`'s cleanup runs. Getting
+    /// this order backwards silently leaks the temp dir on every run
+    /// (measured before this fix).
+    async fn app_state_with_tempdir() -> (TempDir, AppState) {
+        let dir = TempDir::new();
         let db_path = dir.path().join("relay-wright.sqlite3");
         let pool = relay_wright_core::db::init_db(&db_path)
             .await
@@ -3017,13 +3069,13 @@ mod tests {
             engine: AsyncMutex::new(None),
             engine_control: std::sync::Arc::new(AsyncMutex::new(None)),
         };
-        (state, dir)
+        (dir, state)
     }
 
     /// Spec M14: the Tauri-side self-service password change must be
     /// recorded as `password_change` (actor = entity = the caller), and the
     /// entry's `detail` must never carry the password.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn change_own_password_is_recorded_as_password_change() {
         let state = app_state().await;
         let owner = state
@@ -3062,7 +3114,7 @@ mod tests {
 
     /// A FAILED password change (wrong current password) must record
     /// nothing - only the success path is a completed security event.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_change_own_password_records_nothing() {
         let state = app_state().await;
         let owner = state
@@ -3092,9 +3144,9 @@ mod tests {
 
     /// `admin` can create a backup, and it is recorded as `action: "backup"`
     /// with `entityId` = the created file name (spec M17).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn backups_create_records_a_backup_audit_entry() {
-        let (state, _dir) = app_state_with_tempdir().await;
+        let (_dir, state) = app_state_with_tempdir().await;
         let admin = state
             .users
             .create_user("admin", "password123", "管理者", Role::Admin)
@@ -3131,9 +3183,9 @@ mod tests {
 
     /// A `viewer` cannot create a backup (spec M17: "admin以外は全API 403"
     /// on the Tauri side too).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn viewer_cannot_create_backups() {
-        let (state, _dir) = app_state_with_tempdir().await;
+        let (_dir, state) = app_state_with_tempdir().await;
         let viewer = state
             .users
             .create_user("viewer", "password123", "閲覧者", Role::Viewer)
@@ -3150,9 +3202,9 @@ mod tests {
     /// pending - the round trip `backups_create` -> `backups_stage_restore`
     /// -> `backups_pending` (spec M17), plus the `restore_staged` audit
     /// entry.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stage_restore_then_pending_reports_it() {
-        let (state, _dir) = app_state_with_tempdir().await;
+        let (_dir, state) = app_state_with_tempdir().await;
         let admin = state
             .users
             .create_user("admin", "password123", "管理者", Role::Admin)
@@ -3288,7 +3340,7 @@ mod tests {
         (state, pool)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn write_targets_create_is_recorded_with_tauri_origin() {
         let (state, pool) = app_state_with_pool().await;
         // A PLC connection for the target to reference (validated at the
@@ -3347,7 +3399,7 @@ mod tests {
 
     /// A `viewer` session is denied (and the denial audited) when creating a
     /// write target - the Tauri twin of the REST `require_editor` denial.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn write_targets_create_denies_viewer_and_audits_it() {
         let state = app_state().await;
         let viewer = state
@@ -3396,7 +3448,7 @@ mod tests {
     /// `rest_editor_can_create_qr_string_and_it_is_audited`): an `editor`
     /// session can create a QR string via the command body (the response
     /// carrying the server-rendered SVG), recorded with `origin: "tauri"`.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn qr_strings_create_is_recorded_with_tauri_origin() {
         let state = app_state().await;
         let editor = state
@@ -3435,7 +3487,7 @@ mod tests {
 
     /// A `viewer` session is denied (and the denial audited) when creating a
     /// QR string - the Tauri twin of the REST `require_editor` denial.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn qr_strings_create_denies_viewer_and_audits_it() {
         let state = app_state().await;
         let viewer = state
@@ -3480,7 +3532,7 @@ mod tests {
     /// `resource: "tags"`. The PLC connection + collection group the tag needs
     /// are seeded through the state's own services (they exist as commands now,
     /// unlike W2's cross-lineage seed).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tags_create_is_recorded_with_tauri_origin() {
         let (state, _pool) = app_state_with_pool().await;
         let editor = state
@@ -3560,7 +3612,7 @@ mod tests {
     /// A `viewer` session is denied (and the denial audited with
     /// `resource: "tags"`) when creating a tag - the Tauri twin of the REST
     /// `require_editor` denial for the tag registry.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tags_create_denies_viewer_and_audits_it() {
         let state = app_state().await;
         let viewer = state
@@ -3679,7 +3731,7 @@ mod tests {
     /// an `editor` session can cascade-delete a connection via the command
     /// body - the whole subtree goes in one call, the counts come back, and
     /// the audit entry carries `origin: "tauri"` + name/counts in `detail`.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn plc_connections_cascade_delete_removes_subtree_and_is_audited() {
         let (state, pool) = app_state_with_pool().await;
         let editor = state
@@ -3728,7 +3780,7 @@ mod tests {
 
     /// feature/easy-delete: the group-cascade Tauri twin - its tags go with
     /// it, the parent connection survives, audited with counts.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn collection_groups_cascade_delete_removes_tags_and_is_audited() {
         let (state, pool) = app_state_with_pool().await;
         let editor = state
@@ -3777,7 +3829,7 @@ mod tests {
 
     /// feature/easy-delete: a `viewer` session is denied the cascade (denial
     /// audited) and nothing is deleted - the Tauri twin of the REST 403.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn plc_connections_cascade_delete_denies_viewer_and_audits_it() {
         let (state, pool) = app_state_with_pool().await;
         let editor = state
@@ -3830,7 +3882,7 @@ mod tests {
     /// engine is NOT armed, and the denial is recorded to the M14 audit log
     /// with `resource: "engine"` - the Tauri twin of the REST `/api/engine/arm`
     /// admin gate.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn engine_arm_denies_editor_and_audits_it() {
         let (state, pool) = app_state_with_engine().await;
         let editor = state
@@ -3862,7 +3914,7 @@ mod tests {
     /// An `admin` can arm: the state flips to armed AND `EngineControl` writes
     /// exactly one `arm`/`ok` row to `write_audit_log` with the acting actor -
     /// and this layer does NOT double-audit (no second entry).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn engine_admin_can_arm_and_it_flips_state_and_audits() {
         let (state, pool) = app_state_with_engine().await;
         let admin = state
@@ -3892,7 +3944,7 @@ mod tests {
     /// dry-run toggle requires only `editor` (safety-positive): an editor can
     /// enable it, the snapshot reflects it, and a `dry_run_toggle`/`ok` row is
     /// written by `EngineControl`.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn engine_editor_can_toggle_dry_run() {
         let (state, pool) = app_state_with_engine().await;
         let editor = state
@@ -3912,7 +3964,7 @@ mod tests {
 
     /// `engine_status` is a `viewer`+ read: a viewer can read the (disarmed)
     /// snapshot, and it records nothing.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn engine_status_permits_viewer_and_is_not_audited() {
         let (state, _pool) = app_state_with_engine().await;
         let viewer = state
@@ -4002,7 +4054,7 @@ mod tests {
     /// values (quality `bad` here - the fixture's port is closed, and the
     /// monitor degrades to per-tag bad rather than erroring), and nothing is
     /// recorded for a read.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn monitor_group_read_permits_viewer_and_degrades_to_bad_quality() {
         let (state, pool) = app_state_with_engine().await;
         let (group_id, tag_id) = seed_monitor_fixture(&pool).await;
@@ -4031,7 +4083,7 @@ mod tests {
     /// `monitor_tag_write` requires `editor`: a viewer is denied before any
     /// registry/broker work, the denial is recorded with `resource:
     /// "monitor"`, and no `manual_write` row appears.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn monitor_tag_write_denies_viewer_and_audits_it() {
         let (state, pool) = app_state_with_engine().await;
         let (_group_id, tag_id) = seed_monitor_fixture(&pool).await;
@@ -4065,7 +4117,7 @@ mod tests {
     /// closed): the attempt errors, and the log-before-write `manual_write`
     /// row is left `failed` (evidence a write was in flight - debug history).
     /// No arm is required or touched at any point.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn monitor_tag_write_is_audited_with_the_actor_on_the_tauri_path() {
         let (state, pool) = app_state_with_engine().await;
         let (_group_id, tag_id) = seed_monitor_fixture(&pool).await;
@@ -4104,7 +4156,7 @@ mod tests {
     /// `write_audit_log_list` is a `viewer`+ read (plan W4): an unauthenticated
     /// caller is denied, a viewer may read a seeded row back, and - being a
     /// read - it records nothing to the M14 audit log for this resource.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn write_audit_log_list_permits_viewer_and_denies_unauthenticated() {
         let (state, pool) = app_state_with_engine().await;
 
@@ -4167,7 +4219,7 @@ mod tests {
     /// Import requires `admin`: an `editor` is denied (`Forbidden`), nothing is
     /// imported, and the denial is recorded with `resource: "project"` - the
     /// Tauri twin of the REST `/api/project/import` admin gate.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn project_import_denies_editor_and_audits_it() {
         let (state, _pool) = app_state_with_pool().await;
         let editor = state
@@ -4199,7 +4251,7 @@ mod tests {
 
     /// An `admin` can import: it succeeds and records a `project_import` entry
     /// (`resource: "project"`, `origin: "tauri"`) with the per-table counts.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn project_admin_can_import_and_it_is_audited() {
         let (state, _pool) = app_state_with_pool().await;
         let admin = state
@@ -4228,7 +4280,7 @@ mod tests {
     /// Import is refused while the engine is ARMED (the safety guard): arm as
     /// admin, then even an admin import is rejected with the arm message and no
     /// `project_import` is recorded.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn project_import_refused_while_engine_armed() {
         let (state, _pool) = app_state_with_engine().await;
         let admin = state

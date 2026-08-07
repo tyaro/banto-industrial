@@ -395,47 +395,15 @@ mod tests {
         }
     }
 
-    /// Delay between `remove_dir_all` retries in `TempDir::drop`.
-    const TEMP_DIR_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
-
-    /// Retry ceiling in `TempDir::drop` - `TEMP_DIR_RETRY_DELAY *
-    /// TEMP_DIR_MAX_ATTEMPTS` (~2s) is the worst-case teardown block.
-    const TEMP_DIR_MAX_ATTEMPTS: u32 = 40;
-
     impl Drop for TempDir {
-        /// Retries on a short delay: on Windows, closing a WAL-mode
-        /// `SqlitePool` (every `TsWriter` opens one per data file) does not
-        /// synchronously release the underlying file handles, so a
-        /// `remove_dir_all` issued immediately after `close()`/drop can
-        /// observe `ERROR_SHARING_VIOLATION` (measured directly in
-        /// `banto-hub-core`'s identically-shaped `TempEnv` - see
-        /// `apps/banto-hub/core/tests/common/mod.rs`'s module doc for the
-        /// full writeup and measurements). This requires every test using
-        /// `TempDir` to run on a multi-thread tokio runtime with >= 2
-        /// workers (the same doc explains why a blocking retry inside
-        /// `Drop::drop` needs one) - hence every test below is annotated
+        /// Retries on a short delay - see `crate::test_support`'s module doc
+        /// for the full Windows WAL-close-timing rationale and why every
+        /// test using `TempDir` must run on a multi-thread tokio runtime
+        /// with >= 2 workers (hence every test below is annotated
         /// `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]`
-        /// rather than the bare `#[tokio::test]`.
-        ///
-        /// `NotFound` is not an error here: several tests (e.g.
-        /// `open_rejects_an_invalid_config_without_touching_disk`) never
-        /// create anything on disk in the first place.
+        /// rather than the bare `#[tokio::test]`).
         fn drop(&mut self) {
-            for attempt in 1..=TEMP_DIR_MAX_ATTEMPTS {
-                match std::fs::remove_dir_all(&self.0) {
-                    Ok(()) => return,
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
-                    Err(_) if attempt < TEMP_DIR_MAX_ATTEMPTS => {
-                        std::thread::sleep(TEMP_DIR_RETRY_DELAY);
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "TempDir: giving up removing {:?} after {attempt} attempts: {err}",
-                            self.0
-                        );
-                    }
-                }
-            }
+            crate::test_support::retry_remove(&self.0, |p| std::fs::remove_dir_all(p));
         }
     }
 

@@ -691,7 +691,58 @@ mod tests {
     };
     use banto_tstore::{GroupConfig, StoreConfig, SystemClock, TagColumn};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tempfile::tempdir;
+
+    /// A retry-cleanup temp dir wrapper (2026-08-08 audit finding): every
+    /// `Collector` a test here starts writes real, file-backed tstore data
+    /// files into this directory (`EventSink`'s registry pool may be
+    /// `:memory:`, but the writer's own data files never are), each opening
+    /// its own WAL-mode `SqlitePool`. On Windows, closing such a pool does
+    /// not synchronously release its file handles - even after
+    /// `collector.stop().await` (which flushes/closes the writer) returns,
+    /// the OS can hold the file "in use" for a short additional window - so
+    /// plain `tempfile::TempDir`'s single, non-retrying `remove_dir_all`
+    /// (which also silently swallows its error) left a directory behind on
+    /// most runs. See `apps/banto-hub/core/tests/common/mod.rs`'s module
+    /// doc for the fuller writeup and measurements (this crate's own
+    /// `tests/integration.rs::TempEnv` had the identical issue - already
+    /// fixed there; this is the same fix applied to this crate's unit
+    /// tests). Requires a multi-thread tokio runtime with >= 2 workers,
+    /// same reasoning as that module - already true for every test below.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir").keep();
+            Self(dir)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    const TEMP_DIR_RETRY_DELAY: Duration = Duration::from_millis(50);
+    const TEMP_DIR_MAX_ATTEMPTS: u32 = 40;
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            for attempt in 1..=TEMP_DIR_MAX_ATTEMPTS {
+                match std::fs::remove_dir_all(&self.0) {
+                    Ok(()) => return,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+                    Err(_) if attempt < TEMP_DIR_MAX_ATTEMPTS => {
+                        std::thread::sleep(TEMP_DIR_RETRY_DELAY);
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "TempDir: giving up removing {:?} after {attempt} attempts: {err}",
+                            self.0
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// A fake `PlcClient` that connects instantly (no socket) and answers
     /// every request with a fixed sentinel, counting how many times
@@ -788,7 +839,7 @@ mod tests {
     /// injected [`FakeClient`] served the reads).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn start_with_client_factory_uses_the_injected_client() {
-        let dir = tempdir().expect("tempdir");
+        let dir = TempDir::new();
         let reads = Arc::new(AtomicUsize::new(0));
         let reads_for_factory = reads.clone();
         let factory: ClientFactory = Arc::new(move |_spec| {
@@ -868,7 +919,7 @@ mod tests {
     /// registers over time, not just seeding a fixed value once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_simulated_connection_collects_live_changing_values() {
-        let dir = tempdir().expect("tempdir");
+        let dir = TempDir::new();
         let pool = banto_storage::connect_sqlite_memory()
             .await
             .expect("connect sqlite memory");
@@ -932,7 +983,7 @@ mod tests {
     /// branch of its own.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn toggling_simulation_alone_is_classified_as_replaced() {
-        let dir = tempdir().expect("tempdir");
+        let dir = TempDir::new();
         let pool = banto_storage::connect_sqlite_memory()
             .await
             .expect("connect sqlite memory");
