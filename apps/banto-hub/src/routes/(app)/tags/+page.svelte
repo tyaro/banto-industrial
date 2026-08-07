@@ -4,6 +4,15 @@
 	 * シンプル型を反復した新規作成（実装指示: 「tags 画面は 1737 行版
 	 * （一括/連続登録込み）をコピーしない」）。
 	 *
+	 * T13-1（2026-08-08、docs/ux-plan.md §4b）: master-detail レイアウトへ
+	 * 刷新。左は ConnectionTree（接続→収集グループの2階層、汎用部品
+	 * TreeView.svelte を流し込むアプリ側コンポーネント）、右はツールバー
+	 * + 画面全高の BantoGrid。フォームは通常登録・行クリック編集・連続
+	 * 登録・CSVインポートの4フローすべてを Drawer（汎用部品、右スライド
+	 * オーバー）に収める。フォームの状態管理・検証・dry-run フローの
+	 * ロジックは旧インライン版から変更していない（`drawerMode` が
+	 * 旧 `mode`/`selected` の可視状態を統合しただけ）。
+	 *
 	 * フォーム項目は `TagInput`（tagRegistryAdmin.ts、
 	 * `banto_hub_core::rest::TagPayload` と同型）に1:1対応する。数値項目は
 	 * すべて文字列で保持し、空欄 = 未設定（`toInput` で `undefined` に
@@ -17,6 +26,10 @@
 	import { toastStore } from '$lib/toast.svelte';
 	import { sessionStore } from '$lib/session.svelte';
 	import { canWriteResources } from '$lib/permissions';
+	import Drawer from '$lib/components/Drawer.svelte';
+	import SplitPane from '$lib/components/SplitPane.svelte';
+	import ConnectionTree from '$lib/components/ConnectionTree.svelte';
+	import type { ConnectionTreeNodeData } from '$lib/components/connectionTreeTypes';
 	import {
 		listTags,
 		createTag,
@@ -196,11 +209,14 @@
 	}
 
 	/**
-	 * T11-1/T11-2 (docs/ux-plan.md §3): 通常の単発登録フォーム / 連続登録
-	 * フォーム / CSV インポートの切替。
+	 * T13-1 (docs/ux-plan.md §4b): 通常登録・行クリック編集・連続登録・
+	 * CSVインポートの4フローを1つの Drawer に集約する。旧 `Mode`
+	 * （'single' | 'continuous' | 'csv' の表示切替）と旧「選択中タグの
+	 * 編集パネル常時表示」を、この `drawerMode` 1つに統合した -
+	 * `drawerMode !== null` が Drawer の `open` を駆動する。
 	 */
-	type Mode = 'single' | 'continuous' | 'csv';
-	let mode: Mode = $state('single');
+	type DrawerMode = 'create' | 'edit' | 'continuous' | 'csv' | null;
+	let drawerMode: DrawerMode = $state(null);
 
 	let groups: CollectionGroup[] = $state([]);
 	let connections: PlcConnection[] = $state([]);
@@ -290,6 +306,7 @@
 		selected = t;
 		editForm = formFromTag(t);
 		editErrors = {};
+		drawerMode = 'edit'; // T13-1: 行クリック編集はドロワーで開く
 	}
 
 	async function saveEdit(): Promise<void> {
@@ -317,11 +334,104 @@
 			await deleteTag(selected.id);
 			toastStore.push('success', '削除しました');
 			selected = null;
+			drawerMode = null; // 削除後は編集対象が無いのでドロワーを閉じる
 			await reload();
 		} catch (err) {
 			toastStore.push('error', errorMessage(err));
 		}
 	}
+
+	// --- T13-1: Drawer の表示制御 (docs/ux-plan.md §4b) ---------------------
+	//
+	// `selected`（編集対象、上で宣言済み）と `createForm`/`createErrors`
+	// （このあと「連続登録」セクションの前の「create」ブロックで宣言 -
+	// 実際には上の「edit」ブロックより前に既に宣言済み）を参照するため、
+	// 両方が揃うこの位置に置く。
+
+	const drawerTitle = $derived.by((): string => {
+		switch (drawerMode) {
+			case 'create':
+				return '新規作成';
+			case 'edit':
+				return selected ? `${selected.name} を編集` : '編集';
+			case 'continuous':
+				return '連続登録';
+			case 'csv':
+				return 'CSVインポート';
+			default:
+				return '';
+		}
+	});
+
+	// 連続登録・CSVインポートはプレビュー/エラー一覧のテーブルが横に
+	// 広いため、通常登録・編集より少し広いドロワー幅を使う。
+	const drawerWidth = $derived(
+		drawerMode === 'continuous' || drawerMode === 'csv' ? '640px' : '480px'
+	);
+
+	function openCreateDrawer(): void {
+		createForm = blankForm();
+		createErrors = {};
+		drawerMode = 'create';
+	}
+
+	function openContinuousDrawer(): void {
+		drawerMode = 'continuous';
+	}
+
+	function openCsvDrawer(): void {
+		drawerMode = 'csv';
+	}
+
+	function closeDrawer(): void {
+		drawerMode = null;
+	}
+
+	// --- T13-1: ツリーフィルタ + 検索 (docs/ux-plan.md §4b) -----------------
+	//
+	// ツリー選択（接続 or グループ）と検索ボックス（名前・アドレスの部分
+	// 一致、クライアントサイド）を両方満たす行だけを右ペインの BantoGrid
+	// に渡す。サーバーへの問い合わせは発生しない（`tags` は既に全件
+	// ロード済み）。
+
+	type TreeFilter =
+		{ type: 'all' } | { type: 'connection'; id: number } | { type: 'group'; id: number };
+	let treeFilter: TreeFilter = $state({ type: 'all' });
+	let searchQuery = $state('');
+
+	const treeSelectedId = $derived.by((): string => {
+		if (treeFilter.type === 'all') return 'all';
+		if (treeFilter.type === 'connection') return `conn:${treeFilter.id}`;
+		return `group:${treeFilter.id}`;
+	});
+
+	function handleTreeSelect(data: ConnectionTreeNodeData): void {
+		if (data.kind === 'all') treeFilter = { type: 'all' };
+		else if (data.kind === 'connection')
+			treeFilter = { type: 'connection', id: data.connection.id };
+		else treeFilter = { type: 'group', id: data.group.id };
+	}
+
+	const filteredTags = $derived.by((): Tag[] => {
+		let list = tags;
+		if (treeFilter.type === 'group') {
+			const groupId = treeFilter.id;
+			list = list.filter((t) => t.collectionGroupId === groupId);
+		} else if (treeFilter.type === 'connection') {
+			const connectionId = treeFilter.id;
+			const groupIds = new Set(
+				groups.filter((g) => g.plcConnectionId === connectionId).map((g) => g.id)
+			);
+			list = list.filter((t) => groupIds.has(t.collectionGroupId));
+		}
+		const q = searchQuery.trim().toLowerCase();
+		if (q !== '') {
+			list = list.filter(
+				(t) => t.name.toLowerCase().includes(q) || t.address.toLowerCase().includes(q)
+			);
+		}
+		return list;
+	});
 
 	// --- T11-1: 連続登録 (docs/ux-plan.md §3) ------------------------------
 	//
@@ -958,40 +1068,86 @@
 {/snippet}
 
 <div class="page">
-	<h2>タグ登録</h2>
+	<div class="page-header">
+		<h2>タグ登録</h2>
+	</div>
 
-	{#if canWrite}
-		<div class="mode-toggle">
-			<button type="button" class:active={mode === 'single'} onclick={() => (mode = 'single')}
-				>通常登録</button
-			>
-			<button
-				type="button"
-				class:active={mode === 'continuous'}
-				onclick={() => (mode = 'continuous')}>連続登録</button
-			>
-			<button type="button" class:active={mode === 'csv'} onclick={() => (mode = 'csv')}
-				>CSVインポート</button
-			>
-		</div>
-	{/if}
+	<div class="content">
+		<SplitPane leftWidth="280px">
+			{#snippet left()}
+				<ConnectionTree
+					{connections}
+					{groups}
+					{tags}
+					selectedId={treeSelectedId}
+					onselect={handleTreeSelect}
+				/>
+			{/snippet}
+			{#snippet right()}
+				<div class="right-pane">
+					<div class="toolbar">
+						{#if canWrite}
+							<button type="button" onclick={openCreateDrawer}>新規登録</button>
+							<button type="button" onclick={openContinuousDrawer}>連続登録</button>
+							<button type="button" onclick={openCsvDrawer}>CSVインポート</button>
+						{/if}
+						<button type="button" class="secondary" onclick={handleExportCsv}
+							>CSVエクスポート</button
+						>
+						<input
+							type="search"
+							class="search-box"
+							placeholder="名前・アドレスで検索"
+							bind:value={searchQuery}
+						/>
+						<span class="count">{filteredTags.length} / {tags.length} 件</span>
+					</div>
+					<p class="note">
+						{canWrite
+							? '行をクリックすると編集パネルが開きます。'
+							: '閲覧のみ（編集には編集者以上の権限が必要です）。'}
+					</p>
+					{#if loading && tags.length === 0}
+						<p class="loading">読み込み中…</p>
+					{:else}
+						<div class="grid-wrap">
+							<BantoGrid
+								rows={filteredTags}
+								{columns}
+								getRowId={(t) => t.id}
+								onRowClick={canWrite ? selectTag : undefined}
+							/>
+						</div>
+					{/if}
+				</div>
+			{/snippet}
+		</SplitPane>
+	</div>
+</div>
 
-	{#if canWrite && mode === 'single'}
-		<section class="create">
-			<h3>新規作成</h3>
+<Drawer open={drawerMode !== null} title={drawerTitle} width={drawerWidth} onclose={closeDrawer}>
+	{#if drawerMode === 'create' && canWrite}
+		<div class="drawer-section">
 			{@render tagFields(createForm, createErrors)}
-			<button type="button" onclick={handleCreate} disabled={creating || groups.length === 0}
-				>作成</button
-			>
+			<div class="actions">
+				<button type="button" onclick={handleCreate} disabled={creating || groups.length === 0}
+					>作成</button
+				>
+			</div>
 			{#if groups.length === 0}
 				<p class="note">先に 収集グループ を1件以上登録してください。</p>
 			{/if}
-		</section>
-	{/if}
-
-	{#if canWrite && mode === 'continuous'}
-		<section class="create">
-			<h3>連続登録</h3>
+		</div>
+	{:else if drawerMode === 'edit' && selected && canWrite}
+		<div class="drawer-section">
+			{@render tagFields(editForm, editErrors)}
+			<div class="actions">
+				<button type="button" onclick={saveEdit} disabled={saving}>保存</button>
+				<button type="button" class="danger" onclick={handleDelete}>削除</button>
+			</div>
+		</div>
+	{:else if drawerMode === 'continuous' && canWrite}
+		<div class="drawer-section">
 			<p class="note">
 				名前パターン（<code>{'{n}'}</code>が連番に置き換わります。例:
 				<code>temp{'{n}'}</code> + 開始1 + 3点 → temp1, temp2,
@@ -1086,12 +1242,9 @@
 					{/if}
 				</div>
 			{/if}
-		</section>
-	{/if}
-
-	{#if canWrite && mode === 'csv'}
-		<section class="create">
-			<h3>CSVインポート</h3>
+		</div>
+	{:else if drawerMode === 'csv' && canWrite}
+		<div class="drawer-section">
 			<p class="note">
 				CSVファイル（列名ヘッダ付き・タグ登録フォームの項目と1:1対応、接続・グループは名前で参照 —
 				存在しない名前はエラーになります。自動作成はしません）をアップロードすると、
@@ -1170,72 +1323,75 @@
 					{/if}
 				</div>
 			{/if}
-		</section>
-	{/if}
-
-	<section class="list">
-		<h3>一覧</h3>
-		<div class="actions">
-			<button type="button" onclick={handleExportCsv}>CSVエクスポート</button>
 		</div>
-		<p class="note">
-			{canWrite
-				? '行をクリックすると下に編集パネルが表示されます。'
-				: '閲覧のみ（編集には編集者以上の権限が必要です）。'}
-		</p>
-		{#if loading && tags.length === 0}
-			<p class="loading">読み込み中…</p>
-		{:else}
-			<div class="grid-wrap">
-				<BantoGrid
-					rows={tags}
-					{columns}
-					getRowId={(t) => t.id}
-					onRowClick={canWrite ? selectTag : undefined}
-				/>
-			</div>
-		{/if}
-	</section>
-
-	{#if selected && canWrite}
-		<section class="detail">
-			<h3>{selected.name} を編集</h3>
-			{@render tagFields(editForm, editErrors)}
-			<div class="actions">
-				<button type="button" onclick={saveEdit} disabled={saving}>保存</button>
-				<button type="button" class="danger" onclick={handleDelete}>削除</button>
-			</div>
-		</section>
 	{/if}
-</div>
+</Drawer>
 
 <style>
 	.page {
+		height: calc(100vh - var(--banto-shell-header-height) - 2.5rem);
 		display: flex;
 		flex-direction: column;
-		gap: 1rem;
-		max-width: 960px;
+		min-height: 0;
+		gap: 0.75rem;
 	}
 
-	h2 {
+	.page-header {
+		flex: 0 0 auto;
+	}
+
+	.page-header h2 {
 		margin: 0;
 		font-size: 1.1rem;
 	}
 
-	section {
+	.content {
+		flex: 1;
+		min-height: 0;
 		background: var(--banto-surface);
 		border: 1px solid var(--banto-border);
 		border-radius: calc(var(--banto-radius) * 2);
+		overflow: hidden;
+	}
+
+	.right-pane {
+		display: flex;
+		flex-direction: column;
+		height: 100%;
+		min-height: 0;
+		gap: 0.6rem;
 		padding: 1rem 1.25rem;
 	}
 
-	h3 {
-		margin: 0 0 0.75rem;
-		font-size: 0.95rem;
+	.toolbar {
+		flex: 0 0 auto;
+		display: flex;
+		align-items: center;
+		gap: 0.6rem;
+		flex-wrap: wrap;
+	}
+
+	.search-box {
+		margin-left: auto;
+		min-width: 220px;
+		padding: 0.4rem 0.6rem;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+		background: var(--banto-bg);
+		color: var(--banto-text);
+		font-size: 0.8rem;
+		font-family: inherit;
+	}
+
+	.count {
+		flex: 0 0 auto;
+		color: var(--banto-text-muted);
+		font-size: 0.75rem;
 	}
 
 	.note {
-		margin: 0 0 0.5rem;
+		flex: 0 0 auto;
+		margin: 0;
 		color: var(--banto-text-muted);
 		font-size: 0.8rem;
 	}
@@ -1245,7 +1401,14 @@
 	}
 
 	.grid-wrap {
-		height: 320px;
+		flex: 1;
+		min-height: 0;
+	}
+
+	.drawer-section {
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
 	}
 
 	.form-grid {
@@ -1332,21 +1495,19 @@
 		color: var(--banto-danger);
 	}
 
-	.mode-toggle {
-		display: flex;
-		gap: 0.5rem;
+	button.danger:hover {
+		background: color-mix(in srgb, var(--banto-danger) 10%, transparent);
 	}
 
-	.mode-toggle button {
+	button.secondary {
 		background: transparent;
 		border: 1px solid var(--banto-border);
 		color: var(--banto-text-muted);
 	}
 
-	.mode-toggle button.active {
-		background: var(--banto-primary);
-		border-color: var(--banto-primary);
-		color: var(--banto-text-inverse);
+	button.secondary:hover:not(:disabled) {
+		background: color-mix(in srgb, var(--banto-primary) 8%, transparent);
+		color: var(--banto-text);
 	}
 
 	h4 {
@@ -1384,9 +1545,5 @@
 	.error-table th,
 	.error-table td {
 		color: var(--banto-danger);
-	}
-
-	button.danger:hover {
-		background: color-mix(in srgb, var(--banto-danger) 10%, transparent);
 	}
 </style>
