@@ -39,17 +39,52 @@ use sqlx::SqlitePool;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// A temp directory holding the registry database and the tstore data dir,
-/// cleaned up on drop (best-effort - SQLite WAL sidecars may briefly linger).
+/// A temp directory holding the registry database and the tstore data dir.
+///
+/// ## Cleanup: why `drop` retries (banto-hub-core PR #54/#55 investigation)
+///
+/// On Windows, closing a WAL-mode `SqlitePool` clone does not synchronously
+/// release the underlying file handles - the OS can keep the file "in use"
+/// for a short window even after the async close completes. A
+/// `remove_dir_all` issued immediately after the last pool clone drops
+/// observes `ERROR_SHARING_VIOLATION` almost every time (measured ~7%
+/// immediate success across repeated trials in `banto-hub-core`, which
+/// shares this exact `TempEnv` shape - see
+/// `apps/banto-hub/core/tests/common/mod.rs`'s module doc for the full
+/// writeup). [`TempEnv::drop`] retries on a short delay to reliably close
+/// this window (measured 100% success, usually converging within the first
+/// 1-2 attempts).
+///
+/// This requires every test owning a `TempEnv` to run on a multi-thread
+/// tokio runtime with >= 2 workers (`Drop::drop` is synchronous, so the
+/// retry can only block via `std::thread::sleep` - on a single-threaded
+/// runtime that would starve the only worker thread and prevent the
+/// background close from ever being polled; every `#[tokio::test]` in this
+/// file already uses `flavor = "multi_thread"`).
 struct TempEnv {
     root: PathBuf,
 }
 
+/// Delay between `remove_dir_all` retries in [`TempEnv::drop`].
+const TEMP_ENV_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// Retry ceiling in [`TempEnv::drop`] - `TEMP_ENV_RETRY_DELAY * TEMP_ENV_MAX_ATTEMPTS`
+/// (~2s) is the worst-case teardown block, kept generous because the
+/// measured common case converges within 1-2 attempts.
+const TEMP_ENV_MAX_ATTEMPTS: u32 = 40;
+
 impl TempEnv {
     fn new(label: &str) -> Self {
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        // ナノ秒精度のタイムスタンプも一意性キーに含める(PID 再利用時に
+        // 古い(既に初期化済みの)ディレクトリと衝突しないよう -
+        // banto-hub-core PR #54 で確認された衝突パターンと同じ対策)。
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "banto-collect-it-{}-{label}-{id}",
+            "banto-collect-it-{}-{label}-{id}-{nanos}",
             std::process::id()
         ));
         std::fs::create_dir_all(&root).expect("create temp env");
@@ -67,7 +102,20 @@ impl TempEnv {
 
 impl Drop for TempEnv {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        for attempt in 1..=TEMP_ENV_MAX_ATTEMPTS {
+            match std::fs::remove_dir_all(&self.root) {
+                Ok(()) => return,
+                Err(_) if attempt < TEMP_ENV_MAX_ATTEMPTS => {
+                    std::thread::sleep(TEMP_ENV_RETRY_DELAY);
+                }
+                Err(err) => {
+                    eprintln!(
+                        "TempEnv: giving up removing {:?} after {attempt} attempts: {err}",
+                        self.root
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1310,13 +1358,19 @@ async fn count_events_for_connection(pool: &SqlitePool, kind: &str, conn_key: &s
 /// already running under a `Collector`. The minimal fixture for the
 /// "connection added" test.
 struct OneConnEnv {
-    env: TempEnv,
     pool: SqlitePool,
     sim_a: Simulator,
     group_a_id: i64,
     conn_a_key: String,
     tag_a_key: String,
     collector: Collector,
+    // Declared LAST: Rust drops struct fields in declaration order, and
+    // `TempEnv::drop`'s `remove_dir_all` retry only has a chance once every
+    // `SqlitePool` clone above (in particular `pool`) has actually been
+    // dropped - putting `env` first was a measured, 100%-reproducing leak
+    // (`pool` was still alive, still holding its registry file open, for
+    // the entire retry window) - see `TempEnv`'s doc comment.
+    env: TempEnv,
 }
 
 async fn one_conn_setup(label: &str) -> OneConnEnv {
@@ -1375,7 +1429,6 @@ async fn one_conn_setup(label: &str) -> OneConnEnv {
 /// `Collector`. The shared fixture for every T7-1 test that needs to prove
 /// "A never notices what happens to B".
 struct TwoConnEnv {
-    env: TempEnv,
     pool: SqlitePool,
     sim_a: Simulator,
     sim_b: Simulator,
@@ -1387,6 +1440,8 @@ struct TwoConnEnv {
     conn_a_key: String,
     conn_b_key: String,
     collector: Collector,
+    // Declared LAST - see `OneConnEnv`'s `env` field comment.
+    env: TempEnv,
 }
 
 async fn two_conn_setup(label: &str) -> TwoConnEnv {

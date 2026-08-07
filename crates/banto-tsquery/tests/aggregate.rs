@@ -6,7 +6,7 @@ mod common;
 use banto_tsquery::{TsQuery, TsQueryError};
 use common::*;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn computes_min_max_avg_count_excluding_nulls() {
     let dir = TempDir::new("agg-basic");
     let clock = clock_at(DAY1_START_MS);
@@ -44,7 +44,7 @@ async fn computes_min_max_avg_count_excluding_nulls() {
     assert_eq!(result[0].avg, Some(20.0));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tag_with_zero_samples_reports_all_none() {
     let dir = TempDir::new("agg-zero-samples");
     let clock = clock_at(DAY1_START_MS);
@@ -75,7 +75,7 @@ async fn a_tag_with_zero_samples_reports_all_none() {
     assert_eq!(result[1].avg, None);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn merges_min_max_avg_across_multiple_files() {
     let dir = TempDir::new("agg-multi-file");
     let clock = clock_at(DAY1_START_MS);
@@ -130,7 +130,7 @@ async fn merges_min_max_avg_across_multiple_files() {
     assert_eq!(result[0].avg, Some(25.0));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn from_greater_than_to_is_invalid_input() {
     let dir = TempDir::new("agg-invalid-range");
     let query = TsQuery::new(dir.path());
@@ -141,7 +141,7 @@ async fn from_greater_than_to_is_invalid_input() {
     assert!(matches!(err, TsQueryError::InvalidInput(_)));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_tag_keys_returns_an_empty_vec() {
     let dir = TempDir::new("agg-empty-tags");
     let query = TsQuery::new(dir.path());

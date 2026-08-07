@@ -395,9 +395,47 @@ mod tests {
         }
     }
 
+    /// Delay between `remove_dir_all` retries in `TempDir::drop`.
+    const TEMP_DIR_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+    /// Retry ceiling in `TempDir::drop` - `TEMP_DIR_RETRY_DELAY *
+    /// TEMP_DIR_MAX_ATTEMPTS` (~2s) is the worst-case teardown block.
+    const TEMP_DIR_MAX_ATTEMPTS: u32 = 40;
+
     impl Drop for TempDir {
+        /// Retries on a short delay: on Windows, closing a WAL-mode
+        /// `SqlitePool` (every `TsWriter` opens one per data file) does not
+        /// synchronously release the underlying file handles, so a
+        /// `remove_dir_all` issued immediately after `close()`/drop can
+        /// observe `ERROR_SHARING_VIOLATION` (measured directly in
+        /// `banto-hub-core`'s identically-shaped `TempEnv` - see
+        /// `apps/banto-hub/core/tests/common/mod.rs`'s module doc for the
+        /// full writeup and measurements). This requires every test using
+        /// `TempDir` to run on a multi-thread tokio runtime with >= 2
+        /// workers (the same doc explains why a blocking retry inside
+        /// `Drop::drop` needs one) - hence every test below is annotated
+        /// `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]`
+        /// rather than the bare `#[tokio::test]`.
+        ///
+        /// `NotFound` is not an error here: several tests (e.g.
+        /// `open_rejects_an_invalid_config_without_touching_disk`) never
+        /// create anything on disk in the first place.
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            for attempt in 1..=TEMP_DIR_MAX_ATTEMPTS {
+                match std::fs::remove_dir_all(&self.0) {
+                    Ok(()) => return,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+                    Err(_) if attempt < TEMP_DIR_MAX_ATTEMPTS => {
+                        std::thread::sleep(TEMP_DIR_RETRY_DELAY);
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "TempDir: giving up removing {:?} after {attempt} attempts: {err}",
+                            self.0
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -443,7 +481,7 @@ mod tests {
 
     // --- round trip ------------------------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn append_flush_and_read_back_round_trips_multiple_groups_with_nulls() {
         let dir = TempDir::new("roundtrip");
         let clock = clock_at(DAY1_START_MS);
@@ -491,7 +529,7 @@ mod tests {
         writer.close().await.expect("close should succeed");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reader_reports_column_metadata_matching_the_config() {
         let dir = TempDir::new("column-meta");
         let clock = clock_at(DAY1_START_MS);
@@ -513,7 +551,7 @@ mod tests {
         assert_eq!(g1.columns[1].unit, None);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn read_range_bounds_are_inclusive_and_exclude_outside_values() {
         let dir = TempDir::new("range-bounds");
         let clock = clock_at(DAY1_START_MS);
@@ -541,7 +579,7 @@ mod tests {
 
     // --- open()/reopen rotation -------------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reopen_with_same_config_appends_to_the_same_file() {
         let dir = TempDir::new("reopen-same-config");
         let clock = clock_at(DAY1_START_MS);
@@ -579,7 +617,7 @@ mod tests {
         assert_eq!(samples.len(), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reopen_with_a_different_config_rotates_to_the_next_sequence() {
         let dir = TempDir::new("reopen-diff-config");
         let clock = clock_at(DAY1_START_MS);
@@ -603,7 +641,7 @@ mod tests {
         assert_eq!(files[0].date, files[1].date);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn opening_a_third_time_with_the_original_config_rotates_again_rather_than_reusing_seq_1()
     {
         // The *latest* file for the day is what config-sameness is compared
@@ -644,7 +682,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn open_rejects_an_invalid_config_without_touching_disk() {
         let dir = TempDir::new("open-invalid-config");
         let clock = clock_at(DAY1_START_MS);
@@ -657,7 +695,7 @@ mod tests {
 
     // --- day-crossing rotation --------------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn append_across_local_midnight_rotates_to_a_new_dated_file() {
         let dir = TempDir::new("midnight-rotation");
         let clock = clock_at(DAY1_START_MS);
@@ -686,7 +724,7 @@ mod tests {
         assert_eq!(files[1].seq, 1, "a new day starts back at seq 1");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn midnight_rotation_flushes_the_outgoing_days_buffer_before_swapping_files() {
         let dir = TempDir::new("midnight-flush");
         let clock = clock_at(DAY1_START_MS);
@@ -724,7 +762,7 @@ mod tests {
 
     // --- buffering ----------------------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn row_count_threshold_triggers_an_automatic_flush() {
         let dir = TempDir::new("row-threshold");
         let clock = clock_at(DAY1_START_MS);
@@ -753,7 +791,7 @@ mod tests {
         writer.close().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn flush_interval_threshold_triggers_an_automatic_flush() {
         let dir = TempDir::new("interval-threshold");
         let clock = clock_at(DAY1_START_MS);
@@ -795,7 +833,7 @@ mod tests {
         writer.close().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_flushes_remaining_buffered_rows() {
         let dir = TempDir::new("close-flushes");
         let clock = clock_at(DAY1_START_MS);
@@ -817,7 +855,7 @@ mod tests {
         assert_eq!(reader.read_range("g1", 0, i64::MAX).await.unwrap().len(), 1);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn flush_with_nothing_buffered_is_a_harmless_no_op() {
         let dir = TempDir::new("flush-empty");
         let clock = clock_at(DAY1_START_MS);
@@ -837,7 +875,7 @@ mod tests {
 
     // --- error cases -------------------------------------------------
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn append_to_unknown_group_is_an_error() {
         let dir = TempDir::new("unknown-group");
         let clock = clock_at(DAY1_START_MS);
@@ -851,7 +889,7 @@ mod tests {
         assert!(matches!(err, TstoreError::UnknownGroup(g) if g == "no-such-group"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn append_with_wrong_value_count_is_an_error() {
         let dir = TempDir::new("wrong-value-count");
         let clock = clock_at(DAY1_START_MS);
@@ -885,7 +923,7 @@ mod tests {
     /// this is a smoke test for "does bulk buffered writing complete in a
     /// sane amount of time", not a CI performance gate (design instruction:
     /// "CI失敗条件にしない").
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn write_performance_smoke_32_groups_x_8_tags_x_1000_ticks() {
         let dir = TempDir::new("perf-smoke");
         let clock = clock_at(DAY1_START_MS);

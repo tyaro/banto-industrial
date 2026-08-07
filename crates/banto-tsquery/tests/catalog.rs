@@ -7,7 +7,7 @@ mod common;
 use banto_tsquery::TsQuery;
 use common::*;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lists_every_group_and_tag_sorted_by_key() {
     let dir = TempDir::new("cat-groups-tags");
     let clock = clock_at(DAY1_START_MS);
@@ -43,7 +43,7 @@ async fn lists_every_group_and_tag_sorted_by_key() {
     assert_eq!(catalog.groups[1].tags[0].tag_key, "t3");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reports_earliest_and_latest_ptime_per_group() {
     let dir = TempDir::new("cat-range");
     let clock = clock_at(DAY1_START_MS);
@@ -70,7 +70,7 @@ async fn reports_earliest_and_latest_ptime_per_group() {
     assert_eq!(catalog.groups[0].latest_ms, Some(DAY1_START_MS + 7_500));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_most_recently_rotated_files_metadata_wins() {
     let dir = TempDir::new("cat-latest-wins");
     let clock = clock_at(DAY1_START_MS);
@@ -118,7 +118,7 @@ async fn the_most_recently_rotated_files_metadata_wins() {
     assert_eq!(t1.decimals, 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_empty_or_missing_data_directory_yields_an_empty_catalog() {
     let dir = TempDir::new("cat-empty");
     let query = TsQuery::new(dir.path());

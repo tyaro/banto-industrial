@@ -9,7 +9,7 @@ mod common;
 use banto_tsquery::{BinValue, TsQuery};
 use common::*;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_range_concatenates_across_a_local_midnight_rotation() {
     let dir = TempDir::new("multi-midnight-raw");
     let clock = clock_at(DAY1_START_MS);
@@ -46,7 +46,7 @@ async fn read_range_concatenates_across_a_local_midnight_rotation() {
     assert_eq!(result.rows[1].values, vec![Some(2.0)]);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_decimated_concatenates_across_a_local_midnight_rotation() {
     let dir = TempDir::new("multi-midnight-dec");
     let clock = clock_at(DAY1_START_MS);
@@ -91,7 +91,7 @@ async fn read_decimated_concatenates_across_a_local_midnight_rotation() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tag_added_after_a_config_change_rotation_is_a_gap_in_the_older_files_window() {
     let dir = TempDir::new("multi-config-add-tag");
     let clock = clock_at(DAY1_START_MS);
@@ -172,7 +172,7 @@ async fn a_tag_added_after_a_config_change_rotation_is_a_gap_in_the_older_files_
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tag_removed_after_a_config_change_rotation_is_a_gap_in_the_newer_files_window() {
     let dir = TempDir::new("multi-config-remove-tag");
     let clock = clock_at(DAY1_START_MS);
@@ -237,7 +237,7 @@ async fn a_tag_removed_after_a_config_change_rotation_is_a_gap_in_the_newer_file
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_bin_straddling_a_same_day_rotation_boundary_merges_both_files() {
     let dir = TempDir::new("multi-straddle");
     let clock = clock_at(DAY1_START_MS);

@@ -6,7 +6,7 @@ mod common;
 use banto_tsquery::{TsQuery, TsQueryError};
 use common::*;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn returns_requested_tags_in_the_requested_order() {
     let dir = TempDir::new("raw-order");
     let clock = clock_at(DAY1_START_MS);
@@ -44,7 +44,7 @@ async fn returns_requested_tags_in_the_requested_order() {
     assert_eq!(result.rows[4].values, vec![Some(40.0), Some(4.0)]);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn both_range_bounds_are_inclusive() {
     let dir = TempDir::new("raw-bounds");
     let clock = clock_at(DAY1_START_MS);
@@ -91,7 +91,7 @@ async fn both_range_bounds_are_inclusive() {
     assert_eq!(result.rows[0].values, vec![Some(2.0)]);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tag_key_never_present_in_the_group_is_none_without_error() {
     let dir = TempDir::new("raw-missing-tag");
     let clock = clock_at(DAY1_START_MS);
@@ -113,7 +113,7 @@ async fn tag_key_never_present_in_the_group_is_none_without_error() {
     assert_eq!(result.rows[0].values, vec![Some(1.0), None]);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_group_key_yields_an_empty_result_not_an_error() {
     let dir = TempDir::new("raw-unknown-group");
     let clock = clock_at(DAY1_START_MS);
@@ -139,7 +139,7 @@ async fn unknown_group_key_yields_an_empty_result_not_an_error() {
     assert!(result.rows.is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exceeding_max_rows_is_an_error() {
     let dir = TempDir::new("raw-too-many-rows");
     let clock = clock_at(DAY1_START_MS);
@@ -173,7 +173,7 @@ async fn exceeding_max_rows_is_an_error() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn from_greater_than_to_is_invalid_input() {
     let dir = TempDir::new("raw-invalid-range");
     let query = TsQuery::new(dir.path());

@@ -11,7 +11,7 @@ use std::time::Instant;
 use banto_tsquery::TsQuery;
 use common::*;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_decimated_one_day_of_8_tags_at_1s_period() {
     let dir = TempDir::new("perf-smoke");
     let clock = clock_at(DAY1_START_MS);

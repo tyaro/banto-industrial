@@ -8,7 +8,7 @@ mod common;
 use banto_tsquery::{BinValue, TsQuery, TsQueryError, MAX_TARGET_BINS};
 use common::*;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spike_is_preserved_by_the_min_max_envelope() {
     let dir = TempDir::new("dec-spike");
     let clock = clock_at(DAY1_START_MS);
@@ -58,7 +58,7 @@ async fn spike_is_preserved_by_the_min_max_envelope() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zero_row_bins_are_gap_and_do_not_break_neighboring_bins() {
     let dir = TempDir::new("dec-zero-row-gap");
     let clock = clock_at(DAY1_START_MS);
@@ -118,7 +118,7 @@ async fn zero_row_bins_are_gap_and_do_not_break_neighboring_bins() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_null_mixed_with_valid_samples_in_one_bin_still_reports_a_range() {
     let dir = TempDir::new("dec-null-mixed");
     let clock = clock_at(DAY1_START_MS);
@@ -194,7 +194,7 @@ async fn a_null_mixed_with_valid_samples_in_one_bin_still_reports_a_range() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bin_ms_is_clamped_up_to_the_group_period_ms() {
     let dir = TempDir::new("dec-clamp");
     let clock = clock_at(DAY1_START_MS);
@@ -226,7 +226,7 @@ async fn bin_ms_is_clamped_up_to_the_group_period_ms() {
     assert_eq!(result.bin_ms, 5_000);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn near_native_resolution_zoom_reports_exact_sample_time_not_bin_aligned() {
     let dir = TempDir::new("dec-near-native");
     let clock = clock_at(DAY1_START_MS);
@@ -273,7 +273,7 @@ async fn near_native_resolution_zoom_reports_exact_sample_time_not_bin_aligned()
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_group_with_no_data_at_all_returns_gap_bins_covering_the_range() {
     let dir = TempDir::new("dec-no-data");
     let query = TsQuery::new(dir.path());
@@ -285,7 +285,7 @@ async fn a_group_with_no_data_at_all_returns_gap_bins_covering_the_range() {
     assert_eq!(result.bins[0].tags[0], BinValue::Gap);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn target_bins_zero_is_invalid_input() {
     let dir = TempDir::new("dec-zero-bins");
     let query = TsQuery::new(dir.path());
@@ -296,7 +296,7 @@ async fn target_bins_zero_is_invalid_input() {
     assert!(matches!(err, TsQueryError::InvalidInput(_)));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn target_bins_over_the_limit_is_invalid_input() {
     let dir = TempDir::new("dec-over-limit");
     let query = TsQuery::new(dir.path());
@@ -307,7 +307,7 @@ async fn target_bins_over_the_limit_is_invalid_input() {
     assert!(matches!(err, TsQueryError::InvalidInput(_)));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn binned_path_covers_the_full_range_contiguously() {
     let dir = TempDir::new("dec-contiguous");
     let clock = clock_at(DAY1_START_MS);
