@@ -804,7 +804,10 @@
 				temp3）・開始アドレス・点数・共通設定から連続タグを一括生成します。アドレスの増分はデータ型から自動決定（i16/u16
 				等のワード型は+1、i32/u32/f32 は+2、string は文字列長分）。ビット指定アドレス（<code
 					>D100.5</code
-				>のような形式）の連続登録は現時点では未対応です。
+				>のような形式）や、16進数値デバイス（<code>X</code>/<code>Y</code>/<code>B</code>/<code
+					>W</code
+				>/<code>SB</code>/<code>SW</code>/<code>DX</code>/<code>DY</code
+				>）の連続登録は現時点では未対応です。
 			</p>
 			<div class="form-grid">
 				<label class="field">
