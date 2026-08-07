@@ -341,7 +341,7 @@ impl EngineControl {
             match handle.read_only().read(requests).await {
                 Ok(results) => {
                     // The broker preserves request order in its results.
-                    for ((index, row, _), result) in readable.iter().zip(results.into_iter()) {
+                    for ((index, row, _), result) in readable.iter().zip(results) {
                         values[*index] = Some(match result {
                             BatchReadResult::Value(value) => display_value(row, value),
                             BatchReadResult::Bad(e) => MonitorValue::bad(row, e.to_string()),

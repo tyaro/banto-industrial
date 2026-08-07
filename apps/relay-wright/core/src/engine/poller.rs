@@ -89,7 +89,7 @@ pub async fn poll_once(
             Ok(results) => {
                 let now = Instant::now();
                 // The broker preserves request order in its results.
-                for (src, result) in sources.iter().zip(results.into_iter()) {
+                for (src, result) in sources.iter().zip(results) {
                     match result {
                         BatchReadResult::Value(value) => cache.set_good(src.tag_id, value, now),
                         BatchReadResult::Bad(_) => cache.mark_bad(src.tag_id, now),
