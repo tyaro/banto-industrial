@@ -326,3 +326,52 @@ export async function updateTag(id: number, input: TagInput): Promise<Tag> {
 export async function deleteTag(id: number): Promise<void> {
 	await httpRequest<void>(`/api/tags/${id}`, { method: 'DELETE', expectNoContent: true });
 }
+
+// --- T11-1 一括登録 (docs/ux-plan.md §3) -------------------------------------
+
+/** Mirrors `banto_hub_core::rest::BatchTagFieldErrorResponse`. */
+export interface BatchTagFieldError {
+	field: string;
+	message: string;
+}
+
+/**
+ * 行番号(0起点)付きのフィールドエラー — mirrors
+ * `banto_hub_core::rest::BatchTagRowErrorResponse`. `index` はリクエストの
+ * `tags` 配列内の位置（連続登録プレビューの行、将来の T11-2 では CSV の
+ * データ行に対応）。
+ */
+export interface BatchTagRowError {
+	index: number;
+	fieldErrors: BatchTagFieldError[];
+}
+
+/**
+ * `POST /api/tags/batch` の応答 — mirrors
+ * `banto_hub_core::rest::BatchTagsResponse`。**常に HTTP 200** で返る
+ * （`ok: false` は「1件以上のエラーで全体拒否」という通常の応答であって
+ * 例外ではない — 認証/権限/DB エラーは通常どおり `httpRequest` が
+ * `ProviderError` を投げる）。
+ */
+export interface BatchTagsResult {
+	ok: boolean;
+	dryRun: boolean;
+	/** 適用された(または dry run で適用されたはずの)件数。`ok: false` なら常に0。 */
+	count: number;
+	errors: BatchTagRowError[];
+	/** `ok && !dryRun` のときだけ存在(実際に作成されたタグ)。 */
+	tags?: Tag[];
+}
+
+/**
+ * T11-1 の一括登録 API。連続登録（`$lib/banto/continuousRegistration.ts`
+ * が展開した `TagInput[]`）と、将来の T11-2 CSV インポートが共有する。
+ * `dryRun: true` は検証のみで DB 無変更（プレビュー確認後に
+ * `dryRun: false` で本適用する2段階フロー — 設計「dry-run 必須」）。
+ */
+export async function createTagsBatch(tags: TagInput[], dryRun: boolean): Promise<BatchTagsResult> {
+	return httpRequest<BatchTagsResult>('/api/tags/batch', {
+		method: 'POST',
+		body: { tags, dryRun }
+	});
+}

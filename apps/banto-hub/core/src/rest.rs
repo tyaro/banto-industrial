@@ -61,7 +61,7 @@ use banto_server::{
     Identity, ServerEvent,
 };
 use banto_tags::{
-    CollectionGroup, CollectionGroupInput, CollectionGroupService, PlcConnection,
+    BatchTagOutcome, CollectionGroup, CollectionGroupInput, CollectionGroupService, PlcConnection,
     PlcConnectionInput, PlcConnectionService, Tag, TagInput, TagService,
 };
 use serde::{Deserialize, Serialize};
@@ -1910,6 +1910,151 @@ async fn tags_delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// --- T11-1 一括登録 API (docs/ux-plan.md §3): 連続登録 UI と T11-2 の CSV
+// インポートが共有する基盤 - 検証 → all-or-nothing 適用 → 再構成1回。
+// パターン展開（名前パターン/連続アドレス生成）はクライアント側（TS、
+// `apps/banto-hub/src/lib/banto/continuousRegistration.ts`）が担い、この
+// エンドポイントは展開済みの `TagInput` 配列を受け取るだけの汎用一括 API
+// のまま保つ（設計: 「展開結果を一括 API に渡す方式」）。
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchTagsRequest {
+    pub tags: Vec<TagPayload>,
+    /// `true`: 検証結果だけを返す（DB 無変更）。`false`（既定）: 検証 →
+    /// 単一トランザクションで全件 INSERT → 呼び出し元が rebuild を1回。
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+// Note: none of the three response types below derive `utoipa::ToSchema` -
+// `banto_tags::Tag` (embedded in `BatchTagsResponse::tags`) does not
+// implement it, and (like `IssuedApiKeyResponse`/`GrpcSettingsBody` above)
+// this admin-surface endpoint is not part of `ApiDoc`'s documented
+// `/api/v1/*` schema anyway (see this module's doc comment: only the
+// machine-facing tag-space API is utoipa-documented).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchTagFieldErrorResponse {
+    field: String,
+    message: String,
+}
+
+impl From<FieldError> for BatchTagFieldErrorResponse {
+    fn from(err: FieldError) -> Self {
+        Self {
+            field: err.field,
+            message: err.message,
+        }
+    }
+}
+
+/// 行番号(0起点)付きのフィールドエラー一覧 - 設計「行番号/インデックス
+/// 付きのエラー一覧」。CSV インポート(T11-2)ではこの `index` がそのまま
+/// CSV の行番号(ヘッダ行を除く0起点データ行)に対応する想定。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchTagRowErrorResponse {
+    index: usize,
+    field_errors: Vec<BatchTagFieldErrorResponse>,
+}
+
+impl From<banto_tags::BatchTagError> for BatchTagRowErrorResponse {
+    fn from(err: banto_tags::BatchTagError) -> Self {
+        Self {
+            index: err.index,
+            field_errors: err.field_errors.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// `POST /api/tags/batch` の応答。**常に 200** で返す(判断: 2026-08-07) -
+/// 「1件でも不正なら全体拒否」という結果は例外ではなく、dry run の検証
+/// レポートと地続きの通常の応答だから。認証/権限エラー(401/403)や DB
+/// レベルの想定外エラー(500)は既存の `ApiError` 経路(非2xx + `ErrorBody`)
+/// のまま区別する。`ok: false` のときクライアントは `errors` を行ごとに
+/// 表示する(`apps/banto-hub/src/lib/banto/tagRegistryAdmin.ts` 参照)。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchTagsResponse {
+    ok: bool,
+    dry_run: bool,
+    /// 適用された(または dry run で適用されたはずの)件数。`ok: false` の
+    /// ときは常に 0。
+    count: usize,
+    errors: Vec<BatchTagRowErrorResponse>,
+    /// `ok: true && dry_run: false` のときだけ `Some`(実際に作成された
+    /// タグ)。dry run では何も書き込まないので `None`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tags: Option<Vec<Tag>>,
+}
+
+/// `POST /api/tags/batch` - T11-1。editor 以上、CSRF は `/api/tags/*` と
+/// 同じ管理系ルーターの層で一括適用される(`tag_registry_router` 参照)。
+async fn tags_batch(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Json(body): Json<BatchTagsRequest>,
+) -> Result<Json<BatchTagsResponse>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "tags",
+        "POST",
+        "/api/tags/batch",
+    )
+    .await?;
+
+    let dry_run = body.dry_run;
+    let inputs: Vec<TagInput> = body.tags.into_iter().map(Into::into).collect();
+
+    if inputs.is_empty() {
+        return Ok(Json(BatchTagsResponse {
+            ok: true,
+            dry_run,
+            count: 0,
+            errors: Vec::new(),
+            tags: (!dry_run).then(Vec::new),
+        }));
+    }
+
+    let outcome = state.tags.create_batch(inputs, dry_run).await?;
+    match outcome {
+        BatchTagOutcome::Invalid(errors) => Ok(Json(BatchTagsResponse {
+            ok: false,
+            dry_run,
+            count: 0,
+            errors: errors.into_iter().map(Into::into).collect(),
+            tags: None,
+        })),
+        BatchTagOutcome::Valid { count, tags } => {
+            if !dry_run {
+                record_write(
+                    &state.audit,
+                    &state.auth,
+                    &headers,
+                    "batch_create",
+                    "tags",
+                    "-",
+                    Some(json!({ "count": count })),
+                )
+                .await;
+                // T11-1 の核心: n 件でも rebuild はここで1回だけ
+                // (`tags_create` を n 回呼ぶ場合との違い)。
+                rebuild_and_notify(&state.manager, &state.events, "tags").await;
+            }
+            Ok(Json(BatchTagsResponse {
+                ok: true,
+                dry_run,
+                count,
+                errors: Vec::new(),
+                tags,
+            }))
+        }
+    }
+}
+
 /// `/api/plc-connections/*` + `/api/collection-groups/*` + `/api/tags/*`
 /// (viewer-read / editor-write) - `relay-wright-core::rest::tag_registry_router`
 /// を雛形に、書き込み成功後に必ず [`rebuild_and_notify`] を挟む点だけが違う。
@@ -1958,6 +2103,10 @@ fn tag_registry_router(
             "/api/tags/{id}",
             get(tags_get).put(tags_update).delete(tags_delete),
         )
+        // T11-1 (docs/ux-plan.md §3): 一括登録 - `/api/tags/{id}` の下では
+        // なく `/api/tags` の下の固定パスなので、`{id}` (i64) パラメータと
+        // 衝突しない。
+        .route("/api/tags/batch", post(tags_batch))
         .with_state(state)
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }

@@ -3,6 +3,8 @@
 //! belongs to exactly one [`crate::collection_group::CollectionGroup`],
 //! which is what actually drives *when* it gets read from the PLC (§3.1).
 
+use std::collections::{HashMap, HashSet};
+
 use banto_core::{BantoError, FieldError, ListParams, ListResult};
 use banto_storage::ColumnMap;
 use serde::{Deserialize, Serialize};
@@ -624,6 +626,50 @@ const COLUMNS: &str = "id, name, collection_group_id, address, data_type, string
      writable, tag_kind, expression, retain";
 const FK_MESSAGE: &str = "指定された収集グループが見つかりません";
 
+/// Shared by [`TagService::create`] and [`TagService::create_batch`] (T11-1)
+/// so the two INSERT statements cannot drift apart - both bind the exact
+/// same 20 columns in the exact same order (see either call site).
+fn insert_tag_sql() -> String {
+    format!(
+        "INSERT INTO tags (\
+            name, collection_group_id, address, data_type, string_length, \
+            raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, \
+            threshold_h, threshold_hh, threshold_l, threshold_ll, enabled, \
+            writable, tag_kind, expression, retain\
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         RETURNING {COLUMNS}"
+    )
+}
+
+/// A single row's worth of field errors within a [`TagService::create_batch`]
+/// call (T11-1, docs/ux-plan.md §3: "行番号/インデックス付きのエラー一覧").
+/// `index` is the row's 0-based position in the request's `tags` array, so a
+/// client (the continuous-registration preview, and later T11-2's CSV
+/// import) can point back at exactly the offending row/line.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchTagError {
+    pub index: usize,
+    pub field_errors: Vec<FieldError>,
+}
+
+/// Result of [`TagService::create_batch`] - see that method's doc comment for
+/// the all-or-nothing contract each variant implies.
+#[derive(Debug)]
+pub enum BatchTagOutcome {
+    /// At least one row failed validation (including duplicate-name
+    /// detection). Nothing was written - not even the rows that were
+    /// individually fine (design: "1件でもエラーがあれば全体を拒否").
+    Invalid(Vec<BatchTagError>),
+    /// Every row validated. `tags` carries the persisted rows in request
+    /// order for a real apply (`dry_run: false`), or is `None` for
+    /// `dry_run: true` (validation-only - nothing was written).
+    Valid {
+        count: usize,
+        tags: Option<Vec<Tag>>,
+    },
+}
+
 /// Service layer for the `tags` resource. No delete guard is needed here
 /// (unlike [`crate::plc_connection::PlcConnectionService::delete`] /
 /// [`crate::collection_group::CollectionGroupService::delete`]): nothing in
@@ -680,38 +726,30 @@ impl TagService {
     pub async fn create(&self, input: TagInput) -> Result<Tag, BantoError> {
         let validated = validate_tag_input(&input)?;
         validate_tag_kind_placement(&self.pool, input.collection_group_id, &input.tag_kind).await?;
-        sqlx::query_as::<_, Tag>(&format!(
-            "INSERT INTO tags (\
-                name, collection_group_id, address, data_type, string_length, \
-                raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, \
-                threshold_h, threshold_hh, threshold_l, threshold_ll, enabled, \
-                writable, tag_kind, expression, retain\
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             RETURNING {COLUMNS}"
-        ))
-        .bind(&validated.name)
-        .bind(input.collection_group_id)
-        .bind(&validated.address)
-        .bind(&input.data_type)
-        .bind(input.string_length)
-        .bind(input.raw_lo)
-        .bind(input.raw_hi)
-        .bind(input.eng_lo)
-        .bind(input.eng_hi)
-        .bind(&validated.unit)
-        .bind(input.decimals)
-        .bind(input.threshold_h)
-        .bind(input.threshold_hh)
-        .bind(input.threshold_l)
-        .bind(input.threshold_ll)
-        .bind(input.enabled)
-        .bind(input.writable)
-        .bind(&input.tag_kind)
-        .bind(&input.expression)
-        .bind(input.retain)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|err| map_write_error(err, "name", "collectionGroupId", FK_MESSAGE))
+        sqlx::query_as::<_, Tag>(&insert_tag_sql())
+            .bind(&validated.name)
+            .bind(input.collection_group_id)
+            .bind(&validated.address)
+            .bind(&input.data_type)
+            .bind(input.string_length)
+            .bind(input.raw_lo)
+            .bind(input.raw_hi)
+            .bind(input.eng_lo)
+            .bind(input.eng_hi)
+            .bind(&validated.unit)
+            .bind(input.decimals)
+            .bind(input.threshold_h)
+            .bind(input.threshold_hh)
+            .bind(input.threshold_l)
+            .bind(input.threshold_ll)
+            .bind(input.enabled)
+            .bind(input.writable)
+            .bind(&input.tag_kind)
+            .bind(&input.expression)
+            .bind(input.retain)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|err| map_write_error(err, "name", "collectionGroupId", FK_MESSAGE))
     }
 
     pub async fn update(&self, id: i64, input: TagInput) -> Result<Tag, BantoError> {
@@ -771,6 +809,208 @@ impl TagService {
             });
         }
         Ok(())
+    }
+
+    /// Bulk create - T11-1 (docs/ux-plan.md §3): the shared foundation both
+    /// continuous registration and CSV import (T11-2) build on. Calling
+    /// [`TagService::create`] `n` times would (a) be all-or-nothing only at
+    /// the row level, leaving a partially-applied registry on a mid-batch
+    /// failure, and (b) force the caller to rebuild the collector once per
+    /// row (design: "1件ずつ POST を繰り返すと T7 の部分再構成がタグ追加の
+    /// たびに走る（100点で100回）"). This method instead:
+    ///
+    /// 1. Validates every row ([`validate_tag_input`] +
+    ///    [`validate_tag_kind_placement`]), collecting **every** row's
+    ///    errors rather than stopping at the first (design: "行番号付き
+    ///    エラー一覧").
+    /// 2. Detects duplicate `name`s, both within the batch itself and
+    ///    against already-persisted tags (design: "重複名(リクエスト内・
+    ///    既存タグとの両方)も検証で検出").
+    /// 3. If step 1 or 2 found anything, returns [`BatchTagOutcome::Invalid`]
+    ///    and writes nothing at all, `dry_run` or not (design: "1件でも
+    ///    エラーがあれば全体を拒否") - the caller does not need to re-check
+    ///    this itself.
+    /// 4. Otherwise, if `dry_run`, returns [`BatchTagOutcome::Valid`] with
+    ///    `tags: None` - nothing was written, the caller only wanted to know
+    ///    the batch *would* succeed (the continuous-registration preview,
+    ///    and later T11-2's CSV dry-run step).
+    /// 5. Otherwise, inserts every row in **one** `sqlx` transaction (design:
+    ///    "単一トランザクションで全件 INSERT") and returns the persisted
+    ///    rows in request order.
+    ///
+    /// This method never touches the collector - same as every other
+    /// `TagService` method, rebuilding is the caller's job. The intended
+    /// caller (`apps/banto-hub/core/src/rest.rs`'s `POST /api/tags/batch`)
+    /// calls [`crate::plc_connection::PlcConnectionService`]'s sibling hub
+    /// type (`CollectorManager::rebuild`) exactly once after a
+    /// `Valid { tags: Some(_), .. }` result, never per row.
+    ///
+    /// A DB-level failure surfacing only at INSERT time (e.g. a `name` that
+    /// became a duplicate, or a `collection_group_id` that stopped existing,
+    /// between this method's own validation queries and the transaction
+    /// below) is the one case this method cannot report per-row: it rolls
+    /// the transaction back (nothing is written, all-or-nothing still holds)
+    /// but surfaces as a plain `Err(BantoError::Validation)` with a single,
+    /// unindexed `FieldError` rather than a `BatchTagOutcome::Invalid` entry.
+    /// This is an accepted, intentionally-unhandled race window (judgment
+    /// call, T11-1, 2026-08-07): closing it would require holding a
+    /// transaction open across the whole validation pass, which would
+    /// serialize every batch/CRUD write against every other one for the
+    /// duration of a potentially large batch's validation queries - worse in
+    /// practice than the rare surprise of a generic error message on an
+    /// actual concurrent conflict.
+    pub async fn create_batch(
+        &self,
+        inputs: Vec<TagInput>,
+        dry_run: bool,
+    ) -> Result<BatchTagOutcome, BantoError> {
+        let mut row_errors: Vec<Vec<FieldError>> = vec![Vec::new(); inputs.len()];
+        let mut validated: Vec<Option<ValidatedTag>> = Vec::with_capacity(inputs.len());
+
+        for (index, input) in inputs.iter().enumerate() {
+            match validate_tag_input(input) {
+                Ok(v) => validated.push(Some(v)),
+                Err(BantoError::Validation { field_errors }) => {
+                    row_errors[index].extend(field_errors);
+                    validated.push(None);
+                }
+                Err(other) => return Err(other),
+            }
+            match validate_tag_kind_placement(
+                &self.pool,
+                input.collection_group_id,
+                &input.tag_kind,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(BantoError::Validation { field_errors }) => {
+                    row_errors[index].extend(field_errors)
+                }
+                Err(other) => return Err(other),
+            }
+        }
+
+        // Intra-batch duplicates: every index sharing a name with another
+        // index gets flagged, not just the "later" occurrence - a preview/
+        // CSV row list is easier to fix when every offending line is marked.
+        let mut first_seen: HashMap<&str, usize> = HashMap::new();
+        let mut batch_dupe_indices: Vec<usize> = Vec::new();
+        for (index, v) in validated.iter().enumerate() {
+            let Some(v) = v else { continue };
+            match first_seen.get(v.name.as_str()) {
+                Some(&first) => {
+                    if !batch_dupe_indices.contains(&first) {
+                        batch_dupe_indices.push(first);
+                    }
+                    batch_dupe_indices.push(index);
+                }
+                None => {
+                    first_seen.insert(&v.name, index);
+                }
+            }
+        }
+        for index in batch_dupe_indices {
+            row_errors[index].push(FieldError {
+                field: "name".to_string(),
+                message: "リクエスト内の他の行と名前が重複しています".to_string(),
+            });
+        }
+
+        // Duplicates against already-persisted tags: one query covering
+        // every syntactically-valid name in the batch.
+        let candidate_names: Vec<&str> = validated
+            .iter()
+            .filter_map(|v| v.as_ref().map(|v| v.name.as_str()))
+            .collect();
+        if !candidate_names.is_empty() {
+            let mut qb: QueryBuilder<'_, Sqlite> =
+                QueryBuilder::new("SELECT name FROM tags WHERE name IN (");
+            let mut separated = qb.separated(", ");
+            for name in &candidate_names {
+                separated.push_bind(*name);
+            }
+            qb.push(")");
+            let existing: Vec<(String,)> = qb
+                .build_query_as()
+                .fetch_all(&self.pool)
+                .await
+                .map_err(banto_storage::storage_error)?;
+            let existing_names: HashSet<String> = existing.into_iter().map(|(n,)| n).collect();
+            for (index, v) in validated.iter().enumerate() {
+                let Some(v) = v else { continue };
+                if existing_names.contains(&v.name) {
+                    row_errors[index].push(FieldError {
+                        field: "name".to_string(),
+                        message: "既に使用されています".to_string(),
+                    });
+                }
+            }
+        }
+
+        let errors: Vec<BatchTagError> = row_errors
+            .into_iter()
+            .enumerate()
+            .filter(|(_, field_errors)| !field_errors.is_empty())
+            .map(|(index, field_errors)| BatchTagError {
+                index,
+                field_errors,
+            })
+            .collect();
+        if !errors.is_empty() {
+            return Ok(BatchTagOutcome::Invalid(errors));
+        }
+
+        if dry_run {
+            return Ok(BatchTagOutcome::Valid {
+                count: inputs.len(),
+                tags: None,
+            });
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(banto_storage::storage_error)?;
+        let mut created = Vec::with_capacity(inputs.len());
+        let sql = insert_tag_sql();
+        for (input, validated) in inputs.iter().zip(validated.iter()) {
+            let validated = validated.as_ref().expect(
+                "every row validated Ok in the pass above (errors would have returned already)",
+            );
+            let row = sqlx::query_as::<_, Tag>(&sql)
+                .bind(&validated.name)
+                .bind(input.collection_group_id)
+                .bind(&validated.address)
+                .bind(&input.data_type)
+                .bind(input.string_length)
+                .bind(input.raw_lo)
+                .bind(input.raw_hi)
+                .bind(input.eng_lo)
+                .bind(input.eng_hi)
+                .bind(&validated.unit)
+                .bind(input.decimals)
+                .bind(input.threshold_h)
+                .bind(input.threshold_hh)
+                .bind(input.threshold_l)
+                .bind(input.threshold_ll)
+                .bind(input.enabled)
+                .bind(input.writable)
+                .bind(&input.tag_kind)
+                .bind(&input.expression)
+                .bind(input.retain)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|err| map_write_error(err, "name", "collectionGroupId", FK_MESSAGE))?;
+            created.push(row);
+        }
+        tx.commit().await.map_err(banto_storage::storage_error)?;
+
+        Ok(BatchTagOutcome::Valid {
+            count: created.len(),
+            tags: Some(created),
+        })
     }
 }
 
@@ -2102,5 +2342,149 @@ mod tests {
         assert_eq!(result.total_count, 2);
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].name, "C");
+    }
+
+    // --- create_batch (T11-1, docs/ux-plan.md §3) --------------------------
+
+    #[tokio::test]
+    async fn create_batch_persists_every_row_in_request_order() {
+        let (svc, group_id) = setup().await;
+        let inputs = vec![
+            sample_input("Batch1", group_id),
+            sample_input("Batch2", group_id),
+            sample_input("Batch3", group_id),
+        ];
+        let outcome = svc
+            .create_batch(inputs, false)
+            .await
+            .expect("create_batch should succeed");
+        match outcome {
+            BatchTagOutcome::Valid { count, tags } => {
+                assert_eq!(count, 3);
+                let tags = tags.expect("a non-dry-run apply returns the created rows");
+                assert_eq!(
+                    tags.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+                    vec!["Batch1", "Batch2", "Batch3"]
+                );
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+
+        let all = svc.list(ListParams::default()).await.unwrap();
+        assert_eq!(all.total_count, 3);
+    }
+
+    #[tokio::test]
+    async fn create_batch_rejects_everything_when_one_row_is_invalid() {
+        let (svc, group_id) = setup().await;
+        let mut bad = sample_input("Bad", group_id);
+        bad.data_type = "f64".to_string(); // not in ALLOWED_DATA_TYPES
+        let inputs = vec![
+            sample_input("Good1", group_id),
+            bad,
+            sample_input("Good2", group_id),
+        ];
+
+        let outcome = svc
+            .create_batch(inputs, false)
+            .await
+            .expect("create_batch should not error - it reports invalid rows instead");
+        match outcome {
+            BatchTagOutcome::Invalid(errors) => {
+                assert_eq!(errors.len(), 1, "{errors:?}");
+                assert_eq!(errors[0].index, 1);
+                assert!(errors[0].field_errors.iter().any(|e| e.field == "dataType"));
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+
+        // All-or-nothing: not even the two valid rows were written.
+        let all = svc.list(ListParams::default()).await.unwrap();
+        assert_eq!(all.total_count, 0);
+    }
+
+    #[tokio::test]
+    async fn create_batch_dry_run_validates_without_writing() {
+        let (svc, group_id) = setup().await;
+        let inputs = vec![
+            sample_input("Preview1", group_id),
+            sample_input("Preview2", group_id),
+        ];
+
+        let outcome = svc
+            .create_batch(inputs, true)
+            .await
+            .expect("create_batch should succeed");
+        match outcome {
+            BatchTagOutcome::Valid { count, tags } => {
+                assert_eq!(count, 2);
+                assert!(tags.is_none(), "dry run must not report created rows");
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+
+        let all = svc.list(ListParams::default()).await.unwrap();
+        assert_eq!(all.total_count, 0, "dry run must not write anything");
+    }
+
+    #[tokio::test]
+    async fn create_batch_flags_every_index_sharing_a_duplicate_name_within_the_request() {
+        let (svc, group_id) = setup().await;
+        let inputs = vec![
+            sample_input("Dup", group_id),
+            sample_input("Unique", group_id),
+            sample_input("Dup", group_id),
+        ];
+
+        let outcome = svc.create_batch(inputs, true).await.unwrap();
+        match outcome {
+            BatchTagOutcome::Invalid(errors) => {
+                let indices: Vec<usize> = errors.iter().map(|e| e.index).collect();
+                assert_eq!(indices, vec![0, 2], "{errors:?}");
+                for err in &errors {
+                    assert!(err.field_errors.iter().any(|e| e.field == "name"));
+                }
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_batch_flags_a_name_already_used_by_an_existing_tag() {
+        let (svc, group_id) = setup().await;
+        svc.create(sample_input("Existing", group_id))
+            .await
+            .unwrap();
+
+        let outcome = svc
+            .create_batch(vec![sample_input("Existing", group_id)], false)
+            .await
+            .unwrap();
+        match outcome {
+            BatchTagOutcome::Invalid(errors) => {
+                assert_eq!(errors.len(), 1);
+                assert_eq!(errors[0].index, 0);
+                assert_eq!(errors[0].field_errors[0].field, "name");
+                assert_eq!(errors[0].field_errors[0].message, "既に使用されています");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+
+        // Still just the one pre-existing row.
+        let all = svc.list(ListParams::default()).await.unwrap();
+        assert_eq!(all.total_count, 1);
+    }
+
+    #[tokio::test]
+    async fn create_batch_with_an_empty_vec_succeeds_trivially() {
+        let (svc, _group_id) = setup().await;
+        let outcome = svc.create_batch(Vec::new(), false).await.unwrap();
+        match outcome {
+            BatchTagOutcome::Valid { count, tags } => {
+                assert_eq!(count, 0);
+                assert_eq!(tags, Some(Vec::new()));
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
     }
 }
