@@ -22,6 +22,7 @@
 	 * そのまま出す。
 	 */
 	import type { Snippet } from 'svelte';
+	import { SvelteSet } from 'svelte/reactivity';
 	import type { TreeNode } from './treeTypes';
 
 	interface Props {
@@ -35,7 +36,18 @@
 
 	let { nodes, selectedId = null, onselect, ontoggle, oncontextmenu, label }: Props = $props();
 
-	let expanded = $state<Set<string>>(new Set());
+	/**
+	 * 監査指摘（2026-08-08）: プレーンな `Set` は `$state()` で包んでも
+	 * Svelte 5 はディーププロキシしない（配列/オブジェクトと違い
+	 * Set/Map は素通し）ため、`.add()`/`.delete()` のミューテーションが
+	 * リアクティビティに通知されず、展開/折りたたみをクリックしても
+	 * `expanded.has(node.id)` を読むテンプレートが再評価されなかった
+	 * （svelte-check では検出できない実行時バグ）。`apps/relay-wright/
+	 * src/routes/(app)/tags/+page.svelte` の `selectedIds`（`SvelteSet`、
+	 * add/delete のミューテーションが通知される）と同じ前例に倣い、
+	 * `svelte/reactivity` の `SvelteSet` に置き換える。
+	 */
+	const expanded = new SvelteSet<string>();
 	const seenRootIds = new Set<string>();
 
 	// 新規に現れたルートノードだけ自動展開する（既存ノードの開閉状態は
