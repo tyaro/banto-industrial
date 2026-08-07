@@ -55,7 +55,7 @@ jobs:
   rust:
     name: Rust (fmt / clippy / test)
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     # banto-tags (and every later I-series crate) depends on banto-core /
     # banto-storage via a git tag reference into tyaro/banto (see
     # crates/banto-tags/Cargo.toml, banto's docs/publishing.md). banto went
@@ -67,27 +67,31 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      # rustfmt only parses/reformats - no compilation, so unlike the steps
-      # below it can safely cover every workspace member (including the
-      # `chronogazer` src-tauri crate) without needing its native deps built.
+      # rustfmt only parses/reformats - no compilation, so like the steps
+      # below it covers every workspace member, including the
+      # `chronogazer`/`relay-wright` src-tauri crates.
       - name: fmt
         run: cargo fmt --all --check
-      # Scope: every crate EXCEPT `chronogazer` (apps/chronogazer/src-tauri).
-      # Same reasoning as banto's own CI: the Tauri crate pulls in heavy
-      # native/webview dependencies, so it is intentionally excluded from
-      # this pipeline to keep it fast; add it back with the appropriate
-      # tauri-action setup once native builds are needed in CI. R1-A adds
-      # `chronogazer-core` here (the headless service layer + banto-serve
-      # binary), which has no such native deps.
+      # Scope: the whole workspace, no --exclude. The two Tauri src-tauri
+      # crates (`chronogazer`, `relay-wright`) have real tests of their own
+      # (relay-wright: 25, chronogazer: 5) - PR #39 fixed a compile error in
+      # relay-wright's src-tauri tests that a prior narrower CI scope had let
+      # through undetected (a stale field reference left behind by T2-3).
+      # So they stay in scope rather than being excluded for build-time
+      # reasons: this job runs on windows-latest with Swatinem/rust-cache,
+      # where the Tauri/WebView2 dependency build time is acceptable.
       - name: clippy
-        run: cargo clippy -p banto-tags -p banto-plc -p banto-tstore -p banto-collect -p banto-tsquery -p chronogazer-core --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
-        run: cargo test -p banto-tags -p banto-plc -p banto-tstore -p banto-collect -p banto-tsquery -p chronogazer-core
+        run: cargo test --workspace
 
   e2e:
     name: E2E (Playwright smoke)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Known gap: this only covers apps/chronogazer. apps/banto-hub has no
+    # Playwright e2e config yet (docs/t5-handoff.md §2) - add a parallel job
+    # here once one exists.
     steps:
       - name: Checkout
         uses: actions/checkout@v4

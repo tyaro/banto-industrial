@@ -587,7 +587,13 @@ async fn e2e_publishes_values_with_retain_and_online_state() {
         .await
         .unwrap();
     let group = CollectionGroupService::new(app.pool.clone())
-        .create(group_input("fast", conn.id, 100))
+        // period 1000ms（他テストの 100ms より意図的に長い）: このテストは
+        // 発行ペイロードの品質が "good" であることまで assert する（下記）。
+        // 品質は読み出し時判定で period × 2.5 より古いサンプルは stale に
+        // なるため、100ms（閾値 250ms）だと混雑した CI ランナーの停滞だけで
+        // stale に落ちて flake する（CI 初走行 2026-08-07 で実際に発生）。
+        // 1000ms なら閾値 2.5 秒になり、検証意図を弱めずランナー耐性が上がる。
+        .create(group_input("fast", conn.id, 1000))
         .await
         .unwrap();
     TagService::new(app.pool.clone())
