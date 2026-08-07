@@ -48,6 +48,22 @@ pub enum CompileError {
     /// ビット抽出できない - §4.2 の `bit(tag, n)` はタグの生ワード値専用）。
     #[error("bit() の第1引数が不正です（位置 {pos}）: {message}")]
     BadBitTarget { pos: usize, message: String },
+
+    /// 式ソースの文字数が [`crate::MAX_SOURCE_CHARS`] を超えている
+    /// （`compile` の入口、字句解析より前で検出 - `crate` トップレベル doc
+    /// の「DoS 対策」節参照）。位置情報を持たない - この失敗は式全体の
+    /// 長さについてのものであり、特定の文字位置を指し示す意味がないため
+    /// （他の全 variant が `pos` を持つのに対する唯一の例外）。
+    #[error("式が長すぎます: 上限 {max} 文字ですが {actual} 文字です")]
+    SourceTooLong { max: usize, actual: usize },
+
+    /// 括弧のネスト・単項演算子（`-`/`!`）の連鎖・関数呼び出し引数の
+    /// いずれか（またはその組み合わせ）でパーサの再帰深さが
+    /// [`crate::MAX_NESTING_DEPTH`] を超えた（`crate` トップレベル doc の
+    /// 「DoS 対策」節・[`crate::parser`] モジュール doc 参照）。`pos` は
+    /// 深さガードに引っかかった時点で次に読むはずだったトークンの位置。
+    #[error("式のネストが深すぎます（位置 {pos}）: 上限は {max} 段です")]
+    TooDeep { pos: usize, max: usize },
 }
 
 /// 評価時の失敗。NaN・ゼロ除算・オーバーフローは失敗ではなく IEEE 754 の
@@ -110,6 +126,21 @@ mod tests {
         assert_eq!(
             e.to_string(),
             "関数 min の引数の数が不正です（位置 0）: 2 個が必要ですが 3 個です"
+        );
+
+        let e = CompileError::SourceTooLong {
+            max: 1024,
+            actual: 1025,
+        };
+        assert_eq!(
+            e.to_string(),
+            "式が長すぎます: 上限 1024 文字ですが 1025 文字です"
+        );
+
+        let e = CompileError::TooDeep { pos: 7, max: 64 };
+        assert_eq!(
+            e.to_string(),
+            "式のネストが深すぎます（位置 7）: 上限は 64 段です"
         );
     }
 
