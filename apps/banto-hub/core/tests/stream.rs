@@ -307,6 +307,36 @@ async fn connect_ws(
     Ok(stream)
 }
 
+/// Like [`connect_ws`] but authenticates via `Sec-WebSocket-Protocol:
+/// "bearer, {token}"` instead of `Authorization` - exercises
+/// `rest.rs::extract_ws_protocol_token`, the fallback added so a browser
+/// (which cannot set `Authorization` on a WS handshake) can authenticate
+/// `GET /api/v1/stream`. No `Authorization` header is set at all, so a
+/// success here proves the subprotocol path alone is sufficient.
+async fn connect_ws_via_subprotocol(
+    url: &str,
+    token: &str,
+) -> Result<WsStream, tokio_tungstenite::tungstenite::Error> {
+    connect_ws_via_subprotocol_raw(url, &format!("bearer, {token}")).await
+}
+
+/// Like [`connect_ws_via_subprotocol`] but takes the raw
+/// `Sec-WebSocket-Protocol` header value verbatim - used to send malformed
+/// values (e.g. `"bearer"` with no token part) that a real client would
+/// never construct via the `['bearer', token]` array form.
+async fn connect_ws_via_subprotocol_raw(
+    url: &str,
+    protocol_header: &str,
+) -> Result<WsStream, tokio_tungstenite::tungstenite::Error> {
+    let mut request = url.into_client_request().expect("valid ws url");
+    request.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        protocol_header.parse().expect("valid header value"),
+    );
+    let (stream, _response) = connect_async(request).await?;
+    Ok(stream)
+}
+
 async fn send_json(ws: &mut WsStream, value: Value) {
     ws.send(WsMessage::Text(value.to_string().into()))
         .await
@@ -847,4 +877,104 @@ async fn a_slow_subscriber_gets_disconnected_once_the_outbound_queue_fills() {
     assert!(closed, "server should disconnect a slow subscriber");
 
     sim.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 9. `Sec-WebSocket-Protocol` bearer フォールバック（T10、banto-hub のライブ
+//    タグモニタ向けにブラウザ WS 認証の欠落を埋めた変更 -
+//    `rest.rs::extract_ws_protocol_token` の doc comment 参照）
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn valid_session_token_via_subprotocol_header_authenticates_and_streams_data() {
+    let app = test_app("ws-subprotocol-auth-ok").await;
+    let sim = Simulator::start().await;
+    sim.set_holding_register(0, 42); // 40001
+
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(conn_input("line1", sim.addr.port()))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group.id, "40001", "i16"))
+        .await
+        .unwrap();
+    app.manager.rebuild().await.expect("rebuild after seeding");
+
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            app.manager
+                .current_values()
+                .and_then(|c| c.get("tag:1"))
+                .map(|s| s.value)
+                == Some(Some(42.0))
+        })
+        .await,
+        "collector should observe the initial simulator value"
+    );
+
+    // No `Authorization` header at all - only `Sec-WebSocket-Protocol:
+    // "bearer, {token}"`, exactly what a browser `new WebSocket(url,
+    // ['bearer', token])` call sends.
+    let mut ws = connect_ws_via_subprotocol(&app.ws_url("/api/v1/stream"), &app.token)
+        .await
+        .expect("ws handshake via Sec-WebSocket-Protocol should succeed");
+
+    send_json(
+        &mut ws,
+        json!({ "op": "subscribe", "id": 1, "tags": ["line1.fast.temp01"], "mode": "on_change" }),
+    )
+    .await;
+
+    let snapshot = recv_matching(&mut ws, |m| m["op"] == "data" && m["id"] == 1).await;
+    let values = snapshot["values"].as_array().unwrap();
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["tag"], "line1.fast.temp01");
+    assert_eq!(values[0]["v"], 42.0);
+    assert_eq!(values[0]["q"], "good");
+
+    sim.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_subprotocol_header_is_still_rejected_with_401() {
+    let app = test_app("ws-subprotocol-auth-reject").await;
+
+    // Just "bearer" with no second part.
+    let err = connect_ws_via_subprotocol_raw(&app.ws_url("/api/v1/stream"), "bearer")
+        .await
+        .expect_err("a subprotocol header with no token part should be rejected");
+    match err {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            assert_eq!(response.status().as_u16(), 401, "{response:?}");
+        }
+        other => panic!("expected an HTTP-level rejection, got {other:?}"),
+    }
+
+    // Completely unrelated subprotocols (no "bearer" first element).
+    let err = connect_ws_via_subprotocol_raw(&app.ws_url("/api/v1/stream"), "chat, superchat")
+        .await
+        .expect_err("unrelated subprotocols should be rejected");
+    match err {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            assert_eq!(response.status().as_u16(), 401, "{response:?}");
+        }
+        other => panic!("expected an HTTP-level rejection, got {other:?}"),
+    }
+
+    // No header at all, same as the existing no-Authorization test - sanity
+    // check that this test's server setup rejects like every other test.
+    let err = connect_ws(&app.ws_url("/api/v1/stream"), None)
+        .await
+        .expect_err("no auth at all should still be rejected");
+    match err {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            assert_eq!(response.status().as_u16(), 401, "{response:?}");
+        }
+        other => panic!("expected an HTTP-level rejection, got {other:?}"),
+    }
 }

@@ -101,6 +101,51 @@ fn actor_identity(headers: &HeaderMap, auth: &AuthState) -> Option<Identity> {
     bearer_token(headers).and_then(|token| auth.identity_for(token))
 }
 
+/// `Sec-WebSocket-Protocol`-as-bearer-carrier fallback for `GET
+/// /api/v1/stream` only (judgment call, 2026-08-07 - browser WS auth gap
+/// discovered while building banto-hub's live tag monitor, T10).
+///
+/// The browser's native `WebSocket` constructor cannot set custom request
+/// headers - there is no way for page JS to attach `Authorization` to a WS
+/// handshake, so a plain `new WebSocket('/api/v1/stream')` from the admin
+/// UI can never authenticate against [`require_tag_space_auth`]'s normal
+/// [`bearer_token`] check. The standard workaround (used by e.g. AWS IoT's
+/// browser MQTT-over-WS SDK) is to smuggle the token through
+/// `Sec-WebSocket-Protocol`, which the browser *does* let JS set via the
+/// `WebSocket(url, protocols)` constructor overload: the client connects
+/// with `new WebSocket(url, ['bearer', token])`, which the browser sends as
+/// the header `Sec-WebSocket-Protocol: bearer, <token>`. A `?token=` query
+/// parameter was deliberately rejected as an alternative - it would leak the
+/// token into server access logs and browser history, whereas the
+/// subprotocol header is not part of the URL and is not logged that way.
+///
+/// Scoped to the exact path `/api/v1/stream` so no other `/api/v1/*` route's
+/// auth behavior changes - every other machine client (Rust tests, API-key
+/// clients) can and does set `Authorization` directly.
+///
+/// Note: [`crate::stream::ws_upgrade`] calls
+/// `WebSocketUpgrade::protocols(["bearer"])`, which only selects/echoes
+/// `"bearer"` back in the response if the client actually offered it in its
+/// own `Sec-WebSocket-Protocol` request header - so machine clients that
+/// authenticate via `Authorization` and never offer a subprotocol are
+/// unaffected. See that function's doc comment for the full rationale
+/// (`tokio-tungstenite`'s client-side handshake validation requires the echo
+/// when the client does offer a subprotocol).
+fn extract_ws_protocol_token(path: &str, headers: &HeaderMap) -> Option<String> {
+    if path != "/api/v1/stream" {
+        return None;
+    }
+    let raw = headers
+        .get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)?
+        .to_str()
+        .ok()?;
+    let parts: Vec<&str> = raw.split(',').map(str::trim).collect();
+    if parts.len() != 2 || parts[0] != "bearer" {
+        return None;
+    }
+    Some(parts[1].to_string())
+}
+
 /// Record a successful write once the service call it follows has already
 /// succeeded - same convention as chronogazer/relay-wright's `record_write`.
 async fn record_write(
@@ -2691,7 +2736,11 @@ struct TagSpaceAuthState {
 /// T0-1 の `require_auth`（セッション bearer のみ）を置き換える（このモジュール
 /// の doc comment 参照）。
 ///
-/// - `Authorization` ヘッダがない、または `Bearer ` で始まらない → 401
+/// - `Authorization` ヘッダがない、または `Bearer ` で始まらない → `GET
+///   /api/v1/stream` だけは [`extract_ws_protocol_token`] で
+///   `Sec-WebSocket-Protocol` からのフォールバックを試す（ブラウザの
+///   WebSocket が `Authorization` を送れないための救済 - 同関数の doc
+///   comment 参照）。それも失敗すれば 401
 /// - 値が `bh_` で始まる → API キーとして
 ///   [`crate::api_keys::ApiKeysService::lookup`] で照合:
 ///   - [`ApiKeyLookup::Valid`] → `POST /api/v1/values/{tag}`（書き込み、
@@ -2725,7 +2774,10 @@ async fn require_tag_space_auth(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let Some(token) = bearer_token(req.headers()).map(str::to_string) else {
+    let Some(token) = bearer_token(req.headers())
+        .map(str::to_string)
+        .or_else(|| extract_ws_protocol_token(req.uri().path(), req.headers()))
+    else {
         return unauthorized_response();
     };
 
