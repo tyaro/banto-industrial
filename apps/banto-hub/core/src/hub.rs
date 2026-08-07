@@ -673,6 +673,12 @@ impl CollectorManager {
         self.pool.clone()
     }
 
+    /// T12(docs/ux-plan.md §4)の接続テストAPIが、broker経由SLMP接続の既存
+    /// セッションを覗くために使う - `HubSessions::handle_for`参照。
+    pub fn sessions(&self) -> &Arc<HubSessions> {
+        &self.sessions
+    }
+
     /// The shared clock (design: 値のタイムスタンプはサンプル取得時刻 - `rest.rs`
     /// uses this for the `/api/v1/values` snapshot's own `t` field and for a
     /// sample-less tag's fallback timestamp).

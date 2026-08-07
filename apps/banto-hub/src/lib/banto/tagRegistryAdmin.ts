@@ -375,3 +375,58 @@ export async function createTagsBatch(tags: TagInput[], dryRun: boolean): Promis
 		body: { tags, dryRun }
 	});
 }
+
+// --- T12 接続テスト (docs/ux-plan.md §4) -------------------------------------
+
+/**
+ * `POST /api/plc-connections/test` のリクエスト — mirrors
+ * `banto_hub_core::rest::PlcConnectionTestPayload`。フォームの現在値
+ * （未保存でもよい）をそのまま送る。`connectionId` は「保存済み接続の
+ * 編集フォームからのテスト」のときだけ付与する（省略時はバックエンドが
+ * 「新規作成中の接続」として扱う）。
+ */
+export interface PlcConnectionTestRequest {
+	protocol: PlcProtocol;
+	host: string;
+	port: number;
+	unitId: number;
+	simulation: boolean;
+	connectionId?: number;
+}
+
+/**
+ * 接続テスト失敗の理由 — mirrors
+ * `banto_hub_core::rest::PlcConnectionTestError`。`message` は
+ * 対処ヒント込みの日本語文言なので、UI はそのまま表示すればよい
+ * （`kind` は表示の出し分けに使ってもよいが必須ではない）。
+ */
+export interface PlcConnectionTestError {
+	kind: 'tcp' | 'timeout' | 'protocol' | 'device' | 'unsupported';
+	message: string;
+}
+
+/**
+ * `POST /api/plc-connections/test` の応答 — mirrors
+ * `banto_hub_core::rest::PlcConnectionTestResponse`。**常に HTTP 200**
+ * （`ok: false` は「疎通確認の結果が失敗だった」という通常の応答であって
+ * 例外ではない — 認証/権限/CSRF エラーは通常どおり `httpRequest` が
+ * `ProviderError` を投げる）。
+ */
+export interface PlcConnectionTestResult {
+	ok: boolean;
+	elapsedMs: number;
+	error: PlcConnectionTestError | null;
+}
+
+/**
+ * T12: 接続の保存前に疎通確認する。TCP 接続だけでなく実プロトコルでの
+ * 軽い読み出し1回まで行う（docs/ux-plan.md §4）。
+ */
+export async function testPlcConnection(
+	input: PlcConnectionTestRequest
+): Promise<PlcConnectionTestResult> {
+	return httpRequest<PlcConnectionTestResult>('/api/plc-connections/test', {
+		method: 'POST',
+		body: input
+	});
+}

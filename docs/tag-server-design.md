@@ -860,7 +860,7 @@ relay-wright の専管）。
 | T9  | 接続単位のシミュレーションモード（[ux-plan.md](ux-plan.md) §1）                                                                                 | T0      | UX 改善第1弾（2026-08-06 オーナー決定）。**実装済み（T9-1/T9-2、2026-08-07）**                   |
 | T10 | ライブタグモニタ（[ux-plan.md](ux-plan.md) §2）                                                                                                 | T1      | T9 との相乗効果のため T9 の直後。**実装済み（2026-08-07）**                                      |
 | T11 | タグ定義の CSV インポート/エクスポート（[ux-plan.md](ux-plan.md) §3）                                                                           | T0      | **実装済み（T11-1/T11-2、2026-08-07）**                                                          |
-| T12 | PLC 接続テストボタン（[ux-plan.md](ux-plan.md) §4）                                                                                             | T0      |                                                                                                  |
+| T12 | PLC 接続テストボタン（[ux-plan.md](ux-plan.md) §4）                                                                                             | T0      | **実装済み（2026-08-07）**                                                                       |
 
 **T0 実装時の発見（2026-08-05）**: banto-collect の `build_config` は当時
 modbus-tcp のみ対応で、SLMP 接続は構成エラーになっていた（banto-plc の
