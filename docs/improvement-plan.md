@@ -186,6 +186,12 @@
   ② 途中 kill → 再オープンで直近フラッシュ済みデータが読めるテスト
   ③ `ManualClock::set_utc_offset_ms` を使った DST 遷移テスト
   ④ writer append と tsquery 読みを実際に競走させるテスト
+  ⑤ 既知フレークの安定化: banto-hub
+  `tests/integration.rs` の
+  `an_invalid_config_keeps_the_old_collector_and_surfaces_last_config_error`
+  が busy な CI ランナーで quality `good` 期待に `stale` を返し失敗する
+  (2026-08-08、PR #57 の CI で観測 — Rust 無変更の PR で発生しており
+  base 由来。過去の同型修正 `2a96f20` / `3835779` と同じ手当てを適用する)
 - **備考**: ①はコンテナ/CI では完結しない(実行環境と 72h の実時間が必要)
 
 ### H8: ドキュメント整合 — 状態: 一部本 PR
