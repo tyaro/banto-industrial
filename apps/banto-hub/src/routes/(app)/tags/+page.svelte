@@ -44,6 +44,13 @@
 		type ContinuousRegistrationParams,
 		type ContinuousRegistrationResult
 	} from '$lib/banto/continuousRegistration';
+	import {
+		exportTagsCsv,
+		parseTagsCsv,
+		type ImportTagsCsvResult,
+		type ParsedCsvTagRow,
+		type CsvRowError
+	} from '$lib/banto/tagCsv';
 
 	const dataTypeOptions: { value: TagDataType; label: string }[] = [
 		{ value: 'bit', label: 'bit（真偽値1点）' },
@@ -188,8 +195,11 @@
 		};
 	}
 
-	/** T11-1 (docs/ux-plan.md §3): 通常の単発登録フォーム / 連続登録フォームの切替。 */
-	type Mode = 'single' | 'continuous';
+	/**
+	 * T11-1/T11-2 (docs/ux-plan.md §3): 通常の単発登録フォーム / 連続登録
+	 * フォーム / CSV インポートの切替。
+	 */
+	type Mode = 'single' | 'continuous' | 'csv';
 	let mode: Mode = $state('single');
 
 	let groups: CollectionGroup[] = $state([]);
@@ -468,6 +478,134 @@
 			toastStore.push('error', errorMessage(err));
 		} finally {
 			applyingContinuous = false;
+		}
+	}
+
+	// --- T11-2: CSV エクスポート/インポート (docs/ux-plan.md §3) -------------
+	//
+	// エクスポートはこのページが Blob/DOM 操作を担当し（`$lib/banto/tagCsv.ts`
+	// はブラウザ API に依存しない純関数のまま保つ）、インポートは連続登録と
+	// 同じ「プレビュー → 検証(dry-run) → 登録」の2段階フローを踏襲する。
+
+	/** ローカル日付での `banto-hub-tags-YYYY-MM-DD.csv`（設計: ux-plan.md §3）。 */
+	function csvExportFilename(): string {
+		const now = new Date();
+		const y = now.getFullYear();
+		const m = String(now.getMonth() + 1).padStart(2, '0');
+		const d = String(now.getDate()).padStart(2, '0');
+		return `banto-hub-tags-${y}-${m}-${d}.csv`;
+	}
+
+	/**
+	 * 閲覧者でも実行可（`canWrite` でガードしない — 設定のバックアップ/
+	 * レビューは読み取り専用の操作のため）。BOM は `exportTagsCsv` が
+	 * 既に埋め込み済みなのでここで二重に付けない。
+	 */
+	function handleExportCsv(): void {
+		const csv = exportTagsCsv(tags, connections, groups);
+		const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement('a');
+		a.href = url;
+		a.download = csvExportFilename();
+		a.click();
+		URL.revokeObjectURL(url);
+	}
+
+	let csvFileInputEl: HTMLInputElement | undefined = $state();
+	let csvParseResult: ImportTagsCsvResult | null = $state(null);
+
+	/**
+	 * `csvTagsJson` を素直に `csvParseResult?.ok ? ... : null` と書くと、
+	 * TypeScript の制御フロー解析が「`$state(null)` で宣言した直後の
+	 * 変数は（この時点までの直線的なコード上では再代入が見えないため）
+	 * 型が文字通り `null` に絞り込まれる」と判断し、`csvParseResult.rows`
+	 * を `never` 上のプロパティアクセスとしてエラーにする（TS の既知の
+	 * 挙動 — 実際には `handleCsvFileChange` 等のイベントハンドラ内で
+	 * 再代入されるが、それらは別関数のため直線フロー解析には現れない）。
+	 * 関数の引数として受け渡すと、引数は呼び出し元の絞り込み履歴を
+	 * 引き継がず宣言型（`ImportTagsCsvResult | null`）から素直に絞り込め
+	 * るため、これを回避できる。
+	 */
+	function tagsJsonFromCsvParseResult(result: ImportTagsCsvResult | null): string | null {
+		return result?.ok ? JSON.stringify(result.rows.map((r) => r.tag)) : null;
+	}
+
+	const csvTagsJson = $derived(tagsJsonFromCsvParseResult(csvParseResult));
+
+	// 連続登録と同じ鮮度追跡 — 検証後にファイルを差し替えたら「登録」を
+	// 無効化し、再検証を要求する。
+	let csvValidatedTagsJson = $state<string | null>(null);
+	let csvValidationResult = $state<BatchTagsResult | null>(null);
+	let csvValidating = $state(false);
+	let csvApplying = $state(false);
+
+	const csvValidatedFresh = $derived(
+		csvTagsJson !== null && csvTagsJson === csvValidatedTagsJson && csvValidationResult?.ok === true
+	);
+
+	function invalidateCsvValidation(): void {
+		csvValidatedTagsJson = null;
+		csvValidationResult = null;
+	}
+
+	function resetCsvImport(): void {
+		csvParseResult = null;
+		invalidateCsvValidation();
+		if (csvFileInputEl) csvFileInputEl.value = '';
+	}
+
+	async function handleCsvFileChange(e: Event): Promise<void> {
+		const input = e.target as HTMLInputElement;
+		const file = input.files?.[0];
+		if (!file) return;
+		const text = await file.text();
+		csvParseResult = parseTagsCsv(text, connections, groups);
+		invalidateCsvValidation();
+	}
+
+	async function handleValidateCsv(): Promise<void> {
+		if (!csvParseResult?.ok || csvParseResult.rows.length === 0) return;
+		csvValidating = true;
+		try {
+			const result = await createTagsBatch(
+				csvParseResult.rows.map((r) => r.tag),
+				true
+			);
+			csvValidationResult = result;
+			csvValidatedTagsJson = csvTagsJson;
+			if (result.ok) {
+				toastStore.push('success', `検証OK: ${result.count}件登録できます`);
+			} else {
+				toastStore.push('error', 'エラーがあります。下の一覧を確認してください。');
+			}
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			csvValidating = false;
+		}
+	}
+
+	async function handleApplyCsv(): Promise<void> {
+		if (!csvParseResult?.ok || !csvValidatedFresh) return;
+		csvApplying = true;
+		try {
+			const result = await createTagsBatch(
+				csvParseResult.rows.map((r) => r.tag),
+				false
+			);
+			csvValidationResult = result;
+			if (result.ok) {
+				toastStore.push('success', `${result.count}件登録しました`);
+				resetCsvImport();
+				await reload();
+			} else {
+				toastStore.push('error', '一部の行でエラーがあります。下の一覧を確認してください。');
+			}
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			csvApplying = false;
 		}
 	}
 
@@ -766,6 +904,59 @@
 	{/if}
 {/snippet}
 
+{#snippet csvParseErrors(errors: CsvRowError[])}
+	<table class="error-table">
+		<thead>
+			<tr>
+				<th>行</th>
+				<th>内容</th>
+			</tr>
+		</thead>
+		<tbody>
+			{#each errors as e, i (i)}
+				<tr>
+					<td>{e.lineNumber}</td>
+					<td>{e.message}</td>
+				</tr>
+			{/each}
+		</tbody>
+	</table>
+{/snippet}
+
+{#snippet csvBatchRowErrors(result: BatchTagsResult, parsedRows: ParsedCsvTagRow[])}
+	{#if !result.ok}
+		<table class="error-table">
+			<thead>
+				<tr>
+					<th>行</th>
+					<th>項目</th>
+					<th>内容</th>
+				</tr>
+			</thead>
+			<tbody>
+				{#each result.errors as rowError (rowError.index)}
+					{#each rowError.fieldErrors as fe, i (i)}
+						<tr>
+							<!--
+								batchRowErrors（連続登録用）とは違い、ここでの `rowError.index`
+								は「CSV データ行(ヘッダ除く)の0起点位置」= `createTagsBatch` に
+								送った `csvParseResult.rows` 配列の添字。連続登録の「index+1」
+								（プレビュー行番号）とは意味が違うので、実際の CSV ファイル行番号
+								に変換するには `parsedRows[index].lineNumber` を引く必要がある
+								（`$lib/banto/tagCsv.ts::ParsedCsvTagRow.lineNumber` — ヘッダ行=1,
+								最初のデータ行=2）。
+							-->
+							<td>{parsedRows[rowError.index]?.lineNumber ?? `#${rowError.index}`}</td>
+							<td>{fe.field}</td>
+							<td>{fe.message}</td>
+						</tr>
+					{/each}
+				{/each}
+			</tbody>
+		</table>
+	{/if}
+{/snippet}
+
 <div class="page">
 	<h2>タグ登録</h2>
 
@@ -778,6 +969,9 @@
 				type="button"
 				class:active={mode === 'continuous'}
 				onclick={() => (mode = 'continuous')}>連続登録</button
+			>
+			<button type="button" class:active={mode === 'csv'} onclick={() => (mode = 'csv')}
+				>CSVインポート</button
 			>
 		</div>
 	{/if}
@@ -895,8 +1089,95 @@
 		</section>
 	{/if}
 
+	{#if canWrite && mode === 'csv'}
+		<section class="create">
+			<h3>CSVインポート</h3>
+			<p class="note">
+				CSVファイル（列名ヘッダ付き・タグ登録フォームの項目と1:1対応、接続・グループは名前で参照 —
+				存在しない名前はエラーになります。自動作成はしません）をアップロードすると、
+				内容を検証してからプレビュー表示します。連続登録と同じく「検証 → 登録」の2段階で、
+				<strong>新規登録専用</strong>です（既存タグの更新/upsert には対応していません）。
+				エクスポートしたCSVをそのまま再インポートすると、全行が名前重複エラーになります
+				（想定どおりの挙動です）。
+			</p>
+			<div class="field">
+				<input
+					type="file"
+					accept=".csv"
+					bind:this={csvFileInputEl}
+					onchange={handleCsvFileChange}
+				/>
+			</div>
+
+			{#if csvParseResult && !csvParseResult.ok}
+				<h4>エラー（{csvParseResult.errors.length}件）</h4>
+				<p class="note">ファイルを修正して再アップロードしてください。</p>
+				<div class="preview-wrap">
+					{@render csvParseErrors(csvParseResult.errors)}
+				</div>
+			{:else if csvParseResult?.ok && csvParseResult.rows.length === 0}
+				<p class="note">インポートする行がありません。</p>
+			{:else if csvParseResult?.ok}
+				<h4>プレビュー（{csvParseResult.rows.length}件）</h4>
+				<div class="preview-wrap">
+					<table class="preview-table">
+						<thead>
+							<tr>
+								<th>行</th>
+								<th>接続</th>
+								<th>グループ</th>
+								<th>名前</th>
+								<th>アドレス</th>
+								<th>データ型</th>
+								<th>種別</th>
+								<th>有効</th>
+								<th>書き込み可</th>
+							</tr>
+						</thead>
+						<tbody>
+							{#each csvParseResult.rows as row (row.lineNumber)}
+								<tr>
+									<td>{row.lineNumber}</td>
+									<td>{row.connectionName}</td>
+									<td>{row.groupName}</td>
+									<td>{row.tag.name}</td>
+									<td>{row.tag.address}</td>
+									<td>{row.tag.dataType}</td>
+									<td>{row.tag.tagKind ?? 'plc'}</td>
+									<td>{row.tag.enabled ? 'はい' : 'いいえ'}</td>
+									<td>{row.tag.writable ? 'はい' : 'いいえ'}</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+				</div>
+
+				{#if csvValidationResult}
+					{@render csvBatchRowErrors(csvValidationResult, csvParseResult.rows)}
+				{/if}
+
+				<div class="actions">
+					<button type="button" onclick={handleValidateCsv} disabled={csvValidating}>検証</button>
+					<button
+						type="button"
+						onclick={handleApplyCsv}
+						disabled={!csvValidatedFresh || csvApplying}>登録</button
+					>
+					{#if !csvValidatedFresh}
+						<span class="hint"
+							>先に「検証」を実行してください（ファイルを差し替えると再検証が必要）。</span
+						>
+					{/if}
+				</div>
+			{/if}
+		</section>
+	{/if}
+
 	<section class="list">
 		<h3>一覧</h3>
+		<div class="actions">
+			<button type="button" onclick={handleExportCsv}>CSVエクスポート</button>
+		</div>
 		<p class="note">
 			{canWrite
 				? '行をクリックすると下に編集パネルが表示されます。'
