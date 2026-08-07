@@ -58,8 +58,16 @@ struct TempEnv {
 impl TempEnv {
     fn new(label: &str) -> Self {
         let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+        // remove_dir_all は Windows では SQLite 接続がハンドルを解放し切る前に
+        // 呼ばれて失敗することがあり、その場合ディレクトリが残り続ける。PID
+        // だけでは再利用時に古い(既に初期化済みの)ディレクトリと衝突しうる
+        // ため、ナノ秒精度のタイムスタンプも一意性キーに含める。
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "banto-hub-t11-1-it-{}-{label}-{id}",
+            "banto-hub-t11-1-it-{}-{label}-{id}-{nanos}",
             std::process::id()
         ));
         std::fs::create_dir_all(&root).expect("create temp env");
