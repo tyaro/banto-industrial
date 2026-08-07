@@ -178,6 +178,41 @@ retain`（`TagInput` の全フィールドと1:1対応、`collectionGroupId` だ
   プロトコル不一致、という誤設定も検出するため
 - タイムアウトは短め（数秒）に固定。結果は成功/失敗 + 失敗理由を返す
 
+**実装メモ（2026-08-07）**:
+
+- API: `POST /api/plc-connections/test`（editor+・CSRF、既存の
+  `/api/plc-connections/*` と同じ管理系の流儀）。リクエストは
+  `{ protocol, host, port, unitId, simulation, connectionId? }` — 設計時の
+  想定に加え `simulation`（フォームのチェックボックスの現在値）を明示的に
+  送らせる形にした。理由: 保存済み行の `simulation` を見るだけだと、編集中
+  にチェックボックスを ON にしたがまだ保存していない状態を検出できない
+  ため。応答は `{ ok, elapsedMs, error: { kind, message } | null }`、常に
+  HTTP 200（`ok: false` は「疎通確認の結果が失敗だった」という通常の応答
+  であって例外ではないという判断 — T11-1 の一括登録 API と同じ設計判断）。
+  `kind` は `"tcp" | "timeout" | "protocol" | "device" | "unsupported"` の
+  5分類（運用手順は
+  [banto-hub-operations.md §17](banto-hub-operations.md#17-plc-接続テスト)
+  参照）。
+- **実機 R08ENCPU の SLMP 同時セッション数上限（1本、実測）への対策**:
+  保存済み接続（`connectionId` あり）をテストする際、その接続の broker
+  セッションが既に生きていれば新たにダイヤルせず**既存セッション経由で
+  読む**（`apps/banto-hub/core/src/broker_glue.rs::HubSessions::handle_for`
+  — 新規セッションを起動しない読み取り専用の覗き見として追加）。無ければ
+  直接ダイヤルにフォールバックし、この場合と未保存接続のテストの両方で、
+  SLMP の失敗メッセージにセッション数上限の注意文言を付ける。Modbus は
+  同時接続数の制約が緩い機種が多いため常に直接ダイヤルするが、失敗時には
+  同種の（軽い）注意文言を付けている。
+- **`/api/plc-connections/*` は意図的に OpenAPI（utoipa）の対象外のまま**:
+  utoipa がドキュメント化しているのは `/api/v1/*`（機械クライアント向け
+  タグ空間 API）のみで、管理系の create/update/delete も元々対象外だった
+  ため、この方針を維持した（新規にドキュメント対象を広げなかった）。
+- OpenAPI 上記の理由で変更なし。テストは
+  `apps/banto-hub/core/tests/t12_connection_test.rs`（Modbus/SLMP 成功・
+  失敗、broker 経由の既存セッション再利用、virtual/simulation 拒否、RBAC）。
+- UI: 「PLC接続」ページの作成・編集フォーム（共通の `connectionFields`
+  スニペット）に接続テストボタンを追加。編集フォームのみ `connectionId`
+  を送る。作成/編集で独立したテスト実行状態を持ち、多重クリックを防止。
+
 ## 5. バックログ（次点、未着手 — 優先度はオーナー判断）
 
 - タグモニタ行のスパークライン（tstore 履歴の簡易表示。本格トレンドは

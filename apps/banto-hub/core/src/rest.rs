@@ -46,6 +46,7 @@
 //! catalog に定義そのものが存在しない外部名だけ。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -53,9 +54,18 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use banto_broker::BrokerConnectionStatus;
+use banto_broker::{BrokerConnectionStatus, BrokerError};
 use banto_collect::{ApplyReport, ConnectionStatus};
 use banto_core::{BantoError, ErrorBody, FieldError, ListParams, ListResult};
+// T12 (docs/ux-plan.md §4): 保存前の接続テスト API 用。Modbus/SLMP 両方の
+// 直接ダイヤル経路が同じ型を使うので、ここで一括 import する
+// (`BatchReadRequest`/`BatchReadResult`は`banto_broker`ではなく`banto_plc`が
+// 定義元 - `banto_broker::BrokerHandle::read`/`ReadOnlyHandle::read`が
+// 引数・戻り値としてそのまま使っている)。
+use banto_plc::{
+    Address, BatchReadRequest, BatchReadResult, DataType, ModbusTcpClient, ModbusTcpConfig,
+    PlcClient, PlcError, ReadRequest, ReadResult, SlmpClient, SlmpConfig,
+};
 use banto_server::{
     auth_routes, require_auth, require_banto_client_header, sse_route, ApiError, AuthState,
     Identity, ServerEvent,
@@ -1704,6 +1714,425 @@ async fn plc_connections_delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// --- T12 (docs/ux-plan.md §4): 保存前の接続テスト ---------------------------
+//
+// `POST /api/plc-connections/test` は保存不要でホスト/ポート/プロトコルの
+// 疎通を確認する - TCP 接続だけでなく実プロトコルで軽い読み出し1回
+// (先頭デバイス1点)まで行うことで、ポートは開いているがプロトコル不一致、
+// という誤設定も検出する(§4 の設計方針)。レジストリへの書き込みが一切
+// 発生しない読み取り専用の疎通確認なので、`record_write`/`rebuild_and_notify`
+// は呼ばない。
+//
+// 重要な制約(実機 R08ENCPU、`crates/banto-broker/src/lib.rs`のモジュール
+// doc、`crate::broker_glue`のモジュール doc「Session sync policy」節参照):
+// 三菱 SLMP は同時 TCP セッションを1本しか受け付けない機種があるため、
+// 保存済み接続(`connectionId`あり)のテストは、既存の broker セッションが
+// 生きていればそれを再利用して読み、無い場合のみ直接ダイヤルする
+// ([`test_slmp_connection`]参照)。
+
+/// 接続テストの疎通確認に使うタイムアウト(接続・応答とも共通)。数秒固定
+/// (ux-plan.md §4「タイムアウトは短め（数秒）に固定」)。
+const PLC_TEST_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Modbus 直接ダイヤル失敗時に付けるセッション上限ヒント - 「軽く付けてよい」
+/// 扱い(実機依存が明確でないため断定しない)。
+const MODBUS_SESSION_HINT: &str =
+    " 対象PLCが既に別セッションと接続中の場合、機種によっては同時接続数の上限により失敗することがあります。";
+
+/// SLMP 直接ダイヤル失敗時に付けるセッション上限ヒント - 実機 R08ENCPU で
+/// 同時1セッションまでの実測があるため必須ヒントとする。
+const SLMP_SESSION_HINT: &str = " 対象PLCが既に別セッション(この hub の収集や他アプリ)と接続中の場合、SLMPのセッション数上限により接続できないことがあります(実機R08ENCPUでは同時1セッションまでの実測あり)。";
+
+/// `POST /api/plc-connections/test` のリクエストボディ - 保存前のフォーム値を
+/// そのまま受け取る(`PlcConnectionPayload`とは別型: 接続 id を持たないのが
+/// 通常で、保存済み接続の編集中のみ`connectionId`を添える)。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlcConnectionTestPayload {
+    pub protocol: String,
+    pub host: String,
+    pub port: i64,
+    #[serde(default = "default_plc_unit_id")]
+    pub unit_id: i64,
+    /// フォームの「シミュレーションモード」チェックボックスの現在値。
+    /// シミュレーション接続のテストは常に内蔵シミュレータへ繋がり無意味なので
+    /// 拒否する(ux-plan.md §4「protocol: virtual と simulation: true 相当の
+    /// テストは明示エラー」)。保存済み行の simulation フラグではなく、
+    /// フォームの現在値をそのまま送らせる設計(未保存の編集中でも即座に弾ける
+    /// ようにするため)。
+    #[serde(default)]
+    pub simulation: bool,
+    /// 保存済み接続を編集中にテストする場合のみ送る。broker 経由の既存
+    /// セッション判定にのみ使う(接続情報自体は上記 host/port/protocol/unitId
+    /// を毎回使う - フォームの現在入力値をテストするのがこの API の目的の
+    /// ため)。
+    #[serde(default)]
+    pub connection_id: Option<i64>,
+}
+
+/// `POST /api/plc-connections/test` の応答。`ToSchema` は付けない - 下記
+/// `plc_connections_test`のdoc comment参照。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlcConnectionTestResponse {
+    pub ok: bool,
+    pub elapsed_ms: u64,
+    pub error: Option<PlcConnectionTestError>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlcConnectionTestError {
+    /// "tcp" | "timeout" | "protocol" | "device" | "unsupported"
+    pub kind: String,
+    /// 日本語、対処ヒント込み。
+    pub message: String,
+}
+
+/// [`PlcError`]を[`PlcConnectionTestError`]に分類する(Modbus・SLMP直接
+/// ダイヤル共用、`crates/banto-plc/src/error.rs`の各バリアント参照)。
+/// `hint`が`Some`のとき、分類結果の`kind`が`"tcp"`または`"timeout"`のときだけ
+/// 末尾に付加する(それ以外の kind には無関係な文言なので付けない) -
+/// 呼び出し側は「セッション上限ヒントを付けたい経路」でだけ`Some`を渡す。
+/// broker 経由の既存セッション再利用経路(`test_slmp_connection`の前半)は
+/// このヒントが無関係( 「2本目をダイヤルしない」ことそのものが対策なので)
+/// なので常に`None`を渡す。
+fn classify_plc_error(err: &PlcError, hint: Option<&str>) -> PlcConnectionTestError {
+    let (kind, message) = match err {
+        PlcError::ConnectTimeout(_) => (
+            "timeout",
+            "接続タイムアウトです(3秒)。ホスト/ポート、ネットワーク到達性を確認してください。"
+                .to_string(),
+        ),
+        PlcError::ResponseTimeout => (
+            "timeout",
+            "応答タイムアウトです(3秒)。接続はできましたが応答がありませんでした。".to_string(),
+        ),
+        PlcError::Connection(msg) => (
+            "tcp",
+            format!("TCP接続に失敗しました(ポートが閉じている、または到達できません): {msg}"),
+        ),
+        PlcError::Protocol(msg) => (
+            "protocol",
+            format!(
+                "プロトコルエラー: 応答が不正です({msg})。プロトコル選択やポート番号が実機と一致しているか確認してください。"
+            ),
+        ),
+        PlcError::ModbusException { message, .. } | PlcError::SlmpEndCode { message, .. } => (
+            "device",
+            format!(
+                "デバイス読み出しエラー: 接続はできましたが、指定したデバイス/レジスタを読み出せませんでした({message})。アドレス設定や機種依存の可能性があります(致命的ではありません)。"
+            ),
+        ),
+        // NotConnected / InvalidAddress / AddressProtocolMismatch /
+        // UnsupportedCombination / StringSpanUnsupported - このAPIは固定
+        // アドレス("40001"/"D0")しか使わないので通常発生しない防御的ケース。
+        other => ("device", format!("読み出しに失敗しました: {other}")),
+    };
+    let mut message = message;
+    if matches!(kind, "tcp" | "timeout") {
+        if let Some(hint) = hint {
+            message.push_str(hint);
+        }
+    }
+    PlcConnectionTestError {
+        kind: kind.to_string(),
+        message,
+    }
+}
+
+/// Modbus TCP の接続テスト - 直接ダイヤルのみ(Modbusには broker/共有
+/// セッションの概念がない)。ポート/ユニットIDの範囲検証 →
+/// `ModbusTcpClient::connect` → 保持レジスタ先頭1点の`read_batch` → 必ず
+/// `disconnect`、の順で行う。
+async fn test_modbus_connection(
+    payload: &PlcConnectionTestPayload,
+) -> (bool, Option<PlcConnectionTestError>) {
+    let port = match u16::try_from(payload.port) {
+        Ok(port) => port,
+        Err(_) => {
+            return (
+                false,
+                Some(PlcConnectionTestError {
+                    kind: "tcp".to_string(),
+                    message: "ポート番号が不正です(1〜65535の範囲で指定してください)。".to_string(),
+                }),
+            );
+        }
+    };
+    let unit_id = match u8::try_from(payload.unit_id) {
+        Ok(unit_id) => unit_id,
+        Err(_) => {
+            return (
+                false,
+                Some(PlcConnectionTestError {
+                    kind: "tcp".to_string(),
+                    message: "ユニットID(スレーブID)が不正です(0〜255の範囲で指定してください)。"
+                        .to_string(),
+                }),
+            );
+        }
+    };
+
+    let config = ModbusTcpConfig {
+        host: payload.host.clone(),
+        port,
+        unit_id,
+        connect_timeout: PLC_TEST_TIMEOUT,
+        response_timeout: PLC_TEST_TIMEOUT,
+        ..Default::default()
+    };
+    let mut client = ModbusTcpClient::new(config);
+
+    if let Err(err) = client.connect().await {
+        return (
+            false,
+            Some(classify_plc_error(&err, Some(MODBUS_SESSION_HINT))),
+        );
+    }
+
+    // 保持レジスタ先頭を1点読む - テストで固定した文字列リテラルなので parse
+    // は失敗し得ない。
+    let requests = [ReadRequest {
+        address: Address::parse("40001").expect("valid literal"),
+        data_type: DataType::U16,
+    }];
+    let read_result = client.read_batch(&requests).await;
+    client.disconnect().await;
+
+    match read_result {
+        Ok(mut results) => match results.pop() {
+            Some(ReadResult::Value(_)) => (true, None),
+            Some(ReadResult::Bad(err)) => (
+                false,
+                Some(classify_plc_error(&err, Some(MODBUS_SESSION_HINT))),
+            ),
+            None => (
+                false,
+                Some(PlcConnectionTestError {
+                    kind: "device".to_string(),
+                    message: "読み出し結果が空でした。".to_string(),
+                }),
+            ),
+        },
+        Err(err) => (
+            false,
+            Some(classify_plc_error(&err, Some(MODBUS_SESSION_HINT))),
+        ),
+    }
+}
+
+/// SLMP の接続テスト。`payload.connection_id`があり、その接続の broker
+/// セッションが既に生きていれば、それを再利用して読む(新規ダイヤルしない -
+/// 実機 R08ENCPU の SLMP 同時セッション数上限を誤診しないため、この
+/// モジュール冒頭のコメント参照)。無ければ直接ダイヤルにフォールバックする。
+async fn test_slmp_connection(
+    state: &TagRegistryState,
+    payload: &PlcConnectionTestPayload,
+) -> (bool, Option<PlcConnectionTestError>) {
+    if let Some(connection_id) = payload.connection_id {
+        if let Some(handle) = state.manager.sessions().handle_for(connection_id) {
+            let requests = vec![BatchReadRequest::Numeric(ReadRequest {
+                address: Address::parse_slmp("D0").expect("valid literal"),
+                data_type: DataType::U16,
+            })];
+            // `ReadOnlyHandle::read`自体には外側タイムアウトが無いため、
+            // ここで明示的に包む(実装指示どおり)。
+            return match tokio::time::timeout(PLC_TEST_TIMEOUT, handle.read(requests)).await {
+                Err(_elapsed) => (
+                    false,
+                    Some(PlcConnectionTestError {
+                        kind: "timeout".to_string(),
+                        message: "応答タイムアウトです(3秒)。共有セッションが応答しませんでした。"
+                            .to_string(),
+                    }),
+                ),
+                Ok(Err(BrokerError::Disconnected { .. })) => (
+                    false,
+                    Some(PlcConnectionTestError {
+                        kind: "tcp".to_string(),
+                        message: "この接続の共有セッションは現在切断中です(再接続待機中)。PLCの電源やネットワーク、または他アプリとのセッション競合を確認してください。"
+                            .to_string(),
+                    }),
+                ),
+                Ok(Err(BrokerError::ConnectionFailed { reason, .. })) => (
+                    false,
+                    Some(PlcConnectionTestError {
+                        kind: "tcp".to_string(),
+                        message: format!("共有セッションが接続断で失敗しました: {reason}"),
+                    }),
+                ),
+                Ok(Err(BrokerError::TaskGone { .. })) => (
+                    false,
+                    Some(PlcConnectionTestError {
+                        kind: "tcp".to_string(),
+                        message: "内部エラー: セッションタスクが終了しています。".to_string(),
+                    }),
+                ),
+                // 防御的フォールバック: この経路では通常発生しない
+                // (UnsupportedProtocol/InvalidPortはensure_connection時点で
+                // 弾かれているはず)。
+                Ok(Err(err @ BrokerError::UnsupportedProtocol { .. }))
+                | Ok(Err(err @ BrokerError::InvalidPort { .. })) => (
+                    false,
+                    Some(PlcConnectionTestError {
+                        kind: "protocol".to_string(),
+                        message: err.to_string(),
+                    }),
+                ),
+                // 既存セッション再利用経路: セッション上限ヒントは付けない
+                // (design の意図: 「2本目をダイヤルしない」こと自体が対策)。
+                Ok(Ok(mut results)) => match results.pop() {
+                    Some(BatchReadResult::Value(_)) => (true, None),
+                    Some(BatchReadResult::Bad(err)) => {
+                        (false, Some(classify_plc_error(&err, None)))
+                    }
+                    None => (
+                        false,
+                        Some(PlcConnectionTestError {
+                            kind: "device".to_string(),
+                            message: "読み出し結果が空でした。".to_string(),
+                        }),
+                    ),
+                },
+            };
+        }
+    }
+
+    // 直接ダイヤル(connectionId が無い、またはセッションが見つからない場合)。
+    // SLMP は unit_id を使わないので port のみ検証する。
+    let port = match u16::try_from(payload.port) {
+        Ok(port) => port,
+        Err(_) => {
+            return (
+                false,
+                Some(PlcConnectionTestError {
+                    kind: "tcp".to_string(),
+                    message: "ポート番号が不正です(1〜65535の範囲で指定してください)。".to_string(),
+                }),
+            );
+        }
+    };
+
+    let config = SlmpConfig {
+        host: payload.host.clone(),
+        port,
+        connect_timeout: PLC_TEST_TIMEOUT,
+        response_timeout: PLC_TEST_TIMEOUT,
+        ..Default::default()
+    };
+    let mut client = SlmpClient::new(config);
+
+    if let Err(err) = client.connect().await {
+        return (
+            false,
+            Some(classify_plc_error(&err, Some(SLMP_SESSION_HINT))),
+        );
+    }
+
+    let requests = [ReadRequest {
+        address: Address::parse_slmp("D0").expect("valid literal"),
+        data_type: DataType::U16,
+    }];
+    let read_result = client.read_batch(&requests).await;
+    client.disconnect().await;
+
+    match read_result {
+        Ok(mut results) => match results.pop() {
+            Some(ReadResult::Value(_)) => (true, None),
+            Some(ReadResult::Bad(err)) => (
+                false,
+                Some(classify_plc_error(&err, Some(SLMP_SESSION_HINT))),
+            ),
+            None => (
+                false,
+                Some(PlcConnectionTestError {
+                    kind: "device".to_string(),
+                    message: "読み出し結果が空でした。".to_string(),
+                }),
+            ),
+        },
+        Err(err) => (
+            false,
+            Some(classify_plc_error(&err, Some(SLMP_SESSION_HINT))),
+        ),
+    }
+}
+
+/// `POST /api/plc-connections/test` - T12(docs/ux-plan.md §4)。保存前に
+/// host/port/protocol の疎通確認(実プロトコルでの軽い読み出し1回まで)を
+/// 行う。**意図的に** `#[utoipa::path]`を付けず`ApiDoc::paths(...)`にも
+/// 加えない - utoipa がドキュメント対象にしているのは`/api/v1/*`の機械
+/// クライアント向け API のみで(このファイル冒頭「二系統に分かれた
+/// ルーター」節参照)、他の`/api/plc-connections/*`管理ハンドラ
+/// (create/update/delete)も同様に対象外にしている。ここだけドキュメント
+/// 対象を広げると既存方針と矛盾するため、意図的に対象外のままにする。
+///
+/// 権限は他の I1 書き込みハンドラと同じ`require_editor`。CSRF は
+/// `tag_registry_router`が属する管理系ルーター全体に既に`require_banto_client_header`
+/// がかかっているので、ここでの追加対応は不要。
+///
+/// 失敗(`ok: false`)は通常の 200 応答として返す(`tags_batch`と同じ
+/// 「ok:false は通常の応答」という判断) - レジストリへの書き込みが一切
+/// 発生しない読み取り専用の疎通確認なので、監査ログ記録(`record_write`)や
+/// `rebuild_and_notify`は呼ばない。
+async fn plc_connections_test(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Json(payload): Json<PlcConnectionTestPayload>,
+) -> Result<Json<PlcConnectionTestResponse>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "plc_connections",
+        "POST",
+        "/api/plc-connections/test",
+    )
+    .await?;
+
+    let started = std::time::Instant::now();
+
+    // ガード: virtual / simulation / 未知プロトコルは即座に ok:false, kind:
+    // "unsupported"(実プロトコルの疎通確認より前に判定)。
+    let (ok, error) = if payload.protocol == "virtual" {
+        (
+            false,
+            Some(PlcConnectionTestError {
+                kind: "unsupported".to_string(),
+                message: "virtual接続はテスト対象外です(calc/mem予約接続)。".to_string(),
+            }),
+        )
+    } else if payload.simulation {
+        (
+            false,
+            Some(PlcConnectionTestError {
+                kind: "unsupported".to_string(),
+                message: "シミュレーション接続はテスト不要です(常に内蔵シミュレータに接続され、常に成功します)。"
+                    .to_string(),
+            }),
+        )
+    } else {
+        match payload.protocol.as_str() {
+            "modbus-tcp" => test_modbus_connection(&payload).await,
+            "slmp" => test_slmp_connection(&state, &payload).await,
+            other => (
+                false,
+                Some(PlcConnectionTestError {
+                    kind: "unsupported".to_string(),
+                    message: format!("不明なプロトコルです: {other}"),
+                }),
+            ),
+        }
+    };
+
+    Ok(Json(PlcConnectionTestResponse {
+        ok,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        error,
+    }))
+}
+
 async fn collection_groups_list(
     State(state): State<TagRegistryState>,
 ) -> Result<Json<Vec<CollectionGroup>>, ApiError> {
@@ -2088,6 +2517,10 @@ fn tag_registry_router(
                 .put(plc_connections_update)
                 .delete(plc_connections_delete),
         )
+        // T12 (docs/ux-plan.md §4): 保存前の接続テスト - `{id}` の下ではなく
+        // 固定パスなので `/api/plc-connections/{id}` と衝突しない
+        // (下の `/api/tags/batch` と同型のパス設計)。
+        .route("/api/plc-connections/test", post(plc_connections_test))
         .route(
             "/api/collection-groups",
             get(collection_groups_list).post(collection_groups_create),

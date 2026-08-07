@@ -37,8 +37,10 @@
 		updatePlcConnection,
 		deletePlcConnection,
 		isVirtualConnection,
+		testPlcConnection,
 		type PlcConnection,
 		type PlcConnectionInput,
+		type PlcConnectionTestResult,
 		type PlcProtocol
 	} from '$lib/banto/tagRegistryAdmin';
 
@@ -105,6 +107,53 @@
 		};
 	}
 
+	/**
+	 * T12 (docs/ux-plan.md §4): 接続テストの実行状態。作成・編集フォームの
+	 * それぞれが独立した `TestState` を持つ（片方のテスト中でももう片方を
+	 * 操作でき、結果表示も混ざらない）。
+	 */
+	interface TestState {
+		testing: boolean;
+		result: PlcConnectionTestResult | null;
+	}
+
+	function blankTestState(): TestState {
+		return { testing: false, result: null };
+	}
+
+	/**
+	 * `connectionId` は「保存済み接続の編集フォームからのテスト」のときだけ
+	 * `selected.id` を渡す（作成フォームは常に `undefined`）。`testState` は
+	 * 呼び出し元（作成/編集の各セクション）が持つ状態を直接渡してもらい、
+	 * ここで書き換える — `connectionFields` スニペットは作成・編集で共有
+	 * されているため、状態も呼び出し元から注入する形にした。
+	 */
+	async function runConnectionTest(
+		form: FormState,
+		connectionId: number | undefined,
+		testState: TestState
+	): Promise<void> {
+		if (testState.testing) return; // 多重クリック防止
+		testState.testing = true;
+		testState.result = null;
+		try {
+			testState.result = await testPlcConnection({
+				protocol: form.protocol,
+				host: form.host,
+				port: Number(form.port),
+				unitId: Number(form.unitId),
+				simulation: form.simulation,
+				connectionId
+			});
+		} catch (err) {
+			// 401/403・CSRF拒否・ネットワークエラーなど（`ok: false` はここに来ない
+			// 通常応答 — 上の try 内で result にそのまま入る）。
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			testState.testing = false;
+		}
+	}
+
 	let connections: PlcConnection[] = $state([]);
 	let loading = $state(false);
 
@@ -127,6 +176,7 @@
 	let createForm = $state(blankForm());
 	let createErrors: Record<string, string> = $state({});
 	let creating = $state(false);
+	let createTestState: TestState = $state(blankTestState());
 
 	function applyFieldErrors(err: unknown): Record<string, string> | null {
 		if (isProviderError(err) && err.body.kind === 'validation') {
@@ -144,6 +194,7 @@
 			await createPlcConnection(toInput(createForm));
 			toastStore.push('success', '作成しました');
 			createForm = blankForm();
+			createTestState = blankTestState();
 			await reload();
 		} catch (err) {
 			const fieldErrors = applyFieldErrors(err);
@@ -159,6 +210,7 @@
 	let editForm = $state(blankForm());
 	let editErrors: Record<string, string> = $state({});
 	let saving = $state(false);
+	let editTestState: TestState = $state(blankTestState());
 
 	function selectConnection(c: PlcConnection): void {
 		if (isVirtualConnection(c)) {
@@ -171,6 +223,9 @@
 		selected = c;
 		editForm = formFromConnection(c);
 		editErrors = {};
+		// 別の接続に切り替えたら、直前の接続テスト結果は無関係になるので消す
+		// （表示が残ると「今開いている接続のテスト結果」に見えて誤解を招くため）。
+		editTestState = blankTestState();
 	}
 
 	async function saveEdit(): Promise<void> {
@@ -269,7 +324,12 @@
 	}
 </script>
 
-{#snippet connectionFields(form: FormState, errors: Record<string, string>)}
+{#snippet connectionFields(
+	form: FormState,
+	errors: Record<string, string>,
+	connectionId: number | undefined,
+	testState: TestState
+)}
 	<div class="form-grid">
 		<label class="field">
 			名前
@@ -313,6 +373,28 @@
 			実PLCの代わりに内蔵シミュレータに接続します（開発・検証用）。本番運用では有効にしないでください。
 		</span>
 	</div>
+	<div class="test-connection">
+		<button
+			type="button"
+			class="test-btn"
+			onclick={() => runConnectionTest(form, connectionId, testState)}
+			disabled={testState.testing}
+		>
+			{#if testState.testing}<span class="spinner" aria-hidden="true"></span>{/if}
+			接続テスト
+		</button>
+		{#if testState.testing}
+			<span class="test-result testing">テスト中…</span>
+		{:else if testState.result}
+			{#if testState.result.ok}
+				<span class="test-result ok">接続成功（応答 {testState.result.elapsedMs}ms）</span>
+			{:else}
+				<span class="test-result error"
+					>{testState.result.error?.message ?? '接続に失敗しました'}</span
+				>
+			{/if}
+		{/if}
+	</div>
 {/snippet}
 
 <div class="page">
@@ -321,7 +403,7 @@
 	{#if canWrite}
 		<section class="create">
 			<h3>新規作成</h3>
-			{@render connectionFields(createForm, createErrors)}
+			{@render connectionFields(createForm, createErrors, undefined, createTestState)}
 			<button type="button" onclick={handleCreate} disabled={creating}>作成</button>
 		</section>
 	{/if}
@@ -354,7 +436,7 @@
 	{#if selected && canWrite}
 		<section class="detail">
 			<h3>{selected.name} を編集</h3>
-			{@render connectionFields(editForm, editErrors)}
+			{@render connectionFields(editForm, editErrors, selected.id, editTestState)}
 			<div class="actions">
 				<button type="button" onclick={saveEdit} disabled={saving}>保存</button>
 				<button type="button" class="danger" onclick={handleDelete}>削除</button>
@@ -480,6 +562,61 @@
 	.actions {
 		display: flex;
 		gap: 0.75rem;
+	}
+
+	/* T12 (docs/ux-plan.md §4): 接続テストボタン + インライン結果表示。 */
+	.test-connection {
+		display: flex;
+		align-items: center;
+		gap: 0.6rem;
+		margin-bottom: 0.75rem;
+	}
+
+	.test-btn {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+		background: var(--banto-bg);
+		color: var(--banto-text);
+		border: 1px solid var(--banto-border);
+		font-weight: 500;
+	}
+
+	.test-btn:hover:not(:disabled) {
+		background: var(--banto-surface);
+	}
+
+	.spinner {
+		width: 0.85rem;
+		height: 0.85rem;
+		border: 2px solid color-mix(in srgb, var(--banto-text) 25%, transparent);
+		border-top-color: var(--banto-text);
+		border-radius: 50%;
+		animation: spin 0.7s linear infinite;
+	}
+
+	@keyframes spin {
+		to {
+			transform: rotate(360deg);
+		}
+	}
+
+	.test-result {
+		font-size: 0.8rem;
+	}
+
+	.test-result.testing {
+		color: var(--banto-text-muted);
+	}
+
+	.test-result.ok {
+		color: var(--banto-success, #1a7f37);
+		font-weight: 600;
+	}
+
+	.test-result.error {
+		color: var(--banto-danger);
+		font-weight: 600;
 	}
 
 	button {
