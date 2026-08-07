@@ -441,15 +441,25 @@ pub fn spawn_test_handle_answering_ok(connection_id: i64) -> (BrokerHandle, Join
 
 /// A shared, growable directory of live broker sessions - the seam a caller
 /// like relay-wright's タグモニタ (tag monitor, feature/tag-monitor) uses to
-/// reach the SAME one-session-per-CPU broker tasks the engine itself
+/// reach the SAME one-session-per-connection broker tasks the engine itself
 /// reads/writes through.
 ///
-/// ## Why this exists (hard constraint: one SLMP session per CPU)
+/// ## Why this exists (hard constraint: one SLMP session per connected port)
 ///
-/// The real R08ENCPU accepts only ONE concurrent SLMP TCP connection (verified
-/// on hardware: a second connect times out), so a monitor-style caller must
-/// never open its own `SlmpClient` - every such read AND manual write goes
-/// through the broker task that already owns that CPU's single session.
+/// The real R08ENCPU accepts only ONE concurrent SLMP TCP connection **per
+/// port** (verified on hardware 2026-08-07: a second connect to a port that
+/// already has a live session times out, while separate ports opened via the
+/// CPU's own parameters each carry their own simultaneous session fine - the
+/// 2026-08-06 note this doc previously carried, "only ONE concurrent SLMP TCP
+/// connection" with no qualifier, over-read that single-port observation as a
+/// whole-CPU limit). This still means a monitor-style caller must never open
+/// its own `SlmpClient` against a connection this crate already manages -
+/// every such read AND manual write goes through the broker task that already
+/// owns that connection's one session on its one port - because
+/// [`banto_tags::PlcConnection`] fixes one port per connection row; nothing
+/// here changes with the correction, since the broker's value was always
+/// "serialize read/write on the one session a connection actually holds", not
+/// "the CPU can only ever have one session total".
 ///
 /// ## On-demand sessions
 ///

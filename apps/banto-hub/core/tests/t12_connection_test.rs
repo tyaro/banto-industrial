@@ -448,7 +448,8 @@ async fn slmp_test_reuses_existing_broker_session_without_dialing_a_second_conne
     // Test the connection with `connectionId` set - this must reuse the
     // existing broker session rather than dialing a second one (the whole
     // point of T12's broker-reuse design: the real R08ENCPU only accepts one
-    // concurrent SLMP session).
+    // concurrent SLMP session per port, and this connection's port already
+    // has the broker's own session on it).
     let (status, body) = admin_write(
         &app.router,
         "POST",

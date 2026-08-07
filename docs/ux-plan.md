@@ -193,15 +193,15 @@ retain`（`TagInput` の全フィールドと1:1対応、`collectionGroupId` だ
   5分類（運用手順は
   [banto-hub-operations.md §17](banto-hub-operations.md#17-plc-接続テスト)
   参照）。
-- **実機 R08ENCPU の SLMP 同時セッション数上限（1本、実測）への対策**:
+- **実機 R08ENCPU の SLMP は対象ポートにつき同時1接続まで（実測）への対策**:
   保存済み接続（`connectionId` あり）をテストする際、その接続の broker
   セッションが既に生きていれば新たにダイヤルせず**既存セッション経由で
   読む**（`apps/banto-hub/core/src/broker_glue.rs::HubSessions::handle_for`
   — 新規セッションを起動しない読み取り専用の覗き見として追加）。無ければ
   直接ダイヤルにフォールバックし、この場合と未保存接続のテストの両方で、
-  SLMP の失敗メッセージにセッション数上限の注意文言を付ける。Modbus は
-  同時接続数の制約が緩い機種が多いため常に直接ダイヤルするが、失敗時には
-  同種の（軽い）注意文言を付けている。
+  SLMP の失敗メッセージに対象ポートが使用中の可能性がある旨の注意文言を
+  付ける。Modbus は同時接続数の制約が緩い機種が多いため常に直接ダイヤル
+  するが、失敗時には同種の（軽い）注意文言を付けている。
 - **`/api/plc-connections/*` は意図的に OpenAPI（utoipa）の対象外のまま**:
   utoipa がドキュメント化しているのは `/api/v1/*`（機械クライアント向け
   タグ空間 API）のみで、管理系の create/update/delete も元々対象外だった

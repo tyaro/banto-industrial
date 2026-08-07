@@ -1725,10 +1725,11 @@ async fn plc_connections_delete(
 //
 // 重要な制約(実機 R08ENCPU、`crates/banto-broker/src/lib.rs`のモジュール
 // doc、`crate::broker_glue`のモジュール doc「Session sync policy」節参照):
-// 三菱 SLMP は同時 TCP セッションを1本しか受け付けない機種があるため、
-// 保存済み接続(`connectionId`あり)のテストは、既存の broker セッションが
-// 生きていればそれを再利用して読み、無い場合のみ直接ダイヤルする
-// ([`test_slmp_connection`]参照)。
+// 三菱 SLMP は対象ポートが既に別の接続で使用中だと同じポートへの2本目を
+// 受け付けない(2026-08-07 実機確認: ポート毎に1接続、CPU側で複数ポートを
+// 開けていれば複数同時セッションは可能)ため、保存済み接続(`connectionId`
+// あり)のテストは、既存の broker セッションが生きていればそれを再利用して
+// 読み、無い場合のみ直接ダイヤルする([`test_slmp_connection`]参照)。
 
 /// 接続テストの疎通確認に使うタイムアウト(接続・応答とも共通)。数秒固定
 /// (ux-plan.md §4「タイムアウトは短め（数秒）に固定」)。
@@ -1740,8 +1741,9 @@ const MODBUS_SESSION_HINT: &str =
     " 対象PLCが既に別セッションと接続中の場合、機種によっては同時接続数の上限により失敗することがあります。";
 
 /// SLMP 直接ダイヤル失敗時に付けるセッション上限ヒント - 実機 R08ENCPU で
-/// 同時1セッションまでの実測があるため必須ヒントとする。
-const SLMP_SESSION_HINT: &str = " 対象PLCが既に別セッション(この hub の収集や他アプリ)と接続中の場合、SLMPのセッション数上限により接続できないことがあります(実機R08ENCPUでは同時1セッションまでの実測あり)。";
+/// 「対象ポートが既に別の接続で使用中」だと2本目を受け付けない実測がある
+/// ため必須ヒントとする。
+const SLMP_SESSION_HINT: &str = " 対象ポートが既に別の接続(この hub の収集や他アプリ)で使用中の可能性があります。SLMPは同一ポートへの2本目の接続を受け付けないことがあります(実機R08ENCPUで確認済み)。";
 
 /// `POST /api/plc-connections/test` のリクエストボディ - 保存前のフォーム値を
 /// そのまま受け取る(`PlcConnectionPayload`とは別型: 接続 id を持たないのが
@@ -1924,8 +1926,9 @@ async fn test_modbus_connection(
 
 /// SLMP の接続テスト。`payload.connection_id`があり、その接続の broker
 /// セッションが既に生きていれば、それを再利用して読む(新規ダイヤルしない -
-/// 実機 R08ENCPU の SLMP 同時セッション数上限を誤診しないため、この
-/// モジュール冒頭のコメント参照)。無ければ直接ダイヤルにフォールバックする。
+/// 実機 R08ENCPU は対象ポートが既に使用中だと2本目を受け付けないため、これを
+/// 誤診しないための対策。このモジュール冒頭のコメント参照)。無ければ直接
+/// ダイヤルにフォールバックする。
 async fn test_slmp_connection(
     state: &TagRegistryState,
     payload: &PlcConnectionTestPayload,
