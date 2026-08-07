@@ -67,28 +67,23 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      # rustfmt only parses/reformats - no compilation, so unlike the steps
-      # below it can safely cover every workspace member (including the
-      # `chronogazer`/`relay-wright` src-tauri crates) without needing their
-      # native deps built.
+      # rustfmt only parses/reformats - no compilation, so like the steps
+      # below it covers every workspace member, including the
+      # `chronogazer`/`relay-wright` src-tauri crates.
       - name: fmt
         run: cargo fmt --all --check
-      # Scope: every workspace member EXCEPT the two Tauri src-tauri crates
-      # (`chronogazer`, `relay-wright`). This is `--workspace --exclude`
-      # rather than an explicit `-p` allowlist so that new workspace members
-      # are covered automatically instead of silently being skipped by CI
-      # (see git history for the drift this caused). The exclusion itself is
-      # no longer about native/webview deps being unbuildable here - this
-      # job runs on windows-latest, so wry/WebView2 do build - it's purely to
-      # keep the job fast: pulling in the full Tauri + WebView2 toolchain for
-      # both apps would add significant build time for no test coverage
-      # (src-tauri is a thin shell over `chronogazer-core`/`relay-wright-core`,
-      # which ARE covered). Revisit if src-tauri ever grows logic worth
-      # testing directly.
+      # Scope: the whole workspace, no --exclude. The two Tauri src-tauri
+      # crates (`chronogazer`, `relay-wright`) have real tests of their own
+      # (relay-wright: 25, chronogazer: 5) - PR #39 fixed a compile error in
+      # relay-wright's src-tauri tests that a prior narrower CI scope had let
+      # through undetected (a stale field reference left behind by T2-3).
+      # So they stay in scope rather than being excluded for build-time
+      # reasons: this job runs on windows-latest with Swatinem/rust-cache,
+      # where the Tauri/WebView2 dependency build time is acceptable.
       - name: clippy
-        run: cargo clippy --workspace --exclude chronogazer --exclude relay-wright --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: test
-        run: cargo test --workspace --exclude chronogazer --exclude relay-wright
+        run: cargo test --workspace
 
   e2e:
     name: E2E (Playwright smoke)
