@@ -7,12 +7,11 @@
 //! で `Router` を直接叩くが、WebSocket のアップグレードには実際の TCP
 //! 接続 + HTTP Upgrade ハンドシェイクが要る（`oneshot` はこれを完走できない）
 //! ため、このファイルだけ `banto_server::start` で実ポートを bind する -
-//! `TempEnv`/`fast_options`/`wait_until` 等の足場は同ファイルから輸入した
-//! （各 `tests/*.rs` は独立バイナリとしてコンパイルされ、ヘルパーは共有され
-//! ないため複製している）。
+//! `fast_options`/`wait_until` 等の足場は同ファイルから輸入した（各
+//! `tests/*.rs` は独立バイナリとしてコンパイルされ、ヘルパーは共有されない
+//! ため複製している）。`TempEnv` は `tests/common/mod.rs` に集約済み
+//! （2026-08-08、テスト一時ディレクトリリークの根治）。
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -39,52 +38,18 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
-type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+mod common;
+use common::TempEnv;
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
+type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// 設計 §5.2 要件6の送信キュー容量（`stream.rs::OUTBOUND_QUEUE_CAPACITY`）と
 /// 同じ値。テスト8（バックプレッシャ）で「キューが埋まりきる」量の目安に
 /// 使う。
 const OUTBOUND_QUEUE_CAPACITY: usize = 256;
 
-struct TempEnv {
-    root: PathBuf,
-}
-
-impl TempEnv {
-    fn new(label: &str) -> Self {
-        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        // remove_dir_all は Windows では SQLite 接続がハンドルを解放し切る前に
-        // 呼ばれて失敗することがあり、その場合ディレクトリが残り続ける。PID
-        // だけでは再利用時に古い(既に初期化済みの)ディレクトリと衝突しうる
-        // ため、ナノ秒精度のタイムスタンプも一意性キーに含める。
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "banto-hub-ws-it-{}-{label}-{id}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).expect("create temp env");
-        Self { root }
-    }
-
-    fn registry_path(&self) -> PathBuf {
-        self.root.join("registry.sqlite3")
-    }
-
-    fn data_dir(&self) -> PathBuf {
-        self.root.join("data")
-    }
-}
-
-impl Drop for TempEnv {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
+/// Temp-dir prefix passed to `TempEnv::new` (see `tests/common/mod.rs`).
+const TEMP_ENV_PREFIX: &str = "banto-hub-ws-it";
 
 fn fast_options() -> CollectorOptions {
     CollectorOptions {
@@ -177,6 +142,14 @@ struct TestApp {
     _env: TempEnv,
 }
 
+// See `tests/common/mod.rs`'s module doc ("Why `TestApp` also needs
+// `shutdown_test_app`") for why this is required, not optional.
+impl Drop for TestApp {
+    fn drop(&mut self) {
+        common::shutdown_test_app(&self.manager, &self.pool);
+    }
+}
+
 impl TestApp {
     fn ws_url(&self, path: &str) -> String {
         format!("ws://127.0.0.1:{}{path}", self.server.local_addr().port())
@@ -184,7 +157,7 @@ impl TestApp {
 }
 
 async fn test_app(label: &str) -> TestApp {
-    let env = TempEnv::new(label);
+    let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
 
     let users = UsersService::new(pool.clone());

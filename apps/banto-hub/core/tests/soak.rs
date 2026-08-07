@@ -83,13 +83,14 @@
 //!
 //! ## ヘルパーの重複について
 //!
-//! `tests/stream.rs`/`tests/mqtt.rs`と重なるヘルパー（`TempEnv`・
-//! `fast_options`・`wait_until`・rumqttd 起動一式・`LiveSubscriber`等）は
-//! このファイルにも複製している - 各`tests/*.rs`は独立バイナリとして
-//! コンパイルされ、private helper を共有できないため（両ファイルの
-//! モジュール doc comment に同じ注記がある）。
+//! `tests/stream.rs`/`tests/mqtt.rs`と重なるヘルパー（`fast_options`・
+//! `wait_until`・rumqttd 起動一式・`LiveSubscriber`等）はこのファイルにも
+//! 複製している - 各`tests/*.rs`は独立バイナリとしてコンパイルされ、
+//! private helper を共有できないため（両ファイルのモジュール doc comment に
+//! 同じ注記がある）。`TempEnv`は`tests/common/mod.rs`に集約済み
+//! （2026-08-08、テスト一時ディレクトリリークの根治）。
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -180,7 +181,11 @@ mod mem_probe {
 // モジュール doc comment「ヘルパーの重複について」参照）
 // ---------------------------------------------------------------------------
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
+mod common;
+use common::TempEnv;
+
+/// Temp-dir prefix passed to `TempEnv::new` (see `tests/common/mod.rs`).
+const TEMP_ENV_PREFIX: &str = "banto-hub-soak-it";
 
 /// PLC 収集の周期(ms)。WS の`interval_ms`下限クランプ（250ms、
 /// `EVAL_TICK_MS`）より十分速く、かつソーク走行中のレジスタ変更ティック
@@ -192,44 +197,6 @@ const PERIOD_MS: i64 = 100;
 /// このテストは`banto-hub-core`のプライベート定数を見られないので値だけ
 /// 複製する）。
 const EVAL_TICK_MS: i64 = 250;
-
-struct TempEnv {
-    root: PathBuf,
-}
-
-impl TempEnv {
-    fn new(label: &str) -> Self {
-        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        // remove_dir_all は Windows では SQLite 接続がハンドルを解放し切る前に
-        // 呼ばれて失敗することがあり、その場合ディレクトリが残り続ける。PID
-        // だけでは再利用時に古い(既に初期化済みの)ディレクトリと衝突しうる
-        // ため、ナノ秒精度のタイムスタンプも一意性キーに含める。
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "banto-hub-soak-it-{}-{label}-{id}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).expect("create temp env");
-        Self { root }
-    }
-
-    fn registry_path(&self) -> PathBuf {
-        self.root.join("registry.sqlite3")
-    }
-
-    fn data_dir(&self) -> PathBuf {
-        self.root.join("data")
-    }
-}
-
-impl Drop for TempEnv {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
 
 fn fast_options() -> CollectorOptions {
     CollectorOptions {
@@ -444,7 +411,11 @@ impl LiveSubscriber {
 // --- hub テストアプリ(実サーバー) - `tests/stream.rs`から複製 --------------
 
 struct TestApp {
-    server: banto_server::RunningServer,
+    // `Option`, not a bare `RunningServer`: `run_soak` needs to move it out
+    // (via `.take()`) to call `RunningServer::stop(self)` - TestApp
+    // implementing `Drop` (below) forbids partially moving a field out of
+    // it otherwise (`error[E0509]`).
+    server: Option<banto_server::RunningServer>,
     token: String,
     pool: SqlitePool,
     manager: Arc<CollectorManager>,
@@ -452,14 +423,33 @@ struct TestApp {
     env: TempEnv,
 }
 
+// See `tests/common/mod.rs`'s module doc ("Why `TestApp` also needs
+// `shutdown_test_app`") for why this is required, not optional. This file
+// already calls `app.manager.shutdown()` explicitly at the end of its own
+// tests (see the module doc's "ヘルパーの重複について" / soak flow) - this
+// `Drop` impl makes that shutdown idempotent (a second `shutdown()` call is
+// a harmless no-op) and covers any path that doesn't call it explicitly.
+impl Drop for TestApp {
+    fn drop(&mut self) {
+        common::shutdown_test_app(&self.manager, &self.pool);
+    }
+}
+
 impl TestApp {
     fn ws_url(&self, path: &str) -> String {
-        format!("ws://127.0.0.1:{}{path}", self.server.local_addr().port())
+        format!(
+            "ws://127.0.0.1:{}{path}",
+            self.server
+                .as_ref()
+                .expect("server not yet stopped")
+                .local_addr()
+                .port()
+        )
     }
 }
 
 async fn test_app(label: &str) -> TestApp {
-    let env = TempEnv::new(label);
+    let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
 
     let users = UsersService::new(pool.clone());
@@ -554,7 +544,7 @@ async fn test_app(label: &str) -> TestApp {
     .expect("server should start");
 
     TestApp {
-        server,
+        server: Some(server),
         token,
         pool,
         manager,
@@ -629,7 +619,7 @@ struct SoakReport {
 /// doc comment「banto-collect との違い」参照。
 async fn run_soak(label: &str, duration: Duration) -> SoakReport {
     let broker_port = start_test_broker().await;
-    let app = test_app(label).await;
+    let mut app = test_app(label).await;
     let sim = Simulator::start().await;
     sim.set_holding_register(0, 0);
 
@@ -766,7 +756,9 @@ async fn run_soak(label: &str, duration: Duration) -> SoakReport {
     // `read_single_group_rows` doc comment参照)。
     app.manager.shutdown().await;
     sim.stop();
-    app.server.stop().await;
+    if let Some(server) = app.server.take() {
+        server.stop().await;
+    }
 
     let rows = read_single_group_rows(&app.env.data_dir()).await;
 

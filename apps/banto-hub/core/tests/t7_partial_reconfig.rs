@@ -6,11 +6,12 @@
 //! `banto-collect`・`banto-broker`・`relay-wright-core` の既存スイートを流す
 //! ことで確認する（このファイル自体はそれに寄与しない）。
 //!
-//! `tests/integration.rs`/`tests/computed.rs` と同じ理由で `TempEnv`/
-//! `fast_options`/`wait_until`/`TestApp` 相当をこのファイル内に複製している
-//! （各 `tests/*.rs` は独立クレートとしてコンパイルされ、private helper を
+//! `tests/integration.rs`/`tests/computed.rs` と同じ理由で `fast_options`/
+//! `wait_until`/`TestApp` 相当をこのファイル内に複製している（各
+//! `tests/*.rs` は独立クレートとしてコンパイルされ、private helper を
 //! 共有できない）。WS ヘルパ（`connect_ws`/`send_json`/`recv_matching`）は
-//! `tests/computed.rs` と同型。
+//! `tests/computed.rs` と同型。`TempEnv` は `tests/common/mod.rs` に集約済み
+//! （2026-08-08、テスト一時ディレクトリリークの根治）。
 //!
 //! テスト構成:
 //! 1. 本命: 無関係接続の無停止 - シミュレータ2台(A: modbus, B: slmp)稼働中に
@@ -27,8 +28,6 @@
 //! 5. `/api/v1/status` の `last_apply` が実態を反映（起動直後の初回成功 →
 //!    null、apply_config 実行 → 内容を反映、空構成への遷移 → null に戻る）
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,49 +65,15 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tower::ServiceExt;
 
+mod common;
+use common::TempEnv;
+
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 const CLIENT_HEADER: (&str, &str) = ("X-Banto-Client", "banto");
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempEnv {
-    root: PathBuf,
-}
-
-impl TempEnv {
-    fn new(label: &str) -> Self {
-        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        // remove_dir_all は Windows では SQLite 接続がハンドルを解放し切る前に
-        // 呼ばれて失敗することがあり、その場合ディレクトリが残り続ける。PID
-        // だけでは再利用時に古い(既に初期化済みの)ディレクトリと衝突しうる
-        // ため、ナノ秒精度のタイムスタンプも一意性キーに含める。
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "banto-hub-t7-2-it-{}-{label}-{id}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).expect("create temp env");
-        Self { root }
-    }
-
-    fn registry_path(&self) -> PathBuf {
-        self.root.join("registry.sqlite3")
-    }
-
-    fn data_dir(&self) -> PathBuf {
-        self.root.join("data")
-    }
-}
-
-impl Drop for TempEnv {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
+/// Temp-dir prefix passed to `TempEnv::new` (see `tests/common/mod.rs`).
+const TEMP_ENV_PREFIX: &str = "banto-hub-t7-2-it";
 
 fn fast_options() -> CollectorOptions {
     CollectorOptions {
@@ -221,6 +186,14 @@ struct TestApp {
     _env: TempEnv,
 }
 
+// See `tests/common/mod.rs`'s module doc ("Why `TestApp` also needs
+// `shutdown_test_app`") for why this is required, not optional.
+impl Drop for TestApp {
+    fn drop(&mut self) {
+        common::shutdown_test_app(&self.manager, &self.pool);
+    }
+}
+
 impl TestApp {
     fn ws_url(&self, path: &str) -> String {
         format!("ws://127.0.0.1:{}{path}", self.server.local_addr().port())
@@ -228,7 +201,7 @@ impl TestApp {
 }
 
 async fn test_app(label: &str) -> TestApp {
-    let env = TempEnv::new(label);
+    let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
 
     let users = UsersService::new(pool.clone());

@@ -49,6 +49,8 @@ pub mod settings;
 // Crate-internal validation/error helpers shared by the write_* service
 // modules (not part of the public API - see `support.rs`'s doc comment).
 mod support;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod users;
 pub mod write_audit_query;
 pub mod write_rule_conditions;

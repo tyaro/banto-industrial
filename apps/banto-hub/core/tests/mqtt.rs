@@ -1,9 +1,10 @@
 //! T3 の統合テスト（docs/tag-server-design.md §5.3）: 実際の axum `Router`
 //! と Modbus TCP シミュレータ（`tests/integration.rs`と同じ）、そして
 //! **in-process MQTT ブローカー（`rumqttd`）**を使った E2E。`tests/write.rs`/
-//! `tests/stream.rs`と同じ理由で `TempEnv`/`fast_options`/`wait_until`等を
-//! このファイル内に複製している（各 `tests/*.rs` は独立クレートとして
-//! コンパイルされ、private helper を共有できない）。
+//! `tests/stream.rs`と同じ理由で `fast_options`/`wait_until`等をこのファイル
+//! 内に複製している（各 `tests/*.rs` は独立クレートとしてコンパイルされ、
+//! private helper を共有できない）。`TempEnv` は `tests/common/mod.rs` に
+//! 集約済み（2026-08-08、テスト一時ディレクトリリークの根治）。
 //!
 //! テスト構成（実装指示のテスト計画1〜5に対応。6「既存全テストを壊さない」
 //! は `cargo test -p banto-hub-core` 全体で確認する - このファイル単体の
@@ -25,8 +26,6 @@
 //! 再試行する。
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -60,47 +59,13 @@ use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 use tower::ServiceExt;
 
+mod common;
+use common::TempEnv;
+
 const CLIENT_HEADER: (&str, &str) = ("X-Banto-Client", "banto");
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempEnv {
-    root: PathBuf,
-}
-
-impl TempEnv {
-    fn new(label: &str) -> Self {
-        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        // remove_dir_all は Windows では SQLite 接続がハンドルを解放し切る前に
-        // 呼ばれて失敗することがあり、その場合ディレクトリが残り続ける。PID
-        // だけでは再利用時に古い(既に初期化済みの)ディレクトリと衝突しうる
-        // ため、ナノ秒精度のタイムスタンプも一意性キーに含める。
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "banto-hub-mqtt-it-{}-{label}-{id}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).expect("create temp env");
-        Self { root }
-    }
-
-    fn registry_path(&self) -> PathBuf {
-        self.root.join("registry.sqlite3")
-    }
-
-    fn data_dir(&self) -> PathBuf {
-        self.root.join("data")
-    }
-}
-
-impl Drop for TempEnv {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
+/// Temp-dir prefix passed to `TempEnv::new` (see `tests/common/mod.rs`).
+const TEMP_ENV_PREFIX: &str = "banto-hub-mqtt-it";
 
 fn fast_options() -> CollectorOptions {
     CollectorOptions {
@@ -377,8 +342,16 @@ struct TestApp {
     _env: TempEnv,
 }
 
+// See `tests/common/mod.rs`'s module doc ("Why `TestApp` also needs
+// `shutdown_test_app`") for why this is required, not optional.
+impl Drop for TestApp {
+    fn drop(&mut self) {
+        common::shutdown_test_app(&self.manager, &self.pool);
+    }
+}
+
 async fn test_app(label: &str) -> TestApp {
-    let env = TempEnv::new(label);
+    let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
 
     let users = UsersService::new(pool.clone());

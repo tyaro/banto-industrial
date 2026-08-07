@@ -12,15 +12,43 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use banto_tstore::{GroupConfig, ManualClock, StoreConfig, TagColumn, TsWriter, WriterOptions};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Fresh temp directory for one test, best-effort cleaned up on drop -
-/// mirrors `banto-tstore`'s own test `TempDir` helper exactly (plain
-/// `std::fs`, no `tempfile` dependency).
+/// Fresh temp directory for one test, cleaned up on drop - mirrors
+/// `banto-tstore`'s own test `TempDir` helper exactly (plain `std::fs`, no
+/// `tempfile` dependency).
+///
+/// ## Cleanup: why `drop` retries
+///
+/// On Windows, closing a WAL-mode `SqlitePool` (every `TsWriter` opens one
+/// per data file) does not synchronously release the underlying file
+/// handles, so a `remove_dir_all` issued immediately after the writer is
+/// closed/dropped can observe `ERROR_SHARING_VIOLATION` (measured directly
+/// in `banto-hub-core`'s identically-shaped `TempEnv` - see
+/// `apps/banto-hub/core/tests/common/mod.rs`'s module doc for the full
+/// writeup and measurements, and `banto-tstore/src/writer.rs`'s own
+/// `TempDir` for the same fix applied there). [`TempDir::drop`] retries on a
+/// short delay to reliably close this window.
+///
+/// This requires every test using `TempDir` to run on a multi-thread tokio
+/// runtime with >= 2 workers (`Drop::drop` is synchronous, so the retry can
+/// only block via `std::thread::sleep` - on a single-threaded runtime that
+/// would starve the only worker thread and prevent the background close
+/// from ever being polled) - hence every test in this crate's `tests/*.rs`
+/// is annotated `#[tokio::test(flavor = "multi_thread", worker_threads = 2)]`
+/// rather than the bare `#[tokio::test]`.
 pub struct TempDir(PathBuf);
+
+/// Delay between `remove_dir_all` retries in [`TempDir::drop`].
+const TEMP_DIR_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// Retry ceiling in [`TempDir::drop`] - `TEMP_DIR_RETRY_DELAY *
+/// TEMP_DIR_MAX_ATTEMPTS` (~2s) is the worst-case teardown block.
+const TEMP_DIR_MAX_ATTEMPTS: u32 = 40;
 
 impl TempDir {
     pub fn new(label: &str) -> Self {
@@ -39,7 +67,24 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        // `NotFound` is not an error here: a test that never actually wrote
+        // anything (fixture setup failed before touching disk) never
+        // creates this directory in the first place.
+        for attempt in 1..=TEMP_DIR_MAX_ATTEMPTS {
+            match std::fs::remove_dir_all(&self.0) {
+                Ok(()) => return,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) if attempt < TEMP_DIR_MAX_ATTEMPTS => {
+                    std::thread::sleep(TEMP_DIR_RETRY_DELAY);
+                }
+                Err(err) => {
+                    eprintln!(
+                        "TempDir: giving up removing {:?} after {attempt} attempts: {err}",
+                        self.0
+                    );
+                }
+            }
+        }
     }
 }
 

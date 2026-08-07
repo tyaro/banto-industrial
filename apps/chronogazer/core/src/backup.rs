@@ -636,7 +636,7 @@ impl BackupService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use crate::test_support::TempDir;
 
     /// A migrated, on-disk (NOT `:memory:`) SQLite pool at `path`. Every
     /// fixture in this module that needs a pool `VACUUM INTO` will actually
@@ -670,16 +670,25 @@ mod tests {
     /// [`migrated_file_db`]) at `db_path` inside a fresh temp directory -
     /// mirrors production (`db_path` is a real file, `backups/` is its
     /// sibling directory).
-    async fn service() -> (BackupService, tempfile::TempDir) {
-        let dir = tempdir().expect("tempdir");
+    ///
+    /// Returns `(dir, svc)` - **dir first, svc last** - not the more
+    /// natural-looking `(svc, dir)`. See `crate::test_support`'s module doc
+    /// for why: every call site destructures this directly with
+    /// `let (dir, svc) = ...`, and a tuple's bindings from one `let`
+    /// pattern drop in *reverse* of how they're listed - so `svc` (which
+    /// owns the pool), listed last, drops *first*, before `dir`'s cleanup
+    /// runs. Getting this order backwards silently leaks the temp dir on
+    /// every run (measured before this fix).
+    async fn service() -> (TempDir, BackupService) {
+        let dir = TempDir::new();
         let db_path = dir.path().join("chronogazer.sqlite3");
         let pool = migrated_file_db(&db_path).await;
-        (BackupService::new(db_path, pool), dir)
+        (dir, BackupService::new(db_path, pool))
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_then_list_then_read_round_trips() {
-        let (svc, _dir) = service().await;
+        let (_dir, svc) = service().await;
 
         let created = svc.create().await.expect("create should succeed");
         assert!(created.file_name.starts_with("banto-"));
@@ -720,9 +729,9 @@ mod tests {
         assert_eq!(&bytes[0..16], b"SQLite format 3\0");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_twice_in_the_same_second_appends_a_numeric_suffix() {
-        let (svc, dir) = service().await;
+        let (dir, svc) = service().await;
         // Force a same-timestamp collision deterministically rather than
         // relying on two real `create()` calls landing in the same second
         // (flaky) - pre-create the exact file name the second `create()`
@@ -745,15 +754,15 @@ mod tests {
         assert_eq!(listed.len(), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn list_is_empty_when_backups_dir_does_not_exist_yet() {
-        let (svc, _dir) = service().await;
+        let (_dir, svc) = service().await;
         assert_eq!(svc.list().await.unwrap(), Vec::new());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn list_is_sorted_newest_first() {
-        let (svc, dir) = service().await;
+        let (dir, svc) = service().await;
         let backups_dir = dir.path().join("backups");
         tokio::fs::create_dir_all(&backups_dir).await.unwrap();
         tokio::fs::write(backups_dir.join("banto-20260101-000000.sqlite3"), b"a")
@@ -773,9 +782,9 @@ mod tests {
         assert_eq!(listed.len(), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn read_rejects_path_traversal_attempts() {
-        let (svc, _dir) = service().await;
+        let (_dir, svc) = service().await;
         for bad in [
             "../secret.sqlite3",
             "..\\secret.sqlite3",
@@ -792,16 +801,16 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn read_missing_file_is_not_found() {
-        let (svc, _dir) = service().await;
+        let (_dir, svc) = service().await;
         let err = svc.read("banto-does-not-exist.sqlite3").await.unwrap_err();
         assert!(matches!(err, BantoError::NotFound { resource, .. } if resource == "backups"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stage_restore_from_bytes_rejects_garbage() {
-        let (svc, _dir) = service().await;
+        let (_dir, svc) = service().await;
         let err = svc
             .stage_restore_from_bytes(b"not a sqlite file at all")
             .await
@@ -810,9 +819,9 @@ mod tests {
         assert!(svc.pending_restore().await.is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stage_restore_from_bytes_rejects_a_db_missing_required_tables() {
-        let (svc, dir) = service().await;
+        let (dir, svc) = service().await;
         // A real, valid SQLite file - but with none of the required tables.
         let bogus_path = dir.path().join("bogus.sqlite3");
         let pool = banto_storage::connect_sqlite(&bogus_path).await.unwrap();
@@ -828,14 +837,14 @@ mod tests {
         assert!(svc.pending_restore().await.is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stage_restore_from_bytes_accepts_a_valid_db_and_pending_restore_reports_it() {
-        let (svc, _dir) = service().await;
+        let (_dir, svc) = service().await;
         assert!(svc.pending_restore().await.is_none());
 
         // A second, independent, fully-migrated db's bytes - a realistic
         // "restore from an uploaded backup" payload.
-        let other_dir = tempdir().unwrap();
+        let other_dir = TempDir::new();
         let other_path = other_dir.path().join("source.sqlite3");
         let other_pool = migrated_file_db(&other_path).await;
         other_pool.close().await;
@@ -849,9 +858,9 @@ mod tests {
         assert_eq!(pending.size_bytes as usize, bytes.len());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stage_restore_from_file_accepts_an_existing_backup() {
-        let (svc, _dir) = service().await;
+        let (_dir, svc) = service().await;
         let created = svc.create().await.unwrap();
 
         svc.stage_restore_from_file(&created.file_name)
@@ -860,9 +869,9 @@ mod tests {
         assert!(svc.pending_restore().await.is_some());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stage_restore_from_file_rejects_path_traversal() {
-        let (svc, _dir) = service().await;
+        let (_dir, svc) = service().await;
         let err = svc
             .stage_restore_from_file("../outside.sqlite3")
             .await
@@ -870,9 +879,9 @@ mod tests {
         assert!(matches!(err, BantoError::Validation { .. }));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stage_restore_from_file_missing_source_is_not_found() {
-        let (svc, _dir) = service().await;
+        let (_dir, svc) = service().await;
         let err = svc
             .stage_restore_from_file("banto-does-not-exist.sqlite3")
             .await
@@ -880,9 +889,9 @@ mod tests {
         assert!(matches!(err, BantoError::NotFound { .. }));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancel_pending_restore_removes_the_staged_file() {
-        let (svc, _dir) = service().await;
+        let (_dir, svc) = service().await;
         let created = svc.create().await.unwrap();
         svc.stage_restore_from_file(&created.file_name)
             .await
@@ -895,9 +904,9 @@ mod tests {
         assert!(svc.pending_restore().await.is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancel_pending_restore_is_a_no_op_when_nothing_is_staged() {
-        let (svc, _dir) = service().await;
+        let (_dir, svc) = service().await;
         svc.cancel_pending_restore()
             .await
             .expect("cancelling with nothing staged should be a harmless no-op");
@@ -905,9 +914,9 @@ mod tests {
 
     // --- apply_pending_restore_at_startup -----------------------------------
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_pending_restore_is_a_no_op_when_nothing_is_staged() {
-        let dir = tempdir().unwrap();
+        let dir = TempDir::new();
         let db_path = dir.path().join("chronogazer.sqlite3");
         let applied = BackupService::apply_pending_restore_at_startup(&db_path)
             .await
@@ -915,9 +924,9 @@ mod tests {
         assert!(applied.is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_pending_restore_swaps_the_db_file_and_backs_up_the_old_one() {
-        let dir = tempdir().unwrap();
+        let dir = TempDir::new();
         let db_path = dir.path().join("chronogazer.sqlite3");
 
         // A real "current" db on disk, distinguishable from the restore
@@ -989,11 +998,11 @@ mod tests {
         backup_pool.close().await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_pending_restore_with_no_prior_db_file_still_applies() {
         // Edge case documented on `apply_pending_restore_at_startup`: a
         // restore staged before the very first db file ever existed.
-        let dir = tempdir().unwrap();
+        let dir = TempDir::new();
         let db_path = dir.path().join("chronogazer.sqlite3");
 
         let svc = BackupService::new(
@@ -1017,9 +1026,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn apply_pending_restore_deletes_and_skips_a_corrupt_pending_file() {
-        let dir = tempdir().unwrap();
+        let dir = TempDir::new();
         let db_path = dir.path().join("chronogazer.sqlite3");
         tokio::fs::write(
             dir.path().join(PENDING_RESTORE_FILE_NAME),

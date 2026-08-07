@@ -3,8 +3,6 @@
 //! E2E。足場（`TempEnv`/`fast_options`/`wait_until`）は
 //! `crates/banto-collect/tests/integration.rs` を流用している。
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,53 +33,16 @@ use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 use tower::ServiceExt;
 
+mod common;
+use common::TempEnv;
+
 const CLIENT_HEADER: (&str, &str) = ("X-Banto-Client", "banto");
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// A temp directory holding the registry DB and the tstore data dir - the
-/// registry must be *file-backed* (not `:memory:`): `CollectorManager`
-/// hands out several pool connections concurrently (registry reads, event
-/// persistence, per-connection tasks), and each `:memory:` connection is a
-/// separate empty database (`crates/banto-collect/tests/integration.rs`'s
-/// module doc explains the same constraint).
-struct TempEnv {
-    root: PathBuf,
-}
-
-impl TempEnv {
-    fn new(label: &str) -> Self {
-        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        // remove_dir_all は Windows では SQLite 接続がハンドルを解放し切る前に
-        // 呼ばれて失敗することがあり、その場合ディレクトリが残り続ける。PID
-        // だけでは再利用時に古い(既に初期化済みの)ディレクトリと衝突しうる
-        // ため、ナノ秒精度のタイムスタンプも一意性キーに含める。
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "banto-hub-it-{}-{label}-{id}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).expect("create temp env");
-        Self { root }
-    }
-
-    fn registry_path(&self) -> PathBuf {
-        self.root.join("registry.sqlite3")
-    }
-
-    fn data_dir(&self) -> PathBuf {
-        self.root.join("data")
-    }
-}
-
-impl Drop for TempEnv {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
+/// Temp-dir prefix passed to `TempEnv::new` - identifies this file's
+/// directories among any left behind by a panicking test (see
+/// `tests/common/mod.rs`'s module doc for why `TempEnv::drop`'s retry can't
+/// always save a panicking test).
+const TEMP_ENV_PREFIX: &str = "banto-hub-it";
 
 /// Fast timings so the E2E tests finish quickly (mirrors
 /// `banto-collect`'s own `fast_options`).
@@ -193,8 +154,19 @@ struct TestApp {
     _env: TempEnv,
 }
 
+// `tests/common/mod.rs`'s module doc ("Why `TestApp` also needs
+// `shutdown_test_app`"): without this, the background collector tasks
+// `manager` spawned stay alive past this test's scope and keep the
+// registry `SqlitePool` connections they hold checked out, so
+// `TempEnv::drop`'s retry can never succeed.
+impl Drop for TestApp {
+    fn drop(&mut self) {
+        common::shutdown_test_app(&self.manager, &self.pool);
+    }
+}
+
 async fn test_app(label: &str) -> TestApp {
-    let env = TempEnv::new(label);
+    let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
 
     let users = UsersService::new(pool.clone());
@@ -879,9 +851,13 @@ async fn an_invalid_config_keeps_the_old_collector_and_surfaces_last_config_erro
 // 6. settings の既定値
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+// `tests/common/mod.rs`'s module doc: `TempEnv::drop`'s retry needs a
+// multi-thread runtime, so - unlike most standalone `#[tokio::test]`
+// functions that don't touch a `TempEnv` - this one can't use the bare
+// single-threaded default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn settings_defaults_are_port_8722_and_retention_7_days() {
-    let env = TempEnv::new("settings-defaults");
+    let env = TempEnv::new(TEMP_ENV_PREFIX, "settings-defaults");
     let pool = init_db(env.registry_path()).await.expect("init_db");
     let settings = SettingsService::new(pool);
 

@@ -11,4 +11,6 @@ pub mod db;
 pub mod events;
 pub mod rest;
 pub mod settings;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod users;

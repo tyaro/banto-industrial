@@ -60,6 +60,8 @@ pub mod files;
 pub mod meta;
 pub mod reader;
 pub mod schema;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod writer;
 
 pub use clock::{Clock, ManualClock, SystemClock};

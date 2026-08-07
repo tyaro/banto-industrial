@@ -1279,14 +1279,26 @@ mod tests {
     use banto_tags::{CollectionGroupInput, CollectionGroupService, PlcConnectionInput, TagInput};
     use banto_tstore::SystemClock;
     use std::time::Duration;
-    use tempfile::tempdir;
 
     /// `CollectorManager` needs a *file-backed* registry DB, same reasoning
     /// as `banto-collect`'s own integration tests (`build_config` and the
     /// per-connection tasks each hand out their own pool connection; a
     /// `:memory:` DB is a fresh empty database per connection).
-    async fn manager_env() -> (sqlx::SqlitePool, tempfile::TempDir, CollectorManager) {
-        let dir = tempdir().expect("tempdir");
+    ///
+    /// Returns `(dir, manager, pool)` - **dir first, pool last** - not the
+    /// more natural-looking `(pool, dir, manager)`. See
+    /// `crate::test_support`'s module doc for why: every call site
+    /// destructures this directly with `let (_dir, manager, _pool) = ...`,
+    /// and a tuple's bindings from one `let` pattern drop in *reverse* of
+    /// how they're listed - so `pool`, listed last, drops *first*, before
+    /// `dir`'s cleanup runs. Getting this order backwards silently leaks the
+    /// temp dir on every run (measured before this fix).
+    async fn manager_env() -> (
+        crate::test_support::TempDir,
+        CollectorManager,
+        sqlx::SqlitePool,
+    ) {
+        let dir = crate::test_support::TempDir::new("manager-env");
         let db_path = dir.path().join("registry.sqlite3");
         let pool = init_db(&db_path).await.expect("init_db");
         let data_dir = dir.path().join("data");
@@ -1306,12 +1318,14 @@ mod tests {
             sim_registry,
             computed,
         );
-        (pool, dir, manager)
+        (dir, manager, pool)
     }
 
-    #[tokio::test]
+    // `crate::test_support`'s module doc: `TempDir::drop`'s retry needs a
+    // multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rebuild_on_an_empty_registry_is_not_an_error() {
-        let (_pool, _dir, manager) = manager_env().await;
+        let (_dir, manager, _pool) = manager_env().await;
         manager.rebuild().await.expect("empty rebuild should be Ok");
         assert_eq!(manager.revision(), 1);
         assert_eq!(manager.last_error(), None);
@@ -1319,9 +1333,11 @@ mod tests {
         assert!(manager.current_values().is_none());
     }
 
-    #[tokio::test]
+    // `crate::test_support`'s module doc: `TempDir::drop`'s retry needs a
+    // multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rebuild_builds_a_catalog_entry_with_effective_enabled_state() {
-        let (pool, _dir, manager) = manager_env().await;
+        let (_dir, manager, pool) = manager_env().await;
 
         let conn = PlcConnectionService::new(pool.clone())
             .create(PlcConnectionInput {
@@ -1378,11 +1394,20 @@ mod tests {
         assert_eq!(entry.ids, (conn.id, group.id, tag.id));
         assert_eq!(entry.address, "40001");
         assert!(!entry.enabled, "tag itself is disabled");
+
+        // `rebuild()` above spawned a real (if unreachable) per-connection
+        // collector task that would otherwise outlive this test and keep
+        // its `EventSink` pool clone checked out - see
+        // `crate::test_support`'s module doc for why that alone defeats
+        // `TempDir::drop`'s retry regardless of ordering.
+        manager.shutdown().await;
     }
 
-    #[tokio::test]
+    // `crate::test_support`'s module doc: `TempDir::drop`'s retry needs a
+    // multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rebuild_keeps_the_old_state_on_a_config_error() {
-        let (pool, _dir, manager) = manager_env().await;
+        let (_dir, manager, pool) = manager_env().await;
 
         let conn = PlcConnectionService::new(pool.clone())
             .create(PlcConnectionInput {
@@ -1451,15 +1476,27 @@ mod tests {
         assert_eq!(manager.revision(), 1);
         assert_eq!(manager.last_error(), Some(err));
         assert!(manager.tag_map().is_empty());
+
+        // See the shutdown note in `rebuild_builds_a_catalog_entry_with_effective_enabled_state`
+        // above - the first (successful, empty-registry) rebuild here never
+        // spawns a task, but this test's whole point is the SECOND rebuild
+        // attempt with a real connection, which does (and fails at
+        // build_config time before ever reaching that task - but the FIRST
+        // rebuild already committed the empty config with zero tasks, so
+        // there is nothing to stop from that one either; shutdown is still
+        // the harmless, correct thing to call unconditionally).
+        manager.shutdown().await;
     }
 
     /// T9-2 フォローアップ (2026-08-06): `log_simulation_warnings`（この
     /// テストでは `rebuild` 経由で間接的に呼ばれる）が実際に注入された
     /// `DiagLog` を経由すること - 素の `println!` に黙って落ちないことの
     /// 回帰確認（`crate::diag_log` モジュール doc「PR #43 監査指摘」参照）。
-    #[tokio::test]
+    // `crate::test_support`'s module doc: `TempDir::drop`'s retry needs a
+    // multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rebuild_routes_the_simulation_warning_through_the_injected_diag_log() {
-        let (pool, _dir, manager) = manager_env().await;
+        let (_dir, manager, pool) = manager_env().await;
         let lines: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = lines.clone();
         let manager = manager.with_diag_log(DiagLog::new(
@@ -1482,13 +1519,17 @@ mod tests {
 
         manager.rebuild().await.expect("rebuild should be Ok");
 
-        let captured_lines = lines.lock().unwrap();
-        assert!(
-            captured_lines
-                .iter()
-                .any(|line| line.contains("simline") && line.contains("シミュレーション")),
-            "expected a simulation warning line, got: {captured_lines:?}"
-        );
+        {
+            let captured_lines = lines.lock().unwrap();
+            assert!(
+                captured_lines
+                    .iter()
+                    .any(|line| line.contains("simline") && line.contains("シミュレーション")),
+                "expected a simulation warning line, got: {captured_lines:?}"
+            );
+        }
+
+        manager.shutdown().await;
     }
 
     /// Two concurrent `rebuild()` calls must not panic (no double-lock /
@@ -1499,9 +1540,11 @@ mod tests {
     /// assert anything about *ordering* (not this fix's concern, per the
     /// review note) - only that serialization does not corrupt state or
     /// deadlock under concurrency.
-    #[tokio::test]
+    // `crate::test_support`'s module doc: `TempDir::drop`'s retry needs a
+    // multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_rebuild_calls_are_serialized_and_both_succeed() {
-        let (_pool, _dir, manager) = manager_env().await;
+        let (_dir, manager, _pool) = manager_env().await;
         let manager = Arc::new(manager);
 
         let a = manager.clone();

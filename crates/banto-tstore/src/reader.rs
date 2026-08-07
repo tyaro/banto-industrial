@@ -113,45 +113,89 @@ impl TsReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn temp_file_path(label: &str) -> std::path::PathBuf {
-        let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!(
-            "banto-tstore-test-reader-{}-{label}-{id}.sqlite3",
-            std::process::id()
-        ))
+    /// A fresh temp *file path* for one test (not a directory - unlike
+    /// `writer::tests::TempDir`, these tests open bare `.sqlite3` files
+    /// directly with `schema::connect_writable`/`TsReader::open`). Cleans up
+    /// the `.sqlite3` file itself plus its WAL sidecars (`-wal`/`-shm`,
+    /// sqlite's standard naming - appended to the full filename, not
+    /// replacing the extension) on drop - see `crate::test_support`'s
+    /// module doc for why this retries and requires a multi-thread runtime.
+    struct TempFile(PathBuf);
+
+    impl TempFile {
+        fn new(label: &str) -> Self {
+            let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+            // Nanosecond timestamp alongside the PID + counter guards
+            // against PID reuse colliding with an old, already-initialized
+            // file from a previous run (same reasoning as
+            // `apps/banto-hub/core/tests/common/mod.rs`'s `TempEnv::new`).
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "banto-tstore-test-reader-{}-{label}-{id}-{nanos}.sqlite3",
+                std::process::id()
+            ));
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn wal_path(&self) -> PathBuf {
+            let mut s = self.0.clone().into_os_string();
+            s.push("-wal");
+            PathBuf::from(s)
+        }
+
+        fn shm_path(&self) -> PathBuf {
+            let mut s = self.0.clone().into_os_string();
+            s.push("-shm");
+            PathBuf::from(s)
+        }
     }
 
-    #[tokio::test]
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            crate::test_support::retry_remove(&self.0, |p| std::fs::remove_file(p));
+            crate::test_support::retry_remove(&self.wal_path(), |p| std::fs::remove_file(p));
+            crate::test_support::retry_remove(&self.shm_path(), |p| std::fs::remove_file(p));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn open_missing_file_is_a_storage_error() {
-        let path = temp_file_path("missing");
-        let err = TsReader::open(&path).await.unwrap_err();
+        let file = TempFile::new("missing");
+        let err = TsReader::open(file.path()).await.unwrap_err();
         assert!(matches!(err, TstoreError::Storage(_)));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn open_foreign_sqlite_file_is_incompatible() {
-        let path = temp_file_path("foreign");
+        let file = TempFile::new("foreign");
         // A real SQLite file, but not one this crate ever wrote.
-        let pool = schema::connect_writable(&path).await.unwrap();
+        let pool = schema::connect_writable(file.path()).await.unwrap();
         sqlx::query("CREATE TABLE not_tstore (id INTEGER)")
             .execute(&pool)
             .await
             .unwrap();
         pool.close().await;
 
-        let err = TsReader::open(&path).await.unwrap_err();
+        let err = TsReader::open(file.path()).await.unwrap_err();
         assert!(matches!(err, TstoreError::IncompatibleFile(_)));
-        std::fs::remove_file(&path).ok();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn open_file_with_unsupported_format_version_is_incompatible() {
-        let path = temp_file_path("bad-version");
-        let pool = schema::connect_writable(&path).await.unwrap();
+        let file = TempFile::new("bad-version");
+        let pool = schema::connect_writable(file.path()).await.unwrap();
         sqlx::query("CREATE TABLE tstore_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             .execute(&pool)
             .await
@@ -162,11 +206,10 @@ mod tests {
             .unwrap();
         pool.close().await;
 
-        let err = TsReader::open(&path).await.unwrap_err();
+        let err = TsReader::open(file.path()).await.unwrap_err();
         match err {
             TstoreError::IncompatibleFile(message) => assert!(message.contains("999")),
             other => panic!("expected IncompatibleFile, got {other:?}"),
         }
-        std::fs::remove_file(&path).ok();
     }
 }
