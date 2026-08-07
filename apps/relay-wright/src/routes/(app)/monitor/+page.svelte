@@ -18,8 +18,8 @@
 	 * ポーリングは編集中とページ非表示中（visibilitychange）は一時停止し、
 	 * ページ破棄時に必ず clearInterval する。エンジン未起動時はバナーを
 	 * 表示する（モニタの読み取りはエンジンの PLC セッションを使うため —
-	 * 実機 R08ENCPU は SLMP 同時接続を1本しか受けず、モニタが独自接続を
-	 * 張ることはできない）。
+	 * 実機 R08ENCPU は同一ポートへの SLMP 同時接続を1本しか受けず、
+	 * モニタがエンジンと別に同じ接続へ独自接続を張ることはできない）。
 	 */
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '$lib/toast.svelte';

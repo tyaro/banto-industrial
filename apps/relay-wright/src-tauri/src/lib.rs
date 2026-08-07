@@ -2300,8 +2300,8 @@ async fn engine_status(state: State<'_, AppState>) -> Result<EngineStatus, Banto
 // `EngineControl::monitor_write`, so this layer adds ONLY the RBAC gate and
 // the actor username - never a second entry. Both commands ride the SAME
 // shared control slot as `/api/monitor/*`, so all monitor traffic goes
-// through the engine broker's one-session-per-CPU tasks (the R08ENCPU accepts
-// only one SLMP session).
+// through the engine broker's one-session-per-connection tasks (the
+// R08ENCPU accepts only one SLMP session per connected port).
 
 /// Body of [`monitor_group_read`] (see [`engine_arm_body`] for the split
 /// pattern).

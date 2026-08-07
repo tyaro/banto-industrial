@@ -136,8 +136,9 @@ pub struct EngineControl {
     /// The broker's shared session directory (feature/tag-monitor): the
     /// タグモニタ read/manual-write surface (`engine::monitor`, implemented
     /// as further methods on this type) reaches the engine's
-    /// one-session-per-CPU broker tasks through this - never a second SLMP
-    /// client (the real R08ENCPU accepts only one session). Carried here so
+    /// one-session-per-connection broker tasks through this - never a second
+    /// SLMP client against the same connection (the real R08ENCPU accepts
+    /// only one SLMP session per connected port). Carried here so
     /// both wiring paths (Tauri commands + REST routes) get it for free via
     /// the existing [`SharedEngineControl`] slot.
     sessions: SessionDirectory,
