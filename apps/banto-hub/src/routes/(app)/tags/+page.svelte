@@ -24,6 +24,7 @@
 		deleteTag,
 		listCollectionGroups,
 		listPlcConnections,
+		createTagsBatch,
 		MIN_STRING_LENGTH,
 		MAX_STRING_LENGTH,
 		TAG_KIND_OPTIONS,
@@ -34,8 +35,15 @@
 		type TagDataType,
 		type TagKind,
 		type CollectionGroup,
-		type PlcConnection
+		type PlcConnection,
+		type BatchTagsResult
 	} from '$lib/banto/tagRegistryAdmin';
+	import {
+		generateContinuousTags,
+		MAX_CONTINUOUS_COUNT,
+		type ContinuousRegistrationParams,
+		type ContinuousRegistrationResult
+	} from '$lib/banto/continuousRegistration';
 
 	const dataTypeOptions: { value: TagDataType; label: string }[] = [
 		{ value: 'bit', label: 'bit（真偽値1点）' },
@@ -180,6 +188,10 @@
 		};
 	}
 
+	/** T11-1 (docs/ux-plan.md §3): 通常の単発登録フォーム / 連続登録フォームの切替。 */
+	type Mode = 'single' | 'continuous';
+	let mode: Mode = $state('single');
+
 	let groups: CollectionGroup[] = $state([]);
 	let connections: PlcConnection[] = $state([]);
 	let tags: Tag[] = $state([]);
@@ -298,6 +310,164 @@
 			await reload();
 		} catch (err) {
 			toastStore.push('error', errorMessage(err));
+		}
+	}
+
+	// --- T11-1: 連続登録 (docs/ux-plan.md §3) ------------------------------
+	//
+	// 名前パターン・開始番号・開始アドレス・点数・共通設定から
+	// `generateContinuousTags`（純関数、$lib/banto/continuousRegistration.ts）
+	// でプレビュー行を組み立て、確認後に一括 API を叩く。連続登録は PLC
+	// アドレスを前提とする機能のため tagKind は常に 'plc'（TagInput 側の
+	// 既定と同じ、フォーム自体に種別選択は出さない）。
+
+	interface ContinuousFormState {
+		collectionGroupId: string;
+		namePattern: string;
+		startNumber: string;
+		startAddress: string;
+		count: string;
+		dataType: TagDataType;
+		stringLength: string;
+		unit: string;
+		decimals: string;
+		rawLo: string;
+		rawHi: string;
+		engLo: string;
+		engHi: string;
+		thresholdH: string;
+		thresholdHh: string;
+		thresholdL: string;
+		thresholdLl: string;
+		enabled: boolean;
+		writable: boolean;
+	}
+
+	function blankContinuousForm(): ContinuousFormState {
+		return {
+			collectionGroupId: '',
+			namePattern: 'temp{n}',
+			startNumber: '1',
+			startAddress: '',
+			count: '1',
+			dataType: 'i16',
+			stringLength: '',
+			unit: '',
+			decimals: '0',
+			rawLo: '',
+			rawHi: '',
+			engLo: '',
+			engHi: '',
+			thresholdH: '',
+			thresholdHh: '',
+			thresholdL: '',
+			thresholdLl: '',
+			enabled: true,
+			writable: false
+		};
+	}
+
+	let continuousForm = $state(blankContinuousForm());
+
+	/** 生成に必要な最低限の項目が埋まるまでは `null`（エラー表示を急がない）。 */
+	function continuousParams(form: ContinuousFormState): ContinuousRegistrationParams | null {
+		if (
+			form.collectionGroupId === '' ||
+			form.namePattern.trim() === '' ||
+			form.startAddress.trim() === '' ||
+			form.count.trim() === ''
+		) {
+			return null;
+		}
+		return {
+			collectionGroupId: Number(form.collectionGroupId),
+			namePattern: form.namePattern,
+			startNumber: Number(form.startNumber) || 0,
+			startAddress: form.startAddress,
+			count: Number(form.count),
+			dataType: form.dataType,
+			stringLength: form.dataType === 'string' ? (optNum(form.stringLength) ?? null) : null,
+			unit: form.unit === '' ? undefined : form.unit,
+			decimals: Number(form.decimals),
+			rawLo: optNum(form.rawLo) ?? null,
+			rawHi: optNum(form.rawHi) ?? null,
+			engLo: optNum(form.engLo) ?? null,
+			engHi: optNum(form.engHi) ?? null,
+			thresholdH: optNum(form.thresholdH) ?? null,
+			thresholdHh: optNum(form.thresholdHh) ?? null,
+			thresholdL: optNum(form.thresholdL) ?? null,
+			thresholdLl: optNum(form.thresholdLl) ?? null,
+			enabled: form.enabled,
+			writable: form.writable
+		};
+	}
+
+	/** 入力が変わるたびに再計算される、適用前プレビュー(設計「適用前にプレビュー表示」)。 */
+	let continuousPreview: ContinuousRegistrationResult | null = $derived.by(() => {
+		const params = continuousParams(continuousForm);
+		return params ? generateContinuousTags(params) : null;
+	});
+
+	const continuousTagsJson = $derived(
+		continuousPreview?.ok ? JSON.stringify(continuousPreview.tags) : null
+	);
+
+	// dry-run 検証(サーバー側チェック — 既存タグとの重複名等、クライアント
+	// 側のプレビューだけでは分からないもの)の鮮度をフォームの現在値と突き
+	// 合わせる。フォームを1文字でも変えたら「登録」は無効化し、再検証を促す。
+	let validatedTagsJson = $state<string | null>(null);
+	let validationResult = $state<BatchTagsResult | null>(null);
+	let validating = $state(false);
+	let applyingContinuous = $state(false);
+
+	const continuousValidatedFresh = $derived(
+		continuousTagsJson !== null &&
+			continuousTagsJson === validatedTagsJson &&
+			validationResult?.ok === true
+	);
+
+	function invalidateContinuousValidation(): void {
+		validatedTagsJson = null;
+		validationResult = null;
+	}
+
+	async function handleValidateContinuous(): Promise<void> {
+		if (!continuousPreview?.ok) return;
+		validating = true;
+		try {
+			const result = await createTagsBatch(continuousPreview.tags, true);
+			validationResult = result;
+			validatedTagsJson = continuousTagsJson;
+			if (result.ok) {
+				toastStore.push('success', `検証OK: ${result.count}件登録できます`);
+			} else {
+				toastStore.push('error', 'エラーがあります。下の一覧を確認してください。');
+			}
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			validating = false;
+		}
+	}
+
+	async function handleApplyContinuous(): Promise<void> {
+		if (!continuousPreview?.ok || !continuousValidatedFresh) return;
+		applyingContinuous = true;
+		try {
+			const result = await createTagsBatch(continuousPreview.tags, false);
+			validationResult = result;
+			if (result.ok) {
+				toastStore.push('success', `${result.count}件登録しました`);
+				continuousForm = blankContinuousForm();
+				invalidateContinuousValidation();
+				await reload();
+			} else {
+				toastStore.push('error', '一部の行でエラーがあります。下の一覧を確認してください。');
+			}
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			applyingContinuous = false;
 		}
 	}
 
@@ -500,10 +670,119 @@
 	</div>
 {/snippet}
 
+{#snippet continuousCommonFields()}
+	<label class="field">
+		データ型
+		<select bind:value={continuousForm.dataType}>
+			{#each dataTypeOptions as opt (opt.value)}
+				<option value={opt.value}>{opt.label}</option>
+			{/each}
+		</select>
+	</label>
+	{#if continuousForm.dataType === 'string'}
+		<label class="field">
+			文字列長（word数）
+			<input
+				type="number"
+				min={MIN_STRING_LENGTH}
+				max={MAX_STRING_LENGTH}
+				bind:value={continuousForm.stringLength}
+			/>
+			<span class="hint">{MIN_STRING_LENGTH}〜{MAX_STRING_LENGTH} word。連番の増分もこの値。</span>
+		</label>
+	{/if}
+	<label class="field">
+		単位
+		<input type="text" bind:value={continuousForm.unit} placeholder="℃" />
+	</label>
+	<label class="field">
+		小数桁数
+		<input type="number" min="0" bind:value={continuousForm.decimals} />
+	</label>
+	<label class="field">
+		RawLo
+		<input type="number" bind:value={continuousForm.rawLo} />
+	</label>
+	<label class="field">
+		RawHi
+		<input type="number" bind:value={continuousForm.rawHi} />
+	</label>
+	<label class="field">
+		EngLo
+		<input type="number" bind:value={continuousForm.engLo} />
+	</label>
+	<label class="field">
+		EngHi
+		<input type="number" bind:value={continuousForm.engHi} />
+	</label>
+	<label class="field">
+		しきい値 H
+		<input type="number" bind:value={continuousForm.thresholdH} />
+	</label>
+	<label class="field">
+		しきい値 HH
+		<input type="number" bind:value={continuousForm.thresholdHh} />
+	</label>
+	<label class="field">
+		しきい値 L
+		<input type="number" bind:value={continuousForm.thresholdL} />
+	</label>
+	<label class="field">
+		しきい値 LL
+		<input type="number" bind:value={continuousForm.thresholdLl} />
+	</label>
+	<label class="field checkbox">
+		<input type="checkbox" bind:checked={continuousForm.enabled} />
+		有効
+	</label>
+	<label class="field checkbox">
+		<input type="checkbox" bind:checked={continuousForm.writable} />
+		書き込み可（writable）
+	</label>
+{/snippet}
+
+{#snippet batchRowErrors(result: BatchTagsResult)}
+	{#if !result.ok}
+		<table class="error-table">
+			<thead>
+				<tr>
+					<th>行</th>
+					<th>項目</th>
+					<th>内容</th>
+				</tr>
+			</thead>
+			<tbody>
+				{#each result.errors as rowError (rowError.index)}
+					{#each rowError.fieldErrors as fe, i (i)}
+						<tr>
+							<td>{rowError.index + 1}</td>
+							<td>{fe.field}</td>
+							<td>{fe.message}</td>
+						</tr>
+					{/each}
+				{/each}
+			</tbody>
+		</table>
+	{/if}
+{/snippet}
+
 <div class="page">
 	<h2>タグ登録</h2>
 
 	{#if canWrite}
+		<div class="mode-toggle">
+			<button type="button" class:active={mode === 'single'} onclick={() => (mode = 'single')}
+				>通常登録</button
+			>
+			<button
+				type="button"
+				class:active={mode === 'continuous'}
+				onclick={() => (mode = 'continuous')}>連続登録</button
+			>
+		</div>
+	{/if}
+
+	{#if canWrite && mode === 'single'}
 		<section class="create">
 			<h3>新規作成</h3>
 			{@render tagFields(createForm, createErrors)}
@@ -512,6 +791,106 @@
 			>
 			{#if groups.length === 0}
 				<p class="note">先に 収集グループ を1件以上登録してください。</p>
+			{/if}
+		</section>
+	{/if}
+
+	{#if canWrite && mode === 'continuous'}
+		<section class="create">
+			<h3>連続登録</h3>
+			<p class="note">
+				名前パターン（<code>{'{n}'}</code>が連番に置き換わります。例:
+				<code>temp{'{n}'}</code> + 開始1 + 3点 → temp1, temp2,
+				temp3）・開始アドレス・点数・共通設定から連続タグを一括生成します。アドレスの増分はデータ型から自動決定（i16/u16
+				等のワード型は+1、i32/u32/f32 は+2、string は文字列長分）。ビット指定アドレス（<code
+					>D100.5</code
+				>のような形式）や、16進数値デバイス（<code>X</code>/<code>Y</code>/<code>B</code>/<code
+					>W</code
+				>/<code>SB</code>/<code>SW</code>/<code>DX</code>/<code>DY</code
+				>）の連続登録は現時点では未対応です。
+			</p>
+			<div class="form-grid">
+				<label class="field">
+					対象グループ
+					<select bind:value={continuousForm.collectionGroupId}>
+						<option value="" disabled>選択してください</option>
+						{#each groupsFor('plc') as group (group.id)}
+							<option value={String(group.id)}>{group.name}</option>
+						{/each}
+					</select>
+				</label>
+				<label class="field">
+					名前パターン
+					<input type="text" bind:value={continuousForm.namePattern} placeholder="temp{'{n}'}" />
+				</label>
+				<label class="field">
+					開始番号
+					<input type="number" bind:value={continuousForm.startNumber} />
+				</label>
+				<label class="field">
+					開始アドレス
+					<input type="text" bind:value={continuousForm.startAddress} placeholder="D3000" />
+				</label>
+				<label class="field">
+					点数
+					<input
+						type="number"
+						min="1"
+						max={MAX_CONTINUOUS_COUNT}
+						bind:value={continuousForm.count}
+					/>
+				</label>
+				{@render continuousCommonFields()}
+			</div>
+
+			{#if groups.length === 0}
+				<p class="note">先に 収集グループ を1件以上登録してください。</p>
+			{/if}
+
+			{#if continuousPreview && !continuousPreview.ok}
+				<p class="err">{continuousPreview.error}</p>
+			{:else if continuousPreview?.ok}
+				<h4>プレビュー（{continuousPreview.rows.length}件）</h4>
+				<div class="preview-wrap">
+					<table class="preview-table">
+						<thead>
+							<tr>
+								<th>#</th>
+								<th>名前</th>
+								<th>アドレス</th>
+							</tr>
+						</thead>
+						<tbody>
+							{#each continuousPreview.rows as row, i (i)}
+								<tr>
+									<td>{i + 1}</td>
+									<td>{row.name}</td>
+									<td>{row.address}</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+				</div>
+
+				{#if validationResult}
+					{@render batchRowErrors(validationResult)}
+				{/if}
+
+				<div class="actions">
+					<button type="button" onclick={handleValidateContinuous} disabled={validating}
+						>検証</button
+					>
+					<button
+						type="button"
+						onclick={handleApplyContinuous}
+						disabled={!continuousValidatedFresh || applyingContinuous}>登録</button
+					>
+					{#if !continuousValidatedFresh}
+						<span class="hint"
+							>先に「検証」を実行してください（フォームを変更すると再検証が必要）。</span
+						>
+					{/if}
+				</div>
 			{/if}
 		</section>
 	{/if}
@@ -669,6 +1048,60 @@
 	button.danger {
 		background: transparent;
 		border: 1px solid var(--banto-danger);
+		color: var(--banto-danger);
+	}
+
+	.mode-toggle {
+		display: flex;
+		gap: 0.5rem;
+	}
+
+	.mode-toggle button {
+		background: transparent;
+		border: 1px solid var(--banto-border);
+		color: var(--banto-text-muted);
+	}
+
+	.mode-toggle button.active {
+		background: var(--banto-primary);
+		border-color: var(--banto-primary);
+		color: var(--banto-text-inverse);
+	}
+
+	h4 {
+		margin: 0.75rem 0 0.5rem;
+		font-size: 0.85rem;
+	}
+
+	.preview-wrap {
+		max-height: 260px;
+		overflow: auto;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+	}
+
+	.preview-table,
+	.error-table {
+		width: 100%;
+		border-collapse: collapse;
+		font-size: 0.8rem;
+	}
+
+	.preview-table th,
+	.preview-table td,
+	.error-table th,
+	.error-table td {
+		padding: 0.35rem 0.6rem;
+		border-bottom: 1px solid var(--banto-border);
+		text-align: left;
+	}
+
+	.error-table {
+		margin-top: 0.5rem;
+	}
+
+	.error-table th,
+	.error-table td {
 		color: var(--banto-danger);
 	}
 
