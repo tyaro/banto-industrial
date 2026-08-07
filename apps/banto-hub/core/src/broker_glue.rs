@@ -300,8 +300,9 @@ impl HubSessions {
     /// `connection_id` の broker セッションが既に生きていれば、その読み取り
     /// 専用ハンドルを返す(新規に起動はしない) - T12(docs/ux-plan.md §4)の
     /// 接続テストが、収集稼働中の SLMP 接続に対して2本目をダイヤルしてしまう
-    /// 誤診(実機R08ENCPUはSLMP同時セッション1本まで、このモジュールの doc
-    /// comment参照)を避けるための読み取り専用の覗き見。
+    /// 誤診(実機R08ENCPUは対象ポートが既に使用中だと同じポートへの2本目を
+    /// 受け付けない、このモジュールの doc comment参照)を避けるための
+    /// 読み取り専用の覗き見。
     pub fn handle_for(&self, connection_id: i64) -> Option<banto_broker::ReadOnlyHandle> {
         self.directory.handle(connection_id).map(|h| h.read_only())
     }
