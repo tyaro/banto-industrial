@@ -246,10 +246,60 @@ retain`（`TagInput` の全フィールドと1:1対応、`collectionGroupId` だ
 
 **スライス**:
 
-| スライス | 内容                                                                                  |
-| -------- | ------------------------------------------------------------------------------------- |
-| T13-1    | 汎用部品(Drawer/SplitPane/Tree)+ tags ページの master-detail 化(フォームのドロワー化) |
-| T13-2    | monitor ページへのツリー適用(ドロップダウンフィルタ置換)+ 仕上げ                      |
+| スライス | 内容                                                                                                              |
+| -------- | ----------------------------------------------------------------------------------------------------------------- |
+| T13-1    | 汎用部品(Drawer/SplitPane/Tree)+ tags ページの master-detail 化(フォームのドロワー化)（**実装済み・2026-08-08**） |
+| T13-2    | monitor ページへのツリー適用(ドロップダウンフィルタ置換)+ 仕上げ                                                  |
+
+**T13-1 実装メモ（2026-08-08）**:
+
+- 汎用部品（`apps/banto-hub/src/lib/components/`、banto-hub の型に
+  一切依存しない）: `Drawer.svelte`（右スライドオーバー、Esc/オーバー
+  レイクリックで閉じる・開いたら先頭要素へフォーカス）、
+  `SplitPane.svelte`（左右2ペイン、左幅は `leftWidth` prop 固定 —
+  リサイズ可能スプリッタは需要が出てから、と判断して見送り）、
+  `TreeView.svelte`（2階層ツリー、ノードの見た目は `label` スナペットに
+  委ねジェネリックさを保つ。展開状態は内部管理で、新規ルートノードだけ
+  自動展開し既存ノードの開閉は保持する）。共有する型（`TreeNode<T>`）は
+  `.svelte` のインスタンススクリプトから export せず `treeTypes.ts` に
+  分離（`@banto/grid-svelte` の `types.ts` と同じ流儀）。
+- アプリ側コンポーネント: `ConnectionTree.svelte`（同じく
+  `src/lib/components/` 配下 — 既存の Header/Sidebar もこのフォルダに
+  同居しており、汎用/アプリ結合の区別はフォルダでなく import 依存で
+  判断する既存の流儀に合わせた）。接続→収集グループの2階層を組み立て、
+  シミュレーションバッジ（⚠ SIM）・calc/mem 専用アイコン
+  （🧮/💾）・グループのタグ数を `label` スナペットで描画する。「すべて」
+  ノードで tags ページ側のツリーフィルタを解除する。
+- tags ページ: `SplitPane` で左に `ConnectionTree`、右にツールバー
+  （新規登録・連続登録・CSVインポート・CSVエクスポート・検索ボックス）+
+  画面全高の `BantoGrid`（audit-log ページと同じ
+  `height: calc(100vh - var(--banto-shell-header-height) - 2.5rem)` +
+  `flex: 1; min-height: 0` の型）。通常登録・行クリック編集・連続登録・
+  CSVインポートの4フローは `drawerMode`
+  （`'create' | 'edit' | 'continuous' | 'csv' | null`）1つで `Drawer` の
+  表示を駆動する形に統合し、フォーム状態・検証・dry-run のロジック
+  （`toInput`/`formFromTag`/連続登録生成/CSVパース等）は無変更で移設。
+  検索（名前・アドレスの部分一致）とツリー選択は `filteredTags`
+  derived で合成し、クライアントサイドで `BantoGrid` に渡す。
+- **T13-3 への拡張点（2026-08-08、オーナー決定のスコープ追加）**:
+  「ツリーからの右クリック作成」は T13-3 で本実装するが、配線の土台だけ
+  このスライスで仕込んだ。`TreeView.svelte` はノードの右クリックを
+  `oncontextmenu?: (node, { x, y }) => void` prop で上位へ通知できる
+  （メニュー UI 自体は持たない汎用部品のまま — prop 未指定なら
+  `preventDefault` せず素通しして OS/ブラウザ標準メニューを出す）。
+  `ConnectionTree.svelte` はこの `oncontextmenu` をそのまま再公開する
+  prop を持つが、tags ページはまだ配線していない。T13-3 では tags
+  ページ側で `ConnectionTree` に `oncontextmenu` ハンドラを渡し、
+  `node.data.kind`（`'all' | 'connection' | 'group'`）で分岐して
+  「すべて」ノードなら新規接続、接続ノードなら新規グループ、グループ
+  ノードなら新規タグ、というコンテキストメニュー UI（呼び出し側が
+  自前で用意する）を渡された座標に表示する形になる想定。
+- 検証: `pnpm --filter banto-hub check`（svelte-check）0 errors /
+  0 warnings。Rust 側は無変更。
+- 運用手順は
+  [banto-hub-operations.md §15](banto-hub-operations.md#15-タグの連続登録)/
+  [§16](banto-hub-operations.md#16-タグの-csv-インポートエクスポート)
+  にドロワー化の注記を追加（手順自体は不変）。
 
 ## 5. バックログ（次点、未着手 — 優先度はオーナー判断）
 
