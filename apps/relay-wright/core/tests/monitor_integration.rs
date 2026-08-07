@@ -210,7 +210,7 @@ async fn monitor_group_read_returns_display_ready_values_over_the_engine_session
     f.sim.set_bit(SlmpDevice::M, 10, true);
     // "OK" in SJIS, low byte first within the word: 0x4B4F.
     f.sim
-        .set_word(SlmpDevice::D, 300, u16::from_le_bytes([b'O', b'K']));
+        .set_word(SlmpDevice::D, 300, u16::from_le_bytes(*b"OK"));
 
     let (engine, control) = Engine::start(
         f.pool.clone(),
@@ -320,7 +320,7 @@ async fn manual_write_lands_while_disarmed_and_is_audited() {
     write_until_ok(&control, text, "OK", "debugger").await;
     assert_eq!(
         f.sim.get_word(SlmpDevice::D, 310),
-        u16::from_le_bytes([b'O', b'K'])
+        u16::from_le_bytes(*b"OK")
     );
 
     write_until_ok(&control, bit, "1", "debugger").await;
