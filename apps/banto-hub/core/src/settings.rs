@@ -18,12 +18,22 @@
 //! LAN 前提」と同じ線引きで、[`MqttSettings`] のフィールド doc comment に
 //! 判断根拠を記す。
 //!
-//! T4（docs/tag-server-design.md §5.4）で `grpc.*`（2キー、
+//! T4（docs/tag-server-design.md §5.4）で `grpc.*`（3キー、
 //! [`GrpcSettings`]）を追加した。`grpc.enabled` の既定は `false`（設計
 //! 「grpc.enabled(既定 false)」）- REST/WS と違い gRPC は既定で listen
 //! しない、管理 UI で明示的に有効化する形（`WriteControl` の「起動時
 //! disabled」ほど安全上の意味はないが、既定で新しいポートを勝手に開けない
 //! という運用上の配慮）。
+//!
+//! H3（2026-08-08 オーナー決定、docs/improvement-plan.md H3）で
+//! `grpc.bind` を追加した。gRPC は API キー認証必須だが TLS が無いため、
+//! それまで `crate::grpc::GrpcServer::apply` が `"0.0.0.0:{port}"` を
+//! リテラルで bind していたのは REST/WS の既定（`server.bind` =
+//! `127.0.0.1`）と非対称かつ危険（有効化すると API キーが平文で全
+//! インターフェースに流れる）だった。`grpc.bind` の既定を `127.0.0.1`
+//! にし、LAN 公開は管理者が明示的に `0.0.0.0` 等へ変更する opt-in に
+//! 揃える。既に gRPC を LAN 公開で運用していた環境は、アップグレード後に
+//! `grpc.bind` の再設定が必要（意図した安全側の破壊的変更）。
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -46,6 +56,7 @@ const KEY_MQTT_QOS: &str = "mqtt.qos";
 const KEY_MQTT_MIN_INTERVAL_MS: &str = "mqtt.min_interval_ms";
 
 const KEY_GRPC_ENABLED: &str = "grpc.enabled";
+const KEY_GRPC_BIND: &str = "grpc.bind";
 const KEY_GRPC_PORT: &str = "grpc.port";
 
 /// hub の既定ポート（docs/tag-server-design.md §8: 「管理 UI + REST + WS =
@@ -67,6 +78,11 @@ pub const DEFAULT_MQTT_MIN_INTERVAL_MS: i64 = 1000;
 
 /// gRPC の既定ポート（設計 §5.4/§8「既定: REST 880x 系 / gRPC 50051」）。
 pub const DEFAULT_GRPC_PORT: u16 = 50051;
+/// gRPC の既定 bind アドレス（2026-08-08 オーナー決定、
+/// docs/improvement-plan.md H3: 「設定キー `grpc.bind` を追加し既定を
+/// `127.0.0.1` に変更。公開は管理者の明示 opt-in」）。`ServerSettings`
+/// （REST/WS、`server.bind`）と同じ既定値に揃える。
+pub const DEFAULT_GRPC_BIND: &str = "127.0.0.1";
 
 /// hub サーバー本体の bind/port（設計 §8）。ChronoGazer の
 /// `ServerSettings` と違い `enabled` は持たない - hub は常時サーバーで
@@ -149,9 +165,19 @@ impl Default for MqttSettings {
 
 /// T4（docs/tag-server-design.md §5.4）: gRPC サーバーの設定。REST とは
 /// 別ポートで listen する（設計「ポートは REST と分離」）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `bind`（2026-08-08 オーナー決定、docs/improvement-plan.md H3、既定
+/// [`DEFAULT_GRPC_BIND`] = `"127.0.0.1"`）: `crate::grpc::GrpcServer::apply`
+/// がこの値を `std::net::IpAddr` としてパースして bind する
+/// （`ServerSettings::bind` と同じ「文字列のまま保持し、使う側が検証・
+/// 変換する」層構造 — このモジュールでは形式検証しない。不正な文字列が
+/// DB に直接書き込まれた場合の扱いは `GrpcServer::apply` のdoc comment
+/// 参照）。`String` フィールドを持つため `Copy` は付けない
+/// （`MqttSettings`/`ServerSettings` と同じ判断）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrpcSettings {
     pub enabled: bool,
+    pub bind: String,
     pub port: u16,
 }
 
@@ -159,6 +185,7 @@ impl Default for GrpcSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            bind: DEFAULT_GRPC_BIND.to_string(),
             port: DEFAULT_GRPC_PORT,
         }
     }
@@ -318,7 +345,10 @@ impl SettingsService {
     }
 
     /// T4（設計 §5.4）: gRPC 設定、未設定キーは [`GrpcSettings::default`]
-    /// にフォールバック（既定 `enabled: false`）。
+    /// にフォールバック（既定 `enabled: false`、`bind: "127.0.0.1"`。
+    /// 2026-08-08 オーナー決定、docs/improvement-plan.md H3）。`bind` は
+    /// `server_config`の`bind`と同じく、ここでは文字列のまま読むだけで
+    /// 形式検証はしない（[`GrpcSettings`]のdoc comment参照）。
     pub async fn grpc_config(&self) -> Result<GrpcSettings, BantoError> {
         let defaults = GrpcSettings::default();
         let enabled = self
@@ -326,12 +356,17 @@ impl SettingsService {
             .await?
             .map(|value| value == "true")
             .unwrap_or(defaults.enabled);
+        let bind = self.get(KEY_GRPC_BIND).await?.unwrap_or(defaults.bind);
         let port = self
             .get(KEY_GRPC_PORT)
             .await?
             .and_then(|value| value.parse::<u16>().ok())
             .unwrap_or(defaults.port);
-        Ok(GrpcSettings { enabled, port })
+        Ok(GrpcSettings {
+            enabled,
+            bind,
+            port,
+        })
     }
 
     pub async fn set_grpc_config(&self, config: &GrpcSettings) -> Result<(), BantoError> {
@@ -340,6 +375,7 @@ impl SettingsService {
             if config.enabled { "true" } else { "false" },
         )
         .await?;
+        self.set(KEY_GRPC_BIND, &config.bind).await?;
         self.set(KEY_GRPC_PORT, &config.port.to_string()).await?;
         Ok(())
     }
@@ -463,6 +499,7 @@ mod tests {
         let config = svc.grpc_config().await.unwrap();
         assert_eq!(config, GrpcSettings::default());
         assert!(!config.enabled);
+        assert_eq!(config.bind, "127.0.0.1");
         assert_eq!(config.port, 50051);
     }
 
@@ -471,9 +508,29 @@ mod tests {
         let svc = service().await;
         let config = GrpcSettings {
             enabled: true,
+            bind: "0.0.0.0".to_string(),
             port: 51000,
         };
         svc.set_grpc_config(&config).await.unwrap();
         assert_eq!(svc.grpc_config().await.unwrap(), config);
+    }
+
+    /// アップグレード互換性（2026-08-08 オーナー決定、
+    /// docs/improvement-plan.md H3）: `grpc.bind` を導入する前から
+    /// `grpc.enabled`/`grpc.port` だけが保存されている DB（＝この機能が
+    /// 無かった頃の既存環境）でも、`grpc.bind` キーが無ければ
+    /// [`DEFAULT_GRPC_BIND`]（`"127.0.0.1"`）にフォールバックする
+    /// （`grpc.bind` 抜きで直接キーを書き込み、他の2キーだけが設定された
+    /// 状態を再現する）。
+    #[tokio::test]
+    async fn grpc_config_bind_defaults_to_loopback_when_only_bind_key_is_missing() {
+        let svc = service().await;
+        svc.set(KEY_GRPC_ENABLED, "true").await.unwrap();
+        svc.set(KEY_GRPC_PORT, "51000").await.unwrap();
+
+        let config = svc.grpc_config().await.unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.port, 51000);
+        assert_eq!(config.bind, "127.0.0.1");
     }
 }

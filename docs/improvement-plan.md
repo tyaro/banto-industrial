@@ -42,7 +42,7 @@
 | --- | -------------------------------------------------------- | ------ | ---- | ---------------- |
 | H1  | banto-expr の式長・ネスト深さ上限(DoS 根治)              | 最高   | 小   | 完了(残件あり)   |
 | H2  | 手動書き込み(タグモニタ)の安全意味論                     | 最高   | 中   | オーナー判断待ち |
-| H3  | banto-hub gRPC の bind 設定化(既定 127.0.0.1)            | 高     | 中   | 実装中(本 PR)    |
+| H3  | banto-hub gRPC の bind 設定化(既定 127.0.0.1)            | 高     | 中   | 完了(本 PR)      |
 | H4  | 収集タイムスタンプ逆行対策 + append 失敗の可視化         | 高     | 中   | 一部オーナー判断 |
 | H5  | フロントテスト基盤(vitest)+ hub/relay-wright E2E         | 高     | 大   | 未着手           |
 | H6  | サプライチェーン/再現性(deny・audit・toolchain 固定ほか) | 高     | 中   | 未着手           |
@@ -105,7 +105,7 @@
   追記、実装、挙動を固定するテストの更新(現行テストは仕様変更に合わせて
   書き換え)、relay-wright README の安全上の注意の更新
 
-### H3: banto-hub gRPC の bind 設定化 — 状態: 実装中(本 PR)
+### H3: banto-hub gRPC の bind 設定化 — 状態: 完了(2026-08-08、本 PR)
 
 - **事実**: `apps/banto-hub/core/src/grpc.rs` の `GrpcServer::apply` が
   `"0.0.0.0:{port}"` をリテラルで bind しており、変更する設定キーが存在
@@ -122,6 +122,15 @@
 - **受け入れ条件**: settings round-trip・REST PUT/GET・不正値 400・不正
   保存値で落ちないことのテスト、既存 gRPC テスト green、運用ドキュメント
   更新
+- **実施記録(2026-08-08)**: 設定キー `grpc.bind`(既定
+  `DEFAULT_GRPC_BIND = "127.0.0.1"`)を追加し、`GrpcServer::apply` は
+  `IpAddr` パース + `SocketAddr::new`(IPv6 対応)で bind、不正保存値では
+  gRPC のみ起動スキップ(プロセスは落ちない)。`PUT /api/grpc-settings`
+  の `bind` は省略時に現在値維持(mqtt.password と同じ規約)、不正値は
+  既存流儀どおり 422(validation)で拒否。pre-H3 DB(bind キー無し)の
+  フォールバックを含むテスト 6 本を追加、`cargo test -p banto-hub-core`
+  232 本 green。設定 UI に入力欄+平文リスクの注記、運用ドキュメント
+  §1/§2/§6/§8 を更新(アップグレード時の再設定注意を明記)
 - **関連(同梱しない)**: relay-wright の開発用バイナリ
   `relay-wright-serve` の既定 bind も `0.0.0.0`
   (`core/src/bin/relay-wright-serve.rs`)。開発用途と明記されているため

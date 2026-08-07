@@ -195,10 +195,15 @@
 	// 呼ぶので、ここでは保存 API を呼んで結果を反映するだけでよい)。MQTT と
 	// 違いパスワード等の秘匿情報を持たないため、フォームは常に現在値を
 	// そのまま表示する。
+	//
+	// `bind`(2026-08-08 オーナー決定、docs/improvement-plan.md H3)は既定
+	// `127.0.0.1` - `port` と同じく常にフォームの現在値をそのまま送る
+	// (`grpcSettingsAdmin.ts`のdoc comment参照)。
 
 	const canManageGrpc = $derived(isAdmin(sessionStore.role));
 
 	let grpcEnabled = $state(false);
+	let grpcBind = $state('127.0.0.1');
 	let grpcPort = $state(50051);
 
 	let grpcLoaded = $state(false);
@@ -207,6 +212,7 @@
 
 	function applyGrpcSettings(loaded: GrpcSettings): void {
 		grpcEnabled = loaded.enabled;
+		grpcBind = loaded.bind;
 		grpcPort = loaded.port;
 	}
 
@@ -233,7 +239,11 @@
 		grpcError = null;
 		grpcSaving = true;
 		try {
-			const saved = await saveGrpcSettings({ enabled: grpcEnabled, port: grpcPort });
+			const saved = await saveGrpcSettings({
+				enabled: grpcEnabled,
+				bind: grpcBind,
+				port: grpcPort
+			});
 			applyGrpcSettings(saved);
 			toastStore.push('success', 'gRPC 設定を保存しました(即時適用されます)');
 		} catch (err) {
@@ -403,6 +413,15 @@
 						<input type="checkbox" bind:checked={grpcEnabled} />
 						gRPC サーバーを有効にする
 					</label>
+
+					<label class="field">
+						Bind アドレス
+						<input type="text" bind:value={grpcBind} placeholder="127.0.0.1" />
+					</label>
+					<p class="note">
+						127.0.0.1 = このPCのみ(既定・推奨) / 0.0.0.0 = 全インターフェース(非推奨: TLS が
+						無いため API キーが平文で LAN に流れます)。
+					</p>
 
 					<label class="field">
 						ポート

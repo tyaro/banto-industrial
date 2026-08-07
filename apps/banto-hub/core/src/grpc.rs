@@ -4,7 +4,11 @@
 //! `build.rs` が `tonic-prost-build` でビルド時コード生成し
 //! (`OUT_DIR`、コミットしない)、この module がそれを
 //! [`tagserver_v1`] としてラップする。ポートは REST と分離
-//! (既定 50051、設計 §8・[`crate::settings::DEFAULT_GRPC_PORT`])。
+//! (既定 50051、設計 §8・[`crate::settings::DEFAULT_GRPC_PORT`])。bind
+//! アドレスは既定 `127.0.0.1`(2026-08-08 オーナー決定、
+//! docs/improvement-plan.md H3・[`crate::settings::DEFAULT_GRPC_BIND`])
+//! で、以前のように無条件で `0.0.0.0`(全インターフェース)へ bind する
+//! ことはない([`GrpcServer::apply`] のdoc comment参照)。
 //!
 //! ## 意味論は REST/WS と完全に同一(設計 §5.4)
 //!
@@ -59,7 +63,7 @@
 //! に `denied` を記録する(`origin: "grpc"`)。エラー写像は
 //! [`GrpcService::authenticate`] の doc comment参照。
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -671,7 +675,7 @@ impl GrpcServer {
     }
 
     /// 現在の設定を即時反映する: 実行中インスタンスがあれば止め、
-    /// `settings.enabled` なら新しいポートで bind し直す
+    /// `settings.enabled` なら `settings.bind:settings.port` で bind し直す
     /// (`MqttPublisher::apply`/`CollectorManager::rebuild` と同じ「古い
     /// タスクを止めて新しいタスク」パターン)。`bin/banto-hub.rs` の起動
     /// シーケンスと `PUT /api/grpc-settings` の両方から呼ばれる。
@@ -680,6 +684,19 @@ impl GrpcServer {
     /// `MqttPublisher::stop_locked` が poll/eval タスクを abort するのと
     /// 同じ判断: gRPC サーバータスクは内部状態を持たない(`GrpcService`
     /// は読み取り専用ハンドルの束)ので、即座に打ち切っても不整合が残らない。
+    ///
+    /// `settings.bind` は `String` → `IpAddr` パース(2026-08-08 オーナー
+    /// 決定、docs/improvement-plan.md H3)。以前のような
+    /// `format!("0.0.0.0:{port}")` の文字列結合は使わない - IPv6 アドレス
+    /// (`::1` 等)を渡すと `"::1:50051"` のような壊れた文字列になり
+    /// パースに失敗するため、`SocketAddr::new(ip, port)` で組み立てる。
+    /// パースに失敗した場合(DB に不正な文字列が直接書き込まれた場合など)
+    /// は **panic しない** - eprintln で通知したうえで gRPC サーバーを
+    /// 起動せずに戻る。gRPC は任意設定のサブシステムなので、bind
+    /// アドレス1つの不正値でプロセス全体(REST/WS を含む)を落とす理由が
+    /// ない(`grpc_config`が失敗したときに既定値へフォールバックする
+    /// `bin/banto_hub/hub_run.rs`と同じ「壊れた設定で全体を道連れに
+    /// しない」判断)。
     pub async fn apply(&self, settings: &GrpcSettings) {
         let mut guard = self.running.lock().await;
         if let Some(handle) = guard.take() {
@@ -689,9 +706,19 @@ impl GrpcServer {
             return;
         }
 
-        let addr: SocketAddr = format!("0.0.0.0:{}", settings.port)
-            .parse()
-            .expect("u16 のポート番号は常に有効な SocketAddr になる");
+        let ip: IpAddr = match settings.bind.parse() {
+            Ok(ip) => ip,
+            Err(err) => {
+                eprintln!(
+                    "banto-hub: grpc.bind の値 \"{}\" を IP アドレスとして解釈できません\
+                     ({err}) - gRPC サーバーは起動しません(管理 UI または \
+                     PUT /api/grpc-settings で bind を修正してください)",
+                    settings.bind
+                );
+                return;
+            }
+        };
+        let addr = SocketAddr::new(ip, settings.port);
         let server = TagServiceServer::new(self.service.clone());
         let handle = tokio::spawn(async move {
             if let Err(err) = Server::builder().add_service(server).serve(addr).await {

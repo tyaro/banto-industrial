@@ -5,8 +5,16 @@
  * の admin-UI リソース）。
  *
  * MQTT と違い認証情報（パスワード等）を持たないため、`MqttSettingsInput`の
- * ような「変更なし」を表す空文字規約は不要 - `enabled`/`port` の2値を
- * そのまま読み書きする。
+ * ような「変更なし」を表す空文字規約は不要 - `enabled`/`port`/`bind` は
+ * 常に現在値をそのまま読み書きする（この UI からの保存では常にフォームに
+ * 表示中の値を送る - 既存の port 入力と同じ扱い）。
+ *
+ * `bind`（2026-08-08 オーナー決定、docs/improvement-plan.md H3）: 既定は
+ * `127.0.0.1`。サーバー側の `PUT` は `bind` を省略（`undefined`/`null`）
+ * すると現在値を維持する規約を持つが、この管理 UI は常に現在値を積んで
+ * 送るため実質使わない（プログラムからの直接呼び出しでポートだけを
+ * 変えたい場合等に使える経路として、型は `bind` を必須のままにしている
+ * - サーバー側の「省略可」は `+page.svelte` の外側の API 利用者向け）。
  *
  * 保存(`PUT`)は即時適用される（設計実装指示「保存で即時適用」）- サーバー側が
  * 保存直後に `crate::grpc::GrpcServer::apply` を呼ぶ。
@@ -17,6 +25,12 @@ import { CSRF_HEADER } from './setup';
 /** `GET/PUT /api/grpc-settings`の応答/入力（同一形）。 */
 export interface GrpcSettings {
 	enabled: boolean;
+	/**
+	 * bind アドレス（既定 `127.0.0.1`）。`127.0.0.1` はこの PC のみ、
+	 * `0.0.0.0` は全インターフェースに listen する（`+page.svelte`の
+	 * 説明文参照）。
+	 */
+	bind: string;
 	port: number;
 }
 

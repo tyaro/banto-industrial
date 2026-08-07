@@ -45,6 +45,7 @@
 //! 強制的に `q: "bad", v: null` を返す（欠測を隠さない）。404 になるのは
 //! catalog に定義そのものが存在しない外部名だけ。
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1261,8 +1262,17 @@ fn mqtt_settings_router(
 // 同型: admin ロール限定 + CSRF + `PUT` 成功で `crate::grpc::GrpcServer::apply`
 // を呼んで即時適用する（実装指示「保存で即時適用 - MqttPublisher と同じ
 // 再起動可能マネージャパターン」）。MQTT と違い認証情報(パスワード等)を
-// 持たないため、`MqttSettingsRequest`ほど複雑な「変更なし」フィールドの
-// 扱いは不要 - `enabled`/`port` の2値をそのまま読み書きする。
+// 持たないため、`enabled`/`port` は常に現在値をそのまま読み書きする。
+//
+// 2026-08-08 オーナー決定(docs/improvement-plan.md H3)で `bind`
+// (`crate::settings::GrpcSettings::bind`、既定 `127.0.0.1`)を追加した -
+// `PUT` の `bind` は `Option<String>` で、`mqtt.password` と同じ「省略
+// (`None`)= 現在値を維持」規約に合わせる(`GrpcSettingsBody`のdoc comment
+// 参照)。ただし `bind` は秘匿情報ではないので、`password`と違い明示的な
+// 空文字を「変更なし」とは扱わない - 指定した以上は有効な IP アドレスで
+// あることを要求する(`validate_grpc_settings_body`参照)。gRPC は認証
+// 必須だが TLS が無いため、既定を loopback にして LAN 公開は管理者の
+// 明示 opt-in とする(`crate::grpc::GrpcServer::apply`のdoc comment参照)。
 
 #[derive(Clone)]
 struct GrpcSettingsAdminState {
@@ -1274,10 +1284,20 @@ struct GrpcSettingsAdminState {
 }
 
 /// `GET/PUT /api/grpc-settings`の request/response body。
+///
+/// `bind`: `PUT` で省略(未送信、または `null`)すると現在値を維持する
+/// (このモジュールの「gRPC 設定」セクション doc comment参照)。`GET` の
+/// 応答には常に現在の設定値が入る(`From<GrpcSettings>`参照 - 省略が
+/// 起きるのは request 側だけ)。
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct GrpcSettingsBody {
     enabled: bool,
+    /// 省略時(`None`)は現在値を維持。指定する場合は `IpAddr` として
+    /// 解釈できる文字列(例: `"127.0.0.1"`/`"0.0.0.0"`)である必要がある
+    /// - 既定は `crate::settings::DEFAULT_GRPC_BIND`(`"127.0.0.1"`)。
+    #[serde(default)]
+    bind: Option<String>,
     port: u16,
 }
 
@@ -1285,6 +1305,7 @@ impl From<crate::settings::GrpcSettings> for GrpcSettingsBody {
     fn from(config: crate::settings::GrpcSettings) -> Self {
         Self {
             enabled: config.enabled,
+            bind: Some(config.bind),
             port: config.port,
         }
     }
@@ -1299,23 +1320,54 @@ async fn grpc_settings_get(
     Ok(Json(config.into()))
 }
 
+/// 入力検証:
+/// - `port` は 0 不可(`u16` なので上限 65535 は型で保証済み)
+/// - `bind` を指定した場合(`Some`)は `IpAddr` として解釈できる必要がある
+///   - 省略(`None`)は「現在値を維持」であって検証対象ではない
+///     (`GrpcSettingsBody::bind`のdoc comment参照)
+///   - `mqtt.password` と違い、空文字は「変更なし」の特別扱いをしない
+///     (空文字は単に不正な IP として弾かれる) - bind は秘匿情報ではない
+///     ので `None`/フィールド省略のほうで「維持」の意図を表せば足りる
+fn validate_grpc_settings_body(body: &GrpcSettingsBody) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+    if body.port == 0 {
+        errors.push(FieldError {
+            field: "port".to_string(),
+            message: "port は 1〜65535 で指定してください".to_string(),
+        });
+    }
+    if let Some(bind) = &body.bind {
+        if bind.parse::<IpAddr>().is_err() {
+            errors.push(FieldError {
+                field: "bind".to_string(),
+                message: "bind は IP アドレス(例: 127.0.0.1、0.0.0.0)で指定してください"
+                    .to_string(),
+            });
+        }
+    }
+    errors
+}
+
 async fn grpc_settings_put(
     State(state): State<GrpcSettingsAdminState>,
     headers: HeaderMap,
     Json(body): Json<GrpcSettingsBody>,
 ) -> Result<Json<GrpcSettingsBody>, ApiError> {
-    if body.port == 0 {
-        return Err(ApiError(BantoError::Validation {
-            field_errors: vec![FieldError {
-                field: "port".to_string(),
-                message: "port は 1〜65535 で指定してください".to_string(),
-            }],
-        }));
+    let field_errors = validate_grpc_settings_body(&body);
+    if !field_errors.is_empty() {
+        return Err(ApiError(BantoError::Validation { field_errors }));
     }
 
     let settings_service = SettingsService::new(state.manager.pool());
+    // `bind` 省略時は現在値を維持する(`GrpcSettingsBody::bind`のdoc
+    // comment参照 - `mqtt_settings_put`が`password`の「変更なし」を
+    // 解決するために既存値を読むのと同じ形)。
+    let existing = settings_service.grpc_config().await?;
+    let bind = body.bind.unwrap_or(existing.bind);
+
     let config = crate::settings::GrpcSettings {
         enabled: body.enabled,
+        bind,
         port: body.port,
     };
     settings_service.set_grpc_config(&config).await?;
@@ -1332,7 +1384,7 @@ async fn grpc_settings_put(
         "update",
         "grpc_settings",
         "1",
-        Some(json!({ "enabled": config.enabled, "port": config.port })),
+        Some(json!({ "enabled": config.enabled, "bind": config.bind, "port": config.port })),
     )
     .await;
     let _ = state.events.send(ServerEvent::ResourceChanged {
