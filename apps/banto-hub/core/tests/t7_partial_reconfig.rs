@@ -537,7 +537,24 @@ async fn unrelated_connection_is_uninterrupted_by_a_partial_reconfigure() {
         "connection A must not disconnect from an unrelated apply_config change"
     );
 
-    // /api/v1/values で A が good 継続
+    // /api/v1/values で A が good 継続 - A の Collector タスク自体は
+    // apply_config に触れられていない（`unchanged`）が、quality は読み取り時に
+    // 「period(100ms) x STALE_PERIOD_FACTOR(2.5)」= 250ms 以内の更新有無で
+    // 都度導出される（`banto_collect::current`）。CPU 負荷が高いランナーでは
+    // 直前の書き込み処理と competing する他プロセスのせいで A の巡回タスク
+    // 自体のスケジューリングがこの猶予を超えて遅れることがあり、一度も
+    // 切断していなくても読み取りタイミング次第で一時的に stale に見えうる
+    // （フル並列スイートで実際に観測: v["q"] == "stale"）。反応時間ではなく
+    // A が最終的に good を保つことを確認したいので、bound-wait を挟む。
+    assert!(
+        wait_until(Duration::from_secs(8), || async {
+            let (s, v) =
+                get_json(&app.router, "/api/v1/values/line_a.fast_a.ta1", &app.token).await;
+            s == StatusCode::OK && v["v"] == 1111.0 && v["q"] == "good"
+        })
+        .await,
+        "A should remain good after the unrelated reconfigure, even under scheduling jitter"
+    );
     let (status, val_a) =
         get_json(&app.router, "/api/v1/values/line_a.fast_a.ta1", &app.token).await;
     assert_eq!(status, StatusCode::OK);
@@ -820,7 +837,20 @@ async fn deleting_a_connection_untracks_its_broker_session_and_leaves_others_run
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    // A 無停止: 値が引き続き読める。
+    // A 無停止: 値が引き続き読める - 上の
+    // unrelated_connection_is_uninterrupted_by_a_partial_reconfigure と同じ
+    // 理由（quality は読み取り時に period x STALE_PERIOD_FACTOR の猶予で
+    // 都度導出されるため、負荷の高いランナーでは A のタスク自体は無停止でも
+    // 巡回が猶予を超えて遅れ一時的に stale と見えうる）で bound-wait する。
+    assert!(
+        wait_until(Duration::from_secs(8), || async {
+            let (s, v) =
+                get_json(&app.router, "/api/v1/values/line_a.fast_a.ta1", &app.token).await;
+            s == StatusCode::OK && v["q"] == "good"
+        })
+        .await,
+        "A should remain good after B's connection is deleted, even under scheduling jitter"
+    );
     let (status, val_a) =
         get_json(&app.router, "/api/v1/values/line_a.fast_a.ta1", &app.token).await;
     assert_eq!(status, StatusCode::OK);
