@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # rust-toolchain.toml(2026-08-08 導入、H6)と同じバージョンに固定する。
       # cargo-deny-action の `rust-version` を省略するとアクション同梱の
       # イメージ既定バージョン(README 記載時点で 1.85.0)が使われ、この
@@ -58,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           rust-version: '1.94.1'

@@ -21,7 +21,7 @@ jobs:
     # the rust job's banto-core/-storage/-server git-tag deps).
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Version is intentionally omitted: pnpm/action-setup resolves it from
       # the "packageManager" field in the root package.json (pnpm@10.33.0).
@@ -62,7 +62,7 @@ jobs:
     # PUBLIC on 2026-07-12, so Cargo's default git fetcher resolves it with
     # no credentials - no token or insteadOf rewrite is needed here.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -94,7 +94,7 @@ jobs:
     # here once one exists.
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
