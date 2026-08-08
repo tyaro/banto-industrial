@@ -87,7 +87,7 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 # their -core crates), same CI/build reasoning as banto's own workspace
 # Cargo.toml comment on these two.
 keyring = { version = "3", features = ["windows-native", "apple-native", "sync-secret-service"] }
-window-vibrancy = "0.6"
+window-vibrancy = "0.8"
 # Dev-only: isolated temp dirs for filesystem-touching tests (backup
 # service, etc. - mirrors banto's own reasoning for this dependency).
 tempfile = "3"
@@ -119,10 +119,10 @@ utoipa = "5"
 # 用クライアント（dev-dependency のみ - サーバー側は axum 自身の `ws`
 # feature で足りる）。axum 0.8.9 が内部で使っているのと同じ 0.29 系を選び、
 # Cargo.lock に無関係な第2系統を増やさない。
-tokio-tungstenite = "0.29"
-banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v0.1.1" }
-banto-storage = { git = "https://github.com/tyaro/banto.git", tag = "v0.1.1" }
-banto-server = { git = "https://github.com/tyaro/banto.git", tag = "v0.1.1" }
+tokio-tungstenite = "0.30"
+banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v1.1.0" }
+banto-storage = { git = "https://github.com/tyaro/banto.git", tag = "v1.1.0" }
+banto-server = { git = "https://github.com/tyaro/banto.git", tag = "v1.1.0" }
 # T3（docs/tag-server-design.md §5.3）: banto-hub の MQTT publish（外部ブロー
 # カーへ接続するクライアントモードのみ - 組み込みブローカーは §10-4 の判断
 # 待ち）。plan.md §3 で保留になっていた「MQTT クライアント（rumqttc +
