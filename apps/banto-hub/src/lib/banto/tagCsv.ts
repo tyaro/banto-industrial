@@ -15,9 +15,9 @@
  * 「`""` によるエスケープ」の3点さえ実装すれば十分小さいため、自前実装
  * のコストは見合うと判断した。
  *
- * `continuousRegistration.ts` と同じ設計 — 依存なしの純関数群。この
- * リポジトリにはまだ vitest 等のユニットテスト基盤が無いため、テストは
- * 手元の使い捨てスクリプトで手動検証している（完了報告参照）。
+ * `continuousRegistration.ts` と同じ設計 — 依存なしの純関数群。テストは
+ * 同ディレクトリの `tagCsv.test.ts`（vitest、H5 で導入）が全公開 API を
+ * 網羅する。
  */
 import type {
 	CollectionGroup,
@@ -127,7 +127,7 @@ function quoteCsvField(field: string): string {
  * 引用符で囲み、内部の `"` を `""` に二重化する。行区切りは Excel との
  * 相性を優先して CRLF（`\r\n`）固定。`parseCsv(serializeCsv(rows)) ===
  * rows` が任意の入力（埋め込みカンマ・引用符・改行・日本語を含む）で
- * 成り立つことを手動検証済み（完了報告参照）。
+ * 成り立つことを `tagCsv.test.ts` のラウンドトリップテストで固定している。
  */
 export function serializeCsv(rows: string[][]): string {
 	if (rows.length === 0) return '';
