@@ -20,6 +20,7 @@ const KEY_AUTOLOGIN_ENABLED: &str = "auth.autologin.enabled";
 const KEY_AUTOLOGIN_USERNAME: &str = "auth.autologin.username";
 const KEY_AUDIT_RETENTION_DAYS: &str = "audit.retention_days";
 const KEY_AUDIT_RETENTION_ROWS: &str = "audit.retention_rows";
+const KEY_MONITOR_MANUAL_WRITE_ENABLED: &str = "monitor.manual_write_enabled";
 
 /// Default audit-log retention (spec M14): 90 days / 100,000 rows. There is
 /// deliberately no "audit enabled" toggle - the audit trail is a standard
@@ -175,6 +176,30 @@ impl Default for AuditSettings {
             retention_rows: Some(DEFAULT_AUDIT_RETENTION_ROWS),
         }
     }
+}
+
+/// タグモニタ (feature/tag-monitor) の手動書き込み許可設定 (H2, 2026-08-08
+/// オーナー決定 `docs/improvement-plan.md` H2 — B 案): 手動書き込み
+/// (`crate::engine::monitor::EngineControl::monitor_write` が通す
+/// `POST /api/monitor/write` / Tauri `monitor_tag_write` の両経路)は arm
+/// ゲート・レート制限・dry-run を意図的にバイパスする
+/// (`crate::engine::monitor` のモジュール doc 参照)。この設定はその手動
+/// 書き込み自体を許可するかどうかの上位スイッチで、既定は無効 -
+/// 「気づかず常時有効」状態を避けるため、Admin が明示的に有効化しない限り
+/// 手動書き込みは拒否される。有効化/無効化は Admin のみ
+/// (`crate::rest`/`src-tauri` 側の RBAC ゲート)、変更は `settings_change`
+/// として一般 `audit_log` に監査される（このクレート唯一の「既定オフ」
+/// 設定 - 他の3つ（server/auth/audit）はいずれも既定が「変更なしの現状
+/// 維持」であるのに対し、これは意図的に安全側へ倒す新しい既定）。
+///
+/// `Default` is derived (unlike `ServerSettings`/`AuthSettings` above, which
+/// implement it by hand): `bool::default()` already is `false`, so a manual
+/// impl would be redundant - `#[derive(Default)]` is what `clippy::derivable_impls`
+/// wants here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitorSettings {
+    pub manual_write_enabled: bool,
 }
 
 /// Generic key/value settings store, backed by the `settings` table
@@ -420,6 +445,38 @@ impl SettingsService {
         )
         .await?;
         Ok(())
+    }
+
+    /// Read the タグモニタ手動書き込み設定 (H2), falling back to
+    /// [`MonitorSettings::default`] (disabled) for a key that has never been
+    /// set - the safe behavior for both a fresh database and an existing one
+    /// upgraded from before H2.
+    pub async fn monitor_config(&self) -> Result<MonitorSettings, BantoError> {
+        let defaults = MonitorSettings::default();
+        let manual_write_enabled = self
+            .get(KEY_MONITOR_MANUAL_WRITE_ENABLED)
+            .await?
+            .map(|value| value == "true")
+            .unwrap_or(defaults.manual_write_enabled);
+        Ok(MonitorSettings {
+            manual_write_enabled,
+        })
+    }
+
+    /// Persist the タグモニタ手動書き込み設定 (H2). Unlike
+    /// [`SettingsService::set_server_config`]/[`SettingsService::set_auth_config`]
+    /// there is no cross-setting exclusivity guard here - this setting does
+    /// not conflict with anything else in this store.
+    pub async fn set_monitor_config(&self, config: &MonitorSettings) -> Result<(), BantoError> {
+        self.set(
+            KEY_MONITOR_MANUAL_WRITE_ENABLED,
+            if config.manual_write_enabled {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .await
     }
 }
 
@@ -762,5 +819,42 @@ mod tests {
             .unwrap();
         let config = svc.audit_config().await.unwrap();
         assert_eq!(config.retention_days, Some(90));
+    }
+
+    // --- タグモニタ手動書き込み設定 (H2, 2026-08-08) ------------------------
+
+    #[tokio::test]
+    async fn monitor_config_defaults_to_disabled_when_unset() {
+        let svc = service().await;
+        let config = svc.monitor_config().await.unwrap();
+        assert_eq!(config, MonitorSettings::default());
+        assert!(
+            !config.manual_write_enabled,
+            "H2: manual write must default to disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn monitor_config_round_trips_through_set() {
+        let svc = service().await;
+        svc.set_monitor_config(&MonitorSettings {
+            manual_write_enabled: true,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            svc.monitor_config().await.unwrap(),
+            MonitorSettings {
+                manual_write_enabled: true,
+            }
+        );
+
+        // Re-disabling must round-trip back too (not sticky once enabled).
+        svc.set_monitor_config(&MonitorSettings {
+            manual_write_enabled: false,
+        })
+        .await
+        .unwrap();
+        assert!(!svc.monitor_config().await.unwrap().manual_write_enabled);
     }
 }

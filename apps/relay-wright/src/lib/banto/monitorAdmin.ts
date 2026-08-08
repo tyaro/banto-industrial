@@ -2,11 +2,12 @@
  * Client for the タグモニタ screen (feature/tag-monitor). Same
  * three-environment split as `engineAdmin.ts`/`tagRegistryAdmin.ts`:
  *
- * - Tauri webview -> `invoke()` the `monitor_group_read`/`monitor_tag_write`
- *   commands (`apps/relay-wright/src-tauri/src/lib.rs`).
+ * - Tauri webview -> `invoke()` the `monitor_group_read`/`monitor_tag_write`/
+ *   `monitor_config_get`/`monitor_config_apply` commands
+ *   (`apps/relay-wright/src-tauri/src/lib.rs`).
  * - LAN browser served by the embedded server -> `fetch()` the
- *   `POST /api/monitor/read|write` REST routes
- *   (`apps/relay-wright/core/src/rest.rs`).
+ *   `POST /api/monitor/read|write` / `GET`+`PUT /api/monitor/config` REST
+ *   routes (`apps/relay-wright/core/src/rest.rs`).
  * - Plain `vite dev`/`vite preview` demo -> no engine/PLC at all, so every
  *   call rejects with `DEMO_MODE_MESSAGE`; `isMonitorAvailable()` lets the
  *   page show the note up front.
@@ -21,6 +22,15 @@
  * manual write = editor+. Manual writes are the user's explicitly relaxed
  * DEBUG path - no arm gate, no confirm dialog - but every attempt is audited
  * server-side (`write_audit_log`, action `manual_write`).
+ *
+ * H2 (2026-08-08 オーナー決定, `docs/improvement-plan.md` H2 — B 案): manual
+ * writes are ADDITIONALLY gated by the `manual_write_enabled` setting
+ * (`getMonitorConfig`/`setMonitorConfig` below), default OFF - `writeTag`
+ * still exists and behaves exactly as before when the setting is on, but the
+ * backend rejects it with a clear message when it is off. `setMonitorConfig`
+ * is `admin`-only server-side (rejected with a `forbidden` `ProviderError`
+ * otherwise); `getMonitorConfig` is viewer+ (any authenticated role) since
+ * the monitor page itself needs the current value for every role.
  */
 import { invoke } from '@tauri-apps/api/core';
 import { getAuthProvider, isProviderError, ProviderError, type ErrorBody } from '@banto/admin-core';
@@ -37,6 +47,11 @@ export interface MonitorValue {
 	value: number | string | null;
 	quality: 'good' | 'bad';
 	error: string | null;
+}
+
+/** Mirrors `relay_wright_core::settings::MonitorSettings` (camelCase on the wire, H2). */
+export interface MonitorConfig {
+	manualWriteEnabled: boolean;
 }
 
 export const DEMO_MODE_MESSAGE = 'デモモードでは利用できません';
@@ -174,4 +189,30 @@ export async function writeTag(tagId: number, value: string): Promise<void> {
 		body: { tagId, value },
 		expectNoContent: true
 	});
+}
+
+/**
+ * Current 手動書き込み設定 (H2). Any authenticated role may call this - the
+ * monitor page needs it for every role to decide what to render, not just an
+ * admin-only settings screen (see `audit_config_get`'s Rust doc comment for
+ * the contrasting case).
+ */
+export async function getMonitorConfig(): Promise<MonitorConfig> {
+	if (!isMonitorAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri') return invokeCommand<MonitorConfig>('monitor_config_get');
+	return httpRequest<MonitorConfig>('/api/monitor/config', { method: 'GET' });
+}
+
+/**
+ * Persist the `manualWriteEnabled` toggle (H2). `admin`-only (rejected with a
+ * `forbidden` `ProviderError` otherwise).
+ */
+export async function setMonitorConfig(config: MonitorConfig): Promise<MonitorConfig> {
+	if (!isMonitorAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri') {
+		return invokeCommand<MonitorConfig>('monitor_config_apply', {
+			manualWriteEnabled: config.manualWriteEnabled
+		});
+	}
+	return httpRequest<MonitorConfig>('/api/monitor/config', { method: 'PUT', body: config });
 }

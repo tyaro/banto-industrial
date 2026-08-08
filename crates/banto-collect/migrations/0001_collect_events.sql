@@ -15,7 +15,13 @@ CREATE TABLE IF NOT EXISTS collect_events (
     ts INTEGER NOT NULL,
     -- Event kind, snake_case: collection_started | collection_stopped |
     -- plc_connected | plc_disconnected | plc_reconnected | threshold_entered
-    -- | threshold_cleared.
+    -- | threshold_cleared | clock_regression_entered |
+    -- clock_regression_cleared | append_failure_entered |
+    -- append_failure_cleared. No CHECK constraint deliberately - see
+    -- `EventKind::as_str` (src/event.rs) for the authoritative Rust-side
+    -- vocabulary; the last four kinds were added for H4 (2026-08-08 owner
+    -- decision, docs/improvement-plan.md) without a schema change (this
+    -- column was already an unconstrained TEXT NOT NULL).
     kind TEXT NOT NULL,
     -- Which connection (stable "conn:<id>" key), NULL for the collector-wide
     -- collection_started/collection_stopped events.

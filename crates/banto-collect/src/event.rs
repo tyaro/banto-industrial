@@ -49,6 +49,31 @@ pub enum EventKind {
     /// A tag's scaled value left a threshold band (`level` = the band it
     /// left, `value` = the reading that cleared it).
     ThresholdCleared,
+    /// H4 (2026-08-08 オーナー決定, docs/improvement-plan.md): a connection's
+    /// tick observed a `ptime_ms` smaller than the highest one it had seen so
+    /// far - the collection PC's wall clock jumped backwards (NTP sync,
+    /// manual correction). Episode-edge, like `threshold_entered`: emitted
+    /// once when the regression is first observed, not on every subsequent
+    /// regressed tick (`detail` carries the before/after ms). See
+    /// `task::ClockRegressionTracker`.
+    ClockRegressionEntered,
+    /// The companion edge to [`EventKind::ClockRegressionEntered`]: this
+    /// connection's `ptime_ms` climbed back to (or past) the high-water mark
+    /// recorded before the regression - emitted once.
+    ClockRegressionCleared,
+    /// H4: `banto_tstore::TsWriter::append` started failing for one of this
+    /// connection's groups - emitted once when a failure streak begins, not
+    /// on every failed tick (`detail` names the group and carries the
+    /// underlying error). Storage/append failures used to be silently
+    /// swallowed (`let _ = writer.append(...)` in `task.rs`); this and
+    /// [`EventKind::AppendFailureCleared`] are what replaced that silence
+    /// with a recorded anomaly. Collection itself never stops on this - see
+    /// `task.rs`'s module doc.
+    AppendFailureEntered,
+    /// The companion edge to [`EventKind::AppendFailureEntered`]: an append
+    /// for this connection/group succeeded again after one or more failures -
+    /// emitted once (`detail` carries how many consecutive appends failed).
+    AppendFailureCleared,
 }
 
 impl EventKind {
@@ -62,6 +87,10 @@ impl EventKind {
             EventKind::PlcReconnected => "plc_reconnected",
             EventKind::ThresholdEntered => "threshold_entered",
             EventKind::ThresholdCleared => "threshold_cleared",
+            EventKind::ClockRegressionEntered => "clock_regression_entered",
+            EventKind::ClockRegressionCleared => "clock_regression_cleared",
+            EventKind::AppendFailureEntered => "append_failure_entered",
+            EventKind::AppendFailureCleared => "append_failure_cleared",
         }
     }
 }

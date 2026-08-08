@@ -21,13 +21,40 @@
 //! 型検査と同じく「登録時に拒否する意味規則」であり、パーサとエラー生成元を
 //! 分けると、将来関数を追加するときにパーサへ手を入れずに済む
 //! （§4.2「組み込み追加で対応」との相性）。
+//!
+//! ## 深さガード（DoS 対策 - `crate` トップレベル doc 参照）
+//!
+//! [`Parser`] は現在の再帰下降の深さを `depth` フィールドに持ち、
+//! [`Parser::descend`] で [`crate::MAX_NESTING_DEPTH`] を超えたら
+//! [`CompileError::TooDeep`] を返す（超えなければ深さを1増やして渡された
+//! クロージャを呼び、戻り値の成否によらず必ず深さを1戻す - RAII は使わない
+//! が、増減が常に対になるようにこの1箇所に閉じ込めている）。
+//!
+//! 深くネストしうる経路は文法上3つある:
+//!
+//! - 括弧: `primary` → `"(" expr ")"` → `or_expr` → ... → `primary`
+//! - 単項演算子の自己再帰: `unary` → `("-"|"!") unary`
+//! - 関数呼び出し引数: `primary` → `call` の各引数 → `expr`
+//!
+//! [`Parser::descend`] の呼び出しは「式の再入口」（[`Parser::parse_or`]
+//! 自身の本体 - 文法上 `expr` の実体はここ）と「単項演算子の自己再帰」
+//! （[`Parser::parse_unary`] の `-`/`!` 分岐）の2箇所だけに置けば足りる:
+//! 括弧の中身も関数呼び出しの各引数も、内側の式を読むときは必ず
+//! `parse_or` を経由するため、その1箇所で2経路（括弧・関数引数）が同時に
+//! 塞がれ、残る単項演算子の自己再帰だけをもう1箇所で別途塞げば3経路
+//! すべてが尽くされる。
 
 use crate::ast::{BinOp, Expr, UnaryOp};
 use crate::error::CompileError;
 use crate::lexer::{Token, TokenKind};
+use crate::MAX_NESTING_DEPTH;
 
 pub fn parse(tokens: &[Token]) -> Result<Expr, CompileError> {
-    let mut p = Parser { tokens, pos: 0 };
+    let mut p = Parser {
+        tokens,
+        pos: 0,
+        depth: 0,
+    };
     let expr = p.parse_or()?;
     p.expect_eof()?;
     Ok(expr)
@@ -36,6 +63,9 @@ pub fn parse(tokens: &[Token]) -> Result<Expr, CompileError> {
 struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
+    /// 現在の再帰下降の深さ。[`Parser::descend`] だけが増減させる
+    /// （モジュール doc の「深さガード」節参照）。
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -49,6 +79,31 @@ impl<'a> Parser<'a> {
             self.pos += 1;
         }
         t
+    }
+
+    /// 再帰下降の1段階に「降りる」ときに呼ぶ共通ヘルパ（モジュール doc の
+    /// 「深さガード」節参照）。呼び出し前に `depth` を1増やし、
+    /// [`MAX_NESTING_DEPTH`] を超えていれば `f` を呼ばずに
+    /// [`CompileError::TooDeep`] を返す。それ以外は `f` を呼び、その
+    /// 戻り値（`Ok`・`Err` を問わない）を受け取ってから `depth` を1戻して
+    /// 返す - 早期リターンの経路でも増減が必ず対になるようにするため、
+    /// `?` で直接返さずいったん `result` に受けている。
+    fn descend<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, CompileError>,
+    ) -> Result<T, CompileError> {
+        let pos = self.peek().pos;
+        self.depth += 1;
+        let result = if self.depth > MAX_NESTING_DEPTH {
+            Err(CompileError::TooDeep {
+                pos,
+                max: MAX_NESTING_DEPTH,
+            })
+        } else {
+            f(self)
+        };
+        self.depth -= 1;
+        result
     }
 
     fn expect_eof(&mut self) -> Result<(), CompileError> {
@@ -80,20 +135,27 @@ impl<'a> Parser<'a> {
     }
 
     // or_expr := and_expr ("||" and_expr)*
+    //
+    // 文法上の `expr` の実体（モジュール先頭の優先順位表参照）- 括弧の
+    // 中身も関数呼び出しの各引数もここへ再入するため、`descend` を
+    // ここに1つ置くだけで「深さガード」節の3経路のうち2つ（括弧・関数
+    // 引数）が同時に塞がれる。
     fn parse_or(&mut self) -> Result<Expr, CompileError> {
-        let mut lhs = self.parse_and()?;
-        while self.peek().kind == TokenKind::OrOr {
-            let pos = lhs.pos();
-            self.advance();
-            let rhs = self.parse_and()?;
-            lhs = Expr::Binary {
-                op: BinOp::Or,
-                lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-                pos,
-            };
-        }
-        Ok(lhs)
+        self.descend(|p| {
+            let mut lhs = p.parse_and()?;
+            while p.peek().kind == TokenKind::OrOr {
+                let pos = lhs.pos();
+                p.advance();
+                let rhs = p.parse_and()?;
+                lhs = Expr::Binary {
+                    op: BinOp::Or,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    pos,
+                };
+            }
+            Ok(lhs)
+        })
     }
 
     // and_expr := equality ("&&" equality)*
@@ -204,12 +266,16 @@ impl<'a> Parser<'a> {
     }
 
     // unary := ("-" | "!") unary | primary
+    //
+    // `-`/`!` の自己再帰は `parse_or` を経由しない独立した再帰サイクル
+    // なので（モジュール doc の「深さガード」節参照）、`parse_or` の
+    // ガードとは別にここでも `descend` を挟む。
     fn parse_unary(&mut self) -> Result<Expr, CompileError> {
         let pos = self.peek().pos;
         match self.peek().kind {
             TokenKind::Minus => {
                 self.advance();
-                let inner = self.parse_unary()?;
+                let inner = self.descend(Self::parse_unary)?;
                 Ok(Expr::Unary {
                     op: UnaryOp::Neg,
                     expr: Box::new(inner),
@@ -218,7 +284,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Bang => {
                 self.advance();
-                let inner = self.parse_unary()?;
+                let inner = self.descend(Self::parse_unary)?;
                 Ok(Expr::Unary {
                     op: UnaryOp::Not,
                     expr: Box::new(inner),
@@ -619,5 +685,51 @@ mod tests {
         ] {
             assert_eq!(parse_ok(src), parse_ok(src), "unstable reparse for {src}");
         }
+    }
+
+    // ---------- 深さガード（H1: DoS 対策） ----------
+    //
+    // MAX_SOURCE_CHARS には引っかからない範囲（1024文字未満）で
+    // MAX_NESTING_DEPTH（64）を確実に超える入力を使う - 目的はスタック
+    // オーバーフローで落ちず、TooDeep として正常にエラー終了すること。
+
+    #[test]
+    fn deeply_nested_parens_is_too_deep_not_a_crash() {
+        let src = format!("{}1{}", "(".repeat(100), ")".repeat(100));
+        let err = parse_err(&src);
+        assert!(matches!(err, CompileError::TooDeep { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn deeply_chained_unary_minus_is_too_deep_not_a_crash() {
+        let src = format!("{}1", "-".repeat(100));
+        let err = parse_err(&src);
+        assert!(matches!(err, CompileError::TooDeep { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn deeply_chained_unary_not_is_too_deep_not_a_crash() {
+        let src = format!("{}true", "!".repeat(100));
+        let err = parse_err(&src);
+        assert!(matches!(err, CompileError::TooDeep { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn deeply_nested_function_calls_is_too_deep_not_a_crash() {
+        let src = format!("{}1{}", "min(".repeat(100), ")".repeat(100));
+        let err = parse_err(&src);
+        assert!(matches!(err, CompileError::TooDeep { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn nesting_within_limit_parses_one_past_the_limit_is_too_deep() {
+        // 境界値: 括弧63重は MAX_NESTING_DEPTH(64) の枠内に収まり成功する
+        // が、64重になると境界を超えて TooDeep になる。
+        let within = format!("{}1{}", "(".repeat(63), ")".repeat(63));
+        let _ = parse_ok(&within);
+
+        let over = format!("{}1{}", "(".repeat(64), ")".repeat(64));
+        let err = parse_err(&over);
+        assert!(matches!(err, CompileError::TooDeep { .. }), "got {err:?}");
     }
 }

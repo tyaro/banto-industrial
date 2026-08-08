@@ -34,6 +34,45 @@
 //! (`banto-plc-write/src/encode.rs`) still enforces per-type range / SJIS
 //! checks, so a nonsense value is rejected before any wire traffic.
 //!
+//! ## H2 (2026-08-08 オーナー決定, `docs/improvement-plan.md` H2 — B 案):
+//! manual writes are opt-in, off by default
+//!
+//! The bypass above is real and permanent (this remains a debug tool), but it
+//! used to be reachable unconditionally by any `editor`, which read as
+//! "disarm stops writes" even though it never did for this screen. Manual
+//! writes are now ADDITIONALLY gated by
+//! [`crate::settings::SettingsService::monitor_config`]'s
+//! `manual_write_enabled` flag (default `false`).
+//! [`EngineControl::monitor_write`] is the one function that ever calls
+//! `broker.write` for a manual write (reached from every real caller via
+//! [`EngineControl::monitor_tag_write`]), so it checks the flag FIRST, before
+//! touching `write_audit_log` or the wire, and rejects with
+//! [`MANUAL_WRITE_DISABLED_MESSAGE`] when it is off. Toggling the setting is
+//! Admin-only and audited as a `settings_change` (see `crate::rest`'s
+//! `/api/monitor/config` and `src-tauri`'s `monitor_config_apply`). RBAC
+//! (`editor`+ for the write itself) is still checked first, unchanged, by the
+//! wiring layer before it ever calls in here (invariant: this module never
+//! re-checks role).
+//!
+//! A REJECTED attempt gets NO `write_audit_log` row at all: that table's
+//! `action`/`result` CHECK constraints are fixed (an existing on-disk DB
+//! cannot widen them, `migrations/0014_write_audit_log_manual_write.sql`) and
+//! neither value space has a "denied by settings" member, so this module
+//! deliberately does not try to force the new case into either enum. Instead
+//! the REST/Tauri wiring layers, which detect the rejection via
+//! [`is_manual_write_disabled`], record it to the general `audit_log` the
+//! same way an RBAC denial is recorded (`action: "denied"`, `resource:
+//! "monitor"`). That recording deliberately happens at the wiring layer and
+//! not here: `audit_log` rows carry `origin` (`"rest"` vs `"tauri"`), and
+//! this module, reached identically from both paths, has no way to know
+//! which one is calling - writing that row from inside `EngineControl` would
+//! either have to guess `origin` or drop the field's contract for this one
+//! entry. Both wiring layers reach the SAME check (a single call to
+//! [`is_manual_write_disabled`] on the error `monitor_tag_write`/
+//! `monitor_write` already returned), so there is exactly one place per path
+//! that could miss it and no way for the two to double up: each records at
+//! most once, from its own already-terminal error.
+//!
 //! ## Wire-shape layer
 //!
 //! [`EngineControl::monitor_group_read`] / [`EngineControl::monitor_tag_write`]
@@ -58,11 +97,34 @@ use super::poller::ResolvedSource;
 use super::rule_engine::WireShape;
 use super::write_audit::{insert_row, set_result, AuditAction, AuditResult, AuditRow};
 use super::{wire_shape, EngineControl};
+use crate::settings::SettingsService;
 
 /// The audit label used for every manual write's `rule_name_snapshot` (the
 /// column is NOT NULL; non-rule actions carry a short label - same convention
 /// as arm/disarm rows using their action name).
 const MANUAL_WRITE_LABEL: &str = "手動書き込み";
+
+/// The exact rejection [`EngineControl::monitor_write`] returns when manual
+/// writes are disabled by settings (H2, module doc). Kept as a constant
+/// (rather than formatted ad hoc at the call site) so [`is_manual_write_disabled`]
+/// can match on it exactly - the REST/Tauri wiring layers use that to decide
+/// whether a failed write should additionally be recorded to the general
+/// `audit_log` as a denial (module doc explains why that recording happens
+/// there and not in this module).
+const MANUAL_WRITE_DISABLED_MESSAGE: &str =
+    "手動書き込みは設定で無効です(設定画面から有効化できます)";
+
+/// True if `err` is exactly the [`MANUAL_WRITE_DISABLED_MESSAGE`] rejection -
+/// i.e. this specific `monitor_tag_write`/`monitor_write` call failed because
+/// H2's settings gate is closed, as opposed to any other reason (RBAC is
+/// checked earlier by the caller and never reaches this far; a broker/wire
+/// error also comes back as `BantoError::Other` but with a different message).
+/// See this module's doc comment for why the REST/Tauri wiring layers - not
+/// this module - are the ones that call this to decide whether to audit a
+/// denial.
+pub fn is_manual_write_disabled(err: &BantoError) -> bool {
+    matches!(err, BantoError::Other(message) if message == MANUAL_WRITE_DISABLED_MESSAGE)
+}
 
 /// One display-ready monitor reading (camelCase on the wire, both paths).
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -191,6 +253,16 @@ impl EngineControl {
     /// relaxation for this debug screen (module doc). The audit row is left
     /// `failed` on any wire/session error, which is exactly the evidence a
     /// debug history wants.
+    ///
+    /// H2 (module doc): this is the single chokepoint every manual write
+    /// passes through (`monitor_tag_write` - the real entry point for both
+    /// REST and Tauri - calls here on a successfully-parsed write, and any
+    /// lower-level caller that already has a resolved `BatchWriteRequest`
+    /// necessarily calls here too), so the `manual_write_enabled` gate is
+    /// checked FIRST, before anything else in this function: no
+    /// `write_audit_log` row, no session lookup, no wire traffic when it is
+    /// off. See [`is_manual_write_disabled`] for how callers detect this
+    /// specific rejection.
     pub async fn monitor_write(
         &self,
         connection: &PlcConnection,
@@ -199,6 +271,14 @@ impl EngineControl {
         source_tag_id: Option<i64>,
         detail: serde_json::Value,
     ) -> Result<(), BantoError> {
+        if !SettingsService::new(self.pool.clone())
+            .monitor_config()
+            .await?
+            .manual_write_enabled
+        {
+            return Err(BantoError::Other(MANUAL_WRITE_DISABLED_MESSAGE.to_string()));
+        }
+
         // The numeric audit column carries the RAW value that goes to the
         // wire (a string write leaves it NULL and carries its text in the
         // detail JSON - same split as writer.rs).

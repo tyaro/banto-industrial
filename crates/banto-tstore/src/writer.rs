@@ -38,6 +38,46 @@
 //!   are not auto-detected by an already-open `TsWriter` (design: "構成変更
 //!   時は再 open で連番ローテーション" - the caller is expected to open a
 //!   fresh writer after a config change, not mutate one in place).
+//!
+//! ## Wall-clock-wins upsert on a `ptime` collision (owner decision 2026-08-08)
+//!
+//! `Inner::flush_locked`'s `INSERT INTO samples_<n> ... VALUES ...` carries an
+//! `ON CONFLICT(ptime) DO UPDATE SET c1 = excluded.c1, ...` - an upsert, not a
+//! plain `INSERT` that lets `ptime INTEGER PRIMARY KEY` reject a repeat key.
+//! A backward wall-clock jump (NTP sync, manual correction) makes a later
+//! `append`'s `ptime_ms` land on a `ptime` this file already has a row for;
+//! the owner decision (docs/improvement-plan.md H4, 2026-08-08) is "時刻合わせ
+//! を行うのは今から正しい時間で実行するという意味なので、過去データより時刻
+//! 合わせ後のデータを尊重する" - the wall clock is always trusted, so the
+//! *newest* write for a given `ptime` always wins, overwriting whatever was
+//! stored there before. This crate deliberately does not clamp `ptime_ms` to
+//! be monotonic anywhere - [`TsWriter::append`] stores exactly the `ptime_ms`
+//! its caller passes, every time. One consequence worth spelling out: for the
+//! stretch of time the clock had jumped back over, the regressed interval's
+//! old rows are only overwritten one `ptime` at a time as the corrected clock
+//! ticks back up through them - a reader querying mid-recovery sees a mix of
+//! old and already-overwritten samples, not an atomic cutover.
+//!
+//! `ON CONFLICT ... DO UPDATE` rather than `INSERT OR REPLACE`: `OR REPLACE`
+//! is a delete-then-insert under the hood, which would needlessly perturb the
+//! rowid-is-`ptime` clustering `schema.rs`'s doc comment relies on (and
+//! rewrite unrelated column bytes as ordinary `INSERT` in the (usual)
+//! non-colliding case); `DO UPDATE` only touches a row that actually
+//! conflicts and is a plain insert otherwise.
+//!
+//! The buffered form issues one multi-row `INSERT ... VALUES (...), (...),
+//! ...` per group per flush (see `flush_locked` below), so a frozen or
+//! backward-jumping clock that produces more than one tick at the same
+//! `ptime_ms` *before the next flush* puts more than one row for that `ptime`
+//! in the very same `VALUES` list. SQLite still resolves this correctly:
+//! a multi-row `VALUES` upsert is applied row-at-a-time against the table
+//! state built up so far *within the same statement*, so a later row that
+//! collides with an earlier row of that same `INSERT` still runs the `DO
+//! UPDATE` against it - last value in the batch wins, exactly as if each row
+//! had been `append`ed and flushed one at a time. Pinned by
+//! `tests::same_ptime_within_one_flush_batch_last_value_wins` (and
+//! `tests::appending_the_same_ptime_twice_overwrites_the_stored_row` for the
+//! across-flush case).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -305,6 +345,37 @@ impl Inner {
                     binder.push_bind(*value);
                 }
             });
+            // Upsert, not a plain INSERT (owner decision 2026-08-08, see this
+            // module's doc comment "Wall-clock-wins upsert on a `ptime`
+            // collision"): a backward clock jump can make this batch's
+            // `ptime` collide with an already-written row (or, within one
+            // batch, with an earlier row of this same statement) - every
+            // value column is replaced from `excluded` rather than letting
+            // `ptime INTEGER PRIMARY KEY` reject the repeat, so the newest
+            // write always wins. `ON CONFLICT ... DO UPDATE`, not `INSERT OR
+            // REPLACE`: `OR REPLACE` is a delete+insert that would disturb
+            // the rowid-is-`ptime` clustering `schema.rs`'s doc comment
+            // relies on; `DO UPDATE` only touches an actually-colliding row.
+            //
+            // A zero-tag group (`StoreConfig::validate` allows one - see
+            // `config.rs::validate_allows_a_group_with_zero_tags`) has no
+            // value column to reassign, so `DO UPDATE SET` would have an
+            // empty (invalid) SET list; `DO NOTHING` is the exact right
+            // behaviour there anyway - with no columns beyond `ptime` itself,
+            // a colliding row is byte-for-byte indistinguishable from the one
+            // already stored.
+            if column_count == 0 {
+                query_builder.push(" ON CONFLICT(ptime) DO NOTHING");
+            } else {
+                query_builder.push(" ON CONFLICT(ptime) DO UPDATE SET ");
+                for i in 0..column_count {
+                    if i > 0 {
+                        query_builder.push(", ");
+                    }
+                    let column = column_name_for_index(i);
+                    query_builder.push(format!("{column} = excluded.{column}"));
+                }
+            }
             query_builder.build().execute(&mut *tx).await?;
         }
         tx.commit().await?;
@@ -543,6 +614,195 @@ mod tests {
         assert_eq!(samples.len(), 3);
         assert_eq!(samples[0].values[0], Some(1.0));
         assert_eq!(samples[2].values[0], Some(3.0));
+    }
+
+    // --- ptime collision / upsert (owner decision 2026-08-08, H4) ---------
+    //
+    // A clock regression (NTP sync, manual correction) can make a later
+    // `append`'s `ptime_ms` collide with a `ptime` this file already has a
+    // row for - across two separate flushes, or (a frozen/backward-jumping
+    // clock ticking faster than anything drains the buffer) within the very
+    // same buffered flush. Both must overwrite with the newest value, never
+    // error, and never duplicate the row - see `writer.rs`'s module doc,
+    // "Wall-clock-wins upsert on a `ptime` collision".
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn appending_the_same_ptime_twice_overwrites_the_stored_row() {
+        let dir = TempDir::new("ptime-collision-across-flush");
+        let clock = clock_at(DAY1_START_MS);
+        let writer = TsWriter::open(dir.path(), two_group_config(), clock)
+            .await
+            .unwrap();
+
+        writer
+            .append("g1", DAY1_START_MS, &[Some(1.0), None])
+            .await
+            .expect("first append at this ptime");
+        writer.flush().await.unwrap();
+
+        // A second append at the identical ptime_ms (as a clock regression
+        // catching back up to an already-recorded moment would produce) must
+        // succeed and overwrite, not fail on the PK.
+        writer
+            .append("g1", DAY1_START_MS, &[Some(99.0), Some(2.0)])
+            .await
+            .expect("colliding append must overwrite, not error");
+        writer.flush().await.unwrap();
+        writer.close().await.unwrap();
+
+        let files = list_data_files(dir.path()).unwrap();
+        let reader = TsReader::open(&files[0].path).await.unwrap();
+        let samples = reader
+            .read_range("g1", DAY1_START_MS, DAY1_START_MS)
+            .await
+            .unwrap();
+        assert_eq!(
+            samples.len(),
+            1,
+            "the second append must replace the row, not add a new one"
+        );
+        assert_eq!(samples[0].values, vec![Some(99.0), Some(2.0)]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_ptime_within_one_flush_batch_last_value_wins() {
+        let dir = TempDir::new("ptime-collision-same-batch");
+        let clock = clock_at(DAY1_START_MS);
+        // Buffer generously and never auto-flush on interval/row-count, so
+        // every append below lands in the buffer together and reaches
+        // `flush_locked` as one multi-row `INSERT ... VALUES` statement.
+        let options = WriterOptions {
+            max_buffered_rows: 1_000_000,
+            flush_interval_ms: 3_600_000,
+        };
+        let writer = TsWriter::open_with_options(dir.path(), two_group_config(), clock, options)
+            .await
+            .unwrap();
+
+        // Three ticks landing on the identical ptime, all still unflushed -
+        // one INSERT statement, three colliding VALUES rows.
+        writer
+            .append("g1", DAY1_START_MS, &[Some(1.0), None])
+            .await
+            .unwrap();
+        writer
+            .append("g1", DAY1_START_MS, &[Some(2.0), Some(20.0)])
+            .await
+            .unwrap();
+        writer
+            .append("g1", DAY1_START_MS, &[Some(3.0), Some(30.0)])
+            .await
+            .expect("third colliding append in the same batch must not error");
+        writer.flush().await.unwrap();
+        writer.close().await.unwrap();
+
+        let files = list_data_files(dir.path()).unwrap();
+        let reader = TsReader::open(&files[0].path).await.unwrap();
+        let samples = reader
+            .read_range("g1", DAY1_START_MS, DAY1_START_MS)
+            .await
+            .unwrap();
+        assert_eq!(
+            samples.len(),
+            1,
+            "three colliding rows in one batch must resolve to exactly one row"
+        );
+        assert_eq!(
+            samples[0].values,
+            vec![Some(3.0), Some(30.0)],
+            "the last row of the batch must win, exactly as if appended/flushed one at a time"
+        );
+    }
+
+    /// The non-colliding rows in a batch that also contains a collision must
+    /// be entirely unaffected - the upsert only ever touches the `ptime` it
+    /// actually conflicts on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_mixing_colliding_and_fresh_ptimes_only_overwrites_the_collision() {
+        let dir = TempDir::new("ptime-collision-mixed-batch");
+        let clock = clock_at(DAY1_START_MS);
+        let writer = TsWriter::open(dir.path(), two_group_config(), clock)
+            .await
+            .unwrap();
+
+        writer
+            .append("g1", DAY1_START_MS, &[Some(1.0), None])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        // One fresh row, one collision, another fresh row - all buffered
+        // together into a single flush.
+        writer
+            .append("g1", DAY1_START_MS + 1_000, &[Some(11.0), None])
+            .await
+            .unwrap();
+        writer
+            .append("g1", DAY1_START_MS, &[Some(999.0), Some(9.0)])
+            .await
+            .unwrap();
+        writer
+            .append("g1", DAY1_START_MS + 2_000, &[Some(12.0), None])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+        writer.close().await.unwrap();
+
+        let files = list_data_files(dir.path()).unwrap();
+        let reader = TsReader::open(&files[0].path).await.unwrap();
+        let samples = reader
+            .read_range("g1", DAY1_START_MS, DAY1_START_MS + 2_000)
+            .await
+            .unwrap();
+        assert_eq!(samples.len(), 3, "no row should be lost or merged away");
+        assert_eq!(
+            samples[0].values,
+            vec![Some(999.0), Some(9.0)],
+            "the colliding ptime must reflect the newest write"
+        );
+        assert_eq!(samples[1].values, vec![Some(11.0), None]);
+        assert_eq!(samples[2].values, vec![Some(12.0), None]);
+    }
+
+    /// A zero-tag group (`StoreConfig::validate` allows one - see
+    /// `config.rs`) has no value column for `DO UPDATE SET` to reassign;
+    /// `flush_locked` falls back to `DO NOTHING` there (see this module's
+    /// doc comment) - this pins down that a colliding `ptime` in that shape
+    /// of group still resolves to exactly one row rather than erroring on an
+    /// empty `SET` list.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn appending_a_colliding_ptime_to_a_zero_tag_group_does_not_error() {
+        let dir = TempDir::new("ptime-collision-zero-tag-group");
+        let clock = clock_at(DAY1_START_MS);
+        let config = StoreConfig {
+            groups: vec![GroupConfig {
+                key: "g0".to_string(),
+                name: "Group 0".to_string(),
+                period_ms: 1_000,
+                tags: vec![],
+            }],
+        };
+        let writer = TsWriter::open(dir.path(), config, clock).await.unwrap();
+
+        writer.append("g0", DAY1_START_MS, &[]).await.unwrap();
+        writer
+            .append("g0", DAY1_START_MS, &[])
+            .await
+            .expect("colliding append to a zero-tag group must not error");
+        writer.flush().await.unwrap();
+        writer.close().await.unwrap();
+
+        let files = list_data_files(dir.path()).unwrap();
+        let reader = TsReader::open(&files[0].path).await.unwrap();
+        let samples = reader
+            .read_range("g0", DAY1_START_MS, DAY1_START_MS)
+            .await
+            .unwrap();
+        assert_eq!(
+            samples.len(),
+            1,
+            "colliding ptime in a zero-tag group must not duplicate"
+        );
     }
 
     // --- open()/reopen rotation -------------------------------------------

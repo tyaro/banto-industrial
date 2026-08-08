@@ -7,6 +7,15 @@
 //! `ALTER` するのではなく、新しい連番ファイルへローテーションする
 //! （[`config`] モジュールの `StoreConfig` がそのスナップショット）。
 //!
+//! **壁時計を正とする upsert**（2026-08-08 決定、docs/improvement-plan.md
+//! H4）: `samples_<n>` への書き込みは `ptime` の重複を `INTEGER PRIMARY KEY`
+//! 違反として拒否するのではなく、`ON CONFLICT(ptime) DO UPDATE` で常に
+//! 最新の `append` 呼び出しを勝たせる（[`writer`] モジュールドキュメントの
+//! 「Wall-clock-wins upsert on a `ptime` collision」節に詳細）。時計逆行
+//! （NTP 補正・手動修正）後の書き込みは、その時刻に既にある過去データを
+//! 上書きする。単調化クランプは行わない - 壁時計が返す `ptime_ms` を
+//! そのまま信頼する。
+//!
 //! ## この crate が意図的に依存しないもの
 //!
 //! **`banto-tags`（タグレジストリ）**: [`config::StoreConfig`] は

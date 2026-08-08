@@ -412,3 +412,99 @@ fn unknown_function_error_position_points_at_call() {
         other => panic!("expected UnknownFunction, got {other:?}"),
     }
 }
+
+// ---------- H1: 式の文字数上限・パーサの再帰深さ上限（DoS 対策） ----------
+//
+// banto-expr::compile は演算タグの登録時に呼ばれる。深いネスト/連鎖式で
+// tokio ワーカースレッド（既定スタック 2MiB）がスタックオーバーフロー
+// = banto-hub プロセス全体の abort になるのを防ぐガード
+// （crate トップレベル doc の「DoS 対策」節参照）。ここでは深さ系のテストは
+// すべて MAX_SOURCE_CHARS（1024文字）に引っかからない短い入力を使い、
+// 「ネストが原因で TooDeep になる」ことだけを確かめる。文字数上限自体は
+// 別セクションで検証する。
+
+fn nested_parens(n: usize) -> String {
+    format!("{}1{}", "(".repeat(n), ")".repeat(n))
+}
+
+#[test]
+fn deeply_nested_parens_rejected_as_too_deep_not_crashed() {
+    // 100重括弧（201文字、MAX_SOURCE_CHARS の範囲内）- MAX_NESTING_DEPTH
+    // （64）を確実に超え、スタックオーバーフローではなく TooDeep で拒否
+    // される。
+    assert!(matches!(
+        assert_rejected(&nested_parens(100)),
+        CompileError::TooDeep { .. }
+    ));
+}
+
+#[test]
+fn nesting_exactly_at_limit_compiles_one_past_is_too_deep() {
+    // 境界値: 63重括弧は compile 成功、64重括弧は TooDeep（実装の深さ
+    // 会計は「トップレベルの式再入口で1」+「括弧1重につき+1」なので、
+    // MAX_NESTING_DEPTH=64 のとき63重が上限内・64重が超過になる - 詳細は
+    // crates/banto-expr/src/parser.rs の `descend` / モジュール doc 参照）。
+    assert_compiles(&nested_parens(63));
+    assert!(matches!(
+        assert_rejected(&nested_parens(64)),
+        CompileError::TooDeep { .. }
+    ));
+}
+
+#[test]
+fn deeply_chained_unary_minus_rejected_as_too_deep() {
+    let src = format!("{}1", "-".repeat(100));
+    assert!(matches!(
+        assert_rejected(&src),
+        CompileError::TooDeep { .. }
+    ));
+}
+
+#[test]
+fn deeply_chained_unary_not_rejected_as_too_deep_before_typecheck_runs() {
+    // 100個の '!' を bool に重ねる - 型としては（偶数個なら）Bool のまま
+    // 矛盾しないはずだが、型検査に到達する前にパース段階で TooDeep として
+    // 拒否されることを確認する。
+    let src = format!("{}true", "!".repeat(100));
+    assert!(matches!(
+        assert_rejected(&src),
+        CompileError::TooDeep { .. }
+    ));
+}
+
+#[test]
+fn deeply_nested_function_calls_rejected_as_too_deep() {
+    let src = format!("{}1{}", "min(".repeat(100), ")".repeat(100));
+    assert!(matches!(
+        assert_rejected(&src),
+        CompileError::TooDeep { .. }
+    ));
+}
+
+/// 空白は字句解析で読み飛ばされるので、先頭を空白で埋めた `"1"` は文字数
+/// だけを正確に `total_len` に保ったまま常に有効な式になる。
+fn padded_expr_of_len(total_len: usize) -> String {
+    assert!(total_len >= 1);
+    let mut s = " ".repeat(total_len - 1);
+    s.push('1');
+    s
+}
+
+#[test]
+fn source_length_exactly_at_max_compiles() {
+    let src = padded_expr_of_len(banto_expr::MAX_SOURCE_CHARS);
+    assert_eq!(src.chars().count(), banto_expr::MAX_SOURCE_CHARS);
+    assert_compiles(&src);
+}
+
+#[test]
+fn source_length_one_over_max_is_rejected() {
+    let src = padded_expr_of_len(banto_expr::MAX_SOURCE_CHARS + 1);
+    match assert_rejected(&src) {
+        CompileError::SourceTooLong { max, actual } => {
+            assert_eq!(max, banto_expr::MAX_SOURCE_CHARS);
+            assert_eq!(actual, banto_expr::MAX_SOURCE_CHARS + 1);
+        }
+        other => panic!("expected SourceTooLong, got {other:?}"),
+    }
+}

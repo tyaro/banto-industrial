@@ -939,9 +939,11 @@ async fn current_value_quality_transitions_good_bad_stale() {
 
     let config = build_config(&pool).await.unwrap();
     // ManualClock so staleness can be forced deterministically after stop.
-    // (Frozen "now" makes every append share one ptime; the tstore INTEGER
-    // PRIMARY KEY rejects the duplicates and the engine swallows that, which
-    // is fine here - this test only inspects the in-memory cache.)
+    // (Frozen "now" makes every append share one ptime; `banto-tstore`'s
+    // upsert - owner decision 2026-08-08, docs/improvement-plan.md H4 -
+    // resolves that by letting the newest write for that ptime replace the
+    // stored row rather than rejecting it, so this is harmless here - this
+    // test only inspects the in-memory cache, not the stored row count.)
     let clock = Arc::new(ManualClock::new(1_760_000_000_000, 0));
     let collector = Collector::start(
         config,
@@ -993,6 +995,137 @@ async fn current_value_quality_transitions_good_bad_stale() {
         current.get("tag:1").map(|s| s.quality),
         Some(Quality::Stale),
         "a Good sample with no further updates should read Stale"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Clock regression (H4, 2026-08-08 owner decision, docs/improvement-plan.md):
+// a backward jump of the injected clock must be reported exactly once as it
+// happens (not once per regressed tick) and exactly once more on recovery -
+// and the regressed interval's data must survive as an *overwrite* of the
+// pre-regression row (`banto-tstore`'s upsert, the storage half of this same
+// decision), never a duplicate or a silently dropped append.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clock_regression_emits_edge_events_and_overwrites_the_colliding_row() {
+    let env = TempEnv::new("clock-regression");
+    let sim = Simulator::start().await;
+    sim.set_holding_register(0, 1); // pre-regression value
+    let pool = open_registry(&env).await;
+    let conn = PlcConnectionService::new(pool.clone())
+        .create(conn_input("PLC1", sim.addr.port()))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(pool.clone())
+        .create(group_input("G1", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(pool.clone())
+        .create(tag_input("t1", group.id, "40001", "i16"))
+        .await
+        .unwrap();
+
+    let config = build_config(&pool).await.unwrap();
+    let base_ms: i64 = 1_780_000_000_000;
+    // ManualClock so the regression/recovery can be driven deterministically
+    // by the test rather than waiting for real wall-clock drift - scheduling
+    // (when a tick fires) still runs on real tokio timers regardless (see
+    // `task.rs`'s module doc); only the *stamped* `ptime_ms` comes from this
+    // clock, which is exactly what H4's detection watches.
+    let clock = Arc::new(ManualClock::new(base_ms, 0));
+    let collector = Collector::start(
+        config,
+        &env.data_dir(),
+        clock.clone(),
+        EventSink::new(pool.clone()),
+        fast_options(),
+    )
+    .await
+    .unwrap();
+    let current = collector.current_values();
+
+    // Phase 1: clock parked at base_ms - let a real tick land there and
+    // durably flush (fast_options() flushes on every append).
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            current.get("tag:1").map(|s| s.ptime_ms) == Some(base_ms)
+        })
+        .await,
+        "expected a tick recorded at base_ms before advancing the clock"
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Advance forward - this becomes the pre-regression high-water mark.
+    let ahead_ms = base_ms + 5_000;
+    clock.set_now_ms(ahead_ms);
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            current.get("tag:1").map(|s| s.ptime_ms) == Some(ahead_ms)
+        })
+        .await,
+        "expected a tick recorded at ahead_ms"
+    );
+
+    // Regress: jump back to base_ms, colliding with the very first row -
+    // must be reported exactly once as it happens.
+    sim.set_holding_register(0, 99); // the value the overwrite must carry
+    clock.set_now_ms(base_ms);
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            count_events(&pool, "clock_regression_entered").await >= 1
+        })
+        .await,
+        "expected a clock_regression_entered event"
+    );
+    // Let a few more regressed-clock ticks land (all still at ptime =
+    // base_ms) so the overwrite with register value 99 is durable.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Recover: advance past the prior high-water mark.
+    clock.set_now_ms(ahead_ms + 1_000);
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            count_events(&pool, "clock_regression_cleared").await >= 1
+        })
+        .await,
+        "expected a clock_regression_cleared event"
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    collector.stop().await.unwrap();
+    sim.stop();
+
+    // Episode edges only - never one per regressed tick, no matter how many
+    // ticks actually happened while regressed.
+    assert_eq!(
+        count_events(&pool, "clock_regression_entered").await,
+        1,
+        "the regression must be reported exactly once"
+    );
+    assert_eq!(
+        count_events(&pool, "clock_regression_cleared").await,
+        1,
+        "the recovery must be reported exactly once"
+    );
+
+    // The row at base_ms must reflect the OVERWRITE (99), not the original
+    // pre-regression value (1) - proof the regressed interval's data
+    // survives via last-write-wins, never a rejected or duplicated append.
+    let rows = read_single_group_rows(&env.data_dir()).await;
+    assert_eq!(
+        rows.iter().filter(|r| r.ptime_ms == base_ms).count(),
+        1,
+        "the ptime collision must resolve to exactly one row, not a duplicate"
+    );
+    let row_at_base = rows
+        .iter()
+        .find(|r| r.ptime_ms == base_ms)
+        .expect("a row at base_ms must exist");
+    assert_eq!(
+        row_at_base.values[0],
+        Some(99.0),
+        "the regressed-interval write must have overwritten the pre-regression row"
     );
 }
 

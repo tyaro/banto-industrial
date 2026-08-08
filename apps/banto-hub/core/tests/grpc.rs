@@ -9,7 +9,8 @@
 //! （`banto_hub_core::grpc::tagserver_v1`）をそのまま使う - 実装指示どおり
 //! dev-dependency は追加していない。
 //!
-//! テスト構成（実装指示のテスト計画1〜6に対応）:
+//! テスト構成（実装指示のテスト計画1〜6 + H3 の bind 設定化分（2026-08-08
+//! オーナー決定、docs/improvement-plan.md H3）に対応）:
 //! 1. E2E: シミュレータ + `GetCatalog`/`ReadValues`（値・品質・時刻が REST
 //!    と一致 - `crate::hub::effective_sample`を両者が共有するため構造的に
 //!    保証される）
@@ -26,6 +27,10 @@
 //!    拒否 → `PERMISSION_DENIED`
 //! 6. `grpc.enabled=false` では bind しない、`PUT /api/grpc-settings` で
 //!    有効化すると開始する
+//! 7. H3: `grpc.bind` の既定は `127.0.0.1`、`PUT` で明示指定した bind が
+//!    `GET`/`GrpcServer::apply`に反映される、`bind` 省略は現在値を維持、
+//!    不正な bind は 422 で拒否・保存されない、DB に不正値が直接書かれた
+//!    状態で `apply` してもプロセスは落ちない
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -333,6 +338,29 @@ async fn admin_put(
     (status, json)
 }
 
+/// admin 系ルーター(CSRF ヘッダ必須)への `GET` - `admin_post`/`admin_put`
+/// と同じ雛形(H3、2026-08-08 オーナー決定: bind 設定のテストで GET を
+/// 複数回使うため、既存の重複していたインライン版から関数化した)。
+async fn admin_get(router: &Router, path: &str, token: &str) -> (StatusCode, JsonValue) {
+    let response = router
+        .clone()
+        .oneshot(
+            HttpRequest::get(path)
+                .header("Authorization", format!("Bearer {token}"))
+                .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: JsonValue = serde_json::from_slice(&bytes).unwrap_or(JsonValue::Null);
+    (status, json)
+}
+
 /// `POST /api/api-keys` 経由でキーを発行し、平文キー全体(`bh_...`)と id を返す。
 async fn issue_key(
     router: &Router,
@@ -394,6 +422,7 @@ async fn start_grpc_and_connect(grpc_server: &GrpcServer) -> (u16, TagServiceCli
     grpc_server
         .apply(&GrpcSettings {
             enabled: true,
+            bind: "127.0.0.1".to_string(),
             port,
         })
         .await;
@@ -981,26 +1010,7 @@ async fn grpc_disabled_by_default_put_enables_it() {
     }
 
     // GET は保存した設定を読み戻せる。
-    let (status, body) = {
-        let response = app
-            .router
-            .clone()
-            .oneshot(
-                HttpRequest::get("/api/grpc-settings")
-                    .header("Authorization", format!("Bearer {}", app.admin_token))
-                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let json: JsonValue = serde_json::from_slice(&bytes).unwrap_or(JsonValue::Null);
-        (status, json)
-    };
+    let (status, body) = admin_get(&app.router, "/api/grpc-settings", &app.admin_token).await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["enabled"], true);
     assert_eq!(body["port"], port);
@@ -1026,4 +1036,138 @@ async fn grpc_disabled_by_default_put_enables_it() {
     let status_json: JsonValue = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(status_json["grpc"]["enabled"], true);
     assert_eq!(status_json["grpc"]["port"], port);
+}
+
+// ---------------------------------------------------------------------------
+// 7. bind 設定(H3、2026-08-08 オーナー決定、docs/improvement-plan.md H3):
+//    既定 127.0.0.1、PUT で明示指定した bind が GET/apply に反映される、
+//    省略すると現在値を維持する、不正な bind は 422 で拒否される、DB に
+//    直接不正値が書かれていても apply がプロセスを落とさない
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_settings_default_bind_is_loopback() {
+    let app = test_app("grpc-bind-default").await;
+    let (status, body) = admin_get(&app.router, "/api/grpc-settings", &app.admin_token).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["bind"], "127.0.0.1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_settings_put_bind_is_reflected_in_get() {
+    let app = test_app("grpc-bind-put-get").await;
+    let port = free_port();
+
+    // enabled: false なので実際に bind は試みない - ローカルに存在しない
+    // IP でも安全に「設定として保存されるか」だけを検証できる。
+    let (status, body) = admin_put(
+        &app.router,
+        "/api/grpc-settings",
+        &app.admin_token,
+        json!({ "enabled": false, "bind": "10.20.30.40", "port": port }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["bind"], "10.20.30.40");
+
+    let (status, body) = admin_get(&app.router, "/api/grpc-settings", &app.admin_token).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["bind"], "10.20.30.40");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_settings_put_without_bind_keeps_existing_value() {
+    let app = test_app("grpc-bind-omit").await;
+    let port1 = free_port();
+    let port2 = free_port();
+
+    let (status, body) = admin_put(
+        &app.router,
+        "/api/grpc-settings",
+        &app.admin_token,
+        json!({ "enabled": false, "bind": "10.20.30.41", "port": port1 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["bind"], "10.20.30.41");
+
+    // 2回目の PUT では `bind` キー自体を送らない(`None` = 現在値を維持、
+    // `GrpcSettingsBody::bind`のdoc comment参照)。`port` だけが変わり、
+    // `bind` は直前の値のままのはず。
+    let (status, body) = admin_put(
+        &app.router,
+        "/api/grpc-settings",
+        &app.admin_token,
+        json!({ "enabled": false, "port": port2 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["bind"], "10.20.30.41");
+    assert_eq!(body["port"], port2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_settings_put_invalid_bind_is_rejected_and_not_persisted() {
+    let app = test_app("grpc-bind-invalid").await;
+    let port = free_port();
+
+    let (status, body) = admin_put(
+        &app.router,
+        "/api/grpc-settings",
+        &app.admin_token,
+        json!({ "enabled": false, "bind": "abc", "port": port }),
+    )
+    .await;
+    // `BantoError::Validation` は他の admin 設定 PUT(例: `PUT
+    // /api/mqtt-settings`の`put_mqtt_settings_rejects_qos_2_and_enabling_without_a_host`、
+    // `tests/mqtt.rs`参照)と同じく 422 に写像される。
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert_eq!(body["kind"], "validation");
+    assert_eq!(body["field_errors"][0]["field"], "bind");
+
+    // 拒否された PUT は保存されていない - GET は既定値(127.0.0.1)のまま。
+    let (status, body) = admin_get(&app.router, "/api/grpc-settings", &app.admin_token).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["bind"], "127.0.0.1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn grpc_apply_with_invalid_bind_does_not_crash_and_leaves_port_unbound() {
+    let app = test_app("grpc-invalid-bind-apply").await;
+    let port = free_port();
+
+    // `GrpcServer::apply`を直接、DB 経由の PUT バリデーションを迂回して
+    // 呼ぶ - 「DB に不正な文字列が直接書き込まれた場合」(既存 DB を手で
+    // 触った、将来のマイグレーション不備等)を模す(`GrpcServer::apply`の
+    // doc comment参照)。panic せず、ただ起動しないだけであることを
+    // 確認する - この関数自体が最後まで実行できていること自体が
+    // 「プロセスが落ちない」ことの証拠になる。
+    app.grpc_server
+        .apply(&GrpcSettings {
+            enabled: true,
+            bind: "not-an-ip-address".to_string(),
+            port,
+        })
+        .await;
+
+    assert!(
+        std::net::TcpStream::connect_timeout(
+            &format!("127.0.0.1:{port}").parse().unwrap(),
+            Duration::from_millis(200),
+        )
+        .is_err(),
+        "invalid bind should not have started listening"
+    );
+
+    // 続けて有効な設定を apply しても正常に動く - `running` の状態が
+    // 壊れたまま残っていないことを確認する。
+    let (_port, mut client) = start_grpc_and_connect(&app.grpc_server).await;
+    let err = client
+        .get_catalog(tonic::Request::new(GetCatalogRequest {
+            connection: String::new(),
+            group: String::new(),
+        }))
+        .await
+        .expect_err("no metadata should still be unauthenticated after recovering");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
 }

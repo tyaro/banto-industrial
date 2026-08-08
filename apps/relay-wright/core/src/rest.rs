@@ -139,7 +139,7 @@ use crate::registry_cascade::{
     self, ConnectionCascadePreview, ConnectionCascadeSummary, GroupCascadePreview,
     GroupCascadeSummary,
 };
-use crate::settings::{AuditSettings, SettingsService};
+use crate::settings::{AuditSettings, MonitorSettings, SettingsService};
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
 use crate::write_audit_query::{WriteAuditLogRow, WriteAuditLogService};
 use crate::write_rules::{WriteRuleDetail, WriteRuleInput, WriteRuleService};
@@ -2403,9 +2403,13 @@ struct EngineState {
 /// The current control handle, or a clear error if the engine never started
 /// (the same message the Tauri side uses). `None` is not an expected path once
 /// the app/server has launched an engine.
-async fn engine_control_now(state: &EngineState) -> Result<EngineControl, BantoError> {
-    state
-        .control
+///
+/// Takes the bare [`SharedEngineControl`] slot (not `&EngineState`) so
+/// [`MonitorState`] - which is NOT `EngineState` (H2 added a `settings`
+/// field `/api/engine/*` has no use for, see [`MonitorState`]'s doc comment) -
+/// can call this too; every caller passes its own `&state.control`.
+async fn engine_control_now(control: &SharedEngineControl) -> Result<EngineControl, BantoError> {
+    control
         .lock()
         .await
         .clone()
@@ -2428,7 +2432,10 @@ async fn engine_arm(
         "/api/engine/arm",
     )
     .await?;
-    engine_control_now(&state).await?.arm(Some(&actor)).await?;
+    engine_control_now(&state.control)
+        .await?
+        .arm(Some(&actor))
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2449,7 +2456,7 @@ async fn engine_disarm(
         "/api/engine/disarm",
     )
     .await?;
-    engine_control_now(&state)
+    engine_control_now(&state.control)
         .await?
         .disarm(Some(&actor))
         .await?;
@@ -2479,7 +2486,7 @@ async fn engine_dry_run(
         "/api/engine/dry-run",
     )
     .await?;
-    engine_control_now(&state)
+    engine_control_now(&state.control)
         .await?
         .set_dry_run(body.on, Some(&actor))
         .await?;
@@ -2490,7 +2497,7 @@ async fn engine_dry_run(
 /// Read-only, so not audited (any authenticated role - the router's
 /// `require_auth` is the only gate).
 async fn engine_status(State(state): State<EngineState>) -> Result<Json<EngineStatus>, ApiError> {
-    Ok(Json(engine_control_now(&state).await?.status()))
+    Ok(Json(engine_control_now(&state.control).await?.status()))
 }
 
 /// `/api/engine/*` (invariant §1 両経路対称, plan W3-B2): arm/disarm (admin),
@@ -2525,13 +2532,14 @@ fn engine_router(control: SharedEngineControl, audit: AuditLogService, auth: Aut
 //
 // The dual-path surface for the monitor screen: per-group realtime reads
 // (viewer+ - it is a read, though carried as POST since it takes a body and
-// touches the PLC) and one-shot manual tag writes (editor+ - the user
-// explicitly relaxed this debug screen's safety, so editor rather than admin,
-// with NO arm gate; every write is audited by `EngineControl::monitor_write`
-// under `action: 'manual_write'`). Reuses [`EngineState`] - the SAME shared
-// control slot as `/api/engine/*`, so monitor traffic rides the engine
-// broker's one-session-per-connection tasks (hard constraint: the R08ENCPU
-// accepts only one SLMP session per connected port).
+// touches the PLC), one-shot manual tag writes (editor+ - the user explicitly
+// relaxed this debug screen's safety, so editor rather than admin, with NO
+// arm gate; every LANDED write is audited by `EngineControl::monitor_write`
+// under `action: 'manual_write'`), and (H2, 2026-08-08 オーナー決定
+// `docs/improvement-plan.md` H2 — B 案) the `manual_write_enabled` toggle
+// that gates those writes (viewer+ read / admin write - see
+// [`MonitorState`]'s doc comment for why this needs its own state struct
+// rather than reusing [`EngineState`]).
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2546,16 +2554,30 @@ struct MonitorWriteRequest {
     value: String,
 }
 
+/// State for `/api/monitor/*` (feature/tag-monitor). Same shared
+/// [`SharedEngineControl`]/`AuthState`/`AuditLogService` shape as
+/// [`EngineState`], PLUS (H2) [`SettingsService`] for `GET`/
+/// `PUT /api/monitor/config`'s `manual_write_enabled` toggle - kept as its
+/// own struct rather than adding `settings` to [`EngineState`] since
+/// `/api/engine/*`'s arm/disarm/dry-run/status handlers have no use for it.
+#[derive(Clone)]
+struct MonitorState {
+    control: SharedEngineControl,
+    settings: SettingsService,
+    auth: AuthState,
+    audit: AuditLogService,
+}
+
 /// `POST /api/monitor/read` (viewer+): the selected 収集グループ's tags as
 /// display-ready realtime values (scaling + decimals applied; per-tag
 /// quality). Read-only, so not audited - the router's `require_auth` is the
 /// only gate, same convention as `engine_status`.
 async fn monitor_read(
-    State(state): State<EngineState>,
+    State(state): State<MonitorState>,
     Json(body): Json<MonitorReadRequest>,
 ) -> Result<Json<Vec<MonitorValue>>, ApiError> {
     Ok(Json(
-        engine_control_now(&state)
+        engine_control_now(&state.control)
             .await?
             .monitor_group_read(body.collection_group_id)
             .await?,
@@ -2564,11 +2586,25 @@ async fn monitor_read(
 
 /// `POST /api/monitor/write` (editor+): one-shot manual write to a tag's
 /// device. NO arm gate / rate limit / dry-run (the user's explicit relaxation
-/// for this debug screen); the write itself is audited by `EngineControl`
+/// for this debug screen); a LANDED write is audited by `EngineControl`
 /// (`write_audit_log`, `action: 'manual_write'`, actor attributed) - this
 /// layer adds only authorization + actor resolution, never a second audit.
+///
+/// H2: `monitor_tag_write` itself enforces the `manual_write_enabled` gate
+/// (`crate::engine::monitor`'s module doc - the single chokepoint every
+/// manual write passes through) and returns a distinguishable rejection when
+/// it is off ([`is_manual_write_disabled`]); THIS layer, on seeing that
+/// specific rejection, records the `denied`/`resource: "monitor"` entry to
+/// the general `audit_log` - the same shape [`require_engine_role`] uses for
+/// an RBAC denial, just one step later (RBAC already passed by this point).
+/// That recording could not live inside `EngineControl` itself: general
+/// `audit_log` rows carry `origin` (`"rest"`/`"tauri"`), which a function
+/// reached identically from both wiring paths has no way to know (see the
+/// module doc for the full reasoning) - so each wiring path records its own,
+/// from its own already-terminal error, which is also why this can never
+/// double up.
 async fn monitor_write(
-    State(state): State<EngineState>,
+    State(state): State<MonitorState>,
     headers: HeaderMap,
     Json(body): Json<MonitorWriteRequest>,
 ) -> Result<StatusCode, ApiError> {
@@ -2582,25 +2618,107 @@ async fn monitor_write(
         "/api/monitor/write",
     )
     .await?;
-    engine_control_now(&state)
+    let result = engine_control_now(&state.control)
         .await?
         .monitor_tag_write(body.tag_id, &body.value, Some(&actor))
-        .await?;
+        .await;
+    if let Err(err) = &result {
+        if crate::engine::is_manual_write_disabled(err) {
+            let identity = actor_identity(&headers, &state.auth);
+            state
+                .audit
+                .record(AuditEntry {
+                    actor_username: Some(&actor),
+                    actor_role: identity.as_ref().map(|i| i.role.as_str()),
+                    action: "denied",
+                    resource: "monitor",
+                    entity_id: Some(&body.tag_id.to_string()),
+                    detail: Some(json!({ "reason": "manual_write_disabled" })),
+                    origin: "rest",
+                    result: "denied",
+                })
+                .await;
+        }
+    }
+    result?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `/api/monitor/*` (invariant §1 両経路対称, feature/tag-monitor): read
-/// viewer+, write editor+. Same [`EngineState`]/`require_auth` shape as
-/// [`engine_router`]; the write handler applies its own floor inline.
-fn monitor_router(control: SharedEngineControl, audit: AuditLogService, auth: AuthState) -> Router {
-    let state = EngineState {
+/// `GET /api/monitor/config` (viewer+, H2): the current `manual_write_enabled`
+/// setting. Viewer+ (not admin-only, unlike the `PUT` below) because the
+/// monitor page itself needs this for EVERY role that can view it, to decide
+/// whether to show writable cells / the disabled reason / the "safety gate
+/// bypassed" banner - not just to feed an admin-only settings screen (unlike
+/// `audit_config_get`'s `/api/audit-log/config`, which only the admin-only
+/// audit-log screen reads). Read-only, so not audited.
+async fn monitor_config_get(
+    State(state): State<MonitorState>,
+) -> Result<Json<MonitorSettings>, ApiError> {
+    Ok(Json(state.settings.monitor_config().await?))
+}
+
+/// `PUT /api/monitor/config` (admin, H2): persist the `manual_write_enabled`
+/// toggle. Mirrors `audit_config_apply`'s shape exactly: same
+/// `settings_change`/`resource: "settings"` audit entry (the established
+/// convention here is to tag EVERY settings mutation `resource: "settings"`
+/// regardless of which specific setting changed - `audit_config_apply` does
+/// this for the audit-retention policy too - and let `detail` carry which
+/// one), same admin-only floor via [`require_engine_role`].
+async fn monitor_config_apply(
+    State(state): State<MonitorState>,
+    headers: HeaderMap,
+    Json(config): Json<MonitorSettings>,
+) -> Result<Json<MonitorSettings>, ApiError> {
+    let actor = require_engine_role(
+        &state.auth,
+        &state.audit,
+        &headers,
+        Role::Admin,
+        "settings",
+        "PUT",
+        "/api/monitor/config",
+    )
+    .await?;
+    state.settings.set_monitor_config(&config).await?;
+    let identity = actor_identity(&headers, &state.auth);
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor),
+            actor_role: identity.as_ref().map(|i| i.role.as_str()),
+            action: "settings_change",
+            resource: "settings",
+            entity_id: None,
+            detail: Some(json!({ "monitorManualWriteEnabled": config.manual_write_enabled })),
+            origin: "rest",
+            result: "ok",
+        })
+        .await;
+    Ok(Json(state.settings.monitor_config().await?))
+}
+
+/// `/api/monitor/*` (invariant §1 両経路対称, feature/tag-monitor + H2): read
+/// viewer+, write editor+, config read viewer+ / config write admin. Same
+/// `require_auth`-router + per-handler floor shape as [`engine_router`].
+fn monitor_router(
+    control: SharedEngineControl,
+    settings: SettingsService,
+    audit: AuditLogService,
+    auth: AuthState,
+) -> Router {
+    let state = MonitorState {
         control,
+        settings,
         auth: auth.clone(),
         audit,
     };
     Router::new()
         .route("/api/monitor/read", post(monitor_read))
         .route("/api/monitor/write", post(monitor_write))
+        .route(
+            "/api/monitor/config",
+            get(monitor_config_get).put(monitor_config_apply),
+        )
         .with_state(state)
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
@@ -2847,6 +2965,7 @@ pub fn api_router(
         ))
         .merge(monitor_router(
             engine_control.clone(),
+            settings.clone(),
             audit.clone(),
             auth.clone(),
         ))
@@ -5359,12 +5478,22 @@ mod tests {
     /// `POST /api/monitor/write` is editor-gated: a `viewer` is denied (403,
     /// `denied` recorded under `resource: "monitor"`), an `editor` lands the
     /// write in the simulator with NO arm required (the engine stays
-    /// disarmed) and the `manual_write` audit row attributes them.
+    /// disarmed) and the `manual_write` audit row attributes them. H2
+    /// (2026-08-08): manual writes are opt-in now, so this test explicitly
+    /// enables `manual_write_enabled` first - it exercises the "enabled"
+    /// side of that decision; `rest_monitor_write_is_rejected_by_default`
+    /// below fixes the "disabled by default" side.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rest_monitor_write_is_editor_gated_and_audited() {
         let (router, pool, _admin, editor, viewer) = router_with_role_tokens_and_engine().await;
         let sim = banto_plc_write::slmp::simulator::Simulator::start().await;
         let (_group_id, tag_id) = seed_monitor_fixture(&pool, &sim).await;
+        SettingsService::new(pool.clone())
+            .set_monitor_config(&MonitorSettings {
+                manual_write_enabled: true,
+            })
+            .await
+            .expect("enable manual write for this test");
 
         // Viewer: denied + audited.
         let denied = router
@@ -5426,6 +5555,140 @@ mod tests {
         assert_eq!(result, "ok");
         // The route layer never double-audits: no armed flip happened either.
         assert_eq!(write_audit_count(&pool, "arm", "ok").await, 0);
+    }
+
+    /// H2 (2026-08-08): with NO settings change at all (a fresh DB), an
+    /// `editor`'s `POST /api/monitor/write` is rejected - RBAC passed (this
+    /// is not a 403) but `EngineControl::monitor_write`'s settings gate is
+    /// closed by default. Nothing reaches the wire (the simulator's word is
+    /// untouched), no `write_audit_log` row is written (that table's CHECK
+    /// constraints have no "denied by settings" value - `crate::engine::monitor`'s
+    /// module doc), and the rejection IS recorded to the general `audit_log`
+    /// (`action: "denied"`, `resource: "monitor"`) the same way an RBAC
+    /// denial would be.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rest_monitor_write_is_rejected_by_default() {
+        let (router, pool, _admin, editor, _viewer) = router_with_role_tokens_and_engine().await;
+        let sim = banto_plc_write::slmp::simulator::Simulator::start().await;
+        let (_group_id, tag_id) = seed_monitor_fixture(&pool, &sim).await;
+
+        let response = router
+            .oneshot(post_json_auth(
+                "/api/monitor/write",
+                &editor,
+                json!({ "tagId": tag_id, "value": "777" }),
+            ))
+            .await
+            .unwrap();
+        // `BantoError::Other` (matching `set_server_config`/`set_auth_config`'s
+        // existing "blocked by current settings" convention) -> 500, carrying
+        // the Japanese explanation in `message`.
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_json(response).await;
+        assert_eq!(body["kind"], "other");
+        assert!(
+            body["message"].as_str().unwrap().contains("無効"),
+            "expected the manual-write-disabled message, got {body:?}"
+        );
+
+        assert_eq!(
+            sim.get_word(banto_plc::SlmpDevice::D, 100),
+            0,
+            "the disabled gate must not let anything reach the wire"
+        );
+        assert_eq!(
+            write_audit_count(&pool, "manual_write", "ok").await,
+            0,
+            "a gate rejection must not touch write_audit_log at all"
+        );
+        assert_eq!(write_audit_count(&pool, "manual_write", "failed").await, 0);
+
+        let entries = AuditLogService::new(pool.clone())
+            .list(ListParams::default())
+            .await
+            .unwrap();
+        assert!(
+            entries.rows.iter().any(|r| r.action == "denied"
+                && r.resource == "monitor"
+                && r.actor_username.as_deref() == Some("editor")),
+            "expected a denied monitor entry for the disabled gate, got {:?}",
+            entries.rows
+        );
+    }
+
+    /// H2: `GET /api/monitor/config` is viewer+ (the monitor page needs it
+    /// for every role), defaults to `manualWriteEnabled: false`;
+    /// `PUT /api/monitor/config` is admin-only (editor/viewer get 403) and,
+    /// once applied by an admin, round-trips through a following `GET` and
+    /// records a `settings_change`/`resource: "settings"` audit entry -
+    /// mirroring `audit_config_apply_persists_and_is_admin_only` exactly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rest_monitor_config_apply_is_admin_only_and_audited() {
+        let (router, pool, admin, editor, viewer) = router_with_role_tokens_and_engine().await;
+
+        for token in [&admin, &editor, &viewer] {
+            let response = router
+                .clone()
+                .oneshot(get_auth("/api/monitor/config", token))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "config read is viewer+");
+            assert_eq!(body_json(response).await["manualWriteEnabled"], false);
+        }
+
+        for token in [&editor, &viewer] {
+            let response = router
+                .clone()
+                .oneshot(put_json(
+                    "/api/monitor/config",
+                    token,
+                    json!({ "manualWriteEnabled": true }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "token role mismatch"
+            );
+        }
+
+        let apply_response = router
+            .clone()
+            .oneshot(put_json(
+                "/api/monitor/config",
+                &admin,
+                json!({ "manualWriteEnabled": true }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(apply_response.status(), StatusCode::OK);
+        assert_eq!(body_json(apply_response).await["manualWriteEnabled"], true);
+
+        let get_response = router
+            .clone()
+            .oneshot(get_auth("/api/monitor/config", &admin))
+            .await
+            .unwrap();
+        assert_eq!(body_json(get_response).await["manualWriteEnabled"], true);
+
+        let entries = AuditLogService::new(pool.clone())
+            .list(ListParams::default())
+            .await
+            .unwrap();
+        let entry = entries
+            .rows
+            .iter()
+            .find(|r| r.action == "settings_change" && r.resource == "settings")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a settings_change/settings entry, got {:?}",
+                    entries.rows
+                )
+            });
+        assert_eq!(entry.origin, "rest");
+        assert_eq!(entry.result, "ok");
+        assert_eq!(entry.actor_username.as_deref(), Some("admin"));
     }
 
     // --- project file export/import dual-path (feature/project-file) ---------
