@@ -10,11 +10,17 @@
 	 * コピーボタンを必須にしている。`issuedKey` は画面遷移/リロードで
 	 * 消える一時状態（永続化しない）。
 	 *
-	 * スコープ入力: `read` は常設チェックボックス、`write:{connection}.
-	 * {group}.{tag}` は改行/カンマ区切りのテキストエリアで複数指定できる
-	 * ようにし（`write:` プレフィックスは自動付与）、送信直前に配列へ
-	 * 組み立てる（`apiKeysAdmin.ts` の `CreateApiKeyInput.scopes` は
-	 * `string[]`）。
+	 * スコープ入力: `read`（全タグ）は常設チェックボックス、
+	 * `write:{connection}.{group}.{tag}` と `read:{connection}.{group}.{tag}`
+	 * / `read:{connection}.{group}.*`（H10 ③、Option B、2026-08-08 オーナー
+	 * 決定・docs/h10-3-read-scope-proposal.md）はそれぞれ改行/カンマ区切りの
+	 * テキストエリアで複数指定できるようにし（`write:`/`read:` プレフィックス
+	 * は自動付与）、送信直前に配列へ組み立てる（`apiKeysAdmin.ts` の
+	 * `CreateApiKeyInput.scopes` は `string[]` - サーバー側の文法は
+	 * `apps/banto-hub/core/src/api_keys.rs` の `validate_scope` 参照）。
+	 * per-tag read スコープは catalog（`GET /api/v1/tags`）を絞らない -
+	 * 絞るのは値の読み取り（単一・バルク・ストリーム）のみ（案 B、「発見 ≠
+	 * 値アクセス」）。
 	 *
 	 * H10 ①（docs/improvement-plan.md、2026-08-08 オーナー決定）: 有効期限
 	 * は `<input type="date">` で日付のみ受け取り、送信直前にその日の
@@ -76,6 +82,10 @@
 	// --- create ---
 	let name = $state('');
 	let readScope = $state(true);
+	/** H10 ③（Option B）: `read:{connection}.{group}.{tag}` /
+	 *  `read:{connection}.{group}.*` の per-tag read スコープ（任意、`read`
+	 *  チェックボックスとは独立に併用できる）。 */
+	let readScopesText = $state('');
 	let writeScopesText = $state('');
 	/** H10 ①: `"YYYY-MM-DD"` または空文字（空 = 無期限）。 */
 	let expiresAtInput = $state('');
@@ -99,6 +109,15 @@
 	function parseScopes(): string[] {
 		const scopes: string[] = [];
 		if (readScope) scopes.push('read');
+		// H10 ③（Option B）: read:{connection}.{group}.{tag} / read:{connection}.
+		// {group}.* - 完全一致・グループ・ワイルドカードどちらも許可（サーバー
+		// 側の文法検証は api_keys.rs::validate_scope、この入力欄はワイルドカード
+		// も禁止しない点が下の write 欄と異なる）。
+		for (const line of readScopesText.split(/[\n,]/)) {
+			const trimmed = line.trim();
+			if (trimmed === '') continue;
+			scopes.push(trimmed.startsWith('read:') ? trimmed : `read:${trimmed}`);
+		}
 		for (const line of writeScopesText.split(/[\n,]/)) {
 			const trimmed = line.trim();
 			if (trimmed === '') continue;
@@ -121,6 +140,7 @@
 			toastStore.push('success', '発行しました');
 			name = '';
 			readScope = true;
+			readScopesText = '';
 			writeScopesText = '';
 			expiresAtInput = '';
 			await reload();
@@ -225,6 +245,20 @@
 			<label class="field checkbox">
 				<input type="checkbox" bind:checked={readScope} />
 				read（全タグの現在値・状態の読み取り）
+			</label>
+			<label class="field wide">
+				read
+				スコープ（任意、1行または1カンマにつき1つ、"&lbrace;接続&rbrace;.&lbrace;グループ&rbrace;.&lbrace;タグ&rbrace;"
+				または "&lbrace;接続&rbrace;.&lbrace;グループ&rbrace;.*" 形式）
+				<textarea
+					bind:value={readScopesText}
+					rows="3"
+					placeholder="例: line1.fast.temp01, line1.fast.*"></textarea>
+				<span class="hint"
+					>catalog（タグ一覧・PLCアドレス）は上の read
+					と同様に絞られません。ここで指定したタグ以外は値の読み取りのみ403になります。上の read
+					にチェックすると、ここでの指定に関わらず全タグを読めます。</span
+				>
 			</label>
 			<label class="field wide">
 				write

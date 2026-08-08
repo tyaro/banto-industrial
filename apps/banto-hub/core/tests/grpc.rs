@@ -1171,3 +1171,255 @@ async fn grpc_apply_with_invalid_bind_does_not_crash_and_leaves_port_unbound() {
         .expect_err("no metadata should still be unauthenticated after recovering");
     assert_eq!(err.code(), tonic::Code::Unauthenticated);
 }
+
+// ---------------------------------------------------------------------------
+// 8. H10 ③(Option B、docs/h10-3-read-scope-proposal.md §5・§6): per-tag
+//    read スコープ。GetCatalog は絞らない(素の read/read:{tag} いずれでも
+//    全タグ)。ReadValues/StreamValues はスコープ外を除く。
+// ---------------------------------------------------------------------------
+
+/// このセクション共通のフィクスチャ: `line1.fast.temp01`(tag:1)・
+/// `line2.slow.press01`(tag:2)を、同一シミュレータの別アドレスに割り当てて
+/// 別接続・別グループで作り rebuild する。`make_tag`はグループ名を
+/// `"fast"`固定で作るため2回呼ぶとグループ名の `UNIQUE` 制約に衝突する -
+/// ここでは`slmp_conn_input`/`group_input`/`tag_input`を直接使い、2本目の
+/// グループ名を`"slow"`にして衝突を避ける(`make_tag`自体は既存の呼び出し元
+/// 全てが1テストにつき1回しか呼ばないため、シグネチャは変更しない)。戻り値
+/// は `(line1.fast.temp01, line2.slow.press01)` の外部名。
+async fn seed_two_connections_two_tags(app: &TestApp, sim_port: u16) -> (String, String) {
+    let conn1 = PlcConnectionService::new(app.pool.clone())
+        .create(slmp_conn_input("line1", sim_port))
+        .await
+        .unwrap();
+    let group1 = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn1.id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group1.id, "D100", "u16", false, true)) // tag:1
+        .await
+        .unwrap();
+
+    let conn2 = PlcConnectionService::new(app.pool.clone())
+        .create(slmp_conn_input("line2", sim_port))
+        .await
+        .unwrap();
+    let group2 = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("slow", conn2.id, 1000))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("press01", group2.id, "D200", "u16", false, true)) // tag:2
+        .await
+        .unwrap();
+
+    app.manager.rebuild().await.expect("rebuild after seeding");
+    (
+        "line1.fast.temp01".to_string(),
+        "line2.slow.press01".to_string(),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_catalog_with_a_read_colon_key_still_returns_every_tag() {
+    let app = test_app("h10-3-catalog").await;
+    let sim = Simulator::start().await;
+
+    let (name1, name2) = seed_two_connections_two_tags(&app, sim.addr.port()).await;
+
+    let scope = format!("read:{name1}");
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "line1-reader",
+        &[scope.as_str()],
+    )
+    .await;
+    let (_port, mut client) = start_grpc_and_connect(&app.grpc_server).await;
+
+    let catalog = client
+        .get_catalog(bearer_request(
+            GetCatalogRequest {
+                connection: String::new(),
+                group: String::new(),
+            },
+            &key,
+        ))
+        .await
+        .expect("get_catalog should succeed with any read scope (Option B)")
+        .into_inner();
+
+    let names: Vec<&str> = catalog
+        .tags
+        .iter()
+        .map(|t| t.external_name.as_str())
+        .collect();
+    assert!(names.contains(&name1.as_str()));
+    assert!(
+        names.contains(&name2.as_str()),
+        "catalog must stay unfiltered even for a per-tag-scoped key (Option B): {names:?}"
+    );
+
+    sim.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_values_with_a_read_colon_key_is_limited_to_the_in_scope_tag() {
+    let app = test_app("h10-3-read-values").await;
+    let sim = Simulator::start().await;
+    sim.set_word(SlmpDevice::D, 100, 111);
+    sim.set_word(SlmpDevice::D, 200, 222);
+
+    let (name1, name2) = seed_two_connections_two_tags(&app, sim.addr.port()).await;
+
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            app.manager
+                .current_values()
+                .and_then(|c| c.get("tag:1"))
+                .and_then(|s| s.value)
+                .is_some()
+                && app
+                    .manager
+                    .current_values()
+                    .and_then(|c| c.get("tag:2"))
+                    .and_then(|s| s.value)
+                    .is_some()
+        })
+        .await,
+        "collector should have picked up both seeded values"
+    );
+
+    let scope = format!("read:{name1}");
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "line1-reader",
+        &[scope.as_str()],
+    )
+    .await;
+    let (_port, mut client) = start_grpc_and_connect(&app.grpc_server).await;
+
+    // 明示指定: 自分のタグは読める。
+    let values = client
+        .read_values(bearer_request(
+            ReadValuesRequest {
+                tags: vec![name1.clone()],
+            },
+            &key,
+        ))
+        .await
+        .expect("read_values for the in-scope tag should succeed")
+        .into_inner();
+    assert_eq!(values.values.len(), 1);
+    assert_eq!(values.values[0].value, Some(tag_value::Value::Num(111.0)));
+
+    // 明示指定: スコープ外を挙げたら PERMISSION_DENIED(REST の 403 に対応)。
+    let err = client
+        .read_values(bearer_request(
+            ReadValuesRequest {
+                tags: vec![name2.clone()],
+            },
+            &key,
+        ))
+        .await
+        .expect_err("an out-of-scope explicit tag should be denied");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    // 暗黙(tags 省略、全件相当): スコープ外は黙って除かれる。
+    let values = client
+        .read_values(bearer_request(ReadValuesRequest { tags: vec![] }, &key))
+        .await
+        .expect("read_values with tags omitted should succeed")
+        .into_inner();
+    assert_eq!(values.values.len(), 1);
+    assert_eq!(values.values[0].tag, name1);
+
+    sim.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_values_with_a_read_colon_key_only_resolves_the_in_scope_tag() {
+    let app = test_app("h10-3-stream-values").await;
+    let sim = Simulator::start().await;
+    sim.set_word(SlmpDevice::D, 100, 10);
+    sim.set_word(SlmpDevice::D, 200, 20);
+
+    let (name1, _name2) = seed_two_connections_two_tags(&app, sim.addr.port()).await;
+
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            app.manager
+                .current_values()
+                .and_then(|c| c.get("tag:1"))
+                .and_then(|s| s.value)
+                .is_some()
+                && app
+                    .manager
+                    .current_values()
+                    .and_then(|c| c.get("tag:2"))
+                    .and_then(|s| s.value)
+                    .is_some()
+        })
+        .await,
+        "collector should have picked up both seeded values"
+    );
+
+    let scope = format!("read:{name1}");
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "line1-reader",
+        &[scope.as_str()],
+    )
+    .await;
+    let (_port, mut client) = start_grpc_and_connect(&app.grpc_server).await;
+
+    let mut stream = client
+        .stream_values(bearer_request(
+            StreamValuesRequest {
+                tags: vec!["*".to_string()],
+                mode: SubscribeMode::OnChange as i32,
+                interval_ms: 0,
+            },
+            &key,
+        ))
+        .await
+        .expect("wildcard stream_values should succeed")
+        .into_inner();
+
+    let initial: ValueBatch = stream
+        .message()
+        .await
+        .expect("stream should not error")
+        .expect("initial snapshot should be sent");
+    assert_eq!(
+        initial.values.len(),
+        1,
+        "wildcard subscription must resolve only the in-scope tag: {:?}",
+        initial.values
+    );
+    assert_eq!(initial.values[0].tag, name1);
+
+    // スコープ外の値変更ではストリームに何も届かない(タイムアウトで確認 -
+    // `tests/stream.rs`の`assert_no_more_data_for`と同じ意図)。
+    sim.set_word(SlmpDevice::D, 200, 999);
+    let silence = tokio::time::timeout(Duration::from_millis(600), stream.message()).await;
+    assert!(
+        silence.is_err(),
+        "an out-of-scope tag change must not produce a ValueBatch: {silence:?}"
+    );
+
+    // スコープ内の値変更は引き続き届く。
+    sim.set_word(SlmpDevice::D, 100, 77);
+    let changed: ValueBatch = tokio::time::timeout(Duration::from_secs(3), stream.message())
+        .await
+        .expect("should receive a change within 3s")
+        .expect("stream should not error")
+        .expect("stream should not end");
+    assert_eq!(changed.values.len(), 1);
+    assert_eq!(changed.values[0].tag, name1);
+    assert_eq!(changed.values[0].value, Some(tag_value::Value::Num(77.0)));
+
+    sim.stop();
+}

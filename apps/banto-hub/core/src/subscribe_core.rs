@@ -35,11 +35,25 @@
 //! 1コネクション1タスク、`crate::grpc` の `StreamValues` も同様に1呼び出し
 //! 1タスクだが、送信キューの型が axum の `Message` と tonic の
 //! `Result<ValueBatch, Status>` で異なるため、タスク本体までは統合しない)。
+//!
+//! ## per-tag read スコープの交差(H10 ③、Option B、
+//! docs/h10-3-read-scope-proposal.md §5 S4・§6)
+//!
+//! [`initial_values`]/[`evaluate`] は `scope: Option<&ApiKeyContext>` を
+//! 受け取り、[`resolve`] が返したマッチ集合をさらに
+//! `ApiKeyContext::can_read_value` で絞り込む(`None` はフィルタなし -
+//! session token 認証、または呼び出し元がまだ ctx を持たない場合)。
+//! [`resolve`] 自体・[`interval_floor_ms`] は変更しない(パターンマッチのみ
+//! を行う。`interval_floor_ms` は購読元クライアント自身への QoS クランプの
+//! 計算でしかなく、他者へのタグ識別子/値の開示を伴わないため、案 B が絞る
+//! 対象である「値の読み取り」には当たらない)。`crate::stream`/`crate::grpc`
+//! の両方の `StreamValues` 購読解決から共有する。
 
 use std::collections::{HashMap, HashSet};
 
 use banto_collect::{CurrentValuesHandle, Quality};
 
+use crate::api_keys::ApiKeyContext;
 use crate::computed::ServerTagStore;
 use crate::hub::{read_current, TagEntry, TagMap};
 
@@ -154,19 +168,40 @@ pub struct Subscription {
     pub next_due_ms: i64,
 }
 
+/// マッチ集合を per-tag read スコープで絞り込む(H10 ③、Option B -
+/// このモジュールの doc comment「per-tag read スコープの交差」参照)。
+/// `scope` が `None` なら無フィルタ(session token 認証)。
+fn filter_by_scope<'a>(
+    matched: Vec<&'a TagEntry>,
+    scope: Option<&ApiKeyContext>,
+) -> Vec<&'a TagEntry> {
+    match scope {
+        None => matched,
+        Some(ctx) => matched
+            .into_iter()
+            .filter(|entry| ctx.can_read_value(&entry.external_name))
+            .collect(),
+    }
+}
+
 /// 購読受理直後の初期スナップショットを算出する(設計 §5.2 要件5「接続時に
 /// 現在値の初期スナップショットを必ず1回送る」・§5.4「初期スナップショット
 /// 必須」)。戻り値の2番目は [`Subscription::last`] の初期値そのもの
 /// (diff 基準を初期値で立てる - 呼び出し元は続けてこれを保持する
 /// `Subscription` を組み立てる)。
+///
+/// `scope`(H10 ③): [`resolve`] のマッチ結果をさらに per-tag read
+/// スコープで絞る。`None` は無フィルタ(session token 認証、モジュール doc
+/// comment参照)。
 pub fn initial_values(
     patterns: &[TagPattern],
     map: &TagMap,
     current: Option<&CurrentValuesHandle>,
     server_store: &ServerTagStore,
     now_ms: i64,
+    scope: Option<&ApiKeyContext>,
 ) -> (Vec<ResolvedValue>, DiffBaseline) {
-    let matched = resolve(patterns, map);
+    let matched = filter_by_scope(resolve(patterns, map), scope);
     let mut last = HashMap::with_capacity(matched.len());
     let values = matched
         .into_iter()
@@ -189,14 +224,21 @@ pub fn initial_values(
 /// on_change は変化があった行だけ(空なら `None`、何も送らない)、interval
 /// は発火時刻(`next_due_ms`)に達していれば毎回全マッチ行(変化の有無に
 /// 関わらず)。
+///
+/// `scope`(H10 ③): [`initial_values`] と同じ per-tag read スコープ交差。
+/// スコープ外に落ちたタグは(ワイルドカード購読が構成変更でマッチしなく
+/// なった場合と同様に)単に追跡対象から外れる - on_change の diff 基準
+/// (`sub.last`)からも自然に消える([`Subscription::last`] の
+/// `still_present` retain と同じ経路)。
 pub fn evaluate(
     sub: &mut Subscription,
     map: &TagMap,
     current: Option<&CurrentValuesHandle>,
     server_store: &ServerTagStore,
     now_ms: i64,
+    scope: Option<&ApiKeyContext>,
 ) -> Option<Vec<ResolvedValue>> {
-    let matched = resolve(&sub.patterns, map);
+    let matched = filter_by_scope(resolve(&sub.patterns, map), scope);
 
     match sub.mode {
         Mode::OnChange => {

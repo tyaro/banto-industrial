@@ -963,3 +963,183 @@ async fn malformed_subprotocol_header_is_still_rejected_with_401() {
         other => panic!("expected an HTTP-level rejection, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// 10. H10 ③(Option B、docs/h10-3-read-scope-proposal.md §5・§6): per-tag
+//     read スコープは購読解決(`crate::subscribe_core::resolve`)の結果を
+//     交差させる。`read:{tag}` キーはワイルドカード `*` 購読でもスコープ内
+//     のタグしか受信できない。素の `read` キーは従来どおり全件受信する
+//     (テスト6 `stream_requires_auth_and_read_scope` の拡張 - あちらは
+//     「read スコープを一切持たないキーは 403」、ここは「read はあるが
+//     タグ単位に絞られたキーの受信内容」)
+// ---------------------------------------------------------------------------
+
+/// テスト10共通のフィクスチャ: `line1.fast.temp01`(tag:1)・
+/// `line2.slow.press01`(tag:2)を、同一シミュレータの別レジスタに割り当てて
+/// 別接続・別グループで作る(1プロセスに複数シミュレータを立てなくても
+/// host:port の重複は `plc_connections` に一意制約が無く許容されるため
+/// 問題ない)。呼び出し元は続けて `app.manager.rebuild()` を呼ぶこと。
+async fn seed_two_connections_two_tags(app: &TestApp, sim_port: u16) {
+    let conn1 = PlcConnectionService::new(app.pool.clone())
+        .create(conn_input("line1", sim_port))
+        .await
+        .unwrap();
+    let group1 = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn1.id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group1.id, "40001", "i16")) // tag:1
+        .await
+        .unwrap();
+
+    let conn2 = PlcConnectionService::new(app.pool.clone())
+        .create(conn_input("line2", sim_port))
+        .await
+        .unwrap();
+    let group2 = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("slow", conn2.id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("press01", group2.id, "40002", "i16")) // tag:2
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wildcard_subscription_with_per_tag_read_scope_only_receives_in_scope_tag() {
+    let app = test_app("per-tag-read-scope").await;
+    let sim = Simulator::start().await;
+    sim.set_holding_register(0, 1); // line1.fast.temp01 (40001)
+    sim.set_holding_register(1, 2); // line2.slow.press01 (40002)
+
+    seed_two_connections_two_tags(&app, sim.addr.port()).await;
+    app.manager.rebuild().await.expect("rebuild after seeding");
+
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            app.manager
+                .current_values()
+                .and_then(|c| c.get("tag:1"))
+                .map(|s| s.value)
+                == Some(Some(1.0))
+                && app
+                    .manager
+                    .current_values()
+                    .and_then(|c| c.get("tag:2"))
+                    .map(|s| s.value)
+                    == Some(Some(2.0))
+        })
+        .await,
+        "collector should observe both seeded tags"
+    );
+
+    let issued = app
+        .api_keys
+        .issue(
+            "line1-temp01-reader",
+            vec!["read:line1.fast.temp01".to_string()],
+            None,
+        )
+        .await
+        .expect("issue should succeed");
+
+    let mut ws = connect_ws(&app.ws_url("/api/v1/stream"), Some(&issued.key))
+        .await
+        .expect("ws handshake should succeed");
+
+    send_json(
+        &mut ws,
+        json!({ "op": "subscribe", "id": 1, "tags": ["*"], "mode": "on_change" }),
+    )
+    .await;
+
+    let snapshot = recv_matching(&mut ws, |m| m["op"] == "data" && m["id"] == 1).await;
+    let values = snapshot["values"].as_array().unwrap();
+    assert_eq!(
+        values.len(),
+        1,
+        "wildcard subscription must resolve only the in-scope tag: {values:?}"
+    );
+    assert_eq!(values[0]["tag"], "line1.fast.temp01");
+
+    // スコープ外(line2.slow.press01)の値変更は届かない。
+    sim.set_holding_register(1, 99);
+    tokio::time::sleep(Duration::from_millis(400)).await; // give the eval loop a chance to (wrongly) fire
+    assert_no_more_data_for(&mut ws, 1).await;
+
+    // スコープ内(line1.fast.temp01)の値変更は引き続き届く。
+    sim.set_holding_register(0, 42);
+    let changed = recv_matching(&mut ws, |m| m["op"] == "data" && m["id"] == 1).await;
+    let values = changed["values"].as_array().unwrap();
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["tag"], "line1.fast.temp01");
+    assert_eq!(values[0]["v"], 42.0);
+
+    sim.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wildcard_subscription_with_bare_read_scope_receives_every_tag() {
+    let app = test_app("bare-read-scope-stream").await;
+    let sim = Simulator::start().await;
+    sim.set_holding_register(0, 1); // line1.fast.temp01 (40001)
+    sim.set_holding_register(1, 2); // line2.slow.press01 (40002)
+
+    seed_two_connections_two_tags(&app, sim.addr.port()).await;
+    app.manager.rebuild().await.expect("rebuild after seeding");
+
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            app.manager
+                .current_values()
+                .and_then(|c| c.get("tag:1"))
+                .map(|s| s.value)
+                == Some(Some(1.0))
+                && app
+                    .manager
+                    .current_values()
+                    .and_then(|c| c.get("tag:2"))
+                    .map(|s| s.value)
+                    == Some(Some(2.0))
+        })
+        .await,
+        "collector should observe both seeded tags"
+    );
+
+    let issued = app
+        .api_keys
+        .issue("bare-reader", vec!["read".to_string()], None)
+        .await
+        .expect("issue should succeed");
+
+    let mut ws = connect_ws(&app.ws_url("/api/v1/stream"), Some(&issued.key))
+        .await
+        .expect("ws handshake should succeed");
+
+    send_json(
+        &mut ws,
+        json!({ "op": "subscribe", "id": 1, "tags": ["*"], "mode": "on_change" }),
+    )
+    .await;
+
+    let snapshot = recv_matching(&mut ws, |m| m["op"] == "data" && m["id"] == 1).await;
+    let mut tags: Vec<String> = snapshot["values"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["tag"].as_str().unwrap().to_string())
+        .collect();
+    tags.sort();
+    assert_eq!(
+        tags,
+        vec![
+            "line1.fast.temp01".to_string(),
+            "line2.slow.press01".to_string()
+        ],
+        "a bare `read` key must keep receiving every tag (S2 backward compat)"
+    );
+
+    sim.stop();
+}

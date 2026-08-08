@@ -2787,6 +2787,14 @@ struct ValuesResponse {
 /// currently bad". (This error body stays a raw `serde_json::Value` - only
 /// the *successful* `/api/v1/*` bodies were in scope for the T0-2 typed-struct
 /// conversion.)
+///
+/// H10 ③(Option B、docs/h10-3-read-scope-proposal.md §5 S4): API キー起因
+/// の読み取り(`ctx` あり)だけがタグ単位スコープで絞られる。`?tags=`
+/// 省略(暗黙の全件)はスコープ外を**黙って除いた**集合を返す(「聞いても
+/// いないのに403」を避ける)。`?tags=` で明示的にスコープ外タグを挙げたら
+/// [`v1_value_single`] と同じ**403**(存在は catalog 経由で既知なので
+/// 404 ではない)。セッション token(`ctx` 無し)は従来どおり全件(管理 UI
+/// 不変)。
 #[utoipa::path(
     get,
     path = "/api/v1/values",
@@ -2796,12 +2804,14 @@ struct ValuesResponse {
     responses(
         (status = 200, description = "現在値スナップショット", body = ValuesResponse),
         (status = 400, description = "?tags= に未知の外部名が含まれる"),
+        (status = 403, description = "?tags= に per-tag read スコープ外の外部名が含まれる(API キー、H10 ③)"),
     ),
     tag = "tag-space",
 )]
 async fn v1_values(
     State(state): State<TagSpaceState>,
     Query(query): Query<ValuesQuery>,
+    ctx: Option<Extension<ApiKeyContext>>,
 ) -> Response {
     let map = state.manager.tag_map();
     let revision = state.manager.revision();
@@ -2837,6 +2847,24 @@ async fn v1_values(
         }
     }
 
+    let names: Vec<String> = if let Some(Extension(ctx)) = &ctx {
+        if query.tags.is_some() {
+            // 明示指定でスコープ外を1つでも挙げたら 403(単一と同じ規律)。
+            if names.iter().any(|name| !ctx.can_read_value(name)) {
+                return forbidden_response();
+            }
+            names
+        } else {
+            // 暗黙の全件はスコープ外を黙って除く。
+            names
+                .into_iter()
+                .filter(|name| ctx.can_read_value(name))
+                .collect()
+        }
+    } else {
+        names
+    };
+
     let values: Vec<ValueEntry> = names
         .iter()
         .filter_map(|name| map.get(name).map(|entry| (name, entry)))
@@ -2855,12 +2883,20 @@ async fn v1_values(
 /// name is not in the catalog at all (design: 「404 になるのは定義が存在
 /// しない外部名のみ」) - an undefined-but-uncollected tag is `200` with
 /// `q: "bad"`.
+///
+/// H10 ③(Option B、docs/h10-3-read-scope-proposal.md §5 S3): タグは
+/// catalog に見えている(=存在は既知)ので、per-tag read スコープ外は 404
+/// ではなく**403**(`forbidden_response`)。API キー起因の読み取り
+/// (`ctx` あり)だけがこの判定を受ける - セッション token(`ctx` 無し)は
+/// 従来どおり全アクセス(管理 UI 不変)。catalog 自体(`v1_tags`)は絞らない
+/// - このモジュールの `require_tag_space_auth` の doc comment参照。
 #[utoipa::path(
     get,
     path = "/api/v1/values/{tag}",
     params(("tag" = String, Path, description = "外部名 {connection}.{group}.{tag}")),
     responses(
         (status = 200, description = "単一タグの現在値", body = ValueEntry),
+        (status = 403, description = "per-tag read スコープ外(API キー、H10 ③)"),
         (status = 404, description = "catalog に存在しない外部名"),
     ),
     tag = "tag-space",
@@ -2868,24 +2904,32 @@ async fn v1_values(
 async fn v1_value_single(
     State(state): State<TagSpaceState>,
     Path(tag): Path<String>,
-) -> Result<Json<ValueEntry>, ApiError> {
+    ctx: Option<Extension<ApiKeyContext>>,
+) -> Response {
     let map = state.manager.tag_map();
     let Some(entry) = map.get(&tag) else {
-        return Err(ApiError(BantoError::NotFound {
+        return ApiError(BantoError::NotFound {
             resource: "tags".to_string(),
             id: tag,
-        }));
+        })
+        .into_response();
     };
+    if let Some(Extension(ctx)) = &ctx {
+        if !ctx.can_read_value(&tag) {
+            return forbidden_response();
+        }
+    }
     let now_ms = state.manager.clock().now_ms();
     let current = state.manager.current_values();
     let server_store = state.manager.server_store();
-    Ok(Json(value_entry(
+    Json(value_entry(
         &tag,
         entry,
         current.as_ref(),
         &server_store,
         now_ms,
-    )))
+    ))
+    .into_response()
 }
 
 /// `GET /api/v1/status` の `connections` 配列1件分。
@@ -3495,7 +3539,14 @@ async fn require_tag_space_auth(
         let now_ms = state.manager.clock().now_ms();
         match state.api_keys.lookup(&token, now_ms).await {
             Ok(ApiKeyLookup::Valid(ctx)) => {
-                if !is_write_route && !ctx.has_read_scope() {
+                // H10 ③(Option B): この認証層のゲートは「read 系ルートに
+                // 入れるか」だけを見る(has_any_read = 素の read か任意の
+                // read:... を1つでも持つか)。個々のタグの値を読めるかどうか
+                // (can_read_value)は catalog を絞らず、値ハンドラ側
+                // (v1_value_single/v1_values/crate::stream)が個別に判定する
+                // - `crate::api_keys::ApiKeyContext` の doc comment「read の
+                // タグ単位化」参照。
+                if !is_write_route && !ctx.has_any_read() {
                     return forbidden_response();
                 }
                 if let Err(err) = state
@@ -4492,5 +4543,264 @@ mod tests {
         let after = env.api_keys.list().await.unwrap();
         let after_entry = after.iter().find(|k| k.id == id).unwrap();
         assert!(after_entry.last_used_at.is_some());
+    }
+
+    // --- H10 ③: per-tag read スコープ(Option B、
+    // docs/h10-3-read-scope-proposal.md §5・§6) ------------------------------
+
+    /// admin 系ルーター(CSRF ヘッダ必須)への `POST` - `issue_api_key` と
+    /// 同型の汎用ヘルパ(H10 ③ のタグ seed フィクスチャで複数リソースを
+    /// 作るため、`tests/grpc.rs`/`tests/computed.rs` の `admin_post` と
+    /// 同じ形をここにも用意する)。
+    async fn admin_post(
+        router: &Router,
+        path: &str,
+        token: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                HttpRequest::post(path)
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// 認証ヘッダ付きで `/api/v1/*` に `GET` する小さなヘルパ。`/api/v1/*`
+    /// は CSRF 対象外なので `X-Banto-Client` は付けない
+    /// （`v1_tags_requires_auth_but_not_the_csrf_header` 参照）。
+    async fn v1_get(router: &Router, key: &str, path: &str) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                HttpRequest::get(path)
+                    .header("Authorization", format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// `line1.fast.temp01`/`line1.fast.temp02`/`line2.slow.press01` の3タグを
+    /// 別接続・別グループで作る(admin REST 経由 - I1 の書き込みハンドラは
+    /// 成功のたびに `CollectorManager::rebuild` を自動で呼ぶので、明示的な
+    /// rebuild 呼び出しは不要、このモジュールの doc comment「I1 CRUD 書き
+    /// 込み後の再構築」参照)。catalog は registry の読み取りだけで完結する
+    /// (`crate::hub::build_catalog`)ため、実際に PLC へ繋がらないポートでも
+    /// rebuild は成功しカタログへ反映される -
+    /// `tags_create_via_admin_router_rebuilds_the_catalog` と同じ判断。
+    async fn seed_scope_fixture(router: &Router, admin_token: &str) {
+        let (status, conn1) = admin_post(
+            router,
+            "/api/plc-connections",
+            admin_token,
+            json!({ "name": "line1", "host": "127.0.0.1", "port": 15101 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn1:?}");
+        let (status, group1) = admin_post(
+            router,
+            "/api/collection-groups",
+            admin_token,
+            json!({ "name": "fast", "plcConnectionId": conn1["id"], "periodMs": 100 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{group1:?}");
+        for (name, address) in [("temp01", "40001"), ("temp02", "40003")] {
+            let (status, tag) = admin_post(
+                router,
+                "/api/tags",
+                admin_token,
+                json!({
+                    "name": name,
+                    "collectionGroupId": group1["id"],
+                    "address": address,
+                    "dataType": "i16",
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{tag:?}");
+        }
+
+        let (status, conn2) = admin_post(
+            router,
+            "/api/plc-connections",
+            admin_token,
+            json!({ "name": "line2", "host": "127.0.0.1", "port": 15102 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn2:?}");
+        let (status, group2) = admin_post(
+            router,
+            "/api/collection-groups",
+            admin_token,
+            json!({ "name": "slow", "plcConnectionId": conn2["id"], "periodMs": 1000 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{group2:?}");
+        let (status, tag) = admin_post(
+            router,
+            "/api/tags",
+            admin_token,
+            json!({
+                "name": "press01",
+                "collectionGroupId": group2["id"],
+                "address": "40001",
+                "dataType": "i16",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{tag:?}");
+    }
+
+    /// S1/S3/S4(案 B): `read:line1.fast.temp01` キーは catalog は全タグ
+    /// (line2 のタグ含む)を見られるが、値は自分のタグしか読めない - 単一は
+    /// 403、バルクは黙って除外、`?tags=` 明示指定は 403。
+    #[tokio::test]
+    async fn exact_read_scope_key_sees_full_catalog_but_only_its_own_tag_value() {
+        let env = test_env().await;
+        seed_scope_fixture(&env.router, &env.admin_token).await;
+        let (status, issued) = issue_api_key(
+            &env.router,
+            &env.admin_token,
+            "line1-temp01-reader",
+            &["read:line1.fast.temp01"],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{issued:?}");
+        let key = issued["key"].as_str().unwrap();
+
+        // catalog は絞らない - line2 のタグも見える(案 B の核)。
+        let (status, catalog) = v1_get(&env.router, key, "/api/v1/tags").await;
+        assert_eq!(status, StatusCode::OK, "{catalog:?}");
+        let names: Vec<&str> = catalog["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["external_name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"line1.fast.temp01"));
+        assert!(names.contains(&"line1.fast.temp02"));
+        assert!(
+            names.contains(&"line2.slow.press01"),
+            "catalog must stay unfiltered (Option B): {names:?}"
+        );
+
+        // 単一: 自分のタグは 200、他人のタグは 403(404 ではない - catalog
+        // に見えている=存在は既知のため)。
+        let (status, _) = v1_get(&env.router, key, "/api/v1/values/line1.fast.temp01").await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = v1_get(&env.router, key, "/api/v1/values/line2.slow.press01").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // バルク(?tags= 省略): スコープ外は黙って除かれる。
+        let (status, bulk) = v1_get(&env.router, key, "/api/v1/values").await;
+        assert_eq!(status, StatusCode::OK, "{bulk:?}");
+        let bulk_tags: Vec<&str> = bulk["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["tag"].as_str().unwrap())
+            .collect();
+        assert_eq!(bulk_tags, vec!["line1.fast.temp01"]);
+
+        // バルク(?tags= 明示、スコープ外を含む): 403(単一と同じ規律)。
+        let (status, _) = v1_get(&env.router, key, "/api/v1/values?tags=line2.slow.press01").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// S1(グループ・ワイルドカード): `read:line1.fast.*` キーはそのグループ
+    /// の全タグ(temp01・temp02)を読めるが、別グループ(line2.slow)は読め
+    /// ない。
+    #[tokio::test]
+    async fn group_wildcard_read_scope_key_reads_every_tag_in_its_group_but_not_others() {
+        let env = test_env().await;
+        seed_scope_fixture(&env.router, &env.admin_token).await;
+        let (status, issued) = issue_api_key(
+            &env.router,
+            &env.admin_token,
+            "line1-fast-reader",
+            &["read:line1.fast.*"],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{issued:?}");
+        let key = issued["key"].as_str().unwrap();
+
+        for tag in ["line1.fast.temp01", "line1.fast.temp02"] {
+            let (status, body) = v1_get(&env.router, key, &format!("/api/v1/values/{tag}")).await;
+            assert_eq!(status, StatusCode::OK, "{tag}: {body:?}");
+        }
+        let (status, _) = v1_get(&env.router, key, "/api/v1/values/line2.slow.press01").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let (status, bulk) = v1_get(&env.router, key, "/api/v1/values").await;
+        assert_eq!(status, StatusCode::OK, "{bulk:?}");
+        let mut bulk_tags: Vec<&str> = bulk["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["tag"].as_str().unwrap())
+            .collect();
+        bulk_tags.sort_unstable();
+        assert_eq!(bulk_tags, vec!["line1.fast.temp01", "line1.fast.temp02"]);
+    }
+
+    /// S2(後方互換): 素の `read` キーは従来どおり catalog も値(単一・
+    /// バルク・明示 `?tags=`)も全件読める - per-tag スコープ導入で既定動作
+    /// が変わっていないことの回帰防止。
+    #[tokio::test]
+    async fn bare_read_scope_key_still_reads_every_tag_value() {
+        let env = test_env().await;
+        seed_scope_fixture(&env.router, &env.admin_token).await;
+        let (status, issued) =
+            issue_api_key(&env.router, &env.admin_token, "bare-reader", &["read"]).await;
+        assert_eq!(status, StatusCode::CREATED, "{issued:?}");
+        let key = issued["key"].as_str().unwrap();
+
+        let (status, _) = v1_get(&env.router, key, "/api/v1/values/line2.slow.press01").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, bulk) = v1_get(&env.router, key, "/api/v1/values").await;
+        assert_eq!(status, StatusCode::OK, "{bulk:?}");
+        let mut bulk_tags: Vec<&str> = bulk["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["tag"].as_str().unwrap())
+            .collect();
+        bulk_tags.sort_unstable();
+        assert_eq!(
+            bulk_tags,
+            vec![
+                "line1.fast.temp01",
+                "line1.fast.temp02",
+                "line2.slow.press01"
+            ]
+        );
+
+        // 明示 ?tags= でも全件通る(スコープ外という概念が無い)。
+        let (status, _) = v1_get(&env.router, key, "/api/v1/values?tags=line2.slow.press01").await;
+        assert_eq!(status, StatusCode::OK);
     }
 }
