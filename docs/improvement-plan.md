@@ -44,7 +44,7 @@
 | H1  | banto-expr の式長・ネスト深さ上限(DoS 根治)              | 最高   | 小   | 完了(残件あり)   |
 | H2  | 手動書き込み(タグモニタ)の安全意味論                     | 最高   | 中   | 決定済み・実装中 |
 | H3  | banto-hub gRPC の bind 設定化(既定 127.0.0.1)            | 高     | 中   | 完了(本 PR)      |
-| H4  | 収集タイムスタンプ逆行対策 + append 失敗の可視化         | 高     | 中   | 決定済み・実装中 |
+| H4  | 収集タイムスタンプ逆行対策 + append 失敗の可視化         | 高     | 中   | 完了(本 PR)      |
 | H5  | フロントテスト基盤(vitest)+ hub/relay-wright E2E         | 高     | 大   | 未着手           |
 | H6  | サプライチェーン/再現性(deny・audit・toolchain 固定ほか) | 高     | 中   | 未着手           |
 | H7  | ソーク実行・障害系テスト(crash 再オープン・DST・並行)    | 中     | 大   | 未着手           |
@@ -143,7 +143,7 @@
   H3 では触らず、扱いは H8 の README 整備時に「開発用・公開注意」の明記で
   対応する
 
-### H4: 収集タイムスタンプ逆行対策 + append 失敗の可視化 — 状態: 決定済み(2026-08-08)・実装中
+### H4: 収集タイムスタンプ逆行対策 + append 失敗の可視化 — 状態: 完了(2026-08-08、本 PR)
 
 - **事実**: 収集ティックはモノトニック時計駆動だが、保存タイムスタンプ
   `ptime_ms` は壁時計(`SystemClock::now_ms`)。時計が逆行すると使用済み
@@ -169,6 +169,20 @@
   挙動と同値の値を書くだけなら挙動変更なし。値を変える場合はオーナー判断)
 - **受け入れ条件**: 失敗計数のテスト(重複 ptime を注入して欠測イベントが
   残る)、既存テスト green
+- **実施記録(2026-08-08)**: tstore の samples INSERT を
+  `ON CONFLICT(ptime) DO UPDATE`(全値カラム置換)へ変更(`OR REPLACE`
+  は delete+insert で rowid=ptime のクラスタ順序を乱すため不採用。タグ
+  0 本グループは `DO NOTHING`)。同一フラッシュバッチ内の重複も
+  last-wins をテストで固定。collect には接続単位の
+  `ClockRegressionTracker` とグループ単位の `AppendHealth`(いずれも
+  純粋なエッジ検出器)を追加し、`clock_regression_entered/cleared`・
+  `append_failure_entered/cleared` の4イベント種を collect_events へ
+  エピソード遷移時のみ発行(kind 列は CHECK 制約なしのためスキーマ
+  無変更)。append 失敗は毎回 eprintln + エッジでイベント化(24/365
+  継続設計は不変)。新規テスト 16 本、tstore 76 / collect 66 /
+  hub-core 全スイート green
+- **残件(観察)**: 連続失敗回数のリアルタイム外部公開(status API)は
+  未実装(イベント detail と ログのみ)。必要になれば追加
 
 ### H5: フロントテスト基盤 + E2E 拡充 — 状態: 未着手
 

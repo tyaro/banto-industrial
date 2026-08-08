@@ -36,6 +36,34 @@
 //! runs in a *spawned* sub-task (so a slow `connect()` cannot stall the
 //! scheduler) with exponential backoff (1s, 2s, 4s ... capped at 30s),
 //! reset to immediate on a fresh drop and on any success.
+//!
+//! ## H4 (owner decision 2026-08-08): clock regression and append failure are
+//! ## recorded anomalies, not silence
+//!
+//! Two things this task used to let pass without a trace now both surface as
+//! [`crate::event::EventKind`] episode-edge events (docs/improvement-plan.md
+//! H4) - never per tick, only on the state transition, mirroring the
+//! `threshold_entered`/`threshold_cleared` edge-only pattern this file
+//! already uses for tag thresholds (`classify_threshold`/`record_group`
+//! below):
+//!
+//! - **Clock regression.** [`ClockRegressionTracker`] remembers the highest
+//!   `ptime_ms` a connection's tick has ever observed; a new tick whose
+//!   `ptime_ms` is *smaller* means the collection PC's wall clock just moved
+//!   backwards (NTP sync, manual correction). `banto-tstore`'s upsert (owner
+//!   decision 2026-08-08, docs/improvement-plan.md H4,
+//!   `banto_tstore::writer`'s module doc) already makes this safe to keep
+//!   appending through - the wall clock is always trusted, and a `ptime`
+//!   collision is resolved by letting the newest write win rather than
+//!   rejecting it - so this crate does *not* clamp `ptime_ms` to be
+//!   monotonic anywhere; it only makes the fact that it regressed observable.
+//! - **Append failure.** [`AppendHealth`] tracks, per group, whether
+//!   `TsWriter::append` is currently in a failing streak. What used to be
+//!   `let _ = writer.append(...).await;` (failure silently swallowed) is now
+//!   `eprintln!` on every failure (operator-visible in logs immediately) plus
+//!   an event on the two edges (failing streak started / recovered). The
+//!   24/365 design is unchanged: a storage failure still never stops the tick
+//!   loop, it is just no longer silent.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -295,6 +323,122 @@ fn set_status(ctx: &TaskContext, key: &str, status: ConnectionStatus) {
         .insert(key.to_string(), status);
 }
 
+/// The transition [`ClockRegressionTracker::observe`] reports - `None` on
+/// every ordinary (non-edge) tick, which is most of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClockTransition {
+    /// This tick's `ptime_ms` is the first one smaller than the tracker's
+    /// high-water mark - a regression episode just started.
+    Entered { high_water_ms: i64, ptime_ms: i64 },
+    /// This tick's `ptime_ms` climbed back to (or past) the high-water mark
+    /// recorded before the regression - the episode just ended.
+    Recovered { ptime_ms: i64 },
+}
+
+/// One connection's clock-regression episode detector (H4, this module's doc
+/// comment). Pure and `Clock`-independent by design (a plain `i64` in, an
+/// `Option<ClockTransition>` out) so the edge logic itself is unit-testable
+/// without spinning up a task/writer/socket - see this module's tests.
+///
+/// `regressed` plus a separately-held `high_water_ms` (rather than folding
+/// "regressed" into e.g. `high_water_ms` going `None`) mirrors
+/// [`AppendHealth`]'s shape below: the peak must stay remembered *through*
+/// the whole episode so [`Self::observe`] can tell "recovered" (>= the old
+/// peak) apart from "still regressed, but a little less so than the tick
+/// before" (still < the old peak) - both would otherwise look identical if
+/// the peak were overwritten on every observation.
+#[derive(Debug, Default)]
+struct ClockRegressionTracker {
+    high_water_ms: Option<i64>,
+    regressed: bool,
+}
+
+impl ClockRegressionTracker {
+    /// Record one tick's `ptime_ms`. Returns the edge transition, if this
+    /// tick is one - `None` for the first-ever call (nothing to compare
+    /// against yet), every ordinary forward/flat tick, and every repeat tick
+    /// while still inside an already-reported regression.
+    fn observe(&mut self, ptime_ms: i64) -> Option<ClockTransition> {
+        let Some(high_water_ms) = self.high_water_ms else {
+            self.high_water_ms = Some(ptime_ms);
+            return None;
+        };
+
+        if self.regressed {
+            if ptime_ms >= high_water_ms {
+                self.regressed = false;
+                self.high_water_ms = Some(ptime_ms);
+                Some(ClockTransition::Recovered { ptime_ms })
+            } else {
+                None
+            }
+        } else if ptime_ms < high_water_ms {
+            self.regressed = true;
+            Some(ClockTransition::Entered {
+                high_water_ms,
+                ptime_ms,
+            })
+        } else {
+            self.high_water_ms = Some(ptime_ms);
+            None
+        }
+    }
+}
+
+/// The transition [`AppendHealth::record`] reports - `None` on every
+/// non-edge call (a repeat failure within an already-reported streak, or a
+/// success while already healthy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppendTransition {
+    /// The first failure of a new streak (`streak` is always 1 here).
+    Entered { streak: u64 },
+    /// A success ended a streak of `streak` (>= 1) consecutive failures.
+    Recovered { streak: u64 },
+}
+
+/// One group's `TsWriter::append` failure-streak tracker (H4, this module's
+/// doc comment) - the append-failure twin of [`ClockRegressionTracker`],
+/// same "pure edge detector, `record_group` drives it" shape. Kept per group
+/// (not per connection): `TsWriter::append`'s `UnknownGroup` failure mode
+/// (`collector.rs`'s module doc, step 4 of `apply_config`) can affect one
+/// group on a connection while its siblings keep succeeding, so a single
+/// connection-wide flag could flap between "recovered" and "entered" from
+/// unrelated groups' successes/failures within the very same tick.
+#[derive(Debug, Default, Clone, Copy)]
+struct AppendHealth {
+    failing: bool,
+    streak: u64,
+}
+
+impl AppendHealth {
+    /// Record one append outcome. `succeeded = false` increments the streak
+    /// and reports `Entered` the moment it starts (streak 0 -> 1);
+    /// `succeeded = true` reports `Recovered` (with the streak length that
+    /// just ended) iff a streak was in progress, then resets it to 0.
+    fn record(&mut self, succeeded: bool) -> Option<AppendTransition> {
+        if succeeded {
+            if self.failing {
+                let streak = self.streak;
+                self.failing = false;
+                self.streak = 0;
+                Some(AppendTransition::Recovered { streak })
+            } else {
+                None
+            }
+        } else {
+            self.streak += 1;
+            if self.failing {
+                None
+            } else {
+                self.failing = true;
+                Some(AppendTransition::Entered {
+                    streak: self.streak,
+                })
+            }
+        }
+    }
+}
+
 /// Run one connection's collection loop until `stop_rx` flips to `true`.
 pub(crate) async fn run_connection(
     plan: ConnectionPlan,
@@ -316,6 +460,13 @@ pub(crate) async fn run_connection(
         .iter()
         .map(|g| vec![None; g.tags.len()])
         .collect();
+    // H4: one clock-regression tracker for the whole connection (`ptime_ms`
+    // is computed once per tick-wake, shared by every group that fires in
+    // it - see the `tokio::time::sleep_until(soonest)` arm below), and one
+    // append-failure tracker per group (`AppendHealth`'s own doc comment
+    // explains why per-group, not per-connection).
+    let mut clock_tracker = ClockRegressionTracker::default();
+    let mut append_health: Vec<AppendHealth> = vec![AppendHealth::default(); group_count];
 
     // Start out wanting to connect immediately.
     let mut attempt: u32 = 0;
@@ -402,6 +553,35 @@ pub(crate) async fn run_connection(
                 let now = Instant::now();
                 let ptime_ms = ctx.clock.now_ms();
 
+                // H4: detected once per tick-wake (not per group - every
+                // group firing this wake shares this same `ptime_ms`),
+                // regardless of connection state - a clock regression is a
+                // fact about the collection PC, not about PLC connectivity.
+                if let Some(transition) = clock_tracker.observe(ptime_ms) {
+                    let (kind, detail) = match transition {
+                        ClockTransition::Entered { high_water_ms, .. } => (
+                            EventKind::ClockRegressionEntered,
+                            format!(
+                                "収集PCの時計が逆行しました: {high_water_ms}ms → {ptime_ms}ms \
+                                 (Δ{}ms)",
+                                ptime_ms - high_water_ms
+                            ),
+                        ),
+                        ClockTransition::Recovered { .. } => (
+                            EventKind::ClockRegressionCleared,
+                            format!("収集PCの時計逆行から復旧しました: {ptime_ms}ms"),
+                        ),
+                    };
+                    ctx.events
+                        .emit(CollectEvent::connection(
+                            ptime_ms,
+                            kind,
+                            conn_key.clone(),
+                            Some(detail),
+                        ))
+                        .await;
+                }
+
                 for i in 0..group_count {
                     if next_fire[i] > now {
                         continue;
@@ -434,6 +614,7 @@ pub(crate) async fn run_connection(
                                 &ctx,
                                 &conn_key,
                                 &mut threshold_state[i],
+                                &mut append_health[i],
                             )
                             .await;
                         }
@@ -448,6 +629,7 @@ pub(crate) async fn run_connection(
                                 &ctx,
                                 &conn_key,
                                 &mut threshold_state[i],
+                                &mut append_health[i],
                             )
                             .await;
                             ctx.events
@@ -476,6 +658,7 @@ pub(crate) async fn run_connection(
                                 &ctx,
                                 &conn_key,
                                 &mut threshold_state[i],
+                                &mut append_health[i],
                             )
                             .await;
                         }
@@ -505,6 +688,7 @@ async fn record_group(
     ctx: &TaskContext,
     conn_key: &str,
     threshold_state: &mut [Option<ThresholdLevel>],
+    append_health: &mut AppendHealth,
 ) {
     let mut values: Vec<Option<f64>> = Vec::with_capacity(group.tags.len());
 
@@ -564,18 +748,73 @@ async fn record_group(
         }
     }
 
-    // Swallow append failures rather than tear the loop down: a 24/365
-    // recorder keeps collecting through a transient storage hiccup (the
-    // in-memory cache and live events still flow). A persistent failure
-    // (e.g. disk full) is an operational condition surfaced elsewhere, not a
-    // reason to kill this connection's collection.
+    // An append failure never tears the loop down - a 24/365 recorder keeps
+    // collecting through a transient storage hiccup (the in-memory cache and
+    // live events still flow). A persistent failure (e.g. disk full) is an
+    // operational condition surfaced elsewhere, not a reason to kill this
+    // connection's collection. H4 (2026-08-08 owner decision,
+    // docs/improvement-plan.md): unlike before, the failure itself is no
+    // longer silently discarded - `eprintln!` gives every failure immediate
+    // operator-visible log output, and `append_health` (this module's doc
+    // comment) turns the failing-streak start/end into a recorded
+    // `collect_events` row via the same edge-only pattern the threshold
+    // events above use.
     //
     // Re-borrowed fresh on every call (T7-1: `apply_config` may have rotated
     // the writer since the last tick) - the `Ref` guard from `borrow()` is
     // dropped at the end of this statement, before the `.await`, so it never
     // needs to be `Send` across an await point.
     let writer = ctx.writer_rx.borrow().clone();
-    let _ = writer.append(&group.key, ptime_ms, &values).await;
+    let append_result = writer.append(&group.key, ptime_ms, &values).await;
+    // `record` first (its own `streak` counter is the single source of
+    // truth), then the eprintln below reads the just-updated `streak`.
+    let transition = append_health.record(append_result.is_ok());
+
+    if let Err(err) = &append_result {
+        eprintln!(
+            "banto-collect: 接続 {conn_key} グループ {} の書き込みに失敗しました \
+             (ptime={ptime_ms}, 連続{}回目): {err}",
+            group.key, append_health.streak
+        );
+    }
+
+    match transition {
+        Some(AppendTransition::Entered { .. }) => {
+            // `record` only ever reports `Entered` when this call's append
+            // failed, so `append_result` is `Err` here - the fallback text
+            // is unreachable in practice, kept only so this can never panic.
+            let reason = append_result
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "不明なエラー".to_string());
+            ctx.events
+                .emit(CollectEvent::connection(
+                    ptime_ms,
+                    EventKind::AppendFailureEntered,
+                    conn_key,
+                    Some(format!(
+                        "グループ {} の書き込みが失敗し始めました: {reason}",
+                        group.key
+                    )),
+                ))
+                .await;
+        }
+        Some(AppendTransition::Recovered { streak }) => {
+            ctx.events
+                .emit(CollectEvent::connection(
+                    ptime_ms,
+                    EventKind::AppendFailureCleared,
+                    conn_key,
+                    Some(format!(
+                        "グループ {} の書き込みが{streak}回の失敗から復旧しました",
+                        group.key
+                    )),
+                ))
+                .await;
+        }
+        None => {}
+    }
 }
 
 /// Classify a scaled value against a tag's H/HH/L/LL limits. High bands take
@@ -610,6 +849,7 @@ fn classify_threshold(value: f64, tag: &crate::config::TagPlan) -> Option<Thresh
 mod tests {
     use super::*;
     use crate::config::Thresholds;
+    use banto_tstore::{GroupConfig, StoreConfig, SystemClock, TagColumn};
 
     fn cfg() -> BackoffConfig {
         BackoffConfig {
@@ -689,5 +929,323 @@ mod tests {
         });
         assert_eq!(classify_threshold(90.0, &tag), Some(ThresholdLevel::H));
         assert_eq!(classify_threshold(10.0, &tag), None);
+    }
+
+    // --- H4 (2026-08-08 owner decision): clock-regression tracker ---------
+    // Pure logic, no task/writer/socket needed - see `ClockRegressionTracker`'s
+    // own doc comment for why this shape was chosen.
+
+    #[test]
+    fn clock_regression_tracker_first_observation_is_never_a_transition() {
+        let mut tracker = ClockRegressionTracker::default();
+        assert_eq!(
+            tracker.observe(1_000),
+            None,
+            "nothing to compare against yet"
+        );
+    }
+
+    #[test]
+    fn clock_regression_tracker_forward_and_flat_ticks_never_transition() {
+        let mut tracker = ClockRegressionTracker::default();
+        tracker.observe(1_000);
+        assert_eq!(tracker.observe(1_100), None);
+        assert_eq!(
+            tracker.observe(1_100),
+            None,
+            "an unchanged (frozen-clock) ptime is not itself a regression"
+        );
+        assert_eq!(tracker.observe(2_000), None);
+    }
+
+    #[test]
+    fn clock_regression_tracker_reports_entered_once_then_stays_silent_while_still_regressed() {
+        let mut tracker = ClockRegressionTracker::default();
+        tracker.observe(5_000); // establishes the high-water mark
+        assert_eq!(
+            tracker.observe(1_000),
+            Some(ClockTransition::Entered {
+                high_water_ms: 5_000,
+                ptime_ms: 1_000,
+            })
+        );
+        // Still below the high-water mark on every later tick of this same
+        // episode - must not re-fire, even though ptime is itself advancing.
+        assert_eq!(tracker.observe(1_500), None);
+        assert_eq!(tracker.observe(4_999), None);
+    }
+
+    #[test]
+    fn clock_regression_tracker_reports_recovered_once_ptime_reaches_the_high_water_mark() {
+        let mut tracker = ClockRegressionTracker::default();
+        tracker.observe(5_000);
+        tracker.observe(1_000); // Entered
+        assert_eq!(
+            tracker.observe(4_999),
+            None,
+            "not recovered yet - one ms short of the high-water mark"
+        );
+        assert_eq!(
+            tracker.observe(5_000),
+            Some(ClockTransition::Recovered { ptime_ms: 5_000 }),
+            "reaching (not just exceeding) the high-water mark counts as recovered"
+        );
+        assert_eq!(
+            tracker.observe(5_001),
+            None,
+            "back to normal - no repeat event"
+        );
+    }
+
+    #[test]
+    fn clock_regression_tracker_detects_a_second_independent_episode() {
+        let mut tracker = ClockRegressionTracker::default();
+        tracker.observe(1_000);
+        assert!(matches!(
+            tracker.observe(500),
+            Some(ClockTransition::Entered { .. })
+        ));
+        assert!(matches!(
+            tracker.observe(1_000),
+            Some(ClockTransition::Recovered { .. })
+        ));
+        // A fresh regression from the new (higher) high-water mark must be
+        // detected again, not suppressed by the episode that already closed.
+        tracker.observe(2_000);
+        assert!(matches!(
+            tracker.observe(1_500),
+            Some(ClockTransition::Entered { .. })
+        ));
+    }
+
+    // --- H4: append-failure tracker (pure logic) ---------------------------
+
+    #[test]
+    fn append_health_success_while_healthy_is_never_a_transition() {
+        let mut health = AppendHealth::default();
+        assert_eq!(health.record(true), None);
+        assert_eq!(health.record(true), None);
+    }
+
+    #[test]
+    fn append_health_reports_entered_once_then_stays_silent_while_still_failing() {
+        let mut health = AppendHealth::default();
+        assert_eq!(
+            health.record(false),
+            Some(AppendTransition::Entered { streak: 1 })
+        );
+        assert_eq!(
+            health.record(false),
+            None,
+            "still failing - no repeat event"
+        );
+        assert_eq!(health.record(false), None);
+        assert_eq!(
+            health.streak, 3,
+            "the streak keeps counting even while silent"
+        );
+    }
+
+    #[test]
+    fn append_health_reports_recovered_with_the_streak_length_that_just_ended() {
+        let mut health = AppendHealth::default();
+        health.record(false);
+        health.record(false);
+        health.record(false);
+        assert_eq!(
+            health.record(true),
+            Some(AppendTransition::Recovered { streak: 3 })
+        );
+        assert_eq!(health.streak, 0, "the streak resets once recovered");
+        assert_eq!(
+            health.record(true),
+            None,
+            "back to healthy - no repeat event"
+        );
+    }
+
+    #[test]
+    fn append_health_detects_a_second_independent_failure_streak() {
+        let mut health = AppendHealth::default();
+        health.record(false);
+        assert_eq!(
+            health.record(true),
+            Some(AppendTransition::Recovered { streak: 1 })
+        );
+        assert_eq!(
+            health.record(false),
+            Some(AppendTransition::Entered { streak: 1 }),
+            "a fresh streak must be detected again, not suppressed by the earlier one"
+        );
+    }
+
+    // --- H4: a real (non-mocked) append-failure seam -----------------------
+    //
+    // `TsWriter::append` genuinely fails with `TstoreError::UnknownGroup`
+    // when asked to write a group key its `StoreConfig` does not know about -
+    // exactly the race `collector.rs`'s module doc describes for a writer
+    // rotation in flight (T7-1, step 4: "a newly spawned task reading a
+    // brand-new group must never see the *old* writer"). Driving that real
+    // failure - and its real recovery, once the writer "rotates" to a
+    // `StoreConfig` that does know the group, exactly as `apply_config`
+    // distributes a new writer over the same `watch` channel - through the
+    // actual `record_group` proves the event wiring end to end without
+    // inventing a mock/fake `TsWriter`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn record_group_surfaces_a_real_append_failure_and_its_recovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+
+        // Writer #1 knows only "other-group" - every append for
+        // "target-group" against it must genuinely fail with UnknownGroup.
+        let other_group_config = StoreConfig {
+            groups: vec![GroupConfig {
+                key: "other-group".to_string(),
+                name: "Other".to_string(),
+                period_ms: 100,
+                tags: vec![TagColumn {
+                    key: "t0".to_string(),
+                    name: "T0".to_string(),
+                    data_type: "i16".to_string(),
+                    unit: None,
+                    decimals: 0,
+                }],
+            }],
+        };
+        let writer1 = Arc::new(
+            TsWriter::open(dir.path(), other_group_config, clock.clone())
+                .await
+                .expect("writer1 should open"),
+        );
+        let (writer_tx, writer_rx) = watch::channel(writer1);
+
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("sqlite memory pool");
+        let events = EventSink::new(pool);
+        let mut live = events.subscribe();
+
+        let ctx = TaskContext {
+            writer_rx,
+            clock: clock.clone(),
+            current: CurrentValuesHandle::new(clock.clone()),
+            events,
+            status: Arc::new(RwLock::new(HashMap::new())),
+            backoff: BackoffConfig::default(),
+            factory: default_client_factory(),
+        };
+
+        let group = GroupPlan {
+            key: "target-group".to_string(),
+            period: Duration::from_millis(100),
+            period_ms: 100,
+            requests: vec![],
+            tags: vec![crate::config::TagPlan {
+                key: "tag:1".to_string(),
+                scaling: None,
+                thresholds: Thresholds::default(),
+            }],
+        };
+        let mut threshold_state = vec![None];
+        let mut append_health = AppendHealth::default();
+        let good = [ReadResult::Value(TagValue::F64(1.0))];
+
+        // Tick 1: genuinely fails (UnknownGroup) - the entering edge.
+        record_group(
+            &group,
+            Some(&good),
+            1_000,
+            &ctx,
+            "conn:1",
+            &mut threshold_state,
+            &mut append_health,
+        )
+        .await;
+        let evt = live.try_recv().expect("an event should have been emitted");
+        assert_eq!(evt.kind, EventKind::AppendFailureEntered);
+        assert_eq!(evt.connection_key.as_deref(), Some("conn:1"));
+        assert!(evt.detail.is_some());
+        assert!(
+            live.try_recv().is_err(),
+            "only the entering edge should emit, nothing else"
+        );
+
+        // Tick 2: still fails against the same (unrotated) writer - no
+        // repeat event, this is not a per-tick emission.
+        record_group(
+            &group,
+            Some(&good),
+            1_100,
+            &ctx,
+            "conn:1",
+            &mut threshold_state,
+            &mut append_health,
+        )
+        .await;
+        assert!(
+            live.try_recv().is_err(),
+            "a second consecutive failure must not re-emit AppendFailureEntered"
+        );
+        assert_eq!(append_health.streak, 2);
+
+        // "Rotate" the writer (T7-1-style, over the same watch channel
+        // `apply_config` uses) to one that knows "target-group".
+        let target_group_config = StoreConfig {
+            groups: vec![GroupConfig {
+                key: "target-group".to_string(),
+                name: "Target".to_string(),
+                period_ms: 100,
+                tags: vec![TagColumn {
+                    key: "t1".to_string(),
+                    name: "T1".to_string(),
+                    data_type: "i16".to_string(),
+                    unit: None,
+                    decimals: 0,
+                }],
+            }],
+        };
+        let writer2 = Arc::new(
+            TsWriter::open(dir.path(), target_group_config, clock.clone())
+                .await
+                .expect("writer2 should open"),
+        );
+        writer_tx
+            .send(writer2)
+            .expect("the watch channel still has a live receiver in ctx");
+
+        // Tick 3: now genuinely succeeds - the recovery edge.
+        record_group(
+            &group,
+            Some(&good),
+            1_200,
+            &ctx,
+            "conn:1",
+            &mut threshold_state,
+            &mut append_health,
+        )
+        .await;
+        let evt = live
+            .try_recv()
+            .expect("a recovery event should have been emitted");
+        assert_eq!(evt.kind, EventKind::AppendFailureCleared);
+        assert!(
+            evt.detail.as_deref().is_some_and(|d| d.contains('2')),
+            "the recovery detail should mention the 2-failure streak that just ended: {:?}",
+            evt.detail
+        );
+        assert_eq!(append_health.streak, 0);
+
+        // Tick 4: healthy - no repeat event.
+        record_group(
+            &group,
+            Some(&good),
+            1_300,
+            &ctx,
+            "conn:1",
+            &mut threshold_state,
+            &mut append_health,
+        )
+        .await;
+        assert!(live.try_recv().is_err());
     }
 }

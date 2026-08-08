@@ -35,8 +35,12 @@ pub enum CollectError {
     /// Opening/flushing/closing the time-series store failed
     /// (`banto-tstore`). Only ever produced by [`crate::Collector::start`]
     /// (opening the writer) and [`crate::Collector::stop`] (final
-    /// flush/close) - never by the hot append path, which swallows transient
-    /// append failures to keep collecting (see `task.rs`).
+    /// flush/close) - never by the hot append path, which never turns a
+    /// transient append failure into this error type (an append failure
+    /// there still never stops collection - see `task.rs`'s module doc,
+    /// "H4" - though since 2026-08-08 (owner decision, docs/improvement-plan.md
+    /// H4) it is no longer silently discarded either: `task.rs` now logs and
+    /// records it as a `collect_events` row instead).
     #[error("時系列ストレージエラー: {0}")]
     Tstore(#[from] TstoreError),
 

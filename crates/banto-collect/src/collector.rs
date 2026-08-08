@@ -65,11 +65,15 @@
 //!    never gets a chance to read stale data with its old task.
 //! 4. **Distribute the new writer, then retire the old one.** Must happen
 //!    *before* step 5 (spawning new tasks): `TsWriter::append`'s
-//!    unknown-group error is silently swallowed by the hot loop
-//!    (`task.rs::record_group`), so a newly spawned task reading a brand-new
-//!    group must never see the *old* writer, which has no schema for that
-//!    group at all - every row it tried to write would vanish with no error
-//!    surfaced anywhere. Retiring the old writer reuses `stop`'s own
+//!    unknown-group error never stops the hot loop
+//!    (`task.rs::record_group`; H4, 2026-08-08 owner decision,
+//!    docs/improvement-plan.md - the failure itself is now recorded, an
+//!    `eprintln!` plus an `append_failure_entered`/`append_failure_cleared`
+//!    `collect_events` pair, but is still never fatal, by design), so a
+//!    newly spawned task reading a brand-new group must never see the *old*
+//!    writer, which has no schema for that group at all - every row it tried
+//!    to write would still be permanently lost (no retry, no backfill),
+//!    merely no longer silently so. Retiring the old writer reuses `stop`'s own
 //!    `Arc::try_unwrap`-or-flush fallback (`close_or_flush_writer`): an
 //!    unchanged connection may be mid-append on the old writer at the exact
 //!    moment of rotation, so failing to get sole ownership here is an
