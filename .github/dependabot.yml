@@ -1,0 +1,45 @@
+# Dependabot 設定(2026-08-08 導入、docs/improvement-plan.md H6)。
+#
+# 方針:
+# - 対象は cargo(ルート workspace)・npm(ルート pnpm workspace、
+#   pnpm-workspace.yaml で apps/* を束ねているが lockfile は pnpm-lock.yaml
+#   1本のみなのでルート1エントリで足りる)・github-actions(.github/workflows/
+#   配下を自動検出)の3エコシステム、いずれも weekly。
+# - 更新頻度を上げすぎると「supply-chain.yml の cargo-deny チェックに
+#   毎回さらされる小刻みな PR」が乱発し、H6 で入れた仕組み自体がノイズ源に
+#   なるため、まずは weekly から様子を見る。
+# - open-pull-requests-limit は控えめ(5)にし、一度にレビュー負荷が
+#   跳ね上がらないようにする(値を使い切ったら随時引き上げを検討する)。
+# - コミットメッセージは本リポジトリの Conventional Commits 風の
+#   慣習(scope を括弧で示す)に軽く合わせて prefix を指定する。
+#
+# 備考: banto-core/banto-storage/banto-server は crates.io ではなく
+# `https://github.com/tyaro/banto.git` への git 依存(tag 固定、
+# deny.toml [sources] 参照)。Dependabot の cargo エコシステムは git 依存の
+# 自動更新提案が registry 依存ほど手厚くないため、これらの更新は当面
+# 手動(banto 側のタグ更新に追従する形)で行う想定。
+version: 2
+updates:
+  - package-ecosystem: 'cargo'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: 'chore(deps)'
+
+  - package-ecosystem: 'npm'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: 'chore(deps)'
+
+  - package-ecosystem: 'github-actions'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: 'chore(ci)'

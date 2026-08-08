@@ -1,0 +1,31 @@
+# floating stable をやめ再現性を優先する 2026-08-08 決定(docs/improvement-plan.md H6)。
+#
+# 背景: これまで CI (.github/workflows/ci.yml) は `dtolnay/rust-toolchain@stable`
+# で「その時点の最新 stable」を都度取得していた(floating)。産業用途では
+# 「同じソースから同じものを再生成できる」再現性を優先するため、実際にワーク
+# スペース全体(全クレート・全アプリの src-tauri 含む)がビルド・テスト
+# green であることを確認済みのバージョンにピン留めする。
+#
+# channel の値はこのコンテナの `rustc --version --verbose` の実測
+# (1.94.1, commit e408947bf, 2026-03-25 付け)に合わせた。将来の更新は
+# 「意図したコミット」でこのファイルの channel を書き換えて行う
+# (自動追従はさせない)。
+#
+# `dtolnay/rust-toolchain@stable`(ci.yml、本ファイルの対象外・変更禁止)は
+# `rustup toolchain install stable` + `rustup default stable` を行うのみで、
+# 後続の `cargo fmt`/`cargo clippy`/`cargo test` 呼び出しは rustup のプロキシ
+# 経由になる。rustup のツールチェイン解決順序は
+# 「RUSTUP_TOOLCHAIN 環境変数 > +toolchain > ディレクトリ override >
+# rust-toolchain(.toml) > rustup default」であり、本ファイルはリポジトリ
+# 直下に置くことで `rustup default` より優先される。すなわちこのファイルを
+# 置くだけで ci.yml 側は無改造のまま、実際に使われる toolchain は本ファイル
+# 指定のピン留めバージョンに切り替わる(該当アクションのソース
+# `action.yml` に PATH を特定 toolchain の bin へ直接通す処理が無く、
+# `rustup` シム経由のままであることを確認済み)。
+#
+# components: ci.yml の rust ジョブが `components: rustfmt, clippy` を
+# 明示指定しているのと揃え、pin 後も fmt/clippy が同一 toolchain に含まれる
+# ようにする。
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
