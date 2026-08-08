@@ -321,6 +321,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "banto-admin-services"
+version = "1.1.0"
+source = "git+https://github.com/tyaro/banto.git?tag=v1.1.0#84775386f3a0f5df1f6df665381ef2269e7b6c67"
+dependencies = [
+ "argon2",
+ "banto-core",
+ "banto-storage",
+ "password-hash",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "banto-broker"
 version = "0.1.0"
 dependencies = [
@@ -337,7 +352,7 @@ dependencies = [
 name = "banto-collect"
 version = "0.1.0"
 dependencies = [
- "banto-core 0.1.0",
+ "banto-core",
  "banto-plc",
  "banto-storage",
  "banto-tags",
@@ -347,16 +362,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
-]
-
-[[package]]
-name = "banto-core"
-version = "0.1.0"
-source = "git+https://github.com/tyaro/banto.git?tag=v0.1.1#314c03a907ed4d515842e49496d2849b49a4ccbe"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -384,7 +389,7 @@ dependencies = [
  "axum 0.8.9",
  "banto-broker",
  "banto-collect",
- "banto-core 0.1.0",
+ "banto-core",
  "banto-expr",
  "banto-plc",
  "banto-plc-write",
@@ -442,12 +447,13 @@ dependencies = [
 
 [[package]]
 name = "banto-server"
-version = "0.1.0"
-source = "git+https://github.com/tyaro/banto.git?tag=v0.1.1#314c03a907ed4d515842e49496d2849b49a4ccbe"
+version = "1.1.0"
+source = "git+https://github.com/tyaro/banto.git?tag=v1.1.0#84775386f3a0f5df1f6df665381ef2269e7b6c67"
 dependencies = [
  "async-stream",
  "axum 0.8.9",
- "banto-core 0.1.0",
+ "banto-admin-services",
+ "banto-core",
  "futures-util",
  "if-addrs",
  "serde",
@@ -462,7 +468,7 @@ name = "banto-storage"
 version = "1.1.0"
 source = "git+https://github.com/tyaro/banto.git?tag=v1.1.0#84775386f3a0f5df1f6df665381ef2269e7b6c67"
 dependencies = [
- "banto-core 1.1.0",
+ "banto-core",
  "serde_json",
  "sqlx",
  "thiserror 2.0.18",
@@ -472,7 +478,7 @@ dependencies = [
 name = "banto-tags"
 version = "0.1.0"
 dependencies = [
- "banto-core 0.1.0",
+ "banto-core",
  "banto-storage",
  "serde",
  "serde_json",
@@ -784,7 +790,7 @@ dependencies = [
 name = "chronogazer"
 version = "0.1.0"
 dependencies = [
- "banto-core 0.1.0",
+ "banto-core",
  "banto-server",
  "chronogazer-core",
  "futures-util",
@@ -806,7 +812,7 @@ dependencies = [
  "argon2",
  "axum 0.8.9",
  "banto-collect",
- "banto-core 0.1.0",
+ "banto-core",
  "banto-plc",
  "banto-server",
  "banto-storage",
@@ -4038,7 +4044,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "relay-wright"
 version = "0.1.0"
 dependencies = [
- "banto-core 0.1.0",
+ "banto-core",
  "banto-server",
  "banto-tags",
  "futures-util",
@@ -4062,7 +4068,7 @@ dependencies = [
  "argon2",
  "axum 0.8.9",
  "banto-broker",
- "banto-core 0.1.0",
+ "banto-core",
  "banto-plc",
  "banto-plc-write",
  "banto-server",
