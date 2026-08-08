@@ -6,7 +6,7 @@
 それを使う製品アプリ（記録計ほか）を蓄積する。
 
 - 計画: [docs/plan.md](docs/plan.md)（I系 = 資産クレート、R系 = 記録計 **ChronoGazer**、
-  W系 = 自動書き込みアプリ **relay-wright**）
+  W系 = 自動書き込みアプリ **relay-wright**、T系 = タグサーバー **banto-hub**）
 - ChronoGazer（記録計）要件定義: [docs/recorder-requirements.md](docs/recorder-requirements.md)
 - banto 側のスコープ整理: banto リポジトリの docs/template-scope.md
 
@@ -23,6 +23,7 @@ crates/
 apps/
   chronogazer/       R系: デジタル記録計 ChronoGazer（Tauri + LAN、banto テンプレート由来）
   relay-wright/      W系: 条件付きPLC自動書き込みアプリ（Tauri、W1〜W5 実装済み・実機検証残）安全上の注意は同README参照
+  banto-hub/         T系: タグサーバー banto-hub（Tauriなしのヘッドレス axum、REST/WS/MQTT/gRPC でタグ空間を外部公開。T0〜T4/T6〜T12 実装済み・残 T5）
 ```
 
 ### `banto-tags`（I1）
@@ -186,6 +187,23 @@ banto-plc-write → banto-plc の一方向のみ。
 詳細は [crates/banto-plc-write/src/lib.rs](crates/banto-plc-write/src/lib.rs) の
 モジュールドキュメントを参照。
 
+### `apps/chronogazer`（R系）
+
+デジタル記録計 **ChronoGazer**（Tauri + LAN、banto テンプレート由来、
+docs/plan.md §4）。PLC通信 + タグデータ保存 + リアルタイム/ヒストリカル/
+ハイブリッドトレンド + 計器表示を1台に統合し、既設PLC + 現場PCでチャネル数
+自由という価格・柔軟性の優位を狙う。
+
+**現状は R1-A 段階（アプリ骨格のみ）**: ログイン・設定画面と、LANモード
+（`banto-serve`）/ Tauri デスクトップの両起動経路は動く。I系クレート
+（banto-tags/banto-plc/banto-tstore/banto-collect/banto-tsquery）は
+依存には追加済みだが、**まだ REST/Tauri コマンドのどこにも配線されていない**
+（`apps/chronogazer/core/Cargo.toml` の依存コメント参照）。監視・
+ヒストリカル・イベントの各画面は実データ無しのプレースホルダ表示のまま。
+実施計画は [docs/r1-plan.md](docs/r1-plan.md)（Phase R1-A〜R1-D）、要件定義は
+[docs/recorder-requirements.md](docs/recorder-requirements.md)を参照。詳細は
+[apps/chronogazer/README.md](apps/chronogazer/README.md)。
+
 ### `apps/relay-wright`（W系）
 
 条件付き PLC 自動書き込みアプリ（Tauri + banto テンプレート由来、
@@ -209,6 +227,23 @@ pnpm add "github:tyaro/banto#v0.1.0&path:packages/admin-core"
 ```toml
 banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v0.1.0" }
 ```
+
+### `apps/banto-hub`（T系）
+
+FA-Server 型の独立タグサーバー **banto-hub**（Tauri を使わないヘッドレスの
+単一 exe、axum + SQLite。docs/tag-server-design.md §3.1）。I系クレート
+（タグレジストリ・PLC通信・収集エンジン・時系列ストレージ）を束ね、
+タグ空間（= banto-collect の現在値キャッシュ）を **REST / WebSocket /
+MQTT publish / gRPC** の4経路で外部（MES・クラウド・自作画面等）へ公開する。
+書き込みは per-tag opt-in（既定不可）+ API キースコープ + 監査 +
+レート制限ブレーカ付きのパススルーのみ（条件付き自動書き込みは
+relay-wright の専管のまま）。演算タグ・内部タグの一元実装、稼働中の
+タグ定義変更（オンライン動的変更）にも対応する。
+
+実装状況は **T0〜T4/T6〜T12 実装済み・残 T5**（配布・運用強化・実機検証）。
+詳細設計は [docs/tag-server-design.md](docs/tag-server-design.md)、運用手順は
+[docs/banto-hub-operations.md](docs/banto-hub-operations.md)、起動方法は
+[apps/banto-hub/README.md](apps/banto-hub/README.md) を参照。
 
 ## ライセンス
 
