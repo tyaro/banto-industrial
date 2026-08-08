@@ -108,7 +108,7 @@ sha2 = "0.10"
 hex = "0.4"
 # T0-2: API キーの prefix/secret を base64url(パディングなし)で表現するため
 # の汎用エンコーダ。`sqlx-core` 等が既に 0.22 系を木に持っている。
-base64 = "0.22"
+base64 = "0.23"
 # T0-2 / 設計 §5.1・§10-6: `/api/v1/openapi.json` の自動生成(utoipa 採用は
 # 2026-08-04 オーナー決定 - docs/tag-server-design.md §10 の6番)。catalog が
 # クライアントとの互換性契約(§4.1)であるため、コードとスキーマを単一
