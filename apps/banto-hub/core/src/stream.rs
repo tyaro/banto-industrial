@@ -82,7 +82,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::response::Response;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -93,6 +93,7 @@ use tokio::time::MissedTickBehavior;
 
 use banto_collect::CollectEvent;
 
+use crate::api_keys::ApiKeyContext;
 use crate::hub::{quality_str, CollectorManager};
 use crate::rest::TagSpaceState;
 use crate::subscribe_core::{
@@ -114,11 +115,25 @@ const BACKPRESSURE_CLOSE_CODE: u16 = 1013;
 /// （read スコープ必須）を通る - アップグレードリクエスト自体は普通の
 /// HTTP GET なので、ミドルウェアがそのまま効く（設計 §5.2「アップグレード
 /// リクエストの Authorization ヘッダで検証」）。
+///
+/// `ctx`(H10 ③、Option B): `require_tag_space_auth` が API キー認証時に
+/// 挿入した [`ApiKeyContext`] を extensions から取り出す
+/// （`crate::rest::v1_write_value` と同じパターン）。session token 認証
+/// なら extension は無く `None` - [`handle_socket`] 以下へその
+/// `Option<ApiKeyContext>` をそのまま持ち回し（一部を borrow するだけの
+/// `Option<&ApiKeyContext>` ではなく所有権ごと渡す - コネクションの生存
+/// 期間中ずっと必要で、`ApiKeyContext` は安価にクローンできるが、この
+/// 経路では move で足りるためクローンもしない)、`resolve` した購読対象を
+/// per-tag read スコープで絞る（`crate::subscribe_core` のモジュール doc
+/// comment「per-tag read スコープの交差」参照）。`None` は無フィルタ
+/// （session token = 従来どおり全アクセス、管理 UI 不変）。
 pub(crate) async fn ws_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<TagSpaceState>,
+    ctx: Option<Extension<ApiKeyContext>>,
 ) -> Response {
     let manager = state.manager;
+    let scope = ctx.map(|Extension(ctx)| ctx);
     // T10（判断の記録、2026-08-07、`rest.rs::extract_ws_protocol_token` の
     // doc comment も参照）: `.protocols(["bearer"])` は**選択**であって
     // **無条件エコー**ではない - axum の実装（`WebSocketUpgrade::protocols`）
@@ -140,10 +155,14 @@ pub(crate) async fn ws_upgrade(
     // `Sec-WebSocket-Protocol` 認証を使う全クライアント（ブラウザ・この
     // テストスイート）でハンドシェイクが一貫して成功するようにする。
     ws.protocols(["bearer"])
-        .on_upgrade(move |socket| handle_socket(socket, manager))
+        .on_upgrade(move |socket| handle_socket(socket, manager, scope))
 }
 
-async fn handle_socket(socket: WebSocket, manager: Arc<CollectorManager>) {
+async fn handle_socket(
+    socket: WebSocket,
+    manager: Arc<CollectorManager>,
+    scope: Option<ApiKeyContext>,
+) {
     let (sink, mut incoming) = socket.split();
     let (data_tx, data_rx) = mpsc::channel::<Message>(OUTBOUND_QUEUE_CAPACITY);
     let (close_tx, close_rx) = mpsc::channel::<CloseFrame>(1);
@@ -165,7 +184,7 @@ async fn handle_socket(socket: WebSocket, manager: Arc<CollectorManager>) {
         let should_continue = tokio::select! {
             msg = incoming.next() => match msg {
                 Some(Ok(Message::Text(text))) => {
-                    handle_text(&text, &manager, &mut subscriptions, &data_tx, &close_tx).await
+                    handle_text(&text, &manager, &mut subscriptions, &data_tx, &close_tx, scope.as_ref()).await
                 }
                 Some(Ok(Message::Close(_))) => false,
                 Some(Ok(Message::Binary(_))) => {
@@ -177,7 +196,7 @@ async fn handle_socket(socket: WebSocket, manager: Arc<CollectorManager>) {
                 Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => true,
                 Some(Err(_)) | None => false,
             },
-            _ = tick.tick() => evaluate(&manager, &mut subscriptions, &data_tx, &close_tx),
+            _ = tick.tick() => evaluate(&manager, &mut subscriptions, &data_tx, &close_tx, scope.as_ref()),
             event = events.recv() => match event {
                 Ok(event) => send_event(&event, &manager.pool(), &data_tx, &close_tx).await,
                 // broadcast の遅延受信者はスキップするだけ（設計 §5.2/§3.5
@@ -273,6 +292,7 @@ async fn handle_text(
     subscriptions: &mut HashMap<i64, Subscription>,
     data_tx: &mpsc::Sender<Message>,
     close_tx: &mpsc::Sender<CloseFrame>,
+    scope: Option<&ApiKeyContext>,
 ) -> bool {
     let value: Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -291,7 +311,9 @@ async fn handle_text(
 
     match op {
         "subscribe" => match serde_json::from_value::<SubscribeWire>(value) {
-            Ok(msg) => handle_subscribe(msg, manager, subscriptions, data_tx, close_tx).await,
+            Ok(msg) => {
+                handle_subscribe(msg, manager, subscriptions, data_tx, close_tx, scope).await
+            }
             Err(err) => send_error(
                 id_hint,
                 "invalid_request",
@@ -334,6 +356,7 @@ async fn handle_subscribe(
     subscriptions: &mut HashMap<i64, Subscription>,
     data_tx: &mpsc::Sender<Message>,
     close_tx: &mpsc::Sender<CloseFrame>,
+    scope: Option<&ApiKeyContext>,
 ) -> bool {
     if msg.tags.is_empty() {
         return send_error(
@@ -360,6 +383,14 @@ async fn handle_subscribe(
     // 設計 §5.2 要件4: 未知の**具体名**（ワイルドカードでない）が混ざって
     // いたら購読自体を拒否する（REST `?tags=` と同じ「部分成功で誤解させ
     // ない」規律）。ワイルドカードは0件マッチでもエラーにしない。
+    //
+    // H10 ③(Option B): この存在チェックは catalog(絞らない)にのみ照らす
+    // - per-tag read スコープはここでは見ない。スコープ外の具体名を挙げた
+    // subscribe 自体は成立させ、値は resolve 段(下の initial_values/
+    // evaluate)で単に「常に0件マッチ」として扱う - 単一/バルクの明示
+    // `?tags=` が 403 で即座に拒否するのとは非対称だが、購読プロトコルに
+    // 403 相当のエラーコードが無く、新設しても得られる情報(「そのタグは
+    // 存在する」)は catalog が既に開示済みなので実害が無いための判断。
     for pattern in &patterns {
         if let TagPattern::Exact(name) = pattern {
             if map.get(name).is_none() {
@@ -407,8 +438,14 @@ async fn handle_subscribe(
     let now_ms = manager.clock().now_ms();
     let current = manager.current_values();
     let server_store = manager.server_store();
-    let (initial, last) =
-        subscribe_core::initial_values(&patterns, &map, current.as_ref(), &server_store, now_ms);
+    let (initial, last) = subscribe_core::initial_values(
+        &patterns,
+        &map,
+        current.as_ref(),
+        &server_store,
+        now_ms,
+        scope,
+    );
     let values: Vec<ValueWire> = initial.into_iter().map(ValueWire::from).collect();
 
     let next_due_ms = match mode {
@@ -441,6 +478,7 @@ fn evaluate(
     subscriptions: &mut HashMap<i64, Subscription>,
     data_tx: &mpsc::Sender<Message>,
     close_tx: &mpsc::Sender<CloseFrame>,
+    scope: Option<&ApiKeyContext>,
 ) -> bool {
     if subscriptions.is_empty() {
         return true;
@@ -453,7 +491,7 @@ fn evaluate(
 
     for (&id, sub) in subscriptions.iter_mut() {
         if let Some(values) =
-            subscribe_core::evaluate(sub, &map, current.as_ref(), &server_store, now_ms)
+            subscribe_core::evaluate(sub, &map, current.as_ref(), &server_store, now_ms, scope)
         {
             let values: Vec<ValueWire> = values.into_iter().map(ValueWire::from).collect();
             if !send_data(id, now_ms, values, data_tx, close_tx) {

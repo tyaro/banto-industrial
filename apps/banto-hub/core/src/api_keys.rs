@@ -49,12 +49,31 @@
 //! つながらない（`secret` 自体は DB のどこにも保存されていない）。とはいえ
 //! コストがほぼゼロなので、早期リターンする単純な `==` より安全側に倒す。
 //!
-//! ## スコープ構文検証（設計 §5.6・T0-2 スコープ外の明示）
+//! ## スコープ構文検証（設計 §5.6・T0-2 スコープ外の明示、H10 ③ で拡張）
 //!
-//! `read` と `write:{connection}.{group}.{tag}` のみを許可する。書き込み
-//! スコープはワイルドカード不可・3セグメントちょうど・各セグメント非空を
-//! 発行時に検証するが、**実際の書き込み検査（T2）はここでは行わない**
-//! （書き込み API 自体が T0-2 の時点でまだ存在しない）。
+//! `read`・`read:{connection}.{group}.{tag}`・`read:{connection}.{group}.*`・
+//! `write:{connection}.{group}.{tag}` のみを許可する。write スコープは
+//! ワイルドカード不可・3セグメントちょうど・各セグメント非空を発行時に
+//! 検証するが、**実際の書き込み検査（T2）はここでは行わない**（書き込み
+//! API 自体が T0-2 の時点でまだ存在しない）。
+//!
+//! ### read のタグ単位化（H10 ③、Option B、2026-08-08 オーナー決定・
+//! docs/h10-3-read-scope-proposal.md §5 S1・§6）
+//!
+//! read は write と**意図的に非対称**: write の完全一致に加え、read に
+//! 限り `{connection}.{group}.*` のグループ・ワイルドカードも許可する
+//! （read は一括操作が自然で、`crate::subscribe_core::TagPattern::GroupWildcard`
+//! と文法を揃えるため。write は誤書き込みの被害が大きく、引き続き
+//! ワイルドカード不可・完全一致のみ）。
+//!
+//! per-tag read スコープが絞るのは**値の読み取り経路**（単一・バルク・
+//! WebSocket/gRPC ストリーム）だけ — catalog（`GET /api/v1/tags`・gRPC
+//! `GetCatalog`）は per-tag スコープの影響を受けず、read 系スコープを
+//! 1つでも持つキーには常に全タグ（PLC アドレス込み）を返す（案 B の核、
+//! 「発見 ≠ 値アクセス」。オーナー理由: 「PLC アドレスも見えた方が割り付け
+//! ミスに気づきやすい」）。ゲートの二段構成は [`ApiKeyContext::has_any_read`]
+//! （認証層: read 系ルートに入れるか）と [`ApiKeyContext::can_read_value`]
+//! （値ハンドラ: 個々のタグの値を読めるか）に対応する。
 //!
 //! ## トリップ（T2-4、設計 §6-4・2026-08-05 決定）
 //!
@@ -106,22 +125,32 @@ const LAST_USED_THROTTLE_MS: i64 = 60_000;
 
 // --- スコープ構文検証 -------------------------------------------------------
 
-/// 1つのスコープ文字列の構文検証（設計 §5.6）。
+/// 1つのスコープ文字列の構文検証（設計 §5.6、H10 ③ で read 側を拡張 -
+/// このモジュールの doc comment「スコープ構文検証」参照）。
 ///
-/// - `"read"`: そのまま許可。
+/// - `"read"`: そのまま許可（全タグ、従来どおり）。
+/// - `"read:{connection}.{group}.{tag}"`: [`validate_read_scope`] へ委譲
+///   （完全一致、`write:` と対称）。
+/// - `"read:{connection}.{group}.*"`: [`validate_read_scope`] へ委譲
+///   （グループ・ワイルドカード、read に限り許可）。
 /// - `"write:{connection}.{group}.{tag}"`: ワイルドカード（`*`）禁止・
 ///   ピリオド区切りでちょうど3セグメント・各セグメント非空。
 /// - それ以外は全て不正。
 ///
-/// **実際の書き込み可否判定（T2）はここでは行わない** — ここは発行時の
-/// 構文チェックのみ。
+/// **実際の読み取り/書き込み可否判定（値ハンドラ側）はここでは行わない**
+/// — ここは発行時の構文チェックのみ。
 fn validate_scope(scope: &str) -> Result<(), String> {
     if scope == "read" {
         return Ok(());
     }
+    if let Some(pattern) = scope.strip_prefix("read:") {
+        return validate_read_scope(pattern, scope);
+    }
     let Some(pattern) = scope.strip_prefix("write:") else {
         return Err(format!(
-            "不明なスコープです（'read' または 'write:{{connection}}.{{group}}.{{tag}}' のみ許可）: {scope}"
+            "不明なスコープです（'read'、'read:{{connection}}.{{group}}.{{tag}}'、\
+             'read:{{connection}}.{{group}}.*'、'write:{{connection}}.{{group}}.{{tag}}' の\
+             いずれかのみ許可）: {scope}"
         ));
     };
     if pattern.contains('*') {
@@ -133,6 +162,46 @@ fn validate_scope(scope: &str) -> Result<(), String> {
     if segments.len() != 3 || segments.iter().any(|segment| segment.is_empty()) {
         return Err(format!(
             "write スコープは {{connection}}.{{group}}.{{tag}} の3セグメントで指定してください: {scope}"
+        ));
+    }
+    Ok(())
+}
+
+/// `"read:"` の後半（`pattern`）の構文検証（H10 ③ S1、
+/// docs/h10-3-read-scope-proposal.md §5・§6）。`scope` は元のスコープ文字列
+/// 全体 - エラーメッセージにそのまま出す。
+///
+/// 2つの形を許可する:
+/// - グループ・ワイルドカード `{connection}.{group}.*`: ちょうど3セグメント・
+///   先頭2つ（connection/group）が非空・3番目が「`*`」の1文字ちょうど
+///   （タグ名の一部だけを `*` にする「`temp*`」等は不可 - 末尾セグメント全体が
+///   リテラルの `*` である場合のみワイルドカードとして認める）。
+/// - 完全一致 `{connection}.{group}.{tag}`: `write:` と同じ厳密さ
+///   （ワイルドカード禁止・ちょうど3セグメント・各セグメント非空）。
+///
+/// read/write が意図的に非対称である理由はこのモジュールの doc comment
+/// 「read のタグ単位化」参照。
+fn validate_read_scope(pattern: &str, scope: &str) -> Result<(), String> {
+    let segments: Vec<&str> = pattern.split('.').collect();
+    if segments.len() == 3
+        && segments[2] == "*"
+        && !segments[0].is_empty()
+        && !segments[1].is_empty()
+    {
+        return Ok(());
+    }
+    // グループ・ワイルドカードの形に当てはまらなければ、write と同じ
+    // 厳密さ（ワイルドカード禁止・完全一致3セグメント）を要求する。
+    if pattern.contains('*') {
+        return Err(format!(
+            "read スコープのワイルドカードは {{connection}}.{{group}}.* の形のみ許可されています\
+             （タグ名の一部だけを * にはできません）: {scope}"
+        ));
+    }
+    if segments.len() != 3 || segments.iter().any(|segment| segment.is_empty()) {
+        return Err(format!(
+            "read スコープは {{connection}}.{{group}}.{{tag}}（完全一致）または \
+             {{connection}}.{{group}}.*（グループ単位）の3セグメントで指定してください: {scope}"
         ));
     }
     Ok(())
@@ -315,9 +384,59 @@ pub struct ApiKeyContext {
 }
 
 impl ApiKeyContext {
-    /// `/api/v1/*` の認証は `read` スコープを要求する（設計 §5.6）。
-    pub fn has_read_scope(&self) -> bool {
-        self.scopes.iter().any(|scope| scope == "read")
+    /// H10 ③（Option B、docs/h10-3-read-scope-proposal.md §6）: 認証層の
+    /// 「`/api/v1/*` の read 系ルートに入れるか」のゲート。素の `read` か、
+    /// 任意の `read:...`（完全一致・グループ・ワイルドカードいずれも）を
+    /// 1つでも持っていれば true。write 専用キーは従来どおり false（403）
+    /// のまま — `crate::rest::require_tag_space_auth`・
+    /// `crate::grpc::GrpcService::authenticate` が呼ぶ、旧 `has_read_scope`
+    /// が担っていたゲートをそのまま引き継ぐ（catalog はこのゲートだけで
+    /// 完結し、個々のタグへの絞り込みは行わない - 案 B の核。このモジュール
+    /// の doc comment「read のタグ単位化」参照）。
+    pub fn has_any_read(&self) -> bool {
+        self.scopes
+            .iter()
+            .any(|scope| scope == "read" || scope.starts_with("read:"))
+    }
+
+    /// H10 ③（Option B、docs/h10-3-read-scope-proposal.md §6）: 個々の
+    /// タグの**値**を読めるか（catalog の可視性とは別軸 - catalog は絞らず、
+    /// 値ハンドラだけがこれを使う）。素の `read`、`external_name` との
+    /// 完全一致 `read:{external_name}`、または `read:{connection}.{group}.*`
+    /// の `{connection}.{group}.` が `external_name` の前方一致、のいずれか
+    /// で true。
+    ///
+    /// `external_name` は `{connection}.{group}.{tag}` で各セグメント内部に
+    /// `.` を含まない（`crate::hub::build_catalog` の組み立て - `hub.rs:432`
+    /// 付近 - による不変条件）ため、`"{connection}.{group}."`
+    /// （末尾ドット込み）への前方一致は「グループ丸ごと」に対して安全に
+    /// 効く。例えば `read:line1.fast.*` は `line1.fast.temp01` にはマッチ
+    /// するが `line1.fastx.temp01` にはマッチしない（末尾ドットが
+    /// `fast`/`fastx` の混同を防ぐ）。
+    ///
+    /// 注意（fail-closed、既知のトレードオフ - 設計提案書 §6）:
+    /// `external_name` はタグの安定 id ではなくリネームで変わりうる。タグを
+    /// リネームすると、そのタグ名を指す既存の `read:{name}` スコープは
+    /// 新しい名前に自動追従しない（＝値が読めなくなる）。安全側に倒れる
+    /// （見えなくなるだけで、意図しないタグが見えてしまうことはない）ため
+    /// 許容する — 安定 id ベースの照合は複雑さに見合わないとして今回は
+    /// 採らない（オーナー決定）。
+    pub fn can_read_value(&self, external_name: &str) -> bool {
+        self.scopes.iter().any(|scope| {
+            if scope == "read" {
+                return true;
+            }
+            let Some(pattern) = scope.strip_prefix("read:") else {
+                return false;
+            };
+            match pattern.strip_suffix('*') {
+                // `pattern` は発行時に validate_scope 済みなので、`*` 付きは
+                // 必ず "{connection}.{group}.*" の形（strip_suffix('*') の
+                // 結果は末尾ドット込みの "{connection}.{group}." になる）。
+                Some(group_prefix) => external_name.starts_with(group_prefix),
+                None => pattern == external_name,
+            }
+        })
     }
 
     /// T2-4（設計 §6 実装指示 §5「認証」）: `POST /api/v1/values/{tag}` は
@@ -747,6 +866,68 @@ mod tests {
         assert!(validate_scope("").is_err());
     }
 
+    // --- H10 ③: read のタグ単位スコープ構文（S1） -----------------------
+
+    #[test]
+    fn validate_scope_accepts_exact_read_scope() {
+        assert!(validate_scope("read:line1.fast.temp01").is_ok());
+    }
+
+    #[test]
+    fn validate_scope_accepts_group_wildcard_read_scope() {
+        assert!(validate_scope("read:line1.fast.*").is_ok());
+    }
+
+    /// write と違い、read はグループ・ワイルドカードに限り許可される
+    /// （このモジュールの doc comment「read のタグ単位化」参照）。
+    #[test]
+    fn validate_scope_still_rejects_wildcard_in_write() {
+        assert!(validate_scope("write:line1.fast.*").is_err());
+        assert!(validate_scope("write:*").is_err());
+    }
+
+    #[test]
+    fn validate_scope_rejects_read_wildcard_with_wrong_segment_count() {
+        // "read:a.*" - ちょうど2セグメントで、グループ・ワイルドカードの
+        // 3セグメント形に当てはまらない。
+        assert!(validate_scope("read:a.*").is_err());
+        // 4セグメント(末尾がワイルドカードでも不可)。
+        assert!(validate_scope("read:line1.fast.group.*").is_err());
+    }
+
+    #[test]
+    fn validate_scope_rejects_read_with_wrong_segment_count() {
+        assert!(validate_scope("read:a.b.c.d").is_err());
+        assert!(validate_scope("read:line1.fast").is_err());
+    }
+
+    #[test]
+    fn validate_scope_rejects_empty_read_scope() {
+        assert!(validate_scope("read:").is_err());
+    }
+
+    #[test]
+    fn validate_scope_rejects_read_with_empty_tag_segment() {
+        assert!(validate_scope("read:a.b.").is_err());
+    }
+
+    #[test]
+    fn validate_scope_rejects_read_with_empty_connection_or_group_segment() {
+        assert!(validate_scope("read:.fast.temp01").is_err());
+        assert!(validate_scope("read:line1..temp01").is_err());
+        // ワイルドカード形でも先頭2セグメントは非空が必須。
+        assert!(validate_scope("read:.fast.*").is_err());
+        assert!(validate_scope("read:line1..*").is_err());
+    }
+
+    #[test]
+    fn validate_scope_rejects_partial_wildcard_in_read_tag_segment() {
+        // 末尾セグメント丸ごとが `*` の場合のみワイルドカード - タグ名の
+        // 一部だけを `*` にはできない。
+        assert!(validate_scope("read:line1.fast.te*mp").is_err());
+        assert!(validate_scope("read:line1.fast.*temp01").is_err());
+    }
+
     // --- キー生成・パース・ハッシュ ---------------------------------------
 
     #[test]
@@ -851,7 +1032,7 @@ mod tests {
             ApiKeyLookup::Valid(ctx) => {
                 assert_eq!(ctx.id, issued.id);
                 assert_eq!(ctx.name, "mes-gateway");
-                assert!(ctx.has_read_scope());
+                assert!(ctx.has_any_read());
                 assert_eq!(ctx.last_used_at_ms, None);
             }
             other => panic!("expected Valid, got {other:?}"),
@@ -1051,6 +1232,94 @@ mod tests {
             last_used_at_ms: None,
         };
         assert!(!ctx.has_write_scope("line1.fast.temp01"));
+    }
+
+    // --- H10 ③: has_any_read / can_read_value ------------------------------
+
+    fn ctx_with(scopes: &[&str]) -> ApiKeyContext {
+        ApiKeyContext {
+            id: 1,
+            name: "k".to_string(),
+            scopes: scopes.iter().map(|s| s.to_string()).collect(),
+            last_used_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn has_any_read_is_true_for_bare_read() {
+        assert!(ctx_with(&["read"]).has_any_read());
+    }
+
+    #[test]
+    fn has_any_read_is_true_for_any_read_colon_scope() {
+        assert!(ctx_with(&["read:line1.fast.temp01"]).has_any_read());
+        assert!(ctx_with(&["read:line1.fast.*"]).has_any_read());
+    }
+
+    #[test]
+    fn has_any_read_is_false_for_write_only_key() {
+        assert!(!ctx_with(&["write:line1.fast.temp01"]).has_any_read());
+    }
+
+    #[test]
+    fn has_any_read_is_false_for_a_key_with_no_scopes_at_all() {
+        assert!(!ctx_with(&[]).has_any_read());
+    }
+
+    /// 素の `read` は全タグの値を読める(後方互換 - このモジュールの doc
+    /// comment「read のタグ単位化」S2 参照)。
+    #[test]
+    fn can_read_value_bare_read_matches_anything() {
+        let ctx = ctx_with(&["read"]);
+        assert!(ctx.can_read_value("line1.fast.temp01"));
+        assert!(ctx.can_read_value("line2.slow.press01"));
+    }
+
+    #[test]
+    fn can_read_value_exact_scope_matches_only_that_tag() {
+        let ctx = ctx_with(&["read:line1.fast.temp01"]);
+        assert!(ctx.can_read_value("line1.fast.temp01"));
+        assert!(!ctx.can_read_value("line1.fast.temp02"));
+        assert!(!ctx.can_read_value("line2.slow.press01"));
+    }
+
+    #[test]
+    fn can_read_value_group_wildcard_matches_every_tag_in_that_group_only() {
+        let ctx = ctx_with(&["read:line1.fast.*"]);
+        assert!(ctx.can_read_value("line1.fast.temp01"));
+        assert!(ctx.can_read_value("line1.fast.temp02"));
+        // 別グループ・別接続はマッチしない。
+        assert!(!ctx.can_read_value("line1.slow.temp01"));
+        assert!(!ctx.can_read_value("line2.fast.temp01"));
+    }
+
+    /// 前方一致の末尾ドットが `fast`/`fastx` のような接頭辞衝突を防ぐこと
+    /// の回帰防止（[`ApiKeyContext::can_read_value`] の doc comment参照）。
+    #[test]
+    fn can_read_value_group_wildcard_does_not_prefix_collide_with_a_similarly_named_group() {
+        let ctx = ctx_with(&["read:line1.fast.*"]);
+        assert!(!ctx.can_read_value("line1.fastx.temp01"));
+    }
+
+    #[test]
+    fn can_read_value_is_false_when_no_scope_matches() {
+        let ctx = ctx_with(&["read:line1.fast.temp01", "write:line2.slow.press01"]);
+        assert!(!ctx.can_read_value("line2.slow.press01"));
+    }
+
+    #[test]
+    fn can_read_value_is_false_for_a_key_with_no_read_scopes_at_all() {
+        assert!(!ctx_with(&["write:line1.fast.temp01"]).can_read_value("line1.fast.temp01"));
+        assert!(!ctx_with(&[]).can_read_value("line1.fast.temp01"));
+    }
+
+    #[test]
+    fn can_read_value_multiple_scopes_union() {
+        let ctx = ctx_with(&["read:line1.fast.temp01", "read:line2.slow.*"]);
+        assert!(ctx.can_read_value("line1.fast.temp01"));
+        assert!(ctx.can_read_value("line2.slow.press01"));
+        assert!(!ctx.can_read_value("line1.fast.temp02"));
+        assert!(!ctx.can_read_value("line3.fast.temp01"));
     }
 
     // --- T2-4: trip/clear_trip/lookup ordering -----------------------------

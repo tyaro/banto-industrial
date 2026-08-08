@@ -62,6 +62,20 @@
 //! `Revoked`/`Tripped`/未認証は REST と同じく `crate::audit::AuditLogService`
 //! に `denied` を記録する(`origin: "grpc"`)。エラー写像は
 //! [`GrpcService::authenticate`] の doc comment参照。
+//!
+//! ## H10 ③: per-tag read スコープ(Option B、
+//! docs/h10-3-read-scope-proposal.md §5・§6、REST/WS と同じ絞り方)
+//!
+//! `GetCatalog` は絞らない(全タグ・PLC アドレス込みで返す - 案 B の核、
+//! `has_any_read` だけを要求)。`ReadValues`/`StreamValues` はそれぞれの
+//! ハンドラが [`GrpcService::authenticate`] から受け取った
+//! `ApiKeyContext` で `can_read_value` を適用する:
+//! `ReadValues` は明示 `tags` にスコープ外を含めば `PERMISSION_DENIED`、
+//! 省略(全件)時はスコープ外を黙って除く。`StreamValues` は
+//! `crate::subscribe_core::{initial_values, evaluate}` の `scope` 引数に
+//! `Some(&ctx)` を渡し、resolve したマッチ集合をスコープで交差させる
+//! （`crate::stream` の WebSocket 実装と同じ絞り方 - 同モジュールの doc
+//! comment「per-tag read スコープの交差」参照）。
 
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -349,7 +363,14 @@ impl GrpcService {
         let now_ms = self.manager.clock().now_ms();
         match self.api_keys.lookup(token, now_ms).await {
             Ok(ApiKeyLookup::Valid(ctx)) => {
-                if require == RequireScope::Read && !ctx.has_read_scope() {
+                // H10 ③(Option B): 「read 系 RPC に入れるか」だけを見る
+                // ゲート(has_any_read = 素の read か任意の read:... を1つ
+                // でも持つか)。個々のタグの値を読めるか(can_read_value)は
+                // ここでは判定しない - `GetCatalog` は絞らず、
+                // `ReadValues`/`StreamValues` は各ハンドラが ctx を使って
+                // 個別に絞る(`crate::api_keys::ApiKeyContext` の doc
+                // comment「read のタグ単位化」参照)。
+                if require == RequireScope::Read && !ctx.has_any_read() {
                     return Err(Status::permission_denied("read スコープが必要です"));
                 }
                 if let Err(err) = self
@@ -420,7 +441,7 @@ impl TagServiceTrait for GrpcService {
         &self,
         request: Request<ReadValuesRequest>,
     ) -> Result<Response<ReadValuesResponse>, Status> {
-        self.authenticate(&request, RequireScope::Read).await?;
+        let ctx = self.authenticate(&request, RequireScope::Read).await?;
         let req = request.into_inner();
         let map = self.manager.tag_map();
         let revision = self.manager.revision();
@@ -450,7 +471,24 @@ impl TagServiceTrait for GrpcService {
                     unknown.join(", ")
                 )));
             }
+            // H10 ③(Option B、docs/h10-3-read-scope-proposal.md §5 S4、
+            // REST の v1_values `?tags=` と同じ規律): 明示指定でスコープ外
+            // を1つでも挙げたら拒否(REST の 403 に対応する gRPC ステータス、
+            // `write_rejection_status` の doc comment の対応表参照)。
+            if let Some(name) = names.iter().find(|name| !ctx.can_read_value(name)) {
+                return Err(Status::permission_denied(format!(
+                    "missing_read_scope: {name}"
+                )));
+            }
         }
+
+        // H10 ③: 暗黙の全件(tags 省略)はスコープ外を黙って除く。明示指定
+        // (tags 非空)は直前の分岐でスコープ内であることを確認済みなので、
+        // ここでのフィルタは no-op(全件そのまま通る)。
+        let names: Vec<String> = names
+            .into_iter()
+            .filter(|name| ctx.can_read_value(name))
+            .collect();
 
         let values = names
             .iter()
@@ -474,7 +512,7 @@ impl TagServiceTrait for GrpcService {
         &self,
         request: Request<StreamValuesRequest>,
     ) -> Result<Response<Self::StreamValuesStream>, Status> {
-        self.authenticate(&request, RequireScope::Read).await?;
+        let ctx = self.authenticate(&request, RequireScope::Read).await?;
         let req = request.into_inner();
 
         if req.tags.is_empty() {
@@ -491,6 +529,10 @@ impl TagServiceTrait for GrpcService {
         let map = self.manager.tag_map();
         // 設計 §5.2 要件4(WS と同意味論): 未知の具体名が混ざっていたら
         // 購読自体を拒否する。ワイルドカードは0件マッチでもエラーにしない。
+        // H10 ③(Option B): この存在チェックは catalog にのみ照らす(絞らない)
+        // - per-tag read スコープは resolve 段(下の initial_values/evaluate)
+        // でのみ交差させる。`crate::stream::handle_subscribe` と同じ判断
+        // (同モジュールの doc comment参照)。
         for pattern in &patterns {
             if let TagPattern::Exact(name) = pattern {
                 if map.get(name).is_none() {
@@ -522,12 +564,17 @@ impl TagServiceTrait for GrpcService {
         let now_ms = self.manager.clock().now_ms();
         let current = self.manager.current_values();
         let server_store = self.manager.server_store();
+        // H10 ③: ctx は gRPC では常に Some(API キー必須、セッション token
+        // は受けない - このモジュールの doc comment「認証」参照)。素の
+        // `read` キーは `can_read_value` が常に true を返すので、ここで
+        // `Some(&ctx)` を渡しても無フィルタ相当のまま(後方互換)。
         let (initial, last) = subscribe_core::initial_values(
             &patterns,
             &map,
             current.as_ref(),
             &server_store,
             now_ms,
+            Some(&ctx),
         );
         let next_due_ms = match mode {
             Mode::Interval { interval_ms } => now_ms + interval_ms,
@@ -565,6 +612,7 @@ impl TagServiceTrait for GrpcService {
                     current.as_ref(),
                     &server_store,
                     now_ms,
+                    Some(&ctx),
                 ) {
                     // 設計「バックプレッシャは送信バッファ満杯で切断」-
                     // `try_send` が `Full`(または受信側 drop 済みの
