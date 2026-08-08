@@ -42,6 +42,23 @@ fn assert_valid_topo_order(all: &[(String, Vec<String>)], order: &[String]) {
     }
 }
 
+/// 長さ `n` の直列依存チェーンを作る: `a0 -> a1 -> a2 -> ... -> a(n-1)`
+/// （`a(n-1)` が誰にも依存しない末端）。improvement-plan.md H1 残件
+/// （`dag.rs` の `visit` 反復化）の回帰テスト用 - 数千段のチェーンは
+/// banto-hub の T11 一括登録 API で現実に作られうる入力を模している。
+fn linear_chain(n: usize) -> Vec<(String, Vec<String>)> {
+    (0..n)
+        .map(|i| {
+            let deps = if i + 1 < n {
+                vec![format!("a{}", i + 1)]
+            } else {
+                vec![]
+            };
+            (format!("a{i}"), deps)
+        })
+        .collect()
+}
+
 #[test]
 fn self_reference_is_a_cycle() {
     let n = nodes(&[("a", &["a"])]);
@@ -157,4 +174,72 @@ fn cycle_error_display_contains_arrow_separated_path() {
     let n = nodes(&[("a", &["a"])]);
     let err = validate_dag(&n).unwrap_err();
     assert_eq!(err.to_string(), "循環参照を検出しました: a -> a");
+}
+
+// 以下は improvement-plan.md H1 残件（`dag.rs` の `visit` を自己再帰から
+// 明示スタックの反復 DFS へ書き換えた変更）の回帰テスト。目的はスタック
+// オーバーフローで落ちず、数千段のチェーンでも正常系・異常系ともに
+// 妥当な結果を返すこと（`crates/banto-expr/src/parser.rs` の
+// `MAX_NESTING_DEPTH` 系テストと同じ「クラッシュしないことの確認」という
+// 位置付け）。
+
+const DEEP_CHAIN_LEN: usize = 10_000;
+
+#[test]
+fn deep_linear_chain_does_not_overflow_and_has_valid_topo_order() {
+    // a0 -> a1 -> ... -> a9999（a9999 が末端）を反復 DFS で辿り切れること、
+    // かつ得られる順序が正しいトポロジカル順であることを確認する。
+    let n = linear_chain(DEEP_CHAIN_LEN);
+    let order = validate_dag(&n).unwrap();
+    assert_valid_topo_order(&n, &order);
+    assert_eq!(order.len(), DEEP_CHAIN_LEN);
+    // 誰にも依存しない末端 a9999 が最初、誰にも依存されない根 a0 が最後。
+    assert_eq!(order[0], format!("a{}", DEEP_CHAIN_LEN - 1));
+    assert_eq!(order.last().unwrap(), "a0");
+}
+
+#[test]
+fn deep_chain_with_cycle_at_the_tail_does_not_overflow_and_reports_cycle() {
+    // a0 -> a1 -> ... -> a9999 だが、末端であるはずの a9999 は葉を持たず
+    // 1つ前の a9998 を指し返す（a9998 <-> a9999 の2ノード循環）。循環に
+    // 到達するには a0 から9999段降りる必要があるため、循環検出そのものが
+    // 深いチェーンの踏破を強制する形になっている。
+    let mut n = linear_chain(DEEP_CHAIN_LEN);
+    let last = DEEP_CHAIN_LEN - 1;
+    n[last].1 = vec![format!("a{}", last - 1)];
+
+    let err = validate_dag(&n).unwrap_err();
+    assert_eq!(
+        err.cycle,
+        vec![
+            format!("a{}", last - 1),
+            format!("a{}", last),
+            format!("a{}", last - 1),
+        ]
+    );
+}
+
+#[test]
+fn exact_topo_order_for_branching_graph_matches_pre_rewrite_snapshot() {
+    // `visit` を反復実装へ書き換える前の再帰版で得られていたトポロジカル
+    // 順をそのまま固定するスナップショット的テスト（b・c がそれぞれ複数の
+    // 依存を持ち、e を両方から共有する多分岐グラフ）。`assert_valid_topo_order`
+    // が保証する「有効などれか一つの順」ではなく、書き換え前と完全に同じ
+    // 具体的な列であることまで確認する。
+    let n = nodes(&[
+        ("a", &["b", "c"]),
+        ("b", &["d", "e"]),
+        ("c", &["e", "f"]),
+        ("d", &[]),
+        ("e", &[]),
+        ("f", &[]),
+    ]);
+    let order = validate_dag(&n).unwrap();
+    assert_valid_topo_order(&n, &order);
+
+    let expected: Vec<String> = ["d", "e", "b", "f", "c", "a"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(order, expected);
 }
