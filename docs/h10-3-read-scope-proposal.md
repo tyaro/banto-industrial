@@ -1,8 +1,7 @@
 # H10 ③ 提案: API キー read スコープのタグ単位化(catalog の扱い)
 
-状態: **決定済み(2026-08-08、案 B 採用)・実装着手** — オーナー決定: catalog は
-全タグ(PLC アドレス含む)を出し続け、per-tag read スコープは**値の読み取り**のみ
-絞る
+状態: **完了(2026-08-08、案 B、PR #75 マージ済み)** — catalog は全タグ(PLC
+アドレス含む)を出し続け、per-tag read スコープは**値の読み取り**のみ絞る
 最終検証日(コード照合): 2026-08-08
 関連: [docs/improvement-plan.md](improvement-plan.md) H10、
 [docs/tag-server-design.md](tag-server-design.md) §5.6/§9、PR #74(H10 ①②)
