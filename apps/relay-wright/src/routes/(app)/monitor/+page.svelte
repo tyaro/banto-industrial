@@ -8,12 +8,19 @@
 	 * を約1秒周期でポーリング表示する。値はバックエンドでスケーリング+
 	 * 小数桁適用済みの工学値（ルールエンジンが比較する値と同じ）。
 	 *
-	 * 値セルをクリック（editor+）するとインライン入力になり、Enter で
-	 * 即時書き込み・Esc でキャンセル。bit タグは 0/1 ボタンでワンクリック
-	 * 書き込み。確認ダイアログは意図的に無し — 本アプリはデバッグ用途で、
-	 * ユーザーが手動書き込みの安全ゲート（アーム・確認）を明示的に緩和
-	 * している。ただし全書き込みはバックエンドで write_audit_log に
-	 * action='manual_write' として監査される（デバッグ履歴を兼ねる）。
+	 * 値セルをクリック（editor+ かつ手動書き込みが有効な場合）するとインライン
+	 * 入力になり、Enter で即時書き込み・Esc でキャンセル。bit タグは 0/1
+	 * ボタンでワンクリック書き込み。確認ダイアログは意図的に無し —
+	 * 本アプリはデバッグ用途で、ユーザーが手動書き込みの安全ゲート
+	 * （アーム・確認）を明示的に緩和している。ただし全書き込みはバックエンド
+	 * で write_audit_log に action='manual_write' として監査される
+	 * （デバッグ履歴を兼ねる）。
+	 *
+	 * H2（2026-08-08 オーナー決定, docs/improvement-plan.md H2 — B案）:
+	 * 手動書き込みは「設定」画面のトグル（既定オフ）で明示的に有効化しない
+	 * 限り拒否される。有効な間は画面上部に常時警告バナーを表示する
+	 * （arm/レート制限/dry-run の対象外であることの注意）。無効時は値セルの
+	 * クリックを無効化し、その理由を表示する（editor+ でも同様）。
 	 *
 	 * ポーリングは編集中とページ非表示中（visibilitychange）は一時停止し、
 	 * ページ破棄時に必ず clearInterval する。エンジン未起動時はバナーを
@@ -34,14 +41,40 @@
 	import {
 		readGroup,
 		writeTag,
+		getMonitorConfig,
 		isMonitorAvailable,
 		DEMO_MODE_MESSAGE,
 		ENGINE_NOT_RUNNING_MESSAGE,
-		type MonitorValue
+		type MonitorValue,
+		type MonitorConfig
 	} from '$lib/banto/monitorAdmin';
 
 	const available = isMonitorAvailable();
 	const canWrite = $derived(canWriteResources(sessionStore.role));
+
+	// H2: the settings-gate state (default assumed OFF - `false` - until the
+	// real value loads, so the writable UI never flashes on before we know
+	// it is actually allowed). The backend is the real authority regardless
+	// (`EngineControl::monitor_write`'s gate) - this only drives what the UI
+	// shows/allows clicking; a stale/unfetched value degrades safely to "not
+	// writable", never to a false "writable".
+	let monitorConfig = $state<MonitorConfig | null>(null);
+	const manualWriteEnabled = $derived(monitorConfig?.manualWriteEnabled ?? false);
+	const writeUiEnabled = $derived(canWrite && manualWriteEnabled);
+
+	$effect(() => {
+		if (!available) return;
+		void (async () => {
+			try {
+				monitorConfig = await getMonitorConfig();
+			} catch {
+				// Older backend without the command, or a transient failure:
+				// keep treating manual write as disabled (fail closed) rather
+				// than breaking the whole page.
+				monitorConfig = null;
+			}
+		})();
+	});
 
 	const POLL_MS = 1000;
 
@@ -166,7 +199,7 @@
 	}
 
 	function startEdit(entry: MonitorValue): void {
-		if (!canWrite || !available) return;
+		if (!writeUiEnabled || !available) return;
 		editingTagId = entry.tagId;
 		editValue = entry.value === null ? '' : String(entry.value);
 		editError = null;
@@ -212,6 +245,19 @@
 		if (entry.quality !== 'good' || entry.value === null) return '--';
 		return String(entry.value);
 	}
+
+	/**
+	 * Tooltip for a non-writable value cell: a read error takes priority
+	 * (unchanged behavior); otherwise, for an `editor`+ who COULD write if the
+	 * H2 gate were on, explain why the cell isn't clickable (viewers get no
+	 * tooltip here, same as before H2 - the reason is role, already explained
+	 * by the note above the table).
+	 */
+	function readOnlyTitle(entry: MonitorValue): string {
+		if (entry.quality === 'bad') return entry.error ?? '読み取りエラー';
+		if (canWrite && !manualWriteEnabled) return '手動書き込みは設定で無効です';
+		return '';
+	}
 </script>
 
 <div class="page">
@@ -230,10 +276,19 @@
 			</p>
 		{/if}
 
+		{#if manualWriteEnabled}
+			<p class="banner">
+				⚠ 手動書き込みは安全ゲート対象外です — arm / レート制限 / dry-run
+				の対象外で、disarm中でも物理書き込みが行われます。無効化するには「設定」画面へ。
+			</p>
+		{/if}
+
 		<p class="note">
 			接続→収集グループを選ぶと、そのグループのタグの現在値を約1秒周期で表示します。
-			{#if canWrite}
+			{#if writeUiEnabled}
 				値セルをクリックすると即時書き込みできます（確認なし・全書き込みは監査ログに記録されます）。
+			{:else if canWrite}
+				手動書き込みは設定で無効です（設定画面から有効化できます）。
 			{:else}
 				書き込みには編集者以上の権限が必要です（閲覧のみ）。
 			{/if}
@@ -356,7 +411,7 @@
 												{#if editError}
 													<span class="error-text small">{editError}</span>
 												{/if}
-											{:else if canWrite}
+											{:else if writeUiEnabled}
 												<button
 													type="button"
 													class="value-cell writable"
@@ -376,10 +431,7 @@
 													{/if}
 												</button>
 											{:else}
-												<span
-													class="value-cell"
-													title={entry.quality === 'bad' ? (entry.error ?? '読み取りエラー') : ''}
-												>
+												<span class="value-cell" title={readOnlyTitle(entry)}>
 													<span class="value" class:bad={entry.quality === 'bad'}>
 														{displayValue(entry)}
 													</span>

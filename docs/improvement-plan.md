@@ -42,7 +42,7 @@
 | ID  | 内容                                                     | 優先度 | 規模 | 状態             |
 | --- | -------------------------------------------------------- | ------ | ---- | ---------------- |
 | H1  | banto-expr の式長・ネスト深さ上限(DoS 根治)              | 最高   | 小   | 完了(残件あり)   |
-| H2  | 手動書き込み(タグモニタ)の安全意味論                     | 最高   | 中   | 決定済み・実装中 |
+| H2  | 手動書き込み(タグモニタ)の安全意味論                     | 最高   | 中   | 完了(本 PR)      |
 | H3  | banto-hub gRPC の bind 設定化(既定 127.0.0.1)            | 高     | 中   | 完了(本 PR)      |
 | H4  | 収集タイムスタンプ逆行対策 + append 失敗の可視化         | 高     | 中   | 完了(本 PR)      |
 | H5  | フロントテスト基盤(vitest)+ hub/relay-wright E2E         | 高     | 大   | 未着手           |
@@ -83,7 +83,7 @@
   依存チェーン深さの上限追加。式1本内のネストを抑える H1 のガードでは
   防げない別経路
 
-### H2: 手動書き込み(タグモニタ)の安全意味論 — 状態: 決定済み(2026-08-08)・実装中
+### H2: 手動書き込み(タグモニタ)の安全意味論 — 状態: 完了(2026-08-08、本 PR)
 
 - **事実**: relay-wright のタグモニタ手動書き込み
   (`POST /api/monitor/write` / Tauri `monitor_tag_write`、Editor 権限)は
@@ -110,6 +110,26 @@
 - **受け入れ条件**(決定後に確定): 決定内容の本ドキュメントへの日付付き
   追記、実装、挙動を固定するテストの更新(現行テストは仕様変更に合わせて
   書き換え)、relay-wright README の安全上の注意の更新
+- **実施記録(2026-08-08)**: 設定キー `monitor.manual_write_enabled`
+  (既定 false)を追加。ゲートは `EngineControl::monitor_write` 入口の
+  単一チョークポイント(監査・ワイヤ到達より前、設定読み取り失敗時も
+  書き込み中止 = fail-closed)。拒否は `write_audit_log` の CHECK を
+  変えず、REST/Tauri 両配線層が共有定数の完全一致判定
+  (`is_manual_write_disabled`)で検出して一般 `audit_log` に
+  `denied`/`resource:"monitor"` を記録(origin を持つのが配線層のため。
+  二重記録・漏れが構造的に起きない形)。トグルは
+  `GET/PUT /api/monitor/config`(GET viewer+ / PUT admin、
+  settings_change 監査)+ Tauri コマンド。UI はモニタ画面の書き込み
+  ゲート+有効時の常時警告バナー、設定画面に Admin 限定トグル+警告文。
+  README・manual に「既定無効。有効化すると disarm と無関係に書き込ま
+  れる」を明記。既存テスト5本を新仕様へ更新し、既定拒否・有効化→
+  disarm 中でも着弾・再無効化→即拒否・拒否の監査・Admin 限定トグルの
+  新規テストを追加。relay-wright-core 279 テスト green・clippy clean
+  (src-tauri のコンパイルはコンテナ制約により CI(Windows)で検証)
+- **観察(将来検討)**: 無効時の REST 応答は既存の設定競合ガード流儀に
+  合わせ 500(`BantoError::Other`)。`BantoError` が外部 banto クレート
+  由来で variant を足せないための制約で、403/409 系の専用エラー表現は
+  banto 側の改修機会に検討
 
 ### H3: banto-hub gRPC の bind 設定化 — 状態: 完了(2026-08-08、本 PR)
 

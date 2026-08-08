@@ -7,6 +7,15 @@
 //! Same anti-hang discipline as `engine_integration.rs`: every wait for an
 //! asynchronous outcome (the broker's background connect, mainly) is bounded
 //! by a deadline, so a bug fails fast instead of hanging.
+//!
+//! H2 (2026-08-08 オーナー決定, `docs/improvement-plan.md` H2 — B 案): manual
+//! writes are now opt-in (`monitor.manual_write_enabled`, default `false`).
+//! Every test below whose actual point is exercising the write MECHANICS
+//! (lands on the simulator, protocol rejection, wire-encoder range check)
+//! calls [`enable_manual_write`] in its setup, so it keeps testing what it
+//! always tested; the gate itself (default-disabled, enable/disable
+//! round-trip, the denial's audit trail) gets its own dedicated tests near
+//! the bottom of this file.
 
 use std::time::Duration;
 
@@ -18,9 +27,23 @@ use banto_tags::{
     TagInput, TagService,
 };
 use relay_wright_core::db::init_db_memory;
-use relay_wright_core::engine::MonitorValue;
+use relay_wright_core::engine::{is_manual_write_disabled, MonitorValue};
+use relay_wright_core::settings::{MonitorSettings, SettingsService};
 use relay_wright_core::{Engine, EngineConfig, EngineControl};
 use sqlx::SqlitePool;
+
+/// H2: flip `monitor.manual_write_enabled` on for `pool`. Called by every
+/// test in this file that wants the PRE-H2 behavior (manual writes reach the
+/// wire) so it keeps exercising what it always exercised, rather than the new
+/// gate.
+async fn enable_manual_write(pool: &SqlitePool) {
+    SettingsService::new(pool.clone())
+        .set_monitor_config(&MonitorSettings {
+            manual_write_enabled: true,
+        })
+        .await
+        .expect("enable manual write");
+}
 
 /// An in-memory DB, a running simulator, and one SLMP PLC connection +
 /// collection group pointed at it (the monitor's unit of selection).
@@ -245,6 +268,7 @@ async fn monitor_group_read_returns_display_ready_values_over_the_engine_session
 #[tokio::test]
 async fn monitor_spawns_a_broker_session_on_demand_for_an_unmanaged_connection() {
     let f = Fixture::new().await;
+    enable_manual_write(&f.pool).await;
     let tag = f.tag("値", "D500", "u16", None, None, None, 0).await;
     f.sim.set_word(SlmpDevice::D, 500, 42);
 
@@ -272,11 +296,17 @@ async fn monitor_spawns_a_broker_session_on_demand_for_an_unmanaged_connection()
 // ---------------------------------------------------------------------------
 // Manual writes: land while DISARMED (no arm gate - the user's explicit
 // relaxation), audited as manual_write with the actor; scaling is unscaled.
+// H2: this is the "enabled" side of the settings gate decision - the fixture
+// explicitly turns manual_write_enabled ON, fixing that even with the H2
+// gate opted in, disarm still does not stop a manual write. The "disabled by
+// default" side is fixed separately, see `manual_write_is_rejected_by_default`
+// below.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn manual_write_lands_while_disarmed_and_is_audited() {
     let f = Fixture::new().await;
+    enable_manual_write(&f.pool).await;
     let plain = f.tag("生値", "D200", "u16", None, None, None, 0).await;
     // eng 0..=100 → raw 0..=1000: writing eng 50 must land raw 500.
     let scaled = f
@@ -372,6 +402,7 @@ async fn manual_write_lands_while_disarmed_and_is_audited() {
 #[tokio::test]
 async fn monitor_rejects_a_modbus_connection_with_a_clear_error() {
     let f = Fixture::new().await;
+    enable_manual_write(&f.pool).await;
     let plc = PlcConnectionService::new(f.pool.clone());
     let modbus = plc
         .create(PlcConnectionInput {
@@ -460,6 +491,12 @@ async fn monitor_rejects_a_modbus_connection_with_a_clear_error() {
 #[tokio::test]
 async fn invalid_manual_write_values_error_and_are_audited_failed() {
     let f = Fixture::new().await;
+    // H2: the parse-failure cases below never reach `monitor_write` (they
+    // error out in `build()` before it), so they would pass regardless of
+    // this gate - but the trailing out-of-range case DOES reach the wire
+    // encoder inside `monitor_write`, so this needs the gate open like the
+    // other write-mechanics tests in this file.
+    enable_manual_write(&f.pool).await;
     let numeric = f.tag("数値", "D600", "u16", None, None, None, 0).await;
     let bit = f.tag("ビット", "M30", "bit", None, None, None, 0).await;
     let text = f
@@ -544,6 +581,139 @@ async fn invalid_manual_write_values_error_and_are_audited_failed() {
     assert!(
         rows.iter().all(|r| !(r.0 == "manual_write" && r.1 == "ok")),
         "no manual write ever succeeded here: {rows:?}"
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
+        .await
+        .expect("shutdown must not hang");
+}
+
+// ---------------------------------------------------------------------------
+// H2 (2026-08-08 オーナー決定, `docs/improvement-plan.md` H2 — B 案): the
+// manual_write_enabled gate itself - default disabled, enable/disable
+// round-trips, the denial's audit trail. Every test above in this file
+// exercises the WRITE MECHANICS with the gate explicitly opened
+// (`enable_manual_write`); these exercise the gate's own on/off behavior.
+// ---------------------------------------------------------------------------
+
+/// With NO settings change at all (a fresh DB - `Fixture::new` never touches
+/// `monitor.manual_write_enabled`), a manual write is rejected before
+/// anything else happens: nothing reaches the wire, and NO `write_audit_log`
+/// row is written at all (that table's `action`/`result` CHECK constraints
+/// have no "denied by settings" member - `crate::engine::monitor`'s module
+/// doc - so a gate rejection is deliberately absent from that trail, not
+/// recorded under some approximate existing value).
+#[tokio::test]
+async fn manual_write_is_rejected_by_default() {
+    let f = Fixture::new().await;
+    let tag = f.tag("生値", "D700", "u16", None, None, None, 0).await;
+    f.sim.set_word(SlmpDevice::D, 700, 0);
+
+    let (engine, control) = Engine::start(
+        f.pool.clone(),
+        f.all_connections().await,
+        EngineConfig::default(),
+    )
+    .await
+    .expect("engine start");
+
+    // Retry through the connect window like every other write test here (a
+    // "not yet connected" error is expected transiently and is NOT the gate
+    // rejection under test) - but once connected, the gate error must be the
+    // FINAL outcome, never a landed write.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let err = loop {
+        match control
+            .monitor_tag_write(tag, "999", Some("debugger"))
+            .await
+        {
+            Ok(()) => panic!("a disabled gate must never let a write land"),
+            Err(e) if e.to_string().contains("未接続") => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "session never came up"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(e) => break e,
+        }
+    };
+    assert!(
+        is_manual_write_disabled(&err),
+        "expected the manual-write-disabled rejection, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("設定"),
+        "the error should explain the setting gate, got: {err}"
+    );
+
+    assert_eq!(f.sim.get_word(SlmpDevice::D, 700), 0, "nothing was written");
+    let rows = audit_rows(&f.pool).await;
+    assert!(
+        rows.iter().all(|r| r.0 != "manual_write"),
+        "a gate rejection must leave NO write_audit_log row at all: {rows:?}"
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
+        .await
+        .expect("shutdown must not hang");
+}
+
+/// Enabling the setting lets a write land; disabling it again (mid-session,
+/// same engine) immediately reverts to rejecting - the gate is read live on
+/// every call, not cached at engine start.
+#[tokio::test]
+async fn manual_write_toggle_enable_then_disable_flips_the_gate_live() {
+    let f = Fixture::new().await;
+    let tag = f.tag("生値", "D710", "u16", None, None, None, 0).await;
+
+    let (engine, control) = Engine::start(
+        f.pool.clone(),
+        f.all_connections().await,
+        EngineConfig::default(),
+    )
+    .await
+    .expect("engine start");
+
+    // Disabled (default): rejected.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match control.monitor_tag_write(tag, "1", Some("debugger")).await {
+            Err(e) if is_manual_write_disabled(&e) => break,
+            Err(e) if e.to_string().contains("未接続") => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "session never came up"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            other => panic!("expected the disabled-gate rejection first, got {other:?}"),
+        }
+    }
+    assert_eq!(f.sim.get_word(SlmpDevice::D, 710), 0);
+
+    // Enabled: the very same connection/session now lands the write.
+    enable_manual_write(&f.pool).await;
+    write_until_ok(&control, tag, "555", "debugger").await;
+    assert_eq!(f.sim.get_word(SlmpDevice::D, 710), 555);
+
+    // Disabled again: rejected once more, and the earlier successful write is
+    // not somehow undone or re-audited - just the next attempt is blocked.
+    SettingsService::new(f.pool.clone())
+        .set_monitor_config(&MonitorSettings {
+            manual_write_enabled: false,
+        })
+        .await
+        .unwrap();
+    let err = control
+        .monitor_tag_write(tag, "2", Some("debugger"))
+        .await
+        .expect_err("re-disabling must reject the next attempt");
+    assert!(is_manual_write_disabled(&err));
+    assert_eq!(
+        f.sim.get_word(SlmpDevice::D, 710),
+        555,
+        "the disabled write must not have changed the device"
     );
 
     tokio::time::timeout(Duration::from_secs(5), engine.shutdown())

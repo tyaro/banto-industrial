@@ -20,6 +20,12 @@
 		type AuditSettings
 	} from '$lib/banto/auditLogAdmin';
 	import {
+		getMonitorConfig,
+		isMonitorAvailable,
+		setMonitorConfig,
+		type MonitorConfig
+	} from '$lib/banto/monitorAdmin';
+	import {
 		cancelPendingRestore,
 		createBackup,
 		downloadBackup,
@@ -346,6 +352,52 @@
 			toastStore.push('error', errorMessage(err));
 		} finally {
 			applyingAudit = false;
+		}
+	}
+
+	// --- H2 (2026-08-08 オーナー決定, docs/improvement-plan.md H2 — B案):
+	// タグモニタ手動書き込みの有効/無効 -------------------------------------
+	// Same "not Tauri-only" shape as the audit-log section above
+	// (`monitorAdmin.ts` has a REST fallback, `GET`/`PUT /api/monitor/config`)
+	// so a LAN browser admin can also toggle this, not just the desktop app.
+	const monitorAvailable = isMonitorAvailable();
+
+	let monitorConfig = $state<MonitorConfig | null>(null);
+	let manualWriteDraft = $state(false);
+	let applyingMonitor = $state(false);
+	let monitorError: string | null = $state(null);
+
+	function applyMonitorConfigToDrafts(config: MonitorConfig): void {
+		monitorConfig = config;
+		manualWriteDraft = config.manualWriteEnabled;
+	}
+
+	$effect(() => {
+		if (!monitorAvailable || !isAdmin(sessionStore.role)) return;
+		void (async () => {
+			try {
+				applyMonitorConfigToDrafts(await getMonitorConfig());
+			} catch (err) {
+				monitorError = errorMessage(err);
+			}
+		})();
+	});
+
+	async function saveMonitorConfig(): Promise<void> {
+		applyingMonitor = true;
+		monitorError = null;
+		try {
+			applyMonitorConfigToDrafts(await setMonitorConfig({ manualWriteEnabled: manualWriteDraft }));
+			toastStore.push(
+				'success',
+				manualWriteDraft
+					? 'タグモニタの手動書き込みを有効にしました'
+					: 'タグモニタの手動書き込みを無効にしました'
+			);
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			applyingMonitor = false;
 		}
 	}
 
@@ -735,6 +787,36 @@
 			<p class="note">
 				0を入力すると、その項目は無制限になります（既定は90日 /
 				10万件）。古い記録は一覧の表示時に自動的に整理されます。記録の一覧は「監査ログ」画面から確認できます。
+			</p>
+		</section>
+	{/if}
+
+	{#if monitorAvailable && isAdmin(sessionStore.role)}
+		<section>
+			<h2>タグモニタ 手動書き込み</h2>
+
+			<label class="toggle">
+				<input type="checkbox" bind:checked={manualWriteDraft} />
+				手動書き込みを有効にする
+			</label>
+
+			<button type="button" onclick={saveMonitorConfig} disabled={applyingMonitor}>保存</button>
+
+			{#if monitorError}
+				<p class="error">{monitorError}</p>
+			{/if}
+
+			{#if monitorConfig}
+				<p class="status">
+					状態:
+					<strong>{monitorConfig.manualWriteEnabled ? '有効' : '無効（既定）'}</strong>
+				</p>
+			{/if}
+
+			<p class="note warning">
+				有効にすると、タグモニタからの手動書き込みは arm / レート制限 / dry-run
+				の対象外になります。disarm
+				中でも物理書き込みが行われます。無効時はモニタ画面での手動書き込みが拒否されます（既定は無効）。変更は監査ログに記録されます。
 			</p>
 		</section>
 	{/if}

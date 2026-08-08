@@ -31,7 +31,8 @@ use relay_wright_core::audit::{AuditEntry, AuditLogEntry, AuditLogService};
 use relay_wright_core::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 use relay_wright_core::db::init_db;
 use relay_wright_core::engine::{
-    Engine, EngineConfig, EngineControl, EngineStatus, SharedEngineControl,
+    is_manual_write_disabled, Engine, EngineConfig, EngineControl, EngineStatus,
+    SharedEngineControl,
 };
 use relay_wright_core::events::event_channel;
 use relay_wright_core::project::{export_project, import_project, ImportSummary, ProjectFile};
@@ -48,7 +49,9 @@ use relay_wright_core::rest::{
     api_router, audited_credential_verifier, CollectionGroupPayload, PlcConnectionPayload,
     QrStringsReorderPayload, TagPayload,
 };
-use relay_wright_core::settings::{AuditSettings, AuthSettings, ServerSettings, SettingsService};
+use relay_wright_core::settings::{
+    AuditSettings, AuthSettings, MonitorSettings, ServerSettings, SettingsService,
+};
 use relay_wright_core::users::{Role, UserIdentity, UserSummary, UsersService};
 use relay_wright_core::write_audit_query::{WriteAuditLogRow, WriteAuditLogService};
 use relay_wright_core::write_rules::{WriteRuleDetail, WriteRuleInput, WriteRuleService};
@@ -2295,13 +2298,26 @@ async fn engine_status(state: State<'_, AppState>) -> Result<EngineStatus, Banto
 // The Tauri half of the monitor's dual path (invariant §1 両経路対称): read =
 // viewer+, manual write = editor+ (the user explicitly relaxed this DEBUG
 // screen's safety - no arm gate, no confirm; editor rather than admin), with
-// the same audit split as the engine commands: the manual-write audit row
-// (`write_audit_log`, `action: 'manual_write'`) is written INSIDE
+// the same audit split as the engine commands: a LANDED manual-write audit
+// row (`write_audit_log`, `action: 'manual_write'`) is written INSIDE
 // `EngineControl::monitor_write`, so this layer adds ONLY the RBAC gate and
 // the actor username - never a second entry. Both commands ride the SAME
 // shared control slot as `/api/monitor/*`, so all monitor traffic goes
 // through the engine broker's one-session-per-connection tasks (the
 // R08ENCPU accepts only one SLMP session per connected port).
+//
+// H2 (2026-08-08 オーナー決定 `docs/improvement-plan.md` H2 — B 案): manual
+// writes are additionally gated by `SettingsService::monitor_config`'s
+// `manual_write_enabled` (default off) - enforced inside `EngineControl`
+// itself (`relay_wright_core::engine::monitor`'s module doc is the single
+// source of truth for the gate and its reasoning). `monitor_tag_write_body`
+// below detects that specific rejection via `is_manual_write_disabled` and
+// records it to the general `audit_log` as a `denied`/`resource: "monitor"`
+// entry - the same shape a role denial gets - since `EngineControl` itself
+// has no way to know this call came from Tauri (`origin: "tauri"`) rather
+// than REST. `monitor_config_get`/`monitor_config_apply` below expose the
+// toggle itself (viewer+ read / admin write, mirroring `audit_config_get`/
+// `audit_config_apply`).
 
 /// Body of [`monitor_group_read`] (see [`engine_arm_body`] for the split
 /// pattern).
@@ -2328,23 +2344,48 @@ async fn monitor_group_read(
 }
 
 /// Body of [`monitor_tag_write`] (see [`engine_arm_body`] for the split
-/// pattern).
+/// pattern). H2: on a rejection caused specifically by the
+/// `manual_write_enabled` gate being off, records the `denied` audit entry
+/// (see this section's doc comment for why that lives here and not inside
+/// `EngineControl`) before propagating the same error to the caller - RBAC
+/// denials are unaffected, they already return via `require_role`'s own `?`
+/// above and never reach this code.
 async fn monitor_tag_write_body(
     state: &AppState,
     tag_id: i64,
     value: &str,
 ) -> Result<(), BantoError> {
     let actor = require_role(state, Role::Editor, "monitor").await?;
-    current_engine_control(state)
+    let result = current_engine_control(state)
         .await?
         .monitor_tag_write(tag_id, value, Some(&actor.username))
-        .await
+        .await;
+    if let Err(err) = &result {
+        if is_manual_write_disabled(err) {
+            state
+                .audit
+                .record(AuditEntry {
+                    actor_username: Some(&actor.username),
+                    actor_role: Some(actor.role.as_str()),
+                    action: "denied",
+                    resource: "monitor",
+                    entity_id: Some(&tag_id.to_string()),
+                    detail: Some(serde_json::json!({ "reason": "manual_write_disabled" })),
+                    origin: "tauri",
+                    result: "denied",
+                })
+                .await;
+        }
+    }
+    result
 }
 
 /// `editor`+ (feature/tag-monitor): one-shot manual write to a tag's device.
 /// NO arm gate / rate limit / dry-run interception (the user's explicit
-/// relaxation for this debug screen); audited by `EngineControl` as
-/// `manual_write` with the caller attributed.
+/// relaxation for this debug screen); a LANDED write is audited by
+/// `EngineControl` as `manual_write` with the caller attributed (H2: a write
+/// rejected by the `manual_write_enabled` gate is audited differently - see
+/// [`monitor_tag_write_body`]).
 #[tauri::command]
 async fn monitor_tag_write(
     state: State<'_, AppState>,
@@ -2352,6 +2393,65 @@ async fn monitor_tag_write(
     value: String,
 ) -> Result<(), BantoError> {
     monitor_tag_write_body(&state, tag_id, &value).await
+}
+
+/// Body of [`monitor_config_get`] (see [`engine_arm_body`] for the split
+/// pattern).
+async fn monitor_config_get_body(state: &AppState) -> Result<MonitorSettings, BantoError> {
+    require_role(state, Role::Viewer, "settings").await?;
+    state.settings.monitor_config().await
+}
+
+/// Current タグモニタ手動書き込み設定 (H2). Any authenticated role may read
+/// this - unlike `monitor_config_apply` below - since the monitor page needs
+/// it for every role that can view the page, to decide whether to show
+/// writable cells / the disabled reason / the "safety gate bypassed" banner
+/// (same rationale as `audit_config_get`'s doc comment, just a different
+/// audience: that one only feeds an admin-only screen, this one feeds a
+/// viewer+ screen).
+#[tauri::command]
+async fn monitor_config_get(state: State<'_, AppState>) -> Result<MonitorSettings, BantoError> {
+    monitor_config_get_body(&state).await
+}
+
+/// Body of [`monitor_config_apply`] (see [`engine_arm_body`] for the split
+/// pattern).
+async fn monitor_config_apply_body(
+    state: &AppState,
+    manual_write_enabled: bool,
+) -> Result<MonitorSettings, BantoError> {
+    let actor = require_role(state, Role::Admin, "settings").await?;
+    let config = MonitorSettings {
+        manual_write_enabled,
+    };
+    state.settings.set_monitor_config(&config).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "settings_change",
+            resource: "settings",
+            entity_id: None,
+            detail: Some(serde_json::json!({ "monitorManualWriteEnabled": manual_write_enabled })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    state.settings.monitor_config().await
+}
+
+/// `admin`-only (H2): persist the `manual_write_enabled` toggle. Mirrors
+/// `audit_config_apply`'s shape exactly - same `settings_change`/
+/// `resource: "settings"` audit entry (this crate's convention: every
+/// settings mutation is tagged `resource: "settings"` regardless of which
+/// specific setting changed, with `detail` carrying which one).
+#[tauri::command]
+async fn monitor_config_apply(
+    state: State<'_, AppState>,
+    manual_write_enabled: bool,
+) -> Result<MonitorSettings, BantoError> {
+    monitor_config_apply_body(&state, manual_write_enabled).await
 }
 
 /// Body of [`engine_reload`] (see [`engine_arm_body`]).
@@ -2914,6 +3014,8 @@ pub fn run() {
             engine_reload,
             monitor_group_read,
             monitor_tag_write,
+            monitor_config_get,
+            monitor_config_apply,
             project_export,
             project_import,
         ])
@@ -4116,11 +4218,22 @@ mod tests {
     /// attributed - even when the session is down (the fixture's port is
     /// closed): the attempt errors, and the log-before-write `manual_write`
     /// row is left `failed` (evidence a write was in flight - debug history).
-    /// No arm is required or touched at any point.
+    /// No arm is required or touched at any point. H2 (2026-08-08): this test
+    /// exercises what happens once a write attempt REACHES the wire, so it
+    /// explicitly enables `manual_write_enabled` first - see
+    /// `monitor_tag_write_is_rejected_by_default_and_denial_is_audited` below
+    /// for the disabled-by-default side of that decision.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn monitor_tag_write_is_audited_with_the_actor_on_the_tauri_path() {
         let (state, pool) = app_state_with_engine().await;
         let (_group_id, tag_id) = seed_monitor_fixture(&pool).await;
+        state
+            .settings
+            .set_monitor_config(&MonitorSettings {
+                manual_write_enabled: true,
+            })
+            .await
+            .expect("enable manual write for this test");
         let editor = state
             .users
             .create_user("editor", "password123", "編集者", Role::Editor)
@@ -4151,6 +4264,106 @@ mod tests {
         assert_eq!(action, "manual_write");
         assert_eq!(result, "failed");
         assert_eq!(write_audit_count(&pool, "arm", "ok").await, 0);
+    }
+
+    /// H2 (2026-08-08): with NO settings change (a fresh DB), an `editor`'s
+    /// manual write is rejected before anything else - RBAC passed (this is
+    /// not a role denial) but the `manual_write_enabled` gate is closed by
+    /// default. No `write_audit_log` row at all (that table's CHECK has no
+    /// "denied by settings" value), and the rejection IS recorded to the
+    /// general `audit_log` as `action: "denied"`, `resource: "monitor"`,
+    /// `origin: "tauri"`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn monitor_tag_write_is_rejected_by_default_and_denial_is_audited() {
+        let (state, pool) = app_state_with_engine().await;
+        let (_group_id, tag_id) = seed_monitor_fixture(&pool).await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create editor");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+
+        let err = monitor_tag_write_body(&state, tag_id, "42")
+            .await
+            .unwrap_err();
+        assert!(
+            is_manual_write_disabled(&err),
+            "expected the manual-write-disabled rejection, got {err:?}"
+        );
+
+        assert_eq!(write_audit_count(&pool, "manual_write", "ok").await, 0);
+        assert_eq!(write_audit_count(&pool, "manual_write", "failed").await, 0);
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        assert!(
+            entries.rows.iter().any(|r| r.action == "denied"
+                && r.resource == "monitor"
+                && r.origin == "tauri"
+                && r.actor_username.as_deref() == Some("editor")),
+            "expected a denied monitor entry for the disabled gate, got {:?}",
+            entries.rows
+        );
+    }
+
+    /// H2: `monitor_config_get` is `viewer`+ and defaults to
+    /// `manualWriteEnabled: false`; `monitor_config_apply` is `admin`-only
+    /// (editor/viewer denied) and, once applied, persists + round-trips +
+    /// records a `settings_change`/`resource: "settings"` audit entry -
+    /// mirrors `audit_config_apply`'s Tauri-side test shape.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn monitor_config_apply_is_admin_only_and_audited() {
+        let (state, _pool) = app_state_with_engine().await;
+        let viewer = state
+            .users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create viewer");
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create editor");
+        let admin = state
+            .users
+            .create_user("admin", "password123", "管理者", Role::Admin)
+            .await
+            .expect("create admin");
+
+        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+        let config = monitor_config_get_body(&state)
+            .await
+            .expect("viewer may read the config");
+        assert!(!config.manual_write_enabled);
+
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+        let err = monitor_config_apply_body(&state, true).await.unwrap_err();
+        assert!(matches!(err, BantoError::Forbidden));
+
+        *state.auth.lock().expect("auth mutex poisoned") = Some(admin);
+        let applied = monitor_config_apply_body(&state, true)
+            .await
+            .expect("admin may apply the config");
+        assert!(applied.manual_write_enabled);
+
+        let refetched = monitor_config_get_body(&state)
+            .await
+            .expect("admin may read the config");
+        assert!(refetched.manual_write_enabled);
+
+        let entries = state.audit.list(ListParams::default()).await.unwrap();
+        let entry = entries
+            .rows
+            .iter()
+            .find(|r| r.action == "settings_change" && r.resource == "settings")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a settings_change/settings entry, got {:?}",
+                    entries.rows
+                )
+            });
+        assert_eq!(entry.origin, "tauri");
+        assert_eq!(entry.result, "ok");
+        assert_eq!(entry.actor_username.as_deref(), Some("admin"));
     }
 
     /// `write_audit_log_list` is a `viewer`+ read (plan W4): an unauthenticated

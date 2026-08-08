@@ -73,7 +73,7 @@ pub use banto_broker::{
     BackoffConfig, BrokerConnectionStatus, BrokerError, BrokerHandle, BrokerSupervisor,
     ReadOnlyHandle, SessionDirectory,
 };
-pub use monitor::MonitorValue;
+pub use monitor::{is_manual_write_disabled, MonitorValue};
 
 use arming::ArmingState;
 use current_values::CurrentValues;
