@@ -4,6 +4,7 @@
 //! bind/port fields).
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use banto_core::{BantoError, FieldError};
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,13 @@ const KEY_AUTOLOGIN_USERNAME: &str = "auth.autologin.username";
 const KEY_AUDIT_RETENTION_DAYS: &str = "audit.retention_days";
 const KEY_AUDIT_RETENTION_ROWS: &str = "audit.retention_rows";
 const KEY_MONITOR_MANUAL_WRITE_ENABLED: &str = "monitor.manual_write_enabled";
+const KEY_ARM_AUTO_DISARM_SECS: &str = "arm.auto_disarm_secs";
+
+/// Default arm auto-disarm window (H10 ②, 2026-08-08 オーナー決定
+/// `docs/improvement-plan.md` H10): 8 hours = 1 シフト. Kept in sync with
+/// [`crate::engine::EngineConfig::default`]'s `auto_disarm` literal - see
+/// that impl's comment.
+const DEFAULT_ARM_AUTO_DISARM_SECS: u64 = 28_800;
 
 /// Default audit-log retention (spec M14): 90 days / 100,000 rows. There is
 /// deliberately no "audit enabled" toggle - the audit trail is a standard
@@ -200,6 +208,46 @@ impl Default for AuditSettings {
 #[serde(rename_all = "camelCase")]
 pub struct MonitorSettings {
     pub manual_write_enabled: bool,
+}
+
+/// エンジンの arm 時限失効設定 (H10 ②, 2026-08-08 オーナー決定
+/// `docs/improvement-plan.md` H10): アームしてからこの秒数が経過すると
+/// エンジンが自動的に disarm する（`crate::engine::writer::Writer::enforce_arm_expiry`
+/// が毎 tick 判定し、監査ログに記録する - `crate::engine::arming` のモジュール
+/// doc 参照）。既定は 28800 秒 (8 時間 = 1 シフト)。
+///
+/// `auto_disarm_secs = 0` は「無効」を意味する - `0` はどのみち有効な
+/// 失効時間ではありえない（アームした瞬間に失効することになる）ので、
+/// `retention_days`/`retention_rows` と同じ「0 は特別扱いの sentinel」の
+/// 型にはせず、素の `u64` 秒数のまま保持する（GET/PUT
+/// `/api/engine/config` の wire 形もこのまま）。`Option<Duration>`
+/// （`crate::engine::EngineConfig::auto_disarm` が実際に消費する形）への
+/// 変換は [`ArmSettings::auto_disarm`] が受け持つ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArmSettings {
+    pub auto_disarm_secs: u64,
+}
+
+impl Default for ArmSettings {
+    fn default() -> Self {
+        Self {
+            auto_disarm_secs: DEFAULT_ARM_AUTO_DISARM_SECS,
+        }
+    }
+}
+
+impl ArmSettings {
+    /// Convert the stored seconds into the `Duration` the engine actually
+    /// consumes (`crate::engine::EngineConfig.auto_disarm`); `0` means
+    /// "disabled" (`None`) - see the struct doc comment.
+    pub fn auto_disarm(&self) -> Option<Duration> {
+        if self.auto_disarm_secs == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(self.auto_disarm_secs))
+        }
+    }
 }
 
 /// Generic key/value settings store, backed by the `settings` table
@@ -475,6 +523,35 @@ impl SettingsService {
             } else {
                 "false"
             },
+        )
+        .await
+    }
+
+    /// Read the arm 時限失効設定 (H10 ②), falling back to
+    /// [`ArmSettings::default`] (28800 秒 = 8h) for a key that has never been
+    /// set, and ALSO for a set-but-unparseable value - same "corrupt value
+    /// degrades to the safe default" convention as
+    /// [`SettingsService::auth_config`]'s `disabled_role` fallback, chosen
+    /// here over `parse_retention`'s "0/negative -> None" convention because
+    /// `0` is itself a valid, distinct setting here (disabled), not a
+    /// sentinel for "unset".
+    pub async fn arm_config(&self) -> Result<ArmSettings, BantoError> {
+        let defaults = ArmSettings::default();
+        let auto_disarm_secs = self
+            .get(KEY_ARM_AUTO_DISARM_SECS)
+            .await?
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(defaults.auto_disarm_secs);
+        Ok(ArmSettings { auto_disarm_secs })
+    }
+
+    /// Persist the arm 時限失効設定 (H10 ②). No cross-setting exclusivity
+    /// guard, same as [`SettingsService::set_monitor_config`] - this setting
+    /// does not conflict with anything else in this store.
+    pub async fn set_arm_config(&self, config: &ArmSettings) -> Result<(), BantoError> {
+        self.set(
+            KEY_ARM_AUTO_DISARM_SECS,
+            &config.auto_disarm_secs.to_string(),
         )
         .await
     }
@@ -856,5 +933,62 @@ mod tests {
         .await
         .unwrap();
         assert!(!svc.monitor_config().await.unwrap().manual_write_enabled);
+    }
+
+    // --- arm 時限失効設定 (H10 ②, 2026-08-08) --------------------------------
+
+    #[tokio::test]
+    async fn arm_config_defaults_to_8h_when_unset() {
+        let svc = service().await;
+        let config = svc.arm_config().await.unwrap();
+        assert_eq!(config, ArmSettings::default());
+        assert_eq!(
+            config.auto_disarm_secs, 28_800,
+            "H10 ②: default must be 8h (1 shift) = 28800 seconds"
+        );
+        assert_eq!(config.auto_disarm(), Some(Duration::from_secs(28_800)));
+    }
+
+    #[tokio::test]
+    async fn arm_config_round_trips_through_set() {
+        let svc = service().await;
+        svc.set_arm_config(&ArmSettings {
+            auto_disarm_secs: 3_600,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            svc.arm_config().await.unwrap(),
+            ArmSettings {
+                auto_disarm_secs: 3_600,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn arm_config_zero_means_disabled() {
+        let svc = service().await;
+        svc.set_arm_config(&ArmSettings {
+            auto_disarm_secs: 0,
+        })
+        .await
+        .unwrap();
+        let config = svc.arm_config().await.unwrap();
+        assert_eq!(config.auto_disarm_secs, 0);
+        assert_eq!(
+            config.auto_disarm(),
+            None,
+            "0 seconds must convert to a disabled (None) duration"
+        );
+    }
+
+    #[tokio::test]
+    async fn arm_config_falls_back_to_default_on_a_corrupt_stored_value() {
+        let svc = service().await;
+        svc.set(KEY_ARM_AUTO_DISARM_SECS, "not-a-number")
+            .await
+            .unwrap();
+        let config = svc.arm_config().await.unwrap();
+        assert_eq!(config.auto_disarm_secs, 28_800);
     }
 }

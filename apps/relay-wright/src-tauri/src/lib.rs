@@ -50,7 +50,7 @@ use relay_wright_core::rest::{
     QrStringsReorderPayload, TagPayload,
 };
 use relay_wright_core::settings::{
-    AuditSettings, AuthSettings, MonitorSettings, ServerSettings, SettingsService,
+    ArmSettings, AuditSettings, AuthSettings, MonitorSettings, ServerSettings, SettingsService,
 };
 use relay_wright_core::users::{Role, UserIdentity, UserSummary, UsersService};
 use relay_wright_core::write_audit_query::{WriteAuditLogRow, WriteAuditLogService};
@@ -67,6 +67,7 @@ use relay_wright_core::{
 use serde::Serialize;
 use std::str::FromStr;
 use std::sync::Mutex;
+use std::time::Instant;
 use tauri::{Emitter, Manager, State};
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 
@@ -2287,10 +2288,66 @@ async fn engine_set_dry_run(state: State<'_, AppState>, on: bool) -> Result<(), 
 
 /// `viewer`+ (plan W3-B2): read the engine's arm/dry-run snapshot. Read-only,
 /// so not audited (same convention as every other read command here).
+/// `Instant::now()` is the real wall clock - this command IS the wiring layer
+/// H10 ②'s injected-`now` design defers to (see `EngineControl::status`'s doc
+/// comment).
 #[tauri::command]
 async fn engine_status(state: State<'_, AppState>) -> Result<EngineStatus, BantoError> {
     require_role(&state, Role::Viewer, "engine").await?;
-    Ok(current_engine_control(&state).await?.status())
+    Ok(current_engine_control(&state).await?.status(Instant::now()))
+}
+
+/// Body of [`engine_config_get`] (see [`engine_arm_body`] for the split
+/// pattern). H10 ②: any authenticated role may read this - same rationale as
+/// `monitor_config_get_body`.
+async fn engine_config_get_body(state: &AppState) -> Result<ArmSettings, BantoError> {
+    require_role(state, Role::Viewer, "settings").await?;
+    state.settings.arm_config().await
+}
+
+/// `viewer`+ (H10 ②): current `arm.auto_disarm_secs` setting.
+#[tauri::command]
+async fn engine_config_get(state: State<'_, AppState>) -> Result<ArmSettings, BantoError> {
+    engine_config_get_body(&state).await
+}
+
+/// Body of [`engine_config_apply`] (see [`engine_arm_body`] for the split
+/// pattern).
+async fn engine_config_apply_body(
+    state: &AppState,
+    auto_disarm_secs: u64,
+) -> Result<ArmSettings, BantoError> {
+    let actor = require_role(state, Role::Admin, "settings").await?;
+    let config = ArmSettings { auto_disarm_secs };
+    state.settings.set_arm_config(&config).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "settings_change",
+            resource: "settings",
+            entity_id: None,
+            detail: Some(serde_json::json!({ "armAutoDisarmSecs": auto_disarm_secs })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    state.settings.arm_config().await
+}
+
+/// `admin`-only (H10 ②): persist the `arm.auto_disarm_secs` setting. Mirrors
+/// `monitor_config_apply`'s shape exactly - same `settings_change`/
+/// `resource: "settings"` audit entry. NOTE: takes effect for the CURRENTLY
+/// running engine only on the next `engine_reload` (the running `ArmingState`
+/// was built from the value in effect at the last start/reload, same as every
+/// other `EngineConfig` tunable) - the settings screen surfaces this.
+#[tauri::command]
+async fn engine_config_apply(
+    state: State<'_, AppState>,
+    auto_disarm_secs: u64,
+) -> Result<ArmSettings, BantoError> {
+    engine_config_apply_body(&state, auto_disarm_secs).await
 }
 
 // --- タグモニタ (feature/tag-monitor) ----------------------------------------
@@ -2470,11 +2527,18 @@ async fn engine_reload_body(state: &AppState) -> Result<EngineStatus, BantoError
     if let Some(old) = engine_slot.take() {
         old.shutdown().await;
     }
+    // H10 ②: re-read `arm.auto_disarm_secs` on every reload so a settings
+    // change actually takes effect (the running `ArmingState` is fixed for
+    // its lifetime - see `EngineConfig.auto_disarm`'s doc comment).
+    let arm_config = state.settings.arm_config().await?;
+    let engine_config = EngineConfig {
+        auto_disarm: arm_config.auto_disarm(),
+        ..EngineConfig::default()
+    };
     // Rebuild from the CURRENT DB (enabled connections + rules). The rebuilt
     // engine always starts DISARMED - never auto-re-arm (invariant §1).
-    let (engine, control) =
-        Engine::start_from_db(state.pool.clone(), EngineConfig::default()).await?;
-    let status = control.status();
+    let (engine, control) = Engine::start_from_db(state.pool.clone(), engine_config).await?;
+    let status = control.status(Instant::now());
     *state.engine_control.lock().await = Some(control);
     *engine_slot = Some(engine);
     Ok(status)
@@ -2521,7 +2585,7 @@ async fn project_import_body(
     // -> import is allowed. The control is cloned out from under the lock so
     // this does not hold the engine lock across the import.
     let armed = match state.engine_control.lock().await.clone() {
-        Some(control) => control.status().armed,
+        Some(control) => control.status(Instant::now()).armed,
         None => false,
     };
     if armed {
@@ -2790,6 +2854,16 @@ pub fn run() {
                 None
             };
 
+            // H10 ② (2026-08-08 オーナー決定 `docs/improvement-plan.md` H10):
+            // read `arm.auto_disarm_secs` BEFORE starting the engine below, so
+            // its `EngineConfig.auto_disarm` reflects the persisted setting
+            // from the very first start (not just after a later
+            // `engine_reload`). `.expect(...)` mirrors the `server_config`/
+            // `auth_config` reads just below this block - a plain settings
+            // read against a healthy DB "should succeed".
+            let arm_config = tauri::async_runtime::block_on(settings.arm_config())
+                .expect("arm_config should succeed");
+
             // W3-B2: build and START the auto-write engine from the current DB
             // (enabled SLMP connections + enabled rules), BEFORE the LAN server
             // auto-start below - the embedded server shares this engine's
@@ -2803,7 +2877,10 @@ pub fn run() {
             let (initial_engine, initial_engine_control) =
                 match tauri::async_runtime::block_on(Engine::start_from_db(
                     pool.clone(),
-                    EngineConfig::default(),
+                    EngineConfig {
+                        auto_disarm: arm_config.auto_disarm(),
+                        ..EngineConfig::default()
+                    },
                 )) {
                     Ok((engine, control)) => (Some(engine), Some(control)),
                     Err(err) => {
@@ -3011,6 +3088,8 @@ pub fn run() {
             engine_disarm,
             engine_set_dry_run,
             engine_status,
+            engine_config_get,
+            engine_config_apply,
             engine_reload,
             monitor_group_read,
             monitor_tag_write,
@@ -4038,9 +4117,15 @@ mod tests {
         );
 
         // And `engine_status`'s snapshot reflects the flip.
-        let status = current_engine_control(&state).await.unwrap().status();
+        let status = current_engine_control(&state)
+            .await
+            .unwrap()
+            .status(Instant::now());
         assert!(status.armed);
         assert!(!status.dry_run);
+        // H10 ②: the default 8h auto-disarm window is now running.
+        assert_eq!(status.arm_auto_disarm_secs, Some(28_800));
+        assert!(status.arm_remaining_secs.is_some());
     }
 
     /// dry-run toggle requires only `editor` (safety-positive): an editor can
@@ -4076,7 +4161,10 @@ mod tests {
             .expect("create viewer");
         *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
 
-        let status = current_engine_control(&state).await.unwrap().status();
+        let status = current_engine_control(&state)
+            .await
+            .unwrap()
+            .status(Instant::now());
         require_role(&state, Role::Viewer, "engine")
             .await
             .expect("viewer may read status");

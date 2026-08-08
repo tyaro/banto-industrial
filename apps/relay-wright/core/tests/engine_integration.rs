@@ -587,6 +587,122 @@ async fn rate_limit_storm_trips_breaker_and_auto_disarms() {
 }
 
 // ---------------------------------------------------------------------------
+// H10 ②: a tiny auto-disarm window fires, persists, and is audited - even
+// with the engine otherwise idle (no rule ever firing). A large/disabled
+// window must leave the engine armed.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tiny_auto_disarm_window_fires_persists_and_is_audited_while_idle() {
+    let f = Fixture::new().await;
+    // No rules/tags at all - proves `run_engine_loop` checks expiry on EVERY
+    // tick unconditionally, not only when `Writer::process` runs (it cannot:
+    // there is nothing here for it to ever process).
+    let config = EngineConfig {
+        auto_disarm: Some(Duration::from_millis(200)),
+        ..fast_config()
+    };
+    let (engine, control) = Engine::start(f.pool.clone(), connections(&f).await, config)
+        .await
+        .expect("engine start");
+    control.arm(Some("tester")).await.unwrap();
+    assert!(control.is_armed());
+
+    assert!(
+        wait_until(Duration::from_secs(5), || !control.is_armed()).await,
+        "the tiny arm window should have auto-disarmed the idle engine"
+    );
+    assert!(
+        wait_for_count(&f.pool, "disarm", "ok", 1, Duration::from_secs(5)).await,
+        "the auto-disarm must be audited as a disarm/ok row"
+    );
+    assert_eq!(
+        count(&f.pool, "disarm", "ok").await,
+        1,
+        "exactly one auto-disarm audit row, not a double-audit"
+    );
+
+    // H10 ②: unlike the rate-limit trip path, expiry must PERSIST the disarm
+    // to `armed_state` (so the DB/UI history is not left stale).
+    let persisted: i64 = sqlx::query_scalar("SELECT armed_persisted FROM armed_state WHERE id = 1")
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(persisted, 0, "the auto-disarm must be persisted");
+
+    let (detail, actor): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT detail, actor_username FROM write_audit_log \
+         WHERE action = 'disarm' AND result = 'ok'",
+    )
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        detail.as_deref(),
+        Some("engine auto-disarmed: arm window elapsed")
+    );
+    assert_eq!(actor, None, "an automatic expiry has no human actor");
+
+    tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
+        .await
+        .expect("shutdown must not hang");
+}
+
+#[tokio::test]
+async fn a_large_auto_disarm_window_leaves_the_engine_armed() {
+    let f = Fixture::new().await;
+    let config = EngineConfig {
+        auto_disarm: Some(Duration::from_secs(3600)),
+        ..fast_config()
+    };
+    let (engine, control) = Engine::start(f.pool.clone(), connections(&f).await, config)
+        .await
+        .expect("engine start");
+    control.arm(Some("tester")).await.unwrap();
+
+    // Give the loop plenty of ticks to (incorrectly) expire if the window
+    // were not being respected.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        control.is_armed(),
+        "a window far in the future must not auto-disarm"
+    );
+    assert_eq!(
+        count(&f.pool, "disarm", "ok").await,
+        0,
+        "no auto-disarm audit row should exist"
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
+        .await
+        .expect("shutdown must not hang");
+}
+
+#[tokio::test]
+async fn auto_disarm_disabled_never_expires_even_when_armed_a_long_time() {
+    let f = Fixture::new().await;
+    let config = EngineConfig {
+        auto_disarm: None,
+        ..fast_config()
+    };
+    let (engine, control) = Engine::start(f.pool.clone(), connections(&f).await, config)
+        .await
+        .expect("engine start");
+    control.arm(Some("tester")).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        control.is_armed(),
+        "auto_disarm: None must disable the feature entirely"
+    );
+    assert_eq!(count(&f.pool, "disarm", "ok").await, 0);
+
+    tokio::time::timeout(Duration::from_secs(5), engine.shutdown())
+        .await
+        .expect("shutdown must not hang");
+}
+
+// ---------------------------------------------------------------------------
 // Falling edge mode behaves correctly end to end.
 // ---------------------------------------------------------------------------
 

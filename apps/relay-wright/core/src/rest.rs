@@ -127,6 +127,7 @@ use banto_tags::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::str::FromStr;
+use std::time::Instant;
 use tokio::sync::broadcast;
 
 use crate::audit::{AuditEntry, AuditLogService};
@@ -139,7 +140,7 @@ use crate::registry_cascade::{
     self, ConnectionCascadePreview, ConnectionCascadeSummary, GroupCascadePreview,
     GroupCascadeSummary,
 };
-use crate::settings::{AuditSettings, MonitorSettings, SettingsService};
+use crate::settings::{ArmSettings, AuditSettings, MonitorSettings, SettingsService};
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
 use crate::write_audit_query::{WriteAuditLogRow, WriteAuditLogService};
 use crate::write_rules::{WriteRuleDetail, WriteRuleInput, WriteRuleService};
@@ -2390,12 +2391,19 @@ async fn require_engine_role(
 /// paths act on the same live engine, and a Tauri-side `engine_reload` that
 /// swaps the slot is seen here automatically), plus `AuthState`/
 /// `AuditLogService` for the same RBAC gate + denial audit the Tauri commands
-/// apply. The arm/disarm/dry-run AUDIT itself is written INSIDE `EngineControl`
-/// (to `write_audit_log`), so these handlers add ONLY authorization + actor
-/// resolution - never a second audit.
+/// apply, plus (H10 ②) `SettingsService` for `GET`/`PUT /api/engine/config`'s
+/// `arm.auto_disarm_secs` - unlike H2's `manual_write_enabled`, this setting
+/// genuinely belongs to `/api/engine/*` (it configures arm behavior itself),
+/// so it is added directly here rather than via a separate state struct like
+/// [`MonitorState`]. The arm/disarm/dry-run AUDIT itself is written INSIDE
+/// `EngineControl` (to `write_audit_log`), so these handlers add ONLY
+/// authorization + actor resolution - never a second audit; the config
+/// endpoints below audit their own `settings_change` entry directly (same
+/// shape as `monitor_config_apply`).
 #[derive(Clone)]
 struct EngineState {
     control: SharedEngineControl,
+    settings: SettingsService,
     auth: AuthState,
     audit: AuditLogService,
 }
@@ -2495,14 +2503,69 @@ async fn engine_dry_run(
 
 /// `GET /api/engine/status` (viewer+): the engine's arm/dry-run snapshot.
 /// Read-only, so not audited (any authenticated role - the router's
-/// `require_auth` is the only gate).
+/// `require_auth` is the only gate). `Instant::now()` is the real wall clock -
+/// this handler IS the wiring layer H10 ②'s injected-`now` design defers to
+/// (see `EngineControl::status`'s doc comment).
 async fn engine_status(State(state): State<EngineState>) -> Result<Json<EngineStatus>, ApiError> {
-    Ok(Json(engine_control_now(&state.control).await?.status()))
+    Ok(Json(
+        engine_control_now(&state.control)
+            .await?
+            .status(Instant::now()),
+    ))
+}
+
+/// `GET /api/engine/config` (viewer+, H10 ②): the current `arm.auto_disarm_secs`
+/// setting. Viewer+ (not admin-only) because the engine page itself needs
+/// this for every role that can view it (to render the auto-disarm status),
+/// same rationale as `monitor_config_get`'s doc comment. Read-only, so not
+/// audited.
+async fn engine_config_get(
+    State(state): State<EngineState>,
+) -> Result<Json<ArmSettings>, ApiError> {
+    Ok(Json(state.settings.arm_config().await?))
+}
+
+/// `PUT /api/engine/config` (admin, H10 ②): persist the `arm.auto_disarm_secs`
+/// setting. Mirrors `monitor_config_apply`'s shape exactly - same
+/// `settings_change`/`resource: "settings"` audit entry convention, same
+/// admin-only floor via [`require_engine_role`].
+async fn engine_config_apply(
+    State(state): State<EngineState>,
+    headers: HeaderMap,
+    Json(config): Json<ArmSettings>,
+) -> Result<Json<ArmSettings>, ApiError> {
+    let actor = require_engine_role(
+        &state.auth,
+        &state.audit,
+        &headers,
+        Role::Admin,
+        "settings",
+        "PUT",
+        "/api/engine/config",
+    )
+    .await?;
+    state.settings.set_arm_config(&config).await?;
+    let identity = actor_identity(&headers, &state.auth);
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor),
+            actor_role: identity.as_ref().map(|i| i.role.as_str()),
+            action: "settings_change",
+            resource: "settings",
+            entity_id: None,
+            detail: Some(json!({ "armAutoDisarmSecs": config.auto_disarm_secs })),
+            origin: "rest",
+            result: "ok",
+        })
+        .await;
+    Ok(Json(state.settings.arm_config().await?))
 }
 
 /// `/api/engine/*` (invariant §1 両経路対称, plan W3-B2): arm/disarm (admin),
-/// dry-run (editor), status (viewer+). Guarded by `require_auth` for the whole
-/// router (status needs no more); the mutating handlers each additionally call
+/// dry-run (editor), status (viewer+), config read viewer+ / config write
+/// admin (H10 ②). Guarded by `require_auth` for the whole router (status/config
+/// read need no more); the mutating handlers each additionally call
 /// [`require_engine_role`] with their floor - the same read/write floor split
 /// as [`write_registry_router`].
 ///
@@ -2513,9 +2576,15 @@ async fn engine_status(State(state): State<EngineState>) -> Result<Json<EngineSt
 /// transparently reflected by every route above (arm/disarm/dry-run/status act
 /// on the rebuilt engine with no REST change). Exposing reload over REST is
 /// left to a later milestone if a headless deployment ever needs it.
-fn engine_router(control: SharedEngineControl, audit: AuditLogService, auth: AuthState) -> Router {
+fn engine_router(
+    control: SharedEngineControl,
+    settings: SettingsService,
+    audit: AuditLogService,
+    auth: AuthState,
+) -> Router {
     let state = EngineState {
         control,
+        settings,
         auth: auth.clone(),
         audit,
     };
@@ -2524,6 +2593,10 @@ fn engine_router(control: SharedEngineControl, audit: AuditLogService, auth: Aut
         .route("/api/engine/disarm", post(engine_disarm))
         .route("/api/engine/dry-run", post(engine_dry_run))
         .route("/api/engine/status", get(engine_status))
+        .route(
+            "/api/engine/config",
+            get(engine_config_get).put(engine_config_apply),
+        )
         .with_state(state)
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
@@ -2830,7 +2903,7 @@ async fn project_import_handler(
     // Arm guard: refuse while the engine is live. No engine started -> nothing
     // is armed, so import is allowed.
     let armed = match state.control.lock().await.clone() {
-        Some(control) => control.status().armed,
+        Some(control) => control.status(Instant::now()).armed,
         None => false,
     };
     if armed {
@@ -2960,6 +3033,7 @@ pub fn api_router(
         .merge(write_audit_log_router(write_audit_log, auth.clone()))
         .merge(engine_router(
             engine_control.clone(),
+            settings.clone(),
             audit.clone(),
             auth.clone(),
         ))
@@ -5363,7 +5437,9 @@ mod tests {
     }
 
     /// A `viewer` can read the engine status over REST (200) - status is
-    /// viewer+ (the router's `require_auth` is the only gate).
+    /// viewer+ (the router's `require_auth` is the only gate). Also covers
+    /// H10 ②'s new status fields: the default 8h window is reported even
+    /// while disarmed, and `armRemainingSecs` is `null` until armed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rest_viewer_can_read_engine_status() {
         let (router, _pool, _admin, _editor, viewer) = router_with_role_tokens_and_engine().await;
@@ -5373,7 +5449,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(body_json(response).await["armed"], false);
+        let body = body_json(response).await;
+        assert_eq!(body["armed"], false);
+        assert_eq!(body["armAutoDisarmSecs"], 28_800);
+        assert!(body["armRemainingSecs"].is_null());
+    }
+
+    /// H10 ②: `GET /api/engine/config` is viewer+ (the engine page needs it
+    /// for every role), defaults to `autoDisarmSecs: 28800` (8h);
+    /// `PUT /api/engine/config` is admin-only (editor/viewer get 403) and,
+    /// once applied by an admin, round-trips through a following `GET` and
+    /// records a `settings_change`/`resource: "settings"` audit entry -
+    /// mirroring `rest_monitor_config_apply_is_admin_only_and_audited` exactly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rest_engine_config_apply_is_admin_only_and_audited() {
+        let (router, pool, admin, editor, viewer) = router_with_role_tokens_and_engine().await;
+
+        for token in [&admin, &editor, &viewer] {
+            let response = router
+                .clone()
+                .oneshot(get_auth("/api/engine/config", token))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "config read is viewer+");
+            assert_eq!(body_json(response).await["autoDisarmSecs"], 28_800);
+        }
+
+        for token in [&editor, &viewer] {
+            let response = router
+                .clone()
+                .oneshot(put_json(
+                    "/api/engine/config",
+                    token,
+                    json!({ "autoDisarmSecs": 3600 }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "token role mismatch"
+            );
+        }
+
+        let apply_response = router
+            .clone()
+            .oneshot(put_json(
+                "/api/engine/config",
+                &admin,
+                json!({ "autoDisarmSecs": 3600 }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(apply_response.status(), StatusCode::OK);
+        assert_eq!(body_json(apply_response).await["autoDisarmSecs"], 3600);
+
+        let get_response = router
+            .clone()
+            .oneshot(get_auth("/api/engine/config", &admin))
+            .await
+            .unwrap();
+        assert_eq!(body_json(get_response).await["autoDisarmSecs"], 3600);
+
+        let entries = AuditLogService::new(pool.clone())
+            .list(ListParams::default())
+            .await
+            .unwrap();
+        let entry = entries
+            .rows
+            .iter()
+            .find(|r| r.action == "settings_change" && r.resource == "settings")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected a settings_change/settings entry, got {:?}",
+                    entries.rows
+                )
+            });
+        assert_eq!(entry.origin, "rest");
+        assert_eq!(entry.result, "ok");
+        assert_eq!(entry.actor_username.as_deref(), Some("admin"));
     }
 
     // --- タグモニタ dual-path (feature/tag-monitor) ---------------------------

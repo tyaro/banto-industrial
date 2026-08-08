@@ -4,11 +4,11 @@
  * three-environment split as `writeRegistryAdmin.ts`/`auditLogAdmin.ts`:
  *
  * - Tauri webview -> `invoke()` the `engine_arm`/`engine_disarm`/
- *   `engine_set_dry_run`/`engine_status`/`engine_reload` commands
- *   (`apps/relay-wright/src-tauri/src/lib.rs`).
+ *   `engine_set_dry_run`/`engine_status`/`engine_reload`/`engine_config_get`/
+ *   `engine_config_apply` commands (`apps/relay-wright/src-tauri/src/lib.rs`).
  * - LAN browser served by the embedded server -> `fetch()` the
- *   `/api/engine/arm|disarm|dry-run|status` REST routes
- *   (`apps/relay-wright/core/src/rest.rs`).
+ *   `/api/engine/arm|disarm|dry-run|status` and `GET`/`PUT /api/engine/config`
+ *   REST routes (`apps/relay-wright/core/src/rest.rs`).
  * - Plain `vite dev`/`vite preview` demo -> no engine at all, so every call
  *   rejects with `DEMO_MODE_MESSAGE`; `isEngineAvailable()` lets the page show
  *   the note up front.
@@ -20,8 +20,15 @@
  * hide/disable the reload control and surface 「デスクトップ版のみ」.
  *
  * RBAC (invariant §1 両経路対称, enforced on the backend too): arm/disarm/
- * reload = admin, dry-run = editor, status = viewer+. The page role-gates the
- * controls via `permissions.ts`; the backend is the authority.
+ * reload = admin, dry-run = editor, status = viewer+, config read = viewer+,
+ * config write = admin. The page role-gates the controls via
+ * `permissions.ts`; the backend is the authority.
+ *
+ * H10 ② (2026-08-08 オーナー決定, `docs/improvement-plan.md` H10): timed arm
+ * auto-expiry. `getArmConfig`/`setArmConfig` expose the `arm.auto_disarm_secs`
+ * setting (0 = disabled, default 28800 = 8h); `EngineStatus.armAutoDisarmSecs`/
+ * `armRemainingSecs` report the configured window and remaining time so the
+ * engine page can show "自動 disarm まで約 N 分".
  */
 import { invoke } from '@tauri-apps/api/core';
 import { getAuthProvider, isProviderError, ProviderError, type ErrorBody } from '@banto/admin-core';
@@ -37,6 +44,24 @@ export interface EngineStatus {
 	 * this drives only the "前回はアーム状態でした" banner, never behavior.
 	 */
 	wasArmedBeforeRestart: boolean;
+	/**
+	 * H10 ②: the configured auto-disarm window in seconds, or `null` if the
+	 * feature is disabled (`arm.auto_disarm_secs = 0`). Present regardless of
+	 * whether the engine is currently armed.
+	 */
+	armAutoDisarmSecs: number | null;
+	/**
+	 * H10 ②: seconds remaining until auto-disarm, or `null` when disarmed or
+	 * the feature is disabled. A snapshot as of the last `getStatus()` call -
+	 * not a live countdown (the page may derive one locally if desired).
+	 */
+	armRemainingSecs: number | null;
+}
+
+/** Mirrors `relay_wright_core::settings::ArmSettings` (camelCase on the wire, H10 ②). */
+export interface ArmConfig {
+	/** Seconds until auto-disarm after arming; `0` disables the feature. */
+	autoDisarmSecs: number;
 }
 
 export const DEMO_MODE_MESSAGE = 'デモモードでは利用できません';
@@ -199,4 +224,32 @@ export async function reload(): Promise<EngineStatus> {
 		throw new ProviderError({ kind: 'other', message: RELOAD_DESKTOP_ONLY_MESSAGE });
 	}
 	return invokeCommand<EngineStatus>('engine_reload');
+}
+
+/**
+ * Current arm 時限失効設定 (H10 ②). Any authenticated role may call this - the
+ * engine page needs it for every role to render the auto-disarm status, not
+ * just an admin-only settings screen (same rationale as `getMonitorConfig`'s
+ * doc comment).
+ */
+export async function getArmConfig(): Promise<ArmConfig> {
+	if (!isEngineAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri') return invokeCommand<ArmConfig>('engine_config_get');
+	return httpRequest<ArmConfig>('/api/engine/config', { method: 'GET' });
+}
+
+/**
+ * Persist the `autoDisarmSecs` setting (H10 ②). `admin`-only (rejected with a
+ * `forbidden` `ProviderError` otherwise). NOTE: only takes effect for the
+ * running engine on the next `reload()` (Tauri) or process restart (LAN
+ * server) - the settings screen should say so.
+ */
+export async function setArmConfig(config: ArmConfig): Promise<ArmConfig> {
+	if (!isEngineAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri') {
+		return invokeCommand<ArmConfig>('engine_config_apply', {
+			autoDisarmSecs: config.autoDisarmSecs
+		});
+	}
+	return httpRequest<ArmConfig>('/api/engine/config', { method: 'PUT', body: config });
 }

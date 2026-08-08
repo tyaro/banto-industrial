@@ -26,6 +26,12 @@
 		type MonitorConfig
 	} from '$lib/banto/monitorAdmin';
 	import {
+		getArmConfig,
+		isEngineAvailable,
+		setArmConfig,
+		type ArmConfig
+	} from '$lib/banto/engineAdmin';
+	import {
 		cancelPendingRestore,
 		createBackup,
 		downloadBackup,
@@ -398,6 +404,50 @@
 			toastStore.push('error', errorMessage(err));
 		} finally {
 			applyingMonitor = false;
+		}
+	}
+
+	// --- H10 ②(2026-08-08 オーナー決定, docs/improvement-plan.md H10): arm
+	// 時限失効の設定 -----------------------------------------------------------
+	// Same "not Tauri-only" shape as the monitor/audit sections above
+	// (`engineAdmin.ts` has a REST fallback, `GET`/`PUT /api/engine/config`) so
+	// a LAN browser admin can also change this, not just the desktop app.
+	const armConfigAvailable = isEngineAvailable();
+
+	let armConfig = $state<ArmConfig | null>(null);
+	// 0 は「無効」の wire センチネル（既定 28800 秒 = 8時間 = 1シフト）。
+	let autoDisarmSecsDraft = $state(28_800);
+	let applyingArmConfig = $state(false);
+	let armConfigError: string | null = $state(null);
+
+	function applyArmConfigToDrafts(config: ArmConfig): void {
+		armConfig = config;
+		autoDisarmSecsDraft = config.autoDisarmSecs;
+	}
+
+	$effect(() => {
+		if (!armConfigAvailable || !isAdmin(sessionStore.role)) return;
+		void (async () => {
+			try {
+				applyArmConfigToDrafts(await getArmConfig());
+			} catch (err) {
+				armConfigError = errorMessage(err);
+			}
+		})();
+	});
+
+	async function saveArmConfig(): Promise<void> {
+		applyingArmConfig = true;
+		armConfigError = null;
+		try {
+			applyArmConfigToDrafts(
+				await setArmConfig({ autoDisarmSecs: Math.max(0, Math.trunc(autoDisarmSecsDraft)) })
+			);
+			toastStore.push('success', 'arm 自動 disarm の設定を更新しました');
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			applyingArmConfig = false;
 		}
 	}
 
@@ -817,6 +867,42 @@
 				有効にすると、タグモニタからの手動書き込みは arm / レート制限 / dry-run
 				の対象外になります。disarm
 				中でも物理書き込みが行われます。無効時はモニタ画面での手動書き込みが拒否されます（既定は無効）。変更は監査ログに記録されます。
+			</p>
+		</section>
+	{/if}
+
+	{#if armConfigAvailable && isAdmin(sessionStore.role)}
+		<section>
+			<h2>アーム時限失効（H10）</h2>
+
+			<div class="fields">
+				<label class="field">
+					自動 disarm までの秒数（0 = 無効）
+					<input type="number" min="0" step="1" bind:value={autoDisarmSecsDraft} />
+				</label>
+			</div>
+
+			<button type="button" onclick={saveArmConfig} disabled={applyingArmConfig}>保存</button>
+
+			{#if armConfigError}
+				<p class="error">{armConfigError}</p>
+			{/if}
+
+			{#if armConfig}
+				<p class="status">
+					現在の設定:
+					<strong>
+						{armConfig.autoDisarmSecs > 0
+							? `${(armConfig.autoDisarmSecs / 3600).toLocaleString()}時間（${armConfig.autoDisarmSecs.toLocaleString()}秒）`
+							: '無効'}
+					</strong>
+				</p>
+			{/if}
+
+			<p class="note">
+				エンジンをアームしてから指定した秒数が経過すると、自動的にディスアームされます（既定 28800秒
+				= 8時間 =
+				1シフト）。0を入力すると自動失効を無効にします。自動ディスアームは監査ログに記録されます。設定変更は次回のエンジン再構築（リロード）または再起動から反映されます。
 			</p>
 		</section>
 	{/if}

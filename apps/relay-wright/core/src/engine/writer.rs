@@ -23,6 +23,23 @@
 //! dry-run can never trip the breaker - there is no physical write storm to
 //! guard against.
 //!
+//! ## H10 ②: timed arm auto-expiry
+//!
+//! [`Writer::enforce_arm_expiry`] is a SEPARATE entry point from
+//! [`Writer::process`] above, called once per tick from
+//! [`crate::engine::run_engine_loop`] regardless of whether any rule fired
+//! that tick. It must live outside `process` because `process` only runs on a
+//! pending write - an idle armed engine (no rule ever firing) would otherwise
+//! never notice its window elapsed. On expiry it performs a FULL disarm: the
+//! in-memory flag, `armed_state` persistence, AND one `disarm` audit row -
+//! deliberately MORE than step 3's rate-limit trip above (which only flips
+//! the flag + audits, and does NOT persist - an accepted, pre-existing
+//! asymmetry this milestone does not touch). A silent, unpersisted expiry
+//! would leave `armed_state`/the UI's "current state" history stale for an
+//! engine that is idle for hours, which is precisely the case H10 ② exists to
+//! cover - so persistence is not optional here the way it is for the
+//! rate-limit path (which trips on an active write storm, not idle time).
+//!
 //! ## Single-tasked
 //!
 //! The engine drives one writer from one task, feeding it [`PendingWrite`]s one
@@ -42,7 +59,7 @@ use super::arming::ArmingState;
 use super::rate_limiter::RateLimiter;
 use super::rule_engine::{plc_value_as_f64, PendingWrite, WireShape};
 use super::write_audit::{
-    insert_pending_fire, insert_row, set_result, AuditAction, AuditResult, AuditRow,
+    insert_pending_fire, insert_row, persist_armed, set_result, AuditAction, AuditResult, AuditRow,
 };
 
 /// How many characters of a string source/written value are kept in the audit
@@ -193,6 +210,36 @@ impl Writer {
         set_result(&self.pool, audit_id, final_result).await?;
         Ok(())
     }
+
+    /// H10 ②: enforce the arm auto-disarm window - called once per tick from
+    /// [`crate::engine::run_engine_loop`], unconditionally (even on a tick
+    /// with no pending writes). A no-op (`Ok(false)`) unless
+    /// [`ArmingState::is_expired`] says the configured window has elapsed for
+    /// the CURRENTLY armed engine; when it has, performs a full disarm - the
+    /// in-memory flag, `armed_state` persistence, and one `disarm` audit row
+    /// (`actor: None`, same convention as the automatic `rule_fire`/
+    /// `rate_limit_tripped` rows - no human triggered this) - see this
+    /// module's doc comment for why persistence is NOT optional here, unlike
+    /// the rate-limit trip path just above. Returns `Ok(true)` iff it just
+    /// disarmed, so callers/tests can tell a real expiry from a no-op tick.
+    pub async fn enforce_arm_expiry(
+        &mut self,
+        now: Instant,
+    ) -> Result<bool, banto_core::BantoError> {
+        if !self.arming.is_expired(now) {
+            return Ok(false);
+        }
+        self.arming.disarm();
+        persist_armed(&self.pool, false, None).await?;
+        let row = AuditRow::new(
+            AuditAction::Disarm,
+            AuditResult::Ok,
+            AuditAction::Disarm.as_str(),
+        )
+        .with_detail("engine auto-disarmed: arm window elapsed");
+        insert_row(&self.pool, &row).await?;
+        Ok(true)
+    }
 }
 
 /// Turn a resolved target and the value to write into the (numeric or string)
@@ -306,8 +353,10 @@ mod tests {
     #[tokio::test]
     async fn storm_trips_breaker_and_only_rearm_plus_window_slide_recovers() {
         let pool = init_db_memory().await.expect("in-memory db");
-        let arming = Arc::new(ArmingState::new(false));
-        arming.arm();
+        // `auto_disarm: None` - this test exercises the rate-limit trip path,
+        // not H10 ②'s timed expiry (see `enforce_arm_expiry_*` tests below).
+        let arming = Arc::new(ArmingState::new(false, None));
+        arming.arm(Instant::now());
         let (handle, _broker_task) = spawn_test_handle_answering_ok(1);
         let target = ResolvedTarget {
             connection_id: 1,
@@ -357,7 +406,7 @@ mod tests {
 
         // Manual re-arm alone is NOT enough while the window is still full:
         // the very next intent inside the window trips the breaker again.
-        arming.arm();
+        arming.arm(Instant::now());
         writer
             .process(pending(5, 104.0), t0 + Duration::from_secs(30))
             .await
@@ -370,7 +419,7 @@ mod tests {
 
         // Re-arm AND slide the window past both recorded writes (at t0 and
         // t0+1s; both are >= 60s old at t0+62s): the write goes through.
-        arming.arm();
+        arming.arm(Instant::now());
         writer
             .process(pending(6, 105.0), t0 + Duration::from_secs(62))
             .await
@@ -387,8 +436,8 @@ mod tests {
     #[tokio::test]
     async fn string_write_audits_text_in_detail_and_leaves_numeric_columns_null() {
         let pool = init_db_memory().await.expect("in-memory db");
-        let arming = Arc::new(ArmingState::new(false));
-        arming.arm();
+        let arming = Arc::new(ArmingState::new(false, None));
+        arming.arm(Instant::now());
         let (handle, _broker_task) = spawn_test_handle_answering_ok(1);
         let target = ResolvedTarget {
             connection_id: 1,
@@ -427,5 +476,104 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&detail).unwrap();
         assert_eq!(parsed["sourceText"], "OK");
         assert_eq!(parsed["writtenText"], "NG");
+    }
+
+    // --- H10 ②: timed arm auto-expiry (`Writer::enforce_arm_expiry`) --------
+    //
+    // `arming.rs`'s own unit tests prove `is_expired`/`remaining` in
+    // isolation (no DB); these two prove the WIRING - that a real expiry
+    // actually disarms, persists to `armed_state`, and writes exactly one
+    // `disarm`/`ok` audit row (not a double-audit on a later no-op tick).
+    // The full end-to-end proof (a running engine loop actually calling this
+    // every tick) lives in `tests/engine_integration.rs`.
+
+    /// Before the configured window elapses, a tick must be a clean no-op:
+    /// still armed, `armed_state` untouched, no `disarm` row.
+    #[tokio::test]
+    async fn enforce_arm_expiry_is_a_noop_before_the_window_elapses() {
+        let pool = init_db_memory().await.expect("in-memory db");
+        let arming = Arc::new(ArmingState::new(false, Some(Duration::from_secs(100))));
+        let t0 = Instant::now();
+        arming.arm(t0);
+        let mut writer = Writer::new(
+            pool.clone(),
+            arming.clone(),
+            RateLimiter::new(RateLimitConfig::default()),
+            HashMap::new(),
+            HashMap::new(),
+        );
+
+        let disarmed = writer
+            .enforce_arm_expiry(t0 + Duration::from_secs(50))
+            .await
+            .unwrap();
+        assert!(!disarmed, "must be a no-op before the window elapses");
+        assert!(arming.is_armed(), "must still be armed");
+        assert_eq!(count(&pool, "disarm", "ok").await, 0);
+    }
+
+    /// Once the window elapses, `enforce_arm_expiry` performs a FULL disarm -
+    /// the in-memory flag, `armed_state` persistence (unlike the rate-limit
+    /// trip path, which deliberately does NOT persist - see this module's
+    /// doc comment), and exactly one `disarm`/`ok` audit row with the
+    /// distinguishing detail text and no actor. A later no-op tick (already
+    /// disarmed) must not write a second row.
+    #[tokio::test]
+    async fn enforce_arm_expiry_disarms_persists_and_audits_exactly_once() {
+        let pool = init_db_memory().await.expect("in-memory db");
+        let arming = Arc::new(ArmingState::new(false, Some(Duration::from_secs(100))));
+        let t0 = Instant::now();
+        arming.arm(t0);
+        let mut writer = Writer::new(
+            pool.clone(),
+            arming.clone(),
+            RateLimiter::new(RateLimitConfig::default()),
+            HashMap::new(),
+            HashMap::new(),
+        );
+
+        let disarmed = writer
+            .enforce_arm_expiry(t0 + Duration::from_secs(100))
+            .await
+            .unwrap();
+        assert!(disarmed, "the window has elapsed exactly at the deadline");
+        assert!(!arming.is_armed(), "the live flag must flip");
+
+        let persisted: i64 =
+            sqlx::query_scalar("SELECT armed_persisted FROM armed_state WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            persisted, 0,
+            "expiry must PERSIST the disarm (unlike the rate-limit trip path)"
+        );
+
+        assert_eq!(count(&pool, "disarm", "ok").await, 1);
+        let (detail, actor): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT detail, actor_username FROM write_audit_log \
+             WHERE action = 'disarm' AND result = 'ok'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            detail.as_deref(),
+            Some("engine auto-disarmed: arm window elapsed")
+        );
+        assert_eq!(actor, None, "an automatic expiry has no human actor");
+
+        // Already disarmed: a later tick must be a clean no-op, never a
+        // second audit row.
+        let disarmed_again = writer
+            .enforce_arm_expiry(t0 + Duration::from_secs(200))
+            .await
+            .unwrap();
+        assert!(!disarmed_again);
+        assert_eq!(
+            count(&pool, "disarm", "ok").await,
+            1,
+            "must not double-audit"
+        );
     }
 }

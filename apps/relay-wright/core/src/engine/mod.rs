@@ -33,6 +33,14 @@
 //!    before calling `broker.write`; every suppressed case is audited too.
 //! 6. **Dry-run** - dry-run evaluates and audits would-be writes but never
 //!    calls `broker.write`.
+//! 7. **Timed arm auto-expiry (H10 ②, 2026-08-08 オーナー決定
+//!    `docs/improvement-plan.md` H10)** - [`arming::ArmingState`] records when
+//!    the engine was armed and a configurable window (default 8h = 1 shift);
+//!    [`writer::Writer::enforce_arm_expiry`], driven once per tick from
+//!    [`run_engine_loop`] (so it fires even while idle), performs a full
+//!    disarm - flag, `armed_state` persistence, AND an audit row - once the
+//!    window elapses, so an operator who forgets to disarm at shift end does
+//!    not leave live writes enabled indefinitely.
 //!
 //! ## Task/shutdown design
 //!
@@ -56,7 +64,7 @@ pub mod write_audit;
 pub mod writer;
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use banto_core::BantoError;
 use banto_tags::PlcConnection;
@@ -102,6 +110,15 @@ pub struct EngineConfig {
     pub backoff: BackoffConfig,
     /// Write rate-limit caps.
     pub rate: RateLimitConfig,
+    /// H10 ② (2026-08-08 オーナー決定 `docs/improvement-plan.md` H10): the
+    /// timed arm auto-expiry window - once armed, the engine auto-disarms
+    /// after this much wall time has elapsed (enforced by
+    /// [`writer::Writer::enforce_arm_expiry`], driven from [`run_engine_loop`]).
+    /// `None` disables the feature. Fed straight into [`arming::ArmingState::new`].
+    /// Default `Some(8h)` (1 シフト) - see [`crate::settings::ArmSettings`]
+    /// for the persisted `arm.auto_disarm_secs` setting this is sourced from
+    /// at engine start/reload (`0` there maps to `None` here).
+    pub auto_disarm: Option<Duration>,
 }
 
 impl Default for EngineConfig {
@@ -111,6 +128,10 @@ impl Default for EngineConfig {
             eval_interval: Duration::from_millis(500),
             backoff: BackoffConfig::default(),
             rate: RateLimitConfig::default(),
+            // H10 ②: 既定 8 時間 (1 シフト) = 28800 秒。
+            // `settings::ArmSettings::default`(`arm.auto_disarm_secs` の既定値)
+            // と同じ値 - 変える場合は両方揃えること。
+            auto_disarm: Some(Duration::from_secs(28_800)),
         }
     }
 }
@@ -124,6 +145,16 @@ pub struct EngineStatus {
     /// The persisted armed state observed at startup - informational only (the
     /// engine never auto-resumes live writing).
     pub was_armed_before_restart: bool,
+    /// H10 ②: the configured auto-disarm window in seconds, or `None` if the
+    /// feature is disabled (`arm.auto_disarm_secs = 0`). Configuration only -
+    /// present whether or not the engine is currently armed.
+    pub arm_auto_disarm_secs: Option<u64>,
+    /// H10 ②: seconds remaining until auto-disarm as of the `now` passed to
+    /// [`EngineControl::status`], or `None` when disarmed or the feature is
+    /// disabled. `Instant` is monotonic and has no meaningful absolute wire
+    /// representation, so only the remaining duration is exposed - never an
+    /// absolute deadline.
+    pub arm_remaining_secs: Option<u64>,
 }
 
 /// The safe control surface handed to the wiring layer (W3-B2's Tauri commands /
@@ -145,9 +176,13 @@ pub struct EngineControl {
 }
 
 impl EngineControl {
-    /// Arm the engine (allow physical writes). Persists + audits.
+    /// Arm the engine (allow physical writes). Persists + audits. Records
+    /// `Instant::now()` as the H10 ② arm timestamp the auto-expiry window
+    /// counts from - this is the wiring layer, so it is the one place allowed
+    /// to read the real clock (everything below `ArmingState` takes `now`
+    /// injected).
     pub async fn arm(&self, actor: Option<&str>) -> Result<(), BantoError> {
-        self.arming.arm();
+        self.arming.arm(Instant::now());
         persist_armed(&self.pool, true, actor).await?;
         self.audit_toggle(AuditAction::Arm, actor, "engine armed")
             .await
@@ -182,11 +217,18 @@ impl EngineControl {
         self.arming.is_dry_run()
     }
 
-    pub fn status(&self) -> EngineStatus {
+    /// A snapshot of the arm/dry-run state, including H10 ②'s auto-disarm
+    /// window/remaining time computed against the caller-supplied `now`
+    /// (`Instant` is monotonic - callers pass `Instant::now()`; see the
+    /// module doc's H10 ② note on why this crate has no injected-clock
+    /// abstraction at the wiring layer).
+    pub fn status(&self, now: Instant) -> EngineStatus {
         EngineStatus {
             armed: self.arming.is_armed(),
             dry_run: self.arming.is_dry_run(),
             was_armed_before_restart: self.arming.was_armed_before_restart(),
+            arm_auto_disarm_secs: self.arming.auto_disarm().map(|d| d.as_secs()),
+            arm_remaining_secs: self.arming.remaining(now).map(|d| d.as_secs()),
         }
     }
 
@@ -263,7 +305,7 @@ impl Engine {
 
         let cache = CurrentValues::new();
         let persisted_armed = load_persisted_armed(&pool).await?;
-        let arming = std::sync::Arc::new(ArmingState::new(persisted_armed));
+        let arming = std::sync::Arc::new(ArmingState::new(persisted_armed, config.auto_disarm));
 
         let rule_engine = RuleEngine::new(compiled.rules);
         let writer = Writer::new(
@@ -343,6 +385,15 @@ impl Engine {
 /// The evaluate+write task: on each tick, evaluate all rules against the cache
 /// and hand every firing intent to the writer (which applies the safety gate).
 /// Exits promptly on the shutdown signal.
+///
+/// H10 ②: also enforces the arm auto-disarm window on EVERY tick, before
+/// evaluating rules and unconditionally (not just when there is a pending
+/// write) - this is the only place idle-engine expiry can be caught, since
+/// `Writer::process` only runs when a rule actually fires. See
+/// [`writer::Writer::enforce_arm_expiry`]'s doc comment for the full
+/// reasoning. Checking it before `rule_engine.evaluate` means a write that
+/// would otherwise land in this same tick is correctly suppressed
+/// (`suppressed_disarmed`) rather than slipping through one tick late.
 async fn run_engine_loop(
     mut rule_engine: RuleEngine,
     mut writer: Writer,
@@ -357,6 +408,9 @@ async fn run_engine_loop(
             _ = shutdown.changed() => break,
             _ = ticker.tick() => {
                 let now = std::time::Instant::now();
+                if let Err(e) = writer.enforce_arm_expiry(now).await {
+                    eprintln!("relay-wright engine: arm auto-disarm audit error: {e}");
+                }
                 let pending: Vec<PendingWrite> = rule_engine.evaluate(&cache, now);
                 for write in pending {
                     if let Err(e) = writer.process(write, now).await {
