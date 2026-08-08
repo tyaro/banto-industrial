@@ -15,6 +15,14 @@
 	 * ようにし（`write:` プレフィックスは自動付与）、送信直前に配列へ
 	 * 組み立てる（`apiKeysAdmin.ts` の `CreateApiKeyInput.scopes` は
 	 * `string[]`）。
+	 *
+	 * H10 ①（docs/improvement-plan.md、2026-08-08 オーナー決定）: 有効期限
+	 * は `<input type="date">` で日付のみ受け取り、送信直前にその日の
+	 * ローカル終わり（23:59:59）の epoch ミリ秒へ変換する（「その日いっぱい
+	 * 有効」という直感に合わせるため - 0時にすると当日選択がほぼ確実に
+	 * 「現在時刻より未来」のサーバー側検証に落ちてしまう）。未入力なら
+	 * `null`（無期限、既定・動作不変）。一覧の警告バッジは
+	 * `apiKeysAdmin.ts` の `apiKeyWarnings`（純関数）で判定する。
 	 */
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '$lib/toast.svelte';
@@ -23,6 +31,7 @@
 		createApiKey,
 		revokeApiKey,
 		clearTripApiKey,
+		apiKeyWarnings,
 		type ApiKeySummary,
 		type IssuedApiKey
 	} from '$lib/banto/apiKeysAdmin';
@@ -43,10 +52,16 @@
 	let keys: ApiKeySummary[] = $state([]);
 	let loading = $state(false);
 
+	/** H10 ①: 一覧の警告バッジ（`apiKeyWarnings`）の判定基準時刻。ティッカー
+	 *  は持たず、一覧を読み直すたび（`reload()`）に更新する - 「今まさに
+	 *  1秒後に切り替わる」精度は不要な表示用途のため。 */
+	let nowMs = $state(Date.now());
+
 	async function reload(): Promise<void> {
 		loading = true;
 		try {
 			keys = await listApiKeys();
+			nowMs = Date.now();
 		} catch (err) {
 			toastStore.push('error', errorMessage(err));
 		} finally {
@@ -62,8 +77,20 @@
 	let name = $state('');
 	let readScope = $state(true);
 	let writeScopesText = $state('');
+	/** H10 ①: `"YYYY-MM-DD"` または空文字（空 = 無期限）。 */
+	let expiresAtInput = $state('');
 	let createErrors: Record<string, string> = $state({});
 	let creating = $state(false);
+
+	/** `expiresAtInput` を「その日のローカル終わり」の epoch ミリ秒へ変換
+	 *  する（このファイル冒頭の docblock「H10 ①」参照）。空/不正な日付なら
+	 *  `null`（無期限）。 */
+	function expiresAtMs(): number | null {
+		const trimmed = expiresAtInput.trim();
+		if (trimmed === '') return null;
+		const ms = new Date(`${trimmed}T23:59:59`).getTime();
+		return Number.isNaN(ms) ? null : ms;
+	}
 
 	/** issuedKey はこの画面を離れる/リロードすると失われる意図的な一時状態。 */
 	let issuedKey: IssuedApiKey | null = $state(null);
@@ -89,12 +116,13 @@
 				createErrors = { scopes: '少なくとも1つのスコープを指定してください' };
 				return;
 			}
-			issuedKey = await createApiKey({ name, scopes });
+			issuedKey = await createApiKey({ name, scopes, expiresAt: expiresAtMs() });
 			copied = false;
 			toastStore.push('success', '発行しました');
 			name = '';
 			readScope = true;
 			writeScopesText = '';
+			expiresAtInput = '';
 			await reload();
 		} catch (err) {
 			const fieldErrors = applyFieldErrors(err);
@@ -157,6 +185,13 @@
 	function formatLastUsed(ms: number | null): string {
 		return ms === null ? '未使用' : new Date(ms).toLocaleString('ja-JP');
 	}
+
+	/** H10 ①: 有効期限の表示（日付のみ - 発行フォームが日単位でしか
+	 *  受け付けないことに合わせる、`formatLastUsed` は日時まで出すが
+	 *  こちらは意図的に日付のみ）。 */
+	function formatExpiresAt(ms: number | null): string {
+		return ms === null ? '無期限' : new Date(ms).toLocaleDateString('ja-JP');
+	}
 </script>
 
 <div class="page">
@@ -204,6 +239,12 @@
 				>
 			</label>
 			{#if createErrors.scopes}<span class="err">{createErrors.scopes}</span>{/if}
+			<label class="field">
+				有効期限（任意）
+				<input type="date" bind:value={expiresAtInput} />
+				{#if createErrors.expiresAt}<span class="err">{createErrors.expiresAt}</span>{/if}
+				<span class="hint">未入力なら無期限（既定）。指定した日の終わりまで有効です。</span>
+			</label>
 		</div>
 		<button type="button" onclick={handleCreate} disabled={creating}>発行</button>
 	</section>
@@ -223,6 +264,7 @@
 						<th>スコープ</th>
 						<th>作成日時</th>
 						<th>最終使用</th>
+						<th>有効期限</th>
 						<th>状態</th>
 						<th>トリップ</th>
 						<th></th>
@@ -235,7 +277,20 @@
 							<td><code>{key.prefix}</code></td>
 							<td>{key.scopes.join(', ')}</td>
 							<td>{key.createdAt}</td>
-							<td>{formatLastUsed(key.lastUsedAt)}</td>
+							<td>
+								{formatLastUsed(key.lastUsedAt)}
+								{#if apiKeyWarnings(key, nowMs).longUnused}
+									<span class="badge badge-long-unused">長期未使用</span>
+								{/if}
+							</td>
+							<td>
+								{formatExpiresAt(key.expiresAt)}
+								{#if apiKeyWarnings(key, nowMs).expired}
+									<span class="badge badge-expired">期限切れ</span>
+								{:else if apiKeyWarnings(key, nowMs).expiringSoon}
+									<span class="badge badge-expiring-soon">期限接近</span>
+								{/if}
+							</td>
 							<td>{key.revokedAt === null ? '有効' : `失効済み（${key.revokedAt}）`}</td>
 							<td>
 								{#if key.trippedAt === null}
@@ -418,6 +473,36 @@
 
 	.trip-badge {
 		font-weight: 600;
+	}
+
+	/* H10 ①: 期限接近/期限切れ/長期未使用の警告バッジ。色分けは既存の
+	   `.warning`（危険 = --banto-danger の12%ミックス背景 + 前景色）と
+	   同じ手法を踏襲し、新しい色リテラルは増やさない - 深刻度の高い順に
+	   danger（期限切れ）> primary（期限接近、まだ切れていない予告）>
+	   text-muted（長期未使用、注意喚起のみで即時性はない）。 */
+	.badge {
+		display: inline-block;
+		margin-left: 0.4rem;
+		padding: 0.05rem 0.45rem;
+		border-radius: var(--banto-radius);
+		font-size: 0.72rem;
+		font-weight: 600;
+		white-space: nowrap;
+	}
+
+	.badge-expired {
+		color: var(--banto-danger);
+		background: color-mix(in srgb, var(--banto-danger) 12%, transparent);
+	}
+
+	.badge-expiring-soon {
+		color: var(--banto-primary);
+		background: color-mix(in srgb, var(--banto-primary) 12%, transparent);
+	}
+
+	.badge-long-unused {
+		color: var(--banto-text-muted);
+		background: color-mix(in srgb, var(--banto-text-muted) 12%, transparent);
 	}
 
 	td.actions {

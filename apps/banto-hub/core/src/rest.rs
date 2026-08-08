@@ -800,12 +800,30 @@ struct ApiKeysAdminState {
     api_keys: ApiKeysService,
     auth: AuthState,
     audit: AuditLogService,
+    /// H10 ①: `api_keys_create` の「有効期限は未来限定」検証で使う時計
+    /// （`manager.clock()`）。他の `*AdminState`（`WriteControlAdminState`
+    /// 等）が `manager` を持つのと同じ規約 - テストでは
+    /// `ManualClock` に差し替えられる。
+    manager: Arc<CollectorManager>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CreateApiKeyRequest {
     name: String,
     scopes: Vec<String>,
+    /// H10 ①（docs/improvement-plan.md、2026-08-08 オーナー決定）: 任意の
+    /// 有効期限（絶対 epoch ミリ秒、wire は `expiresAt` -
+    /// `crate::api_keys::ApiKeySummary` の `expires_at`/`FieldError::field`
+    /// 命名規約と同じ camelCase に揃えるため、この構造体自体にも
+    /// `rename_all = "camelCase"` を追加した - `name`/`scopes` は
+    /// 1語なので実質無変化）。省略/`null` = 無期限（既定・動作不変、
+    /// `#[serde(default)]` は既存クライアントの後方互換のため -
+    /// `GrpcSettingsBody::bind` 等と同じ規約）。`Some` の場合は
+    /// [`api_keys_create`] が「現在時刻より未来」を検証してから
+    /// [`ApiKeysService::issue`] に渡す（`issue` 自体は再検証しない）。
+    #[serde(default)]
+    expires_at: Option<i64>,
 }
 
 /// `POST /api/api-keys` の応答 - `IssuedApiKey` をそのまま返すと `key`
@@ -813,6 +831,12 @@ struct CreateApiKeyRequest {
 /// クライアント向け `/api/v1/*` と同じ snake_case 規約）ので、それに
 /// 合わせてここでも変換なしでそのまま公開する（T0-2 実装指示の応答例
 /// `{ "id", "name", "prefix", "scopes", "key": "bh_..." }` と一致）。
+///
+/// H10 ①で `expiresAt` を追加していない: 発行応答は元々
+/// `created_at`/`revoked_at`/`tripped_at` も含まない最小限の形（「平文
+/// key を一度だけ返す」ことが主目的）で、入力どおりの値をそのまま返すだけの
+/// `expiresAt` もこの最小性に合わせた - 必要なら直後の `GET /api/api-keys`
+/// 一覧（`crate::api_keys::ApiKeySummary`）で確認できる。
 #[derive(Debug, Serialize, ToSchema)]
 struct IssuedApiKeyResponse {
     id: i64,
@@ -838,13 +862,35 @@ impl From<IssuedApiKey> for IssuedApiKeyResponse {
 
 /// `POST /api/api-keys` - 発行。監査ログには **キー平文・ハッシュを
 /// 含めない**（設計 T0-2 実装指示: 「監査ログに record_write — ただし
-/// キー平文・ハッシュは監査 detail に入れない」）。
+/// キー平文・ハッシュは監査 detail に入れない」）。`expiresAt`（H10 ①）は
+/// 秘密ではないので監査 detail に含めてよい。
+///
+/// `expiresAt` の「未来限定」検証はここで行う（`crate::api_keys` の
+/// サービス層は `now_ms` を持たないため） - `state.manager.clock()` は
+/// `require_tag_space_auth` 等と同じ、テストで差し替え可能な時計。
+/// 不正なら `validate_scopes`/重複名と同じ `BantoError::Validation` 経由の
+/// 4xx で弾く（新しい HTTP パスは作らない）。
 async fn api_keys_create(
     State(state): State<ApiKeysAdminState>,
     headers: HeaderMap,
     Json(body): Json<CreateApiKeyRequest>,
 ) -> Result<(StatusCode, Json<IssuedApiKeyResponse>), ApiError> {
-    let issued = state.api_keys.issue(&body.name, body.scopes).await?;
+    if let Some(expires_at) = body.expires_at {
+        let now_ms = state.manager.clock().now_ms();
+        if expires_at <= now_ms {
+            return Err(ApiError(BantoError::Validation {
+                field_errors: vec![FieldError {
+                    field: "expiresAt".to_string(),
+                    message: "有効期限は現在時刻より後の日時を指定してください".to_string(),
+                }],
+            }));
+        }
+    }
+
+    let issued = state
+        .api_keys
+        .issue(&body.name, body.scopes, body.expires_at)
+        .await?;
     record_write(
         &state.audit,
         &state.auth,
@@ -852,7 +898,11 @@ async fn api_keys_create(
         "create",
         "api_keys",
         &issued.id.to_string(),
-        Some(json!({ "name": issued.name, "scopes": issued.scopes })),
+        Some(json!({
+            "name": issued.name,
+            "scopes": issued.scopes,
+            "expiresAt": body.expires_at,
+        })),
     )
     .await;
     Ok((StatusCode::CREATED, Json(issued.into())))
@@ -917,11 +967,17 @@ async fn api_keys_clear_trip(
 /// `users_router`/`audit_log_router` と同型（ハンドラ内で個別に role
 /// チェックし直さない: 到達した時点で呼び出し元は admin であることが
 /// ルーター層で保証済み）。
-fn api_keys_router(api_keys: ApiKeysService, audit: AuditLogService, auth: AuthState) -> Router {
+fn api_keys_router(
+    api_keys: ApiKeysService,
+    audit: AuditLogService,
+    auth: AuthState,
+    manager: Arc<CollectorManager>,
+) -> Router {
     let state = ApiKeysAdminState {
         api_keys,
         auth: auth.clone(),
         audit: audit.clone(),
+        manager,
     };
     Router::new()
         .route("/api/api-keys", get(api_keys_list).post(api_keys_create))
@@ -3397,6 +3453,12 @@ struct TagSpaceAuthState {
 ///     `{ "error": "key_tripped" }` + audit_log に同様の `denied` 記録
 ///     （read/write いずれのリクエストも拒否 - `crate::api_keys` の
 ///     モジュール doc comment「トリップ」参照）
+///   - [`ApiKeyLookup::Expired`]（H10 ①、docs/improvement-plan.md・
+///     2026-08-08 オーナー決定）→ 401 + audit_log に同様の `denied` 記録
+///     （`reason: "expired"` - `Revoked` の腕をそのまま踏襲。期限切れは
+///     「失効」ではないが、未認証というレスポンス上の扱いは revoked と同じ
+///     401 が適切 - `crate::api_keys` のモジュール doc comment「有効期限」
+///     参照）
 ///   - [`ApiKeyLookup::NotFound`] → 401（監査記録しない - 存在しない/
 ///     偽造されたキーは「誰が」を特定できないただのノイズであり、
 ///     revoked の場合と違って「元は正規に発行されたキーが使われた」という
@@ -3427,12 +3489,15 @@ async fn require_tag_space_auth(
         req.method() == Method::POST && req.uri().path().starts_with("/api/v1/values/");
 
     if token.starts_with("bh_") {
-        match state.api_keys.lookup(&token).await {
+        // H10 ①: 期限切れ判定([`crate::api_keys::ApiKeysService::lookup`])
+        // にも last_used_at 更新にも同じ「今」を使う - 呼び出しごとに
+        // ずれないよう一度だけ取得する。
+        let now_ms = state.manager.clock().now_ms();
+        match state.api_keys.lookup(&token, now_ms).await {
             Ok(ApiKeyLookup::Valid(ctx)) => {
                 if !is_write_route && !ctx.has_read_scope() {
                     return forbidden_response();
                 }
-                let now_ms = state.manager.clock().now_ms();
                 if let Err(err) = state
                     .api_keys
                     .touch_last_used(ctx.id, now_ms, ctx.last_used_at_ms)
@@ -3478,6 +3543,24 @@ async fn require_tag_space_auth(
                     })
                     .await;
                 key_tripped_response()
+            }
+            Ok(ApiKeyLookup::Expired { id, name }) => {
+                let method = req.method().as_str().to_string();
+                let path = req.uri().path().to_string();
+                state
+                    .audit
+                    .record(AuditEntry {
+                        actor_username: None,
+                        actor_role: None,
+                        action: "denied",
+                        resource: "api_keys",
+                        entity_id: Some(&id.to_string()),
+                        detail: Some(json!({ "reason": "expired", "name": name, "method": method, "path": path })),
+                        origin: "rest",
+                        result: "denied",
+                    })
+                    .await;
+                unauthorized_response()
             }
             Ok(ApiKeyLookup::NotFound) => unauthorized_response(),
             Err(err) => {
@@ -3637,6 +3720,7 @@ pub fn api_router(
             api_keys.clone(),
             audit.clone(),
             auth.clone(),
+            manager.clone(),
         ))
         .merge(tag_registry_router(
             plc_connections,
@@ -3699,7 +3783,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use banto_collect::CollectorOptions;
-    use banto_tstore::SystemClock;
+    use banto_tstore::{Clock, ManualClock, SystemClock};
     use tokio::sync::broadcast as tokio_broadcast;
     use tower::ServiceExt;
 
@@ -3710,7 +3794,17 @@ mod tests {
     /// collector lifecycle itself - that is `hub.rs`'s and the integration
     /// test's job). Points at a real temp dir since `CollectorManager` always
     /// needs a `data_dir`, even if `rebuild` is never called in a given test.
-    fn test_manager(pool: sqlx::SqlitePool) -> (Arc<CollectorManager>, tempfile::TempDir) {
+    ///
+    /// `clock` is injectable (H10 ①): every pre-existing caller goes through
+    /// [`test_env`], which passes `Arc::new(SystemClock)` - same behavior as
+    /// before this parameter existed. The expiry E2E tests below go through
+    /// [`test_env_with_clock`] instead, passing a [`ManualClock`] so they can
+    /// advance past a key's `expiresAt` deterministically instead of
+    /// depending on real wall-clock time.
+    fn test_manager_with_clock(
+        pool: sqlx::SqlitePool,
+        clock: Arc<dyn Clock>,
+    ) -> (Arc<CollectorManager>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let sessions = Arc::new(crate::broker_glue::HubSessions::new(
             banto_broker::BackoffConfig::default(),
@@ -3722,7 +3816,7 @@ mod tests {
         let manager = CollectorManager::new(
             pool,
             dir.path().join("data"),
-            Arc::new(SystemClock),
+            clock,
             CollectorOptions::default(),
             sessions,
             sim_registry,
@@ -3745,6 +3839,15 @@ mod tests {
     }
 
     async fn test_env() -> TestEnv {
+        test_env_with_clock(Arc::new(SystemClock)).await
+    }
+
+    /// [`test_env`] but with an injectable clock (H10 ①) - lets a test
+    /// create a key with `expiresAt = clock.now_ms() + small`, assert it
+    /// authenticates, then `advance_ms` past the deadline and assert 401 -
+    /// deterministically, without depending on real wall-clock time. See
+    /// [`test_manager_with_clock`]'s doc comment for the same reasoning.
+    async fn test_env_with_clock(clock: Arc<dyn Clock>) -> TestEnv {
         let pool = migrate_memory().await.expect("migrate_memory");
         let (tx, _rx) = tokio_broadcast::channel(16);
         let users = UsersService::new(pool.clone());
@@ -3753,7 +3856,7 @@ mod tests {
         let collection_groups = CollectionGroupService::new(pool.clone());
         let tags = TagService::new(pool.clone());
         let api_keys = ApiKeysService::new(pool.clone());
-        let (manager, dir) = test_manager(pool.clone());
+        let (manager, dir) = test_manager_with_clock(pool.clone(), clock);
 
         users
             .setup_first_user("admin", "password123", "管理者")
@@ -3857,6 +3960,45 @@ mod tests {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({ "name": name, "scopes": scopes }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// [`issue_api_key`] but also sets `expiresAt` (H10 ①) - kept as a
+    /// separate helper rather than adding a parameter to [`issue_api_key`]
+    /// so the ~10 existing call sites above (all unlimited keys) stay
+    /// untouched.
+    async fn issue_api_key_with_expiry(
+        router: &Router,
+        token: &str,
+        name: &str,
+        scopes: &[&str],
+        expires_at: Option<i64>,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/api-keys")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": name,
+                            "scopes": scopes,
+                            "expiresAt": expires_at,
+                        })
+                        .to_string(),
                     ))
                     .unwrap(),
             )
@@ -4061,6 +4203,155 @@ mod tests {
             .find(|row| row.action == "denied" && row.resource == "api_keys")
             .expect("a denied/api_keys audit row should exist");
         assert_eq!(denied.entity_id.as_deref(), Some(id.to_string().as_str()));
+    }
+
+    // --- H10 ①: 任意の有効期限 ----------------------------------------------
+
+    /// 無期限キー（`expiresAt` 省略）は今までどおり認証できる - 期限切れ
+    /// 判定の追加が既定動作を変えていないことの回帰防止（実装指示の受け入れ
+    /// 条件: 「無期限キーの従来動作不変」）。`ManualClock` を大きく進めても
+    /// 無期限キーは影響を受けないことも合わせて確認する。
+    #[tokio::test]
+    async fn unlimited_api_key_still_authenticates_regardless_of_the_clock() {
+        let clock = Arc::new(ManualClock::new(1_000_000, 0));
+        let env = test_env_with_clock(clock.clone()).await;
+        let (status, issued) =
+            issue_api_key(&env.router, &env.admin_token, "unlimited", &["read"]).await;
+        assert_eq!(status, StatusCode::CREATED, "{issued:?}");
+        let key = issued["key"].as_str().unwrap().to_string();
+
+        clock.advance_ms(999_999_999_999);
+
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/v1/tags")
+                    .header("Authorization", format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// 期限付きキー: 期限内は 200、`advance_ms` で期限を過ぎさせると 401 に
+    /// なり audit_log に `denied`/`api_keys`/`{"reason":"expired"}` が記録
+    /// される（実装指示の受け入れ条件: 「期限切れキーの 401 と UI 警告の
+    /// テスト」の REST 側、`revoked_api_key_is_401_and_audited` と同型）。
+    #[tokio::test]
+    async fn expired_api_key_is_401_and_audited() {
+        let clock = Arc::new(ManualClock::new(1_000_000, 0));
+        let env = test_env_with_clock(clock.clone()).await;
+
+        let expires_at = clock.now_ms() + 60_000;
+        let (status, issued) = issue_api_key_with_expiry(
+            &env.router,
+            &env.admin_token,
+            "expiring",
+            &["read"],
+            Some(expires_at),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{issued:?}");
+        // `IssuedApiKeyResponse`（発行応答）は `id`/`name`/`prefix`/`scopes`/
+        // `key` のみで `expiresAt` は含まない（発行時点で入力どおりの値を
+        // そのまま返すだけの情報であり、既存の `created_at` 等と同じく
+        // 「一覧を見ればわかる」ため - このモジュールの
+        // `IssuedApiKeyResponse` doc comment参照）。代わりに一覧
+        // （`GET /api/api-keys`）に camelCase の `expiresAt` として正しく
+        // 反映されることをここで確認する。
+        let key = issued["key"].as_str().unwrap().to_string();
+        let id = issued["id"].as_i64().unwrap();
+
+        let list_response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::get("/api/api-keys")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let entry = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"].as_i64() == Some(id))
+            .expect("issued key should appear in the list");
+        assert_eq!(entry["expiresAt"].as_i64(), Some(expires_at));
+
+        // 期限前: 通常どおり読める。
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::get("/api/v1/tags")
+                    .header("Authorization", format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // 期限を過ぎさせる。
+        clock.advance_ms(60_001);
+
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/v1/tags")
+                    .header("Authorization", format!("Bearer {key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let audit = AuditLogService::new(env.pool.clone());
+        let entries = audit.list(ListParams::default()).await.unwrap();
+        let denied = entries
+            .rows
+            .iter()
+            .find(|row| {
+                row.action == "denied"
+                    && row.resource == "api_keys"
+                    && row
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("\"expired\""))
+            })
+            .expect("a denied/api_keys audit row with reason=expired should exist");
+        assert_eq!(denied.entity_id.as_deref(), Some(id.to_string().as_str()));
+    }
+
+    /// 発行時点で既に過去/現在時刻以下の `expiresAt` は 422（`Validation`）で
+    /// 拒否される（実装指示: 「Some(e) and e <= now_ms、reject...」）。
+    #[tokio::test]
+    async fn creating_an_api_key_with_a_past_expiry_is_rejected() {
+        let clock = Arc::new(ManualClock::new(1_000_000, 0));
+        let env = test_env_with_clock(clock.clone()).await;
+
+        let (status, body) = issue_api_key_with_expiry(
+            &env.router,
+            &env.admin_token,
+            "already-expired",
+            &["read"],
+            Some(clock.now_ms()), // e <= now_ms(ちょうど今) は拒否
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+        assert_eq!(body["kind"], "validation");
     }
 
     /// `write:` のみのスコープを持つキーで `/api/v1/*`（read 専用エンド

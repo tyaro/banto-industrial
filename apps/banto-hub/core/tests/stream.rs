@@ -707,7 +707,11 @@ async fn stream_requires_auth_and_read_scope() {
 
     let issued = app
         .api_keys
-        .issue("writer-only", vec!["write:line1.fast.temp01".to_string()])
+        .issue(
+            "writer-only",
+            vec!["write:line1.fast.temp01".to_string()],
+            None,
+        )
         .await
         .expect("issue should succeed");
 
