@@ -120,9 +120,9 @@ utoipa = "5"
 # feature で足りる）。axum 0.8.9 が内部で使っているのと同じ 0.29 系を選び、
 # Cargo.lock に無関係な第2系統を増やさない。
 tokio-tungstenite = "0.29"
-banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v0.1.1" }
-banto-storage = { git = "https://github.com/tyaro/banto.git", tag = "v0.1.1" }
-banto-server = { git = "https://github.com/tyaro/banto.git", tag = "v0.1.1" }
+banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v1.1.0" }
+banto-storage = { git = "https://github.com/tyaro/banto.git", tag = "v1.1.0" }
+banto-server = { git = "https://github.com/tyaro/banto.git", tag = "v1.1.0" }
 # T3（docs/tag-server-design.md §5.3）: banto-hub の MQTT publish（外部ブロー
 # カーへ接続するクライアントモードのみ - 組み込みブローカーは §10-4 の判断
 # 待ち）。plan.md §3 で保留になっていた「MQTT クライアント（rumqttc +
