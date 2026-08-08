@@ -59,6 +59,21 @@
 		}
 	}
 
+	/**
+	 * H10 ②: auto-disarm status text for the badge. `armRemainingSecs` is a
+	 * snapshot as of the last `refresh()`, not a live countdown - "約" makes
+	 * that approximation explicit rather than implying second-level accuracy.
+	 */
+	function autoDisarmText(s: EngineStatus): string {
+		if (s.armAutoDisarmSecs === null) return '自動 disarm 無効';
+		if (s.armed && s.armRemainingSecs !== null) {
+			const minutes = Math.ceil(s.armRemainingSecs / 60);
+			return `自動 disarm まで約 ${minutes}分`;
+		}
+		const hours = s.armAutoDisarmSecs / 3600;
+		return `自動 disarm: 有効（アーム後 ${hours}時間で作動）`;
+	}
+
 	$effect(() => {
 		void refresh();
 	});
@@ -165,6 +180,7 @@
 								? '条件成立時に実PLCへ自動書き込みが行われます'
 								: '物理書き込みは抑止されています'}
 						</span>
+						<span class="badge-sub">{autoDisarmText(status)}</span>
 					</div>
 					<div class="badge" class:dry={status.dryRun}>
 						<span class="badge-label">ドライラン</span>

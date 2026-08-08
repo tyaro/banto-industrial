@@ -314,6 +314,10 @@ impl GrpcService {
     /// - [`ApiKeyLookup::Revoked`] → `UNAUTHENTICATED` + audit_log 記録
     /// - [`ApiKeyLookup::Tripped`] → `PERMISSION_DENIED` + audit_log 記録
     ///   (read/write いずれも拒否 - REST と同じ規律)
+    /// - [`ApiKeyLookup::Expired`]（H10 ①、docs/improvement-plan.md・
+    ///   2026-08-08 オーナー決定）→ `UNAUTHENTICATED` + audit_log 記録
+    ///   （`Revoked` と同じ扱い - REST の `require_tag_space_auth` と同じ
+    ///   規律）
     /// - [`ApiKeyLookup::NotFound`] → `UNAUTHENTICATED`(記録しない - REST
     ///   の `require_tag_space_auth` と同じ理由、偽装キーは「誰が」を
     ///   特定できないノイズ)
@@ -338,12 +342,16 @@ impl GrpcService {
             ));
         }
 
-        match self.api_keys.lookup(token).await {
+        // H10 ①: 期限切れ判定 ([`crate::api_keys::ApiKeysService::lookup`])
+        // に使う「今」も、last_used_at 更新に使う「今」も同じ
+        // `self.manager.clock()` から一度だけ取る(REST の
+        // `require_tag_space_auth` と同じ規約)。
+        let now_ms = self.manager.clock().now_ms();
+        match self.api_keys.lookup(token, now_ms).await {
             Ok(ApiKeyLookup::Valid(ctx)) => {
                 if require == RequireScope::Read && !ctx.has_read_scope() {
                     return Err(Status::permission_denied("read スコープが必要です"));
                 }
-                let now_ms = self.manager.clock().now_ms();
                 if let Err(err) = self
                     .api_keys
                     .touch_last_used(ctx.id, now_ms, ctx.last_used_at_ms)
@@ -360,6 +368,10 @@ impl GrpcService {
             Ok(ApiKeyLookup::Tripped { id, name }) => {
                 self.record_denied(id, "tripped", &name).await;
                 Err(Status::permission_denied("key_tripped"))
+            }
+            Ok(ApiKeyLookup::Expired { id, name }) => {
+                self.record_denied(id, "expired", &name).await;
+                Err(Status::unauthenticated("この API キーは有効期限切れです"))
             }
             Ok(ApiKeyLookup::NotFound) => Err(Status::unauthenticated("無効な API キーです")),
             Err(err) => {

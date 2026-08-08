@@ -13,9 +13,26 @@
  * トリップさせたキーの状態と手動解除 - `revoke`（不可逆）とは別の
  * 解除可能な状態（`apps/banto-hub/core/src/api_keys.rs` のモジュール doc
  * comment「トリップ」参照）。
+ *
+ * H10 ①（docs/improvement-plan.md、2026-08-08 オーナー決定）: `expiresAt`
+ * は任意のキー有効期限（epoch ミリ秒、`null` = 無期限・既定）。認可判断
+ * （401 を返すかどうか）はサーバー側（`ApiKeysService::lookup`）が行う -
+ * ここで re-export する `apiKeyWarnings` はあくまで UI の「期限接近」
+ * 「期限切れ」「長期未使用」バッジ表示用の純関数であり、認可には関与
+ * しない。実体は `./apiKeyWarnings` に切り出してある（このファイルは
+ * `@banto/admin-core` を import するため vitest の最小構成では単体
+ * テストできない - 同ファイルの doc comment参照）。
  */
 import { getAuthProvider, ProviderError, type ErrorBody } from '@banto/admin-core';
 import { CSRF_HEADER } from './setup';
+
+export {
+	apiKeyWarnings,
+	EXPIRY_WARNING_THRESHOLD_MS,
+	LONG_UNUSED_THRESHOLD_MS,
+	type ApiKeyWarnings,
+	type ApiKeyExpiryInfo
+} from './apiKeyWarnings';
 
 /** Mirrors `banto_hub_core::api_keys::ApiKeySummary`（wire は camelCase）。 */
 export interface ApiKeySummary {
@@ -28,11 +45,15 @@ export interface ApiKeySummary {
 	revokedAt: string | null;
 	/** T2-4: レート制限超過でトリップした日時（ISO 文字列）、未トリップは null。 */
 	trippedAt: string | null;
+	/** H10 ①: 任意の有効期限（epoch ミリ秒）。`null` = 無期限（既定）。 */
+	expiresAt: number | null;
 }
 
 export interface CreateApiKeyInput {
 	name: string;
 	scopes: string[];
+	/** H10 ①: 任意の有効期限（epoch ミリ秒）。省略/`null` = 無期限（既定）。 */
+	expiresAt?: number | null;
 }
 
 /** Mirrors REST の `IssuedApiKeyResponse` - `key` はこの応答でしか手に入らない平文全体。 */

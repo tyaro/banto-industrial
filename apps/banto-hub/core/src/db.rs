@@ -171,6 +171,15 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
     // 何もしない)。
     add_column_if_missing(pool, "api_keys", "tripped_at", "TEXT").await?;
 
+    // H10 ①(docs/improvement-plan.md・2026-08-08 オーナー決定):
+    // `expires_at` は任意のキー有効期限 - `last_used_at` と同じく epoch
+    // ミリ秒の10進文字列で保存し、`NULL` = 無期限(既定、動作不変)。
+    // `tripped_at` と同じ理由で `add_column_if_missing` の後追い ADD
+    // COLUMN(`api_keys` は T0-2 で既に `CREATE TABLE IF NOT EXISTS`
+    // 済みのため)。列の意味・判定順の詳細は `crate::api_keys` のモジュール
+    // doc comment「有効期限」参照。
+    add_column_if_missing(pool, "api_keys", "expires_at", "TEXT").await?;
+
     // T2-4 (docs/tag-server-design.md §6-6「再起動での安全側復帰」):
     // 書き込み受付フラグの永続値(表示専用 - `crate::write_control` の
     // モジュール doc 参照。**ライブフラグは常に起動時 disabled** で、この
@@ -348,6 +357,30 @@ mod tests {
             rows.iter()
                 .any(|row| row.get::<String, _>("name") == "tripped_at"),
             "api_keys should gain a tripped_at column"
+        );
+
+        // Second run must not error (ALTER TABLE ADD COLUMN on an existing
+        // column would fail if add_column_if_missing's check were skipped).
+        run_migrations(&pool).await.unwrap();
+    }
+
+    /// H10 ①: `api_keys.expires_at` も `tripped_at` と同じ
+    /// `add_column_if_missing` 経由で足される - 上のテストと同じ形で列の
+    /// 存在と冪等性を確認する。
+    #[tokio::test]
+    async fn api_keys_expires_at_column_is_added_idempotently() {
+        let pool = banto_storage::connect_sqlite_memory().await.unwrap();
+        run_migrations(&pool).await.unwrap();
+
+        use sqlx::Row;
+        let rows = sqlx::query("PRAGMA table_info(api_keys)")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert!(
+            rows.iter()
+                .any(|row| row.get::<String, _>("name") == "expires_at"),
+            "api_keys should gain an expires_at column"
         );
 
         // Second run must not error (ALTER TABLE ADD COLUMN on an existing

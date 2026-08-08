@@ -38,6 +38,7 @@ use relay_wright_core::engine::{Engine, EngineConfig, SharedEngineControl};
 use relay_wright_core::events::event_channel;
 use relay_wright_core::qr_strings::QrStringService;
 use relay_wright_core::rest::{api_router, audited_credential_verifier};
+use relay_wright_core::settings::ArmSettings;
 use relay_wright_core::settings::SettingsService;
 use relay_wright_core::users::UsersService;
 use relay_wright_core::write_audit_query::WriteAuditLogService;
@@ -150,14 +151,32 @@ async fn main() {
         }
     }
 
+    // H10 ② (2026-08-08 オーナー決定 `docs/improvement-plan.md` H10): read
+    // `arm.auto_disarm_secs` before starting the engine below, so its
+    // `EngineConfig.auto_disarm` reflects the persisted setting from the
+    // first start. Best-effort, same "must not block startup" convention as
+    // the audit-retention read just above - a read failure falls back to the
+    // default (8h), not to disabling the feature.
+    let auto_disarm = match settings.arm_config().await {
+        Ok(config) => config.auto_disarm(),
+        Err(err) => {
+            eprintln!("relay-wright-serve: arm 自動 disarm 設定の読み取りに失敗しました: {err}");
+            ArmSettings::default().auto_disarm()
+        }
+    };
+
     // W3-B2: start the auto-write engine so `/api/engine/*` is live in this
     // standalone REST vehicle too (and exercisable end-to-end without Tauri).
     // Non-fatal: on failure the routes report "not started". Starts DISARMED
     // (invariant §1) and returns promptly even if a PLC is unreachable. The
     // `Engine` is kept alive for the process lifetime and shut down at Ctrl-C
     // below; its control slot is handed to the router.
+    let engine_config = EngineConfig {
+        auto_disarm,
+        ..EngineConfig::default()
+    };
     let (engine, engine_control): (Option<Engine>, SharedEngineControl) =
-        match Engine::start_from_db(pool.clone(), EngineConfig::default()).await {
+        match Engine::start_from_db(pool.clone(), engine_config).await {
             Ok((engine, control)) => (Some(engine), Arc::new(Mutex::new(Some(control)))),
             Err(err) => {
                 eprintln!("relay-wright-serve: 自動書き込みエンジンの起動に失敗しました: {err}");

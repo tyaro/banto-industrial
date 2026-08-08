@@ -63,12 +63,31 @@
 //! `crate::rest` の書き込みハンドラが [`ApiKeysService::trip`] を呼んで
 //! トリップさせ、admin が管理 UI から [`ApiKeysService::clear_trip`] で
 //! 手動解除する。[`ApiKeysService::lookup`] の判定順は
-//! **ハッシュ一致 → revoked → tripped**（この節見出しの上、「照合の
-//! タイミングについて」の情報漏洩防止の理由付けと同じ順序 - T0-2 の
+//! **ハッシュ一致 → revoked → tripped → expired**（この節見出しの上、
+//! 「照合のタイミングについて」の情報漏洩防止の理由付けと同じ順序 - T0-2 の
 //! revoked チェックがハッシュ一致より先に来てはならないのと同じ理由で、
-//! tripped チェックも revoked の後段に置く）。トリップ中のキーは
-//! read/write いずれの `/api/v1/*` リクエストも拒否される
-//! （`crate::rest::require_tag_space_auth` 参照）。
+//! tripped/expired チェックも revoked の後段に置く。expired が末尾に来る
+//! 理由は次節「有効期限」参照）。トリップ中のキーは read/write いずれの
+//! `/api/v1/*` リクエストも拒否される（`crate::rest::require_tag_space_auth`
+//! 参照）。
+//!
+//! ## 有効期限（H10 ①、docs/improvement-plan.md・2026-08-08 オーナー決定）
+//!
+//! API キーは**既定で無期限**（`expires_at` 列が `NULL`）のまま — 主たる
+//! 統制は引き続き失効（`revoke`）と `last_used_at` の監視。その上で、
+//! キー発行時に**任意**で絶対 epoch ミリ秒の期限を設定できる
+//! （`ApiKeysService::issue` の `expires_at` 引数、検証は
+//! `crate::rest::api_keys_create` が「未来限定」を発行時点で行う）。
+//!
+//! 判定は [`is_expired`]（純関数、`now_ms >= expires_at_ms` で真）を
+//! [`ApiKeysService::lookup`] の末尾 — ハッシュ一致・revoked・tripped の
+//! いずれのチェックも通過した**後**、`Valid` を返す直前に置く。これより
+//! 前段に置いてはいけない: 「照合のタイミングについて」節の情報漏洩防止の
+//! 規律（ハッシュ不一致なら revoked/tripped の別を問わず常に `NotFound`）を
+//! expired にも同じ形で及ぼす必要があるため（[`ApiKeyLookup::Expired`] の
+//! doc comment参照）。UI 側の「期限接近」「長期未使用」警告は
+//! `apps/banto-hub/src/lib/banto/apiKeysAdmin.ts` の `apiKeyWarnings`
+//! （表示のみ・認可判断はしない）が担う。
 
 use banto_core::{BantoError, FieldError};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -217,6 +236,24 @@ pub fn should_touch_last_used(now_ms: i64, last_used_at_ms: Option<i64>) -> bool
     }
 }
 
+/// H10 ①（docs/improvement-plan.md、2026-08-08 オーナー決定）: キーの
+/// 有効期限切れ判定。`should_touch_last_used` と同じく DB/クロックに
+/// 依存しない純関数（単体テスト対象）。呼び出し箇所・判定順は
+/// [`ApiKeysService::lookup`] とこのモジュールの doc comment「有効期限」
+/// 参照。
+///
+/// `expires_at_ms` が `None`（無期限、既定）なら常に `false`。`Some(e)` の
+/// 場合は `now_ms >= e` で真（境界を含む - 期限ちょうどの瞬間は「期限切れ」
+/// 側に倒す。`ApiKeySummary::created_at`/`revoked_at` の ISO 文字列とは違い
+/// `expires_at` も `last_used_at` と同じ epoch ミリ秒の10進文字列で保存する
+/// - db.rs の列コメント参照）。
+pub fn is_expired(now_ms: i64, expires_at_ms: Option<i64>) -> bool {
+    match expires_at_ms {
+        None => false,
+        Some(expires_at) => now_ms >= expires_at,
+    }
+}
+
 // --- 公開の型 ---------------------------------------------------------------
 
 /// 発行直後にのみ平文キーを含めて返す応答。DB には `key`/`key_hash` の
@@ -254,6 +291,14 @@ pub struct ApiKeySummary {
     /// （ISO 文字列、`datetime('now')` そのまま）。`revoked_at` とは別の
     /// 解除可能な状態 - このモジュールの doc comment「トリップ」参照。
     pub tripped_at: Option<String>,
+    /// H10 ①（docs/improvement-plan.md、2026-08-08 オーナー決定）: 任意の
+    /// 有効期限（epoch ミリ秒）。`None` = 無期限（既定・動作不変）。
+    /// `last_used_at` と同じく DB 保存形式（10進文字列）をそのまま数値化
+    /// したもの - このモジュールの doc comment「有効期限」参照。UI 側の
+    /// 警告表示（期限接近/長期未使用/期限切れ）はこの生値を使って
+    /// `apps/banto-hub/src/lib/banto/apiKeysAdmin.ts` の `apiKeyWarnings`
+    /// が計算する（サーバー側はここでは判定しない）。
+    pub expires_at: Option<i64>,
 }
 
 /// [`ApiKeysService::lookup`] が有効なキーに対して返す文脈情報 -
@@ -285,16 +330,18 @@ impl ApiKeyContext {
     }
 }
 
-/// [`ApiKeysService::lookup`] の結果。`Revoked`/`Tripped` を `NotFound` と
-/// 分けるのは「失効済み/トリップ中のキーでのアクセス試行は audit_log に
-/// 記録する」（設計 T0-2 実装指示、T2-4 で `Tripped` にも同じ扱いを拡張）
-/// ため — 呼び出し元（`crate::rest`）がこれらを区別して扱う。
+/// [`ApiKeysService::lookup`] の結果。`Revoked`/`Tripped`/`Expired` を
+/// `NotFound` と分けるのは「失効済み/トリップ中/期限切れのキーでの
+/// アクセス試行は audit_log に記録する」（設計 T0-2 実装指示、T2-4 で
+/// `Tripped` に、H10 ①（docs/improvement-plan.md、2026-08-08 オーナー
+/// 決定）で `Expired` に同じ扱いを拡張）ため — 呼び出し元
+/// （`crate::rest`/`crate::grpc`）がこれらを区別して扱う。
 ///
-/// ハッシュが一致しない場合は revoked/tripped かどうかに関わらず常に
-/// `NotFound` を返す（`Revoked`/`Tripped` を返してしまうと、secret を
-/// 知らない攻撃者に「このプレフィックスは存在し、かつ失効済み/トリップ
-/// 中だ」という情報を漏らすことになるため — [`ApiKeysService::lookup`]
-/// の実装コメント参照）。
+/// ハッシュが一致しない場合は revoked/tripped/expired かどうかに関わらず
+/// 常に `NotFound` を返す（`Revoked`/`Tripped`/`Expired` を返してしまうと、
+/// secret を知らない攻撃者に「このプレフィックスは存在し、かつ失効済み/
+/// トリップ中/期限切れだ」という情報を漏らすことになるため —
+/// [`ApiKeysService::lookup`] の実装コメント参照）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApiKeyLookup {
     Valid(ApiKeyContext),
@@ -306,6 +353,15 @@ pub enum ApiKeyLookup {
     /// させた状態。`revoked_at` と違い、admin が
     /// [`ApiKeysService::clear_trip`] で解除できる。
     Tripped {
+        id: i64,
+        name: String,
+    },
+    /// H10 ①（docs/improvement-plan.md、2026-08-08 オーナー決定）: 任意で
+    /// 設定された `expires_at` を過ぎたキー。`revoked_at`/`tripped_at` と
+    /// 違い、admin が管理 UI から「解除」できる状態ではない（有効期限を
+    /// 過ぎたキーは再び使うなら再発行する運用 - このモジュールの doc
+    /// comment「有効期限」参照）。
+    Expired {
         id: i64,
         name: String,
     },
@@ -321,6 +377,9 @@ pub struct ApiKeysService {
     pool: SqlitePool,
 }
 
+/// `(id, name, prefix, scopes, created_at, last_used_at, revoked_at,
+/// tripped_at, expires_at)` - H10 ①で末尾に `expires_at` を追加(`list`/
+/// `fetch_summary` の SELECT 列順と一致させること)。
 type ApiKeyRow = (
     i64,
     String,
@@ -330,12 +389,14 @@ type ApiKeyRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 /// [`ApiKeysService::lookup`]'s row shape: `(id, name, key_hash, scopes,
-/// last_used_at, revoked_at, tripped_at)` - deliberately not [`ApiKeyRow`]
-/// (which also carries `prefix`/`created_at` instead of `key_hash`); the two
-/// queries select different columns for different purposes.
+/// last_used_at, revoked_at, tripped_at, expires_at)` - deliberately not
+/// [`ApiKeyRow`] (which also carries `prefix`/`created_at` instead of
+/// `key_hash`); the two queries select different columns for different
+/// purposes. H10 ①で末尾に `expires_at` を追加。
 type LookupRow = (
     i64,
     String,
@@ -344,10 +405,21 @@ type LookupRow = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 fn row_to_summary(row: ApiKeyRow) -> Result<ApiKeySummary, BantoError> {
-    let (id, name, prefix, scopes_json, created_at, last_used_at, revoked_at, tripped_at) = row;
+    let (
+        id,
+        name,
+        prefix,
+        scopes_json,
+        created_at,
+        last_used_at,
+        revoked_at,
+        tripped_at,
+        expires_at,
+    ) = row;
     let scopes: Vec<String> = serde_json::from_str(&scopes_json).map_err(|err| {
         BantoError::Other(format!("スコープのデシリアライズに失敗しました: {err}"))
     })?;
@@ -360,6 +432,7 @@ fn row_to_summary(row: ApiKeyRow) -> Result<ApiKeySummary, BantoError> {
         last_used_at: last_used_at.and_then(|value| value.parse::<i64>().ok()),
         revoked_at,
         tripped_at,
+        expires_at: expires_at.and_then(|value| value.parse::<i64>().ok()),
     })
 }
 
@@ -379,7 +452,19 @@ impl ApiKeysService {
     /// 確率的に無視できるほど小さい（約 2.8 × 10^14 分の1）ため、
     /// 衝突時は素直に `UNIQUE` 制約違反の `Storage` エラーとして
     /// 呼び出し元へ伝播させる（リトライは実装しない）。
-    pub async fn issue(&self, name: &str, scopes: Vec<String>) -> Result<IssuedApiKey, BantoError> {
+    ///
+    /// `expires_at`（H10 ①、docs/improvement-plan.md・2026-08-08 オーナー
+    /// 決定）: 任意の絶対 epoch ミリ秒。`None` = 無期限（既定・動作不変）。
+    /// **ここでは値の妥当性を再検証しない** - 「現在時刻より未来」の検証は
+    /// 呼び出し元 `crate::rest::api_keys_create` が発行前に行う（この
+    /// サービス層は `now_ms`/クロックを持たないため - このモジュールの
+    /// doc comment「有効期限」参照）。
+    pub async fn issue(
+        &self,
+        name: &str,
+        scopes: Vec<String>,
+        expires_at: Option<i64>,
+    ) -> Result<IssuedApiKey, BantoError> {
         let name = name.trim();
         if name.is_empty() {
             return Err(BantoError::Validation {
@@ -414,13 +499,14 @@ impl ApiKeysService {
         })?;
 
         let id: i64 = sqlx::query_scalar(
-            "INSERT INTO api_keys (name, prefix, key_hash, scopes) VALUES (?, ?, ?, ?) \
-             RETURNING id",
+            "INSERT INTO api_keys (name, prefix, key_hash, scopes, expires_at) \
+             VALUES (?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(name)
         .bind(&prefix)
         .bind(&key_hash)
         .bind(&scopes_json)
+        .bind(expires_at.map(|value| value.to_string()))
         .fetch_one(&self.pool)
         .await
         .map_err(banto_storage::storage_error)?;
@@ -438,8 +524,8 @@ impl ApiKeysService {
     /// `key_hash` は返さない）。作成順。
     pub async fn list(&self) -> Result<Vec<ApiKeySummary>, BantoError> {
         let rows: Vec<ApiKeyRow> = sqlx::query_as(
-            "SELECT id, name, prefix, scopes, created_at, last_used_at, revoked_at, tripped_at \
-             FROM api_keys ORDER BY id",
+            "SELECT id, name, prefix, scopes, created_at, last_used_at, revoked_at, tripped_at, \
+             expires_at FROM api_keys ORDER BY id",
         )
         .fetch_all(&self.pool)
         .await
@@ -501,8 +587,8 @@ impl ApiKeysService {
     /// 存在しない場合のみ `NotFound`。
     async fn fetch_summary(&self, id: i64) -> Result<ApiKeySummary, BantoError> {
         let row: Option<ApiKeyRow> = sqlx::query_as(
-            "SELECT id, name, prefix, scopes, created_at, last_used_at, revoked_at, tripped_at \
-             FROM api_keys WHERE id = ?",
+            "SELECT id, name, prefix, scopes, created_at, last_used_at, revoked_at, tripped_at, \
+             expires_at FROM api_keys WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -519,30 +605,45 @@ impl ApiKeysService {
     }
 
     /// `Authorization: Bearer <token>` から渡された `bh_...` トークンを
-    /// 照合する。`crate::rest` の `/api/v1/*` ミドルウェアの唯一の入口。
+    /// 照合する。`crate::rest`/`crate::grpc` の唯一の入口。
     ///
-    /// **ハッシュ一致を revoked/tripped チェックより先に行う**: prefix
-    /// だけ一致して secret（＝ハッシュ）が一致しない場合は、そのキーが
-    /// 失効済み/トリップ中か有効かに関わらず常に [`ApiKeyLookup::NotFound`]
-    /// を返す（[`ApiKeyLookup`] の doc comment 参照 - 情報漏洩防止)。
-    /// 判定順は **ハッシュ一致 → revoked → tripped**
-    /// （このモジュールの doc comment「トリップ」参照 - T0-2 と同じ順序の
-    /// 規律）。
-    pub async fn lookup(&self, full_key: &str) -> Result<ApiKeyLookup, BantoError> {
+    /// **ハッシュ一致を revoked/tripped/expired チェックより先に行う**:
+    /// prefix だけ一致して secret（＝ハッシュ）が一致しない場合は、その
+    /// キーが失効済み/トリップ中/期限切れか有効かに関わらず常に
+    /// [`ApiKeyLookup::NotFound`] を返す（[`ApiKeyLookup`] の doc comment
+    /// 参照 - 情報漏洩防止)。判定順は
+    /// **ハッシュ一致 → revoked → tripped → expired**
+    /// （このモジュールの doc comment「トリップ」「有効期限」参照 - T0-2 と
+    /// 同じ順序の規律）。
+    ///
+    /// `now_ms`（H10 ①）: 呼び出し元のクロック（`CollectorManager::clock()`）
+    /// から渡す - [`is_expired`] の判定にのみ使う。既存の
+    /// `last_used_at`/`touch_last_used` は今までどおり呼び出し元が自前で
+    /// `now_ms` を取得して別途呼ぶ（このメソッドは触らない）。
+    pub async fn lookup(&self, full_key: &str, now_ms: i64) -> Result<ApiKeyLookup, BantoError> {
         let Some((prefix, _secret)) = parse_key(full_key) else {
             return Ok(ApiKeyLookup::NotFound);
         };
 
         let row: Option<LookupRow> = sqlx::query_as(
-            "SELECT id, name, key_hash, scopes, last_used_at, revoked_at, tripped_at \
-             FROM api_keys WHERE prefix = ?",
+            "SELECT id, name, key_hash, scopes, last_used_at, revoked_at, tripped_at, \
+             expires_at FROM api_keys WHERE prefix = ?",
         )
         .bind(prefix)
         .fetch_optional(&self.pool)
         .await
         .map_err(banto_storage::storage_error)?;
 
-        let Some((id, name, key_hash, scopes_json, last_used_at, revoked_at, tripped_at)) = row
+        let Some((
+            id,
+            name,
+            key_hash,
+            scopes_json,
+            last_used_at,
+            revoked_at,
+            tripped_at,
+            expires_at,
+        )) = row
         else {
             return Ok(ApiKeyLookup::NotFound);
         };
@@ -558,6 +659,11 @@ impl ApiKeysService {
 
         if tripped_at.is_some() {
             return Ok(ApiKeyLookup::Tripped { id, name });
+        }
+
+        let expires_at_ms = expires_at.and_then(|value| value.parse::<i64>().ok());
+        if is_expired(now_ms, expires_at_ms) {
+            return Ok(ApiKeyLookup::Expired { id, name });
         }
 
         let scopes: Vec<String> = serde_json::from_str(&scopes_json).map_err(|err| {
@@ -706,19 +812,39 @@ mod tests {
         assert!(should_touch_last_used(1_000_000, Some(0)));
     }
 
+    // --- H10 ①: 有効期限判定（純関数） -----------------------------------
+
+    #[test]
+    fn is_expired_is_false_when_unlimited() {
+        assert!(!is_expired(1_000_000, None));
+        assert!(!is_expired(i64::MAX, None));
+    }
+
+    #[test]
+    fn is_expired_is_false_before_the_deadline() {
+        assert!(!is_expired(999_999, Some(1_000_000)));
+    }
+
+    #[test]
+    fn is_expired_is_true_at_and_after_the_deadline() {
+        // 境界含む(ちょうど期限の瞬間は「期限切れ」側)。
+        assert!(is_expired(1_000_000, Some(1_000_000)));
+        assert!(is_expired(1_000_001, Some(1_000_000)));
+    }
+
     // --- サービス: issue/list/revoke/lookup ------------------------------
 
     #[tokio::test]
     async fn issue_then_lookup_round_trips() {
         let svc = service().await;
         let issued = svc
-            .issue("mes-gateway", vec!["read".to_string()])
+            .issue("mes-gateway", vec!["read".to_string()], None)
             .await
             .expect("issue should succeed");
         assert!(issued.key.starts_with("bh_"));
 
         let lookup = svc
-            .lookup(&issued.key)
+            .lookup(&issued.key, 1_000_000)
             .await
             .expect("lookup should succeed");
         match lookup {
@@ -736,13 +862,13 @@ mod tests {
     async fn lookup_with_wrong_secret_is_not_found() {
         let svc = service().await;
         let issued = svc
-            .issue("mes-gateway", vec!["read".to_string()])
+            .issue("mes-gateway", vec!["read".to_string()], None)
             .await
             .unwrap();
         let (prefix, _secret) = parse_key(&issued.key).unwrap();
         let forged = format!("bh_{prefix}_{}", generate_secret());
 
-        let lookup = svc.lookup(&forged).await.unwrap();
+        let lookup = svc.lookup(&forged, 1_000_000).await.unwrap();
         assert_eq!(lookup, ApiKeyLookup::NotFound);
     }
 
@@ -750,7 +876,10 @@ mod tests {
     async fn lookup_unknown_prefix_is_not_found() {
         let svc = service().await;
         let lookup = svc
-            .lookup(&format!("bh_{}_{}", generate_prefix(), generate_secret()))
+            .lookup(
+                &format!("bh_{}_{}", generate_prefix(), generate_secret()),
+                1_000_000,
+            )
             .await
             .unwrap();
         assert_eq!(lookup, ApiKeyLookup::NotFound);
@@ -760,7 +889,7 @@ mod tests {
     async fn issue_rejects_invalid_scope_syntax() {
         let svc = service().await;
         let err = svc
-            .issue("bad-scope", vec!["write:line1.fast.*".to_string()])
+            .issue("bad-scope", vec!["write:line1.fast.*".to_string()], None)
             .await
             .unwrap_err();
         assert!(matches!(err, BantoError::Validation { .. }));
@@ -769,9 +898,11 @@ mod tests {
     #[tokio::test]
     async fn issue_rejects_duplicate_name() {
         let svc = service().await;
-        svc.issue("dup", vec!["read".to_string()]).await.unwrap();
+        svc.issue("dup", vec!["read".to_string()], None)
+            .await
+            .unwrap();
         let err = svc
-            .issue("dup", vec!["read".to_string()])
+            .issue("dup", vec!["read".to_string()], None)
             .await
             .unwrap_err();
         match err {
@@ -786,14 +917,14 @@ mod tests {
     async fn revoke_then_lookup_reports_revoked_not_not_found() {
         let svc = service().await;
         let issued = svc
-            .issue("revoke-me", vec!["read".to_string()])
+            .issue("revoke-me", vec!["read".to_string()], None)
             .await
             .unwrap();
 
         let summary = svc.revoke(issued.id).await.expect("revoke should succeed");
         assert!(summary.revoked_at.is_some());
 
-        let lookup = svc.lookup(&issued.key).await.unwrap();
+        let lookup = svc.lookup(&issued.key, 1_000_000).await.unwrap();
         match lookup {
             ApiKeyLookup::Revoked { id, name } => {
                 assert_eq!(id, issued.id);
@@ -807,7 +938,7 @@ mod tests {
     async fn revoke_is_idempotent_and_keeps_the_first_timestamp() {
         let svc = service().await;
         let issued = svc
-            .issue("idempotent", vec!["read".to_string()])
+            .issue("idempotent", vec!["read".to_string()], None)
             .await
             .unwrap();
 
@@ -830,22 +961,27 @@ mod tests {
         // key's prefix - both are NotFound (see ApiKeyLookup's doc comment).
         let svc = service().await;
         let issued = svc
-            .issue("revoked-forged", vec!["read".to_string()])
+            .issue("revoked-forged", vec!["read".to_string()], None)
             .await
             .unwrap();
         svc.revoke(issued.id).await.unwrap();
 
         let (prefix, _secret) = parse_key(&issued.key).unwrap();
         let forged = format!("bh_{prefix}_{}", generate_secret());
-        let lookup = svc.lookup(&forged).await.unwrap();
+        let lookup = svc.lookup(&forged, 1_000_000).await.unwrap();
         assert_eq!(lookup, ApiKeyLookup::NotFound);
     }
 
     #[tokio::test]
     async fn list_reflects_issued_and_revoked_keys() {
         let svc = service().await;
-        svc.issue("a", vec!["read".to_string()]).await.unwrap();
-        let b = svc.issue("b", vec!["read".to_string()]).await.unwrap();
+        svc.issue("a", vec!["read".to_string()], None)
+            .await
+            .unwrap();
+        let b = svc
+            .issue("b", vec!["read".to_string()], None)
+            .await
+            .unwrap();
         svc.revoke(b.id).await.unwrap();
 
         let listed = svc.list().await.unwrap();
@@ -863,7 +999,7 @@ mod tests {
     async fn touch_last_used_respects_the_throttle() {
         let svc = service().await;
         let issued = svc
-            .issue("throttled", vec!["read".to_string()])
+            .issue("throttled", vec!["read".to_string()], None)
             .await
             .unwrap();
 
@@ -923,7 +1059,7 @@ mod tests {
     async fn trip_then_lookup_reports_tripped_not_valid_or_not_found() {
         let svc = service().await;
         let issued = svc
-            .issue("writer", vec!["write:line1.fast.temp01".to_string()])
+            .issue("writer", vec!["write:line1.fast.temp01".to_string()], None)
             .await
             .unwrap();
 
@@ -931,7 +1067,7 @@ mod tests {
         assert!(summary.tripped_at.is_some());
         assert!(summary.revoked_at.is_none(), "trip must not revoke");
 
-        let lookup = svc.lookup(&issued.key).await.unwrap();
+        let lookup = svc.lookup(&issued.key, 1_000_000).await.unwrap();
         match lookup {
             ApiKeyLookup::Tripped { id, name } => {
                 assert_eq!(id, issued.id);
@@ -945,7 +1081,7 @@ mod tests {
     async fn trip_is_idempotent_and_keeps_the_first_timestamp() {
         let svc = service().await;
         let issued = svc
-            .issue("idempotent-trip", vec!["read".to_string()])
+            .issue("idempotent-trip", vec!["read".to_string()], None)
             .await
             .unwrap();
 
@@ -958,7 +1094,7 @@ mod tests {
     async fn clear_trip_restores_valid_lookup() {
         let svc = service().await;
         let issued = svc
-            .issue("clear-me", vec!["read".to_string()])
+            .issue("clear-me", vec!["read".to_string()], None)
             .await
             .unwrap();
         svc.trip(issued.id).await.unwrap();
@@ -969,7 +1105,7 @@ mod tests {
             .expect("clear_trip should succeed");
         assert!(cleared.tripped_at.is_none());
 
-        let lookup = svc.lookup(&issued.key).await.unwrap();
+        let lookup = svc.lookup(&issued.key, 1_000_000).await.unwrap();
         match lookup {
             ApiKeyLookup::Valid(ctx) => assert_eq!(ctx.id, issued.id),
             other => panic!("expected Valid after clear_trip, got {other:?}"),
@@ -980,7 +1116,7 @@ mod tests {
     async fn clear_trip_is_idempotent() {
         let svc = service().await;
         let issued = svc
-            .issue("clear-idempotent", vec!["read".to_string()])
+            .issue("clear-idempotent", vec!["read".to_string()], None)
             .await
             .unwrap();
 
@@ -998,13 +1134,13 @@ mod tests {
         // key must report Revoked, matching the doc comment's ordering.
         let svc = service().await;
         let issued = svc
-            .issue("revoked-and-tripped", vec!["read".to_string()])
+            .issue("revoked-and-tripped", vec!["read".to_string()], None)
             .await
             .unwrap();
         svc.trip(issued.id).await.unwrap();
         svc.revoke(issued.id).await.unwrap();
 
-        let lookup = svc.lookup(&issued.key).await.unwrap();
+        let lookup = svc.lookup(&issued.key, 1_000_000).await.unwrap();
         match lookup {
             ApiKeyLookup::Revoked { id, .. } => assert_eq!(id, issued.id),
             other => panic!("expected Revoked, got {other:?}"),
@@ -1018,14 +1154,14 @@ mod tests {
         // distinguish itself from any other forged secret.
         let svc = service().await;
         let issued = svc
-            .issue("tripped-forged", vec!["read".to_string()])
+            .issue("tripped-forged", vec!["read".to_string()], None)
             .await
             .unwrap();
         svc.trip(issued.id).await.unwrap();
 
         let (prefix, _secret) = parse_key(&issued.key).unwrap();
         let forged = format!("bh_{prefix}_{}", generate_secret());
-        let lookup = svc.lookup(&forged).await.unwrap();
+        let lookup = svc.lookup(&forged, 1_000_000).await.unwrap();
         assert_eq!(lookup, ApiKeyLookup::NotFound);
     }
 
@@ -1039,8 +1175,13 @@ mod tests {
     #[tokio::test]
     async fn list_reflects_tripped_state() {
         let svc = service().await;
-        let a = svc.issue("a", vec!["read".to_string()]).await.unwrap();
-        svc.issue("b", vec!["read".to_string()]).await.unwrap();
+        let a = svc
+            .issue("a", vec!["read".to_string()], None)
+            .await
+            .unwrap();
+        svc.issue("b", vec!["read".to_string()], None)
+            .await
+            .unwrap();
         svc.trip(a.id).await.unwrap();
 
         let listed = svc.list().await.unwrap();
@@ -1048,5 +1189,131 @@ mod tests {
         assert!(a.tripped_at.is_some());
         let b = listed.iter().find(|k| k.name == "b").unwrap();
         assert!(b.tripped_at.is_none());
+    }
+
+    // --- H10 ①: expires_at / lookup ordering -------------------------------
+
+    /// 無期限キー（`expires_at: None`）は今までどおり - 期限判定を追加した
+    /// ことで既定動作が変わっていないことの回帰防止（実装指示: 「無期限
+    /// キーの従来動作不変」）。`now_ms` にどれだけ大きな値を渡しても
+    /// `Valid` のまま。
+    #[tokio::test]
+    async fn unlimited_key_is_valid_regardless_of_now_ms() {
+        let svc = service().await;
+        let issued = svc
+            .issue("unlimited", vec!["read".to_string()], None)
+            .await
+            .unwrap();
+
+        let lookup = svc.lookup(&issued.key, i64::MAX).await.unwrap();
+        match lookup {
+            ApiKeyLookup::Valid(ctx) => assert_eq!(ctx.id, issued.id),
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    /// 期限付きキー: 期限前は `Valid`、期限ちょうど/以降は `Expired`
+    /// （実装指示の受け入れ条件: 「期限切れキーの 401 と... テスト」の
+    /// サービス層側）。
+    #[tokio::test]
+    async fn expiring_key_is_valid_before_and_expired_at_or_after_the_deadline() {
+        let svc = service().await;
+        let issued = svc
+            .issue("expiring", vec!["read".to_string()], Some(2_000_000))
+            .await
+            .unwrap();
+
+        let before = svc.lookup(&issued.key, 1_999_999).await.unwrap();
+        match before {
+            ApiKeyLookup::Valid(ctx) => assert_eq!(ctx.id, issued.id),
+            other => panic!("expected Valid before the deadline, got {other:?}"),
+        }
+
+        let at_deadline = svc.lookup(&issued.key, 2_000_000).await.unwrap();
+        match at_deadline {
+            ApiKeyLookup::Expired { id, name } => {
+                assert_eq!(id, issued.id);
+                assert_eq!(name, "expiring");
+            }
+            other => panic!("expected Expired at the deadline, got {other:?}"),
+        }
+
+        let after = svc.lookup(&issued.key, 2_000_001).await.unwrap();
+        assert!(matches!(after, ApiKeyLookup::Expired { .. }));
+    }
+
+    /// 判定順: ハッシュ一致 -> revoked -> tripped -> expired。失効済みかつ
+    /// 期限切れのキーは `Revoked` を報告する（`revoked_key_is_reported_
+    /// as_revoked_even_if_also_tripped` と同じ精度で expired にも確認）。
+    #[tokio::test]
+    async fn revoked_key_is_reported_as_revoked_even_if_also_expired() {
+        let svc = service().await;
+        let issued = svc
+            .issue("revoked-and-expired", vec!["read".to_string()], Some(1))
+            .await
+            .unwrap();
+        svc.revoke(issued.id).await.unwrap();
+
+        let lookup = svc.lookup(&issued.key, 1_000_000).await.unwrap();
+        match lookup {
+            ApiKeyLookup::Revoked { id, .. } => assert_eq!(id, issued.id),
+            other => panic!("expected Revoked, got {other:?}"),
+        }
+    }
+
+    /// トリップ中かつ期限切れのキーは `Tripped` を報告する（tripped の判定が
+    /// expired より先に来る、というこのモジュールの doc comment の順序を
+    /// 固定する）。
+    #[tokio::test]
+    async fn tripped_key_is_reported_as_tripped_even_if_also_expired() {
+        let svc = service().await;
+        let issued = svc
+            .issue("tripped-and-expired", vec!["read".to_string()], Some(1))
+            .await
+            .unwrap();
+        svc.trip(issued.id).await.unwrap();
+
+        let lookup = svc.lookup(&issued.key, 1_000_000).await.unwrap();
+        match lookup {
+            ApiKeyLookup::Tripped { id, .. } => assert_eq!(id, issued.id),
+            other => panic!("expected Tripped, got {other:?}"),
+        }
+    }
+
+    /// Info-leak guard（このモジュールの doc comment参照）: 期限切れキーの
+    /// prefix に対する偽造 secret は、他の偽造と同じく常に `NotFound` -
+    /// `wrong_secret_against_a_revoked_key_is_still_not_found`/
+    /// `wrong_secret_against_a_tripped_key_is_still_not_found` と同型。
+    #[tokio::test]
+    async fn wrong_secret_against_an_expired_key_is_still_not_found() {
+        let svc = service().await;
+        let issued = svc
+            .issue("expired-forged", vec!["read".to_string()], Some(1))
+            .await
+            .unwrap();
+
+        let (prefix, _secret) = parse_key(&issued.key).unwrap();
+        let forged = format!("bh_{prefix}_{}", generate_secret());
+        let lookup = svc.lookup(&forged, 1_000_000).await.unwrap();
+        assert_eq!(lookup, ApiKeyLookup::NotFound);
+    }
+
+    /// `list`/`ApiKeySummary` にも `expires_at` がそのまま(epoch ミリ秒)で
+    /// 反映される。
+    #[tokio::test]
+    async fn list_reflects_expires_at() {
+        let svc = service().await;
+        svc.issue("unlimited", vec!["read".to_string()], None)
+            .await
+            .unwrap();
+        svc.issue("expiring", vec!["read".to_string()], Some(2_000_000))
+            .await
+            .unwrap();
+
+        let listed = svc.list().await.unwrap();
+        let unlimited = listed.iter().find(|k| k.name == "unlimited").unwrap();
+        assert_eq!(unlimited.expires_at, None);
+        let expiring = listed.iter().find(|k| k.name == "expiring").unwrap();
+        assert_eq!(expiring.expires_at, Some(2_000_000));
     }
 }
