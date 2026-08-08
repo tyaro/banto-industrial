@@ -87,7 +87,7 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 # their -core crates), same CI/build reasoning as banto's own workspace
 # Cargo.toml comment on these two.
 keyring = { version = "3", features = ["windows-native", "apple-native", "sync-secret-service"] }
-window-vibrancy = "0.6"
+window-vibrancy = "0.8"
 # Dev-only: isolated temp dirs for filesystem-touching tests (backup
 # service, etc. - mirrors banto's own reasoning for this dependency).
 tempfile = "3"
