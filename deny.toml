@@ -1,0 +1,127 @@
+# cargo-deny 設定(2026-08-08 導入、docs/improvement-plan.md H6)。
+#
+# 産業用途では「同じソースから同じものを再生成できる」再現性・供給網の
+# 健全性が重要という判断から、依存クレートのライセンス・既知脆弱性
+# (advisory)・重複バージョン・取得元(source)を CI で機械的に検証する
+# (.github/workflows/supply-chain.yml から `EmbarkStudios/cargo-deny-action`
+# 経由で `cargo deny check` を実行。--all-features で呼び出す)。
+#
+# cargo-deny 0.20 系のスキーマに準拠(licenses/advisories の `version`
+# フィールドは廃止済みで指定不要。旧来の unlicensed/deny/copyleft/
+# allow-osi-fsf-free/default は既に存在しない = 「allow に無いライセンスは
+# 全て拒否」が唯一の挙動)。
+
+[licenses]
+# allow は推測でなく実測に基づく。一次情報源は2段階:
+#   1) `cargo metadata --format-version 1 --offline`(default-features 版・
+#      --all-features 版の両方、2026-08-08 時点で default 654 / all-features
+#      664 パッケージ、workspace member 13 は別扱い)で依存木全体の
+#      `license` フィールドを集計。
+#   2) 実際に `cargo deny --all-features list`(本ファイルの [sources] 等が
+#      揃った状態で実行)で、cargo-deny 自身が「実際にチェック対象とする
+#      グラフ」上の集計と突き合わせ、乖離を確認した。
+# 2) の集計は 1) の超集合ではなく、`Cargo.lock` には載っているが
+# feature 解決の結果どの workspace crate からも到達しない package
+# (例: json5 0.4.1 / libloading 0.7.4, ISC license。tauri-utils 等の
+# manifest には現れるが有効化されるフィーチャの組合せでは resolve
+# グラフに現れない)を除外する。allow リストは 2) の実測(13種)に
+# 合わせてあり、1) 由来で足していた "ISC" は未使用と判明したため外した
+# (`cargo deny check licenses` の `license-not-encountered` warning で検出)。
+#
+# GPL 系(GPL/AGPL/LGPL/GFDL)は allow に含めない(オーナー方針)。依存木内
+# では r-efi 5.3.0/6.0.0 のみが `MIT OR Apache-2.0 OR LGPL-2.1-or-later` を
+# 名乗るが、OR 式であり MIT/Apache-2.0 側で充足するため LGPL を allow に
+# 入れる必要はない(cargo-deny は式全体を評価し、OR は一方が allow に
+# あれば充足とみなす。実際に `cargo deny check licenses` は LGPL 追加なしで
+# green)。
+allow = [
+    "MIT",
+    "Apache-2.0",
+    # target-lexicon が単独(OR 無し)でこの形を名乗るため、"Apache-2.0" とは
+    # 別に組み合わせ全体を許可する必要がある(SPDX の WITH 例外はライセンス
+    # 本体と不可分)。rustix/wasi 等は `... WITH LLVM-exception OR Apache-2.0
+    # OR MIT` の形で MIT 単体でも充足するが、target-lexicon@0.12.16 はこの
+    # 形以外の選択肢がない。
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",     # zerocopy / zerocopy-derive
+    "BSD-3-Clause",
+    "BSL-1.0",           # Boost Software License(ryu / whoami / wasite ほか)
+    "CC0-1.0",           # dunce / tiny-keccak
+    "MIT-0",             # dunce の代替枝
+    # MPL-2.0 はファイル単位の弱いコピーレフト(GPL 系のプロジェクト単位
+    # コピーレフトとは別物で、cargo-deny のドキュメントも GNU 系
+    # (GPL/AGPL/LGPL/GFDL)とは別扱い)。cssparser / cssparser-macros /
+    # selectors / option-ext / dtoa-short が要求しており除外すると依存解決
+    # 不能になるため許可する。オーナーが弱コピーレフトも避けたい場合は
+    # ここを見直すこと。
+    "MPL-2.0",
+    "Unicode-3.0",       # ICU4X 系(icu_* / zerovec 等)・unicode-ident
+    "Unlicense",         # aho-corasick / memchr / byteorder / walkdir ほか
+    "Zlib",
+    "0BSD",              # adler2
+]
+# confidence-threshold・include-build・include-dev・unused-allowed-license
+# などは既定値のまま(明示的に変える理由がないため)。
+
+[bans]
+# 初期導入のため multiple-versions は "warn" に留め、既存の重複バージョンの
+# 整理(別タスク)を待たずに CI が green になるようにする。整理が済んだ
+# 段階で "deny" への引き上げを検討する(本ファイルはその際にも更新する)。
+multiple-versions = "warn"
+# wildcard 依存("*" 版数指定)はバージョン固定を無意味化し H6 の再現性方針
+# と直接矛盾するため deny(初期導入の緩和対象に含めない)。
+wildcards = "deny"
+# 実測で判明: cargo-deny は crates.io 公開の可否基準で判定するため、
+# `path = "../foo"` のようにバージョン指定を伴わない workspace 内部の
+# path 依存も既定では「wildcard」として扱われる(banto-broker/-collect 等の
+# クレート間 path 依存すべてが該当し、`wildcards = "deny"` だけでは
+# `cargo deny check bans` が本リポジトリで必ず失敗する)。本ワークスペースの
+# 全メンバーは `publish.workspace = true`(= `publish = false`)で
+# 非公開なので、`allow-wildcard-paths = true` で「非公開クレートの
+# path/git 依存」を wildcard 判定から除外する(crates.io へ公開する
+# クレートが出てきた場合はそのクレートだけ対象外になる=安全側)。
+allow-wildcard-paths = true
+# 副次的な効果として、`allow-wildcard-paths = true` を入れる前は
+# `banto-core`/`banto-storage`/`banto-server`(git 依存を
+# `{ workspace = true }` で参照している箇所)について
+# `bug[unresolved-workspace-dependency]`(cargo-deny 自身が
+# checks/bans/diags.md で「cargo-deny 側のバグの可能性が高い」と認めている
+# 診断)が出ていたが、上記の設定後は解消して出力から消えることを実測で
+# 確認した(wildcard 判定と同じ内部解決パスを通るためと推測される)。
+#
+# [bans.workspace-dependencies](workspace.dependencies の重複/未使用検査)は
+# 本タスク(H6)の実装仕様に含まれないため未設定。
+
+[sources]
+# 取得元を crates.io と banto 本体の git 依存だけに限定する。
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# banto-core / banto-storage / banto-server(Cargo.toml 参照、tag = "v0.1.1")
+# のみを許可する。".git" 有無はどちらでも cargo 側の正規化により一致する。
+allow-git = ["https://github.com/tyaro/banto"]
+# banto への参照は tag 指定を必須化する(branch/rev への変更は再現性を
+# 損なうため意図的にブロックする。変更したい場合は本ファイルも同時に
+# 見直すこと)。
+required-git-spec = "tag"
+
+[advisories]
+# 既定(deny)を維持: 既知の脆弱性(vulnerability)は無条件で CI を落とす。
+#
+# unmaintained については、cargo-deny 0.18 以降のスキーマでは
+# deny/warn/allow のような lint level ではなく「どの範囲を対象にするか」
+# の scope 指定(all/workspace/transitive/none)に変わっている(このコンテナに
+# 実際に `cargo install`した v0.20.2 の公式ドキュメント
+# checks/advisories/cfg.md と CHANGELOG.md を突き合わせて確認、単なる
+# 推測ではない)。深い transitive 依存の unmaintained advisory で無関係な
+# PR を落とさないよう、cargo-deny
+# 自身の dogfood 設定と同じ "workspace"(直接依存のみを対象)を採用する。
+# これが実装仕様「unmaintained 等は warn」の、現行スキーマにおける実質的な
+# 対応にあたる(scope を絞ることで transitive 依存由来の unmaintained
+# advisory は CI を落とさない = 実質 warn 相当の運用)。unsound も同様の
+# 理由で "workspace" とする。
+unmaintained = "workspace"
+unsound = "workspace"
+# yanked クレートは既定で "warn"(明示して分かりやすくする)。
+yanked = "warn"
+ignore = []
