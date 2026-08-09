@@ -68,6 +68,18 @@
 //!   モードの発行機能（rumqttc）。[`hub::CollectorManager`] を読むだけの
 //!   消費者（設計 §3.4「収集に背圧をかけない」） - `crate::stream`と同じ
 //!   立ち位置
+//! - [`runtime`]: T14-1（docs/banto-hub-t14-design.md §3「D1」）。
+//!   composition root（[`runtime::HubRuntime::start`]/
+//!   [`runtime::RunningHub::shutdown`]）- DB初期化〜各サービス構築〜
+//!   axumサーバー起動〜シャットダウン順序を1箇所に持ち、`bin/banto-hub.rs`
+//!   （コンソール）と `bin/banto_hub/win_service.rs`（Windows サービス）の
+//!   両ホストから呼ばれる薄い composition root。以前は bin 側の
+//!   `hub_run::run(shutdown)` だった
+//! - [`hub_log`]: T14-1 でバイナリクレートからこの lib へ移設した出力
+//!   ヘルパー（[`runtime`] が composition root としてここに来たため）。
+//!   `println!`/`eprintln!` の薄いラッパーで、Windows サービスモードの
+//!   間だけ同じ内容をファイルにもミラーする（[`hub_log`] のモジュール doc
+//!   参照）
 //!
 //! T0/T1 のスコープ外（設計冒頭の指示どおり実装しない）: gRPC、管理 UI
 //! フロントエンドの中身の一部、演算タグ、接続単位の部分再構成。書き込み
@@ -86,8 +98,10 @@ pub mod diag_log;
 pub mod events;
 pub mod grpc;
 pub mod hub;
+pub mod hub_log;
 pub mod mqtt;
 pub mod rest;
+pub mod runtime;
 pub mod settings;
 pub mod stream;
 pub mod subscribe_core;

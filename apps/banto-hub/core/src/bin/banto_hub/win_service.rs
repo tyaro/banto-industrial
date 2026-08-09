@@ -39,8 +39,8 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
 
-use crate::hub_log::{self, log_err_line, log_line};
-use crate::hub_run;
+use banto_hub_core::hub_log::{self, log_err_line, log_line};
+use banto_hub_core::runtime::HubRuntime;
 
 /// SCM 上のサービス名（内部識別子・`sc query`/`Get-Service -Name`等で使う
 /// キー）。表示名（[`SERVICE_DISPLAY_NAME`]）とは別物。
@@ -195,7 +195,8 @@ fn service_main(arguments: Vec<OsString>) {
 
 fn run_service_body(_arguments: Vec<OsString>) {
     // ログファイル（このファイルのモジュール doc、`hub_log`のモジュール
-    // doc 参照）- `hub_run::run`が最初の1行を出すより前に開いておく。
+    // doc 参照）- `HubRuntime::start`（T14-1、`banto_hub_core::runtime`）が
+    // 最初の1行を出すより前に開いておく。
     let log_dir = hub_log::resolve_service_log_dir();
     let log_path = log_dir.join(hub_log::SERVICE_LOG_FILE_NAME);
     if let Err(err) = hub_log::enable_service_log_file(&log_path) {
@@ -210,10 +211,12 @@ fn run_service_body(_arguments: Vec<OsString>) {
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
-            // SCM からの停止要求 = このバイナリの停止トリガー
-            // （`hub_run::run`の`shutdown`パラメータに配線する）。
+            // SCM からの停止要求 = このバイナリの停止トリガー（この
+            // `Notify`を`notified().await`で待ってから
+            // `RunningHub::shutdown`を呼ぶ - 下記参照）。
             // MQTT→gRPC→Collector→broker→サーバーの既存シャットダウン順序は
-            // `hub_run::run`側がそのまま実行する。
+            // `RunningHub::shutdown`（T14-1、`banto_hub_core::runtime`）側が
+            // そのまま実行する。
             ServiceControl::Stop => {
                 handler_notify.notify_one();
                 ServiceControlHandlerResult::NoError
@@ -254,12 +257,13 @@ fn run_service_body(_arguments: Vec<OsString>) {
     };
 
     // 簡略化: 本来は起動処理中に`StartPending`+チェックポイントを刻むべき
-    // だが（SCM の既定タイムアウトは約30秒）、`hub_run::run`は単一の
-    // async関数で細かい進捗チェックポイントを持たない。DB初期化・
-    // collector構築等は通常このタイムアウトに収まる規模なので、
-    // `windows-service`クレート自身の`ping_service`例と同様に、ハンドラ
-    // 登録直後に`Running`を報告する単純化を選んだ（将来、起動が遅くなる
-    // ようなら`StartPending`の刻みを追加する余地あり）。
+    // だが（SCM の既定タイムアウトは約30秒）、`HubRuntime::start`（T14-1、
+    // `banto_hub_core::runtime`）は単一の async関数で細かい進捗
+    // チェックポイントを持たない。DB初期化・collector構築等は通常この
+    // タイムアウトに収まる規模なので、`windows-service`クレート自身の
+    // `ping_service`例と同様に、ハンドラ登録直後に`Running`を報告する
+    // 単純化を選んだ（将来、起動が遅くなるようなら`StartPending`の刻みを
+    // 追加する余地あり）。
     report_status(ServiceState::Running, ServiceExitCode::Win32(0));
     log_line("banto-hub: Windows サービスとして起動しました");
 
@@ -274,10 +278,25 @@ fn run_service_body(_arguments: Vec<OsString>) {
         }
     };
 
-    let shutdown = async move {
+    // env 読み取り（T14-1 でホスト側へ移設 - `crate::build_hub_config`の
+    // doc comment参照）は同期処理なので、ランタイムへ入る前に済ませる。
+    let config = crate::build_hub_config();
+    runtime.block_on(async move {
+        // 旧 `hub_run::run`はここで `expect("init_db should succeed")`等の
+        // 4箇所が panic していた（設計 §2「現行コード地図」）。
+        // `run_service_body`全体は`service_main`で`catch_unwind`されており
+        // （このファイル冒頭のモジュール doc 参照）、panic した場合
+        // `report_status(Stopped, ...)`は実行されない（＝SCM への正常終了
+        // 報告なしにプロセスが終わる）まま変えない - T14-1 は`Result`化した
+        // ものの、ここで明示的に`panic!`し直すことで挙動不変を保つ
+        // （実装指示 T14-1 §6「同等の異常終了」）。
+        let hub = match HubRuntime::start(config).await {
+            Ok(hub) => hub,
+            Err(err) => panic!("banto-hub: 起動に失敗しました: {err}"),
+        };
         shutdown_notify.notified().await;
-    };
-    runtime.block_on(hub_run::run(shutdown));
+        hub.shutdown().await;
+    });
 
     log_line("banto-hub: Windows サービスを停止しました");
     report_status(ServiceState::Stopped, ServiceExitCode::Win32(0));

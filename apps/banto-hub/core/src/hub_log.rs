@@ -1,5 +1,12 @@
-//! T5-1（docs/tag-server-design.md §8「常駐」）: `bin/banto-hub.rs` 全体の
-//! 出力ヘルパー。
+//! T5-1（docs/tag-server-design.md §8「常駐」）: banto-hub 全体の出力
+//! ヘルパー。T14-1（docs/banto-hub-t14-design.md §3「D1」）でバイナリクレート
+//! （旧 `bin/banto_hub/hub_log.rs`）からこの lib クレート（`banto_hub_core`）
+//! へ移設した - `crate::runtime`（composition root）がこのライブラリ側に
+//! 来たため、バイナリクレート限定だったこのモジュールを参照できなくなった
+//! ことによる。出力内容（`println!`/`eprintln!`の薄いラッパー、下記
+//! 「コンソールモードの出力は一切変更しない」契約）は移設前と1バイトも
+//! 変えていない - `bin/banto-hub.rs`/`bin/banto_hub/win_service.rs`からは
+//! `banto_hub_core::hub_log`として引き続き使う。
 //!
 //! コンソールモードは元々すべて `println!`/`eprintln!` 直書きだった
 //! （`log`/`tracing` クレートは未導入 - このワークスペースの依存追加は
@@ -29,14 +36,15 @@ static SERVICE_LOG_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
 
 /// `path` を作成（既存なら追記）で開き、以降 [`log_line`]/[`log_err_line`]
 /// が呼ばれるたびにタイムスタンプ付きの1行を追記する状態にする。
-/// `win_service::run_service_main` が `hub_run::run` を呼ぶ**前**に一度だけ
-/// 呼ぶ - コンソールモードは一度も呼ばない。
+/// `win_service::run_service_body` が `HubRuntime::start`（T14-1、
+/// `crate::runtime`）を呼ぶ**前**に一度だけ呼ぶ - コンソールモードは一度も
+/// 呼ばない。
 ///
 /// 親ディレクトリが無ければ作成する（初回インストール直後は `data_dir`
 /// 自体がまだ存在しないことがあるため）。失敗は呼び出し側が判断する
 /// （このファイル自身は「ログ出力先が無い」以上のことを知らないので
-/// fatal 扱いにしない - `hub_run.rs`の他の起動処理と同じ「失敗してもプロセス
-/// 継続」の作法）。
+/// fatal 扱いにしない - `crate::runtime`の他の起動処理と同じ「失敗しても
+/// プロセス継続」の作法）。
 pub fn enable_service_log_file(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -53,9 +61,9 @@ pub fn enable_service_log_file(path: &Path) -> std::io::Result<()> {
 /// 環境変数（未設定なら既定 `"./data"`）のみを見る、**あえて**簡略化した
 /// 解決規則。
 ///
-/// `bin/hub_run.rs`側の実際の `data_dir` は「環境変数 → 設定 DB の
+/// `crate::runtime`側の実際の `data_dir` は「環境変数 → 設定 DB の
 /// `data.dir` → 既定値」の3層だが、設定 DB を読むには非同期の DB
-/// 接続が要る - このファイルはサービスモードで `hub_run::run` が最初の
+/// 接続が要る - このファイルはサービスモードで `HubRuntime::start` が最初の
 /// 1行を出力する**前**にログファイルを開き終えている必要があるため、
 /// DB を読まずに済む env 変数だけの層で解決する。両者は env 変数を
 /// 設定していれば必ず一致し、設定 DB だけで `data.dir` をカスタマイズ
@@ -166,7 +174,7 @@ mod tests {
     // な `OnceLock`に書き込む - 一度 Some になった後は同じテストバイナリ内の
     // 以後すべての `log_line`/`log_err_line`呼び出しがこのファイルへも
     // ミラーされ続ける（`OnceLock`は取り消せない）。本番では
-    // `win_service::run_service_main`がプロセス起動ごとに高々1回だけ呼ぶので
+    // `win_service::run_service_body`がプロセス起動ごとに高々1回だけ呼ぶので
     // 問題にならないが、テストでは他のテストとの意図しない相互作用を避ける
     // ため、このテストケース1つだけに留める（他のテストで `log_line`の
     // ファイルミラー有無をアサートしない）。ディレクトリは削除しない -

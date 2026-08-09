@@ -54,6 +54,10 @@ banto-expr = { path = "../../../crates/banto-expr" }
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# T14-1 (docs/banto-hub-t14-design.md §3「D1」): runtime.rs の
+# `HubStartError` - 既存クレート（banto-collect 等）と同じ thiserror 由来の
+# 列挙型エラーに揃える。
+thiserror = { workspace = true }
 # T1（docs/tag-server-design.md §5.2）: `GET /api/v1/stream` の WebSocket
 # アップグレード(`axum::extract::ws`)。workspace 既定の axum features に
 # `ws` を足すだけで新規依存は増えない(axum が既に `dep:tokio-tungstenite`

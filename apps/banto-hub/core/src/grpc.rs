@@ -755,8 +755,8 @@ impl GrpcServer {
     /// 起動せずに戻る。gRPC は任意設定のサブシステムなので、bind
     /// アドレス1つの不正値でプロセス全体(REST/WS を含む)を落とす理由が
     /// ない(`grpc_config`が失敗したときに既定値へフォールバックする
-    /// `bin/banto_hub/hub_run.rs`と同じ「壊れた設定で全体を道連れに
-    /// しない」判断)。
+    /// `crate::runtime`(旧 `bin/banto_hub/hub_run.rs`、T14-1で移設)と
+    /// 同じ「壊れた設定で全体を道連れにしない」判断)。
     pub async fn apply(&self, settings: &GrpcSettings) {
         let mut guard = self.running.lock().await;
         if let Some(handle) = guard.take() {
