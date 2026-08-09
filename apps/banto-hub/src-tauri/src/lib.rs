@@ -273,30 +273,53 @@ mod tests {
     /// が既にカバーしている（このシェル crate は Tauri アプリの外形からは
     /// 単体テストできないため - 実装指示「Tauri なしのロジックを分離できれば
     /// core 側既存テストでも可」）。ここではこの crate 固有のロジックだけを
-    /// 検証する: 環境変数が一切設定されていない状態で
-    /// `apps/banto-hub/core/src/bin/banto-hub.rs::build_hub_config`
-    /// と同じ既定値になること。
+    /// 検証する: `apps/banto-hub/core/src/bin/banto-hub.rs::build_hub_config`
+    /// と同じ読み取りロジック（キーごとに「未設定なら既定値」「設定されて
+    /// いれば env の値を反映」）になっていること。
+    ///
+    /// 2026-08-09 レビュー指摘で修正: 以前は「5キーとも未設定である」ことを
+    /// 前提にしていたため、CI や開発者環境で `BANTO_DB` 等がたまたま
+    /// 設定されていると flaky に失敗していた。ここではキーごとに実際の
+    /// 環境変数の有無を読み、その分岐に応じたアサーションを行う - どの
+    /// 実行環境でも決定的に成功する。`std::env::set_var`/`remove_var` に
+    /// よるテスト内での書き換えは、並列実行される他テストのプロセス全体の
+    /// 環境を巻き込む副作用があるため使わない。
     #[test]
-    fn build_hub_config_defaults_when_env_unset() {
-        for key in [
-            "BANTO_DB",
-            "BANTO_ALLOW_SETUP",
-            "PORT",
-            "BANTO_BIND",
-            "BANTO_HUB_DATA",
-        ] {
-            assert!(
-                std::env::var(key).is_err(),
-                "test environment must not predefine {key} for this assertion to be meaningful"
-            );
+    fn build_hub_config_reflects_or_defaults_each_env_var() {
+        let config = build_hub_config();
+
+        match std::env::var("BANTO_DB") {
+            Ok(value) => assert_eq!(config.db_path, value),
+            Err(_) => assert_eq!(config.db_path, DEFAULT_DB_PATH),
         }
 
-        let config = build_hub_config();
-        assert_eq!(config.db_path, DEFAULT_DB_PATH);
-        assert!(!config.allow_setup);
-        assert_eq!(config.port_override, None);
-        assert_eq!(config.bind_override, None);
-        assert_eq!(config.data_dir_override, None);
+        match std::env::var("BANTO_ALLOW_SETUP") {
+            Ok(value) => assert_eq!(config.allow_setup, value == "1"),
+            Err(_) => assert!(!config.allow_setup),
+        }
+
+        match std::env::var("PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+        {
+            Some(port) => assert_eq!(config.port_override, Some(port)),
+            None => assert_eq!(config.port_override, None),
+        }
+
+        match std::env::var("BANTO_BIND") {
+            Ok(value) => assert_eq!(config.bind_override, Some(value)),
+            Err(_) => assert_eq!(config.bind_override, None),
+        }
+
+        match std::env::var("BANTO_HUB_DATA") {
+            Ok(value) => {
+                assert_eq!(
+                    config.data_dir_override,
+                    Some(std::path::PathBuf::from(value))
+                )
+            }
+            Err(_) => assert_eq!(config.data_dir_override, None),
+        }
     }
 
     /// [`js_string_literal`] は [`show_startup_error`] が
