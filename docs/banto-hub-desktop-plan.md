@@ -5,8 +5,10 @@
 `cursor/t18-1-form-dirty-e3cb`）: §9.4 TAG-UX-C のうち dirty 追跡と破棄確認
 を実装（詳細は §9.4 TAG-UX-C の実装メモ）。続く `cursor/t18-1-drawer-busy-e3cb`
 で同 §9.4 の「保存、削除、検証、登録、閉じるを Drawer 単位の busy 状態で
-相互排他にする」も実装済み。TAG-UX-C の残り（`<form>` 化、revision/ETag、
-削除前参照影響、初期読込状態の区別）は未着手。TAG-P0-2・TAG-P0-3 は未着手。
+相互排他にする」も実装済み。続く `cursor/t18-1-tags-form-e3cb` で同 §9.4 の
+「create / edit を `<form>` 化し、必須表示、Enter 送信、クライアント軽量
+検証」も実装済み。TAG-UX-C の残り（revision/ETag、削除前参照影響、初期
+読込状態の区別）は未着手。TAG-P0-2・TAG-P0-3 は未着手。
 最終検証日(コード照合): 2026-08-09
 基準コミット: `22c8c02`（main、PR #103 `optNum` 修正マージ後）。T18-1 は本 PR
 （`apps/banto-hub/src/lib/banto/continuousRegistration.ts` の
@@ -15,9 +17,11 @@ banto-hub 用 Playwright/DOM e2e 基盤の新設）で続行し、続く
 `cursor/t18-1-form-dirty-e3cb` で TAG-UX-C の dirty 追跡・破棄確認
 （create/edit/連続登録/CSVインポート Drawer、`formDirty.ts`、
 `Drawer.svelte` の `onRequestClose`、`banto-hub-tags-dirty-confirm.spec.ts`）
-を追加し、さらに続く `cursor/t18-1-drawer-busy-e3cb` で Drawer busy 状態の
+を追加し、続く `cursor/t18-1-drawer-busy-e3cb` で Drawer busy 状態の
 相互排他（`deleting` フラグの新設、各ボタンの `disabled` を `isDrawerBusy()`
-に統一、`banto-hub-tags-busy.spec.ts`）を追加。
+に統一、`banto-hub-tags-busy.spec.ts`）を追加し、さらに続く
+`cursor/t18-1-tags-form-e3cb` で create/edit Drawer の `<form>` 化・Enter
+送信・必須項目の `required` 表示（`banto-hub-tags-form.spec.ts`）を追加。
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [banto-hub-t16-design.md](banto-hub-t16-design.md)、
@@ -709,8 +713,34 @@ UX-5 の決定を UI のボタン非表示だけで実装しない。アプリ�
 > 削除実行中に保存ボタンが disabled かつ `×` でも確認さえ出さずに閉じ
 > られないことを確認）。
 >
-> **未着手のまま残っている部分**: create/edit の `<form>` 化・Enter
-> 送信・クライアント軽量検証（1点目）、revision/ETag による後勝ち防止・
+> **2026-08-09 追加実装（T18-1 続き、`cursor/t18-1-tags-form-e3cb`）:
+> 1点目「create / edit を `<form>` 化し、必須表示、Enter 送信、クライアント
+> 軽量検証」を実装済み。** `tags/+page.svelte` の create・edit Drawer 内側
+> （`tagFields` snippet を包む要素）を `<div class="drawer-section">` から
+> `<form class="drawer-section" onsubmit={...}>`（onsubmit 内で
+> `event.preventDefault()` してから create は `handleCreate()`、edit は
+> `saveEdit()` を呼ぶ）に変更し、`login/+page.svelte` の既存パターンに
+> 合わせた。「作成」「保存」ボタンは `type="submit"` にして `onclick` を
+> 外した（`disabled` 条件は変更なし）。edit の「削除」は従来どおり
+> `type="button"` と `onclick={handleDelete}` のまま維持し、submit させ
+> ない（削除は別の非同期操作であり、フォーム送信の対象ではない）。
+> `tagFields` 側は `name`・`collectionGroupId`（収集グループ）・
+> `tagKind === 'plc'` 時の `address`・`tagKind === 'computed'` 時の
+> `expression` に HTML `required` 属性と、`.required` クラス（CSS 追加
+> のみ）を当てた `*` の視覚的な必須マークを付けた。他の数値・オプ
+> ション項目（RawLo/RawHi/しきい値等）には付けていない — バックエンド
+> 側で既に「未設定 = 送信しない」という設計（`toInput` の
+> `parseOptionalNumber`）のため、クライアント側の必須表示はサーバーが
+> 実際に必須とする項目だけに限る。continuous/csv Drawer はこの PR では
+> 変更していない（対象外）。実 DOM 受け入れは
+> `e2e/tests-banto-hub/banto-hub-tags-form.spec.ts`（`pnpm e2e:banto-hub`）
+> で、create Drawer で必須項目入力後 Enter 送信でタグが作成されること、
+> 名前を空にしたまま送信すると HTML5 制約検証で `POST /api/tags` 自体が
+> 発生しないこと（`page.route` でカウント）、edit Drawer でも Enter 送信
+> で保存できることを確認している。既存の busy/dirty/continuous/smoke の
+> 4 spec も同じ実行で全て green のままであることを確認済み。
+>
+> **未着手のまま残っている部分**: revision/ETag による後勝ち防止・
 > 差分表示（4点目）、削除前の参照影響・完全外部名表示（5点目）、
 > 初期読込失敗/0件/検索結果0件/再読込中/stale 一覧の区別（6点目）。
 > 受け入れ条件のうち「ボタン連打や保存／削除競合でも mutation は1回だけ
