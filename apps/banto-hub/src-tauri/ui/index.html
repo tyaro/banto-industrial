@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="ja">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>banto-hub</title>
+		<style>
+			html,
+			body {
+				height: 100%;
+				margin: 0;
+				font-family: 'Segoe UI', system-ui, sans-serif;
+				background: #1b1b1f;
+				color: #eee;
+			}
+			main {
+				height: 100%;
+				display: flex;
+				align-items: center;
+				justify-content: center;
+				text-align: center;
+				padding: 1.5rem;
+			}
+			#banto-hub-status {
+				font-size: 1.1rem;
+				white-space: pre-line;
+			}
+		</style>
+	</head>
+	<body>
+		<!--
+      T16-0 (docs/banto-hub-t16-design.md §4.1「P3」): この HTML は
+      HubRuntime 起動が終わるまでの一瞬だけ表示される最小プレースホルダで
+      あり、独自の管理 UI ではない。src/lib.rs の setup() が
+      HubRuntime::start に成功したら、このウィンドウを Hub 自身が配信する
+      http://127.0.0.1:{port}/ へ navigate() する - 管理画面本体は常に Hub
+      (axum) が同一 origin で配信するものだけで、frontendDist の二重配布は
+      行わない。起動に失敗した場合は Rust 側から #banto-hub-status の
+      文言を書き換えてエラーを表示する（src/lib.rs::show_startup_error 参照）。
+    -->
+		<main>
+			<p id="banto-hub-status">起動中…</p>
+		</main>
+	</body>
+</html>

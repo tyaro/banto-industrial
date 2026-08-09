@@ -6,7 +6,11 @@
 # apps/chronogazer/{core,src-tauri}, W1: apps/relay-wright/{core,src-tauri},
 # T0: apps/banto-hub/core (headless タグサーバー、
 # docs/tag-server-design.md), T6-1: crates/banto-expr (演算タグの式評価
-# エンジン、依存ゼロの純粋クレート。hub への配線は T6-2) - see docs/plan.md /
+# エンジン、依存ゼロの純粋クレート。hub への配線は T6-2), T16-0:
+# apps/banto-hub/src-tauri (薄いデスクトップシェル `banto-hub-shell` -
+# HubRuntime を埋め込み Hub 自身の localhost UI を WebView で開くだけ、
+# 独自 frontendDist/invoke は持たない。docs/banto-hub-t16-design.md) -
+# see docs/plan.md /
 # docs/r1-plan.md /
 # the relay-wright plan `luminous-discovering-goblet.md` /
 # docs/tag-server-design.md. banto crates are consumed via git-tag references
@@ -27,6 +31,7 @@ members = [
     "apps/relay-wright/core",
     "apps/relay-wright/src-tauri",
     "apps/banto-hub/core",
+    "apps/banto-hub/src-tauri",
 ]
 
 [workspace.package]

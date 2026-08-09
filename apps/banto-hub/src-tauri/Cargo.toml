@@ -1,0 +1,31 @@
+[package]
+name = "banto-hub-shell"
+description = "banto-hub 薄いデスクトップシェル (T16-0, docs/banto-hub-t16-design.md) - HubRuntime を埋め込み、Hub 自身の localhost UI を WebView で開くだけ。ヘッドレス bin `banto-hub` とは別パッケージ（名前衝突回避）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "banto_hub_shell_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# T16-0 設計 §4.1: HubRuntime を埋め込むだけ - 独自 frontendDist/invoke API は
+# 持たない（design P3・実装指示「二重 UI は作らない」）。
+banto-hub-core = { path = "../core" }
+# トレイアイコン（design §4.3）用に `tray-icon` feature を有効化する - tauri
+# crate の既定 feature には含まれない（chronogazer/relay-wright はトレイを
+# 使わないため既定のまま）。
+tauri = { version = "2", features = ["tray-icon"] }
+# 設計 §4.2「単一インスタンス」: 第二インスタンスは既存ウィンドウを前面化して
+# 自身は終了する。
+tauri-plugin-single-instance = "2"
+# `RunningHub` を保持する `tokio::sync::Mutex`（AppState フィールド型を名指し
+# するためだけの依存 - chronogazer/src-tauri の `tokio` 依存と同じ理由。
+# `HubRuntime::start`/`RunningHub::shutdown` 自体は `tauri::async_runtime`
+# 経由で呼ぶため、実行そのものにはこの依存は要らない）。
+tokio = { workspace = true, features = ["sync"] }
