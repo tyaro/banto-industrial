@@ -1396,19 +1396,25 @@ async fn mini_soak_100ms_three_groups_row_counts_within_tolerance() {
             rows.len(),
             run_secs * 10
         );
-        // Lower bound is deliberately loose (>=10, i.e. a third of the
-        // theoretical ~30): the scheduler is MissedTickBehavior::Skip, so a
-        // busy CI runner can only ever LOSE ticks, never burst extra rows -
-        // the >=18 bound proved flaky on real CI. What this still catches is
-        // a collector that stalls outright (0 rows) or grinds to a crawl,
-        // while the upper bound still pins "skip, don't burst". Tight timing
-        // guarantees are the #[ignore]d long soak's job, not CI's (same
-        // convention as banto-plc's perf smokes: wall-clock numbers are not a
-        // CI failure condition).
+        // Lower bound is deliberately loose (H7 ⑤, 2026-08-08: >=2, i.e.
+        // ~1/15 of the theoretical ~30): the scheduler is
+        // MissedTickBehavior::Skip, so a busy CI runner can only ever LOSE
+        // ticks, never burst extra rows. Both the earlier >=18 bound and the
+        // subsequent >=10 (a third of theoretical) bound proved flaky on
+        // real CI - severe oversubscription was observed to crater counts to
+        // roughly 1/10 of theoretical (~3 here). >=2 sits clearly below that
+        // worst-observed floor (with margin to spare) while still requiring
+        // more than a single fluke row - this test's job is liveness, not
+        // precise throughput (that's the #[ignore]d long soak's job below).
+        // What this still catches is a collector that stalls outright (0-1
+        // rows) or grinds to a crawl, while the upper bound still pins
+        // "skip, don't burst". Tight timing guarantees are not CI's job here
+        // (same convention as banto-plc's perf smokes: wall-clock numbers
+        // are not a CI failure condition).
         assert!(
-            rows.len() >= 10 && rows.len() <= 50,
-            "group {} expected ~30 rows in 3s @100ms (>=10 tolerated for busy \
-             runners), got {}",
+            rows.len() >= 2 && rows.len() <= 50,
+            "group {} expected ~30 rows in 3s @100ms (>=2 liveness floor tolerated for \
+             severely busy runners), got {}",
             g.key,
             rows.len()
         );

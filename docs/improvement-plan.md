@@ -3,9 +3,10 @@
 作成日: 2026-08-08
 状態: **進行中(Phase 1 = PR #58、Phase 2 = PR #59/#73、Phase 3 = H10 ①②③ を PR #74/#75 でマージ済み)**。
 H1〜H4・H6・H8・H10 完了、H5 は vitest 導入まで完了(E2E 拡充は Phase 4)。
-残りは H7(soak/障害系)・H9(SLMP 構造化エラー)・H5 の E2E 拡充
-(いずれも Phase 4 相当/環境依存)。
-最終検証日(コード照合): 2026-08-08
+H7 は ⑤ 既知フレーク安定化の 4 件(A.1/A.3/A.4/A.5)を 2026-08-09 に対応(本 PR)。
+残りは H7 の残タスク(A.2 フレーク・②③④ 堅牢性テスト・① 実機 soak)・
+H9(SLMP 構造化エラー)・H5 の E2E 拡充(いずれも Phase 4 相当/環境依存)。
+最終検証日(コード照合): 2026-08-09
 
 ## 0. 背景と位置づけ
 
@@ -41,18 +42,18 @@ H1〜H4・H6・H8・H10 完了、H5 は vitest 導入まで完了(E2E 拡充は 
 
 ## 2. 改善項目一覧(優先順)
 
-| ID  | 内容                                                     | 優先度 | 規模 | 状態                |
-| --- | -------------------------------------------------------- | ------ | ---- | ------------------- |
-| H1  | banto-expr の式長・ネスト深さ上限(DoS 根治)              | 最高   | 小   | 完了(#58/#59)       |
-| H2  | 手動書き込み(タグモニタ)の安全意味論                     | 最高   | 中   | 完了(#58)           |
-| H3  | banto-hub gRPC の bind 設定化(既定 127.0.0.1)            | 高     | 中   | 完了(#58)           |
-| H4  | 収集タイムスタンプ逆行対策 + append 失敗の可視化         | 高     | 中   | 完了(#58)           |
-| H5  | フロントテスト基盤(vitest)+ hub/relay-wright E2E         | 高     | 大   | vitest 完了・E2E 残 |
-| H6  | サプライチェーン/再現性(deny・audit・toolchain 固定ほか) | 高     | 中   | 完了(#59)           |
-| H7  | ソーク実行・障害系テスト(crash 再オープン・DST・並行)    | 中     | 大   | 未着手              |
-| H8  | ドキュメント整合(状態ヘッダ・README・状態欄義務化)       | 中     | 小   | 完了(#58/#59)       |
-| H9  | SLMP 構造化エラー(fork/upstream)+ transport 共通化       | 中     | 大   | 未着手              |
-| H10 | 認可の細粒度化(キー有効期限・read スコープ・arm 失効)    | 中     | 中   | 完了(#74/#75)       |
+| ID  | 内容                                                     | 優先度 | 規模 | 状態                     |
+| --- | -------------------------------------------------------- | ------ | ---- | ------------------------ |
+| H1  | banto-expr の式長・ネスト深さ上限(DoS 根治)              | 最高   | 小   | 完了(#58/#59)            |
+| H2  | 手動書き込み(タグモニタ)の安全意味論                     | 最高   | 中   | 完了(#58)                |
+| H3  | banto-hub gRPC の bind 設定化(既定 127.0.0.1)            | 高     | 中   | 完了(#58)                |
+| H4  | 収集タイムスタンプ逆行対策 + append 失敗の可視化         | 高     | 中   | 完了(#58)                |
+| H5  | フロントテスト基盤(vitest)+ hub/relay-wright E2E         | 高     | 大   | vitest 完了・E2E 残      |
+| H6  | サプライチェーン/再現性(deny・audit・toolchain 固定ほか) | 高     | 中   | 完了(#59)                |
+| H7  | ソーク実行・障害系テスト(crash 再オープン・DST・並行)    | 中     | 大   | ⑤一部(本 PR)・残 Phase 4 |
+| H8  | ドキュメント整合(状態ヘッダ・README・状態欄義務化)       | 中     | 小   | 完了(#58/#59)            |
+| H9  | SLMP 構造化エラー(fork/upstream)+ transport 共通化       | 中     | 大   | 未着手                   |
+| H10 | 認可の細粒度化(キー有効期限・read スコープ・arm 失効)    | 中     | 中   | 完了(#74/#75)            |
 
 ## 3. 各項目の詳細
 
@@ -249,7 +250,7 @@ H1〜H4・H6・H8・H10 完了、H5 は vitest 導入まで完了(E2E 拡充は 
 - **受け入れ条件**: CI に deny/audit ジョブが載り green、toolchain 固定後
   も全ジョブ green
 
-### H7: ソーク実行・障害系テスト — 状態: 未着手
+### H7: ソーク実行・障害系テスト — 状態: ⑤ 一部完了(既知フレーク安定化 = 本 PR、2026-08-09)。①②③④・A.2 は未着手/対象外
 
 - **事実**: ソークハーネスは**既にある**(banto-hub `tests/soak.rs`
   = 72h 用・Windows メモリプローブ付き、banto-collect に `#[ignore]` の
@@ -259,13 +260,43 @@ H1〜H4・H6・H8・H10 完了、H5 は vitest 導入まで完了(E2E 拡充は 
   ② 途中 kill → 再オープンで直近フラッシュ済みデータが読めるテスト
   ③ `ManualClock::set_utc_offset_ms` を使った DST 遷移テスト
   ④ writer append と tsquery 読みを実際に競走させるテスト
-  ⑤ 既知フレークの安定化: banto-hub
-  `tests/integration.rs` の
-  `an_invalid_config_keeps_the_old_collector_and_surfaces_last_config_error`
-  が busy な CI ランナーで quality `good` 期待に `stale` を返し失敗する
-  (2026-08-08、PR #57 の CI で観測 — Rust 無変更の PR で発生しており
-  base 由来。過去の同型修正 `2a96f20` / `3835779` と同じ手当てを適用する)
-- **備考**: ①はコンテナ/CI では完結しない(実行環境と 72h の実時間が必要)
+  ⑤ 既知フレークの安定化: 依存整理作業(2026-08-08〜09)で繰り返し観測した
+  タイミング/スループット依存フレークを、当リポジトリ既存の実証済みパターン
+  (`2a96f20` = 検証意図を保ったまま最終 assert 直前に `wait_until` の
+  bound-wait を挟む / `3835779` = 収集周期 `period_ms` を広げる)で安定化する
+- **実施記録(2026-08-09、本 PR)**: ⑤ のうち原因が明確な 4 件をテスト専用変更で
+  安定化(prod コード不変・`banto-hub-core` / `banto-collect` の clippy・fmt clean)。
+  - **A.3** gRPC `stream_values_sends_initial_snapshot_then_on_change`: 読み取り時の
+    quality 導出(`period_ms × STALE_PERIOD_FACTOR 2.5` = 250ms)が 250ms の eval tick と
+    同オーダーのため、値不変のまま `Good→Stale` の偽 on_change が本命の 10→99 変化より
+    先に届きうる。**99 が届くまでストリームを drain**(偽 stale を読み飛ばし、全体
+    デッドライン付き)して吸収
+  - **A.5** `integration.rs`
+    `an_invalid_config_keeps_the_old_collector_and_surfaces_last_config_error`:
+    同じ 250ms 余裕。最終 `q=="good"` の直前に `wait_until(8s)` の bound-wait を挿入
+    (`2a96f20` と同型、hard assert は不変)
+  - **A.1** `stream.rs` `plc_disconnect_is_relayed_as_an_event`: subscribe-after-publish
+    競合(`connect_ws` 返却は client が 101 を見ただけで、server の `handle_socket` が
+    `subscribe_events()` に到達済みとは限らない。`broadcast` はリプレイ無しなので
+    `sim.stop()` が先行するとイベントを取りこぼす)。`sim.stop()` の**前に**値購読+初期
+    スナップショット往復で購読の生存を確定
+  - **A.4** soak スループット下限を生存性フロアに緩和(`tests/soak.rs` mini_soak =
+    理論値 1/3 → 1/15、`banto-collect/tests/integration.rs` mini_soak = `>=10` → `>=2`、
+    上限は維持)。`MissedTickBehavior::Skip` で欠落 tick は取り戻さないため過負荷ランナーで
+    スループットが ~1/10 まで下がりうる。当テストの意図は生存性でありスループット精度は
+    `#[ignore]` の long soak が担保
+- **未処理(follow-up)**:
+  - **A.2** `stream.rs` `a_slow_subscriber_gets_disconnected_once_the_outbound_queue_fills`:
+    「アウトバウンドキュー溢れは決定的」という前提が multi-thread ランタイム下で崩れる
+    (writer タスクが別ワーカースレッドで並行 drain + カーネルソケットバッファが吸収し、
+    `try_send` が `Full` を観測しないことがある)。堅牢化には writer を止めるテスト用
+    シーム、または巨大ペイロードでのバッファ超過など踏み込んだ設計が要るため**専用 PR に
+    先送り**(誤修正回避)
+  - **②③④** の新規堅牢性テスト(crash 再オープン / DST 遷移 / read-while-write)は実現性
+    確認済み(`ManualClock::set_utc_offset_ms` 有り、`TsWriter` は `Drop` 無しで drop =
+    クラッシュ模擬可、データファイルは WAL で並行 read 可)→ 続く PR
+- **備考**: ① 実機相当環境(Windows)での 72h soak 実行はコンテナ/CI では完結しない
+  (実行環境と 72h の実時間が必要)ため当セッション対象外
 
 ### H8: ドキュメント整合 — 状態: 一部本 PR
 
