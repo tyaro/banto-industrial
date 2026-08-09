@@ -38,8 +38,8 @@ impl CollectionState {
     }
 }
 
-/// The configured collection mode. `AllSimulation` is the T15 extension
-/// point; T14-2 provides its state-machine path but not its implementation.
+/// The configured collection mode. `AllSimulation` applies a non-persistent
+/// simulation override to enabled physical connections for one run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunMode {
@@ -250,10 +250,7 @@ impl CollectionController {
         self.write_control.disable();
         self.publish_status();
 
-        let result = match mode {
-            RunMode::Configured => self.manager.apply_run(mode).await,
-            RunMode::AllSimulation => Err("all_simulation は T15 で実装されます".to_string()),
-        };
+        let result = self.manager.apply_run(mode).await;
 
         let mut state = self
             .state
@@ -371,14 +368,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn all_simulation_has_a_faulted_path_without_auto_restart() {
+    async fn all_simulation_starts_without_auto_restart() {
         let (_dir, controller) = controller_env().await;
 
-        let faulted = controller.start(RunMode::AllSimulation).await;
-        assert_eq!(faulted.state, CollectionState::Faulted);
-        assert_eq!(faulted.run_id, Some(1));
-        assert!(faulted.last_error.is_some());
-        assert_eq!(controller.status(), faulted);
+        let running = controller.start(RunMode::AllSimulation).await;
+        assert_eq!(running.state, CollectionState::Running);
+        assert_eq!(running.run_id, Some(1));
+        assert!(running.last_error.is_none());
+        assert_eq!(controller.status(), running);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -391,12 +388,10 @@ mod tests {
         let switched = controller.set_mode(RunMode::AllSimulation).await;
 
         // The mode switch must pass through Stopping → Stopped → Starting.
-        // AllSimulation has no T14-2 implementation, so its new start ends
-        // in Faulted rather than remaining Stopped after the mode change.
-        assert_eq!(switched.state, CollectionState::Faulted);
+        assert_eq!(switched.state, CollectionState::Running);
         assert_eq!(switched.mode, RunMode::AllSimulation);
         assert_eq!(switched.run_id, Some(2));
-        assert!(switched.last_error.is_some());
+        assert!(switched.last_error.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

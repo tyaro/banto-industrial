@@ -189,6 +189,29 @@ use crate::broker_glue::{hub_client_factory, HubSessions, SlmpSimRegistry};
 use crate::computed::{self, ComputedEngine, ServerTagStore};
 use crate::diag_log::DiagLog;
 
+/// Build the non-persistent runtime snapshot for a collection mode.
+///
+/// The catalog must continue to describe the saved registry, while the
+/// collector and broker session setup need the effective run-time flags. An
+/// all-simulation run therefore overrides only enabled physical connections
+/// in a cloned snapshot; the database-backed snapshot remains untouched.
+fn runtime_snapshot_for_mode(
+    snapshot: &RegistrySnapshot,
+    mode: crate::controller::RunMode,
+) -> RegistrySnapshot {
+    if mode != crate::controller::RunMode::AllSimulation {
+        return snapshot.clone();
+    }
+
+    let mut runtime = snapshot.clone();
+    for connection in &mut runtime.connections {
+        if connection.enabled && matches!(connection.protocol.as_str(), "modbus-tcp" | "slmp") {
+            connection.simulation = true;
+        }
+    }
+    runtime
+}
+
 /// The effective `(value, quality, timestamp_ms)` triple for one catalog
 /// entry - shared by `crate::rest`'s `/api/v1/values*` and `crate::stream`'s
 /// `data` messages so the two read paths (poll vs. push) can never drift on
@@ -1242,12 +1265,11 @@ impl CollectorManager {
         Ok(revision)
     }
 
-    /// Apply a fresh registry snapshot to a configured collection run. The
-    /// snapshot is validated before broker/collector side effects begin.
+    /// Apply a fresh registry snapshot to a collection run. The saved
+    /// snapshot is validated for the catalog, while the selected mode may
+    /// provide a non-persistent runtime override before collector and broker
+    /// side effects begin.
     pub async fn apply_run(&self, mode: crate::controller::RunMode) -> Result<(), String> {
-        if mode != crate::controller::RunMode::Configured {
-            return Err("all_simulation は T15 で実装されます".to_string());
-        }
         let _guard = self.rebuild_lock.lock().await;
         let snapshot = RegistrySnapshot::load(&self.pool)
             .await
@@ -1256,10 +1278,11 @@ impl CollectorManager {
             .map_err(|err| format!("catalog の検証に失敗しました: {err}"))?;
         computed::build_plan(&new_map)
             .map_err(|err| format!("演算タグの検証に失敗しました: {err}"))?;
-        let mut config = build_config_from(&snapshot).map_err(|err| err.to_string())?;
+        let runtime_snapshot = runtime_snapshot_for_mode(&snapshot, mode);
+        let mut config = build_config_from(&runtime_snapshot).map_err(|err| err.to_string())?;
 
         let (slmp_handles, stale_slmp_ids, resolved_slmp_targets) =
-            self.sync_slmp_sessions_from(&snapshot).await;
+            self.sync_slmp_sessions_from(&runtime_snapshot).await;
         config.suppress_simulation_for(&slmp_handles.keys().cloned().collect());
         for (key, (host, port)) in &resolved_slmp_targets {
             config.set_broker_dial_target(key, host.clone(), *port);
@@ -1445,7 +1468,9 @@ mod tests {
     use super::*;
     use crate::db::init_db;
     use banto_collect::CollectorOptions;
-    use banto_tags::{CollectionGroupInput, CollectionGroupService, PlcConnectionInput, TagInput};
+    use banto_tags::{
+        CollectionGroupInput, CollectionGroupService, PlcConnection, PlcConnectionInput, TagInput,
+    };
     use banto_tstore::SystemClock;
     use std::time::Duration;
 
@@ -1500,6 +1525,69 @@ mod tests {
         assert_eq!(manager.last_error(), None);
         assert!(manager.tag_map().is_empty());
         assert!(manager.current_values().is_none());
+    }
+
+    #[test]
+    fn all_simulation_overrides_only_enabled_physical_connections() {
+        let snapshot = RegistrySnapshot {
+            connections: vec![
+                PlcConnection {
+                    id: 1,
+                    name: "modbus".to_string(),
+                    protocol: "modbus-tcp".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: 502,
+                    unit_id: 1,
+                    enabled: true,
+                    simulation: false,
+                },
+                PlcConnection {
+                    id: 2,
+                    name: "slmp".to_string(),
+                    protocol: "slmp".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: 5007,
+                    unit_id: 1,
+                    enabled: true,
+                    simulation: false,
+                },
+                PlcConnection {
+                    id: 3,
+                    name: "disabled".to_string(),
+                    protocol: "modbus-tcp".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: 502,
+                    unit_id: 1,
+                    enabled: false,
+                    simulation: false,
+                },
+                PlcConnection {
+                    id: 4,
+                    name: "virtual".to_string(),
+                    protocol: "virtual".to_string(),
+                    host: String::new(),
+                    port: 0,
+                    unit_id: 0,
+                    enabled: true,
+                    simulation: false,
+                },
+            ],
+            groups: Vec::new(),
+            tags: Vec::new(),
+        };
+
+        let configured =
+            runtime_snapshot_for_mode(&snapshot, crate::controller::RunMode::Configured);
+        assert_eq!(configured, snapshot);
+
+        let all_simulation =
+            runtime_snapshot_for_mode(&snapshot, crate::controller::RunMode::AllSimulation);
+        assert!(!snapshot.connections[0].simulation);
+        assert!(!snapshot.connections[1].simulation);
+        assert!(all_simulation.connections[0].simulation);
+        assert!(all_simulation.connections[1].simulation);
+        assert!(!all_simulation.connections[2].simulation);
+        assert!(!all_simulation.connections[3].simulation);
     }
 
     // `crate::test_support`'s module doc: `TempDir::drop`'s retry needs a
