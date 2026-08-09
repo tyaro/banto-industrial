@@ -23,7 +23,8 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint .",
-    "e2e": "playwright test --config=e2e/playwright.config.ts"
+    "e2e": "playwright test --config=e2e/playwright.config.ts",
+    "e2e:banto-hub": "playwright test --config=e2e/banto-hub.playwright.config.ts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
