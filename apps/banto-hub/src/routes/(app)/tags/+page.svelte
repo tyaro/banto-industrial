@@ -64,6 +64,7 @@
 		type ParsedCsvTagRow,
 		type CsvRowError
 	} from '$lib/banto/tagCsv';
+	import { parseOptionalNumber, toOptionalNumberOrNull } from '$lib/banto/tagFormNumeric';
 
 	const dataTypeOptions: { value: TagDataType; label: string }[] = [
 		{ value: 'bit', label: 'bit（真偽値1点）' },
@@ -167,11 +168,6 @@
 		};
 	}
 
-	/** 空文字列 = 未設定（省略してバックエンドの `#[serde(default)]` に None として扱わせる）。 */
-	function optNum(s: string): number | undefined {
-		return s === '' ? undefined : Number(s);
-	}
-
 	/**
 	 * T6-2 (docs/tag-server-design.md §4.2's table): `computed`/`internal`
 	 * tags carry no PLC address at all — send an empty string regardless of
@@ -187,17 +183,17 @@
 			collectionGroupId: Number(form.collectionGroupId),
 			address: isPlc ? form.address : '',
 			dataType: form.dataType,
-			stringLength: form.dataType === 'string' ? optNum(form.stringLength) : undefined,
-			rawLo: optNum(form.rawLo),
-			rawHi: optNum(form.rawHi),
-			engLo: optNum(form.engLo),
-			engHi: optNum(form.engHi),
+			stringLength: form.dataType === 'string' ? parseOptionalNumber(form.stringLength) : undefined,
+			rawLo: parseOptionalNumber(form.rawLo),
+			rawHi: parseOptionalNumber(form.rawHi),
+			engLo: parseOptionalNumber(form.engLo),
+			engHi: parseOptionalNumber(form.engHi),
 			unit: form.unit === '' ? undefined : form.unit,
 			decimals: Number(form.decimals),
-			thresholdH: optNum(form.thresholdH),
-			thresholdHh: optNum(form.thresholdHh),
-			thresholdL: optNum(form.thresholdL),
-			thresholdLl: optNum(form.thresholdLl),
+			thresholdH: parseOptionalNumber(form.thresholdH),
+			thresholdHh: parseOptionalNumber(form.thresholdHh),
+			thresholdL: parseOptionalNumber(form.thresholdL),
+			thresholdLl: parseOptionalNumber(form.thresholdLl),
 			enabled: form.enabled,
 			// computed タグは常に writable=false（値は式が決める、§4.2表）-
 			// フォーム自体もこのチェックボックスを隠すが、送信直前にも強制する。
@@ -506,17 +502,17 @@
 			startAddress: form.startAddress,
 			count: Number(form.count),
 			dataType: form.dataType,
-			stringLength: form.dataType === 'string' ? (optNum(form.stringLength) ?? null) : null,
+			stringLength: form.dataType === 'string' ? toOptionalNumberOrNull(form.stringLength) : null,
 			unit: form.unit === '' ? undefined : form.unit,
 			decimals: Number(form.decimals),
-			rawLo: optNum(form.rawLo) ?? null,
-			rawHi: optNum(form.rawHi) ?? null,
-			engLo: optNum(form.engLo) ?? null,
-			engHi: optNum(form.engHi) ?? null,
-			thresholdH: optNum(form.thresholdH) ?? null,
-			thresholdHh: optNum(form.thresholdHh) ?? null,
-			thresholdL: optNum(form.thresholdL) ?? null,
-			thresholdLl: optNum(form.thresholdLl) ?? null,
+			rawLo: toOptionalNumberOrNull(form.rawLo),
+			rawHi: toOptionalNumberOrNull(form.rawHi),
+			engLo: toOptionalNumberOrNull(form.engLo),
+			engHi: toOptionalNumberOrNull(form.engHi),
+			thresholdH: toOptionalNumberOrNull(form.thresholdH),
+			thresholdHh: toOptionalNumberOrNull(form.thresholdHh),
+			thresholdL: toOptionalNumberOrNull(form.thresholdL),
+			thresholdLl: toOptionalNumberOrNull(form.thresholdLl),
 			enabled: form.enabled,
 			writable: form.writable
 		};

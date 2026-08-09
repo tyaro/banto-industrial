@@ -1,12 +1,12 @@
 # banto-hub T16 詳細設計（デスクトップシェル・タスクトレイ）
 
 作成日: 2026-08-09
-状態: **設計確定。P1〜P3 承認済み。T16-0 マージ済み
-（`apps/banto-hub/src-tauri`、パッケージ名 `banto-hub-shell`）。T16-1
-（トレイ状態表示）実装済み・レビュー待ち。次は T16-2。**
+状態: **設計確定。P1〜P3 承認済み。T16-0（薄いシェル `banto-hub-shell`、
+`apps/banto-hub/src-tauri`）・T16-1（トレイ状態表示）マージ済み。
+次は T16-2（T17 依存のため後回し）。**
 最終検証日(コード照合): 2026-08-09
-基準コミット: `ac6bdff`（main、T16-0 マージ後）。T16-1 の実装は本設計と
-同じ PR（`cursor/t16-1-tray-status-e3cb`）で追加。
+基準コミット: `396e927`（main、T16-1 マージ後）。T16-1 の実装は本設計と
+同じ PR（`cursor/t16-1-tray-status-e3cb`、#101）で追加。
 
 関連: [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)
 （§8 シェル / §9.9 トレイ / §10 T16 / §16.3 T16・T17）、

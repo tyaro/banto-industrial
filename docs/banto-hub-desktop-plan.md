@@ -1,11 +1,11 @@
 # banto-hub アプリ／サービス運転計画（T14〜）
 
 作成日: 2026-08-09
-状態: **計画確定。T14・T15 完了。T16 詳細設計は [banto-hub-t16-design.md](banto-hub-t16-design.md)（P1〜P3 承認済み）。T16-0（薄いシェル `banto-hub-shell`）マージ済み。T16-1（トレイ状態表示）実装済み・レビュー待ち。次は T16-2。**
+状態: **計画確定。T14・T15 完了。T16 詳細設計は [banto-hub-t16-design.md](banto-hub-t16-design.md)（P1〜P3 承認済み）。T16-0（薄いシェル `banto-hub-shell`）・T16-1（トレイ状態表示）マージ済み。T16-2 は T17（サービス管理・profile・mutex）依存のため後回し。次/進行中: T18-1（タグ登録 UI/UX の正しさ修正、本 PR は §16.4 の `optNum` null 取りこぼし部分）。**
 最終検証日(コード照合): 2026-08-09
-基準コミット: `ac6bdff`（main、T16-0 マージ後）。T16-1 は本 PR
-（`apps/banto-hub/src-tauri` のトレイ状態表示・終了確認ダイアログ・初回
-継続通知）で追加。
+基準コミット: `396e927`（main、T16-1 マージ後）。T18-1 は本 PR
+（`apps/banto-hub/src/lib/banto/tagFormNumeric.ts` の `optNum` null 取りこぼし
+修正）で着手。
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [banto-hub-t16-design.md](banto-hub-t16-design.md)、
@@ -1637,6 +1637,14 @@ owner ACL を設定する。グループ変更、profile owner 追加、ACL 変�
   フィールドへの number/null 混入」ファミリー（`FormState`/`ContinuousFormState`
   の数値系フィールド全体）であり、**修正は `count` 単独でなくこの族全体を対象**
   にする。
+  > **2026-08-09 修正済み（T18-1、本 PR）**: `parseOptionalNumber`/
+  > `toOptionalNumberOrNull`（`apps/banto-hub/src/lib/banto/tagFormNumeric.ts`）
+  > へ純関数として抽出し、`null`/`undefined`/空白のみ/非有限数をすべて
+  > 「未設定」（`undefined` または `null`）に正規化するよう修正した
+  > （`optNum` は削除）。単票 create/update・連続登録の数値フィールド
+  > （`stringLength`/`rawLo`・`rawHi`/`engLo`・`engHi`/`thresholdH`・`Hh`・
+  > `L`・`Ll`）で使用。`count.trim()` 側（TAG-P0-1 本体・連続登録の点数検証）
+  > は本 PR のスコープ外で別途対応する。
 - **連続登録 / CSV の dry-run も偽陽性**。dry-run は `TagService::create_batch`
   のレジストリ級検証＋重複名までで、プロトコル別アドレス解析・式コンパイルを
   行わない。よって Modbus 接続配下の SLMP 形式アドレスでも「検証OK: N件登録
