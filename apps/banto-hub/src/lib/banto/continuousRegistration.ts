@@ -11,16 +11,13 @@
  *   受け取るだけの汎用エンドポイントのまま保てる（T11-2 の CSV インポート
  *   も同じ API を、別の展開ロジック — CSV パース — から呼ぶだけで済む）。
  *
- * 依存なしの純関数群 — このリポジトリに vitest 等のユニットテスト基盤が
- * まだ無いため（`apps/banto-hub/package.json`・ルート `package.json` の
- * `test` スクリプトを確認したが、`pnpm --recursive --if-present test` が
- * 拾う対象が存在しない）、この Rust 実装以外のテストは書けていない。
- * ロジックをこのファイルの純関数として切り出してあるのは、テスト基盤が
- * 導入され次第すぐにユニットテストを足せるようにするため（実装指示の
- * 「テスト基盤が無ければ純関数として切り出してテスト可能な形にしておき、
- * その旨報告」に対応 — 詳細は完了報告参照）。
+ * 依存なしの純関数群 — フォーム（`+page.svelte`）から状態を持ち込まず
+ * テスト可能にしてある。単体テストは `continuousRegistration.test.ts`
+ * （vitest、`tagFormNumeric.test.ts` と同じ describe/it スタイル。
+ * TAG-P0-1、2026-08-09 に追加）。
  */
 import type { TagDataType, TagInput } from './tagRegistryAdmin';
+import { parseOptionalNumber, toOptionalNumberOrNull } from './tagFormNumeric';
 
 /** 1回のプレビュー/バッチで生成できる点数の上限（暴走防止の安全弁）。 */
 export const MAX_CONTINUOUS_COUNT = 1000;
@@ -186,6 +183,49 @@ export interface ContinuousRegistrationParams extends ContinuousRegistrationComm
 	count: number;
 }
 
+/**
+ * 連続登録フォーム（`+page.svelte` の `continuousForm`）の生の入力状態。
+ *
+ * **TAG-P0-1（2026-08-09、docs/banto-hub-desktop-plan.md §9 TAG-P0-1）:
+ * フィールドの型宣言は `string` だが実際の代入値は必ずしも文字列ではない**。
+ * Svelte 5 の `<input type="number" bind:value>` は空欄で `null` を、
+ * 入力時は `number` を代入する（`<input type="text">`/`<select>` のみが
+ * 実際に `string` を代入する）。この型宣言と実代入値のズレが、旧
+ * `continuousParams()` の `form.count.trim()` 呼び出しで
+ * `TypeError: count.trim is not a function` を起こしていた（`count` は
+ * `<input type="number">` 由来で number|null）。
+ *
+ * 本 interface はこの「型は string だが実体は string|number|null」という
+ * 実態を明示するため、number input 由来のフィールド（`startNumber`/
+ * `count`/`decimals`/`stringLength`/`rawLo`〜`thresholdLl`）は
+ * `string | number | null` とし、text input・select 由来のフィールド
+ * （`collectionGroupId`/`namePattern`/`startAddress`）のみ `string` に
+ * 保つ。パースは {@link buildContinuousParams} が
+ * {@link parseOptionalNumber}/{@link toOptionalNumberOrNull} を通して行う
+ * ため、`.trim()` は string 保証フィールドにのみ現れる。
+ */
+export interface ContinuousFormState {
+	collectionGroupId: string;
+	namePattern: string;
+	startNumber: string | number | null;
+	startAddress: string;
+	count: string | number | null;
+	dataType: TagDataType;
+	stringLength: string | number | null;
+	unit: string;
+	decimals: string | number | null;
+	rawLo: string | number | null;
+	rawHi: string | number | null;
+	engLo: string | number | null;
+	engHi: string | number | null;
+	thresholdH: string | number | null;
+	thresholdHh: string | number | null;
+	thresholdL: string | number | null;
+	thresholdLl: string | number | null;
+	enabled: boolean;
+	writable: boolean;
+}
+
 export interface ContinuousRegistrationRow {
 	name: string;
 	address: string;
@@ -286,4 +326,57 @@ export function generateContinuousTags(
 	}));
 
 	return { ok: true, rows, tags };
+}
+
+/**
+ * {@link ContinuousFormState}（フォームの生の入力値）から
+ * {@link generateContinuousTags} への入力 {@link ContinuousRegistrationParams}
+ * を組み立てる。まだプレビューを生成するには情報不足（対象グループ未選択・
+ * 名前パターン/開始アドレス未入力・点数が未入力または数値化できない）
+ * であれば `null` を返す（エラー表示を急がず、フォーム入力途中は
+ * プレビュー欄を静かに空にするだけにする方針、旧 `continuousParams()`
+ * を踏襲）。
+ *
+ * **TAG-P0-1（2026-08-09）**: `count`/`startNumber`/`decimals` は number
+ * input 由来で `null` が入り得るため {@link parseOptionalNumber} でパースし、
+ * `.trim()` は string 保証フィールド（`collectionGroupId`/`namePattern`/
+ * `startAddress`）にのみ使う。`count` が `undefined`（未入力・非数）の場合は
+ * この関数自体が `null` を返す（`generateContinuousTags` 側の
+ * 「1以上の整数か」の検証はここでは行わない — それは後段の責務）。
+ */
+export function buildContinuousParams(
+	form: ContinuousFormState
+): ContinuousRegistrationParams | null {
+	if (
+		form.collectionGroupId === '' ||
+		form.namePattern.trim() === '' ||
+		form.startAddress.trim() === ''
+	) {
+		return null;
+	}
+	const count = parseOptionalNumber(form.count);
+	if (count === undefined) {
+		return null;
+	}
+	return {
+		collectionGroupId: Number(form.collectionGroupId),
+		namePattern: form.namePattern,
+		startNumber: parseOptionalNumber(form.startNumber) ?? 0,
+		startAddress: form.startAddress,
+		count,
+		dataType: form.dataType,
+		stringLength: form.dataType === 'string' ? toOptionalNumberOrNull(form.stringLength) : null,
+		unit: form.unit === '' ? undefined : form.unit,
+		decimals: parseOptionalNumber(form.decimals) ?? 0,
+		rawLo: toOptionalNumberOrNull(form.rawLo),
+		rawHi: toOptionalNumberOrNull(form.rawHi),
+		engLo: toOptionalNumberOrNull(form.engLo),
+		engHi: toOptionalNumberOrNull(form.engHi),
+		thresholdH: toOptionalNumberOrNull(form.thresholdH),
+		thresholdHh: toOptionalNumberOrNull(form.thresholdHh),
+		thresholdL: toOptionalNumberOrNull(form.thresholdL),
+		thresholdLl: toOptionalNumberOrNull(form.thresholdLl),
+		enabled: form.enabled,
+		writable: form.writable
+	};
 }
