@@ -8,9 +8,14 @@
 //! （`windows-service`クレート、本実装）を追加した。起動〜シャットダウンの
 //! 実処理シーケンス（DB初期化・各サービス構築・`CollectorManager::
 //! rebuild`・MQTT/gRPC起動・axumサーバー起動・シャットダウン順序）は
-//! [`hub_run::run`]に集約されており、コンソールモード・サービスモードの
-//! どちらもそれを呼ぶ。このファイル自身は「どちらのモードで、何を停止
-//! トリガーにして呼ぶか」の分岐だけを持つ。
+//! T14-1（docs/banto-hub-t14-design.md §3「D1」）で lib クレート
+//! （`banto_hub_core`）側の [`banto_hub_core::runtime::HubRuntime`]へ抽出
+//! された - コンソールモード・サービスモードのどちらもそれを呼ぶ。この
+//! ファイル自身は「どちらのモードで、何を停止トリガーにして呼ぶか」の
+//! 分岐と、環境変数を読んで [`banto_hub_core::runtime::HubConfig`]を
+//! 組み立てる役目だけを持つ（env 読み取りは T14-1 で composition root から
+//! ここ（ホスト側）へ移った - `crate::build_hub_config`参照。読み取り結果は
+//! 移設前と1バイトも変えていない）。
 //!
 //! ## サブコマンド（引数なしの既存挙動は一切変更していない）
 //!
@@ -48,18 +53,16 @@
 //! 許さないため、`main`をあらかじめ tokio ランタイム化しておくわけには
 //! いかない）。
 
-// これらのサポートモジュールは `src/bin/banto_hub/`（サブディレクトリ）に
+// このサポートモジュールは `src/bin/banto_hub/`（サブディレクトリ）に
 // 置いてある - Cargo は `src/bin/*.rs`（直下のファイル）をそれぞれ独立した
 // バイナリターゲットとして自動検出してしまう（`[[bin]]`で明示済みの
-// `banto-hub`とは別に、`hub_log.rs`等それぞれに`fn main()`を要求される）
+// `banto-hub`とは別に、`win_service.rs`単体にも`fn main()`を要求される）
 // ため、直下ではなくサブディレクトリ + `#[path]`で読み込む。
-#[path = "banto_hub/hub_log.rs"]
-mod hub_log;
-#[path = "banto_hub/hub_run.rs"]
-mod hub_run;
 #[cfg(windows)]
 #[path = "banto_hub/win_service.rs"]
 mod win_service;
+
+use banto_hub_core::runtime::{HubConfig, HubRuntime, DEFAULT_DB_PATH};
 
 fn main() {
     match std::env::args().nth(1).as_deref() {
@@ -93,16 +96,57 @@ fn print_usage() {
     }
 }
 
+/// 環境変数を読んで [`HubConfig`]を組み立てる - T14-1 より前は
+/// composition root（旧 `hub_run::run`）自身がこの読み取りを行っていたが、
+/// 将来のデスクトップホストが env なしで設定できるようにする設計判断
+/// （docs/banto-hub-t14-design.md §3「D1」）で、ホスト側であるこのファイルへ
+/// 移した。**読み取りロジック（既定値・レイヤー順）は移設前と1バイトも
+/// 変えていない** - 各フィールドの doc comment に旧実装との対応を記す
+/// （[`HubConfig`]自身のフィールド doc も参照）。コンソール・サービス
+/// 両モードから共有する（`win_service`側は `crate::build_hub_config`と
+/// して参照する - `mod win_service`はこのファイルの子モジュールなので
+/// `crate::`で届く）。
+fn build_hub_config() -> HubConfig {
+    HubConfig {
+        db_path: std::env::var("BANTO_DB").unwrap_or_else(|_| DEFAULT_DB_PATH.to_string()),
+        allow_setup: std::env::var("BANTO_ALLOW_SETUP")
+            .map(|value| value == "1")
+            .unwrap_or(false),
+        port_override: std::env::var("PORT")
+            .ok()
+            .and_then(|value| value.parse().ok()),
+        bind_override: std::env::var("BANTO_BIND").ok(),
+        data_dir_override: std::env::var("BANTO_HUB_DATA")
+            .ok()
+            .map(std::path::PathBuf::from),
+    }
+}
+
 /// コンソールモード（既存挙動そのまま）: 独自に tokio ランタイムを構築し、
-/// [`hub_run::run`]を Ctrl-C 待機で駆動する。
+/// [`HubRuntime::start`]→ Ctrl-C 待機 → [`banto_hub_core::runtime::RunningHub::shutdown`]
+/// を駆動する（旧 `hub_run::run(shutdown)`の「構築 → shutdown.await →
+/// teardown」を、T14-1 の制御反転に合わせて呼び出し側で組み立てている -
+/// 中身のシーケンス自体は不変）。
 fn run_console() {
     let runtime = tokio::runtime::Runtime::new().expect("failed to build tokio runtime");
     runtime.block_on(async {
-        let shutdown = async {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("failed to listen for ctrl-c");
+        let config = build_hub_config();
+        // 旧 `hub_run::run`はここで `expect("init_db should succeed")`等の
+        // 4箇所が panic していた（設計 §2「現行コード地図」）。T14-1 で
+        // `Result`化した分、コンソールでは同等の異常終了（panic ではないが
+        // 即座にエラーを表示してプロセスを終了する）に読み替える - 文言は
+        // 簡潔なものに変えたが、「起動失敗はプロセスを続行させない」という
+        // 挙動は不変（実装指示 T14-1 §6）。
+        let hub = match HubRuntime::start(config).await {
+            Ok(hub) => hub,
+            Err(err) => {
+                eprintln!("banto-hub: {err}");
+                std::process::exit(1);
+            }
         };
-        hub_run::run(shutdown).await;
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to listen for ctrl-c");
+        hub.shutdown().await;
     });
 }

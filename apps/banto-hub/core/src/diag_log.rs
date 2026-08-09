@@ -2,17 +2,24 @@
 //! [`crate::hub::CollectorManager`] は、稼働中の SLMP シミュレーションモード
 //! 接続を知らせる警告（`log_simulation_warnings`）や `rebuild`/
 //! `sync_slmp_sessions` の診断ログを素の `println!`/`eprintln!` で出力して
-//! いた - `bin/banto_hub` の `hub_log`（`{data_dir}/banto-hub-service.log`
-//! へのミラー、`hub_log` のモジュール doc 参照）はバイナリクレート限定で、
-//! ライブラリクレート `banto-hub-core` からは届かないため。結果、Windows
-//! サービスモード（コンソール無し）ではこれらの診断が誰にも見えなくなって
-//! いた - 同種の診断が `bin/banto_hub` 側では `hub_log::log_line`/
-//! `log_err_line` 経由でサービスログファイルにも残るのと非対称だった。
+//! いた - 当時 `hub_log`（`{data_dir}/banto-hub-service.log`へのミラー、
+//! `crate::hub_log` のモジュール doc 参照）は `bin/banto_hub` 側のバイナリ
+//! クレート限定で、ライブラリクレート `banto-hub-core` からは届かな
+//! かったため。結果、Windows サービスモード（コンソール無し）ではこれらの
+//! 診断が誰にも見えなくなっていた。同種の診断が `bin/banto_hub` 側では
+//! `hub_log::log_line`/`log_err_line` 経由でサービスログファイルにも残るのと
+//! 非対称だった。
 //!
-//! [`DiagLog`] はこの非対称を解消する注入可能なコールバック対 - `bin/
-//! banto_hub` が [`crate::hub::CollectorManager::with_diag_log`] で
-//! `hub_log::log_line`/`log_err_line` を配線し、それ以外（テスト・将来の
-//! 他バイナリ）は [`DiagLog::default`] を使う。`DiagLog::default` は素の
+//! （T14-1、docs/banto-hub-t14-design.md §3「D1」で `hub_log` 自体はこの
+//! lib クレートへ移設されたが、`hub.rs` を `hub_log` の具体的な宛先に直接
+//! 結合させないという [`DiagLog`] の decoupling 自体は変えていない。呼び
+//! 出し側の `crate::runtime::HubRuntime::start` が引き続き明示的に配線する。）
+//!
+//! [`DiagLog`] はこの非対称を解消する注入可能なコールバック対 -
+//! `crate::runtime::HubRuntime::start`（旧 `bin/banto_hub`）が
+//! [`crate::hub::CollectorManager::with_diag_log`] で `hub_log::log_line`/
+//! `log_err_line` を配線し、それ以外（テスト・将来の他バイナリ）は
+//! [`DiagLog::default`] を使う。`DiagLog::default` は素の
 //! `println!`/`eprintln!` とバイト単位で同じ出力しかしない - `hub_log`
 //! 自身がコンソールモードで守っている契約と同じもの。
 
