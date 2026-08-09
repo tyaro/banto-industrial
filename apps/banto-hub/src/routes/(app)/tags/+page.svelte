@@ -66,6 +66,8 @@
 		type CsvRowError
 	} from '$lib/banto/tagCsv';
 	import { parseOptionalNumber } from '$lib/banto/tagFormNumeric';
+	import { isFormDirty } from '$lib/banto/formDirty';
+	import { beforeNavigate } from '$app/navigation';
 
 	const dataTypeOptions: { value: TagDataType; label: string }[] = [
 		{ value: 'bit', label: 'bit（真偽値1点）' },
@@ -264,6 +266,13 @@
 
 	// --- create ---
 	let createForm = $state(blankForm());
+	/**
+	 * T18-1（TAG-UX-C 一部）: create Drawer を開いた時点のスナップショット。
+	 * `isFormDirty` で `createForm` と比較し、未保存変更の有無を判定する
+	 * （リアクティブに参照しないので `$state` は不要 - 開いた時と保存成功
+	 * 時にだけ差し替える）。
+	 */
+	let createBaseline: FormState = blankForm();
 	let createErrors: Record<string, string> = $state({});
 	let creating = $state(false);
 
@@ -283,6 +292,7 @@
 			await createTag(toInput(createForm));
 			toastStore.push('success', '作成しました');
 			createForm = blankForm();
+			createBaseline = blankForm();
 			await reload();
 		} catch (err) {
 			const fieldErrors = applyFieldErrors(err);
@@ -296,12 +306,16 @@
 	// --- edit ---
 	let selected: Tag | null = $state(null);
 	let editForm = $state(blankForm());
+	/** T18-1（TAG-UX-C 一部）: `createBaseline` と同じ役割、edit 版。 */
+	let editBaseline: FormState = blankForm();
 	let editErrors: Record<string, string> = $state({});
 	let saving = $state(false);
 
 	function selectTag(t: Tag): void {
+		if (!confirmDiscardIfNeeded()) return;
 		selected = t;
 		editForm = formFromTag(t);
+		editBaseline = formFromTag(t);
 		editErrors = {};
 		drawerMode = 'edit'; // T13-1: 行クリック編集はドロワーで開く
 	}
@@ -314,6 +328,10 @@
 			const updated = await updateTag(selected.id, toInput(editForm));
 			toastStore.push('success', '更新しました');
 			selected = updated;
+			// 保存成功後はサーバーの正規化値を基準に取り直す - 未保存
+			// 変更は無くなったので直後の dirty 判定は false になる。
+			editForm = formFromTag(updated);
+			editBaseline = formFromTag(updated);
 			await reload();
 		} catch (err) {
 			const fieldErrors = applyFieldErrors(err);
@@ -366,23 +384,83 @@
 		drawerMode === 'continuous' || drawerMode === 'csv' ? '640px' : '480px'
 	);
 
+	/**
+	 * T18-1（TAG-UX-C 一部、docs/banto-hub-desktop-plan.md §9.4）: 現在開いて
+	 * いる Drawer が busy（作成/保存/検証/登録のいずれかを実行中）かどうか。
+	 * `drawerMode` は常に高々1つしか開いていないため、これらのフラグの
+	 * どれか1つでも立っていれば「今開いている Drawer」の処理中とみなせる。
+	 */
+	function isDrawerBusy(): boolean {
+		return creating || saving || validating || applyingContinuous || csvValidating || csvApplying;
+	}
+
+	/**
+	 * T18-1（TAG-UX-C 一部）: 現在開いている Drawer のフォームが、開いた
+	 * 時点のスナップショット（`*Baseline`）から変更されているか。
+	 * CSV インポートはテキスト入力のフォームを持たないため、
+	 * 「ファイルを解析済みか（`csvParseResult !== null`）」を dirty 相当
+	 * として扱う（同じ `isFormDirty` ヘルパーで一貫させる - baseline 側は
+	 * 常に未解析状態の `null`）。
+	 */
+	function isDrawerDirty(): boolean {
+		switch (drawerMode) {
+			case 'create':
+				return isFormDirty(createBaseline, createForm);
+			case 'edit':
+				return isFormDirty(editBaseline, editForm);
+			case 'continuous':
+				return isFormDirty(continuousBaseline, continuousForm);
+			case 'csv':
+				return isFormDirty(null, csvParseResult);
+			default:
+				return false;
+		}
+	}
+
+	/**
+	 * T18-1（TAG-UX-C 一部）: Drawer を閉じる・別のタグ行を選ぶ・画面遷移
+	 * する、のいずれの経路でも同じ確認を行う共通ヘルパー。
+	 * - busy 中は何もできない（`false` を返し、呼び出し元の操作を止める）。
+	 * - dirty なら `window.confirm` で確認し、キャンセルされたら `false`。
+	 * - busy でも dirty でもなければ `true`（即座に進めてよい）。
+	 */
+	function confirmDiscardIfNeeded(): boolean {
+		if (isDrawerBusy()) return false;
+		if (drawerMode !== null && isDrawerDirty() && !window.confirm('変更を破棄しますか？')) {
+			return false;
+		}
+		return true;
+	}
+
 	function openCreateDrawer(): void {
+		if (!confirmDiscardIfNeeded()) return;
 		createForm = blankForm();
+		createBaseline = blankForm();
 		createErrors = {};
 		drawerMode = 'create';
 	}
 
 	function openContinuousDrawer(): void {
+		if (!confirmDiscardIfNeeded()) return;
+		continuousBaseline = blankContinuousForm();
 		drawerMode = 'continuous';
 	}
 
 	function openCsvDrawer(): void {
+		if (!confirmDiscardIfNeeded()) return;
 		drawerMode = 'csv';
 	}
 
 	function closeDrawer(): void {
 		drawerMode = null;
 	}
+
+	// T18-1: 画面遷移（サイドバーの他画面リンク等）でも Esc/× と同じ破棄
+	// 確認を行う。`confirmDiscardIfNeeded` が `false` を返した（busy 中、
+	// または dirty で確認をキャンセルされた）場合は遷移そのものを止める。
+	beforeNavigate((nav) => {
+		if (drawerMode !== null && !confirmDiscardIfNeeded()) nav.cancel();
+	});
 
 	// --- T13-1: ツリーフィルタ + 検索 (docs/ux-plan.md §4b) -----------------
 	//
@@ -463,6 +541,8 @@
 	}
 
 	let continuousForm = $state(blankContinuousForm());
+	/** T18-1（TAG-UX-C 一部）: `createBaseline` と同じ役割、連続登録版。 */
+	let continuousBaseline: ContinuousFormState = blankContinuousForm();
 
 	/** 入力が変わるたびに再計算される、適用前プレビュー(設計「適用前にプレビュー表示」)。
 	 *
@@ -525,6 +605,7 @@
 			if (result.ok) {
 				toastStore.push('success', `${result.count}件登録しました`);
 				continuousForm = blankContinuousForm();
+				continuousBaseline = blankContinuousForm();
 				invalidateContinuousValidation();
 				await reload();
 			} else {
@@ -1071,7 +1152,13 @@
 	</div>
 </div>
 
-<Drawer open={drawerMode !== null} title={drawerTitle} width={drawerWidth} onclose={closeDrawer}>
+<Drawer
+	open={drawerMode !== null}
+	title={drawerTitle}
+	width={drawerWidth}
+	onclose={closeDrawer}
+	onRequestClose={confirmDiscardIfNeeded}
+>
 	{#if drawerMode === 'create' && canWrite}
 		<div class="drawer-section">
 			{@render tagFields(createForm, createErrors)}
