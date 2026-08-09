@@ -453,6 +453,43 @@ fn bearer_request<T>(message: T, token: &str) -> tonic::Request<T> {
     request
 }
 
+/// Reads `stream.message()` in a loop until a batch whose single value
+/// equals `expected` arrives, skipping any interim batch that doesn't
+/// (H7 ⑤ - see the spurious-stale comment at this helper's call site in
+/// `stream_values_sends_initial_snapshot_then_on_change`). Each individual
+/// read is itself bounded by the remaining time to `deadline`, so a
+/// genuinely stuck stream still fails promptly with a clear message instead
+/// of hanging past the overall deadline.
+async fn drain_until_value(
+    stream: &mut tonic::Streaming<ValueBatch>,
+    deadline: tokio::time::Instant,
+    expected: f64,
+) -> ValueBatch {
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            remaining > Duration::ZERO,
+            "timed out waiting for a ValueBatch carrying value {expected} \
+             (only saw batches with other values - e.g. spurious quality-only changes)"
+        );
+        let batch: ValueBatch = tokio::time::timeout(remaining, stream.message())
+            .await
+            .expect("should receive a batch within the overall deadline")
+            .expect("stream should not error")
+            .expect("stream should not end");
+        assert_eq!(
+            batch.values.len(),
+            1,
+            "expected exactly one value in the batch: {batch:?}"
+        );
+        if batch.values[0].value == Some(tag_value::Value::Num(expected)) {
+            return batch;
+        }
+        // Not the batch we're waiting for (e.g. a spurious quality-only
+        // on_change) - keep draining.
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 1. E2E: GetCatalog / ReadValues
 // ---------------------------------------------------------------------------
@@ -603,11 +640,23 @@ async fn stream_values_sends_initial_snapshot_then_on_change() {
 
     sim.set_word(SlmpDevice::D, 100, 99);
 
-    let changed: ValueBatch = tokio::time::timeout(Duration::from_secs(3), stream.message())
-        .await
-        .expect("should receive a change within 3s")
-        .expect("stream should not error")
-        .expect("stream should not end");
+    // Spurious-stale race (H7 ⑤): quality is derived at *read* time as
+    // period(100ms) x STALE_PERIOD_FACTOR(2.5) = 250ms of grace
+    // (`banto_collect::current`), not pushed by the collector. The 250ms
+    // eval tick (`crate::subscribe_core`, shared with the WS transport -
+    // src/stream.rs's module doc) re-derives quality for the *still-10*
+    // sample on every tick; under CI scheduling jitter that tick can observe
+    // the old sample crossing the staleness threshold (Good -> Stale) before
+    // the collector has actually picked up the new value 99 written above.
+    // on_change fires on that quality-only transition exactly like it would
+    // for a value change, so a spurious `ValueBatch` (value still 10, only
+    // quality differs) can arrive on the stream before the real 10 -> 99
+    // one. A single `stream.message()` read right after `set_word` is
+    // therefore not reliable - drain until the batch that actually carries
+    // 99 arrives, skipping any interim quality-only batches, bounded by an
+    // overall deadline so a truly stuck stream still fails.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let changed = drain_until_value(&mut stream, deadline, 99.0).await;
     assert_eq!(changed.values.len(), 1);
     assert_eq!(changed.values[0].value, Some(tag_value::Value::Num(99.0)));
 

@@ -771,6 +771,45 @@ async fn plc_disconnect_is_relayed_as_an_event() {
         .await
         .expect("ws handshake should succeed");
 
+    // Race (observed under CI load; H7 ⑤): `connect_ws` returning only
+    // proves the *client* saw the HTTP 101 upgrade response - it says
+    // nothing about whether the server's spawned `handle_socket` task
+    // (src/stream.rs) has actually been polled far enough to reach
+    // `manager.subscribe_events()`. That call happens unconditionally near
+    // the top of `handle_socket`, strictly before its `tokio::select!` loop,
+    // but on a busy/oversubscribed runner the task may simply not have been
+    // scheduled yet by the time we get here. If `sim.stop()` ran first, the
+    // collector's PLC read failure could fire `PlcDisconnected` on the
+    // `broadcast` channel before this connection's `events.recv()` is even
+    // listening; `broadcast` has no replay for late subscribers, so the
+    // event would be lost and `recv_matching` below would block the full 5s
+    // and panic (stream.rs:349).
+    //
+    // Fix: establish a real subscribe + await its initial snapshot first
+    // (same round trip as
+    // `subscribe_exact_tag_gets_initial_snapshot_then_on_change_data`
+    // above). Receiving *any* reply for this subscription id is
+    // proof-by-round-trip that `handle_socket` has already executed past
+    // `manager.subscribe_events()` (it is called exactly once,
+    // unconditionally, strictly before the loop that both handles the
+    // incoming "subscribe" message and sends this reply - see
+    // src/stream.rs), so only after this can `sim.stop()` run without
+    // racing the event subscription. Deliberately not asserting on the
+    // snapshot's value/quality here: the pre-check above only proves a
+    // `CurrentSample` exists (`.is_some()`), which - unlike the sibling
+    // test's stronger `== Some(Some(100.0))` check - can still legitimately
+    // be a Bad/no-value bootstrap sample (`current.rs::set` stores an entry
+    // on the very first tick even if that first read hasn't succeeded yet);
+    // asserting a specific value here would reintroduce an unrelated
+    // flake. Only the round trip itself (this connection's handle_socket
+    // task got far enough to answer a subscribe) is what closes the race.
+    send_json(
+        &mut ws,
+        json!({ "op": "subscribe", "id": 1, "tags": ["line1.fast.temp01"], "mode": "on_change" }),
+    )
+    .await;
+    recv_matching(&mut ws, |m| m["op"] == "data" && m["id"] == 1).await;
+
     sim.stop();
 
     let event = recv_matching(&mut ws, |m| {

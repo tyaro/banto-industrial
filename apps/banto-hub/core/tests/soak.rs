@@ -798,22 +798,35 @@ async fn mini_soak_collect_ws_mqtt_stay_alive_for_several_seconds() {
         report.collected_rows, report.elapsed, report.ws_data_messages, report.mqtt_publishes
     );
 
-    // CI の揺らぎを見込んで理論値の1/3を下限とする
-    // (banto-collect の mini_soak と同じ緩さ)。
+    // Liveness floor, not a throughput measurement (H7 ⑤, 2026-08-08):
+    // `MissedTickBehavior::Skip` (this file's module doc "タイミングの許容
+    // 範囲") means a tick missed under CPU pressure is lost forever, never
+    // caught up - so on a severely oversubscribed CI runner these counts can
+    // crater to roughly 1/10 of the theoretical value (the same mechanism
+    // behind the sibling fix to
+    // `crates/banto-collect/tests/integration.rs::mini_soak_100ms_three_groups_row_counts_within_tolerance`).
+    // This test's job is only to prove the 3 pipelines (collect/WS/MQTT)
+    // stayed *alive* for the whole run, not to pin their exact throughput
+    // (that's the #[ignore]d long soak's job - `long_soak_collect_ws_mqtt_stay_alive`
+    // below keeps the tighter 60%/80% bounds since a longer run averages out
+    // jitter). 1/15 is chosen to sit clearly below that worst-observed ~1/10
+    // floor (a further safety margin under it) while `loose_lower_bound`'s
+    // `.max(1.0)` still guarantees the assertion fails outright for a dead
+    // pipeline (0 progress).
     assert!(
-        report.collected_rows >= loose_lower_bound(theoretical_rows, 1.0 / 3.0),
+        report.collected_rows >= loose_lower_bound(theoretical_rows, 1.0 / 15.0),
         "expected ~{theoretical_rows:.0} collected rows in {run_secs}s @ {PERIOD_MS}ms \
-         (>=1/3 tolerated), got {}",
+         (liveness floor >=1/15 tolerated), got {}",
         report.collected_rows
     );
     assert!(
-        report.ws_data_messages as usize >= loose_lower_bound(theoretical_eval_ticks, 1.0 / 3.0),
-        "expected ~{theoretical_eval_ticks:.0} ws data messages (>=1/3 tolerated), got {}",
+        report.ws_data_messages as usize >= loose_lower_bound(theoretical_eval_ticks, 1.0 / 15.0),
+        "expected ~{theoretical_eval_ticks:.0} ws data messages (liveness floor >=1/15 tolerated), got {}",
         report.ws_data_messages
     );
     assert!(
-        report.mqtt_publishes >= loose_lower_bound(theoretical_eval_ticks, 1.0 / 3.0),
-        "expected ~{theoretical_eval_ticks:.0} mqtt publishes (>=1/3 tolerated), got {}",
+        report.mqtt_publishes >= loose_lower_bound(theoretical_eval_ticks, 1.0 / 15.0),
+        "expected ~{theoretical_eval_ticks:.0} mqtt publishes (liveness floor >=1/15 tolerated), got {}",
         report.mqtt_publishes
     );
 }

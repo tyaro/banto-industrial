@@ -834,6 +834,32 @@ async fn an_invalid_config_keeps_the_old_collector_and_surfaces_last_config_erro
 
     // The old collector (with only good_tag) must still be running and
     // readable through REST.
+    //
+    // Bound-wait before the hard assert (H7 ⑤, same pattern as 2a96f20):
+    // quality is derived at *read* time as period(100ms) x
+    // STALE_PERIOD_FACTOR(2.5) = 250ms of grace (`banto_collect::current`),
+    // not pushed by the collector. The old collector's own polling task was
+    // never touched by the rejected rebuild above (it keeps running
+    // unchanged), but on a busy CI runner its scheduling can still lag past
+    // that 250ms grace window between the failed `rebuild()` call and this
+    // read, making good_tag transiently look "stale" even though the
+    // collector never actually stopped. We only care that good_tag is (or
+    // promptly becomes) good/777 again, not the exact timing, so absorb the
+    // scheduling jitter with a bound-wait immediately before the existing
+    // hard assertions rather than weakening them.
+    assert!(
+        wait_until(Duration::from_secs(8), || async {
+            let (s, v) = get_json(
+                &app.router,
+                "/api/v1/values/line1.fast.good_tag",
+                &app.token,
+            )
+            .await;
+            s == StatusCode::OK && v["v"] == 777.0 && v["q"] == "good"
+        })
+        .await,
+        "good_tag should remain/become good after the rejected rebuild, even under scheduling jitter"
+    );
     let (status, value) = get_json(
         &app.router,
         "/api/v1/values/line1.fast.good_tag",
