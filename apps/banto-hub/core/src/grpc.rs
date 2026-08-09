@@ -96,7 +96,7 @@ use tonic::{Request, Response, Status};
 use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::computed::ServerTagStore;
-use crate::controller::CollectionController;
+use crate::controller::{CollectionController, RunMode};
 use crate::hub::{read_current, CollectorManager, TagEntry};
 use crate::settings::GrpcSettings;
 use crate::subscribe_core::{
@@ -222,6 +222,14 @@ fn to_proto_value_batch(
             })
             .collect(),
     }
+}
+
+fn simulation_output_disabled_status(status: &crate::controller::CollectionStatus) -> bool {
+    status.mode == RunMode::AllSimulation
+}
+
+fn simulation_output_disabled(controller: Option<&CollectionController>) -> bool {
+    controller.is_some_and(|controller| simulation_output_disabled_status(&controller.status()))
 }
 
 /// [`crate::write_path::WriteRejection`] を `tonic::Status` へ変換する
@@ -577,6 +585,10 @@ impl TagServiceTrait for GrpcService {
             }
         };
 
+        if simulation_output_disabled(self.collection_controller.as_deref()) {
+            return Err(Status::unavailable("simulation_output_disabled"));
+        }
+
         let now_ms = self.manager.clock().now_ms();
         let current = self.manager.current_values();
         let server_store = self.manager.server_store();
@@ -604,17 +616,46 @@ impl TagServiceTrait for GrpcService {
         };
 
         let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
+        // The lifecycle can switch between the initial status check and the
+        // first batch. Re-check immediately before exposing the stream so a
+        // newly entered all-simulation run does not receive an initial SIM
+        // value through the normal gRPC path.
+        if simulation_output_disabled(self.collection_controller.as_deref()) {
+            return Err(Status::unavailable("simulation_output_disabled"));
+        }
         // 設計「初期スナップショット必須」- subscribe 直後に必ず1回送る
         // (空でも)。作ったばかりのチャネルなので `try_send` が失敗する
         // ことは通常ない(防御的に失敗時は素直にストリームを終える)。
         let _ = tx.try_send(Ok(to_proto_value_batch(now_ms, initial)));
 
         let manager = self.manager.clone();
+        let mut runtime_rx = self
+            .collection_controller
+            .as_ref()
+            .map(|controller| controller.subscribe_status());
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(EVAL_TICK_MS as u64));
             tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    changed = async {
+                        match runtime_rx.as_mut() {
+                            Some(receiver) => receiver.changed().await.map_err(|_| ()),
+                            None => std::future::pending::<Result<(), ()>>().await,
+                        }
+                    } => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                }
+                if runtime_rx
+                    .as_ref()
+                    .is_some_and(|receiver| receiver.borrow().mode == RunMode::AllSimulation)
+                {
+                    break;
+                }
                 if tx.is_closed() {
                     break;
                 }
@@ -817,7 +858,28 @@ impl GrpcServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controller::CollectionState;
+    use crate::controller::{CollectionState, CollectionStatus};
+
+    fn status(mode: RunMode) -> CollectionStatus {
+        CollectionStatus {
+            state: CollectionState::Running,
+            mode,
+            run_id: Some(1),
+            last_error: None,
+            configured_revision: 1,
+            running_revision: 1,
+        }
+    }
+
+    #[test]
+    fn simulation_output_gate_disables_only_all_simulation() {
+        assert!(!simulation_output_disabled_status(&status(
+            RunMode::Configured
+        )));
+        assert!(simulation_output_disabled_status(&status(
+            RunMode::AllSimulation
+        )));
+    }
 
     #[test]
     fn stopped_collection_rejection_maps_to_unavailable() {
