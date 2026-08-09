@@ -19,9 +19,10 @@ use banto_collect::{BackoffConfig, CollectorOptions};
 use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
+use banto_hub_core::controller::{CollectionController, CollectionState, RunMode};
 use banto_hub_core::db::init_db;
 use banto_hub_core::hub::CollectorManager;
-use banto_hub_core::rest::api_router;
+use banto_hub_core::rest::api_router_with_controller;
 use banto_hub_core::users::UsersService;
 use banto_plc::modbus::simulator::Simulator;
 use banto_server::{start, AuthState, Identity, ServerConfig};
@@ -138,6 +139,7 @@ struct TestApp {
     token: String,
     pool: SqlitePool,
     manager: std::sync::Arc<CollectorManager>,
+    controller: std::sync::Arc<CollectionController>,
     api_keys: ApiKeysService,
     _env: TempEnv,
 }
@@ -203,13 +205,19 @@ async fn test_app(label: &str) -> TestApp {
         computed,
     ));
     manager.rebuild().await.expect("initial rebuild");
+    let write_control =
+        std::sync::Arc::new(banto_hub_core::write_control::WriteControl::new(false));
+    let controller = std::sync::Arc::new(CollectionController::new(
+        manager.clone(),
+        write_control.clone(),
+    ));
+    let status = controller.start(RunMode::Configured).await;
+    assert_eq!(status.state, CollectionState::Running);
 
     let api_keys = ApiKeysService::new(pool.clone());
     let (events_tx, _rx) = broadcast::channel(16);
     // T2-4: WriteControl always constructs disabled (docs/tag-server-design.md
     // §6-6) - not exercised by these WebSocket-subscription tests.
-    let write_control =
-        std::sync::Arc::new(banto_hub_core::write_control::WriteControl::new(false));
     let write_audit = banto_hub_core::write_audit::WriteAuditService::new(pool.clone());
     let mqtt = std::sync::Arc::new(banto_hub_core::mqtt::MqttPublisher::new(manager.clone()));
     // T4: this file exercises the WebSocket subscription surface only
@@ -231,7 +239,7 @@ async fn test_app(label: &str) -> TestApp {
         events_tx.clone(),
     );
     let grpc_server = std::sync::Arc::new(banto_hub_core::grpc::GrpcServer::new(grpc_service));
-    let router: Router = api_router(
+    let router: Router = api_router_with_controller(
         users,
         audit,
         PlcConnectionService::new(pool.clone()),
@@ -239,6 +247,7 @@ async fn test_app(label: &str) -> TestApp {
         TagService::new(pool.clone()),
         api_keys.clone(),
         manager.clone(),
+        controller.clone(),
         auth,
         events_tx,
         false,
@@ -264,6 +273,7 @@ async fn test_app(label: &str) -> TestApp {
         token,
         pool,
         manager,
+        controller,
         api_keys,
         _env: env,
     }
@@ -438,6 +448,97 @@ async fn subscribe_exact_tag_gets_initial_snapshot_then_on_change_data() {
     let values = changed["values"].as_array().unwrap();
     assert_eq!(values.len(), 1);
     assert_eq!(values[0]["v"], 200.0);
+
+    sim.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_key_ws_ends_and_rejects_normal_output_during_all_simulation() {
+    let app = test_app("api-key-all-simulation").await;
+    let sim = Simulator::start().await;
+    sim.set_holding_register(0, 100);
+
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(conn_input("line1", sim.addr.port()))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group.id, "40001", "i16"))
+        .await
+        .unwrap();
+    app.manager.rebuild().await.expect("rebuild after seeding");
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            app.manager
+                .current_values()
+                .and_then(|c| c.get("tag:1"))
+                .map(|s| s.value)
+                == Some(Some(100.0))
+        })
+        .await,
+        "collector should observe the initial simulator value"
+    );
+
+    let issued = app
+        .api_keys
+        .issue("all-simulation-reader", vec!["read".to_string()], None)
+        .await
+        .expect("issue should succeed");
+    let mut api_key_ws = connect_ws(&app.ws_url("/api/v1/stream"), Some(&issued.key))
+        .await
+        .expect("API-key WS handshake should succeed");
+    send_json(
+        &mut api_key_ws,
+        json!({ "op": "subscribe", "id": 1, "tags": ["line1.fast.temp01"], "mode": "on_change" }),
+    )
+    .await;
+    let snapshot = recv_matching(&mut api_key_ws, |m| m["op"] == "data" && m["id"] == 1).await;
+    assert_eq!(snapshot["values"][0]["v"], 100.0);
+
+    let mut session_ws = connect_ws(&app.ws_url("/api/v1/stream"), Some(&app.token))
+        .await
+        .expect("session WS handshake should succeed");
+    send_json(
+        &mut session_ws,
+        json!({ "op": "subscribe", "id": 2, "tags": ["line1.fast.temp01"], "mode": "on_change" }),
+    )
+    .await;
+    recv_matching(&mut session_ws, |m| m["op"] == "data" && m["id"] == 2).await;
+
+    let status = app.controller.start(RunMode::AllSimulation).await;
+    assert_eq!(status.state, CollectionState::Running);
+    assert_eq!(status.mode, RunMode::AllSimulation);
+
+    let closed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match api_key_ws.next().await {
+                None | Some(Err(_)) | Some(Ok(WsMessage::Close(_))) => break true,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await
+    .expect("API-key WS should actively end during all-simulation");
+    assert!(closed);
+
+    let mut new_api_key_ws = connect_ws(&app.ws_url("/api/v1/stream"), Some(&issued.key))
+        .await
+        .expect("new API-key WS handshake should still succeed");
+    send_json(
+        &mut new_api_key_ws,
+        json!({ "op": "subscribe", "id": 3, "tags": ["line1.fast.temp01"], "mode": "on_change" }),
+    )
+    .await;
+    let error = recv_matching(&mut new_api_key_ws, |m| m["op"] == "error" && m["id"] == 3).await;
+    assert_eq!(error["code"], "simulation_output_disabled");
+
+    send_json(&mut session_ws, json!({ "op": "ping" })).await;
+    let pong = recv_matching(&mut session_ws, |m| m["op"] == "pong").await;
+    assert_eq!(pong["op"], "pong", "management session WS must remain open");
 
     sim.stop();
 }

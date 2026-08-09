@@ -96,6 +96,7 @@ use tonic::{Request, Response, Status};
 use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::computed::ServerTagStore;
+use crate::controller::{CollectionController, RunMode};
 use crate::hub::{read_current, CollectorManager, TagEntry};
 use crate::settings::GrpcSettings;
 use crate::subscribe_core::{
@@ -223,6 +224,14 @@ fn to_proto_value_batch(
     }
 }
 
+fn simulation_output_disabled_status(status: &crate::controller::CollectionStatus) -> bool {
+    status.mode == RunMode::AllSimulation
+}
+
+fn simulation_output_disabled(controller: Option<&CollectionController>) -> bool {
+    controller.is_some_and(|controller| simulation_output_disabled_status(&controller.status()))
+}
+
 /// [`crate::write_path::WriteRejection`] を `tonic::Status` へ変換する
 /// (設計 §5.4「gRPC 側のエラー写像」)。REST 側の対応物は
 /// `crate::rest::write_rejection_response`。コード対応表:
@@ -236,13 +245,18 @@ fn to_proto_value_batch(
 /// | 429 | `RESOURCE_EXHAUSTED` |
 /// | 501 | `UNIMPLEMENTED` |
 /// | 502 | `UNAVAILABLE` |
-/// | 503 | `FAILED_PRECONDITION`(message に元の REST エラーコード名を併記) |
+/// | 503 | `UNAVAILABLE`(collection_not_running / simulation_write_rejected) / `FAILED_PRECONDITION`(writes_disabled) |
 /// | 500(監査書き込み失敗等、防御的分岐) | `INTERNAL` |
 ///
 /// message は常に `"{rest_error_code}: {detail}"`(detail が無ければ
 /// `rest_error_code` のみ)- 設計「detail 文字列でコード名を併記」の実現。
 fn write_rejection_status(rejection: WriteRejection) -> Status {
     let code = match &rejection {
+        WriteRejection::CollectionNotRunning(_) => tonic::Code::Unavailable,
+        // Keep the simulation safety gate fail-closed at the transport
+        // boundary. It is a stable runtime safety condition, but the REST
+        // mapping is 503; UNAVAILABLE keeps the two transports aligned.
+        WriteRejection::SimulationWriteRejected => tonic::Code::Unavailable,
         WriteRejection::NotFound => tonic::Code::NotFound,
         WriteRejection::NotWritable => tonic::Code::PermissionDenied,
         WriteRejection::TagDisabled => tonic::Code::FailedPrecondition,
@@ -286,6 +300,7 @@ enum RequireScope {
 #[derive(Clone)]
 pub struct GrpcService {
     manager: Arc<CollectorManager>,
+    collection_controller: Option<Arc<CollectionController>>,
     api_keys: ApiKeysService,
     audit: AuditLogService,
     write_audit: WriteAuditService,
@@ -307,6 +322,7 @@ impl GrpcService {
     ) -> Self {
         Self {
             manager,
+            collection_controller: None,
             api_keys,
             audit,
             write_audit,
@@ -314,6 +330,14 @@ impl GrpcService {
             rate_limiter,
             events,
         }
+    }
+
+    /// Enable the T14-4 stopped-state write gate for production wiring.
+    /// `new` intentionally remains ungated for legacy integration tests and
+    /// embedders that construct the service directly.
+    pub fn with_controller(mut self, controller: Arc<CollectionController>) -> Self {
+        self.collection_controller = Some(controller);
+        self
     }
 
     /// `authorization: Bearer bh_...` メタデータを照合する - このモジュール
@@ -561,6 +585,10 @@ impl TagServiceTrait for GrpcService {
             }
         };
 
+        if simulation_output_disabled(self.collection_controller.as_deref()) {
+            return Err(Status::unavailable("simulation_output_disabled"));
+        }
+
         let now_ms = self.manager.clock().now_ms();
         let current = self.manager.current_values();
         let server_store = self.manager.server_store();
@@ -588,17 +616,46 @@ impl TagServiceTrait for GrpcService {
         };
 
         let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
+        // The lifecycle can switch between the initial status check and the
+        // first batch. Re-check immediately before exposing the stream so a
+        // newly entered all-simulation run does not receive an initial SIM
+        // value through the normal gRPC path.
+        if simulation_output_disabled(self.collection_controller.as_deref()) {
+            return Err(Status::unavailable("simulation_output_disabled"));
+        }
         // 設計「初期スナップショット必須」- subscribe 直後に必ず1回送る
         // (空でも)。作ったばかりのチャネルなので `try_send` が失敗する
         // ことは通常ない(防御的に失敗時は素直にストリームを終える)。
         let _ = tx.try_send(Ok(to_proto_value_batch(now_ms, initial)));
 
         let manager = self.manager.clone();
+        let mut runtime_rx = self
+            .collection_controller
+            .as_ref()
+            .map(|controller| controller.subscribe_status());
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(EVAL_TICK_MS as u64));
             tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    changed = async {
+                        match runtime_rx.as_mut() {
+                            Some(receiver) => receiver.changed().await.map_err(|_| ()),
+                            None => std::future::pending::<Result<(), ()>>().await,
+                        }
+                    } => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                }
+                if runtime_rx
+                    .as_ref()
+                    .is_some_and(|receiver| receiver.borrow().mode == RunMode::AllSimulation)
+                {
+                    break;
+                }
                 if tx.is_closed() {
                     break;
                 }
@@ -688,6 +745,7 @@ impl TagServiceTrait for GrpcService {
 
         let deps = write_path::WriteDeps {
             manager: self.manager.as_ref(),
+            collection_controller: self.collection_controller.as_deref(),
             api_keys: &self.api_keys,
             write_audit: &self.write_audit,
             write_control: self.write_control.as_ref(),
@@ -794,5 +852,48 @@ impl GrpcServer {
         if let Some(handle) = guard.take() {
             handle.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::controller::{CollectionState, CollectionStatus};
+
+    fn status(mode: RunMode) -> CollectionStatus {
+        CollectionStatus {
+            state: CollectionState::Running,
+            mode,
+            run_id: Some(1),
+            last_error: None,
+            configured_revision: 1,
+            running_revision: 1,
+        }
+    }
+
+    #[test]
+    fn simulation_output_gate_disables_only_all_simulation() {
+        assert!(!simulation_output_disabled_status(&status(
+            RunMode::Configured
+        )));
+        assert!(simulation_output_disabled_status(&status(
+            RunMode::AllSimulation
+        )));
+    }
+
+    #[test]
+    fn stopped_collection_rejection_maps_to_unavailable() {
+        let status = write_rejection_status(WriteRejection::CollectionNotRunning(
+            CollectionState::Stopped,
+        ));
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(status.message().contains("collection_not_running"));
+    }
+
+    #[test]
+    fn simulation_write_rejection_maps_to_unavailable() {
+        let status = write_rejection_status(WriteRejection::SimulationWriteRejected);
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(status.message().contains("simulation_write_rejected"));
     }
 }

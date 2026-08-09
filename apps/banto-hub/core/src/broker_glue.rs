@@ -354,6 +354,13 @@ impl HubSessions {
         self.directory.remove(connection_id)
     }
 
+    /// Stop one broker session and await its task's completion. This is the
+    /// collection-run-context stop primitive; unlike [`Self::remove`], it
+    /// guarantees that the per-connection task has joined before returning.
+    pub async fn stop_and_join(&self, connection_id: i64) -> bool {
+        self.directory.stop_and_join(connection_id).await
+    }
+
     /// Stop every broker task this directory ever spawned (seeded-empty +
     /// every later `ensure_connection`) and await their clean exit. Called
     /// once, from `bin/banto-hub.rs`'s shutdown sequence, **after**

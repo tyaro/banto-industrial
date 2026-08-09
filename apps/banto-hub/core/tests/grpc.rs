@@ -43,6 +43,7 @@ use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::{HubSessions, SlmpSimRegistry};
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
+use banto_hub_core::controller::{CollectionController, CollectionState, RunMode};
 use banto_hub_core::db::init_db;
 use banto_hub_core::grpc::tagserver_v1::tag_service_client::TagServiceClient;
 use banto_hub_core::grpc::tagserver_v1::{
@@ -181,6 +182,7 @@ struct TestApp {
     pool: SqlitePool,
     manager: Arc<CollectorManager>,
     write_control: Arc<WriteControl>,
+    controller: Arc<CollectionController>,
     grpc_server: Arc<GrpcServer>,
     _env: TempEnv,
 }
@@ -245,6 +247,12 @@ async fn test_app(label: &str) -> TestApp {
     let rate_limiter = Arc::new(AsyncMutex::new(WriteRateLimiter::new(
         WriteRateLimitConfig::default(),
     )));
+    let controller = Arc::new(CollectionController::new(
+        manager.clone(),
+        write_control.clone(),
+    ));
+    let status = controller.start(RunMode::Configured).await;
+    assert_eq!(status.state, CollectionState::Running);
 
     let grpc_service = GrpcService::new(
         manager.clone(),
@@ -254,7 +262,8 @@ async fn test_app(label: &str) -> TestApp {
         write_control.clone(),
         rate_limiter.clone(),
         events_tx.clone(),
-    );
+    )
+    .with_controller(controller.clone());
     let grpc_server = Arc::new(GrpcServer::new(grpc_service));
 
     let router = api_router(
@@ -281,6 +290,7 @@ async fn test_app(label: &str) -> TestApp {
         pool,
         manager,
         write_control,
+        controller,
         grpc_server,
         _env: env,
     }
@@ -659,6 +669,97 @@ async fn stream_values_sends_initial_snapshot_then_on_change() {
     let changed = drain_until_value(&mut stream, deadline, 99.0).await;
     assert_eq!(changed.values.len(), 1);
     assert_eq!(changed.values[0].value, Some(tag_value::Value::Num(99.0)));
+
+    sim.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_values_ends_when_all_simulation_starts() {
+    let app = test_app("stream-values-all-simulation").await;
+    let sim = Simulator::start().await;
+    sim.set_word(SlmpDevice::D, 100, 10);
+
+    let (_tag_id, external_name) = make_tag(
+        &app,
+        "line1",
+        sim.addr.port(),
+        "temp01",
+        "D100",
+        "u16",
+        false,
+        true,
+    )
+    .await;
+    assert!(
+        wait_until(Duration::from_secs(3), || async {
+            app.manager
+                .current_values()
+                .and_then(|c| c.get("tag:1"))
+                .and_then(|s| s.value)
+                .is_some()
+        })
+        .await,
+        "collector should have picked up the seeded value"
+    );
+
+    let (key, _id) = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+    let (_port, mut client) = start_grpc_and_connect(&app.grpc_server).await;
+    let mut stream = client
+        .stream_values(bearer_request(
+            StreamValuesRequest {
+                tags: vec![external_name.clone()],
+                mode: SubscribeMode::OnChange as i32,
+                interval_ms: 0,
+            },
+            &key,
+        ))
+        .await
+        .expect("stream_values should succeed before all-simulation")
+        .into_inner();
+    assert!(
+        stream
+            .message()
+            .await
+            .expect("initial stream read should not error")
+            .is_some(),
+        "configured stream should send an initial batch"
+    );
+
+    let status = app.controller.start(RunMode::AllSimulation).await;
+    assert_eq!(status.state, CollectionState::Running);
+    assert_eq!(status.mode, RunMode::AllSimulation);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            remaining > Duration::ZERO,
+            "stream should end after all-simulation starts"
+        );
+        let next = tokio::time::timeout(remaining, stream.message())
+            .await
+            .expect("stream should end after all-simulation starts")
+            .expect("stream termination should not be a gRPC error");
+        if next.is_none() {
+            break;
+        }
+        // A batch already queued just before the lifecycle notification may
+        // still drain; the stream must close before any later tick can emit.
+    }
+
+    let err = client
+        .stream_values(bearer_request(
+            StreamValuesRequest {
+                tags: vec![external_name],
+                mode: SubscribeMode::OnChange as i32,
+                interval_ms: 0,
+            },
+            &key,
+        ))
+        .await
+        .expect_err("new normal stream must be disabled during all-simulation");
+    assert_eq!(err.code(), tonic::Code::Unavailable);
+    assert_eq!(err.message(), "simulation_output_disabled");
 
     sim.stop();
 }

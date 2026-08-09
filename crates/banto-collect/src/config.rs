@@ -28,7 +28,7 @@ use banto_tags::{
     Tag, TagService,
 };
 use banto_tstore::{GroupConfig, StoreConfig, TagColumn};
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 
 use crate::error::CollectError;
 
@@ -303,6 +303,72 @@ impl CollectorConfig {
     }
 }
 
+/// One logical, point-in-time registry input used by both catalog and
+/// collector preflight builders. The three vectors are intentionally kept as
+/// the registry row types so callers do not need a second DTO conversion and
+/// all existing validation remains in the builders below.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RegistrySnapshot {
+    pub connections: Vec<PlcConnection>,
+    pub groups: Vec<CollectionGroup>,
+    pub tags: Vec<Tag>,
+}
+
+impl RegistrySnapshot {
+    /// Read the registry rows once into a reusable logical snapshot.
+    pub async fn load(pool: &SqlitePool) -> Result<Self, CollectError> {
+        Ok(Self {
+            connections: PlcConnectionService::new(pool.clone())
+                .list(ListParams::default())
+                .await?
+                .rows,
+            groups: CollectionGroupService::new(pool.clone())
+                .list(ListParams::default())
+                .await?
+                .rows,
+            tags: TagService::new(pool.clone())
+                .list(ListParams::default())
+                .await?
+                .rows,
+        })
+    }
+
+    /// Read the same registry snapshot from an already-open SQLite connection.
+    /// Callers use this with a transaction/savepoint so proposed mutations and
+    /// all three registry reads observe one transaction-local state.
+    pub async fn load_connection(connection: &mut SqliteConnection) -> Result<Self, CollectError> {
+        let connections = sqlx::query_as::<_, PlcConnection>(
+            "SELECT id, name, protocol, host, port, unit_id, enabled, simulation \
+             FROM plc_connections ORDER BY id",
+        )
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|err| CollectError::Registry(banto_core::BantoError::Storage(err.to_string())))?;
+        let groups = sqlx::query_as::<_, CollectionGroup>(
+            "SELECT id, name, plc_connection_id, period_ms, enabled \
+             FROM collection_groups ORDER BY id",
+        )
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|err| CollectError::Registry(banto_core::BantoError::Storage(err.to_string())))?;
+        let tags = sqlx::query_as::<_, Tag>(
+            "SELECT id, name, collection_group_id, address, data_type, \
+             string_length, raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, \
+             threshold_h, threshold_hh, threshold_l, threshold_ll, enabled, \
+             writable, tag_kind, expression, retain FROM tags ORDER BY id",
+        )
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|err| CollectError::Registry(banto_core::BantoError::Storage(err.to_string())))?;
+
+        Ok(Self {
+            connections,
+            groups,
+            tags,
+        })
+    }
+}
+
 /// Assemble a [`CollectorConfig`] from the tag registry in `pool` (the app's
 /// shared database). Reads via `banto-tags`' services and keeps only enabled,
 /// reachable rows (see this module's doc comment).
@@ -314,25 +380,23 @@ impl CollectorConfig {
 /// misconfigured tag is caught, before any socket is opened. Registry read
 /// failures surface as [`CollectError::Registry`].
 pub async fn build_config(pool: &SqlitePool) -> Result<CollectorConfig, CollectError> {
-    // Pagination `None` returns every row (banto-storage list_query appends no
-    // LIMIT), so one unpaginated list per resource is the whole registry.
-    let connections = PlcConnectionService::new(pool.clone())
-        .list(ListParams::default())
-        .await?
-        .rows;
-    let groups = CollectionGroupService::new(pool.clone())
-        .list(ListParams::default())
-        .await?
-        .rows;
-    let tags = TagService::new(pool.clone())
-        .list(ListParams::default())
-        .await?
-        .rows;
+    let snapshot = RegistrySnapshot::load(pool).await?;
+    build_config_from(&snapshot)
+}
+
+/// Build a collector configuration from an already-loaded registry snapshot.
+/// This is the shared preflight path used by banto-hub's catalog commit and
+/// run application; it preserves the filtering and validation semantics of
+/// [`build_config`].
+pub fn build_config_from(snapshot: &RegistrySnapshot) -> Result<CollectorConfig, CollectError> {
+    let connections = &snapshot.connections;
+    let groups = &snapshot.groups;
+    let tags = &snapshot.tags;
 
     // Index groups by connection and tags by group, so each connection's plan
     // is one pass rather than repeated full scans.
     let mut groups_by_connection: HashMap<i64, Vec<&CollectionGroup>> = HashMap::new();
-    for group in &groups {
+    for group in groups {
         if group.enabled {
             groups_by_connection
                 .entry(group.plc_connection_id)
@@ -341,7 +405,7 @@ pub async fn build_config(pool: &SqlitePool) -> Result<CollectorConfig, CollectE
         }
     }
     let mut tags_by_group: HashMap<i64, Vec<&Tag>> = HashMap::new();
-    for tag in &tags {
+    for tag in tags {
         if tag.enabled {
             tags_by_group
                 .entry(tag.collection_group_id)
@@ -670,6 +734,29 @@ mod tests {
         assert_eq!(config.group_count(), 0);
         assert_eq!(config.tag_count(), 0);
         assert!(config.store_config.groups.is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_builder_matches_the_pool_compatibility_wrapper() {
+        let pool = registry().await;
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(conn_input("PLC1", 502))
+            .await
+            .unwrap();
+        let group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", conn.id, 1_000))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input("T1", group.id, "40001"))
+            .await
+            .unwrap();
+
+        let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
+        assert_eq!(
+            build_config(&pool).await.unwrap(),
+            build_config_from(&snapshot).unwrap()
+        );
     }
 
     #[tokio::test]

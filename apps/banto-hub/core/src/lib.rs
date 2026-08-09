@@ -93,6 +93,7 @@ pub mod assets;
 pub mod audit;
 pub mod broker_glue;
 pub mod computed;
+pub mod controller;
 pub mod db;
 pub mod diag_log;
 pub mod events;
@@ -112,3 +113,7 @@ pub mod write_audit;
 pub mod write_control;
 pub mod write_path;
 pub mod write_rate;
+
+pub use controller::{
+    CollectionController, CollectionState, CollectionStatus, RunContext, RunId, RunMode,
+};

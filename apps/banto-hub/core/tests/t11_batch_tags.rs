@@ -281,6 +281,26 @@ async fn seed_group(app: &TestApp, label: &str) -> i64 {
     group.id
 }
 
+/// Seed an enabled connection/group for a test that must reach
+/// `banto-collect`'s address/config validation. The ordinary batch fixture is
+/// disabled so it never attempts a PLC connection during compatibility
+/// rebuilds.
+async fn seed_enabled_group(app: &TestApp, label: &str) -> i64 {
+    let mut connection = disabled_conn_input(&format!("enabled_conn_{label}"));
+    connection.enabled = true;
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(connection)
+        .await
+        .unwrap();
+    let mut group = group_input(&format!("enabled_group_{label}"), conn.id);
+    group.enabled = true;
+    CollectionGroupService::new(app.pool.clone())
+        .create(group)
+        .await
+        .unwrap()
+        .id
+}
+
 fn tag_payload(name: &str, group_id: i64, address: &str) -> Value {
     json!({
         "name": name,
@@ -306,7 +326,7 @@ async fn batch_create_all_succeed_and_rebuilds_exactly_once() {
     let app = test_app("all-succeed").await;
     let group_id = seed_group(&app, "a").await;
 
-    let revision_before = app.manager.revision();
+    let revision_before = app.manager.configured_revision();
     let before_count = tag_count(&app).await;
 
     let (status, body) = write_json(
@@ -333,9 +353,9 @@ async fn batch_create_all_succeed_and_rebuilds_exactly_once() {
     // 3件追加したにもかかわらず revision はちょうど+1 - rebuild が (3回で
     // はなく) 1回だけ走ったことの直接証拠。
     assert_eq!(
-        app.manager.revision(),
+        app.manager.configured_revision(),
         revision_before + 1,
-        "a 3-tag batch must trigger exactly one rebuild, not one per tag"
+        "a 3-tag batch must commit the configured catalog exactly once"
     );
     assert_eq!(tag_count(&app).await, before_count + 3);
 }
@@ -398,7 +418,11 @@ async fn batch_dry_run_never_writes() {
     let app = test_app("dry-run").await;
     let group_id = seed_group(&app, "c").await;
 
-    let revision_before = app.manager.revision();
+    let revision_before = app.manager.configured_revision();
+    let db_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
     let before_count = tag_count(&app).await;
 
     let (status, body) = write_json(
@@ -424,8 +448,46 @@ async fn batch_dry_run_never_writes() {
         "dry run must not report created rows: {body:?}"
     );
 
-    assert_eq!(app.manager.revision(), revision_before);
+    assert_eq!(app.manager.configured_revision(), revision_before);
+    let db_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(db_count_after, db_count_before);
     assert_eq!(tag_count(&app).await, before_count);
+}
+
+// ---------------------------------------------------------------------------
+// 3b. 単票のcatalog preflight失敗はmutationごとrollback
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn single_invalid_address_rolls_back_the_db_and_configured_revision() {
+    let app = test_app("single-invalid-address").await;
+    let group_id = seed_enabled_group(&app, "single-invalid-address").await;
+    let revision_before = app.manager.configured_revision();
+    let db_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = write_json(
+        &app.router,
+        "POST",
+        "/api/tags",
+        &app.token,
+        tag_payload("bad_address", group_id, "99999"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert_eq!(body["kind"], json!("validation"));
+
+    let db_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(db_count_after, db_count_before);
+    assert_eq!(app.manager.configured_revision(), revision_before);
 }
 
 // ---------------------------------------------------------------------------

@@ -175,8 +175,8 @@ use tokio::sync::{broadcast, watch};
 
 use banto_broker::{BrokerConnectionStatus, BrokerError, BrokerHandle, ReadOnlyHandle};
 use banto_collect::{
-    build_config, ApplyReport, CollectEvent, Collector, CollectorOptions, ConnectionStatus,
-    CurrentSample, CurrentValuesHandle, EventSink, Quality,
+    build_config_from, ApplyReport, CollectEvent, Collector, CollectorOptions, ConnectionStatus,
+    CurrentSample, CurrentValuesHandle, EventSink, Quality, RegistrySnapshot,
 };
 use banto_core::ListParams;
 use banto_tags::{CollectionGroupService, PlcConnection, PlcConnectionService, Tag, TagService};
@@ -188,6 +188,29 @@ use utoipa::ToSchema;
 use crate::broker_glue::{hub_client_factory, HubSessions, SlmpSimRegistry};
 use crate::computed::{self, ComputedEngine, ServerTagStore};
 use crate::diag_log::DiagLog;
+
+/// Build the non-persistent runtime snapshot for a collection mode.
+///
+/// The catalog must continue to describe the saved registry, while the
+/// collector and broker session setup need the effective run-time flags. An
+/// all-simulation run therefore overrides only enabled physical connections
+/// in a cloned snapshot; the database-backed snapshot remains untouched.
+fn runtime_snapshot_for_mode(
+    snapshot: &RegistrySnapshot,
+    mode: crate::controller::RunMode,
+) -> RegistrySnapshot {
+    if mode != crate::controller::RunMode::AllSimulation {
+        return snapshot.clone();
+    }
+
+    let mut runtime = snapshot.clone();
+    for connection in &mut runtime.connections {
+        if connection.enabled && matches!(connection.protocol.as_str(), "modbus-tcp" | "slmp") {
+            connection.simulation = true;
+        }
+    }
+    runtime
+}
 
 /// The effective `(value, quality, timestamp_ms)` triple for one catalog
 /// entry - shared by `crate::rest`'s `/api/v1/values*` and `crate::stream`'s
@@ -403,7 +426,7 @@ impl TagMap {
 /// whose group or connection row cannot be found (should not happen - both
 /// are `NOT NULL REFERENCES ... ON DELETE RESTRICT` - but defensive against
 /// a future relaxation) is skipped rather than panicking.
-async fn build_catalog(pool: &SqlitePool) -> Result<TagMap, banto_core::BantoError> {
+pub async fn build_catalog(pool: &SqlitePool) -> Result<TagMap, banto_core::BantoError> {
     let connections = PlcConnectionService::new(pool.clone())
         .list(ListParams::default())
         .await?
@@ -417,11 +440,25 @@ async fn build_catalog(pool: &SqlitePool) -> Result<TagMap, banto_core::BantoErr
         .await?
         .rows;
 
+    build_catalog_from(&RegistrySnapshot {
+        connections,
+        groups,
+        tags,
+    })
+}
+
+/// Build the external-name catalog from one registry snapshot. This is kept
+/// separate from the pool-reading compatibility wrapper so a catalog commit
+/// and a collector preflight can use exactly the same logical registry read.
+pub fn build_catalog_from(snapshot: &RegistrySnapshot) -> Result<TagMap, banto_core::BantoError> {
+    let connections = &snapshot.connections;
+    let groups = &snapshot.groups;
+    let tags = &snapshot.tags;
     let conn_by_id: HashMap<i64, _> = connections.iter().map(|c| (c.id, c)).collect();
     let group_by_id: HashMap<i64, _> = groups.iter().map(|g| (g.id, g)).collect();
 
     let mut entries: Vec<TagEntry> = Vec::with_capacity(tags.len());
-    for tag in &tags {
+    for tag in tags {
         let Some(group) = group_by_id.get(&tag.collection_group_id) else {
             continue;
         };
@@ -481,6 +518,7 @@ async fn build_catalog(pool: &SqlitePool) -> Result<TagMap, banto_core::BantoErr
 struct Inner {
     map: Arc<TagMap>,
     revision: u64,
+    running_revision: u64,
     last_error: Option<String>,
     /// `None` when no `Collector` is running (nothing enabled, or before the
     /// first successful rebuild) - mirrors the old
@@ -627,6 +665,7 @@ impl CollectorManager {
             inner: Mutex::new(Inner {
                 map: Arc::new(TagMap::empty()),
                 revision: 0,
+                running_revision: 0,
                 last_error: None,
                 current: None,
                 last_apply: None,
@@ -723,7 +762,16 @@ impl CollectorManager {
     pub async fn rebuild(&self) -> Result<(), String> {
         let _guard = self.rebuild_lock.lock().await;
 
-        let new_map = match build_catalog(&self.pool).await {
+        let snapshot = match RegistrySnapshot::load(&self.pool).await {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                let message = format!("レジストリのスナップショット取得に失敗しました: {err}");
+                self.set_last_error(message.clone());
+                return Err(message);
+            }
+        };
+
+        let new_map = match build_catalog_from(&snapshot) {
             Ok(map) => map,
             Err(err) => {
                 let message = format!("catalog の読み取りに失敗しました: {err}");
@@ -748,7 +796,7 @@ impl CollectorManager {
             }
         };
 
-        let mut config = match build_config(&self.pool).await {
+        let mut config = match build_config_from(&snapshot) {
             Ok(config) => config,
             Err(err) => {
                 let message = err.to_string();
@@ -768,7 +816,8 @@ impl CollectorManager {
         // either way. `stale_slmp_ids` is only actually removed AFTER a
         // successful commit below - see `Self::remove_stale_slmp_sessions`'s
         // doc comment for why the ordering matters.
-        let (slmp_handles, stale_slmp_ids, resolved_slmp_targets) = self.sync_slmp_sessions().await;
+        let (slmp_handles, stale_slmp_ids, resolved_slmp_targets) =
+            self.sync_slmp_sessions_from(&snapshot).await;
 
         // T9-2: every key in `slmp_handles` is, by construction, a
         // broker-routed enabled SLMP connection whose dial target
@@ -983,30 +1032,19 @@ impl CollectorManager {
     /// `CollectorConfig::set_broker_dial_target`'s own doc comment for the
     /// full derivation (found necessary by this crate's own E2E coverage of
     /// the toggle path, `apps/banto-hub/core/tests/t9_simulation.rs`).
-    async fn sync_slmp_sessions(
+    async fn sync_slmp_sessions_from(
         &self,
+        snapshot: &RegistrySnapshot,
     ) -> (
         HashMap<String, ReadOnlyHandle>,
         Vec<i64>,
         HashMap<String, (String, i64)>,
     ) {
-        let connections: Vec<PlcConnection> = match PlcConnectionService::new(self.pool.clone())
-            .list(ListParams::default())
-            .await
-        {
-            Ok(result) => result.rows,
-            Err(err) => {
-                self.diag_log.err_line(&format!(
-                    "banto-hub: SLMP セッション同期のための接続一覧取得に失敗しました: {err}"
-                ));
-                return (HashMap::new(), Vec::new(), HashMap::new());
-            }
-        };
-
         let mut handles = HashMap::new();
         let mut resolved_targets = HashMap::new();
         let mut wanted_ids: HashSet<i64> = HashSet::new();
-        for conn in connections
+        for conn in snapshot
+            .connections
             .iter()
             .filter(|c| c.enabled && c.protocol == "slmp")
         {
@@ -1058,7 +1096,7 @@ impl CollectorManager {
         (handles, stale_ids, resolved_targets)
     }
 
-    /// T7-2/T9-2: [`crate::broker_glue::HubSessions::remove`] and
+    /// T14-2/T7-2/T9-2: [`crate::broker_glue::HubSessions::stop_and_join`] and
     /// [`crate::broker_glue::SlmpSimRegistry::remove`] for every id in
     /// `stale`. Must only be called AFTER the collector-side commit for the
     /// same rebuild has succeeded (see
@@ -1069,7 +1107,7 @@ impl CollectorManager {
     /// is `.await`-heavy, stopping a simulator's ramp task) - was sync before.
     async fn remove_stale_slmp_sessions(&self, stale: &[i64]) {
         for &connection_id in stale {
-            self.sessions.remove(connection_id);
+            let _ = self.sessions.stop_and_join(connection_id).await;
             self.sim_registry.remove(connection_id).await;
         }
     }
@@ -1165,6 +1203,148 @@ impl CollectorManager {
 
     pub fn revision(&self) -> u64 {
         self.inner.lock().expect("hub state lock poisoned").revision
+    }
+
+    /// The catalog revision. This named accessor makes the T14-3 distinction
+    /// explicit while the older `revision()` API remains the configured
+    /// revision on the existing REST/stream wire.
+    pub fn configured_revision(&self) -> u64 {
+        self.revision()
+    }
+
+    /// The revision of the currently applied/stopped collection run.
+    pub fn running_revision(&self) -> u64 {
+        self.inner
+            .lock()
+            .expect("hub state lock poisoned")
+            .running_revision
+    }
+
+    /// Advance the run revision after a successful lifecycle operation.
+    pub(crate) fn advance_running_revision(&self) -> u64 {
+        let mut inner = self.inner.lock().expect("hub state lock poisoned");
+        inner.running_revision += 1;
+        inner.running_revision
+    }
+
+    /// Commit only the catalog and computed plan. No collector, broker
+    /// session, or simulator is started or stopped by this method.
+    pub async fn commit_catalog(&self, snapshot: &RegistrySnapshot) -> Result<u64, String> {
+        let _guard = self.rebuild_lock.lock().await;
+        let new_map = match build_catalog_from(snapshot) {
+            Ok(map) => map,
+            Err(err) => {
+                let message = format!("catalog の検証に失敗しました: {err}");
+                self.set_last_error(message.clone());
+                return Err(message);
+            }
+        };
+        let computed_plan = match computed::build_plan(&new_map) {
+            Ok(plan) => plan,
+            Err(err) => {
+                let message = format!("演算タグの検証に失敗しました: {err}");
+                self.set_last_error(message.clone());
+                return Err(message);
+            }
+        };
+        if let Err(err) = build_config_from(snapshot) {
+            let message = err.to_string();
+            self.set_last_error(message.clone());
+            return Err(message);
+        }
+
+        self.computed.commit(computed_plan);
+        let revision = {
+            let mut inner = self.inner.lock().expect("hub state lock poisoned");
+            inner.map = Arc::new(new_map);
+            inner.revision += 1;
+            inner.last_error = None;
+            inner.revision
+        };
+        let _ = self.revision_tx.send(revision);
+        Ok(revision)
+    }
+
+    /// Apply a fresh registry snapshot to a collection run. The saved
+    /// snapshot is validated for the catalog, while the selected mode may
+    /// provide a non-persistent runtime override before collector and broker
+    /// side effects begin.
+    pub async fn apply_run(&self, mode: crate::controller::RunMode) -> Result<(), String> {
+        let _guard = self.rebuild_lock.lock().await;
+        let snapshot = RegistrySnapshot::load(&self.pool)
+            .await
+            .map_err(|err| format!("レジストリのスナップショット取得に失敗しました: {err}"))?;
+        let new_map = build_catalog_from(&snapshot)
+            .map_err(|err| format!("catalog の検証に失敗しました: {err}"))?;
+        computed::build_plan(&new_map)
+            .map_err(|err| format!("演算タグの検証に失敗しました: {err}"))?;
+        let runtime_snapshot = runtime_snapshot_for_mode(&snapshot, mode);
+        let mut config = build_config_from(&runtime_snapshot).map_err(|err| err.to_string())?;
+
+        let (slmp_handles, stale_slmp_ids, resolved_slmp_targets) =
+            self.sync_slmp_sessions_from(&runtime_snapshot).await;
+        config.suppress_simulation_for(&slmp_handles.keys().cloned().collect());
+        for (key, (host, port)) in &resolved_slmp_targets {
+            config.set_broker_dial_target(key, host.clone(), *port);
+        }
+
+        if config.group_count() == 0 {
+            let old_collector = self.collector.lock().await.take();
+            if let Some(collector) = old_collector {
+                let _ = collector.stop().await;
+            }
+            {
+                let mut inner = self.inner.lock().expect("hub state lock poisoned");
+                inner.current = None;
+                inner.last_apply = None;
+                inner.last_error = None;
+            }
+            self.remove_stale_slmp_sessions(&stale_slmp_ids).await;
+            self.advance_running_revision();
+            return Ok(());
+        }
+
+        let factory = hub_client_factory(Arc::new(slmp_handles));
+        let mut collector_guard = self.collector.lock().await;
+        let commit: Result<(Option<ApplyReport>, CurrentValuesHandle), String> =
+            if let Some(collector) = collector_guard.as_mut() {
+                match collector.apply_config(config, factory).await {
+                    Ok(report) => Ok((Some(report), collector.current_values())),
+                    Err(err) => Err(err.to_string()),
+                }
+            } else {
+                match Collector::start_with_client_factory(
+                    config,
+                    &self.data_dir,
+                    self.clock.clone(),
+                    self.events.clone(),
+                    self.options,
+                    factory,
+                )
+                .await
+                {
+                    Ok(collector) => {
+                        let handle = collector.current_values();
+                        *collector_guard = Some(collector);
+                        Ok((None, handle))
+                    }
+                    Err(err) => Err(err.to_string()),
+                }
+            };
+        drop(collector_guard);
+        let (apply_report, current_handle) = commit.inspect_err(|message| {
+            self.set_last_error(message.clone());
+        })?;
+        {
+            let mut inner = self.inner.lock().expect("hub state lock poisoned");
+            inner.current = Some(current_handle);
+            inner.last_apply = apply_report;
+            inner.last_error = None;
+        }
+        self.remove_stale_slmp_sessions(&stale_slmp_ids).await;
+        self.log_simulation_warnings().await;
+        self.advance_running_revision();
+        Ok(())
     }
 
     /// The most recent rebuild failure message, or `None` if the last
@@ -1269,6 +1449,18 @@ impl CollectorManager {
         inner.current = None;
         inner.last_apply = None;
     }
+
+    /// Stop a collection run while keeping the broker supervisor reusable for
+    /// the next run. The collector is stopped first so no task retains a
+    /// broker handle while the per-connection broker tasks are joined.
+    pub async fn stop(&self) {
+        self.shutdown().await;
+        let connection_ids = self.sessions.connection_ids();
+        for connection_id in connection_ids {
+            let _ = self.sessions.stop_and_join(connection_id).await;
+            self.sim_registry.remove(connection_id).await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1276,7 +1468,9 @@ mod tests {
     use super::*;
     use crate::db::init_db;
     use banto_collect::CollectorOptions;
-    use banto_tags::{CollectionGroupInput, CollectionGroupService, PlcConnectionInput, TagInput};
+    use banto_tags::{
+        CollectionGroupInput, CollectionGroupService, PlcConnection, PlcConnectionInput, TagInput,
+    };
     use banto_tstore::SystemClock;
     use std::time::Duration;
 
@@ -1331,6 +1525,69 @@ mod tests {
         assert_eq!(manager.last_error(), None);
         assert!(manager.tag_map().is_empty());
         assert!(manager.current_values().is_none());
+    }
+
+    #[test]
+    fn all_simulation_overrides_only_enabled_physical_connections() {
+        let snapshot = RegistrySnapshot {
+            connections: vec![
+                PlcConnection {
+                    id: 1,
+                    name: "modbus".to_string(),
+                    protocol: "modbus-tcp".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: 502,
+                    unit_id: 1,
+                    enabled: true,
+                    simulation: false,
+                },
+                PlcConnection {
+                    id: 2,
+                    name: "slmp".to_string(),
+                    protocol: "slmp".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: 5007,
+                    unit_id: 1,
+                    enabled: true,
+                    simulation: false,
+                },
+                PlcConnection {
+                    id: 3,
+                    name: "disabled".to_string(),
+                    protocol: "modbus-tcp".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: 502,
+                    unit_id: 1,
+                    enabled: false,
+                    simulation: false,
+                },
+                PlcConnection {
+                    id: 4,
+                    name: "virtual".to_string(),
+                    protocol: "virtual".to_string(),
+                    host: String::new(),
+                    port: 0,
+                    unit_id: 0,
+                    enabled: true,
+                    simulation: false,
+                },
+            ],
+            groups: Vec::new(),
+            tags: Vec::new(),
+        };
+
+        let configured =
+            runtime_snapshot_for_mode(&snapshot, crate::controller::RunMode::Configured);
+        assert_eq!(configured, snapshot);
+
+        let all_simulation =
+            runtime_snapshot_for_mode(&snapshot, crate::controller::RunMode::AllSimulation);
+        assert!(!snapshot.connections[0].simulation);
+        assert!(!snapshot.connections[1].simulation);
+        assert!(all_simulation.connections[0].simulation);
+        assert!(all_simulation.connections[1].simulation);
+        assert!(!all_simulation.connections[2].simulation);
+        assert!(!all_simulation.connections[3].simulation);
     }
 
     // `crate::test_support`'s module doc: `TempDir::drop`'s retry needs a

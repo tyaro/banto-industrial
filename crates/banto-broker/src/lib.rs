@@ -510,11 +510,19 @@ pub fn spawn_test_handle_answering_ok(connection_id: i64) -> (BrokerHandle, Join
 #[derive(Clone)]
 pub struct SessionDirectory {
     handles: std::sync::Arc<std::sync::Mutex<HashMap<i64, BrokerHandle>>>,
-    tasks: std::sync::Arc<std::sync::Mutex<HashMap<i64, JoinHandle<()>>>>,
+    tasks: std::sync::Arc<std::sync::Mutex<HashMap<i64, TaskEntry>>>,
     backoff: BackoffConfig,
     /// Shared (via `Arc`) with [`BrokerSupervisor`] so on-demand tasks
     /// subscribe to the SAME shutdown trigger as the seeded ones.
     shutdown_tx: std::sync::Arc<watch::Sender<bool>>,
+}
+
+/// The task-local stop signal travels with the join handle. The supervisor
+/// shutdown watch remains a separate, shared signal so stopping one
+/// connection cannot stop its siblings.
+struct TaskEntry {
+    stop_tx: watch::Sender<bool>,
+    join_handle: JoinHandle<()>,
 }
 
 impl SessionDirectory {
@@ -623,6 +631,35 @@ impl SessionDirectory {
             .remove(&connection_id);
         had_handle
     }
+
+    /// Stop one broker task and await its completion.
+    ///
+    /// The per-task signal is independent of the shared supervisor shutdown
+    /// signal. Outstanding [`BrokerHandle`] clones therefore cannot keep this
+    /// task alive: it observes its own signal, closes its socket, and the
+    /// tracked join handle is awaited here.
+    pub async fn stop_and_join(&self, connection_id: i64) -> bool {
+        let entry = self
+            .tasks
+            .lock()
+            .expect("session directory poisoned")
+            .remove(&connection_id);
+        // Remove the directory's handle after the task entry. `ensure_connection`
+        // checks the handle map first; while the old handle is still present it
+        // can only return a clone of the task that is already being stopped.
+        let removed_handle = self
+            .handles
+            .lock()
+            .expect("session directory poisoned")
+            .remove(&connection_id);
+
+        let was_tracked = removed_handle.is_some() || entry.is_some();
+        if let Some(entry) = entry {
+            let _ = entry.stop_tx.send(true);
+            let _ = entry.join_handle.await;
+        }
+        was_tracked
+    }
 }
 
 /// Spawns and owns one broker task per SLMP [`PlcConnection`], and hands out
@@ -718,7 +755,7 @@ impl BrokerSupervisor {
             .lock()
             .expect("session directory poisoned")
             .clear();
-        let tasks: HashMap<i64, JoinHandle<()>> = std::mem::take(
+        let tasks: HashMap<i64, TaskEntry> = std::mem::take(
             &mut self
                 .directory
                 .tasks
@@ -726,7 +763,8 @@ impl BrokerSupervisor {
                 .expect("session directory poisoned"),
         );
         for task in tasks.into_values() {
-            let _ = task.await;
+            let _ = task.stop_tx.send(true);
+            let _ = task.join_handle.await;
         }
     }
 }
@@ -745,8 +783,9 @@ fn spawn_task(
     config: SlmpConfig,
     backoff: BackoffConfig,
     shutdown_rx: watch::Receiver<bool>,
-) -> (BrokerHandle, JoinHandle<()>) {
+) -> (BrokerHandle, TaskEntry) {
     let (tx, rx) = mpsc::channel(JOB_CHANNEL_CAPACITY);
+    let (stop_tx, stop_rx) = watch::channel(false);
     // Initial value mirrors `banto_collect::task::run_connection`'s own
     // startup send: the task's `ConnState` starts at `Backoff { at: now }`
     // (immediate first attempt), i.e. attempt 1 is about to fire.
@@ -758,6 +797,7 @@ fn spawn_task(
         backoff,
         rx,
         shutdown_rx,
+        stop_rx,
         status_tx,
     ));
     (
@@ -766,7 +806,10 @@ fn spawn_task(
             tx,
             status_rx,
         },
-        task,
+        TaskEntry {
+            stop_tx,
+            join_handle: task,
+        },
     )
 }
 
@@ -851,6 +894,7 @@ async fn run_broker_task(
     backoff_cfg: BackoffConfig,
     mut rx: mpsc::Receiver<Job>,
     mut shutdown_rx: watch::Receiver<bool>,
+    mut stop_rx: watch::Receiver<bool>,
     status_tx: watch::Sender<BrokerConnectionStatus>,
 ) {
     let word_order = config.word_order;
@@ -866,6 +910,12 @@ async fn run_broker_task(
             // regardless of how many BrokerHandles/Senders for the job mpsc
             // are still alive elsewhere.
             _ = shutdown_rx.changed() => {
+                break;
+            }
+
+            // Per-connection stop-and-join; unlike `shutdown_rx`, this does
+            // not affect any sibling broker session.
+            _ = stop_rx.changed() => {
                 break;
             }
 
@@ -969,8 +1019,20 @@ async fn run_broker_task(
         }
     }
 
-    if let ConnState::Connected(client) = state {
-        client.close().await;
+    match state {
+        ConnState::Backoff { .. } => {}
+        ConnState::Connecting(handle) => {
+            // `next_conn_event` awaits the inner connect attempt through a
+            // borrowed JoinHandle. If the outer select is interrupted by a
+            // stop signal, the handle remains in `state`; abort and await it
+            // here so stopping a session never leaves a detached connection
+            // attempt behind.
+            handle.abort();
+            let _ = handle.await;
+        }
+        ConnState::Connected(client) => {
+            client.close().await;
+        }
     }
     let _ = status_tx.send(BrokerConnectionStatus::Stopped);
 }
@@ -983,6 +1045,7 @@ mod tests {
     use banto_plc_write::slmp::simulator::Simulator;
     use banto_plc_write::{StringWriteRequest, WriteRequest};
     use futures_util::future::join_all;
+    use tokio::io::AsyncReadExt;
 
     use super::*;
 
@@ -1430,7 +1493,7 @@ mod tests {
         assert_eq!(outcome, Err(BrokerError::Disconnected { connection_id: 1 }));
 
         drop(handle);
-        let _ = task.await;
+        let _ = task.join_handle.await;
     }
 
     #[tokio::test]
@@ -1471,7 +1534,7 @@ mod tests {
         assert_eq!(recovered, vec![BatchReadResult::Value(PlcValue::F64(55.0))]);
 
         drop(handle);
-        let _ = task.await;
+        let _ = task.join_handle.await;
     }
 
     // -----------------------------------------------------------------
@@ -1512,7 +1575,7 @@ mod tests {
             .expect("status watch should report Reconnecting after the session drops");
 
         drop(handle);
-        let _ = task.await;
+        let _ = task.join_handle.await;
     }
 
     #[tokio::test]
@@ -1537,5 +1600,94 @@ mod tests {
         // with the task exiting, but the last value it ever sent - Stopped -
         // is still readable via `borrow()`.
         assert_eq!(*status.borrow(), BrokerConnectionStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn session_directory_stop_and_join_stops_only_the_requested_task() {
+        let connections = [
+            conn(1, "slmp", "127.0.0.1", 0),
+            conn(2, "slmp", "127.0.0.1", 0),
+        ];
+        let supervisor =
+            BrokerSupervisor::spawn(&connections, BackoffConfig::default()).expect("spawn");
+        let directory = supervisor.directory();
+        // Keep a clone alive to prove that stop-and-join does not depend on
+        // every caller dropping its BrokerHandle first.
+        let retained_handle = supervisor.handle(1).expect("connection 1 handle");
+
+        let stopped = tokio::time::timeout(Duration::from_secs(1), directory.stop_and_join(1))
+            .await
+            .expect("per-connection stop should be bounded");
+        assert!(stopped);
+        assert_eq!(directory.connection_count(), 1);
+        assert!(directory.handle(1).is_none());
+        assert!(directory.handle(2).is_some());
+
+        assert!(directory.stop_and_join(2).await);
+        assert_eq!(directory.connection_count(), 0);
+        assert!(!directory.stop_and_join(1).await);
+
+        drop(retained_handle);
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stop_and_join_aborts_an_inflight_connect_attempt() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("local_addr").port();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let _ = accepted_tx.send(());
+            let mut bytes = Vec::new();
+            let _ = socket.read_to_end(&mut bytes).await;
+            let _ = closed_tx.send(());
+        });
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let directory =
+            SessionDirectory::new(BackoffConfig::default(), std::sync::Arc::new(shutdown_tx));
+        let (handle, task) = spawn_task(
+            9,
+            SlmpConfig {
+                host: "127.0.0.1".to_string(),
+                port,
+                connect_timeout: Duration::from_secs(30),
+                response_timeout: Duration::from_secs(30),
+                ..Default::default()
+            },
+            BackoffConfig::default(),
+            shutdown_rx,
+        );
+        directory
+            .handles
+            .lock()
+            .expect("session directory poisoned")
+            .insert(9, handle.clone());
+        directory
+            .tasks
+            .lock()
+            .expect("session directory poisoned")
+            .insert(9, task);
+
+        tokio::time::timeout(Duration::from_secs(1), accepted_rx)
+            .await
+            .expect("connect attempt should reach the local listener")
+            .expect("listener task should stay alive");
+        let stopped = tokio::time::timeout(Duration::from_secs(1), directory.stop_and_join(9))
+            .await
+            .expect("stop_and_join should not wait for connect_timeout");
+        assert!(stopped, "connection should be tracked");
+        tokio::time::timeout(Duration::from_secs(1), closed_rx)
+            .await
+            .expect("aborting the connect attempt should close its socket")
+            .expect("listener task should observe the close");
+
+        drop(handle);
+        server_task.abort();
+        let _ = server_task.await;
     }
 }

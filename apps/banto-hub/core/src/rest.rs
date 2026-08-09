@@ -24,17 +24,16 @@
 //!   スキーマ自体は秘密ではないため（`openapi_json` 関数の doc comment
 //!   参照）。
 //!
-//! ## I1 CRUD 書き込み後の再構築（設計 §4.3）
+//! ## I1 CRUD 書き込み後の catalog commit（T14-3）
 //!
 //! `tag_registry_router` の書き込みハンドラ（create/update/delete、3
-//! リソース共通）は、レジストリへの書き込みが成功した後に必ず
-//! [`crate::hub::CollectorManager::rebuild`] を呼ぶ。rebuild が失敗しても
-//! CRUD 自体は成功のまま返す（設計指示: 「rebuild 失敗は CRUD 自体の失敗に
-//! しない」）— 定義は保存済みで、Collector が旧構成のまま
-//! `last_error`（`/api/v1/status`）に出る、という状態を許容する。
+//! リソース共通）は、同一SQLiteトランザクション内で提案mutation後の
+//! registry snapshot/catalog/computed plan/configを検証し、成功した場合だけ
+//! [`crate::hub::CollectorManager::commit_catalog`] を呼ぶ。これは
+//! configured revisionだけを前進させ、Collector/Broker/Simulatorを起動・再適用
+//! しない。実行中構成への適用はCollectionControllerのstart経路に限る。
 //! 併せて admin-UI 向けの `ServerEvent::ResourceChanged` を SSE (`/api/events`)
-//! に流す（レジストリが実際に変わったことは rebuild の成否と独立な事実なので、
-//! rebuild が失敗していても送る）。
+//! に流す。
 //!
 //! ## タグ空間の値の意味論（設計 §4）
 //!
@@ -56,7 +55,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use banto_broker::{BrokerConnectionStatus, BrokerError};
-use banto_collect::{ApplyReport, ConnectionStatus};
+use banto_collect::{build_config_from, ApplyReport, ConnectionStatus, RegistrySnapshot};
 use banto_core::{BantoError, ErrorBody, FieldError, ListParams, ListResult};
 // T12 (docs/ux-plan.md §4): 保存前の接続テスト API 用。Modbus/SLMP 両方の
 // 直接ダイヤル経路が同じ型を使うので、ここで一括 import する
@@ -84,6 +83,7 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService, IssuedApiKey};
 use crate::audit::{AuditEntry, AuditLogService};
+use crate::controller::{CollectionController, CollectionState, CollectionStatus, RunMode};
 use crate::hub::{CollectorManager, TagEntry};
 use crate::mqtt::MqttPublisher;
 use crate::settings::{MqttSettings, SettingsService};
@@ -193,6 +193,14 @@ struct RoleGuard {
 
 fn forbidden_response() -> Response {
     (StatusCode::FORBIDDEN, Json(ErrorBody::Forbidden)).into_response()
+}
+
+fn simulation_output_disabled_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": "simulation_output_disabled" })),
+    )
+        .into_response()
 }
 
 /// T2-4（設計 §6-4「トリップ」）: トリップ中の API キーでの
@@ -1108,6 +1116,155 @@ fn write_control_router(
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
 
+// --- collection lifecycle control (T14-4): admin + CSRF --------------------
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectionStatusResponse {
+    state: String,
+    mode: String,
+    run_id: Option<u64>,
+    configured_revision: u64,
+    running_revision: u64,
+    last_error: Option<String>,
+}
+
+impl From<CollectionStatus> for CollectionStatusResponse {
+    fn from(status: CollectionStatus) -> Self {
+        Self {
+            state: status.state.as_str().to_string(),
+            mode: status.mode.as_str().to_string(),
+            run_id: status.run_id,
+            configured_revision: status.configured_revision,
+            running_revision: status.running_revision,
+            last_error: status.last_error,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CollectionModeRequest {
+    mode: String,
+}
+
+#[derive(Clone)]
+struct CollectionAdminState {
+    controller: Arc<CollectionController>,
+    auth: AuthState,
+    audit: AuditLogService,
+    events: broadcast::Sender<ServerEvent>,
+}
+
+async fn collection_control_result(
+    state: &CollectionAdminState,
+    headers: &HeaderMap,
+    action: &str,
+    status: CollectionStatus,
+) -> Json<CollectionStatusResponse> {
+    record_write(
+        &state.audit,
+        &state.auth,
+        headers,
+        action,
+        "collection",
+        "1",
+        Some(json!({
+            "state": status.state.as_str(),
+            "mode": status.mode.as_str(),
+            "runId": status.run_id,
+            "configuredRevision": status.configured_revision,
+            "runningRevision": status.running_revision,
+            "lastError": status.last_error,
+        })),
+    )
+    .await;
+    let _ = state.events.send(ServerEvent::ResourceChanged {
+        resource: "collection".to_string(),
+    });
+    Json(status.into())
+}
+
+async fn collection_start(
+    State(state): State<CollectionAdminState>,
+    headers: HeaderMap,
+) -> Json<CollectionStatusResponse> {
+    let status = state.controller.start(RunMode::Configured).await;
+    collection_control_result(&state, &headers, "start", status).await
+}
+
+async fn collection_start_all_simulation(
+    State(state): State<CollectionAdminState>,
+    headers: HeaderMap,
+) -> Json<CollectionStatusResponse> {
+    let status = state.controller.start(RunMode::AllSimulation).await;
+    collection_control_result(&state, &headers, "start_all_simulation", status).await
+}
+
+async fn collection_stop(
+    State(state): State<CollectionAdminState>,
+    headers: HeaderMap,
+) -> Json<CollectionStatusResponse> {
+    let status = state.controller.stop().await;
+    collection_control_result(&state, &headers, "stop", status).await
+}
+
+async fn collection_set_mode(
+    State(state): State<CollectionAdminState>,
+    headers: HeaderMap,
+    Json(body): Json<CollectionModeRequest>,
+) -> Result<Json<CollectionStatusResponse>, ApiError> {
+    let mode = match body.mode.as_str() {
+        "configured" => RunMode::Configured,
+        "all_simulation" => RunMode::AllSimulation,
+        _ => {
+            return Err(ApiError(BantoError::Validation {
+                field_errors: vec![FieldError {
+                    field: "mode".to_string(),
+                    message: "configured または all_simulation を指定してください".to_string(),
+                }],
+            }))
+        }
+    };
+    let status = state.controller.set_mode(mode).await;
+    Ok(collection_control_result(&state, &headers, "set_mode", status).await)
+}
+
+fn collection_control_router(
+    controller: Arc<CollectionController>,
+    audit: AuditLogService,
+    auth: AuthState,
+    events: broadcast::Sender<ServerEvent>,
+) -> Router {
+    let state = CollectionAdminState {
+        controller,
+        auth: auth.clone(),
+        audit: audit.clone(),
+        events,
+    };
+    Router::new()
+        .route("/api/collection/start", post(collection_start))
+        .route(
+            "/api/collection/start-all-simulation",
+            post(collection_start_all_simulation),
+        )
+        .route("/api/collection/stop", post(collection_stop))
+        .route(
+            "/api/collection/mode",
+            post(collection_set_mode).put(collection_set_mode),
+        )
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            RoleGuard {
+                auth: auth.clone(),
+                min: Role::Admin,
+                resource: "collection",
+                audit,
+            },
+            require_role_at_least,
+        ))
+        .layer(middleware::from_fn_with_state(auth, require_auth))
+}
+
 // --- MQTT 設定 (T3、設計 §5.3): admin 限定、CSRF + bearer -------------------
 //
 // `GET/PUT /api/mqtt-settings`（実装指示どおり）。`write_control_router`と
@@ -1687,17 +1844,31 @@ impl From<TagPayload> for TagInput {
     }
 }
 
-/// Rebuild the collector and notify admin-UI SSE subscribers after an I1
-/// write. Never fails the caller (design instructions: 「rebuild 失敗は CRUD
-/// 自体の失敗にしない」) - a rebuild failure is only logged; its message
-/// remains visible via `/api/v1/status`'s `last_config_error`.
-async fn rebuild_and_notify(
+/// Commit the catalog already preflighted in the write transaction and notify
+/// admin-UI SSE subscribers. Production callers leave
+/// `legacy_live_reconfigure` disabled: registry writes advance the configured
+/// revision only. The compatibility router can opt into the pre-T14-3 live
+/// apply for existing embedders/tests.
+async fn commit_catalog_and_notify(
     manager: &CollectorManager,
+    controller: &CollectionController,
     events: &broadcast::Sender<ServerEvent>,
     resource: &str,
+    snapshot: RegistrySnapshot,
+    legacy_live_reconfigure: bool,
 ) {
-    if let Err(err) = manager.rebuild().await {
-        eprintln!("banto-hub: {resource} 変更後の collector 再構築に失敗しました: {err}");
+    if let Err(err) = manager.commit_catalog(&snapshot).await {
+        eprintln!("banto-hub: {resource} 変更後の catalog commit に失敗しました: {err}");
+    } else {
+        controller.refresh_status();
+        if legacy_live_reconfigure && manager.current_values().is_some() {
+            if let Err(err) = manager
+                .apply_run(crate::controller::RunMode::Configured)
+                .await
+            {
+                eprintln!("banto-hub: {resource} 変更後の live reconfigure に失敗しました: {err}");
+            }
+        }
     }
     let _ = events.send(ServerEvent::ResourceChanged {
         resource: resource.to_string(),
@@ -1712,7 +1883,54 @@ struct TagRegistryState {
     auth: AuthState,
     audit: AuditLogService,
     manager: Arc<CollectorManager>,
+    controller: Arc<CollectionController>,
     events: broadcast::Sender<ServerEvent>,
+    legacy_live_reconfigure: bool,
+}
+
+enum RegistryMutationError {
+    Api(ApiError),
+    CollectionEditLocked(CollectionStatusResponse),
+}
+
+impl From<ApiError> for RegistryMutationError {
+    fn from(error: ApiError) -> Self {
+        Self::Api(error)
+    }
+}
+
+impl From<BantoError> for RegistryMutationError {
+    fn from(error: BantoError) -> Self {
+        Self::Api(ApiError(error))
+    }
+}
+
+impl IntoResponse for RegistryMutationError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Api(error) => error.into_response(),
+            Self::CollectionEditLocked(status) => (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "collection_edit_locked",
+                    "state": status.state,
+                    "status": status,
+                    "message": "収集中は構成を編集できません。停止してから再試行してください。"
+                })),
+            )
+                .into_response(),
+        }
+    }
+}
+
+type RegistryMutationResult<T> = Result<T, RegistryMutationError>;
+
+fn require_collection_stopped(state: &TagRegistryState) -> RegistryMutationResult<()> {
+    let status = state.controller.status();
+    if status.state != CollectionState::Stopped {
+        return Err(RegistryMutationError::CollectionEditLocked(status.into()));
+    }
+    Ok(())
 }
 
 async fn plc_connections_list(
@@ -1738,7 +1956,7 @@ async fn plc_connections_create(
     State(state): State<TagRegistryState>,
     headers: HeaderMap,
     Json(input): Json<PlcConnectionPayload>,
-) -> Result<Json<PlcConnection>, ApiError> {
+) -> RegistryMutationResult<Json<PlcConnection>> {
     require_editor(
         &state.auth,
         &state.audit,
@@ -1748,7 +1966,28 @@ async fn plc_connections_create(
         "/api/plc-connections",
     )
     .await?;
-    let created = state.plc_connections.create(input.into()).await?;
+    require_collection_stopped(&state)?;
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    let created = match state.plc_connections.create_tx(&mut tx, input.into()).await {
+        Ok(created) => created,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(ApiError(err).into());
+        }
+    };
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.into());
+        }
+    };
+    tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
         &state.auth,
@@ -1759,7 +1998,15 @@ async fn plc_connections_create(
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
-    rebuild_and_notify(&state.manager, &state.events, "plc_connections").await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.controller,
+        &state.events,
+        "plc_connections",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
     Ok(Json(created))
 }
 
@@ -1768,7 +2015,7 @@ async fn plc_connections_update(
     headers: HeaderMap,
     Path(id): Path<i64>,
     Json(input): Json<PlcConnectionPayload>,
-) -> Result<Json<PlcConnection>, ApiError> {
+) -> RegistryMutationResult<Json<PlcConnection>> {
     require_editor(
         &state.auth,
         &state.audit,
@@ -1778,7 +2025,32 @@ async fn plc_connections_update(
         "/api/plc-connections/{id}",
     )
     .await?;
-    let updated = state.plc_connections.update(id, input.into()).await?;
+    require_collection_stopped(&state)?;
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    let updated = match state
+        .plc_connections
+        .update_tx(&mut tx, id, input.into())
+        .await
+    {
+        Ok(updated) => updated,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(ApiError(err).into());
+        }
+    };
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.into());
+        }
+    };
+    tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
         &state.auth,
@@ -1789,7 +2061,15 @@ async fn plc_connections_update(
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
-    rebuild_and_notify(&state.manager, &state.events, "plc_connections").await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.controller,
+        &state.events,
+        "plc_connections",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
     Ok(Json(updated))
 }
 
@@ -1797,7 +2077,7 @@ async fn plc_connections_delete(
     State(state): State<TagRegistryState>,
     headers: HeaderMap,
     Path(id): Path<i64>,
-) -> Result<StatusCode, ApiError> {
+) -> RegistryMutationResult<StatusCode> {
     require_editor(
         &state.auth,
         &state.audit,
@@ -1807,7 +2087,25 @@ async fn plc_connections_delete(
         "/api/plc-connections/{id}",
     )
     .await?;
-    state.plc_connections.delete(id).await?;
+    require_collection_stopped(&state)?;
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    if let Err(err) = state.plc_connections.delete_tx(&mut tx, id).await {
+        let _ = tx.rollback().await;
+        return Err(ApiError(err).into());
+    }
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.into());
+        }
+    };
+    tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
         &state.auth,
@@ -1818,7 +2116,15 @@ async fn plc_connections_delete(
         None,
     )
     .await;
-    rebuild_and_notify(&state.manager, &state.events, "plc_connections").await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.controller,
+        &state.events,
+        "plc_connections",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2267,7 +2573,7 @@ async fn collection_groups_create(
     State(state): State<TagRegistryState>,
     headers: HeaderMap,
     Json(input): Json<CollectionGroupPayload>,
-) -> Result<Json<CollectionGroup>, ApiError> {
+) -> RegistryMutationResult<Json<CollectionGroup>> {
     require_editor(
         &state.auth,
         &state.audit,
@@ -2277,7 +2583,32 @@ async fn collection_groups_create(
         "/api/collection-groups",
     )
     .await?;
-    let created = state.collection_groups.create(input.into()).await?;
+    require_collection_stopped(&state)?;
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    let created = match state
+        .collection_groups
+        .create_tx(&mut tx, input.into())
+        .await
+    {
+        Ok(created) => created,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(ApiError(err).into());
+        }
+    };
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.into());
+        }
+    };
+    tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
         &state.auth,
@@ -2288,7 +2619,15 @@ async fn collection_groups_create(
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
-    rebuild_and_notify(&state.manager, &state.events, "collection_groups").await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.controller,
+        &state.events,
+        "collection_groups",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
     Ok(Json(created))
 }
 
@@ -2297,7 +2636,7 @@ async fn collection_groups_update(
     headers: HeaderMap,
     Path(id): Path<i64>,
     Json(input): Json<CollectionGroupPayload>,
-) -> Result<Json<CollectionGroup>, ApiError> {
+) -> RegistryMutationResult<Json<CollectionGroup>> {
     require_editor(
         &state.auth,
         &state.audit,
@@ -2307,7 +2646,32 @@ async fn collection_groups_update(
         "/api/collection-groups/{id}",
     )
     .await?;
-    let updated = state.collection_groups.update(id, input.into()).await?;
+    require_collection_stopped(&state)?;
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    let updated = match state
+        .collection_groups
+        .update_tx(&mut tx, id, input.into())
+        .await
+    {
+        Ok(updated) => updated,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(ApiError(err).into());
+        }
+    };
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.into());
+        }
+    };
+    tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
         &state.auth,
@@ -2318,7 +2682,15 @@ async fn collection_groups_update(
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
-    rebuild_and_notify(&state.manager, &state.events, "collection_groups").await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.controller,
+        &state.events,
+        "collection_groups",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
     Ok(Json(updated))
 }
 
@@ -2326,7 +2698,7 @@ async fn collection_groups_delete(
     State(state): State<TagRegistryState>,
     headers: HeaderMap,
     Path(id): Path<i64>,
-) -> Result<StatusCode, ApiError> {
+) -> RegistryMutationResult<StatusCode> {
     require_editor(
         &state.auth,
         &state.audit,
@@ -2336,7 +2708,25 @@ async fn collection_groups_delete(
         "/api/collection-groups/{id}",
     )
     .await?;
-    state.collection_groups.delete(id).await?;
+    require_collection_stopped(&state)?;
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    if let Err(err) = state.collection_groups.delete_tx(&mut tx, id).await {
+        let _ = tx.rollback().await;
+        return Err(ApiError(err).into());
+    }
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.into());
+        }
+    };
+    tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
         &state.auth,
@@ -2347,7 +2737,15 @@ async fn collection_groups_delete(
         None,
     )
     .await;
-    rebuild_and_notify(&state.manager, &state.events, "collection_groups").await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.controller,
+        &state.events,
+        "collection_groups",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2366,7 +2764,7 @@ async fn tags_create(
     State(state): State<TagRegistryState>,
     headers: HeaderMap,
     Json(input): Json<TagPayload>,
-) -> Result<Json<Tag>, ApiError> {
+) -> RegistryMutationResult<Json<Tag>> {
     require_editor(
         &state.auth,
         &state.audit,
@@ -2376,7 +2774,28 @@ async fn tags_create(
         "/api/tags",
     )
     .await?;
-    let created = state.tags.create(input.into()).await?;
+    require_collection_stopped(&state)?;
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    let created = match state.tags.create_tx(&mut tx, input.into()).await {
+        Ok(created) => created,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(ApiError(err).into());
+        }
+    };
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.into());
+        }
+    };
+    tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
         &state.auth,
@@ -2387,7 +2806,15 @@ async fn tags_create(
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
-    rebuild_and_notify(&state.manager, &state.events, "tags").await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.controller,
+        &state.events,
+        "tags",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
     Ok(Json(created))
 }
 
@@ -2396,7 +2823,7 @@ async fn tags_update(
     headers: HeaderMap,
     Path(id): Path<i64>,
     Json(input): Json<TagPayload>,
-) -> Result<Json<Tag>, ApiError> {
+) -> RegistryMutationResult<Json<Tag>> {
     require_editor(
         &state.auth,
         &state.audit,
@@ -2406,7 +2833,28 @@ async fn tags_update(
         "/api/tags/{id}",
     )
     .await?;
-    let updated = state.tags.update(id, input.into()).await?;
+    require_collection_stopped(&state)?;
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    let updated = match state.tags.update_tx(&mut tx, id, input.into()).await {
+        Ok(updated) => updated,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(ApiError(err).into());
+        }
+    };
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.into());
+        }
+    };
+    tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
         &state.auth,
@@ -2417,7 +2865,15 @@ async fn tags_update(
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
-    rebuild_and_notify(&state.manager, &state.events, "tags").await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.controller,
+        &state.events,
+        "tags",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
     Ok(Json(updated))
 }
 
@@ -2425,7 +2881,7 @@ async fn tags_delete(
     State(state): State<TagRegistryState>,
     headers: HeaderMap,
     Path(id): Path<i64>,
-) -> Result<StatusCode, ApiError> {
+) -> RegistryMutationResult<StatusCode> {
     require_editor(
         &state.auth,
         &state.audit,
@@ -2435,7 +2891,25 @@ async fn tags_delete(
         "/api/tags/{id}",
     )
     .await?;
-    state.tags.delete(id).await?;
+    require_collection_stopped(&state)?;
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    if let Err(err) = state.tags.delete_tx(&mut tx, id).await {
+        let _ = tx.rollback().await;
+        return Err(ApiError(err).into());
+    }
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err.into());
+        }
+    };
+    tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
         &state.auth,
@@ -2446,12 +2920,21 @@ async fn tags_delete(
         None,
     )
     .await;
-    rebuild_and_notify(&state.manager, &state.events, "tags").await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.controller,
+        &state.events,
+        "tags",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
 // --- T11-1 一括登録 API (docs/ux-plan.md §3): 連続登録 UI と T11-2 の CSV
-// インポートが共有する基盤 - 検証 → all-or-nothing 適用 → 再構成1回。
+// インポートが共有する基盤 - transaction内検証 → all-or-nothing 適用 →
+// catalog commit 1回。
 // パターン展開（名前パターン/連続アドレス生成）はクライアント側（TS、
 // `apps/banto-hub/src/lib/banto/continuousRegistration.ts`）が担い、この
 // エンドポイントは展開済みの `TagInput` 配列を受け取るだけの汎用一括 API
@@ -2462,7 +2945,7 @@ async fn tags_delete(
 pub struct BatchTagsRequest {
     pub tags: Vec<TagPayload>,
     /// `true`: 検証結果だけを返す（DB 無変更）。`false`（既定）: 検証 →
-    /// 単一トランザクションで全件 INSERT → 呼び出し元が rebuild を1回。
+    /// 単一トランザクションで全件 INSERT → catalog commit を1回。
     #[serde(default)]
     pub dry_run: bool,
 }
@@ -2535,7 +3018,7 @@ async fn tags_batch(
     State(state): State<TagRegistryState>,
     headers: HeaderMap,
     Json(body): Json<BatchTagsRequest>,
-) -> Result<Json<BatchTagsResponse>, ApiError> {
+) -> RegistryMutationResult<Json<BatchTagsResponse>> {
     require_editor(
         &state.auth,
         &state.audit,
@@ -2545,6 +3028,10 @@ async fn tags_batch(
         "/api/tags/batch",
     )
     .await?;
+
+    if !body.dry_run {
+        require_collection_stopped(&state)?;
+    }
 
     let dry_run = body.dry_run;
     let inputs: Vec<TagInput> = body.tags.into_iter().map(Into::into).collect();
@@ -2559,17 +3046,42 @@ async fn tags_batch(
         }));
     }
 
-    let outcome = state.tags.create_batch(inputs, dry_run).await?;
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    let outcome = match state.tags.create_batch_tx(&mut tx, &inputs).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(ApiError(err).into());
+        }
+    };
     match outcome {
-        BatchTagOutcome::Invalid(errors) => Ok(Json(BatchTagsResponse {
-            ok: false,
-            dry_run,
-            count: 0,
-            errors: errors.into_iter().map(Into::into).collect(),
-            tags: None,
-        })),
+        BatchTagOutcome::Invalid(errors) => {
+            let _ = tx.rollback().await;
+            Ok(Json(BatchTagsResponse {
+                ok: false,
+                dry_run,
+                count: 0,
+                errors: errors.into_iter().map(Into::into).collect(),
+                tags: None,
+            }))
+        }
         BatchTagOutcome::Valid { count, tags } => {
-            if !dry_run {
+            let snapshot = match preflight_transaction(&mut tx).await {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    let _ = tx.rollback().await;
+                    return Err(err.into());
+                }
+            };
+            if dry_run {
+                tx.rollback().await.map_err(storage_api_error)?;
+            } else {
+                tx.commit().await.map_err(storage_api_error)?;
                 record_write(
                     &state.audit,
                     &state.auth,
@@ -2580,16 +3092,23 @@ async fn tags_batch(
                     Some(json!({ "count": count })),
                 )
                 .await;
-                // T11-1 の核心: n 件でも rebuild はここで1回だけ
-                // (`tags_create` を n 回呼ぶ場合との違い)。
-                rebuild_and_notify(&state.manager, &state.events, "tags").await;
+                // T11-1 の核心: n 件でも catalog commit はここで1回だけ。
+                commit_catalog_and_notify(
+                    &state.manager,
+                    &state.controller,
+                    &state.events,
+                    "tags",
+                    snapshot,
+                    state.legacy_live_reconfigure,
+                )
+                .await;
             }
             Ok(Json(BatchTagsResponse {
                 ok: true,
                 dry_run,
                 count,
                 errors: Vec::new(),
-                tags,
+                tags: if dry_run { None } else { tags },
             }))
         }
     }
@@ -2597,7 +3116,7 @@ async fn tags_batch(
 
 /// `/api/plc-connections/*` + `/api/collection-groups/*` + `/api/tags/*`
 /// (viewer-read / editor-write) - `relay-wright-core::rest::tag_registry_router`
-/// を雛形に、書き込み成功後に必ず [`rebuild_and_notify`] を挟む点だけが違う。
+/// を雛形に、書き込み成功後に catalog commit と SSE通知を行う。
 #[allow(clippy::too_many_arguments)]
 fn tag_registry_router(
     plc_connections: PlcConnectionService,
@@ -2606,7 +3125,9 @@ fn tag_registry_router(
     audit: AuditLogService,
     auth: AuthState,
     manager: Arc<CollectorManager>,
+    controller: Arc<CollectionController>,
     events: broadcast::Sender<ServerEvent>,
+    legacy_live_reconfigure: bool,
 ) -> Router {
     let state = TagRegistryState {
         plc_connections,
@@ -2615,7 +3136,9 @@ fn tag_registry_router(
         auth: auth.clone(),
         audit,
         manager,
+        controller: controller.clone(),
         events,
+        legacy_live_reconfigure,
     };
     Router::new()
         .route(
@@ -2674,6 +3197,7 @@ fn tag_registry_router(
 #[derive(Clone)]
 pub(crate) struct TagSpaceState {
     pub(crate) manager: Arc<CollectorManager>,
+    pub(crate) controller: Arc<CollectionController>,
     /// T2-4（設計 §6-6）: `GET /api/v1/status` の `write_enabled`/
     /// `write_was_enabled_before_restart` のため。
     pub(crate) write_control: Arc<WriteControl>,
@@ -2687,16 +3211,92 @@ struct TagsQuery {
     group: Option<String>,
 }
 
-/// `GET /api/v1/tags` の応答: `{ "revision", "tags": [TagEntry...] }`。
+/// `GET /api/v1/tags` の応答: `{ "revision", "run_id",
+/// "collection_mode", "tags": [CatalogTagEntry...] }`。
 #[derive(Debug, Serialize, ToSchema)]
 struct CatalogResponse {
     revision: u64,
-    tags: Vec<TagEntry>,
+    run_id: Option<u64>,
+    collection_mode: String,
+    tags: Vec<CatalogTagEntry>,
 }
 
-/// `GET /api/v1/tags` - catalog: `{ "revision", "tags": [TagEntry...] }`,
+/// REST wire DTO for one catalog entry.
+///
+/// `TagEntry` remains the saved/configured catalog owned by `CollectorManager`.
+/// The runtime fields are layered here so an all-simulation run can be
+/// observed without mutating the DB-backed catalog or the shared TagMap.
+#[derive(Debug, Serialize, ToSchema)]
+struct CatalogTagEntry {
+    #[serde(flatten)]
+    entry: TagEntry,
+    configured_simulation: bool,
+    effective_simulation: bool,
+    value_source: String,
+}
+
+impl CatalogTagEntry {
+    fn from_runtime(entry: &TagEntry, runtime: &CollectionStatus) -> Self {
+        Self {
+            entry: entry.clone(),
+            configured_simulation: entry.simulation,
+            effective_simulation: effective_simulation_for_tag(entry, runtime),
+            value_source: value_source_for_tag(entry, runtime).to_string(),
+        }
+    }
+}
+
+fn effective_simulation_for_connection(
+    protocol: &str,
+    enabled: bool,
+    configured_simulation: bool,
+    runtime: &CollectionStatus,
+) -> bool {
+    enabled
+        && runtime.state == CollectionState::Running
+        && matches!(protocol, "modbus-tcp" | "slmp")
+        && (configured_simulation || runtime.mode == RunMode::AllSimulation)
+}
+
+fn effective_simulation_for_tag(entry: &TagEntry, runtime: &CollectionStatus) -> bool {
+    entry.tag_kind == banto_tags::PLC_TAG_KIND
+        && entry.enabled
+        && runtime.state == CollectionState::Running
+        && (entry.simulation || runtime.mode == RunMode::AllSimulation)
+}
+
+fn value_source_for_tag(entry: &TagEntry, runtime: &CollectionStatus) -> &'static str {
+    match entry.tag_kind.as_str() {
+        banto_tags::PLC_TAG_KIND if effective_simulation_for_tag(entry, runtime) => "simulation",
+        banto_tags::PLC_TAG_KIND => "real",
+        banto_tags::COMPUTED_TAG_KIND => "derived_simulation",
+        banto_tags::INTERNAL_TAG_KIND => "internal",
+        // Tag registration validates tag_kind, but keep the wire contract
+        // fail-safe if a future kind is introduced without this DTO update.
+        _ => "internal",
+    }
+}
+
+/// API-key reads expose only the normal external value space.  Saved PLC
+/// simulation configuration is hidden even while the controller is stopped,
+/// while computed tags remain hidden because their source is always
+/// `derived_simulation`.  Internal tags are intentionally retained for
+/// backwards compatibility with existing API-key clients.
+fn api_key_external_output_allowed(entry: &TagEntry, runtime: &CollectionStatus) -> bool {
+    if entry.simulation {
+        return false;
+    }
+    !matches!(
+        value_source_for_tag(entry, runtime),
+        "simulation" | "derived_simulation"
+    )
+}
+
+/// `GET /api/v1/tags` - catalog: `{ "revision", "run_id",
+/// "collection_mode", "tags": [CatalogTagEntry...] }`,
 /// optionally filtered by `?connection=`/`?group=` (matched against the
-/// entry's connection/group *name*, design §5.1's route table).
+/// entry's connection/group *name*, design §5.1's route table). API-key
+/// requests additionally omit simulation and derived-simulation entries.
 #[utoipa::path(
     get,
     path = "/api/v1/tags",
@@ -2710,11 +3310,15 @@ struct CatalogResponse {
 async fn v1_tags(
     State(state): State<TagSpaceState>,
     Query(query): Query<TagsQuery>,
+    ctx: Option<Extension<ApiKeyContext>>,
 ) -> Json<CatalogResponse> {
     let map = state.manager.tag_map();
     let revision = state.manager.revision();
-    let tags: Vec<TagEntry> = map
+    let runtime = state.controller.status();
+    let api_key_request = ctx.is_some();
+    let tags: Vec<CatalogTagEntry> = map
         .iter()
+        .filter(|entry| !api_key_request || api_key_external_output_allowed(entry, &runtime))
         .filter(|entry| {
             query
                 .connection
@@ -2729,9 +3333,14 @@ async fn v1_tags(
                 .map(|g| g == entry.group)
                 .unwrap_or(true)
         })
-        .cloned()
+        .map(|entry| CatalogTagEntry::from_runtime(entry, &runtime))
         .collect();
-    Json(CatalogResponse { revision, tags })
+    Json(CatalogResponse {
+        revision,
+        run_id: runtime.run_id,
+        collection_mode: runtime.mode.as_str().to_string(),
+        tags,
+    })
 }
 
 /// One `/api/v1/values*` entry's wire shape (design §5.1's route table:
@@ -2742,6 +3351,7 @@ struct ValueEntry {
     v: Option<f64>,
     q: String,
     t: i64,
+    value_source: String,
 }
 
 /// Thin wire-formatting wrapper over [`crate::hub::read_current`] (see its
@@ -2755,6 +3365,7 @@ fn value_entry(
     current: Option<&banto_collect::CurrentValuesHandle>,
     server_store: &crate::computed::ServerTagStore,
     now_ms: i64,
+    runtime: &CollectionStatus,
 ) -> ValueEntry {
     let (v, q, t) = crate::hub::read_current(entry, current, server_store, now_ms);
     ValueEntry {
@@ -2762,6 +3373,7 @@ fn value_entry(
         v,
         q: crate::hub::quality_str(q).to_string(),
         t,
+        value_source: value_source_for_tag(entry, runtime).to_string(),
     }
 }
 
@@ -2775,7 +3387,36 @@ struct ValuesQuery {
 struct ValuesResponse {
     revision: u64,
     t: i64,
+    run_id: Option<u64>,
+    collection_mode: String,
     values: Vec<ValueEntry>,
+}
+
+/// Single-value response. The bulk response carries the same run metadata at
+/// the response level, while each value carries its own source classification.
+#[derive(Debug, Serialize, ToSchema)]
+struct SingleValueResponse {
+    tag: String,
+    v: Option<f64>,
+    q: String,
+    t: i64,
+    run_id: Option<u64>,
+    collection_mode: String,
+    value_source: String,
+}
+
+impl SingleValueResponse {
+    fn from_value(value: ValueEntry, runtime: &CollectionStatus) -> Self {
+        Self {
+            tag: value.tag,
+            v: value.v,
+            q: value.q,
+            t: value.t,
+            run_id: runtime.run_id,
+            collection_mode: runtime.mode.as_str().to_string(),
+            value_source: value.value_source,
+        }
+    }
 }
 
 /// `GET /api/v1/values` - full or partial (`?tags=a,b,c`) snapshot.
@@ -2794,7 +3435,8 @@ struct ValuesResponse {
 /// いないのに403」を避ける)。`?tags=` で明示的にスコープ外タグを挙げたら
 /// [`v1_value_single`] と同じ**403**(存在は catalog 経由で既知なので
 /// 404 ではない)。セッション token(`ctx` 無し)は従来どおり全件(管理 UI
-/// 不変)。
+/// 不変)。API キー時はこのスコープ判定後に simulation / derived_simulation
+/// を値一覧から除外する。
 #[utoipa::path(
     get,
     path = "/api/v1/values",
@@ -2815,6 +3457,7 @@ async fn v1_values(
 ) -> Response {
     let map = state.manager.tag_map();
     let revision = state.manager.revision();
+    let runtime = state.controller.status();
     let now_ms = state.manager.clock().now_ms();
     let current = state.manager.current_values();
     let server_store = state.manager.server_store();
@@ -2865,15 +3508,39 @@ async fn v1_values(
         names
     };
 
+    let names: Vec<String> = if ctx.is_some() {
+        names
+            .into_iter()
+            .filter(|name| {
+                map.get(name)
+                    .map(|entry| api_key_external_output_allowed(entry, &runtime))
+                    .unwrap_or(false)
+            })
+            .collect()
+    } else {
+        names
+    };
+
     let values: Vec<ValueEntry> = names
         .iter()
         .filter_map(|name| map.get(name).map(|entry| (name, entry)))
-        .map(|(name, entry)| value_entry(name, entry, current.as_ref(), &server_store, now_ms))
+        .map(|(name, entry)| {
+            value_entry(
+                name,
+                entry,
+                current.as_ref(),
+                &server_store,
+                now_ms,
+                &runtime,
+            )
+        })
         .collect();
 
     Json(ValuesResponse {
         revision,
         t: now_ms,
+        run_id: runtime.run_id,
+        collection_mode: runtime.mode.as_str().to_string(),
         values,
     })
     .into_response()
@@ -2888,15 +3555,17 @@ async fn v1_values(
 /// catalog に見えている(=存在は既知)ので、per-tag read スコープ外は 404
 /// ではなく**403**(`forbidden_response`)。API キー起因の読み取り
 /// (`ctx` あり)だけがこの判定を受ける - セッション token(`ctx` 無し)は
-/// 従来どおり全アクセス(管理 UI 不変)。catalog 自体(`v1_tags`)は絞らない
-/// - このモジュールの `require_tag_space_auth` の doc comment参照。
+/// 従来どおり全アクセス(管理 UI 不変)。API キー時は simulation /
+/// derived_simulation の値を返さず、単一値では `503
+/// simulation_output_disabled` とし、catalog からも除外する。
 #[utoipa::path(
     get,
     path = "/api/v1/values/{tag}",
     params(("tag" = String, Path, description = "外部名 {connection}.{group}.{tag}")),
     responses(
-        (status = 200, description = "単一タグの現在値", body = ValueEntry),
+        (status = 200, description = "単一タグの現在値", body = SingleValueResponse),
         (status = 403, description = "per-tag read スコープ外(API キー、H10 ③)"),
+        (status = 503, description = "simulation / derived_simulation は API キーの外部出力対象外"),
         (status = 404, description = "catalog に存在しない外部名"),
     ),
     tag = "tag-space",
@@ -2920,14 +3589,22 @@ async fn v1_value_single(
         }
     }
     let now_ms = state.manager.clock().now_ms();
+    let runtime = state.controller.status();
+    if ctx.is_some() && !api_key_external_output_allowed(entry, &runtime) {
+        return simulation_output_disabled_response();
+    }
     let current = state.manager.current_values();
     let server_store = state.manager.server_store();
-    Json(value_entry(
-        &tag,
-        entry,
-        current.as_ref(),
-        &server_store,
-        now_ms,
+    Json(SingleValueResponse::from_value(
+        value_entry(
+            &tag,
+            entry,
+            current.as_ref(),
+            &server_store,
+            now_ms,
+            &runtime,
+        ),
+        &runtime,
     ))
     .into_response()
 }
@@ -2943,6 +3620,8 @@ struct ConnectionStatusEntry {
     /// lets a monitoring client (or the admin UI) flag a connection whose
     /// live values are synthetic, not from a real PLC.
     simulation: bool,
+    configured_simulation: bool,
+    effective_simulation: bool,
 }
 
 /// `GET /api/v1/status` の `mqtt`（T3、設計実装指示「`/api/v1/status` に
@@ -3000,6 +3679,12 @@ impl From<ApplyReport> for LastApplyEntry {
 struct StatusResponse {
     version: String,
     revision: u64,
+    configured_revision: u64,
+    running_revision: u64,
+    run_id: Option<u64>,
+    collection_state: String,
+    collection_mode: String,
+    last_runtime_error: Option<String>,
     last_config_error: Option<String>,
     connections: Vec<ConnectionStatusEntry>,
     /// T2-4（設計 §6-6）: 書き込み受付が今いま有効かどうか(ライブフラグ)。
@@ -3039,7 +3724,8 @@ struct StatusResponse {
     tag = "tag-space",
 )]
 async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResponse>, ApiError> {
-    let revision = state.manager.revision();
+    let runtime = state.controller.status();
+    let revision = state.manager.configured_revision();
     let last_config_error = state.manager.last_error();
     let statuses = state.manager.connection_status().await;
 
@@ -3091,6 +3777,13 @@ async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResp
                 status: status_str.to_string(),
                 attempt,
                 simulation: conn.simulation,
+                configured_simulation: conn.simulation,
+                effective_simulation: effective_simulation_for_connection(
+                    &conn.protocol,
+                    conn.enabled,
+                    conn.simulation,
+                    &runtime,
+                ),
             }
         })
         .collect();
@@ -3098,6 +3791,12 @@ async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResp
     Ok(Json(StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         revision,
+        configured_revision: runtime.configured_revision,
+        running_revision: runtime.running_revision,
+        run_id: runtime.run_id,
+        collection_state: runtime.state.as_str().to_string(),
+        collection_mode: runtime.mode.as_str().to_string(),
+        last_runtime_error: runtime.last_error,
         last_config_error,
         connections: entries,
         write_enabled: state.write_control.is_enabled(),
@@ -3291,6 +3990,9 @@ fn write_rejection_response(tag: String, rejection: crate::write_path::WriteReje
     }
 
     let status = match &rejection {
+        WriteRejection::CollectionNotRunning(_) | WriteRejection::SimulationWriteRejected => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         WriteRejection::NotFound => unreachable!("上で特別扱い済み"),
         WriteRejection::NotWritable => StatusCode::FORBIDDEN,
         WriteRejection::TagDisabled => StatusCode::CONFLICT,
@@ -3324,6 +4026,7 @@ fn write_rejection_response(tag: String, rejection: crate::write_path::WriteReje
 #[derive(Clone)]
 struct WriteState {
     manager: Arc<CollectorManager>,
+    collection_controller: Option<Arc<CollectionController>>,
     api_keys: ApiKeysService,
     write_audit: WriteAuditService,
     write_control: Arc<WriteControl>,
@@ -3368,7 +4071,7 @@ struct WriteState {
         (status = 429, description = "rate_limited"),
         (status = 501, description = "write_unsupported_protocol"),
         (status = 502, description = "write_failed"),
-        (status = 503, description = "writes_disabled"),
+        (status = 503, description = "writes_disabled / simulation_write_rejected"),
     ),
     tag = "tag-space",
 )]
@@ -3392,6 +4095,7 @@ async fn v1_write_value(
     let requested = parse_requested_value(&body.v);
     let deps = crate::write_path::WriteDeps {
         manager: state.manager.as_ref(),
+        collection_controller: state.collection_controller.as_deref(),
         api_keys: &state.api_keys,
         write_audit: &state.write_audit,
         write_control: state.write_control.as_ref(),
@@ -3435,7 +4139,9 @@ async fn v1_write_value(
     components(schemas(
         TagEntry,
         CatalogResponse,
+        CatalogTagEntry,
         ValueEntry,
+        SingleValueResponse,
         ValuesResponse,
         ConnectionStatusEntry,
         MqttStatusEntry,
@@ -3643,6 +4349,7 @@ async fn require_tag_space_auth(
 #[allow(clippy::too_many_arguments)]
 fn tag_space_router(
     manager: Arc<CollectorManager>,
+    controller: Arc<CollectionController>,
     auth: AuthState,
     api_keys: ApiKeysService,
     audit: AuditLogService,
@@ -3658,9 +4365,11 @@ fn tag_space_router(
     // なる - 呼び出し元（[`api_router`]）が1個だけ構築し、REST・gRPC 両方の
     // `WriteState`/`GrpcService` へ同じ `Arc` を配る。
     rate_limiter: Arc<AsyncMutex<WriteRateLimiter>>,
+    enforce_collection_state: bool,
 ) -> Router {
     let state = TagSpaceState {
         manager: manager.clone(),
+        controller: controller.clone(),
         write_control: write_control.clone(),
         mqtt,
     };
@@ -3672,6 +4381,7 @@ fn tag_space_router(
     };
     let write_state = WriteState {
         manager: manager.clone(),
+        collection_controller: enforce_collection_state.then_some(controller.clone()),
         api_keys,
         write_audit,
         write_control,
@@ -3717,7 +4427,7 @@ fn openapi_router() -> Router {
 /// (API キー + セッション bearer 併用、CSRF なし - see this module's doc
 /// comment) and the unauthenticated `/api/v1/openapi.json`.
 #[allow(clippy::too_many_arguments)]
-pub fn api_router(
+fn api_router_with_controller_mode(
     users: UsersService,
     audit: AuditLogService,
     plc_connections: PlcConnectionService,
@@ -3725,6 +4435,7 @@ pub fn api_router(
     tags: TagService,
     api_keys: ApiKeysService,
     manager: Arc<CollectorManager>,
+    controller: Arc<CollectionController>,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
     allow_setup: bool,
@@ -3747,6 +4458,7 @@ pub fn api_router(
     // `tag_space_router` のフィールド doc comment参照。ここで新規に
     // 構築すると REST/gRPC でレート制限のバジェットが分裂してしまう。
     rate_limiter: Arc<AsyncMutex<WriteRateLimiter>>,
+    legacy_live_reconfigure: bool,
 ) -> Router {
     let audited_auth_routes = auth_routes(auth.clone()).layer(middleware::from_fn_with_state(
         LogoutAuditState {
@@ -3780,11 +4492,19 @@ pub fn api_router(
             audit.clone(),
             auth.clone(),
             manager.clone(),
+            controller.clone(),
             events.clone(),
+            legacy_live_reconfigure,
         ))
         .merge(write_control_router(
             write_control.clone(),
             manager.clone(),
+            audit.clone(),
+            auth.clone(),
+            events.clone(),
+        ))
+        .merge(collection_control_router(
+            controller.clone(),
             audit.clone(),
             auth.clone(),
             events.clone(),
@@ -3813,6 +4533,7 @@ pub fn api_router(
     admin
         .merge(tag_space_router(
             manager,
+            controller,
             auth,
             api_keys,
             audit,
@@ -3821,8 +4542,135 @@ pub fn api_router(
             events,
             mqtt,
             rate_limiter,
+            !legacy_live_reconfigure,
         ))
         .merge(openapi_router())
+}
+
+/// Run the collector/computed preflight against a registry snapshot read from
+/// the same SQLite transaction that contains the proposed mutation. The tags
+/// services remain the authority for SQL FK/UNIQUE/shape validation; this
+/// helper covers the cross-table collector rules (address/data type and
+/// computed dependency validation).
+fn preflight_snapshot(snapshot: &RegistrySnapshot) -> Result<(), ApiError> {
+    let map = crate::hub::build_catalog_from(snapshot)
+        .map_err(|err| preflight_api_error(format!("catalog の検証に失敗しました: {err}")))?;
+    crate::computed::build_plan(&map)
+        .map_err(|err| preflight_api_error(format!("演算タグの検証に失敗しました: {err}")))?;
+    build_config_from(snapshot)
+        .map(|_| ())
+        .map_err(|err| preflight_api_error(err.to_string()))
+}
+
+fn preflight_api_error(message: String) -> ApiError {
+    ApiError(BantoError::Validation {
+        field_errors: vec![FieldError {
+            field: "configuration".to_string(),
+            message,
+        }],
+    })
+}
+
+fn storage_api_error(error: sqlx::Error) -> ApiError {
+    ApiError(BantoError::Storage(error.to_string()))
+}
+
+async fn preflight_transaction(
+    connection: &mut sqlx::SqliteConnection,
+) -> Result<RegistrySnapshot, ApiError> {
+    let snapshot = RegistrySnapshot::load_connection(connection)
+        .await
+        .map_err(|err| preflight_api_error(format!("レジストリの読み取りに失敗しました: {err}")))?;
+    preflight_snapshot(&snapshot)?;
+    Ok(snapshot)
+}
+
+/// Production composition entry point. Registry writes update the configured
+/// catalog but do not apply it to the running collection.
+#[allow(clippy::too_many_arguments)]
+pub fn api_router_with_controller(
+    users: UsersService,
+    audit: AuditLogService,
+    plc_connections: PlcConnectionService,
+    collection_groups: CollectionGroupService,
+    tags: TagService,
+    api_keys: ApiKeysService,
+    manager: Arc<CollectorManager>,
+    controller: Arc<CollectionController>,
+    auth: AuthState,
+    events: broadcast::Sender<ServerEvent>,
+    allow_setup: bool,
+    write_control: Arc<WriteControl>,
+    write_audit: WriteAuditService,
+    mqtt: Arc<MqttPublisher>,
+    grpc_server: Arc<crate::grpc::GrpcServer>,
+    rate_limiter: Arc<AsyncMutex<WriteRateLimiter>>,
+) -> Router {
+    api_router_with_controller_mode(
+        users,
+        audit,
+        plc_connections,
+        collection_groups,
+        tags,
+        api_keys,
+        manager,
+        controller,
+        auth,
+        events,
+        allow_setup,
+        write_control,
+        write_audit,
+        mqtt,
+        grpc_server,
+        rate_limiter,
+        false,
+    )
+}
+
+/// Compatibility composition entry point for existing embedders/tests. New
+/// hosts should use [`api_router_with_controller`] so MQTT and status observe
+/// the process-wide lifecycle controller.
+#[allow(clippy::too_many_arguments)]
+pub fn api_router(
+    users: UsersService,
+    audit: AuditLogService,
+    plc_connections: PlcConnectionService,
+    collection_groups: CollectionGroupService,
+    tags: TagService,
+    api_keys: ApiKeysService,
+    manager: Arc<CollectorManager>,
+    auth: AuthState,
+    events: broadcast::Sender<ServerEvent>,
+    allow_setup: bool,
+    write_control: Arc<WriteControl>,
+    write_audit: WriteAuditService,
+    mqtt: Arc<MqttPublisher>,
+    grpc_server: Arc<crate::grpc::GrpcServer>,
+    rate_limiter: Arc<AsyncMutex<WriteRateLimiter>>,
+) -> Router {
+    let controller = Arc::new(crate::controller::CollectionController::new(
+        manager.clone(),
+        write_control.clone(),
+    ));
+    api_router_with_controller_mode(
+        users,
+        audit,
+        plc_connections,
+        collection_groups,
+        tags,
+        api_keys,
+        manager,
+        controller,
+        auth,
+        events,
+        allow_setup,
+        write_control,
+        write_audit,
+        mqtt,
+        grpc_server,
+        rate_limiter,
+        true,
+    )
 }
 
 #[cfg(test)]
@@ -4802,5 +5650,349 @@ mod tests {
         // 明示 ?tags= でも全件通る(スコープ外という概念が無い)。
         let (status, _) = v1_get(&env.router, key, "/api/v1/values?tags=line2.slow.press01").await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    fn metadata_test_tag(tag_kind: &str, simulation: bool, enabled: bool) -> TagEntry {
+        TagEntry {
+            external_name: "line1.fast.temp".to_string(),
+            tag_key: "tag:3".to_string(),
+            ids: (1, 2, 3),
+            connection: "line1".to_string(),
+            group: "fast".to_string(),
+            name: "temp".to_string(),
+            address: "40001".to_string(),
+            data_type: "f32".to_string(),
+            unit: Some("C".to_string()),
+            decimals: 1,
+            period_ms: 100,
+            enabled,
+            writable: false,
+            tag_kind: tag_kind.to_string(),
+            expression: (tag_kind == banto_tags::COMPUTED_TAG_KIND)
+                .then(|| "line1.fast.temp + 1".to_string()),
+            retain: false,
+            simulation,
+        }
+    }
+
+    fn metadata_test_status(state: CollectionState, mode: RunMode) -> CollectionStatus {
+        CollectionStatus {
+            state,
+            mode,
+            run_id: (state == CollectionState::Running).then_some(9),
+            last_error: None,
+            configured_revision: 1,
+            running_revision: 1,
+        }
+    }
+
+    #[test]
+    fn rest_catalog_dto_separates_configured_and_effective_simulation() {
+        let tag = metadata_test_tag(banto_tags::PLC_TAG_KIND, false, true);
+        let all_simulation = metadata_test_status(CollectionState::Running, RunMode::AllSimulation);
+        let configured = metadata_test_status(CollectionState::Running, RunMode::Configured);
+        let stopped = metadata_test_status(CollectionState::Stopped, RunMode::AllSimulation);
+
+        let all_simulation_json =
+            serde_json::to_value(CatalogTagEntry::from_runtime(&tag, &all_simulation))
+                .expect("catalog DTO serializes");
+        assert_eq!(all_simulation_json["simulation"], false);
+        assert_eq!(all_simulation_json["configured_simulation"], false);
+        assert_eq!(all_simulation_json["effective_simulation"], true);
+        assert_eq!(all_simulation_json["value_source"], "simulation");
+
+        let all_simulation_catalog = serde_json::to_value(CatalogResponse {
+            revision: 4,
+            run_id: all_simulation.run_id,
+            collection_mode: all_simulation.mode.as_str().to_string(),
+            tags: vec![CatalogTagEntry::from_runtime(&tag, &all_simulation)],
+        })
+        .expect("catalog response serializes");
+        assert_eq!(all_simulation_catalog["run_id"], 9);
+        assert_eq!(all_simulation_catalog["collection_mode"], "all_simulation");
+        assert_eq!(
+            all_simulation_catalog["tags"][0]["value_source"],
+            "simulation"
+        );
+
+        let configured_catalog = serde_json::to_value(CatalogResponse {
+            revision: 4,
+            run_id: configured.run_id,
+            collection_mode: configured.mode.as_str().to_string(),
+            tags: vec![CatalogTagEntry::from_runtime(&tag, &configured)],
+        })
+        .expect("configured catalog response serializes");
+        assert_eq!(configured_catalog["run_id"], 9);
+        assert_eq!(configured_catalog["collection_mode"], "configured");
+        assert_eq!(configured_catalog["tags"][0]["value_source"], "real");
+
+        assert!(!CatalogTagEntry::from_runtime(&tag, &configured).effective_simulation);
+        assert!(!CatalogTagEntry::from_runtime(&tag, &stopped).effective_simulation);
+        assert_eq!(
+            CatalogTagEntry::from_runtime(&tag, &configured).value_source,
+            "real"
+        );
+        assert_eq!(
+            CatalogTagEntry::from_runtime(&tag, &stopped).value_source,
+            "real"
+        );
+        let stopped_catalog = serde_json::to_value(CatalogResponse {
+            revision: 4,
+            run_id: stopped.run_id,
+            collection_mode: stopped.mode.as_str().to_string(),
+            tags: vec![CatalogTagEntry::from_runtime(&tag, &stopped)],
+        })
+        .expect("stopped catalog response serializes");
+        assert!(stopped_catalog["run_id"].is_null());
+        assert_eq!(stopped_catalog["collection_mode"], "all_simulation");
+        assert!(
+            !tag.simulation,
+            "the shared saved catalog must stay unchanged"
+        );
+
+        let saved_simulation = metadata_test_tag(banto_tags::PLC_TAG_KIND, true, true);
+        assert!(effective_simulation_for_connection(
+            "modbus-tcp",
+            true,
+            true,
+            &configured,
+        ));
+        assert!(!effective_simulation_for_connection(
+            "modbus-tcp",
+            true,
+            true,
+            &stopped,
+        ));
+        assert!(!CatalogTagEntry::from_runtime(&saved_simulation, &stopped).effective_simulation);
+    }
+
+    #[test]
+    fn rest_value_source_uses_safe_tag_kind_classification() {
+        let all_simulation = metadata_test_status(CollectionState::Running, RunMode::AllSimulation);
+        let configured = metadata_test_status(CollectionState::Running, RunMode::Configured);
+        let plc = metadata_test_tag(banto_tags::PLC_TAG_KIND, false, true);
+        let computed = metadata_test_tag(banto_tags::COMPUTED_TAG_KIND, false, true);
+        let internal = metadata_test_tag(banto_tags::INTERNAL_TAG_KIND, false, true);
+
+        assert_eq!(value_source_for_tag(&plc, &all_simulation), "simulation");
+        assert_eq!(value_source_for_tag(&plc, &configured), "real");
+        assert_eq!(
+            value_source_for_tag(&computed, &all_simulation),
+            "derived_simulation"
+        );
+        assert_eq!(value_source_for_tag(&internal, &all_simulation), "internal");
+    }
+
+    #[test]
+    fn api_key_external_output_hides_simulation_and_derived_values() {
+        let all_simulation = metadata_test_status(CollectionState::Running, RunMode::AllSimulation);
+        let configured = metadata_test_status(CollectionState::Running, RunMode::Configured);
+        let stopped = metadata_test_status(CollectionState::Stopped, RunMode::AllSimulation);
+        let physical = metadata_test_tag(banto_tags::PLC_TAG_KIND, false, true);
+        let saved_simulation = metadata_test_tag(banto_tags::PLC_TAG_KIND, true, true);
+        let computed = metadata_test_tag(banto_tags::COMPUTED_TAG_KIND, false, true);
+        let internal = metadata_test_tag(banto_tags::INTERNAL_TAG_KIND, false, true);
+
+        assert!(!api_key_external_output_allowed(&physical, &all_simulation));
+        assert!(api_key_external_output_allowed(&physical, &configured));
+        assert!(!api_key_external_output_allowed(
+            &saved_simulation,
+            &configured
+        ));
+        assert!(!api_key_external_output_allowed(
+            &saved_simulation,
+            &stopped
+        ));
+        assert!(!api_key_external_output_allowed(&computed, &configured));
+        assert!(!api_key_external_output_allowed(&computed, &all_simulation));
+        assert!(api_key_external_output_allowed(&internal, &all_simulation));
+    }
+
+    #[test]
+    fn rest_connection_effective_simulation_returns_to_configured_value() {
+        let all_simulation = metadata_test_status(CollectionState::Running, RunMode::AllSimulation);
+        let configured = metadata_test_status(CollectionState::Running, RunMode::Configured);
+        let stopped = metadata_test_status(CollectionState::Stopped, RunMode::AllSimulation);
+
+        assert!(effective_simulation_for_connection(
+            "modbus-tcp",
+            true,
+            false,
+            &all_simulation,
+        ));
+        assert!(!effective_simulation_for_connection(
+            "modbus-tcp",
+            true,
+            false,
+            &configured,
+        ));
+        assert!(!effective_simulation_for_connection(
+            "modbus-tcp",
+            true,
+            false,
+            &stopped,
+        ));
+        assert!(!effective_simulation_for_connection(
+            "virtual",
+            true,
+            false,
+            &all_simulation,
+        ));
+    }
+
+    #[test]
+    fn collection_control_status_is_camel_case_and_all_simulation_is_explicit() {
+        let status = CollectionStatusResponse::from(CollectionStatus {
+            state: CollectionState::Faulted,
+            mode: RunMode::AllSimulation,
+            run_id: Some(7),
+            last_error: Some("T15未実装".to_string()),
+            configured_revision: 3,
+            running_revision: 2,
+        });
+        let value = serde_json::to_value(status).expect("status serializes");
+        assert_eq!(value["state"], "faulted");
+        assert_eq!(value["mode"], "all_simulation");
+        assert_eq!(value["runId"], 7);
+        assert_eq!(value["configuredRevision"], 3);
+        assert_eq!(value["runningRevision"], 2);
+        assert_eq!(value["lastError"], "T15未実装");
+    }
+
+    #[tokio::test]
+    async fn simulation_write_rejection_is_http_503_with_machine_code() {
+        let response = write_rejection_response(
+            "line1.fast.temp01".to_string(),
+            crate::write_path::WriteRejection::SimulationWriteRejected,
+        );
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"error": "simulation_write_rejected"})
+        );
+    }
+
+    #[tokio::test]
+    async fn simulation_output_rejection_is_http_503_with_machine_code() {
+        let response = simulation_output_disabled_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"error": "simulation_output_disabled"})
+        );
+    }
+
+    #[test]
+    fn collection_edit_lock_is_http_409_with_current_status() {
+        let status = CollectionStatusResponse::from(CollectionStatus {
+            state: CollectionState::Running,
+            mode: RunMode::Configured,
+            run_id: Some(1),
+            last_error: None,
+            configured_revision: 4,
+            running_revision: 4,
+        });
+        let response = RegistryMutationError::CollectionEditLocked(status).into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn collection_control_requires_admin_and_csrf_and_is_idempotent() {
+        let env = test_env().await;
+
+        let missing_csrf = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/collection/start")
+            .header("Authorization", format!("Bearer {}", env.admin_token))
+            .body(Body::empty())
+            .unwrap();
+        let response = env.router.clone().oneshot(missing_csrf).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let viewer = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/collection/start")
+            .header("Authorization", format!("Bearer {}", env.viewer_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .body(Body::empty())
+            .unwrap();
+        let response = env.router.clone().oneshot(viewer).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let start = || {
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/api/collection/start")
+                .header("Authorization", format!("Bearer {}", env.admin_token))
+                .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let first = env.router.clone().oneshot(start()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first_json["state"], "running");
+
+        let repeated = env.router.clone().oneshot(start()).await.unwrap();
+        let repeated_body = axum::body::to_bytes(repeated.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let repeated_json: serde_json::Value = serde_json::from_slice(&repeated_body).unwrap();
+        assert_eq!(repeated_json["runId"], first_json["runId"]);
+
+        let stop = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/collection/stop")
+            .header("Authorization", format!("Bearer {}", env.admin_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .body(Body::empty())
+            .unwrap();
+        let response = env.router.clone().oneshot(stop).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT action, resource, result FROM audit_log WHERE resource = 'collection' ORDER BY id",
+        )
+        .fetch_all(&env.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "denied".to_string(),
+                    "collection".to_string(),
+                    "denied".to_string()
+                ),
+                (
+                    "start".to_string(),
+                    "collection".to_string(),
+                    "ok".to_string()
+                ),
+                (
+                    "start".to_string(),
+                    "collection".to_string(),
+                    "ok".to_string()
+                ),
+                (
+                    "stop".to_string(),
+                    "collection".to_string(),
+                    "ok".to_string()
+                ),
+            ]
+        );
     }
 }
