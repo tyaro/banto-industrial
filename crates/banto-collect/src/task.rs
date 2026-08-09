@@ -156,6 +156,10 @@ pub(crate) struct TaskContext {
     pub events: EventSink,
     pub status: StatusMap,
     pub backoff: BackoffConfig,
+    /// Effective per-connection simulation mode for this task. This is
+    /// carried in the shared task context so record_group does not need an
+    /// extra per-call flag argument.
+    pub simulation: bool,
     /// See [`ClientFactory`]'s doc comment.
     pub factory: ClientFactory,
 }
@@ -748,6 +752,15 @@ async fn record_group(
         }
     }
 
+    // Simulation values remain live in the current cache and continue to
+    // drive threshold/event processing above, but they are not a record of
+    // the physical PLC and must never be appended to the real tstore. Keep
+    // append-health untouched so suppression cannot create a false failure or
+    // recovery edge.
+    if ctx.simulation {
+        return;
+    }
+
     // An append failure never tears the loop down - a 24/365 recorder keeps
     // collecting through a transient storage hiccup (the in-memory cache and
     // live events still flow). A persistent failure (e.g. disk full) is an
@@ -1125,13 +1138,14 @@ mod tests {
         let events = EventSink::new(pool);
         let mut live = events.subscribe();
 
-        let ctx = TaskContext {
+        let mut ctx = TaskContext {
             writer_rx,
             clock: clock.clone(),
             current: CurrentValuesHandle::new(clock.clone()),
             events,
             status: Arc::new(RwLock::new(HashMap::new())),
             backoff: BackoffConfig::default(),
+            simulation: false,
             factory: default_client_factory(),
         };
 
@@ -1150,7 +1164,29 @@ mod tests {
         let mut append_health = AppendHealth::default();
         let good = [ReadResult::Value(TagValue::F64(1.0))];
 
-        // Tick 1: genuinely fails (UnknownGroup) - the entering edge.
+        // A simulation tick updates the in-memory path above but must not call
+        // append. The writer intentionally does not know target-group, so an
+        // accidental append would surface as UnknownGroup here.
+        ctx.simulation = true;
+        record_group(
+            &group,
+            Some(&good),
+            900,
+            &ctx,
+            "conn:1",
+            &mut threshold_state,
+            &mut append_health,
+        )
+        .await;
+        assert!(
+            live.try_recv().is_err(),
+            "simulation suppression must not emit append-health events"
+        );
+        assert_eq!(append_health.streak, 0);
+
+        // Tick 1: physical collection genuinely fails (UnknownGroup) - the
+        // entering edge.
+        ctx.simulation = false;
         record_group(
             &group,
             Some(&good),

@@ -347,6 +347,7 @@ impl Collector {
                 events: events.clone(),
                 status: status.clone(),
                 backoff: options.backoff,
+                simulation: plan.simulation,
                 factory: factory.clone(),
             };
             let (stop_tx, stop_rx) = watch::channel(false);
@@ -500,6 +501,7 @@ impl Collector {
                 events: self.events.clone(),
                 status: self.status.clone(),
                 backoff: self.options.backoff,
+                simulation: plan.simulation,
                 factory: factory.clone(),
             };
             let (stop_tx, stop_rx) = watch::channel(false);

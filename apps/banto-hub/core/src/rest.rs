@@ -3944,7 +3944,9 @@ fn write_rejection_response(tag: String, rejection: crate::write_path::WriteReje
     }
 
     let status = match &rejection {
-        WriteRejection::CollectionNotRunning(_) => StatusCode::SERVICE_UNAVAILABLE,
+        WriteRejection::CollectionNotRunning(_) | WriteRejection::SimulationWriteRejected => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         WriteRejection::NotFound => unreachable!("上で特別扱い済み"),
         WriteRejection::NotWritable => StatusCode::FORBIDDEN,
         WriteRejection::TagDisabled => StatusCode::CONFLICT,
@@ -4023,7 +4025,7 @@ struct WriteState {
         (status = 429, description = "rate_limited"),
         (status = 501, description = "write_unsupported_protocol"),
         (status = 502, description = "write_failed"),
-        (status = 503, description = "writes_disabled"),
+        (status = 503, description = "writes_disabled / simulation_write_rejected"),
     ),
     tag = "tag-space",
 )]
@@ -5784,6 +5786,24 @@ mod tests {
         assert_eq!(value["configuredRevision"], 3);
         assert_eq!(value["runningRevision"], 2);
         assert_eq!(value["lastError"], "T15未実装");
+    }
+
+    #[tokio::test]
+    async fn simulation_write_rejection_is_http_503_with_machine_code() {
+        let response = write_rejection_response(
+            "line1.fast.temp01".to_string(),
+            crate::write_path::WriteRejection::SimulationWriteRejected,
+        );
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"error": "simulation_write_rejected"})
+        );
     }
 
     #[test]

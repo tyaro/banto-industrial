@@ -36,13 +36,16 @@
 //! 2. `writable == false` → [`WriteRejection::NotWritable`](監査不要 -
 //!    定義上の拒否)
 //! 3. 実効 enabled == false → [`WriteRejection::TagDisabled`]
-//! 4. Modbus 接続配下 → [`WriteRejection::UnsupportedProtocol`](§6-7:
+//! 4. シミュレーション中の PLC タグ → [`WriteRejection::SimulationWriteRejected`]
+//!    (保存済み simulation または production controller の AllSimulation。
+//!    internal/mem タグはこのゲートの対象外)
+//! 5. Modbus 接続配下 → [`WriteRejection::UnsupportedProtocol`](§6-7:
 //!    v1 の書き込みは SLMP のみ)
-//! 5. write_enabled(受付)off → [`WriteRejection::WritesDisabled`] +
+//! 6. write_enabled(受付)off → [`WriteRejection::WritesDisabled`] +
 //!    write_audit に `suppressed_disabled`
-//! 6. レート制限 would_exceed → [`WriteRejection::RateLimited`] + キー
+//! 7. レート制限 would_exceed → [`WriteRejection::RateLimited`] + キー
 //!    trip + `rate_limit_tripped` 記録
-//! 7. 値変換: まず [`RequestedValue`] の種別と data_type の対称性を検査する
+//! 8. 値変換: まず [`RequestedValue`] の種別と data_type の対称性を検査する
 //!    (bit タグには bool のみ、数値タグには数値のみ - 暗黙の型変換はしない。
 //!    2026-08-06 追加、§4.2 の「タグ種別を跨いだ暗黙変換をしない」設計思想を
 //!    書き込み経路にも適用した)。一致しなければ
@@ -51,7 +54,7 @@
 //!    `banto_plc::TagValue`(数値は範囲チェックで
 //!    [`WriteRejection::ValueOutOfRange`])。文字列タグは
 //!    [`WriteRejection::UnsupportedValueType`] で拒否
-//! 8. **log-before-write** → `CollectorManager::write_broker_handle`
+//! 9. **log-before-write** → `CollectorManager::write_broker_handle`
 //!    経由の `BrokerHandle::write`(1タグ=1リクエスト)→ set_result →
 //!    [`WriteOk`] または [`WriteRejection::WriteFailed`]
 //!
@@ -79,7 +82,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::api_keys::{ApiKeyContext, ApiKeysService};
 use crate::computed::upsert_retained_value;
-use crate::controller::{CollectionController, CollectionState};
+use crate::controller::{CollectionController, CollectionState, RunMode};
 use crate::hub::CollectorManager;
 use crate::write_audit::{WriteAuditAction, WriteAuditResult, WriteAuditRow, WriteAuditService};
 use crate::write_control::WriteControl;
@@ -139,6 +142,11 @@ pub enum WriteRejection {
     /// only installed by production composition; the legacy compatibility
     /// router intentionally leaves it unset for existing embedders/tests.
     CollectionNotRunning(CollectionState),
+    /// PLC タグがシミュレーション接続配下、または production controller
+    /// の AllSimulation 実行中。実機へ誤書き込みしないため、broker handle
+    /// の取得・レート制限消費・監査行作成より前に fail-closed する。
+    /// internal/mem タグはこの拒否の対象外。
+    SimulationWriteRejected,
     /// gate 1: catalog に存在しない外部名(REST: 404, gRPC: NOT_FOUND)。
     NotFound,
     /// gate 2: `writable == false`(REST: 403, gRPC: PERMISSION_DENIED)。
@@ -250,12 +258,16 @@ pub async fn execute_write(
     tag: &str,
     requested: Option<RequestedValue>,
 ) -> Result<WriteOk, WriteRejection> {
-    if let Some(controller) = deps.collection_controller {
-        let state = controller.status().state;
+    let collection_mode = if let Some(controller) = deps.collection_controller {
+        let status = controller.status();
+        let state = status.state;
         if state != CollectionState::Running {
             return Err(WriteRejection::CollectionNotRunning(state));
         }
-    }
+        Some(status.mode)
+    } else {
+        None
+    };
 
     // gate 1: catalog 解決
     let map = deps.manager.tag_map();
@@ -274,6 +286,16 @@ pub async fn execute_write(
     }
 
     let (connection_id, _group_id, tag_id) = entry.ids;
+
+    // Simulation is a safety boundary, not a transport error. Check it before
+    // loading the PLC connection or touching the broker, audit, or rate-limit
+    // paths. Internal/mem tags deliberately remain writable as server-local
+    // values; computed tags are already rejected by `writable == false`.
+    if entry.tag_kind == PLC_TAG_KIND
+        && (entry.simulation || collection_mode == Some(RunMode::AllSimulation))
+    {
+        return Err(WriteRejection::SimulationWriteRejected);
+    }
 
     // gate 4: Modbus 接続配下は非対応(§6-7: v1 の書き込みは SLMP のみ)。
     //
@@ -613,6 +635,7 @@ impl WriteRejection {
     pub fn rest_error_code(&self) -> &'static str {
         match self {
             WriteRejection::CollectionNotRunning(_) => "collection_not_running",
+            WriteRejection::SimulationWriteRejected => "simulation_write_rejected",
             WriteRejection::NotFound => "not_found",
             WriteRejection::NotWritable => "not_writable",
             WriteRejection::TagDisabled => "tag_disabled",
@@ -663,6 +686,18 @@ mod tests {
         assert_eq!(
             rejection.to_json(),
             json!({"error": "collection_not_running"})
+        );
+    }
+
+    #[test]
+    fn simulation_write_rejection_has_a_stable_wire_code() {
+        let rejection = WriteRejection::SimulationWriteRejected;
+
+        assert_eq!(rejection.rest_error_code(), "simulation_write_rejected");
+        assert_eq!(rejection.detail(), None);
+        assert_eq!(
+            rejection.to_json(),
+            json!({"error": "simulation_write_rejected"})
         );
     }
 }
