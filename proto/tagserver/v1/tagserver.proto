@@ -136,6 +136,12 @@ message StreamValuesRequest {
   repeated string tags = 1;
   SubscribeMode mode = 2;
   int64 interval_ms = 3;
+  // T15-3 (docs/banto-hub-desktop-plan.md §6.3): テスト出力の gRPC stream
+  // namespace への opt-in。既定 false = 現行どおり(`AllSimulation`中は
+  // `simulation_output_disabled`で拒否)。true でも、現在の run_id に対して
+  // `TestOutputControl`が有効化されていない限り honored されない
+  // (`test_output_disabled`で拒否 - `crate::grpc::stream_values`参照)。
+  bool test_output = 4;
 }
 
 // 1回の送信(初期スナップショット必須・250ms 評価・スロットルなし - 設計
@@ -144,6 +150,11 @@ message StreamValuesRequest {
 message ValueBatch {
   int64 timestamp_ms = 1;
   repeated TagValue values = 2;
+  // T15-3: テスト出力 stream(`StreamValuesRequest.test_output == true`)
+  // のバッチにのみ true。通常 stream のバッチには決して立たない。
+  bool simulation = 3;
+  // T15-3: テスト出力 stream のバッチにのみ設定する、有効化元の run_id。
+  optional uint64 run_id = 4;
 }
 
 // --- StreamEvents -------------------------------------------------------------

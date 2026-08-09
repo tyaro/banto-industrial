@@ -37,11 +37,13 @@ use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::{HubSessions, SlmpSimRegistry};
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
+use banto_hub_core::controller::{CollectionController, CollectionState, RunMode};
 use banto_hub_core::db::init_db;
 use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::mqtt::MqttPublisher;
-use banto_hub_core::rest::api_router;
+use banto_hub_core::rest::{api_router, api_router_with_controller};
+use banto_hub_core::test_output::TestOutputControl;
 use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
 use banto_hub_core::write_control::WriteControl;
@@ -443,6 +445,133 @@ async fn test_app(label: &str) -> TestApp {
     }
 }
 
+/// T15-3（設計 §6.3）: [`TestApp`]は`MqttPublisher::new`（コントローラ非注入 -
+/// このモジュールの他のテストは`AllSimulation`/テスト出力を一切対象としない
+/// ため常に`PublishTarget::Normal`扱いでよい）を使うが、テスト出力トピック
+/// は`Running`+`AllSimulation`+`TestOutputControl`有効時のみ選ばれる
+/// （`crate::mqtt::eval_target`参照）ので、この構成では検証できない。
+/// このテスト専用に、`MqttPublisher::new_with_controller`+
+/// `api_router_with_controller`で実際の`CollectionController`/
+/// `TestOutputControl`を配線した別構成を用意する。
+struct TestOutputTestApp {
+    router: Router,
+    token: String,
+    pool: SqlitePool,
+    manager: Arc<CollectorManager>,
+    controller: Arc<CollectionController>,
+    test_output: Arc<TestOutputControl>,
+    _env: TempEnv,
+}
+
+impl Drop for TestOutputTestApp {
+    fn drop(&mut self) {
+        common::shutdown_test_app(&self.manager, &self.pool);
+    }
+}
+
+async fn test_output_test_app(label: &str) -> TestOutputTestApp {
+    let env = TempEnv::new(TEMP_ENV_PREFIX, label);
+    let pool = init_db(env.registry_path()).await.expect("init_db");
+
+    let users = UsersService::new(pool.clone());
+    let audit = AuditLogService::new(pool.clone());
+    users
+        .setup_first_user("admin", "password123", "管理者")
+        .await
+        .expect("setup_first_user");
+
+    let verify_users = users.clone();
+    let auth = AuthState::new(move |u: String, p: String| {
+        let users = verify_users.clone();
+        Box::pin(async move {
+            match users.verify(&u, &p).await {
+                Ok(Some(identity)) => Some(Identity {
+                    id: identity.username,
+                    name: identity.display_name,
+                    role: identity.role.to_string(),
+                }),
+                _ => None,
+            }
+        })
+    });
+    let token = auth
+        .login("admin", "password123")
+        .await
+        .expect("admin login");
+
+    let sessions = Arc::new(HubSessions::new(banto_broker::BackoffConfig::default()));
+    let sim_registry = Arc::new(SlmpSimRegistry::new());
+    let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
+    let manager = Arc::new(CollectorManager::new(
+        pool.clone(),
+        env.data_dir(),
+        Arc::new(SystemClock),
+        fast_options(),
+        sessions,
+        sim_registry,
+        computed,
+    ));
+    manager.rebuild().await.expect("initial rebuild");
+
+    let (events_tx, _rx) = broadcast::channel(16);
+    let write_control = Arc::new(WriteControl::new(false));
+    let test_output = Arc::new(TestOutputControl::new());
+    let controller = Arc::new(CollectionController::new(
+        manager.clone(),
+        write_control.clone(),
+        test_output.clone(),
+    ));
+    let write_audit = WriteAuditService::new(pool.clone());
+    let mqtt = Arc::new(MqttPublisher::new_with_controller(
+        manager.clone(),
+        controller.clone(),
+        test_output.clone(),
+    ));
+    let api_keys = ApiKeysService::new(pool.clone());
+    let rate_limiter = Arc::new(tokio::sync::Mutex::new(WriteRateLimiter::new(
+        WriteRateLimitConfig::default(),
+    )));
+    let grpc_service = GrpcService::new(
+        manager.clone(),
+        api_keys.clone(),
+        audit.clone(),
+        write_audit.clone(),
+        write_control.clone(),
+        rate_limiter.clone(),
+        events_tx.clone(),
+    );
+    let grpc_server = Arc::new(GrpcServer::new(grpc_service));
+    let router = api_router_with_controller(
+        users,
+        audit,
+        PlcConnectionService::new(pool.clone()),
+        CollectionGroupService::new(pool.clone()),
+        TagService::new(pool.clone()),
+        api_keys,
+        manager.clone(),
+        controller.clone(),
+        auth,
+        events_tx,
+        false,
+        write_control,
+        write_audit,
+        mqtt,
+        grpc_server,
+        rate_limiter,
+        test_output.clone(),
+    );
+
+    TestOutputTestApp {
+        router,
+        token,
+        pool,
+        manager,
+        controller,
+        test_output,
+        _env: env,
+    }
+}
+
 /// `/api/v1/*`向け - CSRF ヘッダ不要（`crate::rest`の doc comment「二系統に
 /// 分かれたルーター」参照）。管理系(`/api/mqtt-settings`等)の GET には使え
 /// ない - そちらは [`get_json_admin`] を使うこと。
@@ -518,19 +647,22 @@ async fn write_json(
     (status, json)
 }
 
-/// `PUT /api/mqtt-settings`を叩いて即時適用させる。
+/// `PUT /api/mqtt-settings`を叩いて即時適用させる。`router`/`token`を直接
+/// 取るのは、T15-3 のテスト出力テストが`TestApp`とは別の構成
+/// （`TestOutputTestApp`、下記）を使うため - 両方から共有できるようにした。
 async fn put_mqtt_settings(
-    app: &TestApp,
+    router: &Router,
+    token: &str,
     broker_port: u16,
     client_id: &str,
     min_interval_ms: i64,
     enabled: bool,
 ) -> (StatusCode, Value) {
     write_json(
-        &app.router,
+        router,
         "PUT",
         "/api/mqtt-settings",
-        &app.token,
+        token,
         json!({
             "enabled": enabled,
             "host": "127.0.0.1",
@@ -546,8 +678,9 @@ async fn put_mqtt_settings(
     .await
 }
 
-async fn status_mqtt_connected(app: &TestApp) -> bool {
-    let (status, json) = get_json(&app.router, "/api/v1/status", &app.token).await;
+/// [`put_mqtt_settings`]と同じ理由で`router`/`token`を直接取る。
+async fn status_mqtt_connected(router: &Router, token: &str) -> bool {
+    let (status, json) = get_json(router, "/api/v1/status", token).await;
     assert_eq!(status, StatusCode::OK);
     json["mqtt"]["connected"].as_bool().unwrap_or(false)
 }
@@ -595,12 +728,20 @@ async fn e2e_publishes_values_with_retain_and_online_state() {
         "collector should observe the simulator value before enabling MQTT"
     );
 
-    let (status, _body) = put_mqtt_settings(&app, broker_port, "hub-happy-path", 100, true).await;
+    let (status, _body) = put_mqtt_settings(
+        &app.router,
+        &app.token,
+        broker_port,
+        "hub-happy-path",
+        100,
+        true,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     assert!(
         wait_until(Duration::from_secs(6), || async {
-            status_mqtt_connected(&app).await
+            status_mqtt_connected(&app.router, &app.token).await
         })
         .await,
         "/api/v1/status should report mqtt.connected=true once the publisher connects"
@@ -661,11 +802,19 @@ async fn retain_delivers_last_value_to_a_fresh_subscriber() {
         .await
     );
 
-    let (status, _) = put_mqtt_settings(&app, broker_port, "hub-retain", 100, true).await;
+    let (status, _) = put_mqtt_settings(
+        &app.router,
+        &app.token,
+        broker_port,
+        "hub-retain",
+        100,
+        true,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         wait_until(Duration::from_secs(6), || async {
-            status_mqtt_connected(&app).await
+            status_mqtt_connected(&app.router, &app.token).await
         })
         .await
     );
@@ -740,12 +889,19 @@ async fn throttle_suppresses_rapid_changes_and_sends_the_latest_value_once_the_w
     );
 
     const MIN_INTERVAL_MS: i64 = 1000;
-    let (status, _) =
-        put_mqtt_settings(&app, broker_port, "hub-throttle", MIN_INTERVAL_MS, true).await;
+    let (status, _) = put_mqtt_settings(
+        &app.router,
+        &app.token,
+        broker_port,
+        "hub-throttle",
+        MIN_INTERVAL_MS,
+        true,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         wait_until(Duration::from_secs(6), || async {
-            status_mqtt_connected(&app).await
+            status_mqtt_connected(&app.router, &app.token).await
         })
         .await
     );
@@ -864,7 +1020,15 @@ async fn disabled_publishes_nothing_and_enabling_via_put_starts_publishing_immed
     );
 
     // PUT で有効化(即時適用) - 再起動なしに発行が始まる。
-    let (status, body) = put_mqtt_settings(&app, broker_port, "hub-enable-later", 100, true).await;
+    let (status, body) = put_mqtt_settings(
+        &app.router,
+        &app.token,
+        broker_port,
+        "hub-enable-later",
+        100,
+        true,
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["enabled"], true);
     assert!(
@@ -874,7 +1038,7 @@ async fn disabled_publishes_nothing_and_enabling_via_put_starts_publishing_immed
 
     assert!(
         wait_until(Duration::from_secs(6), || async {
-            status_mqtt_connected(&app).await
+            status_mqtt_connected(&app.router, &app.token).await
         })
         .await
     );
@@ -890,6 +1054,253 @@ async fn disabled_publishes_nothing_and_enabling_via_put_starts_publishing_immed
     assert_eq!(
         payload_json(&messages, "banto/line1/fast/temp01").unwrap()["v"],
         7.0
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T15-3: テスト出力専用トピック（設計 §6.3）
+// ---------------------------------------------------------------------------
+
+/// `POST /api/test-output/enable`|`disable`のレスポンス
+/// (`crate::rest::TestOutputStatusEntry`)。
+async fn post_test_output(router: &Router, token: &str, action: &str) -> (StatusCode, Value) {
+    write_json(
+        router,
+        "POST",
+        &format!("/api/test-output/{action}"),
+        token,
+        json!({}),
+    )
+    .await
+}
+
+/// `AllSimulation`かつ`Running`でなければ有効化を拒否し、有効化後は通常
+/// トピックを一切汚さず専用トピック（`{prefix}/test/{run_id}/...`）だけに
+/// `simulation=true`・一致する`run_id`付きで`retain=false`発行する - 実装
+/// 指示のテスト計画1〜3を1本の統合テストにまとめたもの。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_output_topics_carry_simulation_payloads_only_while_armed_during_all_simulation() {
+    let broker_port = start_test_broker().await;
+    let app = test_output_test_app("test-output-happy-path").await;
+
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(conn_input("line1", 1)) // AllSimulation はホスト/ポートに接続しない
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group.id, "40001", "i16"))
+        .await
+        .unwrap();
+    app.manager.rebuild().await.expect("rebuild after seeding");
+
+    let (status, _) = put_mqtt_settings(
+        &app.router,
+        &app.token,
+        broker_port,
+        "hub-test-output",
+        0,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 収集停止中は有効化の前提を満たさない(`Running`+`AllSimulation`必須)。
+    let (status, body) = post_test_output(&app.router, &app.token, "enable").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "test_output_not_available");
+
+    let run_status = app.controller.start(RunMode::AllSimulation).await;
+    assert_eq!(run_status.state, CollectionState::Running);
+    let run_id = run_status
+        .run_id
+        .expect("AllSimulation run should have a run_id");
+
+    assert!(
+        wait_until(Duration::from_secs(6), || async {
+            status_mqtt_connected(&app.router, &app.token).await
+        })
+        .await,
+        "mqtt should connect once enabled, independent of test-output"
+    );
+
+    // 有効化前: `AllSimulation`中なので通常トピックには何も来ない
+    // (既存 PR #95 挙動)し、まだ有効化していないのでテスト出力トピックにも
+    // 何も来ない。
+    let nothing = collect_messages(
+        broker_port,
+        "sub-before-enable",
+        "banto/#",
+        1,
+        Duration::from_millis(500),
+    )
+    .await;
+    let stray_state = nothing
+        .iter()
+        .filter(|(topic, _)| topic != "banto/$state")
+        .count();
+    assert_eq!(
+        stray_state, 0,
+        "no tag topic (normal or test) should publish before test-output is enabled: {nothing:?}"
+    );
+
+    // 有効化: `enabled: true`・`run_id`が一致するレスポンス。
+    let (status, body) = post_test_output(&app.router, &app.token, "enable").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["enabled"], true);
+    assert_eq!(body["run_id"], run_id);
+
+    let live = LiveSubscriber::subscribe(broker_port, "sub-test-live", "banto/#").await;
+    assert!(
+        wait_until(Duration::from_secs(6), || async {
+            live.snapshot()
+                .await
+                .iter()
+                .any(|(topic, _)| topic == &format!("banto/test/{run_id}/line1/fast/temp01"))
+        })
+        .await,
+        "the test-output topic should receive a publish once armed"
+    );
+
+    let messages = live.snapshot().await;
+    let test_topic = format!("banto/test/{run_id}/line1/fast/temp01");
+    let payload = payload_json(&messages, &test_topic).expect("test-output payload");
+    assert_eq!(payload["simulation"], true);
+    assert_eq!(payload["run_id"], run_id);
+    assert!(payload["v"].is_number(), "payload: {payload:?}");
+
+    // 通常トピックには一度も来ていないこと(`AllSimulation`中は抑止のまま)。
+    assert!(
+        !messages
+            .iter()
+            .any(|(topic, _)| topic == "banto/line1/fast/temp01"),
+        "the normal topic must stay silent during all-simulation: {messages:?}"
+    );
+
+    // 明示的な disable: 以後テスト出力トピックへの新規発行が止まる。
+    let (status, body) = post_test_output(&app.router, &app.token, "disable").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["enabled"], false);
+
+    let baseline = live.snapshot().await.len();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let after_disable = live.snapshot().await.split_off(baseline);
+    assert!(
+        after_disable.is_empty(),
+        "no further test-output publish should happen after disable: {after_disable:?}"
+    );
+
+    // retain=false: 発行が止まった後に**新規**購読しても、broker には
+    // テスト出力トピックの最終値が残っていない(通常トピックの
+    // `retain_delivers_last_value_to_a_fresh_subscriber`と対照的な挙動 -
+    // 実装指示「retain=false always」)。発行中の新規購読では「たまたま
+    // タイミング内に生きた発行が来た」だけで retain の有無を判別できない
+    // ため、発行が完全に止まった後で確認する。
+    let fresh = collect_messages(
+        broker_port,
+        "sub-test-fresh",
+        &test_topic,
+        1,
+        Duration::from_millis(700),
+    )
+    .await;
+    assert!(
+        fresh.is_empty(),
+        "a fresh subscriber must NOT receive a retained test-output message: {fresh:?}"
+    );
+
+    let (status, body) = get_json(&app.router, "/api/v1/status", &app.token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["test_output"]["enabled"], false);
+    assert_eq!(body["test_output"]["run_id"], Value::Null);
+}
+
+/// 収集停止は明示的な`disable`と同じ結果になる - `CollectionController`の
+/// `stop_locked`が`test_output.disable()`する（設計「停止／終了／切替後に
+/// 必ず無効へ戻る」）。停止後は再度`AllSimulation`が`Running`に戻るまで
+/// 有効化が拒否される。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_output_auto_disables_on_stop_and_re_enable_is_rejected_until_all_simulation_runs_again(
+) {
+    let broker_port = start_test_broker().await;
+    let app = test_output_test_app("test-output-stop-clears").await;
+
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(conn_input("line1", 1))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group.id, "40001", "i16"))
+        .await
+        .unwrap();
+    app.manager.rebuild().await.expect("rebuild after seeding");
+
+    let (status, _) = put_mqtt_settings(
+        &app.router,
+        &app.token,
+        broker_port,
+        "hub-test-output-stop",
+        0,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let run_status = app.controller.start(RunMode::AllSimulation).await;
+    let run_id = run_status
+        .run_id
+        .expect("AllSimulation run should have a run_id");
+    assert!(
+        wait_until(Duration::from_secs(6), || async {
+            status_mqtt_connected(&app.router, &app.token).await
+        })
+        .await
+    );
+
+    let (status, body) = post_test_output(&app.router, &app.token, "enable").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["run_id"], run_id);
+    assert!(app.test_output.is_active_for(Some(run_id)));
+
+    let test_topic = format!("banto/test/{run_id}/line1/fast/temp01");
+    let live = LiveSubscriber::subscribe(broker_port, "sub-test-stop-live", "banto/#").await;
+    assert!(
+        wait_until(Duration::from_secs(6), || async {
+            live.snapshot()
+                .await
+                .iter()
+                .any(|(topic, _)| topic == &test_topic)
+        })
+        .await,
+        "the test-output topic should receive a publish once armed"
+    );
+
+    app.controller.stop().await;
+
+    // 設計「停止...後に必ず無効へ戻る」: ライブフラグ自身がクリアされる。
+    assert!(!app.test_output.is_active_for(Some(run_id)));
+    let (status, body) = get_json(&app.router, "/api/v1/status", &app.token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["test_output"]["enabled"], false);
+
+    // 停止直後は`Stopped`なので再有効化は前提条件を満たさず拒否される。
+    let (status, body) = post_test_output(&app.router, &app.token, "enable").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "test_output_not_available");
+
+    let baseline = live.snapshot().await.len();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let after_stop = live.snapshot().await.split_off(baseline);
+    assert!(
+        after_stop.is_empty(),
+        "no further test-output publish should happen after the collection stops: {after_stop:?}"
     );
 }
 

@@ -132,6 +132,7 @@ use crate::mqtt::MqttPublisher;
 use crate::rest::{api_router_with_controller, audited_credential_verifier};
 use crate::settings::SettingsService;
 use crate::subscribe_core::EVAL_TICK_MS;
+use crate::test_output::TestOutputControl;
 use crate::users::UsersService;
 use crate::write_audit::WriteAuditService;
 use crate::write_control::{load_persisted_enabled, WriteControl};
@@ -392,9 +393,14 @@ impl HubRuntime {
                 false
             });
         let write_control = Arc::new(WriteControl::new(write_was_enabled_persisted));
+        // T15-3（設計 §6.3）: `write_control`と同じく非永続 - `enabled`は
+        // 常に`false`で構築する（DB/settings から読むものが無いので
+        // `WriteControl`の`was_enabled_before_restart`に相当するものも無い）。
+        let test_output = Arc::new(TestOutputControl::new());
         let controller = Arc::new(CollectionController::new(
             manager.clone(),
             write_control.clone(),
+            test_output.clone(),
         ));
         let write_audit = WriteAuditService::new(pool.clone());
 
@@ -409,6 +415,7 @@ impl HubRuntime {
         let mqtt = Arc::new(MqttPublisher::new_with_controller(
             manager.clone(),
             controller.clone(),
+            test_output.clone(),
         ));
         let mqtt_settings = settings.mqtt_config().await.unwrap_or_else(|err| {
             log_err_line(&format!(
@@ -437,7 +444,8 @@ impl HubRuntime {
             rate_limiter.clone(),
             events.clone(),
         )
-        .with_controller(controller.clone());
+        .with_controller(controller.clone())
+        .with_test_output(test_output.clone());
         let grpc_server = Arc::new(GrpcServer::new(grpc_service));
         let grpc_settings = settings.grpc_config().await.unwrap_or_else(|err| {
             log_err_line(&format!(
@@ -464,6 +472,7 @@ impl HubRuntime {
             mqtt.clone(),
             grpc_server.clone(),
             rate_limiter,
+            test_output,
         )
         .merge(static_router::<FrontendAssets>());
 

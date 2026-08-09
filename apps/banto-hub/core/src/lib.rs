@@ -68,6 +68,11 @@
 //!   モードの発行機能（rumqttc）。[`hub::CollectorManager`] を読むだけの
 //!   消費者（設計 §3.4「収集に背圧をかけない」） - `crate::stream`と同じ
 //!   立ち位置
+//! - [`test_output`]: T15-3（docs/banto-hub-desktop-plan.md §6.3）。現在の
+//!   収集 run コンテキストにのみ opt-in する「テスト出力」フラグ
+//!   （[`write_control::WriteControl`]と同型・非永続）。`crate::mqtt`の
+//!   専用 test トピック・`crate::grpc`の`StreamValues(test_output=true)`
+//!   がこれを読む
 //! - [`runtime`]: T14-1（docs/banto-hub-t14-design.md §3「D1」）。
 //!   composition root（[`runtime::HubRuntime::start`]/
 //!   [`runtime::RunningHub::shutdown`]）- DB初期化〜各サービス構築〜
@@ -106,6 +111,7 @@ pub mod runtime;
 pub mod settings;
 pub mod stream;
 pub mod subscribe_core;
+pub mod test_output;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod users;
