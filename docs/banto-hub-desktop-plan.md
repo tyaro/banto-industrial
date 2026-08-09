@@ -1,12 +1,20 @@
 # banto-hub アプリ／サービス運転計画（T14〜）
 
 作成日: 2026-08-09
-状態: **計画確定。T14・T15 完了。T16 詳細設計は [banto-hub-t16-design.md](banto-hub-t16-design.md)（P1〜P3 承認済み）。T16-0（薄いシェル `banto-hub-shell`）・T16-1（トレイ状態表示）マージ済み。T16-2 は T17（サービス管理・profile・mutex）依存のため後回し。進行中: T18-1（タグ登録 UI/UX の正しさ修正）。§16.4 の `optNum` null 取りこぼしと §9 TAG-P0-1 本体（連続登録 `count.trim()` クラッシュ）はロジック側を修正済み。**2026-08-09（本 PR）: §16.3「banto-hub の Playwright/DOM テスト基盤を T18-1 へ前倒し」を実施し、`e2e/banto-hub.playwright.config.ts`（`pnpm e2e:banto-hub`）を新設。TAG-P0-1 の残受け入れ条件（実 DOM からの点数変更テスト）を `e2e/tests-banto-hub/banto-hub-tags-continuous.spec.ts` で満たし、DOM/E2E 側も含めて TAG-P0-1 は受け入れ条件を全て満たした（closed）。** TAG-P0-2・TAG-P0-3 は未着手。
+状態: **計画確定。T14・T15 完了。T16 詳細設計は [banto-hub-t16-design.md](banto-hub-t16-design.md)（P1〜P3 承認済み）。T16-0（薄いシェル `banto-hub-shell`）・T16-1（トレイ状態表示）マージ済み。T16-2 は T17（サービス管理・profile・mutex）依存のため後回し。進行中: T18-1（タグ登録 UI/UX の正しさ修正）。§16.4 の `optNum` null 取りこぼしと §9 TAG-P0-1 本体（連続登録 `count.trim()` クラッシュ）はロジック側を修正済み。**2026-08-09（本 PR）: §16.3「banto-hub の Playwright/DOM テスト基盤を T18-1 へ前倒し」を実施し、`e2e/banto-hub.playwright.config.ts`（`pnpm e2e:banto-hub`）を新設。TAG-P0-1 の残受け入れ条件（実 DOM からの点数変更テスト）を `e2e/tests-banto-hub/banto-hub-tags-continuous.spec.ts` で満たし、DOM/E2E 側も含めて TAG-P0-1 は受け入れ条件を全て満たした（closed）。** 2026-08-09（本 PR、
+`cursor/t18-1-form-dirty-e3cb`）: §9.4 TAG-UX-C のうち dirty 追跡と破棄確認
+を実装（詳細は §9.4 TAG-UX-C の実装メモ）。TAG-UX-C の残り（`<form>` 化、
+revision/ETag、削除前参照影響、初期読込状態の区別）は未着手。TAG-P0-2・
+TAG-P0-3 は未着手。
 最終検証日(コード照合): 2026-08-09
 基準コミット: `22c8c02`（main、PR #103 `optNum` 修正マージ後）。T18-1 は本 PR
 （`apps/banto-hub/src/lib/banto/continuousRegistration.ts` の
 `buildContinuousParams` 切り出しによる `count.trim()` クラッシュ修正 +
-banto-hub 用 Playwright/DOM e2e 基盤の新設）で続行。
+banto-hub 用 Playwright/DOM e2e 基盤の新設）で続行し、続く
+`cursor/t18-1-form-dirty-e3cb` で TAG-UX-C の dirty 追跡・破棄確認
+（create/edit/連続登録/CSVインポート Drawer、`formDirty.ts`、
+`Drawer.svelte` の `onRequestClose`、`banto-hub-tags-dirty-confirm.spec.ts`）
+を追加。
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [banto-hub-t16-design.md](banto-hub-t16-design.md)、
@@ -656,6 +664,37 @@ UX-5 の決定を UI のボタン非表示だけで実装しない。アプリ�
 - 削除前に演算タグ等の参照影響と完全な外部名を表示する。
 - 初期読込失敗、0件、検索結果0件、再読込中、stale 一覧を区別し、画面内に
   再試行を置く。
+
+> **2026-08-09 一部実装（T18-1、`cursor/t18-1-form-dirty-e3cb`）: dirty
+> 追跡と破棄確認、および busy 中の閉じる操作の抑止を実装済み。**
+> `apps/banto-hub/src/lib/banto/formDirty.ts`（`isFormDirty` -
+> `JSON.stringify` 比較、単体テスト `formDirty.test.ts`）を新設し、
+> `Drawer.svelte` に `onRequestClose?: () => boolean` フックを追加した
+> （Esc・オーバーレイクリック・`×` はすべてこのフック経由。`false` を
+> 返せば `onclose` は呼ばれず開いたまま。未指定時は従来どおり即
+> close で後方互換 - 呼び出し元は現状 `tags/+page.svelte` のみ）。
+> `tags/+page.svelte` は create/edit/連続登録/CSVインポートの各 Drawer に
+> ついて開いた時点のスナップショット（`*Baseline`）を保持し、
+> `confirmDiscardIfNeeded()` が dirty なら `window.confirm` で破棄確認
+> （確認文言は既存 `handleDelete` と同方式）する。この関数を
+> Drawer の `onRequestClose`・別タグ行選択（`selectTag`）・他 Drawer を
+> 開く操作（`openCreateDrawer` 等）・画面遷移（`beforeNavigate`）の
+> すべてから共通で呼ぶことで「同じ破棄確認」を実現している。
+> `creating`/`saving`/`validating`/`applyingContinuous`/`csvValidating`/
+> `csvApplying` のいずれかが真の間は `confirmDiscardIfNeeded()` が
+> 無条件に `false` を返し、確認すら出さず閉じる操作を止める（busy 中は
+> 閉じられない）。実 DOM 受け入れは
+> `e2e/tests-banto-hub/banto-hub-tags-dirty-confirm.spec.ts`
+> （`pnpm e2e:banto-hub`）。
+>
+> **未着手のまま残っている部分**: create/edit の `<form>` 化・Enter
+> 送信・クライアント軽量検証（1点目）、revision/ETag による後勝ち防止・
+> 差分表示（4点目）、削除前の参照影響・完全外部名表示（5点目）、
+> 初期読込失敗/0件/検索結果0件/再読込中/stale 一覧の区別（6点目）。
+> 受け入れ条件のうち「ボタン連打や保存／削除競合でも mutation は1回だけ
+> 実行される」「他セッション更新を黙って上書きしない」もこの PR の範囲外
+> （busy 中の閉じる抑止はボタン自体の `disabled` 属性に既存で依存して
+> おり、mutation の多重実行そのものを防ぐ仕組みは未実装）。
 
 受け入れ条件:
 

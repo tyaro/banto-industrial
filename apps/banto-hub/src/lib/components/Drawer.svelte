@@ -20,6 +20,16 @@
 		/** オーバーレイクリックで閉じるか。既定 true。 */
 		closeOnOverlayClick?: boolean;
 		onclose?: () => void;
+		/**
+		 * T18-1（TAG-UX-C 一部、docs/banto-hub-desktop-plan.md §9.4）:
+		 * Esc・オーバーレイクリック・`×` のいずれで閉じようとした場合も
+		 * 必ずこのフックを経由させ、戻り値が `true`（＝閉じてよい）の
+		 * ときだけ `onclose` を呼ぶ。`false` を返せば `onclose` は呼ばれず
+		 * Drawer は開いたまま — dirty フォームの破棄確認や busy 中の
+		 * クローズ抑止を呼び出し側（`tags/+page.svelte` 等）に委ねる。
+		 * 未指定時は従来どおり即 `onclose`（後方互換）。
+		 */
+		onRequestClose?: () => boolean;
 		children?: Snippet;
 	}
 
@@ -29,13 +39,20 @@
 		width = '480px',
 		closeOnOverlayClick = true,
 		onclose,
+		onRequestClose,
 		children
 	}: Props = $props();
+
+	/** `onRequestClose` 経由でクローズ可否を判定し、許可された場合だけ `onclose` を呼ぶ。 */
+	function requestClose(): void {
+		if (onRequestClose && !onRequestClose()) return;
+		onclose?.();
+	}
 
 	function handleWindowKeydown(event: KeyboardEvent): void {
 		if (open && event.key === 'Escape') {
 			event.preventDefault();
-			onclose?.();
+			requestClose();
 		}
 	}
 
@@ -44,7 +61,7 @@
 	// `stopPropagation` の click ハンドラを付けずに済むので、a11y 的に
 	// クリックハンドラを持つ非インタラクティブ要素が増えない。
 	function handleOverlayClick(event: MouseEvent): void {
-		if (closeOnOverlayClick && event.target === event.currentTarget) onclose?.();
+		if (closeOnOverlayClick && event.target === event.currentTarget) requestClose();
 	}
 
 	/** 開いた直後、パネル内の最初のフォーカス可能要素へフォーカスする。 */
@@ -76,9 +93,7 @@
 		>
 			<div class="drawer-header">
 				{#if title}<h3>{title}</h3>{/if}
-				<button type="button" class="close" onclick={() => onclose?.()} aria-label="閉じる">
-					×
-				</button>
+				<button type="button" class="close" onclick={requestClose} aria-label="閉じる"> × </button>
 			</div>
 			<div class="drawer-body">
 				{@render children?.()}
