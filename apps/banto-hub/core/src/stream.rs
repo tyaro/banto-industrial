@@ -94,6 +94,7 @@ use tokio::time::MissedTickBehavior;
 use banto_collect::CollectEvent;
 
 use crate::api_keys::ApiKeyContext;
+use crate::controller::{CollectionController, RunMode};
 use crate::hub::{quality_str, CollectorManager};
 use crate::rest::TagSpaceState;
 use crate::subscribe_core::{
@@ -133,6 +134,7 @@ pub(crate) async fn ws_upgrade(
     ctx: Option<Extension<ApiKeyContext>>,
 ) -> Response {
     let manager = state.manager;
+    let controller = state.controller;
     let scope = ctx.map(|Extension(ctx)| ctx);
     // T10（判断の記録、2026-08-07、`rest.rs::extract_ws_protocol_token` の
     // doc comment も参照）: `.protocols(["bearer"])` は**選択**であって
@@ -155,12 +157,13 @@ pub(crate) async fn ws_upgrade(
     // `Sec-WebSocket-Protocol` 認証を使う全クライアント（ブラウザ・この
     // テストスイート）でハンドシェイクが一貫して成功するようにする。
     ws.protocols(["bearer"])
-        .on_upgrade(move |socket| handle_socket(socket, manager, scope))
+        .on_upgrade(move |socket| handle_socket(socket, manager, controller, scope))
 }
 
 async fn handle_socket(
     socket: WebSocket,
     manager: Arc<CollectorManager>,
+    controller: Arc<CollectionController>,
     scope: Option<ApiKeyContext>,
 ) {
     let (sink, mut incoming) = socket.split();
@@ -171,6 +174,8 @@ async fn handle_socket(
     let mut events = manager.subscribe_events();
     let mut revision_rx = manager.subscribe_revision();
     let mut subscriptions: HashMap<i64, Subscription> = HashMap::new();
+    let external = scope.is_some();
+    let mut runtime_rx = external.then(|| controller.subscribe_status());
 
     let mut tick = tokio::time::interval(Duration::from_millis(EVAL_TICK_MS as u64));
     // Delay（Skip 相当）: タスクが一時的に詰まっても、詰まった分をまとめて
@@ -184,7 +189,16 @@ async fn handle_socket(
         let should_continue = tokio::select! {
             msg = incoming.next() => match msg {
                 Some(Ok(Message::Text(text))) => {
-                    handle_text(&text, &manager, &mut subscriptions, &data_tx, &close_tx, scope.as_ref()).await
+                    handle_text(
+                        &text,
+                        &manager,
+                        &controller,
+                        &mut subscriptions,
+                        &data_tx,
+                        &close_tx,
+                        scope.as_ref(),
+                    )
+                    .await
                 }
                 Some(Ok(Message::Close(_))) => false,
                 Some(Ok(Message::Binary(_))) => {
@@ -196,7 +210,16 @@ async fn handle_socket(
                 Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => true,
                 Some(Err(_)) | None => false,
             },
-            _ = tick.tick() => evaluate(&manager, &mut subscriptions, &data_tx, &close_tx, scope.as_ref()),
+            _ = tick.tick() => {
+                if external
+                    && !subscriptions.is_empty()
+                    && controller.status().mode == RunMode::AllSimulation
+                {
+                    false
+                } else {
+                    evaluate(&manager, &mut subscriptions, &data_tx, &close_tx, scope.as_ref())
+                }
+            },
             event = events.recv() => match event {
                 Ok(event) => send_event(&event, &manager.pool(), &data_tx, &close_tx).await,
                 // broadcast の遅延受信者はスキップするだけ（設計 §5.2/§3.5
@@ -209,6 +232,20 @@ async fn handle_socket(
             changed = revision_rx.changed() => match changed {
                 Ok(()) => send_config_changed(*revision_rx.borrow(), &data_tx, &close_tx),
                 Err(_) => false,
+            },
+            changed = async {
+                match runtime_rx.as_mut() {
+                    Some(receiver) => receiver.changed().await.map_err(|_| ()),
+                    None => std::future::pending::<Result<(), ()>>().await,
+                }
+            } => match changed {
+                Ok(())
+                    if external
+                        && !subscriptions.is_empty()
+                        && controller.status().mode == RunMode::AllSimulation =>
+                    false,
+                Ok(()) => true,
+                Err(()) => false,
             },
         };
         if !should_continue {
@@ -289,6 +326,7 @@ struct UnsubscribeWire {
 async fn handle_text(
     text: &str,
     manager: &CollectorManager,
+    controller: &CollectionController,
     subscriptions: &mut HashMap<i64, Subscription>,
     data_tx: &mpsc::Sender<Message>,
     close_tx: &mpsc::Sender<CloseFrame>,
@@ -312,7 +350,16 @@ async fn handle_text(
     match op {
         "subscribe" => match serde_json::from_value::<SubscribeWire>(value) {
             Ok(msg) => {
-                handle_subscribe(msg, manager, subscriptions, data_tx, close_tx, scope).await
+                handle_subscribe(
+                    msg,
+                    manager,
+                    controller,
+                    subscriptions,
+                    data_tx,
+                    close_tx,
+                    scope,
+                )
+                .await
             }
             Err(err) => send_error(
                 id_hint,
@@ -353,6 +400,7 @@ async fn handle_text(
 async fn handle_subscribe(
     msg: SubscribeWire,
     manager: &CollectorManager,
+    controller: &CollectionController,
     subscriptions: &mut HashMap<i64, Subscription>,
     data_tx: &mpsc::Sender<Message>,
     close_tx: &mpsc::Sender<CloseFrame>,
@@ -363,6 +411,16 @@ async fn handle_subscribe(
             Some(msg.id),
             "invalid_request",
             "tags が空です".to_string(),
+            data_tx,
+            close_tx,
+        );
+    }
+
+    if scope.is_some() && controller.status().mode == RunMode::AllSimulation {
+        return send_error(
+            Some(msg.id),
+            "simulation_output_disabled",
+            "全PLCシミュレーション中は通常WS出力を利用できません".to_string(),
             data_tx,
             close_tx,
         );
