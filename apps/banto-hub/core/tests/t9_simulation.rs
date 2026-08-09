@@ -518,6 +518,14 @@ async fn toggling_simulation_repoints_the_broker_session_without_leaking_session
 
     // Confirm the new source is actually live (ramp), not a one-off
     // different-but-frozen value.
+    //
+    // Not a fixed sleep(300ms)+assert_ne: the ramp period is 100ms, but on a
+    // loaded CI runner (observed flaky on Windows CI) the collector's period
+    // + scheduling jitter can exceed 300ms before a second good sample is
+    // produced. Poll with wait_until (same pattern as the stream.rs
+    // bound-wait fixes) until a good-quality value different from the first
+    // read shows up, bounded by a generous timeout; the failure message is
+    // unchanged.
     let (status, first) = get_json(
         &app.router,
         "/api/v1/values/line1.fast.t1",
@@ -525,16 +533,17 @@ async fn toggling_simulation_repoints_the_broker_session_without_leaking_session
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let (status, second) = get_json(
-        &app.router,
-        "/api/v1/values/line1.fast.t1",
-        &app.admin_token,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_ne!(
-        first["v"], second["v"],
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            let (status, json) = get_json(
+                &app.router,
+                "/api/v1/values/line1.fast.t1",
+                &app.admin_token,
+            )
+            .await;
+            status == StatusCode::OK && json["q"] == "good" && json["v"] != first["v"]
+        })
+        .await,
         "the hub's own simulator should keep ramping"
     );
 
