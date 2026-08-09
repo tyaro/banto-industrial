@@ -1,9 +1,9 @@
 # banto-hub アプリ／サービス運転計画（T14〜）
 
 作成日: 2026-08-09
-状態: **計画確定（運転 UI/UX 10項目、タグ登録 UI/UX 6項目を 2026-08-09 決定）**
+状態: **計画確定。T14 完了、T15 は T15-1（全体 SIM オーバーライド）と外部出力安全化・T15-2（SIM 対応範囲プリフライト）まで実装済み。T15 残件はテスト出力 namespace と write peek。次は T15 残件または T16。**
 最終検証日(コード照合): 2026-08-09
-基準コミット: `cc255b4`
+基準コミット: `8266f59`（main、PR #95 マージ後。本ブランチで T15-2 を追加）
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [ux-plan.md](ux-plan.md)、
@@ -1058,6 +1058,16 @@ fallback を開いた時の初期フォーカスは見出し、失敗後はエ�
   `retain=false` とする。停止／終了／切替／サービス再起動後に必ず無効へ戻る。
 - SIM 切替で既存 MQTT / gRPC stream を能動終了し、SIM／SIM 依存値への書き込みを
   fail-closed で拒否する。
+
+実装メモ(T15-2、2026-08-09): 「未対応タグを開始前に人間可読な形で表示する」は
+`crates/banto-collect/src/simulation.rs`の`classify_plc_tag`（Modbus/SLMP の
+アドレス・データ型を現行シミュレータの値生成ウィンドウ`RAMP_ADDRESS_COUNT`と
+照合）+ `CollectorManager::simulation_coverage_report`
+（`apps/banto-hub/core/src/hub.rs`）+
+`GET /api/collection/simulation-coverage`（`apps/banto-hub/core/src/rest.rs`、
+admin 限定）として実装済み。プランどおり表示専用で、`start(AllSimulation)`自体は
+未対応タグの有無に関わらずブロックしない。T15 残件（本スライス対象外）は
+テスト出力 namespace 分離と HubSessions の write peek（no-spawn）。
 
 ### T16: デスクトップシェルとタスクトレイ
 
