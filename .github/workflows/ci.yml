@@ -89,9 +89,12 @@ jobs:
     name: E2E (Playwright smoke)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # Known gap: this only covers apps/chronogazer. apps/banto-hub has no
-    # Playwright e2e config yet (docs/t5-handoff.md §2) - add a parallel job
-    # here once one exists.
+    # T18-1 (docs/banto-hub-desktop-plan.md §16.3): apps/banto-hub now has
+    # its own Playwright config (e2e/banto-hub.playwright.config.ts,
+    # `pnpm e2e:banto-hub`) covering first-run setup/login/logout and the
+    # TAG-P0-1 continuous-registration DOM behavior - it runs in this same
+    # job, after the chronogazer suite. Known gap: apps/relay-wright still
+    # has no Playwright e2e config.
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -108,9 +111,13 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # Produces apps/chronogazer/build - the static SvelteKit output
-      # `--features embed-ui` (below) embeds into the server binary
-      # (apps/chronogazer/core/src/assets.rs).
+      # `pnpm build` is recursive (`pnpm --recursive --if-present build`,
+      # root package.json) so it already produces both
+      # apps/chronogazer/build AND apps/banto-hub/build - the static
+      # SvelteKit outputs each app's `--features embed-ui` binary (below)
+      # embeds (apps/chronogazer/core/src/assets.rs,
+      # apps/banto-hub/core/src/assets.rs). No separate
+      # `pnpm --filter banto-hub build` step is needed.
       - name: Build frontend
         run: pnpm build
 
@@ -125,16 +132,40 @@ jobs:
       - name: Build banto-serve (embed-ui)
         run: cargo build -p chronogazer-core --bin banto-serve --features embed-ui
 
+      # e2e/banto-hub.playwright.config.ts's webServer launches this binary
+      # directly, same reasoning - must exist before `pnpm e2e:banto-hub`
+      # below. banto-hub itself is Windows-service-oriented (§8「常駐」) but
+      # the console-mode binary this config runs is cross-platform (the
+      # Windows-only SCM code is `#[cfg(windows)]`-gated - see
+      # apps/banto-hub/core/src/bin/banto-hub.rs's doc comment), so it
+      # builds and runs fine here on ubuntu-latest.
+      - name: Build banto-hub (embed-ui)
+        run: cargo build -p banto-hub-core --bin banto-hub --features embed-ui
+
       - name: Install Playwright Chromium
         run: pnpm exec playwright install --with-deps chromium
 
-      - name: Run E2E smoke suite
+      - name: Run E2E smoke suite (chronogazer)
         run: pnpm e2e
 
-      - name: Upload Playwright report
+      # T18-1: banto-hub's own suite (first-run setup/login/logout +
+      # TAG-P0-1 continuous-registration DOM behavior) - separate step so a
+      # failure here is distinguishable from the chronogazer suite above.
+      - name: Run E2E suite (banto-hub)
+        run: pnpm e2e:banto-hub
+
+      - name: Upload Playwright report (chronogazer)
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: playwright-report
           path: e2e/playwright-report/
+          retention-days: 7
+
+      - name: Upload Playwright report (banto-hub)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report-banto-hub
+          path: e2e/playwright-report-banto-hub/
           retention-days: 7
