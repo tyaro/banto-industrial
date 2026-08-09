@@ -3203,14 +3203,74 @@ struct TagsQuery {
     group: Option<String>,
 }
 
-/// `GET /api/v1/tags` の応答: `{ "revision", "tags": [TagEntry...] }`。
+/// `GET /api/v1/tags` の応答: `{ "revision", "run_id",
+/// "collection_mode", "tags": [CatalogTagEntry...] }`。
 #[derive(Debug, Serialize, ToSchema)]
 struct CatalogResponse {
     revision: u64,
-    tags: Vec<TagEntry>,
+    run_id: Option<u64>,
+    collection_mode: String,
+    tags: Vec<CatalogTagEntry>,
 }
 
-/// `GET /api/v1/tags` - catalog: `{ "revision", "tags": [TagEntry...] }`,
+/// REST wire DTO for one catalog entry.
+///
+/// `TagEntry` remains the saved/configured catalog owned by `CollectorManager`.
+/// The runtime fields are layered here so an all-simulation run can be
+/// observed without mutating the DB-backed catalog or the shared TagMap.
+#[derive(Debug, Serialize, ToSchema)]
+struct CatalogTagEntry {
+    #[serde(flatten)]
+    entry: TagEntry,
+    configured_simulation: bool,
+    effective_simulation: bool,
+    value_source: String,
+}
+
+impl CatalogTagEntry {
+    fn from_runtime(entry: &TagEntry, runtime: &CollectionStatus) -> Self {
+        Self {
+            entry: entry.clone(),
+            configured_simulation: entry.simulation,
+            effective_simulation: effective_simulation_for_tag(entry, runtime),
+            value_source: value_source_for_tag(entry, runtime).to_string(),
+        }
+    }
+}
+
+fn effective_simulation_for_connection(
+    protocol: &str,
+    enabled: bool,
+    configured_simulation: bool,
+    runtime: &CollectionStatus,
+) -> bool {
+    enabled
+        && runtime.state == CollectionState::Running
+        && matches!(protocol, "modbus-tcp" | "slmp")
+        && (configured_simulation || runtime.mode == RunMode::AllSimulation)
+}
+
+fn effective_simulation_for_tag(entry: &TagEntry, runtime: &CollectionStatus) -> bool {
+    entry.tag_kind == banto_tags::PLC_TAG_KIND
+        && entry.enabled
+        && runtime.state == CollectionState::Running
+        && (entry.simulation || runtime.mode == RunMode::AllSimulation)
+}
+
+fn value_source_for_tag(entry: &TagEntry, runtime: &CollectionStatus) -> &'static str {
+    match entry.tag_kind.as_str() {
+        banto_tags::PLC_TAG_KIND if effective_simulation_for_tag(entry, runtime) => "simulation",
+        banto_tags::PLC_TAG_KIND => "real",
+        banto_tags::COMPUTED_TAG_KIND => "derived_simulation",
+        banto_tags::INTERNAL_TAG_KIND => "internal",
+        // Tag registration validates tag_kind, but keep the wire contract
+        // fail-safe if a future kind is introduced without this DTO update.
+        _ => "internal",
+    }
+}
+
+/// `GET /api/v1/tags` - catalog: `{ "revision", "run_id",
+/// "collection_mode", "tags": [CatalogTagEntry...] }`,
 /// optionally filtered by `?connection=`/`?group=` (matched against the
 /// entry's connection/group *name*, design §5.1's route table).
 #[utoipa::path(
@@ -3229,7 +3289,8 @@ async fn v1_tags(
 ) -> Json<CatalogResponse> {
     let map = state.manager.tag_map();
     let revision = state.manager.revision();
-    let tags: Vec<TagEntry> = map
+    let runtime = state.controller.status();
+    let tags: Vec<CatalogTagEntry> = map
         .iter()
         .filter(|entry| {
             query
@@ -3245,9 +3306,14 @@ async fn v1_tags(
                 .map(|g| g == entry.group)
                 .unwrap_or(true)
         })
-        .cloned()
+        .map(|entry| CatalogTagEntry::from_runtime(entry, &runtime))
         .collect();
-    Json(CatalogResponse { revision, tags })
+    Json(CatalogResponse {
+        revision,
+        run_id: runtime.run_id,
+        collection_mode: runtime.mode.as_str().to_string(),
+        tags,
+    })
 }
 
 /// One `/api/v1/values*` entry's wire shape (design §5.1's route table:
@@ -3258,6 +3324,7 @@ struct ValueEntry {
     v: Option<f64>,
     q: String,
     t: i64,
+    value_source: String,
 }
 
 /// Thin wire-formatting wrapper over [`crate::hub::read_current`] (see its
@@ -3271,6 +3338,7 @@ fn value_entry(
     current: Option<&banto_collect::CurrentValuesHandle>,
     server_store: &crate::computed::ServerTagStore,
     now_ms: i64,
+    runtime: &CollectionStatus,
 ) -> ValueEntry {
     let (v, q, t) = crate::hub::read_current(entry, current, server_store, now_ms);
     ValueEntry {
@@ -3278,6 +3346,7 @@ fn value_entry(
         v,
         q: crate::hub::quality_str(q).to_string(),
         t,
+        value_source: value_source_for_tag(entry, runtime).to_string(),
     }
 }
 
@@ -3291,7 +3360,36 @@ struct ValuesQuery {
 struct ValuesResponse {
     revision: u64,
     t: i64,
+    run_id: Option<u64>,
+    collection_mode: String,
     values: Vec<ValueEntry>,
+}
+
+/// Single-value response. The bulk response carries the same run metadata at
+/// the response level, while each value carries its own source classification.
+#[derive(Debug, Serialize, ToSchema)]
+struct SingleValueResponse {
+    tag: String,
+    v: Option<f64>,
+    q: String,
+    t: i64,
+    run_id: Option<u64>,
+    collection_mode: String,
+    value_source: String,
+}
+
+impl SingleValueResponse {
+    fn from_value(value: ValueEntry, runtime: &CollectionStatus) -> Self {
+        Self {
+            tag: value.tag,
+            v: value.v,
+            q: value.q,
+            t: value.t,
+            run_id: runtime.run_id,
+            collection_mode: runtime.mode.as_str().to_string(),
+            value_source: value.value_source,
+        }
+    }
 }
 
 /// `GET /api/v1/values` - full or partial (`?tags=a,b,c`) snapshot.
@@ -3331,6 +3429,7 @@ async fn v1_values(
 ) -> Response {
     let map = state.manager.tag_map();
     let revision = state.manager.revision();
+    let runtime = state.controller.status();
     let now_ms = state.manager.clock().now_ms();
     let current = state.manager.current_values();
     let server_store = state.manager.server_store();
@@ -3384,12 +3483,23 @@ async fn v1_values(
     let values: Vec<ValueEntry> = names
         .iter()
         .filter_map(|name| map.get(name).map(|entry| (name, entry)))
-        .map(|(name, entry)| value_entry(name, entry, current.as_ref(), &server_store, now_ms))
+        .map(|(name, entry)| {
+            value_entry(
+                name,
+                entry,
+                current.as_ref(),
+                &server_store,
+                now_ms,
+                &runtime,
+            )
+        })
         .collect();
 
     Json(ValuesResponse {
         revision,
         t: now_ms,
+        run_id: runtime.run_id,
+        collection_mode: runtime.mode.as_str().to_string(),
         values,
     })
     .into_response()
@@ -3411,7 +3521,7 @@ async fn v1_values(
     path = "/api/v1/values/{tag}",
     params(("tag" = String, Path, description = "外部名 {connection}.{group}.{tag}")),
     responses(
-        (status = 200, description = "単一タグの現在値", body = ValueEntry),
+        (status = 200, description = "単一タグの現在値", body = SingleValueResponse),
         (status = 403, description = "per-tag read スコープ外(API キー、H10 ③)"),
         (status = 404, description = "catalog に存在しない外部名"),
     ),
@@ -3436,14 +3546,19 @@ async fn v1_value_single(
         }
     }
     let now_ms = state.manager.clock().now_ms();
+    let runtime = state.controller.status();
     let current = state.manager.current_values();
     let server_store = state.manager.server_store();
-    Json(value_entry(
-        &tag,
-        entry,
-        current.as_ref(),
-        &server_store,
-        now_ms,
+    Json(SingleValueResponse::from_value(
+        value_entry(
+            &tag,
+            entry,
+            current.as_ref(),
+            &server_store,
+            now_ms,
+            &runtime,
+        ),
+        &runtime,
     ))
     .into_response()
 }
@@ -3459,6 +3574,8 @@ struct ConnectionStatusEntry {
     /// lets a monitoring client (or the admin UI) flag a connection whose
     /// live values are synthetic, not from a real PLC.
     simulation: bool,
+    configured_simulation: bool,
+    effective_simulation: bool,
 }
 
 /// `GET /api/v1/status` の `mqtt`（T3、設計実装指示「`/api/v1/status` に
@@ -3614,6 +3731,13 @@ async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResp
                 status: status_str.to_string(),
                 attempt,
                 simulation: conn.simulation,
+                configured_simulation: conn.simulation,
+                effective_simulation: effective_simulation_for_connection(
+                    &conn.protocol,
+                    conn.enabled,
+                    conn.simulation,
+                    &runtime,
+                ),
             }
         })
         .collect();
@@ -3967,7 +4091,9 @@ async fn v1_write_value(
     components(schemas(
         TagEntry,
         CatalogResponse,
+        CatalogTagEntry,
         ValueEntry,
+        SingleValueResponse,
         ValuesResponse,
         ConnectionStatusEntry,
         MqttStatusEntry,
@@ -5476,6 +5602,169 @@ mod tests {
         // 明示 ?tags= でも全件通る(スコープ外という概念が無い)。
         let (status, _) = v1_get(&env.router, key, "/api/v1/values?tags=line2.slow.press01").await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    fn metadata_test_tag(tag_kind: &str, simulation: bool, enabled: bool) -> TagEntry {
+        TagEntry {
+            external_name: "line1.fast.temp".to_string(),
+            tag_key: "tag:3".to_string(),
+            ids: (1, 2, 3),
+            connection: "line1".to_string(),
+            group: "fast".to_string(),
+            name: "temp".to_string(),
+            address: "40001".to_string(),
+            data_type: "f32".to_string(),
+            unit: Some("C".to_string()),
+            decimals: 1,
+            period_ms: 100,
+            enabled,
+            writable: false,
+            tag_kind: tag_kind.to_string(),
+            expression: (tag_kind == banto_tags::COMPUTED_TAG_KIND)
+                .then(|| "line1.fast.temp + 1".to_string()),
+            retain: false,
+            simulation,
+        }
+    }
+
+    fn metadata_test_status(state: CollectionState, mode: RunMode) -> CollectionStatus {
+        CollectionStatus {
+            state,
+            mode,
+            run_id: (state == CollectionState::Running).then_some(9),
+            last_error: None,
+            configured_revision: 1,
+            running_revision: 1,
+        }
+    }
+
+    #[test]
+    fn rest_catalog_dto_separates_configured_and_effective_simulation() {
+        let tag = metadata_test_tag(banto_tags::PLC_TAG_KIND, false, true);
+        let all_simulation = metadata_test_status(CollectionState::Running, RunMode::AllSimulation);
+        let configured = metadata_test_status(CollectionState::Running, RunMode::Configured);
+        let stopped = metadata_test_status(CollectionState::Stopped, RunMode::AllSimulation);
+
+        let all_simulation_json =
+            serde_json::to_value(CatalogTagEntry::from_runtime(&tag, &all_simulation))
+                .expect("catalog DTO serializes");
+        assert_eq!(all_simulation_json["simulation"], false);
+        assert_eq!(all_simulation_json["configured_simulation"], false);
+        assert_eq!(all_simulation_json["effective_simulation"], true);
+        assert_eq!(all_simulation_json["value_source"], "simulation");
+
+        let all_simulation_catalog = serde_json::to_value(CatalogResponse {
+            revision: 4,
+            run_id: all_simulation.run_id,
+            collection_mode: all_simulation.mode.as_str().to_string(),
+            tags: vec![CatalogTagEntry::from_runtime(&tag, &all_simulation)],
+        })
+        .expect("catalog response serializes");
+        assert_eq!(all_simulation_catalog["run_id"], 9);
+        assert_eq!(all_simulation_catalog["collection_mode"], "all_simulation");
+        assert_eq!(
+            all_simulation_catalog["tags"][0]["value_source"],
+            "simulation"
+        );
+
+        let configured_catalog = serde_json::to_value(CatalogResponse {
+            revision: 4,
+            run_id: configured.run_id,
+            collection_mode: configured.mode.as_str().to_string(),
+            tags: vec![CatalogTagEntry::from_runtime(&tag, &configured)],
+        })
+        .expect("configured catalog response serializes");
+        assert_eq!(configured_catalog["run_id"], 9);
+        assert_eq!(configured_catalog["collection_mode"], "configured");
+        assert_eq!(configured_catalog["tags"][0]["value_source"], "real");
+
+        assert!(!CatalogTagEntry::from_runtime(&tag, &configured).effective_simulation);
+        assert!(!CatalogTagEntry::from_runtime(&tag, &stopped).effective_simulation);
+        assert_eq!(
+            CatalogTagEntry::from_runtime(&tag, &configured).value_source,
+            "real"
+        );
+        assert_eq!(
+            CatalogTagEntry::from_runtime(&tag, &stopped).value_source,
+            "real"
+        );
+        let stopped_catalog = serde_json::to_value(CatalogResponse {
+            revision: 4,
+            run_id: stopped.run_id,
+            collection_mode: stopped.mode.as_str().to_string(),
+            tags: vec![CatalogTagEntry::from_runtime(&tag, &stopped)],
+        })
+        .expect("stopped catalog response serializes");
+        assert!(stopped_catalog["run_id"].is_null());
+        assert_eq!(stopped_catalog["collection_mode"], "all_simulation");
+        assert!(
+            !tag.simulation,
+            "the shared saved catalog must stay unchanged"
+        );
+
+        let saved_simulation = metadata_test_tag(banto_tags::PLC_TAG_KIND, true, true);
+        assert!(effective_simulation_for_connection(
+            "modbus-tcp",
+            true,
+            true,
+            &configured,
+        ));
+        assert!(!effective_simulation_for_connection(
+            "modbus-tcp",
+            true,
+            true,
+            &stopped,
+        ));
+        assert!(!CatalogTagEntry::from_runtime(&saved_simulation, &stopped).effective_simulation);
+    }
+
+    #[test]
+    fn rest_value_source_uses_safe_tag_kind_classification() {
+        let all_simulation = metadata_test_status(CollectionState::Running, RunMode::AllSimulation);
+        let configured = metadata_test_status(CollectionState::Running, RunMode::Configured);
+        let plc = metadata_test_tag(banto_tags::PLC_TAG_KIND, false, true);
+        let computed = metadata_test_tag(banto_tags::COMPUTED_TAG_KIND, false, true);
+        let internal = metadata_test_tag(banto_tags::INTERNAL_TAG_KIND, false, true);
+
+        assert_eq!(value_source_for_tag(&plc, &all_simulation), "simulation");
+        assert_eq!(value_source_for_tag(&plc, &configured), "real");
+        assert_eq!(
+            value_source_for_tag(&computed, &all_simulation),
+            "derived_simulation"
+        );
+        assert_eq!(value_source_for_tag(&internal, &all_simulation), "internal");
+    }
+
+    #[test]
+    fn rest_connection_effective_simulation_returns_to_configured_value() {
+        let all_simulation = metadata_test_status(CollectionState::Running, RunMode::AllSimulation);
+        let configured = metadata_test_status(CollectionState::Running, RunMode::Configured);
+        let stopped = metadata_test_status(CollectionState::Stopped, RunMode::AllSimulation);
+
+        assert!(effective_simulation_for_connection(
+            "modbus-tcp",
+            true,
+            false,
+            &all_simulation,
+        ));
+        assert!(!effective_simulation_for_connection(
+            "modbus-tcp",
+            true,
+            false,
+            &configured,
+        ));
+        assert!(!effective_simulation_for_connection(
+            "modbus-tcp",
+            true,
+            false,
+            &stopped,
+        ));
+        assert!(!effective_simulation_for_connection(
+            "virtual",
+            true,
+            false,
+            &all_simulation,
+        ));
     }
 
     #[test]
