@@ -57,6 +57,24 @@
 //! `ensure_connection`より前にシミュレータを起動・アドレス解決する - 詳細は
 //! `SlmpSimRegistry`自身の doc comment（および同ファイルの module doc
 //! 「T9-1/T9-2 note」節）を参照。
+//!
+//! ## T15-2: all-simulation 開始前のカバレッジプリフライト(docs/banto-hub-desktop-plan.md §9.7)
+//!
+//! [`classify_plc_tag`]は、1タグの(protocol, address, data_type)がこの
+//! モジュールの値生成ウィンドウ([`RAMP_ADDRESS_COUNT`]個のアドレス/デバイス
+//! 番号、上の「値生成」節参照)に収まるかを判定する純粋関数 -
+//! `apps/banto-hub/core/src/hub.rs`の`CollectorManager::simulation_coverage_report`
+//! (T15-2)がカタログの全タグに対して呼び、all-simulation
+//! (`RunMode::AllSimulation`)開始前に「対応 N タグ / 未対応 M タグ」を運用者
+//! へ提示する(プラン §9.7 のモックアップどおり)。ウィンドウ外のタグは
+//! シミュレータ配下でも常に Good/0 で変化しないままなので、それを事前に
+//! 一覧できることが目的 - **`start(AllSimulation)`自体はこの T15-2 では
+//! 一切ブロックしない**(プランの決定どおり、表示のみ)。
+//!
+//! アドレスのパースは`crate::config::build_request`が構成ビルド時に使うのと
+//! 同じ`banto_plc::Address::{parse,parse_slmp}`を再利用する - カバレッジ
+//! 判定が構成ビルドのアドレス解釈からズレて「未対応と表示されたのに実際は
+//! 収集できている(またはその逆)」という不整合を防ぐため。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -64,7 +82,7 @@ use std::time::Duration;
 
 use banto_plc::modbus::simulator::Simulator as ModbusSimulator;
 use banto_plc::slmp::simulator::Simulator as SlmpSimulator;
-use banto_plc::SlmpDevice;
+use banto_plc::{Address, DataType, SlmpDevice};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -74,7 +92,9 @@ use crate::config::Protocol;
 pub(crate) const RAMP_PERIOD_MS: u64 = 100;
 
 /// ランプ波/トグルの対象アドレス数(モジュール doc comment「値生成」参照)。
-const RAMP_ADDRESS_COUNT: u16 = 16;
+/// T15-2: [`classify_plc_tag`]がこのウィンドウ判定に使うため`pub`
+/// (`apps/banto-hub/core/src/hub.rs`は数値を再計算せずこの定数を直接参照する)。
+pub const RAMP_ADDRESS_COUNT: u16 = 16;
 
 /// 起動中の1シミュレータインスタンス - 対応するランプ波生成タスクとその
 /// 停止チャネルを束ねる。`crate::collector::Collector` が接続キー
@@ -212,6 +232,316 @@ async fn slmp_ramp_task(sim: Arc<SlmpSimulator>, mut stop_rx: watch::Receiver<bo
                     sim.set_bit(SlmpDevice::M, offset, word.is_multiple_of(2));
                 }
             }
+        }
+    }
+}
+
+// --- T15-2: all-simulation プリフライトのカバレッジ判定 --------------------
+
+/// [`classify_plc_tag`]の結果 - 1タグが現行シミュレータの値生成ウィンドウ
+/// (このモジュールの doc comment「T15-2」節参照)に収まるか。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SimulationCoverage {
+    /// このモジュールが起動するシミュレータが値を生成し続ける
+    /// (ランプ波/トグル) - all-simulation 下で変化する値が読める。
+    Supported,
+    /// シミュレータ配下でも常に Good/0 のまま変化しない(またはアドレス/
+    /// データ型自体の解釈に失敗した) - `reason`は運用者に見せる日本語の
+    /// 理由文。
+    Unsupported { reason: String },
+}
+
+fn unsupported(reason: impl Into<String>) -> SimulationCoverage {
+    SimulationCoverage::Unsupported {
+        reason: reason.into(),
+    }
+}
+
+/// `bit`指定アドレス(`"40001.3"`/`"D100.5"`、T8 notation)は`data_type=bit`
+/// のタグでのみ意味を持つ - `crate::config::build_request`が構成ビルド時に
+/// 課す規則と同一(そちらは`CollectError::Config`で構成ビルドそのものを
+/// 拒否するので、通常はこの分岐に到達するタグ自体が収集構成に存在しないが、
+/// カタログは構成ビルドの成否と無関係に全タグを載せるため、防御的にここでも
+/// 判定する)。
+fn is_bit_mismatch(bit: Option<u8>, data_type: DataType) -> bool {
+    bit.is_some() && data_type != DataType::Bit
+}
+
+/// 1タグの(`protocol`, `address`, `data_type`)がシミュレータのカバレッジに
+/// 入るかを分類する。`protocol`は`banto_tags::PlcConnection::protocol`
+/// (`"modbus-tcp"` / `"slmp"`)、`address`/`data_type`は`banto_tags::Tag`の
+/// 同名カラムそのもの - `apps/banto-hub/core/src/hub.rs`の
+/// `CollectorManager::simulation_coverage_report`(T15-2)がカタログの各タグ
+/// にそのまま渡す。
+///
+/// パーサーは`crate::config::build_request`と同じ`banto_plc::Address::{parse,
+/// parse_slmp}`(このモジュールの doc comment「T15-2」節参照) - 分類が構成
+/// ビルドのアドレス解釈からズレないようにするため。アドレス/データ型が
+/// 解析できない場合も(構成ビルドなら`CollectError::Config`になるところを)
+/// 「未対応」として理由文とともに報告する - プリフライトは構成ビルド前に
+/// 呼ばれることもあるため、パニックせず常に何らかの分類を返す。
+pub fn classify_plc_tag(protocol: &str, address: &str, data_type: &str) -> SimulationCoverage {
+    // S1 文字列タグ: `crate::config::build_config_from`がタグごと収集対象
+    // から外す(このモジュールの doc comment「値生成」節: 文字列タグ用の
+    // 固定文字列生成は非対応)のと同じ判定。
+    if data_type == banto_tags::STRING_DATA_TYPE {
+        return unsupported("文字列タグは現行シミュレータのランプ生成の対象外です");
+    }
+    let Some(parsed_type) = DataType::parse(data_type) else {
+        return unsupported(format!("データ型 {data_type} は未対応です"));
+    };
+
+    match protocol {
+        "modbus-tcp" => classify_modbus_tag(address, parsed_type),
+        "slmp" => classify_slmp_tag(address, parsed_type),
+        other => unsupported(format!("未対応のプロトコルです: {other}")),
+    }
+}
+
+/// [`classify_plc_tag`]の Modbus 経路。[`modbus_ramp_task`]が実際に書き込む
+/// 範囲(4テーブル全て、オフセット`0..RAMP_ADDRESS_COUNT`)と一致させる。
+fn classify_modbus_tag(address: &str, data_type: DataType) -> SimulationCoverage {
+    let parsed = match Address::parse(address) {
+        Ok(addr) => addr,
+        Err(err) => return unsupported(format!("アドレスの解析に失敗しました: {err}")),
+    };
+    // `Address::parse`は常に`ModbusRef`を返す(I2a: parse/parse_slmpは互いの
+    // 記法を受け付けない)ので`None`分岐は理論上到達しないが、`as_modbus_ref`
+    // の契約どおり網羅的に扱う。
+    let Some((area, offset, bit)) = parsed.as_modbus_ref() else {
+        return unsupported("Modbus アドレスではありません");
+    };
+    if is_bit_mismatch(bit, data_type) {
+        return unsupported(format!(
+            "ビット指定アドレスは data_type=bit のタグでのみ対応します(現在のデータ型: {data_type})"
+        ));
+    }
+    if offset < RAMP_ADDRESS_COUNT {
+        SimulationCoverage::Supported
+    } else {
+        unsupported(format!(
+            "現行シミュレータは{area}のオフセット 0..{RAMP_ADDRESS_COUNT} のみ値を生成します\
+             (このタグのオフセット: {offset})"
+        ))
+    }
+}
+
+/// [`classify_plc_tag`]の SLMP 経路。[`slmp_ramp_task`]が実際に書き込む
+/// 範囲(`D`/`M`のみ、デバイス番号`0..RAMP_ADDRESS_COUNT`)と一致させる。
+fn classify_slmp_tag(address: &str, data_type: DataType) -> SimulationCoverage {
+    let parsed = match Address::parse_slmp(address) {
+        Ok(addr) => addr,
+        Err(err) => return unsupported(format!("アドレスの解析に失敗しました: {err}")),
+    };
+    let Some((device, number, bit)) = parsed.as_slmp() else {
+        return unsupported("SLMP アドレスではありません");
+    };
+    if is_bit_mismatch(bit, data_type) {
+        return unsupported(format!(
+            "ビット指定アドレスは data_type=bit のタグでのみ対応します(現在のデータ型: {data_type})"
+        ));
+    }
+    match device {
+        SlmpDevice::D | SlmpDevice::M => {
+            if number < u32::from(RAMP_ADDRESS_COUNT) {
+                SimulationCoverage::Supported
+            } else {
+                unsupported(format!(
+                    "現行シミュレータはデバイス {} の番号 0..{RAMP_ADDRESS_COUNT} のみ値を生成します\
+                     (このタグの番号: {number})",
+                    device.mnemonic()
+                ))
+            }
+        }
+        other => unsupported(format!(
+            "デバイス {} は現行シミュレータの値生成対象外です(D/M のみ対応)",
+            other.mnemonic()
+        )),
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn modbus_holding_register_within_window_is_supported() {
+        assert_eq!(
+            classify_plc_tag("modbus-tcp", "40001", "u16"),
+            SimulationCoverage::Supported
+        );
+    }
+
+    #[test]
+    fn modbus_holding_register_at_the_last_in_window_offset_is_supported() {
+        // 40016 -> offset 15、RAMP_ADDRESS_COUNT(16)の境界(0..16の最後)。
+        assert_eq!(
+            classify_plc_tag("modbus-tcp", "40016", "u16"),
+            SimulationCoverage::Supported
+        );
+    }
+
+    #[test]
+    fn modbus_holding_register_just_past_the_window_is_unsupported() {
+        // 40017 -> offset 16、ウィンドウ外の最初の1個。
+        assert!(matches!(
+            classify_plc_tag("modbus-tcp", "40017", "u16"),
+            SimulationCoverage::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn modbus_coil_within_window_is_supported() {
+        assert_eq!(
+            classify_plc_tag("modbus-tcp", "00001", "bit"),
+            SimulationCoverage::Supported
+        );
+    }
+
+    #[test]
+    fn modbus_discrete_input_within_window_is_supported() {
+        assert_eq!(
+            classify_plc_tag("modbus-tcp", "10001", "bit"),
+            SimulationCoverage::Supported
+        );
+    }
+
+    #[test]
+    fn modbus_input_register_within_window_is_supported() {
+        assert_eq!(
+            classify_plc_tag("modbus-tcp", "30001", "u16"),
+            SimulationCoverage::Supported
+        );
+    }
+
+    #[test]
+    fn modbus_bit_in_word_within_window_and_bit_type_is_supported() {
+        // 40001.3 -> holding register offset 0、data_type=bit なので許容。
+        assert_eq!(
+            classify_plc_tag("modbus-tcp", "40001.3", "bit"),
+            SimulationCoverage::Supported
+        );
+    }
+
+    #[test]
+    fn modbus_bit_in_word_with_non_bit_data_type_is_unsupported() {
+        assert!(matches!(
+            classify_plc_tag("modbus-tcp", "40001.3", "u16"),
+            SimulationCoverage::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn modbus_unparseable_address_is_unsupported_with_a_reason() {
+        match classify_plc_tag("modbus-tcp", "not-an-address", "u16") {
+            SimulationCoverage::Unsupported { reason } => assert!(!reason.is_empty()),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn string_tag_is_always_unsupported_regardless_of_protocol() {
+        assert!(matches!(
+            classify_plc_tag("modbus-tcp", "40001", "string"),
+            SimulationCoverage::Unsupported { .. }
+        ));
+        assert!(matches!(
+            classify_plc_tag("slmp", "D0", "string"),
+            SimulationCoverage::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn unknown_data_type_is_unsupported() {
+        assert!(matches!(
+            classify_plc_tag("modbus-tcp", "40001", "f64"),
+            SimulationCoverage::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn unknown_protocol_is_unsupported() {
+        assert!(matches!(
+            classify_plc_tag("foo-protocol", "40001", "u16"),
+            SimulationCoverage::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn slmp_d_device_within_window_is_supported() {
+        assert_eq!(
+            classify_plc_tag("slmp", "D0", "u16"),
+            SimulationCoverage::Supported
+        );
+        // D15 -> RAMP_ADDRESS_COUNT(16)の境界(0..16の最後)。
+        assert_eq!(
+            classify_plc_tag("slmp", "D15", "u16"),
+            SimulationCoverage::Supported
+        );
+    }
+
+    #[test]
+    fn slmp_d_device_just_past_the_window_is_unsupported() {
+        assert!(matches!(
+            classify_plc_tag("slmp", "D16", "u16"),
+            SimulationCoverage::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn slmp_m_device_within_window_is_supported() {
+        assert_eq!(
+            classify_plc_tag("slmp", "M0", "bit"),
+            SimulationCoverage::Supported
+        );
+    }
+
+    #[test]
+    fn slmp_m_device_just_past_the_window_is_unsupported() {
+        assert!(matches!(
+            classify_plc_tag("slmp", "M16", "bit"),
+            SimulationCoverage::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn slmp_word_device_other_than_d_is_unsupported() {
+        assert!(matches!(
+            classify_plc_tag("slmp", "W0", "u16"),
+            SimulationCoverage::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn slmp_bit_device_other_than_m_is_unsupported() {
+        assert!(matches!(
+            classify_plc_tag("slmp", "X0", "bit"),
+            SimulationCoverage::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn slmp_bit_in_word_within_window_and_bit_type_is_supported() {
+        // D0.5 -> D デバイス番号0(ウィンドウ内)、data_type=bit なので許容。
+        assert_eq!(
+            classify_plc_tag("slmp", "D0.5", "bit"),
+            SimulationCoverage::Supported
+        );
+    }
+
+    #[test]
+    fn slmp_bit_in_word_with_non_bit_data_type_is_unsupported() {
+        assert!(matches!(
+            classify_plc_tag("slmp", "D0.5", "u16"),
+            SimulationCoverage::Unsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn slmp_unparseable_address_is_unsupported_with_a_reason() {
+        match classify_plc_tag("slmp", "not-an-address", "u16") {
+            SimulationCoverage::Unsupported { reason } => assert!(!reason.is_empty()),
+            other => panic!("expected Unsupported, got {other:?}"),
         }
     }
 }
