@@ -84,7 +84,7 @@ use utoipa::{OpenApi, ToSchema};
 use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService, IssuedApiKey};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::controller::{CollectionController, CollectionState, CollectionStatus, RunMode};
-use crate::hub::{CollectorManager, TagEntry};
+use crate::hub::{CollectorManager, SimulationCoverageReport, TagEntry};
 use crate::mqtt::MqttPublisher;
 use crate::settings::{MqttSettings, SettingsService};
 use crate::test_output::TestOutputControl;
@@ -1291,6 +1291,11 @@ struct CollectionModeRequest {
 #[derive(Clone)]
 struct CollectionAdminState {
     controller: Arc<CollectionController>,
+    /// T15-2: `GET /api/collection/simulation-coverage`が
+    /// `CollectorManager::simulation_coverage_report`を呼ぶために必要
+    /// (`CollectionController`自身はレジストリを読まない、ライフサイクル
+    /// 状態機械のみ - `crate::controller`のモジュール doc comment参照)。
+    manager: Arc<CollectorManager>,
     auth: AuthState,
     audit: AuditLogService,
     events: broadcast::Sender<ServerEvent>,
@@ -1370,14 +1375,34 @@ async fn collection_set_mode(
     Ok(collection_control_result(&state, &headers, "set_mode", status).await)
 }
 
+/// T15-2 (docs/banto-hub-desktop-plan.md §9.7): all-simulation 開始前の
+/// プリフライト - `CollectorManager::simulation_coverage_report`をそのまま
+/// 返す。`start(AllSimulation)`をブロックしないので副作用は一切無く、
+/// `record_write`/`ServerEvent::ResourceChanged`も送らない(表示専用の
+/// 読み取り API - 他の`collection_*`ハンドラのような「状態が変わる操作」
+/// ではない)。
+async fn collection_simulation_coverage(
+    State(state): State<CollectionAdminState>,
+) -> Result<Json<SimulationCoverageReport>, ApiError> {
+    let report = state
+        .manager
+        .simulation_coverage_report()
+        .await
+        .map_err(BantoError::Storage)
+        .map_err(ApiError)?;
+    Ok(Json(report))
+}
+
 fn collection_control_router(
     controller: Arc<CollectionController>,
+    manager: Arc<CollectorManager>,
     audit: AuditLogService,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
 ) -> Router {
     let state = CollectionAdminState {
         controller,
+        manager,
         auth: auth.clone(),
         audit: audit.clone(),
         events,
@@ -1392,6 +1417,10 @@ fn collection_control_router(
         .route(
             "/api/collection/mode",
             post(collection_set_mode).put(collection_set_mode),
+        )
+        .route(
+            "/api/collection/simulation-coverage",
+            get(collection_simulation_coverage),
         )
         .with_state(state)
         .layer(middleware::from_fn_with_state(
@@ -4674,6 +4703,7 @@ fn api_router_with_controller_mode(
         ))
         .merge(collection_control_router(
             controller.clone(),
+            manager.clone(),
             audit.clone(),
             auth.clone(),
             events.clone(),
