@@ -1336,6 +1336,13 @@ owner ACL を設定する。グループ変更、profile owner 追加、ACL 変�
 いずれも計画の骨格を変えるものではないが、各マイルストーン着手前に決定記録を
 追記して曖昧さを解消する。file:line は `cc255b4` 時点。
 
+> **T14 の詳細設計（2026-08-09、上位モデル）**: 下記 T14 の6論点を現行コード
+> 精密照合に基づき詳細設計へ落としたものを
+> [banto-hub-t14-design.md](banto-hub-t14-design.md) に置く。主要判断（preflight
+> 方式・broker stop-and-join の置き場・controller の所有権・MQTT トリガ・書き込み
+> 連動・常駐タスク寿命）は同書 §1 に要約し、要オーナー承認。T14-1〜T14-4 の
+> サブスライスと受入条件は同書 §12。
+
 #### T14（ランタイム状態管理・制御面分離）
 
 - **broker の per-connection stop-and-join API が要る**。`HubSessions::remove`
