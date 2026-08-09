@@ -1286,8 +1286,27 @@ impl CollectorManager {
     /// それをそのまま返す）なので、直近の `rebuild` が既に確保済みの
     /// セッションと同じものが返る。`rebuild` と競合しても安全（同じ
     /// セッションに収束する）。
+    ///
+    /// **T15-4 以降、書き込み経路（`crate::write_path::write_plc_tag`）は
+    /// これを使わない** - `ensure_connection` はセッションが無ければ新規に
+    /// ダイヤルしてしまい、`CollectionController::stop`(→ この
+    /// `sessions.stop_and_join`)と `execute_write` の `.await` 区間が
+    /// 競合した場合に実機へ意図しないセッションを張ってしまう
+    /// （[`Self::write_broker_handle_peek`] の doc comment 参照）。書き込み
+    /// 経路は必ず `write_broker_handle_peek` を使うこと。このメソッド自体は
+    /// ensure セマンティクスを必要とする他の呼び出し元向けに残してある
+    /// （現状、`crate` 内に他の呼び出し元はない）。
     pub fn write_broker_handle(&self, conn: &PlcConnection) -> Result<BrokerHandle, BrokerError> {
         self.sessions.ensure_connection(conn)
+    }
+
+    /// T15-4（このモジュールの上の [`Self::write_broker_handle`] doc comment
+    /// 参照）: 書き込み経路専用の non-spawning peek。`connection_id` の
+    /// broker セッションが既に生きていればその書き込み可能な
+    /// [`BrokerHandle`] を返し、無ければ `None`（新規にはダイヤルしない -
+    /// fail closed）。`crate::write_path::write_plc_tag` の唯一の入口。
+    pub fn write_broker_handle_peek(&self, connection_id: i64) -> Option<BrokerHandle> {
+        self.sessions.write_handle_for(connection_id)
     }
 
     /// Current catalog snapshot. Cheap (`Arc` clone) - safe to call once per
