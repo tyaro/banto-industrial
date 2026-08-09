@@ -67,6 +67,11 @@
 	} from '$lib/banto/tagCsv';
 	import { parseOptionalNumber } from '$lib/banto/tagFormNumeric';
 	import { isFormDirty } from '$lib/banto/formDirty';
+	import {
+		buildExternalName,
+		findReferencingComputedTags,
+		formatDeleteConfirmMessage
+	} from '$lib/banto/tagDeleteImpact';
 	import { beforeNavigate } from '$app/navigation';
 
 	const dataTypeOptions: { value: TagDataType; label: string }[] = [
@@ -370,9 +375,35 @@
 	 */
 	let deleting = $state(false);
 
+	/**
+	 * T18-1（TAG-UX-C 5点目、docs/banto-hub-desktop-plan.md §9.4「削除前に
+	 * 演算タグ等の参照影響と完全な外部名を表示する」）: `tag` の完全外部名
+	 * （`{接続}.{グループ}.{タグ}`）を組み立てる。`groupName`/`connectionName`
+	 * は表示用のフォールバック（`#${id}`/`undefined`）を持つが、外部名は
+	 * 未解決でも `?` で埋めて必ず3セグメントの形にする（通常は起こらない -
+	 * `tags`/`groups`/`connections` は同じ `reload()` で一括取得している）。
+	 */
+	function externalNameForTag(tag: Tag): string {
+		const group = groups.find((g) => g.id === tag.collectionGroupId);
+		const connName = group ? connectionName(group.plcConnectionId) : undefined;
+		return buildExternalName(connName ?? '?', group?.name ?? `#${tag.collectionGroupId}`, tag.name);
+	}
+
 	async function handleDelete(): Promise<void> {
 		if (!selected) return;
-		if (!window.confirm(`${selected.name} を削除しますか？`)) return;
+		const externalName = externalNameForTag(selected);
+		// 削除対象を参照している演算タグを一覧して確認文言に含める - サーバー側の
+		// 削除 preflight（参照切れで失敗）はそのまま正しさの最終バックストップで
+		// あり、クライアント側でハードブロックはしない（確認 OK なら従来どおり
+		// deleteTag を呼ぶ - サーバーが拒否した場合は既存の error toast で通知）。
+		const referencing = findReferencingComputedTags(
+			selected.id,
+			externalName,
+			tags,
+			groups,
+			connections
+		);
+		if (!window.confirm(formatDeleteConfirmMessage(externalName, referencing))) return;
 		deleting = true;
 		try {
 			await deleteTag(selected.id);
