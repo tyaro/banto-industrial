@@ -342,9 +342,18 @@
 		}
 	}
 
+	/**
+	 * T18-1（TAG-UX-C 続き）: 削除中も `deleting` を立てて `isDrawerBusy()`
+	 * に含める - creating/saving と同じ try/finally パターン。これが無いと
+	 * 削除ボタンを連打できたり、削除中に保存・×で閉じる等の他操作が
+	 * 走ってしまう（相互排他が破れる）。
+	 */
+	let deleting = $state(false);
+
 	async function handleDelete(): Promise<void> {
 		if (!selected) return;
 		if (!window.confirm(`${selected.name} を削除しますか？`)) return;
+		deleting = true;
 		try {
 			await deleteTag(selected.id);
 			toastStore.push('success', '削除しました');
@@ -353,6 +362,8 @@
 			await reload();
 		} catch (err) {
 			toastStore.push('error', errorMessage(err));
+		} finally {
+			deleting = false;
 		}
 	}
 
@@ -386,12 +397,23 @@
 
 	/**
 	 * T18-1（TAG-UX-C 一部、docs/banto-hub-desktop-plan.md §9.4）: 現在開いて
-	 * いる Drawer が busy（作成/保存/検証/登録のいずれかを実行中）かどうか。
-	 * `drawerMode` は常に高々1つしか開いていないため、これらのフラグの
-	 * どれか1つでも立っていれば「今開いている Drawer」の処理中とみなせる。
+	 * いる Drawer が busy（作成/保存/削除/検証/登録のいずれかを実行中）
+	 * かどうか。`drawerMode` は常に高々1つしか開いていないため、これらの
+	 * フラグのどれか1つでも立っていれば「今開いている Drawer」の処理中と
+	 * みなせる。削除も busy に含める（TAG-UX-C 続き、
+	 * `cursor/t18-1-drawer-busy-e3cb`）- 削除中に保存や再削除、×での
+	 * クローズができてしまうのを防ぐ。
 	 */
 	function isDrawerBusy(): boolean {
-		return creating || saving || validating || applyingContinuous || csvValidating || csvApplying;
+		return (
+			creating ||
+			saving ||
+			deleting ||
+			validating ||
+			applyingContinuous ||
+			csvValidating ||
+			csvApplying
+		);
 	}
 
 	/**
@@ -1163,8 +1185,10 @@
 		<div class="drawer-section">
 			{@render tagFields(createForm, createErrors)}
 			<div class="actions">
-				<button type="button" onclick={handleCreate} disabled={creating || groups.length === 0}
-					>作成</button
+				<button
+					type="button"
+					onclick={handleCreate}
+					disabled={isDrawerBusy() || groups.length === 0}>作成</button
 				>
 			</div>
 			{#if groups.length === 0}
@@ -1175,8 +1199,10 @@
 		<div class="drawer-section">
 			{@render tagFields(editForm, editErrors)}
 			<div class="actions">
-				<button type="button" onclick={saveEdit} disabled={saving}>保存</button>
-				<button type="button" class="danger" onclick={handleDelete}>削除</button>
+				<button type="button" onclick={saveEdit} disabled={isDrawerBusy()}>保存</button>
+				<button type="button" class="danger" onclick={handleDelete} disabled={isDrawerBusy()}
+					>削除</button
+				>
 			</div>
 		</div>
 	{:else if drawerMode === 'continuous' && canWrite}
@@ -1260,13 +1286,13 @@
 				{/if}
 
 				<div class="actions">
-					<button type="button" onclick={handleValidateContinuous} disabled={validating}
+					<button type="button" onclick={handleValidateContinuous} disabled={isDrawerBusy()}
 						>検証</button
 					>
 					<button
 						type="button"
 						onclick={handleApplyContinuous}
-						disabled={!continuousValidatedFresh || applyingContinuous}>登録</button
+						disabled={!continuousValidatedFresh || isDrawerBusy()}>登録</button
 					>
 					{#if !continuousValidatedFresh}
 						<span class="hint"
@@ -1292,6 +1318,7 @@
 					accept=".csv"
 					bind:this={csvFileInputEl}
 					onchange={handleCsvFileChange}
+					disabled={isDrawerBusy()}
 				/>
 			</div>
 
@@ -1343,11 +1370,11 @@
 				{/if}
 
 				<div class="actions">
-					<button type="button" onclick={handleValidateCsv} disabled={csvValidating}>検証</button>
+					<button type="button" onclick={handleValidateCsv} disabled={isDrawerBusy()}>検証</button>
 					<button
 						type="button"
 						onclick={handleApplyCsv}
-						disabled={!csvValidatedFresh || csvApplying}>登録</button
+						disabled={!csvValidatedFresh || isDrawerBusy()}>登録</button
 					>
 					{#if !csvValidatedFresh}
 						<span class="hint"

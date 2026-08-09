@@ -3,9 +3,10 @@
 作成日: 2026-08-09
 状態: **計画確定。T14・T15 完了。T16 詳細設計は [banto-hub-t16-design.md](banto-hub-t16-design.md)（P1〜P3 承認済み）。T16-0（薄いシェル `banto-hub-shell`）・T16-1（トレイ状態表示）マージ済み。T16-2 は T17（サービス管理・profile・mutex）依存のため後回し。進行中: T18-1（タグ登録 UI/UX の正しさ修正）。§16.4 の `optNum` null 取りこぼしと §9 TAG-P0-1 本体（連続登録 `count.trim()` クラッシュ）はロジック側を修正済み。**2026-08-09（本 PR）: §16.3「banto-hub の Playwright/DOM テスト基盤を T18-1 へ前倒し」を実施し、`e2e/banto-hub.playwright.config.ts`（`pnpm e2e:banto-hub`）を新設。TAG-P0-1 の残受け入れ条件（実 DOM からの点数変更テスト）を `e2e/tests-banto-hub/banto-hub-tags-continuous.spec.ts` で満たし、DOM/E2E 側も含めて TAG-P0-1 は受け入れ条件を全て満たした（closed）。** 2026-08-09（本 PR、
 `cursor/t18-1-form-dirty-e3cb`）: §9.4 TAG-UX-C のうち dirty 追跡と破棄確認
-を実装（詳細は §9.4 TAG-UX-C の実装メモ）。TAG-UX-C の残り（`<form>` 化、
-revision/ETag、削除前参照影響、初期読込状態の区別）は未着手。TAG-P0-2・
-TAG-P0-3 は未着手。
+を実装（詳細は §9.4 TAG-UX-C の実装メモ）。続く `cursor/t18-1-drawer-busy-e3cb`
+で同 §9.4 の「保存、削除、検証、登録、閉じるを Drawer 単位の busy 状態で
+相互排他にする」も実装済み。TAG-UX-C の残り（`<form>` 化、revision/ETag、
+削除前参照影響、初期読込状態の区別）は未着手。TAG-P0-2・TAG-P0-3 は未着手。
 最終検証日(コード照合): 2026-08-09
 基準コミット: `22c8c02`（main、PR #103 `optNum` 修正マージ後）。T18-1 は本 PR
 （`apps/banto-hub/src/lib/banto/continuousRegistration.ts` の
@@ -14,7 +15,9 @@ banto-hub 用 Playwright/DOM e2e 基盤の新設）で続行し、続く
 `cursor/t18-1-form-dirty-e3cb` で TAG-UX-C の dirty 追跡・破棄確認
 （create/edit/連続登録/CSVインポート Drawer、`formDirty.ts`、
 `Drawer.svelte` の `onRequestClose`、`banto-hub-tags-dirty-confirm.spec.ts`）
-を追加。
+を追加し、さらに続く `cursor/t18-1-drawer-busy-e3cb` で Drawer busy 状態の
+相互排他（`deleting` フラグの新設、各ボタンの `disabled` を `isDrawerBusy()`
+に統一、`banto-hub-tags-busy.spec.ts`）を追加。
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [banto-hub-t16-design.md](banto-hub-t16-design.md)、
@@ -687,14 +690,33 @@ UX-5 の決定を UI のボタン非表示だけで実装しない。アプリ�
 > `e2e/tests-banto-hub/banto-hub-tags-dirty-confirm.spec.ts`
 > （`pnpm e2e:banto-hub`）。
 >
+> **2026-08-09 追加実装（T18-1 続き、`cursor/t18-1-drawer-busy-e3cb`）:
+> 3点目「保存、削除、検証、登録、閉じるを Drawer 単位の busy 状態で相互
+> 排他にする」を実装済み。** それまで `handleDelete` に busy フラグが無く
+> 連打可能で、各ボタンの `disabled` が自分のフラグだけを見ていたため
+> Drawer 内で相互排他になっていなかった（保存中でも削除できる、削除中
+> でも保存・×クローズができる等）。`deleting`（`$state`、
+> creating/saving と同じ try/finally パターン）を追加し `isDrawerBusy()`
+> の OR に含めた上で、edit の保存・削除、create の登録、連続登録の検証・
+> 登録、CSV インポートの検証・登録・ファイル選択 (`<input type="file">`)
+> の `disabled` を、それぞれ自前のフラグ参照から `isDrawerBusy()`
+> （元の個別条件と組み合わせるべきもの — create の `groups.length === 0`、
+> 連続登録/CSV の `!continuousValidatedFresh`/`!csvValidatedFresh` は維持）
+> に統一した。これにより「今開いている Drawer で何か1つでも実行中なら、
+> その Drawer 内の全アクションがブロックされる」が徹底される。実 DOM
+> 受け入れは `e2e/tests-banto-hub/banto-hub-tags-busy.spec.ts`
+> （`pnpm e2e:banto-hub`、`page.route` で `DELETE /api/tags/:id` を遅延させ、
+> 削除実行中に保存ボタンが disabled かつ `×` でも確認さえ出さずに閉じ
+> られないことを確認）。
+>
 > **未着手のまま残っている部分**: create/edit の `<form>` 化・Enter
 > 送信・クライアント軽量検証（1点目）、revision/ETag による後勝ち防止・
 > 差分表示（4点目）、削除前の参照影響・完全外部名表示（5点目）、
 > 初期読込失敗/0件/検索結果0件/再読込中/stale 一覧の区別（6点目）。
 > 受け入れ条件のうち「ボタン連打や保存／削除競合でも mutation は1回だけ
-> 実行される」「他セッション更新を黙って上書きしない」もこの PR の範囲外
-> （busy 中の閉じる抑止はボタン自体の `disabled` 属性に既存で依存して
-> おり、mutation の多重実行そのものを防ぐ仕組みは未実装）。
+> 実行される」は busy 中のボタン `disabled` 化で UI 操作からの連打は
+> 防げるようになったが、「他セッション更新を黙って上書きしない」
+> （revision/ETag 依存）はこの PR の範囲外のまま。
 
 受け入れ条件:
 
