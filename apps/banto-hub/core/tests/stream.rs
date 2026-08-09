@@ -857,15 +857,24 @@ async fn plc_disconnect_is_relayed_as_an_event() {
         .unwrap();
     app.manager.rebuild().await.expect("rebuild after seeding");
 
+    // H7 ⑤ follow-up (2026-08-09, CI flake on PR #96): the previous
+    // pre-check only required `CurrentSample::is_some()`. That can pass on a
+    // Bad/no-value bootstrap entry written before the first successful PLC
+    // connect (`current.rs::set`). `PlcDisconnected` is emitted only on the
+    // drop of a previously-connected session (`task.rs`), so stopping the
+    // simulator before the first Good read leaves no event and
+    // `recv_matching` times out. Mirror the sibling subscribe test / gRPC
+    // `stream_events_relays_plc_disconnected`: wait for the seeded value.
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(5), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get("tag:1"))
-                .is_some()
+                .and_then(|s| s.value)
+                == Some(1.0)
         })
         .await,
-        "collector should be connected before we open the ws (so plc_connected doesn't race the subscribe below)"
+        "collector should observe the seeded simulator value before we open the ws (so plc_connected is established and plc_disconnected can fire)"
     );
 
     let mut ws = connect_ws(&app.ws_url("/api/v1/stream"), Some(&app.token))
@@ -895,15 +904,9 @@ async fn plc_disconnect_is_relayed_as_an_event() {
     // unconditionally, strictly before the loop that both handles the
     // incoming "subscribe" message and sends this reply - see
     // src/stream.rs), so only after this can `sim.stop()` run without
-    // racing the event subscription. Deliberately not asserting on the
-    // snapshot's value/quality here: the pre-check above only proves a
-    // `CurrentSample` exists (`.is_some()`), which - unlike the sibling
-    // test's stronger `== Some(Some(100.0))` check - can still legitimately
-    // be a Bad/no-value bootstrap sample (`current.rs::set` stores an entry
-    // on the very first tick even if that first read hasn't succeeded yet);
-    // asserting a specific value here would reintroduce an unrelated
-    // flake. Only the round trip itself (this connection's handle_socket
-    // task got far enough to answer a subscribe) is what closes the race.
+    // racing the event subscription. The pre-check above already proved a
+    // Good seeded value, so the snapshot here is only used as the
+    // subscribe-events liveness round trip (not as a value assertion).
     send_json(
         &mut ws,
         json!({ "op": "subscribe", "id": 1, "tags": ["line1.fast.temp01"], "mode": "on_change" }),
@@ -913,10 +916,29 @@ async fn plc_disconnect_is_relayed_as_an_event() {
 
     sim.stop();
 
-    let event = recv_matching(&mut ws, |m| {
-        m["op"] == "event" && m["kind"] == "plc_disconnected"
+    // Slightly wider than the default 5s recv_matching budget: under a
+    // loaded Windows CI runner the disconnect is still bounded by
+    // `response_timeout` (500ms in `fast_options`), but draining competing
+    // WS frames before the event can stretch wall time.
+    let event = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(WsMessage::Text(text))) => {
+                    let value: Value =
+                        serde_json::from_str(&text).expect("server should send valid JSON");
+                    if value["op"] == "event" && value["kind"] == "plc_disconnected" {
+                        return value;
+                    }
+                }
+                Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => continue,
+                Some(Ok(other)) => panic!("unexpected non-text ws message: {other:?}"),
+                Some(Err(err)) => panic!("ws error while waiting for plc_disconnected: {err}"),
+                None => panic!("connection closed while waiting for plc_disconnected"),
+            }
+        }
     })
-    .await;
+    .await
+    .expect("timed out waiting for plc_disconnected");
     assert_eq!(event["connection"], "line1");
 }
 
