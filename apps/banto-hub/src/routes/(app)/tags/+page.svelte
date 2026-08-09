@@ -812,13 +812,13 @@
 {#snippet tagFields(form: FormState, errors: Record<string, string>)}
 	<div class="form-grid">
 		<label class="field">
-			名前
-			<input type="text" bind:value={form.name} />
+			名前<span class="required">*</span>
+			<input type="text" bind:value={form.name} required />
 			{#if errors.name}<span class="err">{errors.name}</span>{/if}
 		</label>
 		<label class="field">
-			収集グループ
-			<select bind:value={form.collectionGroupId}>
+			収集グループ<span class="required">*</span>
+			<select bind:value={form.collectionGroupId} required>
 				<option value="" disabled>選択してください</option>
 				{#each groupsFor(form.tagKind) as group (group.id)}
 					<option value={String(group.id)}>{group.name}</option>
@@ -851,8 +851,13 @@
 		</label>
 		{#if form.tagKind === 'plc'}
 			<label class="field">
-				アドレス
-				<input type="text" bind:value={form.address} placeholder="D100（ビット: D100.5）" />
+				アドレス<span class="required">*</span>
+				<input
+					type="text"
+					bind:value={form.address}
+					required
+					placeholder="D100（ビット: D100.5）"
+				/>
 				<span class="hint"
 					>ワードデバイスの特定ビットを読み書きするときは「D100.5」のように「.」+ビット位置（0〜15、Modbus
 					は「40001.3」）を付けます。「D100.5」でワードの5ビット目。ビット指定アドレスは data_type =
@@ -863,10 +868,11 @@
 		{/if}
 		{#if form.tagKind === 'computed'}
 			<label class="field wide">
-				式（expression）
+				式（expression）<span class="required">*</span>
 				<textarea
 					bind:value={form.expression}
 					rows="2"
+					required
 					placeholder="(line1.fast.a + line1.fast.b) / 2"></textarea>
 				<span class="hint"
 					>四則・比較・論理・if(c,a,b)・min/max/abs/round/clamp/bit(tag,n)。参照する外部名は他タグ
@@ -1182,29 +1188,37 @@
 	onRequestClose={confirmDiscardIfNeeded}
 >
 	{#if drawerMode === 'create' && canWrite}
-		<div class="drawer-section">
+		<form
+			class="drawer-section"
+			onsubmit={(e) => {
+				e.preventDefault();
+				void handleCreate();
+			}}
+		>
 			{@render tagFields(createForm, createErrors)}
 			<div class="actions">
-				<button
-					type="button"
-					onclick={handleCreate}
-					disabled={isDrawerBusy() || groups.length === 0}>作成</button
-				>
+				<button type="submit" disabled={isDrawerBusy() || groups.length === 0}>作成</button>
 			</div>
 			{#if groups.length === 0}
 				<p class="note">先に 収集グループ を1件以上登録してください。</p>
 			{/if}
-		</div>
+		</form>
 	{:else if drawerMode === 'edit' && selected && canWrite}
-		<div class="drawer-section">
+		<form
+			class="drawer-section"
+			onsubmit={(e) => {
+				e.preventDefault();
+				void saveEdit();
+			}}
+		>
 			{@render tagFields(editForm, editErrors)}
 			<div class="actions">
-				<button type="button" onclick={saveEdit} disabled={isDrawerBusy()}>保存</button>
+				<button type="submit" disabled={isDrawerBusy()}>保存</button>
 				<button type="button" class="danger" onclick={handleDelete} disabled={isDrawerBusy()}
 					>削除</button
 				>
 			</div>
-		</div>
+		</form>
 	{:else if drawerMode === 'continuous' && canWrite}
 		<div class="drawer-section">
 			<p class="note">
@@ -1518,6 +1532,11 @@
 	.hint {
 		font-size: 0.7rem;
 		color: var(--banto-text-muted);
+	}
+
+	.required {
+		margin-left: 0.15rem;
+		color: var(--banto-danger);
 	}
 
 	.err {
