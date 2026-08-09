@@ -1,11 +1,13 @@
 # banto-hub アプリ／サービス運転計画（T14〜）
 
 作成日: 2026-08-09
-状態: **計画確定。T14 完了、T15 は T15-1〜T15-4（全体 SIM・外部出力安全化・対応範囲プリフライト・テスト出力 namespace・write peek no-spawn）まで実装済み。T15 完了。次は T16。**
+状態: **計画確定。T14・T15 完了。T16 詳細設計は [banto-hub-t16-design.md](banto-hub-t16-design.md)（P1〜P3 承認済み）。T16-0（薄いシェル `banto-hub-shell`）実装済み・レビュー待ち。次は T16-1（トレイ状態表示）。**
 最終検証日(コード照合): 2026-08-09
-基準コミット: `904e09e`（main、PR #97 マージ後。本ブランチで T15-4 を追加）
+基準コミット: `fa96c90`（main、PR #98 マージ後・T15 完了）。T16-0 は本 PR
+（`apps/banto-hub/src-tauri` 新設）で追加。
 
 関連: [tag-server-design.md](tag-server-design.md)、
+[banto-hub-t16-design.md](banto-hub-t16-design.md)、
 [ux-plan.md](ux-plan.md)、
 [banto-hub-operations.md](banto-hub-operations.md)、
 [plan.md](plan.md)、
@@ -1169,6 +1171,14 @@ write peek を実装し、T15 を完了させた（§16.3「T15（全 PLC シミ
   ログ、再試行を利用できる。
   ただし profile / mutex / port / version を検証できない場合は開始を表示しない。
 
+> **2026-08-09 追記**（[banto-hub-t16-design.md](banto-hub-t16-design.md) P2）:
+> 上記のうち「Hub 停止中でも native fallback から…」の1条は、T17（サービス
+> 管理・profile・mutex）に依存するため **T16-2（T17 後）の受入条件へ移す**。
+> T16-0（薄いシェル本体: HubRuntime 埋め込み・WebView・トレイ最小2項目・
+> 単一インスタンス・shutdown）はサービス非依存で、T17 を待たず着手・完了
+> できる。T16-1（トレイ状態表示）も T16-0 の直後に着手可 - 詳細は
+> banto-hub-t16-design.md §3 のサブスライス表を参照。
+
 ### T17: サービス管理、プロファイル、インストーラ
 
 - T5-1 の `install` / `uninstall` / `run-service` と `win_service` から SCM
@@ -1486,16 +1496,21 @@ owner ACL を設定する。グループ変更、profile owner 追加、ACL 変�
 
 #### T16 / T17（デスクトップシェル・サービス管理・配布）
 
+> **T16 の詳細設計（2026-08-09）**: 下記 T16/T17 論点のうち T16-0 着手に必要な
+> P1〜P3（T0 再解釈・SCM fallback の T17 後送り・WebView は Hub localhost）を
+> [banto-hub-t16-design.md](banto-hub-t16-design.md) に落とし、**同日承認済み**。
+> T16-0 は T17 を待たず着手可。サービス検出／native fallback（T16-2）は T17 後。
+
 - **desktop⇔service 切替の中間状態を追加**。実行ホストは offline/desktop/
   service の3値だが、切替は2プロセスと SCM を跨ぐため hub 内 controller の
   直列化では守れない。切替の各段階（desktop 停止確認 → サービス開始 →
   health 確認 → 接続切替）と各段階の失敗到達状態を表で定義し、進行状態は
   シェル（ネイティブ側）が所有する旨を明記する。
-- **T16⇔T17 の依存を明示**。T16 の fallback 受入条件（サービス状態取得・
-  開始・停止・応答しないサービスの安全停止）は T17 の SCM 管理層そのもの。
-  最小 SCM 層を T17-0 として先出しするか、T16 の該当受入条件を T17 後へ移す。
-  あわせて T14〜T17 の依存 DAG と並行可能な組（T15⫫T16 基本部 等）を明記し、
-  §15 の worktree 並行運用の根拠にする。
+- **T16⇔T17 の依存を明示**（2026-08-09 決定: **T16 の SCM fallback 受入は
+  T17 後へ移す**）。T16-0 はサービス非依存の薄いシェルのみ。あわせて
+  T14〜T17 の依存 DAG と並行可能な組（T15⫫T16 基本部 等）を明記し、§15 の
+  worktree 並行運用の根拠にする。詳細は
+  [banto-hub-t16-design.md](banto-hub-t16-design.md) §1 P2 / §3。
 - **一回限り ticket プロトコルを1節で確定**（鍵の所在、native⇔Hub の相互
   認証、replay 記録の所在、要求経路と Windows セッション束縛）。推奨は native
   がオフライン署名検証せず localhost の Hub へ ticket を提示して検証+消費する

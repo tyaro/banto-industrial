@@ -22,11 +22,17 @@
 #      グラフ」上の集計と突き合わせ、乖離を確認した。
 # 2) の集計は 1) の超集合ではなく、`Cargo.lock` には載っているが
 # feature 解決の結果どの workspace crate からも到達しない package
-# (例: json5 0.4.1 / libloading 0.7.4, ISC license。tauri-utils 等の
-# manifest には現れるが有効化されるフィーチャの組合せでは resolve
-# グラフに現れない)を除外する。allow リストは 2) の実測(13種)に
-# 合わせてあり、1) 由来で足していた "ISC" は未使用と判明したため外した
+# (例: json5 0.4.1。tauri-utils 等の manifest には現れるが有効化される
+# フィーチャの組合せでは resolve グラフに現れない)を除外する。allow
+# リストは当初 2) の実測(13種)に合わせてあり、1) 由来で足していた
+# "ISC" は当時未使用と判明したため一度外した
 # (`cargo deny check licenses` の `license-not-encountered` warning で検出)。
+#
+# 追記(2026-08-09、T16-0 banto-hub-shell): tauri の `tray-icon` feature を
+# 有効化したところ、依存木に ISC ライセンスが再登場した
+# (libloading 0.7.4 <- libappindicator-sys 0.9.0 <- libappindicator 0.9.0 <-
+# tray-icon 0.24.1 <- tauri(tray-icon feature) <- banto-hub-shell)。よって
+# "ISC" を allow に戻す。
 #
 # GPL 系(GPL/AGPL/LGPL/GFDL)は allow に含めない(オーナー方針)。依存木内
 # では r-efi 5.3.0/6.0.0 のみが `MIT OR Apache-2.0 OR LGPL-2.1-or-later` を
@@ -59,6 +65,7 @@ allow = [
     "Unlicense",         # aho-corasick / memchr / byteorder / walkdir ほか
     "Zlib",
     "0BSD",              # adler2
+    "ISC",               # libloading 0.7.4(tray-icon -> libappindicator 経由、T16-0)
 ]
 # confidence-threshold・include-build・include-dev・unused-allowed-license
 # などは既定値のまま(明示的に変える理由がないため)。

@@ -3,16 +3,27 @@
 //! 踏襲）」）。
 //!
 //! banto-hub は T0 で「Tauri なし構成」と決定されたヘッドレス axum サーバー
-//! （単一 exe、`apps/banto-hub/core/src/bin/banto-hub.rs`）で `src-tauri`
-//! を持たない。既存2アプリ（chronogazer/relay-wright）は `cargo tauri
-//! build` が内部で呼んでいる tauri-bundler で NSIS/MSI インストーラを
-//! 生成しているが、banto-hub をフル Tauri アプリ化はしない
-//! （オーナー決定 2026-08-06）ので、ここでは `tauri-bundler` クレートを
-//! 単体ライブラリとして直接呼び出す。この `apps/banto-hub/installer/`
-//! パッケージ自体が「xtask 的」な立ち位置 - ルートワークスペースの
-//! member ではない（`Cargo.toml` のコメント参照。理由は
-//! `cargo check --workspace --all-targets` を Windows 専用のバンドル処理
-//! に巻き込まないため）。
+//! （単一 exe、`apps/banto-hub/core/src/bin/banto-hub.rs`）を一次形態として
+//! 持つ - この `banto-hub.exe` 自体には `src-tauri` を持たせない。既存2
+//! アプリ（chronogazer/relay-wright）は `cargo tauri build` が内部で呼んで
+//! いる tauri-bundler で NSIS/MSI インストーラを生成しているが、
+//! `banto-hub.exe` を独自 `frontendDist`/`invoke` 面を持つフル Tauri
+//! アプリ化はしない（オーナー決定 2026-08-06）ので、ここでは
+//! `tauri-bundler` クレートを単体ライブラリとして直接呼び出す。
+//!
+//! **2026-08-09 追記**（docs/banto-hub-t16-design.md P1）: 上記の禁止事項は
+//! 「独自 `frontendDist`/`invoke` を持つフル Tauri
+//! アプリ化はしない」という意味に限定される。`HubRuntime` を埋め込み、
+//! Hub 自身の localhost UI を WebView で開くだけの**薄いシェル**
+//! （`apps/banto-hub/src-tauri`、パッケージ名 `banto-hub-shell`、T16-0）は
+//! 二次ホストとして別途追加済み - このインストーラはヘッドレス
+//! `banto-hub.exe` 用のままで変更しない（`banto-hub-shell` 自身のインス
+//! トーラ化は T17 のスコープ、docs/banto-hub-desktop-plan.md §16.3）。
+//!
+//! この `apps/banto-hub/installer/` パッケージ自体が「xtask 的」な立ち位置
+//! - ルートワークスペースの member ではない（`Cargo.toml` のコメント参照。
+//! 理由は `cargo check --workspace --all-targets` を Windows 専用の
+//! バンドル処理に巻き込まないため）。
 //!
 //! ## 使い方
 //!

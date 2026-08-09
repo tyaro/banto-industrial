@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capabilities for the main window - T16-0 は invoke API を持たないため core:default のみ",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

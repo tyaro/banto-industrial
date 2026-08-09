@@ -145,6 +145,20 @@ axum が配信する（ChronoGazer / relay-wright の LAN モードと同じ構�
 `banto_server` の auth / CSRF / SSE をそのまま使う）。デスクトップ窓が
 不要なサーバー用途なので、Tauri シェルを省くことで配布物が単純になる。
 
+> **2026-08-09 追記**（[banto-hub-t16-design.md](banto-hub-t16-design.md) P1、
+> T16-0 着手に伴う再解釈）: 上記の「Tauri は使わない」は、**ヘッドレス exe
+> （`banto-hub.exe`、本節・§8「常駐」）を一次形態として維持する**という
+> 決定として読み替える。[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)
+> §8/§10/§16.3 の方針に従い、**薄いデスクトップシェル
+> （`apps/banto-hub/src-tauri`、パッケージ名 `banto-hub-shell`）を二次
+> ホストとして追加することを許可する** - `HubRuntime`
+> （`banto_hub_core::runtime`）を埋め込み、WebView は本節末尾の「管理 UI の
+> 共通利用」と同じく Hub 自身が配信する `http://127.0.0.1:<port>/` を
+> 開くだけで、独自の `frontendDist`/`invoke` API は持たない（二重 UI 化
+> しない）。禁止していたのは「収集ランタイムを UI フレームワークへ埋め込む
+> こと」「管理 UI をデスクトップ専用に二重実装すること」であり、どちらも
+> このシェルでは発生しない（詳細は banto-hub-t16-design.md §2）。
+
 **管理 UI の共通利用（2026-08-05 オーナー決定）**: 管理 UI の実体は
 banto-hub が配信する1つだけとし、ChronoGazer / relay-wright には
 「タグサーバー管理」メニューを追加して、設定に保存した hub URL
