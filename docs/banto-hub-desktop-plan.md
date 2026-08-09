@@ -554,6 +554,15 @@ UI/UX マイルストーンへ反映し、変更時は新しい決定記録を�
 - 検証失敗時に Collector、実行 revision、PLC セッションを変更しない。
 - 保存済みだが未反映の場合は、解消まで残る状態表示と理由を出す。
 
+> **位置づけ（2026-08-09 オーナー決定、§16.2 に本記録）**: TAG-P0-2 は偶発
+> バグの修正ではなく、I1 CRUD の既存設計判断を覆す製品方針変更である。現行の
+> `rebuild_and_notify`（`apps/banto-hub/core/src/rest.rs`）は設計上
+> 「rebuild 失敗は CRUD 自体の失敗にしない — 失敗はログと `/api/v1/status` の
+> `last_config_error` にのみ出す」（tag-server-design.md §4.3 のオンライン動的
+> 変更モデルに由来）で実装されている。本項はこの「保存 → 非同期 rebuild →
+> 失敗握り潰し」を、全構成 preflight による「保存前検証 → 保存成功＝実行可能を
+> 保証」へ置き換える。詳細と関連文書への注記は §16.2 / §16.5 を参照。
+
 #### TAG-P0-3: 運転中編集ロックを全経路で強制する
 
 UX-5 の決定を UI のボタン非表示だけで実装しない。アプリ／サービスの実機・SIM
@@ -1261,6 +1270,8 @@ owner ACL を設定する。グループ変更、profile owner 追加、ACL 変�
 - `docs/ux-plan.md`: T13 残件との統合、UI/UX 決定記録
 - `docs/banto-hub-operations.md`: 初回導入、試運転、常時運転、サービス管理
 - `docs/plan.md`: T14〜の全体進捗
+- `docs/improvement-plan.md`: H5（banto-hub E2E）・H7-①（72h soak 実行）の
+  状態欄と Phase 4 記述（T18-5 が両者を完了させるため）
 - `docs/t5-handoff.md`: T5-4 / T5-5 の完了証跡と新計画への引継ぎ
 - `README.md`: banto-hub の現行状態と共通 Hub／デスクトップシェルの関係
 - `apps/banto-hub/README.md`: 起動方法、Desktop / Service、開発手順
@@ -1278,3 +1289,196 @@ owner ACL を設定する。グループ変更、profile owner 追加、ACL 変�
 - Markdown、TS、Svelte を編集したら対象ファイルへ Prettier を実行する。
 - Windows サービス、UAC、トレイ、インストーラは Windows 実機で検証する。
 - 設計判断と実施記録は日付付きで本書へ追記する。
+
+## 16. レビュー反映（2026-08-09、上位モデル検証）
+
+本節は、§0〜§15（2026-08-09、外部 AI 起案）に対する上位モデルのコード照合付き
+検証レビューの反映である。improvement-plan.md §0 と同じ二段レビュー（外部 AI
+起案 → 上位モデル検証）の運用に従い、§15 の方針どおり既存記録は上書きせず、
+確認結果・追加のオーナー決定・着手前に確定すべき未決事項をここへ追記する。
+基準は §0〜§15 と同じ `cc255b4`（作業ツリーで照合）。
+
+### 16.1 検証サマリ
+
+- §3 の現状分析（再利用基盤8主張 + ギャップ9主張）と §9.3 の TAG-P0-1 /
+  TAG-P0-2 のバグ主張は、実コードとの照合で行番号・エラー文言まで一致し、
+  誤りは実質ゼロだった。設計の方向性（共通ランタイム化、単一 controller
+  直列化、2レビジョン、非永続 SIM オーバーライド、fail-closed、自動起動と
+  現在状態の分離）は現行コードベースの安全設計（WriteControl の「起動時必ず
+  OFF」、`apply_config` の停止→spawn 順序等）と整合している。
+- 事実面の唯一の要訂正: §9.3 の「タグ検証はアドレス非空まで」は過小描写。
+  実際は `validate_tag_input`（`crates/banto-tags/src/tag.rs`）が名前必須・
+  最大長・dataType/tagKind 許可リスト・種別ごとの配置規則・decimals 範囲・
+  string の stringLength・スケーリング4値の all-or-none・しきい値順序まで
+  検証する。正確な表現は「**プロトコル別アドレス形式の検証だけが保存時に
+  無い**」であり、TAG-P0-2 の核心（保存成功 ≠ 実行可能）は正しい。
+
+### 16.2 追加のオーナー決定（2026-08-09）
+
+- **TAG-P0-2 = I1 CRUD の設計判断を覆す製品方針変更**（§9.3 の位置づけ注記と
+  対応）。現行 `rebuild_and_notify` の「rebuild 失敗は CRUD 自体の失敗に
+  しない」（設計 §4.3 のオンライン動的変更モデルに由来）を、T14 の全構成
+  preflight により「保存前 preflight → 保存成功＝実行可能を保証」モデルへ
+  置き換える。保存成功時は rebuild 失敗が原理的に起きない構成だけを DB へ
+  通す。この方針変更を tag-server-design.md §4.3 と plan.md §4c に日付付きで
+  注記する（本 PR で実施、§16.5）。既存の `last_config_error` /
+  `/api/v1/status` は、preflight を通した後に運転開始で顕在化する実行時
+  エラー（PLC 断・実行時例外）の窓として引き続き使う。
+- **§7 の二重起動防止 mutex を「`Global\` 名前空間 + profile ディレクトリの
+  ファイルロック併用」と確定**する。命名は `Global\BantoHub.<profile-id>` を
+  基本とする。ユーザーセッションと LocalSystem サービス（Session 0）は
+  `Local\` 名前空間が分かれ、無指定では Desktop/Service 二重起動（§13 の最
+  重要リスク）を検知できないため。§12.2 に「ユーザーセッション⇔サービス間の
+  相互排他」を明示テスト項目として追加する。
+
+### 16.3 着手前に計画へ確定すべき未決事項
+
+いずれも計画の骨格を変えるものではないが、各マイルストーン着手前に決定記録を
+追記して曖昧さを解消する。file:line は `cc255b4` 時点。
+
+#### T14（ランタイム状態管理・制御面分離）
+
+- **broker の per-connection stop-and-join API が要る**。`HubSessions::remove`
+  （`broker_glue.rs`）は clone を落とすだけで broker タスク終了を保証せず、
+  join できる `HubSessions::shutdown` は supervisor を消費する一回限りで再利用
+  不能。§5.3 の「接続単位の remove 等で再利用可能へ戻す」を満たすには
+  banto-broker 側に「remove して終了を待つ」新 API（または supervisor 再構築
+  可能化）が必要で、これがどのマイルストーンにも現れていない。停止 step5 の
+  完了条件を「broker タスクの join 完了」と定義し、セッション残留ゼロを TCP
+  レベルで検証する。
+- **rebuild() の分割と revision 消費者マトリクスの確定**。rebuild() を
+  build+commit（catalog、停止中も実行）と apply（Collector、開始時のみ）へ
+  分割する。既存の単一 revision 契約（WS `config_changed`、MQTT 全量再発行、
+  REST/`status` の revision フィールド）が configured / running のどちらを見るか
+  を表で確定する。`config_changed` は catalog 側 revision に紐付けるのが現行
+  構造と最も整合的。
+- **全構成 preflight の実現方式を決定**。検証の実体 `build_catalog` /
+  `build_config`（`crates/banto-collect/src/config.rs`）・`computed::build_plan`
+  は SqlitePool を直接読む。保存前の「提案構成」を検証するには SQLite
+  savepoint 内で仮書き込み→検証→ロールバックするか、検証系を in-memory
+  スナップショット入力へ pure 化するかのどちらかが必要。§3.2 のギャップ一覧に
+  「build\_\* は DB を読む純粋でない関数」を追記して見積りずれを防ぐ。
+- **hub_run 内の常駐タスク棚卸し**。computed 評価ループと tstore 剪定ループは
+  停止ハンドルを持たない（コメントに「no graceful shutdown handle」明記）。
+  全 `tokio::spawn` を「プロセス寿命（剪定）」「run-context 寿命（値 publish・
+  computed の運転依存部分）」へ分類する表を追記する。MQTT は
+  「settings.enabled は意向、collection_state が実効」の優先規則を明文化し、
+  停止中の `$state`/LWT 発行有無を決める。
+- **T14 を3〜4サブスライスへ分割**（例: T14-1 挙動不変のランタイム抽出 /
+  T14-2 状態機械+再開可能 controller / T14-3 preflight+revision 分離 /
+  T14-4 状態 API+編集ロック+書き込み連動）。変更対象が `rest.rs`（約4,800行）・
+  `hub.rs`（約1,566行）と最大級で、1マイルストーン1PR では上位モデルの差分
+  レビュー粒度を超える。§15 の「T18 のような大規模項目は1サブスライス1PR」を
+  T14/T15/T17 にも適用すると明記する。
+
+#### T15（全 PLC シミュレーション）
+
+- **停止中・SIM 中の書き込み経路は既存セッション再利用のみ許可し、新規
+  セッションを spawn しない**。`write_broker_handle → ensure_connection`
+  （`hub.rs`）はセッションが無ければ spawn するため、停止 step5 後の in-flight
+  書き込みが実 PLC へダイヤルし得る。§7 の追加安全条件に明記し、§12.1 に
+  「stopped/SIM 中の書き込み試行が新規 TCP 接続を発生させない」テストを加える。
+
+#### T16 / T17（デスクトップシェル・サービス管理・配布）
+
+- **desktop⇔service 切替の中間状態を追加**。実行ホストは offline/desktop/
+  service の3値だが、切替は2プロセスと SCM を跨ぐため hub 内 controller の
+  直列化では守れない。切替の各段階（desktop 停止確認 → サービス開始 →
+  health 確認 → 接続切替）と各段階の失敗到達状態を表で定義し、進行状態は
+  シェル（ネイティブ側）が所有する旨を明記する。
+- **T16⇔T17 の依存を明示**。T16 の fallback 受入条件（サービス状態取得・
+  開始・停止・応答しないサービスの安全停止）は T17 の SCM 管理層そのもの。
+  最小 SCM 層を T17-0 として先出しするか、T16 の該当受入条件を T17 後へ移す。
+  あわせて T14〜T17 の依存 DAG と並行可能な組（T15⫫T16 基本部 等）を明記し、
+  §15 の worktree 並行運用の根拠にする。
+- **一回限り ticket プロトコルを1節で確定**（鍵の所在、native⇔Hub の相互
+  認証、replay 記録の所在、要求経路と Windows セッション束縛）。推奨は native
+  がオフライン署名検証せず localhost の Hub へ ticket を提示して検証+消費する
+  introspection 方式（replay 管理を Hub 単一箇所に閉じる）。ticket ID を監査に
+  残す。
+- **仮想サービスアカウント（`NT SERVICE\BantoHub`）の採否を T17 で評価**。
+  PLC への TCP クライアントと localhost HTTP に SYSTEM は不要。加えて宣言
+  （「profile owner は信頼済み管理者」）に依存しない技術的防御を §11 へ明記
+  する: profile 配下パスの正規化とリパースポイント拒否、DB 由来のパス/bind/
+  外部接続先を「信頼できない入力」として検証、式評価器の資源・機能制限。
+- **制御 API の bind 区別と「CSRF」の具体化**（§5.4）。既定 `127.0.0.1` を
+  明記し、LAN 公開時に運転制御 API を許可するか（許可なら TLS もしくは平文
+  LAN では制御 API 拒否）をオーナー決定する。現行認証は bearer で cookie 不使用
+  のため古典的 CSRF は成立せず、対策の実体は状態変更 API・WS ハンドシェイクでの
+  Origin/Host 検証 + bearer 必須（cookie 認証を将来も不採用）である旨へ書き換える。
+- **Windows トークンの落とし穴を §8.3 / §9.10 へ織り込む**。(1) Operators
+  グループ追加はそのユーザーの既存ログオントークンに再ログオンまで載らない、
+  (2) UAC split-token で Administrators SID が deny-only になり
+  `CheckTokenMembership` の管理者判定が偽になる（`TokenLinkedToken` 考慮か、
+  管理者は常に UAC 経路へ）。30分受入シナリオに再ログオン手順を含める。
+- **配布まわりを T17 のスコープへ追加**。(1) コード署名方針の決定（証明書
+  調達 or 未署名運用の明示的受容）— 未署名 NSIS+UAC ヘルパーは SmartScreen と
+  「発行元不明」で §2 の「PowerShell を意識せず導入」目標と矛盾する。
+  (2) WebView2 の Fixed Version 同梱可否のスパイク（オフライン工場 PC 前提）。
+  (3) 自動アップデートは初版スコープ外なら「手動インストーラ上書きのみ、将来
+  課題」と明記して意図的除外にする。
+- **上書きインストール時は既存サービスの起動種別・自動起動設定を保持**する
+  （新規インストールのみ「収集を開始しない・自動起動初期 OFF」を適用）。
+  §11 に移行の実施主体（初回アプリ起動時の明示ウィザード）とタイミング
+  （実行前にサービス停止を要求）を追記し、§12.2 の「既存 profile の
+  アップグレード」テストの期待動作を確定する。
+
+#### T18（UI/UX・タグ登録改善・検証）
+
+- **banto-hub の Playwright / DOM テスト基盤を T18-1 の成果物へ前倒し**する。
+  現状 banto-hub 用 e2e config は未作成（`e2e/` は chronogazer smoke のみ）、
+  フロント vitest も logic 2ファイルのみ。E2E の CI 搭載が T18-5 に置かれると
+  T18-2〜4 の受入確認時点で基盤が無い。SCM DACL/ACL/SID 境界試験は
+  「`ServiceManager` trait のモック単体（§12.1）+ 実機 ACL 検証チェックリスト
+  （§12.2）」へ再分類し、性能テストは CI では非ブロッキングの計測記録に留める。
+- **route 移設マトリクス（旧 URL → 新 URL → redirect 有無）を確定**（現状
+  明記は `/status → /operation` のみ、`/settings` の分割先が未定）。LAN
+  ブラウザでの「管理 > サービス」は read-only 状態表示（停止操作が「できない
+  理由」を示せる）とする。
+- **受入の測定プロトコルを T18-5 前に1節追加**（数値自体は妥当なので変えない）:
+  基準ハードウェア、「2秒」の起点イベントとコールド/ウォーム、検索 p95 の母集団
+  （キーストロークか確定検索か）と測定点（API 応答かクライアント描画完了か）、
+  30分試験の被験者条件と試行数、対象テーマの列挙と glass プリセットの最悪
+  コントラスト点の測り方。
+- **OS シャットダウン/ログオフ時の flush 設計を UX-7 の決定記録へ追記**する
+  （§12.2 に試験項目はあるが §8/§9 に設計がない）。アプリホスト収集はユーザー
+  セッションのプロセスで、ログオフ・OS シャットダウンで強制終了され flush 猶予を
+  保証できない。`WM_QUERYENDSESSION` での安全停止+flush、猶予超過時の挙動
+  （shutdown block reason 表示の可否）、「ログオフで収集が止まる」旨を運転画面
+  とチェックリストで示す文言を定義する。
+
+### 16.4 追加で確認された正しさバグ（TAG-P0-1 の対象拡大）
+
+照合中に、計画未言及の同種バグを実コードで確認した。TAG-P0-1 の修正はこれらを
+含めて設計する。
+
+- **`optNum` の null 取りこぼし**（`apps/banto-hub/src/routes/(app)/tags/+page.svelte`
+  の `optNum`）。Svelte 5 は number input をクリアすると `null` を設定するため
+  `null === '' ` が false → `Number(null)` = 0 となり、しきい値 H/HH/L/LL・
+  スケーリング raw/eng を「空欄に戻した」つもりが **0 として黙って保存**される
+  （表示は空欄・保存値は 0）。TAG-P0-1 の `count.trim()` と同じ「string 宣言
+  フィールドへの number/null 混入」ファミリー（`FormState`/`ContinuousFormState`
+  の数値系フィールド全体）であり、**修正は `count` 単独でなくこの族全体を対象**
+  にする。
+- **連続登録 / CSV の dry-run も偽陽性**。dry-run は `TagService::create_batch`
+  のレジストリ級検証＋重複名までで、プロトコル別アドレス解析・式コンパイルを
+  行わない。よって Modbus 接続配下の SLMP 形式アドレスでも「検証OK: N件登録
+  できます」→登録→rebuild 失敗が無通知、と単票と同じ穴が2段階フロー側にもある。
+  TAG-P0-2 の「単票・連続・CSV・運転開始が同じ全構成 preflight を使う」方針で
+  吸収されるが、既存の検証ボタンが偽の安心を与える点を明示する。
+
+### 16.5 本 PR で実施した整合修正
+
+計画マージ（PR #91）が新規1ファイル追加のみで、既存文書との整合手当てが
+先送りされていたため、本 PR で以下を実施した（H8 規約「状態矛盾を放置しない」
+に対応）。
+
+- 本書 §14 の更新対象へ `docs/improvement-plan.md` を追加。
+- `docs/tag-server-design.md` §4.3 に、UX-5（初版は運転中編集ロック）と
+  TAG-P0-2（I1 CRUD の rebuild 失敗握り潰しの置き換え）の日付付き注記を追加。
+- `docs/plan.md` のヘッダ状態行と §4c に、本計画（T14〜T18）へのリンクを追加。
+
+残件（本 PR のスコープ外、別 docs パスで扱う）: `docs/plan.md` §4c の T5 行が
+「72h soak 実行」を T5-5 に帰属させている一方、本書と t5-handoff.md は
+T5-4=ソークハーネス / T5-5=実機サインオフと採番している。この T5-4/T5-5 の
+soak 帰属を t5-handoff.md の定義へ統一する。

@@ -408,6 +408,16 @@ T7-1）を `apps/banto-hub/core/src/hub.rs`（`CollectorManager::rebuild`、T7-2
 - `ApplyReport`（追加/削除/入れ替え/無変更の接続キー一覧・writer ローテート
   有無）を `GET /api/v1/status` の `last_apply` として公開（§9 参照）
 
+> **2026-08-09 オーナー決定（banto-hub-desktop-plan.md UX-5 / TAG-P0-2）**:
+> banto-hub のデスクトップアプリ／サービス運転計画（T14〜T18）では、初版の
+> 公開 UI と直接 REST で**運転（実機・SIM 収集）中の構成編集をロックする**
+> （運転中の CRUD は `409 Conflict`）。本節のオンライン部分再構成基盤
+> （`apply_config`）は廃止せず、内部の状態遷移と将来の下書き一括反映の基盤
+> として維持する。あわせて、I1 CRUD の「rebuild 失敗は CRUD 自体の失敗に
+> しない」設計（`rebuild_and_notify`）は、停止中保存の**全構成 preflight**
+> （保存前検証 → 保存成功＝実行可能を保証）へ置き換える。詳細は
+> [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §5.2 / §9.1 / §16。
+
 ## 5. 外部インターフェース設計
 
 優先順は **REST → WebSocket → (書き込み) → MQTT → gRPC → (OPC UA)**。
