@@ -207,9 +207,11 @@ async fn test_app(label: &str) -> TestApp {
     manager.rebuild().await.expect("initial rebuild");
     let write_control =
         std::sync::Arc::new(banto_hub_core::write_control::WriteControl::new(false));
+    let test_output = std::sync::Arc::new(banto_hub_core::test_output::TestOutputControl::new());
     let controller = std::sync::Arc::new(CollectionController::new(
         manager.clone(),
         write_control.clone(),
+        test_output.clone(),
     ));
     let status = controller.start(RunMode::Configured).await;
     assert_eq!(status.state, CollectionState::Running);
@@ -256,6 +258,7 @@ async fn test_app(label: &str) -> TestApp {
         mqtt,
         grpc_server,
         rate_limiter,
+        test_output,
     );
 
     let server = start(

@@ -38,6 +38,15 @@
 //!   （workspace Cargo.toml のコメント参照）。§5.6 の「v1 は平文」前提と
 //!   一致する - TLS が要る場合はリバースプロキシでの終端に委譲する設計。
 //!
+//! ## T15-3: テスト出力専用トピック（docs/banto-hub-desktop-plan.md §6.3）
+//!
+//! `AllSimulation`中は通常トピック（[`topic_for`]、retain=true）を抑止する
+//! （既存の PR #95 挙動 - このモジュールの[`run_eval_loop`]参照）。
+//! [`crate::test_output::TestOutputControl`]が現在の run_id に対して有効な
+//! 間だけ、[`test_topic_for`]（`{prefix}/test/{run_id}/...`）へ**別トピック**
+//! として`retain=false`で発行する - 通常トピックの retain 挙動は一切変えない
+//! （実装指示「Out of scope: Changing normal-topic retain behavior」）。
+//! [`PublishTarget`]がトピック・retain・payload 型の選択をまとめて持つ。
 //! ## タスク構成（設計 §3.4「収集に背圧をかけない」）
 //!
 //! [`MqttPublisher`] は [`CollectorManager`] の `tag_map`/`current_values`/
@@ -80,9 +89,10 @@ use tokio::time::MissedTickBehavior;
 
 use banto_collect::Quality;
 
-use crate::controller::{CollectionController, CollectionState, RunMode};
+use crate::controller::{CollectionController, CollectionState, CollectionStatus, RunId, RunMode};
 use crate::hub::{quality_str, read_current, CollectorManager, TagEntry};
 use crate::settings::MqttSettings;
+use crate::test_output::TestOutputControl;
 
 /// 評価タイマの固定周期 - `crate::stream::EVAL_TICK_MS` と同じ値・同じ理由
 /// （このモジュールの doc comment「タスク構成」参照）。
@@ -124,6 +134,21 @@ struct ValuePayload {
     t: i64,
 }
 
+/// T15-3（設計 §6.3「payload/メタデータに simulation=true と run_id を
+/// 含む」）: テスト出力専用ペイロード。`ValuePayload`と`v`/`q`/`t`の3
+/// フィールドは同じ形だが、`simulation`/`run_id`を常に追加する - このモジュール
+/// の doc comment「ワイヤ形式が同じでも型は independently に定義する」と同じ
+/// 判断で、通常の`ValuePayload`とは別に持つ（通常トピックへ`simulation`/
+/// `run_id`が混入することは決してない、という保証を型で表す）。
+#[derive(Debug, Serialize)]
+struct TestOutputPayload {
+    v: Option<f64>,
+    q: &'static str,
+    t: i64,
+    simulation: bool,
+    run_id: RunId,
+}
+
 fn qos_from_setting(qos: u8) -> QoS {
     // 設計 §5.3「QoS: 既定1。設定で0/1切り替え(2は使わない)」- 0/1以外の
     // 値が settings に紛れ込んだ場合も(REST 層で validate 済みのはずだが)
@@ -151,6 +176,110 @@ fn topic_for(prefix: &str, entry: &TagEntry) -> String {
 
 fn state_topic(prefix: &str) -> String {
     format!("{prefix}/{STATE_TOPIC_SUFFIX}")
+}
+
+/// T15-3（設計 §6.3「専用 MQTT topic prefix」）: テスト出力専用トピック。
+/// [`topic_for`]の`{prefix}/`直後に`test/{run_id}/`を挟むだけ -
+/// 購読側は`{prefix}/test/#`で全テスト出力、`{prefix}/test/{run_id}/#`で
+/// 特定 run だけを購読できる。通常トピック（[`topic_for`]）とは名前空間が
+/// 完全に分かれているため、購読フィルタが両者を取り違えることはない。
+fn test_topic_for(prefix: &str, run_id: RunId, entry: &TagEntry) -> String {
+    format!(
+        "{prefix}/test/{run_id}/{}/{}/{}",
+        entry.connection, entry.group, entry.name
+    )
+}
+
+/// T15-3: 発行先が通常トピックかテスト出力トピックかを1箇所にまとめる -
+/// [`publish_changed`]/[`publish_all`]はこの列挙が選ぶトピック文字列・
+/// `retain`値・payload 型に一切関与しない。`AllSimulation`中の通常出力抑止
+/// （既存の PR #95 挙動）と、テスト出力の`retain=false`固定は
+/// [`Self::retain`]がそのまま体現する。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PublishTarget {
+    /// 通常トピック（[`topic_for`]、retain=true）- `Running` +
+    /// `RunMode::Configured`のときだけ選ばれる。
+    Normal,
+    /// テスト出力トピック（[`test_topic_for`]、retain=false）-
+    /// `Running` + `RunMode::AllSimulation` かつ
+    /// `TestOutputControl::is_active_for(Some(run_id))`のときだけ選ばれる。
+    Test { run_id: RunId },
+}
+
+impl PublishTarget {
+    fn topic(&self, prefix: &str, entry: &TagEntry) -> String {
+        match self {
+            Self::Normal => topic_for(prefix, entry),
+            Self::Test { run_id } => test_topic_for(prefix, *run_id, entry),
+        }
+    }
+
+    /// 設計 §6.3「MQTT は retain=false 常時」- テスト出力は常に`false`、
+    /// 通常トピックは設計 §5.3の既存挙動どおり常に`true`（実装指示
+    /// 「Out of scope: Changing normal-topic retain behavior」）。
+    fn retain(&self) -> bool {
+        match self {
+            Self::Normal => true,
+            Self::Test { .. } => false,
+        }
+    }
+
+    fn payload_bytes(&self, value: Option<f64>, quality: Quality, ts_ms: i64) -> Vec<u8> {
+        match self {
+            Self::Normal => serde_json::to_vec(&ValuePayload {
+                v: value,
+                q: quality_str(quality),
+                t: ts_ms,
+            })
+            .expect("ValuePayload は常にシリアライズ可能"),
+            Self::Test { run_id } => serde_json::to_vec(&TestOutputPayload {
+                v: value,
+                q: quality_str(quality),
+                t: ts_ms,
+                simulation: true,
+                run_id: *run_id,
+            })
+            .expect("TestOutputPayload は常にシリアライズ可能"),
+        }
+    }
+}
+
+/// 現在の[`CollectionStatus`]と[`TestOutputControl`]から、いま発行すべき
+/// [`PublishTarget`]を決める（このモジュールの doc comment「T15-3」参照）。
+/// `Stopped`/`Starting`/`Stopping`/`Faulted`はいずれも`None`（発行しない）。
+/// `run_id`が無い(`None`)状態の`AllSimulation`は理論上到達しない
+/// （`Running`は常に`run_id`を持つ、`crate::controller`参照）が、防御的に
+/// `None`を返す。
+fn eval_target(
+    status: &CollectionStatus,
+    test_output: Option<&TestOutputControl>,
+) -> Option<PublishTarget> {
+    if status.state != CollectionState::Running {
+        return None;
+    }
+    match status.mode {
+        RunMode::Configured => Some(PublishTarget::Normal),
+        RunMode::AllSimulation => {
+            let run_id = status.run_id?;
+            test_output
+                .is_some_and(|control| control.is_active_for(Some(run_id)))
+                .then_some(PublishTarget::Test { run_id })
+        }
+    }
+}
+
+/// [`eval_target`]の`runtime_rx`有無の分岐をまとめる - コントローラを
+/// 注入していない互換パス（`MqttPublisher::new`、レガシー呼び出し元・
+/// 一部テスト）は常に[`PublishTarget::Normal`]（従来どおり revision 変化
+/// だけで動く - このモジュールの doc comment「タスク構成」参照）。
+fn current_target(
+    runtime_rx: Option<&watch::Receiver<CollectionStatus>>,
+    test_output: Option<&TestOutputControl>,
+) -> Option<PublishTarget> {
+    match runtime_rx {
+        Some(receiver) => eval_target(&receiver.borrow(), test_output),
+        None => Some(PublishTarget::Normal),
+    }
 }
 
 /// eval タスクが on_change の diff とスロットルを判定するための、タグ1本
@@ -182,6 +311,11 @@ struct RunningPublisher {
 pub struct MqttPublisher {
     manager: Arc<CollectorManager>,
     controller: Option<Arc<CollectionController>>,
+    /// T15-3: `controller`とセットで注入する - `controller`が`None`
+    /// （互換パス）なら`AllSimulation`という概念自体が観測できないため、
+    /// こちらも常に`None`のままでよい（このモジュールの doc comment
+    /// 「T15-3」参照）。
+    test_output: Option<Arc<TestOutputControl>>,
     connected_tx: watch::Sender<bool>,
     running: AsyncMutex<Option<RunningPublisher>>,
 }
@@ -195,6 +329,7 @@ impl MqttPublisher {
         Self {
             manager,
             controller: None,
+            test_output: None,
             connected_tx,
             running: AsyncMutex::new(None),
         }
@@ -202,13 +337,18 @@ impl MqttPublisher {
 
     /// Construct the production publisher with the lifecycle watch. Full
     /// catalog publication is then driven by a Running transition, not by a
-    /// stopped catalog commit.
+    /// stopped catalog commit. `test_output`（T15-3）は`controller`と同じ
+    /// `Arc`を`crate::runtime`が配る - `crate::controller::CollectionController::test_output`
+    /// が返すものと同一インスタンスでなければ、REST 側の有効化がこの eval
+    /// ループへ反映されない。
     pub fn new_with_controller(
         manager: Arc<CollectorManager>,
         controller: Arc<CollectionController>,
+        test_output: Arc<TestOutputControl>,
     ) -> Self {
         let mut publisher = Self::new(manager);
         publisher.controller = Some(controller);
+        publisher.test_output = Some(test_output);
         publisher
     }
 
@@ -290,6 +430,7 @@ impl MqttPublisher {
         let eval_task = tokio::spawn(run_eval_loop(
             self.manager.clone(),
             self.controller.clone(),
+            self.test_output.clone(),
             client,
             settings.prefix,
             qos,
@@ -346,9 +487,23 @@ async fn run_eventloop(
 }
 
 /// eval タスク本体 - このモジュールの doc comment「タスク構成」参照。
+///
+/// T15-3: `test_output`は`controller`が`Some`のときのみ意味を持つ（T15-3の
+/// doc comment参照）。`last_active_target`は「いま発行している
+/// [`PublishTarget`]」を追跡し、これが変わった瞬間（新しい run が始まった・
+/// `AllSimulation`へ切り替わった・[`TestOutputControl`]が有効化/無効化
+/// された等）だけ[`publish_all`]（diff・スロットル無視の一斉発行）を呼ぶ -
+/// それ以外の tick では[`publish_changed`]（diff + スロットル）を呼ぶ。
+/// テスト出力の有効化/無効化は`TestOutputControl`自身が watch チャネルを
+/// 持たない（`crate::test_output`のモジュール doc comment「Pure, sync,
+/// DB-free」参照）ため、250ms の tick 自体がこの遷移を検知する唯一の場
+/// になる - `changed`/`resync`アームは`runtime_rx`（`CollectionController`
+/// の状態遷移）由来の通知でしか起きない事象しか拾えない。
+#[allow(clippy::too_many_arguments)]
 async fn run_eval_loop(
     manager: Arc<CollectorManager>,
     controller: Option<Arc<CollectionController>>,
+    test_output: Option<Arc<TestOutputControl>>,
     client: AsyncClient,
     prefix: String,
     qos: QoS,
@@ -357,7 +512,7 @@ async fn run_eval_loop(
 ) {
     let mut revision_rx = manager.subscribe_revision();
     let mut runtime_rx = controller.map(|controller| controller.subscribe_status());
-    let mut last_running_run_id = None;
+    let mut last_active_target: Option<PublishTarget> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(EVAL_TICK_MS));
     // `crate::stream`と同じ理由(評価ループは「だいたい250msおき」でよく、
     // 詰まった分を積み上げて連射する必要はない)。
@@ -368,15 +523,21 @@ async fn run_eval_loop(
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                if let Some(receiver) = runtime_rx.as_ref() {
-                    let status = receiver.borrow();
-                    if status.state != CollectionState::Running || status.mode != RunMode::Configured {
+                match current_target(runtime_rx.as_ref(), test_output.as_deref()) {
+                    None => {
                         last.clear();
-                        last_running_run_id = None;
-                        continue;
+                        last_active_target = None;
+                    }
+                    Some(target) => {
+                        if last_active_target != Some(target) {
+                            last.clear();
+                            last_active_target = Some(target);
+                            publish_all(&manager, &client, target, &prefix, qos, &mut last).await;
+                        } else {
+                            publish_changed(&manager, &client, target, &prefix, qos, min_interval_ms, &mut last).await;
+                        }
                     }
                 }
-                publish_changed(&manager, &client, &prefix, qos, min_interval_ms, &mut last).await;
             }
             changed = async {
                 match runtime_rx.as_mut() {
@@ -386,23 +547,22 @@ async fn run_eval_loop(
             } => {
                 let Ok(running_notification) = changed else { break; };
                 if running_notification {
-                    let status = runtime_rx.as_ref().expect("runtime receiver").borrow().clone();
-                    if status.state == CollectionState::Running
-                        && status.mode == RunMode::Configured
-                        && last_running_run_id != status.run_id
-                    {
-                        last_running_run_id = status.run_id;
-                        publish_all(&manager, &client, &prefix, qos, &mut last).await;
-                    } else if status.state != CollectionState::Running
-                        || status.mode != RunMode::Configured
-                    {
-                        last.clear();
-                        last_running_run_id = None;
+                    match current_target(runtime_rx.as_ref(), test_output.as_deref()) {
+                        None => {
+                            last.clear();
+                            last_active_target = None;
+                        }
+                        Some(target) if last_active_target != Some(target) => {
+                            last.clear();
+                            last_active_target = Some(target);
+                            publish_all(&manager, &client, target, &prefix, qos, &mut last).await;
+                        }
+                        Some(_) => {}
                     }
                 } else {
                     // Compatibility path for test/legacy callers that do not
                     // inject a lifecycle controller.
-                    publish_all(&manager, &client, &prefix, qos, &mut last).await;
+                    publish_all(&manager, &client, PublishTarget::Normal, &prefix, qos, &mut last).await;
                 }
             }
             signal = resync_rx.recv() => {
@@ -411,15 +571,16 @@ async fn run_eval_loop(
                     // このタスクも畳む。
                     break;
                 }
-                if let Some(receiver) = runtime_rx.as_ref() {
-                    let status = receiver.borrow();
-                    if status.state != CollectionState::Running || status.mode != RunMode::Configured {
+                match current_target(runtime_rx.as_ref(), test_output.as_deref()) {
+                    None => {
                         last.clear();
-                        last_running_run_id = None;
-                        continue;
+                        last_active_target = None;
+                    }
+                    Some(target) => {
+                        last_active_target = Some(target);
+                        publish_all(&manager, &client, target, &prefix, qos, &mut last).await;
                     }
                 }
-                publish_all(&manager, &client, &prefix, qos, &mut last).await;
             }
         }
     }
@@ -431,10 +592,13 @@ async fn run_eval_loop(
 /// スロットル抑止中のタグは`last`を更新しない（発行できていないので直近の
 /// 発行状態は変わっていない）- 次の tick でも現在値と`last`を比較し続け、
 /// スロットル窓が明けた最初の tick でその時点の最新値を送る（設計
-/// §5.3「抑止された最新値はスロットル明け最初の tick で発行」）。
+/// §5.3「抑止された最新値はスロットル明け最初の tick で発行」）。T15-3:
+/// `target`が[`PublishTarget::Test`]でもロジックは共通 - トピック・retain・
+/// payload だけが`target`経由で変わる。
 async fn publish_changed(
     manager: &CollectorManager,
     client: &AsyncClient,
+    target: PublishTarget,
     prefix: &str,
     qos: QoS,
     min_interval_ms: i64,
@@ -463,7 +627,14 @@ async fn publish_changed(
             continue;
         }
 
-        publish_one(client, prefix, qos, entry, value, quality, ts_ms).await;
+        publish_one(
+            client,
+            target.topic(prefix, entry),
+            qos,
+            target.retain(),
+            target.payload_bytes(value, quality, ts_ms),
+        )
+        .await;
         last.insert(
             entry.external_name.clone(),
             PublishedState {
@@ -481,10 +652,16 @@ async fn publish_changed(
 /// タグ（`TagEntry::enabled == false`）も含めて全件発行する -
 /// `effective_sample`が`(None, Quality::Bad, ...)`を返すので、REST/WS と
 /// 同じ「欠測を隠さない」規律のまま`q: "bad"`が飛ぶ（`hub.rs`の
-/// `effective_sample`doc comment参照）。
+/// `effective_sample`doc comment参照）。T15-3:
+/// [`PublishTarget::Test`]で呼ばれた場合も同じ全件発行だが、
+/// `retain=false`（[`PublishTarget::retain`]）のため、ここでの一斉発行は
+/// 「broker 側に retain を残す」目的ではなく「新たにアクティブになった
+/// target（新規 run・テスト出力の有効化）に対して即座に現在値を送る」
+/// 目的専用になる。
 async fn publish_all(
     manager: &CollectorManager,
     client: &AsyncClient,
+    target: PublishTarget,
     prefix: &str,
     qos: QoS,
     last: &mut HashMap<String, PublishedState>,
@@ -496,7 +673,14 @@ async fn publish_all(
 
     for entry in map.iter() {
         let (value, quality, ts_ms) = read_current(entry, current.as_ref(), &server_store, now_ms);
-        publish_one(client, prefix, qos, entry, value, quality, ts_ms).await;
+        publish_one(
+            client,
+            target.topic(prefix, entry),
+            qos,
+            target.retain(),
+            target.payload_bytes(value, quality, ts_ms),
+        )
+        .await;
         last.insert(
             entry.external_name.clone(),
             PublishedState {
@@ -508,29 +692,24 @@ async fn publish_all(
     }
 }
 
+/// T15-3: `retain`を呼び出し元(`target.retain()`)から受け取る -
+/// 以前は常に`true`を`publish().await`へ直書きしていた。通常トピック
+/// （[`PublishTarget::Normal`]）は変わらず`true`、テスト出力
+/// （[`PublishTarget::Test`]）は常に`false`（設計 §6.3「MQTT は
+/// retain=false 常時」）。
 async fn publish_one(
     client: &AsyncClient,
-    prefix: &str,
+    topic: String,
     qos: QoS,
-    entry: &TagEntry,
-    value: Option<f64>,
-    quality: Quality,
-    ts_ms: i64,
+    retain: bool,
+    payload: Vec<u8>,
 ) {
-    let topic = topic_for(prefix, entry);
-    let payload = serde_json::to_vec(&ValuePayload {
-        v: value,
-        q: quality_str(quality),
-        t: ts_ms,
-    })
-    .expect("ValuePayload は常にシリアライズ可能");
-
     // `publish().await`はブローカー側の送信バッファ(`AsyncClient::new`の
     // cap引数)が詰まっていると待つ - このモジュールの doc comment
     // 「タスク構成」参照の通り、詰まるのはこの eval タスクだけで
     // `CollectorManager`/収集には一切波及しない(設計 §3.4)。エラーは
     // ログのみ(次の tick か resync で再試行される)。
-    if let Err(err) = client.publish(topic, qos, true, payload).await {
+    if let Err(err) = client.publish(topic, qos, retain, payload).await {
         eprintln!("banto-hub: MQTT タグ値の発行に失敗しました: {err}");
     }
 }
@@ -567,6 +746,128 @@ mod tests {
     fn state_topic_appends_dollar_state() {
         assert_eq!(state_topic("banto"), "banto/$state");
         assert_eq!(state_topic("factory1"), "factory1/$state");
+    }
+
+    fn sample_entry() -> TagEntry {
+        TagEntry {
+            external_name: "line1.fast.temp01".to_string(),
+            tag_key: "tag:1".to_string(),
+            ids: (1, 2, 3),
+            connection: "line1".to_string(),
+            group: "fast".to_string(),
+            name: "temp01".to_string(),
+            address: "40001".to_string(),
+            data_type: "i16".to_string(),
+            unit: None,
+            decimals: 0,
+            period_ms: 100,
+            enabled: true,
+            writable: false,
+            tag_kind: "plc".to_string(),
+            expression: None,
+            retain: false,
+            simulation: false,
+        }
+    }
+
+    /// T15-3（設計 §6.3「専用 MQTT topic prefix」）: 通常トピック
+    /// （`{prefix}/{connection}/{group}/{tag}`）とは名前空間が分かれる。
+    #[test]
+    fn test_topic_for_inserts_test_and_run_id_after_prefix() {
+        let entry = sample_entry();
+        assert_eq!(
+            test_topic_for("banto", 7, &entry),
+            "banto/test/7/line1/fast/temp01"
+        );
+        assert_ne!(
+            test_topic_for("banto", 7, &entry),
+            topic_for("banto", &entry)
+        );
+    }
+
+    /// T15-3（設計 §6.3「MQTT は retain=false 常時」）: 通常トピックの
+    /// retain=true は変えない(実装指示「Out of scope: 通常トピックの
+    /// retain 挙動変更」)。
+    #[test]
+    fn publish_target_retain_is_true_for_normal_and_false_for_test() {
+        assert!(PublishTarget::Normal.retain());
+        assert!(!PublishTarget::Test { run_id: 1 }.retain());
+    }
+
+    /// T15-3: payload に`simulation=true`と一致する`run_id`が乗る。
+    #[test]
+    fn test_target_payload_includes_simulation_and_run_id() {
+        let bytes =
+            PublishTarget::Test { run_id: 42 }.payload_bytes(Some(1.5), Quality::Good, 1000);
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["v"], 1.5);
+        assert_eq!(json["q"], "good");
+        assert_eq!(json["simulation"], true);
+        assert_eq!(json["run_id"], 42);
+    }
+
+    /// 通常トピックの payload には`simulation`/`run_id`が絶対に混入しない。
+    #[test]
+    fn normal_target_payload_has_no_simulation_fields() {
+        let bytes = PublishTarget::Normal.payload_bytes(Some(1.5), Quality::Good, 1000);
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(json.get("simulation").is_none());
+        assert!(json.get("run_id").is_none());
+    }
+
+    /// T15-3: `eval_target`は`Running`+`AllSimulation`でも
+    /// `TestOutputControl`が非アクティブなら`None`(通常トピックへは戻ら
+    /// ない - 既存の PR #95 抑止をそのまま維持)。
+    #[test]
+    fn eval_target_requires_active_test_output_during_all_simulation() {
+        let status = CollectionStatus {
+            state: CollectionState::Running,
+            mode: RunMode::AllSimulation,
+            run_id: Some(9),
+            last_error: None,
+            configured_revision: 1,
+            running_revision: 1,
+        };
+        assert_eq!(eval_target(&status, None), None);
+
+        let test_output = TestOutputControl::new();
+        assert_eq!(eval_target(&status, Some(&test_output)), None);
+
+        test_output.enable(9);
+        assert_eq!(
+            eval_target(&status, Some(&test_output)),
+            Some(PublishTarget::Test { run_id: 9 })
+        );
+
+        // 別 run_id に対する有効化はマッチしない。
+        test_output.enable(10);
+        assert_eq!(eval_target(&status, Some(&test_output)), None);
+    }
+
+    #[test]
+    fn eval_target_configured_running_is_always_normal() {
+        let status = CollectionStatus {
+            state: CollectionState::Running,
+            mode: RunMode::Configured,
+            run_id: Some(1),
+            last_error: None,
+            configured_revision: 1,
+            running_revision: 1,
+        };
+        assert_eq!(eval_target(&status, None), Some(PublishTarget::Normal));
+    }
+
+    #[test]
+    fn eval_target_stopped_is_always_none() {
+        let status = CollectionStatus {
+            state: CollectionState::Stopped,
+            mode: RunMode::AllSimulation,
+            run_id: None,
+            last_error: None,
+            configured_revision: 1,
+            running_revision: 1,
+        };
+        assert_eq!(eval_target(&status, None), None);
     }
 
     #[test]

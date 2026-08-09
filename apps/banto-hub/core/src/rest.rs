@@ -87,6 +87,7 @@ use crate::controller::{CollectionController, CollectionState, CollectionStatus,
 use crate::hub::{CollectorManager, SimulationCoverageReport, TagEntry};
 use crate::mqtt::MqttPublisher;
 use crate::settings::{MqttSettings, SettingsService};
+use crate::test_output::TestOutputControl;
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
 use crate::write_audit::{WriteAuditEntry, WriteAuditService};
 use crate::write_control::WriteControl;
@@ -1109,6 +1110,146 @@ fn write_control_router(
                 auth: auth.clone(),
                 min: Role::Admin,
                 resource: "write_control",
+                audit,
+            },
+            require_role_at_least,
+        ))
+        .layer(middleware::from_fn_with_state(auth, require_auth))
+}
+
+// --- テスト出力トグル (T15-3、設計 §6.3): admin 限定、CSRF + bearer -------
+//
+// `POST /api/test-output/enable`/`disable` は
+// `crate::test_output::TestOutputControl`（ライブフラグのみ、非永続 -
+// `write_control_router`と同型だが`persist_enabled`に相当するものはない）
+// を切り替える。`enable`は`write-control`と違い無条件では成功しない -
+// 収集が`Running`かつ mode が`AllSimulation`であることを要求する
+// （主用途「全体シミュレーション中は通常出力が空になる」の代替出力先を
+// 用意すること、実装指示参照）。`disable`は常に成功する
+// （設計「停止／終了／切替／サービス再起動後に必ず無効へ戻る」の一部を
+// 明示操作でも行えるようにする）。
+
+#[derive(Clone)]
+struct TestOutputAdminState {
+    test_output: Arc<TestOutputControl>,
+    controller: Arc<CollectionController>,
+    auth: AuthState,
+    audit: AuditLogService,
+    events: broadcast::Sender<ServerEvent>,
+}
+
+/// `GET /api/v1/status`の`test_output`と同じ形（`v1_status`参照）。
+/// `crate::test_output::TestOutputStatus`をそのまま JSON へ写す。
+#[derive(Debug, Serialize, ToSchema)]
+struct TestOutputStatusEntry {
+    enabled: bool,
+    run_id: Option<u64>,
+}
+
+impl From<crate::test_output::TestOutputStatus> for TestOutputStatusEntry {
+    fn from(status: crate::test_output::TestOutputStatus) -> Self {
+        Self {
+            enabled: status.enabled,
+            run_id: status.run_id,
+        }
+    }
+}
+
+/// [`test_output_enable`]が有効化の前提を満たさないときの応答 - 実装指示
+/// 「Reject with 409...if collection is not Running or mode is not
+/// AllSimulation」。`RegistryMutationError::CollectionEditLocked`と同じ
+/// 「409 + 現在の`CollectionStatusResponse`を返す」形にする(呼び出し側が
+/// 状態を見て次にどう操作すべきか判断できるようにする)。
+struct TestOutputNotEligible(CollectionStatusResponse);
+
+impl IntoResponse for TestOutputNotEligible {
+    fn into_response(self) -> Response {
+        (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "test_output_not_available",
+                "status": self.0,
+                "message": "テスト出力は収集が稼働中かつ全 PLC シミュレーション中のみ有効化できます。",
+            })),
+        )
+            .into_response()
+    }
+}
+
+async fn test_output_enable(
+    State(state): State<TestOutputAdminState>,
+    headers: HeaderMap,
+) -> Result<Json<TestOutputStatusEntry>, TestOutputNotEligible> {
+    let status = state.controller.status();
+    let run_id = match (status.state, status.mode, status.run_id) {
+        (CollectionState::Running, RunMode::AllSimulation, Some(run_id)) => run_id,
+        _ => return Err(TestOutputNotEligible(status.into())),
+    };
+    state.test_output.enable(run_id);
+
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "enable",
+        "test_output",
+        "1",
+        Some(json!({ "runId": run_id })),
+    )
+    .await;
+    let _ = state.events.send(ServerEvent::ResourceChanged {
+        resource: "test_output".to_string(),
+    });
+
+    Ok(Json(state.test_output.status().into()))
+}
+
+async fn test_output_disable(
+    State(state): State<TestOutputAdminState>,
+    headers: HeaderMap,
+) -> Json<TestOutputStatusEntry> {
+    state.test_output.disable();
+
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "disable",
+        "test_output",
+        "1",
+        None,
+    )
+    .await;
+    let _ = state.events.send(ServerEvent::ResourceChanged {
+        resource: "test_output".to_string(),
+    });
+
+    Json(state.test_output.status().into())
+}
+
+fn test_output_router(
+    test_output: Arc<TestOutputControl>,
+    controller: Arc<CollectionController>,
+    audit: AuditLogService,
+    auth: AuthState,
+    events: broadcast::Sender<ServerEvent>,
+) -> Router {
+    let state = TestOutputAdminState {
+        test_output,
+        controller,
+        auth: auth.clone(),
+        audit: audit.clone(),
+        events,
+    };
+    Router::new()
+        .route("/api/test-output/enable", post(test_output_enable))
+        .route("/api/test-output/disable", post(test_output_disable))
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            RoleGuard {
+                auth: auth.clone(),
+                min: Role::Admin,
+                resource: "test_output",
                 audit,
             },
             require_role_at_least,
@@ -3230,6 +3371,8 @@ pub(crate) struct TagSpaceState {
     /// T2-4（設計 §6-6）: `GET /api/v1/status` の `write_enabled`/
     /// `write_was_enabled_before_restart` のため。
     pub(crate) write_control: Arc<WriteControl>,
+    /// T15-3（設計 §6.3）: `GET /api/v1/status` の `test_output` のため。
+    pub(crate) test_output: Arc<TestOutputControl>,
     /// T3（設計 §5.3）: `GET /api/v1/status` の `mqtt.connected` のため。
     pub(crate) mqtt: Arc<MqttPublisher>,
 }
@@ -3722,6 +3865,11 @@ struct StatusResponse {
     /// `crate::write_control::WriteControl` のモジュール doc comment
     /// 参照。ライブの `write_enabled` には一切影響しない)。
     write_was_enabled_before_restart: bool,
+    /// T15-3（設計 §6.3）: テスト出力（現在の run コンテキスト限定・
+    /// 非永続）が今いま有効かどうかと、有効な場合はどの run に紐付いて
+    /// いるか。`crate::test_output::TestOutputControl`のモジュール doc
+    /// comment参照。
+    test_output: TestOutputStatusEntry,
     /// T3（設計 §5.3）: MQTT publish の設定/接続状態。
     mqtt: MqttStatusEntry,
     /// T4（設計 §5.4）: gRPC サーバーの設定。
@@ -3830,6 +3978,7 @@ async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResp
         connections: entries,
         write_enabled: state.write_control.is_enabled(),
         write_was_enabled_before_restart: state.write_control.was_enabled_before_restart(),
+        test_output: state.test_output.status().into(),
         mqtt: MqttStatusEntry {
             enabled: mqtt_settings.enabled,
             connected: state.mqtt.connected(),
@@ -4176,6 +4325,7 @@ async fn v1_write_value(
         MqttStatusEntry,
         GrpcStatusEntry,
         StatusResponse,
+        TestOutputStatusEntry,
         EventEntry,
         EventsResponse,
         WriteValueRequest,
@@ -4395,11 +4545,16 @@ fn tag_space_router(
     // `WriteState`/`GrpcService` へ同じ `Arc` を配る。
     rate_limiter: Arc<AsyncMutex<WriteRateLimiter>>,
     enforce_collection_state: bool,
+    // T15-3（設計 §6.3）: `GET /api/v1/status` の `test_output` のため -
+    // `controller`が保持するものと**同じ** `Arc`（呼び出し元の責務、
+    // `test_output_router`のそれと同じ規律）。
+    test_output: Arc<TestOutputControl>,
 ) -> Router {
     let state = TagSpaceState {
         manager: manager.clone(),
         controller: controller.clone(),
         write_control: write_control.clone(),
+        test_output,
         mqtt,
     };
     let auth_state = TagSpaceAuthState {
@@ -4488,6 +4643,13 @@ fn api_router_with_controller_mode(
     // 構築すると REST/gRPC でレート制限のバジェットが分裂してしまう。
     rate_limiter: Arc<AsyncMutex<WriteRateLimiter>>,
     legacy_live_reconfigure: bool,
+    // T15-3（設計 §6.3）: テスト出力の非永続フラグ - `controller`が保持
+    // するものと**同じ** `Arc` を渡すこと（呼び出し元の責務、
+    // `write_control`/`mqtt`/`grpc_server`と同じ規約）。ここで新規に
+    // 構築すると `CollectionController`・`MqttPublisher`・
+    // `GrpcService`・この REST admin エンドポイントの4者が別々の
+    // フラグを見てしまう。
+    test_output: Arc<TestOutputControl>,
 ) -> Router {
     let audited_auth_routes = auth_routes(auth.clone()).layer(middleware::from_fn_with_state(
         LogoutAuditState {
@@ -4528,6 +4690,13 @@ fn api_router_with_controller_mode(
         .merge(write_control_router(
             write_control.clone(),
             manager.clone(),
+            audit.clone(),
+            auth.clone(),
+            events.clone(),
+        ))
+        .merge(test_output_router(
+            test_output.clone(),
+            controller.clone(),
             audit.clone(),
             auth.clone(),
             events.clone(),
@@ -4573,6 +4742,7 @@ fn api_router_with_controller_mode(
             mqtt,
             rate_limiter,
             !legacy_live_reconfigure,
+            test_output,
         ))
         .merge(openapi_router())
 }
@@ -4635,6 +4805,7 @@ pub fn api_router_with_controller(
     mqtt: Arc<MqttPublisher>,
     grpc_server: Arc<crate::grpc::GrpcServer>,
     rate_limiter: Arc<AsyncMutex<WriteRateLimiter>>,
+    test_output: Arc<TestOutputControl>,
 ) -> Router {
     api_router_with_controller_mode(
         users,
@@ -4654,6 +4825,7 @@ pub fn api_router_with_controller(
         grpc_server,
         rate_limiter,
         false,
+        test_output,
     )
 }
 
@@ -4678,9 +4850,11 @@ pub fn api_router(
     grpc_server: Arc<crate::grpc::GrpcServer>,
     rate_limiter: Arc<AsyncMutex<WriteRateLimiter>>,
 ) -> Router {
+    let test_output = Arc::new(TestOutputControl::new());
     let controller = Arc::new(crate::controller::CollectionController::new(
         manager.clone(),
         write_control.clone(),
+        test_output.clone(),
     ));
     api_router_with_controller_mode(
         users,
@@ -4700,6 +4874,7 @@ pub fn api_router(
         grpc_server,
         rate_limiter,
         true,
+        test_output,
     )
 }
 

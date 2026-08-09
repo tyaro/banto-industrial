@@ -1,9 +1,9 @@
 # banto-hub アプリ／サービス運転計画（T14〜）
 
 作成日: 2026-08-09
-状態: **計画確定。T14 完了、T15 は T15-1（全体 SIM オーバーライド）と外部出力安全化・T15-2（SIM 対応範囲プリフライト）まで実装済み。T15 残件はテスト出力 namespace と write peek。次は T15 残件または T16。**
+状態: **計画確定。T14 完了、T15 は T15-1〜T15-3（全体 SIM・外部出力安全化・対応範囲プリフライト・テスト出力 namespace）まで実装済み。T15 残件は write peek（no-spawn）。次は T15-4 または T16。**
 最終検証日(コード照合): 2026-08-09
-基準コミット: `8266f59`（main、PR #95 マージ後。本ブランチで T15-2 を追加）
+基準コミット: `f94e181`（main、PR #96 マージ後。本ブランチで T15-3 を統合）
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [ux-plan.md](ux-plan.md)、
@@ -1066,8 +1066,50 @@ fallback を開いた時の初期フォーカスは見出し、失敗後はエ�
 （`apps/banto-hub/core/src/hub.rs`）+
 `GET /api/collection/simulation-coverage`（`apps/banto-hub/core/src/rest.rs`、
 admin 限定）として実装済み。プランどおり表示専用で、`start(AllSimulation)`自体は
-未対応タグの有無に関わらずブロックしない。T15 残件（本スライス対象外）は
-テスト出力 namespace 分離と HubSessions の write peek（no-spawn）。
+未対応タグの有無に関わらずブロックしない。
+
+**T15-3 実装メモ（2026-08-09）**: テスト出力専用 namespace（上記「テスト出力は
+専用 namespace...」の受け入れ条件部分）を実装した。
+
+- 新規モジュール `crate::test_output::TestOutputControl`（`AtomicBool` +
+  `AtomicU64` のみ、DB 非依存 - `write_control.rs` と同型だが
+  `was_enabled_before_restart` に相当するものすら持たない、一切永続化しない
+  設計）。`enable(run_id)`／`disable()`／`is_active_for(run_id)`／`status()`。
+  `CollectionController` が `write_control` と同じ遷移点（`start_locked`／
+  `stop_locked`／`set_mode_locked`）で `disable()` する - 停止／新規開始／
+  モード切替のいずれでも必ず無効へ戻る。
+- REST: `POST /api/test-output/enable`|`disable`（admin + CSRF + audit +
+  `ResourceChanged`、`crate::rest::test_output_router`）。`enable` は収集が
+  `Running` かつ `AllSimulation` でなければ 409
+  `test_output_not_available`（現在の `CollectionStatusResponse` 付き）で
+  拒否する。`GET /api/v1/status` に `test_output: { enabled, run_id }` を
+  追加。
+- MQTT（`crate::mqtt`）: `{prefix}/test/{run_id}/{connection}/{group}/{tag}`
+  （`test_topic_for`）へ、`TestOutputControl` が現在の run_id に対して有効な
+  間だけ `retain=false` で発行する（`PublishTarget` 列挙が通常/テスト出力の
+  トピック・retain・payload 型をまとめて選ぶ）。ペイロードは
+  `{v, q, t, simulation: true, run_id}`。通常トピックの `retain=true` は
+  変更していない。
+- gRPC（`crate::grpc`）: `StreamValuesRequest.test_output = true` で opt-in。
+  `TestOutputControl` が現在の run_id に対して有効でなければ
+  `FAILED_PRECONDITION test_output_disabled` で拒否する。有効なストリームの
+  `ValueBatch` には `simulation = true` と一致する `run_id` を乗せる。
+  テスト出力が無効化された・収集が停止した・run が切り替わったのいずれかで
+  ストリームを能動終了する（`is_active_for` を250ms ごとに再検査する既存の
+  評価ループへ相乗り）。既定（`test_output = false`）の挙動は PR #95
+  （`AllSimulation` 中は `simulation_output_disabled`）を変更していない。
+- proto（`proto/tagserver/v1/tagserver.proto`）:
+  `StreamValuesRequest.test_output`（`bool`）、`ValueBatch.simulation`
+  （`bool`）／`ValueBatch.run_id`（`optional uint64`）を追加（既存フィールドは
+  変更なし - 後方互換）。
+- テスト: `test_output.rs` の単体テスト（enable/disable/run_id 不一致）、
+  `mqtt.rs`/`grpc.rs` の `eval_target`/`test_output_active_run_id` 単体
+  テスト、`tests/mqtt.rs`/`tests/grpc.rs` の統合テスト（テスト出力トピック/
+  ストリームの有効化前後の挙動、`retain=false` の確認、収集停止での
+  自動無効化と再有効化拒否）。
+- 対象外（このスライスでは未実装）: API キー REST/WS 経由のテスト出力、
+  UI のトグル（T18）、通常トピックの retain 挙動変更、フラグの永続化。
+  T15 残件は HubSessions の write peek（no-spawn）。
 
 ### T16: デスクトップシェルとタスクトレイ
 

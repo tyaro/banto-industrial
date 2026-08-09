@@ -13,6 +13,7 @@ use tokio::sync::watch;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::hub::CollectorManager;
+use crate::test_output::TestOutputControl;
 use crate::write_control::WriteControl;
 
 /// A collection lifecycle state.
@@ -86,6 +87,11 @@ pub type RuntimeStatus = CollectionStatus;
 pub struct CollectionController {
     manager: Arc<CollectorManager>,
     write_control: Arc<WriteControl>,
+    /// T15-3（設計 §6.3）: `write_control`と同じ遷移点（`start_locked`/
+    /// `stop_locked`/モード切替）で`disable()`する - テスト出力が「現在の
+    /// run コンテキストのみ」に留まることをここで保証する
+    /// （`crate::test_output`のモジュール doc comment参照）。
+    test_output: Arc<TestOutputControl>,
     state: Mutex<ControllerState>,
     transition: AsyncMutex<()>,
     run_seq: AtomicU64,
@@ -101,7 +107,11 @@ struct ControllerState {
 }
 
 impl CollectionController {
-    pub fn new(manager: Arc<CollectorManager>, write_control: Arc<WriteControl>) -> Self {
+    pub fn new(
+        manager: Arc<CollectorManager>,
+        write_control: Arc<WriteControl>,
+        test_output: Arc<TestOutputControl>,
+    ) -> Self {
         let initial = CollectionStatus {
             state: CollectionState::Stopped,
             mode: RunMode::Configured,
@@ -114,6 +124,7 @@ impl CollectionController {
         Self {
             manager,
             write_control,
+            test_output,
             state: Mutex::new(ControllerState {
                 state: CollectionState::Stopped,
                 mode: RunMode::Configured,
@@ -124,6 +135,12 @@ impl CollectionController {
             run_seq: AtomicU64::new(0),
             status_tx,
         }
+    }
+
+    /// T15-3: `crate::rest`の`GET /api/v1/status`の`test_output`欄と
+    /// `POST /api/test-output/enable|disable`ハンドラのため。
+    pub fn test_output(&self) -> Arc<TestOutputControl> {
+        self.test_output.clone()
     }
 
     /// Return the current state without waiting for an in-flight transition.
@@ -204,6 +221,7 @@ impl CollectionController {
         if current.state == CollectionState::Stopped {
             if current.mode != mode {
                 self.write_control.disable();
+                self.test_output.disable();
             }
             self.set_mode_locked(mode);
             self.publish_status();
@@ -248,6 +266,7 @@ impl CollectionController {
             state.last_error = None;
         }
         self.write_control.disable();
+        self.test_output.disable();
         self.publish_status();
 
         let result = self.manager.apply_run(mode).await;
@@ -280,6 +299,7 @@ impl CollectionController {
             state.state = CollectionState::Stopping;
         }
         self.write_control.disable();
+        self.test_output.disable();
         self.publish_status();
         self.manager.stop().await;
         self.manager.advance_running_revision();
@@ -341,7 +361,12 @@ mod tests {
             Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new()))),
         ));
         let write_control = Arc::new(WriteControl::new(true));
-        let controller = Arc::new(CollectionController::new(manager, write_control.clone()));
+        let test_output = Arc::new(TestOutputControl::new());
+        let controller = Arc::new(CollectionController::new(
+            manager,
+            write_control.clone(),
+            test_output,
+        ));
         write_control.enable();
         (dir, controller)
     }
@@ -458,5 +483,46 @@ mod tests {
         assert_eq!(stopped.state, CollectionState::Stopped);
         assert_eq!(stopped.configured_revision, 1);
         assert_eq!(stopped.running_revision, 2);
+    }
+
+    /// T15-3（設計 §6.3「停止／終了／切替／サービス再起動後に必ず無効へ
+    /// 戻る」）: `write_control`と同じ遷移点(`start_locked`/
+    /// `stop_locked`/停止中のモード切替)で`test_output`も必ず disable
+    /// される。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_output_auto_disables_on_every_lifecycle_transition() {
+        let (_dir, controller) = controller_env().await;
+        let test_output = controller.test_output();
+
+        let running = controller.start(RunMode::AllSimulation).await;
+        assert_eq!(running.state, CollectionState::Running);
+        let run_id = running.run_id.expect("running has a run_id");
+        test_output.enable(run_id);
+        assert!(test_output.is_active_for(Some(run_id)));
+
+        // 新規 start (別 run_id への切替) - 既存 run 用のアーミングは
+        // 引き継がれない。
+        let restarted = controller.start(RunMode::Configured).await;
+        assert_eq!(restarted.state, CollectionState::Running);
+        assert_ne!(restarted.run_id, running.run_id);
+        assert!(!test_output.is_enabled());
+        assert!(!test_output.is_active_for(restarted.run_id));
+
+        test_output.enable(restarted.run_id.expect("running has a run_id"));
+        assert!(test_output.is_enabled());
+        let stopped = controller.stop().await;
+        assert_eq!(stopped.state, CollectionState::Stopped);
+        assert!(!test_output.is_enabled(), "stop must disable test_output");
+
+        // 停止中のモード切替も disable する(要件「モード切替」)。
+        controller.set_mode(RunMode::AllSimulation).await;
+        let running_again = controller.start(RunMode::AllSimulation).await;
+        test_output.enable(running_again.run_id.expect("running has a run_id"));
+        assert!(test_output.is_enabled());
+        controller.set_mode(RunMode::Configured).await;
+        assert!(
+            !test_output.is_enabled(),
+            "a running->stopped mode switch must disable test_output"
+        );
     }
 }

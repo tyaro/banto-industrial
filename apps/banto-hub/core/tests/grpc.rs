@@ -55,6 +55,7 @@ use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::rest::api_router;
 use banto_hub_core::settings::GrpcSettings;
+use banto_hub_core::test_output::TestOutputControl;
 use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
 use banto_hub_core::write_control::WriteControl;
@@ -183,6 +184,9 @@ struct TestApp {
     manager: Arc<CollectorManager>,
     write_control: Arc<WriteControl>,
     controller: Arc<CollectionController>,
+    // T15-3: `controller`が保持するものと同一の `Arc` - `StreamValues`の
+    // `test_output=true`をテストから直接有効化/無効化するため。
+    test_output: Arc<TestOutputControl>,
     grpc_server: Arc<GrpcServer>,
     _env: TempEnv,
 }
@@ -247,9 +251,11 @@ async fn test_app(label: &str) -> TestApp {
     let rate_limiter = Arc::new(AsyncMutex::new(WriteRateLimiter::new(
         WriteRateLimitConfig::default(),
     )));
+    let test_output = Arc::new(TestOutputControl::new());
     let controller = Arc::new(CollectionController::new(
         manager.clone(),
         write_control.clone(),
+        test_output.clone(),
     ));
     let status = controller.start(RunMode::Configured).await;
     assert_eq!(status.state, CollectionState::Running);
@@ -263,7 +269,8 @@ async fn test_app(label: &str) -> TestApp {
         rate_limiter.clone(),
         events_tx.clone(),
     )
-    .with_controller(controller.clone());
+    .with_controller(controller.clone())
+    .with_test_output(test_output.clone());
     let grpc_server = Arc::new(GrpcServer::new(grpc_service));
 
     let router = api_router(
@@ -291,6 +298,7 @@ async fn test_app(label: &str) -> TestApp {
         manager,
         write_control,
         controller,
+        test_output,
         grpc_server,
         _env: env,
     }
@@ -633,6 +641,7 @@ async fn stream_values_sends_initial_snapshot_then_on_change() {
                 tags: vec![external_name.clone()],
                 mode: SubscribeMode::OnChange as i32,
                 interval_ms: 0,
+                test_output: false,
             },
             &key,
         ))
@@ -710,6 +719,7 @@ async fn stream_values_ends_when_all_simulation_starts() {
                 tags: vec![external_name.clone()],
                 mode: SubscribeMode::OnChange as i32,
                 interval_ms: 0,
+                test_output: false,
             },
             &key,
         ))
@@ -753,6 +763,7 @@ async fn stream_values_ends_when_all_simulation_starts() {
                 tags: vec![external_name],
                 mode: SubscribeMode::OnChange as i32,
                 interval_ms: 0,
+                test_output: false,
             },
             &key,
         ))
@@ -762,6 +773,208 @@ async fn stream_values_ends_when_all_simulation_starts() {
     assert_eq!(err.message(), "simulation_output_disabled");
 
     sim.stop();
+}
+
+// ---------------------------------------------------------------------------
+// T15-3: StreamValues(test_output=true) - 専用 stream namespace
+// ---------------------------------------------------------------------------
+
+/// `test_output=true`は`TestOutputControl`が現在の run_id に対して明示的に
+/// `enable`されるまで honored されない - `Stopped`でも`AllSimulation`の
+/// `Running`でも、`enable`前は常に`test_output_disabled`（`FAILED_PRECONDITION`）
+/// で拒否される（`crate::grpc::stream_values`の doc comment「T15-3」参照）。
+/// `enable`後は初回バッチに`simulation=true`・一致する`run_id`が乗る。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_values_test_output_requires_enabling_before_it_is_honored() {
+    let app = test_app("stream-values-test-output-gate").await;
+    let sim = Simulator::start().await;
+    sim.set_word(SlmpDevice::D, 100, 10);
+
+    let (_tag_id, external_name) = make_tag(
+        &app,
+        "line1",
+        sim.addr.port(),
+        "temp01",
+        "D100",
+        "u16",
+        false,
+        true,
+    )
+    .await;
+
+    let (key, _id) = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+    let (_port, mut client) = start_grpc_and_connect(&app.grpc_server).await;
+
+    // Stopped(既定) + test_output=true -> 拒否。
+    let err = client
+        .stream_values(bearer_request(
+            StreamValuesRequest {
+                tags: vec![external_name.clone()],
+                mode: SubscribeMode::OnChange as i32,
+                interval_ms: 0,
+                test_output: true,
+            },
+            &key,
+        ))
+        .await
+        .expect_err("test_output=true without an active TestOutputControl must be rejected");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(err.message(), "test_output_disabled");
+
+    // AllSimulation を起動しても、明示的に enable するまでは依然拒否
+    // (`TestOutputControl`自身は mode を見ない - REST の
+    // `POST /api/test-output/enable`が有効化時に前提条件を検査する側
+    // であって、gRPC 側のゲートは`is_active_for`だけを見る設計 -
+    // `crate::grpc::test_output_active_run_id`の doc comment参照)。
+    let status = app.controller.start(RunMode::AllSimulation).await;
+    assert_eq!(status.state, CollectionState::Running);
+    let run_id = status
+        .run_id
+        .expect("AllSimulation run should have a run_id");
+
+    let err = client
+        .stream_values(bearer_request(
+            StreamValuesRequest {
+                tags: vec![external_name.clone()],
+                mode: SubscribeMode::OnChange as i32,
+                interval_ms: 0,
+                test_output: true,
+            },
+            &key,
+        ))
+        .await
+        .expect_err("test_output=true is still rejected until explicitly enabled");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(err.message(), "test_output_disabled");
+
+    // 通常 stream（test_output=false）は既存 PR #95 挙動どおり
+    // `AllSimulation`中は拒否されたままであること(回帰確認)。
+    let err = client
+        .stream_values(bearer_request(
+            StreamValuesRequest {
+                tags: vec![external_name.clone()],
+                mode: SubscribeMode::OnChange as i32,
+                interval_ms: 0,
+                test_output: false,
+            },
+            &key,
+        ))
+        .await
+        .expect_err("normal stream must remain disabled during all-simulation");
+    assert_eq!(err.code(), tonic::Code::Unavailable);
+    assert_eq!(err.message(), "simulation_output_disabled");
+
+    // enable() すれば通り、バッチに simulation=true・一致する run_id が乗る。
+    app.test_output.enable(run_id);
+    let mut stream = client
+        .stream_values(bearer_request(
+            StreamValuesRequest {
+                tags: vec![external_name],
+                mode: SubscribeMode::OnChange as i32,
+                interval_ms: 0,
+                test_output: true,
+            },
+            &key,
+        ))
+        .await
+        .expect("test_output=true should succeed once TestOutputControl is armed for this run_id")
+        .into_inner();
+    let batch = stream
+        .message()
+        .await
+        .expect("stream should not error")
+        .expect("initial snapshot should be sent");
+    assert!(
+        batch.simulation,
+        "test-output batches must set simulation=true"
+    );
+    assert_eq!(batch.run_id, Some(run_id));
+
+    sim.stop();
+}
+
+/// テスト出力 stream は、明示的な`disable`（設計「明示操作でも無効化」）でも
+/// 収集停止（設計「停止／終了／切替後に必ず無効へ戻る」・
+/// `CollectionController::stop_locked`が`test_output.disable()`する）でも
+/// 終了する - どちらも`TestOutputControl::is_active_for`をこのバッチの
+/// `run_id`に対して false にする、という同じ経路（`crate::grpc::stream_values`
+/// の spawn したタスクの doc comment「T15-3」参照）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stream_values_test_output_ends_when_disabled_or_collection_stops() {
+    for scenario in ["explicit_disable", "collection_stop"] {
+        let app = test_app(&format!("stream-values-test-output-end-{scenario}")).await;
+        let sim = Simulator::start().await;
+        sim.set_word(SlmpDevice::D, 100, 10);
+
+        let (_tag_id, external_name) = make_tag(
+            &app,
+            "line1",
+            sim.addr.port(),
+            "temp01",
+            "D100",
+            "u16",
+            false,
+            true,
+        )
+        .await;
+
+        let status = app.controller.start(RunMode::AllSimulation).await;
+        let run_id = status
+            .run_id
+            .expect("AllSimulation run should have a run_id");
+        app.test_output.enable(run_id);
+
+        let (key, _id) = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+        let (_port, mut client) = start_grpc_and_connect(&app.grpc_server).await;
+
+        let mut stream = client
+            .stream_values(bearer_request(
+                StreamValuesRequest {
+                    tags: vec![external_name],
+                    mode: SubscribeMode::OnChange as i32,
+                    interval_ms: 0,
+                    test_output: true,
+                },
+                &key,
+            ))
+            .await
+            .expect("test_output stream should succeed while armed")
+            .into_inner();
+
+        let initial = stream
+            .message()
+            .await
+            .expect("stream should not error")
+            .expect("initial snapshot should be sent");
+        assert!(initial.simulation);
+        assert_eq!(initial.run_id, Some(run_id));
+
+        match scenario {
+            "explicit_disable" => app.test_output.disable(),
+            "collection_stop" => {
+                app.controller.stop().await;
+            }
+            other => unreachable!("unexpected scenario: {other}"),
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                remaining > Duration::ZERO,
+                "test-output stream should end after {scenario}"
+            );
+            let next = tokio::time::timeout(remaining, stream.message())
+                .await
+                .unwrap_or_else(|_| panic!("test-output stream should end after {scenario}"))
+                .expect("stream termination should not be a gRPC error");
+            if next.is_none() {
+                break;
+            }
+        }
+
+        sim.stop();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -788,6 +1001,7 @@ async fn stream_values_wildcard_picks_up_a_tag_added_after_config_changed() {
                 tags: vec!["line1.fast.*".to_string()],
                 mode: SubscribeMode::OnChange as i32,
                 interval_ms: 0,
+                test_output: false,
             },
             &key,
         ))
@@ -1531,6 +1745,7 @@ async fn stream_values_with_a_read_colon_key_only_resolves_the_in_scope_tag() {
                 tags: vec!["*".to_string()],
                 mode: SubscribeMode::OnChange as i32,
                 interval_ms: 0,
+                test_output: false,
             },
             &key,
         ))
