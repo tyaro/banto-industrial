@@ -85,6 +85,9 @@ H9(SLMP 構造化エラー)・H5 の E2E 拡充(いずれも Phase 4 相当/環�
   オーバーフローが理論上可能。対応は visit の反復化(明示スタック)か
   依存チェーン深さの上限追加。式1本内のネストを抑える H1 のガードでは
   防げない別経路
+- **実施記録(残件、#59/#73)**: `banto-expr/src/dag.rs` の `visit` を
+  明示スタックの反復 DFS へ書き換え、一括登録での同種スタック
+  オーバーフロー経路を解消(Phase 2)
 
 ### H2: 手動書き込み(タグモニタ)の安全意味論 — 状態: 完了(2026-08-08、本 PR)
 
@@ -239,7 +242,7 @@ H9(SLMP 構造化エラー)・H5 の E2E 拡充(いずれも Phase 4 相当/環�
   0 エラー・eslint / prettier 通過
 - **残り(Phase 4)**: banto-hub / relay-wright の E2E 拡充
 
-### H6: サプライチェーン/再現性 — 状態: 未着手
+### H6: サプライチェーン/再現性 — 状態: 完了(2026-08-08、#59)
 
 - **事実**: `rust-toolchain.toml` なし(CI は floating stable)、
   cargo-deny / cargo-audit / SBOM / dependabot なし
@@ -249,6 +252,10 @@ H9(SLMP 構造化エラー)・H5 の E2E 拡充(いずれも Phase 4 相当/環�
   H5 と同時
 - **受け入れ条件**: CI に deny/audit ジョブが載り green、toolchain 固定後
   も全ジョブ green
+- **実施記録(2026-08-08、#59)**: `rust-toolchain.toml` でツールチェーンを
+  固定・`deny.toml`(ライセンス+advisory)+
+  `.github/workflows/supply-chain.yml`(cargo-deny ジョブ)・
+  `.github/dependabot.yml`(cargo/npm/actions)を追加、CI green
 
 ### H7: ソーク実行・障害系テスト — 状態: ⑤+②③④+A.2 完了・④ ギャップ修正済み(2026-08-09)。残るは ①(実機 soak、環境依存)のみ
 
@@ -326,7 +333,7 @@ H9(SLMP 構造化エラー)・H5 の E2E 拡充(いずれも Phase 4 相当/環�
 - **備考**: ① 実機相当環境(Windows)での 72h soak 実行はコンテナ/CI では完結しない
   (実行環境と 72h の実時間が必要)ため当セッション対象外
 
-### H8: ドキュメント整合 — 状態: 一部本 PR
+### H8: ドキュメント整合 — 状態: 完了(#58/#59)
 
 - **事実**: `docs/tag-server-design.md` はヘッダが「設計先行(実装未着手)」
   のまま、同一ファイル §9 の表が T6〜T12 を「実装済み」と記載する自己矛盾。
@@ -339,6 +346,10 @@ H9(SLMP 構造化エラー)・H5 の E2E 拡充(いずれも Phase 4 相当/環�
   最小 README
 - **受け入れ条件**: ヘッダと実装状況表の矛盾ゼロ、README から全アプリに
   到達可能
+- **実施記録(#58/#59)**: 状態ヘッダ2件(tag-server-design.md・plan.md)の
+  実態合わせ、README に banto-hub セクション追加、CLAUDE.md に `状態:`/
+  `最終検証日:` 義務化ルールを追記、banto-hub / chronogazer の最小
+  README を追加
 
 ### H9: SLMP 構造化エラー + transport 共通化 — 状態: 未着手
 

@@ -221,11 +221,11 @@ banto のパッケージ/クレートの消費は **両方とも git タグ参�
 レジストリ発行は棚上げ。banto の docs/publishing.md 参照）:
 
 ```sh
-pnpm add "github:tyaro/banto#v0.1.0&path:packages/admin-core"
+pnpm add "github:tyaro/banto#v1.1.0&path:packages/admin-core"
 ```
 
 ```toml
-banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v0.1.0" }
+banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v1.1.0" }
 ```
 
 ### `apps/banto-hub`（T系）
