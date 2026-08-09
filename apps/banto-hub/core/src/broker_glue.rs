@@ -307,6 +307,30 @@ impl HubSessions {
         self.directory.handle(connection_id).map(|h| h.read_only())
     }
 
+    /// Non-spawning write-capable peek (T15-4, docs/banto-hub-desktop-plan.md
+    /// T15 節): `connection_id` のセッションが既に生きていれば、その
+    /// **書き込み可能な**フル [`banto_broker::BrokerHandle`] をそのまま返す
+    /// (`Self::handle_for` と異なり `read_only()` へ絞らない) - なければ
+    /// `None`(新規にはダイヤルしない)。
+    ///
+    /// `execute_write` の gate 8 は「`CollectionController::stop`(→
+    /// `CollectorManager::stop`→この directory の `stop_and_join`)完了後は
+    /// `CollectionNotRunning` を返す」という外側のゲートでガードしているが、
+    /// `execute_write` 自身は非同期(レジストリ再読み込み・監査行 insert・
+    /// レート制限)で、その `.await` の間に**別の**タスクが `stop_and_join`
+    /// を完了させてしまう競合が理論上あり得る(=外側ゲートを通過した後、
+    /// 物理書き込み直前にセッションが止まっている)。もし従来どおり
+    /// `ensure_connection` を使っていた場合、そこでセッションが無い(=消えた)
+    /// と分かった瞬間に**新しいセッションを実機へダイヤルしてしまう** -
+    /// 収集が止まっているつもりの実機へ、意図せず書き込み用の TCP セッション
+    /// が新規に張られる、というのがこの T15-4 が閉じるレース。多重防御として、
+    /// 書き込み経路は必ずこの覗き見を使い、セッションが無ければ
+    /// (`ensure_connection` を呼ばず)そのまま fail closed する
+    /// (`crate::write_path::write_plc_tag` 参照)。
+    pub fn write_handle_for(&self, connection_id: i64) -> Option<banto_broker::BrokerHandle> {
+        self.directory.handle(connection_id)
+    }
+
     /// The connection-status watch for `connection_id`, if a broker task is
     /// running for it - `None` before the first `ensure_connection` call for
     /// that id (e.g. no rebuild has run yet, or the connection has never been
@@ -566,4 +590,67 @@ pub fn hub_client_factory(
             }
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use banto_plc_write::slmp::simulator::Simulator;
+
+    fn slmp_conn(id: i64, port: u16) -> PlcConnection {
+        PlcConnection {
+            id,
+            name: format!("conn-{id}"),
+            protocol: "slmp".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: port as i64,
+            unit_id: 1,
+            enabled: true,
+            simulation: false,
+        }
+    }
+
+    /// T15-4 の核心の単体テスト: `stop_and_join` 後、`write_handle_for` は
+    /// (再ダイヤルせず)`None` を返し、`connection_count` は 0 のまま
+    /// 留まる - `ensure_connection` を呼べば同じ id のセッションが
+    /// **蘇る**(=新規にダイヤルする)ことと対照させ、書き込み経路が
+    /// なぜ `ensure_connection` を使ってはいけないかを実証する。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_handle_for_does_not_resurrect_a_stopped_session() {
+        let sim = Simulator::start().await;
+        let conn = slmp_conn(1, sim.addr.port());
+
+        let sessions = HubSessions::new(banto_broker::BackoffConfig::default());
+        sessions
+            .ensure_connection(&conn)
+            .expect("ensure_connection should spawn a session");
+        assert_eq!(sessions.connection_count(), 1);
+        assert!(
+            sessions.write_handle_for(conn.id).is_some(),
+            "a live session should be peekable"
+        );
+
+        assert!(sessions.stop_and_join(conn.id).await);
+        assert_eq!(
+            sessions.connection_count(),
+            0,
+            "stop_and_join should untrack the session"
+        );
+        assert!(
+            sessions.write_handle_for(conn.id).is_none(),
+            "peek must not spawn a new session for a stopped connection id"
+        );
+
+        // Contrast: `ensure_connection` (what the write path used to call,
+        // pre-T15-4) WOULD resurrect it - proving `write_handle_for`'s
+        // no-spawn behavior is the meaningful difference, not an accident of
+        // `SessionDirectory::handle` always being empty here.
+        sessions
+            .ensure_connection(&conn)
+            .expect("ensure_connection resurrects the session (contrast case)");
+        assert_eq!(sessions.connection_count(), 1);
+
+        sessions.shutdown().await;
+        sim.stop();
+    }
 }

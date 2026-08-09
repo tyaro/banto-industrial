@@ -54,9 +54,32 @@
 //!    `banto_plc::TagValue`(数値は範囲チェックで
 //!    [`WriteRejection::ValueOutOfRange`])。文字列タグは
 //!    [`WriteRejection::UnsupportedValueType`] で拒否
-//! 9. **log-before-write** → `CollectorManager::write_broker_handle`
-//!    経由の `BrokerHandle::write`(1タグ=1リクエスト)→ set_result →
+//! 9. **log-before-write** → `CollectorManager::write_broker_handle_peek`
+//!    (T15-4、既存セッションの覗き見のみ・新規ダイヤルしない)経由の
+//!    `BrokerHandle::write`(1タグ=1リクエスト)→ set_result →
 //!    [`WriteOk`] または [`WriteRejection::WriteFailed`]
+//!
+//! ### T15-4: gate 8 は broker セッションを新規に張らない(no-spawn peek)
+//!
+//! gate 8 に達するまでの区間(レジストリからのタグ/接続行の再読み込み、
+//! 監査行 insert、レート制限の record など)はすべて `.await` を含み、
+//! `CollectionController::stop()` の `stop_and_join`(収集停止時に broker
+//! セッションを止めて join する)と時間的に競合しうる。外側の gate
+//! (`CollectionNotRunning`)は `execute_write` 呼び出し**前**の一点で
+//! `CollectionState` を見るだけなので、このレースを塞げない - 呼び出し後に
+//! 収集が止まっても `execute_write` は最後まで走り切ってしまう。
+//!
+//! 従来は `CollectorManager::write_broker_handle`
+//! (`banto_broker::SessionDirectory::ensure_connection`)を使っていたが、
+//! これは「セッションが無ければ新規に接続する」実装のため、上記のレースで
+//! セッションが `stop_and_join` 済みだった場合に**実機へ新しい TCP
+//! セッションをダイヤルしてしまう** - 収集を止めたつもりの PLC へ、意図せず
+//! 書き込み用の接続が張られる。これを閉じるため、書き込み経路は
+//! `CollectorManager::write_broker_handle_peek`
+//! (`banto_broker::SessionDirectory::handle`、新規スポーンしない覗き見)
+//! だけを使う: セッションが既に無ければ新規に張らず、そのまま
+//! [`WriteRejection::WriteFailed`] で fail closed する
+//! (`crate::broker_glue::HubSessions::write_handle_for`の doc comment参照)。
 //!
 //! gate 6 の「would_exceed」判定(peek)と、gate 8 直前の実際の
 //! `record`(消費)は別々のロック区間 - 「ゲート通過後・物理書き込み前」の
@@ -485,6 +508,12 @@ pub async fn execute_write(
 /// gate 8 の PLC タグ分岐: 従来どおり `banto_tags::unscale` → SLMP
 /// アドレス解決 → `BrokerHandle::write`。`execute_write` から抽出しただけで
 /// 挙動は変えていない(T6-2 前の唯一の書き込み経路そのもの)。
+///
+/// T15-4(このモジュールの doc comment「gate 8 は broker セッションを新規に
+/// 張らない」節参照): broker handle の取得は non-spawning peek
+/// (`CollectorManager::write_broker_handle_peek`)のみを使う - セッションが
+/// 既に無ければ(≒ 収集停止と競合してセッションが落ちていた)、新規に
+/// ダイヤルせずそのまま [`WriteRejection::WriteFailed`] を返す。
 async fn write_plc_tag(
     deps: &WriteDeps<'_>,
     conn: &banto_tags::PlcConnection,
@@ -528,10 +557,14 @@ async fn write_plc_tag(
         }
     };
 
-    let handle = deps
-        .manager
-        .write_broker_handle(conn)
-        .map_err(|err| WriteRejection::WriteFailed(err.to_string()))?;
+    let Some(handle) = deps.manager.write_broker_handle_peek(conn.id) else {
+        // T15-4: セッションが無い(収集停止・`stop_and_join`との競合など) -
+        // 新規に実機へダイヤルしてはならないので fail closed する。
+        return Err(WriteRejection::WriteFailed(
+            "PLC への接続セッションがありません(書き込みは新しいセッションを開始しません。収集が稼働中か確認してください)"
+                .to_string(),
+        ));
+    };
 
     // T8-2 (docs/tag-server-design.md §6.1, 2026-08-06): a bit-in-word
     // address (`Address::Slmp { bit: Some(_), .. }`, i.e. the catalog

@@ -1,9 +1,9 @@
 # banto-hub アプリ／サービス運転計画（T14〜）
 
 作成日: 2026-08-09
-状態: **計画確定。T14 完了、T15 は T15-1〜T15-3（全体 SIM・外部出力安全化・対応範囲プリフライト・テスト出力 namespace）まで実装済み。T15 残件は write peek（no-spawn）。次は T15-4 または T16。**
+状態: **計画確定。T14 完了、T15 は T15-1〜T15-4（全体 SIM・外部出力安全化・対応範囲プリフライト・テスト出力 namespace・write peek no-spawn）まで実装済み。T15 完了。次は T16。**
 最終検証日(コード照合): 2026-08-09
-基準コミット: `f94e181`（main、PR #96 マージ後。本ブランチで T15-3 を統合）
+基準コミット: `904e09e`（main、PR #97 マージ後。本ブランチで T15-4 を追加）
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [ux-plan.md](ux-plan.md)、
@@ -291,6 +291,11 @@ SIM と、その値に推移的に依存する演算タグにも同じ規則を�
 追加の安全条件:
 
 - 収集停止中は REST / gRPC 書き込みを fail-closed で拒否する。
+- 書き込み経路（gate 8）は既存の broker セッションの non-spawning peek
+  のみを使い、新規セッションを spawn しない（T15-4、2026-08-09 実装済み -
+  `crate::hub::CollectorManager::write_broker_handle_peek`）。停止処理の
+  step5（broker セッション切断）と書き込みリクエストの監査・レート制限
+  区間が競合しても、実機へ意図しない新規 TCP 接続をダイヤルしない。
 - SIM から configured へ戻す際にも書き込み受付を自動復元しない。
 - 同一プロファイルを名前付き mutex または同等の OS ロックで排他する。
 - ポート競合だけを二重起動検知に使わない。
@@ -1109,7 +1114,41 @@ admin 限定）として実装済み。プランどおり表示専用で、`star
   自動無効化と再有効化拒否）。
 - 対象外（このスライスでは未実装）: API キー REST/WS 経由のテスト出力、
   UI のトグル（T18）、通常トピックの retain 挙動変更、フラグの永続化。
-  T15 残件は HubSessions の write peek（no-spawn）。
+
+**T15-4 実装メモ（2026-08-09）**: 書き込み経路（gate 8）の non-spawning
+write peek を実装し、T15 を完了させた（§16.3「T15（全 PLC シミュレーション）」
+の未決事項を解消）。
+
+- `crate::broker_glue::HubSessions::write_handle_for(connection_id)`
+  （`apps/banto-hub/core/src/broker_glue.rs`）: 既存の
+  `banto_broker::SessionDirectory::handle`（元々 non-spawning）をそのまま
+  委譲するだけの薄いラッパー。既存の`handle_for`（読み取り専用に絞る）と
+  異なり、書き込み可能なフル `BrokerHandle` をそのまま返す。
+- `crate::hub::CollectorManager::write_broker_handle_peek(connection_id)`
+  （`apps/banto-hub/core/src/hub.rs`）: 上記を公開する。従来の
+  `write_broker_handle`（`ensure_connection`、セッションが無ければ新規に
+  spawn する）は書き込み経路からは呼ばなくなった（他の呼び出し元は現状
+  なし・将来 ensure セマンティクスが必要な場合のために残置）。
+- `crate::write_path::write_plc_tag`
+  （`apps/banto-hub/core/src/write_path.rs`）: gate 8 の broker handle 取得を
+  `write_broker_handle_peek` へ切替。セッションが無ければ(新規ダイヤルせず)
+  `WriteRejection::WriteFailed`で fail closed する。
+  - 閉じたレース: `execute_write`の gate 1〜7 は `.await` を挟む(レジストリ
+    再読み込み・レート制限・監査行 insert)ため、`CollectionController::stop()`
+    の `stop_and_join` がその間に完了しても、呼び出し前の一点でしか
+    `CollectionState`を見ない外側の`CollectionNotRunning`ゲートはこれを
+    検知できない。従来の`ensure_connection`はここでセッション消失を検知した
+    瞬間に実機へ新規ダイヤルしてしまっていた - non-spawning peek への切替が
+    多重防御としてこれを閉じる。
+- テスト: 単体（`broker_glue::tests::write_handle_for_does_not_resurrect_a_stopped_session`、
+  `stop_and_join`後に`write_handle_for`が`None`を返し
+  `connection_count`が0のままであること、対照として`ensure_connection`が
+  蘇らせること）+ 統合
+  (`apps/banto-hub/core/tests/t15_write_peek.rs`、実`CollectionController`を
+  `Running`のままにして直接`sessions.stop_and_join`を呼びレースを再現、
+  書き込みが502 `write_failed`で失敗しかつ`connection_count() == 0`のまま
+  であることを確認、および正常系でも peek 経由で書き込みが成功することの
+  対照テスト)。
 
 ### T16: デスクトップシェルとタスクトレイ
 
@@ -1270,6 +1309,8 @@ owner ACL を設定する。グループ変更、profile owner 追加、ACL 変�
 - configured / 全体 SIM / stopped の往復統合テスト
 - Modbus / SLMP、直接接続 / broker 経路の双方
 - 書き込み受付 OFF、REST / gRPC fail-closed の回帰
+- 停止処理と書き込みリクエストが競合しても新規 TCP 接続を発生させないこと
+  （T15-4、`apps/banto-hub/core/tests/t15_write_peek.rs`）
 - MQTT / gRPC / WS の停止中・SIM 中の契約
 - 接続別 SIM と SIM 依存演算タグの source 伝播、実機履歴／通常外部出力からの除外
 - SIM テスト出力の専用 namespace、MQTT `retain=false`、run 終了時の自動解除
@@ -1433,11 +1474,15 @@ owner ACL を設定する。グループ変更、profile owner 追加、ACL 変�
 
 #### T15（全 PLC シミュレーション）
 
-- **停止中・SIM 中の書き込み経路は既存セッション再利用のみ許可し、新規
-  セッションを spawn しない**。`write_broker_handle → ensure_connection`
-  （`hub.rs`）はセッションが無ければ spawn するため、停止 step5 後の in-flight
-  書き込みが実 PLC へダイヤルし得る。§7 の追加安全条件に明記し、§12.1 に
-  「stopped/SIM 中の書き込み試行が新規 TCP 接続を発生させない」テストを加える。
+- **解消済み（T15-4、2026-08-09）**: 停止中・SIM 中の書き込み経路は既存
+  セッション再利用のみ許可し、新規セッションを spawn しない。当時の
+  `write_broker_handle → ensure_connection`（`hub.rs`、セッションが無ければ
+  spawn する）を書き込み経路（gate 8）からは呼ばないよう
+  `write_broker_handle_peek`（non-spawning peek、
+  `crate::broker_glue::HubSessions::write_handle_for`）へ切替済み。§7 の
+  追加安全条件に明記し、§12.1 に「停止処理と書き込みリクエストが競合しても
+  新規 TCP 接続を発生させないこと」のテストを追加した（詳細は §10「T15: 全
+  PLC シミュレーション」の「T15-4 実装メモ」参照）。
 
 #### T16 / T17（デスクトップシェル・サービス管理・配布）
 
