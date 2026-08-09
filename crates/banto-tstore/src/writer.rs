@@ -921,6 +921,176 @@ mod tests {
         assert!(matches!(err, TstoreError::Config(_)));
     }
 
+    // --- crash / WAL-recovery on reopen (H7 ②, docs/improvement-plan.md) --
+    //
+    // `TsWriter` deliberately has no `Drop` impl (see this module's doc
+    // comment) - dropping one without calling `close()` first is exactly
+    // what happens when the hosting process is killed: no graceful
+    // `flush_locked()`, no `pool.close()`. What survives is whatever was
+    // already committed to the WAL-mode file by an earlier `flush()` (see
+    // `schema::connect_writable`'s `SqliteJournalMode::Wal`) - a committed
+    // SQLite transaction is durable on disk the moment `COMMIT` returns,
+    // independent of whether the connection that wrote it is later closed
+    // gracefully or just dropped. Anything still sitting in `Inner::buffer`
+    // at the moment of the drop never reached SQLite at all and is gone.
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn crash_drop_without_close_keeps_flushed_rows_and_loses_only_buffered() {
+        let dir = TempDir::new("crash-reopen");
+        // Fixed clock, never advanced: `maybe_flush`'s interval trigger
+        // (`now_ms - last_flush_ms >= flush_interval_ms`) can therefore
+        // never fire on its own - only the explicit `flush()` call below
+        // (and the row-count threshold, which batch B also stays under)
+        // decide what becomes durable before the simulated crash.
+        let clock = clock_at(DAY1_START_MS);
+        let writer = TsWriter::open(dir.path(), two_group_config(), clock)
+            .await
+            .unwrap();
+
+        // Batch A: appended and explicitly flushed - must survive the crash.
+        writer
+            .append("g1", DAY1_START_MS, &[Some(1.0), None])
+            .await
+            .unwrap();
+        writer
+            .append("g1", DAY1_START_MS + 1_000, &[Some(2.0), Some(20.0)])
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        // Batch B: appended but never flushed, and well under
+        // `WriterOptions::default().max_buffered_rows` (500) so the
+        // row-count auto-flush trigger does not fire either - these rows
+        // must still be sitting in `Inner::buffer` at the moment of the
+        // "crash" below.
+        writer
+            .append("g1", DAY1_START_MS + 2_000, &[Some(3.0), None])
+            .await
+            .unwrap();
+        writer
+            .append("g1", DAY1_START_MS + 3_000, &[Some(4.0), None])
+            .await
+            .unwrap();
+
+        // The "crash": drop without close(). No graceful flush, no
+        // `pool.close()`.
+        drop(writer);
+
+        // Reopen exactly as `reopen_with_same_config_appends_to_the_same_file`
+        // does: locate the (single, un-rotated) file on disk and read it
+        // back with a fresh, independent `TsReader`.
+        let files = list_data_files(dir.path()).unwrap();
+        assert_eq!(files.len(), 1, "the crash must not have created a new file");
+        let reader = TsReader::open(&files[0].path).await.unwrap();
+        let samples = reader
+            .read_range("g1", DAY1_START_MS, DAY1_START_MS + 3_000)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            samples.len(),
+            2,
+            "only the flushed batch A rows must have survived the crash"
+        );
+        assert_eq!(samples[0].ptime_ms, DAY1_START_MS);
+        assert_eq!(samples[0].values, vec![Some(1.0), None]);
+        assert_eq!(samples[1].ptime_ms, DAY1_START_MS + 1_000);
+        assert_eq!(samples[1].values, vec![Some(2.0), Some(20.0)]);
+    }
+
+    // --- runtime UTC-offset (DST-style) transition (H7 ③) -----------------
+    //
+    // `Inner::rotate_if_needed` recomputes `today = LocalDate::from_epoch_ms
+    // (clock.now_ms(), clock.utc_offset_ms())` from scratch on *every*
+    // `append` call and compares it against whatever file is currently open
+    // (`self.current_date`) - it never caches the offset or assumes it is
+    // constant for the writer's lifetime (see `clock.rs`'s doc comment on
+    // why `utc_offset_ms()` is re-queried every time rather than cached).
+    // That means a real DST transition (the OS's UTC offset changing
+    // mid-session) must trigger a rotation exactly like an actual
+    // local-midnight crossing would, even if `now_ms` itself barely moves.
+    // This test isolates exactly that: only `set_utc_offset_ms` changes
+    // between the two appends below - `now_ms` does not.
+    //
+    // Time math (also asserted below against the same `LocalDate::
+    // from_epoch_ms` conversion `rotate_if_needed` itself uses, so these
+    // constants can never silently drift from what the writer actually
+    // computes):
+    //   NOW_MS          = 2026-07-12T14:30:00Z
+    //                    = 20_646 days * 86_400_000 + 14h30m
+    //   offset1 (+9h)   -> local 14:30 + 9:00  = 2026-07-12T23:30 -> D1 = 2026-07-12
+    //   offset2 (+10h)  -> local 14:30 + 10:00 = 2026-07-13T00:30 -> D2 = 2026-07-13
+    //   (offset1 -> offset2 is a +1h runtime shift, modeling a DST-style
+    //   jump; with now_ms held fixed, that 1h alone pushes local time past
+    //   midnight and crosses a local-date boundary by itself)
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_runtime_utc_offset_change_alone_rotates_across_the_local_date_it_crosses() {
+        const NOW_MS: i64 = 20_646 * 86_400_000 + 14 * 3_600_000 + 30 * 60_000; // 2026-07-12T14:30:00Z
+        const OFFSET2_MS: i64 = OFFSET_MS + 3_600_000; // +1h "DST-like" shift from OFFSET_MS (+9h)
+
+        let d1 = LocalDate::from_epoch_ms(NOW_MS, OFFSET_MS);
+        let d2 = LocalDate::from_epoch_ms(NOW_MS, OFFSET2_MS);
+        assert_eq!(d1, LocalDate::new(2026, 7, 12));
+        assert_eq!(d2, LocalDate::new(2026, 7, 13));
+        assert_ne!(
+            d1, d2,
+            "the offset change must cross a local-date boundary for this test to prove anything"
+        );
+
+        let dir = TempDir::new("dst-offset-rotation");
+        let clock = clock_at(NOW_MS); // Arc<ManualClock>, offset starts at OFFSET_MS (= d1's offset)
+        let writer = TsWriter::open(dir.path(), two_group_config(), clock.clone())
+            .await
+            .unwrap();
+
+        // Row 1: appended while the offset still resolves to D1.
+        writer
+            .append("g1", NOW_MS, &[Some(1.0), None])
+            .await
+            .unwrap();
+
+        // The "DST transition" itself: now_ms is untouched, only the
+        // runtime offset changes - isolates rotation's reaction to the
+        // offset alone, independent of any clock advance.
+        clock.set_utc_offset_ms(OFFSET2_MS);
+
+        // Row 2: same call shape, but `rotate_if_needed` now computes D2 and
+        // must rotate to a new file before this row is buffered against it.
+        writer
+            .append("g1", NOW_MS + 1_000, &[Some(2.0), Some(20.0)])
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+
+        let files = list_data_files(dir.path()).unwrap();
+        assert_eq!(
+            files.len(),
+            2,
+            "the offset change must have rotated to a new dated file"
+        );
+        assert_eq!(files[0].date, d1);
+        assert_eq!(files[1].date, d2);
+        assert_eq!(files[0].seq, 1);
+        assert_eq!(files[1].seq, 1, "a new local date starts back at seq 1");
+
+        let day1_reader = TsReader::open(&files[0].path).await.unwrap();
+        let day1_samples = day1_reader.read_range("g1", 0, i64::MAX).await.unwrap();
+        assert_eq!(day1_samples.len(), 1, "row 1 must stay in D1's file");
+        assert_eq!(day1_samples[0].ptime_ms, NOW_MS);
+        assert_eq!(day1_samples[0].values, vec![Some(1.0), None]);
+
+        let day2_reader = TsReader::open(&files[1].path).await.unwrap();
+        let day2_samples = day2_reader.read_range("g1", 0, i64::MAX).await.unwrap();
+        assert_eq!(
+            day2_samples.len(),
+            1,
+            "row 2 must land in D2's file, not D1's"
+        );
+        assert_eq!(day2_samples[0].ptime_ms, NOW_MS + 1_000);
+        assert_eq!(day2_samples[0].values, vec![Some(2.0), Some(20.0)]);
+    }
+
     // --- day-crossing rotation --------------------------------------------
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
