@@ -3,8 +3,8 @@
 作成日: 2026-08-08
 状態: **進行中(Phase 1 = PR #58、Phase 2 = PR #59/#73、Phase 3 = H10 ①②③ を PR #74/#75 でマージ済み)**。
 H1〜H4・H6・H8・H10 完了、H5 は vitest 導入まで完了(E2E 拡充は Phase 4)。
-H7 は ⑤ 既知フレーク安定化の 4 件(A.1/A.3/A.4/A.5)を 2026-08-09 に対応(本 PR)。
-残りは H7 の残タスク(A.2 フレーク・②③④ 堅牢性テスト・① 実機 soak)・
+H7 は ⑤ フレーク安定化 4 件(A.1/A.3/A.4/A.5)+ ②③④ 堅牢性テスト(crash 再オープン・DST・
+read-while-write)を 2026-08-09 に対応。残りは H7 の A.2 フレーク・① 実機 soak・
 H9(SLMP 構造化エラー)・H5 の E2E 拡充(いずれも Phase 4 相当/環境依存)。
 最終検証日(コード照合): 2026-08-09
 
@@ -42,18 +42,18 @@ H9(SLMP 構造化エラー)・H5 の E2E 拡充(いずれも Phase 4 相当/環�
 
 ## 2. 改善項目一覧(優先順)
 
-| ID  | 内容                                                     | 優先度 | 規模 | 状態                     |
-| --- | -------------------------------------------------------- | ------ | ---- | ------------------------ |
-| H1  | banto-expr の式長・ネスト深さ上限(DoS 根治)              | 最高   | 小   | 完了(#58/#59)            |
-| H2  | 手動書き込み(タグモニタ)の安全意味論                     | 最高   | 中   | 完了(#58)                |
-| H3  | banto-hub gRPC の bind 設定化(既定 127.0.0.1)            | 高     | 中   | 完了(#58)                |
-| H4  | 収集タイムスタンプ逆行対策 + append 失敗の可視化         | 高     | 中   | 完了(#58)                |
-| H5  | フロントテスト基盤(vitest)+ hub/relay-wright E2E         | 高     | 大   | vitest 完了・E2E 残      |
-| H6  | サプライチェーン/再現性(deny・audit・toolchain 固定ほか) | 高     | 中   | 完了(#59)                |
-| H7  | ソーク実行・障害系テスト(crash 再オープン・DST・並行)    | 中     | 大   | ⑤一部(本 PR)・残 Phase 4 |
-| H8  | ドキュメント整合(状態ヘッダ・README・状態欄義務化)       | 中     | 小   | 完了(#58/#59)            |
-| H9  | SLMP 構造化エラー(fork/upstream)+ transport 共通化       | 中     | 大   | 未着手                   |
-| H10 | 認可の細粒度化(キー有効期限・read スコープ・arm 失効)    | 中     | 中   | 完了(#74/#75)            |
+| ID  | 内容                                                     | 優先度 | 規模 | 状態                |
+| --- | -------------------------------------------------------- | ------ | ---- | ------------------- |
+| H1  | banto-expr の式長・ネスト深さ上限(DoS 根治)              | 最高   | 小   | 完了(#58/#59)       |
+| H2  | 手動書き込み(タグモニタ)の安全意味論                     | 最高   | 中   | 完了(#58)           |
+| H3  | banto-hub gRPC の bind 設定化(既定 127.0.0.1)            | 高     | 中   | 完了(#58)           |
+| H4  | 収集タイムスタンプ逆行対策 + append 失敗の可視化         | 高     | 中   | 完了(#58)           |
+| H5  | フロントテスト基盤(vitest)+ hub/relay-wright E2E         | 高     | 大   | vitest 完了・E2E 残 |
+| H6  | サプライチェーン/再現性(deny・audit・toolchain 固定ほか) | 高     | 中   | 完了(#59)           |
+| H7  | ソーク実行・障害系テスト(crash 再オープン・DST・並行)    | 中     | 大   | ⑤+②③④完了・残 A.2/① |
+| H8  | ドキュメント整合(状態ヘッダ・README・状態欄義務化)       | 中     | 小   | 完了(#58/#59)       |
+| H9  | SLMP 構造化エラー(fork/upstream)+ transport 共通化       | 中     | 大   | 未着手              |
+| H10 | 認可の細粒度化(キー有効期限・read スコープ・arm 失効)    | 中     | 中   | 完了(#74/#75)       |
 
 ## 3. 各項目の詳細
 
@@ -250,7 +250,7 @@ H9(SLMP 構造化エラー)・H5 の E2E 拡充(いずれも Phase 4 相当/環�
 - **受け入れ条件**: CI に deny/audit ジョブが載り green、toolchain 固定後
   も全ジョブ green
 
-### H7: ソーク実行・障害系テスト — 状態: ⑤ 一部完了(既知フレーク安定化 = 本 PR、2026-08-09)。①②③④・A.2 は未着手/対象外
+### H7: ソーク実行・障害系テスト — 状態: ⑤(フレーク安定化)+ ②③④(堅牢性テスト)完了(2026-08-09)。A.2 と ①(実機 soak)が残
 
 - **事実**: ソークハーネスは**既にある**(banto-hub `tests/soak.rs`
   = 72h 用・Windows メモリプローブ付き、banto-collect に `#[ignore]` の
@@ -285,6 +285,29 @@ H9(SLMP 構造化エラー)・H5 の E2E 拡充(いずれも Phase 4 相当/環�
     上限は維持)。`MissedTickBehavior::Skip` で欠落 tick は取り戻さないため過負荷ランナーで
     スループットが ~1/10 まで下がりうる。当テストの意図は生存性でありスループット精度は
     `#[ignore]` の long soak が担保
+- **実施記録(2026-08-09、②③④ = 別 PR)**: コンテナで実施可能な新規堅牢性テスト 3 件を
+  追加(テスト専用・prod/`Cargo.toml` 不変、`banto-tstore` / `banto-tsquery` の clippy・fmt
+  clean。各テストは条件待ち+寛大なタイムアウトで**それ自体が flaky にならない**設計)。
+  - **② crash 再オープン**(`banto-tstore/src/writer.rs`
+    `crash_drop_without_close_keeps_flushed_rows_and_loses_only_buffered`): `TsWriter` は
+    `Drop` 無し → `close()` せず drop = クラッシュ模擬。固定 `ManualClock` + 閾値未満バッチで
+    「flush 済みのみ WAL で生存・未 flush バッファは消失」を検証
+  - **③ DST 遷移**(同
+    `a_runtime_utc_offset_change_alone_rotates_across_the_local_date_it_crosses`): `now_ms`
+    固定のまま `set_utc_offset_ms` のみ変更(+9h→+10h)でローカル日付境界をまたぎ、
+    `rotate_if_needed` が実行中のオフセット変更を反映して新日付ファイルへローテーション
+    することを検証(D1/D2 は `LocalDate::from_epoch_ms` で自己検証)
+  - **④ read-while-write**(`banto-tsquery/tests/concurrency.rs`
+    `concurrent_reads_during_writes_never_corrupt_or_error`): WAL の 1-writer/N-reader で、
+    背景 writer の append+flush 中に前景で `read_range`/`read_decimated`/`catalog` を反復。
+    破損・エラー・count 逆行なし、writer 完了後に全 N 行を確認(5+40 回連続 green)
+  - **④ で判明した follow-up(prod 未修正)**: `TsQuery` の「最初のファイル生成レース中は
+    absent/empty を返す(エラーにしない)」契約に実際のギャップ。`TsWriter::open` は
+    スキーマ作成トランザクション commit の**前に**物理 `.sqlite3` を作るため、その窓で
+    ファイルを開いた reader は空(0 テーブル)DB を見て全 read メソッドが
+    `TsQueryError::IncompatibleFile`(空 `Ok` でなく hard `Err`)を返す。テストは初回行
+    観測前のみ許容(スキーマ凍結後は再発しないため以後はエラー扱い)。`banto-tsquery` 側の
+    手当て候補として記録
 - **未処理(follow-up)**:
   - **A.2** `stream.rs` `a_slow_subscriber_gets_disconnected_once_the_outbound_queue_fills`:
     「アウトバウンドキュー溢れは決定的」という前提が multi-thread ランタイム下で崩れる
@@ -292,9 +315,6 @@ H9(SLMP 構造化エラー)・H5 の E2E 拡充(いずれも Phase 4 相当/環�
     `try_send` が `Full` を観測しないことがある)。堅牢化には writer を止めるテスト用
     シーム、または巨大ペイロードでのバッファ超過など踏み込んだ設計が要るため**専用 PR に
     先送り**(誤修正回避)
-  - **②③④** の新規堅牢性テスト(crash 再オープン / DST 遷移 / read-while-write)は実現性
-    確認済み(`ManualClock::set_utc_offset_ms` 有り、`TsWriter` は `Drop` 無しで drop =
-    クラッシュ模擬可、データファイルは WAL で並行 read 可)→ 続く PR
 - **備考**: ① 実機相当環境(Windows)での 72h soak 実行はコンテナ/CI では完結しない
   (実行環境と 72h の実時間が必要)ため当セッション対象外
 
