@@ -9,8 +9,10 @@
 「create / edit を `<form>` 化し、必須表示、Enter 送信、クライアント軽量
 検証」も実装済み。続く `cursor/t18-1-tags-load-state-e3cb` で同 §9.4 の
 「初期読込失敗、0件、検索結果0件、再読込中、stale 一覧を区別し、画面内に
-再試行を置く」も実装済み。TAG-UX-C の残り（revision/ETag、削除前参照影響）
-は未着手。TAG-P0-2・TAG-P0-3 は未着手。
+再試行を置く」も実装済み。続く `cursor/t18-1-tags-delete-impact-e3cb` で
+同 §9.4 の「削除前に演算タグ等の参照影響と完全な外部名を表示する」も
+実装済み。TAG-UX-C の残りは revision/ETag（4点目）のみ未着手。
+TAG-P0-2・TAG-P0-3 は未着手。
 最終検証日(コード照合): 2026-08-09
 基準コミット: `22c8c02`（main、PR #103 `optNum` 修正マージ後）。T18-1 は本 PR
 （`apps/banto-hub/src/lib/banto/continuousRegistration.ts` の
@@ -26,7 +28,10 @@ banto-hub 用 Playwright/DOM e2e 基盤の新設）で続行し、続く
 送信・必須項目の `required` 表示（`banto-hub-tags-form.spec.ts`）を追加し、
 さらに続く `cursor/t18-1-tags-load-state-e3cb` で tags 一覧の初期読込失敗・
 再読込中・stale・真の空・検索結果0件の区別（`loadError`、
-`banto-hub-tags-load-state.spec.ts`）を追加。
+`banto-hub-tags-load-state.spec.ts`）を追加し、さらに続く
+`cursor/t18-1-tags-delete-impact-e3cb` で削除前の演算タグ参照影響・完全
+外部名表示（`tagDeleteImpact.ts`、
+`banto-hub-tags-delete-impact.spec.ts`）を追加。
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [banto-hub-t16-design.md](banto-hub-t16-design.md)、
@@ -791,8 +796,41 @@ UX-5 の決定を UI のボタン非表示だけで実装しない。アプリ�
 > 5 spec も同じ実行で全て green のままであることを確認済み
 > （計19 spec）。
 >
+> **2026-08-09 追加実装（T18-1 続き、`cursor/t18-1-tags-delete-impact-e3cb`）:
+> 5点目「削除前に演算タグ等の参照影響と完全な外部名を表示する」を実装済み。**
+> それまで `handleDelete` は `${selected.name} を削除しますか？`
+> （タグ名のみ、外部名も参照影響も無し）で確認していた。フロントのみの
+> 実装（新規 API/DB変更なし）で、`apps/banto-hub/src/lib/banto/tagDeleteImpact.ts`
+> （純関数群、単体テスト `tagDeleteImpact.test.ts`）を新設した:
+> `buildExternalName(conn, group, tag)` がバックエンド
+> `hub.rs::build_catalog` の `format!("{}.{}.{}", ...)` と同じ規則で完全
+> 外部名を組み立て、`findReferencingComputedTags(...)` がロード済み
+> `tags` のうち `tagKind === 'computed'` かつ `expression` が削除対象の
+> 外部名をタグ参照として含むものを探す（banto-expr のタグ参照は必ず3
+> セグメントという文法制約 -
+> `crates/banto-expr/src/parser.rs::parse_tag_ref_rest` - を単純化した
+> 正規表現で近似し、前後の境界チェックで `a.b.c` が `a.b.c2` の一部として
+> 誤マッチしないようにしている。完璧なレキサ移植はしていない — 実装
+> 指示どおり「誤検出を減らす実用レベル」)。`formatDeleteConfirmMessage(...)`
+> がこれらを `window.confirm` 用の複数行メッセージに整形する — 参照が無い
+> 場合でも完全外部名は必ず出し、参照がある場合は参照元の演算タグの外部名
+> 一覧と「削除すると参照が壊れ、サーバー側の検証で失敗し得る」旨の警告を
+> 追加する。`tags/+page.svelte::handleDelete` はこれらを呼んで
+> `window.confirm` の文言を差し替えただけで、削除処理自体
+> （`deleteTag` 呼び出し、サーバー側 preflight による参照切れ拒否）は
+> 変更していない — **クライアント側でハードブロックはせず、確認 OK なら
+> 参照があっても従来どおり `deleteTag` を呼ぶ**（サーバーが拒否した場合は
+> 既存の error toast で通知される、正しさの最終バックストップはサーバー
+> 側 preflight のまま）。実 DOM 受け入れは
+> `e2e/tests-banto-hub/banto-hub-tags-delete-impact.spec.ts`
+> （`pnpm e2e:banto-hub`）で、演算タグ（`calc` 予約接続配下）を PLC タグを
+> 参照する式で作成した上で、(1) 参照元が無いタグの削除確認に完全外部名が
+> 出て「参照」の警告が出ないこと、(2) 参照元がある PLC タグの削除確認に
+> 削除対象の完全外部名と参照元の演算タグの外部名が両方出ること、(3) その
+> 確認を dismiss すればタグが残ることを確認している。
+>
 > **未着手のまま残っている部分**: revision/ETag による後勝ち防止・
-> 差分表示（4点目）、削除前の参照影響・完全外部名表示（5点目）。
+> 差分表示（4点目）のみ。
 > 受け入れ条件のうち「ボタン連打や保存／削除競合でも mutation は1回だけ
 > 実行される」は busy 中のボタン `disabled` 化で UI 操作からの連打は
 > 防げるようになったが、「他セッション更新を黙って上書きしない」
