@@ -80,7 +80,7 @@ use tokio::time::MissedTickBehavior;
 
 use banto_collect::Quality;
 
-use crate::controller::{CollectionController, CollectionState};
+use crate::controller::{CollectionController, CollectionState, RunMode};
 use crate::hub::{quality_str, read_current, CollectorManager, TagEntry};
 use crate::settings::MqttSettings;
 
@@ -368,6 +368,14 @@ async fn run_eval_loop(
     loop {
         tokio::select! {
             _ = tick.tick() => {
+                if let Some(receiver) = runtime_rx.as_ref() {
+                    let status = receiver.borrow();
+                    if status.state != CollectionState::Running || status.mode != RunMode::Configured {
+                        last.clear();
+                        last_running_run_id = None;
+                        continue;
+                    }
+                }
                 publish_changed(&manager, &client, &prefix, qos, min_interval_ms, &mut last).await;
             }
             changed = async {
@@ -380,10 +388,16 @@ async fn run_eval_loop(
                 if running_notification {
                     let status = runtime_rx.as_ref().expect("runtime receiver").borrow().clone();
                     if status.state == CollectionState::Running
+                        && status.mode == RunMode::Configured
                         && last_running_run_id != status.run_id
                     {
                         last_running_run_id = status.run_id;
                         publish_all(&manager, &client, &prefix, qos, &mut last).await;
+                    } else if status.state != CollectionState::Running
+                        || status.mode != RunMode::Configured
+                    {
+                        last.clear();
+                        last_running_run_id = None;
                     }
                 } else {
                     // Compatibility path for test/legacy callers that do not
@@ -396,6 +410,14 @@ async fn run_eval_loop(
                     // poll タスクが終了した(abort による停止シーケンス) -
                     // このタスクも畳む。
                     break;
+                }
+                if let Some(receiver) = runtime_rx.as_ref() {
+                    let status = receiver.borrow();
+                    if status.state != CollectionState::Running || status.mode != RunMode::Configured {
+                        last.clear();
+                        last_running_run_id = None;
+                        continue;
+                    }
                 }
                 publish_all(&manager, &client, &prefix, qos, &mut last).await;
             }
