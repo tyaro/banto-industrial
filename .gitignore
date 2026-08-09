@@ -37,4 +37,10 @@ e2e/playwright-report/
 e2e/.cache/
 /test-results/
 
+# Playwright (T18-1 banto-hub e2e/) - e2e/banto-hub.playwright.config.ts
+# pins its own outputDir/HTML reporter folder separate from chronogazer's
+# above, same reasoning.
+e2e/test-results-banto-hub/
+e2e/playwright-report-banto-hub/
+
 # pnpm-lock.yaml is intentionally NOT ignored - the lockfile is committed
