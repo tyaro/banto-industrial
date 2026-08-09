@@ -65,7 +65,7 @@
 		type ParsedCsvTagRow,
 		type CsvRowError
 	} from '$lib/banto/tagCsv';
-	import { parseOptionalNumber, toOptionalNumberOrNull } from '$lib/banto/tagFormNumeric';
+	import { parseOptionalNumber } from '$lib/banto/tagFormNumeric';
 
 	const dataTypeOptions: { value: TagDataType; label: string }[] = [
 		{ value: 'bit', label: 'bit（真偽値1点）' },
