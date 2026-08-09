@@ -1,9 +1,10 @@
 # banto-hub アプリ／サービス運転計画（T14〜）
 
 作成日: 2026-08-09
-状態: **計画確定。T14・T15 完了。T16 詳細設計は [banto-hub-t16-design.md](banto-hub-t16-design.md)（P1〜P3 承認済み）。次は T16-0（薄いシェル）。**
+状態: **計画確定。T14・T15 完了。T16 詳細設計は [banto-hub-t16-design.md](banto-hub-t16-design.md)（P1〜P3 承認済み）。T16-0（薄いシェル `banto-hub-shell`）実装済み・レビュー待ち。次は T16-1（トレイ状態表示）。**
 最終検証日(コード照合): 2026-08-09
-基準コミット: `fa96c90`（main、PR #98 マージ後・T15 完了）
+基準コミット: `fa96c90`（main、PR #98 マージ後・T15 完了）。T16-0 は本 PR
+（`apps/banto-hub/src-tauri` 新設）で追加。
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [banto-hub-t16-design.md](banto-hub-t16-design.md)、
@@ -1169,6 +1170,14 @@ write peek を実装し、T15 を完了させた（§16.3「T15（全 PLC シミ
 - Hub 停止中でも native fallback から状態、開始、応答しないサービスの安全停止、
   ログ、再試行を利用できる。
   ただし profile / mutex / port / version を検証できない場合は開始を表示しない。
+
+> **2026-08-09 追記**（[banto-hub-t16-design.md](banto-hub-t16-design.md) P2）:
+> 上記のうち「Hub 停止中でも native fallback から…」の1条は、T17（サービス
+> 管理・profile・mutex）に依存するため **T16-2（T17 後）の受入条件へ移す**。
+> T16-0（薄いシェル本体: HubRuntime 埋め込み・WebView・トレイ最小2項目・
+> 単一インスタンス・shutdown）はサービス非依存で、T17 を待たず着手・完了
+> できる。T16-1（トレイ状態表示）も T16-0 の直後に着手可 - 詳細は
+> banto-hub-t16-design.md §3 のサブスライス表を参照。
 
 ### T17: サービス管理、プロファイル、インストーラ
 

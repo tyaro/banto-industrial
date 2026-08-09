@@ -1,9 +1,11 @@
 # banto-hub T16 詳細設計（デスクトップシェル・タスクトレイ）
 
 作成日: 2026-08-09
-状態: **設計確定。P1〜P3 承認済み。T16-0 着手可。**
+状態: **設計確定。P1〜P3 承認済み。T16-0 実装済み・レビュー待ち
+（`apps/banto-hub/src-tauri`、パッケージ名 `banto-hub-shell`）。次は T16-1。**
 最終検証日(コード照合): 2026-08-09
-基準コミット: `fa96c90`（main、T15 完了・PR #98 マージ後）
+基準コミット: `fa96c90`（main、T15 完了・PR #98 マージ後）。T16-0 の実装は
+本設計と同じ PR（`cursor/t16-0-thin-shell-e3cb`）で追加。
 
 関連: [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)
 （§8 シェル / §9.9 トレイ / §10 T16 / §16.3 T16・T17）、
@@ -125,7 +127,9 @@ banto-hub-shell (Tauri v2, Windows 優先)
 
 ### 4.4 作成予定ファイル
 
-- `apps/banto-hub/src-tauri/{Cargo.toml,tauri.conf.json,build.rs,src/{main,lib}.rs,capabilities/default.json,icons/}`
+- `apps/banto-hub/src-tauri/{Cargo.toml,tauri.conf.json,build.rs,src/{main,lib}.rs,capabilities/default.json,icons/,ui/index.html}`
+  （`ui/index.html` は §4.1 の起動プレースホルダ - `frontendDist` はこの
+  静的1ファイルのみを指し、SvelteKit ビルドは参照しない）
 - root `Cargo.toml` workspace members へ追加
 - `docs/tag-server-design.md` §3.1 日付付き注記
 - `docs/banto-hub-desktop-plan.md` §10 T16 受入の T17 後送り注記
