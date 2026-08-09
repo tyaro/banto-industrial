@@ -52,9 +52,10 @@
 		type BatchTagsResult
 	} from '$lib/banto/tagRegistryAdmin';
 	import {
+		buildContinuousParams,
 		generateContinuousTags,
 		MAX_CONTINUOUS_COUNT,
-		type ContinuousRegistrationParams,
+		type ContinuousFormState,
 		type ContinuousRegistrationResult
 	} from '$lib/banto/continuousRegistration';
 	import {
@@ -64,7 +65,7 @@
 		type ParsedCsvTagRow,
 		type CsvRowError
 	} from '$lib/banto/tagCsv';
-	import { parseOptionalNumber, toOptionalNumberOrNull } from '$lib/banto/tagFormNumeric';
+	import { parseOptionalNumber } from '$lib/banto/tagFormNumeric';
 
 	const dataTypeOptions: { value: TagDataType; label: string }[] = [
 		{ value: 'bit', label: 'bit（真偽値1点）' },
@@ -437,28 +438,6 @@
 	// アドレスを前提とする機能のため tagKind は常に 'plc'（TagInput 側の
 	// 既定と同じ、フォーム自体に種別選択は出さない）。
 
-	interface ContinuousFormState {
-		collectionGroupId: string;
-		namePattern: string;
-		startNumber: string;
-		startAddress: string;
-		count: string;
-		dataType: TagDataType;
-		stringLength: string;
-		unit: string;
-		decimals: string;
-		rawLo: string;
-		rawHi: string;
-		engLo: string;
-		engHi: string;
-		thresholdH: string;
-		thresholdHh: string;
-		thresholdL: string;
-		thresholdLl: string;
-		enabled: boolean;
-		writable: boolean;
-	}
-
 	function blankContinuousForm(): ContinuousFormState {
 		return {
 			collectionGroupId: '',
@@ -485,42 +464,13 @@
 
 	let continuousForm = $state(blankContinuousForm());
 
-	/** 生成に必要な最低限の項目が埋まるまでは `null`（エラー表示を急がない）。 */
-	function continuousParams(form: ContinuousFormState): ContinuousRegistrationParams | null {
-		if (
-			form.collectionGroupId === '' ||
-			form.namePattern.trim() === '' ||
-			form.startAddress.trim() === '' ||
-			form.count.trim() === ''
-		) {
-			return null;
-		}
-		return {
-			collectionGroupId: Number(form.collectionGroupId),
-			namePattern: form.namePattern,
-			startNumber: Number(form.startNumber) || 0,
-			startAddress: form.startAddress,
-			count: Number(form.count),
-			dataType: form.dataType,
-			stringLength: form.dataType === 'string' ? toOptionalNumberOrNull(form.stringLength) : null,
-			unit: form.unit === '' ? undefined : form.unit,
-			decimals: Number(form.decimals),
-			rawLo: toOptionalNumberOrNull(form.rawLo),
-			rawHi: toOptionalNumberOrNull(form.rawHi),
-			engLo: toOptionalNumberOrNull(form.engLo),
-			engHi: toOptionalNumberOrNull(form.engHi),
-			thresholdH: toOptionalNumberOrNull(form.thresholdH),
-			thresholdHh: toOptionalNumberOrNull(form.thresholdHh),
-			thresholdL: toOptionalNumberOrNull(form.thresholdL),
-			thresholdLl: toOptionalNumberOrNull(form.thresholdLl),
-			enabled: form.enabled,
-			writable: form.writable
-		};
-	}
-
-	/** 入力が変わるたびに再計算される、適用前プレビュー(設計「適用前にプレビュー表示」)。 */
+	/** 入力が変わるたびに再計算される、適用前プレビュー(設計「適用前にプレビュー表示」)。
+	 *
+	 * パラメータ組み立て自体（`form.count` 等の number|null 混入への対応、
+	 * TAG-P0-1）は `$lib/banto/continuousRegistration.ts` の
+	 * {@link buildContinuousParams} に切り出してある。 */
 	let continuousPreview: ContinuousRegistrationResult | null = $derived.by(() => {
-		const params = continuousParams(continuousForm);
+		const params = buildContinuousParams(continuousForm);
 		return params ? generateContinuousTags(params) : null;
 	});
 

@@ -1,11 +1,12 @@
 # banto-hub アプリ／サービス運転計画（T14〜）
 
 作成日: 2026-08-09
-状態: **計画確定。T14・T15 完了。T16 詳細設計は [banto-hub-t16-design.md](banto-hub-t16-design.md)（P1〜P3 承認済み）。T16-0（薄いシェル `banto-hub-shell`）・T16-1（トレイ状態表示）マージ済み。T16-2 は T17（サービス管理・profile・mutex）依存のため後回し。次/進行中: T18-1（タグ登録 UI/UX の正しさ修正、本 PR は §16.4 の `optNum` null 取りこぼし部分）。**
+状態: **計画確定。T14・T15 完了。T16 詳細設計は [banto-hub-t16-design.md](banto-hub-t16-design.md)（P1〜P3 承認済み）。T16-0（薄いシェル `banto-hub-shell`）・T16-1（トレイ状態表示）マージ済み。T16-2 は T17（サービス管理・profile・mutex）依存のため後回し。進行中: T18-1（タグ登録 UI/UX の正しさ修正）。§16.4 の `optNum` null 取りこぼしと §9 TAG-P0-1 本体（連続登録 `count.trim()` クラッシュ）はロジック側を修正済み（本 PR）。TAG-P0-1 受け入れ条件の DOM/E2E コンポーネントテストは banto-hub の Playwright/DOM 基盤未整備のため別スライスで継続。TAG-P0-2・TAG-P0-3 は未着手。**
 最終検証日(コード照合): 2026-08-09
-基準コミット: `396e927`（main、T16-1 マージ後）。T18-1 は本 PR
-（`apps/banto-hub/src/lib/banto/tagFormNumeric.ts` の `optNum` null 取りこぼし
-修正）で着手。
+基準コミット: `22c8c02`（main、PR #103 `optNum` 修正マージ後）。T18-1 は本 PR
+（`apps/banto-hub/src/lib/banto/continuousRegistration.ts` の
+`buildContinuousParams` 切り出しによる `count.trim()` クラッシュ修正）で
+続行。
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [banto-hub-t16-design.md](banto-hub-t16-design.md)、
@@ -527,6 +528,21 @@ UI/UX マイルストーンへ反映し、変更時は新しい決定記録を�
 - `0`、負数、小数、非数、`1001` 以上は、人間可読なインラインエラーになる。
 - 点数、開始番号、小数桁、スケーリング、しきい値を実 DOM から変更する
   コンポーネント／E2E テストを追加する。
+
+> **2026-08-09 ロジック側は修正済み（T18-1、本 PR）**: `form.count.trim()`
+> クラッシュ本体を修正した。`ContinuousFormState`/`buildContinuousParams`
+> を `apps/banto-hub/src/routes/(app)/tags/+page.svelte` から
+> `apps/banto-hub/src/lib/banto/continuousRegistration.ts` へ切り出し、
+> `count`/`startNumber`/`decimals` のパースを §16.4 で導入した
+> `parseOptionalNumber`（`tagFormNumeric.ts`）経由にした（`.trim()` は
+> `collectionGroupId`/`namePattern`/`startAddress` など string 保証
+> フィールドにのみ残す）。単体テスト（`continuousRegistration.test.ts`）で
+> 点数 `1`/`2`/`1000` の行数一致と `0`/負数/`1.5`/`1001` のエラー
+> メッセージを確認済み（`pnpm --filter banto-hub check`/`test` 共にグリーン）。
+> 受け入れ条件のうち **実 DOM からの変更を伴うコンポーネント／E2E テストは
+> 未実施** — banto-hub には Playwright/DOM テスト基盤がまだ無く（§16.3
+> T18 の指摘どおり）、本 PR のスコープは純関数ロジックの修正と単体テストに
+> 限定した。DOM/E2E 側は基盤整備を待つ別スライスで継続する。
 
 #### TAG-P0-2: 「保存成功」と「実行可能」を一致させる
 
@@ -1645,6 +1661,8 @@ owner ACL を設定する。グループ変更、profile owner 追加、ACL 変�
   > （`stringLength`/`rawLo`・`rawHi`/`engLo`・`engHi`/`thresholdH`・`Hh`・
   > `L`・`Ll`）で使用。`count.trim()` 側（TAG-P0-1 本体・連続登録の点数検証）
   > は本 PR のスコープ外で別途対応する。
+  > **追記（2026-08-09、別 PR で対応済み）**: `count.trim()` 本体側も修正した。
+  > 詳細は §9 TAG-P0-1 の実装メモを参照。
 - **連続登録 / CSV の dry-run も偽陽性**。dry-run は `TagService::create_batch`
   のレジストリ級検証＋重複名までで、プロトコル別アドレス解析・式コンパイルを
   行わない。よって Modbus 接続配下の SLMP 形式アドレスでも「検証OK: N件登録
