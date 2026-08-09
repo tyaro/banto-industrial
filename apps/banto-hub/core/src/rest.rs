@@ -195,6 +195,14 @@ fn forbidden_response() -> Response {
     (StatusCode::FORBIDDEN, Json(ErrorBody::Forbidden)).into_response()
 }
 
+fn simulation_output_disabled_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "error": "simulation_output_disabled" })),
+    )
+        .into_response()
+}
+
 /// T2-4（設計 §6-4「トリップ」）: トリップ中の API キーでの
 /// `/api/v1/*` アクセス - read/write いずれも 403。
 /// `crate::rest::require_tag_space_auth` から呼ぶ。
@@ -3269,10 +3277,26 @@ fn value_source_for_tag(entry: &TagEntry, runtime: &CollectionStatus) -> &'stati
     }
 }
 
+/// API-key reads expose only the normal external value space.  Saved PLC
+/// simulation configuration is hidden even while the controller is stopped,
+/// while computed tags remain hidden because their source is always
+/// `derived_simulation`.  Internal tags are intentionally retained for
+/// backwards compatibility with existing API-key clients.
+fn api_key_external_output_allowed(entry: &TagEntry, runtime: &CollectionStatus) -> bool {
+    if entry.simulation {
+        return false;
+    }
+    !matches!(
+        value_source_for_tag(entry, runtime),
+        "simulation" | "derived_simulation"
+    )
+}
+
 /// `GET /api/v1/tags` - catalog: `{ "revision", "run_id",
 /// "collection_mode", "tags": [CatalogTagEntry...] }`,
 /// optionally filtered by `?connection=`/`?group=` (matched against the
-/// entry's connection/group *name*, design §5.1's route table).
+/// entry's connection/group *name*, design §5.1's route table). API-key
+/// requests additionally omit simulation and derived-simulation entries.
 #[utoipa::path(
     get,
     path = "/api/v1/tags",
@@ -3286,12 +3310,15 @@ fn value_source_for_tag(entry: &TagEntry, runtime: &CollectionStatus) -> &'stati
 async fn v1_tags(
     State(state): State<TagSpaceState>,
     Query(query): Query<TagsQuery>,
+    ctx: Option<Extension<ApiKeyContext>>,
 ) -> Json<CatalogResponse> {
     let map = state.manager.tag_map();
     let revision = state.manager.revision();
     let runtime = state.controller.status();
+    let api_key_request = ctx.is_some();
     let tags: Vec<CatalogTagEntry> = map
         .iter()
+        .filter(|entry| !api_key_request || api_key_external_output_allowed(entry, &runtime))
         .filter(|entry| {
             query
                 .connection
@@ -3408,7 +3435,8 @@ impl SingleValueResponse {
 /// いないのに403」を避ける)。`?tags=` で明示的にスコープ外タグを挙げたら
 /// [`v1_value_single`] と同じ**403**(存在は catalog 経由で既知なので
 /// 404 ではない)。セッション token(`ctx` 無し)は従来どおり全件(管理 UI
-/// 不変)。
+/// 不変)。API キー時はこのスコープ判定後に simulation / derived_simulation
+/// を値一覧から除外する。
 #[utoipa::path(
     get,
     path = "/api/v1/values",
@@ -3480,6 +3508,19 @@ async fn v1_values(
         names
     };
 
+    let names: Vec<String> = if ctx.is_some() {
+        names
+            .into_iter()
+            .filter(|name| {
+                map.get(name)
+                    .map(|entry| api_key_external_output_allowed(entry, &runtime))
+                    .unwrap_or(false)
+            })
+            .collect()
+    } else {
+        names
+    };
+
     let values: Vec<ValueEntry> = names
         .iter()
         .filter_map(|name| map.get(name).map(|entry| (name, entry)))
@@ -3514,8 +3555,9 @@ async fn v1_values(
 /// catalog に見えている(=存在は既知)ので、per-tag read スコープ外は 404
 /// ではなく**403**(`forbidden_response`)。API キー起因の読み取り
 /// (`ctx` あり)だけがこの判定を受ける - セッション token(`ctx` 無し)は
-/// 従来どおり全アクセス(管理 UI 不変)。catalog 自体(`v1_tags`)は絞らない
-/// - このモジュールの `require_tag_space_auth` の doc comment参照。
+/// 従来どおり全アクセス(管理 UI 不変)。API キー時は simulation /
+/// derived_simulation の値を返さず、単一値では `503
+/// simulation_output_disabled` とし、catalog からも除外する。
 #[utoipa::path(
     get,
     path = "/api/v1/values/{tag}",
@@ -3523,6 +3565,7 @@ async fn v1_values(
     responses(
         (status = 200, description = "単一タグの現在値", body = SingleValueResponse),
         (status = 403, description = "per-tag read スコープ外(API キー、H10 ③)"),
+        (status = 503, description = "simulation / derived_simulation は API キーの外部出力対象外"),
         (status = 404, description = "catalog に存在しない外部名"),
     ),
     tag = "tag-space",
@@ -3547,6 +3590,9 @@ async fn v1_value_single(
     }
     let now_ms = state.manager.clock().now_ms();
     let runtime = state.controller.status();
+    if ctx.is_some() && !api_key_external_output_allowed(entry, &runtime) {
+        return simulation_output_disabled_response();
+    }
     let current = state.manager.current_values();
     let server_store = state.manager.server_store();
     Json(SingleValueResponse::from_value(
@@ -5738,6 +5784,31 @@ mod tests {
     }
 
     #[test]
+    fn api_key_external_output_hides_simulation_and_derived_values() {
+        let all_simulation = metadata_test_status(CollectionState::Running, RunMode::AllSimulation);
+        let configured = metadata_test_status(CollectionState::Running, RunMode::Configured);
+        let stopped = metadata_test_status(CollectionState::Stopped, RunMode::AllSimulation);
+        let physical = metadata_test_tag(banto_tags::PLC_TAG_KIND, false, true);
+        let saved_simulation = metadata_test_tag(banto_tags::PLC_TAG_KIND, true, true);
+        let computed = metadata_test_tag(banto_tags::COMPUTED_TAG_KIND, false, true);
+        let internal = metadata_test_tag(banto_tags::INTERNAL_TAG_KIND, false, true);
+
+        assert!(!api_key_external_output_allowed(&physical, &all_simulation));
+        assert!(api_key_external_output_allowed(&physical, &configured));
+        assert!(!api_key_external_output_allowed(
+            &saved_simulation,
+            &configured
+        ));
+        assert!(!api_key_external_output_allowed(
+            &saved_simulation,
+            &stopped
+        ));
+        assert!(!api_key_external_output_allowed(&computed, &configured));
+        assert!(!api_key_external_output_allowed(&computed, &all_simulation));
+        assert!(api_key_external_output_allowed(&internal, &all_simulation));
+    }
+
+    #[test]
     fn rest_connection_effective_simulation_returns_to_configured_value() {
         let all_simulation = metadata_test_status(CollectionState::Running, RunMode::AllSimulation);
         let configured = metadata_test_status(CollectionState::Running, RunMode::Configured);
@@ -5803,6 +5874,21 @@ mod tests {
         assert_eq!(
             body,
             serde_json::json!({"error": "simulation_write_rejected"})
+        );
+    }
+
+    #[tokio::test]
+    async fn simulation_output_rejection_is_http_503_with_machine_code() {
+        let response = simulation_output_disabled_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"error": "simulation_output_disabled"})
         );
     }
 
