@@ -436,7 +436,8 @@ impl HubRuntime {
             write_control.clone(),
             rate_limiter.clone(),
             events.clone(),
-        );
+        )
+        .with_controller(controller.clone());
         let grpc_server = Arc::new(GrpcServer::new(grpc_service));
         let grpc_settings = settings.grpc_config().await.unwrap_or_else(|err| {
             log_err_line(&format!(

@@ -96,6 +96,7 @@ use tonic::{Request, Response, Status};
 use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::computed::ServerTagStore;
+use crate::controller::CollectionController;
 use crate::hub::{read_current, CollectorManager, TagEntry};
 use crate::settings::GrpcSettings;
 use crate::subscribe_core::{
@@ -236,13 +237,14 @@ fn to_proto_value_batch(
 /// | 429 | `RESOURCE_EXHAUSTED` |
 /// | 501 | `UNIMPLEMENTED` |
 /// | 502 | `UNAVAILABLE` |
-/// | 503 | `FAILED_PRECONDITION`(message に元の REST エラーコード名を併記) |
+/// | 503 | `UNAVAILABLE`(collection_not_running) / `FAILED_PRECONDITION`(writes_disabled) |
 /// | 500(監査書き込み失敗等、防御的分岐) | `INTERNAL` |
 ///
 /// message は常に `"{rest_error_code}: {detail}"`(detail が無ければ
 /// `rest_error_code` のみ)- 設計「detail 文字列でコード名を併記」の実現。
 fn write_rejection_status(rejection: WriteRejection) -> Status {
     let code = match &rejection {
+        WriteRejection::CollectionNotRunning(_) => tonic::Code::Unavailable,
         WriteRejection::NotFound => tonic::Code::NotFound,
         WriteRejection::NotWritable => tonic::Code::PermissionDenied,
         WriteRejection::TagDisabled => tonic::Code::FailedPrecondition,
@@ -286,6 +288,7 @@ enum RequireScope {
 #[derive(Clone)]
 pub struct GrpcService {
     manager: Arc<CollectorManager>,
+    collection_controller: Option<Arc<CollectionController>>,
     api_keys: ApiKeysService,
     audit: AuditLogService,
     write_audit: WriteAuditService,
@@ -307,6 +310,7 @@ impl GrpcService {
     ) -> Self {
         Self {
             manager,
+            collection_controller: None,
             api_keys,
             audit,
             write_audit,
@@ -314,6 +318,14 @@ impl GrpcService {
             rate_limiter,
             events,
         }
+    }
+
+    /// Enable the T14-4 stopped-state write gate for production wiring.
+    /// `new` intentionally remains ungated for legacy integration tests and
+    /// embedders that construct the service directly.
+    pub fn with_controller(mut self, controller: Arc<CollectionController>) -> Self {
+        self.collection_controller = Some(controller);
+        self
     }
 
     /// `authorization: Bearer bh_...` メタデータを照合する - このモジュール
@@ -688,6 +700,7 @@ impl TagServiceTrait for GrpcService {
 
         let deps = write_path::WriteDeps {
             manager: self.manager.as_ref(),
+            collection_controller: self.collection_controller.as_deref(),
             api_keys: &self.api_keys,
             write_audit: &self.write_audit,
             write_control: self.write_control.as_ref(),
@@ -794,5 +807,20 @@ impl GrpcServer {
         if let Some(handle) = guard.take() {
             handle.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::controller::CollectionState;
+
+    #[test]
+    fn stopped_collection_rejection_maps_to_unavailable() {
+        let status = write_rejection_status(WriteRejection::CollectionNotRunning(
+            CollectionState::Stopped,
+        ));
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert!(status.message().contains("collection_not_running"));
     }
 }

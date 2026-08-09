@@ -79,6 +79,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::api_keys::{ApiKeyContext, ApiKeysService};
 use crate::computed::upsert_retained_value;
+use crate::controller::{CollectionController, CollectionState};
 use crate::hub::CollectorManager;
 use crate::write_audit::{WriteAuditAction, WriteAuditResult, WriteAuditRow, WriteAuditService};
 use crate::write_control::WriteControl;
@@ -134,6 +135,10 @@ pub struct WriteOk {
 /// それこそが「ゲートの実装を2つに割らない」ことの核心。
 #[derive(Debug, Clone, PartialEq)]
 pub enum WriteRejection {
+    /// T14-4: the collection is not in a writable running state. This gate is
+    /// only installed by production composition; the legacy compatibility
+    /// router intentionally leaves it unset for existing embedders/tests.
+    CollectionNotRunning(CollectionState),
     /// gate 1: catalog に存在しない外部名(REST: 404, gRPC: NOT_FOUND)。
     NotFound,
     /// gate 2: `writable == false`(REST: 403, gRPC: PERMISSION_DENIED)。
@@ -173,6 +178,10 @@ pub enum WriteRejection {
 /// 呼び出しの都度使い捨てで作ってよい。
 pub struct WriteDeps<'a> {
     pub manager: &'a CollectorManager,
+    /// Optional lifecycle gate. `None` preserves the legacy `api_router` /
+    /// `GrpcService::new` behavior; production wiring supplies the controller
+    /// so stopped writes fail closed before any broker ensure/spawn path.
+    pub collection_controller: Option<&'a CollectionController>,
     pub api_keys: &'a ApiKeysService,
     pub write_audit: &'a WriteAuditService,
     pub write_control: &'a WriteControl,
@@ -241,6 +250,13 @@ pub async fn execute_write(
     tag: &str,
     requested: Option<RequestedValue>,
 ) -> Result<WriteOk, WriteRejection> {
+    if let Some(controller) = deps.collection_controller {
+        let state = controller.status().state;
+        if state != CollectionState::Running {
+            return Err(WriteRejection::CollectionNotRunning(state));
+        }
+    }
+
     // gate 1: catalog 解決
     let map = deps.manager.tag_map();
     let Some(entry) = map.get(tag).cloned() else {
@@ -596,6 +612,7 @@ impl WriteRejection {
     /// `crate::rest::write_rejection_response` がこの分岐と1対1で対応付ける。
     pub fn rest_error_code(&self) -> &'static str {
         match self {
+            WriteRejection::CollectionNotRunning(_) => "collection_not_running",
             WriteRejection::NotFound => "not_found",
             WriteRejection::NotWritable => "not_writable",
             WriteRejection::TagDisabled => "tag_disabled",
@@ -629,5 +646,23 @@ impl WriteRejection {
             Some(detail) => json!({ "error": self.rest_error_code(), "detail": detail }),
             None => json!({ "error": self.rest_error_code() }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::controller::CollectionState;
+
+    #[test]
+    fn collection_not_running_uses_shared_rest_mapping() {
+        let rejection = WriteRejection::CollectionNotRunning(CollectionState::Stopped);
+
+        assert_eq!(rejection.rest_error_code(), "collection_not_running");
+        assert_eq!(rejection.detail(), None);
+        assert_eq!(
+            rejection.to_json(),
+            json!({"error": "collection_not_running"})
+        );
     }
 }
