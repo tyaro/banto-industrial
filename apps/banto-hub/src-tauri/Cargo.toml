@@ -24,6 +24,15 @@ tauri = { version = "2", features = ["tray-icon"] }
 # 設計 §4.2「単一インスタンス」: 第二インスタンスは既存ウィンドウを前面化して
 # 自身は終了する。
 tauri-plugin-single-instance = "2"
+# T16-1（実装指示 3.「アプリを終了の確認」）: トレイ「アプリを終了」の確認
+# ダイアログ用。JS 側の `@tauri-apps/plugin-dialog` は一切使わず、Rust 側
+# `DialogExt` からネイティブダイアログを直接呼ぶだけ - capabilities への
+# 権限追加は不要（権限は webview からの invoke 経路にのみ効く）。
+tauri-plugin-dialog = "2"
+# T16-1（実装指示 4.「× でトレイ格納時の初回通知」、UX-7）: OS 通知用。
+# 上と同じ理由で JS 側バインディングは使わず、Rust 側 `NotificationExt` から
+# 直接呼ぶ。
+tauri-plugin-notification = "2"
 # `RunningHub` を保持する `tokio::sync::Mutex`（AppState フィールド型を名指し
 # するためだけの依存 - chronogazer/src-tauri の `tokio` 依存と同じ理由。
 # `HubRuntime::start`/`RunningHub::shutdown` 自体は `tauri::async_runtime`

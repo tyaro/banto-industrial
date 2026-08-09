@@ -1,11 +1,12 @@
 # banto-hub T16 詳細設計（デスクトップシェル・タスクトレイ）
 
 作成日: 2026-08-09
-状態: **設計確定。P1〜P3 承認済み。T16-0 実装済み・レビュー待ち
-（`apps/banto-hub/src-tauri`、パッケージ名 `banto-hub-shell`）。次は T16-1。**
+状態: **設計確定。P1〜P3 承認済み。T16-0 マージ済み
+（`apps/banto-hub/src-tauri`、パッケージ名 `banto-hub-shell`）。T16-1
+（トレイ状態表示）実装済み・レビュー待ち。次は T16-2。**
 最終検証日(コード照合): 2026-08-09
-基準コミット: `fa96c90`（main、T15 完了・PR #98 マージ後）。T16-0 の実装は
-本設計と同じ PR（`cursor/t16-0-thin-shell-e3cb`）で追加。
+基準コミット: `ac6bdff`（main、T16-0 マージ後）。T16-1 の実装は本設計と
+同じ PR（`cursor/t16-1-tray-status-e3cb`）で追加。
 
 関連: [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)
 （§8 シェル / §9.9 トレイ / §10 T16 / §16.3 T16・T17）、
@@ -124,6 +125,22 @@ banto-hub-shell (Tauri v2, Windows 優先)
 | ×            | トレイ格納。初回だけ継続通知（可能なら）                   |
 
 開始／再起動／サービス操作はトレイに置かない（§8.2）。
+
+> **T16-1 実装メモ（2026-08-09）**: 上表の「確認なし（T16-0）」「初回だけ
+> 継続通知（可能なら）」は本 PR で以下のとおり実装した（詳細は
+> [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §10「T16」の
+> T16-1 実装メモ）。
+>
+> - 「アプリを終了」は `tauri-plugin-dialog` によるネイティブ確認ダイアログを
+>   経由するようになった。収集中は「収集を停止し、履歴を flush してから
+>   終了します」、停止中は短い確認文言。キャンセル時は shutdown/exit を
+>   一切呼ばない。
+> - 初回継続通知は `tauri-plugin-notification` で OS 通知を出し、既読フラグを
+>   `app_data_dir` 配下のファイルへ永続化する（プロセス内フラグではなく実際に
+>   永続化できた）。
+> - あわせて、トレイの状態ラベル・tooltip・「収集を停止」メニュー項目
+>   （`CollectionController::subscribe_status()` 購読で状態変化に追従）を
+>   §3「T16-1」・desktop-plan §9.7/§9.9 のとおり実装した。
 
 ### 4.4 作成予定ファイル
 
