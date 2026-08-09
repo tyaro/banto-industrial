@@ -823,7 +823,24 @@ async fn plc_disconnect_is_relayed_as_an_event() {
 // 8. バックプレッシャ切断: 送信キューが満杯になったら切断される
 // ---------------------------------------------------------------------------
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// H7フォローアップ（2026-08-09、フレーク根治）: このテストだけ意図的に
+// デフォルトの current_thread（単一スレッド）ランタイムを使う -
+// `multi_thread`/`worker_threads = 2` に**戻さないこと**（フレークが
+// 再発する）。根本原因: 送信経路は `evaluate()`（`src/stream.rs` の同期関数、
+// tick 分岐から呼ばれる）が `enqueue()` 経由で `data_tx.try_send()` を
+// `.await` を挟まないタイトループで回すのに対し、`writer_task`
+// (`src/stream.rs`) は別 `tokio::spawn` タスクとしてキューを drain する。
+// worker_threads = 2 だとこの writer_task が2本目のワーカー上で
+// **同時に** drain してしまい、`try_send` が `Full` を一度も観測できず
+// バックプレッシャ切断（`enqueue`、code 1013）が発火しないままテストの
+// 5秒待ちがタイムアウトする（= フレーク）。current_thread
+// （ワーカースレッド1本）ならこのタスクを同時に動かす2本目のスレッドが
+// 存在しないため、`evaluate()` の同期・await 無しファンアウトが完走する
+// までの間 writer_task は一切 drain できない - よって
+// `subscription_count`（`OUTBOUND_QUEUE_CAPACITY + 64` = 320）本の
+// `try_send` は容量256のキューに対して257本目で確実にオーバーフローし、
+// `enqueue` が確定的に close を発火する。
+#[tokio::test]
 async fn a_slow_subscriber_gets_disconnected_once_the_outbound_queue_fills() {
     let app = test_app("backpressure").await;
     let sim = Simulator::start().await;

@@ -36,9 +36,13 @@ pub struct TsReader {
 
 impl TsReader {
     /// Open `path` read-only and load its metadata. Fails with
-    /// [`TstoreError::IncompatibleFile`] if `path` is not a `banto-tstore`
-    /// file this build understands (missing `tstore_meta`/unsupported
-    /// `format_version`).
+    /// [`TstoreError::Uninitialized`] if the file exists but has no
+    /// `banto-tstore` schema at all yet (e.g. a reader raced
+    /// [`crate::writer::TsWriter::open`]'s file-creation transaction - see
+    /// that variant's doc comment), or [`TstoreError::IncompatibleFile`] if
+    /// it has a `tstore_meta` table but is not a `banto-tstore` file this
+    /// build understands (unsupported `format_version`, or another required
+    /// key/table missing).
     pub async fn open(path: &Path) -> Result<Self, TstoreError> {
         let pool = schema::connect_readonly(path).await?;
         let file_meta = schema::read_file_meta(&pool).await?;
@@ -177,10 +181,23 @@ mod tests {
         assert!(matches!(err, TstoreError::Storage(_)));
     }
 
+    // H7フォローアップ（TsQuery「未初期化ファイル」対応、2026-08-09）:
+    // 以前はこのケース（`tstore_meta` テーブルが無い）を
+    // `TstoreError::IncompatibleFile` として扱っていたが、これは
+    // ライター側のスキーマ作成トランザクション未コミット（レース）と
+    // 「本当に壊れた/無関係なファイル」を区別できない誤ったエラー種別
+    // だった（`crates/banto-tsquery` がこれを見て範囲クエリ全体を
+    // ハードエラーにしてしまっていた）。`tstore_meta` テーブル自体が
+    // 存在しない、という条件だけで判定できる以上、「壊れたファイル」と
+    // 「まだ書き込み中のファイル」を区別する材料はこの時点では無い -
+    // よって両方とも `Uninitialized` に倒す（`error.rs::TstoreError::
+    // Uninitialized` の doc comment 参照）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn open_foreign_sqlite_file_is_incompatible() {
+    async fn open_file_with_an_unrelated_table_and_no_tstore_meta_is_uninitialized() {
         let file = TempFile::new("foreign");
-        // A real SQLite file, but not one this crate ever wrote.
+        // A real, connectable SQLite file with some other table, but no
+        // `tstore_meta` - indistinguishable, from this crate's point of
+        // view, from the writer-race window `Uninitialized` documents.
         let pool = schema::connect_writable(file.path()).await.unwrap();
         sqlx::query("CREATE TABLE not_tstore (id INTEGER)")
             .execute(&pool)
@@ -189,7 +206,24 @@ mod tests {
         pool.close().await;
 
         let err = TsReader::open(file.path()).await.unwrap_err();
-        assert!(matches!(err, TstoreError::IncompatibleFile(_)));
+        assert!(matches!(err, TstoreError::Uninitialized(_)), "{err:?}");
+    }
+
+    /// The literal writer-race window `TstoreError::Uninitialized`'s doc
+    /// comment describes: `connect_writable` (`create_if_missing(true)`)
+    /// brings the physical file into existence, but this test deliberately
+    /// stops there - never running `schema::create_schema`'s transaction -
+    /// so the file has zero tables, exactly what a reader can observe if it
+    /// opens the file in the gap between `TsWriter::open`'s file creation
+    /// and that transaction's commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn open_file_with_zero_tables_is_uninitialized() {
+        let file = TempFile::new("zero-tables");
+        let pool = schema::connect_writable(file.path()).await.unwrap();
+        pool.close().await;
+
+        let err = TsReader::open(file.path()).await.unwrap_err();
+        assert!(matches!(err, TstoreError::Uninitialized(_)), "{err:?}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

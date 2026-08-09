@@ -45,6 +45,14 @@ pub enum TsQueryError {
     /// skipping the file: a query result that quietly omits a real data
     /// file (as opposed to correctly reporting "no data for this group in
     /// this file") would be misleading in an industrial-recorder context.
+    ///
+    /// A file with **no** `banto-tstore` schema at all yet (the writer
+    /// raced its own schema-creation transaction - `banto_tstore::
+    /// TstoreError::Uninitialized`'s doc comment) is *not* routed here: every
+    /// read path checks for that specific condition first (`plan.rs::
+    /// is_uninitialized` / `raw.rs`'s `TstoreError::Uninitialized` match arm)
+    /// and skips the file instead, before this stricter content check ever
+    /// runs.
     #[error("互換性のないデータファイルです: {path}: {message}")]
     IncompatibleFile { path: PathBuf, message: String },
 

@@ -23,32 +23,36 @@
 //! tstore_meta`/`tstore_groups`/`tstore_columns` + the group's `samples_<n>`,
 //! all in one transaction - `schema::create_schema`) commits. A reader that
 //! lists that file during this window and opens it before the commit sees a
-//! real, valid, *empty* (zero-table) SQLite database - which every read
-//! method's metadata query (`SELECT ... FROM tstore_meta`/`tstore_groups`)
-//! reports as `TsQueryError::IncompatibleFile`, not as an empty/absent
-//! result. Empirically (measured while writing this test) this is not a
-//! rare corner case: with the reader racing from the very first instant as
-//! it does below, it is hit on effectively every run, multiple times. It is
-//! observably the exact same real-world condition as "no file yet" (the
-//! writer simply has not finished creating its first file), so this test
-//! tolerates it identically to an empty result - but *only* before the
-//! first row has ever been successfully observed. Once a file's
-//! schema-creation transaction has committed, this crate's central design
-//! (`banto-tstore/src/lib.rs`: "日次ファイル + スキーマ凍結") guarantees that
-//! file's schema never changes again, so this specific race cannot recur
-//! for it - a later `IncompatibleFile` would be a genuine, unexpected
-//! failure and is not tolerated.
+//! real, valid, *empty* (zero-table) SQLite database. Empirically (measured
+//! while writing this test) this is not a rare corner case: with the reader
+//! racing from the very first instant as it does below, it is hit on
+//! effectively every run, multiple times.
 //!
-//! (This looks like a real, narrow gap in `TsQuery`'s documented "absent/
-//! empty, not an error" contract for the pre-first-file window - worth a
-//! follow-up in `banto-tsquery` itself. Out of scope here: this test suite
-//! only adds coverage, it does not change `src/` production logic.)
+//! **FIXED（2026-08-09、H7フォローアップ, docs/improvement-plan.md ④）**:
+//! this used to be a real, documented gap in `TsQuery`'s "absent/empty, not
+//! an error" contract - a reader that raced this exact window got
+//! `TsQueryError::IncompatibleFile` instead of an empty/absent result, and
+//! this test used to tolerate that specifically for the pre-first-row case.
+//! Root cause: `banto-tstore/src/schema.rs::read_file_meta` mapped "no
+//! `tstore_meta` table at all" to the *same* error variant
+//! (`TstoreError::IncompatibleFile`) used for genuinely wrong/corrupt files,
+//! so `banto-tsquery` had no way to tell "raced the writer" apart from "real
+//! format problem". `banto-tstore` now reports the former as its own
+//! variant, `TstoreError::Uninitialized`, and every one of `TsQuery`'s four
+//! read methods (`raw.rs`'s `TstoreError::Uninitialized` match arm;
+//! `plan.rs::is_uninitialized`, shared by `decimate.rs`/`aggregate.rs`/
+//! `catalog.rs`) now skips a file in that state - contributing zero
+//! rows/gaps/absence, same as a file that simply is not there yet - instead
+//! of erroring. This test therefore no longer tolerates `IncompatibleFile`
+//! anywhere in the race, at any row count: every read below must succeed
+//! (or, for `catalog`, at worst report the group as not-yet-present) from
+//! the very first poll, and any error is now a genuine, unexpected failure.
 
 mod common;
 
 use std::time::{Duration, Instant};
 
-use banto_tsquery::{RawRow, TsQuery, TsQueryError};
+use banto_tsquery::{RawRow, TsQuery};
 use common::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -113,18 +117,14 @@ async fn concurrent_reads_during_writes_never_corrupt_or_error() {
                 );
                 last_count = range.rows.len();
             }
-            Err(TsQueryError::IncompatibleFile { .. }) if last_count == 0 => {
-                // See this file's module doc: the writer's very first file
-                // can transiently exist-but-be-schema-less before its
-                // creation transaction commits. Observably the same
-                // condition as "no file yet" - tolerated only pre-first-row.
-            }
-            Err(err) => panic!("read_range must never error once past the first row: {err}"),
+            // FIXED (see this file's module doc): a racing reader now skips
+            // an uninitialized file instead of erroring, so this must never
+            // fail at any point in the race, not just past the first row.
+            Err(err) => panic!("read_range must never error: {err}"),
         }
 
         // Same race, via the decimated + catalog paths - both must stay
-        // error-free (modulo the identical pre-first-row race above) and
-        // internally consistent throughout.
+        // error-free and internally consistent throughout.
         match query
             .read_decimated("g1", &requested_tags, DAY1_START_MS, RANGE_TO_MS, 10)
             .await
@@ -133,8 +133,7 @@ async fn concurrent_reads_during_writes_never_corrupt_or_error() {
                 decimated.bins.len() <= 10,
                 "must never return more than the requested target_bins"
             ),
-            Err(TsQueryError::IncompatibleFile { .. }) if last_count == 0 => {}
-            Err(err) => panic!("read_decimated must never error once past the first row: {err}"),
+            Err(err) => panic!("read_decimated must never error: {err}"),
         }
 
         match query.catalog().await {
@@ -149,8 +148,7 @@ async fn concurrent_reads_during_writes_never_corrupt_or_error() {
                     }
                 }
             }
-            Err(TsQueryError::IncompatibleFile { .. }) if last_count == 0 => {}
-            Err(err) => panic!("catalog must never error once past the first row: {err}"),
+            Err(err) => panic!("catalog must never error: {err}"),
         }
 
         if last_count == ROW_COUNT as usize {

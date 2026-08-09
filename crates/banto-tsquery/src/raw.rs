@@ -10,10 +10,17 @@
 //! time - see `writer.rs`'s rotation design - so no merge-sort is needed,
 //! only concatenation), `tag_keys` projection/reordering, and the row-count
 //! limit.
+//!
+//! A candidate file whose `TsReader::open` fails with
+//! `banto_tstore::TstoreError::Uninitialized` (writer created the file but
+//! has not yet committed its schema - see that variant's doc comment) is
+//! skipped, not errored: it contributes zero rows, same as a file that
+//! never described `group_key` at all. Any other open failure is still a
+//! hard [`TsQueryError::IncompatibleFile`].
 
 use std::path::Path;
 
-use banto_tstore::TsReader;
+use banto_tstore::{TsReader, TstoreError};
 
 use crate::error::TsQueryError;
 use crate::files::candidate_files;
@@ -44,6 +51,12 @@ pub(crate) async fn read_range(
     for file in &files {
         let reader = match TsReader::open(&file.path).await {
             Ok(reader) => reader,
+            // Uninitialized: the writer created this file but has not yet
+            // committed its schema-creation transaction (raced) - not a
+            // real error, treat it exactly like a file this crate has not
+            // even listed yet: contribute zero rows and move on (see
+            // `banto_tstore::TstoreError::Uninitialized`'s doc comment).
+            Err(TstoreError::Uninitialized(_)) => continue,
             Err(err) => {
                 return Err(TsQueryError::IncompatibleFile {
                     path: file.path.clone(),
