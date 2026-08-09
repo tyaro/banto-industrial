@@ -121,6 +121,7 @@ use crate::assets::FrontendAssets;
 use crate::audit::AuditLogService;
 use crate::broker_glue::{HubSessions, SlmpSimRegistry};
 use crate::computed::{load_retained_values, ComputedEngine, ServerTagStore};
+use crate::controller::CollectionController;
 use crate::db::init_db;
 use crate::diag_log::DiagLog;
 use crate::events::event_channel;
@@ -193,9 +194,8 @@ pub enum HubStartError {
 
 /// 起動〜シャットダウンの共通シーケンス本体（このモジュール doc 参照）への
 /// エントリポイント。中身を持たない型 - `HubRuntime::start`は関連関数
-/// （`self`を取らない）。将来 controller 等を持つ拡張点が要るなら
-/// [`RunningHub`]側（構築後の状態）に足す方針（T14-2 以降、設計
-/// §12「T14-2」- `controller()`は T14-1 では生やさない）。
+/// （`self`を取らない）。構築後の状態と収集制御は[`RunningHub`]側が保持し、
+/// T14-2 では [`RunningHub::controller`] から直列化された controller を取得する。
 pub struct HubRuntime;
 
 impl HubRuntime {
@@ -314,24 +314,9 @@ impl HubRuntime {
             .with_diag_log(DiagLog::new(log_line, log_err_line)),
         );
 
-        // Startup rebuild (design §4.3: T0 は起動時に1回). A failure here
-        // (e.g. a stray invalid tag left over from a hand-edited DB) must
-        // not prevent the server from starting - it surfaces via
-        // `/api/v1/status`'s `last_config_error` instead, exactly like a
-        // rebuild triggered by a later CRUD write. T9-2: the "simulation
-        // 接続あり" startup diagnostic (docs/ux-plan.md §1,
-        // accident-prevention (c)) is emitted from inside
-        // `CollectorManager::rebuild` itself - it now routes through
-        // `with_diag_log` (just above) to `hub_log::log_line`, so it reaches
-        // the Windows service log file too (T9-2 フォローアップ
-        // 2026-08-06, `crate::diag_log` モジュール doc 参照) - this call
-        // already covers "hub 起動時" logging, nothing further is needed
-        // here.
-        if let Err(err) = manager.rebuild().await {
-            log_err_line(&format!(
-                "banto-hub: 起動時の collector 構築に失敗しました: {err}"
-            ));
-        }
+        // T14-2: construction no longer starts collection implicitly. The
+        // desktop host remains stopped; the Windows service host explicitly
+        // starts Configured mode through `RunningHub::controller()`.
 
         // T6-2 (design §4.2「評価タイミング」): the computed-tag 250ms
         // evaluation loop - same fixed tick (`EVAL_TICK_MS`,
@@ -395,6 +380,10 @@ impl HubRuntime {
                 false
             });
         let write_control = Arc::new(WriteControl::new(write_was_enabled_persisted));
+        let controller = Arc::new(CollectionController::new(
+            manager.clone(),
+            write_control.clone(),
+        ));
         let write_audit = WriteAuditService::new(pool.clone());
 
         // T3 (docs/tag-server-design.md §5.3): construct stopped, then
@@ -499,6 +488,7 @@ impl HubRuntime {
         Ok(RunningHub {
             mqtt,
             grpc_server,
+            controller,
             manager,
             sessions,
             sim_registry,
@@ -512,11 +502,12 @@ impl HubRuntime {
 /// [`HubRuntime::start`]が返す、稼働中の banto-hub の1インスタンス。
 /// teardown に必要なものを保持する - [`RunningHub::shutdown`]がそれらを
 /// 使ってこのモジュール doc の「シャットダウン順序」節どおりに畳む。
-/// **T14-1 では `controller()` は生やさない**（設計 §12「T14-1」- 収集
-/// 状態機械・controller は T14-2 以降）。
+/// T14-2 の収集状態機械を保持し、[`Self::controller`] から外部ホストへ
+/// [`CollectionController`] を提供する。
 pub struct RunningHub {
     mqtt: Arc<MqttPublisher>,
     grpc_server: Arc<GrpcServer>,
+    controller: Arc<CollectionController>,
     manager: Arc<CollectorManager>,
     sessions: Arc<HubSessions>,
     sim_registry: Arc<SlmpSimRegistry>,
@@ -534,6 +525,11 @@ impl RunningHub {
     /// を直接使っていたのと同じ（設計 §3「D1」の `local_addr()`）。
     pub fn local_addr(&self) -> std::net::SocketAddr {
         self.server.local_addr()
+    }
+
+    /// Obtain the process-wide serialized collection controller.
+    pub fn controller(&self) -> Arc<CollectionController> {
+        self.controller.clone()
     }
 
     /// このモジュール doc の「シャットダウン順序」節どおりに teardown する。

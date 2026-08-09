@@ -39,6 +39,7 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
 
+use banto_hub_core::controller::{CollectionState, RunMode};
 use banto_hub_core::hub_log::{self, log_err_line, log_line};
 use banto_hub_core::runtime::HubRuntime;
 
@@ -256,17 +257,6 @@ fn run_service_body(_arguments: Vec<OsString>) {
         }
     };
 
-    // 簡略化: 本来は起動処理中に`StartPending`+チェックポイントを刻むべき
-    // だが（SCM の既定タイムアウトは約30秒）、`HubRuntime::start`（T14-1、
-    // `banto_hub_core::runtime`）は単一の async関数で細かい進捗
-    // チェックポイントを持たない。DB初期化・collector構築等は通常この
-    // タイムアウトに収まる規模なので、`windows-service`クレート自身の
-    // `ping_service`例と同様に、ハンドラ登録直後に`Running`を報告する
-    // 単純化を選んだ（将来、起動が遅くなるようなら`StartPending`の刻みを
-    // 追加する余地あり）。
-    report_status(ServiceState::Running, ServiceExitCode::Win32(0));
-    log_line("banto-hub: Windows サービスとして起動しました");
-
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
         Err(err) => {
@@ -294,6 +284,18 @@ fn run_service_body(_arguments: Vec<OsString>) {
             Ok(hub) => hub,
             Err(err) => panic!("banto-hub: 起動に失敗しました: {err}"),
         };
+        let start_status = hub.controller().start(RunMode::Configured).await;
+        if start_status.state != CollectionState::Running {
+            log_err_line(&format!(
+                "banto-hub: Configured 収集の開始に失敗しました: {:?}",
+                start_status.last_error
+            ));
+            hub.shutdown().await;
+            report_status(ServiceState::Stopped, ServiceExitCode::ServiceSpecific(1));
+            return;
+        }
+        report_status(ServiceState::Running, ServiceExitCode::Win32(0));
+        log_line("banto-hub: Windows サービスとして起動しました");
         shutdown_notify.notified().await;
         hub.shutdown().await;
     });

@@ -1058,7 +1058,7 @@ impl CollectorManager {
         (handles, stale_ids, resolved_targets)
     }
 
-    /// T7-2/T9-2: [`crate::broker_glue::HubSessions::remove`] and
+    /// T14-2/T7-2/T9-2: [`crate::broker_glue::HubSessions::stop_and_join`] and
     /// [`crate::broker_glue::SlmpSimRegistry::remove`] for every id in
     /// `stale`. Must only be called AFTER the collector-side commit for the
     /// same rebuild has succeeded (see
@@ -1069,7 +1069,7 @@ impl CollectorManager {
     /// is `.await`-heavy, stopping a simulator's ramp task) - was sync before.
     async fn remove_stale_slmp_sessions(&self, stale: &[i64]) {
         for &connection_id in stale {
-            self.sessions.remove(connection_id);
+            let _ = self.sessions.stop_and_join(connection_id).await;
             self.sim_registry.remove(connection_id).await;
         }
     }
@@ -1268,6 +1268,18 @@ impl CollectorManager {
         let mut inner = self.inner.lock().expect("hub state lock poisoned");
         inner.current = None;
         inner.last_apply = None;
+    }
+
+    /// Stop a collection run while keeping the broker supervisor reusable for
+    /// the next run. The collector is stopped first so no task retains a
+    /// broker handle while the per-connection broker tasks are joined.
+    pub async fn stop(&self) {
+        self.shutdown().await;
+        let connection_ids = self.sessions.connection_ids();
+        for connection_id in connection_ids {
+            let _ = self.sessions.stop_and_join(connection_id).await;
+            self.sim_registry.remove(connection_id).await;
+        }
     }
 }
 
