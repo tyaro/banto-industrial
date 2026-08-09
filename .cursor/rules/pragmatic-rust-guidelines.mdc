@@ -1,0 +1,69 @@
+---
+description: Microsoft Pragmatic Rust Guidelines（本リポジトリの Rust 実装時に参照）
+globs: **/*.{rs,toml}
+alwaysApply: false
+---
+
+# Microsoft Pragmatic Rust Guidelines（要約）
+
+出典: https://microsoft.github.io/rust-guidelines/ （Version 2026.6）
+Golden Rule: 文言より精神。回避する前に「何を守るか」を理解する。
+
+`must` は原則常に守る。`should` は柔軟。既存クレートの流儀と衝突する場合は
+既存流儀を優先し、逸脱理由を設計文書かモジュール doc に残す。
+
+## Universal
+
+- 上流の Rust API Guidelines / Clippy を前提にする（M-UPSTREAM-GUIDELINES）
+- 静的検証（clippy / tests）を通す（M-STATIC-VERIFICATION）
+- lint 抑止は `#[allow]` ではなく `#[expect]`（M-LINT-OVERRIDE-EXPECT）
+- 公開型は `Debug`、読み取り向け公開型は `Display`（M-PUBLIC-DEBUG / DISPLAY）
+- 疑わしいならクレートを分割する（M-SMALLER-CRATES）
+- 曖昧語を避け、名前は短く本質だけ（M-WEASEL-WORDS / M-SHORT-NAMES）
+- associated fn より通常関数を優先（M-REGULAR-FN）
+- マジック値は文書化する（M-DOCUMENTED-MAGIC）
+- 構造化ログとメッセージテンプレート（M-LOG-STRUCTURED）
+
+## Libraries
+
+- 公開型は `Send`（M-TYPES-SEND）
+- 外部型を API に漏らさない。再 export は元クレートから（M-DONT-LEAK-TYPES /
+  M-FOREIGN-REEXPORTS）
+- 受け取りは `impl AsRef<>` / `RangeBounds` / sans-IO を検討（M-IMPL-*）
+- ネストした抽象・スマートポインタだらけの API を避ける（M-SIMPLE-ABSTRACTIONS /
+  M-AVOID-WRAPPERS）
+- 型 > ジェネリクス > dyn（M-DI-HIERARCHY）
+- エラーは正準 struct、`From` で変換（M-ERRORS-CANONICAL-STRUCTS / M-FROM-ERROR）
+- 複雑な初期化は builder / cascade（M-INIT-BUILDER / M-INIT-CASCADED）
+- サービスは `Clone`、本質 API は inherent（M-SERVICES-CLONE /
+  M-ESSENTIAL-FN-INHERENT）
+- I/O・syscall はモック可能、テストユーティリティは feature gate
+  （M-MOCKABLE-SYSCALLS / M-TEST-UTIL）
+- 統合テストは `tests/`（M-INTEGRATION-TESTS）
+- 強い型と newtype で不変条件を守る（M-STRONG-TYPES*）
+- builder は最終 `.build()` で検証（M-BUILD-RESULT）
+- glob re-export と安易な static を避ける（M-NO-GLOB-REEXPORTS / M-AVOID-STATICS）
+- 本番は `println!` ではなくテレメトリ（M-LOG-NOT-PRINT）
+- feature は加算的（M-FEATURES-ADDITIVE）
+
+## Correctness / Performance / Project
+
+- `unsafe` は理由付きで最小限。不健全を許さない（M-UNSAFE* / M-UNSOUND）
+- panic は「停止」。バグ検出は error ではなく panic（M-PANIC-*）
+- ホットパスを見極め、スループット優先、長時間タスクに yield（M-HOTPATH /
+  M-THROUGHPUT / M-YIELD-POINTS）
+- 割り当て再利用・初期容量・高速 hasher・不要な間接参照を避ける
+- workspace で共通設定とバージョンを管理（M-CARGO-WORKSPACE /
+  M-CRATES-IN-WORKSPACE）
+- 新規クレートは最新 edition、MSRV は慎重に更新（M-LATEST-EDITION / M-MSRV）
+
+## Documentation / AI
+
+- 先頭文は短く、モジュール doc を充実させる（M-FIRST-DOC-SENTENCE /
+  M-MODULE-DOCS / M-CANONICAL-DOCS）
+- `pub use` は `#[doc(inline)]`（M-DOC-INLINE）
+- アイテムは単一パスから見えるようにする（M-SINGLE-ITEM-PATH）
+- トートロジーテストを書かない（M-TAUTOLOGICAL-TESTS）
+- Rust の問題は Rust らしい形で解く（M-RUST-SHAPED）
+
+詳細と各 ID の本文は公式サイトを正とする。
