@@ -13,6 +13,12 @@
 //! *union* of every tag ever seen (a tag retired from a group's live config
 //! still needs to be selectable for a historical range that predates its
 //! removal).
+//!
+//! A file whose writer has not yet committed its schema-creation
+//! transaction (`crate::plan::is_uninitialized`,
+//! `banto_tstore::TstoreError::Uninitialized`'s doc comment) is skipped
+//! entirely rather than erroring the whole call - it simply contributes no
+//! groups/tags/range, same as if it were not listed at all.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -21,7 +27,9 @@ use banto_tstore::list_data_files;
 use sqlx::Row;
 
 use crate::error::TsQueryError;
-use crate::plan::{incompatible, is_safe_column_name, is_safe_table_name, open_readonly};
+use crate::plan::{
+    incompatible, is_safe_column_name, is_safe_table_name, is_uninitialized, open_readonly,
+};
 use crate::types::{Catalog, GroupCatalogEntry, TagCatalogEntry};
 
 pub(crate) async fn catalog(data_dir: &Path) -> Result<Catalog, TsQueryError> {
@@ -30,6 +38,18 @@ pub(crate) async fn catalog(data_dir: &Path) -> Result<Catalog, TsQueryError> {
 
     for file in &files {
         let pool = open_readonly(&file.path).await?;
+
+        if is_uninitialized(&pool)
+            .await
+            .map_err(|e| incompatible(&file.path, e))?
+        {
+            // Writer has not yet committed this file's schema-creation
+            // transaction (raced) - skip it like any other file that
+            // contributes nothing, not a hard error (see
+            // `plan.rs::is_uninitialized`).
+            pool.close().await;
+            continue;
+        }
 
         let group_rows = sqlx::query("SELECT group_key, group_name, table_name FROM tstore_groups")
             .fetch_all(&pool)

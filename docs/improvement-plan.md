@@ -4,7 +4,7 @@
 状態: **進行中(Phase 1 = PR #58、Phase 2 = PR #59/#73、Phase 3 = H10 ①②③ を PR #74/#75 でマージ済み)**。
 H1〜H4・H6・H8・H10 完了、H5 は vitest 導入まで完了(E2E 拡充は Phase 4)。
 H7 は ⑤ フレーク安定化 4 件(A.1/A.3/A.4/A.5)+ ②③④ 堅牢性テスト(crash 再オープン・DST・
-read-while-write)を 2026-08-09 に対応。残りは H7 の A.2 フレーク・① 実機 soak・
+read-while-write)+ A.2 決定化 + ④ TsQuery ギャップ修正を 2026-08-09 に対応。残りは H7 の ① 実機 soak・
 H9(SLMP 構造化エラー)・H5 の E2E 拡充(いずれも Phase 4 相当/環境依存)。
 最終検証日(コード照合): 2026-08-09
 
@@ -50,7 +50,7 @@ H9(SLMP 構造化エラー)・H5 の E2E 拡充(いずれも Phase 4 相当/環�
 | H4  | 収集タイムスタンプ逆行対策 + append 失敗の可視化         | 高     | 中   | 完了(#58)           |
 | H5  | フロントテスト基盤(vitest)+ hub/relay-wright E2E         | 高     | 大   | vitest 完了・E2E 残 |
 | H6  | サプライチェーン/再現性(deny・audit・toolchain 固定ほか) | 高     | 中   | 完了(#59)           |
-| H7  | ソーク実行・障害系テスト(crash 再オープン・DST・並行)    | 中     | 大   | ⑤+②③④完了・残 A.2/① |
+| H7  | ソーク実行・障害系テスト(crash 再オープン・DST・並行)    | 中     | 大   | ⑤+②③④+A.2完了・残 ① |
 | H8  | ドキュメント整合(状態ヘッダ・README・状態欄義務化)       | 中     | 小   | 完了(#58/#59)       |
 | H9  | SLMP 構造化エラー(fork/upstream)+ transport 共通化       | 中     | 大   | 未着手              |
 | H10 | 認可の細粒度化(キー有効期限・read スコープ・arm 失効)    | 中     | 中   | 完了(#74/#75)       |
@@ -250,7 +250,7 @@ H9(SLMP 構造化エラー)・H5 の E2E 拡充(いずれも Phase 4 相当/環�
 - **受け入れ条件**: CI に deny/audit ジョブが載り green、toolchain 固定後
   も全ジョブ green
 
-### H7: ソーク実行・障害系テスト — 状態: ⑤(フレーク安定化)+ ②③④(堅牢性テスト)完了(2026-08-09)。A.2 と ①(実機 soak)が残
+### H7: ソーク実行・障害系テスト — 状態: ⑤+②③④+A.2 完了・④ ギャップ修正済み(2026-08-09)。残るは ①(実機 soak、環境依存)のみ
 
 - **事実**: ソークハーネスは**既にある**(banto-hub `tests/soak.rs`
   = 72h 用・Windows メモリプローブ付き、banto-collect に `#[ignore]` の
@@ -301,20 +301,28 @@ H9(SLMP 構造化エラー)・H5 の E2E 拡充(いずれも Phase 4 相当/環�
     `concurrent_reads_during_writes_never_corrupt_or_error`): WAL の 1-writer/N-reader で、
     背景 writer の append+flush 中に前景で `read_range`/`read_decimated`/`catalog` を反復。
     破損・エラー・count 逆行なし、writer 完了後に全 N 行を確認(5+40 回連続 green)
-  - **④ で判明した follow-up(prod 未修正)**: `TsQuery` の「最初のファイル生成レース中は
-    absent/empty を返す(エラーにしない)」契約に実際のギャップ。`TsWriter::open` は
-    スキーマ作成トランザクション commit の**前に**物理 `.sqlite3` を作るため、その窓で
-    ファイルを開いた reader は空(0 テーブル)DB を見て全 read メソッドが
-    `TsQueryError::IncompatibleFile`(空 `Ok` でなく hard `Err`)を返す。テストは初回行
-    観測前のみ許容(スキーマ凍結後は再発しないため以後はエラー扱い)。`banto-tsquery` 側の
-    手当て候補として記録
-- **未処理(follow-up)**:
-  - **A.2** `stream.rs` `a_slow_subscriber_gets_disconnected_once_the_outbound_queue_fills`:
-    「アウトバウンドキュー溢れは決定的」という前提が multi-thread ランタイム下で崩れる
-    (writer タスクが別ワーカースレッドで並行 drain + カーネルソケットバッファが吸収し、
-    `try_send` が `Full` を観測しないことがある)。堅牢化には writer を止めるテスト用
-    シーム、または巨大ペイロードでのバッファ超過など踏み込んだ設計が要るため**専用 PR に
-    先送り**(誤修正回避)
+  - **④ で判明したギャップ → 本 follow-up PR(A.2 と同時)で修正済み**: `TsQuery` の
+    「最初のファイル生成レース中は absent/empty を返す(エラーにしない)」契約に実ギャップが
+    あった(生成途中の 0 テーブル DB を全 read が hard `IncompatibleFile` にしていた)。
+    修正内容は下記「A.2 + ④ ギャップ」の実施記録を参照
+- **実施記録(2026-08-09、A.2 + ④ ギャップ = follow-up PR)**:
+  - **A.2** `stream.rs` `a_slow_subscriber_gets_disconnected_once_the_outbound_queue_fills`
+    のフレーク根治(**prod 不変**)。原因は「アウトバウンドキュー溢れは決定的」という前提が
+    `multi_thread` 下で崩れること(別 spawn の `writer_task` が並行 drain し `try_send` が
+    `Full` を観測し損ねる)。修正は当該テストを **`#[tokio::test]`(current_thread)化**する
+    だけ — 単一ワーカーでは同期・await 無しの `evaluate()` ファンアウト中に writer_task が
+    走れず、320 本が容量 256 のキューを 257 本目で確定的にオーバーフローし backpressure
+    close が必ず発火(**40 回連続 green** で決定性確認)。`multi_thread` に戻さない旨コメント明記
+  - **④ TsQuery 生成途中ファイル対応**(prod 修正): `banto-tstore` に
+    `TstoreError::Uninitialized` を新設し、`read_file_meta` が `sqlite_master` で `tstore_meta`
+    不在を判定して返す(`tstore_meta` を持つが書式不整合は従来どおり `IncompatibleFile`)。
+    `banto-tsquery` の全 read 経路(`raw.rs` / `plan.rs`=decimate・aggregate / `catalog.rs`)は
+    `Uninitialized` のファイルを **skip(空扱い)**。concurrency テストは初回行前の許容を撤去し
+    「read は一切エラーしない」に強化。banto-tstore 79 / banto-tsquery 41 green
+  - **意味論変更(オーナー可視)**: `tstore_meta` テーブルが**無い**ファイル(生成途中・
+    無関係な sqlite・稀に meta だけ失ったファイル)は「クエリ全体をエラー」から「その file を
+    静かに skip」へ。異物 1 個で read API 全体が壊れなくなる利点と、`tstore_meta` だけ失った
+    病的ケースが黙って skip される trade-off(後者は日次ファイル+スキーマ凍結上ほぼ起きない)
 - **備考**: ① 実機相当環境(Windows)での 72h soak 実行はコンテナ/CI では完結しない
   (実行環境と 72h の実時間が必要)ため当セッション対象外
 

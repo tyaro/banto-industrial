@@ -51,11 +51,30 @@ pub enum TstoreError {
     InvalidFileName(PathBuf),
 
     /// A file opened via [`crate::reader::TsReader::open`] (or reused via
-    /// [`crate::writer::TsWriter::open`]) is not a `banto-tstore` file this
-    /// version understands: missing/unreadable `tstore_meta`, or a
-    /// `format_version` this build does not support.
+    /// [`crate::writer::TsWriter::open`]) has a `tstore_meta` table but is
+    /// not a `banto-tstore` file this version understands: `format_version`
+    /// missing/unsupported, or another required `tstore_meta`/
+    /// `tstore_groups`/`tstore_columns` key/row missing - a genuine format
+    /// mismatch or corruption. Distinct from [`Self::Uninitialized`], which
+    /// means there is no `banto-tstore` schema at all yet.
     #[error("互換性のないファイルです: {0}")]
     IncompatibleFile(String),
+
+    /// The file exists (SQLite already created it on disk) but has **no**
+    /// `banto-tstore` schema at all yet - no `tstore_meta` table, so nothing
+    /// downstream could be "wrong" about it either. The one confirmed cause:
+    /// [`crate::writer::TsWriter::open`]'s underlying `SqlitePoolOptions::
+    /// connect_with(.. .create_if_missing(true) ..)` (`schema::connect_writable`)
+    /// brings the physical `.sqlite3` file into existence *before*
+    /// `schema::create_schema`'s single DDL transaction commits - a reader
+    /// that opens the file inside that (short, but real - see
+    /// `crates/banto-tsquery/tests/concurrency.rs`) window observes a valid,
+    /// connectable, zero-table SQLite database. Unlike [`Self::IncompatibleFile`]
+    /// (a real format problem worth surfacing as an error), this is "no data
+    /// here yet" - callers that walk a data directory (`banto-tsquery`) treat
+    /// it exactly like a file that does not exist at all, not as a failure.
+    #[error("banto-tstore のスキーマがまだ存在しません（書き込み中の可能性があります）: {0}")]
+    Uninitialized(String),
 }
 
 impl From<sqlx::Error> for TstoreError {

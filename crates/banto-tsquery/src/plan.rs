@@ -25,6 +25,16 @@
 //! the "give me every row for this group in this range" operation it needs,
 //! with no custom SQL required.
 //!
+//! ## Uninitialized files are skipped, not errored
+//!
+//! [`plan_file`] calls [`is_uninitialized`] before querying `tstore_groups`
+//! at all: a file whose writer has not yet committed its schema-creation
+//! transaction (`banto_tstore::TstoreError::Uninitialized`'s doc comment)
+//! returns `Ok(None)` here - the same "this file contributes nothing"
+//! outcome as a file that simply never described `group_key`. `catalog.rs`
+//! (which shares [`open_readonly`] but does not build a [`FilePlan`]) calls
+//! [`is_uninitialized`] directly for the same reason.
+//!
 //! ## SQL-identifier safety
 //!
 //! `table_name`/`column_name` values read back from `tstore_groups`/
@@ -77,6 +87,27 @@ pub(crate) async fn open_readonly(path: &Path) -> Result<SqlitePool, TsQueryErro
     Ok(SqlitePoolOptions::new().connect_with(options).await?)
 }
 
+/// `true` if `pool` has no `banto-tstore` schema at all yet - no
+/// `tstore_meta` table, meaning the writer's schema-creation transaction
+/// (`banto-tstore/src/schema.rs::create_schema`) has not committed (or this
+/// is a genuinely foreign file; either way this crate treats it identically
+/// - see `banto_tstore::TstoreError::Uninitialized`'s doc comment).
+///
+/// Mirrors `banto-tstore/src/schema.rs::read_file_meta`'s own
+/// `sqlite_master` probe for the identical condition - duplicated here
+/// (rather than reused) because this module deliberately does not route
+/// file opens through `banto_tstore::TsReader` (see this module's doc
+/// comment "Why this crate opens its own connections instead of going
+/// through TsReader"), so there is no `TstoreError` to match on at this call
+/// site the way `raw.rs` can.
+pub(crate) async fn is_uninitialized(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
+    let row =
+        sqlx::query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tstore_meta'")
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.is_none())
+}
+
 pub(crate) fn is_safe_table_name(name: &str) -> bool {
     name.strip_prefix("samples_")
         .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
@@ -98,6 +129,17 @@ pub(crate) async fn plan_file(
     tag_keys: &[String],
 ) -> Result<Option<FilePlan>, TsQueryError> {
     let pool = open_readonly(path).await?;
+
+    if is_uninitialized(&pool)
+        .await
+        .map_err(|e| incompatible(path, e))?
+    {
+        // Writer has not yet committed this file's schema-creation
+        // transaction (raced) - treat it exactly like "this file does not
+        // describe group_key at all" below, not as an error.
+        pool.close().await;
+        return Ok(None);
+    }
 
     let group_row =
         sqlx::query("SELECT table_name, period_ms FROM tstore_groups WHERE group_key = ? LIMIT 1")

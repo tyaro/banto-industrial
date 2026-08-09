@@ -215,17 +215,37 @@ pub(crate) async fn create_schema(
 }
 
 /// Read a file's `tstore_meta`/`tstore_groups`/`tstore_columns` back into a
-/// [`FileMeta`]. Returns [`TstoreError::IncompatibleFile`] if the required
-/// tables/keys are missing (not a `banto-tstore` file at all) or if
-/// `format_version` is not one this build understands.
+/// [`FileMeta`]. Returns [`TstoreError::Uninitialized`] if `tstore_meta`
+/// itself does not exist (no `banto-tstore` schema at all yet - see that
+/// variant's doc comment for the writer-race window this covers), or
+/// [`TstoreError::IncompatibleFile`] if `tstore_meta` exists but a required
+/// key is missing/invalid, or `format_version` is not one this build
+/// understands.
 pub(crate) async fn read_file_meta(pool: &SqlitePool) -> Result<FileMeta, TstoreError> {
+    // Detect "no schema at all" robustly via `sqlite_master`, rather than
+    // inferring it from whatever error the `SELECT ... FROM tstore_meta`
+    // below happens to fail with - a missing-table error is the only case
+    // this should catch (a *locked*/corrupt-but-present `tstore_meta` must
+    // still fall through to that query and surface as `IncompatibleFile`,
+    // not be silently reclassified as "uninitialized").
+    let table_exists =
+        sqlx::query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tstore_meta'")
+            .fetch_optional(pool)
+            .await?
+            .is_some();
+    if !table_exists {
+        return Err(TstoreError::Uninitialized(
+            "tstore_meta テーブルが存在しません（書き込み中、またはbanto-tstoreのファイルではない可能性があります）"
+                .to_string(),
+        ));
+    }
+
     let meta_rows = sqlx::query("SELECT key, value FROM tstore_meta")
         .fetch_all(pool)
         .await
         .map_err(|_| {
             TstoreError::IncompatibleFile(
-                "tstore_meta テーブルが見つかりません（banto-tstore のファイルではない可能性があります）"
-                    .to_string(),
+                "tstore_meta テーブルの読み取りに失敗しました".to_string(),
             )
         })?;
 
