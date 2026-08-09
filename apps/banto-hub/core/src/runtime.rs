@@ -102,7 +102,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use banto_collect::{CollectorOptions, Quality};
+use banto_collect::{CollectorOptions, Quality, RegistrySnapshot};
 use banto_core::BantoError;
 use banto_server::{lan_urls, start, static_router, AuthState, RunningServer, ServerConfig};
 use banto_tags::{
@@ -129,7 +129,7 @@ use crate::grpc::{GrpcServer, GrpcService};
 use crate::hub::CollectorManager;
 use crate::hub_log::{log_err_line, log_line};
 use crate::mqtt::MqttPublisher;
-use crate::rest::{api_router, audited_credential_verifier};
+use crate::rest::{api_router_with_controller, audited_credential_verifier};
 use crate::settings::SettingsService;
 use crate::subscribe_core::EVAL_TICK_MS;
 use crate::users::UsersService;
@@ -314,9 +314,21 @@ impl HubRuntime {
             .with_diag_log(DiagLog::new(log_line, log_err_line)),
         );
 
-        // T14-2: construction no longer starts collection implicitly. The
-        // desktop host remains stopped; the Windows service host explicitly
-        // starts Configured mode through `RunningHub::controller()`.
+        // T14-3: startup commits the catalog/preflight only. The desktop host
+        // remains stopped; the Windows service host explicitly starts
+        // Configured mode through `RunningHub::controller()`.
+        match RegistrySnapshot::load(&pool).await {
+            Ok(snapshot) => {
+                if let Err(err) = manager.commit_catalog(&snapshot).await {
+                    log_err_line(&format!(
+                        "banto-hub: 起動時 catalog の commit に失敗しました: {err}"
+                    ));
+                }
+            }
+            Err(err) => log_err_line(&format!(
+                "banto-hub: 起動時レジストリ snapshot の取得に失敗しました: {err}"
+            )),
+        }
 
         // T6-2 (design §4.2「評価タイミング」): the computed-tag 250ms
         // evaluation loop - same fixed tick (`EVAL_TICK_MS`,
@@ -394,7 +406,10 @@ impl HubRuntime {
         // disables" safety rule like the write path does (design has no
         // such requirement for T3; publishing is read-only against the tag
         // space).
-        let mqtt = Arc::new(MqttPublisher::new(manager.clone()));
+        let mqtt = Arc::new(MqttPublisher::new_with_controller(
+            manager.clone(),
+            controller.clone(),
+        ));
         let mqtt_settings = settings.mqtt_config().await.unwrap_or_else(|err| {
             log_err_line(&format!(
                 "banto-hub: MQTT 設定の読み取りに失敗しました: {err}"
@@ -431,7 +446,7 @@ impl HubRuntime {
         });
         grpc_server.apply(&grpc_settings).await;
 
-        let app = api_router(
+        let app = api_router_with_controller(
             users,
             audit,
             plc_connections,
@@ -439,6 +454,7 @@ impl HubRuntime {
             tags,
             api_keys,
             manager.clone(),
+            controller.clone(),
             auth,
             events,
             allow_setup,

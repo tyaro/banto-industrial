@@ -83,7 +83,7 @@
 use banto_core::{BantoError, FieldError, ListParams, ListResult};
 use banto_storage::ColumnMap;
 use serde::{Deserialize, Serialize};
-use sqlx::{QueryBuilder, Sqlite, SqlitePool};
+use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
 use crate::support::{map_write_error, max_length_message, range_message, required_message};
 
@@ -343,6 +343,31 @@ impl PlcConnectionService {
         .map_err(|err| map_write_error(err, "name", "", ""))
     }
 
+    /// Transaction-compatible counterpart of [`Self::create`]. The caller
+    /// owns the transaction and may run additional registry preflight queries
+    /// before deciding to commit or roll it back.
+    pub async fn create_tx(
+        &self,
+        connection: &mut SqliteConnection,
+        input: PlcConnectionInput,
+    ) -> Result<PlcConnection, BantoError> {
+        validate_plc_connection_input(&input)?;
+        sqlx::query_as::<_, PlcConnection>(&format!(
+            "INSERT INTO plc_connections (name, protocol, host, port, unit_id, enabled, simulation) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
+        ))
+        .bind(input.name.trim())
+        .bind(&input.protocol)
+        .bind(input.host.trim())
+        .bind(input.port)
+        .bind(input.unit_id)
+        .bind(input.enabled)
+        .bind(input.simulation)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|err| map_write_error(err, "name", "", ""))
+    }
+
     /// **T6-2 addition**: a `"virtual"`-protocol connection cannot be edited
     /// either (same reservation as [`Self::delete`] - the admin UI shows
     /// `calc`/`mem` as read-only rows, this is the API-layer enforcement of
@@ -382,6 +407,51 @@ impl PlcConnectionService {
         .bind(input.simulation)
         .bind(id)
         .fetch_one(&self.pool)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => BantoError::NotFound {
+                resource: RESOURCE.to_string(),
+                id: id.to_string(),
+            },
+            other => map_write_error(other, "name", "", ""),
+        })
+    }
+
+    /// Transaction-compatible counterpart of [`Self::update`].
+    pub async fn update_tx(
+        &self,
+        connection: &mut SqliteConnection,
+        id: i64,
+        input: PlcConnectionInput,
+    ) -> Result<PlcConnection, BantoError> {
+        validate_plc_connection_input(&input)?;
+        let existing_protocol: Option<String> =
+            sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *connection)
+                .await
+                .map_err(banto_storage::storage_error)?;
+        if existing_protocol.as_deref() == Some(VIRTUAL_PROTOCOL) {
+            return Err(BantoError::Validation {
+                field_errors: vec![FieldError {
+                    field: "id".to_string(),
+                    message: "予約接続（calc/mem）は編集できません".to_string(),
+                }],
+            });
+        }
+        sqlx::query_as::<_, PlcConnection>(&format!(
+            "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ?, simulation = ? \
+             WHERE id = ? RETURNING {COLUMNS}"
+        ))
+        .bind(input.name.trim())
+        .bind(&input.protocol)
+        .bind(input.host.trim())
+        .bind(input.port)
+        .bind(input.unit_id)
+        .bind(input.enabled)
+        .bind(input.simulation)
+        .bind(id)
+        .fetch_one(&mut *connection)
         .await
         .map_err(|err| match err {
             sqlx::Error::RowNotFound => BantoError::NotFound {
@@ -449,6 +519,57 @@ impl PlcConnectionService {
         let result = sqlx::query("DELETE FROM plc_connections WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
+            .await
+            .map_err(banto_storage::storage_error)?;
+        if result.rows_affected() == 0 {
+            return Err(BantoError::NotFound {
+                resource: RESOURCE.to_string(),
+                id: id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Transaction-compatible counterpart of [`Self::delete`].
+    pub async fn delete_tx(
+        &self,
+        connection: &mut SqliteConnection,
+        id: i64,
+    ) -> Result<(), BantoError> {
+        let protocol: Option<String> =
+            sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *connection)
+                .await
+                .map_err(banto_storage::storage_error)?;
+        if protocol.as_deref() == Some(VIRTUAL_PROTOCOL) {
+            return Err(BantoError::Validation {
+                field_errors: vec![FieldError {
+                    field: "id".to_string(),
+                    message: "予約接続（calc/mem）は削除できません".to_string(),
+                }],
+            });
+        }
+        let group_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM collection_groups WHERE plc_connection_id = ?",
+        )
+        .bind(id)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(banto_storage::storage_error)?;
+        if group_count > 0 {
+            return Err(BantoError::Validation {
+                field_errors: vec![FieldError {
+                    field: "id".to_string(),
+                    message: format!(
+                        "この接続を使用している収集グループが{group_count}件あるため削除できません"
+                    ),
+                }],
+            });
+        }
+        let result = sqlx::query("DELETE FROM plc_connections WHERE id = ?")
+            .bind(id)
+            .execute(&mut *connection)
             .await
             .map_err(banto_storage::storage_error)?;
         if result.rows_affected() == 0 {

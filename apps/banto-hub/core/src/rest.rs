@@ -24,17 +24,16 @@
 //!   スキーマ自体は秘密ではないため（`openapi_json` 関数の doc comment
 //!   参照）。
 //!
-//! ## I1 CRUD 書き込み後の再構築（設計 §4.3）
+//! ## I1 CRUD 書き込み後の catalog commit（T14-3）
 //!
 //! `tag_registry_router` の書き込みハンドラ（create/update/delete、3
-//! リソース共通）は、レジストリへの書き込みが成功した後に必ず
-//! [`crate::hub::CollectorManager::rebuild`] を呼ぶ。rebuild が失敗しても
-//! CRUD 自体は成功のまま返す（設計指示: 「rebuild 失敗は CRUD 自体の失敗に
-//! しない」）— 定義は保存済みで、Collector が旧構成のまま
-//! `last_error`（`/api/v1/status`）に出る、という状態を許容する。
+//! リソース共通）は、同一SQLiteトランザクション内で提案mutation後の
+//! registry snapshot/catalog/computed plan/configを検証し、成功した場合だけ
+//! [`crate::hub::CollectorManager::commit_catalog`] を呼ぶ。これは
+//! configured revisionだけを前進させ、Collector/Broker/Simulatorを起動・再適用
+//! しない。実行中構成への適用はCollectionControllerのstart経路に限る。
 //! 併せて admin-UI 向けの `ServerEvent::ResourceChanged` を SSE (`/api/events`)
-//! に流す（レジストリが実際に変わったことは rebuild の成否と独立な事実なので、
-//! rebuild が失敗していても送る）。
+//! に流す。
 //!
 //! ## タグ空間の値の意味論（設計 §4）
 //!
@@ -56,7 +55,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use banto_broker::{BrokerConnectionStatus, BrokerError};
-use banto_collect::{ApplyReport, ConnectionStatus};
+use banto_collect::{build_config_from, ApplyReport, ConnectionStatus, RegistrySnapshot};
 use banto_core::{BantoError, ErrorBody, FieldError, ListParams, ListResult};
 // T12 (docs/ux-plan.md §4): 保存前の接続テスト API 用。Modbus/SLMP 両方の
 // 直接ダイヤル経路が同じ型を使うので、ここで一括 import する
@@ -84,6 +83,7 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService, IssuedApiKey};
 use crate::audit::{AuditEntry, AuditLogService};
+use crate::controller::CollectionController;
 use crate::hub::{CollectorManager, TagEntry};
 use crate::mqtt::MqttPublisher;
 use crate::settings::{MqttSettings, SettingsService};
@@ -1687,17 +1687,31 @@ impl From<TagPayload> for TagInput {
     }
 }
 
-/// Rebuild the collector and notify admin-UI SSE subscribers after an I1
-/// write. Never fails the caller (design instructions: 「rebuild 失敗は CRUD
-/// 自体の失敗にしない」) - a rebuild failure is only logged; its message
-/// remains visible via `/api/v1/status`'s `last_config_error`.
-async fn rebuild_and_notify(
+/// Commit the catalog already preflighted in the write transaction and notify
+/// admin-UI SSE subscribers. Production callers leave
+/// `legacy_live_reconfigure` disabled: registry writes advance the configured
+/// revision only. The compatibility router can opt into the pre-T14-3 live
+/// apply for existing embedders/tests.
+async fn commit_catalog_and_notify(
     manager: &CollectorManager,
+    controller: &CollectionController,
     events: &broadcast::Sender<ServerEvent>,
     resource: &str,
+    snapshot: RegistrySnapshot,
+    legacy_live_reconfigure: bool,
 ) {
-    if let Err(err) = manager.rebuild().await {
-        eprintln!("banto-hub: {resource} 変更後の collector 再構築に失敗しました: {err}");
+    if let Err(err) = manager.commit_catalog(&snapshot).await {
+        eprintln!("banto-hub: {resource} 変更後の catalog commit に失敗しました: {err}");
+    } else {
+        controller.refresh_status();
+        if legacy_live_reconfigure && manager.current_values().is_some() {
+            if let Err(err) = manager
+                .apply_run(crate::controller::RunMode::Configured)
+                .await
+            {
+                eprintln!("banto-hub: {resource} 変更後の live reconfigure に失敗しました: {err}");
+            }
+        }
     }
     let _ = events.send(ServerEvent::ResourceChanged {
         resource: resource.to_string(),
@@ -1712,7 +1726,9 @@ struct TagRegistryState {
     auth: AuthState,
     audit: AuditLogService,
     manager: Arc<CollectorManager>,
+    controller: Arc<CollectionController>,
     events: broadcast::Sender<ServerEvent>,
+    legacy_live_reconfigure: bool,
 }
 
 async fn plc_connections_list(
@@ -1748,7 +1764,27 @@ async fn plc_connections_create(
         "/api/plc-connections",
     )
     .await?;
-    let created = state.plc_connections.create(input.into()).await?;
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    let created = match state.plc_connections.create_tx(&mut tx, input.into()).await {
+        Ok(created) => created,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(ApiError(err));
+        }
+    };
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err);
+        }
+    };
+    tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
         &state.auth,
@@ -1759,7 +1795,15 @@ async fn plc_connections_create(
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
-    rebuild_and_notify(&state.manager, &state.events, "plc_connections").await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.controller,
+        &state.events,
+        "plc_connections",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
     Ok(Json(created))
 }
 
@@ -1778,7 +1822,31 @@ async fn plc_connections_update(
         "/api/plc-connections/{id}",
     )
     .await?;
-    let updated = state.plc_connections.update(id, input.into()).await?;
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    let updated = match state
+        .plc_connections
+        .update_tx(&mut tx, id, input.into())
+        .await
+    {
+        Ok(updated) => updated,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(ApiError(err));
+        }
+    };
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err);
+        }
+    };
+    tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
         &state.auth,
@@ -1789,7 +1857,15 @@ async fn plc_connections_update(
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
-    rebuild_and_notify(&state.manager, &state.events, "plc_connections").await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.controller,
+        &state.events,
+        "plc_connections",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
     Ok(Json(updated))
 }
 
@@ -1807,7 +1883,24 @@ async fn plc_connections_delete(
         "/api/plc-connections/{id}",
     )
     .await?;
-    state.plc_connections.delete(id).await?;
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    if let Err(err) = state.plc_connections.delete_tx(&mut tx, id).await {
+        let _ = tx.rollback().await;
+        return Err(ApiError(err));
+    }
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err);
+        }
+    };
+    tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
         &state.auth,
@@ -1818,7 +1911,15 @@ async fn plc_connections_delete(
         None,
     )
     .await;
-    rebuild_and_notify(&state.manager, &state.events, "plc_connections").await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.controller,
+        &state.events,
+        "plc_connections",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2277,7 +2378,31 @@ async fn collection_groups_create(
         "/api/collection-groups",
     )
     .await?;
-    let created = state.collection_groups.create(input.into()).await?;
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    let created = match state
+        .collection_groups
+        .create_tx(&mut tx, input.into())
+        .await
+    {
+        Ok(created) => created,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(ApiError(err));
+        }
+    };
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err);
+        }
+    };
+    tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
         &state.auth,
@@ -2288,7 +2413,15 @@ async fn collection_groups_create(
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
-    rebuild_and_notify(&state.manager, &state.events, "collection_groups").await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.controller,
+        &state.events,
+        "collection_groups",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
     Ok(Json(created))
 }
 
@@ -2307,7 +2440,31 @@ async fn collection_groups_update(
         "/api/collection-groups/{id}",
     )
     .await?;
-    let updated = state.collection_groups.update(id, input.into()).await?;
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    let updated = match state
+        .collection_groups
+        .update_tx(&mut tx, id, input.into())
+        .await
+    {
+        Ok(updated) => updated,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(ApiError(err));
+        }
+    };
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err);
+        }
+    };
+    tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
         &state.auth,
@@ -2318,7 +2475,15 @@ async fn collection_groups_update(
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
-    rebuild_and_notify(&state.manager, &state.events, "collection_groups").await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.controller,
+        &state.events,
+        "collection_groups",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
     Ok(Json(updated))
 }
 
@@ -2336,7 +2501,24 @@ async fn collection_groups_delete(
         "/api/collection-groups/{id}",
     )
     .await?;
-    state.collection_groups.delete(id).await?;
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    if let Err(err) = state.collection_groups.delete_tx(&mut tx, id).await {
+        let _ = tx.rollback().await;
+        return Err(ApiError(err));
+    }
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err);
+        }
+    };
+    tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
         &state.auth,
@@ -2347,7 +2529,15 @@ async fn collection_groups_delete(
         None,
     )
     .await;
-    rebuild_and_notify(&state.manager, &state.events, "collection_groups").await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.controller,
+        &state.events,
+        "collection_groups",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2376,7 +2566,27 @@ async fn tags_create(
         "/api/tags",
     )
     .await?;
-    let created = state.tags.create(input.into()).await?;
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    let created = match state.tags.create_tx(&mut tx, input.into()).await {
+        Ok(created) => created,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(ApiError(err));
+        }
+    };
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err);
+        }
+    };
+    tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
         &state.auth,
@@ -2387,7 +2597,15 @@ async fn tags_create(
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
-    rebuild_and_notify(&state.manager, &state.events, "tags").await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.controller,
+        &state.events,
+        "tags",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
     Ok(Json(created))
 }
 
@@ -2406,7 +2624,27 @@ async fn tags_update(
         "/api/tags/{id}",
     )
     .await?;
-    let updated = state.tags.update(id, input.into()).await?;
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    let updated = match state.tags.update_tx(&mut tx, id, input.into()).await {
+        Ok(updated) => updated,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(ApiError(err));
+        }
+    };
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err);
+        }
+    };
+    tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
         &state.auth,
@@ -2417,7 +2655,15 @@ async fn tags_update(
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
-    rebuild_and_notify(&state.manager, &state.events, "tags").await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.controller,
+        &state.events,
+        "tags",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
     Ok(Json(updated))
 }
 
@@ -2435,7 +2681,24 @@ async fn tags_delete(
         "/api/tags/{id}",
     )
     .await?;
-    state.tags.delete(id).await?;
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    if let Err(err) = state.tags.delete_tx(&mut tx, id).await {
+        let _ = tx.rollback().await;
+        return Err(ApiError(err));
+    }
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(err);
+        }
+    };
+    tx.commit().await.map_err(storage_api_error)?;
     record_write(
         &state.audit,
         &state.auth,
@@ -2446,12 +2709,21 @@ async fn tags_delete(
         None,
     )
     .await;
-    rebuild_and_notify(&state.manager, &state.events, "tags").await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.controller,
+        &state.events,
+        "tags",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
 // --- T11-1 一括登録 API (docs/ux-plan.md §3): 連続登録 UI と T11-2 の CSV
-// インポートが共有する基盤 - 検証 → all-or-nothing 適用 → 再構成1回。
+// インポートが共有する基盤 - transaction内検証 → all-or-nothing 適用 →
+// catalog commit 1回。
 // パターン展開（名前パターン/連続アドレス生成）はクライアント側（TS、
 // `apps/banto-hub/src/lib/banto/continuousRegistration.ts`）が担い、この
 // エンドポイントは展開済みの `TagInput` 配列を受け取るだけの汎用一括 API
@@ -2462,7 +2734,7 @@ async fn tags_delete(
 pub struct BatchTagsRequest {
     pub tags: Vec<TagPayload>,
     /// `true`: 検証結果だけを返す（DB 無変更）。`false`（既定）: 検証 →
-    /// 単一トランザクションで全件 INSERT → 呼び出し元が rebuild を1回。
+    /// 単一トランザクションで全件 INSERT → catalog commit を1回。
     #[serde(default)]
     pub dry_run: bool,
 }
@@ -2559,17 +2831,42 @@ async fn tags_batch(
         }));
     }
 
-    let outcome = state.tags.create_batch(inputs, dry_run).await?;
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    let outcome = match state.tags.create_batch_tx(&mut tx, &inputs).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(ApiError(err));
+        }
+    };
     match outcome {
-        BatchTagOutcome::Invalid(errors) => Ok(Json(BatchTagsResponse {
-            ok: false,
-            dry_run,
-            count: 0,
-            errors: errors.into_iter().map(Into::into).collect(),
-            tags: None,
-        })),
+        BatchTagOutcome::Invalid(errors) => {
+            let _ = tx.rollback().await;
+            Ok(Json(BatchTagsResponse {
+                ok: false,
+                dry_run,
+                count: 0,
+                errors: errors.into_iter().map(Into::into).collect(),
+                tags: None,
+            }))
+        }
         BatchTagOutcome::Valid { count, tags } => {
-            if !dry_run {
+            let snapshot = match preflight_transaction(&mut tx).await {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    let _ = tx.rollback().await;
+                    return Err(err);
+                }
+            };
+            if dry_run {
+                tx.rollback().await.map_err(storage_api_error)?;
+            } else {
+                tx.commit().await.map_err(storage_api_error)?;
                 record_write(
                     &state.audit,
                     &state.auth,
@@ -2580,16 +2877,23 @@ async fn tags_batch(
                     Some(json!({ "count": count })),
                 )
                 .await;
-                // T11-1 の核心: n 件でも rebuild はここで1回だけ
-                // (`tags_create` を n 回呼ぶ場合との違い)。
-                rebuild_and_notify(&state.manager, &state.events, "tags").await;
+                // T11-1 の核心: n 件でも catalog commit はここで1回だけ。
+                commit_catalog_and_notify(
+                    &state.manager,
+                    &state.controller,
+                    &state.events,
+                    "tags",
+                    snapshot,
+                    state.legacy_live_reconfigure,
+                )
+                .await;
             }
             Ok(Json(BatchTagsResponse {
                 ok: true,
                 dry_run,
                 count,
                 errors: Vec::new(),
-                tags,
+                tags: if dry_run { None } else { tags },
             }))
         }
     }
@@ -2597,7 +2901,7 @@ async fn tags_batch(
 
 /// `/api/plc-connections/*` + `/api/collection-groups/*` + `/api/tags/*`
 /// (viewer-read / editor-write) - `relay-wright-core::rest::tag_registry_router`
-/// を雛形に、書き込み成功後に必ず [`rebuild_and_notify`] を挟む点だけが違う。
+/// を雛形に、書き込み成功後に catalog commit と SSE通知を行う。
 #[allow(clippy::too_many_arguments)]
 fn tag_registry_router(
     plc_connections: PlcConnectionService,
@@ -2606,7 +2910,9 @@ fn tag_registry_router(
     audit: AuditLogService,
     auth: AuthState,
     manager: Arc<CollectorManager>,
+    controller: Arc<CollectionController>,
     events: broadcast::Sender<ServerEvent>,
+    legacy_live_reconfigure: bool,
 ) -> Router {
     let state = TagRegistryState {
         plc_connections,
@@ -2615,7 +2921,9 @@ fn tag_registry_router(
         auth: auth.clone(),
         audit,
         manager,
+        controller,
         events,
+        legacy_live_reconfigure,
     };
     Router::new()
         .route(
@@ -2674,6 +2982,7 @@ fn tag_registry_router(
 #[derive(Clone)]
 pub(crate) struct TagSpaceState {
     pub(crate) manager: Arc<CollectorManager>,
+    pub(crate) controller: Arc<CollectionController>,
     /// T2-4（設計 §6-6）: `GET /api/v1/status` の `write_enabled`/
     /// `write_was_enabled_before_restart` のため。
     pub(crate) write_control: Arc<WriteControl>,
@@ -3000,6 +3309,12 @@ impl From<ApplyReport> for LastApplyEntry {
 struct StatusResponse {
     version: String,
     revision: u64,
+    configured_revision: u64,
+    running_revision: u64,
+    run_id: Option<u64>,
+    collection_state: String,
+    collection_mode: String,
+    last_runtime_error: Option<String>,
     last_config_error: Option<String>,
     connections: Vec<ConnectionStatusEntry>,
     /// T2-4（設計 §6-6）: 書き込み受付が今いま有効かどうか(ライブフラグ)。
@@ -3039,7 +3354,8 @@ struct StatusResponse {
     tag = "tag-space",
 )]
 async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResponse>, ApiError> {
-    let revision = state.manager.revision();
+    let runtime = state.controller.status();
+    let revision = state.manager.configured_revision();
     let last_config_error = state.manager.last_error();
     let statuses = state.manager.connection_status().await;
 
@@ -3098,6 +3414,12 @@ async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResp
     Ok(Json(StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         revision,
+        configured_revision: runtime.configured_revision,
+        running_revision: runtime.running_revision,
+        run_id: runtime.run_id,
+        collection_state: runtime.state.as_str().to_string(),
+        collection_mode: runtime.mode.as_str().to_string(),
+        last_runtime_error: runtime.last_error,
         last_config_error,
         connections: entries,
         write_enabled: state.write_control.is_enabled(),
@@ -3643,6 +3965,7 @@ async fn require_tag_space_auth(
 #[allow(clippy::too_many_arguments)]
 fn tag_space_router(
     manager: Arc<CollectorManager>,
+    controller: Arc<CollectionController>,
     auth: AuthState,
     api_keys: ApiKeysService,
     audit: AuditLogService,
@@ -3661,6 +3984,7 @@ fn tag_space_router(
 ) -> Router {
     let state = TagSpaceState {
         manager: manager.clone(),
+        controller,
         write_control: write_control.clone(),
         mqtt,
     };
@@ -3717,7 +4041,7 @@ fn openapi_router() -> Router {
 /// (API キー + セッション bearer 併用、CSRF なし - see this module's doc
 /// comment) and the unauthenticated `/api/v1/openapi.json`.
 #[allow(clippy::too_many_arguments)]
-pub fn api_router(
+fn api_router_with_controller_mode(
     users: UsersService,
     audit: AuditLogService,
     plc_connections: PlcConnectionService,
@@ -3725,6 +4049,7 @@ pub fn api_router(
     tags: TagService,
     api_keys: ApiKeysService,
     manager: Arc<CollectorManager>,
+    controller: Arc<CollectionController>,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
     allow_setup: bool,
@@ -3747,6 +4072,7 @@ pub fn api_router(
     // `tag_space_router` のフィールド doc comment参照。ここで新規に
     // 構築すると REST/gRPC でレート制限のバジェットが分裂してしまう。
     rate_limiter: Arc<AsyncMutex<WriteRateLimiter>>,
+    legacy_live_reconfigure: bool,
 ) -> Router {
     let audited_auth_routes = auth_routes(auth.clone()).layer(middleware::from_fn_with_state(
         LogoutAuditState {
@@ -3780,7 +4106,9 @@ pub fn api_router(
             audit.clone(),
             auth.clone(),
             manager.clone(),
+            controller.clone(),
             events.clone(),
+            legacy_live_reconfigure,
         ))
         .merge(write_control_router(
             write_control.clone(),
@@ -3813,6 +4141,7 @@ pub fn api_router(
     admin
         .merge(tag_space_router(
             manager,
+            controller,
             auth,
             api_keys,
             audit,
@@ -3823,6 +4152,132 @@ pub fn api_router(
             rate_limiter,
         ))
         .merge(openapi_router())
+}
+
+/// Run the collector/computed preflight against a registry snapshot read from
+/// the same SQLite transaction that contains the proposed mutation. The tags
+/// services remain the authority for SQL FK/UNIQUE/shape validation; this
+/// helper covers the cross-table collector rules (address/data type and
+/// computed dependency validation).
+fn preflight_snapshot(snapshot: &RegistrySnapshot) -> Result<(), ApiError> {
+    let map = crate::hub::build_catalog_from(snapshot)
+        .map_err(|err| preflight_api_error(format!("catalog の検証に失敗しました: {err}")))?;
+    crate::computed::build_plan(&map)
+        .map_err(|err| preflight_api_error(format!("演算タグの検証に失敗しました: {err}")))?;
+    build_config_from(snapshot)
+        .map(|_| ())
+        .map_err(|err| preflight_api_error(err.to_string()))
+}
+
+fn preflight_api_error(message: String) -> ApiError {
+    ApiError(BantoError::Validation {
+        field_errors: vec![FieldError {
+            field: "configuration".to_string(),
+            message,
+        }],
+    })
+}
+
+fn storage_api_error(error: sqlx::Error) -> ApiError {
+    ApiError(BantoError::Storage(error.to_string()))
+}
+
+async fn preflight_transaction(
+    connection: &mut sqlx::SqliteConnection,
+) -> Result<RegistrySnapshot, ApiError> {
+    let snapshot = RegistrySnapshot::load_connection(connection)
+        .await
+        .map_err(|err| preflight_api_error(format!("レジストリの読み取りに失敗しました: {err}")))?;
+    preflight_snapshot(&snapshot)?;
+    Ok(snapshot)
+}
+
+/// Production composition entry point. Registry writes update the configured
+/// catalog but do not apply it to the running collection.
+#[allow(clippy::too_many_arguments)]
+pub fn api_router_with_controller(
+    users: UsersService,
+    audit: AuditLogService,
+    plc_connections: PlcConnectionService,
+    collection_groups: CollectionGroupService,
+    tags: TagService,
+    api_keys: ApiKeysService,
+    manager: Arc<CollectorManager>,
+    controller: Arc<CollectionController>,
+    auth: AuthState,
+    events: broadcast::Sender<ServerEvent>,
+    allow_setup: bool,
+    write_control: Arc<WriteControl>,
+    write_audit: WriteAuditService,
+    mqtt: Arc<MqttPublisher>,
+    grpc_server: Arc<crate::grpc::GrpcServer>,
+    rate_limiter: Arc<AsyncMutex<WriteRateLimiter>>,
+) -> Router {
+    api_router_with_controller_mode(
+        users,
+        audit,
+        plc_connections,
+        collection_groups,
+        tags,
+        api_keys,
+        manager,
+        controller,
+        auth,
+        events,
+        allow_setup,
+        write_control,
+        write_audit,
+        mqtt,
+        grpc_server,
+        rate_limiter,
+        false,
+    )
+}
+
+/// Compatibility composition entry point for existing embedders/tests. New
+/// hosts should use [`api_router_with_controller`] so MQTT and status observe
+/// the process-wide lifecycle controller.
+#[allow(clippy::too_many_arguments)]
+pub fn api_router(
+    users: UsersService,
+    audit: AuditLogService,
+    plc_connections: PlcConnectionService,
+    collection_groups: CollectionGroupService,
+    tags: TagService,
+    api_keys: ApiKeysService,
+    manager: Arc<CollectorManager>,
+    auth: AuthState,
+    events: broadcast::Sender<ServerEvent>,
+    allow_setup: bool,
+    write_control: Arc<WriteControl>,
+    write_audit: WriteAuditService,
+    mqtt: Arc<MqttPublisher>,
+    grpc_server: Arc<crate::grpc::GrpcServer>,
+    rate_limiter: Arc<AsyncMutex<WriteRateLimiter>>,
+) -> Router {
+    let controller = Arc::new(crate::controller::CollectionController::new(
+        manager.clone(),
+        write_control.clone(),
+    ));
+    api_router_with_controller_mode(
+        users,
+        audit,
+        plc_connections,
+        collection_groups,
+        tags,
+        api_keys,
+        manager,
+        controller,
+        auth,
+        events,
+        allow_setup,
+        write_control,
+        write_audit,
+        mqtt,
+        grpc_server,
+        rate_limiter,
+        true,
+    )
 }
 
 #[cfg(test)]

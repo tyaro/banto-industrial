@@ -80,6 +80,7 @@ use tokio::time::MissedTickBehavior;
 
 use banto_collect::Quality;
 
+use crate::controller::{CollectionController, CollectionState};
 use crate::hub::{quality_str, read_current, CollectorManager, TagEntry};
 use crate::settings::MqttSettings;
 
@@ -180,6 +181,7 @@ struct RunningPublisher {
 /// 何も起動しない停止状態のまま）。
 pub struct MqttPublisher {
     manager: Arc<CollectorManager>,
+    controller: Option<Arc<CollectionController>>,
     connected_tx: watch::Sender<bool>,
     running: AsyncMutex<Option<RunningPublisher>>,
 }
@@ -192,9 +194,22 @@ impl MqttPublisher {
         let (connected_tx, _rx) = watch::channel(false);
         Self {
             manager,
+            controller: None,
             connected_tx,
             running: AsyncMutex::new(None),
         }
+    }
+
+    /// Construct the production publisher with the lifecycle watch. Full
+    /// catalog publication is then driven by a Running transition, not by a
+    /// stopped catalog commit.
+    pub fn new_with_controller(
+        manager: Arc<CollectorManager>,
+        controller: Arc<CollectionController>,
+    ) -> Self {
+        let mut publisher = Self::new(manager);
+        publisher.controller = Some(controller);
+        publisher
     }
 
     /// `/api/v1/status`の`mqtt.connected`（`crate::rest::v1_status`参照）。
@@ -274,6 +289,7 @@ impl MqttPublisher {
 
         let eval_task = tokio::spawn(run_eval_loop(
             self.manager.clone(),
+            self.controller.clone(),
             client,
             settings.prefix,
             qos,
@@ -332,6 +348,7 @@ async fn run_eventloop(
 /// eval タスク本体 - このモジュールの doc comment「タスク構成」参照。
 async fn run_eval_loop(
     manager: Arc<CollectorManager>,
+    controller: Option<Arc<CollectionController>>,
     client: AsyncClient,
     prefix: String,
     qos: QoS,
@@ -339,6 +356,8 @@ async fn run_eval_loop(
     mut resync_rx: mpsc::Receiver<()>,
 ) {
     let mut revision_rx = manager.subscribe_revision();
+    let mut runtime_rx = controller.map(|controller| controller.subscribe_status());
+    let mut last_running_run_id = None;
     let mut tick = tokio::time::interval(Duration::from_millis(EVAL_TICK_MS));
     // `crate::stream`と同じ理由(評価ループは「だいたい250msおき」でよく、
     // 詰まった分を積み上げて連射する必要はない)。
@@ -351,15 +370,26 @@ async fn run_eval_loop(
             _ = tick.tick() => {
                 publish_changed(&manager, &client, &prefix, qos, min_interval_ms, &mut last).await;
             }
-            changed = revision_rx.changed() => {
-                if changed.is_err() {
-                    // CollectorManager が破棄された(プロセス終了間際) -
-                    // このタスクも畳む。
-                    break;
+            changed = async {
+                match runtime_rx.as_mut() {
+                    Some(receiver) => receiver.changed().await.map(|_| true).map_err(|_| ()),
+                    None => revision_rx.changed().await.map(|_| false).map_err(|_| ()),
                 }
-                // 設計 §5.3「revision 変化(config_changed)時は新 catalog
-                // で同様に一斉発行」。
-                publish_all(&manager, &client, &prefix, qos, &mut last).await;
+            } => {
+                let Ok(running_notification) = changed else { break; };
+                if running_notification {
+                    let status = runtime_rx.as_ref().expect("runtime receiver").borrow().clone();
+                    if status.state == CollectionState::Running
+                        && last_running_run_id != status.run_id
+                    {
+                        last_running_run_id = status.run_id;
+                        publish_all(&manager, &client, &prefix, qos, &mut last).await;
+                    }
+                } else {
+                    // Compatibility path for test/legacy callers that do not
+                    // inject a lifecycle controller.
+                    publish_all(&manager, &client, &prefix, qos, &mut last).await;
+                }
             }
             signal = resync_rx.recv() => {
                 if signal.is_none() {

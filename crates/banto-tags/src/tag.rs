@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use banto_core::{BantoError, FieldError, ListParams, ListResult};
 use banto_storage::ColumnMap;
 use serde::{Deserialize, Serialize};
-use sqlx::{QueryBuilder, Sqlite, SqlitePool};
+use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
 use crate::plc_connection::{CALC_CONNECTION_NAME, MEM_CONNECTION_NAME, VIRTUAL_PROTOCOL};
 use crate::scaling::Scaling;
@@ -594,6 +594,46 @@ async fn validate_tag_kind_placement(
     }
 }
 
+async fn validate_tag_kind_placement_tx(
+    connection: &mut SqliteConnection,
+    collection_group_id: i64,
+    tag_kind: &str,
+) -> Result<(), BantoError> {
+    let row: Option<(String, String)> = sqlx::query_as(
+        "SELECT pc.name, pc.protocol FROM collection_groups cg \
+         JOIN plc_connections pc ON pc.id = cg.plc_connection_id \
+         WHERE cg.id = ?",
+    )
+    .bind(collection_group_id)
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(banto_storage::storage_error)?;
+    let Some((conn_name, protocol)) = row else {
+        return Ok(());
+    };
+    let is_virtual = protocol == VIRTUAL_PROTOCOL;
+    let placement_error = |message: String| -> Result<(), BantoError> {
+        Err(BantoError::Validation {
+            field_errors: vec![FieldError {
+                field: "tagKind".to_string(),
+                message,
+            }],
+        })
+    };
+    match tag_kind {
+        PLC_TAG_KIND if is_virtual => {
+            placement_error("plc タグは予約接続（calc/mem）配下に作成できません".to_string())
+        }
+        COMPUTED_TAG_KIND if !is_virtual || conn_name != CALC_CONNECTION_NAME => placement_error(
+            format!("computed タグは予約接続 {CALC_CONNECTION_NAME} 配下にのみ作成できます"),
+        ),
+        INTERNAL_TAG_KIND if !is_virtual || conn_name != MEM_CONNECTION_NAME => placement_error(
+            format!("internal タグは予約接続 {MEM_CONNECTION_NAME} 配下にのみ作成できます"),
+        ),
+        _ => Ok(()),
+    }
+}
+
 fn column_map() -> ColumnMap {
     ColumnMap::new()
         .column("id", "id")
@@ -752,6 +792,41 @@ impl TagService {
             .map_err(|err| map_write_error(err, "name", "collectionGroupId", FK_MESSAGE))
     }
 
+    /// Transaction-compatible counterpart of [`Self::create`].
+    pub async fn create_tx(
+        &self,
+        connection: &mut SqliteConnection,
+        input: TagInput,
+    ) -> Result<Tag, BantoError> {
+        let validated = validate_tag_input(&input)?;
+        validate_tag_kind_placement_tx(connection, input.collection_group_id, &input.tag_kind)
+            .await?;
+        sqlx::query_as::<_, Tag>(&insert_tag_sql())
+            .bind(&validated.name)
+            .bind(input.collection_group_id)
+            .bind(&validated.address)
+            .bind(&input.data_type)
+            .bind(input.string_length)
+            .bind(input.raw_lo)
+            .bind(input.raw_hi)
+            .bind(input.eng_lo)
+            .bind(input.eng_hi)
+            .bind(&validated.unit)
+            .bind(input.decimals)
+            .bind(input.threshold_h)
+            .bind(input.threshold_hh)
+            .bind(input.threshold_l)
+            .bind(input.threshold_ll)
+            .bind(input.enabled)
+            .bind(input.writable)
+            .bind(&input.tag_kind)
+            .bind(&input.expression)
+            .bind(input.retain)
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|err| map_write_error(err, "name", "collectionGroupId", FK_MESSAGE))
+    }
+
     pub async fn update(&self, id: i64, input: TagInput) -> Result<Tag, BantoError> {
         let validated = validate_tag_input(&input)?;
         validate_tag_kind_placement(&self.pool, input.collection_group_id, &input.tag_kind).await?;
@@ -796,6 +871,56 @@ impl TagService {
         })
     }
 
+    /// Transaction-compatible counterpart of [`Self::update`].
+    pub async fn update_tx(
+        &self,
+        connection: &mut SqliteConnection,
+        id: i64,
+        input: TagInput,
+    ) -> Result<Tag, BantoError> {
+        let validated = validate_tag_input(&input)?;
+        validate_tag_kind_placement_tx(connection, input.collection_group_id, &input.tag_kind)
+            .await?;
+        sqlx::query_as::<_, Tag>(&format!(
+            "UPDATE tags SET \
+                name = ?, collection_group_id = ?, address = ?, data_type = ?, \
+                string_length = ?, raw_lo = ?, raw_hi = ?, eng_lo = ?, eng_hi = ?, unit = ?, decimals = ?, \
+                threshold_h = ?, threshold_hh = ?, threshold_l = ?, threshold_ll = ?, enabled = ?, \
+                writable = ?, tag_kind = ?, expression = ?, retain = ? \
+             WHERE id = ? RETURNING {COLUMNS}"
+        ))
+        .bind(&validated.name)
+        .bind(input.collection_group_id)
+        .bind(&validated.address)
+        .bind(&input.data_type)
+        .bind(input.string_length)
+        .bind(input.raw_lo)
+        .bind(input.raw_hi)
+        .bind(input.eng_lo)
+        .bind(input.eng_hi)
+        .bind(&validated.unit)
+        .bind(input.decimals)
+        .bind(input.threshold_h)
+        .bind(input.threshold_hh)
+        .bind(input.threshold_l)
+        .bind(input.threshold_ll)
+        .bind(input.enabled)
+        .bind(input.writable)
+        .bind(&input.tag_kind)
+        .bind(&input.expression)
+        .bind(input.retain)
+        .bind(id)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => BantoError::NotFound {
+                resource: RESOURCE.to_string(),
+                id: id.to_string(),
+            },
+            other => map_write_error(other, "name", "collectionGroupId", FK_MESSAGE),
+        })
+    }
+
     pub async fn delete(&self, id: i64) -> Result<(), BantoError> {
         let result = sqlx::query("DELETE FROM tags WHERE id = ?")
             .bind(id)
@@ -809,6 +934,167 @@ impl TagService {
             });
         }
         Ok(())
+    }
+
+    /// Transaction-compatible counterpart of [`Self::delete`].
+    pub async fn delete_tx(
+        &self,
+        connection: &mut SqliteConnection,
+        id: i64,
+    ) -> Result<(), BantoError> {
+        let result = sqlx::query("DELETE FROM tags WHERE id = ?")
+            .bind(id)
+            .execute(&mut *connection)
+            .await
+            .map_err(banto_storage::storage_error)?;
+        if result.rows_affected() == 0 {
+            return Err(BantoError::NotFound {
+                resource: RESOURCE.to_string(),
+                id: id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate and insert a batch using a caller-owned SQLite transaction.
+    /// Unlike [`Self::create_batch`], this method never starts or commits a
+    /// transaction itself: the caller can inspect the resulting registry on
+    /// the same connection and then commit or roll back the whole proposal.
+    pub async fn create_batch_tx(
+        &self,
+        connection: &mut SqliteConnection,
+        inputs: &[TagInput],
+    ) -> Result<BatchTagOutcome, BantoError> {
+        let mut row_errors: Vec<Vec<FieldError>> = vec![Vec::new(); inputs.len()];
+        let mut validated: Vec<Option<ValidatedTag>> = Vec::with_capacity(inputs.len());
+
+        for (index, input) in inputs.iter().enumerate() {
+            match validate_tag_input(input) {
+                Ok(value) => validated.push(Some(value)),
+                Err(BantoError::Validation { field_errors }) => {
+                    row_errors[index].extend(field_errors);
+                    validated.push(None);
+                }
+                Err(other) => return Err(other),
+            }
+            match validate_tag_kind_placement_tx(
+                connection,
+                input.collection_group_id,
+                &input.tag_kind,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(BantoError::Validation { field_errors }) => {
+                    row_errors[index].extend(field_errors)
+                }
+                Err(other) => return Err(other),
+            }
+        }
+
+        let mut first_seen: HashMap<&str, usize> = HashMap::new();
+        let mut batch_dupe_indices = Vec::new();
+        for (index, value) in validated.iter().enumerate() {
+            let Some(value) = value else { continue };
+            match first_seen.get(value.name.as_str()) {
+                Some(&first) => {
+                    if !batch_dupe_indices.contains(&first) {
+                        batch_dupe_indices.push(first);
+                    }
+                    batch_dupe_indices.push(index);
+                }
+                None => {
+                    first_seen.insert(&value.name, index);
+                }
+            }
+        }
+        for index in batch_dupe_indices {
+            row_errors[index].push(FieldError {
+                field: "name".to_string(),
+                message: "リクエスト内の他の行と名前が重複しています".to_string(),
+            });
+        }
+
+        let candidate_names: Vec<&str> = validated
+            .iter()
+            .filter_map(|value| value.as_ref().map(|value| value.name.as_str()))
+            .collect();
+        if !candidate_names.is_empty() {
+            let mut qb: QueryBuilder<'_, Sqlite> =
+                QueryBuilder::new("SELECT name FROM tags WHERE name IN (");
+            let mut separated = qb.separated(", ");
+            for name in &candidate_names {
+                separated.push_bind(*name);
+            }
+            qb.push(")");
+            let existing: Vec<(String,)> = qb
+                .build_query_as()
+                .fetch_all(&mut *connection)
+                .await
+                .map_err(banto_storage::storage_error)?;
+            let existing_names: HashSet<String> =
+                existing.into_iter().map(|(name,)| name).collect();
+            for (index, value) in validated.iter().enumerate() {
+                let Some(value) = value else { continue };
+                if existing_names.contains(&value.name) {
+                    row_errors[index].push(FieldError {
+                        field: "name".to_string(),
+                        message: "既に使用されています".to_string(),
+                    });
+                }
+            }
+        }
+
+        let errors: Vec<BatchTagError> = row_errors
+            .into_iter()
+            .enumerate()
+            .filter(|(_, field_errors)| !field_errors.is_empty())
+            .map(|(index, field_errors)| BatchTagError {
+                index,
+                field_errors,
+            })
+            .collect();
+        if !errors.is_empty() {
+            return Ok(BatchTagOutcome::Invalid(errors));
+        }
+
+        let mut created = Vec::with_capacity(inputs.len());
+        let sql = insert_tag_sql();
+        for (input, value) in inputs.iter().zip(validated.iter()) {
+            let value = value
+                .as_ref()
+                .expect("all batch rows were validated before insertion");
+            let row = sqlx::query_as::<_, Tag>(&sql)
+                .bind(&value.name)
+                .bind(input.collection_group_id)
+                .bind(&value.address)
+                .bind(&input.data_type)
+                .bind(input.string_length)
+                .bind(input.raw_lo)
+                .bind(input.raw_hi)
+                .bind(input.eng_lo)
+                .bind(input.eng_hi)
+                .bind(&value.unit)
+                .bind(input.decimals)
+                .bind(input.threshold_h)
+                .bind(input.threshold_hh)
+                .bind(input.threshold_l)
+                .bind(input.threshold_ll)
+                .bind(input.enabled)
+                .bind(input.writable)
+                .bind(&input.tag_kind)
+                .bind(&input.expression)
+                .bind(input.retain)
+                .fetch_one(&mut *connection)
+                .await
+                .map_err(|err| map_write_error(err, "name", "collectionGroupId", FK_MESSAGE))?;
+            created.push(row);
+        }
+
+        Ok(BatchTagOutcome::Valid {
+            count: created.len(),
+            tags: Some(created),
+        })
     }
 
     /// Bulk create - T11-1 (docs/ux-plan.md §3): the shared foundation both

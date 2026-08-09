@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
+use tokio::sync::watch;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::hub::CollectorManager;
@@ -25,6 +26,18 @@ pub enum CollectionState {
     Faulted,
 }
 
+impl CollectionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Stopping => "stopping",
+            Self::Faulted => "faulted",
+        }
+    }
+}
+
 /// The configured collection mode. `AllSimulation` is the T15 extension
 /// point; T14-2 provides its state-machine path but not its implementation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -32,6 +45,15 @@ pub enum CollectionState {
 pub enum RunMode {
     Configured,
     AllSimulation,
+}
+
+impl RunMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::AllSimulation => "all_simulation",
+        }
+    }
 }
 
 /// Monotonically allocated identifier for one start attempt.
@@ -53,7 +75,12 @@ pub struct CollectionStatus {
     pub mode: RunMode,
     pub run_id: Option<RunId>,
     pub last_error: Option<String>,
+    pub configured_revision: u64,
+    pub running_revision: u64,
 }
+
+/// Public name used by runtime/status consumers for the lifecycle snapshot.
+pub type RuntimeStatus = CollectionStatus;
 
 /// The serialized collection lifecycle controller.
 pub struct CollectionController {
@@ -62,6 +89,7 @@ pub struct CollectionController {
     state: Mutex<ControllerState>,
     transition: AsyncMutex<()>,
     run_seq: AtomicU64,
+    status_tx: watch::Sender<RuntimeStatus>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +102,15 @@ struct ControllerState {
 
 impl CollectionController {
     pub fn new(manager: Arc<CollectorManager>, write_control: Arc<WriteControl>) -> Self {
+        let initial = CollectionStatus {
+            state: CollectionState::Stopped,
+            mode: RunMode::Configured,
+            run_id: None,
+            last_error: None,
+            configured_revision: manager.configured_revision(),
+            running_revision: manager.running_revision(),
+        };
+        let (status_tx, _status_rx) = watch::channel(initial);
         Self {
             manager,
             write_control,
@@ -85,15 +122,31 @@ impl CollectionController {
             }),
             transition: AsyncMutex::new(()),
             run_seq: AtomicU64::new(0),
+            status_tx,
         }
     }
 
     /// Return the current state without waiting for an in-flight transition.
     pub fn status(&self) -> CollectionStatus {
-        self.state
+        let mut status = self
+            .state
             .lock()
             .expect("collection controller state lock poisoned")
-            .status()
+            .status();
+        status.configured_revision = self.manager.configured_revision();
+        status.running_revision = self.manager.running_revision();
+        status
+    }
+
+    /// Subscribe to lifecycle transitions. Catalog-only commits do not start
+    /// a run and therefore do not cause a running transition notification.
+    pub fn subscribe_status(&self) -> watch::Receiver<RuntimeStatus> {
+        self.status_tx.subscribe()
+    }
+
+    /// Refresh the status watch after an external catalog-only commit.
+    pub fn refresh_status(&self) {
+        self.status_tx.send_replace(self.status());
     }
 
     /// Start the requested mode. A request arriving during another transition
@@ -153,6 +206,7 @@ impl CollectionController {
                 self.write_control.disable();
             }
             self.set_mode_locked(mode);
+            self.publish_status();
             return self.status();
         }
         if current.state == CollectionState::Running && current.mode == mode {
@@ -194,9 +248,10 @@ impl CollectionController {
             state.last_error = None;
         }
         self.write_control.disable();
+        self.publish_status();
 
         let result = match mode {
-            RunMode::Configured => self.manager.rebuild().await,
+            RunMode::Configured => self.manager.apply_run(mode).await,
             RunMode::AllSimulation => Err("all_simulation は T15 で実装されます".to_string()),
         };
 
@@ -214,7 +269,9 @@ impl CollectionController {
                 state.last_error = Some(error);
             }
         }
-        state.status()
+        drop(state);
+        self.publish_status();
+        self.status()
     }
 
     async fn stop_locked(&self) {
@@ -226,7 +283,9 @@ impl CollectionController {
             state.state = CollectionState::Stopping;
         }
         self.write_control.disable();
+        self.publish_status();
         self.manager.stop().await;
+        self.manager.advance_running_revision();
         let mut state = self
             .state
             .lock()
@@ -234,6 +293,12 @@ impl CollectionController {
         state.state = CollectionState::Stopped;
         state.context = None;
         state.last_error = None;
+        drop(state);
+        self.publish_status();
+    }
+
+    fn publish_status(&self) {
+        self.status_tx.send_replace(self.status());
     }
 }
 
@@ -244,6 +309,8 @@ impl ControllerState {
             mode: self.mode,
             run_id: self.context.map(|context| context.run_id),
             last_error: self.last_error.clone(),
+            configured_revision: 0,
+            running_revision: 0,
         }
     }
 }
@@ -254,7 +321,7 @@ mod tests {
     use crate::broker_glue::{HubSessions, SlmpSimRegistry};
     use crate::computed::{ComputedEngine, ServerTagStore};
     use crate::db::init_db;
-    use banto_collect::CollectorOptions;
+    use banto_collect::{CollectorOptions, RegistrySnapshot};
     use banto_tstore::SystemClock;
     use std::time::Duration;
 
@@ -363,5 +430,38 @@ mod tests {
         .expect("the first start should complete");
         assert_eq!(final_status.state, CollectionState::Running);
         assert_eq!(final_status.run_id, Some(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn configured_and_running_revisions_are_separate() {
+        let (_dir, controller) = controller_env().await;
+        let snapshot = RegistrySnapshot::load(&controller.manager.pool())
+            .await
+            .expect("empty registry snapshot");
+
+        assert_eq!(controller.status().configured_revision, 0);
+        assert_eq!(controller.status().running_revision, 0);
+        controller
+            .manager
+            .commit_catalog(&snapshot)
+            .await
+            .expect("catalog commit");
+        controller.refresh_status();
+
+        let stopped = controller.status();
+        assert_eq!(stopped.state, CollectionState::Stopped);
+        assert_eq!(stopped.configured_revision, 1);
+        assert_eq!(stopped.running_revision, 0);
+        assert!(controller.manager.current_values().is_none());
+
+        let running = controller.start(RunMode::Configured).await;
+        assert_eq!(running.state, CollectionState::Running);
+        assert_eq!(running.configured_revision, 1);
+        assert_eq!(running.running_revision, 1);
+
+        let stopped = controller.stop().await;
+        assert_eq!(stopped.state, CollectionState::Stopped);
+        assert_eq!(stopped.configured_revision, 1);
+        assert_eq!(stopped.running_revision, 2);
     }
 }

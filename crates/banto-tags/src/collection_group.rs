@@ -7,7 +7,7 @@
 use banto_core::{BantoError, FieldError, ListParams, ListResult};
 use banto_storage::ColumnMap;
 use serde::{Deserialize, Serialize};
-use sqlx::{QueryBuilder, Sqlite, SqlitePool};
+use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
 use crate::support::{map_write_error, max_length_message, required_message};
 
@@ -170,6 +170,26 @@ impl CollectionGroupService {
         .map_err(|err| map_write_error(err, "name", "plcConnectionId", FK_MESSAGE))
     }
 
+    /// Transaction-compatible counterpart of [`Self::create`].
+    pub async fn create_tx(
+        &self,
+        connection: &mut SqliteConnection,
+        input: CollectionGroupInput,
+    ) -> Result<CollectionGroup, BantoError> {
+        validate_collection_group_input(&input)?;
+        sqlx::query_as::<_, CollectionGroup>(&format!(
+            "INSERT INTO collection_groups (name, plc_connection_id, period_ms, enabled) \
+             VALUES (?, ?, ?, ?) RETURNING {COLUMNS}"
+        ))
+        .bind(input.name.trim())
+        .bind(input.plc_connection_id)
+        .bind(input.period_ms)
+        .bind(input.enabled)
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|err| map_write_error(err, "name", "plcConnectionId", FK_MESSAGE))
+    }
+
     pub async fn update(
         &self,
         id: i64,
@@ -186,6 +206,34 @@ impl CollectionGroupService {
         .bind(input.enabled)
         .bind(id)
         .fetch_one(&self.pool)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => BantoError::NotFound {
+                resource: RESOURCE.to_string(),
+                id: id.to_string(),
+            },
+            other => map_write_error(other, "name", "plcConnectionId", FK_MESSAGE),
+        })
+    }
+
+    /// Transaction-compatible counterpart of [`Self::update`].
+    pub async fn update_tx(
+        &self,
+        connection: &mut SqliteConnection,
+        id: i64,
+        input: CollectionGroupInput,
+    ) -> Result<CollectionGroup, BantoError> {
+        validate_collection_group_input(&input)?;
+        sqlx::query_as::<_, CollectionGroup>(&format!(
+            "UPDATE collection_groups SET name = ?, plc_connection_id = ?, period_ms = ?, enabled = ? \
+             WHERE id = ? RETURNING {COLUMNS}"
+        ))
+        .bind(input.name.trim())
+        .bind(input.plc_connection_id)
+        .bind(input.period_ms)
+        .bind(input.enabled)
+        .bind(id)
+        .fetch_one(&mut *connection)
         .await
         .map_err(|err| match err {
             sqlx::Error::RowNotFound => BantoError::NotFound {
@@ -221,6 +269,42 @@ impl CollectionGroupService {
         let result = sqlx::query("DELETE FROM collection_groups WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
+            .await
+            .map_err(banto_storage::storage_error)?;
+        if result.rows_affected() == 0 {
+            return Err(BantoError::NotFound {
+                resource: RESOURCE.to_string(),
+                id: id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Transaction-compatible counterpart of [`Self::delete`].
+    pub async fn delete_tx(
+        &self,
+        connection: &mut SqliteConnection,
+        id: i64,
+    ) -> Result<(), BantoError> {
+        let tag_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM tags WHERE collection_group_id = ?")
+                .bind(id)
+                .fetch_one(&mut *connection)
+                .await
+                .map_err(banto_storage::storage_error)?;
+        if tag_count > 0 {
+            return Err(BantoError::Validation {
+                field_errors: vec![FieldError {
+                    field: "id".to_string(),
+                    message: format!(
+                        "このグループに属するタグが{tag_count}件あるため削除できません"
+                    ),
+                }],
+            });
+        }
+        let result = sqlx::query("DELETE FROM collection_groups WHERE id = ?")
+            .bind(id)
+            .execute(&mut *connection)
             .await
             .map_err(banto_storage::storage_error)?;
         if result.rows_affected() == 0 {
