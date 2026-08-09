@@ -7,9 +7,10 @@
 
 ## 消費するバージョン
 
-- banto は **git タグ `v0.1.1`**（MIT 統一後の main。`v0.1.0` は MIT 前なので使わない）
-  - npm: `pnpm add "github:tyaro/banto#v0.1.1&path:packages/admin-core"` 等
-  - Rust: `{ git = "https://github.com/tyaro/banto.git", tag = "v0.1.1" }`
+- banto は **git タグ `v1.1.0`**（2026-08-09 現在 v1.1.0 に統一。最新は
+  Cargo.toml / package.json を正とする）
+  - npm: `pnpm add "github:tyaro/banto#v1.1.0&path:packages/admin-core"` 等
+  - Rust: `{ git = "https://github.com/tyaro/banto.git", tag = "v1.1.0" }`
 - I 系クレート（banto-tags/plc/tstore/collect/tsquery）は同一ワークスペースの path 依存
 
 ## Phase 分割
