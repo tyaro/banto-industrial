@@ -1,10 +1,11 @@
 # banto-hub アプリ／サービス運転計画（T14〜）
 
 作成日: 2026-08-09
-状態: **計画確定。T14・T15 完了。T16 詳細設計は [banto-hub-t16-design.md](banto-hub-t16-design.md)（P1〜P3 承認済み）。T16-0（薄いシェル `banto-hub-shell`）実装済み・レビュー待ち。次は T16-1（トレイ状態表示）。**
+状態: **計画確定。T14・T15 完了。T16 詳細設計は [banto-hub-t16-design.md](banto-hub-t16-design.md)（P1〜P3 承認済み）。T16-0（薄いシェル `banto-hub-shell`）マージ済み。T16-1（トレイ状態表示）実装済み・レビュー待ち。次は T16-2。**
 最終検証日(コード照合): 2026-08-09
-基準コミット: `fa96c90`（main、PR #98 マージ後・T15 完了）。T16-0 は本 PR
-（`apps/banto-hub/src-tauri` 新設）で追加。
+基準コミット: `ac6bdff`（main、T16-0 マージ後）。T16-1 は本 PR
+（`apps/banto-hub/src-tauri` のトレイ状態表示・終了確認ダイアログ・初回
+継続通知）で追加。
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [banto-hub-t16-design.md](banto-hub-t16-design.md)、
@@ -1178,6 +1179,62 @@ write peek を実装し、T15 を完了させた（§16.3「T15（全 PLC シミ
 > 単一インスタンス・shutdown）はサービス非依存で、T17 を待たず着手・完了
 > できる。T16-1（トレイ状態表示）も T16-0 の直後に着手可 - 詳細は
 > banto-hub-t16-design.md §3 のサブスライス表を参照。
+
+**T16-1 実装メモ（2026-08-09）**: デスクトップホスト（アプリがランタイムを
+所有する場合）限定でトレイ状態表示・終了確認・初回継続通知を実装した
+（サービス検出・native fallback は引き続き T16-2）。
+
+- `apps/banto-hub/src-tauri/src/tray_status.rs`（新規）: 収集状態
+  （`RuntimeStatus`）→ トレイ表示への変換だけを行う純粋関数
+  （`status_label`/`tooltip_text`/`show_stop_item`）。Tauri 型に依存しないため
+  Tauri アプリの外形なしに単体テストできる（実装指示どおり pure 関数を分離）。
+  状態ラベルは desktop-plan §9.7 の表と同じ文言（収集停止／開始中／設定どおり
+  運転／全 PLC シミュレーション／停止処理中／異常停止）。tooltip は
+  `banto-hub — アプリ — {ラベル}`。「収集を停止」を出すのは
+  Starting/Running/Stopping のみで、Faulted は出さない（開始をトレイに置かない
+  のと同じ理由で、異常停止からの操作は本画面の診断へ誘導する）。
+- `apps/banto-hub/src-tauri/src/lib.rs`: `AppState`に
+  `controller: Mutex<Option<Arc<CollectionController>>>`を追加（`RunningHub`と
+  別フィールド - `hub`は`quit`が`take()`で消費するのに対し、こちらは
+  `.await`を挟まない同期ロックで足りるため）。`HubRuntime::start`成功後に
+  `RunningHub::controller()`を保持し、`CollectionController::subscribe_status()`
+  を購読するバックグラウンドタスク（`watch_collection_status`、
+  `tauri::async_runtime::spawn`）が変化のたびに tray tooltip とメニュー
+  （`build_tray_menu`、`TrayIcon::set_tooltip`/`set_menu`）を再構築する。
+  監視タスクは tray 構築後に spawn する（構築前に状態変化が届いても適用先が
+  無いため）。トレイメニューは desktop-plan §9.9 の3構成（起動失敗時は
+  T16-0 と同じ「画面を開く」「アプリを終了」の2項目のみ、収集停止中は状態＋
+  画面を開く＋アプリを終了、収集中は状態＋画面を開く＋収集を停止＋
+  アプリを終了）。「収集を停止」は`CollectionController::stop()`を直接呼ぶ
+  だけで、Hub REST を invoke 経由で二重実装しない。
+- 終了確認（実装指示 3.）: `tauri-plugin-dialog`の`DialogExt`を Rust 側から
+  直接呼ぶだけで、JS 側バインディングは使わない（capabilities への権限追加は
+  不要 - 権限は webview からの invoke 経路にのみ効くため、
+  `capabilities/default.json`は`core:default`のまま変更していない）。
+  収集中は「収集を停止し、履歴を flush してから終了します」、停止中は短い
+  確認文言。キャンセルなら`quit`（`RunningHub::shutdown` → `app.exit`）を
+  一切呼ばない。
+- 初回継続通知（実装指示 4.、UX-7）: `tauri-plugin-notification`の
+  `NotificationExt`を同様に Rust 側から直接呼ぶ。既読フラグは
+  `app.path().app_data_dir()`配下の`tray-hint-shown`ファイルへ永続化する
+  （Hub 本体の DB/data_dir とは独立したシェル固有の状態）。フラグ解決・
+  書き込み・通知表示のいずれかが失敗した場合は静かに諦める（通知が出ない方が
+  「初回だけ」という意図を壊さない安全側）。
+- 新規依存: `tauri-plugin-dialog`、`tauri-plugin-notification`（いずれも
+  version `2`）。`cargo deny --all-features check licenses`で確認済み -
+  新規追加分（`tauri-plugin`/`tauri-plugin-fs`/`tauri-plugin-dialog`/
+  `tauri-plugin-notification`/`rfd`/`notify-rust`/`mac-notification-sys`/
+  `tauri-winrt-notification`）はいずれも MIT/Apache-2.0 系で、既存の
+  `deny.toml`の`allow`リストのままで green（`deny.toml`自体の変更は不要
+  だった）。
+- テスト: `tray_status`の単体テスト（状態×モードの全組合せに対する
+  `status_label`/`tooltip_text`/`show_stop_item`）。
+  `cargo clippy -p banto-hub-shell -- -D warnings`と
+  `cargo test -p banto-hub-shell`が green（Tauri アプリの外形自体は Linux
+  CI で GUI 実行できないため、T16-0 と同じくロジックの単体テストに留める）。
+- 対象外（このスライスでは未実装）: サービス検出・native fallback・
+  `BantoHub Operators`（T16-2/T17）、トレイからの開始・SIM 開始（設計どおり
+  据え置き）。
 
 ### T17: サービス管理、プロファイル、インストーラ
 
