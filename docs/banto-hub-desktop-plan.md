@@ -7,8 +7,10 @@
 で同 §9.4 の「保存、削除、検証、登録、閉じるを Drawer 単位の busy 状態で
 相互排他にする」も実装済み。続く `cursor/t18-1-tags-form-e3cb` で同 §9.4 の
 「create / edit を `<form>` 化し、必須表示、Enter 送信、クライアント軽量
-検証」も実装済み。TAG-UX-C の残り（revision/ETag、削除前参照影響、初期
-読込状態の区別）は未着手。TAG-P0-2・TAG-P0-3 は未着手。
+検証」も実装済み。続く `cursor/t18-1-tags-load-state-e3cb` で同 §9.4 の
+「初期読込失敗、0件、検索結果0件、再読込中、stale 一覧を区別し、画面内に
+再試行を置く」も実装済み。TAG-UX-C の残り（revision/ETag、削除前参照影響）
+は未着手。TAG-P0-2・TAG-P0-3 は未着手。
 最終検証日(コード照合): 2026-08-09
 基準コミット: `22c8c02`（main、PR #103 `optNum` 修正マージ後）。T18-1 は本 PR
 （`apps/banto-hub/src/lib/banto/continuousRegistration.ts` の
@@ -21,7 +23,10 @@ banto-hub 用 Playwright/DOM e2e 基盤の新設）で続行し、続く
 相互排他（`deleting` フラグの新設、各ボタンの `disabled` を `isDrawerBusy()`
 に統一、`banto-hub-tags-busy.spec.ts`）を追加し、さらに続く
 `cursor/t18-1-tags-form-e3cb` で create/edit Drawer の `<form>` 化・Enter
-送信・必須項目の `required` 表示（`banto-hub-tags-form.spec.ts`）を追加。
+送信・必須項目の `required` 表示（`banto-hub-tags-form.spec.ts`）を追加し、
+さらに続く `cursor/t18-1-tags-load-state-e3cb` で tags 一覧の初期読込失敗・
+再読込中・stale・真の空・検索結果0件の区別（`loadError`、
+`banto-hub-tags-load-state.spec.ts`）を追加。
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [banto-hub-t16-design.md](banto-hub-t16-design.md)、
@@ -740,9 +745,54 @@ UX-5 の決定を UI のボタン非表示だけで実装しない。アプリ�
 > で保存できることを確認している。既存の busy/dirty/continuous/smoke の
 > 4 spec も同じ実行で全て green のままであることを確認済み。
 >
+> **2026-08-09 追加実装（T18-1 続き、`cursor/t18-1-tags-load-state-e3cb`）:
+> 6点目「初期読込失敗、0件、検索結果0件、再読込中、stale 一覧を区別し、
+> 画面内に再試行を置く。通信失敗を『タグ0件』と表示しない」を実装済み。**
+> それまで `tags/+page.svelte` は `loading` フラグしか持たず、`reload()`
+> が失敗すると toast だけ出して `tags` はそのまま（初回失敗なら空配列の
+> まま）だったため、「通信失敗」と「タグ0件」が画面上で区別できなかった。
+> `monitor/+page.svelte` の `loadError`（`$state<string | null>`）と同じ
+> パターンを持ち込み、`reload()` を「一旦ローカル変数
+> (`nextGroups`/`nextConnections`/`nextTags`) に受けてから全部揃った時点で
+> まとめて `groups`/`connections`/`tags` へ代入し、成功時のみ `loadError`
+> を `null` に戻す。失敗時は代入をスキップして直前の一覧を保持
+> （stale 維持）」という形に変更した。右ペインの表示は次の優先順位で
+> 分岐する:
+>
+> 1. `loading && tags.length === 0 && !loadError` → 「読み込み中…」。
+> 2. `loadError && tags.length === 0`（初回失敗、一覧なし）→
+>    `.empty-state` に `.err` のエラー文言と `type="button"` の
+>    「再試行」ボタンのみを表示し、空の BantoGrid も「タグがありません」
+>    も出さない（受け入れ条件「通信失敗を『タグ0件』と表示しない」の
+>    直接対応）。
+> 3. それ以外（`tags.length > 0` または真の空）はまず `loading`/
+>    `loadError` に応じたバナーを一覧の上に出し、その下で一覧本体を
+>    出す: `loading` なら「再読込中…」（stale な一覧はそのまま表示を
+>    継続）、`loadError` なら `.reload-banner`（エラー文言 + 再試行
+>    ボタン + 「前回の読込内容を表示しています。」の note）を表示し、
+>    stale な一覧を隠さない。`loading && loadError` が同時に成り得る
+>    （再試行実行中）場合は `loading` を優先しバナーを一時的に隠す
+>    （指示どおり）。
+> 4. 一覧本体側は `tags.length === 0` なら「タグがありません。」
+>    （真の空）、`filteredTags.length === 0`（検索/ツリーフィルタで0件）
+>    なら `monitor/+page.svelte` と同趣旨の「条件に一致するタグが
+>    ありません。」、それ以外は通常の `BantoGrid` を表示する。
+>
+> 実 DOM 受け入れは `e2e/tests-banto-hub/banto-hub-tags-load-state.spec.ts`
+> （`pnpm e2e:banto-hub`）で、(1) `GET /api/tags` を `page.route` で
+> abort させた初回失敗時に画面内エラー文言と「再試行」ボタンが見え、
+> 「タグがありません」や `role="grid"` が出ないこと、(2) route を外して
+> 「再試行」をクリックすると前提データの1件が一覧に表示されること、
+> (3) 検索ボックスに一致しない文字列を入れると「条件に一致するタグが
+> ありません。」（真の空の文言とは異なる）が出ることを確認している。
+> トースト（`ToastHost.svelte`）も同じエラー文言を一時表示するため、
+> 画面内バナーの検証は `.right-pane .err` に限定してトーストとの重複
+> マッチを避けている。既存の busy/dirty/form/continuous/smoke の
+> 5 spec も同じ実行で全て green のままであることを確認済み
+> （計19 spec）。
+>
 > **未着手のまま残っている部分**: revision/ETag による後勝ち防止・
-> 差分表示（4点目）、削除前の参照影響・完全外部名表示（5点目）、
-> 初期読込失敗/0件/検索結果0件/再読込中/stale 一覧の区別（6点目）。
+> 差分表示（4点目）、削除前の参照影響・完全外部名表示（5点目）。
 > 受け入れ条件のうち「ボタン連打や保存／削除競合でも mutation は1回だけ
 > 実行される」は busy 中のボタン `disabled` 化で UI 操作からの連打は
 > 防げるようになったが、「他セッション更新を黙って上書きしない」

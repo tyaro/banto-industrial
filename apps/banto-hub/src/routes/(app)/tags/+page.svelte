@@ -221,6 +221,15 @@
 	let connections: PlcConnection[] = $state([]);
 	let tags: Tag[] = $state([]);
 	let loading = $state(false);
+	/**
+	 * T18-1（TAG-UX-C 6点目、docs/banto-hub-desktop-plan.md §9.4）:
+	 * 初期読込失敗・再読込失敗を通信エラーとして保持する - `tags` は
+	 * 失敗時も直前の内容を残す（stale 維持、`monitor/+page.svelte` の
+	 * `loadError` と同じパターン）。「通信失敗を『タグ0件』と表示しない」
+	 * ため、`tags.length === 0` だけでは空とみなさず、この値も併せて見る。
+	 * 成功時にのみ `null` に戻す。
+	 */
+	let loadError = $state<string | null>(null);
 
 	function groupName(id: number): string {
 		return groups.find((g) => g.id === id)?.name ?? `#${id}`;
@@ -245,16 +254,27 @@
 		});
 	}
 
+	/**
+	 * T18-1（TAG-UX-C 6点目）: 失敗しても `groups`/`connections`/`tags` を
+	 * 差し替えない（stale 一覧を維持する） - 一度 `const` の配列に受けて
+	 * から全部揃った時点でまとめて代入することで、途中失敗時に一部だけ
+	 * 更新されて表示が食い違うことも防ぐ。
+	 */
 	async function reload(): Promise<void> {
 		loading = true;
 		try {
-			[groups, connections, tags] = await Promise.all([
+			const [nextGroups, nextConnections, nextTags] = await Promise.all([
 				listCollectionGroups(),
 				listPlcConnections(),
 				listTags()
 			]);
+			groups = nextGroups;
+			connections = nextConnections;
+			tags = nextTags;
+			loadError = null;
 		} catch (err) {
-			toastStore.push('error', errorMessage(err));
+			loadError = errorMessage(err);
+			toastStore.push('error', loadError);
 		} finally {
 			loading = false;
 		}
@@ -1162,17 +1182,48 @@
 							? '行をクリックすると編集パネルが開きます。'
 							: '閲覧のみ（編集には編集者以上の権限が必要です）。'}
 					</p>
-					{#if loading && tags.length === 0}
+					<!--
+						T18-1（TAG-UX-C 6点目、docs/banto-hub-desktop-plan.md §9.4）:
+						初期読込中・初期読込失敗・再読込中(stale)・再読込失敗(stale)・
+						真の空・検索/ツリーフィルタ0件・通常表示を区別する。
+						「通信失敗をタグ0件と表示しない」ため、`loadError` が立って
+						いる間は空のBantoGridも「タグがありません」も出さない
+						（stale があれば一覧の上にバナー、無ければ再試行のみ）。
+					-->
+					{#if loading && tags.length === 0 && !loadError}
 						<p class="loading">読み込み中…</p>
-					{:else}
-						<div class="grid-wrap">
-							<BantoGrid
-								rows={filteredTags}
-								{columns}
-								getRowId={(t) => t.id}
-								onRowClick={canWrite ? selectTag : undefined}
-							/>
+					{:else if loadError && tags.length === 0}
+						<div class="empty-state">
+							<p class="err">{loadError}</p>
+							<button type="button" onclick={() => void reload()} disabled={loading}>
+								{loading ? '再試行中…' : '再試行'}
+							</button>
 						</div>
+					{:else}
+						{#if loading}
+							<p class="loading">再読込中…</p>
+						{:else if loadError}
+							<div class="reload-banner">
+								<span class="err">{loadError}</span>
+								<button type="button" class="secondary" onclick={() => void reload()}>再試行</button
+								>
+								<span class="hint">前回の読込内容を表示しています。</span>
+							</div>
+						{/if}
+						{#if tags.length === 0}
+							<p class="note">タグがありません。</p>
+						{:else if filteredTags.length === 0}
+							<p class="note">条件に一致するタグがありません。</p>
+						{:else}
+							<div class="grid-wrap">
+								<BantoGrid
+									rows={filteredTags}
+									{columns}
+									getRowId={(t) => t.id}
+									onRowClick={canWrite ? selectTag : undefined}
+								/>
+							</div>
+						{/if}
 					{/if}
 				</div>
 			{/snippet}
@@ -1472,6 +1523,23 @@
 
 	.loading {
 		color: var(--banto-text-muted);
+	}
+
+	/* T18-1（TAG-UX-C 6点目）: 初期読込失敗（一覧なし）時のエラー文言 + 再試行ボタン。 */
+	.empty-state {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 0.5rem;
+	}
+
+	/* 再読込失敗だが stale 一覧が残っている場合の、一覧上部のエラーバナー。 */
+	.reload-banner {
+		flex: 0 0 auto;
+		display: flex;
+		align-items: center;
+		gap: 0.6rem;
+		flex-wrap: wrap;
 	}
 
 	.grid-wrap {
