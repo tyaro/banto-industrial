@@ -1,12 +1,12 @@
 # banto-hub アプリ／サービス運転計画（T14〜）
 
 作成日: 2026-08-09
-状態: **計画確定。T14・T15 完了。T16 詳細設計は [banto-hub-t16-design.md](banto-hub-t16-design.md)（P1〜P3 承認済み）。T16-0（薄いシェル `banto-hub-shell`）・T16-1（トレイ状態表示）マージ済み。T16-2 は T17（サービス管理・profile・mutex）依存のため後回し。進行中: T18-1（タグ登録 UI/UX の正しさ修正）。§16.4 の `optNum` null 取りこぼしと §9 TAG-P0-1 本体（連続登録 `count.trim()` クラッシュ）はロジック側を修正済み（本 PR）。TAG-P0-1 受け入れ条件の DOM/E2E コンポーネントテストは banto-hub の Playwright/DOM 基盤未整備のため別スライスで継続。TAG-P0-2・TAG-P0-3 は未着手。**
+状態: **計画確定。T14・T15 完了。T16 詳細設計は [banto-hub-t16-design.md](banto-hub-t16-design.md)（P1〜P3 承認済み）。T16-0（薄いシェル `banto-hub-shell`）・T16-1（トレイ状態表示）マージ済み。T16-2 は T17（サービス管理・profile・mutex）依存のため後回し。進行中: T18-1（タグ登録 UI/UX の正しさ修正）。§16.4 の `optNum` null 取りこぼしと §9 TAG-P0-1 本体（連続登録 `count.trim()` クラッシュ）はロジック側を修正済み。**2026-08-09（本 PR）: §16.3「banto-hub の Playwright/DOM テスト基盤を T18-1 へ前倒し」を実施し、`e2e/banto-hub.playwright.config.ts`（`pnpm e2e:banto-hub`）を新設。TAG-P0-1 の残受け入れ条件（実 DOM からの点数変更テスト）を `e2e/tests-banto-hub/banto-hub-tags-continuous.spec.ts` で満たし、DOM/E2E 側も含めて TAG-P0-1 は受け入れ条件を全て満たした（closed）。** TAG-P0-2・TAG-P0-3 は未着手。
 最終検証日(コード照合): 2026-08-09
 基準コミット: `22c8c02`（main、PR #103 `optNum` 修正マージ後）。T18-1 は本 PR
 （`apps/banto-hub/src/lib/banto/continuousRegistration.ts` の
-`buildContinuousParams` 切り出しによる `count.trim()` クラッシュ修正）で
-続行。
+`buildContinuousParams` 切り出しによる `count.trim()` クラッシュ修正 +
+banto-hub 用 Playwright/DOM e2e 基盤の新設）で続行。
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [banto-hub-t16-design.md](banto-hub-t16-design.md)、
@@ -529,7 +529,7 @@ UI/UX マイルストーンへ反映し、変更時は新しい決定記録を�
 - 点数、開始番号、小数桁、スケーリング、しきい値を実 DOM から変更する
   コンポーネント／E2E テストを追加する。
 
-> **2026-08-09 ロジック側は修正済み（T18-1、本 PR）**: `form.count.trim()`
+> **2026-08-09 ロジック側は修正済み（T18-1）**: `form.count.trim()`
 > クラッシュ本体を修正した。`ContinuousFormState`/`buildContinuousParams`
 > を `apps/banto-hub/src/routes/(app)/tags/+page.svelte` から
 > `apps/banto-hub/src/lib/banto/continuousRegistration.ts` へ切り出し、
@@ -539,10 +539,19 @@ UI/UX マイルストーンへ反映し、変更時は新しい決定記録を�
 > フィールドにのみ残す）。単体テスト（`continuousRegistration.test.ts`）で
 > 点数 `1`/`2`/`1000` の行数一致と `0`/負数/`1.5`/`1001` のエラー
 > メッセージを確認済み（`pnpm --filter banto-hub check`/`test` 共にグリーン）。
-> 受け入れ条件のうち **実 DOM からの変更を伴うコンポーネント／E2E テストは
-> 未実施** — banto-hub には Playwright/DOM テスト基盤がまだ無く（§16.3
-> T18 の指摘どおり）、本 PR のスコープは純関数ロジックの修正と単体テストに
-> 限定した。DOM/E2E 側は基盤整備を待つ別スライスで継続する。
+>
+> **2026-08-09（本 PR、T18-1 続き）: 実 DOM／E2E 側も完了、TAG-P0-1 は
+> closed**。§16.3「banto-hub の Playwright/DOM テスト基盤を T18-1 へ前倒し」
+> の一環で `e2e/banto-hub.playwright.config.ts`（`pnpm e2e:banto-hub`、
+> chronogazer の `e2e/playwright.config.ts` と同型・ポート/一時DB/出力先を
+> 分離）を新設し、実際に起動した `banto-hub`（`embed-ui`）バイナリに対して
+> `e2e/tests-banto-hub/banto-hub-tags-continuous.spec.ts` が「点数 `1`/`2`/`1000` の
+> 入力とプレビュー件数（`プレビュー（N件）`見出し）の一致」と「`0`/`-1`/
+> `1.5`/`1001` それぞれで `.err` に人間可読なエラー文言が出ること」を実
+> ブラウザ DOM から確認する。あわせて `e2e/tests-banto-hub/banto-hub-smoke.spec.ts`
+> で初回セットアップ／ログイン・ログアウト／サイドバー遷移の smoke も追加
+> した。受け入れ条件の3点（点数一致・エラー表示・実 DOM テスト）を全て
+> 満たしたので、この項目のロジック/DOM 両方の TODO はここで完了とする。
 
 #### TAG-P0-2: 「保存成功」と「実行可能」を一致させる
 
@@ -1619,11 +1628,28 @@ owner ACL を設定する。グループ変更、profile owner 追加、ACL 変�
 #### T18（UI/UX・タグ登録改善・検証）
 
 - **banto-hub の Playwright / DOM テスト基盤を T18-1 の成果物へ前倒し**する。
-  現状 banto-hub 用 e2e config は未作成（`e2e/` は chronogazer smoke のみ）、
-  フロント vitest も logic 2ファイルのみ。E2E の CI 搭載が T18-5 に置かれると
-  T18-2〜4 の受入確認時点で基盤が無い。SCM DACL/ACL/SID 境界試験は
-  「`ServiceManager` trait のモック単体（§12.1）+ 実機 ACL 検証チェックリスト
-  （§12.2）」へ再分類し、性能テストは CI では非ブロッキングの計測記録に留める。
+  **解消済み（2026-08-09、T18-1 本 PR）**: `e2e/banto-hub.playwright.config.ts`
+  （`pnpm e2e:banto-hub`、chronogazer の `e2e/playwright.config.ts` と同型 -
+  ポート8799・一時DB env `BANTO_HUB_E2E_DB_DIR`・`e2e/test-results-banto-hub/`
+  /`e2e/playwright-report-banto-hub/` で chronogazer 側と分離）を新設し、
+  `e2e/tests-banto-hub/banto-hub-smoke.spec.ts`（初回セットアップ／ログイン・
+  ログアウト／サイドバー遷移）と `e2e/tests-banto-hub/banto-hub-tags-continuous.spec.ts`
+  （TAG-P0-1 の残受け入れ - 点数変更の実 DOM テスト）を追加、CI
+  （`.github/workflows/ci.yml` の `e2e` ジョブ）にも
+  `cargo build -p banto-hub-core --bin banto-hub --features embed-ui` +
+  `pnpm e2e:banto-hub` を chronogazer 側の後段ステップとして搭載した。
+  banto-hub 側 spec は `e2e/tests/`（chronogazer 用、テストファイルは
+  無改変）ではなく専用の `e2e/tests-banto-hub/` に置く - chronogazer の
+  `playwright.config.ts` は `testMatch` を絞っていないため、同じ
+  `e2e/tests/` に置くと `pnpm e2e` がこの config の `webServer` ではなく
+  自分の `webServer` に対して banto-hub 用 spec も実行してしまい、
+  chronogazer 側の初回セットアップ（管理者アカウント作成）を先取りされて
+  壊れる（実測済みの回帰）。ディレクトリ分離で chronogazer 側3ファイルを
+  一切変更せずに解決した。T18-2〜4 はこの基盤の上にシナリオを追加していける。
+  SCM DACL/ACL/SID
+  境界試験は「`ServiceManager` trait のモック単体（§12.1）+ 実機 ACL 検証
+  チェックリスト（§12.2）」へ再分類し、性能テストは CI では非ブロッキング
+  の計測記録に留める。
 - **route 移設マトリクス（旧 URL → 新 URL → redirect 有無）を確定**（現状
   明記は `/status → /operation` のみ、`/settings` の分割先が未定）。LAN
   ブラウザでの「管理 > サービス」は read-only 状態表示（停止操作が「できない
