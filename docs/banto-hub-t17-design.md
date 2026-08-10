@@ -23,6 +23,16 @@ fallback を配線、本書 §4 の`ServiceManager`/`HubHealthProbe`契約を消
 [banto-hub-t16-design.md](banto-hub-t16-design.md) §3「T16-2 第一スライス
 実装メモ」。フルの`HostSwitchEngine`（本書 §9）UI/切替ウィザードは未着手 -
 Windows 実機での`WindowsServiceManager`経路検証も未了）。**
+**2026-08-10: T16-2 第二スライス実装済み**（トレイ「サービスを開始/停止」を
+本書 §9 の`HostSwitchEngine`による完了待ちへ配線し直し、`ServiceManager::start`/
+`stop`後のポーリング・Desktop 引き継ぎ前の SCM`Stopped`＋旧 health
+`Unreachable`確認を本書 §9 の不変条件どおり適用するようにした。navigate/probe
+先ホストの`BANTO_BIND`対応、ローカル`Administrators`のトレイ操作許可も
+同スライスで追加。フルの切替ウィザード UI は引き続き未着手（トレイの
+「開始/停止」という単一の入口だけを`HostSwitchEngine`経由にした）。詳細は
+[banto-hub-t16-design.md](banto-hub-t16-design.md) §3「T16-2 第二スライス
+実装メモ」・§5。単体テストで確認済みだが、トレイ操作自体の Windows 実機
+確認は未了。**
 T16-0（薄いシェル）・T16-1（トレイ状態表示）はマージ済みで本書の前提。
 T16-2（サービス検出・native fallback）第一スライスは本書 §4 の引き渡し
 契約（P5）に従い、T17-0/T17-3 が提供する API を消費する形で実装した

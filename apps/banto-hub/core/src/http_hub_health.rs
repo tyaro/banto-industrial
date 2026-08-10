@@ -17,6 +17,19 @@
 //! chunked encoding や keep-alive の複雑なハンドリングは不要 - `Connection:
 //! close`を送ってサーバー側に接続を閉じさせ、EOF まで読み切るだけで足りる。
 //!
+//! ## T16-2 第二スライス（docs/banto-hub-t16-design.md §5 既知の gap
+//! 「navigate 先を`127.0.0.1`固定にしている」）で追加した`host`
+//!
+//! 第一スライスは常に`127.0.0.1`へ接続していた - `BANTO_BIND`をカスタム
+//! した環境では、実際にサービス/デスクトップが listen しているアドレスと
+//! 食い違いうる。[`HttpHubHealthProbe::with_host`]/
+//! [`HttpHubHealthProbe::with_host_and_timeout`]で接続先ホストを指定
+//! できるようにした - 呼び出し元（`apps/banto-hub/src-tauri`）が
+//! `BANTO_BIND`を解決した文字列を渡す（全インターフェース bind は
+//! loopback へ読み替え済みのものを渡す想定 - このモジュール自体は
+//! 読み替えを行わない）。`new`/`with_timeout`は後方互換のため
+//! 引き続き`127.0.0.1`を既定にする。
+//!
 //! ## 判定ロジック
 //!
 //! 1. `expected_port`へ TCP 接続を試みる（タイムアウト短め）。
@@ -41,7 +54,7 @@
 //! 5. 上記のいずれでもなければ [`HealthOutcome::Healthy`]。
 
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -57,24 +70,47 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1500);
 /// 認証不要の health エンドポイント（`crate::rest`の`openapi_json`参照）。
 const HEALTH_PATH: &str = "/api/v1/openapi.json";
 
+/// 接続先ホストの既定値（後方互換 - [`HttpHubHealthProbe::new`]/
+/// [`HttpHubHealthProbe::with_timeout`]が使う、モジュール doc「host」節参照）。
+const DEFAULT_PROBE_HOST: &str = "127.0.0.1";
+
 /// [`HubHealthProbe`]の実 HTTP 実装。`root`は`expected_profile`から
 /// `profile.lock`の場所を組み立てるために持つ（このモジュール doc の
 /// 「profile 確認」節参照）- `crate::profile_paths::resolve_profile_paths_from_env`
 /// が返す`ProfilePaths::root`をそのまま渡す想定。
 pub struct HttpHubHealthProbe {
     root: PathBuf,
+    host: String,
     timeout: Duration,
 }
 
 impl HttpHubHealthProbe {
-    /// 既定タイムアウト（[`DEFAULT_TIMEOUT`]）で構築する。
+    /// 既定ホスト（[`DEFAULT_PROBE_HOST`]）・既定タイムアウト
+    /// （[`DEFAULT_TIMEOUT`]）で構築する。
     pub fn new(root: PathBuf) -> Self {
-        Self::with_timeout(root, DEFAULT_TIMEOUT)
+        Self::with_host_and_timeout(root, DEFAULT_PROBE_HOST.to_string(), DEFAULT_TIMEOUT)
     }
 
-    /// タイムアウトを指定して構築する（テスト用・将来の調整用）。
+    /// タイムアウトを指定して構築する（テスト用・将来の調整用）。ホストは
+    /// 既定（[`DEFAULT_PROBE_HOST`]）のまま。
     pub fn with_timeout(root: PathBuf, timeout: Duration) -> Self {
-        Self { root, timeout }
+        Self::with_host_and_timeout(root, DEFAULT_PROBE_HOST.to_string(), timeout)
+    }
+
+    /// ホストを指定し、タイムアウトは既定（[`DEFAULT_TIMEOUT`]）で構築する。
+    /// `BANTO_BIND`解決結果を渡す呼び出し元（`apps/banto-hub/src-tauri`）
+    /// 向けの主要コンストラクタ（モジュール doc「host」節）。
+    pub fn with_host(root: PathBuf, host: String) -> Self {
+        Self::with_host_and_timeout(root, host, DEFAULT_TIMEOUT)
+    }
+
+    /// ホスト・タイムアウトの両方を指定して構築する。
+    pub fn with_host_and_timeout(root: PathBuf, host: String, timeout: Duration) -> Self {
+        Self {
+            root,
+            host,
+            timeout,
+        }
     }
 }
 
@@ -84,7 +120,7 @@ impl HubHealthProbe for HttpHubHealthProbe {
         expected_profile: &str,
         expected_port: u16,
     ) -> Result<HealthOutcome, ProbeError> {
-        let openapi = match fetch_openapi(expected_port, self.timeout) {
+        let openapi = match fetch_openapi(&self.host, expected_port, self.timeout) {
             FetchOutcome::Unreachable => return Ok(HealthOutcome::Unreachable),
             FetchOutcome::PortConflict => return Ok(HealthOutcome::PortConflict),
             FetchOutcome::Healthy(value) => value,
@@ -116,14 +152,33 @@ enum FetchOutcome {
     Healthy(serde_json::Value),
 }
 
-/// `127.0.0.1:{port}`へ`GET /api/v1/openapi.json`を送り、応答を分類する。
-fn fetch_openapi(port: u16, timeout: Duration) -> FetchOutcome {
-    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let mut stream = match TcpStream::connect_timeout(&addr, timeout) {
-        Ok(stream) => stream,
-        // 接続自体が確立できない(拒否・タイムアウト) - 「health に到達
-        // できない」= Unreachable（このモジュール doc「判定ロジック」1.）。
+/// `{host}:{port}`へ`GET /api/v1/openapi.json`を送り、応答を分類する。
+/// `host`の名前解決自体が失敗した場合（不正なホスト名等）も接続不可と
+/// 同列に扱い Unreachable とする - 呼び出し元にとっては「到達できない」点で
+/// 区別する必要がないため。
+///
+/// `host`が複数アドレスへ解決される場合（例:`localhost`が環境によって
+/// IPv6`::1`を先に返すが、そちらでは何も listen していない）に備えて、
+/// 解決できた全アドレスへ順に接続を試み、最初に成功したものを使う -
+/// 1つ目のアドレスだけを試して即 Unreachable 扱いにしない
+/// （T16-2 第二スライスで`with_host`を追加した際に発覚した実環境依存の
+/// 挙動への対応）。
+fn fetch_openapi(host: &str, port: u16, timeout: Duration) -> FetchOutcome {
+    let addrs: Vec<_> = match (host, port).to_socket_addrs() {
+        Ok(it) => it.collect(),
         Err(_) => return FetchOutcome::Unreachable,
+    };
+    if addrs.is_empty() {
+        return FetchOutcome::Unreachable;
+    }
+    let mut stream = match addrs
+        .iter()
+        .find_map(|addr| TcpStream::connect_timeout(addr, timeout).ok())
+    {
+        Some(stream) => stream,
+        // どのアドレスへも接続を確立できない(拒否・タイムアウト) - 「health に
+        // 到達できない」= Unreachable（このモジュール doc「判定ロジック」1.）。
+        None => return FetchOutcome::Unreachable,
     };
 
     // 接続は確立できた時点で以降の失敗は「誰かが port を使っている」側の
@@ -136,7 +191,7 @@ fn fetch_openapi(port: u16, timeout: Duration) -> FetchOutcome {
     }
 
     let request = format!(
-        "GET {HEALTH_PATH} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUser-Agent: banto-hub-shell-health-probe\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+        "GET {HEALTH_PATH} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: banto-hub-shell-health-probe\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
     );
     if stream.write_all(request.as_bytes()).is_err() {
         return FetchOutcome::PortConflict;
@@ -202,7 +257,7 @@ mod tests {
     use super::*;
     use crate::profile_lock::{try_acquire_profile_lock, HubHostKind};
     use crate::test_support::TempDir;
-    use std::net::TcpListener;
+    use std::net::{Ipv4Addr, TcpListener};
     use std::thread;
 
     const VALID_OPENAPI_BODY: &str =
@@ -339,6 +394,31 @@ mod tests {
 
         let probe =
             HttpHubHealthProbe::with_timeout(root.path().to_path_buf(), Duration::from_millis(500));
+        assert_eq!(
+            probe.probe("default", port),
+            Ok(HealthOutcome::Healthy {
+                version: "v1".to_string()
+            })
+        );
+    }
+
+    /// T16-2 第二スライス: `with_host`が指定したホストへ実際に接続することを
+    /// 確認する - `127.0.0.1`固定だった第一スライスからの回帰防止
+    /// （明示的に別のループバック表記`localhost`を使い、既定値の
+    /// `127.0.0.1`と取り違えていないことを検証する）。
+    #[test]
+    fn probe_with_host_connects_to_specified_host() {
+        let port = spawn_canned_http_server(ok_response(VALID_OPENAPI_BODY));
+        let root = TempDir::new("http-hub-health-with-host");
+        let paths = resolve_profile_paths(root.path(), "default").expect("valid profile id");
+        let _guard =
+            try_acquire_profile_lock(&paths, HubHostKind::Service).expect("acquire lock ok");
+
+        let probe = HttpHubHealthProbe::with_host_and_timeout(
+            root.path().to_path_buf(),
+            "localhost".to_string(),
+            Duration::from_millis(500),
+        );
         assert_eq!(
             probe.probe("default", port),
             Ok(HealthOutcome::Healthy {

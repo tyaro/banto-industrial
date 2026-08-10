@@ -50,17 +50,24 @@
 //! トレイ「管理画面を終了」/「終了」 -> 確認ダイアログ -> (デスクトップ
 //!          ホストなら) RunningHub::shutdown() -> app.exit(0)
 //! トレイ「収集を停止」（デスクトップホスト時） -> controller.stop().await
-//! トレイ「サービスを停止」（サービス接続時、Operators のみ）
-//!          -> ServiceManager::stop() 発行 -> 起動判定をやり直す
-//!          （[`retry_startup`]と同じ経路 - 停止直後は SCM がまだ`Running`/
-//!          `StopPending`のことが多く、その場合は fallback 画面へ落ちる。
-//!          `Stopped`まで落ち着いていれば、そのままデスクトップホストとして
-//!          `HubRuntime::start`を試みる - 「サービスを停止したらこのアプリが
-//!          代わりに運転する」という単純な帰結で、専用の切替ウィザードは
-//!          実装しない）
-//! トレイ「サービスを開始」（fallback 画面、Operators のみ）
-//!          -> ServiceManager::start() 発行 -> 起動判定をやり直す
+//! トレイ「サービスを停止」（サービス接続時、Operators/管理者のみ）
+//!          -> [`run_host_switch`]（`HostKind::Service` を起点に
+//!          [`banto_hub_core::host_switch::HostSwitchEngine`]で
+//!          `SwitchCommand::SwitchToDesktop`を駆動 - T16-2 第二スライス、
+//!          このモジュール doc「T16-2 第二スライスで追加したもの」節）。
+//!          バックグラウンドスレッドで SCM `stop()`発行 →
+//!          `TransitionHandle`相当のポーリングで`Stopped`到達 → 旧 health
+//!          （probe）が`Unreachable`になるまで待ってから、初めて
+//!          `HubRuntime::start`でデスクトップホストとしての起動を試みる
+//!          （「サービスを停止したらこのアプリが代わりに運転する」という
+//!          帰結自体は第一スライスと同じだが、安全に引き継げると確認して
+//!          からにした）。専用の切替ウィザードは実装しない。
+//! トレイ「サービスを開始」（fallback 画面、Operators/管理者のみ）
+//!          -> [`run_host_switch`]（`HostKind::Offline`を起点に
+//!          `SwitchCommand::SwitchToService`を駆動）。SCM `start()`発行 →
+//!          `Running`到達 → health `Healthy`到達まで待ってから接続する。
 //! トレイ「再試行」（fallback 画面） -> 起動判定をやり直すだけ
+//!          （engine を使わない単純な再評価 - [`decide_startup`]）
 //! 第二インスタンス起動 -> 既存ウィンドウを show/unminimize/set_focus、自身は終了
 //! ```
 //!
@@ -114,12 +121,63 @@
 //!
 //! これらは全てデスクトップホスト（アプリがランタイムを所有する場合）専用。
 //! サービス接続時のホスト表示・fallback メニューは T16-2 の対象。
+//!
+//! ## T16-2 第二スライスで追加したもの（docs/banto-hub-t16-design.md §5
+//! 「T16-2 第一スライスの既知の gap」への対応）
+//!
+//! 第一スライスの`decide_startup`（初回起動判定の決定木）自体は変えず、
+//! トレイからの明示的な切替操作（「サービスを開始/停止」）だけを
+//! 安全な完了待ちに置き換えた。
+//!
+//! - [`run_host_switch`]/[`drive_host_switch`]/[`apply_host_switch_outcome`]:
+//!   トレイ「サービスを開始/停止」の実処理を、発行のみの fire-and-forget
+//!   から[`banto_hub_core::host_switch::HostSwitchEngine`]（T17-3）による
+//!   完了待ちへ置き換えた。フルの切替ウィザード UI は依然として作らない
+//!   （第一スライスと同じ方針、実装指示「without rewriting the whole
+//!   first-slice decision tree」）が、トレイ操作という単一の入り口に限り
+//!   engine の不変条件（`ServiceManager::start`/`stop`後に
+//!   `TransitionHandle`相当のポーリングで settled を確認する・Desktop 起動
+//!   前に SCM `Stopped`**かつ**health`Unreachable`を確認する）をそのまま
+//!   再利用する。バックグラウンドスレッド
+//!   （`std::thread::spawn`、`std::thread::sleep`ベースの
+//!   `HostSwitchEngine::step(SwitchCommand::Poll)`ループ - トレイクリックの
+//!   応答性を保つため、呼び出し元のスレッドはブロックしない）で完了まで
+//!   進め、終わったら[`apply_startup_outcome`]で結果を画面・トレイへ反映する
+//!   （[`retry_startup`]と共通の[`apply_outcome_and_sync`]経由）。
+//! - [`ShellDesktopControl`][]: `HostSwitchEngine`が要求する
+//!   [`banto_hub_core::host_switch::DesktopHostControl`]の最小実装。
+//!   このスライスでトレイから起動できる遷移は「Offline→Service」
+//!   （サービスを開始）と「Service→Desktop」（サービスを停止）の2方向のみで、
+//!   どちらも`request_stop`/`is_stopped`（Desktop→Service 側でのみ使われる -
+//!   このスライスではトレイに無い操作）を経由しない。
+//! - navigate/probe 先ホストの解決（[`resolve_navigate_host`]、既知の gap
+//!   「navigate 先を`127.0.0.1`固定にしている」への対応）:
+//!   `BANTO_BIND`（`console`/`service`ホストと同じ env）が設定されていれば
+//!   それを使う。ただし空文字列・`0.0.0.0`・`::`（全インターフェース bind）は
+//!   このプロセス自身が接続する用途では意味を持たないため、loopback
+//!   （`127.0.0.1`）へ読み替える。[`ProbeTarget`]がこの解決結果を保持し、
+//!   [`decide_startup`]・[`attempt_desktop_start`]・[`run_host_switch`]が
+//!   共通で使う。
+//! - Operators に加え Windows ローカル Administrators グループのメンバーも
+//!   サービス操作系トレイ項目を表示できるようにした
+//!   （[`banto_hub_core::service_operators::is_current_process_admin`]、
+//!   既知の gap「Operators ゲートがローカル管理者を誤って隠す」への対応 -
+//!   desktop-plan §8.3「Hub Admin と Windows の専用ローカルグループ
+//!   `BantoHub Operators`（**または Windows 管理者**）」の意図に合わせた）。
+//!   `AppState::can_operate_service`は起動時に両方を1回ずつ確認した
+//!   論理和になる。
 
-use std::net::{Ipv4Addr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
+#[cfg(windows)]
+use std::time::Duration;
 
 use banto_hub_core::controller::{CollectionController, RuntimeStatus};
+#[cfg(windows)]
+use banto_hub_core::host_switch::{
+    DesktopHostControl, DesktopHostError, HostKind, HostSwitchConfig, HostSwitchEngine,
+    StepOutcome, SwitchCommand, SwitchError,
+};
 use banto_hub_core::http_hub_health::HttpHubHealthProbe;
 use banto_hub_core::hub_health::{HealthOutcome, HubHealthProbe};
 use banto_hub_core::profile_lock::HubHostKind;
@@ -128,7 +186,7 @@ use banto_hub_core::runtime::{HubRuntime, RunningHub};
 use banto_hub_core::service_manager::ScmState;
 #[cfg(windows)]
 use banto_hub_core::service_manager::{ServiceManager, WindowsServiceManager};
-use banto_hub_core::service_operators::is_current_process_operator;
+use banto_hub_core::service_operators::{is_current_process_admin, is_current_process_operator};
 use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, WebviewWindow, WindowEvent, Wry};
@@ -173,15 +231,31 @@ struct FallbackInfo {
 
 /// [`decide_startup`]の判定結果。
 enum StartupOutcome {
-    /// サービスへ接続する - `addr`は navigate 先。
+    /// サービスへ接続する - `host`/`port`が navigate 先（実装指示 3.、
+    /// [`resolve_navigate_host`]参照 - 第一スライスは`127.0.0.1`固定
+    /// だった）。
     Service {
-        addr: SocketAddr,
+        host: String,
+        port: u16,
         scm_state: ScmState,
     },
     /// デスクトップホストとして起動できた。
     Desktop(RunningHub),
     /// fallback 画面を表示する。
     Fallback(FallbackInfo),
+}
+
+/// T16-2 第二スライス: [`decide_startup`]・[`attempt_desktop_start`]・
+/// [`run_host_switch`]が共通で使う「今回の起動が期待する対象」をまとめた
+/// 薄い構造体。第一スライスの`expected_probe_target() -> (PathBuf, String,
+/// u16)`に`host`（実装指示 3.）を足しただけで、値の意味自体は変えていない。
+#[derive(Debug, Clone)]
+struct ProbeTarget {
+    root: PathBuf,
+    profile_id: String,
+    port: u16,
+    /// navigate/probe 先ホスト（[`resolve_navigate_host`]が解決）。
+    host: String,
 }
 
 /// `app.manage()` で保持するアプリ全体の唯一の可変状態。
@@ -208,10 +282,13 @@ struct AppState {
     /// トレイメニューの再構築・「サービスを開始/停止」「再試行」の分岐に使う。
     view: StdMutex<ShellView>,
     /// T16-2: `is_current_process_operator().unwrap_or(false)`
-    /// （実装指示 4.「Operators 委任」）。起動時に一度確定し、以後は
-    /// 変えない - Operators グループへの参加はプロセス再起動が前提
-    /// （Windows のトークンはプロセス生存中に再評価されないため、
-    /// このスライスでは再評価の仕組みは作らない）。
+    /// （実装指示 4.「Operators 委任」）。T16-2 第二スライスで
+    /// `is_current_process_admin().unwrap_or(false)`との論理和になった
+    /// （既知の gap「Operators ゲートがローカル管理者を誤って隠す」への
+    /// 対応、`is_current_process_admin`のモジュール doc参照）。起動時に
+    /// 一度確定し、以後は変えない - グループ参加・昇格状態の変更は
+    /// プロセス再起動が前提（Windows のトークンはプロセス生存中に
+    /// 再評価されないため、このスライスでは再評価の仕組みは作らない）。
     can_operate_service: bool,
 }
 
@@ -293,14 +370,19 @@ fn render_fallback(window: &WebviewWindow, info: &FallbackInfo, can_operate: boo
 /// `frontendDist`（`ui/index.html`）の出番はここまで - 二重配布は行わない。
 /// T16-2: サービス接続時（[`StartupOutcome::Service`]）の navigate にも
 /// 共用する - 接続先が自プロセスの`RunningHub`かサービスかは呼び出し元が
-/// 区別するだけで、navigate 自体の処理は同じ。
-fn navigate_to_hub(window: &WebviewWindow, addr: SocketAddr) {
-    let url = match tauri::Url::parse(&format!("http://{addr}/")) {
+/// 区別するだけで、navigate 自体の処理は同じ。`host_port`は呼び出し元が
+/// 組み立てた`host:port`文字列（Desktop は`RunningHub::local_addr()`の
+/// `Display`、Service は[`format_host_port`] - 実装指示 3.「navigate 先を
+/// 127.0.0.1 固定にしない」）。
+fn navigate_to_hub(window: &WebviewWindow, host_port: &str) {
+    let url = match tauri::Url::parse(&format!("http://{host_port}/")) {
         Ok(url) => url,
         Err(err) => {
-            // `addr` は `RunningHub::local_addr()` またはサービスの期待
-            // ポートから組み立てた実バインドアドレスなので、パース失敗は
-            // 事実上起こり得ない - 起きてもプロセスを落とさず診断だけ表示する。
+            // `host_port` は `RunningHub::local_addr()` またはサービスの
+            // 期待ポート・[`resolve_navigate_host`]から組み立てた文字列
+            // なので、パース失敗は事実上起こり得ない（`BANTO_BIND`に URL
+            // として不正な値を設定した場合を除く）- 起きてもプロセスを
+            // 落とさず診断だけ表示する。
             show_startup_error(
                 window,
                 &format!("Hub の URL の組み立てに失敗しました: {err}"),
@@ -414,17 +496,55 @@ fn stop_collection(app: &AppHandle) {
     });
 }
 
-/// T16-2: env（`BANTO_HUB_ROOT`/`BANTO_HUB_PROFILE`/`PORT`）から
-/// [`decide_startup`]が必要とする「期待する root・profile-id・port」を
+/// T16-2: env（`BANTO_HUB_ROOT`/`BANTO_HUB_PROFILE`/`PORT`/`BANTO_BIND`）から
+/// [`decide_startup`]が必要とする「期待する root・profile-id・port・host」を
 /// 解決する。`build_hub_config_from_env`と同じ env を読むが、`HubConfig`
-/// 全体ではなく[`HttpHubHealthProbe`]が必要とする3値だけを返す薄いラッパ。
-fn expected_probe_target() -> (PathBuf, String, u16) {
+/// 全体ではなく[`ProbeTarget`]が必要とする値だけを返す薄いラッパ。
+fn expected_probe_target() -> ProbeTarget {
     let paths = resolve_profile_paths_from_env();
     let port = std::env::var("PORT")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(banto_hub_core::settings::DEFAULT_PORT);
-    (paths.root, paths.profile_id, port)
+    ProbeTarget {
+        root: paths.root,
+        profile_id: paths.profile_id,
+        port,
+        host: resolve_navigate_host(),
+    }
+}
+
+/// T16-2 第二スライス（実装指示 3.、docs/banto-hub-t16-design.md §5 既知の
+/// gap「navigate 先を`127.0.0.1`固定にしている」）: navigate/probe 先ホストを
+/// `BANTO_BIND`から解決する。
+///
+/// console/service ホスト（`apps/banto-hub/core/src/runtime.rs::HubRuntime::start`）
+/// と同じ env を読むが、あちらは「自分自身がどこへ bind するか」で
+/// persisted `server_config.bind`へフォールバックできるのに対し、こちらは
+/// 「まだ起動していないかもしれない別ホストへこのプロセス自身が接続しに
+/// 行く」用途なので、persisted 設定は参照しない（接続先が起動していなければ
+/// そもそも読めないため）。全インターフェース bind（空文字列・`0.0.0.0`・
+/// IPv6 ワイルドカード`::`）は「このホスト上のどこからでも」という意味で
+/// あり、同一ホスト上のこのプロセスからの接続先としては意味を持たないため、
+/// loopback（`127.0.0.1`）へ読み替える（実装指示「Keep loopback-safe
+/// defaults」）。
+fn resolve_navigate_host() -> String {
+    match std::env::var("BANTO_BIND") {
+        Ok(value) if !value.is_empty() && value != "0.0.0.0" && value != "::" => value,
+        _ => "127.0.0.1".to_string(),
+    }
+}
+
+/// URL の authority 部分へ埋め込める`host:port`文字列を組み立てる。IPv6
+/// リテラルは`[host]:port`と角括弧が必要（`std::net::SocketAddr`の
+/// `Display`実装と同じ判定 - `BANTO_BIND`にIPv6アドレスを設定した場合の
+/// 保険、banto-hub の現行既定は IPv4 のみだが将来の変更に備える）。
+fn format_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 /// T16-2: サービス操作（`query_status`/`start`/`stop`）に使う
@@ -450,24 +570,25 @@ fn build_service_manager() -> WindowsServiceManager {
 /// `Running`だが health が怪しい、または SCM が遷移中（StartPending/
 /// StopPending/Other）の間は、サービスが port/profile lock を握っている
 /// 可能性が高いため`HubRuntime::start`を試みず fallback へ回す（デスクトップ
-/// とサービスが同時に同じ profile を掴もうとするのを避ける - 完全な
-/// `HostSwitchEngine`（T17-3）ほど厳密ではないが、実装指示「この
-/// スライスでは HostSwitchEngine を使わない」に沿った最小限の安全策）。
+/// とサービスが同時に同じ profile を掴もうとするのを避ける）。起動直後の
+/// 判定では`HostSwitchEngine`を使わず、トレイからの開始/停止だけが
+/// [`run_host_switch`]経由で engine を駆動する（T16-2 第二スライス）。
 /// `Stopped`/`NotInstalled`、または SCM 問い合わせ自体が失敗した場合は
 /// 従来どおりデスクトップホストとして起動を試みる。
 ///
 /// 非 Windows: SCM という概念が無いため、常に[`attempt_desktop_start`]を
 /// 呼ぶ（実装指示「Non-Windows: keep current Desktop-only path」）。
-fn decide_startup(root: &Path, profile_id: &str, port: u16) -> StartupOutcome {
+fn decide_startup(target: &ProbeTarget) -> StartupOutcome {
     #[cfg(windows)]
     {
         let manager = build_service_manager();
         match manager.query_status() {
             Ok(status) if status.state == ScmState::Running => {
-                let probe = HttpHubHealthProbe::new(root.to_path_buf());
-                match probe.probe(profile_id, port) {
+                let probe = HttpHubHealthProbe::with_host(target.root.clone(), target.host.clone());
+                match probe.probe(&target.profile_id, target.port) {
                     Ok(HealthOutcome::Healthy { .. }) => StartupOutcome::Service {
-                        addr: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                        host: target.host.clone(),
+                        port: target.port,
                         scm_state: status.state,
                     },
                     Ok(other) => StartupOutcome::Fallback(FallbackInfo {
@@ -483,7 +604,7 @@ fn decide_startup(root: &Path, profile_id: &str, port: u16) -> StartupOutcome {
                 }
             }
             Ok(status) if matches!(status.state, ScmState::Stopped | ScmState::NotInstalled) => {
-                attempt_desktop_start(root, profile_id, port, Some(status.state))
+                attempt_desktop_start(target, Some(status.state))
             }
             Ok(status) => {
                 // StartPending/StopPending/Other: 遷移中 - デスクトップを
@@ -498,13 +619,13 @@ fn decide_startup(root: &Path, profile_id: &str, port: u16) -> StartupOutcome {
             Err(_err) => {
                 // SCM 自体に問い合わせられない（未インストール環境・権限不足等）
                 // - 判定材料が無いだけなので、従来どおりデスクトップ起動を試みる。
-                attempt_desktop_start(root, profile_id, port, None)
+                attempt_desktop_start(target, None)
             }
         }
     }
     #[cfg(not(windows))]
     {
-        attempt_desktop_start(root, profile_id, port, None)
+        attempt_desktop_start(target, None)
     }
 }
 
@@ -514,12 +635,7 @@ fn decide_startup(root: &Path, profile_id: &str, port: u16) -> StartupOutcome {
 /// 「ポート競合の相手が別の banto-hub インスタンスかどうか」の手がかりに
 /// なる（`scm_state`の`allow(dead_code)`同様、Err時のみ使う値）。
 #[allow(unused_variables)]
-fn attempt_desktop_start(
-    root: &Path,
-    profile_id: &str,
-    port: u16,
-    scm_state: Option<ScmState>,
-) -> StartupOutcome {
+fn attempt_desktop_start(target: &ProbeTarget, scm_state: Option<ScmState>) -> StartupOutcome {
     // HubRuntime::start はここで同期的に待つ - `tauri::async_runtime`
     // が既定で保持する多重スレッド tokio ランタイム上で block_on
     // する（`apps/chronogazer/src-tauri`の`run()`が`init_db`等を
@@ -529,8 +645,8 @@ fn attempt_desktop_start(
     ))) {
         Ok(hub) => StartupOutcome::Desktop(hub),
         Err(err) => {
-            let health = HttpHubHealthProbe::new(root.to_path_buf())
-                .probe(profile_id, port)
+            let health = HttpHubHealthProbe::with_host(target.root.clone(), target.host.clone())
+                .probe(&target.profile_id, target.port)
                 .ok();
             StartupOutcome::Fallback(FallbackInfo {
                 scm_state,
@@ -547,9 +663,9 @@ fn attempt_desktop_start(
 ///
 /// デスクトップ以外（サービス接続・fallback）へ切り替わる際、直前まで
 /// このプロセスが`RunningHub`を保有していた場合は先に`shutdown()`する -
-/// 「もう一方を起動したまま切り替わる」二重接続を避けるための最小限の
-/// 安全策（`HostSwitchEngine`ほど厳密な待ち合わせは行わない、実装指示
-/// 「full HostSwitchEngine は作らない」の範囲内での安全策）。
+/// 「もう一方を起動したまま切り替わる」二重接続を避けるため。トレイからの
+/// サービス開始/停止の完了待ちは[`run_host_switch`]（`HostSwitchEngine`）が
+/// 担当し、ここは起動判定（[`decide_startup`]）結果の適用に留まる。
 ///
 /// 戻り値の`(RuntimeStatus, Arc<CollectionController>)`はデスクトップへ
 /// 新規遷移した場合のみ`Some` - 呼び出し元がトレイ構築・
@@ -574,14 +690,18 @@ fn apply_startup_outcome(
     }
 
     match outcome {
-        StartupOutcome::Service { addr, scm_state } => {
-            navigate_to_hub(window, addr);
+        StartupOutcome::Service {
+            host,
+            port,
+            scm_state,
+        } => {
+            navigate_to_hub(window, &format_host_port(&host, port));
             *state.view.lock().expect("view mutex poisoned") = ShellView::Service { scm_state };
             None
         }
         StartupOutcome::Desktop(hub) => {
             let addr = hub.local_addr();
-            navigate_to_hub(window, addr);
+            navigate_to_hub(window, &addr.to_string());
             let controller = hub.controller();
             let status = controller.status();
             *tauri::async_runtime::block_on(state.hub.lock()) = Some(hub);
@@ -749,27 +869,21 @@ fn sync_tray(app: &AppHandle) {
     }
 }
 
-/// 起動判定をやり直す共通処理（トレイ「再試行」「サービスを開始」
-/// 「サービスを停止」の全てが最終的にこれを呼ぶ - このモジュール doc
-/// 「起動シーケンス」節の該当行参照）。
-///
-/// デスクトップへ新規遷移した場合のみ[`watch_collection_status`]を新しく
-/// spawn する（[`ShellView`]が直前 Desktop でなかった場合 - 二重 spawn を
-/// 避けるため）。
-fn retry_startup(app: &AppHandle) {
-    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
-        return;
-    };
+/// [`retry_startup`]・[`apply_host_switch_outcome`]共通の適用処理 -
+/// `apply_startup_outcome`を呼び、デスクトップへ新規遷移した場合だけ
+/// [`watch_collection_status`]を新しく spawn してからトレイを同期する
+/// （[`ShellView`]が直前 Desktop でなかった場合 - 二重 spawn を避けるため）。
+/// 第一スライスでは`retry_startup`の末尾にだけ書かれていたロジックを、
+/// 第二スライスで追加した`apply_host_switch_outcome`とも共有できるよう
+/// 切り出した。
+fn apply_outcome_and_sync(app: &AppHandle, window: &WebviewWindow, outcome: StartupOutcome) {
     let state = app.state::<AppState>();
     let was_desktop = matches!(
         *state.view.lock().expect("view mutex poisoned"),
         ShellView::Desktop
     );
-
-    let (root, profile_id, port) = expected_probe_target();
-    let outcome = decide_startup(&root, &profile_id, port);
     let newly_desktop = matches!(outcome, StartupOutcome::Desktop(_));
-    if let Some((_status, controller)) = apply_startup_outcome(app, &window, outcome) {
+    if let Some((_status, controller)) = apply_startup_outcome(app, window, outcome) {
         if !was_desktop && newly_desktop {
             let app_handle = app.clone();
             tauri::async_runtime::spawn(watch_collection_status(app_handle, controller));
@@ -778,41 +892,273 @@ fn retry_startup(app: &AppHandle) {
     sync_tray(app);
 }
 
-/// トレイ「サービスを停止」クリック時のエントリポイント（サービス接続時、
-/// Operators のみ表示 - [`build_service_tray_menu`]）。
+/// 起動判定をやり直す共通処理（トレイ「再試行」が呼ぶ - このモジュール doc
+/// 「起動シーケンス」節の該当行参照）。[`decide_startup`]の単純な決定木を
+/// 呼ぶだけで、`HostSwitchEngine`は使わない（単なる状態の再評価であり、
+/// 明示的な切替操作ではないため - 「サービスを開始/停止」は
+/// [`run_host_switch`]を使う）。
+fn retry_startup(app: &AppHandle) {
+    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+        return;
+    };
+    let target = expected_probe_target();
+    let outcome = decide_startup(&target);
+    apply_outcome_and_sync(app, &window, outcome);
+}
+
+/// [`HostSwitchEngine`]が要求する
+/// [`banto_hub_core::host_switch::DesktopHostControl`]の最小実装
+/// （T16-2 第二スライス、モジュール doc「T16-2 第二スライスで追加した
+/// もの」節）。
 ///
-/// [`ServiceManager::stop`]を発行するだけで完了を待たない（SCM の
-/// `StopPending`遷移は非同期 - 完了待ちのポーリングは実装しない、実装指示
-/// 「full HostSwitchEngine は作らない」の範囲内）。発行後すぐに
-/// [`retry_startup`]で状態を再評価する - 停止がまだ完了していなければ
-/// fallback（「再試行」で様子見）、完了していれば（`Stopped`まで進んでいれば）
-/// デスクトップホストとしての起動を自動的に試みる（このモジュール doc
-/// 「起動シーケンス」節参照）。
+/// このスライスでトレイから駆動する遷移は「Offline→Service」（サービスを
+/// 開始）と「Service→Desktop」（サービスを停止）の2方向だけで、いずれも
+/// `request_stop`/`is_stopped`を経由しない（両方とも`current == Desktop`
+/// から始まる「Desktop→Service」側だけが使う操作 - このスライスのトレイに
+/// その操作は無い、実装指示「Full UI switch wizard は out of scope」）。
+/// そのため両メソッドは呼ばれない前提のダミー実装に留め、実際に使われるのは
+/// 既定実装の`request_start_allowed`（常に許可 - 第一スライスの
+/// `decide_startup`も Desktop 起動を追加の権限確認なしに試みていたのと
+/// 同じ挙動）だけ。
+#[cfg(windows)]
+struct ShellDesktopControl;
+
+#[cfg(windows)]
+impl DesktopHostControl for ShellDesktopControl {
+    fn request_stop(&mut self) -> Result<(), DesktopHostError> {
+        Ok(())
+    }
+
+    fn is_stopped(&self) -> bool {
+        true
+    }
+}
+
+/// [`HostSwitchEngine::step`]の1フェーズに許すタイムアウト（実装指示 1./2.
+/// 「wait_until_settled を呼ぶ」「SCM Stopped かつ health Unreachable まで
+/// 待つ」）。SCM の`StartPending`/`StopPending`は実運用で数秒〜十数秒
+/// かかりうるため、単一フェーズの上限としては`WindowsServiceManager::restart`
+/// が使う`wait_until_settled`の例（30秒）よりやや短いが十分な値にした。
+#[cfg(windows)]
+const HOST_SWITCH_PHASE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// ポーリング間隔（`WindowsServiceManager::restart`の例の 200ms と近い
+/// 値 - トレイ操作の体感待ち時間として長すぎない範囲にした）。
+#[cfg(windows)]
+const HOST_SWITCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// [`run_host_switch`]の最終結果 - [`apply_host_switch_outcome`]が
+/// [`StartupOutcome`]へ変換する前の中間表現（バックグラウンドスレッド
+/// から`AppHandle`越しに結果だけを持ち帰るための値型）。
+#[cfg(windows)]
+enum HostSwitchResult {
+    /// サービスへ接続してよい（health `Healthy`まで確認済み）。
+    Service { scm_state: ScmState },
+    /// デスクトップホストとして起動してよい（SCM `Stopped`+旧 health
+    /// `Unreachable`まで確認済み - 実際の`HubRuntime::start`は
+    /// [`apply_host_switch_outcome`]側で試みる）。
+    Desktop,
+    /// 失敗到達・権限なし等 - fallback 画面に表示する診断情報。
+    Faulted {
+        scm_state: Option<ScmState>,
+        health: Option<HealthOutcome>,
+        reason: String,
+    },
+}
+
+/// [`HostSwitchEngine::step`]を`Poll`で繰り返し、終端の
+/// [`StepOutcome`]（`Completed`/`Faulted`）に到達するまでブロッキングに
+/// 進める（実装指示 1./2. - `TransitionHandle::wait_until_settled`と同じ
+/// 「ポーリング＋sleep」形だが、engine 側が持つ複数フェーズ分の待ちを
+/// まとめて1回のブロッキング呼び出しにする）。呼び出し元
+/// （[`run_host_switch`]）が背景スレッドで呼ぶ前提 - ここ自体はスレッドを
+/// 起動しない。
+#[cfg(windows)]
+fn drive_host_switch<M, P, D>(
+    engine: &mut HostSwitchEngine<M, P, D>,
+    command: SwitchCommand,
+) -> HostSwitchResult
+where
+    M: ServiceManager,
+    P: HubHealthProbe,
+    D: DesktopHostControl,
+{
+    let mut outcome = match engine.step(command) {
+        Ok(outcome) => outcome,
+        Err(SwitchError::PermissionDenied) => {
+            return HostSwitchResult::Faulted {
+                scm_state: None,
+                health: None,
+                reason: SwitchError::PermissionDenied.to_string(),
+            }
+        }
+    };
+    loop {
+        match outcome {
+            StepOutcome::Completed(HostKind::Service) => {
+                return HostSwitchResult::Service {
+                    scm_state: ScmState::Running,
+                };
+            }
+            StepOutcome::Completed(HostKind::Desktop) => {
+                return HostSwitchResult::Desktop;
+            }
+            StepOutcome::Completed(HostKind::Offline) => {
+                // `SwitchToService`/`SwitchToDesktop`が`Offline`へ完了する
+                // 経路は無い（`host_switch`モジュール doc参照）- 呼び出し側
+                // の前提が崩れていない限り到達しないが、念のため安全側で
+                // fallback 表示にする。
+                return HostSwitchResult::Faulted {
+                    scm_state: None,
+                    health: engine.state().last_health.clone(),
+                    reason: "予期しない完了状態(Offline)です".to_string(),
+                };
+            }
+            StepOutcome::Faulted {
+                reached,
+                stage,
+                reason,
+            } => {
+                let scm_state = match reached {
+                    HostKind::Service => Some(ScmState::Running),
+                    HostKind::Offline => Some(ScmState::Stopped),
+                    HostKind::Desktop => None,
+                };
+                return HostSwitchResult::Faulted {
+                    scm_state,
+                    health: engine.state().last_health.clone(),
+                    reason: format!("{stage}: {reason}"),
+                };
+            }
+            StepOutcome::NoOp | StepOutcome::TransitionInProgress => {
+                // 呼び出し元は毎回新しい engine を構築するため、通常は
+                // 起こらない（`current`が既に目的地、または他の遷移が
+                // 進行中というのはこの engine インスタンス自身の状態と
+                // 矛盾する）- 発生したら診断として fallback へ回す。
+                return HostSwitchResult::Faulted {
+                    scm_state: None,
+                    health: None,
+                    reason: "既に目的の状態か、他の遷移と競合しました".to_string(),
+                };
+            }
+            StepOutcome::Waiting => {
+                std::thread::sleep(HOST_SWITCH_POLL_INTERVAL);
+            }
+            StepOutcome::Progressed => {
+                // 要求発行自体は同期 API なので即座に次の判定へ進む
+                // （`host_switch`モジュール doc「DesktopStopping/
+                // ServiceStopping」節と同じ理由）。
+            }
+        }
+        outcome = match engine.step(SwitchCommand::Poll) {
+            Ok(outcome) => outcome,
+            Err(SwitchError::PermissionDenied) => {
+                return HostSwitchResult::Faulted {
+                    scm_state: None,
+                    health: engine.state().last_health.clone(),
+                    reason: SwitchError::PermissionDenied.to_string(),
+                }
+            }
+        };
+    }
+}
+
+/// [`run_host_switch`]がバックグラウンドスレッドで[`drive_host_switch`]を
+/// 終えた後、結果を[`StartupOutcome`]へ変換して画面・トレイへ反映する。
+///
+/// `HostSwitchResult::Desktop`は「Desktop 起動してよい」という engine の
+/// 許可でしかない（`host_switch`モジュール doc「実際の`HubRuntime::start`は
+/// シェル側が呼ぶ」）ため、ここで初めて[`attempt_desktop_start`]を呼んで
+/// 実際の起動を試みる。
+#[cfg(windows)]
+fn apply_host_switch_outcome(app: &AppHandle, target: &ProbeTarget, result: HostSwitchResult) {
+    let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) else {
+        return;
+    };
+    let outcome = match result {
+        HostSwitchResult::Service { scm_state } => StartupOutcome::Service {
+            host: target.host.clone(),
+            port: target.port,
+            scm_state,
+        },
+        HostSwitchResult::Desktop => attempt_desktop_start(target, Some(ScmState::Stopped)),
+        HostSwitchResult::Faulted {
+            scm_state,
+            health,
+            reason,
+        } => StartupOutcome::Fallback(FallbackInfo {
+            scm_state,
+            health,
+            desktop_error: Some(reason),
+        }),
+    };
+    apply_outcome_and_sync(app, &window, outcome);
+}
+
+/// トレイ「サービスを開始/停止」共通のエントリポイント（T16-2 第二スライス、
+/// モジュール doc「T16-2 第二スライスで追加したもの」節）。
+///
+/// 現在の[`ShellView`]から[`HostKind`]（engine の初期状態）を求め、
+/// [`HostSwitchEngine`]を1回だけ構築してバックグラウンドスレッドで
+/// [`drive_host_switch`]を完了まで進める - 呼び出し元（トレイのメニュー
+/// イベントハンドラ）はブロックしない。
+#[cfg(windows)]
+fn run_host_switch(app: &AppHandle, command: SwitchCommand) {
+    let state = app.state::<AppState>();
+    let initial_host = match &*state.view.lock().expect("view mutex poisoned") {
+        ShellView::Desktop => HostKind::Desktop,
+        ShellView::Service { .. } => HostKind::Service,
+        ShellView::Fallback(_) => HostKind::Offline,
+    };
+    let can_operate = state.can_operate_service;
+    let target = expected_probe_target();
+    let manager = build_service_manager();
+    let probe = HttpHubHealthProbe::with_host(target.root.clone(), target.host.clone());
+    let mut engine = HostSwitchEngine::new(
+        manager,
+        probe,
+        ShellDesktopControl,
+        HostSwitchConfig {
+            expected_profile: target.profile_id.clone(),
+            expected_port: target.port,
+            can_operate_service: can_operate,
+            initial_host,
+            phase_timeout: HOST_SWITCH_PHASE_TIMEOUT,
+        },
+    );
+
+    let app_handle = app.clone();
+    std::thread::spawn(move || {
+        let result = drive_host_switch(&mut engine, command);
+        apply_host_switch_outcome(&app_handle, &target, result);
+    });
+}
+
+/// トレイ「サービスを停止」クリック時のエントリポイント（サービス接続時、
+/// Operators/管理者のみ表示 - [`build_service_tray_menu`]）。
+///
+/// T16-2 第二スライスで[`run_host_switch`]（`HostSwitchEngine`）に置き換えた。
+/// SCM `stop()`発行後、`Stopped`到達**かつ**旧 health `Unreachable`到達を
+/// 確認してから初めてデスクトップホストとしての起動を試みる（既知の gap
+/// 「サービス停止後の自動デスクトップ引き継ぎは『たまたまそうなる』動作」
+/// への対応、モジュール doc参照）。
 #[cfg(windows)]
 fn stop_service(app: &AppHandle) {
-    let manager = build_service_manager();
-    if let Err(err) = manager.stop() {
-        eprintln!("banto-hub-shell: サービス停止の要求に失敗しました: {err}");
-    }
-    retry_startup(app);
+    run_host_switch(app, SwitchCommand::SwitchToDesktop);
 }
 
 #[cfg(not(windows))]
 fn stop_service(_app: &AppHandle) {}
 
 /// トレイ「サービスを開始」クリック時のエントリポイント（fallback 時、
-/// Operators かつ SCM が`Stopped`のときだけ表示 -
-/// [`build_fallback_tray_menu`]）。[`stop_service`]と対称的に、発行後すぐ
-/// [`retry_startup`]で再評価する（`StartPending`のままなら fallback の
-/// ままだが、「サービスを開始」自体は`StartPending`では隠れる -
-/// [`tray_status::show_start_service_action`]）。
+/// Operators/管理者かつ SCM が`Stopped`のときだけ表示 -
+/// [`build_fallback_tray_menu`]）。T16-2 第二スライスで[`run_host_switch`]に
+/// 置き換えた - SCM `start()`発行後、`Running`到達**かつ**health`Healthy`
+/// 到達を確認してから接続する（既知の gap「`ServiceManager::start`/`stop`の
+/// 完了待ちをしていない」への対応）。
 #[cfg(windows)]
 fn start_service(app: &AppHandle) {
-    let manager = build_service_manager();
-    if let Err(err) = manager.start() {
-        eprintln!("banto-hub-shell: サービス開始の要求に失敗しました: {err}");
-    }
-    retry_startup(app);
+    run_host_switch(app, SwitchCommand::SwitchToService);
 }
 
 #[cfg(not(windows))]
@@ -922,7 +1268,13 @@ pub fn run() {
             })),
             // T16-2（実装指示 4.）: Operators 判定はプロセス起動時に一度だけ
             // 確定する（[`AppState::can_operate_service`]のフィールド doc参照）。
-            can_operate_service: is_current_process_operator().unwrap_or(false),
+            // T16-2 第二スライス: Operators**または** Windows ローカル
+            // Administrators のメンバーなら操作可能にする
+            // （`is_current_process_admin`のモジュール doc「T16-2 第二
+            // スライスで追加した is_current_process_admin」節、desktop-plan
+            // §8.3 の意図）。
+            can_operate_service: is_current_process_operator().unwrap_or(false)
+                || is_current_process_admin().unwrap_or(false),
         })
         .setup(|app| {
             let window = app
@@ -944,8 +1296,8 @@ pub fn run() {
 
             // T16-2: サービス検出 → 接続 / デスクトップ起動 / fallback の
             // 判定（このモジュール doc「起動シーケンス」節参照）。
-            let (root, profile_id, port) = expected_probe_target();
-            let outcome = decide_startup(&root, &profile_id, port);
+            let target = expected_probe_target();
+            let outcome = decide_startup(&target);
             let desktop_started = apply_startup_outcome(app.handle(), &window, outcome);
 
             // トレイ（T16-1/T16-2、desktop-plan §9.9）: 起動直後の見え方
@@ -1097,17 +1449,42 @@ mod tests {
     /// 同じ理由で env を書き換えない）。
     #[test]
     fn expected_probe_target_matches_resolved_profile_paths() {
-        let (root, profile_id, port) = expected_probe_target();
+        let target = expected_probe_target();
         let expected_paths = resolve_profile_paths_from_env();
-        assert_eq!(root, expected_paths.root);
-        assert_eq!(profile_id, expected_paths.profile_id);
+        assert_eq!(target.root, expected_paths.root);
+        assert_eq!(target.profile_id, expected_paths.profile_id);
         match std::env::var("PORT")
             .ok()
             .and_then(|value| value.parse::<u16>().ok())
         {
-            Some(env_port) => assert_eq!(port, env_port),
-            None => assert_eq!(port, banto_hub_core::settings::DEFAULT_PORT),
+            Some(env_port) => assert_eq!(target.port, env_port),
+            None => assert_eq!(target.port, banto_hub_core::settings::DEFAULT_PORT),
         }
+        // `resolve_navigate_host`が返しうる値と一致する（env を書き換えない
+        // 方針は上と同じ - 実際の`BANTO_BIND`の有無に応じて分岐する）。
+        assert_eq!(target.host, resolve_navigate_host());
+    }
+
+    /// T16-2 第二スライス（実装指示 3.）: `BANTO_BIND`が未設定・空文字列・
+    /// 全インターフェース bind（`0.0.0.0`/`::`）のいずれでも loopback-safe な
+    /// 既定`127.0.0.1`へ読み替えることを、実際の env を書き換えずに確認する
+    /// （`resolve_navigate_host`自体は`BANTO_BIND`しか読まないので、
+    /// 現在の env の値をそのまま期待値の計算に使う）。
+    #[test]
+    fn resolve_navigate_host_falls_back_to_loopback_for_wildcard_or_unset() {
+        let resolved = resolve_navigate_host();
+        match std::env::var("BANTO_BIND") {
+            Ok(value) if !value.is_empty() && value != "0.0.0.0" && value != "::" => {
+                assert_eq!(resolved, value);
+            }
+            _ => assert_eq!(resolved, "127.0.0.1"),
+        }
+    }
+
+    #[test]
+    fn format_host_port_wraps_ipv6_literals_in_brackets() {
+        assert_eq!(format_host_port("127.0.0.1", 8722), "127.0.0.1:8722");
+        assert_eq!(format_host_port("::1", 8722), "[::1]:8722");
     }
 
     /// T16-2 fallback 画面本文（実装指示 2.）の組み立てを確認する - SCM 状態・

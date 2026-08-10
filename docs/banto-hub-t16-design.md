@@ -7,9 +7,16 @@ T16-2 第一スライス（サービス検出・接続・native fallback・Opera
 ゲート）実装済み（下記 §3 T16-2 実装メモ参照）。2026-08-10 Windows
 実機でサービス接続／Desktop 起動の主要経路を確認済み（同メモ末尾）。
 同日発見の既知ギャップ「LocalSystem 作成 profile の ACL」（下記 §5）は
-T17 側（`profile_acl.rs`、docs/banto-hub-t17-design.md §12）で解消済み。**
+T17 側（`profile_acl.rs`、docs/banto-hub-t17-design.md §12）で解消済み。
+T16-2 第二スライス（トレイ開始/停止の`HostSwitchEngine`完了待ち・
+Desktop 引き継ぎの安全化・`BANTO_BIND`対応 navigate/probe・Administrators
+ゲート緩和）実装済み（下記 §3 第二スライス実装メモ、§5 参照）。単体テスト
+（`cargo test -p banto-hub-core` / `-p banto-hub-shell`）で確認済みだが、
+トレイの「サービスを開始/停止」操作自体の Windows 実機確認は未実施
+（§5 に既知の残 gap として記載）。**
 最終検証日(コード照合): 2026-08-10
-最終検証日(Windows 実機): 2026-08-10（T16-2 シェル、管理者 UAC + Operators）
+最終検証日(Windows 実機): 2026-08-10（T16-2 シェル第一スライス、管理者
+UAC + Operators。第二スライスのトレイ開始/停止操作は Windows 実機未確認）
 基準コミット: `396e927`（main、T16-1 マージ後）。T16-1 の実装は本設計と
 同じ PR（`cursor/t16-1-tray-status-e3cb`、#101）で追加。
 
@@ -153,6 +160,64 @@ desktop-plan §10 に日付付きで追記する（T16-0 PR で実施）。
 > **その後の対応（同日）**: `grant-profile-acl`（profile owner への継承付き
 > Modify、`Users`全体には付与しない）で解消済み。
 
+> **T16-2 第二スライス実装メモ（2026-08-10）**: 第一スライスの
+> `decide_startup`（起動時の決定木）自体は変更せず、下記 §5 の既知の gap
+> のうち「トレイ操作の完了待ち」「Desktop 引き継ぎの安全性」「navigate/probe
+> 先ホスト」「Administrators のトレイ操作可否」の4点に対応した。
+>
+> - **トレイ「サービスを開始/停止」の完了待ち**（既知の gap
+>   「`ServiceManager::start`/`stop`の完了待ちをしていない」への対応）:
+>   発行のみの fire-and-forget から
+>   `banto_hub_core::host_switch::HostSwitchEngine`（T17-3 で設計済みの状態
+>   機械）による完了待ちへ置き換えた。`lib.rs::run_host_switch`が現在の
+>   `ShellView`から engine の初期状態を求めて1回だけ構築し、
+>   `std::thread::spawn`した背景スレッドで`HostSwitchEngine::step`を
+>   `Waiting`の間`std::thread::sleep`しながら繰り返し呼ぶ
+>   （`lib.rs::drive_host_switch`）。トレイのメニューイベントハンドラ自体は
+>   即座に返るためクリックの応答性は保たれる。フルの切替ウィザード UI は
+>   引き続き作らず、トレイの「開始/停止」という単一の入り口だけを engine
+>   経由にした（実装指示「without rewriting the whole first-slice decision
+>   tree」）。
+> - **サービス停止後の Desktop 引き継ぎの安全化**（既知の gap「たまたま
+>   そうなる」動作への対応）: `HostSwitchEngine`の`Service→Desktop`遷移が
+>   持つ不変条件（SCM `Stopped`到達**かつ**旧 health `Unreachable`到達を
+>   確認してから初めて Desktop 起動を許可する）をそのまま利用する形になった
+>   - シェル側で個別に待ち合わせロジックを重複実装していない。
+> - **navigate/probe 先ホストの`BANTO_BIND`対応**（既知の gap「navigate 先を
+>   `127.0.0.1`固定にしている」への対応）: `lib.rs::resolve_navigate_host`が
+>   `BANTO_BIND`（console/service ホストと同じ env）を読み、値があればそれを
+>   使う。ただし空文字列・`0.0.0.0`・`::`（全インターフェース bind）は
+>   「このプロセス自身が接続する」用途では意味を持たないため`127.0.0.1`へ
+>   読み替える（loopback-safe default）。`apps/banto-hub/core/src/http_hub_health.rs`
+>   の`HttpHubHealthProbe`に`host`フィールドを追加し
+>   （`with_host`/`with_host_and_timeout`）、`decide_startup`・
+>   `attempt_desktop_start`・`run_host_switch`が同じ解決結果
+>   （`ProbeTarget::host`）を probe・navigate の両方に使う。あわせて、
+>   `host`が複数アドレスに解決される場合（`localhost`が環境によって
+>   `::1`を先に返すが listen していない、等）に備え、解決できた全アドレスへ
+>   順に接続を試みるよう`fetch_openapi`を修正した（1つ目のアドレスだけを
+>   試して誤って`Unreachable`と判定しないようにするため）。
+> - **Administrators のトレイ操作可否**（nice-if-small 実装指示 4.）:
+>   `apps/banto-hub/core/src/service_operators.rs`に
+>   `is_current_process_admin()`（ローカル`Administrators`グループの
+>   メンバーシップ判定、`is_current_process_operator()`と同じ
+>   `windows_impl::is_current_process_member_of`を共有）を追加し、
+>   `AppState::can_operate_service`を「Operators **または** Administrators」
+>   に緩和した（desktop-plan §8.3 の意図に合わせ、ローカル管理者を不必要に
+>   締め出さない）。**既知の限界**: UAC の split token 環境では、シェルが
+>   非昇格プロセスとして動いている場合`Administrators`メンバーシップの
+>   判定が実際の昇格状態と一致しないことがある（Windows の一般的な制約 -
+>   このスライスでは対応しない、低リスクと判断）。
+> - out of scope（今回未着手、引き続き §5 参照）: openapi 応答への
+>   profile-id 埋め込み（ワイヤ確認）、切替ウィザード UI、NSIS/installer
+>   変更。
+>
+> 検証: `cargo fmt` / `cargo clippy -p banto-hub-core -p banto-hub-shell
+--all-features -- -D warnings` / `cargo test -p banto-hub-core`
+> （301 passed, 4 ignored — 既存の Windows 実機限定テストのみ ignore）/
+> `cargo test -p banto-hub-shell`（16 passed）。トレイの「サービスを開始/
+> 停止」操作そのものの Windows 実機確認は未実施（§5 に残 gap として記載）。
+
 ## 4. T16-0 設計（P3）
 
 ### 4.1 Composition
@@ -239,24 +304,34 @@ banto-hub-shell (Tauri v2, Windows 優先)
   Hub インスタンスの profile-id を openapi 応答から確認しておらず、
   「`expected_profile`が解決可能か」「期待 profile の`profile.lock`が
   読めるか」の間接確認に留めている（`http_hub_health.rs`のモジュール doc
-  参照）。openapi 応答へ profile-id を含める等の対応は未実装。
-- **`ServiceManager::start`/`stop`の完了待ちをしていない**: トレイ
-  「サービスを開始/停止」は発行のみで`TransitionHandle::wait_until_settled`
-  を呼ばない。完了確認は利用者が「再試行」を手動で押す前提（`HostSwitchEngine`
-  のような自動ポーリングは今回のスコープ外）。
-- **navigate 先を`127.0.0.1`固定にしている**: `BANTO_BIND`をカスタムした
-  環境では、サービス接続時の navigate 先アドレスが実際のバインド先と
-  食い違う可能性がある（probe 自体も同様に`127.0.0.1`固定）。
-- **サービス停止後の自動デスクトップ引き継ぎは「たまたまそうなる」動作**:
-  トレイ「サービスを停止」後の`retry_startup`は単に決定木をやり直すだけで、
-  「サービスが完全に停止しデスクトップが安全に起動できる」ことを
-  `HostSwitchEngine`の不変条件ほど厳密には確認していない（Desktop
-  起動前に SCM が`Stopped`であることは見るが、旧 health の消失
-  （probe `Unreachable`）までは待たない）。
+  参照）。openapi 応答へ profile-id を含める等の対応は未実装（第二スライスも
+  out of scope、引き続き未解消）。
+- ~~**`ServiceManager::start`/`stop`の完了待ちをしていない**~~: **2026-08-10
+  第二スライスで解消**。トレイ「サービスを開始/停止」は
+  `banto_hub_core::host_switch::HostSwitchEngine`による完了待ちに置き換えた
+  （`lib.rs::run_host_switch`/`drive_host_switch`、上記 §3 第二スライス実装
+  メモ参照）。
+- ~~**navigate 先を`127.0.0.1`固定にしている**~~: **2026-08-10 第二スライスで
+  解消**。`BANTO_BIND`があればそれを解決して navigate/probe 双方に使う
+  （`lib.rs::resolve_navigate_host`、`HttpHubHealthProbe::with_host`、上記
+  §3 参照）。全インターフェース bind は引き続き loopback へ読み替える。
+- ~~**サービス停止後の自動デスクトップ引き継ぎは「たまたまそうなる」動作**~~:
+  **2026-08-10 第二スライスで解消**。トレイ「サービスを停止」は
+  `HostSwitchEngine`の`Service→Desktop`遷移を使うようになり、SCM
+  `Stopped`到達**かつ**旧 health `Unreachable`到達を確認してから初めて
+  Desktop 起動を試みる（上記 §3 参照）。なお「再試行」ボタン
+  （`retry_startup`）は引き続き単純な決定木の再評価のみで、この安全策は
+  トレイの明示的な「サービスを開始/停止」操作にのみ適用される。
 - **Windows 実機での`WindowsServiceManager`経路**: 2026-08-10 に
   `_verify_t17` でサービス Running 時の shell 接続・Stopped 時の Desktop
-  起動を確認済み（§3 実装メモ末尾）。トレイからの開始／停止 UI 操作と
-  `HostSwitchEngine` 完了待ちは未実施（上記 gap）。
+  起動を確認済み（§3 実装メモ末尾）。**トレイからの「サービスを開始/停止」
+  操作と`HostSwitchEngine`完了待ちの実装は第二スライスで完了したが、
+  Windows 実機でのクリック動作そのものの確認はまだ未実施**（単体テストの
+  みで確認、上記 §3 第二スライス実装メモ参照）。
+- **Administrators のトレイ操作可否**: 2026-08-10 第二スライスで
+  `is_current_process_admin()`を追加し、Operators または Administrators
+  なら操作可能にした（上記 §3 参照）。UAC split token 環境での挙動は
+  既知の限界として残る（低リスクと判断、対応は見送り）。
 - **LocalSystem 作成 profile の ACL**: サービス先行作成の DB が対話ユーザー
   から readonly になり Desktop 起動が失敗し得る（§3 実機メモ）。**2026-08-10
   対応済み**: `profile_acl.rs`＋固定アクション`grant-profile-acl`

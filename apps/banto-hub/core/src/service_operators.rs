@@ -49,6 +49,31 @@
 //! 管理者相当のグループを対象とする）、この前提は Windows 実機での
 //! 再確認が済んでいない。slice 2（UAC helper 実装・受け入れ時）で
 //! 実機確認すること。
+//!
+//! ## T16-2 第二スライスで追加した [`is_current_process_admin`]
+//!
+//! desktop-plan §8.3「通常画面のサービス操作は Hub Admin と Windows の
+//! 専用ローカルグループ `BantoHub Operators`（**または Windows 管理者**）
+//! を双方要求する」・§16.3 の意図どおり、`BantoHub Operators`
+//! メンバーシップだけでなく Windows ローカル Administrators グループの
+//! メンバーシップでもサービス操作系トレイ項目を表示できるようにする
+//! （T16-2 第一スライスの既知の gap - `docs/banto-hub-t16-design.md` §5
+//! 「サービス操作系トレイ項目が Operators のみに限定されており、
+//! ローカル管理者が誤って隠される」）。
+//!
+//! 実装は[`is_current_process_operator`]と全く同じ`CheckTokenMembership`
+//! 経路を、グループ名だけ`"Administrators"`（`BUILTIN\Administrators`、
+//! ローカライズに依存しない英語名で`LookupAccountNameW`が解決できる -
+//! [`OPERATORS_GROUP_NAME`]と同じ理由）に変えて再利用するだけ - 新規
+//! Win32 API 面は増やさない。上記「既知の未検証事項」の split-token
+//! 限界がそのまま当てはまる点も同じ: **非昇格**プロセスでは通常の
+//! Administrators メンバーであっても`false`になりうる（UAC のフィルタが
+//! 管理者グループを対象とするため）。そのため、これは「常に管理者を
+//! 正しく検出できる」機能ではなく、「シェルを明示的に管理者として
+//! 実行した（昇格した）場合に `BantoHub Operators` 未登録でも操作可能に
+//! する」効果に限られる、低リスクな追加チェックとして扱う - 昇格していない
+//! 通常の管理者アカウントは従来どおり`BantoHub Operators`への登録が必要
+//! （desktop-plan 同節「管理者は常に UAC 経路へ」の方針とも矛盾しない）。
 
 use thiserror::Error;
 
@@ -56,6 +81,12 @@ use thiserror::Error;
 /// グループ自体の作成は slice 2（UAC helper）が行う - このスライスでは
 /// 名前の参照のみ。
 pub const OPERATORS_GROUP_NAME: &str = "BantoHub Operators";
+
+/// Windows 組み込みローカルグループ`BUILTIN\Administrators`の参照名
+/// （[`is_current_process_admin`]、T16-2 第二スライス）。`LookupAccountNameW`
+/// は英語名でロケールに関わらず解決できる（[`OPERATORS_GROUP_NAME`]と
+/// 同じ理由）。
+pub const ADMINISTRATORS_GROUP_NAME: &str = "Administrators";
 
 /// [`is_current_process_operator`] の失敗モード。
 ///
@@ -91,6 +122,14 @@ pub fn is_current_process_operator() -> Result<bool, OperatorsError> {
     Ok(false)
 }
 
+/// 現在のプロセスが Windows ローカル Administrators グループのメンバーかを
+/// 判定する（非 Windows 版、T16-2 第二スライス）。[`is_current_process_operator`]
+/// の非 Windows 版と同じ理由で常に安全側の`Ok(false)`を返す。
+#[cfg(not(windows))]
+pub fn is_current_process_admin() -> Result<bool, OperatorsError> {
+    Ok(false)
+}
+
 /// 現在のプロセスが [`OPERATORS_GROUP_NAME`] ローカルグループのメンバーかを
 /// 判定する（Windows 版）。
 ///
@@ -102,7 +141,21 @@ pub fn is_current_process_operator() -> Result<bool, OperatorsError> {
 /// そのまま使える）。
 #[cfg(windows)]
 pub fn is_current_process_operator() -> Result<bool, OperatorsError> {
-    windows_impl::is_current_process_operator()
+    windows_impl::is_current_process_member_of(OPERATORS_GROUP_NAME)
+}
+
+/// 現在のプロセスが Windows ローカル Administrators グループのメンバーかを
+/// 判定する（Windows 版、T16-2 第二スライス - モジュール doc「T16-2 第二
+/// スライスで追加した is_current_process_admin」節参照）。
+///
+/// [`is_current_process_operator`]と同じ`CheckTokenMembership`経路を
+/// グループ名だけ変えて再利用する - Administrators は未作成になることが
+/// ない組み込みグループなので、`lookup_account_sid`が`Ok(None)`
+/// （グループ未検出）を返すことは実運用上起こらないはずだが、万一起きても
+/// 同じ「安全側で`false`」規約に従う。
+#[cfg(windows)]
+pub fn is_current_process_admin() -> Result<bool, OperatorsError> {
+    windows_impl::is_current_process_member_of(ADMINISTRATORS_GROUP_NAME)
 }
 
 // T17-2 スライス2（`service_elevated.rs`）が`lookup_account_sid`を
@@ -118,10 +171,15 @@ pub(crate) mod windows_impl {
         CheckTokenMembership, LookupAccountNameW, PSID, SID_NAME_USE,
     };
 
-    use super::{OperatorsError, OPERATORS_GROUP_NAME};
+    use super::OperatorsError;
 
-    pub(super) fn is_current_process_operator() -> Result<bool, OperatorsError> {
-        let mut sid = match lookup_account_sid(OPERATORS_GROUP_NAME)? {
+    /// 指定したローカルグループ（[`super::OPERATORS_GROUP_NAME`]または
+    /// [`super::ADMINISTRATORS_GROUP_NAME`]）に現在のプロセスが属するかを
+    /// 判定する共通実装（T16-2 第二スライスで
+    /// `is_current_process_operator`から切り出し、Administrators 判定
+    /// （[`super::is_current_process_admin`]）と共有できるようにした）。
+    pub(super) fn is_current_process_member_of(group_name: &str) -> Result<bool, OperatorsError> {
+        let mut sid = match lookup_account_sid(group_name)? {
             Some(sid) => sid,
             // グループ未作成 - モジュール doc・関数 doc の「安全側で false」節。
             None => return Ok(false),
@@ -234,6 +292,24 @@ mod tests {
         // P3 で確定した表記そのもの - 表記揺れがあるとインストーラ（slice 2）
         // が作るグループ名と実行時の判定がずれる。
         assert_eq!(OPERATORS_GROUP_NAME, "BantoHub Operators");
+    }
+
+    #[test]
+    fn administrators_group_name_is_the_builtin_english_name() {
+        // T16-2 第二スライス: `LookupAccountNameW`がロケールに関わらず
+        // 解決できる英語表記（モジュール doc「T16-2 第二スライスで追加した
+        // is_current_process_admin」節参照）。
+        assert_eq!(ADMINISTRATORS_GROUP_NAME, "Administrators");
+    }
+
+    /// Administrators は OS 組み込みグループなので常に存在し、
+    /// `is_current_process_admin`は`Err`にならないことを固定する
+    /// （`is_current_process_operator`版と同じ契約）。
+    #[cfg(windows)]
+    #[test]
+    fn admin_membership_check_returns_ok_without_api_error() {
+        let result = is_current_process_admin();
+        assert!(result.is_ok(), "expected Ok(_), got {result:?}");
     }
 
     /// グループ未作成なら`Ok(false)`、作成済みなら`Ok(true|false)`
