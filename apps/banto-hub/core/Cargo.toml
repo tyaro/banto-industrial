@@ -150,5 +150,11 @@ path = "src/bin/banto-hub.rs"
 # 依存にする - Linux 上ではこの依存自体が存在しないので、これを使う
 # コード側は必ず `#[cfg(windows)]` で追加ガードすること
 # （`src/bin/win_service.rs` 参照）。
+#
+# T17-0（docs/banto-hub-t17-design.md §3「T17-0」）でこのパッケージの lib
+# クレート（`src/service_manager.rs`の`WindowsServiceManager`）もこの依存を
+# 使うようになった - このセクションは `[[bin]]`/lib 共通（Cargo.toml は
+# ターゲット別に依存を分けられないため）なので新規セクションは追加せず、
+# ここに1本化してある。
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8.1"
