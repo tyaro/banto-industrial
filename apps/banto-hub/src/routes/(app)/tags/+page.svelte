@@ -342,10 +342,29 @@
 	let createErrors: Record<string, string> = $state({});
 	let creating = $state(false);
 
+	/**
+	 * TAG-P0-2（docs/banto-hub-desktop-plan.md §9.3、2026-08-10 実装メモ）:
+	 * バックエンドの preflight（`preflight_transaction` →
+	 * `build_config_from`/`build_catalog_from`/`computed::build_plan`、
+	 * `apps/banto-hub/core/src/rest.rs::preflight_api_error`）は
+	 * アドレス解析・演算式・DAG 検証の失敗を単票フィールドではなく
+	 * 常に `field: "configuration"` 1本にまとめて返す - `tagFields` は
+	 * 個別フィールドの `errors.xxx` しか描画しないため、このマップに
+	 * `configuration` を素通りさせただけではフォームのどこにも出ず、
+	 * トーストも出ない（`applyFieldErrors` が返せば呼び出し元は
+	 * `toastStore.push` をスキップする）ためサイレント失敗になっていた。
+	 * `tagFields` 側に `errors.configuration` の全体エラー表示を追加した
+	 * うえで、メッセージに「アドレス」を含む場合はアドレス欄の直下にも
+	 * 同じ文言を出す（`errors.address` が未設定のときのみ - 将来
+	 * アドレス欄自体のフィールドエラーが返るようになったら上書きしない）。
+	 */
 	function applyFieldErrors(err: unknown): Record<string, string> | null {
 		if (isProviderError(err) && err.body.kind === 'validation') {
 			const map: Record<string, string> = {};
 			for (const fe of err.body.field_errors) map[fe.field] = fe.message;
+			if (map.configuration && !map.address && map.configuration.includes('アドレス')) {
+				map.address = map.configuration;
+			}
 			return map;
 		}
 		return null;
@@ -983,6 +1002,16 @@
 </script>
 
 {#snippet tagFields(form: FormState, errors: Record<string, string>)}
+	<!--
+		TAG-P0-2（docs/banto-hub-desktop-plan.md §9.3、2026-08-10 実装メモ）:
+		preflight 失敗（field="configuration"）はどの単票フィールドにも
+		属さないフォーム全体エラーのため、個別フィールドの並ぶ form-grid
+		の外（上）に置く。create/edit 両方の form がこの snippet を
+		render するので、ここ1箇所で両方をカバーする。
+	-->
+	{#if errors.configuration}
+		<p class="err" role="alert">{errors.configuration}</p>
+	{/if}
 	<div class="form-grid">
 		<label class="field">
 			名前<span class="required">*</span>
