@@ -18,7 +18,10 @@
 `cursor/t18-1-tags-conflict-diff-e3cb`（本 PR）でフィールド単位の差分表示 UI
 （`tagConflictDiff.ts::diffFormRecords` +「サーバー最新を採用」/
 「自分の内容で再保存」）を実装し、**TAG-UX-C は6点全て実装済み（完了）**。
-TAG-P0-2・TAG-P0-3 は未着手。
+TAG-P0-2 は T14-3 のバックエンド preflight（`preflight_transaction`）+
+本 PR（`cursor/t18-1-tag-p0-2-e3cb`）のフォームでの `configuration` エラー
+表示・実 DOM e2e で受け入れ条件を満たした（closed、詳細は §9.3 TAG-P0-2 の
+実装メモ）。TAG-P0-3 は未着手。
 最終検証日(コード照合): 2026-08-10
 基準コミット: `22c8c02`（main、PR #103 `optNum` 修正マージ後）。T18-1 は本 PR
 （`apps/banto-hub/src/lib/banto/continuousRegistration.ts` の
@@ -635,6 +638,54 @@ UI/UX マイルストーンへ反映し、変更時は新しい決定記録を�
 > 変更モデルに由来）で実装されている。本項はこの「保存 → 非同期 rebuild →
 > 失敗握り潰し」を、全構成 preflight による「保存前検証 → 保存成功＝実行可能を
 > 保証」へ置き換える。詳細と関連文書への注記は §16.2 / §16.5 を参照。
+>
+> **実装メモ（2026-08-10、T14-3 + `cursor/t18-1-tag-p0-2-e3cb`、closed）**:
+> バックエンド側は T14-3 でほぼ完了済みだった -
+> 単票・連続・CSV・運転開始の全経路が同じトランザクション内 preflight
+> （`preflight_transaction` → `build_catalog_from`/`computed::build_plan`/
+> `build_config_from`、`apps/banto-hub/core/src/rest.rs`）を通り、失敗すると
+> DB へのコミット前にロールバックする（422 validation、field は常に
+> `"configuration"` — `preflight_api_error`）。単票 create の同保証は
+> `apps/banto-hub/core/tests/t11_batch_tags.rs::single_invalid_address_rolls_back_the_db_and_configured_revision`
+> で確認済み。残っていたギャップは UI 側のみ:
+>
+> 1. `tags/+page.svelte` の `applyFieldErrors` は preflight 失敗を
+>    `createErrors`/`editErrors` マップへ `configuration` キーで入れていたが、
+>    `tagFields` snippet はどの単票フィールドにも属さない `configuration`
+>    キーを描画しておらず、成功トーストも出ない（`fieldErrors` を返した
+>    呼び出し元は `toastStore.push` をスキップする）ためサイレント失敗に
+>    近かった。`tagFields` の `form-grid` 直上に
+>    `{#if errors.configuration}<p class="err" role="alert">{errors.configuration}</p>{/if}`
+>    を追加し（create/edit 両方の form がこの1つの snippet を render する
+>    ため1箇所で足りる）、加えてメッセージに「アドレス」を含む場合は
+>    `errors.address`（未設定のときのみ）にも同じ文言をコピーしてアドレス
+>    欄の直下にも出すようにした。
+> 2. 実 DOM 受け入れが無かった: `e2e/tests-banto-hub/banto-hub-tags-p0-2-preflight.spec.ts`
+>    を追加し、simulation modbus-tcp 接続配下に SLMP 形式 `D100` を
+>    タグ登録 Drawer から送信して「成功トーストが出ない」「preflight
+>    エラー（role=alert、`アドレス`/`不正` を含む）が画面内に見える」
+>    「DB（`GET /api/tags`）にも一覧グリッドにも残らない」ことを確認する。
+>    回帰として正当な Modbus 参照番号 `40010` での成功も同 spec に含めた。
+>
+> 受け入れ条件4点は全て満たしている:
+>
+> - 「不正な Modbus / SLMP アドレスを登録して『成功』のみを表示しない」:
+>   本 PR の e2e で確認済み（上記）。
+> - 「演算タグの未解決参照・循環も、別画面へ移動せず該当フォームで確認
+>   できる」: `computed::build_plan` の失敗も同じ `preflight_snapshot` →
+>   `preflight_api_error`（field="configuration"）経路を通るため、本 PR で
+>   追加したフォーム表示がそのままカバーする（個別の e2e シナリオは本 PR
+>   のスコープ外 - アドレス検証と同一コード経路のため追加の実装は無い）。
+> - 「検証失敗時に Collector、実行 revision、PLC セッションを変更しない」:
+>   preflight は DB コミット前に実行され失敗時はロールバックするため
+>   （T14-3、`preflight_transaction` が呼ばれるのは `sqlx::Transaction` を
+>   開いた後・commit する前）、そもそも構成が変わらず Collector の
+>   rebuild 自体が起きない。
+> - 「保存済みだが未反映の場合は、解消まで残る状態表示と理由を出す」:
+>   この条件が想定していた状態（保存は成功したが rebuild が失敗し実行に
+>   反映されない中間状態）は、全構成 preflight が「保存成功 = 実行可能」を
+>   保証する設計変更そのものによって発生し得なくなった（状態表示を追加
+>   したのではなく、その状態自体を無くした）。
 
 #### TAG-P0-3: 運転中編集ロックを全経路で強制する
 
