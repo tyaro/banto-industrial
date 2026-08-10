@@ -4,12 +4,14 @@
 状態: **計画確定。T14・T15 完了。T16 詳細設計は [banto-hub-t16-design.md](banto-hub-t16-design.md)（P1〜P3 承認済み）。T16-0（薄いシェル `banto-hub-shell`）・T16-1（トレイ状態表示）マージ済み。T16-2 は T17（サービス管理・profile・mutex）依存のため後回し。2026-08-10: T17 詳細設計 [banto-hub-t17-design.md](banto-hub-t17-design.md) を追加し、同日オーナーが P1〜P6 を承認（設計確定）。同日 T17-0（`ServiceManager` trait / `MockServiceManager` / `WindowsServiceManager`、`apps/banto-hub/core/src/service_manager.rs`）を実装済み（既存 CLI 挙動不変、P4 Demand 化は T17-4）。T16-2 は同書 §4 / P5 の契約を消費する形で着手可（実機確認は後続）。続く `cursor/t17-1-profile-mutex-e3cb` で T17-1（profile path 一本化＋mutex/排他、`apps/banto-hub/core/src/profile_paths.rs`・`profile_lock.rs`）を実装済み（詳細は banto-hub-t17-design.md §8。3ホスト共通の絶対パス解決＋`HubRuntime::start`冒頭の profile 排他 - Windows は named mutex、非 Windows は flock 自体を排他の実体にする）。続く `cursor/t17-3-switch-txn-e3cb` で T17-3（Desktop↔Service 切替トランザクション、`apps/banto-hub/core/src/hub_health.rs`・`host_switch.rs`）を実装済み（詳細は banto-hub-t17-design.md §9。設計 §4 の `HubHealthProbe` を実装し、切替の各段階と失敗到達を `host_switch::HostSwitchEngine`/`SwitchPhase`/`FaultStage` で型として固定、T17-2 の Operators 権限確認は `can_operate_service: bool` のスタブで受け取る）。**2026-08-10: T17-1 Windows 実機検証済み**（[banto-hub-t17-design.md](banto-hub-t17-design.md) §8 — Session 0 サービス install/起動、profile mutex 二重起動拒否、SLMP `192.168.11.200:5200` で banto-hub 収集1本・PLC TCP 1本確認。`crates/banto-broker/examples/real_plc_verify.rs` を main 移植、`625401c`）。cross-session 時の mutex 診断（`Io` vs `AlreadyHeld`）改善は [improvement-plan.md](improvement-plan.md) §6 バックログ。**2026-08-10: T17-2 スライス1〜2実装済み**（`service_operators` /
 `service_elevated` / `service_install` / `banto-hub-elev.exe`、詳細は
 [banto-hub-t17-design.md](banto-hub-t17-design.md) §10。Operators 委任の
-実機受け入れ・T16-2 配線は未了）。**2026-08-10: T17-4（P4「Demand 化」）
+実機受け入れの一部（Operators 作成・ACL・setup-operators 冪等）と
+T16-2 配線は未了。詳細は同 §10）。**2026-08-10: T17-4（P4「Demand 化」）
 実装済み**（`service_install.rs::install` の既定起動種別を `AutoStart`
 +遅延自動開始から `OnDemand`（手動）へ変更、上書きインストール時は
 既存サービスへ触れず早期リターンして既存の起動種別を保持、詳細は
-[banto-hub-t17-design.md](banto-hub-t17-design.md) §11。Windows 実機での
-`sc.exe qc BantoHub` 確認は未実施）。進行中: T18-1（TAG-UX-C・TAG-P0-2 完了、TAG-P0-3 未着手）／**T16-2（実 HTTP probe / 実切替は実機待ち）**、T17-4 の Windows 実機検証（§11 チェックリスト）。§16.4 の `optNum` null 取りこぼしと §9 TAG-P0-1 本体（連続登録 `count.trim()` クラッシュ）はロジック側を修正済み。**2026-08-09（本 PR）: §16.3「banto-hub の Playwright/DOM テスト基盤を T18-1 へ前倒し」を実施し、`e2e/banto-hub.playwright.config.ts`（`pnpm e2e:banto-hub`）を新設。TAG-P0-1 の残受け入れ条件（実 DOM からの点数変更テスト）を `e2e/tests-banto-hub/banto-hub-tags-continuous.spec.ts` で満たし、DOM/E2E 側も含めて TAG-P0-1 は受け入れ条件を全て満たした（closed）。** 2026-08-09（本 PR、
+[banto-hub-t17-design.md](banto-hub-t17-design.md) §11。**同日実機で
+`DEMAND_START` / 再 install 保持 / AutoStart 巻き戻し防止を確認**。OS
+再起動確認と Start-Service 後の収集開始は未実施）。進行中: T18-1（TAG-UX-C・TAG-P0-2 完了、TAG-P0-3 未着手）／**T16-2（実 HTTP probe / 実切替は実機待ち）**。§16.4 の `optNum` null 取りこぼしと §9 TAG-P0-1 本体（連続登録 `count.trim()` クラッシュ）はロジック側を修正済み。**2026-08-09（本 PR）: §16.3「banto-hub の Playwright/DOM テスト基盤を T18-1 へ前倒し」を実施し、`e2e/banto-hub.playwright.config.ts`（`pnpm e2e:banto-hub`）を新設。TAG-P0-1 の残受け入れ条件（実 DOM からの点数変更テスト）を `e2e/tests-banto-hub/banto-hub-tags-continuous.spec.ts` で満たし、DOM/E2E 側も含めて TAG-P0-1 は受け入れ条件を全て満たした（closed）。** 2026-08-09（本 PR、
 `cursor/t18-1-form-dirty-e3cb`）: §9.4 TAG-UX-C のうち dirty 追跡と破棄確認
 を実装（詳細は §9.4 TAG-UX-C の実装メモ）。続く `cursor/t18-1-drawer-busy-e3cb`
 で同 §9.4 の「保存、削除、検証、登録、閉じるを Drawer 単位の busy 状態で
