@@ -22,7 +22,7 @@
 //!
 //! ```text
 //! setup:
-//!   HubRuntime::start(build_hub_config()) -> RunningHub  // 収集は Stopped のまま
+//!   HubRuntime::start(build_hub_config_from_env(HubHostKind::Shell)) -> RunningHub  // 収集は Stopped のまま
 //!   成功: メインウィンドウを Hub の localhost URL へ navigate
 //!   失敗: プレースホルダ (ui/index.html) にエラーを表示、終了操作のみ提供
 //!   トレイ: 状態ラベル・「画面を開く」・(収集中のみ)「収集を停止」・「アプリを終了」
@@ -64,7 +64,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use banto_hub_core::controller::{CollectionController, RuntimeStatus};
-use banto_hub_core::runtime::{HubConfig, HubRuntime, RunningHub, DEFAULT_DB_PATH};
+use banto_hub_core::profile_lock::HubHostKind;
+use banto_hub_core::profile_paths::build_hub_config_from_env;
+use banto_hub_core::runtime::{HubRuntime, RunningHub};
 use tauri::menu::{Menu, MenuBuilder, MenuItemBuilder};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, WebviewWindow, WindowEvent, Wry};
@@ -97,30 +99,6 @@ struct AppState {
     /// 非同期処理するので、ここは同期ロックで足りる）で揃えたいため。
     /// 起動に失敗した場合は`None`のまま。
     controller: StdMutex<Option<Arc<CollectionController>>>,
-}
-
-/// 環境変数から [`HubConfig`] を組み立てる。
-///
-/// `apps/banto-hub/core/src/bin/banto-hub.rs::build_hub_config` と読み取り
-/// ロジック（既定値・レイヤー順）を1バイトも変えずに複製したもの -
-/// コンソール/Windows サービスに続く3つめのホストとして、同じ環境変数
-/// （`BANTO_DB`/`BANTO_ALLOW_SETUP`/`PORT`/`BANTO_BIND`/`BANTO_HUB_DATA`）を
-/// そのまま使えるようにする（設計 §4.1「HubConfig はコンソールと同様に env
-/// から構築してよい」）。
-fn build_hub_config() -> HubConfig {
-    HubConfig {
-        db_path: std::env::var("BANTO_DB").unwrap_or_else(|_| DEFAULT_DB_PATH.to_string()),
-        allow_setup: std::env::var("BANTO_ALLOW_SETUP")
-            .map(|value| value == "1")
-            .unwrap_or(false),
-        port_override: std::env::var("PORT")
-            .ok()
-            .and_then(|value| value.parse().ok()),
-        bind_override: std::env::var("BANTO_BIND").ok(),
-        data_dir_override: std::env::var("BANTO_HUB_DATA")
-            .ok()
-            .map(std::path::PathBuf::from),
-    }
 }
 
 /// JS 文字列リテラルへの最小エスケープ。[`show_startup_error`] が
@@ -429,7 +407,9 @@ pub fn run() {
             // （250ms 評価ループ・保持期間剪定・収集タスク等）はこの
             // block_on と同じランタイム上で並行に走り続ける。
             let mut initial_status: Option<RuntimeStatus> = None;
-            match tauri::async_runtime::block_on(HubRuntime::start(build_hub_config())) {
+            match tauri::async_runtime::block_on(HubRuntime::start(build_hub_config_from_env(
+                HubHostKind::Shell,
+            ))) {
                 Ok(hub) => {
                     // 収集は Stopped のまま（HubRuntime 既存挙動 - T14-3の
                     // 「起動時は catalog の commit のみ」）。T16-1 では
@@ -502,17 +482,19 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use banto_hub_core::profile_paths::resolve_profile_paths_from_env;
 
-    /// [`build_hub_config`] は `HubRuntime::start` 自体の start→shutdown
-    /// ラウンドトリップ（collection が Stopped のまま起動することを含む）
-    /// を一切変えない - それは
+    /// [`build_hub_config_from_env`] は3ホスト共通の関数（T17-1、
+    /// `apps/banto-hub/core/src/profile_paths.rs`）を呼ぶだけになった -
+    /// このシェル crate 固有の複製ロジックは無い。`HubRuntime::start`
+    /// 自体の start→shutdown ラウンドトリップ（collection が Stopped の
+    /// まま起動することを含む）は
     /// `apps/banto-hub/core/src/runtime.rs::tests::start_local_addr_then_shutdown_round_trip`
     /// が既にカバーしている（このシェル crate は Tauri アプリの外形からは
-    /// 単体テストできないため - 実装指示「Tauri なしのロジックを分離できれば
-    /// core 側既存テストでも可」）。ここではこの crate 固有のロジックだけを
-    /// 検証する: `apps/banto-hub/core/src/bin/banto-hub.rs::build_hub_config`
-    /// と同じ読み取りロジック（キーごとに「未設定なら既定値」「設定されて
-    /// いれば env の値を反映」）になっていること。
+    /// 単体テストできないため）。ここでは`HubHostKind::Shell`を渡した結果が
+    /// 共通関数の読み取りロジック（キーごとに「未設定なら profile 既定値」
+    /// 「設定されていれば env の値を反映」）どおりになっていることだけを
+    /// 確認する。
     ///
     /// 2026-08-09 レビュー指摘で修正: 以前は「5キーとも未設定である」ことを
     /// 前提にしていたため、CI や開発者環境で `BANTO_DB` 等がたまたま
@@ -520,14 +502,20 @@ mod tests {
     /// 環境変数の有無を読み、その分岐に応じたアサーションを行う - どの
     /// 実行環境でも決定的に成功する。`std::env::set_var`/`remove_var` に
     /// よるテスト内での書き換えは、並列実行される他テストのプロセス全体の
-    /// 環境を巻き込む副作用があるため使わない。
+    /// 環境を巻き込む副作用があるため使わない（T17-1 でも同じ方針を維持 -
+    /// `resolve_profile_paths_from_env()`を「期待値」として直接呼ぶことで、
+    /// env を書き換えずに profile 既定パスとの一致を確認できる）。
     #[test]
-    fn build_hub_config_reflects_or_defaults_each_env_var() {
-        let config = build_hub_config();
+    fn build_hub_config_from_env_reflects_or_defaults_each_key() {
+        let config = build_hub_config_from_env(HubHostKind::Shell);
+        let expected_paths = resolve_profile_paths_from_env();
 
         match std::env::var("BANTO_DB") {
             Ok(value) => assert_eq!(config.db_path, value),
-            Err(_) => assert_eq!(config.db_path, DEFAULT_DB_PATH),
+            Err(_) => assert_eq!(
+                config.db_path,
+                expected_paths.db_path.to_string_lossy().into_owned()
+            ),
         }
 
         match std::env::var("BANTO_ALLOW_SETUP") {
@@ -548,6 +536,8 @@ mod tests {
             Err(_) => assert_eq!(config.bind_override, None),
         }
 
+        // T17-1（P1）: `BANTO_HUB_DATA`未設定時も、旧既定`None`ではなく
+        // profile の`data_dir`（絶対パス）で必ず`Some`になる。
         match std::env::var("BANTO_HUB_DATA") {
             Ok(value) => {
                 assert_eq!(
@@ -555,8 +545,15 @@ mod tests {
                     Some(std::path::PathBuf::from(value))
                 )
             }
-            Err(_) => assert_eq!(config.data_dir_override, None),
+            Err(_) => assert_eq!(
+                config.data_dir_override,
+                Some(expected_paths.data_dir.clone())
+            ),
         }
+
+        assert_eq!(config.profile_id, expected_paths.profile_id);
+        assert_eq!(config.host_kind, HubHostKind::Shell);
+        assert!(!config.skip_profile_lock);
     }
 
     /// [`js_string_literal`] は [`show_startup_error`] が

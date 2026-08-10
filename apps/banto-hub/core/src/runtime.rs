@@ -43,6 +43,25 @@
 //! 勝つ）が必要なため、この重ね合わせ自体は（settings を読む都合上）
 //! 引き続きこの中で行う（[`HubRuntime::start`]参照）。
 //!
+//! ## T17-1 での唯一の例外（docs/banto-hub-t17-design.md §3「T17-1」・P2）
+//!
+//! 上記の「このモジュール自身は環境変数を一切読まない」原則に対し、
+//! [`HubRuntime::start`]は profile 排他（[`crate::profile_lock`]）の
+//! ためだけに`BANTO_HUB_ROOT`/`ProgramData`/`XDG_DATA_HOME`/`HOME`を読む -
+//! [`HubConfig`]の`db_path`/`data_dir_override`は`BANTO_DB`/
+//! `BANTO_HUB_DATA`で任意の場所へ上書きできてしまう（ホストが渡した値を
+//! そのまま使う既存契約）ため、そこから逆算した場所に profile ロックを
+//! 置くと「排他の対象にしている場所」と「実際にホストが読み書きする
+//! DB/data」が食い違い得る。profile 排他は「同じ machine の同じ
+//! `<profile-id>`を同時に2プロセスが運転しない」という安全機構
+//! （desktop-plan §13 の最重要リスク）そのものなので、`db_path`/
+//! `data_dir_override`の個別上書きとは独立に、常に
+//! `crate::profile_paths::resolve_hub_root`が返す**同じ**正準ディレクトリを
+//! 参照する必要がある - そのため、この1箇所だけ例外的に env を直接読む
+//! （`crate::profile_paths::build_hub_config_from_env`が読む env と同じ
+//! 変数・同じ優先順位関数を再利用するので、同一プロセス内で両者が食い違う
+//! ことはない）。
+//!
 //! ## 起動シーケンス
 //!
 //! init_db → 各サービス構築 → `HubSessions` 構築（T2-2、設計 §6-5。
@@ -129,6 +148,10 @@ use crate::grpc::{GrpcServer, GrpcService};
 use crate::hub::CollectorManager;
 use crate::hub_log::{log_err_line, log_line};
 use crate::mqtt::MqttPublisher;
+use crate::profile_lock::{
+    try_acquire_profile_lock, HubHostKind, ProfileLockError, ProfileLockGuard,
+};
+use crate::profile_paths::{resolve_hub_root, resolve_profile_paths};
 use crate::rest::{api_router_with_controller, audited_credential_verifier};
 use crate::settings::SettingsService;
 use crate::subscribe_core::EVAL_TICK_MS;
@@ -166,6 +189,26 @@ pub struct HubConfig {
     pub bind_override: Option<String>,
     /// settings の `data.dir`を上書きする値。旧 `BANTO_HUB_DATA` env。
     pub data_dir_override: Option<PathBuf>,
+    /// T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P1）: この起動が
+    /// 使う profile id（`crate::profile_paths::DEFAULT_PROFILE_ID`が既定）。
+    /// `skip_profile_lock`が`false`の場合、`start`冒頭でこの id と
+    /// （env から再解決した）root から profile ディレクトリを組み立てて
+    /// 排他を取る（このモジュール doc「T17-1 での唯一の例外」節・
+    /// [`HubRuntime::start`]参照 - `db_path`/`data_dir_override`は
+    /// `BANTO_DB`/`BANTO_HUB_DATA`で任意の場所へ上書きできるため、そこから
+    /// 逆算せず独立に持つ）。
+    pub profile_id: String,
+    /// T17-1（同§3・P2）: この起動を行っているホストの種別
+    /// （`crate::profile_lock::ProfileOwnerInfo`の診断情報に書く）。
+    pub host_kind: HubHostKind,
+    /// テスト専用: `true`なら[`HubRuntime::start`]は profile 排他を一切
+    /// 取らない。既存の unit/integration テストは同じプロセス内で複数の
+    /// `HubRuntime`を起動することがあり（並行実行される他テストとの
+    /// profile 衝突を避ける意図はそもそも無かった - 各テストが自前の一時
+    /// DB/data_dir を使うだけで足りていた）、それらを`false`のままにすると
+    /// 意味のない profile ロック競合が発生するため既定で`true`にして
+    /// 呼び出す。
+    pub skip_profile_lock: bool,
 }
 
 /// [`HubRuntime::start`]の失敗モード。旧 `hub_run::run`は同じ4箇所を
@@ -191,6 +234,14 @@ pub enum HubStartError {
     /// `banto_server::start`失敗（旧: `"server should start"`で `expect`）。
     #[error("banto-hub: サーバーの起動に失敗しました: {0}")]
     ServerStart(BantoError),
+    /// T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P2）:
+    /// `crate::profile_lock::try_acquire_profile_lock`失敗（既に別プロセスが
+    /// この profile を保持している、または profile ディレクトリ・lock
+    /// ファイルの I/O エラー）。DB init より前に検出するため、この4つの中で
+    /// 唯一 DB を一切開かずに返る失敗モード - 安全側で起動そのものを拒否
+    /// する（設計 §1 P2「失敗時は安全側で起動拒否」）。
+    #[error(transparent)]
+    ProfileLock(#[from] ProfileLockError),
 }
 
 /// 起動〜シャットダウンの共通シーケンス本体（このモジュール doc 参照）への
@@ -211,7 +262,31 @@ impl HubRuntime {
             port_override,
             bind_override,
             data_dir_override,
+            profile_id,
+            host_kind,
+            skip_profile_lock,
         } = config;
+
+        // T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P2）: DB init を
+        // 含む一切のリソース確保より前に profile 排他を取る - 失敗した場合
+        // DB を一度も開かずに即座に安全側で起動を拒否する（設計 §1 P2）。
+        // このモジュール doc「T17-1 での唯一の例外」節参照: ここだけ env を
+        // 直接読む。
+        let profile_lock: Option<ProfileLockGuard> = if skip_profile_lock {
+            None
+        } else {
+            let root = resolve_hub_root(
+                std::env::var("BANTO_HUB_ROOT").ok().as_deref(),
+                std::env::var("ProgramData").ok().as_deref(),
+                std::env::var("XDG_DATA_HOME").ok().as_deref(),
+                std::env::var("HOME").ok().as_deref(),
+            );
+            let guard = resolve_profile_paths(&root, &profile_id)
+                .map_err(ProfileLockError::from)
+                .and_then(|paths| try_acquire_profile_lock(&paths, host_kind))
+                .map_err(HubStartError::ProfileLock)?;
+            Some(guard)
+        };
 
         let pool = init_db(&db_path).await.map_err(HubStartError::InitDb)?;
 
@@ -521,6 +596,7 @@ impl HubRuntime {
             server,
             eval_handle,
             prune_handle,
+            _profile_lock: profile_lock,
         })
     }
 }
@@ -543,6 +619,13 @@ pub struct RunningHub {
     eval_handle: JoinHandle<()>,
     /// tstore 剪定24hループの `JoinHandle`（同上）。
     prune_handle: JoinHandle<()>,
+    /// T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P2）: 保持するだけの
+    /// フィールド - `RunningHub`（延いては[`RunningHub::shutdown`]消費後の
+    /// `self`）が drop される時点で`ProfileLockGuard`自身の`Drop`が
+    /// Windows mutex handle の`CloseHandle`／非 Windows lock file の fd
+    /// close（`flock`自動解放）を行う。`skip_profile_lock: true`で構築した
+    /// 場合は`None`。
+    _profile_lock: Option<ProfileLockGuard>,
 }
 
 impl RunningHub {
@@ -704,6 +787,15 @@ mod tests {
             port_override: Some(0),
             bind_override: Some("127.0.0.1".to_string()),
             data_dir_override: Some(data_dir),
+            profile_id: "test".to_string(),
+            host_kind: HubHostKind::Console,
+            // T17-1: このテストは既存の start->shutdown ラウンドトリップ
+            // だけを検証する - profile 排他自体は下の
+            // `start_fails_with_profile_lock_when_another_guard_already_holds_it`
+            // が別途検証するので、ここでは無関係な profile ロック競合を
+            // 避けるため skip する（このモジュール doc の`skip_profile_lock`
+            // フィールド doc comment参照）。
+            skip_profile_lock: true,
         };
 
         let hub = HubRuntime::start(config)
@@ -715,5 +807,54 @@ mod tests {
         assert_ne!(addr.port(), 0, "the OS should have assigned a real port");
 
         hub.shutdown().await;
+    }
+
+    /// T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P2）: `skip_profile_lock:
+    /// false`で、対象 profile を既に別のガードが保持している場合、
+    /// `HubRuntime::start`は DB を一度も開かずに`HubStartError::ProfileLock`
+    /// で失敗する（設計 §1 P2「失敗時は安全側で起動拒否」）。
+    ///
+    /// `BANTO_HUB_ROOT`を一時ディレクトリへ向けて`start`内部の root 解決
+    /// （このモジュール doc「T17-1 での唯一の例外」節）を決定的にする -
+    /// このプロセス内で`BANTO_HUB_ROOT`を読むのはこのテストだけなので、
+    /// 他テストとの並行実行による競合は起きない。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_fails_with_profile_lock_when_another_guard_already_holds_it() {
+        let dir = crate::test_support::TempDir::new("hub-runtime-profile-lock");
+        let root = dir.path().join("root");
+        let profile_id = "locked-profile";
+
+        let paths = resolve_profile_paths(&root, profile_id).expect("valid profile id");
+        let _existing_lock = try_acquire_profile_lock(&paths, HubHostKind::Console)
+            .expect("first acquire should succeed");
+
+        let db_path = dir
+            .path()
+            .join("registry.sqlite3")
+            .to_string_lossy()
+            .into_owned();
+        let config = HubConfig {
+            db_path,
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_string()),
+            data_dir_override: Some(dir.path().join("data")),
+            profile_id: profile_id.to_string(),
+            host_kind: HubHostKind::Service,
+            skip_profile_lock: false,
+        };
+
+        std::env::set_var("BANTO_HUB_ROOT", root.to_string_lossy().as_ref());
+        let result = HubRuntime::start(config).await;
+        std::env::remove_var("BANTO_HUB_ROOT");
+
+        match result {
+            Err(HubStartError::ProfileLock(_)) => {}
+            Err(other) => panic!("expected ProfileLock error, got: {other}"),
+            Ok(hub) => {
+                hub.shutdown().await;
+                panic!("expected HubRuntime::start to fail while the profile lock is held");
+            }
+        }
     }
 }

@@ -158,3 +158,24 @@ path = "src/bin/banto-hub.rs"
 # ここに1本化してある。
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8.1"
+# T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P2）: `profile_lock.rs`が
+# `Global\BantoHub.<profile-id>`named mutex（`CreateMutexW`/`CloseHandle`/
+# `GetLastError`/`ERROR_ALREADY_EXISTS`）で Desktop/Service 間の排他を取る。
+# `CreateMutexW`系 API は`Win32_Security`feature を要求する
+# （`SECURITY_ATTRIBUTES`引数の型のため - null を渡すだけで実際には使わない）。
+# 既に`[target.'cfg(windows)'.dev-dependencies]`が同じ 0.61 系を使っている
+# （tests/soak.rs）ので新規バージョン系列は増えない。
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(not(windows))'.dependencies]
+# T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P2 (c)）: 非 Windows には
+# `Global\`名前空間の mutex が無いため、`profile_lock.rs`は
+# `flock(2)`（`LOCK_EX|LOCK_NB`）自体を排他の実体として使う - Linux CI で
+# 二重取得失敗を検証できるようにするため。`libc`はこのワークスペースの
+# 依存木に既に transitively 存在する（`Cargo.lock`参照、tokio 等経由）ため
+# 新規ノードは増えない。MIT/Apache-2.0 デュアルライセンス。
+libc = "0.2"

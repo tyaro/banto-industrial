@@ -58,27 +58,36 @@ pub fn enable_service_log_file(path: &Path) -> std::io::Result<()> {
 }
 
 /// サービスログファイルを格納するディレクトリの解決 - `BANTO_HUB_DATA`
-/// 環境変数（未設定なら既定 `"./data"`）のみを見る、**あえて**簡略化した
-/// 解決規則。
+/// 環境変数を見る、**あえて**簡略化した解決規則。
+///
+/// T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P1）で既定値を変更した:
+/// 旧既定は素の相対パス `"./data"` だったが、`profile_logs_dir`
+/// （`crate::profile_paths::ProfilePaths::logs_dir` - profile 一本化後の
+/// 絶対パス）を既定にした。`BANTO_HUB_DATA`が設定されていれば従来どおり
+/// その配下を優先する（挙動不変・後方互換）。
 ///
 /// `crate::runtime`側の実際の `data_dir` は「環境変数 → 設定 DB の
 /// `data.dir` → 既定値」の3層だが、設定 DB を読むには非同期の DB
 /// 接続が要る - このファイルはサービスモードで `HubRuntime::start` が最初の
 /// 1行を出力する**前**にログファイルを開き終えている必要があるため、
-/// DB を読まずに済む env 変数だけの層で解決する。両者は env 変数を
-/// 設定していれば必ず一致し、設定 DB だけで `data.dir` をカスタマイズ
-/// している運用でのみ食い違う（その場合ログファイルは既定
-/// `"./data"` 配下に残る - docs/banto-hub-operations.md に明記）。
-pub fn resolve_service_log_dir() -> PathBuf {
-    resolve_service_log_dir_from(std::env::var("BANTO_HUB_DATA").ok())
+/// DB を読まずに済む env 変数 + 呼び出し側が渡す profile paths だけの層で
+/// 解決する。両者は `BANTO_HUB_DATA`を設定していれば必ず一致し、設定 DB
+/// だけで `data.dir` をカスタマイズしている運用でのみ食い違う（その場合
+/// ログファイルは profile の`logs_dir`配下に残る -
+/// docs/banto-hub-operations.md に明記）。
+pub fn resolve_service_log_dir(profile_logs_dir: &Path) -> PathBuf {
+    resolve_service_log_dir_from(std::env::var("BANTO_HUB_DATA").ok(), profile_logs_dir)
 }
 
 /// [`resolve_service_log_dir`]の純粋な内側 - 実際の env var 読み取りを外に
 /// 追い出してあるので、`std::env::set_var`（テスト間で共有されるプロセス
 /// グローバル状態 - 並行実行される他のテストとの競合を避けたい）に一切
 /// 触れずにユニットテストできる。
-fn resolve_service_log_dir_from(env_value: Option<String>) -> PathBuf {
-    PathBuf::from(env_value.unwrap_or_else(|| "./data".to_string()))
+fn resolve_service_log_dir_from(env_value: Option<String>, profile_logs_dir: &Path) -> PathBuf {
+    match env_value {
+        Some(value) => PathBuf::from(value),
+        None => profile_logs_dir.to_path_buf(),
+    }
 }
 
 fn mirror_to_service_log(line: &str) {
@@ -158,14 +167,22 @@ mod tests {
     }
 
     #[test]
-    fn resolve_service_log_dir_defaults_to_data_when_env_unset() {
-        assert_eq!(resolve_service_log_dir_from(None), PathBuf::from("./data"));
+    fn resolve_service_log_dir_defaults_to_profile_logs_dir_when_env_unset() {
+        let profile_logs_dir = PathBuf::from("/root/profiles/default/logs");
+        assert_eq!(
+            resolve_service_log_dir_from(None, &profile_logs_dir),
+            profile_logs_dir
+        );
     }
 
     #[test]
     fn resolve_service_log_dir_honors_env_override() {
+        let profile_logs_dir = PathBuf::from("/root/profiles/default/logs");
         assert_eq!(
-            resolve_service_log_dir_from(Some("/var/banto-hub/data".to_string())),
+            resolve_service_log_dir_from(
+                Some("/var/banto-hub/data".to_string()),
+                &profile_logs_dir
+            ),
             PathBuf::from("/var/banto-hub/data")
         );
     }

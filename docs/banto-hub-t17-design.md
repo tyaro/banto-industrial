@@ -3,12 +3,14 @@
 作成日: 2026-08-10
 状態: **設計確定。主要判断 P1〜P6 は 2026-08-10 オーナー承認済み。
 T17-0（SCM 状態取得＋start/stop/restart/autostart API 抽出、
-`apps/banto-hub/core/src/service_manager.rs`）は同日実装済み（§7）。**
+`apps/banto-hub/core/src/service_manager.rs`）は同日実装済み（§7）。
+T17-1（profile path 一本化＋mutex/排他、`profile_paths.rs`/
+`profile_lock.rs`）も同日実装済み（§8）。**
 T16-0（薄いシェル）・T16-1（トレイ状態表示）はマージ済みで本書の前提。
 T16-2（サービス検出・native fallback）は本書 §4 の引き渡し契約（P5）に
 従い、T17-0 が提供する API を消費する形で着手する。
 最終検証日(コード照合): 2026-08-10
-基準コミット: `42d94c6`（main、T17 P1〜P6 承認記録 #115 マージ後）。
+基準コミット: `84f2a3f`（main、T17-0 マージ後 #116）。
 
 関連: [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)
 （§8 シェル/サービス管理、§10 T16・T17、§11 データプロファイルと移行、
@@ -270,3 +272,108 @@ T17-0（§3「T17-0」・§4「T16-2 への引き渡し契約」）のロジッ�
   - `Paused`系遷移や実 UAC 権限不足時の検知は Windows 実機確認待ち
     （§5 と同様）。実 SCM 呼び出しの正しさは T16-2/T17-4 着手時の実機確認へ
     持ち越し。
+
+## 8. 実装メモ（2026-08-10、T17-1）
+
+T17-1（§3「T17-1」・P1「profile path 一本化」・P2「mutex/排他」、P1・P2 は
+2026-08-10 オーナー承認済み・§6）を新設2モジュール
+`apps/banto-hub/core/src/profile_paths.rs`・`profile_lock.rs`に実装した。
+SCM 経由の状態確認（T17-0、§7）はこのスライスでは呼んでいない（§3
+「T17-1」のスコープ注記どおり）。
+
+- **`profile_paths.rs`（P1）**: 3ホスト（console `bin/banto-hub.rs`/
+  service `win_service.rs`/shell `apps/banto-hub/src-tauri`）が個別に
+  複製していた相対パス既定（`DEFAULT_DB_PATH = "./banto-hub.sqlite3"`・
+  `data_dir`既定`"./data"`・`hub_log::resolve_service_log_dir`既定
+  `"./data"`）を、desktop-plan §11 の layout
+  （`{root}/profiles/<profile-id>/{config,data,logs}`）へ一本化した。
+  - `resolve_hub_root`: `BANTO_HUB_ROOT`（空文字列は無視）が全 OS 共通で
+    最優先。以降は Windows なら`%ProgramData%\BantoHub`（既定
+    `C:\ProgramData`）、非 Windows なら`XDG_DATA_HOME/BantoHub`→
+    `$HOME/.local/share/BantoHub`→`/var/lib/BantoHub`の順。実際の
+    `cfg!(windows)`判定を`resolve_hub_root_impl(is_windows, ...)`という
+    純関数として外に出し、非 Windows CI ランナーでも Windows 側の分岐
+    （パス文字列組み立てロジック自体）を含めて両方テストできる（§3
+    「パス解決の純関数部分は CI 可」）。
+  - `validate_profile_id`: 空文字列・パス区切り（`/`・`\`）・`.`/`..`を
+    拒否する。`build_hub_config_from_env`は不正な`BANTO_HUB_PROFILE`を
+    stderr へ警告してから既定 profile（`"default"`）へフォールバックする
+    - この関数自体が`Result`を返さない（3ホストが直接呼ぶ薄い組み立て
+      関数のため）ので、「どの env でも起動を拒否しない」設計にした。
+  - `build_hub_config_from_env(host_kind: HubHostKind) -> HubConfig`:
+    3ホスト共通の`HubConfig`組み立て関数として新設 - 各ホストの
+    `build_hub_config`（従来は3ホストがそれぞれ個別定義）はこれを呼ぶ
+    だけの薄いラッパになった。`BANTO_DB`/`BANTO_HUB_DATA`が未設定時の
+    既定値は、旧「相対パス文字列」から「profile の絶対パス」へ変わった
+    （`crate::runtime::DEFAULT_DB_PATH`自体は後方互換のため残したが、
+    この関数はもう使わない）。`BANTO_ALLOW_SETUP`/`PORT`/`BANTO_BIND`の
+    読み取り自体は変えていない。
+  - `hub_log::resolve_service_log_dir`: 引数に`profile_logs_dir`
+    （`ProfilePaths::logs_dir`）を追加し、`BANTO_HUB_DATA`未設定時の既定を
+    profile の`logs_dir`にした（`BANTO_HUB_DATA`設定時は従来どおりその
+    配下を優先 - 挙動不変・後方互換）。
+- **`profile_lock.rs`（P2）**: `HubRuntime::start`冒頭（DB init より前）で
+  profile 排他を取る - 失敗時は DB を一度も開かずに安全側で起動を拒否する
+  （§1 P2「失敗時は安全側で起動拒否」、`HubStartError::ProfileLock`）。
+  - Windows: `Global\BantoHub.<profile-id>`（`profile_paths::mutex_name`、
+    desktop-plan §16.2 の命名決定どおり）を`CreateMutexW`で取得し、
+    `GetLastError() == ERROR_ALREADY_EXISTS`で既存所有を検知する
+    （`windows-sys 0.61`、`Cargo.toml`の
+    `[target.'cfg(windows)'.dependencies]`に追加 - 既存の
+    `dev-dependencies`と同じバージョン系列なので新規ノードは増えない）。
+  - 非 Windows: `Global\`名前空間の mutex が無いため、profile ディレクトリ
+    直下の`profile.lock`への`flock(LOCK_EX|LOCK_NB)`**自体**を排他の実体
+    にした（`libc`クレート追加、
+    `[target.'cfg(not(windows))'.dependencies]`）。同一プロセス内で
+    同じ profile を2重に`try_acquire_profile_lock`すると2回目が確実に
+    失敗することを Linux CI で検証できる
+    （`profile_lock::tests::second_acquire_on_the_same_profile_fails`）。
+  - 全 OS 共通: 取得成功後、`profile.lock`へ所有者 PID・ホスト種別
+    （`HubHostKind::{Console,Service,Shell}`）・取得時刻（UNIX ms）を
+    JSON（`ProfileOwnerInfo`）で書く - ロックの正当性そのものはこの内容が
+    持つのではなく（Windows は mutex、非 Windows は flock が持つ）、
+    fallback UI（T16-2）の「所有者不明」等の診断情報源として使う想定
+    （`ProfileLockGuard::lock_file_path`で参照可能にした）。
+  - `HubConfig`に`profile_id`・`host_kind: HubHostKind`・
+    `skip_profile_lock: bool`を追加した。既存の unit/integration テストは
+    同一プロセス内で複数の`HubRuntime`を並行起動することがあり（各テストが
+    自前の一時 DB/data_dir を使うだけで profile 衝突を避ける意図はそもそも
+    無かった）、それらは`skip_profile_lock: true`で構築するよう更新した -
+    新規に profile ロック競合で失敗するテストは無い。
+  - `HubRuntime::start`は「このモジュール自身は環境変数を一切読まない」
+    という T14-1 以来の原則に対する唯一の例外として、profile 排他のためだけ
+    に`BANTO_HUB_ROOT`/`ProgramData`/`XDG_DATA_HOME`/`HOME`を直接読む
+    （`runtime.rs`のモジュール doc「T17-1 での唯一の例外」節参照） -
+    `db_path`/`data_dir_override`は`BANTO_DB`/`BANTO_HUB_DATA`で任意の
+    場所へ上書きできるため、そこから逆算せず`profile_paths`が読む同じ
+    env・同じ優先順位関数で独立に root を再解決する。
+- **3ホストの配線**: `bin/banto-hub.rs`・`win_service.rs`・
+  `apps/banto-hub/src-tauri/src/lib.rs`はいずれもローカル複製の
+  `build_hub_config`を削除し、`profile_paths::build_hub_config_from_env`
+  （それぞれ`HubHostKind::Console`/`Service`/`Shell`を渡す）を呼ぶだけに
+  なった。`win_service.rs`は`HubRuntime::start`より前にログファイルを
+  開く必要があるため、`resolve_profile_paths_from_env().logs_dir`を先に
+  解決してから`hub_log::resolve_service_log_dir`へ渡す（同じ env を
+  `build_hub_config_from_env`と2回読むが、同一プロセス内なので両者が
+  食い違うことはない）。
+- **旧`./banto-hub.sqlite3`/`./data`からの自動移行は行っていない**
+  （desktop-plan §11「黙って移動しない」、本スライスのスコープ外）。
+- **テスト**: `profile_paths`・`profile_lock`の単体テスト（root 解決の
+  全分岐・profile id 検証・mutex 名組み立て・同一 profile の2重取得失敗・
+  異なる profile 間の非干渉・guard drop 後の再取得）に加え、
+  `HubRuntime::start`が実際に`skip_profile_lock: false`で lock 競合時に
+  `HubStartError::ProfileLock`を返すことを検証する統合的なテスト
+  （`runtime::tests::start_fails_with_profile_lock_when_another_guard_already_holds_it`）
+  を追加した。`cargo test -p banto-hub-core`（lib + 全 integration
+  テスト、250+10+その他計約300件）・`cargo test -p banto-hub-shell`が
+  Linux 上で green。`cargo clippy --all-targets -- -D warnings`は
+  非 Windows・`x86_64-pc-windows-gnu`ターゲットの両方で警告0件
+  （Windows 側`profile_lock::acquire_windows`の`unsafe`FFI 呼び出し
+  経路も`cfg(windows)`ビルドとしてコンパイル検証済み）。
+- **Windows 実装の限界（Windows 実機未検証）**: `CreateMutexW`による
+  `Global\`名前空間への書き込みには通常`SeCreateGlobalPrivilege`相当の
+  権限が必要（通常ユーザーは既定で保有）だが、Session 0（サービス）と
+  Session 1+（デスクトップシェル）間で実際に同じ
+  `Global\BantoHub.<profile-id>`ミューテックスを取り合う動作そのものは
+  Windows 実機必須（§5 と同様の限界。Linux CI で検証できるのはパス解決の
+  純関数部分と、非 Windows の flock 排他が実際に機能することのみ）。

@@ -1,7 +1,7 @@
 # banto-hub アプリ／サービス運転計画（T14〜）
 
 作成日: 2026-08-09
-状態: **計画確定。T14・T15 完了。T16 詳細設計は [banto-hub-t16-design.md](banto-hub-t16-design.md)（P1〜P3 承認済み）。T16-0（薄いシェル `banto-hub-shell`）・T16-1（トレイ状態表示）マージ済み。T16-2 は T17（サービス管理・profile・mutex）依存のため後回し。2026-08-10: T17 詳細設計 [banto-hub-t17-design.md](banto-hub-t17-design.md) を追加し、同日オーナーが P1〜P6 を承認（設計確定）。同日 T17-0（`ServiceManager` trait / `MockServiceManager` / `WindowsServiceManager`、`apps/banto-hub/core/src/service_manager.rs`）を実装済み（既存 CLI 挙動不変、P4 Demand 化は T17-4）。T16-2 は同書 §4 / P5 の契約を消費する形で着手可（実機確認は後続）。進行中: T18-1（TAG-UX-C・TAG-P0-2 完了、TAG-P0-3 未着手）／T17-1 以降。§16.4 の `optNum` null 取りこぼしと §9 TAG-P0-1 本体（連続登録 `count.trim()` クラッシュ）はロジック側を修正済み。**2026-08-09（本 PR）: §16.3「banto-hub の Playwright/DOM テスト基盤を T18-1 へ前倒し」を実施し、`e2e/banto-hub.playwright.config.ts`（`pnpm e2e:banto-hub`）を新設。TAG-P0-1 の残受け入れ条件（実 DOM からの点数変更テスト）を `e2e/tests-banto-hub/banto-hub-tags-continuous.spec.ts` で満たし、DOM/E2E 側も含めて TAG-P0-1 は受け入れ条件を全て満たした（closed）。** 2026-08-09（本 PR、
+状態: **計画確定。T14・T15 完了。T16 詳細設計は [banto-hub-t16-design.md](banto-hub-t16-design.md)（P1〜P3 承認済み）。T16-0（薄いシェル `banto-hub-shell`）・T16-1（トレイ状態表示）マージ済み。T16-2 は T17（サービス管理・profile・mutex）依存のため後回し。2026-08-10: T17 詳細設計 [banto-hub-t17-design.md](banto-hub-t17-design.md) を追加し、同日オーナーが P1〜P6 を承認（設計確定）。同日 T17-0（`ServiceManager` trait / `MockServiceManager` / `WindowsServiceManager`、`apps/banto-hub/core/src/service_manager.rs`）を実装済み（既存 CLI 挙動不変、P4 Demand 化は T17-4）。T16-2 は同書 §4 / P5 の契約を消費する形で着手可（実機確認は後続）。続く `cursor/t17-1-profile-mutex-e3cb` で T17-1（profile path 一本化＋mutex/排他、`apps/banto-hub/core/src/profile_paths.rs`・`profile_lock.rs`）を実装済み（詳細は banto-hub-t17-design.md §8。3ホスト共通の絶対パス解決＋`HubRuntime::start`冒頭の profile 排他 - Windows は named mutex、非 Windows は flock 自体を排他の実体にする）。進行中: T18-1（TAG-UX-C・TAG-P0-2 完了、TAG-P0-3 未着手）／T17-2 以降。§16.4 の `optNum` null 取りこぼしと §9 TAG-P0-1 本体（連続登録 `count.trim()` クラッシュ）はロジック側を修正済み。**2026-08-09（本 PR）: §16.3「banto-hub の Playwright/DOM テスト基盤を T18-1 へ前倒し」を実施し、`e2e/banto-hub.playwright.config.ts`（`pnpm e2e:banto-hub`）を新設。TAG-P0-1 の残受け入れ条件（実 DOM からの点数変更テスト）を `e2e/tests-banto-hub/banto-hub-tags-continuous.spec.ts` で満たし、DOM/E2E 側も含めて TAG-P0-1 は受け入れ条件を全て満たした（closed）。** 2026-08-09（本 PR、
 `cursor/t18-1-form-dirty-e3cb`）: §9.4 TAG-UX-C のうち dirty 追跡と破棄確認
 を実装（詳細は §9.4 TAG-UX-C の実装メモ）。続く `cursor/t18-1-drawer-busy-e3cb`
 で同 §9.4 の「保存、削除、検証、登録、閉じるを Drawer 単位の busy 状態で
@@ -1605,8 +1605,10 @@ write peek を実装し、T15 を完了させた（§16.3「T15（全 PLC シミ
 > 秘密除外リスト）を [banto-hub-t17-design.md](banto-hub-t17-design.md)
 > に落とした。**同日オーナーが P1〜P6 を承認し設計確定**。同日 T17-0
 > （`ServiceManager` trait 抽出、`service_manager.rs`、既存 CLI 挙動不変）
-> を実装済み（詳細は同書 §7）。次は T17-1（profile path / mutex）。T16-2 は
-> 同書 §4 / P5 の引き渡し契約に従い、T17-0 API を消費する形で着手できる。
+> を実装済み（詳細は同書 §7）。続く T17-1（profile path 一本化＋
+> mutex/排他、`profile_paths.rs`・`profile_lock.rs`）も実装済み（詳細は
+> 同書 §8）。次は T17-2（UAC helper）以降。T16-2 は同書 §4 / P5 の引き渡し
+> 契約に従い、T17-0 API を消費する形で着手できる。
 
 - T5-1 の `install` / `uninstall` / `run-service` と `win_service` から SCM
   管理層を抽出し、状態取得、開始、停止、再起動、自動起動切替へ拡張する。
