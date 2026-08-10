@@ -63,6 +63,7 @@ function makeTag(overrides: Partial<Tag>): Tag {
 		tagKind: 'plc',
 		expression: null,
 		retain: false,
+		revision: 1,
 		...overrides
 	};
 }

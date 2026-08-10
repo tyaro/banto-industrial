@@ -170,6 +170,7 @@ impl Fixture {
                 tag_kind: "plc".to_string(),
                 expression: None,
                 retain: false,
+                expected_revision: None,
             })
             .await
             .unwrap()
@@ -221,6 +222,7 @@ impl Fixture {
                 tag_kind: "plc".to_string(),
                 expression: None,
                 retain: false,
+                expected_revision: None,
             })
             .await
             .unwrap()
