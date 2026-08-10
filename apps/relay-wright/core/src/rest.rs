@@ -1779,6 +1779,13 @@ pub struct TagPayload {
     pub expression: Option<String>,
     #[serde(default)]
     pub retain: bool,
+    // T18-1 (banto-hub の同名フィールドと同じ理由、
+    // docs/tag-server-design.md §10-2 の互換性保証を踏襲): relay-wright には
+    // revision による楽観ロック UI は無いが、`banto_tags::TagInput` が
+    // このフィールドを要求するため、ワイヤ形状にも additive に足しておく
+    // （`#[serde(default)]` なので既存クライアントのペイロードは無変更で通る）。
+    #[serde(default)]
+    pub expected_revision: Option<i64>,
 }
 
 impl From<TagPayload> for TagInput {
@@ -1804,6 +1811,7 @@ impl From<TagPayload> for TagInput {
             tag_kind: payload.tag_kind,
             expression: payload.expression,
             retain: payload.retain,
+            expected_revision: payload.expected_revision,
         }
     }
 }
@@ -5583,6 +5591,7 @@ mod tests {
                 tag_kind: "plc".to_string(),
                 expression: None,
                 retain: false,
+                expected_revision: None,
             })
             .await
             .expect("create tag");

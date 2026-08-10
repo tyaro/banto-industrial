@@ -152,6 +152,13 @@ export interface Tag {
 	expression: string | null;
 	/** T6-2: internal-tag restart-persistence flag. */
 	retain: boolean;
+	/**
+	 * T18-1 (docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目):
+	 * 楽観的ロック用の行バージョン。`update` が成功する度に +1 される。
+	 * 編集フォームを開いた時点の値を保持しておき、保存時に
+	 * {@link TagInput.expectedRevision} として送り返す。
+	 */
+	revision: number;
 }
 
 /** Mirrors `banto_hub_core::rest::TagPayload`. */
@@ -183,6 +190,17 @@ export interface TagInput {
 	expression?: string | null;
 	/** T6-2: `#[serde(default)]` (= `false`) on the backend. */
 	retain?: boolean;
+	/**
+	 * T18-1 (docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目):
+	 * 更新時の楽観ロック。編集フォームを開いた時点の
+	 * {@link Tag.revision} を渡す — サーバー側の行が既に進んでいたら
+	 * `updateTag` は {@link TagRevisionConflictError} を投げる。
+	 * 省略時（`createTag`/連続登録の `createTagsBatch` は常に省略）は
+	 * `#[serde(default)]` によりチェック無しで更新される
+	 * （バックエンド互換のための挙動で、このページの編集フローは
+	 * 常に明示的に渡す）。
+	 */
+	expectedRevision?: number;
 }
 
 /** `string` tag `stringLength` bounds — mirrors the backend CHECK/validation. */
@@ -217,6 +235,15 @@ interface HttpInit {
 	method: string;
 	body?: unknown;
 	expectNoContent?: boolean;
+	/**
+	 * T18-1 (docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目):
+	 * エラーレスポンスの body が共通の `ErrorBody`（`kind` タグ）形状を
+	 * していない呼び出し元固有のエラー（例: `tags_update` の 409
+	 * `tag_revision_conflict` — `error`/`message`/`tag` という別形状）を
+	 * 独自の `Error` にマップするためのフック。`undefined` を返した場合は
+	 * 通常の `ErrorBody`/`other` フォールバックに委ねる。
+	 */
+	mapErrorBody?: (body: unknown, status: number) => Error | undefined;
 }
 
 async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
@@ -247,6 +274,8 @@ async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
 				message: `${response.status} ${response.statusText}`
 			});
 		}
+		const mapped = init.mapErrorBody?.(body, response.status);
+		if (mapped) throw mapped;
 		if (isErrorBody(body)) throw new ProviderError(body);
 		throw new ProviderError({
 			kind: 'other',
@@ -319,8 +348,45 @@ export async function createTag(input: TagInput): Promise<Tag> {
 	return httpRequest<Tag>('/api/tags', { method: 'POST', body: input });
 }
 
+/**
+ * T18-1 (docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目): `updateTag` が
+ * `expectedRevision` を渡した際、サーバー側の行が既に他クライアントの
+ * 更新で先に進んでいた場合に投げる — mirrors
+ * `banto_hub_core::rest::RegistryMutationError::TagRevisionConflict` の
+ * 409 応答 `{ error: "tag_revision_conflict", message, tag }`。
+ * `current` はその時点のサーバー最新の {@link Tag} で、呼び出し元は
+ * これでフォームを上書きする（差分の並列表示は本 PR のスコープ外 -
+ * ローカル編集は破棄してサーバー最新を表示するだけ）。
+ */
+export class TagRevisionConflictError extends Error {
+	readonly current: Tag;
+
+	constructor(message: string, current: Tag) {
+		super(message);
+		this.name = 'TagRevisionConflictError';
+		this.current = current;
+	}
+}
+
+export function isTagRevisionConflictError(error: unknown): error is TagRevisionConflictError {
+	return error instanceof TagRevisionConflictError;
+}
+
+function mapTagUpdateErrorBody(body: unknown, status: number): Error | undefined {
+	if (status !== 409 || typeof body !== 'object' || body === null) return undefined;
+	const { error, message, tag } = body as { error?: unknown; message?: unknown; tag?: unknown };
+	if (error !== 'tag_revision_conflict' || typeof message !== 'string' || tag === null) {
+		return undefined;
+	}
+	return new TagRevisionConflictError(message, tag as Tag);
+}
+
 export async function updateTag(id: number, input: TagInput): Promise<Tag> {
-	return httpRequest<Tag>(`/api/tags/${id}`, { method: 'PUT', body: input });
+	return httpRequest<Tag>(`/api/tags/${id}`, {
+		method: 'PUT',
+		body: input,
+		mapErrorBody: mapTagUpdateErrorBody
+	});
 }
 
 export async function deleteTag(id: number): Promise<void> {

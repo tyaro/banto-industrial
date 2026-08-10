@@ -299,6 +299,9 @@ async fn validate_by_replay(project: &ProjectFile) -> Result<(), BantoError> {
                 tag_kind: t.tag_kind.clone(),
                 expression: t.expression.clone(),
                 retain: t.retain,
+                // インポートは常に新規作成であり、楽観ロックの対象にする
+                // 「前回取得した revision」という概念自体が無い。
+                expected_revision: None,
             })
             .await?;
         tag_map.insert(t.id, created.id);
@@ -762,6 +765,7 @@ mod tests {
             tag_kind: "plc".to_string(),
             expression: None,
             retain: false,
+            expected_revision: None,
         }
     }
 

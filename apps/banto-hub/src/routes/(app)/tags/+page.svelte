@@ -38,6 +38,7 @@
 		listCollectionGroups,
 		listPlcConnections,
 		createTagsBatch,
+		isTagRevisionConflictError,
 		MIN_STRING_LENGTH,
 		MAX_STRING_LENGTH,
 		TAG_KIND_OPTIONS,
@@ -350,7 +351,10 @@
 		saving = true;
 		editErrors = {};
 		try {
-			const updated = await updateTag(selected.id, toInput(editForm));
+			const updated = await updateTag(selected.id, {
+				...toInput(editForm),
+				expectedRevision: selected.revision
+			});
 			toastStore.push('success', '更新しました');
 			selected = updated;
 			// 保存成功後はサーバーの正規化値を基準に取り直す - 未保存
@@ -359,6 +363,20 @@
 			editBaseline = formFromTag(updated);
 			await reload();
 		} catch (err) {
+			// T18-1（docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目）:
+			// 他クライアントが先にこのタグを更新済み（revision 不一致）。
+			// 「黙って上書きしない」の受け入れ基準どおり成功トーストは出さず、
+			// ローカルの未保存編集は破棄してサーバー最新値でフォームを
+			// 更新する（フィールド差分の並列表示は本 PR のスコープ外）。
+			if (isTagRevisionConflictError(err)) {
+				selected = err.current;
+				editForm = formFromTag(err.current);
+				editBaseline = formFromTag(err.current);
+				editErrors = {};
+				tags = tags.map((t) => (t.id === err.current.id ? err.current : t));
+				toastStore.push('error', err.message);
+				return;
+			}
 			const fieldErrors = applyFieldErrors(err);
 			if (fieldErrors) editErrors = fieldErrors;
 			else toastStore.push('error', errorMessage(err));

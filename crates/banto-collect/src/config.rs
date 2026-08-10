@@ -355,7 +355,7 @@ impl RegistrySnapshot {
             "SELECT id, name, collection_group_id, address, data_type, \
              string_length, raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, \
              threshold_h, threshold_hh, threshold_l, threshold_ll, enabled, \
-             writable, tag_kind, expression, retain FROM tags ORDER BY id",
+             writable, tag_kind, expression, retain, revision FROM tags ORDER BY id",
         )
         .fetch_all(&mut *connection)
         .await
@@ -724,6 +724,7 @@ mod tests {
             tag_kind: "plc".to_string(),
             expression: None,
             retain: false,
+            expected_revision: None,
         }
     }
 
