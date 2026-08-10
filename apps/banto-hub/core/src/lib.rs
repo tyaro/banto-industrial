@@ -103,6 +103,18 @@
 //!   profile 排他 - Windows は`Global\BantoHub.<profile-id>`named mutex、
 //!   非 Windows は profile ディレクトリの`flock`自体を排他の実体にする
 //!   （[`profile_lock::try_acquire_profile_lock`]）
+//! - [`hub_health`]: T17-3（docs/banto-hub-t17-design.md §3「T17-3」・§4）。
+//!   設計 §4 に記述だけがあった[`hub_health::HubHealthProbe`] trait を実装
+//!   した - fallback UI（T16-2）が「別 profile/version」「mutex 所有者不明」
+//!   等を判定するための health/所有権確認。テスト用の
+//!   [`hub_health::MockHubHealthProbe`]を持つ（実 HTTP probe は未実装、
+//!   モジュール doc 参照）
+//! - [`host_switch`]: T17-3（同§3）。Desktop↔Service 切替トランザクションの
+//!   状態機械（[`host_switch::HostSwitchEngine`]）- 切替の各段階
+//!   （[`host_switch::SwitchPhase`]）と失敗到達（[`host_switch::FaultStage`]）
+//!   を型で表現し、二重接続を起こさないことをテストで固定する。進行状態の
+//!   所有者はシェル（ネイティブ側）- このモジュール自身はタイマー・スレッドを
+//!   持たない（モジュール doc 参照）
 //!
 //! T0/T1 のスコープ外（設計冒頭の指示どおり実装しない）: gRPC、管理 UI
 //! フロントエンドの中身の一部、演算タグ、接続単位の部分再構成。書き込み
@@ -121,7 +133,9 @@ pub mod db;
 pub mod diag_log;
 pub mod events;
 pub mod grpc;
+pub mod host_switch;
 pub mod hub;
+pub mod hub_health;
 pub mod hub_log;
 pub mod mqtt;
 pub mod profile_lock;

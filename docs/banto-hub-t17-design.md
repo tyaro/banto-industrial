@@ -5,10 +5,12 @@
 T17-0（SCM 状態取得＋start/stop/restart/autostart API 抽出、
 `apps/banto-hub/core/src/service_manager.rs`）は同日実装済み（§7）。
 T17-1（profile path 一本化＋mutex/排他、`profile_paths.rs`/
-`profile_lock.rs`）も同日実装済み（§8）。**
+`profile_lock.rs`）も同日実装済み（§8）。T17-3（Desktop↔Service 切替
+トランザクション、`hub_health.rs`/`host_switch.rs`）も同日実装済み
+（§9）。**
 T16-0（薄いシェル）・T16-1（トレイ状態表示）はマージ済みで本書の前提。
 T16-2（サービス検出・native fallback）は本書 §4 の引き渡し契約（P5）に
-従い、T17-0 が提供する API を消費する形で着手する。
+従い、T17-0/T17-3 が提供する API を消費する形で着手する。
 最終検証日(コード照合): 2026-08-10
 基準コミット: `84f2a3f`（main、T17-0 マージ後 #116）。
 
@@ -377,3 +379,122 @@ SCM 経由の状態確認（T17-0、§7）はこのスライスでは呼んで�
   `Global\BantoHub.<profile-id>`ミューテックスを取り合う動作そのものは
   Windows 実機必須（§5 と同様の限界。Linux CI で検証できるのはパス解決の
   純関数部分と、非 Windows の flock 排他が実際に機能することのみ）。
+
+## 9. 実装メモ（2026-08-10、T17-3）
+
+T17-3（§3「T17-3」・desktop-plan §9.9「タスクトレイと停止時 fallback」・
+§16.3「desktop⇔service 切替の中間状態を追加」）を新設2モジュール
+`apps/banto-hub/core/src/hub_health.rs`・`host_switch.rs`に実装した。
+T17-0（`ServiceManager`、§7）・T17-1（profile path/mutex、§8）に依存し、
+T17-2（UAC/Operators）はスタブ（`can_operate_service: bool`）で受け取る。
+
+- **`hub_health.rs`**: §4 に記述だけがあった`HubHealthProbe`
+  trait・`HealthOutcome`（`Healthy`/`WrongProfileOrVersion`/
+  `MutexOwnerUnknown`/`PortConflict`/`Unreachable`）・`ProbeError`を実装した。
+  `expected_profile`は§4 の記述（`&ProfileId`）と異なり`&str`にした -
+  このワークスペースに専用の`ProfileId`型は存在せず（`profile_paths`/
+  `profile_lock`ともに`profile_id: String`のまま扱っている）、実装指示の
+  シグネチャ（`&str`）をそのまま採用した。テスト用の`MockHubHealthProbe`
+  （既定 outcome ＋`push_sequence`で1回ずつ消費する queue の2段構成、
+  `MockServiceManager::inject_error`と同じ発想）のみを実装し、**実 HTTP
+  probe は今回入れていない**（実装指示「無くてもモックだけで T17-3 完了可」
+  の範囲 - Windows 実機・T16-2 実配線着手時に追加する。追加しても
+  `host_switch`側の変更は不要 - trait 境界だけに依存するため）。
+- **`host_switch.rs`**: Desktop↔Service 切替トランザクションの状態機械
+  `HostSwitchEngine<M: ServiceManager, P: HubHealthProbe, D: DesktopHostControl>`。
+  `step(SwitchCommand) -> Result<StepOutcome, SwitchError>`で1ステップずつ
+  進める - 内部にスレッド・タイマーは持たず、進行状態の所有者はシェル
+  （呼び出し側が`SwitchCommand::Poll`を繰り返し送ることで前進させる、
+  desktop-plan §16.3「進行状態はシェル（ネイティブ側）が所有する」）。
+  - **`HostKind`**（定常）: `Offline`/`Desktop`/`Service`。
+  - **`SwitchPhase`**（進行中、`Idle`は非進行）: `DesktopStopping`→
+    `AwaitingDesktopRelease`→`ServiceStarting`→`AwaitingServiceHealth`→
+    （完了で`Idle`+`current=Service`）、逆方向は`ServiceStopping`→
+    `AwaitingServiceRelease`→`DesktopStarting`→（完了で`Idle`+
+    `current=Desktop`）、終端の`Faulted { stage: FaultStage, reason }`。
+    `DesktopStopping`/`ServiceStopping`は「停止要求発行の瞬間」を表すが、
+    要求自体が同期 API（`DesktopHostControl::request_stop`/
+    `ServiceManager::stop`）のため成功時は同じ`step`呼び出し内で即座に
+    次段へ進み、外部からは定常観測されない（要求自体の失敗時のみ
+    `FaultStage`として`Faulted`に残る）。
+  - **段階×失敗到達表**（実装指示の不変条件3「もう一方を起動したまま
+    戻ることがない」をこの表で固定した - `cargo test host_switch`の
+    各テストがそれぞれの行を検証する）:
+
+    | 方向            | 失敗段階（`FaultStage`）                   | 到達 `HostKind`                               | 根拠                                             |
+    | --------------- | ------------------------------------------ | --------------------------------------------- | ------------------------------------------------ |
+    | Desktop→Service | `DesktopStopping`（`request_stop`失敗）    | `Desktop`                                     | 未着手 - Desktop は一度も止めていない            |
+    | Desktop→Service | `AwaitingDesktopRelease`（timeout/cancel） | `Desktop`                                     | 解放未確認 - Service には一度も`start`していない |
+    | Desktop→Service | `ServiceStarting`（`start`失敗/timeout）   | `Offline`                                     | Desktop 解放済み・Service 未確認（両方停止）     |
+    | Desktop→Service | `AwaitingServiceHealth`（timeout/cancel）  | SCM `Running`なら`Service`、それ以外`Offline` | 「Service だが Unhealthy」を`last_health`で表現  |
+    | Service→Desktop | `ServiceStopping`（`stop`失敗）            | `Service`                                     | 未着手                                           |
+    | Service→Desktop | `AwaitingServiceRelease`（timeout/cancel） | `Service`                                     | 解放未確認 - Desktop 起動許可を出していない      |
+    | Service→Desktop | `DesktopStarting`（許可 timeout/cancel）   | `Offline`                                     | Service 解放済み・Desktop 未起動（両方停止）     |
+
+  - **`DesktopHostControl`**（コールバック trait）:
+    `request_stop(&mut self) -> Result<(), DesktopHostError>`・
+    `is_stopped(&self) -> bool`（停止済み**かつ**mutex 解放済みの両方を
+    満たしたときだけ`true`を返す実装にする契約）・
+    `request_start_allowed(&self) -> bool`（既定`true`、追加の Windows
+    操作権限確認等のフック）。コアは`HubRuntime`を直接触らず、実際の
+    Desktop Hub 起動・停止はシェル（`apps/banto-hub/src-tauri`）側が
+    この trait を実装して担う（実装指示「コアが HubRuntime を直接触らず、
+    コールバック trait で分離」）。テスト用`MockDesktopHostControl`
+    （`set_stopped`/`set_mutex_released`/`set_released`/`set_start_allowed`/
+    `inject_stop_error`）を用意した。
+  - **不変条件の担保**（`cargo test -p banto-hub-core --lib host_switch`
+    17件で固定）:
+    1. `ServiceManager::start`を呼ぶのは`desktop.is_stopped()`が`true`に
+       なった`AwaitingDesktopRelease`のポーリング内のみ
+       （`desktop_to_service_happy_path_respects_ordering`が
+       `stopped=true`だが`mutex_released=false`の間は SCM が`Stopped`の
+       ままであることまで検証する）。
+    2. Desktop 起動許可（`attempt_desktop_start`）は`AwaitingServiceRelease`
+       で SCM `Stopped`**かつ**probe が`Unreachable`を確認した後にのみ
+       呼ばれる（`service_to_desktop_happy_path_respects_ordering`）。
+    3. 上表のとおり、失敗到達はすべて「未着手のまま」または「両方
+       停止（`Offline`）」のいずれかで、Desktop と Service が両方稼働した
+       まま失敗到達することはない
+       （`desktop_to_service_failure_at_service_start_lands_on_offline_not_desktop`
+       等）。
+    4. `Idle`/`Faulted`（終端）以外の間は新しい`SwitchToService`/
+       `SwitchToDesktop`を`StepOutcome::TransitionInProgress`で拒否する
+       （`overlapping_switch_to_desktop_during_progress_is_rejected`）。
+       `Faulted`は「進行中」ではないため再試行は許す
+       （`desktop_stop_request_failure_leaves_desktop_as_current`が
+       再試行成功まで確認する）。
+    5. `AwaitingServiceHealth`では`Healthy`以外（`WrongProfileOrVersion`/
+       `MutexOwnerUnknown`/`PortConflict`/`Unreachable`）のいずれでも
+       `Waiting`のまま進めない
+       （`ambiguous_probe_outcomes_never_complete_the_switch`）。
+       `HostSwitchState::last_health`に残すので、T16-2 fallback UI の
+       「開始ボタンを隠す」判断にそのまま使える。
+  - **T17-2 スタブ**: `HostSwitchConfig::can_operate_service: bool`が
+    `false`の間は`ServiceManager::start`/`stop`を一切呼ばず
+    `SwitchError::PermissionDenied`を返す
+    （`permission_denied_stub_blocks_service_start_without_calling_scm`/
+    `_stop_without_calling_scm`）。Desktop 自身の起動・停止はこの確認の
+    対象外（Windows サービス操作ではないため）。T17-2 着手時は
+    `HostSwitchEngine::set_can_operate_service`で実際の Operators
+    メンバーシップ判定結果を反映すればよく、engine 再構築は不要。
+  - **T16-2 が次に消費する入口**: `host_switch::{HostKind, SwitchPhase,
+FaultStage, HostSwitchState, SwitchCommand, StepOutcome, SwitchError,
+DesktopHostControl, HostSwitchEngine, HostSwitchConfig}`と
+    `hub_health::{HubHealthProbe, HealthOutcome, ProbeError}`。T16-2 は
+    シェル側で`DesktopHostControl`の実装（`HubRuntime`ラッパー）を1つ
+    書き、`ServiceManager`（T17-0、実装済み）・`HubHealthProbe`（実 HTTP
+    probe、未実装 - 上記`hub_health.rs`節参照）と組み合わせて
+    `HostSwitchEngine`を構築し、シェル自身のタイマー/イベントループから
+    `SwitchCommand::Poll`を送るだけでよい。
+- **やっていないこと**（実装指示のスコープ外どおり）: T17-2 UAC helper
+  本体・T16-2 UI 組み込み（`lib.rs`に`pub mod host_switch;`/`hub_health;`
+  を追加しただけで、Tauri コマンドや Svelte 側の配線はしていない）・実
+  Windows SCM 結合テスト（`MockServiceManager`/`MockHubHealthProbe`/
+  `MockDesktopHostControl`のみ - 実際の2プロセス切替・DB lock・PLC
+  接続競合は Windows 実機必須、§5 のリスク一覧に変更なし）。
+- **テスト**: `cargo fmt -p banto-hub-core -- --check`・
+  `cargo clippy -p banto-hub-core --all-targets -- -D warnings`（非
+  Windows・`x86_64-pc-windows-gnu`の両方で警告0件）・
+  `cargo test -p banto-hub-core --lib host_switch`（17件）・
+  `cargo test -p banto-hub-core --lib`（`hub_health`4件を含め全271件）が
+  Linux 上で green。
