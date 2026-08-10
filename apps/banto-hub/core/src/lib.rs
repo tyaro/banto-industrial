@@ -85,6 +85,13 @@
 //!   `println!`/`eprintln!` の薄いラッパーで、Windows サービスモードの
 //!   間だけ同じ内容をファイルにもミラーする（[`hub_log`] のモジュール doc
 //!   参照）
+//! - [`service_manager`]: T17-0（docs/banto-hub-t17-design.md §3/§4）。
+//!   SCM 状態取得＋start/stop/restart/autostart 操作のホスト非依存ロジック
+//!   層（[`service_manager::ServiceManager`] trait）。テスト用の
+//!   [`service_manager::MockServiceManager`]（常に利用可能）と実 SCM を
+//!   叩く`WindowsServiceManager`（`#[cfg(windows)]`）の2実装を持つ。
+//!   `bin/banto_hub/win_service.rs`の既存`install`/`uninstall`CLI 自体は
+//!   このモジュールに置き換えていない（挙動不変、モジュール doc 参照）
 //!
 //! T0/T1 のスコープ外（設計冒頭の指示どおり実装しない）: gRPC、管理 UI
 //! フロントエンドの中身の一部、演算タグ、接続単位の部分再構成。書き込み
@@ -108,6 +115,7 @@ pub mod hub_log;
 pub mod mqtt;
 pub mod rest;
 pub mod runtime;
+pub mod service_manager;
 pub mod settings;
 pub mod stream;
 pub mod subscribe_core;

@@ -42,10 +42,15 @@ use windows_service::{define_windows_service, service_dispatcher};
 use banto_hub_core::controller::{CollectionState, RunMode};
 use banto_hub_core::hub_log::{self, log_err_line, log_line};
 use banto_hub_core::runtime::HubRuntime;
+// T17-0（docs/banto-hub-t17-design.md §3「T17-0」）: サービス名・起動引数は
+// `banto_hub_core::service_manager`（`WindowsServiceManager`が実 SCM 再登録
+// 時に使う値と同じもの）を単一のソースとして再利用する - このファイルは
+// 以前`SERVICE_NAME`/`RUN_SERVICE_ARG`を自前で定義していたが、値そのものは
+// 1バイトも変えていない（`pub use`での再公開なので、このファイル内・
+// `bin/banto-hub.rs`からの`win_service::SERVICE_NAME`/`RUN_SERVICE_ARG`参照は
+// 変更不要）。
+pub use banto_hub_core::service_manager::{RUN_SERVICE_ARG, SERVICE_NAME};
 
-/// SCM 上のサービス名（内部識別子・`sc query`/`Get-Service -Name`等で使う
-/// キー）。表示名（[`SERVICE_DISPLAY_NAME`]）とは別物。
-pub const SERVICE_NAME: &str = "BantoHub";
 const SERVICE_DISPLAY_NAME: &str = "banto-hub タグサーバー";
 const SERVICE_DESCRIPTION: &str =
     "banto-hub（産業用タグサーバー）を常駐実行します。PLC からタグを収集し、REST/WebSocket/MQTT/gRPC で外部へ公開します。docs/tag-server-design.md 参照。";
@@ -55,10 +60,6 @@ const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 pub const INSTALL_ARG: &str = "install";
 /// `bin/banto-hub.rs`の`uninstall`サブコマンド用引数リテラル。
 pub const UNINSTALL_ARG: &str = "uninstall";
-/// `bin/banto-hub.rs`の`run-service`サブコマンド用引数リテラル - [`install`]
-/// が登録するサービスの起動引数と、`main`のディスパッチ両方から参照される
-/// 単一のソース（文字列の重複を避ける）。
-pub const RUN_SERVICE_ARG: &str = "run-service";
 
 /// Windows サービスとして登録する（管理者権限が必要 - 失敗時はその旨を
 /// 案内して終了する）。登録するバイナリパスには`RUN_SERVICE_ARG`を起動
