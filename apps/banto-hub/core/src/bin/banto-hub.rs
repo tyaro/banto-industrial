@@ -14,8 +14,18 @@
 //! ファイル自身は「どちらのモードで、何を停止トリガーにして呼ぶか」の
 //! 分岐と、環境変数を読んで [`banto_hub_core::runtime::HubConfig`]を
 //! 組み立てる役目だけを持つ（env 読み取りは T14-1 で composition root から
-//! ここ（ホスト側）へ移った - `crate::build_hub_config`参照。読み取り結果は
-//! 移設前と1バイトも変えていない）。
+//! ここ（ホスト側）へ移った）。
+//!
+//! T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P1）で、env 読み取り
+//! 自体は3ホスト共通の[`banto_hub_core::profile_paths::build_hub_config_from_env`]
+//! へ一本化した - 以前この関数はこのファイル自身が定義していたが、
+//! `win_service.rs`（サービスホスト）・`apps/banto-hub/src-tauri`
+//! （デスクトップシェル）の3ホストが個別に複製していたロジックを1箇所へ
+//! 統合した。`BANTO_DB`/`BANTO_ALLOW_SETUP`/`PORT`/`BANTO_BIND`/
+//! `BANTO_HUB_DATA`の読み取り自体（各既定値・レイヤー順）は移設前と1バイトも
+//! 変えていない - 新たに`BANTO_HUB_PROFILE`/`BANTO_HUB_ROOT`が加わり、
+//! `BANTO_DB`/`BANTO_HUB_DATA`未設定時の既定値が相対パスから profile の
+//! 絶対パスへ変わった（`profile_paths`のモジュール doc 参照）。
 //!
 //! ## サブコマンド（引数なしの既存挙動は一切変更していない）
 //!
@@ -62,7 +72,9 @@
 #[path = "banto_hub/win_service.rs"]
 mod win_service;
 
-use banto_hub_core::runtime::{HubConfig, HubRuntime, DEFAULT_DB_PATH};
+use banto_hub_core::profile_lock::HubHostKind;
+use banto_hub_core::profile_paths::build_hub_config_from_env;
+use banto_hub_core::runtime::HubRuntime;
 
 fn main() {
     match std::env::args().nth(1).as_deref() {
@@ -96,32 +108,6 @@ fn print_usage() {
     }
 }
 
-/// 環境変数を読んで [`HubConfig`]を組み立てる - T14-1 より前は
-/// composition root（旧 `hub_run::run`）自身がこの読み取りを行っていたが、
-/// 将来のデスクトップホストが env なしで設定できるようにする設計判断
-/// （docs/banto-hub-t14-design.md §3「D1」）で、ホスト側であるこのファイルへ
-/// 移した。**読み取りロジック（既定値・レイヤー順）は移設前と1バイトも
-/// 変えていない** - 各フィールドの doc comment に旧実装との対応を記す
-/// （[`HubConfig`]自身のフィールド doc も参照）。コンソール・サービス
-/// 両モードから共有する（`win_service`側は `crate::build_hub_config`と
-/// して参照する - `mod win_service`はこのファイルの子モジュールなので
-/// `crate::`で届く）。
-fn build_hub_config() -> HubConfig {
-    HubConfig {
-        db_path: std::env::var("BANTO_DB").unwrap_or_else(|_| DEFAULT_DB_PATH.to_string()),
-        allow_setup: std::env::var("BANTO_ALLOW_SETUP")
-            .map(|value| value == "1")
-            .unwrap_or(false),
-        port_override: std::env::var("PORT")
-            .ok()
-            .and_then(|value| value.parse().ok()),
-        bind_override: std::env::var("BANTO_BIND").ok(),
-        data_dir_override: std::env::var("BANTO_HUB_DATA")
-            .ok()
-            .map(std::path::PathBuf::from),
-    }
-}
-
 /// コンソールモード（既存挙動そのまま）: 独自に tokio ランタイムを構築し、
 /// [`HubRuntime::start`]→ Ctrl-C 待機 → [`banto_hub_core::runtime::RunningHub::shutdown`]
 /// を駆動する（旧 `hub_run::run(shutdown)`の「構築 → shutdown.await →
@@ -130,7 +116,7 @@ fn build_hub_config() -> HubConfig {
 fn run_console() {
     let runtime = tokio::runtime::Runtime::new().expect("failed to build tokio runtime");
     runtime.block_on(async {
-        let config = build_hub_config();
+        let config = build_hub_config_from_env(HubHostKind::Console);
         // 旧 `hub_run::run`はここで `expect("init_db should succeed")`等の
         // 4箇所が panic していた（設計 §2「現行コード地図」）。T14-1 で
         // `Result`化した分、コンソールでは同等の異常終了（panic ではないが

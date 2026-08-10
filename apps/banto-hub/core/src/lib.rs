@@ -92,6 +92,17 @@
 //!   叩く`WindowsServiceManager`（`#[cfg(windows)]`）の2実装を持つ。
 //!   `bin/banto_hub/win_service.rs`の既存`install`/`uninstall`CLI 自体は
 //!   このモジュールに置き換えていない（挙動不変、モジュール doc 参照）
+//! - [`profile_paths`]: T17-1（docs/banto-hub-t17-design.md §3「T17-1」・
+//!   P1）。3ホスト共通の profile 絶対パス解決（`{root}/profiles/
+//!   <profile-id>/{config,data,logs}`、desktop-plan §11）と、それを使う
+//!   [`profile_paths::build_hub_config_from_env`]（`bin/banto-hub.rs`・
+//!   `bin/banto_hub/win_service.rs`・`apps/banto-hub/src-tauri`の3ホストが
+//!   共通で呼ぶ`HubConfig`組み立て関数 - 各ホストが個別に持っていた
+//!   `build_hub_config`はこの1関数へ統合した）
+//! - [`profile_lock`][]: T17-1（同§3・P2）。`HubRuntime::start`冒頭で取る
+//!   profile 排他 - Windows は`Global\BantoHub.<profile-id>`named mutex、
+//!   非 Windows は profile ディレクトリの`flock`自体を排他の実体にする
+//!   （[`profile_lock::try_acquire_profile_lock`]）
 //!
 //! T0/T1 のスコープ外（設計冒頭の指示どおり実装しない）: gRPC、管理 UI
 //! フロントエンドの中身の一部、演算タグ、接続単位の部分再構成。書き込み
@@ -113,6 +124,8 @@ pub mod grpc;
 pub mod hub;
 pub mod hub_log;
 pub mod mqtt;
+pub mod profile_lock;
+pub mod profile_paths;
 pub mod rest;
 pub mod runtime;
 pub mod service_manager;

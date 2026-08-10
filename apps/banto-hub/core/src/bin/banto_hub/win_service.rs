@@ -41,6 +41,8 @@ use windows_service::{define_windows_service, service_dispatcher};
 
 use banto_hub_core::controller::{CollectionState, RunMode};
 use banto_hub_core::hub_log::{self, log_err_line, log_line};
+use banto_hub_core::profile_lock::HubHostKind;
+use banto_hub_core::profile_paths::{build_hub_config_from_env, resolve_profile_paths_from_env};
 use banto_hub_core::runtime::HubRuntime;
 // T17-0（docs/banto-hub-t17-design.md §3「T17-0」）: サービス名・起動引数は
 // `banto_hub_core::service_manager`（`WindowsServiceManager`が実 SCM 再登録
@@ -199,7 +201,13 @@ fn run_service_body(_arguments: Vec<OsString>) {
     // ログファイル（このファイルのモジュール doc、`hub_log`のモジュール
     // doc 参照）- `HubRuntime::start`（T14-1、`banto_hub_core::runtime`）が
     // 最初の1行を出すより前に開いておく。
-    let log_dir = hub_log::resolve_service_log_dir();
+    //
+    // T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P1）:
+    // `resolve_profile_paths_from_env`で profile の`logs_dir`（既定値）を
+    // 先に解決する - 下の`build_hub_config_from_env`と同じ env
+    // （`BANTO_HUB_ROOT`/`BANTO_HUB_PROFILE`）を読むので、同一プロセス内で
+    // 両者が食い違うことはない。
+    let log_dir = hub_log::resolve_service_log_dir(&resolve_profile_paths_from_env().logs_dir);
     let log_path = log_dir.join(hub_log::SERVICE_LOG_FILE_NAME);
     if let Err(err) = hub_log::enable_service_log_file(&log_path) {
         eprintln!(
@@ -269,9 +277,11 @@ fn run_service_body(_arguments: Vec<OsString>) {
         }
     };
 
-    // env 読み取り（T14-1 でホスト側へ移設 - `crate::build_hub_config`の
-    // doc comment参照）は同期処理なので、ランタイムへ入る前に済ませる。
-    let config = crate::build_hub_config();
+    // env 読み取り（T14-1 でホスト側へ移設、T17-1 で3ホスト共通の
+    // `banto_hub_core::profile_paths::build_hub_config_from_env`へ一本化 -
+    // このファイルのモジュール doc 参照）は同期処理なので、ランタイムへ
+    // 入る前に済ませる。
+    let config = build_hub_config_from_env(HubHostKind::Service);
     runtime.block_on(async move {
         // 旧 `hub_run::run`はここで `expect("init_db should succeed")`等の
         // 4箇所が panic していた（設計 §2「現行コード地図」）。
