@@ -549,6 +549,7 @@ impl HubRuntime {
             grpc_server.clone(),
             rate_limiter,
             test_output,
+            profile_id,
         )
         .merge(static_router::<FrontendAssets>());
 

@@ -279,6 +279,7 @@ async fn test_app(label: &str) -> TestApp {
         mqtt,
         grpc_server,
         rate_limiter,
+        banto_hub_core::profile_paths::DEFAULT_PROFILE_ID.to_string(),
     );
 
     let server = start(

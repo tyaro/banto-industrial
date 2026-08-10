@@ -260,6 +260,7 @@ async fn test_app(label: &str) -> TestApp {
         grpc_server,
         rate_limiter,
         test_output,
+        banto_hub_core::profile_paths::DEFAULT_PROFILE_ID.to_string(),
     );
 
     let server = start(

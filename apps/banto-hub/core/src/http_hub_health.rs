@@ -39,18 +39,24 @@
 //!    （「port 競合」- 接続自体は誰かが受けているが banto-hub ではない、
 //!    設計 §「非 JSON / 非 openapi は port 競合」）。
 //! 3. openapi 応答が取れたら `info.version` を抽出する。
-//! 4. profile 確認: このワークスペースの`profile.lock`
-//!    （[`crate::profile_lock::ProfileOwnerInfo`]）は所有者 PID・
-//!    ホスト種別だけを持ち、profile-id 自体は持たない（ファイルの置き場所
-//!    そのものが profile を表す設計 - `crate::profile_paths`のモジュール doc
-//!    参照）。そのため、このスライスでは「`expected_profile`が
-//!    そもそも解決不能（[`crate::profile_paths::validate_profile_id`]が
-//!    拒否）」を[`HealthOutcome::WrongProfileOrVersion`]として扱い、
-//!    「期待 profile の`profile.lock`を開けない」場合を
-//!    [`HealthOutcome::MutexOwnerUnknown`]として扱う - 実際に応答した
-//!    Hub インスタンスの profile-id をワイヤ上で確認する経路（openapi
-//!    応答へ profile-id を含める等）は次スライスの課題として残す
-//!    （Return セクション「既知の gap」参照）。
+//! 4. profile 確認（T16-2 第三スライス、docs/banto-hub-t16-design.md §5
+//!    「HttpHubHealthProbe は openapi 応答から profile-id を検証していない」
+//!    gap への対応 - `crate::rest::openapi_json`のモジュール doc comment
+//!    参照）:
+//!    - まず`expected_profile`自体が profile-id として妥当か検証する
+//!      （[`crate::profile_paths::validate_profile_id`]）。不正なら
+//!      比較しようがないので安全側で[`HealthOutcome::WrongProfileOrVersion`]。
+//!    - openapi 応答の`info.x-banto-hub-profile-id`拡張フィールド
+//!      （[`PROFILE_ID_EXTENSION_KEY`]）を読む - **ここが実際に応答した
+//!      Hub インスタンスの profile-id をワイヤ上で確認する経路**。
+//!      欠落している（旧バージョンの Hub 等）、または文字列でない、または
+//!      `expected_profile`と一致しない場合は
+//!      [`HealthOutcome::WrongProfileOrVersion`]。
+//!    - 一致した場合のみ、二次確認としてこのワークスペースの
+//!      `profile.lock`（[`crate::profile_lock::ProfileOwnerInfo`]、
+//!      所有者 PID・ホスト種別のみを持ち profile-id 自体は持たない -
+//!      `crate::profile_paths`のモジュール doc 参照）を読む -
+//!      開けない場合は[`HealthOutcome::MutexOwnerUnknown`]。
 //! 5. 上記のいずれでもなければ [`HealthOutcome::Healthy`]。
 
 use std::io::{Read, Write};
@@ -73,6 +79,11 @@ const HEALTH_PATH: &str = "/api/v1/openapi.json";
 /// 接続先ホストの既定値（後方互換 - [`HttpHubHealthProbe::new`]/
 /// [`HttpHubHealthProbe::with_timeout`]が使う、モジュール doc「host」節参照）。
 const DEFAULT_PROBE_HOST: &str = "127.0.0.1";
+
+/// openapi 応答の`info`直下に埋め込まれる profile-id 拡張フィールド名
+/// （`crate::rest::openapi_json`が書き込む側 - このモジュール doc
+/// 「判定ロジック」4.参照）。
+const PROFILE_ID_EXTENSION_KEY: &str = "x-banto-hub-profile-id";
 
 /// [`HubHealthProbe`]の実 HTTP 実装。`root`は`expected_profile`から
 /// `profile.lock`の場所を組み立てるために持つ（このモジュール doc の
@@ -130,6 +141,12 @@ impl HubHealthProbe for HttpHubHealthProbe {
         if validate_profile_id(expected_profile).is_err() {
             // 呼び出し元が渡した expected_profile 自体が profile-id として
             // 不正 - 比較しようがないので安全側で「別 profile」扱いにする。
+            return Ok(HealthOutcome::WrongProfileOrVersion);
+        }
+        // T16-2 第三スライス: ワイヤ上の profile-id を確認する（このモジュール
+        // doc「判定ロジック」4.参照）- 欠落・型不一致・不一致のいずれも
+        // 「別 profile」扱いにする（区別しても呼び出し元の対処は変わらない）。
+        if extract_wire_profile_id(&openapi).as_deref() != Some(expected_profile) {
             return Ok(HealthOutcome::WrongProfileOrVersion);
         }
         let paths = match resolve_profile_paths(&self.root, expected_profile) {
@@ -252,6 +269,17 @@ fn extract_version(value: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// openapi 応答から[`PROFILE_ID_EXTENSION_KEY`]拡張フィールドを取り出す -
+/// キー欠落・値が文字列でない場合は`None`（呼び出し元は`None`を「別
+/// profile」と同列に扱う、このモジュール doc「判定ロジック」4.参照）。
+fn extract_wire_profile_id(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("info")
+        .and_then(|info| info.get(PROFILE_ID_EXTENSION_KEY))
+        .and_then(|profile_id| profile_id.as_str())
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,8 +288,19 @@ mod tests {
     use std::net::{Ipv4Addr, TcpListener};
     use std::thread;
 
-    const VALID_OPENAPI_BODY: &str =
+    const VALID_OPENAPI_BODY: &str = r#"{"openapi":"3.1.0","info":{"title":"banto-hub","version":"v1","x-banto-hub-profile-id":"default"},"paths":{}}"#;
+
+    /// T16-2 第三スライス: `x-banto-hub-profile-id`拡張フィールドを欠いた
+    /// openapi 応答 - 旧バージョンの Hub をシミュレートする
+    /// （`probe_returns_wrong_profile_or_version_when_wire_profile_id_missing`
+    /// が使う）。
+    const OPENAPI_BODY_WITHOUT_PROFILE_ID: &str =
         r#"{"openapi":"3.1.0","info":{"title":"banto-hub","version":"v1"},"paths":{}}"#;
+
+    /// T16-2 第三スライス: 別 profile-id を名乗る openapi 応答 -
+    /// `probe_returns_wrong_profile_or_version_when_wire_profile_id_mismatches`
+    /// が使う。
+    const OPENAPI_BODY_WITH_OTHER_PROFILE_ID: &str = r#"{"openapi":"3.1.0","info":{"title":"banto-hub","version":"v1","x-banto-hub-profile-id":"other"},"paths":{}}"#;
 
     fn ok_response(body: &str) -> Vec<u8> {
         format!(
@@ -310,6 +349,24 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(VALID_OPENAPI_BODY).unwrap();
         assert_eq!(extract_version(&value), "v1");
         assert_eq!(extract_version(&serde_json::json!({})), "");
+    }
+
+    #[test]
+    fn extract_wire_profile_id_reads_extension_field() {
+        let value: serde_json::Value = serde_json::from_str(VALID_OPENAPI_BODY).unwrap();
+        assert_eq!(extract_wire_profile_id(&value), Some("default".to_string()));
+    }
+
+    #[test]
+    fn extract_wire_profile_id_is_none_when_missing_or_wrong_type() {
+        let missing: serde_json::Value =
+            serde_json::from_str(OPENAPI_BODY_WITHOUT_PROFILE_ID).unwrap();
+        assert_eq!(extract_wire_profile_id(&missing), None);
+        assert_eq!(
+            extract_wire_profile_id(&serde_json::json!({"info": {"x-banto-hub-profile-id": 1}})),
+            None
+        );
+        assert_eq!(extract_wire_profile_id(&serde_json::json!({})), None);
     }
 
     #[test]
@@ -368,6 +425,41 @@ mod tests {
             HttpHubHealthProbe::with_timeout(root.path().to_path_buf(), Duration::from_millis(500));
         assert_eq!(
             probe.probe("../escape", port),
+            Ok(HealthOutcome::WrongProfileOrVersion)
+        );
+    }
+
+    /// T16-2 第三スライス: openapi 応答が別 profile-id を名乗る場合、
+    /// `profile.lock`を一切見ずにワイヤ確認だけで弾く（このモジュール doc
+    /// 「判定ロジック」4.参照）- そのため`try_acquire_profile_lock`は不要
+    /// （`profile_lock`のモジュール doc「別 profile-id なら…」節が示すとおり
+    /// Windows の named mutex は profile-id 単位の**プロセス超えグローバル**
+    /// 排他なので、このテストで別途 lock を取ると他の`"default"`を使う
+    /// テストと並行実行時に`AlreadyHeld`で衝突しうる - 触れないのが安全）。
+    #[test]
+    fn probe_returns_wrong_profile_or_version_when_wire_profile_id_mismatches() {
+        let port = spawn_canned_http_server(ok_response(OPENAPI_BODY_WITH_OTHER_PROFILE_ID));
+        let root = TempDir::new("http-hub-health-wire-mismatch");
+        let probe =
+            HttpHubHealthProbe::with_timeout(root.path().to_path_buf(), Duration::from_millis(500));
+        assert_eq!(
+            probe.probe("default", port),
+            Ok(HealthOutcome::WrongProfileOrVersion)
+        );
+    }
+
+    /// T16-2 第三スライス: openapi 応答に拡張フィールドが無い（旧バージョンの
+    /// Hub 等）場合も、欠落を「別 profile」と同列に扱って弾く（上のテスト同様、
+    /// 判定はロック確認より前で完結するため`try_acquire_profile_lock`は
+    /// 不要）。
+    #[test]
+    fn probe_returns_wrong_profile_or_version_when_wire_profile_id_missing() {
+        let port = spawn_canned_http_server(ok_response(OPENAPI_BODY_WITHOUT_PROFILE_ID));
+        let root = TempDir::new("http-hub-health-wire-missing");
+        let probe =
+            HttpHubHealthProbe::with_timeout(root.path().to_path_buf(), Duration::from_millis(500));
+        assert_eq!(
+            probe.probe("default", port),
             Ok(HealthOutcome::WrongProfileOrVersion)
         );
     }

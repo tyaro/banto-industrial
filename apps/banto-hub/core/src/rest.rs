@@ -4381,8 +4381,27 @@ struct ApiDoc;
 /// 逆に、スキーマを見るために API キーを要求すると「まずキーを発行して
 /// もらわないとどんな API か分からない」という鶏卵になり、外部連携の
 /// 導入コストを不必要に上げる。
-async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
-    Json(ApiDoc::openapi())
+///
+/// T16-2 第三スライス（docs/banto-hub-t16-design.md §5 既知の gap）: 応答
+/// している Hub インスタンス自身の profile-id を`info.x-banto-hub-profile-id`
+/// 拡張フィールドとして埋め込む。`crate::http_hub_health::HttpHubHealthProbe`
+/// が「lock ファイルの置き場所」だけでなく「ワイヤ応答そのもの」から
+/// profile-id を確認できるようにするための唯一の情報源 - utoipa の
+/// `#[openapi(info(...))]` は任意拡張フィールドを直接生成できないため、
+/// `ApiDoc::openapi()`が生成した`serde_json::Value`へ後から差し込む
+/// （実装指示どおり、utoipa の`Extensions` API とは戦わない最小実装）。
+async fn openapi_json(State(state): State<OpenApiState>) -> Json<serde_json::Value> {
+    let mut value = serde_json::to_value(ApiDoc::openapi()).expect("openapi serialize");
+    value["info"]["x-banto-hub-profile-id"] = serde_json::json!(state.profile_id);
+    Json(value)
+}
+
+/// [`openapi_json`]専用の状態 - この Hub インスタンスが実際に使っている
+/// profile-id（`crate::profile_paths`参照）だけを持つ。`HubRuntime::start`
+/// （`crate::runtime`）が`HubConfig::profile_id`をそのまま渡す。
+#[derive(Clone)]
+struct OpenApiState {
+    profile_id: String,
 }
 
 // --- /api/v1/* 認証: API キー + セッション bearer 併用（設計 §5.6・T0-2） ---
@@ -4640,9 +4659,13 @@ fn tag_space_router(
 }
 
 /// `GET /api/v1/openapi.json` 専用ルーター - 認証層を一切通さない
-/// （`openapi_json`関数の doc comment 参照）。
-fn openapi_router() -> Router {
-    Router::new().route("/api/v1/openapi.json", get(openapi_json))
+/// （`openapi_json`関数の doc comment 参照）。`profile_id`はこの Hub
+/// インスタンスが実際に使っている profile-id（呼び出し元
+/// `api_router_with_controller_mode`が`HubConfig::profile_id`をそのまま渡す）。
+fn openapi_router(profile_id: String) -> Router {
+    Router::new()
+        .route("/api/v1/openapi.json", get(openapi_json))
+        .with_state(OpenApiState { profile_id })
 }
 
 // --- composition ------------------------------------------------------------
@@ -4691,6 +4714,11 @@ fn api_router_with_controller_mode(
     // `GrpcService`・この REST admin エンドポイントの4者が別々の
     // フラグを見てしまう。
     test_output: Arc<TestOutputControl>,
+    // T16-2 第三スライス（docs/banto-hub-t16-design.md §5）:
+    // `GET /api/v1/openapi.json`の`info.x-banto-hub-profile-id`に埋め込む
+    // この Hub インスタンス自身の profile-id - `HubRuntime::start`
+    // （`crate::runtime`）が`HubConfig::profile_id`をそのまま渡す。
+    profile_id: String,
 ) -> Router {
     let audited_auth_routes = auth_routes(auth.clone()).layer(middleware::from_fn_with_state(
         LogoutAuditState {
@@ -4785,7 +4813,7 @@ fn api_router_with_controller_mode(
             !legacy_live_reconfigure,
             test_output,
         ))
-        .merge(openapi_router())
+        .merge(openapi_router(profile_id))
 }
 
 /// Run the collector/computed preflight against a registry snapshot read from
@@ -4847,6 +4875,9 @@ pub fn api_router_with_controller(
     grpc_server: Arc<crate::grpc::GrpcServer>,
     rate_limiter: Arc<AsyncMutex<WriteRateLimiter>>,
     test_output: Arc<TestOutputControl>,
+    // T16-2 第三スライス: `api_router_with_controller_mode`のフィールド doc
+    // comment 参照。
+    profile_id: String,
 ) -> Router {
     api_router_with_controller_mode(
         users,
@@ -4867,6 +4898,7 @@ pub fn api_router_with_controller(
         rate_limiter,
         false,
         test_output,
+        profile_id,
     )
 }
 
@@ -4890,6 +4922,9 @@ pub fn api_router(
     mqtt: Arc<MqttPublisher>,
     grpc_server: Arc<crate::grpc::GrpcServer>,
     rate_limiter: Arc<AsyncMutex<WriteRateLimiter>>,
+    // T16-2 第三スライス: `api_router_with_controller_mode`のフィールド doc
+    // comment 参照。
+    profile_id: String,
 ) -> Router {
     let test_output = Arc::new(TestOutputControl::new());
     let controller = Arc::new(crate::controller::CollectionController::new(
@@ -4916,6 +4951,7 @@ pub fn api_router(
         rate_limiter,
         true,
         test_output,
+        profile_id,
     )
 }
 
@@ -5069,6 +5105,7 @@ mod tests {
             mqtt,
             grpc_server,
             rate_limiter,
+            crate::profile_paths::DEFAULT_PROFILE_ID.to_string(),
         );
         TestEnv {
             router,
@@ -5585,6 +5622,13 @@ mod tests {
         ] {
             assert!(paths.contains_key(path), "missing path: {path}");
         }
+        // T16-2 第三スライス（docs/banto-hub-t16-design.md §5）:
+        // `crate::http_hub_health::HttpHubHealthProbe`がワイヤ上で profile-id
+        // を確認できるようにするための拡張フィールド。
+        assert_eq!(
+            json["info"]["x-banto-hub-profile-id"],
+            serde_json::json!(crate::profile_paths::DEFAULT_PROFILE_ID)
+        );
     }
 
     /// セッション token でも引き続き `/api/v1/*` が読める（設計 T0-1 からの

@@ -12,7 +12,10 @@ T16-2 第二スライス（トレイ開始/停止の`HostSwitchEngine`完了待�
 Desktop 引き継ぎの安全化・`BANTO_BIND`対応 navigate/probe・Administrators
 ゲート緩和）実装済み（下記 §3 第二スライス実装メモ、§5 参照）。
 **同日 Windows 実機でトレイ「サービスを停止」→Desktop 引き継ぎと
-「サービスを開始」→Service 接続を確認済み**（§3 第二スライス実機検証）。**
+「サービスを開始」→Service 接続を確認済み**（§3 第二スライス実機検証）。
+T16-2 第三スライス（openapi 応答への profile-id 埋め込み・
+`HttpHubHealthProbe`のワイヤ確認）実装済み（下記 §3 第三スライス実装メモ、
+§5 参照）- これで T16-2 第一スライスの既知の gap は全て解消済み。**
 最終検証日(コード照合): 2026-08-10
 最終検証日(Windows 実機): 2026-08-10（T16-2 シェル第一・第二スライス、
 Operators 対話ユーザー。トレイ開始/停止の`HostSwitchEngine`完了待ちを含む）
@@ -207,9 +210,8 @@ desktop-plan §10 に日付付きで追記する（T16-0 PR で実施）。
 >   非昇格プロセスとして動いている場合`Administrators`メンバーシップの
 >   判定が実際の昇格状態と一致しないことがある（Windows の一般的な制約 -
 >   このスライスでは対応しない、低リスクと判断）。
-> - out of scope（今回未着手、引き続き §5 参照）: openapi 応答への
->   profile-id 埋め込み（ワイヤ確認）、切替ウィザード UI、NSIS/installer
->   変更。
+> - out of scope（当時）: openapi 応答への profile-id 埋め込み（ワイヤ確認）は
+>   第三スライスで解消、切替ウィザード UI・NSIS/installer 変更は引き続き未着手。
 >
 > 検証: `cargo fmt` / `cargo clippy -p banto-hub-core -p banto-hub-shell
 --all-features -- -D warnings` / `cargo test -p banto-hub-core`
@@ -227,6 +229,54 @@ desktop-plan §10 に日付付きで追記する（T16-0 PR で実施）。
 >
 > 前提: `banto-hub-elev.exe service-install`（Demand）+ `grant-profile-acl`、
 > バイナリは `_verify_t17/`。
+
+> **T16-2 第三スライス実装メモ（2026-08-10）**: 上記 §5「T16-2 第一スライス
+> の既知の gap」に残っていた最後の1点「profile-id のワイヤ確認をして
+> いない」に対応した小規模な follow-up。
+>
+> - **`GET /api/v1/openapi.json`への profile-id 埋め込み**
+>   （`apps/banto-hub/core/src/rest.rs`）: utoipa の`#[openapi(info(...))]`
+>   は任意拡張フィールドを直接生成できないため、`ApiDoc::openapi()`が生成
+>   した`utoipa::openapi::OpenApi`を`serde_json::Value`へ変換したうえで
+>   `info.x-banto-hub-profile-id`へこの Hub インスタンス自身の profile-id
+>   （`HubConfig::profile_id`）を差し込む方式にした（utoipa の
+>   `Extensions` API とは戦わない最小実装）。`openapi_json`ハンドラの状態を
+>   `OpenApiState { profile_id: String }`に変え、`openapi_router`・
+>   `api_router_with_controller_mode`・公開関数`api_router_with_controller`/
+>   `api_router`まで`profile_id: String`引数を素通しした
+>   （`HubRuntime::start`が`HubConfig::profile_id`をそのまま渡す）。
+> - **`HttpHubHealthProbe`のワイヤ確認**
+>   （`apps/banto-hub/core/src/http_hub_health.rs`）: openapi 応答から
+>   `info.x-banto-hub-profile-id`を読み、`expected_profile`と直接比較する
+>   ように変更。欠落（旧バージョンの Hub 等）・型不一致・不一致のいずれも
+>   区別せず`HealthOutcome::WrongProfileOrVersion`に倒す（呼び出し元の対処が
+>   変わらないため）。一致した場合のみ、従来どおり`profile.lock`の読み取り
+>   確認（`MutexOwnerUnknown`/`Healthy`の分岐）へ進む - lock ファイル確認は
+>   ワイヤ確認の**後**に行う二次確認という位置づけに変わった。
+> - 呼び出し元（`apps/banto-hub/src-tauri`）は無変更 -
+>   `HttpHubHealthProbe::with_host`等のコンストラクタのシグネチャは変わって
+>   いない。
+> - テスト call site（`api_router`/`api_router_with_controller`を呼ぶ既存の
+>   単体・結合テスト、計17箇所）は全て
+>   `banto_hub_core::profile_paths::DEFAULT_PROFILE_ID`（`"default"`）を
+>   渡すよう更新した。
+>
+> 検証: `cargo fmt --all -- --check` / `cargo clippy -p banto-hub-core -p
+banto-hub-shell --all-features -- -D warnings` / `cargo test -p
+banto-hub-core --lib`（305 passed, 4 ignored）/ 影響する結合テスト
+> （`integration`/`t7_partial_reconfig`/`t8_bit_access`/`t9_simulation`/
+> `t11_batch_tags`/`computed`/`write`/`soak`/`grpc`/`mqtt`/`stream`/
+> `t12_connection_test`/`t15_write_peek`/`t15_simulation_coverage`）が
+> `--test-threads=1`で全て pass することを確認。**既知の注意点**:
+> `http_hub_health`/`profile_lock`の`"default"` profile を使うテストが
+> 複数あり、Windows の named mutex（`Global\BantoHub.<profile-id>`）が
+> profile-id 単位のプロセス超えグローバル排他であるため、デフォルトの
+> 並列テスト実行では稀に`AlreadyHeld`で衝突することがある
+> （`profile_lock.rs`の`different_profile_ids_can_both_acquire`のコメント
+> が同種の制約に既に触れている）。本スライスで新規追加した2テストは
+> ワイヤ確認だけで結果が決まる（lock を一切取得しない）よう設計し、この
+> 衝突面を増やさないようにした - 既存テスト間の衝突は本スライス以前からの
+> 既知の制約であり、このスライスのスコープ外として残す。
 
 ## 4. T16-0 設計（P3）
 
@@ -310,12 +360,13 @@ banto-hub-shell (Tauri v2, Windows 優先)
 
 ### T16-2 第一スライスの既知の gap（次スライスへの引き継ぎ）
 
-- **profile-id のワイヤ確認をしていない**: `HttpHubHealthProbe`は応答した
-  Hub インスタンスの profile-id を openapi 応答から確認しておらず、
-  「`expected_profile`が解決可能か」「期待 profile の`profile.lock`が
-  読めるか」の間接確認に留めている（`http_hub_health.rs`のモジュール doc
-  参照）。openapi 応答へ profile-id を含める等の対応は未実装（第二スライスも
-  out of scope、引き続き未解消）。
+- ~~**profile-id のワイヤ確認をしていない**~~: **2026-08-10 第三スライスで
+  解消**。`GET /api/v1/openapi.json`の`info.x-banto-hub-profile-id`拡張
+  フィールドに、応答している Hub インスタンス自身の profile-id を埋め込み、
+  `HttpHubHealthProbe`がそれを`expected_profile`と直接比較するようにした
+  （下記 §3 第三スライス実装メモ、`http_hub_health.rs`のモジュール doc
+  参照）。`profile.lock`確認は不一致がないことを確認した後の二次確認として
+  残している。
 - ~~**`ServiceManager::start`/`stop`の完了待ちをしていない**~~: **2026-08-10
   第二スライスで解消**。トレイ「サービスを開始/停止」は
   `banto_hub_core::host_switch::HostSwitchEngine`による完了待ちに置き換えた
