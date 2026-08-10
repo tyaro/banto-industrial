@@ -73,6 +73,7 @@
 		findReferencingComputedTags,
 		formatDeleteConfirmMessage
 	} from '$lib/banto/tagDeleteImpact';
+	import { diffFormRecords, type ConflictFieldDiff } from '$lib/banto/tagConflictDiff';
 	import { beforeNavigate } from '$app/navigation';
 
 	const dataTypeOptions: { value: TagDataType; label: string }[] = [
@@ -175,6 +176,45 @@
 			expression: t.expression ?? '',
 			retain: t.retain
 		};
+	}
+
+	/**
+	 * T18-1（TAG-UX-C 4点目「差分表示 UI」）: revision 競合パネルの表に出す
+	 * フィールドラベル（日本語）。`diffFormRecords`（`$lib/banto/tagConflictDiff.ts`）
+	 * 自体は `FormState` のキー名を知らない汎用ヘルパーのため、ラベルマップは
+	 * このページ側で持つ。
+	 */
+	const FIELD_LABELS: Record<string, string> = {
+		name: '名前',
+		collectionGroupId: '収集グループ',
+		address: 'アドレス',
+		dataType: 'データ型',
+		stringLength: '文字列長',
+		rawLo: 'RawLo',
+		rawHi: 'RawHi',
+		engLo: 'EngLo',
+		engHi: 'EngHi',
+		unit: '単位',
+		decimals: '小数桁数',
+		thresholdH: 'しきい値 H',
+		thresholdHh: 'しきい値 HH',
+		thresholdL: 'しきい値 L',
+		thresholdLl: 'しきい値 LL',
+		enabled: '有効',
+		writable: '書き込み可',
+		tagKind: 'タグ種別',
+		expression: '式（expression）',
+		retain: 'retain'
+	};
+
+	/**
+	 * 差分表示用に `FormState` を plain object へ変換する — `collectionGroupId`
+	 * は数値 ID のままだと差分パネルで読みにくいため、グループ名に変換して
+	 * 渡す（`diffFormRecords` はキーの意味を知らない汎用比較のため、この
+	 * 変換は呼び出し側の責務）。
+	 */
+	function conflictRecord(form: FormState): Record<string, unknown> {
+		return { ...form, collectionGroupId: groupName(Number(form.collectionGroupId)) };
 	}
 
 	/**
@@ -337,12 +377,29 @@
 	let editErrors: Record<string, string> = $state({});
 	let saving = $state(false);
 
+	/**
+	 * T18-1（TAG-UX-C 4点目「差分表示 UI」、docs/banto-hub-desktop-plan.md
+	 * §9.4）: revision 競合発生時のフィールド単位差分。`local` は競合検出
+	 * 時点の編集フォームのスナップショット（以後の入力とは連動しない）、
+	 * `serverForm`/`serverTag` はその時点のサーバー最新値。ユーザーが
+	 * 「サーバー最新を採用」/「自分の内容で再保存」のいずれかを選ぶまで
+	 * 保持し、パネル表示に使う。
+	 */
+	type EditConflict = {
+		local: FormState;
+		serverForm: FormState;
+		serverTag: Tag;
+		fields: ConflictFieldDiff[];
+	};
+	let editConflict: EditConflict | null = $state(null);
+
 	function selectTag(t: Tag): void {
 		if (!confirmDiscardIfNeeded()) return;
 		selected = t;
 		editForm = formFromTag(t);
 		editBaseline = formFromTag(t);
 		editErrors = {};
+		editConflict = null;
 		drawerMode = 'edit'; // T13-1: 行クリック編集はドロワーで開く
 	}
 
@@ -361,19 +418,35 @@
 			// 変更は無くなったので直後の dirty 判定は false になる。
 			editForm = formFromTag(updated);
 			editBaseline = formFromTag(updated);
+			// T18-1（TAG-UX-C 4点目、差分表示 UI）: 競合パネル表示中に
+			// フォームを直接編集して再送信（コンフリクトの解決ボタンを経由
+			// しない経路）しても保存が成功したら差分パネルは消す - パネルが
+			// 参照する `editConflict.local` はもう最新の保存内容ではない。
+			editConflict = null;
 			await reload();
 		} catch (err) {
-			// T18-1（docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目）:
-			// 他クライアントが先にこのタグを更新済み（revision 不一致）。
-			// 「黙って上書きしない」の受け入れ基準どおり成功トーストは出さず、
-			// ローカルの未保存編集は破棄してサーバー最新値でフォームを
-			// 更新する（フィールド差分の並列表示は本 PR のスコープ外）。
+			// T18-1（docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目、
+			// 差分表示 UI）: 他クライアントが先にこのタグを更新済み
+			// （revision 不一致）。「黙って上書きしない」の受け入れ基準どおり
+			// 成功トーストは出さないが、ローカルの未保存編集はもう破棄しない -
+			// `editForm` はユーザーが送ろうとした値のまま残し、
+			// `editBaseline` をサーバー最新値に差し替えて dirty のままにする
+			// （破棄確認の対象として残す）。フィールド単位の差分は
+			// `diffFormRecords` で求めて `editConflict` に保持し、パネル表示
+			// に使う。
 			if (isTagRevisionConflictError(err)) {
+				const local = { ...editForm };
+				const serverForm = formFromTag(err.current);
+				const fields = diffFormRecords(
+					conflictRecord(local),
+					conflictRecord(serverForm),
+					FIELD_LABELS
+				);
 				selected = err.current;
-				editForm = formFromTag(err.current);
-				editBaseline = formFromTag(err.current);
-				editErrors = {};
 				tags = tags.map((t) => (t.id === err.current.id ? err.current : t));
+				editBaseline = serverForm;
+				editErrors = {};
+				editConflict = { local, serverForm, serverTag: err.current, fields };
 				toastStore.push('error', err.message);
 				return;
 			}
@@ -383,6 +456,29 @@
 		} finally {
 			saving = false;
 		}
+	}
+
+	/**
+	 * T18-1（TAG-UX-C 4点目、差分表示 UI）: 競合パネルの「サーバー最新を
+	 * 採用」— ローカルの未保存編集を捨て、フォームをサーバー最新値に
+	 * 揃える（`selected` は競合検出時に既にサーバー最新へ更新済み）。
+	 */
+	function resolveConflictWithServer(): void {
+		if (!editConflict) return;
+		editForm = editConflict.serverForm;
+		editBaseline = editConflict.serverForm;
+		editConflict = null;
+	}
+
+	/**
+	 * T18-1（TAG-UX-C 4点目、差分表示 UI）: 競合パネルの「自分の内容で
+	 * 再保存」— `editForm` はローカルの編集内容のまま変更せず、`selected`
+	 * も既にサーバー最新の revision を指しているため、`saveEdit()` を
+	 * そのまま呼び直せば `expectedRevision` が最新値になり保存が通る。
+	 */
+	async function resolveConflictWithLocal(): Promise<void> {
+		editConflict = null;
+		await saveEdit();
 	}
 
 	/**
@@ -428,6 +524,7 @@
 			toastStore.push('success', '削除しました');
 			selected = null;
 			drawerMode = null; // 削除後は編集対象が無いのでドロワーを閉じる
+			editConflict = null;
 			await reload();
 		} catch (err) {
 			toastStore.push('error', errorMessage(err));
@@ -528,22 +625,29 @@
 		createForm = blankForm();
 		createBaseline = blankForm();
 		createErrors = {};
+		editConflict = null;
 		drawerMode = 'create';
 	}
 
 	function openContinuousDrawer(): void {
 		if (!confirmDiscardIfNeeded()) return;
 		continuousBaseline = blankContinuousForm();
+		editConflict = null;
 		drawerMode = 'continuous';
 	}
 
 	function openCsvDrawer(): void {
 		if (!confirmDiscardIfNeeded()) return;
+		editConflict = null;
 		drawerMode = 'csv';
 	}
 
 	function closeDrawer(): void {
 		drawerMode = null;
+		// T18-1（TAG-UX-C 4点目、差分表示 UI）: Drawer を閉じたら競合パネルの
+		// 状態も破棄する（`confirmDiscardIfNeeded` 経由の破棄確認は
+		// `onRequestClose` が既に済ませている — ここは後始末のみ）。
+		editConflict = null;
 	}
 
 	// T18-1: 画面遷移（サイドバーの他画面リンク等）でも Esc/× と同じ破棄
@@ -1311,6 +1415,57 @@
 				void saveEdit();
 			}}
 		>
+			{#if editConflict}
+				<!--
+					T18-1（TAG-UX-C 4点目「差分表示 UI」、docs/banto-hub-desktop-plan.md
+					§9.4）: revision 競合の差分パネル。フォーム上部に置き、
+					「あなたの入力（editForm、下のフォームにも反映済み）」と
+					「サーバー最新」をフィールド単位で並べる。差分が0件（内容は
+					同じだが revision だけ進んだ稀ケース）でもパネル自体は出す。
+				-->
+				<div class="conflict-panel">
+					<h4 class="conflict-title">他のクライアントが先に更新しています</h4>
+					{#if editConflict.fields.length === 0}
+						<p class="note">内容は同じですが revision が進んでいます。</p>
+					{:else}
+						<table class="preview-table">
+							<thead>
+								<tr>
+									<th>項目</th>
+									<th>あなたの入力</th>
+									<th>サーバー最新</th>
+								</tr>
+							</thead>
+							<tbody>
+								{#each editConflict.fields as f (f.key)}
+									<tr>
+										<td>{f.label}</td>
+										<td>{f.local}</td>
+										<td>{f.server}</td>
+									</tr>
+								{/each}
+							</tbody>
+						</table>
+					{/if}
+					<div class="actions">
+						<button
+							type="button"
+							class="secondary"
+							onclick={resolveConflictWithServer}
+							disabled={isDrawerBusy()}
+						>
+							サーバー最新を採用
+						</button>
+						<button
+							type="button"
+							onclick={() => void resolveConflictWithLocal()}
+							disabled={isDrawerBusy()}
+						>
+							自分の内容で再保存
+						</button>
+					</div>
+				</div>
+			{/if}
 			{@render tagFields(editForm, editErrors)}
 			<div class="actions">
 				<button type="submit" disabled={isDrawerBusy()}>保存</button>
@@ -1740,6 +1895,23 @@
 
 	.error-table th,
 	.error-table td {
+		color: var(--banto-danger);
+	}
+
+	/* T18-1（TAG-UX-C 4点目「差分表示 UI」）: revision 競合時にフォーム上部へ出す差分パネル。 */
+	.conflict-panel {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+		padding: 0.75rem;
+		border: 1px solid var(--banto-danger);
+		border-radius: var(--banto-radius);
+	}
+
+	.conflict-title {
+		margin: 0;
+		font-size: 0.85rem;
+		font-weight: 600;
 		color: var(--banto-danger);
 	}
 </style>
