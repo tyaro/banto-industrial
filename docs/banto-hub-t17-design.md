@@ -12,14 +12,16 @@ T17-1（profile path 一本化＋mutex/排他、`profile_paths.rs`/
 `service_elevated.rs`・`service_install.rs`・`banto-hub-elev.exe`）。
 T17-4（P4「Demand 化」、§11）も同日実装済み
 （`service_install.rs::install`の既定起動種別を`OnDemand`へ変更）。
-Operators 委任の実機受け入れ（UAC プロンプト・メンバーの start/stop）・
-T17-4 の Windows 実機検証（§11 チェックリスト）・T16-2 配線は未了。**
+2026-08-10 Windows 実機で T17-2/T17-4 の主要チェックを実施済み
+（§10・§11。Demand 登録・既存保持・Operators 作成・サービス ACL・
+`setup-operators` 冪等修正）。未了: OS 再起動での Demand 確認、
+非管理者 Operators メンバーでの start/stop、UAC 同意プロンプト
+（非昇格シェル）、T16-2 配線。**
 T16-0（薄いシェル）・T16-1（トレイ状態表示）はマージ済みで本書の前提。
 T16-2（サービス検出・native fallback）は本書 §4 の引き渡し契約（P5）に
 従い、T17-0/T17-3 が提供する API を消費する形で着手する。
 最終検証日(コード照合): 2026-08-10
-最終検証日(Windows 実機): 2026-08-10（§8「Windows 実機検証」、管理者
-PowerShell / Cursor。T17-2 の UAC/Operators 委任受け入れは未実施）
+最終検証日(Windows 実機): 2026-08-10（§8・§10・§11、管理者 Cursor）
 基準コミット: `7178493`（main、T17-3 マージ後 #118）。
 
 関連: [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)
@@ -579,8 +581,21 @@ START / STOP）を追記。`install`/`uninstall` 本体は
 移設し、`win_service` と elev の双方から呼ぶ。
 
 未了: Operators メンバーでの start/stop 実機受け入れ、T16-2 への
-`can_operate_service` 配線、NSIS からの elev 呼び出し。T17-4（P4「Demand
-化」）は §11 で実装済み。
+`can_operate_service` 配線、NSIS からの elev 呼び出し。
+
+### Windows 実機検証（2026-08-10、管理者 Cursor）
+
+テスト用ディレクトリ `_verify_t17/`（gitignored）に
+`banto-hub.exe` / `banto-hub-elev.exe` を配置して実施。
+
+| 項目                                                                 | 結果                                                                            |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `banto-hub-elev` のみ `requireAdministrator` 埋め込み                | OK                                                                              |
+| `setup-operators` 初回（グループ作成・対話ユーザー追加）             | OK（`TKent`）                                                                   |
+| `grant-service-acl`（`sc sdshow` に `(A;;CCLCRPWP;;;OperatorsSID)`） | OK・再実行も OK                                                                 |
+| `setup-operators` 2回目                                              | 初回検証時 **status 1379**（`ERROR_ALIAS_EXISTS`）で失敗 → 同日修正後 OK        |
+| `is_current_process_operator`（ログオン後追加グループ）              | メンバー追加済みでも現トークンでは `false` になり得る（既知制約・要再ログオン） |
+| 非管理者 Operators での start/stop・UAC プロンプト                   | **未実施**                                                                      |
 
 ## 11. T17-4 実装メモ（2026-08-10、P4「Demand 化」）
 
@@ -645,25 +660,13 @@ banto-hub-core --lib`（`--test-threads=1`で283件 green。デフォルトの
   named mutex の競合で稀に失敗することを確認したが、これは T17-1
   時点から存在する既知のテスト間競合であり本スライスの変更とは無関係
   - `profile_lock.rs`は本スライスで変更していない）。
-- **Windows 実機での確認手順（未実施 - 次のチェックリスト）**:
-  1. テスト用の一時ディレクトリに `banto-hub.exe` を配置し、管理者
-     PowerShell で `.\banto-hub.exe install` を実行する。
-  2. `sc.exe qc BantoHub` を実行し、`START_TYPE` が
-     `3   DEMAND_START`（自動なら`2   AUTO_START`）になっていることを
-     確認する。
-  3. `Get-Service BantoHub | Select StartType` でも `Manual` になって
-     いることを確認する。
-  4. 端末を再起動しても `BantoHub` が `Stopped` のままであること
-     （`Get-Service BantoHub`）を確認する - これが P4 の目的そのもの。
-  5. `Start-Service BantoHub` で手動開始できること、開始後は従来どおり
-     `Configured` 収集が始まる（管理 UI やログで確認）ことを確認する。
-  6. 上書きインストール確認: 手順1の状態のまま再度
-     `.\banto-hub.exe install` を実行し、`sc.exe qc BantoHub` の
-     `START_TYPE` が変わらないこと（`DEMAND_START`のまま）を確認する。
-     さらに `Set-Service BantoHub -StartupType Automatic` で意図的に
-     `AutoStart` へ変更した後に再度 `install` を実行し、`AutoStart`が
-     維持される（`Demand`へ巻き戻らない）ことも確認する。
-  7. 確認後は `.\banto-hub.exe uninstall`（管理者権限）でテスト用登録を
-     削除する。**オーナーの実運用中の`BantoHub`サービスに対しては
-     この手順を実行しないこと** - 別ディレクトリ・別チェックアウトで
-     テスト用にビルドした exe を使う。
+- **Windows 実機での確認（2026-08-10、管理者 Cursor、`_verify_t17/`）**:
+  1. [x] テスト用 exe で `install` → `sc.exe qc` が
+         `START_TYPE: 3 DEMAND_START`、`Get-Service` が `Manual` / `Stopped`
+  2. [x] 再 `install` → 早期リターン、`DEMAND_START` 維持
+  3. [x] `Set-Service -StartupType Automatic` 後の再 `install` →
+         `AUTO_START` 維持（Demand へ巻き戻らない）
+  4. [ ] OS 再起動後も Stopped のまま（Demand の最終確認）— 未実施
+  5. [ ] `Start-Service` 後の Configured 収集開始 — 未実施（本セッションは
+         登録・起動種別・ACL に限定）
+  6. [x] 確認後 `uninstall` でテスト用登録を削除（検証後クリーンアップ）

@@ -177,13 +177,20 @@ pub enum ElevatedError {
         "banto-hub-elev: 現在の対話ユーザー名の取得に失敗しました (GetUserNameW, os error {0})"
     )]
     CurrentUserLookupFailed(u32),
-    /// `NetLocalGroupAdd`が`NERR_GroupExists`以外の理由で失敗した。
+    /// `NetLocalGroupAdd`が`NERR_GroupExists`(2223)・`ERROR_ALIAS_EXISTS`
+    /// (1379)以外の理由で失敗した - どちらも「グループが既に存在する」を
+    /// 意味する Win32 の戻り値だが、実機検証で環境によって後者が返る
+    /// ケースを確認したため両方を成功として扱う
+    /// （`create_group_if_missing`参照）。
     #[error(
         "banto-hub-elev: ローカルグループ '{group}' の作成に失敗しました (NetLocalGroupAdd, status {status})"
     )]
     CreateGroupFailed { group: String, status: u32 },
-    /// `NetLocalGroupAddMembers`が`NERR_UserInGroup`以外の理由で失敗した
-    /// （典型例: 指定ユーザーが存在しない = `NERR_UserNotFound`）。
+    /// `NetLocalGroupAddMembers`が`NERR_UserInGroup`(2236)・
+    /// `ERROR_MEMBER_IN_ALIAS`(1378)以外の理由で失敗した（典型例: 指定
+    /// ユーザーが存在しない = `NERR_UserNotFound`）。どちらも「既に
+    /// メンバーである」を意味する Win32 の戻り値 -
+    /// `add_member_if_missing`参照。
     #[error(
         "banto-hub-elev: ユーザー '{user}' をグループ '{group}' に追加できませんでした (NetLocalGroupAddMembers, status {status})"
     )]
@@ -375,7 +382,8 @@ fn too_many_args(action: ElevatedAction, got: usize, expected: &str) -> Elevated
 #[cfg(windows)]
 mod windows_impl {
     use windows_sys::Win32::Foundation::{
-        GetLastError, LocalFree, ERROR_INSUFFICIENT_BUFFER, HLOCAL,
+        GetLastError, LocalFree, ERROR_ALIAS_EXISTS, ERROR_INSUFFICIENT_BUFFER,
+        ERROR_MEMBER_IN_ALIAS, HLOCAL,
     };
     use windows_sys::Win32::NetworkManagement::NetManagement::{
         NERR_GroupExists, NERR_Success, NERR_UserInGroup, NetLocalGroupAdd,
@@ -493,7 +501,13 @@ mod windows_impl {
         // 大文字始まりでない（`Win32 ヘッダー名をそのまま踏襲）ため、
         // パターンマッチにすると`non_upper_case_globals`警告になる
         // （`clippy -D warnings`で失敗する）- `if`の等値比較にして回避する。
-        if status == NERR_Success || status == NERR_GroupExists {
+        //
+        // `ERROR_ALIAS_EXISTS`(1379)も`NERR_GroupExists`(2223)と同じく
+        // 「グループが既に存在する」を意味する - T17-2 実機検証で、2回目の
+        // `setup-operators`実行時に`NetLocalGroupAdd`が`NERR_GroupExists`
+        // ではなく`ERROR_ALIAS_EXISTS`を返すケースを確認したため、両方を
+        // 冪等な成功として扱う（`ElevatedError::CreateGroupFailed`doc参照）。
+        if status == NERR_Success || status == NERR_GroupExists || status == ERROR_ALIAS_EXISTS {
             // 既に存在するグループも冪等性のため成功として扱う
             // （モジュール doc「setup-operators」節参照）。
             return Ok(());
@@ -523,7 +537,12 @@ mod windows_impl {
             )
         };
         // 上の`create_group_if_missing`と同じ理由で`if`の等値比較にする。
-        if status == NERR_Success || status == NERR_UserInGroup {
+        // `ERROR_MEMBER_IN_ALIAS`(1378)も`NERR_UserInGroup`(2236)と同じく
+        // 「既にメンバーである」を意味する（MSDN 上、`NetLocalGroupAddMembers`
+        // はどちらの値も返しうる - `create_group_if_missing`の
+        // `ERROR_ALIAS_EXISTS`と対になる注記、`ElevatedError::AddMemberFailed`
+        // doc参照）。
+        if status == NERR_Success || status == NERR_UserInGroup || status == ERROR_MEMBER_IN_ALIAS {
             // 既にメンバーの場合も冪等性のため成功として扱う。
             return Ok(());
         }
@@ -832,6 +851,28 @@ mod tests {
         }
     }
 
+    /// `create_group_if_missing`/`add_member_if_missing`が「既に存在する」
+    /// 判定に使う追加の Win32 エラーコードの実値を固定する - T17-2 実機
+    /// 検証（2回目の`setup-operators`実行）で`NetLocalGroupAdd`が
+    /// `NERR_GroupExists`(2223)ではなく`ERROR_ALIAS_EXISTS`(1379)を返す
+    /// ケースを確認した際の回帰防止。windows-sys のクレートバージョン変更で
+    /// これらの数値が変わった場合にビルドが失敗する
+    /// （`#[cfg(windows)]`のみ - MSDN で安定して文書化された Win32 の
+    /// エラーコードだが、非 Windows ビルドでは windows-sys 自体を使わない）。
+    #[cfg(windows)]
+    #[test]
+    fn alias_exists_error_codes_match_win32_constants() {
+        use windows_sys::Win32::Foundation::{ERROR_ALIAS_EXISTS, ERROR_MEMBER_IN_ALIAS};
+        assert_eq!(
+            ERROR_ALIAS_EXISTS, 1379,
+            "ERROR_ALIAS_EXISTS の値が変わった"
+        );
+        assert_eq!(
+            ERROR_MEMBER_IN_ALIAS, 1378,
+            "ERROR_MEMBER_IN_ALIAS の値が変わった"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn service_acl_access_mask_matches_win32_constants() {
@@ -872,18 +913,22 @@ mod tests {
     /// （`#[ignore]`）。Windows 実機で
     /// `cargo test -p banto-hub-core --lib service_elevated -- --ignored`
     /// を管理者権限のシェルから実行して確認する。
+    ///
+    /// 2回目の`setup_operators(None)`呼び出しが冪等な成功であることの
+    /// 確認が、`create_group_if_missing`/`add_member_if_missing`の
+    /// `ERROR_ALIAS_EXISTS`(1379)/`ERROR_MEMBER_IN_ALIAS`(1378)対応の
+    /// 実質的な回帰テストになっている（T17-2 実機検証で発見した不具合 -
+    /// `ElevatedError::CreateGroupFailed`doc参照）。
     #[cfg(windows)]
     #[test]
     #[ignore = "管理者権限と実マシンでのグループ作成が必要 - Windows 実機で手動実行"]
     fn setup_operators_creates_group_idempotently() {
+        // 冪等性の確認がこのテストの本体。メンバーシップのトークン反映
+        // （`is_current_process_operator`）はログオン後追加グループが
+        // 既存トークンに載らない既知制約があるためここでは見ない
+        // （`service_operators` モジュール doc・T17-2 実機検証メモ参照）。
         setup_operators(None).expect("first call should succeed");
         setup_operators(None).expect("second call should be a no-op success (idempotent)");
-        let is_operator =
-            crate::service_operators::is_current_process_operator().expect("should not error");
-        assert!(
-            is_operator,
-            "現在のユーザーが BantoHub Operators のメンバーになっているはず"
-        );
     }
 
     /// 実際に`BantoHub`サービスへ DACL を適用する - `BantoHub`サービスが

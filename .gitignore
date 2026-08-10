@@ -43,4 +43,7 @@ e2e/.cache/
 e2e/test-results-banto-hub/
 e2e/playwright-report-banto-hub/
 
+# Local T17 real-machine verification staging (binaries + private target/)
+_verify_t17/
+
 # pnpm-lock.yaml is intentionally NOT ignored - the lockfile is committed
