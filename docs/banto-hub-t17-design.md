@@ -2,12 +2,13 @@
 
 作成日: 2026-08-10
 状態: **設計確定。主要判断 P1〜P6 は 2026-08-10 オーナー承認済み。
-T17-0（SCM 状態取得＋start/stop/restart/autostart API 抽出）から着手可。**
+T17-0（SCM 状態取得＋start/stop/restart/autostart API 抽出、
+`apps/banto-hub/core/src/service_manager.rs`）は同日実装済み（§7）。**
 T16-0（薄いシェル）・T16-1（トレイ状態表示）はマージ済みで本書の前提。
 T16-2（サービス検出・native fallback）は本書 §4 の引き渡し契約（P5）に
-従い、T17-0 以降が提供する API を消費する形で着手する。
+従い、T17-0 が提供する API を消費する形で着手する。
 最終検証日(コード照合): 2026-08-10
-基準コミット: `91ec221`（main、T17 詳細設計草案 #114 マージ後）。
+基準コミット: `42d94c6`（main、T17 P1〜P6 承認記録 #115 マージ後）。
 
 関連: [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)
 （§8 シェル/サービス管理、§10 T16・T17、§11 データプロファイルと移行、
@@ -226,4 +227,46 @@ T16-2 が満たすべき手順（desktop-plan §9.9 のフローそのもの）:
 - [x] P5: T17-0 が提供する API を T16-2 がそのまま消費する境界（§4）
 - [x] P6: 構成パッケージの秘密除外リスト（MQTT password / password_hash / key_hash）
 
-**上記すべて 2026-08-10 オーナー承認済み。T17-0 から実装着手可。**
+**上記すべて 2026-08-10 オーナー承認済み。T17-0 は同日実装済み（§7）。**
+
+## 7. 実装メモ（2026-08-10、T17-0）
+
+T17-0（§3「T17-0」・§4「T16-2 への引き渡し契約」）のロジック層を
+`apps/banto-hub/core/src/service_manager.rs`（新設）に実装した。P1〜P6 は
+同日オーナー承認済み（§6）。T17-0 は §4 の契約に沿った API 提供のみで、
+他スライス（P1 パス一本化・P4 Demand 化等）には依存しない。
+
+- **追加した公開型**: `service_manager::ServiceManager` trait
+  （`query_status`/`start`/`stop`/`restart`/`set_auto_start`、§4 の契約
+  そのまま）・`ScmState`（`NotInstalled`/`Stopped`/`StartPending`/
+  `StopPending`/`Running`/`Other(String)`）・`ServiceStatusSummary`・
+  `ServiceManagerError`（`NotFound`/`AccessDenied`/`Timeout`/`Other`、
+  thiserror 由来）・`TransitionHandle`（目標状態を保持する薄い値型、
+  `wait_until_settled`で`query_status`をポーリングして完了を待つ）。
+  `install`/`uninstall`は trait に含めていない（§4 契約の必須面ではない）。
+- **`MockServiceManager`**: ホスト非依存・常に利用可能（`#[cfg(test)]`
+  ではない）。`installed`フラグ・現在状態・`auto_start`をメモリ上に持ち、
+  `start`/`stop`は冪等（既に目標状態なら no-op）、`restart`は
+  `stop`→`start`合成。一時的な失敗を再現する`inject_error`（1回消費）も
+  持つ。単体テスト13件で状態遷移を検証、`cargo test -p banto-hub-core
+--lib`で Linux 上でも実行できる。
+- **`WindowsServiceManager`**（`#[cfg(windows)]`）: `windows-service`
+  クレートで実 SCM を叩く。サービス名は`service_manager`モジュールに新設した
+  `SERVICE_NAME`定数（値は従来どおり`"BantoHub"`）に一本化し、
+  `win_service.rs`側の同名定数は`pub use`での再公開に変更した（値・挙動は
+  変えていない）。`set_auto_start`は`ChangeServiceConfigW`が
+  `ServiceInfo`全体を要求し、かつ`executable_path`/`launch_arguments`を
+  その場で再エスケープする都合上、`query_config`で取得した生コマンドライン
+  をそのまま渡すと二重エスケープで壊れる — そのため`win_service.rs::install`
+  と同じ組み立て方（構築時に渡す`executable_path`＋固定引数
+  `RUN_SERVICE_ARG`）で`ServiceInfo`を再構築する方式にした。
+- **既存 CLI は不変**: `win_service.rs`の`install`/`uninstall`/
+  `run-service`は本 T17-0 では一切変更していない。起動種別は現状のまま
+  `AutoStart`＋遅延自動開始（P4「Demand 化」は T17-4 で扱う）。
+- **Windows 実装の限界（Windows 実機未検証）**:
+  - `WindowsServiceManager::new`が受け取る`executable_path`は呼び出し元が
+    正しい headless exe パスを渡す前提（T16-2 では呼び出し側の責務）。
+  - `restart`の`wait_until_settled`タイムアウト（30秒・200ms間隔）は暫定値。
+  - `Paused`系遷移や実 UAC 権限不足時の検知は Windows 実機確認待ち
+    （§5 と同様）。実 SCM 呼び出しの正しさは T16-2/T17-4 着手時の実機確認へ
+    持ち越し。
