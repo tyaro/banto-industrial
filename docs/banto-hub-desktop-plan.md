@@ -13,11 +13,13 @@
 同 §9.4 の「削除前に演算タグ等の参照影響と完全な外部名を表示する」も
 実装済み。続く `cursor/t18-1-tags-revision-e3cb` で同 §9.4 の
 「revision / ETag で後勝ち上書きを防ぐ」の**検出**部分（`tags.revision` +
-楽観ロック + HTTP 409）を実装済み — **競合時の差分表示 UI は明示的に
-スコープ外として後回し**にしたため、TAG-UX-C は4点目のうち差分表示のみ
-未着手で残る。
+楽観ロック + HTTP 409）を実装済み — 競合時の差分表示 UI はその時点では
+明示的にスコープ外として後回しにしていたが、続く
+`cursor/t18-1-tags-conflict-diff-e3cb`（本 PR）でフィールド単位の差分表示 UI
+（`tagConflictDiff.ts::diffFormRecords` +「サーバー最新を採用」/
+「自分の内容で再保存」）を実装し、**TAG-UX-C は6点全て実装済み（完了）**。
 TAG-P0-2・TAG-P0-3 は未着手。
-最終検証日(コード照合): 2026-08-09
+最終検証日(コード照合): 2026-08-10
 基準コミット: `22c8c02`（main、PR #103 `optNum` 修正マージ後）。T18-1 は本 PR
 （`apps/banto-hub/src/lib/banto/continuousRegistration.ts` の
 `buildContinuousParams` 切り出しによる `count.trim()` クラッシュ修正 +
@@ -39,8 +41,12 @@ banto-hub 用 Playwright/DOM e2e 基盤の新設）で続行し、続く
 `cursor/t18-1-tags-revision-e3cb` で `tags.revision` 列・楽観的ロック
 （`TagInput::expected_revision`）・競合時 HTTP 409（`TagUpdateError`、
 `RegistryMutationError::TagRevisionConflict`）・管理 UI 側の
-`TagRevisionConflictError` ハンドリングを追加（差分表示 UI は対象外、
-`banto-hub-tags-revision.spec.ts`）。
+`TagRevisionConflictError` ハンドリングを追加（差分表示 UI はその時点では
+対象外）し、さらに続く `cursor/t18-1-tags-conflict-diff-e3cb`（本 PR）で
+競合時の差分表示 UI（`tagConflictDiff.ts::diffFormRecords`、フィールド単位
+の並列比較、「サーバー最新を採用」/「自分の内容で再保存」）を追加して
+TAG-UX-C の4点目を完成させた（`banto-hub-tags-revision.spec.ts` を拡張）。
+これにより **TAG-UX-C は6点全て実装済み（完了）**。
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [banto-hub-t16-design.md](banto-hub-t16-design.md)、
@@ -878,10 +884,62 @@ UX-5 の決定を UI のボタン非表示だけで実装しない。アプリ�
 > 成功トーストが出ず競合メッセージが出ること、別経路側の値が黙って
 > 上書きされないことを確認している。
 >
-> **未着手のまま残っている部分**: 競合時の差分表示 UI
-> （フィールド単位の並列比較・選択的マージ）のみ。検出そのもの
-> （「他セッション更新を黙って上書きしない」）は上記で受け入れ条件を
-> 満たした。
+> **2026-08-10 追加実装（T18-1 続き、`cursor/t18-1-tags-conflict-diff-e3cb`）:
+> 4点目の残り「競合時は差分を表示する」を実装済み — これで TAG-UX-C は
+> 6点全て実装済み（完了）。** 上記の検出（`selected`/`tags` をサーバー
+> 最新に差し替え、`TagRevisionConflictError` を受け取る）はそのまま維持し、
+> その後の挙動を「ローカル編集を黙って破棄してサーバー最新で上書き」から
+> 「両方の値を並べて見せ、ユーザーに選ばせる」に変えた。フロントのみの
+> 実装（新規 API/DB変更なし）:
+>
+> - 新設 `apps/banto-hub/src/lib/banto/tagConflictDiff.ts`
+>   （`diffFormRecords(local, server, labels)`、単体テスト
+>   `tagConflictDiff.test.ts` 7件）。`FormState` はページ内 private 型のため
+>   ヘルパー自体は汎用（`Record<string, unknown>` 同士の比較）にしてあり、
+>   `local`/`server` のキーの和集合を見て値が異なるフィールドだけ
+>   `{ key, label, local, server }` として返す。値は表示用に正規化する
+>   （`boolean` → 「オン」/「オフ」、空文字・`null`・`undefined` →
+>   「（空）」）。`labels` に無いキーは `key` をそのままラベルとして使う。
+> - `tags/+page.svelte::saveEdit` の競合分岐を変更: `editForm`
+>   （ユーザーが送ろうとした値）はもう破棄せずそのまま残し、`editBaseline`
+>   をサーバー最新値に差し替えて dirty のままにする（破棄確認の対象として
+>   残す）。競合検出時点の `editForm` のスナップショット（`local`）と
+>   サーバー最新値（`serverForm = formFromTag(err.current)`）を
+>   `diffFormRecords` に渡し、結果を新設 `editConflict`
+>   （`{ local, serverForm, serverTag, fields }`、`$state`）に保持する。
+>   `collectionGroupId` は数値 ID のままだと差分表示で読みにくいため、
+>   `conflictRecord()` でグループ名に変換してから比較する。フィールド
+>   ラベル（日本語）はページ側の定数 `FIELD_LABELS` に持つ
+>   （ヘルパー自体はフィールドの意味を知らない汎用実装のまま）。
+> - edit Drawer の `<form>` 上部（`tagFields` の直前）に `editConflict` が
+>   あれば競合パネルを表示する: 見出し「他のクライアントが先に更新して
+>   います」、差分が1件以上あれば「項目｜あなたの入力｜サーバー最新」の表
+>   （既存 `.preview-table` を流用）、差分が0件（内容は同じだが revision
+>   だけ進んだ稀ケース）でも「内容は同じですが revision が進んでいます。」
+>   と出す。ボタン2つ: 「サーバー最新を採用」（`resolveConflictWithServer`
+>   - `editForm`/`editBaseline` をサーバー最新値に揃えてパネルを消す）と
+>     「自分の内容で再保存」（`resolveConflictWithLocal` - `editForm` は
+>     変更せず、`selected` が競合検出時に既にサーバー最新の revision を指す
+>     ようになっている点を利用して `saveEdit()` を呼び直す。今度は
+>     `expectedRevision` が最新値と一致するので通常どおり保存が通る）。
+>     どちらのボタンも `isDrawerBusy()` 中は disabled にし、連打で
+>     `saveEdit()` の二重実行を防ぐ。保存が成功した場合（競合パネル経由でも
+>     通常の「保存」ボタン直接クリックでも）は `editConflict` をクリアする。
+> - `selectTag`・`closeDrawer`・`openCreateDrawer`・`openContinuousDrawer`・
+>   `openCsvDrawer`・`handleDelete` のいずれでも `editConflict = null` に
+>   戻す（別タグを選ぶ・Drawer を閉じる・削除する、のいずれでも古い競合
+>   パネルの状態を持ち越さない）。
+>
+> 検証は `svelte-check`（0エラー）、`vitest run`（banto-hub、212件 green -
+> `tagConflictDiff.test.ts` 7件を含む）、`pnpm e2e:banto-hub`（26件 green）。
+> 既存 `banto-hub-tags-revision.spec.ts` は挙動変更（ローカル編集を破棄せず
+> パネルで選ばせる）に伴いアサーションを書き換えた
+> （旧「保存直後にフォームがサーバー最新値に上書きされる」→ 新「保存直後は
+> ローカル入力を保持したまま競合パネルが出る」）上で、差分パネルの表示
+> （「あなたの入力」/「サーバー最新」の値）、「サーバー最新を採用」でフォーム
+> がサーバー値になりパネルが消えること、そのまま保存し直せば成功すること、
+> 2度目の競合で「自分の内容で再保存」を押すとローカルの入力が勝って
+> revision が進むこと、の4テストに拡張した。
 
 受け入れ条件:
 
