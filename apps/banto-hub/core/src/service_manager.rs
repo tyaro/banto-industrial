@@ -16,11 +16,15 @@
 //!   （[`SERVICE_NAME`]）とサービス起動引数（[`RUN_SERVICE_ARG`]）は
 //!   このファイル側の定数を`win_service.rs`が再利用する形にして重複を
 //!   避けた。
-//! - **既存の`install`/`uninstall`/`run-service`CLI（`win_service.rs`）は
-//!   一切変更していない** - 起動種別が常に`AutoStart`+遅延自動開始のまま
-//!   なのも含め挙動不変（P4「Demand 化」は T17-4 で扱う、このファイルでは
-//!   着手しない）。[`WindowsServiceManager`]は「これから T16-2 等が使う
-//!   個別操作 API」であって、既存 CLI 経路を今すぐ置き換えるものではない。
+//! - **T17-0 時点では既存の`install`/`uninstall`/`run-service`CLI
+//!   （`win_service.rs`）を一切変更していなかった** - 起動種別が常に
+//!   `AutoStart`+遅延自動開始のままなのも含め挙動不変（P4「Demand 化」は
+//!   当時 T17-4 で扱うとして、このファイルでは着手しなかった）。P4 は
+//!   その後 T17-4（2026-08-10、`service_install.rs`のモジュール doc・
+//!   docs/banto-hub-t17-design.md §11 参照）で実装済み - `install`の既定
+//!   起動種別は`OnDemand`（手動）になった。[`WindowsServiceManager`]は
+//!   「これから T16-2 等が使う個別操作 API」であって、既存 CLI 経路を
+//!   置き換えるものではない点は変わらない。
 //! - `install`/`uninstall`自体は trait に含めていない（設計 §4 の契約が
 //!   要求する最小面は query/start/stop/restart/set_auto_start のみ - 実装
 //!   指示のとおり、必須ではない拡張は避けた）。
@@ -74,9 +78,9 @@ impl std::fmt::Display for ScmState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceStatusSummary {
     pub state: ScmState,
-    /// Windows 起動時に自動開始するか（P4 決定後の既定は`false` - この
-    /// フィールド自体の意味は変わらないが、既定値を変える`install`側の
-    /// 変更は T17-4 で行う）。
+    /// Windows 起動時に自動開始するか（T17-4 で`install`の既定を
+    /// `OnDemand`（`false`相当）に変更済み - このフィールド自体の意味は
+    /// 変わらない）。
     pub auto_start: bool,
     /// 実行中プロセスの PID（`Running`以外では`None`になりうる）。
     pub pid: Option<u32>,
@@ -203,10 +207,10 @@ struct MockState {
 const MOCK_PID: u32 = 4242;
 
 impl MockServiceManager {
-    /// 登録済み・`Stopped`・自動開始 OFF の状態で始まる（P4 決定後の
-    /// `install`既定に近い状態 - T17-0 時点ではまだ`install`側の既定は
-    /// `AutoStart`のままだが、モックの既定はテストの書きやすさを優先し
-    /// `Stopped`にしている）。
+    /// 登録済み・`Stopped`・自動開始 OFF の状態で始まる（T17-4 で
+    /// `install`側の既定も`OnDemand`（自動開始 OFF 相当）になり、この
+    /// モックの既定と一致した。`Stopped`にしているのはテストの書きやすさ
+    /// を優先したもの）。
     pub fn new() -> Self {
         Self {
             state: std::sync::Mutex::new(MockState {
@@ -531,10 +535,12 @@ mod windows_impl {
             };
             service.change_config(&service_info).map_err(map_win_err)?;
             if enabled {
-                // install()と同じ判断（遅延自動開始、win_service.rs の
-                // モジュール doc 参照）を autostart 再有効化時にも適用する -
-                // P4（Demand 化）が入るまでは AutoStart=遅延あり、
-                // OnDemand=該当なし、の対応を保つ。
+                // 自動起動を明示的に有効化する経路では、install()の
+                // AutoStart 既定（T17-4 以前）と同じ判断（遅延自動開始、
+                // win_service.rs のモジュール doc 参照）を適用する -
+                // T17-4 で install() 自体の既定は OnDemand に変わったが、
+                // AutoStart=遅延あり、OnDemand=該当なし、の対応関係は
+                // 変えていない（OnDemand には遅延自動開始の概念が無い）。
                 service.set_delayed_auto_start(true).map_err(map_win_err)?;
             }
             Ok(())

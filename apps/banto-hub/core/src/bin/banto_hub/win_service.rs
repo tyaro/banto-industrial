@@ -22,14 +22,26 @@
 //!
 //! ## サービス名・表示名・起動種別
 //!
-//! サービス名 `BantoHub`・表示名「banto-hub タグサーバー」。起動種別は
-//! 自動開始だが、**遅延**自動開始
-//! （`banto_hub_core::service_install::install`内の
-//! `set_delayed_auto_start(true)`）を選んだ - banto-hub は起動直後に
-//! TCP bind と（設定次第で）LAN 上の PLC への接続を試みるため、OS 起動
-//! 直後・ネットワークスタック初期化がまだ終わっていないタイミングで
-//! 起動が競合する事故を避ける（docs/tag-server-design.md §8 常駐の
-//! 判断）。
+//! サービス名 `BantoHub`・表示名「banto-hub タグサーバー」。
+//!
+//! **T17-4（P4「Demand 化」、2026-08-10、
+//! docs/banto-hub-t17-design.md §1「P4」・§11）以降、新規インストールの
+//! 既定起動種別は手動開始（`ServiceStartType::OnDemand`）**
+//! （`banto_hub_core::service_install::install`参照）- OS 再起動だけで
+//! banto-hub の収集が始まらないようにするための決定で、`Start-Service`
+//! または管理 UI からの明示操作でのみサービスが開始する。サービスが
+//! 実際に開始したときにサービス本体（[`run_service_body`]）が即座に
+//! `Configured` 収集を開始する挙動自体は変えていない。
+//!
+//! 自動開始を有効にしたい場合（`banto_hub_core::service_manager::
+//! WindowsServiceManager::set_auto_start(true)`、管理 UI 等からの明示
+//! 操作経由）は、従来どおり**遅延**自動開始
+//! （`set_delayed_auto_start(true)`）を組み合わせる - banto-hub は起動
+//! 直後に TCP bind と（設定次第で）LAN 上の PLC への接続を試みるため、
+//! OS 起動直後・ネットワークスタック初期化がまだ終わっていないタイミング
+//! で起動が競合する事故を避ける（docs/tag-server-design.md §8 常駐の
+//! 判断）。`OnDemand`には遅延自動開始の概念が無い（Windows API 仕様）ため
+//! `install`ではこの呼び出しを行わない。
 
 use std::ffi::OsString;
 use std::sync::Arc;

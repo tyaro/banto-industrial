@@ -10,8 +10,10 @@ T17-1（profile path 一本化＋mutex/排他、`profile_paths.rs`/
 （§9）。T17-2（UAC helper / Operators / サービス ACL、§10）は
 2026-08-10 にスライス1〜2を実装済み（`service_operators.rs`・
 `service_elevated.rs`・`service_install.rs`・`banto-hub-elev.exe`）。
-Operators 委任の実機受け入れ（UAC プロンプト・メンバーの start/stop）と
-T17-4（Demand 化）・T16-2 配線は未了。**
+T17-4（P4「Demand 化」、§11）も同日実装済み
+（`service_install.rs::install`の既定起動種別を`OnDemand`へ変更）。
+Operators 委任の実機受け入れ（UAC プロンプト・メンバーの start/stop）・
+T17-4 の Windows 実機検証（§11 チェックリスト）・T16-2 配線は未了。**
 T16-0（薄いシェル）・T16-1（トレイ状態表示）はマージ済みで本書の前提。
 T16-2（サービス検出・native fallback）は本書 §4 の引き渡し契約（P5）に
 従い、T17-0/T17-3 が提供する API を消費する形で着手する。
@@ -223,9 +225,10 @@ T16-2 が満たすべき手順（desktop-plan §9.9 のフローそのもの）:
   警告が出る。証明書調達の有無はオーナー判断待ちで、本書では扱わない。
 - **上書きインストール時の既存サービス設定保持**（desktop-plan §16.3
   「上書きインストール時は既存サービスの起動種別・自動起動設定を保持」）:
-  P4 で新規インストールの既定を `Demand` にする際、既存インストールの
-  現在値をどう検出して保持するかの具体実装は T17-4 着手時に確定する
-  （本書では方針のみ）。
+  T17-4（§11）で対応済み - `install()`は SCM に同名サービスが既に存在
+  する場合は`create_service`を呼ばず早期リターンする（既存の起動種別を
+  含む設定に一切触れない）。より高度な「既存の起動種別を読み取って
+  ログ表示する」等は見送った（本スライスの最小案）。
 - **72時間ソーク・実 PLC 環境でのサービス／シェル往復**
   （desktop-plan §12.2）: T17-3 の切替トランザクションの最終確認は
   Windows 実機でのソークテストが必須。
@@ -576,4 +579,91 @@ START / STOP）を追記。`install`/`uninstall` 本体は
 移設し、`win_service` と elev の双方から呼ぶ。
 
 未了: Operators メンバーでの start/stop 実機受け入れ、T16-2 への
-`can_operate_service` 配線、T17-4 Demand 化、NSIS からの elev 呼び出し。
+`can_operate_service` 配線、NSIS からの elev 呼び出し。T17-4（P4「Demand
+化」）は §11 で実装済み。
+
+## 11. T17-4 実装メモ（2026-08-10、P4「Demand 化」）
+
+P4（§1「P4」・§6 承認済み）に沿い、`install()`の既定起動種別を
+`AutoStart`（+ 遅延自動開始）から `OnDemand`（手動）へ変更した。
+
+- **変更箇所**: `apps/banto-hub/core/src/service_install.rs::install`
+  （実体はここに一本化済み - `win_service.rs::install`は薄い委譲のまま、
+  §10 参照）。`ServiceInfo.start_type`を`ServiceStartType::OnDemand`に
+  変更し、`set_delayed_auto_start(true)`の呼び出しを削除した（`OnDemand`
+  には遅延自動開始の概念が無い - Windows API 仕様どおり、呼んでも意味を
+  持たない）。案内する`println!`を「起動種別: 手動（Demand） - OS 再起動
+  だけでは開始しません」「`Start-Service`または管理 UI から明示的に
+  開始してください」に更新した。
+- **サービス開始後の挙動は不変**: サービスが実際に開始したときに
+  `win_service.rs::run_service_body`が即座に`Configured`収集を開始する
+  既存ロジックには一切手を入れていない（実装指示どおり「サービスが
+  動くたびに収集する」のは既定 OK のまま）。
+- **自動起動を有効化する経路は変更なし**: `service_manager::
+WindowsServiceManager::set_auto_start(true)`（管理 UI 等から明示的に
+  自動起動 ON にする操作、T17-0 で実装済み）は従来どおり`AutoStart`+
+  遅延自動開始を組み立てる。P4 の決定は「新規インストール直後の既定」
+  だけを変えるもので、自動起動を選べる操作自体は残す（design §1
+  「自動起動 ON は初回セットアップウィザードでの明示操作のみで有効化」）。
+- **上書きインストール時の既存設定保持（§5 リスク）**: `install()`は
+  SCM に同名サービス（`BantoHub`）が既に存在する場合、`create_service`
+  を呼ばず**何も変更せずに早期リターン**するようにした
+  （`ServiceAccess::QUERY_CONFIG`で`open_service`を試すだけの軽い
+  存在確認）。これにより:
+  - 既存が`AutoStart`のまま（オーナーが手動で自動起動を有効化した環境
+    等）でも、アップグレード時に`Demand`へ巻き戻されることはない。
+  - NSIS post-install フック（`installer/hooks/service-hooks.nsh`、
+    下記参照）が毎回`install`を呼んでも、既存インストールでは実質
+    no-op になり、以前のように「サービスが既に存在するとエラー終了
+    （終了コード非0）」にはならない。
+  - より高度な「既存の起動種別を読み取って再現する」実装（一度
+    `uninstall`→再`install`するような操作をした場合に限り意味を持つ）
+    は本スライスでは見送った - 実装指示の「smallest safe option」を
+    採用した。
+  - **既知の制約**: 一度`uninstall`してから`install`し直すフロー
+    （docs/banto-hub-operations.md §10 に記載の設定変更手順）では、
+    この早期リターンは効かず新規作成経路を通る（`OnDemand`で作られる）。
+    これは意図どおり - `uninstall`済みなら「既存設定」はもう無い。
+- **NSIS フック**（`apps/banto-hub/installer/hooks/service-hooks.nsh`）:
+  post-install の案内メッセージを、Demand であることと「OS 再起動では
+  開始しない」ことが伝わる文言に更新した。フック自体のロジック
+  （`ExecWait`→終了コード分岐）は変更していない - 上記のとおり
+  `install`側が既存サービスを検出して正常終了するようになったことで、
+  結果的にアップグレード時の「失敗」表示が出なくなる。
+- **`service_manager.rs`のコメント更新**: T17-0 実装時点で残っていた
+  「P4 Demand 化は T17-4 で扱う（未着手）」という趣旨のコメント（モジュール
+  doc・`ServiceStatusSummary::auto_start`・`MockServiceManager::new`・
+  `set_auto_start`内）を、P4 実装済みである旨に更新した。挙動自体
+  （`query_status`/`set_auto_start`のロジック）は変更していない。
+- **ドキュメント**: `docs/banto-hub-desktop-plan.md`（状態行）・
+  `docs/banto-hub-operations.md`（§10「サービスの登録（install）」の
+  起動種別表・説明文、「起動確認」節）を Demand 前提の記述に更新した。
+- **テスト**: `cargo fmt --all`・`cargo clippy -p banto-hub-core
+--all-targets -- -D warnings`（Windows 実機、警告0件）・`cargo test -p
+banto-hub-core --lib`（`--test-threads=1`で283件 green。デフォルトの
+  並列実行では`profile_lock`テスト2件が`Global\BantoHub.default`
+  named mutex の競合で稀に失敗することを確認したが、これは T17-1
+  時点から存在する既知のテスト間競合であり本スライスの変更とは無関係
+  - `profile_lock.rs`は本スライスで変更していない）。
+- **Windows 実機での確認手順（未実施 - 次のチェックリスト）**:
+  1. テスト用の一時ディレクトリに `banto-hub.exe` を配置し、管理者
+     PowerShell で `.\banto-hub.exe install` を実行する。
+  2. `sc.exe qc BantoHub` を実行し、`START_TYPE` が
+     `3   DEMAND_START`（自動なら`2   AUTO_START`）になっていることを
+     確認する。
+  3. `Get-Service BantoHub | Select StartType` でも `Manual` になって
+     いることを確認する。
+  4. 端末を再起動しても `BantoHub` が `Stopped` のままであること
+     （`Get-Service BantoHub`）を確認する - これが P4 の目的そのもの。
+  5. `Start-Service BantoHub` で手動開始できること、開始後は従来どおり
+     `Configured` 収集が始まる（管理 UI やログで確認）ことを確認する。
+  6. 上書きインストール確認: 手順1の状態のまま再度
+     `.\banto-hub.exe install` を実行し、`sc.exe qc BantoHub` の
+     `START_TYPE` が変わらないこと（`DEMAND_START`のまま）を確認する。
+     さらに `Set-Service BantoHub -StartupType Automatic` で意図的に
+     `AutoStart` へ変更した後に再度 `install` を実行し、`AutoStart`が
+     維持される（`Demand`へ巻き戻らない）ことも確認する。
+  7. 確認後は `.\banto-hub.exe uninstall`（管理者権限）でテスト用登録を
+     削除する。**オーナーの実運用中の`BantoHub`サービスに対しては
+     この手順を実行しないこと** - 別ディレクトリ・別チェックアウトで
+     テスト用にビルドした exe を使う。

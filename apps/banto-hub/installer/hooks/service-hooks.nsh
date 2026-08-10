@@ -20,11 +20,17 @@
 ; このフックも常に管理者権限で動く - `banto-hub.exe install`/`uninstall`
 ; が要求する管理者権限をここで満たせる。
 ;
-; サービス登録に失敗しても（例: 二重インストール等で `install` が
-; べき等でないため既存サービスがあるとエラーになる）、インストーラ本体は
-; 中断させない - DetailPrint で案内するだけに留め、必要なら
-; docs/banto-hub-operations.md §10 の手順で手動対応してもらう
-; （T5-2 実装指示: 無理に完璧を狙わず、失敗時は運用手順に落とす）。
+; サービス登録に失敗しても、インストーラ本体は中断させない - DetailPrint
+; で案内するだけに留め、必要なら docs/banto-hub-operations.md §10 の手順で
+; 手動対応してもらう（T5-2 実装指示: 無理に完璧を狙わず、失敗時は運用
+; 手順に落とす）。T17-4（docs/banto-hub-t17-design.md §11）以降、
+; `banto-hub.exe install` は既に同名サービスが登録済みの場合（アップ
+; グレード時等）は既存設定を変更せず正常終了（終了コード0）するため、
+; ここで失敗として案内されるのは「本当に登録に失敗した」場合のみになった
+; （既存サービスがあるだけでは失敗しない）。
+;
+; T17-4（P4「Demand 化」）: 新規インストールの既定起動種別は手動
+; （Demand）になった - OS 再起動だけではサービスは開始しない。
 
 !include "LogicLib.nsh"
 
@@ -34,7 +40,7 @@
   ${If} $0 != 0
     DetailPrint "banto-hub: サービス登録に失敗しました（終了コード $0）。インストール後に管理者権限の PowerShell から手動で次を実行してください: `$INSTDIR\${MAINBINARYNAME}.exe install`（docs/banto-hub-operations.md §10 参照）"
   ${Else}
-    DetailPrint "banto-hub: サービス (BantoHub) を登録しました。`Start-Service BantoHub` または OS 再起動で開始します。"
+    DetailPrint "banto-hub: サービス (BantoHub) の登録を確認しました。起動種別は手動（Demand）です - OS 再起動では開始しません。`Start-Service BantoHub` または管理 UI から明示的に開始してください（既存インストールの場合は起動種別を変更していません）。"
   ${EndIf}
 !macroend
 
