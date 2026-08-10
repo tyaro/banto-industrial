@@ -12,7 +12,9 @@ T16-0（薄いシェル）・T16-1（トレイ状態表示）はマージ済み�
 T16-2（サービス検出・native fallback）は本書 §4 の引き渡し契約（P5）に
 従い、T17-0/T17-3 が提供する API を消費する形で着手する。
 最終検証日(コード照合): 2026-08-10
-基準コミット: `84f2a3f`（main、T17-0 マージ後 #116）。
+最終検証日(Windows 実機): 2026-08-10（§8「Windows 実機検証」、管理者
+PowerShell / Cursor）
+基準コミット: `7178493`（main、T17-3 マージ後 #118）。
 
 関連: [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)
 （§8 シェル/サービス管理、§10 T16・T17、§11 データプロファイルと移行、
@@ -189,11 +191,13 @@ T16-2 が満たすべき手順（desktop-plan §9.9 のフローそのもの）:
 そもそも実行しない前提とする（**要 Windows 実機スパイク**の項目には
 その旨を明記した）。
 
-- **`Global\` named mutex の Session 0 越え挙動**: `Global\` 名前空間が
-  実際にサービス（Session 0）とユーザーセッション間で同一オブジェクトを
-  指すこと自体は Win32 の文書化された仕様だが、CI ランナー環境や
-  `windows-service` クレートの実行コンテキストでどう振る舞うかは未検証。
-  要 Windows 実機スパイク。
+- **`Global\` named mutex の Session 0 越え挙動**: 2026-08-10 実機で
+  **二重起動拒否は確認**（§8「Windows 実機検証」）— サービス（Session 0 /
+  LocalSystem）稼働中に同 profile の Console 起動は exit=1 で失敗する。
+  ただし Console 側のエラーは `ProfileLockError::AlreadyHeld` ではなく
+  `ProfileLockError::Io`（os error 5 / Access Denied）になることがあり、
+  owner 診断 JSON が T16-2 fallback UI に届かない。**改善候補**（
+  improvement-plan.md §6 バックログ参照）。
 - **UAC split-token の管理者判定落とし穴**（desktop-plan §16.3 既指摘）:
   `CheckTokenMembership` が UAC 昇格前トークンでは Administrators を
   deny-only として偽の非管理者判定を返し得る。`TokenLinkedToken` を
@@ -372,13 +376,45 @@ SCM 経由の状態確認（T17-0、§7）はこのスライスでは呼んで�
   非 Windows・`x86_64-pc-windows-gnu`ターゲットの両方で警告0件
   （Windows 側`profile_lock::acquire_windows`の`unsafe`FFI 呼び出し
   経路も`cfg(windows)`ビルドとしてコンパイル検証済み）。
-- **Windows 実装の限界（Windows 実機未検証）**: `CreateMutexW`による
-  `Global\`名前空間への書き込みには通常`SeCreateGlobalPrivilege`相当の
-  権限が必要（通常ユーザーは既定で保有）だが、Session 0（サービス）と
-  Session 1+（デスクトップシェル）間で実際に同じ
-  `Global\BantoHub.<profile-id>`ミューテックスを取り合う動作そのものは
-  Windows 実機必須（§5 と同様の限界。Linux CI で検証できるのはパス解決の
-  純関数部分と、非 Windows の flock 排他が実際に機能することのみ）。
+- **Windows 実装の限界（Session 0 実機検証済み・診断文言に残課題）**:
+  `CreateMutexW`による`Global\`名前空間への書き込みには通常
+  `SeCreateGlobalPrivilege`相当の権限が必要（通常ユーザーは既定で保有）。
+  Session 0（サービス）と Session 1+（Console）間の**排他そのもの**は
+  2026-08-10 実機で確認済み（§8「Windows 実機検証」）— 2 本目は起動しない。
+  同一ユーザーセッション内の Console×2 では `AlreadyHeld` と owner 診断が
+  期待どおり返る。Cross-session では拒否は成功するがエラー種別が
+  `Io(ACCESS_DENIED)` になり得る（§5・improvement-plan.md §6）。
+  Linux CI で検証できるのはパス解決の純関数部分と、非 Windows の flock
+  排他が実際に機能することのみ。
+
+### Windows 実機検証（2026-08-10、管理者 PowerShell / Cursor）
+
+環境: Windows 10、`whoami`/管理者判定 True、`banto-hub.exe` は T17-1 入り
+（`Global\BantoHub` / `profile.lock` 文字列を含むビルド）。テスト用
+`BANTO_HUB_ROOT` を Machine 環境変数で
+`%LOCALAPPDATA%\Temp\banto-hub-t17-admin-v2-*` に向け、`BANTO_HUB_PROFILE=default`・
+`BANTO_ALLOW_SETUP=1`・`PORT=18722`・`BANTO_BIND=127.0.0.1` を Machine に設定。
+検証後はサービス登録解除と Machine 環境変数削除済み。
+
+| 項目                                   | 結果                                                    |
+| -------------------------------------- | ------------------------------------------------------- |
+| `install` → `Start-Service BantoHub`   | 成功（管理者権限）                                      |
+| Session 0 起動                         | 成功（`SessionId: 0`、`run-service`）                   |
+| T17 profile layout                     | 成功（`{root}/profiles/default/{config,data,logs}`）    |
+| `profile.lock` 診断 JSON               | 成功（`host_kind: "service"`）                          |
+| HTTP 疎通                              | 成功（`GET /api/v1/openapi.json` → 200）                |
+| 同一セッション Console×2               | 成功（2 本目 `AlreadyHeld` + owner 表示）               |
+| Session 0 越え（Service 中に Console） | **起動拒否は成功**（exit=1）、エラーは `Io(os error 5)` |
+
+**ハマりどころ（再現性）**:
+
+- Cursor シェルは `CARGO_TARGET_DIR` が sandbox 配下を指すことがあり、
+  `cargo build` しても `D:\...\target\debug\banto-hub.exe` が更新されない。
+  T17-1 未入りの古い exe だと `./banto-hub.sqlite3`（相対パス時代）を使い、
+  mutex 未到達で port bind エラー（10048）まで進む。**実機検証前に exe が
+  T17-1 入りか**（mutex 文字列の有無、profile 絶対パスログ）を確認すること。
+- 初回テストで repo 側 exe が古かったため Session 0 越え mutex は port
+  競合に見えたが、T17-1 入り exe 差し替え後に再検証で上表のとおり。
 
 ## 9. 実装メモ（2026-08-10、T17-3）
 

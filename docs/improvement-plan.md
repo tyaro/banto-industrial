@@ -447,3 +447,12 @@ H9(SLMP 構造化エラー)・H5 の E2E 拡充(いずれも Phase 4 相当/環�
 - CI の E2E は単一 spec / 単一ワーカー。画面が増えたら分割
 - `AGENTS.md` / `SECURITY.md` / `CONTRIBUTING.md` の整備(OSS として
   外部コントリビュータを迎える段階になったら)
+- **T17-1 cross-session mutex 診断**（2026-08-10 Windows 実機観察、
+  [banto-hub-t17-design.md](banto-hub-t17-design.md) §8「Windows 実機検証」）:
+  LocalSystem（Session 0）が profile mutex を保持している間、ユーザーセッション
+  から Console 起動すると**起動拒否自体は成功**するが、
+  `ProfileLockError::AlreadyHeld`（owner 診断付き）ではなく
+  `ProfileLockError::Io`（os error 5 / Access Denied）になることがある。
+  T16-2 fallback UI 向けに `CreateMutexW` の `ERROR_ALREADY_EXISTS` と
+  `ACCESS_DENIED` を分岐し、可能なら `profile.lock` から owner を読んで
+  `AlreadyHeld` に正規化する改善を検討（T17-2 以前の小改修候補）
