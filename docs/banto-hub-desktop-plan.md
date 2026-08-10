@@ -11,7 +11,11 @@
 「初期読込失敗、0件、検索結果0件、再読込中、stale 一覧を区別し、画面内に
 再試行を置く」も実装済み。続く `cursor/t18-1-tags-delete-impact-e3cb` で
 同 §9.4 の「削除前に演算タグ等の参照影響と完全な外部名を表示する」も
-実装済み。TAG-UX-C の残りは revision/ETag（4点目）のみ未着手。
+実装済み。続く `cursor/t18-1-tags-revision-e3cb` で同 §9.4 の
+「revision / ETag で後勝ち上書きを防ぐ」の**検出**部分（`tags.revision` +
+楽観ロック + HTTP 409）を実装済み — **競合時の差分表示 UI は明示的に
+スコープ外として後回し**にしたため、TAG-UX-C は4点目のうち差分表示のみ
+未着手で残る。
 TAG-P0-2・TAG-P0-3 は未着手。
 最終検証日(コード照合): 2026-08-09
 基準コミット: `22c8c02`（main、PR #103 `optNum` 修正マージ後）。T18-1 は本 PR
@@ -31,7 +35,12 @@ banto-hub 用 Playwright/DOM e2e 基盤の新設）で続行し、続く
 `banto-hub-tags-load-state.spec.ts`）を追加し、さらに続く
 `cursor/t18-1-tags-delete-impact-e3cb` で削除前の演算タグ参照影響・完全
 外部名表示（`tagDeleteImpact.ts`、
-`banto-hub-tags-delete-impact.spec.ts`）を追加。
+`banto-hub-tags-delete-impact.spec.ts`）を追加し、さらに続く
+`cursor/t18-1-tags-revision-e3cb` で `tags.revision` 列・楽観的ロック
+（`TagInput::expected_revision`）・競合時 HTTP 409（`TagUpdateError`、
+`RegistryMutationError::TagRevisionConflict`）・管理 UI 側の
+`TagRevisionConflictError` ハンドリングを追加（差分表示 UI は対象外、
+`banto-hub-tags-revision.spec.ts`）。
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [banto-hub-t16-design.md](banto-hub-t16-design.md)、
@@ -829,12 +838,50 @@ UX-5 の決定を UI のボタン非表示だけで実装しない。アプリ�
 > 削除対象の完全外部名と参照元の演算タグの外部名が両方出ること、(3) その
 > 確認を dismiss すればタグが残ることを確認している。
 >
-> **未着手のまま残っている部分**: revision/ETag による後勝ち防止・
-> 差分表示（4点目）のみ。
-> 受け入れ条件のうち「ボタン連打や保存／削除競合でも mutation は1回だけ
-> 実行される」は busy 中のボタン `disabled` 化で UI 操作からの連打は
-> 防げるようになったが、「他セッション更新を黙って上書きしない」
-> （revision/ETag 依存）はこの PR の範囲外のまま。
+> **2026-08-09 追加実装（T18-1 続き、`cursor/t18-1-tags-revision-e3cb`）:
+> 4点目「revision / ETag で後勝ち上書きを防ぐ」の前半（検出）を実装済み。
+> 競合時の差分表示 UI（フィールド単位の並列比較）は明示的にスコープ外
+> として後回しにした。** DB に
+> `crates/banto-tags/migrations/0009_tags_revision.sql` で
+> `tags.revision INTEGER NOT NULL DEFAULT 1` を追加し、
+> `banto_tags::tag::TagService::update`/`update_tx` が成功する度に
+> `revision = revision + 1` する楽観的ロックにした。
+> `TagInput::expected_revision`（`#[serde(default)]`、`None` なら後方互換
+> でチェック無し - relay-wright 等の既存クライアントは変更不要）に値を
+> 渡すと `WHERE id = ? AND revision = ?` になり、0件更新でかつ行自体は
+> 存在する場合を「他クライアントが先に更新した」競合として検出する。hub
+> の REST 層（`update_tx` 経由、新設 `TagUpdateError::RevisionConflict(Tag)`）
+> はこれを HTTP 409 + `error: "tag_revision_conflict"`・日本語 `message`・
+> 現在の `tag` を含む JSON にマップする（`CollectionEditLocked` と同じ
+> 409 パターン）。`relay-wright`/`banto-tags::TagService::update`（pool
+> 版、relay-wright が使う公開シグネチャ）は互換のため
+> `Result<Tag, BantoError>` を維持し、内部で競合を分かりやすい日本語
+> メッセージの `BantoError::Other` に畳んでいる（relay-wright の UI・型は
+> 変更していない）。管理 UI（`tags/+page.svelte::saveEdit`）は編集フォーム
+> を開いた時点の `selected.revision` を `expectedRevision` として送り、
+> `tagRegistryAdmin.ts` の新設 `TagRevisionConflictError`（`updateTag` が
+> 409 + `tag_revision_conflict` を検出したときだけ投げる専用 Error、
+> `current: Tag` を持つ）を受け取ったら **成功トーストは出さず**
+> エラートーストでサーバーのメッセージを表示し、`selected`/`editForm`/
+> `editBaseline` をサーバー最新の `Tag`（`err.current`）で上書きする
+> （ローカルの未保存編集はここで破棄する - フィールド差分の並列表示は
+> 本 PR のスコープ外と明記した通り作っていない）。`tags` 一覧配列内の
+> 該当行も差し替える。検証は `cargo test -p banto-tags`（revision 関連
+> 単体テスト7件追加、128件全て green）、`cargo test -p banto-hub-core --lib`
+> （216件 green）、`cargo check -p relay-wright-core --tests`/
+> `cargo check -p relay-wright --tests`（src-tauri 含め green、relay-wright
+> は無変更コンパイル確認のみ）、`svelte-check`/`vitest run`（banto-hub、
+> それぞれ 0 エラー・205件 green）。実 DOM 受け入れは
+> `e2e/tests-banto-hub/banto-hub-tags-revision.spec.ts`
+> （`pnpm e2e:banto-hub`）で、別経路（`page.request.put`）が先に
+> `expectedRevision` 込みで更新して revision を進めた後、UI 側で保存すると
+> 成功トーストが出ず競合メッセージが出ること、別経路側の値が黙って
+> 上書きされないことを確認している。
+>
+> **未着手のまま残っている部分**: 競合時の差分表示 UI
+> （フィールド単位の並列比較・選択的マージ）のみ。検出そのもの
+> （「他セッション更新を黙って上書きしない」）は上記で受け入れ条件を
+> 満たした。
 
 受け入れ条件:
 

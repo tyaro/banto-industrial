@@ -127,6 +127,7 @@ impl Fixture {
                 tag_kind: "plc".to_string(),
                 expression: None,
                 retain: false,
+                expected_revision: None,
             })
             .await
             .unwrap()
@@ -448,6 +449,7 @@ async fn monitor_rejects_a_modbus_connection_with_a_clear_error() {
             tag_kind: "plc".to_string(),
             expression: None,
             retain: false,
+            expected_revision: None,
         })
         .await
         .unwrap()

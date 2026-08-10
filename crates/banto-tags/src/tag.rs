@@ -145,6 +145,17 @@ pub struct Tag {
     /// consumer - `tag_kind` staying `"plc"`-only until T6 means no row can
     /// reach the internal-tag code path that would read it.
     pub retain: bool,
+    /// T18-1 (docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目「revision /
+    /// ETag で後勝ち上書きを防ぐ」): 楽観的ロック用の行バージョン。
+    /// `migrations/0009_tags_revision.sql` により新規行は `1` から始まり、
+    /// [`TagService::update`]/[`TagService::update_tx`] が成功する度に必ず
+    /// +1 される（`expected_revision` を指定しない呼び出しも例外ではない -
+    /// 「チェックしない」と「増やさない」は別の話）。呼び出し側は編集画面を
+    /// 開いた時点で取得したこの値を [`TagInput::expected_revision`] として
+    /// 送り返すことで、他セッションが先に更新した行を黙って上書きしない
+    /// ようにできる（差分表示 UI は本 PR のスコープ外 -
+    /// [`TagUpdateError::RevisionConflict`] 参照）。
+    pub revision: i64,
 }
 
 impl Tag {
@@ -214,6 +225,11 @@ pub struct TagInput {
     pub expression: Option<String>,
     #[serde(default)]
     pub retain: bool,
+    /// T18-1 (docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目): 更新時の
+    /// 楽観ロック用。create では無視。`None` なら revision チェック無し
+    /// （relay-wright 等の既存クライアント互換）だが revision は +1 する。
+    #[serde(default)]
+    pub expected_revision: Option<i64>,
 }
 
 /// Normalized, validated fields extracted from a [`TagInput`]: trimmed
@@ -657,13 +673,14 @@ fn column_map() -> ColumnMap {
         .column("tagKind", "tag_kind")
         .column("expression", "expression")
         .column("retain", "retain")
+        .column("revision", "revision")
 }
 
 const RESOURCE: &str = "tags";
 const COLUMNS: &str = "id, name, collection_group_id, address, data_type, string_length, \
      raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, \
      threshold_h, threshold_hh, threshold_l, threshold_ll, enabled, \
-     writable, tag_kind, expression, retain";
+     writable, tag_kind, expression, retain, revision";
 const FK_MESSAGE: &str = "指定された収集グループが見つかりません";
 
 /// Shared by [`TagService::create`] and [`TagService::create_batch`] (T11-1)
@@ -679,6 +696,49 @@ fn insert_tag_sql() -> String {
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          RETURNING {COLUMNS}"
     )
+}
+
+/// Shared by [`TagService::update`] and [`TagService::update_tx`] (T18-1) so
+/// the two UPDATE statements cannot drift apart - both bind the exact same
+/// 20 columns in the exact same order (mirrors [`insert_tag_sql`]'s doc
+/// comment), and both always advance `revision` regardless of whether the
+/// caller opted into the optimistic-lock check.
+///
+/// `with_expected_revision` selects the `WHERE` clause: `true` adds
+/// `AND revision = ?` (the caller must bind the expected revision as the
+/// LAST parameter, after `id`) for [`TagInput::expected_revision`]'s `Some`
+/// case; `false` keeps the pre-T18-1 unconditional `WHERE id = ?` for the
+/// `None` case (relay-wright and any other client that never adopts the
+/// lock).
+fn update_tag_sql(with_expected_revision: bool) -> String {
+    let where_clause = if with_expected_revision {
+        "WHERE id = ? AND revision = ?"
+    } else {
+        "WHERE id = ?"
+    };
+    format!(
+        "UPDATE tags SET \
+            name = ?, collection_group_id = ?, address = ?, data_type = ?, \
+            string_length = ?, raw_lo = ?, raw_hi = ?, eng_lo = ?, eng_hi = ?, unit = ?, decimals = ?, \
+            threshold_h = ?, threshold_hh = ?, threshold_l = ?, threshold_ll = ?, enabled = ?, \
+            writable = ?, tag_kind = ?, expression = ?, retain = ?, revision = revision + 1 \
+         {where_clause} RETURNING {COLUMNS}"
+    )
+}
+
+/// Fetch a tag row by id on a caller-owned connection (as opposed to
+/// [`TagService::get`], which always goes through the pool) - used by
+/// [`TagService::update_tx`] to tell apart "no such tag" from "the tag
+/// exists but `expected_revision` was stale" after a
+/// [`update_tag_sql`]-with-lock `UPDATE` returns zero rows.
+async fn fetch_tag_row(
+    connection: &mut SqliteConnection,
+    id: i64,
+) -> Result<Option<Tag>, sqlx::Error> {
+    sqlx::query_as::<_, Tag>(&format!("SELECT {COLUMNS} FROM tags WHERE id = ?"))
+        .bind(id)
+        .fetch_optional(&mut *connection)
+        .await
 }
 
 /// A single row's worth of field errors within a [`TagService::create_batch`]
@@ -708,6 +768,45 @@ pub enum BatchTagOutcome {
         count: usize,
         tags: Option<Vec<Tag>>,
     },
+}
+
+/// [`TagService::update_tx`]'s error type (T18-1, docs/banto-hub-desktop-plan.md
+/// §9.4 TAG-UX-C 4点目). A superset of `BantoError` that additionally
+/// distinguishes the one new failure mode the optimistic-lock `WHERE id = ?
+/// AND revision = ?` clause can produce: zero rows updated *because another
+/// session already advanced the revision*, as opposed to zero rows updated
+/// because the id does not exist at all. The hub REST layer needs this
+/// distinction to answer with `409 Conflict` + the current row (so the admin
+/// UI can refresh instead of silently overwriting) rather than a generic
+/// `404`/`422`.
+///
+/// [`TagService::update`] (the pool-taking, pre-T18-1-shaped method that
+/// relay-wright still calls) intentionally keeps its `Result<Tag, BantoError>`
+/// signature instead of switching to this type - see that method's doc
+/// comment for how it folds a conflict back into `BantoError`.
+#[derive(Debug)]
+pub enum TagUpdateError {
+    /// Every other failure ([`validate_tag_input`]'s field errors,
+    /// [`validate_tag_kind_placement_tx`]'s placement rule, the id simply
+    /// not existing, a UNIQUE/FOREIGN KEY violation, ...) - unchanged from
+    /// what [`TagService::update_tx`] returned before T18-1.
+    Banto(BantoError),
+    /// `WHERE id = ? AND revision = ?` matched zero rows, but the row
+    /// itself still exists (a plain `SELECT ... WHERE id = ?` on the same
+    /// connection found it) - i.e. another session updated it first. Carries
+    /// that current row so the caller can hand it back to the client
+    /// (differencing which fields actually changed is explicitly out of
+    /// scope for this PR - see docs/banto-hub-desktop-plan.md §9.4's
+    /// implementation note). Boxed - `Tag` is large enough that
+    /// `clippy::large_enum_variant` flags an unboxed `Tag` here (it would
+    /// roughly triple this enum's size over the `Banto` variant).
+    RevisionConflict(Box<Tag>),
+}
+
+impl From<BantoError> for TagUpdateError {
+    fn from(err: BantoError) -> Self {
+        Self::Banto(err)
+    }
 }
 
 /// Service layer for the `tags` resource. No delete guard is needed here
@@ -827,98 +926,167 @@ impl TagService {
             .map_err(|err| map_write_error(err, "name", "collectionGroupId", FK_MESSAGE))
     }
 
+    /// **T18-1 optimistic lock** (docs/banto-hub-desktop-plan.md §9.4
+    /// TAG-UX-C 4点目): when `input.expected_revision` is `Some(r)`, the
+    /// `UPDATE` only touches the row if it is still at revision `r`
+    /// (`WHERE id = ? AND revision = ?`) - a stale caller (one that read the
+    /// row before another session updated it) gets zero rows back instead of
+    /// silently clobbering the newer write. `None` keeps the pre-T18-1
+    /// unconditional `WHERE id = ?` for compatibility with clients that
+    /// never adopted the lock (relay-wright today) - either way `revision`
+    /// itself always advances by 1 on a successful update.
+    ///
+    /// This method's signature stays `Result<Tag, BantoError>` (unlike
+    /// [`Self::update_tx`]) so relay-wright's existing call site keeps
+    /// compiling and behaving as before: a revision conflict here is folded
+    /// into a plain [`BantoError::Other`] with a Japanese "reload and retry"
+    /// message rather than the richer [`TagUpdateError::RevisionConflict`]
+    /// (which needs a caller that can actually show the current row - the
+    /// hub REST layer, via [`Self::update_tx`]).
     pub async fn update(&self, id: i64, input: TagInput) -> Result<Tag, BantoError> {
         let validated = validate_tag_input(&input)?;
         validate_tag_kind_placement(&self.pool, input.collection_group_id, &input.tag_kind).await?;
-        sqlx::query_as::<_, Tag>(&format!(
-            "UPDATE tags SET \
-                name = ?, collection_group_id = ?, address = ?, data_type = ?, \
-                string_length = ?, \
-                raw_lo = ?, raw_hi = ?, eng_lo = ?, eng_hi = ?, unit = ?, decimals = ?, \
-                threshold_h = ?, threshold_hh = ?, threshold_l = ?, threshold_ll = ?, enabled = ?, \
-                writable = ?, tag_kind = ?, expression = ?, retain = ? \
-             WHERE id = ? RETURNING {COLUMNS}"
-        ))
-        .bind(&validated.name)
-        .bind(input.collection_group_id)
-        .bind(&validated.address)
-        .bind(&input.data_type)
-        .bind(input.string_length)
-        .bind(input.raw_lo)
-        .bind(input.raw_hi)
-        .bind(input.eng_lo)
-        .bind(input.eng_hi)
-        .bind(&validated.unit)
-        .bind(input.decimals)
-        .bind(input.threshold_h)
-        .bind(input.threshold_hh)
-        .bind(input.threshold_l)
-        .bind(input.threshold_ll)
-        .bind(input.enabled)
-        .bind(input.writable)
-        .bind(&input.tag_kind)
-        .bind(&input.expression)
-        .bind(input.retain)
-        .bind(id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|err| match err {
-            sqlx::Error::RowNotFound => BantoError::NotFound {
-                resource: RESOURCE.to_string(),
-                id: id.to_string(),
-            },
-            other => map_write_error(other, "name", "collectionGroupId", FK_MESSAGE),
-        })
+        let expected_revision = input.expected_revision;
+        let sql = update_tag_sql(expected_revision.is_some());
+        let mut query = sqlx::query_as::<_, Tag>(&sql)
+            .bind(&validated.name)
+            .bind(input.collection_group_id)
+            .bind(&validated.address)
+            .bind(&input.data_type)
+            .bind(input.string_length)
+            .bind(input.raw_lo)
+            .bind(input.raw_hi)
+            .bind(input.eng_lo)
+            .bind(input.eng_hi)
+            .bind(&validated.unit)
+            .bind(input.decimals)
+            .bind(input.threshold_h)
+            .bind(input.threshold_hh)
+            .bind(input.threshold_l)
+            .bind(input.threshold_ll)
+            .bind(input.enabled)
+            .bind(input.writable)
+            .bind(&input.tag_kind)
+            .bind(&input.expression)
+            .bind(input.retain)
+            .bind(id);
+        if let Some(revision) = expected_revision {
+            query = query.bind(revision);
+        }
+        match query.fetch_one(&self.pool).await {
+            Ok(tag) => Ok(tag),
+            Err(sqlx::Error::RowNotFound) => {
+                if expected_revision.is_some() {
+                    // Distinguish "no such tag" from "stale revision" the
+                    // same way update_tx does, just without a connection to
+                    // reuse - see that method's doc comment.
+                    let current = sqlx::query_as::<_, Tag>(&format!(
+                        "SELECT {COLUMNS} FROM tags WHERE id = ?"
+                    ))
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(banto_storage::storage_error)?;
+                    match current {
+                        Some(_) => Err(BantoError::Other(
+                            "他のクライアントがこのタグを更新済みです。再読込してから保存してください。"
+                                .to_string(),
+                        )),
+                        None => Err(BantoError::NotFound {
+                            resource: RESOURCE.to_string(),
+                            id: id.to_string(),
+                        }),
+                    }
+                } else {
+                    Err(BantoError::NotFound {
+                        resource: RESOURCE.to_string(),
+                        id: id.to_string(),
+                    })
+                }
+            }
+            Err(other) => Err(map_write_error(
+                other,
+                "name",
+                "collectionGroupId",
+                FK_MESSAGE,
+            )),
+        }
     }
 
-    /// Transaction-compatible counterpart of [`Self::update`].
+    /// Transaction-compatible counterpart of [`Self::update`] - and the
+    /// richer-error twin the hub REST layer (`tags_update`) actually calls.
+    /// Same optimistic-lock semantics as `update` (see that method's doc
+    /// comment for the WHERE-clause split on `expected_revision`), but on a
+    /// stale revision this returns [`TagUpdateError::RevisionConflict`]
+    /// carrying the tag's current row (re-fetched on the SAME `connection`,
+    /// so it reflects whatever the caller's transaction can see) instead of
+    /// folding the conflict into a generic error - the hub's REST handler
+    /// rolls back and answers `409` with that row so the admin UI can offer
+    /// "reload and retry" instead of silently overwriting.
     pub async fn update_tx(
         &self,
         connection: &mut SqliteConnection,
         id: i64,
         input: TagInput,
-    ) -> Result<Tag, BantoError> {
+    ) -> Result<Tag, TagUpdateError> {
         let validated = validate_tag_input(&input)?;
         validate_tag_kind_placement_tx(connection, input.collection_group_id, &input.tag_kind)
             .await?;
-        sqlx::query_as::<_, Tag>(&format!(
-            "UPDATE tags SET \
-                name = ?, collection_group_id = ?, address = ?, data_type = ?, \
-                string_length = ?, raw_lo = ?, raw_hi = ?, eng_lo = ?, eng_hi = ?, unit = ?, decimals = ?, \
-                threshold_h = ?, threshold_hh = ?, threshold_l = ?, threshold_ll = ?, enabled = ?, \
-                writable = ?, tag_kind = ?, expression = ?, retain = ? \
-             WHERE id = ? RETURNING {COLUMNS}"
-        ))
-        .bind(&validated.name)
-        .bind(input.collection_group_id)
-        .bind(&validated.address)
-        .bind(&input.data_type)
-        .bind(input.string_length)
-        .bind(input.raw_lo)
-        .bind(input.raw_hi)
-        .bind(input.eng_lo)
-        .bind(input.eng_hi)
-        .bind(&validated.unit)
-        .bind(input.decimals)
-        .bind(input.threshold_h)
-        .bind(input.threshold_hh)
-        .bind(input.threshold_l)
-        .bind(input.threshold_ll)
-        .bind(input.enabled)
-        .bind(input.writable)
-        .bind(&input.tag_kind)
-        .bind(&input.expression)
-        .bind(input.retain)
-        .bind(id)
-        .fetch_one(&mut *connection)
-        .await
-        .map_err(|err| match err {
-            sqlx::Error::RowNotFound => BantoError::NotFound {
-                resource: RESOURCE.to_string(),
-                id: id.to_string(),
-            },
-            other => map_write_error(other, "name", "collectionGroupId", FK_MESSAGE),
-        })
+        let expected_revision = input.expected_revision;
+        let sql = update_tag_sql(expected_revision.is_some());
+        let mut query = sqlx::query_as::<_, Tag>(&sql)
+            .bind(&validated.name)
+            .bind(input.collection_group_id)
+            .bind(&validated.address)
+            .bind(&input.data_type)
+            .bind(input.string_length)
+            .bind(input.raw_lo)
+            .bind(input.raw_hi)
+            .bind(input.eng_lo)
+            .bind(input.eng_hi)
+            .bind(&validated.unit)
+            .bind(input.decimals)
+            .bind(input.threshold_h)
+            .bind(input.threshold_hh)
+            .bind(input.threshold_l)
+            .bind(input.threshold_ll)
+            .bind(input.enabled)
+            .bind(input.writable)
+            .bind(&input.tag_kind)
+            .bind(&input.expression)
+            .bind(input.retain)
+            .bind(id);
+        if let Some(revision) = expected_revision {
+            query = query.bind(revision);
+        }
+        match query.fetch_one(&mut *connection).await {
+            Ok(tag) => Ok(tag),
+            Err(sqlx::Error::RowNotFound) => {
+                if expected_revision.is_some() {
+                    let current = fetch_tag_row(connection, id)
+                        .await
+                        .map_err(banto_storage::storage_error)?;
+                    match current {
+                        Some(tag) => Err(TagUpdateError::RevisionConflict(Box::new(tag))),
+                        None => Err(TagUpdateError::Banto(BantoError::NotFound {
+                            resource: RESOURCE.to_string(),
+                            id: id.to_string(),
+                        })),
+                    }
+                } else {
+                    Err(TagUpdateError::Banto(BantoError::NotFound {
+                        resource: RESOURCE.to_string(),
+                        id: id.to_string(),
+                    }))
+                }
+            }
+            Err(other) => Err(TagUpdateError::Banto(map_write_error(
+                other,
+                "name",
+                "collectionGroupId",
+                FK_MESSAGE,
+            ))),
+        }
     }
 
     pub async fn delete(&self, id: i64) -> Result<(), BantoError> {
@@ -1365,6 +1533,7 @@ mod tests {
             tag_kind: PLC_TAG_KIND.to_string(),
             expression: None,
             retain: false,
+            expected_revision: None,
         }
     }
 
@@ -1447,6 +1616,148 @@ mod tests {
         assert!(
             matches!(err, BantoError::NotFound { resource, id } if resource == "tags" && id == "999")
         );
+    }
+
+    // --- T18-1: revision optimistic lock ---------------------------------
+
+    #[tokio::test]
+    async fn create_sets_revision_to_one() {
+        let (svc, group_id) = setup().await;
+        let created = svc.create(sample_input("Rev1", group_id)).await.unwrap();
+        assert_eq!(created.revision, 1);
+    }
+
+    #[tokio::test]
+    async fn update_without_expected_revision_still_advances_it() {
+        let (svc, group_id) = setup().await;
+        let created = svc.create(sample_input("Rev2", group_id)).await.unwrap();
+        assert_eq!(created.revision, 1);
+
+        let mut input = sample_input("Rev2b", group_id);
+        input.expected_revision = None;
+        let updated = svc
+            .update(created.id, input)
+            .await
+            .expect("update without expected_revision should still succeed");
+        assert_eq!(updated.revision, 2);
+    }
+
+    #[tokio::test]
+    async fn update_with_matching_expected_revision_succeeds_and_advances_it() {
+        let (svc, group_id) = setup().await;
+        let created = svc.create(sample_input("Rev3", group_id)).await.unwrap();
+
+        let mut input = sample_input("Rev3b", group_id);
+        input.expected_revision = Some(created.revision);
+        let updated = svc
+            .update(created.id, input)
+            .await
+            .expect("update with the current revision should succeed");
+        assert_eq!(updated.revision, 2);
+    }
+
+    /// [`TagService::update`] (the pool-taking, relay-wright-compatible
+    /// method) folds a stale `expected_revision` into a plain
+    /// `BantoError::Other` - see that method's doc comment for why it does
+    /// not return [`TagUpdateError`].
+    #[tokio::test]
+    async fn update_with_stale_expected_revision_is_rejected_as_other() {
+        let (svc, group_id) = setup().await;
+        let created = svc.create(sample_input("Rev4", group_id)).await.unwrap();
+
+        // Another session updates first, advancing revision to 2.
+        let mut first = sample_input("Rev4-updated", group_id);
+        first.expected_revision = Some(created.revision);
+        svc.update(created.id, first)
+            .await
+            .expect("first update should succeed");
+
+        // A caller still holding the original (now stale) revision=1 is
+        // rejected instead of silently overwriting the row above.
+        let mut stale = sample_input("Rev4-stale", group_id);
+        stale.expected_revision = Some(created.revision);
+        let err = svc.update(created.id, stale).await.unwrap_err();
+        match err {
+            BantoError::Other(message) => assert!(
+                message.contains("再読込"),
+                "expected a reload-and-retry message, got {message:?}"
+            ),
+            other => panic!("expected BantoError::Other, got {other:?}"),
+        }
+
+        // The row itself must reflect the first (successful) update, not
+        // the rejected stale one - "他セッション更新を黙って上書きしない".
+        let current = svc.get(created.id).await.unwrap();
+        assert_eq!(current.name, "Rev4-updated");
+        assert_eq!(current.revision, 2);
+    }
+
+    #[tokio::test]
+    async fn update_tx_with_matching_expected_revision_succeeds_and_advances_it() {
+        let (svc, group_id) = setup().await;
+        let created = svc.create(sample_input("Rev5", group_id)).await.unwrap();
+
+        let mut input = sample_input("Rev5b", group_id);
+        input.expected_revision = Some(created.revision);
+        let mut tx = svc.pool.begin().await.expect("begin tx");
+        let updated = svc
+            .update_tx(&mut tx, created.id, input)
+            .await
+            .expect("update_tx with the current revision should succeed");
+        assert_eq!(updated.revision, 2);
+        tx.commit().await.expect("commit");
+    }
+
+    /// The richer [`TagUpdateError::RevisionConflict`] path (hub's
+    /// `update_tx`, unlike the pool `update` above): a stale
+    /// `expected_revision` returns the tag's CURRENT row so the caller can
+    /// hand it back to the client instead of just a generic error.
+    #[tokio::test]
+    async fn update_tx_with_stale_expected_revision_returns_revision_conflict_with_current_tag() {
+        let (svc, group_id) = setup().await;
+        let created = svc.create(sample_input("Rev6", group_id)).await.unwrap();
+
+        let mut first = sample_input("Rev6-updated", group_id);
+        first.expected_revision = Some(created.revision);
+        let after_first = svc
+            .update(created.id, first)
+            .await
+            .expect("first update should succeed");
+
+        let mut stale = sample_input("Rev6-stale", group_id);
+        stale.expected_revision = Some(created.revision); // the original (now stale) revision=1
+        let mut tx = svc.pool.begin().await.expect("begin tx");
+        let err = svc.update_tx(&mut tx, created.id, stale).await.unwrap_err();
+        match err {
+            TagUpdateError::RevisionConflict(current) => {
+                assert_eq!(current.id, created.id);
+                assert_eq!(current.name, "Rev6-updated");
+                assert_eq!(current.revision, after_first.revision);
+            }
+            other => panic!("expected RevisionConflict, got {other:?}"),
+        }
+        tx.rollback().await.expect("rollback");
+    }
+
+    /// A deleted id with `expected_revision` set must still report plain
+    /// `NotFound` (there is no "current row" to conflict against), not
+    /// `RevisionConflict`.
+    #[tokio::test]
+    async fn update_tx_with_expected_revision_on_a_deleted_id_is_not_found() {
+        let (svc, group_id) = setup().await;
+        let created = svc.create(sample_input("Rev7", group_id)).await.unwrap();
+        svc.delete(created.id).await.expect("delete should succeed");
+
+        let mut input = sample_input("Rev7-gone", group_id);
+        input.expected_revision = Some(created.revision);
+        let mut tx = svc.pool.begin().await.expect("begin tx");
+        let err = svc.update_tx(&mut tx, created.id, input).await.unwrap_err();
+        assert!(matches!(
+            err,
+            TagUpdateError::Banto(BantoError::NotFound { resource, id })
+                if resource == "tags" && id == created.id.to_string()
+        ));
+        tx.rollback().await.expect("rollback");
     }
 
     #[tokio::test]

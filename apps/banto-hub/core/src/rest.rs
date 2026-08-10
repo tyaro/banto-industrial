@@ -72,7 +72,7 @@ use banto_server::{
 };
 use banto_tags::{
     BatchTagOutcome, CollectionGroup, CollectionGroupInput, CollectionGroupService, PlcConnection,
-    PlcConnectionInput, PlcConnectionService, Tag, TagInput, TagService,
+    PlcConnectionInput, PlcConnectionService, Tag, TagInput, TagService, TagUpdateError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1985,6 +1985,15 @@ pub struct TagPayload {
     pub expression: Option<String>,
     #[serde(default)]
     pub retain: bool,
+    /// T18-1（docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目「revision /
+    /// ETag で後勝ち上書きを防ぐ」）: 編集画面が最後に取得した
+    /// `Tag::revision`。`#[serde(default)]`（= `None`）なので既存クライアント
+    /// のペイロードは無変更で通る（revision チェック無しの互換動作 -
+    /// `banto_tags::TagInput::expected_revision`のドキュメント参照）。管理 UI
+    /// （`tags/+page.svelte`）は編集フォームを開いた時点の `selected.revision`
+    /// を常に送る。
+    #[serde(default)]
+    pub expected_revision: Option<i64>,
 }
 
 impl From<TagPayload> for TagInput {
@@ -2010,6 +2019,7 @@ impl From<TagPayload> for TagInput {
             tag_kind: payload.tag_kind,
             expression: payload.expression,
             retain: payload.retain,
+            expected_revision: payload.expected_revision,
         }
     }
 }
@@ -2061,6 +2071,14 @@ struct TagRegistryState {
 enum RegistryMutationError {
     Api(ApiError),
     CollectionEditLocked(CollectionStatusResponse),
+    /// T18-1（docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目）:
+    /// [`TagService::update_tx`] が `TagUpdateError::RevisionConflict` を
+    /// 返した場合の REST 表現 - `CollectionEditLocked` と同じ `409`
+    /// パターンで、現在の（他セッションが先に更新した）`Tag` を丸ごと
+    /// 返す。管理 UI はこれを使ってフォームをサーバー最新値へ更新する
+    /// （差分表示 UI 自体は本 PR のスコープ外）。`banto_tags::TagUpdateError`
+    /// と同じ理由で `Box` にしている（`clippy::large_enum_variant`）。
+    TagRevisionConflict(Box<Tag>),
 }
 
 impl From<ApiError> for RegistryMutationError {
@@ -2075,6 +2093,15 @@ impl From<BantoError> for RegistryMutationError {
     }
 }
 
+impl From<TagUpdateError> for RegistryMutationError {
+    fn from(error: TagUpdateError) -> Self {
+        match error {
+            TagUpdateError::Banto(error) => Self::Api(ApiError(error)),
+            TagUpdateError::RevisionConflict(tag) => Self::TagRevisionConflict(tag),
+        }
+    }
+}
+
 impl IntoResponse for RegistryMutationError {
     fn into_response(self) -> Response {
         match self {
@@ -2086,6 +2113,15 @@ impl IntoResponse for RegistryMutationError {
                     "state": status.state,
                     "status": status,
                     "message": "収集中は構成を編集できません。停止してから再試行してください。"
+                })),
+            )
+                .into_response(),
+            Self::TagRevisionConflict(tag) => (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "tag_revision_conflict",
+                    "message": "他のクライアントがこのタグを更新済みです。再読込してから保存してください。",
+                    "tag": tag
                 })),
             )
                 .into_response(),
@@ -3012,9 +3048,14 @@ async fn tags_update(
         .map_err(storage_api_error)?;
     let updated = match state.tags.update_tx(&mut tx, id, input.into()).await {
         Ok(updated) => updated,
+        // T18-1: `TagUpdateError::RevisionConflict` の場合もロールバックは
+        // 必須 - preflight/catalog を一切見ないまま抜けるので、ここで
+        // 既にトランザクションは何も commit していない状態だが、明示的に
+        // rollback して SQLite の接続をトランザクション外に戻す
+        // （`CollectionEditLocked` 等、既存の早期 return と同じ作法）。
         Err(err) => {
             let _ = tx.rollback().await;
-            return Err(ApiError(err).into());
+            return Err(err.into());
         }
     };
     let snapshot = match preflight_transaction(&mut tx).await {

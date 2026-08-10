@@ -136,6 +136,7 @@ fn tag_input(
         tag_kind: "plc".to_string(),
         expression: None,
         retain: false,
+        expected_revision: None,
     }
 }
 

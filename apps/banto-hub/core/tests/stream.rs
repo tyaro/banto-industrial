@@ -110,6 +110,7 @@ fn tag_input(name: &str, group_id: i64, address: &str, data_type: &str) -> TagIn
         tag_kind: "plc".to_string(),
         expression: None,
         retain: false,
+        expected_revision: None,
     }
 }
 
