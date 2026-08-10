@@ -218,9 +218,13 @@ fn acquire_windows(
     lock_path: &Path,
 ) -> Result<ProfileLockGuard, ProfileLockError> {
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, SetLastError, ERROR_ALREADY_EXISTS,
+        CloseHandle, GetLastError, SetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS,
     };
-    use windows_sys::Win32::System::Threading::CreateMutexW;
+    use windows_sys::Win32::System::Threading::{CreateMutexW, OpenMutexW};
+
+    /// `OpenMutexW` の `dwDesiredAccess` — Win32 `SYNCHRONIZE`（0x0010_0000）。
+    /// windows-sys 0.61 の既定 feature セットに定数 export が無いためリテラル化。
+    const MUTEX_SYNCHRONIZE: u32 = 0x0010_0000;
 
     let name = crate::profile_paths::mutex_name(&paths.profile_id);
     let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
@@ -240,6 +244,40 @@ fn acquire_windows(
         CreateMutexW(std::ptr::null(), 1, wide_name.as_ptr())
     };
     if handle.is_null() {
+        // 2026-08-10 Windows 実機観察（docs/banto-hub-t17-design.md §8・
+        // docs/improvement-plan.md §6）: LocalSystem（Session 0 サービス）が
+        // 既に mutex を保持していると、ユーザーセッションからの
+        // `CreateMutexW`は新規作成扱いにならず`ERROR_ACCESS_DENIED`(5)で
+        // null を返す（`ERROR_ALREADY_EXISTS`にならない - セッションを
+        // 跨いだ既定のセキュリティ記述子では対象オブジェクトへの
+        // クエリ権限が無いため）。素直に`Io`化すると fallback UI が
+        // owner 診断を出せない（起動拒否自体は安全側で成功している）ので、
+        // ここで`OpenMutexW(SYNCHRONIZE)`により「開けるだけ開いて」
+        // 存在確認する - 開けたら他プロセスが保持中と確定できる。
+        let last_error = unsafe { GetLastError() };
+        if last_error == ERROR_ACCESS_DENIED {
+            let open_handle = unsafe { OpenMutexW(MUTEX_SYNCHRONIZE, 0, wide_name.as_ptr()) };
+            if !open_handle.is_null() {
+                unsafe {
+                    CloseHandle(open_handle);
+                }
+                return Err(ProfileLockError::AlreadyHeld {
+                    profile_id: paths.profile_id.clone(),
+                    owner: read_owner_info(lock_path),
+                });
+            }
+            // `OpenMutexW`も拒否された場合（更に厳しい ACL 等）でも、
+            // `profile.lock`診断ファイルが読めるなら owner 情報付きの
+            // `AlreadyHeld`に正規化する - mutex 名前空間自体は
+            // `ERROR_ACCESS_DENIED`から「誰かが存在させている」ことが
+            // 濃厚なため、`Io`より有用な診断になる。
+            if let Some(owner) = read_owner_info(lock_path) {
+                return Err(ProfileLockError::AlreadyHeld {
+                    profile_id: paths.profile_id.clone(),
+                    owner: Some(owner),
+                });
+            }
+        }
         return Err(ProfileLockError::Io(std::io::Error::last_os_error()));
     }
     let already_exists = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;

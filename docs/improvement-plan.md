@@ -456,3 +456,5 @@ H9(SLMP 構造化エラー)・H5 の E2E 拡充(いずれも Phase 4 相当/環�
   T16-2 fallback UI 向けに `CreateMutexW` の `ERROR_ALREADY_EXISTS` と
   `ACCESS_DENIED` を分岐し、可能なら `profile.lock` から owner を読んで
   `AlreadyHeld` に正規化する改善を検討（T17-2 以前の小改修候補）
+  → **2026-08-10 対応済み**（`profile_lock.rs` の `OpenMutexW` /
+  `profile.lock` フォールバック。実機で `AlreadyHeld` + owner 確認）
