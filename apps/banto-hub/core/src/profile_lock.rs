@@ -217,7 +217,9 @@ fn acquire_windows(
     host_kind: HubHostKind,
     lock_path: &Path,
 ) -> Result<ProfileLockGuard, ProfileLockError> {
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, SetLastError, ERROR_ALREADY_EXISTS,
+    };
     use windows_sys::Win32::System::Threading::CreateMutexW;
 
     let name = crate::profile_paths::mutex_name(&paths.profile_id);
@@ -229,7 +231,14 @@ fn acquire_windows(
     // 十分なため - `Global\`名前空間へ書き込むにはこのプロセス自体に
     // `SeCreateGlobalPrivilege`相当の権限が必要（通常ユーザーは既定で
     // 保有、docs/banto-hub-t17-design.md §5「要 Windows 実機スパイク」）。
-    let handle = unsafe { CreateMutexW(std::ptr::null(), 1, wide_name.as_ptr()) };
+    //
+    // `SetLastError(0)`は CreateMutexW の既知の落とし穴対策 - 新規作成に
+    // 成功した場合でも前回のスレッド last-error をクリアしないことがある
+    // ため、呼び出し直前に 0 にしてから `ERROR_ALREADY_EXISTS` を判定する。
+    let handle = unsafe {
+        SetLastError(0);
+        CreateMutexW(std::ptr::null(), 1, wide_name.as_ptr())
+    };
     if handle.is_null() {
         return Err(ProfileLockError::Io(std::io::Error::last_os_error()));
     }

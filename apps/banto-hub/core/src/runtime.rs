@@ -161,10 +161,11 @@ use crate::write_audit::WriteAuditService;
 use crate::write_control::{load_persisted_enabled, WriteControl};
 use crate::write_rate::{WriteRateLimitConfig, WriteRateLimiter};
 
-/// `BANTO_DB`未設定時の既定 DB パス。旧 `hub_run.rs`の同名定数を移設した
-/// もの - `pub`にしたのは、env 読み取りが T14-1 でホスト側
-/// （`bin/banto-hub.rs`・`bin/banto_hub/win_service.rs`）へ移ったため、
-/// 各ホストがこの既定値を参照する必要があるから（値そのものは不変）。
+/// 旧 `BANTO_DB`未設定時の相対既定 DB パス（後方互換・ドキュメント用）。
+/// T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P1）以降、3ホストの
+/// 既定パスの正は[`crate::profile_paths::resolve_profile_paths`] /
+/// [`crate::profile_paths::build_hub_config_from_env`]が返す絶対パスであり、
+/// この定数はホストの`HubConfig`組み立てでは使わない。
 pub const DEFAULT_DB_PATH: &str = "./banto-hub.sqlite3";
 
 /// tstore 保持期間剪定の周期（設計 §3.3: 24h）。ホストからは参照されない
