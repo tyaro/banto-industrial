@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」）: UAC 昇格ヘルパー
+  `banto-hub-elev.exe`専用のアプリケーションマニフェスト。
+
+  `requestedExecutionLevel level="requireAdministrator"` により、OS はこの
+  exe を起動しようとしただけで UAC 同意プロンプトを出す（コード側で
+  明示的に自己昇格を行う必要はない - Windows ローダーが埋め込みマニフェスト
+  を見て処理する）。`banto-hub.exe`本体には別マニフェストを埋め込んでいない
+  ため影響しない（`Cargo.toml`の`[[bin]]`セクション・`build.rs`参照 -
+  `embed_resource::compile_for`で`banto-hub-elev`という bin 名にだけリンク
+  される）。
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity
+      version="1.0.0.0"
+      processorArchitecture="*"
+      name="BantoHub.Elev"
+      type="win32"/>
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>

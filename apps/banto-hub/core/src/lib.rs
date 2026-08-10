@@ -121,7 +121,19 @@
 //!   （[`service_operators::is_current_process_operator`]）- T16-2/
 //!   `host_switch`の`HostSwitchConfig::can_operate_service`スタブを実際の
 //!   判定へ置き換えるための関数。グループ**作成**・サービス SDDL 付与・
-//!   UAC helper 本体は次スライス（モジュール doc 参照）
+//!   UAC helper 本体は次スライス（[`service_elevated`]、モジュール doc 参照）
+//! - [`service_install`]: T17-2 スライス2（同§3）。`bin/banto_hub/
+//!   win_service.rs`にあった Windows サービスの`install`/`uninstall`本体を
+//!   この lib crate へ移設したもの - `banto-hub.exe`（従来どおり）と
+//!   `banto-hub-elev.exe`（[`service_elevated`]）の両方から同じ登録・
+//!   登録解除ロジックを呼べるようにするため
+//! - [`service_elevated`]: T17-2 スライス2（同§3・P3）。UAC 昇格ヘルパー
+//!   `banto-hub-elev.exe`（`bin/banto-hub-elev.rs`）の実装本体。固定6
+//!   アクション（[`service_elevated::ElevatedAction`]）で、ローカルグループ
+//!   `BantoHub Operators`の作成・メンバー追加（`setup-operators`）と
+//!   `BantoHub`サービスへの限定 DACL 付与（`grant-service-acl`）を行う -
+//!   [`service_operators`]が残した「グループ作成・SDDL 付与は次スライス」を
+//!   引き継ぐ
 //!
 //! T0/T1 のスコープ外（設計冒頭の指示どおり実装しない）: gRPC、管理 UI
 //! フロントエンドの中身の一部、演算タグ、接続単位の部分再構成。書き込み
@@ -149,6 +161,8 @@ pub mod profile_lock;
 pub mod profile_paths;
 pub mod rest;
 pub mod runtime;
+pub mod service_elevated;
+pub mod service_install;
 pub mod service_manager;
 pub mod service_operators;
 pub mod settings;

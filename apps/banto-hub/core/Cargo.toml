@@ -94,6 +94,13 @@ tonic-prost-build = { workspace = true }
 # システム protoc に依存しない自己完結ビルドのため（workspace Cargo.toml の
 # コメント参照）。
 protoc-bin-vendored = { workspace = true }
+# T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」）: build.rs が
+# `banto-hub-elev.exe`にだけ`requireAdministrator`マニフェストを埋め込む
+# （`compile_for`は指定した`[[bin]]`名にのみ`cargo:rustc-link-arg-bin`を
+# 発行するため、`banto-hub`本体やテストバイナリには影響しない）。
+# Cargo.lock には既に`embed-resource 3.0.11`が（Tauri の`tauri-build`経由で）
+# 存在しており、新規バージョン系列は増えない。
+embed-resource = "3.0"
 
 [dev-dependencies]
 # T3（docs/tag-server-design.md §5.3）: `net`は tests/mqtt.rs のポート探索
@@ -140,6 +147,17 @@ windows-sys = { version = "0.61", features = [
 name = "banto-hub"
 path = "src/bin/banto-hub.rs"
 
+# T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」）: UAC 昇格ヘルパー
+# - `setup-operators`/`grant-service-acl`/`service-install`/
+# `service-uninstall`/`autostart-enable`/`autostart-disable`の6アクションのみ
+# を受け付ける薄い CLI（本体は`src/service_elevated.rs`、
+# `crate::service_elevated`参照）。`banto-hub-elev.manifest`
+# （`requireAdministrator`、`build.rs`が embed-resource でこのバイナリにだけ
+# リンクする）により、実行するだけで OS が UAC 昇格プロンプトを出す。
+[[bin]]
+name = "banto-hub-elev"
+path = "src/bin/banto-hub-elev.rs"
+
 # T5-1（docs/tag-server-design.md §8「常駐」・docs/t5-handoff.md §3）:
 # banto-hub を Windows サービスとして常駐実行するための SCM 連携
 # （service_manager でのインストール/アンインストール・
@@ -165,10 +183,24 @@ windows-service = "0.8.1"
 # （`SECURITY_ATTRIBUTES`引数の型のため - null を渡すだけで実際には使わない）。
 # 既に`[target.'cfg(windows)'.dev-dependencies]`が同じ 0.61 系を使っている
 # （tests/soak.rs）ので新規バージョン系列は増えない。
+#
+# T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」）: `service_elevated.rs`
+# が UAC 昇格ヘルパー用に4 feature 追加した -
+# `Win32_NetworkManagement_NetManagement`（`NetLocalGroupAdd`/
+# `NetLocalGroupAddMembers`、ローカルグループ`BantoHub Operators`の作成・
+# メンバー追加）、`Win32_Security_Authorization`（`SetEntriesInAclW`・
+# `EXPLICIT_ACCESS_W`、サービス DACL への ACE 追加）、`Win32_System_Services`
+# （`OpenSCManagerW`/`OpenServiceW`/`QueryServiceObjectSecurity`/
+# `SetServiceObjectSecurity`、SCM 生 API）、`Win32_System_WindowsProgramming`
+# （`GetUserNameW`、`setup-operators`のユーザー省略時デフォルト解決）。
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_NetworkManagement_NetManagement",
     "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Services",
     "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
 ] }
 
 [target.'cfg(not(windows))'.dependencies]

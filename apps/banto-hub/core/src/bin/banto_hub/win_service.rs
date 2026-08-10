@@ -11,8 +11,11 @@
 //! ## 3つのエントリポイント
 //!
 //! - [`install`][]: サービス登録（`bin/banto-hub.rs`の`install`サブコマンド、
-//!   人間が管理者権限の PowerShell から直接叩く想定）
-//! - [`uninstall`][]: サービス登録解除（同`uninstall`サブコマンド）
+//!   人間が管理者権限の PowerShell から直接叩く想定）。T17-2 スライス2で
+//!   本体を`banto_hub_core::service_install::install`へ移設し、ここは薄い
+//!   委譲になった（下記参照）。
+//! - [`uninstall`][]: サービス登録解除（同`uninstall`サブコマンド、同じく
+//!   `banto_hub_core::service_install::uninstall`への委譲）
 //! - [`run_service_dispatcher`][]: SCM がサービス開始時に呼ぶ内部
 //!   エントリポイント（同`run-service`サブコマンド - installで登録した
 //!   起動引数そのもの。人間が直接叩く想定ではない）
@@ -20,7 +23,8 @@
 //! ## サービス名・表示名・起動種別
 //!
 //! サービス名 `BantoHub`・表示名「banto-hub タグサーバー」。起動種別は
-//! 自動開始だが、**遅延**自動開始（[`install`]内の
+//! 自動開始だが、**遅延**自動開始
+//! （`banto_hub_core::service_install::install`内の
 //! `set_delayed_auto_start(true)`）を選んだ - banto-hub は起動直後に
 //! TCP bind と（設定次第で）LAN 上の PLC への接続を試みるため、OS 起動
 //! 直後・ネットワークスタック初期化がまだ終わっていないタイミングで
@@ -32,11 +36,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use windows_service::service::{
-    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
-    ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+    ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
-use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 use windows_service::{define_windows_service, service_dispatcher};
 
 use banto_hub_core::controller::{CollectionState, RunMode};
@@ -53,9 +55,14 @@ use banto_hub_core::runtime::HubRuntime;
 // 変更不要）。
 pub use banto_hub_core::service_manager::{RUN_SERVICE_ARG, SERVICE_NAME};
 
-const SERVICE_DISPLAY_NAME: &str = "banto-hub タグサーバー";
-const SERVICE_DESCRIPTION: &str =
-    "banto-hub（産業用タグサーバー）を常駐実行します。PLC からタグを収集し、REST/WebSocket/MQTT/gRPC で外部へ公開します。docs/tag-server-design.md 参照。";
+// T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」）:
+// `install`/`uninstall`の本体は`banto_hub_core::service_install`へ移設した
+// - 新設の UAC 昇格ヘルパー`banto-hub-elev.exe`（別バイナリターゲット）が
+// 同じ SCM 登録・登録解除ロジックを呼べるようにするため
+// （`service_install.rs`のモジュール doc 参照）。ここに残る`SERVICE_TYPE`は
+// `report_status`（このファイル下部）がまだ使うので削除していない -
+// `service_install.rs`側にも同じ値の複製が1つ増えている（そちら側の
+// モジュール doc 参照、値を変えるときは両方直すこと）。
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 
 /// `bin/banto-hub.rs`の`install`サブコマンド用引数リテラル。
@@ -64,106 +71,19 @@ pub const INSTALL_ARG: &str = "install";
 pub const UNINSTALL_ARG: &str = "uninstall";
 
 /// Windows サービスとして登録する（管理者権限が必要 - 失敗時はその旨を
-/// 案内して終了する）。登録するバイナリパスには`RUN_SERVICE_ARG`を起動
-/// 引数として含める - SCM が実際にプロセスを起動する際、`main`の
-/// ディスパッチが[`run_service_dispatcher`]へ振り分けるために必要。
-///
-/// 冪等ではない - 既に同名のサービスが存在する場合は`create_service`が
-/// 失敗する（Windows API の挙動そのまま）。再登録したい場合は先に
-/// [`uninstall`]すること（docs/banto-hub-operations.md に手順を記載）。
+/// 案内して終了する）。本体は`banto_hub_core::service_install::install`
+/// （このファイルのモジュール doc上部の T17-2 コメント参照）- ここは
+/// `banto-hub.exe install`から見た薄い委譲で、挙動は移設前と同一
+/// （`None`を渡すので`std::env::current_exe()`で自分自身を登録対象にする、
+/// 従来どおりの経路）。
 pub fn install() {
-    let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
-    let service_manager = match ServiceManager::local_computer(None::<&str>, manager_access) {
-        Ok(manager) => manager,
-        Err(err) => fail(&format!(
-            "banto-hub: Service Control Manager への接続に失敗しました: {err}"
-        )),
-    };
-
-    let exe_path = match std::env::current_exe() {
-        Ok(path) => path,
-        Err(err) => fail(&format!(
-            "banto-hub: 自身の実行ファイルパスの取得に失敗しました: {err}"
-        )),
-    };
-
-    let service_info = ServiceInfo {
-        name: OsString::from(SERVICE_NAME),
-        display_name: OsString::from(SERVICE_DISPLAY_NAME),
-        service_type: SERVICE_TYPE,
-        start_type: ServiceStartType::AutoStart,
-        error_control: ServiceErrorControl::Normal,
-        executable_path: exe_path.clone(),
-        launch_arguments: vec![OsString::from(RUN_SERVICE_ARG)],
-        dependencies: vec![],
-        // LocalSystem として実行（対話ユーザーのログオンに依存しない常駐 -
-        // relay-wright/chronogazer が Windows スタートアップ登録で狙って
-        // いるのと同じ「誰もログオンしていなくても動く」性質）。専用の
-        // サービスアカウントを使うかどうかは運用判断
-        // （docs/banto-hub-operations.md に記載）。
-        account_name: None,
-        account_password: None,
-    };
-
-    let service = match service_manager.create_service(&service_info, ServiceAccess::CHANGE_CONFIG)
-    {
-        Ok(service) => service,
-        Err(err) => fail(&format!("banto-hub: サービスの登録に失敗しました: {err}")),
-    };
-
-    if let Err(err) = service.set_description(SERVICE_DESCRIPTION) {
-        eprintln!("banto-hub: サービスの説明文の設定に失敗しました（登録自体は完了）: {err}");
-    }
-    // 遅延自動開始（このファイルのモジュール doc 参照）。
-    if let Err(err) = service.set_delayed_auto_start(true) {
-        eprintln!("banto-hub: 遅延自動開始の設定に失敗しました（登録自体は完了）: {err}");
-    }
-
-    println!("banto-hub: Windows サービス '{SERVICE_NAME}' を登録しました");
-    println!("banto-hub:   表示名: {SERVICE_DISPLAY_NAME}");
-    println!("banto-hub:   実行ファイル: {}", exe_path.display());
-    println!("banto-hub:   起動種別: 自動（遅延開始）");
-    println!("banto-hub: `Start-Service {SERVICE_NAME}` または OS 再起動で開始します");
+    banto_hub_core::service_install::install(None);
 }
 
-/// サービス登録を解除する（管理者権限が必要）。実行中なら先に停止する。
+/// サービス登録を解除する（管理者権限が必要）。本体は
+/// `banto_hub_core::service_install::uninstall`（上記`install`と同じ理由）。
 pub fn uninstall() {
-    let manager_access = ServiceManagerAccess::CONNECT;
-    let service_manager = match ServiceManager::local_computer(None::<&str>, manager_access) {
-        Ok(manager) => manager,
-        Err(err) => fail(&format!(
-            "banto-hub: Service Control Manager への接続に失敗しました: {err}"
-        )),
-    };
-
-    let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
-    let service = match service_manager.open_service(SERVICE_NAME, service_access) {
-        Ok(service) => service,
-        Err(err) => fail(&format!(
-            "banto-hub: サービス '{SERVICE_NAME}' が見つかりません（既に未登録の可能性）: {err}"
-        )),
-    };
-
-    match service.query_status() {
-        Ok(status) if status.current_state != ServiceState::Stopped => {
-            if let Err(err) = service.stop() {
-                eprintln!("banto-hub: サービスの停止に失敗しました: {err}");
-            } else {
-                println!("banto-hub: サービスを停止しました");
-            }
-        }
-        Ok(_) => {}
-        Err(err) => eprintln!("banto-hub: サービス状態の取得に失敗しました: {err}"),
-    }
-
-    if let Err(err) = service.delete() {
-        fail(&format!("banto-hub: サービスの削除に失敗しました: {err}"));
-    }
-
-    println!("banto-hub: Windows サービス '{SERVICE_NAME}' の登録を解除しました");
-    println!(
-        "banto-hub: （このプロセスのハンドルが閉じるまで完全な削除が遅延することがあります - Windows API の仕様）"
-    );
+    banto_hub_core::service_install::uninstall();
 }
 
 /// SCM がサービス開始時に呼ぶ内部エントリポイント（`run-service`
@@ -313,9 +233,4 @@ fn run_service_body(_arguments: Vec<OsString>) {
 
     log_line("banto-hub: Windows サービスを停止しました");
     report_status(ServiceState::Stopped, ServiceExitCode::Win32(0));
-}
-
-fn fail(message: &str) -> ! {
-    eprintln!("{message}");
-    std::process::exit(1);
 }

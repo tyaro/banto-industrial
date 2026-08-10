@@ -7,13 +7,17 @@ T17-0（SCM 状態取得＋start/stop/restart/autostart API 抽出、
 T17-1（profile path 一本化＋mutex/排他、`profile_paths.rs`/
 `profile_lock.rs`）も同日実装済み（§8）。T17-3（Desktop↔Service 切替
 トランザクション、`hub_health.rs`/`host_switch.rs`）も同日実装済み
-（§9）。**
+（§9）。T17-2（UAC helper / Operators / サービス ACL、§10）は
+2026-08-10 にスライス1〜2を実装済み（`service_operators.rs`・
+`service_elevated.rs`・`service_install.rs`・`banto-hub-elev.exe`）。
+Operators 委任の実機受け入れ（UAC プロンプト・メンバーの start/stop）と
+T17-4（Demand 化）・T16-2 配線は未了。**
 T16-0（薄いシェル）・T16-1（トレイ状態表示）はマージ済みで本書の前提。
 T16-2（サービス検出・native fallback）は本書 §4 の引き渡し契約（P5）に
 従い、T17-0/T17-3 が提供する API を消費する形で着手する。
 最終検証日(コード照合): 2026-08-10
 最終検証日(Windows 実機): 2026-08-10（§8「Windows 実機検証」、管理者
-PowerShell / Cursor）
+PowerShell / Cursor。T17-2 の UAC/Operators 委任受け入れは未実施）
 基準コミット: `7178493`（main、T17-3 マージ後 #118）。
 
 関連: [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)
@@ -538,15 +542,38 @@ DesktopHostControl, HostSwitchEngine, HostSwitchConfig}`と
     probe、未実装 - 上記`hub_health.rs`節参照）と組み合わせて
     `HostSwitchEngine`を構築し、シェル自身のタイマー/イベントループから
     `SwitchCommand::Poll`を送るだけでよい。
-- **やっていないこと**（実装指示のスコープ外どおり）: T17-2 UAC helper
-  本体・T16-2 UI 組み込み（`lib.rs`に`pub mod host_switch;`/`hub_health;`
-  を追加しただけで、Tauri コマンドや Svelte 側の配線はしていない）・実
-  Windows SCM 結合テスト（`MockServiceManager`/`MockHubHealthProbe`/
+- **やっていないこと**（実装指示のスコープ外どおり）: T16-2 UI 組み込み
+  （`lib.rs`に`pub mod host_switch;`/`hub_health;`を追加しただけで、
+  Tauri コマンドや Svelte 側の配線はしていない）・実 Windows SCM 結合
+  テスト（`MockServiceManager`/`MockHubHealthProbe`/
   `MockDesktopHostControl`のみ - 実際の2プロセス切替・DB lock・PLC
-  接続競合は Windows 実機必須、§5 のリスク一覧に変更なし）。
+  接続競合は Windows 実機必須、§5 のリスク一覧に変更なし）。T17-2 UAC
+  helper 本体は §10 で実装済み。
 - **テスト**: `cargo fmt -p banto-hub-core -- --check`・
   `cargo clippy -p banto-hub-core --all-targets -- -D warnings`（非
   Windows・`x86_64-pc-windows-gnu`の両方で警告0件）・
   `cargo test -p banto-hub-core --lib host_switch`（17件）・
   `cargo test -p banto-hub-core --lib`（`hub_health`4件を含め全271件）が
   Linux 上で green。
+
+## 10. T17-2 実装メモ（2026-08-10）
+
+スライス1: [`service_operators.rs`](../apps/banto-hub/core/src/service_operators.rs)
+— `is_current_process_operator()`（`LookupAccountNameW` +
+`CheckTokenMembership`）。グループ未作成時は `Ok(false)`。
+
+スライス2: UAC 昇格ヘルパー `banto-hub-elev.exe`
+（[`service_elevated.rs`](../apps/banto-hub/core/src/service_elevated.rs) /
+[`banto-hub-elev.rs`](../apps/banto-hub/core/src/bin/banto-hub-elev.rs)）。
+固定6アクションのみ受理（`setup-operators` / `grant-service-acl` /
+`service-install` / `service-uninstall` / `autostart-enable` /
+`autostart-disable`）。`requireAdministrator` マニフェストは
+`embed_resource::compile_for` で elev バイナリにのみ埋め込み。
+サービス DACL は `SetEntriesInAclW` で既存 ACE を壊さず
+`(A;;CCLCRPWP;;;OperatorsSID)` 相当（QUERY_CONFIG / QUERY_STATUS /
+START / STOP）を追記。`install`/`uninstall` 本体は
+[`service_install.rs`](../apps/banto-hub/core/src/service_install.rs) へ
+移設し、`win_service` と elev の双方から呼ぶ。
+
+未了: Operators メンバーでの start/stop 実機受け入れ、T16-2 への
+`can_operate_service` 配線、T17-4 Demand 化、NSIS からの elev 呼び出し。

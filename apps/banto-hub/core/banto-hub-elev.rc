@@ -1,0 +1,10 @@
+// T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」）:
+// `banto-hub-elev.exe`だけに`requireAdministrator`マニフェストを埋め込む
+// ためのリソーススクリプト。`build.rs`が`embed_resource::compile_for`で
+// `banto-hub-elev`という`[[bin]]`名にのみリンクする。
+//
+// `1 24 "..."` は Win32 の慣例的な数値表現そのもの
+// （`CREATEPROCESS_MANIFEST_RESOURCE_ID` = 1, `RT_MANIFEST` = 24）で、
+// windows.h 等のインクルードを一切必要としない最小形。
+
+1 24 "banto-hub-elev.manifest"

@@ -23,23 +23,21 @@
 //!      （または呼び出しプロセスの主トークン、`hToken=NULL`時の既定挙動）に
 //!      その SID が含まれるかを確認する。
 //!
-//! ## このスライスで行っていないこと（slice 2 へ申し送り）
+//! ## slice 2 での引き継ぎ（実装済み）
 //!
-//! - `BantoHub Operators` グループ**自体の作成**・削除・メンバー追加
-//!   （`NetLocalGroupAdd`/`NetLocalGroupAddMembers` 相当）は実装しない。
-//! - 対象サービスの Security Descriptor への SDDL 付与
-//!   （`SetServiceObjectSecurity` で `SC_MANAGER_CONNECT` +
-//!   `SERVICE_QUERY_STATUS`/`QUERY_CONFIG`/`START`/`STOP` のみを
-//!   `BantoHub Operators` SID へ許可する、desktop-plan §8.3・本設計 P3）も
-//!   実装しない。
-//! - UAC helper 本体（固定アクション文字列のみを受け付ける単機能 exe）も
-//!   実装しない。
+//! - `BantoHub Operators` グループ**自体の作成**・メンバー追加
+//!   （`NetLocalGroupAdd`/`NetLocalGroupAddMembers`）、対象サービスの
+//!   Security Descriptor への ACE 付与（`SetServiceObjectSecurity`）、
+//!   UAC helper 本体（`banto-hub-elev.exe`）は [`crate::service_elevated`]
+//!   （slice 2）が実装した。このモジュールは変更していない -
+//!   [`lookup_account_sid`][windows_impl::lookup_account_sid]（本来
+//!   `lookup_group_sid`という名前だった）を`pub(crate)`に広げ、
+//!   `service_elevated`がユーザー名/グループ名 SID 解決の両方に再利用できる
+//!   ようにしただけ。
 //!
-//! いずれも T17-2 の残りスライス（UAC helper exe 新設）で扱う
-//! （`docs/banto-hub-t17-design.md` §3「T17-2」参照）。グループが未作成の
-//! 環境（このスライス時点の全環境を含む）では、[`is_current_process_operator`]
-//! は Windows API エラーにはせず、安全側で `Ok(false)` を返す
-//! （関数のドキュメント参照）。
+//! グループが未作成の環境（`service_elevated::setup_operators`実行前の
+//! 全環境を含む）では、[`is_current_process_operator`]は Windows API
+//! エラーにはせず、安全側で `Ok(false)` を返す（関数のドキュメント参照）。
 //!
 //! ## 既知の未検証事項（要 Windows 実機、`docs/banto-hub-t17-design.md` §5）
 //!
@@ -107,8 +105,14 @@ pub fn is_current_process_operator() -> Result<bool, OperatorsError> {
     windows_impl::is_current_process_operator()
 }
 
+// T17-2 スライス2（`service_elevated.rs`）が`lookup_account_sid`を
+// `BantoHub Operators`グループだけでなく指定ユーザー名の SID 解決にも
+// 再利用するため`pub(crate)`にした - スライス1時点では`is_current_process_
+// operator`専用のプライベートヘルパーだったが、`LookupAccountNameW`自体は
+// ユーザー・ローカルグループのどちらの名前解決にも使える汎用 API なので
+// （関数doc参照）、実装を複製せずここを再利用する。
 #[cfg(windows)]
-mod windows_impl {
+pub(crate) mod windows_impl {
     use windows_sys::Win32::Foundation::{GetLastError, ERROR_NONE_MAPPED};
     use windows_sys::Win32::Security::{
         CheckTokenMembership, LookupAccountNameW, PSID, SID_NAME_USE,
@@ -117,7 +121,7 @@ mod windows_impl {
     use super::{OperatorsError, OPERATORS_GROUP_NAME};
 
     pub(super) fn is_current_process_operator() -> Result<bool, OperatorsError> {
-        let mut sid = match lookup_group_sid(OPERATORS_GROUP_NAME)? {
+        let mut sid = match lookup_account_sid(OPERATORS_GROUP_NAME)? {
             Some(sid) => sid,
             // グループ未作成 - モジュール doc・関数 doc の「安全側で false」節。
             None => return Ok(false),
@@ -143,15 +147,18 @@ mod windows_impl {
         Ok(is_member != 0)
     }
 
-    /// グループ名からこのマシン上の SID を解決する。
+    /// アカウント名（ユーザー名またはローカルグループ名）からこのマシン
+    /// 上の SID を解決する。
     ///
     /// `LookupAccountNameW`はユーザーだけでなくローカルグループ（エイリアス、
-    /// `SidTypeAlias`）の名前解決にも使える。`ERROR_NONE_MAPPED`
-    /// （名前がどのアカウントにも一致しない = グループ未作成）は`Ok(None)`
+    /// `SidTypeAlias`）の名前解決にも使える汎用 API - `service_elevated.rs`
+    /// （T17-2 スライス2）が`BantoHub Operators`グループと指定ユーザー名の
+    /// 両方の SID 解決にこの関数を再利用する。`ERROR_NONE_MAPPED`
+    /// （名前がどのアカウントにも一致しない = 未作成/未存在）は`Ok(None)`
     /// として区別し、それ以外の失敗のみ`Err`にする - 呼び出し元
-    /// （[`is_current_process_operator`]）がこの区別で「未作成なら false」を
-    /// 実装できるようにするため。
-    fn lookup_group_sid(name: &str) -> Result<Option<Vec<u8>>, OperatorsError> {
+    /// （[`is_current_process_operator`]はこれを「未作成なら false」に、
+    /// `service_elevated`は「アカウント未検出」エラーにそれぞれ変換する）。
+    pub(crate) fn lookup_account_sid(name: &str) -> Result<Option<Vec<u8>>, OperatorsError> {
         let wide_name: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
 
         let mut sid_size: u32 = 0;
