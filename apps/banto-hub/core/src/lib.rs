@@ -115,6 +115,13 @@
 //!   を型で表現し、二重接続を起こさないことをテストで固定する。進行状態の
 //!   所有者はシェル（ネイティブ側）- このモジュール自身はタイマー・スレッドを
 //!   持たない（モジュール doc 参照）
+//! - [`service_operators`]: T17-2 スライス1（docs/banto-hub-t17-design.md
+//!   §3「T17-2」・P3）。ローカルグループ`BantoHub Operators`
+//!   （[`service_operators::OPERATORS_GROUP_NAME`]）へのメンバーシップ判定
+//!   （[`service_operators::is_current_process_operator`]）- T16-2/
+//!   `host_switch`の`HostSwitchConfig::can_operate_service`スタブを実際の
+//!   判定へ置き換えるための関数。グループ**作成**・サービス SDDL 付与・
+//!   UAC helper 本体は次スライス（モジュール doc 参照）
 //!
 //! T0/T1 のスコープ外（設計冒頭の指示どおり実装しない）: gRPC、管理 UI
 //! フロントエンドの中身の一部、演算タグ、接続単位の部分再構成。書き込み
@@ -143,6 +150,7 @@ pub mod profile_paths;
 pub mod rest;
 pub mod runtime;
 pub mod service_manager;
+pub mod service_operators;
 pub mod settings;
 pub mod stream;
 pub mod subscribe_core;

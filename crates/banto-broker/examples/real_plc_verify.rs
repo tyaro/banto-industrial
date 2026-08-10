@@ -129,9 +129,7 @@ async fn read_once(requests: &[ReadRequest]) -> Result<Vec<ReadResult>, String> 
 }
 
 /// [`write_once`] の読み取り版（文字列混在バッチ）。
-async fn read_mixed_once(
-    requests: &[BatchReadRequest],
-) -> Result<Vec<BatchReadResult>, String> {
+async fn read_mixed_once(requests: &[BatchReadRequest]) -> Result<Vec<BatchReadResult>, String> {
     let mut client = SlmpClient::new(base_config());
     client
         .connect()
@@ -262,7 +260,9 @@ async fn phase2_write_and_bit_rmw() -> Result<(), String> {
             fmt_word_result(&word[0])
         );
         if !matches!(w.first(), Some(WriteResult::Ok)) {
-            return Err(format!("D3010.{bit} への RMW 書込が Ok を返しませんでした: {w:?}"));
+            return Err(format!(
+                "D3010.{bit} への RMW 書込が Ok を返しませんでした: {w:?}"
+            ));
         }
     }
 
@@ -281,10 +281,7 @@ async fn phase2_write_and_bit_rmw() -> Result<(), String> {
         data_type: DataType::U16,
     }])
     .await?;
-    println!(
-        "[2b] D3010 クリア後: {}",
-        fmt_word_result(&final_word[0])
-    );
+    println!("[2b] D3010 クリア後: {}", fmt_word_result(&final_word[0]));
 
     // 2c: M1000 は素のビットデバイス（D側のRMWと対比するため通常の
     // Numeric/Bit書込で試す — BitInWord は使わない）。
@@ -302,7 +299,9 @@ async fn phase2_write_and_bit_rmw() -> Result<(), String> {
         .await?;
         println!("[2c] M1000={value} 書込結果={w:?} 読戻={r:?}");
         if !matches!(r.first(), Some(ReadResult::Value(TagValue::Bit(b))) if *b == value) {
-            return Err(format!("M1000={value} の書込/読戻が一致しませんでした: {r:?}"));
+            return Err(format!(
+                "M1000={value} の書込/読戻が一致しませんでした: {r:?}"
+            ));
         }
     }
 
