@@ -1,7 +1,7 @@
 # banto-hub アプリ／サービス運転計画（T14〜）
 
 作成日: 2026-08-09
-状態: **計画確定。T14・T15 完了。T16 詳細設計は [banto-hub-t16-design.md](banto-hub-t16-design.md)（P1〜P3 承認済み）。T16-0（薄いシェル `banto-hub-shell`）・T16-1（トレイ状態表示）マージ済み。T16-2 は T17（サービス管理・profile・mutex）依存のため後回し。進行中: T18-1（タグ登録 UI/UX の正しさ修正）。§16.4 の `optNum` null 取りこぼしと §9 TAG-P0-1 本体（連続登録 `count.trim()` クラッシュ）はロジック側を修正済み。**2026-08-09（本 PR）: §16.3「banto-hub の Playwright/DOM テスト基盤を T18-1 へ前倒し」を実施し、`e2e/banto-hub.playwright.config.ts`（`pnpm e2e:banto-hub`）を新設。TAG-P0-1 の残受け入れ条件（実 DOM からの点数変更テスト）を `e2e/tests-banto-hub/banto-hub-tags-continuous.spec.ts` で満たし、DOM/E2E 側も含めて TAG-P0-1 は受け入れ条件を全て満たした（closed）。** 2026-08-09（本 PR、
+状態: **計画確定。T14・T15 完了。T16 詳細設計は [banto-hub-t16-design.md](banto-hub-t16-design.md)（P1〜P3 承認済み）。T16-0（薄いシェル `banto-hub-shell`）・T16-1（トレイ状態表示）マージ済み。T16-2 は T17（サービス管理・profile・mutex）依存のため後回し。2026-08-10: T17 詳細設計草案 [banto-hub-t17-design.md](banto-hub-t17-design.md) を追加（P1〜P6 は提案でオーナー未承認、実装未着手）。進行中: T18-1（タグ登録 UI/UX の正しさ修正）。§16.4 の `optNum` null 取りこぼしと §9 TAG-P0-1 本体（連続登録 `count.trim()` クラッシュ）はロジック側を修正済み。**2026-08-09（本 PR）: §16.3「banto-hub の Playwright/DOM テスト基盤を T18-1 へ前倒し」を実施し、`e2e/banto-hub.playwright.config.ts`（`pnpm e2e:banto-hub`）を新設。TAG-P0-1 の残受け入れ条件（実 DOM からの点数変更テスト）を `e2e/tests-banto-hub/banto-hub-tags-continuous.spec.ts` で満たし、DOM/E2E 側も含めて TAG-P0-1 は受け入れ条件を全て満たした（closed）。** 2026-08-09（本 PR、
 `cursor/t18-1-form-dirty-e3cb`）: §9.4 TAG-UX-C のうち dirty 追跡と破棄確認
 を実装（詳細は §9.4 TAG-UX-C の実装メモ）。続く `cursor/t18-1-drawer-busy-e3cb`
 で同 §9.4 の「保存、削除、検証、登録、閉じるを Drawer 単位の busy 状態で
@@ -53,6 +53,7 @@ TAG-UX-C の4点目を完成させた（`banto-hub-tags-revision.spec.ts` を拡
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [banto-hub-t16-design.md](banto-hub-t16-design.md)、
+[banto-hub-t17-design.md](banto-hub-t17-design.md)、
 [ux-plan.md](ux-plan.md)、
 [banto-hub-operations.md](banto-hub-operations.md)、
 [plan.md](plan.md)、
@@ -1597,6 +1598,13 @@ write peek を実装し、T15 を完了させた（§16.3「T15（全 PLC シミ
   据え置き）。
 
 ### T17: サービス管理、プロファイル、インストーラ
+
+> **2026-08-10 追記**: T17 着手に必要な判断（profile path 一本化・
+> Desktop↔Service 排他・`BantoHub Operators`/UAC helper 権限境界・
+> インストーラの収集非開始保証・T16-2 への引き渡し契約・構成パッケージの
+> 秘密除外リスト）を [banto-hub-t17-design.md](banto-hub-t17-design.md)
+> に落とした。**同書の P1〜P6 は提案であり、オーナー承認待ち**（T16-design
+> の P1〜P3 とは異なり未承認）。承認前は T17 の実装に着手しない。
 
 - T5-1 の `install` / `uninstall` / `run-service` と `win_service` から SCM
   管理層を抽出し、状態取得、開始、停止、再起動、自動起動切替へ拡張する。
