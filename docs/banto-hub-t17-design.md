@@ -396,15 +396,15 @@ SCM 経由の状態確認（T17-0、§7）はこのスライスでは呼んで�
 `BANTO_ALLOW_SETUP=1`・`PORT=18722`・`BANTO_BIND=127.0.0.1` を Machine に設定。
 検証後はサービス登録解除と Machine 環境変数削除済み。
 
-| 項目                                   | 結果                                                    |
-| -------------------------------------- | ------------------------------------------------------- |
-| `install` → `Start-Service BantoHub`   | 成功（管理者権限）                                      |
-| Session 0 起動                         | 成功（`SessionId: 0`、`run-service`）                   |
-| T17 profile layout                     | 成功（`{root}/profiles/default/{config,data,logs}`）    |
-| `profile.lock` 診断 JSON               | 成功（`host_kind: "service"`）                          |
-| HTTP 疎通                              | 成功（`GET /api/v1/openapi.json` → 200）                |
-| 同一セッション Console×2               | 成功（2 本目 `AlreadyHeld` + owner 表示）               |
-| Session 0 越え（Service 中に Console） | **起動拒否は成功**（exit=1）、エラーは `Io(os error 5)` |
+| 項目                                   | 結果                                                                                                                                      |
+| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `install` → `Start-Service BantoHub`   | 成功（管理者権限）                                                                                                                        |
+| Session 0 起動                         | 成功（`SessionId: 0`、`run-service`）                                                                                                     |
+| T17 profile layout                     | 成功（`{root}/profiles/default/{config,data,logs}`）                                                                                      |
+| `profile.lock` 診断 JSON               | 成功（`host_kind: "service"`）                                                                                                            |
+| HTTP 疎通                              | 成功（`GET /api/v1/openapi.json` → 200）                                                                                                  |
+| 同一セッション Console×2               | 成功（2 本目 `AlreadyHeld` + owner 表示）                                                                                                 |
+| Session 0 越え（Service 中に Console） | **起動拒否は成功**（exit=1）。初回は `Io(os error 5)` だったが **`c9a2d73` で `AlreadyHeld` + owner（`host_kind: service`）に正規化済み** |
 
 **ハマりどころ（再現性）**:
 
@@ -415,6 +415,22 @@ SCM 経由の状態確認（T17-0、§7）はこのスライスでは呼んで�
   T17-1 入りか**（mutex 文字列の有無、profile 絶対パスログ）を確認すること。
 - 初回テストで repo 側 exe が古かったため Session 0 越え mutex は port
   競合に見えたが、T17-1 入り exe 差し替え後に再検証で上表のとおり。
+
+### Windows 実機検証 — Console→Service 切替（2026-08-10 夕方）
+
+同一 profile（`BANTO_HUB_ROOT` 共有 DB）で Console 収集 → 強制停止 → Service
+起動の手動切替（`HostSwitchEngine` 配線前の疎通確認。SLMP
+`192.168.11.200:5200`、タグ `line1.g1.d3000`）。
+
+| 段階                          | 結果                                               |
+| ----------------------------- | -------------------------------------------------- |
+| Console 収集中                | `q=good`、PLC TCP Established **1**                |
+| Console 停止直後              | PLC TCP Established **0**（セッション解放）        |
+| Service 起動後                | PLC TCP Established **1**（二重接続なし）          |
+| Service 中に Console 二重起動 | exit=1、`AlreadyHeld` + owner `host_kind: service` |
+
+**未了（T17-3 / T16-2 スコープ）**: `HostSwitchEngine` 経由の自動切替、
+graceful shutdown、実 HTTP `HubHealthProbe`、Shell↔Service 往復の全段階。
 
 ## 9. 実装メモ（2026-08-10、T17-3）
 

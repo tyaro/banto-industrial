@@ -1777,10 +1777,13 @@ owner ACL を設定する。グループ変更、profile owner 追加、ACL 変�
 > **2026-08-10 部分確認済み**（[banto-hub-t17-design.md](banto-hub-t17-design.md)
 > §8、[improvement-plan.md](improvement-plan.md) §6）:
 >
-> - Session 0 サービス起動 + 同 profile Console 二重起動拒否（mutex）
+> - Session 0 サービス起動 + 同 profile Console 二重起動拒否（mutex、
+>   **`AlreadyHeld` + owner 正規化済み** `c9a2d73`）
 > - SLMP 実 PLC 読取・banto-hub 収集1本・PLC TCP Established 1本
 >   （`real_plc_verify` フェーズ1/4、`192.168.11.200:5200`）
-> - **未了**: Desktop↔Service 往復切替、UAC/Operators、72h ソーク、
+> - **Console→Service 手動切替**（同一 profile DB、Console 停止後 TCP 0 →
+>   Service 起動後 TCP 1、二重接続なし — banto-hub-t17-design.md §8 末尾）
+> - **未了**: `HostSwitchEngine` 自動切替、UAC/Operators（T17-2）、
 >   初回インストール〜常時運転化の通し、OS 再起動×自動起動 4 組合せ 等
 
 - 初回インストールからタグ登録、SIM、実機試運転、常時運転化
