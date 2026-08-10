@@ -149,7 +149,7 @@ desktop-plan §10 に日付付きで追記する（T16-0 PR で実施）。
 > profile ACL（desktop-plan §11）未実装の既知ギャップ。検証時は
 > config を消すか Users に Modify を付与して Desktop 経路を確認した。
 
-### T16-2 第一スライスの既知の gap（次スライスへの引き継ぎ）
+## 4. T16-0 設計（P3）
 
 ### 4.1 Composition
 
