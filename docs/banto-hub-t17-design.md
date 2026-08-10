@@ -13,15 +13,15 @@ T17-1（profile path 一本化＋mutex/排他、`profile_paths.rs`/
 T17-4（P4「Demand 化」、§11）も同日実装済み
 （`service_install.rs::install`の既定起動種別を`OnDemand`へ変更）。
 2026-08-10 Windows 実機で T17-2/T17-4 の主要チェックを実施済み
-（§10・§11。Demand 登録・既存保持・Operators 作成・サービス ACL・
-`setup-operators` 冪等修正）。未了: OS 再起動での Demand 確認、
-非管理者 Operators メンバーでの start/stop、UAC 同意プロンプト
-（非昇格シェル）、T16-2 配線。**
+（§10・§11。Demand 登録・OS 再起動後 Stopped・手動 Start・既存保持・
+Operators 作成・サービス ACL・`setup-operators` 冪等・UAC プロンプト・
+非管理者 Operators 委任）。未了: T16-2 配線。**
 T16-0（薄いシェル）・T16-1（トレイ状態表示）はマージ済みで本書の前提。
 T16-2（サービス検出・native fallback）は本書 §4 の引き渡し契約（P5）に
 従い、T17-0/T17-3 が提供する API を消費する形で着手する。
 最終検証日(コード照合): 2026-08-10
-最終検証日(Windows 実機): 2026-08-10（§8・§10・§11、管理者 Cursor）
+最終検証日(Windows 実機): 2026-08-10（§8・§10・§11、管理者 Cursor +
+オーナー対話。Operators 非管理者委任まで完了）
 基準コミット: `7178493`（main、T17-3 マージ後 #118）。
 
 関連: [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)
@@ -595,7 +595,19 @@ START / STOP）を追記。`install`/`uninstall` 本体は
 | `grant-service-acl`（`sc sdshow` に `(A;;CCLCRPWP;;;OperatorsSID)`） | OK・再実行も OK                                                                 |
 | `setup-operators` 2回目                                              | 初回検証時 **status 1379**（`ERROR_ALIAS_EXISTS`）で失敗 → 同日修正後 OK        |
 | `is_current_process_operator`（ログオン後追加グループ）              | メンバー追加済みでも現トークンでは `false` になり得る（既知制約・要再ログオン） |
-| 非管理者 Operators での start/stop・UAC プロンプト                   | **未実施**                                                                      |
+| Demand：OS 再起動後も `Stopped` / `DEMAND_START`                     | **OK**（2026-08-10 オーナー実機）                                               |
+| `Start-Service` で `Running` になること                              | **OK**（同日）                                                                  |
+| UAC 同意プロンプト（非昇格シェルから `banto-hub-elev`）              | **OK**（同日）                                                                  |
+| 非管理者 Operators（`BantoOpTest`）での委任                          | **OK**（同日。下記「Operators 委任」節）                                        |
+
+#### Operators 委任（2026-08-10、`BantoOpTest`、cmd）
+
+- `sc query` — 成功（RUNNING を取得）
+- `sc start` — 既に実行中のため **1056**（`StartService` 自体は受理され、
+  Access Denied ではない = START 権限あり）
+- `sc stop` — Access Denied にならず制御を受け付け（STOP 権限あり）
+- `sc config ... start=auto` / `sc delete` — いずれも **OpenService FAILED 5
+  （アクセスが拒否されました）** = CHANGE_CONFIG / DELETE は委任されていない
 
 ## 11. T17-4 実装メモ（2026-08-10、P4「Demand 化」）
 
@@ -660,13 +672,18 @@ banto-hub-core --lib`（`--test-threads=1`で283件 green。デフォルトの
   named mutex の競合で稀に失敗することを確認したが、これは T17-1
   時点から存在する既知のテスト間競合であり本スライスの変更とは無関係
   - `profile_lock.rs`は本スライスで変更していない）。
-- **Windows 実機での確認（2026-08-10、管理者 Cursor、`_verify_t17/`）**:
+- **Windows 実機での確認（2026-08-10、管理者 Cursor + オーナー対話）**:
   1. [x] テスト用 exe で `install` → `sc.exe qc` が
          `START_TYPE: 3 DEMAND_START`、`Get-Service` が `Manual` / `Stopped`
   2. [x] 再 `install` → 早期リターン、`DEMAND_START` 維持
   3. [x] `Set-Service -StartupType Automatic` 後の再 `install` →
          `AUTO_START` 維持（Demand へ巻き戻らない）
-  4. [ ] OS 再起動後も Stopped のまま（Demand の最終確認）— 未実施
-  5. [ ] `Start-Service` 後の Configured 収集開始 — 未実施（本セッションは
-         登録・起動種別・ACL に限定）
-  6. [x] 確認後 `uninstall` でテスト用登録を削除（検証後クリーンアップ）
+  4. [x] OS 再起動後も `Stopped` / `Manual` / `DEMAND_START`（オーナー確認）
+  5. [x] `Start-Service BantoHub` で `Running`（オーナー確認。Configured
+         収集のログ目視は任意・未必須）
+  6. [x] 確認後いったん `uninstall`（Cursor 検証後）。オーナーが再登録して
+         ①〜③を実施。最終片付けは④完了後
+  7. [x] UAC プロンプト（非昇格から elev）— オーナー確認 OK
+  8. [x] 非管理者 Operators（`BantoOpTest`）: query/start(1056=既実行)/
+         stop は Access Denied にならず、`sc config`/`sc delete` は
+         FAILED 5 — オーナー確認 OK

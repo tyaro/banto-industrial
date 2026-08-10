@@ -10,8 +10,8 @@ T16-2 配線は未了。詳細は同 §10）。**2026-08-10: T17-4（P4「Demand
 +遅延自動開始から `OnDemand`（手動）へ変更、上書きインストール時は
 既存サービスへ触れず早期リターンして既存の起動種別を保持、詳細は
 [banto-hub-t17-design.md](banto-hub-t17-design.md) §11。**同日実機で
-`DEMAND_START` / 再 install 保持 / AutoStart 巻き戻し防止を確認**。OS
-再起動確認と Start-Service 後の収集開始は未実施）。進行中: T18-1（TAG-UX-C・TAG-P0-2 完了、TAG-P0-3 未着手）／**T16-2（実 HTTP probe / 実切替は実機待ち）**。§16.4 の `optNum` null 取りこぼしと §9 TAG-P0-1 本体（連続登録 `count.trim()` クラッシュ）はロジック側を修正済み。**2026-08-09（本 PR）: §16.3「banto-hub の Playwright/DOM テスト基盤を T18-1 へ前倒し」を実施し、`e2e/banto-hub.playwright.config.ts`（`pnpm e2e:banto-hub`）を新設。TAG-P0-1 の残受け入れ条件（実 DOM からの点数変更テスト）を `e2e/tests-banto-hub/banto-hub-tags-continuous.spec.ts` で満たし、DOM/E2E 側も含めて TAG-P0-1 は受け入れ条件を全て満たした（closed）。** 2026-08-09（本 PR、
+`DEMAND_START` / OS 再起動後 Stopped / 手動 Start / 再 install 保持 /
+AutoStart 巻き戻し防止 / UAC / 非管理者 Operators 委任を確認**）。進行中: T18-1（TAG-UX-C・TAG-P0-2 完了、TAG-P0-3 未着手）／**T16-2（実 HTTP probe / 実切替は実機待ち）**。§16.4 の `optNum` null 取りこぼしと §9 TAG-P0-1 本体（連続登録 `count.trim()` クラッシュ）はロジック側を修正済み。**2026-08-09（本 PR）: §16.3「banto-hub の Playwright/DOM テスト基盤を T18-1 へ前倒し」を実施し、`e2e/banto-hub.playwright.config.ts`（`pnpm e2e:banto-hub`）を新設。TAG-P0-1 の残受け入れ条件（実 DOM からの点数変更テスト）を `e2e/tests-banto-hub/banto-hub-tags-continuous.spec.ts` で満たし、DOM/E2E 側も含めて TAG-P0-1 は受け入れ条件を全て満たした（closed）。** 2026-08-09（本 PR、
 `cursor/t18-1-form-dirty-e3cb`）: §9.4 TAG-UX-C のうち dirty 追跡と破棄確認
 を実装（詳細は §9.4 TAG-UX-C の実装メモ）。続く `cursor/t18-1-drawer-busy-e3cb`
 で同 §9.4 の「保存、削除、検証、登録、閉じるを Drawer 単位の busy 状態で
