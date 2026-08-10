@@ -31,12 +31,12 @@ Windows 実機での`WindowsServiceManager`経路検証も未了）。**
 同スライスで追加。フルの切替ウィザード UI は引き続き未着手（トレイの
 「開始/停止」という単一の入口だけを`HostSwitchEngine`経由にした）。詳細は
 [banto-hub-t16-design.md](banto-hub-t16-design.md) §3「T16-2 第二スライス
-実装メモ」・§5。単体テストで確認済みだが、トレイ操作自体の Windows 実機
-確認は未了。**
+実装メモ」・§5。**同日 Windows 実機でトレイ開始/停止の完了待ちを確認済み**。**
 T16-0（薄いシェル）・T16-1（トレイ状態表示）はマージ済みで本書の前提。
 T16-2（サービス検出・native fallback）第一スライスは本書 §4 の引き渡し
 契約（P5）に従い、T17-0/T17-3 が提供する API を消費する形で実装した
-（フルの`HostSwitchEngine`活用・実機検証は継続）。**2026-08-10:
+（フルの切替ウィザード UI は未着手。トレイ開始/停止の`HostSwitchEngine`
+経路は第二スライスで実機確認済み）。**2026-08-10:
 profile ACL 追加スライス（desktop-plan §11、`profile_acl.rs`・
 `grant-profile-acl`）を実装済み（§12）- T16-2 実機検証で見つかった
 「LocalSystem 作成 profile が readonly になる」既知ギャップを解消する。

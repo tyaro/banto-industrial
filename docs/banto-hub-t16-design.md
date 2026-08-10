@@ -10,13 +10,12 @@ T16-2 第一スライス（サービス検出・接続・native fallback・Opera
 T17 側（`profile_acl.rs`、docs/banto-hub-t17-design.md §12）で解消済み。
 T16-2 第二スライス（トレイ開始/停止の`HostSwitchEngine`完了待ち・
 Desktop 引き継ぎの安全化・`BANTO_BIND`対応 navigate/probe・Administrators
-ゲート緩和）実装済み（下記 §3 第二スライス実装メモ、§5 参照）。単体テスト
-（`cargo test -p banto-hub-core` / `-p banto-hub-shell`）で確認済みだが、
-トレイの「サービスを開始/停止」操作自体の Windows 実機確認は未実施
-（§5 に既知の残 gap として記載）。**
+ゲート緩和）実装済み（下記 §3 第二スライス実装メモ、§5 参照）。
+**同日 Windows 実機でトレイ「サービスを停止」→Desktop 引き継ぎと
+「サービスを開始」→Service 接続を確認済み**（§3 第二スライス実機検証）。**
 最終検証日(コード照合): 2026-08-10
-最終検証日(Windows 実機): 2026-08-10（T16-2 シェル第一スライス、管理者
-UAC + Operators。第二スライスのトレイ開始/停止操作は Windows 実機未確認）
+最終検証日(Windows 実機): 2026-08-10（T16-2 シェル第一・第二スライス、
+Operators 対話ユーザー。トレイ開始/停止の`HostSwitchEngine`完了待ちを含む）
 基準コミット: `396e927`（main、T16-1 マージ後）。T16-1 の実装は本設計と
 同じ PR（`cursor/t16-1-tray-status-e3cb`、#101）で追加。
 
@@ -215,8 +214,19 @@ desktop-plan §10 に日付付きで追記する（T16-0 PR で実施）。
 > 検証: `cargo fmt` / `cargo clippy -p banto-hub-core -p banto-hub-shell
 --all-features -- -D warnings` / `cargo test -p banto-hub-core`
 > （301 passed, 4 ignored — 既存の Windows 実機限定テストのみ ignore）/
-> `cargo test -p banto-hub-shell`（16 passed）。トレイの「サービスを開始/
-> 停止」操作そのものの Windows 実機確認は未実施（§5 に残 gap として記載）。
+> `cargo test -p banto-hub-shell`（16 passed）。
+>
+> **Windows 実機検証 — 第二スライス トレイ操作（2026-08-10、`_verify_t17/`、
+> Operators 対話ユーザー `TKent`）**:
+>
+> | シナリオ                                                           | 結果                                                                                                                                                                                                    |
+> | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+> | サービス Running + shell 起動                                      | `profile.lock` `host_kind: service` のまま。openapi 200。プロセスは `banto-hub`(service) + `banto-hub-shell` のみ                                                                                       |
+> | トレイ「サービスを停止」（`HostSwitchEngine` Service→Desktop）     | 約 2〜3 秒で SCM `Stopped`、サービス process 消失、続けて shell が `host_kind: shell` を取得、openapi 200（Desktop Hub）。Stopped 到達と旧 health 消失を待ってから Desktop 起動していることを観測で確認 |
+> | Fallback + Stopped からトレイ「サービスを開始」（Offline→Service） | profile mutex を一時保持して Desktop 起動を失敗させ Fallback にしたうえでクリック。SCM `Running` + `host_kind: service` + openapi 200。shell process は同一のままサービスへ接続                         |
+>
+> 前提: `banto-hub-elev.exe service-install`（Demand）+ `grant-profile-acl`、
+> バイナリは `_verify_t17/`。
 
 ## 4. T16-0 設計（P3）
 
@@ -324,10 +334,9 @@ banto-hub-shell (Tauri v2, Windows 優先)
   トレイの明示的な「サービスを開始/停止」操作にのみ適用される。
 - **Windows 実機での`WindowsServiceManager`経路**: 2026-08-10 に
   `_verify_t17` でサービス Running 時の shell 接続・Stopped 時の Desktop
-  起動を確認済み（§3 実装メモ末尾）。**トレイからの「サービスを開始/停止」
-  操作と`HostSwitchEngine`完了待ちの実装は第二スライスで完了したが、
-  Windows 実機でのクリック動作そのものの確認はまだ未実施**（単体テストの
-  みで確認、上記 §3 第二スライス実装メモ参照）。
+  起動を確認済み（§3 実装メモ末尾）。**同日、第二スライスのトレイ
+  「サービスを停止/開始」と`HostSwitchEngine`完了待ちも実機確認済み**
+  （§3 第二スライス実機検証表）。
 - **Administrators のトレイ操作可否**: 2026-08-10 第二スライスで
   `is_current_process_admin()`を追加し、Operators または Administrators
   なら操作可能にした（上記 §3 参照）。UAC split token 環境での挙動は
