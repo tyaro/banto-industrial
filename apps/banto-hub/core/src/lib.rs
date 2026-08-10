@@ -107,8 +107,13 @@
 //!   設計 §4 に記述だけがあった[`hub_health::HubHealthProbe`] trait を実装
 //!   した - fallback UI（T16-2）が「別 profile/version」「mutex 所有者不明」
 //!   等を判定するための health/所有権確認。テスト用の
-//!   [`hub_health::MockHubHealthProbe`]を持つ（実 HTTP probe は未実装、
-//!   モジュール doc 参照）
+//!   [`hub_health::MockHubHealthProbe`]を持つ（実 HTTP probe は
+//!   [`http_hub_health`]、T16-2 で追加）
+//! - [`http_hub_health`]: T16-2（docs/banto-hub-t16-design.md §3
+//!   「T16-2」）。[`hub_health::HubHealthProbe`]の実 HTTP 実装
+//!   （[`http_hub_health::HttpHubHealthProbe`]）- `GET /api/v1/openapi.json`
+//!   への素朴な TCP/HTTP 往復（新規クレート依存なし）＋期待 profile の
+//!   `profile.lock`診断で health/所有権を判定する
 //! - [`host_switch`]: T17-3（同§3）。Desktop↔Service 切替トランザクションの
 //!   状態機械（[`host_switch::HostSwitchEngine`]）- 切替の各段階
 //!   （[`host_switch::SwitchPhase`]）と失敗到達（[`host_switch::FaultStage`]）
@@ -153,6 +158,7 @@ pub mod diag_log;
 pub mod events;
 pub mod grpc;
 pub mod host_switch;
+pub mod http_hub_health;
 pub mod hub;
 pub mod hub_health;
 pub mod hub_log;

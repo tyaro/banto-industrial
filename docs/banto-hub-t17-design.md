@@ -15,10 +15,18 @@ T17-4（P4「Demand 化」、§11）も同日実装済み
 2026-08-10 Windows 実機で T17-2/T17-4 の主要チェックを実施済み
 （§10・§11。Demand 登録・OS 再起動後 Stopped・手動 Start・既存保持・
 Operators 作成・サービス ACL・`setup-operators` 冪等・UAC プロンプト・
-非管理者 Operators 委任）。未了: T16-2 配線。**
+非管理者 Operators 委任）。**2026-08-10: T16-2 第一スライス実装済み**
+（`apps/banto-hub/src-tauri/src/lib.rs` にサービス検出・接続 + native
+fallback を配線、本書 §4 の`ServiceManager`/`HubHealthProbe`契約を消費。
+併せて §3 T17-3 で trait のみだった実 HTTP probe を
+`apps/banto-hub/core/src/http_hub_health.rs`として実装した。詳細は
+[banto-hub-t16-design.md](banto-hub-t16-design.md) §3「T16-2 第一スライス
+実装メモ」。フルの`HostSwitchEngine`（本書 §9）UI/切替ウィザードは未着手 -
+Windows 実機での`WindowsServiceManager`経路検証も未了）。**
 T16-0（薄いシェル）・T16-1（トレイ状態表示）はマージ済みで本書の前提。
-T16-2（サービス検出・native fallback）は本書 §4 の引き渡し契約（P5）に
-従い、T17-0/T17-3 が提供する API を消費する形で着手する。
+T16-2（サービス検出・native fallback）第一スライスは本書 §4 の引き渡し
+契約（P5）に従い、T17-0/T17-3 が提供する API を消費する形で実装した
+（フルの`HostSwitchEngine`活用・実機検証は継続）。
 最終検証日(コード照合): 2026-08-10
 最終検証日(Windows 実機): 2026-08-10（§8・§10・§11、管理者 Cursor +
 オーナー対話。Operators 非管理者委任まで完了）
@@ -458,9 +466,15 @@ T17-2（UAC/Operators）はスタブ（`can_operate_service: bool`）で受け�
   シグネチャ（`&str`）をそのまま採用した。テスト用の`MockHubHealthProbe`
   （既定 outcome ＋`push_sequence`で1回ずつ消費する queue の2段構成、
   `MockServiceManager::inject_error`と同じ発想）のみを実装し、**実 HTTP
-  probe は今回入れていない**（実装指示「無くてもモックだけで T17-3 完了可」
-  の範囲 - Windows 実機・T16-2 実配線着手時に追加する。追加しても
-  `host_switch`側の変更は不要 - trait 境界だけに依存するため）。
+  probe は当時入れていなかった**（実装指示「無くてもモックだけで T17-3
+  完了可」の範囲 - Windows 実機・T16-2 実配線着手時に追加する予定だった。
+  追加しても`host_switch`側の変更は不要 - trait 境界だけに依存するため）。
+  **2026-08-10 追記**: T16-2 第一スライスで
+  `apps/banto-hub/core/src/http_hub_health.rs::HttpHubHealthProbe`として
+  実装した（`std::net::TcpStream`による素朴な HTTP/1.1 実装、新規クレート
+  依存なし）。予告どおり`host_switch`側の変更は不要だった。詳細は
+  [banto-hub-t16-design.md](banto-hub-t16-design.md) §3「T16-2 第一スライス
+  実装メモ」参照。
 - **`host_switch.rs`**: Desktop↔Service 切替トランザクションの状態機械
   `HostSwitchEngine<M: ServiceManager, P: HubHealthProbe, D: DesktopHostControl>`。
   `step(SwitchCommand) -> Result<StepOutcome, SwitchError>`で1ステップずつ

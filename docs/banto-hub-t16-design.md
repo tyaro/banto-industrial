@@ -3,8 +3,9 @@
 作成日: 2026-08-09
 状態: **設計確定。P1〜P3 承認済み。T16-0（薄いシェル `banto-hub-shell`、
 `apps/banto-hub/src-tauri`）・T16-1（トレイ状態表示）マージ済み。
-次は T16-2（T17 依存のため後回し）。**
-最終検証日(コード照合): 2026-08-09
+T16-2 第一スライス（サービス検出・接続・native fallback・Operators
+ゲート）実装済み（下記 §3 T16-2 実装メモ参照）。**
+最終検証日(コード照合): 2026-08-10
 基準コミット: `396e927`（main、T16-1 マージ後）。T16-1 の実装は本設計と
 同じ PR（`cursor/t16-1-tray-status-e3cb`、#101）で追加。
 
@@ -87,6 +88,50 @@ tag-server-design §3.1 と installer コメントを更新する。
 fallback からサービス開始／安全停止」は T16-2（= T17 後）へ移す旨を
 desktop-plan §10 に日付付きで追記する（T16-0 PR で実施）。
 
+> **T16-2 第一スライス実装メモ（2026-08-10）**: T17（`docs/banto-hub-t17-design.md`
+> §4 の引き渡し契約）が確定したことを受け、`apps/banto-hub/src-tauri/src/lib.rs`
+> を以下のとおり配線した。フルの `HostSwitchEngine`（T17-3）UI/切替ウィザードは
+> 今回のスコープに含めず、「サービス検出→接続、それ以外はデスクトップ起動、
+> 失敗したら native fallback」という単純な決定木のみを実装した（次スライスへの
+> 引き継ぎは §5 参照）。
+>
+> - **サービス検出・接続**: `#[cfg(windows)]`で
+>   `banto_hub_core::service_manager::WindowsServiceManager::query_status()`
+>   を問い合わせ、`Running`かつ
+>   `banto_hub_core::http_hub_health::HttpHubHealthProbe`（後述）が`Healthy`を
+>   返した場合のみ、`HubRuntime::start`を呼ばずにメインウィンドウをサービスの
+>   `http://127.0.0.1:{port}/`へ`navigate`する（実装指示 1.）。`Stopped`/
+>   `NotInstalled`なら従来どおりデスクトップホストとして起動を試みる。
+>   `StartPending`/`StopPending`/その他の遷移中状態は「デスクトップも起動
+>   しない」安全側で fallback へ回す（サービスが port/profile lock を握って
+>   いる可能性があるため）。
+> - **実 HTTP `HubHealthProbe`**（実装指示 3.、T17-3 で deferred だった分）:
+>   `apps/banto-hub/core/src/http_hub_health.rs`に`HttpHubHealthProbe`を追加。
+>   新規クレート依存を増やさず`std::net::TcpStream`で素朴な HTTP/1.1
+>   リクエストを組み立てて`GET /api/v1/openapi.json`を叩き、`serde_json`で
+>   本文を解析する。接続不可は`Unreachable`、200 以外または非 openapi 応答は
+>   `PortConflict`、`expected_profile`が不正または期待 profile の
+>   `profile.lock`が読めない場合は`WrongProfileOrVersion`/`MutexOwnerUnknown`、
+>   それ以外は`info.version`を添えて`Healthy`として分類する。
+> - **native fallback UI**（実装指示 2.）: `ui/index.html`のプレースホルダ
+>   （`#banto-hub-status`）はそのまま流用し、SCM 状態・health 診断・
+>   起動エラー・Operators 可否を日本語の複数行文言として`window.eval`で
+>   書き込む（`lib.rs::fallback_message`、`invoke`面は新設しない）。操作系
+>   （サービス開始／停止／再試行）は webview 側のボタンではなくタスクトレイ
+>   メニューに置いた（「二重 UI を作らない」方針、§4.1 と同じ理由）。
+> - **Operators ゲート**（実装指示 4.）: `banto_hub_core::service_operators::is_current_process_operator()`
+>   の結果をプロセス起動時に一度確定し（`AppState::can_operate_service`）、
+>   トレイの「サービスを開始」（`Stopped`かつ Operators のときだけ）・
+>   「サービスを停止」（`Running`かつ Operators のときだけ）の表示可否に使う。
+>   「サービスを開始」は health が`WrongProfileOrVersion`/`MutexOwnerUnknown`/
+>   `PortConflict`、または SCM が`StartPending`の間は隠す（実装指示 3.）。
+>   純粋な判定ロジックは`tray_status.rs`の`show_start_service_action`/
+>   `show_stop_service_action`に切り出し、Tauri を起動せずテストしている。
+> - 非 Windows: SCM 判定自体をコンパイル対象から外し（`#[cfg(windows)]`）、
+>   常にデスクトップホストとして起動を試みる（従来どおり）。
+>
+> 既知の gap（次スライスへの引き継ぎ）は §5 参照。
+
 ## 4. T16-0 設計（P3）
 
 ### 4.1 Composition
@@ -166,6 +211,32 @@ banto-hub-shell (Tauri v2, Windows 優先)
 
 これらは T16-2 / T17 着手前に、本書へ追記するか `banto-hub-t17-design.md`
 を新設する。
+
+### T16-2 第一スライスの既知の gap（次スライスへの引き継ぎ）
+
+- **profile-id のワイヤ確認をしていない**: `HttpHubHealthProbe`は応答した
+  Hub インスタンスの profile-id を openapi 応答から確認しておらず、
+  「`expected_profile`が解決可能か」「期待 profile の`profile.lock`が
+  読めるか」の間接確認に留めている（`http_hub_health.rs`のモジュール doc
+  参照）。openapi 応答へ profile-id を含める等の対応は未実装。
+- **`ServiceManager::start`/`stop`の完了待ちをしていない**: トレイ
+  「サービスを開始/停止」は発行のみで`TransitionHandle::wait_until_settled`
+  を呼ばない。完了確認は利用者が「再試行」を手動で押す前提（`HostSwitchEngine`
+  のような自動ポーリングは今回のスコープ外）。
+- **navigate 先を`127.0.0.1`固定にしている**: `BANTO_BIND`をカスタムした
+  環境では、サービス接続時の navigate 先アドレスが実際のバインド先と
+  食い違う可能性がある（probe 自体も同様に`127.0.0.1`固定）。
+- **サービス停止後の自動デスクトップ引き継ぎは「たまたまそうなる」動作**:
+  トレイ「サービスを停止」後の`retry_startup`は単に決定木をやり直すだけで、
+  「サービスが完全に停止しデスクトップが安全に起動できる」ことを
+  `HostSwitchEngine`の不変条件ほど厳密には確認していない（Desktop
+  起動前に SCM が`Stopped`であることは見るが、旧 health の消失
+  （probe `Unreachable`）までは待たない）。
+- **Windows 実機での`WindowsServiceManager`経路は未検証**: このスライスの
+  単体テストは`banto-hub-core`側の`MockServiceManager`/`MockHubHealthProbe`
+  と、シェル側の純粋関数（`tray_status`/`fallback_message`）のみをカバーし、
+  実サービスに対する`query_status`/`start`/`stop`は Windows 実機での手動
+  受け入れが必要（`docs/banto-hub-t17-design.md` §5 と同様の未検証事項）。
 
 ## 6. 承認チェックリスト
 

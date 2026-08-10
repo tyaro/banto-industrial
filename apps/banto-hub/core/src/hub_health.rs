@@ -16,11 +16,12 @@
 //!   outcome を返す既定値と、`push_sequence`で予約した出力を先頭から順に
 //!   1回ずつ消費する queue の2段構成（[`crate::service_manager::MockServiceManager::inject_error`]
 //!   の一時失敗フックと同じ発想）。
-//! - **実 HTTP probe（`#[cfg(windows)]`/feature 限定の薄い実装）は今回は
-//!   入れていない** - 実装指示のとおり「無くてもモックだけで T17-3 完了可」
-//!   の範囲に留め、Windows 実機・T16-2/実配線着手時に追加する。[`crate::host_switch`]
-//!   はこの trait だけに依存するので、実装を後から追加しても
-//!   [`crate::host_switch::HostSwitchEngine`]側の変更は不要。
+//! - **実 HTTP probe**は T17-3 時点では入れていなかったが、T16-2
+//!   （docs/banto-hub-t16-design.md §3「T16-2」）で
+//!   [`crate::http_hub_health::HttpHubHealthProbe`]として追加した -
+//!   [`crate::host_switch`]はこの trait だけに依存していたため、
+//!   [`crate::host_switch::HostSwitchEngine`]側の変更は不要だった
+//!   （予告どおり）。
 
 use std::collections::VecDeque;
 use std::sync::Mutex;

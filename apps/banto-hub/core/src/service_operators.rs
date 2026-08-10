@@ -236,18 +236,17 @@ mod tests {
         assert_eq!(OPERATORS_GROUP_NAME, "BantoHub Operators");
     }
 
-    /// このスライス時点では `BantoHub Operators` グループを作成する経路が
-    /// 無い（モジュール doc「行っていないこと」節）ため、CI・開発機の
-    /// いずれでもグループは未作成のはず - 安全側の `Ok(false)` を返すことを
-    /// 固定する。Windows 実機で slice 2 導入前に実行しても green になる。
+    /// グループ未作成なら`Ok(false)`、作成済みなら`Ok(true|false)`
+    /// （メンバーかどうか）のいずれかで、`Err`にはしないことを固定する。
+    /// 以前は「グループは未作成のはず」と`Ok(false)`を要求していたが、
+    /// T17-2 実機検証後の開発機には`BantoHub Operators`が残ることがあり、
+    /// その前提は成立しなくなった（実装済みの「未作成なら false」契約自体は
+    /// `lookup_account_sid`の`Ok(None)`経路で別途カバーされる）。
     #[cfg(windows)]
     #[test]
-    fn returns_false_when_group_does_not_exist_yet() {
+    fn membership_check_returns_ok_without_api_error() {
         let result = is_current_process_operator();
-        assert!(
-            matches!(result, Ok(false)),
-            "expected Ok(false), got {result:?}"
-        );
+        assert!(result.is_ok(), "expected Ok(_), got {result:?}");
     }
 
     /// 実際に `BantoHub Operators` を作成しメンバーを追加した Windows 実機

@@ -11,7 +11,15 @@ T16-2 配線は未了。詳細は同 §10）。**2026-08-10: T17-4（P4「Demand
 既存サービスへ触れず早期リターンして既存の起動種別を保持、詳細は
 [banto-hub-t17-design.md](banto-hub-t17-design.md) §11。**同日実機で
 `DEMAND_START` / OS 再起動後 Stopped / 手動 Start / 再 install 保持 /
-AutoStart 巻き戻し防止 / UAC / 非管理者 Operators 委任を確認**）。進行中: T18-1（TAG-UX-C・TAG-P0-2 完了、TAG-P0-3 未着手）／**T16-2（実 HTTP probe / 実切替は実機待ち）**。§16.4 の `optNum` null 取りこぼしと §9 TAG-P0-1 本体（連続登録 `count.trim()` クラッシュ）はロジック側を修正済み。**2026-08-09（本 PR）: §16.3「banto-hub の Playwright/DOM テスト基盤を T18-1 へ前倒し」を実施し、`e2e/banto-hub.playwright.config.ts`（`pnpm e2e:banto-hub`）を新設。TAG-P0-1 の残受け入れ条件（実 DOM からの点数変更テスト）を `e2e/tests-banto-hub/banto-hub-tags-continuous.spec.ts` で満たし、DOM/E2E 側も含めて TAG-P0-1 は受け入れ条件を全て満たした（closed）。** 2026-08-09（本 PR、
+AutoStart 巻き戻し防止 / UAC / 非管理者 Operators 委任を確認**）。進行中: T18-1（TAG-UX-C・TAG-P0-2 完了、TAG-P0-3 未着手）。**2026-08-10:
+T16-2 第一スライス実装済み**（`apps/banto-hub/src-tauri/src/lib.rs` に
+サービス検出→接続／デスクトップ起動／native fallback の決定木を配線、
+`apps/banto-hub/core/src/http_hub_health.rs` に T17-3 で deferred だった
+実 HTTP `HubHealthProbe` を追加、`is_current_process_operator()` を
+サービス開始/停止のトレイ操作可否ゲートに配線。詳細は
+[banto-hub-t16-design.md](banto-hub-t16-design.md) §3「T16-2 第一スライス
+実装メモ」。フルの `HostSwitchEngine`（T17-3）UI/切替ウィザードは対象外 -
+実機での `WindowsServiceManager` 経路検証は未了）。§16.4 の `optNum` null 取りこぼしと §9 TAG-P0-1 本体（連続登録 `count.trim()` クラッシュ）はロジック側を修正済み。**2026-08-09（本 PR）: §16.3「banto-hub の Playwright/DOM テスト基盤を T18-1 へ前倒し」を実施し、`e2e/banto-hub.playwright.config.ts`（`pnpm e2e:banto-hub`）を新設。TAG-P0-1 の残受け入れ条件（実 DOM からの点数変更テスト）を `e2e/tests-banto-hub/banto-hub-tags-continuous.spec.ts` で満たし、DOM/E2E 側も含めて TAG-P0-1 は受け入れ条件を全て満たした（closed）。** 2026-08-09（本 PR、
 `cursor/t18-1-form-dirty-e3cb`）: §9.4 TAG-UX-C のうち dirty 追跡と破棄確認
 を実装（詳細は §9.4 TAG-UX-C の実装メモ）。続く `cursor/t18-1-drawer-busy-e3cb`
 で同 §9.4 の「保存、削除、検証、登録、閉じるを Drawer 単位の busy 状態で
@@ -1612,6 +1620,45 @@ write peek を実装し、T15 を完了させた（§16.3「T15（全 PLC シミ
 - 対象外（このスライスでは未実装）: サービス検出・native fallback・
   `BantoHub Operators`（T16-2/T17）、トレイからの開始・SIM 開始（設計どおり
   据え置き）。
+
+**T16-2 第一スライス実装メモ（2026-08-10）**: T17 が確定・実装されたことを
+受け、`apps/banto-hub/src-tauri/src/lib.rs`にサービス検出・接続と native
+fallback を配線した。詳細は
+[banto-hub-t16-design.md](banto-hub-t16-design.md) §3「T16-2 第一スライス
+実装メモ」に記載（決定木、`HttpHubHealthProbe`の分類ロジック、Operators
+ゲート、既知の gap）。要点のみここに転記する。
+
+- `apps/banto-hub/core/src/http_hub_health.rs`（新規）: T17-3 で trait のみ
+  だった`HubHealthProbe`の実 HTTP 実装。`std::net::TcpStream`で
+  `GET /api/v1/openapi.json`を叩き、接続不可は`Unreachable`、非 openapi
+  応答は`PortConflict`、期待 profile が解決できない/`profile.lock`が読めない
+  場合は`WrongProfileOrVersion`/`MutexOwnerUnknown`、それ以外は`Healthy`と
+  分類する（新規クレート依存なし）。
+- `apps/banto-hub/src-tauri/src/lib.rs`: `decide_startup`が
+  `#[cfg(windows)]`で`WindowsServiceManager::query_status()`→（`Running`なら）
+  `HttpHubHealthProbe::probe`の順に判定し、`Healthy`ならデスクトップを
+  起動せずサービスの localhost URL へ navigate する。`Stopped`/
+  `NotInstalled`なら従来どおりデスクトップ起動を試みる。デスクトップ起動が
+  失敗した場合、または SCM が`Running`だが health が芳しくない/遷移中の
+  場合は`ShellView::Fallback`（SCM 状態・health 診断・起動エラーを保持）へ
+  落ちる。
+- fallback 画面は`ui/index.html`のプレースホルダをそのまま使い、
+  `render_fallback`/`fallback_message`が診断文言を`window.eval`で書き込む。
+  操作（サービス開始/停止/再試行）は webview のボタンではなくトレイ
+  メニュー（`start_service`/`stop_service`/`retry`）に置いた - invoke 面は
+  新設していない。
+- `is_current_process_operator().unwrap_or(false)`を起動時に一度確定し
+  （`AppState::can_operate_service`）、`tray_status::show_start_service_action`/
+  `show_stop_service_action`（純粋関数、単体テストあり）でトレイ項目の
+  表示可否を決める。
+- 対象外（次スライスへ引き継ぎ）: フルの`HostSwitchEngine`（T17-3）
+  UI/切替ウィザード、SCM `start`/`stop`完了待ちのポーリング、
+  openapi 応答への profile-id 埋め込みによる厳密な所有権確認、
+  Windows 実機での`WindowsServiceManager`経路の受け入れ確認。
+- テスト: `cargo test -p banto-hub-core --lib hub_health`（`http_hub_health`
+  含む）・`cargo test -p banto-hub-shell`・
+  `cargo clippy -p banto-hub-core -p banto-hub-shell --all-targets -- -D warnings`
+  が green（Windows 開発機で実行、`cargo fmt --all`適用済み）。
 
 ### T17: サービス管理、プロファイル、インストーラ
 

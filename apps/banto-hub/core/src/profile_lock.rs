@@ -323,7 +323,13 @@ fn write_owner_info(file: &mut File, host_kind: HubHostKind) -> std::io::Result<
     Ok(())
 }
 
-fn read_owner_info(lock_path: &Path) -> Option<ProfileOwnerInfo> {
+/// T16-2（docs/banto-hub-t16-design.md §3「T16-2」）:
+/// `crate::http_hub_health::HttpHubHealthProbe`が「health は応答するが
+/// 期待 profile の`profile.lock`が読めない」（[`crate::hub_health::HealthOutcome::MutexOwnerUnknown`]）
+/// を判定するために再利用できるよう`pub(crate)`にした - 同一クレート内の
+/// 診断読み取り専用ヘルパーであり、排他の正当性そのもの（Windows: mutex／
+/// 非 Windows: flock）には関与しない（このモジュール doc参照）。
+pub(crate) fn read_owner_info(lock_path: &Path) -> Option<ProfileOwnerInfo> {
     let mut file = File::open(lock_path).ok()?;
     let mut contents = String::new();
     file.read_to_string(&mut contents).ok()?;
