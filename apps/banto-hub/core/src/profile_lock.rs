@@ -356,12 +356,17 @@ mod tests {
         }
     }
 
+    /// 排他の単位は profile-id（desktop-plan §16.2 の
+    /// `Global\BantoHub.<profile-id>`）であり、ディレクトリパスではない。
+    /// 別 profile-id なら同じ root 配下でも同時取得できることを確認する
+    /// （旧テストは「同 id・別 root」だったが、Windows では named mutex が
+    /// profile-id だけを見るため `AlreadyHeld` になり CI windows-latest で
+    /// 落ちる - 製品意味論とも食い違う）。
     #[test]
-    fn different_profile_dirs_can_both_acquire() {
-        let root_a = TempDir::new("profile-lock-independent-a");
-        let root_b = TempDir::new("profile-lock-independent-b");
-        let paths_a = resolve_profile_paths(root_a.path(), "default").expect("valid profile id");
-        let paths_b = resolve_profile_paths(root_b.path(), "default").expect("valid profile id");
+    fn different_profile_ids_can_both_acquire() {
+        let root = TempDir::new("profile-lock-independent-ids");
+        let paths_a = resolve_profile_paths(root.path(), "line-a").expect("valid profile id");
+        let paths_b = resolve_profile_paths(root.path(), "line-b").expect("valid profile id");
 
         let _guard_a =
             try_acquire_profile_lock(&paths_a, HubHostKind::Console).expect("acquire a ok");
