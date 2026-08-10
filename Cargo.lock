@@ -552,12 +552,14 @@ name = "banto-hub-shell"
 version = "0.1.0"
 dependencies = [
  "banto-hub-core",
+ "serde",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-notification",
  "tauri-plugin-single-instance",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

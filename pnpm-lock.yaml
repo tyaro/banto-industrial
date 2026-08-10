@@ -56,6 +56,9 @@ importers:
       '@banto/theme':
         specifier: github:tyaro/banto#v1.1.0&path:packages/theme
         version: https://codeload.github.com/tyaro/banto/tar.gz/84775386f3a0f5df1f6df665381ef2269e7b6c67#path:packages/theme
+      '@tauri-apps/api':
+        specifier: ^2.11.1
+        version: 2.11.1
     devDependencies:
       '@sveltejs/adapter-static':
         specifier: ^3.0.8

@@ -16,7 +16,8 @@
     "@banto/charts": "github:tyaro/banto#v1.1.0&path:packages/charts",
     "@banto/forms": "github:tyaro/banto#v1.1.0&path:packages/forms",
     "@banto/grid-svelte": "github:tyaro/banto#v1.1.0&path:packages/grid-svelte",
-    "@banto/theme": "github:tyaro/banto#v1.1.0&path:packages/theme"
+    "@banto/theme": "github:tyaro/banto#v1.1.0&path:packages/theme",
+    "@tauri-apps/api": "^2.11.1"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.8",

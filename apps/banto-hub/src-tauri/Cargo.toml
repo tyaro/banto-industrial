@@ -38,3 +38,23 @@ tauri-plugin-notification = "2"
 # `HubRuntime::start`/`RunningHub::shutdown` 自体は `tauri::async_runtime`
 # 経由で呼ぶため、実行そのものにはこの依存は要らない）。
 tokio = { workspace = true, features = ["sync"] }
+# Desktop↔Service 切替ウィザード（`host_switch_status`/`host_switch_progress`
+# invoke 面）の DTO・イベントペイロードのシリアライズ用。
+serde = { workspace = true }
+
+# `set_service_autostart` invoke が `banto-hub-elev.exe` を UAC 昇格して
+# 起動する（`ShellExecuteExW`、verb "runas"）ためだけの Windows API 依存。
+# `apps/banto-hub/core`が既に同じ 0.61 系を使っている（`core/Cargo.toml`
+# 参照）ので新規バージョン系列は増えない。`banto_hub_core::service_elevated`
+# 側は昇格後の実処理（`autostart-enable`/`-disable`）だけを持ち、昇格
+# プロセス自体の起動はシェル側の責務（呼び出し元がどのプロセスを UI 経由で
+# 起動するかを決めるのは composition root であるこの crate、という既存の
+# 役割分担と同じ）。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

@@ -21,22 +21,25 @@ fallback を配線、本書 §4 の`ServiceManager`/`HubHealthProbe`契約を消
 併せて §3 T17-3 で trait のみだった実 HTTP probe を
 `apps/banto-hub/core/src/http_hub_health.rs`として実装した。詳細は
 [banto-hub-t16-design.md](banto-hub-t16-design.md) §3「T16-2 第一スライス
-実装メモ」。フルの`HostSwitchEngine`（本書 §9）UI/切替ウィザードは未着手 -
+実装メモ」。フルの`HostSwitchEngine`（本書 §9）UI/切替ウィザードは当時未着手 -
 Windows 実機での`WindowsServiceManager`経路検証も未了）。**
 **2026-08-10: T16-2 第二スライス実装済み**（トレイ「サービスを開始/停止」を
 本書 §9 の`HostSwitchEngine`による完了待ちへ配線し直し、`ServiceManager::start`/
 `stop`後のポーリング・Desktop 引き継ぎ前の SCM`Stopped`＋旧 health
 `Unreachable`確認を本書 §9 の不変条件どおり適用するようにした。navigate/probe
 先ホストの`BANTO_BIND`対応、ローカル`Administrators`のトレイ操作許可も
-同スライスで追加。フルの切替ウィザード UI は引き続き未着手（トレイの
+同スライスで追加。当時フルの切替ウィザード UI は未着手（トレイの
 「開始/停止」という単一の入口だけを`HostSwitchEngine`経由にした）。詳細は
 [banto-hub-t16-design.md](banto-hub-t16-design.md) §3「T16-2 第二スライス
 実装メモ」・§5。**同日 Windows 実機でトレイ開始/停止の完了待ちを確認済み**。**
+**2026-08-11: 切替ウィザード UI 実装済み**（`/status` カード＋シェル最小
+invoke。詳細は [banto-hub-t16-design.md](banto-hub-t16-design.md) §3
+「切替ウィザード UI 実装メモ」。Windows 実機の UI 経路は未検証）。
 T16-0（薄いシェル）・T16-1（トレイ状態表示）はマージ済みで本書の前提。
 T16-2（サービス検出・native fallback）第一スライスは本書 §4 の引き渡し
 契約（P5）に従い、T17-0/T17-3 が提供する API を消費する形で実装した
-（フルの切替ウィザード UI は未着手。トレイ開始/停止の`HostSwitchEngine`
-経路は第二スライスで実機確認済み）。**2026-08-10:
+（トレイ開始/停止の`HostSwitchEngine`経路は第二スライスで実機確認済み。
+切替ウィザード UI は 2026-08-11 実装）。**2026-08-10:
 profile ACL 追加スライス（desktop-plan §11、`profile_acl.rs`・
 `grant-profile-acl`）を実装済み（§12）- T16-2 実機検証で見つかった
 「LocalSystem 作成 profile が readonly になる」既知ギャップを解消する。

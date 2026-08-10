@@ -43,7 +43,11 @@ T16-2 第三スライス実装済み**（`GET /api/v1/openapi.json`の
 埋め込み、`HttpHubHealthProbe`がワイヤ上で`expected_profile`と直接比較する
 よう変更 - T16-2 第一スライスに残っていた最後の既知の gap を解消。詳細は
 [banto-hub-t16-design.md](banto-hub-t16-design.md) §3「T16-2 第三スライス
-実装メモ」・§5）。§16.4 の `optNum` null 取りこぼしと §9 TAG-P0-1 本体（連続登録 `count.trim()` クラッシュ）はロジック側を修正済み。**2026-08-09（本 PR）: §16.3「banto-hub の Playwright/DOM テスト基盤を T18-1 へ前倒し」を実施し、`e2e/banto-hub.playwright.config.ts`（`pnpm e2e:banto-hub`）を新設。TAG-P0-1 の残受け入れ条件（実 DOM からの点数変更テスト）を `e2e/tests-banto-hub/banto-hub-tags-continuous.spec.ts` で満たし、DOM/E2E 側も含めて TAG-P0-1 は受け入れ条件を全て満たした（closed）。** 2026-08-09（本 PR、
+実装メモ」・§5）。**2026-08-11: 切替ウィザード UI 実装済み**（`/status` の
+Windows サービスカード、シェル`host_switch_*`/`set_service_autostart`
+invoke、実`ShellDesktopControl`、自動起動 UAC。詳細は
+[banto-hub-t16-design.md](banto-hub-t16-design.md) §3「切替ウィザード UI
+実装メモ」。Windows 実機での UI 経路は未検証）。§16.4 の `optNum` null 取りこぼしと §9 TAG-P0-1 本体（連続登録 `count.trim()` クラッシュ）はロジック側を修正済み。**2026-08-09（本 PR）: §16.3「banto-hub の Playwright/DOM テスト基盤を T18-1 へ前倒し」を実施し、`e2e/banto-hub.playwright.config.ts`（`pnpm e2e:banto-hub`）を新設。TAG-P0-1 の残受け入れ条件（実 DOM からの点数変更テスト）を `e2e/tests-banto-hub/banto-hub-tags-continuous.spec.ts` で満たし、DOM/E2E 側も含めて TAG-P0-1 は受け入れ条件を全て満たした（closed）。** 2026-08-09（本 PR、
 `cursor/t18-1-form-dirty-e3cb`）: §9.4 TAG-UX-C のうち dirty 追跡と破棄確認
 を実装（詳細は §9.4 TAG-UX-C の実装メモ）。続く `cursor/t18-1-drawer-busy-e3cb`
 で同 §9.4 の「保存、削除、検証、登録、閉じるを Drawer 単位の busy 状態で
