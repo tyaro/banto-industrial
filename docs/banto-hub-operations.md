@@ -485,6 +485,36 @@ OS 起動直後のネットワークスタック初期化前に起動が競合�
 （実行ファイルパス等）を変更したい場合は、先に `uninstall` してから
 `install` し直してください。
 
+### profile ディレクトリの権限（ACL）
+
+`install` されたサービスはローカルシステムアカウント（LocalSystem）で
+動作するため、サービスが**先に** profile ディレクトリ・DB
+（`%ProgramData%\BantoHub\profiles\<profile-id>\...`）を作成すると、
+既定の ACL は SYSTEM/Administrators のみ変更可能になります。この状態で
+後から Desktop 版（対話ユーザー権限）で同じ profile を開こうとすると、
+SQLite が `attempt to write a readonly database` で起動に失敗します
+（docs/banto-hub-t16-design.md §3 実機メモ）。
+
+この問題は `banto-hub-elev.exe grant-profile-acl` で解消できます
+（UAC 昇格ヘルパー、ACL 変更のため UAC 同意が必要 -
+docs/banto-hub-t17-design.md §10・§12、`docs/banto-hub-desktop-plan.md`
+§11）。
+
+```powershell
+# 現在の対話ユーザー・既定 profile（"default"）へ owner 権限を付与
+.\banto-hub-elev.exe grant-profile-acl
+
+# ユーザー・profile を明示する場合
+.\banto-hub-elev.exe grant-profile-acl <ユーザー名> <profile-id>
+```
+
+`Users` グループ全体には一切権限を与えません（desktop-plan §11
+「Users 全体へ権限を与えない」）。`service-install`（elev 経由の
+サービス登録）は、この操作を対話ユーザー・既定 profile に対して
+自動的に一度実行するため、新規インストール直後はこの手動操作は
+通常不要です。既存インストールで上記エラーに遭遇した場合のみ、
+手動で実行してください。
+
 環境変数（§1 の `PORT`/`BANTO_BIND`/`BANTO_DB`/`BANTO_HUB_DATA`/
 `BANTO_ALLOW_SETUP`）はサービスのプロセス環境には引き継がれません。
 サービスとして運用する場合にこれらを固定したい場合は、OS のシステム

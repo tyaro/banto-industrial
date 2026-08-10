@@ -5,7 +5,16 @@
 `service_elevated` / `service_install` / `banto-hub-elev.exe`、詳細は
 [banto-hub-t17-design.md](banto-hub-t17-design.md) §10。Operators 委任の
 実機受け入れの一部（Operators 作成・ACL・setup-operators 冪等）と
-T16-2 配線は未了。詳細は同 §10）。**2026-08-10: T17-4（P4「Demand 化」）
+T16-2 配線は未了。詳細は同 §10）。**2026-08-10: profile ACL 追加スライス
+実装済み**（`apps/banto-hub/core/src/profile_acl.rs`＋固定アクション
+`grant-profile-acl`、詳細は [banto-hub-t17-design.md](banto-hub-t17-design.md)
+§12。T16-2 実機検証で見つかった「LocalSystem 作成 profile が対話ユーザーから
+readonly になる」既知ギャップ（下記本節・§16.3 参照）を、profile owner への
+明示 DACL 付与（`Users` 全体には付与しない）で解消。`service-install` が
+新規インストール時に自動実行する。同日実機で `grant-profile-acl`（UAC）
+による owner Modify 付与と書き込み復旧を確認済み。サービス先行作成→
+Desktop Hub 起動までのフル E2E は任意の追加確認）。
+**2026-08-10: T17-4（P4「Demand 化」）
 実装済み**（`service_install.rs::install` の既定起動種別を `AutoStart`
 +遅延自動開始から `OnDemand`（手動）へ変更、上書きインストール時は
 既存サービスへ触れず早期リターンして既存の起動種別を保持、詳細は
@@ -1782,6 +1791,11 @@ fallback を配線した。詳細は
 インストーラは UAC 下で `BantoHub Operators` を作成し、対話中の Windows ユーザーを
 追加する選択肢を既定 ON で表示する。同時に、選択した profile へそのユーザー固有の
 owner ACL を設定する。グループ変更、profile owner 追加、ACL 変更は UAC を必要とする。
+
+> **2026-08-10 実装済み**: 上記の profile owner ACL 設定は
+> `apps/banto-hub/core/src/profile_acl.rs`（`grant_profile_owner_acl`）＋
+> UAC helper の固定アクション `grant-profile-acl` として実装した。詳細は
+> [banto-hub-t17-design.md](banto-hub-t17-design.md) §12 を参照。
 
 デスクトップ Hub は profile owner の権限で DB を直接更新するため、profile owner は
 ローカルデータを直接変更できる信頼済み管理者という脅威境界になる。ローカル利用者を

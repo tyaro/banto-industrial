@@ -103,6 +103,14 @@
 //!   profile 排他 - Windows は`Global\BantoHub.<profile-id>`named mutex、
 //!   非 Windows は profile ディレクトリの`flock`自体を排他の実体にする
 //!   （[`profile_lock::try_acquire_profile_lock`]）
+//! - [`profile_acl`]: profile ACL 追加スライス（docs/banto-hub-desktop-plan.md
+//!   §11）。LocalSystem（Windows サービス）が先に作成した profile
+//!   ディレクトリ・DB が対話ユーザーから readonly になる実機不具合
+//!   （docs/banto-hub-t16-design.md §3 実機メモ「attempt to write a
+//!   readonly database」）を、profile owner への明示 DACL 付与
+//!   （[`profile_acl::grant_profile_owner_acl`]）で解消する。`Users`
+//!   グループ全体には一切権限を与えない（desktop-plan §11）。呼び出し元は
+//!   [`service_elevated::ElevatedAction::GrantProfileAcl`]（UAC helper 経由）
 //! - [`hub_health`]: T17-3（docs/banto-hub-t17-design.md §3「T17-3」・§4）。
 //!   設計 §4 に記述だけがあった[`hub_health::HubHealthProbe`] trait を実装
 //!   した - fallback UI（T16-2）が「別 profile/version」「mutex 所有者不明」
@@ -132,13 +140,15 @@
 //!   この lib crate へ移設したもの - `banto-hub.exe`（従来どおり）と
 //!   `banto-hub-elev.exe`（[`service_elevated`]）の両方から同じ登録・
 //!   登録解除ロジックを呼べるようにするため
-//! - [`service_elevated`]: T17-2 スライス2（同§3・P3）。UAC 昇格ヘルパー
-//!   `banto-hub-elev.exe`（`bin/banto-hub-elev.rs`）の実装本体。固定6
+//! - [`service_elevated`]: T17-2 スライス2（同§3・P3）＋ profile ACL 追加
+//!   スライス（desktop-plan §11）。UAC 昇格ヘルパー
+//!   `banto-hub-elev.exe`（`bin/banto-hub-elev.rs`）の実装本体。固定7
 //!   アクション（[`service_elevated::ElevatedAction`]）で、ローカルグループ
-//!   `BantoHub Operators`の作成・メンバー追加（`setup-operators`）と
-//!   `BantoHub`サービスへの限定 DACL 付与（`grant-service-acl`）を行う -
-//!   [`service_operators`]が残した「グループ作成・SDDL 付与は次スライス」を
-//!   引き継ぐ
+//!   `BantoHub Operators`の作成・メンバー追加（`setup-operators`）、
+//!   `BantoHub`サービスへの限定 DACL 付与（`grant-service-acl`）、profile
+//!   ディレクトリへの owner DACL 付与（`grant-profile-acl`、
+//!   [`profile_acl`]へ委譲）を行う - [`service_operators`]が残した
+//!   「グループ作成・SDDL 付与は次スライス」を引き継ぐ
 //!
 //! T0/T1 のスコープ外（設計冒頭の指示どおり実装しない）: gRPC、管理 UI
 //! フロントエンドの中身の一部、演算タグ、接続単位の部分再構成。書き込み
@@ -163,6 +173,7 @@ pub mod hub;
 pub mod hub_health;
 pub mod hub_log;
 pub mod mqtt;
+pub mod profile_acl;
 pub mod profile_lock;
 pub mod profile_paths;
 pub mod rest;

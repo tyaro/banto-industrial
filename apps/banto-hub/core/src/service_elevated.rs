@@ -9,7 +9,7 @@
 //!
 //! ## 固定アクション（[`ElevatedAction`]）
 //!
-//! `banto-hub-elev.exe <action> [args...]`が受け付けるのは次の6種類のみ -
+//! `banto-hub-elev.exe <action> [args...]`が受け付けるのは次の7種類のみ -
 //! フリーフォームのコマンド文字列は一切受け付けない（UAC 昇格した管理者
 //! プロセスに任意コマンドを渡させないためのセキュリティ境界、実装指示の
 //! 「固定アクション」要求そのもの）。
@@ -18,10 +18,25 @@
 //! |----------------------|------------------------------------------------------------------------|
 //! | `setup-operators`    | ローカルグループ`BantoHub Operators`を（無ければ）作成し、指定ユーザー（省略時は現在の対話ユーザー）をメンバーに追加する。冪等 |
 //! | `grant-service-acl`  | `BantoHub`サービスの DACL に`BantoHub Operators`への限定 ACE を追加する（下記「SDDL」節） |
-//! | `service-install`    | [`crate::service_install::install`]（`banto-hub.exe`本体を対象）→`setup-operators`→`grant-service-acl`の順で実行 |
+//! | `grant-profile-acl`  | profile ディレクトリ（`[username] [profile-id]`、両方省略時は現在の対話ユーザー・既定 profile）へ owner 用 DACL を付与する（[`crate::profile_acl`]、下記「profile ACL」節） |
+//! | `service-install`    | [`crate::service_install::install`]（`banto-hub.exe`本体を対象）→`setup-operators`→`grant-service-acl`→`grant-profile-acl`（既定ユーザー・既定 profile）の順で実行 |
 //! | `service-uninstall`  | [`crate::service_install::uninstall`]をそのまま呼ぶ                    |
 //! | `autostart-enable`   | `WindowsServiceManager::set_auto_start(true)`                          |
 //! | `autostart-disable`  | `WindowsServiceManager::set_auto_start(false)`                         |
+//!
+//! ## profile ACL（`grant-profile-acl`が付与する権限）
+//!
+//! desktop-plan §11「データプロファイルと移行」の権限方針そのもの -
+//! ACL 変更自体が UAC を要求するため、この固定アクションを新設した
+//! （P3 に「グループ変更、profile owner 追加、ACL 変更は UAC を必要と
+//! する」と明記済み）。実際の DACL 組み立ては[`crate::profile_acl`]が行う。
+//! このモジュールが担うのは「`[username] [profile-id]`引数の省略時
+//! デフォルト解決（現在の対話ユーザー／
+//! [`crate::profile_paths::DEFAULT_PROFILE_ID`]）→ root 解決
+//! （[`crate::profile_paths::resolve_hub_root`]、env
+//! `BANTO_HUB_ROOT`/`ProgramData`/`XDG_DATA_HOME`/`HOME`）→
+//! [`crate::profile_paths::resolve_profile_paths`]で`profile_dir`を得る」
+//! までの配線だけである（[`windows_impl::grant_profile_acl`]参照）。
 //!
 //! ## SDDL（`grant-service-acl`が付与する権限）
 //!
@@ -80,6 +95,7 @@ use thiserror::Error;
 pub enum ElevatedAction {
     SetupOperators,
     GrantServiceAcl,
+    GrantProfileAcl,
     ServiceInstall,
     ServiceUninstall,
     AutostartEnable,
@@ -89,6 +105,7 @@ pub enum ElevatedAction {
 impl ElevatedAction {
     pub const SETUP_OPERATORS: &'static str = "setup-operators";
     pub const GRANT_SERVICE_ACL: &'static str = "grant-service-acl";
+    pub const GRANT_PROFILE_ACL: &'static str = "grant-profile-acl";
     pub const SERVICE_INSTALL: &'static str = "service-install";
     pub const SERVICE_UNINSTALL: &'static str = "service-uninstall";
     pub const AUTOSTART_ENABLE: &'static str = "autostart-enable";
@@ -96,9 +113,10 @@ impl ElevatedAction {
 
     /// [`ElevatedAction::as_str`]が返しうる全文字列 - CLI のヘルプ表示・
     /// エラーメッセージ用（`bin/banto-hub-elev.rs`参照）。
-    pub const ALL_NAMES: [&'static str; 6] = [
+    pub const ALL_NAMES: [&'static str; 7] = [
         Self::SETUP_OPERATORS,
         Self::GRANT_SERVICE_ACL,
+        Self::GRANT_PROFILE_ACL,
         Self::SERVICE_INSTALL,
         Self::SERVICE_UNINSTALL,
         Self::AUTOSTART_ENABLE,
@@ -112,6 +130,7 @@ impl ElevatedAction {
         match raw {
             Self::SETUP_OPERATORS => Some(Self::SetupOperators),
             Self::GRANT_SERVICE_ACL => Some(Self::GrantServiceAcl),
+            Self::GRANT_PROFILE_ACL => Some(Self::GrantProfileAcl),
             Self::SERVICE_INSTALL => Some(Self::ServiceInstall),
             Self::SERVICE_UNINSTALL => Some(Self::ServiceUninstall),
             Self::AUTOSTART_ENABLE => Some(Self::AutostartEnable),
@@ -124,6 +143,7 @@ impl ElevatedAction {
         match self {
             Self::SetupOperators => Self::SETUP_OPERATORS,
             Self::GrantServiceAcl => Self::GRANT_SERVICE_ACL,
+            Self::GrantProfileAcl => Self::GRANT_PROFILE_ACL,
             Self::ServiceInstall => Self::SERVICE_INSTALL,
             Self::ServiceUninstall => Self::SERVICE_UNINSTALL,
             Self::AutostartEnable => Self::AUTOSTART_ENABLE,
@@ -245,6 +265,14 @@ pub enum ElevatedError {
     /// （`autostart-enable`/`autostart-disable`が使う）。
     #[error(transparent)]
     ServiceManager(#[from] crate::service_manager::ServiceManagerError),
+    /// `grant-profile-acl`の`[profile-id]`引数が不正
+    /// （[`crate::profile_paths::validate_profile_id`]が拒否する文字列）。
+    #[error(transparent)]
+    ProfileId(#[from] crate::profile_paths::ProfileIdError),
+    /// [`crate::profile_acl`]側のエラーをそのまま透過する
+    /// （`grant-profile-acl`本体、モジュール doc「profile ACL」節参照）。
+    #[error(transparent)]
+    ProfileAcl(#[from] crate::profile_acl::ProfileAclError),
 }
 
 /// [`ElevatedAction::SetupOperators`]の本体（`user`省略時は現在の対話
@@ -259,6 +287,17 @@ pub fn setup_operators(user: Option<&str>) -> Result<(), ElevatedError> {
 #[cfg(windows)]
 pub fn grant_service_acl() -> Result<(), ElevatedError> {
     windows_impl::grant_service_acl()
+}
+
+/// [`ElevatedAction::GrantProfileAcl`]の本体（`user`/`profile_id`省略時は
+/// それぞれ現在の対話ユーザー／[`crate::profile_paths::DEFAULT_PROFILE_ID`]、
+/// モジュール doc「profile ACL」節参照）。
+#[cfg(windows)]
+pub fn grant_profile_acl(
+    user: Option<&str>,
+    profile_id: Option<&str>,
+) -> Result<(), ElevatedError> {
+    windows_impl::grant_profile_acl(user, profile_id)
 }
 
 /// `banto-hub-elev.exe`と同じディレクトリにあるはずの`banto-hub.exe`の
@@ -281,19 +320,25 @@ fn sibling_banto_hub_exe_path() -> Result<std::path::PathBuf, ElevatedError> {
 
 /// [`ElevatedAction::ServiceInstall`]の本体 - `banto-hub.exe`を対象に
 /// [`crate::service_install::install`]を呼んだ後、`setup-operators`→
-/// `grant-service-acl`を続けて実行する（実装指示の順序どおり）。
+/// `grant-service-acl`→`grant-profile-acl`（既定ユーザー・既定 profile）を
+/// 続けて実行する（実装指示の順序どおり）。`grant-profile-acl`を新規
+/// インストール時点で流しておくことで、初回起動が Desktop/Service
+/// どちらであっても「LocalSystem 作成 profile が readonly になる」実機
+/// バグ（docs/banto-hub-t16-design.md §3 実機メモ、`crate::profile_acl`
+/// モジュール doc参照）を未然に防ぐ。
 ///
 /// `service_install::install`自体は失敗時に`eprintln!`案内の上で
 /// `std::process::exit(1)`する（`service_install.rs`のモジュール doc
 /// 「挙動は一切変えていない」参照）- そのため、このファイルの`Result`は
-/// 実質的に「install 成功後の setup-operators/grant-service-acl の失敗」
-/// だけを表す。
+/// 実質的に「install 成功後の setup-operators/grant-service-acl/
+/// grant-profile-acl の失敗」だけを表す。
 #[cfg(windows)]
 fn service_install_and_delegate() -> Result<(), ElevatedError> {
     let exe_path = sibling_banto_hub_exe_path()?;
     crate::service_install::install(Some(&exe_path));
     setup_operators(None)?;
     grant_service_acl()?;
+    grant_profile_acl(None, None)?;
     Ok(())
 }
 
@@ -325,8 +370,10 @@ fn set_autostart(enabled: bool) -> Result<(), ElevatedError> {
 /// [`ElevatedAction`]と残りの CLI 引数を受け取り、action ごとの引数個数を
 /// 検証した上でディスパッチする。
 ///
-/// `args`は action 自体を除いた残りの引数（`setup-operators`だけが
-/// 0〜1個のユーザー名を受け付け、他の5アクションは追加引数を受け付けない -
+/// `args`は action 自体を除いた残りの引数（`setup-operators`は0〜1個の
+/// ユーザー名、`grant-profile-acl`は0〜2個の`[username] [profile-id]`
+/// （位置引数、`profile-id`だけを指定して`username`を省略することは
+/// できない）を受け付け、他の4アクションは追加引数を受け付けない -
 /// モジュール doc の action 表参照）。
 #[cfg(windows)]
 pub fn run(action: ElevatedAction, args: &[String]) -> Result<(), ElevatedError> {
@@ -340,6 +387,14 @@ pub fn run(action: ElevatedAction, args: &[String]) -> Result<(), ElevatedError>
         ElevatedAction::GrantServiceAcl => {
             reject_extra_args(action, args)?;
             grant_service_acl()
+        }
+        ElevatedAction::GrantProfileAcl => {
+            if args.len() > 2 {
+                return Err(too_many_args(action, args.len(), "0〜2"));
+            }
+            let user = args.first().map(String::as_str);
+            let profile_id = args.get(1).map(String::as_str);
+            grant_profile_acl(user, profile_id)
         }
         ElevatedAction::ServiceInstall => {
             reject_extra_args(action, args)?;
@@ -566,6 +621,42 @@ mod windows_impl {
         result
     }
 
+    /// [`super::grant_profile_acl`]の本体（モジュール doc「profile ACL」節
+    /// 参照）。`user`/`profile_id`省略時のデフォルト解決だけをここで行い、
+    /// 実際の DACL 組み立ては[`crate::profile_acl::grant_profile_owner_acl`]
+    /// （`crate::service_operators::windows_impl::lookup_account_sid`を
+    /// 内部で再利用する別モジュール）へ委譲する。
+    pub(super) fn grant_profile_acl(
+        user: Option<&str>,
+        profile_id: Option<&str>,
+    ) -> Result<(), ElevatedError> {
+        let user_owned;
+        let user_name: &str = match user {
+            Some(name) => name,
+            None => {
+                user_owned = current_user_name()?;
+                &user_owned
+            }
+        };
+        let profile_id = profile_id.unwrap_or(crate::profile_paths::DEFAULT_PROFILE_ID);
+
+        // root 解決は`crate::profile_paths::resolve_profile_paths_from_env`
+        // と同じ4つの env（`BANTO_HUB_ROOT`/`ProgramData`/`XDG_DATA_HOME`/
+        // `HOME`）を読む - `profile-id`だけはこの関数の引数を正とする
+        // （`BANTO_HUB_PROFILE`は読まない。「省略時は既定 profile」という
+        // モジュール doc の記述どおり固定的に振る舞わせるため）。
+        let root = crate::profile_paths::resolve_hub_root(
+            std::env::var("BANTO_HUB_ROOT").ok().as_deref(),
+            std::env::var("ProgramData").ok().as_deref(),
+            std::env::var("XDG_DATA_HOME").ok().as_deref(),
+            std::env::var("HOME").ok().as_deref(),
+        );
+        let paths = crate::profile_paths::resolve_profile_paths(&root, profile_id)?;
+
+        crate::profile_acl::grant_profile_owner_acl(&paths.profile_dir, user_name)?;
+        Ok(())
+    }
+
     fn open_scm() -> Result<SC_HANDLE, ElevatedError> {
         // SAFETY: 引数はすべて null（ローカルマシン・既定データベース）。
         let scm = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
@@ -773,6 +864,10 @@ mod tests {
             Some(ElevatedAction::GrantServiceAcl)
         );
         assert_eq!(
+            ElevatedAction::parse("grant-profile-acl"),
+            Some(ElevatedAction::GrantProfileAcl)
+        );
+        assert_eq!(
             ElevatedAction::parse("service-install"),
             Some(ElevatedAction::ServiceInstall)
         );
@@ -819,7 +914,7 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), original_len, "ALL_NAMES に重複がある");
-        assert_eq!(original_len, 6, "固定アクションは6種類のはず");
+        assert_eq!(original_len, 7, "固定アクションは7種類のはず");
     }
 
     #[test]
@@ -908,6 +1003,19 @@ mod tests {
         assert!(matches!(err, ElevatedError::InvalidArgs(_)));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn run_rejects_too_many_args_for_grant_profile_acl() {
+        let extra = vec![
+            "user-a".to_string(),
+            "profile-a".to_string(),
+            "unexpected-third".to_string(),
+        ];
+        let err = run(ElevatedAction::GrantProfileAcl, &extra)
+            .expect_err("grant-profile-acl only accepts 0-2 args");
+        assert!(matches!(err, ElevatedError::InvalidArgs(_)));
+    }
+
     /// 実際に`BantoHub Operators`グループを作成・メンバー追加する -
     /// 管理者権限が必要なため CI・通常の開発機では実行しない
     /// （`#[ignore]`）。Windows 実機で
@@ -940,5 +1048,19 @@ mod tests {
     fn grant_service_acl_applies_without_error() {
         setup_operators(None).expect("setup-operators should succeed first");
         grant_service_acl().expect("grant-service-acl should succeed against an installed service");
+    }
+
+    /// 実際に`%ProgramData%\BantoHub\profiles\<profile-id>\`へ ACL を
+    /// 適用する - `%ProgramData%`配下への書き込みには管理者権限が必要
+    /// なため`#[ignore]`。Windows 実機で、LocalSystem サービス起動後の
+    /// 実 profile ディレクトリに対して手動実行し、対話ユーザーで DB が
+    /// 書き込めるようになることを確認する
+    /// （docs/banto-hub-t16-design.md §3 実機メモの再現・解消確認）。
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "管理者権限・%ProgramData% への書き込みが必要 - Windows 実機で手動実行"]
+    fn grant_profile_acl_applies_to_default_profile() {
+        grant_profile_acl(None, None)
+            .expect("grant-profile-acl should succeed for the current user / default profile");
     }
 }

@@ -16,12 +16,14 @@
 //! ```
 //!
 //! `<action>`は[`banto_hub_core::service_elevated::ElevatedAction`]が定義
-//! する固定の6種類のみ（`setup-operators`/`grant-service-acl`/
-//! `service-install`/`service-uninstall`/`autostart-enable`/
-//! `autostart-disable`）- フリーフォームなコマンド文字列は一切受け付けない
-//! （昇格プロセスへ任意コマンドを渡させないためのセキュリティ境界）。
-//! `setup-operators`だけ、追加ユーザー名を1個までの引数として受け付ける
-//! （省略時は現在の対話ユーザー - `service_elevated`のモジュール doc参照）。
+//! する固定の7種類のみ（`setup-operators`/`grant-service-acl`/
+//! `grant-profile-acl`/`service-install`/`service-uninstall`/
+//! `autostart-enable`/`autostart-disable`）- フリーフォームなコマンド文字列は
+//! 一切受け付けない（昇格プロセスへ任意コマンドを渡させないための
+//! セキュリティ境界）。`setup-operators`は追加ユーザー名を1個まで、
+//! `grant-profile-acl`は`[username] [profile-id]`を2個まで、それぞれ引数
+//! として受け付ける（省略時は現在の対話ユーザー／既定 profile -
+//! `service_elevated`のモジュール doc参照）。
 //!
 //! 実装本体は[`banto_hub_core::service_elevated`]（lib crate 側に置き、
 //! `banto-hub.exe`とテストコードの両方から検証しやすくしている）- この
@@ -74,6 +76,9 @@ fn print_usage() {
     );
     eprintln!(
         "banto-hub-elev:   例: banto-hub-elev.exe setup-operators [ユーザー名（省略時は現在の対話ユーザー）]"
+    );
+    eprintln!(
+        "banto-hub-elev:   例: banto-hub-elev.exe grant-profile-acl [ユーザー名] [profile-id]（両方省略時は現在の対話ユーザー・既定 profile）"
     );
 }
 

@@ -26,10 +26,16 @@ Windows 実機での`WindowsServiceManager`経路検証も未了）。**
 T16-0（薄いシェル）・T16-1（トレイ状態表示）はマージ済みで本書の前提。
 T16-2（サービス検出・native fallback）第一スライスは本書 §4 の引き渡し
 契約（P5）に従い、T17-0/T17-3 が提供する API を消費する形で実装した
-（フルの`HostSwitchEngine`活用・実機検証は継続）。
+（フルの`HostSwitchEngine`活用・実機検証は継続）。**2026-08-10:
+profile ACL 追加スライス（desktop-plan §11、`profile_acl.rs`・
+`grant-profile-acl`）を実装済み（§12）- T16-2 実機検証で見つかった
+「LocalSystem 作成 profile が readonly になる」既知ギャップを解消する。
+同日 Windows 実機で `grant-profile-acl`（UAC）による owner Modify 付与と
+書き込み復旧を確認済み（§12「Windows 実機検証」）。サービス先行作成→
+Desktop Hub 起動までのフル E2E は任意の追加確認として残す。**
 最終検証日(コード照合): 2026-08-10
-最終検証日(Windows 実機): 2026-08-10（§8・§10・§11、管理者 Cursor +
-オーナー対話。Operators 非管理者委任まで完了）
+最終検証日(Windows 実機): 2026-08-10（§8・§10・§11・§12、管理者 Cursor +
+オーナー対話。Operators 非管理者委任・profile ACL 付与まで完了）
 基準コミット: `7178493`（main、T17-3 マージ後 #118）。
 
 関連: [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)
@@ -701,3 +707,83 @@ banto-hub-core --lib`（`--test-threads=1`で283件 green。デフォルトの
   8. [x] 非管理者 Operators（`BantoOpTest`）: query/start(1056=既実行)/
          stop は Access Denied にならず、`sc config`/`sc delete` は
          FAILED 5 — オーナー確認 OK
+
+## 12. profile ACL 実装メモ（2026-08-10、desktop-plan §11・t16-design §3 実機メモの解消）
+
+T16-2 実機検証（§3・本書 §10 参照）で発見した既知ギャップ - LocalSystem
+（Windows サービス）が先に作成した `%ProgramData%\BantoHub\profiles\
+<profile-id>\...` は Users が書き込めず、Desktop/shell（対話ユーザー）
+起動が `attempt to write a readonly database` で失敗する - を、
+新設した [`profile_acl.rs`](../apps/banto-hub/core/src/profile_acl.rs)
+と新規固定アクション `grant-profile-acl` で解消した。
+
+### 実装
+
+- **`profile_acl::grant_profile_owner_acl(profile_dir, owner_account_name)`**
+  （`#[cfg(windows)]`）: `SYSTEM`/`Administrators`/指定ユーザーの SID を
+  `service_operators::windows_impl::lookup_account_sid`で解決し、
+  `GetNamedSecurityInfoW`→`SetEntriesInAclW`（`SET_ACCESS`、
+  `grant_service_acl`と同じマージ方式）→`SetNamedSecurityInfoW`で
+  `profile_dir`自身とその配下に**既に存在する**全ファイル・
+  全ディレクトリへ再帰的に ACE を適用する。
+- **付与する権限**（desktop-plan §11 のとおり、`Users`全体には一切
+  付与しない）:
+  - `SYSTEM`/`Administrators`: `FILE_ALL_ACCESS`（Full Control）
+  - profile owner（指定ユーザー）:
+    `FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE`
+    （NTFS の「変更(Modify)」既定値、`0x1301BF`。`WRITE_DAC`/
+    `WRITE_OWNER`は含めない - フルコントロールは付与しない）
+  - いずれも`OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE`付き -
+    LocalSystem サービスが以後新規作成するファイルも自動的に owner
+    書き込み可能になる
+  - `BantoHub Operators`には一切 ACE を追加しない（SCM の日常操作権限と
+    profile ファイル権限は別レイヤ、実装指示のとおり）
+- **既存ファイルの修復が必須だった理由**: ACL 継承は「今後作成される
+  ファイル」にしか効かない。実機バグの実体（サービスが既に作成済みの
+  `config/*.sqlite3`）を直すには、`profile_dir`配下の既存ファイルへの
+  再帰適用が必要 - `grant_profile_owner_acl`はこれを行う。
+- **固定アクション `grant-profile-acl`**（`service_elevated.rs`、
+  `banto-hub-elev.exe`）: `[username] [profile-id]`（いずれも省略可、
+  省略時は現在の対話ユーザー／既定 profile "default"）。root は
+  `profile_paths::resolve_hub_root`（env `BANTO_HUB_ROOT`/`ProgramData`/
+  `XDG_DATA_HOME`/`HOME`）で解決する。固定アクションは6→**7種類**に
+  増えた（`ElevatedAction::ALL_NAMES`）。
+- **`service-install`への配線**: `setup-operators`→`grant-service-acl`に
+  続けて`grant-profile-acl(None, None)`（対話ユーザー・既定 profile）を
+  実行するようにした - 新規インストール直後から、Desktop/Service
+  どちらが先に profile を作成しても readonly にならない。
+
+### 非 Windows ビルド
+
+`grant_profile_owner_acl`の非 Windows 版は`Ok(())`にはせず
+`ProfileAclError::UnsupportedPlatform`を返す（Windows ACL という概念
+自体が存在しないため、黙って成功したと誤解させない設計 -
+`service_operators.rs`等の「安全側で false」とは異なり、こちらは
+「操作自体が無意味なので明示的に失敗させる」判断）。
+
+### テスト・検証状況
+
+- `cargo fmt --all` / `cargo clippy -p banto-hub-core --all-targets -- -D warnings`
+  （Windows、警告0件）/
+  `cargo test -p banto-hub-core --lib -- --test-threads=1`
+  （298件 green、4件 ignore）。
+- `profile_acl::tests::grant_profile_owner_acl_applies_to_new_and_existing_files`
+  は`#[ignore]`を付けず通常テストとして実装した - 自プロセスが作成した
+  一時ディレクトリ（したがって自分がオーナー）に対する ACL 変更は
+  Windows の仕様上オーナーに常に許可されるため、管理者権限なしで
+  Windows CI（windows-latest）でも実行できる。実機（Windows 開発機）で
+  green を確認済み。
+- **Windows 実機検証（2026-08-10、非管理者 Cursor + UAC）**:
+  `%ProgramData%\BantoHub\profiles\acl-verify` を SYSTEM/Administrators
+  Full + Users RX のみ（対話ユーザー ACE なし）に制限したうえで
+  `banto-hub-elev.exe grant-profile-acl <user> acl-verify` を UAC 経由で
+  実行（exit 0）。結果:
+  - profile ディレクトリに `MSI-A13\TKent:(OI)(CI)(M)` が追加された
+  - `BUILTIN\Users` は `(OI)(CI)(RX)` のまま（書き込み ACE なし）
+  - 制限後にブロックされていたファイル書き込みが復旧した
+  - SDDL 方針（owner Modify / Users 全体へは付与しない）と一致
+- **任意の追加確認**: LocalSystem の実 `BantoHub` サービスが profile を
+  先に作成した直後の Desktop Hub 起動までのフル E2E は未実施
+  （上記 ACL 付与そのものは確認済み。`#[ignore]`テスト
+  `service_elevated::tests::grant_profile_acl_applies_to_default_profile`
+  も管理者シェルから手動実行可能）。

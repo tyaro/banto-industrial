@@ -5,7 +5,9 @@
 `apps/banto-hub/src-tauri`）・T16-1（トレイ状態表示）マージ済み。
 T16-2 第一スライス（サービス検出・接続・native fallback・Operators
 ゲート）実装済み（下記 §3 T16-2 実装メモ参照）。2026-08-10 Windows
-実機でサービス接続／Desktop 起動の主要経路を確認済み（同メモ末尾）。**
+実機でサービス接続／Desktop 起動の主要経路を確認済み（同メモ末尾）。
+同日発見の既知ギャップ「LocalSystem 作成 profile の ACL」（下記 §5）は
+T17 側（`profile_acl.rs`、docs/banto-hub-t17-design.md §12）で解消済み。**
 最終検証日(コード照合): 2026-08-10
 最終検証日(Windows 実機): 2026-08-10（T16-2 シェル、管理者 UAC + Operators）
 基準コミット: `396e927`（main、T16-1 マージ後）。T16-1 の実装は本設計と
@@ -146,8 +148,10 @@ desktop-plan §10 に日付付きで追記する（T16-0 PR で実施）。
 > `%ProgramData%\BantoHub\profiles\...\config\*.sqlite3` は Users が
 > 書き込めず、Desktop/shell ホスト起動が
 > `attempt to write a readonly database` で失敗し fallback になる。
-> profile ACL（desktop-plan §11）未実装の既知ギャップ。検証時は
-> config を消すか Users に Modify を付与して Desktop 経路を確認した。
+> 検証時は config を消すか Users に Modify を付与して Desktop 経路を確認した
+> （§5「LocalSystem 作成 profile の ACL」参照）。
+> **その後の対応（同日）**: `grant-profile-acl`（profile owner への継承付き
+> Modify、`Users`全体には付与しない）で解消済み。
 
 ## 4. T16-0 設計（P3）
 
@@ -254,8 +258,17 @@ banto-hub-shell (Tauri v2, Windows 優先)
   起動を確認済み（§3 実装メモ末尾）。トレイからの開始／停止 UI 操作と
   `HostSwitchEngine` 完了待ちは未実施（上記 gap）。
 - **LocalSystem 作成 profile の ACL**: サービス先行作成の DB が対話ユーザー
-  から readonly になり Desktop 起動が失敗し得る（§3 実機メモ）。profile
-  ACL 実装（desktop-plan §11）待ち。
+  から readonly になり Desktop 起動が失敗し得る（§3 実機メモ）。**2026-08-10
+  対応済み**: `profile_acl.rs`＋固定アクション`grant-profile-acl`
+  （docs/banto-hub-t17-design.md §12）で profile owner への DACL 付与
+  （`Users`全体には付与しない、desktop-plan §11）を実装した。
+  `service-install`が新規インストール時に自動実行するため、通常は手動
+  操作不要。既存インストールで本エラーに遭遇した場合は
+  `banto-hub-elev.exe grant-profile-acl`で手動解消できる
+  （docs/banto-hub-operations.md §10「profile ディレクトリの権限
+  （ACL）」）。2026-08-10 実機で `grant-profile-acl`（UAC）による
+  owner Modify 付与と書き込み復旧を確認済み（t17-design §12）。
+  サービス先行作成→Desktop Hub 起動までのフル E2E は任意の追加確認。
 
 ## 6. 承認チェックリスト
 
