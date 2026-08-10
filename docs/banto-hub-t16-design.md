@@ -4,8 +4,10 @@
 状態: **設計確定。P1〜P3 承認済み。T16-0（薄いシェル `banto-hub-shell`、
 `apps/banto-hub/src-tauri`）・T16-1（トレイ状態表示）マージ済み。
 T16-2 第一スライス（サービス検出・接続・native fallback・Operators
-ゲート）実装済み（下記 §3 T16-2 実装メモ参照）。**
+ゲート）実装済み（下記 §3 T16-2 実装メモ参照）。2026-08-10 Windows
+実機でサービス接続／Desktop 起動の主要経路を確認済み（同メモ末尾）。**
 最終検証日(コード照合): 2026-08-10
+最終検証日(Windows 実機): 2026-08-10（T16-2 シェル、管理者 UAC + Operators）
 基準コミット: `396e927`（main、T16-1 マージ後）。T16-1 の実装は本設計と
 同じ PR（`cursor/t16-1-tray-status-e3cb`、#101）で追加。
 
@@ -131,8 +133,23 @@ desktop-plan §10 に日付付きで追記する（T16-0 PR で実施）。
 >   常にデスクトップホストとして起動を試みる（従来どおり）。
 >
 > 既知の gap（次スライスへの引き継ぎ）は §5 参照。
+>
+> **Windows 実機検証（2026-08-10、`_verify_t17/`、Operators 対話ユーザー）**:
+>
+> | シナリオ                                                        | 結果                                                                                                                                                      |
+> | --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+> | サービス Running + shell 起動                                   | shell は Desktop Hub を起動せず生存。`profile.lock` は `host_kind: service` のまま。openapi 200。プロセスは `banto-hub`(service) + `banto-hub-shell` のみ |
+> | サービス Stopped + shell 起動（profile DB が Users 書き込み可） | `profile.lock` が `host_kind: shell`、openapi 200（Desktop Hub 埋め込み）                                                                                 |
+> | Operators の `sc start`/`sc stop`                               | OK（既存 T17-2 ACL）                                                                                                                                      |
+>
+> **発見した運用上の注意**: LocalSystem サービスが先に作った
+> `%ProgramData%\BantoHub\profiles\...\config\*.sqlite3` は Users が
+> 書き込めず、Desktop/shell ホスト起動が
+> `attempt to write a readonly database` で失敗し fallback になる。
+> profile ACL（desktop-plan §11）未実装の既知ギャップ。検証時は
+> config を消すか Users に Modify を付与して Desktop 経路を確認した。
 
-## 4. T16-0 設計（P3）
+### T16-2 第一スライスの既知の gap（次スライスへの引き継ぎ）
 
 ### 4.1 Composition
 
@@ -232,11 +249,13 @@ banto-hub-shell (Tauri v2, Windows 優先)
   `HostSwitchEngine`の不変条件ほど厳密には確認していない（Desktop
   起動前に SCM が`Stopped`であることは見るが、旧 health の消失
   （probe `Unreachable`）までは待たない）。
-- **Windows 実機での`WindowsServiceManager`経路は未検証**: このスライスの
-  単体テストは`banto-hub-core`側の`MockServiceManager`/`MockHubHealthProbe`
-  と、シェル側の純粋関数（`tray_status`/`fallback_message`）のみをカバーし、
-  実サービスに対する`query_status`/`start`/`stop`は Windows 実機での手動
-  受け入れが必要（`docs/banto-hub-t17-design.md` §5 と同様の未検証事項）。
+- **Windows 実機での`WindowsServiceManager`経路**: 2026-08-10 に
+  `_verify_t17` でサービス Running 時の shell 接続・Stopped 時の Desktop
+  起動を確認済み（§3 実装メモ末尾）。トレイからの開始／停止 UI 操作と
+  `HostSwitchEngine` 完了待ちは未実施（上記 gap）。
+- **LocalSystem 作成 profile の ACL**: サービス先行作成の DB が対話ユーザー
+  から readonly になり Desktop 起動が失敗し得る（§3 実機メモ）。profile
+  ACL 実装（desktop-plan §11）待ち。
 
 ## 6. 承認チェックリスト
 
