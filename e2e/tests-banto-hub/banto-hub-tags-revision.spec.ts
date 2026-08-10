@@ -1,9 +1,13 @@
 /**
- * タグ更新の楽観的ロック（T18-1 続き、TAG-UX-C 4点目の前半、
+ * タグ更新の楽観的ロック + 競合時の差分表示 UI（T18-1、TAG-UX-C 4点目、
  * docs/banto-hub-desktop-plan.md §9.4「revision / ETag で後勝ち上書きを
- * 防ぐ」）の実 DOM 受け入れテスト。**差分表示 UI（フィールド単位の並列
- * 比較）は本 PR のスコープ外** — ここで確認するのは「他セッション更新を
- * 黙って上書きしない」（検出 + サーバー最新値での上書き）のみ。
+ * 防ぎ、競合時は差分を表示する」）の実 DOM 受け入れテスト。検出（revision
+ * + HTTP 409）は `cursor/t18-1-tags-revision-e3cb` 済み。本 spec は続く
+ * `cursor/t18-1-tags-conflict-diff-e3cb` で追加した差分表示 UI（フィールド
+ * 単位の並列比較・「サーバー最新を採用」/「自分の内容で再保存」）を確認する
+ * - **旧版はここで「フォームが即サーバー最新値に上書きされる」ことを
+ * 確認していたが、挙動変更（ローカル編集を破棄せずパネルで選ばせる）に
+ * 伴い、その部分のアサーションは書き換えている**。
  *
  * `banto-hub-tags-busy.spec.ts`/`banto-hub-tags-form.spec.ts` と同じ
  * パターン: 別 `describe.serial` ブロック（別 `page`）、認証・前提データ
@@ -19,10 +23,16 @@ const CONNECTION_NAME = 'e2e-revision-plc';
 const GROUP_NAME = 'e2e-revision-group';
 const TAG_NAME = 'e2e-revision-tag';
 
-/** 他クライアント（UI を経由しない別経路）が確定させる単位。 */
+/** 1回目の競合: 他クライアント（UI を経由しない別経路）が確定させる単位。 */
 const EXTERNAL_UNIT = 'external-kPa';
-/** UI 側がフォームで入力しようとする単位（サーバーには反映されないはず）。 */
+/** 1回目の競合: UI 側がフォームで入力しようとする単位。 */
 const UI_ATTEMPTED_UNIT = 'ui-should-not-win';
+/** サーバー最新採用後、そのまま保存し直す単位（3件目のテスト）。 */
+const AFTER_RESOLVE_UNIT = 'after-resolve-unit';
+/** 2回目の競合: 他クライアントが確定させる単位。 */
+const EXTERNAL_UNIT_2 = 'external-kPa-2';
+/** 2回目の競合: UI 側が「自分の内容で再保存」で勝たせる単位。 */
+const UI_ATTEMPTED_UNIT_2 = 'ui-should-win-this-time';
 
 interface TagResponse {
 	id: number;
@@ -30,7 +40,7 @@ interface TagResponse {
 	revision: number;
 }
 
-test.describe.serial('banto-hub タグ更新の楽観的ロック (TAG-UX-C)', () => {
+test.describe.serial('banto-hub タグ更新の楽観的ロック + 競合時の差分表示 (TAG-UX-C)', () => {
 	let page: Page;
 	let authedHeaders: Record<string, string>;
 	let tagId: number;
@@ -102,7 +112,7 @@ test.describe.serial('banto-hub タグ更新の楽観的ロック (TAG-UX-C)', (
 		await page.close();
 	});
 
-	test('別経路が先に更新（revision が進む） → UI が古い revision で保存すると 409 になり、黙って上書きしない', async () => {
+	test('別経路が先に更新（revision が進む） → UI が古い revision で保存すると 409 になり、差分パネルが表示される', async () => {
 		await page.goto('/tags');
 		await page.getByRole('gridcell', { name: TAG_NAME, exact: true }).click();
 		const drawer = page.getByRole('dialog', { name: `${TAG_NAME} を編集` });
@@ -148,11 +158,19 @@ test.describe.serial('banto-hub タグ更新の楽観的ロック (TAG-UX-C)', (
 			page.getByText('他のクライアントがこのタグを更新済みです。再読込してから保存してください。')
 		).toBeVisible();
 
-		// フォームはローカルの未保存編集（UI_ATTEMPTED_UNIT）を破棄し、
-		// サーバー最新値（外部更新の EXTERNAL_UNIT）で上書きされている -
-		// 差分の並列表示は本 PR のスコープ外だが、少なくとも UI 側の値が
-		// 黙って勝つことはない。
-		await expect(unitInput).toHaveValue(EXTERNAL_UNIT);
+		// 差分表示 UI（本 spec の本題）: フォーム上部に競合パネルが出て、
+		// 「あなたの入力」列に UI 側の入力、「サーバー最新」列に外部更新の
+		// 値が並ぶ。
+		await expect(drawer.getByText('他のクライアントが先に更新しています')).toBeVisible();
+		const conflictRow = drawer.locator('tr', { hasText: '単位' });
+		await expect(conflictRow).toContainText(UI_ATTEMPTED_UNIT);
+		await expect(conflictRow).toContainText(EXTERNAL_UNIT);
+
+		// 挙動変更点: ローカルの未保存編集（UI_ATTEMPTED_UNIT）は破棄され
+		// ない - フォーム自体は依然としてユーザーが入力した値を保持する
+		// （黙ってサーバー値に上書きされるわけでも、黙ってローカル値が
+		// 勝つわけでもなく、ユーザーが選ぶまで両方が見える）。
+		await expect(unitInput).toHaveValue(UI_ATTEMPTED_UNIT);
 
 		// サーバー側も外部更新の値のまま（UI の保存試行では変わっていない）。
 		const afterRes = await page.request.get(`/api/tags/${tagId}`, { headers: authedHeaders });
@@ -162,7 +180,18 @@ test.describe.serial('banto-hub タグ更新の楽観的ロック (TAG-UX-C)', (
 		expect(after.revision).toBe(2);
 	});
 
-	test('サーバー最新の revision を expectedRevision に使えば、UI からの保存が成功する', async () => {
+	test('「サーバー最新を採用」を押すとフォームがサーバー値になり、差分パネルが消える', async () => {
+		const drawer = page.getByRole('dialog', { name: `${TAG_NAME} を編集` });
+		await expect(drawer).toBeVisible();
+		await expect(drawer.getByText('他のクライアントが先に更新しています')).toBeVisible();
+
+		await drawer.getByRole('button', { name: 'サーバー最新を採用' }).click();
+
+		await expect(drawer.getByText('他のクライアントが先に更新しています')).toHaveCount(0);
+		await expect(drawer.getByLabel('単位')).toHaveValue(EXTERNAL_UNIT);
+	});
+
+	test('サーバー最新を採用した後にそのまま保存すると、通常どおり成功する', async () => {
 		// 前のテストでフォームは既にサーバー最新（revision=2）に更新済み
 		// なので、そのまま何かを変更して保存すれば今度は成功する -
 		// 「検出したら即詰み」ではなく「最新を取り直せば再試行できる」
@@ -171,7 +200,7 @@ test.describe.serial('banto-hub タグ更新の楽観的ロック (TAG-UX-C)', (
 		await expect(drawer).toBeVisible();
 
 		const unitInput = drawer.getByLabel('単位');
-		await unitInput.fill('after-reload-unit');
+		await unitInput.fill(AFTER_RESOLVE_UNIT);
 		await drawer.getByRole('button', { name: '保存' }).click();
 
 		await expect(page.getByText('更新しました')).toBeVisible();
@@ -179,7 +208,58 @@ test.describe.serial('banto-hub タグ更新の楽観的ロック (TAG-UX-C)', (
 		const afterRes = await page.request.get(`/api/tags/${tagId}`, { headers: authedHeaders });
 		expect(afterRes.ok()).toBe(true);
 		const after = (await afterRes.json()) as TagResponse;
-		expect(after.unit).toBe('after-reload-unit');
+		expect(after.unit).toBe(AFTER_RESOLVE_UNIT);
 		expect(after.revision).toBe(3);
+	});
+
+	test('2度目の競合で「自分の内容で再保存」を押すと、ローカルの入力が勝って revision が進む', async () => {
+		const drawer = page.getByRole('dialog', { name: `${TAG_NAME} を編集` });
+		await expect(drawer).toBeVisible();
+
+		// 再び別経路が先に更新して revision を 3 → 4 に進める。
+		const externalUpdateRes = await page.request.put(`/api/tags/${tagId}`, {
+			headers: authedHeaders,
+			data: {
+				name: TAG_NAME,
+				collectionGroupId: groupId,
+				address: '40001',
+				dataType: 'i16',
+				decimals: 0,
+				unit: EXTERNAL_UNIT_2,
+				enabled: true,
+				writable: false,
+				tagKind: 'plc',
+				expectedRevision: 3
+			}
+		});
+		expect(externalUpdateRes.ok()).toBe(true);
+		const externalUpdated = (await externalUpdateRes.json()) as TagResponse;
+		expect(externalUpdated.revision).toBe(4);
+
+		const unitInput = drawer.getByLabel('単位');
+		await unitInput.fill(UI_ATTEMPTED_UNIT_2);
+		await drawer.getByRole('button', { name: '保存' }).click();
+
+		// 再び競合パネルが出て、今回はローカル/サーバーそれぞれの新しい値が
+		// 表に並ぶ。
+		await expect(drawer.getByText('他のクライアントが先に更新しています')).toBeVisible();
+		const conflictRow = drawer.locator('tr', { hasText: '単位' });
+		await expect(conflictRow).toContainText(UI_ATTEMPTED_UNIT_2);
+		await expect(conflictRow).toContainText(EXTERNAL_UNIT_2);
+
+		await drawer.getByRole('button', { name: '自分の内容で再保存' }).click();
+
+		// 「自分の内容で再保存」は `expectedRevision` をサーバー最新
+		// （競合検出時に更新済みの revision=4）に差し替えて再送信するため、
+		// 今度は成功し、ローカルの入力（UI_ATTEMPTED_UNIT_2）が勝つ。
+		await expect(page.getByText('更新しました')).toBeVisible();
+		await expect(drawer.getByText('他のクライアントが先に更新しています')).toHaveCount(0);
+		await expect(unitInput).toHaveValue(UI_ATTEMPTED_UNIT_2);
+
+		const afterRes = await page.request.get(`/api/tags/${tagId}`, { headers: authedHeaders });
+		expect(afterRes.ok()).toBe(true);
+		const after = (await afterRes.json()) as TagResponse;
+		expect(after.unit).toBe(UI_ATTEMPTED_UNIT_2);
+		expect(after.revision).toBe(5);
 	});
 });
