@@ -1883,7 +1883,7 @@ fn default_tag_kind() -> String {
 /// Wire-shaped (camelCase) create/update payload for `plc_connections` -
 /// copied from relay-wright's `PlcConnectionPayload` (invariant across every
 /// app that exposes I1 over REST: one payload shape).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlcConnectionPayload {
     pub name: String,
@@ -1921,7 +1921,7 @@ impl From<PlcConnectionPayload> for PlcConnectionInput {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CollectionGroupPayload {
     pub name: String,
@@ -2078,7 +2078,7 @@ struct QueuedPendingChangeResponse {
     message: String,
 }
 
-async fn queue_pending_tag_change(
+async fn queue_pending_registry_change(
     state: &TagRegistryState,
     headers: &HeaderMap,
     source: &str,
@@ -2203,7 +2203,7 @@ async fn plc_connections_create(
     State(state): State<TagRegistryState>,
     headers: HeaderMap,
     Json(input): Json<PlcConnectionPayload>,
-) -> RegistryMutationResult<Json<PlcConnection>> {
+) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
         &state.audit,
@@ -2213,6 +2213,17 @@ async fn plc_connections_create(
         "/api/plc-connections",
     )
     .await?;
+    let status = state.controller.status();
+    if status.state != CollectionState::Stopped {
+        return queue_pending_registry_change(
+            &state,
+            &headers,
+            "plc_connections.create",
+            json!({ "input": input }),
+            status,
+        )
+        .await;
+    }
     require_collection_stopped(&state)?;
     let mut tx = state
         .manager
@@ -2254,7 +2265,7 @@ async fn plc_connections_create(
         state.legacy_live_reconfigure,
     )
     .await;
-    Ok(Json(created))
+    Ok(Json(created).into_response())
 }
 
 async fn plc_connections_update(
@@ -2262,7 +2273,7 @@ async fn plc_connections_update(
     headers: HeaderMap,
     Path(id): Path<i64>,
     Json(input): Json<PlcConnectionPayload>,
-) -> RegistryMutationResult<Json<PlcConnection>> {
+) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
         &state.audit,
@@ -2272,6 +2283,17 @@ async fn plc_connections_update(
         "/api/plc-connections/{id}",
     )
     .await?;
+    let status = state.controller.status();
+    if status.state != CollectionState::Stopped {
+        return queue_pending_registry_change(
+            &state,
+            &headers,
+            "plc_connections.update",
+            json!({ "id": id, "input": input }),
+            status,
+        )
+        .await;
+    }
     require_collection_stopped(&state)?;
     let mut tx = state
         .manager
@@ -2317,14 +2339,14 @@ async fn plc_connections_update(
         state.legacy_live_reconfigure,
     )
     .await;
-    Ok(Json(updated))
+    Ok(Json(updated).into_response())
 }
 
 async fn plc_connections_delete(
     State(state): State<TagRegistryState>,
     headers: HeaderMap,
     Path(id): Path<i64>,
-) -> RegistryMutationResult<StatusCode> {
+) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
         &state.audit,
@@ -2334,6 +2356,17 @@ async fn plc_connections_delete(
         "/api/plc-connections/{id}",
     )
     .await?;
+    let status = state.controller.status();
+    if status.state != CollectionState::Stopped {
+        return queue_pending_registry_change(
+            &state,
+            &headers,
+            "plc_connections.delete",
+            json!({ "id": id }),
+            status,
+        )
+        .await;
+    }
     require_collection_stopped(&state)?;
     let mut tx = state
         .manager
@@ -2372,7 +2405,7 @@ async fn plc_connections_delete(
         state.legacy_live_reconfigure,
     )
     .await;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 // --- T12 (docs/ux-plan.md §4): 保存前の接続テスト ---------------------------
@@ -2820,7 +2853,7 @@ async fn collection_groups_create(
     State(state): State<TagRegistryState>,
     headers: HeaderMap,
     Json(input): Json<CollectionGroupPayload>,
-) -> RegistryMutationResult<Json<CollectionGroup>> {
+) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
         &state.audit,
@@ -2830,6 +2863,17 @@ async fn collection_groups_create(
         "/api/collection-groups",
     )
     .await?;
+    let status = state.controller.status();
+    if status.state != CollectionState::Stopped {
+        return queue_pending_registry_change(
+            &state,
+            &headers,
+            "collection_groups.create",
+            json!({ "input": input }),
+            status,
+        )
+        .await;
+    }
     require_collection_stopped(&state)?;
     let mut tx = state
         .manager
@@ -2875,7 +2919,7 @@ async fn collection_groups_create(
         state.legacy_live_reconfigure,
     )
     .await;
-    Ok(Json(created))
+    Ok(Json(created).into_response())
 }
 
 async fn collection_groups_update(
@@ -2883,7 +2927,7 @@ async fn collection_groups_update(
     headers: HeaderMap,
     Path(id): Path<i64>,
     Json(input): Json<CollectionGroupPayload>,
-) -> RegistryMutationResult<Json<CollectionGroup>> {
+) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
         &state.audit,
@@ -2893,6 +2937,17 @@ async fn collection_groups_update(
         "/api/collection-groups/{id}",
     )
     .await?;
+    let status = state.controller.status();
+    if status.state != CollectionState::Stopped {
+        return queue_pending_registry_change(
+            &state,
+            &headers,
+            "collection_groups.update",
+            json!({ "id": id, "input": input }),
+            status,
+        )
+        .await;
+    }
     require_collection_stopped(&state)?;
     let mut tx = state
         .manager
@@ -2938,14 +2993,14 @@ async fn collection_groups_update(
         state.legacy_live_reconfigure,
     )
     .await;
-    Ok(Json(updated))
+    Ok(Json(updated).into_response())
 }
 
 async fn collection_groups_delete(
     State(state): State<TagRegistryState>,
     headers: HeaderMap,
     Path(id): Path<i64>,
-) -> RegistryMutationResult<StatusCode> {
+) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
         &state.audit,
@@ -2955,6 +3010,17 @@ async fn collection_groups_delete(
         "/api/collection-groups/{id}",
     )
     .await?;
+    let status = state.controller.status();
+    if status.state != CollectionState::Stopped {
+        return queue_pending_registry_change(
+            &state,
+            &headers,
+            "collection_groups.delete",
+            json!({ "id": id }),
+            status,
+        )
+        .await;
+    }
     require_collection_stopped(&state)?;
     let mut tx = state
         .manager
@@ -2993,7 +3059,7 @@ async fn collection_groups_delete(
         state.legacy_live_reconfigure,
     )
     .await;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn tags_list(State(state): State<TagRegistryState>) -> Result<Json<Vec<Tag>>, ApiError> {
@@ -3023,7 +3089,7 @@ async fn tags_create(
     .await?;
     let status = state.controller.status();
     if status.state != CollectionState::Stopped {
-        return queue_pending_tag_change(
+        return queue_pending_registry_change(
             &state,
             &headers,
             "tags.create",
@@ -3092,7 +3158,7 @@ async fn tags_update(
     .await?;
     let status = state.controller.status();
     if status.state != CollectionState::Stopped {
-        return queue_pending_tag_change(
+        return queue_pending_registry_change(
             &state,
             &headers,
             "tags.update",
@@ -3165,7 +3231,7 @@ async fn tags_delete(
     .await?;
     let status = state.controller.status();
     if status.state != CollectionState::Stopped {
-        return queue_pending_tag_change(
+        return queue_pending_registry_change(
             &state,
             &headers,
             "tags.delete",
@@ -3376,7 +3442,7 @@ async fn tags_batch(
     State(state): State<TagRegistryState>,
     headers: HeaderMap,
     Json(body): Json<BatchTagsRequest>,
-) -> RegistryMutationResult<Json<BatchTagsResponse>> {
+) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
         &state.audit,
@@ -3388,6 +3454,17 @@ async fn tags_batch(
     .await?;
 
     if !body.dry_run {
+        let status = state.controller.status();
+        if status.state != CollectionState::Stopped {
+            return queue_pending_registry_change(
+                &state,
+                &headers,
+                "tags.batch_create",
+                json!({ "dryRun": false, "tags": body.tags }),
+                status,
+            )
+            .await;
+        }
         require_collection_stopped(&state)?;
     }
 
@@ -3401,7 +3478,8 @@ async fn tags_batch(
             count: 0,
             errors: Vec::new(),
             tags: (!dry_run).then(Vec::new),
-        }));
+        })
+        .into_response());
     }
 
     let mut tx = state
@@ -3426,7 +3504,8 @@ async fn tags_batch(
                 count: 0,
                 errors: errors.into_iter().map(Into::into).collect(),
                 tags: None,
-            }))
+            })
+            .into_response())
         }
         BatchTagOutcome::Valid { count, tags } => {
             let snapshot = match preflight_transaction(&mut tx).await {
@@ -3467,7 +3546,8 @@ async fn tags_batch(
                 count,
                 errors: Vec::new(),
                 tags: if dry_run { None } else { tags },
-            }))
+            })
+            .into_response())
         }
     }
 }
@@ -6515,6 +6595,130 @@ mod tests {
             body["message"],
             "収集中のため変更を未適用キューに保存しました。"
         );
+
+        let queued_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_changes")
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+        assert_eq!(queued_count, 1);
+    }
+
+    #[tokio::test]
+    async fn plc_connections_create_while_running_is_accepted_and_queued() {
+        let env = test_env().await;
+
+        let start = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/start")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/plc-connections")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "name": "line-running", "host": "127.0.0.1", "port": 15022 })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["queued"], true);
+
+        let queued_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_changes")
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+        assert_eq!(queued_count, 1);
+    }
+
+    #[tokio::test]
+    async fn tags_batch_non_dry_run_while_running_is_accepted_and_queued() {
+        let env = test_env().await;
+
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line1", "host": "127.0.0.1", "port": 15022 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+
+        let (status, group) = admin_post(
+            &env.router,
+            "/api/collection-groups",
+            &env.admin_token,
+            json!({ "name": "fast", "plcConnectionId": conn["id"], "periodMs": 100 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{group:?}");
+
+        let start = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/start")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/tags/batch")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "dryRun": false,
+                            "tags": [{
+                                "name": "temp01",
+                                "collectionGroupId": group["id"],
+                                "address": "40001",
+                                "dataType": "i16"
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["queued"], true);
 
         let queued_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_changes")
             .fetch_one(&env.pool)
