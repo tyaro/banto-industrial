@@ -67,6 +67,15 @@
 		type CsvRowError
 	} from '$lib/banto/tagCsv';
 	import { parseOptionalNumber } from '$lib/banto/tagFormNumeric';
+	import {
+		DISPLAY_SCALING_FIELDS,
+		THRESHOLD_FIELDS,
+		WRITE_SAFETY_FIELDS,
+		hasFieldError,
+		buildConfirmExternalName,
+		environmentLabel,
+		writePermissionLabel
+	} from '$lib/banto/tagFormLayout';
 	import { isFormDirty } from '$lib/banto/formDirty';
 	import {
 		buildExternalName,
@@ -254,6 +263,53 @@
 	}
 
 	/**
+	 * T18-2a（TAG-UX-B「保存前に最終外部名 `{connection}.{group}.{tag}`、
+	 * 実機／SIM、書き込み許可を固定領域で確認できるようにする」）:
+	 * `tagFields` スニペット末尾の「保存前の確認」領域（`.confirm-panel`）
+	 * を駆動する3つの薄いラッパー。実際の組み立てロジックは
+	 * `$lib/banto/tagFormLayout.ts` の純関数へ切り出してあり、ここは
+	 * `groups`/`connections`（このページの `$state`）からフォームの
+	 * `collectionGroupId` に対応する接続・グループを引くだけの責務。
+	 */
+	function connectionForGroupId(id: string): PlcConnection | undefined {
+		const gid = Number(id);
+		if (!Number.isFinite(gid)) return undefined;
+		const group = groups.find((g) => g.id === gid);
+		return group ? connections.find((c) => c.id === group.plcConnectionId) : undefined;
+	}
+
+	function confirmExternalName(form: FormState): string {
+		const conn = connectionForGroupId(form.collectionGroupId);
+		const group = groups.find((g) => String(g.id) === form.collectionGroupId);
+		return buildConfirmExternalName({
+			connectionName: conn?.name,
+			groupName: group?.name,
+			tagName: form.name
+		});
+	}
+
+	function confirmEnvironmentLabel(form: FormState): string {
+		return environmentLabel(connectionForGroupId(form.collectionGroupId)?.simulation);
+	}
+
+	function confirmWriteLabel(form: FormState): string {
+		return writePermissionLabel(form.tagKind, form.writable);
+	}
+
+	/**
+	 * T18-2a（TAG-UX-G「必須項目、ヒント、エラーを `required` /
+	 * `aria-invalid` / `aria-describedby` で関連付け」）: 複数の id
+	 * （ヒント span・エラー span）を空白区切りの `aria-describedby` へ
+	 * まとめる。`false`/`undefined` は素通りさせて呼び出し側が
+	 * 三項演算子を書かずに済むようにする — 対象が無ければ属性自体を
+	 * 付けない（`undefined` を返す）。
+	 */
+	function describedBy(...ids: (string | false | undefined)[]): string | undefined {
+		const list = ids.filter((id): id is string => Boolean(id));
+		return list.length > 0 ? list.join(' ') : undefined;
+	}
+
+	/**
 	 * T13-1 (docs/ux-plan.md §4b): 通常登録・行クリック編集・連続登録・
 	 * CSVインポートの4フローを1つの Drawer に集約する。旧 `Mode`
 	 * （'single' | 'continuous' | 'csv' の表示切替）と旧「選択中タグの
@@ -395,6 +451,46 @@
 	let editBaseline: FormState = blankForm();
 	let editErrors: Record<string, string> = $state({});
 	let saving = $state(false);
+
+	/**
+	 * T18-2a（TAG-UX-B「詳細を閉じても値保持・詳細エラー時は自動展開」）:
+	 * `tagFields` の3つの `<details class="detail-group">` の開閉状態。
+	 * create/edit の Drawer は `{#if drawerMode === 'create'} ...
+	 * {:else if drawerMode === 'edit'}` で同時に1つしかマウントされないが、
+	 * それぞれ独立した `$state` を持たせる — 共有すると、例えば edit で
+	 * 「しきい値」セクションを開いた状態のまま create Drawer を開いたときに
+	 * その開閉状態が漏れてしまう。
+	 */
+	interface DetailOpenState {
+		display: boolean;
+		threshold: boolean;
+		write: boolean;
+	}
+	function blankDetailOpen(): DetailOpenState {
+		return { display: false, threshold: false, write: false };
+	}
+	let createDetailOpen: DetailOpenState = $state(blankDetailOpen());
+	let editDetailOpen: DetailOpenState = $state(blankDetailOpen());
+
+	/**
+	 * これらの `$effect` は該当セクションにエラーが**新たに現れたときだけ
+	 * 開く**方向にしか作用しない（強制的に閉じることはしない）— ユーザーが
+	 * 手動でセクションを折りたたんだ選択は、次に失敗した送信が
+	 * `createErrors`/`editErrors` を丸ごと再代入して effect を再実行させる
+	 * まで尊重される（`handleCreate`/`saveEdit` は毎回 `xxxErrors = {}` →
+	 * 失敗時に新しいオブジェクトを代入し直すので、この effect はキー入力の
+	 * たびにではなく実際の送信試行のたびにしか再実行されない）。
+	 */
+	$effect(() => {
+		if (hasFieldError(createErrors, DISPLAY_SCALING_FIELDS)) createDetailOpen.display = true;
+		if (hasFieldError(createErrors, THRESHOLD_FIELDS)) createDetailOpen.threshold = true;
+		if (hasFieldError(createErrors, WRITE_SAFETY_FIELDS)) createDetailOpen.write = true;
+	});
+	$effect(() => {
+		if (hasFieldError(editErrors, DISPLAY_SCALING_FIELDS)) editDetailOpen.display = true;
+		if (hasFieldError(editErrors, THRESHOLD_FIELDS)) editDetailOpen.threshold = true;
+		if (hasFieldError(editErrors, WRITE_SAFETY_FIELDS)) editDetailOpen.write = true;
+	});
 
 	/**
 	 * T18-1（TAG-UX-C 4点目「差分表示 UI」、docs/banto-hub-desktop-plan.md
@@ -1001,7 +1097,7 @@
 	];
 </script>
 
-{#snippet tagFields(form: FormState, errors: Record<string, string>)}
+{#snippet tagFields(form: FormState, errors: Record<string, string>, detailOpen: DetailOpenState)}
 	<!--
 		TAG-P0-2（docs/banto-hub-desktop-plan.md §9.3、2026-08-10 実装メモ）:
 		preflight 失敗（field="configuration"）はどの単票フィールドにも
@@ -1012,31 +1108,21 @@
 	{#if errors.configuration}
 		<p class="err" role="alert">{errors.configuration}</p>
 	{/if}
+	<!--
+		T18-2a（docs/banto-hub-t18-design.md「T18-2a 単票フォーム刷新」、
+		TAG-UX-B「入力順を『タグ種別 → 接続／グループ → 名前 → アドレス →
+		データ型』とする」）: 常時表示の基本設定。既存フィールドの入力順
+		だけを並べ替えたもので、各フィールドの挙動（`required`・
+		`groupsFor` 絞り込み・ヒント文言）は元のまま変更していない。
+	-->
 	<div class="form-grid">
-		<label class="field">
-			名前<span class="required">*</span>
-			<input type="text" bind:value={form.name} required />
-			{#if errors.name}<span class="err">{errors.name}</span>{/if}
-		</label>
-		<label class="field">
-			収集グループ<span class="required">*</span>
-			<select bind:value={form.collectionGroupId} required>
-				<option value="" disabled>選択してください</option>
-				{#each groupsFor(form.tagKind) as group (group.id)}
-					<option value={String(group.id)}>{group.name}</option>
-				{/each}
-			</select>
-			{#if form.tagKind === 'computed'}
-				<span class="hint">{CALC_CONNECTION_NAME} 接続配下のグループのみ選択できます。</span>
-			{:else if form.tagKind === 'internal'}
-				<span class="hint">{MEM_CONNECTION_NAME} 接続配下のグループのみ選択できます。</span>
-			{/if}
-			{#if errors.collectionGroupId}<span class="err">{errors.collectionGroupId}</span>{/if}
-		</label>
 		<label class="field">
 			タグ種別
 			<select
+				id="tag-kind"
 				bind:value={form.tagKind}
+				aria-invalid={errors.tagKind ? 'true' : undefined}
+				aria-describedby={describedBy(errors.tagKind && 'tag-kind-err')}
 				onchange={() => {
 					// タグ種別を切り替えたら、もう選択できないグループ ID は
 					// クリアする（`groupsFor` の絞り込みと矛盾する選択を残さない）。
@@ -1049,129 +1135,335 @@
 					<option value={opt.value}>{opt.label}</option>
 				{/each}
 			</select>
-			{#if errors.tagKind}<span class="err">{errors.tagKind}</span>{/if}
+			{#if errors.tagKind}<span class="err" id="tag-kind-err">{errors.tagKind}</span>{/if}
+		</label>
+		<label class="field">
+			収集グループ<span class="required">*</span>
+			<select
+				id="tag-group"
+				bind:value={form.collectionGroupId}
+				required
+				aria-invalid={errors.collectionGroupId ? 'true' : undefined}
+				aria-describedby={describedBy(
+					(form.tagKind !== 'plc' || form.collectionGroupId !== '') && 'tag-group-hint',
+					errors.collectionGroupId && 'tag-group-err'
+				)}
+			>
+				<option value="" disabled>選択してください</option>
+				{#each groupsFor(form.tagKind) as group (group.id)}
+					<option value={String(group.id)}>{group.name}</option>
+				{/each}
+			</select>
+			{#if form.tagKind === 'computed'}
+				<span class="hint" id="tag-group-hint"
+					>{CALC_CONNECTION_NAME} 接続配下のグループのみ選択できます。</span
+				>
+			{:else if form.tagKind === 'internal'}
+				<span class="hint" id="tag-group-hint"
+					>{MEM_CONNECTION_NAME} 接続配下のグループのみ選択できます。</span
+				>
+			{:else if form.tagKind === 'plc' && form.collectionGroupId !== ''}
+				<!--
+					T18-2a（TAG-UX-B 拡張）: plc タグは収集グループから接続が
+					一意に決まるため、選択済みグループがどの接続配下か・実機か
+					SIM かをここで先出しする（保存前の確認領域とは別に、選択
+					直後にも分かるようにする）。
+				-->
+				<span class="hint" id="tag-group-hint"
+					>接続: {connectionForGroupId(form.collectionGroupId)?.name}（{confirmEnvironmentLabel(
+						form
+					)}）</span
+				>
+			{/if}
+			{#if errors.collectionGroupId}<span class="err" id="tag-group-err"
+					>{errors.collectionGroupId}</span
+				>{/if}
+		</label>
+		<label class="field">
+			名前<span class="required">*</span>
+			<input
+				id="tag-name"
+				type="text"
+				bind:value={form.name}
+				required
+				aria-invalid={errors.name ? 'true' : undefined}
+				aria-describedby={describedBy(errors.name && 'tag-name-err')}
+			/>
+			{#if errors.name}<span class="err" id="tag-name-err">{errors.name}</span>{/if}
 		</label>
 		{#if form.tagKind === 'plc'}
 			<label class="field">
 				アドレス<span class="required">*</span>
 				<input
+					id="tag-address"
 					type="text"
 					bind:value={form.address}
 					required
 					placeholder="D100（ビット: D100.5）"
+					aria-invalid={errors.address ? 'true' : undefined}
+					aria-describedby={describedBy('tag-address-hint', errors.address && 'tag-address-err')}
 				/>
-				<span class="hint"
+				<span class="hint" id="tag-address-hint"
 					>ワードデバイスの特定ビットを読み書きするときは「D100.5」のように「.」+ビット位置（0〜15、Modbus
 					は「40001.3」）を付けます。「D100.5」でワードの5ビット目。ビット指定アドレスは data_type =
 					bit のタグでのみ使えます。</span
 				>
-				{#if errors.address}<span class="err">{errors.address}</span>{/if}
+				{#if errors.address}<span class="err" id="tag-address-err">{errors.address}</span>{/if}
 			</label>
 		{/if}
 		{#if form.tagKind === 'computed'}
 			<label class="field wide">
 				式（expression）<span class="required">*</span>
 				<textarea
+					id="tag-expression"
 					bind:value={form.expression}
 					rows="2"
 					required
-					placeholder="(line1.fast.a + line1.fast.b) / 2"></textarea>
-				<span class="hint"
+					placeholder="(line1.fast.a + line1.fast.b) / 2"
+					aria-invalid={errors.expression ? 'true' : undefined}
+					aria-describedby={describedBy(
+						'tag-expression-hint',
+						errors.expression && 'tag-expression-err'
+					)}></textarea>
+				<span class="hint" id="tag-expression-hint"
 					>四則・比較・論理・if(c,a,b)・min/max/abs/round/clamp/bit(tag,n)。参照する外部名は他タグ
 					（plc/computed/internal）の完全名。</span
 				>
-				{#if errors.expression}<span class="err">{errors.expression}</span>{/if}
+				{#if errors.expression}<span class="err" id="tag-expression-err">{errors.expression}</span
+					>{/if}
 			</label>
 		{/if}
 		<label class="field">
 			データ型
-			<select bind:value={form.dataType}>
+			<select
+				id="tag-data-type"
+				bind:value={form.dataType}
+				aria-invalid={errors.dataType ? 'true' : undefined}
+				aria-describedby={describedBy(errors.dataType && 'tag-data-type-err')}
+			>
 				{#each dataTypeOptions as opt (opt.value)}
 					<option value={opt.value}>{opt.label}</option>
 				{/each}
 			</select>
-			{#if errors.dataType}<span class="err">{errors.dataType}</span>{/if}
+			{#if errors.dataType}<span class="err" id="tag-data-type-err">{errors.dataType}</span>{/if}
 		</label>
 		{#if form.dataType === 'string'}
 			<label class="field">
 				文字列長（word数）
 				<input
+					id="tag-string-length"
 					type="number"
 					min={MIN_STRING_LENGTH}
 					max={MAX_STRING_LENGTH}
 					bind:value={form.stringLength}
+					aria-invalid={errors.stringLength ? 'true' : undefined}
+					aria-describedby={describedBy(
+						'tag-string-length-hint',
+						errors.stringLength && 'tag-string-length-err'
+					)}
 				/>
-				<span class="hint">{MIN_STRING_LENGTH}〜{MAX_STRING_LENGTH} word（1 word = 2バイト）。</span
+				<span class="hint" id="tag-string-length-hint"
+					>{MIN_STRING_LENGTH}〜{MAX_STRING_LENGTH} word（1 word = 2バイト）。</span
 				>
-				{#if errors.stringLength}<span class="err">{errors.stringLength}</span>{/if}
+				{#if errors.stringLength}<span class="err" id="tag-string-length-err"
+						>{errors.stringLength}</span
+					>{/if}
 			</label>
 		{/if}
-		<label class="field">
-			単位
-			<input type="text" bind:value={form.unit} placeholder="℃" />
-			{#if errors.unit}<span class="err">{errors.unit}</span>{/if}
-		</label>
-		<label class="field">
-			小数桁数
-			<input type="number" min="0" bind:value={form.decimals} />
-			{#if errors.decimals}<span class="err">{errors.decimals}</span>{/if}
-		</label>
-		<label class="field">
-			RawLo
-			<input type="number" bind:value={form.rawLo} />
-			{#if errors.rawLo}<span class="err">{errors.rawLo}</span>{/if}
-		</label>
-		<label class="field">
-			RawHi
-			<input type="number" bind:value={form.rawHi} />
-			{#if errors.rawHi}<span class="err">{errors.rawHi}</span>{/if}
-		</label>
-		<label class="field">
-			EngLo
-			<input type="number" bind:value={form.engLo} />
-			{#if errors.engLo}<span class="err">{errors.engLo}</span>{/if}
-		</label>
-		<label class="field">
-			EngHi
-			<input type="number" bind:value={form.engHi} />
-			{#if errors.engHi}<span class="err">{errors.engHi}</span>{/if}
-		</label>
-		<label class="field">
-			しきい値 H
-			<input type="number" bind:value={form.thresholdH} />
-			{#if errors.thresholdH}<span class="err">{errors.thresholdH}</span>{/if}
-		</label>
-		<label class="field">
-			しきい値 HH
-			<input type="number" bind:value={form.thresholdHh} />
-			{#if errors.thresholdHh}<span class="err">{errors.thresholdHh}</span>{/if}
-		</label>
-		<label class="field">
-			しきい値 L
-			<input type="number" bind:value={form.thresholdL} />
-			{#if errors.thresholdL}<span class="err">{errors.thresholdL}</span>{/if}
-		</label>
-		<label class="field">
-			しきい値 LL
-			<input type="number" bind:value={form.thresholdLl} />
-			{#if errors.thresholdLl}<span class="err">{errors.thresholdLl}</span>{/if}
-		</label>
 		<label class="field checkbox">
-			<input type="checkbox" bind:checked={form.enabled} />
+			<input id="tag-enabled" type="checkbox" bind:checked={form.enabled} />
 			有効
 		</label>
-		{#if form.tagKind !== 'computed'}
-			<label class="field checkbox">
-				<input type="checkbox" bind:checked={form.writable} />
-				書き込み可（writable）
-			</label>
-		{/if}
 		{#if form.tagKind === 'internal'}
 			<label class="field checkbox">
-				<input type="checkbox" bind:checked={form.retain} />
-				retain（再起動時に最終値を復元）
+				<input id="tag-retain" type="checkbox" bind:checked={form.retain} />
+				再起動時に最終値を復元（retain）
 			</label>
 		{/if}
+	</div>
+	<!--
+		T18-2a（TAG-UX-B「常用する基本設定と、詳細設定を fieldset /
+		折りたたみで分ける」）: 表示・スケーリングの詳細。`RawLo`/`RawHi`/
+		`EngLo`/`EngHi` は「入力下限 (RawLo)」のように日本語ラベルを先出し
+		する（TAG-UX-B「『入力下限 (RawLo)』のように日本語を先に表示す
+		る」）。`detailOpen.display` が false でも値自体は `form` に残り
+		続ける（`<details>` の開閉は表示のみを制御し、束縛先の `form.xxx`
+		は変わらない）。
+	-->
+	<details class="detail-group" bind:open={detailOpen.display}>
+		<summary>表示・スケーリング</summary>
+		<div class="form-grid">
+			<label class="field">
+				単位
+				<input
+					id="tag-unit"
+					type="text"
+					bind:value={form.unit}
+					placeholder="℃"
+					aria-invalid={errors.unit ? 'true' : undefined}
+					aria-describedby={describedBy(errors.unit && 'tag-unit-err')}
+				/>
+				{#if errors.unit}<span class="err" id="tag-unit-err">{errors.unit}</span>{/if}
+			</label>
+			<label class="field">
+				小数桁数
+				<input
+					id="tag-decimals"
+					type="number"
+					min="0"
+					bind:value={form.decimals}
+					aria-invalid={errors.decimals ? 'true' : undefined}
+					aria-describedby={describedBy(errors.decimals && 'tag-decimals-err')}
+				/>
+				{#if errors.decimals}<span class="err" id="tag-decimals-err">{errors.decimals}</span>{/if}
+			</label>
+			<label class="field">
+				入力下限 (RawLo)
+				<input
+					id="tag-raw-lo"
+					type="number"
+					bind:value={form.rawLo}
+					aria-invalid={errors.rawLo ? 'true' : undefined}
+					aria-describedby={describedBy(errors.rawLo && 'tag-raw-lo-err')}
+				/>
+				{#if errors.rawLo}<span class="err" id="tag-raw-lo-err">{errors.rawLo}</span>{/if}
+			</label>
+			<label class="field">
+				入力上限 (RawHi)
+				<input
+					id="tag-raw-hi"
+					type="number"
+					bind:value={form.rawHi}
+					aria-invalid={errors.rawHi ? 'true' : undefined}
+					aria-describedby={describedBy(errors.rawHi && 'tag-raw-hi-err')}
+				/>
+				{#if errors.rawHi}<span class="err" id="tag-raw-hi-err">{errors.rawHi}</span>{/if}
+			</label>
+			<label class="field">
+				換算下限 (EngLo)
+				<input
+					id="tag-eng-lo"
+					type="number"
+					bind:value={form.engLo}
+					aria-invalid={errors.engLo ? 'true' : undefined}
+					aria-describedby={describedBy(errors.engLo && 'tag-eng-lo-err')}
+				/>
+				{#if errors.engLo}<span class="err" id="tag-eng-lo-err">{errors.engLo}</span>{/if}
+			</label>
+			<label class="field">
+				換算上限 (EngHi)
+				<input
+					id="tag-eng-hi"
+					type="number"
+					bind:value={form.engHi}
+					aria-invalid={errors.engHi ? 'true' : undefined}
+					aria-describedby={describedBy(errors.engHi && 'tag-eng-hi-err')}
+				/>
+				{#if errors.engHi}<span class="err" id="tag-eng-hi-err">{errors.engHi}</span>{/if}
+			</label>
+		</div>
+	</details>
+	<details class="detail-group" bind:open={detailOpen.threshold}>
+		<summary>しきい値</summary>
+		<div class="form-grid">
+			<label class="field">
+				しきい値 H
+				<input
+					id="tag-threshold-h"
+					type="number"
+					bind:value={form.thresholdH}
+					aria-invalid={errors.thresholdH ? 'true' : undefined}
+					aria-describedby={describedBy(errors.thresholdH && 'tag-threshold-h-err')}
+				/>
+				{#if errors.thresholdH}<span class="err" id="tag-threshold-h-err">{errors.thresholdH}</span
+					>{/if}
+			</label>
+			<label class="field">
+				しきい値 HH
+				<input
+					id="tag-threshold-hh"
+					type="number"
+					bind:value={form.thresholdHh}
+					aria-invalid={errors.thresholdHh ? 'true' : undefined}
+					aria-describedby={describedBy(errors.thresholdHh && 'tag-threshold-hh-err')}
+				/>
+				{#if errors.thresholdHh}<span class="err" id="tag-threshold-hh-err"
+						>{errors.thresholdHh}</span
+					>{/if}
+			</label>
+			<label class="field">
+				しきい値 L
+				<input
+					id="tag-threshold-l"
+					type="number"
+					bind:value={form.thresholdL}
+					aria-invalid={errors.thresholdL ? 'true' : undefined}
+					aria-describedby={describedBy(errors.thresholdL && 'tag-threshold-l-err')}
+				/>
+				{#if errors.thresholdL}<span class="err" id="tag-threshold-l-err">{errors.thresholdL}</span
+					>{/if}
+			</label>
+			<label class="field">
+				しきい値 LL
+				<input
+					id="tag-threshold-ll"
+					type="number"
+					bind:value={form.thresholdLl}
+					aria-invalid={errors.thresholdLl ? 'true' : undefined}
+					aria-describedby={describedBy(errors.thresholdLl && 'tag-threshold-ll-err')}
+				/>
+				{#if errors.thresholdLl}<span class="err" id="tag-threshold-ll-err"
+						>{errors.thresholdLl}</span
+					>{/if}
+			</label>
+		</div>
+	</details>
+	{#if form.tagKind !== 'computed'}
+		<details class="detail-group" bind:open={detailOpen.write}>
+			<summary>書き込み安全設定</summary>
+			<div class="form-grid">
+				<label class="field checkbox wide">
+					<input id="tag-writable" type="checkbox" bind:checked={form.writable} />
+					外部クライアントから PLC への書き込みを許可
+				</label>
+				{#if form.writable}
+					<!--
+						T18-2a（TAG-UX-B「書き込み許可の文言は『外部クライアントから
+						PLC への書き込みを許可』とし、ON 時に安全上の影響を説明す
+						る」）: 何が可能になるか（外部クライアントからの書き換え）と、
+						実機設備への影響リスクの両方を明示する。
+					-->
+					<p class="warn wide" role="note">
+						外部クライアント（OPC UA・gRPC
+						等）からこのタグの値を書き換えられるようになります。誤操作や意図しない書き込みは実機の設備・工程に直接影響するため、本当に必要な範囲だけ許可してください。
+					</p>
+				{/if}
+			</div>
+		</details>
+	{/if}
+	<!--
+		T18-2a（TAG-UX-B「保存前に最終外部名 `{connection}.{group}.{tag}`、
+		実機／SIM、書き込み許可を固定領域で確認できるようにする」）:
+		`confirmExternalName`/`confirmEnvironmentLabel`/`confirmWriteLabel`
+		は現在の `form`（`$state`）を読むだけなので、別途 `$derived` を
+		用意しなくてもスニペット本体が再実行されるたびに最新値になる。
+	-->
+	<div class="confirm-panel">
+		<h4 class="confirm-title">保存前の確認</h4>
+		<dl class="confirm-list">
+			<div class="confirm-row">
+				<dt>外部名</dt>
+				<dd>{confirmExternalName(form)}</dd>
+			</div>
+			<div class="confirm-row">
+				<dt>実機 / SIM</dt>
+				<dd>{confirmEnvironmentLabel(form)}</dd>
+			</div>
+			<div class="confirm-row">
+				<dt>書き込み許可</dt>
+				<dd>{confirmWriteLabel(form)}</dd>
+			</div>
+		</dl>
 	</div>
 {/snippet}
 
@@ -1428,7 +1720,7 @@
 				void handleCreate();
 			}}
 		>
-			{@render tagFields(createForm, createErrors)}
+			{@render tagFields(createForm, createErrors, createDetailOpen)}
 			<div class="actions">
 				<button type="submit" disabled={isDrawerBusy() || groups.length === 0}>作成</button>
 			</div>
@@ -1495,7 +1787,7 @@
 					</div>
 				</div>
 			{/if}
-			{@render tagFields(editForm, editErrors)}
+			{@render tagFields(editForm, editErrors, editDetailOpen)}
 			<div class="actions">
 				<button type="submit" disabled={isDrawerBusy()}>保存</button>
 				<button type="button" class="danger" onclick={handleDelete} disabled={isDrawerBusy()}
@@ -1843,6 +2135,90 @@
 	.err {
 		color: var(--banto-danger);
 		font-size: 0.75rem;
+	}
+
+	/*
+	 * T18-2a（TAG-UX-B「常用する基本設定と、詳細設定を fieldset /
+	 * 折りたたみで分ける」）: 表示・スケーリング／しきい値／書き込み安全
+	 * 設定の3つの `<details>`。基本 form-grid と視覚的に区切るため上に
+	 * 罫線を引く。
+	 */
+	.detail-group {
+		border-top: 1px solid var(--banto-border);
+		padding-top: 0.6rem;
+		margin-top: 0.1rem;
+	}
+
+	.detail-group summary {
+		cursor: pointer;
+		padding: 0.3rem 0;
+		font-size: 0.85rem;
+		font-weight: 600;
+		color: var(--banto-text);
+	}
+
+	.detail-group[open] summary {
+		margin-bottom: 0.3rem;
+	}
+
+	/* T18-2a（TAG-UX-B「書き込み許可…ON 時に安全上の影響を説明する」）。 */
+	.warn {
+		grid-column: 1 / -1;
+		margin: 0;
+		padding: 0.6rem 0.75rem;
+		border: 1px solid var(--banto-warning);
+		border-radius: var(--banto-radius);
+		background: color-mix(in srgb, var(--banto-warning) 12%, transparent);
+		color: var(--banto-text);
+		font-size: 0.78rem;
+	}
+
+	/*
+	 * T18-2a（TAG-UX-B「保存前に…固定領域で確認できるようにする」）: 保存
+	 * 前の確認領域。フォームの他部分と視覚的に区別できるよう枠付きの箱に
+	 * する。
+	 */
+	.confirm-panel {
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+		background: var(--banto-surface-raised);
+		padding: 0.75rem;
+		margin-bottom: 0.75rem;
+	}
+
+	.confirm-title {
+		margin: 0 0 0.5rem;
+		font-size: 0.8rem;
+		font-weight: 600;
+		color: var(--banto-text);
+	}
+
+	.confirm-list {
+		display: flex;
+		flex-direction: column;
+		gap: 0.35rem;
+		margin: 0;
+	}
+
+	.confirm-row {
+		display: flex;
+		align-items: baseline;
+		gap: 0.5rem;
+	}
+
+	.confirm-row dt {
+		flex: 0 0 auto;
+		min-width: 6.5rem;
+		color: var(--banto-text-muted);
+		font-size: 0.72rem;
+	}
+
+	.confirm-row dd {
+		margin: 0;
+		color: var(--banto-text);
+		font-size: 0.8rem;
+		font-weight: 600;
+		word-break: break-all;
 	}
 
 	.actions {
