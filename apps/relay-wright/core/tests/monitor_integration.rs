@@ -69,6 +69,8 @@ impl Fixture {
                 unit_id: 1,
                 enabled: true,
                 simulation: false,
+
+                word_order: "low_high".to_string(),
             })
             .await
             .expect("create slmp connection");
@@ -414,6 +416,8 @@ async fn monitor_rejects_a_modbus_connection_with_a_clear_error() {
             unit_id: 1,
             enabled: true,
             simulation: false,
+
+            word_order: "low_high".to_string(),
         })
         .await
         .expect("create modbus connection");

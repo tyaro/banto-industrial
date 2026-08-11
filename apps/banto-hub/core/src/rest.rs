@@ -1952,6 +1952,16 @@ fn default_plc_simulation() -> bool {
     false
 }
 
+/// P3-b（監査指摘 2026-08-12）: a `PlcConnectionPayload` missing `wordOrder`
+/// (an old client, or a create/update that never mentions it) keeps MELSEC's
+/// own low-word-first order - the same default
+/// `banto_tags::plc_connection::default_word_order` and migration `0010`'s
+/// column default already use, so an old client's connections behave exactly
+/// as they did before this field existed.
+fn default_plc_word_order() -> String {
+    "low_high".to_string()
+}
+
 fn default_tag_decimals() -> i64 {
     0
 }
@@ -1986,6 +1996,14 @@ pub struct PlcConnectionPayload {
     /// connections specifically, `crate::broker_glue::SlmpSimRegistry`.
     #[serde(default = "default_plc_simulation")]
     pub simulation: bool,
+    /// P3-b（監査指摘 2026-08-12）: SLMP のワード順（32bit値の上位/下位ワードの
+    /// 並び）。`"low_high"`（既定・MELSEC標準）/ `"high_low"`（Modbus/IEEE慣習）
+    /// のいずれか - 検証は `banto_tags::plc_connection::validate_plc_connection_input`
+    /// 側（`ALLOWED_WORD_ORDERS`）に委ねる。modbus-tcp/virtual 接続では無意味
+    /// （`unit_id` と同じ扱い）だが、フォームは "slmp" 選択時のみ表示する
+    /// （`plc-connections/+page.svelte`）。
+    #[serde(default = "default_plc_word_order")]
+    pub word_order: String,
 }
 
 impl From<PlcConnectionPayload> for PlcConnectionInput {
@@ -2000,6 +2018,9 @@ impl From<PlcConnectionPayload> for PlcConnectionInput {
             // T9-2: wired through - see `PlcConnectionPayload::simulation`'s
             // doc comment.
             simulation: payload.simulation,
+            // P3-b: wired through - see `PlcConnectionPayload::word_order`'s
+            // doc comment.
+            word_order: payload.word_order,
         }
     }
 }
@@ -7817,6 +7838,8 @@ mod tests {
                     unit_id: 1,
                     enabled: true,
                     simulation: false,
+
+                    word_order: "low_high".to_string(),
                 },
             )
             .await

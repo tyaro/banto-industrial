@@ -273,6 +273,8 @@ async fn create_connection(pool: &SqlitePool, name: &str, protocol: &str, port: 
             unit_id: 1,
             enabled: true,
             simulation: false,
+
+            word_order: "low_high".to_string(),
         })
         .await
         .expect("create connection")

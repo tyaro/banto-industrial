@@ -94,7 +94,8 @@ const pkg: ConfigPackage = {
 			port: 502,
 			unitId: 1,
 			enabled: true,
-			simulation: false
+			simulation: false,
+			wordOrder: 'low_high'
 		}
 	],
 	collectionGroups: [{ name: 'group1', plcConnectionName: 'plc1', periodMs: 1000, enabled: true }],
@@ -193,7 +194,8 @@ describe('applyConfigPackage: 収集稼働中の QueuedWhileRunningError を検�
 				port: 502,
 				unitId: 1,
 				enabled: true,
-				simulation: false
+				simulation: false,
+				wordOrder: 'low_high'
 			}
 		]);
 		vi.mocked(updatePlcConnection).mockResolvedValue({
@@ -204,7 +206,8 @@ describe('applyConfigPackage: 収集稼働中の QueuedWhileRunningError を検�
 			port: 502,
 			unitId: 1,
 			enabled: true,
-			simulation: false
+			simulation: false,
+			wordOrder: 'low_high'
 		});
 		vi.mocked(listCollectionGroups).mockResolvedValue([
 			{ id: 1, name: 'group1', plcConnectionId: 1, periodMs: 500, enabled: true }
@@ -237,7 +240,8 @@ describe('applyConfigPackage: 全件成功する通常の import（回帰ガー�
 			port: 502,
 			unitId: 1,
 			enabled: true,
-			simulation: false
+			simulation: false,
+			wordOrder: 'low_high'
 		});
 		vi.mocked(createCollectionGroup).mockResolvedValue({
 			id: 1,

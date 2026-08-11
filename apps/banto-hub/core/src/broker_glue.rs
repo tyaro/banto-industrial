@@ -607,6 +607,8 @@ mod tests {
             unit_id: 1,
             enabled: true,
             simulation: false,
+
+            word_order: "low_high".to_string(),
         }
     }
 

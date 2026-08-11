@@ -60,7 +60,8 @@ const connectionInput: PlcConnectionInput = {
 	port: 502,
 	unitId: 1,
 	enabled: true,
-	simulation: false
+	simulation: false,
+	wordOrder: 'low_high'
 };
 
 const connectionResource: PlcConnection = { id: 1, ...connectionInput };

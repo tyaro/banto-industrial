@@ -96,6 +96,25 @@ use crate::support::{map_write_error, max_length_message, range_message, require
 /// the tripwire if they drift.
 pub const ALLOWED_PROTOCOLS: &[&str] = &["modbus-tcp", "slmp", "virtual"];
 
+/// Values accepted in `plc_connections.word_order` (P3-b, 監査指摘
+/// 2026-08-12). Mirrors the SQL `CHECK` added by
+/// `migrations/0010_plc_connections_add_word_order.sql`, same
+/// two-copies-of-one-rule relationship [`ALLOWED_PROTOCOLS`] has with its own
+/// `CHECK` - see that constant's doc comment for why both exist and
+/// `every_allowed_word_order_is_accepted_by_the_sql_check` for the tripwire
+/// that keeps them in sync.
+///
+/// The two strings are the wire form of `banto_plc::decode::WordOrder`'s two
+/// variants - not re-exported as that enum directly, because `banto-tags` has
+/// no dependency on `banto-plc` (this crate is the registry, not a protocol
+/// client) and because `protocol` already established the "TEXT + CHECK, not
+/// a Rust enum" convention for exactly this kind of small closed vocabulary
+/// (this module's doc comment). [`crate::plc_connection`]'s only job is to
+/// store and validate the string; `banto-broker`
+/// (`SessionDirectory::ensure_connection`) is what actually parses it into a
+/// `WordOrder` when building an `SlmpConfig`.
+pub const ALLOWED_WORD_ORDERS: &[&str] = &["low_high", "high_low"];
+
 /// The one non-wire protocol (T6-2, this module's doc comment). Used both by
 /// [`validate_plc_connection_input`] (relaxed host/port) and by
 /// [`crate::tag::TagService`]'s `calc`/`mem` placement check.
@@ -140,6 +159,15 @@ fn default_simulation() -> bool {
     false
 }
 
+/// P3-b: a `PlcConnectionInput` missing `wordOrder` (an old client, or a
+/// direct Rust construction predating this field) builds with MELSEC's own
+/// low-word-first order - the same value migration `0010`'s column default
+/// takes, and the same value `banto_plc::slmp::SlmpConfig::default()` already
+/// used before this field existed, so an old client is unaffected.
+fn default_word_order() -> String {
+    "low_high".to_string()
+}
+
 /// A row of the `plc_connections` table, wire-shaped (camelCase) for a
 /// future settings grid (docs/recorder-requirements.md §6 "タグ設定"
 /// screen: "PLC 接続設定含む").
@@ -155,6 +183,11 @@ pub struct PlcConnection {
     pub enabled: bool,
     /// T9-1 (this module's doc comment, "simulation" section).
     pub simulation: bool,
+    /// P3-b (this module's doc comment, [`ALLOWED_WORD_ORDERS`]). Meaningful
+    /// for `"slmp"` connections only - `"modbus-tcp"`/`"virtual"` rows simply
+    /// carry the column's default, the same treatment `unit_id` gets for
+    /// SLMP (this module's doc comment, above).
+    pub word_order: String,
 }
 
 /// Create/update payload. `protocol`/`unit_id`/`enabled` default (spec:
@@ -176,13 +209,16 @@ pub struct PlcConnectionInput {
     /// T9-1 (this module's doc comment, "simulation" section).
     #[serde(default = "default_simulation")]
     pub simulation: bool,
+    /// P3-b. See [`PlcConnection::word_order`]'s doc comment.
+    #[serde(default = "default_word_order")]
+    pub word_order: String,
 }
 
 /// Validate a [`PlcConnectionInput`]: `name`/`host` trimmed non-empty (name
 /// additionally capped at `MAX_NAME_LEN`), `protocol` in [`ALLOWED_PROTOCOLS`],
-/// `port` in `1..=65535`, `unit_id` in `0..=255`. Returns every violation,
-/// not just the first (mirrors `items::validate_item_input` in the banto
-/// template repo).
+/// `port` in `1..=65535`, `unit_id` in `0..=255`, `word_order` in
+/// [`ALLOWED_WORD_ORDERS`]. Returns every violation, not just the first
+/// (mirrors `items::validate_item_input` in the banto template repo).
 fn validate_plc_connection_input(input: &PlcConnectionInput) -> Result<(), BantoError> {
     let mut errors: Vec<FieldError> = Vec::new();
 
@@ -236,6 +272,22 @@ fn validate_plc_connection_input(input: &PlcConnectionInput) -> Result<(), Banto
         });
     }
 
+    // P3-b: validated for every protocol, not just "slmp" - same stance
+    // `unit_id` already takes (validated even though SLMP never reads it).
+    // Keeping it unconditional avoids a second implicit "which values are
+    // legal" rule that only applies sometimes; a modbus-tcp/virtual row
+    // simply carries whatever value it was given (normally the default) and
+    // nothing ever reads it.
+    if !ALLOWED_WORD_ORDERS.contains(&input.word_order.as_str()) {
+        errors.push(FieldError {
+            field: "wordOrder".to_string(),
+            message: format!(
+                "ワード順は {} のいずれかです",
+                ALLOWED_WORD_ORDERS.join(", ")
+            ),
+        });
+    }
+
     // T9-1 (this module's doc comment, "simulation" section): a "virtual"
     // connection dials nothing, so "simulate this connection" is a category
     // error, not a redundant-but-harmless flag - reject rather than silently
@@ -266,10 +318,11 @@ fn column_map() -> ColumnMap {
         .column("unitId", "unit_id")
         .column("enabled", "enabled")
         .column("simulation", "simulation")
+        .column("wordOrder", "word_order")
 }
 
 const RESOURCE: &str = "plc_connections";
-const COLUMNS: &str = "id, name, protocol, host, port, unit_id, enabled, simulation";
+const COLUMNS: &str = "id, name, protocol, host, port, unit_id, enabled, simulation, word_order";
 
 /// Service layer for the `plc_connections` resource. `Clone` is cheap
 /// (`SqlitePool` is `Arc`-backed), matching the pattern of every resource
@@ -328,8 +381,8 @@ impl PlcConnectionService {
     pub async fn create(&self, input: PlcConnectionInput) -> Result<PlcConnection, BantoError> {
         validate_plc_connection_input(&input)?;
         sqlx::query_as::<_, PlcConnection>(&format!(
-            "INSERT INTO plc_connections (name, protocol, host, port, unit_id, enabled, simulation) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
+            "INSERT INTO plc_connections (name, protocol, host, port, unit_id, enabled, simulation, word_order) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
         ))
         .bind(input.name.trim())
         .bind(&input.protocol)
@@ -338,6 +391,7 @@ impl PlcConnectionService {
         .bind(input.unit_id)
         .bind(input.enabled)
         .bind(input.simulation)
+        .bind(&input.word_order)
         .fetch_one(&self.pool)
         .await
         .map_err(|err| map_write_error(err, "name", "", ""))
@@ -353,8 +407,8 @@ impl PlcConnectionService {
     ) -> Result<PlcConnection, BantoError> {
         validate_plc_connection_input(&input)?;
         sqlx::query_as::<_, PlcConnection>(&format!(
-            "INSERT INTO plc_connections (name, protocol, host, port, unit_id, enabled, simulation) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
+            "INSERT INTO plc_connections (name, protocol, host, port, unit_id, enabled, simulation, word_order) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
         ))
         .bind(input.name.trim())
         .bind(&input.protocol)
@@ -363,6 +417,7 @@ impl PlcConnectionService {
         .bind(input.unit_id)
         .bind(input.enabled)
         .bind(input.simulation)
+        .bind(&input.word_order)
         .fetch_one(&mut *connection)
         .await
         .map_err(|err| map_write_error(err, "name", "", ""))
@@ -395,7 +450,7 @@ impl PlcConnectionService {
         }
 
         sqlx::query_as::<_, PlcConnection>(&format!(
-            "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ?, simulation = ? \
+            "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ?, simulation = ?, word_order = ? \
              WHERE id = ? RETURNING {COLUMNS}"
         ))
         .bind(input.name.trim())
@@ -405,6 +460,7 @@ impl PlcConnectionService {
         .bind(input.unit_id)
         .bind(input.enabled)
         .bind(input.simulation)
+        .bind(&input.word_order)
         .bind(id)
         .fetch_one(&self.pool)
         .await
@@ -440,7 +496,7 @@ impl PlcConnectionService {
             });
         }
         sqlx::query_as::<_, PlcConnection>(&format!(
-            "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ?, simulation = ? \
+            "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ?, simulation = ?, word_order = ? \
              WHERE id = ? RETURNING {COLUMNS}"
         ))
         .bind(input.name.trim())
@@ -450,6 +506,7 @@ impl PlcConnectionService {
         .bind(input.unit_id)
         .bind(input.enabled)
         .bind(input.simulation)
+        .bind(&input.word_order)
         .bind(id)
         .fetch_one(&mut *connection)
         .await
@@ -606,6 +663,8 @@ mod tests {
             unit_id: 1,
             enabled: true,
             simulation: false,
+
+            word_order: "low_high".to_string(),
         }
     }
 
@@ -935,6 +994,8 @@ mod tests {
                 unit_id: 1,
                 enabled: true,
                 simulation: false,
+
+                word_order: "low_high".to_string(),
             })
             .await
             .expect("a virtual connection should accept empty host / port 0");
@@ -977,6 +1038,8 @@ mod tests {
                 unit_id: 1,
                 enabled: true,
                 simulation: false,
+
+                word_order: "low_high".to_string(),
             })
             .await
             .unwrap();
@@ -1006,6 +1069,8 @@ mod tests {
                 unit_id: 1,
                 enabled: true,
                 simulation: false,
+
+                word_order: "low_high".to_string(),
             })
             .await
             .unwrap();
@@ -1240,6 +1305,8 @@ mod tests {
                 unit_id: 1,
                 enabled: true,
                 simulation: true,
+
+                word_order: "low_high".to_string(),
             })
             .await
             .unwrap_err();
@@ -1268,6 +1335,8 @@ mod tests {
                 unit_id: 1,
                 enabled: true,
                 simulation: false,
+
+                word_order: "low_high".to_string(),
             })
             .await
             .expect("simulation: false must not be affected by the new check");
@@ -1330,6 +1399,138 @@ mod tests {
             .expect("update should succeed");
         assert_eq!(updated.name, "After");
         assert_eq!(updated.port, 503);
+    }
+
+    // --- P3-b: "word_order" column (migration 0010) ------------------------
+
+    /// `sample_input`'s default (`"low_high"`, matching
+    /// `default_word_order`/migration `0010`'s column default) round-trips
+    /// through create/get - the baseline every other test in this module
+    /// already exercises implicitly, stated explicitly as the counterpart to
+    /// [`word_order_round_trips_through_update`].
+    #[tokio::test]
+    async fn word_order_defaults_to_low_high_and_round_trips() {
+        let svc = service().await;
+        let mut input = sample_input("WordOrder1");
+        input.protocol = "slmp".to_string();
+        let created = svc.create(input).await.unwrap();
+        assert_eq!(created.word_order, "low_high");
+
+        let fetched = svc.get(created.id).await.unwrap();
+        assert_eq!(fetched.word_order, "low_high");
+    }
+
+    /// `word_order: "high_low"` is accepted and persists through both
+    /// `create` and a later `update` - the direct analogue of
+    /// `simulation_flag_round_trips_through_update`.
+    #[tokio::test]
+    async fn word_order_round_trips_through_update() {
+        let svc = service().await;
+        let mut input = sample_input("WordOrder2");
+        input.protocol = "slmp".to_string();
+        input.word_order = "high_low".to_string();
+        let created = svc.create(input).await.unwrap();
+        assert_eq!(created.word_order, "high_low");
+        assert_eq!(svc.get(created.id).await.unwrap().word_order, "high_low");
+
+        let mut back = sample_input("WordOrder2");
+        back.protocol = "slmp".to_string();
+        back.word_order = "low_high".to_string();
+        let updated = svc.update(created.id, back).await.unwrap();
+        assert_eq!(updated.word_order, "low_high");
+    }
+
+    /// An unrecognized `word_order` is rejected as a `FieldError` on
+    /// `wordOrder`, the same shape [`create_rejects_unknown_protocol`] proves
+    /// for `protocol`.
+    #[tokio::test]
+    async fn create_rejects_unknown_word_order() {
+        let svc = service().await;
+        let mut input = sample_input("X");
+        input.word_order = "middle_endian".to_string();
+        let err = svc.create(input).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "wordOrder");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// [`ALLOWED_WORD_ORDERS`] and the SQL `CHECK` migration `0010` added are
+    /// two hand-written copies of one rule - the `word_order` twin of
+    /// `every_allowed_protocol_is_accepted_by_the_sql_check`.
+    #[tokio::test]
+    async fn every_allowed_word_order_is_accepted_by_the_sql_check() {
+        let svc = service().await;
+        for (i, word_order) in ALLOWED_WORD_ORDERS.iter().enumerate() {
+            let mut input = sample_input(&format!("wo{i}"));
+            input.protocol = "slmp".to_string();
+            input.word_order = (*word_order).to_string();
+            let created = svc.create(input).await.unwrap_or_else(|e| {
+                panic!(
+                    "{word_order} is in ALLOWED_WORD_ORDERS but the SQL CHECK rejected it: {e:?}"
+                )
+            });
+            assert_eq!(&created.word_order, word_order);
+        }
+    }
+
+    /// The reverse direction: a value the SQL `CHECK` would accept must not be
+    /// missing from [`ALLOWED_WORD_ORDERS`] - the `word_order` twin of
+    /// `the_sql_check_accepts_nothing_beyond_allowed_protocols`. Bypasses the
+    /// service layer deliberately, the only way to ask the schema directly
+    /// what it allows.
+    #[tokio::test]
+    async fn the_sql_check_accepts_nothing_beyond_allowed_word_orders() {
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect_sqlite_memory");
+        migrate(&pool).await.expect("migrate");
+
+        for word_order in ["middle_endian", "", "LOW_HIGH", "HighLow"] {
+            let result = sqlx::query(
+                "INSERT INTO plc_connections (name, protocol, host, port, word_order) \
+                 VALUES ('X', 'slmp', '1.2.3.4', 5007, ?)",
+            )
+            .bind(word_order)
+            .execute(&pool)
+            .await;
+            assert!(
+                result.is_err(),
+                "the SQL CHECK accepted word_order {word_order:?}, which is not in ALLOWED_WORD_ORDERS"
+            );
+        }
+    }
+
+    /// A `plc_connections` row created before migration `0010` (i.e. one
+    /// created here through raw SQL that never mentions `word_order`) reads
+    /// back as `"low_high"` - the column default matches
+    /// `SlmpConfig::default().word_order`, so an upgraded database's existing
+    /// SLMP connections keep behaving exactly as they did before this column
+    /// existed (this migration's own header, "既存の全 plc_connections 行 ...
+    /// 「今と同じ動作」のまま").
+    #[tokio::test]
+    async fn a_row_inserted_without_word_order_defaults_to_low_high() {
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect_sqlite_memory");
+        migrate(&pool).await.expect("migrate");
+
+        sqlx::query(
+            "INSERT INTO plc_connections (name, protocol, host, port) \
+             VALUES ('Legacy', 'slmp', '192.168.1.20', 5007)",
+        )
+        .execute(&pool)
+        .await
+        .expect("insert without word_order should use the column default");
+
+        let svc = PlcConnectionService::new(pool);
+        let rows = svc
+            .list(ListParams::default())
+            .await
+            .expect("list should succeed");
+        assert_eq!(rows.rows[0].word_order, "low_high");
     }
 
     #[tokio::test]

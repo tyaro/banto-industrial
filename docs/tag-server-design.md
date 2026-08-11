@@ -909,6 +909,22 @@ MELSEC SLMP 収集には **I8（banto-collect の SLMP 対応、I 系バック�
 `SlmpConfig` が `build_config`・接続タスクの client factory に配線され、
 SLMP 接続の収集が有効になった（管理 UI の「収集は未対応」注記も撤去済み）。
 
+**P3-b 実装時の発見（監査指摘 2026-08-12、実装完了・未マージ、ブランチ
+`claude/slmp-word-order`）**: I8 で配線された `SlmpConfig` は `host`/`port`
+以外が常に `SlmpConfig::default()` 固定で、`word_order`
+（`WordOrder::LowHigh` 既定・MELSEC 標準）を接続ごとに変えられなかった -
+`WordOrder::HighLow` を要する機種につなぐと u32/f32 の値が静かに化ける
+問題があった。これは banto-broker（banto-hub の SLMP 読み取り経路。
+`crate::broker_glue::BrokerReadClient` 参照）と banto-collect の
+`slmp_config_for`（relay-wright/chronogazer が使う直接経路）の**両方**に
+同じ形で存在していた。`plc_connections.word_order`（migration `0010`、
+既定 `low_high` で後方互換）を追加し、`banto_tags::PlcConnection`/
+`PlcConnectionInput` → 両クレートの `SlmpConfig` 構築 → banto-hub の
+`plc-connections` フォーム（"slmp" 選択時のみ表示）まで配線した。CPU 種別 /
+アクセスルート（network/PC/IO/area id）は今回のスコープ外
+（`banto-collect::config::slmp_config_for` の doc comment に "Known
+limitation" として明記、別スライス候補）。
+
 T0/T1 だけでも「読み取り専用タグサーバー」として出荷可能な形を保つ
 （書き込み・MQTT・gRPC は積み増し）。**実機なしで進められる範囲が広い**のが
 本計画の狙い: I 系のシミュレータ（Modbus/SLMP、in-process + 実バイト列）が

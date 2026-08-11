@@ -23,6 +23,24 @@ import { CSRF_HEADER } from './setup';
 
 export type PlcProtocol = 'modbus-tcp' | 'slmp' | 'virtual';
 
+/**
+ * P3-b（監査指摘 2026-08-12）: SLMP 接続のワード順（32bit値の上位/下位ワードの
+ * 並び）— mirrors `banto_plc::decode::WordOrder`（`banto_tags::PlcConnection`
+ * では検証済みの文字列として保存される。`ALLOWED_WORD_ORDERS` 参照）。
+ * `"slmp"` 接続でのみ意味を持つ（modbus-tcp/virtual では無意味 — `unitId` と
+ * 同じ扱い）。
+ */
+export type SlmpWordOrder = 'low_high' | 'high_low';
+
+/**
+ * ワード順のセレクト肢 — mirrors `banto_tags::plc_connection::ALLOWED_WORD_ORDERS`。
+ * 既定は `low_high`（MELSEC 標準、D0=下位/D1=上位）。
+ */
+export const WORD_ORDER_OPTIONS: { value: SlmpWordOrder; label: string }[] = [
+	{ value: 'low_high', label: 'low_high（MELSEC標準・既定）' },
+	{ value: 'high_low', label: 'high_low（Modbus/IEEE慣習）' }
+];
+
 /** Mirrors `banto_tags::PlcConnection`. */
 export interface PlcConnection {
 	id: number;
@@ -37,6 +55,8 @@ export interface PlcConnection {
 	 * 実PLCの代わりに内蔵シミュレータへ接続する（開発・検証用、本番非推奨）。
 	 */
 	simulation: boolean;
+	/** P3-b（監査指摘 2026-08-12）。{@link SlmpWordOrder}参照。 */
+	wordOrder: SlmpWordOrder;
 }
 
 /**
@@ -68,6 +88,8 @@ export interface PlcConnectionInput {
 	enabled: boolean;
 	/** T9-2 (docs/ux-plan.md §1). See {@link PlcConnection.simulation}. */
 	simulation: boolean;
+	/** P3-b（監査指摘 2026-08-12）. See {@link PlcConnection.wordOrder}. */
+	wordOrder: SlmpWordOrder;
 }
 
 /** Mirrors `banto_tags::CollectionGroup`. */

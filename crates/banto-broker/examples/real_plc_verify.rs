@@ -382,6 +382,8 @@ async fn phase4_session_limit() -> Result<(), String> {
         unit_id: 1,
         enabled: true,
         simulation: false,
+
+        word_order: "low_high".to_string(),
     };
 
     let supervisor = BrokerSupervisor::spawn(&[connection], BackoffConfig::default())

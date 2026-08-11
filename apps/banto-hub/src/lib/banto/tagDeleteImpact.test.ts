@@ -25,6 +25,7 @@ function makeConnection(overrides: Partial<PlcConnection>): PlcConnection {
 		unitId: 1,
 		enabled: true,
 		simulation: true,
+		wordOrder: 'low_high',
 		...overrides
 	};
 }

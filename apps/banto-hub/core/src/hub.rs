@@ -1677,6 +1677,8 @@ mod tests {
                     unit_id: 1,
                     enabled: true,
                     simulation: false,
+
+                    word_order: "low_high".to_string(),
                 },
                 PlcConnection {
                     id: 2,
@@ -1687,6 +1689,8 @@ mod tests {
                     unit_id: 1,
                     enabled: true,
                     simulation: false,
+
+                    word_order: "low_high".to_string(),
                 },
                 PlcConnection {
                     id: 3,
@@ -1697,6 +1701,8 @@ mod tests {
                     unit_id: 1,
                     enabled: false,
                     simulation: false,
+
+                    word_order: "low_high".to_string(),
                 },
                 PlcConnection {
                     id: 4,
@@ -1707,6 +1713,8 @@ mod tests {
                     unit_id: 0,
                     enabled: true,
                     simulation: false,
+
+                    word_order: "low_high".to_string(),
                 },
             ],
             groups: Vec::new(),
@@ -1742,6 +1750,8 @@ mod tests {
                 unit_id: 1,
                 enabled: true,
                 simulation: false,
+
+                word_order: "low_high".to_string(),
             })
             .await
             .unwrap();
@@ -1813,6 +1823,8 @@ mod tests {
                 unit_id: 1,
                 enabled: true,
                 simulation: false,
+
+                word_order: "low_high".to_string(),
             })
             .await
             .unwrap();
@@ -1909,6 +1921,8 @@ mod tests {
                 unit_id: 1,
                 enabled: true,
                 simulation: true,
+
+                word_order: "low_high".to_string(),
             })
             .await
             .unwrap();

@@ -4,6 +4,7 @@ import {
 	type PlcConnection,
 	type PlcConnectionInput,
 	type PlcProtocol,
+	type SlmpWordOrder,
 	type Tag,
 	type TagInput
 } from './tagRegistryAdmin';
@@ -171,6 +172,24 @@ function expectNullableNumber(value: unknown, path: string): number | null {
 	return result;
 }
 
+/**
+ * P3-b（監査指摘 2026-08-12）: `wordOrder` は既存のエクスポート済み構成
+ * パッケージ（この列を持たない旧スキーマ）にはまだ存在しない可能性がある
+ * ので、`expectString` 等と違い省略を許容する — 省略時はバックエンドの既定
+ * （`banto_tags::plc_connection::default_word_order`、`"low_high"`）と同じ
+ * 値にフォールバックし、旧パッケージのインポートを壊さない
+ * （`CONFIG_PACKAGE_SCHEMA_VERSION` は据え置き — 後方互換な追加フィールド
+ * なのでバージョンを上げる理由がない）。値が存在する場合は
+ * `low_high`/`high_low` のいずれかであることを検証する。
+ */
+function expectWordOrder(value: unknown, path: string): SlmpWordOrder {
+	if (value === undefined) return 'low_high';
+	if (value === 'low_high' || value === 'high_low') return value;
+	throw new ConfigPackageParseError(
+		`${path} は low_high / high_low のいずれかである必要があります`
+	);
+}
+
 function ensureUniqueNames<T extends { name: string }>(items: readonly T[], path: string): void {
 	const seen = new Set<string>();
 	for (const item of items) {
@@ -186,8 +205,8 @@ function filterVirtualConnections(connections: readonly PlcConnection[]): PlcCon
 }
 
 function sanitizeConnection(input: PlcConnection): ConfigPackagePlcConnection {
-	const { name, protocol, host, port, unitId, enabled, simulation } = input;
-	return { name, protocol, host, port, unitId, enabled, simulation };
+	const { name, protocol, host, port, unitId, enabled, simulation, wordOrder } = input;
+	return { name, protocol, host, port, unitId, enabled, simulation, wordOrder };
 }
 
 function sanitizeGroup(
@@ -311,7 +330,8 @@ function parsePlcConnections(raw: unknown): ConfigPackagePlcConnection[] {
 			port: expectInteger(item.port, `plcConnections[${index}].port`),
 			unitId: expectInteger(item.unitId, `plcConnections[${index}].unitId`),
 			enabled: expectBoolean(item.enabled, `plcConnections[${index}].enabled`),
-			simulation: expectBoolean(item.simulation, `plcConnections[${index}].simulation`)
+			simulation: expectBoolean(item.simulation, `plcConnections[${index}].simulation`),
+			wordOrder: expectWordOrder(item.wordOrder, `plcConnections[${index}].wordOrder`)
 		};
 	});
 }
