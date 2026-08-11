@@ -352,7 +352,7 @@ mod tests {
     #[test]
     fn try_acquire_profile_lock_creates_profile_directories() {
         let root = TempDir::new("profile-lock-layout");
-        let paths = resolve_profile_paths(root.path(), "default").expect("valid profile id");
+        let paths = resolve_profile_paths(root.path(), "creates-dirs").expect("valid profile id");
 
         let _guard =
             try_acquire_profile_lock(&paths, HubHostKind::Console).expect("first acquire ok");
@@ -367,7 +367,8 @@ mod tests {
     #[test]
     fn try_acquire_profile_lock_writes_owner_diagnostics() {
         let root = TempDir::new("profile-lock-owner-info");
-        let paths = resolve_profile_paths(root.path(), "default").expect("valid profile id");
+        let paths =
+            resolve_profile_paths(root.path(), "owner-diagnostics").expect("valid profile id");
 
         let _guard =
             try_acquire_profile_lock(&paths, HubHostKind::Service).expect("first acquire ok");
@@ -384,14 +385,14 @@ mod tests {
     #[test]
     fn second_acquire_on_the_same_profile_fails() {
         let root = TempDir::new("profile-lock-double-acquire");
-        let paths = resolve_profile_paths(root.path(), "default").expect("valid profile id");
+        let paths = resolve_profile_paths(root.path(), "double-acquire").expect("valid profile id");
 
         let _first =
             try_acquire_profile_lock(&paths, HubHostKind::Console).expect("first acquire ok");
 
         match try_acquire_profile_lock(&paths, HubHostKind::Shell) {
             Err(ProfileLockError::AlreadyHeld { profile_id, owner }) => {
-                assert_eq!(profile_id, "default");
+                assert_eq!(profile_id, "double-acquire");
                 let owner = owner.expect("first owner diagnostics should be readable");
                 assert_eq!(owner.host_kind, "console");
             }
@@ -421,7 +422,8 @@ mod tests {
     #[test]
     fn lock_is_released_after_guard_drop_allowing_reacquire() {
         let root = TempDir::new("profile-lock-release-on-drop");
-        let paths = resolve_profile_paths(root.path(), "default").expect("valid profile id");
+        let paths =
+            resolve_profile_paths(root.path(), "release-on-drop").expect("valid profile id");
 
         {
             let _guard =
