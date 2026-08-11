@@ -120,6 +120,23 @@ base64 = "0.23"
 # ソース化する。axum 統合は使わず(パラメータは `#[utoipa::path]` に手で
 # 記述する)最小構成で導入 - `apps/banto-hub/core` のみが使う。
 utoipa = "5"
+# ux-plan.md §5 バックログ「OpenAPI の Swagger UI 同梱」（2026-08-12 オーナー
+# 決定）: `/api/v1/openapi.json`（上の utoipa 由来）をブラウザで閲覧・試打
+# できる Swagger UI をバイナリに同梱する。`default-features = false` +
+# `vendored` feature で `utoipa-swagger-ui-vendored`（Swagger UI 静的資産を
+# crates.io 経由でそのまま同梱、ビルド時ネットワーク取得なし）を使う -
+# 既定の `url` feature（`dep:url` のみ、未使用なので落とす）や、既定の
+# build-dependencies が引く `zip`/`regex` は vendored 経路でも Cargo.toml
+# 上は無条件の build-dependency として残る - 実測(2026-08-12、`cargo deny
+# --all-features check`)では新規に増えたクレート（zip・zlib-rs・zopfli・
+# arbitrary・derive_arbitrary・utoipa-swagger-ui[-vendored]）はいずれも
+# 既存 allow 済みライセンス（MIT/Apache-2.0/Zlib）の範囲内で、deny.toml の
+# 変更は不要だった。実行時ネットワーク依存はゼロ（オフラインで動く要件を
+# 満たす）。`apps/banto-hub/core` のみが使う。
+utoipa-swagger-ui = { version = "9", default-features = false, features = [
+    "axum",
+    "vendored",
+] }
 # T1（docs/tag-server-design.md §5.2）: `GET /api/v1/stream` の WS 統合テスト
 # 用クライアント（dev-dependency のみ - サーバー側は axum 自身の `ws`
 # feature で足りる）。axum 0.8.9 が内部で使っているのと同じ 0.29 系を選び、
