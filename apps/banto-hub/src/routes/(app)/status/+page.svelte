@@ -509,6 +509,17 @@
 													キャンセル
 												</button>
 											</div>
+										{:else if change.state === 'failed'}
+											<div class="pending-actions">
+												<button
+													type="button"
+													class="danger"
+													onclick={() => void handleCancelPending(change)}
+													disabled={pendingActionId !== null}
+												>
+													キャンセル
+												</button>
+											</div>
 										{:else}
 											-
 										{/if}

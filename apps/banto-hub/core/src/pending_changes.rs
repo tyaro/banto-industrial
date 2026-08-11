@@ -57,6 +57,13 @@ pub struct PendingChange {
     pub requested_by_username: Option<String>,
     pub requested_by_role: Option<String>,
     pub failure_reason: Option<String>,
+    /// TAG-P0-3 follow-up（2026-08-12）: 適用対象リソースの enqueue 時点の
+    /// スナップショット（`serde_json::to_string` した DTO 文字列）。
+    /// `execute_pending_apply` が適用直前に再取得・再シリアライズして
+    /// 一致を確認し、他経路での編集を検出する per-resource ガード。
+    /// `configured_revision`（global）は使わない — 複数件を連続適用すると
+    /// 毎回 revision が進むため、global 比較では成立しない。
+    pub base_fingerprint: Option<String>,
 }
 
 type PendingRow = (
@@ -67,6 +74,7 @@ type PendingRow = (
     i64,
     String,
     String,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -84,6 +92,7 @@ fn row_to_pending(row: PendingRow) -> Result<PendingChange, BantoError> {
         requested_by_username,
         requested_by_role,
         failure_reason,
+        base_fingerprint,
     ) = row;
     Ok(PendingChange {
         id,
@@ -98,6 +107,7 @@ fn row_to_pending(row: PendingRow) -> Result<PendingChange, BantoError> {
         requested_by_username,
         requested_by_role,
         failure_reason,
+        base_fingerprint,
     })
 }
 
@@ -111,11 +121,13 @@ impl PendingChangesService {
         Self { pool }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_pending(
         &self,
         source: &str,
         payload: &serde_json::Value,
         base_configured_revision: i64,
+        base_fingerprint: Option<&str>,
         requested_by_username: Option<&str>,
         requested_by_role: Option<&str>,
     ) -> Result<PendingChange, BantoError> {
@@ -128,14 +140,16 @@ impl PendingChangesService {
                source,
                payload,
                base_configured_revision,
+               base_fingerprint,
                requested_by_username,
                requested_by_role
-             ) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(PendingChangeState::Pending.as_str())
         .bind(source)
         .bind(payload_json)
         .bind(base_configured_revision)
+        .bind(base_fingerprint)
         .bind(requested_by_username)
         .bind(requested_by_role)
         .fetch_one(&self.pool)
@@ -157,7 +171,8 @@ impl PendingChangesService {
                updated_at,
                requested_by_username,
                requested_by_role,
-               failure_reason
+               failure_reason,
+               base_fingerprint
              FROM pending_changes
              WHERE id = ?",
         )
@@ -188,7 +203,8 @@ impl PendingChangesService {
                updated_at,
                requested_by_username,
                requested_by_role,
-               failure_reason
+               failure_reason,
+               base_fingerprint
              FROM pending_changes
              ORDER BY id DESC
              LIMIT ?",
@@ -201,13 +217,17 @@ impl PendingChangesService {
         rows.into_iter().map(row_to_pending).collect()
     }
 
+    /// pending だけでなく failed からもキャンセル可能（TAG-P0-3 follow-up、
+    /// 2026-08-12）: 適用時のフィンガープリント不一致で failed になった
+    /// 提案を破棄して再作成する運用上の復旧手段。applying/applied からの
+    /// キャンセルは引き続き不可。
     pub async fn cancel_pending(&self, id: i64) -> Result<PendingChange, BantoError> {
         let row: Option<PendingRow> = sqlx::query_as(
             "UPDATE pending_changes
              SET
                state = ?,
                updated_at = datetime('now')
-             WHERE id = ? AND state = ?
+             WHERE id = ? AND (state = ? OR state = ?)
              RETURNING
                id,
                state,
@@ -218,11 +238,13 @@ impl PendingChangesService {
                updated_at,
                requested_by_username,
                requested_by_role,
-               failure_reason",
+               failure_reason,
+               base_fingerprint",
         )
         .bind(PendingChangeState::Canceled.as_str())
         .bind(id)
         .bind(PendingChangeState::Pending.as_str())
+        .bind(PendingChangeState::Failed.as_str())
         .fetch_optional(&self.pool)
         .await
         .map_err(banto_storage::storage_error)?;
@@ -258,7 +280,8 @@ impl PendingChangesService {
                updated_at,
                requested_by_username,
                requested_by_role,
-               failure_reason",
+               failure_reason,
+               base_fingerprint",
         )
         .bind(PendingChangeState::Applying.as_str())
         .bind(id)
@@ -296,7 +319,8 @@ impl PendingChangesService {
                updated_at,
                requested_by_username,
                requested_by_role,
-               failure_reason",
+               failure_reason,
+               base_fingerprint",
         )
         .bind(PendingChangeState::Applied.as_str())
         .bind(id)
@@ -334,7 +358,8 @@ impl PendingChangesService {
                updated_at,
                requested_by_username,
                requested_by_role,
-               failure_reason",
+               failure_reason,
+               base_fingerprint",
         )
         .bind(PendingChangeState::Failed.as_str())
         .bind(reason)
@@ -374,6 +399,7 @@ mod tests {
                 "tags.create",
                 &serde_json::json!({ "name": "temp01" }),
                 42,
+                None,
                 Some("admin"),
                 Some("admin"),
             )
@@ -398,6 +424,7 @@ mod tests {
                 1,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -406,6 +433,7 @@ mod tests {
                 "tags.create",
                 &serde_json::json!({ "name": "b" }),
                 2,
+                None,
                 None,
                 None,
             )
@@ -426,6 +454,7 @@ mod tests {
                 "tags.update",
                 &serde_json::json!({ "id": 1 }),
                 3,
+                None,
                 None,
                 None,
             )
@@ -449,6 +478,7 @@ mod tests {
                 5,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -467,5 +497,66 @@ mod tests {
         assert!(err
             .to_string()
             .contains("pending 状態以外の提案は適用開始できません"));
+    }
+
+    #[tokio::test]
+    async fn cancel_allows_failed_but_not_applying_or_applied() {
+        let svc = service().await;
+
+        // failed -> canceled は許可（TAG-P0-3 follow-up: フィンガープリント
+        // 不一致で failed になった提案を破棄して再作成できるようにする）。
+        let created = svc
+            .create_pending(
+                "tags.create",
+                &serde_json::json!({ "name": "recoverable" }),
+                7,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        svc.start_applying(created.id).await.unwrap();
+        svc.mark_failed(created.id, "boom").await.unwrap();
+
+        let canceled = svc.cancel_pending(created.id).await.unwrap();
+        assert_eq!(canceled.state, PendingChangeState::Canceled);
+
+        // applying からのキャンセルは不可のまま。
+        let applying_only = svc
+            .create_pending(
+                "tags.create",
+                &serde_json::json!({ "name": "mid-apply" }),
+                8,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        svc.start_applying(applying_only.id).await.unwrap();
+        let err = svc.cancel_pending(applying_only.id).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("pending 状態以外の提案はキャンセルできません"));
+
+        // applied からのキャンセルも不可のまま。
+        let applied_only = svc
+            .create_pending(
+                "tags.create",
+                &serde_json::json!({ "name": "done" }),
+                9,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        svc.start_applying(applied_only.id).await.unwrap();
+        svc.mark_applied(applied_only.id).await.unwrap();
+        let err = svc.cancel_pending(applied_only.id).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("pending 状態以外の提案はキャンセルできません"));
     }
 }

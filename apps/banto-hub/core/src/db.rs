@@ -270,7 +270,8 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
                     requested_by_role TEXT,
                     failure_reason TEXT,
                     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    base_fingerprint TEXT
                 )",
         )
         .execute(pool)
@@ -290,6 +291,17 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
     .execute(pool)
     .await
     .map_err(banto_storage::storage_error)?;
+
+    // TAG-P0-3 follow-up（2026-08-12）: pending change 適用時の per-resource
+    // ステイル検出ガード。`base_fingerprint` は enqueue 時点の対象行の
+    // スナップショット文字列（`crate::rest::compute_pending_base_fingerprint`
+    // 参照）で、`plc_connections`/`collection_groups` の update/delete のみ
+    // 値を持つ（`tags.*` と `*.create` は NULL のまま - 詳細は同関数の
+    // doc comment）。`pending_changes` は本モジュールで既に
+    // `CREATE TABLE IF NOT EXISTS` 済みのため、`tripped_at`/`expires_at`
+    // と同じ理由で `add_column_if_missing` の後追い ADD COLUMN にする
+    // (新規 DB では上の CREATE TABLE で既に列があるため no-op)。
+    add_column_if_missing(pool, "pending_changes", "base_fingerprint", "TEXT").await?;
 
     Ok(())
 }

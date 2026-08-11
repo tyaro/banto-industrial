@@ -20,7 +20,7 @@ Desktop Hub 起動までのフル E2E は任意の追加確認）。
 既存サービスへ触れず早期リターンして既存の起動種別を保持、詳細は
 [banto-hub-t17-design.md](banto-hub-t17-design.md) §11。**同日実機で
 `DEMAND_START` / OS 再起動後 Stopped / 手動 Start / 再 install 保持 /
-AutoStart 巻き戻し防止 / UAC / 非管理者 Operators 委任を確認**）。進行中: T18-1（TAG-UX-C・TAG-P0-2 完了、TAG-P0-3 は **方針改定（運転中編集のキュー化 + 手動適用/キャンセル）** に基づき未着手）。**2026-08-10:
+AutoStart 巻き戻し防止 / UAC / 非管理者 Operators 委任を確認**）。進行中: T18-1（TAG-UX-C・TAG-P0-2 完了、TAG-P0-3 は **方針改定（運転中編集のキュー化 + 手動適用/キャンセル）** に基づき queue/apply/cancel 本体を実装済み・2026-08-12 に apply 時の per-resource フィンガープリントガードを追加、詳細は §9.3）。**2026-08-10:
 T16-2 第一スライス実装済み**（`apps/banto-hub/src-tauri/src/lib.rs` に
 サービス検出→接続／デスクトップ起動／native fallback の決定木を配線、
 `apps/banto-hub/core/src/http_hub_health.rs` に T17-3 で deferred だった
@@ -67,7 +67,8 @@ invoke、実`ShellDesktopControl`、自動起動 UAC。詳細は
 TAG-P0-2 は T14-3 のバックエンド preflight（`preflight_transaction`）+
 本 PR（`cursor/t18-1-tag-p0-2-e3cb`）のフォームでの `configuration` エラー
 表示・実 DOM e2e で受け入れ条件を満たした（closed、詳細は §9.3 TAG-P0-2 の
-実装メモ）。TAG-P0-3 は未着手。
+実装メモ）。TAG-P0-3 は queue/apply/cancel 本体を実装済み・2026-08-12 に
+apply 時の per-resource フィンガープリントガードを追加（詳細は §9.3）。
 最終検証日(コード照合): 2026-08-10
 最終検証日(Windows 実機): 2026-08-10（T17-1 Session 0・SLMP 収集、
 [banto-hub-t17-design.md](banto-hub-t17-design.md) §8）
@@ -761,6 +762,26 @@ UX-5（2026-08-11 追補）の決定を UI 表示だけで終わらせず、サ�
 - `適用` は明示操作時にのみ実行され、共有 preflight 成功時だけ `apply_run` される。
 - `キャンセル` は pending queue を破棄し、実行構成に変更を与えない。
 - 適用処理は直列化され、切替競合で再構成を二重実行しない。
+
+**実装状況（2026-08-12）**: 上記の queue/apply/cancel 本体は `37b665f`
+（運転中編集を pending queue へ保存し管理 API を追加）・`ffbc7ac`（pending
+change apply API と状態遷移を実装）で実装済み。**同日追加**: apply
+時に対象リソース（`plc_connections`/`collection_groups` の
+update/delete）の内容が enqueue 後に他経路で変更・削除されていないかを
+再検証する **per-resource フィンガープリントガード**を追加した
+（`pending_changes.base_fingerprint` — enqueue 時点で対象行を
+`serde_json::to_string` した文字列を保存し、apply 直前に再取得・再比較
+する）。あえてグローバルな `configured_revision` 比較にしていないのは、
+`execute_pending_apply` の成功時に `commit_catalog_and_notify` が毎回
+グローバル revision を進めるため、複数件を連続適用するフローと相性が
+悪いから（詳細は `apps/banto-hub/core/src/rest.rs` の
+`compute_pending_base_fingerprint` doc comment）。不一致時は該当の
+pending change が `failed` になり、`failure_reason` に日本語の説明を
+残す。あわせて、`failed` の提案もキャンセル可能にした（従来は `pending`
+のみ）ので、コンフリクトで詰まった提案を破棄して再作成する復旧経路が
+できた。`tags.*` は既存の `expectedRevision` 楽観ロック
+（`TagUpdateError::RevisionConflict`）で個別にガードされているため、
+本ガードの対象外のまま。
 
 ### 9.4 タグ登録 UI/UX 改善パッケージ
 
