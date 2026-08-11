@@ -206,16 +206,22 @@ impl AuditLogService {
     /// dimension" (mirrors chronogazer's `AuditSettings` convention this
     /// method was copied alongside).
     ///
-    /// docs/banto-hub-remaining-plan.md P3-a: wired up the same way
-    /// chronogazer/relay-wright already do - the settings come from
+    /// docs/banto-hub-remaining-plan.md P3-a: the settings come from
     /// [`crate::settings::SettingsService::audit_config`], and this method
-    /// is called from two places, matching the reference crates' "no
-    /// separate background pruning task" reasoning (see their
-    /// `crate::rest::audit_log_list` doc comment):
-    /// - once at startup (`crate::runtime::HubRuntime::start`), and
+    /// is called from three places:
+    /// - once at startup (`crate::runtime::HubRuntime::start`),
+    /// - every tick of `HubRuntime::start`'s existing 24h tstore-retention
+    ///   loop (P3-a 追補、2026-08-12: unlike chronogazer/relay-wright,
+    ///   which are desktop apps a human restarts often and so get away with
+    ///   "startup + opportunistic-on-list only", banto-hub is a 24/7
+    ///   headless collector - a deployment that never opens the audit-log
+    ///   viewer and never restarts would otherwise never prune at all. See
+    ///   `crate::runtime::audit_prune_once`'s doc comment), and
     /// - opportunistically before every `POST /api/audit-log/list`
     ///   (`crate::rest::audit_log_list`) - best-effort, so a prune failure
-    ///   never blocks an admin from viewing existing entries.
+    ///   never blocks an admin from viewing existing entries. Kept even
+    ///   though the 24h loop makes it non-load-bearing, for low-latency
+    ///   effect when an admin changes the policy and reopens the viewer.
     ///
     /// Returns the total number of rows deleted.
     pub async fn prune(

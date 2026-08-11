@@ -784,6 +784,10 @@ struct AuditLogState {
 /// 剪定する（chronogazer/relay-wright の`audit_log_list`と同じ「list実行
 /// 時に軽く」規約 - `crate::audit::AuditLogService::prune`のdoc comment
 /// 参照）。剪定に失敗しても一覧の取得自体は続行する（best-effort）。
+/// P3-a 追補（2026-08-12）: `crate::runtime::HubRuntime::start`の24h周期
+/// タスクが同じ剪定を回すようになったため、このopportunistic剪定は
+/// もはや無制限成長を防ぐための唯一の保証ではないが、設定変更直後に
+/// 画面を開いた管理者へ即座に反映する効果があるため残している。
 async fn audit_log_list(
     State(state): State<AuditLogState>,
     Json(params): Json<ListParams>,
@@ -818,8 +822,9 @@ async fn audit_log_config_get(
 /// を無制限にする - `crate::settings::AuditSettings`のdoc comment参照）。
 /// `mqtt_settings_put`/`grpc_settings_put`と同じ「保存 → 監査エントリ
 /// 記録」の形だが、こちらは即時適用するランタイム状態を持たないため
-/// （`prune`は次回の起動時/list実行時に読まれるだけ）、`apply`相当の
-/// 呼び出しは無い。
+/// （`prune`は次回の24h周期タスク/起動時/list実行時のいずれかで読まれる
+/// だけ - `crate::runtime::audit_prune_once`のdoc comment参照）、`apply`
+/// 相当の呼び出しは無い。
 async fn audit_log_config_put(
     State(state): State<AuditLogState>,
     headers: HeaderMap,

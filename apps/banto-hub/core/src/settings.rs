@@ -43,8 +43,9 @@
 //! 設定形・既定値（90日/100,000件）・「0以下は無制限」規約が完全に同じ -
 //! [`normalize_retention`]/[`parse_retention`] はそちらからそのまま移植
 //! した。`crate::rest::audit_log_router`（`GET/PUT /api/audit-log/config`）
-//! と `crate::runtime::HubRuntime::start`（起動時1回の剪定）がこの設定を
-//! 読む。
+//! と `crate::runtime::HubRuntime::start`（起動時1回 + 24h 周期タスク、
+//! P3-a 追補・2026-08-12 - `crate::runtime::audit_prune_once`のdoc
+//! comment参照）がこの設定を読む。
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
