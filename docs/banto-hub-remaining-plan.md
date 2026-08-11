@@ -90,9 +90,16 @@ Phase 0 マージ後の main を実機で確認。テスト PLC の複数ポー�
   `AuditSettings`（`crate::settings`、既定 90日/100,000件）を追加し、`GET/PUT /api/audit-log/config`
   （admin 限定）と `crate::runtime::HubRuntime::start` の起動時剪定 + `POST /api/audit-log/list` の
   opportunistic 剪定を配線した（[docs/banto-hub-operations.md §9](banto-hub-operations.md)参照）。
-- **P3-b**: SLMP の word order / CPU 種別を接続設定から露出。broker が `host`/`port` 以外を
-  `SlmpConfig::default()` 固定にしているため、ワード順の異なる機種で u32/f32 の値化けに直結。
-  接続レジストリ・登録 UI へ露出。
+- **P3-b（word_order 実装完了・未マージ、ブランチ `claude/slmp-word-order`）**: SLMP の word order を接続設定から
+  露出。banto-broker（`SessionDirectory::ensure_connection`）と banto-collect
+  （`config::slmp_config_for`、relay-wright/chronogazer が使う経路）の両方が `host`/`port` 以外を
+  `SlmpConfig::default()` 固定にしており、ワード順の異なる機種で u32/f32 の値化けに直結していた
+  問題を解消。`plc_connections.word_order`（migration `0010`、既定 `low_high` で後方互換）→
+  `PlcConnection`/`PlcConnectionInput::wordOrder` → 上記2箇所の `SlmpConfig` 構築 →
+  `plc-connections` 登録/編集フォーム（"slmp" 選択時のみ表示）まで配線済み。
+  **残: CPU 種別 / アクセスルート（network/PC/IO/area id）は今回のスコープ外**
+  （`banto-collect::config::slmp_config_for` の doc comment に "Known limitation" として明記）
+  - 必要になれば別スライスで `plc_connections` に列を追加する。
 - **P3-c**: H9 SLMP 構造化エラー + transport 共通化（[improvement-plan.md](improvement-plan.md)
   §H9）。slmp クレートのバージョン更新前に必須。
 

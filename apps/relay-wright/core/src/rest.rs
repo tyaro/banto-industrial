@@ -1699,6 +1699,16 @@ impl From<PlcConnectionPayload> for PlcConnectionInput {
             // relay-wright never sets it - every connection this app
             // creates/updates keeps the database default (`false`).
             simulation: false,
+            // P3-b (banto-industrial 監査指摘 2026-08-12): `word_order` is a
+            // banto-hub-only exposed setting so far (its plc-connections form
+            // - `apps/banto-hub/src/routes/(app)/plc-connections/+page.svelte`
+            // - is the only UI offering it). relay-wright never sets it -
+            // same stance as `simulation` above - every connection this app
+            // creates/updates keeps the database default (`"low_high"`,
+            // `banto_tags::plc_connection::default_word_order`), i.e. exactly
+            // the behavior every relay-wright connection already had before
+            // this column existed.
+            word_order: "low_high".to_string(),
         }
     }
 }
@@ -4608,6 +4618,8 @@ mod tests {
                 unit_id: 1,
                 enabled: true,
                 simulation: false,
+
+                word_order: "low_high".to_string(),
             })
             .await
             .expect("seed plc connection");
@@ -4902,6 +4914,8 @@ mod tests {
                 unit_id: 1,
                 enabled: true,
                 simulation: false,
+
+                word_order: "low_high".to_string(),
             })
             .await
             .expect("seed plc connection");
@@ -5557,6 +5571,8 @@ mod tests {
                 unit_id: 1,
                 enabled: true,
                 simulation: false,
+
+                word_order: "low_high".to_string(),
             })
             .await
             .expect("create slmp connection");

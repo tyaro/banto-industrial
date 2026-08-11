@@ -82,6 +82,8 @@ fn disabled_conn_input(name: &str) -> PlcConnectionInput {
         unit_id: 1,
         enabled: false,
         simulation: false,
+
+        word_order: "low_high".to_string(),
     }
 }
 

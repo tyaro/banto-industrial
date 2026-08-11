@@ -338,7 +338,7 @@ impl RegistrySnapshot {
     /// all three registry reads observe one transaction-local state.
     pub async fn load_connection(connection: &mut SqliteConnection) -> Result<Self, CollectError> {
         let connections = sqlx::query_as::<_, PlcConnection>(
-            "SELECT id, name, protocol, host, port, unit_id, enabled, simulation \
+            "SELECT id, name, protocol, host, port, unit_id, enabled, simulation, word_order \
              FROM plc_connections ORDER BY id",
         )
         .fetch_all(&mut *connection)
@@ -577,16 +577,21 @@ fn modbus_config_for(conn: &PlcConnection) -> Result<ModbusTcpConfig, CollectErr
 }
 
 /// I8 (2026-08-05): build an [`SlmpConfig`] from a `"slmp"`-protocol
-/// [`PlcConnection`] row. Only `host`/`port` come from the registry -
-/// `banto-tags::PlcConnection` has no columns for SLMP's CPU series, access
-/// route (network/PC/IO/area id), or word order (`unit_id` is Modbus-only and
-/// is not read here), so every other field falls back to
-/// [`SlmpConfig::default`] (R series CPU, the CPU-on-the-other-end access
-/// route, MELSEC's low-word-first order). **Known limitation**: a device
-/// that needs a non-default CPU series or a routed (not-directly-connected)
-/// access route cannot be configured through the registry today - adding
-/// those would need new `plc_connections` columns, deliberately out of scope
-/// for I8 (task instructions: "新しい I1 列は追加しない").
+/// [`PlcConnection`] row. `host`/`port`/`word_order` come from the registry -
+/// `word_order` since P3-b（監査指摘 2026-08-12, migration
+/// `0010_plc_connections_add_word_order.sql`); before that this fn always
+/// fell back to [`SlmpConfig::default`]'s `WordOrder::LowHigh` regardless of
+/// what the device actually needed, silently byte-swapping any u32/f32 tag
+/// read through a connection that required `WordOrder::HighLow`.
+/// `banto-tags::PlcConnection` still has no columns for SLMP's CPU series or
+/// access route (network/PC/IO/area id; `unit_id` is Modbus-only and is not
+/// read here), so those fields still fall back to [`SlmpConfig::default`] (R
+/// series CPU, the CPU-on-the-other-end access route). **Known
+/// limitation**: a device that needs a non-default CPU series or a routed
+/// (not-directly-connected) access route cannot be configured through the
+/// registry today - adding those would need new `plc_connections` columns,
+/// deliberately out of scope for both I8 and P3-b (P3-b task instructions:
+/// "word_order に集中し、他は trivial でない限り実装しない").
 /// `connect_timeout`/`response_timeout` are overridden uniformly by
 /// [`crate::collector::Collector::start`] from [`crate::collector::CollectorOptions`],
 /// exactly like [`modbus_config_for`]'s.
@@ -600,8 +605,23 @@ fn slmp_config_for(conn: &PlcConnection) -> Result<SlmpConfig, CollectError> {
     Ok(SlmpConfig {
         host: conn.host.clone(),
         port,
+        // P3-b: `parse_word_order` mirrors `banto_broker`'s private fn of the
+        // same name/behavior (fails open to `WordOrder::LowHigh` for
+        // anything unrecognized - see its own doc comment) - not shared
+        // because the two crates have no dependency relationship to hang a
+        // shared helper off of, and it is three lines.
+        word_order: parse_word_order(&conn.word_order),
         ..SlmpConfig::default()
     })
+}
+
+/// See [`slmp_config_for`]'s doc comment for why this exists and why it is
+/// not shared with `banto_broker`'s identical fn.
+fn parse_word_order(value: &str) -> WordOrder {
+    match value {
+        "high_low" => WordOrder::HighLow,
+        _ => WordOrder::LowHigh,
+    }
 }
 
 /// Parse a tag's address + data type into a wire [`ReadRequest`]. `protocol`
@@ -690,6 +710,8 @@ mod tests {
             unit_id: 1,
             enabled: true,
             simulation: false,
+
+            word_order: "low_high".to_string(),
         }
     }
 
@@ -1060,6 +1082,67 @@ mod tests {
         assert_eq!(c.groups[0].requests.len(), 1);
     }
 
+    /// P3-b (監査指摘 2026-08-12): `slmp_config_for` must carry the
+    /// connection's own `word_order` into the built `SlmpConfig`, not
+    /// silently fix every connection to `SlmpConfig::default()`'s
+    /// `WordOrder::LowHigh` - the regression test for the audit finding.
+    #[tokio::test]
+    async fn slmp_config_reflects_the_connections_own_word_order() {
+        let pool = registry().await;
+        let plc_svc = PlcConnectionService::new(pool.clone());
+
+        let mut swapped_input = conn_input_slmp("Swapped", 5007);
+        swapped_input.word_order = "high_low".to_string();
+        let swapped = plc_svc.create(swapped_input).await.unwrap();
+        CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", swapped.id, 1_000))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input("T1", swapped.id, "D100"))
+            .await
+            .unwrap();
+
+        let config = build_config(&pool).await.expect("slmp config should build");
+        match &config.connections[0].config {
+            ProtocolConfig::Slmp(slmp) => {
+                assert_eq!(
+                    slmp.word_order,
+                    WordOrder::HighLow,
+                    "a connection asking for high_low must not silently get the default"
+                );
+            }
+            ProtocolConfig::ModbusTcp(_) => panic!("expected Slmp config"),
+        }
+    }
+
+    /// The default-omitted counterpart: a `"slmp"` connection that never sets
+    /// `word_order` (this file's `conn_input_slmp`, unchanged) still gets
+    /// `WordOrder::LowHigh` - the same value every SLMP connection got before
+    /// this column existed, so existing databases are unaffected.
+    #[tokio::test]
+    async fn slmp_config_defaults_to_low_high_word_order() {
+        let pool = registry().await;
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(conn_input_slmp("PLC1", 5007))
+            .await
+            .unwrap();
+        CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", conn.id, 1_000))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input("T1", conn.id, "D100"))
+            .await
+            .unwrap();
+
+        let config = build_config(&pool).await.expect("slmp config should build");
+        match &config.connections[0].config {
+            ProtocolConfig::Slmp(slmp) => assert_eq!(slmp.word_order, WordOrder::LowHigh),
+            ProtocolConfig::ModbusTcp(_) => panic!("expected Slmp config"),
+        }
+    }
+
     /// T9-1 (docs/ux-plan.md §1): `PlcConnection::simulation` carries through
     /// unchanged into `ConnectionPlan::simulation` - `build_config` itself
     /// never starts a simulator or touches host/port (`ConnectionPlan`'s own
@@ -1168,6 +1251,8 @@ mod tests {
                 unit_id: 1,
                 enabled: true,
                 simulation: false,
+
+                word_order: "low_high".to_string(),
             })
             .await
             .unwrap();

@@ -21,7 +21,8 @@ const BASE_CONNECTION: PlcConnection = {
 	port: 502,
 	unitId: 1,
 	enabled: true,
-	simulation: false
+	simulation: false,
+	wordOrder: 'low_high'
 };
 
 const VIRTUAL_CONNECTION: PlcConnection = {
@@ -32,7 +33,8 @@ const VIRTUAL_CONNECTION: PlcConnection = {
 	port: 0,
 	unitId: 0,
 	enabled: true,
-	simulation: false
+	simulation: false,
+	wordOrder: 'low_high'
 };
 
 const BASE_GROUP: CollectionGroup = {
@@ -128,7 +130,8 @@ describe('configPackage', () => {
 				port: 502,
 				unitId: 1,
 				enabled: true,
-				simulation: false
+				simulation: false,
+				wordOrder: 'low_high'
 			}
 		]);
 		expect(pkg.collectionGroups).toEqual([
@@ -234,6 +237,30 @@ describe('configPackage', () => {
 	it('parseConfigPackage は不正な schemaVersion を拒否する', () => {
 		const text = JSON.stringify({ ...makePackage(), schemaVersion: 2 }, null, 2);
 		expect(() => parseConfigPackage(text)).toThrow(/schemaVersion/);
+	});
+
+	// --- P3-b（監査指摘 2026-08-12）: wordOrder は旧スキーマの構成パッケージ
+	// （この列を持たない）を読めなければならない - CONFIG_PACKAGE_SCHEMA_VERSION
+	// は据え置きのまま追加した後方互換フィールドなので、既存のエクスポート済み
+	// ファイルは wordOrder を一切含まない。
+
+	it('parseConfigPackage は wordOrder を持たない旧パッケージを low_high 既定で受け入れる', () => {
+		const pkg = makePackage();
+		const withoutWordOrder = {
+			...pkg,
+			plcConnections: pkg.plcConnections.map(({ wordOrder: _wordOrder, ...rest }) => rest)
+		};
+		const parsed = parseConfigPackage(JSON.stringify(withoutWordOrder));
+		expect(parsed.plcConnections[0].wordOrder).toBe('low_high');
+	});
+
+	it('parseConfigPackage は不正な wordOrder を拒否する', () => {
+		const pkg = makePackage();
+		const withBadWordOrder = {
+			...pkg,
+			plcConnections: pkg.plcConnections.map((c) => ({ ...c, wordOrder: 'middle_endian' }))
+		};
+		expect(() => parseConfigPackage(JSON.stringify(withBadWordOrder))).toThrow(/wordOrder/);
 	});
 
 	it('planByName は name ベースで create/update を分ける', () => {

@@ -38,10 +38,12 @@
 		deletePlcConnection,
 		isVirtualConnection,
 		testPlcConnection,
+		WORD_ORDER_OPTIONS,
 		type PlcConnection,
 		type PlcConnectionInput,
 		type PlcConnectionTestResult,
-		type PlcProtocol
+		type PlcProtocol,
+		type SlmpWordOrder
 	} from '$lib/banto/tagRegistryAdmin';
 
 	// "virtual" is intentionally NOT offered here (this module's doc comment)
@@ -67,6 +69,7 @@
 		unitId: string;
 		enabled: boolean;
 		simulation: boolean;
+		wordOrder: SlmpWordOrder;
 	}
 
 	function blankForm(): FormState {
@@ -79,7 +82,11 @@
 			port: '502',
 			unitId: '1',
 			enabled: true,
-			simulation: false
+			simulation: false,
+			// P3-b（監査指摘 2026-08-12）: バックエンドの既定
+			// （default_plc_word_order / SlmpConfig::default().word_order）と
+			// 一致させる。
+			wordOrder: 'low_high'
 		};
 	}
 
@@ -91,7 +98,8 @@
 			port: String(c.port),
 			unitId: String(c.unitId),
 			enabled: c.enabled,
-			simulation: c.simulation
+			simulation: c.simulation,
+			wordOrder: c.wordOrder
 		};
 	}
 
@@ -103,7 +111,8 @@
 			port: Number(form.port),
 			unitId: Number(form.unitId),
 			enabled: form.enabled,
-			simulation: form.simulation
+			simulation: form.simulation,
+			wordOrder: form.wordOrder
 		};
 	}
 
@@ -282,6 +291,16 @@
 		{ id: 'port', header: 'ポート', accessor: 'port', width: 80, align: 'right' },
 		{ id: 'unitId', header: 'ユニットID', accessor: 'unitId', width: 90, align: 'right' },
 		{
+			// P3-b（監査指摘 2026-08-12）: SLMP 以外では無意味なので "—" にする
+			// （`unitId` 列は数値をそのまま出しているが、こちらは選択肢が2値しか
+			// ないぶん「該当なし」を明示したほうが読み違いにくい）。
+			id: 'wordOrder',
+			header: 'ワード順',
+			accessor: 'wordOrder',
+			width: 100,
+			format: (v, row) => (row.protocol === 'slmp' ? String(v) : '—')
+		},
+		{
 			id: 'enabled',
 			header: '有効',
 			accessor: 'enabled',
@@ -361,6 +380,21 @@
 			<span class="hint">Modbus 用のスレーブID（0〜255）。SLMP では未使用（既定 1 のまま）。</span>
 			{#if errors.unitId}<span class="err">{errors.unitId}</span>{/if}
 		</label>
+		{#if form.protocol === 'slmp'}
+			<label class="field">
+				ワード順
+				<select bind:value={form.wordOrder}>
+					{#each WORD_ORDER_OPTIONS as opt (opt.value)}
+						<option value={opt.value}>{opt.label}</option>
+					{/each}
+				</select>
+				<span class="hint">
+					32bit値（u32/f32等）の上位/下位ワードの並び。機種のマニュアルで確認してください —
+					間違えると値が化けます（上位/下位が入れ替わります）。
+				</span>
+				{#if errors.wordOrder}<span class="err">{errors.wordOrder}</span>{/if}
+			</label>
+		{/if}
 		<label class="field checkbox">
 			<input type="checkbox" bind:checked={form.enabled} />
 			有効

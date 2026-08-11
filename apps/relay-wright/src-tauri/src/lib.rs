@@ -3535,6 +3535,8 @@ mod tests {
                 unit_id: 1,
                 enabled: true,
                 simulation: false,
+
+                word_order: "low_high".to_string(),
             })
             .await
             .expect("seed plc connection");
@@ -4203,6 +4205,8 @@ mod tests {
                 unit_id: 1,
                 enabled: true,
                 simulation: false,
+
+                word_order: "low_high".to_string(),
             })
             .await
             .expect("create slmp connection");

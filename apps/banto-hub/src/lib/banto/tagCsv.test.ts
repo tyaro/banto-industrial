@@ -35,7 +35,8 @@ const CONN_A: PlcConnection = {
 	port: 502,
 	unitId: 1,
 	enabled: true,
-	simulation: false
+	simulation: false,
+	wordOrder: 'low_high'
 };
 const CONN_B: PlcConnection = {
 	id: 2,
@@ -45,7 +46,8 @@ const CONN_B: PlcConnection = {
 	port: 5000,
 	unitId: 1,
 	enabled: true,
-	simulation: false
+	simulation: false,
+	wordOrder: 'low_high'
 };
 const CONNECTIONS: PlcConnection[] = [CONN_A, CONN_B];
 

@@ -121,6 +121,8 @@ impl Fixture {
                 unit_id: 1,
                 enabled: true,
                 simulation: false,
+
+                word_order: "low_high".to_string(),
             })
             .await
             .expect("create slmp connection");

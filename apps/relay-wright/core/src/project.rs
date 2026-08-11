@@ -245,6 +245,8 @@ async fn validate_by_replay(project: &ProjectFile) -> Result<(), BantoError> {
                 unit_id: c.unit_id,
                 enabled: c.enabled,
                 simulation: false,
+
+                word_order: "low_high".to_string(),
             })
             .await?;
         conn_map.insert(c.id, created.id);
@@ -668,6 +670,8 @@ mod tests {
                 unit_id: 1,
                 enabled: true,
                 simulation: false,
+
+                word_order: "low_high".to_string(),
             })
             .await
             .unwrap();
@@ -907,6 +911,8 @@ mod tests {
                 unit_id: 1,
                 enabled: true,
                 simulation: false,
+
+                word_order: "low_high".to_string(),
             })
             .await
             .unwrap();

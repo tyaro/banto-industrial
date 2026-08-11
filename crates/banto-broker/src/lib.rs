@@ -167,7 +167,7 @@ use std::time::Duration;
 
 use banto_plc::{
     execute_slmp_batch_reads, plan_slmp_batch, BatchReadRequest, BatchReadResult, PlcError,
-    SlmpConfig,
+    SlmpConfig, WordOrder,
 };
 use banto_plc_write::{execute_slmp_writes, plan_slmp_write_batch, BatchWriteRequest, WriteResult};
 use banto_tags::PlcConnection;
@@ -178,6 +178,51 @@ use tokio::time::Instant;
 /// SLMP is the only protocol this broker speaks (see the module doc's "Why
 /// SLMP-only" section).
 const SLMP_PROTOCOL: &str = "slmp";
+
+/// Parse [`PlcConnection::word_order`]'s wire string into the
+/// [`WordOrder`] [`SlmpConfig::word_order`] wants (P3-b, 監査指摘
+/// 2026-08-12: this function replacing the old hardcoded
+/// `..SlmpConfig::default()` is the fix). Falls back to
+/// [`WordOrder::LowHigh`] - [`SlmpConfig::default`]'s own value, so an
+/// unrecognized string behaves exactly as every connection did before this
+/// column existed - rather than propagating an error, because
+/// `banto_tags::plc_connection::ALLOWED_WORD_ORDERS` plus the SQL `CHECK`
+/// migration `0010` added already make any other value unreachable through
+/// normal CRUD; this is defense in depth for a hand-edited or
+/// pre-migration-0010 database row, not a path this broker expects to take
+/// in practice.
+fn parse_word_order(value: &str) -> WordOrder {
+    match value {
+        "high_low" => WordOrder::HighLow,
+        // "low_high" and anything unrecognized both land here - see this
+        // fn's own doc comment for why an unrecognized value fails open to
+        // the historical default rather than erroring.
+        _ => WordOrder::LowHigh,
+    }
+}
+
+/// Build [`ensure_connection`][SessionDirectory::ensure_connection]'s
+/// [`SlmpConfig`] from `conn` - factored out of that method so
+/// `word_order_reflects_the_connections_own_setting_not_the_default` below
+/// can exercise the field mapping directly, without spawning a real broker
+/// task or dialing a socket. `port` is taken pre-validated (already an
+/// [`Result::Ok`] `u16` by the time the caller has one) rather than
+/// re-deriving it from `conn.port` here, matching that caller's existing
+/// order of operations.
+fn slmp_config_for(conn: &PlcConnection, port: u16) -> SlmpConfig {
+    SlmpConfig {
+        host: conn.host.clone(),
+        port,
+        // P3-b (監査指摘 2026-08-12): previously `..SlmpConfig::default()`
+        // alone, which fixed every session to `WordOrder::LowHigh` regardless
+        // of what the connection actually specified - a device needing
+        // `WordOrder::HighLow` would silently get byte-swapped u32/f32 values
+        // with no error anywhere. See `parse_word_order`'s doc comment for
+        // the fallback this now goes through.
+        word_order: parse_word_order(&conn.word_order),
+        ..SlmpConfig::default()
+    }
+}
 
 /// Default channel depth for one connection's job queue. Generous relative to
 /// the request sizes either consuming app deals with per cycle; the
@@ -577,11 +622,7 @@ impl SessionDirectory {
             return Ok(handle.clone());
         }
 
-        let config = SlmpConfig {
-            host: conn.host.clone(),
-            port,
-            ..SlmpConfig::default()
-        };
+        let config = slmp_config_for(conn, port);
         let (handle, task) =
             spawn_task(conn.id, config, self.backoff, self.shutdown_tx.subscribe());
         handles.insert(conn.id, handle.clone());
@@ -1059,6 +1100,8 @@ mod tests {
             unit_id: 1,
             enabled: true,
             simulation: false,
+
+            word_order: "low_high".to_string(),
         }
     }
 
@@ -1166,6 +1209,72 @@ mod tests {
         }
         // 1 + 2 + 4 + 8 + 16 + 30 + 30 = 91s of virtual time, instantly.
         assert_eq!(start.elapsed(), Duration::from_secs(91));
+    }
+
+    // -----------------------------------------------------------------
+    // P3-b (監査指摘 2026-08-12): word_order wiring - `slmp_config_for` must
+    // reflect the connection's own `word_order`, not silently fix every
+    // session to `SlmpConfig::default()`'s `WordOrder::LowHigh`.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_word_order_maps_both_allowed_strings() {
+        assert_eq!(parse_word_order("low_high"), WordOrder::LowHigh);
+        assert_eq!(parse_word_order("high_low"), WordOrder::HighLow);
+    }
+
+    /// Defense-in-depth path (this fn's own doc comment): a value that could
+    /// only reach here via a hand-edited or pre-migration-0010 database row
+    /// fails open to the historical default rather than panicking or
+    /// erroring.
+    #[test]
+    fn parse_word_order_falls_back_to_low_high_for_anything_unrecognized() {
+        assert_eq!(parse_word_order("middle_endian"), WordOrder::LowHigh);
+        assert_eq!(parse_word_order(""), WordOrder::LowHigh);
+    }
+
+    /// The regression test for the audit finding itself: `slmp_config_for`
+    /// must carry the connection's own `word_order` into the `SlmpConfig` it
+    /// builds, not the old `..SlmpConfig::default()`-only shape that fixed
+    /// every session to `WordOrder::LowHigh` regardless of what the
+    /// connection specified.
+    #[test]
+    fn word_order_reflects_the_connections_own_setting_not_the_default() {
+        let mut c = conn(1, "slmp", "127.0.0.1", 5007);
+
+        c.word_order = "high_low".to_string();
+        assert_eq!(
+            slmp_config_for(&c, 5007).word_order,
+            WordOrder::HighLow,
+            "a connection asking for high_low must not silently get the default"
+        );
+
+        c.word_order = "low_high".to_string();
+        assert_eq!(slmp_config_for(&c, 5007).word_order, WordOrder::LowHigh);
+    }
+
+    /// Every other [`SlmpConfig`] field `slmp_config_for` does not set stays
+    /// exactly [`SlmpConfig::default`]'s value - the "known limitation" this
+    /// module's fix deliberately did not expand (CPU series, access route,
+    /// timers; see the P3-b task's own report for why). Pins that scope so a
+    /// future edit to this function does not silently widen it.
+    #[test]
+    fn slmp_config_for_only_overrides_host_port_and_word_order() {
+        let c = conn(1, "slmp", "10.0.0.5", 5007);
+        let config = slmp_config_for(&c, 5007);
+        let default = SlmpConfig::default();
+        assert_eq!(config.host, "10.0.0.5");
+        assert_eq!(config.port, 5007);
+        assert_eq!(config.word_order, WordOrder::LowHigh);
+        assert_eq!(config.cpu, default.cpu);
+        assert_eq!(config.connect_timeout, default.connect_timeout);
+        assert_eq!(config.response_timeout, default.response_timeout);
+        assert_eq!(config.network_id, default.network_id);
+        assert_eq!(config.pc_id, default.pc_id);
+        assert_eq!(config.io_id, default.io_id);
+        assert_eq!(config.area_id, default.area_id);
+        assert_eq!(config.serial_id, default.serial_id);
+        assert_eq!(config.cpu_timer, default.cpu_timer);
     }
 
     // -----------------------------------------------------------------

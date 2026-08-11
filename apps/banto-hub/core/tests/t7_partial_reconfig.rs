@@ -99,6 +99,8 @@ fn conn_input(name: &str, port: u16) -> PlcConnectionInput {
         unit_id: 1,
         enabled: true,
         simulation: false,
+
+        word_order: "low_high".to_string(),
     }
 }
 
@@ -118,6 +120,8 @@ fn virtual_conn_input(name: &str) -> PlcConnectionInput {
         unit_id: 1,
         enabled: true,
         simulation: false,
+
+        word_order: "low_high".to_string(),
     }
 }
 
