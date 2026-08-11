@@ -621,8 +621,16 @@ START / STOP）を追記。`install`/`uninstall` 本体は
 [`service_install.rs`](../apps/banto-hub/core/src/service_install.rs) へ
 移設し、`win_service` と elev の双方から呼ぶ。
 
-未了: Operators メンバーでの start/stop 実機受け入れ、T16-2 への
-`can_operate_service` 配線、NSIS からの elev 呼び出し。
+**完了（下記実機検証で確認済み）**: Operators メンバーでの start/stop 実機受け入れ
+（「Windows 実機検証」表・「Operators 委任」節参照）、T16-2 への
+`can_operate_service` 配線（`apps/banto-hub/src-tauri/src/lib.rs` の
+`AppState::can_operate_service`、T16-2 第二スライスで Operators **または**
+Administrators 判定へ拡張、`host_switch.rs`/`host_switch_ipc.rs`・
+トレイ操作可否ゲートへ配線済み。詳細は
+[banto-hub-t16-design.md](banto-hub-t16-design.md) §3）。
+
+未了: NSIS（`apps/banto-hub/installer/`）からの `banto-hub-elev.exe` 呼び出し
+統合（インストーラフックに elev 起動処理はまだ無い）。
 
 ### Windows 実機検証（2026-08-10、管理者 Cursor）
 
