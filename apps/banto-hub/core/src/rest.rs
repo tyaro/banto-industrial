@@ -3603,18 +3603,46 @@ async fn pending_changes_apply(
     State(state): State<PendingChangesAdminState>,
     headers: HeaderMap,
     Path(id): Path<i64>,
-) -> Result<Json<PendingChange>, PendingApplyError> {
+) -> Response {
     let _guard = state.apply_lock.lock().await;
-    let applying = state.pending_changes.start_applying(id).await?;
+    let applying = match state.pending_changes.start_applying(id).await {
+        Ok(applying) => applying,
+        Err(err) => return ApiError(err).into_response(),
+    };
 
     if let Err(err) = execute_pending_apply(&state, &applying).await {
-        if let Err(mark_err) = state.pending_changes.mark_failed(id, &err.reason()).await {
-            eprintln!("banto-hub: pending_change={id} の failed 遷移に失敗しました: {mark_err}");
-        }
-        return Err(err);
+        let failure_reason = err.reason();
+        let failed = match state.pending_changes.mark_failed(id, &failure_reason).await {
+            Ok(failed) => Some(failed),
+            Err(mark_err) => {
+                eprintln!(
+                    "banto-hub: pending_change={id} の failed 遷移に失敗しました: {mark_err}"
+                );
+                None
+            }
+        };
+
+        return match err {
+            PendingApplyError::CollectionEditLocked(status) => (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "collection_edit_locked",
+                    "state": status.state,
+                    "status": status,
+                    "message": "収集中は構成を編集できません。停止してから再試行してください。",
+                    "failureReason": failure_reason,
+                    "pending": failed,
+                })),
+            )
+                .into_response(),
+            PendingApplyError::Api(err) => err.into_response(),
+        };
     }
 
-    let applied = state.pending_changes.mark_applied(id).await?;
+    let applied = match state.pending_changes.mark_applied(id).await {
+        Ok(applied) => applied,
+        Err(err) => return ApiError(err).into_response(),
+    };
     record_write(
         &state.audit,
         &state.auth,
@@ -3625,7 +3653,7 @@ async fn pending_changes_apply(
         Some(json!({ "source": applying.source })),
     )
     .await;
-    Ok(Json(applied))
+    Json(applied).into_response()
 }
 
 fn pending_changes_router(
@@ -7282,6 +7310,8 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"], "collection_edit_locked");
+        assert!(body["failureReason"].is_string());
+        assert_eq!(body["pending"]["state"], "failed");
 
         let pending = PendingChangesService::new(env.pool.clone())
             .get(pending_id)
