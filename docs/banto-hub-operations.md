@@ -180,6 +180,15 @@ MQTT publish は banto-hub が**外部ブローカーへ接続しに行くクラ
 失効（`revoke`）は不可逆です。誤って失効させても復元はできないため、
 必ず新しいキーを発行し直してクライアント側の設定を更新してください。
 
+### API ドキュメント（Swagger UI、2026-08-12 追加）
+
+`http://<host>:<port>/api/v1/swagger-ui/` にアクセスすると、`/api/v1/*`
+（タグ空間 API）の Swagger UI が開きます。認証不要（スキーマ自体は秘密で
+はないため、`GET /api/v1/openapi.json` と同じ扱い）ですが、実際にリクエ
+ストを試打する（Try it out）場合は上の API キーを Authorize に入力して
+ください。Swagger UI 本体はバイナリに同梱済みで、閲覧時に外部（CDN 等）
+へは一切アクセスしません。
+
 ## 4. 書き込み受付の運用手順
 
 banto-hub の書き込みは relay-wright のようなルールエンジンを持たず、

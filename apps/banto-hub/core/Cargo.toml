@@ -75,6 +75,10 @@ hex = { workspace = true }
 base64 = { workspace = true }
 # T0-2 / §10-6: /api/v1/openapi.json の自動生成。
 utoipa = { workspace = true }
+# ux-plan.md §5 バックログ（2026-08-12 オーナー決定）: openapi.json を
+# ブラウザで閲覧・試打できる Swagger UI の同梱（rest.rs の
+# `openapi_router` 参照）。
+utoipa-swagger-ui = { workspace = true }
 # T3（docs/tag-server-design.md §5.3）: mqtt.rs の MqttPublisher が使う MQTT
 # クライアント。
 rumqttc = { workspace = true }

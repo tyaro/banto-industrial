@@ -20,8 +20,10 @@
 //!   `crate::api_keys::ApiKeysService` で照合（`read` スコープ必須、
 //!   失効済みなら 401 + audit_log 記録）、それ以外は従来どおり
 //!   `AuthState` のセッション token として照合する（管理 UI からの直接
-//!   利用互換のため）。`GET /api/v1/openapi.json` だけは認証不要 -
-//!   スキーマ自体は秘密ではないため（`openapi_json` 関数の doc comment
+//!   利用互換のため）。`GET /api/v1/openapi.json` と `GET
+//!   /api/v1/swagger-ui/*`（同梱 Swagger UI、ux-plan.md §5・2026-08-12
+//!   オーナー決定）だけは認証不要 - スキーマ自体は秘密ではないため
+//!   （`openapi_json` 関数の doc comment・`openapi_router` の doc comment
 //!   参照）。
 //!
 //! ## I1 CRUD 書き込み後の catalog commit（T14-3）
@@ -80,6 +82,7 @@ use std::str::FromStr;
 use tokio::sync::broadcast;
 use tokio::sync::Mutex as AsyncMutex;
 use utoipa::{OpenApi, ToSchema};
+use utoipa_swagger_ui::{Config, SwaggerUi};
 
 use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService, IssuedApiKey};
 use crate::audit::{AuditEntry, AuditLogService};
@@ -5386,13 +5389,32 @@ fn tag_space_router(
         ))
 }
 
-/// `GET /api/v1/openapi.json` 専用ルーター - 認証層を一切通さない
-/// （`openapi_json`関数の doc comment 参照）。`profile_id`はこの Hub
-/// インスタンスが実際に使っている profile-id（呼び出し元
-/// `api_router_with_controller_mode`が`HubConfig::profile_id`をそのまま渡す）。
+/// `GET /api/v1/openapi.json` と `GET /api/v1/swagger-ui/*` 専用ルーター -
+/// 認証層を一切通さない（`openapi_json`関数の doc comment 参照）。
+/// `profile_id`はこの Hub インスタンスが実際に使っている profile-id
+/// （呼び出し元 `api_router_with_controller_mode`が
+/// `HubConfig::profile_id`をそのまま渡す）。
+///
+/// ux-plan.md §5 バックログ「OpenAPI の Swagger UI 同梱」（2026-08-12
+/// オーナー決定）: `/api/v1/swagger-ui` に Swagger UI 本体（HTML/JS/CSS）を
+/// 同梱・マウントする。`openapi.json` 同様**認証不要** - Swagger UI 自体は
+/// 静的アセット＋上の `openapi_json` が返すスキーマの閲覧・試打 UI に
+/// すぎず、秘匿情報を含まないため（`openapi_json` の doc comment と同じ
+/// 判断）。`SwaggerUi::url(...)`は使わない - それだと utoipa-swagger-ui が
+/// **別の** `ApiDoc::openapi()`静的スナップショットを新規ルートとして
+/// 生成してしまい、上の`openapi_json`（`x-banto-hub-profile-id`埋め込み
+/// 済み・状態を持つ）と二重管理になる。代わりに`Config::new([...])`で
+/// Swagger UI のフロントエンド JS に「スキーマは`/api/v1/openapi.json`を
+/// 見に行け」と教えるだけにし、ルートは1本のまま
+/// （`utoipa_swagger_ui::Config::new`は fetch 先 URL の設定のみで、それ自体は
+/// ルートを追加しない）。アセットは`vendored` feature
+/// （`utoipa-swagger-ui-vendored`、workspace Cargo.toml 参照）でバイナリに
+/// 同梱済み - ビルド時・実行時ともに外部ネットワーク（CDN 含む）へ
+/// 一切アクセスしない。
 fn openapi_router(profile_id: String) -> Router {
     Router::new()
         .route("/api/v1/openapi.json", get(openapi_json))
+        .merge(SwaggerUi::new("/api/v1/swagger-ui").config(Config::new(["/api/v1/openapi.json"])))
         .with_state(OpenApiState { profile_id })
 }
 
@@ -6375,6 +6397,75 @@ mod tests {
         assert_eq!(
             json["info"]["x-banto-hub-profile-id"],
             serde_json::json!(crate::profile_paths::DEFAULT_PROFILE_ID)
+        );
+    }
+
+    /// `GET /api/v1/swagger-ui/`（末尾スラッシュあり）は認証不要で 200 の
+    /// Swagger UI HTML を返し、それが読み込む `swagger-initializer.js`
+    /// （同じく認証不要）が `/api/v1/openapi.json` を指すよう設定されている
+    /// （`openapi_router` の doc comment、ux-plan.md §5「OpenAPI の
+    /// Swagger UI 同梱」）。`Config`の urls はテンプレート
+    /// `swagger-initializer.js`側に埋め込まれる実装（`index.html`自体には
+    /// 現れない - utoipa-swagger-ui の`format_config`）ため、2ファイルに
+    /// 分けて確認する。末尾スラッシュ無しは 301/308 でスラッシュ有りへ
+    /// redirect される（utoipa-swagger-ui の axum 統合の既定挙動）。
+    #[tokio::test]
+    async fn swagger_ui_is_public_and_references_openapi_json() {
+        let env = test_env().await;
+
+        let redirect = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::get("/api/v1/swagger-ui")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            redirect.status().is_redirection(),
+            "expected redirect, got {}",
+            redirect.status()
+        );
+
+        let index_response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::get("/api/v1/swagger-ui/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(index_response.status(), StatusCode::OK);
+        let index_bytes = axum::body::to_bytes(index_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let index_html = String::from_utf8(index_bytes.to_vec()).unwrap();
+        assert!(
+            index_html.contains("swagger-initializer.js"),
+            "swagger-ui index.html should load swagger-initializer.js"
+        );
+
+        let init_response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/v1/swagger-ui/swagger-initializer.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(init_response.status(), StatusCode::OK);
+        let init_bytes = axum::body::to_bytes(init_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let init_js = String::from_utf8(init_bytes.to_vec()).unwrap();
+        assert!(
+            init_js.contains("/api/v1/openapi.json"),
+            "swagger-initializer.js should be configured to fetch /api/v1/openapi.json"
         );
     }
 

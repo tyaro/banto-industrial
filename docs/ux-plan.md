@@ -314,7 +314,14 @@ retain`（`TagInput` の全フィールドと1:1対応、`collectionGroupId` だ
   ChronoGazer の領分 — スコープの護りに注意）
 - イベント一覧画面（`/api/v1/events` の UI）
 - 管理 UI からの手動書き込み（設計 §6-8 の将来スライス）
-- OpenAPI の Swagger UI 同梱（`banto-tagclient` SDK の手前の一手）
+- ~~OpenAPI の Swagger UI 同梱（`banto-tagclient` SDK の手前の一手）~~ →
+  **実装済み（2026-08-12）**。`utoipa-swagger-ui`（`vendored` feature、
+  ビルド時・実行時とも外部ネットワーク不要）を `GET /api/v1/swagger-ui/`
+  にマウントし、`GET /api/v1/openapi.json`（既存・認証不要）を参照するよう
+  設定した。認証不要な理由は同エンドポイントと同じ（`rest.rs`の
+  `openapi_router` doc comment 参照）。運用手順は
+  [banto-hub-operations.md §3](banto-hub-operations.md#3-api-キー運用)
+  に追記。
 
 ## 6. 運用
 
