@@ -239,6 +239,121 @@ impl PendingChangesService {
             "pending 状態以外の提案はキャンセルできません".to_string(),
         ))
     }
+
+    pub async fn start_applying(&self, id: i64) -> Result<PendingChange, BantoError> {
+        let row: Option<PendingRow> = sqlx::query_as(
+            "UPDATE pending_changes
+             SET
+               state = ?,
+               failure_reason = NULL,
+               updated_at = datetime('now')
+             WHERE id = ? AND state = ?
+             RETURNING
+               id,
+               state,
+               source,
+               payload,
+               base_configured_revision,
+               created_at,
+               updated_at,
+               requested_by_username,
+               requested_by_role,
+               failure_reason",
+        )
+        .bind(PendingChangeState::Applying.as_str())
+        .bind(id)
+        .bind(PendingChangeState::Pending.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(banto_storage::storage_error)?;
+
+        if let Some(row) = row {
+            return row_to_pending(row);
+        }
+
+        let current = self.get(id).await?;
+        Err(BantoError::Other(format!(
+            "pending 状態以外の提案は適用開始できません(state={})",
+            current.state.as_str()
+        )))
+    }
+
+    pub async fn mark_applied(&self, id: i64) -> Result<PendingChange, BantoError> {
+        let row: Option<PendingRow> = sqlx::query_as(
+            "UPDATE pending_changes
+             SET
+               state = ?,
+               failure_reason = NULL,
+               updated_at = datetime('now')
+             WHERE id = ? AND state = ?
+             RETURNING
+               id,
+               state,
+               source,
+               payload,
+               base_configured_revision,
+               created_at,
+               updated_at,
+               requested_by_username,
+               requested_by_role,
+               failure_reason",
+        )
+        .bind(PendingChangeState::Applied.as_str())
+        .bind(id)
+        .bind(PendingChangeState::Applying.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(banto_storage::storage_error)?;
+
+        if let Some(row) = row {
+            return row_to_pending(row);
+        }
+
+        let current = self.get(id).await?;
+        Err(BantoError::Other(format!(
+            "applying 状態以外の提案は適用完了にできません(state={})",
+            current.state.as_str()
+        )))
+    }
+
+    pub async fn mark_failed(&self, id: i64, reason: &str) -> Result<PendingChange, BantoError> {
+        let row: Option<PendingRow> = sqlx::query_as(
+            "UPDATE pending_changes
+             SET
+               state = ?,
+               failure_reason = ?,
+               updated_at = datetime('now')
+             WHERE id = ? AND state = ?
+             RETURNING
+               id,
+               state,
+               source,
+               payload,
+               base_configured_revision,
+               created_at,
+               updated_at,
+               requested_by_username,
+               requested_by_role,
+               failure_reason",
+        )
+        .bind(PendingChangeState::Failed.as_str())
+        .bind(reason)
+        .bind(id)
+        .bind(PendingChangeState::Applying.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(banto_storage::storage_error)?;
+
+        if let Some(row) = row {
+            return row_to_pending(row);
+        }
+
+        let current = self.get(id).await?;
+        Err(BantoError::Other(format!(
+            "applying 状態以外の提案は失敗扱いにできません(state={})",
+            current.state.as_str()
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -322,5 +437,35 @@ mod tests {
 
         let canceled_again = svc.cancel_pending(created.id).await.unwrap();
         assert_eq!(canceled_again.state, PendingChangeState::Canceled);
+    }
+
+    #[tokio::test]
+    async fn applying_state_transitions_are_strict() {
+        let svc = service().await;
+        let created = svc
+            .create_pending(
+                "tags.create",
+                &serde_json::json!({ "name": "strict" }),
+                5,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let applying = svc.start_applying(created.id).await.unwrap();
+        assert_eq!(applying.state, PendingChangeState::Applying);
+
+        let failed = svc
+            .mark_failed(created.id, "simulated failure")
+            .await
+            .unwrap();
+        assert_eq!(failed.state, PendingChangeState::Failed);
+        assert_eq!(failed.failure_reason.as_deref(), Some("simulated failure"));
+
+        let err = svc.start_applying(created.id).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("pending 状態以外の提案は適用開始できません"));
     }
 }

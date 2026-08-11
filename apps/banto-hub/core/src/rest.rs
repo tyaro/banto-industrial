@@ -3283,6 +3283,14 @@ async fn tags_delete(
 #[derive(Clone)]
 struct PendingChangesAdminState {
     pending_changes: PendingChangesService,
+    plc_connections: PlcConnectionService,
+    collection_groups: CollectionGroupService,
+    tags: TagService,
+    manager: Arc<CollectorManager>,
+    controller: Arc<CollectionController>,
+    events: broadcast::Sender<ServerEvent>,
+    apply_lock: Arc<AsyncMutex<()>>,
+    legacy_live_reconfigure: bool,
     auth: AuthState,
     audit: AuditLogService,
 }
@@ -3290,6 +3298,271 @@ struct PendingChangesAdminState {
 #[derive(Debug, Deserialize)]
 struct PendingChangesQuery {
     limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PendingChangeWithInput<T> {
+    input: T,
+}
+
+#[derive(Debug, Deserialize)]
+struct PendingChangeWithId {
+    id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct PendingChangeWithIdAndInput<T> {
+    id: i64,
+    input: T,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingBatchTagsPayload {
+    #[serde(default)]
+    dry_run: bool,
+    tags: Vec<TagPayload>,
+}
+
+enum PendingApplyError {
+    Api(ApiError),
+    CollectionEditLocked(CollectionStatusResponse),
+}
+
+impl From<ApiError> for PendingApplyError {
+    fn from(value: ApiError) -> Self {
+        Self::Api(value)
+    }
+}
+
+impl From<BantoError> for PendingApplyError {
+    fn from(value: BantoError) -> Self {
+        Self::Api(ApiError(value))
+    }
+}
+
+impl PendingApplyError {
+    fn reason(&self) -> String {
+        match self {
+            Self::Api(_) => "pending change の適用に失敗しました".to_string(),
+            Self::CollectionEditLocked(status) => {
+                format!("収集中は構成を編集できません(state={})", status.state)
+            }
+        }
+    }
+}
+
+impl IntoResponse for PendingApplyError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Api(err) => err.into_response(),
+            Self::CollectionEditLocked(status) => (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "collection_edit_locked",
+                    "state": status.state,
+                    "status": status,
+                    "message": "収集中は構成を編集できません。停止してから再試行してください。"
+                })),
+            )
+                .into_response(),
+        }
+    }
+}
+
+fn decode_pending_payload<T: serde::de::DeserializeOwned>(
+    pending: &PendingChange,
+) -> Result<T, PendingApplyError> {
+    serde_json::from_value(pending.payload.clone()).map_err(|err| {
+        PendingApplyError::Api(preflight_api_error(format!(
+            "pending payload の形式が不正です(source={}): {err}",
+            pending.source
+        )))
+    })
+}
+
+async fn execute_pending_apply(
+    state: &PendingChangesAdminState,
+    pending: &PendingChange,
+) -> Result<(), PendingApplyError> {
+    let status = state.controller.status();
+    if status.state != CollectionState::Stopped {
+        return Err(PendingApplyError::CollectionEditLocked(status.into()));
+    }
+
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)
+        .map_err(PendingApplyError::Api)?;
+
+    let resource = match pending.source.as_str() {
+        "plc_connections.create" => {
+            let body: PendingChangeWithInput<PlcConnectionPayload> =
+                decode_pending_payload(pending)?;
+            state
+                .plc_connections
+                .create_tx(&mut tx, body.input.into())
+                .await
+                .map_err(ApiError)
+                .map_err(PendingApplyError::Api)?;
+            "plc_connections"
+        }
+        "plc_connections.update" => {
+            let body: PendingChangeWithIdAndInput<PlcConnectionPayload> =
+                decode_pending_payload(pending)?;
+            state
+                .plc_connections
+                .update_tx(&mut tx, body.id, body.input.into())
+                .await
+                .map_err(ApiError)
+                .map_err(PendingApplyError::Api)?;
+            "plc_connections"
+        }
+        "plc_connections.delete" => {
+            let body: PendingChangeWithId = decode_pending_payload(pending)?;
+            state
+                .plc_connections
+                .delete_tx(&mut tx, body.id)
+                .await
+                .map_err(ApiError)
+                .map_err(PendingApplyError::Api)?;
+            "plc_connections"
+        }
+        "collection_groups.create" => {
+            let body: PendingChangeWithInput<CollectionGroupPayload> =
+                decode_pending_payload(pending)?;
+            state
+                .collection_groups
+                .create_tx(&mut tx, body.input.into())
+                .await
+                .map_err(ApiError)
+                .map_err(PendingApplyError::Api)?;
+            "collection_groups"
+        }
+        "collection_groups.update" => {
+            let body: PendingChangeWithIdAndInput<CollectionGroupPayload> =
+                decode_pending_payload(pending)?;
+            state
+                .collection_groups
+                .update_tx(&mut tx, body.id, body.input.into())
+                .await
+                .map_err(ApiError)
+                .map_err(PendingApplyError::Api)?;
+            "collection_groups"
+        }
+        "collection_groups.delete" => {
+            let body: PendingChangeWithId = decode_pending_payload(pending)?;
+            state
+                .collection_groups
+                .delete_tx(&mut tx, body.id)
+                .await
+                .map_err(ApiError)
+                .map_err(PendingApplyError::Api)?;
+            "collection_groups"
+        }
+        "tags.create" => {
+            let body: PendingChangeWithInput<TagPayload> = decode_pending_payload(pending)?;
+            state
+                .tags
+                .create_tx(&mut tx, body.input.into())
+                .await
+                .map_err(ApiError)
+                .map_err(PendingApplyError::Api)?;
+            "tags"
+        }
+        "tags.update" => {
+            let body: PendingChangeWithIdAndInput<TagPayload> = decode_pending_payload(pending)?;
+            state
+                .tags
+                .update_tx(&mut tx, body.id, body.input.into())
+                .await
+                .map_err(|err| match err {
+                    TagUpdateError::Banto(error) => PendingApplyError::Api(ApiError(error)),
+                    TagUpdateError::RevisionConflict(_) => PendingApplyError::Api(ApiError(
+                        BantoError::Validation {
+                            field_errors: vec![FieldError {
+                                field: "expectedRevision".to_string(),
+                                message: "他のクライアントがこのタグを更新済みです。再読込してから再試行してください。"
+                                    .to_string(),
+                            }],
+                        },
+                    )),
+                })?;
+            "tags"
+        }
+        "tags.delete" => {
+            let body: PendingChangeWithId = decode_pending_payload(pending)?;
+            state
+                .tags
+                .delete_tx(&mut tx, body.id)
+                .await
+                .map_err(ApiError)
+                .map_err(PendingApplyError::Api)?;
+            "tags"
+        }
+        "tags.batch_create" => {
+            let body: PendingBatchTagsPayload = decode_pending_payload(pending)?;
+            if body.dry_run {
+                return Err(PendingApplyError::Api(preflight_api_error(
+                    "pending の tags.batch_create は dryRun=false のみ対応です".to_string(),
+                )));
+            }
+            let inputs: Vec<TagInput> = body.tags.into_iter().map(Into::into).collect();
+            let outcome = state
+                .tags
+                .create_batch_tx(&mut tx, &inputs)
+                .await
+                .map_err(ApiError)
+                .map_err(PendingApplyError::Api)?;
+            if let BatchTagOutcome::Invalid(errors) = outcome {
+                let field_errors = errors
+                    .into_iter()
+                    .flat_map(|row| {
+                        row.field_errors.into_iter().map(move |field| FieldError {
+                            field: format!("tags[{}].{}", row.index, field.field),
+                            message: field.message,
+                        })
+                    })
+                    .collect();
+                return Err(PendingApplyError::Api(ApiError(BantoError::Validation {
+                    field_errors,
+                })));
+            }
+            "tags"
+        }
+        other => {
+            return Err(PendingApplyError::Api(preflight_api_error(format!(
+                "未対応の pending source です: {other}"
+            ))));
+        }
+    };
+
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(PendingApplyError::Api(err));
+        }
+    };
+
+    if let Err(err) = tx.commit().await {
+        return Err(PendingApplyError::Api(storage_api_error(err)));
+    }
+
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.controller,
+        &state.events,
+        resource,
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
+
+    Ok(())
 }
 
 async fn pending_changes_list(
@@ -3326,19 +3599,67 @@ async fn pending_changes_cancel(
     Ok(Json(pending))
 }
 
+async fn pending_changes_apply(
+    State(state): State<PendingChangesAdminState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<PendingChange>, PendingApplyError> {
+    let _guard = state.apply_lock.lock().await;
+    let applying = state.pending_changes.start_applying(id).await?;
+
+    if let Err(err) = execute_pending_apply(&state, &applying).await {
+        if let Err(mark_err) = state.pending_changes.mark_failed(id, &err.reason()).await {
+            eprintln!("banto-hub: pending_change={id} の failed 遷移に失敗しました: {mark_err}");
+        }
+        return Err(err);
+    }
+
+    let applied = state.pending_changes.mark_applied(id).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "apply",
+        "pending_changes",
+        &id.to_string(),
+        Some(json!({ "source": applying.source })),
+    )
+    .await;
+    Ok(Json(applied))
+}
+
 fn pending_changes_router(
     pending_changes: PendingChangesService,
+    plc_connections: PlcConnectionService,
+    collection_groups: CollectionGroupService,
+    tags: TagService,
     audit: AuditLogService,
     auth: AuthState,
+    manager: Arc<CollectorManager>,
+    controller: Arc<CollectionController>,
+    events: broadcast::Sender<ServerEvent>,
+    legacy_live_reconfigure: bool,
 ) -> Router {
     let state = PendingChangesAdminState {
         pending_changes,
+        plc_connections,
+        collection_groups,
+        tags,
+        manager,
+        controller,
+        events,
+        apply_lock: Arc::new(AsyncMutex::new(())),
+        legacy_live_reconfigure,
         auth: auth.clone(),
         audit: audit.clone(),
     };
     Router::new()
         .route("/api/pending-changes", get(pending_changes_list))
         .route("/api/pending-changes/{id}", get(pending_changes_get))
+        .route(
+            "/api/pending-changes/{id}/apply",
+            post(pending_changes_apply),
+        )
         .route(
             "/api/pending-changes/{id}/cancel",
             post(pending_changes_cancel),
@@ -4976,9 +5297,9 @@ fn api_router_with_controller_mode(
             manager.clone(),
         ))
         .merge(tag_registry_router(
-            plc_connections,
-            collection_groups,
-            tags,
+            plc_connections.clone(),
+            collection_groups.clone(),
+            tags.clone(),
             pending_changes.clone(),
             audit.clone(),
             auth.clone(),
@@ -4989,8 +5310,15 @@ fn api_router_with_controller_mode(
         ))
         .merge(pending_changes_router(
             pending_changes,
+            plc_connections,
+            collection_groups,
+            tags,
             audit.clone(),
             auth.clone(),
+            manager.clone(),
+            controller.clone(),
+            events.clone(),
+            legacy_live_reconfigure,
         ))
         .merge(write_control_router(
             write_control.clone(),
@@ -6762,5 +7090,209 @@ mod tests {
 
         let current = pending_changes.get(pending.id).await.unwrap();
         assert_eq!(current.state, PendingChangeState::Canceled);
+    }
+
+    #[tokio::test]
+    async fn pending_changes_apply_endpoint_applies_queued_tags_create() {
+        let env = test_env().await;
+
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line-apply", "host": "127.0.0.1", "port": 15023 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+
+        let (status, group) = admin_post(
+            &env.router,
+            "/api/collection-groups",
+            &env.admin_token,
+            json!({ "name": "fast", "plcConnectionId": conn["id"], "periodMs": 100 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{group:?}");
+
+        let start = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/start")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        let queued = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/tags")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "temp-apply-01",
+                            "collectionGroupId": group["id"],
+                            "address": "40001",
+                            "dataType": "i16"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued.status(), StatusCode::ACCEPTED);
+        let queued_bytes = axum::body::to_bytes(queued.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let queued_body: serde_json::Value = serde_json::from_slice(&queued_bytes).unwrap();
+        let pending_id = queued_body["pending"]["id"]
+            .as_i64()
+            .expect("pending id should exist");
+
+        let stop = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/stop")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop.status(), StatusCode::OK);
+
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{pending_id}/apply"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["state"], "applied");
+
+        let pending = PendingChangesService::new(env.pool.clone())
+            .get(pending_id)
+            .await
+            .unwrap();
+        assert_eq!(pending.state, PendingChangeState::Applied);
+    }
+
+    #[tokio::test]
+    async fn pending_changes_apply_while_running_returns_409_and_keeps_queue_row() {
+        let env = test_env().await;
+
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line-apply-running", "host": "127.0.0.1", "port": 15024 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+
+        let (status, group) = admin_post(
+            &env.router,
+            "/api/collection-groups",
+            &env.admin_token,
+            json!({ "name": "fast", "plcConnectionId": conn["id"], "periodMs": 100 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{group:?}");
+
+        let start = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/start")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        let queued = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/tags")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "temp-apply-running-01",
+                            "collectionGroupId": group["id"],
+                            "address": "40001",
+                            "dataType": "i16"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued.status(), StatusCode::ACCEPTED);
+        let queued_bytes = axum::body::to_bytes(queued.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let queued_body: serde_json::Value = serde_json::from_slice(&queued_bytes).unwrap();
+        let pending_id = queued_body["pending"]["id"]
+            .as_i64()
+            .expect("pending id should exist");
+
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{pending_id}/apply"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "collection_edit_locked");
+
+        let pending = PendingChangesService::new(env.pool.clone())
+            .get(pending_id)
+            .await
+            .unwrap();
+        assert_eq!(pending.state, PendingChangeState::Failed);
+
+        let queued_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_changes")
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+        assert_eq!(queued_count, 1);
     }
 }
