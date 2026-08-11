@@ -15,7 +15,7 @@ import {
 	type Tag,
 	type TagInput
 } from './tagRegistryAdmin';
-import { getGrpcSettings, saveGrpcSettings, type GrpcSettings } from './grpcSettingsAdmin';
+import { getGrpcSettings, saveGrpcSettings } from './grpcSettingsAdmin';
 import { getMqttSettings, saveMqttSettings, type MqttSettings } from './mqttSettingsAdmin';
 import {
 	buildConfigPackage,

@@ -37,7 +37,7 @@ test.describe.serial('banto-hub smoke', () => {
 		// login/+page.svelte がセットアップフォームを描画する（ログイン
 		// フォームではない）。
 		await expect(page.getByRole('heading', { name: 'banto-hub' })).toBeVisible();
-		await expect(page.getByText('初回起動です')).toBeVisible();
+		await expect(page.getByRole('button', { name: 'アカウントを作成' })).toBeVisible();
 
 		await page.getByLabel('表示名').fill(HUB_ADMIN_DISPLAY_NAME);
 		await page.getByLabel('ユーザー名').fill(HUB_ADMIN_USERNAME);

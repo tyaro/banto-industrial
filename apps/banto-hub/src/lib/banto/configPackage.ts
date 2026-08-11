@@ -23,7 +23,7 @@ export const CONFIG_PACKAGE_EXCLUDED_SECRETS = [
 	'history'
 ] as const;
 
-export interface ConfigPackagePlcConnection extends PlcConnectionInput {}
+export type ConfigPackagePlcConnection = PlcConnectionInput;
 
 export interface ConfigPackageCollectionGroup extends Omit<
 	CollectionGroupInput,
@@ -179,10 +179,6 @@ function ensureUniqueNames<T extends { name: string }>(items: readonly T[], path
 		}
 		seen.add(item.name);
 	}
-}
-
-function uniqueWarnings(items: readonly string[]): string[] {
-	return [...new Set(items)];
 }
 
 function filterVirtualConnections(connections: readonly PlcConnection[]): PlcConnection[] {

@@ -3656,6 +3656,7 @@ async fn pending_changes_apply(
     Json(applied).into_response()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pending_changes_router(
     pending_changes: PendingChangesService,
     plc_connections: PlcConnectionService,
