@@ -1127,9 +1127,7 @@ pub(crate) fn run_host_switch(app: &AppHandle, command: SwitchCommand) {
     let mut engine = HostSwitchEngine::new(
         manager,
         probe,
-        ShellDesktopControl {
-            app: app.clone(),
-        },
+        ShellDesktopControl { app: app.clone() },
         HostSwitchConfig {
             expected_profile: target.profile_id.clone(),
             expected_port: target.port,

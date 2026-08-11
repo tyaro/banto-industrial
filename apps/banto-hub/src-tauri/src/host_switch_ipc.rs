@@ -19,9 +19,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
-use crate::{AppState, ShellView};
 #[cfg(windows)]
 use crate::{build_service_manager, run_host_switch};
+use crate::{AppState, ShellView};
 #[cfg(windows)]
 use banto_hub_core::host_switch::SwitchCommand;
 #[cfg(windows)]
@@ -192,10 +192,7 @@ pub fn switch_to_desktop(app: AppHandle, state: State<'_, AppState>) -> Result<(
 
 /// 自動起動の ON/OFF。UAC 経由で `banto-hub-elev.exe` を起動する。
 #[tauri::command]
-pub fn set_service_autostart(
-    state: State<'_, AppState>,
-    enabled: bool,
-) -> Result<(), String> {
+pub fn set_service_autostart(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
     if !state.can_operate_service {
         return Err("サービス操作の権限がありません（BantoHub Operators または管理者）".into());
     }
