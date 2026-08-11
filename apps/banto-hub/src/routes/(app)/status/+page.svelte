@@ -14,6 +14,13 @@
 	 * 実装指示でも明示的にスコープ外）。
 	 */
 	import { isProviderError } from '@banto/admin-core';
+	import {
+		applyPendingChange,
+		cancelPendingChange,
+		isPendingApplyConflictError,
+		listPendingChanges,
+		type PendingChange
+	} from '$lib/banto/pendingChangesAdmin';
 	import { toastStore } from '$lib/toast.svelte';
 	import { sessionStore } from '$lib/session.svelte';
 	import { isAdmin } from '$lib/permissions';
@@ -51,6 +58,7 @@
 	const POLL_INTERVAL_MS = 3000;
 
 	function errorMessage(err: unknown): string {
+		if (isPendingApplyConflictError(err)) return err.failureReason ?? err.message;
 		return isProviderError(err) ? err.message : String(err);
 	}
 
@@ -91,14 +99,20 @@
 		return new Date(epochMs).toLocaleString('ja-JP');
 	}
 
+	function formatDateTime(value: string): string {
+		return new Date(value).toLocaleString('ja-JP');
+	}
+
 	function formatValue(entry: ValueEntry): string {
 		return entry.v === null ? '-' : String(entry.v);
 	}
 
 	let status: StatusResponse | null = $state(null);
 	let values: ValuesResponse | null = $state(null);
+	let pendingChanges = $state<PendingChange[]>([]);
 	let loading = $state(true);
 	let lastErrorShownAt = 0;
+	let pendingActionId = $state<number | null>(null);
 
 	// 連続失敗（サーバー停止中など）でトーストが3秒毎に積み上がらないよう、
 	// 直近のエラー表示から一定時間は再表示を抑制する。
@@ -106,9 +120,14 @@
 
 	async function poll(): Promise<void> {
 		try {
-			const [nextStatus, nextValues] = await Promise.all([getHubStatus(), getHubValues()]);
+			const [nextStatus, nextValues, nextPending] = await Promise.all([
+				getHubStatus(),
+				getHubValues(),
+				hubAdmin ? listPendingChanges() : Promise.resolve<PendingChange[]>([])
+			]);
 			status = nextStatus;
 			values = nextValues;
+			pendingChanges = nextPending;
 		} catch (err) {
 			const now = Date.now();
 			if (now - lastErrorShownAt > ERROR_TOAST_THROTTLE_MS) {
@@ -128,6 +147,51 @@
 
 	function connectionRowClass(conn: ConnectionStatusEntry): string {
 		return `status-${statusClass(conn.status)}`;
+	}
+
+	function pendingStateLabel(state: PendingChange['state']): string {
+		if (state === 'pending') return '保留中';
+		if (state === 'applying') return '適用中';
+		if (state === 'applied') return '適用済み';
+		if (state === 'canceled') return 'キャンセル済み';
+		if (state === 'failed') return '失敗';
+		return state;
+	}
+
+	function pendingStateClass(state: PendingChange['state']): string {
+		if (state === 'applied') return 'good';
+		if (state === 'failed' || state === 'canceled') return 'bad';
+		if (state === 'applying') return 'warn';
+		return 'stale';
+	}
+
+	async function handleApplyPending(change: PendingChange): Promise<void> {
+		pendingActionId = change.id;
+		try {
+			await applyPendingChange(change.id);
+			toastStore.push('success', `pending change #${change.id} を適用しました`);
+			await poll();
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+			if (isPendingApplyConflictError(err)) {
+				await poll();
+			}
+		} finally {
+			pendingActionId = null;
+		}
+	}
+
+	async function handleCancelPending(change: PendingChange): Promise<void> {
+		pendingActionId = change.id;
+		try {
+			await cancelPendingChange(change.id);
+			toastStore.push('success', `pending change #${change.id} をキャンセルしました`);
+			await poll();
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			pendingActionId = null;
+		}
 	}
 
 	// --- 書き込み受付トグル (T2-4、設計 §6-6、admin 限定) --------------------
@@ -385,6 +449,79 @@
 		</section>
 	{/if}
 
+	{#if hubAdmin}
+		<section>
+			<h2>Pending changes</h2>
+			<p class="note">{pendingChanges.length}件の変更提案があります。</p>
+			{#if pendingChanges.length === 0}
+				<p class="note">保留中の変更はありません。</p>
+			{:else}
+				<div class="table-wrap">
+					<table class="pending-table">
+						<thead>
+							<tr>
+								<th>ID</th>
+								<th>source</th>
+								<th>state</th>
+								<th>requestedByUsername</th>
+								<th>createdAt</th>
+								<th>failureReason</th>
+								<th>操作</th>
+							</tr>
+						</thead>
+						<tbody>
+							{#each pendingChanges as change (change.id)}
+								<tr>
+									<td>#{change.id}</td>
+									<td class="pending-source">{change.source}</td>
+									<td>
+										<span class={`state-chip state-${pendingStateClass(change.state)}`}>
+											{pendingStateLabel(change.state)}
+										</span>
+									</td>
+									<td>{change.requestedByUsername ?? '-'}</td>
+									<td>{formatDateTime(change.createdAt)}</td>
+									<td>
+										{#if change.failureReason}
+											<div class:config-error={change.state === 'failed'} class="pending-failure">
+												{change.failureReason}
+											</div>
+										{:else}
+											-
+										{/if}
+									</td>
+									<td>
+										{#if change.state === 'pending'}
+											<div class="pending-actions">
+												<button
+													type="button"
+													onclick={() => void handleApplyPending(change)}
+													disabled={pendingActionId !== null}
+												>
+													適用
+												</button>
+												<button
+													type="button"
+													class="danger"
+													onclick={() => void handleCancelPending(change)}
+													disabled={pendingActionId !== null}
+												>
+													キャンセル
+												</button>
+											</div>
+										{:else}
+											-
+										{/if}
+									</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+				</div>
+			{/if}
+		</section>
+	{/if}
+
 	<section>
 		<h2>Windows サービス</h2>
 		{#if !localShell}
@@ -579,6 +716,10 @@
 		font-family: var(--banto-font-mono, monospace);
 	}
 
+	.pending-source {
+		font-family: var(--banto-font-mono, monospace);
+	}
+
 	.quality-good {
 		color: var(--banto-text);
 	}
@@ -590,6 +731,70 @@
 
 	.quality-stale {
 		color: var(--banto-text-muted);
+	}
+
+	.state-chip {
+		display: inline-flex;
+		align-items: center;
+		padding: 0.15rem 0.45rem;
+		border-radius: 999px;
+		font-size: 0.78rem;
+		font-weight: 600;
+		border: 1px solid var(--banto-border);
+	}
+
+	.state-good {
+		color: var(--banto-text);
+		background: color-mix(in srgb, var(--banto-primary) 8%, transparent);
+	}
+
+	.state-warn {
+		color: var(--banto-danger);
+		background: color-mix(in srgb, var(--banto-danger) 10%, transparent);
+	}
+
+	.state-bad {
+		color: var(--banto-danger);
+		border-color: color-mix(in srgb, var(--banto-danger) 40%, var(--banto-border));
+		background: color-mix(in srgb, var(--banto-danger) 12%, transparent);
+	}
+
+	.state-stale {
+		color: var(--banto-text-muted);
+	}
+
+	.pending-failure {
+		margin: 0;
+		font-size: 0.8rem;
+		white-space: pre-wrap;
+	}
+
+	.pending-actions {
+		display: flex;
+		gap: 0.4rem;
+		flex-wrap: wrap;
+	}
+
+	.pending-actions button {
+		padding: 0.35rem 0.75rem;
+		border: none;
+		border-radius: var(--banto-radius);
+		background: var(--banto-primary);
+		color: var(--banto-text-inverse);
+		font-weight: 600;
+		cursor: pointer;
+	}
+
+	.pending-actions button:disabled {
+		opacity: 0.6;
+		cursor: not-allowed;
+	}
+
+	.pending-actions button.danger {
+		background: transparent;
+		border: 1px solid var(--banto-danger);
+		color: var(--banto-danger);
+		font-weight: 400;
 	}
 
 	.write-on {
