@@ -2,9 +2,11 @@
 
 作成日: 2026-08-12
 状態: **オーナー承認・実行中**。2026-08-12 に docs 14 文書 + コード + GitHub を全量監査した
-結果を実行順に整理したもの。**進捗（2026-08-12）: Phase 0（#119）・監査フォロー①=stale ガード（#121）・
-②最小対応（#121 同梱）・profile_lock フレーク（#122）・Swagger UI（#124）・P3-a audit retention（#125）
-マージ済み。監査③（稼働中 import ガード）着手中（`claude/import-running-guard`）。次は P3-b → P3-c。**
+結果を実行順に整理したもの。**進捗（2026-08-12）: Phase 0（#119）、監査フォロー①=stale ガード（#121）・
+②最小対応（#121）・③稼働中 import ガード（#126）、profile_lock フレーク（#122）、Swagger UI（#124）、
+P3-a audit retention（#125）、P3-b SLMP word order（#127）マージ済み。A群の自己完結分は完了。残る
+P3-c（H9）は slmp 本体改修が絡む2段構え（オーナーが tyaro/slmp 実装→こちらで banto 側、
+[h9-slmp-structured-error-spec.md](h9-slmp-structured-error-spec.md) 参照）で、slmp 実装待ち。**
 個別スライスの詳細設計は既存の
 [plan.md](plan.md)・[tag-server-design.md](tag-server-design.md)・[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)・
 [banto-hub-t16-design.md](banto-hub-t16-design.md)・[banto-hub-t17-design.md](banto-hub-t17-design.md)・
@@ -14,9 +16,10 @@
 
 ## 0. 前提と現況
 
-- 現 main（`9c61a64`）は本セッションの成果を反映済み: #119（pending queue + 構成パッケージ）、
+- 現 main（`69271f6`）は本セッションの成果を反映済み: #119（pending queue + 構成パッケージ）、
   #120（tags-revision フレーク）、#121（① stale ガード + ② 最小対応）、#122（profile_lock フレーク）、
-  #124（Swagger UI）、#125（P3-a audit retention）、および docs・オーナー決定・Issue #123（SDK 起票）。
+  #124（Swagger UI）、#125（P3-a audit retention）、#126（③ 稼働中 import ガード）、
+  #127（P3-b SLMP word order）、および docs・オーナー決定・Issue #123（SDK 起票）。
 - dependabot 群（2026-08-09 発生）は消化済み。
 - テスト用 PLC: 三菱 R08ENCPU、IP `192.168.11.200`（検証・テスト環境のため記載可、2026-08-12
   オーナー）。SLMP ポート `3100`〜`3110` / `3200` / `3201` / `5200` が利用可。安全アドレス帯は
@@ -51,9 +54,9 @@ T17-5 構成パッケージ export/import、`.gitattributes`。
   グローバル revision 突合は apply が revision を上げるためキュー複数適用を壊す点を回避（回帰テスト済み）。
 - **② 中 → 最小対応済み（#121 同梱）／一部残**: `failed` 行のキャンセル導線（cancel を Failed→Canceled
   拡張）と `failure_reason` への実エラー保持は実装済み。**残: `failed` からの「再試行（再キュー）」導線は未実装**。
-- **③ 中 → 着手中（`claude/import-running-guard`）**: 稼働中 import の誤成功表示。`tagRegistryAdmin.ts` が
-  202（queued）を作成済み型と偽り `configPackageAdmin` が依存項目をサイレントスキップ、UI は無条件に成功
-  トースト。方針: import は収集停止中のみ許可する事前ガード＋戻り値型の是正（202 を作成済み型として返さない）。
+- **③ 中 → 完了（#126）**: 稼働中 import の誤成功表示（`tagRegistryAdmin.ts` が 202（queued）を作成済み型と
+  偽り `configPackageAdmin` が依存項目をサイレントスキップ、UI は無条件に成功トースト）を、import は収集停止中
+  のみ許可する事前ガード＋戻り値型の是正（202 を `QueuedWhileRunningError` で弾く）で解消。
 
 ### Phase 1 — docs 整合の是正（軽量・まとめて 1 PR）
 
@@ -90,18 +93,18 @@ Phase 0 マージ後の main を実機で確認。テスト PLC の複数ポー�
   `AuditSettings`（`crate::settings`、既定 90日/100,000件）を追加し、`GET/PUT /api/audit-log/config`
   （admin 限定）と `crate::runtime::HubRuntime::start` の起動時剪定 + `POST /api/audit-log/list` の
   opportunistic 剪定を配線した（[docs/banto-hub-operations.md §9](banto-hub-operations.md)参照）。
-- **P3-b（word_order 実装完了・未マージ、ブランチ `claude/slmp-word-order`）**: SLMP の word order を接続設定から
-  露出。banto-broker（`SessionDirectory::ensure_connection`）と banto-collect
-  （`config::slmp_config_for`、relay-wright/chronogazer が使う経路）の両方が `host`/`port` 以外を
-  `SlmpConfig::default()` 固定にしており、ワード順の異なる機種で u32/f32 の値化けに直結していた
-  問題を解消。`plc_connections.word_order`（migration `0010`、既定 `low_high` で後方互換）→
-  `PlcConnection`/`PlcConnectionInput::wordOrder` → 上記2箇所の `SlmpConfig` 構築 →
-  `plc-connections` 登録/編集フォーム（"slmp" 選択時のみ表示）まで配線済み。
-  **残: CPU 種別 / アクセスルート（network/PC/IO/area id）は今回のスコープ外**
-  （`banto-collect::config::slmp_config_for` の doc comment に "Known limitation" として明記）
-  - 必要になれば別スライスで `plc_connections` に列を追加する。
-- **P3-c**: H9 SLMP 構造化エラー + transport 共通化（[improvement-plan.md](improvement-plan.md)
-  §H9）。slmp クレートのバージョン更新前に必須。
+- **P3-b（完了、#127）**: SLMP の word order を接続設定から露出。banto-broker
+  （`SessionDirectory::ensure_connection`）と banto-collect（`config::slmp_config_for`、
+  relay-wright/chronogazer が使う経路）の両方が `host`/`port` 以外を `SlmpConfig::default()` 固定に
+  しており、ワード順の異なる機種で u32/f32 の値化けに直結していた問題を解消。`plc_connections.word_order`
+  （migration `0010`、既定 `low_high` で後方互換）→ フォーム（"slmp" 選択時のみ）まで end-to-end 配線。
+  **残: CPU 種別 / アクセスルート（network/PC/IO/area id）は別スライス候補**（`slmp_config_for` の
+  doc comment に "Known limitation" として明記）。
+- **P3-c（2段構え・slmp 実装待ち）**: H9 SLMP 構造化エラー + transport 共通化（[improvement-plan.md](improvement-plan.md)
+  §H9）。文言パースの完全削除には外部 `slmp` クレート側の構造化エラーが必要。**2026-08-12 オーナー決定:
+  tyaro/slmp はオーナーが実装・publish → こちらで banto 側（dep 更新・文言パース削除・tripwire 構造化版・
+  broker transport 共通化）を仕上げる**。API 仕様と受け入れ条件は [h9-slmp-structured-error-spec.md](h9-slmp-structured-error-spec.md)。
+  現状は fail-closed + tripwire 2 本で封じ込め済み・非緊急（slmp バージョン更新の前提）。
 
 ### Phase 4 — リリースゲート（T5 の唯一の残り）
 
