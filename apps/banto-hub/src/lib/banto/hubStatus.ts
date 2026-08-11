@@ -52,6 +52,10 @@ export interface StatusResponse {
 	mqtt: MqttStatusEntry;
 	/** T4（設計 §5.4）: gRPC サーバーの設定。 */
 	grpc: GrpcStatusEntry;
+	/** T14-4 の収集ライフサイクル状態 - mirrors `CollectionState::as_str()`
+	 * (`apps/banto-hub/core/src/controller.rs`). `GET /api/v1/status` の
+	 * `collection_state` フィールド。 */
+	collection_state: 'stopped' | 'starting' | 'running' | 'stopping' | 'faulted' | string;
 }
 
 /** `GET /api/v1/values` の1タグ分（`{ tag, v, q, t }`）。 */

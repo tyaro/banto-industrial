@@ -9,6 +9,7 @@ import {
 	updatePlcConnection,
 	updateTag,
 	isVirtualConnection,
+	isQueuedWhileRunningError,
 	type CollectionGroup,
 	type CollectionGroupInput,
 	type PlcConnection,
@@ -25,6 +26,27 @@ import {
 	type ConfigPackageImportSummary,
 	type ConfigPackageInspection
 } from './configPackage';
+
+/**
+ * 監査③（2026-08-12）是正: `settings/+page.svelte` は import 実行前に
+ * 収集停止中であることを確認するが（事前ガード）、ガードをすり抜けて
+ * import 実行中に別セッションが収集を開始した場合の保険として、
+ * `tagRegistryAdmin.ts` の `QueuedWhileRunningError`（202 queued 応答）を
+ * ここで検知し、サイレントスキップ（未解決の warning だけ積んで続行）
+ * ではなく import 全体を中断したことを呼び出し元に伝える。
+ */
+export class ConfigPackageImportAbortedError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'ConfigPackageImportAbortedError';
+	}
+}
+
+export function isConfigPackageImportAbortedError(
+	error: unknown
+): error is ConfigPackageImportAbortedError {
+	return error instanceof ConfigPackageImportAbortedError;
+}
 
 function uniqueWarnings(items: readonly string[]): string[] {
 	return [...new Set(items)];
@@ -138,6 +160,22 @@ export async function inspectConfigPackage(pkg: ConfigPackage): Promise<ConfigPa
 export async function applyConfigPackage(
 	pkg: ConfigPackage,
 	options: ConfigPackageImportOptions = {}
+): Promise<ConfigPackageImportSummary> {
+	try {
+		return await applyConfigPackageInner(pkg, options);
+	} catch (err) {
+		if (isQueuedWhileRunningError(err)) {
+			throw new ConfigPackageImportAbortedError(
+				'収集が稼働中のため構成パッケージの取り込みを中断しました。収集を停止してから再実行してください。'
+			);
+		}
+		throw err;
+	}
+}
+
+async function applyConfigPackageInner(
+	pkg: ConfigPackage,
+	options: ConfigPackageImportOptions
 ): Promise<ConfigPackageImportSummary> {
 	const [currentConnections, currentGroups, currentTags, currentMqtt] = await Promise.all([
 		listPlcConnections(),
