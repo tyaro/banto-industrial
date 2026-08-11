@@ -4,9 +4,9 @@
 状態: **オーナー承認・実行中**。2026-08-12 に docs 14 文書 + コード + GitHub を全量監査した
 結果を実行順に整理したもの。**進捗（2026-08-12）: Phase 0（#119）、監査フォロー①=stale ガード（#121）・
 ②最小対応（#121）・③稼働中 import ガード（#126）、profile_lock フレーク（#122）、Swagger UI（#124）、
-P3-a audit retention（#125）、P3-b SLMP word order（#127）マージ済み。A群の自己完結分は完了。残る
-P3-c（H9）は slmp 本体改修が絡む2段構え（オーナーが tyaro/slmp 実装→こちらで banto 側、
-[h9-slmp-structured-error-spec.md](h9-slmp-structured-error-spec.md) 参照）で、slmp 実装待ち。**
+P3-a audit retention（#125）、P3-b SLMP word order（#127）、P3-c SLMP 構造化エラー（文言パース完全削除、
+[h9-slmp-structured-error-spec.md](h9-slmp-structured-error-spec.md) 参照）マージ済み。A群の自己完結分は完了。
+残るは P3-c の broker session/transport 共通化のみ（別スライス候補、improvement-plan.md §H9）。**
 個別スライスの詳細設計は既存の
 [plan.md](plan.md)・[tag-server-design.md](tag-server-design.md)・[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)・
 [banto-hub-t16-design.md](banto-hub-t16-design.md)・[banto-hub-t17-design.md](banto-hub-t17-design.md)・
@@ -100,11 +100,13 @@ Phase 0 マージ後の main を実機で確認。テスト PLC の複数ポー�
   （migration `0010`、既定 `low_high` で後方互換）→ フォーム（"slmp" 選択時のみ）まで end-to-end 配線。
   **残: CPU 種別 / アクセスルート（network/PC/IO/area id）は別スライス候補**（`slmp_config_for` の
   doc comment に "Known limitation" として明記）。
-- **P3-c（2段構え・slmp 実装待ち）**: H9 SLMP 構造化エラー + transport 共通化（[improvement-plan.md](improvement-plan.md)
-  §H9）。文言パースの完全削除には外部 `slmp` クレート側の構造化エラーが必要。**2026-08-12 オーナー決定:
-  tyaro/slmp はオーナーが実装・publish → こちらで banto 側（dep 更新・文言パース削除・tripwire 構造化版・
-  broker transport 共通化）を仕上げる**。API 仕様と受け入れ条件は [h9-slmp-structured-error-spec.md](h9-slmp-structured-error-spec.md)。
-  現状は fail-closed + tripwire 2 本で封じ込め済み・非緊急（slmp バージョン更新の前提）。
+- **P3-c（文言パース削除は完了、2026-08-12）**: H9 SLMP 構造化エラー（[improvement-plan.md](improvement-plan.md)
+  §H9）。オーナーが `tyaro/slmp`（git 依存、tag `v0.2.0`）で構造化エラーを実装したのを受け、banto 側
+  （dep 更新・`END_CODE_MARKER` 等の文言パース完全削除・tripwire 構造化版への置換・`deny.toml` の
+  git 依存許可）を同日中に完了。API 仕様と受け入れ条件は
+  [h9-slmp-structured-error-spec.md](h9-slmp-structured-error-spec.md)（状態: 実装済み）。**残:
+  broker の session/transport 共通化のみ**、別スライス候補として improvement-plan.md §H9 に記録
+  （具体的な共有ヘルパー案も記載済み）。
 
 ### Phase 4 — リリースゲート（T5 の唯一の残り）
 

@@ -24,32 +24,42 @@
 //!
 //! [`SlmpClient::read_batch`] issues one bulk read per
 //! [`planning::SlmpPlannedRead`] group and classifies every failure via
-//! [`classify_io_error`], which is the whole reason this module needs a
-//! translation layer at all: the wrapped crate reports *everything* as
-//! `std::io::Error`, so a MELSEC CPU politely refusing one read and a
-//! truncated frame arrive looking identical.
+//! [`classify_slmp_error`], which is the whole reason this module needs a
+//! translation layer at all: the wrapped crate's `slmp::SlmpError` and this
+//! crate's [`PlcError`] are deliberately separate vocabularies (I2a's own,
+//! versus I2's - see this crate's `error.rs`), so a MELSEC CPU politely
+//! refusing one read and a truncated frame need to land in different
+//! [`PlcError`] variants even though both start life as an `Err` from the
+//! same `bulk_read` call.
 //!
 //! - **Non-zero SLMP end code** (`0xC059` wrong command, `0xCEE1` request too
-//!   long, ...) - not fatal, and the direct analogue of a Modbus exception
-//!   response. The crate validates the response frame's declared data length
-//!   against what actually arrived *before* it inspects the end code, so
-//!   reaching an end code proves a complete, length-consistent frame was
-//!   received and nothing is left unread: the byte stream is still aligned to
-//!   a request boundary. This becomes `ReadResult::Bad` for only the requests
-//!   mapped to that one group, and the loop moves on.
-//! - **Anything else** (timeout, I/O error, malformed or truncated frame) -
-//!   fatal. `read_batch` stops issuing groups, drops the session
-//!   (`self.inner = None`), and returns `Err`; the caller must `connect()`
-//!   again. Per docs/plan.md I2 §2 this crate does not retry or reconnect on
-//!   its own - that loop is I3's.
+//!   long, ...), `slmp::SlmpError::Device { end_code }` - not fatal, and the
+//!   direct analogue of a Modbus exception response. The crate validates the
+//!   response frame's declared data length against what actually arrived
+//!   *before* it inspects the end code, so reaching `Device` proves a
+//!   complete, length-consistent frame was received and nothing is left
+//!   unread: the byte stream is still aligned to a request boundary. This
+//!   becomes `ReadResult::Bad` for only the requests mapped to that one
+//!   group, and the loop moves on.
+//! - **Anything else** (`Framing`, `Timeout`, `NotConnected`, `Io`) - fatal.
+//!   `read_batch` stops issuing groups, drops the session (`self.inner =
+//!   None`), and returns `Err`; the caller must `connect()` again. Per
+//!   docs/plan.md I2 §2 this crate does not retry or reconnect on its own -
+//!   that loop is I3's.
 //!
-//! Telling the first case from the second means reading the wrapped crate's
-//! error *message text*, because it exposes the end code no other way. That
-//! coupling is deliberate and load-bearing, so it is guarded by a test that
-//! drives a real end-code response through the real crate rather than by a
-//! unit test over hand-written strings - see
-//! `slmp_end_code_is_bad_not_fatal` in `integration_tests.rs`, and the note on
-//! the `slmp` dependency in the workspace `Cargo.toml`.
+//! Telling the first case from the second used to mean reading the wrapped
+//! crate's error *message text* (crates.io `slmp` 0.1.x reported everything as
+//! `std::io::Error`, exposing the end code no other way). H9
+//! (docs/h9-slmp-structured-error-spec.md, 2026-08-12) replaced that with the
+//! git dependency on the owner's fork (`slmp` 0.2.0, see the workspace
+//! `Cargo.toml`), which exposes `SlmpError::Device { end_code }` as its own
+//! enum variant - [`classify_slmp_error`] is now a plain structural `match`,
+//! no string parsing anywhere in this module. The coupling to the wrapped
+//! crate's behavior is still real (it still has to actually validate length
+//! before end code, and actually distinguish `Device` from `Framing`), so it
+//! is still guarded by a test that drives a real end-code response through
+//! the real crate rather than by a unit test over hand-built `SlmpError`
+//! values - see `slmp_end_code_is_bad_not_fatal` in `integration_tests.rs`.
 //!
 //! ## Two deliberate differences from `modbus/mod.rs`
 //!
@@ -79,7 +89,6 @@ pub mod planning;
 #[cfg(any(test, feature = "simulator"))]
 pub mod simulator;
 
-use std::io::ErrorKind;
 use std::time::Duration;
 
 use crate::client::{BoxFuture, PlcClient};
@@ -284,54 +293,35 @@ impl SlmpConfig {
     }
 }
 
-/// The marker the wrapped crate puts at the front of the `std::io::Error` it
-/// builds for a non-zero SLMP end code. Matching on it is how
-/// [`classify_io_error`] tells a device-side refusal (per-request `Bad`) from a
-/// framing failure (connection-fatal) - see this module's doc comment for why
-/// there is no better signal available, and `integration_tests.rs` for the
-/// test that keeps the coupling honest.
-const END_CODE_MARKER: &str = "SLMP Returns Error:";
-
-/// Pull `(code, symbolic name)` out of the wrapped crate's end-code message,
-/// whose shape is `"SLMP Returns Error: {name} (0x{code:X})"`.
-///
-/// Returns `None` for anything that does not match that shape *exactly*, which
-/// [`classify_io_error`] then treats as a framing failure. Failing closed like
-/// this is the deliberate choice: if the message format ever drifts, the cost
-/// is a needless reconnect (one lost poll cycle, recorded as Bad quality),
-/// whereas failing open - assuming an unparsed message was "just a device
-/// error" - would keep reading from a stream that may be desynchronized and
-/// report the misaligned bytes as real measurements.
-fn parse_end_code(text: &str) -> Option<(u16, String)> {
-    let after_marker = text.split_once(END_CODE_MARKER)?.1;
-    let (name, tail) = after_marker.rsplit_once("(0x")?;
-    let hex = tail.strip_suffix(')')?;
-    let code = u16::from_str_radix(hex, 16).ok()?;
-    Some((code, name.trim().to_string()))
-}
-
-/// Translate the wrapped crate's one-size-fits-all `std::io::Error` into this
+/// Translate the wrapped crate's structured [`slmp::SlmpError`] into this
 /// crate's [`PlcError`], which is what decides connection-fatal vs per-request
-/// `Bad` (see [`PlcError::is_connection_fatal`] and this module's doc comment).
-fn classify_io_error(err: &std::io::Error) -> PlcError {
-    let text = err.to_string();
-    match err.kind() {
+/// `Bad` (see [`PlcError::is_connection_fatal`] and this module's doc
+/// comment). A plain structural `match`, unlike the H9-era text-parsing
+/// `classify_io_error`/`parse_end_code` this replaced: `slmp` 0.2.0 exposes
+/// `Device { end_code }` as its own variant, so there is nothing left to
+/// parse.
+fn classify_slmp_error(err: slmp::SlmpError) -> PlcError {
+    match err {
+        // A complete, length-consistent frame carrying a non-zero end code -
+        // the device refused this one request but answered in full, so the
+        // byte stream is still aligned to a request boundary.
+        slmp::SlmpError::Device { end_code } => PlcError::SlmpEndCode {
+            code: end_code,
+            message: slmp::end_code_name(end_code).to_string(),
+        },
+        // The response structure itself is corrupt (bad length, bad fixed
+        // field, echo mismatch) - the byte stream may be desynchronized.
+        slmp::SlmpError::Framing(e) => PlcError::Protocol(e.to_string()),
         // The crate raises this for both its send and its receive deadline;
         // either way the reply we needed did not arrive.
-        ErrorKind::TimedOut => PlcError::ResponseTimeout,
+        slmp::SlmpError::Timeout => PlcError::ResponseTimeout,
         // The crate's own "no stream" guard. Should be unreachable from
         // `read_batch` (which checks `self.inner` first), but if the two ever
         // disagree, agreeing with the crate is the honest answer.
-        ErrorKind::NotConnected => PlcError::NotConnected,
-        // Everything the crate decides about the *content* of a response
-        // lands here: a non-zero end code, and every framing check. Only the
-        // former is safe to continue on.
-        ErrorKind::InvalidData => match parse_end_code(&text) {
-            Some((code, message)) => PlcError::SlmpEndCode { code, message },
-            None => PlcError::Protocol(text),
-        },
-        // Refused, reset, broken pipe, unexpected EOF, DNS failure.
-        _ => PlcError::Connection(text),
+        slmp::SlmpError::NotConnected => PlcError::NotConnected,
+        // Refused, reset, broken pipe, unexpected EOF, DNS failure, and
+        // anything else transport/IO-shaped.
+        slmp::SlmpError::Io(e) => PlcError::Connection(e.to_string()),
     }
 }
 
@@ -424,7 +414,7 @@ async fn execute_one(
         }
         SlmpAccess::Word => client.bulk_read(start, expected, slmp::DataType::U16).await,
     }
-    .map_err(|e| classify_io_error(&e))?;
+    .map_err(classify_slmp_error)?;
 
     // A response carrying fewer (or more) points than were asked for means
     // the crate's frame accounting and ours disagree - the stream is not
@@ -632,15 +622,15 @@ impl PlcClient for SlmpClient {
             tokio::time::timeout(self.config.connect_timeout, client.connect())
                 .await
                 .map_err(|_| PlcError::ConnectTimeout(addr.clone()))?
-                .map_err(|e| match e.kind() {
+                .map_err(|e| match e {
                     // The crate's own hardcoded 1s connect ceiling (see
                     // `SlmpConfig::connect_timeout`) surfaces here rather than
                     // as our outer timeout elapsing, so it has to be mapped to
                     // the same error - otherwise the same failure would be
                     // reported two different ways depending on which deadline
                     // happened to be shorter.
-                    ErrorKind::TimedOut => PlcError::ConnectTimeout(addr.clone()),
-                    _ => PlcError::Connection(e.to_string()),
+                    slmp::SlmpError::Timeout => PlcError::ConnectTimeout(addr.clone()),
+                    other => PlcError::Connection(other.to_string()),
                 })?;
 
             self.inner = Some(client);
@@ -780,53 +770,22 @@ mod tests {
         );
     }
 
-    /// [`parse_end_code`]'s shape, exercised on the exact string the wrapped
-    /// crate builds. `integration_tests.rs` proves the crate really does build
-    /// this string; these cases cover the parsing edges around it.
+    /// The classification table this module's whole error contract rests on -
+    /// now a plain structural `match` over `slmp::SlmpError` (H9,
+    /// docs/h9-slmp-structured-error-spec.md), no message text anywhere. The
+    /// end-to-end proof that the *real* wrapped crate actually produces
+    /// `Device` vs `Framing` correctly still lives in `integration_tests.rs`'s
+    /// `slmp_end_code_is_bad_not_fatal` /
+    /// `a_malformed_frame_is_fatal_even_though_it_shares_a_kind_with_an_end_code`;
+    /// this test only pins down [`classify_slmp_error`]'s own mapping table.
     #[test]
-    fn parse_end_code_extracts_code_and_name() {
-        let text = "SLMP Returns Error: WrongCommand (0xC059)";
-        assert_eq!(
-            parse_end_code(text),
-            Some((0xC059, "WrongCommand".to_string()))
-        );
-
-        let unknown = "SLMP Returns Error: Unknown Error (0x1234)";
-        assert_eq!(
-            parse_end_code(unknown),
-            Some((0x1234, "Unknown Error".to_string()))
-        );
-    }
-
-    #[test]
-    fn parse_end_code_rejects_anything_that_is_not_that_shape() {
-        for text in [
-            "Received Invalid Data Frame",
-            "Received Invalid Length Data",
-            "SLMP Returns Error: WrongCommand",          // no code
-            "SLMP Returns Error: WrongCommand (0xZZZZ)", // not hex
-            "SLMP Returns Error: WrongCommand (0xC059",  // unterminated
-            "",
-        ] {
-            assert_eq!(parse_end_code(text), None, "{text:?} should not parse");
-        }
-    }
-
-    /// The classification table this module's whole error contract rests on.
-    #[test]
-    fn classify_io_error_splits_fatal_from_per_request() {
-        use std::io::Error;
-
-        let end_code = Error::new(
-            ErrorKind::InvalidData,
-            "SLMP Returns Error: WrongCommand (0xC059)",
-        );
-        let classified = classify_io_error(&end_code);
+    fn classify_slmp_error_splits_fatal_from_per_request() {
+        let classified = classify_slmp_error(slmp::SlmpError::Device { end_code: 0xC059 });
         assert_eq!(
             classified,
             PlcError::SlmpEndCode {
                 code: 0xC059,
-                message: "WrongCommand".to_string()
+                message: slmp::end_code_name(0xC059).to_string()
             }
         );
         assert!(
@@ -834,50 +793,37 @@ mod tests {
             "an end code must stay a per-request Bad"
         );
 
-        // A framing failure shares ErrorKind::InvalidData with the above and
-        // must still come out fatal - this is the pair the message match exists
-        // to separate.
-        let framing = Error::new(ErrorKind::InvalidData, "Received Invalid Data Frame");
-        let classified = classify_io_error(&framing);
-        assert!(matches!(classified, PlcError::Protocol(_)));
-        assert!(classified.is_connection_fatal());
-
-        for (kind, expected_fatal) in [
-            (ErrorKind::TimedOut, true),
-            (ErrorKind::NotConnected, true),
-            (ErrorKind::ConnectionReset, true),
-            (ErrorKind::BrokenPipe, true),
-            (ErrorKind::UnexpectedEof, true),
-            (ErrorKind::ConnectionRefused, true),
-        ] {
-            let err = classify_io_error(&Error::new(kind, "boom"));
-            assert_eq!(
-                err.is_connection_fatal(),
-                expected_fatal,
-                "{kind:?} classified as {err:?}"
-            );
-        }
+        // Framing must come out fatal even though a text-parsing classifier
+        // could once confuse it with a `Device` response sharing the same
+        // `io::ErrorKind` - this is the pair H9's structured enum exists to
+        // separate unambiguously.
+        let framing = classify_slmp_error(slmp::SlmpError::Framing(
+            slmp::FramingError::LengthMismatch {
+                declared: 4,
+                actual: 2,
+            },
+        ));
+        assert!(matches!(framing, PlcError::Protocol(_)));
+        assert!(framing.is_connection_fatal());
 
         assert_eq!(
-            classify_io_error(&Error::new(ErrorKind::TimedOut, "x")),
+            classify_slmp_error(slmp::SlmpError::Timeout),
             PlcError::ResponseTimeout
         );
+        assert!(classify_slmp_error(slmp::SlmpError::Timeout).is_connection_fatal());
+
         assert_eq!(
-            classify_io_error(&Error::new(ErrorKind::NotConnected, "x")),
+            classify_slmp_error(slmp::SlmpError::NotConnected),
             PlcError::NotConnected
         );
-    }
+        assert!(classify_slmp_error(slmp::SlmpError::NotConnected).is_connection_fatal());
 
-    /// An unparseable message must fail *closed* (fatal), per
-    /// [`parse_end_code`]'s doc comment - the direction that costs a poll
-    /// cycle rather than trusting a possibly-desynchronized stream.
-    #[test]
-    fn an_end_code_message_of_an_unexpected_shape_is_treated_as_fatal() {
-        let err = classify_io_error(&std::io::Error::new(
-            ErrorKind::InvalidData,
-            "SLMP Returns Error: something new and unparsed",
-        ));
-        assert!(err.is_connection_fatal());
+        let io = classify_slmp_error(slmp::SlmpError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "boom",
+        )));
+        assert!(matches!(io, PlcError::Connection(_)));
+        assert!(io.is_connection_fatal());
     }
 
     #[tokio::test]

@@ -100,16 +100,20 @@ allow-wildcard-paths = true
 # 本タスク(H6)の実装仕様に含まれないため未設定。
 
 [sources]
-# 取得元を crates.io と banto 本体の git 依存だけに限定する。
+# 取得元を crates.io と、明示的に許可した git 依存だけに限定する。
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# banto-core / banto-storage / banto-server(Cargo.toml 参照、tag = "v0.1.1")
-# のみを許可する。".git" 有無はどちらでも cargo 側の正規化により一致する。
-allow-git = ["https://github.com/tyaro/banto"]
-# banto への参照は tag 指定を必須化する(branch/rev への変更は再現性を
-# 損なうため意図的にブロックする。変更したい場合は本ファイルも同時に
-# 見直すこと)。
+# banto-core / banto-storage / banto-server(Cargo.toml 参照、tag = "v1.1.0")と、
+# slmp(Cargo.toml 参照、tag = "v0.2.0" - H9、docs/h9-slmp-structured-error-spec.md、
+# 2026-08-12: crates.io 版 0.1.x はエラーを std::io::Error 一本化でしか露出せず、
+# 構造化エラー(SlmpError::{Device,Framing,Timeout,NotConnected,Io})を実装した
+# オーナーのフォークへ移行)を許可する。".git" 有無はどちらでも cargo 側の
+# 正規化により一致する。
+allow-git = ["https://github.com/tyaro/banto", "https://github.com/tyaro/slmp"]
+# 許可した git 依存はいずれも tag 指定を必須化する(branch/rev への変更は
+# 再現性を損なうため意図的にブロックする。変更したい場合は本ファイルも
+# 同時に見直すこと)。
 required-git-spec = "tag"
 
 [advisories]

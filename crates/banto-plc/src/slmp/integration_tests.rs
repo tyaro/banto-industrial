@@ -3,7 +3,7 @@
 //! cannot exercise: real TCP framing through the wrapped `slmp` crate, real
 //! timeouts, a real dropped connection. `address.rs`/`planning.rs` already
 //! cover the pure logic in isolation, and `mod.rs`'s unit tests cover the error
-//! classifier over hand-written strings; this file is about the parts that only
+//! classifier over hand-built `slmp::SlmpError` values; this file is about the parts that only
 //! exist once the wrapped crate and a socket are involved.
 //!
 //! Structured to mirror `modbus/integration_tests.rs` case for case, so the
@@ -270,8 +270,17 @@ async fn both_cpu_series_frame_layouts_work() {
 /// The tripwire this module exists for (see `mod.rs`'s doc comment and the
 /// `slmp` note in the workspace `Cargo.toml`): a real non-zero end code, built
 /// by the real wrapped crate from real bytes, must classify as a *per-request*
-/// `Bad` and leave its batch-mates alone. If a future `slmp` release changes
-/// how it words that error, this is what fails.
+/// `Bad` and leave its batch-mates alone.
+///
+/// H9 (docs/h9-slmp-structured-error-spec.md, 2026-08-12) replaced this test's
+/// original message-text tripwire (`slmp` 0.1.x reported everything as
+/// `std::io::Error`, so this asserted on the exact wording of its message)
+/// with a direct check on the real crate's structured `slmp::SlmpError`: the
+/// first half below drives a bare `slmp::SLMPClient` against the same
+/// injected end code and asserts it comes back as `SlmpError::Device { .. }`,
+/// not merely "some `Err`". If a future `slmp` release ever reclassified a
+/// non-zero end code as `Framing` instead, this is what fails - not a string
+/// comparison.
 #[tokio::test]
 async fn slmp_end_code_is_bad_not_fatal() {
     let sim = Simulator::start().await;
@@ -280,6 +289,32 @@ async fn slmp_end_code_is_bad_not_fatal() {
     // in separate groups, so injecting on the D0 group must leave D100 intact.
     sim.inject_end_code(SlmpDevice::D, 0, 0xC059);
 
+    // Structured check on the wrapped crate's own error type, bypassing this
+    // crate's classification entirely.
+    let mut raw = slmp::SLMPClient::new(fast_config(&sim).to_wire_props());
+    raw.set_send_timeout(Duration::from_millis(100));
+    raw.set_recv_timeout(Duration::from_millis(100));
+    raw.connect().await.expect("raw connect");
+    let raw_err = raw
+        .bulk_read(
+            slmp::Device {
+                device_type: SlmpDevice::D.to_wire(),
+                address: 0,
+            },
+            1,
+            slmp::DataType::I16,
+        )
+        .await
+        .expect_err("an injected end code must surface as an Err");
+    assert!(
+        matches!(raw_err, slmp::SlmpError::Device { end_code: 0xC059 }),
+        "expected SlmpError::Device {{ end_code: 0xC059 }}, got {raw_err:?}"
+    );
+    raw.close().await;
+
+    // This crate's own classification of the same condition, through the
+    // full client - proves `classify_slmp_error` maps `Device` onto
+    // `PlcError::SlmpEndCode` and that `read_batch` treats it as per-request.
     let mut client = SlmpClient::new(fast_config(&sim));
     client.connect().await.unwrap();
 
@@ -296,10 +331,7 @@ async fn slmp_end_code_is_bad_not_fatal() {
                 "the end code's symbolic name should survive translation"
             );
         }
-        other => panic!(
-            "expected Bad(SlmpEndCode) - if the `slmp` crate changed its error \
-             message format, `super::parse_end_code` needs updating. Got {other:?}"
-        ),
+        other => panic!("expected Bad(SlmpEndCode), got {other:?}"),
     }
     assert_eq!(results[1], ReadResult::Value(TagValue::F64(55.0)));
 
@@ -315,14 +347,39 @@ async fn slmp_end_code_is_bad_not_fatal() {
 }
 
 /// The other half of the pair: a framing failure reaches
-/// [`super::classify_io_error`] with the *same* `ErrorKind::InvalidData` as an
-/// end code and must still come out fatal. Together with the test above, this
-/// is what proves the message-text match is doing real work.
+/// [`super::classify_slmp_error`] as a *different* `slmp::SlmpError` variant
+/// (`Framing`, not `Device`) even though the pre-H9 wrapped crate reported
+/// both through the same `io::ErrorKind::InvalidData` - and must still come
+/// out fatal. Together with the test above, this is what proves H9's
+/// structured `SlmpError` is actually doing the separating, not this crate
+/// merely assuming it.
 #[tokio::test]
 async fn a_malformed_frame_is_fatal_even_though_it_shares_a_kind_with_an_end_code() {
     let sim = Simulator::start().await;
     sim.set_word(SlmpDevice::D, 0, 1);
     sim.emit_malformed_frames();
+
+    // Structured check on the wrapped crate's own error type first.
+    let mut raw = slmp::SLMPClient::new(fast_config(&sim).to_wire_props());
+    raw.set_send_timeout(Duration::from_millis(100));
+    raw.set_recv_timeout(Duration::from_millis(100));
+    raw.connect().await.expect("raw connect");
+    let raw_err = raw
+        .bulk_read(
+            slmp::Device {
+                device_type: SlmpDevice::D.to_wire(),
+                address: 0,
+            },
+            1,
+            slmp::DataType::U16,
+        )
+        .await
+        .expect_err("a length-inconsistent frame must surface as an Err");
+    assert!(
+        matches!(raw_err, slmp::SlmpError::Framing(_)),
+        "expected SlmpError::Framing(_), got {raw_err:?}"
+    );
+    raw.close().await;
 
     let mut client = SlmpClient::new(fast_config(&sim));
     client.connect().await.unwrap();

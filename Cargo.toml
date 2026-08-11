@@ -59,15 +59,17 @@ tokio = { version = "1" }
 # shared dependency so I5 picks up the same version by construction rather
 # than by remembering to match it.
 #
-# Caveat worth knowing before bumping: `banto-plc`'s SLMP error
-# classification reads this crate's `std::io::Error` *message text* to tell a
-# device-side end-code response (per-tag `Bad`) from a framing failure
-# (connection-fatal) - the crate does not expose the end code any other way.
-# `slmp_end_code_is_bad_not_fatal` in `banto-plc/src/slmp/integration_tests.rs`
-# is the tripwire for that coupling: it drives a real end-code response
-# through the real crate, so a message-format change in a future 0.1.x fails
-# that test loudly instead of silently reclassifying device errors as fatal.
-slmp = "0.1.23"
+# H9 (docs/h9-slmp-structured-error-spec.md, 2026-08-12 オーナー決定): 0.2.0
+# はオーナーのフォーク(tyaro/slmp)で、構造化エラー(`SlmpError::{Device,
+# Framing,Timeout,NotConnected,Io}`)を公開する - crates.io 0.1.x が
+# `std::io::Error` 一本化で終了コードをメッセージ文字列でしか露出しなかった
+# ため、`banto-plc`/`banto-plc-write` の SLMP エラー分類はそのメッセージ
+# 文言をパースしてデバイス側拒否(非致命)とフレーミング失敗(致命)を
+# 区別していた。0.2.0 移行後は `SlmpError::Device { end_code }` への
+# 構造化マッチに置き換わっており、文言パースは完全削除済み(§H9 受け入れ
+# 条件)。tag 参照で固定(deny.toml の `required-git-spec = "tag"` と同じ
+# 再現性方針)。
+slmp = { git = "https://github.com/tyaro/slmp", tag = "v0.2.0" }
 # S1 (relay-wright plan, 文字列タグ): Shift-JIS encode/decode for MELSEC string
 # devices - banto-plc's string read decode and banto-plc-write's string write
 # encode. Pinned to the exact version the `slmp` crate above already depends on

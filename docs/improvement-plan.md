@@ -5,8 +5,10 @@
 H1〜H4・H6・H8・H10 完了、H5 は vitest 導入 + banto-hub の Playwright E2E
 (`e2e:banto-hub`、CI 組込済み)まで完了。
 H7 は ⑤ フレーク安定化 4 件(A.1/A.3/A.4/A.5)+ ②③④ 堅牢性テスト(crash 再オープン・DST・
-read-while-write)+ A.2 決定化 + ④ TsQuery ギャップ修正を 2026-08-09 に対応。残りは H7 の ① 実機 soak・
-H9(SLMP 構造化エラー)・H5 の relay-wright 分 E2E(Tauri 依存で WebDriver 検討要、Phase 4
+read-while-write)+ A.2 決定化 + ④ TsQuery ギャップ修正を 2026-08-09 に対応。
+H9 は SLMP 構造化エラー(文言パース完全削除)を 2026-08-12 に対応済み、
+transport 共通化は別スライス候補として残す(§3 H9 参照)。残りは H7 の
+① 実機 soak・H5 の relay-wright 分 E2E(Tauri 依存で WebDriver 検討要、Phase 4
 相当/環境依存)。
 最終検証日(コード照合): 2026-08-12
 
@@ -44,18 +46,18 @@ H9(SLMP 構造化エラー)・H5 の relay-wright 分 E2E(Tauri 依存で WebDri
 
 ## 2. 改善項目一覧(優先順)
 
-| ID  | 内容                                                     | 優先度 | 規模 | 状態                                      |
-| --- | -------------------------------------------------------- | ------ | ---- | ----------------------------------------- |
-| H1  | banto-expr の式長・ネスト深さ上限(DoS 根治)              | 最高   | 小   | 完了(#58/#59)                             |
-| H2  | 手動書き込み(タグモニタ)の安全意味論                     | 最高   | 中   | 完了(#58)                                 |
-| H3  | banto-hub gRPC の bind 設定化(既定 127.0.0.1)            | 高     | 中   | 完了(#58)                                 |
-| H4  | 収集タイムスタンプ逆行対策 + append 失敗の可視化         | 高     | 中   | 完了(#58)                                 |
-| H5  | フロントテスト基盤(vitest)+ hub/relay-wright E2E         | 高     | 大   | vitest・hub E2E 完了、relay-wright E2E 残 |
-| H6  | サプライチェーン/再現性(deny・audit・toolchain 固定ほか) | 高     | 中   | 完了(#59)                                 |
-| H7  | ソーク実行・障害系テスト(crash 再オープン・DST・並行)    | 中     | 大   | ⑤+②③④+A.2完了・残 ①                       |
-| H8  | ドキュメント整合(状態ヘッダ・README・状態欄義務化)       | 中     | 小   | 完了(#58/#59)                             |
-| H9  | SLMP 構造化エラー(fork/upstream)+ transport 共通化       | 中     | 大   | 未着手                                    |
-| H10 | 認可の細粒度化(キー有効期限・read スコープ・arm 失効)    | 中     | 中   | 完了(#74/#75)                             |
+| ID  | 内容                                                     | 優先度 | 規模 | 状態                                                      |
+| --- | -------------------------------------------------------- | ------ | ---- | --------------------------------------------------------- |
+| H1  | banto-expr の式長・ネスト深さ上限(DoS 根治)              | 最高   | 小   | 完了(#58/#59)                                             |
+| H2  | 手動書き込み(タグモニタ)の安全意味論                     | 最高   | 中   | 完了(#58)                                                 |
+| H3  | banto-hub gRPC の bind 設定化(既定 127.0.0.1)            | 高     | 中   | 完了(#58)                                                 |
+| H4  | 収集タイムスタンプ逆行対策 + append 失敗の可視化         | 高     | 中   | 完了(#58)                                                 |
+| H5  | フロントテスト基盤(vitest)+ hub/relay-wright E2E         | 高     | 大   | vitest・hub E2E 完了、relay-wright E2E 残                 |
+| H6  | サプライチェーン/再現性(deny・audit・toolchain 固定ほか) | 高     | 中   | 完了(#59)                                                 |
+| H7  | ソーク実行・障害系テスト(crash 再オープン・DST・並行)    | 中     | 大   | ⑤+②③④+A.2完了・残 ①                                       |
+| H8  | ドキュメント整合(状態ヘッダ・README・状態欄義務化)       | 中     | 小   | 完了(#58/#59)                                             |
+| H9  | SLMP 構造化エラー(fork/upstream)+ transport 共通化       | 中     | 大   | 構造化エラー完了(2026-08-12)・transport共通化は別スライス |
+| H10 | 認可の細粒度化(キー有効期限・read スコープ・arm 失効)    | 中     | 中   | 完了(#74/#75)                                             |
 
 ## 3. 各項目の詳細
 
@@ -358,20 +360,58 @@ H9(SLMP 構造化エラー)・H5 の relay-wright 分 E2E(Tauri 依存で WebDri
   `最終検証日:` 義務化ルールを追記、banto-hub / chronogazer の最小
   README を追加
 
-### H9: SLMP 構造化エラー + transport 共通化 — 状態: 未着手
+### H9: SLMP 構造化エラー + transport 共通化 — 状態: 文言パース削除は完了(2026-08-12)、transport 共通化は別スライス
 
-- **事実**: 外部 `slmp` クレートがエンドコードをエラー文言でしか露出しない
-  ため、banto-plc / banto-plc-write の 2 箇所で文言パースしている。ただし
-  `ErrorKind::InvalidData` との二重フィルタ + パース不能時 fatal 側の
-  fail-closed + CI で実行される tripwire テスト 2 本で封じ込め済み。
-  故障モードは可用性劣化であり誤データ方向には倒れない。また同クレートは
-  受信バッファ 2048 バイト固定(分割応答の再組み立てなし)という制約もある
-- **方針**: fork(`tyaro/slmp`)または upstream PR で構造化エラー
-  (`SlmpError::Device { end_code }` 相当)を得る。その作業に broker の
-  接続処理重複解消(session/transport 層の共通化)を同梱する。**慌てて
-  やる必要はない**が、`slmp` のバージョンを上げる前には必ずここを通す
-- **受け入れ条件**: 文言パース(`END_CODE_MARKER`)の完全削除、tripwire
-  テストの構造化エラー版への置き換え
+- **事実(移行前)**: 外部 `slmp` クレートがエンドコードをエラー文言でしか露出
+  しないため、banto-plc / banto-plc-write の 2 箇所で文言パースしていた。
+  ただし `ErrorKind::InvalidData` との二重フィルタ + パース不能時 fatal 側の
+  fail-closed + CI で実行される tripwire テスト 2 本で封じ込め済みだった。
+- **実施記録(2026-08-12)**: オーナーが `tyaro/slmp`(git 依存、tag
+  `v0.2.0`)で構造化エラー(`SlmpError::{Device{end_code},Framing,Timeout,
+NotConnected,Io}` + `end_code_name`)を実装したのを受け、banto 側を移行。
+  詳細仕様は docs/h9-slmp-structured-error-spec.md(状態: 実装済みに更新
+  済み)。
+  - workspace `Cargo.toml` の `slmp` を crates.io `0.1.23` から
+    `{ git = "https://github.com/tyaro/slmp", tag = "v0.2.0" }` へ差し替え
+  - `banto-plc`/`banto-plc-write` の `slmp/mod.rs`: `END_CODE_MARKER` 定数・
+    `parse_end_code`・`classify_io_error`(文言パース)を完全削除し、
+    `classify_slmp_error(slmp::SlmpError) -> PlcError`/`PlcWriteError` の
+    構造化 `match` に置換(`Device`→`SlmpEndCode`非致命、`Framing`→
+    `Protocol`致命、`Timeout`→`ResponseTimeout`、`NotConnected`→
+    `NotConnected`、`Io`→`Connection`)。`connect()` の接続タイムアウト判定も
+    同様に構造化マッチへ
+  - 両クレートの `slmp/integration_tests.rs` の tripwire 2 本
+    (`slmp_end_code_is_bad_not_fatal`/`a_malformed_frame_is_fatal...`)を、
+    生の `slmp::SLMPClient` を直接叩いて `slmp::SlmpError::Device`/`Framing`
+    variant を直接検証する形へ拡張(文言依存だった doc コメント・
+    panic メッセージも更新)
+  - `deny.toml` の `[sources] allow-git` に `https://github.com/tyaro/slmp`
+    を追加(`required-git-spec = "tag"` は既存の banto 分と共用)
+  - 受け入れ条件どおり `grep -rn END_CODE_MARKER crates/` はヒット0。
+    `cargo build --workspace --all-targets`・`cargo test -p banto-plc -p
+banto-plc-write -p banto-broker -p banto-hub-core`・
+    `cargo fmt --all -- --check`・`cargo clippy --all-targets -- -D
+warnings`(該当クレート)・`cargo deny --all-features check` すべて green
+- **transport 共通化(別スライス候補、本件では未着手)**: `banto-broker`
+  の `connect_attempt` は `slmp::SLMPClient` の構築・タイムアウト設定・
+  `connect()`・エラーマッピングを `banto_plc::slmp::SlmpClient::connect`/
+  `banto_plc_write::slmp::SlmpWriteClient::connect` と実質同一のロジックで
+  再実装している(意図的な重複 - `lib.rs` モジュール doc 参照。banto-plc の
+  `SlmpClient` はソケットを渡すシームを持たないため、現状のままでは
+  broker が再利用できない)。今回は依存差し替えに伴う型変更
+  (`io::Error` → `slmp::SlmpError`)だけを `connect_attempt` に適用して
+  コンパイルを通した。3 箇所を `banto-plc` 側に
+  `pub async fn dial_slmp(config: &SlmpConfig) -> Result<slmp::SLMPClient,
+PlcError>` のような共有ヘルパーとして切り出せる可能性はある
+  (`banto-plc-write`/`banto-broker` は既に `banto_plc` に依存済みで、
+  `PlcWriteError`/broker 側の `ConnState`/`ConnEvent` の戻り値形状を
+  合わせる程度の波及に収まりそう)が、broker 側の `ConnState::Connecting`
+  の型・`next_conn_event`・`run_broker_task` のマッチアームまで触る
+  中程度の改修になり、再接続ロジックへの回帰リスクを伴う。文言パース
+  完全削除という本件の主目的とは独立に評価・レビューすべきと判断し、
+  別スライスとして残す
+- **受け入れ条件(達成)**: 文言パース(`END_CODE_MARKER`)の完全削除、
+  tripwire テストの構造化エラー版への置き換え
 
 ### H10: 認可の細粒度化 — 状態: 完了(①② = PR #74、③ = PR #75、2026-08-08)
 
@@ -433,7 +473,10 @@ H9(SLMP 構造化エラー)・H5 の relay-wright 分 E2E(Tauri 依存で WebDri
   - CI test 実効化、H1 残件(dag.rs 反復化)、H8 残り
 - **Phase 3(PR #74/#75、2026-08-08 マージ済み)**: H10 ①任意期限+警告・
   ②arm 時限失効(#74)、③read スコープのタグ単位化(案 B、#75)
-- **Phase 4(環境・実時間依存)**: H5 の relay-wright 分 E2E、H7 の soak 実行、H9
+- **Phase 4(環境・実時間依存)**: H5 の relay-wright 分 E2E、H7 の soak 実行。
+  H9 は SLMP 構造化エラー(文言パース完全削除)を 2026-08-12 に別 PR で対応
+  済み(環境非依存のため Phase 4 対象から除外)、transport 共通化のみ別
+  スライス候補として残る(§3 H9 参照)
 
 ## 5. スコープ外(明示)
 
