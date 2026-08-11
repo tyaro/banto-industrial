@@ -438,6 +438,12 @@ T7-1）を `apps/banto-hub/core/src/hub.rs`（`CollectorManager::rebuild`、T7-2
 > `キャンセル` で破棄できる。`apply_config` は引き続き内部基盤として維持し、
 > 即時自動反映ではなく「明示適用時の反映エンジン」として用いる。最新の受入条件は
 > [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §9.3 TAG-P0-3 を正とする。
+>
+> **2026-08-12 追補**: pending change の適用時に、対象リソース
+> （`plc_connections`/`collection_groups` の update/delete）が enqueue
+> 後に別経路で変更・削除されていないかを確認する per-resource の
+> フィンガープリントガードを追加した。詳細・不一致時の挙動は
+> [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §9.3 を正とする。
 
 ## 5. 外部インターフェース設計
 

@@ -2078,6 +2078,49 @@ struct QueuedPendingChangeResponse {
     message: String,
 }
 
+/// Per-resource staleness guard for the pending-change queue (TAG-P0-3
+/// follow-up, 2026-08-12): captures the current DB state of the resource a
+/// `plc_connections.update`/`.delete` or `collection_groups.update`/`.delete`
+/// pending change targets, at the moment it is queued. `execute_pending_apply`
+/// re-fetches and re-serializes the same way right before applying and
+/// rejects the apply as a conflict if the strings differ (or the row is
+/// gone) — this is a per-resource check, not a global `configured_revision`
+/// comparison, because `commit_catalog_and_notify` bumps the global revision
+/// on every successful apply and a global check would break applying
+/// multiple unrelated queued changes back-to-back.
+///
+/// Deliberately NOT a hash: rows are small and `serde_json::to_string` on a
+/// `#[derive(Serialize)]` struct with fixed field order is exactly as
+/// comparable as a hash here, without adding a crypto dependency.
+///
+/// `*.create` sources get `None` (there is no prior row to go stale) and
+/// `tags.*` sources get `None` (already guarded by `Tag`'s own
+/// `expectedRevision` optimistic-lock mechanism — see
+/// `TagUpdateError::RevisionConflict` — adding a second guard here would be
+/// redundant).
+async fn compute_pending_base_fingerprint(
+    state: &TagRegistryState,
+    source: &str,
+    payload: &serde_json::Value,
+) -> Option<String> {
+    let id = payload.get("id")?.as_i64()?;
+    match source {
+        "plc_connections.update" | "plc_connections.delete" => state
+            .plc_connections
+            .get(id)
+            .await
+            .ok()
+            .and_then(|row| serde_json::to_string(&row).ok()),
+        "collection_groups.update" | "collection_groups.delete" => state
+            .collection_groups
+            .get(id)
+            .await
+            .ok()
+            .and_then(|row| serde_json::to_string(&row).ok()),
+        _ => None,
+    }
+}
+
 async fn queue_pending_registry_change(
     state: &TagRegistryState,
     headers: &HeaderMap,
@@ -2086,12 +2129,14 @@ async fn queue_pending_registry_change(
     status: CollectionStatus,
 ) -> RegistryMutationResult<Response> {
     let identity = actor_identity(headers, &state.auth);
+    let base_fingerprint = compute_pending_base_fingerprint(state, source, &payload).await;
     let pending = state
         .pending_changes
         .create_pending(
             source,
             &payload,
             state.manager.configured_revision() as i64,
+            base_fingerprint.as_deref(),
             identity.as_ref().map(|v| v.id.as_str()),
             identity.as_ref().map(|v| v.role.as_str()),
         )
@@ -3327,6 +3372,16 @@ struct PendingBatchTagsPayload {
 enum PendingApplyError {
     Api(ApiError),
     CollectionEditLocked(CollectionStatusResponse),
+    /// TAG-P0-3 follow-up（2026-08-12）: この pending change の
+    /// `base_fingerprint` が、適用直前に再取得した対象リソースの現在値と
+    /// 一致しない（＝ enqueue 後に別経路で変更または削除された）場合の
+    /// エラー。`compute_pending_base_fingerprint` の doc comment 参照。
+    /// グローバルな `configured_revision` 比較ではなく per-resource 比較に
+    /// しているのは、複数件の pending change を連続適用すると
+    /// `commit_catalog_and_notify` が毎回グローバル revision を進めるため。
+    Conflict {
+        resource: &'static str,
+    },
 }
 
 impl From<ApiError> for PendingApplyError {
@@ -3341,13 +3396,29 @@ impl From<BantoError> for PendingApplyError {
     }
 }
 
+/// `resource`（テーブル名）を日本語の表示名に寄せてから conflict
+/// メッセージを組み立てる。`reason()`（`failure_reason` 用）と
+/// `IntoResponse`（HTTP レスポンス body 用）の両方から呼ぶことで、
+/// メッセージ文言の重複定義を避ける。
+fn pending_apply_conflict_message(resource: &str) -> String {
+    let display_name = match resource {
+        "plc_connections" => "PLC接続",
+        "collection_groups" => "収集グループ",
+        other => other,
+    };
+    format!(
+        "適用対象の{display_name}が未適用キュー登録後に変更されています。この提案を破棄して再作成してください。"
+    )
+}
+
 impl PendingApplyError {
     fn reason(&self) -> String {
         match self {
-            Self::Api(_) => "pending change の適用に失敗しました".to_string(),
+            Self::Api(err) => format!("pending change の適用に失敗しました: {}", err.0),
             Self::CollectionEditLocked(status) => {
                 format!("収集中は構成を編集できません(state={})", status.state)
             }
+            Self::Conflict { resource } => pending_apply_conflict_message(resource),
         }
     }
 }
@@ -3366,6 +3437,15 @@ impl IntoResponse for PendingApplyError {
                 })),
             )
                 .into_response(),
+            Self::Conflict { resource } => (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "pending_apply_conflict",
+                    "resource": resource,
+                    "message": pending_apply_conflict_message(resource),
+                })),
+            )
+                .into_response(),
         }
     }
 }
@@ -3379,6 +3459,31 @@ fn decode_pending_payload<T: serde::de::DeserializeOwned>(
             pending.source
         )))
     })
+}
+
+/// Re-fetch `id` via `getter`'s result and compare its re-serialized form
+/// against `expected` (the fingerprint captured when the pending change was
+/// queued — see `compute_pending_base_fingerprint`). `Ok(())` if unchanged,
+/// `Err(PendingApplyError::Conflict)` if the row changed OR is now gone
+/// (`Err` from the getter — e.g. `NotFound` — also counts as staleness: the
+/// row this pending change targets no longer exists in the state it was
+/// queued against).
+async fn check_fingerprint_unchanged<T: Serialize>(
+    current: Result<T, BantoError>,
+    expected: &str,
+    resource: &'static str,
+) -> Result<(), PendingApplyError> {
+    let unchanged = match current {
+        Ok(row) => serde_json::to_string(&row)
+            .map(|s| s == expected)
+            .unwrap_or(false),
+        Err(_) => false,
+    };
+    if unchanged {
+        Ok(())
+    } else {
+        Err(PendingApplyError::Conflict { resource })
+    }
 }
 
 async fn execute_pending_apply(
@@ -3413,6 +3518,21 @@ async fn execute_pending_apply(
         "plc_connections.update" => {
             let body: PendingChangeWithIdAndInput<PlcConnectionPayload> =
                 decode_pending_payload(pending)?;
+            if let Some(expected) = &pending.base_fingerprint {
+                // Plain pool read (not part of `tx` above) — same source as
+                // `compute_pending_base_fingerprint` used at enqueue time.
+                // The `apply_lock` mutex in `PendingChangesAdminState`
+                // already serializes concurrent apply calls against each
+                // other, which is the concurrency case this guard closes
+                // (edits made *before* Apply was clicked, not sub-request
+                // races during Apply itself).
+                check_fingerprint_unchanged(
+                    state.plc_connections.get(body.id).await,
+                    expected,
+                    "plc_connections",
+                )
+                .await?;
+            }
             state
                 .plc_connections
                 .update_tx(&mut tx, body.id, body.input.into())
@@ -3423,6 +3543,14 @@ async fn execute_pending_apply(
         }
         "plc_connections.delete" => {
             let body: PendingChangeWithId = decode_pending_payload(pending)?;
+            if let Some(expected) = &pending.base_fingerprint {
+                check_fingerprint_unchanged(
+                    state.plc_connections.get(body.id).await,
+                    expected,
+                    "plc_connections",
+                )
+                .await?;
+            }
             state
                 .plc_connections
                 .delete_tx(&mut tx, body.id)
@@ -3445,6 +3573,14 @@ async fn execute_pending_apply(
         "collection_groups.update" => {
             let body: PendingChangeWithIdAndInput<CollectionGroupPayload> =
                 decode_pending_payload(pending)?;
+            if let Some(expected) = &pending.base_fingerprint {
+                check_fingerprint_unchanged(
+                    state.collection_groups.get(body.id).await,
+                    expected,
+                    "collection_groups",
+                )
+                .await?;
+            }
             state
                 .collection_groups
                 .update_tx(&mut tx, body.id, body.input.into())
@@ -3455,6 +3591,14 @@ async fn execute_pending_apply(
         }
         "collection_groups.delete" => {
             let body: PendingChangeWithId = decode_pending_payload(pending)?;
+            if let Some(expected) = &pending.base_fingerprint {
+                check_fingerprint_unchanged(
+                    state.collection_groups.get(body.id).await,
+                    expected,
+                    "collection_groups",
+                )
+                .await?;
+            }
             state
                 .collection_groups
                 .delete_tx(&mut tx, body.id)
@@ -3636,6 +3780,11 @@ async fn pending_changes_apply(
             )
                 .into_response(),
             PendingApplyError::Api(err) => err.into_response(),
+            // TAG-P0-3 follow-up（2026-08-12）: `IntoResponse` 実装がそのまま
+            // 409 + conflict body を返す。`failure_reason` は既に
+            // `mark_failed` で DB へ記録済みなので、`GET
+            // /api/pending-changes/{id}` から後追いで確認できる。
+            err @ PendingApplyError::Conflict { .. } => err.into_response(),
         };
     }
 
@@ -7093,6 +7242,7 @@ mod tests {
                 "tags.delete",
                 &json!({ "id": 1 }),
                 1,
+                None,
                 Some("admin"),
                 Some("admin"),
             )
@@ -7325,5 +7475,528 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(queued_count, 1);
+    }
+
+    /// TAG-P0-3 follow-up（2026-08-12）: 適用対象の `plc_connections` 行が
+    /// enqueue 時点から変わっていなければ、`base_fingerprint` ガードは何も
+    /// 妨げない（ハッピーパス）。
+    #[tokio::test]
+    async fn pending_apply_plc_connection_update_succeeds_when_row_unchanged() {
+        let env = test_env().await;
+
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line-fp-ok", "host": "127.0.0.1", "port": 15030 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+        let conn_id = conn["id"].as_i64().unwrap();
+
+        let start = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/start")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        let queued = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::put(format!("/api/plc-connections/{conn_id}"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "name": "line-fp-ok-renamed", "host": "127.0.0.1", "port": 15030 })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued.status(), StatusCode::ACCEPTED);
+        let queued_bytes = axum::body::to_bytes(queued.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let queued_body: serde_json::Value = serde_json::from_slice(&queued_bytes).unwrap();
+        let pending_id = queued_body["pending"]["id"].as_i64().unwrap();
+
+        let stop = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/stop")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop.status(), StatusCode::OK);
+
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{pending_id}/apply"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["state"], "applied");
+
+        let updated = PlcConnectionService::new(env.pool.clone())
+            .get(conn_id)
+            .await
+            .unwrap();
+        assert_eq!(updated.name, "line-fp-ok-renamed");
+    }
+
+    /// TAG-P0-3 follow-up（2026-08-12）: pending change を enqueue した後、
+    /// キューを経由しない別経路（別セッションなどを模した直接の service
+    /// 呼び出し）で同じ `plc_connections` 行が書き換えられていた場合、
+    /// apply は conflict として拒否され、pending 行は `failed` へ遷移して
+    /// 具体的な `failure_reason` を残す。その後 `failed` からキャンセル
+    /// できることも確認する（従来は `pending` のみキャンセル可能だった）。
+    #[tokio::test]
+    async fn pending_apply_plc_connection_update_conflicts_when_row_changed_out_of_band() {
+        let env = test_env().await;
+
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line-fp-conflict", "host": "127.0.0.1", "port": 15031 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+        let conn_id = conn["id"].as_i64().unwrap();
+
+        let start = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/start")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        let queued = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::put(format!("/api/plc-connections/{conn_id}"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "name": "line-fp-conflict-queued", "host": "127.0.0.1", "port": 15031 })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued.status(), StatusCode::ACCEPTED);
+        let queued_bytes = axum::body::to_bytes(queued.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let queued_body: serde_json::Value = serde_json::from_slice(&queued_bytes).unwrap();
+        let pending_id = queued_body["pending"]["id"].as_i64().unwrap();
+
+        // 「別経路での編集」を、pending queue を経由しない直接の service 層
+        // 呼び出し（`update_tx` ではなく非トランザクション `update`）で
+        // 模す - 別セッションが同じ行を先に書き換えたケースに相当する。
+        PlcConnectionService::new(env.pool.clone())
+            .update(
+                conn_id,
+                PlcConnectionInput {
+                    name: "line-fp-conflict-hijacked".to_string(),
+                    protocol: "modbus-tcp".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: 15031,
+                    unit_id: 1,
+                    enabled: true,
+                    simulation: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let stop = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/stop")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop.status(), StatusCode::OK);
+
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{pending_id}/apply"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "pending_apply_conflict");
+        assert_eq!(body["resource"], "plc_connections");
+
+        let pending = PendingChangesService::new(env.pool.clone())
+            .get(pending_id)
+            .await
+            .unwrap();
+        assert_eq!(pending.state, PendingChangeState::Failed);
+        let failure_reason = pending
+            .failure_reason
+            .expect("failure_reason should be set");
+        assert!(
+            !failure_reason.is_empty() && failure_reason != "pending change の適用に失敗しました",
+            "failure_reason should be specific, not generic: {failure_reason}"
+        );
+        assert!(
+            failure_reason.contains("変更されています"),
+            "failure_reason should explain the staleness conflict: {failure_reason}"
+        );
+
+        // 元の接続は「別経路」の編集内容のまま(適用は拒否されたので上書き
+        // されていない)。
+        let untouched = PlcConnectionService::new(env.pool.clone())
+            .get(conn_id)
+            .await
+            .unwrap();
+        assert_eq!(untouched.name, "line-fp-conflict-hijacked");
+
+        // failed からのキャンセルは新たに許可された復旧経路。
+        let cancel_response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{pending_id}/cancel"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancel_response.status(), StatusCode::OK);
+        let cancel_bytes = axum::body::to_bytes(cancel_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let cancel_body: serde_json::Value = serde_json::from_slice(&cancel_bytes).unwrap();
+        assert_eq!(cancel_body["state"], "canceled");
+    }
+
+    /// TAG-P0-3 follow-up（2026-08-12）: `collection_groups.update` でも
+    /// 同じ conflict 検出が働く。
+    #[tokio::test]
+    async fn pending_apply_collection_group_update_conflicts_when_row_changed_out_of_band() {
+        let env = test_env().await;
+
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line-group-fp", "host": "127.0.0.1", "port": 15032 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+        let conn_id = conn["id"].as_i64().unwrap();
+
+        let (status, group) = admin_post(
+            &env.router,
+            "/api/collection-groups",
+            &env.admin_token,
+            json!({ "name": "fast", "plcConnectionId": conn_id, "periodMs": 100 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{group:?}");
+        let group_id = group["id"].as_i64().unwrap();
+
+        let start = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/start")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        let queued = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::put(format!("/api/collection-groups/{group_id}"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "fast-queued",
+                            "plcConnectionId": conn_id,
+                            "periodMs": 100
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued.status(), StatusCode::ACCEPTED);
+        let queued_bytes = axum::body::to_bytes(queued.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let queued_body: serde_json::Value = serde_json::from_slice(&queued_bytes).unwrap();
+        let pending_id = queued_body["pending"]["id"].as_i64().unwrap();
+
+        // 別経路での編集（pending queue を経由しない直接の service 呼び出し）。
+        CollectionGroupService::new(env.pool.clone())
+            .update(
+                group_id,
+                CollectionGroupInput {
+                    name: "fast-hijacked".to_string(),
+                    plc_connection_id: conn_id,
+                    period_ms: 100,
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        let stop = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/stop")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop.status(), StatusCode::OK);
+
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{pending_id}/apply"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "pending_apply_conflict");
+        assert_eq!(body["resource"], "collection_groups");
+
+        let pending = PendingChangesService::new(env.pool.clone())
+            .get(pending_id)
+            .await
+            .unwrap();
+        assert_eq!(pending.state, PendingChangeState::Failed);
+    }
+
+    /// TAG-P0-3 follow-up（2026-08-12）、最重要の回帰ガード:
+    /// フィンガープリントは per-resource でなければならない
+    /// （グローバル `configured_revision` 比較に「こっそり」置き換えられて
+    /// いないことを保証する）。無関係な2件の pending change（別々の
+    /// `plc_connections` 行）を running 中に queue し、片方を適用して
+    /// `commit_catalog_and_notify` にグローバル revision を進めさせた後、
+    /// もう片方の適用が「global revision が動いた」ことに巻き込まれず
+    /// 成功することを確認する。
+    #[tokio::test]
+    async fn pending_apply_fingerprint_is_per_resource_not_global_revision() {
+        let env = test_env().await;
+
+        let (status, conn_a) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line-a", "host": "127.0.0.1", "port": 15040 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn_a:?}");
+        let conn_a_id = conn_a["id"].as_i64().unwrap();
+
+        let (status, conn_b) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line-b", "host": "127.0.0.1", "port": 15041 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn_b:?}");
+        let conn_b_id = conn_b["id"].as_i64().unwrap();
+
+        let start = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/start")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        // A・B それぞれ独立に pending update を queue する。
+        let queue_update = |id: i64, name: &'static str, port: i64| {
+            let router = env.router.clone();
+            let token = env.admin_token.clone();
+            async move {
+                let response = router
+                    .oneshot(
+                        HttpRequest::put(format!("/api/plc-connections/{id}"))
+                            .header("Authorization", format!("Bearer {token}"))
+                            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                json!({ "name": name, "host": "127.0.0.1", "port": port })
+                                    .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::ACCEPTED);
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                body["pending"]["id"].as_i64().unwrap()
+            }
+        };
+        let pending_a_id = queue_update(conn_a_id, "line-a-renamed", 15040).await;
+        let pending_b_id = queue_update(conn_b_id, "line-b-renamed", 15041).await;
+
+        let stop = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/stop")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop.status(), StatusCode::OK);
+
+        // A を先に適用する - 成功すれば `commit_catalog_and_notify` が
+        // グローバル `configured_revision` を進める。
+        let apply_a = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{pending_a_id}/apply"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(apply_a.status(), StatusCode::OK);
+        let apply_a_bytes = axum::body::to_bytes(apply_a.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let apply_a_body: serde_json::Value = serde_json::from_slice(&apply_a_bytes).unwrap();
+        assert_eq!(apply_a_body["state"], "applied");
+
+        // B の適用は、A の適用でグローバル revision が進んだことに巻き込ま
+        // れず成功しなければならない - B のフィンガープリントは B 自身の
+        // 行に対して取られており、A の変更とは無関係だから(per-resource
+        // ガードの核心)。
+        let apply_b = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{pending_b_id}/apply"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let apply_b_bytes_status = apply_b.status();
+        let apply_b_bytes = axum::body::to_bytes(apply_b.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let apply_b_body: serde_json::Value = serde_json::from_slice(&apply_b_bytes).unwrap();
+        assert_eq!(
+            apply_b_bytes_status,
+            StatusCode::OK,
+            "B's apply must not be rejected by A's global revision bump: {apply_b_body:?}"
+        );
+        assert_eq!(apply_b_body["state"], "applied");
+
+        let updated_a = PlcConnectionService::new(env.pool.clone())
+            .get(conn_a_id)
+            .await
+            .unwrap();
+        assert_eq!(updated_a.name, "line-a-renamed");
+        let updated_b = PlcConnectionService::new(env.pool.clone())
+            .get(conn_b_id)
+            .await
+            .unwrap();
+        assert_eq!(updated_b.name, "line-b-renamed");
     }
 }
