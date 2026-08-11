@@ -31,6 +31,9 @@ export const TOKEN_STORAGE_KEY = 'banto.auth.token';
  * login」を自動判定するので、実行順が入れ替わっても2つ目の spec は同じ
  * 資格情報でログインできる（setup は一度しか成功しないため、想定と異なる
  * 順で実行された場合の保険）。
+ * したがって `fetchAuthToken`/`ensureLoggedIn` を使う新規 spec は、ファイル名を
+ * `banto-hub-smoke.spec.ts` より辞書順で後になるように付けること（smoke より
+ * 先に走ると smoke の初回セットアップ DOM 検証を壊す）。
  */
 export const HUB_ADMIN_USERNAME = 'e2e-hub-admin';
 export const HUB_ADMIN_PASSWORD = 'E2eHubAdminPass1';

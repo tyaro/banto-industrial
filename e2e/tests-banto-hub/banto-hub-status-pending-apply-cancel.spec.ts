@@ -3,6 +3,15 @@
  *
  * - 収集中に構成変更を送ると pending へ積まれる
  * - status 画面の Pending changes からキャンセル/適用できる
+ *
+ * ファイル名について: 全 spec は単一 webServer / 単一 SQLite DB を共有し、
+ * `banto-hub-smoke.spec.ts` の test 1「first-run setup」だけが「DB 未初期化
+ * ＝初回セットアップ画面が出る」ことを実 DOM で検証する（`banto-hub-auth.ts`
+ * の `fetchAuthToken` 参照）。本 spec の `beforeAll` は `fetchAuthToken` で
+ * 認証を取得する際に DB を初期化してしまうため、ファイル名順で smoke より
+ * 先に実行されると smoke test 1 を壊す。そのため `banto-hub-pending-...`
+ * ではなく `banto-hub-status-pending-...`（`st` > `sm`）とし、辞書順で
+ * smoke より後にソートされるようにしている。
  */
 import { expect, test, type Page } from '@playwright/test';
 import { CSRF_HEADERS, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
