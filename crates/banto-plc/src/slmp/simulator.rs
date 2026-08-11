@@ -16,13 +16,16 @@
 //!
 //! The alternative - a fake in place of `slmp::SLMPClient` behind a trait -
 //! would have been less code, and would have tested nothing that matters. The
-//! two things most likely to be wrong in `slmp/mod.rs` are (a) whether
-//! [`super::classify_io_error`]'s reading of the wrapped crate's error
-//! *messages* still holds, and (b) whether a bit-unit response's nibble
-//! packing is decoded the way the crate expects. Both live strictly *inside*
-//! the crate, so only real bytes on a real socket exercise them. That is also
-//! what makes `slmp_end_code_is_bad_not_fatal` a working tripwire on the
-//! dependency rather than a restatement of this crate's own assumptions.
+//! two things most likely to be wrong in `slmp/mod.rs` are (a) whether the
+//! wrapped crate actually keeps returning `slmp::SlmpError::Device { .. }`
+//! for a non-zero end code and `slmp::SlmpError::Framing(_)` for a corrupt
+//! frame - the structured distinction [`super::classify_slmp_error`] matches
+//! on (H9, docs/h9-slmp-structured-error-spec.md) - and (b) whether a
+//! bit-unit response's nibble packing is decoded the way the crate expects.
+//! Both live strictly *inside* the crate, so only real bytes on a real socket
+//! exercise them. That is also what makes `slmp_end_code_is_bad_not_fatal` a
+//! working tripwire on the dependency rather than a restatement of this
+//! crate's own assumptions.
 //!
 //! The frame layout implemented below is the 4E binary request/response pair as
 //! the wrapped crate builds and validates it (`slmp::SLMPClient`'s
@@ -70,9 +73,11 @@ struct State {
     end_codes: HashMap<(SlmpDevice, u32), u16>,
     /// When set, every response is emitted with a data-length field that
     /// disagrees with the bytes actually sent. Exists to exercise the *other*
-    /// half of the wrapped crate's `InvalidData` errors: a framing failure,
-    /// which must be classified connection-fatal even though it shares an
-    /// `ErrorKind` with a perfectly recoverable end code.
+    /// half of the end-code/framing pair: a framing failure
+    /// (`slmp::SlmpError::Framing(_)`), which must be classified
+    /// connection-fatal even though the pre-H9 wrapped crate used to report
+    /// it through the same `io::ErrorKind::InvalidData` as a perfectly
+    /// recoverable end code.
     malformed: bool,
     /// When set, requests are never answered - for exercising the client's
     /// response timeout without needing an unreachable host.

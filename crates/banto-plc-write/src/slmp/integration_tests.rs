@@ -2,8 +2,8 @@
 //! [`super::simulator::Simulator`] - the scenarios only real TCP framing
 //! through the wrapped `slmp` crate can exercise. `planning.rs`/`encode.rs`
 //! cover the pure logic in isolation and `mod.rs`'s unit tests cover the error
-//! classifier over hand-written strings; this file is about the parts that only
-//! exist once the wrapped crate and a socket are involved - and, crucially, the
+//! classifier over hand-built `slmp::SlmpError` values; this file is about the
+//! parts that only exist once the wrapped crate and a socket are involved - and, crucially, the
 //! write/read *round trips* that prove a written value lands with the right
 //! bytes and word order (read back through the real `banto_plc::SlmpClient`, not
 //! just inspected in the simulator).
@@ -241,12 +241,40 @@ async fn both_cpu_series_write_frame_layouts_work() {
 /// the real wrapped crate from real bytes on a *write*, must classify as a
 /// per-request `Bad` and leave its batch-mates alone, and the connection must
 /// stay usable afterwards.
+///
+/// H9 (docs/h9-slmp-structured-error-spec.md, 2026-08-12) replaced this test's
+/// original message-text tripwire with a direct check on the real crate's
+/// structured `slmp::SlmpError`, mirroring `banto-plc`'s read-side test: if a
+/// future `slmp` release ever stopped returning `SlmpError::Device` for a
+/// non-zero end code, this is what fails, not a string comparison.
 #[tokio::test]
 async fn slmp_write_end_code_is_bad_not_fatal() {
     let sim = Simulator::start().await;
     // D0 and D100 are far apart, so the planner puts them in separate groups;
     // injecting on the D0 group must leave the D100 write intact.
     sim.inject_end_code(SlmpDevice::D, 0, 0xC061); // WrongLength
+
+    // Structured check on the wrapped crate's own error type first, bypassing
+    // this crate's classification entirely.
+    let mut raw = slmp::SLMPClient::new(fast_config(&sim).to_wire_props());
+    raw.set_send_timeout(Duration::from_millis(100));
+    raw.set_recv_timeout(Duration::from_millis(100));
+    raw.connect().await.expect("raw connect");
+    let raw_err = raw
+        .bulk_write(
+            slmp::Device {
+                device_type: SlmpDevice::D.to_wire(),
+                address: 0,
+            },
+            &[slmp::TypedData::U16(5)],
+        )
+        .await
+        .expect_err("an injected end code must surface as an Err");
+    assert!(
+        matches!(raw_err, slmp::SlmpError::Device { end_code: 0xC061 }),
+        "expected SlmpError::Device {{ end_code: 0xC061 }}, got {raw_err:?}"
+    );
+    raw.close().await;
 
     let mut client = SlmpWriteClient::new(fast_config(&sim));
     client.connect().await.unwrap();
@@ -264,8 +292,7 @@ async fn slmp_write_end_code_is_bad_not_fatal() {
             assert_eq!(*code, 0xC061);
             assert!(
                 !message.is_empty(),
-                "the end code's symbolic name should survive translation - if the `slmp` \
-                 crate changed its error message format, `super::parse_end_code` needs updating"
+                "the end code's symbolic name should survive translation"
             );
         }
         other => panic!("expected Bad(SlmpEndCode), got {other:?}"),
@@ -285,13 +312,36 @@ async fn slmp_write_end_code_is_bad_not_fatal() {
     assert_eq!(sim.get_word(SlmpDevice::D, 0), 7);
 }
 
-/// The other half of the pair: a framing failure reaches `classify_io_error`
-/// with the same `ErrorKind::InvalidData` as an end code and must still come out
-/// fatal and tear the client down.
+/// The other half of the pair: a framing failure reaches
+/// [`super::classify_slmp_error`] as a *different* `slmp::SlmpError` variant
+/// (`Framing`, not `Device`) and must still come out fatal and tear the
+/// client down. Together with the test above, this is what proves H9's
+/// structured `SlmpError` is actually doing the separating.
 #[tokio::test]
 async fn a_malformed_frame_is_fatal_and_tears_down_the_connection() {
     let sim = Simulator::start().await;
     sim.emit_malformed_frames();
+
+    // Structured check on the wrapped crate's own error type first.
+    let mut raw = slmp::SLMPClient::new(fast_config(&sim).to_wire_props());
+    raw.set_send_timeout(Duration::from_millis(100));
+    raw.set_recv_timeout(Duration::from_millis(100));
+    raw.connect().await.expect("raw connect");
+    let raw_err = raw
+        .bulk_write(
+            slmp::Device {
+                device_type: SlmpDevice::D.to_wire(),
+                address: 0,
+            },
+            &[slmp::TypedData::U16(1)],
+        )
+        .await
+        .expect_err("a length-inconsistent frame must surface as an Err");
+    assert!(
+        matches!(raw_err, slmp::SlmpError::Framing(_)),
+        "expected SlmpError::Framing(_), got {raw_err:?}"
+    );
+    raw.close().await;
 
     let mut client = SlmpWriteClient::new(fast_config(&sim));
     client.connect().await.unwrap();

@@ -12,10 +12,11 @@
 //! device-state duplication in a test double is acceptable rather than reaching
 //! into another crate's internals. So this is a standalone fake CPU: it speaks
 //! real SLMP 4E bytes (the whole point - the two things most likely to be wrong
-//! in the write client are the wrapped crate's error-*message* classification
-//! and the bit-unit nibble *packing*, both of which only real bytes exercise),
-//! keeps state in plain `HashMap`s, and can inject an end code, a malformed
-//! frame, or a hang.
+//! in the write client are whether the wrapped crate's structured
+//! `slmp::SlmpError` classification (H9, docs/h9-slmp-structured-error-spec.md)
+//! still holds and the bit-unit nibble *packing*, both of which only real
+//! bytes exercise), keeps state in plain `HashMap`s, and can inject an end
+//! code, a malformed frame, or a hang.
 //!
 //! The frame layout is the 4E binary request/response pair as the wrapped
 //! `slmp` crate builds and validates it: a 15-byte prefix, a 2-byte end code (on

@@ -87,7 +87,8 @@
 //! `banto_plc::slmp::SlmpClient::connect`'s body (build a bare
 //! `slmp::SLMPClient` from `SlmpConfig::to_wire_props()`, wire the two
 //! per-crate timeouts, wrap the connect in `SlmpConfig::connect_timeout`, map
-//! `std::io::Error` the same way). This is deliberate duplication, not an
+//! the structured `slmp::SlmpError` (H9,
+//! docs/h9-slmp-structured-error-spec.md) the same way). This is deliberate duplication, not an
 //! oversight: `banto_plc::SlmpClient` is a `PlcClient` that owns its *own*
 //! private `Option<slmp::SLMPClient>` with no seam to hand that socket to
 //! `banto_plc_write::execute_slmp_writes` afterward, so the broker cannot
@@ -906,9 +907,12 @@ async fn connect_attempt(config: SlmpConfig) -> (Box<slmp::SLMPClient>, Result<(
 
     let result = match tokio::time::timeout(config.connect_timeout, client.connect()).await {
         Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(match e.kind() {
-            std::io::ErrorKind::TimedOut => PlcError::ConnectTimeout(addr.clone()),
-            _ => PlcError::Connection(e.to_string()),
+        // H9 (docs/h9-slmp-structured-error-spec.md, 2026-08-12): `connect()`
+        // now returns `slmp::SlmpResult<()>` rather than `io::Result<()>` -
+        // same mapping `banto_plc::slmp::SlmpClient::connect` uses.
+        Ok(Err(e)) => Err(match e {
+            slmp::SlmpError::Timeout => PlcError::ConnectTimeout(addr.clone()),
+            other => PlcError::Connection(other.to_string()),
         }),
         Err(_elapsed) => Err(PlcError::ConnectTimeout(addr.clone())),
     };
@@ -1618,8 +1622,10 @@ mod tests {
         let (handle, task) = spawn_task(1, config, backoff, shutdown_rx);
 
         // Establish the session, then make the simulator unresponsive: the
-        // next request times out (connection-fatal per classify_io_error),
-        // which must fail that request AND drop into reconnect-backoff.
+        // next request times out (connection-fatal per
+        // `banto_plc_write::execute_slmp_writes`'s classification of
+        // `slmp::SlmpError::Timeout`), which must fail that request AND drop
+        // into reconnect-backoff.
         let _ = read_once_connected(&handle, vec![rreq("D0", DataType::U16)]).await;
         sim.hang();
 

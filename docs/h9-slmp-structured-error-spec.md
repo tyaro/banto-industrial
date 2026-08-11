@@ -1,9 +1,12 @@
 # H9: SLMP 構造化エラー — tyaro/slmp への実装仕様と banto 側の受け入れ
 
 作成日: 2026-08-12
-状態: **仕様確定・実装待ち（2段構え）**。2026-08-12 オーナー決定: slmp 本体（`tyaro/slmp`、
-crates.io `slmp`）はオーナーが構造化エラーを実装・publish → その後こちらで banto 側を仕上げる。
-本書は (1) tyaro/slmp が公開すべき API と (2) それを受けて banto 側で行う変更（受け入れ条件）を定める。
+状態: **実装済み**（2026-08-12）。オーナーが `tyaro/slmp`（git 依存、tag `v0.2.0`）で
+§2 の構造化エラー API を実装し、banto 側（§3）を同日中に対応した。banto-plc /
+banto-plc-write の文言パース（`END_CODE_MARKER`/`parse_end_code`/`classify_io_error`）は
+完全削除済み。broker の session/transport 共通化（§3 の5番目）は今回の対応に含めず、
+別スライス候補として improvement-plan.md §H9 に記録した。
+本書は (1) tyaro/slmp が公開した API と (2) それを受けて banto 側で行った変更（受け入れ条件）を記す。
 関連: [improvement-plan.md](improvement-plan.md) §H9、[banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) P3-c。
 
 ## 1. 現状（文言パース依存）
@@ -53,18 +56,22 @@ banto が文言パース無しで「非ゼロ終了コード」と「フレー�
   （「終了コードに到達した＝完全なフレームだった」という不変条件が非致命判定の根拠）。
 - 破壊的変更になるので **semver を上げて publish**（例 `0.1.24` or `0.2.0`）。
 
-## 3. banto 側の受け入れ（実装待ち＝こちらで対応）
+## 3. banto 側の受け入れ（実装済み、2026-08-12）
 
-slmp の新バージョンが出たら、こちらで:
-
-1. workspace `Cargo.toml` の `slmp` を新バージョンへ更新。
+1. workspace `Cargo.toml` の `slmp` を `{ git = "https://github.com/tyaro/slmp", tag = "v0.2.0" }`
+   へ更新（deny.toml `[sources] allow-git` に対応 URL を追加）。
 2. `crates/banto-plc/src/slmp/mod.rs`: `classify_io_error` / `parse_end_code` / `END_CODE_MARKER` を削除し、
-   `SlmpError::Device { end_code }` → `PlcError::SlmpEndCode { code, message }`（message は banto 自前の
-   終了コード→名前テーブル）、`Framing`/`Io` → 致命（`PlcError::Protocol`/`Connection`）、`Timeout` →
-   `PlcError::ResponseTimeout`、`NotConnected` → `PlcError::NotConnected` に**構造化マッチ**で置き換える。
-3. `crates/banto-plc-write` 側の同種パース箇所も同様に置換。
-4. tripwire テスト2本を**構造化エラー版**へ置き換え（文言形式ではなく `SlmpError` variant を検証）。
-5. 併せて H9 のもう一項目「broker の session/transport 層の共通化」を banto 側リファクタとして実施
-   （§H9 記載。slmp API 差し替えと同時が効率的）。
+   `SlmpError::Device { end_code }` → `PlcError::SlmpEndCode { code, message }`（message は
+   `slmp::end_code_name` 由来）、`Framing`/`Io` → 致命（`PlcError::Protocol`/`Connection`）、`Timeout` →
+   `PlcError::ResponseTimeout`、`NotConnected` → `PlcError::NotConnected` の**構造化マッチ**
+   （`classify_slmp_error`）へ置き換え済み。
+3. `crates/banto-plc-write` 側の同種パース箇所も同様に置換済み（`classify_slmp_error` を
+   `PlcWriteError` 版として実装)。
+4. tripwire テスト2本を**構造化エラー版**へ置換済み（生の `slmp::SLMPClient` を直接叩いて
+   `slmp::SlmpError::Device`/`Framing` variant を直接検証する形へ拡張）。
+5. 「broker の session/transport 層の共通化」は**今回のスコープには含めず**、別スライス候補として
+   improvement-plan.md §H9 に記録した（`connect_attempt` の型変更 `io::Error`→`slmp::SlmpError` の
+   コンパイル対応のみ実施）。
 
-**受け入れ条件（§H9）**: 文言パース（`END_CODE_MARKER`）の完全削除、tripwire テストの構造化エラー版への置換。
+**受け入れ条件（§H9、達成）**: 文言パース（`END_CODE_MARKER`）の完全削除、tripwire テストの構造化
+エラー版への置換。`grep -rn END_CODE_MARKER crates/` はヒット0。
