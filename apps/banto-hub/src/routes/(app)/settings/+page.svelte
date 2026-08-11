@@ -28,7 +28,8 @@
 	import {
 		applyConfigPackage,
 		inspectConfigPackage,
-		loadConfigPackage
+		loadConfigPackage,
+		isConfigPackageImportAbortedError
 	} from '$lib/banto/configPackageAdmin';
 	import {
 		parseConfigPackage,
@@ -38,7 +39,12 @@
 		type ConfigPackageImportSummary
 	} from '$lib/banto/configPackage';
 
+	const IMPORT_BLOCKED_MESSAGE = '構成パッケージの取り込みは収集を停止してから実行してください';
+
 	function errorMessage(err: unknown): string {
+		if (isConfigPackageImportAbortedError(err)) {
+			return err.message;
+		}
 		if (isProviderError(err)) {
 			if (err.body.kind === 'validation' && err.body.field_errors.length > 0) {
 				return err.body.field_errors.map((fe) => fe.message).join(' / ');
@@ -129,6 +135,13 @@
 	let mqttSaving = $state(false);
 	let mqttError: string | null = $state(null);
 	let mqttConnected = $state(false);
+	/**
+	 * 監査③（2026-08-12）是正: 収集が停止中でない間は構成パッケージの
+	 * インポートを実行させない UX ヒント用。5秒毎に `loadMqttStatus`
+	 * 経由で更新される best-effort な値であり、権威ある判定ではない
+	 * （権威ある判定は `handleApplyConfigPackage` 冒頭の再フェッチ）。
+	 */
+	let collectionState: string | null = $state(null);
 
 	function applyMqttSettings(loaded: MqttSettings): void {
 		mqttEnabled = loaded.enabled;
@@ -147,6 +160,7 @@
 		try {
 			const status = await getHubStatus();
 			mqttConnected = status.mqtt.connected;
+			collectionState = status.collection_state;
 		} catch {
 			// 状態表示だけの補助情報 - 取得失敗はエラー表示せず黙って保持する。
 		}
@@ -233,6 +247,15 @@
 	let configPackageImportSummary: ConfigPackageImportSummary | null = $state(null);
 	let mqttImportUsername = $state('');
 	let mqttImportPassword = $state('');
+
+	/**
+	 * 監査③（2026-08-12）是正: 収集稼働中の構成パッケージ import はサイレント
+	 * に壊れる（`configPackageAdmin.ts` の doc comment参照）ため、
+	 * `collectionState` が `'stopped'` 以外の間はボタンを無効化し警告文を
+	 * 出す。best-effort な UX ヒントであり、権威ある判定は
+	 * `handleApplyConfigPackage` 冒頭の再フェッチで行う。
+	 */
+	const importGuardActive = $derived(collectionState !== null && collectionState !== 'stopped');
 
 	function applyGrpcSettings(loaded: GrpcSettings): void {
 		grpcEnabled = loaded.enabled;
@@ -346,6 +369,15 @@
 		configPackageApplyError = null;
 		configPackageImportSummary = null;
 		try {
+			// 監査③（2026-08-12）是正: 収集稼働中の import はサイレントに
+			// 壊れる（configPackageAdmin.ts の doc comment参照）ため、実行
+			// 直前に必ず最新の収集状態を取り直して確認する（`importGuardActive`
+			// は5秒ポーリングの古い値かもしれず、権威ある判定には使えない）。
+			const freshStatus = await getHubStatus();
+			if (freshStatus.collection_state !== 'stopped') {
+				configPackageApplyError = IMPORT_BLOCKED_MESSAGE;
+				return;
+			}
 			const summary = await applyConfigPackage(configPackageData, {
 				mqttUsername: mqttImportUsername.trim() === '' ? undefined : mqttImportUsername,
 				mqttPassword: mqttImportPassword
@@ -640,10 +672,14 @@
 						</p>
 					{/if}
 
+					{#if importGuardActive}
+						<p class="note warning">{IMPORT_BLOCKED_MESSAGE}</p>
+					{/if}
+
 					<button
 						type="button"
 						onclick={handleApplyConfigPackage}
-						disabled={configPackageApplying || configPackageWorking}
+						disabled={configPackageApplying || configPackageWorking || importGuardActive}
 					>
 						インポートを実行
 					</button>

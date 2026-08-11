@@ -283,8 +283,61 @@ async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
 		});
 	}
 
+	if (response.status === 202) {
+		let body: unknown;
+		try {
+			body = await response.json();
+		} catch {
+			throw new ProviderError({
+				kind: 'other',
+				message: `${response.status} ${response.statusText}`
+			});
+		}
+		if (isQueuedWhileRunningBody(body)) throw new QueuedWhileRunningError(body);
+		throw new ProviderError({
+			kind: 'other',
+			message: `${response.status} ${response.statusText}`
+		});
+	}
+
 	if (init.expectNoContent) return undefined as T;
 	return (await response.json()) as T;
+}
+
+/**
+ * 監査③（2026-08-12）是正: 収集稼働中は plc-connections/collection-groups/tags
+ * の作成・更新・削除が即時適用されず `queue_pending_registry_change`
+ * （`apps/banto-hub/core/src/rest.rs`）が 202 Accepted +
+ * `QueuedPendingChangeResponse { queued: true, pending, status, message }`
+ * を返す。`response.ok` は 202 も真になるため、これを検出せず素通しすると
+ * 呼び出し元が「作成済みリソース」型（`PlcConnection`/`CollectionGroup`/
+ * `Tag`）として扱ってしまい `.id`/`.name` が `undefined` になる
+ * （configPackageAdmin.ts の import がこれで壊れていた）。この 202 を
+ * 検出して判別可能な例外に変換し、呼び出し元に「作成済みではなくキュー
+ * 投入された」ことを必ず伝える。
+ */
+export class QueuedWhileRunningError extends Error {
+	readonly pending: unknown;
+	readonly status: unknown;
+
+	constructor(body: { message: string; pending?: unknown; status?: unknown }) {
+		super(body.message);
+		this.name = 'QueuedWhileRunningError';
+		this.pending = body.pending;
+		this.status = body.status;
+	}
+}
+
+export function isQueuedWhileRunningError(error: unknown): error is QueuedWhileRunningError {
+	return error instanceof QueuedWhileRunningError;
+}
+
+function isQueuedWhileRunningBody(
+	value: unknown
+): value is { queued: true; message: string; pending?: unknown; status?: unknown } {
+	if (typeof value !== 'object' || value === null) return false;
+	const v = value as { queued?: unknown; message?: unknown };
+	return v.queued === true && typeof v.message === 'string';
 }
 
 // --- PLC connections --------------------------------------------------------
