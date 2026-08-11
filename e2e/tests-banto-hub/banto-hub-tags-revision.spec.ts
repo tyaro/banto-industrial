@@ -16,7 +16,7 @@
  * 相当）が UI より先に同じタグを更新して revision を進める」ことで作る -
  * UI 側の編集フォームは古い revision を掴んだまま保存を試みる。
  */
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
 import { CSRF_HEADERS, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
 
 const CONNECTION_NAME = 'e2e-revision-plc';
@@ -40,6 +40,45 @@ interface TagResponse {
 	revision: number;
 }
 
+/**
+ * この spec が使う固定名（CONNECTION_NAME/GROUP_NAME）の PLC接続・収集
+ * グループ・配下タグを、存在すれば掃除する。plc_connections / collection_groups
+ * は `name` に UNIQUE 制約があるため（`crates/banto-tags/migrations/0001,
+ * 0002`）、失敗テストが `describe.serial` でリトライされて beforeAll が
+ * 再走すると、前回作成済みの同名リソースが残ったまま POST して UNIQUE
+ * 違反で not-ok になり beforeAll ごと落ちる - それを防ぐための冪等掃除。
+ * FK は RESTRICT なので削除順は タグ → グループ → 接続。
+ */
+async function cleanupExistingFixtures(
+	request: APIRequestContext,
+	headers: Record<string, string>
+): Promise<void> {
+	const groupsRes = await request.get('/api/collection-groups', { headers });
+	if (groupsRes.ok()) {
+		const groups = (await groupsRes.json()) as Array<{ id: number; name: string }>;
+		const existingGroup = groups.find((g) => g.name === GROUP_NAME);
+		if (existingGroup) {
+			const tagsRes = await request.get('/api/tags', { headers });
+			if (tagsRes.ok()) {
+				const tags = (await tagsRes.json()) as Array<{ id: number; collectionGroupId: number }>;
+				for (const tag of tags.filter((t) => t.collectionGroupId === existingGroup.id)) {
+					await request.delete(`/api/tags/${tag.id}`, { headers });
+				}
+			}
+			await request.delete(`/api/collection-groups/${existingGroup.id}`, { headers });
+		}
+	}
+
+	const connectionsRes = await request.get('/api/plc-connections', { headers });
+	if (connectionsRes.ok()) {
+		const connections = (await connectionsRes.json()) as Array<{ id: number; name: string }>;
+		const existingConnection = connections.find((c) => c.name === CONNECTION_NAME);
+		if (existingConnection) {
+			await request.delete(`/api/plc-connections/${existingConnection.id}`, { headers });
+		}
+	}
+}
+
 test.describe.serial('banto-hub タグ更新の楽観的ロック + 競合時の差分表示 (TAG-UX-C)', () => {
 	let page: Page;
 	let authedHeaders: Record<string, string>;
@@ -53,6 +92,10 @@ test.describe.serial('banto-hub タグ更新の楽観的ロック + 競合時の
 		const token = await fetchAuthToken(page.request);
 		await injectAuthToken(page, token);
 		authedHeaders = { ...CSRF_HEADERS, Authorization: `Bearer ${token}` };
+
+		// 失敗テストのリトライで beforeAll が再走した場合に備え、前回分の
+		// 同名リソースを先に掃除しておく（初回実行では何もしない）。
+		await cleanupExistingFixtures(page.request, authedHeaders);
 
 		// 前提データ: シミュレーションモードの PLC接続 + 収集グループ +
 		// タグ1件（実 PLC/実ネットワークへは繋がない）。新規行は
@@ -203,7 +246,11 @@ test.describe.serial('banto-hub タグ更新の楽観的ロック + 競合時の
 		await unitInput.fill(AFTER_RESOLVE_UNIT);
 		await drawer.getByRole('button', { name: '保存' }).click();
 
-		await expect(page.getByText('更新しました')).toBeVisible();
+		// 同一 page で複数回保存するため、先行テストのトーストが
+		// AUTO_DISMISS_MS（4000ms）以内に消えないと `getByText` が複数
+		// 要素にマッチし strict mode violation になる - 最新トーストに
+		// スコープする。
+		await expect(page.getByText('更新しました').last()).toBeVisible();
 
 		const afterRes = await page.request.get(`/api/tags/${tagId}`, { headers: authedHeaders });
 		expect(afterRes.ok()).toBe(true);
@@ -252,7 +299,9 @@ test.describe.serial('banto-hub タグ更新の楽観的ロック + 競合時の
 		// 「自分の内容で再保存」は `expectedRevision` をサーバー最新
 		// （競合検出時に更新済みの revision=4）に差し替えて再送信するため、
 		// 今度は成功し、ローカルの入力（UI_ATTEMPTED_UNIT_2）が勝つ。
-		await expect(page.getByText('更新しました')).toBeVisible();
+		// 同一 page で複数回保存するため最新トーストにスコープ（strict mode
+		// violation 回避）。
+		await expect(page.getByText('更新しました').last()).toBeVisible();
 		await expect(drawer.getByText('他のクライアントが先に更新しています')).toHaveCount(0);
 		await expect(unitInput).toHaveValue(UI_ATTEMPTED_UNIT_2);
 
