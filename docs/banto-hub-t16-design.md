@@ -15,10 +15,15 @@ Desktop 引き継ぎの安全化・`BANTO_BIND`対応 navigate/probe・Administr
 「サービスを開始」→Service 接続を確認済み**（§3 第二スライス実機検証）。
 T16-2 第三スライス（openapi 応答への profile-id 埋め込み・
 `HttpHubHealthProbe`のワイヤ確認）実装済み（下記 §3 第三スライス実装メモ、
-§5 参照）- これで T16-2 第一スライスの既知の gap は全て解消済み。**
-最終検証日(コード照合): 2026-08-10
+§5 参照）- これで T16-2 第一スライスの既知の gap は全て解消済み。
+**切替ウィザード UI**（`/status` の Windows サービスカード＋シェル最小
+invoke・実`ShellDesktopControl`・自動起動 UAC）実装済み（下記 §3
+切替ウィザード実装メモ）。Windows 実機での Desktop→Service UI 経路は
+未検証。**
+最終検証日(コード照合): 2026-08-11
 最終検証日(Windows 実機): 2026-08-10（T16-2 シェル第一・第二スライス、
-Operators 対話ユーザー。トレイ開始/停止の`HostSwitchEngine`完了待ちを含む）
+Operators 対話ユーザー。トレイ開始/停止の`HostSwitchEngine`完了待ちを含む。
+切替ウィザード UI 経路は未検証）
 基準コミット: `396e927`（main、T16-1 マージ後）。T16-1 の実装は本設計と
 同じ PR（`cursor/t16-1-tray-status-e3cb`、#101）で追加。
 
@@ -277,6 +282,26 @@ banto-hub-core --lib`（305 passed, 4 ignored）/ 影響する結合テスト
 > ワイヤ確認だけで結果が決まる（lock を一切取得しない）よう設計し、この
 > 衝突面を増やさないようにした - 既存テスト間の衝突は本スライス以前からの
 > 既知の制約であり、このスライスのスコープ外として残す。
+
+> **切替ウィザード UI 実装メモ（2026-08-11）**: desktop-plan §9.7 の
+> 「Windows サービス」カードを Hub 管理 UI（`/status`）に追加し、シェルへ
+> 最小の Tauri invoke を配線した（運転 API の二重実装はしない）。
+>
+> - **`ShellDesktopControl`**: Desktop→Service で`RunningHub::shutdown`を
+>   実行し、`is_stopped`は hub 未保有で`true`（ダミー実装を置き換え）。
+> - **invoke**: `host_switch_status` / `switch_to_service` /
+>   `switch_to_desktop` / `set_service_autostart`（`host_switch_ipc.rs`）。
+>   進捗は`host_switch_progress`イベント。トレイ開始/停止と単一飛行フラグを
+>   共有。自動起動は`banto-hub-elev.exe`を`ShellExecuteExW`（verb `runas`）で
+>   起動。
+> - **UI**: `hostSwitchShell.ts` / `hostSwitchGate.ts`。ゲートは Hub Admin +
+>   `can_operate` + `last_config_error == null` + revision 取得済み。非シェル
+>   では「ローカルシェルが必要」と表示して無効化。
+> - out of scope: `/operation` ナビ再編・共通運転バー（T18）、遠隔ブラウザ SCM、
+>   NSIS。
+>
+> 検証: コード照合時点では単体（ゲート vitest）・`cargo`/型チェックを実施。
+> **Windows 実機での Desktop→Service UI 経路・自動起動 UAC は未検証**。
 
 ## 4. T16-0 設計（P3）
 

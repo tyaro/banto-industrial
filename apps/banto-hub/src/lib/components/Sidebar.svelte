@@ -7,6 +7,8 @@
 	import { isAdmin } from '$lib/permissions';
 	import { APP_NAME } from '$lib/appName';
 
+	let { pendingCount = 0 }: { pendingCount?: number } = $props();
+
 	function isActive(path: string): boolean {
 		return page.url.pathname === path || page.url.pathname.startsWith(path + '/');
 	}
@@ -34,7 +36,12 @@
 			>
 				<span class="icon">{item.icon}</span>
 				{#if !settings.sidebarCollapsed}
-					<span>{item.label}</span>
+					<span class="nav-label">
+						<span>{item.label}</span>
+						{#if item.path === '/status' && pendingCount > 0}
+							<span class="pending-badge">{pendingCount}</span>
+						{/if}
+					</span>
 				{/if}
 			</a>
 		{/each}
@@ -105,5 +112,27 @@
 	.icon {
 		width: 1.25rem;
 		text-align: center;
+	}
+
+	.nav-label {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.45rem;
+		min-width: 0;
+	}
+
+	.pending-badge {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		min-width: 1.35rem;
+		height: 1.35rem;
+		padding: 0 0.4rem;
+		border-radius: 999px;
+		background: color-mix(in srgb, var(--banto-danger) 12%, transparent);
+		color: var(--banto-danger);
+		font-size: 0.72rem;
+		font-weight: 700;
+		line-height: 1;
 	}
 </style>

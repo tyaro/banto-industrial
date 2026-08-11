@@ -145,11 +145,15 @@
 //!   進め、終わったら[`apply_startup_outcome`]で結果を画面・トレイへ反映する
 //!   （[`retry_startup`]と共通の[`apply_outcome_and_sync`]経由）。
 //! - [`ShellDesktopControl`][]: `HostSwitchEngine`が要求する
-//!   [`banto_hub_core::host_switch::DesktopHostControl`]の最小実装。
-//!   このスライスでトレイから起動できる遷移は「Offline→Service」
-//!   （サービスを開始）と「Service→Desktop」（サービスを停止）の2方向のみで、
-//!   どちらも`request_stop`/`is_stopped`（Desktop→Service 側でのみ使われる -
-//!   このスライスではトレイに無い操作）を経由しない。
+//!   [`banto_hub_core::host_switch::DesktopHostControl`]の実装。
+//!   Desktop→Service では`request_stop`がこのプロセスの`RunningHub`を
+//!   `shutdown`し、`is_stopped`は hub 未保有で`true`を返す
+//!   （切替ウィザード UI / `switch_to_service` invoke がこの経路を使う）。
+//! - [`host_switch_ipc`]: Hub 管理 UI 向けの最小 invoke
+//!   （`host_switch_status` / `switch_to_service` / `switch_to_desktop` /
+//!   `set_service_autostart`）と`host_switch_progress`イベント。
+//!   **運転 API（タグ CRUD・収集開始/停止）の invoke は作らない** -
+//!   シェル composition（SCM／切替／昇格）だけを許可する。
 //! - navigate/probe 先ホストの解決（[`resolve_navigate_host`]、既知の gap
 //!   「navigate 先を`127.0.0.1`固定にしている」への対応）:
 //!   `BANTO_BIND`（`console`/`service`ホストと同じ env）が設定されていれば
@@ -194,6 +198,7 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_notification::NotificationExt;
 use tokio::sync::Mutex as AsyncMutex;
 
+mod host_switch_ipc;
 mod tray_status;
 
 /// メインウィンドウのラベル - `tauri.conf.json` の `app.windows[0].label` と
@@ -207,7 +212,7 @@ const MAIN_WINDOW_LABEL: &str = "main";
 /// [`watch_collection_status`]が別途トレイへ反映するため、ここでは
 /// 「今どのホストを見せているか」の分岐にだけ使う。
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ShellView {
+pub(crate) enum ShellView {
     /// このプロセスが保有する[`RunningHub`]を表示中。
     Desktop,
     /// Windows サービス（`BantoHub`、`Running`かつ health `Healthy`確認済み）
@@ -259,7 +264,7 @@ struct ProbeTarget {
 }
 
 /// `app.manage()` で保持するアプリ全体の唯一の可変状態。
-struct AppState {
+pub(crate) struct AppState {
     /// 稼働中の Hub。デスクトップホストとして起動できた場合のみ`Some`
     /// （サービス接続時・fallback 時は`None` - [`show_fallback_ui`]・
     /// [`show_startup_error`]参照）。
@@ -280,7 +285,7 @@ struct AppState {
     controller: StdMutex<Option<Arc<CollectionController>>>,
     /// T16-2: 現在シェルが表示している見え方（[`ShellView`]）。
     /// トレイメニューの再構築・「サービスを開始/停止」「再試行」の分岐に使う。
-    view: StdMutex<ShellView>,
+    pub(crate) view: StdMutex<ShellView>,
     /// T16-2: `is_current_process_operator().unwrap_or(false)`
     /// （実装指示 4.「Operators 委任」）。T16-2 第二スライスで
     /// `is_current_process_admin().unwrap_or(false)`との論理和になった
@@ -289,7 +294,7 @@ struct AppState {
     /// 一度確定し、以後は変えない - グループ参加・昇格状態の変更は
     /// プロセス再起動が前提（Windows のトークンはプロセス生存中に
     /// 再評価されないため、このスライスでは再評価の仕組みは作らない）。
-    can_operate_service: bool,
+    pub(crate) can_operate_service: bool,
 }
 
 /// JS 文字列リテラルへの最小エスケープ。[`show_startup_error`]・
@@ -907,30 +912,34 @@ fn retry_startup(app: &AppHandle) {
 }
 
 /// [`HostSwitchEngine`]が要求する
-/// [`banto_hub_core::host_switch::DesktopHostControl`]の最小実装
-/// （T16-2 第二スライス、モジュール doc「T16-2 第二スライスで追加した
-/// もの」節）。
+/// [`banto_hub_core::host_switch::DesktopHostControl`]の実装
+/// （Desktop→Service 切替ウィザード、desktop-plan §9.7）。
 ///
-/// このスライスでトレイから駆動する遷移は「Offline→Service」（サービスを
-/// 開始）と「Service→Desktop」（サービスを停止）の2方向だけで、いずれも
-/// `request_stop`/`is_stopped`を経由しない（両方とも`current == Desktop`
-/// から始まる「Desktop→Service」側だけが使う操作 - このスライスのトレイに
-/// その操作は無い、実装指示「Full UI switch wizard は out of scope」）。
-/// そのため両メソッドは呼ばれない前提のダミー実装に留め、実際に使われるのは
-/// 既定実装の`request_start_allowed`（常に許可 - 第一スライスの
-/// `decide_startup`も Desktop 起動を追加の権限確認なしに試みていたのと
-/// 同じ挙動）だけ。
+/// `request_stop`はこのプロセスが保有する[`RunningHub`]を`take`して
+/// `shutdown`し、controller ハンドルも消す。完了後の`is_stopped`は
+/// hub 未保有（`None`）で`true` - profile mutex は`RunningHub::shutdown`
+/// 側で解放される。
 #[cfg(windows)]
-struct ShellDesktopControl;
+struct ShellDesktopControl {
+    app: AppHandle,
+}
 
 #[cfg(windows)]
 impl DesktopHostControl for ShellDesktopControl {
     fn request_stop(&mut self) -> Result<(), DesktopHostError> {
+        let state = self.app.state::<AppState>();
+        let hub = tauri::async_runtime::block_on(state.hub.lock()).take();
+        if let Some(hub) = hub {
+            tauri::async_runtime::block_on(hub.shutdown());
+            *state.controller.lock().expect("controller mutex poisoned") = None;
+        }
         Ok(())
     }
 
     fn is_stopped(&self) -> bool {
-        true
+        let state = self.app.state::<AppState>();
+        let stopped = tauri::async_runtime::block_on(state.hub.lock()).is_none();
+        stopped
     }
 }
 
@@ -1095,15 +1104,16 @@ fn apply_host_switch_outcome(app: &AppHandle, target: &ProbeTarget, result: Host
     apply_outcome_and_sync(app, &window, outcome);
 }
 
-/// トレイ「サービスを開始/停止」共通のエントリポイント（T16-2 第二スライス、
-/// モジュール doc「T16-2 第二スライスで追加したもの」節）。
+/// トレイ「サービスを開始/停止」および切替ウィザード invoke 共通の
+/// エントリポイント。呼び出し元が[`host_switch_ipc::begin_switch_or_warn`]で
+/// 進行中フラグを立てたうえで呼ぶこと（完了時にこの関数がクリアする）。
 ///
 /// 現在の[`ShellView`]から[`HostKind`]（engine の初期状態）を求め、
 /// [`HostSwitchEngine`]を1回だけ構築してバックグラウンドスレッドで
 /// [`drive_host_switch`]を完了まで進める - 呼び出し元（トレイのメニュー
-/// イベントハンドラ）はブロックしない。
+/// イベントハンドラ / invoke）はブロックしない。
 #[cfg(windows)]
-fn run_host_switch(app: &AppHandle, command: SwitchCommand) {
+pub(crate) fn run_host_switch(app: &AppHandle, command: SwitchCommand) {
     let state = app.state::<AppState>();
     let initial_host = match &*state.view.lock().expect("view mutex poisoned") {
         ShellView::Desktop => HostKind::Desktop,
@@ -1117,7 +1127,7 @@ fn run_host_switch(app: &AppHandle, command: SwitchCommand) {
     let mut engine = HostSwitchEngine::new(
         manager,
         probe,
-        ShellDesktopControl,
+        ShellDesktopControl { app: app.clone() },
         HostSwitchConfig {
             expected_profile: target.profile_id.clone(),
             expected_port: target.port,
@@ -1129,8 +1139,44 @@ fn run_host_switch(app: &AppHandle, command: SwitchCommand) {
 
     let app_handle = app.clone();
     std::thread::spawn(move || {
+        host_switch_ipc::emit_progress(
+            &app_handle,
+            host_switch_ipc::HostSwitchProgressEvent {
+                phase: "running".into(),
+                message: "切替処理を実行しています…".into(),
+                done: false,
+                error: None,
+            },
+        );
         let result = drive_host_switch(&mut engine, command);
+        let (phase, message, error) = match &result {
+            HostSwitchResult::Service { .. } => (
+                "completed".to_string(),
+                "サービスへの切替が完了しました".to_string(),
+                None,
+            ),
+            HostSwitchResult::Desktop => (
+                "completed".to_string(),
+                "アプリへの切替が完了しました".to_string(),
+                None,
+            ),
+            HostSwitchResult::Faulted { reason, .. } => (
+                "faulted".to_string(),
+                format!("切替に失敗しました: {reason}"),
+                Some(reason.clone()),
+            ),
+        };
         apply_host_switch_outcome(&app_handle, &target, result);
+        host_switch_ipc::end_switch();
+        host_switch_ipc::emit_progress(
+            &app_handle,
+            host_switch_ipc::HostSwitchProgressEvent {
+                phase,
+                message,
+                done: true,
+                error,
+            },
+        );
     });
 }
 
@@ -1144,6 +1190,18 @@ fn run_host_switch(app: &AppHandle, command: SwitchCommand) {
 /// への対応、モジュール doc参照）。
 #[cfg(windows)]
 fn stop_service(app: &AppHandle) {
+    if !host_switch_ipc::begin_switch_or_warn(app) {
+        return;
+    }
+    host_switch_ipc::emit_progress(
+        app,
+        host_switch_ipc::HostSwitchProgressEvent {
+            phase: "starting".into(),
+            message: "アプリへの切替を開始しています…".into(),
+            done: false,
+            error: None,
+        },
+    );
     run_host_switch(app, SwitchCommand::SwitchToDesktop);
 }
 
@@ -1158,6 +1216,18 @@ fn stop_service(_app: &AppHandle) {}
 /// 完了待ちをしていない」への対応）。
 #[cfg(windows)]
 fn start_service(app: &AppHandle) {
+    if !host_switch_ipc::begin_switch_or_warn(app) {
+        return;
+    }
+    host_switch_ipc::emit_progress(
+        app,
+        host_switch_ipc::HostSwitchProgressEvent {
+            phase: "starting".into(),
+            message: "サービスへの切替を開始しています…".into(),
+            done: false,
+            error: None,
+        },
+    );
     run_host_switch(app, SwitchCommand::SwitchToService);
 }
 
@@ -1258,6 +1328,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         // T16-1: `×` でトレイ格納した初回だけの継続通知用（実装指示 4.、UX-7）。
         .plugin(tauri_plugin_notification::init())
+        .invoke_handler(tauri::generate_handler![
+            host_switch_ipc::host_switch_status,
+            host_switch_ipc::switch_to_service,
+            host_switch_ipc::switch_to_desktop,
+            host_switch_ipc::set_service_autostart,
+        ])
         .manage(AppState {
             hub: AsyncMutex::new(None),
             controller: StdMutex::new(None),

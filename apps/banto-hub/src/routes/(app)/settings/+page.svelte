@@ -25,6 +25,18 @@
 		saveGrpcSettings,
 		type GrpcSettings
 	} from '$lib/banto/grpcSettingsAdmin';
+	import {
+		applyConfigPackage,
+		inspectConfigPackage,
+		loadConfigPackage
+	} from '$lib/banto/configPackageAdmin';
+	import {
+		parseConfigPackage,
+		serializeConfigPackage,
+		type ConfigPackage,
+		type ConfigPackageInspection,
+		type ConfigPackageImportSummary
+	} from '$lib/banto/configPackage';
 
 	function errorMessage(err: unknown): string {
 		if (isProviderError(err)) {
@@ -210,6 +222,18 @@
 	let grpcSaving = $state(false);
 	let grpcError: string | null = $state(null);
 
+	let configPackageFileEl: HTMLInputElement | undefined = $state();
+	let configPackageLoaded = $state(false);
+	let configPackageData: ConfigPackage | null = $state(null);
+	let configPackageInspection: ConfigPackageInspection | null = $state(null);
+	let configPackageLoadError: string | null = $state(null);
+	let configPackageWorking = $state(false);
+	let configPackageApplying = $state(false);
+	let configPackageApplyError: string | null = $state(null);
+	let configPackageImportSummary: ConfigPackageImportSummary | null = $state(null);
+	let mqttImportUsername = $state('');
+	let mqttImportPassword = $state('');
+
 	function applyGrpcSettings(loaded: GrpcSettings): void {
 		grpcEnabled = loaded.enabled;
 		grpcBind = loaded.bind;
@@ -250,6 +274,92 @@
 			grpcError = errorMessage(err);
 		} finally {
 			grpcSaving = false;
+		}
+	}
+
+	function resetConfigPackageImport(): void {
+		configPackageData = null;
+		configPackageInspection = null;
+		configPackageLoadError = null;
+		configPackageApplyError = null;
+		configPackageImportSummary = null;
+		mqttImportUsername = '';
+		mqttImportPassword = '';
+		if (configPackageFileEl) configPackageFileEl.value = '';
+	}
+
+	function configPackageExportFilename(): string {
+		const now = new Date();
+		const y = now.getFullYear();
+		const m = String(now.getMonth() + 1).padStart(2, '0');
+		const d = String(now.getDate()).padStart(2, '0');
+		return `banto-hub-config-${y}-${m}-${d}.json`;
+	}
+
+	async function handleExportConfigPackage(): Promise<void> {
+		configPackageWorking = true;
+		try {
+			const pkg = await loadConfigPackage();
+			const blob = new Blob([serializeConfigPackage(pkg)], {
+				type: 'application/json;charset=utf-8'
+			});
+			const url = URL.createObjectURL(blob);
+			const a = document.createElement('a');
+			a.href = url;
+			a.download = configPackageExportFilename();
+			a.click();
+			URL.revokeObjectURL(url);
+			toastStore.push('success', '構成パッケージをダウンロードしました');
+		} catch (err) {
+			configPackageLoadError = errorMessage(err);
+		} finally {
+			configPackageWorking = false;
+		}
+	}
+
+	async function handleConfigPackageFileChange(event: Event): Promise<void> {
+		const input = event.currentTarget as HTMLInputElement | null;
+		const file = input?.files?.[0];
+		resetConfigPackageImport();
+		if (!file) return;
+		configPackageWorking = true;
+		try {
+			const text = await file.text();
+			const pkg = parseConfigPackage(text);
+			const inspection = await inspectConfigPackage(pkg);
+			configPackageData = pkg;
+			configPackageInspection = inspection;
+			configPackageLoaded = true;
+			mqttImportUsername = '';
+			mqttImportPassword = '';
+		} catch (err) {
+			configPackageLoadError = errorMessage(err);
+			configPackageLoaded = false;
+		} finally {
+			configPackageWorking = false;
+		}
+	}
+
+	async function handleApplyConfigPackage(): Promise<void> {
+		if (!configPackageData || !configPackageInspection) return;
+		configPackageApplying = true;
+		configPackageApplyError = null;
+		configPackageImportSummary = null;
+		try {
+			const summary = await applyConfigPackage(configPackageData, {
+				mqttUsername: mqttImportUsername.trim() === '' ? undefined : mqttImportUsername,
+				mqttPassword: mqttImportPassword
+			});
+			configPackageImportSummary = summary;
+			const [loadedMqtt, loadedGrpc] = await Promise.all([getMqttSettings(), getGrpcSettings()]);
+			applyMqttSettings(loadedMqtt);
+			applyGrpcSettings(loadedGrpc);
+			await loadMqttStatus();
+			toastStore.push('success', '構成パッケージを適用しました');
+		} catch (err) {
+			configPackageApplyError = errorMessage(err);
+		} finally {
+			configPackageApplying = false;
 		}
 	}
 </script>
@@ -443,6 +553,108 @@
 			{/if}
 		</section>
 	{/if}
+
+	{#if canManageMqtt || canManageGrpc}
+		<section>
+			<h2>構成パッケージ</h2>
+			<p class="note">
+				PLC 接続・収集グループ・タグ・MQTT / gRPC の非秘密設定を JSON で移送します。 MQTT
+				の認証情報は含めないため、必要ならインポート時に再入力してください。
+			</p>
+			<div class="package-actions">
+				<button type="button" onclick={handleExportConfigPackage} disabled={configPackageWorking}>
+					JSON をダウンロード
+				</button>
+				<label class="field file-field">
+					<span>JSON ファイル</span>
+					<input
+						type="file"
+						accept=".json,application/json"
+						bind:this={configPackageFileEl}
+						onchange={handleConfigPackageFileChange}
+						disabled={configPackageWorking}
+					/>
+				</label>
+			</div>
+
+			{#if configPackageLoadError}
+				<p class="error">{configPackageLoadError}</p>
+			{/if}
+
+			{#if configPackageData && configPackageInspection}
+				<div class="package-summary">
+					<p class="note">
+						schemaVersion={configPackageData.schemaVersion} / product={configPackageData.product} / exportedAt={configPackageData.exportedAt}
+					</p>
+					<p class="note">
+						PLC 接続 {configPackageInspection.counts.plcConnections.create} 追加 /
+						{configPackageInspection.counts.plcConnections.update} 更新、収集グループ
+						{configPackageInspection.counts.collectionGroups.create} 追加 /
+						{configPackageInspection.counts.collectionGroups.update} 更新、タグ
+						{configPackageInspection.counts.tags.create} 追加 /
+						{configPackageInspection.counts.tags.update} 更新。
+					</p>
+					<p class="note">
+						MQTT は
+						{configPackageInspection.mqttSettings.enabled ? '有効' : '無効'} / gRPC は {configPackageInspection
+							.grpcSettings.enabled
+							? '有効'
+							: '無効'} です。
+					</p>
+					{#if configPackageInspection.mqttCredentialsRequired}
+						<p class="note warning">
+							MQTT
+							のユーザー名・パスワードはパッケージに含まれません。必要なら下で再入力してください。
+						</p>
+					{/if}
+					{#if configPackageInspection.warnings.length > 0}
+						<ul class="warnings">
+							{#each configPackageInspection.warnings as warning (warning)}
+								<li>{warning}</li>
+							{/each}
+						</ul>
+					{/if}
+
+					<label class="field">
+						MQTT ユーザー名（必要な場合のみ再入力）
+						<input type="text" bind:value={mqttImportUsername} autocomplete="off" />
+					</label>
+					<label class="field">
+						MQTT パスワード（必要な場合のみ再入力）
+						<input type="password" bind:value={mqttImportPassword} autocomplete="new-password" />
+					</label>
+
+					{#if configPackageApplyError}
+						<p class="error">{configPackageApplyError}</p>
+					{/if}
+
+					{#if configPackageImportSummary}
+						<p class="note success">
+							インポート完了: PLC 接続 {configPackageImportSummary.counts.plcConnections.create} 追加
+							/
+							{configPackageImportSummary.counts.plcConnections.update} 更新、収集グループ
+							{configPackageImportSummary.counts.collectionGroups.create} 追加 /
+							{configPackageImportSummary.counts.collectionGroups.update} 更新、タグ
+							{configPackageImportSummary.counts.tags.create} 追加 /
+							{configPackageImportSummary.counts.tags.update} 更新。
+						</p>
+					{/if}
+
+					<button
+						type="button"
+						onclick={handleApplyConfigPackage}
+						disabled={configPackageApplying || configPackageWorking}
+					>
+						インポートを実行
+					</button>
+				</div>
+			{:else if configPackageLoaded}
+				<p class="note">JSON を読み込み中です...</p>
+			{:else}
+				<p class="note">JSON を選択すると、追加/更新件数と再入力項目を確認できます。</p>
+			{/if}
+		</section>
+	{/if}
 </div>
 
 <style>
@@ -591,5 +803,39 @@
 
 	.field.checkbox input {
 		width: auto;
+	}
+
+	.package-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.75rem;
+		align-items: end;
+		margin: 0.75rem 0 0;
+	}
+
+	.file-field {
+		min-width: 220px;
+	}
+
+	.package-summary {
+		display: flex;
+		flex-direction: column;
+		gap: 0.75rem;
+		margin-top: 0.75rem;
+	}
+
+	.warnings {
+		margin: 0;
+		padding-left: 1.2rem;
+		color: var(--banto-text-muted);
+		font-size: 0.8rem;
+	}
+
+	.note.warning {
+		color: var(--banto-warning, #8a5a00);
+	}
+
+	.note.success {
+		color: var(--banto-success, #1a7f37);
 	}
 </style>

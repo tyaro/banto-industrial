@@ -8,6 +8,8 @@
 	import { sessionStore } from '$lib/session.svelte';
 	import { commandPaletteStore } from '$lib/commandPalette.svelte';
 
+	let { pendingCount = 0 }: { pendingCount?: number } = $props();
+
 	async function logout() {
 		await getAuthProvider().logout();
 		goto('/login');
@@ -27,6 +29,12 @@
 	<h1>{pageTitle(page.url.pathname)}</h1>
 
 	<div class="spacer"></div>
+
+	{#if pendingCount > 0}
+		<div class="pending-pill" aria-label={`未適用の変更が${pendingCount}件あります`}>
+			未適用 {pendingCount}件
+		</div>
+	{/if}
 
 	<button
 		type="button"
@@ -64,6 +72,19 @@
 
 	.spacer {
 		flex: 1;
+	}
+
+	.pending-pill {
+		display: inline-flex;
+		align-items: center;
+		padding: 0.2rem 0.55rem;
+		border-radius: 999px;
+		border: 1px solid color-mix(in srgb, var(--banto-danger) 24%, var(--banto-border));
+		background: color-mix(in srgb, var(--banto-danger) 10%, var(--banto-surface));
+		color: var(--banto-danger);
+		font-size: 0.75rem;
+		font-weight: 600;
+		white-space: nowrap;
 	}
 
 	.icon-button {

@@ -14,6 +14,13 @@
 	 * 実装指示でも明示的にスコープ外）。
 	 */
 	import { isProviderError } from '@banto/admin-core';
+	import {
+		applyPendingChange,
+		cancelPendingChange,
+		isPendingApplyConflictError,
+		listPendingChanges,
+		type PendingChange
+	} from '$lib/banto/pendingChangesAdmin';
 	import { toastStore } from '$lib/toast.svelte';
 	import { sessionStore } from '$lib/session.svelte';
 	import { isAdmin } from '$lib/permissions';
@@ -26,12 +33,32 @@
 		type ValuesResponse
 	} from '$lib/banto/hubStatus';
 	import { enableWriteControl, disableWriteControl } from '$lib/banto/writeControlAdmin';
+	import {
+		canSwitchToDesktop,
+		canSwitchToService,
+		canToggleAutostart,
+		hostSwitchDisabledReason,
+		type HostSwitchGateInput
+	} from '$lib/banto/hostSwitchGate';
+	import {
+		getHostSwitchStatus,
+		isLocalShell,
+		listenHostSwitchProgress,
+		setServiceAutostart,
+		switchToDesktop,
+		switchToService,
+		type HostSwitchProgress,
+		type HostSwitchStatus
+	} from '$lib/banto/hostSwitchShell';
 
 	const canManageWriteControl = $derived(isAdmin(sessionStore.role));
+	const localShell = isLocalShell();
+	const hubAdmin = $derived(isAdmin(sessionStore.role));
 
 	const POLL_INTERVAL_MS = 3000;
 
 	function errorMessage(err: unknown): string {
+		if (isPendingApplyConflictError(err)) return err.failureReason ?? err.message;
 		return isProviderError(err) ? err.message : String(err);
 	}
 
@@ -72,14 +99,20 @@
 		return new Date(epochMs).toLocaleString('ja-JP');
 	}
 
+	function formatDateTime(value: string): string {
+		return new Date(value).toLocaleString('ja-JP');
+	}
+
 	function formatValue(entry: ValueEntry): string {
 		return entry.v === null ? '-' : String(entry.v);
 	}
 
 	let status: StatusResponse | null = $state(null);
 	let values: ValuesResponse | null = $state(null);
+	let pendingChanges = $state<PendingChange[]>([]);
 	let loading = $state(true);
 	let lastErrorShownAt = 0;
+	let pendingActionId = $state<number | null>(null);
 
 	// 連続失敗（サーバー停止中など）でトーストが3秒毎に積み上がらないよう、
 	// 直近のエラー表示から一定時間は再表示を抑制する。
@@ -87,9 +120,14 @@
 
 	async function poll(): Promise<void> {
 		try {
-			const [nextStatus, nextValues] = await Promise.all([getHubStatus(), getHubValues()]);
+			const [nextStatus, nextValues, nextPending] = await Promise.all([
+				getHubStatus(),
+				getHubValues(),
+				hubAdmin ? listPendingChanges() : Promise.resolve<PendingChange[]>([])
+			]);
 			status = nextStatus;
 			values = nextValues;
+			pendingChanges = nextPending;
 		} catch (err) {
 			const now = Date.now();
 			if (now - lastErrorShownAt > ERROR_TOAST_THROTTLE_MS) {
@@ -109,6 +147,51 @@
 
 	function connectionRowClass(conn: ConnectionStatusEntry): string {
 		return `status-${statusClass(conn.status)}`;
+	}
+
+	function pendingStateLabel(state: PendingChange['state']): string {
+		if (state === 'pending') return '保留中';
+		if (state === 'applying') return '適用中';
+		if (state === 'applied') return '適用済み';
+		if (state === 'canceled') return 'キャンセル済み';
+		if (state === 'failed') return '失敗';
+		return state;
+	}
+
+	function pendingStateClass(state: PendingChange['state']): string {
+		if (state === 'applied') return 'good';
+		if (state === 'failed' || state === 'canceled') return 'bad';
+		if (state === 'applying') return 'warn';
+		return 'stale';
+	}
+
+	async function handleApplyPending(change: PendingChange): Promise<void> {
+		pendingActionId = change.id;
+		try {
+			await applyPendingChange(change.id);
+			toastStore.push('success', `pending change #${change.id} を適用しました`);
+			await poll();
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+			if (isPendingApplyConflictError(err)) {
+				await poll();
+			}
+		} finally {
+			pendingActionId = null;
+		}
+	}
+
+	async function handleCancelPending(change: PendingChange): Promise<void> {
+		pendingActionId = change.id;
+		try {
+			await cancelPendingChange(change.id);
+			toastStore.push('success', `pending change #${change.id} をキャンセルしました`);
+			await poll();
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			pendingActionId = null;
+		}
 	}
 
 	// --- 書き込み受付トグル (T2-4、設計 §6-6、admin 限定) --------------------
@@ -137,6 +220,152 @@
 			toastStore.push('error', errorMessage(err));
 		} finally {
 			writeControlBusy = false;
+		}
+	}
+
+	// --- Windows サービスカード（desktop-plan §9.7、ローカルシェル限定） -----
+	let hostSwitch: HostSwitchStatus | null = $state(null);
+	let hostSwitchBusy = $state(false);
+	let hostProgress: HostSwitchProgress | null = $state(null);
+	let hostSwitchError: string | null = $state(null);
+	let autostartBusy = $state(false);
+
+	const scmStateLabels: Record<string, string> = {
+		NotInstalled: '未インストール',
+		Stopped: '停止',
+		StartPending: '開始中',
+		StopPending: '停止中',
+		Running: '実行中',
+		Other: 'その他'
+	};
+
+	function scmStateLabel(raw: string | null | undefined): string {
+		if (!raw) return '不明';
+		if (raw.startsWith('Other(')) return `その他 (${raw.slice(6, -1)})`;
+		return scmStateLabels[raw] ?? raw;
+	}
+
+	function gateInput(): HostSwitchGateInput {
+		const viewRaw = hostSwitch?.view ?? 'fallback';
+		const view =
+			viewRaw === 'desktop' || viewRaw === 'service' || viewRaw === 'fallback'
+				? viewRaw
+				: 'fallback';
+		return {
+			isLocalShell: localShell,
+			isAdmin: hubAdmin,
+			canOperate: hostSwitch?.canOperate ?? false,
+			view,
+			switching: hostSwitchBusy || hostSwitch?.switching === true,
+			lastConfigError: status?.last_config_error ?? null,
+			hasRevision: status != null && typeof status.revision === 'number'
+		};
+	}
+
+	const gate = $derived(gateInput());
+	const disabledReason = $derived(hostSwitchDisabledReason(gate));
+	const allowSwitchToService = $derived(canSwitchToService(gate));
+	const allowSwitchToDesktop = $derived(canSwitchToDesktop(gate));
+	const allowAutostart = $derived(canToggleAutostart(gate));
+
+	async function refreshHostSwitch(): Promise<void> {
+		if (!localShell) {
+			hostSwitch = null;
+			return;
+		}
+		try {
+			hostSwitch = await getHostSwitchStatus();
+		} catch (err) {
+			hostSwitchError = errorMessage(err);
+		}
+	}
+
+	$effect(() => {
+		if (!localShell) return;
+		void refreshHostSwitch();
+		const timer = setInterval(() => {
+			if (!hostSwitchBusy) void refreshHostSwitch();
+		}, POLL_INTERVAL_MS);
+		let unlisten: (() => void) | undefined;
+		void listenHostSwitchProgress((ev) => {
+			hostProgress = ev;
+			if (ev.error) hostSwitchError = ev.error;
+			if (ev.done) {
+				hostSwitchBusy = false;
+				void refreshHostSwitch();
+				void poll();
+			} else {
+				hostSwitchBusy = true;
+			}
+		}).then((fn) => {
+			unlisten = fn;
+		});
+		return () => {
+			clearInterval(timer);
+			unlisten?.();
+		};
+	});
+
+	async function handleSwitchToService(): Promise<void> {
+		hostSwitchBusy = true;
+		hostSwitchError = null;
+		hostProgress = {
+			phase: 'starting',
+			message: 'サービスへの切替を開始しています…',
+			done: false,
+			error: null
+		};
+		try {
+			await switchToService();
+		} catch (err) {
+			hostSwitchBusy = false;
+			hostSwitchError = errorMessage(err);
+			toastStore.push('error', hostSwitchError);
+		}
+	}
+
+	async function handleSwitchToDesktop(): Promise<void> {
+		hostSwitchBusy = true;
+		hostSwitchError = null;
+		hostProgress = {
+			phase: 'starting',
+			message: 'アプリへの切替を開始しています…',
+			done: false,
+			error: null
+		};
+		try {
+			await switchToDesktop();
+		} catch (err) {
+			hostSwitchBusy = false;
+			hostSwitchError = errorMessage(err);
+			toastStore.push('error', hostSwitchError);
+		}
+	}
+
+	async function handleAutostartChange(enabled: boolean): Promise<void> {
+		const nextLabel = enabled ? '自動起動（AutoStart）' : '手動起動（OnDemand）';
+		const ok = window.confirm(
+			`Banto Hub サービスの次回 Windows 起動時の設定を変更します。\n\n` +
+				`変更後の起動種別: ${nextLabel}\n\n` +
+				`この設定を変更しても、現在のサービスは開始・停止しません。\n` +
+				`続行すると Windows の管理者昇格（UAC）が求められます。`
+		);
+		if (!ok) {
+			await refreshHostSwitch();
+			return;
+		}
+		autostartBusy = true;
+		hostSwitchError = null;
+		try {
+			await setServiceAutostart(enabled);
+			toastStore.push('success', enabled ? '自動起動を有効にしました' : '自動起動を無効にしました');
+			await refreshHostSwitch();
+		} catch (err) {
+			hostSwitchError = errorMessage(err);
+			toastStore.push('error', hostSwitchError);
+			await refreshHostSwitch();
+		} finally {
+			autostartBusy = false;
 		}
 	}
 </script>
@@ -219,6 +448,140 @@
 			</div>
 		</section>
 	{/if}
+
+	{#if hubAdmin}
+		<section>
+			<h2>Pending changes</h2>
+			<p class="note">{pendingChanges.length}件の変更提案があります。</p>
+			{#if pendingChanges.length === 0}
+				<p class="note">保留中の変更はありません。</p>
+			{:else}
+				<div class="table-wrap">
+					<table class="pending-table">
+						<thead>
+							<tr>
+								<th>ID</th>
+								<th>source</th>
+								<th>state</th>
+								<th>requestedByUsername</th>
+								<th>createdAt</th>
+								<th>failureReason</th>
+								<th>操作</th>
+							</tr>
+						</thead>
+						<tbody>
+							{#each pendingChanges as change (change.id)}
+								<tr>
+									<td>#{change.id}</td>
+									<td class="pending-source">{change.source}</td>
+									<td>
+										<span class={`state-chip state-${pendingStateClass(change.state)}`}>
+											{pendingStateLabel(change.state)}
+										</span>
+									</td>
+									<td>{change.requestedByUsername ?? '-'}</td>
+									<td>{formatDateTime(change.createdAt)}</td>
+									<td>
+										{#if change.failureReason}
+											<div class:config-error={change.state === 'failed'} class="pending-failure">
+												{change.failureReason}
+											</div>
+										{:else}
+											-
+										{/if}
+									</td>
+									<td>
+										{#if change.state === 'pending'}
+											<div class="pending-actions">
+												<button
+													type="button"
+													onclick={() => void handleApplyPending(change)}
+													disabled={pendingActionId !== null}
+												>
+													適用
+												</button>
+												<button
+													type="button"
+													class="danger"
+													onclick={() => void handleCancelPending(change)}
+													disabled={pendingActionId !== null}
+												>
+													キャンセル
+												</button>
+											</div>
+										{:else}
+											-
+										{/if}
+									</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+				</div>
+			{/if}
+		</section>
+	{/if}
+
+	<section>
+		<h2>Windows サービス</h2>
+		{#if !localShell}
+			<p class="note">ローカルシェルが必要です（ブラウザ遠隔からは操作できません）。</p>
+		{:else if !hostSwitch}
+			<p class="note">シェル状態を読み込み中…</p>
+		{:else}
+			<dl class="summary">
+				<dt>現在の状態</dt>
+				<dd>{scmStateLabel(hostSwitch.scmState)}</dd>
+				<dt>シェル表示</dt>
+				<dd>
+					{hostSwitch.view === 'desktop'
+						? 'アプリ'
+						: hostSwitch.view === 'service'
+							? 'サービス接続'
+							: 'フォールバック'}
+				</dd>
+			</dl>
+
+			{#if hostSwitchBusy || (hostProgress && !hostProgress.done)}
+				<p class="switch-progress" role="status">
+					{hostProgress?.message ?? '切替処理が進行中です…'}
+				</p>
+			{/if}
+
+			{#if hostSwitchError}
+				<p class="config-error">切替エラー: {hostSwitchError}</p>
+			{/if}
+
+			{#if disabledReason && !allowSwitchToService && !allowSwitchToDesktop}
+				<p class="note">{disabledReason}</p>
+			{/if}
+
+			<div class="write-control-actions">
+				<button type="button" onclick={handleSwitchToService} disabled={!allowSwitchToService}>
+					サービスへ切り替えて開始
+				</button>
+				<button type="button" onclick={handleSwitchToDesktop} disabled={!allowSwitchToDesktop}>
+					サービスを停止してアプリで開く
+				</button>
+			</div>
+
+			<div class="autostart-block">
+				<p class="autostart-heading">次回 Windows 起動</p>
+				<label class="autostart-label">
+					<input
+						type="checkbox"
+						checked={hostSwitch.autoStart}
+						disabled={!allowAutostart || autostartBusy}
+						onchange={(e) => void handleAutostartChange(e.currentTarget.checked)}
+					/>
+					Banto Hub サービスを自動起動する
+				</label>
+				<p class="note">
+					この設定を変更しても、現在のサービスは開始・停止しません。変更時は管理者昇格（UAC）が必要です。
+				</p>
+			</div>
+		{/if}
+	</section>
 
 	<section>
 		<h2>タグ現在値</h2>
@@ -353,6 +716,10 @@
 		font-family: var(--banto-font-mono, monospace);
 	}
 
+	.pending-source {
+		font-family: var(--banto-font-mono, monospace);
+	}
+
 	.quality-good {
 		color: var(--banto-text);
 	}
@@ -364,6 +731,70 @@
 
 	.quality-stale {
 		color: var(--banto-text-muted);
+	}
+
+	.state-chip {
+		display: inline-flex;
+		align-items: center;
+		padding: 0.15rem 0.45rem;
+		border-radius: 999px;
+		font-size: 0.78rem;
+		font-weight: 600;
+		border: 1px solid var(--banto-border);
+	}
+
+	.state-good {
+		color: var(--banto-text);
+		background: color-mix(in srgb, var(--banto-primary) 8%, transparent);
+	}
+
+	.state-warn {
+		color: var(--banto-danger);
+		background: color-mix(in srgb, var(--banto-danger) 10%, transparent);
+	}
+
+	.state-bad {
+		color: var(--banto-danger);
+		border-color: color-mix(in srgb, var(--banto-danger) 40%, var(--banto-border));
+		background: color-mix(in srgb, var(--banto-danger) 12%, transparent);
+	}
+
+	.state-stale {
+		color: var(--banto-text-muted);
+	}
+
+	.pending-failure {
+		margin: 0;
+		font-size: 0.8rem;
+		white-space: pre-wrap;
+	}
+
+	.pending-actions {
+		display: flex;
+		gap: 0.4rem;
+		flex-wrap: wrap;
+	}
+
+	.pending-actions button {
+		padding: 0.35rem 0.75rem;
+		border: none;
+		border-radius: var(--banto-radius);
+		background: var(--banto-primary);
+		color: var(--banto-text-inverse);
+		font-weight: 600;
+		cursor: pointer;
+	}
+
+	.pending-actions button:disabled {
+		opacity: 0.6;
+		cursor: not-allowed;
+	}
+
+	.pending-actions button.danger {
+		background: transparent;
+		border: 1px solid var(--banto-danger);
+		color: var(--banto-danger);
+		font-weight: 400;
 	}
 
 	.write-on {
@@ -401,5 +832,33 @@
 		border: 1px solid var(--banto-danger);
 		color: var(--banto-danger);
 		font-weight: 400;
+	}
+
+	.switch-progress {
+		margin: 0.75rem 0 0;
+		padding: 0.5rem 0.7rem;
+		border-radius: var(--banto-radius);
+		background: color-mix(in srgb, var(--banto-primary) 12%, transparent);
+		font-size: 0.85rem;
+	}
+
+	.autostart-block {
+		margin-top: 1rem;
+		padding-top: 0.75rem;
+		border-top: 1px solid var(--banto-border);
+	}
+
+	.autostart-heading {
+		margin: 0 0 0.35rem;
+		font-size: 0.9rem;
+		font-weight: 600;
+	}
+
+	.autostart-label {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		font-size: 0.875rem;
+		margin-bottom: 0.35rem;
 	}
 </style>

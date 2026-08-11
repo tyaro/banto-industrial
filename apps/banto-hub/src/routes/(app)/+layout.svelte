@@ -3,9 +3,16 @@
 	import Header from '$lib/components/Header.svelte';
 	import Sidebar from '$lib/components/Sidebar.svelte';
 	import CommandPalette from '$lib/components/CommandPalette.svelte';
+	import { listPendingChanges } from '$lib/banto/pendingChangesAdmin';
 	import { commandPaletteStore } from '$lib/commandPalette.svelte';
+	import { isAdmin } from '$lib/permissions';
+	import { sessionStore } from '$lib/session.svelte';
 
 	let { children } = $props();
+	let pendingCount = $state(0);
+
+	const POLL_INTERVAL_MS = 3000;
+	const hubAdmin = $derived(isAdmin(sessionStore.role));
 
 	function handleKeydown(event: KeyboardEvent): void {
 		if (event.key.toLowerCase() === 'k' && (event.ctrlKey || event.metaKey)) {
@@ -13,14 +20,42 @@
 			commandPaletteStore.toggle();
 		}
 	}
+
+	$effect(() => {
+		if (!hubAdmin) {
+			pendingCount = 0;
+			return;
+		}
+
+		let cancelled = false;
+
+		async function pollPendingCount(): Promise<void> {
+			try {
+				const pendingChanges = await listPendingChanges();
+				if (!cancelled) {
+					pendingCount = pendingChanges.length;
+				}
+			} catch {
+				// 常時表示用の補助ポーリングなので、失敗時は静かに無視する。
+			}
+		}
+
+		void pollPendingCount();
+		const timer = setInterval(() => void pollPendingCount(), POLL_INTERVAL_MS);
+
+		return () => {
+			cancelled = true;
+			clearInterval(timer);
+		};
+	});
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
 
 <div class="shell">
-	<Sidebar />
+	<Sidebar {pendingCount} />
 	<div class="main">
-		<Header />
+		<Header {pendingCount} />
 		<main>
 			{@render children()}
 		</main>

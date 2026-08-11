@@ -431,6 +431,13 @@ T7-1）を `apps/banto-hub/core/src/hub.rs`（`CollectorManager::rebuild`、T7-2
 > しない」設計（`rebuild_and_notify`）は、停止中保存の**全構成 preflight**
 > （保存前検証 → 保存成功＝実行可能を保証）へ置き換える。詳細は
 > [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §5.2 / §9.1 / §16。
+>
+> **2026-08-11 追補（UX-5 方針改定）**: 公開操作の契約を更新し、運転中編集は
+> 一律 `409` 拒否ではなく **pending queue への保存**を許可する。実行構成への
+> 反映は人が任意タイミングで明示 `適用` したときのみ行い、適用前は
+> `キャンセル` で破棄できる。`apply_config` は引き続き内部基盤として維持し、
+> 即時自動反映ではなく「明示適用時の反映エンジン」として用いる。最新の受入条件は
+> [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §9.3 TAG-P0-3 を正とする。
 
 ## 5. 外部インターフェース設計
 
