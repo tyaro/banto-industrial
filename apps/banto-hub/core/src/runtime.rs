@@ -69,7 +69,15 @@
 //! `SlmpSimRegistry` 構築（T9-2、docs/ux-plan.md §1。同じく
 //! `CollectorManager` の外で生存する SLMP シミュレータ registry）→
 //! `CollectorManager::rebuild()`（起動時1回、設計 §4.3）→ tstore 剪定
-//! （起動時1回 + 24h 周期、設計 §3.3・保持既定7日）→ `MqttPublisher`構築 +
+//! （起動時1回 + 24h 周期、設計 §3.3・保持既定7日）→ 監査ログ剪定
+//! （起動時1回 + tstore と同じ24h周期タスクに相乗り、
+//! docs/banto-hub-remaining-plan.md P3-a 追補・2026-08-12。banto-hub は
+//! 24/7 常駐のヘッドレスサーバーで、chronogazer/relay-wright のような
+//! 「人間が頻繁に再起動するデスクトップアプリ」ではないため、
+//! chronogazer/relay-wright と同じ「起動時 + list実行時 opportunistic の
+//! みで専用の周期タスクは持たない」だけでは、監査ログ画面を長期間開かず
+//! 再起動もしない運用で剪定が実質発火しない。[`audit_prune_once`]の
+//! doc comment参照）→ `MqttPublisher`構築 +
 //! settings の永続値を`apply`（T3、設計 §5.3。`mqtt.enabled=false`なら
 //! 何も起動しない）→ `GrpcServer`構築 + settings の永続値を`apply`（T4、
 //! 設計 §5.4。`grpc.enabled=false`(既定)なら bind しない）→ axum サーバー
@@ -436,16 +444,28 @@ impl HubRuntime {
         // instead of discarded - see this module's doc comment ("T14-1 での
         // 唯一の挙動変化").
         prune_once(&settings, &data_dir, clock.as_ref()).await;
+
+        // Audit-log retention sweep (docs/banto-hub-remaining-plan.md
+        // P3-a): startup-once, same as the tstore sweep above - see
+        // [`audit_prune_once`]'s doc comment for why this rides along on
+        // the tstore sweep's existing 24h loop below rather than staying
+        // "startup + opportunistic-on-list only" like chronogazer/
+        // relay-wright. Best-effort: a failure here must never stop the
+        // server from starting.
+        audit_prune_once(&settings, &audit).await;
+
         let prune_handle: JoinHandle<()> = {
             let prune_settings = settings.clone();
             let prune_data_dir = data_dir.clone();
             let prune_clock = clock.clone();
+            let prune_audit = audit.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(PRUNE_INTERVAL);
-                interval.tick().await; // first tick fires immediately; startup sweep above already ran
+                interval.tick().await; // first tick fires immediately; startup sweeps above already ran
                 loop {
                     interval.tick().await;
                     prune_once(&prune_settings, &prune_data_dir, prune_clock.as_ref()).await;
+                    audit_prune_once(&prune_settings, &prune_audit).await;
                 }
             })
         };
@@ -759,6 +779,45 @@ async fn prune_once(
     }
 }
 
+/// One audit-log retention sweep (docs/banto-hub-remaining-plan.md P3-a
+/// 追補、2026-08-12): read the configured retention policy (days/rows) and
+/// call [`AuditLogService::prune`]. Mirrors [`prune_once`]'s shape
+/// (best-effort - a settings-read failure or a prune failure is only
+/// logged, never fatal / never stops the caller's loop).
+///
+/// Called from three places, matching chronogazer/relay-wright's "no
+/// separate background task" reasoning MINUS the "no periodic task" part -
+/// banto-hub is a 24/7 headless collector (unlike the Tauri-shell reference
+/// apps, which are desktop apps a human restarts often), so a deployment
+/// that never opens the audit-log viewer and never restarts would otherwise
+/// never prune at all. The 24h periodic tstore sweep below already exists
+/// for the same class of problem (design §3.3), so audit-log retention now
+/// rides along on it instead of inventing a second timer:
+/// - once at startup ([`HubRuntime::start`]),
+/// - every tick of the existing 24h tstore retention loop
+///   ([`HubRuntime::start`]'s `prune_handle`), and
+/// - opportunistically before every `POST /api/audit-log/list`
+///   (`crate::rest::audit_log_list`) - kept for low-latency effect on an
+///   admin who just changed the retention policy and immediately reopens
+///   the viewer, even though the 24h loop now makes it non-load-bearing.
+async fn audit_prune_once(settings: &SettingsService, audit: &AuditLogService) {
+    let config = match settings.audit_config().await {
+        Ok(config) => config,
+        Err(err) => {
+            log_err_line(&format!(
+                "banto-hub: 監査ログの保持設定の読み取りに失敗しました: {err}"
+            ));
+            return;
+        }
+    };
+    if let Err(err) = audit
+        .prune(config.retention_days, config.retention_rows)
+        .await
+    {
+        log_err_line(&format!("banto-hub: 監査ログの剪定に失敗しました: {err}"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -858,5 +917,91 @@ mod tests {
                 panic!("expected HubRuntime::start to fail while the profile lock is held");
             }
         }
+    }
+
+    /// P3-a 追補（2026-08-12、docs/banto-hub-remaining-plan.md）:
+    /// [`audit_prune_once`] is the exact function [`HubRuntime::start`]
+    /// calls both once at startup and on every tick of the 24h
+    /// `prune_handle` loop (see that closure's body above) - the periodic
+    /// interval itself cannot be waited out in a test, so this pins down
+    /// the shared function the loop actually invokes: given a retention
+    /// policy that caps rows below the seeded count, calling it once
+    /// prunes down to that cap, proving the wiring this function exists for
+    /// (settings → `AuditLogService::prune`) is correct independent of
+    /// which of the three call sites triggers it.
+    #[tokio::test]
+    async fn audit_prune_once_prunes_down_to_the_configured_row_cap() {
+        let pool = crate::db::migrate_memory().await.expect("migrate_memory");
+        let settings = SettingsService::new(pool.clone());
+        let audit = AuditLogService::new(pool.clone());
+
+        for i in 0..5 {
+            sqlx::query(
+                "INSERT INTO audit_log (actor_username, actor_role, action, resource, entity_id, detail, origin, result) \
+                 VALUES ('admin', 'admin', 'create', 'items', ?, NULL, 'rest', 'ok')",
+            )
+            .bind(i.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        settings
+            .set_audit_config(&crate::settings::AuditSettings {
+                retention_days: None,
+                retention_rows: Some(2),
+            })
+            .await
+            .expect("set_audit_config");
+
+        audit_prune_once(&settings, &audit).await;
+
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 2);
+    }
+
+    /// A settings read failure (simulated here by a plain misconfigured
+    /// `SettingsService`... in practice `SettingsService::audit_config`
+    /// only fails on a real storage error, which is hard to induce without
+    /// a broken pool) is out of scope for this test - the important
+    /// behavior already covered by [`prune_once`]'s call sites in
+    /// `HubRuntime::start` is "never panics, never aborts the loop", which
+    /// [`audit_prune_once_prunes_down_to_the_configured_row_cap`]'s
+    /// successful round trip already exercises the non-error path of. A
+    /// `None`/`None` policy (unlimited on both dimensions) must be a no-op,
+    /// matching [`crate::audit::AuditLogService::prune`]'s own
+    /// `prune_with_both_none_is_a_no_op` unit test.
+    #[tokio::test]
+    async fn audit_prune_once_with_unlimited_policy_is_a_no_op() {
+        let pool = crate::db::migrate_memory().await.expect("migrate_memory");
+        let settings = SettingsService::new(pool.clone());
+        let audit = AuditLogService::new(pool.clone());
+
+        sqlx::query(
+            "INSERT INTO audit_log (actor_username, actor_role, action, resource, entity_id, detail, origin, result) \
+             VALUES ('admin', 'admin', 'create', 'items', '1', NULL, 'rest', 'ok')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        settings
+            .set_audit_config(&crate::settings::AuditSettings {
+                retention_days: None,
+                retention_rows: None,
+            })
+            .await
+            .expect("set_audit_config");
+
+        audit_prune_once(&settings, &audit).await;
+
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 1);
     }
 }
