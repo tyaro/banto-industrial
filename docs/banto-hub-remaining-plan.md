@@ -2,22 +2,22 @@
 
 作成日: 2026-08-12
 状態: **オーナー承認・実行中**。2026-08-12 に docs 14 文書 + コード + GitHub を全量監査した
-結果を実行順に整理したもの。**Phase 0（PR #119 マージ）完了（2026-08-11、merge commit
-`ec1a546`）。次は Phase 0.5 ① pending apply の revision ガード**（オーナー判断: 一旦マージ →
-ガードは main 側でフォロー）。個別スライスの詳細設計は既存の
+結果を実行順に整理したもの。**進捗（2026-08-12）: Phase 0（#119）・監査フォロー①=stale ガード（#121）・
+②最小対応（#121 同梱）・profile_lock フレーク（#122）・Swagger UI（#124）・P3-a audit retention（#125）
+マージ済み。監査③（稼働中 import ガード）着手中（`claude/import-running-guard`）。次は P3-b → P3-c。**
+個別スライスの詳細設計は既存の
 [plan.md](plan.md)・[tag-server-design.md](tag-server-design.md)・[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)・
 [banto-hub-t16-design.md](banto-hub-t16-design.md)・[banto-hub-t17-design.md](banto-hub-t17-design.md)・
 [improvement-plan.md](improvement-plan.md) を正とし、本書はそれらの残項目の**優先順位と着手順**を定める索引。
 最終検証日(監査): 2026-08-12
-基準コミット: 889f622（監査時）／`ec1a546`（PR #119 マージ後）
+基準コミット: 889f622（監査時）／`9c61a64`（#125 マージ後の現 main）
 
 ## 0. 前提と現況
 
-- ローカル `main` は origin より 1 コミット先行（`889f622` 切替ウィザード UI、未 push）。
-  この `889f622` は **open 中の [PR #119](https://github.com/tyaro/banto-industrial/pull/119) の
-  最初のコミットそのもの**で、PR はその上に 11 コミットを積んだ**厳密な上位集合**
-  （fast-forward 関係・コンフリクトなし）。push しても衝突せず、PR マージで先行分も取り込まれる。
-- open PR は #119 のみ。dependabot 群（2026-08-09 発生）は消化済み。
+- 現 main（`9c61a64`）は本セッションの成果を反映済み: #119（pending queue + 構成パッケージ）、
+  #120（tags-revision フレーク）、#121（① stale ガード + ② 最小対応）、#122（profile_lock フレーク）、
+  #124（Swagger UI）、#125（P3-a audit retention）、および docs・オーナー決定・Issue #123（SDK 起票）。
+- dependabot 群（2026-08-09 発生）は消化済み。
 - テスト用 PLC: 三菱 R08ENCPU、IP `192.168.11.200`（検証・テスト環境のため記載可、2026-08-12
   オーナー）。SLMP ポート `3100`〜`3110` / `3200` / `3201` / `5200` が利用可。安全アドレス帯は
   `D3000-4999` / `M1000-2000`。複数ポートを多重接続・多重クライアント検証（1 ポートあたり
@@ -43,22 +43,17 @@ PR #119 には main 未反映の重要実装が含まれていた。マージが
 取り込んだ主実装: TAG-P0-3 の pending queue 方式（一律 409 拒否からの改定）、
 T17-5 構成パッケージ export/import、`.gitattributes`。
 
-### Phase 0.5 — pending queue の監査フォロー（P0-b 検出、①が次の着手）
+### Phase 0.5 — pending queue の監査フォロー（P0-b 検出）
 
-- **① 重大・次の着手**: pending apply 時にサーバー最新状態への再検証が無く、`plc_connections` /
-  `collection_groups` の apply が無警告で上書きする。`base_configured_revision` は保存・フロント
-  公開までされているのに `execute_pending_apply`（[rest.rs](../apps/banto-hub/core/src/rest.rs)
-  の 3401 付近）で未使用。`tags.update` のみ `expectedRevision` 楽観ロックで保護済み。修正方針:
-  apply 時に `manager.configured_revision()` と `base_configured_revision` を突合し、不一致なら
-  拒否/警告する（既存フィールドを活かす小改修）。オーナー判断で「一旦マージ → main 側でガード」
-  として本項目を次スライスに切り出し。
-- **② 中**: `failed` 状態のキュー行が詰み。収集中に誤 apply すると即 `failed`、`cancel` は
-  `pending` からのみ・UI も pending のみボタン表示で再試行もキャンセルも不能。`failure_reason` も
-  固定文言で実原因を破棄。再試行/破棄導線と原因保持を追加する。
-- **③ 中**: 稼働中 import の誤成功表示。稼働中は create API が `202 + QueuedPendingChangeResponse`
-  を返すが `tagRegistryAdmin.ts` が `PlcConnection`/`Tag` 型と偽って返すため、`configPackageAdmin`
-  の名前対応付けが `undefined` キーになり依存項目がサイレントスキップ。UI は稼働状態を見ず無条件に
-  成功トーストを出す。import 時の稼働状態ハンドリングと戻り値型を是正する。
+- **① 重大 → 完了（#121）**: pending apply 時にサーバー最新状態への再検証が無く、`plc_connections` /
+  `collection_groups` の apply が無警告で上書きしていた問題を、per-resource フィンガープリント方式
+  （enqueue 時に対象の現在値を保存 → apply 直前に再突合、不一致/消失なら Conflict 失敗）で解消。
+  グローバル revision 突合は apply が revision を上げるためキュー複数適用を壊す点を回避（回帰テスト済み）。
+- **② 中 → 最小対応済み（#121 同梱）／一部残**: `failed` 行のキャンセル導線（cancel を Failed→Canceled
+  拡張）と `failure_reason` への実エラー保持は実装済み。**残: `failed` からの「再試行（再キュー）」導線は未実装**。
+- **③ 中 → 着手中（`claude/import-running-guard`）**: 稼働中 import の誤成功表示。`tagRegistryAdmin.ts` が
+  202（queued）を作成済み型と偽り `configPackageAdmin` が依存項目をサイレントスキップ、UI は無条件に成功
+  トースト。方針: import は収集停止中のみ許可する事前ガード＋戻り値型の是正（202 を作成済み型として返さない）。
 
 ### Phase 1 — docs 整合の是正（軽量・まとめて 1 PR）
 
