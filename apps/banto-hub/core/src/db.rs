@@ -256,6 +256,41 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
     .await
     .map_err(banto_storage::storage_error)?;
 
+    // TAG-P0-3（2026-08-11 方針改定）: 運転中編集の pending queue。
+    // `payload` は提案変更を JSON 文字列で保持し、実行構成への反映は
+    // 後続スライス（手動 apply/cancel API）で行う。
+    sqlx::query(
+                "CREATE TABLE IF NOT EXISTS pending_changes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    state TEXT NOT NULL CHECK (state IN ('pending','applying','applied','canceled','failed')),
+                    source TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    base_configured_revision INTEGER NOT NULL,
+                    requested_by_username TEXT,
+                    requested_by_role TEXT,
+                    failure_reason TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )",
+        )
+        .execute(pool)
+        .await
+        .map_err(banto_storage::storage_error)?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_pending_changes_state_created_at
+                 ON pending_changes(state, created_at)",
+    )
+    .execute(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_pending_changes_created_at
+                 ON pending_changes(created_at)",
+    )
+    .execute(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+
     Ok(())
 }
 
@@ -316,6 +351,7 @@ mod tests {
             "write_control_state",
             "hub_write_audit",
             "hub_retained_values",
+            "pending_changes",
         ] {
             let exists: Option<String> = sqlx::query_scalar(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",

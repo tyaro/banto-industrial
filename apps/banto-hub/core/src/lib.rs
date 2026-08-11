@@ -68,6 +68,9 @@
 //!   モードの発行機能（rumqttc）。[`hub::CollectorManager`] を読むだけの
 //!   消費者（設計 §3.4「収集に背圧をかけない」） - `crate::stream`と同じ
 //!   立ち位置
+//! - [`pending_changes`]: TAG-P0-3（2026-08-11 方針改定）。運転中編集の
+//!   提案変更（pending queue）を保持する service 層。実行構成への反映
+//!   （手動 apply）と破棄（cancel）の前提となる永続化基盤
 //! - [`test_output`]: T15-3（docs/banto-hub-desktop-plan.md §6.3）。現在の
 //!   収集 run コンテキストにのみ opt-in する「テスト出力」フラグ
 //!   （[`write_control::WriteControl`]と同型・非永続）。`crate::mqtt`の
@@ -173,6 +176,7 @@ pub mod hub;
 pub mod hub_health;
 pub mod hub_log;
 pub mod mqtt;
+pub mod pending_changes;
 pub mod profile_acl;
 pub mod profile_lock;
 pub mod profile_paths;
