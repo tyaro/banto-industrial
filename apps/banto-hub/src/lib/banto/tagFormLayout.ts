@@ -30,14 +30,7 @@
 import type { TagKind } from './tagRegistryAdmin';
 
 /** 「表示・スケーリング」詳細セクションに属するフィールド名。 */
-export const DISPLAY_SCALING_FIELDS = [
-	'unit',
-	'decimals',
-	'rawLo',
-	'rawHi',
-	'engLo',
-	'engHi'
-] as const;
+export const DISPLAY_SCALING_FIELDS = ['decimals', 'rawLo', 'rawHi', 'engLo', 'engHi'] as const;
 
 /** 「しきい値」詳細セクションに属するフィールド名。 */
 export const THRESHOLD_FIELDS = ['thresholdH', 'thresholdHh', 'thresholdL', 'thresholdLl'] as const;

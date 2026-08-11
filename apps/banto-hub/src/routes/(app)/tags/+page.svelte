@@ -1270,6 +1270,18 @@
 					>{/if}
 			</label>
 		{/if}
+		<label class="field">
+			単位
+			<input
+				id="tag-unit"
+				type="text"
+				bind:value={form.unit}
+				placeholder="℃"
+				aria-invalid={errors.unit ? 'true' : undefined}
+				aria-describedby={describedBy(errors.unit && 'tag-unit-err')}
+			/>
+			{#if errors.unit}<span class="err" id="tag-unit-err">{errors.unit}</span>{/if}
+		</label>
 		<label class="field checkbox">
 			<input id="tag-enabled" type="checkbox" bind:checked={form.enabled} />
 			有効
@@ -1293,18 +1305,6 @@
 	<details class="detail-group" bind:open={detailOpen.display}>
 		<summary>表示・スケーリング</summary>
 		<div class="form-grid">
-			<label class="field">
-				単位
-				<input
-					id="tag-unit"
-					type="text"
-					bind:value={form.unit}
-					placeholder="℃"
-					aria-invalid={errors.unit ? 'true' : undefined}
-					aria-describedby={describedBy(errors.unit && 'tag-unit-err')}
-				/>
-				{#if errors.unit}<span class="err" id="tag-unit-err">{errors.unit}</span>{/if}
-			</label>
 			<label class="field">
 				小数桁数
 				<input
