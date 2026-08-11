@@ -153,13 +153,37 @@ MQTT publish は banto-hub が**外部ブローカーへ接続しに行くクラ
 
 - `read`: `/api/v1/tags`・`/api/v1/values`・`/api/v1/stream` などの
   読み取り系すべてに使える
+- `read:{connection}.{group}.{tag}`: 指定した1タグの**値**の読み取りのみ許可
+  （例: `read:line1.fast.setpoint01`）
+- `read:{connection}.{group}.*`: 指定したグループ配下の全タグの値読み取りを
+  許可するワイルドカード（read 限定。例: `read:line1.fast.*`）
 - `write:{connection}.{group}.{tag}`: 指定した1タグへの書き込みのみ許可
   （例: `write:line1.fast.setpoint01`）
 
 **write スコープはワイルドカード不可・完全一致のみ**です
 （`write:line1.fast.*` のような指定や3セグメント以外の指定は発行時に
 拒否されます）。複数タグへの書き込みを許可したい場合は、スコープを
-タグの数だけ列挙してください。
+タグの数だけ列挙してください。**read の per-tag スコープのみ、グループ
+単位のワイルドカード（`read:{connection}.{group}.*`）を許可**します。
+
+**read:{...} は「値」のみを絞り、catalog（`GET /api/v1/tags`）は絞りません。**
+`read` または任意の `read:{...}` を1つでも持つキーは、`GET /api/v1/tags`
+（PLC アドレス含む全タグ一覧）を従来どおり閲覧できます。per-tag
+スコープが制限するのは値の読み取り経路（単一値・バルク値・
+WebSocket/gRPC ストリーム）のみで、スコープ外タグの値読みは
+`403` になります（一覧には出るが値は読めない、という状態が意図した
+挙動です）。素の `read` は従来どおり全タグの catalog・値の両方に使えます
+（既存キーへの影響はありません）。
+
+`read:{connection}.{group}.{tag}` は `write:` と同じく
+`external_name`（`{connection}.{group}.{tag}`）の完全一致で判定するため、
+対象の接続・収集グループ・タグ名のいずれかをリネームすると、リネーム後の
+名前を指す新しいスコープを発行し直すまで値が読めなくなります
+（fail-closed。catalog の一覧表示自体には影響しません）。
+
+この per-tag read スコープの採用理由・比較検討は
+[h10-3-read-scope-proposal.md](h10-3-read-scope-proposal.md)（H10③、
+2026-08-08 オーナー決定、案 B）を参照してください。
 
 ### 管理 REST（admin ロール限定、管理 UI からも操作可能）
 
