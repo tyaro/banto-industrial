@@ -204,12 +204,18 @@ impl AuditLogService {
     /// share the same second). `None` means unlimited for that dimension;
     /// a non-positive value is also treated defensively as "skip this
     /// dimension" (mirrors chronogazer's `AuditSettings` convention this
-    /// method was copied alongside, even though banto-hub's own
-    /// `crate::settings` has no equivalent typed `AuditSettings`/
-    /// `audit_config` yet - T0-1 does not wire audit-log retention into any
-    /// settings key or call `prune` from `crate::rest`/`bin/banto-hub.rs`;
-    /// this method exists and is unit-tested for a future milestone to wire
-    /// up the same way chronogazer/relay-wright already do).
+    /// method was copied alongside).
+    ///
+    /// docs/banto-hub-remaining-plan.md P3-a: wired up the same way
+    /// chronogazer/relay-wright already do - the settings come from
+    /// [`crate::settings::SettingsService::audit_config`], and this method
+    /// is called from two places, matching the reference crates' "no
+    /// separate background pruning task" reasoning (see their
+    /// `crate::rest::audit_log_list` doc comment):
+    /// - once at startup (`crate::runtime::HubRuntime::start`), and
+    /// - opportunistically before every `POST /api/audit-log/list`
+    ///   (`crate::rest::audit_log_list`) - best-effort, so a prune failure
+    ///   never blocks an admin from viewing existing entries.
     ///
     /// Returns the total number of rows deleted.
     pub async fn prune(

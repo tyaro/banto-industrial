@@ -87,7 +87,7 @@ use crate::controller::{CollectionController, CollectionState, CollectionStatus,
 use crate::hub::{CollectorManager, SimulationCoverageReport, TagEntry};
 use crate::mqtt::MqttPublisher;
 use crate::pending_changes::{PendingChange, PendingChangesService};
-use crate::settings::{MqttSettings, SettingsService};
+use crate::settings::{AuditSettings, MqttSettings, SettingsService};
 use crate::test_output::TestOutputControl;
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
 use crate::write_audit::{WriteAuditEntry, WriteAuditService};
@@ -765,27 +765,102 @@ async fn audit_logout_middleware(
     response
 }
 
-// --- audit log (read-only in T0: no retention-config endpoints - not part
-// of the T0-1 scope) ---------------------------------------------------------
+// --- audit log (docs/banto-hub-remaining-plan.md P3-a: retention-config
+// endpoints added - chronogazer/relay-wright と同型の `AuditSettings`
+// 配線) -----------------------------------------------------------------
 
 #[derive(Clone)]
 struct AuditLogState {
     audit: AuditLogService,
+    // `mqtt_settings_router`/`grpc_settings_router`と同じ規約:
+    // `SettingsService`自体は持たず、ハンドラ内で
+    // `SettingsService::new(state.manager.pool())`を都度構築する。
+    manager: Arc<CollectorManager>,
+    auth: AuthState,
 }
 
+/// `POST /api/audit-log/list`（admin 限定）: フィルタ/ソート/ページング
+/// 済みの監査ログ一覧。読む前に retention 設定に従って opportunistic に
+/// 剪定する（chronogazer/relay-wright の`audit_log_list`と同じ「list実行
+/// 時に軽く」規約 - `crate::audit::AuditLogService::prune`のdoc comment
+/// 参照）。剪定に失敗しても一覧の取得自体は続行する（best-effort）。
 async fn audit_log_list(
     State(state): State<AuditLogState>,
     Json(params): Json<ListParams>,
 ) -> Result<Json<ListResult<crate::audit::AuditLogEntry>>, ApiError> {
+    if let Ok(config) = SettingsService::new(state.manager.pool())
+        .audit_config()
+        .await
+    {
+        let _ = state
+            .audit
+            .prune(config.retention_days, config.retention_rows)
+            .await;
+    }
     Ok(Json(state.audit.list(params).await?))
 }
 
-fn audit_log_router(audit: AuditLogService, auth: AuthState) -> Router {
+/// `GET /api/audit-log/config`（admin 限定）: 現在の retention 設定。
+/// 読み取り専用のため監査エントリは記録しない（read routes are never
+/// audited - `crate::audit`のモジュール doc comment参照）。
+async fn audit_log_config_get(
+    State(state): State<AuditLogState>,
+) -> Result<Json<AuditSettings>, ApiError> {
+    Ok(Json(
+        SettingsService::new(state.manager.pool())
+            .audit_config()
+            .await?,
+    ))
+}
+
+/// `PUT /api/audit-log/config`（admin 限定）: retention 設定を保存する。
+/// `retentionDays`/`retentionRows`いずれも省略・`null`可（そのフィールド
+/// を無制限にする - `crate::settings::AuditSettings`のdoc comment参照）。
+/// `mqtt_settings_put`/`grpc_settings_put`と同じ「保存 → 監査エントリ
+/// 記録」の形だが、こちらは即時適用するランタイム状態を持たないため
+/// （`prune`は次回の起動時/list実行時に読まれるだけ）、`apply`相当の
+/// 呼び出しは無い。
+async fn audit_log_config_put(
+    State(state): State<AuditLogState>,
+    headers: HeaderMap,
+    Json(config): Json<AuditSettings>,
+) -> Result<Json<AuditSettings>, ApiError> {
+    let settings_service = SettingsService::new(state.manager.pool());
+    settings_service.set_audit_config(&config).await?;
+
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "update",
+        "audit_log_config",
+        "1",
+        Some(json!({
+            "retentionDays": config.retention_days,
+            "retentionRows": config.retention_rows,
+        })),
+    )
+    .await;
+
+    Ok(Json(settings_service.audit_config().await?))
+}
+
+fn audit_log_router(
+    audit: AuditLogService,
+    auth: AuthState,
+    manager: Arc<CollectorManager>,
+) -> Router {
     let state = AuditLogState {
         audit: audit.clone(),
+        manager,
+        auth: auth.clone(),
     };
     Router::new()
         .route("/api/audit-log/list", post(audit_log_list))
+        .route(
+            "/api/audit-log/config",
+            get(audit_log_config_get).put(audit_log_config_put),
+        )
         .with_state(state)
         .layer(middleware::from_fn_with_state(
             RoleGuard {
@@ -5467,7 +5542,11 @@ fn api_router_with_controller_mode(
         ))
         .merge(sse_route(auth.clone(), events.clone()))
         .merge(users_router(users, audit.clone(), auth.clone()))
-        .merge(audit_log_router(audit.clone(), auth.clone()))
+        .merge(audit_log_router(
+            audit.clone(),
+            auth.clone(),
+            manager.clone(),
+        ))
         .merge(api_keys_router(
             api_keys.clone(),
             audit.clone(),
@@ -7998,5 +8077,176 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(updated_b.name, "line-b-renamed");
+    }
+
+    // --- 監査ログ retention 設定 (docs/banto-hub-remaining-plan.md P3-a) ----
+
+    /// `GET/PUT /api/audit-log/config`: admin 限定（viewer は403）、既定値
+    /// （90日/100,000件）、保存した値の round-trip、PUT が
+    /// `audit_log_config`リソースへの`update`監査エントリを1件だけ記録する
+    /// ことを1本のテストで固定する（`collection_control_requires_admin_and_csrf_and_is_idempotent`
+    /// と同じ「1テストで RBAC + 挙動 + 監査を通して確認する」形）。
+    #[tokio::test]
+    async fn audit_log_config_round_trips_and_requires_admin() {
+        let env = test_env().await;
+
+        let viewer_get = HttpRequest::builder()
+            .method("GET")
+            .uri("/api/audit-log/config")
+            .header("Authorization", format!("Bearer {}", env.viewer_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .body(Body::empty())
+            .unwrap();
+        let response = env.router.clone().oneshot(viewer_get).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let admin_get = HttpRequest::builder()
+            .method("GET")
+            .uri("/api/audit-log/config")
+            .header("Authorization", format!("Bearer {}", env.admin_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .body(Body::empty())
+            .unwrap();
+        let response = env.router.clone().oneshot(admin_get).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["retentionDays"], 90);
+        assert_eq!(body["retentionRows"], 100_000);
+
+        let put_body = || {
+            Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "retentionDays": 30,
+                    "retentionRows": 5000
+                }))
+                .unwrap(),
+            )
+        };
+
+        let viewer_put = HttpRequest::builder()
+            .method("PUT")
+            .uri("/api/audit-log/config")
+            .header("Authorization", format!("Bearer {}", env.viewer_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .header("content-type", "application/json")
+            .body(put_body())
+            .unwrap();
+        let response = env.router.clone().oneshot(viewer_put).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let admin_put = HttpRequest::builder()
+            .method("PUT")
+            .uri("/api/audit-log/config")
+            .header("Authorization", format!("Bearer {}", env.admin_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .header("content-type", "application/json")
+            .body(put_body())
+            .unwrap();
+        let response = env.router.clone().oneshot(admin_put).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let applied: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(applied["retentionDays"], 30);
+        assert_eq!(applied["retentionRows"], 5000);
+
+        let refetch = HttpRequest::builder()
+            .method("GET")
+            .uri("/api/audit-log/config")
+            .header("Authorization", format!("Bearer {}", env.admin_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .body(Body::empty())
+            .unwrap();
+        let response = env.router.clone().oneshot(refetch).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let refetched: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(refetched["retentionDays"], 30);
+        assert_eq!(refetched["retentionRows"], 5000);
+
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT action, resource, result FROM audit_log WHERE resource = 'audit_log_config' ORDER BY id",
+        )
+        .fetch_all(&env.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                "update".to_string(),
+                "audit_log_config".to_string(),
+                "ok".to_string()
+            )]
+        );
+    }
+
+    /// `POST /api/audit-log/list`が読む前に retention 設定に従って
+    /// opportunistic に剪定すること（`crate::audit::AuditLogService::prune`
+    /// の配線そのもの、docs/banto-hub-remaining-plan.md P3-a）を、REST
+    /// エンドポイント越しに確認する - `crate::audit`の単体テストは
+    /// `prune`自体の正しさを担保済みなので、ここでは「呼ばれること」だけを
+    /// 見る。
+    #[tokio::test]
+    async fn audit_log_list_opportunistically_prunes_by_configured_retention() {
+        let env = test_env().await;
+
+        for i in 0..5 {
+            sqlx::query(
+                "INSERT INTO audit_log (actor_username, actor_role, action, resource, entity_id, detail, origin, result) \
+                 VALUES ('admin', 'admin', 'create', 'items', ?, NULL, 'rest', 'ok')",
+            )
+            .bind(i.to_string())
+            .execute(&env.pool)
+            .await
+            .unwrap();
+        }
+
+        let put = HttpRequest::builder()
+            .method("PUT")
+            .uri("/api/audit-log/config")
+            .header("Authorization", format!("Bearer {}", env.admin_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "retentionDays": null,
+                    "retentionRows": 2
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = env.router.clone().oneshot(put).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // PUT 自体も1件 audit_log 行を作るため、この時点で 5(シード) + 1(PUT)
+        // = 6件。retentionRows=2 で list を叩くと、剪定後は最新2件のみ残る。
+        let list = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/audit-log/list")
+            .header("Authorization", format!("Bearer {}", env.admin_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({})).unwrap(),
+            ))
+            .unwrap();
+        let response = env.router.clone().oneshot(list).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["totalCount"], 2);
+
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 2);
     }
 }

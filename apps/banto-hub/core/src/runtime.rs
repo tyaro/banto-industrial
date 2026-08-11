@@ -69,7 +69,11 @@
 //! `SlmpSimRegistry` 構築（T9-2、docs/ux-plan.md §1。同じく
 //! `CollectorManager` の外で生存する SLMP シミュレータ registry）→
 //! `CollectorManager::rebuild()`（起動時1回、設計 §4.3）→ tstore 剪定
-//! （起動時1回 + 24h 周期、設計 §3.3・保持既定7日）→ `MqttPublisher`構築 +
+//! （起動時1回 + 24h 周期、設計 §3.3・保持既定7日）→ 監査ログ剪定
+//! （起動時1回、docs/banto-hub-remaining-plan.md P3-a。chronogazer/
+//! relay-wright と同じく専用の周期タスクは持たず、これと
+//! `POST /api/audit-log/list`実行時の opportunistic な剪定の2箇所のみ）
+//! → `MqttPublisher`構築 +
 //! settings の永続値を`apply`（T3、設計 §5.3。`mqtt.enabled=false`なら
 //! 何も起動しない）→ `GrpcServer`構築 + settings の永続値を`apply`（T4、
 //! 設計 §5.4。`grpc.enabled=false`(既定)なら bind しない）→ axum サーバー
@@ -436,6 +440,33 @@ impl HubRuntime {
         // instead of discarded - see this module's doc comment ("T14-1 での
         // 唯一の挙動変化").
         prune_once(&settings, &data_dir, clock.as_ref()).await;
+
+        // Audit-log retention sweep (docs/banto-hub-remaining-plan.md
+        // P3-a): startup-once, matching chronogazer/relay-wright's
+        // `bin/*-serve.rs` timing - see
+        // `crate::audit::AuditLogService::prune`'s doc comment for the
+        // other call site (opportunistic, on `POST /api/audit-log/list`).
+        // Deliberately no periodic background task here either, same
+        // reasoning as the reference crates (this plus the opportunistic
+        // prune on that admin-only, infrequently-visited route is judged
+        // sufficient). Best-effort: a prune failure must never stop the
+        // server from starting.
+        match settings.audit_config().await {
+            Ok(config) => {
+                if let Err(err) = audit
+                    .prune(config.retention_days, config.retention_rows)
+                    .await
+                {
+                    log_err_line(&format!(
+                        "banto-hub: 起動時の監査ログの剪定に失敗しました: {err}"
+                    ));
+                }
+            }
+            Err(err) => log_err_line(&format!(
+                "banto-hub: 監査ログの保持設定の読み取りに失敗しました: {err}"
+            )),
+        }
+
         let prune_handle: JoinHandle<()> = {
             let prune_settings = settings.clone();
             let prune_data_dir = data_dir.clone();

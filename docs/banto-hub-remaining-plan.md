@@ -89,9 +89,12 @@ Phase 0 マージ後の main を実機で確認。テスト PLC の複数ポー�
 
 ### Phase 3 — バックログ実装（採番済み・実装系）
 
-- **P3-a**: audit ログ retention の配線（低リスク・影響大）。[audit.rs:200](../apps/banto-hub/core/src/audit.rs)
-  の `prune` は休眠実装で REST/起動パスに未配線 → 監査ログ無制限成長。chronogazer/relay-wright と
-  同等の `AuditSettings` 配線を追加。
+- **P3-a（完了、2026-08-12、ブランチ `claude/audit-retention`）**: audit ログ retention の配線
+  （低リスク・影響大）。[audit.rs:200](../apps/banto-hub/core/src/audit.rs) の `prune` は休眠実装で
+  REST/起動パスに未配線 → 監査ログ無制限成長、だった問題を解消。chronogazer/relay-wright と同等の
+  `AuditSettings`（`crate::settings`、既定 90日/100,000件）を追加し、`GET/PUT /api/audit-log/config`
+  （admin 限定）と `crate::runtime::HubRuntime::start` の起動時剪定 + `POST /api/audit-log/list` の
+  opportunistic 剪定を配線した（[docs/banto-hub-operations.md §9](banto-hub-operations.md)参照）。
 - **P3-b**: SLMP の word order / CPU 種別を接続設定から露出。broker が `host`/`port` 以外を
   `SlmpConfig::default()` 固定にしているため、ワード順の異なる機種で u32/f32 の値化けに直結。
   接続レジストリ・登録 UI へ露出。

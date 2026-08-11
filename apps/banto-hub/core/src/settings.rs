@@ -34,6 +34,17 @@
 //! にし、LAN 公開は管理者が明示的に `0.0.0.0` 等へ変更する opt-in に
 //! 揃える。既に gRPC を LAN 公開で運用していた環境は、アップグレード後に
 //! `grpc.bind` の再設定が必要（意図した安全側の破壊的変更）。
+//!
+//! docs/banto-hub-remaining-plan.md P3-a（2026-08-12）で `audit.*`
+//! （2キー、[`AuditSettings`]）を追加した - `crate::audit::AuditLogService`
+//! の監査ログ retention（保持日数・保持件数の上限）を設定する。
+//! `apps/chronogazer/core/src/settings.rs`・
+//! `apps/relay-wright/core/src/settings.rs` の `AuditSettings` と
+//! 設定形・既定値（90日/100,000件）・「0以下は無制限」規約が完全に同じ -
+//! [`normalize_retention`]/[`parse_retention`] はそちらからそのまま移植
+//! した。`crate::rest::audit_log_router`（`GET/PUT /api/audit-log/config`）
+//! と `crate::runtime::HubRuntime::start`（起動時1回の剪定）がこの設定を
+//! 読む。
 
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -58,6 +69,42 @@ const KEY_MQTT_MIN_INTERVAL_MS: &str = "mqtt.min_interval_ms";
 const KEY_GRPC_ENABLED: &str = "grpc.enabled";
 const KEY_GRPC_BIND: &str = "grpc.bind";
 const KEY_GRPC_PORT: &str = "grpc.port";
+
+const KEY_AUDIT_RETENTION_DAYS: &str = "audit.retention_days";
+const KEY_AUDIT_RETENTION_ROWS: &str = "audit.retention_rows";
+
+/// 監査ログ retention の既定値（90日/100,000件） - chronogazer/relay-wright
+/// の `AuditSettings` と同じ既定（このモジュールの doc comment参照）。
+const DEFAULT_AUDIT_RETENTION_DAYS: i64 = 90;
+const DEFAULT_AUDIT_RETENTION_ROWS: i64 = 100_000;
+
+/// `0以下は「無制限」として None 扱い` - chronogazer/relay-wright の
+/// `normalize_retention` と同一（このモジュールの doc comment参照）:
+/// 保存済み値・[`SettingsService::set_audit_config`]直後の読み戻しの
+/// どちらでも、非正の値は常に「無制限」に丸める。
+fn normalize_retention(value: i64) -> Option<i64> {
+    if value > 0 {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// [`SettingsService::audit_config`]の2フィールドで共有: 未設定キーは
+/// `default`にフォールバックし、設定済みだがパース不能な値も同様に
+/// `default`にフォールバックする（他の `*_config` の壊れた値の扱いと
+/// 同じ規約）。パース成功時は[`normalize_retention`]で正規化する - `"0"`
+/// は「ユーザーが明示的に無制限を選んだ」ことを意味するため`default`へは
+/// フォールバックしない。
+fn parse_retention(raw: Option<String>, default: Option<i64>) -> Option<i64> {
+    match raw {
+        Some(value) => value
+            .parse::<i64>()
+            .map(normalize_retention)
+            .unwrap_or(default),
+        None => default,
+    }
+}
 
 /// hub の既定ポート（docs/tag-server-design.md §8: 「管理 UI + REST + WS =
 /// 8722」）。
@@ -187,6 +234,32 @@ impl Default for GrpcSettings {
             enabled: false,
             bind: DEFAULT_GRPC_BIND.to_string(),
             port: DEFAULT_GRPC_PORT,
+        }
+    }
+}
+
+/// 監査ログ retention 設定（docs/banto-hub-remaining-plan.md P3-a）:
+/// [`crate::audit::AuditLogService::prune`]に渡す日数上限・件数上限。
+/// どちらのフィールドも `None` はその軸が無制限であることを意味する
+/// （[`normalize_retention`]参照）。
+///
+/// `Deserialize`（`Serialize`に加えて）が必要 - `crate::rest`の
+/// `GET/PUT /api/audit-log/config` がこの型を直接 request/response body
+/// として使う（`crate::rest::GrpcSettingsBody`等と違い、専用の request
+/// 型を起こしていない - 秘匿フィールドが無い単純な2フィールド設定値
+/// なので素の`AuditSettings`をそのまま往復させて問題ない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditSettings {
+    pub retention_days: Option<i64>,
+    pub retention_rows: Option<i64>,
+}
+
+impl Default for AuditSettings {
+    fn default() -> Self {
+        Self {
+            retention_days: Some(DEFAULT_AUDIT_RETENTION_DAYS),
+            retention_rows: Some(DEFAULT_AUDIT_RETENTION_ROWS),
         }
     }
 }
@@ -379,6 +452,45 @@ impl SettingsService {
         self.set(KEY_GRPC_PORT, &config.port.to_string()).await?;
         Ok(())
     }
+
+    /// 監査ログ retention 設定を読む。未設定キーは
+    /// [`AuditSettings::default`]にフォールバックする（[`parse_retention`]
+    /// 参照）。
+    pub async fn audit_config(&self) -> Result<AuditSettings, BantoError> {
+        let defaults = AuditSettings::default();
+
+        let retention_days = parse_retention(
+            self.get(KEY_AUDIT_RETENTION_DAYS).await?,
+            defaults.retention_days,
+        );
+        let retention_rows = parse_retention(
+            self.get(KEY_AUDIT_RETENTION_ROWS).await?,
+            defaults.retention_rows,
+        );
+
+        Ok(AuditSettings {
+            retention_days,
+            retention_rows,
+        })
+    }
+
+    /// 監査ログ retention 設定を保存する。`None`は`"0"`として書き込む -
+    /// [`parse_retention`]が読み取り側で非正の値を「無制限」に丸めるため、
+    /// 「未設定かどうか」を区別するための別センチネルは不要（chronogazer/
+    /// relay-wright の`set_audit_config`と同じ規約）。
+    pub async fn set_audit_config(&self, config: &AuditSettings) -> Result<(), BantoError> {
+        self.set(
+            KEY_AUDIT_RETENTION_DAYS,
+            &config.retention_days.unwrap_or(0).to_string(),
+        )
+        .await?;
+        self.set(
+            KEY_AUDIT_RETENTION_ROWS,
+            &config.retention_rows.unwrap_or(0).to_string(),
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -532,5 +644,70 @@ mod tests {
         assert!(config.enabled);
         assert_eq!(config.port, 51000);
         assert_eq!(config.bind, "127.0.0.1");
+    }
+
+    // --- 監査ログ retention 設定（docs/banto-hub-remaining-plan.md P3-a）---
+
+    #[tokio::test]
+    async fn audit_config_defaults_when_unset() {
+        let svc = service().await;
+        let config = svc.audit_config().await.unwrap();
+        assert_eq!(config, AuditSettings::default());
+        assert_eq!(config.retention_days, Some(90));
+        assert_eq!(config.retention_rows, Some(100_000));
+    }
+
+    #[tokio::test]
+    async fn audit_config_round_trips_through_set() {
+        let svc = service().await;
+        let config = AuditSettings {
+            retention_days: Some(30),
+            retention_rows: Some(5_000),
+        };
+        svc.set_audit_config(&config).await.unwrap();
+        assert_eq!(svc.audit_config().await.unwrap(), config);
+    }
+
+    /// `None` は「そのフィールドは無制限」として保存・読み戻る
+    /// （[`normalize_retention`]参照）。
+    #[tokio::test]
+    async fn audit_config_none_round_trips_as_unlimited() {
+        let svc = service().await;
+        svc.set_audit_config(&AuditSettings {
+            retention_days: None,
+            retention_rows: None,
+        })
+        .await
+        .unwrap();
+
+        let config = svc.audit_config().await.unwrap();
+        assert_eq!(config.retention_days, None);
+        assert_eq!(config.retention_rows, None);
+    }
+
+    /// 片方のキーだけ明示的に無制限へ変更しても、もう片方は未変更の
+    /// キーとして残り、次回読み取りでも [`AuditSettings::default`]
+    /// にはフォールバックしない（`set` 済みキーは常にそのまま読める -
+    /// [`parse_retention`]が「設定済みだが値0」を無制限と区別して扱う
+    /// ことの確認）。
+    #[tokio::test]
+    async fn audit_config_days_only_change_leaves_rows_untouched() {
+        let svc = service().await;
+        svc.set(KEY_AUDIT_RETENTION_DAYS, "0").await.unwrap();
+
+        let config = svc.audit_config().await.unwrap();
+        assert_eq!(config.retention_days, None);
+        assert_eq!(config.retention_rows, Some(100_000)); // 未設定キーは既定値のまま
+    }
+
+    /// 非正の値は保存経路を通らず直接キーに書き込まれた場合でも
+    /// 「無制限」に丸める（[`normalize_retention`]の防御的な扱い）。
+    #[tokio::test]
+    async fn audit_config_non_positive_value_normalizes_to_unlimited() {
+        let svc = service().await;
+        svc.set(KEY_AUDIT_RETENTION_DAYS, "-5").await.unwrap();
+
+        let config = svc.audit_config().await.unwrap();
+        assert_eq!(config.retention_days, None);
     }
 }
