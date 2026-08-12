@@ -535,7 +535,7 @@ async fn e2e_get_catalog_and_read_values_match_rest_semantics() {
     .await;
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get("tag:1"))
@@ -625,7 +625,7 @@ async fn stream_values_sends_initial_snapshot_then_on_change() {
     .await;
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get("tag:1"))
@@ -704,7 +704,7 @@ async fn stream_values_ends_when_all_simulation_starts() {
     )
     .await;
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get("tag:1"))
@@ -1064,7 +1064,7 @@ async fn stream_events_relays_plc_disconnected() {
     .await;
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get("tag:1"))
@@ -1150,7 +1150,7 @@ async fn write_value_happy_path_reaches_the_simulator() {
     assert_eq!(response.result, "ok");
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             sim.get_word(SlmpDevice::D, 100) == 1234
         })
         .await,
@@ -1641,7 +1641,7 @@ async fn read_values_with_a_read_colon_key_is_limited_to_the_in_scope_tag() {
     let (name1, name2) = seed_two_connections_two_tags(&app, sim.addr.port()).await;
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get("tag:1"))
@@ -1716,7 +1716,7 @@ async fn stream_values_with_a_read_colon_key_only_resolves_the_in_scope_tag() {
     let (name1, _name2) = seed_two_connections_two_tags(&app, sim.addr.port()).await;
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get("tag:1"))

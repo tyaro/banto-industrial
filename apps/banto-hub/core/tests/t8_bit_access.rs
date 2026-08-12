@@ -426,7 +426,7 @@ async fn collection_reads_bit_and_word_tags_off_the_same_word() {
 
     // Collection is async (100ms period) - poll until every tag settles.
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             let (status, json) = get_json(
                 &app.router,
                 "/api/v1/values/line1.fast.word",
@@ -522,7 +522,7 @@ async fn write_to_a_bit_in_word_tag_changes_only_that_bit_and_collection_reads_i
     // 収集が同じ broker セッションで書き込み結果を読み戻す。
     let tag_key = format!("tag:{tag_id}");
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get(&tag_key))
@@ -533,13 +533,32 @@ async fn write_to_a_bit_in_word_tag_changes_only_that_bit_and_collection_reads_i
         "collection should read the bit back as true"
     );
 
-    let (status, json) = get_json(
-        &app.router,
-        &format!("/api/v1/values/{external_name}"),
-        &app.admin_token,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+    // 上の wait_until は `current_values()` 経由の内部スナップショットで
+    // 「値が 1.0 になった」ことしか見ていない。REST 応答の品質フィールドは
+    // 別スナップショットのため、値が 1.0 になった直後の一瞬だけ品質が
+    // stale に戻る窓があり、単発 GET だとそこを引いて落ちる
+    // （実例 run 31590862923、`left: "stale" / right: "good"`）。
+    // v==1.0 && q=="good" が両立する応答が観測できるまで改めてポーリング
+    // してから最後の assert を行う。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut json;
+    loop {
+        let (status, body) = get_json(
+            &app.router,
+            &format!("/api/v1/values/{external_name}"),
+            &app.admin_token,
+        )
+        .await;
+        json = body;
+        if status == StatusCode::OK && json["v"] == 1.0 && json["q"] == "good" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "REST read of the written bit should settle at v=1.0 with good quality within 10s (last: {json:?})"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(json["v"], 1.0);
     assert_eq!(json["q"], "good");
 

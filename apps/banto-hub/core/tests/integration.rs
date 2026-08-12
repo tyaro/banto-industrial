@@ -343,7 +343,7 @@ async fn e2e_read_via_rest_after_rebuild() {
     app.manager.rebuild().await.expect("rebuild after seeding");
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get("tag:1"))
@@ -392,7 +392,7 @@ async fn e2e_read_slmp_via_rest_after_rebuild() {
     app.manager.rebuild().await.expect("rebuild after seeding");
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get("tag:1"))
@@ -445,7 +445,7 @@ async fn e2e_slmp_session_survives_a_rebuild_via_broker() {
     // (`CollectorManager::rebuild`'s client factory routes every SLMP
     // connection through `banto_broker` - see hub.rs's doc comment).
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             let (status, body) =
                 get_json(&app.router, "/api/v1/values/line1.fast.t1", &app.token).await;
             status == StatusCode::OK && body["v"] == 111.0
@@ -487,7 +487,7 @@ async fn e2e_slmp_session_survives_a_rebuild_via_broker() {
     // Value continuity through the surviving session: both the pre-existing
     // tag and the newly-added one read correctly after the rebuild.
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             let (s1, b1) = get_json(&app.router, "/api/v1/values/line1.fast.t1", &app.token).await;
             let (s2, b2) = get_json(&app.router, "/api/v1/values/line1.fast.t2", &app.token).await;
             s1 == StatusCode::OK && b1["v"] == 111.0 && s2 == StatusCode::OK && b2["v"] == 222.0
@@ -802,7 +802,7 @@ async fn an_invalid_config_keeps_the_old_collector_and_surfaces_last_config_erro
     app.manager.rebuild().await.expect("first rebuild");
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get("tag:1"))

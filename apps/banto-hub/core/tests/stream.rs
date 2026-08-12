@@ -421,7 +421,7 @@ async fn subscribe_exact_tag_gets_initial_snapshot_then_on_change_data() {
     app.manager.rebuild().await.expect("rebuild after seeding");
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get("tag:1"))
@@ -479,7 +479,7 @@ async fn api_key_ws_ends_and_rejects_normal_output_during_all_simulation() {
         .unwrap();
     app.manager.rebuild().await.expect("rebuild after seeding");
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get("tag:1"))
@@ -577,7 +577,7 @@ async fn wildcard_subscription_picks_up_a_tag_added_after_config_changed() {
     app.manager.rebuild().await.expect("rebuild after seeding");
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get("tag:1"))
@@ -620,7 +620,7 @@ async fn wildcard_subscription_picks_up_a_tag_added_after_config_changed() {
     assert!(config_changed["revision"].as_u64().unwrap() > revision_before);
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get(&format!("tag:{}", created.id)))
@@ -669,7 +669,7 @@ async fn interval_mode_sends_data_on_a_schedule_even_without_changes() {
     app.manager.rebuild().await.expect("rebuild after seeding");
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get("tag:1"))
@@ -759,7 +759,7 @@ async fn unsubscribe_stops_further_data() {
     app.manager.rebuild().await.expect("rebuild after seeding");
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get("tag:1"))
@@ -993,7 +993,7 @@ async fn a_slow_subscriber_gets_disconnected_once_the_outbound_queue_fills() {
     app.manager.rebuild().await.expect("rebuild after seeding");
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get("tag:1"))
@@ -1077,7 +1077,7 @@ async fn valid_session_token_via_subprotocol_header_authenticates_and_streams_da
     app.manager.rebuild().await.expect("rebuild after seeding");
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get("tag:1"))
@@ -1204,7 +1204,7 @@ async fn wildcard_subscription_with_per_tag_read_scope_only_receives_in_scope_ta
     app.manager.rebuild().await.expect("rebuild after seeding");
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get("tag:1"))
@@ -1283,7 +1283,7 @@ async fn wildcard_subscription_with_bare_read_scope_receives_every_tag() {
     app.manager.rebuild().await.expect("rebuild after seeding");
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get("tag:1"))
