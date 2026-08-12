@@ -279,9 +279,13 @@
 	{/if}
 
 	{#if lastCreated}
-		<!-- T18-2d（TAG-UX-A「グループ作成後は次のタグへ進む CTA を表示する」） -->
+		<!-- T18-2d（TAG-UX-A「グループ作成後は次のタグへ進む CTA を表示する」）。
+			文言は「登録が完了しました」とし、上の成功トースト（`作成しました`）と
+			部分一致しないようにする（tags/+page.svelte 側の同種バナーで
+			`getByText('作成しました')` が strict mode violation を起こした
+			実測回帰、2026-08-12、PR #135 CI、と同じ理由の予防）。 -->
 		<div class="onboarding-banner">
-			<span>「{lastCreated.name}」を作成しました。</span>
+			<span>「{lastCreated.name}」の登録が完了しました。</span>
 			<a class="onboarding-cta" href={tagsHref(lastCreated.id)}>次へ: タグを登録</a>
 			<button type="button" class="secondary" onclick={() => (lastCreated = null)}>閉じる</button>
 		</div>

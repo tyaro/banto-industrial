@@ -455,10 +455,14 @@
 		<!--
 			T18-2d（TAG-UX-A「PLC 作成後は次のグループ…へ進む CTA を表示する」）:
 			接続作成の直後に、上の接続テスト・下の収集グループ作成への導線を
-			まとめて出す（サイドバー探索なしで次工程へ進めるようにする）。
+			まとめて出す（サイドバー探索なしで次工程へ進めるようにする）。文言は
+			「登録が完了しました」とし、上の成功トースト（`作成しました`）と
+			部分一致しないようにする（tags/+page.svelte 側の同種バナーで
+			`getByText('作成しました')` が strict mode violation を起こした
+			実測回帰、2026-08-12、PR #135 CI、と同じ理由の予防）。
 		-->
 		<div class="onboarding-banner">
-			<span>「{lastCreated.name}」を作成しました。</span>
+			<span>「{lastCreated.name}」の登録が完了しました。</span>
 			<a class="onboarding-cta" href={collectionGroupsHref(lastCreated.id)}
 				>次へ: 収集グループを作成</a
 			>

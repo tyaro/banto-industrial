@@ -1880,9 +1880,15 @@
 					</div>
 					{#if showMonitorCta}
 						<!-- T18-2d（TAG-UX-A「タグ登録 → SIM 値確認」）: 直近のタグ登録に続けて、
-							サイドバー探索なしで値確認まで到達できるよう案内する。 -->
+							サイドバー探索なしで値確認まで到達できるよう案内する。文言は
+							「登録が完了しました」とし、上の成功トースト（`作成しました`）と
+							部分一致しないようにする -
+							`page.getByText('作成しました')`（`e2e/tests-banto-hub/
+							banto-hub-tags-form.spec.ts`/`banto-hub-tags-p0-2-preflight.spec.ts`）
+							がトーストと二重ヒットして strict mode violation になっていた
+							実測回帰（2026-08-12、PR #135 CI）の修正。 -->
 						<div class="onboarding-banner">
-							<span>タグを作成しました。</span>
+							<span>タグの登録が完了しました。</span>
 							<a class="onboarding-cta" href="/monitor">次へ: SIM値を確認</a>
 							<button type="button" class="secondary" onclick={() => (showMonitorCta = false)}
 								>閉じる</button
