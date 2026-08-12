@@ -14,6 +14,7 @@ import { describe, expect, it } from 'vitest';
 import {
 	buildContinuousParams,
 	generateContinuousTags,
+	incrementAddress,
 	MAX_CONTINUOUS_COUNT,
 	type ContinuousFormState
 } from './continuousRegistration';
@@ -152,6 +153,104 @@ describe('generateContinuousTags: 不正な点数は ok:false + 人間可読メ�
 		expect(result.ok).toBe(false);
 		if (!result.ok) {
 			expect(result.error).toMatch(new RegExp(`${MAX_CONTINUOUS_COUNT}以下`));
+		}
+	});
+});
+
+// --- T18-3c（docs/banto-hub-t18-design.md「T18-3c 連続登録の基数/bit
+// 連番」）: SLMP の16進デバイス繰り上げとワード内 bit 連番 -------------
+
+describe('incrementAddress: 16進デバイスの桁上がり（受け入れケース）', () => {
+	it('X1E → X1F → X20（16進の桁境界を正しく繰り上げる）', () => {
+		expect(incrementAddress('X1E', 1, 0)).toBe('X1E');
+		expect(incrementAddress('X1E', 1, 1)).toBe('X1F');
+		expect(incrementAddress('X1E', 1, 2)).toBe('X20');
+	});
+
+	it('W1FF → W200', () => {
+		expect(incrementAddress('W1FF', 1, 0)).toBe('W1FF');
+		expect(incrementAddress('W1FF', 1, 1)).toBe('W200');
+	});
+});
+
+describe('incrementAddress: ワード内 bit 連番（受け入れケース）', () => {
+	it('D100.14 → D100.15 → D101.0（bit15 の次はワード+1・bit0）', () => {
+		expect(incrementAddress('D100.14', 1, 0)).toBe('D100.14');
+		expect(incrementAddress('D100.14', 1, 1)).toBe('D100.15');
+		expect(incrementAddress('D100.14', 1, 2)).toBe('D101.0');
+	});
+});
+
+describe('incrementAddress: 既存の10進連番は不変', () => {
+	it('D100(i16 相当・step1) → D101', () => {
+		expect(incrementAddress('D100', 1, 1)).toBe('D101');
+	});
+
+	it('D100(i32 相当・step2) → D102', () => {
+		expect(incrementAddress('D100', 2, 1)).toBe('D102');
+	});
+
+	it('Modbus 参照番号（デバイスニーモニックなし）は素朴な10進増分のまま', () => {
+		expect(incrementAddress('40001', 1, 1)).toBe('40002');
+	});
+});
+
+describe('incrementAddress: 範囲外・不正な形式はエラー（null）', () => {
+	it('デバイス番号の上限を超えるとエラー', () => {
+		const atMax = 'D16777215'; // MAX_DEVICE_NUMBER = 0x00FFFFFF
+		expect(incrementAddress(atMax, 1, 0)).toBe(atMax);
+		expect(incrementAddress(atMax, 1, 1)).toBeNull();
+	});
+
+	it('bit 軸の上限（number が MAX_DEVICE_NUMBER を超える）を超えるとエラー', () => {
+		const nearMax = 'D16777215.0';
+		expect(incrementAddress(nearMax, 1, 15)).toBe('D16777215.15');
+		expect(incrementAddress(nearMax, 1, 16)).toBeNull();
+	});
+
+	it('16進デバイスに10進のみの数字でも不正な文字が混ざると解釈できずエラー', () => {
+		expect(incrementAddress('M1A', 1, 0)).toBeNull();
+	});
+
+	it('デバイスにも数字にも解釈できない文字列はエラー', () => {
+		expect(incrementAddress('ZZZ', 1, 0)).toBeNull();
+	});
+});
+
+describe('generateContinuousTags: 16進デバイス・bit 連番がプレビューまで通る', () => {
+	it('X1E を開始アドレスに、bit 型3点で X1E/X1F/X20 が生成される', () => {
+		const params = buildContinuousParams(
+			baseForm({ startAddress: 'X1E', dataType: 'bit', count: 3 })
+		);
+		expect(params).not.toBeNull();
+		const result = generateContinuousTags(params!);
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			expect(result.rows.map((r) => r.address)).toEqual(['X1E', 'X1F', 'X20']);
+		}
+	});
+
+	it('D100.14 を開始アドレスに、bit 型3点で D100.14/D100.15/D101.0 が生成される', () => {
+		const params = buildContinuousParams(
+			baseForm({ startAddress: 'D100.14', dataType: 'bit', count: 3 })
+		);
+		expect(params).not.toBeNull();
+		const result = generateContinuousTags(params!);
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			expect(result.rows.map((r) => r.address)).toEqual(['D100.14', 'D100.15', 'D101.0']);
+		}
+	});
+
+	it('bit サフィックス付きアドレスは data_type が bit 以外だとエラーになる', () => {
+		const params = buildContinuousParams(
+			baseForm({ startAddress: 'D100.14', dataType: 'i16', count: 3 })
+		);
+		expect(params).not.toBeNull();
+		const result = generateContinuousTags(params!);
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.error).toMatch(/bit/);
 		}
 	});
 });
