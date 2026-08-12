@@ -19,6 +19,9 @@ const EDIT_TAG_NAME = 'e2e-form-edit-tag';
 
 test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C)', () => {
 	let page: Page;
+	// T18-2c: 「登録して次へ」の親設定引継ぎ検証（テスト1.5）で、収集グループ
+	// の `<select>` value（数値 ID の文字列表現）と突き合わせるために保持する。
+	let groupId: number;
 
 	test.beforeAll(async ({ browser }) => {
 		page = await browser.newPage();
@@ -56,6 +59,7 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 		});
 		expect(groupRes.ok()).toBe(true);
 		const group = (await groupRes.json()) as { id: number };
+		groupId = group.id;
 
 		const tagRes = await page.request.post('/api/tags', {
 			headers: authedHeaders,
@@ -97,13 +101,74 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 		await addressInput.press('Enter');
 
 		await expect(page.getByText('作成しました')).toBeVisible();
-		// handleCreate() は成功後も Drawer を開いたまま createForm だけ
-		// blankForm() に戻す（連続作業を想定した既存挙動） - フォームが
-		// 空に戻っていることで送信が実際に行われたことを確認する。
+		// T18-2c: テキスト入力内での Enter 実装送信は、DOM 上で先に置いた
+		// 「登録して次へ」ボタンが既定（`+page.svelte`
+		// `create-register-next`/`SubmitEvent.submitter` 参照）- Drawer は
+		// 開いたまま、名前・アドレスだけ空へ戻り（`carryFormForNext`）、他の
+		// 共通値（収集グループ等の「親設定」を含む）は引き継がれる。ここでは
+		// 名前欄が空に戻っていることで送信が実際に行われたことを確認する。
 		await expect(drawer.getByLabel('名前')).toHaveValue('');
 
-		await drawer.getByRole('button', { name: '閉じる' }).click();
+		// T18-2c: create Drawer には「登録して閉じる」ボタンも増え、部分一致だと
+		// Drawer 右上の × （aria-label="閉じる"）と二重マッチするため exact 指定。
+		await drawer.getByRole('button', { name: '閉じる', exact: true }).click();
 		await expect(page.getByRole('gridcell', { name: CREATE_TAG_NAME, exact: true })).toBeVisible();
+	});
+
+	test('1.5. create Drawer: 「登録して次へ」は親設定（収集グループ）と共通値（データ型・単位）を引き継ぎ、名前/アドレスだけ空にする（T18-2c、TAG-UX-2）', async () => {
+		await page.goto('/tags');
+		await page.getByRole('button', { name: '新規登録' }).click();
+		const drawer = page.getByRole('dialog', { name: '新規作成' });
+		await expect(drawer).toBeVisible();
+
+		await drawer.getByLabel('名前').fill('e2e-form-carry-1');
+		await drawer.getByLabel('収集グループ').selectOption({ label: GROUP_NAME });
+		// 既定 dataType（f32）から明示的に切り替えて、「直前の入力を引き継ぐ」
+		// ことを既定値との一致で偽陽性にならないよう確認する。
+		await drawer.getByLabel('データ型').selectOption({ value: 'i16' });
+		await drawer.getByLabel('単位').fill('℃');
+		const addressInput = drawer.getByLabel('アドレス');
+		await addressInput.fill('40030');
+		await drawer.getByRole('button', { name: '登録して次へ' }).click();
+
+		await expect(page.getByText('作成しました')).toBeVisible();
+
+		// 名前・アドレスは次のタグ入力に向けて空へ戻る。
+		await expect(drawer.getByLabel('名前')).toHaveValue('');
+		await expect(addressInput).toHaveValue('');
+		// 親設定（収集グループ）と、その他の共通値（データ型・単位）は
+		// 直前の入力のまま保持される（TAG-UX-2「親設定と明示選択した共通値を
+		// 保持」）。
+		await expect(drawer.getByLabel('収集グループ')).toHaveValue(String(groupId));
+		await expect(drawer.getByLabel('データ型')).toHaveValue('i16');
+		await expect(drawer.getByLabel('単位')).toHaveValue('℃');
+
+		// フォーカスは次の論理入力（名前）へ移っている。
+		await expect(drawer.getByLabel('名前')).toBeFocused();
+
+		await drawer.getByRole('button', { name: '閉じる', exact: true }).click();
+		await expect(
+			page.getByRole('gridcell', { name: 'e2e-form-carry-1', exact: true })
+		).toBeVisible();
+	});
+
+	test('1.6. create Drawer: 「登録して閉じる」は保存成功後に Drawer 自体を閉じる（T18-2c、TAG-UX-2）', async () => {
+		await page.goto('/tags');
+		await page.getByRole('button', { name: '新規登録' }).click();
+		const drawer = page.getByRole('dialog', { name: '新規作成' });
+		await expect(drawer).toBeVisible();
+
+		await drawer.getByLabel('名前').fill('e2e-form-close-1');
+		await drawer.getByLabel('収集グループ').selectOption({ label: GROUP_NAME });
+		await drawer.getByLabel('アドレス').fill('40040');
+		await drawer.getByRole('button', { name: '登録して閉じる' }).click();
+
+		await expect(page.getByText('作成しました')).toBeVisible();
+		// 「登録して次へ」と違い、× を別途押さなくても Drawer 自体が閉じる。
+		await expect(drawer).toBeHidden();
+		await expect(
+			page.getByRole('gridcell', { name: 'e2e-form-close-1', exact: true })
+		).toBeVisible();
 	});
 
 	test('2. create Drawer: 名前を空のまま送信すると HTML5 validation でサーバーに送信されない', async () => {
@@ -120,7 +185,11 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 		// 名前は空のまま、他の必須項目（収集グループ・アドレス）だけ埋める。
 		await drawer.getByLabel('収集グループ').selectOption({ label: GROUP_NAME });
 		await drawer.getByLabel('アドレス').fill('40020');
-		await drawer.getByRole('button', { name: '作成' }).click();
+		// T18-2c: create Drawer のボタンは「登録して次へ」「登録して閉じる」の
+		// 2つに分かれた（旧「作成」ボタン）。HTML5 制約検証はどちらのボタンで
+		// 押しても等しく submit イベント自体を止めるため、ここでは
+		// 既定（Enter 押下時と同じ）の「登録して次へ」を使う。
+		await drawer.getByRole('button', { name: '登録して次へ' }).click();
 
 		// ブラウザの HTML5 制約検証が submit イベント自体を止めるため、
 		// onsubmit 経由の handleCreate() は呼ばれず POST は発生しない。
