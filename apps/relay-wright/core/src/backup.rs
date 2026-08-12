@@ -732,26 +732,63 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_twice_in_the_same_second_appends_a_numeric_suffix() {
         let (dir, svc) = service().await;
+        let backups_dir = dir.path().join("backups");
+        tokio::fs::create_dir_all(&backups_dir).await.unwrap();
+
         // Force a same-timestamp collision deterministically rather than
         // relying on two real `create()` calls landing in the same second
         // (flaky) - pre-create the exact file name the second `create()`
-        // would otherwise pick.
-        let now: String = sqlx::query_scalar("SELECT datetime('now')")
-            .fetch_one(&svc.pool)
-            .await
-            .unwrap();
-        let stamp = compact_stamp(&now);
-        let backups_dir = dir.path().join("backups");
-        tokio::fs::create_dir_all(&backups_dir).await.unwrap();
-        tokio::fs::write(backups_dir.join(format!("banto-{stamp}.sqlite3")), b"stub")
-            .await
-            .unwrap();
+        // would otherwise pick. This still isn't fully deterministic: if a
+        // second boundary is crossed between our `datetime('now')` snapshot
+        // below and `create()`'s own internal snapshot, `create()` picks a
+        // different, non-colliding stamp and returns a plain
+        // `banto-{newstamp}.sqlite3` instead of a `-1` suffixed name. We
+        // detect that case - the returned file name doesn't match either the
+        // stub's stamp or its `-1` suffix - and retry: clean up both files
+        // and try again with a fresh snapshot. The odds of crossing the
+        // boundary on every attempt fall off exponentially, so a handful of
+        // retries is enough to make this effectively non-flaky.
+        for remaining in (0..5).rev() {
+            let now: String = sqlx::query_scalar("SELECT datetime('now')")
+                .fetch_one(&svc.pool)
+                .await
+                .unwrap();
+            let stamp = compact_stamp(&now);
+            let stub_path = backups_dir.join(format!("banto-{stamp}.sqlite3"));
+            tokio::fs::write(&stub_path, b"stub").await.unwrap();
 
-        let created = svc.create().await.expect("create should succeed");
-        assert_eq!(created.file_name, format!("banto-{stamp}-1.sqlite3"));
+            let created = svc.create().await.expect("create should succeed");
 
-        let listed = svc.list().await.unwrap();
-        assert_eq!(listed.len(), 2);
+            // `create()` must never silently overwrite the colliding stub
+            // under its original name - that would be a real regression,
+            // not a timing artifact, so it's checked before the retry logic.
+            assert_ne!(
+                created.file_name,
+                format!("banto-{stamp}.sqlite3"),
+                "create() overwrote the colliding stub instead of appending a numeric suffix"
+            );
+
+            if created.file_name == format!("banto-{stamp}-1.sqlite3") {
+                let listed = svc.list().await.unwrap();
+                assert_eq!(listed.len(), 2);
+                return;
+            }
+
+            // Crossed a second boundary: `created.file_name` is
+            // `banto-{newstamp}.sqlite3` for some newstamp != stamp, so the
+            // stub never actually collided. Reset and try again.
+            tokio::fs::remove_file(&stub_path).await.unwrap();
+            tokio::fs::remove_file(backups_dir.join(&created.file_name))
+                .await
+                .unwrap();
+
+            if remaining == 0 {
+                panic!(
+                    "failed to keep the datetime('now') snapshot and create() within the same \
+                     second after 5 attempts"
+                );
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
