@@ -1779,16 +1779,16 @@ async fn stream_values_with_a_read_colon_key_only_resolves_the_in_scope_tag() {
         "an out-of-scope tag change must not produce a ValueBatch: {silence:?}"
     );
 
-    // スコープ内の値変更は引き続き届く。
+    // スコープ内の値変更は引き続き届く。旧値(10)を載せた spurious な
+    // quality-only on_change バッチが先に届きうるレース(H7 ⑤ - grpc.rs の
+    // `drain_until_value` / `stream_values_sends_initial_snapshot_then_on_change`
+    // 参照)を、値 77 を載せたバッチが来るまで drain して吸収する。全体
+    // deadline で truly-stuck なストリームは依然として明確に失敗する。
     sim.set_word(SlmpDevice::D, 100, 77);
-    let changed: ValueBatch = tokio::time::timeout(Duration::from_secs(3), stream.message())
-        .await
-        .expect("should receive a change within 3s")
-        .expect("stream should not error")
-        .expect("stream should not end");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let changed = drain_until_value(&mut stream, deadline, 77.0).await;
     assert_eq!(changed.values.len(), 1);
     assert_eq!(changed.values[0].tag, name1);
-    assert_eq!(changed.values[0].value, Some(tag_value::Value::Num(77.0)));
 
     sim.stop();
 }
