@@ -18,6 +18,7 @@
  */
 import type { TagDataType, TagInput } from './tagRegistryAdmin';
 import { parseOptionalNumber, toOptionalNumberOrNull } from './tagFormNumeric';
+import { formatSlmpAddress, MAX_DEVICE_NUMBER, parseSlmpAddress } from './slmpDeviceTable';
 
 /** 1回のプレビュー/バッチで生成できる点数の上限（暴走防止の安全弁）。 */
 export const MAX_CONTINUOUS_COUNT = 1000;
@@ -32,7 +33,8 @@ const TWO_WORD_DATA_TYPES: ReadonlySet<TagDataType> = new Set(['i32', 'u32', 'f3
  * （M100 等）に置かれるかワードのビット位置（D100.5）に置かれるかは
  * アドレス書式の話であって data_type の話ではないので、増分自体は
  * bit/i16/u16 のどれでも同じ「+1」でよい — 実際にどちらの形かは
- * {@link hasBitSuffix} が別軸でガードする）。
+ * {@link incrementAddress} がアドレス自体の形（`.N` 付きかどうか）から
+ * 判別する）。
  */
 export function addressIncrement(dataType: TagDataType, stringLength?: number | null): number {
 	if (dataType === 'string') return Math.max(1, stringLength ?? 1);
@@ -41,94 +43,62 @@ export function addressIncrement(dataType: TagDataType, stringLength?: number | 
 }
 
 /**
- * ビット付きアドレス（`D100.5`・`40001.3` — `crates/banto-plc/src/address.rs`
- * ・`slmp/address.rs` の「bit-in-word notation」）かどうか。
+ * アドレスを1件分進める。`step` は {@link addressIncrement} が返すワード
+ * 増分、`index` は連番中の何件目か（0始まり）。
  *
- * **設計判断（2026-08-07）: ビット付きアドレスの連続登録は v1 非対応**。
- * ワード側の連続登録（例: D100, D101, ...）とビット位置側の連番（例:
- * D100.0, D100.1, ...）のどちらを操作者が意図しているかは名前パターンや
- * 開始アドレスだけからは自明に決まらず、ビット位置が15を超えたときに
- * 次のワードへ繰り上げる（D100.15 の次を D101.0 にする）べきかどうかの
- * 規則も自明ではない。誤った繰り上げ規則を実装するより、明示的に
- * 「未対応」としてエラー表示する方が安全（判断として記録）。
- */
-export function hasBitSuffix(address: string): boolean {
-	return /\.\d{1,2}$/.test(address.trim());
-}
-
-/**
- * 16進表記のデバイス番号を持つ SLMP デバイス（`crates/banto-plc/src/
- * slmp/address.rs::SlmpDevice::radix` が `16` を返す8デバイス — X/Y/B/W/
- * SB/SW/DX/DY）を先頭に持つアドレスかどうか。
+ * **T18-3c（docs/banto-hub-t18-design.md「T18-3c 連続登録の基数/bit
+ * 連番」、2026-08-13）: SLMP デバイス記法（`slmpDeviceTable.ts` 経由で
+ * `crates/banto-plc/src/slmp/address.rs` の規則を参照）を認識できるときは
+ * その軸に沿って増分する**。ワード内 bit 連番（`.N` 付き）とデバイス番号の
+ * 連番（16進デバイスの桁上がりを含む）を自動判別する — 以前はどちらも
+ * 「非対応」としてエラーにしていたが、軸をアドレス自体の形から一意に
+ * 決められる（`.N` があれば bit 軸、無ければデバイス番号軸）ため、判断を
+ * 保留する理由がなくなった。
  *
- * **設計判断（2026-08-07、監査で検出された不具合の修正）: 16進デバイス
- * 番号の連続登録は明示的に非対応とする**。{@link incrementAddress} は
- * アドレス末尾の数字列を素朴に10進として `+step` するため、番号が
- * たまたま10進数字だけに見える範囲（例 `X10`〜`X19`、`W100`）だと
- * ガードをすり抜けてしまい、実際には16進の桁境界（例: `X19` の次は
- * 16進なら `X1A`、10進増分だと誤って `X20` になり `X1A`〜`X1F` の6点を
- * 黙って飛ばす）で不連続な採番列が生成される。プレビューには一見正しい
- * アドレス列が表示されるため操作者が気付きにくい「静かなバグ」であり、
- * ビット付きアドレス（{@link hasBitSuffix}）と同じ「推測せず明示的に
- * 非対応とする」方針に合わせ、16進デバイスは番号が10進に見えるかどうか
- * に関わらず一律で連続登録の対象外とする。
+ * - **bit 軸**（{@link parseSlmpAddress} が `bit` を返す場合）: `number` と
+ *   `bit` を「1ワード=16bit」の1本の数直線上の値
+ *   （`number * 16 + bit`）とみなし、そこへ `index` を足してから
+ *   16で割った商・余りに戻す。`step` は使わない（bit 連番は常に1行=1bit
+ *   進む — ワード型の `step` を混ぜると「2bit飛ばし」のような意味の
+ *   薄い増分になってしまうため）。例: `D100.14` → (i=1) `D100.15` →
+ *   (i=2) `D101.0`（bit15 の次はワード+1・bit0）。
+ * - **デバイス番号軸**（bit サフィックスが無い場合）: `number + step *
+ *   index` をそのデバイスの基数で整形し直す。16進デバイス
+ *   （X/Y/B/W/SB/SW/DX/DY）は16進の桁上がりが自然に起こる
+ *   （`Number.parseInt`/`toString(16)` が基数変換そのものを担うため、
+ *   10進の下2桁だけを見て繰り上げるような特別扱いは不要）。例: `X1E` →
+ *   (i=1) `X1F` → (i=2) `X20`、`W1FF` → (i=1) `W200`。
  *
- * マッチ規則: アドレス先頭の英字列（デバイスニーモニック）を丸ごと
- * 抜き出し、8デバイスのどれかと完全一致するかで判定する（部分一致では
- * ない）。`incrementAddress` と同じ「先頭の英字列 + 末尾の数字列」という
- * アドレス分解を前提にしており、`SD100`（SD、10進）を`S` + `D100` と
- * 誤認したり、`SW100`（SW、16進）を`S` + `W100` と誤認したりしない
- * （先頭の英字列全体 "SD"/"SW" をひとかたまりで比較するため、2文字
- * ニーモニックと1文字ニーモニックを取り違えない — 実際のパーサ
- * （`slmp/address.rs::parse` の `DEVICE_TABLE`）の「2文字ニーモニックが
- * 1文字ニーモニックより先にマッチする」という順序制約と整合する結果に
- * なる）。数字のみの Modbus 参照番号（`"40001"` 等、先頭に英字が無い）
- * はこの関数の対象外（`false`）— 10進なので影響を受けない。
- */
-const HEX_RADIX_DEVICE_MNEMONICS: ReadonlySet<string> = new Set([
-	'X',
-	'Y',
-	'B',
-	'W',
-	'SB',
-	'SW',
-	'DX',
-	'DY'
-]);
-
-export function hasHexRadixDevice(address: string): boolean {
-	const trimmed = address.trim();
-	const match = /^([A-Za-z]+)\d+$/.exec(trimmed);
-	if (!match) return false;
-	return HEX_RADIX_DEVICE_MNEMONICS.has(match[1].toUpperCase());
-}
-
-/**
- * アドレス末尾の10進数字の並びをインクリメントする。`prefix`（デバイス
- * ニーモニックや空文字）はそのまま保持し、数字部分だけを
- * `base + step * index` に置き換える。元の桁数を可能な限り維持するため
- * `padStart` で0埋めするが、桁上がりで元の桁数を超える場合はそのまま
- * 自然な桁数にする（例: "D9" → "D10" は問題なく増える）。
+ * どちらの軸でも、結果のデバイス番号が {@link MAX_DEVICE_NUMBER} を
+ * 超える場合は `null`（呼び出し元 `generateContinuousTags` がその行を
+ * エラーにする）。
  *
- * **呼び出し元は事前に {@link hasHexRadixDevice} でガードすること** -
- * この関数自体は「末尾が10進数字で終わるか」しか見ないため、16進デバイス
- * の番号がたまたま10進数字だけに見える場合（`hasHexRadixDevice` の doc
- * comment 参照）は誤ってここを通り抜けてしまう。`generateContinuousTags`
- * が両方のガードを順に適用する。
- *
- * 末尾が10進数字で終わらないアドレス（16進の英字を含む番号、例 "X1A"
- * ・"W1FF"）は増分できないので `null` を返す（`hasHexRadixDevice` の
- * ガードに引っかからない、より単純な「そもそも数字として解釈できない」
- * ケースの保険）。
- *
- * Modbus 参照番号（`"40001"` 等）は先頭の領域選択桁も含めて丸ごと1個の
- * 数字列として扱う。1区画（0-based で最大9999点、6桁形式なら
- * さらに広い）を大きく超える連続登録で領域境界（例: 49999→50000で
- * area が3→5に変わる）を跨ぐ操作は稀な用途と判断し、v1では特別扱いしない
- * （判断: 2026-08-07）。
+ * **SLMP デバイス記法として解釈できないアドレスへのフォールバック**:
+ * Modbus 参照番号（`"40001"` 等、デバイスニーモニックを持たない）や
+ * その他 {@link parseSlmpAddress} が `null` を返す形式は、T18-3c 以前と
+ * 同じ「先頭の非数字列 + 末尾の10進数字列」を `base + step * index` で
+ * 増分する素朴なロジックにフォールバックする（既存の10進連番の挙動は
+ * 不変にする、という受け入れ条件のための後方互換パス）。
  */
 export function incrementAddress(address: string, step: number, index: number): string | null {
 	const trimmed = address.trim();
+
+	const parsed = parseSlmpAddress(trimmed);
+	if (parsed) {
+		if (parsed.bit !== undefined) {
+			const total = parsed.number * 16 + parsed.bit + index;
+			const number = Math.floor(total / 16);
+			const bit = total % 16;
+			if (number > MAX_DEVICE_NUMBER) return null;
+			return formatSlmpAddress(parsed.mnemonic, number, bit);
+		}
+		const number = parsed.number + step * index;
+		if (!Number.isFinite(number) || number < 0 || number > MAX_DEVICE_NUMBER) return null;
+		return formatSlmpAddress(parsed.mnemonic, number);
+	}
+
+	// フォールバック: SLMP デバイス記法として解釈できないアドレス
+	// （Modbus 参照番号など）向けの、T18-3c 以前と同じ素朴な10進増分。
 	const match = /^(\D*)(\d+)$/.exec(trimmed);
 	if (!match) return null;
 	const [, prefix, digits] = match;
@@ -253,18 +223,16 @@ export function generateContinuousTags(
 	if (trimmedAddress === '') {
 		return { ok: false, error: '開始アドレスを入力してください。' };
 	}
-	if (hasBitSuffix(trimmedAddress)) {
+	// T18-3c: bit 軸（`.N` 付きアドレス）は data_type が bit のタグでしか
+	// 意味を持たない（16bit 値の1ワードをビット単位でずらして書き込む、
+	// という操作が成立しないため）。ここで弾かないと
+	// `generateContinuousTags` はワード連番のつもりで `.N` を生成してしまう。
+	const parsedStartAddress = parseSlmpAddress(trimmedAddress);
+	if (parsedStartAddress?.bit !== undefined && params.dataType !== 'bit') {
 		return {
 			ok: false,
 			error:
-				'ビット指定アドレス（例: D100.5、40001.3）の連続登録は現時点では未対応です。個別に登録してください。'
-		};
-	}
-	if (hasHexRadixDevice(trimmedAddress)) {
-		return {
-			ok: false,
-			error:
-				'16進数値デバイス（X/Y/B/W/SB/SW/DX/DY）の連続登録は現時点では未対応です（10進増分では16進の桁境界で採番が不連続になるため）。個別に登録してください。'
+				'ビット指定アドレス（例: D100.5）のワード内 bit 連番は、データ型が bit のタグでのみ使用できます。'
 		};
 	}
 	if (params.dataType === 'string' && (!params.stringLength || params.stringLength < 1)) {
@@ -299,7 +267,7 @@ export function generateContinuousTags(
 		if (address === null) {
 			return {
 				ok: false,
-				error: `開始アドレス "${trimmedAddress}" は自動採番に対応していない形式です（末尾が10進数字のアドレスのみ対応、16進デバイス番号は非対応）。`
+				error: `${i + 1}件目（連番${n}）のアドレスを算出できません（開始アドレス "${trimmedAddress}" の形式が未対応か、デバイス番号の上限（0x00FFFFFF）を超えています）。`
 			};
 		}
 		rows.push({ name, address });
