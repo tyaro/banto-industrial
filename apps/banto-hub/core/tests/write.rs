@@ -467,7 +467,7 @@ async fn e2e_write_then_collection_reads_the_value_back_through_the_same_broker_
     // が同じセッションで値を読み戻す。
     let tag_key = format!("tag:{tag_id}");
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .current_values()
                 .and_then(|c| c.get(&tag_key))

@@ -301,7 +301,7 @@ async fn collects_values_in_tag_order_with_scaling_applied() {
     // Let several ticks land, verified via the cache before stopping.
     let current = collector.current_values();
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get("tag:1").map(|s| s.value) == Some(Some(1234.0))
         })
         .await,
@@ -356,7 +356,7 @@ async fn bit_tags_record_zero_or_one() {
     .unwrap();
     let current = collector.current_values();
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get("tag:1").map(|s| s.value) == Some(Some(1.0))
         })
         .await,
@@ -404,7 +404,7 @@ async fn lifecycle_events_are_emitted_and_persisted() {
     .unwrap();
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             count_events(&pool, "plc_connected").await >= 1
         })
         .await,
@@ -470,7 +470,7 @@ async fn hard_drop_keeps_appending_null_rows_and_marks_reconnecting() {
     // store is guaranteed to contain real values from before the drop.
     let current = collector.current_values();
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get("tag:1").map(|s| s.value) == Some(Some(7.0))
         })
         .await,
@@ -500,7 +500,7 @@ async fn hard_drop_keeps_appending_null_rows_and_marks_reconnecting() {
 
     // Ticks never stop: the cache keeps updating with Bad quality while down.
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get("tag:1").map(|s| s.quality) == Some(Quality::Bad)
         })
         .await,
@@ -554,7 +554,7 @@ async fn auto_reconnects_and_values_resume_after_recovery() {
     let current = collector.current_values();
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get("tag:1").map(|s| s.value) == Some(Some(55.0))
         })
         .await,
@@ -631,7 +631,7 @@ async fn slmp_collects_values_and_writes_to_tstore() {
 
     let current = collector.current_values();
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get("tag:1").map(|s| s.value) == Some(Some(4321.0))
         })
         .await,
@@ -687,7 +687,7 @@ async fn slmp_hard_drop_keeps_appending_null_rows_and_marks_reconnecting() {
 
     let current = collector.current_values();
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get("tag:1").map(|s| s.value) == Some(Some(7.0))
         })
         .await,
@@ -715,7 +715,7 @@ async fn slmp_hard_drop_keeps_appending_null_rows_and_marks_reconnecting() {
         "expected Reconnecting status while the SLMP PLC is down"
     );
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get("tag:1").map(|s| s.quality) == Some(Quality::Bad)
         })
         .await,
@@ -773,7 +773,7 @@ async fn slmp_auto_reconnects_and_values_resume_after_recovery() {
     let current = collector.current_values();
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get("tag:1").map(|s| s.value) == Some(Some(55.0))
         })
         .await,
@@ -861,7 +861,7 @@ async fn threshold_entered_and_cleared_fire_only_on_edges() {
     // Several normal-band ticks: no threshold events (state-change only, and
     // repeating the same in-band value is not a change).
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get("tag:1").map(|s| s.value) == Some(Some(30.0))
         })
         .await
@@ -876,7 +876,7 @@ async fn threshold_entered_and_cleared_fire_only_on_edges() {
     // Cross into H.
     sim.set_holding_register(0, 60);
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             entered_levels(&pool).await.contains(&"H".to_string())
         })
         .await,
@@ -886,7 +886,7 @@ async fn threshold_entered_and_cleared_fire_only_on_edges() {
     // Escalate into HH: clears H, enters HH (one edge, one pair of events).
     sim.set_holding_register(0, 95);
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             entered_levels(&pool).await.contains(&"HH".to_string())
         })
         .await,
@@ -896,7 +896,7 @@ async fn threshold_entered_and_cleared_fire_only_on_edges() {
     // Return to normal: clears HH.
     sim.set_holding_register(0, 30);
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             count_events(&pool, "threshold_cleared").await >= 2
         })
         .await,
@@ -906,7 +906,7 @@ async fn threshold_entered_and_cleared_fire_only_on_edges() {
     // Dip below L to prove the low side works too.
     sim.set_holding_register(0, 10);
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             entered_levels(&pool).await.contains(&"L".to_string())
         })
         .await,
@@ -961,7 +961,7 @@ async fn current_value_quality_transitions_good_bad_stale() {
 
     // Good while connected and reading.
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             matches!(current.get("tag:1").map(|s| s.quality), Some(Quality::Good))
         })
         .await,
@@ -1051,7 +1051,7 @@ async fn clock_regression_emits_edge_events_and_overwrites_the_colliding_row() {
     // Phase 1: clock parked at base_ms - let a real tick land there and
     // durably flush (fast_options() flushes on every append).
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get("tag:1").map(|s| s.ptime_ms) == Some(base_ms)
         })
         .await,
@@ -1063,7 +1063,7 @@ async fn clock_regression_emits_edge_events_and_overwrites_the_colliding_row() {
     let ahead_ms = base_ms + 5_000;
     clock.set_now_ms(ahead_ms);
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get("tag:1").map(|s| s.ptime_ms) == Some(ahead_ms)
         })
         .await,
@@ -1075,7 +1075,7 @@ async fn clock_regression_emits_edge_events_and_overwrites_the_colliding_row() {
     sim.set_holding_register(0, 99); // the value the overwrite must carry
     clock.set_now_ms(base_ms);
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             count_events(&pool, "clock_regression_entered").await >= 1
         })
         .await,
@@ -1088,7 +1088,7 @@ async fn clock_regression_emits_edge_events_and_overwrites_the_colliding_row() {
     // Recover: advance past the prior high-water mark.
     clock.set_now_ms(ahead_ms + 1_000);
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             count_events(&pool, "clock_regression_cleared").await >= 1
         })
         .await,
@@ -1177,7 +1177,7 @@ async fn stop_flushes_buffered_rows_so_none_are_lost() {
     .unwrap();
     let current = collector.current_values();
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get("tag:1").map(|s| s.value) == Some(Some(3.0))
         })
         .await
@@ -1226,7 +1226,7 @@ async fn status_reports_connected_while_running_and_stop_completes_cleanly() {
     .unwrap();
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             matches!(
                 collector.status().get(&conn_key),
                 Some(ConnectionStatus::Connected)
@@ -1279,7 +1279,7 @@ async fn collect_events_rows_carry_the_full_shape() {
 
     // Value 100 >= H(50): the first Good tick raises threshold_entered.
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             count_events(&pool, "threshold_entered").await >= 1
         })
         .await,
@@ -1715,7 +1715,7 @@ async fn apply_config_adding_a_tag_to_b_never_restarts_a() {
 
     // A must keep ticking with no reconnect anywhere in its history.
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get(&setup.tag_a_key).map(|s| s.ptime_ms) > Some(a_ptime_before)
         })
         .await,
@@ -1734,7 +1734,7 @@ async fn apply_config_adding_a_tag_to_b_never_restarts_a() {
 
     // B collects the new tag too.
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get(&tag_b2_key).map(|s| s.value) == Some(Some(99.0))
         })
         .await,
@@ -1795,7 +1795,7 @@ async fn apply_config_adding_a_connection_leaves_the_existing_one_untouched() {
     );
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get(&setup.tag_a_key).map(|s| s.ptime_ms) > Some(a_ptime_before)
         })
         .await,
@@ -1808,7 +1808,7 @@ async fn apply_config_adding_a_connection_leaves_the_existing_one_untouched() {
     );
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get(&tag_b_key).map(|s| s.value) == Some(Some(33.0))
         })
         .await,
@@ -1858,7 +1858,7 @@ async fn apply_config_removing_a_connection_retains_the_rest() {
     );
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get(&setup.tag_a_key).map(|s| s.ptime_ms) > Some(a_ptime_before)
         })
         .await,
@@ -1934,7 +1934,7 @@ async fn apply_config_settings_only_change_does_not_rotate_the_writer() {
     );
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get(&setup.tag_a_key).map(|s| s.ptime_ms) > Some(a_ptime_before)
         })
         .await,
@@ -1948,7 +1948,7 @@ async fn apply_config_settings_only_change_does_not_rotate_the_writer() {
 
     // B must actually be talking to the *new* target now.
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get(&setup.tag_b_key).map(|s| s.value) == Some(Some(77.0))
         })
         .await,
@@ -2020,7 +2020,7 @@ async fn apply_config_writer_open_failure_is_all_or_nothing() {
     );
     let a_ptime_after_failure = current.get(&setup.tag_a_key).unwrap().ptime_ms;
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get(&setup.tag_a_key).map(|s| s.ptime_ms) > Some(a_ptime_after_failure)
         })
         .await,
@@ -2061,7 +2061,7 @@ async fn apply_config_writer_rotation_preserves_old_and_new_data() {
     // Let a few real rows land on A before rotating.
     let current = setup.collector.current_values();
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get(&setup.tag_a_key).map(|s| s.value) == Some(Some(11.0))
         })
         .await
@@ -2095,7 +2095,7 @@ async fn apply_config_writer_rotation_preserves_old_and_new_data() {
     assert!(report.writer_rotated);
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get(&tag_b_key).map(|s| s.value) == Some(Some(66.0))
         })
         .await,

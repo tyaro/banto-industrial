@@ -366,7 +366,7 @@ async fn broker_routed_slmp_connection_serves_synthetic_ramp_values() {
     // ensure_connection がそのアドレスへ接続していないと、これは Bad のまま
     // タイムアウトする。
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             let (status, json) = get_json(
                 &app.router,
                 "/api/v1/values/simline.fast.t1",
@@ -379,9 +379,12 @@ async fn broker_routed_slmp_connection_serves_synthetic_ramp_values() {
         "the broker-routed simulated connection should serve a good-quality value"
     );
 
-    // ランプ波であることの確認: 一定時間おいてもう一度読み、値が変わって
-    // いること(固定値の代用品ではなく、実際に動いているシミュレータである
-    // ことの証拠)。
+    // ランプ波であることの確認: 最初の値と異なる値が観測できるまで待つ
+    // (固定値の代用品ではなく、実際に動いているシミュレータであることの
+    // 証拠)。固定 sleep + 単発2回読みだと、CI 高負荷で収集が sleep 時間内に
+    // 進まないと2値が同じになり偽陰性で落ちる（実例、`left: 43.0 /
+    // right: 43.0`）。変化が観測できさえすればランプ波が動いている証明に
+    // なるので、wait_until でポーリングして偽陰性を避ける。
     let (status, first) = get_json(
         &app.router,
         "/api/v1/values/simline.fast.t1",
@@ -389,16 +392,18 @@ async fn broker_routed_slmp_connection_serves_synthetic_ramp_values() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let (status, second) = get_json(
-        &app.router,
-        "/api/v1/values/simline.fast.t1",
-        &app.admin_token,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_ne!(
-        first["v"], second["v"],
+    let first_value = first["v"].clone();
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            let (status, json) = get_json(
+                &app.router,
+                "/api/v1/values/simline.fast.t1",
+                &app.admin_token,
+            )
+            .await;
+            status == StatusCode::OK && json["v"] != first_value
+        })
+        .await,
         "the simulated value should keep changing (ramp wave), not sit fixed"
     );
 
@@ -465,7 +470,7 @@ async fn toggling_simulation_repoints_the_broker_session_without_leaking_session
     // Phase 1: simulation=false - values come from the test-owned external
     // simulator.
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             let (status, json) = get_json(
                 &app.router,
                 "/api/v1/values/line1.fast.t1",
@@ -495,7 +500,7 @@ async fn toggling_simulation_repoints_the_broker_session_without_leaking_session
     app.manager.rebuild().await.expect("rebuild after toggle");
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             let (status, json) = get_json(
                 &app.router,
                 "/api/v1/values/line1.fast.t1",
@@ -569,7 +574,7 @@ async fn toggling_simulation_repoints_the_broker_session_without_leaking_session
         "an unrelated tag addition must not reopen the simulated broker session"
     );
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             let (status, json) = get_json(
                 &app.router,
                 "/api/v1/values/line1.fast.t2",
