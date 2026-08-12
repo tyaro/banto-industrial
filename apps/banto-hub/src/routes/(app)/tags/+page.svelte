@@ -21,6 +21,7 @@
 	 * `dataType === 'string'` のときのみ表示・送信する（`MIN_STRING_LENGTH`/
 	 * `MAX_STRING_LENGTH` はヒント表示のみ - 実際の検証はバックエンド）。
 	 */
+	import { tick } from 'svelte';
 	import { BantoGrid, type GridColumn } from '@banto/grid-svelte';
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '$lib/toast.svelte';
@@ -78,6 +79,7 @@
 		fieldErrorsFromList
 	} from '$lib/banto/tagFormLayout';
 	import { addressHelpFor } from '$lib/banto/tagAddressHelp';
+	import { carryFormForNext } from '$lib/banto/tagFormCarry';
 	import { isFormDirty } from '$lib/banto/formDirty';
 	import {
 		buildExternalName,
@@ -423,15 +425,51 @@
 		return null;
 	}
 
-	async function handleCreate(): Promise<void> {
+	/**
+	 * T18-2c（docs/banto-hub-t18-design.md「T18-2c 登録後分岐と親引継ぎ」、
+	 * TAG-UX-2）: create Drawer の主アクションを「登録して次へ」
+	 * （`closeAfterSave = false`）と「登録して閉じる」（`true`）に分ける。
+	 * `closeAfterSave` は create フォームの `onsubmit` が
+	 * `SubmitEvent.submitter`（どちらのボタンが送信を起こしたか）から
+	 * 決める - `submitter` が取れない場合（テキスト入力内での Enter
+	 * 実装送信を `submitter` を返さない古いエンジンが処理した場合等）は
+	 * `undefined` になり、`submitter?.id === 'create-register-close'` が
+	 * 自然に `false`（＝「登録して次へ」側）へフォールバックする。これは
+	 * DOM 上も「登録して次へ」ボタンを先に置くことで Enter 押下時の既定
+	 * ボタンにしている（`banto-hub-tags-form.spec.ts`
+	 * 1番の Enter 送信テストが前提にしている「保存後も Drawer が開いたまま」
+	 * 挙動と一致させるため）。
+	 *
+	 * 「登録して閉じる」＝保存成功後に `closeDrawer()`（現状の Drawer
+	 * `×`/Esc と同じ後始末）。「登録して次へ」＝保存成功後も Drawer は
+	 * 開いたまま、`carryFormForNext`（`$lib/banto/tagFormCarry.ts`）で
+	 * 名前・アドレスだけ空にした次フォームへ差し替える -
+	 * タグ種別・収集グループ（「親設定」）を含むそれ以外のフィールドは
+	 * すべて直前の入力のまま引き継ぐ（TAG-UX-2「親設定と明示選択した共通値を
+	 * 保持」、具体的な選択 UI が設計書に無いため tagFormCarry.ts 冒頭の
+	 * コメントに書いた既定にフォールバック）。`createBaseline` も同じ値へ
+	 * 差し替えることで、引き継いだ値そのものは dirty 扱いにならない
+	 * （名前・アドレスへ次の入力をしたときにだけ dirty になる）。
+	 */
+	async function handleCreate(closeAfterSave: boolean): Promise<void> {
 		creating = true;
 		createErrors = {};
 		try {
 			await createTag(toInput(createForm));
 			toastStore.push('success', '作成しました');
-			createForm = blankForm();
-			createBaseline = blankForm();
-			createAddressPreflight = blankAddressPreflight();
+			if (closeAfterSave) {
+				closeDrawer();
+			} else {
+				const nextForm = carryFormForNext(createForm);
+				createForm = nextForm;
+				createBaseline = { ...nextForm };
+				createAddressPreflight = blankAddressPreflight();
+				// フォーム差し替え後の DOM 更新を待ってから、次の論理入力
+				// （名前 - 全タグ種別で必須かつ常に空になる唯一のフィールド）
+				// へフォーカスを移し、連続入力を続けられるようにする。
+				await tick();
+				document.getElementById('tag-name')?.focus();
+			}
 			await reload();
 		} catch (err) {
 			const fieldErrors = applyFieldErrors(err);
@@ -1858,14 +1896,39 @@
 			class="drawer-section"
 			onsubmit={(e) => {
 				e.preventDefault();
-				void handleCreate();
+				// T18-2c: どちらのボタンが送信を起こしたかは
+				// `SubmitEvent.submitter` から判定する - `undefined`/`null`
+				// （submitter を返さない実装での Enter 実装送信等）の場合は
+				// DOM 上で先に置いた「登録して次へ」（closeAfterSave=false）を
+				// 既定にする。`handleCreate` 側のコメントも参照。
+				const submitter = (e as SubmitEvent).submitter;
+				void handleCreate(submitter?.id === 'create-register-close');
 			}}
 		>
 			{@render tagFields(createForm, createErrors, createDetailOpen, createAddressPreflight, () =>
 				scheduleAddressPreflight(createForm, 'create')
 			)}
 			<div class="actions">
-				<button type="submit" disabled={isDrawerBusy() || groups.length === 0}>作成</button>
+				<!--
+					T18-2c（TAG-UX-2「作成後は『登録して次へ』と『登録して閉じる』を
+					分け…」）: 「登録して次へ」を先に置き、Enter 押下時の既定
+					送信ボタンにする（`handleCreate` のコメント参照）。
+				-->
+				<button
+					type="submit"
+					id="create-register-next"
+					disabled={isDrawerBusy() || groups.length === 0}
+				>
+					登録して次へ
+				</button>
+				<button
+					type="submit"
+					id="create-register-close"
+					class="secondary"
+					disabled={isDrawerBusy() || groups.length === 0}
+				>
+					登録して閉じる
+				</button>
 			</div>
 			{#if groups.length === 0}
 				<p class="note">先に 収集グループ を1件以上登録してください。</p>

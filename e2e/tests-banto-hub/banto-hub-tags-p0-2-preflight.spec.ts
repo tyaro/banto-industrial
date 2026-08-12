@@ -133,7 +133,9 @@ test.describe.serial('banto-hub タグ preflight 失敗の可視性 (TAG-P0-2)',
 		await expect(page.getByText('作成しました')).toBeVisible();
 		await expect(drawer.getByRole('alert')).toHaveCount(0);
 
-		await drawer.getByRole('button', { name: '閉じる' }).click();
+		// T18-2c: create Drawer には「登録して閉じる」ボタンも増え、部分一致だと
+		// Drawer 右上の × （aria-label="閉じる"）と二重マッチするため exact 指定。
+		await drawer.getByRole('button', { name: '閉じる', exact: true }).click();
 		await expect(page.getByRole('gridcell', { name: VALID_TAG_NAME, exact: true })).toBeVisible();
 	});
 });
