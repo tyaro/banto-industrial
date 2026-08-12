@@ -20,6 +20,13 @@
 	 * この汎用部品に含めない（呼び出し側が出す）。prop 未指定なら
 	 * `preventDefault` せず素通しし、ブラウザ標準のコンテキストメニューを
 	 * そのまま出す。
+	 *
+	 * T18-2e（docs/banto-hub-desktop-plan.md §9.4 TAG-UX-G「キーボード・
+	 * タッチでも使える常時表示の作成操作」）: マウス右クリックと同じ
+	 * `oncontextmenu` コールバックを、キーボードの `Shift+F10`/メニュー
+	 * キー（`event.key === 'ContextMenu'`）からも起動できるようにする。
+	 * 座標が無いキー操作のため、押下されたノードラベル要素の直下（左下）を
+	 * 疑似的な右クリック位置として渡す。
 	 */
 	import type { Snippet } from 'svelte';
 	import { SvelteSet } from 'svelte/reactivity';
@@ -77,6 +84,16 @@
 		event.preventDefault();
 		oncontextmenu(node, { x: event.clientX, y: event.clientY });
 	}
+
+	/** `Shift+F10`/メニューキーをマウス右クリックと同じ `oncontextmenu` へ変換する。 */
+	function handleNodeKeydown(node: TreeNode<T>, event: KeyboardEvent): void {
+		if (!oncontextmenu) return;
+		const isContextMenuKey = event.key === 'ContextMenu' || (event.key === 'F10' && event.shiftKey);
+		if (!isContextMenuKey) return;
+		event.preventDefault();
+		const rect = (event.currentTarget as HTMLElement).getBoundingClientRect();
+		oncontextmenu(node, { x: rect.left, y: rect.bottom });
+	}
 </script>
 
 <div class="tree" role="tree">
@@ -105,6 +122,7 @@
 					class="node-label"
 					onclick={() => onselect?.(node)}
 					oncontextmenu={(event) => handleContextMenu(node, event)}
+					onkeydown={(event) => handleNodeKeydown(node, event)}
 				>
 					{@render label(node)}
 				</button>
@@ -124,6 +142,7 @@
 								class="node-label"
 								onclick={() => onselect?.(child)}
 								oncontextmenu={(event) => handleContextMenu(child, event)}
+								onkeydown={(event) => handleNodeKeydown(child, event)}
 							>
 								{@render label(child)}
 							</button>
