@@ -31,7 +31,9 @@
 	import Drawer from '$lib/components/Drawer.svelte';
 	import SplitPane from '$lib/components/SplitPane.svelte';
 	import ConnectionTree from '$lib/components/ConnectionTree.svelte';
+	import TreeContextMenu from '$lib/components/TreeContextMenu.svelte';
 	import type { ConnectionTreeNodeData } from '$lib/components/connectionTreeTypes';
+	import type { TreeNode } from '$lib/components/treeTypes';
 	import {
 		listTags,
 		createTag,
@@ -93,7 +95,11 @@
 		formatDeleteConfirmMessage
 	} from '$lib/banto/tagDeleteImpact';
 	import { diffFormRecords, type ConflictFieldDiff } from '$lib/banto/tagConflictDiff';
-	import { beforeNavigate } from '$app/navigation';
+	import {
+		resolveTagTreeContextMenuAction,
+		type TagTreeContextMenuAction
+	} from '$lib/banto/tagTreeContextMenu';
+	import { beforeNavigate, goto } from '$app/navigation';
 
 	const dataTypeOptions: { value: TagDataType; label: string }[] = [
 		{ value: 'bit', label: 'bit（真偽値1点）' },
@@ -933,6 +939,81 @@
 		else if (data.kind === 'connection')
 			treeFilter = { type: 'connection', id: data.connection.id };
 		else treeFilter = { type: 'group', id: data.group.id };
+	}
+
+	/**
+	 * T18-2e（docs/banto-hub-t18-design.md「T18-2e T13-3 移管」、
+	 * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A）: ツリーの右クリック
+	 * （`ConnectionTree`/`TreeView` の `oncontextmenu` - マウス右クリックと
+	 * `Shift+F10`/メニューキーの両方がここに集約される）から出す、階層に
+	 * 応じた作成の**補助操作**。常時表示の「新規登録」等の主操作
+	 * （`openCreateDrawer`/上のツールバー）はそのまま残す - このメニューは
+	 * それを置き換えない。
+	 *
+	 * 作成種別・遷移先/プリセットの決定自体は依存ゼロの純関数
+	 * `resolveTagTreeContextMenuAction`（`tagTreeContextMenu.ts`）に委ね、
+	 * ここは DOM 状態（メニューの表示位置・選択ノードの反映）と実行
+	 * （画面遷移 or create Drawer 起動）だけを担う。
+	 */
+	interface TreeContextMenuState {
+		x: number;
+		y: number;
+		action: TagTreeContextMenuAction;
+		/** メニューを閉じたときにフォーカスを戻す元要素（開いた時点の `document.activeElement`）。 */
+		triggerEl: HTMLElement | null;
+	}
+	let treeContextMenu: TreeContextMenuState | null = $state(null);
+
+	/**
+	 * 右クリックされたノードを選択状態にする - 「親（接続/グループ）は
+	 * 選択ノードからプリセットする」（実装指示 T18-2e スコープ1点目）を、
+	 * 既存の `resolveGroupIdFromTreeSelection`（T18-2d、`openCreateDrawer` が
+	 * 使う）にそのまま乗せるため。`calc`/`mem` 配下等、作成操作が無い
+	 * ノード（`resolveTagTreeContextMenuAction` が `null` を返す）は選択だけ
+	 * 反映してメニューは出さない。
+	 */
+	function handleTreeContextMenu(
+		node: TreeNode<ConnectionTreeNodeData>,
+		position: { x: number; y: number }
+	): void {
+		handleTreeSelect(node.data);
+		const action = resolveTagTreeContextMenuAction(node.data);
+		if (!action) {
+			treeContextMenu = null;
+			return;
+		}
+		treeContextMenu = {
+			x: position.x,
+			y: position.y,
+			action,
+			triggerEl: document.activeElement instanceof HTMLElement ? document.activeElement : null
+		};
+	}
+
+	function closeTreeContextMenu(): void {
+		const trigger = treeContextMenu?.triggerEl;
+		treeContextMenu = null;
+		trigger?.focus();
+	}
+
+	/**
+	 * `createConnection`/`createGroup` は他画面（`/plc-connections`/
+	 * `/collection-groups?connectionId=`）への遷移 - このページはそれらの
+	 * 作成フォームを持たない。遷移は SvelteKit の `goto` を使うため、
+	 * 既存の `beforeNavigate` 破棄確認（開いている Drawer が dirty なら
+	 * 確認する）がそのまま効く。`createTag` はこのページ自身が持つ create
+	 * Drawer を、右クリックされたグループへプリセットした状態で開く -
+	 * `handleTreeContextMenu` が既に `treeFilter` をそのグループへ合わせて
+	 * いるので、`openCreateDrawer()`（`resolveGroupIdFromTreeSelection` 経由
+	 * で選択中ノードからプリセットする T18-2d 既存ロジック）をそのまま
+	 * 呼ぶだけでよい。
+	 */
+	function activateTreeContextMenuAction(action: TagTreeContextMenuAction): void {
+		if (action.kind === 'createTag') {
+			openCreateDrawer();
+		} else {
+			void goto(action.href);
+		}
 	}
 
 	/**
@@ -1857,6 +1938,7 @@
 					{tags}
 					selectedId={treeSelectedId}
 					onselect={handleTreeSelect}
+					oncontextmenu={canWrite ? handleTreeContextMenu : undefined}
 				/>
 			{/snippet}
 			{#snippet right()}
@@ -1963,6 +2045,22 @@
 		</SplitPane>
 	</div>
 </div>
+
+{#if treeContextMenu}
+	{@const action = treeContextMenu.action}
+	<TreeContextMenu
+		x={treeContextMenu.x}
+		y={treeContextMenu.y}
+		items={[
+			{
+				id: action.kind,
+				label: action.label,
+				onSelect: () => activateTreeContextMenuAction(action)
+			}
+		]}
+		onClose={closeTreeContextMenu}
+	/>
+{/if}
 
 <Drawer
 	open={drawerMode !== null}
