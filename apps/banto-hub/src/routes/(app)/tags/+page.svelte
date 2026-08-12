@@ -83,6 +83,7 @@
 	} from '$lib/banto/tagFormLayout';
 	import { addressHelpFor } from '$lib/banto/tagAddressHelp';
 	import { carryFormForNext } from '$lib/banto/tagFormCarry';
+	import { buildDuplicateFormValues } from '$lib/banto/tagDuplicate';
 	import {
 		resolveGroupIdFromTreeSelection,
 		resolvePresetGroupId,
@@ -413,6 +414,36 @@
 	let createBaseline: FormState = blankForm();
 	let createErrors: Record<string, string> = $state({});
 	let creating = $state(false);
+
+	/**
+	 * T18-3a（docs/banto-hub-t18-design.md「T18-3a タグ複製」、TAG-UX-D
+	 * 前半）: 複製元タグ。`openDuplicateDrawer` が set し、Drawer を閉じたら
+	 * `closeDrawer` が `null` に戻す。`null` の間は create Drawer は通常の
+	 * 新規作成（`openCreateDrawer` 経由）であり、複製元との差分パネルは
+	 * 出さない。「登録して次へ」で複製フォームのまま続けて作成した場合も
+	 * （`handleCreate` は `duplicateSource` に触れないため）そのまま複製元
+	 * を保持し続ける - 直前の複製に対する差分として引き続き意味がある。
+	 */
+	let duplicateSource: Tag | null = $state(null);
+
+	/**
+	 * T18-3a（受け入れ「保存前に複製元との差分を確認できる」）: 複製元タグ
+	 * （`duplicateSource`）と複製後フォーム（`createForm`）のフィールド単位
+	 * 差分。`saveEdit` の revision 競合パネルが使っているのと同じ純関数
+	 * `diffFormRecords`（`tagConflictDiff.ts`）をそのまま再利用する -
+	 * 「サーバー最新 vs ローカル」を「複製元 vs 複製後」に読み替えただけで
+	 * 意味は同じ（フィールド単位の value 差分）。`createForm` は `$state` の
+	 * ため、入力するたびにこの `$derived` も再計算される（保存前に常に
+	 * 最新の差分を確認できる）。
+	 */
+	const duplicateDiff = $derived.by((): ConflictFieldDiff[] | null => {
+		if (drawerMode !== 'create' || !duplicateSource) return null;
+		return diffFormRecords(
+			conflictRecord(formFromTag(duplicateSource)),
+			conflictRecord(createForm),
+			FIELD_LABELS
+		);
+	});
 
 	/**
 	 * TAG-P0-2（docs/banto-hub-desktop-plan.md §9.3、2026-08-10 実装メモ）:
@@ -881,6 +912,38 @@
 		createErrors = {};
 		createAddressPreflight = blankAddressPreflight();
 		editConflict = null;
+		duplicateSource = null; // T18-3a: 通常の新規作成では複製元差分パネルを出さない
+		drawerMode = 'create';
+	}
+
+	/**
+	 * T18-3a（docs/banto-hub-t18-design.md「T18-3a タグ複製」、TAG-UX-D
+	 * 前半「『このタグを複製』、型/単位/スケーリング/しきい値を引継ぎ名前と
+	 * アドレスのみ変更する」）: `t` を複製元に create Drawer を開く。
+	 * `openCreateDrawer` を土台にし、`blankForm()` の代わりに「複製元タグ→
+	 * フォーム変換」（edit フローが使っている `formFromTag`、同じ変換を
+	 * ここでも再利用する）→ `buildDuplicateFormValues`（`tagDuplicate.ts`）
+	 * で名前・アドレスだけ調整した値を `createForm`/`createBaseline` の
+	 * 初期値にする。`createBaseline` にも同じ値を入れるのは
+	 * `openCreateDrawer` の既存 preset と同じ理由 - まだ何も入力していない
+	 * 状態（複製名・空アドレスが入っただけ）を dirty と誤認しないため。
+	 *
+	 * `drawerMode` は `'create'` のまま（複製も「新規作成」であり、保存は
+	 * 既存 `handleCreate`/`createTag` をそのまま使う - 既存タグを上書き
+	 * しない受け入れ条件は、この経路が常に POST 新規作成であることで自然に
+	 * 満たされる）。`duplicateSource` に複製元タグを保持し、`duplicateDiff`
+	 * （上で宣言済みの `$derived`）が保存前の差分パネルに使う。
+	 */
+	function openDuplicateDrawer(t: Tag): void {
+		if (!confirmDiscardIfNeeded()) return;
+		const existingNames = tags.map((tag) => tag.name);
+		const next = buildDuplicateFormValues(formFromTag(t), existingNames);
+		createForm = next;
+		createBaseline = { ...next };
+		createErrors = {};
+		createAddressPreflight = blankAddressPreflight();
+		editConflict = null;
+		duplicateSource = t;
 		drawerMode = 'create';
 	}
 
@@ -903,6 +966,8 @@
 		// 状態も破棄する（`confirmDiscardIfNeeded` 経由の破棄確認は
 		// `onRequestClose` が既に済ませている — ここは後始末のみ）。
 		editConflict = null;
+		// T18-3a: 複製元差分パネルの状態も、Drawer を閉じたらクリアする。
+		duplicateSource = null;
 		// T18-2b: 保留中のデバウンス preflight があれば止める - 閉じた後の
 		// Drawer に対して古い結果が届いても表示先が無いので無害だが、
 		// 不要な `/api/tags/batch` 呼び出し自体を止めておく。
@@ -2083,6 +2148,43 @@
 				void handleCreate(submitter?.id === 'create-register-close');
 			}}
 		>
+			{#if duplicateSource}
+				<!--
+					T18-3a（docs/banto-hub-t18-design.md「T18-3a タグ複製」、
+					TAG-UX-D 前半「保存前に複製元との差分と外部名を確認できる」）:
+					複製元タグと複製後フォームのフィールド単位差分。既存の
+					revision 競合パネル（`.conflict-panel`/`.preview-table`、下の
+					`{:else if drawerMode === 'edit'}` 側参照）と同じマークアップを
+					流用し、新規 CSS は追加しない - 列見出しだけ「あなたの入力/
+					サーバー最新」ではなく「複製元/複製後」に読み替える。
+				-->
+				<div class="conflict-panel">
+					<h4 class="conflict-title">複製元との差分</h4>
+					<p class="note">複製元: {externalNameForTag(duplicateSource)}</p>
+					{#if duplicateDiff && duplicateDiff.length === 0}
+						<p class="note">複製元と同じ内容です（名前・アドレスも含め差分はまだありません）。</p>
+					{:else if duplicateDiff}
+						<table class="preview-table">
+							<thead>
+								<tr>
+									<th>項目</th>
+									<th>複製元</th>
+									<th>複製後</th>
+								</tr>
+							</thead>
+							<tbody>
+								{#each duplicateDiff as f (f.key)}
+									<tr>
+										<td>{f.label}</td>
+										<td>{f.local}</td>
+										<td>{f.server}</td>
+									</tr>
+								{/each}
+							</tbody>
+						</table>
+					{/if}
+				</div>
+			{/if}
 			{@render tagFields(createForm, createErrors, createDetailOpen, createAddressPreflight, () =>
 				scheduleAddressPreflight(createForm, 'create')
 			)}
@@ -2179,6 +2281,22 @@
 			)}
 			<div class="actions">
 				<button type="submit" disabled={isDrawerBusy()}>保存</button>
+				<!--
+					T18-3a（docs/banto-hub-t18-design.md「T18-3a タグ複製」）: 起動口。
+					文言は既存トースト「作成しました」/「更新しました」/「削除しました」や
+					ボタン名「新規登録」「登録して次へ」「登録して閉じる」「保存」
+					「削除」と部分文字列としても被らないものにする（`tagTreeContextMenu.ts`
+					冒頭コメントの教訓、PR #135 CI 回帰と同じ配慮）。
+				-->
+				<button
+					type="button"
+					class="secondary"
+					data-testid="tag-duplicate-button"
+					onclick={() => selected && openDuplicateDrawer(selected)}
+					disabled={isDrawerBusy()}
+				>
+					このタグを複製
+				</button>
 				<button type="button" class="danger" onclick={handleDelete} disabled={isDrawerBusy()}
 					>削除</button
 				>
