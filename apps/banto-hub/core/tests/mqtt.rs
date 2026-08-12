@@ -1159,19 +1159,22 @@ async fn test_output_topics_carry_simulation_payloads_only_while_armed_during_al
     assert_eq!(body["run_id"], run_id);
 
     let live = LiveSubscriber::subscribe(broker_port, "sub-test-live", "banto/#").await;
+    let test_topic = format!("banto/test/{run_id}/line1/fast/temp01");
+    // 初回サイクルは `q:"bad", v:null`(シミュレーション値サンプル前)で
+    // publish されることがあるため、トピック到達だけでなく最新payloadの
+    // `v`が数値になる(=goodなサンプル到達)まで待つ。
     assert!(
         wait_until(Duration::from_secs(6), || async {
-            live.snapshot()
-                .await
-                .iter()
-                .any(|(topic, _)| topic == &format!("banto/test/{run_id}/line1/fast/temp01"))
+            let messages = live.snapshot().await;
+            payload_json(&messages, &test_topic)
+                .map(|payload| payload["v"].is_number())
+                .unwrap_or(false)
         })
         .await,
-        "the test-output topic should receive a publish once armed"
+        "the test-output topic should carry a numeric sample once armed"
     );
 
     let messages = live.snapshot().await;
-    let test_topic = format!("banto/test/{run_id}/line1/fast/temp01");
     let payload = payload_json(&messages, &test_topic).expect("test-output payload");
     assert_eq!(payload["simulation"], true);
     assert_eq!(payload["run_id"], run_id);
