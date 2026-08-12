@@ -770,6 +770,41 @@ pub enum BatchTagOutcome {
     },
 }
 
+/// A single row's worth of field errors within a
+/// [`TagService::update_batch_tx`] call (T18-3b, bulk tag operations).
+/// Mirrors [`BatchTagError`], but additionally carries `id`: unlike a create
+/// batch (whose rows have no identity yet), an update batch's rows already
+/// carry the client's own numeric id, and echoing it back lets the client
+/// map an error onto the right row without relying on `index` alone.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchTagUpdateError {
+    pub index: usize,
+    pub id: i64,
+    pub field_errors: Vec<FieldError>,
+}
+
+/// Result of [`TagService::update_batch_tx`] - the update-side counterpart of
+/// [`BatchTagOutcome`], same all-or-nothing contract (see that type's doc
+/// comment), applied to updates instead of inserts.
+#[derive(Debug)]
+pub enum BatchTagUpdateOutcome {
+    /// At least one row failed validation, tag-kind placement, referenced an
+    /// id that does not exist, or carried a stale `expectedRevision`.
+    /// Nothing was written - not even the rows that were individually fine.
+    Invalid(Vec<BatchTagUpdateError>),
+    /// Every row updated cleanly. `tags` carries the updated rows in request
+    /// order for a real apply (`dry_run: false`), or is `None` for
+    /// `dry_run: true` (validation-only - nothing was written, same
+    /// "write-then-rollback inside the caller's transaction" pattern as
+    /// [`TagService::create_batch_tx`] - see `tags_batch_update`'s REST
+    /// handler for where that decision is made).
+    Valid {
+        count: usize,
+        tags: Option<Vec<Tag>>,
+    },
+}
+
 /// [`TagService::update_tx`]'s error type (T18-1, docs/banto-hub-desktop-plan.md
 /// §9.4 TAG-UX-C 4点目). A superset of `BantoError` that additionally
 /// distinguishes the one new failure mode the optimistic-lock `WHERE id = ?
@@ -1087,6 +1122,264 @@ impl TagService {
                 FK_MESSAGE,
             ))),
         }
+    }
+
+    /// Validate and update a batch of existing tags using a caller-owned
+    /// SQLite transaction (T18-3b, bulk tag operations) - the update-side
+    /// counterpart of [`Self::create_batch_tx`], following the exact same
+    /// two-phase shape: validate every row first with no writes (so an
+    /// `Invalid` outcome never leaves a partial write behind, since nothing
+    /// was written yet), then, only if every row is clean, apply all updates
+    /// on the same connection. Like `create_batch_tx`, this method never
+    /// begins/commits/rolls back the transaction itself - the caller
+    /// (`apps/banto-hub/core/src/rest.rs`'s `POST /api/tags/batch-update`)
+    /// decides based on the returned [`BatchTagUpdateOutcome`], exactly like
+    /// it does for `create_batch_tx`'s [`BatchTagOutcome`].
+    ///
+    /// Each `(id, input)` pair is validated with [`validate_tag_input`] +
+    /// [`validate_tag_kind_placement_tx`], the same two checks a single
+    /// [`Self::update_tx`] call runs, and `input.expected_revision` is
+    /// honored per row exactly like `update_tx`'s optimistic lock (`Some(r)`
+    /// requires the row to still be at revision `r`, `None` skips the
+    /// check). Three failure modes specific to a *batch* of updates are also
+    /// collected here as row-indexed field errors instead of aborting the
+    /// whole call early (design: report every row's problem in one
+    /// response, not just the first, same as `create_batch_tx`):
+    ///
+    /// - an `id` that does not resolve to any row (`"id"` field error),
+    /// - an `expectedRevision` that no longer matches the row's current
+    ///   revision (`"expectedRevision"` field error - the same conflict
+    ///   [`TagUpdateError::RevisionConflict`] reports for a single update,
+    ///   aggregated by row here instead of surfaced as a `409`),
+    /// - a `name` colliding with another row already in the table,
+    ///   EXCLUDING the row's own id - so a row that keeps its current name
+    ///   is never falsely flagged just because that name also happens to be
+    ///   its own.
+    ///
+    /// A DB-level failure surfacing only at `UPDATE` time is possible here
+    /// too (the same accepted, intentionally-unhandled race window
+    /// [`Self::create_batch_tx`]'s doc comment describes for `INSERT`) and is
+    /// handled the same way: bubbled up as a plain `Err(BantoError)`, and the
+    /// caller rolls back the whole transaction. **Note one case this
+    /// pre-check's own id-exclusion cannot fully clear**: two rows swapping
+    /// names with each other (`A→B`, `B→A`) passes this read-only validation
+    /// pass (each candidate name's *current* owner is the row itself or the
+    /// other swap partner, so nothing looks like a genuine clash), but the
+    /// actual apply loop below issues one single-row `UPDATE` per row in
+    /// sequence, not one atomic multi-row statement - so the first `UPDATE`
+    /// of a swap collides with the UNIQUE constraint on `name` (the second
+    /// row has not been renamed away yet) and surfaces as exactly this kind
+    /// of DB-level `Err`, safely rolling back the whole batch rather than
+    /// applying half a swap. Supporting real swaps would need either a
+    /// temporary-name two-pass rename or a single multi-row `UPDATE ... FROM
+    /// (VALUES ...)`; out of scope for T18-3b (judgment call, mirrors
+    /// `create_batch_tx`'s own accepted race window).
+    pub async fn update_batch_tx(
+        &self,
+        connection: &mut SqliteConnection,
+        updates: &[(i64, TagInput)],
+    ) -> Result<BatchTagUpdateOutcome, BantoError> {
+        let mut row_errors: Vec<Vec<FieldError>> = vec![Vec::new(); updates.len()];
+        let mut validated: Vec<Option<ValidatedTag>> = Vec::with_capacity(updates.len());
+
+        for (index, (_id, input)) in updates.iter().enumerate() {
+            match validate_tag_input(input) {
+                Ok(value) => validated.push(Some(value)),
+                Err(BantoError::Validation { field_errors }) => {
+                    row_errors[index].extend(field_errors);
+                    validated.push(None);
+                }
+                Err(other) => return Err(other),
+            }
+            match validate_tag_kind_placement_tx(
+                connection,
+                input.collection_group_id,
+                &input.tag_kind,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(BantoError::Validation { field_errors }) => {
+                    row_errors[index].extend(field_errors)
+                }
+                Err(other) => return Err(other),
+            }
+        }
+
+        // Existing-row snapshot: one query for every target id, used below to
+        // detect (a) an id that does not exist and (b) a stale
+        // expectedRevision - both without writing anything, mirroring
+        // create_batch_tx's read-only validation pass.
+        let ids: Vec<i64> = updates.iter().map(|(id, _)| *id).collect();
+        let mut existing_revisions: HashMap<i64, i64> = HashMap::new();
+        if !ids.is_empty() {
+            let mut qb: QueryBuilder<'_, Sqlite> =
+                QueryBuilder::new("SELECT id, revision FROM tags WHERE id IN (");
+            let mut separated = qb.separated(", ");
+            for id in &ids {
+                separated.push_bind(*id);
+            }
+            qb.push(")");
+            let rows: Vec<(i64, i64)> = qb
+                .build_query_as()
+                .fetch_all(&mut *connection)
+                .await
+                .map_err(banto_storage::storage_error)?;
+            existing_revisions = rows.into_iter().collect();
+        }
+        for (index, (id, input)) in updates.iter().enumerate() {
+            match existing_revisions.get(id) {
+                None => row_errors[index].push(FieldError {
+                    field: "id".to_string(),
+                    message: "見つかりません".to_string(),
+                }),
+                Some(&current_revision) => {
+                    if let Some(expected) = input.expected_revision {
+                        if expected != current_revision {
+                            row_errors[index].push(FieldError {
+                                field: "expectedRevision".to_string(),
+                                message: "他のクライアントがこのタグを更新済みです。再読込してから保存してください。"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Intra-batch duplicates: same aggregation style as create_batch_tx
+        // (every index sharing a name with another index gets flagged, not
+        // just the "later" occurrence).
+        let mut first_seen: HashMap<&str, usize> = HashMap::new();
+        let mut batch_dupe_indices = Vec::new();
+        for (index, value) in validated.iter().enumerate() {
+            let Some(value) = value else { continue };
+            match first_seen.get(value.name.as_str()) {
+                Some(&first) => {
+                    if !batch_dupe_indices.contains(&first) {
+                        batch_dupe_indices.push(first);
+                    }
+                    batch_dupe_indices.push(index);
+                }
+                None => {
+                    first_seen.insert(&value.name, index);
+                }
+            }
+        }
+        for index in batch_dupe_indices {
+            row_errors[index].push(FieldError {
+                field: "name".to_string(),
+                message: "リクエスト内の他の行と名前が重複しています".to_string(),
+            });
+        }
+
+        // Duplicates against already-persisted tags, excluding each row's own
+        // current id (so keeping the current name is never a false
+        // positive). The UNIQUE constraint at UPDATE time below remains the
+        // final backstop for anything this snapshot cannot see - including a
+        // same-batch name swap, which this exclusion alone cannot fully
+        // clear (see this method's doc comment).
+        let candidate_names: Vec<&str> = validated
+            .iter()
+            .filter_map(|value| value.as_ref().map(|value| value.name.as_str()))
+            .collect();
+        if !candidate_names.is_empty() {
+            let mut qb: QueryBuilder<'_, Sqlite> =
+                QueryBuilder::new("SELECT id, name FROM tags WHERE name IN (");
+            let mut separated = qb.separated(", ");
+            for name in &candidate_names {
+                separated.push_bind(*name);
+            }
+            qb.push(")");
+            let existing_names: Vec<(i64, String)> = qb
+                .build_query_as()
+                .fetch_all(&mut *connection)
+                .await
+                .map_err(banto_storage::storage_error)?;
+            let owner_by_name: HashMap<String, i64> = existing_names
+                .into_iter()
+                .map(|(id, name)| (name, id))
+                .collect();
+            for (index, (id, value)) in updates
+                .iter()
+                .map(|(id, _)| id)
+                .zip(validated.iter())
+                .enumerate()
+            {
+                let Some(value) = value else { continue };
+                if let Some(&owner_id) = owner_by_name.get(&value.name) {
+                    if owner_id != *id {
+                        row_errors[index].push(FieldError {
+                            field: "name".to_string(),
+                            message: "既に使用されています".to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        let errors: Vec<BatchTagUpdateError> = row_errors
+            .into_iter()
+            .enumerate()
+            .filter(|(_, field_errors)| !field_errors.is_empty())
+            .map(|(index, field_errors)| BatchTagUpdateError {
+                index,
+                id: updates[index].0,
+                field_errors,
+            })
+            .collect();
+        if !errors.is_empty() {
+            return Ok(BatchTagUpdateOutcome::Invalid(errors));
+        }
+
+        let mut updated = Vec::with_capacity(updates.len());
+        let sql_with_revision = update_tag_sql(true);
+        let sql_without_revision = update_tag_sql(false);
+        for ((id, input), value) in updates.iter().zip(validated.iter()) {
+            let value = value
+                .as_ref()
+                .expect("all batch rows were validated before update");
+            let sql = if input.expected_revision.is_some() {
+                &sql_with_revision
+            } else {
+                &sql_without_revision
+            };
+            let mut query = sqlx::query_as::<_, Tag>(sql)
+                .bind(&value.name)
+                .bind(input.collection_group_id)
+                .bind(&value.address)
+                .bind(&input.data_type)
+                .bind(input.string_length)
+                .bind(input.raw_lo)
+                .bind(input.raw_hi)
+                .bind(input.eng_lo)
+                .bind(input.eng_hi)
+                .bind(&value.unit)
+                .bind(input.decimals)
+                .bind(input.threshold_h)
+                .bind(input.threshold_hh)
+                .bind(input.threshold_l)
+                .bind(input.threshold_ll)
+                .bind(input.enabled)
+                .bind(input.writable)
+                .bind(&input.tag_kind)
+                .bind(&input.expression)
+                .bind(input.retain)
+                .bind(*id);
+            if let Some(revision) = input.expected_revision {
+                query = query.bind(revision);
+            }
+            let row = query
+                .fetch_one(&mut *connection)
+                .await
+                .map_err(|err| map_write_error(err, "name", "collectionGroupId", FK_MESSAGE))?;
+            updated.push(row);
+        }
+
+        Ok(BatchTagUpdateOutcome::Valid {
+            count: updated.len(),
+            tags: Some(updated),
+        })
     }
 
     pub async fn delete(&self, id: i64) -> Result<(), BantoError> {
@@ -3087,5 +3380,263 @@ mod tests {
             }
             other => panic!("expected Valid, got {other:?}"),
         }
+    }
+
+    // --- update_batch_tx (T18-3b, bulk tag operations) ----------------------
+
+    #[tokio::test]
+    async fn update_batch_tx_updates_every_row_in_one_transaction() {
+        let (svc, group_id) = setup().await;
+        let a = svc.create(sample_input("UB-A", group_id)).await.unwrap();
+        let b = svc.create(sample_input("UB-B", group_id)).await.unwrap();
+
+        let mut input_a = sample_input("UB-A2", group_id);
+        input_a.enabled = false;
+        let mut input_b = sample_input("UB-B2", group_id);
+        input_b.enabled = false;
+
+        let mut tx = svc.pool.begin().await.expect("begin tx");
+        let outcome = svc
+            .update_batch_tx(&mut tx, &[(a.id, input_a), (b.id, input_b)])
+            .await
+            .expect("update_batch_tx should succeed");
+        match outcome {
+            BatchTagUpdateOutcome::Valid { count, tags } => {
+                assert_eq!(count, 2);
+                let tags = tags.expect("a non-dry-run apply returns the updated rows");
+                assert_eq!(
+                    tags.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+                    vec!["UB-A2", "UB-B2"]
+                );
+                assert!(tags.iter().all(|t| !t.enabled));
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+        tx.commit().await.expect("commit");
+
+        let fetched_a = svc.get(a.id).await.unwrap();
+        let fetched_b = svc.get(b.id).await.unwrap();
+        assert_eq!(fetched_a.name, "UB-A2");
+        assert_eq!(fetched_b.name, "UB-B2");
+        // update_tag_sql always advances revision, batch or not.
+        assert_eq!(fetched_a.revision, 2);
+        assert_eq!(fetched_b.revision, 2);
+    }
+
+    #[tokio::test]
+    async fn update_batch_tx_moves_a_tag_to_another_collection_group() {
+        let (svc, group_id) = setup().await;
+        let other_group = CollectionGroupService::new(svc.pool.clone())
+            .create(CollectionGroupInput {
+                name: "OtherGroup".to_string(),
+                plc_connection_id: PlcConnectionService::new(svc.pool.clone())
+                    .list(ListParams::default())
+                    .await
+                    .unwrap()
+                    .rows[0]
+                    .id,
+                period_ms: 1_000,
+                enabled: true,
+            })
+            .await
+            .unwrap();
+        let tag = svc.create(sample_input("UB-Move", group_id)).await.unwrap();
+
+        let mut moved = sample_input("UB-Move", other_group.id);
+        moved.expected_revision = Some(tag.revision);
+
+        let mut tx = svc.pool.begin().await.expect("begin tx");
+        let outcome = svc
+            .update_batch_tx(&mut tx, &[(tag.id, moved)])
+            .await
+            .expect("update_batch_tx should succeed");
+        assert!(matches!(
+            outcome,
+            BatchTagUpdateOutcome::Valid { count: 1, .. }
+        ));
+        tx.commit().await.expect("commit");
+
+        let fetched = svc.get(tag.id).await.unwrap();
+        assert_eq!(fetched.collection_group_id, other_group.id);
+    }
+
+    #[tokio::test]
+    async fn update_batch_tx_aggregates_a_stale_expected_revision_as_a_row_error_and_writes_nothing(
+    ) {
+        let (svc, group_id) = setup().await;
+        let a = svc.create(sample_input("UB-C", group_id)).await.unwrap();
+        let b = svc.create(sample_input("UB-D", group_id)).await.unwrap();
+
+        // Another session updates `a` first, advancing its revision to 2.
+        svc.update(a.id, sample_input("UB-C-bumped", group_id))
+            .await
+            .expect("first update should succeed");
+
+        let mut input_a = sample_input("UB-C-stale", group_id);
+        input_a.expected_revision = Some(a.revision); // now stale (a.revision == 1)
+        let input_b = sample_input("UB-D2", group_id);
+
+        let mut tx = svc.pool.begin().await.expect("begin tx");
+        let outcome = svc
+            .update_batch_tx(&mut tx, &[(a.id, input_a), (b.id, input_b)])
+            .await
+            .expect("update_batch_tx should not error - a stale revision is a row error");
+        match outcome {
+            BatchTagUpdateOutcome::Invalid(errors) => {
+                assert_eq!(errors.len(), 1, "{errors:?}");
+                assert_eq!(errors[0].index, 0);
+                assert_eq!(errors[0].id, a.id);
+                assert!(
+                    errors[0]
+                        .field_errors
+                        .iter()
+                        .any(|e| e.field == "expectedRevision"),
+                    "{errors:?}"
+                );
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        tx.rollback().await.expect("rollback");
+
+        // All-or-nothing: `b`'s row was individually fine but must still be
+        // untouched - only `a`'s own prior (non-batch) update is reflected.
+        let fetched_b = svc.get(b.id).await.unwrap();
+        assert_eq!(fetched_b.name, "UB-D");
+    }
+
+    #[tokio::test]
+    async fn update_batch_tx_flags_a_nonexistent_id() {
+        let (svc, group_id) = setup().await;
+        let a = svc.create(sample_input("UB-E", group_id)).await.unwrap();
+
+        let mut tx = svc.pool.begin().await.expect("begin tx");
+        let outcome = svc
+            .update_batch_tx(
+                &mut tx,
+                &[
+                    (a.id, sample_input("UB-E2", group_id)),
+                    (999_999, sample_input("UB-Ghost", group_id)),
+                ],
+            )
+            .await
+            .expect("update_batch_tx should not error - a missing id is a row error");
+        match outcome {
+            BatchTagUpdateOutcome::Invalid(errors) => {
+                assert_eq!(errors.len(), 1, "{errors:?}");
+                assert_eq!(errors[0].index, 1);
+                assert_eq!(errors[0].id, 999_999);
+                assert!(errors[0].field_errors.iter().any(|e| e.field == "id"));
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        tx.rollback().await.expect("rollback");
+
+        // All-or-nothing: `a`'s individually-fine row was not written either.
+        let fetched_a = svc.get(a.id).await.unwrap();
+        assert_eq!(fetched_a.name, "UB-E");
+    }
+
+    #[tokio::test]
+    async fn update_batch_tx_rejects_the_whole_batch_when_one_row_is_invalid() {
+        let (svc, group_id) = setup().await;
+        let a = svc.create(sample_input("UB-F", group_id)).await.unwrap();
+        let b = svc.create(sample_input("UB-G", group_id)).await.unwrap();
+
+        let mut bad = sample_input("UB-F2", group_id);
+        bad.data_type = "f64".to_string(); // not in ALLOWED_DATA_TYPES
+
+        let mut tx = svc.pool.begin().await.expect("begin tx");
+        let outcome = svc
+            .update_batch_tx(
+                &mut tx,
+                &[(a.id, bad), (b.id, sample_input("UB-G2", group_id))],
+            )
+            .await
+            .expect("update_batch_tx should not error - it reports invalid rows instead");
+        match outcome {
+            BatchTagUpdateOutcome::Invalid(errors) => {
+                assert_eq!(errors.len(), 1, "{errors:?}");
+                assert_eq!(errors[0].index, 0);
+                assert_eq!(errors[0].id, a.id);
+                assert!(errors[0].field_errors.iter().any(|e| e.field == "dataType"));
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        tx.rollback().await.expect("rollback");
+
+        // All-or-nothing: not even the individually-valid row `b` was written.
+        let fetched_a = svc.get(a.id).await.unwrap();
+        let fetched_b = svc.get(b.id).await.unwrap();
+        assert_eq!(fetched_a.name, "UB-F");
+        assert_eq!(fetched_b.name, "UB-G");
+    }
+
+    #[tokio::test]
+    async fn update_batch_tx_flags_a_name_already_used_by_another_row() {
+        let (svc, group_id) = setup().await;
+        let a = svc.create(sample_input("UB-H", group_id)).await.unwrap();
+        let b = svc.create(sample_input("UB-I", group_id)).await.unwrap();
+
+        // `a` tries to steal `b`'s current name.
+        let input_a = sample_input("UB-I", group_id);
+
+        let mut tx = svc.pool.begin().await.expect("begin tx");
+        let outcome = svc
+            .update_batch_tx(&mut tx, &[(a.id, input_a)])
+            .await
+            .expect("update_batch_tx should not error - it reports invalid rows instead");
+        match outcome {
+            BatchTagUpdateOutcome::Invalid(errors) => {
+                assert_eq!(errors.len(), 1, "{errors:?}");
+                assert_eq!(errors[0].id, a.id);
+                assert!(
+                    errors[0]
+                        .field_errors
+                        .iter()
+                        .any(|e| e.field == "name" && e.message == "既に使用されています"),
+                    "{errors:?}"
+                );
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        tx.rollback().await.expect("rollback");
+        assert_eq!(svc.get(b.id).await.unwrap().name, "UB-I");
+    }
+
+    #[tokio::test]
+    async fn update_batch_tx_does_not_falsely_flag_a_row_that_keeps_its_own_name() {
+        let (svc, group_id) = setup().await;
+        let a = svc.create(sample_input("UB-J", group_id)).await.unwrap();
+
+        // Same name, only `enabled` changes - must not collide with itself.
+        let mut input_a = sample_input("UB-J", group_id);
+        input_a.enabled = false;
+
+        let mut tx = svc.pool.begin().await.expect("begin tx");
+        let outcome = svc
+            .update_batch_tx(&mut tx, &[(a.id, input_a)])
+            .await
+            .expect("update_batch_tx should succeed");
+        assert!(matches!(
+            outcome,
+            BatchTagUpdateOutcome::Valid { count: 1, .. }
+        ));
+        tx.commit().await.expect("commit");
+        assert!(!svc.get(a.id).await.unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn update_batch_tx_with_an_empty_slice_succeeds_trivially() {
+        let (svc, _group_id) = setup().await;
+        let mut tx = svc.pool.begin().await.expect("begin tx");
+        let outcome = svc.update_batch_tx(&mut tx, &[]).await.unwrap();
+        match outcome {
+            BatchTagUpdateOutcome::Valid { count, tags } => {
+                assert_eq!(count, 0);
+                assert_eq!(tags, Some(Vec::new()));
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+        tx.rollback().await.expect("rollback");
     }
 }

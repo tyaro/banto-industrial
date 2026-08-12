@@ -16,6 +16,13 @@
 //! であることは「rebuild がちょうど1回呼ばれた」ことの直接証拠になる - N
 //! 件のタグを `POST /api/tags` で N 回叩けば revision は+Nになるところ、
 //! バッチ API は件数によらず常に+1。
+//!
+//! T18-3b（bulk tag operations）: 末尾に `POST /api/tags/batch-update` の
+//! 同種の統合テスト（一括 enabled 切替・グループ移動・不正 id/revision
+//! 競合での all-or-nothing rollback・dry run・稼働中キュー）も同居させて
+//! いる - `/api/tags/batch`（T11-1、上のセクション群）の update 版で、
+//! 検証観点（all-or-nothing・単一トランザクション・rebuild 1回・dry run）
+//! が完全に対になるため、専用ファイルへ分けずここに追加した。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -603,4 +610,406 @@ async fn batch_with_empty_tags_array_is_a_harmless_success() {
         revision_before,
         "no rebuild for an empty batch"
     );
+}
+
+// ===========================================================================
+// T18-3b: POST /api/tags/batch-update （一括更新: enabled 切替・グループ
+// 移動）
+// ===========================================================================
+
+/// Row payload for `/api/tags/batch-update`: the same shape as
+/// `tag_payload`'s single-row body, plus `id` and an optional
+/// `expectedRevision`.
+fn tag_batch_update_payload(
+    id: i64,
+    name: &str,
+    group_id: i64,
+    address: &str,
+    enabled: bool,
+    expected_revision: Option<i64>,
+) -> Value {
+    let mut v = tag_payload(name, group_id, address);
+    v["id"] = json!(id);
+    v["enabled"] = json!(enabled);
+    if let Some(revision) = expected_revision {
+        v["expectedRevision"] = json!(revision);
+    }
+    v
+}
+
+async fn create_tag(app: &TestApp, name: &str, group_id: i64, address: &str) -> Value {
+    let (status, created) = write_json(
+        &app.router,
+        "POST",
+        "/api/tags",
+        &app.token,
+        tag_payload(name, group_id, address),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created:?}");
+    created
+}
+
+// ---------------------------------------------------------------------------
+// U1. 全件成功（一括 enabled 切替）+ rebuild が1回だけ走る
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_update_all_succeed_and_rebuilds_exactly_once() {
+    let app = test_app("update-all-succeed").await;
+    let group_id = seed_group(&app, "u1").await;
+
+    let t1 = create_tag(&app, "ut1", group_id, "40001").await;
+    let t2 = create_tag(&app, "ut2", group_id, "40002").await;
+    let t3 = create_tag(&app, "ut3", group_id, "40003").await;
+
+    let revision_before = app.manager.configured_revision();
+
+    let (status, body) = write_json(
+        &app.router,
+        "POST",
+        "/api/tags/batch-update",
+        &app.token,
+        json!({
+            "dryRun": false,
+            "tags": [
+                tag_batch_update_payload(t1["id"].as_i64().unwrap(), "ut1", group_id, "40001", false, Some(t1["revision"].as_i64().unwrap())),
+                tag_batch_update_payload(t2["id"].as_i64().unwrap(), "ut2", group_id, "40002", false, Some(t2["revision"].as_i64().unwrap())),
+                tag_batch_update_payload(t3["id"].as_i64().unwrap(), "ut3", group_id, "40003", false, Some(t3["revision"].as_i64().unwrap())),
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["count"], json!(3));
+    assert_eq!(body["tags"].as_array().unwrap().len(), 3);
+    assert_eq!(body["errors"].as_array().unwrap().len(), 0);
+    assert!(
+        body["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["enabled"] == json!(false)),
+        "{body:?}"
+    );
+
+    // 3件更新したにもかかわらず revision はちょうど+1 - rebuild が1回だけ
+    // 走ったことの直接証拠（T11-1 と同じ検証方法）。
+    assert_eq!(
+        app.manager.configured_revision(),
+        revision_before + 1,
+        "a 3-tag batch-update must commit the configured catalog exactly once"
+    );
+
+    let (status, fetched) = get_json(
+        &app.router,
+        &format!("/api/tags/{}", t1["id"].as_i64().unwrap()),
+        &app.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(fetched["enabled"], json!(false));
+    assert_eq!(fetched["revision"], json!(2));
+}
+
+// ---------------------------------------------------------------------------
+// U2. 一括グループ移動
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_update_moves_tags_to_another_collection_group() {
+    let app = test_app("update-move-group").await;
+    let group_a = seed_group(&app, "u2a").await;
+    let group_b = seed_group(&app, "u2b").await;
+
+    let t1 = create_tag(&app, "um1", group_a, "40001").await;
+    let t2 = create_tag(&app, "um2", group_a, "40002").await;
+
+    let (status, body) = write_json(
+        &app.router,
+        "POST",
+        "/api/tags/batch-update",
+        &app.token,
+        json!({
+            "dryRun": false,
+            "tags": [
+                tag_batch_update_payload(t1["id"].as_i64().unwrap(), "um1", group_b, "40001", true, None),
+                tag_batch_update_payload(t2["id"].as_i64().unwrap(), "um2", group_b, "40002", true, None),
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["count"], json!(2));
+
+    let (_, fetched1) = get_json(
+        &app.router,
+        &format!("/api/tags/{}", t1["id"].as_i64().unwrap()),
+        &app.token,
+    )
+    .await;
+    let (_, fetched2) = get_json(
+        &app.router,
+        &format!("/api/tags/{}", t2["id"].as_i64().unwrap()),
+        &app.token,
+    )
+    .await;
+    assert_eq!(fetched1["collectionGroupId"], json!(group_b));
+    assert_eq!(fetched2["collectionGroupId"], json!(group_b));
+}
+
+// ---------------------------------------------------------------------------
+// U3. 存在しない id を含む一括更新は全体 rollback（DB 無変更）
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_update_rejects_whole_batch_on_a_nonexistent_id() {
+    let app = test_app("update-bad-id").await;
+    let group_id = seed_group(&app, "u3").await;
+
+    let t1 = create_tag(&app, "ug1", group_id, "40001").await;
+    let revision_before = app.manager.revision();
+
+    let (status, body) = write_json(
+        &app.router,
+        "POST",
+        "/api/tags/batch-update",
+        &app.token,
+        json!({
+            "dryRun": false,
+            "tags": [
+                tag_batch_update_payload(t1["id"].as_i64().unwrap(), "ug1-renamed", group_id, "40001", false, None),
+                tag_batch_update_payload(999_999, "ghost", group_id, "40002", false, None),
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], json!(false));
+    assert_eq!(body["count"], json!(0));
+    assert!(body.get("tags").is_none(), "{body:?}");
+
+    let errors = body["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0]["index"], json!(1));
+    assert_eq!(errors[0]["id"], json!(999_999));
+    let field_errors = errors[0]["fieldErrors"].as_array().unwrap();
+    assert!(
+        field_errors.iter().any(|e| e["field"] == "id"),
+        "{field_errors:?}"
+    );
+
+    // All-or-nothing: t1's individually-fine rename was not written either,
+    // and no rebuild happened.
+    assert_eq!(app.manager.revision(), revision_before);
+    let (_, fetched1) = get_json(
+        &app.router,
+        &format!("/api/tags/{}", t1["id"].as_i64().unwrap()),
+        &app.token,
+    )
+    .await;
+    assert_eq!(fetched1["name"], json!("ug1"));
+}
+
+// ---------------------------------------------------------------------------
+// U4. revision 競合を含む一括更新は全体 rollback（DB 無変更）
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_update_rejects_whole_batch_on_a_stale_expected_revision() {
+    let app = test_app("update-stale-revision").await;
+    let group_id = seed_group(&app, "u4").await;
+
+    let t1 = create_tag(&app, "us1", group_id, "40001").await;
+    let t2 = create_tag(&app, "us2", group_id, "40002").await;
+    let stale_revision = t1["revision"].as_i64().unwrap();
+
+    // Another (single-row) update advances t1's revision behind the batch's
+    // back.
+    let (status, _) = write_json(
+        &app.router,
+        "PUT",
+        &format!("/api/tags/{}", t1["id"].as_i64().unwrap()),
+        &app.token,
+        tag_payload("us1-bumped", group_id, "40001"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let revision_before = app.manager.revision();
+
+    let (status, body) = write_json(
+        &app.router,
+        "POST",
+        "/api/tags/batch-update",
+        &app.token,
+        json!({
+            "dryRun": false,
+            "tags": [
+                tag_batch_update_payload(t1["id"].as_i64().unwrap(), "us1-stale", group_id, "40001", false, Some(stale_revision)),
+                tag_batch_update_payload(t2["id"].as_i64().unwrap(), "us2-renamed", group_id, "40002", false, None),
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], json!(false));
+    let errors = body["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0]["index"], json!(0));
+    let field_errors = errors[0]["fieldErrors"].as_array().unwrap();
+    assert!(
+        field_errors
+            .iter()
+            .any(|e| e["field"] == "expectedRevision"),
+        "{field_errors:?}"
+    );
+
+    // All-or-nothing: t2 (whose row was individually fine) is still
+    // untouched, and no rebuild happened for this batch attempt.
+    assert_eq!(app.manager.revision(), revision_before);
+    let (_, fetched2) = get_json(
+        &app.router,
+        &format!("/api/tags/{}", t2["id"].as_i64().unwrap()),
+        &app.token,
+    )
+    .await;
+    assert_eq!(fetched2["name"], json!("us2"));
+}
+
+// ---------------------------------------------------------------------------
+// U5. dry run は DB 無変更
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_update_dry_run_never_writes() {
+    let app = test_app("update-dry-run").await;
+    let group_id = seed_group(&app, "u5").await;
+    let t1 = create_tag(&app, "ud1", group_id, "40001").await;
+
+    let revision_before = app.manager.configured_revision();
+
+    let (status, body) = write_json(
+        &app.router,
+        "POST",
+        "/api/tags/batch-update",
+        &app.token,
+        json!({
+            "dryRun": true,
+            "tags": [
+                tag_batch_update_payload(t1["id"].as_i64().unwrap(), "ud1-preview", group_id, "40001", false, None),
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["dryRun"], json!(true));
+    assert_eq!(body["count"], json!(1));
+    assert!(
+        body.get("tags").is_none(),
+        "dry run must not report updated rows: {body:?}"
+    );
+
+    assert_eq!(app.manager.configured_revision(), revision_before);
+    let (_, fetched1) = get_json(
+        &app.router,
+        &format!("/api/tags/{}", t1["id"].as_i64().unwrap()),
+        &app.token,
+    )
+    .await;
+    assert_eq!(
+        fetched1["name"],
+        json!("ud1"),
+        "dry run must not write anything"
+    );
+    assert_eq!(fetched1["revision"], json!(1));
+}
+
+// ---------------------------------------------------------------------------
+// U6. 空配列は no-op 成功
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_update_with_empty_tags_array_is_a_harmless_success() {
+    let app = test_app("update-empty-batch").await;
+    let revision_before = app.manager.revision();
+
+    let (status, body) = write_json(
+        &app.router,
+        "POST",
+        "/api/tags/batch-update",
+        &app.token,
+        json!({ "tags": [], "dryRun": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["count"], json!(0));
+    assert_eq!(
+        app.manager.revision(),
+        revision_before,
+        "no rebuild for an empty batch"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// U7. 稼働中は非 dryRun がキューされる（202）
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_update_non_dry_run_while_running_is_accepted_and_queued() {
+    let app = test_app("update-queued").await;
+    let group_id = seed_group(&app, "u7").await;
+    let t1 = create_tag(&app, "uq1", group_id, "40001").await;
+
+    let start = app
+        .router
+        .clone()
+        .oneshot(
+            HttpRequest::post("/api/collection/start")
+                .header("Authorization", format!("Bearer {}", app.token))
+                .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start.status(), StatusCode::OK);
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            HttpRequest::post("/api/tags/batch-update")
+                .header("Authorization", format!("Bearer {}", app.token))
+                .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "dryRun": false,
+                        "tags": [
+                            tag_batch_update_payload(t1["id"].as_i64().unwrap(), "uq1-updated", group_id, "40001", false, None),
+                        ],
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["queued"], json!(true));
+
+    let queued_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_changes")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(queued_count, 1);
 }

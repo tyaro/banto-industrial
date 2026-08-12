@@ -517,6 +517,65 @@ export async function createTagsBatch(tags: TagInput[], dryRun: boolean): Promis
 	});
 }
 
+// --- T18-3b 一括操作 (docs/banto-hub-t18-design.md「T18-3b 一括操作」) -------
+
+/**
+ * `POST /api/tags/batch-update` の1行分 - mirrors
+ * `banto_hub_core::rest::TagBatchUpdatePayload`（`#[serde(flatten)]` で
+ * {@link TagInput} の全フィールドを JSON 直下に展開し、`id` だけ乗せる形。
+ * 単票 PUT（`updateTag`）と同じく `expectedRevision` は任意 - 一括操作の
+ * 呼び出し元（`+page.svelte`/`$lib/banto/tagBulkOps.ts`）は常に選択時点の
+ * {@link Tag.revision} を明示的に渡す。
+ */
+export interface BatchTagUpdateRow extends TagInput {
+	id: number;
+}
+
+/**
+ * 行番号(0起点)付きのフィールドエラー — mirrors
+ * `banto_hub_core::rest::BatchTagUpdateRowErrorResponse`。T11-1 の
+ * {@link BatchTagRowError} と同じ形に、行が元々持っている `id` を足した
+ * だけ（更新対象なので、クライアントは `index` だけでなく `id` でも行を
+ * 突き合わせられる）。
+ */
+export interface BatchTagUpdateRowError {
+	index: number;
+	id: number;
+	fieldErrors: BatchTagFieldError[];
+}
+
+/**
+ * `POST /api/tags/batch-update` の応答 — mirrors
+ * `banto_hub_core::rest::BatchTagsUpdateResponse`。T11-1 の
+ * {@link BatchTagsResult} と同じ「常に HTTP 200、`ok: false` は行ごと
+ * エラーの通常応答」契約（あちらの doc comment 参照）。
+ */
+export interface BatchTagsUpdateResult {
+	ok: boolean;
+	dryRun: boolean;
+	/** 適用された(または dry run で適用されたはずの)件数。`ok: false` なら常に0。 */
+	count: number;
+	errors: BatchTagUpdateRowError[];
+	/** `ok && !dryRun` のときだけ存在(実際に更新されたタグ)。 */
+	tags?: Tag[];
+}
+
+/**
+ * T18-3b の一括更新 API。`createTagsBatch`（T11-1、新規作成）の更新版 -
+ * 稼働中は 202 でキュー投入される（`httpRequest` が既存どおり
+ * {@link QueuedWhileRunningError} を投げる）ので、呼び出し元は他の
+ * 書き込み系呼び出しと同じ catch で扱える。
+ */
+export async function updateTagsBatch(
+	rows: BatchTagUpdateRow[],
+	dryRun: boolean
+): Promise<BatchTagsUpdateResult> {
+	return httpRequest<BatchTagsUpdateResult>('/api/tags/batch-update', {
+		method: 'POST',
+		body: { tags: rows, dryRun }
+	});
+}
+
 // --- T12 接続テスト (docs/ux-plan.md §4) -------------------------------------
 
 /**

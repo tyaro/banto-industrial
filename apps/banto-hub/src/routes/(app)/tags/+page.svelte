@@ -42,6 +42,7 @@
 		listCollectionGroups,
 		listPlcConnections,
 		createTagsBatch,
+		updateTagsBatch,
 		isTagRevisionConflictError,
 		MIN_STRING_LENGTH,
 		MAX_STRING_LENGTH,
@@ -54,8 +55,17 @@
 		type TagKind,
 		type CollectionGroup,
 		type PlcConnection,
-		type BatchTagsResult
+		type BatchTagsResult,
+		type BatchTagsUpdateResult,
+		type BatchTagUpdateRow
 	} from '$lib/banto/tagRegistryAdmin';
+	import {
+		buildBulkEnableRows,
+		buildBulkMoveRows,
+		hasMixedTagKinds,
+		summarizeBulkChange,
+		type BulkChangeSummary
+	} from '$lib/banto/tagBulkOps';
 	import {
 		buildContinuousParams,
 		generateContinuousTags,
@@ -391,6 +401,14 @@
 			connections = nextConnections;
 			tags = nextTags;
 			loadError = null;
+			// T18-3b: 再取得で消えた（削除された等の）タグの選択を掃除する -
+			// 存在しない id を選択集合に残すと、一括操作の対象件数表示や
+			// summarizeBulkChange の計算が古い/存在しない行を含んでしまう。
+			if (selectedIds.size > 0) {
+				const existingIds = new Set(nextTags.map((t) => t.id));
+				const next = new Set([...selectedIds].filter((id) => existingIds.has(id)));
+				if (next.size !== selectedIds.size) selectedIds = next;
+			}
 		} catch (err) {
 			loadError = errorMessage(err);
 			toastStore.push('error', loadError);
@@ -532,6 +550,21 @@
 		}
 	}
 
+	/**
+	 * T18-3b（docs/banto-hub-t18-design.md「T18-3b 一括操作」）: 複数選択
+	 * された行の id 集合。BantoGrid（`node_modules/@banto/grid-svelte`）は
+	 * 任意セル描画（チェックボックス列等）に対応しておらず、`editable` な
+	 * 列を1つでも足すと `onRowClick` の意味が変わってしまう
+	 * （編集済みでない列のシングルクリックが編集を開かなくなる - 既存の
+	 * 「行クリックで編集パネルを開く」挙動を壊す）ため、選択列は追加せず
+	 * `selectionMode`（下）でクリックの意味を「編集を開く」⇔「選択を
+	 * 切り替える」で明示的に切り替える方式にした（実装指示の代案(b)）。
+	 * 選択中の行は `rowClass`（下の `tagRowClass`）で強調表示する。
+	 */
+	let selectedIds = $state<Set<number>>(new Set());
+	/** T18-3b: 選択モードのON/OFF。OFFへ戻すときは選択も一緒にクリアする（`toggleSelectionMode`）。 */
+	let selectionMode = $state(false);
+
 	// --- edit ---
 	let selected: Tag | null = $state(null);
 	let editForm = $state(blankForm());
@@ -671,6 +704,29 @@
 		editConflict = null;
 		editAddressPreflight = blankAddressPreflight();
 		drawerMode = 'edit'; // T13-1: 行クリック編集はドロワーで開く
+	}
+
+	/**
+	 * T18-3b: 選択モードのON/OFF切り替え。OFFへ戻すときは選択集合もクリア
+	 * する - 選択モードを抜けたのに一括操作バーだけ残る（選択済みなのに
+	 * 何を選んだか画面上でもう分からない）状態を避けるため。
+	 */
+	function toggleSelectionMode(): void {
+		selectionMode = !selectionMode;
+		if (!selectionMode) selectedIds = new Set();
+	}
+
+	/** T18-3b: 選択モード中の行クリック — 選択のON/OFFを切り替える（`selectTag` の代わりに `onRowClick` へ渡す）。 */
+	function toggleSelectRow(t: Tag): void {
+		const next = new Set(selectedIds);
+		if (next.has(t.id)) next.delete(t.id);
+		else next.add(t.id);
+		selectedIds = next;
+	}
+
+	/** T18-3b: 選択中の行を BantoGrid の `rowClass` 経由で強調表示する（M14/T9-2 と同じ仕組み、下の CSS 参照）。 */
+	function tagRowClass(t: Tag): string | undefined {
+		return selectedIds.has(t.id) ? 'tag-row-selected' : undefined;
 	}
 
 	async function saveEdit(): Promise<void> {
@@ -1359,6 +1415,111 @@
 		}
 	}
 
+	// --- T18-3b: 一括操作 (docs/banto-hub-t18-design.md「T18-3b 一括操作」) --
+	//
+	// 連続登録・CSVインポートの「プレビュー→確認→適用」の流儀を踏襲するが、
+	// ここでは対象件数・差分の計算はサーバー往復なしのクライアント純関数
+	// （`$lib/banto/tagBulkOps.ts::summarizeBulkChange`）で行う - 選択済み
+	// タグの現在値は既にこのページの `tags` にあるため、dry-run を別途
+	// 叩かなくても「対象N件・差分」を確認パネルに出せる（実装指示「過剰
+	// 実装は避け、最低限『件数＋主要差分を見せてから適用』を満たす」）。
+
+	/** 一括操作バーの3ボタンに対応する。`null` は確認パネルを閉じている状態。 */
+	type BulkAction = 'enable' | 'disable' | 'move' | null;
+	let bulkAction: BulkAction = $state(null);
+	/** `bulkAction === 'move'` のときの移動先グループ（`<select>` の値、未選択は `''`）。 */
+	let bulkTargetGroupId = $state('');
+	let bulkApplying = $state(false);
+	/** 直近の `updateTagsBatch` 応答。`ok: false` のときだけ行エラー表示に使う。 */
+	let bulkResult: BatchTagsUpdateResult | null = $state(null);
+
+	const selectedTags = $derived(tags.filter((t) => selectedIds.has(t.id)));
+	/** T18-3b「選択タグに複数種別混在の場合はグループ移動を無効化」の判定。有効/無効切替は種別混在でも可。 */
+	const selectedTagsMixedKind = $derived(hasMixedTagKinds(selectedTags));
+
+	/** 移動先候補 - 選択タグの種別（混在していなければ）に整合するグループのみ（`groupsFor` を再利用）。 */
+	const bulkMoveGroupOptions = $derived.by((): CollectionGroup[] => {
+		if (selectedTags.length === 0 || selectedTagsMixedKind) return [];
+		return groupsFor(selectedTags[0].tagKind);
+	});
+
+	const bulkTargetGroupIdNum = $derived.by((): number | null => {
+		if (bulkTargetGroupId === '') return null;
+		const n = Number(bulkTargetGroupId);
+		return Number.isFinite(n) ? n : null;
+	});
+
+	/** `updateTagsBatch` に渡す実際の行。移動先未選択など未確定の間は空配列（「適用」を無効化する判定にも使う）。 */
+	const bulkRows = $derived.by((): BatchTagUpdateRow[] => {
+		if (bulkAction === 'enable') return buildBulkEnableRows(selectedTags, true);
+		if (bulkAction === 'disable') return buildBulkEnableRows(selectedTags, false);
+		if (bulkAction === 'move' && bulkTargetGroupIdNum !== null) {
+			return buildBulkMoveRows(selectedTags, bulkTargetGroupIdNum);
+		}
+		return [];
+	});
+
+	/** 確認パネルの「対象N件・差分」表示。`bulkRows` と同じ確定条件（移動先未選択なら `null`）。 */
+	const bulkSummary = $derived.by((): BulkChangeSummary<boolean | number> | null => {
+		if (bulkAction === 'enable') return summarizeBulkChange(selectedTags, 'enabled', true);
+		if (bulkAction === 'disable') return summarizeBulkChange(selectedTags, 'enabled', false);
+		if (bulkAction === 'move' && bulkTargetGroupIdNum !== null) {
+			return summarizeBulkChange(selectedTags, 'collectionGroupId', bulkTargetGroupIdNum);
+		}
+		return null;
+	});
+
+	/** 差分テーブルの「変更前/変更後」セル表示 - `enabled` は日本語ラベル、`collectionGroupId` はグループ名に整形する。 */
+	function bulkFieldDisplay(action: Exclude<BulkAction, null>, value: boolean | number): string {
+		if (action === 'move') return groupName(Number(value));
+		return value ? '有効' : '無効';
+	}
+
+	function openBulkPanel(action: 'enable' | 'disable' | 'move'): void {
+		bulkAction = action;
+		bulkTargetGroupId = '';
+		bulkResult = null;
+	}
+
+	function closeBulkPanel(): void {
+		bulkAction = null;
+		bulkTargetGroupId = '';
+		bulkResult = null;
+	}
+
+	/**
+	 * 「この内容で一括反映」— `dryRun: false` で直接適用する（上のコメント
+	 * のとおり、対象件数・差分は既にクライアント側で確認済みという設計）。
+	 * `errors` が返れば（`ok: false`）確認パネルは開いたまま行エラーを
+	 * 表示し、選択・入力はそのまま保持する（連続登録/CSVの「検証」失敗時と
+	 * 同じ「直さず再送信できる」形）。
+	 */
+	async function handleApplyBulk(): Promise<void> {
+		if (bulkAction === null || bulkRows.length === 0) return;
+		bulkApplying = true;
+		bulkResult = null;
+		try {
+			const result = await updateTagsBatch(bulkRows, false);
+			bulkResult = result;
+			if (result.ok) {
+				toastStore.push('success', `選択した${result.count}件を一括反映しました`);
+				closeBulkPanel();
+				selectedIds = new Set();
+				await reload();
+			} else {
+				toastStore.push('error', '選択タグの一部で更新エラーが発生しました（下の一覧参照）。');
+			}
+		} catch (err) {
+			// T18-3b（収集稼働中の 202 キュー投入）: `QueuedWhileRunningError` も
+			// 含め、他の書き込み系呼び出しと同じ汎用エラートーストに委ねる -
+			// 現状の単票/連続登録/CSVインポートもこの経路以上の専用UIは
+			// 持っていないため、ここだけ特別扱いはしない。
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			bulkApplying = false;
+		}
+	}
+
 	const columns: GridColumn<Tag>[] = [
 		{ id: 'id', header: 'ID', accessor: 'id', width: 60, align: 'right' },
 		{
@@ -1936,6 +2097,33 @@
 	{/if}
 {/snippet}
 
+{#snippet bulkRowErrors(result: BatchTagsUpdateResult)}
+	{#if !result.ok}
+		<table class="error-table">
+			<thead>
+				<tr>
+					<th>#</th>
+					<th>ID</th>
+					<th>項目</th>
+					<th>内容</th>
+				</tr>
+			</thead>
+			<tbody>
+				{#each result.errors as rowError (rowError.index)}
+					{#each rowError.fieldErrors as fe, i (i)}
+						<tr>
+							<td>{rowError.index + 1}</td>
+							<td>{rowError.id}</td>
+							<td>{fe.field}</td>
+							<td>{fe.message}</td>
+						</tr>
+					{/each}
+				{/each}
+			</tbody>
+		</table>
+	{/if}
+{/snippet}
+
 {#snippet csvParseErrors(errors: CsvRowError[])}
 	<table class="error-table">
 		<thead>
@@ -2013,6 +2201,17 @@
 							<button type="button" onclick={openCreateDrawer}>新規登録</button>
 							<button type="button" onclick={openContinuousDrawer}>連続登録</button>
 							<button type="button" onclick={openCsvDrawer}>CSVインポート</button>
+							<!-- T18-3b: 選択列を追加する代わりに、行クリックの意味そのものを
+								「編集を開く」⇔「選択を切り替える」で切り替えるトグル
+								（`selectTag`/`toggleSelectRow` の doc comment 参照）。 -->
+							<button
+								type="button"
+								class="secondary"
+								data-testid="tag-selection-mode-toggle"
+								onclick={toggleSelectionMode}
+							>
+								{selectionMode ? '複数選択を終了' : '複数選択'}
+							</button>
 						{/if}
 						<button type="button" class="secondary" onclick={handleExportCsv}
 							>CSVエクスポート</button
@@ -2025,6 +2224,114 @@
 						/>
 						<span class="count">{filteredTags.length} / {tags.length} 件</span>
 					</div>
+					{#if canWrite && selectedIds.size > 0}
+						<!-- T18-3b: 選択が1件以上のときだけ出す一括操作バー
+							（`showMonitorCta` バナーと同じ帯パターン）。文言は既存トースト/
+							ボタン名と部分文字列でも被らないものにしてある（PR #135 の教訓、
+							`handleApplyBulk`/成功トーストのコメント参照）。 -->
+						<div class="onboarding-banner" data-testid="tag-bulk-bar">
+							<span>選択 {selectedIds.size} 件</span>
+							<button
+								type="button"
+								data-testid="tag-bulk-enable-open"
+								onclick={() => openBulkPanel('enable')}>一括で有効化</button
+							>
+							<button
+								type="button"
+								class="secondary"
+								data-testid="tag-bulk-disable-open"
+								onclick={() => openBulkPanel('disable')}>一括で無効化</button
+							>
+							<button
+								type="button"
+								class="secondary"
+								data-testid="tag-bulk-move-open"
+								disabled={selectedTagsMixedKind}
+								title={selectedTagsMixedKind
+									? '種別（plc/computed/internal）が混在する選択ではグループ移動できません'
+									: undefined}
+								onclick={() => openBulkPanel('move')}>グループへ一括移動</button
+							>
+							<button
+								type="button"
+								class="secondary"
+								data-testid="tag-bulk-clear-selection"
+								onclick={() => (selectedIds = new Set())}>選択解除</button
+							>
+						</div>
+					{/if}
+					{#if canWrite && bulkAction !== null}
+						{@const actionLabel =
+							bulkAction === 'enable'
+								? '選択タグを一括で有効化'
+								: bulkAction === 'disable'
+									? '選択タグを一括で無効化'
+									: '選択タグをグループへ一括移動'}
+						<!-- T18-3b: 適用前に対象件数・差分を確認するパネル。連続登録/CSVの
+							`.preview-table`/`.confirm-panel` をそのまま流用する（既存
+							プレビュー表示との視覚的な一貫性を優先し、新規スタイルは足さない）。 -->
+						<div class="confirm-panel" data-testid="tag-bulk-confirm-panel">
+							<p class="confirm-title">{actionLabel}</p>
+							{#if bulkAction === 'move'}
+								<label class="field">
+									移動先グループ
+									<select bind:value={bulkTargetGroupId} data-testid="tag-bulk-target-group">
+										<option value="" disabled>選択してください</option>
+										{#each bulkMoveGroupOptions as group (group.id)}
+											<option value={String(group.id)}>{group.name}</option>
+										{/each}
+									</select>
+								</label>
+							{/if}
+							{#if bulkSummary}
+								<p class="note">
+									対象 {bulkSummary.targetCount} 件・変更 {bulkSummary.changedCount} 件
+								</p>
+								<div class="preview-wrap">
+									<table class="preview-table">
+										<thead>
+											<tr>
+												<th>ID</th>
+												<th>名前</th>
+												<th>変更前</th>
+												<th>変更後</th>
+											</tr>
+										</thead>
+										<tbody>
+											{#each bulkSummary.rows as row (row.id)}
+												<tr>
+													<td>{row.id}</td>
+													<td>{row.name}</td>
+													<td>{bulkFieldDisplay(bulkAction, row.from)}</td>
+													<td>{bulkFieldDisplay(bulkAction, row.to)}</td>
+												</tr>
+											{/each}
+										</tbody>
+									</table>
+								</div>
+							{:else if bulkAction === 'move'}
+								<p class="hint">移動先グループを選択してください。</p>
+							{/if}
+							{#if bulkResult}
+								{@render bulkRowErrors(bulkResult)}
+							{/if}
+							<div class="actions">
+								<button
+									type="button"
+									data-testid="tag-bulk-apply"
+									disabled={bulkApplying || bulkRows.length === 0}
+									onclick={handleApplyBulk}>この内容で一括反映</button
+								>
+								<button
+									type="button"
+									class="secondary"
+									data-testid="tag-bulk-cancel"
+									onclick={closeBulkPanel}
+									disabled={bulkApplying}>キャンセル</button
+								>
+							</div>
+						</div>
+					{/if}
 					{#if showMonitorCta}
 						<!-- T18-2d（TAG-UX-A「タグ登録 → SIM 値確認」）: 直近のタグ登録に続けて、
 							サイドバー探索なしで値確認まで到達できるよう案内する。文言は
@@ -2043,9 +2350,13 @@
 						</div>
 					{/if}
 					<p class="note">
-						{canWrite
-							? '行をクリックすると編集パネルが開きます。'
-							: '閲覧のみ（編集には編集者以上の権限が必要です）。'}
+						{#if !canWrite}
+							閲覧のみ（編集には編集者以上の権限が必要です）。
+						{:else if selectionMode}
+							行をクリックすると選択の切り替えになります（編集は「複数選択を終了」してから）。
+						{:else}
+							行をクリックすると編集パネルが開きます。
+						{/if}
 					</p>
 					<!--
 						T18-1（TAG-UX-C 6点目、docs/banto-hub-desktop-plan.md §9.4）:
@@ -2100,7 +2411,8 @@
 									rows={filteredTags}
 									{columns}
 									getRowId={(t) => t.id}
-									onRowClick={canWrite ? selectTag : undefined}
+									onRowClick={canWrite ? (selectionMode ? toggleSelectRow : selectTag) : undefined}
+									rowClass={tagRowClass}
 								/>
 							</div>
 						{/if}
@@ -2876,5 +3188,16 @@
 		font-size: 0.85rem;
 		font-weight: 600;
 		color: var(--banto-danger);
+	}
+
+	/*
+	 * T18-3b（一括操作）: 選択モード中に選択済みの行を一覧で一目で分かる
+	 * よう強調する。plc-connections ページの `.sim-row`（spec M14 の
+	 * rowClass 仕組み）と同じパターン - BantoGrid 内部の DOM はこの
+	 * コンポーネントのスコープド CSS の外なので :global が必要。
+	 */
+	:global(.row.tag-row-selected) {
+		background: color-mix(in srgb, var(--banto-primary) 14%, transparent);
+		border-left: 3px solid var(--banto-primary);
 	}
 </style>
