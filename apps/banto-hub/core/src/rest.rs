@@ -73,8 +73,9 @@ use banto_server::{
     Identity, ServerEvent,
 };
 use banto_tags::{
-    BatchTagOutcome, CollectionGroup, CollectionGroupInput, CollectionGroupService, PlcConnection,
-    PlcConnectionInput, PlcConnectionService, Tag, TagInput, TagService, TagUpdateError,
+    BatchTagOutcome, BatchTagUpdateOutcome, CollectionGroup, CollectionGroupInput,
+    CollectionGroupService, PlcConnection, PlcConnectionInput, PlcConnectionService, Tag, TagInput,
+    TagService, TagUpdateError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -3473,6 +3474,17 @@ struct PendingBatchTagsPayload {
     tags: Vec<TagPayload>,
 }
 
+/// T18-3b: [`PendingBatchTagsPayload`] の一括更新版 - `tags.batch_update`
+/// 経由でキューされた pending change を [`execute_pending_apply`] が
+/// デコードする際の形。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingBatchTagsUpdatePayload {
+    #[serde(default)]
+    dry_run: bool,
+    tags: Vec<TagBatchUpdatePayload>,
+}
+
 enum PendingApplyError {
     Api(ApiError),
     CollectionEditLocked(CollectionStatusResponse),
@@ -3766,6 +3778,36 @@ async fn execute_pending_apply(
                 .map_err(ApiError)
                 .map_err(PendingApplyError::Api)?;
             if let BatchTagOutcome::Invalid(errors) = outcome {
+                let field_errors = errors
+                    .into_iter()
+                    .flat_map(|row| {
+                        row.field_errors.into_iter().map(move |field| FieldError {
+                            field: format!("tags[{}].{}", row.index, field.field),
+                            message: field.message,
+                        })
+                    })
+                    .collect();
+                return Err(PendingApplyError::Api(ApiError(BantoError::Validation {
+                    field_errors,
+                })));
+            }
+            "tags"
+        }
+        "tags.batch_update" => {
+            let body: PendingBatchTagsUpdatePayload = decode_pending_payload(pending)?;
+            if body.dry_run {
+                return Err(PendingApplyError::Api(preflight_api_error(
+                    "pending の tags.batch_update は dryRun=false のみ対応です".to_string(),
+                )));
+            }
+            let updates: Vec<(i64, TagInput)> = body.tags.into_iter().map(Into::into).collect();
+            let outcome = state
+                .tags
+                .update_batch_tx(&mut tx, &updates)
+                .await
+                .map_err(ApiError)
+                .map_err(PendingApplyError::Api)?;
+            if let BatchTagUpdateOutcome::Invalid(errors) = outcome {
                 let field_errors = errors
                     .into_iter()
                     .flat_map(|row| {
@@ -4155,6 +4197,201 @@ async fn tags_batch(
     }
 }
 
+// --- T18-3b 一括更新 API (bulk tag operations): tags_batch (T11-1) の
+// update-side 対（apps/banto-hub/core/src/rest.rs doc 冒頭ではなくこの
+// セクション直下に配置 - tags_batch のリクエスト/レスポンス封筒・
+// all-or-nothing・catalog commit 1回という骨格をそのまま流用する）。
+// 用途: (1) 一括 enabled 切り替え、(2) 一括グループ移動
+// （collectionGroupId 付け替え）。一括削除は対象外。
+
+/// [`TagPayload`] に `id`（更新対象）を足しただけの一括更新1行分のペイロード。
+/// `#[serde(flatten)]` で `TagPayload` の全フィールド（`expectedRevision`
+/// 込み）をそのまま JSON 直下に展開する - 単票 PUT の body と全く同じ形
+/// （`{ name, address, ..., expectedRevision }`）に `id` だけが乗る。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TagBatchUpdatePayload {
+    pub id: i64,
+    #[serde(flatten)]
+    pub input: TagPayload,
+}
+
+impl From<TagBatchUpdatePayload> for (i64, TagInput) {
+    fn from(payload: TagBatchUpdatePayload) -> Self {
+        (payload.id, payload.input.into())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchTagsUpdateRequest {
+    pub tags: Vec<TagBatchUpdatePayload>,
+    /// `true`: 検証結果だけを返す（DB 無変更）。`false`（既定）: 検証 →
+    /// 単一トランザクションで全件 UPDATE → catalog commit を1回
+    /// （`BatchTagsRequest::dry_run` と同じ意味）。
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// 行番号(0起点)付きのフィールドエラー一覧 - [`BatchTagRowErrorResponse`]
+/// と同じ形だが、更新対象の行は既に `id` を持っているので併記する
+/// （クライアントが `index` だけでなく `id` でも行を突き合わせられる）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchTagUpdateRowErrorResponse {
+    index: usize,
+    id: i64,
+    field_errors: Vec<BatchTagFieldErrorResponse>,
+}
+
+impl From<banto_tags::BatchTagUpdateError> for BatchTagUpdateRowErrorResponse {
+    fn from(err: banto_tags::BatchTagUpdateError) -> Self {
+        Self {
+            index: err.index,
+            id: err.id,
+            field_errors: err.field_errors.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// `POST /api/tags/batch-update` の応答。[`BatchTagsResponse`]（T11-1）と
+/// 同じ「常に 200、`ok: false` で行ごとエラー」契約 - あちらの doc comment
+/// 参照。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchTagsUpdateResponse {
+    ok: bool,
+    dry_run: bool,
+    /// 適用された(または dry run で適用されたはずの)件数。`ok: false` の
+    /// ときは常に 0。
+    count: usize,
+    errors: Vec<BatchTagUpdateRowErrorResponse>,
+    /// `ok: true && dry_run: false` のときだけ `Some`(実際に更新されたタグ)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tags: Option<Vec<Tag>>,
+}
+
+/// `POST /api/tags/batch-update` - T18-3b（bulk tag operations）。editor
+/// 以上、`tags_batch`（T11-1）の骨格をそのまま写した update 版:
+/// トランザクション内検証 → all-or-nothing 適用 → catalog commit 1回。
+/// revision 競合（[`TagUpdateError::RevisionConflict`] が単票更新で返す
+/// `409`）もここでは行単位エラーとして集約する - 一括操作の「どれか stale
+/// なら全体 ok:false・無書込」という all-or-nothing 契約を、単票の
+/// 「対象1行だけ 409 で弾く」より優先するため（design: T18-3b 一括操作）。
+async fn tags_batch_update(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Json(body): Json<BatchTagsUpdateRequest>,
+) -> RegistryMutationResult<Response> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "tags",
+        "POST",
+        "/api/tags/batch-update",
+    )
+    .await?;
+
+    if !body.dry_run {
+        let status = state.controller.status();
+        if status.state != CollectionState::Stopped {
+            return queue_pending_registry_change(
+                &state,
+                &headers,
+                "tags.batch_update",
+                json!({ "dryRun": false, "tags": body.tags }),
+                status,
+            )
+            .await;
+        }
+        require_collection_stopped(&state)?;
+    }
+
+    let dry_run = body.dry_run;
+    let updates: Vec<(i64, TagInput)> = body.tags.into_iter().map(Into::into).collect();
+
+    if updates.is_empty() {
+        return Ok(Json(BatchTagsUpdateResponse {
+            ok: true,
+            dry_run,
+            count: 0,
+            errors: Vec::new(),
+            tags: (!dry_run).then(Vec::new),
+        })
+        .into_response());
+    }
+
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    let outcome = match state.tags.update_batch_tx(&mut tx, &updates).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(ApiError(err).into());
+        }
+    };
+    match outcome {
+        BatchTagUpdateOutcome::Invalid(errors) => {
+            let _ = tx.rollback().await;
+            Ok(Json(BatchTagsUpdateResponse {
+                ok: false,
+                dry_run,
+                count: 0,
+                errors: errors.into_iter().map(Into::into).collect(),
+                tags: None,
+            })
+            .into_response())
+        }
+        BatchTagUpdateOutcome::Valid { count, tags } => {
+            let snapshot = match preflight_transaction(&mut tx).await {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    let _ = tx.rollback().await;
+                    return Err(err.into());
+                }
+            };
+            if dry_run {
+                tx.rollback().await.map_err(storage_api_error)?;
+            } else {
+                tx.commit().await.map_err(storage_api_error)?;
+                record_write(
+                    &state.audit,
+                    &state.auth,
+                    &headers,
+                    "batch_update",
+                    "tags",
+                    "-",
+                    Some(json!({ "count": count })),
+                )
+                .await;
+                // T18-3b の核心 (tags_batch/T11-1 と同じ): n 件でも catalog
+                // commit はここで1回だけ。
+                commit_catalog_and_notify(
+                    &state.manager,
+                    &state.controller,
+                    &state.events,
+                    "tags",
+                    snapshot,
+                    state.legacy_live_reconfigure,
+                )
+                .await;
+            }
+            Ok(Json(BatchTagsUpdateResponse {
+                ok: true,
+                dry_run,
+                count,
+                errors: Vec::new(),
+                tags: if dry_run { None } else { tags },
+            })
+            .into_response())
+        }
+    }
+}
+
 /// `/api/plc-connections/*` + `/api/collection-groups/*` + `/api/tags/*`
 /// (viewer-read / editor-write) - `relay-wright-core::rest::tag_registry_router`
 /// を雛形に、書き込み成功後に catalog commit と SSE通知を行う。
@@ -4217,6 +4454,9 @@ fn tag_registry_router(
         // なく `/api/tags` の下の固定パスなので、`{id}` (i64) パラメータと
         // 衝突しない。
         .route("/api/tags/batch", post(tags_batch))
+        // T18-3b (bulk tag operations): 一括更新 - 同じ理由で `/api/tags`
+        // 直下の固定パス（`/api/tags/batch` と衝突しない別セグメント）。
+        .route("/api/tags/batch-update", post(tags_batch_update))
         .with_state(state)
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }

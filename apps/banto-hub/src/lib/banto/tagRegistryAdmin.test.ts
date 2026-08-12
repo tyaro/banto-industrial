@@ -45,12 +45,14 @@ import {
 	createPlcConnection,
 	updatePlcConnection,
 	createTag,
+	updateTagsBatch,
 	isQueuedWhileRunningError,
 	QueuedWhileRunningError,
 	type PlcConnection,
 	type PlcConnectionInput,
 	type Tag,
-	type TagInput
+	type TagInput,
+	type BatchTagUpdateRow
 } from './tagRegistryAdmin';
 
 const connectionInput: PlcConnectionInput = {
@@ -151,6 +153,15 @@ describe('httpRequest の 202 (queued while running) 処理', () => {
 		});
 	});
 
+	it('T18-3b: updateTagsBatch も同様に QueuedWhileRunningError で reject する', async () => {
+		mockFetchOnce({ status: 202, ok: true, body: queuedBody });
+		const rows: BatchTagUpdateRow[] = [{ id: 1, expectedRevision: 1, ...tagInput }];
+		await expect(updateTagsBatch(rows, false)).rejects.toSatisfy((err: unknown) => {
+			expect(isQueuedWhileRunningError(err)).toBe(true);
+			return true;
+		});
+	});
+
 	it('202 だが queued shape に合致しない body は ProviderError にフォールバックする（isQueuedWhileRunningError は false）', async () => {
 		mockFetchOnce({ status: 202, ok: true, body: { unexpected: 'shape' } });
 		await expect(createPlcConnection(connectionInput)).rejects.toSatisfy((err: unknown) => {
@@ -171,5 +182,19 @@ describe('httpRequest の通常成功パス（200/201）は 202 分岐追加の�
 		mockFetchOnce({ status: 200, ok: true, body: tagResource });
 		const result = await createTag(tagInput);
 		expect(result).toEqual(tagResource);
+	});
+
+	it('T18-3b: updateTagsBatch は 200 で BatchTagsUpdateResult を resolve する', async () => {
+		const batchResult = {
+			ok: true,
+			dryRun: false,
+			count: 1,
+			errors: [],
+			tags: [tagResource]
+		};
+		mockFetchOnce({ status: 200, ok: true, body: batchResult });
+		const rows: BatchTagUpdateRow[] = [{ id: 1, expectedRevision: 1, ...tagInput }];
+		const result = await updateTagsBatch(rows, false);
+		expect(result).toEqual(batchResult);
 	});
 });
