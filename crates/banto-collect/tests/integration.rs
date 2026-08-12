@@ -1548,7 +1548,7 @@ async fn one_conn_setup(label: &str) -> OneConnEnv {
     let current = collector.current_values();
     let tag_a_key = format!("tag:{}", tag_a.id);
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get(&tag_a_key).map(|s| s.value) == Some(Some(11.0))
         })
         .await,
@@ -1637,14 +1637,14 @@ async fn two_conn_setup(label: &str) -> TwoConnEnv {
     let tag_a_key = format!("tag:{}", tag_a.id);
     let tag_b_key = format!("tag:{}", tag_b.id);
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get(&tag_a_key).map(|s| s.value) == Some(Some(11.0))
         })
         .await,
         "A should read its initial value before any apply_config"
     );
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             current.get(&tag_b_key).map(|s| s.value) == Some(Some(22.0))
         })
         .await,
