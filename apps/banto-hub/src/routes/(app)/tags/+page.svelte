@@ -22,6 +22,7 @@
 	 * `MAX_STRING_LENGTH` はヒント表示のみ - 実際の検証はバックエンド）。
 	 */
 	import { tick } from 'svelte';
+	import { page } from '$app/state';
 	import { BantoGrid, type GridColumn } from '@banto/grid-svelte';
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '$lib/toast.svelte';
@@ -80,6 +81,11 @@
 	} from '$lib/banto/tagFormLayout';
 	import { addressHelpFor } from '$lib/banto/tagAddressHelp';
 	import { carryFormForNext } from '$lib/banto/tagFormCarry';
+	import {
+		resolveGroupIdFromTreeSelection,
+		resolvePresetGroupId,
+		type TreeSelectionForPreset
+	} from '$lib/banto/tagOnboarding';
 	import { isFormDirty } from '$lib/banto/formDirty';
 	import {
 		buildExternalName,
@@ -426,6 +432,14 @@
 	}
 
 	/**
+	 * T18-2d（TAG-UX-A「タグ登録 → SIM 値確認」の最終ステップ CTA）: タグを
+	 * 1件でも作成したら「次へ: SIM値を確認」バナーを出す（`/monitor` は
+	 * WS 経由の現在値を表示するのみで、ここから直接 SIM 値の good/bad は
+	 * 判定しない - 判定はチェックリスト側 `tagOnboarding.ts` の責務）。
+	 */
+	let showMonitorCta = $state(false);
+
+	/**
 	 * T18-2c（docs/banto-hub-t18-design.md「T18-2c 登録後分岐と親引継ぎ」、
 	 * TAG-UX-2）: create Drawer の主アクションを「登録して次へ」
 	 * （`closeAfterSave = false`）と「登録して閉じる」（`true`）に分ける。
@@ -457,6 +471,7 @@
 		try {
 			await createTag(toInput(createForm));
 			toastStore.push('success', '作成しました');
+			showMonitorCta = true;
 			if (closeAfterSave) {
 				closeDrawer();
 			} else {
@@ -839,10 +854,24 @@
 		return true;
 	}
 
+	/**
+	 * T18-2d（docs/banto-hub-t18-design.md「T18-2d 初回導線チェックリスト」、
+	 * TAG-UX-A「ツリーで選択中の接続／グループを単票・連続登録へプリセット
+	 * する」）: 開いた時点でツリーがグループを選択中なら、そのグループを
+	 * `collectionGroupId` へ初期値として入れる（`resolveGroupIdFromTreeSelection`
+	 * が「すべて」/接続選択/calc・mem配下は `null` にする - 冒頭 import 元の
+	 * doc comment 参照）。プリセットした値も `createBaseline` に含めるので
+	 * dirty 扱いにはならない（TAG-UX-A「選択グループからタグを作る場合、
+	 * グループの再選択を要求しない」を満たしつつ、まだ何も入力していない
+	 * 状態を dirty と誤認しない）。
+	 */
 	function openCreateDrawer(): void {
 		if (!confirmDiscardIfNeeded()) return;
-		createForm = blankForm();
-		createBaseline = blankForm();
+		const presetGroupId = resolveGroupIdFromTreeSelection(treeFilter, groups, connections);
+		const next = blankForm();
+		if (presetGroupId !== null) next.collectionGroupId = String(presetGroupId);
+		createForm = next;
+		createBaseline = { ...next };
 		createErrors = {};
 		createAddressPreflight = blankAddressPreflight();
 		editConflict = null;
@@ -905,6 +934,25 @@
 			treeFilter = { type: 'connection', id: data.connection.id };
 		else treeFilter = { type: 'group', id: data.group.id };
 	}
+
+	/**
+	 * T18-2d（TAG-UX-A、collection-groups ページの「次へ: タグを登録」CTA の
+	 * 受け側）: `/tags?groupId=` で渡された収集グループをツリー選択へ反映
+	 * する（一度だけ - `onboardingQueryApplied` で guard、`reload()` は
+	 * 作成/削除のたびにも呼ばれるため `groups`/`connections` の参照は何度も
+	 * 変わる）。ツリー選択に反映するだけで Drawer は自動で開かない -
+	 * 「新規登録」ボタンを押した時点で `openCreateDrawer()` がこの選択から
+	 * プリセットする（同関数の doc comment 参照）。calc/mem 配下や無効な ID
+	 * は `resolvePresetGroupId` が弾くのでツリー選択は変えない。
+	 */
+	let onboardingQueryApplied = $state(false);
+	$effect(() => {
+		if (onboardingQueryApplied) return;
+		if (connections.length === 0 && groups.length === 0) return;
+		onboardingQueryApplied = true;
+		const id = resolvePresetGroupId(page.url.searchParams.get('groupId'), groups, connections);
+		if (id !== null) treeFilter = { type: 'group', id };
+	});
 
 	const filteredTags = $derived.by((): Tag[] => {
 		let list = tags;
@@ -1830,6 +1878,23 @@
 						/>
 						<span class="count">{filteredTags.length} / {tags.length} 件</span>
 					</div>
+					{#if showMonitorCta}
+						<!-- T18-2d（TAG-UX-A「タグ登録 → SIM 値確認」）: 直近のタグ登録に続けて、
+							サイドバー探索なしで値確認まで到達できるよう案内する。文言は
+							「登録が完了しました」とし、上の成功トースト（`作成しました`）と
+							部分一致しないようにする -
+							`page.getByText('作成しました')`（`e2e/tests-banto-hub/
+							banto-hub-tags-form.spec.ts`/`banto-hub-tags-p0-2-preflight.spec.ts`）
+							がトーストと二重ヒットして strict mode violation になっていた
+							実測回帰（2026-08-12、PR #135 CI）の修正。 -->
+						<div class="onboarding-banner">
+							<span>タグの登録が完了しました。</span>
+							<a class="onboarding-cta" href="/monitor">次へ: SIM値を確認</a>
+							<button type="button" class="secondary" onclick={() => (showMonitorCta = false)}
+								>閉じる</button
+							>
+						</div>
+					{/if}
 					<p class="note">
 						{canWrite
 							? '行をクリックすると編集パネルが開きます。'
@@ -1864,7 +1929,22 @@
 							</div>
 						{/if}
 						{#if tags.length === 0}
-							<p class="note">タグがありません。</p>
+							<!--
+								T18-2d（TAG-UX-A「空状態を…不足する前工程と移動ボタンを示す」）:
+								連鎖する前工程（PLC接続→収集グループ）のうち欠けているものを
+								案内する。connections/groups が両方揃っていれば通常の空表示。
+							-->
+							<div class="empty-state">
+								{#if connections.length === 0}
+									<p class="note">先に PLC接続 を作成してください。</p>
+									<a class="onboarding-cta" href="/plc-connections">PLC接続ページへ移動</a>
+								{:else if groups.length === 0}
+									<p class="note">先に 収集グループ を作成してください。</p>
+									<a class="onboarding-cta" href="/collection-groups">収集グループページへ移動</a>
+								{:else}
+									<p class="note">タグがありません。上の「新規登録」から追加してください。</p>
+								{/if}
+							</div>
 						{:else if filteredTags.length === 0}
 							<p class="note">条件に一致するタグがありません。</p>
 						{:else}
@@ -1931,7 +2011,10 @@
 				</button>
 			</div>
 			{#if groups.length === 0}
-				<p class="note">先に 収集グループ を1件以上登録してください。</p>
+				<p class="note">
+					先に 収集グループ を1件以上登録してください。
+					<a class="onboarding-cta" href="/collection-groups">収集グループページへ移動</a>
+				</p>
 			{/if}
 		</form>
 	{:else if drawerMode === 'edit' && selected && canWrite}
@@ -2051,7 +2134,10 @@
 			</div>
 
 			{#if groups.length === 0}
-				<p class="note">先に 収集グループ を1件以上登録してください。</p>
+				<p class="note">
+					先に 収集グループ を1件以上登録してください。
+					<a class="onboarding-cta" href="/collection-groups">収集グループページへ移動</a>
+				</p>
 			{/if}
 
 			{#if continuousPreview && !continuousPreview.ok}
@@ -2264,6 +2350,36 @@
 		flex-direction: column;
 		align-items: flex-start;
 		gap: 0.5rem;
+	}
+
+	/* T18-2d（TAG-UX-A）: 前工程への移動リンク・作成直後の「次へ」導線バナー。 */
+	.onboarding-cta {
+		display: inline-block;
+		padding: 0.3rem 0.75rem;
+		border-radius: var(--banto-radius);
+		background: var(--banto-primary);
+		color: var(--banto-text-inverse);
+		font-weight: 600;
+		font-size: 0.8rem;
+		text-decoration: none;
+		white-space: nowrap;
+	}
+
+	.onboarding-cta:hover {
+		background: var(--banto-primary-hover);
+	}
+
+	.onboarding-banner {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 0.75rem;
+		margin-bottom: 0.75rem;
+		padding: 0.5rem 0.8rem;
+		border: 1px solid var(--banto-primary);
+		border-radius: var(--banto-radius);
+		background: color-mix(in srgb, var(--banto-primary) 8%, transparent);
+		font-size: 0.85rem;
 	}
 
 	/* 再読込失敗だが stale 一覧が残っている場合の、一覧上部のエラーバナー。 */

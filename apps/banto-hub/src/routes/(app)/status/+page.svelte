@@ -12,6 +12,18 @@
 	 * リロードする頻度を上げても実機の負荷は増えないので、WebSocket/SSE
 	 * 差分配信を新設するより単純な定期ポーリングで十分（WebSocket は
 	 * 実装指示でも明示的にスコープ外）。
+	 *
+	 * T18-2d（docs/banto-hub-t18-design.md「T18-2d 初回導線チェックリスト」、
+	 * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A）: 「サーバー状態」の上に
+	 * 初回チェックリスト（PLC接続作成→接続テスト→収集グループ作成→タグ登録
+	 * →SIM値確認）を追加する。着地点が /status（navigation.ts の doc comment
+	 * 参照）なので、ここが「サイドバーを探索せず案内だけで完了できる」の
+	 * 起点として自然。完了判定・次工程算出はすべて `$lib/banto/tagOnboarding.ts`
+	 * の純関数（実データ判定、画面訪問では判定しない）に委ねる。
+	 * `listPlcConnections`/`listCollectionGroups`/`listTags` は3秒ポーリング
+	 * には乗せず、チェックリストが未完了の間だけ取得する
+	 * （`pollRegistry`/`onboardingDone` 参照）- 完了後は10,000タグ規模でも
+	 * 無駄な一覧取得を繰り返さない。
 	 */
 	import { isProviderError } from '@banto/admin-core';
 	import {
@@ -32,6 +44,15 @@
 		type ValueEntry,
 		type ValuesResponse
 	} from '$lib/banto/hubStatus';
+	import {
+		listPlcConnections,
+		listCollectionGroups,
+		listTags,
+		type CollectionGroup,
+		type PlcConnection,
+		type Tag
+	} from '$lib/banto/tagRegistryAdmin';
+	import { computeOnboardingSteps, isOnboardingComplete } from '$lib/banto/tagOnboarding';
 	import { enableWriteControl, disableWriteControl } from '$lib/banto/writeControlAdmin';
 	import {
 		canSwitchToDesktop,
@@ -139,9 +160,59 @@
 		}
 	}
 
+	// --- T18-2d 初回チェックリスト（TAG-UX-A） -------------------------------
+	//
+	// `status`/`values` は上の poll() が3秒毎に更新するが、一覧系
+	// （plc-connections/collection-groups/tags）はチェックリスト専用の
+	// 追加取得で、チェックリストが未完了の間だけ回す（`onboardingDone` が
+	// 真になったら以後は取得しない - 冒頭 doc comment 参照）。
+	let registrySnapshot: {
+		connections: PlcConnection[];
+		groups: CollectionGroup[];
+		tags: Tag[];
+	} | null = $state(null);
+	let onboardingDone = $state(false);
+
+	async function pollRegistry(): Promise<void> {
+		if (onboardingDone) return;
+		try {
+			const [connections, groups, tags] = await Promise.all([
+				listPlcConnections(),
+				listCollectionGroups(),
+				listTags()
+			]);
+			registrySnapshot = { connections, groups, tags };
+		} catch {
+			// ベストエフォート - チェックリストがこの周期だけ更新されないだけで、
+			// 主機能（サーバー状態・書き込み受付等）の表示は poll() 側が独立して
+			// 継続する。エラートーストは poll() 側と重複するので出さない。
+		}
+	}
+
+	const onboardingSteps = $derived.by(() => {
+		if (!registrySnapshot || !status || !values) return [];
+		return computeOnboardingSteps({
+			connections: registrySnapshot.connections,
+			groups: registrySnapshot.groups,
+			tags: registrySnapshot.tags,
+			connectionStatuses: status.connections,
+			values: values.values
+		});
+	});
+
+	$effect(() => {
+		if (onboardingSteps.length > 0 && isOnboardingComplete(onboardingSteps)) {
+			onboardingDone = true;
+		}
+	});
+
 	$effect(() => {
 		void poll();
-		const timer = setInterval(() => void poll(), POLL_INTERVAL_MS);
+		void pollRegistry();
+		const timer = setInterval(() => {
+			void poll();
+			void pollRegistry();
+		}, POLL_INTERVAL_MS);
 		return () => clearInterval(timer);
 	});
 
@@ -371,6 +442,24 @@
 </script>
 
 <div class="page">
+	{#if onboardingSteps.length > 0 && !isOnboardingComplete(onboardingSteps)}
+		<section class="onboarding">
+			<h2>初回セットアップ</h2>
+			<p class="note">PLC接続の作成からSIM値の確認まで、この画面の案内だけで完了できます。</p>
+			<ol class="onboarding-list">
+				{#each onboardingSteps as step (step.id)}
+					<li class="onboarding-step" class:done={step.done}>
+						<span class="onboarding-mark" aria-hidden="true">{step.done ? '✓' : '○'}</span>
+						<span class="onboarding-label">{step.label}</span>
+						{#if !step.done}
+							<a class="onboarding-cta" href={step.href}>{step.ctaLabel}</a>
+						{/if}
+					</li>
+				{/each}
+			</ol>
+		</section>
+	{/if}
+
 	<section>
 		<h2>サーバー状態</h2>
 		{#if loading && !status}
@@ -660,6 +749,63 @@
 		margin: 0 0 0.5rem;
 		color: var(--banto-text-muted);
 		font-size: 0.8rem;
+	}
+
+	/* T18-2d（TAG-UX-A）: 初回チェックリスト。 */
+	.onboarding {
+		border-color: var(--banto-primary);
+	}
+
+	.onboarding-list {
+		list-style: none;
+		margin: 0.5rem 0 0;
+		padding: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 0.4rem;
+	}
+
+	.onboarding-step {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		font-size: 0.875rem;
+		padding: 0.35rem 0.5rem;
+		border-radius: var(--banto-radius);
+	}
+
+	.onboarding-step.done {
+		color: var(--banto-text-muted);
+	}
+
+	.onboarding-mark {
+		display: inline-flex;
+		width: 1.2rem;
+		justify-content: center;
+		font-weight: 700;
+	}
+
+	.onboarding-step.done .onboarding-mark {
+		color: var(--banto-success, #1a7f37);
+	}
+
+	.onboarding-label {
+		flex: 1;
+	}
+
+	.onboarding-cta {
+		padding: 0.3rem 0.75rem;
+		border-radius: var(--banto-radius);
+		background: var(--banto-primary);
+		color: var(--banto-text-inverse);
+		font-weight: 600;
+		font-size: 0.8rem;
+		text-decoration: none;
+		white-space: nowrap;
+	}
+
+	.onboarding-cta:hover {
+		background: var(--banto-primary-hover);
 	}
 
 	.summary {

@@ -12,6 +12,7 @@
 	 * （「…タグが N 件あるため削除できません」）で拒否されるので、それを
 	 * トーストで表示する（plc-connections 画面と同じパターン）。
 	 */
+	import { page } from '$app/state';
 	import { BantoGrid, type GridColumn } from '@banto/grid-svelte';
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '$lib/toast.svelte';
@@ -28,6 +29,7 @@
 		type CollectionGroupInput,
 		type PlcConnection
 	} from '$lib/banto/tagRegistryAdmin';
+	import { resolvePresetConnectionId, tagsHref } from '$lib/banto/tagOnboarding';
 
 	const canWrite = $derived(canWriteResources(sessionStore.role));
 
@@ -77,10 +79,31 @@
 		return connections.find((c) => c.id === id)?.name ?? `#${id}`;
 	}
 
+	/**
+	 * T18-2d（TAG-UX-A「ツリーで選択中の接続／グループを単票・連続登録へ
+	 * プリセットする」の姉妹機能 - 画面間の「PLC接続を作成→次のグループ
+	 * へ」導線）: `/collection-groups?connectionId=` で渡された接続を新規
+	 * 作成フォームへ一度だけプリセットする。`presetApplied` で「一度だけ」
+	 * を保証する - `reload()` は作成/更新のたびにも呼ばれるため、guard が
+	 * 無いとユーザーが選び直した後の再読込で毎回上書きされてしまう。
+	 * 無効な値（未指定・非数値・存在しない ID・calc/mem 等の virtual 接続）
+	 * は `resolvePresetConnectionId` が `null` にするのでプリセットしない
+	 * （既定の「選択してください」のまま）。
+	 */
+	let presetApplied = $state(false);
+
+	function applyConnectionPresetFromQuery(): void {
+		if (presetApplied) return;
+		presetApplied = true;
+		const id = resolvePresetConnectionId(page.url.searchParams.get('connectionId'), connections);
+		if (id !== null) createForm = { ...createForm, plcConnectionId: String(id) };
+	}
+
 	async function reload(): Promise<void> {
 		loading = true;
 		try {
 			[connections, groups] = await Promise.all([listPlcConnections(), listCollectionGroups()]);
+			applyConnectionPresetFromQuery();
 		} catch (err) {
 			toastStore.push('error', errorMessage(err));
 		} finally {
@@ -96,6 +119,11 @@
 	let createForm = $state(blankForm());
 	let createErrors: Record<string, string> = $state({});
 	let creating = $state(false);
+	/**
+	 * T18-2d（TAG-UX-A「グループ作成後は次のタグへ進む CTA を表示する」）:
+	 * plc-connections ページの `lastCreated` と同じパターン。
+	 */
+	let lastCreated: CollectionGroup | null = $state(null);
 
 	function applyFieldErrors(err: unknown): Record<string, string> | null {
 		if (isProviderError(err) && err.body.kind === 'validation') {
@@ -110,9 +138,10 @@
 		creating = true;
 		createErrors = {};
 		try {
-			await createCollectionGroup(toInput(createForm));
+			const created = await createCollectionGroup(toInput(createForm));
 			toastStore.push('success', '作成しました');
 			createForm = blankForm();
+			lastCreated = created;
 			await reload();
 		} catch (err) {
 			const fieldErrors = applyFieldErrors(err);
@@ -237,9 +266,29 @@
 				>作成</button
 			>
 			{#if connections.length === 0}
-				<p class="note">先に PLC接続 を1件以上登録してください。</p>
+				<!--
+					T18-2d（TAG-UX-A「空状態を…不足する前工程と移動ボタンを示す」）:
+					前工程（PLC接続）が無いことを示し、その場で移動できるようにする。
+				-->
+				<p class="note">
+					先に PLC接続 を1件以上登録してください。
+					<a class="onboarding-cta" href="/plc-connections">PLC接続ページへ移動</a>
+				</p>
 			{/if}
 		</section>
+	{/if}
+
+	{#if lastCreated}
+		<!-- T18-2d（TAG-UX-A「グループ作成後は次のタグへ進む CTA を表示する」）。
+			文言は「登録が完了しました」とし、上の成功トースト（`作成しました`）と
+			部分一致しないようにする（tags/+page.svelte 側の同種バナーで
+			`getByText('作成しました')` が strict mode violation を起こした
+			実測回帰、2026-08-12、PR #135 CI、と同じ理由の予防）。 -->
+		<div class="onboarding-banner">
+			<span>「{lastCreated.name}」の登録が完了しました。</span>
+			<a class="onboarding-cta" href={tagsHref(lastCreated.id)}>次へ: タグを登録</a>
+			<button type="button" class="secondary" onclick={() => (lastCreated = null)}>閉じる</button>
+		</div>
 	{/if}
 
 	<section class="list">
@@ -356,6 +405,47 @@
 	.actions {
 		display: flex;
 		gap: 0.75rem;
+	}
+
+	/* T18-2d（TAG-UX-A）: 前工程への移動リンク・作成直後の「次へ」導線バナー。 */
+	.onboarding-banner {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 0.75rem;
+		margin-top: 1rem;
+		padding: 0.6rem 0.9rem;
+		border: 1px solid var(--banto-primary);
+		border-radius: var(--banto-radius);
+		background: color-mix(in srgb, var(--banto-primary) 8%, transparent);
+		font-size: 0.85rem;
+	}
+
+	.onboarding-cta {
+		display: inline-block;
+		padding: 0.3rem 0.75rem;
+		border-radius: var(--banto-radius);
+		background: var(--banto-primary);
+		color: var(--banto-text-inverse);
+		font-weight: 600;
+		font-size: 0.8rem;
+		text-decoration: none;
+		white-space: nowrap;
+	}
+
+	.onboarding-cta:hover {
+		background: var(--banto-primary-hover);
+	}
+
+	button.secondary {
+		background: transparent;
+		border: 1px solid var(--banto-border);
+		color: var(--banto-text-muted);
+	}
+
+	button.secondary:hover:not(:disabled) {
+		background: color-mix(in srgb, var(--banto-primary) 8%, transparent);
+		color: var(--banto-text);
 	}
 
 	button {

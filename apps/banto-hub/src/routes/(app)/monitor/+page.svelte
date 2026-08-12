@@ -195,6 +195,16 @@
 
 		{#if loading && rows.length === 0}
 			<p class="note">読み込み中…</p>
+		{:else if rows.length === 0}
+			<!--
+				T18-2d（docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A「空状態を…
+				不足する前工程と移動ボタンを示す」）: タグが1件も無い（フィルタの
+				問題ではなく真の空）場合は、前工程（タグ登録）へ案内する。
+			-->
+			<p class="note">
+				登録されているタグがありません。先に タグの登録画面 からタグを作成してください。
+			</p>
+			<a class="onboarding-cta" href="/tags">タグの登録画面へ移動</a>
 		{:else if filteredRows.length === 0}
 			<p class="note">条件に一致するタグがありません。</p>
 		{:else}
@@ -272,6 +282,23 @@
 		color: var(--banto-danger);
 		font-size: 0.8rem;
 		margin: 0 0 0.5rem;
+	}
+
+	/* T18-2d（TAG-UX-A）: 前工程（タグ登録）への移動リンク。 */
+	.onboarding-cta {
+		display: inline-block;
+		padding: 0.3rem 0.75rem;
+		border-radius: var(--banto-radius);
+		background: var(--banto-primary);
+		color: var(--banto-text-inverse);
+		font-weight: 600;
+		font-size: 0.8rem;
+		text-decoration: none;
+		white-space: nowrap;
+	}
+
+	.onboarding-cta:hover {
+		background: var(--banto-primary-hover);
 	}
 
 	.status-line {
