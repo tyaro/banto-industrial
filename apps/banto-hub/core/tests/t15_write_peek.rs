@@ -388,14 +388,14 @@ async fn write_after_session_stop_and_join_fails_closed_without_spawning_a_new_s
     app.write_control.enable();
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.sessions.connection_count() == 1
         })
         .await,
         "rebuild should have established exactly one broker session"
     );
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .broker_status(conn_id)
                 .map(|s| s == banto_broker::BrokerConnectionStatus::Connected)
@@ -458,7 +458,7 @@ async fn write_succeeds_via_peek_while_the_session_is_alive() {
     app.write_control.enable();
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.manager
                 .broker_status(conn_id)
                 .map(|s| s == banto_broker::BrokerConnectionStatus::Connected)

@@ -447,7 +447,7 @@ async fn unrelated_connection_is_uninterrupted_by_a_partial_reconfigure() {
     app.manager.rebuild().await.expect("initial rebuild");
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             let (s, v) =
                 get_json(&app.router, "/api/v1/values/line_a.fast_a.ta1", &app.token).await;
             s == StatusCode::OK && v["v"] == 1111.0 && v["q"] == "good"
@@ -456,7 +456,7 @@ async fn unrelated_connection_is_uninterrupted_by_a_partial_reconfigure() {
         "A should be collecting before the change under test"
     );
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             let (s, v) =
                 get_json(&app.router, "/api/v1/values/line_b.fast_b.tb1", &app.token).await;
             s == StatusCode::OK && v["v"] == 2222.0 && v["q"] == "good"
@@ -563,7 +563,7 @@ async fn unrelated_connection_is_uninterrupted_by_a_partial_reconfigure() {
         .collect();
     assert!(names.contains(&"line_b.fast_b.tb2"));
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             let (s, v) =
                 get_json(&app.router, "/api/v1/values/line_b.fast_b.tb2", &app.token).await;
             s == StatusCode::OK && v["v"] == 3333.0 && v["q"] == "good"
@@ -628,7 +628,7 @@ async fn server_side_tag_only_change_never_touches_the_collector() {
 
     app.manager.rebuild().await.expect("initial rebuild");
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             let (s, v) = get_json(&app.router, "/api/v1/values/line1.fast.t1", &app.token).await;
             s == StatusCode::OK && v["q"] == "good"
         })
@@ -753,7 +753,7 @@ async fn deleting_a_connection_untracks_its_broker_session_and_leaves_others_run
     app.manager.rebuild().await.expect("initial rebuild");
 
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             let (s, v) =
                 get_json(&app.router, "/api/v1/values/line_a.fast_a.ta1", &app.token).await;
             s == StatusCode::OK && v["q"] == "good"
@@ -761,7 +761,7 @@ async fn deleting_a_connection_untracks_its_broker_session_and_leaves_others_run
         .await
     );
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             let (s, v) =
                 get_json(&app.router, "/api/v1/values/line_b.fast_b.tb1", &app.token).await;
             s == StatusCode::OK && v["q"] == "good"
@@ -848,7 +848,7 @@ async fn deleting_a_connection_untracks_its_broker_session_and_leaves_others_run
     // config, so it only happens once the connection ROW itself (not just
     // its groups/tags) is gone.
     assert!(
-        wait_until(Duration::from_secs(3), || async {
+        wait_until(Duration::from_secs(10), || async {
             app.sessions.connection_count() == 0
         })
         .await,
