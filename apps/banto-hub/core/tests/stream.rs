@@ -1255,9 +1255,15 @@ async fn wildcard_subscription_with_per_tag_read_scope_only_receives_in_scope_ta
     tokio::time::sleep(Duration::from_millis(400)).await; // give the eval loop a chance to (wrongly) fire
     assert_no_more_data_for(&mut ws, 1).await;
 
-    // スコープ内(line1.fast.temp01)の値変更は引き続き届く。
+    // スコープ内(line1.fast.temp01)の値変更は引き続き届く。旧値(1)を載せた
+    // spurious な quality-only on_change バッチが先に届きうるレース(H7 ⑤ -
+    // grpc.rs の drain_until_value で直した gRPC 姉妹テストと同一。PR #139 参照)
+    // を、値 42 を載せたバッチが来るまで recv_matching の述語で drain して吸収する。
     sim.set_holding_register(0, 42);
-    let changed = recv_matching(&mut ws, |m| m["op"] == "data" && m["id"] == 1).await;
+    let changed = recv_matching(&mut ws, |m| {
+        m["op"] == "data" && m["id"] == 1 && m["values"][0]["v"] == 42.0
+    })
+    .await;
     let values = changed["values"].as_array().unwrap();
     assert_eq!(values.len(), 1);
     assert_eq!(values[0]["tag"], "line1.fast.temp01");
