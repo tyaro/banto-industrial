@@ -86,3 +86,31 @@ export function writePermissionLabel(tagKind: TagKind, writable: boolean): strin
 	if (tagKind === 'computed') return '不許可（演算タグは書き込み不可）';
 	return writable ? '許可' : '不許可';
 }
+
+/**
+ * T18-2b（TAG-UX-6「入力中に共通 preflight を実行する」）: サーバーが返す
+ * フィールドエラーの配列（`field`/`message` のペア）をフィールド名 →
+ * メッセージのマップへ畳み込む。もともと単票 create/edit の submit 時
+ * エラー処理（`+page.svelte::applyFieldErrors`）だけが持っていたロジック
+ * だが、単票の dry-run preflight（`createTagsBatch(..., dryRun=true)` の
+ * `BatchTagsResult.errors[n].fieldErrors`）も同じ `{field, message}[]` の
+ * 形（`@banto/admin-core::FieldError` / `tagRegistryAdmin.ts::BatchTagFieldError`
+ * と同型）を返すため、入力中プレビューと submit 時エラー表示の両方から
+ * 呼べるようここへ切り出した。
+ *
+ * TAG-P0-2 の preflight（`field: "configuration"` に全体エラーをまとめる
+ * 契約、`apps/banto-hub/core/src/rest.rs::preflight_api_error`）はどの
+ * 単票フィールドにも属さないため、メッセージに「アドレス」を含む場合は
+ * `address` キーにもコピーする（`errors.address` が未設定のときのみ -
+ * 将来アドレス欄自体のフィールドエラーが返るようになったら上書きしない）。
+ */
+export function fieldErrorsFromList(
+	fieldErrors: readonly { field: string; message: string }[]
+): Record<string, string> {
+	const map: Record<string, string> = {};
+	for (const fe of fieldErrors) map[fe.field] = fe.message;
+	if (map.configuration && !map.address && map.configuration.includes('アドレス')) {
+		map.address = map.configuration;
+	}
+	return map;
+}

@@ -74,8 +74,10 @@
 		hasFieldError,
 		buildConfirmExternalName,
 		environmentLabel,
-		writePermissionLabel
+		writePermissionLabel,
+		fieldErrorsFromList
 	} from '$lib/banto/tagFormLayout';
+	import { addressHelpFor } from '$lib/banto/tagAddressHelp';
 	import { isFormDirty } from '$lib/banto/formDirty';
 	import {
 		buildExternalName,
@@ -416,12 +418,7 @@
 	 */
 	function applyFieldErrors(err: unknown): Record<string, string> | null {
 		if (isProviderError(err) && err.body.kind === 'validation') {
-			const map: Record<string, string> = {};
-			for (const fe of err.body.field_errors) map[fe.field] = fe.message;
-			if (map.configuration && !map.address && map.configuration.includes('アドレス')) {
-				map.address = map.configuration;
-			}
-			return map;
+			return fieldErrorsFromList(err.body.field_errors);
 		}
 		return null;
 	}
@@ -434,6 +431,7 @@
 			toastStore.push('success', '作成しました');
 			createForm = blankForm();
 			createBaseline = blankForm();
+			createAddressPreflight = blankAddressPreflight();
 			await reload();
 		} catch (err) {
 			const fieldErrors = applyFieldErrors(err);
@@ -471,6 +469,72 @@
 	}
 	let createDetailOpen: DetailOpenState = $state(blankDetailOpen());
 	let editDetailOpen: DetailOpenState = $state(blankDetailOpen());
+
+	/**
+	 * T18-2b（docs/banto-hub-t18-design.md「T18-2b プロトコル別アドレス補助」、
+	 * TAG-UX-6「入力中に共通 preflight を実行する」）: アドレス入力中の
+	 * デバウンス dry-run 検証状態。新規バックエンドは作らず、連続登録/CSV
+	 * インポートが使っているのと同じ `createTagsBatch(tags, dryRun=true)`
+	 * （`POST /api/tags/batch`）を単票1件で呼ぶ。`checkedFor` は最後に検証を
+	 * 実行した時点の `toInput(form)` の JSON（`continuousTagsJson`/
+	 * `csvTagsJson` の「鮮度」判定と同じ発想 - ただしここでは登録可否の
+	 * ゲートには使わず、あくまで参考表示なので `$derived` の fresh 判定までは
+	 * 持たない）。`result` が `null` のままなのは「まだ検証していない/
+	 * 検証条件を満たさない」と「ネットワークエラーで検証できなかった」の
+	 * 両方 - 入力中の補助表示であり、実際の正しさの最終防衛は既存どおり
+	 * submit 時の preflight（`applyFieldErrors`）なので、ここで通信エラーを
+	 * トーストで騒がしく出したりはしない。
+	 */
+	interface AddressPreflightState {
+		checking: boolean;
+		result: BatchTagsResult | null;
+	}
+	function blankAddressPreflight(): AddressPreflightState {
+		return { checking: false, result: null };
+	}
+	let createAddressPreflight: AddressPreflightState = $state(blankAddressPreflight());
+	let editAddressPreflight: AddressPreflightState = $state(blankAddressPreflight());
+	let addressPreflightTimer: ReturnType<typeof setTimeout> | undefined;
+
+	/**
+	 * アドレス欄の `oninput` から呼ぶ。名前・収集グループ・アドレスの
+	 * いずれかが未入力ならまだ有効なプレビュー対象を作れないので、直前の
+	 * 結果を消して何もしない（グループ未選択で protocol が定まらない状態の
+	 * dry-run は「configuration」エラーが名前欄の空欄理由で埋まるだけの
+	 * ノイズになるため）。400ms のデバウンスはタイプ中の連打で毎打鍵
+	 * `/api/tags/batch` を叩かないようにするための単純なタイマー -
+	 * 連続登録の「検証」ボタン（明示クリック）と違い、これは自動発火なので
+	 * 控えめな間隔にしている。
+	 */
+	function scheduleAddressPreflight(form: FormState, target: 'create' | 'edit'): void {
+		if (addressPreflightTimer !== undefined) clearTimeout(addressPreflightTimer);
+		const ready =
+			form.tagKind === 'plc' &&
+			form.name.trim() !== '' &&
+			form.collectionGroupId !== '' &&
+			form.address.trim() !== '';
+		if (!ready) {
+			if (target === 'create') createAddressPreflight = blankAddressPreflight();
+			else editAddressPreflight = blankAddressPreflight();
+			return;
+		}
+		addressPreflightTimer = setTimeout(() => void runAddressPreflight(form, target), 400);
+	}
+
+	async function runAddressPreflight(form: FormState, target: 'create' | 'edit'): Promise<void> {
+		if (target === 'create') createAddressPreflight = { ...createAddressPreflight, checking: true };
+		else editAddressPreflight = { ...editAddressPreflight, checking: true };
+		let result: BatchTagsResult | null;
+		try {
+			result = await createTagsBatch([toInput(form)], true);
+		} catch {
+			// 通信エラー等はここでは無視する - このコメント直上の型doc参照。
+			result = null;
+		}
+		const next: AddressPreflightState = { checking: false, result };
+		if (target === 'create') createAddressPreflight = next;
+		else editAddressPreflight = next;
+	}
 
 	/**
 	 * これらの `$effect` は該当セクションにエラーが**新たに現れたときだけ
@@ -515,6 +579,7 @@
 		editBaseline = formFromTag(t);
 		editErrors = {};
 		editConflict = null;
+		editAddressPreflight = blankAddressPreflight();
 		drawerMode = 'edit'; // T13-1: 行クリック編集はドロワーで開く
 	}
 
@@ -533,6 +598,7 @@
 			// 変更は無くなったので直後の dirty 判定は false になる。
 			editForm = formFromTag(updated);
 			editBaseline = formFromTag(updated);
+			editAddressPreflight = blankAddressPreflight();
 			// T18-1（TAG-UX-C 4点目、差分表示 UI）: 競合パネル表示中に
 			// フォームを直接編集して再送信（コンフリクトの解決ボタンを経由
 			// しない経路）しても保存が成功したら差分パネルは消す - パネルが
@@ -740,6 +806,7 @@
 		createForm = blankForm();
 		createBaseline = blankForm();
 		createErrors = {};
+		createAddressPreflight = blankAddressPreflight();
 		editConflict = null;
 		drawerMode = 'create';
 	}
@@ -763,6 +830,10 @@
 		// 状態も破棄する（`confirmDiscardIfNeeded` 経由の破棄確認は
 		// `onRequestClose` が既に済ませている — ここは後始末のみ）。
 		editConflict = null;
+		// T18-2b: 保留中のデバウンス preflight があれば止める - 閉じた後の
+		// Drawer に対して古い結果が届いても表示先が無いので無害だが、
+		// 不要な `/api/tags/batch` 呼び出し自体を止めておく。
+		if (addressPreflightTimer !== undefined) clearTimeout(addressPreflightTimer);
 	}
 
 	// T18-1: 画面遷移（サイドバーの他画面リンク等）でも Esc/× と同じ破棄
@@ -1097,7 +1168,13 @@
 	];
 </script>
 
-{#snippet tagFields(form: FormState, errors: Record<string, string>, detailOpen: DetailOpenState)}
+{#snippet tagFields(
+	form: FormState,
+	errors: Record<string, string>,
+	detailOpen: DetailOpenState,
+	addressPreflight: AddressPreflightState,
+	onAddressInput: () => void
+)}
 	<!--
 		TAG-P0-2（docs/banto-hub-desktop-plan.md §9.3、2026-08-10 実装メモ）:
 		preflight 失敗（field="configuration"）はどの単票フィールドにも
@@ -1192,24 +1269,88 @@
 			{#if errors.name}<span class="err" id="tag-name-err">{errors.name}</span>{/if}
 		</label>
 		{#if form.tagKind === 'plc'}
-			<label class="field">
-				アドレス<span class="required">*</span>
+			<!--
+				T18-2b（docs/banto-hub-t18-design.md「T18-2b プロトコル別アドレス
+				補助」、TAG-UX-6）: 選択中の収集グループが属する接続の
+				`protocol`（`slmp`/`modbus-tcp`/未選択）と `dataType` から、
+				アドレス例・対応デバイス・占有範囲・bit 指定可否をここで
+				切り替える。マッピング自体は依存ゼロの純関数
+				`$lib/banto/tagAddressHelp.ts::addressHelpFor` に切り出してあり
+				（受け入れ条件「Modbus 選択時に D100 を推奨例にしない」は
+				そちら側のユニットテストで固定）、ここは表示だけを担う。
+				`preflightFieldErrors`/`preflightMessage` は入力中の
+				デバウンス dry-run 検証（`scheduleAddressPreflight`/
+				`runAddressPreflight`、同じ preflight 契約
+				`createTagsBatch(..., dryRun=true)` を流用）の表示 - 送信時の
+				`errors.address`（`tag-address-err`）とは別枠で、送信前の
+				参考表示として `tag-address-preflight` に出す。
+
+				他フィールドと違いここだけ `<label class="field">` で
+				input を包まず `<div class="field">` + 明示 `<label for>` に
+				している - アドレス例・デバイス一覧・bit 指定ヒントの文章量が
+				多く、暗黙ラベル（label の子孫テキスト全体が accessible name
+				になる）のままだと「収集グループ」「単位」等、他フィールドの
+				ラベル文言をヒント文中にたまたま含んだ瞬間 `getByLabel` が
+				両方にマッチしてしまう（実 DOM 検証で発覚 - ヒント文に
+				「収集グループ」を含めた版で
+				`banto-hub-tags-form.spec.ts`/`banto-hub-tags-p0-2-preflight.spec.ts`
+				が、「ビット単位」を含めた版で `banto-hub-tags-revision.spec.ts`
+				がそれぞれ多重マッチで落ちた）。`<label for>` で名前を
+				「アドレス」だけに固定すれば、ヒント文の言葉選びに関わらず
+				安全。
+			-->
+			{@const protocol = connectionForGroupId(form.collectionGroupId)?.protocol}
+			{@const addressHelp = addressHelpFor(protocol, form.dataType)}
+			{@const preflightFieldErrors = addressPreflight.result
+				? fieldErrorsFromList(addressPreflight.result.errors[0]?.fieldErrors ?? [])
+				: {}}
+			{@const preflightMessage = addressPreflight.checking
+				? '確認中…'
+				: addressPreflight.result?.ok
+					? '検証OK'
+					: (preflightFieldErrors.address ?? null)}
+			<div class="field">
+				<label for="tag-address">アドレス<span class="required">*</span></label>
 				<input
 					id="tag-address"
 					type="text"
 					bind:value={form.address}
+					oninput={onAddressInput}
 					required
-					placeholder="D100（ビット: D100.5）"
+					placeholder={addressHelp.placeholder}
 					aria-invalid={errors.address ? 'true' : undefined}
-					aria-describedby={describedBy('tag-address-hint', errors.address && 'tag-address-err')}
+					aria-describedby={describedBy(
+						'tag-address-hint',
+						addressHelp.examples.length > 0 && 'tag-address-examples',
+						'tag-address-bit-hint',
+						preflightMessage !== null && 'tag-address-preflight',
+						errors.address && 'tag-address-err'
+					)}
 				/>
 				<span class="hint" id="tag-address-hint"
-					>ワードデバイスの特定ビットを読み書きするときは「D100.5」のように「.」+ビット位置（0〜15、Modbus
-					は「40001.3」）を付けます。「D100.5」でワードの5ビット目。ビット指定アドレスは data_type =
-					bit のタグでのみ使えます。</span
+					>{addressHelp.deviceHint}{#if addressHelp.occupancyHint !== ''}
+						{addressHelp.occupancyHint}{/if}</span
 				>
+				{#if addressHelp.examples.length > 0}
+					<span class="hint" id="tag-address-examples"
+						>例: {addressHelp.examples
+							.map((e) => `${e.address}（${e.description}）`)
+							.join('、')}</span
+					>
+				{/if}
+				<span class="hint" id="tag-address-bit-hint">{addressHelp.bitHint}</span>
+				{#if preflightMessage !== null}
+					<span
+						class="hint address-preflight"
+						class:address-preflight-checking={addressPreflight.checking}
+						class:address-preflight-ok={addressPreflight.result?.ok === true}
+						class:address-preflight-error={addressPreflight.result?.ok === false}
+						id="tag-address-preflight"
+						aria-live="polite">{preflightMessage}</span
+					>
+				{/if}
 				{#if errors.address}<span class="err" id="tag-address-err">{errors.address}</span>{/if}
-			</label>
+			</div>
 		{/if}
 		{#if form.tagKind === 'computed'}
 			<label class="field wide">
@@ -1720,7 +1861,9 @@
 				void handleCreate();
 			}}
 		>
-			{@render tagFields(createForm, createErrors, createDetailOpen)}
+			{@render tagFields(createForm, createErrors, createDetailOpen, createAddressPreflight, () =>
+				scheduleAddressPreflight(createForm, 'create')
+			)}
 			<div class="actions">
 				<button type="submit" disabled={isDrawerBusy() || groups.length === 0}>作成</button>
 			</div>
@@ -1787,7 +1930,9 @@
 					</div>
 				</div>
 			{/if}
-			{@render tagFields(editForm, editErrors, editDetailOpen)}
+			{@render tagFields(editForm, editErrors, editDetailOpen, editAddressPreflight, () =>
+				scheduleAddressPreflight(editForm, 'edit')
+			)}
 			<div class="actions">
 				<button type="submit" disabled={isDrawerBusy()}>保存</button>
 				<button type="button" class="danger" onclick={handleDelete} disabled={isDrawerBusy()}
@@ -2135,6 +2280,24 @@
 	.err {
 		color: var(--banto-danger);
 		font-size: 0.75rem;
+	}
+
+	/*
+	 * T18-2b（TAG-UX-6「入力中に共通 preflight を実行する」）: アドレス欄の
+	 * デバウンス dry-run 検証の参考表示。送信時の `.err`（固定でエラー色）
+	 * と違い、確認中/OK/エラーの3状態を持つのでそれぞれ控えめな色分けに
+	 * する。
+	 */
+	.address-preflight-checking {
+		color: var(--banto-text-muted);
+	}
+
+	.address-preflight-ok {
+		color: var(--banto-success, #1a7f37);
+	}
+
+	.address-preflight-error {
+		color: var(--banto-danger);
 	}
 
 	/*

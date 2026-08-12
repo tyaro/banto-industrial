@@ -11,7 +11,8 @@ import {
 	hasFieldError,
 	buildConfirmExternalName,
 	environmentLabel,
-	writePermissionLabel
+	writePermissionLabel,
+	fieldErrorsFromList
 } from './tagFormLayout';
 
 describe('hasFieldError', () => {
@@ -142,5 +143,47 @@ describe('writePermissionLabel', () => {
 
 	it('internal かつ writable=false は不許可', () => {
 		expect(writePermissionLabel('internal', false)).toBe('不許可');
+	});
+});
+
+describe('fieldErrorsFromList', () => {
+	it('field/message のペアをフィールド名でマップ化する', () => {
+		expect(
+			fieldErrorsFromList([
+				{ field: 'name', message: '必須です' },
+				{ field: 'address', message: '不正なアドレスです' }
+			])
+		).toEqual({ name: '必須です', address: '不正なアドレスです' });
+	});
+
+	it('空配列なら空オブジェクト', () => {
+		expect(fieldErrorsFromList([])).toEqual({});
+	});
+
+	it('configuration にアドレスを含むメッセージがあり address 未設定なら address にもコピーする', () => {
+		expect(
+			fieldErrorsFromList([{ field: 'configuration', message: 'アドレスの形式が不正です' }])
+		).toEqual({
+			configuration: 'アドレスの形式が不正です',
+			address: 'アドレスの形式が不正です'
+		});
+	});
+
+	it('address が既に設定されていれば configuration の内容で上書きしない', () => {
+		expect(
+			fieldErrorsFromList([
+				{ field: 'address', message: '個別のアドレスエラー' },
+				{ field: 'configuration', message: 'アドレスの形式が不正です' }
+			])
+		).toEqual({
+			address: '個別のアドレスエラー',
+			configuration: 'アドレスの形式が不正です'
+		});
+	});
+
+	it('configuration にアドレスを含まないメッセージなら address へコピーしない', () => {
+		expect(
+			fieldErrorsFromList([{ field: 'configuration', message: '式の評価に失敗しました' }])
+		).toEqual({ configuration: '式の評価に失敗しました' });
 	});
 });
