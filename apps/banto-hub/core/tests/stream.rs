@@ -1033,19 +1033,31 @@ async fn a_slow_subscriber_gets_disconnected_once_the_outbound_queue_fills() {
     sim.set_holding_register(0, 999);
 
     // The server must close the connection - reading further eventually
-    // yields a Close frame (or the stream simply ends).
-    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+    // yields a Close frame (or the stream simply ends). T18-4b (banto-hub-t18
+    // -design.md「T18-4b 選択購読と再接続堅牢化」): the monitor UI shows a
+    // dedicated message when the disconnect is specifically the backpressure
+    // close code (1013, `stream.rs::BACKPRESSURE_CLOSE_CODE`) rather than a
+    // generic reconnect, so this test also pins the wire-level code - not
+    // just "some" disconnect happened.
+    let close_frame = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             match ws.next().await {
-                Some(Ok(WsMessage::Close(_))) | None => return true,
+                Some(Ok(WsMessage::Close(frame))) => return frame,
                 Some(Ok(_)) => continue,
-                Some(Err(_)) => return true,
+                Some(Err(_)) | None => return None,
             }
         }
     })
     .await
-    .unwrap_or(false);
-    assert!(closed, "server should disconnect a slow subscriber");
+    .unwrap_or(None);
+
+    let frame = close_frame
+        .expect("server should disconnect a slow subscriber with a Close frame carrying a code");
+    assert_eq!(
+        u16::from(frame.code),
+        1013,
+        "backpressure disconnect should use close code 1013: {frame:?}"
+    );
 
     sim.stop();
 }
@@ -1332,6 +1344,87 @@ async fn wildcard_subscription_with_bare_read_scope_receives_every_tag() {
         ],
         "a bare `read` key must keep receiving every tag (S2 backward compat)"
     );
+
+    sim.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 11. T18-4b（docs/banto-hub-t18-design.md「T18-4b 選択購読と再接続堅牢化」、
+//     TAG-UX-H の一部）: グループワイルドカード購読
+//     (`"{connection}.{group}.*"`、`subscribe_core.rs::TagPattern::GroupWildcard`)
+//     は宣言したグループのタグだけを対象にする - banto-hub のモニタ画面が
+//     ツリーでグループを選んだときに送る購読と同じ形。テスト10系と同じ
+//     `seed_two_connections_two_tags` フィクスチャ（別接続・別グループの2タグ）
+//     を流用し、テスト10 `wildcard_subscription_with_per_tag_read_scope_...`
+//     の「スコープ外は届かない/スコープ内は届く」検証パターンをそのまま
+//     踏襲する。
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn group_wildcard_subscription_only_receives_its_own_group_tag() {
+    let app = test_app("group-wildcard-scope").await;
+    let sim = Simulator::start().await;
+    sim.set_holding_register(0, 1); // line1.fast.temp01 (40001)
+    sim.set_holding_register(1, 2); // line2.slow.press01 (40002)
+
+    seed_two_connections_two_tags(&app, sim.addr.port()).await;
+    app.manager.rebuild().await.expect("rebuild after seeding");
+
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            app.manager
+                .current_values()
+                .and_then(|c| c.get("tag:1"))
+                .map(|s| s.value)
+                == Some(Some(1.0))
+                && app
+                    .manager
+                    .current_values()
+                    .and_then(|c| c.get("tag:2"))
+                    .map(|s| s.value)
+                    == Some(Some(2.0))
+        })
+        .await,
+        "collector should observe both seeded tags"
+    );
+
+    let mut ws = connect_ws(&app.ws_url("/api/v1/stream"), Some(&app.token))
+        .await
+        .expect("ws handshake should succeed");
+
+    send_json(
+        &mut ws,
+        json!({ "op": "subscribe", "id": 1, "tags": ["line1.fast.*"], "mode": "on_change" }),
+    )
+    .await;
+
+    let snapshot = recv_matching(&mut ws, |m| m["op"] == "data" && m["id"] == 1).await;
+    let values = snapshot["values"].as_array().unwrap();
+    assert_eq!(
+        values.len(),
+        1,
+        "group wildcard subscription must resolve only its own group's tag: {values:?}"
+    );
+    assert_eq!(values[0]["tag"], "line1.fast.temp01");
+
+    // 別グループ(line2.slow.press01)の値変更は届かない。
+    sim.set_holding_register(1, 99);
+    tokio::time::sleep(Duration::from_millis(400)).await; // give the eval loop a chance to (wrongly) fire
+    assert_no_more_data_for(&mut ws, 1).await;
+
+    // 自グループ(line1.fast.temp01)の値変更は引き続き届く。旧値(1)を載せた
+    // spurious な quality-only on_change バッチが先に届きうるレース(テスト10
+    // と同じ理由・同じ対策)を、値 42 を載せたバッチが来るまで recv_matching
+    // の述語で drain して吸収する。
+    sim.set_holding_register(0, 42);
+    let changed = recv_matching(&mut ws, |m| {
+        m["op"] == "data" && m["id"] == 1 && m["values"][0]["v"] == 42.0
+    })
+    .await;
+    let values = changed["values"].as_array().unwrap();
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["tag"], "line1.fast.temp01");
+    assert_eq!(values[0]["v"], 42.0);
 
     sim.stop();
 }

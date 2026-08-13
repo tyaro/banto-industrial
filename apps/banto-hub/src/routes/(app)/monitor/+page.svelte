@@ -23,8 +23,20 @@
 	 * 一覧 API から読むだけの補助データで、値表示自体は従来どおり
 	 * catalog（`rows`）+ WS が正。絞り込みロジックは依存ゼロの純関数
 	 * `filterMonitorRows`（`$lib/banto/monitorFilter.ts`）に切り出してある。
-	 * WS 購読のロジック（`connectTagStream` 呼び出し）自体は変更していない
-	 * （購読最適化は T18-4b の別スライス）。
+	 *
+	 * T18-4b（docs/banto-hub-t18-design.md「T18-4b 選択購読と再接続堅牢化」、
+	 * TAG-UX-H の一部）: T18-4a まで WS 購読（`connectTagStream`）は常に
+	 * 全タグ購読（`tags:['*']`）で、ツリー選択は表示絞り込み
+	 * （`filterMonitorRows`）にしか使っていなかった。ここから購読自体も
+	 * ツリー選択に合わせて絞る - `monitorSubscription.ts::subscriptionPatternsFor`
+	 * が `treeFilter`/`connections`/`groups` からサーバー向けパターン文字列を
+	 * 組み立て、`connectTagStream` の第2引数（`getSubscriptionTags`）として
+	 * 渡す。加えて、①WS バックプレッシャ切断（close code 1013）を通常の
+	 * 再接続と区別して表示し、②再接続時は初期スナップショット受信まで
+	 * 「現在値」を古いまま出さず stale 扱いする（`awaitingSnapshot`）。
+	 * どちらも `row.v`/`row.q`/`row.t` 自体は書き換えず、表示用ヘルパー
+	 * `displayQuality`/`displayValue` でラップするだけ - 再接続後の初期
+	 * スナップショットが届けば通常どおり上書きされる。
 	 *
 	 * 権限: relay-wright のモニタは書き込みセルを editor 以上に限定するが、
 	 * この画面には書き込み要素が無いため viewer を含む全ロールが無条件で
@@ -47,6 +59,7 @@
 		type Tag
 	} from '$lib/banto/tagRegistryAdmin';
 	import { filterMonitorRows, type MonitorTreeFilter } from '$lib/banto/monitorFilter';
+	import { subscriptionPatternsFor } from '$lib/banto/monitorSubscription';
 	import SplitPane from '$lib/components/SplitPane.svelte';
 	import ConnectionTree from '$lib/components/ConnectionTree.svelte';
 	import type { ConnectionTreeNodeData } from '$lib/components/connectionTreeTypes';
@@ -69,6 +82,14 @@
 	let loading = $state(true);
 	let loadError = $state<string | null>(null);
 	let wsConnected = $state(false);
+	/** T18-4b: 直近の切断がバックプレッシャ切断（close code 1013、
+	 * `stream.rs::BACKPRESSURE_CLOSE_CODE`）だったか。再接続成功で解除する。 */
+	let wsBackpressure = $state(false);
+	/** T18-4b: 接続確立/購読変更（resubscribe）直後から初期スナップショット
+	 * （最初の onData）を受けるまでの間 true。true の間、行の表示は
+	 * `displayQuality`/`displayValue` で stale 相当に強制する（`row.v`/`q`/`t`
+	 * 自体は書き換えない）。 */
+	let awaitingSnapshot = $state(true);
 
 	/** 直近で値/品質が変化した外部名（一時的なハイライト表示用）。 */
 	let flashing = $state<Record<string, boolean>>({});
@@ -144,30 +165,12 @@
 		});
 	}
 
-	$effect(() => {
-		void reloadCatalog();
-		void reloadAdmin();
-
-		const disconnect = connectTagStream({
-			onData: applyStreamData,
-			onConfigChanged: () => {
-				void reloadCatalog();
-				void reloadAdmin();
-			},
-			onStatusChange: (connected) => {
-				wsConnected = connected;
-			}
-		});
-
-		return () => {
-			disconnect();
-		};
-	});
-
 	// --- T18-4a: ツリー選択 + 検索（クライアント側のみ・再取得なし） --------
 	//
 	// tags ページの `TreeFilter`/`handleTreeSelect`/`treeSelectedId` と同じ
-	// 形（`monitorFilter.ts` 冒頭の doc comment 参照）。
+	// 形（`monitorFilter.ts` 冒頭の doc comment 参照）。`treeFilter` は
+	// T18-4b で購読範囲（`subscriptionPatternsFor`）にも使うため、接続を
+	// 張る $effect より先に宣言する。
 
 	let treeFilter: MonitorTreeFilter = $state({ type: 'all' });
 	let searchQuery = $state('');
@@ -184,6 +187,72 @@
 			treeFilter = { type: 'connection', id: data.connection.id };
 		else treeFilter = { type: 'group', id: data.group.id };
 	}
+
+	// --- T18-4b: WS 接続（1本を維持） --------------------------------------
+	//
+	// `streamResubscribe` はこの $effect が張ったソケットの `resubscribe`
+	// を、下のツリー選択監視 $effect から呼べるように保持するだけの素の
+	// クロージャ参照（`$state` にする必要はない - 参照する側は `treeFilter`
+	// の変化にだけ反応すればよく、この変数自体の再代入を検知する必要は
+	// 無いため）。
+
+	let streamResubscribe: (() => void) | null = null;
+
+	$effect(() => {
+		void reloadCatalog();
+		void reloadAdmin();
+
+		const { disconnect, resubscribe } = connectTagStream(
+			{
+				onData: (values) => {
+					applyStreamData(values);
+					// 初期スナップショット（またはそれ以降の on_change）を
+					// 1回でも受けたら stale 強制表示を解除する。
+					awaitingSnapshot = false;
+				},
+				onConfigChanged: () => {
+					void reloadCatalog();
+					void reloadAdmin();
+				},
+				onStatusChange: (connected, closeCode) => {
+					wsConnected = connected;
+					if (connected) {
+						// 再接続確立 - 新しい購読の初期スナップショットが
+						// 届くまで stale 表示にし、バックプレッシャ表示は
+						// 解除する。
+						wsBackpressure = false;
+						awaitingSnapshot = true;
+					} else if (closeCode === 1013) {
+						// `stream.rs::BACKPRESSURE_CLOSE_CODE` - 送信キュー
+						// 溢れによる強制切断。通常の再接続中表示とは別の
+						// 文言を出す（テンプレート参照）。
+						wsBackpressure = true;
+					}
+				}
+			},
+			() => subscriptionPatternsFor(treeFilter, connections, groups)
+		);
+		streamResubscribe = resubscribe;
+
+		return () => {
+			streamResubscribe = null;
+			disconnect();
+		};
+	});
+
+	// --- T18-4b: ツリー選択の変更を購読に反映する（再接続はしない） --------
+	//
+	// 接続そのものは上の $effect が1本維持する - ここは `treeFilter` が
+	// 変わるたびに既存ソケット上で unsubscribe→再 subscribe するだけ
+	// （`connectTagStream` の doc comment 参照）。マウント直後にも1回走るが、
+	// その時点ではソケットがまだ開いていないことが多く `resubscribe()` は
+	// no-op になる（次の onopen が現行の `treeFilter` で購読するので問題
+	// ない）。
+	$effect(() => {
+		void treeFilter;
+		streamResubscribe?.();
+		awaitingSnapshot = true;
+	});
 
 	const filteredRows = $derived(filterMonitorRows(rows, treeFilter, searchQuery));
 
@@ -209,6 +278,20 @@
 		return row.unit ? `${row.v} ${row.unit}` : String(row.v);
 	}
 
+	/** T18-4b: `awaitingSnapshot` の間は `row.q` を書き換えずに表示上だけ
+	 * `'stale'` 扱いする（`qualityClass`/`qualityLabel` はそのまま使い回す）。 */
+	function displayQuality(row: Row): string {
+		return awaitingSnapshot ? 'stale' : row.q;
+	}
+
+	/** T18-4b: `displayQuality` と対になる値表示版。`row.v`/`row.t` 自体は
+	 * 保持したまま、`awaitingSnapshot` の間だけ `formatValue` の
+	 * 「品質が good でない」の分岐と同じ `'--'` を返す。 */
+	function displayValue(row: Row): string {
+		if (awaitingSnapshot) return '--';
+		return formatValue(row);
+	}
+
 	function formatTime(epochMs: number): string {
 		if (!epochMs) return '--';
 		return new Date(epochMs).toLocaleString('ja-JP');
@@ -221,11 +304,17 @@
 		<p class="note">
 			登録済みタグの現在値をリアルタイム表示します（WebSocket購読、書き込み機能はありません）。
 		</p>
-		<p class="note status-line">
+		<p class="note status-line" class:status-warning={!wsConnected && wsBackpressure}>
 			<span class="ws-dot" class:on={wsConnected} class:off={!wsConnected}></span>
-			{wsConnected
-				? '接続中（リアルタイム更新中）'
-				: '再接続中…（値は最後の受信内容のまま停止しています）'}
+			{#if wsConnected}
+				接続中（リアルタイム更新中）
+			{:else if wsBackpressure}
+				<!-- T18-4b: BACKPRESSURE_CLOSE_CODE (1013) - 送信キュー溢れによる
+					強制切断。通常の再接続中と見た目・文言を変えて区別する。 -->
+				サーバーが遅い購読者として切断しました（自動再接続中…）
+			{:else}
+				再接続中…（値は最後の受信内容のまま停止しています）
+			{/if}
 		</p>
 
 		{#if loadError}
@@ -303,8 +392,12 @@
 													{/if}
 												</td>
 												<td>{row.group}</td>
-												<td class="value quality-{qualityClass(row.q)}">{formatValue(row)}</td>
-												<td class="quality quality-{qualityClass(row.q)}">{qualityLabel(row.q)}</td>
+												<td class="value quality-{qualityClass(displayQuality(row))}"
+													>{displayValue(row)}</td
+												>
+												<td class="quality quality-{qualityClass(displayQuality(row))}"
+													>{qualityLabel(displayQuality(row))}</td
+												>
 												<td>{formatTime(row.t)}</td>
 											</tr>
 										{/each}
@@ -374,6 +467,12 @@
 		display: flex;
 		align-items: center;
 		gap: 0.4rem;
+	}
+
+	/* T18-4b: バックプレッシャ切断（1013）は通常の再接続中と文言だけでなく
+	   色でも区別する - 既存の .ws-dot.off と同じ --banto-danger を流用。 */
+	.status-line.status-warning {
+		color: var(--banto-danger);
 	}
 
 	.ws-dot {
