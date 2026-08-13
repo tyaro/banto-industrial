@@ -118,8 +118,15 @@ export async function getCatalog(): Promise<CatalogResponse> {
 export interface TagStreamHandlers {
 	onData: (values: StreamValue[]) => void;
 	onConfigChanged: (revision: number) => void;
-	/** 接続確立/切断のたびに呼ばれる（画面側が「値が古いかも」を示すため）。 */
-	onStatusChange?: (connected: boolean) => void;
+	/**
+	 * 接続確立/切断のたびに呼ばれる（画面側が「値が古いかも」を示すため）。
+	 * T18-4b: 切断時（`connected: false`）は `CloseEvent.code` を
+	 * `closeCode` として渡す - 画面側がバックプレッシャ切断
+	 * （`BACKPRESSURE_CLOSE_CODE` = 1013、`stream.rs` 参照）を通常の再接続と
+	 * 区別して表示できるようにするため。`connected: true` の呼び出しでは
+	 * 意味を持たないので渡さない（undefined でよい）。
+	 */
+	onStatusChange?: (connected: boolean, closeCode?: number) => void;
 }
 
 const RECONNECT_BASE_DELAY_MS = 1000;
@@ -135,21 +142,45 @@ function streamUrl(): string {
 }
 
 /**
- * `/api/v1/stream` への購読を開始する（常に `tags: ["*"]`・
- * `mode: "on_change"` - このページはフィルタを画面側で行うので購読自体は
- * 全タグを対象にする）。戻り値は破棄関数（ソケットを閉じ、保留中の再接続
- * タイマーを止める）。
+ * `/api/v1/stream` への購読を開始する。T18-4b までは常に `tags: ["*"]`
+ * 固定だったが、以後は `getSubscriptionTags()`（呼び出し側が
+ * `monitorSubscription.ts::subscriptionPatternsFor` 等で組み立てる）の
+ * 戻り値を購読対象にする - 画面側のツリー選択に合わせて購読範囲を絞れる
+ * ようにするため（`mode` は引き続き常に `"on_change"`）。`getSubscriptionTags`
+ * は呼ぶたびに最新の絞り込み結果を返す関数を渡す想定（`$derived` 相当を
+ * クロージャで包んだもの）で、このモジュール自身は絞り込みロジックを
+ * 持たない。
+ *
+ * 戻り値は `{ disconnect, resubscribe }`:
+ * - `disconnect()`: ソケットを閉じ、保留中の再接続タイマーを止める
+ *   （旧 API の戻り値そのもの）。
+ * - `resubscribe()`: 購読範囲（`getSubscriptionTags()` の結果）が変わった
+ *   ときに呼ぶ。ソケットが開いていれば現在の購読 id を unsubscribe した上で
+ *   id をインクリメントして新しい範囲で再 subscribe する。ソケットが
+ *   未接続（`ws === null` または `readyState !== OPEN`）なら何もしない -
+ *   次に張られるソケットの `onopen` がその時点の `getSubscriptionTags()` の
+ *   結果で購読するので、ここで何もしなくても最終的に正しい範囲に収束する
+ *   （no-op で十分という設計）。
+ *
+ * 購読 id はこの関数のクロージャ内で単調増加させる1つの変数として持つ
+ * （初期値1）。新しいソケットが繋がった（再接続含む）だけでは増やさない -
+ * その時点の id で最初の subscribe を送るだけで、増やすのは
+ * `resubscribe()` が unsubscribe→再 subscribe するときだけ。
  *
  * 再接続は `events.ts::createSseEventProvider` と同じ形（`AbortController`
  * の代わりに `WebSocket.close()`、`setTimeout` ベースの指数バックオフ、
  * トークン未取得時は短い間隔で再試行）を踏襲する - このリポジトリで最初の
  * ブラウザ WS クライアントなので、既存の WS 固有の前例はまだない。
  */
-export function connectTagStream(handlers: TagStreamHandlers): () => void {
+export function connectTagStream(
+	handlers: TagStreamHandlers,
+	getSubscriptionTags: () => string[]
+): { disconnect: () => void; resubscribe: () => void } {
 	let stopped = false;
 	let ws: WebSocket | null = null;
 	let timer: ReturnType<typeof setTimeout> | null = null;
 	let reconnectDelayMs = RECONNECT_BASE_DELAY_MS;
+	let subscriptionId = 1;
 
 	function scheduleReconnect(delayMs: number): void {
 		if (stopped) return;
@@ -176,7 +207,14 @@ export function connectTagStream(handlers: TagStreamHandlers): () => void {
 			}
 			reconnectDelayMs = RECONNECT_BASE_DELAY_MS;
 			handlers.onStatusChange?.(true);
-			socket.send(JSON.stringify({ op: 'subscribe', id: 1, tags: ['*'], mode: 'on_change' }));
+			socket.send(
+				JSON.stringify({
+					op: 'subscribe',
+					id: subscriptionId,
+					tags: getSubscriptionTags(),
+					mode: 'on_change'
+				})
+			);
 		};
 
 		socket.onmessage = (event) => {
@@ -196,14 +234,16 @@ export function connectTagStream(handlers: TagStreamHandlers): () => void {
 				const revision = (msg as { revision?: unknown }).revision;
 				if (typeof revision === 'number') handlers.onConfigChanged(revision);
 			}
-			// "event"/"pong"/"error" は無視 - このページは常に `*` を購読する
-			// ので unknown_tag 等のユーザー向けエラーは発生しない
+			// "event"/"pong"/"error" は無視 - `getSubscriptionTags()` は常に
+			// `*` かグループワイルドカード（`{connection}.{group}.*`）しか
+			// 返さない（`monitorSubscription.ts` 参照、具体名 `Exact` は
+			// 使わない）ので unknown_tag 等のユーザー向けエラーは発生しない
 			// (subscribe_core.rs: ワイルドカードは0件マッチでもエラーにしない)。
 		};
 
-		socket.onclose = () => {
+		socket.onclose = (ev: CloseEvent) => {
 			if (ws === socket) ws = null;
-			handlers.onStatusChange?.(false);
+			handlers.onStatusChange?.(false, ev.code);
 			if (stopped) return;
 			scheduleReconnect(reconnectDelayMs);
 			reconnectDelayMs = Math.min(reconnectDelayMs * 2, RECONNECT_MAX_DELAY_MS);
@@ -217,10 +257,29 @@ export function connectTagStream(handlers: TagStreamHandlers): () => void {
 
 	connectOnce();
 
-	return () => {
+	function disconnect(): void {
 		stopped = true;
 		if (timer !== null) clearTimeout(timer);
 		ws?.close();
 		ws = null;
-	};
+	}
+
+	function resubscribe(): void {
+		// ソケット未接続なら no-op - この関数の doc comment 参照（次の
+		// onopen が現行の getSubscriptionTags() の結果で購読するので
+		// 収束する）。
+		if (ws === null || ws.readyState !== WebSocket.OPEN) return;
+		ws.send(JSON.stringify({ op: 'unsubscribe', id: subscriptionId }));
+		subscriptionId += 1;
+		ws.send(
+			JSON.stringify({
+				op: 'subscribe',
+				id: subscriptionId,
+				tags: getSubscriptionTags(),
+				mode: 'on_change'
+			})
+		);
+	}
+
+	return { disconnect, resubscribe };
 }
