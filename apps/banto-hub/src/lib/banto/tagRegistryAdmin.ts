@@ -229,6 +229,14 @@ export interface TagInput {
 export const MIN_STRING_LENGTH = 1;
 export const MAX_STRING_LENGTH = 128;
 
+/**
+ * `decimals` bounds — mirrors `banto_tags::tag::{MIN_DECIMALS, MAX_DECIMALS}`
+ * (`crates/banto-tags/src/tag.rs`). T18-3e（BantoGrid セル編集）の
+ * `decimals` 列 `validate` が使う。
+ */
+export const MIN_DECIMALS = 0;
+export const MAX_DECIMALS = 6;
+
 // --- error plumbing (mirrors writeRegistryAdmin.ts) --------------------------
 
 const NETWORK_ERROR_MESSAGE = 'サーバーに接続できません';
