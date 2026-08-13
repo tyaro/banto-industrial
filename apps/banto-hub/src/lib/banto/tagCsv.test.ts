@@ -13,7 +13,13 @@
  */
 import { describe, expect, it, test } from 'vitest';
 import {
+	buildErrorRowsCsv,
+	buildTagCsvTemplate,
+	checkCsvRowLimit,
+	checkCsvSizeLimit,
 	exportTagsCsv,
+	MAX_CSV_BYTES,
+	MAX_CSV_ROWS,
 	parseCsv,
 	parseTagsCsv,
 	serializeCsv,
@@ -1155,5 +1161,139 @@ describe('parseTagsCsv', () => {
 			const rows = expectOk(parseTagsCsv(text, CONNECTIONS, GROUPS));
 			expect(rows[0].tag.name).toBe('Tag, "special"');
 		});
+	});
+});
+
+// ==============================================================================
+// buildTagCsvTemplate (T18-3d)
+// ==============================================================================
+
+describe('buildTagCsvTemplate', () => {
+	it('先頭に UTF-8 BOM(U+FEFF)が付く', () => {
+		expect(buildTagCsvTemplate().charCodeAt(0)).toBe(0xfeff);
+	});
+
+	it('ヘッダ行のみ(データ行なし)で TAG_CSV_COLUMNS どおり', () => {
+		const template = buildTagCsvTemplate();
+		const table = parseCsv(stripBom(template));
+		expect(table).toEqual([[...TAG_CSV_COLUMNS]]);
+	});
+
+	it('parseTagsCsv にそのまま通せる(データ行0件として受理される)', () => {
+		const template = buildTagCsvTemplate();
+		expect(parseTagsCsv(template, CONNECTIONS, GROUPS)).toEqual({ ok: true, rows: [] });
+	});
+});
+
+// ==============================================================================
+// buildErrorRowsCsv (T18-3d)
+// ==============================================================================
+
+describe('buildErrorRowsCsv', () => {
+	it('先頭に UTF-8 BOM(U+FEFF)が付く', () => {
+		const csv = buildErrorRowsCsv([{ lineNumber: 2, message: 'name は必須です。' }]);
+		expect(csv.charCodeAt(0)).toBe(0xfeff);
+	});
+
+	it('ヘッダ行が lineNumber/message + TAG_CSV_COLUMNS の順になる', () => {
+		const csv = buildErrorRowsCsv([]);
+		const [header] = parseCsv(stripBom(csv));
+		expect(header).toEqual(['lineNumber', 'message', ...TAG_CSV_COLUMNS]);
+	});
+
+	it('0件でもヘッダ行だけの CSV になる', () => {
+		const csv = buildErrorRowsCsv([]);
+		const table = parseCsv(stripBom(csv));
+		expect(table).toHaveLength(1);
+	});
+
+	it('lineNumber/message がそのまま出力される', () => {
+		const csv = buildErrorRowsCsv([
+			{ lineNumber: 2, message: 'name は必須です。' },
+			{ lineNumber: 5, message: 'dataType "xyz" は不正な値です。' }
+		]);
+		const table = parseCsv(stripBom(csv));
+		expect(table[1][0]).toBe('2');
+		expect(table[1][1]).toBe('name は必須です。');
+		expect(table[2][0]).toBe('5');
+		expect(table[2][1]).toBe('dataType "xyz" は不正な値です。');
+	});
+
+	it('original が渡されればそのまま TAG_CSV_COLUMNS の列順で後続列に出る', () => {
+		const original = row({ name: '' });
+		const csv = buildErrorRowsCsv([{ lineNumber: 2, message: 'name は必須です。', original }]);
+		const table = parseCsv(stripBom(csv));
+		expect(table[1].slice(2)).toEqual(original);
+	});
+
+	it('original が無い行は元データ列が全て空欄になる', () => {
+		const csv = buildErrorRowsCsv([{ lineNumber: 2, message: 'name は必須です。' }]);
+		const table = parseCsv(stripBom(csv));
+		expect(table[1].slice(2)).toEqual(TAG_CSV_COLUMNS.map(() => ''));
+	});
+
+	it('original が TAG_CSV_COLUMNS より短い場合、足りない列は空欄になる', () => {
+		const csv = buildErrorRowsCsv([
+			{ lineNumber: 2, message: 'エラー', original: ['ConnA', 'GroupX'] }
+		]);
+		const table = parseCsv(stripBom(csv));
+		expect(table[1][2]).toBe('ConnA');
+		expect(table[1][3]).toBe('GroupX');
+		expect(table[1][4]).toBe('');
+	});
+
+	it('複数行のエラーをまとめて1つの CSV にできる(再ダウンロード想定)', () => {
+		const csv = buildErrorRowsCsv([
+			{ lineNumber: 2, message: 'エラーA', original: row({ name: '' }) },
+			{ lineNumber: 3, message: 'エラーB', original: row({ dataType: 'xyz' }) }
+		]);
+		const table = parseCsv(stripBom(csv));
+		expect(table).toHaveLength(3);
+	});
+});
+
+// ==============================================================================
+// checkCsvSizeLimit / checkCsvRowLimit (T18-3d)
+// ==============================================================================
+
+describe('checkCsvSizeLimit', () => {
+	it('上限ちょうどは OK', () => {
+		expect(checkCsvSizeLimit(MAX_CSV_BYTES)).toEqual({ ok: true });
+	});
+
+	it('上限未満は OK', () => {
+		expect(checkCsvSizeLimit(MAX_CSV_BYTES - 1)).toEqual({ ok: true });
+	});
+
+	it('上限超過は NG(上限値を含む日本語メッセージ)', () => {
+		const result = checkCsvSizeLimit(MAX_CSV_BYTES + 1);
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error('unreachable');
+		expect(result.message).toContain('5MB');
+	});
+
+	it('0バイトは OK', () => {
+		expect(checkCsvSizeLimit(0)).toEqual({ ok: true });
+	});
+});
+
+describe('checkCsvRowLimit', () => {
+	it('上限ちょうどは OK', () => {
+		expect(checkCsvRowLimit(MAX_CSV_ROWS)).toEqual({ ok: true });
+	});
+
+	it('上限未満は OK', () => {
+		expect(checkCsvRowLimit(MAX_CSV_ROWS - 1)).toEqual({ ok: true });
+	});
+
+	it('上限超過は NG(上限値を含む日本語メッセージ)', () => {
+		const result = checkCsvRowLimit(MAX_CSV_ROWS + 1);
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error('unreachable');
+		expect(result.message).toContain('10,000');
+	});
+
+	it('0件は OK', () => {
+		expect(checkCsvRowLimit(0)).toEqual({ ok: true });
 	});
 });
