@@ -23,7 +23,7 @@
 	 */
 	import { tick } from 'svelte';
 	import { page } from '$app/state';
-	import { BantoGrid, type GridColumn } from '@banto/grid-svelte';
+	import { BantoGrid, type CellEdit, type GridColumn } from '@banto/grid-svelte';
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '$lib/toast.svelte';
 	import { sessionStore } from '$lib/session.svelte';
@@ -46,6 +46,8 @@
 		isTagRevisionConflictError,
 		MIN_STRING_LENGTH,
 		MAX_STRING_LENGTH,
+		MIN_DECIMALS,
+		MAX_DECIMALS,
 		TAG_KIND_OPTIONS,
 		CALC_CONNECTION_NAME,
 		MEM_CONNECTION_NAME,
@@ -66,6 +68,14 @@
 		summarizeBulkChange,
 		type BulkChangeSummary
 	} from '$lib/banto/tagBulkOps';
+	import {
+		applyTagCellOverrides,
+		buildTagCellEditBatch,
+		mergeTagCellEdits,
+		type EditableTagField,
+		type TagCellEditInput
+	} from '$lib/banto/tagCellEdit';
+	import { getHubStatus, type StatusResponse } from '$lib/banto/hubStatus';
 	import {
 		buildContinuousParams,
 		generateContinuousTags,
@@ -392,6 +402,34 @@
 	 */
 	let loadError = $state<string | null>(null);
 
+	/**
+	 * T18-3e（docs/banto-hub-t18-design.md「T18-3e BantoGrid セル編集/TSV貼付
+	 * の接続」、実装指示「停止中のみ編集可（停止中ロック）」）: BantoGrid の
+	 * セル編集/TSV貼付は収集停止中（`collection_state === 'stopped'`）のみ
+	 * 許可する。`getHubStatus()`（`GET /api/v1/status`）は初期ロード時と
+	 * 保存直前（`handleSaveGridEdits`）の両方で呼び直す - 収集の開始/停止は
+	 * 別画面から行われうるため、このページを開いたまま状態が変わる可能性が
+	 * ある。取得に失敗した場合は `hubStatus` を `null` のままにし、
+	 * `collectionStopped` は安全側（`false` = 編集不可）にフォールバックする。
+	 */
+	let hubStatus: StatusResponse | null = $state(null);
+	const collectionStopped = $derived.by((): boolean => {
+		const s = hubStatus;
+		return s !== null && s.collection_state === 'stopped';
+	});
+
+	async function loadHubStatus(): Promise<void> {
+		try {
+			hubStatus = await getHubStatus();
+		} catch {
+			// 通信エラーは安全側（編集不可）にフォールバックするだけで、ここでは
+			// トーストを出さない - `tags`/`groups`/`connections` の `reload()` が
+			// 既に読込失敗バナーを持っており、これは表編集ロックの参考情報に
+			// すぎないため二重にエラーを騒がしくしない。
+			hubStatus = null;
+		}
+	}
+
 	function groupName(id: number): string {
 		return groups.find((g) => g.id === id)?.name ?? `#${id}`;
 	}
@@ -451,6 +489,7 @@
 
 	$effect(() => {
 		void reload();
+		void loadHubStatus();
 	});
 
 	// --- create ---
@@ -761,8 +800,17 @@
 	 * T18-3b: 選択モードのON/OFF切り替え。OFFへ戻すときは選択集合もクリア
 	 * する - 選択モードを抜けたのに一括操作バーだけ残る（選択済みなのに
 	 * 何を選んだか画面上でもう分からない）状態を避けるため。
+	 *
+	 * T18-3e: 表編集モード（`gridEditMode`）とは相互排他 - ONにする前に
+	 * 表編集モードが立っていれば、保留中のセル編集を破棄した上で（キャンセル
+	 * されたら選択モードへは切り替えない）まず表編集モードを終了する
+	 * （実装指示「selectionMode と相互排他」）。
 	 */
 	function toggleSelectionMode(): void {
+		if (!selectionMode && gridEditMode) {
+			if (!confirmDiscardPendingCellEdits()) return;
+			gridEditMode = false;
+		}
 		selectionMode = !selectionMode;
 		if (!selectionMode) selectedIds = new Set();
 	}
@@ -778,6 +826,207 @@
 	/** T18-3b: 選択中の行を BantoGrid の `rowClass` 経由で強調表示する（M14/T9-2 と同じ仕組み、下の CSS 参照）。 */
 	function tagRowClass(t: Tag): string | undefined {
 		return selectedIds.has(t.id) ? 'tag-row-selected' : undefined;
+	}
+
+	// --- T18-3e: BantoGrid セル編集/TSV貼付 (docs/banto-hub-t18-design.md
+	// 「T18-3e BantoGrid セル編集/TSV貼付の接続」) ---------------------------
+	//
+	// 「表編集モード」トグル - selectionMode と同型だが、こちらは ON の間
+	// `columns`（下の `$derived.by`）へ `enabled`/`writable`/`unit`/`decimals`
+	// の `editable` を付与する。BantoGrid は `editable` を持つ列が1つでも
+	// あると単一クリックの `onRowClick` を発火させなくなる仕様
+	// （`node_modules/@banto/grid-svelte` の `hasEditableColumns`）ため、OFF
+	// の間は `columns` に `editable` キー自体を含めず、既存の単一クリック
+	// 編集・複数選択（selectionMode）を厳密に維持する。
+
+	/** T18-3e: 表編集モードのON/OFF。既定 OFF（既存挙動を完全維持）。 */
+	let gridEditMode = $state(false);
+
+	/**
+	 * 保留中のセル編集（即保存しない - `onCellEdit`/`onRangePaste` はここに
+	 * 積むだけ）。「保存」操作時に `buildTagCellEditBatch` へ渡して
+	 * `BatchTagUpdateRow[]` を組み立てる。
+	 */
+	let pendingCellEdits = $state<TagCellEditInput[]>([]);
+
+	/**
+	 * 保留編集を id ごとにマージした上書き値 - グリッド表示のローカル上書きに
+	 * 使う（`gridDisplayRows` - `filteredTags`/`tags` より後（下の「T13-1:
+	 * ツリーフィルタ + 検索」節）で定義している。`filteredTags` に依存する
+	 * `$derived` は、TS の TDZ 解析（svelte-check）に引っかからないよう
+	 * `filteredTags` 宣言より後ろに置く必要があるため）。
+	 */
+	const pendingCellOverridesById = $derived(mergeTagCellEdits(pendingCellEdits));
+
+	/** `buildTagCellEditBatch` の結果 - 保存確認パネル・保留バーの件数表示・適用行に使う。 */
+	const cellEditBatch = $derived(buildTagCellEditBatch(pendingCellEdits, tags));
+	const cellEditRowsJson = $derived(JSON.stringify(cellEditBatch.rows));
+
+	/** 連続登録/CSV/一括操作と同じ「検証済みかどうか」の鮮度追跡（`csvUpdateValidatedFresh` 等と同型）。 */
+	let cellEditValidatedRowsJson = $state<string | null>(null);
+	let cellEditValidationResult = $state<BatchTagsUpdateResult | null>(null);
+	let cellEditValidating = $state(false);
+	let cellEditApplying = $state(false);
+	/** 保存確認パネル（差分＋preflight結果）の開閉。 */
+	let cellEditPanelOpen = $state(false);
+
+	const cellEditValidatedFresh = $derived(
+		cellEditBatch.rows.length > 0 &&
+			cellEditRowsJson === cellEditValidatedRowsJson &&
+			cellEditValidationResult?.ok === true
+	);
+
+	/** 保留中のセル編集を全て破棄する（「破棄」ボタン、表編集モードOFF、保存成功後の後始末で共通に使う）。 */
+	function discardGridEdits(): void {
+		pendingCellEdits = [];
+		cellEditValidationResult = null;
+		cellEditValidatedRowsJson = null;
+		cellEditPanelOpen = false;
+	}
+
+	/** 保留編集が無ければ確認不要で `true`。あれば `window.confirm` で破棄確認する（`confirmDiscardIfNeeded` と同じ流儀）。 */
+	function confirmDiscardPendingCellEdits(): boolean {
+		if (pendingCellEdits.length === 0) return true;
+		if (!window.confirm('保留中のセル編集を破棄します。よろしいですか？')) return false;
+		discardGridEdits();
+		return true;
+	}
+
+	/**
+	 * 表編集モードのトグル。ONにするには収集停止中である必要がある
+	 * （実装指示「停止中ロック」、ボタン自体も `!collectionStopped` で
+	 * disabled にする - これは二重ガード）。ONにする前に選択モードが
+	 * 立っていれば終了する（相互排他、`toggleSelectionMode` と対称）。
+	 * OFFにするときは保留編集があれば破棄確認する。
+	 */
+	function toggleGridEditMode(): void {
+		if (!gridEditMode) {
+			if (!collectionStopped) return;
+			if (selectionMode) {
+				selectionMode = false;
+				selectedIds = new Set();
+			}
+			gridEditMode = true;
+			return;
+		}
+		if (!confirmDiscardPendingCellEdits()) return;
+		gridEditMode = false;
+	}
+
+	/**
+	 * BantoGrid `onCellEdit`（1セル編集）。BantoGrid の列 `validate` が既に
+	 * 不正値を弾いた後にしか呼ばれないため、ここでは保留バッファへ積むだけ
+	 * （即保存しない）。`editable` は `gridEditMode && collectionStopped` の
+	 * ときしか true にならないので、このハンドラ自体は常時登録したままで
+	 * 安全（`editable` が false のセルはそもそも edit セッションへ入れない）。
+	 */
+	async function handleGridCellEdit(edit: CellEdit<Tag>): Promise<void> {
+		pendingCellEdits = [
+			...pendingCellEdits,
+			{ id: Number(edit.rowId), field: edit.field as EditableTagField, value: edit.value }
+		];
+	}
+
+	/**
+	 * BantoGrid `onRangePaste`（TSV貼付、Excel からの貼り付け）。
+	 * `edits` は BantoGrid が既に「editable な列のみ・既存行のみ（行は増え
+	 * ない）・`validate` 通過済み」に絞り込んだ後の配列 - ここでも保留
+	 * バッファへ積むだけでよい。`skipped`（編集不可列・validate 失敗・
+	 * アドレス範囲外等でスキップされたセル数）は簡易トーストで知らせる。
+	 */
+	async function handleGridRangePaste(
+		edits: CellEdit<Tag>[],
+		info: { skipped: number }
+	): Promise<void> {
+		if (edits.length > 0) {
+			pendingCellEdits = [
+				...pendingCellEdits,
+				...edits.map((e) => ({
+					id: Number(e.rowId),
+					field: e.field as EditableTagField,
+					value: e.value
+				}))
+			];
+		}
+		if (info.skipped > 0) {
+			toastStore.push(
+				'error',
+				`${info.skipped} 件のセルは貼り付けできませんでした（編集不可の列・不正な値など）`
+			);
+		}
+	}
+
+	/**
+	 * 「保存」— `buildTagCellEditBatch` で組み立てた行を `updateTagsBatch`
+	 * の dry-run（全構成 preflight）にかけ、結果を確認パネルに表示する
+	 * （実装指示「保留バッファ→preflight→差分確認→all-or-nothing 適用」）。
+	 * 保存直前に収集状態を再確認する - 稼働中に切り替わっていれば preflight
+	 * すら投げず、確認パネルも開かない（停止中ロックの最終防波堤）。
+	 */
+	async function handleSaveGridEdits(): Promise<void> {
+		if (cellEditBatch.rows.length === 0) return;
+		await loadHubStatus();
+		if (!collectionStopped) {
+			toastStore.push(
+				'error',
+				'収集稼働中は表編集を保存できません。収集を停止してから再度お試しください。'
+			);
+			return;
+		}
+		cellEditValidating = true;
+		cellEditValidationResult = null;
+		try {
+			const result = await updateTagsBatch(cellEditBatch.rows, true);
+			cellEditValidationResult = result;
+			cellEditValidatedRowsJson = cellEditRowsJson;
+			cellEditPanelOpen = true;
+			if (!result.ok) {
+				toastStore.push('error', 'エラーがあります。下の一覧を確認してください。');
+			}
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			cellEditValidating = false;
+		}
+	}
+
+	/** 確認パネルの「閉じる」- 保留バッファは維持したまま、パネルだけ閉じる（続けて編集・再保存できる）。 */
+	function cancelCellEditConfirm(): void {
+		cellEditPanelOpen = false;
+	}
+
+	/**
+	 * 確認パネルの「この内容で保存を適用」- `dryRun: false` の本適用
+	 * （all-or-nothing）。202（稼働中キュー投入）を含む例外は他の書き込み系
+	 * 呼び出しと同じ汎用エラートーストに委ねる（停止中ロックがあるため通常
+	 * 到達しないが、最終防波堤として同じ扱いにしておく）。
+	 */
+	async function handleApplyGridEdits(): Promise<void> {
+		if (!cellEditValidatedFresh) return;
+		cellEditApplying = true;
+		try {
+			const result = await updateTagsBatch(cellEditBatch.rows, false);
+			cellEditValidationResult = result;
+			if (result.ok) {
+				toastStore.push('success', `${result.count}件のセル編集を保存しました`);
+				monitorCtaHref = monitorHref({
+					groupId: soleGroupId(cellEditBatch.rows.map((r) => r.collectionGroupId))
+				});
+				discardGridEdits();
+				await reload();
+			} else {
+				toastStore.push('error', '一部のセルでエラーが発生しました。下の一覧を確認してください。');
+			}
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			cellEditApplying = false;
+		}
+	}
+
+	/** 保存確認パネルの「変更内容」列 - `formatCsvUpdateDiffs` と同じ「field: from → to」を複数フィールド分カンマ区切りにする表示。 */
+	function formatCellEditDiffs(diffs: ConflictFieldDiff[]): string {
+		return diffs.map((d) => `${d.label}: ${d.local} → ${d.server}`).join(', ');
 	}
 
 	async function saveEdit(): Promise<void> {
@@ -1103,8 +1352,16 @@
 	// T18-1: 画面遷移（サイドバーの他画面リンク等）でも Esc/× と同じ破棄
 	// 確認を行う。`confirmDiscardIfNeeded` が `false` を返した（busy 中、
 	// または dirty で確認をキャンセルされた）場合は遷移そのものを止める。
+	// T18-3e: 保留中のセル編集がある場合も同様に確認する（Drawer は開いて
+	// いなくても、表編集の保留バッファは未保存の変更のため）。
 	beforeNavigate((nav) => {
-		if (drawerMode !== null && !confirmDiscardIfNeeded()) nav.cancel();
+		if (drawerMode !== null && !confirmDiscardIfNeeded()) {
+			nav.cancel();
+			return;
+		}
+		if (pendingCellEdits.length > 0 && !confirmDiscardPendingCellEdits()) {
+			nav.cancel();
+		}
 	});
 
 	// --- T13-1: ツリーフィルタ + 検索 (docs/ux-plan.md §4b) -----------------
@@ -1246,6 +1503,20 @@
 		}
 		return list;
 	});
+
+	/**
+	 * T18-3e: BantoGrid に渡す実際の行。保存前の保留編集を可視化するため、
+	 * `filteredTags` に保留中の上書きをローカルに重ねる（実装指示「保留中は
+	 * グリッド表示に反映する工夫」）。BantoGrid 自身は `rows` を書き換えない
+	 * ので、これをしないと `onCellEdit` の commit 完了直後にセルが元の値へ
+	 * 見た目上「戻って」しまう（チェックボックスをオンにした直後にオフへ
+	 * 戻って見える等、実運用上ほぼバグにしか見えないため上書き表示にした）。
+	 */
+	const gridDisplayRows = $derived(
+		pendingCellOverridesById.size === 0
+			? filteredTags
+			: filteredTags.map((t) => applyTagCellOverrides(t, pendingCellOverridesById.get(t.id)))
+	);
 
 	// --- T11-1: 連続登録 (docs/ux-plan.md §3) ------------------------------
 	//
@@ -1839,45 +2110,103 @@
 		}
 	}
 
-	const columns: GridColumn<Tag>[] = [
-		{ id: 'id', header: 'ID', accessor: 'id', width: 60, align: 'right' },
-		{
-			id: 'name',
-			header: '名前',
-			accessor: 'name',
-			width: 140,
-			filterable: true,
-			filterType: 'text'
-		},
-		{
-			id: 'collectionGroupId',
-			header: '収集グループ',
-			accessor: (row) => groupName(row.collectionGroupId),
-			width: 140
-		},
-		{ id: 'address', header: 'アドレス', accessor: 'address', width: 100 },
-		{ id: 'dataType', header: '型', accessor: 'dataType', width: 80 },
-		{
-			id: 'tagKind',
-			header: '種別',
-			accessor: 'tagKind',
-			width: 90
-		},
-		{
-			id: 'enabled',
-			header: '有効',
-			accessor: 'enabled',
-			width: 70,
-			format: (v) => (v ? 'はい' : 'いいえ')
-		},
-		{
-			id: 'writable',
-			header: '書き込み可',
-			accessor: 'writable',
-			width: 90,
-			format: (v) => (v ? 'はい' : 'いいえ')
-		}
-	];
+	/**
+	 * T18-3e: `gridEditMode`（表編集モード）に応じて列定義を差し替える
+	 * `$derived.by` - プレーンな `const` のままだと、`editable`/`editor` を
+	 * 常に持たせておいて評価結果だけ `gridEditMode` 次第で切り替える実装に
+	 * なりがちだが、それは誤り。BantoGrid の `hasEditableColumns` は
+	 * `columns.some(c => Boolean(c.editable))`（**関数さえ入っていれば
+	 * true** - 呼び出した結果は見ない）で決まり、これが true になると
+	 * 単一クリックの `onRowClick` が発火しなくなりダブルクリックへ切り替わる
+	 * （`node_modules/@banto/grid-svelte` の `BantoGrid.svelte`
+	 * `hasEditableColumns`/`handleCellClick` 参照）。
+	 *
+	 * そのため OFF（既定）のときは `editable` キー自体を持たせない8列
+	 * （既存どおり）を返し、単一クリック編集・複数選択（T18-3b）を厳密に
+	 * 維持する。ON のときだけ `enabled`/`writable` に `editable`/`editor` を
+	 * 足し、`unit`/`decimals` の2列を追加する（実装指示「編集モード時のみ
+	 * 列追加」- 既存 e2e はいずれも表編集モードへ入らないため、この2列は
+	 * 既存 spec のグリッド構造に一切影響しない）。
+	 *
+	 * `address`/`dataType`/`collectionGroupId`/`tagKind`/`name`/`expression`
+	 * は意図的に対象外（型連動・配置規則・DAG・一意制約・外部名変更の連鎖が
+	 * 重く、単票 Drawer に誘導する設計判断、実装指示 T18-3e 参照）。
+	 *
+	 * 各 editable 列の `editable` は関数形 `() => gridEditMode &&
+	 * collectionStopped` - 「表編集モードON」かつ「収集停止中」の両方を
+	 * 満たす間だけ実際に編集できる（停止中ロック）。
+	 */
+	const columns = $derived.by((): GridColumn<Tag>[] => {
+		const cellEditable = () => gridEditMode && collectionStopped;
+		const base: GridColumn<Tag>[] = [
+			{ id: 'id', header: 'ID', accessor: 'id', width: 60, align: 'right' },
+			{
+				id: 'name',
+				header: '名前',
+				accessor: 'name',
+				width: 140,
+				filterable: true,
+				filterType: 'text'
+			},
+			{
+				id: 'collectionGroupId',
+				header: '収集グループ',
+				accessor: (row) => groupName(row.collectionGroupId),
+				width: 140
+			},
+			{ id: 'address', header: 'アドレス', accessor: 'address', width: 100 },
+			{ id: 'dataType', header: '型', accessor: 'dataType', width: 80 },
+			{
+				id: 'tagKind',
+				header: '種別',
+				accessor: 'tagKind',
+				width: 90
+			},
+			{
+				id: 'enabled',
+				header: '有効',
+				accessor: 'enabled',
+				width: 70,
+				format: (v) => (v ? 'はい' : 'いいえ'),
+				...(gridEditMode ? { editable: cellEditable, editor: 'checkbox' as const } : {})
+			},
+			{
+				id: 'writable',
+				header: '書き込み可',
+				accessor: 'writable',
+				width: 90,
+				format: (v) => (v ? 'はい' : 'いいえ'),
+				...(gridEditMode ? { editable: cellEditable, editor: 'checkbox' as const } : {})
+			}
+		];
+		if (!gridEditMode) return base;
+		return [
+			...base,
+			{
+				id: 'unit',
+				header: '単位',
+				accessor: 'unit',
+				width: 90,
+				editable: cellEditable,
+				editor: 'text' as const
+			},
+			{
+				id: 'decimals',
+				header: '小数桁数',
+				accessor: 'decimals',
+				width: 90,
+				editable: cellEditable,
+				editor: 'number' as const,
+				validate: (value: unknown) => {
+					const n = Number(value);
+					if (!Number.isInteger(n) || n < MIN_DECIMALS || n > MAX_DECIMALS) {
+						return `小数桁数は ${MIN_DECIMALS}〜${MAX_DECIMALS} の整数で指定してください`;
+					}
+					return null;
+				}
+			}
+		];
+	});
 </script>
 
 {#snippet tagFields(
@@ -2584,6 +2913,19 @@
 							>
 								{selectionMode ? '複数選択を終了' : '複数選択'}
 							</button>
+							<!-- T18-3e: セル編集/TSV貼付の表編集モード。収集停止中のみON にできる
+								（停止中ロック、`toggleGridEditMode` の doc comment 参照）。ON中は
+								selectionMode と相互排他。 -->
+							<button
+								type="button"
+								class="secondary"
+								data-testid="tag-grid-edit-mode-toggle"
+								disabled={!gridEditMode && !collectionStopped}
+								title={!collectionStopped ? '収集停止中のみ表編集できます' : undefined}
+								onclick={toggleGridEditMode}
+							>
+								{gridEditMode ? '表編集を終了' : '表編集'}
+							</button>
 						{/if}
 						<!-- T18-3d: 出力範囲（全件/絞り込み結果/選択行）。選択行は
 							選択が1件も無ければ選べない（disabled option）。 -->
@@ -2610,6 +2952,91 @@
 						/>
 						<span class="count">{filteredTags.length} / {tags.length} 件</span>
 					</div>
+					{#if canWrite && hubStatus !== null && !collectionStopped}
+						<!-- T18-3e: 停止中ロックの説明バナー - `hubStatus` 取得前
+							（`null`）は誤って「稼働中」と表示しないよう、取得済みの
+							ときだけ出す（実装指示「稼働中は編集不可で…バナー/無効表示」）。 -->
+						<p class="note" data-testid="tag-grid-edit-locked-note">
+							収集稼働中のため表編集はできません（収集を停止すると表編集を有効にできます）。
+						</p>
+					{/if}
+					{#if canWrite && gridEditMode && pendingCellEdits.length > 0}
+						<!-- T18-3e: 保留中のセル編集バー（`tag-bulk-bar` と同じ帯パターン）。
+							「保存」は preflight（dry-run）を挟んでから確認パネルを開く
+							（`handleSaveGridEdits`）。件数は「実際に値が変わる行数」
+							（`cellEditBatch.diffRows`）- 元に戻した編集は保留バッファには
+							残るが、この件数には含めない。 -->
+						<div class="onboarding-banner" data-testid="tag-cell-edit-bar">
+							<span>保留中の編集 {cellEditBatch.diffRows.length} 件</span>
+							<button
+								type="button"
+								data-testid="tag-cell-edit-save"
+								disabled={cellEditValidating || cellEditBatch.rows.length === 0}
+								onclick={handleSaveGridEdits}
+							>
+								{cellEditValidating ? '確認中…' : '保存'}
+							</button>
+							<button
+								type="button"
+								class="secondary"
+								data-testid="tag-cell-edit-discard"
+								disabled={cellEditValidating || cellEditApplying}
+								onclick={discardGridEdits}
+							>
+								破棄
+							</button>
+						</div>
+					{/if}
+					{#if canWrite && cellEditPanelOpen}
+						<!-- T18-3e: 保存前の差分確認パネル（`tag-bulk-confirm-panel` と同じ
+							`.confirm-panel`/`.preview-table` を流用）。preflight
+							（`dryRun: true`）の結果はエラー行表示にのみ使い、差分自体は
+							クライアント側の `cellEditBatch.diffRows`（`tagCellEdit.ts`）を
+							表示する。 -->
+						<div class="confirm-panel" data-testid="tag-cell-edit-confirm-panel">
+							<p class="confirm-title">表編集の保存内容を確認</p>
+							<p class="note">対象 {cellEditBatch.diffRows.length} 件</p>
+							<div class="preview-wrap">
+								<table class="preview-table">
+									<thead>
+										<tr>
+											<th>ID</th>
+											<th>名前</th>
+											<th>変更内容</th>
+										</tr>
+									</thead>
+									<tbody>
+										{#each cellEditBatch.diffRows.slice(0, PREVIEW_DISPLAY_LIMIT) as row (row.id)}
+											<tr>
+												<td>{row.id}</td>
+												<td>{row.name}</td>
+												<td>{formatCellEditDiffs(row.diffs)}</td>
+											</tr>
+										{/each}
+									</tbody>
+								</table>
+							</div>
+							{@render previewLimitNote(cellEditBatch.diffRows.length)}
+							{#if cellEditValidationResult}
+								{@render bulkRowErrors(cellEditValidationResult)}
+							{/if}
+							<div class="actions">
+								<button
+									type="button"
+									data-testid="tag-cell-edit-apply"
+									disabled={!cellEditValidatedFresh || cellEditApplying}
+									onclick={handleApplyGridEdits}>この内容で保存を適用</button
+								>
+								<button
+									type="button"
+									class="secondary"
+									data-testid="tag-cell-edit-cancel-confirm"
+									onclick={cancelCellEditConfirm}
+									disabled={cellEditApplying}>閉じる</button
+								>
+							</div>
+						</div>
+					{/if}
 					{#if canWrite && selectedIds.size > 0}
 						<!-- T18-3b: 選択が1件以上のときだけ出す一括操作バー
 							（`monitorCtaHref` バナーと同じ帯パターン）。文言は既存トースト/
@@ -2741,6 +3168,8 @@
 					<p class="note">
 						{#if !canWrite}
 							閲覧のみ（編集には編集者以上の権限が必要です）。
+						{:else if gridEditMode}
+							セルをダブルクリックまたは選択して直接編集できます（Excel等からの貼り付けにも対応）。行を開くにはダブルクリックしてください。「保存」を押すまで反映されません。
 						{:else if selectionMode}
 							行をクリックすると選択の切り替えになります（編集は「複数選択を終了」してから）。
 						{:else}
@@ -2796,13 +3225,42 @@
 							<p class="note">条件に一致するタグがありません。</p>
 						{:else}
 							<div class="grid-wrap">
-								<BantoGrid
-									rows={filteredTags}
-									{columns}
-									getRowId={(t) => t.id}
-									onRowClick={canWrite ? (selectionMode ? toggleSelectRow : selectTag) : undefined}
-									rowClass={tagRowClass}
-								/>
+								<!--
+									T18-3e: `@banto/grid-svelte` の `GridState`
+									（`node_modules/@banto/grid-svelte/src/state.svelte.ts`）は
+									コンストラクタで受け取った `columns` を private フィールドへ
+									一度だけ固定し（`this.order` も初期化時の列 id 一覧のまま）、
+									以後 `columns` prop が差し替わっても再構築しない
+									（`BantoGrid.svelte` の `const gridState = externalState ??
+									new GridState(columns, ...)` は素の `const` - プロパティ変更で
+									再実行されるリアクティブな式ではない）。そのため
+									`gridEditMode` の変化で `columns` の中身（`editable`/
+									`unit`・`decimals` 列の有無）を変えても、BantoGrid 側は
+									初回マウント時の列定義のまま更新されない。
+									`{#key gridEditMode}` でモード切替のたびに BantoGrid
+									自体を作り直し（アンマウント→再マウント）、新しい
+									`columns` で `GridState` を最初から組み立て直させることで
+									回避する - grid-svelte 本体は変更しない制約の中で確実に
+									列定義を反映させる標準的な Svelte パターン。表編集モードの
+									ON/OFF は頻繁な操作ではないため、切替時に列幅ドラッグ・
+									ソート・フィルタ・スクロール位置がリセットされるのは
+									許容できるコストと判断した。
+								-->
+								{#key gridEditMode}
+									<BantoGrid
+										rows={gridDisplayRows}
+										{columns}
+										getRowId={(t) => t.id}
+										onRowClick={canWrite
+											? selectionMode
+												? toggleSelectRow
+												: selectTag
+											: undefined}
+										rowClass={tagRowClass}
+										onCellEdit={canWrite && gridEditMode ? handleGridCellEdit : undefined}
+										onRangePaste={canWrite && gridEditMode ? handleGridRangePaste : undefined}
+									/>
+								{/key}
 							</div>
 						{/if}
 					{/if}
