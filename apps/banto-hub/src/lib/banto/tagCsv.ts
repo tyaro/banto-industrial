@@ -479,3 +479,71 @@ export function parseTagsCsv(
 	if (errors.length > 0) return { ok: false, errors };
 	return { ok: true, rows };
 }
+
+// --- T18-3d 更新用テンプレート/エラー行 CSV/上限 ------------------------------
+
+/**
+ * ヘッダ行のみの空 CSV テンプレート（T18-3d、docs/banto-hub-t18-design.md
+ * 「T18-3d CSV 新規/更新分離」）。ダウンロードしてそのまま `parseTagsCsv`
+ * に通せる形にするため、列は {@link TAG_CSV_COLUMNS} と完全に一致させる
+ * （{@link exportTagsCsv} のヘッダ行と同じ単一の情報源を使う）。
+ * {@link exportTagsCsv} と同様、Excel の文字化け対策で UTF-8 BOM を付与する。
+ */
+export function buildTagCsvTemplate(): string {
+	return '﻿' + serializeCsv([[...TAG_CSV_COLUMNS]]);
+}
+
+/**
+ * インポートでエラーになった行を「再ダウンロードして直せる」CSV に変換する
+ * （T18-3d 受け入れ基準「エラー行 CSV 再 DL」）。列は
+ * `lineNumber`（Excel 上の行番号と一致 - ヘッダ=1、最初のデータ行=2、
+ * {@link ParsedCsvTagRow.lineNumber}/{@link CsvRowError.lineNumber} と
+ * 同じ契約）、`message`（エラー内容）に続けて、元のセル値を
+ * {@link TAG_CSV_COLUMNS} の列順で並べる（`original` が無い、または
+ * 該当列が無い行はその列を空欄にする）。元データ列を残すのは、ユーザーが
+ * 値を直接直してそのまま再アップロードできるようにするため。
+ * {@link exportTagsCsv} と同様 UTF-8 BOM 付き。
+ */
+export function buildErrorRowsCsv(
+	rows: { lineNumber: number; message: string; original?: string[] }[]
+): string {
+	const header = ['lineNumber', 'message', ...TAG_CSV_COLUMNS];
+	const body = rows.map((r) => [
+		String(r.lineNumber),
+		r.message,
+		...TAG_CSV_COLUMNS.map((_, i) => r.original?.[i] ?? '')
+	]);
+	return '﻿' + serializeCsv([header, ...body]);
+}
+
+/**
+ * CSV インポートの性能目標（docs/ux-plan.md §4「10,000タグ」）に合わせた
+ * 事前チェック用の上限定数。{@link checkCsvSizeLimit} は「解析前に」
+ * ファイルサイズ（バイト数）で弾くため、パースコストをかける前に明らかに
+ * 過大なファイルを早期に拒否できる。{@link checkCsvRowLimit} はパース後の
+ * 実データ行数（ヘッダを除く）を弾く — サイズが小さくても短い行を大量に
+ * 詰め込んだ CSV は行数超過になり得るため、両方のチェックが必要。
+ */
+export const MAX_CSV_BYTES = 5 * 1024 * 1024;
+export const MAX_CSV_ROWS = 10000;
+
+/** バイト数が {@link MAX_CSV_BYTES} 以下かを判定する（解析前チェック）。 */
+export function checkCsvSizeLimit(
+	byteLength: number
+): { ok: true } | { ok: false; message: string } {
+	if (byteLength <= MAX_CSV_BYTES) return { ok: true };
+	const mb = MAX_CSV_BYTES / (1024 * 1024);
+	return {
+		ok: false,
+		message: `CSVファイルのサイズが上限（${mb}MB）を超えています。ファイルを分割してください。`
+	};
+}
+
+/** データ行数が {@link MAX_CSV_ROWS} 以下かを判定する（パース後チェック）。 */
+export function checkCsvRowLimit(rowCount: number): { ok: true } | { ok: false; message: string } {
+	if (rowCount <= MAX_CSV_ROWS) return { ok: true };
+	return {
+		ok: false,
+		message: `CSV の行数が上限（${MAX_CSV_ROWS.toLocaleString('ja-JP')}行）を超えています。ファイルを分割してください。`
+	};
+}

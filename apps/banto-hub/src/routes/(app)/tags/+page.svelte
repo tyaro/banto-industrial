@@ -76,10 +76,22 @@
 	import {
 		exportTagsCsv,
 		parseTagsCsv,
+		parseCsv,
+		stripBom,
+		buildTagCsvTemplate,
+		buildErrorRowsCsv,
+		checkCsvSizeLimit,
+		checkCsvRowLimit,
 		type ImportTagsCsvResult,
 		type ParsedCsvTagRow,
 		type CsvRowError
 	} from '$lib/banto/tagCsv';
+	import {
+		classifyCsvUpdate,
+		type CsvUpdateClassification,
+		type CsvUpdateRow,
+		type CsvRowCategory
+	} from '$lib/banto/tagCsvDiff';
 	import { parseOptionalNumber } from '$lib/banto/tagFormNumeric';
 	import {
 		DISPLAY_SCALING_FIELDS,
@@ -905,7 +917,9 @@
 			validating ||
 			applyingContinuous ||
 			csvValidating ||
-			csvApplying
+			csvApplying ||
+			csvUpdateValidating ||
+			csvUpdateApplying
 		);
 	}
 
@@ -1287,11 +1301,17 @@
 		}
 	}
 
-	// --- T11-2: CSV エクスポート/インポート (docs/ux-plan.md §3) -------------
+	// --- T11-2/T18-3d: CSV エクスポート/インポート
+	// (docs/ux-plan.md §3, docs/banto-hub-t18-design.md「T18-3d CSV
+	// 新規/更新分離＋テンプレート」) -------------------------------------
 	//
 	// エクスポートはこのページが Blob/DOM 操作を担当し（`$lib/banto/tagCsv.ts`
 	// はブラウザ API に依存しない純関数のまま保つ）、インポートは連続登録と
 	// 同じ「プレビュー → 検証(dry-run) → 登録」の2段階フローを踏襲する。
+	// T18-3d でモードを「新規追加(create)」「既存更新(update)」に分離した -
+	// 新規追加は既存どおり `createTagsBatch`、既存更新は
+	// `$lib/banto/tagCsvDiff.ts::classifyCsvUpdate` で分類してから
+	// `updateTagsBatch`（changed 行のみ）を叩く。
 
 	/** ローカル日付での `banto-hub-tags-YYYY-MM-DD.csv`（設計: ux-plan.md §3）。 */
 	function csvExportFilename(): string {
@@ -1303,23 +1323,65 @@
 	}
 
 	/**
+	 * CSV テキストをファイルとしてダウンロードする共通ヘルパー（T18-3d、
+	 * エクスポート/テンプレート DL/エラー行 DL の3箇所で使う同一パターンを
+	 * 集約しただけ - 挙動は既存の `handleExportCsv` と同じ）。
+	 */
+	function downloadCsvText(csv: string, filename: string): void {
+		const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement('a');
+		a.href = url;
+		a.download = filename;
+		a.click();
+		URL.revokeObjectURL(url);
+	}
+
+	/**
+	 * T18-3d「出力範囲（全件/絞り込み/選択行）」。既定は既存挙動どおり全件。
+	 */
+	let csvExportScope: 'all' | 'filtered' | 'selected' = $state('all');
+
+	/**
 	 * 閲覧者でも実行可（`canWrite` でガードしない — 設定のバックアップ/
 	 * レビューは読み取り専用の操作のため）。BOM は `exportTagsCsv` が
 	 * 既に埋め込み済みなのでここで二重に付けない。
 	 */
 	function handleExportCsv(): void {
-		const csv = exportTagsCsv(tags, connections, groups);
-		const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
-		const url = URL.createObjectURL(blob);
-		const a = document.createElement('a');
-		a.href = url;
-		a.download = csvExportFilename();
-		a.click();
-		URL.revokeObjectURL(url);
+		const source =
+			csvExportScope === 'selected'
+				? selectedTags
+				: csvExportScope === 'filtered'
+					? filteredTags
+					: tags;
+		const csv = exportTagsCsv(source, connections, groups);
+		downloadCsvText(csv, csvExportFilename());
 	}
+
+	/** T18-3d テンプレート DL: 列ヘッダのみの空 CSV（そのまま埋めて再アップロードできる形）。 */
+	function handleDownloadCsvTemplate(): void {
+		downloadCsvText(buildTagCsvTemplate(), 'banto-hub-tags-template.csv');
+	}
+
+	/** T18-3d インポートモード。既定は既存挙動と同じ「新規追加」。 */
+	let csvMode: 'create' | 'update' = $state('create');
 
 	let csvFileInputEl: HTMLInputElement | undefined = $state();
 	let csvParseResult: ImportTagsCsvResult | null = $state(null);
+	/**
+	 * アップロードした CSV の生セル（`parseCsv` 直後、`parseTagsCsv` の
+	 * バリデーション前）。T18-3d のエラー CSV 再 DL
+	 * （{@link buildErrorRowsCsv} の `original` 列）を組み立てるために
+	 * `lineNumber - 1` でこの配列を引く（`parseTagsCsv` の
+	 * `ParsedCsvTagRow.lineNumber`/`CsvRowError.lineNumber` と同じ
+	 * 「ヘッダ=1・最初のデータ行=2」の契約 — `parseCsv` が返す行配列は
+	 * ヘッダを含む0起点なので `lineNumber - 1` が対応する行になる）。
+	 */
+	let csvRawTable: string[][] | null = $state(null);
+	/** T18-3d: `checkCsvSizeLimit` で拒否された（解析すらしていない）ときのメッセージ。 */
+	let csvSizeError: string | null = $state(null);
+	/** T18-3d: `checkCsvRowLimit` で拒否されたときのメッセージ。 */
+	let csvRowLimitError: string | null = $state(null);
 
 	/**
 	 * `csvTagsJson` を素直に `csvParseResult?.ok ? ... : null` と書くと、
@@ -1339,8 +1401,8 @@
 
 	const csvTagsJson = $derived(tagsJsonFromCsvParseResult(csvParseResult));
 
-	// 連続登録と同じ鮮度追跡 — 検証後にファイルを差し替えたら「登録」を
-	// 無効化し、再検証を要求する。
+	// 連続登録と同じ鮮度追跡 - 検証後にファイルを差し替えたら「登録」を
+	// 無効化し、再検証を要求する（新規追加モード）。
 	let csvValidatedTagsJson = $state<string | null>(null);
 	let csvValidationResult = $state<BatchTagsResult | null>(null);
 	let csvValidating = $state(false);
@@ -1350,24 +1412,123 @@
 		csvTagsJson !== null && csvTagsJson === csvValidatedTagsJson && csvValidationResult?.ok === true
 	);
 
+	/**
+	 * T18-3d 既存更新モードの分類結果。`csvMode === 'update'` かつ構文的に
+	 * 妥当な行が1件以上あるときだけ計算する（`tags` が変わるたびに再計算
+	 * される - 一括反映/単票編集など他フローでの変更も反映される）。
+	 */
+	const csvUpdateClassification = $derived.by((): CsvUpdateClassification | null => {
+		if (csvMode !== 'update' || !csvParseResult?.ok || csvParseResult.rows.length === 0) {
+			return null;
+		}
+		return classifyCsvUpdate(csvParseResult.rows, tags);
+	});
+
+	/** プレビュー表の「行番号 → changed 行」引き当て用（エラー表示の index→行番号変換に使う）。 */
+	const csvUpdateChangedRows = $derived(
+		csvUpdateClassification?.rows.filter((r) => r.category === 'changed') ?? []
+	);
+
+	const csvUpdateRowsJson = $derived(
+		csvUpdateClassification ? JSON.stringify(csvUpdateClassification.updateRows) : null
+	);
+	let csvUpdateValidatedRowsJson = $state<string | null>(null);
+	let csvUpdateValidationResult = $state<BatchTagsUpdateResult | null>(null);
+	let csvUpdateValidating = $state(false);
+	let csvUpdateApplying = $state(false);
+
+	const csvUpdateValidatedFresh = $derived(
+		csvUpdateRowsJson !== null &&
+			csvUpdateRowsJson === csvUpdateValidatedRowsJson &&
+			csvUpdateValidationResult?.ok === true
+	);
+
+	/** 新規追加/既存更新どちらの検証結果も無効化する（ファイル差し替え・モード切替の共通後始末）。 */
 	function invalidateCsvValidation(): void {
 		csvValidatedTagsJson = null;
 		csvValidationResult = null;
+		csvUpdateValidatedRowsJson = null;
+		csvUpdateValidationResult = null;
 	}
 
 	function resetCsvImport(): void {
 		csvParseResult = null;
+		csvRawTable = null;
+		csvSizeError = null;
+		csvRowLimitError = null;
 		invalidateCsvValidation();
 		if (csvFileInputEl) csvFileInputEl.value = '';
 	}
 
+	/** T18-3d モード切替 - ファイルはそのまま保持し、検証結果だけ無効化する（プレビューはモードごとに再計算される）。 */
+	function handleCsvModeChange(mode: 'create' | 'update'): void {
+		csvMode = mode;
+		invalidateCsvValidation();
+	}
+
+	/**
+	 * T18-3d 受け入れ「上限超過は解析前に理由付き拒否」:
+	 * `checkCsvSizeLimit` は `file.text()` の前（＝解析コストをかける前）に
+	 * 呼ぶ。行数上限（`checkCsvRowLimit`）はパース後にしか分からないので
+	 * `parseTagsCsv` の後に判定する。
+	 */
 	async function handleCsvFileChange(e: Event): Promise<void> {
 		const input = e.target as HTMLInputElement;
 		const file = input.files?.[0];
 		if (!file) return;
-		const text = await file.text();
-		csvParseResult = parseTagsCsv(text, connections, groups);
+
+		csvSizeError = null;
+		csvRowLimitError = null;
+		csvRawTable = null;
+		csvParseResult = null;
 		invalidateCsvValidation();
+
+		const sizeCheck = checkCsvSizeLimit(file.size);
+		if (!sizeCheck.ok) {
+			csvSizeError = sizeCheck.message;
+			return;
+		}
+
+		const text = await file.text();
+		// エラー CSV 再 DL の `original` 列用に、バリデーション前の生セルも
+		// 保持しておく（`parseTagsCsv` はバリデーション結果だけを返す）。
+		csvRawTable = parseCsv(stripBom(text));
+
+		const result = parseTagsCsv(text, connections, groups);
+		if (result.ok) {
+			const rowCheck = checkCsvRowLimit(result.rows.length);
+			if (!rowCheck.ok) {
+				csvRowLimitError = rowCheck.message;
+				return;
+			}
+		}
+		csvParseResult = result;
+	}
+
+	/**
+	 * T18-3d エラー行 CSV 再 DL。parse エラー（構文/必須項目/型不正）と
+	 * 既存更新モードの分類エラー（CSV 内重複キー）のどちらか一方だけが
+	 * 同時に存在しうる（分類は構文的に妥当な行にしか行わないため）。
+	 */
+	function handleDownloadCsvErrorRows(): void {
+		let rows: { lineNumber: number; message: string; original?: string[] }[] = [];
+		if (csvParseResult && !csvParseResult.ok) {
+			rows = csvParseResult.errors.map((e) => ({
+				lineNumber: e.lineNumber,
+				message: e.message,
+				original: csvRawTable?.[e.lineNumber - 1]
+			}));
+		} else if (csvUpdateClassification) {
+			rows = csvUpdateClassification.rows
+				.filter((r) => r.category === 'error')
+				.map((r) => ({
+					lineNumber: r.lineNumber,
+					message: r.message ?? '',
+					original: csvRawTable?.[r.lineNumber - 1]
+				}));
+		}
+		if (rows.length === 0) return;
+		downloadCsvText(buildErrorRowsCsv(rows), 'banto-hub-tags-errors.csv');
 	}
 
 	async function handleValidateCsv(): Promise<void> {
@@ -1413,6 +1574,82 @@
 		} finally {
 			csvApplying = false;
 		}
+	}
+
+	/**
+	 * T18-3d 既存更新モードの「検証」。`updateTagsBatch` を `dryRun: true`
+	 * で `changed` 行のみ呼ぶ（`updateRows` が既に changed だけを含む）。
+	 */
+	async function handleValidateCsvUpdate(): Promise<void> {
+		if (!csvUpdateClassification || csvUpdateClassification.updateRows.length === 0) return;
+		csvUpdateValidating = true;
+		try {
+			const result = await updateTagsBatch(csvUpdateClassification.updateRows, true);
+			csvUpdateValidationResult = result;
+			csvUpdateValidatedRowsJson = csvUpdateRowsJson;
+			if (result.ok) {
+				toastStore.push('success', `検証OK: ${result.count}件更新できます`);
+			} else {
+				toastStore.push('error', 'エラーがあります。下の一覧を確認してください。');
+			}
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			csvUpdateValidating = false;
+		}
+	}
+
+	/**
+	 * T18-3d 既存更新モードの適用。CSV に無い既存タグには一切触れない
+	 * （`updateRows` が changed のみのため暗黙削除・暗黙新規作成は発生しない
+	 * - `tagCsvDiff.ts` の doc comment 参照）。
+	 */
+	async function handleApplyCsvUpdate(): Promise<void> {
+		if (!csvUpdateClassification || !csvUpdateValidatedFresh) return;
+		csvUpdateApplying = true;
+		try {
+			const result = await updateTagsBatch(csvUpdateClassification.updateRows, false);
+			csvUpdateValidationResult = result;
+			if (result.ok) {
+				toastStore.push('success', `${result.count}件更新しました`);
+				resetCsvImport();
+				await reload();
+			} else {
+				toastStore.push(
+					'error',
+					'一部の行で更新エラーが発生しました。下の一覧を確認してください。'
+				);
+			}
+		} catch (err) {
+			// T18-3b の一括反映と同じく、稼働中の 202 キュー投入
+			// (QueuedWhileRunningError) も含めて汎用エラートーストに委ねる。
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			csvUpdateApplying = false;
+		}
+	}
+
+	/** T18-3d 差分プレビュー表の区分ラベル。 */
+	function csvUpdateCategoryLabel(category: CsvRowCategory): string {
+		switch (category) {
+			case 'added':
+				return '追加';
+			case 'changed':
+				return '変更';
+			case 'unchanged':
+				return '変更なし';
+			case 'error':
+				return 'エラー';
+		}
+	}
+
+	/**
+	 * T18-3d 差分プレビュー表の「内容」列（changed 行）。`FIELD_LABELS` で
+	 * 日本語化し、無ければ raw キーのまま表示する。
+	 */
+	function formatCsvUpdateDiffs(diffs: CsvUpdateRow['diffs']): string {
+		if (!diffs || diffs.length === 0) return '';
+		return diffs.map((d) => `${FIELD_LABELS[d.field] ?? d.field}: ${d.from} → ${d.to}`).join(', ');
 	}
 
 	// --- T18-3b: 一括操作 (docs/banto-hub-t18-design.md「T18-3b 一括操作」) --
@@ -2177,6 +2414,43 @@
 	{/if}
 {/snippet}
 
+{#snippet csvUpdateBatchRowErrors(result: BatchTagsUpdateResult, changedRows: CsvUpdateRow[])}
+	{#if !result.ok}
+		<table class="error-table">
+			<thead>
+				<tr>
+					<th>行</th>
+					<th>ID</th>
+					<th>項目</th>
+					<th>内容</th>
+				</tr>
+			</thead>
+			<tbody>
+				{#each result.errors as rowError (rowError.index)}
+					{#each rowError.fieldErrors as fe, i (i)}
+						<tr>
+							<!--
+								csvBatchRowErrors（新規追加用）と同じ理由で、ここでの
+								`rowError.index` は `updateTagsBatch` に送った
+								`csvUpdateClassification.updateRows`（= changed 行のみ）配列の
+								添字。実際の CSV ファイル行番号に変換するには
+								`changedRows[index].lineNumber` を引く必要がある
+								（changedRows は classification.rows を category === 'changed' で
+								絞った、updateRows と同じ並び順の配列 - `csvUpdateChangedRows`
+								参照）。
+							-->
+							<td>{changedRows[rowError.index]?.lineNumber ?? `#${rowError.index}`}</td>
+							<td>{rowError.id}</td>
+							<td>{fe.field}</td>
+							<td>{fe.message}</td>
+						</tr>
+					{/each}
+				{/each}
+			</tbody>
+		</table>
+	{/if}
+{/snippet}
+
 <div class="page">
 	<div class="page-header">
 		<h2>タグ登録</h2>
@@ -2213,6 +2487,20 @@
 								{selectionMode ? '複数選択を終了' : '複数選択'}
 							</button>
 						{/if}
+						<!-- T18-3d: 出力範囲（全件/絞り込み結果/選択行）。選択行は
+							選択が1件も無ければ選べない（disabled option）。 -->
+						<select
+							class="csv-export-scope"
+							data-testid="tag-csv-export-scope"
+							bind:value={csvExportScope}
+							title="CSVエクスポートの対象範囲"
+						>
+							<option value="all">全件（{tags.length}件）</option>
+							<option value="filtered">絞り込み結果（{filteredTags.length}件）</option>
+							<option value="selected" disabled={selectedIds.size === 0}>
+								選択行（{selectedIds.size}件）
+							</option>
+						</select>
 						<button type="button" class="secondary" onclick={handleExportCsv}
 							>CSVエクスポート</button
 						>
@@ -2715,14 +3003,65 @@
 		</div>
 	{:else if drawerMode === 'csv' && canWrite}
 		<div class="drawer-section">
-			<p class="note">
-				CSVファイル（列名ヘッダ付き・タグ登録フォームの項目と1:1対応、接続・グループは名前で参照 —
-				存在しない名前はエラーになります。自動作成はしません）をアップロードすると、
-				内容を検証してからプレビュー表示します。連続登録と同じく「検証 → 登録」の2段階で、
-				<strong>新規登録専用</strong>です（既存タグの更新/upsert には対応していません）。
-				エクスポートしたCSVをそのまま再インポートすると、全行が名前重複エラーになります
-				（想定どおりの挙動です）。
-			</p>
+			<!-- T18-3d: 「新規追加」/「既存更新」モード切替。文言は既存トースト/
+				ボタン名と部分一致しないものにしてある（PR #135 の教訓）。 -->
+			<div class="field csv-mode-field">
+				<span class="csv-mode-label">インポートモード</span>
+				<div class="csv-mode-options">
+					<label>
+						<input
+							type="radio"
+							name="csv-mode"
+							value="create"
+							checked={csvMode === 'create'}
+							data-testid="tag-csv-mode-create"
+							onchange={() => handleCsvModeChange('create')}
+							disabled={isDrawerBusy()}
+						/>
+						新規追加
+					</label>
+					<label>
+						<input
+							type="radio"
+							name="csv-mode"
+							value="update"
+							checked={csvMode === 'update'}
+							data-testid="tag-csv-mode-update"
+							onchange={() => handleCsvModeChange('update')}
+							disabled={isDrawerBusy()}
+						/>
+						既存更新
+					</label>
+				</div>
+			</div>
+
+			{#if csvMode === 'create'}
+				<p class="note">
+					CSVファイル（列名ヘッダ付き・タグ登録フォームの項目と1:1対応、接続・グループは名前で参照 —
+					存在しない名前はエラーになります。自動作成はしません）をアップロードすると、
+					内容を検証してからプレビュー表示します。連続登録と同じく「検証 → 登録」の2段階です。
+					<strong>新規追加モードでは既存タグは更新されません</strong>。
+					エクスポートしたCSVをそのまま再インポートすると、全行が名前重複エラーになります
+					（想定どおりの挙動です）。
+				</p>
+			{:else}
+				<p class="note">
+					既存タグを CSV で一括更新します。突き合わせは「接続＋グループ＋名前」で行い、
+					一致した行のうち<strong>実際に値が変わる行だけ</strong>を更新します。
+					<strong>CSV に無い既存タグは変更されません</strong>（暗黙の削除はしません）。 CSV
+					にはあるが既存に無い名前の行は追加登録されません（新規追加モードを使ってください）。
+				</p>
+			{/if}
+
+			<div class="actions">
+				<button
+					type="button"
+					class="secondary"
+					data-testid="tag-csv-template-download"
+					onclick={handleDownloadCsvTemplate}>テンプレートをダウンロード</button
+				>
+			</div>
+
 			<div class="field">
 				<input
 					type="file"
@@ -2733,15 +3072,27 @@
 				/>
 			</div>
 
-			{#if csvParseResult && !csvParseResult.ok}
+			{#if csvSizeError}
+				<p class="err" data-testid="tag-csv-size-error">{csvSizeError}</p>
+			{:else if csvRowLimitError}
+				<p class="err" data-testid="tag-csv-row-limit-error">{csvRowLimitError}</p>
+			{:else if csvParseResult && !csvParseResult.ok}
 				<h4>エラー（{csvParseResult.errors.length}件）</h4>
 				<p class="note">ファイルを修正して再アップロードしてください。</p>
 				<div class="preview-wrap">
 					{@render csvParseErrors(csvParseResult.errors)}
 				</div>
+				<div class="actions">
+					<button
+						type="button"
+						class="secondary"
+						data-testid="tag-csv-error-download"
+						onclick={handleDownloadCsvErrorRows}>エラー行をCSVでダウンロード</button
+					>
+				</div>
 			{:else if csvParseResult?.ok && csvParseResult.rows.length === 0}
 				<p class="note">インポートする行がありません。</p>
-			{:else if csvParseResult?.ok}
+			{:else if csvParseResult?.ok && csvMode === 'create'}
 				<h4>プレビュー（{csvParseResult.rows.length}件）</h4>
 				<div class="preview-wrap">
 					<table class="preview-table">
@@ -2788,6 +3139,81 @@
 						disabled={!csvValidatedFresh || isDrawerBusy()}>登録</button
 					>
 					{#if !csvValidatedFresh}
+						<span class="hint"
+							>先に「検証」を実行してください（ファイルを差し替えると再検証が必要）。</span
+						>
+					{/if}
+				</div>
+			{:else if csvParseResult?.ok && csvMode === 'update' && csvUpdateClassification}
+				<h4>差分プレビュー（{csvUpdateClassification.rows.length}件）</h4>
+				<p class="note" data-testid="tag-csv-update-summary">
+					追加 {csvUpdateClassification.addedCount} / 変更 {csvUpdateClassification.changedCount}
+					/ 変更なし {csvUpdateClassification.unchangedCount} / エラー {csvUpdateClassification.errorCount}
+					件
+				</p>
+				<div class="preview-wrap">
+					<table class="preview-table">
+						<thead>
+							<tr>
+								<th>行</th>
+								<th>名前</th>
+								<th>区分</th>
+								<th>内容</th>
+							</tr>
+						</thead>
+						<tbody>
+							{#each csvUpdateClassification.rows as row (row.lineNumber)}
+								<tr>
+									<td>{row.lineNumber}</td>
+									<td>{row.name}</td>
+									<td>{csvUpdateCategoryLabel(row.category)}</td>
+									<td>
+										{#if row.category === 'changed'}
+											{formatCsvUpdateDiffs(row.diffs)}
+										{:else}
+											{row.message ?? ''}
+										{/if}
+									</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+				</div>
+
+				{#if csvUpdateClassification.errorCount > 0}
+					<div class="actions">
+						<button
+							type="button"
+							class="secondary"
+							data-testid="tag-csv-error-download"
+							onclick={handleDownloadCsvErrorRows}>エラー行をCSVでダウンロード</button
+						>
+					</div>
+				{/if}
+
+				{#if csvUpdateClassification.updateRows.length === 0}
+					<p class="note">変更対象がありません。</p>
+				{/if}
+
+				{#if csvUpdateValidationResult}
+					{@render csvUpdateBatchRowErrors(csvUpdateValidationResult, csvUpdateChangedRows)}
+				{/if}
+
+				<div class="actions">
+					<button
+						type="button"
+						data-testid="tag-csv-update-validate"
+						onclick={handleValidateCsvUpdate}
+						disabled={csvUpdateClassification.updateRows.length === 0 || isDrawerBusy()}
+						>検証</button
+					>
+					<button
+						type="button"
+						data-testid="tag-csv-update-apply"
+						onclick={handleApplyCsvUpdate}
+						disabled={!csvUpdateValidatedFresh || isDrawerBusy()}>更新を適用</button
+					>
+					{#if csvUpdateClassification.updateRows.length > 0 && !csvUpdateValidatedFresh}
 						<span class="hint"
 							>先に「検証」を実行してください（ファイルを差し替えると再検証が必要）。</span
 						>
@@ -2840,6 +3266,18 @@
 		align-items: center;
 		gap: 0.6rem;
 		flex-wrap: wrap;
+	}
+
+	/* T18-3d: CSVエクスポートの出力範囲セレクタ（ツールバー内、既存の
+		`.field select` は Drawer 内専用のため流用せずここで最小定義する）。 */
+	.csv-export-scope {
+		padding: 0.4rem 0.5rem;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+		background: var(--banto-bg);
+		color: var(--banto-text);
+		font-size: 0.8rem;
+		font-family: inherit;
 	}
 
 	.search-box {
@@ -3145,6 +3583,35 @@
 		overflow: auto;
 		border: 1px solid var(--banto-border);
 		border-radius: var(--banto-radius);
+	}
+
+	/* T18-3d: CSV インポートモード切替（新規追加/既存更新）のラジオ行。 */
+	.csv-mode-field {
+		flex-direction: row;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 0.75rem;
+	}
+
+	.csv-mode-label {
+		font-weight: 600;
+	}
+
+	.csv-mode-options {
+		display: flex;
+		gap: 1rem;
+	}
+
+	.csv-mode-options label {
+		display: flex;
+		align-items: center;
+		gap: 0.3rem;
+		font-weight: normal;
+		color: var(--banto-text);
+	}
+
+	.csv-mode-options input {
+		width: auto;
 	}
 
 	.preview-table,
