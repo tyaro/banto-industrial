@@ -137,4 +137,31 @@ test.describe.serial('banto-hub pending apply/cancel', () => {
 		const tags = (await tagsRes.json()) as Array<{ name: string }>;
 		expect(tags.some((tag) => tag.name === `e2e-pending-apply-${RUN_ID}`)).toBe(true);
 	});
+
+	test('3. 失敗した提案を再試行して適用できる（一過性失敗からの回復）', async () => {
+		const pendingId = await queueTagWhileRunning(`e2e-pending-requeue-${RUN_ID}`);
+		const authedHeaders = { ...CSRF_HEADERS, Authorization: `Bearer ${token}` };
+
+		await page.goto('/status');
+		await expect(page.getByRole('heading', { level: 2, name: 'Pending changes' })).toBeVisible();
+
+		const row = page.locator('tbody tr', { hasText: `#${pendingId}` });
+		await expect(row).toBeVisible();
+
+		// 収集稼働中に適用 → 409 collection_edit_locked で failed になる。
+		await row.getByRole('button', { name: '適用' }).click();
+		await expect(row).toContainText('失敗');
+
+		// 再試行で pending に差し戻る。
+		await row.getByRole('button', { name: '再試行' }).click();
+		await expect(row).toContainText('保留中');
+		await expect(row.getByRole('button', { name: '再試行' })).toHaveCount(0);
+
+		// 収集を止めてから適用すると成功する。
+		const stopRes = await page.request.post('/api/collection/stop', { headers: authedHeaders });
+		expect(stopRes.ok()).toBe(true);
+
+		await row.getByRole('button', { name: '適用' }).click();
+		await expect(row).toContainText('適用済み');
+	});
 });

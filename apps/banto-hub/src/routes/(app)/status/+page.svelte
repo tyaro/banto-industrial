@@ -31,6 +31,7 @@
 		cancelPendingChange,
 		isPendingApplyConflictError,
 		listPendingChanges,
+		requeuePendingChange,
 		type PendingChange
 	} from '$lib/banto/pendingChangesAdmin';
 	import { toastStore } from '$lib/toast.svelte';
@@ -257,6 +258,19 @@
 		try {
 			await cancelPendingChange(change.id);
 			toastStore.push('success', `pending change #${change.id} をキャンセルしました`);
+			await poll();
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			pendingActionId = null;
+		}
+	}
+
+	async function handleRequeuePending(change: PendingChange): Promise<void> {
+		pendingActionId = change.id;
+		try {
+			await requeuePendingChange(change.id);
+			toastStore.push('success', `pending change #${change.id} を再試行キューへ戻しました`);
 			await poll();
 		} catch (err) {
 			toastStore.push('error', errorMessage(err));
@@ -600,6 +614,13 @@
 											</div>
 										{:else if change.state === 'failed'}
 											<div class="pending-actions">
+												<button
+													type="button"
+													onclick={() => void handleRequeuePending(change)}
+													disabled={pendingActionId !== null}
+												>
+													再試行
+												</button>
 												<button
 													type="button"
 													class="danger"
