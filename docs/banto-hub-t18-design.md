@@ -1,7 +1,7 @@
 # banto-hub T18 詳細設計・実行プラン（UI/UX・タグ登録改善）
 
 作成日: 2026-08-12
-状態: **計画確定（2026-08-12 オーナー承認、§4 決定済み）。T18-2 完了（a〜e、PR #132〜#136）。T18-3 進行中（a/b/c/d 完了、次は e）。T18-4 完了（a〜c）。T18-5a 第1段完了（フロント最適化のみ、2026-08-13）、第2段・T18-5b〜d は未着手**。T18-1 は完了（TAG-P0-1 / TAG-P0-2 / TAG-UX-C /
+状態: **計画確定（2026-08-12 オーナー承認、§4 決定済み）。T18-2 完了（a〜e、PR #132〜#136）。T18-3 進行中（a/b/c/d 完了、次は e）。T18-4 完了（a〜c）。T18-5a 第1段完了（フロント最適化のみ、2026-08-13）。T18-5b 完了（T18 機能の E2E を CI へ追加、2026-08-13）。第2段・T18-5c/d は未着手**。T18-1 は完了（TAG-P0-1 / TAG-P0-2 / TAG-UX-C /
 TAG-P0-3=pending queue、#119/#126 ほか）。本書は残る **T18-3〜T18-5** を実装可能な粒度の
 サブスライスへ分解し、依存・受け入れ・工数感・実行順・未決事項を定める。詳細な UX 設計と決定は
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §9.4（TAG-UX-A〜H）・§9.5（TAG-UX-1〜6 決定）を
@@ -88,8 +88,18 @@ TAG-UX-5（構成パッケージ export/import）は T17 が所有し #119 で�
   1,000 件（`PREVIEW_DISPLAY_LIMIT`＝`MAX_CONTINUOUS_COUNT` と同値。連続登録の最大1000行は
   全表示、CSV 最大10000行が上限化される）に制限（検証・適用・件数サマリ・エラー一覧は全件のまま）。
   **第2段**（一覧のサーバー paging/search/sort、Tree/プレビューの仮想化、性能目標の実測）は別途対応。
-- **T18-5b 総合 E2E を CI へ**: banto-hub のページ E2E を CI に載せ、H5 の同アプリ残件を完了（H5 は banto-hub 分は
-  既に整備済み、本項は T18 機能の E2E 追加）。
+- **T18-5b 総合 E2E を CI へ** ✅完了（2026-08-13）: banto-hub のページ E2E を CI に載せ、H5 の同アプリ残件を完了
+  （H5 は banto-hub 分は既に整備済み、本項は T18 機能の E2E 追加）。`e2e/tests-banto-hub/` に T18 機能の
+  Playwright スペックを追加した（`banto-hub.playwright.config.ts` の `testMatch: 'banto-hub-*.spec.ts'` に
+  ファイル名で自動一致するため、CI ワークフロー（`pnpm e2e:banto-hub`）の変更は不要）:
+  `banto-hub-tags-duplicate`（T18-3a 複製）/`banto-hub-tags-bulk`（T18-3b 一括有効化・無効化・グループ移動）/
+  `banto-hub-tags-continuous-radix`（T18-3c `X1E→X1F→X20`・`D100.14→D100.15→D101.0`）/
+  `banto-hub-tags-csv`（T18-3d CSV 新規/更新・テンプレDL・エクスポート）/
+  `banto-hub-tags-monitor-tree`（T18-4a/4c モニタ Tree/検索・`?group=`/`?focus=` ディープリンク）/
+  `banto-hub-tags-onboarding-cta`（T18-4c 登録後の確認 CTA）。前提データは REST 直叩き（`simulation:true`、実 PLC 不要）、
+  固定名は `RUN_ID` で一意化し、共有 DB を成長させない（後続 spec が仮想化グリッドで自分の行を見失わないよう
+  `afterAll` で作成分を掃除する）。全 spec は `banto-hub-smoke` より辞書順で後に置く（先に走ると smoke の初回
+  セットアップ DOM 検証を壊すため、モニタ系も `banto-hub-tags-monitor-*` としている）。
 - **T18-5c Windows 往復・狭幅/倍率検証**: アプリ→サービス→アプリ往復、1280×720/1024×768/800×600・125%/150%。
 - **T18-5d 72h soak（T5-4/H7①共通）**: 一度だけ実行し T5-5 実 PLC サインオフとは別に記録。運用ガイド/README/
   設計書/全体計画を更新。
