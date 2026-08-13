@@ -1,7 +1,7 @@
 # banto-hub T18 詳細設計・実行プラン（UI/UX・タグ登録改善）
 
 作成日: 2026-08-12
-状態: **計画確定（2026-08-12 オーナー承認、§4 決定済み）。T18-2 完了（a〜e、PR #132〜#136）。T18-3 進行中（a/b/c/d 完了、次は e）。T18-4 完了（a〜c）。次は T18-5**。T18-1 は完了（TAG-P0-1 / TAG-P0-2 / TAG-UX-C /
+状態: **計画確定（2026-08-12 オーナー承認、§4 決定済み）。T18-2 完了（a〜e、PR #132〜#136）。T18-3 進行中（a/b/c/d 完了、次は e）。T18-4 完了（a〜c）。T18-5a 第1段完了（フロント最適化のみ、2026-08-13）、第2段・T18-5b〜d は未着手**。T18-1 は完了（TAG-P0-1 / TAG-P0-2 / TAG-UX-C /
 TAG-P0-3=pending queue、#119/#126 ほか）。本書は残る **T18-3〜T18-5** を実装可能な粒度の
 サブスライスへ分解し、依存・受け入れ・工数感・実行順・未決事項を定める。詳細な UX 設計と決定は
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §9.4（TAG-UX-A〜H）・§9.5（TAG-UX-1〜6 決定）を
@@ -82,6 +82,11 @@ TAG-UX-5（構成パッケージ export/import）は T17 が所有し #119 で�
 - **T18-5a 大量タグ性能（TAG-UX-H）**: Tree 構築を `O(T+G+C)` 化、閾値超で一覧をサーバー paging/search/sort へ、
   Tree/一括プレビューの仮想化。受け入れ: 10,000 タグ・500 グループで初期操作可能まで 2 秒、検索 p95 100ms、
   1,000 件 dry-run/適用 5 秒・Collector 再構成 1 回。
+  **第1段（2026-08-13、フロント最適化のみ）完了**: ConnectionTree の Tree 構築を
+  `connectionTreeBuild.ts`（`buildTagCountsByGroup`/`buildGroupsByConnection`）で
+  `O(T+G+C)` 化、連続登録/CSV新規/CSV更新差分/一括操作差分の4プレビュー表を表示のみ先頭
+  500 件（`PREVIEW_DISPLAY_LIMIT`）に制限（検証・適用・件数サマリ・エラー一覧は全件のまま）。
+  **第2段**（一覧のサーバー paging/search/sort、Tree/プレビューの仮想化、性能目標の実測）は別途対応。
 - **T18-5b 総合 E2E を CI へ**: banto-hub のページ E2E を CI に載せ、H5 の同アプリ残件を完了（H5 は banto-hub 分は
   既に整備済み、本項は T18 機能の E2E 追加）。
 - **T18-5c Windows 往復・狭幅/倍率検証**: アプリ→サービス→アプリ往復、1280×720/1024×768/800×600・125%/150%。

@@ -135,6 +135,18 @@
 		{ value: 'string', label: 'string（文字列）' }
 	];
 
+	/**
+	 * T18-5a（docs/banto-hub-t18-design.md「T18-5a 大量タグ性能」第1段）:
+	 * 一括登録/更新のプレビュー表（連続登録・CSV新規・CSV更新差分・一括操作
+	 * 差分の4箇所）は最大 MAX_CSV_ROWS（10,000行）まで全件を DOM 描画して
+	 * いたため、大規模 CSV では描画が重くなる。検証（dryRun）・適用
+	 * （createTagsBatch/updateTagsBatch 等）・件数サマリ・エラー一覧は
+	 * 引き続き全件を対象にしたまま、`{#each}` に渡す配列だけ先頭
+	 * PREVIEW_DISPLAY_LIMIT 件に絞る（サーバーページング/windowed grid化
+	 * する第2段は別途対応）。
+	 */
+	const PREVIEW_DISPLAY_LIMIT = 500;
+
 	const canWrite = $derived(canWriteResources(sessionStore.role));
 
 	function errorMessage(err: unknown): string {
@@ -2514,6 +2526,22 @@
 	{/if}
 {/snippet}
 
+{#snippet previewLimitNote(totalCount: number)}
+	<!--
+		T18-5a（docs/banto-hub-t18-design.md「T18-5a 大量タグ性能」第1段）:
+		連続登録/CSV新規/CSV更新差分/一括操作差分の4プレビュー表で共通の
+		「表示だけ先頭 PREVIEW_DISPLAY_LIMIT 件に絞る」注記。検証・適用・
+		件数サマリ・エラー一覧（batchRowErrors 系）はこの注記と無関係に
+		全件を対象にしたまま動く。
+	-->
+	{#if totalCount > PREVIEW_DISPLAY_LIMIT}
+		<p class="note">
+			ほか {totalCount - PREVIEW_DISPLAY_LIMIT} 件は表示を省略しています（検証・適用は全 {totalCount}
+			件を対象に行われます。エラーは下の一覧に全件表示されます）
+		</p>
+	{/if}
+{/snippet}
+
 <div class="page">
 	<div class="page-header">
 		<h2>タグ登録</h2>
@@ -2649,7 +2677,7 @@
 											</tr>
 										</thead>
 										<tbody>
-											{#each bulkSummary.rows as row (row.id)}
+											{#each bulkSummary.rows.slice(0, PREVIEW_DISPLAY_LIMIT) as row (row.id)}
 												<tr>
 													<td>{row.id}</td>
 													<td>{row.name}</td>
@@ -2660,6 +2688,7 @@
 										</tbody>
 									</table>
 								</div>
+								{@render previewLimitNote(bulkSummary.rows.length)}
 							{:else if bulkAction === 'move'}
 								<p class="hint">移動先グループを選択してください。</p>
 							{/if}
@@ -3034,7 +3063,7 @@
 							</tr>
 						</thead>
 						<tbody>
-							{#each continuousPreview.rows as row, i (i)}
+							{#each continuousPreview.rows.slice(0, PREVIEW_DISPLAY_LIMIT) as row, i (i)}
 								<tr>
 									<td>{i + 1}</td>
 									<td>{row.name}</td>
@@ -3044,6 +3073,7 @@
 						</tbody>
 					</table>
 				</div>
+				{@render previewLimitNote(continuousPreview.rows.length)}
 
 				{#if validationResult}
 					{@render batchRowErrors(validationResult)}
@@ -3175,7 +3205,7 @@
 							</tr>
 						</thead>
 						<tbody>
-							{#each csvParseResult.rows as row (row.lineNumber)}
+							{#each csvParseResult.rows.slice(0, PREVIEW_DISPLAY_LIMIT) as row (row.lineNumber)}
 								<tr>
 									<td>{row.lineNumber}</td>
 									<td>{row.connectionName}</td>
@@ -3191,6 +3221,7 @@
 						</tbody>
 					</table>
 				</div>
+				{@render previewLimitNote(csvParseResult.rows.length)}
 
 				{#if csvValidationResult}
 					{@render csvBatchRowErrors(csvValidationResult, csvParseResult.rows)}
@@ -3227,7 +3258,7 @@
 							</tr>
 						</thead>
 						<tbody>
-							{#each csvUpdateClassification.rows as row (row.lineNumber)}
+							{#each csvUpdateClassification.rows.slice(0, PREVIEW_DISPLAY_LIMIT) as row (row.lineNumber)}
 								<tr>
 									<td>{row.lineNumber}</td>
 									<td>{row.name}</td>
@@ -3244,6 +3275,7 @@
 						</tbody>
 					</table>
 				</div>
+				{@render previewLimitNote(csvUpdateClassification.rows.length)}
 
 				{#if csvUpdateClassification.errorCount > 0}
 					<div class="actions">
