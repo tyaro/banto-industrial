@@ -4,15 +4,18 @@
 状態: **オーナー承認・実行中**。2026-08-12 に docs 14 文書 + コード + GitHub を全量監査した
 結果を実行順に整理したもの。**進捗（2026-08-12）: Phase 0（#119）、監査フォロー①=stale ガード（#121）・
 ②最小対応（#121）・③稼働中 import ガード（#126）、profile_lock フレーク（#122）、Swagger UI（#124）、
-P3-a audit retention（#125）、P3-b SLMP word order（#127）、P3-c SLMP 構造化エラー（文言パース完全削除、
+P3-a audit retention（#125）、P3-b SLMP word order（#127）、P3-c SLMP 構造化エラー（#129、文言パース完全削除、
 [h9-slmp-structured-error-spec.md](h9-slmp-structured-error-spec.md) 参照）マージ済み。A群の自己完結分は完了。
-残るは P3-c の broker session/transport 共通化のみ（別スライス候補、improvement-plan.md §H9）。**
+**進捗追記（2026-08-14）**: Phase 1 docs 整合（#128）完了。B群の T18 は
+[banto-hub-t18-design.md](banto-hub-t18-design.md) にて T18-2〜T18-5b 完了（#132〜#154。T18-5a 第2段は
+実測ファースト判定=目標達成、windowed 化バックログ降格）。残るは P3-c の broker session/transport 共通化
+（別スライス候補、improvement-plan.md §H9）、②failed→再試行導線、Phase 2 実機検証系（T18-5c/d 含む）。**
 個別スライスの詳細設計は既存の
 [plan.md](plan.md)・[tag-server-design.md](tag-server-design.md)・[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)・
 [banto-hub-t16-design.md](banto-hub-t16-design.md)・[banto-hub-t17-design.md](banto-hub-t17-design.md)・
 [improvement-plan.md](improvement-plan.md) を正とし、本書はそれらの残項目の**優先順位と着手順**を定める索引。
-最終検証日(監査): 2026-08-12
-基準コミット: 889f622（監査時）／`9c61a64`（#125 マージ後の現 main）
+最終検証日(監査): 2026-08-12（進捗行の同期: 2026-08-14）
+基準コミット: 889f622（監査時）／`d5ba55e`（T18-5a 判定記録後の現 main、2026-08-14）
 
 ## 0. 前提と現況
 
@@ -58,10 +61,11 @@ T17-5 構成パッケージ export/import、`.gitattributes`。
   偽り `configPackageAdmin` が依存項目をサイレントスキップ、UI は無条件に成功トースト）を、import は収集停止中
   のみ許可する事前ガード＋戻り値型の是正（202 を `QueuedWhileRunningError` で弾く）で解消。
 
-### Phase 1 — docs 整合の是正（軽量・まとめて 1 PR）
+### Phase 1 — docs 整合の是正（完了：PR #128、2026-08-12）
 
 CLAUDE.md の状態欄同期規約（H8）に反する乖離を一括是正。実装を伴わない docs 修正のため
-メインセッション直で可。
+メインセッション直で可。**下記5件すべて #128（コミット `d54d848`）で反映済み**（2026-08-14 に
+全件を現行 docs と突き合わせて解消を再確認済み）。
 
 1. [banto-hub-t14-design.md](banto-hub-t14-design.md) の状態行「実装未着手」→ T14 完了を反映。
 2. [improvement-plan.md](improvement-plan.md) H5 欄を更新（banto-hub 分の E2E は 9 spec +

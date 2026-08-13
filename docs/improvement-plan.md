@@ -248,7 +248,10 @@ transport 共通化は別スライス候補として残す(§3 H9 参照)。残�
   `pnpm e2e:banto-hub` を追加し CI に組込済み。`e2e/tests-banto-hub/` に
   banto-hub-smoke・status-pending-apply-cancel・tags-busy/continuous/
   delete-impact/dirty-confirm/form/load-state/p0-2-preflight/revision の
-  計 10 spec を実装、受け入れ条件(banto-hub E2E ジョブの追加)を充足
+  計 10 spec を実装、受け入れ条件(banto-hub E2E ジョブの追加)を充足。
+  その後 T18-5b(#151)・T18-3e(#152) で tags-bulk/continuous-radix/csv/
+  duplicate/monitor-tree/onboarding-cta/cell-edit を追加し、2026-08-14 時点で
+  計 17 spec(ほかに opt-in の性能計測 spec が別 config に 1 本、#154)
 - **残り(Phase 4)**: relay-wright の E2E(Tauri 依存で WebDriver 検討要)
 
 ### H6: サプライチェーン/再現性 — 状態: 完了(2026-08-08、#59)
