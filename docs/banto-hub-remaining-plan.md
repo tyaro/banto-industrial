@@ -8,8 +8,10 @@ P3-a audit retention（#125）、P3-b SLMP word order（#127）、P3-c SLMP 構�
 [h9-slmp-structured-error-spec.md](h9-slmp-structured-error-spec.md) 参照）マージ済み。A群の自己完結分は完了。
 **進捗追記（2026-08-14）**: Phase 1 docs 整合（#128）完了。B群の T18 は
 [banto-hub-t18-design.md](banto-hub-t18-design.md) にて T18-2〜T18-5b 完了（#132〜#154。T18-5a 第2段は
-実測ファースト判定=目標達成、windowed 化バックログ降格）。残るは P3-c の broker session/transport 共通化
-（別スライス候補、improvement-plan.md §H9）、②failed→再試行導線、Phase 2 実機検証系（T18-5c/d 含む）。**
+実測ファースト判定=目標達成、windowed 化バックログ降格）。②failed→再試行（再キュー）導線を
+`claude/pending-requeue` ブランチで実装完了（下記 Phase 0.5 参照）。残るは P3-c の broker
+session/transport 共通化（別スライス候補、improvement-plan.md §H9）、Phase 2 実機検証系
+（T18-5c/d 含む）。**
 個別スライスの詳細設計は既存の
 [plan.md](plan.md)・[tag-server-design.md](tag-server-design.md)・[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)・
 [banto-hub-t16-design.md](banto-hub-t16-design.md)・[banto-hub-t17-design.md](banto-hub-t17-design.md)・
@@ -55,8 +57,13 @@ T17-5 構成パッケージ export/import、`.gitattributes`。
   `collection_groups` の apply が無警告で上書きしていた問題を、per-resource フィンガープリント方式
   （enqueue 時に対象の現在値を保存 → apply 直前に再突合、不一致/消失なら Conflict 失敗）で解消。
   グローバル revision 突合は apply が revision を上げるためキュー複数適用を壊す点を回避（回帰テスト済み）。
-- **② 中 → 最小対応済み（#121 同梱）／一部残**: `failed` 行のキャンセル導線（cancel を Failed→Canceled
-  拡張）と `failure_reason` への実エラー保持は実装済み。**残: `failed` からの「再試行（再キュー）」導線は未実装**。
+- **② 中 → 完了（`claude/pending-requeue`、2026-08-14）**: `failed` 行のキャンセル導線（cancel を
+  Failed→Canceled 拡張）と `failure_reason` への実エラー保持は #121 で実装済み。**`failed` からの
+  「再試行（再キュー）」導線を追加実装**: `requeue_pending`（Failed→Pending、`base_fingerprint`・
+  `payload`・`base_configured_revision` は据え置き）、`POST /api/pending-changes/{id}/requeue`、
+  status 画面の「再試行」ボタン。fingerprint を再計算しないことで、再 apply 時に既存の
+  ステイルガードが再チェックされ、一過性失敗（収集稼働中の 409 等）は再試行で回復し、真の
+  コンフリクト（enqueue 後の別経路変更）は再度安全に fail する。
 - **③ 中 → 完了（#126）**: 稼働中 import の誤成功表示（`tagRegistryAdmin.ts` が 202（queued）を作成済み型と
   偽り `configPackageAdmin` が依存項目をサイレントスキップ、UI は無条件に成功トースト）を、import は収集停止中
   のみ許可する事前ガード＋戻り値型の是正（202 を `QueuedWhileRunningError` で弾く）で解消。

@@ -783,6 +783,17 @@ pending change が `failed` になり、`failure_reason` に日本語の説明�
 （`TagUpdateError::RevisionConflict`）で個別にガードされているため、
 本ガードの対象外のまま。
 
+**追加実装（`claude/pending-requeue`、2026-08-14）**: `failed` の提案を
+`pending` へ差し戻す「再試行（再キュー）」導線を追加した
+（`PendingChangesService::requeue_pending`、`POST
+/api/pending-changes/{id}/requeue`、status 画面「再試行」ボタン）。
+`base_fingerprint`・`payload`・`base_configured_revision` はあえて
+再計算せず据え置く — 据え置けば再 apply 時に上記フィンガープリント
+ガードが同じ内容で再チェックされるため、収集稼働中の 409 のような
+一過性失敗は再試行で回復でき、enqueue 後に対象行が別経路で変わって
+いる真のコンフリクトは再試行後も安全に再度 fail する（黙って上書き
+しない）。
+
 ### 9.4 タグ登録 UI/UX 改善パッケージ
 
 #### TAG-UX-A: 初回導線と親設定の引継ぎ（P1）
