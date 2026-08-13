@@ -9,13 +9,27 @@
 	 * 「エンジンの PLC セッションを共有する（実機は SLMP 同時接続を1本しか
 	 * 受けない）」という制約から来ていたが、この画面は WS 経由で
 	 * `CollectorManager` の現在値スナップショットを読むだけで、独自の PLC
-	 * セッションを持たないためその制約が存在しない。よってツリーではなく
-	 * フラットな一覧 + 接続/グループのプルダウンフィルタにした。書き込み
-	 * UI も一切持たない（ux-plan.md §2「書き込み操作は付けない」）。
+	 * セッションを持たないためその制約が存在しない。書き込み UI も一切
+	 * 持たない（ux-plan.md §2「書き込み操作は付けない」）。
+	 *
+	 * T18-4a（docs/banto-hub-t18-design.md「T18-4a モニタの Tree/検索統合」、
+	 * T13-2 移管）: 当初のフラット一覧 + 接続/グループのプルダウン
+	 * フィルタを、タグ登録ページ（`(app)/tags/+page.svelte`）と同じ
+	 * SplitPane + ConnectionTree + 検索ボックスの Tree/検索 UI へ置換した -
+	 * 登録と同じ操作感でモニタ対象を絞り込めるようにする、という目的の
+	 * スライス。ツリー・絞り込みは表示専用（`ConnectionTree` の
+	 * `oncontextmenu` は渡さない - このページに作成系 UI は無い）。ツリーへ
+	 * 渡す `connections`/`groups`/`adminTags` は tagRegistryAdmin.ts の既存
+	 * 一覧 API から読むだけの補助データで、値表示自体は従来どおり
+	 * catalog（`rows`）+ WS が正。絞り込みロジックは依存ゼロの純関数
+	 * `filterMonitorRows`（`$lib/banto/monitorFilter.ts`）に切り出してある。
+	 * WS 購読のロジック（`connectTagStream` 呼び出し）自体は変更していない
+	 * （購読最適化は T18-4b の別スライス）。
 	 *
 	 * 権限: relay-wright のモニタは書き込みセルを editor 以上に限定するが、
 	 * この画面には書き込み要素が無いため viewer を含む全ロールが無条件で
-	 * 閲覧できる（ゲートすべき対象が無い）。
+	 * 閲覧できる（ゲートすべき対象が無い）。ツリー・検索も同様に読み取り
+	 * 専用の絞り込みでしかないため、権限ゲートは追加しない。
 	 */
 	import { toastStore } from '$lib/toast.svelte';
 	import {
@@ -24,6 +38,18 @@
 		type CatalogTagEntry,
 		type StreamValue
 	} from '$lib/banto/tagMonitorAdmin';
+	import {
+		listPlcConnections,
+		listCollectionGroups,
+		listTags,
+		type PlcConnection,
+		type CollectionGroup,
+		type Tag
+	} from '$lib/banto/tagRegistryAdmin';
+	import { filterMonitorRows, type MonitorTreeFilter } from '$lib/banto/monitorFilter';
+	import SplitPane from '$lib/components/SplitPane.svelte';
+	import ConnectionTree from '$lib/components/ConnectionTree.svelte';
+	import type { ConnectionTreeNodeData } from '$lib/components/connectionTreeTypes';
 	import { isProviderError } from '@banto/admin-core';
 
 	/** catalog の1タグ + WS から届く最新の現在値。 */
@@ -80,6 +106,33 @@
 		}
 	}
 
+	// --- T18-4a: ツリー表示専用の補助データ（接続/収集グループ/タグ）------
+	//
+	// `ConnectionTree` に渡すためだけにロードする - 値表示自体は catalog
+	// （`rows`）+ WS のまま変えない。tags ページの `reload()` と違い、この
+	// 画面の一次表示は `rows` なので、失敗時も `rows` はそのまま・
+	// エラートーストだけ出す（`loadError`/空状態は catalog 側の責務のまま
+	// 触らない）。
+
+	let connections = $state<PlcConnection[]>([]);
+	let groups = $state<CollectionGroup[]>([]);
+	let adminTags = $state<Tag[]>([]);
+
+	async function reloadAdmin(): Promise<void> {
+		try {
+			const [nextConnections, nextGroups, nextTags] = await Promise.all([
+				listPlcConnections(),
+				listCollectionGroups(),
+				listTags()
+			]);
+			connections = nextConnections;
+			groups = nextGroups;
+			adminTags = nextTags;
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		}
+	}
+
 	function applyStreamData(values: StreamValue[]): void {
 		const byTag = new Map(values.map((v) => [v.tag, v]));
 		if (byTag.size === 0) return;
@@ -93,10 +146,14 @@
 
 	$effect(() => {
 		void reloadCatalog();
+		void reloadAdmin();
 
 		const disconnect = connectTagStream({
 			onData: applyStreamData,
-			onConfigChanged: () => void reloadCatalog(),
+			onConfigChanged: () => {
+				void reloadCatalog();
+				void reloadAdmin();
+			},
 			onStatusChange: (connected) => {
 				wsConnected = connected;
 			}
@@ -107,24 +164,28 @@
 		};
 	});
 
-	// --- フィルタ（接続・グループ、クライアント側のみ・再取得なし） ---------
-	let connectionFilter = $state('');
-	let groupFilter = $state('');
+	// --- T18-4a: ツリー選択 + 検索（クライアント側のみ・再取得なし） --------
+	//
+	// tags ページの `TreeFilter`/`handleTreeSelect`/`treeSelectedId` と同じ
+	// 形（`monitorFilter.ts` 冒頭の doc comment 参照）。
 
-	const connectionOptions = $derived(
-		Array.from(new Set(rows.map((r) => r.connection))).sort((a, b) => a.localeCompare(b))
-	);
-	const groupOptions = $derived(
-		Array.from(new Set(rows.map((r) => r.group))).sort((a, b) => a.localeCompare(b))
-	);
+	let treeFilter: MonitorTreeFilter = $state({ type: 'all' });
+	let searchQuery = $state('');
 
-	const filteredRows = $derived(
-		rows.filter(
-			(r) =>
-				(connectionFilter === '' || r.connection === connectionFilter) &&
-				(groupFilter === '' || r.group === groupFilter)
-		)
-	);
+	const treeSelectedId = $derived.by((): string => {
+		if (treeFilter.type === 'all') return 'all';
+		if (treeFilter.type === 'connection') return `conn:${treeFilter.id}`;
+		return `group:${treeFilter.id}`;
+	});
+
+	function handleTreeSelect(data: ConnectionTreeNodeData): void {
+		if (data.kind === 'all') treeFilter = { type: 'all' };
+		else if (data.kind === 'connection')
+			treeFilter = { type: 'connection', id: data.connection.id };
+		else treeFilter = { type: 'group', id: data.group.id };
+	}
+
+	const filteredRows = $derived(filterMonitorRows(rows, treeFilter, searchQuery));
 
 	const qualityLabels: Record<string, string> = {
 		good: '良好',
@@ -155,7 +216,7 @@
 </script>
 
 <div class="page">
-	<section>
+	<div class="page-header">
 		<h2>タグモニタ</h2>
 		<p class="note">
 			登録済みタグの現在値をリアルタイム表示します（WebSocket購読、書き込み機能はありません）。
@@ -170,96 +231,112 @@
 		{#if loadError}
 			<p class="error-text">{loadError}</p>
 		{/if}
+	</div>
 
-		<div class="filters">
-			<label class="field">
-				接続
-				<select bind:value={connectionFilter}>
-					<option value="">すべて</option>
-					{#each connectionOptions as name (name)}
-						<option value={name}>{name}</option>
-					{/each}
-				</select>
-			</label>
-			<label class="field">
-				グループ
-				<select bind:value={groupFilter}>
-					<option value="">すべて</option>
-					{#each groupOptions as name (name)}
-						<option value={name}>{name}</option>
-					{/each}
-				</select>
-			</label>
-			<span class="muted small count">{filteredRows.length} / {rows.length} 件</span>
+	{#if loading && rows.length === 0}
+		<p class="note">読み込み中…</p>
+	{:else if rows.length === 0}
+		<!--
+			T18-2d（docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A「空状態を…
+			不足する前工程と移動ボタンを示す」）: タグが1件も無い（フィルタの
+			問題ではなく真の空）場合は、前工程（タグ登録）へ案内する。ツリー/
+			検索を出しても絞り込む対象が無いので、SplitPane は出さない。
+		-->
+		<p class="note">
+			登録されているタグがありません。先に タグの登録画面 からタグを作成してください。
+		</p>
+		<a class="onboarding-cta" href="/tags">タグの登録画面へ移動</a>
+	{:else}
+		<!--
+			T18-4a: タグ登録ページと同じ SplitPane + ConnectionTree + 検索
+			ボックス。左ツリーは接続/グループを選択して絞り込むだけの表示専用
+			（`oncontextmenu` は渡さない - このページに作成系 UI は無い）。
+		-->
+		<div class="content">
+			<SplitPane leftWidth="280px">
+				{#snippet left()}
+					<ConnectionTree
+						{connections}
+						{groups}
+						tags={adminTags}
+						selectedId={treeSelectedId}
+						onselect={handleTreeSelect}
+					/>
+				{/snippet}
+				{#snippet right()}
+					<div class="right-pane">
+						<div class="toolbar">
+							<input
+								type="search"
+								class="search-box"
+								placeholder="外部名・名前・アドレスで検索"
+								bind:value={searchQuery}
+							/>
+							<span class="count">{filteredRows.length} / {rows.length} 件</span>
+						</div>
+						{#if filteredRows.length === 0}
+							<p class="note">条件に一致するタグがありません。</p>
+						{:else}
+							<div class="table-wrap">
+								<table class="values-table">
+									<thead>
+										<tr>
+											<th>外部名</th>
+											<th>接続</th>
+											<th>グループ</th>
+											<th>値</th>
+											<th>品質</th>
+											<th>時刻</th>
+										</tr>
+									</thead>
+									<tbody>
+										{#each filteredRows as row (row.external_name)}
+											<tr class:flash={flashing[row.external_name]}>
+												<td class="tag-name">{row.external_name}</td>
+												<td>
+													{row.connection}
+													{#if row.simulation}
+														<span
+															class="sim-badge"
+															title="シミュレーション接続（実機ではありません）">⚠ SIM</span
+														>
+													{/if}
+												</td>
+												<td>{row.group}</td>
+												<td class="value quality-{qualityClass(row.q)}">{formatValue(row)}</td>
+												<td class="quality quality-{qualityClass(row.q)}">{qualityLabel(row.q)}</td>
+												<td>{formatTime(row.t)}</td>
+											</tr>
+										{/each}
+									</tbody>
+								</table>
+							</div>
+						{/if}
+					</div>
+				{/snippet}
+			</SplitPane>
 		</div>
-
-		{#if loading && rows.length === 0}
-			<p class="note">読み込み中…</p>
-		{:else if rows.length === 0}
-			<!--
-				T18-2d（docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A「空状態を…
-				不足する前工程と移動ボタンを示す」）: タグが1件も無い（フィルタの
-				問題ではなく真の空）場合は、前工程（タグ登録）へ案内する。
-			-->
-			<p class="note">
-				登録されているタグがありません。先に タグの登録画面 からタグを作成してください。
-			</p>
-			<a class="onboarding-cta" href="/tags">タグの登録画面へ移動</a>
-		{:else if filteredRows.length === 0}
-			<p class="note">条件に一致するタグがありません。</p>
-		{:else}
-			<div class="table-wrap">
-				<table class="values-table">
-					<thead>
-						<tr>
-							<th>外部名</th>
-							<th>接続</th>
-							<th>グループ</th>
-							<th>値</th>
-							<th>品質</th>
-							<th>時刻</th>
-						</tr>
-					</thead>
-					<tbody>
-						{#each filteredRows as row (row.external_name)}
-							<tr class:flash={flashing[row.external_name]}>
-								<td class="tag-name">{row.external_name}</td>
-								<td>
-									{row.connection}
-									{#if row.simulation}
-										<span class="sim-badge" title="シミュレーション接続（実機ではありません）"
-											>⚠ SIM</span
-										>
-									{/if}
-								</td>
-								<td>{row.group}</td>
-								<td class="value quality-{qualityClass(row.q)}">{formatValue(row)}</td>
-								<td class="quality quality-{qualityClass(row.q)}">{qualityLabel(row.q)}</td>
-								<td>{formatTime(row.t)}</td>
-							</tr>
-						{/each}
-					</tbody>
-				</table>
-			</div>
-		{/if}
-	</section>
+	{/if}
 </div>
 
 <style>
+	/* T18-4a: tags ページ（`(app)/tags/+page.svelte`）と同じ
+	   page/page-header/content/right-pane/toolbar 構成 - SplitPane が
+	   `height: 100%` を前提にしているため、画面全体を calc(100vh - ...) の
+	   flex column にして `.content` に残り高さ全部を渡す。 */
 	.page {
+		height: calc(100vh - var(--banto-shell-header-height) - 2.5rem);
 		display: flex;
 		flex-direction: column;
-		gap: 1rem;
+		min-height: 0;
+		gap: 0.75rem;
 	}
 
-	section {
-		background: var(--banto-surface);
-		border: 1px solid var(--banto-border);
-		border-radius: calc(var(--banto-radius) * 2);
-		padding: 1rem 1.25rem;
+	.page-header {
+		flex: 0 0 auto;
 	}
 
-	h2 {
+	.page-header h2 {
 		margin: 0 0 0.75rem;
 		font-size: 1.1rem;
 	}
@@ -268,14 +345,6 @@
 		margin: 0 0 0.5rem;
 		color: var(--banto-text-muted);
 		font-size: 0.8rem;
-	}
-
-	.muted {
-		color: var(--banto-text-muted);
-	}
-
-	.small {
-		font-size: 0.75rem;
 	}
 
 	.error-text {
@@ -323,34 +392,47 @@
 		background: var(--banto-danger);
 	}
 
-	.filters {
+	.content {
+		flex: 1;
+		min-height: 0;
+		background: var(--banto-surface);
+		border: 1px solid var(--banto-border);
+		border-radius: calc(var(--banto-radius) * 2);
+		overflow: hidden;
+	}
+
+	.right-pane {
 		display: flex;
-		align-items: flex-end;
-		gap: 1rem;
-		margin-bottom: 0.75rem;
+		flex-direction: column;
+		height: 100%;
+		min-height: 0;
+		gap: 0.6rem;
+		padding: 1rem 1.25rem;
+	}
+
+	.toolbar {
+		flex: 0 0 auto;
+		display: flex;
+		align-items: center;
+		gap: 0.6rem;
 		flex-wrap: wrap;
 	}
 
-	.field {
-		display: flex;
-		flex-direction: column;
-		gap: 0.3rem;
-		font-size: 0.8rem;
-		color: var(--banto-text-muted);
-	}
-
-	.field select {
-		padding: 0.35rem 0.5rem;
+	.search-box {
+		margin-left: auto;
+		min-width: 220px;
+		padding: 0.4rem 0.6rem;
 		border: 1px solid var(--banto-border);
 		border-radius: var(--banto-radius);
 		background: var(--banto-bg);
 		color: var(--banto-text);
-		min-width: 10rem;
+		font-size: 0.8rem;
 	}
 
 	.count {
-		margin-left: auto;
-		align-self: center;
+		flex: 0 0 auto;
+		color: var(--banto-text-muted);
+		font-size: 0.75rem;
 	}
 
 	table {
@@ -377,7 +459,8 @@
 	}
 
 	.table-wrap {
-		max-height: 560px;
+		flex: 1;
+		min-height: 0;
 		overflow-y: auto;
 	}
 
