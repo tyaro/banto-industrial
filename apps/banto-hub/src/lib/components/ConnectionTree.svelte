@@ -13,6 +13,7 @@
 	import TreeView from './TreeView.svelte';
 	import type { TreeNode } from './treeTypes';
 	import type { ConnectionTreeNodeData } from './connectionTreeTypes';
+	import { buildTagCountsByGroup, buildGroupsByConnection } from './connectionTreeBuild';
 	import {
 		isVirtualConnection,
 		CALC_CONNECTION_NAME,
@@ -43,16 +44,23 @@
 
 	let { connections, groups, tags, selectedId = null, onselect, oncontextmenu }: Props = $props();
 
+	// T18-5a（docs/banto-hub-t18-design.md「T18-5a 大量タグ性能」第1段）:
+	// tags/groups をそれぞれ1回だけ Map に集計する（O(T)/O(G)）。connections/
+	// groups/tags が変わらない限り再計算されないので、ラベル描画のたびに
+	// 全走査していた旧実装（tagCountForGroup の O(グループ数×タグ数)、
+	// groups.filter の O(接続数×グループ数)）を避けられる。詳細は
+	// connectionTreeBuild.ts のコメント参照。
+	const tagCountsByGroup = $derived(buildTagCountsByGroup(tags));
+	const groupsByConnection = $derived(buildGroupsByConnection(groups));
+
 	function tagCountForGroup(groupId: number): number {
-		let count = 0;
-		for (const t of tags) if (t.collectionGroupId === groupId) count++;
-		return count;
+		return tagCountsByGroup.get(groupId) ?? 0;
 	}
 
 	const nodes = $derived.by((): TreeNode<ConnectionTreeNodeData>[] => {
 		const allNode: TreeNode<ConnectionTreeNodeData> = { id: 'all', data: { kind: 'all' } };
 		const connectionNodes = connections.map((connection): TreeNode<ConnectionTreeNodeData> => {
-			const childGroups = groups.filter((g) => g.plcConnectionId === connection.id);
+			const childGroups = groupsByConnection.get(connection.id) ?? [];
 			return {
 				id: `conn:${connection.id}`,
 				data: { kind: 'connection', connection },
