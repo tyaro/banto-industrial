@@ -1,7 +1,7 @@
 # banto-hub T18 詳細設計・実行プラン（UI/UX・タグ登録改善）
 
 作成日: 2026-08-12
-状態: **計画確定（2026-08-12 オーナー承認、§4 決定済み）。T18-2 完了（a〜e、PR #132〜#136）。T18-3 完了（a〜e。e=BantoGrid セル編集/TSV貼付、2026-08-13）。T18-4 完了（a〜c）。T18-5a 第1段完了（フロント最適化のみ、2026-08-13）。T18-5b 完了（T18 機能の E2E を CI へ追加、2026-08-13）。残りは T18-5a 第2段（方式は §4 決定 6 の実測ファースト、2026-08-13 決定）・T18-5c/d（実機/soak）**。T18-1 は完了（TAG-P0-1 / TAG-P0-2 / TAG-UX-C /
+状態: **計画確定（2026-08-12 オーナー承認、§4 決定済み）。T18-2 完了（a〜e、PR #132〜#136）。T18-3 完了（a〜e。e=BantoGrid セル編集/TSV貼付、2026-08-13）。T18-4 完了（a〜c）。T18-5a 第1段完了（フロント最適化のみ、2026-08-13）。T18-5a 第2段は計測ハーネス（opt-in Playwright スペック）まで完了（2026-08-13、開発機参考実行では目標内）、基準機実測とそれに基づく windowed 化要否の最終判断は未了。T18-5b 完了（T18 機能の E2E を CI へ追加、2026-08-13）。残りは T18-5a 第2段の基準機実測・T18-5c/d（実機/soak）**。T18-1 は完了（TAG-P0-1 / TAG-P0-2 / TAG-UX-C /
 TAG-P0-3=pending queue、#119/#126 ほか）。本書は残る **T18-3〜T18-5** を実装可能な粒度の
 サブスライスへ分解し、依存・受け入れ・工数感・実行順・未決事項を定める。詳細な UX 設計と決定は
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §9.4（TAG-UX-A〜H）・§9.5（TAG-UX-1〜6 決定）を
@@ -88,6 +88,12 @@ TAG-UX-5（構成パッケージ export/import）は T17 が所有し #119 で�
   1,000 件（`PREVIEW_DISPLAY_LIMIT`＝`MAX_CONTINUOUS_COUNT` と同値。連続登録の最大1000行は
   全表示、CSV 最大10000行が上限化される）に制限（検証・適用・件数サマリ・エラー一覧は全件のまま）。
   **第2段**（一覧のサーバー paging/search/sort、Tree/プレビューの仮想化、性能目標の実測）は別途対応。
+  **計測ハーネス（2026-08-13）完了**: 決定6の実測ファースト方針に基づき、10,000 タグ・500 グループを
+  seed して決定3の性能目標を実測する opt-in・CI 対象外の Playwright スペック
+  （`e2e/tests-banto-hub-perf/perf-tags-10k.spec.ts`、専用 config・使い捨て DB、`pnpm e2e:banto-hub:perf`。
+  手順は `e2e/README.md`）を追加。基準機（Intel Core i5 第11世代・メモリ8〜16GB）以外の開発機での参考実行では
+  初期表示・検索 p95・連続登録1,000件 dry-run/適用のいずれも目標内に収まったが、基準機での実測はまだ行っておらず、
+  windowed 化の要否判断（決定6）は基準機実測後に別途行う。
 - **T18-5b 総合 E2E を CI へ** ✅完了（2026-08-13）: banto-hub のページ E2E を CI に載せ、H5 の同アプリ残件を完了
   （H5 は banto-hub 分は既に整備済み、本項は T18 機能の E2E 追加）。`e2e/tests-banto-hub/` に T18 機能の
   Playwright スペックを追加した（`banto-hub.playwright.config.ts` の `testMatch: 'banto-hub-*.spec.ts'` に
