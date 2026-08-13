@@ -43,6 +43,7 @@
 	 * 閲覧できる（ゲートすべき対象が無い）。ツリー・検索も同様に読み取り
 	 * 専用の絞り込みでしかないため、権限ゲートは追加しない。
 	 */
+	import { page } from '$app/state';
 	import { toastStore } from '$lib/toast.svelte';
 	import {
 		getCatalog,
@@ -187,6 +188,63 @@
 			treeFilter = { type: 'connection', id: data.connection.id };
 		else treeFilter = { type: 'group', id: data.group.id };
 	}
+
+	// --- T18-4c: 確認導線のディープリンク受け口 -----------------------------
+	//
+	// タグ登録ページ（`(app)/tags/+page.svelte`）の CTA（`monitorHref`、
+	// `$lib/banto/tagOnboarding.ts`）から `?group=`/`?connection=`/`?focus=`
+	// 付きで遷移してきたときに、ツリー選択と「確認対象」ハイライトへ反映
+	// する。tags ページの `onboardingQueryApplied` パターン（同ファイル
+	// 1164〜1171行目付近）と同型 - 一度だけ適用し、以後のユーザー操作
+	// （ツリー選択の変更等）を上書きしない。`treeSelectedId` は上の
+	// `$derived.by` が `treeFilter` から自動で追従するため、別途同期する
+	// 必要はない。
+
+	/** T18-4c: 上のクエリ適用を一度だけ行うためのガード。 */
+	let confirmQueryApplied = $state(false);
+	/** T18-4c: `?focus=` で渡された external_name の集合。持続的な「確認対象」強調に使う。 */
+	let focusSet = $state<Set<string>>(new Set());
+
+	/**
+	 * T18-4c: `?group=`/`?connection=` の検証は、tags ページの
+	 * `resolvePresetGroupId`/`resolvePresetConnectionId`（`tagOnboarding.ts`）
+	 * とは違い virtual（calc/mem）接続・配下グループを除外しない - あちらは
+	 * 「PLC タグ登録フォームへの親プリセット」用で calc/mem 配下には
+	 * `plc` タグを作らせない制約からの除外だが、モニタは
+	 * computed/internal タグ（calc/mem 配下に存在しうる）も含めて閲覧する
+	 * 読み取り専用画面なので、単純な存在検証だけで十分。
+	 */
+	$effect(() => {
+		if (confirmQueryApplied) return;
+		if (connections.length === 0 && groups.length === 0) return;
+		confirmQueryApplied = true;
+
+		const groupParam = page.url.searchParams.get('group');
+		const connectionParam = page.url.searchParams.get('connection');
+		if (groupParam !== null) {
+			const id = Number(groupParam);
+			if (Number.isInteger(id) && groups.some((g) => g.id === id)) {
+				treeFilter = { type: 'group', id };
+			}
+		} else if (connectionParam !== null) {
+			const id = Number(connectionParam);
+			if (Number.isInteger(id) && connections.some((c) => c.id === id)) {
+				treeFilter = { type: 'connection', id };
+			}
+		}
+
+		// `URLSearchParams.get()` はこの時点で既に1回パーセントデコード
+		// 済みの文字列を返す（`monitorHref` は各要素を `encodeURIComponent`
+		// してからカンマ区切りで連結しているだけ）。ここでさらに
+		// `decodeURIComponent` を掛けると二重デコードになり、external_name
+		// に `%` を含む値（例: `50%開度` のような名前）があると
+		// `URIError: URI malformed` で例外になる（`%` の後続がエスケープの
+		// 数値として解釈できないため）。追加のデコードはしない。
+		const focusParam = page.url.searchParams.get('focus');
+		if (focusParam) {
+			focusSet = new Set(focusParam.split(',').filter((name) => name !== ''));
+		}
+	});
 
 	// --- T18-4b: WS 接続（1本を維持） --------------------------------------
 	//
@@ -380,7 +438,10 @@
 									</thead>
 									<tbody>
 										{#each filteredRows as row (row.external_name)}
-											<tr class:flash={flashing[row.external_name]}>
+											<tr
+												class:flash={flashing[row.external_name]}
+												class:confirm-target={focusSet.has(row.external_name)}
+											>
 												<td class="tag-name">{row.external_name}</td>
 												<td>
 													{row.connection}
@@ -600,5 +661,20 @@
 	tr.flash {
 		background: color-mix(in srgb, var(--banto-primary) 16%, transparent);
 		transition: background 0.6s ease-out;
+	}
+
+	/* T18-4c（確認導線）: `?focus=` で渡された行の持続的な強調表示。
+	   `tr.flash`（一時的な値変化ハイライト、数百ms で消える）とは別物 -
+	   左ボーダー＋淡い背景を消えないまま保つ。配色は tags ページの
+	   `.tag-row-selected`（`(app)/tags/+page.svelte` の
+	   `:global(.row.tag-row-selected)`）に合わせてある。`tr.flash` と同時に
+	   付いても両立する（flash 中は一時的に background が上書きされ、
+	   flash が消えると confirm-target の背景へ遷移で戻る）。 */
+	tr.confirm-target td {
+		background: color-mix(in srgb, var(--banto-primary) 14%, transparent);
+	}
+
+	tr.confirm-target td:first-child {
+		border-left: 3px solid var(--banto-primary);
 	}
 </style>
