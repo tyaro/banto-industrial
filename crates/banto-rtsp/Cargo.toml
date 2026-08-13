@@ -1,0 +1,10 @@
+[package]
+name = "banto-rtsp"
+description = "Pure RTSP endpoint, reconnect policy, and JPEG frame primitives"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }

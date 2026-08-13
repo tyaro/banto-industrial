@@ -13,7 +13,8 @@
 # see docs/plan.md /
 # docs/r1-plan.md /
 # the relay-wright plan `luminous-discovering-goblet.md` /
-# docs/tag-server-design.md. banto crates are consumed via git-tag references
+# docs/tag-server-design.md, R1-B: crates/banto-rtsp (RTSP基礎値・JPEG
+# parser・再接続方針、ネットワークI/Oなし). banto crates are consumed via git-tag references
 # (banto docs/publishing.md).
 [workspace]
 resolver = "2"
@@ -26,6 +27,7 @@ members = [
     "crates/banto-tsquery",
     "crates/banto-broker",
     "crates/banto-expr",
+    "crates/banto-rtsp",
     "apps/chronogazer/core",
     "apps/chronogazer/src-tauri",
     "apps/relay-wright/core",
