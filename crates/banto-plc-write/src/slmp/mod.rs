@@ -109,7 +109,7 @@ pub mod simulator;
 #[cfg(test)]
 mod integration_tests;
 
-use banto_plc::{BoxFuture, SlmpConfig, SlmpCpu, SlmpDevice};
+use banto_plc::{dial_slmp, BoxFuture, PlcError, SlmpConfig, SlmpDevice};
 
 use crate::client::PlcWriteClient;
 use crate::error::PlcWriteError;
@@ -119,17 +119,6 @@ use planning::{
     plan_slmp_write_batch, plan_slmp_writes, SlmpPlannedBitWrite, SlmpWritePlanOutcome,
     WritePayload,
 };
-
-/// Map [`banto_plc::SlmpCpu`] onto the wrapped crate's `CPU`. Re-derived here
-/// (rather than reusing `banto-plc`'s mapping, which is private) for the same
-/// reason the device mapping below is.
-fn cpu_to_wire(cpu: SlmpCpu) -> slmp::CPU {
-    match cpu {
-        SlmpCpu::Q => slmp::CPU::Q,
-        SlmpCpu::R => slmp::CPU::R,
-        SlmpCpu::L => slmp::CPU::L,
-    }
-}
 
 /// Map [`banto_plc::SlmpDevice`] onto the wrapped crate's `DeviceType`.
 ///
@@ -173,23 +162,6 @@ fn device_to_wire(device: SlmpDevice) -> slmp::DeviceType {
     }
 }
 
-/// Build the wrapped crate's connection props from a [`SlmpConfig`]. Reuses the
-/// shared read-side config type (its fields are all `pub`); `banto-plc`'s own
-/// `to_wire_props` is private, so the small assembly is repeated here.
-fn to_wire_props(config: &SlmpConfig) -> slmp::SLMP4EConnectionProps {
-    slmp::SLMP4EConnectionProps {
-        ip: config.host.clone(),
-        port: config.port,
-        cpu: cpu_to_wire(config.cpu),
-        serial_id: config.serial_id,
-        network_id: config.network_id,
-        pc_id: config.pc_id,
-        io_id: config.io_id,
-        area_id: config.area_id,
-        cpu_timer: config.cpu_timer,
-    }
-}
-
 /// Translate the wrapped crate's structured [`slmp::SlmpError`] into a
 /// [`PlcWriteError`], deciding connection-fatal vs per-request `Bad`. Same
 /// mapping table as the read side's `classify_slmp_error` (`banto-plc`'s
@@ -206,6 +178,26 @@ fn classify_slmp_error(err: slmp::SlmpError) -> PlcWriteError {
         slmp::SlmpError::Timeout => PlcWriteError::ResponseTimeout,
         slmp::SlmpError::NotConnected => PlcWriteError::NotConnected,
         slmp::SlmpError::Io(e) => PlcWriteError::Connection(e.to_string()),
+    }
+}
+
+/// Map a [`banto_plc::PlcError`] coming out of [`dial_slmp`] onto this
+/// crate's [`PlcWriteError`], preserving [`SlmpWriteClient::connect`]'s
+/// former inline mapping exactly: `dial_slmp` only ever fails with
+/// [`PlcError::ConnectTimeout`] or [`PlcError::Connection`], and both carry
+/// the identical address/message `String` the old inline code built, so this
+/// unwraps and rewraps them rather than going through `PlcError`'s own
+/// `Display` (which would double up its own "接続エラー:" prefix onto the
+/// message). Not a general `PlcError` → `PlcWriteError` conversion - H9's
+/// read/write error vocabularies are deliberately separate (see this
+/// module's doc comment) - so no blanket `From` is added for the other
+/// variants; the catch-all only guards against `dial_slmp` growing a new
+/// failure mode in the future.
+fn dial_error_to_write(err: PlcError) -> PlcWriteError {
+    match err {
+        PlcError::ConnectTimeout(addr) => PlcWriteError::ConnectTimeout(addr),
+        PlcError::Connection(msg) => PlcWriteError::Connection(msg),
+        other => PlcWriteError::Connection(other.to_string()),
     }
 }
 
@@ -473,20 +465,7 @@ impl PlcWriteClient for SlmpWriteClient {
                 previous.close().await;
             }
 
-            let addr = format!("{}:{}", self.config.host, self.config.port);
-            let mut client = slmp::SLMPClient::new(to_wire_props(&self.config));
-            client.set_send_timeout(self.config.response_timeout);
-            client.set_recv_timeout(self.config.response_timeout);
-
-            tokio::time::timeout(self.config.connect_timeout, client.connect())
-                .await
-                .map_err(|_| PlcWriteError::ConnectTimeout(addr.clone()))?
-                .map_err(|e| match e {
-                    slmp::SlmpError::Timeout => PlcWriteError::ConnectTimeout(addr.clone()),
-                    other => PlcWriteError::Connection(other.to_string()),
-                })?;
-
-            self.inner = Some(client);
+            self.inner = Some(dial_slmp(&self.config).await.map_err(dial_error_to_write)?);
             Ok(())
         })
     }
