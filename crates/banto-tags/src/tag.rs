@@ -179,6 +179,18 @@ impl Tag {
     }
 }
 
+/// Per-group tag count (T18-5a 第2段, docs/banto-hub-t18-design.md §4 決定6:
+/// 薄い部品の先行配線). Lets the admin UI show "N tags" next to each
+/// collection group without pulling every tag row. `collection_group_id`
+/// carries no join to the group's name - the caller already has the group
+/// list and zips these counts onto it by id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupTagCount {
+    pub collection_group_id: i64,
+    pub tag_count: i64,
+}
+
 /// Create/update payload.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TagInput {
@@ -887,6 +899,22 @@ impl TagService {
             rows,
             total_count: total_count as u64,
         })
+    }
+
+    /// Tag counts grouped by `collection_group_id` (T18-5a 第2段,
+    /// docs/banto-hub-t18-design.md §4 決定6). A fixed aggregate, not a
+    /// `list`-style filter/sort/paginate query - covered by the existing
+    /// `idx_tags_collection_group_id` index (`migrations/0003_tags.sql`).
+    /// Groups with zero tags simply do not appear in the result; the caller
+    /// treats a missing id as `0`.
+    pub async fn count_by_group(&self) -> Result<Vec<GroupTagCount>, BantoError> {
+        sqlx::query_as::<_, GroupTagCount>(
+            "SELECT collection_group_id, COUNT(*) AS tag_count FROM tags \
+             GROUP BY collection_group_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(banto_storage::storage_error)
     }
 
     pub async fn get(&self, id: i64) -> Result<Tag, BantoError> {
@@ -3236,6 +3264,71 @@ mod tests {
         assert_eq!(result.total_count, 2);
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].name, "C");
+    }
+
+    // --- count_by_group (T18-5a 第2段, docs/banto-hub-t18-design.md §4 決定6) --
+
+    #[tokio::test]
+    async fn count_by_group_is_empty_for_an_empty_db() {
+        let (svc, _group_id) = setup().await;
+        let counts = svc
+            .count_by_group()
+            .await
+            .expect("count_by_group should succeed");
+        assert!(counts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn count_by_group_counts_tags_per_group() {
+        let (svc, group_id) = setup().await;
+        svc.create(sample_input("A", group_id)).await.unwrap();
+        svc.create(sample_input("B", group_id)).await.unwrap();
+
+        let plc_svc = PlcConnectionService::new(svc.pool.clone());
+        let conn2 = plc_svc
+            .create(PlcConnectionInput {
+                name: "PLC2".to_string(),
+                protocol: "modbus-tcp".to_string(),
+                host: "10.0.0.2".to_string(),
+                port: 502,
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+                word_order: "low_high".to_string(),
+            })
+            .await
+            .unwrap();
+        let group_svc = CollectionGroupService::new(svc.pool.clone());
+        let group2 = group_svc
+            .create(CollectionGroupInput {
+                name: "Group2".to_string(),
+                plc_connection_id: conn2.id,
+                period_ms: 1_000,
+                enabled: true,
+            })
+            .await
+            .unwrap();
+        svc.create(sample_input("C", group2.id)).await.unwrap();
+
+        let mut counts = svc
+            .count_by_group()
+            .await
+            .expect("count_by_group should succeed");
+        counts.sort_by_key(|c| c.collection_group_id);
+
+        assert_eq!(
+            counts,
+            vec![
+                GroupTagCount {
+                    collection_group_id: group_id,
+                    tag_count: 2,
+                },
+                GroupTagCount {
+                    collection_group_id: group2.id,
+                    tag_count: 1,
+                },
+            ]
+        );
     }
 
     // --- create_batch (T11-1, docs/ux-plan.md §3) --------------------------
