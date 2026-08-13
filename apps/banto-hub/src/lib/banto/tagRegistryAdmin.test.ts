@@ -46,6 +46,8 @@ import {
 	updatePlcConnection,
 	createTag,
 	updateTagsBatch,
+	listTagsPaged,
+	listTagGroupCounts,
 	isQueuedWhileRunningError,
 	QueuedWhileRunningError,
 	type PlcConnection,
@@ -196,5 +198,42 @@ describe('httpRequest の通常成功パス（200/201）は 202 分岐追加の�
 		const rows: BatchTagUpdateRow[] = [{ id: 1, expectedRevision: 1, ...tagInput }];
 		const result = await updateTagsBatch(rows, false);
 		expect(result).toEqual(batchResult);
+	});
+});
+
+describe('T18-5a 第2段（docs/banto-hub-t18-design.md §4 決定6）: listTagsPaged / listTagGroupCounts の配線', () => {
+	it('listTagsPaged は POST /api/tags/list に params をそのまま渡し ListResult<Tag> を resolve する', async () => {
+		const listResult = { rows: [tagResource], totalCount: 1 };
+		mockFetchOnce({ status: 200, ok: true, body: listResult });
+		const params = {
+			filters: [{ field: 'enabled', op: 'eq' as const, value: true }],
+			sort: [],
+			pagination: { offset: 0, limit: 50 }
+		};
+
+		const result = await listTagsPaged(params);
+
+		expect(result).toEqual(listResult);
+		const mockedFetch = fetch as unknown as ReturnType<typeof vi.fn>;
+		const [url, init] = mockedFetch.mock.calls[0] as [string, RequestInit];
+		expect(url).toBe('/api/tags/list');
+		expect(init.method).toBe('POST');
+		expect(JSON.parse(init.body as string)).toEqual(params);
+	});
+
+	it('listTagGroupCounts は GET /api/tags/group-counts で GroupTagCount[] を resolve する', async () => {
+		const counts = [
+			{ collectionGroupId: 1, tagCount: 3 },
+			{ collectionGroupId: 2, tagCount: 1 }
+		];
+		mockFetchOnce({ status: 200, ok: true, body: counts });
+
+		const result = await listTagGroupCounts();
+
+		expect(result).toEqual(counts);
+		const mockedFetch = fetch as unknown as ReturnType<typeof vi.fn>;
+		const [url, init] = mockedFetch.mock.calls[0] as [string, RequestInit];
+		expect(url).toBe('/api/tags/group-counts');
+		expect(init.method).toBe('GET');
 	});
 });

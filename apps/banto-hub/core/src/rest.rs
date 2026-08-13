@@ -74,8 +74,8 @@ use banto_server::{
 };
 use banto_tags::{
     BatchTagOutcome, BatchTagUpdateOutcome, CollectionGroup, CollectionGroupInput,
-    CollectionGroupService, PlcConnection, PlcConnectionInput, PlcConnectionService, Tag, TagInput,
-    TagService, TagUpdateError,
+    CollectionGroupService, GroupTagCount, PlcConnection, PlcConnectionInput, PlcConnectionService,
+    Tag, TagInput, TagService, TagUpdateError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -3216,6 +3216,28 @@ async fn tags_list(State(state): State<TagRegistryState>) -> Result<Json<Vec<Tag
     Ok(Json(state.tags.list(ListParams::default()).await?.rows))
 }
 
+/// `POST /api/tags/list`（T18-5a 第2段、docs/banto-hub-t18-design.md §4
+/// 決定6「薄い部品の先行配線」）: `write_audit_list`/`audit_log_list` と同型の
+/// 素通しハンドラ - `ListParams` をそのままサービスへ渡し `ListResult<Tag>`
+/// を返すだけ。認可は `GET /api/tags` と同じくルーター全体の
+/// `require_auth`（viewer 以上で読み取り可）のみで、`require_editor` は
+/// 呼ばない（読み取り専用エンドポイントのため）。
+async fn tags_list_query(
+    State(state): State<TagRegistryState>,
+    Json(params): Json<ListParams>,
+) -> Result<Json<ListResult<Tag>>, ApiError> {
+    Ok(Json(state.tags.list(params).await?))
+}
+
+/// `GET /api/tags/group-counts`（T18-5a 第2段、同 §4 決定6）: グループ別の
+/// タグ件数集計。`GET /api/tags` と同じ読み取り専用エンドポイントなので
+/// `require_auth` のみ。
+async fn tags_group_counts(
+    State(state): State<TagRegistryState>,
+) -> Result<Json<Vec<GroupTagCount>>, ApiError> {
+    Ok(Json(state.tags.count_by_group().await?))
+}
+
 async fn tags_get(
     State(state): State<TagRegistryState>,
     Path(id): Path<i64>,
@@ -4457,6 +4479,14 @@ fn tag_registry_router(
         // T18-3b (bulk tag operations): 一括更新 - 同じ理由で `/api/tags`
         // 直下の固定パス（`/api/tags/batch` と衝突しない別セグメント）。
         .route("/api/tags/batch-update", post(tags_batch_update))
+        // T18-5a 第2段 (docs/banto-hub-t18-design.md §4 決定6): `ListParams`
+        // 素通しのページング付き一覧 - `/api/tags/batch`・`/api/tags/batch-update`
+        // と同じ理由で `/api/tags/{id}` (i64 パラメータ) と衝突しない固定
+        // セグメント (axum の matchit は静的セグメント優先 - 統合テストで
+        // `/api/tags/{id}` 側の解決も併せて確認する)。
+        .route("/api/tags/list", post(tags_list_query))
+        // 同じく固定セグメント。グループ別タグ件数集計。
+        .route("/api/tags/group-counts", get(tags_group_counts))
         .with_state(state)
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
@@ -8607,5 +8637,185 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining, 2);
+    }
+
+    // --- T18-5a 第2段 (docs/banto-hub-t18-design.md §4 決定6): 薄い部品の
+    // 先行配線 - POST /api/tags/list と GET /api/tags/group-counts --------
+
+    /// `admin_post` 経由で PLC接続 → 収集グループ → タグ を1本作る。
+    /// `group_id` が `None` なら新しい接続+グループも作る、`Some` ならその
+    /// グループへタグを追加するだけ - 返り値は `(tag_id, group_id)`。
+    async fn create_tag_via_admin(
+        router: &Router,
+        token: &str,
+        suffix: &str,
+        group_id: Option<i64>,
+    ) -> (i64, i64) {
+        let group_id = match group_id {
+            Some(id) => id,
+            None => {
+                let (status, conn) = admin_post(
+                    router,
+                    "/api/plc-connections",
+                    token,
+                    json!({ "name": format!("conn-{suffix}"), "host": "127.0.0.1", "port": 15300 }),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{conn:?}");
+                let conn_id = conn["id"].as_i64().unwrap();
+                let (status, group) = admin_post(
+                    router,
+                    "/api/collection-groups",
+                    token,
+                    json!({
+                        "name": format!("group-{suffix}"),
+                        "plcConnectionId": conn_id,
+                        "periodMs": 1000
+                    }),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{group:?}");
+                group["id"].as_i64().unwrap()
+            }
+        };
+        let (status, tag) = admin_post(
+            router,
+            "/api/tags",
+            token,
+            json!({
+                "name": format!("tag-{suffix}"),
+                "collectionGroupId": group_id,
+                "address": "D100",
+                "dataType": "i16"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{tag:?}");
+        (tag["id"].as_i64().unwrap(), group_id)
+    }
+
+    /// (a) 認証なし → 401（CSRF ヘッダは付けている - `admin_routes_require_the_csrf_header`
+    /// が CSRF 側は別途カバー済みなので、ここでは認証だけを外す）。
+    #[tokio::test]
+    async fn tags_list_query_requires_auth() {
+        let env = test_env().await;
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::post("/api/tags/list")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&json!({})).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// (b) filter + sort + pagination + totalCount が `TagService::list` に
+    /// そのまま素通しされること、viewer でも読めること（`GET /api/tags` と
+    /// 同じ require_auth のみ）、(c) `/api/tags/{id}` が `/api/tags/list` と
+    /// 衝突せず両方とも正しいハンドラへ解決されることを1本で確認する。
+    #[tokio::test]
+    async fn tags_list_query_filters_paginates_and_resolves_beside_tags_id() {
+        let env = test_env().await;
+        let (tag_a, group_id) =
+            create_tag_via_admin(&env.router, &env.admin_token, "a", None).await;
+        let (tag_b, _) =
+            create_tag_via_admin(&env.router, &env.admin_token, "b", Some(group_id)).await;
+        let (_tag_c, _) =
+            create_tag_via_admin(&env.router, &env.admin_token, "c", Some(group_id)).await;
+
+        let (status, body) = admin_post(
+            &env.router,
+            "/api/tags/list",
+            &env.admin_token,
+            json!({
+                "filters": [{ "field": "collectionGroupId", "op": "eq", "value": group_id }],
+                "sort": [{ "field": "name", "direction": "asc" }],
+                "pagination": { "offset": 0, "limit": 2 }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["totalCount"], 3);
+        let rows = body["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["name"], "tag-a");
+        assert_eq!(rows[1]["name"], "tag-b");
+
+        // viewer（読み取り専用）でも読める - `require_editor` は呼ばない。
+        let (status, viewer_body) =
+            admin_post(&env.router, "/api/tags/list", &env.viewer_token, json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{viewer_body:?}");
+        assert_eq!(viewer_body["totalCount"], 3);
+
+        // (c) `/api/tags/{id}` 側も同じルーターで正しく解決される
+        // (axum の matchit は静的セグメント `/api/tags/list` を優先するため
+        // `{id}: i64` に飲み込まれない - 逆にここでは数値 id が
+        // `/api/tags/{id}` へ正しく届くことを確認する)。
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::get(format!("/api/tags/{tag_b}"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let single: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(single["id"], tag_b);
+        assert_eq!(single["name"], "tag-b");
+
+        let _ = tag_a;
+    }
+
+    /// (d) `GET /api/tags/group-counts` がグループ別のタグ件数を返すこと。
+    /// 200 が返ること自体が (c) の「`/api/tags/{id}` (`{id}: i64`) に
+    /// 飲み込まれていない」証拠でもある - 飲み込まれていれば `group-counts`
+    /// は不正な i64 として 400 になる。
+    #[tokio::test]
+    async fn tags_group_counts_returns_per_group_totals() {
+        let env = test_env().await;
+        let (_tag_a1, group1) =
+            create_tag_via_admin(&env.router, &env.admin_token, "ga1", None).await;
+        create_tag_via_admin(&env.router, &env.admin_token, "ga2", Some(group1)).await;
+        let (_tag_b1, group2) =
+            create_tag_via_admin(&env.router, &env.admin_token, "gb1", None).await;
+
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::get("/api/tags/group-counts")
+                    .header("Authorization", format!("Bearer {}", env.viewer_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let counts = body.as_array().unwrap();
+        let find = |gid: i64| {
+            counts
+                .iter()
+                .find(|c| c["collectionGroupId"] == gid)
+                .map(|c| c["tagCount"].as_i64().unwrap())
+        };
+        assert_eq!(find(group1), Some(2));
+        assert_eq!(find(group2), Some(1));
     }
 }
