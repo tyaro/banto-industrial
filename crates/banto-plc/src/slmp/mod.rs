@@ -325,6 +325,49 @@ fn classify_slmp_error(err: slmp::SlmpError) -> PlcError {
     }
 }
 
+/// Dial a fresh SLMP session against `config`: build the wrapped crate's
+/// client, wire [`SlmpConfig::response_timeout`] into its send/receive
+/// deadlines, then race `connect()` against [`SlmpConfig::connect_timeout`]
+/// and map a failure onto [`PlcError`].
+///
+/// The single shared implementation of the SLMP connect sequence (H9
+/// transport 共通化, docs/improvement-plan.md §H9): this crate's
+/// [`SlmpClient::connect`], `banto_plc_write::slmp::SlmpWriteClient::connect`,
+/// and `banto_broker`'s `connect_attempt` used to hand-roll the identical
+/// four steps independently (build the wire client, wire both timeouts, race
+/// `connect()` against the outer deadline, map `slmp::SlmpError` to this
+/// crate's error type) - this is now the one place that sequence is written,
+/// and the three callers each fold its result into their own shape (owned
+/// `Option<inner>` for the two client wrappers, a bare returned client for
+/// the broker). `classify_slmp_error` above is deliberately not reused here:
+/// it maps *request*-time failures where a non-zero end code is a per-request
+/// `Bad`, but a `connect()` failure is always connection-fatal, so this
+/// function keeps its own two-arm mapping (`Timeout` → [`PlcError::ConnectTimeout`],
+/// everything else → [`PlcError::Connection`]) exactly as all three call
+/// sites already agreed on.
+pub async fn dial_slmp(config: &SlmpConfig) -> Result<slmp::SLMPClient, PlcError> {
+    let addr = format!("{}:{}", config.host, config.port);
+    let mut client = slmp::SLMPClient::new(config.to_wire_props());
+    client.set_send_timeout(config.response_timeout);
+    client.set_recv_timeout(config.response_timeout);
+
+    tokio::time::timeout(config.connect_timeout, client.connect())
+        .await
+        .map_err(|_| PlcError::ConnectTimeout(addr.clone()))?
+        .map_err(|e| match e {
+            // The crate's own hardcoded 1s connect ceiling (see
+            // `SlmpConfig::connect_timeout`) surfaces here rather than as our
+            // outer timeout elapsing, so it has to be mapped to the same
+            // error - otherwise the same failure would be reported two
+            // different ways depending on which deadline happened to be
+            // shorter.
+            slmp::SlmpError::Timeout => PlcError::ConnectTimeout(addr.clone()),
+            other => PlcError::Connection(other.to_string()),
+        })?;
+
+    Ok(client)
+}
+
 /// The [`crate::client::PlcClient`] implementation for MELSEC MC/SLMP. One
 /// instance per PLC connection - not `Clone`, not internally reconnecting (see
 /// this module's doc comment and docs/plan.md I2 §2).
@@ -614,26 +657,7 @@ impl PlcClient for SlmpClient {
                 previous.close().await;
             }
 
-            let addr = format!("{}:{}", self.config.host, self.config.port);
-            let mut client = slmp::SLMPClient::new(self.config.to_wire_props());
-            client.set_send_timeout(self.config.response_timeout);
-            client.set_recv_timeout(self.config.response_timeout);
-
-            tokio::time::timeout(self.config.connect_timeout, client.connect())
-                .await
-                .map_err(|_| PlcError::ConnectTimeout(addr.clone()))?
-                .map_err(|e| match e {
-                    // The crate's own hardcoded 1s connect ceiling (see
-                    // `SlmpConfig::connect_timeout`) surfaces here rather than
-                    // as our outer timeout elapsing, so it has to be mapped to
-                    // the same error - otherwise the same failure would be
-                    // reported two different ways depending on which deadline
-                    // happened to be shorter.
-                    slmp::SlmpError::Timeout => PlcError::ConnectTimeout(addr.clone()),
-                    other => PlcError::Connection(other.to_string()),
-                })?;
-
-            self.inner = Some(client);
+            self.inner = Some(dial_slmp(&self.config).await?);
             Ok(())
         })
     }

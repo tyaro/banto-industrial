@@ -4,8 +4,8 @@
 状態: **実装済み**（2026-08-12）。オーナーが `tyaro/slmp`（git 依存、tag `v0.2.0`）で
 §2 の構造化エラー API を実装し、banto 側（§3）を同日中に対応した。banto-plc /
 banto-plc-write の文言パース（`END_CODE_MARKER`/`parse_end_code`/`classify_io_error`）は
-完全削除済み。broker の session/transport 共通化（§3 の5番目）は今回の対応に含めず、
-別スライス候補として improvement-plan.md §H9 に記録した。
+完全削除済み。broker の session/transport 共通化（§3 の5番目）は本書作成時点では対応に含めず
+別スライス候補としていたが、2026-08-14 に `banto_plc::dial_slmp` への集約で完了した（§3-5参照）。
 本書は (1) tyaro/slmp が公開した API と (2) それを受けて banto 側で行った変更（受け入れ条件）を記す。
 関連: [improvement-plan.md](improvement-plan.md) §H9、[banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) P3-c。
 
@@ -69,9 +69,11 @@ banto が文言パース無しで「非ゼロ終了コード」と「フレー�
    `PlcWriteError` 版として実装)。
 4. tripwire テスト2本を**構造化エラー版**へ置換済み（生の `slmp::SLMPClient` を直接叩いて
    `slmp::SlmpError::Device`/`Framing` variant を直接検証する形へ拡張）。
-5. 「broker の session/transport 層の共通化」は**今回のスコープには含めず**、別スライス候補として
+5. 「broker の session/transport 層の共通化」は本書作成時点ではスコープに含めず、別スライス候補として
    improvement-plan.md §H9 に記録した（`connect_attempt` の型変更 `io::Error`→`slmp::SlmpError` の
-   コンパイル対応のみ実施）。
+   コンパイル対応のみ実施）。その別スライスは 2026-08-14 に `banto-plc` の共有ヘルパー
+   `dial_slmp` への集約で完了（`SlmpClient::connect`/`SlmpWriteClient::connect`/
+   `banto-broker::connect_attempt` の3箇所が同一実装を共有。詳細は improvement-plan.md §H9）。
 
 **受け入れ条件（§H9、達成）**: 文言パース（`END_CODE_MARKER`）の完全削除、tripwire テストの構造化
 エラー版への置換。`grep -rn END_CODE_MARKER crates/` はヒット0。
