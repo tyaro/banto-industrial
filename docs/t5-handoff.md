@@ -1,5 +1,10 @@
 # T5（配布・運用強化）ローカルセッション引き継ぎ
 
+> **📦 アーカイブ（2026-08-14）**: 役目を終えたセッション引き継ぎメモ。内容は
+> [banto-hub-operations.md](banto-hub-operations.md)・[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)
+> に反映済み。残る T5-5（72h soak 実行 + 実機サインオフ）の現行の追跡は
+> [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) Phase 4。本書は経緯として保存。
+
 作成: 2026-08-06（クラウドセッションの区切り）。banto-hub の T 系のうち
 実機・Windows 依存のない範囲（T0〜T4 / T6〜T8）が main に入った時点の
 引き継ぎ。次はローカル（Windows）環境で T5 を進める。
