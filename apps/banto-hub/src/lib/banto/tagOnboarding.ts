@@ -100,6 +100,42 @@ export function tagsHref(groupId: number | null): string {
 	return groupId === null ? '/tags' : `/tags?groupId=${groupId}`;
 }
 
+/**
+ * T18-4c（docs/banto-hub-t18-design.md「T18-4c 確認導線」、
+ * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-H「新規／変更タグを『確認対象』
+ * として値・品質・時刻へ1クリックで移動できるようにする」）: タグ登録
+ * ページの各成功ハンドラから `/monitor` へ渡す遷移先を組み立てる。
+ *
+ * - `groupId` が指定されていれば `?group={id}`。`groupId` が無く
+ *   `connectionId` があれば `?connection={id}`（**group と connection は
+ *   同時指定しない・group を優先** - モニタのツリー絞り込みは「すべて／
+ *   接続／グループ」のいずれか1つの粒度しか選べないため）。
+ * - `focus`（対象タグの external_name 配列）が空でなければ `focus=` を
+ *   付ける。複数要素はカンマ区切りで連結し、各要素は `encodeURIComponent`
+ *   する（`URLSearchParams` は使わない - 呼び出し側で組み立てた「区切りの
+ *   カンマは生のまま、要素の中身だけ encode 済み」の文字列をそのまま
+ *   `URLSearchParams` へ渡すと、`,` まで含めて二重に percent-encode
+ *   されてしまう）。group/connection パラメータがあれば `&` で連結する。
+ * - `focus` が空配列・未指定なら `focus` パラメータ自体を付けない。
+ * - 何も指定が無ければ `/monitor` をそのまま返す。
+ */
+export function monitorHref(opts: {
+	groupId?: number | null;
+	connectionId?: number | null;
+	focus?: string[];
+}): string {
+	const params: string[] = [];
+	if (opts.groupId !== null && opts.groupId !== undefined) {
+		params.push(`group=${opts.groupId}`);
+	} else if (opts.connectionId !== null && opts.connectionId !== undefined) {
+		params.push(`connection=${opts.connectionId}`);
+	}
+	if (opts.focus && opts.focus.length > 0) {
+		params.push(`focus=${opts.focus.map((name) => encodeURIComponent(name)).join(',')}`);
+	}
+	return params.length === 0 ? '/monitor' : `/monitor?${params.join('&')}`;
+}
+
 export type OnboardingStepId = 'connection' | 'connectionTest' | 'group' | 'tag' | 'simValue';
 
 export interface OnboardingStep {

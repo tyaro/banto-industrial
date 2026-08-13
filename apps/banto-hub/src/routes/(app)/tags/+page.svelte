@@ -107,6 +107,7 @@
 	import { carryFormForNext } from '$lib/banto/tagFormCarry';
 	import { buildDuplicateFormValues } from '$lib/banto/tagDuplicate';
 	import {
+		monitorHref,
 		resolveGroupIdFromTreeSelection,
 		resolvePresetGroupId,
 		type TreeSelectionForPreset
@@ -499,12 +500,28 @@
 	}
 
 	/**
-	 * T18-2d（TAG-UX-A「タグ登録 → SIM 値確認」の最終ステップ CTA）: タグを
-	 * 1件でも作成したら「次へ: SIM値を確認」バナーを出す（`/monitor` は
-	 * WS 経由の現在値を表示するのみで、ここから直接 SIM 値の good/bad は
-	 * 判定しない - 判定はチェックリスト側 `tagOnboarding.ts` の責務）。
+	 * T18-4c（docs/banto-hub-t18-design.md「T18-4c 確認導線」、
+	 * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-H「新規／変更タグを
+	 * 『確認対象』として値・品質・時刻へ1クリックで移動できるようにする」）:
+	 * T18-2d の `showMonitorCta`（新規作成専用の真偽値）を一般化し、新規・
+	 * 複製・編集・連続登録・CSV 新規/更新取り込み・一括更新のすべての成功
+	 * 経路で使う「次はここへ」リンク先に置き換えた。`null` はバナー非表示、
+	 * 非 `null` なら `monitorHref()`（`tagOnboarding.ts`）が組み立てた
+	 * `/monitor?...` を指す。`/monitor` は WS 経由の現在値を表示するのみで、
+	 * ここから直接 SIM 値の good/bad は判定しない（判定はチェックリスト側
+	 * `tagOnboarding.ts::computeOnboardingSteps` の責務のまま）。
+	 *
+	 * **QueuedWhileRunning（収集稼働中の 202 キュー投入）では設定しない**:
+	 * 各ハンドラは `createTag`/`updateTag`/`createTagsBatch`/`updateTagsBatch`
+	 * の `await` が成功した後（＝ `QueuedWhileRunningError` が投げられず
+	 * catch に落ちなかった場合）にのみ `monitorCtaHref` を代入する。202
+	 * 応答時は `tagRegistryAdmin.ts::httpRequest` がその `await` 自体を
+	 * `QueuedWhileRunningError` として投げ、各ハンドラの `catch` ブロック
+	 * （汎用エラートーストへ委ねている箇所）に落ちるため、この代入行へは
+	 * 到達しない - 追加の分岐は不要で、既存の try/catch 構造がそのまま
+	 * 「キュー投入時は CTA を出さない」を満たす。
 	 */
-	let showMonitorCta = $state(false);
+	let monitorCtaHref: string | null = $state(null);
 
 	/**
 	 * T18-2c（docs/banto-hub-t18-design.md「T18-2c 登録後分岐と親引継ぎ」、
@@ -536,9 +553,12 @@
 		creating = true;
 		createErrors = {};
 		try {
-			await createTag(toInput(createForm));
+			const created = await createTag(toInput(createForm));
 			toastStore.push('success', '作成しました');
-			showMonitorCta = true;
+			monitorCtaHref = monitorHref({
+				groupId: created.collectionGroupId,
+				focus: [externalNameForTag(created)]
+			});
 			if (closeAfterSave) {
 				closeDrawer();
 			} else {
@@ -751,6 +771,10 @@
 				expectedRevision: selected.revision
 			});
 			toastStore.push('success', '更新しました');
+			monitorCtaHref = monitorHref({
+				groupId: updated.collectionGroupId,
+				focus: [externalNameForTag(updated)]
+			});
 			selected = updated;
 			// 保存成功後はサーバーの正規化値を基準に取り直す - 未保存
 			// 変更は無くなったので直後の dirty 判定は false になる。
@@ -840,6 +864,19 @@
 		const group = groups.find((g) => g.id === tag.collectionGroupId);
 		const connName = group ? connectionName(group.plcConnectionId) : undefined;
 		return buildExternalName(connName ?? '?', group?.name ?? `#${tag.collectionGroupId}`, tag.name);
+	}
+
+	/**
+	 * T18-4c: 複数タグの `collectionGroupId` が単一グループに収まっている
+	 * かを判定する。単一ならその ID を返し、空・複数グループへ跨る場合は
+	 * `null`（`monitorHref({ groupId: null, ... })` は `group` パラメータを
+	 * 付けない = 素の `/monitor` への絞り込み無しリンクになる - CSV/一括
+	 * 操作のように対象が複数グループへ跨りうる経路の CTA で使う）。
+	 */
+	function soleGroupId(ids: number[]): number | null {
+		if (ids.length === 0) return null;
+		const first = ids[0];
+		return ids.every((id) => id === first) ? first : null;
 	}
 
 	async function handleDelete(): Promise<void> {
@@ -1287,6 +1324,11 @@
 			validationResult = result;
 			if (result.ok) {
 				toastStore.push('success', `${result.count}件登録しました`);
+				// T18-4c: 連続登録は対象グループが単一に確定しているため
+				// group 絞りだけ渡す（対象タグ数が多くなりうるため focus は
+				// 省略 - 実装指示どおりの妥協）。フォームをリセットする前に
+				// 読む必要がある。
+				monitorCtaHref = monitorHref({ groupId: Number(continuousForm.collectionGroupId) });
 				continuousForm = blankContinuousForm();
 				continuousBaseline = blankContinuousForm();
 				invalidateContinuousValidation();
@@ -1564,6 +1606,13 @@
 			csvValidationResult = result;
 			if (result.ok) {
 				toastStore.push('success', `${result.count}件登録しました`);
+				// T18-4c: 取り込み行が単一グループに収まっていれば group 絞り、
+				// 複数グループに跨る場合は絞り無し（`soleGroupId` が null を
+				// 返す）で `/monitor` へ。`resetCsvImport()` で `csvParseResult`
+				// が消える前に読む必要がある。
+				monitorCtaHref = monitorHref({
+					groupId: soleGroupId(csvParseResult.rows.map((r) => r.tag.collectionGroupId))
+				});
 				resetCsvImport();
 				await reload();
 			} else {
@@ -1612,6 +1661,12 @@
 			csvUpdateValidationResult = result;
 			if (result.ok) {
 				toastStore.push('success', `${result.count}件更新しました`);
+				// T18-4c: 新規CSVと同じ考え方 - 更新行が単一グループに収まって
+				// いれば group 絞り、複数グループ跨ぎなら絞り無し。
+				// `resetCsvImport()` の前に `csvUpdateClassification` を読む。
+				monitorCtaHref = monitorHref({
+					groupId: soleGroupId(csvUpdateClassification.updateRows.map((r) => r.collectionGroupId))
+				});
 				resetCsvImport();
 				await reload();
 			} else {
@@ -1740,6 +1795,14 @@
 			bulkResult = result;
 			if (result.ok) {
 				toastStore.push('success', `選択した${result.count}件を一括反映しました`);
+				// T18-4c: move は移動先グループが確定しているのでそれを使う。
+				// enable/disable は選択タグ群のグループが単一なら絞り、複数
+				// グループへ跨るなら絞り無し。`closeBulkPanel()`/`selectedIds`
+				// リセットの前に `selectedTags`（選択中の $derived）を読む。
+				monitorCtaHref =
+					bulkAction === 'move' && bulkTargetGroupIdNum !== null
+						? monitorHref({ groupId: bulkTargetGroupIdNum })
+						: monitorHref({ groupId: soleGroupId(selectedTags.map((t) => t.collectionGroupId)) });
 				closeBulkPanel();
 				selectedIds = new Set();
 				await reload();
@@ -2514,7 +2577,7 @@
 					</div>
 					{#if canWrite && selectedIds.size > 0}
 						<!-- T18-3b: 選択が1件以上のときだけ出す一括操作バー
-							（`showMonitorCta` バナーと同じ帯パターン）。文言は既存トースト/
+							（`monitorCtaHref` バナーと同じ帯パターン）。文言は既存トースト/
 							ボタン名と部分文字列でも被らないものにしてある（PR #135 の教訓、
 							`handleApplyBulk`/成功トーストのコメント参照）。 -->
 						<div class="onboarding-banner" data-testid="tag-bulk-bar">
@@ -2620,19 +2683,21 @@
 							</div>
 						</div>
 					{/if}
-					{#if showMonitorCta}
-						<!-- T18-2d（TAG-UX-A「タグ登録 → SIM 値確認」）: 直近のタグ登録に続けて、
-							サイドバー探索なしで値確認まで到達できるよう案内する。文言は
-							「登録が完了しました」とし、上の成功トースト（`作成しました`）と
-							部分一致しないようにする -
-							`page.getByText('作成しました')`（`e2e/tests-banto-hub/
-							banto-hub-tags-form.spec.ts`/`banto-hub-tags-p0-2-preflight.spec.ts`）
-							がトーストと二重ヒットして strict mode violation になっていた
-							実測回帰（2026-08-12、PR #135 CI）の修正。 -->
+					{#if monitorCtaHref}
+						<!-- T18-4c（docs/banto-hub-t18-design.md「T18-4c 確認導線」）: 新規/
+							複製/編集/連続登録/CSV取り込み/一括更新のいずれの成功後にも、
+							サイドバー探索なしでその対象タグの値・品質・時刻へ1クリックで
+							移動できるよう案内する。文言はどの成功トースト（`作成しました`
+							`更新しました`/`削除しました`/一括登録・一括更新の件数付き文言）
+							とも部分一致しないようにしてある - `page.getByText('作成しました')`
+							等（`e2e/tests-banto-hub/banto-hub-tags-form.spec.ts`/
+							`banto-hub-tags-p0-2-preflight.spec.ts`）がトーストと二重ヒットして
+							strict mode violation になっていた実測回帰（2026-08-12、PR #135
+							CI）の再発防止。 -->
 						<div class="onboarding-banner">
-							<span>タグの登録が完了しました。</span>
-							<a class="onboarding-cta" href="/monitor">次へ: SIM値を確認</a>
-							<button type="button" class="secondary" onclick={() => (showMonitorCta = false)}
+							<span>モニタで値・品質・時刻を確認できます。</span>
+							<a class="onboarding-cta" href={monitorCtaHref}>確認: 値・品質・時刻を見る</a>
+							<button type="button" class="secondary" onclick={() => (monitorCtaHref = null)}
 								>閉じる</button
 							>
 						</div>
