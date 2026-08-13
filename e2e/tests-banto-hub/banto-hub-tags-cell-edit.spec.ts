@@ -150,8 +150,13 @@ test.describe.serial('banto-hub タグ表編集 (T18-3e)', () => {
 		// `data-cell-field` 属性で1つのセルを固定して掴む。
 		const enabledCell = page.locator('[data-cell-field="enabled"]');
 		await enabledCell.dblclick();
-		await enabledCell.locator('input[type="checkbox"]').uncheck();
-		// blur で commit させる。
+		// BantoGrid のチェックボックス editor はトグルした瞬間に commit され、
+		// セルがテキスト表示へ再描画されて input が detach する。`uncheck()`/
+		// `check()` は「クリック後に目的の checked 状態で安定する」ことを待つ
+		// ため、detach した input に対して検証がタイムアウトする - 事後状態を
+		// 待たない単純な `click()` でトグル（=commit）させる。
+		await enabledCell.locator('input[type="checkbox"]').click();
+		// checkbox-toggle で既に commit 済み（Tab は保険。詳細は上コメント）。
 		await page.keyboard.press('Tab');
 
 		const bar = page.getByTestId('tag-cell-edit-bar');
@@ -179,7 +184,9 @@ test.describe.serial('banto-hub タグ表編集 (T18-3e)', () => {
 	test('5. 「破棄」で保留中の編集を戻せる（適用しない）', async () => {
 		const enabledCell = page.locator('[data-cell-field="enabled"]');
 		await enabledCell.dblclick();
-		await enabledCell.locator('input[type="checkbox"]').check();
+		// テスト#2 と同じ理由で toggle は `click()`（commit で input が detach
+		// するため `check()` の事後状態待ちはタイムアウトする）。
+		await enabledCell.locator('input[type="checkbox"]').click();
 		await page.keyboard.press('Tab');
 
 		const bar = page.getByTestId('tag-cell-edit-bar');
