@@ -85,7 +85,8 @@ TAG-UX-5（構成パッケージ export/import）は T17 が所有し #119 で�
   **第1段（2026-08-13、フロント最適化のみ）完了**: ConnectionTree の Tree 構築を
   `connectionTreeBuild.ts`（`buildTagCountsByGroup`/`buildGroupsByConnection`）で
   `O(T+G+C)` 化、連続登録/CSV新規/CSV更新差分/一括操作差分の4プレビュー表を表示のみ先頭
-  500 件（`PREVIEW_DISPLAY_LIMIT`）に制限（検証・適用・件数サマリ・エラー一覧は全件のまま）。
+  1,000 件（`PREVIEW_DISPLAY_LIMIT`＝`MAX_CONTINUOUS_COUNT` と同値。連続登録の最大1000行は
+  全表示、CSV 最大10000行が上限化される）に制限（検証・適用・件数サマリ・エラー一覧は全件のまま）。
   **第2段**（一覧のサーバー paging/search/sort、Tree/プレビューの仮想化、性能目標の実測）は別途対応。
 - **T18-5b 総合 E2E を CI へ**: banto-hub のページ E2E を CI に載せ、H5 の同アプリ残件を完了（H5 は banto-hub 分は
   既に整備済み、本項は T18 機能の E2E 追加）。

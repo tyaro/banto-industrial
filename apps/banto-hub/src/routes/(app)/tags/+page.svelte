@@ -144,8 +144,15 @@
 	 * 引き続き全件を対象にしたまま、`{#each}` に渡す配列だけ先頭
 	 * PREVIEW_DISPLAY_LIMIT 件に絞る（サーバーページング/windowed grid化
 	 * する第2段は別途対応）。
+	 *
+	 * 上限は連続登録の最大点数 MAX_CONTINUOUS_COUNT（=1000）に合わせる:
+	 * 連続登録プレビュー（最大1000行）は全件表示のままにし（1000行は許容
+	 * 範囲で、`banto-hub-tags-continuous.spec.ts` の「点数1000 →
+	 * プレビュー1000件」も維持される）、真に重い CSV インポート
+	 * （最大 MAX_CSV_ROWS=10000 行）だけが上限化される（10000→1000 で
+	 * DOM 描画を1桁削減）。
 	 */
-	const PREVIEW_DISPLAY_LIMIT = 500;
+	const PREVIEW_DISPLAY_LIMIT = 1000;
 
 	const canWrite = $derived(canWriteResources(sessionStore.role));
 
