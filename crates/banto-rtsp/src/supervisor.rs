@@ -129,13 +129,20 @@ pub(crate) struct AttemptReporter {
 
 impl AttemptReporter {
     #[allow(dead_code)]
-    pub(crate) fn first_frame(&self, received_at: SystemTime) {
-        *lock_recover(&self.first_frame_seen) = true;
+    pub(crate) fn frame(&self, received_at: SystemTime) {
+        let is_first_frame = {
+            let mut first_frame_seen = lock_recover(&self.first_frame_seen);
+            let is_first = !*first_frame_seen;
+            *first_frame_seen = true;
+            is_first
+        };
         update_status(&self.shared, |status| {
-            status.state = VideoState::Live;
             status.last_frame_at = Some(received_at);
-            status.consecutive_failures = 0;
-            status.error = None;
+            if is_first_frame {
+                status.state = VideoState::Live;
+                status.consecutive_failures = 0;
+                status.error = None;
+            }
         });
     }
 
@@ -502,6 +509,7 @@ mod tests {
     enum Action {
         Fail(RtspError),
         FrameThenFail(SystemTime, RtspError),
+        FramesThenFail(SystemTime, SystemTime, RtspError),
         FrameThenStop(SystemTime),
         Stop,
     }
@@ -522,12 +530,18 @@ mod tests {
             match self.actions.pop_front().expect("script exhausted") {
                 Action::Fail(error) => Err(error),
                 Action::FrameThenFail(at, error) => {
-                    reporter.first_frame(at);
+                    reporter.frame(at);
+                    lock_recover(&self.live_snapshots).push(reporter.shared_status());
+                    Err(error)
+                }
+                Action::FramesThenFail(first_at, second_at, error) => {
+                    reporter.frame(first_at);
+                    reporter.frame(second_at);
                     lock_recover(&self.live_snapshots).push(reporter.shared_status());
                     Err(error)
                 }
                 Action::FrameThenStop(at) => {
-                    reporter.first_frame(at);
+                    reporter.frame(at);
                     lock_recover(&self.live_snapshots).push(reporter.shared_status());
                     Ok(stopped())
                 }
@@ -639,6 +653,30 @@ mod tests {
         assert_eq!(final_status.last_frame_at, Some(at));
         assert_eq!(final_status.consecutive_failures, 1);
         assert_eq!(final_status.error.unwrap().code, RtspErrorCode::SpawnFailed);
+    }
+
+    #[test]
+    fn later_frame_updates_timestamp_without_repeating_first_frame_reset() {
+        let first_at = SystemTime::UNIX_EPOCH + Duration::from_secs(7);
+        let second_at = SystemTime::UNIX_EPOCH + Duration::from_secs(8);
+        let (factory, _, live) = scripted(vec![
+            Action::FramesThenFail(first_at, second_at, retry_error()),
+            Action::Stop,
+        ]);
+        let waiter = RecordingWaiter {
+            delays: Arc::new(Mutex::new(Vec::new())),
+            stop_after_waits: None,
+            waits: 0,
+        };
+        let state = shared();
+
+        run_control_core(factory, waiter, policy(), Arc::clone(&state)).unwrap();
+
+        let live = lock_recover(&live);
+        assert_eq!(live[0].state, VideoState::Live);
+        assert_eq!(live[0].last_frame_at, Some(second_at));
+        assert_eq!(live[0].consecutive_failures, 0);
+        assert_eq!(live[0].error, None);
     }
 
     struct ActiveStopFactory {

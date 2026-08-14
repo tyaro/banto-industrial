@@ -29,7 +29,7 @@ use crate::{
 const STDOUT_WORKER_NAME: &str = "banto-rtsp-stdout";
 const STDERR_WORKER_NAME: &str = "banto-rtsp-stderr";
 
-type FirstFrameCallback = Box<dyn FnOnce(SystemTime) + Send + 'static>;
+type FirstFrameCallback = Box<dyn FnMut(SystemTime) + Send + 'static>;
 
 /// Crate-internal controller capability for one interruptible session.
 #[allow(dead_code)]
@@ -157,7 +157,7 @@ impl FfmpegSession {
         first_frame: F,
     ) -> Result<FfmpegSessionCompletion, RtspError>
     where
-        F: FnOnce(SystemTime) + Send + 'static,
+        F: FnMut(SystemTime) + Send + 'static,
     {
         self.run_with_control_and_first_frame(
             StoreClosePolicy::Preserve,
@@ -439,18 +439,13 @@ where
     let stdout_worker = match spawner.spawn(STDOUT_WORKER_NAME, move || {
         let mut decoder = decoder;
         run_worker(stdout_sender, move || {
-            pump_jpeg_stream_with_first_frame(
-                stdout,
-                &mut decoder,
-                &stdout_frames,
-                input_guard,
-                first_frame,
-            )
+            pump_jpeg_stream_with_first_frame(stdout, &mut decoder, &stdout_frames, first_frame)
         })
     }) {
         Ok(worker) => worker,
         Err(error) => {
             let _ = child.terminate_and_reap();
+            let _ = cleanup_input_guard(input_guard);
             let _ = apply_store_policy(store_policy, &frames, &diagnostics);
             return Err(SessionError::ThreadSpawn {
                 worker: SessionWorker::Stdout,
@@ -471,6 +466,7 @@ where
         Err(error) => {
             let _ = child.terminate_and_reap();
             let _ = stdout_worker.join();
+            let _ = cleanup_input_guard(input_guard);
             let _ = apply_store_policy(store_policy, &frames, &diagnostics);
             return Err(SessionError::ThreadSpawn {
                 worker: SessionWorker::Stderr,
@@ -488,6 +484,7 @@ where
 
     let stdout_result = stdout_worker.join();
     let stderr_result = stderr_worker.join();
+    let input_cleanup = cleanup_input_guard(input_guard);
     let (frames_close, diagnostics_close) = apply_store_policy(store_policy, &frames, &diagnostics);
 
     let monitor_completion = wait_result?;
@@ -495,6 +492,7 @@ where
     let stderr_summary = join_worker(stderr_result, SessionWorker::Stderr)?;
     frames_close?;
     diagnostics_close?;
+    input_cleanup?;
     match monitor_completion {
         MonitorCompletion::Exited(exit) => {
             if !exit.success {
@@ -510,6 +508,13 @@ where
             stdout: stdout_summary,
             stderr: stderr_summary,
         }),
+    }
+}
+
+fn cleanup_input_guard(input_guard: Option<FfmpegInputFile>) -> Result<(), RtspError> {
+    match input_guard {
+        Some(guard) => guard.cleanup(),
+        None => Ok(()),
     }
 }
 
@@ -1094,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn session_first_frame_callback_follows_cleanup_with_published_timestamp() {
+    fn session_first_frame_callback_precedes_cleanup_with_published_timestamp() {
         let (path, guard) = input_guard("first-frame-callback");
         let callback_path = path.clone();
         let (mut child, _, _) = FakeChild::success();
@@ -1117,7 +1122,7 @@ mod tests {
             StoreClosePolicy::Preserve,
             None,
             Some(Box::new(move |received_at| {
-                assert!(!callback_path.exists());
+                assert!(callback_path.exists());
                 *callback_at.lock().unwrap() = Some(received_at);
             })),
         )
@@ -1245,6 +1250,7 @@ mod tests {
 
     #[test]
     fn stdout_read_failure_is_returned_after_reap_and_both_joins() {
+        let (path, guard) = input_guard("stdout-read-failure");
         let (mut child, waited, terminated) = FakeChild::running();
         let frames = LatestFrameStore::new();
         let (diagnostics, _) = FfmpegDiagnostics::new(2, 64).unwrap();
@@ -1257,13 +1263,14 @@ mod tests {
             frames,
             diagnostics,
             FfmpegLogSanitizer::new(&endpoint(), None).stream(),
-            None,
+            Some(guard),
             &SystemThreadSpawner,
         )
         .unwrap_err();
 
         assert!(waited.load(Ordering::SeqCst));
         assert!(terminated.load(Ordering::SeqCst));
+        assert!(!path.exists());
         assert_eq!(error.public_info().code, RtspErrorCode::StdoutReadFailed);
     }
 

@@ -46,29 +46,37 @@ impl fmt::Debug for PumpSummary {
 
 /// Reads FFmpeg stdout until EOF and publishes every complete JPEG.
 ///
-/// The input-file guard is explicitly cleaned immediately after the first
-/// frame is published. Before that point every return path relies on the guard's
-/// Drop cleanup. Decoder and frame-store errors retain their existing
-/// [`RtspError`] variants; only reader I/O is classified as a pump error.
+/// The input-file guard is retained for API compatibility and is dropped only
+/// after the reader reaches EOF or returns an error. Session orchestration must
+/// keep the guard outside the worker until the FFmpeg child is reaped.
 pub fn pump_jpeg_stream<R: Read>(
     reader: R,
     decoder: &mut JpegFrameDecoder,
     store: &LatestFrameStore,
     input_guard: Option<FfmpegInputFile>,
 ) -> Result<PumpSummary, RtspError> {
-    pump_jpeg_stream_with_first_frame(reader, decoder, store, input_guard, None::<fn(SystemTime)>)
+    let result = pump_jpeg_stream_with_first_frame(reader, decoder, store, None::<fn(SystemTime)>);
+    match input_guard {
+        Some(guard) => match result {
+            Ok(summary) => guard.cleanup().map(|_| summary),
+            Err(error) => {
+                drop(guard);
+                Err(error)
+            }
+        },
+        None => result,
+    }
 }
 
 pub(crate) fn pump_jpeg_stream_with_first_frame<R, F>(
     mut reader: R,
     decoder: &mut JpegFrameDecoder,
     store: &LatestFrameStore,
-    mut input_guard: Option<FfmpegInputFile>,
     mut first_frame: Option<F>,
 ) -> Result<PumpSummary, RtspError>
 where
     R: Read,
-    F: FnOnce(SystemTime),
+    F: FnMut(SystemTime),
 {
     let mut summary = PumpSummary::new();
     let mut buffer = [0u8; READ_BUFFER_BYTES];
@@ -89,12 +97,9 @@ where
             summary.frames_published = summary.frames_published.saturating_add(1);
             if !summary.first_frame_seen {
                 summary.first_frame_seen = true;
-                if let Some(guard) = input_guard.take() {
-                    guard.cleanup()?;
-                }
-                if let Some(report) = first_frame.take() {
-                    report(received_at);
-                }
+            }
+            if let Some(report) = first_frame.as_mut() {
+                report(received_at);
             }
         }
     }
@@ -251,7 +256,7 @@ mod tests {
     }
 
     #[test]
-    fn first_frame_removes_input_file() {
+    fn first_frame_does_not_remove_input_file_until_pump_returns() {
         let (path, guard) = input_guard("first-frame");
         let mut decoder = JpegFrameDecoder::new(32).unwrap();
         let store = LatestFrameStore::new();
@@ -269,21 +274,20 @@ mod tests {
     }
 
     #[test]
-    fn first_frame_callback_runs_once_with_published_timestamp() {
+    fn frame_callback_runs_for_each_published_frame_with_published_timestamp() {
         let bytes = vec![0xff, 0xd8, 1, 0xff, 0xd9, 0xff, 0xd8, 2, 0xff, 0xd9];
         let mut decoder = JpegFrameDecoder::new(64).unwrap();
         let store = LatestFrameStore::new();
         let calls = Arc::new(AtomicUsize::new(0));
-        let reported_at = Arc::new(Mutex::new(None));
+        let reported = Arc::new(Mutex::new(Vec::new()));
         let callback_calls = Arc::clone(&calls);
-        let callback_at = Arc::clone(&reported_at);
+        let callback_reported = Arc::clone(&reported);
         let callback_store = store.clone();
 
         let summary = pump_jpeg_stream_with_first_frame(
             Cursor::new(bytes),
             &mut decoder,
             &store,
-            None,
             Some(move |received_at| {
                 callback_calls.fetch_add(1, Ordering::Relaxed);
                 let published_at = callback_store
@@ -291,15 +295,23 @@ mod tests {
                     .unwrap()
                     .expect("first frame must already be published")
                     .received_at;
-                *callback_at.lock().unwrap() = Some((received_at, published_at));
+                let sequence = callback_store.snapshot().unwrap().unwrap().sequence;
+                callback_reported
+                    .lock()
+                    .unwrap()
+                    .push((sequence, received_at, published_at));
             }),
         )
         .unwrap();
 
         assert_eq!(summary.frames_published, 2);
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-        let (reported_at, published_at) = reported_at.lock().unwrap().unwrap();
-        assert_eq!(reported_at, published_at);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let reported = reported.lock().unwrap();
+        assert_eq!(reported.len(), 2);
+        assert_eq!(reported[0].0, 1);
+        assert_eq!(reported[1].0, 2);
+        assert_eq!(reported[0].1, reported[0].2);
+        assert_eq!(reported[1].1, reported[1].2);
     }
 
     #[test]

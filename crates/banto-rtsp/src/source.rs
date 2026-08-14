@@ -257,7 +257,7 @@ impl SessionAttemptFactory for ProductionSessionFactory {
     ) -> Result<FfmpegSessionCompletion, RtspError> {
         self.build_session()?
             .run_preserving_stores_until_with_first_frame(stop, move |received_at| {
-                reporter.first_frame(received_at);
+                reporter.frame(received_at);
             })
     }
 }
