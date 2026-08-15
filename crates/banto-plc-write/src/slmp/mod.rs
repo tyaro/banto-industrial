@@ -109,7 +109,9 @@ pub mod simulator;
 #[cfg(test)]
 mod integration_tests;
 
-use banto_plc::{dial_slmp, BoxFuture, PlcError, SlmpConfig, SlmpDevice};
+use banto_plc::{
+    classify_slmp, dial_slmp, BoxFuture, PlcError, SlmpConfig, SlmpDevice, SlmpErrorClass,
+};
 
 use crate::client::PlcWriteClient;
 use crate::error::PlcWriteError;
@@ -162,23 +164,34 @@ fn device_to_wire(device: SlmpDevice) -> slmp::DeviceType {
     }
 }
 
-/// Translate the wrapped crate's structured [`slmp::SlmpError`] into a
-/// [`PlcWriteError`], deciding connection-fatal vs per-request `Bad`. Same
-/// mapping table as the read side's `classify_slmp_error` (`banto-plc`'s
-/// `slmp/mod.rs`), just returning this crate's own error type - a plain
-/// structural `match`, no message-text parsing (H9,
-/// docs/h9-slmp-structured-error-spec.md).
-fn classify_slmp_error(err: slmp::SlmpError) -> PlcWriteError {
-    match err {
-        slmp::SlmpError::Device { end_code } => PlcWriteError::SlmpEndCode {
-            code: end_code,
-            message: slmp::end_code_name(end_code).to_string(),
-        },
-        slmp::SlmpError::Framing(e) => PlcWriteError::Protocol(e.to_string()),
-        slmp::SlmpError::Timeout => PlcWriteError::ResponseTimeout,
-        slmp::SlmpError::NotConnected => PlcWriteError::NotConnected,
-        slmp::SlmpError::Io(e) => PlcWriteError::Connection(e.to_string()),
+/// This crate's half of H9's single-sourced classification: `banto_plc`'s
+/// [`SlmpErrorClass`] carries the read/write-independent decision
+/// (`classify_slmp`), and this `From` impl just folds it into
+/// [`PlcWriteError`]'s own vocabulary - the write-side twin of
+/// `banto_plc`'s `impl From<SlmpErrorClass> for PlcError`.
+impl From<SlmpErrorClass> for PlcWriteError {
+    fn from(class: SlmpErrorClass) -> Self {
+        match class {
+            SlmpErrorClass::EndCode { code, message } => {
+                PlcWriteError::SlmpEndCode { code, message }
+            }
+            SlmpErrorClass::Protocol(msg) => PlcWriteError::Protocol(msg),
+            SlmpErrorClass::ResponseTimeout => PlcWriteError::ResponseTimeout,
+            SlmpErrorClass::NotConnected => PlcWriteError::NotConnected,
+            SlmpErrorClass::Connection(msg) => PlcWriteError::Connection(msg),
+        }
     }
+}
+
+/// Translate the wrapped crate's structured [`slmp::SlmpError`] into a
+/// [`PlcWriteError`], deciding connection-fatal vs per-request `Bad`. The
+/// classification decision itself is `banto_plc::classify_slmp` (H9,
+/// docs/h9-slmp-structured-error-spec.md) - this used to be an independent
+/// copy of the read side's 5-arm `match`, now it is just that shared
+/// decision folded into this crate's error type via
+/// `impl From<SlmpErrorClass> for PlcWriteError` above.
+fn classify_slmp_error(err: slmp::SlmpError) -> PlcWriteError {
+    classify_slmp(err).into()
 }
 
 /// Map a [`banto_plc::PlcError`] coming out of [`dial_slmp`] onto this

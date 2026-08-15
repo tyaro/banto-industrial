@@ -6,6 +6,9 @@
 banto-plc-write の文言パース（`END_CODE_MARKER`/`parse_end_code`/`classify_io_error`）は
 完全削除済み。broker の session/transport 共通化（§3 の5番目）は本書作成時点では対応に含めず
 別スライス候補としていたが、2026-08-14 に `banto_plc::dial_slmp` への集約で完了した（§3-5参照）。
+`classify_slmp_error` の重複統合（banto-plc/banto-plc-write の同一5分岐 match）も同日、
+`banto_plc::SlmpErrorClass`/`classify_slmp` への集約で完了した（§3-5参照）。これで本書の受け入れ
+条件は残スライスなしで達成済み。
 本書は (1) tyaro/slmp が公開した API と (2) それを受けて banto 側で行った変更（受け入れ条件）を記す。
 関連: [improvement-plan.md](improvement-plan.md) §H9、[banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) P3-c。
 
@@ -74,6 +77,13 @@ banto が文言パース無しで「非ゼロ終了コード」と「フレー�
    コンパイル対応のみ実施）。その別スライスは 2026-08-14 に `banto-plc` の共有ヘルパー
    `dial_slmp` への集約で完了（`SlmpClient::connect`/`SlmpWriteClient::connect`/
    `banto-broker::connect_attempt` の3箇所が同一実装を共有。詳細は improvement-plan.md §H9）。
+6. 「`classify_slmp_error` の重複統合」（banto-plc / banto-plc-write に同一の5分岐 match が
+   独立に存在していた）も本書作成時点では別スライス候補として improvement-plan.md §H9 に
+   記録していたが、2026-08-14 に `banto-plc` の `pub enum SlmpErrorClass` +
+   `pub fn classify_slmp(slmp::SlmpError) -> SlmpErrorClass`（分類の決定ロジックの単一ソース）
+   への集約で完了した。`PlcError`/`PlcWriteError` はそれぞれ `impl From<SlmpErrorClass> for
+Self` で自分の語彙へ写すだけになり、両クレートの `classify_slmp_error` は
+   `classify_slmp(err).into()` の1行に縮小（詳細は improvement-plan.md §H9）。
 
 **受け入れ条件（§H9、達成）**: 文言パース（`END_CODE_MARKER`）の完全削除、tripwire テストの構造化
-エラー版への置換。`grep -rn END_CODE_MARKER crates/` はヒット0。
+エラー版への置換、`classify_slmp_error` の重複統合。`grep -rn END_CODE_MARKER crates/` はヒット0。

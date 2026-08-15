@@ -11,7 +11,9 @@ P3-a audit retention（#125）、P3-b SLMP word order（#127）、P3-c SLMP 構�
 実測ファースト判定=目標達成、windowed 化バックログ降格）。②failed→再試行（再キュー）導線を
 `claude/pending-requeue` ブランチで実装完了（下記 Phase 0.5 参照）。P3-c の broker
 session/transport 共通化は `banto_plc::dial_slmp` への集約で完了（2026-08-14、
-improvement-plan.md §H9）。残るは Phase 2 実機検証系（T18-5c/d 含む）。**
+improvement-plan.md §H9）。`classify_slmp_error` の重複統合も
+`banto_plc::SlmpErrorClass`/`classify_slmp` への集約で同日完了し、P3-c は
+完全完了（残スライスなし）。残るは Phase 2 実機検証系（T18-5c/d 含む）。**
 個別スライスの詳細設計は既存の
 [plan.md](plan.md)・[tag-server-design.md](tag-server-design.md)・[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)・
 [banto-hub-t16-design.md](banto-hub-t16-design.md)・[banto-hub-t17-design.md](banto-hub-t17-design.md)・
@@ -111,14 +113,16 @@ Phase 0 マージ後の main を実機で確認。テスト PLC の複数ポー�
   （migration `0010`、既定 `low_high` で後方互換）→ フォーム（"slmp" 選択時のみ）まで end-to-end 配線。
   **残: CPU 種別 / アクセスルート（network/PC/IO/area id）は別スライス候補**（`slmp_config_for` の
   doc comment に "Known limitation" として明記）。
-- **P3-c（完了、文言パース削除2026-08-12・transport共通化2026-08-14）**: H9 SLMP 構造化エラー
-  （[improvement-plan.md](improvement-plan.md) §H9）。オーナーが `tyaro/slmp`（git 依存、tag
-  `v0.2.0`）で構造化エラーを実装したのを受け、banto 側（dep 更新・`END_CODE_MARKER` 等の文言
-  パース完全削除・tripwire 構造化版への置換・`deny.toml` の git 依存許可）を同日中に完了。API 仕様
-  と受け入れ条件は [h9-slmp-structured-error-spec.md](h9-slmp-structured-error-spec.md)（状態:
-  実装済み）。broker の session/transport 共通化（banto-broker/banto-plc/banto-plc-write の SLMP
-  connect 重複）は `banto-plc` の共有ヘルパー `dial_slmp` への集約で完了（詳細は
-  improvement-plan.md §H9）。`classify_slmp_error` の重複統合のみ引き続き別スライス候補。
+- **P3-c（完全完了、文言パース削除2026-08-12・transport共通化/classify_slmp_error統合2026-08-14）**:
+  H9 SLMP 構造化エラー（[improvement-plan.md](improvement-plan.md) §H9）。オーナーが
+  `tyaro/slmp`（git 依存、tag `v0.2.0`）で構造化エラーを実装したのを受け、banto 側（dep 更新・
+  `END_CODE_MARKER` 等の文言パース完全削除・tripwire 構造化版への置換・`deny.toml` の git 依存許可）
+  を同日中に完了。API 仕様と受け入れ条件は
+  [h9-slmp-structured-error-spec.md](h9-slmp-structured-error-spec.md)（状態: 実装済み）。broker
+  の session/transport 共通化（banto-broker/banto-plc/banto-plc-write の SLMP connect 重複）は
+  `banto-plc` の共有ヘルパー `dial_slmp` への集約で完了。`classify_slmp_error` の重複統合
+  （banto-plc/banto-plc-write の同一5分岐 match）も `banto-plc` の `SlmpErrorClass`/`classify_slmp`
+  への集約で完了し、残スライスなし（詳細は improvement-plan.md §H9）。
 
 ### Phase 4 — リリースゲート（T5 の唯一の残り）
 
