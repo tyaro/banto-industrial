@@ -1,5 +1,8 @@
 # R1-A: banto README「テンプレートから自分のアプリを作る」手順の穴
 
+> **📦 アーカイブ（2026-08-14）**: 上流 banto（v0.1.1）への外部フィードバック用チェックリストで、
+> 本リポジトリの実装仕様ではない。現行の banto 依存は v1.2.0。経緯として保存。
+
 作成日: 2026-07-13。R1-A（`apps/admin-template` → `apps/chronogazer`
 コピー・リネーム・デモ削除）を実施した際に見つかった、banto の
 [README.md](https://github.com/tyaro/banto/blob/v0.1.1/README.md)

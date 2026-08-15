@@ -2,9 +2,13 @@
 
 作成日: 2026-07-12（過去アプリ棚卸しと記録計構想の議論に基づく）
 状態: **進行中。I系（I0〜I5）実装済み、W系（relay-wright）は W5 まで実装済み
-（実機検証のみ残、§4b）。T系（タグサーバー、§4c）は T0〜T4/T6〜T12 実装済み・
-残 T5（配布・運用強化、実機検証）、T13（画面刷新）計画中
-（[ux-plan.md](ux-plan.md)）**（2026-08-08 更新）
+（実機検証のみ残、§4b）。T系（タグサーバー、§4c）は T0〜T4/T6〜T18-5b 実装済み・
+残 T18-5c/d（Windows 実機往復・72h soak = 実機必須）と P3-b（SLMP CPU 種別/
+アクセスルート露出 = バックログ）。T13〜T18 の詳細と最新の全体像は
+[banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
+[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
+T13-1 までの粒度で、以降は同書へ移管）。Hardening（H1〜H10）は完了。docs 全体の
+地図は [README.md](README.md)**（2026-08-14 更新。本文の T 系表は 2026-08-08 時点）
 
 AI コードレビュー指摘の改善計画（H系）は
 [improvement-plan.md](improvement-plan.md) で管理する（2026-08-08）。

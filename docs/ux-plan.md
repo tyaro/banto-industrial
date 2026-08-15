@@ -1,5 +1,10 @@
 # banto-hub UX 改善計画（T9〜T13）
 
+> **📦 アーカイブ（2026-08-14）**: 本書は役目を終えた旧計画。T9〜T12 は実装済み、T13-2/T13-3 は
+> [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)（T18-4/T18-2）へ移管済みで、現行の正はそちら。
+> 本書は T9〜T12 の設計 rationale（なぜその UX にしたか）を引くためにのみ参照する。現行の全体像は
+> [README.md](README.md) を見よ。
+
 作成日: 2026-08-06（オーナー承認済み）
 状態: **T9〜T12 実装済み（2026-08-07）・T13-1 実装済み（2026-08-08）。T13-2/T13-3 は
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) の T18-4/T18-2 へ移管済み
