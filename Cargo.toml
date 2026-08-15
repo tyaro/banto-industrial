@@ -109,7 +109,7 @@ getrandom = "0.2"
 # ランダムキーには不向き(理由は `apps/banto-hub/core/src/api_keys.rs` の
 # モジュール doc 参照)。`sqlx-core` 等が既に 0.10 系を木に持っているので
 # 新規ノードは増えない。
-sha2 = "0.10"
+sha2 = "0.11"
 # T0-2: SHA-256 ダイジェストの hex エンコード表示・DB 保存用。既に
 # `sqlx-core` 等が同じ 0.4 系を木に持っている。
 hex = "0.4"
