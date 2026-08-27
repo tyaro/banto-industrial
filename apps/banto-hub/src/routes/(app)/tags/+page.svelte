@@ -32,6 +32,8 @@
 	import SplitPane from '$lib/components/SplitPane.svelte';
 	import ConnectionTree from '$lib/components/ConnectionTree.svelte';
 	import TreeContextMenu from '$lib/components/TreeContextMenu.svelte';
+	import ConnectionDrawer from '$lib/components/ConnectionDrawer.svelte';
+	import CollectionGroupDrawer from '$lib/components/CollectionGroupDrawer.svelte';
 	import type { ConnectionTreeNodeData } from '$lib/components/connectionTreeTypes';
 	import type { TreeNode } from '$lib/components/treeTypes';
 	import {
@@ -130,10 +132,10 @@
 	} from '$lib/banto/tagDeleteImpact';
 	import { diffFormRecords, type ConflictFieldDiff } from '$lib/banto/tagConflictDiff';
 	import {
-		resolveTagTreeContextMenuAction,
-		type TagTreeContextMenuAction
+		resolveTreeContextMenuItems,
+		type TreeContextMenuItemAction
 	} from '$lib/banto/tagTreeContextMenu';
-	import { beforeNavigate, goto } from '$app/navigation';
+	import { beforeNavigate } from '$app/navigation';
 
 	const dataTypeOptions: { value: TagDataType; label: string }[] = [
 		{ value: 'bit', label: 'bit（真偽値1点）' },
@@ -1394,19 +1396,22 @@
 	 * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A）: ツリーの右クリック
 	 * （`ConnectionTree`/`TreeView` の `oncontextmenu` - マウス右クリックと
 	 * `Shift+F10`/メニューキーの両方がここに集約される）から出す、階層に
-	 * 応じた作成の**補助操作**。常時表示の「新規登録」等の主操作
+	 * 応じたメニュー。常時表示の「新規登録」等の主操作
 	 * （`openCreateDrawer`/上のツールバー）はそのまま残す - このメニューは
 	 * それを置き換えない。
 	 *
-	 * 作成種別・遷移先/プリセットの決定自体は依存ゼロの純関数
-	 * `resolveTagTreeContextMenuAction`（`tagTreeContextMenu.ts`）に委ね、
-	 * ここは DOM 状態（メニューの表示位置・選択ノードの反映）と実行
-	 * （画面遷移 or create Drawer 起動）だけを担う。
+	 * T18-6d（TAG-UX-7、2026-08-27 オーナー決定）追記: T18-2e 時点は「作成」
+	 * 1項目だけだったが、ここに「接続/グループの再設定・削除」を追加した
+	 * （既存のタグ作成項目は壊さず同じメニューに項目を足す - 実装指示の
+	 * 制約）。項目の種別・ラベル・対象 ID の決定自体は依存ゼロの純関数
+	 * `resolveTreeContextMenuItems`（`tagTreeContextMenu.ts`）に委ね、ここは
+	 * DOM 状態（メニューの表示位置・選択ノードの反映）と実行（Drawer 起動）
+	 * だけを担う。
 	 */
 	interface TreeContextMenuState {
 		x: number;
 		y: number;
-		action: TagTreeContextMenuAction;
+		items: TreeContextMenuItemAction[];
 		/** メニューを閉じたときにフォーカスを戻す元要素（開いた時点の `document.activeElement`）。 */
 		triggerEl: HTMLElement | null;
 	}
@@ -1416,24 +1421,24 @@
 	 * 右クリックされたノードを選択状態にする - 「親（接続/グループ）は
 	 * 選択ノードからプリセットする」（実装指示 T18-2e スコープ1点目）を、
 	 * 既存の `resolveGroupIdFromTreeSelection`（T18-2d、`openCreateDrawer` が
-	 * 使う）にそのまま乗せるため。`calc`/`mem` 配下等、作成操作が無い
-	 * ノード（`resolveTagTreeContextMenuAction` が `null` を返す）は選択だけ
-	 * 反映してメニューは出さない。
+	 * 使う）にそのまま乗せるため。`calc`/`mem` 配下等、操作が無いノード
+	 * （`resolveTreeContextMenuItems` が空配列を返す）は選択だけ反映して
+	 * メニューは出さない。
 	 */
 	function handleTreeContextMenu(
 		node: TreeNode<ConnectionTreeNodeData>,
 		position: { x: number; y: number }
 	): void {
 		handleTreeSelect(node.data);
-		const action = resolveTagTreeContextMenuAction(node.data);
-		if (!action) {
+		const items = resolveTreeContextMenuItems(node.data);
+		if (items.length === 0) {
 			treeContextMenu = null;
 			return;
 		}
 		treeContextMenu = {
 			x: position.x,
 			y: position.y,
-			action,
+			items,
 			triggerEl: document.activeElement instanceof HTMLElement ? document.activeElement : null
 		};
 	}
@@ -1445,22 +1450,154 @@
 	}
 
 	/**
-	 * `createConnection`/`createGroup` は他画面（`/plc-connections`/
-	 * `/collection-groups?connectionId=`）への遷移 - このページはそれらの
-	 * 作成フォームを持たない。遷移は SvelteKit の `goto` を使うため、
-	 * 既存の `beforeNavigate` 破棄確認（開いている Drawer が dirty なら
-	 * 確認する）がそのまま効く。`createTag` はこのページ自身が持つ create
-	 * Drawer を、右クリックされたグループへプリセットした状態で開く -
-	 * `handleTreeContextMenu` が既に `treeFilter` をそのグループへ合わせて
-	 * いるので、`openCreateDrawer()`（`resolveGroupIdFromTreeSelection` 経由
-	 * で選択中ノードからプリセットする T18-2d 既存ロジック）をそのまま
-	 * 呼ぶだけでよい。
+	 * T18-6d: 接続/収集グループの管理 Drawer 状態。`ConnectionDrawer`/
+	 * `CollectionGroupDrawer`（T18-6a/6b、自己完結部品）を、単独ページ
+	 * （`/plc-connections`/`/collection-groups`）と全く同じ使い方でこの
+	 * ページにも並べて開くだけ - このページ独自の接続/グループ CRUD 処理は
+	 * 持たない。保存/削除成功時は既存の `reload()`（groups/connections/tags
+	 * を1回で取り直す）をそのまま呼んで、ツリーと右ペインの一覧の両方に
+	 * 反映する。
 	 */
-	function activateTreeContextMenuAction(action: TagTreeContextMenuAction): void {
-		if (action.kind === 'createTag') {
-			openCreateDrawer();
-		} else {
-			void goto(action.href);
+	let connectionDrawerOpen = $state(false);
+	let connectionDrawerTarget: PlcConnection | null = $state(null);
+	/** T18-6d: 「接続を削除」から開いた場合だけ `true`（下の doc comment 参照）。 */
+	let connectionDrawerRequestDelete = $state(false);
+
+	let groupDrawerOpen = $state(false);
+	let groupDrawerTarget: CollectionGroup | null = $state(null);
+	let groupDrawerPresetConnectionId: number | null = $state(null);
+	/** T18-6d: 「収集グループを削除」から開いた場合だけ `true`（下の doc comment 参照）。 */
+	let groupDrawerRequestDelete = $state(false);
+
+	function openConnectionCreateDrawer(): void {
+		if (!confirmDiscardIfNeeded()) return;
+		closeDrawer(); // タグ Drawer が開いていれば閉じる（同時に複数 Drawer を出さない）。
+		connectionDrawerTarget = null;
+		connectionDrawerRequestDelete = false;
+		connectionDrawerOpen = true;
+	}
+
+	function openConnectionEditDrawer(connectionId: number): void {
+		const target = connections.find((c) => c.id === connectionId);
+		if (!target) return; // 通常起きない（右クリック直後は必ず存在する）が、念のため無視する。
+		if (!confirmDiscardIfNeeded()) return;
+		closeDrawer();
+		connectionDrawerTarget = target;
+		connectionDrawerRequestDelete = false;
+		connectionDrawerOpen = true;
+	}
+
+	/**
+	 * 「接続を削除」メニュー項目: `ConnectionDrawer` を再設定モードで開き、
+	 * `requestDelete` で Drawer 側の既存 `handleDelete` を1回だけ呼ばせる -
+	 * 確認ダイアログ・削除影響エラー（収集グループが参照している場合）の
+	 * 扱いは `ConnectionDrawer.svelte::handleDelete` の実装をそのまま使い、
+	 * ここでは独自の削除処理を持たない（実装指示の制約）。
+	 */
+	function openConnectionDeleteFlow(connectionId: number): void {
+		const target = connections.find((c) => c.id === connectionId);
+		if (!target) return;
+		if (!confirmDiscardIfNeeded()) return;
+		closeDrawer();
+		connectionDrawerTarget = target;
+		connectionDrawerRequestDelete = true;
+		connectionDrawerOpen = true;
+	}
+
+	function closeConnectionDrawer(): void {
+		connectionDrawerOpen = false;
+	}
+
+	async function handleConnectionDrawerSaved(): Promise<void> {
+		await reload();
+	}
+
+	async function handleConnectionDrawerDeleted(): Promise<void> {
+		await reload();
+	}
+
+	function openGroupCreateDrawer(presetConnectionId: number): void {
+		if (!confirmDiscardIfNeeded()) return;
+		closeDrawer();
+		groupDrawerTarget = null;
+		groupDrawerPresetConnectionId = presetConnectionId;
+		groupDrawerRequestDelete = false;
+		groupDrawerOpen = true;
+	}
+
+	function openGroupEditDrawer(groupId: number): void {
+		const target = groups.find((g) => g.id === groupId);
+		if (!target) return;
+		if (!confirmDiscardIfNeeded()) return;
+		closeDrawer();
+		groupDrawerTarget = target;
+		groupDrawerPresetConnectionId = null;
+		groupDrawerRequestDelete = false;
+		groupDrawerOpen = true;
+	}
+
+	/**
+	 * 「収集グループを削除」メニュー項目: `openConnectionDeleteFlow` と同じ
+	 * 考え方 - `CollectionGroupDrawer` を再設定モードで開き、`requestDelete`
+	 * で既存の `handleDelete`（タグが参照している場合の Validation エラーを
+	 * 含む）を1回だけ呼ばせる。
+	 */
+	function openGroupDeleteFlow(groupId: number): void {
+		const target = groups.find((g) => g.id === groupId);
+		if (!target) return;
+		if (!confirmDiscardIfNeeded()) return;
+		closeDrawer();
+		groupDrawerTarget = target;
+		groupDrawerPresetConnectionId = null;
+		groupDrawerRequestDelete = true;
+		groupDrawerOpen = true;
+	}
+
+	function closeGroupDrawer(): void {
+		groupDrawerOpen = false;
+	}
+
+	async function handleGroupDrawerSaved(): Promise<void> {
+		await reload();
+	}
+
+	async function handleGroupDrawerDeleted(): Promise<void> {
+		await reload();
+	}
+
+	/**
+	 * `createTag` はこのページ自身が持つ create Drawer を、右クリックされた
+	 * グループへプリセットした状態で開く - `handleTreeContextMenu` が既に
+	 * `treeFilter` をそのグループへ合わせているので、`openCreateDrawer()`
+	 * （`resolveGroupIdFromTreeSelection` 経由で選択中ノードからプリセット
+	 * する T18-2d 既存ロジック）をそのまま呼ぶだけでよい（T18-2e から無改変）。
+	 * 接続/グループの作成・再設定・削除（T18-6d 追加分）は、いずれも
+	 * `ConnectionDrawer`/`CollectionGroupDrawer` を対応するモードで開く
+	 * 上記の open系/Flow系関数へ振り分けるだけで、独自の CRUD ロジックは持たない。
+	 */
+	function activateTreeContextMenuAction(action: TreeContextMenuItemAction): void {
+		switch (action.kind) {
+			case 'createTag':
+				openCreateDrawer();
+				break;
+			case 'createConnection':
+				openConnectionCreateDrawer();
+				break;
+			case 'createGroup':
+				openGroupCreateDrawer(action.connectionId);
+				break;
+			case 'reconfigureConnection':
+				openConnectionEditDrawer(action.connectionId);
+				break;
+			case 'deleteConnection':
+				openConnectionDeleteFlow(action.connectionId);
+				break;
+			case 'reconfigureGroup':
+				openGroupEditDrawer(action.groupId);
+				break;
+			case 'deleteGroup':
+				openGroupDeleteFlow(action.groupId);
+				break;
 		}
 	}
 
@@ -3271,20 +3408,44 @@
 </div>
 
 {#if treeContextMenu}
-	{@const action = treeContextMenu.action}
 	<TreeContextMenu
 		x={treeContextMenu.x}
 		y={treeContextMenu.y}
-		items={[
-			{
-				id: action.kind,
-				label: action.label,
-				onSelect: () => activateTreeContextMenuAction(action)
-			}
-		]}
+		items={treeContextMenu.items.map((action) => ({
+			id: action.kind,
+			label: action.label,
+			onSelect: () => activateTreeContextMenuAction(action)
+		}))}
 		onClose={closeTreeContextMenu}
 	/>
 {/if}
+
+<!--
+	T18-6d: 接続/収集グループの管理 Drawer。単独ページ（`/plc-connections`/
+	`/collection-groups`）と全く同じ部品・同じ渡し方 - このページの右クリック
+	メニューから開く以外の違いはない。
+-->
+<ConnectionDrawer
+	open={connectionDrawerOpen}
+	connection={connectionDrawerTarget}
+	existingNames={connections.map((c) => c.name)}
+	requestDelete={connectionDrawerRequestDelete}
+	onClose={closeConnectionDrawer}
+	onSaved={handleConnectionDrawerSaved}
+	onDeleted={handleConnectionDrawerDeleted}
+/>
+
+<CollectionGroupDrawer
+	open={groupDrawerOpen}
+	group={groupDrawerTarget}
+	existingNames={groups.map((g) => g.name)}
+	{connections}
+	presetPlcConnectionId={groupDrawerPresetConnectionId}
+	requestDelete={groupDrawerRequestDelete}
+	onClose={closeGroupDrawer}
+	onSaved={handleGroupDrawerSaved}
+	onDeleted={handleGroupDrawerDeleted}
+/>
 
 <Drawer
 	open={drawerMode !== null}
