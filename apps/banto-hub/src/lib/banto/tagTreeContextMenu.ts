@@ -31,6 +31,13 @@
  *   新規作成する導線ではない（実装指示「calc/mem（virtual）配下では作成
  *   メニューを出さない」、`tagRegistryAdmin.groupsFor` が同じ接続を
  *   `computed`/`internal` 種別専用として扱っているのと同じ理由）。
+ *
+ * T18-6d（TAG-UX-7、2026-08-27 オーナー決定）追記: 上記は T18-2e 時点の
+ * 「作成のみ・1項目」の挙動を固定する既存関数として変更せず残す（下の
+ * `resolveTagTreeContextMenuAction` 単体テストが `.toEqual` でこの形を
+ * 固定しているため）。ツリー右クリックから接続/グループの再設定・削除も
+ * 行えるようにする本体は、この関数を土台にする `resolveTreeContextMenuItems`
+ * （本ファイル下部）に別途実装する。
  */
 import { collectionGroupsHref } from './tagOnboarding';
 import type { ConnectionTreeNodeData } from '$lib/components/connectionTreeTypes';
@@ -91,4 +98,66 @@ export function resolveTagTreeContextMenuAction(
 		label: `${data.group.name} 配下にタグを作成`,
 		groupId: data.group.id
 	};
+}
+
+/**
+ * T18-6d（TAG-UX-7、実装指示「タグ登録ページのツリー右クリックから PLC接続・
+ * 収集グループを管理できるようにする」）: タグツリーの右クリックメニューに
+ * 出す**全項目**を決める純関数。`resolveTagTreeContextMenuAction`（上記、
+ * T18-2e で導入済み・既存ユニットテストが固定している「作成」1項目版）は
+ * そのまま残し、ここではそれを土台に「接続/グループの再設定・削除」項目を
+ * 追加する - 既存のタグ作成メニュー（`createTag`）を壊さず「同じメニューに
+ * 項目を足す」（実装指示の制約）ため。virtual（`calc`/`mem`）配下でメニュー
+ * 自体を出さない判定も `resolveTagTreeContextMenuAction` が `null` を返す
+ * ことにそのまま乗せる（二重実装しない）。
+ *
+ * `createConnection`/`createGroup` は T18-2e 時点では他画面への `goto`
+ * （`href`）だったが、T18-6a/6b で `ConnectionDrawer`/`CollectionGroupDrawer`
+ * という自己完結部品がこのページからも開けるようになったため、T18-6d では
+ * 「その場で Drawer を開く」に置き換える - よって `href` は使わず、ラベルも
+ * 実装指示が指定する文言（接続名を冠さない「収集グループを作成」等）に
+ * 差し替える。`createTag`（グループ配下にタグを作成）だけは T18-2e の挙動
+ * （このページ自身の create Drawer をプリセット付きで開く）を変えないので
+ * label も含めそのまま流用する。
+ *
+ * 呼び出し側（`tags/+page.svelte`）は、返ってきた各項目の `kind` に応じて
+ * `ConnectionDrawer`/`CollectionGroupDrawer`/既存 create Drawer のどれを
+ * 開くかだけを振り分ける - 判定ロジック自体はここに閉じ込め、ページ側は
+ * DOM 組み立てと実行に専念させる（`tagOnboarding.ts`/上記関数と同じ方針）。
+ */
+export type TreeContextMenuItemAction =
+	| { kind: 'createConnection'; label: string }
+	| { kind: 'createGroup'; label: string; connectionId: number }
+	| { kind: 'reconfigureConnection'; label: string; connectionId: number }
+	| { kind: 'deleteConnection'; label: string; connectionId: number }
+	| { kind: 'createTag'; label: string; groupId: number }
+	| { kind: 'reconfigureGroup'; label: string; groupId: number }
+	| { kind: 'deleteGroup'; label: string; groupId: number };
+
+export function resolveTreeContextMenuItems(
+	data: ConnectionTreeNodeData
+): TreeContextMenuItemAction[] {
+	const createAction = resolveTagTreeContextMenuAction(data);
+	if (!createAction) return []; // virtual 配下 - メニュー自体を出さない。
+
+	if (createAction.kind === 'createConnection') {
+		return [{ kind: 'createConnection', label: createAction.label }];
+	}
+	if (createAction.kind === 'createGroup') {
+		return [
+			{ kind: 'createGroup', label: '収集グループを作成', connectionId: createAction.connectionId },
+			{
+				kind: 'reconfigureConnection',
+				label: '接続を再設定',
+				connectionId: createAction.connectionId
+			},
+			{ kind: 'deleteConnection', label: '接続を削除', connectionId: createAction.connectionId }
+		];
+	}
+	// createAction.kind === 'createTag'
+	return [
+		{ kind: 'createTag', label: createAction.label, groupId: createAction.groupId },
+		{ kind: 'reconfigureGroup', label: '収集グループを再設定', groupId: createAction.groupId },
+		{ kind: 'deleteGroup', label: '収集グループを削除', groupId: createAction.groupId }
+	];
 }
