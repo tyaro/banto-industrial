@@ -64,6 +64,18 @@
 		connection: PlcConnection | null;
 		/** TAG-UX-8 の連番プリフィルに使う、既存の接続名一覧（新規作成時のみ参照）。 */
 		existingNames: string[];
+		/**
+		 * T18-6d（タグツリー右クリック「接続を削除」からの起動）: `true` かつ
+		 * `connection` が非 `null`（再設定モード）で Drawer を開いた直後、
+		 * フォーム初期化に続けて既存の `handleDelete` をそのまま1回だけ呼ぶ -
+		 * 確認ダイアログ（`window.confirm`）・削除影響エラー（収集グループが
+		 * 参照している場合の Validation エラー）の扱いはすべて `handleDelete`
+		 * の実装をそのまま流用し、ここでは独自の削除処理を持たない（実装指示の
+		 * 制約）。確認をキャンセルした場合はこの Drawer に留まり、そのまま
+		 * 再設定フォームとして使い続けられる。既定 `false`（単独ページからの
+		 * 通常の再設定オープンでは何も起きない）。
+		 */
+		requestDelete?: boolean;
 		onClose: () => void;
 		/** 作成/更新が成功した直後に呼ばれる（202キュー投入時は呼ばれない — まだ確定していないため）。 */
 		onSaved: (conn: PlcConnection) => void;
@@ -71,7 +83,15 @@
 		onDeleted: (id: number) => void;
 	}
 
-	let { open, connection, existingNames, onClose, onSaved, onDeleted }: Props = $props();
+	let {
+		open,
+		connection,
+		existingNames,
+		requestDelete = false,
+		onClose,
+		onSaved,
+		onDeleted
+	}: Props = $props();
 
 	const isCreate = $derived(connection === null);
 	const drawerTitle = $derived(isCreate ? '新規作成' : `${connection?.name} を編集`);
@@ -150,6 +170,12 @@
 		testState = blankTestState();
 		step = 1;
 		portTouched = !isDefaultPortForProtocol(form.port, form.protocol);
+
+		// T18-6d: 「接続を削除」からの起動 - フォーム初期化直後に既存の
+		// handleDelete を1回だけ呼ぶ（上の Props.requestDelete 参照）。
+		if (requestDelete && connection) {
+			void handleDelete();
+		}
 	});
 
 	function onProtocolChange(): void {
