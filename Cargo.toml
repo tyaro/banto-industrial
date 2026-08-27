@@ -99,11 +99,14 @@ window-vibrancy = "0.8"
 # service, etc. - mirrors banto's own reasoning for this dependency).
 tempfile = "3"
 # T0-2 (docs/tag-server-design.md §5.6): API キーの secret 部分(32バイト)を
-# 生成する CSPRNG。`password-hash`(上の行、`getrandom` feature 有効)は既に
-# `rand_core` 0.6.4 経由で `getrandom` 0.2.17 を木に持っているので、ここも
-# 同じ 0.2 系に揃えて Cargo.lock に新しいメジャーバージョンの `getrandom`
-# ノードを増やさない。`apps/banto-hub/core::api_keys` のみが使う。
-getrandom = "0.2"
+# 生成する CSPRNG。0.4 系を直接指定する: `uuid`(tauri-utils 経由)や
+# `rand` 0.10(tokio-tungstenite 経由)が既に `getrandom` 0.3/0.4 系を木に
+# 持っており、0.2 系(`password-hash` → `rand_core` 0.6.4 経由)に揃えても
+# Cargo.lock 内の getrandom バージョン集合(0.2/0.3/0.4)は変わらないため、
+# 新しい方に追従する(0.3 は `getrandom()` が `fill()` に改名されているので
+# 0.2 のまま留めても実利がない)。`apps/banto-hub/core::api_keys` のみが
+# 使う。
+getrandom = "0.4"
 # T0-2: API キーの照合用ハッシュ(SHA-256)。argon2 は低エントロピーな
 # パスワード用に意図的に遅く、毎リクエスト照合する高エントロピーな
 # ランダムキーには不向き(理由は `apps/banto-hub/core/src/api_keys.rs` の
