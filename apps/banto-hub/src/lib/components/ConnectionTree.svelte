@@ -9,6 +9,14 @@
 	 *
 	 * 選択状態はこのコンポーネントが所有しない（tags ページ側が
 	 * `selectedId` を渡し、選択イベントで通知を受けるだけ）。
+	 *
+	 * T18-6c（2026-08-27 オーナー決定、TAG-UX-9 見た目刷新）追記: ノード
+	 * 種別アイコン・グループの設定周期表示・空グループ案内行を追加する。
+	 * banto-hub 固有の意匠（アイコン絵文字・periodMs の表示フォーマット・
+	 * 「収集グループ未登録」の文言）はすべてこのファイルに閉じ込め、
+	 * TreeView.svelte はジェネリックな構造（階層別背景・枠線コンテナ・
+	 * 空状態スロット）だけを提供する。階層は「接続→収集グループ」の
+	 * 2階層のまま（タグはツリーに出さない）で変更しない。
 	 */
 	import TreeView from './TreeView.svelte';
 	import type { TreeNode } from './treeTypes';
@@ -72,13 +80,35 @@
 		return [allNode, ...connectionNodes];
 	});
 
-	function connectionBadge(connection: PlcConnection): string | null {
+	/**
+	 * T18-6c: ノード種別アイコン（行頭）。実 PLC 接続は 🔌、`calc`/`mem`
+	 * 予約接続はそれぞれ 🧮/💾（末尾バッジ側の絵文字と重複させないため、
+	 * `connectionBadge` からは絵文字を外しテキストのみにした - 下記参照）。
+	 */
+	function connectionIcon(connection: PlcConnection): string {
 		if (isVirtualConnection(connection)) {
-			if (connection.name === CALC_CONNECTION_NAME) return '🧮 calc';
-			if (connection.name === MEM_CONNECTION_NAME) return '💾 mem';
-			return null;
+			return connection.name === CALC_CONNECTION_NAME ? '🧮' : '💾';
 		}
+		return '🔌';
+	}
+
+	/**
+	 * T18-6c: `calc`/`mem` は行頭アイコンで種別を示すようになったため、末尾
+	 * バッジは廃止する（2026-08-27 オーナー決定「バッジは消すか calc/mem の
+	 * テキストのみにする」の前者を採る - `connection.name` 自体が既に
+	 * `'calc'`/`'mem'` なので、テキストのみのバッジにしても行の表示が
+	 * 「calc calc」/「mem mem」のように名前と二重になってしまうと実機
+	 * 確認で判明したため）。`⚠ SIM` バッジは種別ではなく状態（実機では
+	 * ない）を表すので、アイコン化の対象外のまま従来どおり維持する。
+	 */
+	function connectionBadge(connection: PlcConnection): string | null {
+		if (isVirtualConnection(connection)) return null;
 		return connection.simulation ? '⚠ SIM' : null;
+	}
+
+	/** T18-6c: グループ行に併記する設定周期。`periodMs` をそのまま `100ms` 形式で表示する（実測周期は対象外 - オーナー決定）。 */
+	function formatPeriod(periodMs: number): string {
+		return `${periodMs}ms`;
 	}
 
 	// TreeView は選択イベントをノード全体（TreeNode<T>）で通知するが、
@@ -92,8 +122,10 @@
 <TreeView {nodes} {selectedId} onselect={handleSelect} {oncontextmenu}>
 	{#snippet label(node)}
 		{#if node.data.kind === 'all'}
+			<span class="icon" aria-hidden="true">📁</span>
 			<span class="label">すべて</span>
 		{:else if node.data.kind === 'connection'}
+			<span class="icon" aria-hidden="true">{connectionIcon(node.data.connection)}</span>
 			<span class="label">{node.data.connection.name}</span>
 			{#if connectionBadge(node.data.connection)}
 				<span
@@ -105,13 +137,25 @@
 				>
 			{/if}
 		{:else if node.data.kind === 'group'}
+			<span class="icon" aria-hidden="true">⏱</span>
 			<span class="label">{node.data.group.name}</span>
 			<span class="count">({tagCountForGroup(node.data.group.id)})</span>
+			<span class="period">{formatPeriod(node.data.group.periodMs)}</span>
+		{/if}
+	{/snippet}
+	{#snippet emptyState(node)}
+		{#if node.data.kind === 'connection'}
+			収集グループ未登録
 		{/if}
 	{/snippet}
 </TreeView>
 
 <style>
+	.icon {
+		display: inline-block;
+		margin-right: 0.3rem;
+	}
+
 	.label {
 		overflow: hidden;
 		text-overflow: ellipsis;
@@ -130,6 +174,12 @@
 	}
 
 	.count {
+		margin-left: 0.3rem;
+		color: var(--banto-text-muted);
+		font-size: 0.75rem;
+	}
+
+	.period {
 		margin-left: 0.3rem;
 		color: var(--banto-text-muted);
 		font-size: 0.75rem;
