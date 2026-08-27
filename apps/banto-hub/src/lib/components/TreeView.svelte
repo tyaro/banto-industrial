@@ -27,6 +27,12 @@
 	 * キー（`event.key === 'ContextMenu'`）からも起動できるようにする。
 	 * 座標が無いキー操作のため、押下されたノードラベル要素の直下（左下）を
 	 * 疑似的な右クリック位置として渡す。
+	 *
+	 * T18-6c（2026-08-27 オーナー決定、TAG-UX-9 見た目刷新）: 構造だけを
+	 * ここに足す - 「ルート行/子行で背景を変える段差」「枠線＋角丸コンテナに
+	 * 入れて内側でスクロール」「子が0件のルートノード向けの空状態スロット」。
+	 * アイコンや設定周期など banto-hub 固有の意匠は持ち込まない（呼び出し側の
+	 * ConnectionTree.svelte の label/emptyState スナペットに任せる）。
 	 */
 	import type { Snippet } from 'svelte';
 	import { SvelteSet } from 'svelte/reactivity';
@@ -39,9 +45,24 @@
 		ontoggle?: (node: TreeNode<T>, expanded: boolean) => void;
 		oncontextmenu?: (node: TreeNode<T>, position: { x: number; y: number }) => void;
 		label: Snippet<[TreeNode<T>]>;
+		/**
+		 * T18-6c: ルートノードの children が空配列（[]、undefined ではない）の
+		 * ときだけ、その直下に呼び出し側が用意する「空状態」の行を差し込む。
+		 * TreeView 自身は「グループ未登録」のような banto-hub 固有の文言を
+		 * 知らない - ConnectionTree.svelte がテキストを決める。
+		 */
+		emptyState?: Snippet<[TreeNode<T>]>;
 	}
 
-	let { nodes, selectedId = null, onselect, ontoggle, oncontextmenu, label }: Props = $props();
+	let {
+		nodes,
+		selectedId = null,
+		onselect,
+		ontoggle,
+		oncontextmenu,
+		label,
+		emptyState
+	}: Props = $props();
 
 	/**
 	 * 監査指摘（2026-08-08）: プレーンな `Set` は `$state()` で包んでも
@@ -96,65 +117,95 @@
 	}
 </script>
 
-<div class="tree" role="tree">
-	{#each nodes as node (node.id)}
-		<div class="node-group">
-			<div
-				class="node-row"
-				class:selected={selectedId === node.id}
-				role="treeitem"
-				aria-selected={selectedId === node.id}
-			>
-				{#if node.children?.length}
+<div class="tree-container">
+	<div class="tree" role="tree">
+		{#each nodes as node (node.id)}
+			<div class="node-group">
+				<div
+					class="node-row"
+					class:selected={selectedId === node.id}
+					role="treeitem"
+					aria-selected={selectedId === node.id}
+				>
+					{#if node.children?.length}
+						<button
+							type="button"
+							class="toggle"
+							onclick={() => toggle(node)}
+							aria-label={expanded.has(node.id) ? '折りたたむ' : '展開する'}
+						>
+							{expanded.has(node.id) ? '▾' : '▸'}
+						</button>
+					{:else}
+						<span class="toggle-spacer"></span>
+					{/if}
 					<button
 						type="button"
-						class="toggle"
-						onclick={() => toggle(node)}
-						aria-label={expanded.has(node.id) ? '折りたたむ' : '展開する'}
+						class="node-label"
+						onclick={() => onselect?.(node)}
+						oncontextmenu={(event) => handleContextMenu(node, event)}
+						onkeydown={(event) => handleNodeKeydown(node, event)}
 					>
-						{expanded.has(node.id) ? '▾' : '▸'}
+						{@render label(node)}
 					</button>
-				{:else}
-					<span class="toggle-spacer"></span>
-				{/if}
-				<button
-					type="button"
-					class="node-label"
-					onclick={() => onselect?.(node)}
-					oncontextmenu={(event) => handleContextMenu(node, event)}
-					onkeydown={(event) => handleNodeKeydown(node, event)}
-				>
-					{@render label(node)}
-				</button>
-			</div>
-			{#if node.children?.length && expanded.has(node.id)}
-				<div class="children">
-					{#each node.children as child (child.id)}
-						<div
-							class="node-row child"
-							class:selected={selectedId === child.id}
-							role="treeitem"
-							aria-selected={selectedId === child.id}
-						>
-							<span class="toggle-spacer"></span>
-							<button
-								type="button"
-								class="node-label"
-								onclick={() => onselect?.(child)}
-								oncontextmenu={(event) => handleContextMenu(child, event)}
-								onkeydown={(event) => handleNodeKeydown(child, event)}
-							>
-								{@render label(child)}
-							</button>
-						</div>
-					{/each}
 				</div>
-			{/if}
-		</div>
-	{/each}
+				{#if node.children?.length && expanded.has(node.id)}
+					<div class="children">
+						{#each node.children as child (child.id)}
+							<div
+								class="node-row child"
+								class:selected={selectedId === child.id}
+								role="treeitem"
+								aria-selected={selectedId === child.id}
+							>
+								<span class="toggle-spacer"></span>
+								<button
+									type="button"
+									class="node-label"
+									onclick={() => onselect?.(child)}
+									oncontextmenu={(event) => handleContextMenu(child, event)}
+									onkeydown={(event) => handleNodeKeydown(child, event)}
+								>
+									{@render label(child)}
+								</button>
+							</div>
+						{/each}
+					</div>
+				{:else if node.children && node.children.length === 0 && emptyState}
+					<!--
+						T18-6c: 子グループが1つも無い接続の下に淡色の案内行を出す
+						（参考実装の empty-node 相当）。`node.children` が
+						`undefined`（=そもそも子を持たない種類のノード。例:
+						「すべて」ノード）のときは出さない - `children: []` と
+						明示された場合のみ「子は0件」とみなす。
+					-->
+					<div class="node-row child empty">
+						<span class="toggle-spacer"></span>
+						<span class="node-label empty-label">{@render emptyState(node)}</span>
+					</div>
+				{/if}
+			</div>
+		{/each}
+	</div>
 </div>
 
 <style>
+	/*
+	 * T18-6c: ツリー全体を枠線＋角丸のコンテナに収め、内側でスクロール
+	 * させる。呼び出し元（SplitPane.svelte の左ペイン）は既に
+	 * `overflow-y: auto` を持つが、このコンテナが利用可能高さいっぱいに
+	 * 広がって自前でスクロールするため、実際にスクロールバーが出るのは
+	 * 通常このコンテナ側になる。
+	 */
+	.tree-container {
+		height: 100%;
+		box-sizing: border-box;
+		overflow-y: auto;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+		background: var(--banto-surface);
+	}
+
 	.tree {
 		display: flex;
 		flex-direction: column;
@@ -166,10 +217,21 @@
 		display: flex;
 		align-items: center;
 		gap: 0.2rem;
+		border-radius: var(--banto-radius);
+		/*
+		 * T18-6c: 階層ごとに行の背景を変えて段差を出す。ルート行（接続/
+		 * 「すべて」）はコンテナの基準面（--banto-surface）よりわずかに
+		 * 沈んだ面 --banto-surface-subtle を敷き、子行（グループ）は
+		 * コンテナ自体の基準面がそのまま透ける（`.node-row.child` で
+		 * transparent に戻す）。新しい hex は増やさず、既存の
+		 * --banto-surface 系トークンだけで表現する。
+		 */
+		background: var(--banto-surface-subtle);
 	}
 
 	.node-row.child {
 		padding-left: 1.4rem;
+		background: transparent;
 	}
 
 	.toggle,
@@ -208,6 +270,18 @@
 
 	.node-label:hover {
 		background: color-mix(in srgb, var(--banto-primary) 8%, transparent);
+	}
+
+	/*
+	 * T18-6c: 「収集グループ未登録」のような空状態行。ボタンではなく
+	 * 非対話なテキスト（クリックしても選択/コンテキストメニューは無い）
+	 * なので、ホバー背景・カーソルは付けず、色だけ既存の
+	 * --banto-text-muted に落として案内文だと分かるようにする。
+	 */
+	.empty-label {
+		color: var(--banto-text-muted);
+		font-style: italic;
+		cursor: default;
 	}
 
 	.node-row.selected > .node-label {

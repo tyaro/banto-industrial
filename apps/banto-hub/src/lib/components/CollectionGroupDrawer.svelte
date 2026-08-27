@@ -1,0 +1,507 @@
+<script lang="ts">
+	/**
+	 * T18-6b（TAG-UX-7/TAG-UX-8、2026-08-27 オーナー決定「収集グループの作成／
+	 * 再設定を Drawer に寄せる」）: 収集グループの作成・再設定を担う共通部品。
+	 * T18-6a の `ConnectionDrawer.svelte` を反復した実装（実装指示「同じ構造・
+	 * 同じ流儀を踏襲すること」）— `Drawer.svelte`（汎用スライドオーバー、
+	 * T13-1）を内包した自己完結コンポーネントにしてあるので、呼び出し側は
+	 * `Drawer` を別途インスタンス化せず
+	 * `<CollectionGroupDrawer open={...} group={...} .../>` を並べるだけでよい。
+	 * `collection-groups/+page.svelte` 単独ページと、将来のタグツリー右クリック
+	 * （T18-6d、別スライスが配線予定）の双方から使うことを狙って
+	 * `src/lib/components/` に置く。
+	 *
+	 * **新規作成 = ウィザード（3ステップ）、再設定 = 単一フォーム**
+	 * （`ConnectionDrawer.svelte` と同じ考え方。`group` prop が `null` かどうか
+	 * で分岐する）。ステップは既存フィールドを自然に分けただけで、フィールド・
+	 * 検証は旧 `collection-groups/+page.svelte` のページ内実装（BantoGrid一覧+
+	 * 縦積み編集パネル構成）から1つも落としていない。PLC接続側と異なり
+	 * 「接続テスト」に相当する工程は無い（収集グループは PLC 疎通確認の対象
+	 * ではない）ので、3ステップ目は確認表示のみ:
+	 * 1. 識別: 名前（TAG-UX-8 の連番プリフィル対象）
+	 * 2. 接続先と周期: 所属する PLC 接続 / 収集周期 / 有効
+	 * 3. 確認: 入力内容の確認表示 + 「作成」
+	 *
+	 * 純関数部分（連番採番・フォーム⇄API入力変換）は
+	 * `$lib/banto/collectionGroupForm.ts` へ切り出し済み（そちらでユニット
+	 * テスト済み）。採番ロジック自体は `plcConnectionForm.ts::nextConnectionName`
+	 * と共通の `sequentialName.ts::nextSequentialName` を使う。
+	 *
+	 * **202 (QueuedWhileRunningError, 収集稼働中のキュー投入) の扱い**
+	 * （実装指示6）: `ConnectionDrawer.svelte` と同じく失敗ではなく案内として
+	 * `toastStore.push('info', ...)` を使う。Drawer は閉じずフォームを保持する。
+	 *
+	 * **所属する PLC 接続の既定値**（実装指示4）: `presetPlcConnectionId` prop
+	 * を通じて、Drawer を開いた文脈（ページの `?connectionId=` クエリ、または
+	 * 将来 T18-6d のツリー接続ノードからの起動）を尊重する。新規作成フォームを
+	 * 開いた時点でこの prop が非 `null` ならその接続をプリセットし、`null`
+	 * （既定 `undefined`）ならページの旧来どおり未選択のまま出す。
+	 */
+	import { isProviderError } from '@banto/admin-core';
+	import Drawer from './Drawer.svelte';
+	import { toastStore } from '$lib/toast.svelte';
+	import {
+		createCollectionGroup,
+		deleteCollectionGroup,
+		isQueuedWhileRunningError,
+		updateCollectionGroup,
+		ALLOWED_PERIOD_MS,
+		type CollectionGroup,
+		type PlcConnection
+	} from '$lib/banto/tagRegistryAdmin';
+	import {
+		blankGroupForm,
+		formToGroupInput,
+		groupToForm,
+		nextGroupName,
+		type CollectionGroupFormState
+	} from '$lib/banto/collectionGroupForm';
+
+	interface Props {
+		open: boolean;
+		/** `null` なら新規作成（ウィザード）。非 `null` ならそのグループの再設定（単一フォーム）。 */
+		group: CollectionGroup | null;
+		/** TAG-UX-8 の連番プリフィルに使う、既存のグループ名一覧（新規作成時のみ参照）。 */
+		existingNames: string[];
+		/** PLC接続の選択肢（新規作成・再設定共通、一覧ページから取得済みのものを渡す）。 */
+		connections: PlcConnection[];
+		/**
+		 * 新規作成フォームを開いたときに所属PLC接続としてプリセットする ID
+		 * （実装指示4「Drawer を開いた文脈を尊重する」- T18-6d でツリーの接続
+		 * ノードから開く際に使う想定。`collection-groups/+page.svelte` は現行の
+		 * `?connectionId=` クエリから解決した値をここへ渡す）。`null`/未指定
+		 * なら従来どおり未選択のまま出す。
+		 */
+		presetPlcConnectionId?: number | null;
+		/**
+		 * T18-6d（タグツリー右クリック「収集グループを削除」からの起動）:
+		 * `true` かつ `group` が非 `null`（再設定モード）で Drawer を開いた
+		 * 直後、フォーム初期化に続けて既存の `handleDelete` をそのまま1回だけ
+		 * 呼ぶ - 確認ダイアログ（`window.confirm`）・削除影響エラー（タグが
+		 * 参照している場合の Validation エラー）の扱いはすべて `handleDelete`
+		 * の実装をそのまま流用し、ここでは独自の削除処理を持たない
+		 * （`ConnectionDrawer.svelte` の同名 prop と同じ考え方）。確認を
+		 * キャンセルした場合はこの Drawer に留まり、そのまま再設定フォームと
+		 * して使い続けられる。既定 `false`。
+		 */
+		requestDelete?: boolean;
+		onClose: () => void;
+		/** 作成/更新が成功した直後に呼ばれる（202キュー投入時は呼ばれない — まだ確定していないため）。 */
+		onSaved: (group: CollectionGroup) => void;
+		/** 削除が成功した直後に呼ばれる。 */
+		onDeleted: (id: number) => void;
+	}
+
+	let {
+		open,
+		group,
+		existingNames,
+		connections,
+		presetPlcConnectionId = null,
+		requestDelete = false,
+		onClose,
+		onSaved,
+		onDeleted
+	}: Props = $props();
+
+	const isCreate = $derived(group === null);
+	const drawerTitle = $derived(isCreate ? '新規作成' : `${group?.name} を編集`);
+
+	function errorMessage(err: unknown): string {
+		return isProviderError(err) ? err.message : String(err);
+	}
+
+	function applyFieldErrors(err: unknown): Record<string, string> | null {
+		if (isProviderError(err) && err.body.kind === 'validation') {
+			const map: Record<string, string> = {};
+			for (const fe of err.body.field_errors) map[fe.field] = fe.message;
+			return map;
+		}
+		return null;
+	}
+
+	let form: CollectionGroupFormState = $state(blankGroupForm(ALLOWED_PERIOD_MS[0]));
+	let errors: Record<string, string> = $state({});
+	let saving = $state(false);
+	let deleting = $state(false);
+	let step: 1 | 2 | 3 = $state(1);
+
+	/**
+	 * Drawer を開いた対象（新規作成 or どのグループの再設定か）を表すキー。
+	 * `ConnectionDrawer.svelte::lastOpenKey` と同じ役割・同じ理由
+	 * （保存成功後に親が `groups` を再取得して新しい `CollectionGroup`
+	 * オブジェクト（同じ id）を渡してきても、このキーは変わらないため未保存
+	 * 編集を巻き戻さない - `handleSave` 側が保存直後に明示的に `form` を
+	 * 正規化済みの値へ差し替える）。
+	 */
+	let lastOpenKey: string | null = null;
+
+	$effect(() => {
+		if (!open) {
+			lastOpenKey = null;
+			return;
+		}
+		const key = group ? `edit:${group.id}` : 'create';
+		if (key === lastOpenKey) return;
+		lastOpenKey = key;
+
+		if (group) {
+			form = groupToForm(group);
+		} else {
+			const blank = blankGroupForm(ALLOWED_PERIOD_MS[0]);
+			blank.name = nextGroupName(existingNames);
+			if (presetPlcConnectionId != null) blank.plcConnectionId = String(presetPlcConnectionId);
+			form = blank;
+		}
+		errors = {};
+		step = 1;
+
+		// T18-6d: 「収集グループを削除」からの起動 - フォーム初期化直後に
+		// 既存の handleDelete を1回だけ呼ぶ（上の Props.requestDelete 参照）。
+		if (requestDelete && group) {
+			void handleDelete();
+		}
+	});
+
+	/** 送信前のフィールド → 該当ウィザードステップの対応（作成時のエラー誘導用）。 */
+	const FIELD_STEP: Record<string, 1 | 2 | 3> = {
+		name: 1,
+		plcConnectionId: 2,
+		periodMs: 2
+	};
+
+	function stepForFieldErrors(fieldErrors: Record<string, string>): 1 | 2 | 3 | null {
+		let target: 1 | 2 | 3 | null = null;
+		for (const field of Object.keys(fieldErrors)) {
+			const s = FIELD_STEP[field];
+			if (s !== undefined && (target === null || s < target)) target = s;
+		}
+		return target;
+	}
+
+	const canAdvanceFromStep1 = $derived(form.name.trim() !== '');
+	const canAdvanceFromStep2 = $derived(form.plcConnectionId !== '');
+
+	function goNext(): void {
+		if (step === 1 && canAdvanceFromStep1) step = 2;
+		else if (step === 2 && canAdvanceFromStep2) step = 3;
+	}
+
+	function goBack(): void {
+		if (step > 1) step = (step - 1) as 1 | 2 | 3;
+	}
+
+	function connectionName(id: string): string {
+		const numId = Number(id);
+		return connections.find((c) => c.id === numId)?.name ?? '（未選択）';
+	}
+
+	async function handleCreate(): Promise<void> {
+		saving = true;
+		errors = {};
+		try {
+			const created = await createCollectionGroup(formToGroupInput(form));
+			toastStore.push('success', '作成しました');
+			onSaved(created);
+			onClose();
+		} catch (err) {
+			if (isQueuedWhileRunningError(err)) {
+				// 実装指示6: 失敗ではなく案内として扱う（Drawerは開いたまま）。
+				toastStore.push('info', err.message);
+				return;
+			}
+			const fieldErrors = applyFieldErrors(err);
+			if (fieldErrors) {
+				errors = fieldErrors;
+				const target = stepForFieldErrors(fieldErrors);
+				if (target !== null) step = target;
+			} else {
+				toastStore.push('error', errorMessage(err));
+			}
+		} finally {
+			saving = false;
+		}
+	}
+
+	async function handleSave(): Promise<void> {
+		if (!group) return;
+		saving = true;
+		errors = {};
+		try {
+			const updated = await updateCollectionGroup(group.id, formToGroupInput(form));
+			toastStore.push('success', '更新しました');
+			// 保存成功後はサーバーの正規化値を基準に取り直す（ConnectionDrawer
+			// の handleSave と同じ方針）。Drawer は閉じない。
+			form = groupToForm(updated);
+			onSaved(updated);
+		} catch (err) {
+			if (isQueuedWhileRunningError(err)) {
+				toastStore.push('info', err.message);
+				return;
+			}
+			const fieldErrors = applyFieldErrors(err);
+			if (fieldErrors) errors = fieldErrors;
+			else toastStore.push('error', errorMessage(err));
+		} finally {
+			saving = false;
+		}
+	}
+
+	async function handleDelete(): Promise<void> {
+		if (!group) return;
+		if (!window.confirm(`${group.name} を削除しますか？`)) return;
+		deleting = true;
+		try {
+			await deleteCollectionGroup(group.id);
+			toastStore.push('success', '削除しました');
+			onDeleted(group.id);
+			onClose();
+		} catch (err) {
+			if (isQueuedWhileRunningError(err)) {
+				toastStore.push('info', err.message);
+				return;
+			}
+			// タグが参照している場合はサービス層の分かりやすい Validation
+			// エラー（件数入り）がここに来る。
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			deleting = false;
+		}
+	}
+
+	function isBusy(): boolean {
+		return saving || deleting;
+	}
+
+	/** 処理中は ×・Esc・オーバーレイクリックでの close を抑止する。 */
+	function onRequestClose(): boolean {
+		return !isBusy();
+	}
+</script>
+
+{#snippet nameField()}
+	<label class="field">
+		名前
+		<input type="text" id="group-name" bind:value={form.name} />
+		{#if errors.name}<span class="err">{errors.name}</span>{/if}
+	</label>
+{/snippet}
+
+{#snippet destinationFields()}
+	<div class="form-grid">
+		<label class="field">
+			PLC接続
+			<select bind:value={form.plcConnectionId}>
+				<option value="" disabled>選択してください</option>
+				{#each connections as conn (conn.id)}
+					<option value={String(conn.id)}>{conn.name}</option>
+				{/each}
+			</select>
+			{#if errors.plcConnectionId}<span class="err">{errors.plcConnectionId}</span>{/if}
+		</label>
+		<label class="field">
+			収集周期
+			<select bind:value={form.periodMs}>
+				{#each ALLOWED_PERIOD_MS as ms (ms)}
+					<option value={String(ms)}>{ms} ms</option>
+				{/each}
+			</select>
+			{#if errors.periodMs}<span class="err">{errors.periodMs}</span>{/if}
+		</label>
+		<label class="field checkbox">
+			<input type="checkbox" bind:checked={form.enabled} />
+			有効
+		</label>
+	</div>
+{/snippet}
+
+{#snippet confirmSummary()}
+	<dl class="summary">
+		<dt>名前</dt>
+		<dd>{form.name || '（未入力）'}</dd>
+		<dt>PLC接続</dt>
+		<dd>{form.plcConnectionId ? connectionName(form.plcConnectionId) : '（未選択）'}</dd>
+		<dt>収集周期</dt>
+		<dd>{form.periodMs} ms</dd>
+		<dt>有効</dt>
+		<dd>{form.enabled ? 'はい' : 'いいえ'}</dd>
+	</dl>
+{/snippet}
+
+<Drawer {open} title={drawerTitle} {onRequestClose} onclose={onClose} width="480px">
+	{#if isCreate}
+		<ol class="wizard-steps" aria-label="作成手順">
+			<li class:active={step === 1} class:done={step > 1}>1. 識別</li>
+			<li class:active={step === 2} class:done={step > 2}>2. 接続先と周期</li>
+			<li class:active={step === 3}>3. 確認</li>
+		</ol>
+
+		{#if step === 1}
+			{@render nameField()}
+		{:else if step === 2}
+			{@render destinationFields()}
+		{:else}
+			{@render confirmSummary()}
+		{/if}
+
+		<div class="wizard-actions">
+			{#if step > 1}
+				<button type="button" class="secondary" onclick={goBack} disabled={saving}>戻る</button>
+			{/if}
+			{#if step === 1}
+				<button type="button" onclick={goNext} disabled={!canAdvanceFromStep1}>次へ</button>
+			{:else if step === 2}
+				<button type="button" onclick={goNext} disabled={!canAdvanceFromStep2}>次へ</button>
+			{:else}
+				<button type="button" onclick={handleCreate} disabled={saving}>作成</button>
+			{/if}
+		</div>
+	{:else}
+		{@render nameField()}
+		{@render destinationFields()}
+		<div class="actions">
+			<button type="button" onclick={handleSave} disabled={saving || deleting}>保存</button>
+			<button type="button" class="danger" onclick={handleDelete} disabled={saving || deleting}>
+				削除
+			</button>
+		</div>
+	{/if}
+</Drawer>
+
+<style>
+	.form-grid {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
+		gap: 0.75rem;
+		margin-bottom: 0.75rem;
+	}
+
+	.field {
+		display: flex;
+		flex-direction: column;
+		gap: 0.3rem;
+		font-size: 0.8rem;
+		color: var(--banto-text-muted);
+		margin-bottom: 0.75rem;
+	}
+
+	.field.checkbox {
+		flex-direction: row;
+		align-items: center;
+		gap: 0.4rem;
+	}
+
+	.field input,
+	.field select {
+		padding: 0.4rem 0.5rem;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+		background: var(--banto-bg);
+		color: var(--banto-text);
+	}
+
+	.field.checkbox input {
+		width: auto;
+	}
+
+	.err {
+		color: var(--banto-danger);
+		font-size: 0.75rem;
+	}
+
+	.wizard-steps {
+		display: flex;
+		gap: 0.5rem;
+		list-style: none;
+		margin: 0 0 1rem;
+		padding: 0;
+		font-size: 0.75rem;
+		color: var(--banto-text-muted);
+	}
+
+	.wizard-steps li {
+		padding: 0.3rem 0.6rem;
+		border-radius: var(--banto-radius);
+		border: 1px solid var(--banto-border);
+	}
+
+	.wizard-steps li.active {
+		border-color: var(--banto-primary);
+		color: var(--banto-primary);
+		font-weight: 600;
+	}
+
+	.wizard-steps li.done {
+		color: var(--banto-text);
+	}
+
+	.wizard-actions {
+		display: flex;
+		justify-content: flex-end;
+		gap: 0.75rem;
+		margin-top: 1rem;
+	}
+
+	.summary {
+		display: grid;
+		grid-template-columns: auto 1fr;
+		gap: 0.35rem 0.75rem;
+		margin: 0 0 1rem;
+		font-size: 0.85rem;
+	}
+
+	.summary dt {
+		color: var(--banto-text-muted);
+	}
+
+	.summary dd {
+		margin: 0;
+		color: var(--banto-text);
+	}
+
+	.actions {
+		display: flex;
+		gap: 0.75rem;
+		margin-top: 1rem;
+	}
+
+	button {
+		padding: 0.5rem 1rem;
+		border: none;
+		border-radius: var(--banto-radius);
+		background: var(--banto-primary);
+		color: var(--banto-text-inverse);
+		font-weight: 600;
+		cursor: pointer;
+	}
+
+	button:hover:not(:disabled) {
+		background: var(--banto-primary-hover);
+	}
+
+	button:disabled {
+		opacity: 0.6;
+		cursor: not-allowed;
+	}
+
+	button.secondary {
+		background: transparent;
+		border: 1px solid var(--banto-border);
+		color: var(--banto-text-muted);
+	}
+
+	button.secondary:hover:not(:disabled) {
+		background: color-mix(in srgb, var(--banto-primary) 8%, transparent);
+		color: var(--banto-text);
+	}
+
+	button.danger {
+		background: transparent;
+		border: 1px solid var(--banto-danger);
+		color: var(--banto-danger);
+	}
+
+	button.danger:hover:not(:disabled) {
+		background: color-mix(in srgb, var(--banto-danger) 10%, transparent);
+	}
+</style>
