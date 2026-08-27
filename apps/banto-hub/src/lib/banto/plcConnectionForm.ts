@@ -34,6 +34,7 @@ import type {
 	PlcProtocol,
 	SlmpWordOrder
 } from './tagRegistryAdmin';
+import { nextSequentialName } from './sequentialName';
 
 // "virtual" is intentionally NOT offered here — the two virtual connections
 // (calc/mem) are auto-provisioned by the backend, not created through this
@@ -82,21 +83,17 @@ export function isDefaultPortForProtocol(port: string, protocol: PlcProtocol): b
  * `prefix` 部分の大文字小文字や前後の記号は区別しない緩い一致はしない
  * （`^${prefix}(\d+)$` の厳密一致 — `connection1-old` のような接尾辞付きは
  * 無視し、番号として扱わない）。
+ *
+ * T18-6b: 採番ロジック自体は {@link nextSequentialName}（`sequentialName.ts`）
+ * へ切り出し、収集グループ側（`collectionGroupForm.ts::nextGroupName`）と
+ * 共有している。この関数は挙動・シグネチャとも無改変の薄いラッパー
+ * （`plcConnectionForm.test.ts` は無改変で通る）。
  */
 export function nextConnectionName(
 	existingNames: readonly string[],
 	prefix = 'connection'
 ): string {
-	const escapedPrefix = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-	const pattern = new RegExp(`^${escapedPrefix}(\\d+)$`);
-	const used = new Set<number>();
-	for (const name of existingNames) {
-		const match = pattern.exec(name);
-		if (match) used.add(Number(match[1]));
-	}
-	let n = 1;
-	while (used.has(n)) n++;
-	return `${prefix}${n}`;
+	return nextSequentialName(existingNames, prefix);
 }
 
 /** 編集フォーム状態（作成/編集共通）。数値入力は文字列で保持し、空欄=未設定。 */
