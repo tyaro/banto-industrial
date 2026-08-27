@@ -73,6 +73,18 @@
 		 * なら従来どおり未選択のまま出す。
 		 */
 		presetPlcConnectionId?: number | null;
+		/**
+		 * T18-6d（タグツリー右クリック「収集グループを削除」からの起動）:
+		 * `true` かつ `group` が非 `null`（再設定モード）で Drawer を開いた
+		 * 直後、フォーム初期化に続けて既存の `handleDelete` をそのまま1回だけ
+		 * 呼ぶ - 確認ダイアログ（`window.confirm`）・削除影響エラー（タグが
+		 * 参照している場合の Validation エラー）の扱いはすべて `handleDelete`
+		 * の実装をそのまま流用し、ここでは独自の削除処理を持たない
+		 * （`ConnectionDrawer.svelte` の同名 prop と同じ考え方）。確認を
+		 * キャンセルした場合はこの Drawer に留まり、そのまま再設定フォームと
+		 * して使い続けられる。既定 `false`。
+		 */
+		requestDelete?: boolean;
 		onClose: () => void;
 		/** 作成/更新が成功した直後に呼ばれる（202キュー投入時は呼ばれない — まだ確定していないため）。 */
 		onSaved: (group: CollectionGroup) => void;
@@ -86,6 +98,7 @@
 		existingNames,
 		connections,
 		presetPlcConnectionId = null,
+		requestDelete = false,
 		onClose,
 		onSaved,
 		onDeleted
@@ -142,6 +155,12 @@
 		}
 		errors = {};
 		step = 1;
+
+		// T18-6d: 「収集グループを削除」からの起動 - フォーム初期化直後に
+		// 既存の handleDelete を1回だけ呼ぶ（上の Props.requestDelete 参照）。
+		if (requestDelete && group) {
+			void handleDelete();
+		}
 	});
 
 	/** 送信前のフィールド → 該当ウィザードステップの対応（作成時のエラー誘導用）。 */
