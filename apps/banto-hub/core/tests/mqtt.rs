@@ -953,8 +953,14 @@ async fn throttle_suppresses_rapid_changes_and_sends_the_latest_value_once_the_w
     let after: Vec<(String, String)> = live.snapshot().await.split_off(baseline_count);
 
     // 抑止された中間値(200)は一度も発行されていないこと。
+    // ペイロード文字列全体への部分文字列一致(contains)だと、エポックミリ秒の
+    // タイムスタンプに偶然 "200" という数字列が含まれた場合に誤検知するため、
+    // JSON をパースして "v" フィールドの値そのものを比較する。
     assert!(
-        !after.iter().any(|(_, payload)| payload.contains("200")),
+        !after.iter().any(|(_, payload)| {
+            let value: Value = serde_json::from_str(payload).expect("payload should be JSON");
+            value["v"] == 200.0
+        }),
         "an intermediate value suppressed by the throttle must never be published: {after:?}"
     );
     // スロットル明け最初の tick で最新値(300)だけが1回届いていること
