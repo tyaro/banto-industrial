@@ -146,9 +146,11 @@ impl QrStringService {
     /// The full list in display order (`sort_order` asc, `id` asc as the
     /// tie-breaker for legacy/equal values), each row with its rendered SVG.
     pub async fn list(&self) -> Result<Vec<QrString>, BantoError> {
-        let rows: Vec<QrString> = sqlx::query_as(&format!(
+        // AssertSqlSafe: 補間されるのは COLUMNS 定数（本ファイル内の固定文字列）
+        // のみで、外部入力は含まれない。
+        let rows: Vec<QrString> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
             "SELECT {COLUMNS} FROM qr_strings ORDER BY sort_order ASC, id ASC"
-        ))
+        )))
         .fetch_all(&self.pool)
         .await
         .map_err(banto_storage::storage_error)?;
@@ -156,12 +158,16 @@ impl QrStringService {
     }
 
     pub async fn get(&self, id: i64) -> Result<QrString, BantoError> {
-        sqlx::query_as::<_, QrString>(&format!("SELECT {COLUMNS} FROM qr_strings WHERE id = ?"))
-            .bind(id)
-            .fetch_one(&self.pool)
-            .await
-            .map(with_svg)
-            .map_err(|err| banto_storage::not_found(err, RESOURCE, id.to_string()))
+        // AssertSqlSafe: list() と同じ理由 - COLUMNS 定数のみを埋め込む固定
+        // 文字列。id はプレースホルダでバインドする。
+        sqlx::query_as::<_, QrString>(sqlx::AssertSqlSafe(format!(
+            "SELECT {COLUMNS} FROM qr_strings WHERE id = ?"
+        )))
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+        .map(with_svg)
+        .map_err(|err| banto_storage::not_found(err, RESOURCE, id.to_string()))
     }
 
     /// Create at the end of the list (`MAX(sort_order) + 1`).
@@ -173,11 +179,13 @@ impl QrStringService {
             });
         }
 
-        sqlx::query_as::<_, QrString>(&format!(
+        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
+        // 文字列。値はすべてプレースホルダでバインドする。
+        sqlx::query_as::<_, QrString>(sqlx::AssertSqlSafe(format!(
             "INSERT INTO qr_strings (label, text, sort_order) \
              VALUES (?, ?, (SELECT COALESCE(MAX(sort_order) + 1, 0) FROM qr_strings)) \
              RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(&normalized.label)
         .bind(&normalized.text)
         .fetch_one(&self.pool)
@@ -195,9 +203,11 @@ impl QrStringService {
             });
         }
 
-        sqlx::query_as::<_, QrString>(&format!(
+        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
+        // 文字列。値はすべてプレースホルダでバインドする。
+        sqlx::query_as::<_, QrString>(sqlx::AssertSqlSafe(format!(
             "UPDATE qr_strings SET label = ?, text = ? WHERE id = ? RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(&normalized.label)
         .bind(&normalized.text)
         .bind(id)

@@ -466,7 +466,7 @@ impl WriteRuleService {
         // Load the OTHER enabled rules and build the edge set. Edges are
         // labeled with the rule name so a detected cycle can name a culprit.
         let other_rules: Vec<(i64, String, i64)> = {
-            let mut builder: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+            let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
                 "SELECT id, name, write_target_id FROM write_rules WHERE enabled = 1",
             );
             if let Some(id) = exclude_rule_id {
@@ -534,7 +534,7 @@ impl WriteRuleService {
     ) -> Result<ListResult<WriteRuleDetail>, BantoError> {
         let columns = column_map();
 
-        let mut rows_builder: QueryBuilder<'_, Sqlite> =
+        let mut rows_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new(format!("SELECT {COLUMNS} FROM write_rules"));
         banto_storage::list_query::sqlite::apply_list_params(&mut rows_builder, &columns, &params)?;
         let rules: Vec<WriteRule> = rows_builder
@@ -549,7 +549,7 @@ impl WriteRuleService {
             details.push(WriteRuleDetail { rule, conditions });
         }
 
-        let mut count_builder: QueryBuilder<'_, Sqlite> =
+        let mut count_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new("SELECT COUNT(*) FROM write_rules");
         banto_storage::list_query::sqlite::append_where(
             &mut count_builder,
@@ -581,9 +581,11 @@ impl WriteRuleService {
     }
 
     pub async fn get(&self, id: i64) -> Result<WriteRuleDetail, BantoError> {
-        let rule = sqlx::query_as::<_, WriteRule>(&format!(
+        // AssertSqlSafe: 補間されるのは COLUMNS 定数（本ファイル内の固定文字列）
+        // のみで、外部入力は含まれない。id はプレースホルダでバインドする。
+        let rule = sqlx::query_as::<_, WriteRule>(sqlx::AssertSqlSafe(format!(
             "SELECT {COLUMNS} FROM write_rules WHERE id = ?"
-        ))
+        )))
         .bind(id)
         .fetch_one(&self.pool)
         .await
@@ -608,12 +610,14 @@ impl WriteRuleService {
             .await
             .map_err(banto_storage::storage_error)?;
 
-        let rule = sqlx::query_as::<_, WriteRule>(&format!(
+        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
+        // 文字列。値はすべてプレースホルダでバインドする。
+        let rule = sqlx::query_as::<_, WriteRule>(sqlx::AssertSqlSafe(format!(
             "INSERT INTO write_rules (\
                 name, enabled, edge_mode, cooldown_ms, write_target_id, \
                 write_value_mode, write_constant_value, write_constant_text, write_source_tag_id\
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(input.name.trim())
         .bind(input.enabled)
         .bind(&input.edge_mode)
@@ -654,13 +658,15 @@ impl WriteRuleService {
             .await
             .map_err(banto_storage::storage_error)?;
 
-        let rule = sqlx::query_as::<_, WriteRule>(&format!(
+        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
+        // 文字列。値はすべてプレースホルダでバインドする。
+        let rule = sqlx::query_as::<_, WriteRule>(sqlx::AssertSqlSafe(format!(
             "UPDATE write_rules SET \
                 name = ?, enabled = ?, edge_mode = ?, cooldown_ms = ?, write_target_id = ?, \
                 write_value_mode = ?, write_constant_value = ?, write_constant_text = ?, \
                 write_source_tag_id = ? \
              WHERE id = ? RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(input.name.trim())
         .bind(input.enabled)
         .bind(&input.edge_mode)

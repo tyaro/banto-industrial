@@ -747,10 +747,14 @@ async fn fetch_tag_row(
     connection: &mut SqliteConnection,
     id: i64,
 ) -> Result<Option<Tag>, sqlx::Error> {
-    sqlx::query_as::<_, Tag>(&format!("SELECT {COLUMNS} FROM tags WHERE id = ?"))
-        .bind(id)
-        .fetch_optional(&mut *connection)
-        .await
+    // AssertSqlSafe: 補間されるのは COLUMNS 定数（本ファイル内の固定文字列）
+    // のみで、外部入力は一切混入しない。id はプレースホルダでバインドする。
+    sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(format!(
+        "SELECT {COLUMNS} FROM tags WHERE id = ?"
+    )))
+    .bind(id)
+    .fetch_optional(&mut *connection)
+    .await
 }
 
 /// A single row's worth of field errors within a [`TagService::create_batch`]
@@ -873,7 +877,7 @@ impl TagService {
     pub async fn list(&self, params: ListParams) -> Result<ListResult<Tag>, BantoError> {
         let columns = column_map();
 
-        let mut rows_builder: QueryBuilder<'_, Sqlite> =
+        let mut rows_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new(format!("SELECT {COLUMNS} FROM tags"));
         banto_storage::list_query::sqlite::apply_list_params(&mut rows_builder, &columns, &params)?;
         let rows: Vec<Tag> = rows_builder
@@ -882,7 +886,7 @@ impl TagService {
             .await
             .map_err(banto_storage::storage_error)?;
 
-        let mut count_builder: QueryBuilder<'_, Sqlite> =
+        let mut count_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new("SELECT COUNT(*) FROM tags");
         banto_storage::list_query::sqlite::append_where(
             &mut count_builder,
@@ -918,17 +922,23 @@ impl TagService {
     }
 
     pub async fn get(&self, id: i64) -> Result<Tag, BantoError> {
-        sqlx::query_as::<_, Tag>(&format!("SELECT {COLUMNS} FROM tags WHERE id = ?"))
-            .bind(id)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|err| banto_storage::not_found(err, RESOURCE, id.to_string()))
+        // AssertSqlSafe: fetch_tag_row と同じ理由 - COLUMNS 定数のみを埋め込む
+        // 固定文字列で、外部入力は含まない。
+        sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(format!(
+            "SELECT {COLUMNS} FROM tags WHERE id = ?"
+        )))
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|err| banto_storage::not_found(err, RESOURCE, id.to_string()))
     }
 
     pub async fn create(&self, input: TagInput) -> Result<Tag, BantoError> {
         let validated = validate_tag_input(&input)?;
         validate_tag_kind_placement(&self.pool, input.collection_group_id, &input.tag_kind).await?;
-        sqlx::query_as::<_, Tag>(&insert_tag_sql())
+        // AssertSqlSafe: insert_tag_sql() は固定の列名・プレースホルダのみで
+        // 構築される文字列で外部入力は含まれない（本ファイル内の関数定義参照）。
+        sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(insert_tag_sql()))
             .bind(&validated.name)
             .bind(input.collection_group_id)
             .bind(&validated.address)
@@ -963,7 +973,9 @@ impl TagService {
         let validated = validate_tag_input(&input)?;
         validate_tag_kind_placement_tx(connection, input.collection_group_id, &input.tag_kind)
             .await?;
-        sqlx::query_as::<_, Tag>(&insert_tag_sql())
+        // AssertSqlSafe: insert_tag_sql() は固定の列名・プレースホルダのみで
+        // 構築される文字列で外部入力は含まれない（本ファイル内の関数定義参照）。
+        sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(insert_tag_sql()))
             .bind(&validated.name)
             .bind(input.collection_group_id)
             .bind(&validated.address)
@@ -1011,7 +1023,10 @@ impl TagService {
         validate_tag_kind_placement(&self.pool, input.collection_group_id, &input.tag_kind).await?;
         let expected_revision = input.expected_revision;
         let sql = update_tag_sql(expected_revision.is_some());
-        let mut query = sqlx::query_as::<_, Tag>(&sql)
+        // AssertSqlSafe: update_tag_sql() は expected_revision の有無で固定の
+        // WHERE 句を選ぶだけの純粋関数で、外部入力は含まれない。以降 `sql` は
+        // 再利用しないのでそのまま move する。
+        let mut query = sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(sql))
             .bind(&validated.name)
             .bind(input.collection_group_id)
             .bind(&validated.address)
@@ -1043,9 +1058,11 @@ impl TagService {
                     // Distinguish "no such tag" from "stale revision" the
                     // same way update_tx does, just without a connection to
                     // reuse - see that method's doc comment.
-                    let current = sqlx::query_as::<_, Tag>(&format!(
+                    // AssertSqlSafe: fetch_tag_row と同じ理由 - COLUMNS 定数のみを
+                    // 埋め込む固定文字列。
+                    let current = sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(format!(
                         "SELECT {COLUMNS} FROM tags WHERE id = ?"
-                    ))
+                    )))
                     .bind(id)
                     .fetch_optional(&self.pool)
                     .await
@@ -1097,7 +1114,10 @@ impl TagService {
             .await?;
         let expected_revision = input.expected_revision;
         let sql = update_tag_sql(expected_revision.is_some());
-        let mut query = sqlx::query_as::<_, Tag>(&sql)
+        // AssertSqlSafe: update() と同じ理由 - update_tag_sql() は固定の
+        // WHERE 句を選ぶだけの純粋関数で外部入力は含まれない。`sql` は
+        // 以降再利用しないので move する。
+        let mut query = sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(sql))
             .bind(&validated.name)
             .bind(input.collection_group_id)
             .bind(&validated.address)
@@ -1241,7 +1261,7 @@ impl TagService {
         let ids: Vec<i64> = updates.iter().map(|(id, _)| *id).collect();
         let mut existing_revisions: HashMap<i64, i64> = HashMap::new();
         if !ids.is_empty() {
-            let mut qb: QueryBuilder<'_, Sqlite> =
+            let mut qb: QueryBuilder<Sqlite> =
                 QueryBuilder::new("SELECT id, revision FROM tags WHERE id IN (");
             let mut separated = qb.separated(", ");
             for id in &ids {
@@ -1312,7 +1332,7 @@ impl TagService {
             .filter_map(|value| value.as_ref().map(|value| value.name.as_str()))
             .collect();
         if !candidate_names.is_empty() {
-            let mut qb: QueryBuilder<'_, Sqlite> =
+            let mut qb: QueryBuilder<Sqlite> =
                 QueryBuilder::new("SELECT id, name FROM tags WHERE name IN (");
             let mut separated = qb.separated(", ");
             for name in &candidate_names {
@@ -1372,7 +1392,9 @@ impl TagService {
             } else {
                 &sql_without_revision
             };
-            let mut query = sqlx::query_as::<_, Tag>(sql)
+            // AssertSqlSafe: update() と同じ理由 - update_tag_sql() が返す
+            // 固定文字列を、行ごとに使い回しているだけ（外部入力は含まれない）。
+            let mut query = sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(&value.name)
                 .bind(input.collection_group_id)
                 .bind(&value.address)
@@ -1509,7 +1531,7 @@ impl TagService {
             .filter_map(|value| value.as_ref().map(|value| value.name.as_str()))
             .collect();
         if !candidate_names.is_empty() {
-            let mut qb: QueryBuilder<'_, Sqlite> =
+            let mut qb: QueryBuilder<Sqlite> =
                 QueryBuilder::new("SELECT name FROM tags WHERE name IN (");
             let mut separated = qb.separated(", ");
             for name in &candidate_names {
@@ -1553,7 +1575,9 @@ impl TagService {
             let value = value
                 .as_ref()
                 .expect("all batch rows were validated before insertion");
-            let row = sqlx::query_as::<_, Tag>(&sql)
+            // AssertSqlSafe: insert_tag_sql() が返す固定文字列を、行ごとに
+            // 使い回しているだけ（外部入力は含まれない）。
+            let row = sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(&value.name)
                 .bind(input.collection_group_id)
                 .bind(&value.address)
@@ -1699,7 +1723,7 @@ impl TagService {
             .filter_map(|v| v.as_ref().map(|v| v.name.as_str()))
             .collect();
         if !candidate_names.is_empty() {
-            let mut qb: QueryBuilder<'_, Sqlite> =
+            let mut qb: QueryBuilder<Sqlite> =
                 QueryBuilder::new("SELECT name FROM tags WHERE name IN (");
             let mut separated = qb.separated(", ");
             for name in &candidate_names {
@@ -1754,7 +1778,9 @@ impl TagService {
             let validated = validated.as_ref().expect(
                 "every row validated Ok in the pass above (errors would have returned already)",
             );
-            let row = sqlx::query_as::<_, Tag>(&sql)
+            // AssertSqlSafe: insert_tag_sql() が返す固定文字列を、行ごとに
+            // 使い回しているだけ（外部入力は含まれない）。
+            let row = sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(&validated.name)
                 .bind(input.collection_group_id)
                 .bind(&validated.address)

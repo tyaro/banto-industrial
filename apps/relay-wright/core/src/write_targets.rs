@@ -285,7 +285,7 @@ impl WriteTargetService {
     pub async fn list(&self, params: ListParams) -> Result<ListResult<WriteTarget>, BantoError> {
         let columns = column_map();
 
-        let mut rows_builder: QueryBuilder<'_, Sqlite> =
+        let mut rows_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new(format!("SELECT {COLUMNS} FROM write_targets"));
         banto_storage::list_query::sqlite::apply_list_params(&mut rows_builder, &columns, &params)?;
         let rows: Vec<WriteTarget> = rows_builder
@@ -294,7 +294,7 @@ impl WriteTargetService {
             .await
             .map_err(banto_storage::storage_error)?;
 
-        let mut count_builder: QueryBuilder<'_, Sqlite> =
+        let mut count_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new("SELECT COUNT(*) FROM write_targets");
         banto_storage::list_query::sqlite::append_where(
             &mut count_builder,
@@ -314,9 +314,11 @@ impl WriteTargetService {
     }
 
     pub async fn get(&self, id: i64) -> Result<WriteTarget, BantoError> {
-        sqlx::query_as::<_, WriteTarget>(&format!(
+        // AssertSqlSafe: 補間されるのは COLUMNS 定数（本ファイル内の固定文字列）
+        // のみで、外部入力は含まれない。id はプレースホルダでバインドする。
+        sqlx::query_as::<_, WriteTarget>(sqlx::AssertSqlSafe(format!(
             "SELECT {COLUMNS} FROM write_targets WHERE id = ?"
-        ))
+        )))
         .bind(id)
         .fetch_one(&self.pool)
         .await
@@ -337,12 +339,14 @@ impl WriteTargetService {
             });
         }
 
-        sqlx::query_as::<_, WriteTarget>(&format!(
+        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
+        // 文字列。値はすべてプレースホルダでバインドする。
+        sqlx::query_as::<_, WriteTarget>(sqlx::AssertSqlSafe(format!(
             "INSERT INTO write_targets (\
                 name, plc_connection_id, address, data_type, string_length, \
                 raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, enabled\
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(&normalized.name)
         .bind(input.plc_connection_id)
         .bind(&normalized.address)
@@ -378,12 +382,14 @@ impl WriteTargetService {
             });
         }
 
-        sqlx::query_as::<_, WriteTarget>(&format!(
+        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
+        // 文字列。値はすべてプレースホルダでバインドする。
+        sqlx::query_as::<_, WriteTarget>(sqlx::AssertSqlSafe(format!(
             "UPDATE write_targets SET \
                 name = ?, plc_connection_id = ?, address = ?, data_type = ?, string_length = ?, \
                 raw_lo = ?, raw_hi = ?, eng_lo = ?, eng_hi = ?, unit = ?, decimals = ?, enabled = ? \
              WHERE id = ? RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(&normalized.name)
         .bind(input.plc_connection_id)
         .bind(&normalized.address)

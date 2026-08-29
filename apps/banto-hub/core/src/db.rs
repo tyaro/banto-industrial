@@ -319,7 +319,10 @@ async fn add_column_if_missing(
 ) -> Result<(), BantoError> {
     use sqlx::Row;
 
-    let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+    // AssertSqlSafe: この関数の doc comment の通り、`table`/`column`/
+    // `ddl_type` は呼び出し元が埋め込む固定のスキーマ定数のみを渡す
+    // （呼び出し元一覧を確認済み）- ユーザー入力は通さない。
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA table_info({table})")))
         .fetch_all(pool)
         .await
         .map_err(banto_storage::storage_error)?;
@@ -329,9 +332,9 @@ async fn add_column_if_missing(
             .unwrap_or(false)
     });
     if !exists {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE {table} ADD COLUMN {column} {ddl_type}"
-        ))
+        )))
         .execute(pool)
         .await
         .map_err(banto_storage::storage_error)?;
