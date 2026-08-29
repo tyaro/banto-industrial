@@ -86,7 +86,7 @@ tower = "0.5"
 futures-util = "0.3"
 rust-embed = "8"
 argon2 = "0.5"
-password-hash = { version = "0.5", features = ["getrandom"] }
+password-hash = { version = "0.6", features = ["getrandom"] }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 # Desktop-only (apps/chronogazer/src-tauri and apps/relay-wright/src-tauri,
 # mirrors banto's own M11/M12 reasoning): OS keyring storage for auto-login
