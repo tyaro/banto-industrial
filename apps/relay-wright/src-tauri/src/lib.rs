@@ -3942,10 +3942,13 @@ mod tests {
         assert_eq!(summary.tags, 2);
 
         for table in ["plc_connections", "collection_groups", "tags"] {
-            let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+            // AssertSqlSafe: table はこの直上の固定配列リテラルの要素のみ
+            // （テストコード、外部入力は無い）。
+            let count: i64 =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
             assert_eq!(count, 0, "{table} should be empty after the cascade");
         }
 

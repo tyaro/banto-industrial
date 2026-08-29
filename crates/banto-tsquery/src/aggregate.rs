@@ -69,7 +69,12 @@ pub(crate) async fn aggregate(
             plan.table_name
         );
 
-        let row = sqlx::query(&sql)
+        // AssertSqlSafe: `select_list`/`plan.table_name` は plan.rs の
+        // モジュール doc「SQL-identifier safety」の通り、`is_safe_table_name`/
+        // `is_safe_column_name` で検証済みの `samples_<n>`/`c<i>` 形式の識別子
+        // のみで構成される（呼び出し元の group_key/tag_key は値としてしか
+        // 使われない）。バインド値は from_ms/to_ms のみ。
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(from_ms)
             .bind(to_ms)
             .fetch_one(&plan.pool)

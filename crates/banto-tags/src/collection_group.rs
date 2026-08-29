@@ -117,7 +117,7 @@ impl CollectionGroupService {
     ) -> Result<ListResult<CollectionGroup>, BantoError> {
         let columns = column_map();
 
-        let mut rows_builder: QueryBuilder<'_, Sqlite> =
+        let mut rows_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new(format!("SELECT {COLUMNS} FROM collection_groups"));
         banto_storage::list_query::sqlite::apply_list_params(&mut rows_builder, &columns, &params)?;
         let rows: Vec<CollectionGroup> = rows_builder
@@ -126,7 +126,7 @@ impl CollectionGroupService {
             .await
             .map_err(banto_storage::storage_error)?;
 
-        let mut count_builder: QueryBuilder<'_, Sqlite> =
+        let mut count_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new("SELECT COUNT(*) FROM collection_groups");
         banto_storage::list_query::sqlite::append_where(
             &mut count_builder,
@@ -146,9 +146,11 @@ impl CollectionGroupService {
     }
 
     pub async fn get(&self, id: i64) -> Result<CollectionGroup, BantoError> {
-        sqlx::query_as::<_, CollectionGroup>(&format!(
+        // AssertSqlSafe: 補間されるのは COLUMNS 定数（本ファイル内の固定文字列）
+        // のみで、外部入力は含まれない。id はプレースホルダでバインドする。
+        sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
             "SELECT {COLUMNS} FROM collection_groups WHERE id = ?"
-        ))
+        )))
         .bind(id)
         .fetch_one(&self.pool)
         .await
@@ -157,10 +159,12 @@ impl CollectionGroupService {
 
     pub async fn create(&self, input: CollectionGroupInput) -> Result<CollectionGroup, BantoError> {
         validate_collection_group_input(&input)?;
-        sqlx::query_as::<_, CollectionGroup>(&format!(
+        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
+        // 文字列。値はすべてプレースホルダでバインドする。
+        sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
             "INSERT INTO collection_groups (name, plc_connection_id, period_ms, enabled) \
              VALUES (?, ?, ?, ?) RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(input.name.trim())
         .bind(input.plc_connection_id)
         .bind(input.period_ms)
@@ -177,10 +181,12 @@ impl CollectionGroupService {
         input: CollectionGroupInput,
     ) -> Result<CollectionGroup, BantoError> {
         validate_collection_group_input(&input)?;
-        sqlx::query_as::<_, CollectionGroup>(&format!(
+        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
+        // 文字列。値はすべてプレースホルダでバインドする。
+        sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
             "INSERT INTO collection_groups (name, plc_connection_id, period_ms, enabled) \
              VALUES (?, ?, ?, ?) RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(input.name.trim())
         .bind(input.plc_connection_id)
         .bind(input.period_ms)
@@ -196,10 +202,12 @@ impl CollectionGroupService {
         input: CollectionGroupInput,
     ) -> Result<CollectionGroup, BantoError> {
         validate_collection_group_input(&input)?;
-        sqlx::query_as::<_, CollectionGroup>(&format!(
+        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
+        // 文字列。値はすべてプレースホルダでバインドする。
+        sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
             "UPDATE collection_groups SET name = ?, plc_connection_id = ?, period_ms = ?, enabled = ? \
              WHERE id = ? RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(input.name.trim())
         .bind(input.plc_connection_id)
         .bind(input.period_ms)
@@ -224,10 +232,12 @@ impl CollectionGroupService {
         input: CollectionGroupInput,
     ) -> Result<CollectionGroup, BantoError> {
         validate_collection_group_input(&input)?;
-        sqlx::query_as::<_, CollectionGroup>(&format!(
+        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
+        // 文字列。値はすべてプレースホルダでバインドする。
+        sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
             "UPDATE collection_groups SET name = ?, plc_connection_id = ?, period_ms = ?, enabled = ? \
              WHERE id = ? RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(input.name.trim())
         .bind(input.plc_connection_id)
         .bind(input.period_ms)

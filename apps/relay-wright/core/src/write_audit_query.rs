@@ -109,7 +109,7 @@ impl WriteAuditLogService {
             params
         };
 
-        let mut rows_builder: QueryBuilder<'_, Sqlite> =
+        let mut rows_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new(format!("SELECT {COLUMNS} FROM write_audit_log"));
         banto_storage::list_query::sqlite::apply_list_params(&mut rows_builder, &columns, &params)?;
         let rows: Vec<WriteAuditLogRow> = rows_builder
@@ -118,7 +118,7 @@ impl WriteAuditLogService {
             .await
             .map_err(banto_storage::storage_error)?;
 
-        let mut count_builder: QueryBuilder<'_, Sqlite> =
+        let mut count_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new("SELECT COUNT(*) FROM write_audit_log");
         banto_storage::list_query::sqlite::append_where(
             &mut count_builder,
