@@ -220,6 +220,22 @@ impl UsersService {
         Ok(count > 0)
     }
 
+    /// Does at least one `admin` role account exist? Used by
+    /// `crate::commissioning::CommissioningService::lock_down`（設計
+    /// §5.6「試運転モードとロックダウン」・2026-08-30 オーナー決定）の
+    /// ガードとして: ロックダウン（試運転モード→ロックダウン済み、
+    /// 以後は認証必須）を実行する前に、ログインできる管理者が最低1人
+    /// 存在することを確認する。ここで確認しないと、誰も
+    /// ログインできない状態のまま施錠してしまい、UI からも API からも
+    /// 一切操作できない詰み状態を自分で作ってしまう。
+    pub async fn has_admin(&self) -> Result<bool, BantoError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role = 'admin'")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(banto_storage::storage_error)?;
+        Ok(count > 0)
+    }
+
     /// Create the very first account. Only succeeds while the `users` table
     /// is empty - once any account exists, this always fails with
     /// `BantoError::Other`, regardless of the requested username (spec:

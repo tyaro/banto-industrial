@@ -69,8 +69,7 @@ use banto_plc::{
     PlcClient, PlcError, ReadRequest, ReadResult, SlmpClient, SlmpConfig,
 };
 use banto_server::{
-    auth_routes, require_auth, require_banto_client_header, sse_route, ApiError, AuthState,
-    Identity, ServerEvent,
+    auth_routes, require_banto_client_header, sse_route, ApiError, AuthState, Identity, ServerEvent,
 };
 use banto_tags::{
     BatchTagOutcome, BatchTagUpdateOutcome, CollectionGroup, CollectionGroupInput,
@@ -87,6 +86,7 @@ use utoipa_swagger_ui::{Config, SwaggerUi};
 
 use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService, IssuedApiKey};
 use crate::audit::{AuditEntry, AuditLogService};
+use crate::commissioning::{CommissioningService, CommissioningState};
 use crate::controller::{CollectionController, CollectionState, CollectionStatus, RunMode};
 use crate::hub::{CollectorManager, SimulationCoverageReport, TagEntry};
 use crate::mqtt::MqttPublisher;
@@ -114,8 +114,68 @@ fn unauthorized_response() -> Response {
     (StatusCode::UNAUTHORIZED, Json(ErrorBody::Unauthorized)).into_response()
 }
 
-fn actor_identity(headers: &HeaderMap, auth: &AuthState) -> Option<Identity> {
+/// 試運転モード（docs/tag-server-design.md §5.6「試運転モードとロックダウン」・
+/// 2026-08-30 オーナー決定）: ロックダウン済みなら従来どおり bearer token
+/// から identity を引く。**未ロックダウン（試運転モード）なら、渡された
+/// `headers`の中身に関わらず無条件で合成の管理者 identity
+/// (`crate::commissioning::synthetic_identity`) を返す** - 設計 §5.6
+/// 「actor_identity() が合成の管理者 identity を返す」「これにより
+/// require_editor などの下流が現行のまま動く」のとおり。この関数の呼び出し
+/// 元（`require_editor`・`record_write`・監査ログ記録の各所）は一切
+/// 分岐を増やさずに「admin 相当の identity が常に手に入る」前提のまま
+/// 動く。監査ログ (`audit_log.actor_username`) にはこの合成 id
+/// (`commissioning`) がそのまま記録される - 「試運転モード中に行われた
+/// 操作」だと後から判別できる、意図した挙動（設計 §5.6）。
+fn actor_identity(
+    headers: &HeaderMap,
+    auth: &AuthState,
+    commissioning: &CommissioningState,
+) -> Option<Identity> {
+    if !commissioning.is_locked_down() {
+        return Some(crate::commissioning::synthetic_identity());
+    }
     bearer_token(headers).and_then(|token| auth.identity_for(token))
+}
+
+/// `AuthState` + `CommissioningState`をまとめた、
+/// [`require_auth_or_commissioning`]の`middleware::from_fn_with_state`用
+/// state。従来の`banto_server::require_auth`（`State<AuthState>`のみ）を
+/// 直接差し替えず、この型を挟む1段ラッパーにしてある理由は
+/// [`require_auth_or_commissioning`]のdoc comment参照。
+#[derive(Clone)]
+struct AuthGate {
+    auth: AuthState,
+    commissioning: CommissioningState,
+}
+
+/// 試運転モード（設計 §5.6・2026-08-30 オーナー決定）: `banto_server::require_auth`
+/// をそのまま`.layer(middleware::from_fn_with_state(auth, require_auth))`
+/// で貼ると、常にセッション bearer を要求してしまい試運転モードの
+/// 「管理 UI / 管理 REST は認証なしで操作できる」を実現できない。この
+/// ラッパーが手前に立ち、ロックダウン済みなら`require_auth`と全く同じ
+/// 判定（bearer token 検証、失敗時 401 - `unauthorized_response`は
+/// `banto_server::require_auth`の401ボディをそのまま再現したもの、この
+/// ファイル冒頭の`unauthorized_response`のdoc comment参照）を行い、
+/// **未ロックダウン中は無条件で次のレイヤーへ素通しする**（設計 §5.6
+/// 「require_auth を通さない（またはバイパスする）」）。素通しした後段の
+/// `require_role_at_least`/`require_editor`は[`actor_identity`]経由で
+/// 合成 admin identity を受け取るので、トークン無しでも「admin 相当」
+/// として動く（このファイル管理系ルーターの`require_auth`レイヤー全箇所
+/// （`users_router`等）でこれに差し替える - `/api/v1/*`のタグ空間 API
+/// （`require_tag_space_auth`、API キー認証）はこの対象外 - 設計 §5.6は
+/// 「管理 UI / 管理 REST」のみを試運転モードの対象にしている）。
+async fn require_auth_or_commissioning(
+    State(gate): State<AuthGate>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !gate.commissioning.is_locked_down() {
+        return next.run(req).await;
+    }
+    match bearer_token(req.headers()) {
+        Some(token) if gate.auth.verify(token) => next.run(req).await,
+        _ => unauthorized_response(),
+    }
 }
 
 /// `Sec-WebSocket-Protocol`-as-bearer-carrier fallback for `GET
@@ -165,16 +225,21 @@ fn extract_ws_protocol_token(path: &str, headers: &HeaderMap) -> Option<String> 
 
 /// Record a successful write once the service call it follows has already
 /// succeeded - same convention as chronogazer/relay-wright's `record_write`.
+/// 試運転モード対応（設計 §5.6）で `commissioning` 引数が増えて8引数に
+/// なった - このファイルの他の合成関数（`api_router_with_controller_mode`
+/// 等）と同じく `#[allow]` で許容する。
+#[allow(clippy::too_many_arguments)]
 async fn record_write(
     audit: &AuditLogService,
     auth: &AuthState,
+    commissioning: &CommissioningState,
     headers: &HeaderMap,
     action: &str,
     resource: &str,
     entity_id: &str,
     detail: Option<serde_json::Value>,
 ) {
-    let identity = actor_identity(headers, auth);
+    let identity = actor_identity(headers, auth, commissioning);
     audit
         .record(AuditEntry {
             actor_username: identity.as_ref().map(|i| i.id.as_str()),
@@ -192,6 +257,7 @@ async fn record_write(
 #[derive(Clone)]
 struct RoleGuard {
     auth: AuthState,
+    commissioning: CommissioningState,
     min: Role,
     resource: &'static str,
     audit: AuditLogService,
@@ -250,7 +316,16 @@ async fn require_role_at_least(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let identity = bearer_token(req.headers()).and_then(|token| guard.auth.identity_for(token));
+    // 試運転モード（設計 §5.6・2026-08-30 オーナー決定）: 未ロックダウン中は
+    // トークンの有無に関わらず合成 admin identity を使う -
+    // `require_auth_or_commissioning`が手前で既に素通ししている前提なので、
+    // ここで従来どおりトークン必須にしてしまうと「管理 REST は認証なしで
+    // 操作できる」が実現できない（[`actor_identity`]と同じ判断）。
+    let identity = if !guard.commissioning.is_locked_down() {
+        Some(crate::commissioning::synthetic_identity())
+    } else {
+        bearer_token(req.headers()).and_then(|token| guard.auth.identity_for(token))
+    };
     let role = identity
         .as_ref()
         .and_then(|identity| Role::from_str(&identity.role).ok());
@@ -285,13 +360,14 @@ async fn require_role_at_least(
 /// 共通に使う - `relay-wright-core::rest::require_editor` と同型。
 async fn require_editor(
     auth: &AuthState,
+    commissioning: &CommissioningState,
     audit: &AuditLogService,
     headers: &HeaderMap,
     resource: &'static str,
     method: &str,
     path: &str,
 ) -> Result<(), BantoError> {
-    match actor_identity(headers, auth) {
+    match actor_identity(headers, auth, commissioning) {
         Some(identity)
             if Role::from_str(&identity.role)
                 .map(|role| role.at_least(Role::Editor))
@@ -371,14 +447,34 @@ struct ResetPasswordResponse {
 struct UsersAdminState {
     users: UsersService,
     auth: AuthState,
+    commissioning: CommissioningState,
     audit: AuditLogService,
 }
 
+/// `users_delete`専用: 呼び出し元自身の numeric row id を解決する
+/// （自己削除ガード`UsersService::delete_user`のdoc comment参照）。
+///
+/// 試運転モード（設計 §5.6・2026-08-30 オーナー決定）中は、bearer token を
+/// 一切要求せず、`users`テーブルに絶対に存在しない sentinel の
+/// `id: 0`（`AUTOINCREMENT`は1始まり）を持つ合成`UserIdentity`を返す -
+/// `delete_user`の`id == acting_user_id`という自己削除ガードは、実在しない
+/// idとは決して一致しないため無害に素通りする（合成 identity は
+/// 「削除されうる実在アカウント」ではないので、このガードの対象外で
+/// 正しい）。
 async fn acting_user(
     headers: &HeaderMap,
     auth: &AuthState,
+    commissioning: &CommissioningState,
     users: &UsersService,
 ) -> Result<UserIdentity, BantoError> {
+    if !commissioning.is_locked_down() {
+        return Ok(UserIdentity {
+            id: 0,
+            username: crate::commissioning::SYNTHETIC_ACTOR_ID.to_string(),
+            display_name: "試運転モード".to_string(),
+            role: Role::Admin,
+        });
+    }
     let username = bearer_token(headers)
         .and_then(|token| auth.identity_for(token))
         .map(|identity| identity.id);
@@ -414,6 +510,7 @@ async fn users_create(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "create",
         "users",
@@ -437,6 +534,7 @@ async fn users_update(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "update",
         "users",
@@ -457,6 +555,7 @@ async fn users_reset_password(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "password_reset",
         "users",
@@ -472,11 +571,12 @@ async fn users_delete(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
-    let acting = acting_user(&headers, &state.auth, &state.users).await?;
+    let acting = acting_user(&headers, &state.auth, &state.commissioning, &state.users).await?;
     state.users.delete_user(id, acting.id).await?;
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "delete",
         "users",
@@ -487,10 +587,16 @@ async fn users_delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn users_router(users: UsersService, audit: AuditLogService, auth: AuthState) -> Router {
+fn users_router(
+    users: UsersService,
+    audit: AuditLogService,
+    auth: AuthState,
+    commissioning: CommissioningState,
+) -> Router {
     let state = UsersAdminState {
         users,
         auth: auth.clone(),
+        commissioning: commissioning.clone(),
         audit: audit.clone(),
     };
     Router::new()
@@ -504,13 +610,20 @@ fn users_router(users: UsersService, audit: AuditLogService, auth: AuthState) ->
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
+                commissioning: commissioning.clone(),
                 min: Role::Admin,
                 resource: "users",
                 audit,
             },
             require_role_at_least,
         ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- extra auth routes (status/setup/change-password) ---------------------
@@ -732,6 +845,7 @@ pub fn audited_credential_verifier(
 #[derive(Clone)]
 struct LogoutAuditState {
     auth: AuthState,
+    commissioning: CommissioningState,
     audit: AuditLogService,
 }
 
@@ -743,7 +857,7 @@ async fn audit_logout_middleware(
     let is_logout =
         req.method() == axum::http::Method::POST && req.uri().path() == "/api/auth/logout";
     let identity = if is_logout {
-        actor_identity(req.headers(), &state.auth)
+        actor_identity(req.headers(), &state.auth, &state.commissioning)
     } else {
         None
     };
@@ -781,6 +895,7 @@ struct AuditLogState {
     // `SettingsService::new(state.manager.pool())`を都度構築する。
     manager: Arc<CollectorManager>,
     auth: AuthState,
+    commissioning: CommissioningState,
 }
 
 /// `POST /api/audit-log/list`（admin 限定）: フィルタ/ソート/ページング
@@ -840,6 +955,7 @@ async fn audit_log_config_put(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "update",
         "audit_log_config",
@@ -857,12 +973,14 @@ async fn audit_log_config_put(
 fn audit_log_router(
     audit: AuditLogService,
     auth: AuthState,
+    commissioning: CommissioningState,
     manager: Arc<CollectorManager>,
 ) -> Router {
     let state = AuditLogState {
         audit: audit.clone(),
         manager,
         auth: auth.clone(),
+        commissioning: commissioning.clone(),
     };
     Router::new()
         .route("/api/audit-log/list", post(audit_log_list))
@@ -874,13 +992,20 @@ fn audit_log_router(
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
+                commissioning: commissioning.clone(),
                 min: Role::Admin,
                 resource: "audit_log",
                 audit,
             },
             require_role_at_least,
         ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- API キー管理 (docs/tag-server-design.md §5.6・T0-2 実装指示 §1「管理
@@ -893,6 +1018,7 @@ fn audit_log_router(
 struct ApiKeysAdminState {
     api_keys: ApiKeysService,
     auth: AuthState,
+    commissioning: CommissioningState,
     audit: AuditLogService,
     /// H10 ①: `api_keys_create` の「有効期限は未来限定」検証で使う時計
     /// （`manager.clock()`）。他の `*AdminState`（`WriteControlAdminState`
@@ -988,6 +1114,7 @@ async fn api_keys_create(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "create",
         "api_keys",
@@ -1021,6 +1148,7 @@ async fn api_keys_revoke(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "revoke",
         "api_keys",
@@ -1044,6 +1172,7 @@ async fn api_keys_clear_trip(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "clear_trip",
         "api_keys",
@@ -1065,11 +1194,13 @@ fn api_keys_router(
     api_keys: ApiKeysService,
     audit: AuditLogService,
     auth: AuthState,
+    commissioning: CommissioningState,
     manager: Arc<CollectorManager>,
 ) -> Router {
     let state = ApiKeysAdminState {
         api_keys,
         auth: auth.clone(),
+        commissioning: commissioning.clone(),
         audit: audit.clone(),
         manager,
     };
@@ -1081,13 +1212,20 @@ fn api_keys_router(
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
+                commissioning: commissioning.clone(),
                 min: Role::Admin,
                 resource: "api_keys",
                 audit,
             },
             require_role_at_least,
         ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- 書き込み受付トグル (T2-4、設計 §6-6): admin 限定、CSRF + bearer -------
@@ -1103,6 +1241,7 @@ struct WriteControlAdminState {
     write_control: Arc<WriteControl>,
     manager: Arc<CollectorManager>,
     auth: AuthState,
+    commissioning: CommissioningState,
     audit: AuditLogService,
     events: broadcast::Sender<ServerEvent>,
 }
@@ -1127,7 +1266,7 @@ async fn write_control_set(
         state.write_control.disable();
     }
 
-    let identity = actor_identity(headers, &state.auth);
+    let identity = actor_identity(headers, &state.auth, &state.commissioning);
     if let Err(err) = crate::write_control::persist_enabled(
         &state.manager.pool(),
         enabled,
@@ -1141,6 +1280,7 @@ async fn write_control_set(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         headers,
         action,
         "write_control",
@@ -1177,12 +1317,14 @@ fn write_control_router(
     manager: Arc<CollectorManager>,
     audit: AuditLogService,
     auth: AuthState,
+    commissioning: CommissioningState,
     events: broadcast::Sender<ServerEvent>,
 ) -> Router {
     let state = WriteControlAdminState {
         write_control,
         manager,
         auth: auth.clone(),
+        commissioning: commissioning.clone(),
         audit: audit.clone(),
         events,
     };
@@ -1193,13 +1335,20 @@ fn write_control_router(
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
+                commissioning: commissioning.clone(),
                 min: Role::Admin,
                 resource: "write_control",
                 audit,
             },
             require_role_at_least,
         ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- テスト出力トグル (T15-3、設計 §6.3): admin 限定、CSRF + bearer -------
@@ -1219,6 +1368,7 @@ struct TestOutputAdminState {
     test_output: Arc<TestOutputControl>,
     controller: Arc<CollectionController>,
     auth: AuthState,
+    commissioning: CommissioningState,
     audit: AuditLogService,
     events: broadcast::Sender<ServerEvent>,
 }
@@ -1275,6 +1425,7 @@ async fn test_output_enable(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "enable",
         "test_output",
@@ -1298,6 +1449,7 @@ async fn test_output_disable(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "disable",
         "test_output",
@@ -1317,12 +1469,14 @@ fn test_output_router(
     controller: Arc<CollectionController>,
     audit: AuditLogService,
     auth: AuthState,
+    commissioning: CommissioningState,
     events: broadcast::Sender<ServerEvent>,
 ) -> Router {
     let state = TestOutputAdminState {
         test_output,
         controller,
         auth: auth.clone(),
+        commissioning: commissioning.clone(),
         audit: audit.clone(),
         events,
     };
@@ -1333,13 +1487,20 @@ fn test_output_router(
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
+                commissioning: commissioning.clone(),
                 min: Role::Admin,
                 resource: "test_output",
                 audit,
             },
             require_role_at_least,
         ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- collection lifecycle control (T14-4): admin + CSRF --------------------
@@ -1382,6 +1543,7 @@ struct CollectionAdminState {
     /// 状態機械のみ - `crate::controller`のモジュール doc comment参照)。
     manager: Arc<CollectorManager>,
     auth: AuthState,
+    commissioning: CommissioningState,
     audit: AuditLogService,
     events: broadcast::Sender<ServerEvent>,
 }
@@ -1395,6 +1557,7 @@ async fn collection_control_result(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         headers,
         action,
         "collection",
@@ -1483,12 +1646,14 @@ fn collection_control_router(
     manager: Arc<CollectorManager>,
     audit: AuditLogService,
     auth: AuthState,
+    commissioning: CommissioningState,
     events: broadcast::Sender<ServerEvent>,
 ) -> Router {
     let state = CollectionAdminState {
         controller,
         manager,
         auth: auth.clone(),
+        commissioning: commissioning.clone(),
         audit: audit.clone(),
         events,
     };
@@ -1511,13 +1676,20 @@ fn collection_control_router(
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
+                commissioning: commissioning.clone(),
                 min: Role::Admin,
                 resource: "collection",
                 audit,
             },
             require_role_at_least,
         ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- MQTT 設定 (T3、設計 §5.3): admin 限定、CSRF + bearer -------------------
@@ -1533,6 +1705,7 @@ struct MqttSettingsAdminState {
     manager: Arc<CollectorManager>,
     mqtt: Arc<MqttPublisher>,
     auth: AuthState,
+    commissioning: CommissioningState,
     audit: AuditLogService,
     events: broadcast::Sender<ServerEvent>,
 }
@@ -1678,6 +1851,7 @@ async fn mqtt_settings_put(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "update",
         "mqtt_settings",
@@ -1697,12 +1871,14 @@ fn mqtt_settings_router(
     mqtt: Arc<MqttPublisher>,
     audit: AuditLogService,
     auth: AuthState,
+    commissioning: CommissioningState,
     events: broadcast::Sender<ServerEvent>,
 ) -> Router {
     let state = MqttSettingsAdminState {
         manager,
         mqtt,
         auth: auth.clone(),
+        commissioning: commissioning.clone(),
         audit: audit.clone(),
         events,
     };
@@ -1715,13 +1891,20 @@ fn mqtt_settings_router(
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
+                commissioning: commissioning.clone(),
                 min: Role::Admin,
                 resource: "mqtt_settings",
                 audit,
             },
             require_role_at_least,
         ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- gRPC 設定 (T4、設計 §5.4): admin 限定、CSRF + bearer -------------------
@@ -1747,6 +1930,7 @@ struct GrpcSettingsAdminState {
     manager: Arc<CollectorManager>,
     grpc_server: Arc<crate::grpc::GrpcServer>,
     auth: AuthState,
+    commissioning: CommissioningState,
     audit: AuditLogService,
     events: broadcast::Sender<ServerEvent>,
 }
@@ -1848,6 +2032,7 @@ async fn grpc_settings_put(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "update",
         "grpc_settings",
@@ -1867,12 +2052,14 @@ fn grpc_settings_router(
     grpc_server: Arc<crate::grpc::GrpcServer>,
     audit: AuditLogService,
     auth: AuthState,
+    commissioning: CommissioningState,
     events: broadcast::Sender<ServerEvent>,
 ) -> Router {
     let state = GrpcSettingsAdminState {
         manager,
         grpc_server,
         auth: auth.clone(),
+        commissioning: commissioning.clone(),
         audit: audit.clone(),
         events,
     };
@@ -1885,13 +2072,20 @@ fn grpc_settings_router(
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
+                commissioning: commissioning.clone(),
                 min: Role::Admin,
                 resource: "grpc_settings",
                 audit,
             },
             require_role_at_least,
         ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- 書き込み監査の閲覧 (T2-4、設計 §6-3): admin 限定、CSRF + bearer -------
@@ -1914,6 +2108,7 @@ fn write_audit_router(
     write_audit: WriteAuditService,
     audit: AuditLogService,
     auth: AuthState,
+    commissioning: CommissioningState,
 ) -> Router {
     let state = WriteAuditAdminState { write_audit };
     Router::new()
@@ -1922,13 +2117,20 @@ fn write_audit_router(
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
+                commissioning: commissioning.clone(),
                 min: Role::Admin,
                 resource: "write_audit",
                 audit,
             },
             require_role_at_least,
         ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- I1 CRUD (viewer-read / editor-write) + collector rebuild -------------
@@ -2167,6 +2369,7 @@ struct TagRegistryState {
     collection_groups: CollectionGroupService,
     tags: TagService,
     auth: AuthState,
+    commissioning: CommissioningState,
     audit: AuditLogService,
     manager: Arc<CollectorManager>,
     controller: Arc<CollectionController>,
@@ -2233,7 +2436,7 @@ async fn queue_pending_registry_change(
     payload: serde_json::Value,
     status: CollectionStatus,
 ) -> RegistryMutationResult<Response> {
-    let identity = actor_identity(headers, &state.auth);
+    let identity = actor_identity(headers, &state.auth, &state.commissioning);
     let base_fingerprint = compute_pending_base_fingerprint(state, source, &payload).await;
     let pending = state
         .pending_changes
@@ -2356,6 +2559,7 @@ async fn plc_connections_create(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "plc_connections",
@@ -2399,6 +2603,7 @@ async fn plc_connections_create(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "create",
         "plc_connections",
@@ -2426,6 +2631,7 @@ async fn plc_connections_update(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "plc_connections",
@@ -2473,6 +2679,7 @@ async fn plc_connections_update(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "update",
         "plc_connections",
@@ -2499,6 +2706,7 @@ async fn plc_connections_delete(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "plc_connections",
@@ -2539,6 +2747,7 @@ async fn plc_connections_delete(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "delete",
         "plc_connections",
@@ -2930,6 +3139,7 @@ async fn plc_connections_test(
 ) -> Result<Json<PlcConnectionTestResponse>, ApiError> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "plc_connections",
@@ -3006,6 +3216,7 @@ async fn collection_groups_create(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "collection_groups",
@@ -3053,6 +3264,7 @@ async fn collection_groups_create(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "create",
         "collection_groups",
@@ -3080,6 +3292,7 @@ async fn collection_groups_update(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "collection_groups",
@@ -3127,6 +3340,7 @@ async fn collection_groups_update(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "update",
         "collection_groups",
@@ -3153,6 +3367,7 @@ async fn collection_groups_delete(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "collection_groups",
@@ -3193,6 +3408,7 @@ async fn collection_groups_delete(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "delete",
         "collection_groups",
@@ -3252,6 +3468,7 @@ async fn tags_create(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "tags",
@@ -3294,6 +3511,7 @@ async fn tags_create(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "create",
         "tags",
@@ -3321,6 +3539,7 @@ async fn tags_update(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "tags",
@@ -3368,6 +3587,7 @@ async fn tags_update(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "update",
         "tags",
@@ -3394,6 +3614,7 @@ async fn tags_delete(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "tags",
@@ -3433,6 +3654,7 @@ async fn tags_delete(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "delete",
         "tags",
@@ -3464,6 +3686,7 @@ struct PendingChangesAdminState {
     apply_lock: Arc<AsyncMutex<()>>,
     legacy_live_reconfigure: bool,
     auth: AuthState,
+    commissioning: CommissioningState,
     audit: AuditLogService,
 }
 
@@ -3901,6 +4124,7 @@ async fn pending_changes_cancel(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "cancel",
         "pending_changes",
@@ -3920,6 +4144,7 @@ async fn pending_changes_requeue(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "requeue",
         "pending_changes",
@@ -3982,6 +4207,7 @@ async fn pending_changes_apply(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "apply",
         "pending_changes",
@@ -4000,6 +4226,7 @@ fn pending_changes_router(
     tags: TagService,
     audit: AuditLogService,
     auth: AuthState,
+    commissioning: CommissioningState,
     manager: Arc<CollectorManager>,
     controller: Arc<CollectionController>,
     events: broadcast::Sender<ServerEvent>,
@@ -4016,6 +4243,7 @@ fn pending_changes_router(
         apply_lock: Arc::new(AsyncMutex::new(())),
         legacy_live_reconfigure,
         auth: auth.clone(),
+        commissioning: commissioning.clone(),
         audit: audit.clone(),
     };
     Router::new()
@@ -4037,13 +4265,20 @@ fn pending_changes_router(
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
+                commissioning: commissioning.clone(),
                 min: Role::Admin,
                 resource: "pending_changes",
                 audit,
             },
             require_role_at_least,
         ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- T11-1 一括登録 API (docs/ux-plan.md §3): 連続登録 UI と T11-2 の CSV
@@ -4135,6 +4370,7 @@ async fn tags_batch(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "tags",
@@ -4212,6 +4448,7 @@ async fn tags_batch(
                 record_write(
                     &state.audit,
                     &state.auth,
+                    &state.commissioning,
                     &headers,
                     "batch_create",
                     "tags",
@@ -4329,6 +4566,7 @@ async fn tags_batch_update(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "tags",
@@ -4406,6 +4644,7 @@ async fn tags_batch_update(
                 record_write(
                     &state.audit,
                     &state.auth,
+                    &state.commissioning,
                     &headers,
                     "batch_update",
                     "tags",
@@ -4448,6 +4687,7 @@ fn tag_registry_router(
     pending_changes: PendingChangesService,
     audit: AuditLogService,
     auth: AuthState,
+    commissioning: CommissioningState,
     manager: Arc<CollectorManager>,
     controller: Arc<CollectionController>,
     events: broadcast::Sender<ServerEvent>,
@@ -4458,6 +4698,7 @@ fn tag_registry_router(
         collection_groups,
         tags,
         auth: auth.clone(),
+        commissioning: commissioning.clone(),
         audit,
         manager,
         controller: controller.clone(),
@@ -4511,7 +4752,13 @@ fn tag_registry_router(
         // 同じく固定セグメント。グループ別タグ件数集計。
         .route("/api/tags/group-counts", get(tags_group_counts))
         .with_state(state)
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- /api/v1/* タグ空間 API（設計 §5.1） ------------------------------------
@@ -5812,6 +6059,117 @@ fn openapi_router(profile_id: String) -> Router {
         .with_state(OpenApiState { profile_id })
 }
 
+// --- 試運転モード/ロックダウン (設計 §5.6・2026-08-30 オーナー決定) --------
+//
+// `GET /api/commissioning/status`: 現在ロックダウン済みかどうか。試運転
+// モード中は管理 UI がまだログインできない（ログインという概念自体が
+// バイパスされている）ため、**この読み取りだけは`require_auth_or_commissioning`
+// の対象外にして常に未認証で叩けるようにする** - 実装指示「未認証でも
+// 取得できる必要がある」のとおり。読み取り専用のため監査エントリは
+// 記録しない（`crate::audit`のモジュール doc「read routes are never
+// audited」と同じ規約）。
+//
+// `POST /api/commissioning/lock-down`: 試運転モード → ロックダウン済みへの
+// 唯一の正方向遷移（`CommissioningService::lock_down`）。他の admin
+// エンドポイントと同じ`RoleGuard`（admin ちょうど）+
+// `require_auth_or_commissioning`を掛ける - 試運転モード中はその
+// ガード自体が素通しになるので実質誰でも叩けるが、ロックダウン済みに
+// なった後は admin セッションが無いと叩けなくなる（＝ロックダウン後に
+// 再度ロックダウンし直すことはできるが admin 権限が要る、という自然な
+// 挙動）。
+//
+// 試運転モードへ戻す REST エンドポイントは意図的に存在しない
+// （`crate::commissioning`のモジュール doc「REST では絶対に公開しない
+// こと」参照 - 設計 §5.6「UI・REST からは解除できない」・
+// `banto-hub-elev.exe`経由限定）。
+
+#[derive(Clone)]
+struct CommissioningAdminState {
+    commissioning: CommissioningService,
+    auth: AuthState,
+    audit: AuditLogService,
+}
+
+async fn commissioning_status(
+    State(state): State<CommissioningAdminState>,
+) -> Json<crate::commissioning::CommissioningStatus> {
+    Json(crate::commissioning::CommissioningStatus {
+        locked_down: state.commissioning.is_locked_down(),
+    })
+}
+
+async fn commissioning_lock_down(
+    State(state): State<CommissioningAdminState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::commissioning::CommissioningStatus>, ApiError> {
+    state.commissioning.lock_down().await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &state.commissioning.state(),
+        &headers,
+        "lock_down",
+        "commissioning",
+        "1",
+        None,
+    )
+    .await;
+    Ok(Json(crate::commissioning::CommissioningStatus {
+        locked_down: true,
+    }))
+}
+
+fn commissioning_router(
+    commissioning: CommissioningService,
+    audit: AuditLogService,
+    auth: AuthState,
+) -> Router {
+    let state = CommissioningAdminState {
+        commissioning: commissioning.clone(),
+        auth: auth.clone(),
+        audit: audit.clone(),
+    };
+    let commissioning_state = commissioning.state();
+
+    // status は未認証で読める必要がある（設計 §5.6）ので、他の admin
+    // ルーターと違い `require_auth_or_commissioning`/`RoleGuard` を一切
+    // 掛けない - `require_banto_client_header`（CSRF、`admin`ルーター全体に
+    // 掛かる）だけは他の admin エンドポイントと同様に適用される
+    // （`X-Banto-Client`ヘッダはログイン資格情報ではなく「自前のフロント
+    // エンドから来た」ことを示すだけなので、未ログインの `GET
+    // /api/auth/status`等と同じく問題ない - このファイル冒頭の
+    // 「二系統に分かれたルーター」節参照）。
+    let status_route = Router::new()
+        .route("/api/commissioning/status", get(commissioning_status))
+        .with_state(state.clone());
+
+    let lock_down_route = Router::new()
+        .route(
+            "/api/commissioning/lock-down",
+            post(commissioning_lock_down),
+        )
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            RoleGuard {
+                auth: auth.clone(),
+                commissioning: commissioning_state.clone(),
+                min: Role::Admin,
+                resource: "commissioning",
+                audit,
+            },
+            require_role_at_least,
+        ))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning: commissioning_state,
+            },
+            require_auth_or_commissioning,
+        ));
+
+    status_route.merge(lock_down_route)
+}
+
 // --- composition ------------------------------------------------------------
 
 /// Compose the full router: the admin surface (auth/users/audit-log/I1 CRUD/
@@ -5830,6 +6188,13 @@ fn api_router_with_controller_mode(
     manager: Arc<CollectorManager>,
     controller: Arc<CollectionController>,
     auth: AuthState,
+    // 試運転モードとロックダウン（設計 §5.6・2026-08-30 オーナー決定）:
+    // `crate::runtime::HubRuntime::start`が起動時に一度だけ`CommissioningService::load`
+    // した結果をここへ注入する（`ApiKeysService`等、他サービスと同じ規約）。
+    // ここではフル `CommissioningService`（`commissioning_router`の
+    // `lock_down`が使う）を受け取り、他の全 admin ルーターへは軽量な
+    // `CommissioningState`ハンドル（`.state()`）だけを配る。
+    commissioning: CommissioningService,
     events: broadcast::Sender<ServerEvent>,
     allow_setup: bool,
     // T2-4（設計 §6）: 書き込み受付の起動時 disabled フラグと書き込み監査
@@ -5865,9 +6230,12 @@ fn api_router_with_controller_mode(
     // （`crate::runtime`）が`HubConfig::profile_id`をそのまま渡す。
     profile_id: String,
 ) -> Router {
+    let commissioning_state = commissioning.state();
+
     let audited_auth_routes = auth_routes(auth.clone()).layer(middleware::from_fn_with_state(
         LogoutAuditState {
             auth: auth.clone(),
+            commissioning: commissioning_state.clone(),
             audit: audit.clone(),
         },
         audit_logout_middleware,
@@ -5882,16 +6250,28 @@ fn api_router_with_controller_mode(
             allow_setup,
         ))
         .merge(sse_route(auth.clone(), events.clone()))
-        .merge(users_router(users, audit.clone(), auth.clone()))
+        .merge(commissioning_router(
+            commissioning,
+            audit.clone(),
+            auth.clone(),
+        ))
+        .merge(users_router(
+            users,
+            audit.clone(),
+            auth.clone(),
+            commissioning_state.clone(),
+        ))
         .merge(audit_log_router(
             audit.clone(),
             auth.clone(),
+            commissioning_state.clone(),
             manager.clone(),
         ))
         .merge(api_keys_router(
             api_keys.clone(),
             audit.clone(),
             auth.clone(),
+            commissioning_state.clone(),
             manager.clone(),
         ))
         .merge(tag_registry_router(
@@ -5901,6 +6281,7 @@ fn api_router_with_controller_mode(
             pending_changes.clone(),
             audit.clone(),
             auth.clone(),
+            commissioning_state.clone(),
             manager.clone(),
             controller.clone(),
             events.clone(),
@@ -5913,6 +6294,7 @@ fn api_router_with_controller_mode(
             tags,
             audit.clone(),
             auth.clone(),
+            commissioning_state.clone(),
             manager.clone(),
             controller.clone(),
             events.clone(),
@@ -5923,6 +6305,7 @@ fn api_router_with_controller_mode(
             manager.clone(),
             audit.clone(),
             auth.clone(),
+            commissioning_state.clone(),
             events.clone(),
         ))
         .merge(test_output_router(
@@ -5930,6 +6313,7 @@ fn api_router_with_controller_mode(
             controller.clone(),
             audit.clone(),
             auth.clone(),
+            commissioning_state.clone(),
             events.clone(),
         ))
         .merge(collection_control_router(
@@ -5937,18 +6321,21 @@ fn api_router_with_controller_mode(
             manager.clone(),
             audit.clone(),
             auth.clone(),
+            commissioning_state.clone(),
             events.clone(),
         ))
         .merge(write_audit_router(
             write_audit.clone(),
             audit.clone(),
             auth.clone(),
+            commissioning_state.clone(),
         ))
         .merge(mqtt_settings_router(
             manager.clone(),
             mqtt.clone(),
             audit.clone(),
             auth.clone(),
+            commissioning_state.clone(),
             events.clone(),
         ))
         .merge(grpc_settings_router(
@@ -5956,6 +6343,7 @@ fn api_router_with_controller_mode(
             grpc_server,
             audit.clone(),
             auth.clone(),
+            commissioning_state,
             events.clone(),
         ))
         .layer(middleware::from_fn(require_banto_client_header));
@@ -6029,6 +6417,9 @@ pub fn api_router_with_controller(
     manager: Arc<CollectorManager>,
     controller: Arc<CollectionController>,
     auth: AuthState,
+    // 試運転モードとロックダウン（設計 §5.6）: `api_router_with_controller_mode`
+    // のフィールド doc comment参照。
+    commissioning: CommissioningService,
     events: broadcast::Sender<ServerEvent>,
     allow_setup: bool,
     write_control: Arc<WriteControl>,
@@ -6053,6 +6444,7 @@ pub fn api_router_with_controller(
         manager,
         controller,
         auth,
+        commissioning,
         events,
         allow_setup,
         write_control,
@@ -6079,6 +6471,9 @@ pub fn api_router(
     api_keys: ApiKeysService,
     manager: Arc<CollectorManager>,
     auth: AuthState,
+    // 試運転モードとロックダウン（設計 §5.6）: `api_router_with_controller_mode`
+    // のフィールド doc comment参照。
+    commissioning: CommissioningService,
     events: broadcast::Sender<ServerEvent>,
     allow_setup: bool,
     write_control: Arc<WriteControl>,
@@ -6108,6 +6503,7 @@ pub fn api_router(
         manager,
         controller,
         auth,
+        commissioning,
         events,
         allow_setup,
         write_control,
@@ -6190,12 +6586,30 @@ mod tests {
         test_env_with_clock(Arc::new(SystemClock)).await
     }
 
+    /// 試運転モード（設計 §5.6・2026-08-30 オーナー決定）のテスト用: [`test_env`]
+    /// と同じ環境を、明示的に**ロックダウンしないまま**（＝試運転モードの
+    /// まま）返す - `commissioning_mode_tests`（このモジュール下部）専用。
+    async fn test_env_unlocked() -> TestEnv {
+        test_env_with_clock_and_lock(Arc::new(SystemClock), false).await
+    }
+
     /// [`test_env`] but with an injectable clock (H10 ①) - lets a test
     /// create a key with `expiresAt = clock.now_ms() + small`, assert it
     /// authenticates, then `advance_ms` past the deadline and assert 401 -
     /// deterministically, without depending on real wall-clock time. See
     /// [`test_manager_with_clock`]'s doc comment for the same reasoning.
+    /// Always locked down - see [`test_env_with_clock_and_lock`].
     async fn test_env_with_clock(clock: Arc<dyn Clock>) -> TestEnv {
+        test_env_with_clock_and_lock(clock, true).await
+    }
+
+    /// [`test_env_with_clock`]で共有している実体。`locked_down: false`は
+    /// [`test_env_unlocked`]専用（試運転モードのテスト） - このファイルの
+    /// 大半の既存テストは「ロックダウン済み」の挙動そのものを検証している
+    /// ため、`test_env_with_clock`自体は常に`true`を渡して既存の意味論を
+    /// 一切変えない（実装指示「既存の認証・監査の挙動を、ロックダウン済み
+    /// 状態では一切変えないこと」）。
+    async fn test_env_with_clock_and_lock(clock: Arc<dyn Clock>, locked_down: bool) -> TestEnv {
         let pool = migrate_memory().await.expect("migrate_memory");
         let (tx, _rx) = tokio_broadcast::channel(16);
         let users = UsersService::new(pool.clone());
@@ -6256,6 +6670,28 @@ mod tests {
             tx.clone(),
         );
         let grpc_server = Arc::new(crate::grpc::GrpcServer::new(grpc_service));
+
+        // 試運転モードとロックダウン（設計 §5.6・2026-08-30 オーナー決定）:
+        // このファイルの大半の既存テストは「ロックダウン済み（従来どおり
+        // bearer セッションのログイン必須）」の挙動そのものを検証している
+        // ため、共有テスト環境は明示的にロックダウンしてから router を
+        // 組み立てる - こうしないと未ロックダウン（試運転モード）の
+        // バイパスが効いてしまい、`admin_token`/`viewer_token`を使わない
+        // リクエストまで通ってしまう（実装指示「既存の認証・監査の挙動を、
+        // ロックダウン済み状態では一切変えないこと」）。試運転モード側の
+        // 挙動は`commissioning_mode_tests`（このモジュール下部）で別途
+        // 専用のテスト環境を組んで検証する。
+        let settings = SettingsService::new(pool.clone());
+        let commissioning = CommissioningService::load(settings, users.clone())
+            .await
+            .expect("CommissioningService::load");
+        if locked_down {
+            commissioning
+                .lock_down()
+                .await
+                .expect("lock_down the shared test environment");
+        }
+
         let router = api_router(
             users,
             audit,
@@ -6265,6 +6701,7 @@ mod tests {
             api_keys.clone(),
             manager,
             auth,
+            commissioning,
             tx,
             false,
             write_control,
@@ -9264,5 +9701,201 @@ mod tests {
         };
         assert_eq!(find(group1), Some(2));
         assert_eq!(find(group2), Some(1));
+    }
+
+    // --- 試運転モードとロックダウン (設計 §5.6・2026-08-30 オーナー決定) ----
+
+    /// 未ロックダウン（試運転モード）中は、管理 REST が `Authorization`
+    /// ヘッダを一切付けなくても通ることを確認する - 実装指示「未ロックダウン
+    /// 時に認証なしで管理 API が通る」。`GET /api/users`（`RoleGuard`で
+    /// admin 限定のエンドポイント）を選んだのは、`require_auth_or_commissioning`
+    /// だけでなく`require_role_at_least`（合成 identity の role が admin
+    /// 相当であること）も両方バイパスされていることまで一度に確認できる
+    /// ため。
+    #[tokio::test]
+    async fn unlocked_commissioning_mode_allows_admin_api_without_any_token() {
+        let env = test_env_unlocked().await;
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/users")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "commissioning mode should let an unauthenticated request through"
+        );
+    }
+
+    /// 対照実験: ロックダウン済み（既存の共有テスト環境 `test_env()`）では
+    /// 従来どおり `Authorization` ヘッダ無しの管理 API アクセスが 401 になる
+    /// ことを明示的に固定する - 実装指示「ロックダウン済みで認証なしなら
+    /// 401」。このファイルの他の多数のテストも同じ前提の上に成り立って
+    /// いるが、この試運転モード機能に直接紐づく回帰テストとして単独でも
+    /// 固定しておく。
+    #[tokio::test]
+    async fn locked_down_admin_api_requires_a_token() {
+        let env = test_env().await;
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/users")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// `GET /api/commissioning/status` は試運転モード中でも
+    /// `Authorization` ヘッダ無しで読める必要がある（実装指示「未認証でも
+    /// 取得できる必要がある」- 試運転モードでは認証そのものが無いため）。
+    #[tokio::test]
+    async fn unlocked_commissioning_status_is_readable_without_any_token() {
+        let env = test_env_unlocked().await;
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/commissioning/status")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["lockedDown"], false);
+    }
+
+    /// 同じ読み取り専用ステータスは、ロックダウン済みでも同様に
+    /// `Authorization` ヘッダ無しで読める（意図的 - UI が警告バナーの
+    /// 表示可否を判断するのに使う想定で、どちらの状態でも認証を要求
+    /// しない）。
+    #[tokio::test]
+    async fn locked_down_commissioning_status_is_still_readable_without_a_token() {
+        let env = test_env().await;
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/commissioning/status")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["lockedDown"], true);
+    }
+
+    /// `POST /api/commissioning/lock-down`（設計 §5.6「遷移」の唯一の正方向
+    /// 経路）: 試運転モード中は（`require_auth_or_commissioning`/
+    /// `require_role_at_least`がバイパスされているため）トークン無しで
+    /// 叩け、成功すると状態がロックダウン済みへ切り替わる。切り替わった
+    /// 直後は、同じ router に対する以降のリクエストが（もはや試運転モード
+    /// ではないので）再び 401 を要求するようになることまで確認する -
+    /// これは `CommissioningState`（`Arc<AtomicBool>`）がプロセス内で
+    /// 共有されていることの証拠でもある。
+    #[tokio::test]
+    async fn commissioning_lock_down_flips_state_and_then_requires_auth() {
+        let env = test_env_unlocked().await;
+
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/commissioning/lock-down")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["lockedDown"], true);
+
+        // Now that lock-down has been applied, a plain unauthenticated
+        // request to an admin route must be rejected again.
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/users")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// 実装指示「管理者0件でロックダウンしようとするとエラー」の REST
+    /// 経由での確認。既存の唯一の admin アカウントを editor へ降格させた
+    /// 上で（生の SQL 経由 - `UsersService::update_user`自身の「最後の
+    /// admin を降格できない」ガードを迂回する必要がある。
+    /// `crate::commissioning`のテストと同じ手筋）、ロックダウンを試みると
+    /// 明確なエラー（4xx、`success` フラグを持たない `ApiError` 形）になり、
+    /// 状態も試運転モードのまま変わらないことを確認する。
+    #[tokio::test]
+    async fn commissioning_lock_down_fails_without_any_admin_account() {
+        let env = test_env_unlocked().await;
+        sqlx::query("UPDATE users SET role = 'editor' WHERE username = 'admin'")
+            .execute(&env.pool)
+            .await
+            .expect("downgrade the only admin via raw SQL");
+
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/commissioning/lock-down")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_client_error(),
+            "expected a 4xx error, got {}",
+            response.status()
+        );
+
+        // Still commissioning mode - the failed lock-down must not have
+        // flipped the state.
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/commissioning/status")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["lockedDown"], false);
     }
 }
