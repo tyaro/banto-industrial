@@ -1,9 +1,9 @@
 # banto-tagclient 設計
 
 作成日: 2026-08-29
-状態: **設計確定・実装前**。上位レビュー反映（2026-08-30）。本統合作業の設計ゲート（2026-08-29）で、
-`crates/banto-tagclient` を読み取り専用データプレーンクライアントとして定義した。
-実装、公開APIの確定、依存追加、リリース互換commit/tagの決定は未了である。
+状態: **S1a完了、REST transportはS1b、WebSocket/workerはS2/S3で未実装**。上位レビュー反映
+（2026-08-30）。S1aでは、読み取り専用DTO、Endpoint/Secret境界、stable ID resolverを実装した。
+REST送信、Authorization、redirect、WebSocket、worker、再接続、書き込みは未実装である。
 設計時参照baseline: `b9552627a86015b354b3c5651184fb108ba89e44`
 実API確認日: 2026-08-30（`apps/banto-hub/core/src/rest.rs` / `stream.rs`）
 
@@ -275,9 +275,11 @@ sequenceDiagram
 
 ## 7. 依存と実装ゲート
 
-候補はworkspace系列の`tokio`、`serde`、`serde_json`、`thiserror`、
-`tokio-tungstenite`である。REST clientは手書きHTTP parserを避け、
-`reqwest`の`default-features = false`と`json` featureを推奨する。手書きparserは
+S1aでレビュー済みの依存は、workspaceの`serde`/`serde_json`、`reqwest 0.13.4`
+（`default-features = false`、URL型のみのため`json` featureなし）、
+`zeroize 1.9.0`（derive featureなし）である。Cargo.lockにはこれらの既存package系列を
+再利用し、S1a追加による新規package系列は増えていない。REST clientは手書きHTTP parserを避け、
+S1bでreqwestを使う。手書きparserは
 HTTP framing、redirect、timeout、header処理、認証の誤実装リスクを増やすため採用しない。
 
 crate追加前に、次をレビューゲートとする。
@@ -315,14 +317,15 @@ crate追加前に、次をレビューゲートとする。
 
 ## 9. 実装sliceと完了条件
 
-| slice | 内容                                                         | 完了条件                                                                                                                                                                                  |
-| ----- | ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| S1    | crate骨格、設定、secret wrapper、REST catalog/snapshot DTO   | URL境界・redirect拒否、redaction、metadata保持、value_source未知値、重複fail-closed、catalog resolveテストが通る。                                                                        |
-| S2    | WS購読、latest snapshot、状態機械                            | WS先行接続、bounded pending map、handshake buffer latest-wins、older WS frame does not overwrite REST snapshot、race-free publish gate、on_change、backpressure/latest-winsテストが通る。 |
-| S3    | config_changed、rebinding/coalesce、再解決、再接続、shutdown | snapshot後の通知取り逃しなし、revision/run metadata不一致retry、coalesced rebind、旧値無効化、401/403、切断復旧、残留なしテストが通る。                                                   |
-| S4    | workspace統合と互換性固定                                    | 依存レビュー、fmt/clippy/test、Hub互換commit/tagの記録が完了する。                                                                                                                        |
+| slice | 内容                                                           | 完了条件                                                                                                                                                                                  |
+| ----- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| S1a   | crate骨格、共通DTO、SecretApiKey、Endpoint、stable ID resolver | URL境界・redaction・metadata保持・unknown値保持・重複fail-closed・catalog resolveテストが通る。REST送信、Authorization、redirect処理は含めない。                                          |
+| S1b   | REST catalog/values transport、Authorization、redirect拒否     | reqwestによる読み取り専用GET、認証ヘッダ、redirectを追従しない設定、HTTPエラー分類のテストが通る。                                                                                        |
+| S2    | WS購読、latest snapshot、状態機械                              | WS先行接続、bounded pending map、handshake buffer latest-wins、older WS frame does not overwrite REST snapshot、race-free publish gate、on_change、backpressure/latest-winsテストが通る。 |
+| S3    | config_changed、rebinding/coalesce、再解決、再接続、shutdown   | snapshot後の通知取り逃しなし、revision/run metadata不一致retry、coalesced rebind、旧値無効化、401/403、切断復旧、残留なしテストが通る。                                                   |
+| S4    | workspace統合と互換性固定                                      | 依存レビュー、fmt/clippy/test、Hub互換commit/tagの記録が完了する。                                                                                                                        |
 
 初版のDefinition of Doneは、全テスト表を自動化し、書き込み・PLC直結が存在せず、
 demoへの自動fallbackがなく、認証情報が全観測可能面からredactされ、停止後にworkerが
-残らないこととする。Hub本体、public共通資産、既存コード、manifest、lockfileを変更せず、
+残らないこととする。Hub本体・既存app/crate実装は変更せず、manifest/lockfileは承認済み追加のみとし、
 新規依存は別レビューで承認されるまで追加しない。

@@ -18,8 +18,8 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
   （windowed 化はバックログ降格）。
 - **Hardening（H1〜H10）**: すべて完了。H9（SLMP 構造化エラー + transport 共通化）は 2026-08-14 完了。
 - **出荷ゲート**: T5-5 = 72h soak 実行 + 実機最終サインオフのみ残（実機必須）。
-- **banto-tagclient**: 読み取り専用データプレーンクライアントの設計を確定（上位レビュー反映済み）。
-  実装前であり、Hubのrelease tagと依存追加のレビューは未了。
+- **banto-tagclient**: **S1a完了**。読み取り専用DTO、Endpoint/Secret境界、stable ID resolverを
+  実装済み。REST transportはS1b、WebSocket/worker・再接続はS2/S3で未実装。Hubのrelease tagは未確定。
 
 ## まず読む順
 
