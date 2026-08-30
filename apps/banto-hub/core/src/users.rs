@@ -780,6 +780,26 @@ mod tests {
         assert!(!verify_password("wrong", &hash));
     }
 
+    /// 依存更新の回帰ガード（dependabot #188: `password-hash` 0.5→0.6 の
+    /// 検証時に追加、2026-08-30）。ここに埋め込んだ PHC 文字列は
+    /// `password-hash`/`argon2` 0.5 系の現行コードで実際に
+    /// `hash_password("t18-password-hash-regression")` を実行して得たもの
+    /// （生成時刻のログはコミット時のセッション参照）。既存ユーザーの
+    /// パスワードハッシュは DB に保存済みの PHC 文字列そのものなので、
+    /// 依存更新のたびにこの固定リテラルが `verify_password` を通ることを
+    /// 確認すれば「保存済みハッシュが検証できなくなる」事故を機械的に
+    /// 検出できる。`argon2`/`password-hash` を将来 0.6 系以降へ上げる際は、
+    /// このテストが最初に落ちるべき回帰センサーとして残す。
+    #[test]
+    fn verifies_a_hash_fixed_from_password_hash_0_5() {
+        const PASSWORD: &str = "t18-password-hash-regression";
+        const HASH_FROM_0_5: &str =
+            "$argon2id$v=19$m=19456,t=2,p=1$eXfK1qD0vlRwwb2mtenDmQ$XFql1m/rfH6EQ12vPYIQltgSR6WyX83U4Bde0HTbHt0";
+
+        assert!(verify_password(PASSWORD, HASH_FROM_0_5));
+        assert!(!verify_password("wrong-password", HASH_FROM_0_5));
+    }
+
     // --- Role -------------------------------------------------------------
 
     #[test]
