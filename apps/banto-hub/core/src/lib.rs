@@ -164,6 +164,7 @@ pub mod api_keys;
 pub mod assets;
 pub mod audit;
 pub mod broker_glue;
+pub mod commissioning;
 pub mod computed;
 pub mod controller;
 pub mod db;

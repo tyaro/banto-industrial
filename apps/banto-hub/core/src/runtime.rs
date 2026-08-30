@@ -147,6 +147,7 @@ use crate::api_keys::ApiKeysService;
 use crate::assets::FrontendAssets;
 use crate::audit::AuditLogService;
 use crate::broker_glue::{HubSessions, SlmpSimRegistry};
+use crate::commissioning::CommissioningService;
 use crate::computed::{load_retained_values, ComputedEngine, ServerTagStore};
 use crate::controller::CollectionController;
 use crate::db::init_db;
@@ -251,6 +252,17 @@ pub enum HubStartError {
     /// する（設計 §1 P2「失敗時は安全側で起動拒否」）。
     #[error(transparent)]
     ProfileLock(#[from] ProfileLockError),
+    /// 試運転モードとロックダウン（設計 §5.6・2026-08-30 オーナー決定）:
+    /// `CommissioningService::load`失敗（DB からロックダウン状態を読めない
+    /// - `settings`テーブルへのアクセス自体が壊れているのと同種の異常）。
+    #[error("banto-hub: 試運転モード/ロックダウン状態の読み取りに失敗しました: {0}")]
+    Commissioning(BantoError),
+    /// 試運転モードとロックダウン（設計 §5.6 制約1）:
+    /// `crate::commissioning::enforce_loopback_when_commissioning`が非
+    /// loopback バインド + 未ロックダウンを検出した - 起動そのものを
+    /// 拒否する（メッセージ自体に対処法を含む、同関数の doc comment参照）。
+    #[error("{0}")]
+    UnsafeCommissioningBind(String),
 }
 
 /// 起動〜シャットダウンの共通シーケンス本体（このモジュール doc 参照）への
@@ -332,6 +344,44 @@ impl HubRuntime {
         let port: u16 = port_override.unwrap_or(server_config.port);
         let bind = bind_override.unwrap_or(server_config.bind);
         let data_dir = data_dir_override.unwrap_or_else(|| PathBuf::from(store_config.data_dir));
+
+        // 試運転モードとロックダウン（docs/tag-server-design.md §5.6・
+        // 2026-08-30 オーナー決定）: DB の永続状態からロックダウン済みかを
+        // 解決する（`CommissioningService::load`・`crate::commissioning`の
+        // モジュール doc 参照 - フラグ未設定は常に試運転モード、ユーザーの
+        // 有無は判定に関与しない）。
+        let commissioning = CommissioningService::load(settings.clone(), users.clone())
+            .await
+            .map_err(HubStartError::Commissioning)?;
+
+        // 制約1（設計 §5.6）: 非 loopback バインド（`bind`が`0.0.0.0`等）
+        // かつ未ロックダウンの構成は起動そのものを拒否する -
+        // `crate::commissioning::enforce_loopback_when_commissioning`の
+        // doc comment参照。**`HubRuntime::start`はコンソール
+        // （`bin/banto-hub.rs`）・Windows サービス（`win_service.rs`）・
+        // デスクトップシェル（`apps/banto-hub/src-tauri`）の全ホストが
+        // 唯一経由するこの1箇所**（このモジュール doc「起動シーケンス」・
+        // `HubRuntime::start`自身の doc comment参照）なので、ここに置くだけで
+        // 実装指示が名指しした`bin/banto-hub.rs`の起動経路を含む全ホストに
+        // 確実に効く - ホスト側の env 読み取り（`build_hub_config_from_env`
+        // 等）にこのチェックを置いてしまうと、ホストを追加・変更するたびに
+        // 個別にガードし直す必要が生まれ、抜け道になり得る。
+        crate::commissioning::enforce_loopback_when_commissioning(
+            &bind,
+            commissioning.is_locked_down(),
+        )
+        .map_err(HubStartError::UnsafeCommissioningBind)?;
+
+        // 起動ログへの警告（実装指示5・設計 §5.6「未ロックダウンの間は…
+        // 起動ログにも出す」）: 未ロックダウンで起動したときは、試運転
+        // モードで動いていることを一目で分かるように警告を出す。
+        if !commissioning.is_locked_down() {
+            log_line(
+                "banto-hub: [WARN] 試運転モード: 認証なしで誰でも管理 UI / 管理 REST を\
+                 操作できます。運用に入る前に管理 UI からロックダウンを実行してください\
+                 （docs/tag-server-design.md §5.6「試運転モードとロックダウン」）。",
+            );
+        }
 
         let clock = Arc::new(SystemClock);
         // T2-2 (docs/tag-server-design.md §6-5): constructed here, OUTSIDE
@@ -561,6 +611,7 @@ impl HubRuntime {
             manager.clone(),
             controller.clone(),
             auth,
+            commissioning,
             events,
             allow_setup,
             write_control,
@@ -869,6 +920,83 @@ mod tests {
         assert_eq!(addr.ip().to_string(), "127.0.0.1");
         assert_ne!(addr.port(), 0, "the OS should have assigned a real port");
 
+        hub.shutdown().await;
+    }
+
+    /// 試運転モードとロックダウン（設計 §5.6 制約1・2026-08-30 オーナー決定）:
+    /// 非 loopback バインド（`0.0.0.0`）+ 未ロックダウン（フラグ未設定の
+    /// フレッシュ DB）は`HubRuntime::start`が起動そのものを拒否する -
+    /// `HubStartError::UnsafeCommissioningBind`で、DB を開いた後に検出
+    /// されるが、`banto_server::start`（実バインド）より前に短絡する
+    /// （このテストは`local_addr`を一切呼ばずに`Err`を確認することで、
+    /// 実際にソケットを bind していないことを間接的に裏付ける）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_rejects_non_loopback_bind_when_not_locked_down() {
+        let dir = crate::test_support::TempDir::new("hub-runtime-commissioning-reject");
+        let db_path = dir
+            .path()
+            .join("registry.sqlite3")
+            .to_string_lossy()
+            .into_owned();
+        let data_dir = dir.path().join("data");
+
+        let config = HubConfig {
+            db_path,
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("0.0.0.0".to_string()),
+            data_dir_override: Some(data_dir),
+            profile_id: "test-commissioning-reject".to_string(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+        };
+
+        match HubRuntime::start(config).await {
+            Err(HubStartError::UnsafeCommissioningBind(message)) => {
+                assert!(message.contains("loopback"));
+            }
+            Err(other) => panic!("expected UnsafeCommissioningBind, got: {other}"),
+            Ok(hub) => {
+                hub.shutdown().await;
+                panic!(
+                    "expected HubRuntime::start to refuse a non-loopback bind while \
+                     not locked down"
+                );
+            }
+        }
+    }
+
+    /// 試運転モードとロックダウン（設計 §5.6 制約1）: loopback バインド
+    /// （`127.0.0.1`）+ 未ロックダウン（フレッシュ DB）は制約1に抵触しない
+    /// ため、通常どおり起動できる - 試運転は「Hub が動いている機械の前」
+    /// （loopback）で行う前提なので、これが許可される唯一の未ロックダウン
+    /// 構成。`start_local_addr_then_shutdown_round_trip`と実質同じ前提
+    /// （フレッシュ DB = 未ロックダウン）だが、このテストは名前と doc
+    /// comment でこの安全制約の「許可される側」を明示的に固定する。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_succeeds_with_loopback_bind_when_not_locked_down() {
+        let dir = crate::test_support::TempDir::new("hub-runtime-commissioning-allow");
+        let db_path = dir
+            .path()
+            .join("registry.sqlite3")
+            .to_string_lossy()
+            .into_owned();
+        let data_dir = dir.path().join("data");
+
+        let config = HubConfig {
+            db_path,
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_string()),
+            data_dir_override: Some(data_dir),
+            profile_id: "test-commissioning-allow".to_string(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+        };
+
+        let hub = HubRuntime::start(config).await.expect(
+            "HubRuntime::start should succeed for a loopback bind even while not locked down",
+        );
         hub.shutdown().await;
     }
 
