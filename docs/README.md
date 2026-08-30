@@ -1,12 +1,12 @@
 # docs 地図（まずここを読む）
 
 banto-industrial のドキュメント全体の入口。「どの文書が何の**正**か」「今どこまで進んでいるか」を
-1 画面で引くための地図。詳細は各文書へ辿る。最終更新: 2026-08-14。
+1 画面で引くための地図。詳細は各文書へ辿る。最終更新: 2026-08-30。
 
 > この地図は索引に徹する。実装状況・設計判断の本体は各文書側にあり、状態の**正**は
 > 常にリンク先の `状態:` 行と各表とする（CLAUDE.md H8 の状態欄同期規約）。
 
-## 現状ひとめ（2026-08-14）
+## 現状ひとめ（2026-08-30）
 
 - **構成**: Rust workspace + SvelteKit/Tauri。アプリは **banto-hub**（タグサーバー）/ **chronogazer**
   （記録計）/ **relay-wright**。上流 `banto` は git tag / `@banto/*` を消費（現行 **v1.2.0**）。
@@ -18,6 +18,8 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
   （windowed 化はバックログ降格）。
 - **Hardening（H1〜H10）**: すべて完了。H9（SLMP 構造化エラー + transport 共通化）は 2026-08-14 完了。
 - **出荷ゲート**: T5-5 = 72h soak 実行 + 実機最終サインオフのみ残（実機必須）。
+- **banto-tagclient**: 読み取り専用データプレーンクライアントの設計を確定（上位レビュー反映済み）。
+  実装前であり、Hubのrelease tagと依存追加のレビューは未了。
 
 ## まず読む順
 
@@ -34,6 +36,7 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
 | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
 | [plan.md](plan.md)                                         | **全体計画の親**。I/R/W/T 系マイルストーンと依存の一覧。                                               |
 | [tag-server-design.md](tag-server-design.md)               | **banto-hub 設計の一次ソース**。タグ空間モデル・外部 IF・書き込み安全。実装状況は §9（T 系）表が正。   |
+| [banto-tagclient-design.md](banto-tagclient-design.md)     | **banto-tagclient の実装前設計**。読み取り専用SDKのREST/WS、binding、再接続、停止、テストゲートの正。  |
 | [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)     | **banto-hub 運転計画（T14〜T18）・UI/UX 決定台帳**。§9.3〜9.5 が T18 タグ登録 UX の受け入れの正。      |
 | [banto-hub-operations.md](banto-hub-operations.md)         | **banto-hub 運用ガイド**（起動・ポート・API/MQTT/gRPC・サービス化・soak 手順）。現状の運用を引く入口。 |
 | [banto-hub-t14-design.md](banto-hub-t14-design.md)         | T14 詳細設計（ランタイム状態管理・制御面分離）。                                                       |
