@@ -16,7 +16,8 @@
 # 備考: banto-core/banto-storage/banto-server は crates.io ではなく
 # `https://github.com/tyaro/banto.git` への git 依存(tag 固定、
 # deny.toml [sources] 参照)。Dependabot の cargo エコシステムは git 依存の
-# 自動更新提案が registry 依存ほど手厚くないため、これらの更新は当面
+# 自動更新提案が registry 依存ほど手厚くない(タグの新旧判定を誤る)ため、
+# 下の cargo エントリの `ignore` で明示的に除外し、これらの更新は
 # 手動(banto 側のタグ更新に追従する形)で行う想定。
 version: 2
 updates:
@@ -27,6 +28,16 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: 'chore(deps)'
+    # banto-* は crates.io ではなく git 依存(tag 固定)で、更新は banto 側の
+    # リリースに追従する手動運用(上の備考参照)。Dependabot は git タグの
+    # 新旧を正しく判定できず、2026-08-30 に v1.4.0 -> v1.3.0 という
+    # **ダウングレード**を3本提案した(#184/#187/#191、クローズ済み)。
+    # v1.3.0 の banto-storage は sqlx 0.8 固定で、当リポジトリの sqlx 0.9
+    # (#181)と型が食い違いビルドが壊れるため、明示的に除外する。
+    ignore:
+      - dependency-name: 'banto-core'
+      - dependency-name: 'banto-storage'
+      - dependency-name: 'banto-server'
 
   - package-ecosystem: 'npm'
     directory: '/'
