@@ -11,7 +11,7 @@ transport 共通化(broker/plc/plc-write の SLMP dial 重複統合)も
 `banto_plc::dial_slmp` への集約で完了(2026-08-14)。`classify_slmp_error`
 の重複統合も `banto_plc::SlmpErrorClass`/`classify_slmp` への集約で
 2026-08-14 に完了し、H9 は完全完了(残スライスなし)。残りは H7 の
-① 実機 soak・H5 の relay-wright 分 E2E(Tauri 依存で WebDriver 検討要、Phase 4
+① 実機 soak・H5 の relay-wright 分 E2E(2026-08-30 に受け入れ範囲を引き直し。組み込みサーバーモードを Playwright で対応中、Tauri 固有経路は WebDriver 課題として分離。Phase 4
 相当/環境依存)。
 最終検証日(コード照合): 2026-08-14
 
@@ -55,7 +55,7 @@ transport 共通化(broker/plc/plc-write の SLMP dial 重複統合)も
 | H2  | 手動書き込み(タグモニタ)の安全意味論                     | 最高   | 中   | 完了(#58)                                                                                                  |
 | H3  | banto-hub gRPC の bind 設定化(既定 127.0.0.1)            | 高     | 中   | 完了(#58)                                                                                                  |
 | H4  | 収集タイムスタンプ逆行対策 + append 失敗の可視化         | 高     | 中   | 完了(#58)                                                                                                  |
-| H5  | フロントテスト基盤(vitest)+ hub/relay-wright E2E         | 高     | 大   | vitest・hub E2E 完了、relay-wright E2E 残                                                                  |
+| H5  | フロントテスト基盤(vitest)+ hub/relay-wright E2E         | 高     | 大   | vitest・hub E2E 完了、relay-wright は組み込みサーバーモードで対応中(2026-08-30 範囲引き直し)               |
 | H6  | サプライチェーン/再現性(deny・audit・toolchain 固定ほか) | 高     | 中   | 完了(#59)                                                                                                  |
 | H7  | ソーク実行・障害系テスト(crash 再オープン・DST・並行)    | 中     | 大   | ⑤+②③④+A.2完了・残 ①                                                                                        |
 | H8  | ドキュメント整合(状態ヘッダ・README・状態欄義務化)       | 中     | 小   | 完了(#58/#59)                                                                                              |
@@ -217,7 +217,7 @@ transport 共通化(broker/plc/plc-write の SLMP dial 重複統合)も
 - **残件(観察)**: 連続失敗回数のリアルタイム外部公開(status API)は
   未実装(イベント detail と ログのみ)。必要になれば追加
 
-### H5: フロントテスト基盤 + E2E 拡充 — 状態: vitest 導入完了(2026-08-08)・banto-hub の Playwright E2E 完了。残るは relay-wright 分の E2E(Tauri 依存で WebDriver 検討要)のみ
+### H5: フロントテスト基盤 + E2E 拡充 — 状態: vitest 導入完了(2026-08-08)・banto-hub の Playwright E2E 完了。relay-wright は組み込みサーバーモードの E2E で対応中(2026-08-30 に受け入れ範囲を引き直し。Tauri 固有経路は WebDriver 課題として分離)
 
 - **事実**: フロントエンドのユニットテストは 0 本。CI の Test ステップは
   `--if-present` で全パッケージがスキップされる no-op。Playwright E2E は
@@ -230,6 +230,22 @@ transport 共通化(broker/plc/plc-write の SLMP dial 重複統合)も
   後回しでよい
 - **受け入れ条件**: CI の Test ステップが実テストを実行して落ちうる状態に
   なること、banto-hub E2E ジョブの追加
+
+- **受け入れ範囲の引き直し（2026-08-30 オーナー決定）**: 「relay-wright は Tauri 依存で
+  WebDriver 検討要」という上記の方針は、**調査の結果、実態より悲観的だった**。
+  `apps/relay-wright/src/lib/banto/setup.ts` の doc comment のとおり、relay-wright の
+  フロントは①Tauri webview（`invoke()`）②**組み込みサーバーが配信する LAN ブラウザ**
+  （`fetch()` で REST・SSE）③素の `vite dev`（インメモリ）の**3環境を明示的にサポート**し、
+  UI コードは環境で分岐しない（プロバイダ層が吸収する）。②を担う
+  `relay-wright-serve`（`apps/relay-wright/core/src/bin/`）は doc comment 自身が
+  「Tauri 不要の開発用ビークル」と位置づけており、`PORT`/`BANTO_BIND`/`BANTO_DB`/
+  `BANTO_ALLOW_SETUP` という **banto-hub と同じ環境変数**で起動できる。
+  したがって**②に対する Playwright E2E は Tauri も WebDriver も不要**で、
+  `e2e/banto-hub.playwright.config.ts` と同じ形（専用ポート 8800・専用 testDir・
+  専用 outputDir・専用 teardown・専用の一時DB用 env 変数名）で3つ目として組める。
+  よって **H5 の受け入れは「②組み込みサーバーモードの E2E を CI に載せる」までとし、
+  ①Tauri 固有経路（`invoke()` 分岐・`banto://event`・vibrancy 等のネイティブ挙動）の
+  E2E は WebDriver（tauri-driver）課題として H5 のスコープ外へ分離**する。
 - **実施記録(2026-08-08)**: 旧サンドボックスをブロックしていた
   lockfile 問題(プロキシが `@banto/*` git 依存 URL を CI 非互換の形式へ
   書き換える)は、GitHub 直アクセス可能な Windows 開発機で

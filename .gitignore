@@ -50,6 +50,12 @@ e2e/test-results-banto-hub-perf/
 e2e/playwright-report-banto-hub-perf/
 e2e/perf-results/
 
+# Playwright (H5 relay-wright e2e/) - e2e/relay-wright.playwright.config.ts
+# pins its own outputDir/HTML reporter folder separate from
+# chronogazer's/banto-hub's above, same reasoning.
+e2e/test-results-relay-wright/
+e2e/playwright-report-relay-wright/
+
 # Local T17 real-machine verification staging (binaries + private target/)
 _verify_t17/
 
