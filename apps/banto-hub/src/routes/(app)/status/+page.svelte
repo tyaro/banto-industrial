@@ -648,7 +648,11 @@
 		{#if !localShell}
 			<p class="note">ローカルシェルが必要です（ブラウザ遠隔からは操作できません）。</p>
 		{:else if !hostSwitch}
-			<p class="note">シェル状態を読み込み中…</p>
+			{#if hostSwitchError}
+				<p class="config-error">シェル状態の取得に失敗しました: {hostSwitchError}</p>
+			{:else}
+				<p class="note">シェル状態を読み込み中…</p>
+			{/if}
 		{:else}
 			<dl class="summary">
 				<dt>現在の状態</dt>

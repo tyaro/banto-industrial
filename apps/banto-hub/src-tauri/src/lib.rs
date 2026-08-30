@@ -170,6 +170,28 @@
 //!   `BantoHub Operators`（**または Windows 管理者**）」の意図に合わせた）。
 //!   `AppState::can_operate_service`は起動時に両方を1回ずつ確認した
 //!   論理和になる。
+//!
+//! ## T16 実機検証で発覚した不具合の修正（2026-08-30）
+//!
+//! 実機（Windows）で切替ウィザード UI がまったく動作しない不具合があった。
+//! 開発者ツールに `event.listen not allowed on window "main" ... URL:
+//! http://127.0.0.1:8722/ allowed on: [windows: "main", URL: local]`
+//! というエラーが出ており、原因は
+//! `capabilities/default.json` に Tauri v2 の `remote.urls` 設定が無く、
+//! [`navigate_to_hub`]で読み込む自プロセス配信 origin（`URL: local`＝
+//! ローカルアセット由来ではない）からの `invoke`/`event.listen` が
+//! ケイパビリティの既定（ローカルアセット origin のみ許可）で拒否されて
+//! いたこと。[`host_switch_ipc`]の4コマンドが呼べず、`/status`の
+//! 「Windows サービス」カードが「シェル状態を読み込み中…」のまま
+//! 進まなくなっていた。`capabilities/default.json`に
+//! `remote.urls: ["http://127.0.0.1:*/*"]`を追加して解消した - この
+//! crate は`resolve_navigate_host`/`navigate_to_hub`の実装どおり自プロセス
+//! 内`HubRuntime`（既定`127.0.0.1`、`BANTO_BIND`が空/`0.0.0.0`/`::`なら
+//! 同じくloopbackへ読み替える）以外へ navigate する経路を持たないため、
+//! 許可 origin をこの loopback に限定できる（詳細な安全性の論拠は
+//! `capabilities/default.json`の`description`に記載）。ポートは`PORT`
+//! env で可変なためワイルドカードにしたが、ホストは`127.0.0.1`固定のまま
+//! 広げていない。
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
