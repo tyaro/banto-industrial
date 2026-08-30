@@ -3,6 +3,7 @@
 	import Header from '$lib/components/Header.svelte';
 	import Sidebar from '$lib/components/Sidebar.svelte';
 	import CommandPalette from '$lib/components/CommandPalette.svelte';
+	import CommissioningBanner from '$lib/components/CommissioningBanner.svelte';
 	import { listPendingChanges } from '$lib/banto/pendingChangesAdmin';
 	import { commandPaletteStore } from '$lib/commandPalette.svelte';
 	import { isAdmin } from '$lib/permissions';
@@ -51,6 +52,8 @@
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
+
+<CommissioningBanner />
 
 <div class="shell">
 	<Sidebar {pendingCount} />
