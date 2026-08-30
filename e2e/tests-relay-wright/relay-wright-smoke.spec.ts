@@ -36,6 +36,27 @@ const CONNECTION_NAME_EDITED = 'E2E生成PLC接続（編集済み）';
 const CONNECTION_HOST = '192.168.11.200';
 
 test.describe.serial('relay-wright smoke (mode 2: embedded server)', () => {
+	// PLC接続画面（テスト4）の `.grid-wrap { height: 320px }` は「新規作成」
+	// フォームの下にあり、Playwright の既定ビューポート（1280x720）だと
+	// 画面下端からはみ出す（実測: 行が Y≈462〜782、ビューポート高は720）。
+	// `@banto/grid-svelte` の BantoGrid は行セルの `onpointerdown` で
+	// `containerEl.focus()` を呼ぶが、フォーカスした要素がビューポートから
+	// はみ出していると、ブラウザがそれを機械的に「見える位置までスクロール」
+	// させる - これが素の `locator.click()` の mousedown 直後（次の mouseup
+	// より前）に割り込むと、クリック対象のセルがポインタの真下から動いて
+	// しまい、click イベントは mousedown/mouseup 両ターゲットの最近共通祖先
+	// （`.banto-grid` コンテナ自身）に発火し、`onRowClick` が呼ばれない
+	// （実測で確認済み - `getByRole('gridcell', ...)` でも `getByText` でも
+	// 同一の失敗で、ロケータの選び方は無関係だった）。banto-hub 側の
+	// BantoGrid（例: `banto-hub-tags-busy.spec.ts`）で同じ単純クリックが
+	// 通るのは、そちらの一覧が「画面全高」でページ上部から表示されており、
+	// クリック時点で既にビューポート内に収まっている（focus() 由来の
+	// 自動スクロールが発生しない）ため。ビューポートを縦に広げて
+	// `.grid-wrap` を最初から完全にビューポート内へ収めておけば、この
+	// 競合自体が起きず、banto-hub と同じ素の `getByRole('gridcell').click()`
+	// が使える（実測確認済み）。
+	test.use({ viewport: { width: 1280, height: 900 } });
+
 	let page: Page;
 
 	test.beforeAll(async ({ browser }) => {
@@ -117,20 +138,12 @@ test.describe.serial('relay-wright smoke (mode 2: embedded server)', () => {
 
 		// --- edit ---
 		// 行クリックで下に編集パネルが開く（plc-connections/+page.svelte の
-		// selectConnection）。BantoGrid のセルは onpointerdown で
-		// `selection.setActive()`（アクティブセルのハイライト）を先に走らせて
-		// おり、その再描画がちょうど mousedown〜mouseup の間にセルの実際の
-		// 位置をわずかに動かすことがある（調査で確認済み: 素の
-		// `locator.click()` だと mousedown 時点では正しくセルに当たっている
-		// のに、直後の mouseup 時点で同じ座標の `elementFromPoint` が
-		// `.banto-grid` コンテナ自身に変わってしまい、結果として click イベント
-		// が mousedown/mouseup 両ターゲットの最近共通祖先である `.banto-grid`
-		// に発火してしまい、`onRowClick` が呼ばれず編集パネルが開かない）。
-		// 実座標でのポインタ操作ではなくセル要素へ直接 `click` イベントを
-		// dispatch することで、この BantoGrid 側の再描画タイミング競合を
-		// 迂回する（アプリの行クリック挙動自体を検証したいのであって、生の
-		// マウス座標移動の再現性を検証したいわけではないため許容する）。
-		await gridWrap.getByText(CONNECTION_NAME, { exact: true }).dispatchEvent('click');
+		// selectConnection）。banto-hub の spec 群（例:
+		// banto-hub-tags-busy.spec.ts）と同じ `getByRole('gridcell', ...)`
+		// への素のクリックで開く（このファイル冒頭の `test.use({ viewport })`
+		// の doc comment 参照 - ここでビューポートを縦に広げていないと、
+		// BantoGrid の focus() 起因の自動スクロールに競合して開かない）。
+		await gridWrap.getByRole('gridcell', { name: CONNECTION_NAME, exact: true }).click();
 		const detailSection = page.locator('section.detail');
 		await expect(
 			detailSection.getByRole('heading', { name: `${CONNECTION_NAME} を編集` })
