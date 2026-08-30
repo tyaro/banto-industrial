@@ -1,17 +1,19 @@
 //! Opaque API-key input validation. The value never has a public formatter or
 //! accessor and is zeroized when dropped.
 
+use reqwest::RequestBuilder;
 use zeroize::Zeroize;
 
 use crate::error::{Error, ErrorKind};
 
 pub type SecretError = Error;
 
-/// A validated API key owned by the future transport layer.
+/// A validated API key owned by the REST transport.
 ///
 /// There is intentionally no `Clone`, `Debug`, `Display`, `Serialize`,
-/// `Deserialize`, `as_str`, or `to_string` implementation. S1a does not send
-/// headers; the eventual transport adapter must keep the value private too.
+/// `Deserialize`, `as_str`, or `to_string` implementation. The REST transport
+/// applies it directly to an Authorization header without returning the raw
+/// value to callers.
 pub struct SecretApiKey {
     value: String,
 }
@@ -23,6 +25,10 @@ impl SecretApiKey {
             return Err(Error::new(ErrorKind::InvalidSecret));
         }
         Ok(Self { value })
+    }
+
+    pub(crate) fn apply_authorization(&self, request: RequestBuilder) -> RequestBuilder {
+        request.bearer_auth(&self.value)
     }
 }
 

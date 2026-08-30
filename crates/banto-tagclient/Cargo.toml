@@ -1,6 +1,6 @@
 [package]
 name = "banto-tagclient"
-description = "S1a: read-only banto-hub tag catalog, value DTOs, endpoint boundary, and stable-ID resolver"
+description = "S1b: read-only banto-hub REST catalog and values client with safe endpoint and secret boundaries"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,3 +11,6 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 zeroize = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

@@ -1,9 +1,9 @@
 # banto-tagclient 設計
 
 作成日: 2026-08-29
-状態: **S1a完了、REST transportはS1b、WebSocket/workerはS2/S3で未実装**。上位レビュー反映
-（2026-08-30）。S1aでは、読み取り専用DTO、Endpoint/Secret境界、stable ID resolverを実装した。
-REST送信、Authorization、redirect、WebSocket、worker、再接続、書き込みは未実装である。
+状態: **S1b完了、WebSocket/workerはS2/S3で未実装**。S1bでは、reqwestによる読み取り専用
+REST catalog/values transport、Authorization、redirect拒否、HTTPエラー分類を実装した。
+上位レビュー反映（2026-08-31）。S2/S3のWebSocket、worker、再接続、書き込みは未着手である。
 設計時参照baseline: `b9552627a86015b354b3c5651184fb108ba89e44`
 実API確認日: 2026-08-30（`apps/banto-hub/core/src/rest.rs` / `stream.rs`）
 
@@ -42,6 +42,7 @@ flowchart LR
 - `banto-tagclient` はTauri、Svelte、OS keyring、案件設定を知らない。
 - private側adapterがkeyringからAPI keyを取得し、SDKへ渡す。SDKはkeyringを所有しない。
 - API keyは `Authorization: Bearer <token>` ヘッダだけで送る。URL queryへ入れない。
+- S1b RESTは自動system/environment proxyを無効化し、設定endpointへ直接接続する。redirectも追従しない。
 - endpointは初版では`http`/`ws`のみとする（`https`/`wss`は別設計）。URLは
   userinfo、query、fragmentを必ず拒否し、HTTP redirectも追従しない。hostは空でない
   DNS名またはIP、portは省略または1..=65535、pathはorigin-formの絶対path（必要なら
@@ -142,24 +143,26 @@ WS `data`にはrevision/source/run metadataがないため、最後に確定し�
 metadataと、値側entryのauthoritativeな`value_source`をその接続世代へ固定する。
 切断・再bindingでは必ずこのsnapshotを再取得し、旧世代のWS値を再利用しない。
 
-## 4. 公開API案とエラー契約
+## 4. 公開APIとエラー契約
 
-APIは実装sliceで確定する。初版の候補は次のとおりである。
+S1bで確定した公開APIは次のとおりである。REST clientは自動system/environment proxyを無効化し、
+設定endpointへ直接接続する（redirectも追従しない）。
 
 ```rust
-pub struct TagClientConfig { /* endpoint, API key, backoff */ }
-pub struct TagClientHandle { /* latest state + worker owner */ }
+pub struct RestClient { /* Endpoint + opaque SecretApiKey + reqwest Client */ }
 
-impl TagClientHandle {
-	pub async fn start(config: TagClientConfig, bindings: Vec<BindingRequest>)
-		-> Result<Self, TagClientError>;
-	pub fn latest(&self) -> LatestTagSnapshot;
-	pub fn subscribe(&self) -> LatestSnapshotReceiver;
-	pub async fn shutdown(self) -> Result<(), TagClientError>;
+impl RestClient {
+	pub fn new(endpoint: Endpoint, secret: SecretApiKey) -> Result<Self>;
+	pub async fn fetch_catalog(&self) -> Result<CatalogSnapshot>;
+	pub async fn fetch_values(&self, tags: &[&str]) -> Result<ValuesSnapshot>;
 }
 ```
 
-`SecretApiKey`は明示的なopaque wrapperとする。候補APIは
+`fetch_values`は外部タグ名を単一の`tags=name1,name2` queryへエンコードし、空リストでも
+`tags=`を送る。タグ名にカンマが含まれる場合は通信前に`invalid_tag_selection`でfail-closed
+する。S1bはsnapshotを返す読み取り専用transportまでであり、worker、最新値配信、購読はS2/S3で扱う。
+
+`SecretApiKey`は明示的なopaque wrapperとする。crate-private APIは
 `SecretApiKey::new(String) -> Result<SecretApiKey, SecretError>`と、SDK内部だけが使う
 `apply_authorization(request)`（Authorization bearer headerを設定する）であり、raw値を
 返す`as_str`/`to_string`は提供しない。`Clone`, `Debug`, `Display`, `Serialize`,
@@ -181,6 +184,7 @@ impl TagClientHandle {
 | `duplicate_requested_stable_id` | 要求stable ID重複                                                | fail-closed。部分bindingを公開しない。                       |
 | `duplicate_catalog_stable_id`   | catalog内stable ID重複                                           | fail-closed。部分bindingを公開しない。                       |
 | `invalid_endpoint`              | 禁止scheme/URL部品、redirect応答                                 | 再試行せず設定を修正する。                                   |
+| `invalid_tag_selection`         | カンマを含む外部タグ名（Hubの単一queryで曖昧になるため拒否）     | 入力を修正する。                                             |
 | `stopped`                       | 呼出側の停止または正常shutdown                                   | 再接続しない。                                               |
 
 `Debug`/`Display`、エラー、ログにtokenを含めない。endpointについてもhost以外のpathや
@@ -311,6 +315,7 @@ crate追加前に、次をレビューゲートとする。
 | disconnect/reconnect         | bounded backoff後、catalog/snapshotから接続を再構築する。                                         |
 | 401/403                      | `unauthorized`になり、高速無限再試行しない。                                                      |
 | malformed JSON               | `protocol_error`に分類し、secretを出さず回復経路へ入る。                                          |
+| invalid tag selection        | カンマを含む外部タグ名を通信前に`invalid_tag_selection`として拒否する。                              |
 | backpressure/latest-wins     | 遅いconsumerでもqueueが無制限に増えず、最新値を観測できる。                                       |
 | shutdown                     | task、socket、channelが残留しない。                                                               |
 | secret redaction             | Debug/Display/エラー/ログへtokenやendpoint pathを出さない。                                       |

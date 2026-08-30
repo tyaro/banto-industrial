@@ -46,7 +46,7 @@ impl Endpoint {
         Ok(Self { base })
     }
 
-    /// Build the two S1a REST route URLs without performing I/O.
+    /// Build the two REST route URLs without performing I/O.
     pub fn rest_urls(&self) -> RestUrls {
         RestUrls {
             tags: append_path(&self.base, "tags"),

@@ -9,6 +9,7 @@ use std::fmt;
 pub enum ErrorKind {
     InvalidSecret,
     InvalidEndpoint,
+    InvalidTagSelection,
     DuplicateBindingKey,
     DuplicateRequestedStableId,
     DuplicateCatalogStableId,
@@ -28,6 +29,7 @@ impl ErrorKind {
         match self {
             Self::InvalidSecret => "invalid_secret",
             Self::InvalidEndpoint => "invalid_endpoint",
+            Self::InvalidTagSelection => "invalid_tag_selection",
             Self::DuplicateBindingKey => "duplicate_binding_key",
             Self::DuplicateRequestedStableId => "duplicate_requested_stable_id",
             Self::DuplicateCatalogStableId => "duplicate_catalog_stable_id",
