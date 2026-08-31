@@ -74,10 +74,6 @@ struct SubscribeRequest<'a> {
 
 impl WebSocketConnection {
     /// Send one exact Hub `on_change` subscription request.
-    #[allow(
-        dead_code,
-        reason = "S2b-2a methods are consumed by the S2b-2b worker slice"
-    )]
     pub(crate) async fn subscribe_on_change(
         &mut self,
         subscription_id: i64,
@@ -100,10 +96,6 @@ impl WebSocketConnection {
 
     /// Receive exactly one application text frame, handling native control
     /// frames without adding an unbounded queue.
-    #[allow(
-        dead_code,
-        reason = "S2b-2a methods are consumed by the S2b-2b worker slice"
-    )]
     pub(crate) async fn receive_text(&mut self) -> Result<String> {
         loop {
             match self.stream.next().await {

@@ -17,9 +17,9 @@ pub mod error;
 pub mod rest;
 pub mod secret;
 /// S2a remains crate-internal until the S2b-2 worker slice wires it in.
-#[allow(dead_code, reason = "S2a core is wired by the S2b-2 worker slice")]
 mod stream_core;
 pub mod types;
+mod worker;
 mod ws_transport;
 
 pub use binding::{

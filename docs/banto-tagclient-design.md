@@ -1,11 +1,11 @@
 # banto-tagclient 設計
 
 作成日: 2026-08-29
-状態: **S2b-2a完了、S2b-2b/S3未完了**。S1bのREST catalog/values transport、S2aの
+状態: **S2b-2b完了、S3未完了**。S1bのREST catalog/values transport、S2aの
 Hub WS wire純粋解析・bounded pending map・latest-wins publish gate・非LIVE current抑止に加え、
-S2b-1では認証付きWebSocket handshake transport、S2b-2aではon_change subscribe送信と
-1フレーム受信を実装した。worker/watch配信、latest配信、再接続、rebinding、shutdownは
-S2b-2b/S3で未実装である（2026-08-31）。
+S2b-1の認証付きWebSocket handshake、S2b-2aのon_change subscribe送信と1フレーム受信、
+S2b-2bのcrate-private単一世代worker・tokio watchによるlatest snapshot配信・atomic publishを
+実装した。公開Handle、再接続、rebinding、shutdownはS3で未実装である（2026-08-31）。
 設計時参照baseline: `b9552627a86015b354b3c5651184fb108ba89e44`
 実API確認日: 2026-08-30（`apps/banto-hub/core/src/rest.rs` / `stream.rs`）
 
@@ -307,6 +307,9 @@ S2b-2aでは`futures-util 0.3`をcrateの直接workspace依存として追加し
 によるboundedな1フレーム送受信とPing時flushに使用し、licenseはMIT OR Apache-2.0、既存の
 workspace/lock系列を再利用してpackage/version blockは追加していない。追加featureは`sink`のみである。
 
+S2b-2bでは既存workspaceの`tokio`に`sync`と`macros` featureを有効化し、`watch`によるboundedな
+latest state配信と`select!`によるWS優先処理に使用する。新規package/version blockは追加していない。
+
 ## 8. テスト計画
 
 | テスト                       | 確認する契約                                                                                      |
@@ -339,8 +342,8 @@ workspace/lock系列を再利用してpackage/version blockは追加していな
 | S2a    | WS wire解析、publish gate、latest snapshot、状態DTO            | malformed/unknown/id・tag拒否、bounded pending、handshake latest-wins、RESTとのtimestamp/sequence統合、metadata一致、非LIVE current抑止の純粋coreテストが通る。 |
 | S2b-1  | 認証付きWebSocket handshake transport                          | prefix保持URL、Authorization、redirect非追従、HTTP/timeout分類、1MiB制限、秘密redactionのテストが通る。                                                         |
 | S2b-2a | on_change subscribe送信、1フレーム受信                         | 厳密なsubscribe JSON、共通tag validation、native Ping/Pong、Text受信、Binary/Close/EOF/容量分類のテストが通る。                                                 |
-| S2b-2b | worker、latest snapshot配信                                    | worker/watch相当の配信、実接続のbackpressure/latest-winsテストが通る。                                                                                          |
-| S2     | WS購読、latest snapshot、状態機械                              | S2a/S2b-1/S2b-2a/S2b-2bの完了条件を満たし、WS先行接続からatomic publishまでの全テストが通る。                                                                   |
+| S2b-2b | 単一世代worker、watch latest snapshot配信、atomic publish      | catalog→WS subscribe→初回data→REST gateの順序、完全snapshotのatomic publish、live更新のlatest-wins、失敗時current消去のテストが通る。                           |
+| S2     | WS購読、latest snapshot、状態機械                              | S2a/S2b-1/S2b-2a/S2b-2bの完了条件を満たし、WS先行接続から単一世代のatomic publishまでの全テストが通る。公開Handle、再接続、rebinding、shutdownはS3に残る。      |
 | S3     | config_changed、rebinding/coalesce、再解決、再接続、shutdown   | snapshot後の通知取り逃しなし、revision/run metadata不一致retry、coalesced rebind、旧値無効化、401/403、切断復旧、残留なしテストが通る。                         |
 | S4     | workspace統合と互換性固定                                      | 依存レビュー、fmt/clippy/test、Hub互換commit/tagの記録が完了する。                                                                                              |
 

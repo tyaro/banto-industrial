@@ -25,8 +25,17 @@ pub(crate) struct HubWireValue {
 /// represented as `Ignored` because they do not affect the value gate.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum HubWireMessage {
-    Data { values: Vec<HubWireValue> },
+    Data {
+        timestamp: i64,
+        values: Vec<HubWireValue>,
+    },
     ConfigChanged,
+    Ignored,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AcceptedWire {
+    Data,
     Ignored,
 }
 
@@ -80,7 +89,10 @@ pub(crate) fn parse_hub_wire(
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(HubWireMessage::Data { values })
+            Ok(HubWireMessage::Data {
+                timestamp: wire._timestamp,
+                values,
+            })
         }
         "config_changed" => {
             let _: WireConfigChanged =
@@ -144,6 +156,7 @@ pub(crate) struct PublishGate {
     rest_snapshot: Option<ValuesSnapshot>,
     rest_marker: Option<u64>,
     invalid_reason: Option<ErrorKind>,
+    latest_envelope_timestamp: Option<i64>,
 }
 
 impl PublishGate {
@@ -165,6 +178,7 @@ impl PublishGate {
             rest_snapshot: None,
             rest_marker: None,
             invalid_reason: None,
+            latest_envelope_timestamp: None,
         })
     }
 
@@ -173,7 +187,7 @@ impl PublishGate {
         self.pending.len()
     }
 
-    pub(crate) fn accept_wire(&mut self, raw: &str) -> Result<()> {
+    pub(crate) fn accept_wire(&mut self, raw: &str) -> Result<AcceptedWire> {
         if let Some(reason) = self.invalid_reason {
             return Err(Error::new(reason));
         }
@@ -185,16 +199,19 @@ impl PublishGate {
             }
         };
         match message {
-            HubWireMessage::Data { values } => self.accept_data(&values),
+            HubWireMessage::Data { timestamp, values } => {
+                self.accept_data(timestamp, &values)?;
+                Ok(AcceptedWire::Data)
+            }
             HubWireMessage::ConfigChanged => {
                 self.invalid_reason = Some(ErrorKind::RevisionMismatch);
                 Err(Error::new(ErrorKind::RevisionMismatch))
             }
-            HubWireMessage::Ignored => Ok(()),
+            HubWireMessage::Ignored => Ok(AcceptedWire::Ignored),
         }
     }
 
-    fn accept_data(&mut self, values: &[HubWireValue]) -> Result<()> {
+    fn accept_data(&mut self, timestamp: i64, values: &[HubWireValue]) -> Result<()> {
         if let Some(reason) = self.invalid_reason {
             return Err(Error::new(reason));
         }
@@ -209,6 +226,10 @@ impl PublishGate {
             self.invalid_reason = Some(ErrorKind::ProtocolError);
             return Err(protocol_error());
         }
+        self.latest_envelope_timestamp = Some(
+            self.latest_envelope_timestamp
+                .map_or(timestamp, |old| old.max(timestamp)),
+        );
         for value in values {
             self.sequence += 1;
             let entry = PendingValue {
@@ -242,7 +263,7 @@ impl PublishGate {
 
     /// Validate metadata and explicit values, then atomically overlay newer WS
     /// entries. No partial or pre-gate current snapshot is ever returned.
-    pub(crate) fn finalize(self, catalog: &CatalogSnapshot) -> Result<ValuesSnapshot> {
+    pub(crate) fn finalize(&self, catalog: &CatalogSnapshot) -> Result<ValuesSnapshot> {
         if let Some(reason) = self.invalid_reason {
             return Err(Error::new(reason));
         }
@@ -290,7 +311,9 @@ impl PublishGate {
         }
         let result = ValuesSnapshot {
             revision: rest.revision,
-            t: rest.t,
+            t: self
+                .latest_envelope_timestamp
+                .map_or(rest.t, |timestamp| rest.t.max(timestamp)),
             run_id: rest.run_id,
             collection_mode: rest.collection_mode.clone(),
             values,
@@ -374,6 +397,45 @@ mod tests {
         assert_eq!(
             parse_hub_wire(r#"{"op":"pong"}"#, 1, &gate.allowed_tags).unwrap(),
             HubWireMessage::Ignored
+        );
+    }
+
+    #[test]
+    fn accepted_wire_distinguishes_data_and_ignored_and_preserves_envelope_time() {
+        let mut gate = valid_gate();
+        assert_eq!(
+            gate.accept_wire(r#"{"op":"event","id":1}"#).unwrap(),
+            AcceptedWire::Ignored
+        );
+        assert_eq!(
+            gate.accept_wire(r#"{"op":"data","id":1,"t":20,"values":[]}"#)
+                .unwrap(),
+            AcceptedWire::Data
+        );
+        gate.record_rest_snapshot(rest(vec![value("a", 1.0, 10), value("b", 2.0, 10)]))
+            .unwrap();
+        assert_eq!(
+            gate.finalize(&catalog(CollectionMode::Configured))
+                .unwrap()
+                .t,
+            20
+        );
+        gate.accept_wire(
+            r#"{"op":"data","id":1,"t":30,"values":[{"tag":"a","v":3,"q":"good","t":30}]}"#,
+        )
+        .unwrap();
+        let newer = gate.finalize(&catalog(CollectionMode::Configured)).unwrap();
+        assert_eq!(newer.t, 30);
+        assert_eq!(newer.values[0].v, Some(3.0));
+        gate.accept_wire(
+            r#"{"op":"data","id":1,"t":5,"values":[{"tag":"a","v":5,"q":"good","t":5}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            gate.finalize(&catalog(CollectionMode::Configured))
+                .unwrap()
+                .t,
+            30
         );
     }
 
