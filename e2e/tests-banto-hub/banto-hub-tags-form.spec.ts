@@ -182,9 +182,14 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 		const drawer = page.getByRole('dialog', { name: '新規作成' });
 		await expect(drawer).toBeVisible();
 
-		// 名前は空のまま、他の必須項目（収集グループ・アドレス）だけ埋める。
+		// 名前は空のまま、収集グループだけ埋める。
+		// 2026-09-01 オーナー要望（タグ名が空欄ならアドレスをタグ名にする
+		// プリフィル、`$lib/banto/tagNamePrefill.ts`）以降、アドレス欄へ
+		// 入力すると名前欄が自動で埋まってしまい「名前が空のまま」という
+		// この検証の前提が崩れるため、あえてアドレスは埋めない - 名前欄
+		// 自体の HTML5 `required` 制約が効いているかどうかは、アドレスの
+		// 有無に関わらず `nameInvalid` の判定（下）だけで確認できる。
 		await drawer.getByLabel('収集グループ').selectOption({ label: GROUP_NAME });
-		await drawer.getByLabel('アドレス').fill('40020');
 		// T18-2c: create Drawer のボタンは「登録して次へ」「登録して閉じる」の
 		// 2つに分かれた（旧「作成」ボタン）。HTML5 制約検証はどちらのボタンで
 		// 押しても等しく submit イベント自体を止めるため、ここでは
