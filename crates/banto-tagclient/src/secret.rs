@@ -2,7 +2,8 @@
 //! accessor and is zeroized when dropped.
 
 use reqwest::RequestBuilder;
-use zeroize::Zeroize;
+use tokio_tungstenite::tungstenite::http::{header::AUTHORIZATION, HeaderValue, Request};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Error, ErrorKind};
 
@@ -29,6 +30,21 @@ impl SecretApiKey {
 
     pub(crate) fn apply_authorization(&self, request: RequestBuilder) -> RequestBuilder {
         request.bearer_auth(&self.value)
+    }
+
+    pub(crate) fn apply_stream_authorization(
+        &self,
+        mut request: Request<()>,
+    ) -> Result<Request<()>, Error> {
+        let mut bearer = Zeroizing::new(String::with_capacity(7 + self.value.len()));
+        bearer.push_str("Bearer ");
+        bearer.push_str(&self.value);
+        let value =
+            HeaderValue::from_str(&bearer).map_err(|_| Error::new(ErrorKind::InvalidSecret))?;
+        let mut value = value;
+        value.set_sensitive(true);
+        request.headers_mut().insert(AUTHORIZATION, value);
+        Ok(request)
     }
 }
 
@@ -77,5 +93,23 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.to_string(), "invalid_secret");
+    }
+
+    #[test]
+    fn stream_authorization_header_is_sensitive() {
+        let request = Request::builder()
+            .uri("ws://example.test/api/v1/stream")
+            .body(())
+            .unwrap();
+        let request = SecretApiKey::new(test_secret())
+            .unwrap()
+            .apply_stream_authorization(request)
+            .unwrap();
+        assert!(request.headers().get(AUTHORIZATION).unwrap().is_sensitive());
+        assert!(!format!("{:?}", request.headers()).contains(&test_secret()));
+        assert!(
+            !format!("{:?}", request.headers().get(AUTHORIZATION).unwrap())
+                .contains(&test_secret())
+        );
     }
 }

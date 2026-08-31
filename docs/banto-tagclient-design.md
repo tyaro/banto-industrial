@@ -1,9 +1,10 @@
 # banto-tagclient 設計
 
 作成日: 2026-08-29
-状態: **S2a完了、S2b/S3未完了**。S1bのREST catalog/values transportに加え、S2aでは
-Hub WS wire純粋解析、bounded pending map、latest-wins publish gate、非LIVE current抑止を実装した。
-実WebSocket transport、worker、再接続、shutdownはS2b/S3で未実装である（2026-08-31）。
+状態: **S2b-1完了、S2b-2/S3未完了**。S1bのREST catalog/values transport、S2aの
+Hub WS wire純粋解析・bounded pending map・latest-wins publish gate・非LIVE current抑止に加え、
+S2b-1では認証付きWebSocket handshake transportを実装した。subscribe、worker/watch配信、
+再接続、rebinding、shutdownはS2b-2/S3で未実装である（2026-08-31）。
 設計時参照baseline: `b9552627a86015b354b3c5651184fb108ba89e44`
 実API確認日: 2026-08-30（`apps/banto-hub/core/src/rest.rs` / `stream.rs`）
 
@@ -294,7 +295,11 @@ crate追加前に、次をレビューゲートとする。
 4. 既存workspace featureとの整合
 5. Hubのrelease tagまたは互換commitへの固定方法
 
-設計時点でtarget Hubのrelease tagは未定である。参照baselineは本書冒頭のcommitとし、
+S2b-1では`tokio-tungstenite 0.30`（MIT）と`tungstenite 0.30`（MIT OR Apache-2.0）を
+承認済みworkspace依存として利用する。TLS featureは有効化せず、Cargo.lockは既存系列のみを
+再利用する。WebSocket transportのbinary size実測はS4で行う。Issue #199の既存version/comment
+不整合はS4統合ゲートで追跡する。設計時点でtarget Hubのrelease tagは未定である。参照baselineは
+本書冒頭のcommitとし、
 リリース互換commit/tagはSDK実装完了時に決める。
 
 ## 8. テスト計画
@@ -327,8 +332,9 @@ crate追加前に、次をレビューゲートとする。
 | S1a   | crate骨格、共通DTO、SecretApiKey、Endpoint、stable ID resolver | URL境界・redaction・metadata保持・unknown値保持・重複fail-closed・catalog resolveテストが通る。REST送信、Authorization、redirect処理は含めない。                |
 | S1b   | REST catalog/values transport、Authorization、redirect拒否     | reqwestによる読み取り専用GET、認証ヘッダ、redirectを追従しない設定、HTTPエラー分類のテストが通る。                                                              |
 | S2a   | WS wire解析、publish gate、latest snapshot、状態DTO            | malformed/unknown/id・tag拒否、bounded pending、handshake latest-wins、RESTとのtimestamp/sequence統合、metadata一致、非LIVE current抑止の純粋coreテストが通る。 |
-| S2b   | 実WebSocket購読、worker、latest snapshot配信                   | WS transport、on_change購読、worker/watch相当の配信、実接続のbackpressure/latest-winsテストが通る。                                                             |
-| S2    | WS購読、latest snapshot、状態機械                              | S2a/S2bの完了条件を満たし、WS先行接続からatomic publishまでの全テストが通る。                                                                                   |
+| S2b-1 | 認証付きWebSocket handshake transport                          | prefix保持URL、Authorization、redirect非追従、HTTP/timeout分類、1MiB制限、秘密redactionのテストが通る。                                                         |
+| S2b-2 | 実WebSocket購読、worker、latest snapshot配信                   | on_change購読、worker/watch相当の配信、実接続のbackpressure/latest-winsテストが通る。                                                                           |
+| S2    | WS購読、latest snapshot、状態機械                              | S2a/S2b-1/S2b-2の完了条件を満たし、WS先行接続からatomic publishまでの全テストが通る。                                                                           |
 | S3    | config_changed、rebinding/coalesce、再解決、再接続、shutdown   | snapshot後の通知取り逃しなし、revision/run metadata不一致retry、coalesced rebind、旧値無効化、401/403、切断復旧、残留なしテストが通る。                         |
 | S4    | workspace統合と互換性固定                                      | 依存レビュー、fmt/clippy/test、Hub互換commit/tagの記録が完了する。                                                                                              |
 

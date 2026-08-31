@@ -73,6 +73,13 @@ impl Endpoint {
     pub fn port(&self) -> Option<u16> {
         self.base.port()
     }
+
+    pub(crate) fn stream_url(&self) -> Result<Url> {
+        let mut url = append_path(&self.base, "stream");
+        url.set_scheme("ws")
+            .map_err(|_| Error::new(ErrorKind::InvalidEndpoint))?;
+        Ok(url)
+    }
 }
 
 fn append_path(base: &Url, leaf: &str) -> Url {
@@ -155,5 +162,17 @@ mod tests {
             };
             assert_eq!(error.kind(), ErrorKind::InvalidEndpoint);
         }
+    }
+
+    #[test]
+    fn builds_prefixed_websocket_route_without_query_or_fragment() {
+        let endpoint = Endpoint::new("http://example.test/private-prefix///").unwrap();
+        let url = endpoint.stream_url().unwrap();
+        assert_eq!(
+            url.as_str(),
+            "ws://example.test/private-prefix/api/v1/stream"
+        );
+        assert!(url.query().is_none());
+        assert!(url.fragment().is_none());
     }
 }

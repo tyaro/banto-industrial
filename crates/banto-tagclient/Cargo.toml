@@ -10,6 +10,8 @@ publish.workspace = true
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true, features = ["net", "time"] }
+tokio-tungstenite = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]

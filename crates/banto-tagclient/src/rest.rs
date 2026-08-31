@@ -8,6 +8,7 @@ use crate::endpoint::Endpoint;
 use crate::error::{Error, ErrorKind, Result};
 use crate::secret::SecretApiKey;
 use crate::types::{CatalogSnapshot, ValuesSnapshot};
+use crate::ws_transport::WebSocketConnection;
 
 /// A read-only banto-hub REST client that connects directly to its endpoint,
 /// without redirects or system/environment proxy configuration.
@@ -71,6 +72,16 @@ impl RestClient {
             .await
             .map_err(|_| Error::new(ErrorKind::Transport))?;
         serde_json::from_slice(&body).map_err(|_| Error::new(ErrorKind::ProtocolError))
+    }
+
+    /// Connect the S2b-1 stream using this client's endpoint and secret.
+    /// S2b-2 wires the returned connection into subscription and worker state.
+    #[allow(
+        dead_code,
+        reason = "S2b-1 connection is wired by the S2b-2 worker slice"
+    )]
+    pub(crate) async fn connect_stream(&self) -> Result<WebSocketConnection> {
+        crate::ws_transport::connect(&self.endpoint, &self.secret).await
     }
 }
 
