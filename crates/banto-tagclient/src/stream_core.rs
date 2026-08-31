@@ -34,6 +34,18 @@ fn protocol_error() -> Error {
     Error::new(ErrorKind::ProtocolError)
 }
 
+pub(crate) fn validate_tag_selection(tags: &[String]) -> Result<()> {
+    let mut seen = HashSet::with_capacity(tags.len());
+    if tags.is_empty()
+        || tags
+            .iter()
+            .any(|tag| tag.trim().is_empty() || tag.contains(',') || !seen.insert(tag.as_str()))
+    {
+        return Err(Error::new(ErrorKind::InvalidTagSelection));
+    }
+    Ok(())
+}
+
 /// Parse and validate one Hub wire message against the active subscription and
 /// explicit allowed tag set. Unknown tags and subscription IDs fail closed.
 pub(crate) fn parse_hub_wire(
@@ -142,16 +154,9 @@ impl PublishGate {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        let mut allowed_tags = HashSet::new();
-        for tag in tags {
-            let tag = tag.into();
-            if tag.trim().is_empty() || tag.contains(',') || !allowed_tags.insert(tag) {
-                return Err(Error::new(ErrorKind::InvalidTagSelection));
-            }
-        }
-        if allowed_tags.is_empty() {
-            return Err(Error::new(ErrorKind::InvalidTagSelection));
-        }
+        let tags = tags.into_iter().map(Into::into).collect::<Vec<String>>();
+        validate_tag_selection(&tags)?;
+        let allowed_tags = tags.into_iter().collect::<HashSet<_>>();
         Ok(Self {
             subscription_id,
             allowed_tags,

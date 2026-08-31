@@ -1,13 +1,20 @@
-//! Direct, authenticated WebSocket handshake for S2b-1.
+//! Direct, authenticated WebSocket handshake and one-frame exchange for S2b-2a.
 //!
-//! This module deliberately stops after the connection handshake. Subscription,
-//! worker/watch delivery, rebinding, reconnect, and shutdown belong to S2b-2/S3.
+//! This module deliberately stops after one subscription send and one-frame
+//! receive primitive. Worker/watch delivery, rebinding, reconnect, and shutdown
+//! belong to S2b-2b/S3.
 
 use std::time::Duration;
 
+use futures_util::{SinkExt, StreamExt};
+use serde::Serialize;
 use tokio_tungstenite::{
     connect_async_with_config,
-    tungstenite::{client::IntoClientRequest, protocol::WebSocketConfig, Error as WsError},
+    tungstenite::{
+        client::IntoClientRequest,
+        protocol::{Message, WebSocketConfig},
+        Error as WsError,
+    },
     WebSocketStream,
 };
 
@@ -15,13 +22,15 @@ use crate::{
     endpoint::Endpoint,
     error::{Error, ErrorKind, Result},
     secret::SecretApiKey,
+    stream_core::validate_tag_selection,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_WEBSOCKET_SIZE: usize = 1024 * 1024;
 
-pub(crate) type WebSocketConnection =
-    WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+pub(crate) struct WebSocketConnection {
+    stream: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+}
 
 pub(crate) async fn connect(
     endpoint: &Endpoint,
@@ -52,7 +61,86 @@ async fn connect_with_timeout(
     .await
     .map_err(|_| Error::new(ErrorKind::Transport))?;
     let (stream, _) = result.map_err(classify_handshake_error)?;
-    Ok(stream)
+    Ok(WebSocketConnection { stream })
+}
+
+#[derive(Serialize)]
+struct SubscribeRequest<'a> {
+    op: &'static str,
+    id: i64,
+    tags: &'a [String],
+    mode: &'static str,
+}
+
+impl WebSocketConnection {
+    /// Send one exact Hub `on_change` subscription request.
+    #[allow(
+        dead_code,
+        reason = "S2b-2a methods are consumed by the S2b-2b worker slice"
+    )]
+    pub(crate) async fn subscribe_on_change(
+        &mut self,
+        subscription_id: i64,
+        tags: &[String],
+    ) -> Result<()> {
+        validate_tag_selection(tags)?;
+        let request = SubscribeRequest {
+            op: "subscribe",
+            id: subscription_id,
+            tags,
+            mode: "on_change",
+        };
+        let payload =
+            serde_json::to_string(&request).map_err(|_| Error::new(ErrorKind::ProtocolError))?;
+        self.stream
+            .send(Message::Text(payload.into()))
+            .await
+            .map_err(classify_stream_error)
+    }
+
+    /// Receive exactly one application text frame, handling native control
+    /// frames without adding an unbounded queue.
+    #[allow(
+        dead_code,
+        reason = "S2b-2a methods are consumed by the S2b-2b worker slice"
+    )]
+    pub(crate) async fn receive_text(&mut self) -> Result<String> {
+        loop {
+            match self.stream.next().await {
+                Some(Ok(Message::Text(text))) => return Ok(text.to_string()),
+                Some(Ok(Message::Ping(_))) => {
+                    self.stream.flush().await.map_err(classify_stream_error)?;
+                }
+                Some(Ok(Message::Pong(_))) => {}
+                Some(Ok(Message::Binary(_))) | Some(Ok(Message::Frame(_))) => {
+                    return Err(Error::new(ErrorKind::ProtocolError));
+                }
+                Some(Ok(Message::Close(_))) | None => {
+                    return Err(Error::new(ErrorKind::Transport));
+                }
+                Some(Err(error)) => return Err(classify_stream_error(error)),
+            }
+        }
+    }
+}
+
+fn classify_stream_error(error: WsError) -> Error {
+    match error {
+        WsError::Io(_) | WsError::Tls(_) | WsError::ConnectionClosed | WsError::AlreadyClosed => {
+            Error::new(ErrorKind::Transport)
+        }
+        WsError::Protocol(
+            tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+        ) => Error::new(ErrorKind::Transport),
+        WsError::Capacity(_)
+        | WsError::Protocol(_)
+        | WsError::WriteBufferFull(_)
+        | WsError::Utf8(_)
+        | WsError::AttackAttempt
+        | WsError::Url(_)
+        | WsError::Http(_)
+        | WsError::HttpFormat(_) => Error::new(ErrorKind::ProtocolError),
+    }
 }
 
 fn classify_handshake_error(error: WsError) -> Error {
@@ -86,13 +174,15 @@ fn classify_handshake_error(error: WsError) -> Error {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use futures_util::{SinkExt, StreamExt};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
     use tokio_tungstenite::{
-        accept_hdr_async,
+        accept_async, accept_hdr_async,
         tungstenite::handshake::server::{Request, Response},
+        tungstenite::Message,
     };
 
     use super::*;
@@ -153,18 +243,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            connection.get_config().max_message_size,
+            connection.stream.get_config().max_message_size,
             Some(MAX_WEBSOCKET_SIZE)
         );
         assert_eq!(
-            connection.get_config().max_frame_size,
+            connection.stream.get_config().max_frame_size,
             Some(MAX_WEBSOCKET_SIZE)
         );
         assert_eq!(
-            connection.get_config().max_write_buffer_size,
+            connection.stream.get_config().max_write_buffer_size,
             MAX_WEBSOCKET_SIZE
         );
-        assert!(!connection.get_config().accept_unmasked_frames);
+        assert!(!connection.stream.get_config().accept_unmasked_frames);
         let observed = observed.lock().unwrap().clone().unwrap();
         assert_eq!(observed.0.as_deref(), Some("Bearer test-secret-opaque"));
         assert!(observed.1.is_none());
@@ -185,7 +275,8 @@ mod tests {
             let (endpoint, secret) = client(address);
             let error = connect_with_timeout(&endpoint, &secret, Duration::from_secs(2))
                 .await
-                .unwrap_err();
+                .err()
+                .unwrap();
             assert_eq!(error.kind(), kind);
             assert!(!error.to_string().contains("private-body-token"));
         }
@@ -205,9 +296,238 @@ mod tests {
         let (endpoint, secret) = client(format!("{address}/private-path"));
         let error = connect_with_timeout(&endpoint, &secret, Duration::from_millis(20))
             .await
-            .unwrap_err();
+            .err()
+            .unwrap();
         assert_eq!(error.kind(), ErrorKind::Transport);
         assert!(!format!("{error:?}").contains(TEST_SECRET));
+        server.await.unwrap();
+    }
+
+    async fn accept_and_wait_for_subscription(
+        listener: TcpListener,
+    ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        socket
+    }
+
+    #[tokio::test]
+    async fn subscribe_on_change_sends_exact_ordered_json() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            match tokio::time::timeout(Duration::from_secs(1), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+            {
+                Message::Text(text) => text.to_string(),
+                _ => panic!("subscription was not text"),
+            }
+        });
+        let (endpoint, secret) = client(address);
+        let mut connection = connect_with_timeout(&endpoint, &secret, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let tags = vec!["first".to_owned(), "second".to_owned()];
+        connection.subscribe_on_change(1, &tags).await.unwrap();
+        assert_eq!(
+            server.await.unwrap(),
+            r#"{"op":"subscribe","id":1,"tags":["first","second"],"mode":"on_change"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_tags_are_rejected_before_any_subscription_frame() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            tokio::time::timeout(Duration::from_millis(100), socket.next())
+                .await
+                .is_err()
+        });
+        let (endpoint, secret) = client(address);
+        let mut connection = connect_with_timeout(&endpoint, &secret, Duration::from_secs(1))
+            .await
+            .unwrap();
+        for tags in [
+            Vec::new(),
+            vec![String::new()],
+            vec!["  ".to_owned()],
+            vec!["bad,tag".to_owned()],
+            vec!["same".to_owned(), "same".to_owned()],
+        ] {
+            assert_eq!(
+                connection
+                    .subscribe_on_change(1, &tags)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidTagSelection
+            );
+        }
+        assert!(server.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn first_data_text_is_accepted_by_s2a_publish_gate() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut socket = accept_and_wait_for_subscription(listener).await;
+            socket
+                .send(Message::Text(
+                    r#"{"op":"data","id":1,"t":1,"values":[{"tag":"temperature","v":21.5,"q":"good","t":1}]}"#.into(),
+                ))
+                .await
+                .unwrap();
+        });
+        let (endpoint, secret) = client(address);
+        let mut connection = connect_with_timeout(&endpoint, &secret, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let tags = vec!["temperature".to_owned()];
+        connection.subscribe_on_change(1, &tags).await.unwrap();
+        let text = tokio::time::timeout(Duration::from_secs(1), connection.receive_text())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut gate = crate::stream_core::PublishGate::new(1, tags).unwrap();
+        gate.accept_wire(&text).unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_ping_is_flushed_as_pong_before_next_text() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut socket = accept_and_wait_for_subscription(listener).await;
+            socket
+                .send(Message::Ping(vec![1, 2, 3].into()))
+                .await
+                .unwrap();
+            let pong = tokio::time::timeout(Duration::from_secs(1), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert!(matches!(pong, Message::Pong(_)));
+            socket
+                .send(Message::Text("{\"op\":\"pong\"}".into()))
+                .await
+                .unwrap();
+        });
+        let (endpoint, secret) = client(address);
+        let mut connection = connect_with_timeout(&endpoint, &secret, Duration::from_secs(1))
+            .await
+            .unwrap();
+        connection
+            .subscribe_on_change(1, &["tag".to_owned()])
+            .await
+            .unwrap();
+        let text = tokio::time::timeout(Duration::from_secs(1), connection.receive_text())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(text, "{\"op\":\"pong\"}");
+        server.await.unwrap();
+    }
+
+    async fn connection_for_single_message(
+        message: Message,
+    ) -> (WebSocketConnection, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut socket = accept_and_wait_for_subscription(listener).await;
+            socket.send(message).await.unwrap();
+        });
+        let (endpoint, secret) = client(address);
+        let mut connection = connect_with_timeout(&endpoint, &secret, Duration::from_secs(1))
+            .await
+            .unwrap();
+        connection
+            .subscribe_on_change(1, &["tag".to_owned()])
+            .await
+            .unwrap();
+        (connection, server)
+    }
+
+    #[tokio::test]
+    async fn binary_and_oversized_text_are_protocol_errors() {
+        let (mut binary, binary_server) =
+            connection_for_single_message(Message::Binary(vec![1].into())).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), binary.receive_text())
+                .await
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ProtocolError
+        );
+        binary_server.await.unwrap();
+
+        let (mut oversized, oversized_server) =
+            connection_for_single_message(Message::Text("x".repeat(MAX_WEBSOCKET_SIZE + 1).into()))
+                .await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), oversized.receive_text())
+                .await
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ProtocolError
+        );
+        oversized_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_and_eof_are_transport_errors() {
+        let (mut closed, closed_server) = connection_for_single_message(Message::Close(None)).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), closed.receive_text())
+                .await
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Transport
+        );
+        closed_server.await.unwrap();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(1), socket.next()).await;
+            drop(socket);
+        });
+        let (endpoint, secret) = client(address);
+        let mut eof = connect_with_timeout(&endpoint, &secret, Duration::from_secs(1))
+            .await
+            .unwrap();
+        eof.subscribe_on_change(1, &["tag".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), eof.receive_text())
+                .await
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Transport
+        );
         server.await.unwrap();
     }
 
