@@ -20,10 +20,12 @@ crates/
   banto-collect/     I3b: 収集エンジン（PLC定期読み出し→banto-tstore書き込み、現在値・イベント供給）実装済み
   banto-tsquery/     I4: 期間クエリ + サーバ側 min/max 間引き（read_range/read_decimated/aggregate/catalog）実装済み
   banto-plc-write/   I5: PLC書き込み（SLMP一括書き込み。読み取り側と分離した専用trait）実装済み
+  banto-broker/      I6: PLC アクセスブローカー（接続毎1タスク・read/write 単一セッション・再接続バックオフ）実装済み
+  banto-expr/        T6-1: 演算タグの式評価エンジン（tokio/レジストリ非依存、依存は thiserror のみ）実装済み
 apps/
   chronogazer/       R系: デジタル記録計 ChronoGazer（Tauri + LAN、banto テンプレート由来）
   relay-wright/      W系: 条件付きPLC自動書き込みアプリ（Tauri、W1〜W5 実装済み・実機検証残）安全上の注意は同README参照
-  banto-hub/         T系: タグサーバー banto-hub（Tauriなしのヘッドレス axum、REST/WS/MQTT/gRPC でタグ空間を外部公開。T0〜T4/T6〜T12 実装済み・残 T5）
+  banto-hub/         T系: タグサーバー banto-hub（Tauriなしのヘッドレス axum、REST/WS/MQTT/gRPC でタグ空間を外部公開。T18-6 まで実装済み・試運転モード/ロックダウン対応、残は実機/soak 系のみ）
 ```
 
 ### `banto-tags`（I1）
@@ -218,14 +220,17 @@ docs/plan.md §4b）。タグレジストリの読み取り値を条件に、設
 
 banto のパッケージ/クレートの消費は **両方とも git タグ参照**
 （2026-07-12 決定。GitHub 組織名 banto が取得不能だったため
-レジストリ発行は棚上げ。banto の docs/publishing.md 参照）:
+レジストリ発行は棚上げ。banto の docs/publishing.md 参照）。
+両者は独立に追従しており必ずしも同じタグではない
+（2026-09-01 時点: npm `@banto/*` は `v1.2.0`、Rust クレートは `v1.4.0`。
+実際の値は各 `package.json`/`Cargo.toml` を正とする）:
 
 ```sh
-pnpm add "github:tyaro/banto#v1.1.0&path:packages/admin-core"
+pnpm add "github:tyaro/banto#v1.2.0&path:packages/admin-core"
 ```
 
 ```toml
-banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v1.1.0" }
+banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v1.4.0" }
 ```
 
 ### `apps/banto-hub`（T系）
@@ -240,8 +245,10 @@ MQTT publish / gRPC** の4経路で外部（MES・クラウド・自作画面等
 relay-wright の専管のまま）。演算タグ・内部タグの一元実装、稼働中の
 タグ定義変更（オンライン動的変更）にも対応する。
 
-実装状況は **T0〜T4/T6〜T12 実装済み・残 T5**（配布・運用強化・実機検証）。
-詳細設計は [docs/tag-server-design.md](docs/tag-server-design.md)、運用手順は
+実装状況は **T0〜T18-6 実装済み**（試運転モード・ロックダウン、収集の開始/停止 UI、
+タグ名一意性の収集グループ内一意への緩和を含む。2026-08-31 時点）。残るは
+T18-5c/d・T5-5（Windows 実機往復・72h soak 実行 + 実機最終サインオフ）等の
+実機依存項目のみ。詳細設計は [docs/tag-server-design.md](docs/tag-server-design.md)、運用手順は
 [docs/banto-hub-operations.md](docs/banto-hub-operations.md)、起動方法は
 [apps/banto-hub/README.md](apps/banto-hub/README.md) を参照。
 

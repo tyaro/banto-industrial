@@ -4,6 +4,11 @@
 > [banto-hub-operations.md](banto-hub-operations.md)・[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)
 > に反映済み。残る T5-5（72h soak 実行 + 実機サインオフ）の現行の追跡は
 > [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) Phase 4。本書は経緯として保存。
+> T5-4（本書 §3 表）/T5-5 の採番は docs/plan.md §4c もこの定義へ統一済み
+> （2026-09-01、banto-hub-desktop-plan.md §16.5 の残件を解消）。
+
+状態: **アーカイブ（役目終了・経緯として保存）**。
+最終検証日(コード照合): 2026-09-01
 
 作成: 2026-08-06（クラウドセッションの区切り）。banto-hub の T 系のうち
 実機・Windows 依存のない範囲（T0〜T4 / T6〜T8）が main に入った時点の

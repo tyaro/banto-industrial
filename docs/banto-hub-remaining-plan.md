@@ -13,12 +13,19 @@ P3-a audit retention（#125）、P3-b SLMP word order（#127）、P3-c SLMP 構�
 session/transport 共通化は `banto_plc::dial_slmp` への集約で完了（2026-08-14、
 improvement-plan.md §H9）。`classify_slmp_error` の重複統合も
 `banto_plc::SlmpErrorClass`/`classify_slmp` への集約で同日完了し、P3-c は
-完全完了（残スライスなし）。残るは Phase 2 実機検証系（T18-5c/d 含む）。**
+完全完了（残スライスなし）。
+**進捗追記（2026-09-01）**: P2-a（切替ウィザード UI の Windows 実機経路）は
+2026-08-31/09-01 のオーナー実機検証で完了（下記 Phase 2 参照）。B群の T18 は
+desktop-plan §9.5（TAG-UX-7〜9）を受けて 2026-08-27 に T18-6（接続/グループ
+Drawer とツリー意匠）も完了（#173/#174/#176/#177）。banto-tagclient SDK は
+Issue #123 として起票済み（起票は完了・着手は SCADA 計画具体化と同時、
+下記「別途スケジュール」参照）。残るは Phase 2 実機検証系（T18-5c/d 含む）と
+Phase 4 リリースゲート（H7① 実機 soak）のみ。**
 個別スライスの詳細設計は既存の
 [plan.md](plan.md)・[tag-server-design.md](tag-server-design.md)・[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)・
 [banto-hub-t16-design.md](banto-hub-t16-design.md)・[banto-hub-t17-design.md](banto-hub-t17-design.md)・
 [improvement-plan.md](improvement-plan.md) を正とし、本書はそれらの残項目の**優先順位と着手順**を定める索引。
-最終検証日(監査): 2026-08-12（進捗行の同期: 2026-08-14）
+最終検証日(監査): 2026-08-12（進捗行の同期: 2026-09-01）
 基準コミット: 889f622（監査時）／`d5ba55e`（T18-5a 判定記録後の現 main、2026-08-14）
 
 ## 0. 前提と現況
@@ -89,9 +96,11 @@ CLAUDE.md の状態欄同期規約（H8）に反する乖離を一括是正。�
 
 Phase 0 マージ後の main を実機で確認。テスト PLC の複数ポートを使う。
 
-- **P2-a**: 切替ウィザード UI の Windows 実機経路（Desktop→Service UI 操作・自動起動 UAC）。
-  [banto-hub-t16-design.md](banto-hub-t16-design.md)「切替ウィザード UI 実装メモ」で未検証と
-  記録された経路。
+- **P2-a（完了、2026-08-31/09-01 オーナー実機検証）**: 切替ウィザード UI の Windows 実機経路
+  （Desktop→Service UI 操作・自動起動 UAC・Service→Desktop 逆経路・UAC キャンセル時の異常系）。
+  [banto-hub-t16-design.md](banto-hub-t16-design.md)「切替ウィザード UI 実装メモ」で当時未検証と
+  記録されていた経路だが、実機で3層の不具合（remote origin ケイパビリティ・ACL 未宣言・管理 UI の
+  `/api/v1/*` 誤用）を発見・修正した上ですべて確認済み。
 - **P2-b**: profile 先行作成 → Desktop Hub 起動のフル E2E（[banto-hub-t17-design.md](banto-hub-t17-design.md)
   §12 の任意追加確認）。
 - **P2-c**: テスト PLC `192.168.11.200` の複数ポート（例 `3100`〜`3105`）で SLMP 収集を
@@ -133,10 +142,12 @@ Phase 0 マージ後の main を実機で確認。テスト PLC の複数ポー�
 
 ### 別途スケジュール（未着手スライス・オーナー起票判断）
 
-- T16-3（共通運転バー、依存 T18-1）、T18-2〜T18-5（初回導線／複製・一括・CSV／モニタ導線／
-  性能・出荷検証）。
+- T16-3（共通運転バー、依存 T18-1）は未着手のまま残る。T18-2〜T18-6（初回導線／複製・一括・
+  CSV／モニタ導線／性能・出荷検証／接続・グループ Drawer とツリー意匠）は
+  T18-5c/d（実機/soak・性能ハーネス基準機実行）を除き完了済み
+  （[banto-hub-t18-design.md](banto-hub-t18-design.md) 参照）。
 - NSIS インストーラからの `banto-hub-elev.exe` 呼び出し統合。
-- banto-tagclient SDK の**起票**（決定済み・未起票。リポジトリ issue 0 件）。
+- banto-tagclient SDK の実装（Issue #123 として起票済み・着手は SCADA 計画具体化と同時、v1.x）。
 
 ### 保留・オーナー決定（2026-08-12 に一部を決定）
 

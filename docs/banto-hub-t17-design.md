@@ -34,7 +34,11 @@ Windows 実機での`WindowsServiceManager`経路検証も未了）。**
 実装メモ」・§5。**同日 Windows 実機でトレイ開始/停止の完了待ちを確認済み**。**
 **2026-08-11: 切替ウィザード UI 実装済み**（`/status` カード＋シェル最小
 invoke。詳細は [banto-hub-t16-design.md](banto-hub-t16-design.md) §3
-「切替ウィザード UI 実装メモ」。Windows 実機の UI 経路は未検証）。
+「切替ウィザード UI 実装メモ」。Windows 実機の UI 経路は当時未検証）。
+**2026-09-01: 上記 UI 経路の Windows 実機検証完了**（Desktop→Service は
+2026-08-31、Service→Desktop 逆経路・自動起動トグルの UAC 昇格・UAC
+キャンセル時の異常系は 2026-09-01 にオーナーが実機確認、詳細は
+[banto-hub-t16-design.md](banto-hub-t16-design.md) §3）。
 T16-0（薄いシェル）・T16-1（トレイ状態表示）はマージ済みで本書の前提。
 T16-2（サービス検出・native fallback）第一スライスは本書 §4 の引き渡し
 契約（P5）に従い、T17-0/T17-3 が提供する API を消費する形で実装した
@@ -46,9 +50,11 @@ profile ACL 追加スライス（desktop-plan §11、`profile_acl.rs`・
 同日 Windows 実機で `grant-profile-acl`（UAC）による owner Modify 付与と
 書き込み復旧を確認済み（§12「Windows 実機検証」）。サービス先行作成→
 Desktop Hub 起動までのフル E2E は任意の追加確認として残す。**
-最終検証日(コード照合): 2026-08-10
+最終検証日(コード照合): 2026-09-01
 最終検証日(Windows 実機): 2026-08-10（§8・§10・§11・§12、管理者 Cursor +
-オーナー対話。Operators 非管理者委任・profile ACL 付与まで完了）
+オーナー対話。Operators 非管理者委任・profile ACL 付与まで完了）。
+切替ウィザード UI 経路は 2026-08-31/09-01 に別途実機検証完了（§3、
+[banto-hub-t16-design.md](banto-hub-t16-design.md) §3 参照）
 基準コミット: `7178493`（main、T17-3 マージ後 #118）。
 
 関連: [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)
@@ -240,7 +246,11 @@ T16-2 が満たすべき手順（desktop-plan §9.9 のフローそのもの）:
 - **サービス Security Descriptor（SDDL）への `BantoHub Operators`
   SID 付与の正確な API 呼び出し**（P3）: `SetServiceObjectSecurity` の
   引数構成、`windows-service`/`windows-sys` クレートでの表現方法は本書
-  では確定しない。要 Windows 実機スパイク。
+  では確定しない。要 Windows 実機スパイク。**解消（2026-08-10）**: §10
+  で `EXPLICIT_ACCESS_W` + `SetEntriesInAclW`（既存 ACE を壊さずマージ）→
+  `SetServiceObjectSecurity` として実装し（`service_elevated.rs`
+  `grant-service-acl`）、同日 Windows 実機で `sc sdshow` による確認・
+  再実行時の冪等性まで確認済み（§10「Windows 実機検証」表参照）。
 - **Operators グループ追加が既存ログオントークンに載らない**
   （desktop-plan §16.3 既指摘）: 再ログオン手順を受入シナリオに含める
   必要があるが、実際の遅延・挙動は実機確認が必要。
@@ -776,7 +786,9 @@ T16-2 実機検証（§3・本書 §10 参照）で発見した既知ギャッ�
   省略時は現在の対話ユーザー／既定 profile "default"）。root は
   `profile_paths::resolve_hub_root`（env `BANTO_HUB_ROOT`/`ProgramData`/
   `XDG_DATA_HOME`/`HOME`）で解決する。固定アクションは6→**7種類**に
-  増えた（`ElevatedAction::ALL_NAMES`）。
+  増えた（`ElevatedAction::ALL_NAMES`）。**2026-08-31 追記**: ロックダウン
+  回復用に `reset-password`・`revert-to-commissioning` が追加され、
+  現在は**9種類**（`apps/banto-hub/core/src/service_elevated.rs:199-209`）。
 - **`service-install`への配線**: `setup-operators`→`grant-service-acl`に
   続けて`grant-profile-acl(None, None)`（対話ユーザー・既定 profile）を
   実行するようにした - 新規インストール直後から、Desktop/Service
