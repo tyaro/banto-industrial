@@ -18,12 +18,18 @@ T16-2 第三スライス（openapi 応答への profile-id 埋め込み・
 §5 参照）- これで T16-2 第一スライスの既知の gap は全て解消済み。
 **切替ウィザード UI**（`/status` の Windows サービスカード＋シェル最小
 invoke・実`ShellDesktopControl`・自動起動 UAC）実装済み（下記 §3
-切替ウィザード実装メモ）。Windows 実機での Desktop→Service UI 経路は
+切替ウィザード実装メモ）。**2026-08-31: Windows 実機で検証し、実装時には
+見えていなかった3層の不具合（remote origin ケイパビリティ・ACL 未宣言・
+管理 UI の `/api/v1/*` 誤用）を発見・修正した上で Desktop→Service 切替の
+成功を確認済み**（下記 §3 切替ウィザード実機検証メモ）。**Service→Desktop
+の逆経路、自動起動トグルの UAC、UAC キャンセル時の挙動は依然として
 未検証。**
 最終検証日(コード照合): 2026-08-11
-最終検証日(Windows 実機): 2026-08-10（T16-2 シェル第一・第二スライス、
-Operators 対話ユーザー。トレイ開始/停止の`HostSwitchEngine`完了待ちを含む。
-切替ウィザード UI 経路は未検証）
+最終検証日(Windows 実機): 2026-08-31（切替ウィザード UI の Desktop→Service
+経路、下記 §3 切替ウィザード実機検証メモ）。T16-2 シェル第一・第二スライス
+自体は 2026-08-10 に検証済み（Operators 対話ユーザー、
+`HostSwitchEngine`完了待ちを含む）。**Service→Desktop 逆経路・自動起動
+トグルの UAC・UAC キャンセル時の挙動は未検証のまま。**
 基準コミット: `396e927`（main、T16-1 マージ後）。T16-1 の実装は本設計と
 同じ PR（`cursor/t16-1-tray-status-e3cb`、#101）で追加。
 
@@ -302,6 +308,39 @@ banto-hub-core --lib`（305 passed, 4 ignored）/ 影響する結合テスト
 >
 > 検証: コード照合時点では単体（ゲート vitest）・`cargo`/型チェックを実施。
 > **Windows 実機での Desktop→Service UI 経路・自動起動 UAC は未検証**。
+
+> **切替ウィザード実機検証メモ（2026-08-31）**: Windows 実機で `/status`
+> の Windows サービスカードから Desktop→Service 切替を検証したところ、
+> コード照合だけでは見えていなかった3層の不具合が続けて見つかった
+> （後から同じ罠を踏まないための記録）。
+>
+> 1. **リモートオリジンがケイパビリティ未許可**: このシェルは自分自身が
+>    配信する `http://127.0.0.1:{port}/` を `window.navigate` で読み込む
+>    設計だが、Tauri v2 の既定は `capabilities/default.json` に
+>    `remote.urls` が無いローカルアセット由来（`URL: local`）にしか
+>    `core:default`（invoke・`event.listen`）を許可しない。
+>    `remote.urls: ["http://127.0.0.1:*/*"]` を追加して解消した
+>    （`2539858`）。
+> 2. **自前コマンドが ACL 未宣言**: `generate_handler!` はランタイムの
+>    ディスパッチ登録に過ぎず ACL には現れない。tauri 2.11.5 の ACL
+>    マニフェストにアプリ自身のコマンド（`APP_ACL_KEY`）のエントリが
+>    無いと `host_switch_status not allowed. Plugin not found` を返す。
+>    `tauri-build` の `Attributes::app_manifest(AppManifest::commands)` で
+>    4コマンド（`host_switch_status`/`switch_to_service`/
+>    `switch_to_desktop`/`set_service_autostart`）を ACL へ宣言し、自動
+>    生成された `allow-<command>` permission を `capabilities/default.json`
+>    に追加して解消した（`db20794`）。
+> 3. **管理 UI の状態取得が `/api/v1/*` を使っていた**: `hubStatus.ts` が
+>    `/api/v1/status`・`/api/v1/values` を叩いており、これらは
+>    `require_tag_space_auth`（API キー認証）固定で試運転モードのバイパス
+>    対象外（tag-server-design.md §5.6「管理 UI と `/api/v1/*` の境界」
+>    参照）のため 401 になり、`hostSwitchGate.isPreflightOk` が構成
+>    revision の取得失敗で連鎖的に切替ゲートを閉じていた。管理系
+>    `GET /api/status`・`GET /api/values` を新設して解消した（`0c6c3e7`）。
+>
+> **確認できたのは Desktop→Service 切替の成功まで。** 逆経路
+> （Service→Desktop）、自動起動トグルの UAC、UAC キャンセル時の挙動は
+> **依然として未確認**であり、次回の実機セッションへ引き継ぐ。
 
 ## 4. T16-0 設計（P3）
 
