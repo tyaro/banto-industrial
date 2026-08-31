@@ -35,9 +35,9 @@
 //! 「ロックダウン」操作（[`CommissioningService::lock_down`]、
 //! `POST /api/commissioning/lock-down`・要 admin）でのみ試運転モード →
 //! ロックダウン済みへ移る。逆方向（[`revert_to_commissioning`]）は
-//! `banto-hub-elev.exe` 経由のみで、REST には一切公開しない - 本スライスは
-//! elev 側を実装しないため、この関数はまだどこからも呼ばれない（将来 elev
-//! に配線するための内部 API として先に用意しておく、実装指示のとおり）。
+//! `banto-hub-elev.exe` 経由のみで、REST には一切公開しない - 2026-08-31
+//! に`crate::service_elevated`の`revert-to-commissioning`アクション
+//! （`revert_to_commissioning_with_audit`）から配線済み。
 //!
 //! ## loopback 制約
 //!
@@ -258,10 +258,14 @@ impl CommissioningService {
     /// **REST では絶対に公開しないこと**（設計 §5.6「逆方向は
     /// `banto-hub-elev.exe` 経由でのみ可能とし、UI・REST からは解除
     /// できない」）- `crate::rest`にこれを呼ぶハンドラ/ルートを追加しては
-    /// いけない。本スライスでは `banto-hub-elev.exe`側の配線は行わない
-    /// （実装指示の範囲外）ため、この関数はまだどこからも呼ばれていない -
-    /// 将来 elev の新アクション（UAC 昇格必須）から DB パスを指定して
-    /// 呼び出す形を想定した、配線待ちの内部 API。
+    /// いけない。`banto-hub-elev.exe`は稼働中の Hub プロセスとは別プロセス
+    /// なので、この「実行中の`CommissioningService`を持つ」メソッド版を
+    /// 直接呼ぶことはできない - elev 側は代わりに自由関数版
+    /// [`revert_to_commissioning`]（DB プールだけを渡せる）を使う
+    /// （2026-08-31、`crate::service_elevated`から配線済み）。このメソッド版
+    /// はテストからのみ呼ばれる（本体は同じ処理を`CommissioningState`経由で
+    /// 行うだけなので、テストで実行中プロセスの状態遷移として検証する用途で
+    /// 残してある）。
     ///
     /// 呼び出し元は、戻した直後に「非 loopback バインドのままだと次回
     /// 起動が拒否される」（[`enforce_loopback_when_commissioning`]、設計
@@ -283,10 +287,11 @@ impl CommissioningService {
 /// 直接呼べるようにした自由関数版。
 ///
 /// **REST では絶対に公開しないこと**（[`CommissioningService::revert_to_commissioning`]
-/// のdoc comment参照）。本スライスでは elev 側の配線を行わないため未使用 -
-/// 将来 elev の新アクションから呼ばれる想定で先に用意しておく（実装指示
-/// 「状態を戻す内部 API/関数だけ用意しておく」）。
-#[allow(dead_code)]
+/// のdoc comment参照）。2026-08-31 に
+/// `crate::service_elevated::revert_to_commissioning_with_audit`
+/// （`ElevatedAction::RevertToCommissioning`＝`revert-to-commissioning`
+/// アクションの中核処理）から配線された - 対象 profile の DB を直接開いて
+/// この関数を呼び、直後に監査ログへ1行記録する（§5.6 制約4）。
 pub async fn revert_to_commissioning(pool: &sqlx::SqlitePool) -> Result<(), BantoError> {
     let settings = SettingsService::new(pool.clone());
     settings.set(KEY_LOCKED_DOWN, "false").await
