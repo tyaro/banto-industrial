@@ -1,6 +1,6 @@
 [package]
 name = "banto-tagclient"
-description = "S1b: read-only banto-hub REST catalog and values client with safe endpoint and secret boundaries"
+description = "Read-only banto-hub tag contracts, snapshots, and streaming client core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

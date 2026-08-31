@@ -1,6 +1,8 @@
 //! Hub-compatible read-only DTOs. Wire names intentionally follow the
 //! machine-facing snake_case contract.
 
+use std::fmt;
+
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize, Serializer};
 
@@ -240,6 +242,80 @@ pub struct ValuesSnapshot {
     pub run_id: Option<u64>,
     pub collection_mode: CollectionMode,
     pub values: Vec<ValueEntry>,
+}
+
+/// Public connection state for the future streaming client. A current value
+/// is only exposed while the state is `Live`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TagClientConnectionState {
+    Stopped,
+    Connecting,
+    Handshaking,
+    Live,
+    Rebinding,
+    Reconnecting,
+    Unauthorized,
+}
+
+impl fmt::Display for TagClientConnectionState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Stopped => "stopped",
+            Self::Connecting => "connecting",
+            Self::Handshaking => "handshaking",
+            Self::Live => "live",
+            Self::Rebinding => "rebinding",
+            Self::Reconnecting => "reconnecting",
+            Self::Unauthorized => "unauthorized",
+        };
+        f.write_str(name)
+    }
+}
+
+/// Current public state. Non-live states must not retain a current snapshot.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TagClientState {
+    state: TagClientConnectionState,
+    current: Option<ValuesSnapshot>,
+}
+
+#[allow(
+    dead_code,
+    reason = "TagClientState mutation is wired by the S2b worker slice"
+)]
+impl TagClientState {
+    pub(crate) const fn new(state: TagClientConnectionState) -> Self {
+        Self {
+            state,
+            current: None,
+        }
+    }
+
+    pub const fn connection_state(&self) -> TagClientConnectionState {
+        self.state
+    }
+
+    pub fn current(&self) -> Option<&ValuesSnapshot> {
+        self.current.as_ref()
+    }
+
+    pub(crate) fn transition(&mut self, state: TagClientConnectionState) {
+        self.state = state;
+        if state != TagClientConnectionState::Live {
+            self.current = None;
+        }
+    }
+
+    pub(crate) fn publish(&mut self, snapshot: ValuesSnapshot) {
+        self.state = TagClientConnectionState::Live;
+        self.current = Some(snapshot);
+    }
+}
+
+impl fmt::Display for TagClientState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.state.fmt(f)
+    }
 }
 
 #[cfg(test)]

@@ -1,9 +1,9 @@
 # banto-tagclient 設計
 
 作成日: 2026-08-29
-状態: **S1b完了、WebSocket/workerはS2/S3で未実装**。S1bでは、reqwestによる読み取り専用
-REST catalog/values transport、Authorization、redirect拒否、HTTPエラー分類を実装した。
-上位レビュー反映（2026-08-31）。S2/S3のWebSocket、worker、再接続、書き込みは未着手である。
+状態: **S2a完了、S2b/S3未完了**。S1bのREST catalog/values transportに加え、S2aでは
+Hub WS wire純粋解析、bounded pending map、latest-wins publish gate、非LIVE current抑止を実装した。
+実WebSocket transport、worker、再接続、shutdownはS2b/S3で未実装である（2026-08-31）。
 設計時参照baseline: `b9552627a86015b354b3c5651184fb108ba89e44`
 実API確認日: 2026-08-30（`apps/banto-hub/core/src/rest.rs` / `stream.rs`）
 
@@ -315,20 +315,22 @@ crate追加前に、次をレビューゲートとする。
 | disconnect/reconnect         | bounded backoff後、catalog/snapshotから接続を再構築する。                                         |
 | 401/403                      | `unauthorized`になり、高速無限再試行しない。                                                      |
 | malformed JSON               | `protocol_error`に分類し、secretを出さず回復経路へ入る。                                          |
-| invalid tag selection        | カンマを含む外部タグ名を通信前に`invalid_tag_selection`として拒否する。                              |
+| invalid tag selection        | カンマを含む外部タグ名を通信前に`invalid_tag_selection`として拒否する。                           |
 | backpressure/latest-wins     | 遅いconsumerでもqueueが無制限に増えず、最新値を観測できる。                                       |
 | shutdown                     | task、socket、channelが残留しない。                                                               |
 | secret redaction             | Debug/Display/エラー/ログへtokenやendpoint pathを出さない。                                       |
 
 ## 9. 実装sliceと完了条件
 
-| slice | 内容                                                           | 完了条件                                                                                                                                                                                  |
-| ----- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| S1a   | crate骨格、共通DTO、SecretApiKey、Endpoint、stable ID resolver | URL境界・redaction・metadata保持・unknown値保持・重複fail-closed・catalog resolveテストが通る。REST送信、Authorization、redirect処理は含めない。                                          |
-| S1b   | REST catalog/values transport、Authorization、redirect拒否     | reqwestによる読み取り専用GET、認証ヘッダ、redirectを追従しない設定、HTTPエラー分類のテストが通る。                                                                                        |
-| S2    | WS購読、latest snapshot、状態機械                              | WS先行接続、bounded pending map、handshake buffer latest-wins、older WS frame does not overwrite REST snapshot、race-free publish gate、on_change、backpressure/latest-winsテストが通る。 |
-| S3    | config_changed、rebinding/coalesce、再解決、再接続、shutdown   | snapshot後の通知取り逃しなし、revision/run metadata不一致retry、coalesced rebind、旧値無効化、401/403、切断復旧、残留なしテストが通る。                                                   |
-| S4    | workspace統合と互換性固定                                      | 依存レビュー、fmt/clippy/test、Hub互換commit/tagの記録が完了する。                                                                                                                        |
+| slice | 内容                                                           | 完了条件                                                                                                                                                        |
+| ----- | -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| S1a   | crate骨格、共通DTO、SecretApiKey、Endpoint、stable ID resolver | URL境界・redaction・metadata保持・unknown値保持・重複fail-closed・catalog resolveテストが通る。REST送信、Authorization、redirect処理は含めない。                |
+| S1b   | REST catalog/values transport、Authorization、redirect拒否     | reqwestによる読み取り専用GET、認証ヘッダ、redirectを追従しない設定、HTTPエラー分類のテストが通る。                                                              |
+| S2a   | WS wire解析、publish gate、latest snapshot、状態DTO            | malformed/unknown/id・tag拒否、bounded pending、handshake latest-wins、RESTとのtimestamp/sequence統合、metadata一致、非LIVE current抑止の純粋coreテストが通る。 |
+| S2b   | 実WebSocket購読、worker、latest snapshot配信                   | WS transport、on_change購読、worker/watch相当の配信、実接続のbackpressure/latest-winsテストが通る。                                                             |
+| S2    | WS購読、latest snapshot、状態機械                              | S2a/S2bの完了条件を満たし、WS先行接続からatomic publishまでの全テストが通る。                                                                                   |
+| S3    | config_changed、rebinding/coalesce、再解決、再接続、shutdown   | snapshot後の通知取り逃しなし、revision/run metadata不一致retry、coalesced rebind、旧値無効化、401/403、切断復旧、残留なしテストが通る。                         |
+| S4    | workspace統合と互換性固定                                      | 依存レビュー、fmt/clippy/test、Hub互換commit/tagの記録が完了する。                                                                                              |
 
 初版のDefinition of Doneは、全テスト表を自動化し、書き込み・PLC直結が存在せず、
 demoへの自動fallbackがなく、認証情報が全観測可能面からredactされ、停止後にworkerが
