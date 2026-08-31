@@ -17,18 +17,35 @@
  *    {@link nextGroupName}。採番ロジック自体は `plcConnectionForm.ts` の
  *    `nextConnectionName` と共通の {@link nextSequentialName}
  *    （`sequentialName.ts`）を使う。
+ *
+ * 修正1（実機で再現した不具合、2026-08-31 オーナー報告）: {@link nextGroupName}
+ * は既存レコード名に加えて `pendingNames`（pending queue 内の未適用の作成分
+ * の名前 - `pendingCreateNames.ts::pendingCreateNames` で抽出したもの）も
+ * 衝突候補として受け取れる。収集稼働中の作成は 202 でキューに入るだけで
+ * DB（＝ `existingNames`）には現れないため、`pendingNames` を見ないと
+ * 「稼働中に同じ Drawer を複数回開くと毎回同じ名前が提案され、後から一括
+ * 適用すると名前の一意制約で全滅する」（オーナーが実機で再現: 収集稼働中に
+ * 3回作成 → 3回とも `group1` が提案され全部衝突）。
  */
 import { nextSequentialName } from './sequentialName';
 import type { CollectionGroup, CollectionGroupInput } from './tagRegistryAdmin';
 
 /**
  * TAG-UX-8: 新規作成フォームの名前プリフィル。`prefix`（既定 `"group"`）に
- * 続く数字部分だけを見て、`existingNames` に含まれない最小の正整数を選ぶ
- * （挙動は `plcConnectionForm.ts::nextConnectionName` と同一 -
- * {@link nextSequentialName} を参照）。
+ * 続く数字部分だけを見て、`existingNames` と `pendingNames` の両方に
+ * 含まれない最小の正整数を選ぶ（挙動は `plcConnectionForm.ts::
+ * nextConnectionName` と同一 - {@link nextSequentialName} を参照）。
+ *
+ * `pendingNames` は既定 `[]`（省略可）- 呼び出し側が pending queue の
+ * 取得に失敗した場合や、まだ取得前の初期表示ではこの引数を省略して
+ * `existingNames` だけで採番してよい（モジュール doc comment の修正1参照）。
  */
-export function nextGroupName(existingNames: readonly string[], prefix = 'group'): string {
-	return nextSequentialName(existingNames, prefix);
+export function nextGroupName(
+	existingNames: readonly string[],
+	prefix = 'group',
+	pendingNames: readonly string[] = []
+): string {
+	return nextSequentialName([...existingNames, ...pendingNames], prefix);
 }
 
 /** 編集フォーム状態（作成/編集共通）。数値入力は文字列で保持し、空欄=未設定。 */

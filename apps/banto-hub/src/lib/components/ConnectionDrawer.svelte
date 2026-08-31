@@ -24,6 +24,21 @@
 	 * `$lib/banto/plcConnectionForm.ts` へ切り出し済み（そちらでユニット
 	 * テスト済み）。
 	 *
+	 * **連番プリフィルは pending queue も見る**（実機で再現した不具合の修正1、
+	 * 2026-08-31 オーナー報告 - `CollectionGroupDrawer.svelte` と同じ不具合が
+	 * PLC接続側にもあった）: 収集稼働中の作成は 202 でキューに入るだけで
+	 * DB（`existingNames`）には現れないため、既存レコードだけを見る連番採番
+	 * では稼働中に Drawer を複数回開くたびに同じ名前が提案され、後から
+	 * 一括適用すると名前の一意制約で全滅する。開いた直後は従来どおり
+	 * `existingNames` だけで即座に仮の名前を出しつつ、裏で
+	 * `listPendingChanges()`（admin 限定 API）を取得して pending 内の
+	 * 未適用の `plc_connections.create` 分（`pendingCreateNames.ts`）も
+	 * 候補に加え直す。ユーザーが名前欄を編集する前に取得が終われば
+	 * 差し替える（`provisionalName`）。**pending の取得に失敗（権限不足含む）
+	 * しても既存レコードだけでの採番のまま続行する**（プリフィルは利便性
+	 * 機能であり、これで作成自体を止めない）。詳細は
+	 * `CollectionGroupDrawer.svelte` の同名コメント参照。
+	 *
 	 * **202 (QueuedWhileRunningError, 収集稼働中のキュー投入) の扱い**
 	 * （実装指示5）: 失敗ではなく案内として `toastStore.push('info', ...)`
 	 * を使う（汎用エラーの `'error'` と区別する）。`tags/+page.svelte` は
@@ -37,6 +52,10 @@
 	import { isProviderError } from '@banto/admin-core';
 	import Drawer from './Drawer.svelte';
 	import { toastStore } from '$lib/toast.svelte';
+	import { isAdmin } from '$lib/permissions';
+	import { sessionStore } from '$lib/session.svelte';
+	import { listPendingChanges, type PendingChange } from '$lib/banto/pendingChangesAdmin';
+	import { pendingCreateNames } from '$lib/banto/pendingCreateNames';
 	import {
 		createPlcConnection,
 		deletePlcConnection,
@@ -57,6 +76,9 @@
 		nextConnectionName,
 		type PlcConnectionFormState
 	} from '$lib/banto/plcConnectionForm';
+
+	/** `pendingChangesAdmin.ts::PendingChange.source` - `rest.rs::plc_connections_create` が `queue_pending_registry_change` に渡す文字列と一致させる。 */
+	const PENDING_SOURCE = 'plc_connections.create';
 
 	interface Props {
 		open: boolean;
@@ -150,6 +172,15 @@
 	 */
 	let lastOpenKey: string | null = null;
 
+	/**
+	 * 修正1（実機で再現した不具合、2026-08-31 オーナー報告）: 新規作成フォームを
+	 * 開いた直後に `nextConnectionName(existingNames)` だけで即座に割り当てた
+	 * 「仮の」名前。pending queue 取得が完了した後、ユーザーがまだ名前欄を
+	 * 編集していなければ（`form.name === provisionalName`）pending も
+	 * 反映した名前へ差し替える。ユーザーが既に編集していれば上書きしない。
+	 */
+	let provisionalName: string | null = null;
+
 	$effect(() => {
 		if (!open) {
 			lastOpenKey = null;
@@ -161,10 +192,14 @@
 
 		if (connection) {
 			form = connectionToForm(connection);
+			provisionalName = null;
 		} else {
 			const blank = blankConnectionForm();
-			blank.name = nextConnectionName(existingNames);
+			const initialName = nextConnectionName(existingNames);
+			blank.name = initialName;
+			provisionalName = initialName;
 			form = blank;
+			void refinePendingNamePrefill(key);
 		}
 		errors = {};
 		testState = blankTestState();
@@ -177,6 +212,38 @@
 			void handleDelete();
 		}
 	});
+
+	/**
+	 * pending queue（`GET /api/pending-changes`、admin 限定）を取得し、
+	 * まだ適用されていない `plc_connections.create` の名前も連番プリフィル
+	 * の衝突候補に加えて `form.name` を差し替える。上の `$effect` からの
+	 * fire-and-forget 呼び出し専用（本体はモジュール doc comment の
+	 * 「連番プリフィルは pending queue も見る」参照 - `CollectionGroupDrawer.
+	 * svelte::refinePendingNamePrefill` と同じ実装）。
+	 *
+	 * - admin 以外は `/api/pending-changes` が 403（`RoleGuard` が
+	 *   `denied` を監査ログに記録する）になるだけなので、そもそも叩かない
+	 *   - editor での通常の作成操作のたびに監査ログを汚さないため。
+	 * - 取得に失敗しても（ネットワークエラー等）既存レコードだけの採番の
+	 *   まま続行する（プリフィルは利便性機能であり、これで作成自体は止めない）。
+	 * - Drawer が既に閉じられた／別の対象で開き直された（`openKey` が
+	 *   `lastOpenKey` と一致しない）場合は結果を捨てる。
+	 */
+	async function refinePendingNamePrefill(openKey: string): Promise<void> {
+		if (!isAdmin(sessionStore.role)) return;
+		let pending: PendingChange[];
+		try {
+			pending = await listPendingChanges();
+		} catch {
+			return;
+		}
+		if (lastOpenKey !== openKey) return;
+		const pendingNames = pendingCreateNames(pending, PENDING_SOURCE);
+		if (pendingNames.length === 0) return;
+		const refined = nextConnectionName(existingNames, 'connection', pendingNames);
+		if (form.name === provisionalName) form.name = refined;
+		provisionalName = refined;
+	}
 
 	function onProtocolChange(): void {
 		if (portTouched) return;

@@ -3772,10 +3772,36 @@ fn pending_apply_conflict_message(resource: &str) -> String {
     )
 }
 
+/// `BantoError` の `Display`（`thiserror` の `#[error(...)]`）は種別ごとの
+/// 定型文だけで、`Validation` は常に `"validation failed"` としか出ない。
+/// フィールド単位の理由（`field_errors`）が丸ごと落ちる。pending change の
+/// 失敗理由としてはこれでは「何が」失敗したのか分からない（実機で再現した
+/// 不具合の修正2、2026-08-31 オーナー報告: 収集稼働中に同じ名前で収集
+/// グループを3回作成し、3回とも適用時に `pending change の適用に失敗
+/// しました: validation failed` としか出ず、名前が重複していることに
+/// 気づけなかった）。`Validation` のときだけ `field_errors` を
+/// `"{field}: {message}"` の形へ展開する（該当する UI 入力欄の項目名と揃う。
+/// `ConnectionDrawer.svelte`/`CollectionGroupDrawer.svelte` の
+/// `applyFieldErrors` が読む `field`/`message` と同じペア）。それ以外の
+/// 種別は従来どおり `Display` に委ねる。
+fn banto_error_detail(err: &BantoError) -> String {
+    match err {
+        BantoError::Validation { field_errors } if !field_errors.is_empty() => field_errors
+            .iter()
+            .map(|fe| format!("{}: {}", fe.field, fe.message))
+            .collect::<Vec<_>>()
+            .join(", "),
+        other => other.to_string(),
+    }
+}
+
 impl PendingApplyError {
     fn reason(&self) -> String {
         match self {
-            Self::Api(err) => format!("pending change の適用に失敗しました: {}", err.0),
+            Self::Api(err) => format!(
+                "pending change の適用に失敗しました: {}",
+                banto_error_detail(&err.0)
+            ),
             Self::CollectionEditLocked(status) => {
                 format!("収集中は構成を編集できません(state={})", status.state)
             }
@@ -9076,6 +9102,126 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(updated.name, "line-fp-ok-renamed");
+    }
+
+    /// 実機で再現した不具合の修正2（2026-08-31 オーナー報告）: pending change
+    /// の適用が validation エラー（名前の重複）で失敗したとき、
+    /// `failure_reason` にフィールド単位の詳細（`name: 既に使用されています`）
+    /// が含まれることを確認する。修正前は `BantoError` の `Display`
+    /// （`thiserror`）が種別ごとの定型文だけ（`Validation` は常に
+    /// `"validation failed"`）だったため、`pending change の適用に失敗
+    /// しました: validation failed` としか出ず、何が失敗したのか分からな
+    /// かった - オーナーが収集稼働中に同じ名前（`group1`）で収集グループを
+    /// 3回作成し、3回とも適用が全滅した際にこれで気づけなかった。
+    #[tokio::test]
+    async fn pending_apply_collection_group_create_failure_reason_includes_field_detail() {
+        let env = test_env().await;
+
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line-dup-name-detail", "host": "127.0.0.1", "port": 15042 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+        let conn_id = conn["id"].as_i64().unwrap();
+
+        // 先に "group1" を普通に（収集停止中に）作成しておく - 既存レコード
+        // として DB に存在する状態を作る。
+        let (status, existing) = admin_post(
+            &env.router,
+            "/api/collection-groups",
+            &env.admin_token,
+            json!({ "name": "group1", "plcConnectionId": conn_id, "periodMs": 100 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{existing:?}");
+
+        let start = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/start")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        // 収集稼働中に同じ名前 "group1" で再度作成 → オーナーが実機で再現した
+        // 状況そのもの: 202 でキューに入るだけで、DB には現れない。
+        let queued = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection-groups")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "name": "group1", "plcConnectionId": conn_id, "periodMs": 100 })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued.status(), StatusCode::ACCEPTED);
+        let queued_bytes = axum::body::to_bytes(queued.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let queued_body: serde_json::Value = serde_json::from_slice(&queued_bytes).unwrap();
+        let pending_id = queued_body["pending"]["id"].as_i64().unwrap();
+
+        let stop = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/stop")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop.status(), StatusCode::OK);
+
+        // 適用すると "name" が重複しているため validation エラーで拒否される。
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{pending_id}/apply"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let pending = PendingChangesService::new(env.pool.clone())
+            .get(pending_id)
+            .await
+            .unwrap();
+        assert_eq!(pending.state, PendingChangeState::Failed);
+        let failure_reason = pending
+            .failure_reason
+            .expect("failure_reason should be set");
+        assert_ne!(
+            failure_reason, "pending change の適用に失敗しました: validation failed",
+            "failure_reason should include field-level detail, not just the generic BantoError Display: {failure_reason}"
+        );
+        assert!(
+            failure_reason.contains("name") && failure_reason.contains("既に使用されています"),
+            "failure_reason should say which field failed and why: {failure_reason}"
+        );
     }
 
     /// TAG-P0-3 follow-up（2026-08-12）: pending change を enqueue した後、
