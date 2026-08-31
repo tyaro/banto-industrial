@@ -1,10 +1,11 @@
 //! One connection-generation worker and bounded latest-state publication.
 //!
-//! The worker is crate-private and is intentionally not spawned here. S3a
-//! provides the public owner for task lifetime and explicit shutdown; S3b adds
-//! reconnect and rebinding.
+//! The attempt and supervisor are crate-private. S3a provides the public owner
+//! for task lifetime and explicit shutdown; S3b-1 adds sequential reconnect and
+//! backoff while rebinding remains in S3b-2.
 
 use tokio::sync::{oneshot, watch};
+use tokio::time::Duration;
 
 use crate::{
     binding::{resolve_bindings, BindingRequest},
@@ -13,6 +14,171 @@ use crate::{
     stream_core::{AcceptedWire, PublishGate},
     types::{TagClientConnectionState, TagClientState},
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BackoffConfig {
+    base: Duration,
+    max: Duration,
+}
+
+impl Default for BackoffConfig {
+    fn default() -> Self {
+        Self {
+            base: Duration::from_secs(1),
+            max: Duration::from_secs(30),
+        }
+    }
+}
+
+impl BackoffConfig {
+    #[cfg(test)]
+    pub(crate) const fn new(base: Duration, max: Duration) -> Self {
+        Self { base, max }
+    }
+
+    fn delay_for(self, retry_number: u32) -> Duration {
+        if self.max.is_zero() || self.base.is_zero() {
+            return Duration::ZERO;
+        }
+        let mut delay = if self.base < self.max {
+            self.base
+        } else {
+            self.max
+        };
+        let mut doublings = retry_number.saturating_sub(1);
+        while doublings > 0 && delay < self.max {
+            let Some(next) = delay.checked_mul(2) else {
+                return self.max;
+            };
+            if next >= self.max {
+                return self.max;
+            }
+            delay = next;
+            doublings -= 1;
+        }
+        delay
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RetryTracker {
+    next_retry_number: u32,
+}
+
+impl RetryTracker {
+    const fn new() -> Self {
+        Self {
+            next_retry_number: 1,
+        }
+    }
+
+    fn delay_after_failure(&mut self, backoff: BackoffConfig, was_live: bool) -> Duration {
+        if was_live {
+            self.next_retry_number = 1;
+        }
+        let delay = backoff.delay_for(self.next_retry_number);
+        self.next_retry_number = self.next_retry_number.saturating_add(1);
+        delay
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AttemptFailure {
+    error: Error,
+    was_live: bool,
+}
+
+pub(crate) async fn run_supervisor(
+    rest: &RestClient,
+    requests: &[BindingRequest],
+    subscription_id: i64,
+    state_tx: &watch::Sender<TagClientState>,
+    stop: oneshot::Receiver<()>,
+) -> Result<()> {
+    run_supervisor_with_config(
+        rest,
+        requests,
+        subscription_id,
+        state_tx,
+        stop,
+        BackoffConfig::default(),
+    )
+    .await
+}
+
+pub(crate) async fn run_supervisor_with_config(
+    rest: &RestClient,
+    requests: &[BindingRequest],
+    subscription_id: i64,
+    state_tx: &watch::Sender<TagClientState>,
+    mut stop: oneshot::Receiver<()>,
+    backoff: BackoffConfig,
+) -> Result<()> {
+    let mut retry_tracker = RetryTracker::new();
+    loop {
+        let attempt = run_attempt(rest, requests, subscription_id, state_tx, &mut stop).await;
+        let failure = match attempt {
+            Ok(()) => {
+                state_tx.send_replace(TagClientState::new(TagClientConnectionState::Stopped));
+                return Ok(());
+            }
+            Err(failure) => failure,
+        };
+        let error = failure.error;
+        if error.kind() == ErrorKind::Stopped {
+            state_tx.send_replace(TagClientState::new(TagClientConnectionState::Stopped));
+            return Ok(());
+        }
+        if error.kind() == ErrorKind::Unauthorized {
+            state_tx.send_replace(TagClientState::unauthorized());
+            return Err(error);
+        }
+        if !is_retryable(error.kind()) {
+            let mut state = TagClientState::new(TagClientConnectionState::Stopped);
+            state.fail(error.kind());
+            state_tx.send_replace(state);
+            return Err(error);
+        }
+        state_tx.send_replace(TagClientState::reconnecting(error.kind()));
+        let delay = retry_tracker.delay_after_failure(backoff, failure.was_live);
+        tokio::select! {
+            biased;
+            _ = &mut stop => {
+                state_tx.send_replace(TagClientState::new(TagClientConnectionState::Stopped));
+                return Ok(());
+            }
+            _ = tokio::time::sleep(delay) => {}
+        }
+    }
+}
+
+fn is_retryable(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::Transport | ErrorKind::ProtocolError | ErrorKind::CatalogUnavailable
+    )
+}
+
+async fn run_attempt(
+    rest: &RestClient,
+    requests: &[BindingRequest],
+    subscription_id: i64,
+    state_tx: &watch::Sender<TagClientState>,
+    stop: &mut oneshot::Receiver<()>,
+) -> std::result::Result<(), AttemptFailure> {
+    state_tx.send_replace(TagClientState::new(TagClientConnectionState::Connecting));
+    let mut was_live = false;
+    run_generation_inner(
+        rest,
+        requests,
+        subscription_id,
+        state_tx,
+        stop,
+        &mut was_live,
+    )
+    .await
+    .map_err(|error| AttemptFailure { error, was_live })
+}
 
 /// Run exactly one connection generation. No task is spawned and no retry is
 /// attempted; any failure clears current and returns its stable error kind.
@@ -27,22 +193,20 @@ pub(crate) async fn run_generation(
     state_tx: &watch::Sender<TagClientState>,
     mut stop: oneshot::Receiver<()>,
 ) -> Result<()> {
-    state_tx.send_replace(TagClientState::new(TagClientConnectionState::Connecting));
-    let result = run_generation_inner(rest, requests, subscription_id, state_tx, &mut stop).await;
-    match result {
+    match run_attempt(rest, requests, subscription_id, state_tx, &mut stop).await {
         Ok(()) => {
             state_tx.send_replace(TagClientState::new(TagClientConnectionState::Stopped));
             Ok(())
         }
-        Err(error) if error.kind() == ErrorKind::Stopped => {
+        Err(failure) if failure.error.kind() == ErrorKind::Stopped => {
             state_tx.send_replace(TagClientState::new(TagClientConnectionState::Stopped));
             Ok(())
         }
-        Err(error) => {
+        Err(failure) => {
             let mut state = TagClientState::new(TagClientConnectionState::Stopped);
-            state.fail(error.kind());
+            state.fail(failure.error.kind());
             state_tx.send_replace(state);
-            Err(error)
+            Err(failure.error)
         }
     }
 }
@@ -53,6 +217,7 @@ async fn run_generation_inner(
     subscription_id: i64,
     state_tx: &watch::Sender<TagClientState>,
     stop: &mut oneshot::Receiver<()>,
+    was_live: &mut bool,
 ) -> Result<()> {
     if requests.is_empty() {
         return Err(Error::new(ErrorKind::InvalidTagSelection));
@@ -118,7 +283,7 @@ async fn run_generation_inner(
         }
     };
     gate.record_rest_snapshot(rest_snapshot)?;
-    publish_snapshot(&gate, &catalog, state_tx)?;
+    publish_snapshot(&gate, &catalog, state_tx, was_live)?;
 
     loop {
         let text = tokio::select! {
@@ -130,7 +295,7 @@ async fn run_generation_inner(
             result = connection.receive_text() => result?,
         };
         if gate.accept_wire(&text)? == AcceptedWire::Data {
-            publish_snapshot(&gate, &catalog, state_tx)?;
+            publish_snapshot(&gate, &catalog, state_tx, was_live)?;
         }
     }
 }
@@ -139,11 +304,13 @@ fn publish_snapshot(
     gate: &PublishGate,
     catalog: &crate::types::CatalogSnapshot,
     state_tx: &watch::Sender<TagClientState>,
+    was_live: &mut bool,
 ) -> Result<()> {
     let snapshot = gate.finalize(catalog)?;
     let mut state = TagClientState::new(TagClientConnectionState::Stopped);
     state.publish(snapshot);
     state_tx.send_replace(state);
+    *was_live = true;
     Ok(())
 }
 
@@ -256,6 +423,37 @@ mod tests {
             SecretApiKey::new("test-token".into()).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn backoff_is_exponential_capped_and_overflow_safe() {
+        let backoff = BackoffConfig::default();
+        assert_eq!(backoff.delay_for(1), Duration::from_secs(1));
+        assert_eq!(backoff.delay_for(2), Duration::from_secs(2));
+        assert_eq!(backoff.delay_for(3), Duration::from_secs(4));
+        assert_eq!(backoff.delay_for(4), Duration::from_secs(8));
+        assert_eq!(backoff.delay_for(5), Duration::from_secs(16));
+        assert_eq!(backoff.delay_for(6), Duration::from_secs(30));
+        assert_eq!(backoff.delay_for(100), Duration::from_secs(30));
+        assert_eq!(backoff.delay_for(u32::MAX), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn live_failure_resets_retry_delay_to_the_base() {
+        let backoff = BackoffConfig::new(Duration::from_secs(1), Duration::from_secs(30));
+        let mut tracker = RetryTracker::new();
+        assert_eq!(
+            tracker.delay_after_failure(backoff, false),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            tracker.delay_after_failure(backoff, false),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            tracker.delay_after_failure(backoff, true),
+            Duration::from_secs(1)
+        );
     }
 
     #[tokio::test]

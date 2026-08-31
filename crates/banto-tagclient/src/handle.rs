@@ -1,7 +1,7 @@
 //! Public owner for one banto-hub connection generation.
 //!
-//! This slice owns the worker task and exposes only a cloned state snapshot or
-//! watch receiver. Reconnect, rebinding, and restart remain an S3b concern.
+//! This slice owns the supervisor task and exposes only a cloned state snapshot
+//! or watch receiver. Rebinding and restart remain an S3b-2 concern.
 
 use std::collections::HashSet;
 
@@ -36,13 +36,53 @@ pub struct TagClientHandle {
 
 impl TagClientHandle {
     pub(crate) fn spawn(rest: RestClient, requests: Vec<BindingRequest>, runtime: Handle) -> Self {
+        Self::spawn_inner(rest, requests, runtime, None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_with_backoff(
+        rest: RestClient,
+        requests: Vec<BindingRequest>,
+        runtime: Handle,
+        backoff: worker::BackoffConfig,
+    ) -> Self {
+        Self::spawn_inner(rest, requests, runtime, Some(backoff))
+    }
+
+    fn spawn_inner(
+        rest: RestClient,
+        requests: Vec<BindingRequest>,
+        runtime: Handle,
+        backoff: Option<worker::BackoffConfig>,
+    ) -> Self {
         let (stop_tx, stop_rx) = oneshot::channel();
         let initial = TagClientState::new(TagClientConnectionState::Stopped);
         let (state_tx, state_rx) = watch::channel(initial);
         let worker_state_tx = state_tx.clone();
         let task = runtime.spawn(async move {
-            worker::run_generation(&rest, &requests, SUBSCRIPTION_ID, &worker_state_tx, stop_rx)
-                .await
+            match backoff {
+                Some(backoff) => {
+                    worker::run_supervisor_with_config(
+                        &rest,
+                        &requests,
+                        SUBSCRIPTION_ID,
+                        &worker_state_tx,
+                        stop_rx,
+                        backoff,
+                    )
+                    .await
+                }
+                None => {
+                    worker::run_supervisor(
+                        &rest,
+                        &requests,
+                        SUBSCRIPTION_ID,
+                        &worker_state_tx,
+                        stop_rx,
+                    )
+                    .await
+                }
+            }
         });
         Self {
             stop_tx: Some(stop_tx),
@@ -225,6 +265,146 @@ mod tests {
         stream.write_all(response.as_bytes()).await.unwrap();
     }
 
+    #[derive(Clone, Copy)]
+    enum RetryCause {
+        Transport,
+        Protocol,
+        CatalogUnavailable,
+    }
+
+    async fn serve_retry_to_live(
+        listener: TcpListener,
+        first_failure: RetryCause,
+        live: oneshot::Sender<()>,
+        release: oneshot::Receiver<()>,
+    ) {
+        match first_failure {
+            RetryCause::Transport => {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_http_request(&mut stream).await;
+            }
+            RetryCause::CatalogUnavailable => {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_http_request(&mut stream).await;
+                write_response(&mut stream, "503 Service Unavailable", String::new()).await;
+            }
+            RetryCause::Protocol => {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_http_request(&mut stream).await;
+                write_response(
+                    &mut stream,
+                    "200 OK",
+                    serde_json::to_string(&catalog()).unwrap(),
+                )
+                .await;
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(1), socket.next())
+                    .await
+                    .unwrap();
+                socket.send(Message::Text("not-json".into())).await.unwrap();
+            }
+        }
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_http_request(&mut stream).await;
+        write_response(
+            &mut stream,
+            "200 OK",
+            serde_json::to_string(&catalog()).unwrap(),
+        )
+        .await;
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        let subscription = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(subscription, Message::Text(_)));
+        socket
+            .send(Message::Text(
+                r#"{"op":"data","id":1,"t":1,"values":[{"tag":"alpha","v":1,"q":"good","t":1}]}"#
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_http_request(&mut stream).await;
+        write_response(
+            &mut stream,
+            "200 OK",
+            serde_json::to_string(&values()).unwrap(),
+        )
+        .await;
+        live.send(()).unwrap();
+        let _ = release.await;
+    }
+
+    async fn serve_first_transport_and_check_no_retry(
+        listener: TcpListener,
+        second_connection: oneshot::Sender<bool>,
+    ) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_http_request(&mut stream).await;
+        drop(stream);
+        let connected = tokio::time::timeout(Duration::from_millis(150), listener.accept())
+            .await
+            .is_ok();
+        let _ = second_connection.send(connected);
+    }
+
+    async fn serve_unauthorized_and_check_no_retry(
+        listener: TcpListener,
+        status: &'static str,
+        second_connection: oneshot::Sender<bool>,
+    ) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_http_request(&mut stream).await;
+        write_response(&mut stream, status, String::new()).await;
+        let connected = tokio::time::timeout(Duration::from_millis(150), listener.accept())
+            .await
+            .is_ok();
+        let _ = second_connection.send(connected);
+    }
+
+    async fn serve_success(listener: &TcpListener) -> WebSocketStream<TcpStream> {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_http_request(&mut stream).await;
+        write_response(
+            &mut stream,
+            "200 OK",
+            serde_json::to_string(&catalog()).unwrap(),
+        )
+        .await;
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        let subscription = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(subscription, Message::Text(_)));
+        socket
+            .send(Message::Text(
+                r#"{"op":"data","id":1,"t":1,"values":[{"tag":"alpha","v":1,"q":"good","t":1}]}"#
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_http_request(&mut stream).await;
+        write_response(
+            &mut stream,
+            "200 OK",
+            serde_json::to_string(&values()).unwrap(),
+        )
+        .await;
+        socket
+    }
+
     async fn observe_graceful_close(
         mut socket: WebSocketStream<TcpStream>,
         close_seen: oneshot::Sender<bool>,
@@ -392,6 +572,24 @@ mod tests {
         .unwrap();
     }
 
+    async fn wait_reconnecting(receiver: &mut watch::Receiver<TagClientState>, kind: ErrorKind) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state = receiver.borrow();
+                if state.connection_state() == TagClientConnectionState::Reconnecting
+                    && state.last_error() == Some(kind)
+                    && state.current().is_none()
+                {
+                    return;
+                }
+                drop(state);
+                receiver.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn join_panic_is_classified_without_source_details() {
         let task = tokio::spawn(async { panic!("test panic") });
@@ -446,6 +644,192 @@ mod tests {
         let watched = handle.state_watch();
         assert_eq!(watched.borrow().last_error(), None);
         drop(handle);
+    }
+
+    async fn assert_retry_recovers(first_failure: RetryCause, error: ErrorKind) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (live_tx, live_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_retry_to_live(
+            listener,
+            first_failure,
+            live_tx,
+            release_rx,
+        ));
+        let handle = TagClientHandle::spawn_with_backoff(
+            client(address),
+            vec![request("alpha", StableTagId::new(1, 1, 1))],
+            Handle::current(),
+            worker::BackoffConfig::new(Duration::from_millis(5), Duration::from_millis(20)),
+        );
+        let mut receiver = handle.state_watch();
+        wait_reconnecting(&mut receiver, error).await;
+        live_rx.await.unwrap();
+        wait_live(&mut receiver).await;
+        assert!(receiver.borrow().current().is_some());
+        release_tx.send(()).unwrap();
+        wait_reconnecting(&mut receiver, ErrorKind::Transport).await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transport_failure_reconnects_from_catalog() {
+        assert_retry_recovers(RetryCause::Transport, ErrorKind::Transport).await;
+    }
+
+    #[tokio::test]
+    async fn protocol_failure_reconnects_from_catalog() {
+        assert_retry_recovers(RetryCause::Protocol, ErrorKind::ProtocolError).await;
+    }
+
+    #[tokio::test]
+    async fn catalog_failure_reconnects_from_catalog() {
+        assert_retry_recovers(
+            RetryCause::CatalogUnavailable,
+            ErrorKind::CatalogUnavailable,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn live_disconnect_restarts_catalog_and_returns_live() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (first_live_tx, first_live_rx) = oneshot::channel();
+        let (drop_first_tx, drop_first_rx) = oneshot::channel();
+        let (second_live_tx, second_live_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let first_socket = serve_success(&listener).await;
+            first_live_tx.send(()).unwrap();
+            drop_first_rx.await.unwrap();
+            drop(first_socket);
+            let second_socket = serve_success(&listener).await;
+            second_live_tx.send(()).unwrap();
+            let _ = release_rx.await;
+            drop(second_socket);
+        });
+        let handle = TagClientHandle::spawn_with_backoff(
+            client(address),
+            vec![request("alpha", StableTagId::new(1, 1, 1))],
+            Handle::current(),
+            worker::BackoffConfig::new(Duration::from_millis(5), Duration::from_millis(20)),
+        );
+        let mut receiver = handle.state_watch();
+        first_live_rx.await.unwrap();
+        wait_live(&mut receiver).await;
+        drop_first_tx.send(()).unwrap();
+        wait_reconnecting(&mut receiver, ErrorKind::Transport).await;
+        second_live_rx.await.unwrap();
+        wait_live(&mut receiver).await;
+        assert!(receiver.borrow().current().is_some());
+        release_tx.send(()).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_backoff_stops_without_an_extra_attempt() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (second_tx, second_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_first_transport_and_check_no_retry(
+            listener, second_tx,
+        ));
+        let handle = TagClientHandle::spawn_with_backoff(
+            client(address),
+            vec![request("alpha", StableTagId::new(1, 1, 1))],
+            Handle::current(),
+            worker::BackoffConfig::new(Duration::from_secs(1), Duration::from_secs(30)),
+        );
+        let mut receiver = handle.state_watch();
+        wait_reconnecting(&mut receiver, ErrorKind::Transport).await;
+        let result = tokio::time::timeout(Duration::from_millis(200), handle.shutdown())
+            .await
+            .unwrap();
+        assert!(result.is_ok());
+        assert_eq!(receiver.borrow().current(), None);
+        assert_eq!(receiver.borrow().last_error(), None);
+        assert!(!second_rx.await.unwrap());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drop_during_backoff_clears_state_without_an_extra_attempt() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (second_tx, second_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_first_transport_and_check_no_retry(
+            listener, second_tx,
+        ));
+        let handle = TagClientHandle::spawn_with_backoff(
+            client(address),
+            vec![request("alpha", StableTagId::new(1, 1, 1))],
+            Handle::current(),
+            worker::BackoffConfig::new(Duration::from_secs(1), Duration::from_secs(30)),
+        );
+        let mut receiver = handle.state_watch();
+        wait_reconnecting(&mut receiver, ErrorKind::Transport).await;
+        drop(handle);
+        tokio::time::timeout(Duration::from_millis(200), receiver.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            receiver.borrow().connection_state(),
+            TagClientConnectionState::Stopped
+        );
+        assert_eq!(receiver.borrow().current(), None);
+        assert_eq!(receiver.borrow().last_error(), None);
+        assert!(!second_rx.await.unwrap());
+        server.await.unwrap();
+    }
+
+    async fn assert_unauthorized_does_not_retry(status: &'static str) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (second_tx, second_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_unauthorized_and_check_no_retry(
+            listener, status, second_tx,
+        ));
+        let handle = client(address)
+            .start(vec![request("alpha", StableTagId::new(1, 1, 1))])
+            .unwrap();
+        let mut receiver = handle.state_watch();
+        wait_failed(&mut receiver, ErrorKind::Unauthorized).await;
+        assert_eq!(
+            receiver.borrow().connection_state(),
+            TagClientConnectionState::Unauthorized
+        );
+        assert_eq!(receiver.borrow().current(), None);
+        assert_eq!(
+            receiver.borrow().last_error(),
+            Some(ErrorKind::Unauthorized)
+        );
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
+            .await
+            .unwrap();
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::Unauthorized);
+        assert!(!second_rx.await.unwrap());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unauthorized_401_and_403_are_single_attempt_terminal_failures() {
+        assert_unauthorized_does_not_retry("401 Unauthorized").await;
+        assert_unauthorized_does_not_retry("403 Forbidden").await;
     }
 
     #[tokio::test]

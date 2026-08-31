@@ -305,6 +305,22 @@ impl TagClientState {
         self.last_error
     }
 
+    pub(crate) const fn reconnecting(error: crate::error::ErrorKind) -> Self {
+        Self {
+            state: TagClientConnectionState::Reconnecting,
+            current: None,
+            last_error: Some(error),
+        }
+    }
+
+    pub(crate) const fn unauthorized() -> Self {
+        Self {
+            state: TagClientConnectionState::Unauthorized,
+            current: None,
+            last_error: Some(crate::error::ErrorKind::Unauthorized),
+        }
+    }
+
     pub(crate) fn transition(&mut self, state: TagClientConnectionState) {
         self.state = state;
         self.last_error = None;
