@@ -3,17 +3,19 @@
 作成日: 2026-08-08
 状態: **進行中(Phase 1 = PR #58、Phase 2 = PR #59/#73、Phase 3 = H10 ①②③ を PR #74/#75 でマージ済み)**。
 H1〜H4・H6・H8・H10 完了、H5 は vitest 導入 + banto-hub の Playwright E2E
-(`e2e:banto-hub`、CI 組込済み)まで完了。
+(`e2e:banto-hub`、CI 組込済み)に加え、relay-wright の組み込みサーバーモード E2E
+(`e2e:relay-wright`、CI 組込済み)も完了(2026-08-30、PR #193)。Tauri 固有経路
+(`invoke()`分岐・`banto://event`・vibrancy 等)の E2E は WebDriver(tauri-driver)
+課題として H5 のスコープ外へ分離済み。
 H7 は ⑤ フレーク安定化 4 件(A.1/A.3/A.4/A.5)+ ②③④ 堅牢性テスト(crash 再オープン・DST・
 read-while-write)+ A.2 決定化 + ④ TsQuery ギャップ修正を 2026-08-09 に対応。
 H9 は SLMP 構造化エラー(文言パース完全削除)を 2026-08-12 に対応済み、
 transport 共通化(broker/plc/plc-write の SLMP dial 重複統合)も
 `banto_plc::dial_slmp` への集約で完了(2026-08-14)。`classify_slmp_error`
 の重複統合も `banto_plc::SlmpErrorClass`/`classify_slmp` への集約で
-2026-08-14 に完了し、H9 は完全完了(残スライスなし)。残りは H7 の
-① 実機 soak・H5 の relay-wright 分 E2E(2026-08-30 に受け入れ範囲を引き直し。組み込みサーバーモードを Playwright で対応中、Tauri 固有経路は WebDriver 課題として分離。Phase 4
-相当/環境依存)。
-最終検証日(コード照合): 2026-08-14
+2026-08-14 に完了し、H9 は完全完了(残スライスなし)。**残りは H7 の
+① 実機 soak のみ**(H5 は上記のとおり完了)。
+最終検証日(コード照合): 2026-09-01
 
 ## 0. 背景と位置づけ
 
@@ -49,18 +51,18 @@ transport 共通化(broker/plc/plc-write の SLMP dial 重複統合)も
 
 ## 2. 改善項目一覧(優先順)
 
-| ID  | 内容                                                     | 優先度 | 規模 | 状態                                                                                                       |
-| --- | -------------------------------------------------------- | ------ | ---- | ---------------------------------------------------------------------------------------------------------- |
-| H1  | banto-expr の式長・ネスト深さ上限(DoS 根治)              | 最高   | 小   | 完了(#58/#59)                                                                                              |
-| H2  | 手動書き込み(タグモニタ)の安全意味論                     | 最高   | 中   | 完了(#58)                                                                                                  |
-| H3  | banto-hub gRPC の bind 設定化(既定 127.0.0.1)            | 高     | 中   | 完了(#58)                                                                                                  |
-| H4  | 収集タイムスタンプ逆行対策 + append 失敗の可視化         | 高     | 中   | 完了(#58)                                                                                                  |
-| H5  | フロントテスト基盤(vitest)+ hub/relay-wright E2E         | 高     | 大   | vitest・hub E2E 完了、relay-wright は組み込みサーバーモードで対応中(2026-08-30 範囲引き直し)               |
-| H6  | サプライチェーン/再現性(deny・audit・toolchain 固定ほか) | 高     | 中   | 完了(#59)                                                                                                  |
-| H7  | ソーク実行・障害系テスト(crash 再オープン・DST・並行)    | 中     | 大   | ⑤+②③④+A.2完了・残 ①                                                                                        |
-| H8  | ドキュメント整合(状態ヘッダ・README・状態欄義務化)       | 中     | 小   | 完了(#58/#59)                                                                                              |
-| H9  | SLMP 構造化エラー(fork/upstream)+ transport 共通化       | 中     | 大   | 完了(構造化エラー2026-08-12・transport共通化2026-08-14・classify_slmp_error統合2026-08-14。残スライスなし) |
-| H10 | 認可の細粒度化(キー有効期限・read スコープ・arm 失効)    | 中     | 中   | 完了(#74/#75)                                                                                              |
+| ID  | 内容                                                     | 優先度 | 規模 | 状態                                                                                                         |
+| --- | -------------------------------------------------------- | ------ | ---- | ------------------------------------------------------------------------------------------------------------ |
+| H1  | banto-expr の式長・ネスト深さ上限(DoS 根治)              | 最高   | 小   | 完了(#58/#59)                                                                                                |
+| H2  | 手動書き込み(タグモニタ)の安全意味論                     | 最高   | 中   | 完了(#58)                                                                                                    |
+| H3  | banto-hub gRPC の bind 設定化(既定 127.0.0.1)            | 高     | 中   | 完了(#58)                                                                                                    |
+| H4  | 収集タイムスタンプ逆行対策 + append 失敗の可視化         | 高     | 中   | 完了(#58)                                                                                                    |
+| H5  | フロントテスト基盤(vitest)+ hub/relay-wright E2E         | 高     | 大   | 完了(vitest・hub E2E・relay-wright 組み込みサーバーモード E2E。2026-08-30 に受け入れ範囲を引き直し、PR #193) |
+| H6  | サプライチェーン/再現性(deny・audit・toolchain 固定ほか) | 高     | 中   | 完了(#59)                                                                                                    |
+| H7  | ソーク実行・障害系テスト(crash 再オープン・DST・並行)    | 中     | 大   | ⑤+②③④+A.2完了・残 ①                                                                                          |
+| H8  | ドキュメント整合(状態ヘッダ・README・状態欄義務化)       | 中     | 小   | 完了(#58/#59)                                                                                                |
+| H9  | SLMP 構造化エラー(fork/upstream)+ transport 共通化       | 中     | 大   | 完了(構造化エラー2026-08-12・transport共通化2026-08-14・classify_slmp_error統合2026-08-14。残スライスなし)   |
+| H10 | 認可の細粒度化(キー有効期限・read スコープ・arm 失効)    | 中     | 中   | 完了(#74/#75)                                                                                                |
 
 ## 3. 各項目の詳細
 
@@ -217,7 +219,7 @@ transport 共通化(broker/plc/plc-write の SLMP dial 重複統合)も
 - **残件(観察)**: 連続失敗回数のリアルタイム外部公開(status API)は
   未実装(イベント detail と ログのみ)。必要になれば追加
 
-### H5: フロントテスト基盤 + E2E 拡充 — 状態: vitest 導入完了(2026-08-08)・banto-hub の Playwright E2E 完了。relay-wright は組み込みサーバーモードの E2E で対応中(2026-08-30 に受け入れ範囲を引き直し。Tauri 固有経路は WebDriver 課題として分離)
+### H5: フロントテスト基盤 + E2E 拡充 — 状態: 完了。vitest 導入(2026-08-08)・banto-hub の Playwright E2E・relay-wright の組み込みサーバーモード E2E(2026-08-30 に受け入れ範囲を引き直した上で完了、PR #193)。Tauri 固有経路は WebDriver 課題として H5 のスコープ外へ分離
 
 - **事実**: フロントエンドのユニットテストは 0 本。CI の Test ステップは
   `--if-present` で全パッケージがスキップされる no-op。Playwright E2E は
@@ -271,7 +273,12 @@ transport 共通化(broker/plc/plc-write の SLMP dial 重複統合)も
   その後 T18-5b(#151)・T18-3e(#152) で tags-bulk/continuous-radix/csv/
   duplicate/monitor-tree/onboarding-cta/cell-edit を追加し、2026-08-14 時点で
   計 17 spec(ほかに opt-in の性能計測 spec が別 config に 1 本、#154)
-- **残り(Phase 4)**: relay-wright の E2E(Tauri 依存で WebDriver 検討要)
+- **実施記録(relay-wright E2E、2026-08-30、PR #193)**: 受け入れ範囲の引き直し
+  （下記参照）を経て、`e2e/relay-wright.playwright.config.ts` +
+  `pnpm e2e:relay-wright` を追加し CI に組込済み。`e2e/tests-relay-wright/
+relay-wright-smoke.spec.ts` で初回セットアップ→ログイン/ログアウト→
+  PLC 接続 REST CRUD(リロード後の永続確認込み)を実装。H5 は完了(残るのは
+  Tauri 固有経路の E2E で、下記のとおり H5 のスコープ外・別課題)
 
 ### H6: サプライチェーン/再現性 — 状態: 完了(2026-08-08、#59)
 
@@ -519,7 +526,10 @@ Self` で自分の語彙へ写すだけにした。両クレートの
   - CI test 実効化、H1 残件(dag.rs 反復化)、H8 残り
 - **Phase 3(PR #74/#75、2026-08-08 マージ済み)**: H10 ①任意期限+警告・
   ②arm 時限失効(#74)、③read スコープのタグ単位化(案 B、#75)
-- **Phase 4(環境・実時間依存)**: H5 の relay-wright 分 E2E、H7 の soak 実行。
+- **Phase 4(環境・実時間依存)**: H5 の relay-wright 分 E2E は 2026-08-30 に
+  受け入れ範囲を「組み込みサーバーモードの E2E」へ引き直した上で完了
+  (PR #193。Tauri 固有経路は WebDriver 課題として分離し Phase 4 の対象外へ)。
+  **残るは H7 の soak 実行のみ**。
   H9 は SLMP 構造化エラー(文言パース完全削除)を 2026-08-12、transport
   共通化(`dial_slmp` への集約)と `classify_slmp_error` 統合
   (`SlmpErrorClass`/`classify_slmp` への集約)を 2026-08-14 にそれぞれ別
