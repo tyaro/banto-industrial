@@ -1,9 +1,15 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capabilities for the main window - chronogazer と同様 core:default。切替ウィザードの invoke は generate_handler 登録のみ（運転 API の invoke は追加しない）。T16（2026-08-30、実機検証で発覚）: このシェルは自分自身が配信する UI を `window.navigate` で読み込む設計であり（`src/lib.rs` の crate doc 冒頭、`navigate_to_hub`/`resolve_navigate_host` 参照）、Tauri v2 の既定ではローカルアセット由来（URL: local）の origin にしか `core:default`（invoke・event.listen 等）を許可しないため、navigate 後の webview からは切替ウィザードの4コマンド（host_switch_status/switch_to_service/switch_to_desktop/set_service_autostart）が呼べず機能しない不具合があった。そのため `remote.urls` でこの origin を許可する。安全と判断する根拠: (1) navigate 先は `resolve_navigate_host`（既定 `127.0.0.1`、`BANTO_BIND` 未設定/`0.0.0.0`/`::` はすべて `127.0.0.1` に読み替える設計）が組み立てる自プロセス内 `HubRuntime` の URL のみで、外部サイトへ navigate する導線はコード上どこにも無い（`BANTO_BIND` はデプロイ時に管理者が設定する env であり、リモート攻撃者が注入できる入力ではない - 通常運用ではこの env は未設定で既定の loopback になる）。(2) ここで許可する permission は `core:default` と、この crate 自身が `generate_handler` で登録する4コマンドのみで、任意コマンド実行や他 origin への波及口は無い。(3) 許可範囲は `127.0.0.1` 固定とし、`localhost` や他ホストへは広げていない。ポート番号は `PORT` env で変わりうるため固定できず、ワイルドカード（URLPattern の port `*`）にしている。",
+  "description": "Capabilities for the main window - chronogazer と同様 core:default。切替ウィザードの invoke は generate_handler 登録のみ（運転 API の invoke は追加しない）。T16（2026-08-30、実機検証で発覚）: このシェルは自分自身が配信する UI を `window.navigate` で読み込む設計であり（`src/lib.rs` の crate doc 冒頭、`navigate_to_hub`/`resolve_navigate_host` 参照）、Tauri v2 の既定ではローカルアセット由来（URL: local）の origin にしか `core:default`（invoke・event.listen 等）を許可しないため、navigate 後の webview からは切替ウィザードの4コマンド（host_switch_status/switch_to_service/switch_to_desktop/set_service_autostart）が呼べず機能しない不具合があった。そのため `remote.urls` でこの origin を許可する。安全と判断する根拠: (1) navigate 先は `resolve_navigate_host`（既定 `127.0.0.1`、`BANTO_BIND` 未設定/`0.0.0.0`/`::` はすべて `127.0.0.1` に読み替える設計）が組み立てる自プロセス内 `HubRuntime` の URL のみで、外部サイトへ navigate する導線はコード上どこにも無い（`BANTO_BIND` はデプロイ時に管理者が設定する env であり、リモート攻撃者が注入できる入力ではない - 通常運用ではこの env は未設定で既定の loopback になる）。(2) ここで許可する permission は `core:default` と、この crate 自身が `generate_handler` で登録する4コマンドのみで、任意コマンド実行や他 origin への波及口は無い。(3) 許可範囲は `127.0.0.1` 固定とし、`localhost` や他ホストへは広げていない。ポート番号は `PORT` env で変わりうるため固定できず、ワイルドカード（URLPattern の port `*`）にしている。 T16 追記（remote.urls 追加後もなお `host_switch_status not allowed. Plugin not found` が実機で再発）: `remote.urls` はケイパビリティ層（`core:default` を origin に許可するか）の話であり、その手前で ACL マニフェスト（`tauri_build::try_build` が生成する `gen/schemas/acl-manifests.json`）にアプリ自身のコマンドのエントリが無いと `tauri-2.11.5` の `ipc/authority.rs`（402-409 行付近）が \"Plugin not found\" を返すことを tauri のソースで確認した。`generate_handler!` はランタイムのディスパッチ登録に過ぎず ACL には現れないため、`src-tauri/build.rs` で `tauri_build::Attributes::new().app_manifest(tauri_build::AppManifest::new().commands([...]))` により `host_switch_status`/`switch_to_service`/`switch_to_desktop`/`set_service_autostart` の4コマンドを ACL へ宣言し、ここで自動生成された `allow-<command>` permission（ハイフン区切り）を明示的に許可する。この4つ以外のコマンドは宣言・許可のどちらにも追加していない。",
   "windows": ["main"],
-  "permissions": ["core:default"],
+  "permissions": [
+    "core:default",
+    "allow-host-switch-status",
+    "allow-switch-to-service",
+    "allow-switch-to-desktop",
+    "allow-set-service-autostart"
+  ],
   "remote": {
     "urls": ["http://127.0.0.1:*/*"]
   }
