@@ -61,6 +61,7 @@
 	} from '$lib/banto/tagRegistryAdmin';
 	import { filterMonitorRows, type MonitorTreeFilter } from '$lib/banto/monitorFilter';
 	import { subscriptionPatternsFor } from '$lib/banto/monitorSubscription';
+	import { applyTagValues, mergeTagValues, type RowValue } from '$lib/banto/monitorValues';
 	import SplitPane from '$lib/components/SplitPane.svelte';
 	import ConnectionTree from '$lib/components/ConnectionTree.svelte';
 	import type { ConnectionTreeNodeData } from '$lib/components/connectionTreeTypes';
@@ -102,18 +103,42 @@
 		}, FLASH_MS);
 	}
 
+	/**
+	 * WS `data` から届いた最新値のキャッシュ（`external_name` → 値）。
+	 *
+	 * **2026-08-31 実機診断で特定した不具合の修正の核心**
+	 * （`$lib/banto/monitorValues.ts` 冒頭 doc comment に詳細）: 下の
+	 * 初期化 `$effect` は `reloadCatalog()`（catalog の HTTP 取得、非同期・
+	 * 未 await）を呼んだ直後に `connectTagStream()`（WS 接続、即座に
+	 * `subscribe` して初期スナップショットを受ける）を呼ぶ。実機の速度では
+	 * WS の初期スナップショットの方が catalog の HTTP 応答より先に届く
+	 * レースが常態的に発生し、旧実装はその場の（まだ空の）`rows` にしか
+	 * 突き合わせていなかったため、先着した値がそのまま失われていた。
+	 * PLC の値が全て `0` で変化しない実機環境では `mode: 'on_change'` に
+	 * よりそれ以降の配信が無く、一度の取りこぼしがそのまま「値が永久に
+	 * 反映されない」不具合になっていた。
+	 *
+	 * 修正: 受け取った値を `rows` から独立したこのマップへ蓄積し、
+	 * catalog 再構築時（`toRow`）は必ずこのマップを見る - catalog と WS
+	 * のどちらが先に終わっても、両方終わった時点で必ず値が反映される
+	 * （$state にする必要はない - このマップ自体を直接描画に使わず、
+	 * 常に `rows` への反映を経由するため）。 */
+	let latestValues = new Map<string, RowValue>();
+
 	function toRow(entry: CatalogTagEntry, previous?: Row): Row {
+		const cached = latestValues.get(entry.external_name);
 		return {
 			...entry,
-			v: previous?.v ?? null,
-			q: previous?.q ?? 'stale',
-			t: previous?.t ?? 0
+			v: cached?.v ?? previous?.v ?? null,
+			q: cached?.q ?? previous?.q ?? 'stale',
+			t: cached?.t ?? previous?.t ?? 0
 		};
 	}
 
-	/** catalog を（再）取得し、既存の生値（v/q/t）を維持しつつ行を作り直す。
-	 * 新規タグは追加され、消えたタグは自然に脱落する（`catalog.tags` を
-	 * そのまま元に組み立てるため）。 */
+	/** catalog を（再）取得し、既存の生値（v/q/t）または WS 到着済みの
+	 * 最新値（`latestValues`、上の doc comment 参照）を反映しつつ行を
+	 * 作り直す。新規タグは追加され、消えたタグは自然に脱落する
+	 * （`catalog.tags` をそのまま元に組み立てるため）。 */
 	async function reloadCatalog(): Promise<void> {
 		try {
 			const catalog = await getCatalog();
@@ -155,15 +180,23 @@
 		}
 	}
 
+	/**
+	 * WS `data` の `values` を `latestValues`（上の doc comment 参照）へ
+	 * 畳み込んだ上で `rows` に反映する。`latestValues` を経由することで、
+	 * この時点で `rows` がまだ空（catalog 未取得）でも値を失わない -
+	 * 後から `reloadCatalog`/`toRow` が同じマップを見て埋める。
+	 */
 	function applyStreamData(values: StreamValue[]): void {
-		const byTag = new Map(values.map((v) => [v.tag, v]));
-		if (byTag.size === 0) return;
-		rows = rows.map((row) => {
-			const update = byTag.get(row.external_name);
-			if (!update) return row;
-			triggerFlash(row.external_name);
-			return { ...row, v: update.v, q: update.q, t: update.t };
-		});
+		if (values.length === 0) return;
+		latestValues = mergeTagValues(latestValues, values);
+		const existingNames = new Set(rows.map((r) => r.external_name));
+		rows = applyTagValues(rows, latestValues);
+		// フラッシュ表示は「今回のメッセージで届いた」タグに限る（過去分も
+		// 含む latestValues 全体ではなく、あくまで今回の差分に対して一瞬
+		// ハイライトする、という従来どおりの挙動を維持する）。
+		for (const value of values) {
+			if (existingNames.has(value.tag)) triggerFlash(value.tag);
+		}
 	}
 
 	// --- T18-4a: ツリー選択 + 検索（クライアント側のみ・再取得なし） --------

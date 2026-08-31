@@ -43,11 +43,13 @@ use banto_collect::{BackoffConfig, CollectorOptions};
 use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::{HubSessions, SlmpSimRegistry};
+use banto_hub_core::commissioning::CommissioningService;
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
 use banto_hub_core::db::init_db;
 use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::rest::api_router;
+use banto_hub_core::settings::SettingsService;
 use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
 use banto_hub_core::write_control::WriteControl;
@@ -224,6 +226,15 @@ async fn test_app(label: &str) -> TestApp {
     );
     let grpc_server = Arc::new(GrpcServer::new(grpc_service));
 
+    let settings = SettingsService::new(pool.clone());
+    let commissioning = CommissioningService::load(settings, users.clone())
+        .await
+        .expect("CommissioningService::load");
+    commissioning
+        .lock_down()
+        .await
+        .expect("lock_down the test environment");
+
     let router = api_router(
         users,
         audit,
@@ -233,6 +244,7 @@ async fn test_app(label: &str) -> TestApp {
         api_keys,
         manager.clone(),
         auth,
+        commissioning,
         events_tx,
         false,
         write_control.clone(),

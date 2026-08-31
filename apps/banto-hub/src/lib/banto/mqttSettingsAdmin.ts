@@ -11,8 +11,9 @@
  * UI にする（`+page.svelte`参照）。
  *
  * 保存(`PUT`)は即時適用される（設計実装指示「保存で即時適用」）- 現在の
- * 接続状態（`connected`）は `GET /api/v1/status`（`hubStatus.ts`）の
- * `mqtt.connected` を見る。このファイルは設定の読み書きのみを提供する。
+ * 接続状態（`connected`）は `GET /api/status`（`hubStatus.ts`、2026-08-31
+ * オーナー決定で `/api/v1/status` から切替）の `mqtt.connected` を見る。
+ * このファイルは設定の読み書きのみを提供する。
  */
 import { getAuthProvider, ProviderError, type ErrorBody } from '@banto/admin-core';
 import { CSRF_HEADER } from './setup';

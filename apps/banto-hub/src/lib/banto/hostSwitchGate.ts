@@ -21,7 +21,8 @@ export type HostSwitchGateInput = {
 	view: HostShellView;
 	/** 切替トランザクション進行中か。 */
 	switching: boolean;
-	/** `GET /api/v1/status` の last_config_error。 */
+	/** `GET /api/status`（`hubStatus.ts`、2026-08-31以前は `/api/v1/status`）の
+	 * last_config_error。 */
 	lastConfigError: string | null | undefined;
 	/** status.revision が取得できているか。 */
 	hasRevision: boolean;

@@ -1,31 +1,68 @@
 /**
  * T18-2d（docs/banto-hub-t18-design.md「T18-2d 初回導線チェックリスト」、
  * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A「初回導線と親設定の引継ぎ」）:
- * 初回チェックリスト（PLC接続作成→接続テスト→収集グループ作成→タグ登録→
- * SIM値確認）の完了判定・次工程算出と、ツリー選択/URLクエリからのフォーム
- * プリセット決定を担う、依存ゼロの純関数群。`tagFormCarry.ts`/
+ * 初回チェックリスト（PLC接続作成→収集グループ作成→タグ登録→収集開始→
+ * モニタで値確認）の完了判定・次工程算出と、ツリー選択/URLクエリからの
+ * フォームプリセット決定を担う、依存ゼロの純関数群。`tagFormCarry.ts`/
  * `tagDeleteImpact.ts` と同じ方針 - Svelte 側（`status`/`plc-connections`/
  * `collection-groups`/`tags` の各 `+page.svelte`）は `$state`/`$effect`/
  * DOM 組み立てに専念させ、判定ロジックはここへ集約してユニットテストする。
  * `tagRegistryAdmin`/`hubStatus` からは型だけを取り込み（`import type`）、
  * 実行時の依存は無い。
  *
- * 設計判断（TAG-UX-A「完了判定は画面訪問でなく実データで判定」に対応する
- * 具体的な判定元がスコープ指示にあるため、それに従う）:
+ * **2026-08-31 オーナー指摘による工程の見直し（実機での使用感から判明）**:
+ * 実際の試運転の流れは「PLC接続の設定→収集グループ作成→タグ登録→収集を
+ * 開始してPLCにアクセスできているか確認」であり、以前の5工程
+ * （connection→connectionTest→group→tag→simValue）には2つの問題があった。
+ *
+ * 1. 「接続テストの成功」が `connections` の `status: "connected"` で
+ *    判定されていたが、これは収集エンジンが実際にセッションを張っている
+ *    ライブ状態であり、対象接続に収集グループ・タグがあり、かつ収集が
+ *    `RunMode::Configured` で稼働していない限り絶対に `"connected"` に
+ *    ならない。つまりこの工程は「収集グループ作成」「タグ登録」より前の
+ *    2番目に置かれていたにもかかわらず、実際にはそれらの**後**、かつ
+ *    「収集を開始した後」でないと達成不可能だった - 手順として矛盾して
+ *    いた。さらに当時は収集を開始する UI 導線自体が無かった
+ *    （`POST /api/collection/start` を叩けるのは API のみ）ため、この
+ *    工程は事実上どの画面からも完了させられなかった。
+ * 2. 最終工程「SIM値の確認」という名前が「全PLCシミュレーションを挟む
+ *    ことが必須」であるかのような誤解を招いていた。実際の判定条件
+ *    （`values` に `q === "good"` が1件でもあるか）はシミュレーションかどうか
+ *    を問わないが、収集を開始する手段が無かった当時は事実上シミュレーション
+ *    経由でしか満たせなかった。実機が目の前にある試運転では SIM を挟む
+ *    必然性が無い（オーナー指摘）ため、工程名を「モニタで値確認」へ改め、
+ *    実機由来の値でも達成できることを明確にした。
+ *
+ * これを受け、新しい5工程は connection→group→tag→collectionStart→
+ * monitorValue。「接続テストの成功」は独立した工程として廃止し、その意図
+ * （実際に接続できているかの確認）は新設した「収集の開始」
+ * （`RunMode::Configured` で稼働中/稼働試行中かどうか）と「モニタで値確認」
+ * の2工程に引き継いだ - 収集を実際に開始して値が読めることを確認する、と
+ * いう一連の流れそのものが「接続テスト」の実質だからである。
+ *
+ * **区別注意（触っていないもの）**: 接続単位のシミュレーション
+ * （`PlcConnection.simulation`、T9-2、接続の Drawer のチェックボックス）は
+ * このオーナー指摘とは無関係で一切変更していない。「全PLCシミュレーション」
+ * （`RunMode::AllSimulation`、`POST /api/collection/start-all-simulation`）
+ * だけを必須動線から外した - 前者は接続ごとに実機/SIMを選ぶ機能、後者は
+ * 運転モード全体を切り替える機能で、混同しないこと
+ * （`collectionControlAdmin.ts` 冒頭のdoc comment も参照）。
+ *
+ * 判定元（実データ判定。画面訪問や操作ログでは判定しない）:
  * - **PLC接続の作成**: `calc`/`mem`（`protocol: "virtual"`、自動プロビジョニ
  *   ング）を除く `PlcConnection` が1件以上存在するか。
- * - **接続テストの成功**: 単発のテストボタン結果（クリック操作のログ）では
- *   なく、`GET /api/v1/status` の `connections`（`ConnectionStatusEntry`、
- *   実際に収集エンジンが張っているライブ接続状態）に `status: "connected"`
- *   の非virtual接続が1件でもあるか - 「画面訪問でなく実データ」により忠実
- *   （テストボタンを押した記憶ではなく、実際に繋がっているという事実）。
  * - **収集グループの作成**: virtual接続配下を除く `CollectionGroup` が1件
  *   以上存在するか。
  * - **タグの登録**: `tagKind === "plc"` の `Tag` が1件以上存在するか
  *   （`computed`/`internal` はこのチェックリストが案内する「PLCタグ収集」
  *   の導線とは無関係なので数えない）。
- * - **SIM値の確認**: `GET /api/v1/values` の `values` に `q === "good"` が
- *   1件でもあるか。
+ * - **収集の開始**: `GET /api/status`（`hubStatus.ts`参照）の
+ *   `collection_mode === "configured"` かつ `collection_state !== "stopped"`
+ *   か - 「全PLCシミュレーション」（`collection_mode === "all_simulation"`）
+ *   だけでは達成できない（実機に接続する操作を経たことを要求するため、
+ *   上記のオーナー指摘に忠実）。
+ * - **モニタで値確認**: `GET /api/values`（同上）の `values` に
+ *   `q === "good"` が1件でもあるか（シミュレーション/実機を問わない）。
  *
  * 各工程の CTA リンク先（`href`）は「まだ埋まっていない親」を優先して選ぶ
  * （{@link connectionAwaitingGroup}/{@link groupAwaitingTag}）- 単に
@@ -33,7 +70,7 @@
  * しまい、「グループが無い接続」「タグが無いグループ」に辿り着けない。
  */
 import type { CollectionGroup, PlcConnection, Tag } from './tagRegistryAdmin';
-import type { ConnectionStatusEntry, ValueEntry } from './hubStatus';
+import type { ValueEntry } from './hubStatus';
 
 /** `PlcConnection.protocol === "virtual"`（`calc`/`mem`）かどうか。型だけの
  * 依存に留めるため、`tagRegistryAdmin.isVirtualConnection` は呼ばず同じ判定
@@ -136,7 +173,7 @@ export function monitorHref(opts: {
 	return params.length === 0 ? '/monitor' : `/monitor?${params.join('&')}`;
 }
 
-export type OnboardingStepId = 'connection' | 'connectionTest' | 'group' | 'tag' | 'simValue';
+export type OnboardingStepId = 'connection' | 'group' | 'tag' | 'collectionStart' | 'monitorValue';
 
 export interface OnboardingStep {
 	id: OnboardingStepId;
@@ -155,28 +192,34 @@ export interface OnboardingSnapshot {
 	connections: PlcConnection[];
 	groups: CollectionGroup[];
 	tags: Tag[];
-	connectionStatuses: ConnectionStatusEntry[];
+	/** `GET /api/status` の `collection_state`（`hubStatus.ts`参照）。 */
+	collectionState: string;
+	/** `GET /api/status` の `collection_mode`（同上、2026-08-31 新設）。 */
+	collectionMode: string;
 	values: ValueEntry[];
 }
 
 /**
  * 5工程チェックリストの完了状態と次工程 CTA を組み立てる。工程の順序は
- * 常に `connection → connectionTest → group → tag → simValue` で固定
- * （TAG-UX-A の連続導線と一致）。
+ * 常に `connection → group → tag → collectionStart → monitorValue` で固定
+ * （2026-08-31 オーナー指摘 - 冒頭 doc comment 参照。旧 `connectionTest`/
+ * `simValue` からの変更理由もそこに記載）。
  */
 export function computeOnboardingSteps(snapshot: OnboardingSnapshot): OnboardingStep[] {
 	const real = realConnections(snapshot.connections);
 	const hasConnection = real.length > 0;
 
-	const connectedIds = new Set(
-		snapshot.connectionStatuses.filter((s) => s.status === 'connected').map((s) => s.id)
-	);
-	const hasConnectionTest = real.some((c) => connectedIds.has(c.id));
-
 	const groups = realGroups(snapshot.groups, snapshot.connections);
 	const hasGroup = groups.length > 0;
 
 	const hasTag = snapshot.tags.some((t) => t.tagKind === 'plc');
+
+	// 「全PLCシミュレーション」（collectionMode === "all_simulation"）だけでは
+	// 完了させない - 実PLCへの接続を試みたことを要求する（冒頭 doc comment
+	// 「収集の開始」参照）。starting/running/stopping/faulted はいずれも
+	// 「開始操作を経た」ことの証跡として扱う。
+	const hasCollectionStart =
+		snapshot.collectionMode === 'configured' && snapshot.collectionState !== 'stopped';
 
 	const hasGoodValue = snapshot.values.some((v) => v.q === 'good');
 
@@ -190,13 +233,6 @@ export function computeOnboardingSteps(snapshot: OnboardingSnapshot): Onboarding
 			done: hasConnection,
 			href: '/plc-connections',
 			ctaLabel: 'PLC接続を作成'
-		},
-		{
-			id: 'connectionTest',
-			label: '接続テストの成功',
-			done: hasConnectionTest,
-			href: '/plc-connections',
-			ctaLabel: '接続テストを行う'
 		},
 		{
 			id: 'group',
@@ -213,11 +249,18 @@ export function computeOnboardingSteps(snapshot: OnboardingSnapshot): Onboarding
 			ctaLabel: 'タグを登録'
 		},
 		{
-			id: 'simValue',
-			label: 'SIM値の確認',
+			id: 'collectionStart',
+			label: '収集の開始',
+			done: hasCollectionStart,
+			href: '/status#collection-control',
+			ctaLabel: '収集を開始'
+		},
+		{
+			id: 'monitorValue',
+			label: 'モニタで値確認',
 			done: hasGoodValue,
 			href: '/monitor',
-			ctaLabel: 'SIM値を確認'
+			ctaLabel: 'モニタで確認'
 		}
 	];
 }

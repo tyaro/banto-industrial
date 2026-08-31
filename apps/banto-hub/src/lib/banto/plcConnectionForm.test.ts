@@ -40,6 +40,26 @@ describe('nextConnectionName', () => {
 	});
 });
 
+describe('nextConnectionName（修正1: pendingNames — 実機で再現した不具合、2026-08-31 オーナー報告）', () => {
+	it('既存 connection1 に加え pending の connection1 があっても connection2 を返す（収集グループ側と同じ不具合が接続側にもあった）', () => {
+		expect(nextConnectionName(['connection1'], 'connection', ['connection1'])).toBe('connection2');
+	});
+
+	it('pendingNames が空なら既存レコードのみの場合と同じ結果になる（回帰確認）', () => {
+		expect(nextConnectionName(['connection1', 'connection3'], 'connection', [])).toBe(
+			'connection2'
+		);
+	});
+
+	it('pendingNames を省略しても既存の呼び出し（引数2つ）と同じ結果になる', () => {
+		expect(nextConnectionName(['connection1'], 'connection')).toBe('connection2');
+	});
+
+	it('pendingNames にしか無い番号も歯抜け埋めの対象として除外する', () => {
+		expect(nextConnectionName(['connection1'], 'connection', ['connection2'])).toBe('connection3');
+	});
+});
+
 describe('defaultPortFor / isDefaultPortForProtocol', () => {
 	it('modbus-tcp の既定ポートは 502', () => {
 		expect(defaultPortFor('modbus-tcp')).toBe(502);

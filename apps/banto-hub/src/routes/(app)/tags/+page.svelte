@@ -408,7 +408,8 @@
 	 * T18-3e（docs/banto-hub-t18-design.md「T18-3e BantoGrid セル編集/TSV貼付
 	 * の接続」、実装指示「停止中のみ編集可（停止中ロック）」）: BantoGrid の
 	 * セル編集/TSV貼付は収集停止中（`collection_state === 'stopped'`）のみ
-	 * 許可する。`getHubStatus()`（`GET /api/v1/status`）は初期ロード時と
+	 * 許可する。`getHubStatus()`（`GET /api/status`、2026-08-31 オーナー
+	 * 決定で `/api/v1/status` から切替 - `hubStatus.ts`参照）は初期ロード時と
 	 * 保存直前（`handleSaveGridEdits`）の両方で呼び直す - 収集の開始/停止は
 	 * 別画面から行われうるため、このページを開いたまま状態が変わる可能性が
 	 * ある。取得に失敗した場合は `hubStatus` を `null` のままにし、
@@ -1313,7 +1314,15 @@
 	 */
 	function openDuplicateDrawer(t: Tag): void {
 		if (!confirmDiscardIfNeeded()) return;
-		const existingNames = tags.map((tag) => tag.name);
+		// 2026-08-31 オーナー決定: タグ名の一意性は全体一意→収集グループ内一意へ
+		// 緩和された（サーバー側 `crates/banto-tags` migration 0011）。複製名が
+		// 避けるべき既存名も複製元と同じ収集グループ内のものだけでよい -
+		// 他グループの同名タグは合法な同名で、それを理由に `_copy2` へ
+		// 繰り上げるのは不要な事故防止（最終的な一意性検証は既存どおり
+		// サーバー側 `createTag` が正 - `tagDuplicate.ts` の doc comment参照）。
+		const existingNames = tags
+			.filter((tag) => tag.collectionGroupId === t.collectionGroupId)
+			.map((tag) => tag.name);
 		const next = buildDuplicateFormValues(formFromTag(t), existingNames);
 		createForm = next;
 		createBaseline = { ...next };
