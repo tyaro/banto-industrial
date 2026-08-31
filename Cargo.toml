@@ -26,6 +26,7 @@ members = [
     "crates/banto-tsquery",
     "crates/banto-broker",
     "crates/banto-expr",
+    "crates/banto-tagclient",
     "apps/chronogazer/core",
     "apps/chronogazer/src-tauri",
     "apps/relay-wright/core",
@@ -50,6 +51,8 @@ publish = false
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+reqwest = { version = "0.13.4", default-features = false }
+zeroize = "1.9.0"
 sqlx = { version = "0.9", default-features = false }
 tokio = { version = "1" }
 # I2a (docs/plan.md「条件付き自動書き込みアプリ」I2a): MELSEC MC protocol
@@ -146,7 +149,7 @@ utoipa-swagger-ui = { version = "9", default-features = false, features = [
 # 用クライアント（dev-dependency のみ - サーバー側は axum 自身の `ws`
 # feature で足りる）。axum 0.8.9 が内部で使っているのと同じ 0.29 系を選び、
 # Cargo.lock に無関係な第2系統を増やさない。
-tokio-tungstenite = "0.30"
+tokio-tungstenite = "0.29"
 banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v1.4.0" }
 banto-storage = { git = "https://github.com/tyaro/banto.git", tag = "v1.4.0" }
 banto-server = { git = "https://github.com/tyaro/banto.git", tag = "v1.4.0" }

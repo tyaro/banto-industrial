@@ -5,7 +5,7 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
 
 状態: **地図として現行**。索引に徹し、実装状況・設計判断の本体は各文書側で管理する。
 最終更新: 2026-09-01（T18-6・試運転モード/ロックダウン・収集開始停止 UI・タグ名一意性緩和・
-H5 relay-wright E2E 完了を反映）。
+H5 relay-wright E2E 完了・banto-tagclient S4a 統合を反映）。
 最終検証日(コード照合): 2026-09-01
 
 > この地図は索引に徹する。実装状況・設計判断の本体は各文書側にあり、状態の**正**は
@@ -29,6 +29,11 @@ H5 relay-wright E2E 完了を反映）。
   組み込みサーバーモード E2E を含め完了（2026-08-30、PR #193。Tauri 固有経路の E2E は WebDriver 課題と
   して別スコープに分離）。**残るは H7 の① 実機 soak のみ**（詳細は improvement-plan.md）。
 - **出荷ゲート**: T5-5（実機での 72h soak 実行 + 実機最終サインオフ）のみ残（実機必須）。
+- **banto-tagclient**: **S4a完了（2026-09-01）**。読み取り専用DTO、Endpoint/Secret境界、
+  stable ID resolver、REST catalog/values transport、WS wire純粋解析、bounded publish gate、認証付き
+  WebSocket handshake、on_change subscribe、単一世代workerとwatchによるatomic latest snapshot配信、
+  公開Handle、worker所有権、明示shutdown、catalog起点の再接続・backoff・停止割り込み、rebinding、config_changed再解決、消費型restartによるcredential/endpoint置換を実装済み。S4b-1互換候補ではorigin/main 509bf0e（Banto v1.4.0）とのローカル統合でtokio-tungstenite 0.29系一本化を確認したが、未push・未mergeである。S4互換tag固定、実Hub/LAN統合検証、配布サイズ確認は残課題である。
+  Hubのrelease tagは未確定。
 
 ## まず読む順
 
@@ -45,6 +50,7 @@ H5 relay-wright E2E 完了を反映）。
 | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
 | [plan.md](plan.md)                                         | **全体計画の親**。I/R/W/T 系マイルストーンと依存の一覧。                                               |
 | [tag-server-design.md](tag-server-design.md)               | **banto-hub 設計の一次ソース**。タグ空間モデル・外部 IF・書き込み安全。実装状況は §9（T 系）表が正。   |
+| [banto-tagclient-design.md](banto-tagclient-design.md)     | **banto-tagclient の実装前設計**。読み取り専用SDKのREST/WS、binding、再接続、停止、テストゲートの正。  |
 | [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)     | **banto-hub 運転計画（T14〜T18）・UI/UX 決定台帳**。§9.3〜9.5 が T18 タグ登録 UX の受け入れの正。      |
 | [banto-hub-operations.md](banto-hub-operations.md)         | **banto-hub 運用ガイド**（起動・ポート・API/MQTT/gRPC・サービス化・soak 手順）。現状の運用を引く入口。 |
 | [banto-hub-t14-design.md](banto-hub-t14-design.md)         | T14 詳細設計（ランタイム状態管理・制御面分離）。                                                       |
