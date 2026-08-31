@@ -85,7 +85,9 @@ use banto_storage::ColumnMap;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
-use crate::support::{map_write_error, max_length_message, range_message, required_message};
+use crate::support::{
+    map_write_error, max_length_message, range_message, required_message, NAME_ALREADY_USED,
+};
 
 /// Protocols accepted in `plc_connections.protocol` today. Mirrors the SQL
 /// `CHECK` - as widened by `migrations/0004_plc_connections_allow_slmp.sql`,
@@ -340,7 +342,7 @@ impl PlcConnectionService {
     pub async fn list(&self, params: ListParams) -> Result<ListResult<PlcConnection>, BantoError> {
         let columns = column_map();
 
-        let mut rows_builder: QueryBuilder<'_, Sqlite> =
+        let mut rows_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new(format!("SELECT {COLUMNS} FROM plc_connections"));
         banto_storage::list_query::sqlite::apply_list_params(&mut rows_builder, &columns, &params)?;
         let rows: Vec<PlcConnection> = rows_builder
@@ -349,7 +351,7 @@ impl PlcConnectionService {
             .await
             .map_err(banto_storage::storage_error)?;
 
-        let mut count_builder: QueryBuilder<'_, Sqlite> =
+        let mut count_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new("SELECT COUNT(*) FROM plc_connections");
         banto_storage::list_query::sqlite::append_where(
             &mut count_builder,
@@ -369,9 +371,11 @@ impl PlcConnectionService {
     }
 
     pub async fn get(&self, id: i64) -> Result<PlcConnection, BantoError> {
-        sqlx::query_as::<_, PlcConnection>(&format!(
+        // AssertSqlSafe: 補間されるのは COLUMNS 定数（本ファイル内の固定文字列）
+        // のみで、外部入力は含まれない。id はプレースホルダでバインドする。
+        sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
             "SELECT {COLUMNS} FROM plc_connections WHERE id = ?"
-        ))
+        )))
         .bind(id)
         .fetch_one(&self.pool)
         .await
@@ -380,10 +384,12 @@ impl PlcConnectionService {
 
     pub async fn create(&self, input: PlcConnectionInput) -> Result<PlcConnection, BantoError> {
         validate_plc_connection_input(&input)?;
-        sqlx::query_as::<_, PlcConnection>(&format!(
+        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
+        // 文字列。値はすべてプレースホルダでバインドする。
+        sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
             "INSERT INTO plc_connections (name, protocol, host, port, unit_id, enabled, simulation, word_order) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(input.name.trim())
         .bind(&input.protocol)
         .bind(input.host.trim())
@@ -394,7 +400,7 @@ impl PlcConnectionService {
         .bind(&input.word_order)
         .fetch_one(&self.pool)
         .await
-        .map_err(|err| map_write_error(err, "name", "", ""))
+        .map_err(|err| map_write_error(err, "name", NAME_ALREADY_USED, "", ""))
     }
 
     /// Transaction-compatible counterpart of [`Self::create`]. The caller
@@ -406,10 +412,12 @@ impl PlcConnectionService {
         input: PlcConnectionInput,
     ) -> Result<PlcConnection, BantoError> {
         validate_plc_connection_input(&input)?;
-        sqlx::query_as::<_, PlcConnection>(&format!(
+        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
+        // 文字列。値はすべてプレースホルダでバインドする。
+        sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
             "INSERT INTO plc_connections (name, protocol, host, port, unit_id, enabled, simulation, word_order) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(input.name.trim())
         .bind(&input.protocol)
         .bind(input.host.trim())
@@ -420,7 +428,7 @@ impl PlcConnectionService {
         .bind(&input.word_order)
         .fetch_one(&mut *connection)
         .await
-        .map_err(|err| map_write_error(err, "name", "", ""))
+        .map_err(|err| map_write_error(err, "name", NAME_ALREADY_USED, "", ""))
     }
 
     /// **T6-2 addition**: a `"virtual"`-protocol connection cannot be edited
@@ -449,10 +457,12 @@ impl PlcConnectionService {
             });
         }
 
-        sqlx::query_as::<_, PlcConnection>(&format!(
+        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
+        // 文字列。値はすべてプレースホルダでバインドする。
+        sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
             "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ?, simulation = ?, word_order = ? \
              WHERE id = ? RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(input.name.trim())
         .bind(&input.protocol)
         .bind(input.host.trim())
@@ -469,7 +479,7 @@ impl PlcConnectionService {
                 resource: RESOURCE.to_string(),
                 id: id.to_string(),
             },
-            other => map_write_error(other, "name", "", ""),
+            other => map_write_error(other, "name", NAME_ALREADY_USED, "", ""),
         })
     }
 
@@ -495,10 +505,12 @@ impl PlcConnectionService {
                 }],
             });
         }
-        sqlx::query_as::<_, PlcConnection>(&format!(
+        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
+        // 文字列。値はすべてプレースホルダでバインドする。
+        sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
             "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ?, simulation = ?, word_order = ? \
              WHERE id = ? RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(input.name.trim())
         .bind(&input.protocol)
         .bind(input.host.trim())
@@ -515,7 +527,7 @@ impl PlcConnectionService {
                 resource: RESOURCE.to_string(),
                 id: id.to_string(),
             },
-            other => map_write_error(other, "name", "", ""),
+            other => map_write_error(other, "name", NAME_ALREADY_USED, "", ""),
         })
     }
 

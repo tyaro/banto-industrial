@@ -1,12 +1,24 @@
 # e2e/ — Playwright E2E スイート
 
-このリポジトリには独立した3つの Playwright config がある。いずれも「LAN/REST モードの実サーバーに対する DOM テスト」で、モックした frontend ではない。ポート・一時 DB・出力ディレクトリは互いに分離してあるので、同一マシンで独立に実行できる。
+このリポジトリには独立した4つの Playwright config がある。いずれも「LAN/REST モードの実サーバーに対する DOM テスト」で、モックした frontend ではない。ポート・一時 DB・出力ディレクトリは互いに分離してあるので、同一マシンで独立に実行できる。
 
-| config                                | 対象                          | コマンド                  | CI             |
-| ------------------------------------- | ----------------------------- | ------------------------- | -------------- |
-| `playwright.config.ts`                | ChronoGazer smoke             | `pnpm e2e`                | ✅             |
-| `banto-hub.playwright.config.ts`      | banto-hub 本体 (T18 機能一式) | `pnpm e2e:banto-hub`      | ✅             |
-| `banto-hub-perf.playwright.config.ts` | banto-hub 性能計測（後述）    | `pnpm e2e:banto-hub:perf` | ❌ opt-in のみ |
+| config                                | 対象                                                     | コマンド                  | CI             |
+| ------------------------------------- | -------------------------------------------------------- | ------------------------- | -------------- |
+| `playwright.config.ts`                | ChronoGazer smoke                                        | `pnpm e2e`                | ✅             |
+| `banto-hub.playwright.config.ts`      | banto-hub 本体 (T18 機能一式)                            | `pnpm e2e:banto-hub`      | ✅             |
+| `banto-hub-perf.playwright.config.ts` | banto-hub 性能計測（後述）                               | `pnpm e2e:banto-hub:perf` | ❌ opt-in のみ |
+| `relay-wright.playwright.config.ts`   | relay-wright（LAN/REST モード = spec §11.1 モード2のみ） | `pnpm e2e:relay-wright`   | ✅             |
+
+relay-wright は Tauri アプリだが、`relay-wright-serve`（`apps/relay-wright/core/src/bin/relay-wright-serve.rs`）という Tauri 不要の組み込みサーバー用バイナリ（spec §11.1 のモード2 = LAN ブラウザ／`HttpDataProvider`+`SseEventProvider`）を持つため、banto-hub と同じ形の Playwright E2E をそのまま組める（詳細は `relay-wright.playwright.config.ts` の doc comment）。Tauri webview 固有の経路（モード1: `invoke()` 分岐・`banto://event`・vibrancy 等）はこの config の対象外で、WebDriver が要る別課題として切り分けてある。
+
+## ポート割り当て
+
+| アプリ         | ポート |
+| -------------- | ------ |
+| chronogazer    | 8798   |
+| banto-hub      | 8799   |
+| relay-wright   | 8800   |
+| banto-hub-perf | 8801   |
 
 ## ビルド前提
 
@@ -17,6 +29,7 @@ pnpm install
 pnpm build                                                          # フロントの静的ビルド（assets.rs が embed する）
 cargo build -p chronogazer-core --bin banto-serve --features embed-ui   # pnpm e2e 用
 cargo build -p banto-hub-core --bin banto-hub --features embed-ui       # pnpm e2e:banto-hub / :perf 用
+cargo build -p relay-wright-core --bin relay-wright-serve --features embed-ui  # pnpm e2e:relay-wright 用
 pnpm exec playwright install chromium                               # 初回のみ
 ```
 

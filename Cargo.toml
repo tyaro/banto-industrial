@@ -53,7 +53,7 @@ serde_json = "1"
 thiserror = "2"
 reqwest = { version = "0.13.4", default-features = false }
 zeroize = "1.9.0"
-sqlx = { version = "0.8", default-features = false }
+sqlx = { version = "0.9", default-features = false }
 tokio = { version = "1" }
 # I2a (docs/plan.md「条件付き自動書き込みアプリ」I2a): MELSEC MC protocol
 # (SLMP) framing, wrapped by `banto-plc`'s `slmp` module. MIT, tokio-async,
@@ -149,10 +149,10 @@ utoipa-swagger-ui = { version = "9", default-features = false, features = [
 # 用クライアント（dev-dependency のみ - サーバー側は axum 自身の `ws`
 # feature で足りる）。axum 0.8.9 が内部で使っているのと同じ 0.29 系を選び、
 # Cargo.lock に無関係な第2系統を増やさない。
-tokio-tungstenite = "0.30"
-banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v1.2.0" }
-banto-storage = { git = "https://github.com/tyaro/banto.git", tag = "v1.2.0" }
-banto-server = { git = "https://github.com/tyaro/banto.git", tag = "v1.2.0" }
+tokio-tungstenite = "0.29"
+banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v1.4.0" }
+banto-storage = { git = "https://github.com/tyaro/banto.git", tag = "v1.4.0" }
+banto-server = { git = "https://github.com/tyaro/banto.git", tag = "v1.4.0" }
 # T3（docs/tag-server-design.md §5.3）: banto-hub の MQTT publish（外部ブロー
 # カーへ接続するクライアントモードのみ - 組み込みブローカーは §10-4 の判断
 # 待ち）。plan.md §3 で保留になっていた「MQTT クライアント（rumqttc +

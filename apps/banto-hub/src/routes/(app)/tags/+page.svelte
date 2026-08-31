@@ -118,6 +118,7 @@
 	import { addressHelpFor } from '$lib/banto/tagAddressHelp';
 	import { carryFormForNext } from '$lib/banto/tagFormCarry';
 	import { buildDuplicateFormValues } from '$lib/banto/tagDuplicate';
+	import { nextTagNameOnAddressChange } from '$lib/banto/tagNamePrefill';
 	import {
 		monitorHref,
 		resolveGroupIdFromTreeSelection,
@@ -408,7 +409,8 @@
 	 * T18-3e（docs/banto-hub-t18-design.md「T18-3e BantoGrid セル編集/TSV貼付
 	 * の接続」、実装指示「停止中のみ編集可（停止中ロック）」）: BantoGrid の
 	 * セル編集/TSV貼付は収集停止中（`collection_state === 'stopped'`）のみ
-	 * 許可する。`getHubStatus()`（`GET /api/v1/status`）は初期ロード時と
+	 * 許可する。`getHubStatus()`（`GET /api/status`、2026-08-31 オーナー
+	 * 決定で `/api/v1/status` から切替 - `hubStatus.ts`参照）は初期ロード時と
 	 * 保存直前（`handleSaveGridEdits`）の両方で呼び直す - 収集の開始/停止は
 	 * 別画面から行われうるため、このページを開いたまま状態が変わる可能性が
 	 * ある。取得に失敗した場合は `hubStatus` を `null` のままにし、
@@ -505,6 +507,33 @@
 	let createBaseline: FormState = blankForm();
 	let createErrors: Record<string, string> = $state({});
 	let creating = $state(false);
+
+	/**
+	 * 2026-09-01 オーナー要望「タグ名が空欄のままならアドレスをタグ名として
+	 * 使う」: create Drawer 専用の「名前欄をユーザーが直接編集したか」の
+	 * 追跡フラグ。`ConnectionDrawer.svelte` の `portTouched` と同じ設計
+	 * （`$lib/banto/tagNamePrefill.ts` モジュール doc comment 参照）。
+	 *
+	 * - `false`（既定）の間だけ、アドレス欄の入力に追従して名前欄を
+	 *   プリフィルする（`nextTagNameOnAddressChange`）。
+	 * - 名前欄の `oninput` で `true` に固定する（下の `tagFields` snippet
+	 *   呼び出しの最終引数）。
+	 * - 編集フォーム（`editForm`）は対象外のため、edit 側には対応する
+	 *   touched 変数を持たない（`edit` 用の呼び出しは常に no-op を渡す）。
+	 *
+	 * リセットするタイミング:
+	 * - `openCreateDrawer`（新規に空フォームを開く）: `false` に戻す。
+	 * - `handleCreate` の「登録して次へ」（`carryFormForNext` で名前・
+	 *   アドレスを空へ戻す）: 次の1件はまた「名前が空」から始まるので
+	 *   `false` に戻す。
+	 * - `openDuplicateDrawer`（タグ複製）: `buildDuplicateFormValues` が
+	 *   既に意味のある複製名（`{元名}_copy` 等）を入れているため、これを
+	 *   アドレス入力で上書きされたくない - あえて `true`（＝プリフィル
+	 *   対象外）で開始する（`banto-hub-tags-duplicate.spec.ts` の「アドレス
+	 *   を入れて登録しても複製名はそのまま」という既存挙動を壊さないための
+	 *   判断）。
+	 */
+	let createNameTouched = $state(false);
 
 	/**
 	 * T18-3a（docs/banto-hub-t18-design.md「T18-3a タグ複製」、TAG-UX-D
@@ -626,6 +655,9 @@
 				createForm = nextForm;
 				createBaseline = { ...nextForm };
 				createAddressPreflight = blankAddressPreflight();
+				// 2026-09-01: 名前・アドレスとも空へ戻る次の1件なので、また
+				// 「名前が空」から始まる - プリフィル対象へリセットする。
+				createNameTouched = false;
 				// フォーム差し替え後の DOM 更新を待ってから、次の論理入力
 				// （名前 - 全タグ種別で必須かつ常に空になる唯一のフィールド）
 				// へフォーカスを移し、連続入力を続けられるようにする。
@@ -1290,6 +1322,8 @@
 		createAddressPreflight = blankAddressPreflight();
 		editConflict = null;
 		duplicateSource = null; // T18-3a: 通常の新規作成では複製元差分パネルを出さない
+		// 2026-09-01: 空フォームなので「名前が空」から始まる - プリフィル対象。
+		createNameTouched = false;
 		drawerMode = 'create';
 	}
 
@@ -1313,7 +1347,15 @@
 	 */
 	function openDuplicateDrawer(t: Tag): void {
 		if (!confirmDiscardIfNeeded()) return;
-		const existingNames = tags.map((tag) => tag.name);
+		// 2026-08-31 オーナー決定: タグ名の一意性は全体一意→収集グループ内一意へ
+		// 緩和された（サーバー側 `crates/banto-tags` migration 0011）。複製名が
+		// 避けるべき既存名も複製元と同じ収集グループ内のものだけでよい -
+		// 他グループの同名タグは合法な同名で、それを理由に `_copy2` へ
+		// 繰り上げるのは不要な事故防止（最終的な一意性検証は既存どおり
+		// サーバー側 `createTag` が正 - `tagDuplicate.ts` の doc comment参照）。
+		const existingNames = tags
+			.filter((tag) => tag.collectionGroupId === t.collectionGroupId)
+			.map((tag) => tag.name);
 		const next = buildDuplicateFormValues(formFromTag(t), existingNames);
 		createForm = next;
 		createBaseline = { ...next };
@@ -1321,6 +1363,10 @@
 		createAddressPreflight = blankAddressPreflight();
 		editConflict = null;
 		duplicateSource = t;
+		// 2026-09-01: 複製名（`{元名}_copy` 等）は既に意味のある値が入って
+		// いるため、プリフィル対象外として開始する（上の `createNameTouched`
+		// 宣言のコメント参照 - アドレスを後から入力しても複製名を上書きしない）。
+		createNameTouched = true;
 		drawerMode = 'create';
 	}
 
@@ -2351,7 +2397,8 @@
 	errors: Record<string, string>,
 	detailOpen: DetailOpenState,
 	addressPreflight: AddressPreflightState,
-	onAddressInput: () => void
+	onAddressInput: () => void,
+	onNameInput: () => void
 )}
 	<!--
 		TAG-P0-2（docs/banto-hub-desktop-plan.md §9.3、2026-08-10 実装メモ）:
@@ -2440,6 +2487,7 @@
 				id="tag-name"
 				type="text"
 				bind:value={form.name}
+				oninput={onNameInput}
 				required
 				aria-invalid={errors.name ? 'true' : undefined}
 				aria-describedby={describedBy(errors.name && 'tag-name-err')}
@@ -3505,8 +3553,32 @@
 					{/if}
 				</div>
 			{/if}
-			{@render tagFields(createForm, createErrors, createDetailOpen, createAddressPreflight, () =>
-				scheduleAddressPreflight(createForm, 'create')
+			{@render tagFields(
+				createForm,
+				createErrors,
+				createDetailOpen,
+				createAddressPreflight,
+				() => {
+					// 2026-09-01 オーナー要望: アドレス欄の入力に追従して名前欄を
+					// プリフィルする（`createNameTouched` が false の間だけ、
+					// `$lib/banto/tagNamePrefill.ts` 参照）。`scheduleAddressPreflight`
+					// より先に行うことで、プリフィルで名前欄が埋まった直後の
+					// 入力から preflight の実行条件（`form.name.trim() !== ''`、
+					// 下の `scheduleAddressPreflight` 定義参照）を満たせるように
+					// する。
+					const nextName = nextTagNameOnAddressChange(
+						createForm.tagKind === 'plc',
+						createForm.address,
+						createNameTouched
+					);
+					if (nextName !== null) createForm.name = nextName;
+					scheduleAddressPreflight(createForm, 'create');
+				},
+				() => {
+					// 名前欄をユーザーが直接編集した合図 - 以後はアドレス入力に
+					// 追従させない（`createNameTouched` 宣言のコメント参照）。
+					createNameTouched = true;
+				}
 			)}
 			<div class="actions">
 				<!--
@@ -3596,8 +3668,16 @@
 					</div>
 				</div>
 			{/if}
-			{@render tagFields(editForm, editErrors, editDetailOpen, editAddressPreflight, () =>
-				scheduleAddressPreflight(editForm, 'edit')
+			{@render tagFields(
+				editForm,
+				editErrors,
+				editDetailOpen,
+				editAddressPreflight,
+				() => scheduleAddressPreflight(editForm, 'edit'),
+				// 2026-09-01: 名前空欄→アドレス自動プリフィルは対象外（既存タグの
+				// 名前を空にするのは「消したい」意図かもしれないため - 実装指示
+				// どおり編集フォームは対象外にする）。何もしない no-op を渡す。
+				() => {}
 			)}
 			<div class="actions">
 				<button type="submit" disabled={isDrawerBusy()}>保存</button>

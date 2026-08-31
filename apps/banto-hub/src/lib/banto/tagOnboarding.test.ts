@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { CollectionGroup, PlcConnection, Tag } from './tagRegistryAdmin';
-import type { ConnectionStatusEntry, ValueEntry } from './hubStatus';
+import type { ValueEntry } from './hubStatus';
 import {
 	collectionGroupsHref,
 	computeOnboardingSteps,
@@ -75,10 +75,6 @@ function tag(overrides: Partial<Tag> = {}): Tag {
 	};
 }
 
-function connectionStatus(overrides: Partial<ConnectionStatusEntry> = {}): ConnectionStatusEntry {
-	return { name: 'plc1', id: 1, status: 'connected', attempt: null, ...overrides };
-}
-
 function valueEntry(overrides: Partial<ValueEntry> = {}): ValueEntry {
 	return { tag: 'plc1.group1.tag1', v: 1, q: 'good', t: 1, ...overrides };
 }
@@ -87,7 +83,14 @@ const CALC = connection({ id: 900, name: 'calc', protocol: 'virtual', simulation
 const MEM = connection({ id: 901, name: 'mem', protocol: 'virtual', simulation: false });
 
 function emptySnapshot(): OnboardingSnapshot {
-	return { connections: [], groups: [], tags: [], connectionStatuses: [], values: [] };
+	return {
+		connections: [],
+		groups: [],
+		tags: [],
+		collectionState: 'stopped',
+		collectionMode: 'configured',
+		values: []
+	};
 }
 
 describe('computeOnboardingSteps', () => {
@@ -97,10 +100,10 @@ describe('computeOnboardingSteps', () => {
 		expect(steps.every((s) => !s.done)).toBe(true);
 		expect(steps.map((s) => s.id)).toEqual([
 			'connection',
-			'connectionTest',
 			'group',
 			'tag',
-			'simValue'
+			'collectionStart',
+			'monitorValue'
 		]);
 		expect(steps.find((s) => s.id === 'group')?.href).toBe('/collection-groups');
 		expect(steps.find((s) => s.id === 'tag')?.href).toBe('/tags');
@@ -121,21 +124,29 @@ describe('computeOnboardingSteps', () => {
 		expect(steps.find((s) => s.id === 'group')?.href).toBe('/collection-groups?connectionId=1');
 	});
 
-	it('接続テストは status.connections の connected 状態から判定する（テストボタンの記録ではない）', () => {
-		const conn = connection({ id: 1 });
-		const notConnected = computeOnboardingSteps({
+	it('「収集の開始」は collectionMode: configured かつ停止中でないことで判定する（2026-08-31 見直し）', () => {
+		const stopped = computeOnboardingSteps({
 			...emptySnapshot(),
-			connections: [conn],
-			connectionStatuses: [connectionStatus({ id: 1, status: 'reconnecting' })]
+			collectionMode: 'configured',
+			collectionState: 'stopped'
 		});
-		expect(notConnected.find((s) => s.id === 'connectionTest')?.done).toBe(false);
+		expect(stopped.find((s) => s.id === 'collectionStart')?.done).toBe(false);
 
-		const connected = computeOnboardingSteps({
+		const running = computeOnboardingSteps({
 			...emptySnapshot(),
-			connections: [conn],
-			connectionStatuses: [connectionStatus({ id: 1, status: 'connected' })]
+			collectionMode: 'configured',
+			collectionState: 'running'
 		});
-		expect(connected.find((s) => s.id === 'connectionTest')?.done).toBe(true);
+		expect(running.find((s) => s.id === 'collectionStart')?.done).toBe(true);
+	});
+
+	it('「全PLCシミュレーション」の稼働だけでは「収集の開始」を完了扱いにしない（必須動線から外した）', () => {
+		const steps = computeOnboardingSteps({
+			...emptySnapshot(),
+			collectionMode: 'all_simulation',
+			collectionState: 'running'
+		});
+		expect(steps.find((s) => s.id === 'collectionStart')?.done).toBe(false);
 	});
 
 	it('virtual接続配下のグループは「収集グループの作成」に数えない', () => {
@@ -168,18 +179,18 @@ describe('computeOnboardingSteps', () => {
 		expect(steps.find((s) => s.id === 'tag')?.done).toBe(true);
 	});
 
-	it('q: good の値が1件でもあれば「SIM値の確認」が完了する', () => {
+	it('q: good の値が1件でもあれば「モニタで値確認」が完了する（実機/SIMを問わない）', () => {
 		const notGood = computeOnboardingSteps({
 			...emptySnapshot(),
 			values: [valueEntry({ q: 'bad' }), valueEntry({ q: 'stale' })]
 		});
-		expect(notGood.find((s) => s.id === 'simValue')?.done).toBe(false);
+		expect(notGood.find((s) => s.id === 'monitorValue')?.done).toBe(false);
 
 		const good = computeOnboardingSteps({
 			...emptySnapshot(),
 			values: [valueEntry({ q: 'good' })]
 		});
-		expect(good.find((s) => s.id === 'simValue')?.done).toBe(true);
+		expect(good.find((s) => s.id === 'monitorValue')?.done).toBe(true);
 	});
 
 	it('すべて満たすとどの工程も done になる', () => {
@@ -190,7 +201,8 @@ describe('computeOnboardingSteps', () => {
 			connections: [conn],
 			groups: [g],
 			tags: [t],
-			connectionStatuses: [connectionStatus({ id: 1, status: 'connected' })],
+			collectionMode: 'configured',
+			collectionState: 'running',
 			values: [valueEntry({ q: 'good' })]
 		});
 		expect(steps.every((s) => s.done)).toBe(true);

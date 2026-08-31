@@ -320,7 +320,10 @@ impl BackupService {
             .to_string_lossy()
             .to_string();
 
-        sqlx::query(&vacuum_into_sql(&path))
+        // AssertSqlSafe: `path` は self.backups_dir()/unique_path から生成した
+        // 非ユーザー入力のパスで、vacuum_into_sql が SQL 文字列リテラルとして
+        // 適切にエスケープ済み（同関数の doc comment 参照）。
+        sqlx::query(sqlx::AssertSqlSafe(vacuum_into_sql(&path)))
             .execute(&self.pool)
             .await
             .map_err(banto_storage::storage_error)?;

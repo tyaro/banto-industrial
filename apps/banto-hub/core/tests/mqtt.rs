@@ -36,6 +36,7 @@ use banto_collect::{BackoffConfig, CollectorOptions};
 use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::{HubSessions, SlmpSimRegistry};
+use banto_hub_core::commissioning::CommissioningService;
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
 use banto_hub_core::controller::{CollectionController, CollectionState, RunMode};
 use banto_hub_core::db::init_db;
@@ -43,6 +44,7 @@ use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::mqtt::MqttPublisher;
 use banto_hub_core::rest::{api_router, api_router_with_controller};
+use banto_hub_core::settings::SettingsService;
 use banto_hub_core::test_output::TestOutputControl;
 use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
@@ -421,6 +423,15 @@ async fn test_app(label: &str) -> TestApp {
         events_tx.clone(),
     );
     let grpc_server = Arc::new(GrpcServer::new(grpc_service));
+    let settings = SettingsService::new(pool.clone());
+    let commissioning = CommissioningService::load(settings, users.clone())
+        .await
+        .expect("CommissioningService::load");
+    commissioning
+        .lock_down()
+        .await
+        .expect("lock_down the test environment");
+
     let router = api_router(
         users,
         audit,
@@ -430,6 +441,7 @@ async fn test_app(label: &str) -> TestApp {
         api_keys,
         manager.clone(),
         auth,
+        commissioning,
         events_tx,
         false,
         write_control,
@@ -545,6 +557,15 @@ async fn test_output_test_app(label: &str) -> TestOutputTestApp {
         events_tx.clone(),
     );
     let grpc_server = Arc::new(GrpcServer::new(grpc_service));
+    let settings = SettingsService::new(pool.clone());
+    let commissioning = CommissioningService::load(settings, users.clone())
+        .await
+        .expect("CommissioningService::load");
+    commissioning
+        .lock_down()
+        .await
+        .expect("lock_down the test environment");
+
     let router = api_router_with_controller(
         users,
         audit,
@@ -555,6 +576,7 @@ async fn test_output_test_app(label: &str) -> TestOutputTestApp {
         manager.clone(),
         controller.clone(),
         auth,
+        commissioning,
         events_tx,
         false,
         write_control,
@@ -953,8 +975,14 @@ async fn throttle_suppresses_rapid_changes_and_sends_the_latest_value_once_the_w
     let after: Vec<(String, String)> = live.snapshot().await.split_off(baseline_count);
 
     // 抑止された中間値(200)は一度も発行されていないこと。
+    // ペイロード文字列全体への部分文字列一致(contains)だと、エポックミリ秒の
+    // タイムスタンプに偶然 "200" という数字列が含まれた場合に誤検知するため、
+    // JSON をパースして "v" フィールドの値そのものを比較する。
     assert!(
-        !after.iter().any(|(_, payload)| payload.contains("200")),
+        !after.iter().any(|(_, payload)| {
+            let value: Value = serde_json::from_str(payload).expect("payload should be JSON");
+            value["v"] == 200.0
+        }),
         "an intermediate value suppressed by the throttle must never be published: {after:?}"
     );
     // スロットル明け最初の tick で最新値(300)だけが1回届いていること

@@ -1,29 +1,53 @@
 <script lang="ts">
 	/**
 	 * 接続状態モニタ画面（実装指示のスコープ主軸機能、新規作成）。
-	 * `GET /api/v1/status`（connections/revision/last_config_error）と
-	 * `GET /api/v1/values`（全タグ現在値）を3秒ポーリングで表示する。
+	 * `GET /api/status`（connections/revision/last_config_error）と
+	 * `GET /api/values`（全タグ現在値）を3秒ポーリングで表示する
+	 * （2026-08-31 オーナー決定「案A」で `/api/v1/status`・`/api/v1/values`
+	 * から管理系エンドポイントへ切替 - 試運転モード中は `/api/v1/*` が
+	 * 401 になるため、`hubStatus.ts`冒頭のdoc comment参照）。
 	 *
 	 * ポーリングでよい理由（設計 §5.1）: 読み取りは
 	 * `CollectorManager::current_values` が保持するオンメモリの現在値
 	 * スナップショットを読むだけで、PLC への追加ポーリング要求は一切
 	 * 発生しない（設計 §4: 「/api/v1/values* は current_values を読むだけで
-	 * 完結し、PLC への追加要求を発生させない」）。つまりこの画面が
+	 * 完結し、PLC への追加要求を発生させない」- `/api/values`も同じ
+	 * `CollectorManager::current_values`を読むだけの`compute_status`/
+	 * `build_values_response`を共有しているので同じ理屈が成り立つ）。
+	 * つまりこの画面が
 	 * リロードする頻度を上げても実機の負荷は増えないので、WebSocket/SSE
 	 * 差分配信を新設するより単純な定期ポーリングで十分（WebSocket は
 	 * 実装指示でも明示的にスコープ外）。
 	 *
 	 * T18-2d（docs/banto-hub-t18-design.md「T18-2d 初回導線チェックリスト」、
 	 * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A）: 「サーバー状態」の上に
-	 * 初回チェックリスト（PLC接続作成→接続テスト→収集グループ作成→タグ登録
-	 * →SIM値確認）を追加する。着地点が /status（navigation.ts の doc comment
-	 * 参照）なので、ここが「サイドバーを探索せず案内だけで完了できる」の
-	 * 起点として自然。完了判定・次工程算出はすべて `$lib/banto/tagOnboarding.ts`
+	 * 初回チェックリスト（PLC接続作成→収集グループ作成→タグ登録→収集開始→
+	 * モニタで値確認、2026-08-31 見直し後の順序 - 下記のオーナー指摘参照）を
+	 * 追加する。着地点が /status（navigation.ts の doc comment参照）なので、
+	 * ここが「サイドバーを探索せず案内だけで完了できる」の起点として自然。
+	 * 完了判定・次工程算出はすべて `$lib/banto/tagOnboarding.ts`
 	 * の純関数（実データ判定、画面訪問では判定しない）に委ねる。
 	 * `listPlcConnections`/`listCollectionGroups`/`listTags` は3秒ポーリング
 	 * には乗せず、チェックリストが未完了の間だけ取得する
 	 * （`pollRegistry`/`onboardingDone` 参照）- 完了後は10,000タグ規模でも
 	 * 無駄な一覧取得を繰り返さない。
+	 *
+	 * **2026-08-31 オーナー指摘（収集の開始/停止 UI の追加）**: `rest.rs` の
+	 * `commit_catalog_and_notify` の doc comment のとおり、本番経路では
+	 * PLC接続/収集グループ/タグの登録・変更は configured revision を
+	 * 進めるだけで、動いている（あるいはまだ一度も開始していない）収集機
+	 * には反映されない。`POST /api/collection/start|stop` 自体は元々 API
+	 * にしか無く、UI から叩く導線が1つも無かった - 実機での試運転の最後の
+	 * 一歩「PLC に接続開始し、タグにアクセスできているか確認する」を画面
+	 * から行えなかった。「収集の開始・停止」セクション（`#collection-control`、
+	 * `collectionControlAdmin.ts` 使用）はその導線。初回チェックリストも
+	 * これに合わせて見直した（`tagOnboarding.ts` 冒頭のdoc comment参照 -
+	 * 「接続テストの成功」を廃止し「収集の開始」を新設、「SIM値の確認」は
+	 * 「モニタで値確認」に改称して実機由来の値でも達成できることを明確化、
+	 * 「全PLCシミュレーション」は必須動線から外して補助的な選択肢のまま
+	 * 残した）。接続単位のシミュレーション（`PlcConnection.simulation`、
+	 * T9-2、接続 Drawer のチェックボックス）は今回のオーナー指摘とは無関係で
+	 * 一切変更していない。
 	 */
 	import { isProviderError } from '@banto/admin-core';
 	import {
@@ -49,12 +73,18 @@
 		listPlcConnections,
 		listCollectionGroups,
 		listTags,
+		isVirtualConnection,
 		type CollectionGroup,
 		type PlcConnection,
 		type Tag
 	} from '$lib/banto/tagRegistryAdmin';
 	import { computeOnboardingSteps, isOnboardingComplete } from '$lib/banto/tagOnboarding';
 	import { enableWriteControl, disableWriteControl } from '$lib/banto/writeControlAdmin';
+	import {
+		startCollection,
+		startAllSimulationCollection,
+		stopCollection
+	} from '$lib/banto/collectionControlAdmin';
 	import {
 		canSwitchToDesktop,
 		canSwitchToService,
@@ -196,7 +226,8 @@
 			connections: registrySnapshot.connections,
 			groups: registrySnapshot.groups,
 			tags: registrySnapshot.tags,
-			connectionStatuses: status.connections,
+			collectionState: status.collection_state,
+			collectionMode: status.collection_mode,
 			values: values.values
 		});
 	});
@@ -276,6 +307,144 @@
 			toastStore.push('error', errorMessage(err));
 		} finally {
 			pendingActionId = null;
+		}
+	}
+
+	// --- 収集の開始・停止 (2026-08-31 オーナー指摘、admin 限定) --------------
+	//
+	// `POST /api/collection/start|start-all-simulation|stop` は元々 admin
+	// ロール必須（`collection_control_router` の `RoleGuard{min: Role::Admin}`）
+	// なので、書き込み受付トグルと同じく操作ボタンは `canManageWriteControl`
+	// （= admin）でだけ出す。状態表示自体（現在の運転状態）は「サーバー状態」
+	// と同じ「読み取り専用・ロール不問」の扱いにする。
+	let collectionActionBusy = $state(false);
+
+	// 関数越しに読む理由: `status?.collection_state` を `$derived(...)` へ直接
+	// 書くと svelte-check（TS の制御フロー解析）が誤って `status` を `never`
+	// と推論するケースがある - このファイルの他の `$derived`
+	// （`gate`/`disabledReason`等）もすべて関数呼び出し越しに読む形にして
+	// 回避している、それに倣う。
+	function computeIsCollectionTransitioning(): boolean {
+		return status?.collection_state === 'starting' || status?.collection_state === 'stopping';
+	}
+	const isCollectionTransitioning = $derived(computeIsCollectionTransitioning());
+
+	// faulted も「開始」で再試行できるようにする（専用の再試行 API は無く、
+	// `start` を再度叩くのが唯一の回復手段 - `controller.rs` 参照）。
+	function computeCanStartCollection(): boolean {
+		return (
+			!isCollectionTransitioning &&
+			(status?.collection_state === 'stopped' || status?.collection_state === 'faulted')
+		);
+	}
+	const canStartCollection = $derived(computeCanStartCollection());
+
+	function computeCanStopCollection(): boolean {
+		return !isCollectionTransitioning && status?.collection_state === 'running';
+	}
+	const canStopCollection = $derived(computeCanStopCollection());
+
+	const collectionStateLabels: Record<string, string> = {
+		stopped: '収集停止',
+		starting: '開始中',
+		stopping: '停止処理中',
+		faulted: '異常停止'
+	};
+
+	/** desktop-plan §9.7 の状態表示（`running` は mode で「設定どおり運転」/
+	 * 「全PLCシミュレーション」に分ける）。 */
+	function collectionStateLabel(): string {
+		if (!status) return '-';
+		if (status.collection_state === 'running') {
+			return status.collection_mode === 'all_simulation'
+				? '全PLCシミュレーション運転中'
+				: '設定どおり運転中';
+		}
+		return collectionStateLabels[status.collection_state] ?? status.collection_state;
+	}
+
+	function collectionStateClass(): string {
+		if (!status) return '';
+		if (status.collection_state === 'running') {
+			return status.collection_mode === 'all_simulation' ? 'warn' : 'ok';
+		}
+		if (status.collection_state === 'faulted') return 'bad';
+		return '';
+	}
+
+	/**
+	 * desktop-plan §9.7「確認・エラー文言の基準」: 「開始」は実機/SIM接続の
+	 * 内訳をボタン直前に示す。ここでの内訳は `registrySnapshot`（チェック
+	 * リスト完了後は更新が止まる、冒頭 doc comment参照）に頼らず、確認直前に
+	 * 毎回 `listPlcConnections` を取り直して正確な件数にする - 収集開始は
+	 * 頻繁に押す操作ではないので追加の一覧取得コストは無視できる。
+	 */
+	async function handleStartCollection(): Promise<void> {
+		collectionActionBusy = true;
+		try {
+			const connections = await listPlcConnections();
+			const active = connections.filter((c) => c.enabled && !isVirtualConnection(c));
+			const realCount = active.filter((c) => !c.simulation).length;
+			const simCount = active.filter((c) => c.simulation).length;
+			const writeLine = status?.write_enabled
+				? 'PLC書き込み: 有効（書き込みを受け付けています）'
+				: 'PLC書き込み: OFF';
+			const ok = window.confirm(
+				'設定どおり収集を開始しますか。\n\n' +
+					`実PLC: ${realCount}接続 / 接続別SIM: ${simCount}接続\n` +
+					'履歴: 実機由来値を記録 / 通常外部出力: 設定どおり\n' +
+					writeLine
+			);
+			if (!ok) return;
+			await startCollection();
+			toastStore.push('success', '収集を開始しました');
+			await poll();
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			collectionActionBusy = false;
+		}
+	}
+
+	/**
+	 * 全PLCシミュレーション開始 - 主動線ではなく副次的な選択肢
+	 * （2026-08-31 オーナー指摘、`collectionControlAdmin.ts` 冒頭のdoc
+	 * comment参照）。desktop-plan §9.7 の確認文言基準どおり「実PLCへ接続
+	 * しない」「実機履歴・通常外部出力へ記録しない」を確認する。
+	 */
+	async function handleStartAllSimulation(): Promise<void> {
+		collectionActionBusy = true;
+		try {
+			const ok = window.confirm(
+				'全PLCシミュレーションを開始しますか。\n\n' +
+					'実PLCには接続しません。実機履歴と通常外部出力へは記録しません。'
+			);
+			if (!ok) return;
+			await startAllSimulationCollection();
+			toastStore.push('success', '全PLCシミュレーションを開始しました');
+			await poll();
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			collectionActionBusy = false;
+		}
+	}
+
+	/** desktop-plan §9.7 の確認文言基準どおりの文言。 */
+	async function handleStopCollection(): Promise<void> {
+		collectionActionBusy = true;
+		try {
+			const ok = window.confirm(
+				'収集を停止します。履歴を flush し、PLC接続と通常の外部出力を停止します。\n\nよろしいですか？'
+			);
+			if (!ok) return;
+			await stopCollection();
+			toastStore.push('success', '収集を停止しました');
+			await poll();
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			collectionActionBusy = false;
 		}
 	}
 
@@ -459,7 +628,9 @@
 	{#if onboardingSteps.length > 0 && !isOnboardingComplete(onboardingSteps)}
 		<section class="onboarding">
 			<h2>初回セットアップ</h2>
-			<p class="note">PLC接続の作成からSIM値の確認まで、この画面の案内だけで完了できます。</p>
+			<p class="note">
+				PLC接続の作成から収集開始・モニタでの値確認まで、この画面の案内だけで完了できます。
+			</p>
 			<ol class="onboarding-list">
 				{#each onboardingSteps as step (step.id)}
 					<li class="onboarding-step" class:done={step.done}>
@@ -511,6 +682,63 @@
 						{/each}
 					</tbody>
 				</table>
+			{/if}
+		{/if}
+	</section>
+
+	<section id="collection-control">
+		<h2>収集の開始・停止</h2>
+		{#if !status}
+			<p class="note">読み込み中…</p>
+		{:else}
+			<dl class="summary">
+				<dt>現在の状態</dt>
+				<dd class={collectionStateClass()}>{collectionStateLabel()}</dd>
+			</dl>
+			{#if status.collection_state === 'running' && status.collection_mode === 'all_simulation'}
+				<p class="config-error">
+					⚠ 全PLCシミュレーション運転中 -
+					実PLCへの接続、実機履歴、通常の外部出力への記録は行っていません。
+				</p>
+			{/if}
+			{#if status.last_runtime_error}
+				<p class="config-error">実行時エラー: {status.last_runtime_error}</p>
+			{/if}
+			{#if canManageWriteControl}
+				<div class="write-control-actions">
+					{#if canStartCollection}
+						<button
+							type="button"
+							onclick={() => void handleStartCollection()}
+							disabled={collectionActionBusy}
+						>
+							開始
+						</button>
+						<button
+							type="button"
+							class="secondary"
+							onclick={() => void handleStartAllSimulation()}
+							disabled={collectionActionBusy}
+						>
+							全PLC シミュレーション
+						</button>
+					{/if}
+					{#if canStopCollection}
+						<button
+							type="button"
+							class="danger"
+							onclick={() => void handleStopCollection()}
+							disabled={collectionActionBusy}
+						>
+							停止
+						</button>
+					{/if}
+				</div>
+				{#if isCollectionTransitioning}
+					<p class="note">処理中です。しばらくお待ちください…</p>
+				{/if}
+			{:else}
+				<p class="note">開始・停止は管理者限定です。</p>
 			{/if}
 		{/if}
 	</section>
@@ -648,7 +876,11 @@
 		{#if !localShell}
 			<p class="note">ローカルシェルが必要です（ブラウザ遠隔からは操作できません）。</p>
 		{:else if !hostSwitch}
-			<p class="note">シェル状態を読み込み中…</p>
+			{#if hostSwitchError}
+				<p class="config-error">シェル状態の取得に失敗しました: {hostSwitchError}</p>
+			{:else}
+				<p class="note">シェル状態を読み込み中…</p>
+			{/if}
 		{:else}
 			<dl class="summary">
 				<dt>現在の状態</dt>
@@ -975,6 +1207,22 @@
 		font-weight: 400;
 	}
 
+	/* 「収集の開始・停止」セクションの現在状態表示（`collectionStateClass()`）。 */
+	.summary dd.ok {
+		color: var(--banto-text);
+		font-weight: 600;
+	}
+
+	.summary dd.warn {
+		color: var(--banto-danger);
+		font-weight: 600;
+	}
+
+	.summary dd.bad {
+		color: var(--banto-danger);
+		font-weight: 700;
+	}
+
 	.write-on {
 		color: var(--banto-text);
 		font-weight: 600;
@@ -1009,6 +1257,15 @@
 		background: transparent;
 		border: 1px solid var(--banto-danger);
 		color: var(--banto-danger);
+		font-weight: 400;
+	}
+
+	/* 「全PLCシミュレーション」等の副次的な操作 - 主操作より目立たせない
+	   （2026-08-31 オーナー指摘: 全PLC SIM は主動線ではなく副次的な選択肢）。 */
+	.write-control-actions button.secondary {
+		background: transparent;
+		border: 1px solid var(--banto-border);
+		color: var(--banto-text-muted);
 		font-weight: 400;
 	}
 

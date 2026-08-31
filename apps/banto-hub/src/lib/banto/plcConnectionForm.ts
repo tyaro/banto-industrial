@@ -86,14 +86,23 @@ export function isDefaultPortForProtocol(port: string, protocol: PlcProtocol): b
  *
  * T18-6b: 採番ロジック自体は {@link nextSequentialName}（`sequentialName.ts`）
  * へ切り出し、収集グループ側（`collectionGroupForm.ts::nextGroupName`）と
- * 共有している。この関数は挙動・シグネチャとも無改変の薄いラッパー
- * （`plcConnectionForm.test.ts` は無改変で通る）。
+ * 共有している。
+ *
+ * 修正1（実機で再現した不具合、2026-08-31 オーナー報告）: `pendingNames`
+ * （pending queue 内の未適用の `plc_connections.create` 分の名前 -
+ * `pendingCreateNames.ts::pendingCreateNames` で抽出したもの）も衝突候補
+ * として受け取れるよう拡張した。既存の呼び出し（`existingNames`/`prefix`
+ * のみ渡す形）は `pendingNames` が既定 `[]` なので無改変で通る
+ * （`plcConnectionForm.test.ts` の既存ケースはそのまま）。収集グループ側
+ * （`collectionGroupForm.ts::nextGroupName`）と同じ理由 - 詳細はそちらの
+ * モジュール doc comment 参照。
  */
 export function nextConnectionName(
 	existingNames: readonly string[],
-	prefix = 'connection'
+	prefix = 'connection',
+	pendingNames: readonly string[] = []
 ): string {
-	return nextSequentialName(existingNames, prefix);
+	return nextSequentialName([...existingNames, ...pendingNames], prefix);
 }
 
 /** 編集フォーム状態（作成/編集共通）。数値入力は文字列で保持し、空欄=未設定。 */

@@ -92,7 +92,11 @@ impl TsReader {
             group.table_name
         );
 
-        let rows = sqlx::query(&sql)
+        // AssertSqlSafe: `column_list`/`group.table_name` は schema.rs の
+        // モジュール doc の通り `samples_<n>`/`c<i>` 形式の生成済み識別子のみで
+        // 構成され、呼び出し元の `group_key` などユーザー入力は含まれない
+        // （バインド値として from_ms/to_ms のみを渡す）。
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(from_ms)
             .bind(to_ms)
             .fetch_all(&self.pool)

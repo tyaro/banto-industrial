@@ -166,7 +166,7 @@ impl AuditLogService {
     pub async fn list(&self, params: ListParams) -> Result<ListResult<AuditLogEntry>, BantoError> {
         let columns = column_map();
 
-        let mut rows_builder: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+        let mut rows_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
             "SELECT id, ts, actor_username, actor_role, action, resource, entity_id, detail, origin, result \
              FROM audit_log",
         );
@@ -177,7 +177,7 @@ impl AuditLogService {
             .await
             .map_err(banto_storage::storage_error)?;
 
-        let mut count_builder: QueryBuilder<'_, Sqlite> =
+        let mut count_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new("SELECT COUNT(*) FROM audit_log");
         banto_storage::list_query::sqlite::append_where(
             &mut count_builder,

@@ -77,7 +77,10 @@ pub(crate) async fn catalog(data_dir: &Path) -> Result<Catalog, TsQueryError> {
             .map_err(|e| incompatible(&file.path, e))?;
 
             let range_sql = format!("SELECT MIN(ptime), MAX(ptime) FROM {table_name}");
-            let range_row = sqlx::query(&range_sql)
+            // AssertSqlSafe: table_name はこの直前の is_safe_table_name で
+            // 検証済み（samples_<n> 形式のみ許可、それ以外は既に早期リターン
+            // 済み）。
+            let range_row = sqlx::query(sqlx::AssertSqlSafe(range_sql))
                 .fetch_one(&pool)
                 .await
                 .map_err(|e| incompatible(&file.path, e))?;

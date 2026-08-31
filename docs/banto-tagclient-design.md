@@ -8,6 +8,10 @@ S2b-2bのcrate-private単一世代worker・tokio watchによるlatest snapshot�
 実装した。S3aでは公開Handle、worker所有権、明示shutdown、Drop時の非同期処理なしabortを
 実装した。S3b-1ではcatalog起点の逐次再接続、指数backoff、停止割り込みを実装し、S3b-2ではconfig_changed再bind、revision/runtime metadataの再解決、coalesceを実装した（2026-08-31）。
 S4aでは、資格情報を複製せず旧世代を停止・joinしてから置換RestClientで再開始する、消費型の公開`restart`を実装した（2026-09-01）。
+S4b-1互換候補では、`origin/main` 509bf0e（Banto v1.4.0）との統合検証で
+`tokio-tungstenite`を0.29系へ一本化できることをローカルに確認した。Issue #199の
+解消は未push・未mergeの候補上の確認であり、Issue自体は完了扱いにしない。実Hub/LAN接続、
+配布サイズ、release tag、private appへの固定は未完で、RTSPの別worktree/別履歴も含めない。
 設計時参照baseline: `b9552627a86015b354b3c5651184fb108ba89e44`
 実API確認日: 2026-08-30（`apps/banto-hub/core/src/rest.rs` / `stream.rs`）
 

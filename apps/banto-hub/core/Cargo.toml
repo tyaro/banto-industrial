@@ -210,12 +210,20 @@ windows-service = "0.8.1"
 # `OBJECT_INHERIT_ACE`/`CONTAINER_INHERIT_ACE`は既存の
 # `Win32_Security`/`Win32_Security_Authorization`に含まれるため新規
 # feature 追加は不要。
+#
+# ロックダウン回復アクション追加（docs/tag-server-design.md §5.6、
+# `service_elevated.rs`の`reset-password`/`revert-to-commissioning`）:
+# `Win32_System_Console`を追加した - `GetStdHandle`/`GetConsoleMode`/
+# `SetConsoleMode`/`ENABLE_ECHO_INPUT`（`reset-password`が新しいパスワードを
+# 標準入力から読む際、コンソールのエコーを一時的に止めるため。新しい
+# クレートは増えず、既存の`windows-sys`0.61系列に feature を足すだけ）。
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_NetManagement",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_Services",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",

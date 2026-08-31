@@ -16,14 +16,20 @@
 //! ```
 //!
 //! `<action>`は[`banto_hub_core::service_elevated::ElevatedAction`]が定義
-//! する固定の7種類のみ（`setup-operators`/`grant-service-acl`/
+//! する固定の9種類のみ（`setup-operators`/`grant-service-acl`/
 //! `grant-profile-acl`/`service-install`/`service-uninstall`/
-//! `autostart-enable`/`autostart-disable`）- フリーフォームなコマンド文字列は
+//! `autostart-enable`/`autostart-disable`/`reset-password`/
+//! `revert-to-commissioning`）- フリーフォームなコマンド文字列は
 //! 一切受け付けない（昇格プロセスへ任意コマンドを渡させないための
 //! セキュリティ境界）。`setup-operators`は追加ユーザー名を1個まで、
-//! `grant-profile-acl`は`[username] [profile-id]`を2個まで、それぞれ引数
-//! として受け付ける（省略時は現在の対話ユーザー／既定 profile -
-//! `service_elevated`のモジュール doc参照）。
+//! `grant-profile-acl`は`[username] [profile-id]`を2個まで、
+//! `reset-password`は`<username> [profile-id]`を1〜2個（`username`は省略
+//! 不可）、`revert-to-commissioning`は`[profile-id]`を1個まで、それぞれ
+//! 引数として受け付ける（省略時は現在の対話ユーザー／既定 profile -
+//! `service_elevated`のモジュール doc参照）。**`reset-password`の新パスワード
+//! 自体は引数に含めない** - プロセス一覧・シェル履歴に残さないため、実行後に
+//! 標準入力から対話的に読む（`service_elevated`モジュール doc「ロックダウン
+//! 回復アクション」節参照）。
 //!
 //! 実装本体は[`banto_hub_core::service_elevated`]（lib crate 側に置き、
 //! `banto-hub.exe`とテストコードの両方から検証しやすくしている）- この
@@ -50,7 +56,7 @@ fn main() {
 
     let Some(action) = ElevatedAction::parse(action_arg) else {
         eprintln!(
-            "banto-hub-elev: 不明な action '{action_arg}' です（固定の6種類のみ受け付けます）"
+            "banto-hub-elev: 不明な action '{action_arg}' です（固定の9種類のみ受け付けます）"
         );
         print_usage();
         std::process::exit(1);
@@ -79,6 +85,12 @@ fn print_usage() {
     );
     eprintln!(
         "banto-hub-elev:   例: banto-hub-elev.exe grant-profile-acl [ユーザー名] [profile-id]（両方省略時は現在の対話ユーザー・既定 profile）"
+    );
+    eprintln!(
+        "banto-hub-elev:   例: banto-hub-elev.exe reset-password <ユーザー名> [profile-id]（新パスワードは実行後に標準入力から入力、profile-id省略時は既定 profile）"
+    );
+    eprintln!(
+        "banto-hub-elev:   例: banto-hub-elev.exe revert-to-commissioning [profile-id]（ロックダウン済み→試運転モードへ復帰、profile-id省略時は既定 profile）"
     );
 }
 

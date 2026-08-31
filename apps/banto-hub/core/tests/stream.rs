@@ -18,11 +18,13 @@ use axum::Router;
 use banto_collect::{BackoffConfig, CollectorOptions};
 use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::audit::AuditLogService;
+use banto_hub_core::commissioning::CommissioningService;
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
 use banto_hub_core::controller::{CollectionController, CollectionState, RunMode};
 use banto_hub_core::db::init_db;
 use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::rest::api_router_with_controller;
+use banto_hub_core::settings::SettingsService;
 use banto_hub_core::users::UsersService;
 use banto_plc::modbus::simulator::Simulator;
 use banto_server::{start, AuthState, Identity, ServerConfig};
@@ -162,6 +164,19 @@ impl TestApp {
 }
 
 async fn test_app(label: &str) -> TestApp {
+    test_app_with_lock(label, true).await
+}
+
+/// [`test_app`]だが試運転モード（未ロックダウン）のまま返す - 管理系WS
+/// `/api/tag-stream`（`admin_tag_stream_router`、設計 §5.6・2026-08-31
+/// オーナー決定）の試運転モード側の挙動を確認するテスト専用。`tests/rest.rs`
+/// 相当が無いこのファイルでは、`apps/banto-hub/core/src/rest.rs`の
+/// `test_env_unlocked`と同じ役割をこの関数が担う。
+async fn test_app_unlocked(label: &str) -> TestApp {
+    test_app_with_lock(label, false).await
+}
+
+async fn test_app_with_lock(label: &str, locked_down: bool) -> TestApp {
     let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
 
@@ -244,6 +259,17 @@ async fn test_app(label: &str) -> TestApp {
         events_tx.clone(),
     );
     let grpc_server = std::sync::Arc::new(banto_hub_core::grpc::GrpcServer::new(grpc_service));
+    let settings = SettingsService::new(pool.clone());
+    let commissioning = CommissioningService::load(settings, users.clone())
+        .await
+        .expect("CommissioningService::load");
+    if locked_down {
+        commissioning
+            .lock_down()
+            .await
+            .expect("lock_down the test environment");
+    }
+
     let router: Router = api_router_with_controller(
         users,
         audit,
@@ -254,6 +280,7 @@ async fn test_app(label: &str) -> TestApp {
         manager.clone(),
         controller.clone(),
         auth,
+        commissioning,
         events_tx,
         false,
         write_control,
@@ -1427,4 +1454,108 @@ async fn group_wildcard_subscription_only_receives_its_own_group_tag() {
     assert_eq!(values[0]["v"], 42.0);
 
     sim.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 12. 管理系 WS `/api/tag-stream`（`admin_tag_stream_router`、設計 §5.6・
+//     2026-08-31 オーナー決定「案A」の見落とし是正）: ライブタグモニタ
+//     （`tagMonitorAdmin.ts`）が試運転モード中も繋がるようにするための追加。
+//     ハンドラ本体は`/api/v1/stream`と共有（`crate::stream::ws_upgrade`）
+//     なので、購読プロトコル自体（`on_change`・ワイルドカード等）はテスト
+//     1〜11 で既に確認済み - ここでは認証境界だけを確認する。
+// ---------------------------------------------------------------------------
+
+/// 試運転モード中は `/api/tag-stream` が `Authorization` も
+/// `Sec-WebSocket-Protocol` も無しで接続でき、購読・データ受信まで通しで
+/// 動く - `tagMonitorAdmin.ts` が試運転モード中に行う接続と同型。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_tag_stream_allows_unauthenticated_connection_during_commissioning() {
+    let app = test_app_unlocked("admin-stream-commissioning").await;
+    let sim = Simulator::start().await;
+    sim.set_holding_register(0, 7); // 40001
+
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(conn_input("line1", sim.addr.port()))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group.id, "40001", "i16"))
+        .await
+        .unwrap();
+    app.manager.rebuild().await.expect("rebuild after seeding");
+
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            app.manager
+                .current_values()
+                .and_then(|c| c.get("tag:1"))
+                .map(|s| s.value)
+                == Some(Some(7.0))
+        })
+        .await,
+        "collector should observe the initial simulator value"
+    );
+
+    // No `Authorization` header, no `Sec-WebSocket-Protocol` offer at all -
+    // exactly what `tagMonitorAdmin.ts::connectOnce` sends while
+    // `sessionStore.commissioningMode` is true.
+    let mut ws = connect_ws(&app.ws_url("/api/tag-stream"), None)
+        .await
+        .expect("unauthenticated ws handshake should succeed during commissioning mode");
+
+    send_json(
+        &mut ws,
+        json!({ "op": "subscribe", "id": 1, "tags": ["line1.fast.temp01"], "mode": "on_change" }),
+    )
+    .await;
+
+    let snapshot = recv_matching(&mut ws, |m| m["op"] == "data" && m["id"] == 1).await;
+    let values = snapshot["values"].as_array().unwrap();
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["tag"], "line1.fast.temp01");
+    assert_eq!(values[0]["v"], 7.0);
+    assert_eq!(values[0]["q"], "good");
+
+    sim.stop();
+}
+
+/// 対照実験: ロックダウン済みでは `/api/tag-stream` も認証が要る -
+/// `Authorization`/`Sec-WebSocket-Protocol` どちらも無い接続は401、有効な
+/// セッション bearer を `Sec-WebSocket-Protocol: bearer, <token>` で運べば
+/// 接続できる（`valid_session_token_via_subprotocol_header_authenticates_and_streams_data`
+/// と同型 - `require_auth_or_commissioning`側に追加した
+/// `extract_ws_protocol_token`フォールバックの確認）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admin_tag_stream_requires_auth_when_locked_down() {
+    let app = test_app("admin-stream-locked-down").await;
+
+    let err = connect_ws(&app.ws_url("/api/tag-stream"), None)
+        .await
+        .expect_err("no auth at all should be rejected once locked down");
+    match err {
+        tokio_tungstenite::tungstenite::Error::Http(response) => {
+            assert_eq!(response.status().as_u16(), 401, "{response:?}");
+        }
+        other => panic!("expected an HTTP-level rejection, got {other:?}"),
+    }
+
+    // `Authorization` ヘッダも通常どおり通る（ブラウザ以外のクライアント、
+    // あるいはこのテストのように直接ヘッダを付けられる場合の経路）。
+    let ok = connect_ws(&app.ws_url("/api/tag-stream"), Some(&app.token)).await;
+    assert!(
+        ok.is_ok(),
+        "a valid session token via Authorization should be accepted: {ok:?}"
+    );
+
+    // ブラウザの `WebSocket` が実際に使う経路: `Sec-WebSocket-Protocol:
+    // bearer, <token>`。
+    let ok = connect_ws_via_subprotocol(&app.ws_url("/api/tag-stream"), &app.token).await;
+    assert!(
+        ok.is_ok(),
+        "a valid session token via Sec-WebSocket-Protocol should be accepted: {ok:?}"
+    );
 }

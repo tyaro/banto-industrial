@@ -808,9 +808,11 @@ mod tests {
             ("write_rule_conditions", "threshold_text"),
             ("write_rules", "write_constant_text"),
         ] {
-            let count: i64 = sqlx::query_scalar(&format!(
+            // AssertSqlSafe: table/column はこの直上の固定配列リテラルの
+            // 要素のみ（テストコード、外部入力は無い）。
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{column}'"
-            ))
+            )))
             .fetch_one(&pool)
             .await
             .unwrap();

@@ -25,15 +25,16 @@
     "lint": "eslint .",
     "e2e": "playwright test --config=e2e/playwright.config.ts",
     "e2e:banto-hub": "playwright test --config=e2e/banto-hub.playwright.config.ts",
-    "e2e:banto-hub:perf": "playwright test --config=e2e/banto-hub-perf.playwright.config.ts"
+    "e2e:banto-hub:perf": "playwright test --config=e2e/banto-hub-perf.playwright.config.ts",
+    "e2e:relay-wright": "playwright test --config=e2e/relay-wright.playwright.config.ts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@playwright/test": "^1.62.1",
     "eslint": "^10.8.0",
     "eslint-config-prettier": "^10.1.8",
-    "eslint-plugin-svelte": "^3.22.0",
-    "globals": "^17.9.0",
+    "eslint-plugin-svelte": "^3.23.0",
+    "globals": "^17.11.0",
     "prettier": "^3.9.6",
     "prettier-plugin-svelte": "^4.1.1",
     "typescript": "^6.0.3",

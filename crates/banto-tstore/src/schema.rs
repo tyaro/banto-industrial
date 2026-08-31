@@ -188,7 +188,13 @@ pub(crate) async fn create_schema(
             create_table.push_str(&format!(", {} REAL", column_name_for_index(tag_index)));
         }
         create_table.push(')');
-        sqlx::query(&create_table).execute(&mut *tx).await?;
+        // AssertSqlSafe: create_table はモジュール冒頭のコメントの通り
+        // `table_name_for_index`/`column_name_for_index` が生成する
+        // `samples_<n>`/`c<i>` のみで構成される識別子であり、呼び出し元の
+        // `group_key`/`tag_key` などユーザー入力は一切含まれない。
+        sqlx::query(sqlx::AssertSqlSafe(create_table))
+            .execute(&mut *tx)
+            .await?;
 
         for (tag_index, tag) in group.tags.iter().enumerate() {
             let column_name = column_name_for_index(tag_index);
