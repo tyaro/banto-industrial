@@ -78,6 +78,21 @@ export interface StatusResponse {
 	 * (`apps/banto-hub/core/src/controller.rs`). `GET /api/status` の
 	 * `collectionState` フィールド。 */
 	collection_state: 'stopped' | 'starting' | 'running' | 'stopping' | 'faulted' | string;
+	/**
+	 * 2026-08-31 オーナー指摘（収集開始/停止 UI 追加）で新規に露出。
+	 * mirrors `RunMode::as_str()`（`apps/banto-hub/core/src/controller.rs`）。
+	 * `collection_state` だけでは「設定どおり運転」と「全 PLC
+	 * シミュレーション運転」を区別できない
+	 * （desktop-plan §9.7 の状態表 `running/configured` /
+	 * `running/all_simulation` に対応するにはこちらも要る）。
+	 */
+	collection_mode: 'configured' | 'all_simulation' | string;
+	/**
+	 * 同上（2026-08-31）。`CollectionStatus.last_error` を運ぶ - 収集の
+	 * 起動/実行時エラー（`faulted` 状態の原因）。`last_config_error` とは
+	 * 別物（あちらは構成の静的検証エラー）なので混同しないこと。
+	 */
+	last_runtime_error: string | null;
 }
 
 /** サーバーから受け取る camelCase の生レスポンス形（`AdminStatusResponse`）。 */
@@ -91,6 +106,8 @@ interface RawStatusResponse {
 	mqtt: MqttStatusEntry;
 	grpc: GrpcStatusEntry;
 	collectionState: string;
+	collectionMode: string;
+	lastRuntimeError: string | null;
 }
 
 /** サーバーの camelCase 応答を、このファイルが公開する既存の型（snake_case
@@ -108,7 +125,9 @@ function fromRawStatus(raw: RawStatusResponse): StatusResponse {
 		write_was_enabled_before_restart: raw.writeWasEnabledBeforeRestart,
 		mqtt: raw.mqtt,
 		grpc: raw.grpc,
-		collection_state: raw.collectionState
+		collection_state: raw.collectionState,
+		collection_mode: raw.collectionMode,
+		last_runtime_error: raw.lastRuntimeError
 	};
 }
 
