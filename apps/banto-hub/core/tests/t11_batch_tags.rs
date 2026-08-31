@@ -587,9 +587,8 @@ async fn batch_rejects_a_name_already_used_by_an_existing_tag() {
     assert_eq!(errors[0]["index"], json!(0));
     let field_errors = errors[0]["fieldErrors"].as_array().unwrap();
     assert!(
-        field_errors
-            .iter()
-            .any(|e| e["field"] == "name" && e["message"] == "既に使用されています"),
+        field_errors.iter().any(|e| e["field"] == "name"
+            && e["message"] == "この収集グループ内では既に使用されています"),
         "{field_errors:?}"
     );
 

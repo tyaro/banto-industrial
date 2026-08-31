@@ -694,6 +694,15 @@ const COLUMNS: &str = "id, name, collection_group_id, address, data_type, string
      threshold_h, threshold_hh, threshold_l, threshold_ll, enabled, \
      writable, tag_kind, expression, retain, revision";
 const FK_MESSAGE: &str = "指定された収集グループが見つかりません";
+/// UNIQUE-violation message for `tags.name` (migration
+/// `0011_tags_unique_name_per_group.sql`, 2026-08-31 オーナー決定:
+/// 「タグ名の一意性を全タグ一意→収集グループ内一意へ緩和」)。外部名は
+/// `{connection}.{group}.{tag}` の合成（`banto-hub-core::hub::build_catalog_from`）
+/// であり末端のタグ名まで全体一意にする必要はなく、同型装置を複数台つないで
+/// 同じ PLC アドレス（＝同じタグ名）を使う構成を許すための変更 - よって
+/// `crate::support::NAME_ALREADY_USED`（`plc_connections`/`collection_groups`
+/// 用、今も全体一意）とは異なる、スコープを明示した文言にする。
+const NAME_ALREADY_USED_IN_GROUP: &str = "この収集グループ内では既に使用されています";
 
 /// Shared by [`TagService::create`] and [`TagService::create_batch`] (T11-1)
 /// so the two INSERT statements cannot drift apart - both bind the exact
@@ -961,7 +970,15 @@ impl TagService {
             .bind(input.retain)
             .fetch_one(&self.pool)
             .await
-            .map_err(|err| map_write_error(err, "name", "collectionGroupId", FK_MESSAGE))
+            .map_err(|err| {
+                map_write_error(
+                    err,
+                    "name",
+                    NAME_ALREADY_USED_IN_GROUP,
+                    "collectionGroupId",
+                    FK_MESSAGE,
+                )
+            })
     }
 
     /// Transaction-compatible counterpart of [`Self::create`].
@@ -998,7 +1015,15 @@ impl TagService {
             .bind(input.retain)
             .fetch_one(&mut *connection)
             .await
-            .map_err(|err| map_write_error(err, "name", "collectionGroupId", FK_MESSAGE))
+            .map_err(|err| {
+                map_write_error(
+                    err,
+                    "name",
+                    NAME_ALREADY_USED_IN_GROUP,
+                    "collectionGroupId",
+                    FK_MESSAGE,
+                )
+            })
     }
 
     /// **T18-1 optimistic lock** (docs/banto-hub-desktop-plan.md §9.4
@@ -1087,6 +1112,7 @@ impl TagService {
             Err(other) => Err(map_write_error(
                 other,
                 "name",
+                NAME_ALREADY_USED_IN_GROUP,
                 "collectionGroupId",
                 FK_MESSAGE,
             )),
@@ -1166,6 +1192,7 @@ impl TagService {
             Err(other) => Err(TagUpdateError::Banto(map_write_error(
                 other,
                 "name",
+                NAME_ALREADY_USED_IN_GROUP,
                 "collectionGroupId",
                 FK_MESSAGE,
             ))),
@@ -1297,12 +1324,20 @@ impl TagService {
 
         // Intra-batch duplicates: same aggregation style as create_batch_tx
         // (every index sharing a name with another index gets flagged, not
-        // just the "later" occurrence).
-        let mut first_seen: HashMap<&str, usize> = HashMap::new();
+        // just the "later" occurrence). Keyed by (collection_group_id, name)
+        // - not name alone - now that `tags.name` is only unique within its
+        // group (migration 0011, 2026-08-31 オーナー決定): two rows in the
+        // same batch that share a name but target *different* groups are not
+        // a conflict, e.g. a bulk group-move that leaves some rows in their
+        // original group and retargets others.
+        let mut first_seen: HashMap<(i64, &str), usize> = HashMap::new();
         let mut batch_dupe_indices = Vec::new();
-        for (index, value) in validated.iter().enumerate() {
-            let Some(value) = value else { continue };
-            match first_seen.get(value.name.as_str()) {
+        for (index, (_, input)) in updates.iter().enumerate() {
+            let Some(value) = &validated[index] else {
+                continue;
+            };
+            let key = (input.collection_group_id, value.name.as_str());
+            match first_seen.get(&key) {
                 Some(&first) => {
                     if !batch_dupe_indices.contains(&first) {
                         batch_dupe_indices.push(first);
@@ -1310,7 +1345,7 @@ impl TagService {
                     batch_dupe_indices.push(index);
                 }
                 None => {
-                    first_seen.insert(&value.name, index);
+                    first_seen.insert(key, index);
                 }
             }
         }
@@ -1327,39 +1362,44 @@ impl TagService {
         // final backstop for anything this snapshot cannot see - including a
         // same-batch name swap, which this exclusion alone cannot fully
         // clear (see this method's doc comment).
+        //
+        // The owner lookup is keyed by (collection_group_id, name), matching
+        // the UNIQUE(collection_group_id, name) constraint (migration 0011)
+        // - keying by name alone would let two existing tags in different
+        // groups that happen to share a name silently collide in this
+        // HashMap (last one read wins), hiding genuine same-group conflicts
+        // or raising false ones depending on which row won.
         let candidate_names: Vec<&str> = validated
             .iter()
             .filter_map(|value| value.as_ref().map(|value| value.name.as_str()))
             .collect();
         if !candidate_names.is_empty() {
             let mut qb: QueryBuilder<Sqlite> =
-                QueryBuilder::new("SELECT id, name FROM tags WHERE name IN (");
+                QueryBuilder::new("SELECT id, collection_group_id, name FROM tags WHERE name IN (");
             let mut separated = qb.separated(", ");
             for name in &candidate_names {
                 separated.push_bind(*name);
             }
             qb.push(")");
-            let existing_names: Vec<(i64, String)> = qb
+            let existing_rows: Vec<(i64, i64, String)> = qb
                 .build_query_as()
                 .fetch_all(&mut *connection)
                 .await
                 .map_err(banto_storage::storage_error)?;
-            let owner_by_name: HashMap<String, i64> = existing_names
+            let owner_by_group_name: HashMap<(i64, String), i64> = existing_rows
                 .into_iter()
-                .map(|(id, name)| (name, id))
+                .map(|(id, collection_group_id, name)| ((collection_group_id, name), id))
                 .collect();
-            for (index, (id, value)) in updates
-                .iter()
-                .map(|(id, _)| id)
-                .zip(validated.iter())
-                .enumerate()
-            {
-                let Some(value) = value else { continue };
-                if let Some(&owner_id) = owner_by_name.get(&value.name) {
+            for (index, (id, input)) in updates.iter().enumerate() {
+                let Some(value) = &validated[index] else {
+                    continue;
+                };
+                let key = (input.collection_group_id, value.name.clone());
+                if let Some(&owner_id) = owner_by_group_name.get(&key) {
                     if owner_id != *id {
                         row_errors[index].push(FieldError {
                             field: "name".to_string(),
-                            message: "既に使用されています".to_string(),
+                            message: NAME_ALREADY_USED_IN_GROUP.to_string(),
                         });
                     }
                 }
@@ -1419,10 +1459,15 @@ impl TagService {
             if let Some(revision) = input.expected_revision {
                 query = query.bind(revision);
             }
-            let row = query
-                .fetch_one(&mut *connection)
-                .await
-                .map_err(|err| map_write_error(err, "name", "collectionGroupId", FK_MESSAGE))?;
+            let row = query.fetch_one(&mut *connection).await.map_err(|err| {
+                map_write_error(
+                    err,
+                    "name",
+                    NAME_ALREADY_USED_IN_GROUP,
+                    "collectionGroupId",
+                    FK_MESSAGE,
+                )
+            })?;
             updated.push(row);
         }
 
@@ -1503,11 +1548,17 @@ impl TagService {
             }
         }
 
-        let mut first_seen: HashMap<&str, usize> = HashMap::new();
+        // Keyed by (collection_group_id, name), not name alone - see
+        // update_batch_tx's identical comment above (migration 0011,
+        // 2026-08-31 オーナー決定: `tags.name` はグループ内一意).
+        let mut first_seen: HashMap<(i64, &str), usize> = HashMap::new();
         let mut batch_dupe_indices = Vec::new();
-        for (index, value) in validated.iter().enumerate() {
-            let Some(value) = value else { continue };
-            match first_seen.get(value.name.as_str()) {
+        for (index, input) in inputs.iter().enumerate() {
+            let Some(value) = &validated[index] else {
+                continue;
+            };
+            let key = (input.collection_group_id, value.name.as_str());
+            match first_seen.get(&key) {
                 Some(&first) => {
                     if !batch_dupe_indices.contains(&first) {
                         batch_dupe_indices.push(first);
@@ -1515,7 +1566,7 @@ impl TagService {
                     batch_dupe_indices.push(index);
                 }
                 None => {
-                    first_seen.insert(&value.name, index);
+                    first_seen.insert(key, index);
                 }
             }
         }
@@ -1526,31 +1577,36 @@ impl TagService {
             });
         }
 
+        // Existing-tag lookup keyed by (collection_group_id, name) - a plain
+        // `HashSet<String>` of names would treat "same name, different
+        // group" as a collision even though it is not one under
+        // UNIQUE(collection_group_id, name) (migration 0011).
         let candidate_names: Vec<&str> = validated
             .iter()
             .filter_map(|value| value.as_ref().map(|value| value.name.as_str()))
             .collect();
         if !candidate_names.is_empty() {
             let mut qb: QueryBuilder<Sqlite> =
-                QueryBuilder::new("SELECT name FROM tags WHERE name IN (");
+                QueryBuilder::new("SELECT collection_group_id, name FROM tags WHERE name IN (");
             let mut separated = qb.separated(", ");
             for name in &candidate_names {
                 separated.push_bind(*name);
             }
             qb.push(")");
-            let existing: Vec<(String,)> = qb
+            let existing: Vec<(i64, String)> = qb
                 .build_query_as()
                 .fetch_all(&mut *connection)
                 .await
                 .map_err(banto_storage::storage_error)?;
-            let existing_names: HashSet<String> =
-                existing.into_iter().map(|(name,)| name).collect();
-            for (index, value) in validated.iter().enumerate() {
-                let Some(value) = value else { continue };
-                if existing_names.contains(&value.name) {
+            let existing_group_names: HashSet<(i64, String)> = existing.into_iter().collect();
+            for (index, input) in inputs.iter().enumerate() {
+                let Some(value) = &validated[index] else {
+                    continue;
+                };
+                if existing_group_names.contains(&(input.collection_group_id, value.name.clone())) {
                     row_errors[index].push(FieldError {
                         field: "name".to_string(),
-                        message: "既に使用されています".to_string(),
+                        message: NAME_ALREADY_USED_IN_GROUP.to_string(),
                     });
                 }
             }
@@ -1600,7 +1656,15 @@ impl TagService {
                 .bind(input.retain)
                 .fetch_one(&mut *connection)
                 .await
-                .map_err(|err| map_write_error(err, "name", "collectionGroupId", FK_MESSAGE))?;
+                .map_err(|err| {
+                    map_write_error(
+                        err,
+                        "name",
+                        NAME_ALREADY_USED_IN_GROUP,
+                        "collectionGroupId",
+                        FK_MESSAGE,
+                    )
+                })?;
             created.push(row);
         }
 
@@ -1693,11 +1757,15 @@ impl TagService {
         // Intra-batch duplicates: every index sharing a name with another
         // index gets flagged, not just the "later" occurrence - a preview/
         // CSV row list is easier to fix when every offending line is marked.
-        let mut first_seen: HashMap<&str, usize> = HashMap::new();
+        // Keyed by (collection_group_id, name), not name alone - see
+        // update_batch_tx's identical comment for why (migration 0011,
+        // 2026-08-31 オーナー決定: `tags.name` はグループ内一意).
+        let mut first_seen: HashMap<(i64, &str), usize> = HashMap::new();
         let mut batch_dupe_indices: Vec<usize> = Vec::new();
-        for (index, v) in validated.iter().enumerate() {
-            let Some(v) = v else { continue };
-            match first_seen.get(v.name.as_str()) {
+        for (index, input) in inputs.iter().enumerate() {
+            let Some(v) = &validated[index] else { continue };
+            let key = (input.collection_group_id, v.name.as_str());
+            match first_seen.get(&key) {
                 Some(&first) => {
                     if !batch_dupe_indices.contains(&first) {
                         batch_dupe_indices.push(first);
@@ -1705,7 +1773,7 @@ impl TagService {
                     batch_dupe_indices.push(index);
                 }
                 None => {
-                    first_seen.insert(&v.name, index);
+                    first_seen.insert(key, index);
                 }
             }
         }
@@ -1717,31 +1785,35 @@ impl TagService {
         }
 
         // Duplicates against already-persisted tags: one query covering
-        // every syntactically-valid name in the batch.
+        // every syntactically-valid name in the batch, matched by
+        // (collection_group_id, name) - a plain name-only HashSet would
+        // treat "same name, different group" as a collision even though it
+        // is not one under UNIQUE(collection_group_id, name) (migration
+        // 0011).
         let candidate_names: Vec<&str> = validated
             .iter()
             .filter_map(|v| v.as_ref().map(|v| v.name.as_str()))
             .collect();
         if !candidate_names.is_empty() {
             let mut qb: QueryBuilder<Sqlite> =
-                QueryBuilder::new("SELECT name FROM tags WHERE name IN (");
+                QueryBuilder::new("SELECT collection_group_id, name FROM tags WHERE name IN (");
             let mut separated = qb.separated(", ");
             for name in &candidate_names {
                 separated.push_bind(*name);
             }
             qb.push(")");
-            let existing: Vec<(String,)> = qb
+            let existing: Vec<(i64, String)> = qb
                 .build_query_as()
                 .fetch_all(&self.pool)
                 .await
                 .map_err(banto_storage::storage_error)?;
-            let existing_names: HashSet<String> = existing.into_iter().map(|(n,)| n).collect();
-            for (index, v) in validated.iter().enumerate() {
-                let Some(v) = v else { continue };
-                if existing_names.contains(&v.name) {
+            let existing_group_names: HashSet<(i64, String)> = existing.into_iter().collect();
+            for (index, input) in inputs.iter().enumerate() {
+                let Some(v) = &validated[index] else { continue };
+                if existing_group_names.contains(&(input.collection_group_id, v.name.clone())) {
                     row_errors[index].push(FieldError {
                         field: "name".to_string(),
-                        message: "既に使用されています".to_string(),
+                        message: NAME_ALREADY_USED_IN_GROUP.to_string(),
                     });
                 }
             }
@@ -1803,7 +1875,15 @@ impl TagService {
                 .bind(input.retain)
                 .fetch_one(&mut *tx)
                 .await
-                .map_err(|err| map_write_error(err, "name", "collectionGroupId", FK_MESSAGE))?;
+                .map_err(|err| {
+                    map_write_error(
+                        err,
+                        "name",
+                        NAME_ALREADY_USED_IN_GROUP,
+                        "collectionGroupId",
+                        FK_MESSAGE,
+                    )
+                })?;
             created.push(row);
         }
         tx.commit().await.map_err(banto_storage::storage_error)?;
@@ -2233,10 +2313,49 @@ mod tests {
         match err {
             BantoError::Validation { field_errors } => {
                 assert_eq!(field_errors[0].field, "name");
-                assert_eq!(field_errors[0].message, "既に使用されています");
+                assert_eq!(field_errors[0].message, NAME_ALREADY_USED_IN_GROUP);
             }
             other => panic!("expected Validation, got {other:?}"),
         }
+    }
+
+    /// 2026-08-31 オーナー決定の主目的そのもの: 同型構成の装置を複数台
+    /// つないで同じ PLC アドレス（＝同じタグ名）を使う構成を許すため、
+    /// `tags.name` の一意性を全体一意→収集グループ内一意へ緩和した
+    /// （migration 0011）。同じ名前でも収集グループが違えば両方登録できる
+    /// ことを、[`create_rejects_duplicate_name`]（同一グループでは拒否される
+    /// こと）の直接の対になるテストとして確認する。
+    #[tokio::test]
+    async fn create_allows_the_same_name_in_a_different_collection_group() {
+        let (svc, group_id) = setup().await;
+        let other_group = CollectionGroupService::new(svc.pool.clone())
+            .create(CollectionGroupInput {
+                name: "OtherGroup".to_string(),
+                plc_connection_id: PlcConnectionService::new(svc.pool.clone())
+                    .list(ListParams::default())
+                    .await
+                    .unwrap()
+                    .rows[0]
+                    .id,
+                period_ms: 1_000,
+                enabled: true,
+            })
+            .await
+            .unwrap();
+
+        let first = svc
+            .create(sample_input("D100", group_id))
+            .await
+            .expect("first tag should be created");
+        let second = svc
+            .create(sample_input("D100", other_group.id))
+            .await
+            .expect("same name in a different group should be accepted");
+
+        assert_eq!(first.name, "D100");
+        assert_eq!(second.name, "D100");
+        assert_ne!(first.collection_group_id, second.collection_group_id);
+        assert_ne!(first.id, second.id);
     }
 
     #[tokio::test]
@@ -3257,6 +3376,225 @@ mod tests {
         .is_err());
     }
 
+    // --- migration 0011 (table rebuild: tags.name グループ内一意へ) --------
+
+    /// Migration 0011 rebuilds `tags` again (SQLite cannot `ALTER` a
+    /// column-level `UNIQUE` into a table-level composite one), so this test
+    /// follows `migration_0005_preserves_rows_and_foreign_keys_on_a_populated_database`'s
+    /// exact recipe: the whole migration chain 0001-0010 applied first (a
+    /// faithful stand-in for a deployed pre-0011 database), non-default
+    /// values throughout the seeded row so a dropped/transposed column would
+    /// show up as a mismatch, then 0011 applied on its own pinned connection
+    /// inside one transaction exactly as sqlx's own `Migrate::apply` runs it.
+    #[tokio::test]
+    async fn migration_0011_preserves_rows_and_allows_the_same_name_in_a_different_group() {
+        use sqlx::{Acquire, Executor};
+
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect_sqlite_memory");
+        let mut conn = pool.acquire().await.expect("acquire one pinned connection");
+
+        // The schema as of 0010, i.e. what a deployed pre-0011 database
+        // looks like.
+        for (label, sql) in [
+            (
+                "0001",
+                include_str!("../migrations/0001_plc_connections.sql"),
+            ),
+            (
+                "0002",
+                include_str!("../migrations/0002_collection_groups.sql"),
+            ),
+            ("0003", include_str!("../migrations/0003_tags.sql")),
+            (
+                "0004",
+                include_str!("../migrations/0004_plc_connections_allow_slmp.sql"),
+            ),
+            (
+                "0005",
+                include_str!("../migrations/0005_tags_allow_string.sql"),
+            ),
+            (
+                "0006",
+                include_str!("../migrations/0006_tags_writable_kind.sql"),
+            ),
+            (
+                "0007",
+                include_str!("../migrations/0007_plc_connections_allow_virtual.sql"),
+            ),
+            (
+                "0008",
+                include_str!("../migrations/0008_plc_connections_add_simulation.sql"),
+            ),
+            ("0009", include_str!("../migrations/0009_tags_revision.sql")),
+            (
+                "0010",
+                include_str!("../migrations/0010_plc_connections_add_word_order.sql"),
+            ),
+        ] {
+            conn.execute(sql)
+                .await
+                .unwrap_or_else(|e| panic!("pre-0011 migration {label} failed: {e}"));
+        }
+
+        // Two connections, each with its own group, so the eventual
+        // duplicate-name-across-groups insert below is a realistic "two
+        // identical PLCs" scenario, not just two groups under one PLC.
+        conn.execute(
+            "INSERT INTO plc_connections (id, name, protocol, host, port, unit_id, enabled) \
+             VALUES (7, 'Line1 PLC', 'slmp', '192.168.1.10', 5007, 3, 0)",
+        )
+        .await
+        .expect("seed connection 1");
+        conn.execute(
+            "INSERT INTO plc_connections (id, name, protocol, host, port, unit_id, enabled) \
+             VALUES (8, 'Line2 PLC', 'slmp', '192.168.1.11', 5007, 3, 1)",
+        )
+        .await
+        .expect("seed connection 2");
+        conn.execute(
+            "INSERT INTO collection_groups (id, name, plc_connection_id, period_ms, enabled) \
+             VALUES (4, 'G1', 7, 1000, 1)",
+        )
+        .await
+        .expect("seed collection group 1");
+        conn.execute(
+            "INSERT INTO collection_groups (id, name, plc_connection_id, period_ms, enabled) \
+             VALUES (5, 'G2', 8, 1000, 1)",
+        )
+        .await
+        .expect("seed collection group 2");
+        // Non-default values throughout - a column dropped or transposed by
+        // the rebuild shows up as a mismatch rather than coinciding with a
+        // default.
+        conn.execute(
+            "INSERT INTO tags (id, name, collection_group_id, address, data_type, string_length, \
+             raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, threshold_h, threshold_hh, \
+             threshold_l, threshold_ll, enabled, writable, tag_kind, expression, retain, revision) \
+             VALUES (9, 'D100', 4, 'D100', 'i16', NULL, 0, 100, 0, 50, 'degC', 2, 45, 50, 10, 5, \
+             1, 1, 'plc', NULL, 0, 3)",
+        )
+        .await
+        .expect("seed tag");
+
+        let migration = include_str!("../migrations/0011_tags_unique_name_per_group.sql");
+        let mut tx = conn.begin().await.expect("begin, as the migrator does");
+        tx.execute(migration).await.expect("0011 should apply");
+        tx.commit().await.expect("0011 should commit");
+
+        // Every column of the existing tag survived, values and all.
+        #[allow(clippy::type_complexity)]
+        let tag: (
+            i64,
+            String,
+            i64,
+            String,
+            String,
+            i64,
+            bool,
+            String,
+            Option<String>,
+            bool,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT id, name, collection_group_id, address, data_type, decimals, \
+             writable, tag_kind, expression, retain, revision FROM tags WHERE id = 9",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the seeded tag should have been copied across");
+        assert_eq!(
+            tag,
+            (
+                9,
+                "D100".to_string(),
+                4,
+                "D100".to_string(),
+                "i16".to_string(),
+                2,
+                true,
+                "plc".to_string(),
+                None,
+                false,
+                3
+            )
+        );
+
+        let violations: Vec<(String,)> = sqlx::query_as("PRAGMA foreign_key_check")
+            .fetch_all(&mut *conn)
+            .await
+            .expect("foreign_key_check");
+        assert!(
+            violations.is_empty(),
+            "the rebuild left dangling foreign keys: {violations:?}"
+        );
+
+        // Foreign keys are still *enforced*, not merely currently consistent.
+        assert!(
+            sqlx::query(
+                "INSERT INTO tags (name, collection_group_id, address, data_type) \
+                 VALUES ('orphan', 999, 'D0', 'i16')",
+            )
+            .execute(&mut *conn)
+            .await
+            .is_err(),
+            "foreign keys should still be enforced after the migration"
+        );
+
+        // The index survived under its original name.
+        let index_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+             AND name = 'idx_tags_collection_group_id'",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("index lookup");
+        assert_eq!(index_count, 1);
+
+        // The point of the whole exercise: the same PLC address ("D100"),
+        // used as the tag name, is now registerable under a *different*
+        // collection group - the "two identical PLCs" scenario the owner's
+        // 2026-08-31 decision exists to unblock.
+        sqlx::query(
+            "INSERT INTO tags (name, collection_group_id, address, data_type) \
+             VALUES ('D100', 5, 'D100', 'i16')",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("the same tag name should now be accepted in a different collection group");
+
+        // But the constraint is not simply gone: the *same* group still
+        // rejects the *same* name.
+        assert!(
+            sqlx::query(
+                "INSERT INTO tags (name, collection_group_id, address, data_type) \
+                 VALUES ('D100', 4, 'D200', 'i16')",
+            )
+            .execute(&mut *conn)
+            .await
+            .is_err(),
+            "UNIQUE(collection_group_id, name) should still reject a same-group duplicate"
+        );
+
+        // Defense-in-depth CHECKs from earlier migrations survived the
+        // rebuild too (0005's data_type/string_length, 0006's tag_kind).
+        assert!(sqlx::query(
+            "INSERT INTO tags (name, collection_group_id, address, data_type) \
+             VALUES ('Nope', 4, 'D300', 'f64')",
+        )
+        .execute(&mut *conn)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "INSERT INTO tags (name, collection_group_id, address, data_type, tag_kind) \
+             VALUES ('Nope2', 4, 'D400', 'i16', 'bogus')",
+        )
+        .execute(&mut *conn)
+        .await
+        .is_err());
+    }
+
     // --- list -------------------------------------------------------------
 
     #[tokio::test]
@@ -3478,7 +3816,10 @@ mod tests {
                 assert_eq!(errors.len(), 1);
                 assert_eq!(errors[0].index, 0);
                 assert_eq!(errors[0].field_errors[0].field, "name");
-                assert_eq!(errors[0].field_errors[0].message, "既に使用されています");
+                assert_eq!(
+                    errors[0].field_errors[0].message,
+                    NAME_ALREADY_USED_IN_GROUP
+                );
             }
             other => panic!("expected Invalid, got {other:?}"),
         }
@@ -3496,6 +3837,94 @@ mod tests {
             BatchTagOutcome::Valid { count, tags } => {
                 assert_eq!(count, 0);
                 assert_eq!(tags, Some(Vec::new()));
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    /// [`create_batch_flags_a_name_already_used_by_an_existing_tag`]'s direct
+    /// negative counterpart: a name already used by a persisted tag in a
+    /// *different* group must NOT be flagged - migration 0011's whole point.
+    /// Also covers the `create_batch_tx`/`create_batch` bug this task fixed:
+    /// the persisted-duplicate lookup used to be a name-only `HashSet`/
+    /// `HashMap`, so two existing tags sharing a name across groups would
+    /// silently collide inside it (last-inserted-wins on the hash key) -
+    /// keying by `(collection_group_id, name)` fixes that.
+    #[tokio::test]
+    async fn create_batch_allows_a_name_already_used_by_an_existing_tag_in_a_different_group() {
+        let (svc, group_id) = setup().await;
+        let other_group = CollectionGroupService::new(svc.pool.clone())
+            .create(CollectionGroupInput {
+                name: "OtherGroup".to_string(),
+                plc_connection_id: PlcConnectionService::new(svc.pool.clone())
+                    .list(ListParams::default())
+                    .await
+                    .unwrap()
+                    .rows[0]
+                    .id,
+                period_ms: 1_000,
+                enabled: true,
+            })
+            .await
+            .unwrap();
+        svc.create(sample_input("D100", group_id)).await.unwrap();
+
+        let outcome = svc
+            .create_batch(vec![sample_input("D100", other_group.id)], false)
+            .await
+            .unwrap();
+        match outcome {
+            BatchTagOutcome::Valid { count, tags } => {
+                assert_eq!(count, 1);
+                let tags = tags.expect("non-dry-run reports created rows");
+                assert_eq!(tags[0].name, "D100");
+                assert_eq!(tags[0].collection_group_id, other_group.id);
+            }
+            other => panic!("expected Valid, got {other:?}"),
+        }
+
+        let all = svc.list(ListParams::default()).await.unwrap();
+        assert_eq!(all.total_count, 2, "both same-named tags should exist now");
+    }
+
+    /// Same fix, exercised on the intra-batch duplicate check instead of the
+    /// persisted-tag one: two rows in one request sharing a name but
+    /// targeting different groups are not a same-batch conflict either
+    /// (previously keyed by name alone, same bug class as the test above).
+    #[tokio::test]
+    async fn create_batch_does_not_flag_the_same_name_across_different_groups_within_the_request() {
+        let (svc, group_id) = setup().await;
+        let other_group = CollectionGroupService::new(svc.pool.clone())
+            .create(CollectionGroupInput {
+                name: "OtherGroup".to_string(),
+                plc_connection_id: PlcConnectionService::new(svc.pool.clone())
+                    .list(ListParams::default())
+                    .await
+                    .unwrap()
+                    .rows[0]
+                    .id,
+                period_ms: 1_000,
+                enabled: true,
+            })
+            .await
+            .unwrap();
+
+        let outcome = svc
+            .create_batch(
+                vec![
+                    sample_input("D100", group_id),
+                    sample_input("D100", other_group.id),
+                ],
+                false,
+            )
+            .await
+            .unwrap();
+        match outcome {
+            BatchTagOutcome::Valid { count, tags } => {
+                assert_eq!(count, 2);
+                let tags = tags.expect("non-dry-run reports created rows");
+                assert_eq!(tags[0].collection_group_id, group_id);
+                assert_eq!(tags[1].collection_group_id, other_group.id);
             }
             other => panic!("expected Valid, got {other:?}"),
         }
@@ -3712,7 +4141,7 @@ mod tests {
                     errors[0]
                         .field_errors
                         .iter()
-                        .any(|e| e.field == "name" && e.message == "既に使用されています"),
+                        .any(|e| e.field == "name" && e.message == NAME_ALREADY_USED_IN_GROUP),
                     "{errors:?}"
                 );
             }
@@ -3720,6 +4149,104 @@ mod tests {
         }
         tx.rollback().await.expect("rollback");
         assert_eq!(svc.get(b.id).await.unwrap().name, "UB-I");
+    }
+
+    /// [`update_batch_tx_flags_a_name_already_used_by_another_row`]'s direct
+    /// negative counterpart, and a regression test for the bug this task
+    /// fixed: the persisted-name owner lookup used to be a plain
+    /// `HashMap<String, i64>` keyed by name alone, so an existing tag in a
+    /// *different* group with the same target name would either falsely
+    /// block this update or (worse, since `.collect()` on a duplicate key
+    /// keeps only the last row read) silently mask a genuine same-group
+    /// conflict elsewhere in the batch, depending on read order. Keying by
+    /// `(collection_group_id, name)` fixes both failure modes.
+    #[tokio::test]
+    async fn update_batch_tx_allows_a_name_already_used_by_another_row_in_a_different_group() {
+        let (svc, group_id) = setup().await;
+        let other_group = CollectionGroupService::new(svc.pool.clone())
+            .create(CollectionGroupInput {
+                name: "OtherGroup".to_string(),
+                plc_connection_id: PlcConnectionService::new(svc.pool.clone())
+                    .list(ListParams::default())
+                    .await
+                    .unwrap()
+                    .rows[0]
+                    .id,
+                period_ms: 1_000,
+                enabled: true,
+            })
+            .await
+            .unwrap();
+        let a = svc.create(sample_input("UB-H2", group_id)).await.unwrap();
+        // `b` owns "UB-I2", but in the *other* group - not a conflict for `a`,
+        // which stays in `group_id`.
+        svc.create(sample_input("UB-I2", other_group.id))
+            .await
+            .unwrap();
+
+        let input_a = sample_input("UB-I2", group_id);
+        let mut tx = svc.pool.begin().await.expect("begin tx");
+        let outcome = svc
+            .update_batch_tx(&mut tx, &[(a.id, input_a)])
+            .await
+            .expect("update_batch_tx should succeed");
+        assert!(
+            matches!(outcome, BatchTagUpdateOutcome::Valid { count: 1, .. }),
+            "{outcome:?}"
+        );
+        tx.commit().await.expect("commit");
+        assert_eq!(svc.get(a.id).await.unwrap().name, "UB-I2");
+    }
+
+    /// Same fix, exercised on the intra-batch duplicate check: two rows in
+    /// one `update_batch_tx` request renamed to the *same* name but moved
+    /// into two *different* groups is not a same-batch conflict (the
+    /// bulk-move UI path - `apps/banto-hub/src/lib/banto/tagBulkOps.ts` -
+    /// only ever changes `collectionGroupId`, but nothing stops a future
+    /// caller from combining a rename with a move in one batch).
+    #[tokio::test]
+    async fn update_batch_tx_does_not_flag_the_same_name_across_different_groups_within_the_request(
+    ) {
+        let (svc, group_id) = setup().await;
+        let other_group = CollectionGroupService::new(svc.pool.clone())
+            .create(CollectionGroupInput {
+                name: "OtherGroup".to_string(),
+                plc_connection_id: PlcConnectionService::new(svc.pool.clone())
+                    .list(ListParams::default())
+                    .await
+                    .unwrap()
+                    .rows[0]
+                    .id,
+                period_ms: 1_000,
+                enabled: true,
+            })
+            .await
+            .unwrap();
+        let a = svc.create(sample_input("UB-K1", group_id)).await.unwrap();
+        let b = svc
+            .create(sample_input("UB-K2", other_group.id))
+            .await
+            .unwrap();
+
+        // Both renamed to "Shared", but landing in two different groups.
+        let mut tx = svc.pool.begin().await.expect("begin tx");
+        let outcome = svc
+            .update_batch_tx(
+                &mut tx,
+                &[
+                    (a.id, sample_input("Shared", group_id)),
+                    (b.id, sample_input("Shared", other_group.id)),
+                ],
+            )
+            .await
+            .expect("update_batch_tx should succeed");
+        assert!(
+            matches!(outcome, BatchTagUpdateOutcome::Valid { count: 2, .. }),
+            "{outcome:?}"
+        );
+        tx.commit().await.expect("commit");
+        assert_eq!(svc.get(a.id).await.unwrap().name, "Shared");
+        assert_eq!(svc.get(b.id).await.unwrap().name, "Shared");
     }
 
     #[tokio::test]

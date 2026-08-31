@@ -1314,7 +1314,15 @@
 	 */
 	function openDuplicateDrawer(t: Tag): void {
 		if (!confirmDiscardIfNeeded()) return;
-		const existingNames = tags.map((tag) => tag.name);
+		// 2026-08-31 オーナー決定: タグ名の一意性は全体一意→収集グループ内一意へ
+		// 緩和された（サーバー側 `crates/banto-tags` migration 0011）。複製名が
+		// 避けるべき既存名も複製元と同じ収集グループ内のものだけでよい -
+		// 他グループの同名タグは合法な同名で、それを理由に `_copy2` へ
+		// 繰り上げるのは不要な事故防止（最終的な一意性検証は既存どおり
+		// サーバー側 `createTag` が正 - `tagDuplicate.ts` の doc comment参照）。
+		const existingNames = tags
+			.filter((tag) => tag.collectionGroupId === t.collectionGroupId)
+			.map((tag) => tag.name);
 		const next = buildDuplicateFormValues(formFromTag(t), existingNames);
 		createForm = next;
 		createBaseline = { ...next };

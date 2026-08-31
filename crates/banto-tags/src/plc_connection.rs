@@ -85,7 +85,9 @@ use banto_storage::ColumnMap;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
-use crate::support::{map_write_error, max_length_message, range_message, required_message};
+use crate::support::{
+    map_write_error, max_length_message, range_message, required_message, NAME_ALREADY_USED,
+};
 
 /// Protocols accepted in `plc_connections.protocol` today. Mirrors the SQL
 /// `CHECK` - as widened by `migrations/0004_plc_connections_allow_slmp.sql`,
@@ -398,7 +400,7 @@ impl PlcConnectionService {
         .bind(&input.word_order)
         .fetch_one(&self.pool)
         .await
-        .map_err(|err| map_write_error(err, "name", "", ""))
+        .map_err(|err| map_write_error(err, "name", NAME_ALREADY_USED, "", ""))
     }
 
     /// Transaction-compatible counterpart of [`Self::create`]. The caller
@@ -426,7 +428,7 @@ impl PlcConnectionService {
         .bind(&input.word_order)
         .fetch_one(&mut *connection)
         .await
-        .map_err(|err| map_write_error(err, "name", "", ""))
+        .map_err(|err| map_write_error(err, "name", NAME_ALREADY_USED, "", ""))
     }
 
     /// **T6-2 addition**: a `"virtual"`-protocol connection cannot be edited
@@ -477,7 +479,7 @@ impl PlcConnectionService {
                 resource: RESOURCE.to_string(),
                 id: id.to_string(),
             },
-            other => map_write_error(other, "name", "", ""),
+            other => map_write_error(other, "name", NAME_ALREADY_USED, "", ""),
         })
     }
 
@@ -525,7 +527,7 @@ impl PlcConnectionService {
                 resource: RESOURCE.to_string(),
                 id: id.to_string(),
             },
-            other => map_write_error(other, "name", "", ""),
+            other => map_write_error(other, "name", NAME_ALREADY_USED, "", ""),
         })
     }
 

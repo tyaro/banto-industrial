@@ -376,9 +376,13 @@ pub struct TagMap {
     by_external: HashMap<String, TagEntry>,
     /// Stable display/listing order: connection name, then group name, then
     /// tag name (design's own hub.rs sketch: "catalog の安定順(connection,
-    /// group, tag の名前順)"). `tags.name`/`collection_groups.name`/
-    /// `plc_connections.name` are each globally `UNIQUE` in the registry
-    /// schema, so external names never collide.
+    /// group, tag の名前順)"). `collection_groups.name`/`plc_connections.name`
+    /// are each globally `UNIQUE`, and `tags.name` is `UNIQUE(collection_group_id,
+    /// name)` (migration 0011, 2026-08-31 オーナー決定: 全体一意→収集グループ内
+    /// 一意へ緩和 - 同型装置を複数台つないで同じ PLC アドレスを使う構成を
+    /// 許すため) - so external names still never collide: two tags sharing a
+    /// `name` must live in two different groups, and those groups' own
+    /// (globally-unique) names already differ.
     ordered: Vec<String>,
 }
 
@@ -1733,6 +1737,108 @@ mod tests {
         assert!(all_simulation.connections[1].simulation);
         assert!(!all_simulation.connections[2].simulation);
         assert!(!all_simulation.connections[3].simulation);
+    }
+
+    /// 2026-08-31 オーナー決定「タグ名の一意性を全体一意→収集グループ内一意へ
+    /// 緩和」の回帰防止: `tags.name` が2つのグループで重複していても、
+    /// `external_name` は `{connection}.{group}.{tag}` の合成のまま従来どおり
+    /// 組み立てられ、かつグループをまたいで衝突しないこと -
+    /// `TagMap`（旧 `ordered`フィールドの doc comment参照）が前提とする
+    /// 「`collection_groups.name`/`plc_connections.name` は今もグローバルに
+    /// `UNIQUE` だから外部名は衝突しない」という理屈を、実際に
+    /// `build_catalog_from` を通して確かめる。DB を経由しない純粋関数テスト
+    /// (`all_simulation_overrides_only_enabled_physical_connections` と同じ
+    /// スタイル)。
+    #[test]
+    fn build_catalog_from_assembles_distinct_external_names_for_a_shared_tag_name_across_groups() {
+        let conn1 = PlcConnection {
+            id: 1,
+            name: "line1".to_string(),
+            protocol: "modbus-tcp".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 502,
+            unit_id: 1,
+            enabled: true,
+            simulation: false,
+
+            word_order: "low_high".to_string(),
+        };
+        let conn2 = PlcConnection {
+            id: 2,
+            name: "line2".to_string(),
+            protocol: "modbus-tcp".to_string(),
+            host: "127.0.0.2".to_string(),
+            port: 502,
+            unit_id: 1,
+            enabled: true,
+            simulation: false,
+
+            word_order: "low_high".to_string(),
+        };
+        let group1 = banto_tags::CollectionGroup {
+            id: 10,
+            name: "fast".to_string(),
+            plc_connection_id: conn1.id,
+            period_ms: 1_000,
+            enabled: true,
+        };
+        let group2 = banto_tags::CollectionGroup {
+            id: 20,
+            name: "slow".to_string(),
+            plc_connection_id: conn2.id,
+            period_ms: 1_000,
+            enabled: true,
+        };
+        let tag_in_group1 = Tag {
+            id: 100,
+            name: "D100".to_string(),
+            collection_group_id: group1.id,
+            address: "D100".to_string(),
+            data_type: "i16".to_string(),
+            string_length: None,
+            raw_lo: None,
+            raw_hi: None,
+            eng_lo: None,
+            eng_hi: None,
+            unit: None,
+            decimals: 0,
+            threshold_h: None,
+            threshold_hh: None,
+            threshold_l: None,
+            threshold_ll: None,
+            enabled: true,
+            writable: false,
+            tag_kind: "plc".to_string(),
+            expression: None,
+            retain: false,
+            revision: 1,
+        };
+        // Same `name` ("D100"), a different collection group - exactly the
+        // "two identical PLCs, same PLC address" scenario migration 0011
+        // exists to unblock.
+        let tag_in_group2 = Tag {
+            id: 200,
+            collection_group_id: group2.id,
+            ..tag_in_group1.clone()
+        };
+
+        let snapshot = RegistrySnapshot {
+            connections: vec![conn1, conn2],
+            groups: vec![group1, group2],
+            tags: vec![tag_in_group1, tag_in_group2],
+        };
+
+        let map = build_catalog_from(&snapshot).expect("build_catalog_from");
+        assert_eq!(map.iter().count(), 2, "both same-named tags must appear");
+
+        let entry1 = map.get("line1.fast.D100").expect("line1.fast.D100");
+        assert_eq!(entry1.ids, (1, 10, 100));
+        let entry2 = map.get("line2.slow.D100").expect("line2.slow.D100");
+        assert_eq!(entry2.ids, (2, 20, 200));
+        assert_ne!(
+            entry1.external_name, entry2.external_name,
+            "external names must not collide across groups"
+        );
     }
 
     // `crate::test_support`'s module doc: `TempDir::drop`'s retry needs a

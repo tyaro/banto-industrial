@@ -9,7 +9,7 @@ use banto_storage::ColumnMap;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
-use crate::support::{map_write_error, max_length_message, required_message};
+use crate::support::{map_write_error, max_length_message, required_message, NAME_ALREADY_USED};
 
 /// Selectable collection periods, milliseconds (recorder-requirements.md
 /// §3.1: "標準 1s / 選択肢 100ms・200ms・500ms・2s・5s・10s・1min") - mirrors
@@ -171,7 +171,15 @@ impl CollectionGroupService {
         .bind(input.enabled)
         .fetch_one(&self.pool)
         .await
-        .map_err(|err| map_write_error(err, "name", "plcConnectionId", FK_MESSAGE))
+        .map_err(|err| {
+            map_write_error(
+                err,
+                "name",
+                NAME_ALREADY_USED,
+                "plcConnectionId",
+                FK_MESSAGE,
+            )
+        })
     }
 
     /// Transaction-compatible counterpart of [`Self::create`].
@@ -193,7 +201,15 @@ impl CollectionGroupService {
         .bind(input.enabled)
         .fetch_one(&mut *connection)
         .await
-        .map_err(|err| map_write_error(err, "name", "plcConnectionId", FK_MESSAGE))
+        .map_err(|err| {
+            map_write_error(
+                err,
+                "name",
+                NAME_ALREADY_USED,
+                "plcConnectionId",
+                FK_MESSAGE,
+            )
+        })
     }
 
     pub async fn update(
@@ -220,7 +236,7 @@ impl CollectionGroupService {
                 resource: RESOURCE.to_string(),
                 id: id.to_string(),
             },
-            other => map_write_error(other, "name", "plcConnectionId", FK_MESSAGE),
+            other => map_write_error(other, "name", NAME_ALREADY_USED, "plcConnectionId", FK_MESSAGE),
         })
     }
 
@@ -250,7 +266,7 @@ impl CollectionGroupService {
                 resource: RESOURCE.to_string(),
                 id: id.to_string(),
             },
-            other => map_write_error(other, "name", "plcConnectionId", FK_MESSAGE),
+            other => map_write_error(other, "name", NAME_ALREADY_USED, "plcConnectionId", FK_MESSAGE),
         })
     }
 
