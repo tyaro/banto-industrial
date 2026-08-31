@@ -1,7 +1,8 @@
 //! Public owner for one banto-hub connection generation.
 //!
 //! This slice owns the supervisor task and exposes only a cloned state snapshot
-//! or watch receiver. Public restart and credential update remain an S4 concern.
+//! or watch receiver. `restart` replaces the consumed owner with a new client
+//! and credential set after the old generation has stopped and joined.
 
 use std::collections::HashSet;
 
@@ -31,6 +32,7 @@ pub struct TagClientHandle {
     state_tx: watch::Sender<TagClientState>,
     state_rx: watch::Receiver<TagClientState>,
     task: Option<JoinHandle<Result<()>>>,
+    requests: Vec<BindingRequest>,
     explicit_shutdown: bool,
 }
 
@@ -55,6 +57,7 @@ impl TagClientHandle {
         runtime: Handle,
         backoff: Option<worker::BackoffConfig>,
     ) -> Self {
+        let worker_requests = requests.clone();
         let (stop_tx, stop_rx) = oneshot::channel();
         let initial = TagClientState::new(TagClientConnectionState::Stopped);
         let (state_tx, state_rx) = watch::channel(initial);
@@ -64,7 +67,7 @@ impl TagClientHandle {
                 Some(backoff) => {
                     worker::run_supervisor_with_config(
                         &rest,
-                        &requests,
+                        &worker_requests,
                         SUBSCRIPTION_ID,
                         &worker_state_tx,
                         stop_rx,
@@ -75,7 +78,7 @@ impl TagClientHandle {
                 None => {
                     worker::run_supervisor(
                         &rest,
-                        &requests,
+                        &worker_requests,
                         SUBSCRIPTION_ID,
                         &worker_state_tx,
                         stop_rx,
@@ -89,6 +92,7 @@ impl TagClientHandle {
             state_tx,
             state_rx,
             task: Some(task),
+            requests,
             explicit_shutdown: false,
         }
     }
@@ -105,6 +109,50 @@ impl TagClientHandle {
 
     /// Request stop, close the socket when connected, and join the worker.
     pub async fn shutdown(mut self) -> Result<()> {
+        let joined = self.stop_and_join().await;
+        let result = match joined {
+            Ok(Ok(())) => {
+                self.publish_clean_stopped();
+                Ok(())
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => {
+                self.publish_failure(ErrorKind::Transport);
+                Err(Error::new(ErrorKind::Transport))
+            }
+        };
+        self.explicit_shutdown = true;
+        result
+    }
+
+    /// Replace this consumed owner with a new client and credential set.
+    ///
+    /// The old generation is stopped and joined before the replacement starts.
+    /// The old state receiver is left at clean `Stopped`; callers must subscribe
+    /// to the returned handle's new watch channel. Cancelling this future while
+    /// the old worker is joining drops this owner, so its task is aborted by
+    /// `Drop` and the replacement is not started.
+    pub async fn restart(mut self, replacement: RestClient) -> Result<TagClientHandle> {
+        let joined = self.stop_and_join().await;
+        match joined {
+            Err(_) => {
+                self.publish_failure(ErrorKind::Transport);
+                self.explicit_shutdown = true;
+                return Err(Error::new(ErrorKind::Transport));
+            }
+            Ok(Ok(())) | Ok(Err(_)) => {
+                // A completed stable worker error belongs to the replaced
+                // generation and must not prevent an explicit restart.
+                self.publish_clean_stopped();
+            }
+        }
+        self.explicit_shutdown = true;
+        let runtime = Handle::try_current().map_err(|_| Error::new(ErrorKind::Transport))?;
+        let requests = std::mem::take(&mut self.requests);
+        Ok(Self::spawn(replacement, requests, runtime))
+    }
+
+    async fn stop_and_join(&mut self) -> std::result::Result<Result<()>, JoinError> {
         if let Some(stop_tx) = self.stop_tx.take() {
             let _ = stop_tx.send(());
         }
@@ -112,13 +160,21 @@ impl TagClientHandle {
             Some(task) => task.await,
             None => Ok(Ok(())),
         };
-        if joined.is_err() {
-            let mut state = TagClientState::new(TagClientConnectionState::Stopped);
-            state.fail(ErrorKind::Transport);
-            self.state_tx.send_replace(state);
-        }
-        self.explicit_shutdown = true;
-        classify_join_result(joined)
+        // This runs only after the await completes. If the enclosing future is
+        // cancelled while waiting, `self.task` remains available to Drop.
+        self.task.take();
+        joined
+    }
+
+    fn publish_clean_stopped(&self) {
+        self.state_tx
+            .send_replace(TagClientState::new(TagClientConnectionState::Stopped));
+    }
+
+    fn publish_failure(&self, error: ErrorKind) {
+        let mut state = TagClientState::new(TagClientConnectionState::Stopped);
+        state.fail(error);
+        self.state_tx.send_replace(state);
     }
 }
 
@@ -155,6 +211,7 @@ pub(crate) fn validate_start_requests(requests: &[BindingRequest]) -> Result<()>
     Ok(())
 }
 
+#[cfg(test)]
 fn classify_join_result(joined: std::result::Result<Result<()>, JoinError>) -> Result<()> {
     match joined {
         Ok(result) => result,
@@ -245,6 +302,14 @@ mod tests {
         .unwrap()
     }
 
+    fn client_with_secret(address: String, secret: &str) -> RestClient {
+        RestClient::new(
+            Endpoint::new(address).unwrap(),
+            SecretApiKey::new(secret.to_owned()).unwrap(),
+        )
+        .unwrap()
+    }
+
     async fn read_http_request(stream: &mut TcpStream) {
         let mut request = Vec::new();
         let mut buffer = [0_u8; 1024];
@@ -253,6 +318,18 @@ mod tests {
             request.extend_from_slice(&buffer[..count]);
             if request.windows(4).any(|window| window == b"\r\n\r\n") {
                 return;
+            }
+        }
+    }
+
+    async fn read_http_request_text(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let count = stream.read(&mut buffer).await.unwrap();
+            request.extend_from_slice(&buffer[..count]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return String::from_utf8(request).unwrap();
             }
         }
     }
@@ -403,6 +480,89 @@ mod tests {
         )
         .await;
         socket
+    }
+
+    async fn serve_restart_after_terminal(
+        listener: TcpListener,
+        status: &'static str,
+        close_seen: oneshot::Sender<bool>,
+    ) {
+        let (mut old_http, _) = listener.accept().await.unwrap();
+        let old_request = read_http_request_text(&mut old_http).await;
+        assert!(old_request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer old-restart-secret"));
+        write_response(&mut old_http, status, String::new()).await;
+
+        let (mut new_http, _) = listener.accept().await.unwrap();
+        let new_request = read_http_request_text(&mut new_http).await;
+        assert!(new_request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer new-restart-secret"));
+        write_response(
+            &mut new_http,
+            "200 OK",
+            serde_json::to_string(&catalog()).unwrap(),
+        )
+        .await;
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        let subscription = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(subscription, Message::Text(_)));
+        socket
+            .send(Message::Text(
+                r#"{"op":"data","id":1,"t":1,"values":[{"tag":"alpha","v":1,"q":"good","t":1}]}"#
+                    .into(),
+            ))
+            .await
+            .unwrap();
+
+        let (mut values_stream, _) = listener.accept().await.unwrap();
+        read_http_request(&mut values_stream).await;
+        write_response(
+            &mut values_stream,
+            "200 OK",
+            serde_json::to_string(&values()).unwrap(),
+        )
+        .await;
+        observe_graceful_close(socket, close_seen).await;
+    }
+
+    async fn serve_two_generations(
+        listener: TcpListener,
+        old_close_seen: oneshot::Sender<bool>,
+        new_close_seen: oneshot::Sender<bool>,
+    ) {
+        let old_socket = serve_success(&listener).await;
+        observe_graceful_close(old_socket, old_close_seen).await;
+        let new_socket = serve_success(&listener).await;
+        observe_graceful_close(new_socket, new_close_seen).await;
+    }
+
+    async fn serve_restart_cancellation(
+        listener: TcpListener,
+        close_seen: oneshot::Sender<bool>,
+        peer_closed: oneshot::Sender<bool>,
+        second_connection: oneshot::Sender<bool>,
+    ) {
+        let socket = serve_success(&listener).await;
+        let mut socket = socket;
+        let first = tokio::time::timeout(Duration::from_secs(2), socket.next()).await;
+        let got_close = matches!(first, Ok(Some(Ok(Message::Close(_)))));
+        let _ = close_seen.send(got_close);
+        let disconnected = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .is_ok_and(|result| matches!(result, None | Some(Err(_))));
+        let _ = peer_closed.send(disconnected);
+        let connected = tokio::time::timeout(Duration::from_millis(200), listener.accept())
+            .await
+            .is_ok();
+        let _ = second_connection.send(connected);
     }
 
     async fn observe_graceful_close(
@@ -880,6 +1040,195 @@ mod tests {
     async fn unauthorized_401_and_403_are_single_attempt_terminal_failures() {
         assert_unauthorized_does_not_retry("401 Unauthorized").await;
         assert_unauthorized_does_not_retry("403 Forbidden").await;
+    }
+
+    async fn assert_restart_replaces_terminal_generation(status: &'static str) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (close_seen_tx, close_seen_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_restart_after_terminal(
+            listener,
+            status,
+            close_seen_tx,
+        ));
+
+        let old_handle = client_with_secret(address.clone(), "old-restart-secret")
+            .start(vec![request("alpha", StableTagId::new(1, 1, 1))])
+            .unwrap();
+        let mut old_state = old_handle.state_watch();
+        wait_failed(&mut old_state, ErrorKind::Unauthorized).await;
+        let replacement = client_with_secret(address, "new-restart-secret");
+        let new_handle =
+            tokio::time::timeout(Duration::from_secs(2), old_handle.restart(replacement))
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(
+            old_state.borrow().connection_state(),
+            TagClientConnectionState::Stopped
+        );
+        assert_eq!(old_state.borrow().current(), None);
+        assert_eq!(old_state.borrow().last_error(), None);
+        let mut new_state = new_handle.state_watch();
+        wait_live(&mut new_state).await;
+        assert!(new_state.borrow().current().is_some());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), new_handle.shutdown())
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        assert!(tokio::time::timeout(Duration::from_secs(2), close_seen_rx)
+            .await
+            .unwrap()
+            .unwrap());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_replaces_401_and_403_with_new_credentials_and_same_bindings() {
+        assert_restart_replaces_terminal_generation("401 Unauthorized").await;
+        assert_restart_replaces_terminal_generation("403 Forbidden").await;
+    }
+
+    #[tokio::test]
+    async fn restart_joins_old_live_socket_before_new_generation_and_closes_both() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (old_close_tx, old_close_rx) = oneshot::channel();
+        let (new_close_tx, new_close_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_two_generations(listener, old_close_tx, new_close_tx));
+
+        let old_handle = client(address.clone())
+            .start(vec![request("alpha", StableTagId::new(1, 1, 1))])
+            .unwrap();
+        let mut old_state = old_handle.state_watch();
+        wait_live(&mut old_state).await;
+        let replacement = client_with_secret(address, "replacement-secret");
+        let new_handle =
+            tokio::time::timeout(Duration::from_secs(2), old_handle.restart(replacement))
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(
+            old_state.borrow().connection_state(),
+            TagClientConnectionState::Stopped
+        );
+        assert_eq!(old_state.borrow().current(), None);
+        assert_eq!(old_state.borrow().last_error(), None);
+        assert!(tokio::time::timeout(Duration::from_secs(1), old_close_rx)
+            .await
+            .unwrap()
+            .unwrap());
+
+        let mut new_state = new_handle.state_watch();
+        wait_live(&mut new_state).await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), new_handle.shutdown())
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        assert!(tokio::time::timeout(Duration::from_secs(2), new_close_rx)
+            .await
+            .unwrap()
+            .unwrap());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelling_restart_future_aborts_old_generation_without_starting_replacement() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (close_seen_tx, close_seen_rx) = oneshot::channel();
+        let (peer_closed_tx, peer_closed_rx) = oneshot::channel();
+        let (second_connection_tx, second_connection_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_restart_cancellation(
+            listener,
+            close_seen_tx,
+            peer_closed_tx,
+            second_connection_tx,
+        ));
+
+        let old_handle = client(address.clone())
+            .start(vec![request("alpha", StableTagId::new(1, 1, 1))])
+            .unwrap();
+        let mut old_state = old_handle.state_watch();
+        wait_live(&mut old_state).await;
+        let replacement = client_with_secret(address, "replacement-not-started");
+        let restart_task = tokio::spawn(old_handle.restart(replacement));
+        assert!(tokio::time::timeout(Duration::from_secs(2), close_seen_rx)
+            .await
+            .unwrap()
+            .unwrap());
+        restart_task.abort();
+        match restart_task.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("cancelled restart unexpectedly completed"),
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state = old_state.borrow();
+                if state.connection_state() == TagClientConnectionState::Stopped
+                    && state.current().is_none()
+                    && state.last_error().is_none()
+                {
+                    return;
+                }
+                drop(state);
+                old_state.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2), peer_closed_rx)
+            .await
+            .unwrap()
+            .unwrap());
+        assert!(!second_connection_rx.await.unwrap());
+        server.await.unwrap();
+    }
+
+    fn panic_result() -> Result<()> {
+        panic!("test panic")
+    }
+
+    #[tokio::test]
+    async fn restart_join_error_is_transport_and_does_not_start_replacement() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (stop_tx, _stop_rx) = oneshot::channel();
+        let initial = TagClientState::new(TagClientConnectionState::Stopped);
+        let (state_tx, state_rx) = watch::channel(initial);
+        let task: JoinHandle<Result<()>> = tokio::spawn(async { panic_result() });
+        let handle = TagClientHandle {
+            stop_tx: Some(stop_tx),
+            state_tx,
+            state_rx,
+            task: Some(task),
+            requests: vec![request("alpha", StableTagId::new(1, 1, 1))],
+            explicit_shutdown: false,
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            handle.restart(client_with_secret(address, "replacement-not-started")),
+        )
+        .await
+        .unwrap();
+        let result = match result {
+            Ok(_) => panic!("restart unexpectedly succeeded after a join panic"),
+            Err(error) => error,
+        };
+        assert_eq!(result.kind(), ErrorKind::Transport);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

@@ -1,11 +1,13 @@
-//! `banto-tagclient` S3a: read-only Hub contracts and one owned stream generation.
+//! `banto-tagclient` S4a: read-only Hub contracts with owned restartable
+//! connection generations.
 //!
 //! This crate provides safe endpoint construction, Hub wire DTOs, an opaque
 //! API-key boundary, stable-ID binding resolution, read-only REST requests,
 //! network-free publish-gate core, direct authenticated WebSocket handshakes,
-//! and a public owner for one generation. Reconnect/backoff, rebinding,
-//! PLC/Modbus access, writes, Tauri, and keyring integration remain S3b (or an
-//! application-side concern).
+//! and a public owner for one generation. The consumed `TagClientHandle::restart`
+//! API replaces credentials and endpoint ownership only after the old worker is
+//! stopped and joined. PLC/Modbus access, writes, Tauri, and keyring integration
+//! remain outside this crate's read-only boundary.
 //!
 //! The DTOs mirror the machine-facing snake_case `/api/v1/tags` and
 //! `/api/v1/values` responses. Unknown mode, source, and quality strings are

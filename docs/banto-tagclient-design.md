@@ -1,12 +1,13 @@
 # banto-tagclient 設計
 
 作成日: 2026-08-29
-状態: **S3b完了（S3b-1/S3b-2）**。S1bのREST catalog/values transport、S2aの
+状態: **S4a完了（2026-09-01）**。S1bのREST catalog/values transport、S2aの
 Hub WS wire純粋解析・bounded pending map・latest-wins publish gate・非LIVE current抑止に加え、
 S2b-1の認証付きWebSocket handshake、S2b-2aのon_change subscribe送信と1フレーム受信、
 S2b-2bのcrate-private単一世代worker・tokio watchによるlatest snapshot配信・atomic publishを
 実装した。S3aでは公開Handle、worker所有権、明示shutdown、Drop時の非同期処理なしabortを
 実装した。S3b-1ではcatalog起点の逐次再接続、指数backoff、停止割り込みを実装し、S3b-2ではconfig_changed再bind、revision/runtime metadataの再解決、coalesceを実装した（2026-08-31）。
+S4aでは、資格情報を複製せず旧世代を停止・joinしてから置換RestClientで再開始する、消費型の公開`restart`を実装した（2026-09-01）。
 設計時参照baseline: `b9552627a86015b354b3c5651184fb108ba89e44`
 実API確認日: 2026-08-30（`apps/banto-hub/core/src/rest.rs` / `stream.rs`）
 
@@ -169,6 +170,7 @@ impl TagClientHandle {
 	pub fn state(&self) -> TagClientState;
 	pub fn state_watch(&self) -> tokio::sync::watch::Receiver<TagClientState>;
 	pub async fn shutdown(self) -> Result<()>;
+	pub async fn restart(self, replacement: RestClient) -> Result<TagClientHandle>;
 }
 ```
 
@@ -179,6 +181,10 @@ impl TagClientHandle {
 `shutdown().await`で停止通知・WebSocket close・worker joinを行う。DropはblockせずStoppedを
 通知してbest-effort abortする。worker失敗時は`TagClientState::last_error()`へ安定分類を残し、
 shutdownはそのエラーを返す。公開Handleによるcatalog起点の再接続・retry、rebinding、retry拡張はS3bで扱う。
+`restart(replacement)`はhandleとreplacement clientを消費し、旧workerの停止・WebSocket close・join完了後に
+同じbinding要求で新世代を起動する。旧`state_watch`はcleanな`stopped`で終わり、返却された新Handleの
+`state_watch`を購読する。restart futureのキャンセル時は旧handleのDropが残存workerをabortし、replacementも
+通常のDropで破棄される。旧taskの`JoinError`/panicは`transport`として返し、新世代を起動しない。
 
 `SecretApiKey`は明示的なopaque wrapperとする。crate-private APIは
 `SecretApiKey::new(String) -> Result<SecretApiKey, SecretError>`と、SDK内部だけが使う
@@ -293,7 +299,9 @@ sequenceDiagram
 - `TagClientHandle`がworker task、socket、channelの所有者である。
 - `shutdown().await`は停止通知、socket close、task joinを行う。明示shutdownを推奨し、
   Dropは同期的なStopped通知、停止通知、best-effort abortだけを行いblockしない。
-- `shutdown`後およびDrop後に再接続taskやsocketが残らないことをテストする。S3bで再接続とrebindingを扱う。
+- `restart(replacement).await`も旧task、socket、channelの停止・join後に新世代を開始する。旧watchは再利用せず、
+  返却handleの新しいwatchを購読する。restart futureのキャンセルでもDropが旧taskをabortする。
+- `shutdown`後、restart後、およびDrop後に再接続taskやsocketが残らないことをテストする。
 
 ## 7. 依存と実装ゲート
 
@@ -364,7 +372,8 @@ featureを有効化し、公開Handleだけがworkerをspawnする。新規packa
 | S3a    | 公開Handle、worker所有権、明示shutdown、Drop abort             | runtime外startのfail-closed、state/state_watch、Live後のgraceful close/join、in-flight stop、失敗error保持、Drop後のcurrent消去テストが通る。                               |
 | S3b-1  | catalog起点の再接続、backoff、停止割り込み                     | Transport/ProtocolError/CatalogUnavailableを逐次retryし、Unauthorized等をterminal扱いにする。Live後のbackoff reset、Reconnecting中のcurrent消去、停止割り込みテストが通る。 |
 | S3b-2  | config_changed、rebinding/coalesce、再解決、retry拡張          | revision/runtime metadata不一致の再解決、coalesced rebind、旧値無効化、停止可能なrebind retryを実装し、テストが通る。                                                       |
-| S4     | workspace統合と互換性固定                                      | 公開restart/credential更新、S4互換tag固定、実Hub/LAN統合検証、依存レビューと最終互換性確認を完了する。                                                                      |
+| S4a    | 公開restart、credential置換、旧世代join                        | terminal/Live世代の置換、旧watchのclean停止、旧join前の新接続抑止、restart cancellation、JoinError fail-closedのテストが通る。                                              |
+| S4     | workspace統合と互換性固定                                      | S4互換tag固定、実Hub/LAN統合検証、依存レビューと最終互換性確認を完了する。                                                                                                  |
 
 初版のDefinition of Doneは、全テスト表を自動化し、書き込み・PLC直結が存在せず、
 demoへの自動fallbackがなく、認証情報が全観測可能面からredactされ、停止後にworkerが

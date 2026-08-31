@@ -38,7 +38,9 @@ impl RestClient {
     /// Start one owned connection generation on the current Tokio runtime.
     ///
     /// Requests are validated before a task or network operation is created.
-    /// Reconnect, rebinding, and restart belong to the following slice.
+    /// Reconnect and rebinding are handled by the supervisor; use
+    /// [`TagClientHandle::restart`] to replace this consumed client and its
+    /// credentials after the old handle has stopped and joined.
     pub fn start(self, requests: Vec<BindingRequest>) -> Result<TagClientHandle> {
         validate_start_requests(&requests)?;
         let runtime =

@@ -1,12 +1,12 @@
 # docs 地図（まずここを読む）
 
 banto-industrial のドキュメント全体の入口。「どの文書が何の**正**か」「今どこまで進んでいるか」を
-1 画面で引くための地図。詳細は各文書へ辿る。最終更新: 2026-08-31。
+1 画面で引くための地図。詳細は各文書へ辿る。最終更新: 2026-09-01。
 
 > この地図は索引に徹する。実装状況・設計判断の本体は各文書側にあり、状態の**正**は
 > 常にリンク先の `状態:` 行と各表とする（CLAUDE.md H8 の状態欄同期規約）。
 
-## 現状ひとめ（2026-08-31）
+## 現状ひとめ（2026-09-01）
 
 - **構成**: Rust workspace + SvelteKit/Tauri。アプリは **banto-hub**（タグサーバー）/ **chronogazer**
   （記録計）/ **relay-wright**。上流 `banto` は git tag / `@banto/*` を消費（現行 **v1.2.0**）。
@@ -18,10 +18,10 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
   （windowed 化はバックログ降格）。
 - **Hardening（H1〜H10）**: すべて完了。H9（SLMP 構造化エラー + transport 共通化）は 2026-08-14 完了。
 - **出荷ゲート**: T5-5 = 72h soak 実行 + 実機最終サインオフのみ残（実機必須）。
-- **banto-tagclient**: **S3b完了（S3b-1/S3b-2、2026-08-31）**。読み取り専用DTO、Endpoint/Secret境界、
+- **banto-tagclient**: **S4a完了（2026-09-01）**。読み取り専用DTO、Endpoint/Secret境界、
   stable ID resolver、REST catalog/values transport、WS wire純粋解析、bounded publish gate、認証付き
   WebSocket handshake、on_change subscribe、単一世代workerとwatchによるatomic latest snapshot配信、
-  公開Handle、worker所有権、明示shutdown、catalog起点の再接続・backoff・停止割り込み、rebinding、config_changed再解決を実装済み。公開restart/credential更新、S4互換tag固定、実Hub/LAN統合検証はS4で実施する。
+  公開Handle、worker所有権、明示shutdown、catalog起点の再接続・backoff・停止割り込み、rebinding、config_changed再解決、消費型restartによるcredential/endpoint置換を実装済み。S4互換tag固定、実Hub/LAN統合検証は残課題である。
   Hubのrelease tagは未確定。
 
 ## まず読む順
