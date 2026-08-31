@@ -1,12 +1,12 @@
 # banto-tagclient 設計
 
 作成日: 2026-08-29
-状態: **S3b-1完了、S3b-2未完了**。S1bのREST catalog/values transport、S2aの
+状態: **S3b完了（S3b-1/S3b-2）**。S1bのREST catalog/values transport、S2aの
 Hub WS wire純粋解析・bounded pending map・latest-wins publish gate・非LIVE current抑止に加え、
 S2b-1の認証付きWebSocket handshake、S2b-2aのon_change subscribe送信と1フレーム受信、
 S2b-2bのcrate-private単一世代worker・tokio watchによるlatest snapshot配信・atomic publishを
 実装した。S3aでは公開Handle、worker所有権、明示shutdown、Drop時の非同期処理なしabortを
-実装した。S3b-1ではcatalog起点の逐次再接続、指数backoff、停止割り込みを実装した。config_changed再bind、revision/runtime metadataの再解決、coalesceはS3b-2で未実装である（2026-08-31）。
+実装した。S3b-1ではcatalog起点の逐次再接続、指数backoff、停止割り込みを実装し、S3b-2ではconfig_changed再bind、revision/runtime metadataの再解決、coalesceを実装した（2026-08-31）。
 設計時参照baseline: `b9552627a86015b354b3c5651184fb108ba89e44`
 実API確認日: 2026-08-30（`apps/banto-hub/core/src/rest.rs` / `stream.rs`）
 
@@ -178,7 +178,7 @@ impl TagClientHandle {
 `TagClientHandle`を返す。handleはclone不可で、`state`/`state_watch`だけを公開し、明示的な
 `shutdown().await`で停止通知・WebSocket close・worker joinを行う。DropはblockせずStoppedを
 通知してbest-effort abortする。worker失敗時は`TagClientState::last_error()`へ安定分類を残し、
-shutdownはそのエラーを返す。公開Handleによるcatalog起点の再接続・retryはS3b-1で扱い、rebindingとretry拡張はS3b-2で扱う。
+shutdownはそのエラーを返す。公開Handleによるcatalog起点の再接続・retry、rebinding、retry拡張はS3bで扱う。
 
 `SecretApiKey`は明示的なopaque wrapperとする。crate-private APIは
 `SecretApiKey::new(String) -> Result<SecretApiKey, SecretError>`と、SDK内部だけが使う
@@ -293,7 +293,7 @@ sequenceDiagram
 - `TagClientHandle`がworker task、socket、channelの所有者である。
 - `shutdown().await`は停止通知、socket close、task joinを行う。明示shutdownを推奨し、
   Dropは同期的なStopped通知、停止通知、best-effort abortだけを行いblockしない。
-- `shutdown`後およびDrop後に再接続taskやsocketが残らないことをテストする。再接続はS3b-1、rebindingはS3b-2で扱う。
+- `shutdown`後およびDrop後に再接続taskやsocketが残らないことをテストする。S3bで再接続とrebindingを扱う。
 
 ## 7. 依存と実装ゲート
 
@@ -360,11 +360,11 @@ featureを有効化し、公開Handleだけがworkerをspawnする。新規packa
 | S2b-1  | 認証付きWebSocket handshake transport                          | prefix保持URL、Authorization、redirect非追従、HTTP/timeout分類、1MiB制限、秘密redactionのテストが通る。                                                                     |
 | S2b-2a | on_change subscribe送信、1フレーム受信                         | 厳密なsubscribe JSON、共通tag validation、native Ping/Pong、Text受信、Binary/Close/EOF/容量分類のテストが通る。                                                             |
 | S2b-2b | 単一世代worker、watch latest snapshot配信、atomic publish      | catalog→WS subscribe→初回data→REST gateの順序、完全snapshotのatomic publish、live更新のlatest-wins、失敗時current消去のテストが通る。                                       |
-| S2     | WS購読、latest snapshot、状態機械                              | S2a/S2b-1/S2b-2a/S2b-2bの完了条件を満たし、WS先行接続から単一世代のatomic publishまでの全テストが通る。公開Handle、再接続、rebinding、shutdownはS3に残る。                  |
+| S2     | WS購読、latest snapshot、状態機械                              | S2a/S2b-1/S2b-2a/S2b-2bの完了条件を満たし、WS先行接続から単一世代のatomic publishまでの全テストが通る。公開Handle、再接続、rebinding、shutdownはS3a/S3bで扱う。             |
 | S3a    | 公開Handle、worker所有権、明示shutdown、Drop abort             | runtime外startのfail-closed、state/state_watch、Live後のgraceful close/join、in-flight stop、失敗error保持、Drop後のcurrent消去テストが通る。                               |
 | S3b-1  | catalog起点の再接続、backoff、停止割り込み                     | Transport/ProtocolError/CatalogUnavailableを逐次retryし、Unauthorized等をterminal扱いにする。Live後のbackoff reset、Reconnecting中のcurrent消去、停止割り込みテストが通る。 |
-| S3b-2  | config_changed、rebinding/coalesce、再解決、retry拡張          | revision/runtime metadata不一致の再解決、coalesced rebind、旧値無効化を実装する。                                                                                           |
-| S4     | workspace統合と互換性固定                                      | 依存レビュー、fmt/clippy/test、Hub互換commit/tagの記録が完了する。                                                                                                          |
+| S3b-2  | config_changed、rebinding/coalesce、再解決、retry拡張          | revision/runtime metadata不一致の再解決、coalesced rebind、旧値無効化、停止可能なrebind retryを実装し、テストが通る。                                                       |
+| S4     | workspace統合と互換性固定                                      | 公開restart/credential更新、S4互換tag固定、実Hub/LAN統合検証、依存レビューと最終互換性確認を完了する。                                                                      |
 
 初版のDefinition of Doneは、全テスト表を自動化し、書き込み・PLC直結が存在せず、
 demoへの自動fallbackがなく、認証情報が全観測可能面からredactされ、停止後にworkerが

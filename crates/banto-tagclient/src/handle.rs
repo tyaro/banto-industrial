@@ -1,7 +1,7 @@
 //! Public owner for one banto-hub connection generation.
 //!
 //! This slice owns the supervisor task and exposes only a cloned state snapshot
-//! or watch receiver. Rebinding and restart remain an S3b-2 concern.
+//! or watch receiver. Public restart and credential update remain an S4 concern.
 
 use std::collections::HashSet;
 
@@ -546,6 +546,28 @@ mod tests {
         let _ = peer_closed.send(closed);
     }
 
+    async fn serve_rebinding_drop(listener: TcpListener, second_started: oneshot::Sender<()>) {
+        let (mut first, _) = listener.accept().await.unwrap();
+        read_http_request(&mut first).await;
+        write_response(
+            &mut first,
+            "200 OK",
+            serde_json::to_string(&CatalogSnapshot {
+                revision: 1,
+                run_id: Some(7),
+                collection_mode: CollectionMode::Configured,
+                tags: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .await;
+        let (mut second, _) = listener.accept().await.unwrap();
+        read_http_request(&mut second).await;
+        second_started.send(()).unwrap();
+        let mut buffer = [0_u8; 64];
+        let _ = tokio::time::timeout(Duration::from_secs(1), second.read(&mut buffer)).await;
+    }
+
     async fn wait_live(receiver: &mut watch::Receiver<TagClientState>) {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -794,6 +816,34 @@ mod tests {
         assert_eq!(receiver.borrow().current(), None);
         assert_eq!(receiver.borrow().last_error(), None);
         assert!(!second_rx.await.unwrap());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drop_during_rebinding_clears_state_and_does_not_start_another_attempt() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (second_started_tx, second_started_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_rebinding_drop(listener, second_started_tx));
+        let handle = client(address)
+            .start(vec![request("alpha", StableTagId::new(1, 1, 1))])
+            .unwrap();
+        let mut receiver = handle.state_watch();
+        tokio::time::timeout(Duration::from_secs(1), second_started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(handle);
+        tokio::time::timeout(Duration::from_millis(200), receiver.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            receiver.borrow().connection_state(),
+            TagClientConnectionState::Stopped
+        );
+        assert_eq!(receiver.borrow().current(), None);
+        assert_eq!(receiver.borrow().last_error(), None);
         server.await.unwrap();
     }
 

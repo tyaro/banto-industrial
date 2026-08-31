@@ -321,6 +321,14 @@ impl TagClientState {
         }
     }
 
+    pub(crate) const fn rebinding(error: crate::error::ErrorKind) -> Self {
+        Self {
+            state: TagClientConnectionState::Rebinding,
+            current: None,
+            last_error: Some(error),
+        }
+    }
+
     pub(crate) fn transition(&mut self, state: TagClientConnectionState) {
         self.state = state;
         self.last_error = None;
