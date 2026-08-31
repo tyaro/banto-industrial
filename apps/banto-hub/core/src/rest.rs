@@ -164,6 +164,18 @@ struct AuthGate {
 /// （`users_router`等）でこれに差し替える - `/api/v1/*`のタグ空間 API
 /// （`require_tag_space_auth`、API キー認証）はこの対象外 - 設計 §5.6は
 /// 「管理 UI / 管理 REST」のみを試運転モードの対象にしている）。
+///
+/// `admin_tag_stream_router`（`/api/tag-stream`、試運転モード対応・
+/// 2026-08-31 オーナー決定）用に、ロックダウン済み時の bearer 取得へ
+/// [`extract_ws_protocol_token`]によるフォールバックを追加した -
+/// ブラウザの`WebSocket`は`Authorization`ヘッダを送れないため、
+/// `require_tag_space_auth`が`/api/v1/stream`向けに使っているのと同じ
+/// `Sec-WebSocket-Protocol: bearer, <token>`の運び方をここでも認める
+/// 必要がある。`extract_ws_protocol_token`はパスを厳密一致で許可リスト化
+/// している（`/api/v1/stream`と[`ADMIN_TAG_STREAM_PATH`]の2つのみ）ので、
+/// この関数を`.layer`として使う他の管理系ルーター（`/api/status`・
+/// `/api/users`等）には一切影響しない - それらのパスに対しては
+/// `extract_ws_protocol_token`が常に`None`を返す。
 async fn require_auth_or_commissioning(
     State(gate): State<AuthGate>,
     req: axum::extract::Request,
@@ -172,8 +184,11 @@ async fn require_auth_or_commissioning(
     if !gate.commissioning.is_locked_down() {
         return next.run(req).await;
     }
-    match bearer_token(req.headers()) {
-        Some(token) if gate.auth.verify(token) => next.run(req).await,
+    let token = bearer_token(req.headers())
+        .map(str::to_string)
+        .or_else(|| extract_ws_protocol_token(req.uri().path(), req.headers()));
+    match token {
+        Some(token) if gate.auth.verify(&token) => next.run(req).await,
         _ => unauthorized_response(),
     }
 }
@@ -200,6 +215,16 @@ async fn require_auth_or_commissioning(
 /// auth behavior changes - every other machine client (Rust tests, API-key
 /// clients) can and does set `Authorization` directly.
 ///
+/// 2026-08-31 オーナー決定（試運転モード対応の続き）: 管理系 WS
+/// `admin_tag_stream_router`（`/api/tag-stream`）も同じブラウザ制約
+/// （`Authorization`を送れない）を抱えるため、許可パスに
+/// [`ADMIN_TAG_STREAM_PATH`]を追加した。`/api/v1/stream`自身の挙動は
+/// 一切変えていない - この関数を呼ぶのは`require_tag_space_auth`
+/// （`/api/v1/stream`専用）と`require_auth_or_commissioning`
+/// （`admin_tag_stream_router`はこれ経由、他の管理系ルーターは
+/// このパス自体が来ないので影響なし）の2箇所のみで、どちらも
+/// パスの厳密一致で絞っているため他ルートへの越境は起きない。
+///
 /// Note: [`crate::stream::ws_upgrade`] calls
 /// `WebSocketUpgrade::protocols(["bearer"])`, which only selects/echoes
 /// `"bearer"` back in the response if the client actually offered it in its
@@ -209,7 +234,7 @@ async fn require_auth_or_commissioning(
 /// (`tokio-tungstenite`'s client-side handshake validation requires the echo
 /// when the client does offer a subprotocol).
 fn extract_ws_protocol_token(path: &str, headers: &HeaderMap) -> Option<String> {
-    if path != "/api/v1/stream" {
+    if path != "/api/v1/stream" && path != ADMIN_TAG_STREAM_PATH {
         return None;
     }
     let raw = headers
@@ -4903,30 +4928,21 @@ fn api_key_external_output_allowed(entry: &TagEntry, runtime: &CollectionStatus)
     )
 }
 
-/// `GET /api/v1/tags` - catalog: `{ "revision", "run_id",
-/// "collection_mode", "tags": [CatalogTagEntry...] }`,
-/// optionally filtered by `?connection=`/`?group=` (matched against the
-/// entry's connection/group *name*, design §5.1's route table). API-key
-/// requests additionally omit simulation and derived-simulation entries.
-#[utoipa::path(
-    get,
-    path = "/api/v1/tags",
-    params(
-        ("connection" = Option<String>, Query, description = "接続名で絞り込む"),
-        ("group" = Option<String>, Query, description = "収集グループ名で絞り込む"),
-    ),
-    responses((status = 200, description = "catalog スナップショット", body = CatalogResponse)),
-    tag = "tag-space",
-)]
-async fn v1_tags(
-    State(state): State<TagSpaceState>,
-    Query(query): Query<TagsQuery>,
-    ctx: Option<Extension<ApiKeyContext>>,
-) -> Json<CatalogResponse> {
+/// `GET /api/v1/tags`・管理系 `GET /api/tag-catalog`（[`admin_tag_catalog`]、
+/// 試運転モード対応・設計 §5.6・2026-08-31 オーナー決定「案A」の続き）が
+/// 共有する本体。`api_key_request` が true の場合のみ
+/// [`api_key_external_output_allowed`] でシミュレーション系タグを隠す
+/// （機械クライアント向けの絞り込み、design §5.1）。管理 UI 側の呼び出し
+/// （`admin_tag_catalog`、`api_key_request = false` 固定）は他の管理系
+/// エンドポイントと同様、シミュレーション設定も含め全件を返す。
+fn build_catalog_response(
+    state: &TagSpaceState,
+    query: &TagsQuery,
+    api_key_request: bool,
+) -> CatalogResponse {
     let map = state.manager.tag_map();
     let revision = state.manager.revision();
     let runtime = state.controller.status();
-    let api_key_request = ctx.is_some();
     let tags: Vec<CatalogTagEntry> = map
         .iter()
         .filter(|entry| !api_key_request || api_key_external_output_allowed(entry, &runtime))
@@ -4946,12 +4962,39 @@ async fn v1_tags(
         })
         .map(|entry| CatalogTagEntry::from_runtime(entry, &runtime))
         .collect();
-    Json(CatalogResponse {
+    CatalogResponse {
         revision,
         run_id: runtime.run_id,
         collection_mode: runtime.mode.as_str().to_string(),
         tags,
-    })
+    }
+}
+
+/// `GET /api/v1/tags` ハンドラ本体 - catalog: `{ "revision", "run_id",
+/// "collection_mode", "tags": [CatalogTagEntry...] }`,
+/// optionally filtered by `?connection=`/`?group=` (matched against the
+/// entry's connection/group *name*, design §5.1's route table). API-key
+/// requests additionally omit simulation and derived-simulation entries.
+/// ロジックは[`build_catalog_response`]側にあり、ここでは`ctx`から
+/// `api_key_request`を判定して渡すだけ - 管理系の[`admin_tag_catalog`]は
+/// 同じ関数を`api_key_request = false`固定で呼ぶ（二重管理を避けるための
+/// 分離、`compute_status`/[`v1_status`]と同じ構成）。
+#[utoipa::path(
+    get,
+    path = "/api/v1/tags",
+    params(
+        ("connection" = Option<String>, Query, description = "接続名で絞り込む"),
+        ("group" = Option<String>, Query, description = "収集グループ名で絞り込む"),
+    ),
+    responses((status = 200, description = "catalog スナップショット", body = CatalogResponse)),
+    tag = "tag-space",
+)]
+async fn v1_tags(
+    State(state): State<TagSpaceState>,
+    Query(query): Query<TagsQuery>,
+    ctx: Option<Extension<ApiKeyContext>>,
+) -> Json<CatalogResponse> {
+    Json(build_catalog_response(&state, &query, ctx.is_some()))
 }
 
 /// One `/api/v1/values*` entry's wire shape (design §5.1's route table:
@@ -5471,15 +5514,21 @@ async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResp
     Ok(Json(compute_status(&state).await?))
 }
 
-// --- 管理系 `GET /api/status`・`GET /api/values`（設計 §5.6・2026-08-31
-// オーナー決定「案A」） --------------------------------------------------
+// --- 管理系 `GET /api/status`・`GET /api/values`・`GET /api/tag-catalog`・
+// `GET /api/tag-stream`（設計 §5.6・2026-08-31 オーナー決定「案A」） --------
 //
 // 実機の試運転モードで判明した問題: 管理 UI（`hubStatus.ts`）が
 // `GET /api/v1/status`・`GET /api/v1/values` を使っていたため、試運転モード
 // （未ロックダウン・未ログイン・API キー未発行）中はどちらも401になり、
 // 状態ページの「サーバー状態」「タグ現在値」が空になっていた
 // （`hostSwitchGate.isPreflightOk`が`status.revision`を要求するため、
-// Desktop↔Service 切替ウィザードまで連鎖的に塞がれる）。
+// Desktop↔Service 切替ウィザードまで連鎖的に塞がれる）。当初これを
+// `/api/status`・`/api/values`の新設だけで解消したつもりだったが、
+// **ライブタグモニタ（`tagMonitorAdmin.ts`）が別に`/api/v1/tags`（catalog）と
+// `/api/v1/stream`（WS）を直接叩いている経路を見落としていた** -
+// 同じ理由（`require_tag_space_auth`固定・試運転モードのバイパス対象外）で
+// モニタの行が1つも出ない不具合が残っていた。`/api/tag-catalog`・
+// `/api/tag-stream`はこの見落としの是正として同日に追加した。
 //
 // なぜ `/api/v1/*` 側を試運転モード対応にしないか: `/api/v1/*` は機械
 // クライアント向けタグ空間 API で、認証は`require_tag_space_auth`
@@ -5490,9 +5539,12 @@ async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResp
 // 採用した方針: `/api/v1/*` のルート・認証・レスポンス形状は一切変えず、
 // 管理系ルーター（試運転モードのバイパスが効き、ロックダウン後はセッション
 // bearer が要る側）に別口のエンドポイントを追加する。ロジックは
-// `compute_status`/`resolve_value_names`/`build_values_response`（上の
-// `/api/v1/status`・`/api/v1/values`ハンドラと**完全に同じ関数**）を呼ぶ
-// だけで、二重管理にはしていない。
+// `compute_status`/`resolve_value_names`/`build_values_response`/
+// `build_catalog_response`（上の`/api/v1/status`・`/api/v1/values`・
+// `/api/v1/tags`ハンドラと**完全に同じ関数**）を呼ぶだけで、二重管理には
+// していない。WS（`/api/tag-stream`）は関数どころかハンドラ自体
+// （[`crate::stream::ws_upgrade`]）を`/api/v1/stream`とそのまま共有する -
+// `admin_tag_stream_router`のdoc comment参照。
 //
 // 認可レベル: `RoleGuard`（admin 限定）は掛けない。理由:
 // 1. `/api/v1/status`・`/api/v1/values`自体がそもそもロール制約の無い
@@ -5701,15 +5753,116 @@ async fn admin_values(
     .into_response()
 }
 
-/// [`admin_status`]・[`admin_values`]用ルーター - 管理系（試運転モードの
-/// バイパスが効く側）に配置する。`RoleGuard`は掛けない理由はこのセクション
-/// 冒頭のdoc comment参照（読み取り専用・ロール不問、`tag_registry_router`の
-/// `GET`系と同じ扱い）。状態は[`TagSpaceState`]を[`tag_space_router`]とは
-/// 別に組み立てる - こちらは`require_auth_or_commissioning`層を被せる
-/// ため、`require_tag_space_auth`層を被せる`tag_space_router`側の
-/// `Router`とは共有できない（axum の`Router`は1つにつき1枚の認証
-/// `.layer`しか意味を持たないため、同じ`Router`を2種類の認証で使い回す
-/// ことはできない）。
+/// [`CatalogTagEntry`]のcamelCase版（`GET /api/tag-catalog`用、
+/// [`admin_tag_catalog`]参照）。`banto_tags`/`crate::hub::TagEntry`は
+/// `/api/v1/*`向けに意図して snake_case のまま（同型の doc comment
+/// 「Field names are plain snake_case on the wire」参照）なので、
+/// `#[serde(flatten)]`に頼らずフィールドを手動で列挙してcamelCaseへ
+/// 変換する（`AdminConnectionStatusEntry`等、このファイルの他の
+/// `Admin*`camelCase版と同じ手法）。
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct AdminCatalogTagEntry {
+    external_name: String,
+    tag_key: String,
+    #[schema(value_type = Vec<i64>)]
+    ids: (i64, i64, i64),
+    connection: String,
+    group: String,
+    name: String,
+    address: String,
+    data_type: String,
+    unit: Option<String>,
+    decimals: i64,
+    period_ms: i64,
+    enabled: bool,
+    writable: bool,
+    tag_kind: String,
+    expression: Option<String>,
+    retain: bool,
+    simulation: bool,
+    configured_simulation: bool,
+    effective_simulation: bool,
+    value_source: String,
+}
+
+impl From<CatalogTagEntry> for AdminCatalogTagEntry {
+    fn from(entry: CatalogTagEntry) -> Self {
+        Self {
+            external_name: entry.entry.external_name,
+            tag_key: entry.entry.tag_key,
+            ids: entry.entry.ids,
+            connection: entry.entry.connection,
+            group: entry.entry.group,
+            name: entry.entry.name,
+            address: entry.entry.address,
+            data_type: entry.entry.data_type,
+            unit: entry.entry.unit,
+            decimals: entry.entry.decimals,
+            period_ms: entry.entry.period_ms,
+            enabled: entry.entry.enabled,
+            writable: entry.entry.writable,
+            tag_kind: entry.entry.tag_kind,
+            expression: entry.entry.expression,
+            retain: entry.entry.retain,
+            simulation: entry.entry.simulation,
+            configured_simulation: entry.configured_simulation,
+            effective_simulation: entry.effective_simulation,
+            value_source: entry.value_source,
+        }
+    }
+}
+
+/// [`CatalogResponse`]のcamelCase版。
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct AdminCatalogResponse {
+    revision: u64,
+    run_id: Option<u64>,
+    collection_mode: String,
+    tags: Vec<AdminCatalogTagEntry>,
+}
+
+impl From<CatalogResponse> for AdminCatalogResponse {
+    fn from(resp: CatalogResponse) -> Self {
+        Self {
+            revision: resp.revision,
+            run_id: resp.run_id,
+            collection_mode: resp.collection_mode,
+            tags: resp.tags.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// `GET /api/tag-catalog` - 管理 UI 向け（試運転モードのバイパス対象、
+/// このセクション冒頭のdoc comment参照）。ライブタグモニタ
+/// （`tagMonitorAdmin.ts`）が本来必要としていたのはこれ - 元々は
+/// `/api/v1/tags`を直接叩いていたため、試運転モード中は行が1つも表示され
+/// ない不具合の原因だった。[`build_catalog_response`]を`/api/v1/tags`
+/// （[`v1_tags`]）と共有し、`api_key_request = false`固定（管理系ルーター
+/// にAPIキーの概念は無い）で呼ぶ - シミュレーション設定を含め全件を返す
+/// （[`admin_values`]と同じ判断）。
+async fn admin_tag_catalog(
+    State(state): State<TagSpaceState>,
+    Query(query): Query<TagsQuery>,
+) -> Json<AdminCatalogResponse> {
+    Json(build_catalog_response(&state, &query, false).into())
+}
+
+/// [`admin_status`]・[`admin_values`]・[`admin_tag_catalog`]用ルーター -
+/// 管理系（試運転モードのバイパスが効く側）に配置する。`RoleGuard`は
+/// 掛けない理由はこのセクション冒頭のdoc comment参照（読み取り専用・
+/// ロール不問、`tag_registry_router`の`GET`系と同じ扱い）。状態は
+/// [`TagSpaceState`]を[`tag_space_router`]とは別に組み立てる - こちらは
+/// `require_auth_or_commissioning`層を被せるため、`require_tag_space_auth`
+/// 層を被せる`tag_space_router`側の`Router`とは共有できない（axum の
+/// `Router`は1つにつき1枚の認証`.layer`しか意味を持たないため、同じ
+/// `Router`を2種類の認証で使い回すことはできない）。
+///
+/// **WS（`/api/tag-stream`）はここに同居させない** -
+/// [`admin_tag_stream_router`]のdoc comment参照（この Router 全体は最終的に
+/// `require_banto_client_header`(CSRF) レイヤーの内側に組み込まれるが、
+/// ブラウザの`WebSocket`はCSRF用カスタムヘッダを送れないため）。
 fn admin_status_router(
     manager: Arc<CollectorManager>,
     controller: Arc<CollectionController>,
@@ -5729,6 +5882,93 @@ fn admin_status_router(
     Router::new()
         .route("/api/status", get(admin_status))
         .route("/api/values", get(admin_values))
+        .route("/api/tag-catalog", get(admin_tag_catalog))
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
+}
+
+/// `GET /api/tag-stream`（管理系 WS、[`admin_tag_stream_router`]）のパス -
+/// [`extract_ws_protocol_token`]の許可リストと[`admin_tag_stream_router`]の
+/// 両方から参照する定数にして、パス文字列のタイプミスで両者がずれるのを
+/// 防ぐ。
+const ADMIN_TAG_STREAM_PATH: &str = "/api/tag-stream";
+
+/// [`crate::stream::ws_upgrade`]（`/api/v1/stream`と全く同じハンドラ関数）
+/// 用の管理系ルーター - 試運転モード対応（設計 §5.6・2026-08-31 オーナー
+/// 決定）で新設。ライブタグモニタ（`tagMonitorAdmin.ts`）の購読先を
+/// 試運転モードでも繋がるようにするための追加（このセクション冒頭の
+/// doc comment参照 - `/api/tag-catalog`と対になる存在）。
+///
+/// ## なぜ`admin_status_router`に同居させないか（CSRF とブラウザ WS の制約）
+///
+/// [`api_router_with_controller_mode`]が組み立てる`admin`ルーター一式は
+/// 最後に`require_banto_client_header`（CSRF、`X-Banto-Client`ヘッダ必須）
+/// を1枚被せる。ところがブラウザの`WebSocket`コンストラクタは（この
+/// ファイル冒頭のモジュール doc comment、および
+/// `extract_ws_protocol_token`のdoc comment が`Authorization`について
+/// 説明しているのと全く同じ理由で）カスタムヘッダを一切送れない -
+/// `X-Banto-Client`もその例外ではない。もし`/api/tag-stream`を
+/// `admin_status_router`に同居させて`admin`側のCSRFレイヤーの内側に
+/// 置いてしまうと、実ブラウザからは**認証の成否に関わらず**常に403に
+/// なり、管理 UI から絶対に接続できなくなる。
+///
+/// そのため、このルーターは単独で構築し、`tag_space_router`
+/// （`/api/v1/*`、同じ理由でCSRF対象外 - このファイル冒頭のモジュール
+/// doc comment参照）と同様に`admin`へCSRFレイヤーを被せた**後**に
+/// `.merge()`する（[`api_router_with_controller_mode`]参照）。CSRFを
+/// 要求しない代わりに、認証自体は[`require_auth_or_commissioning`]で
+/// 別途担保する（ロックダウン済みなら有効なセッション bearer が必須 -
+/// CSRFの有無に関わらず未認証アクセスは401になる）ので、保護水準は
+/// 落ちていない。
+///
+/// ## 認証: ロックダウン済みでの Sec-WebSocket-Protocol フォールバック
+///
+/// ブラウザは`Authorization`ヘッダも送れないので、ロックダウン済み状態
+/// （通常ログイン後）でこのWSに繋ぐには何らかの代替経路が要る。
+/// `/api/v1/stream`が使っているのと**全く同じ仕組み**
+/// （`Sec-WebSocket-Protocol: bearer, <token>`、`extract_ws_protocol_token`
+/// 参照）を[`require_auth_or_commissioning`]側にも追加した - パスの許可
+/// リストに[`ADMIN_TAG_STREAM_PATH`]を足しただけで、`/api/v1/stream`の
+/// 認証・ルート・レスポンス形状は一切変えていない（`require_tag_space_auth`
+/// は無変更）。試運転モード中（未ロックダウン）は
+/// [`require_auth_or_commissioning`]がヘッダの中身を見る前に無条件で
+/// 素通しするので、トークン（Sec-WebSocket-Protocolオファーそのもの）が
+/// 無くても接続できる。
+///
+/// ## `scope`（per-tag read スコープ）は常に`None`
+///
+/// [`crate::stream::ws_upgrade`]は`ApiKeyContext`拡張が無ければ`scope`を
+/// `None`として扱う（=購読の絞り込み無し、全アクセス）。管理系ルーターは
+/// `require_auth_or_commissioning`しか通らず`ApiKeyContext`を挿入する
+/// ことは無いので、この管理系WSは常に`scope = None`側の経路を通る -
+/// これは「セッション bearer で`/api/v1/stream`に繋いだ場合」と全く同じ
+/// 挙動（`crate::stream::handle_socket`のフィールド doc comment
+/// 「`external = scope.is_some()`」参照）で、管理 UI が今まで手にしていた
+/// アクセス範囲を狭めても広げてもいない。
+fn admin_tag_stream_router(
+    manager: Arc<CollectorManager>,
+    controller: Arc<CollectionController>,
+    write_control: Arc<WriteControl>,
+    test_output: Arc<TestOutputControl>,
+    mqtt: Arc<MqttPublisher>,
+    auth: AuthState,
+    commissioning: CommissioningState,
+) -> Router {
+    let state = TagSpaceState {
+        manager,
+        controller,
+        write_control,
+        test_output,
+        mqtt,
+    };
+    Router::new()
+        .route(ADMIN_TAG_STREAM_PATH, get(crate::stream::ws_upgrade))
         .with_state(state)
         .layer(middleware::from_fn_with_state(
             AuthGate {
@@ -6682,11 +6922,12 @@ fn api_router_with_controller_mode(
             events.clone(),
         ))
         // 試運転モード対応（設計 §5.6・2026-08-31 オーナー決定「案A」）:
-        // `GET /api/status`・`GET /api/values` - `/api/v1/status`・
-        // `/api/v1/values`と同じ情報を管理系（試運転モードのバイパスが
-        // 効く側）から読めるようにする。`admin_status_router`のdoc comment
-        // 参照。ここで渡す `manager`/`controller`/`write_control`/
-        // `test_output`/`mqtt`の各`Arc`は、下の`tag_space_router`へ渡す
+        // `GET /api/status`・`GET /api/values`・`GET /api/tag-catalog` -
+        // `/api/v1/status`・`/api/v1/values`・`/api/v1/tags`と同じ情報を
+        // 管理系（試運転モードのバイパスが効く側）から読めるようにする。
+        // `admin_status_router`のdoc comment参照。ここで渡す
+        // `manager`/`controller`/`write_control`/`test_output`/`mqtt`の各
+        // `Arc`は、下の`tag_space_router`/`admin_tag_stream_router`へ渡す
         // ものと**同じ**インスタンスの`clone()` - 別インスタンスを作ると
         // 状態が分裂する（このファイルの他の`Arc`共有規律と同じ）。
         .merge(admin_status_router(
@@ -6696,11 +6937,25 @@ fn api_router_with_controller_mode(
             test_output.clone(),
             mqtt.clone(),
             auth.clone(),
-            commissioning_state,
+            commissioning_state.clone(),
         ))
         .layer(middleware::from_fn(require_banto_client_header));
 
     admin
+        // `admin_tag_stream_router`（`/api/tag-stream`）は意図的に上の
+        // `admin`（CSRF レイヤー適用済み）へ`tag_space_router`と同じ形で
+        // `.merge()`する - CSRF レイヤーの**外側**に置く必要がある理由は
+        // `admin_tag_stream_router`のdoc comment参照（ブラウザの
+        // `WebSocket`はCSRF用カスタムヘッダを送れない）。
+        .merge(admin_tag_stream_router(
+            manager.clone(),
+            controller.clone(),
+            write_control.clone(),
+            test_output.clone(),
+            mqtt.clone(),
+            auth.clone(),
+            commissioning_state,
+        ))
         .merge(tag_space_router(
             manager,
             controller,
@@ -10570,5 +10825,148 @@ mod tests {
         assert!(!v1_tags.is_empty(), "fixture should seed at least one tag");
         assert_eq!(v1_tags, admin_tags);
         assert_eq!(admin_values_body["revision"], v1_values_body["revision"]);
+    }
+
+    // --- 試運転モード対応: 管理系 `/api/tag-catalog`・`/api/tag-stream`
+    // (設計 §5.6・2026-08-31 オーナー決定「案A」の続き) ------------------------
+    //
+    // 状態ページ（`/api/status`・`/api/values`）は直した当日に直したが、
+    // ライブタグモニタ（`tagMonitorAdmin.ts`）が別に`/api/v1/tags`
+    // （catalog）・`/api/v1/stream`（WS）を直接叩いていることを見落として
+    // いた - 同じ理由（`require_tag_space_auth`固定）で試運転モード中は
+    // モニタの行が1つも表示されない不具合が残っていた。以下はその是正の
+    // 確認（`unlocked_commissioning_mode_allows_admin_status_and_values_without_any_token`
+    // 等と同型）。WS（`/api/tag-stream`）は実TCP接続が要るため
+    // `tests/stream.rs`側で確認する。
+
+    /// 試運転モード中は `/api/tag-catalog` が `Authorization` ヘッダ無しで
+    /// 読める。
+    #[tokio::test]
+    async fn unlocked_commissioning_mode_allows_admin_tag_catalog_without_any_token() {
+        let env = test_env_unlocked().await;
+
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/tag-catalog")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// 対照実験: ロックダウン済みでは、他の管理系ルーターと同様
+    /// `Authorization` ヘッダ無しの `/api/tag-catalog` は 401。
+    #[tokio::test]
+    async fn locked_down_admin_tag_catalog_requires_a_token() {
+        let env = test_env().await;
+
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/tag-catalog")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// 回帰確認: catalog本体を`build_catalog_response`へ切り出した後も、
+    /// `/api/v1/tags`は従来どおり API キー認証で動く（`v1_status_still_works_with_an_api_key_after_the_admin_status_split`
+    /// と同型、対象だけ`/api/v1/tags`）。
+    #[tokio::test]
+    async fn v1_tags_still_works_with_an_api_key_after_the_admin_catalog_split() {
+        let env = test_env().await;
+        seed_scope_fixture(&env.router, &env.admin_token).await;
+        let (status, issued) =
+            issue_api_key(&env.router, &env.admin_token, "catalog-reader", &["read"]).await;
+        assert_eq!(status, StatusCode::CREATED, "{issued:?}");
+        let key = issued["key"].as_str().expect("key should be present");
+
+        let (status, body) = v1_get(&env.router, key, "/api/v1/tags").await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert!(body["tags"].as_array().is_some_and(|tags| !tags.is_empty()));
+    }
+
+    /// 共有ロジックの担保: 管理系 `/api/tag-catalog`（camelCase）と
+    /// `/api/v1/tags`（snake_case）が同じ情報を返すこと -
+    /// 両者が[`build_catalog_response`]を共有していることの直接的な証拠
+    /// （`admin_status_and_values_carry_the_same_information_as_v1`と同型）。
+    #[tokio::test]
+    async fn admin_tag_catalog_carries_the_same_information_as_v1_tags() {
+        let env = test_env().await;
+        seed_scope_fixture(&env.router, &env.admin_token).await;
+
+        let (status, v1_body) = v1_get(&env.router, &env.admin_token, "/api/v1/tags").await;
+        assert_eq!(status, StatusCode::OK, "{v1_body:?}");
+
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/tag-catalog")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let admin_body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(admin_body["revision"], v1_body["revision"]);
+        assert_eq!(admin_body["collectionMode"], v1_body["collection_mode"]);
+
+        let mut v1_tag_names: Vec<&str> = v1_body["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["external_name"].as_str().unwrap())
+            .collect();
+        let mut admin_tag_names: Vec<&str> = admin_body["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["externalName"].as_str().unwrap())
+            .collect();
+        v1_tag_names.sort_unstable();
+        admin_tag_names.sort_unstable();
+        assert!(
+            !v1_tag_names.is_empty(),
+            "fixture should seed at least one tag"
+        );
+        assert_eq!(v1_tag_names, admin_tag_names);
+
+        // camelCase 変換が正しく効いていること（フィールド名だけでなく値も
+        // 一致すること）の代表サンプル1件。
+        let v1_first = v1_body["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["external_name"] == v1_tag_names[0])
+            .unwrap();
+        let admin_first = admin_body["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["externalName"] == v1_tag_names[0])
+            .unwrap();
+        assert_eq!(admin_first["tagKey"], v1_first["tag_key"]);
+        assert_eq!(admin_first["dataType"], v1_first["data_type"]);
+        assert_eq!(admin_first["periodMs"], v1_first["period_ms"]);
+        assert_eq!(
+            admin_first["effectiveSimulation"],
+            v1_first["effective_simulation"]
+        );
+        assert_eq!(admin_first["valueSource"], v1_first["value_source"]);
     }
 }
