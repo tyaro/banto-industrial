@@ -1,14 +1,20 @@
 <script lang="ts">
 	/**
 	 * 接続状態モニタ画面（実装指示のスコープ主軸機能、新規作成）。
-	 * `GET /api/v1/status`（connections/revision/last_config_error）と
-	 * `GET /api/v1/values`（全タグ現在値）を3秒ポーリングで表示する。
+	 * `GET /api/status`（connections/revision/last_config_error）と
+	 * `GET /api/values`（全タグ現在値）を3秒ポーリングで表示する
+	 * （2026-08-31 オーナー決定「案A」で `/api/v1/status`・`/api/v1/values`
+	 * から管理系エンドポイントへ切替 - 試運転モード中は `/api/v1/*` が
+	 * 401 になるため、`hubStatus.ts`冒頭のdoc comment参照）。
 	 *
 	 * ポーリングでよい理由（設計 §5.1）: 読み取りは
 	 * `CollectorManager::current_values` が保持するオンメモリの現在値
 	 * スナップショットを読むだけで、PLC への追加ポーリング要求は一切
 	 * 発生しない（設計 §4: 「/api/v1/values* は current_values を読むだけで
-	 * 完結し、PLC への追加要求を発生させない」）。つまりこの画面が
+	 * 完結し、PLC への追加要求を発生させない」- `/api/values`も同じ
+	 * `CollectorManager::current_values`を読むだけの`compute_status`/
+	 * `build_values_response`を共有しているので同じ理屈が成り立つ）。
+	 * つまりこの画面が
 	 * リロードする頻度を上げても実機の負荷は増えないので、WebSocket/SSE
 	 * 差分配信を新設するより単純な定期ポーリングで十分（WebSocket は
 	 * 実装指示でも明示的にスコープ外）。

@@ -15,7 +15,8 @@
  * - **PLC接続の作成**: `calc`/`mem`（`protocol: "virtual"`、自動プロビジョニ
  *   ング）を除く `PlcConnection` が1件以上存在するか。
  * - **接続テストの成功**: 単発のテストボタン結果（クリック操作のログ）では
- *   なく、`GET /api/v1/status` の `connections`（`ConnectionStatusEntry`、
+ *   なく、`GET /api/status`（2026-08-31 オーナー決定で `/api/v1/status`
+ *   から切替、`hubStatus.ts`参照）の `connections`（`ConnectionStatusEntry`、
  *   実際に収集エンジンが張っているライブ接続状態）に `status: "connected"`
  *   の非virtual接続が1件でもあるか - 「画面訪問でなく実データ」により忠実
  *   （テストボタンを押した記憶ではなく、実際に繋がっているという事実）。
@@ -24,8 +25,8 @@
  * - **タグの登録**: `tagKind === "plc"` の `Tag` が1件以上存在するか
  *   （`computed`/`internal` はこのチェックリストが案内する「PLCタグ収集」
  *   の導線とは無関係なので数えない）。
- * - **SIM値の確認**: `GET /api/v1/values` の `values` に `q === "good"` が
- *   1件でもあるか。
+ * - **SIM値の確認**: `GET /api/values`（同上、`hubStatus.ts`参照）の
+ *   `values` に `q === "good"` が1件でもあるか。
  *
  * 各工程の CTA リンク先（`href`）は「まだ埋まっていない親」を優先して選ぶ
  * （{@link connectionAwaitingGroup}/{@link groupAwaitingTag}）- 単に

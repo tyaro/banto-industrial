@@ -1,20 +1,42 @@
 /**
- * タグ空間 API（`/api/v1/*`）のうち状態モニタ画面が使う2ルートのクライアント
- * （`GET /api/v1/status`・`GET /api/v1/values`、新規作成）。
+ * 管理系状態 API（`GET /api/status`・`GET /api/values`）のクライアント。
  *
- * **注意: `/api/v1/*` の応答は snake_case**（`apps/banto-hub/core/src/rest.rs`
- * の `StatusResponse`/`ValuesResponse`/`ValueEntry`/`ConnectionStatusEntry`
- * 参照）。`usersAdmin.ts`/`tagRegistryAdmin.ts` 等の管理系 camelCase DTO と
- * 混同しないこと - このファイルの型は意図的に snake_case のまま宣言している。
+ * **2026-08-31 オーナー決定（案A）: `/api/v1/*` から管理系エンドポイントへ
+ * 切り替えた。** 元々は `GET /api/v1/status`・`GET /api/v1/values`（タグ
+ * 空間 API）を叩いていたが、`/api/v1/*` は `require_tag_space_auth`（API
+ * キー or セッション bearer）固定で、設計 §5.6 の判断により試運転モードの
+ * バイパス対象**外**（PLC 書き込み経路と同じ境界を守るため）。試運転モード
+ * 中（未ロックダウン・未ログイン・API キー未発行）に管理 UI からこれを
+ * 直接叩くと 401 になり、状態ページの「サーバー状態」「タグ現在値」が
+ * 空になっていた（`hostSwitchGate.isPreflightOk` が `status.revision` を
+ * 要求するため、切替ウィザードまで連鎖的に塞がれる）。
  *
- * 認証はセッション bearer（`Authorization: Bearer <token>`）のみで足りる。
- * `/api/v1/*` は CSRF ヘッダ（`X-Banto-Client`）を要求しない設計
- * （設計 §5.1/§5.6: 機械クライアント向けで任意ヘッダを付けられる前提の
- * ため CSRF の脅威モデルに乗らない）なので、ここでは付けていない。
+ * `/api/status`・`/api/values`（`apps/banto-hub/core/src/rest.rs` の
+ * `admin_status`/`admin_values`、新規）は管理系ルーター（試運転モードの
+ * バイパスが効き、ロックダウン済みならセッション認証が要る側）に置かれて
+ * おり、ロジックは `/api/v1/*` ハンドラと共有（`compute_status`/
+ * `build_values_response`）した上で camelCase に包み直したもの。
+ * `/api/v1/*` 自体はルート・認証・レスポンス形状とも一切変更していない
+ * （機械クライアントの互換性を壊さないため）。
+ *
+ * **注意: この管理系エンドポイントの応答は camelCase**
+ * （`usersAdmin.ts`/`tagRegistryAdmin.ts` 等、他の管理系 DTO と同じ命名
+ * 規則）。`/api/v1/*` 側は意図して snake_case のまま
+ * （`apps/banto-hub/core/src/rest.rs` の `StatusResponse`/`ValuesResponse`
+ * 参照）- 混同しないこと。
+ *
+ * 認証はセッション bearer（`Authorization: Bearer <token>`）。管理系
+ * ルーターの慣行どおり CSRF ヘッダ（`X-Banto-Client`）を要求するため付ける
+ * （`/api/v1/*` は要求しないが、こちらは要求する - 管理系ルーター全体に
+ * `require_banto_client_header` が掛かっているため）。
  */
 import { getAuthProvider, ProviderError, type ErrorBody } from '@banto/admin-core';
+import { CSRF_HEADER } from './setup';
 
-/** `GET /api/v1/status` の `connections` 配列1件分。 */
+/** `GET /api/status` の `connections` 配列1件分。サーバーは
+ * `simulation`/`configuredSimulation`/`effectiveSimulation` も返すが、この
+ * 画面群はまだ使っていないので（T18-6時点）フィールドを増やさない -
+ * 必要になったらここに追加する。 */
 export interface ConnectionStatusEntry {
 	name: string;
 	id: number;
@@ -22,14 +44,14 @@ export interface ConnectionStatusEntry {
 	attempt: number | null;
 }
 
-/** `GET /api/v1/status` の `mqtt`（T3、設計 §5.3）。 */
+/** `GET /api/status` の `mqtt`（T3、設計 §5.3）。 */
 export interface MqttStatusEntry {
 	enabled: boolean;
 	connected: boolean;
 }
 
 /**
- * `GET /api/v1/status` の `grpc`（T4、設計 §5.4）。MQTT と違い「実際に
+ * `GET /api/status` の `grpc`（T4、設計 §5.4）。MQTT と違い「実際に
  * 接続できているか」のライブ状態は持たない - gRPC サーバーは listen する
  * だけなので、設定値がそのまま意図した状態を表す。
  */
@@ -38,7 +60,7 @@ export interface GrpcStatusEntry {
 	port: number;
 }
 
-/** `GET /api/v1/status` の応答。 */
+/** `GET /api/status` の応答。 */
 export interface StatusResponse {
 	version: string;
 	revision: number;
@@ -53,12 +75,44 @@ export interface StatusResponse {
 	/** T4（設計 §5.4）: gRPC サーバーの設定。 */
 	grpc: GrpcStatusEntry;
 	/** T14-4 の収集ライフサイクル状態 - mirrors `CollectionState::as_str()`
-	 * (`apps/banto-hub/core/src/controller.rs`). `GET /api/v1/status` の
-	 * `collection_state` フィールド。 */
+	 * (`apps/banto-hub/core/src/controller.rs`). `GET /api/status` の
+	 * `collectionState` フィールド。 */
 	collection_state: 'stopped' | 'starting' | 'running' | 'stopping' | 'faulted' | string;
 }
 
-/** `GET /api/v1/values` の1タグ分（`{ tag, v, q, t }`）。 */
+/** サーバーから受け取る camelCase の生レスポンス形（`AdminStatusResponse`）。 */
+interface RawStatusResponse {
+	version: string;
+	revision: number;
+	lastConfigError: string | null;
+	connections: ConnectionStatusEntry[];
+	writeEnabled: boolean;
+	writeWasEnabledBeforeRestart: boolean;
+	mqtt: MqttStatusEntry;
+	grpc: GrpcStatusEntry;
+	collectionState: string;
+}
+
+/** サーバーの camelCase 応答を、このファイルが公開する既存の型（snake_case
+ * のキーを持つ `StatusResponse`）へ変換する。既存の呼び出し元
+ * （`status`/`settings`/`tags` の各画面）はこのファイル冒頭のdoc comment
+ * のとおり `/api/v1/*` 時代の snake_case キーのまま参照し続けられる -
+ * サーバー側の命名規則の変更をこのモジュール内に閉じ込める。 */
+function fromRawStatus(raw: RawStatusResponse): StatusResponse {
+	return {
+		version: raw.version,
+		revision: raw.revision,
+		last_config_error: raw.lastConfigError,
+		connections: raw.connections,
+		write_enabled: raw.writeEnabled,
+		write_was_enabled_before_restart: raw.writeWasEnabledBeforeRestart,
+		mqtt: raw.mqtt,
+		grpc: raw.grpc,
+		collection_state: raw.collectionState
+	};
+}
+
+/** `GET /api/values` の1タグ分（`{ tag, v, q, t }`）。 */
 export interface ValueEntry {
 	tag: string;
 	v: number | null;
@@ -66,7 +120,7 @@ export interface ValueEntry {
 	t: number;
 }
 
-/** `GET /api/v1/values` の応答。 */
+/** `GET /api/values` の応答。 */
 export interface ValuesResponse {
 	revision: number;
 	t: number;
@@ -96,7 +150,7 @@ function currentToken(): string | null {
 }
 
 async function httpGet<T>(path: string): Promise<T> {
-	const headers: Record<string, string> = {};
+	const headers: Record<string, string> = { ...CSRF_HEADER };
 	const token = currentToken();
 	if (token) headers.Authorization = `Bearer ${token}`;
 
@@ -128,10 +182,11 @@ async function httpGet<T>(path: string): Promise<T> {
 }
 
 export async function getHubStatus(): Promise<StatusResponse> {
-	return httpGet<StatusResponse>('/api/v1/status');
+	const raw = await httpGet<RawStatusResponse>('/api/status');
+	return fromRawStatus(raw);
 }
 
 /** 全タグの現在値スナップショット（`?tags=` 省略 = 全件）。 */
 export async function getHubValues(): Promise<ValuesResponse> {
-	return httpGet<ValuesResponse>('/api/v1/values');
+	return httpGet<ValuesResponse>('/api/values');
 }
