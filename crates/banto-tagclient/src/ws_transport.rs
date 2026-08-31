@@ -1,8 +1,7 @@
-//! Direct, authenticated WebSocket handshake and one-frame exchange for S2b-2a.
+//! Direct, authenticated WebSocket handshake and bounded stream exchange.
 //!
-//! This module deliberately stops after one subscription send and one-frame
-//! receive primitive. Worker/watch delivery, rebinding, reconnect, and shutdown
-//! belong to S2b-2b/S3.
+//! The connection remains crate-private; the S3a handle owns its lifetime.
+//! Rebinding and reconnect remain outside this slice.
 
 use std::time::Duration;
 
@@ -26,6 +25,7 @@ use crate::{
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_WEBSOCKET_SIZE: usize = 1024 * 1024;
 
 pub(crate) struct WebSocketConnection {
@@ -73,6 +73,14 @@ struct SubscribeRequest<'a> {
 }
 
 impl WebSocketConnection {
+    pub(crate) async fn close_best_effort(&mut self) {
+        let close = async {
+            let _ = self.stream.send(Message::Close(None)).await;
+            let _ = self.stream.next().await;
+        };
+        let _ = tokio::time::timeout(CLOSE_TIMEOUT, close).await;
+    }
+
     /// Send one exact Hub `on_change` subscription request.
     pub(crate) async fn subscribe_on_change(
         &mut self,

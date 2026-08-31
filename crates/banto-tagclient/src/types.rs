@@ -277,17 +277,19 @@ impl fmt::Display for TagClientConnectionState {
 pub struct TagClientState {
     state: TagClientConnectionState,
     current: Option<ValuesSnapshot>,
+    last_error: Option<crate::error::ErrorKind>,
 }
 
 #[allow(
     dead_code,
-    reason = "TagClientState mutation is wired by the S2b worker slice"
+    reason = "TagClientState mutation is wired by the S3a handle and worker slices"
 )]
 impl TagClientState {
     pub(crate) const fn new(state: TagClientConnectionState) -> Self {
         Self {
             state,
             current: None,
+            last_error: None,
         }
     }
 
@@ -299,8 +301,13 @@ impl TagClientState {
         self.current.as_ref()
     }
 
+    pub const fn last_error(&self) -> Option<crate::error::ErrorKind> {
+        self.last_error
+    }
+
     pub(crate) fn transition(&mut self, state: TagClientConnectionState) {
         self.state = state;
+        self.last_error = None;
         if state != TagClientConnectionState::Live {
             self.current = None;
         }
@@ -309,6 +316,13 @@ impl TagClientState {
     pub(crate) fn publish(&mut self, snapshot: ValuesSnapshot) {
         self.state = TagClientConnectionState::Live;
         self.current = Some(snapshot);
+        self.last_error = None;
+    }
+
+    pub(crate) fn fail(&mut self, error: crate::error::ErrorKind) {
+        self.state = TagClientConnectionState::Stopped;
+        self.current = None;
+        self.last_error = Some(error);
     }
 }
 

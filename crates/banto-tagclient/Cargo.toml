@@ -11,7 +11,7 @@ futures-util = { workspace = true, features = ["sink"] }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["net", "time", "sync", "macros"] }
+tokio = { workspace = true, features = ["net", "time", "sync", "macros", "rt"] }
 tokio-tungstenite = { workspace = true }
 zeroize = { workspace = true }
 

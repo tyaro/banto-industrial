@@ -1,10 +1,11 @@
-//! `banto-tagclient` S2b-1: read-only Hub contracts and direct WebSocket handshake core.
+//! `banto-tagclient` S3a: read-only Hub contracts and one owned stream generation.
 //!
 //! This crate provides safe endpoint construction, Hub wire DTOs, an opaque
 //! API-key boundary, stable-ID binding resolution, read-only REST requests,
-//! network-free publish-gate core, and direct authenticated WebSocket handshakes.
-//! Workers, subscriptions, reconnect/backoff, PLC/Modbus access, writes, Tauri,
-//! and keyring integration remain S2b-2/S3 (or an application-side concern).
+//! network-free publish-gate core, direct authenticated WebSocket handshakes,
+//! and a public owner for one generation. Reconnect/backoff, rebinding,
+//! PLC/Modbus access, writes, Tauri, and keyring integration remain S3b (or an
+//! application-side concern).
 //!
 //! The DTOs mirror the machine-facing snake_case `/api/v1/tags` and
 //! `/api/v1/values` responses. Unknown mode, source, and quality strings are
@@ -14,6 +15,7 @@
 pub mod binding;
 pub mod endpoint;
 pub mod error;
+mod handle;
 pub mod rest;
 pub mod secret;
 /// S2a remains crate-internal until the S2b-2 worker slice wires it in.
@@ -27,6 +29,7 @@ pub use binding::{
 };
 pub use endpoint::{Endpoint, RestUrls};
 pub use error::{Error, ErrorKind, Result};
+pub use handle::TagClientHandle;
 pub use rest::RestClient;
 pub use secret::{SecretApiKey, SecretError};
 pub use types::{

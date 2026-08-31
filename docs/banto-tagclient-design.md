@@ -1,11 +1,12 @@
 # banto-tagclient 設計
 
 作成日: 2026-08-29
-状態: **S2b-2b完了、S3未完了**。S1bのREST catalog/values transport、S2aの
+状態: **S3a完了、S3b未完了**。S1bのREST catalog/values transport、S2aの
 Hub WS wire純粋解析・bounded pending map・latest-wins publish gate・非LIVE current抑止に加え、
 S2b-1の認証付きWebSocket handshake、S2b-2aのon_change subscribe送信と1フレーム受信、
 S2b-2bのcrate-private単一世代worker・tokio watchによるlatest snapshot配信・atomic publishを
-実装した。公開Handle、再接続、rebinding、shutdownはS3で未実装である（2026-08-31）。
+実装した。S3aでは公開Handle、worker所有権、明示shutdown、Drop時の非同期処理なしabortを
+実装した。再接続、rebinding、retryはS3bで未実装である（2026-08-31）。
 設計時参照baseline: `b9552627a86015b354b3c5651184fb108ba89e44`
 実API確認日: 2026-08-30（`apps/banto-hub/core/src/rest.rs` / `stream.rs`）
 
@@ -157,12 +158,27 @@ impl RestClient {
 	pub fn new(endpoint: Endpoint, secret: SecretApiKey) -> Result<Self>;
 	pub async fn fetch_catalog(&self) -> Result<CatalogSnapshot>;
 	pub async fn fetch_values(&self, tags: &[&str]) -> Result<ValuesSnapshot>;
+	pub fn start(self, requests: Vec<BindingRequest>) -> Result<TagClientHandle>;
+}
+
+pub struct TagClientHandle { /* private stop/state/task ownership */ }
+
+pub struct TagClientState { /* state, optional current, optional last_error */ }
+
+impl TagClientHandle {
+	pub fn state(&self) -> TagClientState;
+	pub fn state_watch(&self) -> tokio::sync::watch::Receiver<TagClientState>;
+	pub async fn shutdown(self) -> Result<()>;
 }
 ```
 
 `fetch_values`は外部タグ名を単一の`tags=name1,name2` queryへエンコードし、空リストでも
 `tags=`を送る。タグ名にカンマが含まれる場合は通信前に`invalid_tag_selection`でfail-closed
-する。S1bはsnapshotを返す読み取り専用transportまでであり、worker、最新値配信、購読はS2/S3で扱う。
+する。S3aの`start`は要求をspawn・通信前に検証し、現在のTokio runtime上で単一世代workerを所有する
+`TagClientHandle`を返す。handleはclone不可で、`state`/`state_watch`だけを公開し、明示的な
+`shutdown().await`で停止通知・WebSocket close・worker joinを行う。DropはblockせずStoppedを
+通知してbest-effort abortする。worker失敗時は`TagClientState::last_error()`へ安定分類を残し、
+shutdownはそのエラーを返す。公開Handleによる再接続・rebinding・retryはS3bで扱う。
 
 `SecretApiKey`は明示的なopaque wrapperとする。crate-private APIは
 `SecretApiKey::new(String) -> Result<SecretApiKey, SecretError>`と、SDK内部だけが使う
@@ -275,9 +291,9 @@ sequenceDiagram
   snapshotより古いpendingは公開前に破棄する。
 - 遅いconsumerのための無制限queueは作らない。古い中間値は破棄可能である。
 - `TagClientHandle`がworker task、socket、channelの所有者である。
-- `shutdown().await`は停止通知、socket close、task joinを行う。失敗しても残留させず、
-  Drop時は明示的にabortする方針を実装時に確定する。
-- `shutdown`後に再接続taskやsocketが残らないことをテストする。
+- `shutdown().await`は停止通知、socket close、task joinを行う。明示shutdownを推奨し、
+  Dropは同期的なStopped通知、停止通知、best-effort abortだけを行いblockしない。
+- `shutdown`後およびDrop後に再接続taskやsocketが残らないことをテストする。再接続自体はS3bで扱う。
 
 ## 7. 依存と実装ゲート
 
@@ -308,7 +324,8 @@ S2b-2aでは`futures-util 0.3`をcrateの直接workspace依存として追加し
 workspace/lock系列を再利用してpackage/version blockは追加していない。追加featureは`sink`のみである。
 
 S2b-2bでは既存workspaceの`tokio`に`sync`と`macros` featureを有効化し、`watch`によるboundedな
-latest state配信と`select!`によるWS優先処理に使用する。新規package/version blockは追加していない。
+latest state配信と`select!`によるWS優先処理に使用した。S3aでは同じ既存workspace依存の`rt`
+featureを有効化し、公開Handleだけがworkerをspawnする。新規package/version blockは追加していない。
 
 ## 8. テスト計画
 
@@ -344,7 +361,8 @@ latest state配信と`select!`によるWS優先処理に使用する。新規pac
 | S2b-2a | on_change subscribe送信、1フレーム受信                         | 厳密なsubscribe JSON、共通tag validation、native Ping/Pong、Text受信、Binary/Close/EOF/容量分類のテストが通る。                                                 |
 | S2b-2b | 単一世代worker、watch latest snapshot配信、atomic publish      | catalog→WS subscribe→初回data→REST gateの順序、完全snapshotのatomic publish、live更新のlatest-wins、失敗時current消去のテストが通る。                           |
 | S2     | WS購読、latest snapshot、状態機械                              | S2a/S2b-1/S2b-2a/S2b-2bの完了条件を満たし、WS先行接続から単一世代のatomic publishまでの全テストが通る。公開Handle、再接続、rebinding、shutdownはS3に残る。      |
-| S3     | config_changed、rebinding/coalesce、再解決、再接続、shutdown   | snapshot後の通知取り逃しなし、revision/run metadata不一致retry、coalesced rebind、旧値無効化、401/403、切断復旧、残留なしテストが通る。                         |
+| S3a    | 公開Handle、worker所有権、明示shutdown、Drop abort             | runtime外startのfail-closed、state/state_watch、Live後のgraceful close/join、in-flight stop、失敗error保持、Drop後のcurrent消去テストが通る。                   |
+| S3b    | config_changed、rebinding/coalesce、再解決、再接続、retry      | snapshot後の通知取り逃しなし、revision/run metadata不一致retry、coalesced rebind、旧値無効化、切断復旧テストが通る。                                            |
 | S4     | workspace統合と互換性固定                                      | 依存レビュー、fmt/clippy/test、Hub互換commit/tagの記録が完了する。                                                                                              |
 
 初版のDefinition of Doneは、全テスト表を自動化し、書き込み・PLC直結が存在せず、

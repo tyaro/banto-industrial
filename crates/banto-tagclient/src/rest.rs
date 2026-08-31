@@ -4,8 +4,10 @@ use std::fmt;
 
 use reqwest::{Client, ClientBuilder, StatusCode};
 
+use crate::binding::BindingRequest;
 use crate::endpoint::Endpoint;
 use crate::error::{Error, ErrorKind, Result};
+use crate::handle::{validate_start_requests, TagClientHandle};
 use crate::secret::SecretApiKey;
 use crate::types::{CatalogSnapshot, ValuesSnapshot};
 use crate::ws_transport::WebSocketConnection;
@@ -31,6 +33,17 @@ impl RestClient {
             secret,
             http,
         })
+    }
+
+    /// Start one owned connection generation on the current Tokio runtime.
+    ///
+    /// Requests are validated before a task or network operation is created.
+    /// Reconnect, rebinding, and restart belong to the following slice.
+    pub fn start(self, requests: Vec<BindingRequest>) -> Result<TagClientHandle> {
+        validate_start_requests(&requests)?;
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|_| Error::new(ErrorKind::Transport))?;
+        Ok(TagClientHandle::spawn(self, requests, runtime))
     }
 
     /// Fetch and deserialize `GET /api/v1/tags`.

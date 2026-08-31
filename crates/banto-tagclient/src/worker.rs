@@ -1,10 +1,10 @@
 //! One connection-generation worker and bounded latest-state publication.
 //!
-//! The worker is crate-private and is intentionally not spawned here. S3 will
-//! provide the public owner for task lifetime, reconnect, rebinding, and
-//! shutdown.
+//! The worker is crate-private and is intentionally not spawned here. S3a
+//! provides the public owner for task lifetime and explicit shutdown; S3b adds
+//! reconnect and rebinding.
 
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use crate::{
     binding::{resolve_bindings, BindingRequest},
@@ -18,20 +18,33 @@ use crate::{
 /// attempted; any failure clears current and returns its stable error kind.
 #[allow(
     dead_code,
-    reason = "S2b-2b worker is owned and spawned by the S3 handle slice"
+    reason = "S3a TagClientHandle owns this crate-private worker"
 )]
 pub(crate) async fn run_generation(
     rest: &RestClient,
     requests: &[BindingRequest],
     subscription_id: i64,
     state_tx: &watch::Sender<TagClientState>,
+    mut stop: oneshot::Receiver<()>,
 ) -> Result<()> {
     state_tx.send_replace(TagClientState::new(TagClientConnectionState::Connecting));
-    let result = run_generation_inner(rest, requests, subscription_id, state_tx).await;
-    if result.is_err() {
-        state_tx.send_replace(TagClientState::new(TagClientConnectionState::Stopped));
+    let result = run_generation_inner(rest, requests, subscription_id, state_tx, &mut stop).await;
+    match result {
+        Ok(()) => {
+            state_tx.send_replace(TagClientState::new(TagClientConnectionState::Stopped));
+            Ok(())
+        }
+        Err(error) if error.kind() == ErrorKind::Stopped => {
+            state_tx.send_replace(TagClientState::new(TagClientConnectionState::Stopped));
+            Ok(())
+        }
+        Err(error) => {
+            let mut state = TagClientState::new(TagClientConnectionState::Stopped);
+            state.fail(error.kind());
+            state_tx.send_replace(state);
+            Err(error)
+        }
     }
-    result
 }
 
 async fn run_generation_inner(
@@ -39,11 +52,16 @@ async fn run_generation_inner(
     requests: &[BindingRequest],
     subscription_id: i64,
     state_tx: &watch::Sender<TagClientState>,
+    stop: &mut oneshot::Receiver<()>,
 ) -> Result<()> {
     if requests.is_empty() {
         return Err(Error::new(ErrorKind::InvalidTagSelection));
     }
-    let catalog = rest.fetch_catalog().await?;
+    let catalog = tokio::select! {
+        biased;
+        _ = &mut *stop => return Err(stopped()),
+        result = rest.fetch_catalog() => result?,
+    };
     let resolution = resolve_bindings(requests, &catalog.tags)?;
     if !resolution.unresolved.is_empty() {
         return Err(Error::new(ErrorKind::BindingUnresolved));
@@ -56,13 +74,29 @@ async fn run_generation_inner(
     let mut gate = PublishGate::new(subscription_id, tags.clone())?;
 
     state_tx.send_replace(TagClientState::new(TagClientConnectionState::Handshaking));
-    let mut connection = rest.connect_stream().await?;
-    connection
-        .subscribe_on_change(subscription_id, &tags)
-        .await?;
+    let mut connection = tokio::select! {
+        biased;
+        _ = &mut *stop => return Err(stopped()),
+        result = rest.connect_stream() => result?,
+    };
+    tokio::select! {
+        biased;
+        _ = &mut *stop => {
+            connection.close_best_effort().await;
+            return Err(stopped());
+        }
+        result = connection.subscribe_on_change(subscription_id, &tags) => result?,
+    }
 
     loop {
-        let text = connection.receive_text().await?;
+        let text = tokio::select! {
+            biased;
+            _ = &mut *stop => {
+                connection.close_best_effort().await;
+                return Err(stopped());
+            }
+            result = connection.receive_text() => result?,
+        };
         if gate.accept_wire(&text)? == AcceptedWire::Data {
             break;
         }
@@ -73,6 +107,10 @@ async fn run_generation_inner(
     let rest_snapshot = loop {
         tokio::select! {
             biased;
+            _ = &mut *stop => {
+                connection.close_best_effort().await;
+                return Err(stopped());
+            }
             text = connection.receive_text() => {
                 gate.accept_wire(&text?)?;
             }
@@ -83,7 +121,14 @@ async fn run_generation_inner(
     publish_snapshot(&gate, &catalog, state_tx)?;
 
     loop {
-        let text = connection.receive_text().await?;
+        let text = tokio::select! {
+            biased;
+            _ = &mut *stop => {
+                connection.close_best_effort().await;
+                return Err(stopped());
+            }
+            result = connection.receive_text() => result?,
+        };
         if gate.accept_wire(&text)? == AcceptedWire::Data {
             publish_snapshot(&gate, &catalog, state_tx)?;
         }
@@ -100,6 +145,10 @@ fn publish_snapshot(
     state.publish(snapshot);
     state_tx.send_replace(state);
     Ok(())
+}
+
+fn stopped() -> Error {
+    Error::new(ErrorKind::Stopped)
 }
 
 #[cfg(test)]
@@ -300,8 +349,10 @@ mod tests {
             },
         ];
         let rest_client = client(address);
-        let worker =
-            tokio::spawn(async move { run_generation(&rest_client, &requests, 9, &sender).await });
+        let (_stop_tx, stop_rx) = oneshot::channel();
+        let worker = tokio::spawn(async move {
+            run_generation(&rest_client, &requests, 9, &sender, stop_rx).await
+        });
         for expected in [
             TagClientConnectionState::Connecting,
             TagClientConnectionState::Handshaking,
@@ -383,9 +434,16 @@ mod tests {
     async fn empty_binding_requests_fail_before_websocket_and_keep_current_empty() {
         let (sender, receiver) =
             watch::channel(TagClientState::new(TagClientConnectionState::Stopped));
+        let (_stop_tx, stop_rx) = oneshot::channel();
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            run_generation(&client("http://127.0.0.1:1".into()), &[], 1, &sender),
+            run_generation(
+                &client("http://127.0.0.1:1".into()),
+                &[],
+                1,
+                &sender,
+                stop_rx,
+            ),
         )
         .await
         .unwrap();
@@ -416,9 +474,10 @@ mod tests {
             binding_key: "missing".into(),
             stable_id: StableTagId::new(9, 9, 9),
         };
+        let (_stop_tx, stop_rx) = oneshot::channel();
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            run_generation(&client(address), &[request], 1, &sender),
+            run_generation(&client(address), &[request], 1, &sender, stop_rx),
         )
         .await
         .unwrap();
@@ -468,9 +527,10 @@ mod tests {
             binding_key: "alpha".into(),
             stable_id: StableTagId::new(1, 1, 1),
         };
+        let (_stop_tx, stop_rx) = oneshot::channel();
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            run_generation(&client(address), &[request], 1, &sender),
+            run_generation(&client(address), &[request], 1, &sender, stop_rx),
         )
         .await
         .unwrap();
