@@ -93,8 +93,12 @@ jobs:
     # its own Playwright config (e2e/banto-hub.playwright.config.ts,
     # `pnpm e2e:banto-hub`) covering first-run setup/login/logout and the
     # TAG-P0-1 continuous-registration DOM behavior - it runs in this same
-    # job, after the chronogazer suite. Known gap: apps/relay-wright still
-    # has no Playwright e2e config.
+    # job, after the chronogazer suite.
+    # H5: apps/relay-wright now has its own Playwright config too
+    # (e2e/relay-wright.playwright.config.ts, `pnpm e2e:relay-wright`),
+    # covering the Tauri-free embedded-server mode (spec §11.1 mode 2) -
+    # see that config's doc comment for why Tauri-webview-only paths (mode
+    # 1) are out of scope here.
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -142,6 +146,20 @@ jobs:
       - name: Build banto-hub (embed-ui)
         run: cargo build -p banto-hub-core --bin banto-hub --features embed-ui
 
+      # e2e/relay-wright.playwright.config.ts's webServer launches this
+      # binary directly, same reasoning as banto-hub above - must exist
+      # before `pnpm e2e:relay-wright` below. `pnpm build` (above) already
+      # built apps/relay-wright/build recursively, but relay-wright is a
+      # Tauri app (unlike chronogazer/banto-hub's plain SvelteKit apps) so
+      # its own `pnpm --filter relay-wright build` is run explicitly here
+      # too, to keep this step self-contained if the recursive build step
+      # ever narrows its scope.
+      - name: Build relay-wright frontend
+        run: pnpm --filter relay-wright build
+
+      - name: Build relay-wright-serve (embed-ui)
+        run: cargo build -p relay-wright-core --bin relay-wright-serve --features embed-ui
+
       - name: Install Playwright Chromium
         run: pnpm exec playwright install --with-deps chromium
 
@@ -153,6 +171,12 @@ jobs:
       # failure here is distinguishable from the chronogazer suite above.
       - name: Run E2E suite (banto-hub)
         run: pnpm e2e:banto-hub
+
+      # H5: relay-wright's own suite (embedded-server mode first-run
+      # setup/login/logout + PLC接続 REST CRUD) - separate step, same
+      # reasoning as banto-hub above.
+      - name: Run E2E suite (relay-wright)
+        run: pnpm e2e:relay-wright
 
       - name: Upload Playwright report (chronogazer)
         if: failure()
@@ -168,4 +192,12 @@ jobs:
         with:
           name: playwright-report-banto-hub
           path: e2e/playwright-report-banto-hub/
+          retention-days: 7
+
+      - name: Upload Playwright report (relay-wright)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report-relay-wright
+          path: e2e/playwright-report-relay-wright/
           retention-days: 7

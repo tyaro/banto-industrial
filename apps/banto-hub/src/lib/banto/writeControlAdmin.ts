@@ -4,9 +4,11 @@
  * に対応する - `apiKeysAdmin.ts`/`auditLogAdmin.ts` と同じ httpRequest 雛形。
  *
  * 現在の状態自体（`writeEnabled`/`writeWasEnabledBeforeRestart` に相当する
- * 値）は `GET /api/v1/status`（`hubStatus.ts` の `StatusResponse`、
- * snake_case の `write_enabled`/`write_was_enabled_before_restart`）を見る -
- * このファイルは enable/disable の**書き込み**操作のみを提供する。
+ * 値）は `GET /api/status`（`hubStatus.ts` の `StatusResponse`、2026-08-31
+ * オーナー決定で `/api/v1/status` から切替、同ファイル内では
+ * snake_case の `write_enabled`/`write_was_enabled_before_restart` として
+ * 公開）を見る - このファイルは enable/disable の**書き込み**操作のみを
+ * 提供する。
  */
 import { getAuthProvider, ProviderError, type ErrorBody } from '@banto/admin-core';
 import { CSRF_HEADER } from './setup';

@@ -83,19 +83,21 @@
 //! needed, we were already using it a moment ago" reasoning `run_connection`
 //! uses for its own fatal-read branch.
 //!
-//! `connect_attempt` necessarily re-implements
-//! `banto_plc::slmp::SlmpClient::connect`'s body (build a bare
-//! `slmp::SLMPClient` from `SlmpConfig::to_wire_props()`, wire the two
-//! per-crate timeouts, wrap the connect in `SlmpConfig::connect_timeout`, map
-//! the structured `slmp::SlmpError` (H9,
-//! docs/h9-slmp-structured-error-spec.md) the same way). This is deliberate duplication, not an
-//! oversight: `banto_plc::SlmpClient` is a `PlcClient` that owns its *own*
-//! private `Option<slmp::SLMPClient>` with no seam to hand that socket to
-//! `banto_plc_write::execute_slmp_writes` afterward, so the broker cannot
-//! reuse it and still keep read and write on one shared session - the whole
-//! point of this crate. Reconnecting a bare client is the smallest amount of
-//! code that lets both `execute_slmp_reads` and `execute_slmp_writes` borrow
-//! the *same* `slmp::SLMPClient`.
+//! `connect_attempt` dials through [`banto_plc::dial_slmp`], the one shared
+//! implementation of the connect sequence (build a bare `slmp::SLMPClient`
+//! from `SlmpConfig::to_wire_props()`, wire the two per-crate timeouts, wrap
+//! the connect in `SlmpConfig::connect_timeout`, map the structured
+//! `slmp::SlmpError` (H9, docs/h9-slmp-structured-error-spec.md)) that
+//! `banto_plc::slmp::SlmpClient::connect` and
+//! `banto_plc_write::slmp::SlmpWriteClient::connect` also call - see
+//! `dial_slmp`'s own doc comment (H9 transport 共通化,
+//! docs/improvement-plan.md §H9). What still differs here, and is not
+//! shareable, is what happens to the client *after* the dial: `SlmpClient` is
+//! a `PlcClient` that stashes the result in its own private
+//! `Option<slmp::SLMPClient>`, but this broker needs the bare client itself
+//! so `execute_slmp_reads` and `execute_slmp_writes` can borrow the *same*
+//! session in `ConnState::Connected` - the whole point of this crate.
+//! `connect_attempt` is that thin unwrap-and-rebox layer.
 //!
 //! ## Queued-request-while-down policy: fail fast, never queue
 //!
@@ -167,8 +169,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use banto_plc::{
-    execute_slmp_batch_reads, plan_slmp_batch, BatchReadRequest, BatchReadResult, PlcError,
-    SlmpConfig, WordOrder,
+    dial_slmp, execute_slmp_batch_reads, plan_slmp_batch, BatchReadRequest, BatchReadResult,
+    PlcError, SlmpConfig, WordOrder,
 };
 use banto_plc_write::{execute_slmp_writes, plan_slmp_write_batch, BatchWriteRequest, WriteResult};
 use banto_tags::PlcConnection;
@@ -892,32 +894,22 @@ async fn next_conn_event(state: &mut ConnState) -> ConnEvent {
     }
 }
 
-/// Build a bare `slmp::SLMPClient` from `config` and attempt to connect it,
-/// applying the same timeouts/error-mapping `banto_plc::slmp::SlmpClient::connect`
-/// does (see the module doc for why this is re-implemented here rather than
-/// reused). The client is returned either way - on failure it never held a
-/// stream (the wrapped crate's `connect()` clears its own socket before
-/// dialing), so there is nothing to close, but returning it uniformly keeps
-/// this function's shape simple.
+/// Dial `config` through the shared [`banto_plc::dial_slmp`] (see the module
+/// doc's "Reconnect / backoff policy" section) and box the result into this
+/// broker's `(client, result)` shape. The client is returned either way - on
+/// failure `dial_slmp` never handed one back, so this rebuilds a fresh,
+/// unconnected placeholder; the caller (`next_conn_event`'s
+/// `ConnEvent::Finished` arm) only ever inspects the client on the `Ok` side
+/// and discards it on `Err`, so the placeholder is never touched - but
+/// returning the pair unconditionally keeps this function's shape simple.
 async fn connect_attempt(config: SlmpConfig) -> (Box<slmp::SLMPClient>, Result<(), PlcError>) {
-    let addr = format!("{}:{}", config.host, config.port);
-    let mut client = Box::new(slmp::SLMPClient::new(config.to_wire_props()));
-    client.set_send_timeout(config.response_timeout);
-    client.set_recv_timeout(config.response_timeout);
-
-    let result = match tokio::time::timeout(config.connect_timeout, client.connect()).await {
-        Ok(Ok(())) => Ok(()),
-        // H9 (docs/h9-slmp-structured-error-spec.md, 2026-08-12): `connect()`
-        // now returns `slmp::SlmpResult<()>` rather than `io::Result<()>` -
-        // same mapping `banto_plc::slmp::SlmpClient::connect` uses.
-        Ok(Err(e)) => Err(match e {
-            slmp::SlmpError::Timeout => PlcError::ConnectTimeout(addr.clone()),
-            other => PlcError::Connection(other.to_string()),
-        }),
-        Err(_elapsed) => Err(PlcError::ConnectTimeout(addr.clone())),
-    };
-
-    (client, result)
+    match dial_slmp(&config).await {
+        Ok(client) => (Box::new(client), Ok(())),
+        Err(err) => (
+            Box::new(slmp::SLMPClient::new(config.to_wire_props())),
+            Err(err),
+        ),
+    }
 }
 
 /// One connection's broker loop: owns `config`'s session end-to-end (connect,

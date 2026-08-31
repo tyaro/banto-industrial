@@ -12,23 +12,23 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@banto/admin-core": "github:tyaro/banto#v1.1.0&path:packages/admin-core",
-    "@banto/charts": "github:tyaro/banto#v1.1.0&path:packages/charts",
-    "@banto/forms": "github:tyaro/banto#v1.1.0&path:packages/forms",
-    "@banto/grid-svelte": "github:tyaro/banto#v1.1.0&path:packages/grid-svelte",
-    "@banto/theme": "github:tyaro/banto#v1.1.0&path:packages/theme",
+    "@banto/admin-core": "github:tyaro/banto#v1.2.0&path:packages/admin-core",
+    "@banto/charts": "github:tyaro/banto#v1.2.0&path:packages/charts",
+    "@banto/forms": "github:tyaro/banto#v1.2.0&path:packages/forms",
+    "@banto/grid-svelte": "github:tyaro/banto#v1.2.0&path:packages/grid-svelte",
+    "@banto/theme": "github:tyaro/banto#v1.2.0&path:packages/theme",
     "@tauri-apps/api": "^2.11.1"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.8",
-    "@sveltejs/kit": "^2.22.0",
+    "@sveltejs/kit": "^2.70.2",
     "@sveltejs/vite-plugin-svelte": "^5.0.0",
     "@tailwindcss/vite": "^4.3.3",
-    "svelte": "^5.56.8",
+    "svelte": "^5.56.10",
     "svelte-check": "^4.2.0",
     "tailwindcss": "^4.3.3",
-    "typescript": "^5.8.0",
-    "vite": "^8.2.0",
-    "vitest": "^4.1.10"
+    "typescript": "^6.0.3",
+    "vite": "^8.2.2",
+    "vitest": "^4.1.11"
   }
 }

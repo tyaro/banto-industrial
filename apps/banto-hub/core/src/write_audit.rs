@@ -237,7 +237,7 @@ impl WriteAuditService {
     ) -> Result<ListResult<WriteAuditEntry>, BantoError> {
         let columns = column_map();
 
-        let mut rows_builder: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+        let mut rows_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
             "SELECT id, ts, api_key_id, api_key_name_snapshot, tag_id, external_name_snapshot, \
              value_requested, action, result, detail FROM hub_write_audit",
         );
@@ -248,7 +248,7 @@ impl WriteAuditService {
             .await
             .map_err(banto_storage::storage_error)?;
 
-        let mut count_builder: QueryBuilder<'_, Sqlite> =
+        let mut count_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new("SELECT COUNT(*) FROM hub_write_audit");
         banto_storage::list_query::sqlite::append_where(
             &mut count_builder,

@@ -9,7 +9,7 @@ use banto_storage::ColumnMap;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
-use crate::support::{map_write_error, max_length_message, required_message};
+use crate::support::{map_write_error, max_length_message, required_message, NAME_ALREADY_USED};
 
 /// Selectable collection periods, milliseconds (recorder-requirements.md
 /// §3.1: "標準 1s / 選択肢 100ms・200ms・500ms・2s・5s・10s・1min") - mirrors
@@ -117,7 +117,7 @@ impl CollectionGroupService {
     ) -> Result<ListResult<CollectionGroup>, BantoError> {
         let columns = column_map();
 
-        let mut rows_builder: QueryBuilder<'_, Sqlite> =
+        let mut rows_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new(format!("SELECT {COLUMNS} FROM collection_groups"));
         banto_storage::list_query::sqlite::apply_list_params(&mut rows_builder, &columns, &params)?;
         let rows: Vec<CollectionGroup> = rows_builder
@@ -126,7 +126,7 @@ impl CollectionGroupService {
             .await
             .map_err(banto_storage::storage_error)?;
 
-        let mut count_builder: QueryBuilder<'_, Sqlite> =
+        let mut count_builder: QueryBuilder<Sqlite> =
             QueryBuilder::new("SELECT COUNT(*) FROM collection_groups");
         banto_storage::list_query::sqlite::append_where(
             &mut count_builder,
@@ -146,9 +146,11 @@ impl CollectionGroupService {
     }
 
     pub async fn get(&self, id: i64) -> Result<CollectionGroup, BantoError> {
-        sqlx::query_as::<_, CollectionGroup>(&format!(
+        // AssertSqlSafe: 補間されるのは COLUMNS 定数（本ファイル内の固定文字列）
+        // のみで、外部入力は含まれない。id はプレースホルダでバインドする。
+        sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
             "SELECT {COLUMNS} FROM collection_groups WHERE id = ?"
-        ))
+        )))
         .bind(id)
         .fetch_one(&self.pool)
         .await
@@ -157,17 +159,27 @@ impl CollectionGroupService {
 
     pub async fn create(&self, input: CollectionGroupInput) -> Result<CollectionGroup, BantoError> {
         validate_collection_group_input(&input)?;
-        sqlx::query_as::<_, CollectionGroup>(&format!(
+        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
+        // 文字列。値はすべてプレースホルダでバインドする。
+        sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
             "INSERT INTO collection_groups (name, plc_connection_id, period_ms, enabled) \
              VALUES (?, ?, ?, ?) RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(input.name.trim())
         .bind(input.plc_connection_id)
         .bind(input.period_ms)
         .bind(input.enabled)
         .fetch_one(&self.pool)
         .await
-        .map_err(|err| map_write_error(err, "name", "plcConnectionId", FK_MESSAGE))
+        .map_err(|err| {
+            map_write_error(
+                err,
+                "name",
+                NAME_ALREADY_USED,
+                "plcConnectionId",
+                FK_MESSAGE,
+            )
+        })
     }
 
     /// Transaction-compatible counterpart of [`Self::create`].
@@ -177,17 +189,27 @@ impl CollectionGroupService {
         input: CollectionGroupInput,
     ) -> Result<CollectionGroup, BantoError> {
         validate_collection_group_input(&input)?;
-        sqlx::query_as::<_, CollectionGroup>(&format!(
+        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
+        // 文字列。値はすべてプレースホルダでバインドする。
+        sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
             "INSERT INTO collection_groups (name, plc_connection_id, period_ms, enabled) \
              VALUES (?, ?, ?, ?) RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(input.name.trim())
         .bind(input.plc_connection_id)
         .bind(input.period_ms)
         .bind(input.enabled)
         .fetch_one(&mut *connection)
         .await
-        .map_err(|err| map_write_error(err, "name", "plcConnectionId", FK_MESSAGE))
+        .map_err(|err| {
+            map_write_error(
+                err,
+                "name",
+                NAME_ALREADY_USED,
+                "plcConnectionId",
+                FK_MESSAGE,
+            )
+        })
     }
 
     pub async fn update(
@@ -196,10 +218,12 @@ impl CollectionGroupService {
         input: CollectionGroupInput,
     ) -> Result<CollectionGroup, BantoError> {
         validate_collection_group_input(&input)?;
-        sqlx::query_as::<_, CollectionGroup>(&format!(
+        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
+        // 文字列。値はすべてプレースホルダでバインドする。
+        sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
             "UPDATE collection_groups SET name = ?, plc_connection_id = ?, period_ms = ?, enabled = ? \
              WHERE id = ? RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(input.name.trim())
         .bind(input.plc_connection_id)
         .bind(input.period_ms)
@@ -212,7 +236,7 @@ impl CollectionGroupService {
                 resource: RESOURCE.to_string(),
                 id: id.to_string(),
             },
-            other => map_write_error(other, "name", "plcConnectionId", FK_MESSAGE),
+            other => map_write_error(other, "name", NAME_ALREADY_USED, "plcConnectionId", FK_MESSAGE),
         })
     }
 
@@ -224,10 +248,12 @@ impl CollectionGroupService {
         input: CollectionGroupInput,
     ) -> Result<CollectionGroup, BantoError> {
         validate_collection_group_input(&input)?;
-        sqlx::query_as::<_, CollectionGroup>(&format!(
+        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
+        // 文字列。値はすべてプレースホルダでバインドする。
+        sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
             "UPDATE collection_groups SET name = ?, plc_connection_id = ?, period_ms = ?, enabled = ? \
              WHERE id = ? RETURNING {COLUMNS}"
-        ))
+        )))
         .bind(input.name.trim())
         .bind(input.plc_connection_id)
         .bind(input.period_ms)
@@ -240,7 +266,7 @@ impl CollectionGroupService {
                 resource: RESOURCE.to_string(),
                 id: id.to_string(),
             },
-            other => map_write_error(other, "name", "plcConnectionId", FK_MESSAGE),
+            other => map_write_error(other, "name", NAME_ALREADY_USED, "plcConnectionId", FK_MESSAGE),
         })
     }
 

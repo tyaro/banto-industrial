@@ -77,7 +77,10 @@ pub use slmp::planning::{
     plan_slmp_batch, plan_slmp_requests, ReadKind, SlmpMappedRequest, SlmpPlanOutcome,
     SlmpPlannedRead,
 };
-pub use slmp::{execute_slmp_batch_reads, execute_slmp_reads, SlmpClient, SlmpConfig, SlmpCpu};
+pub use slmp::{
+    classify_slmp, dial_slmp, execute_slmp_batch_reads, execute_slmp_reads, SlmpClient, SlmpConfig,
+    SlmpCpu, SlmpErrorClass,
+};
 pub use types::{
     BatchReadRequest, BatchReadResult, DataType, PlcValue, ReadRequest, ReadResult,
     StringReadRequest, TagValue,

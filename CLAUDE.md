@@ -1,8 +1,9 @@
 # banto-industrial プロジェクト規約（Claude 向け）
 
 産業用データ収集・監視アプリ群（Rust workspace + SvelteKit/Tauri）。
+**docs 全体の地図・現状ひとめ・各文書の「正」は [docs/README.md](docs/README.md) を最初に参照。**
 全体計画は [docs/plan.md](docs/plan.md)、タグサーバー banto-hub の設計は
-[docs/tag-server-design.md](docs/tag-server-design.md) を参照。
+[docs/tag-server-design.md](docs/tag-server-design.md)。
 
 ## AI モデルの役割分担（2026-08-05 オーナー指示）
 

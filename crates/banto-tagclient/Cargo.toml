@@ -1,0 +1,19 @@
+[package]
+name = "banto-tagclient"
+description = "Read-only banto-hub tag contracts, snapshots, and streaming client core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+futures-util = { workspace = true, features = ["sink"] }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["net", "time", "sync", "macros", "rt"] }
+tokio-tungstenite = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

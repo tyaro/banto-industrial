@@ -3,7 +3,9 @@
 	import Header from '$lib/components/Header.svelte';
 	import Sidebar from '$lib/components/Sidebar.svelte';
 	import CommandPalette from '$lib/components/CommandPalette.svelte';
+	import CommissioningBanner from '$lib/components/CommissioningBanner.svelte';
 	import { listPendingChanges } from '$lib/banto/pendingChangesAdmin';
+	import { countUnappliedPendingChanges } from '$lib/banto/pendingUnappliedCount';
 	import { commandPaletteStore } from '$lib/commandPalette.svelte';
 	import { isAdmin } from '$lib/permissions';
 	import { sessionStore } from '$lib/session.svelte';
@@ -33,7 +35,12 @@
 			try {
 				const pendingChanges = await listPendingChanges();
 				if (!cancelled) {
-					pendingCount = pendingChanges.length;
+					// 実機で発見された不具合(2026-08-31、オーナー報告): 全件を
+					// 数えると applied/canceled/failed も「未適用」に含めてし
+					// まう（4件中3件キャンセル済み・1件適用済みなのに「未適用
+					// 4件」と表示された）。未適用として数える state の判断は
+					// `pendingUnappliedCount.ts` を参照。
+					pendingCount = countUnappliedPendingChanges(pendingChanges);
 				}
 			} catch {
 				// 常時表示用の補助ポーリングなので、失敗時は静かに無視する。
@@ -51,6 +58,8 @@
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
+
+<CommissioningBanner />
 
 <div class="shell">
 	<Sidebar {pendingCount} />

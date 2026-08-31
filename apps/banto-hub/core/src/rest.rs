@@ -69,13 +69,12 @@ use banto_plc::{
     PlcClient, PlcError, ReadRequest, ReadResult, SlmpClient, SlmpConfig,
 };
 use banto_server::{
-    auth_routes, require_auth, require_banto_client_header, sse_route, ApiError, AuthState,
-    Identity, ServerEvent,
+    auth_routes, require_banto_client_header, sse_route, ApiError, AuthState, Identity, ServerEvent,
 };
 use banto_tags::{
     BatchTagOutcome, BatchTagUpdateOutcome, CollectionGroup, CollectionGroupInput,
-    CollectionGroupService, PlcConnection, PlcConnectionInput, PlcConnectionService, Tag, TagInput,
-    TagService, TagUpdateError,
+    CollectionGroupService, GroupTagCount, PlcConnection, PlcConnectionInput, PlcConnectionService,
+    Tag, TagInput, TagService, TagUpdateError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -87,8 +86,9 @@ use utoipa_swagger_ui::{Config, SwaggerUi};
 
 use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService, IssuedApiKey};
 use crate::audit::{AuditEntry, AuditLogService};
+use crate::commissioning::{CommissioningService, CommissioningState};
 use crate::controller::{CollectionController, CollectionState, CollectionStatus, RunMode};
-use crate::hub::{CollectorManager, SimulationCoverageReport, TagEntry};
+use crate::hub::{CollectorManager, SimulationCoverageReport, TagEntry, TagMap};
 use crate::mqtt::MqttPublisher;
 use crate::pending_changes::{PendingChange, PendingChangesService};
 use crate::settings::{AuditSettings, MqttSettings, SettingsService};
@@ -114,8 +114,83 @@ fn unauthorized_response() -> Response {
     (StatusCode::UNAUTHORIZED, Json(ErrorBody::Unauthorized)).into_response()
 }
 
-fn actor_identity(headers: &HeaderMap, auth: &AuthState) -> Option<Identity> {
+/// 試運転モード（docs/tag-server-design.md §5.6「試運転モードとロックダウン」・
+/// 2026-08-30 オーナー決定）: ロックダウン済みなら従来どおり bearer token
+/// から identity を引く。**未ロックダウン（試運転モード）なら、渡された
+/// `headers`の中身に関わらず無条件で合成の管理者 identity
+/// (`crate::commissioning::synthetic_identity`) を返す** - 設計 §5.6
+/// 「actor_identity() が合成の管理者 identity を返す」「これにより
+/// require_editor などの下流が現行のまま動く」のとおり。この関数の呼び出し
+/// 元（`require_editor`・`record_write`・監査ログ記録の各所）は一切
+/// 分岐を増やさずに「admin 相当の identity が常に手に入る」前提のまま
+/// 動く。監査ログ (`audit_log.actor_username`) にはこの合成 id
+/// (`commissioning`) がそのまま記録される - 「試運転モード中に行われた
+/// 操作」だと後から判別できる、意図した挙動（設計 §5.6）。
+fn actor_identity(
+    headers: &HeaderMap,
+    auth: &AuthState,
+    commissioning: &CommissioningState,
+) -> Option<Identity> {
+    if !commissioning.is_locked_down() {
+        return Some(crate::commissioning::synthetic_identity());
+    }
     bearer_token(headers).and_then(|token| auth.identity_for(token))
+}
+
+/// `AuthState` + `CommissioningState`をまとめた、
+/// [`require_auth_or_commissioning`]の`middleware::from_fn_with_state`用
+/// state。従来の`banto_server::require_auth`（`State<AuthState>`のみ）を
+/// 直接差し替えず、この型を挟む1段ラッパーにしてある理由は
+/// [`require_auth_or_commissioning`]のdoc comment参照。
+#[derive(Clone)]
+struct AuthGate {
+    auth: AuthState,
+    commissioning: CommissioningState,
+}
+
+/// 試運転モード（設計 §5.6・2026-08-30 オーナー決定）: `banto_server::require_auth`
+/// をそのまま`.layer(middleware::from_fn_with_state(auth, require_auth))`
+/// で貼ると、常にセッション bearer を要求してしまい試運転モードの
+/// 「管理 UI / 管理 REST は認証なしで操作できる」を実現できない。この
+/// ラッパーが手前に立ち、ロックダウン済みなら`require_auth`と全く同じ
+/// 判定（bearer token 検証、失敗時 401 - `unauthorized_response`は
+/// `banto_server::require_auth`の401ボディをそのまま再現したもの、この
+/// ファイル冒頭の`unauthorized_response`のdoc comment参照）を行い、
+/// **未ロックダウン中は無条件で次のレイヤーへ素通しする**（設計 §5.6
+/// 「require_auth を通さない（またはバイパスする）」）。素通しした後段の
+/// `require_role_at_least`/`require_editor`は[`actor_identity`]経由で
+/// 合成 admin identity を受け取るので、トークン無しでも「admin 相当」
+/// として動く（このファイル管理系ルーターの`require_auth`レイヤー全箇所
+/// （`users_router`等）でこれに差し替える - `/api/v1/*`のタグ空間 API
+/// （`require_tag_space_auth`、API キー認証）はこの対象外 - 設計 §5.6は
+/// 「管理 UI / 管理 REST」のみを試運転モードの対象にしている）。
+///
+/// `admin_tag_stream_router`（`/api/tag-stream`、試運転モード対応・
+/// 2026-08-31 オーナー決定）用に、ロックダウン済み時の bearer 取得へ
+/// [`extract_ws_protocol_token`]によるフォールバックを追加した -
+/// ブラウザの`WebSocket`は`Authorization`ヘッダを送れないため、
+/// `require_tag_space_auth`が`/api/v1/stream`向けに使っているのと同じ
+/// `Sec-WebSocket-Protocol: bearer, <token>`の運び方をここでも認める
+/// 必要がある。`extract_ws_protocol_token`はパスを厳密一致で許可リスト化
+/// している（`/api/v1/stream`と[`ADMIN_TAG_STREAM_PATH`]の2つのみ）ので、
+/// この関数を`.layer`として使う他の管理系ルーター（`/api/status`・
+/// `/api/users`等）には一切影響しない - それらのパスに対しては
+/// `extract_ws_protocol_token`が常に`None`を返す。
+async fn require_auth_or_commissioning(
+    State(gate): State<AuthGate>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !gate.commissioning.is_locked_down() {
+        return next.run(req).await;
+    }
+    let token = bearer_token(req.headers())
+        .map(str::to_string)
+        .or_else(|| extract_ws_protocol_token(req.uri().path(), req.headers()));
+    match token {
+        Some(token) if gate.auth.verify(&token) => next.run(req).await,
+        _ => unauthorized_response(),
+    }
 }
 
 /// `Sec-WebSocket-Protocol`-as-bearer-carrier fallback for `GET
@@ -140,6 +215,16 @@ fn actor_identity(headers: &HeaderMap, auth: &AuthState) -> Option<Identity> {
 /// auth behavior changes - every other machine client (Rust tests, API-key
 /// clients) can and does set `Authorization` directly.
 ///
+/// 2026-08-31 オーナー決定（試運転モード対応の続き）: 管理系 WS
+/// `admin_tag_stream_router`（`/api/tag-stream`）も同じブラウザ制約
+/// （`Authorization`を送れない）を抱えるため、許可パスに
+/// [`ADMIN_TAG_STREAM_PATH`]を追加した。`/api/v1/stream`自身の挙動は
+/// 一切変えていない - この関数を呼ぶのは`require_tag_space_auth`
+/// （`/api/v1/stream`専用）と`require_auth_or_commissioning`
+/// （`admin_tag_stream_router`はこれ経由、他の管理系ルーターは
+/// このパス自体が来ないので影響なし）の2箇所のみで、どちらも
+/// パスの厳密一致で絞っているため他ルートへの越境は起きない。
+///
 /// Note: [`crate::stream::ws_upgrade`] calls
 /// `WebSocketUpgrade::protocols(["bearer"])`, which only selects/echoes
 /// `"bearer"` back in the response if the client actually offered it in its
@@ -149,7 +234,7 @@ fn actor_identity(headers: &HeaderMap, auth: &AuthState) -> Option<Identity> {
 /// (`tokio-tungstenite`'s client-side handshake validation requires the echo
 /// when the client does offer a subprotocol).
 fn extract_ws_protocol_token(path: &str, headers: &HeaderMap) -> Option<String> {
-    if path != "/api/v1/stream" {
+    if path != "/api/v1/stream" && path != ADMIN_TAG_STREAM_PATH {
         return None;
     }
     let raw = headers
@@ -165,16 +250,21 @@ fn extract_ws_protocol_token(path: &str, headers: &HeaderMap) -> Option<String> 
 
 /// Record a successful write once the service call it follows has already
 /// succeeded - same convention as chronogazer/relay-wright's `record_write`.
+/// 試運転モード対応（設計 §5.6）で `commissioning` 引数が増えて8引数に
+/// なった - このファイルの他の合成関数（`api_router_with_controller_mode`
+/// 等）と同じく `#[allow]` で許容する。
+#[allow(clippy::too_many_arguments)]
 async fn record_write(
     audit: &AuditLogService,
     auth: &AuthState,
+    commissioning: &CommissioningState,
     headers: &HeaderMap,
     action: &str,
     resource: &str,
     entity_id: &str,
     detail: Option<serde_json::Value>,
 ) {
-    let identity = actor_identity(headers, auth);
+    let identity = actor_identity(headers, auth, commissioning);
     audit
         .record(AuditEntry {
             actor_username: identity.as_ref().map(|i| i.id.as_str()),
@@ -192,6 +282,7 @@ async fn record_write(
 #[derive(Clone)]
 struct RoleGuard {
     auth: AuthState,
+    commissioning: CommissioningState,
     min: Role,
     resource: &'static str,
     audit: AuditLogService,
@@ -250,7 +341,16 @@ async fn require_role_at_least(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    let identity = bearer_token(req.headers()).and_then(|token| guard.auth.identity_for(token));
+    // 試運転モード（設計 §5.6・2026-08-30 オーナー決定）: 未ロックダウン中は
+    // トークンの有無に関わらず合成 admin identity を使う -
+    // `require_auth_or_commissioning`が手前で既に素通ししている前提なので、
+    // ここで従来どおりトークン必須にしてしまうと「管理 REST は認証なしで
+    // 操作できる」が実現できない（[`actor_identity`]と同じ判断）。
+    let identity = if !guard.commissioning.is_locked_down() {
+        Some(crate::commissioning::synthetic_identity())
+    } else {
+        bearer_token(req.headers()).and_then(|token| guard.auth.identity_for(token))
+    };
     let role = identity
         .as_ref()
         .and_then(|identity| Role::from_str(&identity.role).ok());
@@ -285,13 +385,14 @@ async fn require_role_at_least(
 /// 共通に使う - `relay-wright-core::rest::require_editor` と同型。
 async fn require_editor(
     auth: &AuthState,
+    commissioning: &CommissioningState,
     audit: &AuditLogService,
     headers: &HeaderMap,
     resource: &'static str,
     method: &str,
     path: &str,
 ) -> Result<(), BantoError> {
-    match actor_identity(headers, auth) {
+    match actor_identity(headers, auth, commissioning) {
         Some(identity)
             if Role::from_str(&identity.role)
                 .map(|role| role.at_least(Role::Editor))
@@ -371,14 +472,34 @@ struct ResetPasswordResponse {
 struct UsersAdminState {
     users: UsersService,
     auth: AuthState,
+    commissioning: CommissioningState,
     audit: AuditLogService,
 }
 
+/// `users_delete`専用: 呼び出し元自身の numeric row id を解決する
+/// （自己削除ガード`UsersService::delete_user`のdoc comment参照）。
+///
+/// 試運転モード（設計 §5.6・2026-08-30 オーナー決定）中は、bearer token を
+/// 一切要求せず、`users`テーブルに絶対に存在しない sentinel の
+/// `id: 0`（`AUTOINCREMENT`は1始まり）を持つ合成`UserIdentity`を返す -
+/// `delete_user`の`id == acting_user_id`という自己削除ガードは、実在しない
+/// idとは決して一致しないため無害に素通りする（合成 identity は
+/// 「削除されうる実在アカウント」ではないので、このガードの対象外で
+/// 正しい）。
 async fn acting_user(
     headers: &HeaderMap,
     auth: &AuthState,
+    commissioning: &CommissioningState,
     users: &UsersService,
 ) -> Result<UserIdentity, BantoError> {
+    if !commissioning.is_locked_down() {
+        return Ok(UserIdentity {
+            id: 0,
+            username: crate::commissioning::SYNTHETIC_ACTOR_ID.to_string(),
+            display_name: "試運転モード".to_string(),
+            role: Role::Admin,
+        });
+    }
     let username = bearer_token(headers)
         .and_then(|token| auth.identity_for(token))
         .map(|identity| identity.id);
@@ -414,6 +535,7 @@ async fn users_create(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "create",
         "users",
@@ -437,6 +559,7 @@ async fn users_update(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "update",
         "users",
@@ -457,6 +580,7 @@ async fn users_reset_password(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "password_reset",
         "users",
@@ -472,11 +596,12 @@ async fn users_delete(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, ApiError> {
-    let acting = acting_user(&headers, &state.auth, &state.users).await?;
+    let acting = acting_user(&headers, &state.auth, &state.commissioning, &state.users).await?;
     state.users.delete_user(id, acting.id).await?;
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "delete",
         "users",
@@ -487,10 +612,16 @@ async fn users_delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn users_router(users: UsersService, audit: AuditLogService, auth: AuthState) -> Router {
+fn users_router(
+    users: UsersService,
+    audit: AuditLogService,
+    auth: AuthState,
+    commissioning: CommissioningState,
+) -> Router {
     let state = UsersAdminState {
         users,
         auth: auth.clone(),
+        commissioning: commissioning.clone(),
         audit: audit.clone(),
     };
     Router::new()
@@ -504,13 +635,20 @@ fn users_router(users: UsersService, audit: AuditLogService, auth: AuthState) ->
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
+                commissioning: commissioning.clone(),
                 min: Role::Admin,
                 resource: "users",
                 audit,
             },
             require_role_at_least,
         ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- extra auth routes (status/setup/change-password) ---------------------
@@ -732,6 +870,7 @@ pub fn audited_credential_verifier(
 #[derive(Clone)]
 struct LogoutAuditState {
     auth: AuthState,
+    commissioning: CommissioningState,
     audit: AuditLogService,
 }
 
@@ -743,7 +882,7 @@ async fn audit_logout_middleware(
     let is_logout =
         req.method() == axum::http::Method::POST && req.uri().path() == "/api/auth/logout";
     let identity = if is_logout {
-        actor_identity(req.headers(), &state.auth)
+        actor_identity(req.headers(), &state.auth, &state.commissioning)
     } else {
         None
     };
@@ -781,6 +920,7 @@ struct AuditLogState {
     // `SettingsService::new(state.manager.pool())`を都度構築する。
     manager: Arc<CollectorManager>,
     auth: AuthState,
+    commissioning: CommissioningState,
 }
 
 /// `POST /api/audit-log/list`（admin 限定）: フィルタ/ソート/ページング
@@ -840,6 +980,7 @@ async fn audit_log_config_put(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "update",
         "audit_log_config",
@@ -857,12 +998,14 @@ async fn audit_log_config_put(
 fn audit_log_router(
     audit: AuditLogService,
     auth: AuthState,
+    commissioning: CommissioningState,
     manager: Arc<CollectorManager>,
 ) -> Router {
     let state = AuditLogState {
         audit: audit.clone(),
         manager,
         auth: auth.clone(),
+        commissioning: commissioning.clone(),
     };
     Router::new()
         .route("/api/audit-log/list", post(audit_log_list))
@@ -874,13 +1017,20 @@ fn audit_log_router(
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
+                commissioning: commissioning.clone(),
                 min: Role::Admin,
                 resource: "audit_log",
                 audit,
             },
             require_role_at_least,
         ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- API キー管理 (docs/tag-server-design.md §5.6・T0-2 実装指示 §1「管理
@@ -893,6 +1043,7 @@ fn audit_log_router(
 struct ApiKeysAdminState {
     api_keys: ApiKeysService,
     auth: AuthState,
+    commissioning: CommissioningState,
     audit: AuditLogService,
     /// H10 ①: `api_keys_create` の「有効期限は未来限定」検証で使う時計
     /// （`manager.clock()`）。他の `*AdminState`（`WriteControlAdminState`
@@ -988,6 +1139,7 @@ async fn api_keys_create(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "create",
         "api_keys",
@@ -1021,6 +1173,7 @@ async fn api_keys_revoke(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "revoke",
         "api_keys",
@@ -1044,6 +1197,7 @@ async fn api_keys_clear_trip(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "clear_trip",
         "api_keys",
@@ -1065,11 +1219,13 @@ fn api_keys_router(
     api_keys: ApiKeysService,
     audit: AuditLogService,
     auth: AuthState,
+    commissioning: CommissioningState,
     manager: Arc<CollectorManager>,
 ) -> Router {
     let state = ApiKeysAdminState {
         api_keys,
         auth: auth.clone(),
+        commissioning: commissioning.clone(),
         audit: audit.clone(),
         manager,
     };
@@ -1081,13 +1237,20 @@ fn api_keys_router(
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
+                commissioning: commissioning.clone(),
                 min: Role::Admin,
                 resource: "api_keys",
                 audit,
             },
             require_role_at_least,
         ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- 書き込み受付トグル (T2-4、設計 §6-6): admin 限定、CSRF + bearer -------
@@ -1103,6 +1266,7 @@ struct WriteControlAdminState {
     write_control: Arc<WriteControl>,
     manager: Arc<CollectorManager>,
     auth: AuthState,
+    commissioning: CommissioningState,
     audit: AuditLogService,
     events: broadcast::Sender<ServerEvent>,
 }
@@ -1127,7 +1291,7 @@ async fn write_control_set(
         state.write_control.disable();
     }
 
-    let identity = actor_identity(headers, &state.auth);
+    let identity = actor_identity(headers, &state.auth, &state.commissioning);
     if let Err(err) = crate::write_control::persist_enabled(
         &state.manager.pool(),
         enabled,
@@ -1141,6 +1305,7 @@ async fn write_control_set(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         headers,
         action,
         "write_control",
@@ -1177,12 +1342,14 @@ fn write_control_router(
     manager: Arc<CollectorManager>,
     audit: AuditLogService,
     auth: AuthState,
+    commissioning: CommissioningState,
     events: broadcast::Sender<ServerEvent>,
 ) -> Router {
     let state = WriteControlAdminState {
         write_control,
         manager,
         auth: auth.clone(),
+        commissioning: commissioning.clone(),
         audit: audit.clone(),
         events,
     };
@@ -1193,13 +1360,20 @@ fn write_control_router(
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
+                commissioning: commissioning.clone(),
                 min: Role::Admin,
                 resource: "write_control",
                 audit,
             },
             require_role_at_least,
         ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- テスト出力トグル (T15-3、設計 §6.3): admin 限定、CSRF + bearer -------
@@ -1219,6 +1393,7 @@ struct TestOutputAdminState {
     test_output: Arc<TestOutputControl>,
     controller: Arc<CollectionController>,
     auth: AuthState,
+    commissioning: CommissioningState,
     audit: AuditLogService,
     events: broadcast::Sender<ServerEvent>,
 }
@@ -1275,6 +1450,7 @@ async fn test_output_enable(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "enable",
         "test_output",
@@ -1298,6 +1474,7 @@ async fn test_output_disable(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "disable",
         "test_output",
@@ -1317,12 +1494,14 @@ fn test_output_router(
     controller: Arc<CollectionController>,
     audit: AuditLogService,
     auth: AuthState,
+    commissioning: CommissioningState,
     events: broadcast::Sender<ServerEvent>,
 ) -> Router {
     let state = TestOutputAdminState {
         test_output,
         controller,
         auth: auth.clone(),
+        commissioning: commissioning.clone(),
         audit: audit.clone(),
         events,
     };
@@ -1333,13 +1512,20 @@ fn test_output_router(
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
+                commissioning: commissioning.clone(),
                 min: Role::Admin,
                 resource: "test_output",
                 audit,
             },
             require_role_at_least,
         ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- collection lifecycle control (T14-4): admin + CSRF --------------------
@@ -1382,6 +1568,7 @@ struct CollectionAdminState {
     /// 状態機械のみ - `crate::controller`のモジュール doc comment参照)。
     manager: Arc<CollectorManager>,
     auth: AuthState,
+    commissioning: CommissioningState,
     audit: AuditLogService,
     events: broadcast::Sender<ServerEvent>,
 }
@@ -1395,6 +1582,7 @@ async fn collection_control_result(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         headers,
         action,
         "collection",
@@ -1483,12 +1671,14 @@ fn collection_control_router(
     manager: Arc<CollectorManager>,
     audit: AuditLogService,
     auth: AuthState,
+    commissioning: CommissioningState,
     events: broadcast::Sender<ServerEvent>,
 ) -> Router {
     let state = CollectionAdminState {
         controller,
         manager,
         auth: auth.clone(),
+        commissioning: commissioning.clone(),
         audit: audit.clone(),
         events,
     };
@@ -1511,13 +1701,20 @@ fn collection_control_router(
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
+                commissioning: commissioning.clone(),
                 min: Role::Admin,
                 resource: "collection",
                 audit,
             },
             require_role_at_least,
         ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- MQTT 設定 (T3、設計 §5.3): admin 限定、CSRF + bearer -------------------
@@ -1533,6 +1730,7 @@ struct MqttSettingsAdminState {
     manager: Arc<CollectorManager>,
     mqtt: Arc<MqttPublisher>,
     auth: AuthState,
+    commissioning: CommissioningState,
     audit: AuditLogService,
     events: broadcast::Sender<ServerEvent>,
 }
@@ -1678,6 +1876,7 @@ async fn mqtt_settings_put(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "update",
         "mqtt_settings",
@@ -1697,12 +1896,14 @@ fn mqtt_settings_router(
     mqtt: Arc<MqttPublisher>,
     audit: AuditLogService,
     auth: AuthState,
+    commissioning: CommissioningState,
     events: broadcast::Sender<ServerEvent>,
 ) -> Router {
     let state = MqttSettingsAdminState {
         manager,
         mqtt,
         auth: auth.clone(),
+        commissioning: commissioning.clone(),
         audit: audit.clone(),
         events,
     };
@@ -1715,13 +1916,20 @@ fn mqtt_settings_router(
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
+                commissioning: commissioning.clone(),
                 min: Role::Admin,
                 resource: "mqtt_settings",
                 audit,
             },
             require_role_at_least,
         ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- gRPC 設定 (T4、設計 §5.4): admin 限定、CSRF + bearer -------------------
@@ -1747,6 +1955,7 @@ struct GrpcSettingsAdminState {
     manager: Arc<CollectorManager>,
     grpc_server: Arc<crate::grpc::GrpcServer>,
     auth: AuthState,
+    commissioning: CommissioningState,
     audit: AuditLogService,
     events: broadcast::Sender<ServerEvent>,
 }
@@ -1848,6 +2057,7 @@ async fn grpc_settings_put(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "update",
         "grpc_settings",
@@ -1867,12 +2077,14 @@ fn grpc_settings_router(
     grpc_server: Arc<crate::grpc::GrpcServer>,
     audit: AuditLogService,
     auth: AuthState,
+    commissioning: CommissioningState,
     events: broadcast::Sender<ServerEvent>,
 ) -> Router {
     let state = GrpcSettingsAdminState {
         manager,
         grpc_server,
         auth: auth.clone(),
+        commissioning: commissioning.clone(),
         audit: audit.clone(),
         events,
     };
@@ -1885,13 +2097,20 @@ fn grpc_settings_router(
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
+                commissioning: commissioning.clone(),
                 min: Role::Admin,
                 resource: "grpc_settings",
                 audit,
             },
             require_role_at_least,
         ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- 書き込み監査の閲覧 (T2-4、設計 §6-3): admin 限定、CSRF + bearer -------
@@ -1914,6 +2133,7 @@ fn write_audit_router(
     write_audit: WriteAuditService,
     audit: AuditLogService,
     auth: AuthState,
+    commissioning: CommissioningState,
 ) -> Router {
     let state = WriteAuditAdminState { write_audit };
     Router::new()
@@ -1922,13 +2142,20 @@ fn write_audit_router(
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
+                commissioning: commissioning.clone(),
                 min: Role::Admin,
                 resource: "write_audit",
                 audit,
             },
             require_role_at_least,
         ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- I1 CRUD (viewer-read / editor-write) + collector rebuild -------------
@@ -2167,6 +2394,7 @@ struct TagRegistryState {
     collection_groups: CollectionGroupService,
     tags: TagService,
     auth: AuthState,
+    commissioning: CommissioningState,
     audit: AuditLogService,
     manager: Arc<CollectorManager>,
     controller: Arc<CollectionController>,
@@ -2233,7 +2461,7 @@ async fn queue_pending_registry_change(
     payload: serde_json::Value,
     status: CollectionStatus,
 ) -> RegistryMutationResult<Response> {
-    let identity = actor_identity(headers, &state.auth);
+    let identity = actor_identity(headers, &state.auth, &state.commissioning);
     let base_fingerprint = compute_pending_base_fingerprint(state, source, &payload).await;
     let pending = state
         .pending_changes
@@ -2356,6 +2584,7 @@ async fn plc_connections_create(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "plc_connections",
@@ -2399,6 +2628,7 @@ async fn plc_connections_create(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "create",
         "plc_connections",
@@ -2426,6 +2656,7 @@ async fn plc_connections_update(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "plc_connections",
@@ -2473,6 +2704,7 @@ async fn plc_connections_update(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "update",
         "plc_connections",
@@ -2499,6 +2731,7 @@ async fn plc_connections_delete(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "plc_connections",
@@ -2539,6 +2772,7 @@ async fn plc_connections_delete(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "delete",
         "plc_connections",
@@ -2930,6 +3164,7 @@ async fn plc_connections_test(
 ) -> Result<Json<PlcConnectionTestResponse>, ApiError> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "plc_connections",
@@ -3006,6 +3241,7 @@ async fn collection_groups_create(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "collection_groups",
@@ -3053,6 +3289,7 @@ async fn collection_groups_create(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "create",
         "collection_groups",
@@ -3080,6 +3317,7 @@ async fn collection_groups_update(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "collection_groups",
@@ -3127,6 +3365,7 @@ async fn collection_groups_update(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "update",
         "collection_groups",
@@ -3153,6 +3392,7 @@ async fn collection_groups_delete(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "collection_groups",
@@ -3193,6 +3433,7 @@ async fn collection_groups_delete(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "delete",
         "collection_groups",
@@ -3216,6 +3457,28 @@ async fn tags_list(State(state): State<TagRegistryState>) -> Result<Json<Vec<Tag
     Ok(Json(state.tags.list(ListParams::default()).await?.rows))
 }
 
+/// `POST /api/tags/list`（T18-5a 第2段、docs/banto-hub-t18-design.md §4
+/// 決定6「薄い部品の先行配線」）: `write_audit_list`/`audit_log_list` と同型の
+/// 素通しハンドラ - `ListParams` をそのままサービスへ渡し `ListResult<Tag>`
+/// を返すだけ。認可は `GET /api/tags` と同じくルーター全体の
+/// `require_auth`（viewer 以上で読み取り可）のみで、`require_editor` は
+/// 呼ばない（読み取り専用エンドポイントのため）。
+async fn tags_list_query(
+    State(state): State<TagRegistryState>,
+    Json(params): Json<ListParams>,
+) -> Result<Json<ListResult<Tag>>, ApiError> {
+    Ok(Json(state.tags.list(params).await?))
+}
+
+/// `GET /api/tags/group-counts`（T18-5a 第2段、同 §4 決定6）: グループ別の
+/// タグ件数集計。`GET /api/tags` と同じ読み取り専用エンドポイントなので
+/// `require_auth` のみ。
+async fn tags_group_counts(
+    State(state): State<TagRegistryState>,
+) -> Result<Json<Vec<GroupTagCount>>, ApiError> {
+    Ok(Json(state.tags.count_by_group().await?))
+}
+
 async fn tags_get(
     State(state): State<TagRegistryState>,
     Path(id): Path<i64>,
@@ -3230,6 +3493,7 @@ async fn tags_create(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "tags",
@@ -3272,6 +3536,7 @@ async fn tags_create(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "create",
         "tags",
@@ -3299,6 +3564,7 @@ async fn tags_update(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "tags",
@@ -3346,6 +3612,7 @@ async fn tags_update(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "update",
         "tags",
@@ -3372,6 +3639,7 @@ async fn tags_delete(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "tags",
@@ -3411,6 +3679,7 @@ async fn tags_delete(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "delete",
         "tags",
@@ -3442,6 +3711,7 @@ struct PendingChangesAdminState {
     apply_lock: Arc<AsyncMutex<()>>,
     legacy_live_reconfigure: bool,
     auth: AuthState,
+    commissioning: CommissioningState,
     audit: AuditLogService,
 }
 
@@ -3527,10 +3797,36 @@ fn pending_apply_conflict_message(resource: &str) -> String {
     )
 }
 
+/// `BantoError` の `Display`（`thiserror` の `#[error(...)]`）は種別ごとの
+/// 定型文だけで、`Validation` は常に `"validation failed"` としか出ない。
+/// フィールド単位の理由（`field_errors`）が丸ごと落ちる。pending change の
+/// 失敗理由としてはこれでは「何が」失敗したのか分からない（実機で再現した
+/// 不具合の修正2、2026-08-31 オーナー報告: 収集稼働中に同じ名前で収集
+/// グループを3回作成し、3回とも適用時に `pending change の適用に失敗
+/// しました: validation failed` としか出ず、名前が重複していることに
+/// 気づけなかった）。`Validation` のときだけ `field_errors` を
+/// `"{field}: {message}"` の形へ展開する（該当する UI 入力欄の項目名と揃う。
+/// `ConnectionDrawer.svelte`/`CollectionGroupDrawer.svelte` の
+/// `applyFieldErrors` が読む `field`/`message` と同じペア）。それ以外の
+/// 種別は従来どおり `Display` に委ねる。
+fn banto_error_detail(err: &BantoError) -> String {
+    match err {
+        BantoError::Validation { field_errors } if !field_errors.is_empty() => field_errors
+            .iter()
+            .map(|fe| format!("{}: {}", fe.field, fe.message))
+            .collect::<Vec<_>>()
+            .join(", "),
+        other => other.to_string(),
+    }
+}
+
 impl PendingApplyError {
     fn reason(&self) -> String {
         match self {
-            Self::Api(err) => format!("pending change の適用に失敗しました: {}", err.0),
+            Self::Api(err) => format!(
+                "pending change の適用に失敗しました: {}",
+                banto_error_detail(&err.0)
+            ),
             Self::CollectionEditLocked(status) => {
                 format!("収集中は構成を編集できません(state={})", status.state)
             }
@@ -3879,8 +4175,29 @@ async fn pending_changes_cancel(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "cancel",
+        "pending_changes",
+        &id.to_string(),
+        None,
+    )
+    .await;
+    Ok(Json(pending))
+}
+
+async fn pending_changes_requeue(
+    State(state): State<PendingChangesAdminState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<PendingChange>, ApiError> {
+    let pending = state.pending_changes.requeue_pending(id).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &state.commissioning,
+        &headers,
+        "requeue",
         "pending_changes",
         &id.to_string(),
         None,
@@ -3941,6 +4258,7 @@ async fn pending_changes_apply(
     record_write(
         &state.audit,
         &state.auth,
+        &state.commissioning,
         &headers,
         "apply",
         "pending_changes",
@@ -3959,6 +4277,7 @@ fn pending_changes_router(
     tags: TagService,
     audit: AuditLogService,
     auth: AuthState,
+    commissioning: CommissioningState,
     manager: Arc<CollectorManager>,
     controller: Arc<CollectionController>,
     events: broadcast::Sender<ServerEvent>,
@@ -3975,6 +4294,7 @@ fn pending_changes_router(
         apply_lock: Arc::new(AsyncMutex::new(())),
         legacy_live_reconfigure,
         auth: auth.clone(),
+        commissioning: commissioning.clone(),
         audit: audit.clone(),
     };
     Router::new()
@@ -3988,17 +4308,28 @@ fn pending_changes_router(
             "/api/pending-changes/{id}/cancel",
             post(pending_changes_cancel),
         )
+        .route(
+            "/api/pending-changes/{id}/requeue",
+            post(pending_changes_requeue),
+        )
         .with_state(state)
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
+                commissioning: commissioning.clone(),
                 min: Role::Admin,
                 resource: "pending_changes",
                 audit,
             },
             require_role_at_least,
         ))
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- T11-1 一括登録 API (docs/ux-plan.md §3): 連続登録 UI と T11-2 の CSV
@@ -4090,6 +4421,7 @@ async fn tags_batch(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "tags",
@@ -4167,6 +4499,7 @@ async fn tags_batch(
                 record_write(
                     &state.audit,
                     &state.auth,
+                    &state.commissioning,
                     &headers,
                     "batch_create",
                     "tags",
@@ -4284,6 +4617,7 @@ async fn tags_batch_update(
 ) -> RegistryMutationResult<Response> {
     require_editor(
         &state.auth,
+        &state.commissioning,
         &state.audit,
         &headers,
         "tags",
@@ -4361,6 +4695,7 @@ async fn tags_batch_update(
                 record_write(
                     &state.audit,
                     &state.auth,
+                    &state.commissioning,
                     &headers,
                     "batch_update",
                     "tags",
@@ -4403,6 +4738,7 @@ fn tag_registry_router(
     pending_changes: PendingChangesService,
     audit: AuditLogService,
     auth: AuthState,
+    commissioning: CommissioningState,
     manager: Arc<CollectorManager>,
     controller: Arc<CollectionController>,
     events: broadcast::Sender<ServerEvent>,
@@ -4413,6 +4749,7 @@ fn tag_registry_router(
         collection_groups,
         tags,
         auth: auth.clone(),
+        commissioning: commissioning.clone(),
         audit,
         manager,
         controller: controller.clone(),
@@ -4457,8 +4794,22 @@ fn tag_registry_router(
         // T18-3b (bulk tag operations): 一括更新 - 同じ理由で `/api/tags`
         // 直下の固定パス（`/api/tags/batch` と衝突しない別セグメント）。
         .route("/api/tags/batch-update", post(tags_batch_update))
+        // T18-5a 第2段 (docs/banto-hub-t18-design.md §4 決定6): `ListParams`
+        // 素通しのページング付き一覧 - `/api/tags/batch`・`/api/tags/batch-update`
+        // と同じ理由で `/api/tags/{id}` (i64 パラメータ) と衝突しない固定
+        // セグメント (axum の matchit は静的セグメント優先 - 統合テストで
+        // `/api/tags/{id}` 側の解決も併せて確認する)。
+        .route("/api/tags/list", post(tags_list_query))
+        // 同じく固定セグメント。グループ別タグ件数集計。
+        .route("/api/tags/group-counts", get(tags_group_counts))
         .with_state(state)
-        .layer(middleware::from_fn_with_state(auth, require_auth))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 // --- /api/v1/* タグ空間 API（設計 §5.1） ------------------------------------
@@ -4577,30 +4928,21 @@ fn api_key_external_output_allowed(entry: &TagEntry, runtime: &CollectionStatus)
     )
 }
 
-/// `GET /api/v1/tags` - catalog: `{ "revision", "run_id",
-/// "collection_mode", "tags": [CatalogTagEntry...] }`,
-/// optionally filtered by `?connection=`/`?group=` (matched against the
-/// entry's connection/group *name*, design §5.1's route table). API-key
-/// requests additionally omit simulation and derived-simulation entries.
-#[utoipa::path(
-    get,
-    path = "/api/v1/tags",
-    params(
-        ("connection" = Option<String>, Query, description = "接続名で絞り込む"),
-        ("group" = Option<String>, Query, description = "収集グループ名で絞り込む"),
-    ),
-    responses((status = 200, description = "catalog スナップショット", body = CatalogResponse)),
-    tag = "tag-space",
-)]
-async fn v1_tags(
-    State(state): State<TagSpaceState>,
-    Query(query): Query<TagsQuery>,
-    ctx: Option<Extension<ApiKeyContext>>,
-) -> Json<CatalogResponse> {
+/// `GET /api/v1/tags`・管理系 `GET /api/tag-catalog`（[`admin_tag_catalog`]、
+/// 試運転モード対応・設計 §5.6・2026-08-31 オーナー決定「案A」の続き）が
+/// 共有する本体。`api_key_request` が true の場合のみ
+/// [`api_key_external_output_allowed`] でシミュレーション系タグを隠す
+/// （機械クライアント向けの絞り込み、design §5.1）。管理 UI 側の呼び出し
+/// （`admin_tag_catalog`、`api_key_request = false` 固定）は他の管理系
+/// エンドポイントと同様、シミュレーション設定も含め全件を返す。
+fn build_catalog_response(
+    state: &TagSpaceState,
+    query: &TagsQuery,
+    api_key_request: bool,
+) -> CatalogResponse {
     let map = state.manager.tag_map();
     let revision = state.manager.revision();
     let runtime = state.controller.status();
-    let api_key_request = ctx.is_some();
     let tags: Vec<CatalogTagEntry> = map
         .iter()
         .filter(|entry| !api_key_request || api_key_external_output_allowed(entry, &runtime))
@@ -4620,12 +4962,39 @@ async fn v1_tags(
         })
         .map(|entry| CatalogTagEntry::from_runtime(entry, &runtime))
         .collect();
-    Json(CatalogResponse {
+    CatalogResponse {
         revision,
         run_id: runtime.run_id,
         collection_mode: runtime.mode.as_str().to_string(),
         tags,
-    })
+    }
+}
+
+/// `GET /api/v1/tags` ハンドラ本体 - catalog: `{ "revision", "run_id",
+/// "collection_mode", "tags": [CatalogTagEntry...] }`,
+/// optionally filtered by `?connection=`/`?group=` (matched against the
+/// entry's connection/group *name*, design §5.1's route table). API-key
+/// requests additionally omit simulation and derived-simulation entries.
+/// ロジックは[`build_catalog_response`]側にあり、ここでは`ctx`から
+/// `api_key_request`を判定して渡すだけ - 管理系の[`admin_tag_catalog`]は
+/// 同じ関数を`api_key_request = false`固定で呼ぶ（二重管理を避けるための
+/// 分離、`compute_status`/[`v1_status`]と同じ構成）。
+#[utoipa::path(
+    get,
+    path = "/api/v1/tags",
+    params(
+        ("connection" = Option<String>, Query, description = "接続名で絞り込む"),
+        ("group" = Option<String>, Query, description = "収集グループ名で絞り込む"),
+    ),
+    responses((status = 200, description = "catalog スナップショット", body = CatalogResponse)),
+    tag = "tag-space",
+)]
+async fn v1_tags(
+    State(state): State<TagSpaceState>,
+    Query(query): Query<TagsQuery>,
+    ctx: Option<Extension<ApiKeyContext>>,
+) -> Json<CatalogResponse> {
+    Json(build_catalog_response(&state, &query, ctx.is_some()))
 }
 
 /// One `/api/v1/values*` entry's wire shape (design §5.1's route table:
@@ -4741,39 +5110,18 @@ async fn v1_values(
     ctx: Option<Extension<ApiKeyContext>>,
 ) -> Response {
     let map = state.manager.tag_map();
-    let revision = state.manager.revision();
     let runtime = state.controller.status();
-    let now_ms = state.manager.clock().now_ms();
-    let current = state.manager.current_values();
-    let server_store = state.manager.server_store();
 
-    let names: Vec<String> = match &query.tags {
-        Some(raw) => raw
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect(),
-        None => map
-            .iter()
-            .map(|entry| entry.external_name.clone())
-            .collect(),
-    };
-
-    if query.tags.is_some() {
-        let unknown: Vec<&str> = names
-            .iter()
-            .map(String::as_str)
-            .filter(|name| map.get(name).is_none())
-            .collect();
-        if !unknown.is_empty() {
+    let names = match resolve_value_names(&map, &query) {
+        Ok(names) => names,
+        Err(unknown) => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({ "error": "unknown_tag", "tags": unknown })),
             )
                 .into_response();
         }
-    }
+    };
 
     let names: Vec<String> = if let Some(Extension(ctx)) = &ctx {
         if query.tags.is_some() {
@@ -4806,6 +5154,59 @@ async fn v1_values(
         names
     };
 
+    Json(build_values_response(&state, &map, &runtime, names)).into_response()
+}
+
+/// `GET /api/v1/values`・管理系`GET /api/values`([`admin_values`])が共有
+/// する`?tags=`解決: 省略時は全タグ、指定時はカンマ区切りをパースする。
+/// 未知の外部名を1つでも含む場合は`Err(unknown)`（外部名のリスト、呼び出し
+/// 元が400を組み立てる）を返す。API キーのper-tagスコープ判定（`ctx`）は
+/// ここに含めない - 管理系にはその概念が無く、`v1_values`側だけが追加で
+/// 適用する。
+fn resolve_value_names(map: &TagMap, query: &ValuesQuery) -> Result<Vec<String>, Vec<String>> {
+    let names: Vec<String> = match &query.tags {
+        Some(raw) => raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        None => map
+            .iter()
+            .map(|entry| entry.external_name.clone())
+            .collect(),
+    };
+
+    if query.tags.is_some() {
+        let unknown: Vec<String> = names
+            .iter()
+            .filter(|name| map.get(name).is_none())
+            .cloned()
+            .collect();
+        if !unknown.is_empty() {
+            return Err(unknown);
+        }
+    }
+
+    Ok(names)
+}
+
+/// 指定された外部名の集合から[`ValuesResponse`]を組み立てる -
+/// `/api/v1/values`・管理系`/api/values`([`admin_values`])が共有する本体。
+/// `map`/`runtime`は呼び出し元がAPIキーのper-tagスコープ絞り込み等を終えた
+/// 後の値を渡す想定（1リクエスト内で複数回`tag_map()`/`controller.status()`
+/// を呼んで状態がずれるのを避けるため、呼び出し元で1回だけ取得したものを
+/// 共有する）。
+fn build_values_response(
+    state: &TagSpaceState,
+    map: &TagMap,
+    runtime: &CollectionStatus,
+    names: Vec<String>,
+) -> ValuesResponse {
+    let now_ms = state.manager.clock().now_ms();
+    let current = state.manager.current_values();
+    let server_store = state.manager.server_store();
+
     let values: Vec<ValueEntry> = names
         .iter()
         .filter_map(|name| map.get(name).map(|entry| (name, entry)))
@@ -4816,19 +5217,18 @@ async fn v1_values(
                 current.as_ref(),
                 &server_store,
                 now_ms,
-                &runtime,
+                runtime,
             )
         })
         .collect();
 
-    Json(ValuesResponse {
-        revision,
+    ValuesResponse {
+        revision: state.manager.revision(),
         t: now_ms,
         run_id: runtime.run_id,
         collection_mode: runtime.mode.as_str().to_string(),
         values,
-    })
-    .into_response()
+    }
 }
 
 /// `GET /api/v1/values/{tag}` - single tag. `404` only when the external
@@ -4994,10 +5394,11 @@ struct StatusResponse {
     last_apply: Option<LastApplyEntry>,
 }
 
-/// `GET /api/v1/status` - `{ "version", "revision", "last_config_error",
-/// "connections": [...] }` (design §5.1's route table). Connection names
-/// come from the registry directly (not the catalog) so a connection with
-/// zero tags still appears.
+/// `GET /api/v1/status`・管理系 `GET /api/status`（2026-08-31 オーナー決定
+/// 「案A」、`admin_status`参照）が共有する本体。`{ "version", "revision",
+/// "last_config_error", "connections": [...] }` (design §5.1's route table)
+/// を組み立てる。Connection names come from the registry directly (not the
+/// catalog) so a connection with zero tags still appears.
 ///
 /// T2-2 (docs/tag-server-design.md §6-5, 2026-08-05 決定): an SLMP
 /// connection's status comes from
@@ -5007,13 +5408,7 @@ struct StatusResponse {
 /// for why the broker's answer is the one that reflects whether the physical
 /// session is actually up for a broker-managed connection. Modbus connections
 /// are unaffected and keep reading from `banto_collect::Collector::status`.
-#[utoipa::path(
-    get,
-    path = "/api/v1/status",
-    responses((status = 200, description = "サーバー状態", body = StatusResponse)),
-    tag = "tag-space",
-)]
-async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResponse>, ApiError> {
+async fn compute_status(state: &TagSpaceState) -> Result<StatusResponse, ApiError> {
     let runtime = state.controller.status();
     let revision = state.manager.configured_revision();
     let last_config_error = state.manager.last_error();
@@ -5078,7 +5473,7 @@ async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResp
         })
         .collect();
 
-    Ok(Json(StatusResponse {
+    Ok(StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         revision,
         configured_revision: runtime.configured_revision,
@@ -5101,7 +5496,487 @@ async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResp
             port: grpc_settings.port,
         },
         last_apply: state.manager.last_apply().map(LastApplyEntry::from),
-    }))
+    })
+}
+
+/// `GET /api/v1/status` ハンドラ本体 - [`compute_status`]をそのまま JSON へ
+/// 包むだけ。ロジックは`compute_status`側にあり、ここでは wire 形式
+/// （snake_case、機械クライアント向け）を選ぶだけ - 管理系の
+/// [`admin_status`]はカラムは同じ`compute_status`を呼び、camelCase の
+/// [`AdminStatusResponse`]へ包み直す（二重管理を避けるための分離）。
+#[utoipa::path(
+    get,
+    path = "/api/v1/status",
+    responses((status = 200, description = "サーバー状態", body = StatusResponse)),
+    tag = "tag-space",
+)]
+async fn v1_status(State(state): State<TagSpaceState>) -> Result<Json<StatusResponse>, ApiError> {
+    Ok(Json(compute_status(&state).await?))
+}
+
+// --- 管理系 `GET /api/status`・`GET /api/values`・`GET /api/tag-catalog`・
+// `GET /api/tag-stream`（設計 §5.6・2026-08-31 オーナー決定「案A」） --------
+//
+// 実機の試運転モードで判明した問題: 管理 UI（`hubStatus.ts`）が
+// `GET /api/v1/status`・`GET /api/v1/values` を使っていたため、試運転モード
+// （未ロックダウン・未ログイン・API キー未発行）中はどちらも401になり、
+// 状態ページの「サーバー状態」「タグ現在値」が空になっていた
+// （`hostSwitchGate.isPreflightOk`が`status.revision`を要求するため、
+// Desktop↔Service 切替ウィザードまで連鎖的に塞がれる）。当初これを
+// `/api/status`・`/api/values`の新設だけで解消したつもりだったが、
+// **ライブタグモニタ（`tagMonitorAdmin.ts`）が別に`/api/v1/tags`（catalog）と
+// `/api/v1/stream`（WS）を直接叩いている経路を見落としていた** -
+// 同じ理由（`require_tag_space_auth`固定・試運転モードのバイパス対象外）で
+// モニタの行が1つも出ない不具合が残っていた。`/api/tag-catalog`・
+// `/api/tag-stream`はこの見落としの是正として同日に追加した。
+//
+// なぜ `/api/v1/*` 側を試運転モード対応にしないか: `/api/v1/*` は機械
+// クライアント向けタグ空間 API で、認証は`require_tag_space_auth`
+// （API キー or セッション bearer）固定 - 設計 §5.6 の決定で試運転モードの
+// バイパス対象**外**（PLC 書き込み経路 `/api/v1/values/{tag}` と同じ境界を
+// 守るため、機械クライアントの認証要件を試運転モードで緩めない）。
+//
+// 採用した方針: `/api/v1/*` のルート・認証・レスポンス形状は一切変えず、
+// 管理系ルーター（試運転モードのバイパスが効き、ロックダウン後はセッション
+// bearer が要る側）に別口のエンドポイントを追加する。ロジックは
+// `compute_status`/`resolve_value_names`/`build_values_response`/
+// `build_catalog_response`（上の`/api/v1/status`・`/api/v1/values`・
+// `/api/v1/tags`ハンドラと**完全に同じ関数**）を呼ぶだけで、二重管理には
+// していない。WS（`/api/tag-stream`）は関数どころかハンドラ自体
+// （[`crate::stream::ws_upgrade`]）を`/api/v1/stream`とそのまま共有する -
+// `admin_tag_stream_router`のdoc comment参照。
+//
+// 認可レベル: `RoleGuard`（admin 限定）は掛けない。理由:
+// 1. `/api/v1/status`・`/api/v1/values`自体がそもそもロール制約の無い
+//    読み取り専用エンドポイント（`tag_space_router`参照、`RoleGuard`は
+//    一切登場しない）。管理系に持ち込むだけでロールを新設するのは
+//    「同じ情報を管理 UI からも読めるようにする」というこの変更の趣旨から
+//    外れる。
+// 2. 管理系ルーターの既存の慣行でも、書き込み系（`write-control`・
+//    `collection`等）は`RoleGuard{min: Role::Admin}`を掛ける一方、
+//    読み取り専用の一覧系（`/api/tags`・`/api/plc-connections`・
+//    `/api/pending-changes`の`GET`等、`tag_registry_router`/
+//    `pending_changes_router`参照）は`require_auth_or_commissioning`のみ
+//    （ロール不問 = viewer でも読める）。状態ページ・タグ現在値は
+//    まさにこの「読み取り専用の一覧系」に分類され、viewer ロールの
+//    利用者にも見えるべき情報（実際、状態ページは`canManageWriteControl`
+//    等で書き込み操作のボタンだけを admin 限定にし、閲覧自体は誰でも
+//    行える設計 - `(app)/status/+page.svelte`参照）。
+//
+// レスポンスの命名規則: 管理系 DTO（`CollectionStatusResponse`・
+// `WriteControlStatusResponse`等）はすべて`#[serde(rename_all =
+// "camelCase")]`。`/api/v1/*`側は意図して snake_case のまま
+// （`hubStatus.ts`冒頭の doc comment参照）。このエンドポイントは管理系
+// ルーターに属するので camelCase 側の規約に倣う - フィールド名に
+// アンダースコアを含まない型（`MqttStatusEntry`・`GrpcStatusEntry`・
+// `ValueEntry`）はそのまま再利用し（camelCase と snake_case で JSON が
+// 一致するため二重定義しない）、アンダースコアを含む型だけ
+// `Admin*`のcamelCase版を新設して`From`で変換する。
+
+/// [`ConnectionStatusEntry`]のcamelCase版（`configuredSimulation`・
+/// `effectiveSimulation`）。
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct AdminConnectionStatusEntry {
+    name: String,
+    id: i64,
+    status: String,
+    attempt: Option<u32>,
+    simulation: bool,
+    configured_simulation: bool,
+    effective_simulation: bool,
+}
+
+impl From<ConnectionStatusEntry> for AdminConnectionStatusEntry {
+    fn from(entry: ConnectionStatusEntry) -> Self {
+        Self {
+            name: entry.name,
+            id: entry.id,
+            status: entry.status,
+            attempt: entry.attempt,
+            simulation: entry.simulation,
+            configured_simulation: entry.configured_simulation,
+            effective_simulation: entry.effective_simulation,
+        }
+    }
+}
+
+/// [`TestOutputStatusEntry`]のcamelCase版（`runId`）。
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct AdminTestOutputStatusEntry {
+    enabled: bool,
+    run_id: Option<u64>,
+}
+
+impl From<TestOutputStatusEntry> for AdminTestOutputStatusEntry {
+    fn from(entry: TestOutputStatusEntry) -> Self {
+        Self {
+            enabled: entry.enabled,
+            run_id: entry.run_id,
+        }
+    }
+}
+
+/// [`LastApplyEntry`]のcamelCase版（`writerRotated`）。
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct AdminLastApplyEntry {
+    added: Vec<String>,
+    removed: Vec<String>,
+    replaced: Vec<String>,
+    unchanged: Vec<String>,
+    writer_rotated: bool,
+}
+
+impl From<LastApplyEntry> for AdminLastApplyEntry {
+    fn from(entry: LastApplyEntry) -> Self {
+        Self {
+            added: entry.added,
+            removed: entry.removed,
+            replaced: entry.replaced,
+            unchanged: entry.unchanged,
+            writer_rotated: entry.writer_rotated,
+        }
+    }
+}
+
+/// `GET /api/status`の応答 - [`StatusResponse`]（`/api/v1/status`）と
+/// 完全に同じ情報をcamelCaseで運ぶ。`mqtt`/`grpc`は元の型
+/// （`MqttStatusEntry`/`GrpcStatusEntry`）をそのまま再利用する -
+/// フィールド名にアンダースコアが無くcamelCase化で形が変わらないため。
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct AdminStatusResponse {
+    version: String,
+    revision: u64,
+    configured_revision: u64,
+    running_revision: u64,
+    run_id: Option<u64>,
+    collection_state: String,
+    collection_mode: String,
+    last_runtime_error: Option<String>,
+    last_config_error: Option<String>,
+    connections: Vec<AdminConnectionStatusEntry>,
+    write_enabled: bool,
+    write_was_enabled_before_restart: bool,
+    test_output: AdminTestOutputStatusEntry,
+    mqtt: MqttStatusEntry,
+    grpc: GrpcStatusEntry,
+    last_apply: Option<AdminLastApplyEntry>,
+}
+
+impl From<StatusResponse> for AdminStatusResponse {
+    fn from(status: StatusResponse) -> Self {
+        Self {
+            version: status.version,
+            revision: status.revision,
+            configured_revision: status.configured_revision,
+            running_revision: status.running_revision,
+            run_id: status.run_id,
+            collection_state: status.collection_state,
+            collection_mode: status.collection_mode,
+            last_runtime_error: status.last_runtime_error,
+            last_config_error: status.last_config_error,
+            connections: status.connections.into_iter().map(Into::into).collect(),
+            write_enabled: status.write_enabled,
+            write_was_enabled_before_restart: status.write_was_enabled_before_restart,
+            test_output: status.test_output.into(),
+            mqtt: status.mqtt,
+            grpc: status.grpc,
+            last_apply: status.last_apply.map(Into::into),
+        }
+    }
+}
+
+/// `GET /api/status` - 管理 UI 向け（試運転モードのバイパス対象、
+/// このセクション冒頭のdoc comment参照）。[`compute_status`]を
+/// `/api/v1/status`と共有し、camelCaseへ包み直すだけ。
+async fn admin_status(
+    State(state): State<TagSpaceState>,
+) -> Result<Json<AdminStatusResponse>, ApiError> {
+    Ok(Json(compute_status(&state).await?.into()))
+}
+
+/// `GET /api/values`の応答 - [`ValuesResponse`]（`/api/v1/values`）と
+/// 完全に同じ情報をcamelCaseで運ぶ。`values`は[`ValueEntry`]をそのまま
+/// 再利用する（フィールド名にアンダースコアが無いため）。
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct AdminValuesResponse {
+    revision: u64,
+    t: i64,
+    run_id: Option<u64>,
+    collection_mode: String,
+    values: Vec<ValueEntry>,
+}
+
+impl From<ValuesResponse> for AdminValuesResponse {
+    fn from(resp: ValuesResponse) -> Self {
+        Self {
+            revision: resp.revision,
+            t: resp.t,
+            run_id: resp.run_id,
+            collection_mode: resp.collection_mode,
+            values: resp.values,
+        }
+    }
+}
+
+/// `GET /api/values` - 管理 UI 向け（試運転モードのバイパス対象、
+/// このセクション冒頭のdoc comment参照）。`/api/v1/values`と違い API キー
+/// の概念が無い（管理系ルーターにはセッション bearer/試運転の合成
+/// identity しか来ない）ので、`ctx`によるper-tagスコープ絞り込みは行わず
+/// 常に全件（`?tags=`指定時はその集合）を返す - `resolve_value_names`/
+/// `build_values_response`は`v1_values`と共有する。
+async fn admin_values(
+    State(state): State<TagSpaceState>,
+    Query(query): Query<ValuesQuery>,
+) -> Response {
+    let map = state.manager.tag_map();
+    let runtime = state.controller.status();
+
+    let names = match resolve_value_names(&map, &query) {
+        Ok(names) => names,
+        Err(unknown) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "unknown_tag", "tags": unknown })),
+            )
+                .into_response();
+        }
+    };
+
+    Json(AdminValuesResponse::from(build_values_response(
+        &state, &map, &runtime, names,
+    )))
+    .into_response()
+}
+
+/// [`CatalogTagEntry`]のcamelCase版（`GET /api/tag-catalog`用、
+/// [`admin_tag_catalog`]参照）。`banto_tags`/`crate::hub::TagEntry`は
+/// `/api/v1/*`向けに意図して snake_case のまま（同型の doc comment
+/// 「Field names are plain snake_case on the wire」参照）なので、
+/// `#[serde(flatten)]`に頼らずフィールドを手動で列挙してcamelCaseへ
+/// 変換する（`AdminConnectionStatusEntry`等、このファイルの他の
+/// `Admin*`camelCase版と同じ手法）。
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct AdminCatalogTagEntry {
+    external_name: String,
+    tag_key: String,
+    #[schema(value_type = Vec<i64>)]
+    ids: (i64, i64, i64),
+    connection: String,
+    group: String,
+    name: String,
+    address: String,
+    data_type: String,
+    unit: Option<String>,
+    decimals: i64,
+    period_ms: i64,
+    enabled: bool,
+    writable: bool,
+    tag_kind: String,
+    expression: Option<String>,
+    retain: bool,
+    simulation: bool,
+    configured_simulation: bool,
+    effective_simulation: bool,
+    value_source: String,
+}
+
+impl From<CatalogTagEntry> for AdminCatalogTagEntry {
+    fn from(entry: CatalogTagEntry) -> Self {
+        Self {
+            external_name: entry.entry.external_name,
+            tag_key: entry.entry.tag_key,
+            ids: entry.entry.ids,
+            connection: entry.entry.connection,
+            group: entry.entry.group,
+            name: entry.entry.name,
+            address: entry.entry.address,
+            data_type: entry.entry.data_type,
+            unit: entry.entry.unit,
+            decimals: entry.entry.decimals,
+            period_ms: entry.entry.period_ms,
+            enabled: entry.entry.enabled,
+            writable: entry.entry.writable,
+            tag_kind: entry.entry.tag_kind,
+            expression: entry.entry.expression,
+            retain: entry.entry.retain,
+            simulation: entry.entry.simulation,
+            configured_simulation: entry.configured_simulation,
+            effective_simulation: entry.effective_simulation,
+            value_source: entry.value_source,
+        }
+    }
+}
+
+/// [`CatalogResponse`]のcamelCase版。
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct AdminCatalogResponse {
+    revision: u64,
+    run_id: Option<u64>,
+    collection_mode: String,
+    tags: Vec<AdminCatalogTagEntry>,
+}
+
+impl From<CatalogResponse> for AdminCatalogResponse {
+    fn from(resp: CatalogResponse) -> Self {
+        Self {
+            revision: resp.revision,
+            run_id: resp.run_id,
+            collection_mode: resp.collection_mode,
+            tags: resp.tags.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// `GET /api/tag-catalog` - 管理 UI 向け（試運転モードのバイパス対象、
+/// このセクション冒頭のdoc comment参照）。ライブタグモニタ
+/// （`tagMonitorAdmin.ts`）が本来必要としていたのはこれ - 元々は
+/// `/api/v1/tags`を直接叩いていたため、試運転モード中は行が1つも表示され
+/// ない不具合の原因だった。[`build_catalog_response`]を`/api/v1/tags`
+/// （[`v1_tags`]）と共有し、`api_key_request = false`固定（管理系ルーター
+/// にAPIキーの概念は無い）で呼ぶ - シミュレーション設定を含め全件を返す
+/// （[`admin_values`]と同じ判断）。
+async fn admin_tag_catalog(
+    State(state): State<TagSpaceState>,
+    Query(query): Query<TagsQuery>,
+) -> Json<AdminCatalogResponse> {
+    Json(build_catalog_response(&state, &query, false).into())
+}
+
+/// [`admin_status`]・[`admin_values`]・[`admin_tag_catalog`]用ルーター -
+/// 管理系（試運転モードのバイパスが効く側）に配置する。`RoleGuard`は
+/// 掛けない理由はこのセクション冒頭のdoc comment参照（読み取り専用・
+/// ロール不問、`tag_registry_router`の`GET`系と同じ扱い）。状態は
+/// [`TagSpaceState`]を[`tag_space_router`]とは別に組み立てる - こちらは
+/// `require_auth_or_commissioning`層を被せるため、`require_tag_space_auth`
+/// 層を被せる`tag_space_router`側の`Router`とは共有できない（axum の
+/// `Router`は1つにつき1枚の認証`.layer`しか意味を持たないため、同じ
+/// `Router`を2種類の認証で使い回すことはできない）。
+///
+/// **WS（`/api/tag-stream`）はここに同居させない** -
+/// [`admin_tag_stream_router`]のdoc comment参照（この Router 全体は最終的に
+/// `require_banto_client_header`(CSRF) レイヤーの内側に組み込まれるが、
+/// ブラウザの`WebSocket`はCSRF用カスタムヘッダを送れないため）。
+fn admin_status_router(
+    manager: Arc<CollectorManager>,
+    controller: Arc<CollectionController>,
+    write_control: Arc<WriteControl>,
+    test_output: Arc<TestOutputControl>,
+    mqtt: Arc<MqttPublisher>,
+    auth: AuthState,
+    commissioning: CommissioningState,
+) -> Router {
+    let state = TagSpaceState {
+        manager,
+        controller,
+        write_control,
+        test_output,
+        mqtt,
+    };
+    Router::new()
+        .route("/api/status", get(admin_status))
+        .route("/api/values", get(admin_values))
+        .route("/api/tag-catalog", get(admin_tag_catalog))
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
+}
+
+/// `GET /api/tag-stream`（管理系 WS、[`admin_tag_stream_router`]）のパス -
+/// [`extract_ws_protocol_token`]の許可リストと[`admin_tag_stream_router`]の
+/// 両方から参照する定数にして、パス文字列のタイプミスで両者がずれるのを
+/// 防ぐ。
+const ADMIN_TAG_STREAM_PATH: &str = "/api/tag-stream";
+
+/// [`crate::stream::ws_upgrade`]（`/api/v1/stream`と全く同じハンドラ関数）
+/// 用の管理系ルーター - 試運転モード対応（設計 §5.6・2026-08-31 オーナー
+/// 決定）で新設。ライブタグモニタ（`tagMonitorAdmin.ts`）の購読先を
+/// 試運転モードでも繋がるようにするための追加（このセクション冒頭の
+/// doc comment参照 - `/api/tag-catalog`と対になる存在）。
+///
+/// ## なぜ`admin_status_router`に同居させないか（CSRF とブラウザ WS の制約）
+///
+/// [`api_router_with_controller_mode`]が組み立てる`admin`ルーター一式は
+/// 最後に`require_banto_client_header`（CSRF、`X-Banto-Client`ヘッダ必須）
+/// を1枚被せる。ところがブラウザの`WebSocket`コンストラクタは（この
+/// ファイル冒頭のモジュール doc comment、および
+/// `extract_ws_protocol_token`のdoc comment が`Authorization`について
+/// 説明しているのと全く同じ理由で）カスタムヘッダを一切送れない -
+/// `X-Banto-Client`もその例外ではない。もし`/api/tag-stream`を
+/// `admin_status_router`に同居させて`admin`側のCSRFレイヤーの内側に
+/// 置いてしまうと、実ブラウザからは**認証の成否に関わらず**常に403に
+/// なり、管理 UI から絶対に接続できなくなる。
+///
+/// そのため、このルーターは単独で構築し、`tag_space_router`
+/// （`/api/v1/*`、同じ理由でCSRF対象外 - このファイル冒頭のモジュール
+/// doc comment参照）と同様に`admin`へCSRFレイヤーを被せた**後**に
+/// `.merge()`する（[`api_router_with_controller_mode`]参照）。CSRFを
+/// 要求しない代わりに、認証自体は[`require_auth_or_commissioning`]で
+/// 別途担保する（ロックダウン済みなら有効なセッション bearer が必須 -
+/// CSRFの有無に関わらず未認証アクセスは401になる）ので、保護水準は
+/// 落ちていない。
+///
+/// ## 認証: ロックダウン済みでの Sec-WebSocket-Protocol フォールバック
+///
+/// ブラウザは`Authorization`ヘッダも送れないので、ロックダウン済み状態
+/// （通常ログイン後）でこのWSに繋ぐには何らかの代替経路が要る。
+/// `/api/v1/stream`が使っているのと**全く同じ仕組み**
+/// （`Sec-WebSocket-Protocol: bearer, <token>`、`extract_ws_protocol_token`
+/// 参照）を[`require_auth_or_commissioning`]側にも追加した - パスの許可
+/// リストに[`ADMIN_TAG_STREAM_PATH`]を足しただけで、`/api/v1/stream`の
+/// 認証・ルート・レスポンス形状は一切変えていない（`require_tag_space_auth`
+/// は無変更）。試運転モード中（未ロックダウン）は
+/// [`require_auth_or_commissioning`]がヘッダの中身を見る前に無条件で
+/// 素通しするので、トークン（Sec-WebSocket-Protocolオファーそのもの）が
+/// 無くても接続できる。
+///
+/// ## `scope`（per-tag read スコープ）は常に`None`
+///
+/// [`crate::stream::ws_upgrade`]は`ApiKeyContext`拡張が無ければ`scope`を
+/// `None`として扱う（=購読の絞り込み無し、全アクセス）。管理系ルーターは
+/// `require_auth_or_commissioning`しか通らず`ApiKeyContext`を挿入する
+/// ことは無いので、この管理系WSは常に`scope = None`側の経路を通る -
+/// これは「セッション bearer で`/api/v1/stream`に繋いだ場合」と全く同じ
+/// 挙動（`crate::stream::handle_socket`のフィールド doc comment
+/// 「`external = scope.is_some()`」参照）で、管理 UI が今まで手にしていた
+/// アクセス範囲を狭めても広げてもいない。
+fn admin_tag_stream_router(
+    manager: Arc<CollectorManager>,
+    controller: Arc<CollectionController>,
+    write_control: Arc<WriteControl>,
+    test_output: Arc<TestOutputControl>,
+    mqtt: Arc<MqttPublisher>,
+    auth: AuthState,
+    commissioning: CommissioningState,
+) -> Router {
+    let state = TagSpaceState {
+        manager,
+        controller,
+        write_control,
+        test_output,
+        mqtt,
+    };
+    Router::new()
+        .route(ADMIN_TAG_STREAM_PATH, get(crate::stream::ws_upgrade))
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -5759,6 +6634,117 @@ fn openapi_router(profile_id: String) -> Router {
         .with_state(OpenApiState { profile_id })
 }
 
+// --- 試運転モード/ロックダウン (設計 §5.6・2026-08-30 オーナー決定) --------
+//
+// `GET /api/commissioning/status`: 現在ロックダウン済みかどうか。試運転
+// モード中は管理 UI がまだログインできない（ログインという概念自体が
+// バイパスされている）ため、**この読み取りだけは`require_auth_or_commissioning`
+// の対象外にして常に未認証で叩けるようにする** - 実装指示「未認証でも
+// 取得できる必要がある」のとおり。読み取り専用のため監査エントリは
+// 記録しない（`crate::audit`のモジュール doc「read routes are never
+// audited」と同じ規約）。
+//
+// `POST /api/commissioning/lock-down`: 試運転モード → ロックダウン済みへの
+// 唯一の正方向遷移（`CommissioningService::lock_down`）。他の admin
+// エンドポイントと同じ`RoleGuard`（admin ちょうど）+
+// `require_auth_or_commissioning`を掛ける - 試運転モード中はその
+// ガード自体が素通しになるので実質誰でも叩けるが、ロックダウン済みに
+// なった後は admin セッションが無いと叩けなくなる（＝ロックダウン後に
+// 再度ロックダウンし直すことはできるが admin 権限が要る、という自然な
+// 挙動）。
+//
+// 試運転モードへ戻す REST エンドポイントは意図的に存在しない
+// （`crate::commissioning`のモジュール doc「REST では絶対に公開しない
+// こと」参照 - 設計 §5.6「UI・REST からは解除できない」・
+// `banto-hub-elev.exe`経由限定）。
+
+#[derive(Clone)]
+struct CommissioningAdminState {
+    commissioning: CommissioningService,
+    auth: AuthState,
+    audit: AuditLogService,
+}
+
+async fn commissioning_status(
+    State(state): State<CommissioningAdminState>,
+) -> Json<crate::commissioning::CommissioningStatus> {
+    Json(crate::commissioning::CommissioningStatus {
+        locked_down: state.commissioning.is_locked_down(),
+    })
+}
+
+async fn commissioning_lock_down(
+    State(state): State<CommissioningAdminState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::commissioning::CommissioningStatus>, ApiError> {
+    state.commissioning.lock_down().await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &state.commissioning.state(),
+        &headers,
+        "lock_down",
+        "commissioning",
+        "1",
+        None,
+    )
+    .await;
+    Ok(Json(crate::commissioning::CommissioningStatus {
+        locked_down: true,
+    }))
+}
+
+fn commissioning_router(
+    commissioning: CommissioningService,
+    audit: AuditLogService,
+    auth: AuthState,
+) -> Router {
+    let state = CommissioningAdminState {
+        commissioning: commissioning.clone(),
+        auth: auth.clone(),
+        audit: audit.clone(),
+    };
+    let commissioning_state = commissioning.state();
+
+    // status は未認証で読める必要がある（設計 §5.6）ので、他の admin
+    // ルーターと違い `require_auth_or_commissioning`/`RoleGuard` を一切
+    // 掛けない - `require_banto_client_header`（CSRF、`admin`ルーター全体に
+    // 掛かる）だけは他の admin エンドポイントと同様に適用される
+    // （`X-Banto-Client`ヘッダはログイン資格情報ではなく「自前のフロント
+    // エンドから来た」ことを示すだけなので、未ログインの `GET
+    // /api/auth/status`等と同じく問題ない - このファイル冒頭の
+    // 「二系統に分かれたルーター」節参照）。
+    let status_route = Router::new()
+        .route("/api/commissioning/status", get(commissioning_status))
+        .with_state(state.clone());
+
+    let lock_down_route = Router::new()
+        .route(
+            "/api/commissioning/lock-down",
+            post(commissioning_lock_down),
+        )
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            RoleGuard {
+                auth: auth.clone(),
+                commissioning: commissioning_state.clone(),
+                min: Role::Admin,
+                resource: "commissioning",
+                audit,
+            },
+            require_role_at_least,
+        ))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning: commissioning_state,
+            },
+            require_auth_or_commissioning,
+        ));
+
+    status_route.merge(lock_down_route)
+}
+
 // --- composition ------------------------------------------------------------
 
 /// Compose the full router: the admin surface (auth/users/audit-log/I1 CRUD/
@@ -5777,6 +6763,13 @@ fn api_router_with_controller_mode(
     manager: Arc<CollectorManager>,
     controller: Arc<CollectionController>,
     auth: AuthState,
+    // 試運転モードとロックダウン（設計 §5.6・2026-08-30 オーナー決定）:
+    // `crate::runtime::HubRuntime::start`が起動時に一度だけ`CommissioningService::load`
+    // した結果をここへ注入する（`ApiKeysService`等、他サービスと同じ規約）。
+    // ここではフル `CommissioningService`（`commissioning_router`の
+    // `lock_down`が使う）を受け取り、他の全 admin ルーターへは軽量な
+    // `CommissioningState`ハンドル（`.state()`）だけを配る。
+    commissioning: CommissioningService,
     events: broadcast::Sender<ServerEvent>,
     allow_setup: bool,
     // T2-4（設計 §6）: 書き込み受付の起動時 disabled フラグと書き込み監査
@@ -5812,9 +6805,12 @@ fn api_router_with_controller_mode(
     // （`crate::runtime`）が`HubConfig::profile_id`をそのまま渡す。
     profile_id: String,
 ) -> Router {
+    let commissioning_state = commissioning.state();
+
     let audited_auth_routes = auth_routes(auth.clone()).layer(middleware::from_fn_with_state(
         LogoutAuditState {
             auth: auth.clone(),
+            commissioning: commissioning_state.clone(),
             audit: audit.clone(),
         },
         audit_logout_middleware,
@@ -5829,16 +6825,28 @@ fn api_router_with_controller_mode(
             allow_setup,
         ))
         .merge(sse_route(auth.clone(), events.clone()))
-        .merge(users_router(users, audit.clone(), auth.clone()))
+        .merge(commissioning_router(
+            commissioning,
+            audit.clone(),
+            auth.clone(),
+        ))
+        .merge(users_router(
+            users,
+            audit.clone(),
+            auth.clone(),
+            commissioning_state.clone(),
+        ))
         .merge(audit_log_router(
             audit.clone(),
             auth.clone(),
+            commissioning_state.clone(),
             manager.clone(),
         ))
         .merge(api_keys_router(
             api_keys.clone(),
             audit.clone(),
             auth.clone(),
+            commissioning_state.clone(),
             manager.clone(),
         ))
         .merge(tag_registry_router(
@@ -5848,6 +6856,7 @@ fn api_router_with_controller_mode(
             pending_changes.clone(),
             audit.clone(),
             auth.clone(),
+            commissioning_state.clone(),
             manager.clone(),
             controller.clone(),
             events.clone(),
@@ -5860,6 +6869,7 @@ fn api_router_with_controller_mode(
             tags,
             audit.clone(),
             auth.clone(),
+            commissioning_state.clone(),
             manager.clone(),
             controller.clone(),
             events.clone(),
@@ -5870,6 +6880,7 @@ fn api_router_with_controller_mode(
             manager.clone(),
             audit.clone(),
             auth.clone(),
+            commissioning_state.clone(),
             events.clone(),
         ))
         .merge(test_output_router(
@@ -5877,6 +6888,7 @@ fn api_router_with_controller_mode(
             controller.clone(),
             audit.clone(),
             auth.clone(),
+            commissioning_state.clone(),
             events.clone(),
         ))
         .merge(collection_control_router(
@@ -5884,18 +6896,21 @@ fn api_router_with_controller_mode(
             manager.clone(),
             audit.clone(),
             auth.clone(),
+            commissioning_state.clone(),
             events.clone(),
         ))
         .merge(write_audit_router(
             write_audit.clone(),
             audit.clone(),
             auth.clone(),
+            commissioning_state.clone(),
         ))
         .merge(mqtt_settings_router(
             manager.clone(),
             mqtt.clone(),
             audit.clone(),
             auth.clone(),
+            commissioning_state.clone(),
             events.clone(),
         ))
         .merge(grpc_settings_router(
@@ -5903,11 +6918,44 @@ fn api_router_with_controller_mode(
             grpc_server,
             audit.clone(),
             auth.clone(),
+            commissioning_state.clone(),
             events.clone(),
+        ))
+        // 試運転モード対応（設計 §5.6・2026-08-31 オーナー決定「案A」）:
+        // `GET /api/status`・`GET /api/values`・`GET /api/tag-catalog` -
+        // `/api/v1/status`・`/api/v1/values`・`/api/v1/tags`と同じ情報を
+        // 管理系（試運転モードのバイパスが効く側）から読めるようにする。
+        // `admin_status_router`のdoc comment参照。ここで渡す
+        // `manager`/`controller`/`write_control`/`test_output`/`mqtt`の各
+        // `Arc`は、下の`tag_space_router`/`admin_tag_stream_router`へ渡す
+        // ものと**同じ**インスタンスの`clone()` - 別インスタンスを作ると
+        // 状態が分裂する（このファイルの他の`Arc`共有規律と同じ）。
+        .merge(admin_status_router(
+            manager.clone(),
+            controller.clone(),
+            write_control.clone(),
+            test_output.clone(),
+            mqtt.clone(),
+            auth.clone(),
+            commissioning_state.clone(),
         ))
         .layer(middleware::from_fn(require_banto_client_header));
 
     admin
+        // `admin_tag_stream_router`（`/api/tag-stream`）は意図的に上の
+        // `admin`（CSRF レイヤー適用済み）へ`tag_space_router`と同じ形で
+        // `.merge()`する - CSRF レイヤーの**外側**に置く必要がある理由は
+        // `admin_tag_stream_router`のdoc comment参照（ブラウザの
+        // `WebSocket`はCSRF用カスタムヘッダを送れない）。
+        .merge(admin_tag_stream_router(
+            manager.clone(),
+            controller.clone(),
+            write_control.clone(),
+            test_output.clone(),
+            mqtt.clone(),
+            auth.clone(),
+            commissioning_state,
+        ))
         .merge(tag_space_router(
             manager,
             controller,
@@ -5976,6 +7024,9 @@ pub fn api_router_with_controller(
     manager: Arc<CollectorManager>,
     controller: Arc<CollectionController>,
     auth: AuthState,
+    // 試運転モードとロックダウン（設計 §5.6）: `api_router_with_controller_mode`
+    // のフィールド doc comment参照。
+    commissioning: CommissioningService,
     events: broadcast::Sender<ServerEvent>,
     allow_setup: bool,
     write_control: Arc<WriteControl>,
@@ -6000,6 +7051,7 @@ pub fn api_router_with_controller(
         manager,
         controller,
         auth,
+        commissioning,
         events,
         allow_setup,
         write_control,
@@ -6026,6 +7078,9 @@ pub fn api_router(
     api_keys: ApiKeysService,
     manager: Arc<CollectorManager>,
     auth: AuthState,
+    // 試運転モードとロックダウン（設計 §5.6）: `api_router_with_controller_mode`
+    // のフィールド doc comment参照。
+    commissioning: CommissioningService,
     events: broadcast::Sender<ServerEvent>,
     allow_setup: bool,
     write_control: Arc<WriteControl>,
@@ -6055,6 +7110,7 @@ pub fn api_router(
         manager,
         controller,
         auth,
+        commissioning,
         events,
         allow_setup,
         write_control,
@@ -6137,12 +7193,30 @@ mod tests {
         test_env_with_clock(Arc::new(SystemClock)).await
     }
 
+    /// 試運転モード（設計 §5.6・2026-08-30 オーナー決定）のテスト用: [`test_env`]
+    /// と同じ環境を、明示的に**ロックダウンしないまま**（＝試運転モードの
+    /// まま）返す - `commissioning_mode_tests`（このモジュール下部）専用。
+    async fn test_env_unlocked() -> TestEnv {
+        test_env_with_clock_and_lock(Arc::new(SystemClock), false).await
+    }
+
     /// [`test_env`] but with an injectable clock (H10 ①) - lets a test
     /// create a key with `expiresAt = clock.now_ms() + small`, assert it
     /// authenticates, then `advance_ms` past the deadline and assert 401 -
     /// deterministically, without depending on real wall-clock time. See
     /// [`test_manager_with_clock`]'s doc comment for the same reasoning.
+    /// Always locked down - see [`test_env_with_clock_and_lock`].
     async fn test_env_with_clock(clock: Arc<dyn Clock>) -> TestEnv {
+        test_env_with_clock_and_lock(clock, true).await
+    }
+
+    /// [`test_env_with_clock`]で共有している実体。`locked_down: false`は
+    /// [`test_env_unlocked`]専用（試運転モードのテスト） - このファイルの
+    /// 大半の既存テストは「ロックダウン済み」の挙動そのものを検証している
+    /// ため、`test_env_with_clock`自体は常に`true`を渡して既存の意味論を
+    /// 一切変えない（実装指示「既存の認証・監査の挙動を、ロックダウン済み
+    /// 状態では一切変えないこと」）。
+    async fn test_env_with_clock_and_lock(clock: Arc<dyn Clock>, locked_down: bool) -> TestEnv {
         let pool = migrate_memory().await.expect("migrate_memory");
         let (tx, _rx) = tokio_broadcast::channel(16);
         let users = UsersService::new(pool.clone());
@@ -6203,6 +7277,28 @@ mod tests {
             tx.clone(),
         );
         let grpc_server = Arc::new(crate::grpc::GrpcServer::new(grpc_service));
+
+        // 試運転モードとロックダウン（設計 §5.6・2026-08-30 オーナー決定）:
+        // このファイルの大半の既存テストは「ロックダウン済み（従来どおり
+        // bearer セッションのログイン必須）」の挙動そのものを検証している
+        // ため、共有テスト環境は明示的にロックダウンしてから router を
+        // 組み立てる - こうしないと未ロックダウン（試運転モード）の
+        // バイパスが効いてしまい、`admin_token`/`viewer_token`を使わない
+        // リクエストまで通ってしまう（実装指示「既存の認証・監査の挙動を、
+        // ロックダウン済み状態では一切変えないこと」）。試運転モード側の
+        // 挙動は`commissioning_mode_tests`（このモジュール下部）で別途
+        // 専用のテスト環境を組んで検証する。
+        let settings = SettingsService::new(pool.clone());
+        let commissioning = CommissioningService::load(settings, users.clone())
+            .await
+            .expect("CommissioningService::load");
+        if locked_down {
+            commissioning
+                .lock_down()
+                .await
+                .expect("lock_down the shared test environment");
+        }
+
         let router = api_router(
             users,
             audit,
@@ -6212,6 +7308,7 @@ mod tests {
             api_keys.clone(),
             manager,
             auth,
+            commissioning,
             tx,
             false,
             write_control,
@@ -7913,6 +9010,261 @@ mod tests {
         assert_eq!(queued_count, 1);
     }
 
+    /// TAG-P0-3 follow-up（2026-08-14）: failed 状態の提案を requeue すると
+    /// pending へ戻り、failure_reason はクリアされる。
+    #[tokio::test]
+    async fn pending_changes_requeue_endpoint_returns_pending_state() {
+        let env = test_env().await;
+
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line-requeue-basic", "host": "127.0.0.1", "port": 15034 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+
+        let (status, group) = admin_post(
+            &env.router,
+            "/api/collection-groups",
+            &env.admin_token,
+            json!({ "name": "fast", "plcConnectionId": conn["id"], "periodMs": 100 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{group:?}");
+
+        let start = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/start")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        let queued = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/tags")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "temp-requeue-basic-01",
+                            "collectionGroupId": group["id"],
+                            "address": "40001",
+                            "dataType": "i16"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued.status(), StatusCode::ACCEPTED);
+        let queued_bytes = axum::body::to_bytes(queued.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let queued_body: serde_json::Value = serde_json::from_slice(&queued_bytes).unwrap();
+        let pending_id = queued_body["pending"]["id"]
+            .as_i64()
+            .expect("pending id should exist");
+
+        // 収集稼働中に apply → 409 collection_edit_locked で failed へ遷移
+        // （pending_changes_apply_while_running_returns_409_and_keeps_queue_row
+        // と同じ経路で failed 行を用意する）。
+        let apply_while_running = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{pending_id}/apply"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(apply_while_running.status(), StatusCode::CONFLICT);
+
+        let pending_changes = PendingChangesService::new(env.pool.clone());
+        let failed = pending_changes.get(pending_id).await.unwrap();
+        assert_eq!(failed.state, PendingChangeState::Failed);
+
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{pending_id}/requeue"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["state"], "pending");
+        assert!(body["failureReason"].is_null());
+
+        let requeued = pending_changes.get(pending_id).await.unwrap();
+        assert_eq!(requeued.state, PendingChangeState::Pending);
+    }
+
+    /// TAG-P0-3 follow-up（2026-08-14）: 一過性の失敗（収集稼働中の 409）は
+    /// requeue → 収集停止 → 再 apply で回復できることを確認する。
+    #[tokio::test]
+    async fn pending_changes_requeue_then_apply_succeeds_after_transient_failure_clears() {
+        let env = test_env().await;
+
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line-requeue-transient", "host": "127.0.0.1", "port": 15035 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+
+        let (status, group) = admin_post(
+            &env.router,
+            "/api/collection-groups",
+            &env.admin_token,
+            json!({ "name": "fast", "plcConnectionId": conn["id"], "periodMs": 100 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{group:?}");
+
+        let start = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/start")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        let queued = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/tags")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "temp-requeue-transient-01",
+                            "collectionGroupId": group["id"],
+                            "address": "40001",
+                            "dataType": "i16"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued.status(), StatusCode::ACCEPTED);
+        let queued_bytes = axum::body::to_bytes(queued.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let queued_body: serde_json::Value = serde_json::from_slice(&queued_bytes).unwrap();
+        let pending_id = queued_body["pending"]["id"]
+            .as_i64()
+            .expect("pending id should exist");
+
+        let apply_while_running = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{pending_id}/apply"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(apply_while_running.status(), StatusCode::CONFLICT);
+
+        let pending_changes = PendingChangesService::new(env.pool.clone());
+        let failed = pending_changes.get(pending_id).await.unwrap();
+        assert_eq!(failed.state, PendingChangeState::Failed);
+
+        let requeue_response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{pending_id}/requeue"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(requeue_response.status(), StatusCode::OK);
+        let requeue_bytes = axum::body::to_bytes(requeue_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let requeue_body: serde_json::Value = serde_json::from_slice(&requeue_bytes).unwrap();
+        assert_eq!(requeue_body["state"], "pending");
+
+        let stop = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/stop")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop.status(), StatusCode::OK);
+
+        let reapply = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{pending_id}/apply"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reapply.status(), StatusCode::OK);
+        let reapply_bytes = axum::body::to_bytes(reapply.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reapply_body: serde_json::Value = serde_json::from_slice(&reapply_bytes).unwrap();
+        assert_eq!(reapply_body["state"], "applied");
+
+        let applied = pending_changes.get(pending_id).await.unwrap();
+        assert_eq!(applied.state, PendingChangeState::Applied);
+    }
+
     /// TAG-P0-3 follow-up（2026-08-12）: 適用対象の `plc_connections` 行が
     /// enqueue 時点から変わっていなければ、`base_fingerprint` ガードは何も
     /// 妨げない（ハッピーパス）。
@@ -8005,6 +9357,126 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(updated.name, "line-fp-ok-renamed");
+    }
+
+    /// 実機で再現した不具合の修正2（2026-08-31 オーナー報告）: pending change
+    /// の適用が validation エラー（名前の重複）で失敗したとき、
+    /// `failure_reason` にフィールド単位の詳細（`name: 既に使用されています`）
+    /// が含まれることを確認する。修正前は `BantoError` の `Display`
+    /// （`thiserror`）が種別ごとの定型文だけ（`Validation` は常に
+    /// `"validation failed"`）だったため、`pending change の適用に失敗
+    /// しました: validation failed` としか出ず、何が失敗したのか分からな
+    /// かった - オーナーが収集稼働中に同じ名前（`group1`）で収集グループを
+    /// 3回作成し、3回とも適用が全滅した際にこれで気づけなかった。
+    #[tokio::test]
+    async fn pending_apply_collection_group_create_failure_reason_includes_field_detail() {
+        let env = test_env().await;
+
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line-dup-name-detail", "host": "127.0.0.1", "port": 15042 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+        let conn_id = conn["id"].as_i64().unwrap();
+
+        // 先に "group1" を普通に（収集停止中に）作成しておく - 既存レコード
+        // として DB に存在する状態を作る。
+        let (status, existing) = admin_post(
+            &env.router,
+            "/api/collection-groups",
+            &env.admin_token,
+            json!({ "name": "group1", "plcConnectionId": conn_id, "periodMs": 100 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{existing:?}");
+
+        let start = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/start")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        // 収集稼働中に同じ名前 "group1" で再度作成 → オーナーが実機で再現した
+        // 状況そのもの: 202 でキューに入るだけで、DB には現れない。
+        let queued = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection-groups")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "name": "group1", "plcConnectionId": conn_id, "periodMs": 100 })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued.status(), StatusCode::ACCEPTED);
+        let queued_bytes = axum::body::to_bytes(queued.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let queued_body: serde_json::Value = serde_json::from_slice(&queued_bytes).unwrap();
+        let pending_id = queued_body["pending"]["id"].as_i64().unwrap();
+
+        let stop = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/stop")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop.status(), StatusCode::OK);
+
+        // 適用すると "name" が重複しているため validation エラーで拒否される。
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{pending_id}/apply"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let pending = PendingChangesService::new(env.pool.clone())
+            .get(pending_id)
+            .await
+            .unwrap();
+        assert_eq!(pending.state, PendingChangeState::Failed);
+        let failure_reason = pending
+            .failure_reason
+            .expect("failure_reason should be set");
+        assert_ne!(
+            failure_reason, "pending change の適用に失敗しました: validation failed",
+            "failure_reason should include field-level detail, not just the generic BantoError Display: {failure_reason}"
+        );
+        assert!(
+            failure_reason.contains("name") && failure_reason.contains("既に使用されています"),
+            "failure_reason should say which field failed and why: {failure_reason}"
+        );
     }
 
     /// TAG-P0-3 follow-up（2026-08-12）: pending change を enqueue した後、
@@ -8163,6 +9635,175 @@ mod tests {
             .unwrap();
         let cancel_body: serde_json::Value = serde_json::from_slice(&cancel_bytes).unwrap();
         assert_eq!(cancel_body["state"], "canceled");
+    }
+
+    /// TAG-P0-3 follow-up（2026-08-14）: requeue は fingerprint/payload を
+    /// 一切変更しないため、真のコンフリクト（enqueue 後に対象行が別経路で
+    /// 変わっている場合）は requeue → 再 apply でも安全に再度 fail し、
+    /// 対象行を上書きしないことを確認する。
+    #[tokio::test]
+    async fn pending_changes_requeue_conflict_still_fails_on_reapply_with_fingerprint_intact() {
+        let env = test_env().await;
+
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line-fp-conflict-requeue", "host": "127.0.0.1", "port": 15033 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+        let conn_id = conn["id"].as_i64().unwrap();
+
+        let start = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/start")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        let queued = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::put(format!("/api/plc-connections/{conn_id}"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({ "name": "line-fp-conflict-requeue-queued", "host": "127.0.0.1", "port": 15033 })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued.status(), StatusCode::ACCEPTED);
+        let queued_bytes = axum::body::to_bytes(queued.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let queued_body: serde_json::Value = serde_json::from_slice(&queued_bytes).unwrap();
+        let pending_id = queued_body["pending"]["id"].as_i64().unwrap();
+
+        // 別経路（pending queue を経由しない直接の service 呼び出し）で
+        // 同じ行を書き換え、真のコンフリクトを作る。
+        PlcConnectionService::new(env.pool.clone())
+            .update(
+                conn_id,
+                PlcConnectionInput {
+                    name: "line-fp-conflict-requeue-hijacked".to_string(),
+                    protocol: "modbus-tcp".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: 15033,
+                    unit_id: 1,
+                    enabled: true,
+                    simulation: false,
+
+                    word_order: "low_high".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let stop = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/stop")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop.status(), StatusCode::OK);
+
+        let first_apply = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{pending_id}/apply"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_apply.status(), StatusCode::CONFLICT);
+        let first_apply_bytes = axum::body::to_bytes(first_apply.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let first_apply_body: serde_json::Value =
+            serde_json::from_slice(&first_apply_bytes).unwrap();
+        assert_eq!(first_apply_body["error"], "pending_apply_conflict");
+        assert_eq!(first_apply_body["resource"], "plc_connections");
+
+        let pending_changes = PendingChangesService::new(env.pool.clone());
+        let failed = pending_changes.get(pending_id).await.unwrap();
+        assert_eq!(failed.state, PendingChangeState::Failed);
+
+        // requeue は成功する（failed -> pending への差し戻しは常に許可）。
+        let requeue_response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{pending_id}/requeue"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(requeue_response.status(), StatusCode::OK);
+        let requeue_bytes = axum::body::to_bytes(requeue_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let requeue_body: serde_json::Value = serde_json::from_slice(&requeue_bytes).unwrap();
+        assert_eq!(requeue_body["state"], "pending");
+
+        // しかし fingerprint/payload は据え置きのままなので、コンフリクトが
+        // 解消されていない限り再 apply も同じ理由で再び fail する。
+        let second_apply = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{pending_id}/apply"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_apply.status(), StatusCode::CONFLICT);
+        let second_apply_bytes = axum::body::to_bytes(second_apply.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let second_apply_body: serde_json::Value =
+            serde_json::from_slice(&second_apply_bytes).unwrap();
+        assert_eq!(second_apply_body["error"], "pending_apply_conflict");
+        assert_eq!(second_apply_body["resource"], "plc_connections");
+
+        let failed_again = pending_changes.get(pending_id).await.unwrap();
+        assert_eq!(failed_again.state, PendingChangeState::Failed);
+
+        // 対象行は「別経路」の編集内容のまま(再 apply も拒否されたので
+        // 上書きされていない)。
+        let untouched = PlcConnectionService::new(env.pool.clone())
+            .get(conn_id)
+            .await
+            .unwrap();
+        assert_eq!(untouched.name, "line-fp-conflict-requeue-hijacked");
     }
 
     /// TAG-P0-3 follow-up（2026-08-12）: `collection_groups.update` でも
@@ -8607,5 +10248,725 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining, 2);
+    }
+
+    // --- T18-5a 第2段 (docs/banto-hub-t18-design.md §4 決定6): 薄い部品の
+    // 先行配線 - POST /api/tags/list と GET /api/tags/group-counts --------
+
+    /// `admin_post` 経由で PLC接続 → 収集グループ → タグ を1本作る。
+    /// `group_id` が `None` なら新しい接続+グループも作る、`Some` ならその
+    /// グループへタグを追加するだけ - 返り値は `(tag_id, group_id)`。
+    async fn create_tag_via_admin(
+        router: &Router,
+        token: &str,
+        suffix: &str,
+        group_id: Option<i64>,
+    ) -> (i64, i64) {
+        let group_id = match group_id {
+            Some(id) => id,
+            None => {
+                let (status, conn) = admin_post(
+                    router,
+                    "/api/plc-connections",
+                    token,
+                    json!({ "name": format!("conn-{suffix}"), "host": "127.0.0.1", "port": 15300 }),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{conn:?}");
+                let conn_id = conn["id"].as_i64().unwrap();
+                let (status, group) = admin_post(
+                    router,
+                    "/api/collection-groups",
+                    token,
+                    json!({
+                        "name": format!("group-{suffix}"),
+                        "plcConnectionId": conn_id,
+                        "periodMs": 1000
+                    }),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{group:?}");
+                group["id"].as_i64().unwrap()
+            }
+        };
+        let (status, tag) = admin_post(
+            router,
+            "/api/tags",
+            token,
+            json!({
+                "name": format!("tag-{suffix}"),
+                "collectionGroupId": group_id,
+                "address": "D100",
+                "dataType": "i16"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{tag:?}");
+        (tag["id"].as_i64().unwrap(), group_id)
+    }
+
+    /// (a) 認証なし → 401（CSRF ヘッダは付けている - `admin_routes_require_the_csrf_header`
+    /// が CSRF 側は別途カバー済みなので、ここでは認証だけを外す）。
+    #[tokio::test]
+    async fn tags_list_query_requires_auth() {
+        let env = test_env().await;
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::post("/api/tags/list")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&json!({})).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// (b) filter + sort + pagination + totalCount が `TagService::list` に
+    /// そのまま素通しされること、viewer でも読めること（`GET /api/tags` と
+    /// 同じ require_auth のみ）、(c) `/api/tags/{id}` が `/api/tags/list` と
+    /// 衝突せず両方とも正しいハンドラへ解決されることを1本で確認する。
+    #[tokio::test]
+    async fn tags_list_query_filters_paginates_and_resolves_beside_tags_id() {
+        let env = test_env().await;
+        let (tag_a, group_id) =
+            create_tag_via_admin(&env.router, &env.admin_token, "a", None).await;
+        let (tag_b, _) =
+            create_tag_via_admin(&env.router, &env.admin_token, "b", Some(group_id)).await;
+        let (_tag_c, _) =
+            create_tag_via_admin(&env.router, &env.admin_token, "c", Some(group_id)).await;
+
+        let (status, body) = admin_post(
+            &env.router,
+            "/api/tags/list",
+            &env.admin_token,
+            json!({
+                "filters": [{ "field": "collectionGroupId", "op": "eq", "value": group_id }],
+                "sort": [{ "field": "name", "direction": "asc" }],
+                "pagination": { "offset": 0, "limit": 2 }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["totalCount"], 3);
+        let rows = body["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["name"], "tag-a");
+        assert_eq!(rows[1]["name"], "tag-b");
+
+        // viewer（読み取り専用）でも読める - `require_editor` は呼ばない。
+        let (status, viewer_body) =
+            admin_post(&env.router, "/api/tags/list", &env.viewer_token, json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{viewer_body:?}");
+        assert_eq!(viewer_body["totalCount"], 3);
+
+        // (c) `/api/tags/{id}` 側も同じルーターで正しく解決される
+        // (axum の matchit は静的セグメント `/api/tags/list` を優先するため
+        // `{id}: i64` に飲み込まれない - 逆にここでは数値 id が
+        // `/api/tags/{id}` へ正しく届くことを確認する)。
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::get(format!("/api/tags/{tag_b}"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let single: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(single["id"], tag_b);
+        assert_eq!(single["name"], "tag-b");
+
+        let _ = tag_a;
+    }
+
+    /// (d) `GET /api/tags/group-counts` がグループ別のタグ件数を返すこと。
+    /// 200 が返ること自体が (c) の「`/api/tags/{id}` (`{id}: i64`) に
+    /// 飲み込まれていない」証拠でもある - 飲み込まれていれば `group-counts`
+    /// は不正な i64 として 400 になる。
+    #[tokio::test]
+    async fn tags_group_counts_returns_per_group_totals() {
+        let env = test_env().await;
+        let (_tag_a1, group1) =
+            create_tag_via_admin(&env.router, &env.admin_token, "ga1", None).await;
+        create_tag_via_admin(&env.router, &env.admin_token, "ga2", Some(group1)).await;
+        let (_tag_b1, group2) =
+            create_tag_via_admin(&env.router, &env.admin_token, "gb1", None).await;
+
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::get("/api/tags/group-counts")
+                    .header("Authorization", format!("Bearer {}", env.viewer_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let counts = body.as_array().unwrap();
+        let find = |gid: i64| {
+            counts
+                .iter()
+                .find(|c| c["collectionGroupId"] == gid)
+                .map(|c| c["tagCount"].as_i64().unwrap())
+        };
+        assert_eq!(find(group1), Some(2));
+        assert_eq!(find(group2), Some(1));
+    }
+
+    // --- 試運転モードとロックダウン (設計 §5.6・2026-08-30 オーナー決定) ----
+
+    /// 未ロックダウン（試運転モード）中は、管理 REST が `Authorization`
+    /// ヘッダを一切付けなくても通ることを確認する - 実装指示「未ロックダウン
+    /// 時に認証なしで管理 API が通る」。`GET /api/users`（`RoleGuard`で
+    /// admin 限定のエンドポイント）を選んだのは、`require_auth_or_commissioning`
+    /// だけでなく`require_role_at_least`（合成 identity の role が admin
+    /// 相当であること）も両方バイパスされていることまで一度に確認できる
+    /// ため。
+    #[tokio::test]
+    async fn unlocked_commissioning_mode_allows_admin_api_without_any_token() {
+        let env = test_env_unlocked().await;
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/users")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "commissioning mode should let an unauthenticated request through"
+        );
+    }
+
+    /// 対照実験: ロックダウン済み（既存の共有テスト環境 `test_env()`）では
+    /// 従来どおり `Authorization` ヘッダ無しの管理 API アクセスが 401 になる
+    /// ことを明示的に固定する - 実装指示「ロックダウン済みで認証なしなら
+    /// 401」。このファイルの他の多数のテストも同じ前提の上に成り立って
+    /// いるが、この試運転モード機能に直接紐づく回帰テストとして単独でも
+    /// 固定しておく。
+    #[tokio::test]
+    async fn locked_down_admin_api_requires_a_token() {
+        let env = test_env().await;
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/users")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// `GET /api/commissioning/status` は試運転モード中でも
+    /// `Authorization` ヘッダ無しで読める必要がある（実装指示「未認証でも
+    /// 取得できる必要がある」- 試運転モードでは認証そのものが無いため）。
+    #[tokio::test]
+    async fn unlocked_commissioning_status_is_readable_without_any_token() {
+        let env = test_env_unlocked().await;
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/commissioning/status")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["lockedDown"], false);
+    }
+
+    /// 同じ読み取り専用ステータスは、ロックダウン済みでも同様に
+    /// `Authorization` ヘッダ無しで読める（意図的 - UI が警告バナーの
+    /// 表示可否を判断するのに使う想定で、どちらの状態でも認証を要求
+    /// しない）。
+    #[tokio::test]
+    async fn locked_down_commissioning_status_is_still_readable_without_a_token() {
+        let env = test_env().await;
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/commissioning/status")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["lockedDown"], true);
+    }
+
+    /// `POST /api/commissioning/lock-down`（設計 §5.6「遷移」の唯一の正方向
+    /// 経路）: 試運転モード中は（`require_auth_or_commissioning`/
+    /// `require_role_at_least`がバイパスされているため）トークン無しで
+    /// 叩け、成功すると状態がロックダウン済みへ切り替わる。切り替わった
+    /// 直後は、同じ router に対する以降のリクエストが（もはや試運転モード
+    /// ではないので）再び 401 を要求するようになることまで確認する -
+    /// これは `CommissioningState`（`Arc<AtomicBool>`）がプロセス内で
+    /// 共有されていることの証拠でもある。
+    #[tokio::test]
+    async fn commissioning_lock_down_flips_state_and_then_requires_auth() {
+        let env = test_env_unlocked().await;
+
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/commissioning/lock-down")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["lockedDown"], true);
+
+        // Now that lock-down has been applied, a plain unauthenticated
+        // request to an admin route must be rejected again.
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/users")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// 実装指示「管理者0件でロックダウンしようとするとエラー」の REST
+    /// 経由での確認。既存の唯一の admin アカウントを editor へ降格させた
+    /// 上で（生の SQL 経由 - `UsersService::update_user`自身の「最後の
+    /// admin を降格できない」ガードを迂回する必要がある。
+    /// `crate::commissioning`のテストと同じ手筋）、ロックダウンを試みると
+    /// 明確なエラー（4xx、`success` フラグを持たない `ApiError` 形）になり、
+    /// 状態も試運転モードのまま変わらないことを確認する。
+    #[tokio::test]
+    async fn commissioning_lock_down_fails_without_any_admin_account() {
+        let env = test_env_unlocked().await;
+        sqlx::query("UPDATE users SET role = 'editor' WHERE username = 'admin'")
+            .execute(&env.pool)
+            .await
+            .expect("downgrade the only admin via raw SQL");
+
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/commissioning/lock-down")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_client_error(),
+            "expected a 4xx error, got {}",
+            response.status()
+        );
+
+        // Still commissioning mode - the failed lock-down must not have
+        // flipped the state.
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/commissioning/status")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["lockedDown"], false);
+    }
+
+    // --- 試運転モード対応: 管理系 `/api/status`・`/api/values`
+    // (設計 §5.6・2026-08-31 オーナー決定「案A」) -----------------------------
+    //
+    // 実機で判明した問題: `/api/v1/status`・`/api/v1/values`は
+    // `require_tag_space_auth`（API キー or セッション bearer）固定で、
+    // 設計 §5.6 の判断により試運転モードのバイパス対象**外**（PLC 書き込み
+    // 経路と同じ境界を守るため）。試運転モード中（未ロックダウン・未
+    // ログイン・API キー未発行）の管理 UI からこれを直接叩くと 401 になり、
+    // 状態ページの「サーバー状態」「タグ現在値」が空になっていた
+    // （`hostSwitchGate.isPreflightOk`が`status.revision`を要求するため、
+    // 切替ウィザードまで連鎖的に塞がれる）。以下は管理系ルーターに新設した
+    // `/api/status`・`/api/values`（`admin_status_router`）がこれを解消して
+    // いることの確認。
+
+    /// 試運転モード中は `/api/status`・`/api/values` が `Authorization`
+    /// ヘッダ無しで読める - `unlocked_commissioning_mode_allows_admin_api_without_any_token`
+    /// と同型（管理系ルーターに属するので`require_auth_or_commissioning`の
+    /// バイパスが効く）。
+    #[tokio::test]
+    async fn unlocked_commissioning_mode_allows_admin_status_and_values_without_any_token() {
+        let env = test_env_unlocked().await;
+
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::get("/api/status")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/values")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// 対照実験: ロックダウン済みでは、他の管理系ルーターと同様
+    /// `Authorization` ヘッダ無しの `/api/status`・`/api/values` は 401
+    /// （`locked_down_admin_api_requires_a_token`と同型）。
+    #[tokio::test]
+    async fn locked_down_admin_status_and_values_require_a_token() {
+        let env = test_env().await;
+
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::get("/api/status")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/values")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// 回帰確認: `v1_status`本体を`compute_status`へ切り出した後も、
+    /// `/api/v1/status`は従来どおり API キー認証で動く - `require_tag_space_auth`
+    /// を一切変えていないことの確認（`issued_api_key_can_read_api_v1_tags`
+    /// と同型、対象だけ`/api/v1/status`）。
+    #[tokio::test]
+    async fn v1_status_still_works_with_an_api_key_after_the_admin_status_split() {
+        let env = test_env().await;
+        let (status, issued) =
+            issue_api_key(&env.router, &env.admin_token, "status-reader", &["read"]).await;
+        assert_eq!(status, StatusCode::CREATED, "{issued:?}");
+        let key = issued["key"].as_str().expect("key should be present");
+
+        let (status, body) = v1_get(&env.router, key, "/api/v1/status").await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert!(body["revision"].is_number());
+        assert!(body["last_config_error"].is_null());
+    }
+
+    /// 共有ロジックの担保: 管理系 `/api/status`・`/api/values`（camelCase）
+    /// と `/api/v1/status`・`/api/v1/values`（snake_case）が同じ情報を
+    /// 返すこと - 両者が[`compute_status`]/[`build_values_response`]を
+    /// 共有していることの直接的な証拠（実装を二重管理していれば、この
+    /// テストは値がずれた時点で落ちる）。セッション bearer はどちらの
+    /// ルーターにも通る（`/api/v1/*`はAPIキーとセッション bearer の両対応、
+    /// 管理系はセッション bearer 対応）ので、同じ`admin_token`で両方を
+    /// 叩いて比較する。
+    #[tokio::test]
+    async fn admin_status_and_values_carry_the_same_information_as_v1() {
+        let env = test_env().await;
+        seed_scope_fixture(&env.router, &env.admin_token).await;
+
+        let (status, v1_status_body) =
+            v1_get(&env.router, &env.admin_token, "/api/v1/status").await;
+        assert_eq!(status, StatusCode::OK, "{v1_status_body:?}");
+
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::get("/api/status")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let admin_status_body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(admin_status_body["revision"], v1_status_body["revision"]);
+        assert_eq!(admin_status_body["version"], v1_status_body["version"]);
+        assert_eq!(
+            admin_status_body["collectionState"],
+            v1_status_body["collection_state"]
+        );
+        assert_eq!(
+            admin_status_body["writeEnabled"],
+            v1_status_body["write_enabled"]
+        );
+        assert_eq!(
+            admin_status_body["lastConfigError"],
+            v1_status_body["last_config_error"]
+        );
+        assert_eq!(
+            admin_status_body["connections"].as_array().unwrap().len(),
+            v1_status_body["connections"].as_array().unwrap().len()
+        );
+        assert_eq!(
+            admin_status_body["connections"][0]["name"],
+            v1_status_body["connections"][0]["name"]
+        );
+        assert_eq!(
+            admin_status_body["connections"][0]["effectiveSimulation"],
+            v1_status_body["connections"][0]["effective_simulation"]
+        );
+
+        let (status, v1_values_body) =
+            v1_get(&env.router, &env.admin_token, "/api/v1/values").await;
+        assert_eq!(status, StatusCode::OK, "{v1_values_body:?}");
+
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/values")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let admin_values_body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let mut v1_tags: Vec<&str> = v1_values_body["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["tag"].as_str().unwrap())
+            .collect();
+        let mut admin_tags: Vec<&str> = admin_values_body["values"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["tag"].as_str().unwrap())
+            .collect();
+        v1_tags.sort_unstable();
+        admin_tags.sort_unstable();
+        assert!(!v1_tags.is_empty(), "fixture should seed at least one tag");
+        assert_eq!(v1_tags, admin_tags);
+        assert_eq!(admin_values_body["revision"], v1_values_body["revision"]);
+    }
+
+    // --- 試運転モード対応: 管理系 `/api/tag-catalog`・`/api/tag-stream`
+    // (設計 §5.6・2026-08-31 オーナー決定「案A」の続き) ------------------------
+    //
+    // 状態ページ（`/api/status`・`/api/values`）は直した当日に直したが、
+    // ライブタグモニタ（`tagMonitorAdmin.ts`）が別に`/api/v1/tags`
+    // （catalog）・`/api/v1/stream`（WS）を直接叩いていることを見落として
+    // いた - 同じ理由（`require_tag_space_auth`固定）で試運転モード中は
+    // モニタの行が1つも表示されない不具合が残っていた。以下はその是正の
+    // 確認（`unlocked_commissioning_mode_allows_admin_status_and_values_without_any_token`
+    // 等と同型）。WS（`/api/tag-stream`）は実TCP接続が要るため
+    // `tests/stream.rs`側で確認する。
+
+    /// 試運転モード中は `/api/tag-catalog` が `Authorization` ヘッダ無しで
+    /// 読める。
+    #[tokio::test]
+    async fn unlocked_commissioning_mode_allows_admin_tag_catalog_without_any_token() {
+        let env = test_env_unlocked().await;
+
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/tag-catalog")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// 対照実験: ロックダウン済みでは、他の管理系ルーターと同様
+    /// `Authorization` ヘッダ無しの `/api/tag-catalog` は 401。
+    #[tokio::test]
+    async fn locked_down_admin_tag_catalog_requires_a_token() {
+        let env = test_env().await;
+
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/tag-catalog")
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// 回帰確認: catalog本体を`build_catalog_response`へ切り出した後も、
+    /// `/api/v1/tags`は従来どおり API キー認証で動く（`v1_status_still_works_with_an_api_key_after_the_admin_status_split`
+    /// と同型、対象だけ`/api/v1/tags`）。
+    #[tokio::test]
+    async fn v1_tags_still_works_with_an_api_key_after_the_admin_catalog_split() {
+        let env = test_env().await;
+        seed_scope_fixture(&env.router, &env.admin_token).await;
+        let (status, issued) =
+            issue_api_key(&env.router, &env.admin_token, "catalog-reader", &["read"]).await;
+        assert_eq!(status, StatusCode::CREATED, "{issued:?}");
+        let key = issued["key"].as_str().expect("key should be present");
+
+        let (status, body) = v1_get(&env.router, key, "/api/v1/tags").await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert!(body["tags"].as_array().is_some_and(|tags| !tags.is_empty()));
+    }
+
+    /// 共有ロジックの担保: 管理系 `/api/tag-catalog`（camelCase）と
+    /// `/api/v1/tags`（snake_case）が同じ情報を返すこと -
+    /// 両者が[`build_catalog_response`]を共有していることの直接的な証拠
+    /// （`admin_status_and_values_carry_the_same_information_as_v1`と同型）。
+    #[tokio::test]
+    async fn admin_tag_catalog_carries_the_same_information_as_v1_tags() {
+        let env = test_env().await;
+        seed_scope_fixture(&env.router, &env.admin_token).await;
+
+        let (status, v1_body) = v1_get(&env.router, &env.admin_token, "/api/v1/tags").await;
+        assert_eq!(status, StatusCode::OK, "{v1_body:?}");
+
+        let response = env
+            .router
+            .oneshot(
+                HttpRequest::get("/api/tag-catalog")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let admin_body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(admin_body["revision"], v1_body["revision"]);
+        assert_eq!(admin_body["collectionMode"], v1_body["collection_mode"]);
+
+        let mut v1_tag_names: Vec<&str> = v1_body["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["external_name"].as_str().unwrap())
+            .collect();
+        let mut admin_tag_names: Vec<&str> = admin_body["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["externalName"].as_str().unwrap())
+            .collect();
+        v1_tag_names.sort_unstable();
+        admin_tag_names.sort_unstable();
+        assert!(
+            !v1_tag_names.is_empty(),
+            "fixture should seed at least one tag"
+        );
+        assert_eq!(v1_tag_names, admin_tag_names);
+
+        // camelCase 変換が正しく効いていること（フィールド名だけでなく値も
+        // 一致すること）の代表サンプル1件。
+        let v1_first = v1_body["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["external_name"] == v1_tag_names[0])
+            .unwrap();
+        let admin_first = admin_body["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["externalName"] == v1_tag_names[0])
+            .unwrap();
+        assert_eq!(admin_first["tagKey"], v1_first["tag_key"]);
+        assert_eq!(admin_first["dataType"], v1_first["data_type"]);
+        assert_eq!(admin_first["periodMs"], v1_first["period_ms"]);
+        assert_eq!(
+            admin_first["effectiveSimulation"],
+            v1_first["effective_simulation"]
+        );
+        assert_eq!(admin_first["valueSource"], v1_first["value_source"]);
     }
 }

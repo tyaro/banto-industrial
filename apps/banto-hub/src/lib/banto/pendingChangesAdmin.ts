@@ -191,3 +191,9 @@ export async function cancelPendingChange(id: number): Promise<PendingChange> {
 		method: 'POST'
 	});
 }
+
+export async function requeuePendingChange(id: number): Promise<PendingChange> {
+	return httpRequest<PendingChange>(`/api/pending-changes/${id}/requeue`, {
+		method: 'POST'
+	});
+}

@@ -28,6 +28,7 @@ members = [
     "crates/banto-broker",
     "crates/banto-expr",
     "crates/banto-rtsp",
+    "crates/banto-tagclient",
     "apps/chronogazer/core",
     "apps/chronogazer/src-tauri",
     "apps/relay-wright/core",
@@ -52,7 +53,9 @@ publish = false
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-sqlx = { version = "0.8", default-features = false }
+reqwest = { version = "0.13.4", default-features = false }
+zeroize = "1.9.0"
+sqlx = { version = "0.9", default-features = false }
 tokio = { version = "1" }
 # I2a (docs/plan.md「条件付き自動書き込みアプリ」I2a): MELSEC MC protocol
 # (SLMP) framing, wrapped by `banto-plc`'s `slmp` module. MIT, tokio-async,
@@ -101,17 +104,20 @@ window-vibrancy = "0.8"
 # service, etc. - mirrors banto's own reasoning for this dependency).
 tempfile = "3"
 # T0-2 (docs/tag-server-design.md §5.6): API キーの secret 部分(32バイト)を
-# 生成する CSPRNG。`password-hash`(上の行、`getrandom` feature 有効)は既に
-# `rand_core` 0.6.4 経由で `getrandom` 0.2.17 を木に持っているので、ここも
-# 同じ 0.2 系に揃えて Cargo.lock に新しいメジャーバージョンの `getrandom`
-# ノードを増やさない。`apps/banto-hub/core::api_keys` のみが使う。
-getrandom = "0.2"
+# 生成する CSPRNG。0.4 系を直接指定する: `uuid`(tauri-utils 経由)や
+# `rand` 0.10(tokio-tungstenite 経由)が既に `getrandom` 0.3/0.4 系を木に
+# 持っており、0.2 系(`password-hash` → `rand_core` 0.6.4 経由)に揃えても
+# Cargo.lock 内の getrandom バージョン集合(0.2/0.3/0.4)は変わらないため、
+# 新しい方に追従する(0.3 は `getrandom()` が `fill()` に改名されているので
+# 0.2 のまま留めても実利がない)。`apps/banto-hub/core::api_keys` のみが
+# 使う。
+getrandom = "0.4"
 # T0-2: API キーの照合用ハッシュ(SHA-256)。argon2 は低エントロピーな
 # パスワード用に意図的に遅く、毎リクエスト照合する高エントロピーな
 # ランダムキーには不向き(理由は `apps/banto-hub/core/src/api_keys.rs` の
 # モジュール doc 参照)。`sqlx-core` 等が既に 0.10 系を木に持っているので
 # 新規ノードは増えない。
-sha2 = "0.10"
+sha2 = "0.11"
 # T0-2: SHA-256 ダイジェストの hex エンコード表示・DB 保存用。既に
 # `sqlx-core` 等が同じ 0.4 系を木に持っている。
 hex = "0.4"
@@ -145,10 +151,10 @@ utoipa-swagger-ui = { version = "9", default-features = false, features = [
 # 用クライアント（dev-dependency のみ - サーバー側は axum 自身の `ws`
 # feature で足りる）。axum 0.8.9 が内部で使っているのと同じ 0.29 系を選び、
 # Cargo.lock に無関係な第2系統を増やさない。
-tokio-tungstenite = "0.30"
-banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v1.1.0" }
-banto-storage = { git = "https://github.com/tyaro/banto.git", tag = "v1.1.0" }
-banto-server = { git = "https://github.com/tyaro/banto.git", tag = "v1.1.0" }
+tokio-tungstenite = "0.29"
+banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v1.4.0" }
+banto-storage = { git = "https://github.com/tyaro/banto.git", tag = "v1.4.0" }
+banto-server = { git = "https://github.com/tyaro/banto.git", tag = "v1.4.0" }
 # T3（docs/tag-server-design.md §5.3）: banto-hub の MQTT publish（外部ブロー
 # カーへ接続するクライアントモードのみ - 組み込みブローカーは §10-4 の判断
 # 待ち）。plan.md §3 で保留になっていた「MQTT クライアント（rumqttc +

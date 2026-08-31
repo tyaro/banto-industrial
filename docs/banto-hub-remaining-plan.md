@@ -4,15 +4,29 @@
 状態: **オーナー承認・実行中**。2026-08-12 に docs 14 文書 + コード + GitHub を全量監査した
 結果を実行順に整理したもの。**進捗（2026-08-12）: Phase 0（#119）、監査フォロー①=stale ガード（#121）・
 ②最小対応（#121）・③稼働中 import ガード（#126）、profile_lock フレーク（#122）、Swagger UI（#124）、
-P3-a audit retention（#125）、P3-b SLMP word order（#127）、P3-c SLMP 構造化エラー（文言パース完全削除、
+P3-a audit retention（#125）、P3-b SLMP word order（#127）、P3-c SLMP 構造化エラー（#129、文言パース完全削除、
 [h9-slmp-structured-error-spec.md](h9-slmp-structured-error-spec.md) 参照）マージ済み。A群の自己完結分は完了。
-残るは P3-c の broker session/transport 共通化のみ（別スライス候補、improvement-plan.md §H9）。**
+**進捗追記（2026-08-14）**: Phase 1 docs 整合（#128）完了。B群の T18 は
+[banto-hub-t18-design.md](banto-hub-t18-design.md) にて T18-2〜T18-5b 完了（#132〜#154。T18-5a 第2段は
+実測ファースト判定=目標達成、windowed 化バックログ降格）。②failed→再試行（再キュー）導線を
+`claude/pending-requeue` ブランチで実装完了（下記 Phase 0.5 参照）。P3-c の broker
+session/transport 共通化は `banto_plc::dial_slmp` への集約で完了（2026-08-14、
+improvement-plan.md §H9）。`classify_slmp_error` の重複統合も
+`banto_plc::SlmpErrorClass`/`classify_slmp` への集約で同日完了し、P3-c は
+完全完了（残スライスなし）。
+**進捗追記（2026-09-01）**: P2-a（切替ウィザード UI の Windows 実機経路）は
+2026-08-31/09-01 のオーナー実機検証で完了（下記 Phase 2 参照）。B群の T18 は
+desktop-plan §9.5（TAG-UX-7〜9）を受けて 2026-08-27 に T18-6（接続/グループ
+Drawer とツリー意匠）も完了（#173/#174/#176/#177）。banto-tagclient SDK は
+Issue #123 として起票済み（起票は完了・着手は SCADA 計画具体化と同時、
+下記「別途スケジュール」参照）。残るは Phase 2 実機検証系（T18-5c/d 含む）と
+Phase 4 リリースゲート（H7① 実機 soak）のみ。**
 個別スライスの詳細設計は既存の
 [plan.md](plan.md)・[tag-server-design.md](tag-server-design.md)・[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)・
 [banto-hub-t16-design.md](banto-hub-t16-design.md)・[banto-hub-t17-design.md](banto-hub-t17-design.md)・
 [improvement-plan.md](improvement-plan.md) を正とし、本書はそれらの残項目の**優先順位と着手順**を定める索引。
-最終検証日(監査): 2026-08-12
-基準コミット: 889f622（監査時）／`9c61a64`（#125 マージ後の現 main）
+最終検証日(監査): 2026-08-12（進捗行の同期: 2026-09-01）
+基準コミット: 889f622（監査時）／`d5ba55e`（T18-5a 判定記録後の現 main、2026-08-14）
 
 ## 0. 前提と現況
 
@@ -52,16 +66,22 @@ T17-5 構成パッケージ export/import、`.gitattributes`。
   `collection_groups` の apply が無警告で上書きしていた問題を、per-resource フィンガープリント方式
   （enqueue 時に対象の現在値を保存 → apply 直前に再突合、不一致/消失なら Conflict 失敗）で解消。
   グローバル revision 突合は apply が revision を上げるためキュー複数適用を壊す点を回避（回帰テスト済み）。
-- **② 中 → 最小対応済み（#121 同梱）／一部残**: `failed` 行のキャンセル導線（cancel を Failed→Canceled
-  拡張）と `failure_reason` への実エラー保持は実装済み。**残: `failed` からの「再試行（再キュー）」導線は未実装**。
+- **② 中 → 完了（`claude/pending-requeue`、2026-08-14）**: `failed` 行のキャンセル導線（cancel を
+  Failed→Canceled 拡張）と `failure_reason` への実エラー保持は #121 で実装済み。**`failed` からの
+  「再試行（再キュー）」導線を追加実装**: `requeue_pending`（Failed→Pending、`base_fingerprint`・
+  `payload`・`base_configured_revision` は据え置き）、`POST /api/pending-changes/{id}/requeue`、
+  status 画面の「再試行」ボタン。fingerprint を再計算しないことで、再 apply 時に既存の
+  ステイルガードが再チェックされ、一過性失敗（収集稼働中の 409 等）は再試行で回復し、真の
+  コンフリクト（enqueue 後の別経路変更）は再度安全に fail する。
 - **③ 中 → 完了（#126）**: 稼働中 import の誤成功表示（`tagRegistryAdmin.ts` が 202（queued）を作成済み型と
   偽り `configPackageAdmin` が依存項目をサイレントスキップ、UI は無条件に成功トースト）を、import は収集停止中
   のみ許可する事前ガード＋戻り値型の是正（202 を `QueuedWhileRunningError` で弾く）で解消。
 
-### Phase 1 — docs 整合の是正（軽量・まとめて 1 PR）
+### Phase 1 — docs 整合の是正（完了：PR #128、2026-08-12）
 
 CLAUDE.md の状態欄同期規約（H8）に反する乖離を一括是正。実装を伴わない docs 修正のため
-メインセッション直で可。
+メインセッション直で可。**下記5件すべて #128（コミット `d54d848`）で反映済み**（2026-08-14 に
+全件を現行 docs と突き合わせて解消を再確認済み）。
 
 1. [banto-hub-t14-design.md](banto-hub-t14-design.md) の状態行「実装未着手」→ T14 完了を反映。
 2. [improvement-plan.md](improvement-plan.md) H5 欄を更新（banto-hub 分の E2E は 9 spec +
@@ -76,9 +96,11 @@ CLAUDE.md の状態欄同期規約（H8）に反する乖離を一括是正。�
 
 Phase 0 マージ後の main を実機で確認。テスト PLC の複数ポートを使う。
 
-- **P2-a**: 切替ウィザード UI の Windows 実機経路（Desktop→Service UI 操作・自動起動 UAC）。
-  [banto-hub-t16-design.md](banto-hub-t16-design.md)「切替ウィザード UI 実装メモ」で未検証と
-  記録された経路。
+- **P2-a（完了、2026-08-31/09-01 オーナー実機検証）**: 切替ウィザード UI の Windows 実機経路
+  （Desktop→Service UI 操作・自動起動 UAC・Service→Desktop 逆経路・UAC キャンセル時の異常系）。
+  [banto-hub-t16-design.md](banto-hub-t16-design.md)「切替ウィザード UI 実装メモ」で当時未検証と
+  記録されていた経路だが、実機で3層の不具合（remote origin ケイパビリティ・ACL 未宣言・管理 UI の
+  `/api/v1/*` 誤用）を発見・修正した上ですべて確認済み。
 - **P2-b**: profile 先行作成 → Desktop Hub 起動のフル E2E（[banto-hub-t17-design.md](banto-hub-t17-design.md)
   §12 の任意追加確認）。
 - **P2-c**: テスト PLC `192.168.11.200` の複数ポート（例 `3100`〜`3105`）で SLMP 収集を
@@ -100,13 +122,16 @@ Phase 0 マージ後の main を実機で確認。テスト PLC の複数ポー�
   （migration `0010`、既定 `low_high` で後方互換）→ フォーム（"slmp" 選択時のみ）まで end-to-end 配線。
   **残: CPU 種別 / アクセスルート（network/PC/IO/area id）は別スライス候補**（`slmp_config_for` の
   doc comment に "Known limitation" として明記）。
-- **P3-c（文言パース削除は完了、2026-08-12）**: H9 SLMP 構造化エラー（[improvement-plan.md](improvement-plan.md)
-  §H9）。オーナーが `tyaro/slmp`（git 依存、tag `v0.2.0`）で構造化エラーを実装したのを受け、banto 側
-  （dep 更新・`END_CODE_MARKER` 等の文言パース完全削除・tripwire 構造化版への置換・`deny.toml` の
-  git 依存許可）を同日中に完了。API 仕様と受け入れ条件は
-  [h9-slmp-structured-error-spec.md](h9-slmp-structured-error-spec.md)（状態: 実装済み）。**残:
-  broker の session/transport 共通化のみ**、別スライス候補として improvement-plan.md §H9 に記録
-  （具体的な共有ヘルパー案も記載済み）。
+- **P3-c（完全完了、文言パース削除2026-08-12・transport共通化/classify_slmp_error統合2026-08-14）**:
+  H9 SLMP 構造化エラー（[improvement-plan.md](improvement-plan.md) §H9）。オーナーが
+  `tyaro/slmp`（git 依存、tag `v0.2.0`）で構造化エラーを実装したのを受け、banto 側（dep 更新・
+  `END_CODE_MARKER` 等の文言パース完全削除・tripwire 構造化版への置換・`deny.toml` の git 依存許可）
+  を同日中に完了。API 仕様と受け入れ条件は
+  [h9-slmp-structured-error-spec.md](h9-slmp-structured-error-spec.md)（状態: 実装済み）。broker
+  の session/transport 共通化（banto-broker/banto-plc/banto-plc-write の SLMP connect 重複）は
+  `banto-plc` の共有ヘルパー `dial_slmp` への集約で完了。`classify_slmp_error` の重複統合
+  （banto-plc/banto-plc-write の同一5分岐 match）も `banto-plc` の `SlmpErrorClass`/`classify_slmp`
+  への集約で完了し、残スライスなし（詳細は improvement-plan.md §H9）。
 
 ### Phase 4 — リリースゲート（T5 の唯一の残り）
 
@@ -117,10 +142,12 @@ Phase 0 マージ後の main を実機で確認。テスト PLC の複数ポー�
 
 ### 別途スケジュール（未着手スライス・オーナー起票判断）
 
-- T16-3（共通運転バー、依存 T18-1）、T18-2〜T18-5（初回導線／複製・一括・CSV／モニタ導線／
-  性能・出荷検証）。
+- T16-3（共通運転バー、依存 T18-1）は未着手のまま残る。T18-2〜T18-6（初回導線／複製・一括・
+  CSV／モニタ導線／性能・出荷検証／接続・グループ Drawer とツリー意匠）は
+  T18-5c/d（実機/soak・性能ハーネス基準機実行）を除き完了済み
+  （[banto-hub-t18-design.md](banto-hub-t18-design.md) 参照）。
 - NSIS インストーラからの `banto-hub-elev.exe` 呼び出し統合。
-- banto-tagclient SDK の**起票**（決定済み・未起票。リポジトリ issue 0 件）。
+- banto-tagclient SDK の実装（Issue #123 として起票済み・着手は SCADA 計画具体化と同時、v1.x）。
 
 ### 保留・オーナー決定（2026-08-12 に一部を決定）
 

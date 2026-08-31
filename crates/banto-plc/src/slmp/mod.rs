@@ -293,36 +293,119 @@ impl SlmpConfig {
     }
 }
 
-/// Translate the wrapped crate's structured [`slmp::SlmpError`] into this
-/// crate's [`PlcError`], which is what decides connection-fatal vs per-request
-/// `Bad` (see [`PlcError::is_connection_fatal`] and this module's doc
-/// comment). A plain structural `match`, unlike the H9-era text-parsing
+/// Read/write-independent classification of a structured [`slmp::SlmpError`].
+/// The single source of truth for the SLMP error classification policy (H9,
+/// docs/h9-slmp-structured-error-spec.md): both [`PlcError`] (this crate) and
+/// `banto_plc_write::PlcWriteError` map this via `From` into their own error
+/// vocabulary, so the decision logic that used to be duplicated as two
+/// identical 5-arm `match`es now lives in exactly one place. Each variant
+/// carries the same meaning `classify_slmp_error`'s arms below used to
+/// document individually.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlmpErrorClass {
+    /// A complete, length-consistent frame carrying a non-zero end code - the
+    /// device refused this one request but answered in full, so the byte
+    /// stream is still aligned to a request boundary. Not connection-fatal.
+    EndCode { code: u16, message: String },
+    /// The response structure itself is corrupt (bad length, bad fixed
+    /// field, echo mismatch) - the byte stream may be desynchronized.
+    /// Connection-fatal.
+    Protocol(String),
+    /// The crate raises this for both its send and its receive deadline;
+    /// either way the reply we needed did not arrive. Connection-fatal.
+    ResponseTimeout,
+    /// The crate's own "no stream" guard. Should be unreachable from
+    /// `read_batch`/`write_batch` (which check the session first), but if
+    /// the two ever disagree, agreeing with the crate is the honest answer.
+    /// Connection-fatal.
+    NotConnected,
+    /// Refused, reset, broken pipe, unexpected EOF, DNS failure, and
+    /// anything else transport/IO-shaped. Connection-fatal.
+    Connection(String),
+}
+
+/// The plain structural `match` that decides [`SlmpErrorClass`] for a
+/// structured [`slmp::SlmpError`], unlike the H9-era text-parsing
 /// `classify_io_error`/`parse_end_code` this replaced: `slmp` 0.2.0 exposes
 /// `Device { end_code }` as its own variant, so there is nothing left to
 /// parse.
-fn classify_slmp_error(err: slmp::SlmpError) -> PlcError {
+pub fn classify_slmp(err: slmp::SlmpError) -> SlmpErrorClass {
     match err {
-        // A complete, length-consistent frame carrying a non-zero end code -
-        // the device refused this one request but answered in full, so the
-        // byte stream is still aligned to a request boundary.
-        slmp::SlmpError::Device { end_code } => PlcError::SlmpEndCode {
+        slmp::SlmpError::Device { end_code } => SlmpErrorClass::EndCode {
             code: end_code,
             message: slmp::end_code_name(end_code).to_string(),
         },
-        // The response structure itself is corrupt (bad length, bad fixed
-        // field, echo mismatch) - the byte stream may be desynchronized.
-        slmp::SlmpError::Framing(e) => PlcError::Protocol(e.to_string()),
-        // The crate raises this for both its send and its receive deadline;
-        // either way the reply we needed did not arrive.
-        slmp::SlmpError::Timeout => PlcError::ResponseTimeout,
-        // The crate's own "no stream" guard. Should be unreachable from
-        // `read_batch` (which checks `self.inner` first), but if the two ever
-        // disagree, agreeing with the crate is the honest answer.
-        slmp::SlmpError::NotConnected => PlcError::NotConnected,
-        // Refused, reset, broken pipe, unexpected EOF, DNS failure, and
-        // anything else transport/IO-shaped.
-        slmp::SlmpError::Io(e) => PlcError::Connection(e.to_string()),
+        slmp::SlmpError::Framing(e) => SlmpErrorClass::Protocol(e.to_string()),
+        slmp::SlmpError::Timeout => SlmpErrorClass::ResponseTimeout,
+        slmp::SlmpError::NotConnected => SlmpErrorClass::NotConnected,
+        slmp::SlmpError::Io(e) => SlmpErrorClass::Connection(e.to_string()),
     }
+}
+
+impl From<SlmpErrorClass> for PlcError {
+    fn from(class: SlmpErrorClass) -> Self {
+        match class {
+            SlmpErrorClass::EndCode { code, message } => PlcError::SlmpEndCode { code, message },
+            SlmpErrorClass::Protocol(msg) => PlcError::Protocol(msg),
+            SlmpErrorClass::ResponseTimeout => PlcError::ResponseTimeout,
+            SlmpErrorClass::NotConnected => PlcError::NotConnected,
+            SlmpErrorClass::Connection(msg) => PlcError::Connection(msg),
+        }
+    }
+}
+
+/// Translate the wrapped crate's structured [`slmp::SlmpError`] into this
+/// crate's [`PlcError`], which is what decides connection-fatal vs per-request
+/// `Bad` (see [`PlcError::is_connection_fatal`] and this module's doc
+/// comment). The classification decision itself now lives in
+/// [`classify_slmp`]/[`SlmpErrorClass`] (H9, shared with
+/// `banto_plc_write::PlcWriteError`'s own `classify_slmp_error`); this
+/// function is just that shared decision folded into this crate's error type.
+fn classify_slmp_error(err: slmp::SlmpError) -> PlcError {
+    classify_slmp(err).into()
+}
+
+/// Dial a fresh SLMP session against `config`: build the wrapped crate's
+/// client, wire [`SlmpConfig::response_timeout`] into its send/receive
+/// deadlines, then race `connect()` against [`SlmpConfig::connect_timeout`]
+/// and map a failure onto [`PlcError`].
+///
+/// The single shared implementation of the SLMP connect sequence (H9
+/// transport 共通化, docs/improvement-plan.md §H9): this crate's
+/// [`SlmpClient::connect`], `banto_plc_write::slmp::SlmpWriteClient::connect`,
+/// and `banto_broker`'s `connect_attempt` used to hand-roll the identical
+/// four steps independently (build the wire client, wire both timeouts, race
+/// `connect()` against the outer deadline, map `slmp::SlmpError` to this
+/// crate's error type) - this is now the one place that sequence is written,
+/// and the three callers each fold its result into their own shape (owned
+/// `Option<inner>` for the two client wrappers, a bare returned client for
+/// the broker). `classify_slmp_error` above is deliberately not reused here:
+/// it maps *request*-time failures where a non-zero end code is a per-request
+/// `Bad`, but a `connect()` failure is always connection-fatal, so this
+/// function keeps its own two-arm mapping (`Timeout` → [`PlcError::ConnectTimeout`],
+/// everything else → [`PlcError::Connection`]) exactly as all three call
+/// sites already agreed on.
+pub async fn dial_slmp(config: &SlmpConfig) -> Result<slmp::SLMPClient, PlcError> {
+    let addr = format!("{}:{}", config.host, config.port);
+    let mut client = slmp::SLMPClient::new(config.to_wire_props());
+    client.set_send_timeout(config.response_timeout);
+    client.set_recv_timeout(config.response_timeout);
+
+    tokio::time::timeout(config.connect_timeout, client.connect())
+        .await
+        .map_err(|_| PlcError::ConnectTimeout(addr.clone()))?
+        .map_err(|e| match e {
+            // The crate's own hardcoded 1s connect ceiling (see
+            // `SlmpConfig::connect_timeout`) surfaces here rather than as our
+            // outer timeout elapsing, so it has to be mapped to the same
+            // error - otherwise the same failure would be reported two
+            // different ways depending on which deadline happened to be
+            // shorter.
+            slmp::SlmpError::Timeout => PlcError::ConnectTimeout(addr.clone()),
+            other => PlcError::Connection(other.to_string()),
+        })?;
+
+    Ok(client)
 }
 
 /// The [`crate::client::PlcClient`] implementation for MELSEC MC/SLMP. One
@@ -614,26 +697,7 @@ impl PlcClient for SlmpClient {
                 previous.close().await;
             }
 
-            let addr = format!("{}:{}", self.config.host, self.config.port);
-            let mut client = slmp::SLMPClient::new(self.config.to_wire_props());
-            client.set_send_timeout(self.config.response_timeout);
-            client.set_recv_timeout(self.config.response_timeout);
-
-            tokio::time::timeout(self.config.connect_timeout, client.connect())
-                .await
-                .map_err(|_| PlcError::ConnectTimeout(addr.clone()))?
-                .map_err(|e| match e {
-                    // The crate's own hardcoded 1s connect ceiling (see
-                    // `SlmpConfig::connect_timeout`) surfaces here rather than
-                    // as our outer timeout elapsing, so it has to be mapped to
-                    // the same error - otherwise the same failure would be
-                    // reported two different ways depending on which deadline
-                    // happened to be shorter.
-                    slmp::SlmpError::Timeout => PlcError::ConnectTimeout(addr.clone()),
-                    other => PlcError::Connection(other.to_string()),
-                })?;
-
-            self.inner = Some(client);
+            self.inner = Some(dial_slmp(&self.config).await?);
             Ok(())
         })
     }
@@ -770,6 +834,43 @@ mod tests {
         );
     }
 
+    /// Pins down [`classify_slmp`]'s mapping table - the single source the
+    /// two crates' `PlcError`/`PlcWriteError` `From<SlmpErrorClass>` impls
+    /// both build on (H9, docs/h9-slmp-structured-error-spec.md).
+    #[test]
+    fn classify_slmp_maps_every_slmp_error_variant() {
+        assert_eq!(
+            classify_slmp(slmp::SlmpError::Device { end_code: 0xC059 }),
+            SlmpErrorClass::EndCode {
+                code: 0xC059,
+                message: slmp::end_code_name(0xC059).to_string()
+            }
+        );
+
+        let framing = classify_slmp(slmp::SlmpError::Framing(
+            slmp::FramingError::LengthMismatch {
+                declared: 4,
+                actual: 2,
+            },
+        ));
+        assert!(matches!(framing, SlmpErrorClass::Protocol(_)));
+
+        assert_eq!(
+            classify_slmp(slmp::SlmpError::Timeout),
+            SlmpErrorClass::ResponseTimeout
+        );
+        assert_eq!(
+            classify_slmp(slmp::SlmpError::NotConnected),
+            SlmpErrorClass::NotConnected
+        );
+
+        let io = classify_slmp(slmp::SlmpError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "boom",
+        )));
+        assert!(matches!(io, SlmpErrorClass::Connection(_)));
+    }
+
     /// The classification table this module's whole error contract rests on -
     /// now a plain structural `match` over `slmp::SlmpError` (H9,
     /// docs/h9-slmp-structured-error-spec.md), no message text anywhere. The
@@ -777,7 +878,9 @@ mod tests {
     /// `Device` vs `Framing` correctly still lives in `integration_tests.rs`'s
     /// `slmp_end_code_is_bad_not_fatal` /
     /// `a_malformed_frame_is_fatal_even_though_it_shares_a_kind_with_an_end_code`;
-    /// this test only pins down [`classify_slmp_error`]'s own mapping table.
+    /// this test only pins down [`classify_slmp_error`]'s own mapping table
+    /// (i.e. that it still folds [`classify_slmp`]'s result into [`PlcError`]
+    /// correctly).
     #[test]
     fn classify_slmp_error_splits_fatal_from_per_request() {
         let classified = classify_slmp_error(slmp::SlmpError::Device { end_code: 0xC059 });

@@ -262,6 +262,53 @@ impl PendingChangesService {
         ))
     }
 
+    /// failed→pending 差し戻し。fingerprint/payload/base_configured_revision
+    /// は変更せず据え置く。再 apply 時に既存の検証（フィンガープリント
+    /// ガード等）が再実行されるため、一過性の失敗（収集稼働中の 409 など）
+    /// は再 apply で成功しうるが、真のコンフリクト（enqueue 後に対象行が
+    /// 別経路で変わっている場合）は再度安全に fail する。TAG-P0-3
+    /// follow-up、2026-08-14。
+    pub async fn requeue_pending(&self, id: i64) -> Result<PendingChange, BantoError> {
+        let row: Option<PendingRow> = sqlx::query_as(
+            "UPDATE pending_changes
+             SET
+               state = ?,
+               failure_reason = NULL,
+               updated_at = datetime('now')
+             WHERE id = ? AND state = ?
+             RETURNING
+               id,
+               state,
+               source,
+               payload,
+               base_configured_revision,
+               created_at,
+               updated_at,
+               requested_by_username,
+               requested_by_role,
+               failure_reason,
+               base_fingerprint",
+        )
+        .bind(PendingChangeState::Pending.as_str())
+        .bind(id)
+        .bind(PendingChangeState::Failed.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(banto_storage::storage_error)?;
+
+        if let Some(row) = row {
+            return row_to_pending(row);
+        }
+
+        let current = self.get(id).await?;
+        if current.state == PendingChangeState::Pending {
+            return Ok(current);
+        }
+        Err(BantoError::Other(
+            "failed 状態の提案のみ再試行できます".to_string(),
+        ))
+    }
+
     pub async fn start_applying(&self, id: i64) -> Result<PendingChange, BantoError> {
         let row: Option<PendingRow> = sqlx::query_as(
             "UPDATE pending_changes
@@ -497,6 +544,78 @@ mod tests {
         assert!(err
             .to_string()
             .contains("pending 状態以外の提案は適用開始できません"));
+    }
+
+    #[tokio::test]
+    async fn requeue_moves_failed_back_to_pending_and_clears_reason() {
+        let svc = service().await;
+        let created = svc
+            .create_pending(
+                "tags.create",
+                &serde_json::json!({ "name": "requeue-me" }),
+                11,
+                Some("fp-abc123"),
+                Some("admin"),
+                Some("admin"),
+            )
+            .await
+            .unwrap();
+        let original_fingerprint = created.base_fingerprint.clone();
+        let original_payload = created.payload.clone();
+
+        svc.start_applying(created.id).await.unwrap();
+        svc.mark_failed(created.id, "boom").await.unwrap();
+
+        let requeued = svc.requeue_pending(created.id).await.unwrap();
+        assert_eq!(requeued.state, PendingChangeState::Pending);
+        assert_eq!(requeued.failure_reason, None);
+        assert_eq!(requeued.base_fingerprint, original_fingerprint);
+        assert_eq!(requeued.payload, original_payload);
+    }
+
+    #[tokio::test]
+    async fn requeue_rejects_non_failed() {
+        let svc = service().await;
+
+        // applied からは再試行できない（pending からの再試行は
+        // requeue_is_idempotent_for_already_pending が示す通り成功する
+        // no-op のため、ここでは対象外）。
+        let applied_only = svc
+            .create_pending(
+                "tags.create",
+                &serde_json::json!({ "name": "already-applied" }),
+                13,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        svc.start_applying(applied_only.id).await.unwrap();
+        svc.mark_applied(applied_only.id).await.unwrap();
+        let err = svc.requeue_pending(applied_only.id).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("failed 状態の提案のみ再試行できます"));
+    }
+
+    #[tokio::test]
+    async fn requeue_is_idempotent_for_already_pending() {
+        let svc = service().await;
+        let created = svc
+            .create_pending(
+                "tags.create",
+                &serde_json::json!({ "name": "no-op" }),
+                14,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let requeued = svc.requeue_pending(created.id).await.unwrap();
+        assert_eq!(requeued.state, PendingChangeState::Pending);
     }
 
     #[tokio::test]

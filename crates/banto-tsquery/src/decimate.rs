@@ -159,7 +159,9 @@ pub(crate) async fn read_decimated(
                 "SELECT COUNT(*) FROM {} WHERE ptime >= ? AND ptime <= ?",
                 plan.table_name
             );
-            let count: i64 = sqlx::query_scalar(&sql)
+            // AssertSqlSafe: plan.table_name は plan.rs の「SQL-identifier
+            // safety」の通り is_safe_table_name で検証済みの samples_<n> のみ。
+            let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
                 .bind(from_ms)
                 .bind(to_ms)
                 .fetch_one(&plan.pool)
@@ -244,7 +246,10 @@ async fn fetch_binned(
             plan.table_name
         ));
 
-        let rows = sqlx::query(&sql)
+        // AssertSqlSafe: `column`/`plan.table_name` は is_safe_table_name/
+        // is_safe_column_name で検証済みの samples_<n>/c<i> のみで構成される
+        // （plan.rs の「SQL-identifier safety」）。バインド値のみ可変。
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(from_ms)
             .bind(bin_ms)
             .bind(from_ms)
@@ -326,7 +331,10 @@ async fn fetch_raw_passthrough(
             plan.table_name
         );
 
-        let rows = sqlx::query(&sql)
+        // AssertSqlSafe: `column_list`/`plan.table_name` は is_safe_table_name/
+        // is_safe_column_name で検証済みの samples_<n>/c<i> のみで構成される
+        // （plan.rs の「SQL-identifier safety」）。
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(from_ms)
             .bind(to_ms)
             .fetch_all(&plan.pool)

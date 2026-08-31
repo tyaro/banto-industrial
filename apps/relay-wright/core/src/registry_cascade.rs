@@ -88,12 +88,15 @@ async fn count_rules_referencing_tags(
     doomed_tags_sql: &str,
     id: i64,
 ) -> Result<i64, BantoError> {
-    sqlx::query_scalar(&format!(
+    // AssertSqlSafe: `doomed_tags_sql` は呼び出し元(下記2箇所)で
+    // TAGS_OF_CONNECTION/TAGS_OF_GROUP のどちらかの固定文字列定数しか渡さない
+    // - 外部入力は一切混入しない（可変な id は `?` プレースホルダでバインド）。
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM write_rules \
          WHERE write_source_tag_id IN {doomed_tags_sql} \
             OR id IN (SELECT write_rule_id FROM write_rule_conditions \
                       WHERE source_tag_id IN {doomed_tags_sql})"
-    ))
+    )))
     .bind(id)
     .bind(id)
     .fetch_one(pool)
@@ -130,11 +133,15 @@ pub async fn cascade_preview_plc_connection(
             .fetch_one(pool)
             .await
             .map_err(banto_storage::storage_error)?;
-    let tags: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {TAGS_OF_CONNECTION}"))
-        .bind(id)
-        .fetch_one(pool)
-        .await
-        .map_err(banto_storage::storage_error)?;
+    // AssertSqlSafe: TAGS_OF_CONNECTION は本ファイル内の固定文字列定数
+    // （外部入力は含まれない、可変な id は `?` プレースホルダでバインド）。
+    let tags: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {TAGS_OF_CONNECTION}"
+    )))
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
     let write_targets: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM write_targets WHERE plc_connection_id = ?")
             .bind(id)
@@ -196,9 +203,11 @@ pub async fn cascade_delete_plc_connection(
         return Err(not_found(CONNECTION_RESOURCE, id));
     }
 
-    let tags = sqlx::query(&format!(
+    // AssertSqlSafe: TAGS_OF_CONNECTION は本ファイル内の固定文字列定数
+    // （外部入力は含まれない、可変な id は `?` プレースホルダでバインド）。
+    let tags = sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM tags WHERE id IN {TAGS_OF_CONNECTION}"
-    ))
+    )))
     .bind(id)
     .execute(&mut *tx)
     .await
@@ -356,8 +365,13 @@ mod tests {
         )
     }
 
+    // AssertSqlSafe: テスト専用ヘルパー。呼び出し元はテスト内で採番した
+    // 整数 id を `format!` で埋め込んだ SQL のみを渡す（外部入力は無い）。
     async fn count(pool: &SqlitePool, sql: &str) -> i64 {
-        sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_one(pool)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]

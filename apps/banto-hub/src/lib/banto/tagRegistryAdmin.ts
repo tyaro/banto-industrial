@@ -16,7 +16,13 @@
  * `DEMO_MODE_MESSAGE` のような「利用不可」表現自体が不要と判断し、
  * ページ側の呼び出し元ごと削っている。
  */
-import { getAuthProvider, ProviderError, type ErrorBody } from '@banto/admin-core';
+import {
+	getAuthProvider,
+	ProviderError,
+	type ErrorBody,
+	type ListParams,
+	type ListResult
+} from '@banto/admin-core';
 import { CSRF_HEADER } from './setup';
 
 // --- wire types (camelCase, matching the Rust serde shapes) -----------------
@@ -425,6 +431,33 @@ export async function deleteCollectionGroup(id: number): Promise<void> {
 
 export async function listTags(): Promise<Tag[]> {
 	return httpRequest<Tag[]>('/api/tags', { method: 'GET' });
+}
+
+/**
+ * T18-5a 第2段（docs/banto-hub-t18-design.md §4 決定6「薄い部品の先行配線」）:
+ * `POST /api/tags/list` — フィルタ/ソート/ページングつきのタグ一覧。
+ * `listWriteAudit`（`writeAuditAdmin.ts`）と同型の素通し呼び出し。まだどの
+ * UI からも使われていない（配線のみ）。
+ */
+export async function listTagsPaged(params: ListParams): Promise<ListResult<Tag>> {
+	return httpRequest<ListResult<Tag>>('/api/tags/list', { method: 'POST', body: params });
+}
+
+/**
+ * T18-5a 第2段（同 §4 決定6）: `GET /api/tags/group-counts` の応答行 -
+ * mirrors `banto_tags::GroupTagCount`。
+ */
+export interface GroupTagCount {
+	collectionGroupId: number;
+	tagCount: number;
+}
+
+/**
+ * グループ別のタグ件数集計（`GET /api/tags/group-counts`）。まだどの UI
+ * からも使われていない（配線のみ）。
+ */
+export async function listTagGroupCounts(): Promise<GroupTagCount[]> {
+	return httpRequest<GroupTagCount[]>('/api/tags/group-counts', { method: 'GET' });
 }
 
 export async function createTag(input: TagInput): Promise<Tag> {

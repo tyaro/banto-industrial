@@ -239,7 +239,7 @@ fn random_b64(byte_len: usize) -> String {
     // getrandom の失敗（OS 側の乱数源が壊れている等）は復旧不能なので
     // panic させる - `password_hash::rand_core::OsRng` 経由の argon2 塩生成
     // が失敗時に panic するのと同じ扱い（crate::users::hash_password 参照）。
-    getrandom::getrandom(&mut buf).expect("システム乱数生成器の呼び出しに失敗しました");
+    getrandom::fill(&mut buf).expect("システム乱数生成器の呼び出しに失敗しました");
     URL_SAFE_NO_PAD.encode(buf)
 }
 

@@ -220,6 +220,22 @@ impl UsersService {
         Ok(count > 0)
     }
 
+    /// Does at least one `admin` role account exist? Used by
+    /// `crate::commissioning::CommissioningService::lock_down`（設計
+    /// §5.6「試運転モードとロックダウン」・2026-08-30 オーナー決定）の
+    /// ガードとして: ロックダウン（試運転モード→ロックダウン済み、
+    /// 以後は認証必須）を実行する前に、ログインできる管理者が最低1人
+    /// 存在することを確認する。ここで確認しないと、誰も
+    /// ログインできない状態のまま施錠してしまい、UI からも API からも
+    /// 一切操作できない詰み状態を自分で作ってしまう。
+    pub async fn has_admin(&self) -> Result<bool, BantoError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE role = 'admin'")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(banto_storage::storage_error)?;
+        Ok(count > 0)
+    }
+
     /// Create the very first account. Only succeeds while the `users` table
     /// is empty - once any account exists, this always fails with
     /// `BantoError::Other`, regardless of the requested username (spec:
@@ -778,6 +794,26 @@ mod tests {
         let hash = hash_password("hunter2hunter").unwrap();
         assert!(verify_password("hunter2hunter", &hash));
         assert!(!verify_password("wrong", &hash));
+    }
+
+    /// 依存更新の回帰ガード（dependabot #188: `password-hash` 0.5→0.6 の
+    /// 検証時に追加、2026-08-30）。ここに埋め込んだ PHC 文字列は
+    /// `password-hash`/`argon2` 0.5 系の現行コードで実際に
+    /// `hash_password("t18-password-hash-regression")` を実行して得たもの
+    /// （生成時刻のログはコミット時のセッション参照）。既存ユーザーの
+    /// パスワードハッシュは DB に保存済みの PHC 文字列そのものなので、
+    /// 依存更新のたびにこの固定リテラルが `verify_password` を通ることを
+    /// 確認すれば「保存済みハッシュが検証できなくなる」事故を機械的に
+    /// 検出できる。`argon2`/`password-hash` を将来 0.6 系以降へ上げる際は、
+    /// このテストが最初に落ちるべき回帰センサーとして残す。
+    #[test]
+    fn verifies_a_hash_fixed_from_password_hash_0_5() {
+        const PASSWORD: &str = "t18-password-hash-regression";
+        const HASH_FROM_0_5: &str =
+            "$argon2id$v=19$m=19456,t=2,p=1$eXfK1qD0vlRwwb2mtenDmQ$XFql1m/rfH6EQ12vPYIQltgSR6WyX83U4Bde0HTbHt0";
+
+        assert!(verify_password(PASSWORD, HASH_FROM_0_5));
+        assert!(!verify_password("wrong-password", HASH_FROM_0_5));
     }
 
     // --- Role -------------------------------------------------------------
