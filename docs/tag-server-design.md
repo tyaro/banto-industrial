@@ -1,10 +1,10 @@
 # タグサーバーアプリ 設計ドキュメント（草案）
 
 作成日: 2026-08-04
-状態: **実装追従中（2026-08-31 更新）**。起案時は設計先行だったが、
-apps/banto-hub として実装が進行 — T0〜T4 / T6〜T18-5b 実装済み・残 T18-5c/d
-（Windows 実機往復・72h soak）と P3-b（SLMP CPU 種別/アクセスルート露出、
-バックログ）。実装状況は §9（T系）の表を正とする。マイルストーンは §9、
+状態: **実装追従中（2026-09-01 更新）**。起案時は設計先行だったが、
+apps/banto-hub として実装が進行 — T0〜T18-6 実装済み・残 T18-5c/d
+（Windows 実機往復・72h soak）と P3-b の残件（SLMP CPU 種別/アクセスルート露出、
+バックログ。word order 自体は #127 で完了済み）。実装状況は §9（T系）の表を正とする。マイルストーンは §9、
 オーナー判断待ちの未決事項は §10。T14 以降の運転計画・UI/UX 決定台帳は
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)、docs 全体の地図は
 [README.md](README.md)。UX 改善（T9〜T13）の経緯は [ux-plan.md](ux-plan.md)（アーカイブ）。
@@ -1013,8 +1013,8 @@ MELSEC SLMP 収集には **I8（banto-collect の SLMP 対応、I 系バック�
 `SlmpConfig` が `build_config`・接続タスクの client factory に配線され、
 SLMP 接続の収集が有効になった（管理 UI の「収集は未対応」注記も撤去済み）。
 
-**P3-b 実装時の発見（監査指摘 2026-08-12、実装完了・未マージ、ブランチ
-`claude/slmp-word-order`）**: I8 で配線された `SlmpConfig` は `host`/`port`
+**P3-b 実装時の発見（監査指摘 2026-08-12、ブランチ `claude/slmp-word-order`、
+#127 で 2026-08-11 マージ済み）**: I8 で配線された `SlmpConfig` は `host`/`port`
 以外が常に `SlmpConfig::default()` 固定で、`word_order`
 （`WordOrder::LowHigh` 既定・MELSEC 標準）を接続ごとに変えられなかった -
 `WordOrder::HighLow` を要する機種につなぐと u32/f32 の値が静かに化ける

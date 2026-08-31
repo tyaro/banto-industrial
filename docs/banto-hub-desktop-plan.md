@@ -47,7 +47,10 @@ T16-2 第三スライス実装済み**（`GET /api/v1/openapi.json`の
 Windows サービスカード、シェル`host_switch_*`/`set_service_autostart`
 invoke、実`ShellDesktopControl`、自動起動 UAC。詳細は
 [banto-hub-t16-design.md](banto-hub-t16-design.md) §3「切替ウィザード UI
-実装メモ」。Windows 実機での UI 経路は未検証）。§16.4 の `optNum` null 取りこぼしと §9 TAG-P0-1 本体（連続登録 `count.trim()` クラッシュ）はロジック側を修正済み。**2026-08-09（本 PR）: §16.3「banto-hub の Playwright/DOM テスト基盤を T18-1 へ前倒し」を実施し、`e2e/banto-hub.playwright.config.ts`（`pnpm e2e:banto-hub`）を新設。TAG-P0-1 の残受け入れ条件（実 DOM からの点数変更テスト）を `e2e/tests-banto-hub/banto-hub-tags-continuous.spec.ts` で満たし、DOM/E2E 側も含めて TAG-P0-1 は受け入れ条件を全て満たした（closed）。** 2026-08-09（本 PR、
+実装メモ」。Windows 実機での UI 経路は当時未検証）。**2026-09-01: 上記 UI 経路の
+Windows 実機検証完了**（Desktop→Service は2026-08-31、Service→Desktop 逆経路・
+自動起動トグルの UAC 昇格・UAC キャンセル時の異常系は 2026-09-01 にオーナーが
+実機確認。詳細は [banto-hub-t16-design.md](banto-hub-t16-design.md) §3）。§16.4 の `optNum` null 取りこぼしと §9 TAG-P0-1 本体（連続登録 `count.trim()` クラッシュ）はロジック側を修正済み。**2026-08-09（本 PR）: §16.3「banto-hub の Playwright/DOM テスト基盤を T18-1 へ前倒し」を実施し、`e2e/banto-hub.playwright.config.ts`（`pnpm e2e:banto-hub`）を新設。TAG-P0-1 の残受け入れ条件（実 DOM からの点数変更テスト）を `e2e/tests-banto-hub/banto-hub-tags-continuous.spec.ts` で満たし、DOM/E2E 側も含めて TAG-P0-1 は受け入れ条件を全て満たした（closed）。** 2026-08-09（本 PR、
 `cursor/t18-1-form-dirty-e3cb`）: §9.4 TAG-UX-C のうち dirty 追跡と破棄確認
 を実装（詳細は §9.4 TAG-UX-C の実装メモ）。続く `cursor/t18-1-drawer-busy-e3cb`
 で同 §9.4 の「保存、削除、検証、登録、閉じるを Drawer 単位の busy 状態で
@@ -70,8 +73,10 @@ TAG-P0-2 は T14-3 のバックエンド preflight（`preflight_transaction`）+
 実装メモ）。TAG-P0-3 は queue/apply/cancel 本体を実装済み・2026-08-12 に
 apply 時の per-resource フィンガープリントガードを追加（詳細は §9.3）。
 最終検証日(コード照合): 2026-08-10
-最終検証日(Windows 実機): 2026-08-10（T17-1 Session 0・SLMP 収集、
-[banto-hub-t17-design.md](banto-hub-t17-design.md) §8）
+最終検証日(Windows 実機): 2026-09-01（T17-1 Session 0・SLMP 収集は 2026-08-10、
+[banto-hub-t17-design.md](banto-hub-t17-design.md) §8。切替ウィザード UI の
+Desktop↔Service 全経路は 2026-08-31/09-01 に追加検証・完了、
+[banto-hub-t16-design.md](banto-hub-t16-design.md) §3）
 基準コミット: `625401c`（main、T17 Session 0 実機検証記録 + `real_plc_verify`
 移植）。T18-1 は本 PR
 （`apps/banto-hub/src/lib/banto/continuousRegistration.ts` の
@@ -175,7 +180,9 @@ UI/UX 6項目は、いずれも 2026-08-09 に決定済みである。
 - サービス停止後もデスクトップシェル／タスクトレイから状態確認と再開ができる。
 - 収集、書き込み、履歴、外部出力の安全規則を両ホストで同一に保つ。
 - 現行の部分再構成基盤、REST / WS / MQTT / gRPC、認証、監査の安全不変条件を
-  回帰させない。初版の公開操作では、決定どおり運転中の構成編集をロックする。
+  回帰させない。初版（2026-08-09時点）の公開操作では、決定どおり運転中の構成編集を
+  ロックする方針だったが、**UX-5 改定（2026-08-11）により、運転中編集は拒否ではなく
+  下書きキュー化 + 手動適用/キャンセルへ変更**した（§9.1・§9.3 TAG-P0-3 参照。実装済み）。
 
 ### 2.2 非目的
 
@@ -301,9 +308,12 @@ RunningHub::shutdown().await
 
 停止中の CRUD は提案構成全体をトランザクション前に preflight し、不正なら
 DB へ保存しない。保存成功時は `configured_revision` だけを進め、PLC セッションや
-Collector を開始しない。開始成功時に `running_revision` を追いつかせる。初版では
-運転中の構成 CRUD を UI、単票／一括 API、直接 REST の全経路で拒否する。現行の
-部分再構成機構は、内部状態遷移と将来の下書き一括反映の基盤として保持する。
+Collector を開始しない。開始成功時に `running_revision` を追いつかせる。初版
+（2026-08-09時点）では運転中の構成 CRUD を UI、単票／一括 API、直接 REST の
+全経路で拒否する方針だったが、**UX-5 改定（2026-08-11）により pending change
+queue へ保存し、明示操作でのみ適用/キャンセルする方式へ変更・実装済み**
+（TAG-P0-3、§9.3 参照）。現行の部分再構成機構は、その「明示適用時の反映
+エンジン」として使う（下書き一括反映の基盤という位置づけ自体は変わらない）。
 
 ### 5.3 再開可能な収集 controller
 
@@ -541,11 +551,14 @@ UI/UX マイルストーンへ反映し、変更時は新しい決定記録を�
   停止中は「開始」「全 PLC シミュレーション」、運転中は「停止」を主操作とする。
   「開始」は保存済みの接続別 SIM 設定に従うため、直前に
   `実機 3接続 / SIM 1接続` のような実効内訳を表示する。
-- 初版では、実機／SIM 運転中の PLC 接続、収集グループ、タグ構成の編集をロックし、
-  「停止して編集」を案内する。下書き編集と運転への一括反映は将来拡張とする。
+- 初版（2026-08-09時点）では、実機／SIM 運転中の PLC 接続、収集グループ、タグ構成の
+  編集をロックし、「停止して編集」を案内する方針だったが、**UX-5 改定（2026-08-11）
+  により、運転中の編集は pending change queue へ保存し、明示操作の「適用」または
+  「キャンセル」で扱う方式へ変更・実装済み**（TAG-P0-3、§9.3 参照）。「停止して編集」
+  への案内は行わない。
 - `docs/plan.md` §4c と `docs/tag-server-design.md` が記載するオンライン部分再構成は、
-  内部基盤として維持する。ただし初版の UI と直接 REST では運転中編集を許可せず、
-  T14 でこの製品方針変更を関連文書へ明記する。
+  内部基盤として維持する。UI と直接 REST の運転中編集要求は pending queue の
+  明示適用時にこの部分再構成機構（`apply_config`）を呼ぶ形で反映する。
 - タグ単票フォームは基本設定を常時表示し、高度設定を折りたたむ。
 - タグ作成後は「登録して次へ」と「登録して閉じる」を分け、選択中の親と安全な
   共通値を保持する。接続／グループ、型、単位、スケーリング、しきい値は保持可能、
@@ -1331,7 +1344,10 @@ flowchart LR
 - 「サービスへ切り替えて開始」は Hub Admin、Windows 操作権限、preflight 成功、
   profile lock 解放をすべて満たす場合だけ有効にする。
 - 運転中に「設定」を開いた場合は読み取り専用とし、ページ上部へ
-  `収集中のため変更できません [停止して編集]` を表示する。
+  `収集中のため変更できません [停止して編集]` を表示する（**初版方針。UX-5
+  改定（2026-08-11）により、実装は読み取り専用ロックではなく編集を pending
+  change queue へ保存し「未適用の変更あり」+「適用」/「キャンセル」を表示する
+  方式**、§9.3 TAG-P0-3 参照）。
 
 遷移中と異常停止は、操作不能の理由と回復操作を状態カード内へ残す。
 
@@ -1867,8 +1883,9 @@ fallback を配線した。詳細は
 - 常時運転化で必要な UAC の理由が事前に表示される。
 - サービス停止後もシェルから状態確認と再開ができる。
 - 状態を色だけに依存せず文字とアイコンでも判別できる。
-- PLC 作成→グループ作成→タグ登録→SIM 値確認を、次工程の案内と親設定の引継ぎで
-  完遂できる。
+- PLC 作成→グループ作成→タグ登録→収集開始→モニタで値確認を、次工程の案内と
+  親設定の引継ぎで完遂できる（**2026-08-31 見直し**: 旧「SIM 値確認」は
+  「収集開始→モニタで値確認」に置き換え済み、§9.6・§9.8 参照）。
 - チェックリストは画面訪問でなく、保存、preflight、モニタの `Good` 値と SIM 表示で
   完了判定する。
 - 現行の全 route が「運転／設定／モニタ／外部連携／管理」のいずれかに割り当てられ、
@@ -2261,7 +2278,9 @@ owner ACL を設定する。グループ変更、profile owner 追加、ACL 変�
   TAG-P0-2（I1 CRUD の rebuild 失敗握り潰しの置き換え）の日付付き注記を追加。
 - `docs/plan.md` のヘッダ状態行と §4c に、本計画（T14〜T18）へのリンクを追加。
 
-残件（本 PR のスコープ外、別 docs パスで扱う）: `docs/plan.md` §4c の T5 行が
+残件（本 PR のスコープ外、別 docs パスで扱う）: ~~`docs/plan.md` §4c の T5 行が
 「72h soak 実行」を T5-5 に帰属させている一方、本書と t5-handoff.md は
 T5-4=ソークハーネス / T5-5=実機サインオフと採番している。この T5-4/T5-5 の
-soak 帰属を t5-handoff.md の定義へ統一する。
+soak 帰属を t5-handoff.md の定義へ統一する。~~ **解消済み（2026-09-01）**:
+`docs/plan.md` §4c の T5 行を t5-handoff.md の定義（T5-4=ソークハーネス実装
+＝実装済み／T5-5=実機での soak 実行 + 実機最終サインオフ＝残）へ統一した。

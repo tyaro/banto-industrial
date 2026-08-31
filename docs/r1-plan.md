@@ -1,6 +1,8 @@
 # R1 実施計画 — ChronoGazer アプリ骨格 + 設定 + 監視画面
 
 作成日: 2026-07-13（I0〜I4 完了時点で司令塔が事前設計。新セッションへの引き継ぎ文書を兼ねる）
+状態: **実施済み（R1 完了）**。バージョン記述は当時の記録として残す。
+最終検証日(コード照合): 2026-09-01
 前提: [recorder-requirements.md](recorder-requirements.md)（R0、未決事項ゼロ）と [plan.md](plan.md) §4。
 実施プロセスは banto と同じ（司令塔が設計・分割 → 実装は general-purpose(sonnet)、
 難所は opus に委譲 → 検証 → Phase 毎コミット → PR + CI → ユーザーマージ）。
@@ -11,6 +13,9 @@
   Cargo.toml / package.json を正とする）
   - npm: `pnpm add "github:tyaro/banto#v1.1.0&path:packages/admin-core"` 等
   - Rust: `{ git = "https://github.com/tyaro/banto.git", tag = "v1.1.0" }`
+  - **2026-09-01 時点の実値**: npm `@banto/*` は `v1.2.0`、Rust クレートは
+    `v1.4.0`（両者は独立に追従するため一致しない。上記は 2026-08-09 時点の
+    記録としてそのまま残す。実際の値は各 `package.json`/`Cargo.toml` を正とする）
 - I 系クレート（banto-tags/plc/tstore/collect/tsquery）は同一ワークスペースの path 依存
 
 ## Phase 分割
