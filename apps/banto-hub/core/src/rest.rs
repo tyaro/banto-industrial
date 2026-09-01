@@ -56,7 +56,7 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use banto_broker::{BrokerConnectionStatus, BrokerError};
+use banto_broker::{is_supported_protocol, BrokerConnectionStatus, BrokerError};
 use banto_collect::{build_config_from, ApplyReport, ConnectionStatus, RegistrySnapshot};
 use banto_core::{BantoError, ErrorBody, FieldError, ListParams, ListResult};
 // T12 (docs/ux-plan.md §4): 保存前の接続テスト API 用。Modbus/SLMP 両方の
@@ -5400,14 +5400,18 @@ struct StatusResponse {
 /// を組み立てる。Connection names come from the registry directly (not the
 /// catalog) so a connection with zero tags still appears.
 ///
-/// T2-2 (docs/tag-server-design.md §6-5, 2026-08-05 決定): an SLMP
-/// connection's status comes from
+/// T2-2/#131 (docs/tag-server-design.md §6-5, 2026-08-05 決定): a
+/// broker-managed connection's status (per `banto_broker::is_supported_protocol`;
+/// `"slmp"` and, as of #131, 2026-09-01, `"modbus-tcp"` too) comes from
 /// [`crate::hub::CollectorManager::broker_status`] (the broker's own
 /// `ConnState`) instead of `banto_collect`'s own status map - see
 /// `crate::broker_glue`'s module doc ("The two-backoff double bookkeeping")
 /// for why the broker's answer is the one that reflects whether the physical
-/// session is actually up for a broker-managed connection. Modbus connections
-/// are unaffected and keep reading from `banto_collect::Collector::status`.
+/// session is actually up for a broker-managed connection. A connection
+/// whose protocol the broker does NOT manage (any protocol string outside
+/// that registered set) still falls back to reading from
+/// `banto_collect::Collector::status` - unaffected by #131, since it was
+/// never broker-routed to begin with.
 async fn compute_status(state: &TagSpaceState) -> Result<StatusResponse, ApiError> {
     let runtime = state.controller.status();
     let revision = state.manager.configured_revision();
@@ -5428,7 +5432,7 @@ async fn compute_status(state: &TagSpaceState) -> Result<StatusResponse, ApiErro
     let entries: Vec<ConnectionStatusEntry> = connections
         .into_iter()
         .map(|conn| {
-            let (status_str, attempt) = if conn.protocol == "slmp" {
+            let (status_str, attempt) = if is_supported_protocol(&conn.protocol) {
                 match state.manager.broker_status(conn.id) {
                     Some(BrokerConnectionStatus::Connected) => ("connected", None),
                     Some(BrokerConnectionStatus::Reconnecting { attempt }) => {

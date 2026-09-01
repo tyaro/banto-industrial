@@ -26,7 +26,10 @@
 //!   windows rather than pre-typed by the wrapped crate.
 //! - [`modbus`]: the first protocol implementation
 //!   ([`modbus::ModbusTcpClient`]), chosen to go first for debuggability
-//!   (recorder-requirements.md §1)
+//!   (recorder-requirements.md §1); its connect ([`dial_modbus`]) and
+//!   borrowed-stream read execution ([`execute_modbus_reads`]) are shared
+//!   with `banto-broker`'s Modbus driver (#131), mirroring `slmp`'s
+//!   `dial_slmp`/`execute_slmp_batch_reads` split
 //! - [`slmp`]: the MELSEC MC/SLMP implementation ([`slmp::SlmpClient`], I2a) -
 //!   the eventual primary target, a sibling behind the same trait. Unlike
 //!   `modbus`, it wraps an external crate for the wire framing rather than
@@ -70,7 +73,7 @@ pub use address::{Address, AddressArea};
 pub use client::{BoxFuture, PlcClient};
 pub use decode::WordOrder;
 pub use error::PlcError;
-pub use modbus::{ModbusTcpClient, ModbusTcpConfig};
+pub use modbus::{dial_modbus, execute_modbus_reads, ModbusTcpClient, ModbusTcpConfig};
 pub use planning::{plan_batch_requests, plan_requests, MappedRequest, PlanOutcome, PlannedRead};
 pub use slmp::address::{SlmpAccess, SlmpDevice};
 pub use slmp::planning::{

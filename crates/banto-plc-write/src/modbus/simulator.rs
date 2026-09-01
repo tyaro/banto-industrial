@@ -20,6 +20,13 @@
 //! hand-roll them a second time. What is NOT reused is *request decoding*:
 //! parsing an incoming FC5/6/15/16 request PDU is server-only logic with no
 //! client-side equivalent to share.
+//!
+//! `exceptions` (via [`Simulator::inject_exception`]) is checked by every
+//! handler - reads (FC1/FC3) and writes (FC5/6/15/16) alike (#131 broker
+//! slice, 2026-09-01: the read handlers did not check it until this slice
+//! needed to exercise a read-side Modbus exception through `banto-broker`'s
+//! Modbus driver, alongside the write-side exceptions this crate's own
+//! round-trip tests already covered).
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -313,6 +320,9 @@ fn handle_read_coils(state: &State, pdu: &[u8]) -> Result<Vec<u8>, (u8, u8)> {
     }
     let start = u16::from_be_bytes([pdu[1], pdu[2]]);
     let quantity = u16::from_be_bytes([pdu[3], pdu[4]]);
+    if let Some(&code) = state.exceptions.get(&(FC_READ_COILS, start)) {
+        return Err((FC_READ_COILS, code));
+    }
     let bits: Vec<bool> = (0..quantity)
         .map(|i| *state.coils.get(&(start + i)).unwrap_or(&false))
         .collect();
@@ -330,6 +340,9 @@ fn handle_read_holding_registers(state: &State, pdu: &[u8]) -> Result<Vec<u8>, (
     }
     let start = u16::from_be_bytes([pdu[1], pdu[2]]);
     let quantity = u16::from_be_bytes([pdu[3], pdu[4]]);
+    if let Some(&code) = state.exceptions.get(&(FC_READ_HOLDING_REGISTERS, start)) {
+        return Err((FC_READ_HOLDING_REGISTERS, code));
+    }
     let regs: Vec<u16> = (0..quantity)
         .map(|i| *state.holding_registers.get(&(start + i)).unwrap_or(&0))
         .collect();

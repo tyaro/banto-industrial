@@ -39,8 +39,12 @@
 //! 4. シミュレーション中の PLC タグ → [`WriteRejection::SimulationWriteRejected`]
 //!    (保存済み simulation または production controller の AllSimulation。
 //!    internal/mem タグはこのゲートの対象外)
-//! 5. Modbus 接続配下 → [`WriteRejection::UnsupportedProtocol`](§6-7:
-//!    v1 の書き込みは SLMP のみ)
+//! 5. 接続のプロトコルに broker ドライバが登録されていない →
+//!    [`WriteRejection::UnsupportedProtocol`](`banto_broker::is_supported_protocol`/
+//!    `banto_broker::DRIVERS` が唯一の正 - #131（2026-09-01）以降、slmp と
+//!    modbus-tcp の両方がこのゲートを通過する。Modbus は Numeric（数値/
+//!    ビット、FC5/6/15/16）のみ対応、String は broker 側で per-request Bad
+//!    になる）
 //! 6. write_enabled(受付)off → [`WriteRejection::WritesDisabled`] +
 //!    write_audit に `suppressed_disabled`
 //! 7. レート制限 would_exceed → [`WriteRejection::RateLimited`] + キー
@@ -89,6 +93,7 @@
 
 use std::time::Instant;
 
+use banto_broker::is_supported_protocol;
 use banto_collect::Quality;
 use banto_core::BantoError;
 use banto_plc::{Address, DataType, TagValue as PlcTagValue};
@@ -320,7 +325,16 @@ pub async fn execute_write(
         return Err(WriteRejection::SimulationWriteRejected);
     }
 
-    // gate 4: Modbus 接続配下は非対応(§6-7: v1 の書き込みは SLMP のみ)。
+    // gate 4: 接続のプロトコルに broker ドライバが登録されていなければ
+    // 非対応(#131、2026-09-01: `banto_broker::is_supported_protocol`/
+    // `banto_broker::DRIVERS` が唯一の正 - 現状 slmp と modbus-tcp の両方が
+    // 登録済みなので、このゲートを実際に通過できないのは未登録プロトコル
+    // だけになった。banto-tags の `ALLOWED_PROTOCOLS` は `"virtual"` も
+    // 許可しているが、`"virtual"` 接続配下には PLC 種別タグを作成できない
+    // ため - `banto_tags::tag::validate_tag_kind_placement` 参照 - 通常の
+    // registry 経由ではこのゲートに`"virtual"`行が到達することはなく、この
+    // 分岐は将来 broker に未登録のプロトコルが増えた場合や、想定外のデータ
+    // に対する防御でもある)。
     //
     // T6-2 決定(docs/tag-server-design.md §4.2「internal タグ...PLC へ送ら
     // ない」): `internal` タグは PLC 接続を一切経由しないため、このプロト
@@ -331,14 +345,13 @@ pub async fn execute_write(
     // 「書き込み: 不可(値は式が決まる)」を特別扱いなしに成立させている。
     // writable opt-in・write スコープ・レート制限・write_enabled・監査は
     // `internal` タグにもそのまま一様に適用する - タグ種別で緩めない保守的
-    // な一様ルール(SLMP プロトコルゲートだけがタグ種別で分岐する唯一の
-    // 例外)。
+    // な一様ルール(プロトコルゲートだけがタグ種別で分岐する唯一の例外)。
     let conn = if entry.tag_kind == PLC_TAG_KIND {
         let conn = PlcConnectionService::new(deps.manager.pool())
             .get(connection_id)
             .await
             .map_err(map_registry_error)?;
-        if conn.protocol != "slmp" {
+        if !is_supported_protocol(&conn.protocol) {
             return Err(WriteRejection::UnsupportedProtocol);
         }
         Some(conn)
@@ -505,8 +518,10 @@ pub async fn execute_write(
     })
 }
 
-/// gate 8 の PLC タグ分岐: 従来どおり `banto_tags::unscale` → SLMP
-/// アドレス解決 → `BrokerHandle::write`。`execute_write` から抽出しただけで
+/// gate 8 の PLC タグ分岐: 従来どおり `banto_tags::unscale` → プロトコル別
+/// アドレス解決(#131 以降 SLMP/Modbus TCP の両方 - `banto_collect`の
+/// `build_request`と同じ`conn.protocol`分岐)→ `BrokerHandle::write`。
+/// `execute_write` から抽出しただけで
 /// 挙動は変えていない(T6-2 前の唯一の書き込み経路そのもの)。
 ///
 /// T15-4(このモジュールの doc comment「gate 8 は broker セッションを新規に
@@ -547,12 +562,24 @@ async fn write_plc_tag(
         }
     };
 
-    let address = match Address::parse_slmp(&entry.address) {
+    // #131 (2026-09-01): dispatch on `conn.protocol` exactly like
+    // `crates/banto-collect/src/config.rs`'s `build_request` does for reads -
+    // gate 4 (`execute_write`, above) no longer restricts this function to
+    // SLMP connections alone, so the address notation must be parsed with
+    // the matching protocol's parser.
+    let address = match conn.protocol.as_str() {
+        "modbus-tcp" => Address::parse(&entry.address),
+        // "slmp" and (defensively) anything else the protocol gate above
+        // already restricted to a broker-registered protocol.
+        _ => Address::parse_slmp(&entry.address),
+    };
+    let address = match address {
         Ok(address) => address,
         Err(err) => {
             // catalog のアドレスは登録時に banto-tags で検証済みのはずの
-            // 防御的分岐(§6-7: writable にできるのは SLMP 接続配下のタグ
-            // のみなので、ここに来る時点でアドレスは SLMP 表記のはず)。
+            // 防御的分岐(gate 4 で broker が対応するプロトコルの接続だけに
+            // 絞られているので、ここに来る時点でアドレスは対応プロトコルの
+            // 表記のはず)。
             return Err(WriteRejection::InvalidAddress(err.to_string()));
         }
     };
@@ -583,6 +610,14 @@ async fn write_plc_tag(
     // above is handled rather than `unwrap`ped. A genuine bit-*device*
     // address (`"M50"`, no `.N` suffix) still takes the `Numeric` branch
     // exactly as before T8 - only a word device's bit-in-word notation does.
+    //
+    // #131 (2026-09-01): this `matches!` is on the `Address::Slmp` variant
+    // specifically, so a Modbus tag's `address` (always `Address::ModbusRef`
+    // - see the protocol dispatch above) can never match it and always takes
+    // the `Numeric` branch below, unconditionally - a Modbus bit-in-word
+    // write is out of scope for this slice (`banto_broker`'s Modbus driver
+    // only ever receives `BatchWriteRequest::Numeric`/`String` from this
+    // function, never `BitInWord`, for a Modbus connection).
     let is_bit_in_word = matches!(address, Address::Slmp { bit: Some(_), .. });
     let request = if is_bit_in_word {
         let PlcTagValue::Bit(value) = tag_value else {

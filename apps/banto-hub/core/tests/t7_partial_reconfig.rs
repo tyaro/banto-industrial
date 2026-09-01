@@ -780,10 +780,19 @@ async fn deleting_a_connection_untracks_its_broker_session_and_leaves_others_run
         })
         .await
     );
+    // #131 (2026-09-01): `HubSessions`/`sync_slmp_sessions_from` now manages a
+    // broker session for every connection whose protocol
+    // `banto_broker::is_supported_protocol` covers - `"slmp"` (B) AND
+    // `"modbus-tcp"` (A) - not SLMP alone as when this test (and its literal
+    // "for B" assertion) was written. A's session exists purely for
+    // write/status routing (its *collection reads* still go through
+    // banto-collect's own direct `ModbusTcpClient`, unaffected - see
+    // `crate::broker_glue::hub_client_factory`'s doc comment), so this count
+    // is now 2, not 1.
     assert_eq!(
         app.sessions.connection_count(),
-        1,
-        "exactly one broker session should exist, for B"
+        2,
+        "a broker session should exist for both A (modbus-tcp, #131) and B (slmp)"
     );
 
     // B 削除: FK 制約(ON DELETE RESTRICT)があるので tag → group → connection
@@ -858,13 +867,15 @@ async fn deleting_a_connection_untracks_its_broker_session_and_leaves_others_run
     // B の broker セッションが整理される (HubSessions のセッション数で確認) -
     // this is keyed off the registry's connection list, not the collect
     // config, so it only happens once the connection ROW itself (not just
-    // its groups/tags) is gone.
+    // its groups/tags) is gone. #131: A (modbus-tcp) still keeps its own
+    // broker session (write/status routing) throughout, so the count settles
+    // at 1 (A only), not 0, once B's is untracked.
     assert!(
         wait_until(Duration::from_secs(10), || async {
-            app.sessions.connection_count() == 0
+            app.sessions.connection_count() == 1
         })
         .await,
-        "B's broker session should be untracked after the connection is deleted"
+        "B's broker session should be untracked after the connection is deleted, leaving only A's"
     );
 
     // status から B が消える。

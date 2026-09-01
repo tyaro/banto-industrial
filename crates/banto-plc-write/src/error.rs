@@ -187,6 +187,20 @@ pub enum PlcWriteError {
         "ビット書き込みの確認読みで不一致を検出しました（デバイス={area}, ビット={bit}）。書き戻し競合の可能性があります"
     )]
     BitWriteVerificationFailed { area: String, bit: u8 },
+
+    /// #131 broker slice (2026-09-01): a `BatchWriteRequest::String` or
+    /// `BatchWriteRequest::BitInWord` submitted against a Modbus connection.
+    /// Both are out of scope for this slice for different reasons - String
+    /// because MELSEC string devices have no Modbus equivalent (see
+    /// `crate::modbus::planning`'s module doc, "What is deliberately out of
+    /// scope"), BitInWord because Modbus's atomic FC22 (Mask Write Register)
+    /// is left for whenever it is actually needed rather than reusing SLMP's
+    /// RMW path (same module doc). Resolved by `banto_broker`'s Modbus driver
+    /// before any wire traffic - a per-request `Bad`, never a whole-batch
+    /// `Err`: a batch mixing this with a `Numeric` request still writes the
+    /// `Numeric` half.
+    #[error("{kind} は Modbus 接続では未対応です（この Issue のスコープ外）。Numeric（数値/ビット）書き込みのみ対応しています")]
+    UnsupportedRequestKind { kind: String },
 }
 
 impl PlcWriteError {
@@ -220,7 +234,9 @@ impl PlcWriteError {
     /// this whole switch exists to prevent for #131: a broker that treated an
     /// ordinary device refusal as connection-fatal would drop and reconnect
     /// the session on every single write rejection instead of just failing
-    /// that one write.
+    /// that one write. [`Self::UnsupportedRequestKind`] (2026-09-01, the
+    /// broker slice of #131) is a third configuration error resolved before
+    /// any wire traffic, exactly like `UnsupportedCombination`.
     pub fn is_connection_fatal(&self) -> bool {
         !matches!(
             self,
@@ -234,6 +250,7 @@ impl PlcWriteError {
                 | PlcWriteError::BitWriteVerificationFailed { .. }
                 | PlcWriteError::ModbusReadOnlyArea { .. }
                 | PlcWriteError::ModbusException { .. }
+                | PlcWriteError::UnsupportedRequestKind { .. }
         )
     }
 }
@@ -289,6 +306,9 @@ mod tests {
                 function: 0x06,
                 code: 0x02,
                 message: "illegal data address".to_string(),
+            },
+            PlcWriteError::UnsupportedRequestKind {
+                kind: "文字列書き込み".to_string(),
             },
         ];
         for err in per_request {
