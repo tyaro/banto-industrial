@@ -117,6 +117,9 @@ impl TagClientHandle {
             }
             Ok(Err(error)) => Err(error),
             Err(_) => {
+                tracing::warn!(
+                    "banto-tagclient worker task ended unexpectedly during shutdown (join error)"
+                );
                 self.publish_failure(ErrorKind::Transport);
                 Err(Error::new(ErrorKind::Transport))
             }
@@ -136,6 +139,9 @@ impl TagClientHandle {
         let joined = self.stop_and_join().await;
         match joined {
             Err(_) => {
+                tracing::warn!(
+                    "banto-tagclient worker task ended unexpectedly during restart (join error)"
+                );
                 self.publish_failure(ErrorKind::Transport);
                 self.explicit_shutdown = true;
                 return Err(Error::new(ErrorKind::Transport));
@@ -183,6 +189,9 @@ impl Drop for TagClientHandle {
         if self.explicit_shutdown {
             return;
         }
+        tracing::debug!(
+            "TagClientHandle dropped without explicit shutdown; aborting the worker task"
+        );
         self.state_tx
             .send_replace(TagClientState::new(TagClientConnectionState::Stopped));
         if let Some(stop_tx) = self.stop_tx.take() {

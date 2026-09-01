@@ -207,10 +207,12 @@ pub(crate) async fn run_supervisor_with_config(
         };
         let error = failure.error;
         if error.kind() == ErrorKind::Stopped {
+            tracing::debug!("banto-tagclient worker stopped by caller request");
             state_tx.send_replace(TagClientState::new(TagClientConnectionState::Stopped));
             return Ok(());
         }
         if error.kind() == ErrorKind::Unauthorized {
+            tracing::warn!("banto-tagclient worker stopping: banto-hub rejected credentials");
             state_tx.send_replace(TagClientState::unauthorized());
             return Err(error);
         }
@@ -219,10 +221,18 @@ pub(crate) async fn run_supervisor_with_config(
         }
         match plan_failure(&mut retry_tracker, &mut rebind_tracker, mode, failure) {
             FailurePlan::Rebind(next_mode) => {
+                tracing::debug!(
+                    error_kind = error.kind().as_str(),
+                    "banto-tagclient rebinding after a configuration change or metadata mismatch"
+                );
                 mode = next_mode;
                 continue;
             }
             FailurePlan::Terminal => {
+                tracing::warn!(
+                    error_kind = error.kind().as_str(),
+                    "banto-tagclient worker stopping: terminal, non-retryable error"
+                );
                 let mut state = TagClientState::new(TagClientConnectionState::Stopped);
                 state.fail(error.kind());
                 state_tx.send_replace(state);
@@ -231,6 +241,11 @@ pub(crate) async fn run_supervisor_with_config(
             FailurePlan::Backoff => {
                 state_tx.send_replace(TagClientState::reconnecting(error.kind()));
                 let delay = retry_tracker.delay_after_failure(backoff, failure.was_live);
+                tracing::debug!(
+                    error_kind = error.kind().as_str(),
+                    delay_ms = delay.as_millis() as u64,
+                    "banto-tagclient scheduling a reconnect attempt from the catalog"
+                );
                 mode = AttemptMode::Connecting;
                 tokio::select! {
                     biased;
@@ -1766,5 +1781,61 @@ mod tests {
         );
         assert_eq!(receiver.borrow().current(), None);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retry_backoff_diagnostic_omits_secret() {
+        let (log, _guard) = crate::test_support::capture();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        // Accept and immediately drop each connection (without ever writing a
+        // response) so every catalog request fails fast and deterministically
+        // with a transport error, unlike relying on OS-specific timing for a
+        // connection to a closed port.
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = [0_u8; 1024];
+                let _ = stream.read(&mut buffer).await;
+                drop(stream);
+            }
+        });
+        let (sender, mut receiver) =
+            watch::channel(TagClientState::new(TagClientConnectionState::Stopped));
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let rest_client = client(address);
+        let requests = vec![BindingRequest {
+            binding_key: "stable".into(),
+            stable_id: StableTagId::new(1, 1, 1),
+        }];
+        let worker_sender = sender.clone();
+        let task = tokio::spawn(async move {
+            run_supervisor_with_config(
+                &rest_client,
+                &requests,
+                1,
+                &worker_sender,
+                stop_rx,
+                BackoffConfig::new(Duration::from_millis(20), Duration::from_millis(50)),
+            )
+            .await
+        });
+        wait_state(
+            &mut receiver,
+            TagClientConnectionState::Reconnecting,
+            Some(ErrorKind::Transport),
+        )
+        .await;
+        stop_tx.send(()).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_ok());
+        server.abort();
+        assert!(!log.contains("test-token"));
+        assert!(log.contains("scheduling a reconnect"));
     }
 }

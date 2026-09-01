@@ -30,6 +30,8 @@ const MAX_WEBSOCKET_SIZE: usize = 1024 * 1024;
 
 pub(crate) struct WebSocketConnection {
     stream: WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    host: Option<String>,
+    port: Option<u16>,
 }
 
 pub(crate) async fn connect(
@@ -54,14 +56,140 @@ async fn connect_with_timeout(
         .max_message_size(Some(MAX_WEBSOCKET_SIZE))
         .max_frame_size(Some(MAX_WEBSOCKET_SIZE))
         .max_write_buffer_size(MAX_WEBSOCKET_SIZE);
+    let host = endpoint.host().map(str::to_owned);
+    let port = endpoint.port();
     let result = tokio::time::timeout(
         timeout,
         connect_async_with_config(request, Some(config), false),
     )
     .await
-    .map_err(|_| Error::new(ErrorKind::Transport))?;
-    let (stream, _) = result.map_err(classify_handshake_error)?;
-    Ok(WebSocketConnection { stream })
+    .map_err(|_| {
+        tracing::warn!(
+            host = ?host,
+            port = ?port,
+            timeout_ms = timeout.as_millis() as u64,
+            "banto-hub WebSocket connect timed out"
+        );
+        Error::new(ErrorKind::Transport)
+    })?;
+    let (stream, _) = result.map_err(|error| {
+        log_handshake_error(host.as_deref(), port, &error);
+        classify_handshake_error(error)
+    })?;
+    Ok(WebSocketConnection { stream, host, port })
+}
+
+/// Log a safe, secret-free diagnostic for a WebSocket handshake failure.
+///
+/// Only the error's classification (status code, protocol violation kind, or
+/// underlying `io::ErrorKind`) is recorded, never `WsError`'s own
+/// `Display`/`Debug`, which can echo the handshake URL (path prefix) or a
+/// server-controlled response body back into the log.
+fn log_handshake_error(host: Option<&str>, port: Option<u16>, error: &WsError) {
+    match error {
+        WsError::Http(response) => {
+            tracing::warn!(
+                host = ?host,
+                port = ?port,
+                status = response.status().as_u16(),
+                "banto-hub WebSocket handshake was rejected"
+            );
+        }
+        WsError::Io(io_error) => {
+            tracing::warn!(
+                host = ?host,
+                port = ?port,
+                io_kind = ?io_error.kind(),
+                "banto-hub WebSocket connection failed at the transport layer"
+            );
+        }
+        WsError::Tls(_) => {
+            tracing::warn!(
+                host = ?host,
+                port = ?port,
+                "banto-hub WebSocket TLS handshake failed"
+            );
+        }
+        WsError::Url(_) => {
+            tracing::warn!(
+                host = ?host,
+                port = ?port,
+                "banto-hub WebSocket URL was rejected before connecting"
+            );
+        }
+        WsError::ConnectionClosed | WsError::AlreadyClosed => {
+            tracing::debug!(
+                host = ?host,
+                port = ?port,
+                "banto-hub WebSocket connection was already closed during handshake"
+            );
+        }
+        WsError::Capacity(_)
+        | WsError::Protocol(_)
+        | WsError::WriteBufferFull(_)
+        | WsError::Utf8(_)
+        | WsError::AttackAttempt
+        | WsError::HttpFormat(_) => {
+            tracing::warn!(
+                host = ?host,
+                port = ?port,
+                "banto-hub WebSocket handshake violated the protocol"
+            );
+        }
+    }
+}
+
+/// Log a safe, secret-free diagnostic for a post-handshake WebSocket
+/// send/receive failure. Same redaction rule as [`log_handshake_error`]:
+/// never format `WsError` itself.
+fn log_stream_error(
+    host: Option<&str>,
+    port: Option<u16>,
+    operation: &'static str,
+    error: &WsError,
+) {
+    match error {
+        WsError::Io(io_error) => {
+            tracing::warn!(
+                host = ?host,
+                port = ?port,
+                operation,
+                io_kind = ?io_error.kind(),
+                "banto-hub WebSocket connection failed at the transport layer"
+            );
+        }
+        WsError::Tls(_) => {
+            tracing::warn!(
+                host = ?host,
+                port = ?port,
+                operation,
+                "banto-hub WebSocket TLS error"
+            );
+        }
+        WsError::ConnectionClosed | WsError::AlreadyClosed => {
+            tracing::debug!(
+                host = ?host,
+                port = ?port,
+                operation,
+                "banto-hub WebSocket connection was already closed"
+            );
+        }
+        WsError::Capacity(_)
+        | WsError::Protocol(_)
+        | WsError::WriteBufferFull(_)
+        | WsError::Utf8(_)
+        | WsError::AttackAttempt
+        | WsError::Url(_)
+        | WsError::Http(_)
+        | WsError::HttpFormat(_) => {
+            tracing::warn!(
+                host = ?host,
+                port = ?port,
+                operation,
+                "banto-hub WebSocket message violated the protocol"
+            );
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -99,7 +227,10 @@ impl WebSocketConnection {
         self.stream
             .send(Message::Text(payload.into()))
             .await
-            .map_err(classify_stream_error)
+            .map_err(|error| {
+                log_stream_error(self.host.as_deref(), self.port, "subscribe", &error);
+                classify_stream_error(error)
+            })
     }
 
     /// Receive exactly one application text frame, handling native control
@@ -109,16 +240,40 @@ impl WebSocketConnection {
             match self.stream.next().await {
                 Some(Ok(Message::Text(text))) => return Ok(text.to_string()),
                 Some(Ok(Message::Ping(_))) => {
-                    self.stream.flush().await.map_err(classify_stream_error)?;
+                    self.stream.flush().await.map_err(|error| {
+                        log_stream_error(self.host.as_deref(), self.port, "flush_pong", &error);
+                        classify_stream_error(error)
+                    })?;
                 }
                 Some(Ok(Message::Pong(_))) => {}
                 Some(Ok(Message::Binary(_))) | Some(Ok(Message::Frame(_))) => {
+                    tracing::warn!(
+                        host = ?self.host,
+                        port = ?self.port,
+                        "banto-hub sent an unexpected binary WebSocket frame"
+                    );
                     return Err(Error::new(ErrorKind::ProtocolError));
                 }
-                Some(Ok(Message::Close(_))) | None => {
+                Some(Ok(Message::Close(_))) => {
+                    tracing::debug!(
+                        host = ?self.host,
+                        port = ?self.port,
+                        "banto-hub closed the WebSocket connection"
+                    );
                     return Err(Error::new(ErrorKind::Transport));
                 }
-                Some(Err(error)) => return Err(classify_stream_error(error)),
+                None => {
+                    tracing::warn!(
+                        host = ?self.host,
+                        port = ?self.port,
+                        "banto-hub WebSocket connection ended unexpectedly"
+                    );
+                    return Err(Error::new(ErrorKind::Transport));
+                }
+                Some(Err(error)) => {
+                    log_stream_error(self.host.as_deref(), self.port, "receive", &error);
+                    return Err(classify_stream_error(error));
+                }
             }
         }
     }
@@ -551,6 +706,79 @@ mod tests {
             classify_handshake_error(WsError::AlreadyClosed).kind(),
             ErrorKind::Transport
         );
+    }
+
+    #[tokio::test]
+    async fn handshake_rejection_diagnostic_omits_secret_and_path() {
+        let (log, _guard) = crate::test_support::capture();
+        let address = status_server(401, "unauthorized-body-with-token").await;
+        let (endpoint, secret) = client(format!("{address}/private-secret-path"));
+        let error = connect_with_timeout(&endpoint, &secret, Duration::from_secs(2))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::Unauthorized);
+        assert!(!log.contains(TEST_SECRET));
+        assert!(!log.contains("private-secret-path"));
+        assert!(!log.contains("unauthorized-body-with-token"));
+        assert!(log.contains("401"));
+    }
+
+    #[tokio::test]
+    async fn handshake_connection_refused_diagnostic_omits_secret_and_path() {
+        let (log, _guard) = crate::test_support::capture();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let (endpoint, secret) = client(format!("{address}/private-refused-path"));
+        let error = connect_with_timeout(&endpoint, &secret, Duration::from_secs(2))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::Transport);
+        assert!(!log.contains(TEST_SECRET));
+        assert!(!log.contains("private-refused-path"));
+    }
+
+    #[tokio::test]
+    async fn handshake_timeout_diagnostic_omits_secret_and_path() {
+        let (log, _guard) = crate::test_support::capture();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = stream.shutdown().await;
+        });
+        let (endpoint, secret) = client(format!("{address}/private-timeout-path"));
+        let error = connect_with_timeout(&endpoint, &secret, Duration::from_millis(20))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::Transport);
+        assert!(!log.contains(TEST_SECRET));
+        assert!(!log.contains("private-timeout-path"));
+        assert!(log.contains("timeout_ms"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stream_error_diagnostic_omits_secret_and_path() {
+        let (log, _guard) = crate::test_support::capture();
+        let (mut connection, server) =
+            connection_for_single_message(Message::Binary(vec![1].into())).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), connection.receive_text())
+                .await
+                .unwrap()
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ProtocolError
+        );
+        assert!(!log.contains(TEST_SECRET));
+        server.await.unwrap();
     }
 
     #[test]
