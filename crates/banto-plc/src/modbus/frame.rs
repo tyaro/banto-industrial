@@ -7,13 +7,46 @@
 //! trade-off is made again for MELSEC MC/SLMP when I2 continues into that
 //! protocol.
 //!
-//! `pub(crate)` throughout: `modbus/mod.rs` (the client, encodes requests /
-//! decodes responses) and, under the `simulator` feature, `modbus/simulator.rs`
-//! (the test double, does the mirror image - decodes requests / encodes
-//! responses) both live in this module tree and share these functions, which
-//! is also what keeps the simulator's framing honest - it is built from the
-//! same primitives as the real client rather than a hand-rolled duplicate
-//! that could silently drift.
+//! `pub(crate)` for most of this module: `modbus/mod.rs` (the client, encodes
+//! requests / decodes responses) and, under the `simulator` feature,
+//! `modbus/simulator.rs` (the test double, does the mirror image - decodes
+//! requests / encodes responses) both live in this module tree and share
+//! these functions, which is also what keeps the simulator's framing honest -
+//! it is built from the same primitives as the real client rather than a
+//! hand-rolled duplicate that could silently drift.
+//!
+//! ## What is `pub` instead, and why (2026-09-01, #131 前半スライス)
+//!
+//! [`build_request_frame`], [`wrap_mbap`], [`parse_mbap_header`]/[`MbapHeader`],
+//! [`MBAP_HEADER_LEN`], [`exception_message`] and the byte-packing helpers
+//! [`encode_bits_payload`]/[`encode_registers_payload`] are `pub` so
+//! `banto-plc-write` (I5, a separate crate) can build and parse Modbus TCP
+//! write frames (FC5/6/15/16) without re-deriving MBAP framing from the spec
+//! a second time - the exact duplication H9
+//! (docs/h9-slmp-structured-error-spec.md) had to clean up after (three
+//! copies of SLMP's connect/dial sequence). This crate stays read-only itself
+//! (see this crate's `lib.rs` - "no write method, on purpose"); exposing
+//! these eight items only lets another crate speak the same *wire format*,
+//! which is protocol trivia (byte layout), not a read/write policy decision.
+//!
+//! This is deliberately a **narrower** set than "make the whole module
+//! `pub`": [`FC_READ_*`] stay `pub(crate)` (a write client defines its own
+//! FC5/6/15/16 constants - reusing this module's read-only FC list for a
+//! write would be actively confusing), and [`ParsedResponse`]/
+//! [`parse_response_pdu`] stay `pub(crate)` too - their PDU shape assumes a
+//! **read** response (`byte_count` + data), which does not describe a write
+//! response at all (FC5/6/15/16 always echo back `function + 2 words`, no
+//! byte-count field - see the Modbus Application Protocol spec §6.5-6.8,
+//! 6.11-6.12). `banto-plc-write` parses its own echo shape instead of forcing
+//! a mismatched shape through this function.
+//!
+//! [`build_request_frame`] is reused as-is for FC5/FC6 (write single coil/
+//! register) despite its name: its PDU shape - `function + u16 + u16` - is
+//! *byte-for-byte* identical to a single-write request (`function` +
+//! address + value, both 16-bit big-endian fields), so `banto-plc-write`
+//! calls it with the write target's value in the `count` parameter's place.
+//! See that crate's own doc comment at the call site for why this is a
+//! genuine shape reuse rather than a misuse.
 
 use crate::address::AddressArea;
 use crate::error::PlcError;
@@ -25,12 +58,16 @@ pub(crate) const FC_READ_INPUT_REGISTERS: u8 = 0x04;
 
 /// The exception-response bit (Modbus Application Protocol spec §7): a
 /// response function code with this bit set means "the request failed, the
-/// next byte is an exception code" rather than "here is your data".
-const EXCEPTION_FLAG: u8 = 0x80;
+/// next byte is an exception code" rather than "here is your data". `pub`
+/// (2026-09-01, #131) so `banto-plc-write` can recognize an exception
+/// response in its own write-echo parser without re-deriving this from the
+/// spec a second time.
+pub const EXCEPTION_FLAG: u8 = 0x80;
 
 /// MBAP header size in bytes: transaction id (2) + protocol id (2) + length
-/// (2) + unit id (1).
-pub(crate) const MBAP_HEADER_LEN: usize = 7;
+/// (2) + unit id (1). `pub` (2026-09-01, #131) - see this module's doc
+/// comment.
+pub const MBAP_HEADER_LEN: usize = 7;
 
 pub(crate) fn function_code_for(area: AddressArea) -> u8 {
     match area {
@@ -43,8 +80,11 @@ pub(crate) fn function_code_for(area: AddressArea) -> u8 {
 
 /// Human-readable text for a Modbus exception code (Modbus Application
 /// Protocol spec §7, standard codes only - device-specific codes outside
-/// this table still surface, just with a generic message).
-pub(crate) fn exception_message(code: u8) -> &'static str {
+/// this table still surface, just with a generic message). `pub` (2026-09-01,
+/// #131) so `banto-plc-write`'s `PlcWriteError::ModbusException` gets the
+/// identical wording the read side's `PlcError::ModbusException` uses,
+/// rather than a second, possibly-drifting copy of this table.
+pub fn exception_message(code: u8) -> &'static str {
     match code {
         0x01 => "不正なファンクションコード",
         0x02 => "不正なデータアドレス",
@@ -61,8 +101,10 @@ pub(crate) fn exception_message(code: u8) -> &'static str {
 
 /// Build a complete request frame (MBAP header + PDU) for a "read N
 /// elements starting at `start_offset`" call - the same PDU shape for all
-/// four read function codes, only `function` differs.
-pub(crate) fn build_request_frame(
+/// four read function codes, only `function` differs. `pub` (2026-09-01,
+/// #131) - see this module's doc comment for why `banto-plc-write` also
+/// calls this, unmodified, for FC5/FC6 single writes.
+pub fn build_request_frame(
     transaction_id: u16,
     unit_id: u8,
     function: u8,
@@ -105,11 +147,14 @@ pub(crate) fn build_exception_response_frame(
     wrap_mbap(transaction_id, unit_id, &pdu)
 }
 
-/// Pack coil/discrete-input values into Modbus's response byte layout: bit 0
-/// of the first byte is the first element, LSB-first, remaining bits of the
-/// final byte zero-padded (Modbus Application Protocol spec §6.1).
-#[cfg_attr(not(any(test, feature = "simulator")), allow(dead_code))]
-pub(crate) fn encode_bits_payload(bits: &[bool]) -> Vec<u8> {
+/// Pack coil/discrete-input values into Modbus's byte layout: bit 0 of the
+/// first byte is the first element, LSB-first, remaining bits of the final
+/// byte zero-padded (Modbus Application Protocol spec §6.1). Used for FC1/2
+/// *response* payloads here (by the test simulator) and, identically, for an
+/// FC15 (write multiple coils) *request* payload by `banto-plc-write` - the
+/// two are the same on-wire bit packing, just read in different directions.
+/// `pub` (2026-09-01, #131) - see this module's doc comment.
+pub fn encode_bits_payload(bits: &[bool]) -> Vec<u8> {
     let byte_len = bits.len().div_ceil(8);
     let mut out = vec![0u8; byte_len];
     for (i, &bit) in bits.iter().enumerate() {
@@ -120,10 +165,12 @@ pub(crate) fn encode_bits_payload(bits: &[bool]) -> Vec<u8> {
     out
 }
 
-/// Pack register values into Modbus's response byte layout: each register
-/// big-endian, in order.
-#[cfg_attr(not(any(test, feature = "simulator")), allow(dead_code))]
-pub(crate) fn encode_registers_payload(regs: &[u16]) -> Vec<u8> {
+/// Pack register values into Modbus's byte layout: each register big-endian,
+/// in order. Used for FC3/4 *response* payloads here (by the test simulator)
+/// and, identically, for an FC16 (write multiple registers) *request*
+/// payload by `banto-plc-write`. `pub` (2026-09-01, #131) - see this module's
+/// doc comment.
+pub fn encode_registers_payload(regs: &[u16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(regs.len() * 2);
     for r in regs {
         out.extend_from_slice(&r.to_be_bytes());
@@ -131,7 +178,11 @@ pub(crate) fn encode_registers_payload(regs: &[u16]) -> Vec<u8> {
     out
 }
 
-fn wrap_mbap(transaction_id: u16, unit_id: u8, pdu: &[u8]) -> Vec<u8> {
+/// `pub` (2026-09-01, #131) - the one piece `banto-plc-write` needs to frame
+/// its own FC15/FC16 (multiple coils/registers) request PDUs, which have a
+/// byte-count-plus-data shape [`build_request_frame`] does not produce. See
+/// this module's doc comment.
+pub fn wrap_mbap(transaction_id: u16, unit_id: u8, pdu: &[u8]) -> Vec<u8> {
     let mut frame = Vec::with_capacity(MBAP_HEADER_LEN + pdu.len());
     frame.extend_from_slice(&transaction_id.to_be_bytes());
     frame.extend_from_slice(&0u16.to_be_bytes()); // protocol id, always 0 for Modbus
@@ -146,14 +197,17 @@ fn wrap_mbap(transaction_id: u16, unit_id: u8, pdu: &[u8]) -> Vec<u8> {
 /// separately - see `modbus/mod.rs`'s `execute_one` for the two-phase
 /// `read_exact` this enables (fixed 7-byte header, then a PDU sized from the
 /// header's `length` field).
+/// `pub` (2026-09-01, #131) - `banto-plc-write` needs this to do the same
+/// two-phase `read_exact` (fixed header, then a PDU sized from `length`) as
+/// this crate's own read client. See this module's doc comment.
 #[derive(Debug)]
-pub(crate) struct MbapHeader {
+pub struct MbapHeader {
     pub transaction_id: u16,
     pub length: u16,
     pub unit_id: u8,
 }
 
-pub(crate) fn parse_mbap_header(buf: &[u8; MBAP_HEADER_LEN]) -> Result<MbapHeader, PlcError> {
+pub fn parse_mbap_header(buf: &[u8; MBAP_HEADER_LEN]) -> Result<MbapHeader, PlcError> {
     let transaction_id = u16::from_be_bytes([buf[0], buf[1]]);
     let protocol_id = u16::from_be_bytes([buf[2], buf[3]]);
     if protocol_id != 0 {

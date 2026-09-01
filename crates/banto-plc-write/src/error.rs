@@ -123,6 +123,42 @@ pub enum PlcWriteError {
     #[error("PLC異常応答: SLMP終了コード=0x{code:04X} ({message})")]
     SlmpEndCode { code: u16, message: String },
 
+    /// #131 (2026-09-01): a [`crate::types::WriteRequest`] targets a Modbus
+    /// address in DiscreteInput (`1xxxx`) or InputRegister (`3xxxx`) - both
+    /// read-only by Modbus wire protocol, permanently, for every
+    /// implementation (see `banto-tags::tag`'s `validate_tag_input` doc
+    /// comment for the registry-side half of this same 2026-09-01 owner
+    /// decision, docs/tag-server-design.md §6 決定A). Resolved by
+    /// [`crate::modbus::planning::plan_modbus_writes`] before any wire
+    /// traffic - a per-request `Bad`, never a whole-batch `Err`, exactly like
+    /// [`Self::UnsupportedCombination`]. Kept as its own variant rather than
+    /// folded into `UnsupportedCombination` because the reason has nothing to
+    /// do with `data_type`: unlike a bit-at-a-word-device mismatch, *no*
+    /// `data_type` would make a DiscreteInput/InputRegister address writable.
+    #[error("{area} は Modbus 仕様上の読み取り専用領域のため書き込めません")]
+    ModbusReadOnlyArea { area: String },
+
+    /// The PLC answered a Modbus write with a well-formed exception response
+    /// (function code with the high bit set + a 1-byte exception code) - e.g.
+    /// "illegal data address" because a tag's address does not exist on this
+    /// device. The write analogue of `banto_plc::PlcError::ModbusException`,
+    /// and non-fatal for the identical reason: the byte stream is still in
+    /// sync (a complete, well-formed response was received, it just carries
+    /// an error code instead of an ack), so this is exactly the "individual
+    /// error" [`Self::is_connection_fatal`]'s per-request bucket exists for -
+    /// **not** connection-fatal, unlike every genuine framing/timeout/socket
+    /// failure above. Getting this backwards would mean every ordinary
+    /// device-side refusal (e.g. a write to a protected register) forces a
+    /// reconnect instead of just failing that one request - see this crate's
+    /// module-level write-driver doc and docs/tag-server-design.md §6 for why
+    /// the broker relies on this exact line.
+    #[error("PLC異常応答: function=0x{function:02x} code=0x{code:02x} ({message})")]
+    ModbusException {
+        function: u8,
+        code: u8,
+        message: String,
+    },
+
     /// T8 (docs/tag-server-design.md §6.1): two `BitInWord` requests in the
     /// same batch target the same bit of the same word with conflicting
     /// values (one `true`, one `false`). RMW cannot satisfy both, and
@@ -175,6 +211,16 @@ impl PlcWriteError {
     /// which by construction only occurs *after* a complete, successful RMW
     /// read/write/confirm cycle - the connection is unquestionably fine, only
     /// the PLC-side race the confirmation read exists to catch happened).
+    /// #131 (2026-09-01) adds two more Modbus-specific exclusions:
+    /// [`Self::ModbusReadOnlyArea`] (a configuration error resolved before any
+    /// wire traffic, like `UnsupportedCombination`) and
+    /// [`Self::ModbusException`] (a device-side exception response - the
+    /// Modbus twin of `SlmpEndCode`, same "complete, well-formed answer"
+    /// reasoning). Getting `ModbusException` wrong here is the one mistake
+    /// this whole switch exists to prevent for #131: a broker that treated an
+    /// ordinary device refusal as connection-fatal would drop and reconnect
+    /// the session on every single write rejection instead of just failing
+    /// that one write.
     pub fn is_connection_fatal(&self) -> bool {
         !matches!(
             self,
@@ -186,6 +232,8 @@ impl PlcWriteError {
                 | PlcWriteError::StringSpanUnsupported { .. }
                 | PlcWriteError::ConflictingBitWrite { .. }
                 | PlcWriteError::BitWriteVerificationFailed { .. }
+                | PlcWriteError::ModbusReadOnlyArea { .. }
+                | PlcWriteError::ModbusException { .. }
         )
     }
 }
@@ -233,6 +281,14 @@ mod tests {
             PlcWriteError::BitWriteVerificationFailed {
                 area: "D100".to_string(),
                 bit: 5,
+            },
+            PlcWriteError::ModbusReadOnlyArea {
+                area: "discrete input（1xxxx）".to_string(),
+            },
+            PlcWriteError::ModbusException {
+                function: 0x06,
+                code: 0x02,
+                message: "illegal data address".to_string(),
             },
         ];
         for err in per_request {

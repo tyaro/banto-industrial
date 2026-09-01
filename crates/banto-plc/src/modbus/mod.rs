@@ -26,7 +26,12 @@
 //!   again before the next `read_batch` call. Per docs/plan.md I2 §2, this
 //!   crate does not retry/reconnect on its own; that loop is I3's.
 
-mod frame;
+// `pub` (2026-09-01, #131): `banto-plc-write` needs a handful of items from
+// here (MBAP framing, not the read-only FC1-4 semantics) - see `frame`'s own
+// module doc for exactly which items and why. The module path itself being
+// public does not widen anything by itself; each item still opts in to `pub`
+// individually inside `frame.rs`.
+pub mod frame;
 #[cfg(test)]
 mod integration_tests;
 #[cfg(any(test, feature = "simulator"))]

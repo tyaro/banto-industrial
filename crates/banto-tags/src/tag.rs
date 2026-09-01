@@ -296,12 +296,59 @@ fn validate_thresholds(
     Ok(())
 }
 
+/// If `address` is unmistakably a Modbus reference number
+/// (`banto_plc::address::Address::parse`'s notation, I2 §3) in a read-only
+/// area, names that area for the 2026-09-01 owner-decision-A check in
+/// [`validate_tag_input`] above. `None` otherwise - either the address is not
+/// in Modbus reference-number notation at all, or it is (`0xxxx`/`4xxxx`,
+/// Coil/HoldingRegister - both writable areas).
+///
+/// Deliberately **not** a call into `banto-plc::address::Address::parse`:
+/// that would make I1 (this crate) depend on I2 for something I2's own
+/// module doc says is deliberately I2's job, not I1's (see
+/// `crates/banto-plc/src/address.rs`'s module doc - "`Tag::address` column is
+/// free-text precisely because this crate, not I1, owns the format"), and
+/// would drag banto-plc's tokio/slmp/encoding_rs dependency stack into the
+/// registry crate for a two-branch prefix check. So this reproduces only the
+/// "digit count + leading digit selects the area" fragment of that parser's
+/// grammar - not the numeric-range check, not the bit-suffix semantics, not
+/// error reporting. That narrow duplication is fine (unlike the frame-level
+/// duplication H9 fixed): the full address is still validated by I2 whenever
+/// it is actually used for I/O, so a wrong verdict here can only be a false
+/// negative on a *malformed* address (e.g. digits out of the 1..=65536
+/// range), which I2 will reject anyway before it is ever read or written -
+/// it can never be a false positive that blocks a legitimately-writable
+/// address, because every SLMP device mnemonic starts with a letter
+/// (`crates/banto-plc/src/slmp/address.rs`'s device table), so a plain 5-6
+/// digit string can never be a valid address under any *other* protocol this
+/// system supports either. That is also why no connection/protocol lookup is
+/// needed here (contrast [`validate_tag_kind_placement`] below, which does
+/// need one): the read-only-ness this function detects is a property of the
+/// address text alone, independent of which connection the tag ends up on.
+fn modbus_read_only_area(address: &str) -> Option<&'static str> {
+    // Strip an optional T8 bit-in-word suffix (`"30001.5"`) the same way
+    // `Address::parse` does - only the base reference number selects the
+    // area, and a bit suffix on Coil/DiscreteInput is already rejected by I2
+    // as invalid, not our concern here.
+    let base = address.split_once('.').map_or(address, |(base, _)| base);
+    let len = base.chars().count();
+    if (len != 5 && len != 6) || !base.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    match base.chars().next() {
+        Some('1') => Some("discrete input（1xxxx）"),
+        Some('3') => Some("input register（3xxxx）"),
+        _ => None,
+    }
+}
+
 /// Validate a [`TagInput`], collecting every violation (mirrors
 /// `items::validate_item_input`'s "report everything, not just the first"
 /// convention in the banto template repo). On success, returns the trimmed
 /// `name`/`address` and normalized `unit` for the caller to bind directly.
 ///
-/// **`writable` gets no validation here beyond accepting the bool as-is.**
+/// **`writable` gets no validation here beyond accepting the bool as-is -
+/// with one exception (2026-09-01 オーナー決定 A, below).**
 /// Design §6 item 1 makes `writable` a per-tag opt-in, and item 7 restricts
 /// which *connections* can actually be targeted for a write ("writable に
 /// できるのは SLMP 接続配下のタグのみ"). That second rule is deliberately NOT
@@ -315,6 +362,31 @@ fn validate_thresholds(
 /// reject or warn on `writable` + non-SLMP without I1 having to know the
 /// write stack's protocol coverage at all - keeping the two concerns (row
 /// validity vs. write-path capability) from being entangled in one crate.
+///
+/// **The exception (2026-09-01 オーナー決定 A, docs/tag-server-design.md §6):
+/// a Modbus DiscreteInput/InputRegister address IS checked here**, and
+/// `writable = true` on one is rejected at registration. This does not
+/// contradict the reasoning above - it is a different kind of fact:
+/// "does the write stack currently support this protocol" (the paragraph
+/// above) is a *temporary* capability gap that `#131` closes, and stays the
+/// app layer's (`write_path.rs`) call. Whether `1xxxx`/`3xxxx` is writable at
+/// all is not a capability gap that any write stack will ever close - it is
+/// a *permanent* property of the Modbus address space itself (DiscreteInput/
+/// InputRegister are read-only by wire protocol, full stop), so it is
+/// exactly the same kind of fact as "is this address non-empty" or "is this
+/// number in range" - i.e. squarely "is this row well-formed", which this
+/// function already owns. See [`modbus_read_only_area`] for why this check
+/// needs no protocol/connection lookup (and so can live in this synchronous,
+/// DB-free function) despite address *format* otherwise being I2's concern.
+///
+/// **Existing rows are not migrated.** A `writable` tag already sitting on a
+/// `1xxxx`/`3xxxx` address predates this check and stays as-is; the write
+/// path (T2-4) already rejects any Modbus tag's write attempt outright
+/// (design §6 item 7 - Modbus has no write stack wired in yet), so a
+/// pre-existing bad row causes no real write to happen today. Only new
+/// create/update *inputs* are checked (see [`TagService::create`]/
+/// [`TagService::update`]) - there is no backfill migration scrubbing
+/// existing `tags` rows.
 fn validate_tag_input(input: &TagInput) -> Result<ValidatedTag, BantoError> {
     let mut errors: Vec<FieldError> = Vec::new();
 
@@ -385,6 +457,23 @@ fn validate_tag_input(input: &TagInput) -> Result<ValidatedTag, BantoError> {
                     field: "expression".to_string(),
                     message: "plc タグには expression を設定できません".to_string(),
                 });
+            }
+            // 2026-09-01 オーナー決定A (docs/tag-server-design.md §6): Modbus
+            // の DiscreteInput(1xxxx)/InputRegister(3xxxx) は仕様上ずっと
+            // 読み取り専用 - どんな書き込みスタックを実装しても書けないので、
+            // writable との組み合わせを登録時に拒否する。エラーは
+            // `writable` 側に付ける（`computed` タグの場合と同じ流儀 - 問題は
+            // address ではなく、その address に対して writable を立てたこと）。
+            if input.writable {
+                if let Some(area) = modbus_read_only_area(trimmed_address) {
+                    errors.push(FieldError {
+                        field: "writable".to_string(),
+                        message: format!(
+                            "{area} は Modbus 仕様上の読み取り専用領域のため \
+                             writable にできません"
+                        ),
+                    });
+                }
             }
         }
         COMPUTED_TAG_KIND => {
@@ -2987,6 +3076,109 @@ mod tests {
             }
             other => panic!("expected Validation, got {other:?}"),
         }
+    }
+
+    // --- 2026-09-01 オーナー決定A: Modbus 読み取り専用領域への writable 拒否 --
+
+    /// `1xxxx`(DiscreteInput) は Modbus 仕様上ずっと読み取り専用 - #131 で
+    /// 書き込みスタックが実装されても書けるようにはならないので、登録時に
+    /// 拒否する（docs/tag-server-design.md §6 決定A）。
+    #[tokio::test]
+    async fn create_rejects_writable_discrete_input() {
+        let (svc, group_id) = setup().await;
+        let mut input = sample_input("DI1", group_id);
+        input.address = "10001".to_string();
+        input.data_type = "bit".to_string();
+        input.writable = true;
+        let err = svc.create(input).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "writable");
+                assert!(field_errors[0].message.contains("discrete input"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// `3xxxx`(InputRegister) も同じ理由で読み取り専用。
+    #[tokio::test]
+    async fn create_rejects_writable_input_register() {
+        let (svc, group_id) = setup().await;
+        let mut input = sample_input("IR1", group_id);
+        input.address = "30001".to_string();
+        input.writable = true;
+        let err = svc.create(input).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "writable");
+                assert!(field_errors[0].message.contains("input register"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// The other two Modbus areas (`0xxxx` Coil / `4xxxx` HoldingRegister)
+    /// stay writable - only DiscreteInput/InputRegister are read-only by
+    /// wire protocol. `sample_input`'s default address is already `40001`
+    /// (HoldingRegister), so this pins that the T2-era round trip
+    /// (`create_then_get_round_trips_writable_and_kind_columns`) is not
+    /// accidentally affected by this new check.
+    #[tokio::test]
+    async fn create_allows_writable_coil_and_holding_register() {
+        let (svc, group_id) = setup().await;
+
+        let mut coil = sample_input("Coil1", group_id);
+        coil.address = "00001".to_string();
+        coil.data_type = "bit".to_string();
+        coil.writable = true;
+        assert!(svc.create(coil).await.unwrap().writable);
+
+        let mut holding = sample_input("HR1", group_id);
+        holding.address = "40001".to_string();
+        holding.writable = true;
+        assert!(svc.create(holding).await.unwrap().writable);
+    }
+
+    /// A non-writable tag on a read-only area is unaffected - the check only
+    /// fires on the `writable` + read-only-area *combination*, matching the
+    /// "well-formed row today, not yet writable" framing used for the
+    /// protocol-coverage exception in this module's other doc comment.
+    #[tokio::test]
+    async fn create_allows_non_writable_discrete_input() {
+        let (svc, group_id) = setup().await;
+        let mut input = sample_input("DI2", group_id);
+        input.address = "10001".to_string();
+        input.data_type = "bit".to_string();
+        input.writable = false;
+        assert!(!svc.create(input).await.unwrap().writable);
+    }
+
+    /// Direct unit coverage of the address-shape helper: only a 5/6-digit
+    /// all-numeric reference number starting with `1`/`3` counts, matching
+    /// `banto_plc::address::Address::parse`'s own grammar for those two
+    /// prefixes (see this function's doc comment on why the rest of that
+    /// grammar - range checks, bit-suffix rules - is deliberately not
+    /// reproduced here).
+    #[test]
+    fn modbus_read_only_area_matches_only_the_two_readonly_prefixes() {
+        assert_eq!(
+            modbus_read_only_area("10001"),
+            Some("discrete input（1xxxx）")
+        );
+        assert_eq!(
+            modbus_read_only_area("30001"),
+            Some("input register（3xxxx）")
+        );
+        assert_eq!(modbus_read_only_area("410000"), None); // 6-digit HoldingRegister
+        assert_eq!(modbus_read_only_area("00001"), None); // Coil
+        assert_eq!(modbus_read_only_area("40001"), None); // HoldingRegister
+        assert_eq!(
+            modbus_read_only_area("30001.5"),
+            Some("input register（3xxxx）")
+        ); // bit-in-word suffix stripped first
+        assert_eq!(modbus_read_only_area("D100"), None); // SLMP, not digit-only
+        assert_eq!(modbus_read_only_area(""), None);
+        assert_eq!(modbus_read_only_area("1000"), None); // too short (4 digits)
     }
 
     /// `string` data type makes no sense for a computed/internal tag (their
