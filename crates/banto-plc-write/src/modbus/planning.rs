@@ -37,7 +37,7 @@
 //! ## Quantity limits differ from the read side - do not reuse its constants
 //!
 //! [`MAX_WRITE_REGISTERS`]/[`MAX_WRITE_COILS`] are the Modbus **write** caps
-//! (FC16: 123 registers: FC15: 1968 coils), not
+//! (FC16: 123 registers / FC15: 1968 coils), not
 //! `banto_plc::planning::MAX_REGISTERS_PER_READ`/`MAX_COILS_PER_READ` (125/
 //! 2000), which are the **read** caps (FC3/4: 125 registers, FC1/2: 2000
 //! coils) bound by a different rule (the response payload, which carries
