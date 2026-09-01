@@ -42,6 +42,17 @@
 //!   standalone, owns-its-socket form) plus [`slmp::plan_slmp_writes`] and
 //!   [`slmp::execute_slmp_writes`], the pure-planner / borrowed-client pair the
 //!   W3 broker calls to write over its *shared* single-session-per-CPU socket.
+//! - [`modbus`]: the Modbus TCP implementation (#131 前半スライス, FC5/6/15/16),
+//!   [`ModbusWriteClient`] (standalone) plus
+//!   [`modbus::planning::plan_modbus_writes`] and [`execute_modbus_writes`],
+//!   the same pure-planner / borrowed-stream split as `slmp`, kept symmetric
+//!   so a future broker caller can plug in the same way once Modbus
+//!   connections join broker management (#130's follow-up - **not** wired
+//!   into `banto-broker` by this slice; see `modbus`'s module doc). Modbus
+//!   writes are therefore encode-and-execute-ready but still unreachable from
+//!   any tag write today - the app layer (`apps/banto-hub`'s
+//!   `write_path.rs`) continues to reject a Modbus tag's write outright until
+//!   #130 lands (docs/tag-server-design.md §6 item 7).
 //!
 //! ## T8: bit-in-word writes (docs/tag-server-design.md §6.1, 2026-08-06)
 //!
@@ -60,11 +71,14 @@
 pub mod client;
 pub mod encode;
 pub mod error;
+pub mod modbus;
 pub mod slmp;
 pub mod types;
 
 pub use client::PlcWriteClient;
 pub use error::PlcWriteError;
+pub use modbus::planning::{plan_modbus_writes, ModbusPlannedWrite, ModbusWritePlanOutcome};
+pub use modbus::{execute_modbus_writes, ModbusWriteClient};
 pub use slmp::planning::{
     plan_slmp_write_batch, plan_slmp_writes, BitWriteMapping, SlmpPlannedBitWrite,
     SlmpPlannedWrite, SlmpWritePlanOutcome, WritePayload,

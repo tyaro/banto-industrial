@@ -29,13 +29,18 @@ slmp = { workspace = true }
 # writes (`encode.rs::encode_string_value`). Same version the `slmp` crate
 # uses - see the workspace Cargo.toml note on why its PLCString is not reused.
 encoding_rs = { workspace = true }
-# Only the pieces this crate's own code touches: TCP connect/response timeouts
-# (`time`). Frame I/O happens inside the wrapped `slmp` crate, not here. No
-# "rt"/"macros" - this crate never spawns tasks or defines its own runtime;
-# that is the consuming app's (or the tests') job. (Cargo feature-unification
-# still hands this crate full tokio via `slmp`'s own `features = ["full"]`, same
-# as banto-plc - the narrow list is a statement of what this crate's code uses.)
-tokio = { workspace = true, features = ["time"] }
+# TCP connect/response timeouts (`time`), plus (2026-09-01, #131) `net`/
+# `io-util`: the SLMP side's frame I/O happens inside the wrapped `slmp`
+# crate, but Modbus has no such wrapped crate (same reason banto-plc
+# hand-rolls Modbus framing itself - see `banto-plc/src/modbus/frame.rs`), so
+# `modbus::ModbusWriteClient` owns a raw `tokio::net::TcpStream` and drives it
+# with `AsyncReadExt`/`AsyncWriteExt` exactly like `banto_plc::ModbusTcpClient`
+# does for reads. No "rt"/"macros" - this crate never spawns tasks or defines
+# its own runtime; that is the consuming app's (or the tests') job. (Cargo
+# feature-unification still hands this crate full tokio via `slmp`'s own
+# `features = ["full"]`, same as banto-plc - the narrow list is a statement of
+# what this crate's code uses.)
+tokio = { workspace = true, features = ["net", "time", "io-util"] }
 
 # Exposes the in-process SLMP read+write simulator beyond this crate's own tests,
 # so W3's engine integration tests can drive writes-then-read-back against a fake
@@ -46,4 +51,6 @@ tokio = { workspace = true, features = ["time"] }
 simulator = ["tokio/rt"]
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
+# "net"/"time"/"io-util" already come from the base dependency above (2026-09-01,
+# #131) - only "rt-multi-thread"/"macros" are test-only (`#[tokio::test]`).
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
