@@ -85,6 +85,23 @@
 //! [`EngineControl::monitor_read`] / [`EngineControl::monitor_write`] carry
 //! raw batch requests for callers (tests) that already resolved the wire
 //! shape.
+//!
+//! ## SLMP-only is THIS module's own product-scope decision, not a broker
+//! limitation
+//!
+//! `banto-broker` gained a `"modbus-tcp"` driver (Issue #131, 2026-09-01) and
+//! serves Modbus reads/writes through `SessionDirectory::ensure_connection`
+//! just fine - the broker itself no longer rejects a non-SLMP connection.
+//! Every public entry point below (`monitor_read`, `monitor_write`,
+//! `monitor_group_read`, and transitively `monitor_tag_write`) therefore
+//! calls [`require_slmp`] itself, mirroring `engine::mod`'s own
+//! `SLMP_PROTOCOL` filter on `Engine::start`'s managed-connection set. This
+//! exists purely because relay-wright's タグモニタ - a MANUAL WRITE surface -
+//! has never been reviewed or designed for anything but SLMP; extending it to
+//! Modbus is a separate, unreviewed product decision that Issue #131's
+//! banto-hub-only scope does not authorize. A reader wondering "why does the
+//! monitor reject Modbus" should stop here, not go looking at the broker (it
+//! already supports Modbus and will not explain this rejection).
 
 use banto_core::{BantoError, FieldError};
 use banto_plc::{Address, BatchReadRequest, BatchReadResult, PlcValue, TagValue};
@@ -221,12 +238,36 @@ fn validation_error(message: String) -> BantoError {
     }
 }
 
+/// relay-wright's own SLMP-only product-scope gate for the tag monitor -
+/// mirrors `engine::mod`'s `SLMP_PROTOCOL` filter on `Engine::start`'s
+/// managed-connection set (the `let keep = c.protocol == SLMP_PROTOCOL;`
+/// line). This is NOT a broker limitation - `banto-broker` gained a
+/// `"modbus-tcp"` driver in Issue #131 (2026-09-01) and serves Modbus reads/
+/// writes through `SessionDirectory::ensure_connection` just fine today. This
+/// check exists purely because relay-wright itself has never been reviewed or
+/// designed for anything but SLMP (the engine's own rule evaluation already
+/// skips non-SLMP connections outright); extending the tag monitor - a MANUAL
+/// WRITE surface - to Modbus is a separate, unreviewed product decision that
+/// Issue #131's banto-hub-only scope does not authorize. If relay-wright ever
+/// does add Modbus support, this is the gate (and `engine::mod`'s matching
+/// one) to remove together - do not let one drift ahead of the other.
+fn require_slmp(connection: &PlcConnection) -> Result<(), BantoError> {
+    if connection.protocol != super::SLMP_PROTOCOL {
+        return Err(BantoError::Other(format!(
+            "タグモニタは SLMP 接続のみ対応です(接続 {} は protocol={}, relay-wright は現時点で他プロトコルに未対応)",
+            connection.id, connection.protocol
+        )));
+    }
+    Ok(())
+}
+
 impl EngineControl {
     /// Low-level monitor read: resolve `connection_id` in the registry,
     /// ensure its broker session (spawning one on demand - see the module
     /// doc), and read `requests` through it via a [`super::ReadOnlyHandle`].
-    /// Non-SLMP connections are rejected with the broker's
-    /// `UnsupportedProtocol` error.
+    /// Non-SLMP connections are rejected by [`require_slmp`] - relay-wright's
+    /// own product-scope gate (module doc's "SLMP-only" note), not a broker
+    /// constraint (the broker itself accepts Modbus TCP as of Issue #131).
     pub async fn monitor_read(
         &self,
         connection_id: i64,
@@ -235,6 +276,7 @@ impl EngineControl {
         let connection = PlcConnectionService::new(self.pool.clone())
             .get(connection_id)
             .await?;
+        require_slmp(&connection)?;
         let handle = self
             .sessions
             .ensure_connection(&connection)
@@ -324,6 +366,15 @@ impl EngineControl {
         // mid-write still leaves evidence a write was in flight.
         let audit_id = insert_row(&self.pool, &row).await?;
 
+        // relay-wright's own SLMP-only gate (module doc): checked here, AFTER
+        // the audit row above, so a rejected write to a non-SLMP connection
+        // leaves the same `failed` audit trail it did back when the broker
+        // itself rejected the connection at `ensure_connection` (this used to
+        // be an implicit side effect of that broker-level rejection; now that
+        // the broker accepts Modbus TCP too, `require_slmp` reproduces it
+        // explicitly, at the same point in the sequence).
+        require_slmp(connection)?;
+
         let handle = self
             .sessions
             .ensure_connection(connection)
@@ -352,7 +403,8 @@ impl EngineControl {
     /// whole-connection failure (session down) all degrade to per-tag
     /// `quality: "bad"` entries - the monitor keeps rendering. Only a
     /// missing group/connection or a non-SLMP connection is a call-level
-    /// error.
+    /// error - the latter via [`require_slmp`], relay-wright's own
+    /// product-scope gate (module doc), not a broker-level rejection.
     pub async fn monitor_group_read(
         &self,
         collection_group_id: i64,
@@ -372,6 +424,7 @@ impl EngineControl {
         let connection = PlcConnectionService::new(self.pool.clone())
             .get(connection_id)
             .await?;
+        require_slmp(&connection)?;
 
         let rows: Vec<TagRow> = sqlx::query_as(
             "SELECT id, name, address, data_type, string_length, \
