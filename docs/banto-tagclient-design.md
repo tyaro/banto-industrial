@@ -1,7 +1,11 @@
 # banto-tagclient 設計
 
 作成日: 2026-08-29
-状態: **S4a・W1完了（2026-09-01）**。S1bのREST catalog/values transport、S2aの
+状態: **S4a・W1完了（2026-09-01）、S4統合ゲート1〜4完了（2026-09-02、§7.1）**。
+S4統合ゲートの5項目（本書§7冒頭）のうち、依存グラフ・license/保守状況・Windows配布
+バイナリ増分・workspace feature整合の実測（1〜4）は完了した。**5（Hubのrelease tag
+または互換commitへの固定方法）はオーナー決定待ちで未完**であり、S4自体はまだ
+完了していない。S1bのREST catalog/values transport、S2aの
 Hub WS wire純粋解析・bounded pending map・latest-wins publish gate・非LIVE current抑止に加え、
 S2b-1の認証付きWebSocket handshake、S2b-2aのon_change subscribe送信と1フレーム受信、
 S2b-2bのcrate-private単一世代worker・tokio watchによるlatest snapshot配信・atomic publishを
@@ -414,6 +418,162 @@ featureを有効化し、公開Handleだけがworkerをspawnする。新規packa
 W1（書き込み）は新規依存を追加していない。POST bodyは既存の`serde_json`で手組みし
 （`reqwest`の`json` featureは有効化していない - `default-features = false`のまま）、
 既存の`reqwest::Client`/`Endpoint`/`SecretApiKey`を再利用する。`Cargo.lock`に増分はない。
+
+### 7.1 S4統合ゲート 1〜4 の実測結果（2026-09-02）
+
+Issue #123 S4のレビューゲート（本節冒頭の5項目）のうち、1〜4を実測した。
+5（Hubのrelease tagまたは互換commitへの固定方法）はオーナー決定待ちで本節では扱わない。
+
+計測条件: `main`（`41352d9`）から作業ブランチを切った状態、`cargo build --release`
+（workspace既定プロファイル、`opt-level`等の上書きなし）、Windows/MSVCターゲット。
+`banto-tagclient`を依存に持つアプリは本計測時点で存在しない（`cargo tree -i banto-tagclient`
+で確認済み）。
+
+#### 1. `Cargo.lock`増分と依存グラフ
+
+`cargo tree -p banto-tagclient -e normal --prefix none`で列挙した全依存（`banto-tagclient`
+自身を含め106パッケージ、重複除去後）と、workspaceの他の全メンバー
+（`banto-tags`/`banto-plc`/`banto-plc-write`/`banto-tstore`/`banto-collect`/
+`banto-tsquery`/`banto-broker`/`banto-expr`/`banto-rtsp`/`chronogazer-core`/`chronogazer`/
+`relay-wright-core`/`relay-wright`/`banto-hub-core`/`banto-hub-shell`）それぞれの
+`cargo tree -p <member> -e normal --prefix none`の和集合（362パッケージ）を比較した。
+
+`banto-tagclient`にのみ現れ、他のどのworkspaceメンバーの依存グラフにも現れない
+パッケージ（＝真の追加コスト）は次の3つだけだった。
+
+- `reqwest v0.13.4`
+- `tower-http v0.6.11`（`reqwest`の依存）
+- `ipnet v2.12.0`（`reqwest`が`hyper-util`に要求するfeature経由）
+
+一方、`tokio-tungstenite v0.29.0`・`tungstenite v0.29.0`・`futures-util v0.3.32`は
+`cargo tree -e normal -i <pkg> --workspace`で確認した結果、**既にworkspaceに存在する**
+（`axum`の`ws` feature経由で`banto-hub-core`/`banto-server`が、`banto-server`経由で
+`chronogazer-core`/`relay-wright-core`が間接的に依存グラフに持っている）。設計時点
+（S2b-1/S2b-2a、本書§7上部）で「既存package系列を再利用し新規package/version blockは
+増えない」としていた記述は、この実測で裏付けられた。`reqwest`のtransitive依存の大半
+（`bytes`/`http`/`http-body`/`hyper`/`hyper-util`/`tower`/`url`/`idna`/`icu_*`等）も、
+既に`axum`/`tonic`経由でworkspaceに存在するため増分ゼロであり、`reqwest`本体の追加で
+新規に増えるのは実質`tower-http`と`ipnet`の2パッケージのみである。
+
+#### 2. licenseと保守状況
+
+SDK固有の3パッケージのlicense（`Cargo.toml`の`license`フィールドをローカルregistry
+キャッシュで直接確認）。
+
+| パッケージ   | license           | 手元の解決バージョン | crates.io最新  | 最新の公開日 |
+| ------------ | ----------------- | -------------------- | -------------- | ------------ |
+| `reqwest`    | MIT OR Apache-2.0 | 0.13.4               | 0.13.4（最新） | 2026-05-25   |
+| `tower-http` | MIT               | 0.6.11               | 0.7.1          | 2026-08-31   |
+| `ipnet`      | MIT OR Apache-2.0 | 2.12.0               | 2.12.1         | 2026-08-02   |
+
+コピーレフトlicense（GPL/AGPL等）は無い。`cargo deny check licenses`はローカルでも
+`licenses ok`で通過した（CIのゲートと一致）。3パッケージとも直近数ヶ月以内に新版が
+出ており、保守停止の兆候はない。`reqwest`は手元の解決バージョンがそのまま最新版で
+追随済み。`tower-http`/`ipnet`は最新から1マイナー/パッチ差だが、workspaceの他依存
+（`axum`/`tonic`側が要求するバージョン境界）との整合を優先しているためで、既存の
+バージョン管理方針（本書冒頭・§7上部のS2b系記述と同様、無条件追随はしない）と矛盾しない。
+
+#### 3-a. 単独消費者（`real_hub_smoke` example）のバイナリサイズ
+
+`cargo build --release --example real_hub_smoke -p banto-tagclient`と、比較用に
+一時的に追加した`tokio`ランタイムのみを使うexample（`banto-tagclient`のコードは一切
+参照しない、計測後に削除済み）を同じprofileでビルドして比較した。
+
+| バイナリ                                         | サイズ                        |
+| ------------------------------------------------ | ----------------------------- |
+| tokio-onlyの一時example（`tokio_baseline.rs`）   | 267,776 bytes（約261 KiB）    |
+| `real_hub_smoke`（catalog/読取/購読/書込を使用） | 2,549,248 bytes（約2.43 MiB） |
+| 差分                                             | 2,281,472 bytes（約2.18 MiB） |
+
+この差分が「SDK本体＋SDK固有依存（`reqwest`/`tower-http`/`ipnet`＋SDK自身のコード）を
+実際に使った場合」のおおよそのコストである。tokio-only exampleは`banto-tagclient`
+クレート内に置いた（実装指示どおり一時exampleとして作成・削除）が、`banto_tagclient`の
+シンボルを一切参照しないため、リンカのdead code eliminationにより`reqwest`等の
+未使用コードはリンクされず、純粋なtokioランタイム起動コストのみが計上されている
+（3-bの結果と合わせて後述のとおり裏付けられる）。
+
+#### 3-b. 既存アプリへの限界コスト（本命）
+
+`apps/banto-hub`・`apps/relay-wright`・`apps/chronogazer`のうち、`reqwest`または
+`tokio-tungstenite`を**既に**依存グラフに持つものを`cargo tree -p <pkg> -e normal -i <dep>`
+で調べた。
+
+| アプリ                             | `reqwest` | `tokio-tungstenite`                  |
+| ---------------------------------- | --------- | ------------------------------------ |
+| `banto-hub-core`/`banto-hub-shell` | 無し      | **有り**（`axum`の`ws` feature経由） |
+| `chronogazer-core`/`chronogazer`   | 無し      | 無し                                 |
+| `relay-wright-core`/`relay-wright` | 無し      | 無し                                 |
+
+想定と異なり、**workspace内のどのアプリも`reqwest`をまだ持っていない**。`reqwest`が
+本当にゼロ追加になる既存消費者は現時点で存在しない。`tokio-tungstenite`（および
+`tungstenite`/`futures-util`/`tokio`本体）を既に持つのは`banto-hub-core`/`banto-hub-shell`
+のみで、これは`axum`のWebSocket**サーバー**機能（`/api/v1/stream`）経由であり、
+WSクライアントとしての実利用ではない。
+
+`banto-hub-core`の`[[bin]] name = "banto-hub"`（headless server本体、`embed-ui`
+feature不使用、既定features）を対象に、一時的に`banto-tagclient`を依存へ1行追加
+（コード側からは一切呼び出さない - 実装指示どおり`Cargo.toml`の追加のみ）して比較した。
+**既存のE2Eが依存する`target/release/banto-hub.exe`を壊さないため、計測前に同ファイルを
+別途バックアップし、計測後にバックアップから復元した**（`cargo test --workspace`は
+実行していない）。
+
+| ビルド対象                                           | サイズ                          |
+| ---------------------------------------------------- | ------------------------------- |
+| `banto-hub`（現状、`banto-tagclient`依存なし）       | 27,435,008 bytes（約26.16 MiB） |
+| `banto-hub`（`banto-tagclient`を依存に追加、未使用） | 27,436,544 bytes（約26.17 MiB） |
+| 差分                                                 | 1,536 bytes                     |
+
+差分は実測でわずか1.5 KBだった。これは実装指示にある「`Cargo.toml`に1行」だけの追加で
+`banto-tagclient`のAPIを一切呼び出していないため、リンカのdead code eliminationにより
+`reqwest`/`banto-tagclient`本体のコードがほぼ丸ごと最終バイナリから除去された結果である
+（3-aのtokio-only exampleが示した同じ挙動）。**実際にアプリが`banto-tagclient`のAPIを
+呼び出すようになった場合の現実的なコスト見積もりは、この1.5 KBではなく3-aの差分
+（約2.18 MiB、SDK本体・`reqwest`・`tower-http`・`ipnet`を実際に使った場合の増分）に近い**
+と考えるべきである。3-bの1.5 KBという数字は「依存を宣言しただけでは実行コードは
+増えない」というdead code eliminationの効果を裏付ける参考値であり、本番導入時の
+見積もりとしては3-aを採用する。
+
+一時変更は完全にrevertした。`git checkout -- apps/banto-hub/core/Cargo.toml Cargo.lock`後、
+`git status`はclean（差分なし）である。
+
+#### 4. 既存workspace featureとの整合
+
+`banto-tagclient`が有効化するfeatureは`futures-util`の`sink`、`tokio`の
+`net`/`time`/`sync`/`macros`/`rt`、`reqwest`（既定feature、`default-features = false`
+指定なし）である。これらが他のworkspaceメンバーの要求と**機能的に衝突する例は無かった**
+（同一featureの有効/無効が矛盾する状況は発生していない - Cargoのfeature unificationは
+「和集合」であり「排他」を扱わないため、原理的に矛盾は起きない）。
+
+ただし、3-bの計測で**feature unificationによる副作用**を1件確認した。
+`banto-hub-core`単体（`banto-tagclient`なし）を`cargo build -p banto-hub-core`する場合、
+`hyper-util`は`axum`/`tonic`が要求するfeatureだけでビルドされ、`ipnet`は必要ない
+（`cargo tree -p banto-hub-core -e normal -i ipnet`は空）。しかし`banto-tagclient`
+（`reqwest`経由で`hyper-util`にclient向けfeatureを要求する）を同じビルド単位に加えると、
+**同一の`hyper-util v0.1.20`パッケージがビルド全体で1回だけ、両者の要求featureの和集合で
+コンパイルされる**ため、`banto-hub-core`だけを見ても`ipnet`が依存グラフに現れるように
+なる（`cargo tree -p banto-hub-core -e normal -i ipnet`で確認済み、`hyper-util`の
+親に`axum`経由と`reqwest`経由の両方が並ぶ）。これはCargoのfeature resolver v2の
+既知の仕様どおりの挙動であり、機能的な衝突・ビルド失敗ではない。バイナリサイズへの
+実害も3-bのとおり実測1.5 KB相当と無視できる範囲である。
+
+#### まとめ
+
+- SDK固有の新規追加パッケージ: `reqwest`・`tower-http`・`ipnet`の3つのみ。
+  `tokio-tungstenite`/`tungstenite`/`futures-util`は既にworkspaceに存在する
+  （S2b-1/S2b-2a時点の記述どおり）。
+- 3-a（単独消費者、実際にSDKを使用）: 約261 KiB → 約2.43 MiB、差分約2.18 MiB。
+- 3-b（`banto-hub`に依存追加のみ、未使用）: 約26.16 MiB → 約26.17 MiB、差分1.5 KB
+  （dead code eliminationにより未使用コードはリンクされないため。実利用時の見積もりは
+  3-aの約2.18 MiBを参照）。
+- feature衝突: 無し。ただしfeature unificationにより`hyper-util`が`ipnet`を要求する
+  ようになる副作用を確認（バイナリサイズ・機能への実害は無視できる）。
+- license: 3パッケージともMIT系（コピーレフト無し）、`cargo deny check licenses`が
+  ローカルでも`licenses ok`。
+- 推測で埋めた箇所: 無し。すべて`cargo tree`/`cargo build`の実測、または
+  crates.io APIから取得した公開日である。ただし「`banto-hub`以外のアプリで
+  同様の限界コストを実測した場合の値」は本計測の対象外であり、`reqwest`非依存の
+  `chronogazer`/`relay-wright`は3-aの単独消費者コスト（約2.18 MiB）がそのまま
+  上限見積もりになると考えられるが、実測はしていない。
 
 ## 8. テスト計画
 
