@@ -594,6 +594,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "banto-rtsp"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "banto-server"
 version = "1.4.0"
 source = "git+https://github.com/tyaro/banto.git?tag=v1.4.0#da5c5f760886eaf2e7fda95ffa8dee352a5594c5"
