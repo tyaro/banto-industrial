@@ -13,6 +13,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["net", "time", "sync", "macros", "rt"] }
 tokio-tungstenite = { workspace = true }
+# Issue #209: connection-failure diagnostics (host/port, safe error
+# classification) without exposing API keys or endpoint paths in logs. See
+# `error.rs` module doc for the redaction invariant this must preserve.
+tracing = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]

@@ -22,6 +22,8 @@ pub mod rest;
 pub mod secret;
 /// S2a remains crate-internal until the S2b-2 worker slice wires it in.
 mod stream_core;
+#[cfg(test)]
+mod test_support;
 pub mod types;
 mod worker;
 mod ws_transport;

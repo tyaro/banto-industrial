@@ -27,7 +27,10 @@ impl RestClient {
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .build()
-            .map_err(|_| Error::new(ErrorKind::Transport))?;
+            .map_err(|_| {
+                tracing::warn!("failed to build the banto-hub REST client");
+                Error::new(ErrorKind::Transport)
+            })?;
         Ok(Self {
             endpoint,
             secret,
@@ -55,14 +58,22 @@ impl RestClient {
             .apply_authorization(self.http.get(self.endpoint.tags_url()))
             .send()
             .await
-            .map_err(|_| Error::new(ErrorKind::Transport))?;
+            .map_err(|error| self.log_send_failure("fetch_catalog", &error))?;
         let status = response.status();
-        classify_catalog_status(status)?;
+        classify_catalog_status(&self.endpoint, status)?;
         let body = response
             .bytes()
             .await
-            .map_err(|_| Error::new(ErrorKind::Transport))?;
-        serde_json::from_slice(&body).map_err(|_| Error::new(ErrorKind::ProtocolError))
+            .map_err(|error| self.log_send_failure("fetch_catalog_body", &error))?;
+        serde_json::from_slice(&body).map_err(|_| {
+            tracing::warn!(
+                host = ?self.endpoint.host(),
+                port = ?self.endpoint.port(),
+                body_len = body.len() as u64,
+                "banto-hub catalog response was not valid JSON"
+            );
+            Error::new(ErrorKind::ProtocolError)
+        })
     }
 
     /// Fetch and deserialize `GET /api/v1/values` for exactly the supplied
@@ -79,40 +90,120 @@ impl RestClient {
             .apply_authorization(self.http.get(url))
             .send()
             .await
-            .map_err(|_| Error::new(ErrorKind::Transport))?;
+            .map_err(|error| self.log_send_failure("fetch_values", &error))?;
         let status = response.status();
-        classify_values_status(status)?;
+        classify_values_status(&self.endpoint, status)?;
         let body = response
             .bytes()
             .await
-            .map_err(|_| Error::new(ErrorKind::Transport))?;
-        serde_json::from_slice(&body).map_err(|_| Error::new(ErrorKind::ProtocolError))
+            .map_err(|error| self.log_send_failure("fetch_values_body", &error))?;
+        serde_json::from_slice(&body).map_err(|_| {
+            tracing::warn!(
+                host = ?self.endpoint.host(),
+                port = ?self.endpoint.port(),
+                body_len = body.len() as u64,
+                "banto-hub values response was not valid JSON"
+            );
+            Error::new(ErrorKind::ProtocolError)
+        })
     }
 
     /// Connect the stream using this client's endpoint and secret.
     pub(crate) async fn connect_stream(&self) -> Result<WebSocketConnection> {
         crate::ws_transport::connect(&self.endpoint, &self.secret).await
     }
+
+    /// Log a safe, secret-free diagnostic for a failed REST send or body
+    /// read and return the stable `transport` classification.
+    ///
+    /// Only `reqwest::Error`'s boolean classifiers (`is_timeout`,
+    /// `is_connect`) and any underlying `io::ErrorKind` are recorded. The
+    /// error's own `Display`/`Debug` is never logged: reqwest's error
+    /// formatting echoes the request URL back, which would leak the
+    /// endpoint's path prefix (see `Endpoint`'s redaction contract).
+    fn log_send_failure(&self, operation: &'static str, error: &reqwest::Error) -> Error {
+        tracing::warn!(
+            host = ?self.endpoint.host(),
+            port = ?self.endpoint.port(),
+            operation,
+            timeout = error.is_timeout(),
+            connect = error.is_connect(),
+            io_kind = ?io_error_kind(error),
+            "banto-hub REST request failed"
+        );
+        Error::new(ErrorKind::Transport)
+    }
 }
 
-fn classify_catalog_status(status: StatusCode) -> Result<()> {
+/// Walk a `std::error::Error` source chain looking for the underlying
+/// `std::io::Error` and return only its `ErrorKind` (a plain enum, never the
+/// OS-provided message text) so DNS/refused/timeout-style failures can be
+/// told apart in logs without risking secret-bearing text from any layer.
+fn io_error_kind(error: &(dyn std::error::Error + 'static)) -> Option<std::io::ErrorKind> {
+    let mut source = error.source();
+    while let Some(current) = source {
+        if let Some(io_error) = current.downcast_ref::<std::io::Error>() {
+            return Some(io_error.kind());
+        }
+        source = current.source();
+    }
+    None
+}
+
+fn classify_catalog_status(endpoint: &Endpoint, status: StatusCode) -> Result<()> {
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        tracing::warn!(
+            host = ?endpoint.host(),
+            port = ?endpoint.port(),
+            status = u64::from(status.as_u16()),
+            "banto-hub rejected the catalog request as unauthorized"
+        );
         Err(Error::new(ErrorKind::Unauthorized))
     } else if status.is_redirection() {
+        tracing::warn!(
+            host = ?endpoint.host(),
+            port = ?endpoint.port(),
+            status = u64::from(status.as_u16()),
+            "banto-hub catalog response was a redirect; redirects are not followed"
+        );
         Err(Error::new(ErrorKind::InvalidEndpoint))
     } else if !status.is_success() {
+        tracing::warn!(
+            host = ?endpoint.host(),
+            port = ?endpoint.port(),
+            status = u64::from(status.as_u16()),
+            "banto-hub catalog request failed"
+        );
         Err(Error::new(ErrorKind::CatalogUnavailable))
     } else {
         Ok(())
     }
 }
 
-fn classify_values_status(status: StatusCode) -> Result<()> {
+fn classify_values_status(endpoint: &Endpoint, status: StatusCode) -> Result<()> {
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        tracing::warn!(
+            host = ?endpoint.host(),
+            port = ?endpoint.port(),
+            status = u64::from(status.as_u16()),
+            "banto-hub rejected the values request as unauthorized"
+        );
         Err(Error::new(ErrorKind::Unauthorized))
     } else if status.is_redirection() {
+        tracing::warn!(
+            host = ?endpoint.host(),
+            port = ?endpoint.port(),
+            status = u64::from(status.as_u16()),
+            "banto-hub values response was a redirect; redirects are not followed"
+        );
         Err(Error::new(ErrorKind::InvalidEndpoint))
     } else if !status.is_success() {
+        tracing::warn!(
+            host = ?endpoint.host(),
+            port = ?endpoint.port(),
+            status = u64::from(status.as_u16()),
+            "banto-hub values request failed"
+        );
         Err(Error::new(ErrorKind::Transport))
     } else {
         Ok(())
@@ -328,5 +419,62 @@ mod tests {
             client(address).fetch_catalog().await.unwrap_err().kind(),
             ErrorKind::Transport
         );
+    }
+
+    #[tokio::test]
+    async fn connection_refused_diagnostic_omits_secret_and_path() {
+        let (log, _guard) = crate::test_support::capture();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let error = client(address).fetch_catalog().await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Transport);
+        assert!(!log.contains(&test_secret()));
+        assert!(!log.contains("private-prefix"));
+        // The diagnostic exists and carries the operation name, so this test
+        // would fail if the logging call were ever silently dropped.
+        assert!(log.contains("fetch_catalog"));
+    }
+
+    #[tokio::test]
+    async fn unauthorized_diagnostic_omits_secret_and_path() {
+        let (log, _guard) = crate::test_support::capture();
+        let (address, handle) = server(401, "");
+        let error = client(address).fetch_catalog().await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Unauthorized);
+        assert!(!log.contains(&test_secret()));
+        assert!(!log.contains("private-prefix"));
+        assert!(log.contains("401"));
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_json_diagnostic_omits_body_secret_and_path() {
+        let (log, _guard) = crate::test_support::capture();
+        let (address, handle) = server(200, "not-json-super-secret-body");
+        let error = client(address).fetch_catalog().await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ProtocolError);
+        assert!(!log.contains("not-json-super-secret-body"));
+        assert!(!log.contains(&test_secret()));
+        assert!(!log.contains("private-prefix"));
+        handle.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn redirect_diagnostic_omits_location_secret_and_path() {
+        let (log, _guard) = crate::test_support::capture();
+        let (address, handle) = server_with_headers(
+            302,
+            "secret-body-token",
+            Some("http://127.0.0.1:1/redirect-target"),
+            "secret-body-token".len(),
+        );
+        let error = client(address).fetch_catalog().await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidEndpoint);
+        assert!(!log.contains("secret-body-token"));
+        assert!(!log.contains(&test_secret()));
+        assert!(!log.contains("private-prefix"));
+        assert!(!log.contains("redirect-target"));
+        handle.join().unwrap();
     }
 }
