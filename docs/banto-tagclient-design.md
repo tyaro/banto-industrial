@@ -1,11 +1,11 @@
 # banto-tagclient 設計
 
 作成日: 2026-08-29
-状態: **S4a・W1完了（2026-09-01）、S4統合ゲート1〜4完了（2026-09-02、§7.1）**。
-S4統合ゲートの5項目（本書§7冒頭）のうち、依存グラフ・license/保守状況・Windows配布
-バイナリ増分・workspace feature整合の実測（1〜4）は完了した。**5（Hubのrelease tag
-または互換commitへの固定方法）はオーナー決定待ちで未完**であり、S4自体はまだ
-完了していない。S1bのREST catalog/values transport、S2aの
+状態: **S4統合ゲート完了（2026-09-02）。S4a・W1完了（2026-09-01）**。
+S4統合ゲートの5項目（本書§7冒頭）はすべて済んだ。依存グラフ・license/保守状況・
+Windows配布バイナリ増分・workspace feature整合の実測は§7.1、**5（Hubのrelease tag
+への固定）は 2026-09-02 オーナー決定で `v0.1.0` に固定**した（§7.2）。
+残るのはLAN越しの接続確認とprivate appへの固定である。S1bのREST catalog/values transport、S2aの
 Hub WS wire純粋解析・bounded pending map・latest-wins publish gate・非LIVE current抑止に加え、
 S2b-1の認証付きWebSocket handshake、S2b-2aのon_change subscribe送信と1フレーム受信、
 S2b-2bのcrate-private単一世代worker・tokio watchによるlatest snapshot配信・atomic publishを
@@ -14,8 +14,10 @@ S2b-2bのcrate-private単一世代worker・tokio watchによるlatest snapshot�
 S4aでは、資格情報を複製せず旧世代を停止・joinしてから置換RestClientで再開始する、消費型の公開`restart`を実装した（2026-09-01）。
 S4b-1互換候補では、`origin/main` 509bf0e（Banto v1.4.0）との統合検証で
 `tokio-tungstenite`を0.29系へ一本化できることをローカルに確認した。Issue #199の
-解消は未push・未mergeの候補上の確認であり、Issue自体は完了扱いにしない。実Hub/LAN接続、
-配布サイズ、release tag、private appへの固定は未完で、RTSPの別worktree/別履歴も含めない。
+解消は未push・未mergeの候補上の確認であり、Issue自体は完了扱いにしない。
+**実Hub接続は2026-09-01に検証済み**（`docs/real-machine-test-2026-09.md`、6項目すべて合格。
+403/503の区別を含む）、**配布サイズは§7.1、release tagは§7.2で確定**した。
+**LAN越しの接続確認とprivate appへの固定は未完**で、RTSPの別worktree/別履歴も含めない。
 **W1（2026-09-01）**では、Issue #123の残スコープだった単一タグ書き込み
 （`RestClient::write_tag`）を実装した。stable IDから外部名を都度re解決し、
 `POST /api/v1/values/{tag}`を1回送るだけで、`worker.rs`の再接続・backoff機構には
@@ -574,6 +576,27 @@ feature不使用、既定features）を対象に、一時的に`banto-tagclient`
   同様の限界コストを実測した場合の値」は本計測の対象外であり、`reqwest`非依存の
   `chronogazer`/`relay-wright`は3-aの単独消費者コスト（約2.18 MiB）がそのまま
   上限見積もりになると考えられるが、実測はしていない。
+
+### 7.2 S4統合ゲート 5: 互換性の固定先（2026-09-02 オーナー決定）
+
+**Hubの `v0.1.0` に固定する。** 本リポジトリにはこれまでrelease tagが1つも
+存在しなかったため、2026-09-02にオーナー決定で**最初のrelease tag `v0.1.0`**を
+`41352d9` に対して作成した。
+
+固定先を互換commitではなくtagにしたのは、SDKを外部に配る前提では
+**「どのHubと組み合わせて検証済みか」を人が読める形で示せること**の価値が
+大きいためである。commitハッシュは正確だが、利用者が意味を読み取れない。
+
+`v0.1.0` の時点で揃っているもの:
+
+- brokerの読み書き経路のプロトコル抽象化（Issue #130）
+- Modbus書き込み FC5/6/15/16 と brokerへの配線（Issue #131）
+- 本crateの catalog/読取/購読/書込（Issue #123 の機能スコープ）
+- **実機検証済み**: SLMP実機（R08ENCPU）で回帰なし、Modbus実スレーブ、
+  SDKの403/503区別（`docs/real-machine-test-2026-09.md`）
+
+以後、Hub側のwire互換に影響する変更を入れるときは、このtagを基準に
+互換性を判断する。SDKが動作を確認したHubのバージョンは本節を正とする。
 
 ## 8. テスト計画
 
