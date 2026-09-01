@@ -244,12 +244,22 @@ test.describe.serial('banto-hub タグ更新の楽観的ロック + 競合時の
 
 		const unitInput = drawer.getByLabel('単位');
 		await unitInput.fill(AFTER_RESOLVE_UNIT);
-		await drawer.getByRole('button', { name: '保存' }).click();
 
-		// 同一 page で複数回保存するため、先行テストのトーストが
-		// AUTO_DISMISS_MS（4000ms）以内に消えないと `getByText` が複数
-		// 要素にマッチし strict mode violation になる - 最新トーストに
-		// スコープする。
+		// 同期点はこの保存が発火する PUT の完了そのものにする（トースト文言
+		// ではない）。トーストは AUTO_DISMISS_MS（4000ms）残り続け、直前の
+		// テストも同じ文言のトーストを出すため、`.last()` だけでは「新しい
+		// トーストが出た」ことを保証できず、まだ既存トーストにマッチして
+		// 素通りしてしまう（Issue #216）。待受はクリックより前に張る -
+		// クリック後だと応答が先に来て取りこぼす可能性がある。
+		const saved = page.waitForResponse(
+			(r) => r.url().includes(`/api/tags/${tagId}`) && r.request().method() === 'PUT'
+		);
+		await drawer.getByRole('button', { name: '保存' }).click();
+		await saved;
+
+		// PUT 完了を待った後なので、ここで最新（配列末尾に push される）
+		// トーストを見ているという保証がある。トーストの表示自体の確認は
+		// 引き続き行う。
 		await expect(page.getByText('更新しました').last()).toBeVisible();
 
 		const afterRes = await page.request.get(`/api/tags/${tagId}`, { headers: authedHeaders });
@@ -294,13 +304,25 @@ test.describe.serial('banto-hub タグ更新の楽観的ロック + 競合時の
 		await expect(conflictRow).toContainText(UI_ATTEMPTED_UNIT_2);
 		await expect(conflictRow).toContainText(EXTERNAL_UNIT_2);
 
-		await drawer.getByRole('button', { name: '自分の内容で再保存' }).click();
-
 		// 「自分の内容で再保存」は `expectedRevision` をサーバー最新
 		// （競合検出時に更新済みの revision=4）に差し替えて再送信するため、
 		// 今度は成功し、ローカルの入力（UI_ATTEMPTED_UNIT_2）が勝つ。
-		// 同一 page で複数回保存するため最新トーストにスコープ（strict mode
-		// violation 回避）。
+		// 同期点はこのクリックが発火する PUT の完了そのものにする（トースト
+		// 文言ではない）。トーストは AUTO_DISMISS_MS（4000ms）残り続け、
+		// 直前のテストも同じ文言のトーストを出すため、`.last()` だけでは
+		// 「新しいトーストが出た」ことを保証できず、まだ処理中の PUT が
+		// コミットされる前に後続の GET がまだ古い値を読んでしまう
+		// （Issue #216）。待受はクリックより前に張る - クリック後だと
+		// 応答が先に来て取りこぼす可能性がある。
+		const saved = page.waitForResponse(
+			(r) => r.url().includes(`/api/tags/${tagId}`) && r.request().method() === 'PUT'
+		);
+		await drawer.getByRole('button', { name: '自分の内容で再保存' }).click();
+		await saved;
+
+		// PUT 完了を待った後なので、ここで最新（配列末尾に push される）
+		// トーストを見ているという保証がある。トーストの表示自体の確認は
+		// 引き続き行う。
 		await expect(page.getByText('更新しました').last()).toBeVisible();
 		await expect(drawer.getByText('他のクライアントが先に更新しています')).toHaveCount(0);
 		await expect(unitInput).toHaveValue(UI_ATTEMPTED_UNIT_2);
