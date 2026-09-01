@@ -25,79 +25,112 @@
 //! relay-wright caller now reaches these types via `banto_broker::` instead
 //! of `crate::engine::broker::`, with zero behavioral change.
 //!
-//! ## Why SLMP-only (and not a protocol-agnostic broker)
+//! ## Protocol abstraction (I9 / Issue #130, 2026-09-01) and the one driver
+//! registered today
 //!
-//! This crate speaks MELSEC SLMP exclusively ([`SLMP_PROTOCOL`], enforced by
-//! [`BrokerSupervisor::spawn`]/[`SessionDirectory::ensure_connection`]
-//! rejecting anything else with [`BrokerError::UnsupportedProtocol`]) because
-//! every caller that exists today - relay-wright's write engine, and
-//! banto-hub's upcoming write path (docs/tag-server-design.md §6 item 7) -
-//! writes MELSEC only; Modbus TCP has no write primitive anywhere in this
-//! workspace yet (`banto-plc-write`, the crate this broker drives writes
-//! through, is SLMP-only). Generalizing this broker to be protocol-agnostic
-//! (an abstraction over "read+write share one session" that a future Modbus
-//! write stack could plug into) is deliberately out of scope for this
-//! extraction - it is tracked as **I9** (docs/tag-server-design.md §6 item 7:
+//! This crate used to speak MELSEC SLMP exclusively, hardcoded throughout.
+//! Since #130, read/write execution against a live session is behind a small
+//! trait, [`session::BrokerSession`] (see that module's doc for the full
+//! contract) - this file's reconnect state machine ([`ConnState`],
+//! [`ConnEvent`], [`run_broker_task`]) and its job-processing loop only ever
+//! call `BrokerSession::read_batch`/`write_batch`/`disconnect` on a
+//! `Box<dyn BrokerSession>`, never a protocol-specific type or function. The
+//! one place [`banto_tags::PlcConnection::protocol`] is still inspected is
+//! [`SessionDirectory::ensure_connection`], and that is now a small data
+//! table ([`DRIVERS`]) mapping a protocol string to a driver's own
+//! "build this connection's session and spawn its task" constructor, in
+//! place of the old `conn.protocol != SLMP_PROTOCOL` equality check.
+//!
+//! Exactly one driver is registered today: `"slmp"` ([`slmp_driver`] module,
+//! wrapping `banto_plc`'s `plan_slmp_batch`/`execute_slmp_batch_reads` and
+//! `banto_plc_write`'s `plan_slmp_write_batch`/`execute_slmp_writes` behind
+//! [`slmp_driver::SlmpSession`] - moved out of this file's job loop, not
+//! changed). Every other `protocol` value - including the literal string
+//! `"modbus-tcp"` - is still rejected with
+//! [`BrokerError::UnsupportedProtocol`], with the same message as before;
+//! this refactor (tracked since docs/tag-server-design.md §6 item 7 as **I9**,
 //! "Modbus 書き込み（banto-plc-write への FC5/6/15/16 追加 + broker の
-//! プロトコル抽象化）は I9 バックログ"). Extracting the crate now, ahead of
-//! I9, means that abstraction only has to be designed once - against a
-//! shared crate both apps already depend on - rather than twice against two
-//! diverging copies.
+//! プロトコル抽象化）は I9 バックログ", now done for the broker half) only
+//! changes *how* that rejection is decided, not what any caller observes.
+//! Issue #131 (Modbus TCP write support) is expected to add a `"modbus-tcp"`
+//! [`session::BrokerSession`] implementation and one more [`DRIVERS`] entry -
+//! nothing else in this file should need to change for that; #130 itself
+//! implements no Modbus behavior at all.
+//!
+//! ### Why a new trait, not `banto_plc::PlcClient` + `banto_plc_write::PlcWriteClient`
+//!
+//! [`session::BrokerSession`] is a **new** trait defined in this crate, not a
+//! reuse of the two existing read/write traits, and that is a deliberate,
+//! load-bearing choice - see `session.rs`'s module doc ("Why one trait with
+//! both `read_batch` and `write_batch`") for the full reasoning: composing
+//! `PlcClient` (reads) with `PlcWriteClient` (writes) would give this broker
+//! two independent trait objects, each wrapping its own private
+//! `Option<slmp::SLMPClient>` socket, which reopens exactly the "read and
+//! write to the same CPU can interleave on the wire, or fight over one PLC
+//! session slot" problem this crate's extraction (I6) was meant to close for
+//! good - see "Message shape and how serialization is guaranteed" below.
 //!
 //! ## Message shape and how serialization is guaranteed
 //!
 //! Each connection's task ([`BrokerSupervisor::spawn`] / the internal
-//! `spawn_task`) owns exactly one bare `slmp::SLMPClient` and a
+//! `spawn_task`) owns exactly one `Box<dyn session::BrokerSession>` and a
 //! `tokio::sync::mpsc::Receiver<Job>`. [`Job`] has two variants -
 //! `Read`/`Write` - each carrying its owned request `Vec` and a
 //! `tokio::sync::oneshot::Sender` for the reply. The task's main loop takes
-//! jobs off the channel **one at a time** and `.await`s the whole read/write
-//! before looking at the next one; there is exactly one mutable borrow of the
-//! client alive at any instant, and it never crosses an await point held by
-//! two jobs at once. So the one-socket-at-a-time property is structural (the
-//! same argument `banto-collect/src/task.rs`'s module doc makes for its
+//! jobs off the channel **one at a time** and `.await`s the whole
+//! `read_batch`/`write_batch` call before looking at the next one; there is
+//! exactly one mutable borrow of the session alive at any instant, and it
+//! never crosses an await point held by two jobs at once. So the
+//! one-session-at-a-time property is structural (the same argument
+//! `banto-collect/src/task.rs`'s module doc makes for its
 //! single-task-owns-the-client design), not a lock - a read and a write to
 //! the same CPU cannot interleave on the wire because nothing ever runs two
-//! `execute_slmp_reads`/`execute_slmp_writes` calls concurrently against one
-//! client.
+//! `BrokerSession` calls concurrently against one session, and (see "Why a
+//! new trait" above) there is only ever one `BrokerSession` per connection to
+//! begin with, never a separate read-side and write-side instance.
 //!
 //! [`BrokerHandle`] is the clonable submission point (holds the mpsc
 //! `Sender`); many callers (a poller and a writer, in either consuming app)
 //! can hold clones and submit concurrently - the mpsc channel is what
 //! serializes their requests onto the one task, in arrival order, with no
 //! corruption possible because the task itself is the only thing touching
-//! the client.
+//! the session.
 //!
 //! ## Reconnect / backoff policy
 //!
 //! Structure copied from `banto-collect/src/task.rs`'s `run_connection`
 //! (`ConnState`/`ConnEvent`/spawned-connect-attempt shape), *not* its
 //! `TsWriter`-flavoured content: `ConnState` here is `Backoff { at } |
-//! Connecting(JoinHandle<..>) | Connected(slmp::SLMPClient)`, and the initial
-//! state is `Backoff { at: now }` so the first connect attempt fires
-//! immediately. A failed connect attempt reschedules the next one after
-//! [`backoff_delay`] (exponential, parameterized by [`BackoffConfig`],
-//! capped, reset to attempt 0 on any success). A connection-fatal failure
-//! *while processing a request* (see below) drops the client and re-enters
-//! `Backoff` immediately (attempt reset to 0) - the same "no disconnect event
-//! needed, we were already using it a moment ago" reasoning `run_connection`
-//! uses for its own fatal-read branch.
+//! Connecting(JoinHandle<..>) | Connected(Box<dyn session::BrokerSession>)`,
+//! and the initial state is `Backoff { at: now }` so the first connect
+//! attempt fires immediately. A failed connect attempt reschedules the next
+//! one after [`backoff_delay`] (exponential, parameterized by
+//! [`BackoffConfig`], capped, reset to attempt 0 on any success). A
+//! connection-fatal failure *while processing a request* (see below) drops
+//! the session and re-enters `Backoff` immediately (attempt reset to 0) -
+//! the same "no disconnect event needed, we were already using it a moment
+//! ago" reasoning `run_connection` uses for its own fatal-read branch.
 //!
-//! `connect_attempt` dials through [`banto_plc::dial_slmp`], the one shared
-//! implementation of the connect sequence (build a bare `slmp::SLMPClient`
-//! from `SlmpConfig::to_wire_props()`, wire the two per-crate timeouts, wrap
-//! the connect in `SlmpConfig::connect_timeout`, map the structured
+//! Each driver supplies its own reusable "dial a fresh session" step (a
+//! [`session::Connector`], built once per connection and called again on
+//! every reconnect attempt) rather than this file calling a
+//! protocol-specific connect function directly - see [`connect_attempt`].
+//! For the one driver registered today, [`slmp_driver::connector`] dials
+//! through [`banto_plc::dial_slmp`], the one shared implementation of the
+//! connect sequence (build a bare `slmp::SLMPClient` from
+//! `SlmpConfig::to_wire_props()`, wire the two per-crate timeouts, wrap the
+//! connect in `SlmpConfig::connect_timeout`, map the structured
 //! `slmp::SlmpError` (H9, docs/h9-slmp-structured-error-spec.md)) that
 //! `banto_plc::slmp::SlmpClient::connect` and
 //! `banto_plc_write::slmp::SlmpWriteClient::connect` also call - see
 //! `dial_slmp`'s own doc comment (H9 transport 共通化,
-//! docs/improvement-plan.md §H9). What still differs here, and is not
-//! shareable, is what happens to the client *after* the dial: `SlmpClient` is
-//! a `PlcClient` that stashes the result in its own private
-//! `Option<slmp::SLMPClient>`, but this broker needs the bare client itself
-//! so `execute_slmp_reads` and `execute_slmp_writes` can borrow the *same*
-//! session in `ConnState::Connected` - the whole point of this crate.
-//! `connect_attempt` is that thin unwrap-and-rebox layer.
+//! docs/improvement-plan.md §H9) - exactly what this file's own
+//! `connect_attempt` did inline before #130 moved the SLMP-specific half of
+//! it into [`slmp_driver::connector`]. What still differs here, and is not
+//! shareable, is what happens to the client *after* the dial - see "Why a new
+//! trait" above for why this broker wraps it in its own session type
+//! ([`slmp_driver::SlmpSession`]) rather than handing it to `SlmpClient`'s or
+//! `SlmpWriteClient`'s own private `Option<slmp::SLMPClient>`.
 //!
 //! ## Queued-request-while-down policy: fail fast, never queue
 //!
@@ -121,18 +154,30 @@
 //! message) **and** the task falls back into `Backoff` - both happen from the
 //! same match arm, so the two can never drift out of sync.
 //!
-//! ## Why no explicit call to `is_connection_fatal` appears here
+//! ## The `Err` contract every `BrokerSession` implementation must uphold
 //!
-//! Both `banto_plc::execute_slmp_reads` and `banto_plc_write::execute_slmp_writes`
-//! already enforce the connection-fatal/per-request split internally (a
+//! (Formerly "Why no explicit call to `is_connection_fatal` appears here" -
+//! renamed for #130 because the contract this section describes now lives on
+//! a trait, not just on two SLMP-specific functions.)
+//!
+//! [`run_broker_task`]'s job loop never calls anything resembling
+//! `is_connection_fatal` - it trusts [`session::BrokerSession::read_batch`]/
+//! [`write_batch`][session::BrokerSession::write_batch] completely: `Err`
+//! means connection-fatal, full stop, and any per-device failure must already
+//! be folded into `Ok(Vec<_>)` by the time it gets here. For
+//! [`slmp_driver::SlmpSession`] that split is inherited for free: both
+//! `banto_plc::execute_slmp_batch_reads` and
+//! `banto_plc_write::execute_slmp_writes` already enforce it internally (a
 //! device-side SLMP end code becomes a `Bad`/per-target failure folded into
-//! `Ok(Vec<_>)`; only a connection-fatal condition surfaces as `Err`). So by
-//! the time either function returns `Err` here, the caller already knows it
-//! is connection-fatal by construction - there is no second classification
-//! step to perform, and (incidentally) `banto_plc::PlcError::is_connection_fatal`
-//! is `pub(crate)` there and not reachable from this crate anyway.
-//! `banto_plc_write::PlcWriteError::is_connection_fatal` *is* `pub`, but this
-//! crate still never needs to call it for the same reason.
+//! `Ok(Vec<_>)`; only a connection-fatal condition surfaces as `Err`), so
+//! `SlmpSession` just maps their `Err` straight through to its own. A future
+//! driver will not get this for granted the same way - see
+//! [`session::BrokerSession`]'s own doc comment, which now carries this
+//! contract explicitly (rather than it living only in `banto_plc`'s and
+//! `banto_plc_write`'s own doc comments, as it did pre-#130) precisely
+//! because the next implementer (Modbus TCP, #131) has to do that
+//! classification itself and needs to find the rule stated somewhere that
+//! is not SLMP-specific.
 //!
 //! ## Connection status observability (I6 T2-1 addition, 2026-08-05)
 //!
@@ -168,18 +213,21 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use banto_plc::{
-    dial_slmp, execute_slmp_batch_reads, plan_slmp_batch, BatchReadRequest, BatchReadResult,
-    PlcError, SlmpConfig, WordOrder,
-};
-use banto_plc_write::{execute_slmp_writes, plan_slmp_write_batch, BatchWriteRequest, WriteResult};
+use banto_plc::{BatchReadRequest, BatchReadResult, SlmpConfig, WordOrder};
+use banto_plc_write::{BatchWriteRequest, WriteResult};
 use banto_tags::PlcConnection;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-/// SLMP is the only protocol this broker speaks (see the module doc's "Why
-/// SLMP-only" section).
+mod session;
+mod slmp_driver;
+
+use session::{BrokerSession, Connector, SessionError};
+
+/// The protocol string identifying the SLMP driver ([`slmp_driver`]) in
+/// [`DRIVERS`] - the only entry registered today (see the module doc's
+/// "Protocol abstraction" section).
 const SLMP_PROTOCOL: &str = "slmp";
 
 /// Parse [`PlcConnection::word_order`]'s wire string into the
@@ -573,6 +621,37 @@ struct TaskEntry {
     join_handle: JoinHandle<()>,
 }
 
+/// One [`DRIVERS`] entry: given a connection already confirmed to match this
+/// driver's protocol string, its already-validated `u16` port, the shared
+/// backoff config, and this task's clone of the supervisor-wide shutdown
+/// signal, build and spawn that connection's whole broker task. Every driver
+/// produces the same `(BrokerHandle, TaskEntry)` pair regardless of its own
+/// config type or [`session::BrokerSession`] implementation - see
+/// [`spawn_slmp_driver`] for the one registered today.
+type DriverSpawn =
+    fn(&PlcConnection, u16, BackoffConfig, watch::Receiver<bool>) -> (BrokerHandle, TaskEntry);
+
+/// The protocol -> driver dispatch table [`SessionDirectory::ensure_connection`]
+/// consults (Issue #130 D5). Exactly one entry today; Issue #131 (Modbus TCP
+/// write support) is expected to add a `"modbus-tcp"` entry here and nowhere
+/// else - `ensure_connection`'s own lookup logic does not change per driver
+/// added.
+const DRIVERS: &[(&str, DriverSpawn)] = &[(SLMP_PROTOCOL, spawn_slmp_driver)];
+
+/// [`DriverSpawn`] for `"slmp"`: build this connection's [`SlmpConfig`] (see
+/// [`slmp_config_for`]) and hand it to [`spawn_task`] - the same SLMP-specific
+/// entry point this crate's own unit tests call directly (with a hand-built
+/// `SlmpConfig`, bypassing `PlcConnection`/`ensure_connection` entirely - see
+/// `spawn_task`'s own doc comment).
+fn spawn_slmp_driver(
+    conn: &PlcConnection,
+    port: u16,
+    backoff: BackoffConfig,
+    shutdown_rx: watch::Receiver<bool>,
+) -> (BrokerHandle, TaskEntry) {
+    spawn_task(conn.id, slmp_config_for(conn, port), backoff, shutdown_rx)
+}
+
 impl SessionDirectory {
     fn new(backoff: BackoffConfig, shutdown_tx: std::sync::Arc<watch::Sender<bool>>) -> Self {
         Self {
@@ -605,16 +684,21 @@ impl SessionDirectory {
     }
 
     /// The handle for `conn`, spawning its broker task first if none is
-    /// running yet (see the struct doc's on-demand policy). Rejects non-SLMP
-    /// connections with [`BrokerError::UnsupportedProtocol`] - this broker is
-    /// SLMP-only.
+    /// running yet (see the struct doc's on-demand policy). Rejects a
+    /// connection whose `protocol` has no [`DRIVERS`] entry with
+    /// [`BrokerError::UnsupportedProtocol`] - `"slmp"` is the only one
+    /// registered today (see the module doc's "Protocol abstraction"
+    /// section), so this still rejects everything else exactly as it did
+    /// when this was a direct `!= SLMP_PROTOCOL` check.
     pub fn ensure_connection(&self, conn: &PlcConnection) -> Result<BrokerHandle, BrokerError> {
-        if conn.protocol != SLMP_PROTOCOL {
-            return Err(BrokerError::UnsupportedProtocol {
+        let driver = DRIVERS
+            .iter()
+            .find(|(protocol, _)| *protocol == conn.protocol)
+            .map(|(_, spawn)| *spawn)
+            .ok_or_else(|| BrokerError::UnsupportedProtocol {
                 connection_id: conn.id,
                 protocol: conn.protocol.clone(),
-            });
-        }
+            })?;
         let port = u16::try_from(conn.port).map_err(|_| BrokerError::InvalidPort {
             connection_id: conn.id,
             port: conn.port,
@@ -625,9 +709,7 @@ impl SessionDirectory {
             return Ok(handle.clone());
         }
 
-        let config = slmp_config_for(conn, port);
-        let (handle, task) =
-            spawn_task(conn.id, config, self.backoff, self.shutdown_tx.subscribe());
+        let (handle, task) = driver(conn, port, self.backoff, self.shutdown_tx.subscribe());
         handles.insert(conn.id, handle.clone());
         self.tasks
             .lock()
@@ -835,9 +917,14 @@ fn spawn_task(
     // (immediate first attempt), i.e. attempt 1 is about to fire.
     let (status_tx, status_rx) =
         watch::channel(BrokerConnectionStatus::Reconnecting { attempt: 1 });
+    // The only SLMP-specific line in this function: everything downstream
+    // (`run_broker_task`, `ConnState`, `ConnEvent`) only ever sees the
+    // resulting `Connector` - see the module doc's "Protocol abstraction"
+    // section.
+    let connector = slmp_driver::connector(config);
     let task = tokio::spawn(run_broker_task(
         connection_id,
-        config,
+        connector,
         backoff,
         rx,
         shutdown_rx,
@@ -864,19 +951,22 @@ enum ConnState {
     Backoff { at: Instant },
     /// A connect attempt is running in a spawned sub-task, so a slow
     /// `connect()` cannot stall the job loop.
-    Connecting(JoinHandle<(Box<slmp::SLMPClient>, Result<(), PlcError>)>),
-    /// Connected and owning the live client - the only state in which a
-    /// [`Job`] is actually serviced. Boxed (clippy::large_enum_variant):
-    /// `slmp::SLMPClient` carries a fixed internal receive buffer that makes
-    /// it far larger than `ConnState`'s other variants.
-    Connected(Box<slmp::SLMPClient>),
+    Connecting(JoinHandle<Result<Box<dyn BrokerSession>, String>>),
+    /// Connected and owning the live session - the only state in which a
+    /// [`Job`] is actually serviced. `Box<dyn BrokerSession>` is required for
+    /// `dyn` dispatch, and incidentally keeps this variant small the same way
+    /// the pre-#130 `Box<slmp::SLMPClient>` did (`slmp::SLMPClient` carries a
+    /// fixed internal receive buffer that would otherwise make this variant
+    /// far larger than `ConnState`'s other variants; that data now simply
+    /// lives on the same heap allocation, inside whichever session type a
+    /// driver's `Connector` produced).
+    Connected(Box<dyn BrokerSession>),
 }
 
 /// What woke the connection side of the task's `select!`.
 enum ConnEvent {
     Due,
-    /// Boxed for the same reason as `ConnState::Connected`.
-    Finished(Box<slmp::SLMPClient>, Result<(), PlcError>),
+    Finished(Result<Box<dyn BrokerSession>, String>),
     JoinError,
 }
 
@@ -888,33 +978,27 @@ async fn next_conn_event(state: &mut ConnState) -> ConnEvent {
             ConnEvent::Due
         }
         ConnState::Connecting(handle) => match handle.await {
-            Ok((client, result)) => ConnEvent::Finished(client, result),
+            Ok(result) => ConnEvent::Finished(result),
             Err(_join_err) => ConnEvent::JoinError,
         },
     }
 }
 
-/// Dial `config` through the shared [`banto_plc::dial_slmp`] (see the module
-/// doc's "Reconnect / backoff policy" section) and box the result into this
-/// broker's `(client, result)` shape. The client is returned either way - on
-/// failure `dial_slmp` never handed one back, so this rebuilds a fresh,
-/// unconnected placeholder; the caller (`next_conn_event`'s
-/// `ConnEvent::Finished` arm) only ever inspects the client on the `Ok` side
-/// and discards it on `Err`, so the placeholder is never touched - but
-/// returning the pair unconditionally keeps this function's shape simple.
-async fn connect_attempt(config: SlmpConfig) -> (Box<slmp::SLMPClient>, Result<(), PlcError>) {
-    match dial_slmp(&config).await {
-        Ok(client) => (Box::new(client), Ok(())),
-        Err(err) => (
-            Box::new(slmp::SLMPClient::new(config.to_wire_props())),
-            Err(err),
-        ),
-    }
+/// Call `connector` once (see the module doc's "Reconnect / backoff policy"
+/// section) - the generic half of what a pre-#130 single `connect_attempt`
+/// did inline for SLMP specifically; the protocol-specific half now lives in
+/// each driver's own `Connector` (e.g. [`slmp_driver::connector`]).
+async fn connect_attempt(connector: Connector) -> Result<Box<dyn BrokerSession>, String> {
+    connector().await
 }
 
-/// One connection's broker loop: owns `config`'s session end-to-end (connect,
-/// reconnect-with-backoff, disconnect on shutdown) and services [`Job`]s
-/// serialized through `rx`. Exits on either of two independent signals:
+/// One connection's broker loop: owns this connection's session end-to-end
+/// (connect via `connector`, reconnect-with-backoff, disconnect on shutdown)
+/// and services [`Job`]s serialized through `rx`. Protocol-agnostic by
+/// construction (Issue #130 D4) - every read/write/disconnect call here goes
+/// through [`session::BrokerSession`], never a protocol-specific type or
+/// function; see the module doc's "Protocol abstraction" section. Exits on
+/// either of two independent signals:
 /// every [`BrokerHandle`] for this connection has been dropped (`rx.recv()`
 /// returns `None`), or the supervisor-wide shutdown trigger fires
 /// (`shutdown_rx` changes, or its `Sender` is dropped) - see
@@ -927,14 +1011,13 @@ async fn connect_attempt(config: SlmpConfig) -> (Box<slmp::SLMPClient>, Result<(
 /// flow here.
 async fn run_broker_task(
     connection_id: i64,
-    config: SlmpConfig,
+    connector: Connector,
     backoff_cfg: BackoffConfig,
     mut rx: mpsc::Receiver<Job>,
     mut shutdown_rx: watch::Receiver<bool>,
     mut stop_rx: watch::Receiver<bool>,
     status_tx: watch::Sender<BrokerConnectionStatus>,
 ) {
-    let word_order = config.word_order;
     let mut attempt: u32 = 0;
     let mut state = ConnState::Backoff { at: Instant::now() };
 
@@ -961,15 +1044,15 @@ async fn run_broker_task(
                     ConnEvent::Due => {
                         attempt += 1;
                         let _ = status_tx.send(BrokerConnectionStatus::Reconnecting { attempt });
-                        let handle = tokio::spawn(connect_attempt(config.clone()));
+                        let handle = tokio::spawn(connect_attempt(connector.clone()));
                         state = ConnState::Connecting(handle);
                     }
-                    ConnEvent::Finished(client, Ok(())) => {
+                    ConnEvent::Finished(Ok(session)) => {
                         attempt = 0;
-                        state = ConnState::Connected(client);
+                        state = ConnState::Connected(session);
                         let _ = status_tx.send(BrokerConnectionStatus::Connected);
                     }
-                    ConnEvent::Finished(_client, Err(_err)) => {
+                    ConnEvent::Finished(Err(_err)) => {
                         let delay = backoff_delay(attempt, backoff_cfg);
                         state = ConnState::Backoff {
                             at: Instant::now() + delay,
@@ -999,10 +1082,9 @@ async fn run_broker_task(
                         // `state`) mirrors banto-collect's task.rs: it keeps
                         // the borrow of `state` from ending mid-await from
                         // ever overlapping with the reassignment below.
-                        let outcome: Option<Result<Vec<BatchReadResult>, PlcError>> = match &mut state {
-                            ConnState::Connected(client) => {
-                                let plan = plan_slmp_batch(&requests);
-                                Some(execute_slmp_batch_reads(client, &plan, requests.len(), word_order).await)
+                        let outcome: Option<Result<Vec<BatchReadResult>, SessionError>> = match &mut state {
+                            ConnState::Connected(session) => {
+                                Some(session.read_batch(&requests).await)
                             }
                             _ => None,
                         };
@@ -1025,11 +1107,10 @@ async fn run_broker_task(
                         }
                     }
                     Job::Write { requests, respond_to } => {
-                        let outcome: Option<Result<Vec<WriteResult>, banto_plc_write::PlcWriteError>> =
+                        let outcome: Option<Result<Vec<WriteResult>, SessionError>> =
                             match &mut state {
-                                ConnState::Connected(client) => {
-                                    let plan = plan_slmp_write_batch(&requests, word_order);
-                                    Some(execute_slmp_writes(client, &plan, requests.len()).await)
+                                ConnState::Connected(session) => {
+                                    Some(session.write_batch(&requests).await)
                                 }
                                 _ => None,
                             };
@@ -1067,8 +1148,8 @@ async fn run_broker_task(
             handle.abort();
             let _ = handle.await;
         }
-        ConnState::Connected(client) => {
-            client.close().await;
+        ConnState::Connected(mut session) => {
+            session.disconnect().await;
         }
     }
     let _ = status_tx.send(BrokerConnectionStatus::Stopped);
