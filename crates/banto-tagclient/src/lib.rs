@@ -1,13 +1,20 @@
 //! `banto-tagclient` S4a: read-only Hub contracts with owned restartable
-//! connection generations.
+//! connection generations, plus (Issue #123) a single-tag write path.
 //!
 //! This crate provides safe endpoint construction, Hub wire DTOs, an opaque
-//! API-key boundary, stable-ID binding resolution, read-only REST requests,
-//! network-free publish-gate core, direct authenticated WebSocket handshakes,
-//! and a public owner for one generation. The consumed `TagClientHandle::restart`
-//! API replaces credentials and endpoint ownership only after the old worker is
-//! stopped and joined. PLC/Modbus access, writes, Tauri, and keyring integration
-//! remain outside this crate's read-only boundary.
+//! API-key boundary, stable-ID binding resolution, REST requests (read and a
+//! single-tag write), network-free publish-gate core, direct authenticated
+//! WebSocket handshakes, and a public owner for one generation. The consumed
+//! `TagClientHandle::restart` API replaces credentials and endpoint ownership
+//! only after the old worker is stopped and joined. PLC/Modbus access, batch/
+//! recipe writes, Tauri, and keyring integration remain outside this crate's
+//! boundary (batch/recipe writes are deferred until a real requirement
+//! appears - see the `write` module doc).
+//!
+//! [`RestClient::write_tag`] is deliberately independent of `worker.rs`'s
+//! reconnect/backoff supervisor: it is a single request that never retries
+//! automatically (2026-09-01 owner decision), because resending a write the
+//! caller cannot confirm was lost risks a double write to the PLC.
 //!
 //! The DTOs mirror the machine-facing snake_case `/api/v1/tags` and
 //! `/api/v1/values` responses. Unknown mode, source, and quality strings are
@@ -26,6 +33,7 @@ mod stream_core;
 mod test_support;
 pub mod types;
 mod worker;
+pub mod write;
 mod ws_transport;
 
 pub use binding::{
@@ -40,3 +48,4 @@ pub use types::{
     CatalogSnapshot, CatalogTag, CollectionMode, StableTagId, TagClientConnectionState,
     TagClientState, ValueEntry, ValueQuality, ValueSource, ValuesSnapshot,
 };
+pub use write::RequestedValue;

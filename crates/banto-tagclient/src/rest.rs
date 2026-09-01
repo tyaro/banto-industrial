@@ -1,4 +1,5 @@
-//! Read-only REST transport for the banto-hub catalog and value snapshot.
+//! REST transport for the banto-hub catalog, value snapshot, and (Issue
+//! #123) single-tag write.
 
 use std::fmt;
 
@@ -9,11 +10,15 @@ use crate::endpoint::Endpoint;
 use crate::error::{Error, ErrorKind, Result};
 use crate::handle::{validate_start_requests, TagClientHandle};
 use crate::secret::SecretApiKey;
-use crate::types::{CatalogSnapshot, ValuesSnapshot};
+use crate::types::{CatalogSnapshot, StableTagId, ValuesSnapshot};
+use crate::write::{resolve_write_target, send_write, RequestedValue};
 use crate::ws_transport::WebSocketConnection;
 
-/// A read-only banto-hub REST client that connects directly to its endpoint,
-/// without redirects or system/environment proxy configuration.
+/// A banto-hub REST client that connects directly to its endpoint, without
+/// redirects or system/environment proxy configuration. Reads
+/// ([`fetch_catalog`](Self::fetch_catalog), [`fetch_values`](Self::fetch_values))
+/// may be reused freely; [`write_tag`](Self::write_tag) additionally never
+/// retries (see the `write` module doc for why).
 pub struct RestClient {
     endpoint: Endpoint,
     secret: SecretApiKey,
@@ -106,6 +111,31 @@ impl RestClient {
             );
             Error::new(ErrorKind::ProtocolError)
         })
+    }
+
+    /// Write one tag by its stable ID (Issue #123, tag-server-design.md §6).
+    ///
+    /// This is a single `POST /api/v1/values/{tag}` and nothing else - see
+    /// the `write` module doc for why it is not part of `worker.rs`'s
+    /// reconnect/backoff machinery and never retries automatically. The
+    /// `external_name` banto-hub currently uses is resolved fresh from
+    /// `GET /api/v1/tags` on every call (never cached, never accepted
+    /// directly from the caller) because a rename changes it independently
+    /// of the stable ID (design §4.1). A resolution failure
+    /// ([`ErrorKind::BindingUnresolved`], [`ErrorKind::DuplicateCatalogStableId`])
+    /// or a catalog fetch failure both return before any write request is
+    /// sent.
+    pub async fn write_tag(&self, stable_id: StableTagId, value: RequestedValue) -> Result<()> {
+        let catalog = self.fetch_catalog().await?;
+        let external_name = resolve_write_target(stable_id, &catalog.tags)?;
+        send_write(
+            &self.http,
+            &self.endpoint,
+            &self.secret,
+            &external_name,
+            value,
+        )
+        .await
     }
 
     /// Connect the stream using this client's endpoint and secret.

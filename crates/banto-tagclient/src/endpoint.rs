@@ -80,6 +80,18 @@ impl Endpoint {
             .map_err(|_| Error::new(ErrorKind::InvalidEndpoint))?;
         Ok(url)
     }
+
+    /// `POST /api/v1/values/{tag}` (design §5.1/§6). `external_name` becomes
+    /// exactly one additional path segment past [`values_url`](Self::values_url);
+    /// `Url::path_segments_mut` percent-encodes it, so a name is never
+    /// mistaken for an extra path level.
+    pub(crate) fn value_url(&self, external_name: &str) -> Url {
+        let mut url = append_path(&self.base, "values");
+        url.path_segments_mut()
+            .expect("HTTP URLs always support path segment mutation")
+            .push(external_name);
+        url
+    }
 }
 
 fn append_path(base: &Url, leaf: &str) -> Url {
@@ -174,5 +186,26 @@ mod tests {
         );
         assert!(url.query().is_none());
         assert!(url.fragment().is_none());
+    }
+
+    #[test]
+    fn builds_prefixed_write_route_as_one_extra_segment() {
+        let endpoint = Endpoint::new("http://example.test/private-prefix///").unwrap();
+        let url = endpoint.value_url("line1.fast.temp01");
+        assert_eq!(
+            url.as_str(),
+            "http://example.test/private-prefix/api/v1/values/line1.fast.temp01"
+        );
+    }
+
+    #[test]
+    fn write_route_percent_encodes_a_name_instead_of_adding_a_path_level() {
+        let endpoint = Endpoint::new("http://example.test").unwrap();
+        let url = endpoint.value_url("line1/evil");
+        assert_eq!(
+            url.as_str(),
+            "http://example.test/api/v1/values/line1%2Fevil"
+        );
+        assert_eq!(url.path_segments().unwrap().count(), 4);
     }
 }

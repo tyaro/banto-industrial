@@ -21,6 +21,24 @@ pub enum ErrorKind {
     RevisionMismatch,
     RuntimeMetadataMismatch,
     Stopped,
+    /// Write rejected with HTTP 403 (`not_writable` / `missing_write_scope` /
+    /// `session_token_cannot_write` / `key_tripped`, tag-server-design.md §6
+    /// gates 2/8). A configuration or credential problem, not a transient
+    /// server state - retrying the same request will not help.
+    WriteForbidden,
+    /// Write rejected with HTTP 503 (`writes_disabled` /
+    /// `collection_not_running` / `simulation_write_rejected`,
+    /// tag-server-design.md §6 gate 5). A transient server-side state; the
+    /// caller may choose to retry later, but this crate never does so
+    /// automatically (2026-09-01 owner decision - see the `write` module doc).
+    WriteUnavailable,
+    /// Any other write-time rejection banto-hub returned as a stable error
+    /// code (404 `not_found`, 409 `tag_disabled`, 422
+    /// `unsupported_value_type`/`value_out_of_range`, 429 `rate_limited`,
+    /// 501 `write_unsupported_protocol`, 502 `write_failed`). The request as
+    /// constructed cannot succeed; the caller must change the tag, value, or
+    /// timing before trying again.
+    WriteRejected,
 }
 
 impl ErrorKind {
@@ -41,6 +59,9 @@ impl ErrorKind {
             Self::RevisionMismatch => "revision_mismatch",
             Self::RuntimeMetadataMismatch => "runtime_metadata_mismatch",
             Self::Stopped => "stopped",
+            Self::WriteForbidden => "write_forbidden",
+            Self::WriteUnavailable => "write_unavailable",
+            Self::WriteRejected => "write_rejected",
         }
     }
 }
