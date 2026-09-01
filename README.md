@@ -221,12 +221,13 @@ docs/plan.md §4b）。タグレジストリの読み取り値を条件に、設
 banto のパッケージ/クレートの消費は **両方とも git タグ参照**
 （2026-07-12 決定。GitHub 組織名 banto が取得不能だったため
 レジストリ発行は棚上げ。banto の docs/publishing.md 参照）。
-両者は独立に追従しており必ずしも同じタグではない
-（2026-09-01 時点: npm `@banto/*` は `v1.2.0`、Rust クレートは `v1.4.0`。
-実際の値は各 `package.json`/`Cargo.toml` を正とする）:
+両者は別マニフェスト（`package.json`/`Cargo.toml`）で独立に追従できるが、
+**上げるときは揃えて上げる運用**とする（2026-09-01、Issue #220 — npm 側
+だけ v1.2.0 に取り残されていたのを是正した教訓）。2026-09-01 時点で両者とも
+`v1.4.0`（実際の値は各 `package.json`/`Cargo.toml` を正とする）:
 
 ```sh
-pnpm add "github:tyaro/banto#v1.2.0&path:packages/admin-core"
+pnpm add "github:tyaro/banto#v1.4.0&path:packages/admin-core"
 ```
 
 ```toml
