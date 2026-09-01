@@ -19,9 +19,19 @@
 //!
 //! - `HUB_URL`（省略時 `http://127.0.0.1:8722`）と `HUB_API_KEY`（必須）を
 //!   環境変数で受け取る。API キーはソースに埋め込まない。
-//! - 6項目それぞれが独立して合否を出す。前段（catalog 取得）が失敗しても、
-//!   以降の項目は「スキップ」として記録したうえで最後まで実行し切る
-//!   （途中で panic して残りの項目の情報を失わないため）。
+//! - `HUB_ADMIN_TOKEN`（任意）を設定すると、項目6が叩く
+//!   `/api/write-control/{enable,disable}` に管理セッションの
+//!   `Authorization: Bearer` ヘッダを付ける。試運転モードの Hub では
+//!   この認証は不要だが、**ロックダウン済みの Hub（＝本番の実態）では
+//!   このヘッダが無いと 401/403 になり項目6を実行できない**ため、その
+//!   場合はこの環境変数に管理者の Bearer トークンを設定すること。
+//!   トークンはソースに埋め込まない。
+//! - 6項目それぞれが独立して合否を出す。前段（catalog 取得）が失敗した
+//!   場合、以降の項目は「**実際に試して失敗した**」のではなく
+//!   「**前段が失敗して検証できなかった＝スキップ**」として区別して
+//!   記録したうえで最後まで実行し切る（途中で panic して残りの項目の
+//!   情報を失わないため）。スキップも「検証できていない」という点では
+//!   失敗と同様に扱い、終了コードは非ゼロのままにする。
 //! - 項目6（503確認）は `POST /api/write-control/disable` で受付を
 //!   意図的に無効化するため、検証後は必ず `POST /api/write-control/enable`
 //!   で元に戻す。これを戻し忘れると、稼働中の Hub の以降の書き込みが
@@ -44,20 +54,71 @@ const EXT_MB_DI_RO: &str = "mb.g1.di_ro";
 const LIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const UPDATE_WINDOW: Duration = Duration::from_secs(5);
 
+/// 1項目の検証結果の状態。
+///
+/// 「実際に試して失敗した」（`Fail`）と「前段が失敗して検証できなかった」
+/// （`Skipped`）は読み手にとって全く違う情報なので区別する。ただし
+/// どちらも「検証できていない」という点では成功ではないため、終了コードの
+/// 判定（[`StepStatus::is_pass`]）では両方とも非成功として扱う。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StepStatus {
+    /// 実際に試して期待どおりだった。
+    Pass,
+    /// 実際に試したが期待と異なった、またはエラーになった。
+    Fail,
+    /// 前段の失敗により、この項目自体は試せなかった。
+    Skipped,
+}
+
+impl StepStatus {
+    /// サマリ表示用のマーク。
+    fn mark(self) -> &'static str {
+        match self {
+            StepStatus::Pass => "OK",
+            StepStatus::Fail => "NG",
+            StepStatus::Skipped => "SKIP",
+        }
+    }
+
+    /// 終了コード判定用。スキップは成功として扱わない
+    /// （「検証できていない」のであって「成功した」わけではないため）。
+    fn is_pass(self) -> bool {
+        matches!(self, StepStatus::Pass)
+    }
+}
+
 /// 1項目の検証結果（最後にまとめて表示するためのサマリ行）。
 struct StepResult {
     name: &'static str,
-    ok: bool,
+    status: StepStatus,
     detail: String,
 }
 
 impl StepResult {
-    fn new(name: &'static str, ok: bool, detail: impl Into<String>) -> Self {
+    fn new(name: &'static str, status: StepStatus, detail: impl Into<String>) -> Self {
         Self {
             name,
-            ok,
+            status,
             detail: detail.into(),
         }
+    }
+
+    /// 実際に試した結果が bool で得られる場合の簡便コンストラクタ。
+    fn from_bool(name: &'static str, ok: bool, detail: impl Into<String>) -> Self {
+        Self::new(
+            name,
+            if ok {
+                StepStatus::Pass
+            } else {
+                StepStatus::Fail
+            },
+            detail,
+        )
+    }
+
+    /// 前段の失敗によりこの項目を試せなかった場合のコンストラクタ。
+    fn skipped(name: &'static str, detail: impl Into<String>) -> Self {
+        Self::new(name, StepStatus::Skipped, detail)
     }
 }
 
@@ -85,7 +146,7 @@ async fn step1_catalog(hub_url: &str, api_key: &str) -> (StepResult, Option<Cata
         Ok(client) => client,
         Err(error) => {
             println!("  クライアント構築失敗: kind={}", error.kind().as_str());
-            let result = StepResult::new(
+            let result = StepResult::from_bool(
                 "catalog取得",
                 false,
                 format!("client build error: {}", error.kind().as_str()),
@@ -111,12 +172,15 @@ async fn step1_catalog(hub_url: &str, api_key: &str) -> (StepResult, Option<Cata
                 );
             }
             let detail = format!("tags={}", catalog.tags.len());
-            (StepResult::new("catalog取得", true, detail), Some(catalog))
+            (
+                StepResult::from_bool("catalog取得", true, detail),
+                Some(catalog),
+            )
         }
         Err(error) => {
             println!("  失敗: kind={}", error.kind().as_str());
             let detail = error.kind().as_str().to_owned();
-            (StepResult::new("catalog取得", false, detail), None)
+            (StepResult::from_bool("catalog取得", false, detail), None)
         }
     }
 }
@@ -128,7 +192,7 @@ async fn step2_read(hub_url: &str, api_key: &str) -> StepResult {
         Ok(client) => client,
         Err(error) => {
             println!("  クライアント構築失敗: kind={}", error.kind().as_str());
-            return StepResult::new("読み取り", false, error.kind().as_str().to_owned());
+            return StepResult::from_bool("読み取り", false, error.kind().as_str().to_owned());
         }
     };
     match client.fetch_values(&[EXT_PLC_D3000, EXT_MB_HR1]).await {
@@ -143,11 +207,11 @@ async fn step2_read(hub_url: &str, api_key: &str) -> StepResult {
                 );
             }
             let detail = format!("{}件取得", snapshot.values.len());
-            StepResult::new("読み取り", !snapshot.values.is_empty(), detail)
+            StepResult::from_bool("読み取り", !snapshot.values.is_empty(), detail)
         }
         Err(error) => {
             println!("  失敗: kind={}", error.kind().as_str());
-            StepResult::new("読み取り", false, error.kind().as_str().to_owned())
+            StepResult::from_bool("読み取り", false, error.kind().as_str().to_owned())
         }
     }
 }
@@ -201,15 +265,15 @@ async fn step3_subscribe(
     println!("--- [3/6] 購読 (start / WebSocket) ---");
     let Some(catalog) = catalog else {
         println!("  スキップ: catalog取得に失敗したため stable_id を解決できません。");
-        return StepResult::new("購読", false, "catalog未取得のためスキップ");
+        return StepResult::skipped("購読", "catalog未取得のためスキップ");
     };
     let Some(plc_tag) = find_tag(catalog, EXT_PLC_D3000) else {
         println!("  失敗: {EXT_PLC_D3000} が catalog に見つかりません。");
-        return StepResult::new("購読", false, "plc.gs.d3000がcatalogに存在しない");
+        return StepResult::from_bool("購読", false, "plc.gs.d3000がcatalogに存在しない");
     };
     let Some(mb_tag) = find_tag(catalog, EXT_MB_HR1) else {
         println!("  失敗: {EXT_MB_HR1} が catalog に見つかりません。");
-        return StepResult::new("購読", false, "mb.g1.hr1がcatalogに存在しない");
+        return StepResult::from_bool("購読", false, "mb.g1.hr1がcatalogに存在しない");
     };
     let requests = vec![
         BindingRequest {
@@ -225,14 +289,14 @@ async fn step3_subscribe(
         Ok(client) => client,
         Err(error) => {
             println!("  クライアント構築失敗: kind={}", error.kind().as_str());
-            return StepResult::new("購読", false, error.kind().as_str().to_owned());
+            return StepResult::from_bool("購読", false, error.kind().as_str().to_owned());
         }
     };
     let handle = match client.start(requests) {
         Ok(handle) => handle,
         Err(error) => {
             println!("  start失敗: kind={}", error.kind().as_str());
-            return StepResult::new("購読", false, error.kind().as_str().to_owned());
+            return StepResult::from_bool("購読", false, error.kind().as_str().to_owned());
         }
     };
 
@@ -252,7 +316,7 @@ async fn step3_subscribe(
         );
         let shutdown_result = handle.shutdown().await;
         println!("  shutdown: {}", describe_unit_result(&shutdown_result));
-        return StepResult::new("購読", false, "Live到達タイムアウト");
+        return StepResult::from_bool("購読", false, "Live到達タイムアウト");
     }
     println!("  Live状態に到達しました。");
 
@@ -304,7 +368,7 @@ async fn step3_subscribe(
         "live到達=true, 値更新={updated}, shutdown成功={}",
         shutdown_result.is_ok()
     );
-    StepResult::new("購読", ok, detail)
+    StepResult::from_bool("購読", ok, detail)
 }
 
 fn describe_unit_result(result: &banto_tagclient::Result<()>) -> String {
@@ -323,17 +387,17 @@ async fn step4_write(
     println!("--- [4/6] 書き込み (write_tag) ---");
     let Some(catalog) = catalog else {
         println!("  スキップ: catalog取得に失敗したため stable_id を解決できません。");
-        return StepResult::new("書き込み", false, "catalog未取得のためスキップ");
+        return StepResult::skipped("書き込み", "catalog未取得のためスキップ");
     };
     let Some(tag) = find_tag(catalog, EXT_PLC_D3000) else {
         println!("  失敗: {EXT_PLC_D3000} が catalog に見つかりません。");
-        return StepResult::new("書き込み", false, "plc.gs.d3000がcatalogに存在しない");
+        return StepResult::from_bool("書き込み", false, "plc.gs.d3000がcatalogに存在しない");
     };
     let client = match build_client(hub_url, api_key) {
         Ok(client) => client,
         Err(error) => {
             println!("  クライアント構築失敗: kind={}", error.kind().as_str());
-            return StepResult::new("書き込み", false, error.kind().as_str().to_owned());
+            return StepResult::from_bool("書き込み", false, error.kind().as_str().to_owned());
         }
     };
     let test_value = 4242.0;
@@ -374,11 +438,11 @@ async fn step4_write(
                     );
                 }
             }
-            StepResult::new("書き込み", matched, format!("読戻={got:?}"))
+            StepResult::from_bool("書き込み", matched, format!("読戻={got:?}"))
         }
         Err(error) => {
             println!("  書込失敗: kind={}", error.kind().as_str());
-            StepResult::new("書き込み", false, error.kind().as_str().to_owned())
+            StepResult::from_bool("書き込み", false, error.kind().as_str().to_owned())
         }
     }
 }
@@ -392,11 +456,11 @@ async fn step5_forbidden(
     println!("--- [5/6] 403 (writable=false) 確認 ---");
     let Some(catalog) = catalog else {
         println!("  スキップ: catalog取得に失敗したため stable_id を解決できません。");
-        return StepResult::new("403確認", false, "catalog未取得のためスキップ");
+        return StepResult::skipped("403確認", "catalog未取得のためスキップ");
     };
     let Some(tag) = find_tag(catalog, EXT_MB_DI_RO) else {
         println!("  失敗: {EXT_MB_DI_RO} が catalog に見つかりません。");
-        return StepResult::new("403確認", false, "mb.g1.di_roがcatalogに存在しない");
+        return StepResult::from_bool("403確認", false, "mb.g1.di_roがcatalogに存在しない");
     };
     if tag.writable {
         println!("  警告: {EXT_MB_DI_RO} は writable=true でした（想定は false）。");
@@ -405,13 +469,13 @@ async fn step5_forbidden(
         Ok(client) => client,
         Err(error) => {
             println!("  クライアント構築失敗: kind={}", error.kind().as_str());
-            return StepResult::new("403確認", false, error.kind().as_str().to_owned());
+            return StepResult::from_bool("403確認", false, error.kind().as_str().to_owned());
         }
     };
     match client.write_tag(tag.ids, RequestedValue::Bool(true)).await {
         Ok(()) => {
             println!("  想定外: writable=false のタグへの書込が成功してしまいました。");
-            StepResult::new("403確認", false, "書込が成功してしまった（本来403のはず）")
+            StepResult::from_bool("403確認", false, "書込が成功してしまった（本来403のはず）")
         }
         Err(error) => {
             let matched = error.kind() == ErrorKind::WriteForbidden;
@@ -420,30 +484,49 @@ async fn step5_forbidden(
                 error.kind().as_str()
             );
             let detail = format!("kind={}", error.kind().as_str());
-            StepResult::new("403確認", matched, detail)
+            StepResult::from_bool("403確認", matched, detail)
         }
     }
 }
 
-/// `POST /api/write-control/{enable|disable}` を叩く（試運転モードのため
-/// Bearer 認証は不要だが、CSRF ガード用の `X-Banto-Client` ヘッダは必要）。
+/// `POST /api/write-control/{enable|disable}` を叩く。
+///
+/// 試運転モードの Hub では管理セッションの Bearer 認証は不要で、CSRF
+/// ガード用の `X-Banto-Client` ヘッダのみで通る。ただし**ロックダウン済み
+/// の Hub（＝本番の実態）ではこれだけでは 401/403 になる**ため、
+/// `admin_token`（環境変数 `HUB_ADMIN_TOKEN` 由来。未設定なら `None`）が
+/// 与えられていれば `Authorization: Bearer` ヘッダを付ける。
 async fn set_write_control(
     http: &reqwest::Client,
     hub_url: &str,
     enable: bool,
+    admin_token: Option<&str>,
 ) -> Result<(), String> {
     let action = if enable { "enable" } else { "disable" };
     let base = hub_url.trim_end_matches('/');
     let url = format!("{base}/api/write-control/{action}");
-    let response = http
-        .post(url)
-        .header("X-Banto-Client", "banto")
+    let mut request = http.post(url).header("X-Banto-Client", "banto");
+    if let Some(token) = admin_token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    let response = request
         .send()
         .await
         .map_err(|error| format!("送信失敗: {error}"))?;
     let status = response.status();
     if status.is_success() {
         Ok(())
+    } else if status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::FORBIDDEN
+    {
+        let hint = if admin_token.is_some() {
+            "HUB_ADMIN_TOKEN の値が無効か、権限が不足している可能性があります。"
+        } else {
+            "ロックダウン済みの Hub では管理セッションの認証が必要です。環境変数 HUB_ADMIN_TOKEN に管理者の Bearer トークンを設定してください（試運転モードでは不要）。"
+        };
+        Err(format!(
+            "HTTPステータス={status}（認証/権限エラー）。{hint}"
+        ))
     } else {
         Err(format!("HTTPステータス={status}"))
     }
@@ -457,27 +540,28 @@ async fn step6_unavailable(
     hub_url: &str,
     api_key: &str,
     catalog: Option<&CatalogSnapshot>,
+    admin_token: Option<&str>,
 ) -> StepResult {
     println!("--- [6/6] 503 (write-control 無効化) 確認 ---");
     let Some(catalog) = catalog else {
         println!("  スキップ: catalog取得に失敗したため stable_id を解決できません。");
-        return StepResult::new("503確認", false, "catalog未取得のためスキップ");
+        return StepResult::skipped("503確認", "catalog未取得のためスキップ");
     };
     let Some(tag) = find_tag(catalog, EXT_PLC_D3000) else {
         println!("  失敗: {EXT_PLC_D3000} が catalog に見つかりません。");
-        return StepResult::new("503確認", false, "plc.gs.d3000がcatalogに存在しない");
+        return StepResult::from_bool("503確認", false, "plc.gs.d3000がcatalogに存在しない");
     };
     let http = match reqwest::ClientBuilder::new().no_proxy().build() {
         Ok(http) => http,
         Err(error) => {
             println!("  reqwestクライアント構築失敗: {error}");
             let detail = format!("reqwestクライアント構築失敗: {error}");
-            return StepResult::new("503確認", false, detail);
+            return StepResult::from_bool("503確認", false, detail);
         }
     };
 
     println!("  write-control を無効化します (POST /api/write-control/disable) ...");
-    let disable_result = set_write_control(&http, hub_url, false).await;
+    let disable_result = set_write_control(&http, hub_url, false, admin_token).await;
 
     let (write_ok, write_detail) = match &disable_result {
         Ok(()) => {
@@ -515,7 +599,7 @@ async fn step6_unavailable(
 
     // ここまでの成否に関わらず、必ず有効化へ戻す。
     println!("  write-control を有効化に戻します (POST /api/write-control/enable) ...");
-    let enable_result = set_write_control(&http, hub_url, true).await;
+    let enable_result = set_write_control(&http, hub_url, true, admin_token).await;
     match &enable_result {
         Ok(()) => println!("  有効化: 成功"),
         Err(message) => {
@@ -546,7 +630,7 @@ async fn step6_unavailable(
         "{write_detail}, enable呼び出し={}, 復旧確認={restored}",
         enable_result.is_ok()
     );
-    StepResult::new("503確認", write_ok, detail)
+    StepResult::from_bool("503確認", write_ok, detail)
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -562,6 +646,9 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // ロックダウン済みの Hub（本番の実態）で項目6の write-control 切り替えに
+    // 管理セッションの認証が要る場合のみ設定する。試運転モードでは不要。
+    let admin_token = env::var("HUB_ADMIN_TOKEN").ok();
     println!("Hub URL: {hub_url}\n");
 
     let mut results = Vec::new();
@@ -582,25 +669,33 @@ async fn main() {
     results.push(step5_forbidden(&hub_url, &api_key, catalog.as_ref()).await);
     println!();
 
-    results.push(step6_unavailable(&hub_url, &api_key, catalog.as_ref()).await);
+    results.push(
+        step6_unavailable(&hub_url, &api_key, catalog.as_ref(), admin_token.as_deref()).await,
+    );
     println!();
 
     println!("=== 検証結果サマリ ===");
     for result in &results {
-        let mark = if result.ok { "OK" } else { "NG" };
-        println!("[{mark}] {} - {}", result.name, result.detail);
+        println!(
+            "[{}] {} - {}",
+            result.status.mark(),
+            result.name,
+            result.detail
+        );
     }
-    let all_ok = results.iter().all(|result| result.ok);
+    // スキップも「検証できていない」という点では成功ではないため、
+    // 終了コードの判定では失敗と同様に非成功として扱う（表示のみ区別する）。
+    let all_pass = results.iter().all(|result| result.status.is_pass());
     println!();
     println!(
         "総合結果: {}",
-        if all_ok {
+        if all_pass {
             "全項目成功"
         } else {
-            "一部項目が失敗または想定外"
+            "一部項目が失敗・想定外、またはスキップ"
         }
     );
-    if !all_ok {
+    if !all_pass {
         std::process::exit(1);
     }
 }
