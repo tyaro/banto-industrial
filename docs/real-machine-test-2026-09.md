@@ -1,7 +1,7 @@
 # 実機テスト手順書（2026-09-01 実装分）
 
 作成日: 2026-09-01
-状態: **A（SLMP 回帰）完了・B（Modbus）実施済み（2026-09-01）**。C（tagclient）未実施。検証不能項目は §8 を参照
+状態: **A・B・C 実施完了（2026-09-01）**。A は全項目合格、B は合格4/一部合格1/検証不能3（理由は §8）、C は全項目合格
 対象: [#130](https://github.com/tyaro/banto-industrial/issues/130) broker プロトコル抽象化 / [#131](https://github.com/tyaro/banto-industrial/issues/131) Modbus 書き込み（[#219](https://github.com/tyaro/banto-industrial/issues/219)） / [#123](https://github.com/tyaro/banto-industrial/issues/123) banto-tagclient
 
 ---
@@ -266,7 +266,7 @@ BANTO_HUB_DATA=<scratch>/hub-smoke-data
 | B-3.6 数量上限                   | **検証不能** | 単一リクエストのため FC15/FC16 の複数要素経路に到達しない。§8-1 参照                        |
 | B-3.7 部分成功                   | **一部合格** | String は 422（値型ゲート）で broker 到達前に拒否。**直後の書き込みは成功**しセッション無傷 |
 | B-3.8 SLMP と Modbus の同居      | **合格**     | 実 PLC・実スレーブ・到達不能接続を同時稼働。それぞれ connected/connected/reconnecting       |
-| C tagclient                      | 未実施       |                                                                                             |
+| C tagclient                      | **合格**     | 6項目すべて成功。**403 と 503 が期待どおり区別**された。§9 参照                             |
 
 ### 副次的に確認できたこと
 
@@ -311,3 +311,37 @@ BANTO_HUB_DATA=<scratch>/hub-smoke-data
 - 結果を [#219](https://github.com/tyaro/banto-industrial/issues/219)（Modbus）と [#123](https://github.com/tyaro/banto-industrial/issues/123)（tagclient）へ記録する
 - SLMP 回帰（A）に異常が無ければ、[#130](https://github.com/tyaro/banto-industrial/issues/130) の実機確認が済んだことを本書の `状態:` 行へ反映する
 - 異常があれば**そのまま起票する**。「たぶん環境依存」で流さない — このプロジェクトで実機のみ露見した不具合は、いずれも実在の欠陥だった
+
+---
+
+## 9. C（banto-tagclient）の実施結果
+
+検証ハーネス: `crates/banto-tagclient/examples/real_hub_smoke.rs`
+
+```bash
+HUB_API_KEY=bh_xxxxxxxx cargo run --example real_hub_smoke -p banto-tagclient
+```
+
+`HUB_URL`（既定 `http://127.0.0.1:8722`）と `HUB_API_KEY` を環境変数で受け取る。**キーはコードに埋め込まない。**
+
+| 項目              | 結果     | 内容                                                                 |
+| ----------------- | -------- | -------------------------------------------------------------------- |
+| 1. catalog 取得   | **合格** | tags=11                                                              |
+| 2. 読み取り       | **合格** | `plc.gs.d3000` / `mb.g1.hr1`（quality=good）                         |
+| 3. 購読           | **合格** | Live 到達後、値の更新を受信                                          |
+| 4. 書き込み       | **合格** | `plc.gs.d3000` ← 4242、読み戻し一致                                  |
+| 5. **403 の区別** | **合格** | `writable=false` のタグ → `ErrorKind::WriteForbidden`                |
+| 6. **503 の区別** | **合格** | 受付無効化中 → `ErrorKind::WriteUnavailable`。復帰後の書き込みも成功 |
+
+**403 と 503 が実機で区別できることを確認した。** 403 は「設定の問題」、503 は「一時的な状態」で現場の対処が違うため、SDK 利用者がここを判別できることが実用上の要。
+
+### ハーネス作成中に判明した Hub の挙動（実装バグではない）
+
+いずれも Hub の設計どおりの挙動だが、**SDK 利用者が最初に踏む**ものなので記録する。
+
+- **購読は on-change 配信**（`apps/banto-hub/core/src/subscribe_core.rs` の `Mode::OnChange`）。値も quality も変化しなければ**フレームは1つも来ない**。「購読したのに何も届かない」は正常な場合がある。値が静止している環境で購読を確認するには、**別クライアントから値を変える**必要がある。
+- **書き込み直後の読み取りは旧値を返す**。Hub の current 値は**次回ポーリングで更新される**ため、周期 1000ms なら最大1周期ぶん遅れる。書き込み → 即読み戻しで一致を期待すると失敗する。**ポーリング周期を跨いで確認すること。**
+
+### C の未実施分
+
+**LAN 越し（別マシンから）の確認は未実施**（本日はすべて同一 PC のループバック）。#123 の残スコープである**配布サイズの実測**と **release tag での固定**も未着手。
