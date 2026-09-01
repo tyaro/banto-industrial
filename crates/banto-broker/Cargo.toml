@@ -6,7 +6,7 @@
 # 不変 - relay-wright 側の既存テストが回帰網（詳細は src/lib.rs 冒頭 doc）。
 [package]
 name = "banto-broker"
-description = "I6: PLC access broker（read/write 単一セッション・SLMP専用）- relay-wright W3-A から抽出、banto-hub T2-2 と共用 (docs/tag-server-design.md §6-5)"
+description = "I6: PLC access broker（read/write 単一セッション、SLMP/Modbus TCP対応）- relay-wright W3-A から抽出、banto-hub T2-2 と共用 (docs/tag-server-design.md §6-5)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

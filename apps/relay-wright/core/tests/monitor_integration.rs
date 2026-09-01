@@ -402,8 +402,20 @@ async fn manual_write_lands_while_disarmed_and_is_audited() {
 // audited as failed manual writes (debug history).
 // ---------------------------------------------------------------------------
 
+/// This is relay-wright's OWN product-scope decision, not a broker
+/// limitation: `banto-broker` gained a `"modbus-tcp"` driver in Issue #131
+/// (2026-09-01) and happily serves Modbus reads/writes through
+/// `SessionDirectory::ensure_connection` today. relay-wright's タグモニタ has
+/// never been reviewed or designed for anything but SLMP, so
+/// `engine::monitor`'s own `require_slmp` gate (mirroring `engine::mod`'s
+/// `SLMP_PROTOCOL` filter on `Engine::start`'s managed-connection set)
+/// rejects the Modbus connection itself, before the request ever reaches the
+/// broker. This test proves both `monitor_group_read` and `monitor_tag_write`
+/// reject it with a clear, SLMP-mentioning error, and that the rejected write
+/// still lands a `failed` audit row (debug history is not lost just because
+/// the rejection moved from the broker to this module).
 #[tokio::test]
-async fn monitor_rejects_a_modbus_connection_with_a_clear_error() {
+async fn monitor_rejects_a_modbus_connection_via_relay_wrights_own_slmp_only_gate() {
     let f = Fixture::new().await;
     enable_manual_write(&f.pool).await;
     let plc = PlcConnectionService::new(f.pool.clone());

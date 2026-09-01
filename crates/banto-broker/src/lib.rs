@@ -41,21 +41,24 @@
 //! "build this connection's session and spawn its task" constructor, in
 //! place of the old `conn.protocol != SLMP_PROTOCOL` equality check.
 //!
-//! Exactly one driver is registered today: `"slmp"` ([`slmp_driver`] module,
-//! wrapping `banto_plc`'s `plan_slmp_batch`/`execute_slmp_batch_reads` and
-//! `banto_plc_write`'s `plan_slmp_write_batch`/`execute_slmp_writes` behind
-//! [`slmp_driver::SlmpSession`] - moved out of this file's job loop, not
-//! changed). Every other `protocol` value - including the literal string
-//! `"modbus-tcp"` - is still rejected with
-//! [`BrokerError::UnsupportedProtocol`], with the same message as before;
-//! this refactor (tracked since docs/tag-server-design.md §6 item 7 as **I9**,
-//! "Modbus 書き込み（banto-plc-write への FC5/6/15/16 追加 + broker の
-//! プロトコル抽象化）は I9 バックログ", now done for the broker half) only
-//! changes *how* that rejection is decided, not what any caller observes.
-//! Issue #131 (Modbus TCP write support) is expected to add a `"modbus-tcp"`
-//! [`session::BrokerSession`] implementation and one more [`DRIVERS`] entry -
-//! nothing else in this file should need to change for that; #130 itself
-//! implements no Modbus behavior at all.
+//! Two drivers are registered as of #131 (2026-09-01): `"slmp"`
+//! ([`slmp_driver`] module, wrapping `banto_plc`'s
+//! `plan_slmp_batch`/`execute_slmp_batch_reads` and `banto_plc_write`'s
+//! `plan_slmp_write_batch`/`execute_slmp_writes` behind
+//! [`slmp_driver::SlmpSession`] - moved out of this file's job loop by #130,
+//! not changed), and `"modbus-tcp"` ([`modbus_driver`] module, wrapping
+//! `banto_plc`'s `plan_batch_requests`/`execute_modbus_reads` and
+//! `banto_plc_write`'s `plan_modbus_writes`/`execute_modbus_writes` behind
+//! [`modbus_driver::ModbusSession`] - #131's own addition, landed in the same
+//! PR as this paragraph's update). Every other `protocol` value is still
+//! rejected with [`BrokerError::UnsupportedProtocol`] (see
+//! [`is_supported_protocol`] for the single source of truth on which
+//! protocol strings are currently registered). This refactor was tracked
+//! since docs/tag-server-design.md §6 item 7 as **I9**, "Modbus 書き込み
+//! （banto-plc-write への FC5/6/15/16 追加 + broker のプロトコル抽象化）は
+//! I9 バックログ" - #130 did the protocol-abstraction half (no Modbus
+//! behavior), and #131 (this PR) adds the `"modbus-tcp"` driver itself, so
+//! I9 is now fully done.
 //!
 //! ### Why a new trait, not `banto_plc::PlcClient` + `banto_plc_write::PlcWriteClient`
 //!
@@ -220,15 +223,20 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+mod modbus_driver;
 mod session;
 mod slmp_driver;
 
 use session::{BrokerSession, Connector, SessionError};
 
 /// The protocol string identifying the SLMP driver ([`slmp_driver`]) in
-/// [`DRIVERS`] - the only entry registered today (see the module doc's
-/// "Protocol abstraction" section).
+/// [`DRIVERS`] (see the module doc's "Protocol abstraction" section).
 const SLMP_PROTOCOL: &str = "slmp";
+
+/// The protocol string identifying the Modbus TCP driver ([`modbus_driver`])
+/// in [`DRIVERS`] (#131, 2026-09-01) - see the module doc's "Protocol
+/// abstraction" section.
+const MODBUS_PROTOCOL: &str = "modbus-tcp";
 
 /// Parse [`PlcConnection::word_order`]'s wire string into the
 /// [`WordOrder`] [`SlmpConfig::word_order`] wants (P3-b, 監査指摘
@@ -272,6 +280,41 @@ fn slmp_config_for(conn: &PlcConnection, port: u16) -> SlmpConfig {
         // the fallback this now goes through.
         word_order: parse_word_order(&conn.word_order),
         ..SlmpConfig::default()
+    }
+}
+
+/// Build [`ensure_connection`][SessionDirectory::ensure_connection]'s
+/// [`banto_plc::ModbusTcpConfig`] from `conn` - the Modbus twin of
+/// [`slmp_config_for`], factored out for the same test-without-a-socket
+/// reason.
+///
+/// `unit_id`: `banto_tags::PlcConnection::unit_id` is registry-validated to
+/// `0..=255` at input time (`banto-tags`'s `MIN_UNIT_ID..=MAX_UNIT_ID`), so
+/// `conn.unit_id: i64` always fits `u8` for any row that passed normal CRUD -
+/// the `unwrap_or_else` fallback to `ModbusTcpConfig::default().unit_id` is
+/// defense-in-depth for a hand-edited/pre-migration row, exactly the same
+/// fail-open posture [`parse_word_order`] documents for `word_order`, not a
+/// path expected in practice.
+///
+/// `word_order`: reuses [`parse_word_order`] (the *same* helper
+/// [`slmp_config_for`] uses, not a duplicate) even though
+/// [`banto_plc::ModbusTcpConfig::default`]'s own `word_order` is
+/// [`WordOrder::HighLow`] - the opposite of [`SlmpConfig::default`]'s
+/// `WordOrder::LowHigh`. `parse_word_order`'s fallback to `WordOrder::LowHigh`
+/// on an unrecognized string is unconditional regardless of which protocol
+/// calls it; this matches `banto_plc_write::modbus::ModbusWriteClient`'s
+/// already-documented behavior of taking the connection's configured order
+/// through this same shared `word_order` column, so a hand-edited/
+/// pre-migration Modbus row fails open to `LowHigh` too, not to
+/// `ModbusTcpConfig::default()`'s `HighLow`.
+fn modbus_config_for(conn: &PlcConnection, port: u16) -> banto_plc::ModbusTcpConfig {
+    banto_plc::ModbusTcpConfig {
+        host: conn.host.clone(),
+        port,
+        unit_id: u8::try_from(conn.unit_id)
+            .unwrap_or_else(|_| banto_plc::ModbusTcpConfig::default().unit_id),
+        word_order: parse_word_order(&conn.word_order),
+        ..banto_plc::ModbusTcpConfig::default()
     }
 }
 
@@ -340,13 +383,18 @@ pub enum BrokerError {
     #[error("PLC接続 {connection_id} のブローカータスクは終了しています")]
     TaskGone { connection_id: i64 },
 
-    /// [`BrokerSupervisor::spawn`] was given a connection whose
-    /// `protocol` is not `"slmp"`. This broker is SLMP-only; a Modbus TCP (or
-    /// any other protocol) connection is rejected outright rather than
-    /// silently skipped, so a caller relying on `.handle(id)` finds out
-    /// immediately at startup rather than discovering a missing handle later
-    /// as an unexplained `None`.
-    #[error("接続 {connection_id} は SLMP ではありません（protocol={protocol}）。ブローカーは SLMP 専用です")]
+    /// [`BrokerSupervisor::spawn`] was given a connection whose `protocol`
+    /// has no [`DRIVERS`] entry - as of #131 (2026-09-01), that means
+    /// anything other than `"slmp"` or `"modbus-tcp"`. Such a connection is
+    /// rejected outright rather than silently skipped, so a caller relying on
+    /// `.handle(id)` finds out immediately at startup rather than discovering
+    /// a missing handle later as an unexplained `None`.
+    ///
+    /// The "slmp, modbus-tcp" list below is hand-written rather than derived
+    /// from [`DRIVERS`] at the `#[error(...)]` site (a `thiserror` format
+    /// string cannot call a function), so it must be kept in sync with
+    /// [`DRIVERS`] by hand if a third driver is ever added.
+    #[error("接続 {connection_id} のプロトコル {protocol} はブローカー未対応です（対応: slmp, modbus-tcp）")]
     UnsupportedProtocol {
         connection_id: i64,
         protocol: String,
@@ -632,11 +680,13 @@ type DriverSpawn =
     fn(&PlcConnection, u16, BackoffConfig, watch::Receiver<bool>) -> (BrokerHandle, TaskEntry);
 
 /// The protocol -> driver dispatch table [`SessionDirectory::ensure_connection`]
-/// consults (Issue #130 D5). Exactly one entry today; Issue #131 (Modbus TCP
-/// write support) is expected to add a `"modbus-tcp"` entry here and nowhere
-/// else - `ensure_connection`'s own lookup logic does not change per driver
-/// added.
-const DRIVERS: &[(&str, DriverSpawn)] = &[(SLMP_PROTOCOL, spawn_slmp_driver)];
+/// consults (Issue #130 D5). Two entries as of #131 (2026-09-01, Modbus TCP
+/// write support) - `ensure_connection`'s own lookup logic did not need to
+/// change to add the second one.
+const DRIVERS: &[(&str, DriverSpawn)] = &[
+    (SLMP_PROTOCOL, spawn_slmp_driver),
+    (MODBUS_PROTOCOL, spawn_modbus_driver),
+];
 
 /// [`DriverSpawn`] for `"slmp"`: build this connection's [`SlmpConfig`] (see
 /// [`slmp_config_for`]) and hand it to [`spawn_task`] - the same SLMP-specific
@@ -650,6 +700,35 @@ fn spawn_slmp_driver(
     shutdown_rx: watch::Receiver<bool>,
 ) -> (BrokerHandle, TaskEntry) {
     spawn_task(conn.id, slmp_config_for(conn, port), backoff, shutdown_rx)
+}
+
+/// [`DriverSpawn`] for `"modbus-tcp"` (#131, 2026-09-01): build this
+/// connection's [`banto_plc::ModbusTcpConfig`] (see [`modbus_config_for`])
+/// and hand it, already wrapped as a [`modbus_driver::connector`], to
+/// [`spawn_task_with_connector`] - unlike [`spawn_slmp_driver`], this cannot
+/// go through [`spawn_task`] itself, since that wrapper is hardcoded to
+/// [`slmp_driver::connector`].
+fn spawn_modbus_driver(
+    conn: &PlcConnection,
+    port: u16,
+    backoff: BackoffConfig,
+    shutdown_rx: watch::Receiver<bool>,
+) -> (BrokerHandle, TaskEntry) {
+    spawn_task_with_connector(
+        conn.id,
+        modbus_driver::connector(modbus_config_for(conn, port)),
+        backoff,
+        shutdown_rx,
+    )
+}
+
+/// Whether `protocol` has a registered [`DRIVERS`] entry - the single source
+/// of truth for "does the broker manage this connection's protocol", so a
+/// caller outside this crate (banto-hub) never needs to hardcode the list of
+/// supported protocol strings itself. Mirrors
+/// [`SessionDirectory::ensure_connection`]'s own lookup.
+pub fn is_supported_protocol(protocol: &str) -> bool {
+    DRIVERS.iter().any(|(p, _)| *p == protocol)
 }
 
 impl SessionDirectory {
@@ -686,10 +765,10 @@ impl SessionDirectory {
     /// The handle for `conn`, spawning its broker task first if none is
     /// running yet (see the struct doc's on-demand policy). Rejects a
     /// connection whose `protocol` has no [`DRIVERS`] entry with
-    /// [`BrokerError::UnsupportedProtocol`] - `"slmp"` is the only one
-    /// registered today (see the module doc's "Protocol abstraction"
-    /// section), so this still rejects everything else exactly as it did
-    /// when this was a direct `!= SLMP_PROTOCOL` check.
+    /// [`BrokerError::UnsupportedProtocol`] - `"slmp"` and `"modbus-tcp"` are
+    /// the two registered as of #131 (see the module doc's "Protocol
+    /// abstraction" section), so this still rejects everything else exactly
+    /// as it did when this was a direct `!= SLMP_PROTOCOL` check.
     pub fn ensure_connection(&self, conn: &PlcConnection) -> Result<BrokerHandle, BrokerError> {
         let driver = DRIVERS
             .iter()
@@ -895,18 +974,18 @@ impl BrokerSupervisor {
     }
 }
 
-/// Build one connection's `(handle, task)` pair - the part of
-/// [`BrokerSupervisor::spawn`]'s body that does not need to see the whole
-/// slice, factored out so the test module can spawn a task against a
-/// hand-built [`SlmpConfig`] (e.g. a short `response_timeout` for a fast
-/// reconnect test) without going through `PlcConnection`/`BrokerSupervisor`
-/// at all. `shutdown_rx` is the task's clone of the supervisor-wide shutdown
-/// trigger (see [`BrokerSupervisor::shutdown`]); a caller that does not need
-/// that path (e.g. a test that only ever drops its lone `BrokerHandle`) can
-/// pass a receiver from a `watch::channel` it never signals.
-fn spawn_task(
+/// Build one connection's `(handle, task)` pair from an already-built
+/// [`Connector`] - the protocol-agnostic core [`spawn_task`] (SLMP) and
+/// [`spawn_modbus_driver`] (Modbus TCP) both call, factored out (#131,
+/// 2026-09-01) so a second driver did not need its own copy of this
+/// bookkeeping. `shutdown_rx` is the task's clone of the supervisor-wide
+/// shutdown trigger (see [`BrokerSupervisor::shutdown`]); a caller that does
+/// not need that path (e.g. a test that only ever drops its lone
+/// `BrokerHandle`) can pass a receiver from a `watch::channel` it never
+/// signals.
+fn spawn_task_with_connector(
     connection_id: i64,
-    config: SlmpConfig,
+    connector: Connector,
     backoff: BackoffConfig,
     shutdown_rx: watch::Receiver<bool>,
 ) -> (BrokerHandle, TaskEntry) {
@@ -917,11 +996,6 @@ fn spawn_task(
     // (immediate first attempt), i.e. attempt 1 is about to fire.
     let (status_tx, status_rx) =
         watch::channel(BrokerConnectionStatus::Reconnecting { attempt: 1 });
-    // The only SLMP-specific line in this function: everything downstream
-    // (`run_broker_task`, `ConnState`, `ConnEvent`) only ever sees the
-    // resulting `Connector` - see the module doc's "Protocol abstraction"
-    // section.
-    let connector = slmp_driver::connector(config);
     let task = tokio::spawn(run_broker_task(
         connection_id,
         connector,
@@ -941,6 +1015,27 @@ fn spawn_task(
             stop_tx,
             join_handle: task,
         },
+    )
+}
+
+/// SLMP-specific wrapper over [`spawn_task_with_connector`], kept only so
+/// existing tests (and any external caller) that pass a bare [`SlmpConfig`]
+/// directly keep working unchanged after #131 generalized the underlying
+/// spawn logic to any protocol's [`Connector`]. [`spawn_slmp_driver`] is the
+/// `DRIVERS`-facing entry point; this is the lower-level one this crate's own
+/// unit tests call directly (with a hand-built `SlmpConfig`, bypassing
+/// `PlcConnection`/`ensure_connection` entirely).
+fn spawn_task(
+    connection_id: i64,
+    config: SlmpConfig,
+    backoff: BackoffConfig,
+    shutdown_rx: watch::Receiver<bool>,
+) -> (BrokerHandle, TaskEntry) {
+    spawn_task_with_connector(
+        connection_id,
+        slmp_driver::connector(config),
+        backoff,
+        shutdown_rx,
     )
 }
 
@@ -1358,20 +1453,38 @@ mod tests {
     // Supervisor
     // -----------------------------------------------------------------
 
+    /// Renamed from `supervisor_rejects_a_modbus_tcp_connection` (#131,
+    /// 2026-09-01): that test's premise is now wrong - `"modbus-tcp"` is a
+    /// registered [`DRIVERS`] protocol as of this PR, no longer rejected. The
+    /// property this test guards (an unregistered protocol string is
+    /// rejected outright, not silently skipped) is unchanged, so it is kept
+    /// with a made-up unsupported protocol string instead of dropped.
     #[tokio::test]
-    async fn supervisor_rejects_a_modbus_tcp_connection() {
-        let connections = [conn(1, "modbus-tcp", "127.0.0.1", 502)];
+    async fn supervisor_rejects_an_unsupported_protocol_connection() {
+        let connections = [conn(1, "bogus-protocol", "127.0.0.1", 502)];
         let err = match BrokerSupervisor::spawn(&connections, BackoffConfig::default()) {
-            Ok(_) => panic!("modbus-tcp must be rejected"),
+            Ok(_) => panic!("an unregistered protocol must be rejected"),
             Err(e) => e,
         };
         assert_eq!(
             err,
             BrokerError::UnsupportedProtocol {
                 connection_id: 1,
-                protocol: "modbus-tcp".to_string(),
+                protocol: "bogus-protocol".to_string(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn supervisor_hands_out_a_handle_per_modbus_tcp_connection() {
+        let sim = banto_plc_write::modbus::simulator::Simulator::start().await;
+        let connections = [conn(7, "modbus-tcp", "127.0.0.1", sim.addr.port())];
+        let supervisor = BrokerSupervisor::spawn(&connections, BackoffConfig::default())
+            .expect("a modbus-tcp connection should spawn");
+        assert_eq!(supervisor.connection_count(), 1);
+        assert!(supervisor.handle(7).is_some());
+        assert!(supervisor.handle(999).is_none());
+        supervisor.shutdown().await;
     }
 
     #[tokio::test]

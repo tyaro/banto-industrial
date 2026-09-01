@@ -162,6 +162,16 @@ struct TestApp {
     pool: SqlitePool,
     manager: Arc<CollectorManager>,
     write_control: Arc<WriteControl>,
+    /// #131 (2026-09-01): the SAME `Arc` `manager`'s internals hold - needed
+    /// so a test can reach `HubSessions::write_handle_for` directly, the way
+    /// `tests/t15_write_peek.rs`/`tests/t9_simulation.rs` already do, to
+    /// exercise the broker session below `write_path::execute_write`'s own
+    /// gates (e.g. the simulation-write safety gate, which unconditionally
+    /// rejects writes to ANY `simulation = true` PLC tag over REST regardless
+    /// of protocol - unrelated to and unchanged by this task, but it means a
+    /// test proving `SlmpSimRegistry::resolve`'s Modbus fix cannot go through
+    /// `POST /api/v1/values/{tag}` at all and must call the broker directly).
+    sessions: Arc<HubSessions>,
     _env: TempEnv,
 }
 
@@ -211,7 +221,7 @@ async fn test_app(label: &str) -> TestApp {
         env.data_dir(),
         Arc::new(SystemClock),
         fast_options(),
-        sessions,
+        sessions.clone(),
         sim_registry,
         computed,
     ));
@@ -279,6 +289,7 @@ async fn test_app(label: &str) -> TestApp {
         pool,
         manager,
         write_control,
+        sessions,
         _env: env,
     }
 }
@@ -504,6 +515,229 @@ async fn e2e_write_then_collection_reads_the_value_back_through_the_same_broker_
 }
 
 // ---------------------------------------------------------------------------
+// 1b. #131 (2026-09-01): the same E2E happy path, but for a Modbus TCP tag -
+//    proves banto-broker's new "modbus-tcp" driver actually lets a Modbus
+//    connection's writable tag be written through
+//    POST /api/v1/values/{tag}, landing on the wire via
+//    `banto_plc_write::modbus::simulator::Simulator`. Unlike the SLMP test
+//    above, Modbus reads stay on banto-collect's own direct `ModbusTcpClient`
+//    (`crate::broker_glue::hub_client_factory`'s doc comment, "Read/write
+//    asymmetry for Modbus TCP") - the collection read-back below still
+//    succeeds because both the broker's write socket and banto-collect's own
+//    read socket dial the SAME external simulator process, just over two
+//    independent TCP connections (the accepted tradeoff docs/tag-server-design.md
+//    §6 item 5 documents for Modbus, in contrast to SLMP's single shared
+//    session).
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_modbus_write_then_collection_reads_the_value_back() {
+    let app = test_app("e2e-modbus-happy").await;
+    let sim = banto_plc_write::modbus::simulator::Simulator::start().await;
+
+    let (tag_id, external_name) = make_tag(
+        &app,
+        "line1",
+        "modbus-tcp",
+        sim.addr.port(),
+        "temp01",
+        "40001",
+        "u16",
+        true,
+        true,
+    )
+    .await;
+    app.write_control.enable();
+
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:line1.fast.temp01"],
+    )
+    .await;
+
+    let (status, body) = v1_post(
+        &app.router,
+        &format!("/api/v1/values/{external_name}"),
+        &key,
+        json!({ "v": 1234 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["tag"], external_name);
+    assert_eq!(body["result"], "ok");
+
+    assert_eq!(
+        sim.get_holding_register(0),
+        1234,
+        "value must land on the wire (via the broker's modbus-tcp driver)"
+    );
+
+    // 収集(banto-collect の直接 ModbusTcpClient、broker とは別ソケット)が
+    // 同じシミュレータから読み戻すことの確認 - Modbus は読み取りが broker
+    // 経由にならない、という #131 のスコープ境界を裏側から裏づける
+    // (書き込みは broker、読み取りは直接クライアントの、別々のソケット
+    // 経由で、どちらも同じ実体を見ている)。
+    let tag_key = format!("tag:{tag_id}");
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            app.manager
+                .current_values()
+                .and_then(|c| c.get(&tag_key))
+                .map(|s| s.value)
+                == Some(Some(1234.0))
+        })
+        .await,
+        "collection should read back the value the write endpoint just wrote"
+    );
+
+    let (status, json) = get_json(
+        &app.router,
+        &format!("/api/v1/values/{external_name}"),
+        &app.admin_token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["v"], 1234.0);
+    assert_eq!(json["q"], "good");
+
+    sim.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 1c. #131 (2026-09-01) simulation-safety regression test for the Part 1 fix
+//    to `SlmpSimRegistry::resolve`: a Modbus connection with
+//    `simulation = true` must have its broker session dial the in-process
+//    MODBUS-speaking simulator `SlmpSimRegistry` substitutes, NOT the
+//    connection's configured (real, unreachable in this test) host/port, and
+//    NOT (the bug this fixes) an SLMP-speaking simulator mismatched against
+//    the Modbus wire protocol the broker's `ModbusSession` actually speaks.
+//
+//    This deliberately does NOT go through `POST /api/v1/values/{tag}` (the
+//    way the other E2E tests in this file do) - `write_path::execute_write`'s
+//    simulation-write safety gate (module doc gate 4,
+//    `WriteRejection::SimulationWriteRejected`) unconditionally rejects a
+//    write to ANY `simulation = true` PLC tag over REST, for every protocol,
+//    both before and after this task (that gate is a deliberate,
+//    protocol-agnostic UX safety rule - "don't let an operator write to what
+//    might look like a real device but is actually a dev-mode simulator" -
+//    and this task does not touch it). So this test instead reaches the
+//    broker session the same way `tests/t15_write_peek.rs` does: directly via
+//    `HubSessions::write_handle_for`, bypassing `execute_write`'s gates
+//    entirely, to isolate exactly what this task changed -
+//    `SlmpSimRegistry::resolve`'s protocol-aware simulator selection - from
+//    the unrelated REST-level safety gate.
+//
+//    What "success" means here is subtler than "the write returns Ok":
+//    `banto_collect::simulation::start`'s in-process simulators
+//    (`banto_plc::{modbus,slmp}::simulator::Simulator`) are READ-ONLY - they
+//    exist for `Collector`'s own T9-1 read-side simulation feature, and
+//    `banto_plc::modbus::simulator::Simulator` answers any write function
+//    code (FC5/6/15/16) with a clean Modbus "illegal function" exception
+//    (verified by reading `crates/banto-plc/src/modbus/simulator.rs`'s
+//    `build_response`). So a *well-formed* `WriteResult::Bad(ModbusException)`
+//    response is actually the strongest available proof this fix works: it
+//    means the broker's `ModbusSession` dialed something that speaks valid
+//    Modbus TCP framing well enough to construct a proper MBAP-framed
+//    exception reply. Verified empirically (temporarily reverting the Part 1
+//    fix and rerunning this exact test) that the OLD, buggy behavior is
+//    `BrokerError::ConnectionFailed { reason: "応答タイムアウト" }` - the
+//    Modbus session times out waiting for a response it can parse, because
+//    `resolve` had dialed an SLMP-speaking simulator that never produces
+//    anything shaped like a Modbus TCP response frame at all.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn simulated_modbus_connection_write_dials_the_in_process_simulator_not_the_real_host() {
+    let app = test_app("e2e-modbus-sim-write").await;
+
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(PlcConnectionInput {
+            simulation: true,
+            // Port 1 is a privileged port nothing in this test suite listens
+            // on - connecting to it fails fast (connection refused) rather
+            // than hanging, so if the Part 1 fix ever regressed and this
+            // dialed the connection's own host/port instead of the
+            // simulator, the test would fail fast rather than time out.
+            ..modbus_conn_input("line1", 1)
+        })
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group.id, "40017", "u16", true, true))
+        .await
+        .unwrap();
+    app.manager.rebuild().await.expect("rebuild");
+
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            app.manager
+                .broker_status(conn.id)
+                .map(|s| s == banto_broker::BrokerConnectionStatus::Connected)
+                .unwrap_or(false)
+        })
+        .await,
+        "the broker session should reach Connected against the substituted simulator, not hang \
+         trying to dial the unreachable real host/port"
+    );
+
+    let handle = app
+        .sessions
+        .write_handle_for(conn.id)
+        .expect("a live broker session should be peekable for this connection");
+    let results = handle
+        .write(vec![banto_plc_write::BatchWriteRequest::Numeric(
+            banto_plc_write::WriteRequest {
+                address: banto_plc::Address::ModbusRef {
+                    area: banto_plc::AddressArea::HoldingRegister,
+                    // Offset 16 ("40017") is deliberately outside
+                    // `banto_collect::simulation::RAMP_ADDRESS_COUNT` (16),
+                    // so nothing else is racing to overwrite it - not load-
+                    // bearing here (this test does not read the value back),
+                    // but keeps this test's address choice consistent with
+                    // `e2e_modbus_write_then_collection_reads_the_value_back`'s
+                    // and avoids any doubt about ramp interference.
+                    offset: 16,
+                    bit: None,
+                },
+                data_type: banto_plc::DataType::U16,
+                value: banto_plc::TagValue::F64(4242.0),
+            },
+        )])
+        .await
+        .expect(
+            "the write must reach a live, Modbus-speaking session and get back a well-formed \
+             response - NOT BrokerError::ConnectionFailed/Disconnected, which is what the pre-fix \
+             SLMP-simulator mismatch produced (verified empirically - see this test's own doc \
+             comment above)",
+        );
+    assert_eq!(
+        results.len(),
+        1,
+        "one request in, one result out: {results:?}"
+    );
+    assert!(
+        matches!(
+            &results[0],
+            banto_plc_write::WriteResult::Bad(banto_plc_write::PlcWriteError::ModbusException {
+                function: 6,
+                code: 1,
+                ..
+            })
+        ),
+        "expected a well-formed Modbus \"illegal function\" exception from the read-only \
+         in-process simulator (proof the broker dialed a real Modbus-speaking peer - see this \
+         test's doc comment for why this Bad, not an Ok, is the correct expectation here), got \
+         {results:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 2. ゲート網羅
 // ---------------------------------------------------------------------------
 
@@ -603,8 +837,25 @@ async fn gate_disabled_tag_is_409_tag_disabled() {
     sim.stop();
 }
 
+/// #131 (2026-09-01) regression note: this test used to be named
+/// `gate_modbus_connection_is_501_write_unsupported_protocol` and asserted a
+/// Modbus tag write was rejected at the protocol gate (`write_path.rs` gate
+/// 5, formerly a literal `conn.protocol != "slmp"` check) with a 501. That
+/// premise is now false - `banto_broker` registered a `"modbus-tcp"` driver
+/// (#131), `write_path::execute_write`'s protocol gate is now
+/// `banto_broker::is_supported_protocol`, and a Modbus tag no longer trips it
+/// at all. Renamed (matching how `crates/banto-broker`'s own
+/// `supervisor_rejects_a_modbus_tcp_connection` was renamed to
+/// `supervisor_rejects_an_unsupported_protocol_connection` in the same PR)
+/// to pin down what actually happens now instead of deleting the coverage:
+/// the connection points at a port nothing listens on (15099, same as
+/// before), so the write now passes the protocol gate, reaches the broker
+/// session (which `rebuild` spawned but which never manages to connect), and
+/// fails at the broker call itself with `WriteRejection::WriteFailed` (502) -
+/// proving the gate genuinely passed rather than the write succeeding for
+/// the wrong reason (e.g. some other gate silently absorbing the rejection).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn gate_modbus_connection_is_501_write_unsupported_protocol() {
+async fn gate_modbus_connection_now_passes_the_protocol_gate_and_fails_only_at_the_broker_call() {
     let app = test_app("gate-modbus").await;
     let (_tag_id, external_name) = make_tag(
         &app,
@@ -634,7 +885,73 @@ async fn gate_modbus_connection_is_501_write_unsupported_protocol() {
         json!({ "v": 1 }),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body:?}");
+    assert_eq!(body["error"], "write_failed");
+}
+
+/// #131 (2026-09-01) gate coverage: `write_path::execute_write`'s protocol
+/// gate (gate 5) still rejects a connection whose protocol has no
+/// `banto_broker` driver - proven here with `"virtual"`
+/// (`banto_tags::ALLOWED_PROTOCOLS` allows it at the registry layer, but
+/// `banto_broker::is_supported_protocol` does not, so it is a genuine
+/// still-unsupported protocol string, unlike `"modbus-tcp"` above). A `plc`
+/// tag cannot normally be placed under any `"virtual"`-protocol connection
+/// (`banto_tags::tag::validate_tag_kind_placement` rejects it unconditionally
+/// - "plc タグは予約接続（calc/mem）配下に作成できません" - regardless of the
+/// connection's name), so this test bypasses the registry service layer with
+/// a raw SQL `UPDATE` after creating an ordinary Modbus connection/group/tag
+/// through the normal API, mirroring this codebase's existing convention for
+/// exercising a defensive/otherwise-unreachable-via-CRUD branch (see
+/// `crates/banto-tags/src/plc_connection.rs`'s
+/// `the_sql_check_accepts_nothing_beyond_allowed_protocols`-style tests).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gate_unsupported_broker_protocol_is_501_write_unsupported_protocol() {
+    let app = test_app("gate-unsupported-protocol").await;
+    let (_tag_id, external_name) = make_tag(
+        &app,
+        "line1",
+        "modbus-tcp",
+        15099,
+        "temp01",
+        "40001",
+        "i16",
+        true,
+        true,
+    )
+    .await;
+
+    // Bypass PlcConnectionService (which enforces ALLOWED_PROTOCOLS = the SQL
+    // CHECK's list, `"modbus-tcp" | "slmp" | "virtual"`) to land on a
+    // protocol string the SQL CHECK still allows but `banto_broker` has no
+    // driver for - "virtual" is the only such string in ALLOWED_PROTOCOLS
+    // today, so this is not a fully synthetic value, just one the registry
+    // layer would otherwise never let a `plc`-kind tag's connection use.
+    sqlx::query("UPDATE plc_connections SET protocol = 'virtual' WHERE name = 'line1'")
+        .execute(&app.pool)
+        .await
+        .expect("hand-edit the connection's protocol");
+    app.manager
+        .rebuild()
+        .await
+        .expect("rebuild after hand-edit");
+
+    app.write_control.enable();
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:line1.fast.temp01"],
+    )
+    .await;
+
+    let (status, body) = v1_post(
+        &app.router,
+        &format!("/api/v1/values/{external_name}"),
+        &key,
+        json!({ "v": 1 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body:?}");
     assert_eq!(body["error"], "write_unsupported_protocol");
 }
 

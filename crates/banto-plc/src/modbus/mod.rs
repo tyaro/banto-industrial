@@ -113,12 +113,6 @@ impl ModbusTcpClient {
         }
     }
 
-    fn next_tid(&mut self) -> u16 {
-        let tid = self.next_transaction_id;
-        self.next_transaction_id = self.next_transaction_id.wrapping_add(1);
-        tid
-    }
-
     /// Send one wire request for `group` and decode its response.
     /// `Err(PlcError::ModbusException { .. })` is the *only* non-fatal
     /// outcome (see this module's doc comment) - every other `Err` means
@@ -194,24 +188,158 @@ enum GroupValues {
     Registers(Vec<u16>),
 }
 
+/// Dial a fresh Modbus TCP session against `config`: connect the raw socket,
+/// racing it against [`ModbusTcpConfig::connect_timeout`] and mapping a
+/// failure onto [`PlcError`], then set `TCP_NODELAY` best-effort.
+///
+/// The single shared implementation of the Modbus TCP connect sequence (H9
+/// transport 共通化, docs/improvement-plan.md §H9, mirroring
+/// [`crate::dial_slmp`]'s doc comment for the SLMP side): before this
+/// extraction, [`ModbusTcpClient::connect`] built its own `TcpStream`
+/// inline, and a future `banto-broker` Modbus driver (#131) would otherwise
+/// have needed to duplicate the exact same four steps (build the address
+/// string, race `TcpStream::connect` against the timeout, map
+/// `ConnectTimeout`/`Connection`, best-effort `set_nodelay`) a second time.
+/// This is now the one place that sequence is written; `ModbusTcpClient::connect`
+/// folds the result into its own `Option<TcpStream>` field (and resets its
+/// own `next_transaction_id`, which this function does not touch - dialing
+/// is connection-establishment only, not session-state reset), and
+/// `banto-broker`'s Modbus driver wraps the returned bare `TcpStream`
+/// directly in its own session type instead.
+pub async fn dial_modbus(config: &ModbusTcpConfig) -> Result<TcpStream, PlcError> {
+    let addr = format!("{}:{}", config.host, config.port);
+    let stream = tokio::time::timeout(config.connect_timeout, TcpStream::connect(&addr))
+        .await
+        .map_err(|_| PlcError::ConnectTimeout(addr.clone()))?
+        .map_err(|e| PlcError::Connection(e.to_string()))?;
+    // Modbus request/response pairs are small (a handful of bytes to tens of
+    // bytes for a 256-tag group's worth of registers) and every caller of
+    // this function always waits for a reply before sending the next request
+    // - Nagle's algorithm's batching would only ever add latency here, never
+    // save a packet, which directly fights the 100ms-cycle performance
+    // target (recorder-requirements.md §3.1). Best-effort: a platform that
+    // rejects `set_nodelay` still works, just potentially slower.
+    let _ = stream.set_nodelay(true);
+    Ok(stream)
+}
+
+/// Execute a planned batch of reads on a **borrowed** `TcpStream` plus the
+/// small amount of per-connection state (`next_transaction_id`) a Modbus TCP
+/// session needs between calls - the reusable core a future broker caller
+/// (`banto-broker`'s Modbus driver, this same #131 PR) calls directly against
+/// its own shared socket and shared transaction-id counter, exactly mirroring
+/// [`crate::execute_slmp_batch_reads`]'s relationship to the SLMP driver (see
+/// that function's doc comment).
+///
+/// The transaction id increment is inlined here (`let tid =
+/// *next_transaction_id; *next_transaction_id =
+/// next_transaction_id.wrapping_add(1);`) rather than going through a
+/// `next_tid()` method, matching
+/// `banto_plc_write::execute_modbus_writes`'s shape exactly: there is no
+/// `self` in a free function, and keeping the increment identical between
+/// the read and write borrowed-stream executors is what lets a caller share
+/// one counter between both (see `banto-broker`'s `ModbusSession` doc
+/// comment for why that sharing is safety-critical).
+///
+/// `Err` is reserved for a connection-fatal failure (the caller must drop
+/// the stream and reconnect); a device-side Modbus exception becomes a
+/// per-request [`ReadResult::Bad`] for that group's requests and the loop
+/// continues - same contract as [`ModbusTcpClient::read_batch`] before this
+/// extraction. Unlike that method, this function does not own a `stream`
+/// field to clear on a fatal error: it simply returns `Err` immediately, and
+/// stream teardown is the caller's job (mirroring
+/// `execute_modbus_writes`, which does the same).
+pub async fn execute_modbus_reads(
+    stream: &mut TcpStream,
+    unit_id: u8,
+    response_timeout: Duration,
+    next_transaction_id: &mut u16,
+    outcome: &crate::planning::PlanOutcome,
+    total_requests: usize,
+    word_order: WordOrder,
+) -> Result<Vec<ReadResult>, PlcError> {
+    let mut results: Vec<Option<ReadResult>> = vec![None; total_requests];
+    for (index, reason) in &outcome.immediate_bad {
+        results[*index] = Some(ReadResult::Bad(reason.clone()));
+    }
+
+    for group in &outcome.reads {
+        let tid = *next_transaction_id;
+        *next_transaction_id = next_transaction_id.wrapping_add(1);
+
+        let attempt = tokio::time::timeout(
+            response_timeout,
+            ModbusTcpClient::execute_one(stream, tid, unit_id, group),
+        )
+        .await
+        .unwrap_or(Err(PlcError::ResponseTimeout));
+
+        match attempt {
+            Ok(values) => {
+                for m in &group.mapping {
+                    let value = match &values {
+                        GroupValues::Bits(bits) => TagValue::Bit(bits[m.offset_in_read as usize]),
+                        GroupValues::Registers(regs) => {
+                            // T8 (docs/tag-server-design.md §6.1): a
+                            // bit-in-word request decodes one bit out of the
+                            // register window instead of the whole register
+                            // as `m.data_type` - `m.bit` is `Some` only when
+                            // the planner already proved `m.data_type ==
+                            // DataType::Bit`, so there is no possibility of
+                            // decoding the wrong shape here.
+                            let decoded = match m.bit {
+                                Some(bit) => {
+                                    decode_register_bit(regs, m.offset_in_read as usize, bit)
+                                }
+                                None => decode_register_value(
+                                    regs,
+                                    m.offset_in_read as usize,
+                                    m.data_type,
+                                    word_order,
+                                ),
+                            };
+                            match decoded {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    results[m.request_index] = Some(ReadResult::Bad(e));
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+                    results[m.request_index] = Some(ReadResult::Value(value));
+                }
+            }
+            Err(err) if !err.is_connection_fatal() => {
+                // Modbus exception: only this group is bad, keep going.
+                for m in &group.mapping {
+                    results[m.request_index] = Some(ReadResult::Bad(err.clone()));
+                }
+            }
+            Err(err) => {
+                // Connection-fatal: stream may be desynchronized or dead.
+                // Stop and hand the error up - per this module's doc
+                // comment, reconnecting is the caller's job.
+                return Err(err);
+            }
+        }
+    }
+
+    Ok(results
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            r.unwrap_or_else(|| {
+                panic!("plan_requests must account for every input index, missing {i}")
+            })
+        })
+        .collect())
+}
+
 impl PlcClient for ModbusTcpClient {
     fn connect(&mut self) -> BoxFuture<'_, Result<(), PlcError>> {
         Box::pin(async move {
-            let addr = format!("{}:{}", self.config.host, self.config.port);
-            let stream =
-                tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(&addr))
-                    .await
-                    .map_err(|_| PlcError::ConnectTimeout(addr.clone()))?
-                    .map_err(|e| PlcError::Connection(e.to_string()))?;
-            // Modbus request/response pairs are small (a handful of bytes to
-            // tens of bytes for a 256-tag group's worth of registers) and
-            // this client always waits for a reply before sending the next
-            // request - Nagle's algorithm's batching would only ever add
-            // latency here, never save a packet, which directly fights the
-            // 100ms-cycle performance target (recorder-requirements.md
-            // §3.1). Best-effort: a platform that rejects `set_nodelay`
-            // still works, just potentially slower.
-            let _ = stream.set_nodelay(true);
+            let stream = dial_modbus(&self.config).await?;
             self.stream = Some(stream);
             self.next_transaction_id = 0;
             Ok(())
@@ -228,100 +356,35 @@ impl PlcClient for ModbusTcpClient {
             }
 
             let outcome = plan_requests(requests);
-            let mut results: Vec<Option<ReadResult>> = vec![None; requests.len()];
-            for (index, reason) in outcome.immediate_bad {
-                results[index] = Some(ReadResult::Bad(reason));
-            }
-
             let response_timeout = self.config.response_timeout;
             let unit_id = self.config.unit_id;
             let word_order = self.config.word_order;
 
-            for group in &outcome.reads {
-                let tid = self.next_tid();
-                // `self.stream` is guaranteed `Some` here: the only place
-                // that clears it is the fatal-error branch a few lines
-                // below, which returns immediately afterward.
-                let stream = self
-                    .stream
-                    .as_mut()
-                    .expect("checked Some above, only cleared on early return");
+            // `self.stream` is guaranteed `Some` here (checked above); it is
+            // only ever cleared below, on the fatal branch, right before
+            // returning.
+            let stream = self
+                .stream
+                .as_mut()
+                .expect("checked Some above, only cleared on early return");
 
-                let attempt = tokio::time::timeout(
-                    response_timeout,
-                    Self::execute_one(stream, tid, unit_id, group),
-                )
-                .await
-                .unwrap_or(Err(PlcError::ResponseTimeout));
-
-                match attempt {
-                    Ok(values) => {
-                        for m in &group.mapping {
-                            let value = match &values {
-                                GroupValues::Bits(bits) => {
-                                    TagValue::Bit(bits[m.offset_in_read as usize])
-                                }
-                                GroupValues::Registers(regs) => {
-                                    // T8 (docs/tag-server-design.md §6.1): a
-                                    // bit-in-word request decodes one bit out
-                                    // of the register window instead of the
-                                    // whole register as `m.data_type` -
-                                    // `m.bit` is `Some` only when the
-                                    // planner already proved `m.data_type ==
-                                    // DataType::Bit`, so there is no
-                                    // possibility of decoding the wrong shape
-                                    // here.
-                                    let decoded = match m.bit {
-                                        Some(bit) => decode_register_bit(
-                                            regs,
-                                            m.offset_in_read as usize,
-                                            bit,
-                                        ),
-                                        None => decode_register_value(
-                                            regs,
-                                            m.offset_in_read as usize,
-                                            m.data_type,
-                                            word_order,
-                                        ),
-                                    };
-                                    match decoded {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            results[m.request_index] = Some(ReadResult::Bad(e));
-                                            continue;
-                                        }
-                                    }
-                                }
-                            };
-                            results[m.request_index] = Some(ReadResult::Value(value));
-                        }
-                    }
-                    Err(err) if !err.is_connection_fatal() => {
-                        // Modbus exception: only this group is bad, keep going.
-                        for m in &group.mapping {
-                            results[m.request_index] = Some(ReadResult::Bad(err.clone()));
-                        }
-                    }
-                    Err(err) => {
-                        // Connection-fatal: stream may be desynchronized or
-                        // dead. Stop, tear it down, and hand the error up -
-                        // per this module's doc comment, reconnecting is
-                        // the caller's (I3's) job.
-                        self.stream = None;
-                        return Err(err);
-                    }
+            match execute_modbus_reads(
+                stream,
+                unit_id,
+                response_timeout,
+                &mut self.next_transaction_id,
+                &outcome,
+                requests.len(),
+                word_order,
+            )
+            .await
+            {
+                Ok(results) => Ok(results),
+                Err(err) => {
+                    self.stream = None;
+                    Err(err)
                 }
             }
-
-            Ok(results
-                .into_iter()
-                .enumerate()
-                .map(|(i, r)| {
-                    r.unwrap_or_else(|| {
-                        panic!("plan_requests must account for every input index, missing {i}")
-                    })
-                })
-                .collect())
         })
     }
 
