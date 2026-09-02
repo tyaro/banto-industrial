@@ -345,7 +345,7 @@ impl RegistrySnapshot {
         .await
         .map_err(|err| CollectError::Registry(banto_core::BantoError::Storage(err.to_string())))?;
         let groups = sqlx::query_as::<_, CollectionGroup>(
-            "SELECT id, name, plc_connection_id, period_ms, enabled \
+            "SELECT id, name, plc_connection_id, period_ms, enabled, default_writable \
              FROM collection_groups ORDER BY id",
         )
         .fetch_all(&mut *connection)
@@ -721,6 +721,7 @@ mod tests {
             plc_connection_id: conn_id,
             period_ms,
             enabled: true,
+            default_writable: true,
         }
     }
 

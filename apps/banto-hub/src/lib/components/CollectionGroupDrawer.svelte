@@ -83,10 +83,6 @@
 		nextGroupName,
 		type CollectionGroupFormState
 	} from '$lib/banto/collectionGroupForm';
-	import {
-		getGroupDefaultWritable,
-		setGroupDefaultWritable
-	} from '$lib/banto/groupWritableDefault';
 
 	/** `pendingChangesAdmin.ts::PendingChange.source` - `rest.rs::collection_groups_create` が `queue_pending_registry_change` に渡す文字列と一致させる。 */
 	const PENDING_SOURCE = 'collection_groups.create';
@@ -172,21 +168,6 @@
 	let step: 1 | 2 | 3 = $state(1);
 
 	/**
-	 * T19 S1-b（UX-34、docs/banto-hub-t19-design.md §2「収集グループ単位で
-	 * 既定値を変更できるようにします」、2026-09-02 オーナー決定）: 「この
-	 * グループの新規タグは既定で書込可」チェックボックスの現在値。
-	 *
-	 * **サーバーの `CollectionGroup`/`CollectionGroupInput` の一部ではない**
-	 * - `$lib/banto/groupWritableDefault.ts` の doc comment に書いた理由
-	 * （`banto-tags` が relay-wright/banto-collect とも共有するクレートで、
-	 * DB 列化の影響範囲がそれら無関係なアプリに及ぶと判明したため）で
-	 * `localStorage` 側に持つ。新規作成では対象グループの id がまだ無い
-	 * ため、作成成功後（`handleCreate` の `created.id` 確定後）に初めて
-	 * 保存する - それまではこの `$state` だけがユーザーの選択を保持する。
-	 */
-	let defaultWritablePref = $state(true);
-
-	/**
 	 * Drawer を開いた対象（新規作成 or どのグループの再設定か）を表すキー。
 	 * `ConnectionDrawer.svelte::lastOpenKey` と同じ役割・同じ理由
 	 * （保存成功後に親が `groups` を再取得して新しい `CollectionGroup`
@@ -217,14 +198,7 @@
 		if (group) {
 			form = groupToForm(group);
 			provisionalName = null;
-			// T19 S1-b（UX-34）: 既存グループの再設定 - このブラウザに保存済みの
-			// 既定値を読み直す（未設定なら `getGroupDefaultWritable` 自体が
-			// 全体既定の `true` を返す）。
-			defaultWritablePref = getGroupDefaultWritable(group.id);
 		} else {
-			// T19 S1-b（UX-34）: 新規作成は id が無いのでこのブラウザの保存値を
-			// 参照しようがない - 全体既定の `true` から始める。
-			defaultWritablePref = true;
 			const blank = blankGroupForm(DEFAULT_PERIOD_MS);
 			const initialName = nextGroupName(existingNames);
 			blank.name = initialName;
@@ -315,12 +289,6 @@
 		try {
 			const created = await createCollectionGroup(formToGroupInput(form));
 			toastStore.push('success', '作成しました');
-			// T19 S1-b（UX-34）: 作成が確定した時点で初めて id が確定するため、
-			// ここで初めて（このブラウザの）既定値を保存する。202 キュー投入時
-			// はこの then 節に来ない（下の catch の `isQueuedWhileRunningError`
-			// 分岐 - まだ id が確定していないため保存しようがなく、それでよい:
-			// 後で実際にこのグループを再設定 Drawer で開いたときにまた選べる）。
-			setGroupDefaultWritable(created.id, defaultWritablePref);
 			onSaved(created);
 			onClose();
 		} catch (err) {
@@ -352,10 +320,6 @@
 			// 保存成功後はサーバーの正規化値を基準に取り直す（ConnectionDrawer
 			// の handleSave と同じ方針）。Drawer は閉じない。
 			form = groupToForm(updated);
-			// T19 S1-b（UX-34）: 202 キュー投入時（下の catch）はまだ確定して
-			// いないため保存しない - 実際に適用されてから再度開いたときの
-			// 選択に委ねる。
-			setGroupDefaultWritable(updated.id, defaultWritablePref);
 			onSaved(updated);
 		} catch (err) {
 			if (isQueuedWhileRunningError(err)) {
@@ -437,11 +401,12 @@
 		</label>
 		<!--
 			T19 S1-b（UX-34「収集グループ単位で既定値を変更できるようにする」、
-			2026-09-02 オーナー決定）: このグループへの新規タグ登録が
-			「書き込み可（writable）」チェックボックスをどちらの状態で
-			始めるかを、グループ単位で選べる。サーバーの `CollectionGroup`
-			には保存しない（このブラウザの `localStorage` にのみ残る -
-			`$lib/banto/groupWritableDefault.ts` の doc comment に理由あり）。
+			2026-09-02 オーナー決定「グループ単位の既定値は DB 列に持つ」）:
+			このグループへの新規タグ登録が「書き込み可（writable）」
+			チェックボックスをどちらの状態で始めるかを、グループ単位で
+			選べる。サーバーの `CollectionGroup.defaultWritable`
+			（`crates/banto-tags/src/collection_group.rs`）に永続化される -
+			`periodMs`/`enabled` と同じ、`form` の通常フィールドの1つ。
 			`writable` の実際の登録可否（computed タグ拒否、および
 			Modbus 読み取り専用領域拒否を含む8段ゲート - 後者は S1-b0 で
 			UI に配線予定、`$lib/banto/writableDefault.ts` 参照）には
@@ -449,7 +414,7 @@
 			チェックボックスの初期値だけを決める。
 		-->
 		<label class="field checkbox wide">
-			<input type="checkbox" bind:checked={defaultWritablePref} disabled={readOnly} />
+			<input type="checkbox" bind:checked={form.defaultWritable} disabled={readOnly} />
 			このグループの新規タグは既定で書込可（writable）
 		</label>
 		<span class="hint wide">
@@ -471,7 +436,7 @@
 		<dt>有効</dt>
 		<dd>{form.enabled ? 'はい' : 'いいえ'}</dd>
 		<dt>新規タグの書込可既定</dt>
-		<dd>{defaultWritablePref ? 'ON' : 'OFF'}</dd>
+		<dd>{form.defaultWritable ? 'ON' : 'OFF'}</dd>
 	</dl>
 {/snippet}
 

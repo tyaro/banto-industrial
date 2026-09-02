@@ -2022,6 +2022,7 @@ mod tests {
                 plc_connection_id: conn.id,
                 period_ms: 1_000,
                 enabled: true,
+                default_writable: true,
             })
             .await
             .unwrap();
@@ -2428,6 +2429,7 @@ mod tests {
                     .id,
                 period_ms: 1_000,
                 enabled: true,
+                default_writable: true,
             })
             .await
             .unwrap();
@@ -2901,6 +2903,7 @@ mod tests {
                 plc_connection_id: conn.id,
                 period_ms: 1_000,
                 enabled: true,
+                default_writable: true,
             })
             .await
             .expect("group under a virtual connection should be creatable");
@@ -3861,6 +3864,7 @@ mod tests {
                 plc_connection_id: conn2.id,
                 period_ms: 1_000,
                 enabled: true,
+                default_writable: true,
             })
             .await
             .unwrap();
@@ -4056,6 +4060,7 @@ mod tests {
                     .id,
                 period_ms: 1_000,
                 enabled: true,
+                default_writable: true,
             })
             .await
             .unwrap();
@@ -4097,6 +4102,7 @@ mod tests {
                     .id,
                 period_ms: 1_000,
                 enabled: true,
+                default_writable: true,
             })
             .await
             .unwrap();
@@ -4177,6 +4183,7 @@ mod tests {
                     .id,
                 period_ms: 1_000,
                 enabled: true,
+                default_writable: true,
             })
             .await
             .unwrap();
@@ -4366,6 +4373,7 @@ mod tests {
                     .id,
                 period_ms: 1_000,
                 enabled: true,
+                default_writable: true,
             })
             .await
             .unwrap();
@@ -4411,6 +4419,7 @@ mod tests {
                     .id,
                 period_ms: 1_000,
                 enabled: true,
+                default_writable: true,
             })
             .await
             .unwrap();

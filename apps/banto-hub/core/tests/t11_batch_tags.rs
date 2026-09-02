@@ -102,6 +102,7 @@ fn group_input(name: &str, conn_id: i64) -> CollectionGroupInput {
         plc_connection_id: conn_id,
         period_ms: 1_000,
         enabled: false,
+        default_writable: true,
     }
 }
 

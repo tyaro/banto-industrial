@@ -70,6 +70,13 @@ export interface CollectionGroupFormState {
 	plcConnectionId: string;
 	periodMs: string;
 	enabled: boolean;
+	/**
+	 * T19 S1-b（UX-34、2026-09-02 オーナー決定「グループ単位の既定値は
+	 * DB 列に持つ」）: このグループへ新規タグを登録するときの `writable`
+	 * チェックボックスの既定値。サーバー側 `CollectionGroup.defaultWritable`
+	 * と1対1（`periodMs`/`enabled` と同じ、単純なフォームフィールド）。
+	 */
+	defaultWritable: boolean;
 }
 
 /**
@@ -97,7 +104,11 @@ export function blankGroupForm(defaultPeriodMs: number): CollectionGroupFormStat
 		name: '',
 		plcConnectionId: '',
 		periodMs: String(defaultPeriodMs),
-		enabled: true
+		enabled: true,
+		// T19 S1-b（UX-34 全体方針「既定 ON」）: 新規グループ自体の既定値
+		// も ON から始める（サーバー側の列既定値、`banto_tags::
+		// collection_group::default_writable_true` と揃える）。
+		defaultWritable: true
 	};
 }
 
@@ -107,7 +118,8 @@ export function groupToForm(g: CollectionGroup): CollectionGroupFormState {
 		name: g.name,
 		plcConnectionId: String(g.plcConnectionId),
 		periodMs: String(g.periodMs),
-		enabled: g.enabled
+		enabled: g.enabled,
+		defaultWritable: g.defaultWritable
 	};
 }
 
@@ -117,6 +129,7 @@ export function formToGroupInput(form: CollectionGroupFormState): CollectionGrou
 		name: form.name,
 		plcConnectionId: Number(form.plcConnectionId),
 		periodMs: Number(form.periodMs),
-		enabled: form.enabled
+		enabled: form.enabled,
+		defaultWritable: form.defaultWritable
 	};
 }

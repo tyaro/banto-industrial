@@ -125,7 +125,6 @@
 	import { buildDuplicateFormValues } from '$lib/banto/tagDuplicate';
 	import { nextTagNameOnAddressChange } from '$lib/banto/tagNamePrefill';
 	import { canDefaultWritable, writableDefaultBlockedReason } from '$lib/banto/writableDefault';
-	import { getGroupDefaultWritable } from '$lib/banto/groupWritableDefault';
 	import {
 		monitorHref,
 		resolveGroupIdFromTreeSelection,
@@ -570,11 +569,13 @@
 	 * T19 S1-b（UX-34）: create Drawer が開いている間、`createForm.writable`
 	 * を「PLC タグかどうか」（{@link canDefaultWritable}、
 	 * `$lib/banto/writableDefault.ts`）とグループ単位の既定値
-	 * （{@link getGroupDefaultWritable}、`$lib/banto/
-	 * groupWritableDefault.ts` - このブラウザの `localStorage` にしか
-	 * 残らない設定であることの背景は同モジュールの doc comment 参照）の
-	 * 両方から自動計算し続ける。`createWritableTouched` が `true` になった
-	 * 後は何もしない（ユーザーが自分で決めた値を上書きしない）。
+	 * （`CollectionGroup.defaultWritable` - 2026-09-02 オーナー判断
+	 * 「グループ単位の既定値は DB 列に持つ」により、既に読み込み済みの
+	 * `groups` 配列から直接引く。以前の実装は `localStorage` を使っていた
+	 * が、本番投入前に安いうちに正しく持たせる判断でサーバー側の列へ
+	 * 置き換えた）の両方から自動計算し続ける。`createWritableTouched` が
+	 * `true` になった後は何もしない（ユーザーが自分で決めた値を上書き
+	 * しない）。
 	 *
 	 * **2026-09-02 オーナー判断（S1-b0 分離）**: アドレス領域（Modbus
 	 * `1xxxx`/`3xxxx` 読み取り専用）による絞り込みはここでは行わない -
@@ -589,7 +590,7 @@
 	 * 絞り込みが有効になる - 関数シグネチャは既にその形になっている。
 	 *
 	 * 依存として読むのは `drawerMode`・`createWritableTouched`・
-	 * `createForm.tagKind`・`createForm.collectionGroupId` の4つ -
+	 * `createForm.tagKind`・`createForm.collectionGroupId`・`groups` の5つ -
 	 * `createForm.writable` 自身は読まない（読むと自分の書き込みで自分を
 	 * 再トリガーする無限ループのリスクになる）。
 	 */
@@ -597,10 +598,13 @@
 		if (drawerMode !== 'create' || createWritableTouched) return;
 		const eligible = canDefaultWritable(createForm.tagKind);
 		const groupId = Number(createForm.collectionGroupId);
-		const groupDefault =
+		const selectedGroup =
 			createForm.collectionGroupId !== '' && Number.isFinite(groupId)
-				? getGroupDefaultWritable(groupId)
-				: true;
+				? groups.find((g) => g.id === groupId)
+				: undefined;
+		// 未選択・グループが見つからない間は全体既定の `true` にフォール
+		// バックする（`groupWritableDefault.ts` の旧実装と同じ既定値）。
+		const groupDefault = selectedGroup?.defaultWritable ?? true;
 		createForm.writable = eligible && groupDefault;
 	});
 

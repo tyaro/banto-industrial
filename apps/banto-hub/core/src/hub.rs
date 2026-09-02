@@ -1881,6 +1881,7 @@ mod tests {
             plc_connection_id: conn1.id,
             period_ms: 1_000,
             enabled: true,
+            default_writable: true,
         };
         let group2 = banto_tags::CollectionGroup {
             id: 20,
@@ -1888,6 +1889,7 @@ mod tests {
             plc_connection_id: conn2.id,
             period_ms: 1_000,
             enabled: true,
+            default_writable: true,
         };
         let tag_in_group1 = Tag {
             id: 100,
@@ -1967,6 +1969,7 @@ mod tests {
                 plc_connection_id: conn.id,
                 period_ms: 100,
                 enabled: true,
+                default_writable: true,
             })
             .await
             .unwrap();
@@ -2040,6 +2043,7 @@ mod tests {
                 plc_connection_id: conn.id,
                 period_ms: 100,
                 enabled: true,
+                default_writable: true,
             })
             .await
             .unwrap();

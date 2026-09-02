@@ -22,6 +22,17 @@ fn default_enabled() -> bool {
     true
 }
 
+/// T19 S1-b（UX-34、docs/banto-hub-t19-design.md §2・§3.3、2026-09-02
+/// オーナー決定）: `default_writable` の既定値。UX-34 の全体方針「既定
+/// ON」に合わせ、`CollectionGroupInput` に列を省略した既存クライアント
+/// （relay-wright/chronogazer にはこの列自体が無いので該当しないが、将来
+/// 追従が遅れた banto-hub クライアントを想定した後方互換）は「既定 ON」の
+/// グループとして作成される - `migrations/0012_collection_groups_add_
+/// default_writable.sql` の列既定値 `1` と揃えてある。
+fn default_writable_true() -> bool {
+    true
+}
+
 /// A row of the `collection_groups` table, wire-shaped (camelCase) for a
 /// future settings grid (recorder-requirements.md §6 "グループ設定" screen).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
@@ -32,6 +43,14 @@ pub struct CollectionGroup {
     pub plc_connection_id: i64,
     pub period_ms: i64,
     pub enabled: bool,
+    /// T19 S1-b（UX-34）: このグループへ新規タグを登録するときの
+    /// `writable` チェックボックスの初期値（banto-hub の UI 向け既定値で
+    /// あり、`tags.writable` 自体の検証ルールとは無関係 - `tag.rs::
+    /// validate_tag_input` の computed タグ拒否・Modbus 読み取り専用領域
+    /// 拒否はこの値に関係なくそのまま効く）。relay-wright/chronogazer の
+    /// 収集・書き込み動作はこの列を一切参照しない（`migrations/0012_
+    /// collection_groups_add_default_writable.sql` 参照）。
+    pub default_writable: bool,
 }
 
 /// Create/update payload.
@@ -42,6 +61,10 @@ pub struct CollectionGroupInput {
     pub period_ms: i64,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// T19 S1-b（UX-34）: 省略時は `default_writable_true`（既定 ON、
+    /// migration 0012 の列既定値と同じ）。
+    #[serde(default = "default_writable_true")]
+    pub default_writable: bool,
 }
 
 /// Validate a [`CollectionGroupInput`]: `name` trimmed non-empty and capped
@@ -94,10 +117,11 @@ fn column_map() -> ColumnMap {
         .column("plcConnectionId", "plc_connection_id")
         .column("periodMs", "period_ms")
         .column("enabled", "enabled")
+        .column("defaultWritable", "default_writable")
 }
 
 const RESOURCE: &str = "collection_groups";
-const COLUMNS: &str = "id, name, plc_connection_id, period_ms, enabled";
+const COLUMNS: &str = "id, name, plc_connection_id, period_ms, enabled, default_writable";
 const FK_MESSAGE: &str = "指定されたPLC接続が見つかりません";
 
 /// Service layer for the `collection_groups` resource.
@@ -162,13 +186,14 @@ impl CollectionGroupService {
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
-            "INSERT INTO collection_groups (name, plc_connection_id, period_ms, enabled) \
-             VALUES (?, ?, ?, ?) RETURNING {COLUMNS}"
+            "INSERT INTO collection_groups (name, plc_connection_id, period_ms, enabled, default_writable) \
+             VALUES (?, ?, ?, ?, ?) RETURNING {COLUMNS}"
         )))
         .bind(input.name.trim())
         .bind(input.plc_connection_id)
         .bind(input.period_ms)
         .bind(input.enabled)
+        .bind(input.default_writable)
         .fetch_one(&self.pool)
         .await
         .map_err(|err| {
@@ -192,13 +217,14 @@ impl CollectionGroupService {
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
-            "INSERT INTO collection_groups (name, plc_connection_id, period_ms, enabled) \
-             VALUES (?, ?, ?, ?) RETURNING {COLUMNS}"
+            "INSERT INTO collection_groups (name, plc_connection_id, period_ms, enabled, default_writable) \
+             VALUES (?, ?, ?, ?, ?) RETURNING {COLUMNS}"
         )))
         .bind(input.name.trim())
         .bind(input.plc_connection_id)
         .bind(input.period_ms)
         .bind(input.enabled)
+        .bind(input.default_writable)
         .fetch_one(&mut *connection)
         .await
         .map_err(|err| {
@@ -221,13 +247,14 @@ impl CollectionGroupService {
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
-            "UPDATE collection_groups SET name = ?, plc_connection_id = ?, period_ms = ?, enabled = ? \
+            "UPDATE collection_groups SET name = ?, plc_connection_id = ?, period_ms = ?, enabled = ?, default_writable = ? \
              WHERE id = ? RETURNING {COLUMNS}"
         )))
         .bind(input.name.trim())
         .bind(input.plc_connection_id)
         .bind(input.period_ms)
         .bind(input.enabled)
+        .bind(input.default_writable)
         .bind(id)
         .fetch_one(&self.pool)
         .await
@@ -251,13 +278,14 @@ impl CollectionGroupService {
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
-            "UPDATE collection_groups SET name = ?, plc_connection_id = ?, period_ms = ?, enabled = ? \
+            "UPDATE collection_groups SET name = ?, plc_connection_id = ?, period_ms = ?, enabled = ?, default_writable = ? \
              WHERE id = ? RETURNING {COLUMNS}"
         )))
         .bind(input.name.trim())
         .bind(input.plc_connection_id)
         .bind(input.period_ms)
         .bind(input.enabled)
+        .bind(input.default_writable)
         .bind(id)
         .fetch_one(&mut *connection)
         .await
@@ -381,6 +409,7 @@ mod tests {
             plc_connection_id,
             period_ms: 1_000,
             enabled: true,
+            default_writable: true,
         }
     }
 
@@ -395,9 +424,52 @@ mod tests {
         assert_eq!(created.plc_connection_id, conn_id);
         assert_eq!(created.period_ms, 1_000);
         assert!(created.enabled);
+        assert!(created.default_writable);
 
         let fetched = svc.get(created.id).await.expect("get should succeed");
         assert_eq!(fetched, created);
+    }
+
+    /// T19 S1-b（UX-34）: `default_writable` を省略した入力（後方互換 -
+    /// 現行 banto-hub クライアントは常に明示的に送るが、JSON 側の
+    /// `#[serde(default)]` を裏付けるテスト）は既定 `true` になる。
+    #[tokio::test]
+    async fn create_defaults_default_writable_to_true_when_json_omits_it() {
+        let (_plc_svc, svc, conn_id) = setup().await;
+        // `CollectionGroupInput` itself deserializes snake_case (no
+        // `#[serde(rename_all = "camelCase")]` - only `CollectionGroup`, the
+        // read model, is wire-shaped that way; the camelCase mirroring for
+        // input happens one layer up, in `banto_hub_core::rest::
+        // CollectionGroupPayload`). This test exercises this crate's own
+        // `#[serde(default)]` directly, so it uses this type's own field
+        // names.
+        let input: CollectionGroupInput = serde_json::from_value(json!({
+            "name": "NoDefaultWritableField",
+            "plc_connection_id": conn_id,
+            "period_ms": 1_000,
+        }))
+        .expect("deserialize should succeed without default_writable");
+        let created = svc.create(input).await.expect("create should succeed");
+        assert!(created.default_writable);
+    }
+
+    /// T19 S1-b（UX-34「収集グループ単位で既定値を変更できる」）:
+    /// `default_writable: false` で作成・更新した値が往復する。
+    #[tokio::test]
+    async fn create_and_update_round_trip_default_writable_false() {
+        let (_plc_svc, svc, conn_id) = setup().await;
+        let mut input = sample_input("OptOut", conn_id);
+        input.default_writable = false;
+        let created = svc.create(input).await.expect("create should succeed");
+        assert!(!created.default_writable);
+
+        let mut update_input = sample_input("OptOut", conn_id);
+        update_input.default_writable = true;
+        let updated = svc
+            .update(created.id, update_input)
+            .await
+            .expect("update should succeed");
+        assert!(updated.default_writable);
     }
 
     #[tokio::test]

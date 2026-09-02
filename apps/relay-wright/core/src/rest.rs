@@ -1732,6 +1732,20 @@ impl From<CollectionGroupPayload> for CollectionGroupInput {
             plc_connection_id: payload.plc_connection_id,
             period_ms: payload.period_ms,
             enabled: payload.enabled,
+            // T19 S1-b (banto-industrial, 2026-09-02): `default_writable` is
+            // a banto-hub-only exposed setting (its tag registration form -
+            // `apps/banto-hub/src/routes/(app)/tags/+page.svelte` - is the
+            // only UI that reads it, to pre-check the new-tag `writable`
+            // checkbox). relay-wright never exposes it in its own
+            // `CollectionGroupPayload` above - same stance as `simulation`/
+            // `word_order` in `PlcConnectionPayload`'s `From` impl just
+            // above - so every group this app creates/updates keeps the
+            // column's own database default (`true`,
+            // `banto_tags::collection_group::default_writable_true`). This
+            // field has no effect on collection or write behavior (see its
+            // doc comment on `banto_tags::CollectionGroup`), so hardcoding
+            // it here cannot change any relay-wright behavior.
+            default_writable: true,
         }
     }
 }
@@ -4925,6 +4939,7 @@ mod tests {
                 plc_connection_id: conn.id,
                 period_ms: 1_000,
                 enabled: true,
+                default_writable: true,
             })
             .await
             .expect("seed collection group");
@@ -5582,6 +5597,7 @@ mod tests {
                 plc_connection_id: conn.id,
                 period_ms: 1000,
                 enabled: true,
+                default_writable: true,
             })
             .await
             .expect("create collection group");

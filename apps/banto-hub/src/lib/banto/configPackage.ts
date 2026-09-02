@@ -190,6 +190,21 @@ function expectWordOrder(value: unknown, path: string): SlmpWordOrder {
 	);
 }
 
+/**
+ * T19 S1-b（UX-34、2026-09-02 オーナー決定）: `defaultWritable` は既存の
+ * エクスポート済み構成パッケージ（この項目を持たない旧スキーマ）には
+ * まだ存在しない可能性があるので、`expectWordOrder` と同じ理由で省略を
+ * 許容する — 省略時はバックエンドの既定（`banto_tags::collection_group::
+ * default_writable_true`、`true`）と同じ値にフォールバックし、旧
+ * パッケージのインポートを壊さない（`CONFIG_PACKAGE_SCHEMA_VERSION` は
+ * 据え置き — 後方互換な追加フィールドなのでバージョンを上げる理由が
+ * ない）。値が存在する場合は真偽値であることを検証する。
+ */
+function expectDefaultWritable(value: unknown, path: string): boolean {
+	if (value === undefined) return true;
+	return expectBoolean(value, path);
+}
+
 function ensureUniqueNames<T extends { name: string }>(items: readonly T[], path: string): void {
 	const seen = new Set<string>();
 	for (const item of items) {
@@ -217,7 +232,8 @@ function sanitizeGroup(
 		name: input.name,
 		plcConnectionName: connectionName,
 		periodMs: input.periodMs,
-		enabled: input.enabled
+		enabled: input.enabled,
+		defaultWritable: input.defaultWritable
 	};
 }
 
@@ -349,7 +365,11 @@ function parseCollectionGroups(raw: unknown): ConfigPackageCollectionGroup[] {
 				`collectionGroups[${index}].plcConnectionName`
 			),
 			periodMs: expectInteger(item.periodMs, `collectionGroups[${index}].periodMs`),
-			enabled: expectBoolean(item.enabled, `collectionGroups[${index}].enabled`)
+			enabled: expectBoolean(item.enabled, `collectionGroups[${index}].enabled`),
+			defaultWritable: expectDefaultWritable(
+				item.defaultWritable,
+				`collectionGroups[${index}].defaultWritable`
+			)
 		};
 	});
 }
