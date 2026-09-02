@@ -3479,6 +3479,120 @@ async fn tags_group_counts(
     Ok(Json(state.tags.count_by_group().await?))
 }
 
+#[derive(Debug, Deserialize)]
+struct AddressWritableQuery {
+    /// `banto_tags::plc_connection::ALLOWED_PROTOCOLS`（`"modbus-tcp"` /
+    /// `"slmp"` / `"virtual"`）のいずれかを想定するが、未知の値もエラーには
+    /// せず単に「判定材料が無い」＝`writable: null` として扱う（下記応答の
+    /// フィールド doc 参照）- 将来プロトコルが増えてもこのエンドポイント自体
+    /// の追随を待たずに安全側（既定を適用しない）へ倒れる。
+    protocol: String,
+    /// 生のアドレス文字列（例: `"30001"`）。空文字・不正な形式・入力途中の
+    /// 文字列も許容し、単に `writable: null` を返す（下記参照）。
+    address: String,
+}
+
+/// [`tags_address_writable`]の応答。**T19 S1-b0（2026-09-02 オーナー決定）:
+/// `null`(`None`)は「判定不能」だけを意味する** - 領域制限が無いことの
+/// 表明ではない。3値の意味は次のとおり:
+///
+/// - `writable: Some(true)`, `area: None` -
+///   領域による書き込み制限が存在しないプロトコル（`slmp`/`virtual`。SLMP
+///   デバイスに Modbus の 1xxxx/3xxxx に相当する「恒久的に読み取り専用の
+///   エリア」という概念は無い）。書き込み可能領域の観点では既定を適用して
+///   よい。
+/// - `writable: Some(bool)`, `area: Some(_)` - `protocol == "modbus-tcp"`
+///   で `address` が Modbus 参照番号としてパースできた。`area` は
+///   [`AddressArea`]の`Display`文字列（`"coil"`/`"discrete_input"`/
+///   `"input_register"`/`"holding_register"`）、`writable` はその領域の
+///   [`AddressArea::is_writable`]。
+/// - `writable: None`, `area: None` - **判定不能**（`address` が空・入力
+///   途中・不正な形式、または `protocol` がこの3つのいずれでもない）。
+///   `apps/banto-hub/src/lib/banto/writableDefault.ts`の
+///   `writableArea: boolean | undefined`契約と対応させるため、UI は
+///   これを`undefined`として扱い、**チェックボックスの既定 ON を適用しない**
+///   （安全側 - 誤って読み取り専用領域に既定 ON してしまうより、既定が
+///   一時的に効かない方を選ぶ）。
+///
+/// **呼び出し失敗時のフェイルセーフ契約:** このエンドポイント自体が
+/// 4xx/5xx を返した場合、あるいはネットワーク到達不能などで応答が
+/// 得られなかった場合も、呼び出し側は上記の`writable: None`と同じ扱い
+/// （＝既定を適用しない）にすること。判定不能を「安全に倒す」という
+/// この応答の設計方針を、通信失敗時にも一貫させるため。
+#[derive(Debug, Serialize)]
+struct AddressWritableResponse {
+    writable: Option<bool>,
+    area: Option<String>,
+}
+
+/// `GET /api/tags/address-writable`（T19 S1-b0、2026-09-02 オーナー判断）:
+/// 「Modbus の 1xxxx（discrete input）/3xxxx（input register）は書き込め
+/// ない」という規則の正は `banto_plc_address::AddressArea::is_writable`
+/// （`banto-plc`が re-export し、`banto-tags`の登録時検証・
+/// `banto-plc-write`の書き込みプランナーも同じ定義を読む）1箇所のみ - この
+/// ハンドラはそれをアドレス文字列に適用して返すだけで、**UI 側に「先頭桁で
+/// エリアを判定する」ロジックを持たせないための唯一の入口**にする
+/// （`crates/banto-tags/src/tag.rs::modbus_read_only_area`のような「桁数＋
+/// 先頭桁」の狭い複製すら UI には作らせない、という 2026-09-02 の設計判断 -
+/// アドレスのパース自体をサーバーに一本化する）。
+///
+/// `/api/tags` と同じ読み取り専用・副作用なしのエンドポイントなので
+/// `require_auth`（viewer 以上）のみで`require_editor`は呼ばない。DB
+/// アクセスも無い純粋な計算なので`State<TagRegistryState>`も取らない。
+/// `plc_connections_test`と同じ理由で意図的に`#[utoipa::path]`を付けず
+/// `ApiDoc`にも加えない(`/api/v1/*`のみを文書化する既存方針、このファイル
+/// 冒頭「二系統に分かれたルーター」節参照)。
+///
+/// `null`の意味論・呼び出し失敗時の契約は[`AddressWritableResponse`]の
+/// doc comment を参照。
+async fn tags_address_writable(
+    Query(query): Query<AddressWritableQuery>,
+) -> Json<AddressWritableResponse> {
+    match query.protocol.as_str() {
+        "modbus-tcp" => match Address::parse(&query.address) {
+            Ok(addr) => match addr.as_modbus_ref() {
+                Some((area, _offset, _bit)) => Json(AddressWritableResponse {
+                    writable: Some(area.is_writable()),
+                    area: Some(area.to_string()),
+                }),
+                // `Address::parse` only ever produces `ModbusRef` (see
+                // `banto_plc::address`'s own
+                // `parse_still_means_modbus_reference_notation` test), so
+                // this arm is unreachable in practice - kept instead of
+                // `unreachable!()` so a future change to `parse` degrades to
+                // "cannot determine" rather than a panic on this
+                // side-effect-free endpoint.
+                None => Json(AddressWritableResponse {
+                    writable: None,
+                    area: None,
+                }),
+            },
+            // Malformed or still-being-typed address text - cannot determine
+            // yet, not "no restriction" (see this response type's doc
+            // comment on why these two must not collapse into one value).
+            Err(_) => Json(AddressWritableResponse {
+                writable: None,
+                area: None,
+            }),
+        },
+        // SLMP devices have no Modbus-style permanently-read-only area, and
+        // `virtual` (calc/mem) tags have no PLC address at all - neither
+        // protocol has an area-based write restriction to report, so the
+        // default may be applied.
+        "slmp" | "virtual" => Json(AddressWritableResponse {
+            writable: Some(true),
+            area: None,
+        }),
+        // Unknown protocol (e.g. a future addition this handler has not
+        // been taught about yet) - cannot determine, fail safe rather than
+        // guess either way.
+        _ => Json(AddressWritableResponse {
+            writable: None,
+            area: None,
+        }),
+    }
+}
+
 async fn tags_get(
     State(state): State<TagRegistryState>,
     Path(id): Path<i64>,
@@ -4802,6 +4916,10 @@ fn tag_registry_router(
         .route("/api/tags/list", post(tags_list_query))
         // 同じく固定セグメント。グループ別タグ件数集計。
         .route("/api/tags/group-counts", get(tags_group_counts))
+        // T19 S1-b0（2026-09-02）: 同じく固定セグメント。指定アドレスが
+        // 書き込み可能な領域かどうかの判定（`tags_address_writable`の doc
+        // comment 参照）。
+        .route("/api/tags/address-writable", get(tags_address_writable))
         .with_state(state)
         .layer(middleware::from_fn_with_state(
             AuthGate {

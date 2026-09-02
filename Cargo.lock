@@ -576,11 +576,16 @@ dependencies = [
 name = "banto-plc"
 version = "0.1.0"
 dependencies = [
+ "banto-plc-address",
  "encoding_rs",
  "slmp",
  "thiserror 2.0.20",
  "tokio",
 ]
+
+[[package]]
+name = "banto-plc-address"
+version = "0.1.0"
 
 [[package]]
 name = "banto-plc-write"
@@ -648,6 +653,7 @@ name = "banto-tags"
 version = "0.1.0"
 dependencies = [
  "banto-core",
+ "banto-plc-address",
  "banto-storage",
  "serde",
  "serde_json",

@@ -325,6 +325,18 @@ fn validate_thresholds(
 /// needed here (contrast [`validate_tag_kind_placement`] below, which does
 /// need one): the read-only-ness this function detects is a property of the
 /// address text alone, independent of which connection the tag ends up on.
+///
+/// **T19 S1-b0 (2026-09-02 オーナー判断):** the digit-prefix-selects-area
+/// mapping just above stays this function's own narrow reproduction (for the
+/// reasons above), but *which areas are writable* no longer is - that one
+/// fact now lives exactly once, in the dependency-free
+/// `banto_plc_address::AddressArea::is_writable()`, which both `banto-plc`
+/// (via a re-export) and `banto-plc-write`'s Modbus write planner also read.
+/// This function calls it instead of hardcoding a second `'1'`/`'3'` rejection
+/// list, so a future area's writability only needs deciding once. The
+/// returned message strings (`"discrete input（1xxxx）"` /
+/// `"input register（3xxxx）"`) and this function's overall behavior are
+/// unchanged by this refactor - see the tests below.
 fn modbus_read_only_area(address: &str) -> Option<&'static str> {
     // Strip an optional T8 bit-in-word suffix (`"30001.5"`) the same way
     // `Address::parse` does - only the base reference number selects the
@@ -335,10 +347,27 @@ fn modbus_read_only_area(address: &str) -> Option<&'static str> {
     if (len != 5 && len != 6) || !base.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
-    match base.chars().next() {
-        Some('1') => Some("discrete input（1xxxx）"),
-        Some('3') => Some("input register（3xxxx）"),
-        _ => None,
+    // Narrow digit-prefix-to-area mapping (see this function's doc comment
+    // for why it stays hand-written here); the writability verdict itself
+    // comes from `banto_plc_address::AddressArea::is_writable()` just below,
+    // not from which arm of this match we land in.
+    let area = match base.chars().next() {
+        Some('0') => banto_plc_address::AddressArea::Coil,
+        Some('1') => banto_plc_address::AddressArea::DiscreteInput,
+        Some('3') => banto_plc_address::AddressArea::InputRegister,
+        Some('4') => banto_plc_address::AddressArea::HoldingRegister,
+        _ => return None,
+    };
+    if area.is_writable() {
+        return None;
+    }
+    match area {
+        banto_plc_address::AddressArea::DiscreteInput => Some("discrete input（1xxxx）"),
+        banto_plc_address::AddressArea::InputRegister => Some("input register（3xxxx）"),
+        // Filtered out by the `is_writable()` check above.
+        banto_plc_address::AddressArea::Coil | banto_plc_address::AddressArea::HoldingRegister => {
+            unreachable!("writable areas already returned None above")
+        }
     }
 }
 

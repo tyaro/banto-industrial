@@ -23,8 +23,14 @@
 //! (`4xxxx`) are writable by Modbus wire protocol - [`AddressArea::DiscreteInput`]
 //! (`1xxxx`) and [`AddressArea::InputRegister`] (`3xxxx`) are read-only,
 //! permanently, for every implementation (this is the *device*'s wire
-//! behavior, not something this driver or any other could work around). A
-//! request targeting either read-only area is resolved into
+//! behavior, not something this driver or any other could work around). T19
+//! S1-b0 (2026-09-02) moved this exact fact into
+//! [`AddressArea::is_writable()`] (the dependency-free `banto_plc_address`
+//! crate, re-exported as `banto_plc::AddressArea`), which
+//! [`plan_modbus_writes`]'s gate below and [`is_compatible`] both read - it
+//! is no longer hardcoded here as its own `DiscreteInput | InputRegister`
+//! list, since `banto-tags`' registration-time check reads the same
+//! definition. A request targeting either read-only area is resolved into
 //! [`ModbusWritePlanOutcome::immediate_bad`] as
 //! [`PlcWriteError::ModbusReadOnlyArea`], before any wire traffic - the exact
 //! same defense-in-depth relationship the read side has with
@@ -112,11 +118,26 @@ pub const MAX_WRITE_COILS: u16 = 1968;
 /// [`AddressArea::HoldingRegister`]. [`AddressArea::DiscreteInput`]/
 /// [`AddressArea::InputRegister`] are filtered out earlier (read-only, never
 /// reach this check) - see [`plan_modbus_writes`].
+///
+/// T19 S1-b0 (2026-09-02): the read-only-area rejection is expressed via
+/// [`AddressArea::is_writable()`] (from `banto_plc_address`, re-exported as
+/// `banto_plc::AddressArea`) rather than a second hardcoded
+/// `DiscreteInput | InputRegister => false` arm, so this crate reads the same
+/// one definition [`plan_modbus_writes`]'s own read-only gate does instead of
+/// stating the rule a third time.
 fn is_compatible(area: AddressArea, data_type: DataType) -> bool {
+    if !area.is_writable() {
+        // Unreachable in practice: `plan_modbus_writes` already routes
+        // DiscreteInput/InputRegister to `PlcWriteError::ModbusReadOnlyArea`
+        // before this function is ever called (see its doc comment).
+        return false;
+    }
     match area {
         AddressArea::Coil => data_type == DataType::Bit,
         AddressArea::HoldingRegister => data_type != DataType::Bit,
-        AddressArea::DiscreteInput | AddressArea::InputRegister => false,
+        AddressArea::DiscreteInput | AddressArea::InputRegister => {
+            unreachable!("read-only areas already returned false above")
+        }
     }
 }
 
@@ -248,10 +269,11 @@ pub fn plan_modbus_writes(
             continue;
         }
 
-        if matches!(
-            area,
-            AddressArea::DiscreteInput | AddressArea::InputRegister
-        ) {
+        // T19 S1-b0 (2026-09-02): the read-only-area gate itself now reads
+        // `AddressArea::is_writable()` (this module's doc comment's
+        // "Which Modbus areas are writable at all" section) instead of
+        // hardcoding `DiscreteInput | InputRegister` here.
+        if !area.is_writable() {
             immediate_bad.push((
                 index,
                 PlcWriteError::ModbusReadOnlyArea {

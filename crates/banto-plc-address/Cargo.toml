@@ -1,0 +1,19 @@
+# T19 S1-b0（2026-09-02 オーナー判断）: 「Modbus の 1xxxx/3xxxx は書き込めない」
+# という規則が `banto-plc`（プロトコルの正）と `banto-tags`（登録時検証の
+# 狭い複製）の2箇所に分かれていたのを、この依存ゼロ crate 1箇所に統合する
+# ためだけに作った最小の切り出し - `AddressArea` 列挙型とその
+# `is_writable()`/`Display` だけを持つ。`banto-plc` は
+# `src/address.rs` で re-export して公開パス(`banto_plc::AddressArea`)を
+# 保ち、`banto-tags`(I1)はこの crate に直接依存することで、I1 が
+# 意図的に避けている `banto-plc` の tokio/slmp/encoding_rs 依存スタックを
+# 引き込まずに同じ定義を参照できる(`crates/banto-tags/src/tag.rs`の
+# `modbus_read_only_area` 冒頭コメント参照)。
+[package]
+name = "banto-plc-address"
+description = "PLC アドレス領域(AddressArea)の書き込み可否 - banto-plc/banto-tags/banto-plc-write が共有する依存ゼロの語彙 (T19 S1-b0)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
