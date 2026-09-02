@@ -15,11 +15,15 @@
 # the relay-wright plan `luminous-discovering-goblet.md` /
 # docs/tag-server-design.md, R1-B: crates/banto-rtsp (RTSP基礎値・JPEG
 # parser・再接続方針、ネットワークI/Oなし). banto crates are consumed via git-tag references
-# (banto docs/publishing.md).
+# (banto docs/publishing.md). T19 S1-b0: crates/banto-plc-address (AddressArea
+# の書き込み可否を1箇所で定義する依存ゼロ crate。banto-plc/banto-tags/
+# banto-plc-write が共有する - crates/banto-plc-address/src/lib.rs のモジュール
+# doc 参照).
 [workspace]
 resolver = "2"
 members = [
     "crates/banto-tags",
+    "crates/banto-plc-address",
     "crates/banto-plc",
     "crates/banto-plc-write",
     "crates/banto-tstore",

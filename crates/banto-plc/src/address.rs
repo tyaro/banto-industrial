@@ -57,29 +57,16 @@ use crate::slmp::address::{self as slmp_address, SlmpDevice};
 
 /// Which register/coil space an [`Address`] falls in, and (via
 /// [`crate::planning`]) which Modbus function code reads it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum AddressArea {
-    /// `0xxxx` - read with FC1 (Read Coils).
-    Coil,
-    /// `1xxxx` - read with FC2 (Read Discrete Inputs).
-    DiscreteInput,
-    /// `3xxxx` - read with FC4 (Read Input Registers).
-    InputRegister,
-    /// `4xxxx` - read with FC3 (Read Holding Registers).
-    HoldingRegister,
-}
-
-impl std::fmt::Display for AddressArea {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            AddressArea::Coil => "coil",
-            AddressArea::DiscreteInput => "discrete_input",
-            AddressArea::InputRegister => "input_register",
-            AddressArea::HoldingRegister => "holding_register",
-        };
-        f.write_str(s)
-    }
-}
+///
+/// T19 S1-b0 (2026-09-02): defined in the dependency-free `banto-plc-address`
+/// crate, not here - `banto-tags` (I1) needs this crate's "is this area
+/// writable" fact (`is_writable()`) without taking on this crate's tokio/
+/// slmp/encoding_rs dependency stack just to get it, and `banto-plc-write`
+/// (I5) shares the same definition rather than re-deriving it a third time.
+/// Re-exported here so every existing `banto_plc::AddressArea`/
+/// `banto_plc::address::AddressArea` path is unchanged - see
+/// `banto-plc-address`'s module doc for the full reasoning.
+pub use banto_plc_address::AddressArea;
 
 /// A parsed, protocol-ready PLC address. Which variant a tag gets is decided
 /// once, by which parser the caller ran, which in turn follows the

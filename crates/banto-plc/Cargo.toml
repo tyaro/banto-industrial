@@ -8,6 +8,11 @@ publish.workspace = true
 
 [dependencies]
 thiserror = { workspace = true }
+# T19 S1-b0: `AddressArea`'s definition (including `is_writable()`) now lives
+# in this dependency-free sibling crate, shared with `banto-tags`/
+# `banto-plc-write` - see its module doc. `src/address.rs` re-exports it so
+# `banto_plc::AddressArea` is unchanged for every existing caller.
+banto-plc-address = { path = "../banto-plc-address" }
 # Only the pieces this crate actually touches: TCP I/O (net), connect/response
 # timeouts (time), frame read/write (io-util). No "rt"/"macros" here - this
 # crate never spawns tasks or defines its own #[tokio::main]/#[tokio::test];

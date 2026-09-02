@@ -9,6 +9,13 @@ publish.workspace = true
 [dependencies]
 banto-core = { workspace = true }
 banto-storage = { workspace = true, features = ["sqlite"] }
+# T19 S1-b0: `AddressArea::is_writable()`, the single definition of "which
+# Modbus areas are writable" - used by `tag.rs::modbus_read_only_area`
+# instead of hand-duplicating the rule. Dependency-free (see its module doc),
+# so this does NOT reintroduce the `banto-plc` dependency this crate
+# deliberately avoids (tokio/slmp/encoding_rs - see `tag.rs`'s
+# `modbus_read_only_area` doc comment).
+banto-plc-address = { path = "../banto-plc-address" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # `migrate`: this crate embeds its own schema (`migrations/`) via
