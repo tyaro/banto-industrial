@@ -54,6 +54,25 @@ const REAL_GROUP = `e2e-tcm-grp-${RUN_ID}`;
 const VIRT_GROUP = `e2e-tcm-virtgrp-${RUN_ID}`;
 const VIRT_GROUP_RENAMED = `${VIRT_GROUP}-renamed`;
 
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * ツリーのグループ行のアクセシブル名は「名前 + タグ件数 + 周期」の合成
+ *（例: `e2e-tcm-virtgrp-1730000000000 (1) 1000ms`）になるため、接続ノード
+ * と違って `exact: true` の完全一致は決して成立しない。かといって単純な
+ * 部分一致に戻すと、`VIRT_GROUP` と `VIRT_GROUP_RENAMED`（`-renamed` の
+ * 有無だけが違う）が相互に部分一致してしまう。名前の直後が ` (`（件数の
+ * 開始）であることまで確認して境界を明示することで、接尾辞ありでも
+ * 一意に当てる。
+ */
+function groupNodeByName(page: Page, name: string) {
+	return page
+		.getByRole('tree')
+		.getByRole('button', { name: new RegExp(`^${escapeRegExp(name)} \\(`) });
+}
+
 interface ConnectionRow {
 	id: number;
 	name: string;
@@ -193,16 +212,12 @@ test.describe
 		await wizard.getByRole('button', { name: '作成', exact: true }).click();
 
 		await expect(adminPage.getByText('作成しました')).toBeVisible();
-		await expect(
-			adminPage.getByRole('tree').getByRole('button', { name: VIRT_GROUP, exact: true })
-		).toBeVisible();
+		await expect(groupNodeByName(adminPage, VIRT_GROUP)).toBeVisible();
 	});
 
 	test('3. virtual（calc）配下の収集グループを再設定できる', async () => {
 		await adminPage.goto('/tags');
-		const groupNode = adminPage
-			.getByRole('tree')
-			.getByRole('button', { name: VIRT_GROUP, exact: true });
+		const groupNode = groupNodeByName(adminPage, VIRT_GROUP);
 		await expect(groupNode).toBeVisible();
 		await groupNode.click({ button: 'right' });
 		await adminPage.getByRole('menuitem', { name: '収集グループを再設定', exact: true }).click();
@@ -216,9 +231,7 @@ test.describe
 
 	test('4. virtual（calc）配下の収集グループを削除できる', async () => {
 		await adminPage.goto('/tags');
-		const groupNode = adminPage
-			.getByRole('tree')
-			.getByRole('button', { name: VIRT_GROUP_RENAMED, exact: true });
+		const groupNode = groupNodeByName(adminPage, VIRT_GROUP_RENAMED);
 		await expect(groupNode).toBeVisible();
 		await groupNode.click({ button: 'right' });
 
@@ -230,9 +243,7 @@ test.describe
 		await adminPage.getByRole('menuitem', { name: '収集グループを削除', exact: true }).click();
 
 		await expect(adminPage.getByText('削除しました')).toBeVisible();
-		await expect(
-			adminPage.getByRole('tree').getByRole('button', { name: VIRT_GROUP_RENAMED, exact: true })
-		).toHaveCount(0);
+		await expect(groupNodeByName(adminPage, VIRT_GROUP_RENAMED)).toHaveCount(0);
 	});
 
 	test('5. canWrite がある利用者にはツリー上部に常設の作成ボタンが出る', async () => {
