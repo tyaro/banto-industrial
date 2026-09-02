@@ -25,9 +25,13 @@ class SessionStore {
 	authDisabled = $state(false);
 
 	/**
-	 * 試運転モード（未ロックダウン）中か。`(app)/+layout.svelte` の常時警告
-	 * バナー（`CommissioningBanner.svelte`）と、設定画面のロックダウン
-	 * セクションの表示条件はこのフラグだけで決まる。
+	 * 試運転モード（未ロックダウン）中か。設定画面のロックダウンセクション
+	 * の表示条件はこのフラグで決まる（`status/+page.svelte`「サーバー状態」
+	 * の表示にも使う）。
+	 *
+	 * T19 S1-d（UX-45、2026-09-03）: 常時表示していた警告バナー
+	 * （`(app)/+layout.svelte` の `CommissioningBanner.svelte`）は撤去した
+	 * - このフラグ自体・ロックダウンセクションの表示条件は変えていない。
 	 */
 	commissioningMode = $state(false);
 

@@ -687,8 +687,8 @@
 	 * 経路で使う「次はここへ」リンク先に置き換えた。`null` はバナー非表示、
 	 * 非 `null` なら `monitorHref()`（`tagOnboarding.ts`）が組み立てた
 	 * `/monitor?...` を指す。`/monitor` は WS 経由の現在値を表示するのみで、
-	 * ここから直接 SIM 値の good/bad は判定しない（判定はチェックリスト側
-	 * `tagOnboarding.ts::computeOnboardingSteps` の責務のまま）。
+	 * ここから直接 SIM 値の good/bad は判定しない（T19 S1-d で撤去した初回
+	 * チェックリストが担っていた判定 - 現在この値を使う画面は無い）。
 	 *
 	 * **QueuedWhileRunning（収集稼働中の 202 キュー投入）では設定しない**:
 	 * 各ハンドラは `createTag`/`updateTag`/`createTagsBatch`/`updateTagsBatch`
@@ -3837,14 +3837,40 @@
 								T18-2d（TAG-UX-A「空状態を…不足する前工程と移動ボタンを示す」）:
 								連鎖する前工程（PLC接続→収集グループ）のうち欠けているものを
 								案内する。connections/groups が両方揃っていれば通常の空表示。
+
+								T19 S1-d（UX-30、2026-09-03）: 旧 `/plc-connections`・
+								`/collection-groups` 画面の削除に伴い、CTA を画面遷移
+								（`<a href>`）からその場で Drawer を開くボタンへ差し替えた
+								（`openConnectionCreateDrawer`/`openGroupCreateDrawer` は
+								既存のツリー右クリックメニューと同じ関数 - 新しい実装は
+								持たない）。旧画面の「新規作成」ボタンは `canWrite` 限定
+								だった（削除前の `plc-connections/+page.svelte` 参照）ので、
+								ここも `canWrite` で同じ権限に揃える - viewer には作成ボタン
+								を出さず、案内文のみにする（既存の権限判定を緩めない）。
 							-->
 							<div class="empty-state">
 								{#if connections.length === 0}
 									<p class="note">先に PLC接続 を作成してください。</p>
-									<a class="onboarding-cta" href="/plc-connections">PLC接続ページへ移動</a>
+									{#if canWrite}
+										<button
+											type="button"
+											class="onboarding-cta"
+											onclick={() => openConnectionCreateDrawer()}
+										>
+											PLC接続を作成
+										</button>
+									{/if}
 								{:else if groups.length === 0}
 									<p class="note">先に 収集グループ を作成してください。</p>
-									<a class="onboarding-cta" href="/collection-groups">収集グループページへ移動</a>
+									{#if canWrite}
+										<button
+											type="button"
+											class="onboarding-cta"
+											onclick={() => openGroupCreateDrawer()}
+										>
+											収集グループを作成
+										</button>
+									{/if}
 								{:else}
 									<p class="note">タグがありません。上の「新規登録」から追加してください。</p>
 								{/if}
@@ -4069,7 +4095,12 @@
 			{#if groups.length === 0}
 				<p class="note">
 					先に 収集グループ を1件以上登録してください。
-					<a class="onboarding-cta" href="/collection-groups">収集グループページへ移動</a>
+					<!-- T19 S1-d（UX-30、2026-09-03）: 上の empty-state と同じ理由で
+					     `/collection-groups` への遷移をその場で Drawer を開くボタンへ
+					     差し替えた。 -->
+					<button type="button" class="onboarding-cta" onclick={() => openGroupCreateDrawer()}>
+						収集グループを作成
+					</button>
 				</p>
 			{/if}
 		</form>
@@ -4285,7 +4316,12 @@
 			{#if groups.length === 0}
 				<p class="note">
 					先に 収集グループ を1件以上登録してください。
-					<a class="onboarding-cta" href="/collection-groups">収集グループページへ移動</a>
+					<!-- T19 S1-d（UX-30、2026-09-03）: 上の empty-state と同じ理由で
+					     `/collection-groups` への遷移をその場で Drawer を開くボタンへ
+					     差し替えた。 -->
+					<button type="button" class="onboarding-cta" onclick={() => openGroupCreateDrawer()}>
+						収集グループを作成
+					</button>
 				</p>
 			{/if}
 
@@ -4704,17 +4740,26 @@
 		gap: 0.5rem;
 	}
 
-	/* T18-2d（TAG-UX-A）: 前工程への移動リンク・作成直後の「次へ」導線バナー。 */
+	/*
+		T18-2d（TAG-UX-A）: 前工程への移動リンク・作成直後の「次へ」導線バナー。
+		T19 S1-d（UX-30、2026-09-03）: 前工程への移動は `<a href>` から
+		「その場で Drawer を開く」`<button>` へ差し替えたため、`<a>`/`<button>`
+		どちらに付けても同じ見た目になるよう境界線・フォント・カーソルを
+		明示的にリセットする（`<a>`（確認導線バナー、T18-4c）は無改変）。
+	*/
 	.onboarding-cta {
 		display: inline-block;
 		padding: 0.3rem 0.75rem;
+		border: none;
 		border-radius: var(--banto-radius);
 		background: var(--banto-primary);
 		color: var(--banto-text-inverse);
+		font: inherit;
 		font-weight: 600;
 		font-size: 0.8rem;
 		text-decoration: none;
 		white-space: nowrap;
+		cursor: pointer;
 	}
 
 	.onboarding-cta:hover {

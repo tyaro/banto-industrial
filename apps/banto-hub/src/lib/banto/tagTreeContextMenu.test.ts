@@ -46,8 +46,7 @@ describe('resolveTagTreeContextMenuAction', () => {
 		const data: ConnectionTreeNodeData = { kind: 'all' };
 		expect(resolveTagTreeContextMenuAction(data)).toEqual({
 			kind: 'createConnection',
-			label: 'PLC接続を作成',
-			href: '/plc-connections'
+			label: 'PLC接続を作成'
 		});
 	});
 
@@ -57,8 +56,7 @@ describe('resolveTagTreeContextMenuAction', () => {
 		expect(resolveTagTreeContextMenuAction(data)).toEqual({
 			kind: 'createGroup',
 			label: 'line-a 配下に収集グループを作成',
-			connectionId: 7,
-			href: '/collection-groups?connectionId=7'
+			connectionId: 7
 		});
 	});
 
@@ -68,8 +66,7 @@ describe('resolveTagTreeContextMenuAction', () => {
 		expect(resolveTagTreeContextMenuAction(data)).toEqual({
 			kind: 'createGroup',
 			label: 'calc 配下に収集グループを作成',
-			connectionId: 2,
-			href: '/collection-groups?connectionId=2'
+			connectionId: 2
 		});
 	});
 

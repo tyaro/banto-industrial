@@ -19,18 +19,18 @@
 	 * 差分配信を新設するより単純な定期ポーリングで十分（WebSocket は
 	 * 実装指示でも明示的にスコープ外）。
 	 *
-	 * T18-2d（docs/banto-hub-t18-design.md「T18-2d 初回導線チェックリスト」、
-	 * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A）: 「サーバー状態」の上に
-	 * 初回チェックリスト（PLC接続作成→収集グループ作成→タグ登録→収集開始→
-	 * モニタで値確認、2026-08-31 見直し後の順序 - 下記のオーナー指摘参照）を
-	 * 追加する。着地点が /status（navigation.ts の doc comment参照）なので、
-	 * ここが「サイドバーを探索せず案内だけで完了できる」の起点として自然。
-	 * 完了判定・次工程算出はすべて `$lib/banto/tagOnboarding.ts`
-	 * の純関数（実データ判定、画面訪問では判定しない）に委ねる。
-	 * `listPlcConnections`/`listCollectionGroups`/`listTags` は3秒ポーリング
-	 * には乗せず、チェックリストが未完了の間だけ取得する
-	 * （`pollRegistry`/`onboardingDone` 参照）- 完了後は10,000タグ規模でも
-	 * 無駄な一覧取得を繰り返さない。
+	 * T19 S1-d（docs/banto-hub-t19-design.md UX-44、2026-09-03）: T18-2d で
+	 * 「サーバー状態」の上に置いていた初回チェックリスト（PLC接続作成→収集
+	 * グループ作成→タグ登録→収集開始→モニタで値確認、完了判定は
+	 * `$lib/banto/tagOnboarding.ts::computeOnboardingSteps` の純関数）を撤去
+	 * した（2026-09-02 オーナー決定「起動直後は何も出さない」）。設定操作の
+	 * 入口はタグ画面（`/tags`）へ既に一本化済み（S1-a〜S1-c）で、案内が無くても
+	 * ツリーの右クリックから接続・グループ・タグを作成できる。管理アカウント
+	 * 作成の経路は撤去していない -「ロックダウンしたい」「ユーザーを分けたい」
+	 * ときだけユーザー管理画面（`/users`、admin限定ナビ）から作る形にした
+	 * （ロックダウンには admin アカウントが必須 - 設定画面のロックダウン
+	 * セクション・`commissioning_lock_down_fails_without_any_admin_account`
+	 * 参照）。
 	 *
 	 * **2026-08-31 オーナー指摘（収集の開始/停止 UI の追加）**: `rest.rs` の
 	 * `commit_catalog_and_notify` の doc comment のとおり、本番経路では
@@ -40,13 +40,9 @@
 	 * にしか無く、UI から叩く導線が1つも無かった - 実機での試運転の最後の
 	 * 一歩「PLC に接続開始し、タグにアクセスできているか確認する」を画面
 	 * から行えなかった。「収集の開始・停止」セクション（`#collection-control`、
-	 * `collectionControlAdmin.ts` 使用）はその導線。初回チェックリストも
-	 * これに合わせて見直した（`tagOnboarding.ts` 冒頭のdoc comment参照 -
-	 * 「接続テストの成功」を廃止し「収集の開始」を新設、「SIM値の確認」は
-	 * 「モニタで値確認」に改称して実機由来の値でも達成できることを明確化、
-	 * 「全PLCシミュレーション」は必須動線から外して補助的な選択肢のまま
-	 * 残した）。接続単位のシミュレーション（`PlcConnection.simulation`、
-	 * T9-2、接続 Drawer のチェックボックス）は今回のオーナー指摘とは無関係で
+	 * `collectionControlAdmin.ts` 使用）はその導線。接続単位のシミュレーション
+	 * （`PlcConnection.simulation`、T9-2、接続 Drawer のチェックボックス）は
+	 * 今回のオーナー指摘とは無関係で
 	 * 一切変更していない。
 	 */
 	import { isProviderError } from '@banto/admin-core';
@@ -69,16 +65,7 @@
 		type ValueEntry,
 		type ValuesResponse
 	} from '$lib/banto/hubStatus';
-	import {
-		listPlcConnections,
-		listCollectionGroups,
-		listTags,
-		isVirtualConnection,
-		type CollectionGroup,
-		type PlcConnection,
-		type Tag
-	} from '$lib/banto/tagRegistryAdmin';
-	import { computeOnboardingSteps, isOnboardingComplete } from '$lib/banto/tagOnboarding';
+	import { listPlcConnections, isVirtualConnection } from '$lib/banto/tagRegistryAdmin';
 	import { enableWriteControl, disableWriteControl } from '$lib/banto/writeControlAdmin';
 	import {
 		startCollection,
@@ -191,60 +178,16 @@
 		}
 	}
 
-	// --- T18-2d 初回チェックリスト（TAG-UX-A） -------------------------------
-	//
-	// `status`/`values` は上の poll() が3秒毎に更新するが、一覧系
-	// （plc-connections/collection-groups/tags）はチェックリスト専用の
-	// 追加取得で、チェックリストが未完了の間だけ回す（`onboardingDone` が
-	// 真になったら以後は取得しない - 冒頭 doc comment 参照）。
-	let registrySnapshot: {
-		connections: PlcConnection[];
-		groups: CollectionGroup[];
-		tags: Tag[];
-	} | null = $state(null);
-	let onboardingDone = $state(false);
-
-	async function pollRegistry(): Promise<void> {
-		if (onboardingDone) return;
-		try {
-			const [connections, groups, tags] = await Promise.all([
-				listPlcConnections(),
-				listCollectionGroups(),
-				listTags()
-			]);
-			registrySnapshot = { connections, groups, tags };
-		} catch {
-			// ベストエフォート - チェックリストがこの周期だけ更新されないだけで、
-			// 主機能（サーバー状態・書き込み受付等）の表示は poll() 側が独立して
-			// 継続する。エラートーストは poll() 側と重複するので出さない。
-		}
-	}
-
-	const onboardingSteps = $derived.by(() => {
-		if (!registrySnapshot || !status || !values) return [];
-		return computeOnboardingSteps({
-			connections: registrySnapshot.connections,
-			groups: registrySnapshot.groups,
-			tags: registrySnapshot.tags,
-			collectionState: status.collection_state,
-			collectionMode: status.collection_mode,
-			values: values.values
-		});
-	});
-
-	$effect(() => {
-		if (onboardingSteps.length > 0 && isOnboardingComplete(onboardingSteps)) {
-			onboardingDone = true;
-		}
-	});
+	// T19 S1-d（UX-44、docs/banto-hub-t19-design.md、2026-09-03）: T18-2d の
+	// 初回チェックリスト（`registrySnapshot`/`onboardingDone`/`pollRegistry`/
+	// `onboardingSteps` とそれを完了させる `$effect`）を撤去した（2026-09-02
+	// オーナー決定「起動直後は何も出さない」）。`listPlcConnections` は
+	// `handleStartCollection` が確認ダイアログ用に個別で呼ぶため引き続き
+	// import している。
 
 	$effect(() => {
 		void poll();
-		void pollRegistry();
-		const timer = setInterval(() => {
-			void poll();
-			void pollRegistry();
-		}, POLL_INTERVAL_MS);
+		const timer = setInterval(() => void poll(), POLL_INTERVAL_MS);
 		return () => clearInterval(timer);
 	});
 
@@ -625,26 +568,6 @@
 </script>
 
 <div class="page">
-	{#if onboardingSteps.length > 0 && !isOnboardingComplete(onboardingSteps)}
-		<section class="onboarding">
-			<h2>初回セットアップ</h2>
-			<p class="note">
-				PLC接続の作成から収集開始・モニタでの値確認まで、この画面の案内だけで完了できます。
-			</p>
-			<ol class="onboarding-list">
-				{#each onboardingSteps as step (step.id)}
-					<li class="onboarding-step" class:done={step.done}>
-						<span class="onboarding-mark" aria-hidden="true">{step.done ? '✓' : '○'}</span>
-						<span class="onboarding-label">{step.label}</span>
-						{#if !step.done}
-							<a class="onboarding-cta" href={step.href}>{step.ctaLabel}</a>
-						{/if}
-					</li>
-				{/each}
-			</ol>
-		</section>
-	{/if}
-
 	<section>
 		<h2>サーバー状態</h2>
 		{#if loading && !status}
@@ -655,6 +578,23 @@
 				<dd>{status.version}</dd>
 				<dt>リビジョン</dt>
 				<dd>{status.revision}</dd>
+				<!--
+					T19 S1-d（UX-45、docs/banto-hub-t19-design.md §3.6、2026-09-03）:
+					`CommissioningBanner.svelte` の常時表示（全画面共通の警告バナー）を
+					やめた代わりに、事実として状態を確認できる場所をここに残す -
+					警告ではなく「サーバー状態」の一項目として並べる。安全性は
+					損なわれない: 試運転モード中は非 loopback バインドが構造的に
+					拒否される（`enforce_loopback_when_commissioning`）ため、無認証の
+					まま外部ネットワークへ露出することはない（設計 §3.6）。
+				-->
+				<dt>試運転モード</dt>
+				<dd>
+					{#if sessionStore.commissioningMode}
+						有効（未ロックダウン・認証なしでアクセス可能）
+					{:else}
+						無効（認証必須）
+					{/if}
+				</dd>
 			</dl>
 			{#if status.last_config_error}
 				<p class="config-error">設定エラー: {status.last_config_error}</p>
@@ -1002,63 +942,6 @@
 		margin: 0 0 0.5rem;
 		color: var(--banto-text-muted);
 		font-size: 0.8rem;
-	}
-
-	/* T18-2d（TAG-UX-A）: 初回チェックリスト。 */
-	.onboarding {
-		border-color: var(--banto-primary);
-	}
-
-	.onboarding-list {
-		list-style: none;
-		margin: 0.5rem 0 0;
-		padding: 0;
-		display: flex;
-		flex-direction: column;
-		gap: 0.4rem;
-	}
-
-	.onboarding-step {
-		display: flex;
-		align-items: center;
-		gap: 0.5rem;
-		font-size: 0.875rem;
-		padding: 0.35rem 0.5rem;
-		border-radius: var(--banto-radius);
-	}
-
-	.onboarding-step.done {
-		color: var(--banto-text-muted);
-	}
-
-	.onboarding-mark {
-		display: inline-flex;
-		width: 1.2rem;
-		justify-content: center;
-		font-weight: 700;
-	}
-
-	.onboarding-step.done .onboarding-mark {
-		color: var(--banto-success, #1a7f37);
-	}
-
-	.onboarding-label {
-		flex: 1;
-	}
-
-	.onboarding-cta {
-		padding: 0.3rem 0.75rem;
-		border-radius: var(--banto-radius);
-		background: var(--banto-primary);
-		color: var(--banto-text-inverse);
-		font-weight: 600;
-		font-size: 0.8rem;
-		text-decoration: none;
-		white-space: nowrap;
-	}
-
-	.onboarding-cta:hover {
-		background: var(--banto-primary-hover);
 	}
 
 	.summary {

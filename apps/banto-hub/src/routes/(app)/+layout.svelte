@@ -1,9 +1,15 @@
 <script lang="ts">
 	// relay-wright の同名ファイルから無改変で複製。
+	// T19 S1-d（UX-45、docs/banto-hub-t19-design.md §3.6、2026-09-03）:
+	// `CommissioningBanner`（試運転モードの常時表示バナー）を撤去した
+	// （2026-09-02 オーナー決定「常時表示しない」）。安全性は損なわれない -
+	// 試運転モード中は非 loopback バインドが構造的に拒否される
+	// （`enforce_loopback_when_commissioning`）ため、無認証のまま外部
+	// ネットワークへ露出することはない。状態を知る手段は
+	// `status/+page.svelte` の「サーバー状態」に事実として残した。
 	import Header from '$lib/components/Header.svelte';
 	import Sidebar from '$lib/components/Sidebar.svelte';
 	import CommandPalette from '$lib/components/CommandPalette.svelte';
-	import CommissioningBanner from '$lib/components/CommissioningBanner.svelte';
 	import { listPendingChanges } from '$lib/banto/pendingChangesAdmin';
 	import { countUnappliedPendingChanges } from '$lib/banto/pendingUnappliedCount';
 	import { commandPaletteStore } from '$lib/commandPalette.svelte';
@@ -58,8 +64,6 @@
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
-
-<CommissioningBanner />
 
 <div class="shell">
 	<Sidebar {pendingCount} />
