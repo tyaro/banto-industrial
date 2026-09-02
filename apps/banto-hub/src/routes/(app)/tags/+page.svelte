@@ -1483,12 +1483,13 @@
 	}
 
 	/**
-	 * T19 S1-c（UX-33）: ツールバーの「連続登録」ボタンは
-	 * `registrationTarget?.supportsContinuous` が `true` のときしか表示され
-	 * ない（virtual＝calc/mem 配下のグループでは連続登録自体を提示しない -
-	 * 連続登録は PLC アドレスの算術前提の機能で `tagKind` は常に `'plc'`。
-	 * `resolveRegistrationTarget` の doc comment 参照）ため、開いた時点で
-	 * 必ず対象グループが確定している。`continuousForm.collectionGroupId` を
+	 * T19 S1-c（UX-33）: ツールバーの「連続登録」ボタンは、グループ未選択
+	 * では表示されず、選択中でも `registrationTarget.supportsContinuous`
+	 * が `false` のときは **表示されるが `disabled`** になる（virtual＝
+	 * calc/mem 配下のグループ。連続登録は PLC アドレスの算術前提の機能で
+	 * `tagKind` は常に `'plc'` のため。`resolveRegistrationTarget` の
+	 * doc comment 参照）。押せる状態で到達した時点で対象グループは確定
+	 * している。`continuousForm.collectionGroupId` を
 	 * その対象で毎回上書きする - 前回開いたときに別グループを選んでいた
 	 * 形跡が残っていても、常に「今ツリーで選択しているグループへ」を優先
 	 * する。`continuousForm` 自体はリセットしない既存の挙動
