@@ -563,11 +563,11 @@ async fn step6_unavailable(
     println!("  write-control を無効化します (POST /api/write-control/disable) ...");
     let disable_result = set_write_control(&http, hub_url, false, admin_token).await;
 
-    let (write_ok, write_detail) = match &disable_result {
+    match disable_result {
         Ok(()) => {
             println!("  無効化: 成功");
             let write_client = build_client(hub_url, api_key);
-            match write_client {
+            let (write_ok, write_detail) = match write_client {
                 Ok(client) => match client.write_tag(tag.ids, RequestedValue::Num(1.0)).await {
                     Ok(()) => {
                         println!("  想定外: write-control無効時に書込が成功してしまいました。");
@@ -589,48 +589,57 @@ async fn step6_unavailable(
                         format!("client build error: {}", error.kind().as_str()),
                     )
                 }
+            };
+
+            // disable に成功した＝実際に write-control を無効化してしまった
+            // 場合のみ、Hub の状態を書き換えた責任として必ず enable へ戻す
+            // 復旧処理を行う。disable 自体が失敗した場合は何も変更していない
+            // ため、この節には入らない（下の Err 枝を参照）。
+            println!("  write-control を有効化に戻します (POST /api/write-control/enable) ...");
+            let enable_result = set_write_control(&http, hub_url, true, admin_token).await;
+            match &enable_result {
+                Ok(()) => println!("  有効化: 成功"),
+                Err(message) => {
+                    println!(
+                        "  ★★★ 有効化に失敗しました: {message} ★★★ 手動で /api/write-control/enable を呼んで復旧してください。"
+                    );
+                }
             }
+
+            // 復旧確認: 実際に書き込めることを確かめる（あくまで付随情報）。
+            let restored = match build_client(hub_url, api_key) {
+                Ok(client) => client
+                    .write_tag(tag.ids, RequestedValue::Num(0.0))
+                    .await
+                    .is_ok(),
+                Err(_) => false,
+            };
+            println!(
+                "  復旧確認 (書込テスト): {}",
+                if restored {
+                    "成功（write-controlは復旧済み）"
+                } else {
+                    "失敗（write-controlが復旧していない可能性）"
+                }
+            );
+
+            let detail = format!(
+                "{write_detail}, enable呼び出し={}, 復旧確認={restored}",
+                enable_result.is_ok()
+            );
+            StepResult::from_bool("503確認", write_ok, detail)
         }
         Err(message) => {
             println!("  無効化失敗: {message}（この場合503確認自体は検証できません）");
-            (false, format!("disable失敗: {message}"))
-        }
-    };
-
-    // ここまでの成否に関わらず、必ず有効化へ戻す。
-    println!("  write-control を有効化に戻します (POST /api/write-control/enable) ...");
-    let enable_result = set_write_control(&http, hub_url, true, admin_token).await;
-    match &enable_result {
-        Ok(()) => println!("  有効化: 成功"),
-        Err(message) => {
-            println!(
-                "  ★★★ 有効化に失敗しました: {message} ★★★ 手動で /api/write-control/enable を呼んで復旧してください。"
-            );
+            // disable 自体が失敗した＝write-control は何も変更されていない
+            // ため、enable への復旧は不要（むしろ「手動で復旧してください」と
+            // 表示すると、実際には無効化されていないのに利用者を無用に
+            // 不安にさせる）。よってここでは enable を呼ばず、その旨のみ示す。
+            println!("  無効化に失敗したため write-control は変更されていません（復旧不要）。");
+            let detail = format!("disable失敗: {message}（write-control未変更のため復旧不要）");
+            StepResult::from_bool("503確認", false, detail)
         }
     }
-
-    // 復旧確認: 実際に書き込めることを確かめる（あくまで付随情報）。
-    let restored = match build_client(hub_url, api_key) {
-        Ok(client) => client
-            .write_tag(tag.ids, RequestedValue::Num(0.0))
-            .await
-            .is_ok(),
-        Err(_) => false,
-    };
-    println!(
-        "  復旧確認 (書込テスト): {}",
-        if restored {
-            "成功（write-controlは復旧済み）"
-        } else {
-            "失敗（write-controlが復旧していない可能性）"
-        }
-    );
-
-    let detail = format!(
-        "{write_detail}, enable呼び出し={}, 復旧確認={restored}",
-        enable_result.is_ok()
-    );
-    StepResult::from_bool("503確認", write_ok, detail)
 }
 
 #[tokio::main(flavor = "current_thread")]
