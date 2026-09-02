@@ -46,32 +46,13 @@
  * 壊さないため）。
  */
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
-import { CSRF_HEADERS, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
+import { CSRF_HEADERS, fetchAuthToken, groupNodeByName, injectAuthToken } from './banto-hub-auth';
 
 const RUN_ID = Date.now();
 const REAL_CONN = `e2e-tcm-conn-${RUN_ID}`;
 const REAL_GROUP = `e2e-tcm-grp-${RUN_ID}`;
 const VIRT_GROUP = `e2e-tcm-virtgrp-${RUN_ID}`;
 const VIRT_GROUP_RENAMED = `${VIRT_GROUP}-renamed`;
-
-function escapeRegExp(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-/**
- * ツリーのグループ行のアクセシブル名は「名前 + タグ件数 + 周期」の合成
- *（例: `e2e-tcm-virtgrp-1730000000000 (1) 1000ms`）になるため、接続ノード
- * と違って `exact: true` の完全一致は決して成立しない。かといって単純な
- * 部分一致に戻すと、`VIRT_GROUP` と `VIRT_GROUP_RENAMED`（`-renamed` の
- * 有無だけが違う）が相互に部分一致してしまう。名前の直後が ` (`（件数の
- * 開始）であることまで確認して境界を明示することで、接尾辞ありでも
- * 一意に当てる。
- */
-function groupNodeByName(page: Page, name: string) {
-	return page
-		.getByRole('tree')
-		.getByRole('button', { name: new RegExp(`^${escapeRegExp(name)} \\(`) });
-}
 
 interface ConnectionRow {
 	id: number;

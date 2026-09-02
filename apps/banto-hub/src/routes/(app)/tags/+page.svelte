@@ -127,8 +127,9 @@
 	import { canDefaultWritable, writableDefaultBlockedReason } from '$lib/banto/writableDefault';
 	import {
 		monitorHref,
-		resolveGroupIdFromTreeSelection,
 		resolvePresetGroupId,
+		resolveRegistrationTarget,
+		type RegistrationTarget,
 		type TreeSelectionForPreset
 	} from '$lib/banto/tagOnboarding';
 	import { isFormDirty } from '$lib/banto/formDirty';
@@ -564,6 +565,22 @@
 	 *   と同格の引き継ぎ対象であり、この既定計算で上書きすべきではない）。
 	 */
 	let createWritableTouched = $state(false);
+
+	/**
+	 * T19 S1-c（UX-33）: create Drawer がツリーで選択中のグループへ
+	 * 「確定」した状態（`openCreateDrawer` がツールバー経由で開かれた場合に
+	 * `true` にする）かどうか。`true` の間、`tagFields` snippet はタグ種別・
+	 * 収集グループの2つの `<select>` を `disabled` にし、対象グループ名を
+	 * 明示するメッセージを出す - 「選択されたグループに対して登録する」
+	 * （実装指示、docs/banto-hub-t19-design.md UX-33）を、プリセットのみに
+	 * 留めず実際に変更不能にすることで満たす。
+	 *
+	 * `openDuplicateDrawer`（複製）は `false` のまま - 複製元と同じグループに
+	 * 限定する理由が無く、従来どおり任意のグループへ複製できる。
+	 * 「登録して次へ」（`handleCreate`）はこの値に触れない - 連続登録と同じ
+	 * 対象グループのまま次の1件を続けて登録できることを維持する。
+	 */
+	let createGroupLocked = $state(false);
 
 	/**
 	 * T19 S1-b（UX-34）: create Drawer が開いている間、`createForm.writable`
@@ -1374,27 +1391,38 @@
 	}
 
 	/**
-	 * T18-2d（docs/banto-hub-t18-design.md「T18-2d 初回導線チェックリスト」、
-	 * TAG-UX-A「ツリーで選択中の接続／グループを単票・連続登録へプリセット
-	 * する」）: 開いた時点でツリーがグループを選択中なら、そのグループを
-	 * `collectionGroupId` へ初期値として入れる（`resolveGroupIdFromTreeSelection`
-	 * が「すべて」/接続選択/calc・mem配下は `null` にする - 冒頭 import 元の
-	 * doc comment 参照）。プリセットした値も `createBaseline` に含めるので
-	 * dirty 扱いにはならない（TAG-UX-A「選択グループからタグを作る場合、
-	 * グループの再選択を要求しない」を満たしつつ、まだ何も入力していない
-	 * 状態を dirty と誤認しない）。
+	 * T19 S1-c（UX-33、旧 T18-2d「ツリーで選択中の接続／グループを単票・
+	 * 連続登録へプリセットする」を置き換え）: ツールバーの「新規登録」は
+	 * `registrationTarget`（ツリー選択から決まる、依存ゼロの純関数
+	 * `resolveRegistrationTarget` 参照）が非 `null` のときしか表示されない
+	 * ため、開いた時点で必ず対象グループが1つに決まっている。旧実装は
+	 * 「プリセットするだけ（変更可能）」だったが、UX-33「選択されたグループ
+	 * に対して登録する」に合わせ、`tagKind`・`collectionGroupId` の両方を
+	 * その場で確定し（`createGroupLocked = true`）、`tagFields` snippet 側で
+	 * 該当 `<select>` を `disabled` にする（下の呼び出し箇所参照）。
+	 * プリセットした値は `createBaseline` にも入れるので dirty 扱いには
+	 * ならない（まだ何も入力していない状態を dirty と誤認しない - 旧実装と
+	 * 同じ配慮）。
+	 *
+	 * `registrationTarget` が `null`（呼び出し元の異常系 - 通常はボタン自体が
+	 * 出ないため到達しない）の場合は、フォールバックとして旧来どおり空の
+	 * `tagKind: 'plc'` から始める未確定フォームを開く。
 	 */
 	function openCreateDrawer(): void {
 		if (!confirmDiscardIfNeeded()) return;
-		const presetGroupId = resolveGroupIdFromTreeSelection(treeFilter, groups, connections);
+		const target = registrationTarget;
 		const next = blankForm();
-		if (presetGroupId !== null) next.collectionGroupId = String(presetGroupId);
+		if (target !== null) {
+			next.collectionGroupId = String(target.groupId);
+			next.tagKind = target.tagKind;
+		}
 		createForm = next;
 		createBaseline = { ...next };
 		createErrors = {};
 		createAddressPreflight = blankAddressPreflight();
 		editConflict = null;
 		duplicateSource = null; // T18-3a: 通常の新規作成では複製元差分パネルを出さない
+		createGroupLocked = target !== null;
 		// 2026-09-01: 空フォームなので「名前が空」から始まる - プリフィル対象。
 		createNameTouched = false;
 		// T19 S1-b（UX-34）: 新規タグは常に `writable` の自動計算から始まる
@@ -1447,13 +1475,34 @@
 		// しきい値」と同格の引き継ぎ対象 - 自動計算で上書きしない（上の
 		// `createWritableTouched` 宣言のコメント参照）。
 		createWritableTouched = true;
+		// T19 S1-c（UX-33）: 複製は複製元のグループを引き継ぐだけで、現在の
+		// ツリー選択には従わない（従来どおり任意のグループへ変更できる）ため
+		// `false`（`createGroupLocked` 宣言のコメント参照）。
+		createGroupLocked = false;
 		drawerMode = 'create';
 	}
 
+	/**
+	 * T19 S1-c（UX-33）: ツールバーの「連続登録」ボタンは、グループ未選択
+	 * では表示されず、選択中でも `registrationTarget.supportsContinuous`
+	 * が `false` のときは **表示されるが `disabled`** になる（virtual＝
+	 * calc/mem 配下のグループ。連続登録は PLC アドレスの算術前提の機能で
+	 * `tagKind` は常に `'plc'` のため。`resolveRegistrationTarget` の
+	 * doc comment 参照）。押せる状態で到達した時点で対象グループは確定
+	 * している。`continuousForm.collectionGroupId` を
+	 * その対象で毎回上書きする - 前回開いたときに別グループを選んでいた
+	 * 形跡が残っていても、常に「今ツリーで選択しているグループへ」を優先
+	 * する。`continuousForm` 自体はリセットしない既存の挙動
+	 * （`continuousNamePatternTouched` 宣言のコメント参照）は変えていない -
+	 * 上書きするのは対象グループの1フィールドのみ。
+	 */
 	function openContinuousDrawer(): void {
 		if (!confirmDiscardIfNeeded()) return;
 		continuousBaseline = blankContinuousForm();
 		editConflict = null;
+		if (registrationTarget !== null && registrationTarget.supportsContinuous) {
+			continuousForm.collectionGroupId = String(registrationTarget.groupId);
+		}
 		drawerMode = 'continuous';
 	}
 
@@ -1518,6 +1567,21 @@
 	}
 
 	/**
+	 * T19 S1-c（UX-33、docs/banto-hub-t19-design.md「タグ登録の起点」、
+	 * 2026-09-02 オーナー決定「グループ選択時に右画面を出し、そのグループに
+	 * 対して登録する」）: 現在のツリー選択から、タグ登録操作（新規登録・
+	 * 連続登録）のツールバーを出してよいか・対象グループは何かを決める。
+	 * `null` は「すべて」ノード・接続ノード選択時（タグは必ずグループに
+	 * 属するため登録先が一意に決まらない） - 判定ロジック自体は依存ゼロの
+	 * 純関数 `resolveRegistrationTarget`（`tagOnboarding.ts`）に切り出して
+	 * ユニットテスト済み。ここでは `treeFilter`/`groups`/`connections` を
+	 * 渡すだけ。
+	 */
+	const registrationTarget = $derived.by((): RegistrationTarget | null =>
+		resolveRegistrationTarget(treeFilter, groups, connections)
+	);
+
+	/**
 	 * T18-2e（docs/banto-hub-t18-design.md「T18-2e T13-3 移管」、
 	 * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A）: ツリーの右クリック
 	 * （`ConnectionTree`/`TreeView` の `oncontextmenu` - マウス右クリックと
@@ -1562,8 +1626,9 @@
 	/**
 	 * 右クリックされたノードを選択状態にする - 「親（接続/グループ）は
 	 * 選択ノードからプリセットする」（実装指示 T18-2e スコープ1点目）を、
-	 * 既存の `resolveGroupIdFromTreeSelection`（T18-2d、`openCreateDrawer` が
-	 * 使う）にそのまま乗せるため。T19 S1-a 以降、書き込み権限がある利用者は
+	 * 既存の `registrationTarget`（T19 S1-c、`resolveRegistrationTarget` 経由、
+	 * `openCreateDrawer` が使う）にそのまま乗せるため。T19 S1-a 以降、
+	 * 書き込み権限がある利用者は
 	 * `calc`/`mem` 配下でも常にメニューが出る（`resolveTreeContextMenuItems`
 	 * が空配列を返すことは無くなった - 上の doc comment 参照）。メニューが
 	 * 空になるのは viewer が「すべて」ノードを右クリックした場合のみ
@@ -1778,8 +1843,9 @@
 	 * `createTag` はこのページ自身が持つ create Drawer を、右クリックされた
 	 * グループへプリセットした状態で開く - `handleTreeContextMenu` が既に
 	 * `treeFilter` をそのグループへ合わせているので、`openCreateDrawer()`
-	 * （`resolveGroupIdFromTreeSelection` 経由で選択中ノードからプリセット
-	 * する T18-2d 既存ロジック）をそのまま呼ぶだけでよい（T18-2e から無改変）。
+	 * （`registrationTarget`/`resolveRegistrationTarget` 経由で選択中ノードから
+	 * 対象グループを確定する T19 S1-c ロジック）をそのまま呼ぶだけでよい
+	 * （T18-2e から関数の呼び出し方自体は無改変）。
 	 * 接続/グループの作成・再設定・削除（T18-6d 追加分）は、いずれも
 	 * `ConnectionDrawer`/`CollectionGroupDrawer` を対応するモードで開く
 	 * 上記の open系/Flow系関数へ振り分けるだけで、独自の CRUD ロジックは持たない。
@@ -1825,9 +1891,11 @@
 	 * する（一度だけ - `onboardingQueryApplied` で guard、`reload()` は
 	 * 作成/削除のたびにも呼ばれるため `groups`/`connections` の参照は何度も
 	 * 変わる）。ツリー選択に反映するだけで Drawer は自動で開かない -
-	 * 「新規登録」ボタンを押した時点で `openCreateDrawer()` がこの選択から
-	 * プリセットする（同関数の doc comment 参照）。calc/mem 配下や無効な ID
-	 * は `resolvePresetGroupId` が弾くのでツリー選択は変えない。
+	 * ツリーがグループを選択した状態になれば、`registrationTarget` が非
+	 * `null` になり「新規登録」ボタンが現れる - 押した時点で `openCreateDrawer()`
+	 * がこの選択を登録先として確定する（同関数の doc comment 参照）。
+	 * calc/mem 配下や無効な ID は `resolvePresetGroupId` が弾くのでツリー
+	 * 選択は変えない。
 	 */
 	let onboardingQueryApplied = $state(false);
 	$effect(() => {
@@ -2616,7 +2684,8 @@
 	addressPreflight: AddressPreflightState,
 	onAddressInput: () => void,
 	onNameInput: () => void,
-	onWritableInput: () => void
+	onWritableInput: () => void,
+	groupLocked: boolean
 )}
 	<!--
 		TAG-P0-2（docs/banto-hub-desktop-plan.md §9.3、2026-08-10 実装メモ）:
@@ -2627,6 +2696,18 @@
 	-->
 	{#if errors.configuration}
 		<p class="err" role="alert">{errors.configuration}</p>
+	{/if}
+	{#if groupLocked && form.collectionGroupId !== ''}
+		<!--
+			T19 S1-c（UX-33、docs/banto-hub-t19-design.md「タグ登録の起点」）:
+			ツリーで選択したグループから開いた新規登録は、そのグループへの
+			登録で確定している - プルダウンを見なくても分かるよう、フォーム
+			先頭でも対象グループ名を明示する（実装指示「どのグループに登録
+			されるのかが画面上で明確であること」）。
+		-->
+		<p class="note" data-testid="tag-create-group-locked-note">
+			「{groupName(Number(form.collectionGroupId))}」へ登録します。
+		</p>
 	{/if}
 	<!--
 		T18-2a（docs/banto-hub-t18-design.md「T18-2a 単票フォーム刷新」、
@@ -2641,6 +2722,7 @@
 			<select
 				id="tag-kind"
 				bind:value={form.tagKind}
+				disabled={groupLocked}
 				aria-invalid={errors.tagKind ? 'true' : undefined}
 				aria-describedby={describedBy(errors.tagKind && 'tag-kind-err')}
 				onchange={() => {
@@ -2663,6 +2745,7 @@
 				id="tag-group"
 				bind:value={form.collectionGroupId}
 				required
+				disabled={groupLocked}
 				aria-invalid={errors.collectionGroupId ? 'true' : undefined}
 				aria-describedby={describedBy(
 					(form.tagKind !== 'plc' || form.collectionGroupId !== '') && 'tag-group-hint',
@@ -3406,8 +3489,46 @@
 				<div class="right-pane">
 					<div class="toolbar">
 						{#if canWrite}
-							<button type="button" onclick={openCreateDrawer}>新規登録</button>
-							<button type="button" onclick={openContinuousDrawer}>連続登録</button>
+							<!--
+								T19 S1-c（UX-33、docs/banto-hub-t19-design.md「タグ登録の
+								起点」、2026-09-02 オーナー決定「グループ選択時に右画面を
+								出し、そのグループに対して登録する」）: 「新規登録」
+								「連続登録」はツリーでグループが選択されているときだけ出す
+								- `registrationTarget`（依存ゼロの純関数
+								`resolveRegistrationTarget`、`tagOnboarding.ts`）が
+								「すべて」ノード・接続ノード選択時は `null` を返す
+								（タグは必ずグループに属するため、これらの選択では登録先が
+								一意に決まらない - 実装指示のとおりの扱い）。`null` の間は
+								ボタンを消すだけでなく案内を出す（実装指示「ただ消えるだけに
+								しないこと」）。
+
+								CSVインポートだけは対象外 - CSV は行ごとに `connection`/
+								`group` 列で対象グループを指定でき、1ファイルが複数グループに
+								またがりうる（`tagCsv.ts::parseCsvRows` 参照）。ツリー選択に
+								紐づけると「選択中のグループにしか取り込めない」という誤解や
+								制約を生むだけなので、従来どおりツリー選択と無関係に常時表示
+								する（2026-09-03 実装判断）。
+							-->
+							{#if registrationTarget}
+								<span class="registration-target" data-testid="tag-registration-target">
+									「{registrationTarget.groupName}」へ登録
+								</span>
+								<button type="button" onclick={openCreateDrawer}>新規登録</button>
+								<button
+									type="button"
+									onclick={openContinuousDrawer}
+									disabled={!registrationTarget.supportsContinuous}
+									title={registrationTarget.supportsContinuous
+										? undefined
+										: '連続登録は PLC アドレスを持つ収集グループでのみ使えます'}
+								>
+									連続登録
+								</button>
+							{:else}
+								<span class="registration-hint" data-testid="tag-registration-hint">
+									左のツリーで収集グループを選択すると、ここに新規登録・連続登録の操作が表示されます
+								</span>
+							{/if}
 							<button type="button" onclick={openCsvDrawer}>CSVインポート</button>
 							<!-- T18-3b: 選択列を追加する代わりに、行クリックの意味そのものを
 								「編集を開く」⇔「選択を切り替える」で切り替えるトグル
@@ -3919,7 +4040,9 @@
 					// 直接クリックした合図 - 以後は自動計算しない
 					// （`createWritableTouched` 宣言のコメント参照）。
 					createWritableTouched = true;
-				}
+				},
+				// T19 S1-c（UX-33）: `createGroupLocked` 宣言のコメント参照。
+				createGroupLocked
 			)}
 			<div class="actions">
 				<!--
@@ -4032,7 +4155,11 @@
 				// T19 S1-b（UX-34）: 既定の自動適用は create Drawer 限定
 				// （`createWritableTouched` 宣言のコメント参照）- 編集フォームに
 				// 対応する touched 変数は無いため no-op を渡す。
-				() => {}
+				() => {},
+				// T19 S1-c（UX-33）: 編集フォームはグループ確定の対象外
+				// （`createGroupLocked` 宣言のコメント参照 - ロックは create
+				// Drawer 限定）。
+				false
 			)}
 			<div class="actions">
 				<button type="submit" disabled={isDrawerBusy()}>保存</button>
@@ -4069,10 +4196,25 @@
 					>SB</code
 				>/<code>SW</code>/<code>DX</code>/<code>DY</code> は16進デバイス番号として桁上がりを扱います。
 			</p>
+			{#if continuousForm.collectionGroupId !== ''}
+				<!--
+					T19 S1-c（UX-33）: 連続登録はツリーでグループが選択されている
+					ときだけ提示される（ツールバー側の `registrationTarget` 判定、
+					`openContinuousDrawer` 参照）ため、開いた時点で対象グループは
+					既に確定している - フォーム先頭でも明示する。
+				-->
+				<p class="note" data-testid="tag-continuous-group-locked-note">
+					「{groupName(Number(continuousForm.collectionGroupId))}」へ連続登録します。
+				</p>
+			{/if}
 			<div class="form-grid">
 				<label class="field">
 					対象グループ
-					<select bind:value={continuousForm.collectionGroupId}>
+					<!--
+						T19 S1-c（UX-33）: 対象は開いた時点のツリー選択で確定済みの
+						ため、変更不能にする（上のノート参照）。
+					-->
+					<select bind:value={continuousForm.collectionGroupId} disabled>
 						<option value="" disabled>選択してください</option>
 						{#each groupsFor('plc') as group (group.id)}
 							<option value={String(group.id)}>{group.name}</option>
@@ -4529,6 +4671,25 @@
 		margin: 0;
 		color: var(--banto-text-muted);
 		font-size: 0.8rem;
+	}
+
+	/*
+	 * T19 S1-c（UX-33）: ツールバーの登録先表示（対象グループが決まっている
+	 * とき）。ボタンと並ぶので `.note` より主張を強くする - ミュートせず
+	 * 通常のテキスト色・太字にして「今どこへ登録するか」を目立たせる。
+	 */
+	.registration-target {
+		flex: 0 0 auto;
+		font-weight: 600;
+		font-size: 0.85rem;
+	}
+
+	/* 対象グループ未選択時の案内。ボタンが消えるだけにならないよう
+	   `.note` と同じ控えめな見た目でその場に文言を残す。 */
+	.registration-hint {
+		flex: 0 0 auto;
+		color: var(--banto-text-muted);
+		font-size: 0.85rem;
 	}
 
 	.loading {
