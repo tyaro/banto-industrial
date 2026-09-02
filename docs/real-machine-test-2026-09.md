@@ -1,7 +1,7 @@
 # 実機テスト手順書（2026-09-01 実装分）
 
 作成日: 2026-09-01
-状態: **A・B・C 実施完了（2026-09-01）**。A は全項目合格、B は合格4/一部合格1/検証不能3（理由は §8）、C は全項目合格
+状態: **A・B・C 実施完了（2026-09-01）、C は別マシンからの LAN 検証も完了（2026-09-02、§9 C-LAN）**。A は全項目合格、B は合格4/一部合格1/検証不能3（理由は §8）、C は全項目合格
 対象: [#130](https://github.com/tyaro/banto-industrial/issues/130) broker プロトコル抽象化 / [#131](https://github.com/tyaro/banto-industrial/issues/131) Modbus 書き込み（[#219](https://github.com/tyaro/banto-industrial/issues/219)） / [#123](https://github.com/tyaro/banto-industrial/issues/123) banto-tagclient
 
 ---
@@ -64,10 +64,13 @@ BANTO_HUB_DATA=<scratch>/hub-smoke-data
 ### 1.3 ハマりどころ（既知）
 
 - **素の `banto-hub` バイナリは収集停止で起動する**。Web 管理 UI に収集開始ボタンは無い。開始/停止は `POST /api/collection/start`（`RunMode::Configured` = 実機）/ `POST /api/collection/stop`。
-- 管理 REST の認証は **localStorage `banto.auth.token` の Bearer** ＋ CSRF 固定ヘッダ **`X-Banto-Client: banto`**（Cookie ではない）。UI に無い操作は、ブラウザの認証済みコンテキストからこの2ヘッダを付けて `fetch` すれば叩ける。
+- 管理 REST の認証は **Bearer トークン** ＋ CSRF 固定ヘッダ **`X-Banto-Client: banto`**（Cookie ではない）。**トークンは `localStorage` には無い**（`@banto/admin-core` の認証プロバイダが内部で保持する）。スクリプトから叩くときは **`POST /api/auth/login` の応答の `token`** を使うのが確実（2026-09-02 に確認。それ以前の「localStorage の `banto.auth.token`」という記述は誤り）。
 - **収集稼働中のレジストリ変更は 202 で pending queue に入り**即時反映されない。status ページの「Pending changes」で適用するか、**収集停止中に設定を済ませる**。
 - monitor のライブ表示は **vite dev が WebSocket を proxy しない**ため「再接続中」になる（開発プロキシの制約で、製品バグではない）。値の確認は `GET /api/v1/values/{external_name}` か status ページで行う。
-- 試運転モード（loopback のみ・ログイン不要）を使うと設定作業が速い。**ロックダウン後は元に戻せない**点に注意。
+- 試運転モード（loopback のみ・ログイン不要）を使うと設定作業が速い。**ロックダウンには管理アカウントが必須**（締め出し防止。`commissioning_lock_down_fails_without_any_admin_account` で固定）。ロックダウンを戻すには**特権サービス側の `revert-to-commissioning`** が要るので、通常操作では戻せないと考えてよい。
+- **試運転モードのままでは非 loopback バインドが拒否される**（`enforce_loopback_when_commissioning`）。**LAN から接続する試験には必ずロックダウンが要る。**
+- **セッションはメモリ保持**。Hub を再起動するとログイン token が失効するので取り直す。
+- **プロファイルは 1 プロセス排他**。古いプロセスが残っていると新プロセスは `profile 'default' は既に別プロセスが使用中です` で起動できない（**保持者の PID がメッセージに出る**）。
 - 管理者セットアップ（`POST /api/auth/setup`）はアカウント作成とパスワード設定を伴うため、**オーナーが実施する**。
 
 ---
@@ -342,6 +345,46 @@ HUB_API_KEY=bh_xxxxxxxx cargo run --example real_hub_smoke -p banto-tagclient
 - **購読は on-change 配信**（`apps/banto-hub/core/src/subscribe_core.rs` の `Mode::OnChange`）。値も quality も変化しなければ**フレームは1つも来ない**。「購読したのに何も届かない」は正常な場合がある。値が静止している環境で購読を確認するには、**別クライアントから値を変える**必要がある。
 - **書き込み直後の読み取りは旧値を返す**。Hub の current 値は**次回ポーリングで更新される**ため、周期 1000ms なら最大1周期ぶん遅れる。書き込み → 即読み戻しで一致を期待すると失敗する。**ポーリング周期を跨いで確認すること。**
 
+### C-LAN: 別マシンからの検証（2026-09-02）— **全6項目合格**
+
+2026-09-01 の実施はすべて同一 PC のループバックだったため、翌日に**別マシンから**やり直した。
+
+**条件**: Hub を**ロックダウン済み**にし、`0.0.0.0` にバインドして LAN で待ち受け。別マシンから `http://<この PC の LAN アドレス>:8722` へ接続。別マシンには **Rust 環境を入れず**、`cargo build --release --example real_hub_smoke` で作った実行ファイル（2.4 MB）をコピーしただけ。
+
+**結果**: catalog 取得・読み取り・購読・書き込み・403・503 の**6項目すべて合格**。
+
+ループバックでは確認できなかった次が確かめられた。
+
+- **WebSocket の購読が LAN 越しに機能する**（項目3 で値の更新を受信）
+- **API キー認証がネットワーク越しに通る**
+- **ロックダウン後の管理トークン経路**が実際に働く（項目6）
+
+#### 1回目は項目6 だけ 401 で失敗した — これは収穫だった
+
+`HUB_ADMIN_TOKEN` 未設定のバイナリを先にコピーしたため、項目6 が 401 で落ちた。このときハーネスが出したメッセージ:
+
+```
+無効化失敗: HTTPステータス=401 Unauthorized（認証/権限エラー）。
+ロックダウン済みの Hub では管理セッションの認証が必要です。
+環境変数 HUB_ADMIN_TOKEN に管理者の Bearer トークンを設定してください。
+```
+
+**原因と対処が即座に分かった。** この分かりやすいエラーは PR #223 のレビュー指摘を受けて追加したもので、**まさに想定した状況で役に立った**。無ければ「なぜか6だけ落ちる」で止まっていた。
+
+同時に**粗も見つかった**。`disable` が失敗して**何も無効化していない**のに「手動で復旧してください」と警告していた。復旧すべきものが無いので誤りであり、修正済み（本 PR）。
+
+### 実機で判明した運用上の性質
+
+いずれも設計どおりだが、**知らないと詰まる**ので記録する。
+
+- **セッションはメモリ保持**。Hub を再起動するとログイン token が失効する（`banto-server` の `auth.rs` に「abandoned sessions accumulate in memory」と明記）。運用上は**再起動したらログインし直し**を意味する。今回、LAN バインドのための再起動でトークンが無効になり、取り直した。
+- **プロファイルは 1 プロセス排他**。古いプロセスが残っていると新しいプロセスは
+  `profile 'default' は既に別プロセスが使用中です（owner: ... pid: ...）` で起動できない。**保持者の PID がメッセージに出る**ので切り分けは容易。今回これで LAN バインドが一度失敗した。
+- **ロックダウンは実機で正しく効く**。認証なしの管理 API アクセスは 401 になる。ロックダウンには**管理アカウントの存在が必須**（`commissioning_lock_down_fails_without_any_admin_account` で固定されている締め出し防止）。
+- **試運転モードでは非 loopback バインドが拒否される**ため、**LAN 試験には必ずロックダウンが要る**。
+- 管理 UI の認証 token は **`localStorage` には無い**（`@banto/admin-core` の認証プロバイダが内部で保持）。token が要るときは `POST /api/auth/login` の応答から取るのが確実。
+- **`NoDefaultCurrentDirectoryInExePath=1`** が設定された Windows 環境では、バッチからカレントディレクトリの exe を名前だけでは起動できない。`if not exist` の判定は通るのに「見つからない」と言われる紛らわしい症状になる。**`%~dp0` で明示パス指定**すること。
+
 ### C の未実施分
 
-**LAN 越し（別マシンから）の確認は未実施**（本日はすべて同一 PC のループバック）。#123 の残スコープである**配布サイズの実測**と **release tag での固定**も未着手。
+**配布サイズの実測**と **release tag での固定**は完了した（`docs/banto-tagclient-design.md` §7.1 / §7.2、tag = `v0.1.0`）。**private app への固定**のみ未着手。
