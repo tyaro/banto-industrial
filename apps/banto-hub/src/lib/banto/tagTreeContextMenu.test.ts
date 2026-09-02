@@ -6,7 +6,11 @@
 import { describe, expect, it } from 'vitest';
 import type { PlcConnection, CollectionGroup } from './tagRegistryAdmin';
 import type { ConnectionTreeNodeData } from '$lib/components/connectionTreeTypes';
-import { resolveTagTreeContextMenuAction, resolveTreeContextMenuItems } from './tagTreeContextMenu';
+import {
+	resolveTagTreeContextMenuAction,
+	resolveTreeContextMenuItems,
+	resolveReadOnlyTreeContextMenuItems
+} from './tagTreeContextMenu';
 
 function connection(overrides: Partial<PlcConnection> = {}): PlcConnection {
 	return {
@@ -55,10 +59,15 @@ describe('resolveTagTreeContextMenuAction', () => {
 		});
 	});
 
-	it('virtual（calc/mem）接続ノードは null（メニューを出さない）', () => {
+	it('virtual（calc/mem）接続ノードも、その接続 ID をプリセットしたグループ作成リンクを返す（T19 S1-a、配下のグループ作成は許可）', () => {
 		const calc = connection({ id: 2, name: 'calc', protocol: 'virtual' });
 		const data: ConnectionTreeNodeData = { kind: 'connection', connection: calc };
-		expect(resolveTagTreeContextMenuAction(data)).toBeNull();
+		expect(resolveTagTreeContextMenuAction(data)).toEqual({
+			kind: 'createGroup',
+			label: 'calc 配下に収集グループを作成',
+			connectionId: 2,
+			href: '/collection-groups?connectionId=2'
+		});
 	});
 
 	it('実接続配下のグループノードは、そのグループ ID をプリセットしたタグ作成アクションを返す', () => {
@@ -72,11 +81,15 @@ describe('resolveTagTreeContextMenuAction', () => {
 		});
 	});
 
-	it('virtual（calc/mem）接続配下のグループノードは null（メニューを出さない）', () => {
+	it('virtual（calc/mem）接続配下のグループノードも、そのグループ ID をプリセットしたタグ作成アクションを返す（T19 S1-a、配下のタグ作成は許可）', () => {
 		const mem = connection({ id: 4, name: 'mem', protocol: 'virtual' });
 		const g = group({ id: 10, name: 'internal-tags', plcConnectionId: 4 });
 		const data: ConnectionTreeNodeData = { kind: 'group', group: g, connection: mem };
-		expect(resolveTagTreeContextMenuAction(data)).toBeNull();
+		expect(resolveTagTreeContextMenuAction(data)).toEqual({
+			kind: 'createTag',
+			label: 'internal-tags 配下にタグを作成',
+			groupId: 10
+		});
 	});
 
 	it('メニュー項目の文言は既存 e2e が参照する成功トースト/ボタン名と部分一致しない', () => {
@@ -133,10 +146,12 @@ describe('resolveTreeContextMenuItems', () => {
 		]);
 	});
 
-	it('virtual（calc/mem）接続ノードは空配列（メニューを出さない）', () => {
+	it('virtual（calc/mem）接続ノードは「収集グループを作成」の1項目のみを返す（T19 S1-a、接続自体の再設定・削除は禁止のまま）', () => {
 		const calc = connection({ id: 2, name: 'calc', protocol: 'virtual' });
 		const data: ConnectionTreeNodeData = { kind: 'connection', connection: calc };
-		expect(resolveTreeContextMenuItems(data)).toEqual([]);
+		expect(resolveTreeContextMenuItems(data)).toEqual([
+			{ kind: 'createGroup', label: '収集グループを作成', connectionId: 2 }
+		]);
 	});
 
 	it('実接続配下のグループノードは「タグを作成／収集グループを再設定／収集グループを削除」の3項目を返す（既存のタグ作成項目を先頭のまま維持）', () => {
@@ -150,11 +165,15 @@ describe('resolveTreeContextMenuItems', () => {
 		]);
 	});
 
-	it('virtual（calc/mem）接続配下のグループノードは空配列（メニューを出さない）', () => {
+	it('virtual（calc/mem）接続配下のグループノードは「タグを作成／収集グループを再設定／収集グループを削除」の3項目を返す（T19 S1-a、グループ自体は virtual ではないため通常グループと同じ権限）', () => {
 		const mem = connection({ id: 4, name: 'mem', protocol: 'virtual' });
 		const g = group({ id: 10, name: 'internal-tags', plcConnectionId: 4 });
 		const data: ConnectionTreeNodeData = { kind: 'group', group: g, connection: mem };
-		expect(resolveTreeContextMenuItems(data)).toEqual([]);
+		expect(resolveTreeContextMenuItems(data)).toEqual([
+			{ kind: 'createTag', label: 'internal-tags 配下にタグを作成', groupId: 10 },
+			{ kind: 'reconfigureGroup', label: '収集グループを再設定', groupId: 10 },
+			{ kind: 'deleteGroup', label: '収集グループを削除', groupId: 10 }
+		]);
 	});
 
 	it('新規追加した項目の文言も既存 e2e が参照する成功トースト/ボタン名と部分一致しない', () => {
@@ -182,5 +201,43 @@ describe('resolveTreeContextMenuItems', () => {
 				expect(collision.includes(item.label)).toBe(false);
 			}
 		}
+	});
+});
+
+/**
+ * T19 S1-a（docs/banto-hub-t19-design.md §7.1「viewer ロールからの接続・
+ * グループ詳細の閲覧」）: viewer（`canWrite` 無し）向けの右クリックメニュー
+ * を決める `resolveReadOnlyTreeContextMenuItems` を検証する。書き込み系の
+ * `resolveTreeContextMenuItems` とは別関数 - virtual（calc/mem）でも制限
+ * しないこと、ルートノードは空配列であることを固定する。
+ */
+describe('resolveReadOnlyTreeContextMenuItems', () => {
+	it('"すべて" ノードは空配列（閲覧対象が無い）', () => {
+		expect(resolveReadOnlyTreeContextMenuItems({ kind: 'all' })).toEqual([]);
+	});
+
+	it('実接続ノードは「詳細を表示」の1項目のみを返す', () => {
+		const conn = connection({ id: 7, name: 'line-a' });
+		const data: ConnectionTreeNodeData = { kind: 'connection', connection: conn };
+		expect(resolveReadOnlyTreeContextMenuItems(data)).toEqual([
+			{ kind: 'viewConnection', label: '詳細を表示', connectionId: 7 }
+		]);
+	});
+
+	it('virtual（calc/mem）接続ノードも「詳細を表示」を返す（閲覧は virtual を特別扱いしない）', () => {
+		const calc = connection({ id: 2, name: 'calc', protocol: 'virtual' });
+		const data: ConnectionTreeNodeData = { kind: 'connection', connection: calc };
+		expect(resolveReadOnlyTreeContextMenuItems(data)).toEqual([
+			{ kind: 'viewConnection', label: '詳細を表示', connectionId: 2 }
+		]);
+	});
+
+	it('グループノードは「詳細を表示」の1項目のみを返す（virtual 接続配下でも同じ）', () => {
+		const mem = connection({ id: 4, name: 'mem', protocol: 'virtual' });
+		const g = group({ id: 10, name: 'internal-tags', plcConnectionId: 4 });
+		const data: ConnectionTreeNodeData = { kind: 'group', group: g, connection: mem };
+		expect(resolveReadOnlyTreeContextMenuItems(data)).toEqual([
+			{ kind: 'viewGroup', label: '詳細を表示', groupId: 10 }
+		]);
 	});
 });

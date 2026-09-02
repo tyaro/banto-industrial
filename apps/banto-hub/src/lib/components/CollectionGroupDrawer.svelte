@@ -106,6 +106,14 @@
 		 * して使い続けられる。既定 `false`。
 		 */
 		requestDelete?: boolean;
+		/**
+		 * T19 S1-a（docs/banto-hub-t19-design.md §7.1「viewer ロールからの
+		 * 接続・グループ詳細の閲覧」）: `ConnectionDrawer.svelte` の同名
+		 * prop と同じ考え方 - `true` なら閲覧専用モードで開く（入力は
+		 * すべて `disabled`、保存・削除のボタンは出さない）。常に既存の
+		 * グループ（`group` 非 `null`）と組み合わせて使う想定。既定 `false`。
+		 */
+		readOnly?: boolean;
 		onClose: () => void;
 		/** 作成/更新が成功した直後に呼ばれる（202キュー投入時は呼ばれない — まだ確定していないため）。 */
 		onSaved: (group: CollectionGroup) => void;
@@ -120,13 +128,16 @@
 		connections,
 		presetPlcConnectionId = null,
 		requestDelete = false,
+		readOnly = false,
 		onClose,
 		onSaved,
 		onDeleted
 	}: Props = $props();
 
 	const isCreate = $derived(group === null);
-	const drawerTitle = $derived(isCreate ? '新規作成' : `${group?.name} を編集`);
+	const drawerTitle = $derived(
+		isCreate ? '新規作成' : readOnly ? `${group?.name} の詳細` : `${group?.name} を編集`
+	);
 
 	function errorMessage(err: unknown): string {
 		return isProviderError(err) ? err.message : String(err);
@@ -192,7 +203,9 @@
 
 		// T18-6d: 「収集グループを削除」からの起動 - フォーム初期化直後に
 		// 既存の handleDelete を1回だけ呼ぶ（上の Props.requestDelete 参照）。
-		if (requestDelete && group) {
+		// readOnly では呼び出し側が requestDelete を渡すことは無い想定だが、
+		// 念のため二重に閲覧専用を守る。
+		if (requestDelete && group && !readOnly) {
 			void handleDelete();
 		}
 	});
@@ -347,7 +360,7 @@
 {#snippet nameField()}
 	<label class="field">
 		名前
-		<input type="text" id="group-name" bind:value={form.name} />
+		<input type="text" id="group-name" bind:value={form.name} disabled={readOnly} />
 		{#if errors.name}<span class="err">{errors.name}</span>{/if}
 	</label>
 {/snippet}
@@ -356,7 +369,7 @@
 	<div class="form-grid">
 		<label class="field">
 			PLC接続
-			<select bind:value={form.plcConnectionId}>
+			<select bind:value={form.plcConnectionId} disabled={readOnly}>
 				<option value="" disabled>選択してください</option>
 				{#each connections as conn (conn.id)}
 					<option value={String(conn.id)}>{conn.name}</option>
@@ -366,7 +379,7 @@
 		</label>
 		<label class="field">
 			収集周期
-			<select bind:value={form.periodMs}>
+			<select bind:value={form.periodMs} disabled={readOnly}>
 				{#each ALLOWED_PERIOD_MS as ms (ms)}
 					<option value={String(ms)}>{ms} ms</option>
 				{/each}
@@ -374,7 +387,7 @@
 			{#if errors.periodMs}<span class="err">{errors.periodMs}</span>{/if}
 		</label>
 		<label class="field checkbox">
-			<input type="checkbox" bind:checked={form.enabled} />
+			<input type="checkbox" bind:checked={form.enabled} disabled={readOnly} />
 			有効
 		</label>
 	</div>
@@ -424,12 +437,14 @@
 	{:else}
 		{@render nameField()}
 		{@render destinationFields()}
-		<div class="actions">
-			<button type="button" onclick={handleSave} disabled={saving || deleting}>保存</button>
-			<button type="button" class="danger" onclick={handleDelete} disabled={saving || deleting}>
-				削除
-			</button>
-		</div>
+		{#if !readOnly}
+			<div class="actions">
+				<button type="button" onclick={handleSave} disabled={saving || deleting}>保存</button>
+				<button type="button" class="danger" onclick={handleDelete} disabled={saving || deleting}>
+					削除
+				</button>
+			</div>
+		{/if}
 	{/if}
 </Drawer>
 
