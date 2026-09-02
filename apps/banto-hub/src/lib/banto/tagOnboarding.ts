@@ -69,7 +69,7 @@
  * 先頭要素を指すと、複数接続/グループがある環境で既に子を持つ親へ誘導して
  * しまい、「グループが無い接続」「タグが無いグループ」に辿り着けない。
  */
-import type { CollectionGroup, PlcConnection, Tag } from './tagRegistryAdmin';
+import type { CollectionGroup, PlcConnection, Tag, TagKind } from './tagRegistryAdmin';
 import type { ValueEntry } from './hubStatus';
 
 /** `PlcConnection.protocol === "virtual"`（`calc`/`mem`）かどうか。型だけの
@@ -78,6 +78,14 @@ import type { ValueEntry } from './hubStatus';
 function isVirtual(connection: Pick<PlcConnection, 'protocol'>): boolean {
 	return connection.protocol === 'virtual';
 }
+
+/** `tagRegistryAdmin.CALC_CONNECTION_NAME`/`MEM_CONNECTION_NAME` と同じ値を
+ * ここに複製する（`isVirtual` と同じ「依存ゼロ」方針 - 冒頭コメント参照）。
+ * {@link resolveRegistrationTarget} がグループの `tagKind` を確定するために
+ * 使う - `protocol === 'virtual'` だけでは `computed`（calc配下）と
+ * `internal`（mem配下）を区別できない。 */
+const CALC_CONNECTION_NAME = 'calc';
+const MEM_CONNECTION_NAME = 'mem';
 
 /** virtual（`calc`/`mem`）を除いた実接続。 */
 function realConnections(connections: PlcConnection[]): PlcConnection[] {
@@ -333,4 +341,68 @@ export function resolveGroupIdFromTreeSelection(
 ): number | null {
 	if (selection.type !== 'group') return null;
 	return resolvePresetGroupId(String(selection.id), groups, connections);
+}
+
+/**
+ * T19 S1-c（UX-33、docs/banto-hub-t19-design.md「タグ登録の起点」、2026-09-02
+ * オーナー決定「グループ選択時に右画面を出し、そのグループに対して登録する」）:
+ * 現在のツリー選択から、タグ登録操作（新規登録・連続登録）を提示してよいか、
+ * 提示するなら対象グループは何かを1つの値にまとめる。`null` は「提示しない」
+ * （呼び出し側はツールバーの登録ボタンを出さず、代わりに案内を出す） -
+ * 「すべて」ノード・接続ノードはグループが一意に決まらないためいずれも
+ * `null`（実装指示「接続ノードや『すべて』を選んでいる場合…グループが
+ * 特定できない状態」）。
+ *
+ * {@link resolveGroupIdFromTreeSelection}（T18-2d、単票フォームへの
+ * 「プリセット」用）とは違い、**virtual（calc/mem）配下のグループを除外
+ * しない**。右クリックメニューの「グループ配下にタグを作成」
+ * （`tagTreeContextMenu.ts::resolveTagTreeContextMenuAction`、T19 S1-a で
+ * virtual 配下も常に許可するよう改めた）と同じ権限に揃えるべきだからである -
+ * calc/mem 配下のグループもタグは必ずグループに属する通常の収集グループで
+ * あり、選択すれば登録先は一意に決まる（`computed`/`internal` タグを
+ * 作れないと、旧 UI が持っていた機能が失われる）。
+ */
+export interface RegistrationTarget {
+	/** 登録先の収集グループ ID。 */
+	groupId: number;
+	/** 画面表示用のグループ名（「どのグループに登録されるか」を明示する）。 */
+	groupName: string;
+	/**
+	 * このグループへ新規作成するタグの種別。グループが属する接続の名前で
+	 * 一意に決まる（`calc` 配下は `computed`、`mem` 配下は `internal`、それ
+	 * 以外は `plc` - `banto_tags::tag::validate_tag_kind_placement` と同じ
+	 * 配置規則）。単票の新規登録フォームはこの値へ固定する。
+	 */
+	tagKind: TagKind;
+	/**
+	 * 連続登録フォームを提示してよいか。連続登録は PLC アドレスの算術
+	 * （増分・桁上がり）を前提にした機能で `tagKind` は常に `'plc'`
+	 * （`ContinuousFormState` 冒頭コメント参照）- `computed`/`internal` タグは
+	 * アドレスを持てないため、virtual 配下のグループでは常に `false`。
+	 */
+	supportsContinuous: boolean;
+}
+
+export function resolveRegistrationTarget(
+	selection: TreeSelectionForPreset,
+	groups: Pick<CollectionGroup, 'id' | 'name' | 'plcConnectionId'>[],
+	connections: Pick<PlcConnection, 'id' | 'name' | 'protocol'>[]
+): RegistrationTarget | null {
+	if (selection.type !== 'group') return null;
+	const group = groups.find((g) => g.id === selection.id);
+	if (!group) return null; // 通常起きない（選択できるのは実在するグループのみ）。
+	const conn = connections.find((c) => c.id === group.plcConnectionId);
+	if (!conn) return null; // 同上。
+	const tagKind: TagKind =
+		conn.name === CALC_CONNECTION_NAME
+			? 'computed'
+			: conn.name === MEM_CONNECTION_NAME
+				? 'internal'
+				: 'plc';
+	return {
+		groupId: group.id,
+		groupName: group.name,
+		tagKind,
+		supportsContinuous: tagKind === 'plc'
+	};
 }

@@ -17,6 +17,7 @@ import {
 	resolveGroupIdFromTreeSelection,
 	resolvePresetConnectionId,
 	resolvePresetGroupId,
+	resolveRegistrationTarget,
 	tagsHref,
 	type OnboardingSnapshot
 } from './tagOnboarding';
@@ -384,5 +385,60 @@ describe('resolveGroupIdFromTreeSelection', () => {
 		expect(
 			resolveGroupIdFromTreeSelection({ type: 'group', id: 20 }, groups, connections)
 		).toBeNull();
+	});
+});
+
+describe('resolveRegistrationTarget', () => {
+	// T19 S1-c（UX-33）: `resolveGroupIdFromTreeSelection` と違い、virtual
+	// （calc/mem）配下のグループも登録対象として扱う - 右クリック「グループ
+	// 配下にタグを作成」（tagTreeContextMenu.ts）と同じ権限に揃えるため。
+	const connections = [connection({ id: 1 }), CALC, MEM];
+	const plcGroup = group({ id: 10, name: 'plc-group', plcConnectionId: 1 });
+	const calcGroup = group({ id: 20, name: 'calc-group', plcConnectionId: CALC.id });
+	const memGroup = group({ id: 30, name: 'mem-group', plcConnectionId: MEM.id });
+	const groups = [plcGroup, calcGroup, memGroup];
+
+	it('"all" 選択は null（登録操作を提示しない）', () => {
+		expect(resolveRegistrationTarget({ type: 'all' }, groups, connections)).toBeNull();
+	});
+
+	it('接続選択は null（グループが一意に決まらない）', () => {
+		expect(
+			resolveRegistrationTarget({ type: 'connection', id: 1 }, groups, connections)
+		).toBeNull();
+	});
+
+	it('存在しないグループ ID の選択は null', () => {
+		expect(resolveRegistrationTarget({ type: 'group', id: 999 }, groups, connections)).toBeNull();
+	});
+
+	it('実グループ（plc）選択: tagKind=plc・連続登録も使える', () => {
+		const target = resolveRegistrationTarget({ type: 'group', id: 10 }, groups, connections);
+		expect(target).toEqual({
+			groupId: 10,
+			groupName: 'plc-group',
+			tagKind: 'plc',
+			supportsContinuous: true
+		});
+	});
+
+	it('calc 配下のグループ選択: tagKind=computed・連続登録は使えない', () => {
+		const target = resolveRegistrationTarget({ type: 'group', id: 20 }, groups, connections);
+		expect(target).toEqual({
+			groupId: 20,
+			groupName: 'calc-group',
+			tagKind: 'computed',
+			supportsContinuous: false
+		});
+	});
+
+	it('mem 配下のグループ選択: tagKind=internal・連続登録は使えない', () => {
+		const target = resolveRegistrationTarget({ type: 'group', id: 30 }, groups, connections);
+		expect(target).toEqual({
+			groupId: 30,
+			groupName: 'mem-group',
+			tagKind: 'internal',
+			supportsContinuous: false
+		});
 	});
 });
