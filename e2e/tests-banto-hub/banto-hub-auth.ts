@@ -14,7 +14,7 @@
  *   （`createHttpAuthProvider` の `DEFAULT_STORAGE_KEY`、
  *   `remember` 未指定時の既定保存先）に入る。
  */
-import type { APIRequestContext, Page } from '@playwright/test';
+import type { APIRequestContext, Locator, Page } from '@playwright/test';
 
 /** 管理系 REST 全体で共通の CSRF ヘッダー（`$lib/banto/setup.ts::CSRF_HEADER` と同型）。 */
 export const CSRF_HEADERS = { 'X-Banto-Client': 'banto' } as const;
@@ -100,4 +100,29 @@ export async function injectAuthToken(page: Page, token: string): Promise<void> 
 export async function ensureLoggedIn(page: Page): Promise<void> {
 	const token = await fetchAuthToken(page.request);
 	await injectAuthToken(page, token);
+}
+
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * T19 S1-a（`banto-hub-tags-tree-context-menu.spec.ts` で発見・固定された
+ * 罠、T19 S1-c で「新規登録」「連続登録」がグループ選択に紐づいたことで
+ * ツリーのグループ選択が他 spec にも広がったため、ここへ切り出した共有
+ * ヘルパー）: ツリーのグループ行のアクセシブル名は「名前 + タグ件数 + 周期」
+ * の合成（例: `e2e-tcm-virtgrp-1730000000000 (1) 1000ms`）になるため、接続
+ * ノードと違って `exact: true` の完全一致は決して成立しない。かといって
+ * 単純な部分一致に戻すと、接尾辞だけが違う2つのグループ名（例:
+ * `VIRT_GROUP` と `VIRT_GROUP_RENAMED`）が相互に部分一致してしまう。名前の
+ * 直後が ` (`（件数の開始）であることまで確認して境界を明示することで、
+ * 接尾辞ありでも一意に当てる。
+ *
+ * 接続ノードのラベルは名前そのものなので、そちらは `exact: true` で足りる
+ * （このヘルパーは不要）。
+ */
+export function groupNodeByName(page: Page, name: string): Locator {
+	return page
+		.getByRole('tree')
+		.getByRole('button', { name: new RegExp(`^${escapeRegExp(name)} \\(`) });
 }

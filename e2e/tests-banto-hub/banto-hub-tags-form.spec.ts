@@ -10,7 +10,7 @@
  * 叩いて作る。
  */
 import { expect, test, type Page } from '@playwright/test';
-import { CSRF_HEADERS, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
+import { CSRF_HEADERS, fetchAuthToken, groupNodeByName, injectAuthToken } from './banto-hub-auth';
 
 const CONNECTION_NAME = 'e2e-form-plc';
 const GROUP_NAME = 'e2e-form-group';
@@ -85,12 +85,19 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 
 	test('1. create Drawer: 必須項目を入力後 Enter で送信され、タグが作成される', async () => {
 		await page.goto('/tags');
+		// T19 S1-c（UX-33）: 「新規登録」はツリーでグループが選択されている
+		// ときしか出ない上、開いた create Drawer は選択中グループへ確定済み
+		// （収集グループの `<select>` が disabled）になる - 旧実装は空の
+		// フォームから `<select>` で選ぶ前提だったため、まずツリーで対象
+		// グループを選んでおく（`groupNodeByName` は `banto-hub-auth.ts`
+		// 参照 - グループ行のアクセシブル名は「名前 (件数) 周期」の合成で
+		// `exact: true` が成立しない）。
+		await groupNodeByName(page, GROUP_NAME).click();
 		await page.getByRole('button', { name: '新規登録' }).click();
 		const drawer = page.getByRole('dialog', { name: '新規作成' });
 		await expect(drawer).toBeVisible();
 
 		await drawer.getByLabel('名前').fill(CREATE_TAG_NAME);
-		await drawer.getByLabel('収集グループ').selectOption({ label: GROUP_NAME });
 		const addressInput = drawer.getByLabel('アドレス');
 		// modbus-tcp 接続配下なので Modbus 参照番号形式（`Address::parse`、
 		// crates/banto-plc/src/address.rs）が必要 - 他 spec と同じ理由。
@@ -117,12 +124,14 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 
 	test('1.5. create Drawer: 「登録して次へ」は親設定（収集グループ）と共通値（データ型・単位）を引き継ぎ、名前/アドレスだけ空にする（T18-2c、TAG-UX-2）', async () => {
 		await page.goto('/tags');
+		// T19 S1-c（UX-33）: テスト1と同じ理由でツリーの対象グループ選択が
+		// 先に必要（`groupNodeByName` doc comment 参照）。
+		await groupNodeByName(page, GROUP_NAME).click();
 		await page.getByRole('button', { name: '新規登録' }).click();
 		const drawer = page.getByRole('dialog', { name: '新規作成' });
 		await expect(drawer).toBeVisible();
 
 		await drawer.getByLabel('名前').fill('e2e-form-carry-1');
-		await drawer.getByLabel('収集グループ').selectOption({ label: GROUP_NAME });
 		// 既定 dataType（f32）から明示的に切り替えて、「直前の入力を引き継ぐ」
 		// ことを既定値との一致で偽陽性にならないよう確認する。
 		await drawer.getByLabel('データ型').selectOption({ value: 'i16' });
@@ -154,12 +163,14 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 
 	test('1.6. create Drawer: 「登録して閉じる」は保存成功後に Drawer 自体を閉じる（T18-2c、TAG-UX-2）', async () => {
 		await page.goto('/tags');
+		// T19 S1-c（UX-33）: テスト1と同じ理由でツリーの対象グループ選択が
+		// 先に必要（`groupNodeByName` doc comment 参照）。
+		await groupNodeByName(page, GROUP_NAME).click();
 		await page.getByRole('button', { name: '新規登録' }).click();
 		const drawer = page.getByRole('dialog', { name: '新規作成' });
 		await expect(drawer).toBeVisible();
 
 		await drawer.getByLabel('名前').fill('e2e-form-close-1');
-		await drawer.getByLabel('収集グループ').selectOption({ label: GROUP_NAME });
 		await drawer.getByLabel('アドレス').fill('40040');
 		await drawer.getByRole('button', { name: '登録して閉じる' }).click();
 
@@ -178,18 +189,23 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 			await route.continue();
 		});
 
+		// T19 S1-c（UX-33）: ページ遷移はしていないが、直前のテスト（1.6）で
+		// 選択したツリーのグループがまだ保持されている保証に頼らず、明示的に
+		// 選び直す（`groupNodeByName` doc comment 参照。既に選択中のノードを
+		// 再クリックしても treeFilter は変わらず無害）。
+		await groupNodeByName(page, GROUP_NAME).click();
 		await page.getByRole('button', { name: '新規登録' }).click();
 		const drawer = page.getByRole('dialog', { name: '新規作成' });
 		await expect(drawer).toBeVisible();
 
-		// 名前は空のまま、収集グループだけ埋める。
+		// 名前は空のまま送信する。収集グループはツリー選択で確定済み
+		// （create Drawer の `<select>` は disabled - 上のコメント参照）。
 		// 2026-09-01 オーナー要望（タグ名が空欄ならアドレスをタグ名にする
 		// プリフィル、`$lib/banto/tagNamePrefill.ts`）以降、アドレス欄へ
 		// 入力すると名前欄が自動で埋まってしまい「名前が空のまま」という
 		// この検証の前提が崩れるため、あえてアドレスは埋めない - 名前欄
 		// 自体の HTML5 `required` 制約が効いているかどうかは、アドレスの
 		// 有無に関わらず `nameInvalid` の判定（下）だけで確認できる。
-		await drawer.getByLabel('収集グループ').selectOption({ label: GROUP_NAME });
 		// T18-2c: create Drawer のボタンは「登録して次へ」「登録して閉じる」の
 		// 2つに分かれた（旧「作成」ボタン）。HTML5 制約検証はどちらのボタンで
 		// 押しても等しく submit イベント自体を止めるため、ここでは

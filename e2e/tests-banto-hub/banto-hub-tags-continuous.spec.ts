@@ -16,7 +16,7 @@
  * （ここでは前提データ作成の手数を減らして安定性を優先する）。
  */
 import { expect, test, type Page } from '@playwright/test';
-import { CSRF_HEADERS, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
+import { CSRF_HEADERS, fetchAuthToken, groupNodeByName, injectAuthToken } from './banto-hub-auth';
 
 const CONNECTION_NAME = 'e2e-continuous-plc';
 const GROUP_NAME = 'e2e-continuous-group';
@@ -66,6 +66,12 @@ test.describe.serial('banto-hub タグ連続登録 DOM (TAG-P0-1)', () => {
 		// アドレス・名前パターン・開始番号)を済ませておく - 各 test は
 		// 「点数」欄だけを変えてプレビュー/エラー表示を確認する。
 		//
+		// T19 S1-c（UX-33）: 「連続登録」はツリーでグループが選択されている
+		// ときしか出ない上、開いた Drawer は選択中グループへ確定済み
+		// （対象グループの `<select>` が disabled）になる - まずツリーで
+		// 対象グループを選ぶ（`groupNodeByName` は `banto-hub-auth.ts`
+		// 参照）。以前は Drawer を開いてから `<select>` で選ぶ実装だった。
+		//
 		// T19 S1-b（UX-35、docs/banto-hub-t19-design.md「連続登録の名前
 		// パターン — デバイス名を既定とし、開始番号はアドレスから導出」、
 		// 2026-09-02 オーナー決定）で名前パターン/開始番号の既定値が
@@ -76,9 +82,9 @@ test.describe.serial('banto-hub タグ連続登録 DOM (TAG-P0-1)', () => {
 		// 入力して固定する（既定導出ロジックが今後変わってもこのテストは
 		// 影響を受けない）。
 		await page.goto('/tags');
+		await groupNodeByName(page, GROUP_NAME).click();
 		await page.getByRole('button', { name: '連続登録' }).click();
 		await expect(page.getByRole('dialog', { name: '連続登録' })).toBeVisible();
-		await page.getByLabel('対象グループ').selectOption({ label: GROUP_NAME });
 		await page.getByLabel('開始アドレス').fill('D100');
 		await page.getByLabel('名前パターン').fill('temp{n}');
 		await page.getByLabel('開始番号').fill('1');

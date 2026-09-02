@@ -13,7 +13,7 @@
  * （`banto-hub-auth.ts` 参照）ため `banto-hub-tags-*`。
  */
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
-import { CSRF_HEADERS, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
+import { CSRF_HEADERS, fetchAuthToken, groupNodeByName, injectAuthToken } from './banto-hub-auth';
 
 const RUN_ID = Date.now();
 const CONNECTION_NAME = `e2e-cta-plc-${RUN_ID}`;
@@ -98,12 +98,16 @@ test.describe.serial('banto-hub 登録後の確認導線 CTA (T18-4c)', () => {
 
 	test('1. UI でタグ登録すると確認 CTA が出て、href が /monitor?group=...&focus=... になる', async () => {
 		await page.goto('/tags');
+		// T19 S1-c（UX-33）: 「新規登録」はツリーでグループが選択されている
+		// ときしか出ない上、開いた create Drawer は選択中グループへ確定済み
+		// （収集グループの `<select>` が disabled）になる - まずツリーで対象
+		// グループを選ぶ（`groupNodeByName` は `banto-hub-auth.ts` 参照）。
+		await groupNodeByName(page, GROUP_NAME).click();
 		await page.getByRole('button', { name: '新規登録' }).click();
 		const drawer = page.getByRole('dialog', { name: '新規作成' });
 		await expect(drawer).toBeVisible();
 
 		await drawer.getByLabel('名前').fill(TAG_NAME);
-		await drawer.getByLabel('収集グループ').selectOption({ label: GROUP_NAME });
 		await drawer.getByLabel('アドレス').fill('40001');
 		await drawer.getByRole('button', { name: '登録して閉じる' }).click();
 

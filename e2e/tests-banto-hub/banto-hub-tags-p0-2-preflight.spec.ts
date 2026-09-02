@@ -14,7 +14,7 @@
  * `page.request` で直接 REST を叩いて作る。
  */
 import { expect, test, type Page } from '@playwright/test';
-import { CSRF_HEADERS, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
+import { CSRF_HEADERS, fetchAuthToken, groupNodeByName, injectAuthToken } from './banto-hub-auth';
 
 const CONNECTION_NAME = 'e2e-p0-2-plc';
 const GROUP_NAME = 'e2e-p0-2-group';
@@ -68,12 +68,16 @@ test.describe.serial('banto-hub タグ preflight 失敗の可視性 (TAG-P0-2)',
 
 	test('Modbus 接続配下に SLMP 形式アドレス D100 を登録すると preflight で拒否され、成功トースト・DB保存のいずれも起きない', async () => {
 		await page.goto('/tags');
+		// T19 S1-c（UX-33）: 「新規登録」はツリーでグループが選択されている
+		// ときしか出ない上、開いた create Drawer は選択中グループへ確定済み
+		// （収集グループの `<select>` が disabled）になる - まずツリーで対象
+		// グループを選ぶ（`groupNodeByName` は `banto-hub-auth.ts` 参照）。
+		await groupNodeByName(page, GROUP_NAME).click();
 		await page.getByRole('button', { name: '新規登録' }).click();
 		const drawer = page.getByRole('dialog', { name: '新規作成' });
 		await expect(drawer).toBeVisible();
 
 		await drawer.getByLabel('名前').fill(INVALID_TAG_NAME);
-		await drawer.getByLabel('収集グループ').selectOption({ label: GROUP_NAME });
 		const addressInput = drawer.getByLabel('アドレス');
 		// D100 は MELSEC（SLMP）デバイス表記であり、この接続の modbus-tcp
 		// （`Address::parse`、crates/banto-plc/src/address.rs）では不正
@@ -120,12 +124,14 @@ test.describe.serial('banto-hub タグ preflight 失敗の可視性 (TAG-P0-2)',
 
 	test('回帰: 正当な Modbus 参照番号アドレスなら preflight を通過して作成に成功する', async () => {
 		await page.goto('/tags');
+		// T19 S1-c（UX-33）: 前のテストと同じ理由でツリーの対象グループ選択が
+		// 先に必要（`groupNodeByName` doc comment 参照）。
+		await groupNodeByName(page, GROUP_NAME).click();
 		await page.getByRole('button', { name: '新規登録' }).click();
 		const drawer = page.getByRole('dialog', { name: '新規作成' });
 		await expect(drawer).toBeVisible();
 
 		await drawer.getByLabel('名前').fill(VALID_TAG_NAME);
-		await drawer.getByLabel('収集グループ').selectOption({ label: GROUP_NAME });
 		const addressInput = drawer.getByLabel('アドレス');
 		await addressInput.fill('40010');
 		await addressInput.press('Enter');

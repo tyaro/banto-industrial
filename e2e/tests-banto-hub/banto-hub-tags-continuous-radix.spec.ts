@@ -11,7 +11,7 @@
  * `RUN_ID` で一意化し、リトライ再走用の冪等掃除を持つ。
  */
 import { expect, test, type APIRequestContext, type Locator, type Page } from '@playwright/test';
-import { CSRF_HEADERS, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
+import { CSRF_HEADERS, fetchAuthToken, groupNodeByName, injectAuthToken } from './banto-hub-auth';
 
 const RUN_ID = Date.now();
 const CONNECTION_NAME = `e2e-radix-plc-${RUN_ID}`;
@@ -78,12 +78,18 @@ test.describe.serial('banto-hub 連続登録の基数/bit 連番 (T18-3c)', () =
 		});
 		expect(groupRes.ok()).toBe(true);
 
-		// 連続登録 Drawer を開いて対象グループを選ぶ（各 test はアドレス/型/点数
-		// だけ差し替えてプレビュー行を検証する）。
+		// 連続登録 Drawer を開く（各 test はアドレス/型/点数だけ差し替えて
+		// プレビュー行を検証する）。
+		//
+		// T19 S1-c（UX-33）: 「連続登録」はツリーでグループが選択されている
+		// ときしか出ない上、開いた Drawer は選択中グループへ確定済み
+		// （対象グループの `<select>` が disabled）になる - まずツリーで
+		// 対象グループを選ぶ（`groupNodeByName` は `banto-hub-auth.ts`
+		// 参照）。以前は Drawer を開いてから `<select>` で選ぶ実装だった。
 		await page.goto('/tags');
+		await groupNodeByName(page, GROUP_NAME).click();
 		await page.getByRole('button', { name: '連続登録' }).click();
 		await expect(page.getByRole('dialog', { name: '連続登録' })).toBeVisible();
-		await page.getByLabel('対象グループ').selectOption({ label: GROUP_NAME });
 	});
 
 	test.afterAll(async () => {
