@@ -98,6 +98,19 @@
 		 * 通常の再設定オープンでは何も起きない）。
 		 */
 		requestDelete?: boolean;
+		/**
+		 * T19 S1-a（docs/banto-hub-t19-design.md §7.1「viewer ロールからの
+		 * 接続・グループ詳細の閲覧」）: `true` なら閲覧専用モードで開く -
+		 * 入力はすべて `disabled`、接続テスト・保存・削除のボタンは出さない。
+		 * viewer ロールはツリーの右クリックから編集 Drawer 自体を開けない
+		 * （`tags/+page.svelte` が `canWrite` で `oncontextmenu` を丸ごと
+		 * 落としている）ため、旧 `plc-connections` 画面が持っていた「全ロール
+		 * 閲覧可・書き込みのみ制限」を、新規画面を作らずこの Drawer 自身に
+		 * 持たせる形で再現する。常に既存の接続（`connection` 非 `null`）と
+		 * 組み合わせて使う想定（新規作成フォームを閲覧専用で開く意味は無い）。
+		 * 既定 `false` - 書き込み権限がある利用者の挙動は一切変えない。
+		 */
+		readOnly?: boolean;
 		onClose: () => void;
 		/** 作成/更新が成功した直後に呼ばれる（202キュー投入時は呼ばれない — まだ確定していないため）。 */
 		onSaved: (conn: PlcConnection) => void;
@@ -110,13 +123,16 @@
 		connection,
 		existingNames,
 		requestDelete = false,
+		readOnly = false,
 		onClose,
 		onSaved,
 		onDeleted
 	}: Props = $props();
 
 	const isCreate = $derived(connection === null);
-	const drawerTitle = $derived(isCreate ? '新規作成' : `${connection?.name} を編集`);
+	const drawerTitle = $derived(
+		isCreate ? '新規作成' : readOnly ? `${connection?.name} の詳細` : `${connection?.name} を編集`
+	);
 
 	function errorMessage(err: unknown): string {
 		return isProviderError(err) ? err.message : String(err);
@@ -208,7 +224,9 @@
 
 		// T18-6d: 「接続を削除」からの起動 - フォーム初期化直後に既存の
 		// handleDelete を1回だけ呼ぶ（上の Props.requestDelete 参照）。
-		if (requestDelete && connection) {
+		// readOnly では呼び出し側が requestDelete を渡すことは無い想定だが、
+		// 念のため二重に閲覧専用を守る。
+		if (requestDelete && connection && !readOnly) {
 			void handleDelete();
 		}
 	});
@@ -398,7 +416,7 @@
 {#snippet nameField()}
 	<label class="field">
 		名前
-		<input type="text" id="connection-name" bind:value={form.name} />
+		<input type="text" id="connection-name" bind:value={form.name} disabled={readOnly} />
 		{#if errors.name}<span class="err">{errors.name}</span>{/if}
 	</label>
 {/snippet}
@@ -407,7 +425,7 @@
 	<div class="form-grid">
 		<label class="field">
 			プロトコル
-			<select bind:value={form.protocol} onchange={onProtocolChange}>
+			<select bind:value={form.protocol} onchange={onProtocolChange} disabled={readOnly}>
 				{#each PROTOCOL_OPTIONS as opt (opt.value)}
 					<option value={opt.value}>{opt.label}</option>
 				{/each}
@@ -416,24 +434,31 @@
 		</label>
 		<label class="field">
 			ホスト
-			<input type="text" bind:value={form.host} placeholder="192.168.1.10" />
+			<input type="text" bind:value={form.host} placeholder="192.168.1.10" disabled={readOnly} />
 			{#if errors.host}<span class="err">{errors.host}</span>{/if}
 		</label>
 		<label class="field">
 			ポート
-			<input type="number" min="1" max="65535" bind:value={form.port} oninput={onPortInput} />
+			<input
+				type="number"
+				min="1"
+				max="65535"
+				bind:value={form.port}
+				oninput={onPortInput}
+				disabled={readOnly}
+			/>
 			{#if errors.port}<span class="err">{errors.port}</span>{/if}
 		</label>
 		<label class="field">
 			ユニットID
-			<input type="number" min="0" max="255" bind:value={form.unitId} />
+			<input type="number" min="0" max="255" bind:value={form.unitId} disabled={readOnly} />
 			<span class="hint">Modbus 用のスレーブID（0〜255）。SLMP では未使用（既定 1 のまま）。</span>
 			{#if errors.unitId}<span class="err">{errors.unitId}</span>{/if}
 		</label>
 		{#if form.protocol === 'slmp'}
 			<label class="field">
 				ワード順
-				<select bind:value={form.wordOrder}>
+				<select bind:value={form.wordOrder} disabled={readOnly}>
 					{#each WORD_ORDER_OPTIONS as opt (opt.value)}
 						<option value={opt.value}>{opt.label}</option>
 					{/each}
@@ -446,11 +471,11 @@
 			</label>
 		{/if}
 		<label class="field checkbox">
-			<input type="checkbox" bind:checked={form.enabled} />
+			<input type="checkbox" bind:checked={form.enabled} disabled={readOnly} />
 			有効
 		</label>
 		<label class="field checkbox">
-			<input type="checkbox" bind:checked={form.simulation} />
+			<input type="checkbox" bind:checked={form.simulation} disabled={readOnly} />
 			シミュレーションモード
 		</label>
 		<span class="hint sim-hint">
@@ -532,13 +557,15 @@
 	{:else}
 		{@render nameField()}
 		{@render destinationFields()}
-		{@render testConnectionBlock()}
-		<div class="actions">
-			<button type="button" onclick={handleSave} disabled={saving || deleting}>保存</button>
-			<button type="button" class="danger" onclick={handleDelete} disabled={saving || deleting}>
-				削除
-			</button>
-		</div>
+		{#if !readOnly}
+			{@render testConnectionBlock()}
+			<div class="actions">
+				<button type="button" onclick={handleSave} disabled={saving || deleting}>保存</button>
+				<button type="button" class="danger" onclick={handleDelete} disabled={saving || deleting}>
+					削除
+				</button>
+			</div>
+		{/if}
 	{/if}
 </Drawer>
 

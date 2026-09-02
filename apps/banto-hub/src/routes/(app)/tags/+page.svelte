@@ -133,7 +133,7 @@
 	} from '$lib/banto/tagDeleteImpact';
 	import { diffFormRecords, type ConflictFieldDiff } from '$lib/banto/tagConflictDiff';
 	import {
-		resolveTreeContextMenuItems,
+		resolveTreeContextMenuItemsForRole,
 		type TreeContextMenuItemAction
 	} from '$lib/banto/tagTreeContextMenu';
 	import { beforeNavigate } from '$app/navigation';
@@ -1453,6 +1453,22 @@
 	 * `resolveTreeContextMenuItems`（`tagTreeContextMenu.ts`）に委ね、ここは
 	 * DOM 状態（メニューの表示位置・選択ノードの反映）と実行（Drawer 起動）
 	 * だけを担う。
+	 *
+	 * T19 S1-a（docs/banto-hub-t19-design.md §7.1「viewer ロールからの接続・
+	 * グループ詳細の閲覧」）追記: 以前はこのハンドラ自体を `canWrite` の
+	 * ときだけ `oncontextmenu` に配線していた（viewer は右クリックしても
+	 * 何も起きなかった）。旧 `plc-connections`/`collection-groups` 画面の
+	 * グリッドは全ロールが閲覧できていたのに対し、ツリー一本化後は viewer が
+	 * `host`/`port` 等を見る手段が無くなる（設計 §7.1「必須」項目）ため、
+	 * `oncontextmenu` は常時配線し、`canWrite` に応じて書き込み用メニュー
+	 * （作成・再設定・削除）と viewer 向けメニュー（「詳細を表示」の1項目
+	 * のみ）を切り替える判断自体は `resolveTreeContextMenuItemsForRole`
+	 * （`tagTreeContextMenu.ts`、依存ゼロの純関数）へ切り出し済み - ここでは
+	 * `canWrite` を渡すだけにして、分岐そのものを単体テストで固定できる
+	 * ようにする（コードレビュー指摘、2026-09-02: E2E は試運転モードでは
+	 * role 差を検証できないため、この分岐は単体テストが最終防衛線になる）。
+	 * 書き込み権限がある利用者の挙動（メニュー内容・実行結果）は一切
+	 * 変えていない。
 	 */
 	interface TreeContextMenuState {
 		x: number;
@@ -1467,16 +1483,19 @@
 	 * 右クリックされたノードを選択状態にする - 「親（接続/グループ）は
 	 * 選択ノードからプリセットする」（実装指示 T18-2e スコープ1点目）を、
 	 * 既存の `resolveGroupIdFromTreeSelection`（T18-2d、`openCreateDrawer` が
-	 * 使う）にそのまま乗せるため。`calc`/`mem` 配下等、操作が無いノード
-	 * （`resolveTreeContextMenuItems` が空配列を返す）は選択だけ反映して
-	 * メニューは出さない。
+	 * 使う）にそのまま乗せるため。T19 S1-a 以降、書き込み権限がある利用者は
+	 * `calc`/`mem` 配下でも常にメニューが出る（`resolveTreeContextMenuItems`
+	 * が空配列を返すことは無くなった - 上の doc comment 参照）。メニューが
+	 * 空になるのは viewer が「すべて」ノードを右クリックした場合のみ
+	 * （`resolveReadOnlyTreeContextMenuItems` が閲覧対象無しとして `[]` を
+	 * 返す）- その場合も選択だけは反映してメニューは出さない。
 	 */
 	function handleTreeContextMenu(
 		node: TreeNode<ConnectionTreeNodeData>,
 		position: { x: number; y: number }
 	): void {
 		handleTreeSelect(node.data);
-		const items = resolveTreeContextMenuItems(node.data);
+		const items = resolveTreeContextMenuItemsForRole(node.data, canWrite);
 		if (items.length === 0) {
 			treeContextMenu = null;
 			return;
@@ -1508,18 +1527,30 @@
 	let connectionDrawerTarget: PlcConnection | null = $state(null);
 	/** T18-6d: 「接続を削除」から開いた場合だけ `true`（下の doc comment 参照）。 */
 	let connectionDrawerRequestDelete = $state(false);
+	/**
+	 * T19 S1-a（docs/banto-hub-t19-design.md §7.1「viewer ロールからの接続・
+	 * グループ詳細の閲覧」）: viewer の「詳細を表示」から開いた場合だけ
+	 * `true`。`ConnectionDrawer` を読み取り専用モード（`readOnly` prop）で
+	 * 開くためのフラグ - 書き込み系の open系関数（作成/再設定/削除）は
+	 * すべて明示的に `false` を設定し、書き込み権限がある利用者の挙動を
+	 * 変えない。
+	 */
+	let connectionDrawerReadOnly = $state(false);
 
 	let groupDrawerOpen = $state(false);
 	let groupDrawerTarget: CollectionGroup | null = $state(null);
 	let groupDrawerPresetConnectionId: number | null = $state(null);
 	/** T18-6d: 「収集グループを削除」から開いた場合だけ `true`（下の doc comment 参照）。 */
 	let groupDrawerRequestDelete = $state(false);
+	/** T19 S1-a: `connectionDrawerReadOnly` と同じ役割（`CollectionGroupDrawer` 用）。 */
+	let groupDrawerReadOnly = $state(false);
 
 	function openConnectionCreateDrawer(): void {
 		if (!confirmDiscardIfNeeded()) return;
 		closeDrawer(); // タグ Drawer が開いていれば閉じる（同時に複数 Drawer を出さない）。
 		connectionDrawerTarget = null;
 		connectionDrawerRequestDelete = false;
+		connectionDrawerReadOnly = false;
 		connectionDrawerOpen = true;
 	}
 
@@ -1530,6 +1561,28 @@
 		closeDrawer();
 		connectionDrawerTarget = target;
 		connectionDrawerRequestDelete = false;
+		connectionDrawerReadOnly = false;
+		connectionDrawerOpen = true;
+	}
+
+	/**
+	 * T19 S1-a: viewer の右クリック「詳細を表示」（`resolveReadOnlyTreeContextMenuItems`
+	 * の `viewConnection`）から開く。`openConnectionEditDrawer` と対になる
+	 * 読み取り専用版 - 対象が見つからない場合の無視、`confirmDiscardIfNeeded`
+	 * （viewer は書き込み系フォームを開けないため通常は素通りする）、複数
+	 * Drawer を同時に出さないための `closeDrawer()` は同じ考え方を踏襲する。
+	 * virtual（calc/mem）接続でも制限しない（閲覧は書き込みと異なり特別扱い
+	 * する理由が無い - `resolveReadOnlyTreeContextMenuItems` の doc comment
+	 * と同じ理由）。
+	 */
+	function openConnectionViewDrawer(connectionId: number): void {
+		const target = connections.find((c) => c.id === connectionId);
+		if (!target) return;
+		if (!confirmDiscardIfNeeded()) return;
+		closeDrawer();
+		connectionDrawerTarget = target;
+		connectionDrawerRequestDelete = false;
+		connectionDrawerReadOnly = true;
 		connectionDrawerOpen = true;
 	}
 
@@ -1547,6 +1600,7 @@
 		closeDrawer();
 		connectionDrawerTarget = target;
 		connectionDrawerRequestDelete = true;
+		connectionDrawerReadOnly = false;
 		connectionDrawerOpen = true;
 	}
 
@@ -1562,12 +1616,22 @@
 		await reload();
 	}
 
-	function openGroupCreateDrawer(presetConnectionId: number): void {
+	/**
+	 * T19 S1-a（docs/banto-hub-t19-design.md §7.1「常時表示の『新規作成』
+	 * 入口」）: ツリー上部の常設ボタン「収集グループを追加」から開く場合は
+	 * 所属 PLC 接続を未選択のまま出す（旧 `collection-groups` 画面の常設
+	 * ボタンと同じ挙動）。ツリーの接続ノード右クリック「収集グループを作成」
+	 * （`resolveTreeContextMenuItems` の `createGroup`）は引き続き接続 ID を
+	 * 渡してプリセットする - 呼び出し元によって挙動を変えるため、
+	 * `presetConnectionId` は省略可能にした（既定 `null` = 未選択）。
+	 */
+	function openGroupCreateDrawer(presetConnectionId: number | null = null): void {
 		if (!confirmDiscardIfNeeded()) return;
 		closeDrawer();
 		groupDrawerTarget = null;
 		groupDrawerPresetConnectionId = presetConnectionId;
 		groupDrawerRequestDelete = false;
+		groupDrawerReadOnly = false;
 		groupDrawerOpen = true;
 	}
 
@@ -1579,6 +1643,24 @@
 		groupDrawerTarget = target;
 		groupDrawerPresetConnectionId = null;
 		groupDrawerRequestDelete = false;
+		groupDrawerReadOnly = false;
+		groupDrawerOpen = true;
+	}
+
+	/**
+	 * T19 S1-a: viewer の右クリック「詳細を表示」（`viewGroup`）から開く。
+	 * `openConnectionViewDrawer` と対になる読み取り専用版 - virtual 接続
+	 * （calc/mem）配下のグループでも制限しない。
+	 */
+	function openGroupViewDrawer(groupId: number): void {
+		const target = groups.find((g) => g.id === groupId);
+		if (!target) return;
+		if (!confirmDiscardIfNeeded()) return;
+		closeDrawer();
+		groupDrawerTarget = target;
+		groupDrawerPresetConnectionId = null;
+		groupDrawerRequestDelete = false;
+		groupDrawerReadOnly = true;
 		groupDrawerOpen = true;
 	}
 
@@ -1596,6 +1678,7 @@
 		groupDrawerTarget = target;
 		groupDrawerPresetConnectionId = null;
 		groupDrawerRequestDelete = true;
+		groupDrawerReadOnly = false;
 		groupDrawerOpen = true;
 	}
 
@@ -1620,6 +1703,9 @@
 	 * 接続/グループの作成・再設定・削除（T18-6d 追加分）は、いずれも
 	 * `ConnectionDrawer`/`CollectionGroupDrawer` を対応するモードで開く
 	 * 上記の open系/Flow系関数へ振り分けるだけで、独自の CRUD ロジックは持たない。
+	 * `viewConnection`/`viewGroup`（T19 S1-a 追加分、viewer 向け）も同じ
+	 * Drawer を `readOnly` モードで開く `openConnectionViewDrawer`/
+	 * `openGroupViewDrawer` へ振り分けるだけ - 新しい画面や別実装は持たない。
 	 */
 	function activateTreeContextMenuAction(action: TreeContextMenuItemAction): void {
 		switch (action.kind) {
@@ -1643,6 +1729,12 @@
 				break;
 			case 'deleteGroup':
 				openGroupDeleteFlow(action.groupId);
+				break;
+			case 'viewConnection':
+				openConnectionViewDrawer(action.connectionId);
+				break;
+			case 'viewGroup':
+				openGroupViewDrawer(action.groupId);
 				break;
 		}
 	}
@@ -3071,14 +3163,36 @@
 	<div class="content">
 		<SplitPane leftWidth="280px">
 			{#snippet left()}
-				<ConnectionTree
-					{connections}
-					{groups}
-					{tags}
-					selectedId={treeSelectedId}
-					onselect={handleTreeSelect}
-					oncontextmenu={canWrite ? handleTreeContextMenu : undefined}
-				/>
+				<div class="tree-pane">
+					<!--
+						T19 S1-a（docs/banto-hub-t19-design.md §7.1「常時表示の
+						『新規作成』入口」）: 接続・グループの作成は右クリック
+						（と Shift+F10）だけが入口だったため、旧 `plc-connections`/
+						`collection-groups` 画面が持っていた常設ボタンに相当する
+						入口をツリー上部に置く。タグ用ツールバー（右ペインの
+						「新規登録」「連続登録」「CSVインポート」）とは対象が違う
+						ため混ぜない - 別のツールバーとしてツリー側に置く。
+						`canWrite` が無ければ出さない（既存の権限判定は緩めない）。
+					-->
+					{#if canWrite}
+						<div class="tree-toolbar">
+							<button type="button" class="secondary" onclick={openConnectionCreateDrawer}>
+								PLC接続を追加
+							</button>
+							<button type="button" class="secondary" onclick={() => openGroupCreateDrawer()}>
+								収集グループを追加
+							</button>
+						</div>
+					{/if}
+					<ConnectionTree
+						{connections}
+						{groups}
+						{tags}
+						selectedId={treeSelectedId}
+						onselect={handleTreeSelect}
+						oncontextmenu={handleTreeContextMenu}
+					/>
+				</div>
 			{/snippet}
 			{#snippet right()}
 				<div class="right-pane">
@@ -3478,6 +3592,7 @@
 	connection={connectionDrawerTarget}
 	existingNames={connections.map((c) => c.name)}
 	requestDelete={connectionDrawerRequestDelete}
+	readOnly={connectionDrawerReadOnly}
 	onClose={closeConnectionDrawer}
 	onSaved={handleConnectionDrawerSaved}
 	onDeleted={handleConnectionDrawerDeleted}
@@ -3490,6 +3605,7 @@
 	{connections}
 	presetPlcConnectionId={groupDrawerPresetConnectionId}
 	requestDelete={groupDrawerRequestDelete}
+	readOnly={groupDrawerReadOnly}
 	onClose={closeGroupDrawer}
 	onSaved={handleGroupDrawerSaved}
 	onDeleted={handleGroupDrawerDeleted}
@@ -4052,6 +4168,37 @@
 		border: 1px solid var(--banto-border);
 		border-radius: calc(var(--banto-radius) * 2);
 		overflow: hidden;
+	}
+
+	/*
+	 * T19 S1-a: ツリーペイン全体のラッパ。`SplitPane.svelte::.pane-left` が
+	 * `overflow-y: auto` を持つため、ツリー本体と常設ボタンを縦積みにして
+	 * スクロール領域を共有する（別スクロール領域には分けない - ツリーが
+	 * 空/短い環境で不要な二重スクロールバーを避けるため）。
+	 */
+	.tree-pane {
+		display: flex;
+		flex-direction: column;
+		min-height: 100%;
+	}
+
+	/* T19 S1-a: 接続・グループの常設作成ボタン。右ペインの `.toolbar`（タグ用）
+	   とは対象が違うため混ぜない - 見た目もツリー直上の帯として区別する。 */
+	.tree-toolbar {
+		flex: 0 0 auto;
+		display: flex;
+		gap: 0.5rem;
+		padding: 0.6rem 0.75rem;
+		border-bottom: 1px solid var(--banto-border);
+		position: sticky;
+		top: 0;
+		background: var(--banto-surface);
+		z-index: 1;
+	}
+
+	.tree-toolbar button {
+		font-size: 0.78rem;
+		padding: 0.35rem 0.6rem;
 	}
 
 	.right-pane {
