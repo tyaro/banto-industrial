@@ -9,8 +9,10 @@ import type { ConnectionTreeNodeData } from '$lib/components/connectionTreeTypes
 import {
 	resolveTagTreeContextMenuAction,
 	resolveTreeContextMenuItems,
-	resolveReadOnlyTreeContextMenuItems
+	resolveReadOnlyTreeContextMenuItems,
+	resolveTreeContextMenuItemsForRole
 } from './tagTreeContextMenu';
+import { canWriteResources } from '../permissions';
 
 function connection(overrides: Partial<PlcConnection> = {}): PlcConnection {
 	return {
@@ -239,5 +241,65 @@ describe('resolveReadOnlyTreeContextMenuItems', () => {
 		expect(resolveReadOnlyTreeContextMenuItems(data)).toEqual([
 			{ kind: 'viewGroup', label: '詳細を表示', groupId: 10 }
 		]);
+	});
+});
+
+/**
+ * T19 S1-a 追記（コードレビュー指摘、2026-09-02）: `resolveTreeContextMenuItemsForRole`
+ * が `canWrite` の値で `resolveTreeContextMenuItems`/
+ * `resolveReadOnlyTreeContextMenuItems` のどちらに委譲するかを固定する。
+ * E2E（`banto-hub-tags-tree-context-menu.spec.ts`）は E2E 環境が常に試運転
+ * モード（`commissioning.rs::synthetic_identity` が全リクエストを admin
+ * 相当として扱う - 設計 §5.6）で動くため、viewer ロールの実際の権限差を
+ * 検証できない。この分岐が「viewer には書き込み系メニューが絶対に出ない」
+ * ことを保証する最終防衛線になる - `canWriteResources('viewer')` が
+ * `false` であることも合わせて固定し、`$lib/permissions.ts` 側の定義が
+ * 変わってもここで検知できるようにする。
+ */
+describe('resolveTreeContextMenuItemsForRole', () => {
+	it('viewer（canWriteResources("viewer") = false）は実接続ノードで「詳細を表示」の1項目のみ', () => {
+		expect(canWriteResources('viewer')).toBe(false);
+		const conn = connection({ id: 7, name: 'line-a' });
+		const data: ConnectionTreeNodeData = { kind: 'connection', connection: conn };
+		expect(resolveTreeContextMenuItemsForRole(data, canWriteResources('viewer'))).toEqual([
+			{ kind: 'viewConnection', label: '詳細を表示', connectionId: 7 }
+		]);
+	});
+
+	it('viewer は virtual（calc）接続ノードでも「詳細を表示」の1項目のみ（作成・再設定・削除は含まない）', () => {
+		const calc = connection({ id: 2, name: 'calc', protocol: 'virtual' });
+		const data: ConnectionTreeNodeData = { kind: 'connection', connection: calc };
+		const items = resolveTreeContextMenuItemsForRole(data, canWriteResources('viewer'));
+		expect(items).toEqual([{ kind: 'viewConnection', label: '詳細を表示', connectionId: 2 }]);
+		// 明示的に禁止項目が含まれないことを固定する（本タスクの核心）。
+		expect(items.some((i) => i.kind === 'reconfigureConnection')).toBe(false);
+		expect(items.some((i) => i.kind === 'deleteConnection')).toBe(false);
+		expect(items.some((i) => i.kind === 'createGroup')).toBe(false);
+	});
+
+	it('viewer は「すべて」ノードで空配列（作成メニューを含まない）', () => {
+		const items = resolveTreeContextMenuItemsForRole({ kind: 'all' }, canWriteResources('viewer'));
+		expect(items).toEqual([]);
+	});
+
+	it.each(['editor', 'admin'] as const)(
+		'%s（canWriteResources = true）は実接続ノードで作成/再設定/削除の3項目',
+		(role) => {
+			expect(canWriteResources(role)).toBe(true);
+			const conn = connection({ id: 7, name: 'line-a' });
+			const data: ConnectionTreeNodeData = { kind: 'connection', connection: conn };
+			expect(resolveTreeContextMenuItemsForRole(data, canWriteResources(role))).toEqual([
+				{ kind: 'createGroup', label: '収集グループを作成', connectionId: 7 },
+				{ kind: 'reconfigureConnection', label: '接続を再設定', connectionId: 7 },
+				{ kind: 'deleteConnection', label: '接続を削除', connectionId: 7 }
+			]);
+		}
+	);
+
+	it('canWrite=true でも virtual（calc）接続ノードでは reconfigure/delete を含まない（権限の規則が緩んでいないこと）', () => {
+		const calc = connection({ id: 2, name: 'calc', protocol: 'virtual' });
+		const data: ConnectionTreeNodeData = { kind: 'connection', connection: calc };
+		const items = resolveTreeContextMenuItemsForRole(data, true);
+		expect(items).toEqual([{ kind: 'createGroup', label: '収集グループを作成', connectionId: 2 }]);
 	});
 });

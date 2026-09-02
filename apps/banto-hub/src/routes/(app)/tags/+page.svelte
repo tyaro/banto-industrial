@@ -133,8 +133,7 @@
 	} from '$lib/banto/tagDeleteImpact';
 	import { diffFormRecords, type ConflictFieldDiff } from '$lib/banto/tagConflictDiff';
 	import {
-		resolveTreeContextMenuItems,
-		resolveReadOnlyTreeContextMenuItems,
+		resolveTreeContextMenuItemsForRole,
 		type TreeContextMenuItemAction
 	} from '$lib/banto/tagTreeContextMenu';
 	import { beforeNavigate } from '$app/navigation';
@@ -1461,11 +1460,15 @@
 	 * 何も起きなかった）。旧 `plc-connections`/`collection-groups` 画面の
 	 * グリッドは全ロールが閲覧できていたのに対し、ツリー一本化後は viewer が
 	 * `host`/`port` 等を見る手段が無くなる（設計 §7.1「必須」項目）ため、
-	 * `oncontextmenu` は常時配線し、ここで `canWrite` により書き込み用の
-	 * `resolveTreeContextMenuItems`（作成・再設定・削除）と、viewer 向けの
-	 * `resolveReadOnlyTreeContextMenuItems`（「詳細を表示」の1項目のみ）を
-	 * 切り替える。書き込み権限がある利用者の挙動（メニュー内容・実行結果）は
-	 * 一切変えていない。
+	 * `oncontextmenu` は常時配線し、`canWrite` に応じて書き込み用メニュー
+	 * （作成・再設定・削除）と viewer 向けメニュー（「詳細を表示」の1項目
+	 * のみ）を切り替える判断自体は `resolveTreeContextMenuItemsForRole`
+	 * （`tagTreeContextMenu.ts`、依存ゼロの純関数）へ切り出し済み - ここでは
+	 * `canWrite` を渡すだけにして、分岐そのものを単体テストで固定できる
+	 * ようにする（コードレビュー指摘、2026-09-02: E2E は試運転モードでは
+	 * role 差を検証できないため、この分岐は単体テストが最終防衛線になる）。
+	 * 書き込み権限がある利用者の挙動（メニュー内容・実行結果）は一切
+	 * 変えていない。
 	 */
 	interface TreeContextMenuState {
 		x: number;
@@ -1480,18 +1483,19 @@
 	 * 右クリックされたノードを選択状態にする - 「親（接続/グループ）は
 	 * 選択ノードからプリセットする」（実装指示 T18-2e スコープ1点目）を、
 	 * 既存の `resolveGroupIdFromTreeSelection`（T18-2d、`openCreateDrawer` が
-	 * 使う）にそのまま乗せるため。`calc`/`mem` 配下等、操作が無いノード
-	 * （`resolveTreeContextMenuItems` が空配列を返す）は選択だけ反映して
-	 * メニューは出さない。
+	 * 使う）にそのまま乗せるため。T19 S1-a 以降、書き込み権限がある利用者は
+	 * `calc`/`mem` 配下でも常にメニューが出る（`resolveTreeContextMenuItems`
+	 * が空配列を返すことは無くなった - 上の doc comment 参照）。メニューが
+	 * 空になるのは viewer が「すべて」ノードを右クリックした場合のみ
+	 * （`resolveReadOnlyTreeContextMenuItems` が閲覧対象無しとして `[]` を
+	 * 返す）- その場合も選択だけは反映してメニューは出さない。
 	 */
 	function handleTreeContextMenu(
 		node: TreeNode<ConnectionTreeNodeData>,
 		position: { x: number; y: number }
 	): void {
 		handleTreeSelect(node.data);
-		const items = canWrite
-			? resolveTreeContextMenuItems(node.data)
-			: resolveReadOnlyTreeContextMenuItems(node.data);
+		const items = resolveTreeContextMenuItemsForRole(node.data, canWrite);
 		if (items.length === 0) {
 			treeContextMenu = null;
 			return;

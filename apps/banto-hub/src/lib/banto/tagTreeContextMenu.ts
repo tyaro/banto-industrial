@@ -234,3 +234,27 @@ export function resolveReadOnlyTreeContextMenuItems(
 	}
 	return []; // data.kind === 'all' - 閲覧対象が無い。
 }
+
+/**
+ * T19 S1-a 追記（コードレビュー指摘、2026-09-02）: `resolveTreeContextMenuItems`
+ * （書き込み権限あり）と `resolveReadOnlyTreeContextMenuItems`（書き込み
+ * 権限なし）のどちらを呼ぶかを `canWrite` で切り替える、依存ゼロの純関数。
+ * 元は `tags/+page.svelte::handleTreeContextMenu` に直接書いていた三項演算
+ * （`canWrite ? resolveTreeContextMenuItems(node.data) :
+ * resolveReadOnlyTreeContextMenuItems(node.data)`）をここへ抽出した -
+ * 「viewer には書き込み系メニューが絶対に出ない」という分岐そのものを
+ * ページ側の実装から切り離し、依存ゼロの単体テストで固定できるようにする
+ * ため（`tags/+page.svelte` は Svelte コンポーネントで DOM 実 E2E でしか
+ * 検証できないが、この分岐だけは純関数として抜き出せる）。
+ *
+ * `canWrite` は呼び出し側（`$lib/permissions.ts::canWriteResources(role)`）
+ * が計算済みの真偽値をそのまま渡す - このファイルは「依存ゼロ」方針
+ * （冒頭 doc comment 参照）のため `permissions.ts` を import せず、role の
+ * 意味（'admin'/'editor'/'viewer'）そのものはここでは扱わない。
+ */
+export function resolveTreeContextMenuItemsForRole(
+	data: ConnectionTreeNodeData,
+	canWrite: boolean
+): TreeContextMenuItemAction[] {
+	return canWrite ? resolveTreeContextMenuItems(data) : resolveReadOnlyTreeContextMenuItems(data);
+}
