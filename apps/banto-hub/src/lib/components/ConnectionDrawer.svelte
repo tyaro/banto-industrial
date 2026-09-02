@@ -20,6 +20,17 @@
 	 *    （SLMPのみ）ワード順/有効/シミュレーション
 	 * 3. 接続テスト・確認: 入力内容の確認表示 + 接続テスト + 「作成」
 	 *
+	 * **T19 S1-b（UX-31、2026-09-02 オーナー決定「作成＝中央モーダル、
+	 * 編集＝右ペイン」）: 作成ウィザードは `Modal.svelte`（中央）、再設定
+	 * フォームと閲覧専用モードは `Drawer.svelte`（右ペイン）で描画する**
+	 * （下のマークアップの `{#if isCreate}` で提示先ごと分岐 - `isCreate`
+	 * は `connection` prop の null 性から決まり、Drawer を開いている間に
+	 * 値が変わることはない前提のため、`open` だけを `isCreate` で振り分ける
+	 * 単純な分岐で安全）。`Drawer.svelte` が持つフォーカストラップ・
+	 * 二重発火防止・オーバーレイの仕組みは `Modal.svelte` も同じ契約
+	 * （`onRequestClose`）で提供するため、呼び出し側（本ファイル）の
+	 * ロジックはどちらの提示先でも変更していない。
+	 *
 	 * 純関数部分（連番採番・既定ポート・フォーム⇄API入力変換）は
 	 * `$lib/banto/plcConnectionForm.ts` へ切り出し済み（そちらでユニット
 	 * テスト済み）。
@@ -51,6 +62,7 @@
 	 */
 	import { isProviderError } from '@banto/admin-core';
 	import Drawer from './Drawer.svelte';
+	import Modal from './Modal.svelte';
 	import { toastStore } from '$lib/toast.svelte';
 	import { isAdmin } from '$lib/permissions';
 	import { sessionStore } from '$lib/session.svelte';
@@ -525,8 +537,14 @@
 	</dl>
 {/snippet}
 
-<Drawer {open} title={drawerTitle} {onRequestClose} onclose={onClose} width="480px">
-	{#if isCreate}
+{#if isCreate}
+	<Modal
+		open={open && isCreate}
+		title={drawerTitle}
+		{onRequestClose}
+		onclose={onClose}
+		width="560px"
+	>
 		<ol class="wizard-steps" aria-label="作成手順">
 			<li class:active={step === 1} class:done={step > 1}>1. 識別</li>
 			<li class:active={step === 2} class:done={step > 2}>2. プロトコルと接続先</li>
@@ -554,7 +572,15 @@
 				<button type="button" onclick={handleCreate} disabled={saving}>作成</button>
 			{/if}
 		</div>
-	{:else}
+	</Modal>
+{:else}
+	<Drawer
+		open={open && !isCreate}
+		title={drawerTitle}
+		{onRequestClose}
+		onclose={onClose}
+		width="480px"
+	>
 		{@render nameField()}
 		{@render destinationFields()}
 		{#if !readOnly}
@@ -566,8 +592,8 @@
 				</button>
 			</div>
 		{/if}
-	{/if}
-</Drawer>
+	</Drawer>
+{/if}
 
 <style>
 	.form-grid {

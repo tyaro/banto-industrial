@@ -313,6 +313,7 @@ mod tests {
                     plc_connection_id: conn_id,
                     period_ms: 1_000,
                     enabled: true,
+                    default_writable: true,
                 })
                 .await
                 .expect("seed group");

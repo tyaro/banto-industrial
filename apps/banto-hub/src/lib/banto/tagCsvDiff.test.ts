@@ -31,14 +31,16 @@ const GROUP_A: CollectionGroup = {
 	name: 'GroupA',
 	plcConnectionId: CONN_A.id,
 	periodMs: 1000,
-	enabled: true
+	enabled: true,
+	defaultWritable: true
 };
 const GROUP_B: CollectionGroup = {
 	id: 11,
 	name: 'GroupB',
 	plcConnectionId: CONN_A.id,
 	periodMs: 1000,
-	enabled: true
+	enabled: true,
+	defaultWritable: true
 };
 const GROUPS: CollectionGroup[] = [GROUP_A, GROUP_B];
 

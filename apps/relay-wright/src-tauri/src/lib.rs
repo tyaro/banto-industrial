@@ -4219,6 +4219,7 @@ mod tests {
                 plc_connection_id: conn.id,
                 period_ms: 1000,
                 enabled: true,
+                default_writable: true,
             })
             .await
             .expect("create collection group");

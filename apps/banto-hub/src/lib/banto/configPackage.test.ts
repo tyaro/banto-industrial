@@ -42,7 +42,8 @@ const BASE_GROUP: CollectionGroup = {
 	name: 'group-a',
 	plcConnectionId: BASE_CONNECTION.id,
 	periodMs: 1000,
-	enabled: true
+	enabled: true,
+	defaultWritable: true
 };
 
 const VIRTUAL_GROUP: CollectionGroup = {
@@ -50,7 +51,8 @@ const VIRTUAL_GROUP: CollectionGroup = {
 	name: 'group-calc',
 	plcConnectionId: VIRTUAL_CONNECTION.id,
 	periodMs: 1000,
-	enabled: true
+	enabled: true,
+	defaultWritable: true
 };
 
 const BASE_TAG: Tag = {
@@ -139,13 +141,15 @@ describe('configPackage', () => {
 				name: 'group-a',
 				plcConnectionName: 'line-a',
 				periodMs: 1000,
-				enabled: true
+				enabled: true,
+				defaultWritable: true
 			},
 			{
 				name: 'group-calc',
 				plcConnectionName: 'calc',
 				periodMs: 1000,
-				enabled: true
+				enabled: true,
+				defaultWritable: true
 			}
 		]);
 		expect(pkg.tags).toEqual([
@@ -261,6 +265,34 @@ describe('configPackage', () => {
 			plcConnections: pkg.plcConnections.map((c) => ({ ...c, wordOrder: 'middle_endian' }))
 		};
 		expect(() => parseConfigPackage(JSON.stringify(withBadWordOrder))).toThrow(/wordOrder/);
+	});
+
+	// --- T19 S1-b（UX-34、2026-09-02 オーナー決定）: defaultWritable は
+	// wordOrder と同じ理由で旧スキーマの構成パッケージ（この項目を持たない）
+	// を読めなければならない - CONFIG_PACKAGE_SCHEMA_VERSION は据え置きの
+	// まま追加した後方互換フィールド。
+
+	it('parseConfigPackage は defaultWritable を持たない旧パッケージを true 既定で受け入れる', () => {
+		const pkg = makePackage();
+		const withoutDefaultWritable = {
+			...pkg,
+			collectionGroups: pkg.collectionGroups.map(
+				({ defaultWritable: _defaultWritable, ...rest }) => rest
+			)
+		};
+		const parsed = parseConfigPackage(JSON.stringify(withoutDefaultWritable));
+		expect(parsed.collectionGroups[0].defaultWritable).toBe(true);
+	});
+
+	it('parseConfigPackage は不正な defaultWritable を拒否する', () => {
+		const pkg = makePackage();
+		const withBadDefaultWritable = {
+			...pkg,
+			collectionGroups: pkg.collectionGroups.map((g) => ({ ...g, defaultWritable: 'yes' }))
+		};
+		expect(() => parseConfigPackage(JSON.stringify(withBadDefaultWritable))).toThrow(
+			/defaultWritable/
+		);
 	});
 
 	it('planByName は name ベースで create/update を分ける', () => {

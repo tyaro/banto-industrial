@@ -20,7 +20,7 @@ function connection(id: number, name: string): PlcConnection {
 }
 
 function group(id: number, name: string, plcConnectionId: number): CollectionGroup {
-	return { id, name, plcConnectionId, periodMs: 1000, enabled: true };
+	return { id, name, plcConnectionId, periodMs: 1000, enabled: true, defaultWritable: true };
 }
 
 describe('subscriptionPatternsFor', () => {

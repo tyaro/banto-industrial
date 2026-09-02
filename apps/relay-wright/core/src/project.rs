@@ -266,6 +266,15 @@ async fn validate_by_replay(project: &ProjectFile) -> Result<(), BantoError> {
                 plc_connection_id: plc_id,
                 period_ms: g.period_ms,
                 enabled: g.enabled,
+                // T19 S1-b (banto-industrial, 2026-09-02): round-trip the
+                // source group's own value, same as every other field here -
+                // this is a project snapshot restore, not a fresh-group
+                // creation, so the imported group should keep its recorded
+                // `default_writable` rather than resetting to a hardcoded
+                // value. See `banto_tags::CollectionGroup::default_writable`'s
+                // doc comment - it has no effect on collection/write
+                // behavior, only on banto-hub's own new-tag form default.
+                default_writable: g.default_writable,
             })
             .await?;
         group_map.insert(g.id, created.id);
@@ -681,6 +690,7 @@ mod tests {
                 plc_connection_id: conn.id,
                 period_ms: 1000,
                 enabled: true,
+                default_writable: true,
             })
             .await
             .unwrap();

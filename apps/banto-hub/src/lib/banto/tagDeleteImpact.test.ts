@@ -37,6 +37,7 @@ function makeGroup(overrides: Partial<CollectionGroup>): CollectionGroup {
 		plcConnectionId: 1,
 		periodMs: 1000,
 		enabled: true,
+		defaultWritable: true,
 		...overrides
 	};
 }

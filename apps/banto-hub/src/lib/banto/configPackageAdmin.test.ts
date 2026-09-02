@@ -98,7 +98,15 @@ const pkg: ConfigPackage = {
 			wordOrder: 'low_high'
 		}
 	],
-	collectionGroups: [{ name: 'group1', plcConnectionName: 'plc1', periodMs: 1000, enabled: true }],
+	collectionGroups: [
+		{
+			name: 'group1',
+			plcConnectionName: 'plc1',
+			periodMs: 1000,
+			enabled: true,
+			defaultWritable: true
+		}
+	],
 	tags: [
 		{
 			name: 'tag1',
@@ -210,7 +218,14 @@ describe('applyConfigPackage: 収集稼働中の QueuedWhileRunningError を検�
 			wordOrder: 'low_high'
 		});
 		vi.mocked(listCollectionGroups).mockResolvedValue([
-			{ id: 1, name: 'group1', plcConnectionId: 1, periodMs: 500, enabled: true }
+			{
+				id: 1,
+				name: 'group1',
+				plcConnectionId: 1,
+				periodMs: 500,
+				enabled: true,
+				defaultWritable: true
+			}
 		]);
 		vi.mocked(updateCollectionGroup).mockRejectedValue(
 			new MockQueuedWhileRunningError('収集稼働中のためキュー投入されました')
@@ -248,7 +263,8 @@ describe('applyConfigPackage: 全件成功する通常の import（回帰ガー�
 			name: 'group1',
 			plcConnectionId: 1,
 			periodMs: 1000,
-			enabled: true
+			enabled: true,
+			defaultWritable: true
 		});
 		vi.mocked(createTag).mockResolvedValue({
 			id: 1,

@@ -2190,6 +2190,18 @@ fn default_plc_word_order() -> String {
     "low_high".to_string()
 }
 
+/// T19 S1-b（UX-34、docs/banto-hub-t19-design.md §2）: a
+/// `CollectionGroupPayload` missing `defaultWritable` (an old client, or a
+/// create/update that never mentions it) keeps the same default as the
+/// column itself (`migrations/0012_collection_groups_add_default_writable
+/// .sql`'s `DEFAULT 1`, and `banto_tags::collection_group::
+/// default_writable_true`) - UX-34's overall "既定 ON" policy, mirrored the
+/// same way `default_plc_word_order` mirrors migration `0010`'s column
+/// default.
+fn default_group_writable() -> bool {
+    true
+}
+
 fn default_tag_decimals() -> i64 {
     0
 }
@@ -2261,6 +2273,12 @@ pub struct CollectionGroupPayload {
     pub period_ms: i64,
     #[serde(default = "default_payload_enabled")]
     pub enabled: bool,
+    /// T19 S1-b（UX-34）: このグループへ新規タグを登録するときの
+    /// `writable` チェックボックスの既定値。省略時は `default_group_writable`
+    /// （既定 ON、`banto_tags::collection_group::default_writable_true`と
+    /// 同じ既定値）。
+    #[serde(default = "default_group_writable")]
+    pub default_writable: bool,
 }
 
 impl From<CollectionGroupPayload> for CollectionGroupInput {
@@ -2270,6 +2288,9 @@ impl From<CollectionGroupPayload> for CollectionGroupInput {
             plc_connection_id: payload.plc_connection_id,
             period_ms: payload.period_ms,
             enabled: payload.enabled,
+            // T19 S1-b: wired through - see `CollectionGroupPayload::
+            // default_writable`'s doc comment.
+            default_writable: payload.default_writable,
         }
     }
 }
@@ -10004,6 +10025,7 @@ mod tests {
                     plc_connection_id: conn_id,
                     period_ms: 100,
                     enabled: true,
+                    default_writable: true,
                 },
             )
             .await

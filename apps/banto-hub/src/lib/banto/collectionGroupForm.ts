@@ -7,7 +7,7 @@
  * `$state`/DOM 組み立てに専念させ、ここに置く関数はスナップショット値だけを
  * 引数に取り、テストしやすく保つ。
  *
- * 本モジュールが担う2つの役割:
+ * 本モジュールが担う3つの役割:
  *
  * 1. **フォーム状態の組み立て**（旧 `collection-groups/+page.svelte` が
  *    ページ内に持っていた `FormState`/`blankForm`/`formFromGroup`/`toInput`
@@ -17,6 +17,7 @@
  *    {@link nextGroupName}。採番ロジック自体は `plcConnectionForm.ts` の
  *    `nextConnectionName` と共通の {@link nextSequentialName}
  *    （`sequentialName.ts`）を使う。
+ * 3. **収集周期の既定値**（T19 S1-b UX-32）: {@link DEFAULT_PERIOD_MS}。
  *
  * 修正1（実機で再現した不具合、2026-08-31 オーナー報告）: {@link nextGroupName}
  * は既存レコード名に加えて `pendingNames`（pending queue 内の未適用の作成分
@@ -29,6 +30,21 @@
  */
 import { nextSequentialName } from './sequentialName';
 import type { CollectionGroup, CollectionGroupInput } from './tagRegistryAdmin';
+
+/**
+ * T19 S1-b（UX-32、docs/banto-hub-t19-design.md §5.2「現行は
+ * `ALLOWED_PERIOD_MS[0]` = 100ms。UX-32 で 1s へ変更する」、2026-09-02
+ * オーナー決定）: 収集グループ新規作成フォームの収集周期の既定値。
+ * `crates/banto-tags/src/collection_group.rs::ALLOWED_PERIOD_MS` の並び
+ * （`[100, 200, 500, 1000, 2000, 5000, 10000, 60000]`）はそのまま
+ * （100ms も引き続き選べる）— 変わるのは新規作成時に最初から選ばれている
+ * 値だけ。ここにローカル定数として持つ理由はモジュール冒頭コメントの
+ * 「依存ゼロの純関数」方針と同じ — `tagRegistryAdmin.ts` から値としての
+ * `ALLOWED_PERIOD_MS` を import すると `@banto/admin-core` を推移的に
+ * 引き込み、この最小 vitest 構成が壊れる（{@link blankGroupForm} の
+ * doc comment 参照）。
+ */
+export const DEFAULT_PERIOD_MS = 1000;
 
 /**
  * TAG-UX-8: 新規作成フォームの名前プリフィル。`prefix`（既定 `"group"`）に
@@ -54,6 +70,13 @@ export interface CollectionGroupFormState {
 	plcConnectionId: string;
 	periodMs: string;
 	enabled: boolean;
+	/**
+	 * T19 S1-b（UX-34、2026-09-02 オーナー決定「グループ単位の既定値は
+	 * DB 列に持つ」）: このグループへ新規タグを登録するときの `writable`
+	 * チェックボックスの既定値。サーバー側 `CollectionGroup.defaultWritable`
+	 * と1対1（`periodMs`/`enabled` と同じ、単純なフォームフィールド）。
+	 */
+	defaultWritable: boolean;
 }
 
 /**
@@ -63,8 +86,11 @@ export interface CollectionGroupFormState {
  * （`CollectionGroupDrawer.svelte`）が `blankGroupForm()` の直後に代入する
  * （`plcConnectionForm.ts::blankConnectionForm` と同じ役割分担）。
  *
- * `defaultPeriodMs` は呼び出し側が渡す（`ALLOWED_PERIOD_MS[0]` = 100ms、
- * 旧ページ実装をそのまま踏襲）。本モジュールは「依存ゼロの純関数」方針
+ * `defaultPeriodMs` は呼び出し側が渡す（T19 S1-b UX-32、2026-09-02
+ * オーナー決定「収集周期の既定を 1s へ変更」— 旧実装の `ALLOWED_PERIOD_MS[0]`
+ * = 100ms から `DEFAULT_PERIOD_MS` = 1000ms へ変更。選択肢
+ * （`ALLOWED_PERIOD_MS`）自体は変えない、100ms も引き続き選べる）。
+ * 本モジュールは「依存ゼロの純関数」方針
  * （冒頭コメント）を保つため `tagRegistryAdmin.ts` から値としての
  * `ALLOWED_PERIOD_MS` を import しない — `plcConnectionForm.ts` が
  * `DEFAULT_PORTS` をローカルに持つのと同じ理由に加えて、値 import は
@@ -78,7 +104,11 @@ export function blankGroupForm(defaultPeriodMs: number): CollectionGroupFormStat
 		name: '',
 		plcConnectionId: '',
 		periodMs: String(defaultPeriodMs),
-		enabled: true
+		enabled: true,
+		// T19 S1-b（UX-34 全体方針「既定 ON」）: 新規グループ自体の既定値
+		// も ON から始める（サーバー側の列既定値、`banto_tags::
+		// collection_group::default_writable_true` と揃える）。
+		defaultWritable: true
 	};
 }
 
@@ -88,7 +118,8 @@ export function groupToForm(g: CollectionGroup): CollectionGroupFormState {
 		name: g.name,
 		plcConnectionId: String(g.plcConnectionId),
 		periodMs: String(g.periodMs),
-		enabled: g.enabled
+		enabled: g.enabled,
+		defaultWritable: g.defaultWritable
 	};
 }
 
@@ -98,6 +129,7 @@ export function formToGroupInput(form: CollectionGroupFormState): CollectionGrou
 		name: form.name,
 		plcConnectionId: Number(form.plcConnectionId),
 		periodMs: Number(form.periodMs),
-		enabled: form.enabled
+		enabled: form.enabled,
+		defaultWritable: form.defaultWritable
 	};
 }

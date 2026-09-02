@@ -105,6 +105,15 @@ export interface CollectionGroup {
 	plcConnectionId: number;
 	periodMs: number;
 	enabled: boolean;
+	/**
+	 * T19 S1-b（UX-34、docs/banto-hub-t19-design.md §2、2026-09-02 オーナー
+	 * 決定「グループ単位の既定値は DB 列に持つ」）: このグループへ新規タグを
+	 * 登録するときの `writable` チェックボックスの既定値。`tags.writable`
+	 * 自体の検証（computed タグ拒否・Modbus 読み取り専用領域拒否）とは
+	 * 無関係 - あくまで新規タグフォームを開いた瞬間の UI 上の初期値だけを
+	 * 決める（`$lib/banto/writableDefault.ts` 参照）。
+	 */
+	defaultWritable: boolean;
 }
 
 /** Mirrors `banto_hub_core::rest::CollectionGroupPayload`. */
@@ -113,6 +122,8 @@ export interface CollectionGroupInput {
 	plcConnectionId: number;
 	periodMs: number;
 	enabled: boolean;
+	/** {@link CollectionGroup.defaultWritable} 参照。 */
+	defaultWritable: boolean;
 }
 
 /**

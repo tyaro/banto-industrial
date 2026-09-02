@@ -79,45 +79,50 @@ describe('nextGroupName（修正1: pendingNames — 実機で再現した不具�
 });
 
 describe('blankGroupForm / groupToForm / formToGroupInput', () => {
-	it('blankGroupForm は渡された既定周期を文字列化した初期値を返す', () => {
+	it('blankGroupForm は渡された既定周期を文字列化した初期値を返す（defaultWritable も既定 ON）', () => {
 		expect(blankGroupForm(100)).toEqual({
 			name: '',
 			plcConnectionId: '',
 			periodMs: '100',
-			enabled: true
+			enabled: true,
+			defaultWritable: true
 		});
 	});
 
-	it('groupToForm は保存済みグループを文字列化したフォーム状態へ変換する', () => {
+	it('groupToForm は保存済みグループを文字列化したフォーム状態へ変換する（defaultWritable も引き継ぐ）', () => {
 		const group: CollectionGroup = {
 			id: 7,
 			name: 'Group1',
 			plcConnectionId: 3,
 			periodMs: 5000,
-			enabled: true
+			enabled: true,
+			defaultWritable: false
 		};
 		expect(groupToForm(group)).toEqual({
 			name: 'Group1',
 			plcConnectionId: '3',
 			periodMs: '5000',
-			enabled: true
+			enabled: true,
+			defaultWritable: false
 		});
 	});
 
-	it('formToGroupInput は数値フィールドを number へ戻す（往復変換）', () => {
+	it('formToGroupInput は数値フィールドを number へ戻す（往復変換、defaultWritable も含む）', () => {
 		const group: CollectionGroup = {
 			id: 1,
 			name: 'X',
 			plcConnectionId: 2,
 			periodMs: 1000,
-			enabled: false
+			enabled: false,
+			defaultWritable: true
 		};
 		const form: CollectionGroupFormState = groupToForm(group);
 		expect(formToGroupInput(form)).toEqual({
 			name: 'X',
 			plcConnectionId: 2,
 			periodMs: 1000,
-			enabled: false
+			enabled: false,
+			defaultWritable: true
 		});
 	});
 });

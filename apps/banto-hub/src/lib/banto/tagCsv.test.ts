@@ -64,21 +64,24 @@ const GROUP_A_X: CollectionGroup = {
 	name: 'GroupX',
 	plcConnectionId: CONN_A.id,
 	periodMs: 1000,
-	enabled: true
+	enabled: true,
+	defaultWritable: true
 };
 const GROUP_A_Y: CollectionGroup = {
 	id: 11,
 	name: 'GroupY',
 	plcConnectionId: CONN_A.id,
 	periodMs: 1000,
-	enabled: true
+	enabled: true,
+	defaultWritable: true
 };
 const GROUP_B_X: CollectionGroup = {
 	id: 20,
 	name: 'GroupX',
 	plcConnectionId: CONN_B.id,
 	periodMs: 1000,
-	enabled: true
+	enabled: true,
+	defaultWritable: true
 };
 const GROUPS: CollectionGroup[] = [GROUP_A_X, GROUP_A_Y, GROUP_B_X];
 
@@ -547,7 +550,8 @@ describe('exportTagsCsv', () => {
 			name: 'OrphanGroup',
 			plcConnectionId: 999999,
 			periodMs: 1000,
-			enabled: true
+			enabled: true,
+			defaultWritable: true
 		};
 		const tag = makeTag({ collectionGroupId: orphanGroup.id });
 		const csv = exportTagsCsv([tag], CONNECTIONS, [...GROUPS, orphanGroup]);

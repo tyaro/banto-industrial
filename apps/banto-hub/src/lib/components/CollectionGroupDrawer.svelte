@@ -22,6 +22,13 @@
 	 * 2. 接続先と周期: 所属する PLC 接続 / 収集周期 / 有効
 	 * 3. 確認: 入力内容の確認表示 + 「作成」
 	 *
+	 * **T19 S1-b（UX-31、2026-09-02 オーナー決定「作成＝中央モーダル、
+	 * 編集＝右ペイン」）: 作成ウィザードは `Modal.svelte`（中央）、再設定
+	 * フォームと閲覧専用モードは `Drawer.svelte`（右ペイン）で描画する**
+	 * （`ConnectionDrawer.svelte` と同じ分岐 - `isCreate` で提示先自体を
+	 * 切り替える。`isCreate` は `group` prop の null 性から決まり、Drawer/
+	 * Modal を開いている間に値が変わることはない前提）。
+	 *
 	 * 純関数部分（連番採番・フォーム⇄API入力変換）は
 	 * `$lib/banto/collectionGroupForm.ts` へ切り出し済み（そちらでユニット
 	 * テスト済み）。採番ロジック自体は `plcConnectionForm.ts::nextConnectionName`
@@ -53,6 +60,7 @@
 	 */
 	import { isProviderError } from '@banto/admin-core';
 	import Drawer from './Drawer.svelte';
+	import Modal from './Modal.svelte';
 	import { toastStore } from '$lib/toast.svelte';
 	import { isAdmin } from '$lib/permissions';
 	import { sessionStore } from '$lib/session.svelte';
@@ -69,6 +77,7 @@
 	} from '$lib/banto/tagRegistryAdmin';
 	import {
 		blankGroupForm,
+		DEFAULT_PERIOD_MS,
 		formToGroupInput,
 		groupToForm,
 		nextGroupName,
@@ -152,7 +161,7 @@
 		return null;
 	}
 
-	let form: CollectionGroupFormState = $state(blankGroupForm(ALLOWED_PERIOD_MS[0]));
+	let form: CollectionGroupFormState = $state(blankGroupForm(DEFAULT_PERIOD_MS));
 	let errors: Record<string, string> = $state({});
 	let saving = $state(false);
 	let deleting = $state(false);
@@ -190,7 +199,7 @@
 			form = groupToForm(group);
 			provisionalName = null;
 		} else {
-			const blank = blankGroupForm(ALLOWED_PERIOD_MS[0]);
+			const blank = blankGroupForm(DEFAULT_PERIOD_MS);
 			const initialName = nextGroupName(existingNames);
 			blank.name = initialName;
 			provisionalName = initialName;
@@ -390,6 +399,29 @@
 			<input type="checkbox" bind:checked={form.enabled} disabled={readOnly} />
 			有効
 		</label>
+		<!--
+			T19 S1-b（UX-34「収集グループ単位で既定値を変更できるようにする」、
+			2026-09-02 オーナー決定「グループ単位の既定値は DB 列に持つ」）:
+			このグループへの新規タグ登録が「書き込み可（writable）」
+			チェックボックスをどちらの状態で始めるかを、グループ単位で
+			選べる。サーバーの `CollectionGroup.defaultWritable`
+			（`crates/banto-tags/src/collection_group.rs`）に永続化される -
+			`periodMs`/`enabled` と同じ、`form` の通常フィールドの1つ。
+			`writable` の実際の登録可否（computed タグ拒否、および
+			Modbus 読み取り専用領域拒否を含む8段ゲート - 後者は S1-b0 で
+			UI に配線予定、`$lib/banto/writableDefault.ts` 参照）には
+			一切影響しない - あくまで新規タグフォームを開いた瞬間の
+			チェックボックスの初期値だけを決める。
+		-->
+		<label class="field checkbox wide">
+			<input type="checkbox" bind:checked={form.defaultWritable} disabled={readOnly} />
+			このグループの新規タグは既定で書込可（writable）
+		</label>
+		<span class="hint wide">
+			チェックを入れると、このグループへ新規タグを登録するとき「外部クライアントから PLC
+			への書き込みを許可」が既定でオンになります（computed タグには適用されません）。個々の
+			タグ側でいつでも上書きできます。
+		</span>
 	</div>
 {/snippet}
 
@@ -403,11 +435,19 @@
 		<dd>{form.periodMs} ms</dd>
 		<dt>有効</dt>
 		<dd>{form.enabled ? 'はい' : 'いいえ'}</dd>
+		<dt>新規タグの書込可既定</dt>
+		<dd>{form.defaultWritable ? 'ON' : 'OFF'}</dd>
 	</dl>
 {/snippet}
 
-<Drawer {open} title={drawerTitle} {onRequestClose} onclose={onClose} width="480px">
-	{#if isCreate}
+{#if isCreate}
+	<Modal
+		open={open && isCreate}
+		title={drawerTitle}
+		{onRequestClose}
+		onclose={onClose}
+		width="560px"
+	>
 		<ol class="wizard-steps" aria-label="作成手順">
 			<li class:active={step === 1} class:done={step > 1}>1. 識別</li>
 			<li class:active={step === 2} class:done={step > 2}>2. 接続先と周期</li>
@@ -434,7 +474,15 @@
 				<button type="button" onclick={handleCreate} disabled={saving}>作成</button>
 			{/if}
 		</div>
-	{:else}
+	</Modal>
+{:else}
+	<Drawer
+		open={open && !isCreate}
+		title={drawerTitle}
+		{onRequestClose}
+		onclose={onClose}
+		width="480px"
+	>
 		{@render nameField()}
 		{@render destinationFields()}
 		{#if !readOnly}
@@ -445,8 +493,8 @@
 				</button>
 			</div>
 		{/if}
-	{/if}
-</Drawer>
+	</Drawer>
+{/if}
 
 <style>
 	.form-grid {
@@ -482,6 +530,21 @@
 
 	.field.checkbox input {
 		width: auto;
+	}
+
+	/* T19 S1-b（UX-34）: 「このグループの新規タグは既定で書込可」チェックボックスと補足文を全幅にする。 */
+	.field.wide {
+		grid-column: 1 / -1;
+	}
+
+	.hint {
+		font-size: 0.7rem;
+		color: var(--banto-text-muted);
+	}
+
+	.hint.wide {
+		grid-column: 1 / -1;
+		margin: 0;
 	}
 
 	.err {

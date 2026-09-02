@@ -214,7 +214,8 @@ async function applyConfigPackageInner(
 			name: group.name,
 			plcConnectionId: connection.id,
 			periodMs: group.periodMs,
-			enabled: group.enabled
+			enabled: group.enabled,
+			defaultWritable: group.defaultWritable
 		};
 		const existing = groupByName.get(group.name);
 		if (existing) {

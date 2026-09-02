@@ -63,13 +63,25 @@ test.describe.serial('banto-hub タグ連続登録 DOM (TAG-P0-1)', () => {
 		expect(groupRes.ok()).toBe(true);
 
 		// 連続登録 Drawer を開き、点数以外の固定入力(対象グループ・開始
-		// アドレス)を済ませておく - 各 test は「点数」欄だけを変えて
-		// プレビュー/エラー表示を確認する。
+		// アドレス・名前パターン・開始番号)を済ませておく - 各 test は
+		// 「点数」欄だけを変えてプレビュー/エラー表示を確認する。
+		//
+		// T19 S1-b（UX-35、docs/banto-hub-t19-design.md「連続登録の名前
+		// パターン — デバイス名を既定とし、開始番号はアドレスから導出」、
+		// 2026-09-02 オーナー決定）で名前パターン/開始番号の既定値が
+		// 「固定値 `temp{n}`/`1`」から「開始アドレスから導出」に変わった。
+		// このテストが確認したいのは「点数 N を指定するとプレビューが N 件
+		// になり登録結果と一致する」ことであって名前パターンの既定ロジック
+		// 自体ではないため、既定導出に頼らず名前パターン・開始番号を明示
+		// 入力して固定する（既定導出ロジックが今後変わってもこのテストは
+		// 影響を受けない）。
 		await page.goto('/tags');
 		await page.getByRole('button', { name: '連続登録' }).click();
 		await expect(page.getByRole('dialog', { name: '連続登録' })).toBeVisible();
 		await page.getByLabel('対象グループ').selectOption({ label: GROUP_NAME });
 		await page.getByLabel('開始アドレス').fill('D100');
+		await page.getByLabel('名前パターン').fill('temp{n}');
+		await page.getByLabel('開始番号').fill('1');
 	});
 
 	test.afterAll(async () => {
@@ -89,8 +101,8 @@ test.describe.serial('banto-hub タグ連続登録 DOM (TAG-P0-1)', () => {
 		await fillCount('2');
 		await expect(page.getByRole('heading', { level: 4, name: 'プレビュー（2件）' })).toBeVisible();
 		// プレビュー行自体も期待した名前/アドレスで並んでいること
-		// （名前パターンの既定値 `temp{n}`・開始番号1・開始アドレス D100、
-		// データ型の既定 i16 は+1刻み）。
+		// （beforeAll で明示入力した名前パターン `temp{n}`・開始番号1・
+		// 開始アドレス D100、データ型の既定 i16 は+1刻み）。
 		await expect(page.locator('.preview-table tbody tr')).toHaveCount(2);
 		const firstRow = page.locator('.preview-table tbody tr').nth(0);
 		await expect(firstRow).toContainText('temp1');

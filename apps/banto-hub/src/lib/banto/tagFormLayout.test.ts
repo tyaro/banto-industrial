@@ -6,9 +6,11 @@
 import { describe, expect, it } from 'vitest';
 import {
 	DISPLAY_SCALING_FIELDS,
+	DISPLAY_SCALING_VALUE_FIELDS,
 	THRESHOLD_FIELDS,
 	WRITE_SAFETY_FIELDS,
 	hasFieldError,
+	hasAnyFieldValue,
 	buildConfirmExternalName,
 	environmentLabel,
 	writePermissionLabel,
@@ -49,6 +51,39 @@ describe('hasFieldError', () => {
 
 	it('値が空文字列（falsy）のエラーキーは無視する', () => {
 		expect(hasFieldError({ rawLo: '' }, DISPLAY_SCALING_FIELDS)).toBe(false);
+	});
+});
+
+describe('hasAnyFieldValue', () => {
+	it('DISPLAY_SCALING_VALUE_FIELDS のいずれかに非空文字列があれば true', () => {
+		expect(hasAnyFieldValue({ rawLo: '0' }, DISPLAY_SCALING_VALUE_FIELDS)).toBe(true);
+		expect(hasAnyFieldValue({ engHi: '100' }, DISPLAY_SCALING_VALUE_FIELDS)).toBe(true);
+	});
+
+	it('decimals は DISPLAY_SCALING_VALUE_FIELDS に含まれない（常に既定値 0 を持つため対象外）', () => {
+		expect(hasAnyFieldValue({ decimals: '2' }, DISPLAY_SCALING_VALUE_FIELDS)).toBe(false);
+	});
+
+	it('THRESHOLD_FIELDS のいずれかに非空文字列があれば true', () => {
+		expect(hasAnyFieldValue({ thresholdHh: '80' }, THRESHOLD_FIELDS)).toBe(true);
+	});
+
+	it('すべて空文字列なら false', () => {
+		expect(
+			hasAnyFieldValue({ rawLo: '', rawHi: '', engLo: '', engHi: '' }, DISPLAY_SCALING_VALUE_FIELDS)
+		).toBe(false);
+	});
+
+	it('前後の空白だけの値は未設定として扱う', () => {
+		expect(hasAnyFieldValue({ rawLo: '   ' }, DISPLAY_SCALING_VALUE_FIELDS)).toBe(false);
+	});
+
+	it('対象キー自体が values に無くても false のまま（例外にしない）', () => {
+		expect(hasAnyFieldValue({}, DISPLAY_SCALING_VALUE_FIELDS)).toBe(false);
+	});
+
+	it('数値の "0" は非空文字列として設定済み扱いにする', () => {
+		expect(hasAnyFieldValue({ thresholdL: '0' }, THRESHOLD_FIELDS)).toBe(true);
 	});
 });
 
