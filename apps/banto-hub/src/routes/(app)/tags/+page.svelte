@@ -29,6 +29,7 @@
 	import { sessionStore } from '$lib/session.svelte';
 	import { canWriteResources } from '$lib/permissions';
 	import Drawer from '$lib/components/Drawer.svelte';
+	import Modal from '$lib/components/Modal.svelte';
 	import SplitPane from '$lib/components/SplitPane.svelte';
 	import ConnectionTree from '$lib/components/ConnectionTree.svelte';
 	import TreeContextMenu from '$lib/components/TreeContextMenu.svelte';
@@ -82,6 +83,8 @@
 		buildContinuousParams,
 		generateContinuousTags,
 		MAX_CONTINUOUS_COUNT,
+		nextNamePatternOnAddressChange,
+		nextStartNumberOnAddressChange,
 		type ContinuousFormState,
 		type ContinuousRegistrationResult
 	} from '$lib/banto/continuousRegistration';
@@ -107,9 +110,11 @@
 	import { parseOptionalNumber } from '$lib/banto/tagFormNumeric';
 	import {
 		DISPLAY_SCALING_FIELDS,
+		DISPLAY_SCALING_VALUE_FIELDS,
 		THRESHOLD_FIELDS,
 		WRITE_SAFETY_FIELDS,
 		hasFieldError,
+		hasAnyFieldValue,
 		buildConfirmExternalName,
 		environmentLabel,
 		writePermissionLabel,
@@ -119,6 +124,8 @@
 	import { carryFormForNext } from '$lib/banto/tagFormCarry';
 	import { buildDuplicateFormValues } from '$lib/banto/tagDuplicate';
 	import { nextTagNameOnAddressChange } from '$lib/banto/tagNamePrefill';
+	import { canDefaultWritable, writableDefaultBlockedReason } from '$lib/banto/writableDefault';
+	import { getGroupDefaultWritable } from '$lib/banto/groupWritableDefault';
 	import {
 		monitorHref,
 		resolveGroupIdFromTreeSelection,
@@ -534,6 +541,68 @@
 	 *   判断）。
 	 */
 	let createNameTouched = $state(false);
+
+	/**
+	 * T19 S1-b（UX-34、docs/banto-hub-t19-design.md §2・§3.3、2026-09-02
+	 * オーナー決定「`writable` の既定 ON。ただし収集グループ単位で変更可
+	 * （条件付き適用）」）: create Drawer 専用の「`writable` チェックボックス
+	 * をユーザーが直接編集したか」の追跡フラグ。`createNameTouched` と同じ
+	 * touched 追跡方式 - `false` の間だけ、下の `$effect`（タグ種別・
+	 * アドレス・収集グループの変化を見る）が `createForm.writable` を
+	 * 自動計算し続ける。チェックボックスをユーザーが直接クリックした時点で
+	 * `true` に固定する（`tagFields` snippet の write-safety セクション参照）。
+	 *
+	 * リセットするタイミング:
+	 * - `openCreateDrawer`: `false` に戻す（新規タグは常に自動計算から
+	 *   始まる）。
+	 * - `handleCreate` の「登録して次へ」: **触れない** - `carryFormForNext`
+	 *   は `writable` を「直前の入力のまま引き継ぐ」共通値として扱っている
+	 *   （`tagFormCarry.ts` 冒頭コメント参照）。touched もリセットすると、
+	 *   ユーザーが前の1件で手動 OFF にした意図が次の1件で黙って ON に
+	 *   戻ってしまう。
+	 * - `openDuplicateDrawer`: **`true` で開始する**（`createNameTouched`
+	 *   と同じ判断 - 複製元の `writable` は「型/単位/スケーリング/しきい値」
+	 *   と同格の引き継ぎ対象であり、この既定計算で上書きすべきではない）。
+	 */
+	let createWritableTouched = $state(false);
+
+	/**
+	 * T19 S1-b（UX-34）: create Drawer が開いている間、`createForm.writable`
+	 * を「PLC タグかどうか」（{@link canDefaultWritable}、
+	 * `$lib/banto/writableDefault.ts`）とグループ単位の既定値
+	 * （{@link getGroupDefaultWritable}、`$lib/banto/
+	 * groupWritableDefault.ts` - このブラウザの `localStorage` にしか
+	 * 残らない設定であることの背景は同モジュールの doc comment 参照）の
+	 * 両方から自動計算し続ける。`createWritableTouched` が `true` になった
+	 * 後は何もしない（ユーザーが自分で決めた値を上書きしない）。
+	 *
+	 * **2026-09-02 オーナー判断（S1-b0 分離）**: アドレス領域（Modbus
+	 * `1xxxx`/`3xxxx` 読み取り専用）による絞り込みはここでは行わない -
+	 * `canDefaultWritable` の第2引数（`writableArea`）を意図的に省略して
+	 * いる（`undefined` 扱い）。この規則をアドレス文字列から UI 側で
+	 * 判定すると、`banto-plc`（`AddressArea`）・`banto-tags`
+	 * （`modbus_read_only_area`）に続く3つ目の手書き複製になってしまう
+	 * ため、プロトコル層のデータを受け取れるようになる別スライス S1-b0
+	 * まで保留する（`writableDefault.ts` の doc comment 参照）。S1-b0 が
+	 * サーバー由来の判定結果（例: アドレス preflight のレスポンスに
+	 * 判定結果を足す）を用意したら、ここへ第2引数として渡すだけで
+	 * 絞り込みが有効になる - 関数シグネチャは既にその形になっている。
+	 *
+	 * 依存として読むのは `drawerMode`・`createWritableTouched`・
+	 * `createForm.tagKind`・`createForm.collectionGroupId` の4つ -
+	 * `createForm.writable` 自身は読まない（読むと自分の書き込みで自分を
+	 * 再トリガーする無限ループのリスクになる）。
+	 */
+	$effect(() => {
+		if (drawerMode !== 'create' || createWritableTouched) return;
+		const eligible = canDefaultWritable(createForm.tagKind);
+		const groupId = Number(createForm.collectionGroupId);
+		const groupDefault =
+			createForm.collectionGroupId !== '' && Number.isFinite(groupId)
+				? getGroupDefaultWritable(groupId)
+				: true;
+		createForm.writable = eligible && groupDefault;
+	});
 
 	/**
 	 * T18-3a（docs/banto-hub-t18-design.md「T18-3a タグ複製」、TAG-UX-D
@@ -1324,6 +1393,9 @@
 		duplicateSource = null; // T18-3a: 通常の新規作成では複製元差分パネルを出さない
 		// 2026-09-01: 空フォームなので「名前が空」から始まる - プリフィル対象。
 		createNameTouched = false;
+		// T19 S1-b（UX-34）: 新規タグは常に `writable` の自動計算から始まる
+		// （上の `createWritableTouched` 宣言のコメント参照）。
+		createWritableTouched = false;
 		drawerMode = 'create';
 	}
 
@@ -1367,6 +1439,10 @@
 		// いるため、プリフィル対象外として開始する（上の `createNameTouched`
 		// 宣言のコメント参照 - アドレスを後から入力しても複製名を上書きしない）。
 		createNameTouched = true;
+		// T19 S1-b（UX-34）: 複製元の `writable` は「型/単位/スケーリング/
+		// しきい値」と同格の引き継ぎ対象 - 自動計算で上書きしない（上の
+		// `createWritableTouched` 宣言のコメント参照）。
+		createWritableTouched = true;
 		drawerMode = 'create';
 	}
 
@@ -1800,12 +1876,20 @@
 	// でプレビュー行を組み立て、確認後に一括 API を叩く。連続登録は PLC
 	// アドレスを前提とする機能のため tagKind は常に 'plc'（TagInput 側の
 	// 既定と同じ、フォーム自体に種別選択は出さない）。
+	//
+	// T19 S1-b（UX-35、docs/banto-hub-t19-design.md §2「名前パターンの既定を
+	// デバイス名から導出・開始番号は入力不要」、2026-09-02 オーナー決定）:
+	// `namePattern`/`startNumber` はもう固定の初期値（旧 `temp{n}`/`1`）を
+	// 持たず空で始め、開始アドレス欄の入力に追従して
+	// `nextNamePatternOnAddressChange`/`nextStartNumberOnAddressChange`
+	// （touched 追跡方式、`$lib/banto/tagNamePrefill.ts::
+	// nextTagNameOnAddressChange` と同じ設計）でプリフィルする。
 
 	function blankContinuousForm(): ContinuousFormState {
 		return {
 			collectionGroupId: '',
-			namePattern: 'temp{n}',
-			startNumber: '1',
+			namePattern: '',
+			startNumber: '',
 			startAddress: '',
 			count: '1',
 			dataType: 'i16',
@@ -1828,6 +1912,37 @@
 	let continuousForm = $state(blankContinuousForm());
 	/** T18-1（TAG-UX-C 一部）: `createBaseline` と同じ役割、連続登録版。 */
 	let continuousBaseline: ContinuousFormState = blankContinuousForm();
+
+	/**
+	 * T19 S1-b（UX-35）: 名前パターン欄・開始番号欄をユーザーが直接編集した
+	 * 合図。`createNameTouched`（`tagNamePrefill.ts` 参照）と同じ役割 -
+	 * 立っている間は開始アドレス入力に追従させない。
+	 *
+	 * **`openContinuousDrawer` では false へ戻さない**: 連続登録フォーム
+	 * 自体（`continuousForm`）は Drawer を閉じて開き直しても値を保持する
+	 * 既存の挙動（`openContinuousDrawer` が `continuousBaseline` だけ
+	 * 差し替え、`continuousForm` はリセットしない — 下の関数のコメント
+	 * 参照）に合わせ、ここも同じタイミング（一括登録が成功して
+	 * `continuousForm` 自体が空へ戻る `handleApplyContinuous`）でのみ
+	 * `false` に戻す。Drawer を閉じただけで touched をリセットすると、
+	 * 「ユーザーが編集した名前パターンが残っているのに、次に開いたときの
+	 * 最初のアドレス編集で黙って上書きされる」という事故が起きるため。
+	 */
+	let continuousNamePatternTouched = $state(false);
+	let continuousStartNumberTouched = $state(false);
+
+	/**
+	 * T19 S1-b（UX-36、単票フォームの `createDetailOpen`/`editDetailOpen` と
+	 * 同じ考え方）: 連続登録フォームの「表示・スケーリング」「しきい値」の
+	 * 開閉状態。既定は閉じた状態（design「既定は閉じた状態」）。連続登録は
+	 * フィールド単位のサーバーエラーを持たない（検証結果はプレビュー
+	 * テーブルの行単位エラー）ため、単票フォームのような「エラー時に自動
+	 * 展開」は無い。
+	 */
+	let continuousDetailOpen: { display: boolean; threshold: boolean } = $state({
+		display: false,
+		threshold: false
+	});
 
 	/** 入力が変わるたびに再計算される、適用前プレビュー(設計「適用前にプレビュー表示」)。
 	 *
@@ -1896,6 +2011,12 @@
 				monitorCtaHref = monitorHref({ groupId: Number(continuousForm.collectionGroupId) });
 				continuousForm = blankContinuousForm();
 				continuousBaseline = blankContinuousForm();
+				// T19 S1-b（UX-35）: フォームが空へ戻るのに合わせ、touched も
+				// 戻す（上の宣言のコメント参照）— そうしないと次回の開始
+				// アドレス入力がプリフィルされなくなる。
+				continuousNamePatternTouched = false;
+				continuousStartNumberTouched = false;
+				continuousDetailOpen = { display: false, threshold: false };
 				invalidateContinuousValidation();
 				await reload();
 			} else {
@@ -2490,7 +2611,8 @@
 	detailOpen: DetailOpenState,
 	addressPreflight: AddressPreflightState,
 	onAddressInput: () => void,
-	onNameInput: () => void
+	onNameInput: () => void,
+	onWritableInput: () => void
 )}
 	<!--
 		TAG-P0-2（docs/banto-hub-desktop-plan.md §9.3、2026-08-10 実装メモ）:
@@ -2762,7 +2884,19 @@
 		は変わらない）。
 	-->
 	<details class="detail-group" bind:open={detailOpen.display}>
-		<summary>表示・スケーリング</summary>
+		<summary>
+			表示・スケーリング
+			{#if hasAnyFieldValue(form, DISPLAY_SCALING_VALUE_FIELDS)}
+				<!--
+					T19 S1-b（UX-36「値が設定されているときは、閉じていてもそれが
+					分かるようにする」、2026-09-02 オーナー決定）: RawLo/Hi・
+					EngLo/Hi のいずれかに値が入っていれば、詳細を開かなくても
+					分かるバッジを summary に出す。閉じたまま気付けないと危険
+					（design原文）という安全上の理由。
+				-->
+				<span class="detail-value-badge" title="値が設定されています">設定あり</span>
+			{/if}
+		</summary>
 		<div class="form-grid">
 			<label class="field">
 				小数桁数
@@ -2823,7 +2957,12 @@
 		</div>
 	</details>
 	<details class="detail-group" bind:open={detailOpen.threshold}>
-		<summary>しきい値</summary>
+		<summary>
+			しきい値
+			{#if hasAnyFieldValue(form, THRESHOLD_FIELDS)}
+				<span class="detail-value-badge" title="値が設定されています">設定あり</span>
+			{/if}
+		</summary>
 		<div class="form-grid">
 			<label class="field">
 				しきい値 H
@@ -2878,14 +3017,52 @@
 		</div>
 	</details>
 	{#if form.tagKind !== 'computed'}
+		<!--
+			T19 S1-b（UX-34）: `writableDefaultBlockedReason` の第2引数
+			（アドレス領域がサーバー的に書き込み可能かどうか）は
+			2026-09-02 オーナー判断（S1-b0 分離）によりここでは意図的に
+			省略する（`undefined` 扱い）。Modbus `1xxxx`/`3xxxx` のような
+			規則をアドレス文字列から UI 側で判定すると、`banto-plc`
+			（`AddressArea`）・`banto-tags`（`modbus_read_only_area`）に
+			続く3つ目の手書き複製になってしまうため、プロトコル層の
+			データをサーバーから受け取れるようになる別スライス S1-b0 まで
+			保留する（`$lib/banto/writableDefault.ts` の doc comment
+			参照）。そのため現状 `writableBlockedReason` は `tagKind ===
+			'computed'` のときしか非 `null` にならない（このセクション自体
+			が computed では非表示なので、実質ここには来ない） -
+			チェックボックスは今のところ無効化されない。S1-b0 がアドレス
+			preflight 等でこの判定結果を返すようになったら、その値を
+			第2引数として渡すだけで絞り込みが有効になる。
+		-->
+		{@const writableBlockedReason = writableDefaultBlockedReason(form.tagKind)}
 		<details class="detail-group" bind:open={detailOpen.write}>
 			<summary>書き込み安全設定</summary>
 			<div class="form-grid">
 				<label class="field checkbox wide">
-					<input id="tag-writable" type="checkbox" bind:checked={form.writable} />
+					<input
+						id="tag-writable"
+						type="checkbox"
+						checked={writableBlockedReason === null && form.writable}
+						disabled={writableBlockedReason !== null}
+						onchange={(e) => {
+							form.writable = (e.currentTarget as HTMLInputElement).checked;
+							onWritableInput();
+						}}
+					/>
 					外部クライアントから PLC への書き込みを許可
 				</label>
-				{#if form.writable}
+				{#if writableBlockedReason}
+					<!--
+						T19 S1-b（UX-34「該当しない場合は既定を適用せず、なぜ
+						writable にできないのかが利用者に分かる表示にしてください」、
+						2026-09-02 オーナー決定）: 現状は到達しない分岐
+						（computed タグはこのセクション自体が非表示 - 上の
+						`{#if form.tagKind !== 'computed'}`）。S1-b0 でアドレス
+						領域判定が配線されれば、読み取り専用領域のときにも
+						ここへ来るようになる。
+					-->
+					<p class="hint wide" id="tag-writable-blocked-reason">{writableBlockedReason}</p>
+				{:else if form.writable}
 					<!--
 						T18-2a（TAG-UX-B「書き込み許可の文言は『外部クライアントから
 						PLC への書き込みを許可』とし、ON 時に安全上の影響を説明す
@@ -2955,38 +3132,6 @@
 		小数桁数
 		<input type="number" min="0" bind:value={continuousForm.decimals} />
 	</label>
-	<label class="field">
-		RawLo
-		<input type="number" bind:value={continuousForm.rawLo} />
-	</label>
-	<label class="field">
-		RawHi
-		<input type="number" bind:value={continuousForm.rawHi} />
-	</label>
-	<label class="field">
-		EngLo
-		<input type="number" bind:value={continuousForm.engLo} />
-	</label>
-	<label class="field">
-		EngHi
-		<input type="number" bind:value={continuousForm.engHi} />
-	</label>
-	<label class="field">
-		しきい値 H
-		<input type="number" bind:value={continuousForm.thresholdH} />
-	</label>
-	<label class="field">
-		しきい値 HH
-		<input type="number" bind:value={continuousForm.thresholdHh} />
-	</label>
-	<label class="field">
-		しきい値 L
-		<input type="number" bind:value={continuousForm.thresholdL} />
-	</label>
-	<label class="field">
-		しきい値 LL
-		<input type="number" bind:value={continuousForm.thresholdLl} />
-	</label>
 	<label class="field checkbox">
 		<input type="checkbox" bind:checked={continuousForm.enabled} />
 		有効
@@ -2995,6 +3140,65 @@
 		<input type="checkbox" bind:checked={continuousForm.writable} />
 		書き込み可（writable）
 	</label>
+	<!--
+		T19 S1-b（UX-36、単票フォームの `<details class="detail-group">` と
+		同じ扱い）: RawLo/RawHi/EngLo/EngHi・しきい値 HH/H/L/LL は既定で
+		閉じ、値が入っていれば summary にバッジを出す。
+	-->
+	<div class="continuous-detail-wrap">
+		<details class="detail-group" bind:open={continuousDetailOpen.display}>
+			<summary>
+				表示・スケーリング
+				{#if hasAnyFieldValue(continuousForm, DISPLAY_SCALING_VALUE_FIELDS)}
+					<span class="detail-value-badge" title="値が設定されています">設定あり</span>
+				{/if}
+			</summary>
+			<div class="form-grid">
+				<label class="field">
+					RawLo
+					<input type="number" bind:value={continuousForm.rawLo} />
+				</label>
+				<label class="field">
+					RawHi
+					<input type="number" bind:value={continuousForm.rawHi} />
+				</label>
+				<label class="field">
+					EngLo
+					<input type="number" bind:value={continuousForm.engLo} />
+				</label>
+				<label class="field">
+					EngHi
+					<input type="number" bind:value={continuousForm.engHi} />
+				</label>
+			</div>
+		</details>
+		<details class="detail-group" bind:open={continuousDetailOpen.threshold}>
+			<summary>
+				しきい値
+				{#if hasAnyFieldValue(continuousForm, THRESHOLD_FIELDS)}
+					<span class="detail-value-badge" title="値が設定されています">設定あり</span>
+				{/if}
+			</summary>
+			<div class="form-grid">
+				<label class="field">
+					しきい値 H
+					<input type="number" bind:value={continuousForm.thresholdH} />
+				</label>
+				<label class="field">
+					しきい値 HH
+					<input type="number" bind:value={continuousForm.thresholdHh} />
+				</label>
+				<label class="field">
+					しきい値 L
+					<input type="number" bind:value={continuousForm.thresholdL} />
+				</label>
+				<label class="field">
+					しきい値 LL
+					<input type="number" bind:value={continuousForm.thresholdLl} />
+				</label>
+			</div>
+		</details>
+	</div>
 {/snippet}
 
 {#snippet batchRowErrors(result: BatchTagsResult)}
@@ -3611,10 +3815,21 @@
 	onDeleted={handleGroupDrawerDeleted}
 />
 
-<Drawer
-	open={drawerMode !== null}
+<!--
+	T19 S1-b（UX-31、docs/banto-hub-t19-design.md §3.2「作成は前後関係を
+	必要としない一方向の作業なので中央モーダルで集中させる」）: タグの
+	新規登録（`drawerMode === 'create'` - 複製もここに含む、上の
+	`openDuplicateDrawer` コメント参照）だけを中央モーダル（`Modal.svelte`）
+	へ切り出す。編集・連続登録・CSVインポートは引き続き右ペイン
+	（`Drawer.svelte`）のまま - 一覧を見ながら直す/取り込む作業のため
+	（同designの§3.2）。`onclose`/`onRequestClose` は既存の
+	`closeDrawer`/`confirmDiscardIfNeeded` をそのまま共有する（破棄確認・
+	busy 中クローズ抑止のロジックは変えない）。
+-->
+<Modal
+	open={drawerMode === 'create'}
 	title={drawerTitle}
-	width={drawerWidth}
+	width="560px"
 	onclose={closeDrawer}
 	onRequestClose={confirmDiscardIfNeeded}
 >
@@ -3694,6 +3909,12 @@
 					// 名前欄をユーザーが直接編集した合図 - 以後はアドレス入力に
 					// 追従させない（`createNameTouched` 宣言のコメント参照）。
 					createNameTouched = true;
+				},
+				() => {
+					// T19 S1-b（UX-34）: `writable` チェックボックスをユーザーが
+					// 直接クリックした合図 - 以後は自動計算しない
+					// （`createWritableTouched` 宣言のコメント参照）。
+					createWritableTouched = true;
 				}
 			)}
 			<div class="actions">
@@ -3725,7 +3946,17 @@
 				</p>
 			{/if}
 		</form>
-	{:else if drawerMode === 'edit' && selected && canWrite}
+	{/if}
+</Modal>
+
+<Drawer
+	open={drawerMode === 'edit' || drawerMode === 'continuous' || drawerMode === 'csv'}
+	title={drawerTitle}
+	width={drawerWidth}
+	onclose={closeDrawer}
+	onRequestClose={confirmDiscardIfNeeded}
+>
+	{#if drawerMode === 'edit' && selected && canWrite}
 		<form
 			class="drawer-section"
 			onsubmit={(e) => {
@@ -3793,6 +4024,10 @@
 				// 2026-09-01: 名前空欄→アドレス自動プリフィルは対象外（既存タグの
 				// 名前を空にするのは「消したい」意図かもしれないため - 実装指示
 				// どおり編集フォームは対象外にする）。何もしない no-op を渡す。
+				() => {},
+				// T19 S1-b（UX-34）: 既定の自動適用は create Drawer 限定
+				// （`createWritableTouched` 宣言のコメント参照）- 編集フォームに
+				// 対応する touched 変数は無いため no-op を渡す。
 				() => {}
 			)}
 			<div class="actions">
@@ -3842,15 +4077,52 @@
 				</label>
 				<label class="field">
 					名前パターン
-					<input type="text" bind:value={continuousForm.namePattern} placeholder="temp{'{n}'}" />
+					<input
+						type="text"
+						bind:value={continuousForm.namePattern}
+						placeholder="D{'{n}'}"
+						oninput={() => {
+							// T19 S1-b（UX-35）: ユーザーが直接編集した合図 - 以後は
+							// 開始アドレス入力に追従させない（上の
+							// `continuousNamePatternTouched` 宣言のコメント参照）。
+							continuousNamePatternTouched = true;
+						}}
+					/>
 				</label>
 				<label class="field">
 					開始番号
-					<input type="number" bind:value={continuousForm.startNumber} />
+					<input
+						type="number"
+						bind:value={continuousForm.startNumber}
+						oninput={() => {
+							continuousStartNumberTouched = true;
+						}}
+					/>
 				</label>
 				<label class="field">
 					開始アドレス
-					<input type="text" bind:value={continuousForm.startAddress} placeholder="D3000" />
+					<input
+						type="text"
+						bind:value={continuousForm.startAddress}
+						placeholder="D3000"
+						oninput={() => {
+							// T19 S1-b（UX-35「名前パターンの既定をデバイス名から導出・
+							// 開始番号は入力不要」）: 名前パターン・開始番号のどちらも
+							// ユーザーがまだ直接編集していなければ、開始アドレスから
+							// 導出した値へ追従させる（`tagNamePrefill.ts` の
+							// `nextTagNameOnAddressChange` と同じ touched 追跡方式）。
+							const nextPattern = nextNamePatternOnAddressChange(
+								continuousForm.startAddress,
+								continuousNamePatternTouched
+							);
+							if (nextPattern !== null) continuousForm.namePattern = nextPattern;
+							const nextStart = nextStartNumberOnAddressChange(
+								continuousForm.startAddress,
+								continuousStartNumberTouched
+							);
+							if (nextStart !== null) continuousForm.startNumber = nextStart;
+						}}
+					/>
 				</label>
 				<label class="field">
 					点数
@@ -4342,6 +4614,11 @@
 		grid-column: 1 / -1;
 	}
 
+	/* T19 S1-b（UX-36）: 連続登録フォームの詳細セクション2つを form-grid 内で全幅にする。 */
+	.continuous-detail-wrap {
+		grid-column: 1 / -1;
+	}
+
 	.field input,
 	.field select,
 	.field textarea {
@@ -4364,6 +4641,17 @@
 	.hint {
 		font-size: 0.7rem;
 		color: var(--banto-text-muted);
+	}
+
+	/*
+	 * T19 S1-b（UX-34）: `writable` チェックボックスが無効化されている理由
+	 * （`#tag-writable-blocked-reason`）を form-grid の全幅で表示する。
+	 * `.warn` と同じ「独立して grid-column を持つ」流儀（`.wide` 単体クラス
+	 * は `.field.wide` にしか効かないため）。
+	 */
+	.hint.wide {
+		grid-column: 1 / -1;
+		margin: 0;
 	}
 
 	.required {
@@ -4416,6 +4704,23 @@
 
 	.detail-group[open] summary {
 		margin-bottom: 0.3rem;
+	}
+
+	/*
+	 * T19 S1-b（UX-36「値が設定されているときは、閉じていてもそれが分かる
+	 * ようにする」）: 詳細セクションが閉じたままでも視認できるバッジ。
+	 * 色は warning ではなく primary 系（危険ではなく「情報あり」の意味）。
+	 */
+	.detail-value-badge {
+		display: inline-block;
+		margin-left: 0.5rem;
+		padding: 0.05rem 0.5rem;
+		border-radius: 999px;
+		font-size: 0.7rem;
+		font-weight: 600;
+		color: var(--banto-primary);
+		background: color-mix(in srgb, var(--banto-primary) 14%, transparent);
+		vertical-align: middle;
 	}
 
 	/* T18-2a（TAG-UX-B「書き込み許可…ON 時に安全上の影響を説明する」）。 */

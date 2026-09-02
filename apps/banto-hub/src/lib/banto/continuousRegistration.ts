@@ -196,6 +196,105 @@ export interface ContinuousFormState {
 	writable: boolean;
 }
 
+/**
+ * T19 S1-b（UX-35、docs/banto-hub-t19-design.md §2「連続登録の名前パターン
+ * — デバイス名（M/D/W/B 等）を既定とし、開始番号はアドレスから導出（入力
+ * 不要）」、2026-09-02 オーナー決定）: 開始アドレスから連続登録フォームの
+ * 名前パターンの既定値を導出する。
+ *
+ * - **SLMP デバイス記法として解釈できるアドレス**（`parseSlmpAddress` が
+ *   非 `null`）: デバイスのニーモニック（`M`/`D`/`W`/`B` 等）をそのまま
+ *   使い `"{mnemonic}{n}"` を返す（例: `D3000` → `D{n}`、`M100` → `M{n}`）。
+ *   `.N` bit サフィックス付きアドレス（例 `D100.5`）でもワード側の
+ *   ニーモニックだけを使う（bit 位置は名前に含めない — 命名の既定値は
+ *   「どのデバイス系列か」だけ示せば十分で、`.5` まで名前に埋め込むと
+ *   連番展開後の名前が冗長になるため）。
+ * - **Modbus 参照番号等、デバイスニーモニックを持たないアドレス**
+ *   （`incrementAddress` と同じフォールバック正規表現「先頭の非数字列 +
+ *   末尾の10進数字列」を使う）: 非数字の先頭部分が有れば
+ *   それをニーモニック相当として使う（例 `AI40001` → `AI{n}`）。**先頭に
+ *   非数字部分が無い場合**（`"40001"` のような素の参照番号 — Modbus の
+ *   典型形）は、デバイス名を名乗れる情報が無いため既定 `"tag{n}"` を返す
+ *   （実装判断: 「タグ」という汎用語を使い、既存の `blankContinuousForm`
+ *   の旧既定 `temp{n}` とは意図的に区別する — `temp` は「一時的な値」を
+ *   連想させ、実際の連続登録の用途（恒久タグの一括登録）とずれるため）。
+ * - **開始アドレスが空**: 導出できないので空文字列を返す（呼び出し側は
+ *   これを「まだプリフィルしない」の合図として扱ってよい — 空の名前
+ *   パターンは {@link generateContinuousTags} が
+ *   「名前パターンを入力してください」で弾く）。
+ */
+export function defaultNamePatternFromAddress(address: string): string {
+	const trimmed = address.trim();
+	if (trimmed === '') return '';
+
+	const parsed = parseSlmpAddress(trimmed);
+	if (parsed) return `${parsed.mnemonic}{n}`;
+
+	const match = /^(\D*)\d+$/.exec(trimmed);
+	const prefix = match?.[1]?.trim();
+	return prefix ? `${prefix}{n}` : 'tag{n}';
+}
+
+/**
+ * T19 S1-b（UX-35、同design「開始番号はアドレスから導出（入力不要）」）:
+ * 開始アドレスから連続登録フォームの開始番号の既定値を導出する。
+ * `D3000` なら `3000`（設計の例そのまま）。
+ *
+ * - SLMP デバイス記法として解釈できれば `parsed.number`（デバイス番号 -
+ *   `.N` bit サフィックスは無視する。ビット位置ではなくワード/ビット
+ *   デバイスの番号そのものを名前の連番に使う方が「アドレスと名前が対応
+ *   している」という直感に合う）。
+ * - 解釈できなければ {@link incrementAddress} と同じフォールバック正規表現
+ *   で末尾の10進数字列を取り出し、その数値を返す（例 `"40001"` → `40001`）。
+ * - どちらの形にも合わない、またはアドレスが空なら `null`
+ *   （呼び出し側は「導出できない」の合図として扱う - 使う際は
+ *   `generateContinuousTags` の `startNumber` 既定 `0` にフォールバック
+ *   する）。
+ */
+export function defaultStartNumberFromAddress(address: string): number | null {
+	const trimmed = address.trim();
+	if (trimmed === '') return null;
+
+	const parsed = parseSlmpAddress(trimmed);
+	if (parsed) return parsed.number;
+
+	const match = /^\D*(\d+)$/.exec(trimmed);
+	if (!match) return null;
+	return Number.parseInt(match[1], 10);
+}
+
+/**
+ * T19 S1-b（UX-35）: 開始アドレス欄の `oninput` から呼ぶ、名前パターン欄の
+ * プリフィル判定。`$lib/banto/tagNamePrefill.ts::nextTagNameOnAddressChange`
+ * と同じ「touched 追跡」方式 - ユーザーが名前パターン欄を一度でも直接編集
+ * したら `namePatternTouched` を立て、以後はアドレス入力に追従させない。
+ * `null` を返せば呼び出し側は名前パターン欄に触れない。
+ */
+export function nextNamePatternOnAddressChange(
+	newAddress: string,
+	namePatternTouched: boolean
+): string | null {
+	if (namePatternTouched) return null;
+	return defaultNamePatternFromAddress(newAddress);
+}
+
+/**
+ * T19 S1-b（UX-35）: 開始アドレス欄の `oninput` から呼ぶ、開始番号欄の
+ * プリフィル判定。{@link nextNamePatternOnAddressChange} と同じ
+ * 「touched 追跡」方式。導出できない間（{@link defaultStartNumberFromAddress}
+ * が `null`）は空文字列を返す - 開始番号欄を空のまま保つ
+ * （`buildContinuousParams` が空欄を `startNumber: 0` 既定として扱う、
+ * 既存の `parseOptionalNumber` の挙動どおり）。
+ */
+export function nextStartNumberOnAddressChange(
+	newAddress: string,
+	startNumberTouched: boolean
+): string | null {
+	if (startNumberTouched) return null;
+	const derived = defaultStartNumberFromAddress(newAddress);
+	return derived === null ? '' : String(derived);
+}
+
 export interface ContinuousRegistrationRow {
 	name: string;
 	address: string;

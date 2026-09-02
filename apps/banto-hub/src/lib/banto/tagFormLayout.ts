@@ -7,7 +7,7 @@
  * `$effect`/DOM 組み立てに専念させ、ここに置く関数はスナップショット値
  * だけを引数に取り、テストしやすく保つ。
  *
- * 本モジュールが担う2つの役割:
+ * 本モジュールが担う3つの役割:
  *
  * 1. **詳細セクションの自動展開判定**（TAG-UX-B「詳細側にエラー時は自動
  *    展開する」）: `<details class="detail-group">` 3セクション
@@ -22,6 +22,14 @@
  *    引いてこれらへ渡すだけの薄いラッパーを持つ（ページ側の `FormState`/
  *    `groupsFor` 等に依存させないため、ここでは素の文字列・真偽値だけを
  *    受け取る）。
+ * 3. **詳細セクションの「値設定済み」インジケータ**（T19 S1-b UX-36、
+ *    docs/banto-hub-t19-design.md §2「スケーリング・閾値は詳細設定に
+ *    格納。既定は閉じた状態。値が設定されているときは、閉じていても
+ *    それが分かるようにする」、2026-09-02 オーナー決定）:
+ *    {@link hasAnyFieldValue} と、インジケータ対象のフィールド集合定数
+ *    （{@link DISPLAY_SCALING_VALUE_FIELDS}）。「閉じたら値が見えなくなり、
+ *    危険なしきい値設定に気付けない」という安全上の懸念（design原文）への
+ *    対応 - `<summary>` にバッジを出す判定に使う。
  *
  * 上記いずれも `FormState`（ページ側の型）を直接知らなくても成立するため
  * ここへ切り出すことでユニットテスト対象にできる（`+page.svelte` 自体には
@@ -39,12 +47,58 @@ export const THRESHOLD_FIELDS = ['thresholdH', 'thresholdHh', 'thresholdL', 'thr
 export const WRITE_SAFETY_FIELDS = ['writable'] as const;
 
 /**
+ * T19 S1-b（UX-36）: 「表示・スケーリング」の「値設定済み」インジケータ
+ * 対象。{@link DISPLAY_SCALING_FIELDS} から `decimals` を除いたもの -
+ * `decimals` は常に既定値 `'0'`（未入力ではなく通常の数値入力）を持つ
+ * フィールドで、design が挙げる対象（「RawLo/Hi・EngLo/Hi・閾値
+ * HH/H/L/LL」）にも含まれないため、バッジ判定からは外す（「値が入って
+ * いれば知らせる」の対象は、入っていないのが普通というフィールドに絞る）。
+ */
+export const DISPLAY_SCALING_VALUE_FIELDS = ['rawLo', 'rawHi', 'engLo', 'engHi'] as const;
+
+/**
  * `errors`（フィールド名 → エラーメッセージのマップ）のうち、`fields` に
  * 含まれるいずれかのキーが真値を持つか。`<details bind:open>` を強制的に
  * 開く条件の判定に使う（TAG-UX-B「詳細側にエラー時は自動展開する」）。
  */
 export function hasFieldError(errors: Record<string, string>, fields: readonly string[]): boolean {
 	return fields.some((field) => Boolean(errors[field]));
+}
+
+/**
+ * T19 S1-b（UX-36、モジュール冒頭コメントの役割3参照）: `values` のうち、
+ * `fields` に含まれるいずれかが空でない値を持つか。`<details>` を閉じた
+ * ままでも `<summary>` にバッジを出すかどうかの判定に使う。
+ *
+ * `values` は広い `object` 型で受ける（関数内部の doc comment 参照 -
+ * `Record<string, unknown>` にすると呼び出し元の具体的なインターフェース
+ * 型で「index signature が無い」という TypeScript エラーになる）。
+ * これにより単票タグフォーム（`FormState`、数値系フィールドはすべて
+ * `string`、「空文字列 = 未設定」規約、`blankForm`/`numOrEmpty` 参照）と
+ * 連続登録フォーム（`ContinuousFormState`、Svelte 5 の
+ * `<input type="number" bind:value>` が代入する実体は
+ * `string | number | null`、`continuousRegistration.ts` の doc comment
+ * 参照）の両方から同じ関数で呼べる - 個別に型を合わせた薄いラッパーを
+ * 2つ持つより、値を文字列化して判定する方が単純。`null`/`undefined` は
+ * 未設定として扱い、それ以外は文字列化して前後の空白を trim する
+ * （`buildConfirmExternalName` の trim 方針と同じ）。
+ */
+export function hasAnyFieldValue(values: object, fields: readonly string[]): boolean {
+	// `values` is typed as the broad `object` (rather than `Record<string,
+	// unknown>`) precisely so callers can pass concrete interfaces
+	// (`FormState`/`ContinuousFormState`, neither of which declares an index
+	// signature) without a TypeScript "index signature is missing" error at
+	// the call site - `Record<string, unknown>` requires the argument type
+	// to structurally have one. The cast here is safe: every field this
+	// function is ever called with is a known key of the caller's own form
+	// type (`DISPLAY_SCALING_VALUE_FIELDS`/`THRESHOLD_FIELDS`), so indexing
+	// with a lookup that might miss is exactly the same risk a direct
+	// `values[field]` would already have.
+	const record = values as Record<string, unknown>;
+	return fields.some((field) => {
+		const v = record[field];
+		return v !== null && v !== undefined && String(v).trim() !== '';
+	});
 }
 
 /**

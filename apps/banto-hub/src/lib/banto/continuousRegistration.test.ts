@@ -13,9 +13,13 @@
 import { describe, expect, it } from 'vitest';
 import {
 	buildContinuousParams,
+	defaultNamePatternFromAddress,
+	defaultStartNumberFromAddress,
 	generateContinuousTags,
 	incrementAddress,
 	MAX_CONTINUOUS_COUNT,
+	nextNamePatternOnAddressChange,
+	nextStartNumberOnAddressChange,
 	type ContinuousFormState
 } from './continuousRegistration';
 
@@ -252,5 +256,96 @@ describe('generateContinuousTags: 16進デバイス・bit 連番がプレビュ�
 		if (!result.ok) {
 			expect(result.error).toMatch(/bit/);
 		}
+	});
+});
+
+// T19 S1-b（UX-35、docs/banto-hub-t19-design.md §2「連続登録の名前パターン
+// — デバイス名を既定とし、開始番号はアドレスから導出（入力不要）」）:
+// `defaultNamePatternFromAddress`/`defaultStartNumberFromAddress` と、
+// それらを touched 追跡でラップする `nextNamePatternOnAddressChange`/
+// `nextStartNumberOnAddressChange` のユニットテスト。
+
+describe('defaultNamePatternFromAddress', () => {
+	it('SLMP デバイス記法（ワード）はニーモニックをそのまま使う - D3000 → D{n}', () => {
+		expect(defaultNamePatternFromAddress('D3000')).toBe('D{n}');
+	});
+
+	it('SLMP デバイス記法（ビット）も同様 - M100 → M{n}', () => {
+		expect(defaultNamePatternFromAddress('M100')).toBe('M{n}');
+	});
+
+	it('16進デバイスもニーモニックだけを使う - W1FF → W{n}', () => {
+		expect(defaultNamePatternFromAddress('W1FF')).toBe('W{n}');
+	});
+
+	it('bit サフィックス付きアドレスはワード側のニーモニックのみ使う - D100.5 → D{n}', () => {
+		expect(defaultNamePatternFromAddress('D100.5')).toBe('D{n}');
+	});
+
+	it('小文字入力も大文字ニーモニックへ正規化する - d3000 → D{n}', () => {
+		expect(defaultNamePatternFromAddress('d3000')).toBe('D{n}');
+	});
+
+	it('デバイスニーモニックを持つ非SLMP形式は先頭の非数字列を使う - AI40001 → AI{n}', () => {
+		expect(defaultNamePatternFromAddress('AI40001')).toBe('AI{n}');
+	});
+
+	it('Modbus 参照番号のようにデバイス名を持たないアドレスは既定 tag{n} - 40001', () => {
+		expect(defaultNamePatternFromAddress('40001')).toBe('tag{n}');
+	});
+
+	it('開始アドレスが空文字列なら空文字列を返す（導出しない合図）', () => {
+		expect(defaultNamePatternFromAddress('')).toBe('');
+		expect(defaultNamePatternFromAddress('   ')).toBe('');
+	});
+});
+
+describe('defaultStartNumberFromAddress', () => {
+	it('SLMP デバイス記法はデバイス番号を返す - D3000 → 3000（設計の例そのまま）', () => {
+		expect(defaultStartNumberFromAddress('D3000')).toBe(3000);
+	});
+
+	it('16進デバイスも10進のデバイス番号を返す - W1FF → 511', () => {
+		expect(defaultStartNumberFromAddress('W1FF')).toBe(0x1ff);
+	});
+
+	it('bit サフィックス付きアドレスは bit 位置ではなくデバイス番号を返す - D100.5 → 100', () => {
+		expect(defaultStartNumberFromAddress('D100.5')).toBe(100);
+	});
+
+	it('デバイス名を持たない Modbus 参照番号は数字列そのものを返す - 40001', () => {
+		expect(defaultStartNumberFromAddress('40001')).toBe(40001);
+	});
+
+	it('数字を含まないアドレスは null（導出できない合図）', () => {
+		expect(defaultStartNumberFromAddress('AI')).toBeNull();
+	});
+
+	it('開始アドレスが空文字列なら null', () => {
+		expect(defaultStartNumberFromAddress('')).toBeNull();
+	});
+});
+
+describe('nextNamePatternOnAddressChange', () => {
+	it('touched が false なら新アドレスから導出した値を返す', () => {
+		expect(nextNamePatternOnAddressChange('D3000', false)).toBe('D{n}');
+	});
+
+	it('touched が true なら null（呼び出し側は名前パターン欄に触れない）', () => {
+		expect(nextNamePatternOnAddressChange('D3000', true)).toBeNull();
+	});
+});
+
+describe('nextStartNumberOnAddressChange', () => {
+	it('touched が false なら新アドレスから導出した値を文字列で返す', () => {
+		expect(nextStartNumberOnAddressChange('D3000', false)).toBe('3000');
+	});
+
+	it('touched が false でも導出できないアドレスなら空文字列を返す', () => {
+		expect(nextStartNumberOnAddressChange('', false)).toBe('');
+	});
+
+	it('touched が true なら null（呼び出し側は開始番号欄に触れない）', () => {
+		expect(nextStartNumberOnAddressChange('D3000', true)).toBeNull();
 	});
 });

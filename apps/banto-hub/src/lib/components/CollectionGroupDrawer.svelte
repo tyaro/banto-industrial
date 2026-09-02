@@ -22,6 +22,13 @@
 	 * 2. 接続先と周期: 所属する PLC 接続 / 収集周期 / 有効
 	 * 3. 確認: 入力内容の確認表示 + 「作成」
 	 *
+	 * **T19 S1-b（UX-31、2026-09-02 オーナー決定「作成＝中央モーダル、
+	 * 編集＝右ペイン」）: 作成ウィザードは `Modal.svelte`（中央）、再設定
+	 * フォームと閲覧専用モードは `Drawer.svelte`（右ペイン）で描画する**
+	 * （`ConnectionDrawer.svelte` と同じ分岐 - `isCreate` で提示先自体を
+	 * 切り替える。`isCreate` は `group` prop の null 性から決まり、Drawer/
+	 * Modal を開いている間に値が変わることはない前提）。
+	 *
 	 * 純関数部分（連番採番・フォーム⇄API入力変換）は
 	 * `$lib/banto/collectionGroupForm.ts` へ切り出し済み（そちらでユニット
 	 * テスト済み）。採番ロジック自体は `plcConnectionForm.ts::nextConnectionName`
@@ -53,6 +60,7 @@
 	 */
 	import { isProviderError } from '@banto/admin-core';
 	import Drawer from './Drawer.svelte';
+	import Modal from './Modal.svelte';
 	import { toastStore } from '$lib/toast.svelte';
 	import { isAdmin } from '$lib/permissions';
 	import { sessionStore } from '$lib/session.svelte';
@@ -69,11 +77,16 @@
 	} from '$lib/banto/tagRegistryAdmin';
 	import {
 		blankGroupForm,
+		DEFAULT_PERIOD_MS,
 		formToGroupInput,
 		groupToForm,
 		nextGroupName,
 		type CollectionGroupFormState
 	} from '$lib/banto/collectionGroupForm';
+	import {
+		getGroupDefaultWritable,
+		setGroupDefaultWritable
+	} from '$lib/banto/groupWritableDefault';
 
 	/** `pendingChangesAdmin.ts::PendingChange.source` - `rest.rs::collection_groups_create` が `queue_pending_registry_change` に渡す文字列と一致させる。 */
 	const PENDING_SOURCE = 'collection_groups.create';
@@ -152,11 +165,26 @@
 		return null;
 	}
 
-	let form: CollectionGroupFormState = $state(blankGroupForm(ALLOWED_PERIOD_MS[0]));
+	let form: CollectionGroupFormState = $state(blankGroupForm(DEFAULT_PERIOD_MS));
 	let errors: Record<string, string> = $state({});
 	let saving = $state(false);
 	let deleting = $state(false);
 	let step: 1 | 2 | 3 = $state(1);
+
+	/**
+	 * T19 S1-b（UX-34、docs/banto-hub-t19-design.md §2「収集グループ単位で
+	 * 既定値を変更できるようにします」、2026-09-02 オーナー決定）: 「この
+	 * グループの新規タグは既定で書込可」チェックボックスの現在値。
+	 *
+	 * **サーバーの `CollectionGroup`/`CollectionGroupInput` の一部ではない**
+	 * - `$lib/banto/groupWritableDefault.ts` の doc comment に書いた理由
+	 * （`banto-tags` が relay-wright/banto-collect とも共有するクレートで、
+	 * DB 列化の影響範囲がそれら無関係なアプリに及ぶと判明したため）で
+	 * `localStorage` 側に持つ。新規作成では対象グループの id がまだ無い
+	 * ため、作成成功後（`handleCreate` の `created.id` 確定後）に初めて
+	 * 保存する - それまではこの `$state` だけがユーザーの選択を保持する。
+	 */
+	let defaultWritablePref = $state(true);
 
 	/**
 	 * Drawer を開いた対象（新規作成 or どのグループの再設定か）を表すキー。
@@ -189,8 +217,15 @@
 		if (group) {
 			form = groupToForm(group);
 			provisionalName = null;
+			// T19 S1-b（UX-34）: 既存グループの再設定 - このブラウザに保存済みの
+			// 既定値を読み直す（未設定なら `getGroupDefaultWritable` 自体が
+			// 全体既定の `true` を返す）。
+			defaultWritablePref = getGroupDefaultWritable(group.id);
 		} else {
-			const blank = blankGroupForm(ALLOWED_PERIOD_MS[0]);
+			// T19 S1-b（UX-34）: 新規作成は id が無いのでこのブラウザの保存値を
+			// 参照しようがない - 全体既定の `true` から始める。
+			defaultWritablePref = true;
+			const blank = blankGroupForm(DEFAULT_PERIOD_MS);
 			const initialName = nextGroupName(existingNames);
 			blank.name = initialName;
 			provisionalName = initialName;
@@ -280,6 +315,12 @@
 		try {
 			const created = await createCollectionGroup(formToGroupInput(form));
 			toastStore.push('success', '作成しました');
+			// T19 S1-b（UX-34）: 作成が確定した時点で初めて id が確定するため、
+			// ここで初めて（このブラウザの）既定値を保存する。202 キュー投入時
+			// はこの then 節に来ない（下の catch の `isQueuedWhileRunningError`
+			// 分岐 - まだ id が確定していないため保存しようがなく、それでよい:
+			// 後で実際にこのグループを再設定 Drawer で開いたときにまた選べる）。
+			setGroupDefaultWritable(created.id, defaultWritablePref);
 			onSaved(created);
 			onClose();
 		} catch (err) {
@@ -311,6 +352,10 @@
 			// 保存成功後はサーバーの正規化値を基準に取り直す（ConnectionDrawer
 			// の handleSave と同じ方針）。Drawer は閉じない。
 			form = groupToForm(updated);
+			// T19 S1-b（UX-34）: 202 キュー投入時（下の catch）はまだ確定して
+			// いないため保存しない - 実際に適用されてから再度開いたときの
+			// 選択に委ねる。
+			setGroupDefaultWritable(updated.id, defaultWritablePref);
 			onSaved(updated);
 		} catch (err) {
 			if (isQueuedWhileRunningError(err)) {
@@ -390,6 +435,28 @@
 			<input type="checkbox" bind:checked={form.enabled} disabled={readOnly} />
 			有効
 		</label>
+		<!--
+			T19 S1-b（UX-34「収集グループ単位で既定値を変更できるようにする」、
+			2026-09-02 オーナー決定）: このグループへの新規タグ登録が
+			「書き込み可（writable）」チェックボックスをどちらの状態で
+			始めるかを、グループ単位で選べる。サーバーの `CollectionGroup`
+			には保存しない（このブラウザの `localStorage` にのみ残る -
+			`$lib/banto/groupWritableDefault.ts` の doc comment に理由あり）。
+			`writable` の実際の登録可否（computed タグ拒否、および
+			Modbus 読み取り専用領域拒否を含む8段ゲート - 後者は S1-b0 で
+			UI に配線予定、`$lib/banto/writableDefault.ts` 参照）には
+			一切影響しない - あくまで新規タグフォームを開いた瞬間の
+			チェックボックスの初期値だけを決める。
+		-->
+		<label class="field checkbox wide">
+			<input type="checkbox" bind:checked={defaultWritablePref} disabled={readOnly} />
+			このグループの新規タグは既定で書込可（writable）
+		</label>
+		<span class="hint wide">
+			チェックを入れると、このグループへ新規タグを登録するとき「外部クライアントから PLC
+			への書き込みを許可」が既定でオンになります（computed タグには適用されません）。個々の
+			タグ側でいつでも上書きできます。
+		</span>
 	</div>
 {/snippet}
 
@@ -403,11 +470,19 @@
 		<dd>{form.periodMs} ms</dd>
 		<dt>有効</dt>
 		<dd>{form.enabled ? 'はい' : 'いいえ'}</dd>
+		<dt>新規タグの書込可既定</dt>
+		<dd>{defaultWritablePref ? 'ON' : 'OFF'}</dd>
 	</dl>
 {/snippet}
 
-<Drawer {open} title={drawerTitle} {onRequestClose} onclose={onClose} width="480px">
-	{#if isCreate}
+{#if isCreate}
+	<Modal
+		open={open && isCreate}
+		title={drawerTitle}
+		{onRequestClose}
+		onclose={onClose}
+		width="560px"
+	>
 		<ol class="wizard-steps" aria-label="作成手順">
 			<li class:active={step === 1} class:done={step > 1}>1. 識別</li>
 			<li class:active={step === 2} class:done={step > 2}>2. 接続先と周期</li>
@@ -434,7 +509,15 @@
 				<button type="button" onclick={handleCreate} disabled={saving}>作成</button>
 			{/if}
 		</div>
-	{:else}
+	</Modal>
+{:else}
+	<Drawer
+		open={open && !isCreate}
+		title={drawerTitle}
+		{onRequestClose}
+		onclose={onClose}
+		width="480px"
+	>
 		{@render nameField()}
 		{@render destinationFields()}
 		{#if !readOnly}
@@ -445,8 +528,8 @@
 				</button>
 			</div>
 		{/if}
-	{/if}
-</Drawer>
+	</Drawer>
+{/if}
 
 <style>
 	.form-grid {
@@ -482,6 +565,21 @@
 
 	.field.checkbox input {
 		width: auto;
+	}
+
+	/* T19 S1-b（UX-34）: 「このグループの新規タグは既定で書込可」チェックボックスと補足文を全幅にする。 */
+	.field.wide {
+		grid-column: 1 / -1;
+	}
+
+	.hint {
+		font-size: 0.7rem;
+		color: var(--banto-text-muted);
+	}
+
+	.hint.wide {
+		grid-column: 1 / -1;
+		margin: 0;
 	}
 
 	.err {
