@@ -2068,6 +2068,20 @@ struct PrunePreviewResponse {
     would_delete_count: usize,
 }
 
+/// `retention_days`（設定の生値）を`banto_tstore`が要求する`u32`日数へ
+/// 変換する。剪定は不可逆な削除なので、`None`（無制限）はもちろん、
+/// `u32`に収まらない想定外の値（`parse_retention`は上限クランプを
+/// しないため、DBを直接編集された等で`u32::MAX`超の値が入り得る）の
+/// ときも「削除しない」側（`None`）に倒す - 変換失敗を「削除数0」では
+/// なく「大量削除」に丸めるのは破壊的操作の失敗方向として逆。
+///
+/// prune-preview / prune-now の両方が必ずこの関数の結果**だけ**で
+/// 「prune するか否か」を決めること - 判定がここから外れて両者でズレると
+/// 「プレビューは0件だったのに実行したら消えた」が起き得る。
+fn resolve_prune_retention_days(retention_days: Option<i64>) -> Option<u32> {
+    retention_days.and_then(|days| u32::try_from(days).ok())
+}
+
 /// `POST /api/store-settings/prune-preview`（admin 限定・読み取り専用）:
 /// フロントの確認ダイアログ（実装指示「削除予定数を返す手段を必ず用意」）が
 /// 使う。破壊的操作ではないため監査エントリは記録しない（read routes are
@@ -2078,12 +2092,11 @@ async fn store_settings_prune_preview(
     let config = SettingsService::new(state.manager.pool())
         .store_config()
         .await?;
-    let Some(retention_days) = config.retention_days else {
+    let Some(retention_days) = resolve_prune_retention_days(config.retention_days) else {
         return Ok(Json(PrunePreviewResponse {
             would_delete_count: 0,
         }));
     };
-    let retention_days = u32::try_from(retention_days).unwrap_or(0);
     let clock = state.manager.clock();
     let today = LocalDate::from_epoch_ms(clock.now_ms(), clock.utc_offset_ms());
     let plan = banto_tstore::plan_prune(state.manager.data_dir(), retention_days, today)
@@ -2112,16 +2125,25 @@ async fn store_settings_prune_now(
     let config = SettingsService::new(state.manager.pool())
         .store_config()
         .await?;
-    let deleted_count = match config.retention_days {
+    let deleted_count = match resolve_prune_retention_days(config.retention_days) {
         Some(retention_days) => {
-            let retention_days = u32::try_from(retention_days).unwrap_or(0);
             let clock = state.manager.clock();
             let today = LocalDate::from_epoch_ms(clock.now_ms(), clock.utc_offset_ms());
             let report = banto_tstore::prune_files(state.manager.data_dir(), retention_days, today)
                 .map_err(|err| ApiError(BantoError::Storage(err.to_string())))?;
             report.deleted.len()
         }
-        None => 0,
+        None => {
+            // `resolve_prune_retention_days`が`None`を返すのは無制限設定
+            // （既知の正常系、ログ不要）か、`u32`に収まらない想定外の値
+            // （破壊的操作の入口なので記録する）のどちらか。
+            if let Some(retention_days) = config.retention_days {
+                crate::hub_log::log_err_line(&format!(
+                    "banto-hub: 保持日数の値が想定外のため剪定をスキップしました: {retention_days}"
+                ));
+            }
+            0
+        }
     };
 
     record_write(
@@ -11945,6 +11967,69 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["deletedCount"], 0);
         assert!(old_file.exists(), "unlimited retention must delete nothing");
+    }
+
+    /// レビュー指摘の安全化: 保持日数が`u32::MAX`を超える値で保存されて
+    /// いる状態（`parse_retention`は上限クランプをしないため、保存経路を
+    /// 通らず直接設定された等でこの状態になり得る）で prune-preview /
+    /// prune-now を叩くと、どちらも削除0件になり（既存ファイルが消えず）、
+    /// 両者の判定が一致すること（`resolve_prune_retention_days`を両方の
+    /// ハンドラが共有していることの固定）を確認する。
+    #[tokio::test]
+    async fn store_settings_prune_with_out_of_range_retention_days_deletes_nothing() {
+        let today = LocalDate::new(2026, 7, 12);
+        let now_ms = today.to_days_since_epoch() * 86_400_000 + 12 * 3_600_000;
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(now_ms, 0));
+        let env = test_env_with_clock(clock).await;
+
+        let data_dir = store_settings_test_data_dir(&env);
+        let old_file = touch_data_file(&data_dir, LocalDate::new(2020, 1, 1), 1);
+
+        // `PUT /api/store-settings`のバリデーション（1〜3650）を経由せず、
+        // 保存経路そのものへ想定外の巨大値を直接書き込む - レビュー指摘が
+        // 想定する「設定が壊れている・DBを直接編集された」状況の再現。
+        SettingsService::new(env.pool.clone())
+            .set_store_config(&StoreSettings {
+                data_dir: "./data".to_string(),
+                retention_days: Some(u32::MAX as i64 + 1),
+            })
+            .await
+            .expect("set_store_config");
+
+        let preview = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/store-settings/prune-preview")
+            .header("Authorization", format!("Bearer {}", env.admin_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .body(Body::empty())
+            .unwrap();
+        let response = env.router.clone().oneshot(preview).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["wouldDeleteCount"], 0);
+        assert!(old_file.exists(), "preview must not delete anything");
+
+        let prune_now = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/store-settings/prune-now")
+            .header("Authorization", format!("Bearer {}", env.admin_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .body(Body::empty())
+            .unwrap();
+        let response = env.router.clone().oneshot(prune_now).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["deletedCount"], 0);
+        assert!(
+            old_file.exists(),
+            "out-of-range retention_days must delete nothing, matching the preview"
+        );
     }
 
     // --- T18-5a 第2段 (docs/banto-hub-t18-design.md §4 決定6): 薄い部品の

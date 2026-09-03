@@ -805,7 +805,10 @@ async fn ensure_virtual_connection(pool: &SqlitePool, name: &str) {
 /// T19 S2-d（UX-39）: `retention_days` is now `Option<i64>` -
 /// `None`（無制限）means the operator explicitly chose "don't prune", so
 /// this sweep is skipped entirely rather than calling
-/// [`banto_tstore::prune_files`] with some sentinel day count.
+/// [`banto_tstore::prune_files`] with some sentinel day count. Likewise, if
+/// the stored value doesn't fit in the `u32` [`banto_tstore::prune_files`]
+/// expects, the sweep is skipped (not defaulted to some day count) - see the
+/// comment at the `u32::try_from` call below.
 async fn prune_once(
     settings: &SettingsService,
     data_dir: &std::path::Path,
@@ -824,7 +827,16 @@ async fn prune_once(
         log_line("banto-hub: tstore 保持期間は無制限のため剪定をスキップしました");
         return;
     };
-    let retention_days = u32::try_from(retention_days).unwrap_or(7);
+    // 剪定は不可逆な削除なので、保持日数が`u32`に収まらない想定外の値
+    // （`parse_retention`は上限クランプをしないため、DBを直接編集された
+    // 等で`u32::MAX`超の値が入り得る）のときは、削除する側ではなく
+    // 保持する側（上の無制限スキップと同じくスキップ）に倒す。
+    let Ok(retention_days) = u32::try_from(retention_days) else {
+        log_err_line(&format!(
+            "banto-hub: tstore 保持日数の値が想定外のため剪定をスキップしました: {retention_days}"
+        ));
+        return;
+    };
     let today = LocalDate::from_epoch_ms(clock.now_ms(), clock.utc_offset_ms());
     match banto_tstore::prune_files(data_dir, retention_days, today) {
         Ok(report) => {
@@ -1220,6 +1232,40 @@ mod tests {
             remaining.len(),
             1,
             "unlimited retention must delete nothing"
+        );
+    }
+
+    /// レビュー指摘の安全化: 保持日数が`u32`に収まらない想定外の値
+    /// （`parse_retention`は上限クランプをしないため、保存経路を通らず
+    /// 直接キーへ書き込まれた等で`u32::MAX`超の値が入り得る）のとき、
+    /// `prune_once`は`banto_tstore::prune_files`を呼ばず（＝デフォルト
+    /// 7日等にフォールバックせず）何も削除しない - 不可逆な削除を伴う
+    /// 剪定の失敗方向は「保持する側」でなければならない。
+    #[tokio::test]
+    async fn prune_once_with_out_of_range_retention_days_is_a_no_op() {
+        let pool = crate::db::migrate_memory().await.expect("migrate_memory");
+        let settings = SettingsService::new(pool.clone());
+        settings
+            .set_store_config(&crate::settings::StoreSettings {
+                data_dir: "./data".to_string(),
+                retention_days: Some(u32::MAX as i64 + 1),
+            })
+            .await
+            .expect("set_store_config");
+
+        let dir = crate::test_support::TempDir::new("prune-once-out-of-range");
+        let data_dir = dir.path().join("data");
+        let today = LocalDate::new(2026, 7, 12);
+        touch_test_data_file(&data_dir, LocalDate::new(2000, 1, 1), 1);
+
+        let clock = manual_clock_at(today);
+        prune_once(&settings, &data_dir, clock.as_ref()).await;
+
+        let remaining = banto_tstore::list_data_files(&data_dir).expect("list_data_files");
+        assert_eq!(
+            remaining.len(),
+            1,
+            "out-of-range retention_days must delete nothing"
         );
     }
 }
