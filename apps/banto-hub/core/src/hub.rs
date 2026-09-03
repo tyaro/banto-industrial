@@ -847,6 +847,21 @@ impl CollectorManager {
         self.clock.clone()
     }
 
+    /// The **effective** tstore data directory - the same `PathBuf` this
+    /// manager was constructed with, i.e. `crate::runtime::HubRuntime::start`'s
+    /// `data_dir` after `data_dir_override`/`BANTO_HUB_DATA` has already been
+    /// applied over the persisted `store_config().data_dir`. T19 S2-d
+    /// （UX-39）の `POST /api/store-settings/prune-now`/`prune-preview` は
+    /// このアクセサ経由で「実際に書き込み・削除が起きるディレクトリ」を
+    /// 得る - `SettingsService::store_config().data_dir` を直接読むと
+    /// override 環境で実ディレクトリとズレる可能性があるため使わない
+    /// （`crate::runtime::HubRuntime::start`のdoc comment「PORT/BANTO_BIND/
+    /// BANTO_HUB_DATA（via `*_override`）override the persisted settings」
+    /// 参照）。
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
     /// Rebuild the catalog and reconfigure the `Collector` from the current
     /// registry state (design §4.3, T7: "部分適用"). Called once at boot and
     /// after every I1 CRUD write that succeeds.

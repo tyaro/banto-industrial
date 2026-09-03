@@ -798,9 +798,14 @@ async fn ensure_virtual_connection(pool: &SqlitePool, name: &str) {
 }
 
 /// One retention sweep (design §3.3): read the configured retention days
-/// (falling back to [`crate::settings::DEFAULT_RETENTION_DAYS`] if the
-/// settings read itself fails) and delete tstore files older than that,
+/// (falling back to `Some(`[`crate::settings::DEFAULT_RETENTION_DAYS`]`)` if
+/// the settings read itself fails) and delete tstore files older than that,
 /// today computed from `clock`. Errors are logged, never fatal.
+///
+/// T19 S2-d（UX-39）: `retention_days` is now `Option<i64>` -
+/// `None`（無制限）means the operator explicitly chose "don't prune", so
+/// this sweep is skipped entirely rather than calling
+/// [`banto_tstore::prune_files`] with some sentinel day count.
 async fn prune_once(
     settings: &SettingsService,
     data_dir: &std::path::Path,
@@ -812,8 +817,12 @@ async fn prune_once(
             log_err_line(&format!(
                 "banto-hub: 保持設定の読み取りに失敗しました: {err}"
             ));
-            crate::settings::DEFAULT_RETENTION_DAYS
+            Some(crate::settings::DEFAULT_RETENTION_DAYS)
         }
+    };
+    let Some(retention_days) = retention_days else {
+        log_line("banto-hub: tstore 保持期間は無制限のため剪定をスキップしました");
+        return;
     };
     let retention_days = u32::try_from(retention_days).unwrap_or(7);
     let today = LocalDate::from_epoch_ms(clock.now_ms(), clock.utc_offset_ms());
@@ -1133,5 +1142,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining, 1);
+    }
+
+    // --- T19 S2-d (docs/banto-hub-t19-design.md §5.1、UX-39):
+    // `prune_once`が`StoreSettings.retention_days`の`Option<i64>`化に
+    // 追従していること（`Some`は従来どおり剪定、`None`＝無制限は剪定
+    // しない）を、`audit_prune_once`の上の2テストと対になる形で固定する。
+
+    fn manual_clock_at(today: LocalDate) -> Arc<dyn banto_tstore::Clock> {
+        // 正午 UTC・オフセット0 - `today`がそのままローカル日付になる
+        // （`LocalDate::from_epoch_ms`のdoc comment参照）、境界からは
+        // 十分離れているので日付計算の丸め誤差を気にしなくてよい。
+        let now_ms = today.to_days_since_epoch() * 86_400_000 + 12 * 3_600_000;
+        Arc::new(banto_tstore::ManualClock::new(now_ms, 0))
+    }
+
+    fn touch_test_data_file(data_dir: &std::path::Path, date: LocalDate, seq: u32) {
+        std::fs::create_dir_all(data_dir).expect("create data dir");
+        std::fs::write(
+            data_dir.join(format!("{}-{:03}.sqlite3", date.to_yyyymmdd(), seq)),
+            b"",
+        )
+        .expect("touch data file");
+    }
+
+    #[tokio::test]
+    async fn prune_once_deletes_aged_out_files_with_a_finite_policy() {
+        let pool = crate::db::migrate_memory().await.expect("migrate_memory");
+        let settings = SettingsService::new(pool.clone());
+        settings
+            .set_store_config(&crate::settings::StoreSettings {
+                data_dir: "./data".to_string(),
+                retention_days: Some(7),
+            })
+            .await
+            .expect("set_store_config");
+
+        let dir = crate::test_support::TempDir::new("prune-once-finite");
+        let data_dir = dir.path().join("data");
+        let today = LocalDate::new(2026, 7, 12);
+        touch_test_data_file(&data_dir, LocalDate::new(2026, 6, 1), 1); // aged out
+        touch_test_data_file(&data_dir, today, 1); // kept
+
+        let clock = manual_clock_at(today);
+        prune_once(&settings, &data_dir, clock.as_ref()).await;
+
+        let remaining = banto_tstore::list_data_files(&data_dir).expect("list_data_files");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].date, today);
+    }
+
+    /// UX-39 オーナー決定2（無制限の選択肢）: `retention_days: None`のとき
+    /// `prune_once`は`banto_tstore::prune_files`を一切呼ばない - 古い
+    /// ファイルがそのまま残ることで間接的に確認する。
+    #[tokio::test]
+    async fn prune_once_with_unlimited_policy_is_a_no_op() {
+        let pool = crate::db::migrate_memory().await.expect("migrate_memory");
+        let settings = SettingsService::new(pool.clone());
+        settings
+            .set_store_config(&crate::settings::StoreSettings {
+                data_dir: "./data".to_string(),
+                retention_days: None,
+            })
+            .await
+            .expect("set_store_config");
+
+        let dir = crate::test_support::TempDir::new("prune-once-unlimited");
+        let data_dir = dir.path().join("data");
+        let today = LocalDate::new(2026, 7, 12);
+        touch_test_data_file(&data_dir, LocalDate::new(2000, 1, 1), 1);
+
+        let clock = manual_clock_at(today);
+        prune_once(&settings, &data_dir, clock.as_ref()).await;
+
+        let remaining = banto_tstore::list_data_files(&data_dir).expect("list_data_files");
+        assert_eq!(
+            remaining.len(),
+            1,
+            "unlimited retention must delete nothing"
+        );
     }
 }

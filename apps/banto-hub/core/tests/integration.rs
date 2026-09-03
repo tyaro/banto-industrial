@@ -1027,6 +1027,6 @@ async fn settings_defaults_are_port_8722_and_retention_7_days() {
     assert_eq!(server.bind, "127.0.0.1");
 
     let store = settings.store_config().await.unwrap();
-    assert_eq!(store.retention_days, DEFAULT_RETENTION_DAYS);
+    assert_eq!(store.retention_days, Some(DEFAULT_RETENTION_DAYS));
     assert_eq!(store.data_dir, "./data");
 }

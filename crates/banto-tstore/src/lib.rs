@@ -57,7 +57,9 @@
 //! （範囲クエリ・間引きは I4 の仕事）。
 //!
 //! [`files`][]: [`files::list_data_files`]/[`files::prune_files`] -
-//! データディレクトリ単位の列挙・保持期限削除。
+//! データディレクトリ単位の列挙・保持期限削除。[`files::plan_prune`] は
+//! `prune_files` と同じ削除判定をファイルに触れずに返すプレビュー
+//! （banto-hub T19 S2-d、UX-39）。
 //!
 //! [`error`][]: [`error::TstoreError`]。
 
@@ -77,7 +79,7 @@ pub use clock::{Clock, ManualClock, SystemClock};
 pub use config::{GroupConfig, StoreConfig, TagColumn};
 pub use date::LocalDate;
 pub use error::TstoreError;
-pub use files::{list_data_files, prune_files, DataFileInfo, PruneReport};
+pub use files::{list_data_files, plan_prune, prune_files, DataFileInfo, PruneReport};
 pub use meta::{ColumnMeta, GroupMeta};
 pub use reader::{Sample, TsReader};
 pub use writer::{TsWriter, WriterOptions};
