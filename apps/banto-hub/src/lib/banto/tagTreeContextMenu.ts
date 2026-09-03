@@ -14,17 +14,24 @@
  *
  * 階層ルール（実装指示 T18-2e スコープ1点目）:
  * - ルート（"すべて" ノード = 空ツリーでも常にある `ConnectionTreeNodeData`
- *   の `{ kind: 'all' }`）→ PLC接続の新規作成（`/plc-connections` へ遷移
- *   - このページ自体は接続作成フォームを持たないため、遷移一択）。
- * - 接続ノード → その接続配下に収集グループを新規作成
- *   （`/collection-groups?connectionId=` へ遷移。プリセットの組み立ては
- *   `tagOnboarding.ts::collectionGroupsHref` をそのまま再利用 - T18-2d の
- *   「作成した親 ID が次工程へ自動設定される」導線と同じ仕組み）。
+ *   の `{ kind: 'all' }`）→ PLC接続の新規作成。
+ * - 接続ノード → その接続配下に収集グループを新規作成（`connectionId` を
+ *   プリセットとして返す）。
  * - グループノード → そのグループ配下にタグを新規作成（このページ自身が
  *   タグの CRUD を持つため、遷移ではなく `groupId` だけを返す - 呼び出し側
  *   が `treeFilter` をこのグループへ合わせたうえで既存の create Drawer
  *   （`openCreateDrawer`、`resolveGroupIdFromTreeSelection` 経由で選択中
  *   ノードからプリセットする既存 T18-2d ロジック）をそのまま開けばよい）。
+ *
+ * T19 S1-d（docs/banto-hub-t19-design.md UX-30、2026-09-03）追記:
+ * `createConnection`/`createGroup` はもともと T18-2e 時点では
+ * `/plc-connections`・`/collection-groups` への `goto`（`href` 付き）
+ * だったが、T18-6d で「その場で Drawer を開く」方式に置き換わって以来
+ * `href` フィールドは呼び出し側（`tags/+page.svelte::activateTreeContextMenuAction`）
+ * から一度も参照されていなかった（`resolveTreeContextMenuItems` が
+ * `TreeContextMenuItemAction` へ変換する際に握りつぶしていた）。両画面が
+ * 削除された（設計 §3.1・§7.1）のに合わせ、この死んだ `href` フィールドと
+ * `tagOnboarding.ts::collectionGroupsHref` への依存を除去した。
  *
  * T19 S1-a（docs/banto-hub-t19-design.md §7.1、2026-09-02）追記: T18-2e〜
  * T18-6d 時点は `calc`/`mem`（`protocol: 'virtual'`）接続、およびその配下の
@@ -49,7 +56,6 @@
  * 再設定・削除」項目を追加する本体は、この関数を土台にする
  * `resolveTreeContextMenuItems`（本ファイル下部）に実装している。
  */
-import { collectionGroupsHref } from './tagOnboarding';
 import type { ConnectionTreeNodeData } from '$lib/components/connectionTreeTypes';
 
 /**
@@ -63,8 +69,8 @@ function isVirtual(connection: { protocol: string }): boolean {
 }
 
 export type TagTreeContextMenuAction =
-	| { kind: 'createConnection'; label: string; href: string }
-	| { kind: 'createGroup'; label: string; connectionId: number; href: string }
+	| { kind: 'createConnection'; label: string }
+	| { kind: 'createGroup'; label: string; connectionId: number }
 	| { kind: 'createTag'; label: string; groupId: number };
 
 /**
@@ -90,8 +96,7 @@ export function resolveTagTreeContextMenuAction(
 	if (data.kind === 'all') {
 		return {
 			kind: 'createConnection',
-			label: 'PLC接続を作成',
-			href: '/plc-connections'
+			label: 'PLC接続を作成'
 		};
 	}
 	if (data.kind === 'connection') {
@@ -101,8 +106,7 @@ export function resolveTagTreeContextMenuAction(
 		return {
 			kind: 'createGroup',
 			label: `${data.connection.name} 配下に収集グループを作成`,
-			connectionId: data.connection.id,
-			href: collectionGroupsHref(data.connection.id)
+			connectionId: data.connection.id
 		};
 	}
 	// data.kind === 'group'（virtual 接続配下でもタグ作成は許可する）
