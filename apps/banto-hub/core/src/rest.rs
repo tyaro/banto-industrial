@@ -4332,11 +4332,21 @@ async fn execute_pending_apply(
                 .map_err(ApiError)
                 .map_err(PendingApplyError::Api)?;
             if let BatchTagDeleteOutcome::Invalid(errors) = outcome {
+                // `tags.batch_update` 分岐（直上）と違い `.{field.field}` を
+                // 付けない: あちらの pending payload は `{ "tags": [ {
+                // "id":…, "name":… } ] }` というオブジェクトの配列なので
+                // `tags[i].<field>` が実在する JSON パスになるが、こちらの
+                // payload は `{ "ids": [1, 2, 3] }` というスカラの配列なの
+                // で、`ids[i]` 自体が対象を指し、その下に `.id` は存在しな
+                // い。実際 `delete_batch_tx` が返す行エラーの `field` は
+                // 構造上つねに `"id"`（重複・不存在の2種のみ）なので、
+                // `.{field.field}` を付けても情報は増えず実在しないパスに
+                // なるだけ。
                 let field_errors = errors
                     .into_iter()
                     .flat_map(|row| {
                         row.field_errors.into_iter().map(move |field| FieldError {
-                            field: format!("ids[{}].{}", row.index, field.field),
+                            field: format!("ids[{}]", row.index),
                             message: field.message,
                         })
                     })

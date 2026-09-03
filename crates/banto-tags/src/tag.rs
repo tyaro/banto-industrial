@@ -1714,28 +1714,28 @@ impl TagService {
         let mut row_errors: Vec<Vec<FieldError>> = vec![Vec::new(); ids.len()];
 
         // Intra-batch duplicate ids: flag every occurrence (not just the
-        // second one onward), same aggregation style as create_batch_tx's/
-        // update_batch_tx's duplicate-name checks.
-        let mut first_seen: HashMap<i64, usize> = HashMap::new();
-        let mut batch_dupe_indices: Vec<usize> = Vec::new();
-        for (index, id) in ids.iter().enumerate() {
-            match first_seen.get(id) {
-                Some(&first) => {
-                    if !batch_dupe_indices.contains(&first) {
-                        batch_dupe_indices.push(first);
-                    }
-                    batch_dupe_indices.push(index);
-                }
-                None => {
-                    first_seen.insert(*id, index);
-                }
+        // second one onward), same intent as create_batch_tx's/
+        // update_batch_tx's duplicate-name checks, but computed in O(n)
+        // instead of their O(n^2) `Vec::contains` scan - a batch has no
+        // upper size limit, and an authenticated editor sending many
+        // repeated ids would otherwise make this quadratic. First pass
+        // finds which ids repeat at all (`HashSet`); second pass flags
+        // every index whose id is in that set, which naturally visits
+        // indices in ascending order.
+        let mut seen_ids: HashSet<i64> = HashSet::new();
+        let mut dupe_ids: HashSet<i64> = HashSet::new();
+        for id in ids {
+            if !seen_ids.insert(*id) {
+                dupe_ids.insert(*id);
             }
         }
-        for index in batch_dupe_indices {
-            row_errors[index].push(FieldError {
-                field: "id".to_string(),
-                message: "リクエスト内で id が重複しています".to_string(),
-            });
+        for (index, id) in ids.iter().enumerate() {
+            if dupe_ids.contains(id) {
+                row_errors[index].push(FieldError {
+                    field: "id".to_string(),
+                    message: "リクエスト内で id が重複しています".to_string(),
+                });
+            }
         }
 
         // Existing-row check - one query for every target id, mirrors
@@ -4769,6 +4769,37 @@ mod tests {
         // All-or-nothing: neither `a` nor `b` was deleted.
         assert!(svc.get(a.id).await.is_ok());
         assert!(svc.get(b.id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_batch_tx_flags_every_occurrence_when_all_ids_are_identical() {
+        // Regression guard for the O(n) duplicate-detection rewrite: with
+        // every id in the batch the same, all occurrences (not just the
+        // second one onward, and not deduplicated to one error) must be
+        // flagged.
+        let (svc, group_id) = setup().await;
+        let a = svc.create(sample_input("DB-H", group_id)).await.unwrap();
+
+        let mut tx = svc.pool.begin().await.expect("begin tx");
+        let outcome = svc
+            .delete_batch_tx(&mut tx, &[a.id, a.id, a.id])
+            .await
+            .expect("delete_batch_tx should not error - duplicate ids are row errors");
+        match outcome {
+            BatchTagDeleteOutcome::Invalid(errors) => {
+                assert_eq!(errors.len(), 3, "{errors:?}");
+                for (expected_index, err) in errors.iter().enumerate() {
+                    assert_eq!(err.index, expected_index);
+                    assert_eq!(err.id, a.id);
+                    assert!(err.field_errors.iter().any(|e| e.field == "id"));
+                }
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        tx.rollback().await.expect("rollback");
+
+        // All-or-nothing: `a` was not deleted.
+        assert!(svc.get(a.id).await.is_ok());
     }
 
     #[tokio::test]
