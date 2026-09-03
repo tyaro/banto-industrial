@@ -88,6 +88,11 @@
 		nextConnectionName,
 		type PlcConnectionFormState
 	} from '$lib/banto/plcConnectionForm';
+	import {
+		countConnectionCascadeImpact,
+		formatConnectionDeleteConfirmMessage
+	} from '$lib/banto/registryCascadeImpact';
+	import type { CollectionGroup, Tag } from '$lib/banto/tagRegistryAdmin';
 
 	/** `pendingChangesAdmin.ts::PendingChange.source` - `rest.rs::plc_connections_create` が `queue_pending_registry_change` に渡す文字列と一致させる。 */
 	const PENDING_SOURCE = 'plc_connections.create';
@@ -98,6 +103,15 @@
 		connection: PlcConnection | null;
 		/** TAG-UX-8 の連番プリフィルに使う、既存の接続名一覧（新規作成時のみ参照）。 */
 		existingNames: string[];
+		/**
+		 * T19 S2-b（UX-38、docs/banto-hub-t19-design.md §3.4）: 削除確認
+		 * ダイアログで「消える定義の件数」を出すために必要な、ページが既に
+		 * 読み込み済みの収集グループ・タグの一覧（新規作成時は参照しない）。
+		 * `registryCascadeImpact.ts::countConnectionCascadeImpact` へそのまま
+		 * 渡す。
+		 */
+		groups: CollectionGroup[];
+		tags: Tag[];
 		/**
 		 * T18-6d（タグツリー右クリック「接続を削除」からの起動）: `true` かつ
 		 * `connection` が非 `null`（再設定モード）で Drawer を開いた直後、
@@ -134,6 +148,8 @@
 		open,
 		connection,
 		existingNames,
+		groups,
+		tags,
 		requestDelete = false,
 		readOnly = false,
 		onClose,
@@ -393,9 +409,17 @@
 		}
 	}
 
+	/**
+	 * T19 S2-b（UX-38）: 確認メッセージに「消える定義の件数」と「履歴は残る」
+	 * を明示する（実装指示「何件消えるか分からないまま削除させない」）。
+	 * バックエンドはこの接続を消すと配下の収集グループ・タグを全部まとめて
+	 * 削除する（`cascade_delete_tx` - もう拒否しない）ため、影響が見えない
+	 * と事故になる。
+	 */
 	async function handleDelete(): Promise<void> {
 		if (!connection) return;
-		if (!window.confirm(`${connection.name} を削除しますか？`)) return;
+		const impact = countConnectionCascadeImpact(connection.id, groups, tags);
+		if (!window.confirm(formatConnectionDeleteConfirmMessage(connection.name, impact))) return;
 		deleting = true;
 		try {
 			await deletePlcConnection(connection.id);

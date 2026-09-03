@@ -377,6 +377,122 @@ async fn e2e_read_via_rest_after_rebuild() {
 }
 
 // ---------------------------------------------------------------------------
+// 1a-2. T19 S2-b (UX-38, docs/banto-hub-t19-design.md §3.4「親の削除は
+//       『定義のみ・履歴は残す』」): カスケード削除しても banto-tstore の
+//       実データは無傷 - このクレートは tags/collection_groups/
+//       plc_connections の3テーブルしか触らない (banto-tags は
+//       banto-tstore に依存しない、banto-tstore の lib.rs doc comment
+//       「この crate が意図的に依存しないもの」節) ので構造的に保証される
+//       はずだが、それを実データで固定するのがこのテスト。
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_connection_with_tags_cascades_and_preserves_tstore_history() {
+    let app = test_app("cascade-history").await;
+    let sim = Simulator::start().await;
+    sim.set_holding_register(0, 777); // 40001
+
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(conn_input("line1", sim.addr.port()))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group.id, "40001", "i16"))
+        .await
+        .unwrap();
+
+    app.manager.rebuild().await.expect("rebuild after seeding");
+
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            app.manager
+                .current_values()
+                .and_then(|c| c.get("tag:1"))
+                .map(|s| s.value)
+                == Some(Some(777.0))
+        })
+        .await,
+        "collector should observe the simulator value before we delete its registry rows"
+    );
+
+    // Stop the collector so the sample is flushed to disk before we read the
+    // tstore file directly, and so the DELETE below (which requires
+    // collection to be `Stopped`) is applied immediately rather than queued.
+    app.manager.shutdown().await;
+    sim.stop();
+
+    let data_dir = app._env.data_dir();
+    let rows_before = read_single_group_rows(&data_dir).await;
+    assert!(
+        rows_before.iter().any(|r| r.values[0] == Some(777.0)),
+        "a sample should already be on disk before the delete: {rows_before:?}"
+    );
+
+    // The connection has a group and a tag - the pre-UX-38 behavior would
+    // reject this with a Validation error ("収集グループが1件あるため削除
+    // できません"). It must now succeed and remove the connection, its
+    // group, and its tag in one call.
+    let (status, _json) = write_json(
+        &app.router,
+        "DELETE",
+        &format!("/api/plc-connections/{}", conn.id),
+        &app.token,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    assert!(
+        PlcConnectionService::new(app.pool.clone())
+            .get(conn.id)
+            .await
+            .is_err(),
+        "the connection definition should be gone"
+    );
+    assert!(
+        CollectionGroupService::new(app.pool.clone())
+            .get(group.id)
+            .await
+            .is_err(),
+        "the group definition should be gone with its connection"
+    );
+
+    // The point of the test: the tstore file - a completely separate
+    // storage engine that never heard about the DELETE - still has the
+    // sample recorded before the registry rows were removed.
+    let rows_after = read_single_group_rows(&data_dir).await;
+    assert_eq!(
+        rows_after.len(),
+        rows_before.len(),
+        "cascade-deleting the registry rows must not touch tstore history"
+    );
+    assert!(
+        rows_after.iter().any(|r| r.values[0] == Some(777.0)),
+        "the recorded sample must survive the cascade delete: {rows_after:?}"
+    );
+}
+
+/// Read every row of the (single) collection group's data file in
+/// `data_dir`, the same way `crates/banto-collect/tests/integration.rs`'s
+/// helper of the same name does.
+async fn read_single_group_rows(data_dir: &std::path::Path) -> Vec<banto_tstore::Sample> {
+    let files = banto_tstore::list_data_files(data_dir).expect("list files");
+    assert_eq!(files.len(), 1, "expected exactly one data file");
+    let reader = banto_tstore::TsReader::open(&files[0].path)
+        .await
+        .expect("open reader");
+    let group_key = reader.groups()[0].key.clone();
+    reader
+        .read_range(&group_key, 0, i64::MAX)
+        .await
+        .expect("read range")
+}
+
+// ---------------------------------------------------------------------------
 // 1b. E2E 読み取り (SLMP, I8): シミュレータ -> レジストリ -> rebuild ->
 //     /api/v1/values/{tag} - the SLMP twin of `e2e_read_via_rest_after_rebuild`,
 //     proving banto-collect's SLMP wiring reaches all the way through the hub.

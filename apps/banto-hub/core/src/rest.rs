@@ -2799,10 +2799,21 @@ async fn plc_connections_delete(
         .begin()
         .await
         .map_err(storage_api_error)?;
-    if let Err(err) = state.plc_connections.delete_tx(&mut tx, id).await {
-        let _ = tx.rollback().await;
-        return Err(ApiError(err).into());
-    }
+    // T19 S2-b（UX-38、docs/banto-hub-t19-design.md §3.4・§7.5、2026-09-02
+    // オーナー決定）: 「タグがあってもグループ・接続を削除可。定義のみ削除
+    // し、履歴は残す」- `delete_tx`（子が居れば拒否）ではなく
+    // `cascade_delete_tx`（配下のグループ・タグごと1トランザクションで削除、
+    // `banto_tags::plc_connection::PlcConnectionService::cascade_delete_tx`
+    // の doc comment参照）を使う。`banto-tstore` の履歴データはこのクレート
+    // が触らない別ストレージなので無傷のまま残る。予約接続（calc/mem）は
+    // このカスケード経路でも従来どおり削除できない。
+    let cascade = match state.plc_connections.cascade_delete_tx(&mut tx, id).await {
+        Ok(cascade) => cascade,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(ApiError(err).into());
+        }
+    };
     let snapshot = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
@@ -2819,7 +2830,12 @@ async fn plc_connections_delete(
         "delete",
         "plc_connections",
         &id.to_string(),
-        None,
+        Some(json!({
+            "cascade": {
+                "deletedGroups": cascade.deleted_groups,
+                "deletedTags": cascade.deleted_tags,
+            },
+        })),
     )
     .await;
     commit_catalog_and_notify(
@@ -3460,10 +3476,17 @@ async fn collection_groups_delete(
         .begin()
         .await
         .map_err(storage_api_error)?;
-    if let Err(err) = state.collection_groups.delete_tx(&mut tx, id).await {
-        let _ = tx.rollback().await;
-        return Err(ApiError(err).into());
-    }
+    // T19 S2-b（UX-38）: `plc_connections_delete` と同じ理由・同じ形で
+    // `cascade_delete_tx` を使う（属するタグごと1トランザクションで削除、
+    // `banto_tags::collection_group::CollectionGroupService::cascade_delete_tx`
+    // の doc comment参照）。
+    let cascade = match state.collection_groups.cascade_delete_tx(&mut tx, id).await {
+        Ok(cascade) => cascade,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(ApiError(err).into());
+        }
+    };
     let snapshot = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
@@ -3480,7 +3503,9 @@ async fn collection_groups_delete(
         "delete",
         "collection_groups",
         &id.to_string(),
-        None,
+        Some(json!({
+            "cascade": { "deletedTags": cascade.deleted_tags },
+        })),
     )
     .await;
     commit_catalog_and_notify(
@@ -4119,9 +4144,13 @@ async fn execute_pending_apply(
                 )
                 .await?;
             }
+            // T19 S2-b（UX-38）: `plc_connections_delete`（即時削除の REST
+            // ハンドラ）と同じく `cascade_delete_tx` を使う - 収集稼働中に
+            // キューされ、後で（停止後に）適用される削除も同じ「子ごと削除」
+            // 仕様に揃える。
             state
                 .plc_connections
-                .delete_tx(&mut tx, body.id)
+                .cascade_delete_tx(&mut tx, body.id)
                 .await
                 .map_err(ApiError)
                 .map_err(PendingApplyError::Api)?;
@@ -4167,9 +4196,11 @@ async fn execute_pending_apply(
                 )
                 .await?;
             }
+            // T19 S2-b（UX-38）: `plc_connections.delete`分岐と同じ理由で
+            // `cascade_delete_tx` を使う。
             state
                 .collection_groups
-                .delete_tx(&mut tx, body.id)
+                .cascade_delete_tx(&mut tx, body.id)
                 .await
                 .map_err(ApiError)
                 .map_err(PendingApplyError::Api)?;
@@ -8514,6 +8545,33 @@ mod tests {
         (status, json)
     }
 
+    /// `admin_post` の `DELETE` 版 - T19 S2-b（UX-38）のカスケード削除
+    /// テストがまとめて必要とするため追加。
+    async fn admin_delete(
+        router: &Router,
+        path: &str,
+        token: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                HttpRequest::delete(path)
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
     /// 認証ヘッダ付きで `/api/v1/*` に `GET` する小さなヘルパ。`/api/v1/*`
     /// は CSRF 対象外なので `X-Banto-Client` は付けない
     /// （`v1_tags_requires_auth_but_not_the_csrf_header` 参照）。
@@ -9874,6 +9932,324 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(updated.name, "line-fp-ok-renamed");
+    }
+
+    // --- T19 S2-b (UX-38, docs/banto-hub-t19-design.md §3.4/§7.5,
+    // 2026-09-02 オーナー決定「タグがあってもグループ・接続を削除可。定義の
+    // み削除し、履歴は残す」) --------------------------------------------
+
+    /// REST 経由の主張: `DELETE /api/plc-connections/{id}` は、配下に収集
+    /// グループ・タグがあっても拒否せず、まとめて削除する
+    /// （収集停止中は即時 - `plc_connections_delete` が
+    /// `cascade_delete_tx` を呼ぶ経路）。
+    #[tokio::test]
+    async fn plc_connections_delete_cascades_when_it_has_groups_and_tags() {
+        let env = test_env().await;
+
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line-cascade", "host": "127.0.0.1", "port": 15060 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+        let conn_id = conn["id"].as_i64().unwrap();
+
+        let (status, group) = admin_post(
+            &env.router,
+            "/api/collection-groups",
+            &env.admin_token,
+            json!({ "name": "g-cascade", "plcConnectionId": conn_id, "periodMs": 1000 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{group:?}");
+        let group_id = group["id"].as_i64().unwrap();
+
+        let (status, tag) = admin_post(
+            &env.router,
+            "/api/tags",
+            &env.admin_token,
+            json!({
+                "name": "t-cascade",
+                "collectionGroupId": group_id,
+                "address": "40001",
+                "dataType": "i16"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{tag:?}");
+        let tag_id = tag["id"].as_i64().unwrap();
+
+        // 削除前: 拒否ではなく成功する（旧仕様なら 422 Validation だった）。
+        let (status, _body) = admin_delete(
+            &env.router,
+            &format!("/api/plc-connections/{conn_id}"),
+            &env.admin_token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        assert!(matches!(
+            PlcConnectionService::new(env.pool.clone())
+                .get(conn_id)
+                .await
+                .unwrap_err(),
+            BantoError::NotFound { .. }
+        ));
+        assert!(matches!(
+            CollectionGroupService::new(env.pool.clone())
+                .get(group_id)
+                .await
+                .unwrap_err(),
+            BantoError::NotFound { .. }
+        ));
+        assert!(matches!(
+            TagService::new(env.pool.clone())
+                .get(tag_id)
+                .await
+                .unwrap_err(),
+            BantoError::NotFound { .. }
+        ));
+    }
+
+    /// `DELETE /api/collection-groups/{id}` の同じ主張: タグがあっても
+    /// 拒否せず、まとめて削除する。
+    #[tokio::test]
+    async fn collection_groups_delete_cascades_when_it_has_tags() {
+        let env = test_env().await;
+
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line-cascade-2", "host": "127.0.0.1", "port": 15061 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+        let conn_id = conn["id"].as_i64().unwrap();
+
+        let (status, group) = admin_post(
+            &env.router,
+            "/api/collection-groups",
+            &env.admin_token,
+            json!({ "name": "g-cascade-2", "plcConnectionId": conn_id, "periodMs": 1000 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{group:?}");
+        let group_id = group["id"].as_i64().unwrap();
+
+        let (status, tag) = admin_post(
+            &env.router,
+            "/api/tags",
+            &env.admin_token,
+            json!({
+                "name": "t-cascade-2",
+                "collectionGroupId": group_id,
+                "address": "40001",
+                "dataType": "i16"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{tag:?}");
+        let tag_id = tag["id"].as_i64().unwrap();
+
+        let (status, _body) = admin_delete(
+            &env.router,
+            &format!("/api/collection-groups/{group_id}"),
+            &env.admin_token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        assert!(matches!(
+            CollectionGroupService::new(env.pool.clone())
+                .get(group_id)
+                .await
+                .unwrap_err(),
+            BantoError::NotFound { .. }
+        ));
+        assert!(matches!(
+            TagService::new(env.pool.clone())
+                .get(tag_id)
+                .await
+                .unwrap_err(),
+            BantoError::NotFound { .. }
+        ));
+        // The connection itself is untouched by a group-level delete.
+        PlcConnectionService::new(env.pool.clone())
+            .get(conn_id)
+            .await
+            .expect("the connection must survive a group delete");
+    }
+
+    /// UX-38 の対象外: 予約接続（calc/mem）はカスケード経路でも削除できない
+    /// （§7.5「virtual 接続（calc/mem）の削除・編集禁止はそのまま維持
+    /// する」）。
+    #[tokio::test]
+    async fn plc_connections_delete_still_refuses_a_virtual_connection() {
+        let env = test_env().await;
+        let calc = PlcConnectionService::new(env.pool.clone())
+            .create(banto_tags::PlcConnectionInput {
+                name: banto_tags::CALC_CONNECTION_NAME.to_string(),
+                protocol: banto_tags::VIRTUAL_PROTOCOL.to_string(),
+                host: String::new(),
+                port: 0,
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+                word_order: "low_high".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let (status, body) = admin_delete(
+            &env.router,
+            &format!("/api/plc-connections/{}", calc.id),
+            &env.admin_token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+
+        PlcConnectionService::new(env.pool.clone())
+            .get(calc.id)
+            .await
+            .expect("calc should survive");
+    }
+
+    /// キューされた削除（収集稼働中に 202 で保留し、停止後に適用）も同じ
+    /// カスケード仕様に揃っている - `execute_pending_apply` の
+    /// `"plc_connections.delete"` 分岐が `cascade_delete_tx` を呼ぶことの
+    /// 回帰テスト（この分岐を旧 `delete_tx` のまま直し忘れると、即時削除
+    /// (`plc_connections_delete`) は成功するのにキュー適用だけこの
+    /// バリデーションで失敗する、という非対称なバグになる）。
+    #[tokio::test]
+    async fn pending_apply_plc_connection_delete_cascades_when_it_has_groups_and_tags() {
+        let env = test_env().await;
+
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line-cascade-pending", "host": "127.0.0.1", "port": 15062 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+        let conn_id = conn["id"].as_i64().unwrap();
+
+        let (status, group) = admin_post(
+            &env.router,
+            "/api/collection-groups",
+            &env.admin_token,
+            json!({ "name": "g-cascade-pending", "plcConnectionId": conn_id, "periodMs": 1000 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{group:?}");
+        let group_id = group["id"].as_i64().unwrap();
+
+        let (status, tag) = admin_post(
+            &env.router,
+            "/api/tags",
+            &env.admin_token,
+            json!({
+                "name": "t-cascade-pending",
+                "collectionGroupId": group_id,
+                "address": "40001",
+                "dataType": "i16"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{tag:?}");
+        let tag_id = tag["id"].as_i64().unwrap();
+
+        let start = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/start")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        // While running, the delete is only queued (202) - not yet applied.
+        let queued = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::delete(format!("/api/plc-connections/{conn_id}"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(queued.status(), StatusCode::ACCEPTED);
+        let queued_bytes = axum::body::to_bytes(queued.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let queued_body: serde_json::Value = serde_json::from_slice(&queued_bytes).unwrap();
+        let pending_id = queued_body["pending"]["id"].as_i64().unwrap();
+
+        let stop = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/stop")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop.status(), StatusCode::OK);
+
+        let apply = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{pending_id}/apply"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(apply.status(), StatusCode::OK);
+        let apply_bytes = axum::body::to_bytes(apply.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let apply_body: serde_json::Value = serde_json::from_slice(&apply_bytes).unwrap();
+        assert_eq!(apply_body["state"], "applied");
+
+        assert!(matches!(
+            PlcConnectionService::new(env.pool.clone())
+                .get(conn_id)
+                .await
+                .unwrap_err(),
+            BantoError::NotFound { .. }
+        ));
+        assert!(matches!(
+            CollectionGroupService::new(env.pool.clone())
+                .get(group_id)
+                .await
+                .unwrap_err(),
+            BantoError::NotFound { .. }
+        ));
+        assert!(matches!(
+            TagService::new(env.pool.clone())
+                .get(tag_id)
+                .await
+                .unwrap_err(),
+            BantoError::NotFound { .. }
+        ));
     }
 
     /// 実機で再現した不具合の修正2（2026-08-31 オーナー報告）: pending change

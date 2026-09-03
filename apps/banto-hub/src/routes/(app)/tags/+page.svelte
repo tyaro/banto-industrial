@@ -3946,6 +3946,8 @@
 	open={connectionDrawerOpen}
 	connection={connectionDrawerTarget}
 	existingNames={connections.map((c) => c.name)}
+	{groups}
+	{tags}
 	requestDelete={connectionDrawerRequestDelete}
 	readOnly={connectionDrawerReadOnly}
 	onClose={closeConnectionDrawer}
@@ -3958,6 +3960,7 @@
 	group={groupDrawerTarget}
 	existingNames={groups.map((g) => g.name)}
 	{connections}
+	{tags}
 	presetPlcConnectionId={groupDrawerPresetConnectionId}
 	requestDelete={groupDrawerRequestDelete}
 	readOnly={groupDrawerReadOnly}

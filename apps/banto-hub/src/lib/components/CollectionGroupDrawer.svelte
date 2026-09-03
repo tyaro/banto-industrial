@@ -73,7 +73,8 @@
 		updateCollectionGroup,
 		ALLOWED_PERIOD_MS,
 		type CollectionGroup,
-		type PlcConnection
+		type PlcConnection,
+		type Tag
 	} from '$lib/banto/tagRegistryAdmin';
 	import {
 		blankGroupForm,
@@ -83,6 +84,10 @@
 		nextGroupName,
 		type CollectionGroupFormState
 	} from '$lib/banto/collectionGroupForm';
+	import {
+		countGroupCascadeImpact,
+		formatGroupDeleteConfirmMessage
+	} from '$lib/banto/registryCascadeImpact';
 
 	/** `pendingChangesAdmin.ts::PendingChange.source` - `rest.rs::collection_groups_create` が `queue_pending_registry_change` に渡す文字列と一致させる。 */
 	const PENDING_SOURCE = 'collection_groups.create';
@@ -95,6 +100,13 @@
 		existingNames: string[];
 		/** PLC接続の選択肢（新規作成・再設定共通、一覧ページから取得済みのものを渡す）。 */
 		connections: PlcConnection[];
+		/**
+		 * T19 S2-b（UX-38、docs/banto-hub-t19-design.md §3.4）: 削除確認
+		 * ダイアログで「消えるタグの件数」を出すために必要な、ページが既に
+		 * 読み込み済みのタグ一覧（新規作成時は参照しない）。
+		 * `registryCascadeImpact.ts::countGroupCascadeImpact` へそのまま渡す。
+		 */
+		tags: Tag[];
 		/**
 		 * 新規作成フォームを開いたときに所属PLC接続としてプリセットする ID
 		 * （実装指示4「Drawer を開いた文脈を尊重する」- T18-6d でツリーの接続
@@ -135,6 +147,7 @@
 		group,
 		existingNames,
 		connections,
+		tags,
 		presetPlcConnectionId = null,
 		requestDelete = false,
 		readOnly = false,
@@ -334,9 +347,15 @@
 		}
 	}
 
+	/**
+	 * T19 S2-b（UX-38）: `ConnectionDrawer.svelte::handleDelete` と同じ理由で
+	 * 確認メッセージに件数と履歴保持を明示する - このグループを消すと属する
+	 * タグも全部まとめて削除される（`cascade_delete_tx` - もう拒否しない）。
+	 */
 	async function handleDelete(): Promise<void> {
 		if (!group) return;
-		if (!window.confirm(`${group.name} を削除しますか？`)) return;
+		const impact = countGroupCascadeImpact(group.id, tags);
+		if (!window.confirm(formatGroupDeleteConfirmMessage(group.name, impact))) return;
 		deleting = true;
 		try {
 			await deleteCollectionGroup(group.id);

@@ -369,6 +369,65 @@ impl CollectionGroupService {
         }
         Ok(())
     }
+
+    /// T19 S2-b（UX-38、docs/banto-hub-t19-design.md §3.4・§7.5）: カスケード
+    /// 削除の入口 - [`crate::plc_connection::PlcConnectionService::cascade_delete_tx`]
+    /// の doc comment がここでの設計判断（[`Self::delete`]/[`Self::delete_tx`]
+    /// は変更せず新メソッドを足す理由 - relay-wright との契約）をそのまま
+    /// 説明しているので、そちらを参照。このグループに属する全タグ →
+    /// このグループ、の順（FK 順）で削除する。tstore の履歴には触れない
+    /// （同じ理由 - このクレートは banto-tstore に依存しない）。
+    pub async fn cascade_delete_tx(
+        &self,
+        connection: &mut SqliteConnection,
+        id: i64,
+    ) -> Result<CollectionGroupCascadeOutcome, BantoError> {
+        let deleted_tags = sqlx::query("DELETE FROM tags WHERE collection_group_id = ?")
+            .bind(id)
+            .execute(&mut *connection)
+            .await
+            .map_err(banto_storage::storage_error)?
+            .rows_affected() as i64;
+
+        let result = sqlx::query("DELETE FROM collection_groups WHERE id = ?")
+            .bind(id)
+            .execute(&mut *connection)
+            .await
+            .map_err(banto_storage::storage_error)?;
+        if result.rows_affected() == 0 {
+            return Err(BantoError::NotFound {
+                resource: RESOURCE.to_string(),
+                id: id.to_string(),
+            });
+        }
+
+        Ok(CollectionGroupCascadeOutcome { deleted_tags })
+    }
+
+    /// Non-transactional counterpart of [`Self::cascade_delete_tx`] - opens
+    /// its own transaction so both DELETEs stay atomic (mirrors
+    /// [`crate::plc_connection::PlcConnectionService::cascade_delete`]).
+    pub async fn cascade_delete(
+        &self,
+        id: i64,
+    ) -> Result<CollectionGroupCascadeOutcome, BantoError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(banto_storage::storage_error)?;
+        let outcome = self.cascade_delete_tx(&mut tx, id).await?;
+        tx.commit().await.map_err(banto_storage::storage_error)?;
+        Ok(outcome)
+    }
+}
+
+/// What [`CollectionGroupService::cascade_delete`]/[`CollectionGroupService::cascade_delete_tx`]
+/// removed besides the group row itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionGroupCascadeOutcome {
+    pub deleted_tags: i64,
 }
 
 #[cfg(test)]
@@ -614,6 +673,100 @@ mod tests {
             other => panic!("expected Validation, got {other:?}"),
         }
         svc.get(group.id).await.expect("group should survive");
+    }
+
+    // --- T19 S2-b (UX-38, docs/banto-hub-t19-design.md §3.4/§7.5): cascade
+    // delete - a NEW method, `delete`/`delete_tx` above are unchanged (see
+    // `CollectionGroupService::cascade_delete_tx`'s doc comment, which points
+    // at `PlcConnectionService::cascade_delete_tx`'s longer explanation of
+    // why: relay-wright depends on the guarded methods refusing).
+
+    /// The core UX-38 behavior for a group: tags go with it in one call.
+    #[tokio::test]
+    async fn cascade_delete_removes_tags_with_the_group() {
+        let (_plc_svc, svc, conn_id) = setup().await;
+        let group = svc.create(sample_input("InUse", conn_id)).await.unwrap();
+        for name in ["T1", "T2"] {
+            sqlx::query(
+                "INSERT INTO tags (name, collection_group_id, address, data_type) \
+                 VALUES (?, ?, '40001', 'i16')",
+            )
+            .bind(name)
+            .bind(group.id)
+            .execute(&svc.pool)
+            .await
+            .unwrap();
+        }
+
+        let outcome = svc
+            .cascade_delete(group.id)
+            .await
+            .expect("cascade_delete should succeed even with tags");
+        assert_eq!(outcome.deleted_tags, 2);
+
+        assert!(matches!(
+            svc.get(group.id).await.unwrap_err(),
+            BantoError::NotFound { .. }
+        ));
+        let remaining_tags: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags")
+            .fetch_one(&svc.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining_tags, 0);
+    }
+
+    /// A childless group behaves exactly like the old `delete`.
+    #[tokio::test]
+    async fn cascade_delete_with_no_tags_behaves_like_a_plain_delete() {
+        let (_plc_svc, svc, conn_id) = setup().await;
+        let group = svc.create(sample_input("Lonely", conn_id)).await.unwrap();
+        let outcome = svc.cascade_delete(group.id).await.unwrap();
+        assert_eq!(outcome.deleted_tags, 0);
+        assert!(matches!(
+            svc.get(group.id).await.unwrap_err(),
+            BantoError::NotFound { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn cascade_delete_missing_id_is_not_found() {
+        let (_plc_svc, svc, _conn_id) = setup().await;
+        let err = svc.cascade_delete(999).await.unwrap_err();
+        assert!(matches!(err, BantoError::NotFound { .. }));
+    }
+
+    /// Same atomicity contract as
+    /// `plc_connection::tests::cascade_delete_tx_rolls_back_together_with_the_callers_transaction`:
+    /// `cascade_delete_tx` must not commit anything by itself, so a caller
+    /// (`apps/banto-hub/core/src/rest.rs::collection_groups_delete`) that
+    /// rolls its own transaction back after a failed preflight leaves both
+    /// the group and its tags untouched.
+    #[tokio::test]
+    async fn cascade_delete_tx_rolls_back_together_with_the_callers_transaction() {
+        let (_plc_svc, svc, conn_id) = setup().await;
+        let group = svc.create(sample_input("Rollback", conn_id)).await.unwrap();
+        sqlx::query(
+            "INSERT INTO tags (name, collection_group_id, address, data_type) \
+             VALUES ('T1', ?, '40001', 'i16')",
+        )
+        .bind(group.id)
+        .execute(&svc.pool)
+        .await
+        .unwrap();
+
+        let mut tx = svc.pool.begin().await.unwrap();
+        let outcome = svc.cascade_delete_tx(&mut tx, group.id).await.unwrap();
+        assert_eq!(outcome.deleted_tags, 1);
+        tx.rollback().await.unwrap();
+
+        svc.get(group.id)
+            .await
+            .expect("group should survive the rollback");
+        let remaining_tags: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags")
+            .fetch_one(&svc.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining_tags, 1);
     }
 
     #[tokio::test]

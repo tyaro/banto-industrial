@@ -36,11 +36,12 @@ pub mod tag;
 mod support;
 
 pub use collection_group::{
-    CollectionGroup, CollectionGroupInput, CollectionGroupService, ALLOWED_PERIOD_MS,
+    CollectionGroup, CollectionGroupCascadeOutcome, CollectionGroupInput, CollectionGroupService,
+    ALLOWED_PERIOD_MS,
 };
 pub use plc_connection::{
-    PlcConnection, PlcConnectionInput, PlcConnectionService, ALLOWED_PROTOCOLS,
-    CALC_CONNECTION_NAME, MEM_CONNECTION_NAME, VIRTUAL_PROTOCOL,
+    PlcConnection, PlcConnectionCascadeOutcome, PlcConnectionInput, PlcConnectionService,
+    ALLOWED_PROTOCOLS, CALC_CONNECTION_NAME, MEM_CONNECTION_NAME, VIRTUAL_PROTOCOL,
 };
 pub use scaling::{scale_raw, unscale, Scaling};
 pub use tag::{
