@@ -40,7 +40,14 @@ import { CSRF_HEADER } from './setup';
 export interface ConnectionStatusEntry {
 	name: string;
 	id: number;
-	status: 'connected' | 'reconnecting' | 'stopped';
+	/**
+	 * T19 S2-a（UX-48、2026-09-03）: `unused` は「有効な収集グループが
+	 * 1つも無い接続」（=収集側もセッションを張らない）を表す。`stopped`
+	 * （無効化・未同期・実際に切れている等）とは意図的に区別する - 見た目
+	 * が同じだと「壊れている」と誤解される（`docs/banto-hub-t19-design.md`
+	 * §3.8）。
+	 */
+	status: 'connected' | 'reconnecting' | 'stopped' | 'unused';
 	attempt: number | null;
 }
 

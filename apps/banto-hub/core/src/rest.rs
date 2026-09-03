@@ -57,7 +57,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use banto_broker::{is_supported_protocol, BrokerConnectionStatus, BrokerError};
-use banto_collect::{build_config_from, ApplyReport, ConnectionStatus, RegistrySnapshot};
+use banto_collect::{
+    build_config_from, connections_with_collected_groups, ApplyReport, ConnectionStatus,
+    RegistrySnapshot,
+};
 use banto_core::{BantoError, ErrorBody, FieldError, ListParams, ListResult};
 // T12 (docs/ux-plan.md §4): 保存前の接続テスト API 用。Modbus/SLMP 両方の
 // 直接ダイヤル経路が同じ型を使うので、ここで一括 import する
@@ -5551,6 +5554,14 @@ struct StatusResponse {
 /// that registered set) still falls back to reading from
 /// `banto_collect::Collector::status` - unaffected by #131, since it was
 /// never broker-routed to begin with.
+///
+/// **T19 S2-a (UX-48, 2026-09-03)**: an enabled, broker-managed connection
+/// with zero enabled collection groups reports `"unused"` here instead of
+/// falling through to `broker_status` (which would read `None`/`Stopped`
+/// indistinguishably from a disabled connection) - see
+/// `crate::hub::CollectorManager::sync_slmp_sessions_from`'s doc comment for
+/// why such a connection has no broker session to report on in the first
+/// place.
 async fn compute_status(state: &TagSpaceState) -> Result<StatusResponse, ApiError> {
     let runtime = state.controller.status();
     let revision = state.manager.configured_revision();
@@ -5561,6 +5572,19 @@ async fn compute_status(state: &TagSpaceState) -> Result<StatusResponse, ApiErro
         .list(ListParams::default())
         .await?
         .rows;
+    // T19 S2-a (UX-48): same predicate the session sync
+    // (`CollectorManager::sync_slmp_sessions_from`) and the collector itself
+    // (`banto_collect::build_config_from`) use to decide "does this
+    // connection have anything to collect" - reused here so the status
+    // screen can tell a genuinely-unused connection ("unused" below) apart
+    // from one that is enabled, has tags, and simply isn't connecting
+    // ("stopped"/"reconnecting").
+    let collectible_connection_ids = connections_with_collected_groups(
+        &CollectionGroupService::new(state.manager.pool())
+            .list(ListParams::default())
+            .await?
+            .rows,
+    );
     let mqtt_settings = SettingsService::new(state.manager.pool())
         .mqtt_config()
         .await?;
@@ -5572,16 +5596,29 @@ async fn compute_status(state: &TagSpaceState) -> Result<StatusResponse, ApiErro
         .into_iter()
         .map(|conn| {
             let (status_str, attempt) = if is_supported_protocol(&conn.protocol) {
-                match state.manager.broker_status(conn.id) {
-                    Some(BrokerConnectionStatus::Connected) => ("connected", None),
-                    Some(BrokerConnectionStatus::Reconnecting { attempt }) => {
-                        ("reconnecting", Some(attempt))
+                // T19 S2-a (UX-48): a connection with no enabled collection
+                // group gets no broker session pre-synced at all (see
+                // `CollectorManager::sync_slmp_sessions_from`'s doc comment),
+                // so `broker_status` would otherwise round it down to
+                // "stopped" indistinguishably from a disabled or genuinely
+                // failing connection. Surface it as its own "unused" status
+                // instead - a disabled connection still reports "stopped"
+                // (checked first: `conn.enabled` gates this branch), so the
+                // two stay visually distinct.
+                if conn.enabled && !collectible_connection_ids.contains(&conn.id) {
+                    ("unused", None)
+                } else {
+                    match state.manager.broker_status(conn.id) {
+                        Some(BrokerConnectionStatus::Connected) => ("connected", None),
+                        Some(BrokerConnectionStatus::Reconnecting { attempt }) => {
+                            ("reconnecting", Some(attempt))
+                        }
+                        // "stopped" also covers "no broker session yet" (no
+                        // rebuild has run, or this connection is currently
+                        // disabled) - same rounding banto_collect's own
+                        // ConnectionStatus branch below uses.
+                        Some(BrokerConnectionStatus::Stopped) | None => ("stopped", None),
                     }
-                    // "stopped" also covers "no broker session yet" (no
-                    // rebuild has run, or this connection is currently
-                    // disabled) - same rounding banto_collect's own
-                    // ConnectionStatus branch below uses.
-                    Some(BrokerConnectionStatus::Stopped) | None => ("stopped", None),
                 }
             } else {
                 let key = format!("conn:{}", conn.id);
@@ -7666,6 +7703,59 @@ mod tests {
         assert_eq!(json["revision"], 1);
         assert!(json["last_config_error"].is_null());
         assert_eq!(json["connections"].as_array().unwrap().len(), 1);
+        // T19 S2-a (UX-48): a connection with zero collection groups (this
+        // one - it was created with no group at all) reports "unused", not
+        // "stopped"/"reconnecting" - it never gets a broker session synced
+        // in the first place (`CollectorManager::sync_slmp_sessions_from`'s
+        // doc comment), so lumping it in with "stopped" would read as
+        // broken rather than simply not set up yet.
+        assert_eq!(json["connections"][0]["status"], "unused");
+    }
+
+    /// T19 S2-a (UX-48): the flip side of the assertion added to
+    /// `tags_create_via_admin_router_rebuilds_the_catalog` above - once a
+    /// connection has an enabled group and tag, its status is no longer
+    /// "unused" even before any explicit rebuild/run has synced a broker
+    /// session for it (it falls back to the pre-existing "stopped" rounding
+    /// documented on `compute_status`, not the new "unused" bucket).
+    #[tokio::test]
+    async fn a_connection_with_a_tag_is_never_reported_unused() {
+        let (router, token, _dir) = router_with_token().await;
+
+        let (status, conn) = admin_post(
+            &router,
+            "/api/plc-connections",
+            &token,
+            json!({ "name": "line1", "host": "127.0.0.1", "port": 15023 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+        let (status, group) = admin_post(
+            &router,
+            "/api/collection-groups",
+            &token,
+            json!({ "name": "g1", "plcConnectionId": conn["id"], "periodMs": 1000 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{group:?}");
+        let (status, tag) = admin_post(
+            &router,
+            "/api/tags",
+            &token,
+            json!({
+                "name": "t1",
+                "collectionGroupId": group["id"],
+                "address": "40001",
+                "dataType": "i16",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{tag:?}");
+
+        let (status, status_body) = v1_get(&router, &token, "/api/v1/status").await;
+        assert_eq!(status, StatusCode::OK, "{status_body:?}");
+        assert_eq!(status_body["connections"].as_array().unwrap().len(), 1);
+        assert_ne!(status_body["connections"][0]["status"], "unused");
     }
 
     // --- T0-2: API キー基盤 ------------------------------------------------
