@@ -15,7 +15,7 @@
  * `cascade_delete_tx` が数える）であり、ここでの計算がずれても実際に消える
  * 件数自体には影響しない（確認文言だけの話）。
  */
-import type { CollectionGroup, PlcConnection, Tag } from './tagRegistryAdmin';
+import type { CollectionGroup, Tag } from './tagRegistryAdmin';
 
 /** 接続を削除したときに一緒に消える定義の件数。 */
 export interface ConnectionCascadeImpact {

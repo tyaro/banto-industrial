@@ -9,22 +9,7 @@ import {
 	formatConnectionDeleteConfirmMessage,
 	formatGroupDeleteConfirmMessage
 } from './registryCascadeImpact';
-import type { CollectionGroup, PlcConnection, Tag } from './tagRegistryAdmin';
-
-function makeConnection(overrides: Partial<PlcConnection>): PlcConnection {
-	return {
-		id: 1,
-		name: 'line1',
-		protocol: 'modbus-tcp',
-		host: '127.0.0.1',
-		port: 502,
-		unitId: 1,
-		enabled: true,
-		simulation: true,
-		wordOrder: 'low_high',
-		...overrides
-	};
-}
+import type { CollectionGroup, Tag } from './tagRegistryAdmin';
 
 function makeGroup(overrides: Partial<CollectionGroup>): CollectionGroup {
 	return {
