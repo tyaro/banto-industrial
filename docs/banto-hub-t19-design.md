@@ -101,7 +101,15 @@ MCP からの書き込みも `POST /api/v1/values/{tag}` と同じ経路を通�
 
 **設定（`enabled` の既定 OFF 等）を増やす案は採らない。** 利用者が理解して使い分けねばならない設定が増えるのは UX の後退であり、そもそも**アプリ側で判断できる**（2026-09-02 オーナー判断）。
 
-**機能は失われない。** 書き込み要求が来た時点で `ensure_connection` が**その場でセッションを張る**（`broker_glue.rs:308`「spawning its broker task on first sight」）。事前同期は最適化にすぎない。
+**当初この節には「書き込み要求時に `ensure_connection` がその場でセッションを張るので機能は失われない」と書いていたが、これは誤りだった**（2026-09-03 訂正）。T15-4 以降、書き込み経路は `write_broker_handle_peek`（生成しない覗き見）だけを使い、セッションが無ければ `WriteRejection::WriteFailed` で fail closed する（`write_path.rs:587`）。
+
+**実際の挙動**: セッションは **`rebuild()` 時**（収集の開始・再起動）と、**カタログ変更時（稼働中のみ、S2-a 案B）**に同期される。
+
+**カタログ変更時の同期は、現時点では REST から到達しない防御である**（2026-09-03 確認）。レジストリの編集は稼働中だと 202 で保留され（`require_collection_stopped` / `queue_pending_registry_change`）、**pending の適用は `Stopped` を要求する**（`rest.rs:4062`）。したがってカタログを変える経路はすべて停止を経由し、次の開始時の `rebuild()` でセッションが同期される。「タグを足したのに書けない」状態には**到達しない**。
+
+それでも実装したのは、**述語の根拠がカタログにある以上、カタログが変わった時点で評価し直すのが振る舞いとして正しい**ためである（2026-09-03 オーナー判断）。`legacy_live_reconfigure` が有効な環境や、将来 稼働中編集を許す変更が入った場合にも破綻しない。
+
+**同期は `CollectionController` の `transition` ロック（`try_lock`）で start/stop と直列化し、`Running` のときだけ行う。** これは T15-4 が塞いだ危険（**止めたはずの PLC へダイヤルしてしまう**）を別経路で再現しないための措置である。`CollectorManager::stop()` は `rebuild_lock` を取らないため、`commit_catalog` 側の排他だけでは防げない。
 
 **UI 上の帰結**: タグの無い接続は状態画面で `connected` / `reconnecting` を示さなくなる。「未使用」に相当する表示を与えるかは実装時に決める。
 
