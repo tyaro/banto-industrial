@@ -159,19 +159,32 @@ UX-30 と同じ理屈である。同じ情報を複数画面が持つと、利�
 新しい削除経路は追加していない。状態画面には新しいステータス `unused`（`connections[].status`）を
 追加し、無効化された `stopped` とは区別して表示する。
 
-**実装時に判明した重要な前提の誤り**: 本節の元の記述は「書き込み要求時には `ensure_connection` が
-その場でセッションを張る」としていたが、これは T15-4（`crate::write_path`）以降は誤り -
-書き込み経路は `CollectorManager::write_broker_handle_peek`（非スポーンの覗き見、セッションが
-無ければ `WriteRejection::WriteFailed` で fail closed）だけを使い、`ensure_connection` ベースの
-`write_broker_handle` は現状どこからも呼ばれていない（T15-4 が意図的にそうした - 収集停止との
-競合で実機へ意図しないセッションを張るレースを防ぐため）。したがって **タグの無い接続にタグを
-追加しても、次の rebuild/apply_run（実務的には収集の再起動）までは、その新しいタグへの書き込みが
-fail closed になる** - 「状態表示が遅れるだけ」ではなく実際の書き込みギャップである。この制約は
-本スライス以前から「登録内容の保存だけでは稼働中の収集へ即時反映されない」（`crate::rest` の
-`commit_catalog_and_notify` 参照、`legacy_live_reconfigure` は本番では無効）という既存の制約の
-延長線上にあり、新しい設定を増やさずに解決する手段は見当たらなかったため、今回は対応せず
-テストで挙動を固定し、運用上の注意点として明記するにとどめた
-（`apps/banto-hub/core/src/hub.rs` の `sync_slmp_sessions_from` doc comment 参照）。
+**実装時に判明した重要な前提の誤り（本節の元の記述で私が書いた誤り）**: 「書き込み要求が来た時点で
+`ensure_connection` がその場でセッションを張る」という記述は T15-4（`crate::write_path`）以降は誤り
+だった。事実は逆で、書き込み経路は `CollectorManager::write_broker_handle_peek`（非スポーンの覗き見、
+セッションが無ければ `WriteRejection::WriteFailed` で fail closed）だけを使い、`ensure_connection`
+ベースの `write_broker_handle` は現状どこからも呼ばれていない（T15-4 が意図的にそうした - 収集停止
+との競合で実機へ意図しないセッションを張るレースを防ぐため）。
+
+**案B で解消済み（2026-09-03、オーナー決定）**: 上の誤りに起因して、初回実装は「タグの無かった
+接続にタグを追加しても、次の rebuild/apply_run（実務的には収集の再起動）までその新しいタグへの
+書き込みが fail closed になる」という制約を残し、対応せずテストで挙動を固定するにとどめていた。
+**この制約は解消した**: `crate::rest::commit_catalog_and_notify`（登録変更のたびに呼ばれる、catalog
+コミットの唯一の入口 - CRUD ハンドラと `execute_pending_apply` の両方がここを通る）が、catalog
+コミット成功後に `CollectionController::resync_sessions_for_catalog_change` を呼ぶようになった。
+このメソッドは `start`/`stop` と同じ `transition` ロックを `try_lock` し、**取れなければ何もせず**
+（start/stop 自身が同じ仕事をするため割り込む必要がない）、**状態が `Running` のときだけ**
+`CollectorManager::resync_broker_sessions`（内部は既存の `sync_slmp_sessions_from` をそのまま再利用）
+を呼んでセッションを同期し直す。`CollectorManager::stop` は `rebuild_lock` を取らないため、
+`transition` ロックでの直列化が無いと「意図して止めた PLC へ、カタログ変更同期が直後にセッションを
+張り直してしまう」という T15-4 と同型のレースを再導入しかねない - `resync_sessions_for_catalog_change`
+がまさにこれを防ぐために `transition` ロックを使う設計になっている（詳細は同メソッドの doc comment、
+`apps/banto-hub/core/src/controller.rs`）。**唯一の既知の残存ギャップ**: この resync は稼働中の
+`Collector` 本体には一切触れないため、SLMP 接続（収集読み取りが broker 経由の唯一のプロトコル）で
+最後の有効グループが消えたタイミングでは、旧設定のまま読み取りを続けている collect タスクが読んでいる
+セッションを止めてしまう可能性がある（read エラーとして現れ、次の rebuild/apply_run で自己解消する -
+パニックや書き込み側のハザードではない）。Modbus TCP 接続はこの影響を受けない（収集読み取りは
+broker を経由しないため）。詳細は `CollectorManager::resync_broker_sessions` の doc comment参照。
 
 **残**: UX-37/38/39/40 は未着手。実機での再確認（本節末尾の注意）は未実施。
 

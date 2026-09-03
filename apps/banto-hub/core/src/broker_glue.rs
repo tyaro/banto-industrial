@@ -288,8 +288,14 @@ impl PlcClient for BrokerReadClient {
 /// it now goes through the exact same removal path described above the
 /// moment it stops qualifying - no new mechanism, just a narrower wanted
 /// set. See `CollectorManager::sync_slmp_sessions_from`'s doc comment for the
-/// full derivation and the one caveat it carries (writes to a tag added to a
-/// still-unsynced connection fail closed until the next rebuild/apply_run).
+/// full derivation. **T19 S2-a 案B (2026-09-03)**: a tag added to a
+/// still-unsynced connection no longer has to wait for the next
+/// rebuild/apply_run to become writable - `crate::rest::commit_catalog_and_notify`
+/// now also drives `CollectorManager::resync_broker_sessions` (via
+/// `crate::controller::CollectionController::resync_sessions_for_catalog_change`)
+/// whenever the catalog change commits while a run is already `Running` -
+/// see that method's doc comment for the full derivation and its
+/// transition-lock discipline.
 pub struct HubSessions {
     directory: SessionDirectory,
     /// `Some` until [`Self::shutdown`] consumes it (`BrokerSupervisor::shutdown`
