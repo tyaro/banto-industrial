@@ -4,11 +4,22 @@
 	import { page } from '$app/state';
 	import { getAuthProvider } from '@banto/admin-core';
 	import { pageTitle } from '$lib/navigation';
-	import { settings } from '$lib/settings.svelte';
+	import { mobileNavStore } from '$lib/mobileNav.svelte';
 	import { sessionStore } from '$lib/session.svelte';
 	import { commandPaletteStore } from '$lib/commandPalette.svelte';
 
 	let { pendingCount = 0 }: { pendingCount?: number } = $props();
+
+	// T19 S3-a（UX-43）: ☰ の振り分け - 狭幅(≤900px)ではオフキャンバスの
+	// 開閉、デスクトップでは従来どおりサイドバーの折り畳み
+	// （`mobileNavStore.toggleHamburger` に判断を集約、mobileNav.ts 参照）。
+	const hamburgerLabel = $derived(
+		mobileNavStore.isNarrow
+			? mobileNavStore.open
+				? 'メニューを閉じる'
+				: 'メニューを開く'
+			: 'サイドバーの切り替え'
+	);
 
 	async function logout() {
 		await getAuthProvider().logout();
@@ -20,8 +31,9 @@
 	<button
 		type="button"
 		class="icon-button"
-		onclick={() => settings.toggleSidebar()}
-		aria-label="サイドバーの切り替え"
+		onclick={() => mobileNavStore.toggleHamburger()}
+		aria-label={hamburgerLabel}
+		aria-expanded={mobileNavStore.isNarrow ? mobileNavStore.open : undefined}
 	>
 		☰
 	</button>
@@ -57,6 +69,10 @@
 		align-items: center;
 		gap: 0.75rem;
 		height: var(--banto-shell-header-height);
+		/* T19 S3-a（UX-43）: 真の固定 - ヘッダーは本文のスクロールに関わらず
+		   縮まない固定領域にする（(app)/+layout.svelte の `main` だけが
+		   専用スクロール領域を持つ）。 */
+		flex-shrink: 0;
 		padding: 0 1rem;
 		background: var(--banto-surface);
 		border-bottom: 1px solid var(--banto-border);
