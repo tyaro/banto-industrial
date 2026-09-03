@@ -1,7 +1,7 @@
 # banto-hub T19 設計: 設定 UI の再編と運用機能の追加
 
 作成日: 2026-09-02
-状態: **S1（S1-a / S1-b0 / S1-b / S1-c / S1-d）完了（2026-09-03）。S2-a（UX-48、§3.8）完了（2026-09-03）**。決定は §2・§8、調査結果は §7、進捗は §4。S2 の残り（UX-37/38/39/40）は未着手。実機再確認は未実施（§3.8 末尾の注意参照）
+状態: **S1（S1-a / S1-b0 / S1-b / S1-c / S1-d）完了（2026-09-03）。S2-a（UX-48、§3.8）完了（2026-09-03）。S2-b（UX-38、§3.4・§7.5）完了（2026-09-03）**。決定は §2・§8、調査結果は §7、進捗は §4。S2 の残り（UX-37/39/40）は未着手。実機再確認は未実施（§3.8 末尾の注意参照）
 親計画: [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)（§9 UI/UX 決定台帳へ本書の決定を反映する）
 
 ---
@@ -155,7 +155,8 @@ UX-30 と同じ理屈である。同じ情報を複数画面が持つと、利�
 
 一括削除、親の削除（定義のみ）、履歴保持期間の設定、削除の取り消しトースト、**タグの無い接続でセッションを張らない**（§3.8）。
 
-**UX-38 は Rust 側の拒否ロジックと DB 制約の両方を変更する**（§7.5）。既存の単体テストも前提が変わるため更新する。**virtual 接続（calc/mem）の削除禁止は維持する。**
+**UX-38 は Rust 側の変更を伴う**（§7.5、当初想定と実装結果の差分は本節下の
+「S2-b」ブロック参照）。**virtual 接続（calc/mem）の削除禁止は維持する。**
 
 **完了条件**: タグを複数選んで消せる。タグを持つ接続を消しても履歴が残る。誤削除を数秒以内に戻せる。
 
@@ -194,7 +195,40 @@ UX-30 と同じ理屈である。同じ情報を複数画面が持つと、利�
 パニックや書き込み側のハザードではない）。Modbus TCP 接続はこの影響を受けない（収集読み取りは
 broker を経由しないため）。詳細は `CollectorManager::resync_broker_sessions` の doc comment参照。
 
-**残**: UX-37/38/39/40 は未着手。実機での再確認（本節末尾の注意）は未実施。
+**S2-b（UX-38、§3.4・§7.5）: 完了（2026-09-03）。** 当初案の「既存の
+`delete`/`delete_tx`（拒否）を書き換える」ではなく、**新しいメソッド
+`cascade_delete`/`cascade_delete_tx` を追加**する形にした（実装中に判明した
+事実による設計変更 - §7.5 の想定は banto-tags 単体しか見ておらず、
+`apps/relay-wright/core/src/registry_cascade.rs` が「banto-tags の
+`delete`/`delete_tx` は子が居れば拒否する」ことを前提にした**独自の一括
+削除 UI をこのクレートの外に**既に持っている事実を見落としていた）。
+banto-tags は banto-hub 以外に relay-wright/banto-collect とも共有する
+クレートで、UX-38 は banto-hub 単独の決定であるため、既存メソッドの意味を
+変えると relay-wright の「通常 DELETE は安全側（拒否）」という契約を
+無断で崩すことになる。新メソッドを足し、`apps/banto-hub/core/src/rest.rs`
+の `plc_connections_delete`/`collection_groups_delete`（即時削除）と
+`execute_pending_apply` の `"plc_connections.delete"`/
+`"collection_groups.delete"` 分岐（稼働中にキューされ、停止後に適用される
+削除）の**両方**をこちらへ差し替えた（後者を見落とすと「即時削除は成功
+するのにキュー適用だけ旧仕様のまま失敗する」非対称なバグになるところ
+だった - 回帰テストで固定済み）。`delete`/`delete_tx` 自体は無変更のため、
+relay-wright/banto-collect のテスト・挙動への影響はゼロ（`cargo test -p
+relay-wright-core -p banto-collect` で確認済み）。
+
+カスケードは1トランザクション内で FK 順（tags → collection_groups →
+plc_connections）に削除するのみで、DB 制約は `ON DELETE RESTRICT` の
+まま変更していない - 新メソッドは子を先に消してから親を消すため
+RESTRICT に抵触せず、SQLite のテーブル再構築マイグレーション（`ALTER
+TABLE` で制約を変更できない）という高コストな変更を避けられる。RESTRICT
+は「サービス層を経由しない直接 SQL」への防御という元の役割のまま残る。
+tstore の履歴は banto-tags が触らない別ストレージ（`banto-tstore`）なので
+構造的に無傷 - `apps/banto-hub/core/tests/integration.rs::
+deleting_a_connection_with_tags_cascades_and_preserves_tstore_history`
+で実データを使って固定した。virtual 接続（calc/mem）の削除禁止は新
+メソッドでも維持している。削除確認 UI は「消える定義の件数」と「履歴は
+残る」旨を明示する（`apps/banto-hub/src/lib/banto/registryCascadeImpact.ts`）。
+
+**残**: UX-37/39/40 は未着手。実機での再確認（本節末尾の注意）は未実施。
 
 ### S3: レイアウトとサーバー状態（UX-43/46/47）
 
@@ -268,9 +302,18 @@ broker を経由しないため）。詳細は `CollectorManager::resync_broker_
 - グループ: タグが参照していると拒否（`crates/banto-tags/src/collection_group.rs:284-293`）
 - DB 側も `ON DELETE RESTRICT`（`migrations/0002_collection_groups.sql:11`、`0011_tags_unique_name_per_group.sql:43`）
 
-UX-38 では**この拒否ロジックと制約の両方**を変更する。既存の単体テスト（`delete_refuses_when_a_collection_group_references_it` 等）も**前提が変わるため更新が要る**。
+この節を書いた時点の想定は「この拒否ロジックと `ON DELETE RESTRICT` 制約の
+両方を変更する」だったが、**実装時に banto-tags が relay-wright とも共有する
+クレートであることに起因する制約が判明し、この想定どおりにはしなかった**
+（実装結果は §4「S2-b」ブロック参照）: 上記の拒否ロジック（`delete`/
+`delete_tx`）と `ON DELETE RESTRICT` は**どちらも変更していない**。代わりに
+`cascade_delete`/`cascade_delete_tx` という新メソッドを追加し、banto-hub の
+REST 層だけをそちらへ差し替えた。既存の単体テスト
+（`delete_refuses_when_a_collection_group_references_it` 等）は**対象の
+メソッドの意味が変わっていないため無変更のまま残り**、新メソッド用のテストを
+別途追加した。
 
-**virtual 接続（calc/mem）の削除・編集禁止はそのまま維持する**（`plc_connection.rs:561-568, 438-458`）。自動プロビジョニングされる予約接続であり、UX-38 の対象外。
+**virtual 接続（calc/mem）の削除・編集禁止はそのまま維持する**（`plc_connection.rs:561-568, 438-458`）。自動プロビジョニングされる予約接続であり、UX-38 の対象外。新メソッド `cascade_delete`/`cascade_delete_tx` でもこの禁止は維持している。
 
 ### 7.6 構成の保存・読込は実装済み（UX-42）
 

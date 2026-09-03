@@ -649,6 +649,120 @@ impl PlcConnectionService {
         }
         Ok(())
     }
+
+    /// T19 S2-b（UX-38、docs/banto-hub-t19-design.md §3.4・§7.5、2026-09-02
+    /// オーナー決定「タグがあってもグループ・接続を削除可。定義のみ削除し、
+    /// 履歴は残す」）: [`Self::delete`]/[`Self::delete_tx`] とは別の、
+    /// カスケード削除の入口。この接続配下の全グループの全タグ →
+    /// 全グループ → この接続、の順（FK 順）で削除する。
+    ///
+    /// **[`Self::delete`]/[`Self::delete_tx`] は変更していない**（意図的 -
+    /// このモジュールの doc comment 冒頭の注意点参照）: `relay-wright` は
+    /// このクレートの通常 `delete`/`delete_tx` が「子が居れば拒否する」
+    /// ことを前提にした独自の一括削除 UI
+    /// （`apps/relay-wright/core/src/registry_cascade.rs`、その doc comment
+    /// 「banto-tags must not be modified from this app (invariant)」）を
+    /// **別に**持っており、通常の DELETE ルートはそのままの安全側の挙動
+    /// （拒否）を維持する設計になっている。banto-tags は relay-wright/
+    /// banto-collect とも共有するクレートなので、既存の `delete`/`delete_tx`
+    /// の意味をここで変えると、UX-38 は banto-hub だけの決定であるにも
+    /// かかわらず relay-wright の「通常 DELETE は安全側」という契約を無断で
+    /// 崩すことになる。UX-38 を要求する `banto-hub` 側の REST ハンドラ
+    /// （`apps/banto-hub/core/src/rest.rs::plc_connections_delete`）だけを
+    /// この新しいメソッドへ差し替える。
+    ///
+    /// **tstore の履歴は触らない**: このクレートはそもそも `banto-tstore`
+    /// （日次ファイルの独立したストレージエンジン、`banto-tstore` の lib.rs
+    /// doc comment「この crate が意図的に依存しないもの」節参照）に接続
+    /// しない - `plc_connections`/`collection_groups`/`tags` の3テーブル
+    /// しか触れないので、tstore の実データは構造的に無傷のまま残る
+    /// （孤児となった履歴は UX-39 の保持期間で自然に消える想定 - §3.4）。
+    ///
+    /// 予約接続（`calc`/`mem`）はこのカスケード経路でも削除できない
+    /// （[`Self::delete`] と同じ理由 - このモジュールの doc comment
+    /// 「"virtual"」節、[`Self::delete`] 自身の doc comment参照）。
+    pub async fn cascade_delete_tx(
+        &self,
+        connection: &mut SqliteConnection,
+        id: i64,
+    ) -> Result<PlcConnectionCascadeOutcome, BantoError> {
+        let protocol: Option<String> =
+            sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *connection)
+                .await
+                .map_err(banto_storage::storage_error)?;
+        if protocol.as_deref() == Some(VIRTUAL_PROTOCOL) {
+            return Err(BantoError::Validation {
+                field_errors: vec![FieldError {
+                    field: "id".to_string(),
+                    message: "予約接続（calc/mem）は削除できません".to_string(),
+                }],
+            });
+        }
+
+        // FK 順: tags -> collection_groups -> plc_connections。
+        let deleted_tags = sqlx::query(
+            "DELETE FROM tags WHERE collection_group_id IN \
+             (SELECT id FROM collection_groups WHERE plc_connection_id = ?)",
+        )
+        .bind(id)
+        .execute(&mut *connection)
+        .await
+        .map_err(banto_storage::storage_error)?
+        .rows_affected() as i64;
+
+        let deleted_groups =
+            sqlx::query("DELETE FROM collection_groups WHERE plc_connection_id = ?")
+                .bind(id)
+                .execute(&mut *connection)
+                .await
+                .map_err(banto_storage::storage_error)?
+                .rows_affected() as i64;
+
+        let result = sqlx::query("DELETE FROM plc_connections WHERE id = ?")
+            .bind(id)
+            .execute(&mut *connection)
+            .await
+            .map_err(banto_storage::storage_error)?;
+        if result.rows_affected() == 0 {
+            return Err(BantoError::NotFound {
+                resource: RESOURCE.to_string(),
+                id: id.to_string(),
+            });
+        }
+
+        Ok(PlcConnectionCascadeOutcome {
+            deleted_groups,
+            deleted_tags,
+        })
+    }
+
+    /// Non-transactional counterpart of [`Self::cascade_delete_tx`] - opens
+    /// its own transaction so the three DELETEs stay atomic even when the
+    /// caller has no transaction of its own (mirrors how [`Self::delete`]
+    /// relates to [`Self::delete_tx`], except `delete`/`delete_tx` do not
+    /// need a transaction since each is a single row-affecting statement).
+    pub async fn cascade_delete(&self, id: i64) -> Result<PlcConnectionCascadeOutcome, BantoError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(banto_storage::storage_error)?;
+        let outcome = self.cascade_delete_tx(&mut tx, id).await?;
+        tx.commit().await.map_err(banto_storage::storage_error)?;
+        Ok(outcome)
+    }
+}
+
+/// What [`PlcConnectionService::cascade_delete`]/[`PlcConnectionService::cascade_delete_tx`]
+/// removed besides the connection row itself - lets a caller (audit log,
+/// tests) report exactly how much a single confirm removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlcConnectionCascadeOutcome {
+    pub deleted_groups: i64,
+    pub deleted_tags: i64,
 }
 
 #[cfg(test)]
@@ -1602,6 +1716,220 @@ mod tests {
 
         // The row must still be there after the rejected delete.
         svc.get(conn.id).await.expect("connection should survive");
+    }
+
+    // --- T19 S2-b (UX-38, docs/banto-hub-t19-design.md §3.4/§7.5): cascade
+    // delete - deliberately a NEW method (`cascade_delete`/`cascade_delete_tx`),
+    // not a change to `delete`/`delete_tx` above. See `cascade_delete_tx`'s
+    // own doc comment for why the guarded methods stay untouched (relay-wright
+    // depends on their "refuse while children exist" behavior).
+
+    /// The core UX-38 behavior: a connection with groups and tags can be
+    /// removed in one call, and every descendant definition goes with it.
+    #[tokio::test]
+    async fn cascade_delete_removes_groups_and_tags_with_the_connection() {
+        let svc = service().await;
+        let conn = svc.create(sample_input("InUse")).await.unwrap();
+
+        for group_name in ["G1", "G2"] {
+            sqlx::query(
+                "INSERT INTO collection_groups (name, plc_connection_id, period_ms, enabled) \
+                 VALUES (?, ?, 1000, 1)",
+            )
+            .bind(group_name)
+            .bind(conn.id)
+            .execute(&svc.pool)
+            .await
+            .unwrap();
+        }
+        let group_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM collection_groups WHERE plc_connection_id = ? ORDER BY id",
+        )
+        .bind(conn.id)
+        .fetch_all(&svc.pool)
+        .await
+        .unwrap();
+        for (i, group_id) in group_ids.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO tags (name, collection_group_id, address, data_type) \
+                 VALUES (?, ?, '40001', 'i16')",
+            )
+            .bind(format!("T{i}"))
+            .bind(group_id)
+            .execute(&svc.pool)
+            .await
+            .unwrap();
+        }
+
+        let outcome = svc
+            .cascade_delete(conn.id)
+            .await
+            .expect("cascade_delete should succeed even with children");
+        assert_eq!(outcome.deleted_groups, 2);
+        assert_eq!(outcome.deleted_tags, 2);
+
+        assert!(matches!(
+            svc.get(conn.id).await.unwrap_err(),
+            BantoError::NotFound { .. }
+        ));
+        let remaining_groups: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM collection_groups WHERE plc_connection_id = ?",
+        )
+        .bind(conn.id)
+        .fetch_one(&svc.pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining_groups, 0);
+        let remaining_tags: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags")
+            .fetch_one(&svc.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining_tags, 0,
+            "the tags must be gone along with their groups"
+        );
+    }
+
+    /// A childless connection behaves exactly like the old `delete`.
+    #[tokio::test]
+    async fn cascade_delete_with_no_children_behaves_like_a_plain_delete() {
+        let svc = service().await;
+        let conn = svc.create(sample_input("Lonely")).await.unwrap();
+        let outcome = svc.cascade_delete(conn.id).await.unwrap();
+        assert_eq!(outcome.deleted_groups, 0);
+        assert_eq!(outcome.deleted_tags, 0);
+        assert!(matches!(
+            svc.get(conn.id).await.unwrap_err(),
+            BantoError::NotFound { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn cascade_delete_missing_id_is_not_found() {
+        let svc = service().await;
+        let err = svc.cascade_delete(999).await.unwrap_err();
+        assert!(matches!(err, BantoError::NotFound { .. }));
+    }
+
+    /// The one invariant UX-38 must NOT touch: a reserved `calc`/`mem`
+    /// connection stays undeletable even through the cascade path, and even
+    /// when it does have groups/tags under it (unlike the plain in-use
+    /// guard on non-virtual connections, this check fires unconditionally -
+    /// same as [`delete_refuses_a_virtual_connection_even_with_no_groups_attached`]).
+    #[tokio::test]
+    async fn cascade_delete_still_refuses_a_virtual_connection_even_with_tags() {
+        let svc = service().await;
+        let calc = svc
+            .create(PlcConnectionInput {
+                name: CALC_CONNECTION_NAME.to_string(),
+                protocol: VIRTUAL_PROTOCOL.to_string(),
+                host: String::new(),
+                port: 0,
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+
+                word_order: "low_high".to_string(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO collection_groups (name, plc_connection_id, period_ms, enabled) \
+             VALUES ('calc-group', ?, 1000, 1)",
+        )
+        .bind(calc.id)
+        .execute(&svc.pool)
+        .await
+        .unwrap();
+        let group_id: i64 =
+            sqlx::query_scalar("SELECT id FROM collection_groups WHERE plc_connection_id = ?")
+                .bind(calc.id)
+                .fetch_one(&svc.pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO tags (name, collection_group_id, address, data_type, tag_kind) \
+             VALUES ('c1', ?, '', 'f32', 'computed')",
+        )
+        .bind(group_id)
+        .execute(&svc.pool)
+        .await
+        .unwrap();
+
+        let err = svc.cascade_delete(calc.id).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "id");
+                assert!(field_errors[0].message.contains("予約接続"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        // Nothing was touched: connection, group, and tag all survive.
+        svc.get(calc.id).await.expect("calc should survive");
+        let remaining_groups: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM collection_groups WHERE plc_connection_id = ?",
+        )
+        .bind(calc.id)
+        .fetch_one(&svc.pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining_groups, 1);
+        let remaining_tags: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags")
+            .fetch_one(&svc.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining_tags, 1);
+    }
+
+    /// `cascade_delete_tx` must not commit anything on its own - it has to
+    /// participate cleanly in a transaction the CALLER controls (this is how
+    /// `apps/banto-hub/core/src/rest.rs::plc_connections_delete` uses it:
+    /// begin -> `cascade_delete_tx` -> preflight -> commit, rolling the whole
+    /// transaction back if preflight rejects the resulting registry state).
+    /// This test proves the "both parent and children survive together" half
+    /// of that contract by rolling back explicitly instead of committing.
+    #[tokio::test]
+    async fn cascade_delete_tx_rolls_back_together_with_the_callers_transaction() {
+        let svc = service().await;
+        let conn = svc.create(sample_input("Rollback")).await.unwrap();
+        sqlx::query(
+            "INSERT INTO collection_groups (name, plc_connection_id, period_ms, enabled) \
+             VALUES ('G1', ?, 1000, 1)",
+        )
+        .bind(conn.id)
+        .execute(&svc.pool)
+        .await
+        .unwrap();
+        let group_id: i64 =
+            sqlx::query_scalar("SELECT id FROM collection_groups WHERE plc_connection_id = ?")
+                .bind(conn.id)
+                .fetch_one(&svc.pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO tags (name, collection_group_id, address, data_type) \
+             VALUES ('T1', ?, '40001', 'i16')",
+        )
+        .bind(group_id)
+        .execute(&svc.pool)
+        .await
+        .unwrap();
+
+        let mut tx = svc.pool.begin().await.unwrap();
+        let outcome = svc.cascade_delete_tx(&mut tx, conn.id).await.unwrap();
+        assert_eq!(outcome.deleted_groups, 1);
+        assert_eq!(outcome.deleted_tags, 1);
+        tx.rollback().await.unwrap();
+
+        // Rolled back: everything is exactly as before.
+        svc.get(conn.id)
+            .await
+            .expect("connection should survive the rollback");
+        let remaining_tags: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags")
+            .fetch_one(&svc.pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining_tags, 1);
     }
 
     #[tokio::test]
