@@ -24,6 +24,7 @@ import {
 	type ListResult
 } from '@banto/admin-core';
 import { CSRF_HEADER } from './setup';
+import { deferredDelete } from './deferredDelete.svelte';
 
 // --- wire types (camelCase, matching the Rust serde shapes) -----------------
 
@@ -294,6 +295,25 @@ interface HttpInit {
 }
 
 async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
+	/**
+	 * T19 S2-c2 (UX-40, docs/banto-hub-t19-design.md §3.10): 変更系リクエストの
+	 * 直前で、タグ削除の取り消し猶予（`deferredDelete.svelte.ts`）を打ち切って
+	 * 即時実行する。GET では呼ばない - 猶予中の行は画面側が `pendingIds` で
+	 * 一覧から除外しているので、GET の再読込で行が復活することはない。逆に
+	 * GET でも flush すると、`(app)/+layout.svelte` の3秒ポーリングのような
+	 * 定期 GET が猶予をほぼ即座に潰してしまい、取り消しの猶予がほぼ機能
+	 * しなくなる。
+	 *
+	 * 変更系（POST/PUT/DELETE 等）の直前で flush する理由: 猶予中に別の
+	 * 変更系リクエストを送ると、サーバー上にはまだ削除されていないタグが
+	 * 残っているために矛盾が起きうる。特にタグ名はグループ内で一意なので、
+	 * 削除したはずの名前で新規作成すると「名前が既に使われています」で
+	 * 弾かれ、画面上は消えているのに同名では作れない、という状態になる。
+	 */
+	if (init.method !== 'GET') {
+		await deferredDelete.flush();
+	}
+
 	const hasBody = init.body !== undefined;
 	const headers: Record<string, string> = { ...CSRF_HEADER };
 	if (hasBody) headers['Content-Type'] = 'application/json';

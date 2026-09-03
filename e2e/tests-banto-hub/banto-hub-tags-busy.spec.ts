@@ -5,10 +5,19 @@
  *
  * `banto-hub-tags-dirty-confirm.spec.ts` と同じパターン: 別
  * `describe.serial` ブロック（別 `page`）、認証・前提データ作成は
- * `page.request` で直接 REST を叩く。このテストの本題は「削除実行中に
- * 他の操作（保存・×での破棄確認/クローズ）がブロックされるか」であり、
- * `page.route` で `DELETE /api/tags/:id` を遅延させて busy 状態の窓を
- * 作る。
+ * `page.request` で直接 REST を叩く。
+ *
+ * T19 S2-c2（UX-40、docs/banto-hub-t19-design.md §3.10）で挙動が変わった:
+ * 削除は「遅延実行」になり、`window.confirm` の OK 直後に
+ * （実際の `DELETE` を待たず）ドロワーが閉じるようになった。そのため
+ * 「削除実行中は保存ボタンが disabled になり、×でも閉じられない」という
+ * 旧テストの前提（削除中もドロワーが開いたまま busy になる）が成立しなく
+ * なった - `deleting` busy フラグ自体を削除している
+ * （`(app)/tags/+page.svelte` の `isDrawerBusy()` 参照）。このテストは
+ * 「実際の DELETE が遅延・失敗しても、確認 OK 後は busy 待ちなしに即座に
+ * ドロワーが閉じる」という新しい契約の回帰ガードに書き換えた
+ * （`page.route` での遅延ゲートはそのまま流用 - 「実際の削除がどれだけ
+ * 遅くても、UI 側は待たない」ことを示すのに使う）。
  */
 import { expect, test, type Page } from '@playwright/test';
 import { CSRF_HEADERS, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
@@ -79,9 +88,13 @@ test.describe.serial('banto-hub タグ Drawer busy 相互排他 (TAG-UX-C)', () 
 		await page.close();
 	});
 
-	test('削除実行中は保存ボタンが disabled になり、×でも閉じられない', async () => {
+	test('削除確認後は busy 待ちなしに即座にドロワーが閉じる（実際の DELETE は待たない）', async () => {
 		// DELETE /api/tags/:id だけを遅延させる - GET/POST/PUT や他 API には
-		// 触れず、reload() 等の後続処理に影響しないようにする。
+		// 触れない。T19 S2-c2 以降、実際の DELETE は確認 OK の数秒後
+		// （`UNDO_WINDOW_MS`）に送られるが、このゲートで「実際に送られた
+		// その DELETE がまだ応答を返していない」状態を作り、その間も
+		// ドロワーが（とっくに）閉じていることを示す - 「削除は Drawer の
+		// busy 状態と無関係になった」ことの回帰ガード。
 		let releaseDelete: (() => void) | undefined;
 		const deleteGate = new Promise<void>((resolve) => {
 			releaseDelete = resolve;
@@ -106,28 +119,20 @@ test.describe.serial('banto-hub タグ Drawer busy 相互排他 (TAG-UX-C)', () 
 		});
 		await drawer.getByRole('button', { name: '削除' }).click();
 
-		// 削除リクエストが（route でゲートされたまま）実行中の間 -
-		// 保存・削除自身が disabled になり、Drawer 単位で相互排他される
-		// ことを確認する。
-		const saveButton = drawer.getByRole('button', { name: '保存' });
-		const deleteButton = drawer.getByRole('button', { name: '削除' });
-		await expect(saveButton).toBeDisabled();
-		await expect(deleteButton).toBeDisabled();
-
-		// busy 中は confirmDiscardIfNeeded() が確認すら出さず false を返す
-		// ため、× を押しても window.confirm は出ず、Drawer も閉じない。
-		let dialogShownWhileBusy = false;
-		page.once('dialog', (dialog) => {
-			dialogShownWhileBusy = true;
-			void dialog.dismiss();
-		});
-		await page.getByRole('button', { name: '閉じる' }).click();
-		await expect(drawer).toBeVisible();
-		expect(dialogShownWhileBusy).toBe(false);
-
-		// ゲートを解放して削除を完了させる - 削除成功後は Drawer が閉じる
-		// （既存挙動、`handleDelete` が `drawerMode = null` にする）。
-		releaseDelete?.();
+		// T19 S2-c2（UX-40、docs/banto-hub-t19-design.md §3.10）: 削除は
+		// 「遅延実行」になり、confirm 直後にドロワーを閉じる・一覧から隠す
+		// （`deleting` busy フラグは削除済み - `isDrawerBusy()` 参照）。
+		// 実際の DELETE がまだ送信すらされていない（`UNDO_WINDOW_MS` 未経過）
+		// この時点で、既にドロワーは閉じている。
 		await expect(drawer).toBeHidden();
+		await expect(page.getByRole('gridcell', { name: TAG_NAME, exact: true })).toHaveCount(0);
+
+		// ゲートを解放し、猶予後に実際の DELETE が送られて完了することを
+		// 確認する（フィクスチャの後始末も兼ねる）。
+		const deleteRequest = page.waitForResponse(
+			(res) => res.request().method() === 'DELETE' && /\/api\/tags\/\d+$/.test(res.url())
+		);
+		releaseDelete?.();
+		await deleteRequest;
 	});
 });

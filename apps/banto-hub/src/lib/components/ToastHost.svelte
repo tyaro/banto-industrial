@@ -1,5 +1,6 @@
 <script lang="ts">
-	// relay-wright の同名コンポーネントから無改変で複製。
+	// relay-wright の同名コンポーネントから複製（当初は無改変）。
+	// T19 S2-c2（UX-40）でアクションボタン（取り消し等）の描画を追加。
 	import { toastStore } from '$lib/toast.svelte';
 </script>
 
@@ -7,6 +8,16 @@
 	{#each toastStore.toasts as toast (toast.id)}
 		<div class="toast {toast.kind}">
 			<span class="message">{toast.message}</span>
+			{#if toast.action}
+				<button
+					type="button"
+					class="action"
+					data-testid="toast-undo"
+					onclick={toast.action.onClick}
+				>
+					{toast.action.label}
+				</button>
+			{/if}
 			<button
 				type="button"
 				class="close"
@@ -59,6 +70,22 @@
 
 	.message {
 		flex: 1;
+	}
+
+	.action {
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+		background: none;
+		color: var(--banto-primary);
+		cursor: pointer;
+		font-size: 0.8rem;
+		font-weight: 600;
+		padding: 0.2rem 0.5rem;
+		white-space: nowrap;
+	}
+
+	.action:hover {
+		background: var(--banto-surface);
 	}
 
 	.close {

@@ -18,6 +18,12 @@
  * 一切評価せずに `tagRegistryAdmin.ts` 本体（`httpRequest` を含む）を
  * そのままロード・テストできる。`httpRequest` を抽出/リファクタしてまで
  * テスト可能にする必要はなかった。
+ *
+ * T19 S2-c2（UX-40）追記: `httpRequest` は変更系リクエストの直前で
+ * `./deferredDelete.svelte`（同じく `$state` を使う `.svelte.ts`）の
+ * `deferredDelete.flush()` を呼ぶようになった。同じ理由でこれも `vi.mock`
+ * する - フェイクは `flush` の呼び出し回数を記録するだけの spy にして、
+ * 下の「GET では呼ばない/非GETでは呼ぶ」テストで検証する。
  */
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 
@@ -39,6 +45,11 @@ vi.mock('@banto/admin-core', () => ({
 
 vi.mock('./setup', () => ({
 	CSRF_HEADER: { 'X-Banto-Client': 'banto' }
+}));
+
+const { deferredDeleteFlush } = vi.hoisted(() => ({ deferredDeleteFlush: vi.fn(async () => {}) }));
+vi.mock('./deferredDelete.svelte', () => ({
+	deferredDelete: { flush: deferredDeleteFlush }
 }));
 
 import {
@@ -235,5 +246,29 @@ describe('T18-5a 第2段（docs/banto-hub-t18-design.md §4 決定6）: listTags
 		const [url, init] = mockedFetch.mock.calls[0] as [string, RequestInit];
 		expect(url).toBe('/api/tags/group-counts');
 		expect(init.method).toBe('GET');
+	});
+});
+
+describe('T19 S2-c2（UX-40、docs/banto-hub-t19-design.md §3.10）: httpRequest の deferredDelete.flush() フック', () => {
+	beforeEach(() => {
+		deferredDeleteFlush.mockClear();
+	});
+
+	it('GET では flush() を呼ばない（listTagGroupCounts）', async () => {
+		mockFetchOnce({ status: 200, ok: true, body: [] });
+		await listTagGroupCounts();
+		expect(deferredDeleteFlush).not.toHaveBeenCalled();
+	});
+
+	it('POST（変更系）では fetch の前に flush() を呼ぶ（createTag）', async () => {
+		mockFetchOnce({ status: 200, ok: true, body: tagResource });
+		await createTag(tagInput);
+		expect(deferredDeleteFlush).toHaveBeenCalledTimes(1);
+	});
+
+	it('PUT（変更系）でも flush() を呼ぶ（updatePlcConnection）', async () => {
+		mockFetchOnce({ status: 200, ok: true, body: connectionResource });
+		await updatePlcConnection(1, connectionInput);
+		expect(deferredDeleteFlush).toHaveBeenCalledTimes(1);
 	});
 });
