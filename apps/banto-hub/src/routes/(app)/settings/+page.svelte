@@ -29,6 +29,23 @@
 		type GrpcSettings
 	} from '$lib/banto/grpcSettingsAdmin';
 	import {
+		getStoreSettings,
+		setStoreSettings,
+		previewPrune,
+		pruneNow
+	} from '$lib/banto/storeSettingsAdmin';
+	import {
+		formToRetentionDays,
+		formatPruneConfirmMessage,
+		formatPruneDoneMessage,
+		formatRetentionSavedMessage,
+		hasUnsavedRetentionChange,
+		pruneDisabledReason,
+		retentionDaysToForm,
+		validateRetentionForm,
+		type RetentionFormState
+	} from '$lib/banto/storeRetentionForm';
+	import {
 		applyConfigPackage,
 		inspectConfigPackage,
 		loadConfigPackage,
@@ -386,6 +403,109 @@
 		}
 	}
 
+	// --- 履歴の保持期間（T19 S2-d、docs/banto-hub-t19-design.md §5.1、UX-39、
+	// admin 限定） -------------------------------------------------------------
+	//
+	// 2026-09-03 オーナー決定1: 「保存」ボタンは保持方針を**保存するだけ**
+	// （次回の24時間周期タスク/再起動から自然に反映される・非破壊）。
+	// 「今すぐ古い履歴を削除」は**別の**破壊的操作で、保存済みの方針で即時
+	// 剪定する - `previewPrune`で件数を確認してから `window.confirm` で
+	// 不可逆であることを明示し、OK のときだけ `pruneNow`を呼ぶ。
+	// オーナー決定2: 「無制限（削除しない）」を選択肢として持つ。
+
+	const canManageStore = $derived(isAdmin(sessionStore.role));
+
+	const DEFAULT_RETENTION_DAYS_FALLBACK = 7;
+
+	let storeRetentionForm: RetentionFormState = $state({
+		unlimited: false,
+		days: DEFAULT_RETENTION_DAYS_FALLBACK
+	});
+	/** 直近に `getStoreSettings`/保存成功で確定した`retentionDays` - `hasUnsavedRetentionChange`の基準。 */
+	let savedRetentionDays: number | null = $state(null);
+
+	let storeLoaded = $state(false);
+	let storeSaving = $state(false);
+	let storeError: string | null = $state(null);
+	let pruning = $state(false);
+	let pruneError: string | null = $state(null);
+
+	const storeValidationError = $derived(validateRetentionForm(storeRetentionForm));
+	const storeHasUnsavedChange = $derived(
+		hasUnsavedRetentionChange(savedRetentionDays, storeRetentionForm)
+	);
+	const storePruneDisabledReason = $derived(pruneDisabledReason(storeHasUnsavedChange));
+
+	$effect(() => {
+		if (!canManageStore) return;
+		let cancelled = false;
+		(async () => {
+			try {
+				const loaded = await getStoreSettings();
+				if (!cancelled) {
+					savedRetentionDays = loaded.retentionDays;
+					storeRetentionForm = retentionDaysToForm(
+						loaded.retentionDays,
+						DEFAULT_RETENTION_DAYS_FALLBACK
+					);
+				}
+			} catch (err) {
+				if (!cancelled) storeError = errorMessage(err);
+			} finally {
+				if (!cancelled) storeLoaded = true;
+			}
+		})();
+		return () => {
+			cancelled = true;
+		};
+	});
+
+	async function submitStoreSettings(event: SubmitEvent): Promise<void> {
+		event.preventDefault();
+		storeError = null;
+		if (storeValidationError) {
+			storeError = storeValidationError;
+			return;
+		}
+		storeSaving = true;
+		try {
+			const saved = await setStoreSettings({
+				retentionDays: formToRetentionDays(storeRetentionForm)
+			});
+			savedRetentionDays = saved.retentionDays;
+			storeRetentionForm = retentionDaysToForm(
+				saved.retentionDays,
+				DEFAULT_RETENTION_DAYS_FALLBACK
+			);
+			toastStore.push('success', formatRetentionSavedMessage());
+		} catch (err) {
+			storeError = errorMessage(err);
+		} finally {
+			storeSaving = false;
+		}
+	}
+
+	async function handlePruneNow(): Promise<void> {
+		pruneError = null;
+		pruning = true;
+		try {
+			const preview = await previewPrune();
+			if (preview.wouldDeleteCount === 0) {
+				toastStore.push('info', '削除対象はありません');
+				return;
+			}
+			if (!window.confirm(formatPruneConfirmMessage(preview.wouldDeleteCount))) {
+				return;
+			}
+			const result = await pruneNow();
+			toastStore.push('success', formatPruneDoneMessage(result.deletedCount));
+		} catch (err) {
+			pruneError = errorMessage(err);
+		} finally {
+			pruning = false;
+		}
+	}
+
 	function resetConfigPackageImport(): void {
 		configPackageData = null;
 		configPackageInspection = null;
@@ -696,6 +816,71 @@
 					<p class="note">
 						REST/WebSocket とは別ポートで listen します(既定 50051)。無効化中はこのポートで一切
 						listen しません。
+					</p>
+				</form>
+			{:else}
+				<p class="note">読み込み中...</p>
+			{/if}
+		</section>
+	{/if}
+
+	{#if canManageStore}
+		<section>
+			<h2>データ保持</h2>
+			{#if storeLoaded}
+				<form onsubmit={submitStoreSettings}>
+					<label class="field checkbox">
+						<input
+							type="checkbox"
+							checked={storeRetentionForm.unlimited}
+							onchange={(e) =>
+								(storeRetentionForm = {
+									...storeRetentionForm,
+									unlimited: (e.currentTarget as HTMLInputElement).checked
+								})}
+						/>
+						無制限（削除しない）
+					</label>
+
+					<label class="field">
+						保持日数
+						<input
+							type="number"
+							min="1"
+							max="3650"
+							bind:value={storeRetentionForm.days}
+							disabled={storeRetentionForm.unlimited}
+						/>
+					</label>
+
+					{#if storeError}
+						<p class="error">{storeError}</p>
+					{/if}
+
+					<button type="submit" disabled={storeSaving || storeValidationError !== null}>
+						保存
+					</button>
+					<p class="note">
+						保存すると次回の自動剪定（起動時 + 24時間ごと）から反映されます。保存だけでは既存の
+						履歴は削除されません。
+					</p>
+
+					{#if pruneError}
+						<p class="error">{pruneError}</p>
+					{/if}
+
+					<button
+						type="button"
+						class="danger"
+						onclick={handlePruneNow}
+						disabled={pruning || storeHasUnsavedChange}
+						title={storePruneDisabledReason ?? undefined}
+					>
+						{pruning ? '削除中…' : '今すぐ古い履歴を削除'}
+					</button>
+					<p class="note">
+						保存済みの保持方針に従って、保持期間を過ぎた履歴ファイルを今すぐ削除します。
+						<strong>削除すると元に戻せません。</strong>
 					</p>
 				</form>
 			{:else}

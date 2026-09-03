@@ -151,18 +151,30 @@ impl Default for ServerSettings {
 }
 
 /// tstore のデータディレクトリと保持期間（設計 §3.3）。
+///
+/// `retention_days`: T19 S2-d（UX-39、docs/banto-hub-t19-design.md §5.1）で
+/// `i64` から `Option<i64>` へ変更した。**以前は素の `i64`（既定7）で、
+/// `crate::runtime::prune_once` はこれをそのまま `u32` へキャストして
+/// `banto_tstore::prune_files` に渡していた（`0` は「当日のみ保持」という
+/// 意味だった）。今回から非正の値・未設定はすべて `None`＝「無制限（剪定
+/// しない）」を意味するように変わる** - 監査ログ側の
+/// [`AuditSettings::retention_days`]・[`normalize_retention`]/
+/// [`parse_retention`] と同じ規約に揃えた（UX-39 のオーナー決定「無制限を
+/// 選べるようにする」）。実運用では store 保持を 0 に設定する UI がこれまで
+/// 存在しなかったため（REST/UI は本 T19 S2-d が最初の追加）、この意味変更
+/// による実挙動の退行は無い。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StoreSettings {
     pub data_dir: String,
-    pub retention_days: i64,
+    pub retention_days: Option<i64>,
 }
 
 impl Default for StoreSettings {
     fn default() -> Self {
         Self {
             data_dir: "./data".to_string(),
-            retention_days: DEFAULT_RETENTION_DAYS,
+            retention_days: Some(DEFAULT_RETENTION_DAYS),
         }
     }
 }
@@ -319,25 +331,33 @@ impl SettingsService {
     }
 
     /// Read the tstore data dir / retention settings, falling back to
-    /// [`StoreSettings::default`] for any unset key.
+    /// [`StoreSettings::default`] for any unset key. `retention_days` uses
+    /// the same [`parse_retention`] as the audit log settings - a
+    /// non-positive or unparsable stored value normalizes to `None`
+    /// (unlimited), see [`StoreSettings::retention_days`]'s doc comment for
+    /// why this crosses from a plain `i64` to `Option<i64>`.
     pub async fn store_config(&self) -> Result<StoreSettings, BantoError> {
         let defaults = StoreSettings::default();
         let data_dir = self.get(KEY_DATA_DIR).await?.unwrap_or(defaults.data_dir);
-        let retention_days = self
-            .get(KEY_RETENTION_DAYS)
-            .await?
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(defaults.retention_days);
+        let retention_days =
+            parse_retention(self.get(KEY_RETENTION_DAYS).await?, defaults.retention_days);
         Ok(StoreSettings {
             data_dir,
             retention_days,
         })
     }
 
+    /// Save the tstore data dir / retention settings. `retention_days` of
+    /// `None` is written as `"0"` - the same "no separate sentinel needed"
+    /// convention as [`Self::set_audit_config`], since [`parse_retention`]
+    /// already treats a stored `"0"` as unlimited on the read side.
     pub async fn set_store_config(&self, config: &StoreSettings) -> Result<(), BantoError> {
         self.set(KEY_DATA_DIR, &config.data_dir).await?;
-        self.set(KEY_RETENTION_DAYS, &config.retention_days.to_string())
-            .await?;
+        self.set(
+            KEY_RETENTION_DAYS,
+            &config.retention_days.unwrap_or(0).to_string(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -543,7 +563,7 @@ mod tests {
         let config = svc.store_config().await.unwrap();
         assert_eq!(config, StoreSettings::default());
         assert_eq!(config.data_dir, "./data");
-        assert_eq!(config.retention_days, 7);
+        assert_eq!(config.retention_days, Some(7));
     }
 
     #[tokio::test]
@@ -551,10 +571,39 @@ mod tests {
         let svc = service().await;
         let config = StoreSettings {
             data_dir: "/var/banto-hub/data".to_string(),
-            retention_days: 14,
+            retention_days: Some(14),
         };
         svc.set_store_config(&config).await.unwrap();
         assert_eq!(svc.store_config().await.unwrap(), config);
+    }
+
+    /// UX-39（無制限の選択肢）: `None` は保存側で `"0"` として書かれ、
+    /// 読み取り側は [`parse_retention`] で `None` に丸め戻る - 監査ログの
+    /// `audit_config_none_round_trips_as_unlimited` と同じ規約。
+    #[tokio::test]
+    async fn store_config_none_round_trips_as_unlimited() {
+        let svc = service().await;
+        svc.set_store_config(&StoreSettings {
+            data_dir: "./data".to_string(),
+            retention_days: None,
+        })
+        .await
+        .unwrap();
+
+        let config = svc.store_config().await.unwrap();
+        assert_eq!(config.retention_days, None);
+    }
+
+    /// 防御的な扱い: 保存経路を通らず直接キーへ非正の値が書き込まれた
+    /// 場合でも「無制限」に丸める（監査ログの
+    /// `audit_config_non_positive_value_normalizes_to_unlimited` と同じ）。
+    #[tokio::test]
+    async fn store_config_non_positive_value_normalizes_to_unlimited() {
+        let svc = service().await;
+        svc.set(KEY_RETENTION_DAYS, "-3").await.unwrap();
+
+        let config = svc.store_config().await.unwrap();
+        assert_eq!(config.retention_days, None);
     }
 
     #[tokio::test]

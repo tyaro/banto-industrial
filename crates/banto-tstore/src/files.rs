@@ -83,6 +83,34 @@ pub struct PruneReport {
     pub kept: Vec<PathBuf>,
 }
 
+/// Classify every recognized data file into "would be deleted" / "would be
+/// kept" for `retention_days` relative to `today`, **without touching the
+/// filesystem** (no `fs::remove_file` call) - the dry-run counterpart of
+/// [`prune_files`], which shares this exact classification (see its doc
+/// comment for the age rule) and only adds the actual deletion step on top.
+/// Kept as a single function so the two never drift apart (banto-hub T19
+/// S2-d, UX-39: the REST layer needs a "how many files would this delete"
+/// preview before the destructive prune-now call).
+pub fn plan_prune(
+    data_dir: &Path,
+    retention_days: u32,
+    today: LocalDate,
+) -> Result<PruneReport, TstoreError> {
+    let mut report = PruneReport::default();
+    let today_days = today.to_days_since_epoch();
+
+    for file in list_data_files(data_dir)? {
+        let age_days = today_days - file.date.to_days_since_epoch();
+        if age_days > retention_days as i64 {
+            report.deleted.push(file.path);
+        } else {
+            report.kept.push(file.path);
+        }
+    }
+
+    Ok(report)
+}
+
 /// Delete every recognized data file older than `retention_days` relative to
 /// `today`, keeping `today`'s own file(s) unconditionally regardless of
 /// `retention_days` (design: "当日は対象外"). A file is deleted when
@@ -101,25 +129,21 @@ pub struct PruneReport {
 /// Never touches files that do not parse as `YYYYMMDD-NNN.sqlite3` (same
 /// "skip, don't fail" tolerance as [`list_data_files`]) - this function
 /// only ever deletes files it can positively identify as its own.
+///
+/// The classification itself (which files are "deleted" vs "kept") is
+/// delegated to [`plan_prune`] so the dry-run preview and the real prune can
+/// never disagree; this function's only addition on top of the plan is
+/// actually removing the files the plan marked as `deleted`.
 pub fn prune_files(
     data_dir: &Path,
     retention_days: u32,
     today: LocalDate,
 ) -> Result<PruneReport, TstoreError> {
-    let mut report = PruneReport::default();
-    let today_days = today.to_days_since_epoch();
-
-    for file in list_data_files(data_dir)? {
-        let age_days = today_days - file.date.to_days_since_epoch();
-        if age_days > retention_days as i64 {
-            fs::remove_file(&file.path)?;
-            report.deleted.push(file.path);
-        } else {
-            report.kept.push(file.path);
-        }
+    let plan = plan_prune(data_dir, retention_days, today)?;
+    for path in &plan.deleted {
+        fs::remove_file(path)?;
     }
-
-    Ok(report)
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -306,5 +330,75 @@ mod tests {
 
     fn data_file_name_for_test(date: LocalDate, seq: u32) -> String {
         crate::schema::data_file_name(date, seq)
+    }
+
+    // --- plan_prune (dry-run) ---
+
+    #[test]
+    fn plan_prune_does_not_touch_the_filesystem() {
+        let dir = TempDir::new("plan-prune-no-delete");
+        let today = LocalDate::new(2026, 7, 12);
+        let old_date = LocalDate::new(2026, 4, 1); // well over 90 days before today
+        dir.touch(&data_file_name_for_test(old_date, 1));
+        dir.touch(&data_file_name_for_test(today, 1));
+
+        let plan = plan_prune(dir.path(), 90, today).expect("plan should succeed");
+        assert_eq!(plan.deleted.len(), 1);
+        assert_eq!(plan.kept.len(), 1);
+        // Unlike prune_files, nothing was actually removed.
+        assert!(plan.deleted[0].exists());
+    }
+
+    #[test]
+    fn plan_prune_classification_matches_prune_files() {
+        let plan_dir = TempDir::new("plan-prune-matches-a");
+        let prune_dir = TempDir::new("plan-prune-matches-b");
+        let today = LocalDate::new(2026, 7, 12);
+        let dates = [
+            LocalDate::new(2026, 7, 12), // today: always kept
+            LocalDate::new(2026, 4, 13), // exactly at the 90-day boundary: kept
+            LocalDate::new(2026, 4, 12), // one day past boundary: deleted
+            LocalDate::new(2026, 1, 1),  // well past boundary: deleted
+        ];
+        for date in dates {
+            plan_dir.touch(&data_file_name_for_test(date, 1));
+            prune_dir.touch(&data_file_name_for_test(date, 1));
+        }
+
+        let plan = plan_prune(plan_dir.path(), 90, today).expect("plan should succeed");
+        let pruned = prune_files(prune_dir.path(), 90, today).expect("prune should succeed");
+
+        let plan_deleted: Vec<&str> = plan
+            .deleted
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        let pruned_deleted: Vec<&str> = pruned
+            .deleted
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(plan_deleted, pruned_deleted);
+        assert_eq!(plan.deleted.len(), 2);
+
+        let plan_kept: Vec<&str> = plan
+            .kept
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        let pruned_kept: Vec<&str> = pruned
+            .kept
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(plan_kept, pruned_kept);
+        assert_eq!(plan.kept.len(), 2);
+    }
+
+    #[test]
+    fn plan_prune_on_missing_dir_is_a_harmless_no_op() {
+        let dir = std::env::temp_dir().join("banto-tstore-test-plan-prune-missing-xyz");
+        let plan = plan_prune(&dir, 90, LocalDate::new(2026, 7, 12)).expect("should not error");
+        assert_eq!(plan, PruneReport::default());
     }
 }

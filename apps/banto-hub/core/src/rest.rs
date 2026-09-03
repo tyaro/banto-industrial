@@ -62,6 +62,7 @@ use banto_collect::{
     RegistrySnapshot,
 };
 use banto_core::{BantoError, ErrorBody, FieldError, ListParams, ListResult};
+use banto_tstore::LocalDate;
 // T12 (docs/ux-plan.md §4): 保存前の接続テスト API 用。Modbus/SLMP 両方の
 // 直接ダイヤル経路が同じ型を使うので、ここで一括 import する
 // (`BatchReadRequest`/`BatchReadResult`は`banto_broker`ではなく`banto_plc`が
@@ -94,7 +95,7 @@ use crate::controller::{CollectionController, CollectionState, CollectionStatus,
 use crate::hub::{CollectorManager, SimulationCoverageReport, TagEntry, TagMap};
 use crate::mqtt::MqttPublisher;
 use crate::pending_changes::{PendingChange, PendingChangesService};
-use crate::settings::{AuditSettings, MqttSettings, SettingsService};
+use crate::settings::{AuditSettings, MqttSettings, SettingsService, StoreSettings};
 use crate::test_output::TestOutputControl;
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
 use crate::write_audit::{WriteAuditEntry, WriteAuditService};
@@ -1922,6 +1923,276 @@ fn mqtt_settings_router(
                 commissioning: commissioning.clone(),
                 min: Role::Admin,
                 resource: "mqtt_settings",
+                audit,
+            },
+            require_role_at_least,
+        ))
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
+}
+
+// --- 履歴保持 (T19 S2-d、docs/banto-hub-t19-design.md §5.1、UX-39): admin
+// 限定、CSRF + bearer -----------------------------------------------------
+//
+// `GET/PUT /api/store-settings` は `mqtt_settings_router`/`audit_log_router`
+// と同型（admin ロール限定 + CSRF は `api_router` 側で管理系ルーター全体に
+// 一括で被せる）だが、**`PUT` は保存するだけで即時適用（剪定）はしない**
+// （2026-09-03 オーナー決定1: 「保存は方針のみ。剪定は別ボタンで即時実行」）
+// - `mqtt_settings_put`/`grpc_settings_put`の「保存 → apply」パターンとは
+// 意図的に非対称。剪定は `POST /api/store-settings/prune-now` だけが行う
+// 別の破壊的操作。
+//
+// `prune-preview`/`prune-now` は `data_dir`/`clock` を
+// `CollectorManager::data_dir`/`CollectorManager::clock`（このモジュールの
+// 他の`now_ms`利用箇所と同じ供給元 - `state.manager.clock()`）から得る。
+// `SettingsService::store_config().data_dir` を直接読まないのは、
+// `data_dir_override`/`BANTO_HUB_DATA`環境変数で実効値が永続設定と
+// ズレている環境があり得るため - `CollectorManager::data_dir`のdoc comment
+// 参照。`today`の算出は`crate::runtime::prune_once`と全く同じ式
+// （`LocalDate::from_epoch_ms(clock.now_ms(), clock.utc_offset_ms())`）を
+// 使い、剪定タイミングの判断がずれないようにする。
+
+#[derive(Clone)]
+struct StoreSettingsAdminState {
+    manager: Arc<CollectorManager>,
+    auth: AuthState,
+    commissioning: CommissioningState,
+    audit: AuditLogService,
+}
+
+/// `GET/PUT /api/store-settings`・`POST /api/store-settings/prune-*`の
+/// request/response body。`data_dir`はこの T19 S2-d のスコープ外なので
+/// 含めない（実装指示「data_dir は今回のスコープ外」）。`retentionDays`が
+/// `null`＝無制限（[`crate::settings::StoreSettings::retention_days`]の
+/// doc comment参照）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoreSettingsResponse {
+    retention_days: Option<i64>,
+}
+
+impl From<StoreSettings> for StoreSettingsResponse {
+    fn from(config: StoreSettings) -> Self {
+        Self {
+            retention_days: config.retention_days,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoreSettingsRequest {
+    #[serde(default)]
+    retention_days: Option<i64>,
+}
+
+/// tstore 保持期間の上限（10年）。実装指示「上限は3650（10年）とする」。
+const MAX_STORE_RETENTION_DAYS: i64 = 3650;
+
+/// 入力検証（実装指示どおり）: `null`（無制限）は常に可。数値は 1 以上
+/// [`MAX_STORE_RETENTION_DAYS`] 以下の整数のみ（0 以下＝「当日のみ」相当は
+/// 今回 UI から提供しない）。
+fn validate_store_settings_request(body: &StoreSettingsRequest) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+    if let Some(days) = body.retention_days {
+        if !(1..=MAX_STORE_RETENTION_DAYS).contains(&days) {
+            errors.push(FieldError {
+                field: "retentionDays".to_string(),
+                message: format!(
+                    "retentionDays は 1〜{MAX_STORE_RETENTION_DAYS} の整数、または無制限（null）にしてください"
+                ),
+            });
+        }
+    }
+    errors
+}
+
+async fn store_settings_get(
+    State(state): State<StoreSettingsAdminState>,
+) -> Result<Json<StoreSettingsResponse>, ApiError> {
+    let config = SettingsService::new(state.manager.pool())
+        .store_config()
+        .await?;
+    Ok(Json(config.into()))
+}
+
+/// `PUT /api/store-settings`（admin 限定）: 保持方針を**保存するだけ**
+/// （2026-09-03 オーナー決定1）。ここで `banto_tstore::prune_files`/
+/// `plan_prune`を呼ぶことは絶対にしない - 次回の24h周期タスク/起動時
+/// （`crate::runtime::prune_once`）で自然に効く。`dataDir`はこの
+/// リクエストで変更しない（既存値を読んで維持する）。
+async fn store_settings_put(
+    State(state): State<StoreSettingsAdminState>,
+    headers: HeaderMap,
+    Json(body): Json<StoreSettingsRequest>,
+) -> Result<Json<StoreSettingsResponse>, ApiError> {
+    let field_errors = validate_store_settings_request(&body);
+    if !field_errors.is_empty() {
+        return Err(ApiError(BantoError::Validation { field_errors }));
+    }
+
+    let settings_service = SettingsService::new(state.manager.pool());
+    let existing = settings_service.store_config().await?;
+    let config = StoreSettings {
+        data_dir: existing.data_dir,
+        retention_days: body.retention_days,
+    };
+    settings_service.set_store_config(&config).await?;
+
+    record_write(
+        &state.audit,
+        &state.auth,
+        &state.commissioning,
+        &headers,
+        "update",
+        "store_settings",
+        "1",
+        Some(json!({ "retentionDays": config.retention_days })),
+    )
+    .await;
+
+    Ok(Json(config.into()))
+}
+
+/// `POST /api/store-settings/prune-preview`の応答: 現在
+/// **保存済みの**保持方針で削除される見込みのファイル数
+/// （`banto_tstore::plan_prune`、実際には削除しない）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrunePreviewResponse {
+    would_delete_count: usize,
+}
+
+/// `retention_days`（設定の生値）を`banto_tstore`が要求する`u32`日数へ
+/// 変換する。剪定は不可逆な削除なので、`None`（無制限）はもちろん、
+/// `u32`に収まらない想定外の値（`parse_retention`は上限クランプを
+/// しないため、DBを直接編集された等で`u32::MAX`超の値が入り得る）の
+/// ときも「削除しない」側（`None`）に倒す - 変換失敗を「削除数0」では
+/// なく「大量削除」に丸めるのは破壊的操作の失敗方向として逆。
+///
+/// prune-preview / prune-now の両方が必ずこの関数の結果**だけ**で
+/// 「prune するか否か」を決めること - 判定がここから外れて両者でズレると
+/// 「プレビューは0件だったのに実行したら消えた」が起き得る。
+fn resolve_prune_retention_days(retention_days: Option<i64>) -> Option<u32> {
+    retention_days.and_then(|days| u32::try_from(days).ok())
+}
+
+/// `POST /api/store-settings/prune-preview`（admin 限定・読み取り専用）:
+/// フロントの確認ダイアログ（実装指示「削除予定数を返す手段を必ず用意」）が
+/// 使う。破壊的操作ではないため監査エントリは記録しない（read routes are
+/// never audited - `crate::audit`のモジュール doc comment参照）。
+async fn store_settings_prune_preview(
+    State(state): State<StoreSettingsAdminState>,
+) -> Result<Json<PrunePreviewResponse>, ApiError> {
+    let config = SettingsService::new(state.manager.pool())
+        .store_config()
+        .await?;
+    let Some(retention_days) = resolve_prune_retention_days(config.retention_days) else {
+        return Ok(Json(PrunePreviewResponse {
+            would_delete_count: 0,
+        }));
+    };
+    let clock = state.manager.clock();
+    let today = LocalDate::from_epoch_ms(clock.now_ms(), clock.utc_offset_ms());
+    let plan = banto_tstore::plan_prune(state.manager.data_dir(), retention_days, today)
+        .map_err(|err| ApiError(BantoError::Storage(err.to_string())))?;
+    Ok(Json(PrunePreviewResponse {
+        would_delete_count: plan.deleted.len(),
+    }))
+}
+
+/// `POST /api/store-settings/prune-now`の応答: 実際に削除したファイル数。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PruneNowResponse {
+    deleted_count: usize,
+}
+
+/// `POST /api/store-settings/prune-now`（admin 限定）: **保存済みの**
+/// 保持方針（`store_config().retention_days`）で今すぐ剪定する
+/// （2026-09-03 オーナー決定1: 「今すぐ古い履歴を削除」の実体）。無制限
+/// （`None`）のときは何も削除せず`deletedCount: 0`を返す。不可逆な削除
+/// なので必ず監査エントリを記録する。
+async fn store_settings_prune_now(
+    State(state): State<StoreSettingsAdminState>,
+    headers: HeaderMap,
+) -> Result<Json<PruneNowResponse>, ApiError> {
+    let config = SettingsService::new(state.manager.pool())
+        .store_config()
+        .await?;
+    let deleted_count = match resolve_prune_retention_days(config.retention_days) {
+        Some(retention_days) => {
+            let clock = state.manager.clock();
+            let today = LocalDate::from_epoch_ms(clock.now_ms(), clock.utc_offset_ms());
+            let report = banto_tstore::prune_files(state.manager.data_dir(), retention_days, today)
+                .map_err(|err| ApiError(BantoError::Storage(err.to_string())))?;
+            report.deleted.len()
+        }
+        None => {
+            // `resolve_prune_retention_days`が`None`を返すのは無制限設定
+            // （既知の正常系、ログ不要）か、`u32`に収まらない想定外の値
+            // （破壊的操作の入口なので記録する）のどちらか。
+            if let Some(retention_days) = config.retention_days {
+                crate::hub_log::log_err_line(&format!(
+                    "banto-hub: 保持日数の値が想定外のため剪定をスキップしました: {retention_days}"
+                ));
+            }
+            0
+        }
+    };
+
+    record_write(
+        &state.audit,
+        &state.auth,
+        &state.commissioning,
+        &headers,
+        "delete",
+        "store_settings_prune",
+        "1",
+        Some(json!({ "deletedCount": deleted_count })),
+    )
+    .await;
+
+    Ok(Json(PruneNowResponse { deleted_count }))
+}
+
+fn store_settings_router(
+    manager: Arc<CollectorManager>,
+    audit: AuditLogService,
+    auth: AuthState,
+    commissioning: CommissioningState,
+) -> Router {
+    let state = StoreSettingsAdminState {
+        manager,
+        auth: auth.clone(),
+        commissioning: commissioning.clone(),
+        audit: audit.clone(),
+    };
+    Router::new()
+        .route(
+            "/api/store-settings",
+            get(store_settings_get).put(store_settings_put),
+        )
+        .route(
+            "/api/store-settings/prune-preview",
+            post(store_settings_prune_preview),
+        )
+        .route(
+            "/api/store-settings/prune-now",
+            post(store_settings_prune_now),
+        )
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            RoleGuard {
+                auth: auth.clone(),
+                commissioning: commissioning.clone(),
+                min: Role::Admin,
+                resource: "store_settings",
                 audit,
             },
             require_role_at_least,
@@ -7359,6 +7630,12 @@ fn api_router_with_controller_mode(
             commissioning_state.clone(),
             events.clone(),
         ))
+        .merge(store_settings_router(
+            manager.clone(),
+            audit.clone(),
+            auth.clone(),
+            commissioning_state.clone(),
+        ))
         .merge(grpc_settings_router(
             manager.clone(),
             grpc_server,
@@ -11359,6 +11636,400 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remaining, 2);
+    }
+
+    // --- T19 S2-d (docs/banto-hub-t19-design.md §5.1、UX-39): 履歴の保持
+    // 期間 - GET/PUT /api/store-settings と POST /api/store-settings/
+    // prune-preview・prune-now -------------------------------------------
+
+    /// `env`が使う実際のtstoreデータディレクトリ（`test_manager_with_clock`
+    /// が`dir.path().join("data")`を`CollectorManager`へ渡している - この
+    /// テストではファイルを直接置く/確認するために同じパスを再現する）。
+    fn store_settings_test_data_dir(env: &TestEnv) -> std::path::PathBuf {
+        env._dir.path().join("data")
+    }
+
+    fn touch_data_file(
+        data_dir: &std::path::Path,
+        date: LocalDate,
+        seq: u32,
+    ) -> std::path::PathBuf {
+        std::fs::create_dir_all(data_dir).expect("create data dir");
+        let path = data_dir.join(format!("{}-{:03}.sqlite3", date.to_yyyymmdd(), seq));
+        std::fs::write(&path, b"").expect("touch data file");
+        path
+    }
+
+    /// `GET/PUT /api/store-settings`: admin 限定（viewer は403）、既定値
+    /// （`Some(7)`）、`null`（無制限）を含めた往復、バリデーション範囲
+    /// （1〜3650、実装指示どおり）を確認する。
+    #[tokio::test]
+    async fn store_settings_round_trips_requires_admin_and_validates_range() {
+        let env = test_env().await;
+
+        let get = |token: String| {
+            let router = env.router.clone();
+            async move {
+                let request = HttpRequest::builder()
+                    .method("GET")
+                    .uri("/api/store-settings")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap();
+                router.oneshot(request).await.unwrap()
+            }
+        };
+
+        let response = get(env.viewer_token.clone()).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = get(env.admin_token.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["retentionDays"], 7);
+
+        let put = |token: String, value: serde_json::Value| {
+            let router = env.router.clone();
+            async move {
+                let request = HttpRequest::builder()
+                    .method("PUT")
+                    .uri("/api/store-settings")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "retentionDays": value })).unwrap(),
+                    ))
+                    .unwrap();
+                router.oneshot(request).await.unwrap()
+            }
+        };
+
+        // viewer は書けない。
+        let response = put(env.viewer_token.clone(), serde_json::json!(30)).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // バリデーション: 0以下・上限超過は422。
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(-5),
+            serde_json::json!(3651),
+        ] {
+            let response = put(env.admin_token.clone(), bad.clone()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "retentionDays={bad:?} should be rejected"
+            );
+        }
+
+        // 正常な保存 → 再取得で往復する。
+        let response = put(env.admin_token.clone(), serde_json::json!(30)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let applied: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(applied["retentionDays"], 30);
+
+        let response = get(env.admin_token.clone()).await;
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let refetched: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(refetched["retentionDays"], 30);
+
+        // UX-39: 無制限（null）も保存・読み戻しできる。
+        let response = put(env.admin_token.clone(), serde_json::Value::Null).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let applied: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(applied["retentionDays"], serde_json::Value::Null);
+
+        let response = get(env.admin_token.clone()).await;
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let refetched: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(refetched["retentionDays"], serde_json::Value::Null);
+
+        // `resource = 'store_settings'`は成功した更新（action='update'）に
+        // 加えて、viewer の403（`require_role_at_least`が同じ`resource`名で
+        // 記録する`action='denied'`エントリ）も含む - ここでは「保存が
+        // 何回成功したか」だけを見るため`action='update'`に絞る。
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT action, resource, result FROM audit_log WHERE resource = 'store_settings' AND action = 'update' ORDER BY id",
+        )
+        .fetch_all(&env.pool)
+        .await
+        .unwrap();
+        // 正常な PUT（30 → null）の2件だけが記録される（バリデーション
+        // エラーになった3件・viewer の403は記録されない）。
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(
+                row,
+                (
+                    "update".to_string(),
+                    "store_settings".to_string(),
+                    "ok".to_string()
+                )
+            );
+        }
+    }
+
+    /// オーナー決定1の核心: **`PUT /api/store-settings` は保存するだけで、
+    /// 履歴ファイルを一切削除しない**。保持日数を1日に絞っても、既存の
+    /// 古いデータファイルはディスク上に残ることを確認する。
+    #[tokio::test]
+    async fn store_settings_put_never_deletes_history_files() {
+        let today = LocalDate::new(2026, 7, 12);
+        let now_ms = today.to_days_since_epoch() * 86_400_000 + 12 * 3_600_000;
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(now_ms, 0));
+        let env = test_env_with_clock(clock).await;
+
+        let data_dir = store_settings_test_data_dir(&env);
+        let old_file = touch_data_file(&data_dir, LocalDate::new(2026, 6, 1), 1);
+        let today_file = touch_data_file(&data_dir, today, 1);
+
+        // 保持日数を1日という厳しい値に変更しても、PUT 自体は削除しない。
+        let put = HttpRequest::builder()
+            .method("PUT")
+            .uri("/api/store-settings")
+            .header("Authorization", format!("Bearer {}", env.admin_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({ "retentionDays": 1 })).unwrap(),
+            ))
+            .unwrap();
+        let response = env.router.clone().oneshot(put).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        assert!(old_file.exists(), "PUT must not prune the old file");
+        assert!(today_file.exists());
+    }
+
+    /// `POST /api/store-settings/prune-preview`・`prune-now`が**保存済みの**
+    /// 保持方針で動くこと、preview は削除しないこと、prune-now は実際に
+    /// 削除して監査ログに残すことを確認する（admin 限定も併せて確認）。
+    #[tokio::test]
+    async fn store_settings_prune_preview_and_prune_now_use_saved_policy() {
+        let today = LocalDate::new(2026, 7, 12);
+        let now_ms = today.to_days_since_epoch() * 86_400_000 + 12 * 3_600_000;
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(now_ms, 0));
+        let env = test_env_with_clock(clock).await;
+
+        let data_dir = store_settings_test_data_dir(&env);
+        // 7日保持のとき、30日以上前のファイルは削除対象、当日ファイルは
+        // 対象外 - `banto-tstore`の`prune_files`単体テストと同じ境界判定。
+        let old_file = touch_data_file(&data_dir, LocalDate::new(2026, 6, 1), 1);
+        let today_file = touch_data_file(&data_dir, today, 1);
+
+        let put = HttpRequest::builder()
+            .method("PUT")
+            .uri("/api/store-settings")
+            .header("Authorization", format!("Bearer {}", env.admin_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({ "retentionDays": 7 })).unwrap(),
+            ))
+            .unwrap();
+        let response = env.router.clone().oneshot(put).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // viewer は preview/prune-now どちらも403。
+        for path in [
+            "/api/store-settings/prune-preview",
+            "/api/store-settings/prune-now",
+        ] {
+            let request = HttpRequest::builder()
+                .method("POST")
+                .uri(path)
+                .header("Authorization", format!("Bearer {}", env.viewer_token))
+                .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                .body(Body::empty())
+                .unwrap();
+            let response = env.router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "path={path}");
+        }
+
+        // preview は件数を返すだけで削除しない。
+        let preview = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/store-settings/prune-preview")
+            .header("Authorization", format!("Bearer {}", env.admin_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .body(Body::empty())
+            .unwrap();
+        let response = env.router.clone().oneshot(preview).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["wouldDeleteCount"], 1);
+        assert!(old_file.exists(), "preview must not delete anything");
+
+        // prune-now は実際に削除し、削除数を返し、監査ログに残す。
+        let prune_now = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/store-settings/prune-now")
+            .header("Authorization", format!("Bearer {}", env.admin_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .body(Body::empty())
+            .unwrap();
+        let response = env.router.clone().oneshot(prune_now).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["deletedCount"], 1);
+        assert!(
+            !old_file.exists(),
+            "prune-now must delete the aged-out file"
+        );
+        assert!(today_file.exists(), "today's file must survive");
+
+        let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT action, resource, result, detail FROM audit_log WHERE resource = 'store_settings_prune' ORDER BY id",
+        )
+        .fetch_all(&env.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "delete");
+        assert_eq!(rows[0].1, "store_settings_prune");
+        assert_eq!(rows[0].2, "ok");
+        let detail: serde_json::Value =
+            serde_json::from_str(rows[0].3.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["deletedCount"], 1);
+    }
+
+    /// UX-39（無制限の選択肢）: `retentionDays: null`のときは
+    /// preview/prune-now とも何も削除しない。
+    #[tokio::test]
+    async fn store_settings_prune_with_unlimited_policy_deletes_nothing() {
+        let today = LocalDate::new(2026, 7, 12);
+        let now_ms = today.to_days_since_epoch() * 86_400_000 + 12 * 3_600_000;
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(now_ms, 0));
+        let env = test_env_with_clock(clock).await;
+
+        let data_dir = store_settings_test_data_dir(&env);
+        let old_file = touch_data_file(&data_dir, LocalDate::new(2020, 1, 1), 1);
+
+        let put = HttpRequest::builder()
+            .method("PUT")
+            .uri("/api/store-settings")
+            .header("Authorization", format!("Bearer {}", env.admin_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({ "retentionDays": null })).unwrap(),
+            ))
+            .unwrap();
+        let response = env.router.clone().oneshot(put).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let preview = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/store-settings/prune-preview")
+            .header("Authorization", format!("Bearer {}", env.admin_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .body(Body::empty())
+            .unwrap();
+        let response = env.router.clone().oneshot(preview).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["wouldDeleteCount"], 0);
+
+        let prune_now = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/store-settings/prune-now")
+            .header("Authorization", format!("Bearer {}", env.admin_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .body(Body::empty())
+            .unwrap();
+        let response = env.router.clone().oneshot(prune_now).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["deletedCount"], 0);
+        assert!(old_file.exists(), "unlimited retention must delete nothing");
+    }
+
+    /// レビュー指摘の安全化: 保持日数が`u32::MAX`を超える値で保存されて
+    /// いる状態（`parse_retention`は上限クランプをしないため、保存経路を
+    /// 通らず直接設定された等でこの状態になり得る）で prune-preview /
+    /// prune-now を叩くと、どちらも削除0件になり（既存ファイルが消えず）、
+    /// 両者の判定が一致すること（`resolve_prune_retention_days`を両方の
+    /// ハンドラが共有していることの固定）を確認する。
+    #[tokio::test]
+    async fn store_settings_prune_with_out_of_range_retention_days_deletes_nothing() {
+        let today = LocalDate::new(2026, 7, 12);
+        let now_ms = today.to_days_since_epoch() * 86_400_000 + 12 * 3_600_000;
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new(now_ms, 0));
+        let env = test_env_with_clock(clock).await;
+
+        let data_dir = store_settings_test_data_dir(&env);
+        let old_file = touch_data_file(&data_dir, LocalDate::new(2020, 1, 1), 1);
+
+        // `PUT /api/store-settings`のバリデーション（1〜3650）を経由せず、
+        // 保存経路そのものへ想定外の巨大値を直接書き込む - レビュー指摘が
+        // 想定する「設定が壊れている・DBを直接編集された」状況の再現。
+        SettingsService::new(env.pool.clone())
+            .set_store_config(&StoreSettings {
+                data_dir: "./data".to_string(),
+                retention_days: Some(u32::MAX as i64 + 1),
+            })
+            .await
+            .expect("set_store_config");
+
+        let preview = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/store-settings/prune-preview")
+            .header("Authorization", format!("Bearer {}", env.admin_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .body(Body::empty())
+            .unwrap();
+        let response = env.router.clone().oneshot(preview).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["wouldDeleteCount"], 0);
+        assert!(old_file.exists(), "preview must not delete anything");
+
+        let prune_now = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/store-settings/prune-now")
+            .header("Authorization", format!("Bearer {}", env.admin_token))
+            .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+            .body(Body::empty())
+            .unwrap();
+        let response = env.router.clone().oneshot(prune_now).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["deletedCount"], 0);
+        assert!(
+            old_file.exists(),
+            "out-of-range retention_days must delete nothing, matching the preview"
+        );
     }
 
     // --- T18-5a 第2段 (docs/banto-hub-t18-design.md §4 決定6): 薄い部品の
