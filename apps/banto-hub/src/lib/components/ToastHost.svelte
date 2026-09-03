@@ -12,7 +12,7 @@
 				<button
 					type="button"
 					class="action"
-					data-testid="toast-undo"
+					data-testid={`toast-action-${toast.id}`}
 					onclick={toast.action.onClick}
 				>
 					{toast.action.label}

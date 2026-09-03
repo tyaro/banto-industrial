@@ -19,7 +19,8 @@
  * 「削除の遅延実行」になった（confirm 直後は一覧から消えるだけで、実際の
  * `DELETE` は数秒後）。テスト3（confirm OK → 削除完了）は見た目だけでなく
  * 実際の `DELETE` レスポンスを待つよう変更し、取り消しトースト
- * （`data-testid="toast-undo"`）を押すケースをテスト4として追加した。
+ * （ロール+ラベル `role: 'button', name: '取り消し'` で取得）を押すケースを
+ * テスト4として追加した。
  */
 import { expect, test, type Page, type Request } from '@playwright/test';
 import { CSRF_HEADERS, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
@@ -255,7 +256,7 @@ test.describe.serial('banto-hub タグ削除前の参照影響表示 (TAG-UX-C)'
 				page.getByRole('gridcell', { name: REFERENCED_TAG_NAME, exact: true })
 			).toHaveCount(0);
 
-			const undoButton = page.getByTestId('toast-undo');
+			const undoButton = page.getByRole('button', { name: '取り消し' });
 			await expect(undoButton).toBeVisible();
 			await undoButton.click();
 

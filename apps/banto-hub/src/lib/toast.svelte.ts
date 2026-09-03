@@ -45,8 +45,11 @@ class ToastStore {
 			? {
 					label: options.action.label,
 					onClick: () => {
-						options.action!.onClick();
-						this.dismiss(id);
+						try {
+							options.action!.onClick();
+						} finally {
+							this.dismiss(id);
+						}
 					}
 				}
 			: undefined;
