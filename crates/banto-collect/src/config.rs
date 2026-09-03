@@ -18,7 +18,7 @@
 //! this filtered set, so a disabled connection contributes nothing - no
 //! socket, no columns, no cache entries.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use banto_core::ListParams;
@@ -367,6 +367,41 @@ impl RegistrySnapshot {
             tags,
         })
     }
+}
+
+/// Connection ids that have at least one *enabled* [`CollectionGroup`] -
+/// the exact predicate [`build_config_from`] itself uses below to decide
+/// whether a connection gets a [`ConnectionPlan`] at all (see that
+/// function's "A connection with no collected groups gets no task and no
+/// socket" comment). Note this is a *group*-level check, not a *tag*-level
+/// one: an enabled group with zero tags still counts here, matching
+/// `build_config_from`'s own behaviour (a group is pushed into its
+/// `group_plans` regardless of whether any of its tags survived the loop
+/// below) - "収集対象グループが1つ以上ある", not "タグが1件でもある".
+///
+/// Deliberately does **not** replicate `build_config_from`'s
+/// protocol-specific parsing (`parse_protocol`/`modbus_config_for`/
+/// `slmp_config_for`, all of which can fail for reasons unrelated to "does
+/// this connection have anything to collect") - a caller asking only "is
+/// this connection tagless" should not be able to fail over a malformed
+/// port number on an unrelated field. This means the two can disagree only
+/// when the connection's own config is already invalid, in which case
+/// `build_config_from`/`build_config` fail outright and surface that error
+/// through their own, separate path.
+///
+/// Exposed so callers outside this crate (banto-hub's write-side broker
+/// session sync, T19 S2-a/UX-48: `crate::hub::CollectorManager`'s session
+/// sync in `apps/banto-hub/core/src/hub.rs`) can decide "does this
+/// connection need a session" from the exact same input data
+/// (`RegistrySnapshot`) and the exact same rule the collector itself uses,
+/// rather than maintaining a second, potentially drifting definition of
+/// "tagless connection".
+pub fn connections_with_collected_groups(groups: &[CollectionGroup]) -> HashSet<i64> {
+    groups
+        .iter()
+        .filter(|group| group.enabled)
+        .map(|group| group.plc_connection_id)
+        .collect()
 }
 
 /// Assemble a [`CollectorConfig`] from the tag registry in `pool` (the app's
@@ -827,6 +862,81 @@ mod tests {
         assert_eq!(
             config.store_config.groups[0].key,
             format!("grp:{}", group.id)
+        );
+    }
+
+    /// T19 S2-a (UX-48): `connections_with_collected_groups` is a pure
+    /// function over `groups` alone, so it can be tested without a DB at
+    /// all - a connection with no group, one with only a disabled group,
+    /// and one with an enabled (even tagless) group.
+    #[test]
+    fn connections_with_collected_groups_is_group_based_not_tag_based() {
+        let groups = vec![
+            CollectionGroup {
+                id: 1,
+                name: "G-enabled-empty".to_string(),
+                plc_connection_id: 10,
+                period_ms: 1_000,
+                enabled: true,
+                default_writable: true,
+            },
+            CollectionGroup {
+                id: 2,
+                name: "G-disabled".to_string(),
+                plc_connection_id: 20,
+                period_ms: 1_000,
+                enabled: false,
+                default_writable: true,
+            },
+        ];
+
+        let collectible = connections_with_collected_groups(&groups);
+
+        // conn 10 has an enabled group (even with zero tags of its own in
+        // this fixture) - it counts, matching build_config_from's own
+        // group-level (not tag-level) skip rule.
+        assert!(collectible.contains(&10));
+        // conn 20's only group is disabled - it does not count, same as a
+        // connection with no group at all (conn 30, never mentioned here).
+        assert!(!collectible.contains(&20));
+        assert!(!collectible.contains(&30));
+    }
+
+    #[tokio::test]
+    async fn connections_with_collected_groups_matches_build_config_from_skip_rule() {
+        let pool = registry().await;
+        let conn_svc = PlcConnectionService::new(pool.clone());
+
+        // conn_tagless: enabled connection, zero groups - build_config_from
+        // skips it entirely ("reading nothing from a PLC is pointless").
+        let conn_tagless = conn_svc.create(conn_input("Tagless", 502)).await.unwrap();
+        // conn_tagged: enabled connection with an enabled group and a tag -
+        // build_config_from gives it a ConnectionPlan.
+        let conn_tagged = conn_svc.create(conn_input("Tagged", 503)).await.unwrap();
+        let group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", conn_tagged.id, 1_000))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input("T1", group.id, "40001"))
+            .await
+            .unwrap();
+
+        let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
+        let collectible = connections_with_collected_groups(&snapshot.groups);
+        assert!(!collectible.contains(&conn_tagless.id));
+        assert!(collectible.contains(&conn_tagged.id));
+
+        let config = build_config_from(&snapshot).unwrap();
+        let plan_ids: HashSet<i64> = config
+            .connections
+            .iter()
+            .map(|c| c.key.strip_prefix("conn:").unwrap().parse::<i64>().unwrap())
+            .collect();
+        assert_eq!(
+            plan_ids, collectible,
+            "connections_with_collected_groups must exactly match which \
+             connections build_config_from actually gives a ConnectionPlan"
         );
     }
 

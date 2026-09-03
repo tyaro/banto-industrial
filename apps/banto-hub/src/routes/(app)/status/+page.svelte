@@ -104,7 +104,12 @@
 	const statusLabels: Record<string, string> = {
 		connected: '接続中',
 		reconnecting: '再接続中',
-		stopped: '停止中'
+		stopped: '停止中',
+		// T19 S2-a（UX-48）: タグの無い接続はそもそもセッションを張らない
+		// ので「停止中」（本来動くはずが止まっている）とは区別する - 見た目
+		// が同じだと壊れていると誤解される（docs/banto-hub-t19-design.md
+		// §3.8）。
+		unused: '未使用（タグ未登録）'
 	};
 
 	function statusLabel(status: string): string {
@@ -114,6 +119,7 @@
 	function statusClass(status: string): string {
 		if (status === 'connected') return 'ok';
 		if (status === 'reconnecting') return 'warn';
+		if (status === 'unused') return 'muted';
 		return 'bad';
 	}
 
@@ -998,6 +1004,14 @@
 
 	tr.status-bad td {
 		color: var(--banto-text-muted);
+	}
+
+	tr.status-muted td {
+		/* T19 S2-a（UX-48）: 「停止中」（status-bad）と同じ落ち着いた色調だが、
+		   壊れているのではなく元から使っていないことを示すため斜体で
+		   区別する。 */
+		color: var(--banto-text-muted);
+		font-style: italic;
 	}
 
 	.table-wrap {

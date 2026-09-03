@@ -57,7 +57,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use banto_broker::{is_supported_protocol, BrokerConnectionStatus, BrokerError};
-use banto_collect::{build_config_from, ApplyReport, ConnectionStatus, RegistrySnapshot};
+use banto_collect::{
+    build_config_from, connections_with_collected_groups, ApplyReport, ConnectionStatus,
+    RegistrySnapshot,
+};
 use banto_core::{BantoError, ErrorBody, FieldError, ListParams, ListResult};
 // T12 (docs/ux-plan.md §4): 保存前の接続テスト API 用。Modbus/SLMP 両方の
 // 直接ダイヤル経路が同じ型を使うので、ここで一括 import する
@@ -2383,6 +2386,20 @@ impl From<TagPayload> for TagInput {
 /// `legacy_live_reconfigure` disabled: registry writes advance the configured
 /// revision only. The compatibility router can opt into the pre-T14-3 live
 /// apply for existing embedders/tests.
+///
+/// **T19 S2-a 案B (UX-48, docs/banto-hub-t19-design.md §3.8, 2026-09-03)**:
+/// the single function every registry-mutation handler in this file AND
+/// `execute_pending_apply` (the `/api/pending-changes/{id}/apply` handler's
+/// worker) funnel through - see this fn's call sites - so this is also the
+/// one place that needs to re-sync broker sessions for a catalog change made
+/// while a collection run is already `Running`. That resync
+/// (`CollectionController::resync_sessions_for_catalog_change`) runs in the
+/// `else` branch below unconditionally (not just for `legacy_live_reconfigure`
+/// callers): it is a no-op unless the controller is actually `Running` (its
+/// own doc comment), so it is always safe to call, and skipping it for the
+/// production (non-legacy) case would defeat the entire point of 案B - see
+/// that method's doc comment for the full derivation, including why this is
+/// safe against the T15-4 stop-vs-write race.
 async fn commit_catalog_and_notify(
     manager: &CollectorManager,
     controller: &CollectionController,
@@ -2402,6 +2419,10 @@ async fn commit_catalog_and_notify(
             {
                 eprintln!("banto-hub: {resource} 変更後の live reconfigure に失敗しました: {err}");
             }
+        } else {
+            controller
+                .resync_sessions_for_catalog_change(&snapshot)
+                .await;
         }
     }
     let _ = events.send(ServerEvent::ResourceChanged {
@@ -5551,6 +5572,14 @@ struct StatusResponse {
 /// that registered set) still falls back to reading from
 /// `banto_collect::Collector::status` - unaffected by #131, since it was
 /// never broker-routed to begin with.
+///
+/// **T19 S2-a (UX-48, 2026-09-03)**: an enabled, broker-managed connection
+/// with zero enabled collection groups reports `"unused"` here instead of
+/// falling through to `broker_status` (which would read `None`/`Stopped`
+/// indistinguishably from a disabled connection) - see
+/// `crate::hub::CollectorManager::sync_slmp_sessions_from`'s doc comment for
+/// why such a connection has no broker session to report on in the first
+/// place.
 async fn compute_status(state: &TagSpaceState) -> Result<StatusResponse, ApiError> {
     let runtime = state.controller.status();
     let revision = state.manager.configured_revision();
@@ -5561,6 +5590,19 @@ async fn compute_status(state: &TagSpaceState) -> Result<StatusResponse, ApiErro
         .list(ListParams::default())
         .await?
         .rows;
+    // T19 S2-a (UX-48): same predicate the session sync
+    // (`CollectorManager::sync_slmp_sessions_from`) and the collector itself
+    // (`banto_collect::build_config_from`) use to decide "does this
+    // connection have anything to collect" - reused here so the status
+    // screen can tell a genuinely-unused connection ("unused" below) apart
+    // from one that is enabled, has tags, and simply isn't connecting
+    // ("stopped"/"reconnecting").
+    let collectible_connection_ids = connections_with_collected_groups(
+        &CollectionGroupService::new(state.manager.pool())
+            .list(ListParams::default())
+            .await?
+            .rows,
+    );
     let mqtt_settings = SettingsService::new(state.manager.pool())
         .mqtt_config()
         .await?;
@@ -5572,16 +5614,29 @@ async fn compute_status(state: &TagSpaceState) -> Result<StatusResponse, ApiErro
         .into_iter()
         .map(|conn| {
             let (status_str, attempt) = if is_supported_protocol(&conn.protocol) {
-                match state.manager.broker_status(conn.id) {
-                    Some(BrokerConnectionStatus::Connected) => ("connected", None),
-                    Some(BrokerConnectionStatus::Reconnecting { attempt }) => {
-                        ("reconnecting", Some(attempt))
+                // T19 S2-a (UX-48): a connection with no enabled collection
+                // group gets no broker session pre-synced at all (see
+                // `CollectorManager::sync_slmp_sessions_from`'s doc comment),
+                // so `broker_status` would otherwise round it down to
+                // "stopped" indistinguishably from a disabled or genuinely
+                // failing connection. Surface it as its own "unused" status
+                // instead - a disabled connection still reports "stopped"
+                // (checked first: `conn.enabled` gates this branch), so the
+                // two stay visually distinct.
+                if conn.enabled && !collectible_connection_ids.contains(&conn.id) {
+                    ("unused", None)
+                } else {
+                    match state.manager.broker_status(conn.id) {
+                        Some(BrokerConnectionStatus::Connected) => ("connected", None),
+                        Some(BrokerConnectionStatus::Reconnecting { attempt }) => {
+                            ("reconnecting", Some(attempt))
+                        }
+                        // "stopped" also covers "no broker session yet" (no
+                        // rebuild has run, or this connection is currently
+                        // disabled) - same rounding banto_collect's own
+                        // ConnectionStatus branch below uses.
+                        Some(BrokerConnectionStatus::Stopped) | None => ("stopped", None),
                     }
-                    // "stopped" also covers "no broker session yet" (no
-                    // rebuild has run, or this connection is currently
-                    // disabled) - same rounding banto_collect's own
-                    // ConnectionStatus branch below uses.
-                    Some(BrokerConnectionStatus::Stopped) | None => ("stopped", None),
                 }
             } else {
                 let key = format!("conn:{}", conn.id);
@@ -7666,6 +7721,325 @@ mod tests {
         assert_eq!(json["revision"], 1);
         assert!(json["last_config_error"].is_null());
         assert_eq!(json["connections"].as_array().unwrap().len(), 1);
+        // T19 S2-a (UX-48): a connection with zero collection groups (this
+        // one - it was created with no group at all) reports "unused", not
+        // "stopped"/"reconnecting" - it never gets a broker session synced
+        // in the first place (`CollectorManager::sync_slmp_sessions_from`'s
+        // doc comment), so lumping it in with "stopped" would read as
+        // broken rather than simply not set up yet.
+        assert_eq!(json["connections"][0]["status"], "unused");
+    }
+
+    /// T19 S2-a (UX-48): the flip side of the assertion added to
+    /// `tags_create_via_admin_router_rebuilds_the_catalog` above - once a
+    /// connection has an enabled group and tag, its status is no longer
+    /// "unused" even before any explicit rebuild/run has synced a broker
+    /// session for it (it falls back to the pre-existing "stopped" rounding
+    /// documented on `compute_status`, not the new "unused" bucket).
+    #[tokio::test]
+    async fn a_connection_with_a_tag_is_never_reported_unused() {
+        let (router, token, _dir) = router_with_token().await;
+
+        let (status, conn) = admin_post(
+            &router,
+            "/api/plc-connections",
+            &token,
+            json!({ "name": "line1", "host": "127.0.0.1", "port": 15023 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+        let (status, group) = admin_post(
+            &router,
+            "/api/collection-groups",
+            &token,
+            json!({ "name": "g1", "plcConnectionId": conn["id"], "periodMs": 1000 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{group:?}");
+        let (status, tag) = admin_post(
+            &router,
+            "/api/tags",
+            &token,
+            json!({
+                "name": "t1",
+                "collectionGroupId": group["id"],
+                "address": "40001",
+                "dataType": "i16",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{tag:?}");
+
+        let (status, status_body) = v1_get(&router, &token, "/api/v1/status").await;
+        assert_eq!(status, StatusCode::OK, "{status_body:?}");
+        assert_eq!(status_body["connections"].as_array().unwrap().len(), 1);
+        assert_ne!(status_body["connections"][0]["status"], "unused");
+    }
+
+    /// T19 S2-a 案B (UX-48, docs/banto-hub-t19-design.md §3.8, 2026-09-03):
+    /// a manager/controller pair without the router/RBAC/session layer
+    /// around it, so the tests below can call `commit_catalog_and_notify`
+    /// (this file's own catalog-commit entry point - the ONE function every
+    /// registry-mutation handler and `execute_pending_apply` funnel
+    /// through, this fn's own doc comment) directly while the controller is
+    /// `Running`. That is a state none of this file's own HTTP handlers can
+    /// ever reach for a catalog-only commit: every one of them checks
+    /// `state.controller.status().state == CollectionState::Stopped`
+    /// first and queues the change as a pending one otherwise
+    /// (`require_collection_stopped`/`queue_pending_registry_change`), and
+    /// `execute_pending_apply` itself refuses to apply a queued change
+    /// unless the controller is `Stopped` too
+    /// (`PendingApplyError::CollectionEditLocked`). Calling the shared
+    /// commit function directly here is what lets these tests prove out the
+    /// underlying safety net (`CollectionController::
+    /// resync_sessions_for_catalog_change`) on its own terms, independent of
+    /// that REST-level policy layer - see that method's doc comment for why
+    /// the safety net has to exist regardless.
+    async fn catalog_resync_test_env() -> (
+        Arc<CollectorManager>,
+        Arc<CollectionController>,
+        broadcast::Sender<ServerEvent>,
+        sqlx::SqlitePool,
+        tempfile::TempDir,
+    ) {
+        let pool = migrate_memory().await.expect("migrate_memory");
+        let (manager, dir) = test_manager_with_clock(pool.clone(), Arc::new(SystemClock));
+        let write_control = Arc::new(WriteControl::new(false));
+        let test_output = Arc::new(TestOutputControl::new());
+        let controller = Arc::new(CollectionController::new(
+            manager.clone(),
+            write_control,
+            test_output,
+        ));
+        let (events, _rx) = tokio_broadcast::channel(16);
+        (manager, controller, events, pool, dir)
+    }
+
+    /// T19 S2-a 案B, "most important" per the implementation instructions:
+    /// a catalog change committed while collection is `Stopped` must NOT
+    /// dial a broker session - `CollectionController::
+    /// resync_sessions_for_catalog_change` only acts while `Running` (its
+    /// own doc comment). This is the direct evidence that 案B does not
+    /// reopen the T15-4 hazard (`crate::write_path`'s module doc comment,
+    /// "gate 8 は broker セッションを新規に張らない") of dialing a PLC the
+    /// operator meant to leave stopped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_catalog_and_notify_does_not_dial_a_session_while_collection_is_stopped() {
+        let (manager, controller, events, pool, _dir) = catalog_resync_test_env().await;
+        assert_eq!(controller.status().state, CollectionState::Stopped);
+
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(
+                serde_json::from_value::<PlcConnectionPayload>(json!({
+                    "name": "line-resync-stopped",
+                    "host": "127.0.0.1",
+                    "port": 15041,
+                }))
+                .unwrap()
+                .into(),
+            )
+            .await
+            .unwrap();
+        let group = CollectionGroupService::new(pool.clone())
+            .create(
+                serde_json::from_value::<CollectionGroupPayload>(json!({
+                    "name": "g1",
+                    "plcConnectionId": conn.id,
+                    "periodMs": 1000,
+                }))
+                .unwrap()
+                .into(),
+            )
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(
+                serde_json::from_value::<TagPayload>(json!({
+                    "name": "t1",
+                    "collectionGroupId": group.id,
+                    "address": "40001",
+                    "dataType": "i16",
+                }))
+                .unwrap()
+                .into(),
+            )
+            .await
+            .unwrap();
+
+        let snapshot = RegistrySnapshot::load(&pool).await.expect("snapshot");
+        commit_catalog_and_notify(&manager, &controller, &events, "tags", snapshot, false).await;
+
+        assert!(
+            !manager.sessions().connection_ids().contains(&conn.id),
+            "a catalog change committed while stopped must not dial a broker session"
+        );
+        assert!(
+            manager.write_broker_handle_peek(conn.id).is_none(),
+            "no session exists, so the write path must still fail closed"
+        );
+    }
+
+    /// T19 S2-a 案B: the "add" case - a tag (and its group) registered under
+    /// a previously-tagless connection while collection is already
+    /// `Running` gets a broker session synced immediately on that catalog
+    /// commit, not only at the next `start`/`stop` cycle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_catalog_and_notify_syncs_a_session_for_a_newly_tagged_connection_while_running()
+    {
+        let (manager, controller, events, pool, _dir) = catalog_resync_test_env().await;
+
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(
+                serde_json::from_value::<PlcConnectionPayload>(json!({
+                    "name": "line-resync-add",
+                    "host": "127.0.0.1",
+                    "port": 15042,
+                }))
+                .unwrap()
+                .into(),
+            )
+            .await
+            .unwrap();
+
+        let started = controller.start(RunMode::Configured).await;
+        assert_eq!(started.state, CollectionState::Running);
+        // Zero collection groups yet (T19 S2-a) - genuinely tagless, so
+        // `apply_run` (inside `start`) did not sync a broker session for it.
+        assert!(!manager.sessions().connection_ids().contains(&conn.id));
+
+        let group = CollectionGroupService::new(pool.clone())
+            .create(
+                serde_json::from_value::<CollectionGroupPayload>(json!({
+                    "name": "g1",
+                    "plcConnectionId": conn.id,
+                    "periodMs": 1000,
+                }))
+                .unwrap()
+                .into(),
+            )
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(
+                serde_json::from_value::<TagPayload>(json!({
+                    "name": "t1",
+                    "collectionGroupId": group.id,
+                    "address": "40001",
+                    "dataType": "i16",
+                }))
+                .unwrap()
+                .into(),
+            )
+            .await
+            .unwrap();
+
+        let snapshot = RegistrySnapshot::load(&pool).await.expect("snapshot");
+        commit_catalog_and_notify(&manager, &controller, &events, "tags", snapshot, false).await;
+
+        assert!(
+            manager.sessions().connection_ids().contains(&conn.id),
+            "adding a tag to a tagless connection while running must sync a broker session \
+             immediately (T19 S2-a 案B), not only at the next start/stop cycle"
+        );
+        assert!(
+            manager.write_broker_handle_peek(conn.id).is_some(),
+            "the write path must find the session peek-able right after the catalog commit"
+        );
+
+        controller.stop().await;
+    }
+
+    /// T19 S2-a 案B: the "remove" flip side - once a connection's last
+    /// enabled collection group is disabled while collection is `Running`,
+    /// its broker session is torn down on that same catalog commit, mirroring
+    /// `CollectorManager::rebuild`'s own add+remove sync (T7-2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_catalog_and_notify_removes_a_session_once_the_last_group_is_disabled_while_running(
+    ) {
+        let (manager, controller, events, pool, _dir) = catalog_resync_test_env().await;
+
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(
+                serde_json::from_value::<PlcConnectionPayload>(json!({
+                    "name": "line-resync-remove",
+                    "host": "127.0.0.1",
+                    "port": 15043,
+                }))
+                .unwrap()
+                .into(),
+            )
+            .await
+            .unwrap();
+        let groups = CollectionGroupService::new(pool.clone());
+        let group = groups
+            .create(
+                serde_json::from_value::<CollectionGroupPayload>(json!({
+                    "name": "g1",
+                    "plcConnectionId": conn.id,
+                    "periodMs": 1000,
+                }))
+                .unwrap()
+                .into(),
+            )
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(
+                serde_json::from_value::<TagPayload>(json!({
+                    "name": "t1",
+                    "collectionGroupId": group.id,
+                    "address": "40001",
+                    "dataType": "i16",
+                }))
+                .unwrap()
+                .into(),
+            )
+            .await
+            .unwrap();
+
+        let started = controller.start(RunMode::Configured).await;
+        assert_eq!(started.state, CollectionState::Running);
+        assert!(
+            manager.sessions().connection_ids().contains(&conn.id),
+            "a connection with a tag must get a broker session synced on start, as before T19 S2-a"
+        );
+
+        groups
+            .update(
+                group.id,
+                CollectionGroupInput {
+                    name: group.name.clone(),
+                    plc_connection_id: group.plc_connection_id,
+                    period_ms: group.period_ms,
+                    enabled: false,
+                    default_writable: group.default_writable,
+                },
+            )
+            .await
+            .unwrap();
+
+        let snapshot = RegistrySnapshot::load(&pool).await.expect("snapshot");
+        commit_catalog_and_notify(
+            &manager,
+            &controller,
+            &events,
+            "collection_groups",
+            snapshot,
+            false,
+        )
+        .await;
+
+        assert!(
+            !manager.sessions().connection_ids().contains(&conn.id),
+            "disabling a connection's last enabled group while running must remove its broker \
+             session on that same catalog commit (T19 S2-a 案B)"
+        );
+        assert!(
+            manager.write_broker_handle_peek(conn.id).is_none(),
+            "no session remains, so the write path must fail closed"
+        );
+
+        controller.stop().await;
     }
 
     // --- T0-2: API キー基盤 ------------------------------------------------

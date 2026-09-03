@@ -8,6 +8,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use banto_collect::RegistrySnapshot;
 use serde::Serialize;
 use tokio::sync::watch;
 use tokio::sync::Mutex as AsyncMutex;
@@ -164,6 +165,54 @@ impl CollectionController {
     /// Refresh the status watch after an external catalog-only commit.
     pub fn refresh_status(&self) {
         self.status_tx.send_replace(self.status());
+    }
+
+    /// T19 S2-a 案B (UX-48, docs/banto-hub-t19-design.md §3.8, 2026-09-03):
+    /// re-sync broker sessions against `snapshot` after a catalog-only
+    /// commit (`crate::rest::commit_catalog_and_notify`, the only intended
+    /// caller), closing the gap where a tag added to a previously-tagless
+    /// connection (or the last tag/group removed from one) would not affect
+    /// broker sessions - and therefore the write path
+    /// (`crate::hub::CollectorManager::write_broker_handle_peek`) - until
+    /// the next `start`/`stop` cycle.
+    ///
+    /// **Serialized against `start`/`stop` via the SAME `transition` lock
+    /// those use** (`try_lock`, identical discipline to
+    /// [`Self::start`]/[`Self::stop`] above): if a start or stop is already
+    /// in flight, this does nothing - that in-flight transition is itself
+    /// about to either establish or tear down every broker session
+    /// correctly (via [`CollectorManager::apply_run`]/[`CollectorManager::stop`]),
+    /// so there is nothing left for this call to add, and calling
+    /// [`CollectorManager::resync_broker_sessions`] concurrently with it
+    /// would be exactly the hazard the next paragraph describes. This is
+    /// what keeps a catalog-driven resync from ever racing
+    /// [`Self::stop_locked`]'s call into `CollectorManager::stop` - the
+    /// T15-4-shaped danger 案B has to avoid re-introducing (see
+    /// `CollectorManager::resync_broker_sessions`'s own doc comment for the
+    /// full derivation: `CollectorManager::stop` does not take the
+    /// manager's own `rebuild_lock`, so only this `transition` lock stands
+    /// between "stop just tore a session down" and "resync re-dials it a
+    /// moment later").
+    ///
+    /// **Only resyncs while the controller reports `Running`** - a
+    /// `Stopped`/`Starting`/`Stopping`/`Faulted` controller has no broker
+    /// sessions that should exist at all (a `Stopped` controller in
+    /// particular has none at all - `CollectorManager::stop` already tore
+    /// every one of them down), and dialing one here on a catalog commit
+    /// made while stopped would be exactly the "PLC we meant to leave
+    /// stopped gets dialed anyway" mistake T15-4 fixed once already for the
+    /// write path.
+    pub async fn resync_sessions_for_catalog_change(&self, snapshot: &RegistrySnapshot) {
+        let Ok(_guard) = self.transition.try_lock() else {
+            return;
+        };
+        let current = self.status();
+        if current.state != CollectionState::Running {
+            return;
+        }
+        self.manager
+            .resync_broker_sessions(snapshot, current.mode)
+            .await;
     }
 
     /// Start the requested mode. A request arriving during another transition

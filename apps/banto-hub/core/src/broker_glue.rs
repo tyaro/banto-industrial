@@ -277,6 +277,25 @@ impl PlcClient for BrokerReadClient {
 /// per-connection `remove` for exactly the ids that fell out of the wanted
 /// set is the minimal change that actually reclaims resources without ever
 /// touching a session nothing asked to remove.
+///
+/// **T19 S2-a addendum (UX-48, docs/banto-hub-t19-design.md §3.8,
+/// 2026-09-03)**: "every currently-enabled connection whose protocol the
+/// broker manages" above got one more condition - the connection also needs
+/// at least one *enabled collection group* (`banto_collect::
+/// connections_with_collected_groups`, the same predicate `build_config_from`
+/// uses to decide whether a connection collects anything at all). A
+/// connection with zero enabled groups no longer falls in the wanted set, so
+/// it now goes through the exact same removal path described above the
+/// moment it stops qualifying - no new mechanism, just a narrower wanted
+/// set. See `CollectorManager::sync_slmp_sessions_from`'s doc comment for the
+/// full derivation. **T19 S2-a 案B (2026-09-03)**: a tag added to a
+/// still-unsynced connection no longer has to wait for the next
+/// rebuild/apply_run to become writable - `crate::rest::commit_catalog_and_notify`
+/// now also drives `CollectorManager::resync_broker_sessions` (via
+/// `crate::controller::CollectionController::resync_sessions_for_catalog_change`)
+/// whenever the catalog change commits while a run is already `Running` -
+/// see that method's doc comment for the full derivation and its
+/// transition-lock discipline.
 pub struct HubSessions {
     directory: SessionDirectory,
     /// `Some` until [`Self::shutdown`] consumes it (`BrokerSupervisor::shutdown`

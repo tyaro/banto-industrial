@@ -193,8 +193,9 @@ use banto_broker::{
     is_supported_protocol, BrokerConnectionStatus, BrokerError, BrokerHandle, ReadOnlyHandle,
 };
 use banto_collect::{
-    build_config_from, ApplyReport, CollectEvent, Collector, CollectorOptions, ConnectionStatus,
-    CurrentSample, CurrentValuesHandle, EventSink, Quality, RegistrySnapshot,
+    build_config_from, connections_with_collected_groups, ApplyReport, CollectEvent, Collector,
+    CollectorOptions, ConnectionStatus, CurrentSample, CurrentValuesHandle, EventSink, Quality,
+    RegistrySnapshot,
 };
 use banto_core::ListParams;
 use banto_tags::{CollectionGroupService, PlcConnection, PlcConnectionService, Tag, TagService};
@@ -932,13 +933,25 @@ impl CollectorManager {
         // not just SLMP) plus the set of tracked ids that are no longer
         // wanted - see `Self::sync_slmp_sessions_from`'s doc comment.
         // Deliberately unconditional (runs even when `config.group_count()
-        // == 0` just below) - a connection can be enabled with no
-        // collectible groups yet and still deserve a live broker session
-        // ready for the write path, and this step never touches
+        // == 0` just below) - independent of whether the resulting
+        // collector config ends up empty, every OTHER still-collectible
+        // connection's broker session bookkeeping (add/remove) must still
+        // happen this rebuild, and this step never touches
         // `inner`/`collector` so it carries no all-or-nothing risk either
-        // way. `stale_slmp_ids` is only actually removed AFTER a successful
-        // commit below - see `Self::remove_stale_slmp_sessions`'s doc
-        // comment for why the ordering matters.
+        // way. **Since T19 S2-a (UX-48)**, a connection with zero enabled
+        // collection groups no longer gets a session synced here at all -
+        // see `Self::sync_slmp_sessions_from`'s own doc comment (this
+        // paragraph used to claim the opposite - "a connection can be
+        // enabled with no collectible groups yet and still deserve a live
+        // broker session" - which stopped being true the moment that fn
+        // started filtering on `banto_collect::connections_with_collected_groups`).
+        // `CollectionController::resync_sessions_for_catalog_change`'s doc
+        // comment (T19 S2-a 案B) covers how such a connection can still get
+        // a session before the next rebuild, via a catalog-only commit made
+        // while a run is already `Running`. `stale_slmp_ids` is only
+        // actually removed AFTER a successful commit below - see
+        // `Self::remove_stale_slmp_sessions`'s doc comment for why the
+        // ordering matters.
         let (slmp_handles, stale_slmp_ids, resolved_slmp_targets, read_routed_keys) =
             self.sync_slmp_sessions_from(&snapshot).await;
 
@@ -1191,6 +1204,49 @@ impl CollectorManager {
     /// full `handles.keys()` set - see this fn's protocol-filter comment
     /// below for why conflating the two would silently break a simulated
     /// Modbus connection's collection reads.
+    ///
+    /// **T19 S2-a (UX-48, docs/banto-hub-t19-design.md §3.8)**: a connection
+    /// with nothing to collect - no *enabled* [`banto_tags::CollectionGroup`]
+    /// under it at all - is no longer in the wanted set either, so it gets
+    /// no broker session pre-synced here. This mirrors `banto-collect`'s own
+    /// `build_config_from` skip rule exactly ("A connection with no
+    /// collected groups gets no task and no socket") via the shared
+    /// [`banto_collect::connections_with_collected_groups`] predicate - same
+    /// input snapshot, same rule, so the two can never silently disagree.
+    /// Before this, EVERY enabled+broker-managed-protocol connection got a
+    /// session regardless of tag count, which is what made a "registered but
+    /// still empty" connection sit in `reconnecting` on the status screen
+    /// forever during development.
+    ///
+    /// A connection that already falls out of the wanted set here (its only
+    /// group got disabled, or its last group/tag was deleted) is handled by
+    /// the SAME pre-existing mechanism as any other now-unwanted connection:
+    /// it lands in the `stale_ids` this fn already computes below and gets
+    /// torn down via [`Self::remove_stale_slmp_sessions`] after the caller's
+    /// collector-side commit succeeds (T7-2's "add + remove" full sync) - no
+    /// new removal path was needed.
+    ///
+    /// **This does NOT reopen the on-demand `ensure_connection`-on-write
+    /// path** (`crate::write_path` never calls it - see
+    /// [`Self::write_broker_handle_peek`]'s doc comment, T15-4: the write
+    /// path only *peeks* an already-synced session and fails closed
+    /// (`WriteRejection::WriteFailed`) rather than dialing on demand, to
+    /// avoid resurrecting a session a concurrent `stop` just tore down).
+    ///
+    /// **T19 S2-a 案B (2026-09-03) closed the write-gap this paragraph used
+    /// to describe**: a connection with zero enabled groups the last time
+    /// `Self::rebuild`/`Self::apply_run` ran no longer has to wait for the
+    /// next rebuild/apply_run (typically: stopping and restarting the
+    /// collection run) to get a session once a group/tag is registered
+    /// under it - [`crate::rest::commit_catalog_and_notify`] now also drives
+    /// [`crate::controller::CollectionController::resync_sessions_for_catalog_change`]
+    /// after every catalog-only commit, which re-runs this very fn (via
+    /// [`Self::resync_broker_sessions`]) whenever a collection run is
+    /// already `Running` - see that method's doc comment for the full
+    /// derivation, including why it is safe against the same T15-4
+    /// stop-vs-write race this fn's caller ([`Self::rebuild`]) already had
+    /// to reckon with, and the narrower removal-ordering caveat it carries
+    /// that `Self::rebuild` itself does not.
     async fn sync_slmp_sessions_from(
         &self,
         snapshot: &RegistrySnapshot,
@@ -1204,6 +1260,11 @@ impl CollectorManager {
         let mut resolved_targets = HashMap::new();
         let mut wanted_ids: HashSet<i64> = HashSet::new();
         let mut read_routed_keys: HashSet<String> = HashSet::new();
+        // T19 S2-a (UX-48): see this fn's own doc comment above - the same
+        // predicate `build_config_from` uses to decide "does this connection
+        // have anything to collect", shared via banto-collect so the two
+        // definitions of "tagless connection" cannot drift apart.
+        let collectible_connection_ids = connections_with_collected_groups(&snapshot.groups);
         // #131 (2026-09-01): every connection whose protocol the broker has a
         // driver for - not just SLMP - gets a session synced here (needed for
         // write/status routing, `crate::write_path`/`CollectorManager::broker_status`).
@@ -1212,11 +1273,11 @@ impl CollectorManager {
         // mean a Modbus connection's *collection reads* moved onto the
         // broker too - they have not; see the `read_routed_keys` comment
         // below for the one place that distinction still matters.
-        for conn in snapshot
-            .connections
-            .iter()
-            .filter(|c| c.enabled && is_supported_protocol(&c.protocol))
-        {
+        for conn in snapshot.connections.iter().filter(|c| {
+            c.enabled
+                && is_supported_protocol(&c.protocol)
+                && collectible_connection_ids.contains(&c.id)
+        }) {
             wanted_ids.insert(conn.id);
 
             // T9-2: resolve the effective dial target (simulator address if
@@ -1702,6 +1763,92 @@ impl CollectorManager {
             self.sim_registry.remove(connection_id).await;
         }
     }
+
+    /// T19 S2-a 案B (UX-48, docs/banto-hub-t19-design.md §3.8, 2026-09-03):
+    /// re-sync broker sessions against `snapshot` WITHOUT touching the
+    /// running `Collector`'s own task set - the counterpart to
+    /// [`Self::rebuild`]/[`Self::apply_run`] for a catalog-only commit
+    /// (`crate::rest::commit_catalog_and_notify`) that happens while a
+    /// collection run is already `Running`. Reuses
+    /// [`Self::sync_slmp_sessions_from`]/[`Self::remove_stale_slmp_sessions`]
+    /// verbatim - the exact same add-then-remove semantics `Self::rebuild`
+    /// already uses for every broker session, just invoked from a different
+    /// trigger. `mode` mirrors [`Self::apply_run`]'s own handling
+    /// (`runtime_snapshot_for_mode`) so a resync during an `AllSimulation`
+    /// run keeps resolving simulator dial targets instead of the
+    /// connections' real host/port.
+    ///
+    /// This is what closes the write-path gap [`Self::sync_slmp_sessions_from`]'s
+    /// own doc comment used to describe (T19 S2-a's original slice, before
+    /// 案B): a tag registered under a previously-tagless connection now gets
+    /// a broker session synced the moment its catalog change commits while
+    /// already running, not only at the next `rebuild`/`apply_run` (in
+    /// practice: the next start/stop cycle) -
+    /// `crate::write_path::write_plc_tag`'s `write_broker_handle_peek` call
+    /// no longer fails closed for a tag added while already running.
+    ///
+    /// **Caller discipline is what keeps this safe against T15-4's
+    /// stop-vs-write race** (see `crate::write_path`'s module doc comment,
+    /// "T15-4: gate 8 は broker セッションを新規に張らない"): this must only
+    /// ever be called while [`crate::controller::CollectionController`]'s
+    /// `transition` lock is held for the duration AND its state has already
+    /// been confirmed `Running` -
+    /// [`crate::controller::CollectionController::resync_sessions_for_catalog_change`]
+    /// is the only intended caller and carries that discipline; nothing in
+    /// `crate::rest` should call this directly. Without that guard, a
+    /// catalog-triggered resync racing `CollectionController::stop()`
+    /// (whose [`Self::stop`] does NOT take `rebuild_lock` - notice this fn's
+    /// own `rebuild_lock` acquisition below only serializes against
+    /// `rebuild`/`commit_catalog`/`apply_run`, not against `Self::stop`)
+    /// could re-`ensure_connection` a session moments after `stop`
+    /// intentionally tore it down - exactly the "PLC we meant to leave
+    /// stopped gets dialed anyway" mistake T15-4 already fixed once for the
+    /// write path itself. The controller-level `transition` lock is what
+    /// actually prevents that: `CollectionController::stop`'s `stop_locked`
+    /// holds the very same lock for the whole of `Self::stop`, so this fn
+    /// and a real stop can never run concurrently.
+    ///
+    /// **Narrower safety envelope than `Self::rebuild`'s removal step**:
+    /// `Self::rebuild` only calls `Self::remove_stale_slmp_sessions` AFTER
+    /// the collector-side commit for the SAME snapshot has already stopped
+    /// any collect task reading through a to-be-removed connection's
+    /// session (this module's doc comment, "SLMP broker セッションの削除
+    /// 同期"). This fn never touches the `Collector` at all (that is the
+    /// whole point - it must not disturb a run that is not being
+    /// restarted), so that ordering guarantee does not hold here: if the
+    /// connection whose last enabled group was just removed is an SLMP
+    /// connection (the one protocol whose *collection reads* are
+    /// broker-routed - see [`Self::sync_slmp_sessions_from`]'s
+    /// `read_routed_keys` doc paragraph), a still-running collect task from
+    /// the PREVIOUS `apply_run` may still be reading through the very
+    /// session this removes. That read would then fail (an ordinary
+    /// reconnect/backoff cycle - `banto_broker::BrokerError::Disconnected`
+    /// on the next `read_batch` - not a panic, and not the write-path hazard
+    /// the paragraph above guards against) until the next `apply_run`/
+    /// `rebuild` actually stops that task - a narrow, self-healing gap
+    /// accepted here because catalog-only commits have never updated the
+    /// running `Collector`'s task set at all
+    /// (`crate::rest::commit_catalog_and_notify`'s doc comment, "registry
+    /// writes advance the configured revision only"), and closing it fully
+    /// would require this fn to also drive `apply_config`, i.e. become a
+    /// second `apply_run` - out of scope for 案B, which targets the write
+    /// path specifically. A Modbus TCP connection (today's other
+    /// broker-managed protocol) never hits this gap at all - its collection
+    /// reads stay on `banto-collect`'s own direct `ModbusTcpClient`
+    /// regardless of this fn's broker-session bookkeeping
+    /// (`crate::broker_glue::hub_client_factory`'s "Read/write asymmetry
+    /// for Modbus TCP").
+    pub(crate) async fn resync_broker_sessions(
+        &self,
+        snapshot: &RegistrySnapshot,
+        mode: crate::controller::RunMode,
+    ) {
+        let _guard = self.rebuild_lock.lock().await;
+        let runtime_snapshot = runtime_snapshot_for_mode(snapshot, mode);
+        let (_handles, stale_ids, _resolved_targets, _read_routed_keys) =
+            self.sync_slmp_sessions_from(&runtime_snapshot).await;
+        self.remove_stale_slmp_sessions(&stale_ids).await;
+    }
 }
 
 #[cfg(test)]
@@ -2014,6 +2161,137 @@ mod tests {
         // its `EventSink` pool clone checked out - see
         // `crate::test_support`'s module doc for why that alone defeats
         // `TempDir::drop`'s retry regardless of ordering.
+        manager.shutdown().await;
+    }
+
+    /// T19 S2-a (UX-48, docs/banto-hub-t19-design.md §3.8): a connection
+    /// with zero groups at all gets no broker session pre-synced - the same
+    /// "reading nothing from a PLC is pointless" rule `banto_collect`
+    /// already applied to its own task/socket, now shared with the
+    /// write-side session sync via
+    /// `banto_collect::connections_with_collected_groups`. Before this
+    /// change, `manager.sessions().connection_ids()` would have contained
+    /// `conn.id` and `broker_status` would have returned
+    /// `Some(BrokerConnectionStatus::Reconnecting { .. })` forever - the
+    /// "registered but still empty connection stuck in reconnecting"
+    /// grievance this slice fixes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rebuild_does_not_sync_a_broker_session_for_a_tagless_connection() {
+        let (_dir, manager, pool) = manager_env().await;
+
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(PlcConnectionInput {
+                name: "tagless".to_string(),
+                protocol: "modbus-tcp".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 15021,
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+
+                word_order: "low_high".to_string(),
+            })
+            .await
+            .unwrap();
+
+        manager.rebuild().await.expect("rebuild should be Ok");
+
+        assert!(
+            !manager.sessions().connection_ids().contains(&conn.id),
+            "a connection with no collection group must not get a broker session"
+        );
+        assert_eq!(
+            manager.broker_status(conn.id),
+            None,
+            "no session was ever synced, so there is nothing to report status for"
+        );
+        // T15-4: the write path only peeks an already-synced session and
+        // never dials on demand (see `CollectorManager::write_broker_handle_peek`'s
+        // doc comment) - so a write targeting a tag under this connection
+        // would fail closed (`WriteRejection::WriteFailed`) at gate 9, not
+        // succeed via an on-demand session spawn.
+        assert!(
+            manager.write_broker_handle_peek(conn.id).is_none(),
+            "write path must fail closed - it never spawns a session on demand"
+        );
+
+        manager.shutdown().await;
+    }
+
+    /// Regression guard for the flip side of
+    /// `rebuild_does_not_sync_a_broker_session_for_a_tagless_connection`: a
+    /// connection with an enabled group and an enabled tag keeps getting its
+    /// broker session pre-synced exactly as before T19 S2-a.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rebuild_still_syncs_a_broker_session_for_a_connection_with_a_tag() {
+        let (_dir, manager, pool) = manager_env().await;
+
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(PlcConnectionInput {
+                name: "tagged".to_string(),
+                protocol: "modbus-tcp".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 15022,
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+
+                word_order: "low_high".to_string(),
+            })
+            .await
+            .unwrap();
+        let group = CollectionGroupService::new(pool.clone())
+            .create(CollectionGroupInput {
+                name: "g1".to_string(),
+                plc_connection_id: conn.id,
+                period_ms: 1_000,
+                enabled: true,
+                default_writable: true,
+            })
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(TagInput {
+                name: "t1".to_string(),
+                collection_group_id: group.id,
+                address: "40001".to_string(),
+                data_type: "i16".to_string(),
+                string_length: None,
+                raw_lo: None,
+                raw_hi: None,
+                eng_lo: None,
+                eng_hi: None,
+                unit: None,
+                decimals: 0,
+                threshold_h: None,
+                threshold_hh: None,
+                threshold_l: None,
+                threshold_ll: None,
+                enabled: true,
+                writable: true,
+                tag_kind: "plc".to_string(),
+                expression: None,
+                retain: false,
+                expected_revision: None,
+            })
+            .await
+            .unwrap();
+
+        manager.rebuild().await.expect("rebuild should be Ok");
+
+        assert!(
+            manager.sessions().connection_ids().contains(&conn.id),
+            "a connection with a tag must still get a broker session, as before T19 S2-a"
+        );
+        assert!(
+            manager.broker_status(conn.id).is_some(),
+            "a synced session always has SOME status (at least Reconnecting), never None"
+        );
+        assert!(
+            manager.write_broker_handle_peek(conn.id).is_some(),
+            "the pre-synced session must be immediately writable without an on-demand dial"
+        );
+
         manager.shutdown().await;
     }
 

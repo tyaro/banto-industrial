@@ -1,7 +1,7 @@
 # banto-hub T19 設計: 設定 UI の再編と運用機能の追加
 
 作成日: 2026-09-02
-状態: **S1（S1-a / S1-b0 / S1-b / S1-c / S1-d）完了（2026-09-03）**。決定は §2・§8、調査結果は §7、進捗は §4。未決事項なし
+状態: **S1（S1-a / S1-b0 / S1-b / S1-c / S1-d）完了（2026-09-03）。S2-a（UX-48、§3.8）完了（2026-09-03）**。決定は §2・§8、調査結果は §7、進捗は §4。S2 の残り（UX-37/38/39/40）は未着手。実機再確認は未実施（§3.8 末尾の注意参照）
 親計画: [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)（§9 UI/UX 決定台帳へ本書の決定を反映する）
 
 ---
@@ -101,7 +101,15 @@ MCP からの書き込みも `POST /api/v1/values/{tag}` と同じ経路を通�
 
 **設定（`enabled` の既定 OFF 等）を増やす案は採らない。** 利用者が理解して使い分けねばならない設定が増えるのは UX の後退であり、そもそも**アプリ側で判断できる**（2026-09-02 オーナー判断）。
 
-**機能は失われない。** 書き込み要求が来た時点で `ensure_connection` が**その場でセッションを張る**（`broker_glue.rs:308`「spawning its broker task on first sight」）。事前同期は最適化にすぎない。
+**当初この節には「書き込み要求時に `ensure_connection` がその場でセッションを張るので機能は失われない」と書いていたが、これは誤りだった**（2026-09-03 訂正）。T15-4 以降、書き込み経路は `write_broker_handle_peek`（生成しない覗き見）だけを使い、セッションが無ければ `WriteRejection::WriteFailed` で fail closed する（`write_path.rs:587`）。
+
+**実際の挙動**: セッションは **`rebuild()` 時**（収集の開始・再起動）と、**カタログ変更時（稼働中のみ、S2-a 案B）**に同期される。
+
+**カタログ変更時の同期は、現時点では REST から到達しない防御である**（2026-09-03 確認）。レジストリの編集は稼働中だと 202 で保留され（`require_collection_stopped` / `queue_pending_registry_change`）、**pending の適用は `Stopped` を要求する**（`rest.rs:4062`）。したがってカタログを変える経路はすべて停止を経由し、次の開始時の `rebuild()` でセッションが同期される。「タグを足したのに書けない」状態には**到達しない**。
+
+それでも実装したのは、**述語の根拠がカタログにある以上、カタログが変わった時点で評価し直すのが振る舞いとして正しい**ためである（2026-09-03 オーナー判断）。`legacy_live_reconfigure` が有効な環境や、将来 稼働中編集を許す変更が入った場合にも破綻しない。
+
+**同期は `CollectionController` の `transition` ロック（`try_lock`）で start/stop と直列化し、`Running` のときだけ行う。** これは T15-4 が塞いだ危険（**止めたはずの PLC へダイヤルしてしまう**）を別経路で再現しないための措置である。`CollectorManager::stop()` は `rebuild_lock` を取らないため、`commit_catalog` 側の排他だけでは防げない。
 
 **UI 上の帰結**: タグの無い接続は状態画面で `connected` / `reconnecting` を示さなくなる。「未使用」に相当する表示を与えるかは実装時に決める。
 
@@ -150,6 +158,43 @@ UX-30 と同じ理屈である。同じ情報を複数画面が持つと、利�
 **UX-38 は Rust 側の拒否ロジックと DB 制約の両方を変更する**（§7.5）。既存の単体テストも前提が変わるため更新する。**virtual 接続（calc/mem）の削除禁止は維持する。**
 
 **完了条件**: タグを複数選んで消せる。タグを持つ接続を消しても履歴が残る。誤削除を数秒以内に戻せる。
+
+**S2-a（UX-48、§3.8）: 完了（2026-09-03）。** `banto_collect::connections_with_collected_groups`
+（収集側 `build_config_from` の「有効な収集グループが1つ以上ある」判定そのものを共有）を
+`CollectorManager::sync_slmp_sessions_from`（`apps/banto-hub/core/src/hub.rs`）の絞り込みへ追加し、
+タグの無い（正確には有効な収集グループの無い）接続は broker セッションを事前同期しないようにした。
+既存セッションの除去は T7-2 の「wanted 集合から外れたら stale として除去」の仕組みをそのまま使い、
+新しい削除経路は追加していない。状態画面には新しいステータス `unused`（`connections[].status`）を
+追加し、無効化された `stopped` とは区別して表示する。
+
+**実装時に判明した重要な前提の誤り（本節の元の記述で私が書いた誤り）**: 「書き込み要求が来た時点で
+`ensure_connection` がその場でセッションを張る」という記述は T15-4（`crate::write_path`）以降は誤り
+だった。事実は逆で、書き込み経路は `CollectorManager::write_broker_handle_peek`（非スポーンの覗き見、
+セッションが無ければ `WriteRejection::WriteFailed` で fail closed）だけを使い、`ensure_connection`
+ベースの `write_broker_handle` は現状どこからも呼ばれていない（T15-4 が意図的にそうした - 収集停止
+との競合で実機へ意図しないセッションを張るレースを防ぐため）。
+
+**案B で解消済み（2026-09-03、オーナー決定）**: 上の誤りに起因して、初回実装は「タグの無かった
+接続にタグを追加しても、次の rebuild/apply_run（実務的には収集の再起動）までその新しいタグへの
+書き込みが fail closed になる」という制約を残し、対応せずテストで挙動を固定するにとどめていた。
+**この制約は解消した**: `crate::rest::commit_catalog_and_notify`（登録変更のたびに呼ばれる、catalog
+コミットの唯一の入口 - CRUD ハンドラと `execute_pending_apply` の両方がここを通る）が、catalog
+コミット成功後に `CollectionController::resync_sessions_for_catalog_change` を呼ぶようになった。
+このメソッドは `start`/`stop` と同じ `transition` ロックを `try_lock` し、**取れなければ何もせず**
+（start/stop 自身が同じ仕事をするため割り込む必要がない）、**状態が `Running` のときだけ**
+`CollectorManager::resync_broker_sessions`（内部は既存の `sync_slmp_sessions_from` をそのまま再利用）
+を呼んでセッションを同期し直す。`CollectorManager::stop` は `rebuild_lock` を取らないため、
+`transition` ロックでの直列化が無いと「意図して止めた PLC へ、カタログ変更同期が直後にセッションを
+張り直してしまう」という T15-4 と同型のレースを再導入しかねない - `resync_sessions_for_catalog_change`
+がまさにこれを防ぐために `transition` ロックを使う設計になっている（詳細は同メソッドの doc comment、
+`apps/banto-hub/core/src/controller.rs`）。**唯一の既知の残存ギャップ**: この resync は稼働中の
+`Collector` 本体には一切触れないため、SLMP 接続（収集読み取りが broker 経由の唯一のプロトコル）で
+最後の有効グループが消えたタイミングでは、旧設定のまま読み取りを続けている collect タスクが読んでいる
+セッションを止めてしまう可能性がある（read エラーとして現れ、次の rebuild/apply_run で自己解消する -
+パニックや書き込み側のハザードではない）。Modbus TCP 接続はこの影響を受けない（収集読み取りは
+broker を経由しないため）。詳細は `CollectorManager::resync_broker_sessions` の doc comment参照。
+
+**残**: UX-37/38/39/40 は未着手。実機での再確認（本節末尾の注意）は未実施。
 
 ### S3: レイアウトとサーバー状態（UX-43/46/47）
 
