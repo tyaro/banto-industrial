@@ -31,10 +31,12 @@ class MobileNavStore {
 	}
 
 	openNav(): void {
+		if (this.#state.open) return;
 		this.#state = { ...this.#state, open: true };
 	}
 
 	closeNav(): void {
+		if (!this.#state.open) return;
 		this.#state = { ...this.#state, open: false };
 	}
 
