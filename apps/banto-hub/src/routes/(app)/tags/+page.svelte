@@ -46,6 +46,7 @@
 		listPlcConnections,
 		createTagsBatch,
 		updateTagsBatch,
+		deleteTagsBatch,
 		isTagRevisionConflictError,
 		MIN_STRING_LENGTH,
 		MAX_STRING_LENGTH,
@@ -62,11 +63,14 @@
 		type PlcConnection,
 		type BatchTagsResult,
 		type BatchTagsUpdateResult,
-		type BatchTagUpdateRow
+		type BatchTagsDeleteResult,
+		type BatchTagUpdateRow,
+		type BatchTagFieldError
 	} from '$lib/banto/tagRegistryAdmin';
 	import {
 		buildBulkEnableRows,
 		buildBulkMoveRows,
+		formatTagsBulkDeleteConfirmMessage,
 		hasMixedTagKinds,
 		summarizeBulkChange,
 		type BulkChangeSummary
@@ -2474,14 +2478,23 @@
 	// 叩かなくても「対象N件・差分」を確認パネルに出せる（実装指示「過剰
 	// 実装は避け、最低限『件数＋主要差分を見せてから適用』を満たす」）。
 
-	/** 一括操作バーの3ボタンに対応する。`null` は確認パネルを閉じている状態。 */
-	type BulkAction = 'enable' | 'disable' | 'move' | null;
+	/**
+	 * 一括操作バーのボタンに対応する。`null` は確認パネルを閉じている状態。
+	 * `'delete'`（T19 S2-c1、UX-37）は他の3つと違い `updateTagsBatch` では
+	 * なく `deleteTagsBatch` を叩く - `bulkRows`/`bulkSummary` の「差分」
+	 * 概念を持たず、対象は選択タグの `id` そのもの（`bulkDeleteIds` 参照）。
+	 */
+	type BulkAction = 'enable' | 'disable' | 'move' | 'delete' | null;
 	let bulkAction: BulkAction = $state(null);
 	/** `bulkAction === 'move'` のときの移動先グループ（`<select>` の値、未選択は `''`）。 */
 	let bulkTargetGroupId = $state('');
 	let bulkApplying = $state(false);
-	/** 直近の `updateTagsBatch` 応答。`ok: false` のときだけ行エラー表示に使う。 */
-	let bulkResult: BatchTagsUpdateResult | null = $state(null);
+	/**
+	 * 直近の `updateTagsBatch`/`deleteTagsBatch` 応答。`ok: false` のときだけ
+	 * 行エラー表示に使う。2つの応答型は `dryRun`/`tags` の有無が違うだけで
+	 * `errors` の行エラー形は同一（`bulkRowErrors` スニペット参照）。
+	 */
+	let bulkResult: BatchTagsUpdateResult | BatchTagsDeleteResult | null = $state(null);
 
 	const selectedTags = $derived(tags.filter((t) => selectedIds.has(t.id)));
 	/** T18-3b「選択タグに複数種別混在の場合はグループ移動を無効化」の判定。有効/無効切替は種別混在でも可。 */
@@ -2509,6 +2522,21 @@
 		return [];
 	});
 
+	/**
+	 * T19 S2-c1: `deleteTagsBatch` に渡す実際の id 一覧。`bulkAction ===
+	 * 'delete'` のときだけ非空（「適用」を無効化する判定にも使う - `bulkRows`
+	 * と同じ役割を delete 側に持たせたもの）。
+	 */
+	const bulkDeleteIds = $derived.by((): number[] => {
+		if (bulkAction !== 'delete') return [];
+		return selectedTags.map((t) => t.id);
+	});
+
+	/** 確認パネルの「この内容で一括反映」ボタンを無効化する条件の対象件数。 */
+	const bulkTargetCount = $derived(
+		bulkAction === 'delete' ? bulkDeleteIds.length : bulkRows.length
+	);
+
 	/** 確認パネルの「対象N件・差分」表示。`bulkRows` と同じ確定条件（移動先未選択なら `null`）。 */
 	const bulkSummary = $derived.by((): BulkChangeSummary<boolean | number> | null => {
 		if (bulkAction === 'enable') return summarizeBulkChange(selectedTags, 'enabled', true);
@@ -2525,7 +2553,7 @@
 		return value ? '有効' : '無効';
 	}
 
-	function openBulkPanel(action: 'enable' | 'disable' | 'move'): void {
+	function openBulkPanel(action: 'enable' | 'disable' | 'move' | 'delete'): void {
 		bulkAction = action;
 		bulkTargetGroupId = '';
 		bulkResult = null;
@@ -2543,9 +2571,41 @@
 	 * `errors` が返れば（`ok: false`）確認パネルは開いたまま行エラーを
 	 * 表示し、選択・入力はそのまま保持する（連続登録/CSVの「検証」失敗時と
 	 * 同じ「直さず再送信できる」形）。
+	 *
+	 * T19 S2-c1: `bulkAction === 'delete'` のときだけ `deleteTagsBatch` を
+	 * 叩く別経路にする - `updateTagsBatch` 系との違いは「差分プレビューを
+	 * 持たない（対象は id そのもの）」「dry run が無い」の2点のみで、
+	 * 成功/失敗トースト・202キュー時の扱い（稼働中は`QueuedWhileRunningError`
+	 * を他の一括操作と同じ汎用エラートーストに委ねる）は完全に揃える。
+	 * トースト文言は既存の単票削除トースト「削除しました」と部分文字列でも
+	 * 被らないよう変えてある（PR #135 の教訓 - 上のコメント参照）。
 	 */
 	async function handleApplyBulk(): Promise<void> {
-		if (bulkAction === null || bulkRows.length === 0) return;
+		if (bulkAction === null) return;
+		if (bulkAction === 'delete') {
+			if (bulkDeleteIds.length === 0) return;
+			bulkApplying = true;
+			bulkResult = null;
+			try {
+				const result = await deleteTagsBatch(bulkDeleteIds);
+				bulkResult = result;
+				if (result.ok) {
+					toastStore.push('success', `選択した${result.count}件のタグの削除が完了しました`);
+					closeBulkPanel();
+					selectedIds = new Set();
+					await reload();
+				} else {
+					toastStore.push('error', '選択タグの一部で削除エラーが発生しました（下の一覧参照）。');
+				}
+			} catch (err) {
+				toastStore.push('error', errorMessage(err));
+			} finally {
+				bulkApplying = false;
+			}
+			return;
+		}
+
+		if (bulkRows.length === 0) return;
 		bulkApplying = true;
 		bulkResult = null;
 		try {
@@ -3313,7 +3373,10 @@
 	{/if}
 {/snippet}
 
-{#snippet bulkRowErrors(result: BatchTagsUpdateResult)}
+{#snippet bulkRowErrors(result: {
+	ok: boolean;
+	errors: { index: number; id: number; fieldErrors: BatchTagFieldError[] }[];
+})}
 	{#if !result.ok}
 		<table class="error-table">
 			<thead>
@@ -3695,6 +3758,12 @@
 							>
 							<button
 								type="button"
+								class="danger"
+								data-testid="tag-bulk-delete-open"
+								onclick={() => openBulkPanel('delete')}>一括で削除</button
+							>
+							<button
+								type="button"
 								class="secondary"
 								data-testid="tag-bulk-clear-selection"
 								onclick={() => (selectedIds = new Set())}>選択解除</button
@@ -3707,10 +3776,15 @@
 								? '選択タグを一括で有効化'
 								: bulkAction === 'disable'
 									? '選択タグを一括で無効化'
-									: '選択タグをグループへ一括移動'}
+									: bulkAction === 'move'
+										? '選択タグをグループへ一括移動'
+										: '選択タグを一括削除'}
 						<!-- T18-3b: 適用前に対象件数・差分を確認するパネル。連続登録/CSVの
 							`.preview-table`/`.confirm-panel` をそのまま流用する（既存
-							プレビュー表示との視覚的な一貫性を優先し、新規スタイルは足さない）。 -->
+							プレビュー表示との視覚的な一貫性を優先し、新規スタイルは足さない）。
+							T19 S2-c1: `delete` は差分表ではなく確認文言（`formatTagsBulkDeleteConfirmMessage`）
+							を表示するだけ - 対象は選択タグの id そのもので「変更前/変更後」の
+							概念が無いため。 -->
 						<div class="confirm-panel" data-testid="tag-bulk-confirm-panel">
 							<p class="confirm-title">{actionLabel}</p>
 							{#if bulkAction === 'move'}
@@ -3724,7 +3798,11 @@
 									</select>
 								</label>
 							{/if}
-							{#if bulkSummary}
+							{#if bulkAction === 'delete'}
+								<p class="note bulk-delete-message" data-testid="tag-bulk-delete-confirm-message">
+									{formatTagsBulkDeleteConfirmMessage(selectedTags.length)}
+								</p>
+							{:else if bulkSummary}
 								<p class="note">
 									対象 {bulkSummary.targetCount} 件・変更 {bulkSummary.changedCount} 件
 								</p>
@@ -3761,7 +3839,7 @@
 								<button
 									type="button"
 									data-testid="tag-bulk-apply"
-									disabled={bulkApplying || bulkRows.length === 0}
+									disabled={bulkApplying || bulkTargetCount === 0}
 									onclick={handleApplyBulk}>この内容で一括反映</button
 								>
 								<button
@@ -4966,6 +5044,15 @@
 		font-size: 0.8rem;
 		font-weight: 600;
 		color: var(--banto-text);
+	}
+
+	/*
+	 * T19 S2-c1（UX-37）: 一括削除の確認文言
+	 * （`formatTagsBulkDeleteConfirmMessage`）は改行区切りの複数行文字列
+	 * なので、`.note`（既定 `white-space: normal`）のままだと改行が潰れる。
+	 */
+	.bulk-delete-message {
+		white-space: pre-line;
 	}
 
 	.confirm-list {

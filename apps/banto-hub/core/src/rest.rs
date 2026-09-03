@@ -75,9 +75,9 @@ use banto_server::{
     auth_routes, require_banto_client_header, sse_route, ApiError, AuthState, Identity, ServerEvent,
 };
 use banto_tags::{
-    BatchTagOutcome, BatchTagUpdateOutcome, CollectionGroup, CollectionGroupInput,
-    CollectionGroupService, GroupTagCount, PlcConnection, PlcConnectionInput, PlcConnectionService,
-    Tag, TagInput, TagService, TagUpdateError,
+    BatchTagDeleteOutcome, BatchTagOutcome, BatchTagUpdateOutcome, CollectionGroup,
+    CollectionGroupInput, CollectionGroupService, GroupTagCount, PlcConnection, PlcConnectionInput,
+    PlcConnectionService, Tag, TagInput, TagService, TagUpdateError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -3936,6 +3936,16 @@ struct PendingBatchTagsUpdatePayload {
     tags: Vec<TagBatchUpdatePayload>,
 }
 
+/// T19 S2-c1: [`PendingBatchTagsPayload`]の一括削除版 - `tags.batch_delete`
+/// 経由でキューされた pending change を [`execute_pending_apply`] が
+/// デコードする際の形。一括削除に dry run は無いので、更新/作成版と違い
+/// `dry_run` フィールドを持たない([`BatchTagsDeleteRequest`]と同型)。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingBatchTagsDeletePayload {
+    ids: Vec<i64>,
+}
+
 enum PendingApplyError {
     Api(ApiError),
     CollectionEditLocked(CollectionStatusResponse),
@@ -4296,6 +4306,37 @@ async fn execute_pending_apply(
                     .flat_map(|row| {
                         row.field_errors.into_iter().map(move |field| FieldError {
                             field: format!("tags[{}].{}", row.index, field.field),
+                            message: field.message,
+                        })
+                    })
+                    .collect();
+                return Err(PendingApplyError::Api(ApiError(BantoError::Validation {
+                    field_errors,
+                })));
+            }
+            "tags"
+        }
+        "tags.batch_delete" => {
+            // T19 S2-c1 (UX-37): tags.batch_update 分岐と同じ形 - 稼働中に
+            // キューされ、後で（停止後に）適用される一括削除も、即時削除
+            // （`tags_batch_delete`）と全く同じ `delete_batch_tx` を使う。
+            // ここを他の delete 系分岐（`tags.delete`/`plc_connections.delete`/
+            // `collection_groups.delete`）と揃えないと、「即時削除はできる
+            // のに、稼働中に積んだ保留削除だけ適用時に失敗する」という
+            // 非対称バグになる（S2-b で実際に踏みかけた罠 - 実装指示参照）。
+            let body: PendingBatchTagsDeletePayload = decode_pending_payload(pending)?;
+            let outcome = state
+                .tags
+                .delete_batch_tx(&mut tx, &body.ids)
+                .await
+                .map_err(ApiError)
+                .map_err(PendingApplyError::Api)?;
+            if let BatchTagDeleteOutcome::Invalid(errors) = outcome {
+                let field_errors = errors
+                    .into_iter()
+                    .flat_map(|row| {
+                        row.field_errors.into_iter().map(move |field| FieldError {
+                            field: format!("ids[{}].{}", row.index, field.field),
                             message: field.message,
                         })
                     })
@@ -4914,6 +4955,168 @@ async fn tags_batch_update(
     }
 }
 
+// --- T19 S2-c1 一括削除 API (bulk tag delete, UX-37): tags_batch_update
+// (T18-3b) の削除版として骨格をそのまま写す - 稼働中は pending 1件で 202、
+// 停止中は単一トランザクションで all-or-nothing 削除 → catalog commit
+// 1回。実際の削除ロジックは `banto_tags::TagService::delete_batch_tx`
+// （単票 `delete_tx` と同じ判定を id ごとに適用するだけ - 一括経路だけの
+// 新しい削除セマンティクスは持たない、そのメソッドの doc comment 参照）。
+
+/// `POST /api/tags/batch-delete` のリクエスト。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchTagsDeleteRequest {
+    pub ids: Vec<i64>,
+}
+
+/// 行番号(0起点)付きのフィールドエラー一覧 - [`BatchTagUpdateRowErrorResponse`]
+/// と全く同じ形（`banto_tags::BatchTagDeleteError`が
+/// `banto_tags::BatchTagUpdateError`と同じ形を持つことの写し）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchTagDeleteRowErrorResponse {
+    index: usize,
+    id: i64,
+    field_errors: Vec<BatchTagFieldErrorResponse>,
+}
+
+impl From<banto_tags::BatchTagDeleteError> for BatchTagDeleteRowErrorResponse {
+    fn from(err: banto_tags::BatchTagDeleteError) -> Self {
+        Self {
+            index: err.index,
+            id: err.id,
+            field_errors: err.field_errors.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// `POST /api/tags/batch-delete` の応答。[`BatchTagsUpdateResponse`]と同じ
+/// 「常に 200、`ok: false` で行ごとエラー」契約だが、`dryRun`/`tags` は
+/// 持たない - `tags_batch_delete`の doc comment 参照（削除に事前検証
+/// プレビューの意味が薄いため dry run 自体を設けていない）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchTagsDeleteResponse {
+    ok: bool,
+    /// 削除された(または `ok: false` なら常に0の)件数。
+    count: usize,
+    errors: Vec<BatchTagDeleteRowErrorResponse>,
+}
+
+/// `POST /api/tags/batch-delete` - T19 S2-c1（UX-37 一括削除）。editor
+/// 以上、`tags_batch_update`の骨格をそのまま写した削除版:
+/// トランザクション内検証 → all-or-nothing 適用 → catalog commit 1回。
+///
+/// `dryRun` は設けない（実装指示、doc 冒頭参照） - 一括更新の dry run は
+/// 「差分を確認してから確定する」ためのものだが、削除は差分ではなく
+/// リクエストの `ids` そのものが対象そのものであり、対象件数・内訳は
+/// クライアント側（選択済みタグの一覧）で既に分かっている。サーバー
+/// 往復で検証結果を見せる段階を挟む理由がないため、常に即時適用
+/// （収集稼働中は他の書き込みと同じく pending キュー）の一段構成にした。
+async fn tags_batch_delete(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Json(body): Json<BatchTagsDeleteRequest>,
+) -> RegistryMutationResult<Response> {
+    require_editor(
+        &state.auth,
+        &state.commissioning,
+        &state.audit,
+        &headers,
+        "tags",
+        "POST",
+        "/api/tags/batch-delete",
+    )
+    .await?;
+
+    let status = state.controller.status();
+    if status.state != CollectionState::Stopped {
+        return queue_pending_registry_change(
+            &state,
+            &headers,
+            "tags.batch_delete",
+            json!({ "ids": body.ids }),
+            status,
+        )
+        .await;
+    }
+
+    let ids = body.ids;
+    if ids.is_empty() {
+        return Ok(Json(BatchTagsDeleteResponse {
+            ok: true,
+            count: 0,
+            errors: Vec::new(),
+        })
+        .into_response());
+    }
+
+    let mut tx = state
+        .manager
+        .pool()
+        .begin()
+        .await
+        .map_err(storage_api_error)?;
+    let outcome = match state.tags.delete_batch_tx(&mut tx, &ids).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Err(ApiError(err).into());
+        }
+    };
+    match outcome {
+        BatchTagDeleteOutcome::Invalid(errors) => {
+            let _ = tx.rollback().await;
+            Ok(Json(BatchTagsDeleteResponse {
+                ok: false,
+                count: 0,
+                errors: errors.into_iter().map(Into::into).collect(),
+            })
+            .into_response())
+        }
+        BatchTagDeleteOutcome::Valid { count } => {
+            let snapshot = match preflight_transaction(&mut tx).await {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    let _ = tx.rollback().await;
+                    return Err(err.into());
+                }
+            };
+            tx.commit().await.map_err(storage_api_error)?;
+            // 削除件数を detail に含める（T19 S2-b の cascade_delete と同じ
+            // 考え方 - 監査ログから「何件消えたか」が読めるようにする）。
+            record_write(
+                &state.audit,
+                &state.auth,
+                &state.commissioning,
+                &headers,
+                "batch_delete",
+                "tags",
+                "-",
+                Some(json!({ "count": count })),
+            )
+            .await;
+            // tags_batch/tags_batch_update と同じ核心: n 件でも catalog
+            // commit はここで1回だけ。
+            commit_catalog_and_notify(
+                &state.manager,
+                &state.controller,
+                &state.events,
+                "tags",
+                snapshot,
+                state.legacy_live_reconfigure,
+            )
+            .await;
+            Ok(Json(BatchTagsDeleteResponse {
+                ok: true,
+                count,
+                errors: Vec::new(),
+            })
+            .into_response())
+        }
+    }
+}
+
 /// `/api/plc-connections/*` + `/api/collection-groups/*` + `/api/tags/*`
 /// (viewer-read / editor-write) - `relay-wright-core::rest::tag_registry_router`
 /// を雛形に、書き込み成功後に catalog commit と SSE通知を行う。
@@ -4981,6 +5184,10 @@ fn tag_registry_router(
         // T18-3b (bulk tag operations): 一括更新 - 同じ理由で `/api/tags`
         // 直下の固定パス（`/api/tags/batch` と衝突しない別セグメント）。
         .route("/api/tags/batch-update", post(tags_batch_update))
+        // T19 S2-c1 (UX-37): 一括削除 - 同じ理由で `/api/tags` 直下の固定
+        // パス（`/api/tags/batch`・`/api/tags/batch-update` と衝突しない
+        // 別セグメント）。
+        .route("/api/tags/batch-delete", post(tags_batch_delete))
         // T18-5a 第2段 (docs/banto-hub-t18-design.md §4 決定6): `ListParams`
         // 素通しのページング付き一覧 - `/api/tags/batch`・`/api/tags/batch-update`
         // と同じ理由で `/api/tags/{id}` (i64 パラメータ) と衝突しない固定

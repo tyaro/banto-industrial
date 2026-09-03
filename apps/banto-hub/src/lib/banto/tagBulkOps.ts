@@ -1,7 +1,12 @@
 /**
  * T18-3b 一括操作（docs/banto-hub-t18-design.md「T18-3b 一括操作
  * （TAG-UX-D 中）」: 複数選択＋一括有効/無効・グループ移動。一括削除は
- * 参照影響・復旧方法が未確定のためバックログ扱いで対象外）。
+ * 当時は参照影響・復旧方法が未確定のためバックログ扱いで対象外だった
+ * （T19 S2-c1、UX-37 でこのファイルに追加 - {@link formatTagsBulkDeleteConfirmMessage}
+ * 参照。既存 `delete`/`delete_tx` と同じ判定を id ごとに適用するだけの
+ * 一括削除であり、参照影響（演算タグの式参照）は単票削除と同じく
+ * ハードブロックしない設計 - `crates/banto-tags/src/tag.rs::TagService::delete_batch_tx`
+ * の doc comment 参照）。
  *
  * `tagCsv.ts`/`tagDuplicate.ts` と同じ方針の依存ゼロ純関数群 -
  * `+page.svelte` 側の `FormState` には依存せず、`tagRegistryAdmin.ts` の
@@ -133,4 +138,19 @@ export function summarizeBulkChange<T extends boolean | number>(
 		changedCount: rows.filter((row) => row.changed).length,
 		rows
 	};
+}
+
+/**
+ * T19 S2-c1（UX-37）一括削除の確認パネル文言。`registryCascadeImpact.ts`
+ * の接続/収集グループ削除確認文言と同じ2点方針に揃える（実装指示）:
+ * 対象を明示すること、記録済みの履歴（収集データ）は残ることを必ず
+ * 明示すること。タグ自体は子リソースを持たないため件数計算は不要 -
+ * 選択件数をそのまま埋め込むだけの純関数。
+ */
+export function formatTagsBulkDeleteConfirmMessage(count: number): string {
+	return [
+		`選択した ${count} 件のタグを削除します。`,
+		'',
+		'記録済みの履歴（収集データ）は削除されません。'
+	].join('\n');
 }

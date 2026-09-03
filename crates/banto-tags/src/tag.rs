@@ -948,6 +948,36 @@ pub enum BatchTagUpdateOutcome {
     },
 }
 
+/// A single row's worth of field errors within a
+/// [`TagService::delete_batch_tx`] call (T19 S2-c1, bulk tag delete).
+/// Mirrors [`BatchTagUpdateError`]'s shape (`index` + `id` + `field_errors`)
+/// even though a delete row has no other fields to validate - keeping the
+/// same shape lets the REST layer's `BatchTagUpdateRowErrorResponse`-style
+/// conversion and the frontend's shared error-table rendering apply
+/// unchanged to delete results too.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchTagDeleteError {
+    pub index: usize,
+    pub id: i64,
+    pub field_errors: Vec<FieldError>,
+}
+
+/// Result of [`TagService::delete_batch_tx`] - the delete-side counterpart of
+/// [`BatchTagUpdateOutcome`]/[`BatchTagOutcome`], same all-or-nothing
+/// contract (see [`BatchTagOutcome`]'s doc comment), applied to deletes.
+/// `Valid` carries only `count` (unlike the create/update outcomes' `tags`)
+/// - there is nothing left to hand back once a row is deleted.
+#[derive(Debug)]
+pub enum BatchTagDeleteOutcome {
+    /// At least one `id` did not resolve to any row, or the same `id`
+    /// appeared more than once in the request. Nothing was deleted - not
+    /// even the ids that individually exist.
+    Invalid(Vec<BatchTagDeleteError>),
+    /// Every id resolved to a distinct existing row and was deleted.
+    Valid { count: usize },
+}
+
 /// [`TagService::update_tx`]'s error type (T18-1, docs/banto-hub-desktop-plan.md
 /// §9.4 TAG-UX-C 4点目). A superset of `BantoError` that additionally
 /// distinguishes the one new failure mode the optimistic-lock `WHERE id = ?
@@ -1628,6 +1658,148 @@ impl TagService {
             });
         }
         Ok(())
+    }
+
+    /// Delete a batch of existing tags using a caller-owned SQLite
+    /// transaction (T19 S2-c1, UX-37 一括削除) - the delete-side counterpart
+    /// of [`Self::create_batch_tx`]/[`Self::update_batch_tx`], following the
+    /// same two-phase all-or-nothing shape: a read-only validation pass first
+    /// (so an `Invalid` outcome never leaves a partial delete behind), then,
+    /// only if every id is clean, delete every row on the same connection.
+    ///
+    /// **This method intentionally applies no delete semantics beyond what
+    /// [`Self::delete_tx`] already applies per id.** See this type's own doc
+    /// comment ("No delete guard is needed here ... nothing in this crate
+    /// references a `tags` row by id") and [`Self::delete`]/[`Self::delete_tx`]
+    /// themselves: today a tag can be deleted even while a `computed` tag's
+    /// `expression` still names it (that reference is a free-form string
+    /// resolved at collector-rebuild time by `banto_expr`, not a DB-level
+    /// foreign key, so nothing here or in the single-row path checks it).
+    /// Design decision (T19 S2-c1, 2026-09-03): keep this batch entry point's
+    /// rejection surface identical to the single-row entry point's rather
+    /// than inventing a new guard the single-row path does not also enforce.
+    /// Inventing one here would make deleting one-by-one and deleting via
+    /// this method behave differently for the exact same rows, which is a
+    /// worse surprise than the pre-existing (and unchanged) dangling-reference
+    /// behavior itself.
+    ///
+    /// Two failure modes are collected as row-indexed field errors instead of
+    /// aborting the whole call early (same "report every row's problem in
+    /// one response" style as `create_batch_tx`/`update_batch_tx`):
+    ///
+    /// - an `id` that does not resolve to any row (`"id"` field error,
+    ///   `"見つかりません"` - the same case [`Self::delete_tx`] reports as
+    ///   [`BantoError::NotFound`] for a single id),
+    /// - an `id` repeated more than once within `ids` itself (`"id"` field
+    ///   error) - every occurrence is flagged, not just the second one
+    ///   onward (same style as the intra-batch duplicate-name checks in
+    ///   `create_batch_tx`/`update_batch_tx`). Rejected rather than silently
+    ///   deduplicated: a caller building a confirmation UI around "N件削除"
+    ///   should never see fewer rows actually deleted than the count it
+    ///   showed the user.
+    ///
+    /// `ids` empty returns `Valid { count: 0 }` immediately - nothing to
+    /// validate, nothing to delete (mirrors `create_batch_tx`'s handling of
+    /// an empty `inputs` slice, modulo that method going through its
+    /// row-error machinery first; here there is nothing to iterate at all).
+    pub async fn delete_batch_tx(
+        &self,
+        connection: &mut SqliteConnection,
+        ids: &[i64],
+    ) -> Result<BatchTagDeleteOutcome, BantoError> {
+        if ids.is_empty() {
+            return Ok(BatchTagDeleteOutcome::Valid { count: 0 });
+        }
+
+        let mut row_errors: Vec<Vec<FieldError>> = vec![Vec::new(); ids.len()];
+
+        // Intra-batch duplicate ids: flag every occurrence (not just the
+        // second one onward), same aggregation style as create_batch_tx's/
+        // update_batch_tx's duplicate-name checks.
+        let mut first_seen: HashMap<i64, usize> = HashMap::new();
+        let mut batch_dupe_indices: Vec<usize> = Vec::new();
+        for (index, id) in ids.iter().enumerate() {
+            match first_seen.get(id) {
+                Some(&first) => {
+                    if !batch_dupe_indices.contains(&first) {
+                        batch_dupe_indices.push(first);
+                    }
+                    batch_dupe_indices.push(index);
+                }
+                None => {
+                    first_seen.insert(*id, index);
+                }
+            }
+        }
+        for index in batch_dupe_indices {
+            row_errors[index].push(FieldError {
+                field: "id".to_string(),
+                message: "リクエスト内で id が重複しています".to_string(),
+            });
+        }
+
+        // Existing-row check - one query for every target id, mirrors
+        // update_batch_tx's existing-revisions snapshot (read-only, no
+        // writes yet).
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("SELECT id FROM tags WHERE id IN (");
+        let mut separated = qb.separated(", ");
+        for id in ids {
+            separated.push_bind(*id);
+        }
+        qb.push(")");
+        let existing_ids: HashSet<i64> = qb
+            .build_query_scalar()
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(banto_storage::storage_error)?
+            .into_iter()
+            .collect();
+        for (index, id) in ids.iter().enumerate() {
+            if !existing_ids.contains(id) {
+                row_errors[index].push(FieldError {
+                    field: "id".to_string(),
+                    message: "見つかりません".to_string(),
+                });
+            }
+        }
+
+        let errors: Vec<BatchTagDeleteError> = row_errors
+            .into_iter()
+            .enumerate()
+            .filter(|(_, field_errors)| !field_errors.is_empty())
+            .map(|(index, field_errors)| BatchTagDeleteError {
+                index,
+                id: ids[index],
+                field_errors,
+            })
+            .collect();
+        if !errors.is_empty() {
+            return Ok(BatchTagDeleteOutcome::Invalid(errors));
+        }
+
+        // Every id validated (exists, no duplicates) - safe to delete one by
+        // one on the same connection/transaction.
+        for id in ids {
+            let result = sqlx::query("DELETE FROM tags WHERE id = ?")
+                .bind(id)
+                .execute(&mut *connection)
+                .await
+                .map_err(banto_storage::storage_error)?;
+            if result.rows_affected() == 0 {
+                // Should not happen - the existence snapshot above just saw
+                // this id on the very same connection/transaction. Treated as
+                // a plain Err (caller rolls back the whole transaction)
+                // rather than a row-indexed Invalid, mirroring the "DB-level
+                // failure surfacing only at write time" race window
+                // create_batch_tx/update_batch_tx already accept and document.
+                return Err(BantoError::NotFound {
+                    resource: RESOURCE.to_string(),
+                    id: id.to_string(),
+                });
+            }
+        }
+
+        Ok(BatchTagDeleteOutcome::Valid { count: ids.len() })
     }
 
     /// Validate and insert a batch using a caller-owned SQLite transaction.
@@ -4514,5 +4686,125 @@ mod tests {
             other => panic!("expected Valid, got {other:?}"),
         }
         tx.rollback().await.expect("rollback");
+    }
+
+    // -----------------------------------------------------------------
+    // T19 S2-c1 (UX-37): delete_batch_tx
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn delete_batch_tx_deletes_every_row_in_one_transaction() {
+        let (svc, group_id) = setup().await;
+        let a = svc.create(sample_input("DB-A", group_id)).await.unwrap();
+        let b = svc.create(sample_input("DB-B", group_id)).await.unwrap();
+        let c = svc.create(sample_input("DB-C", group_id)).await.unwrap();
+
+        let mut tx = svc.pool.begin().await.expect("begin tx");
+        let outcome = svc
+            .delete_batch_tx(&mut tx, &[a.id, b.id])
+            .await
+            .expect("delete_batch_tx should succeed");
+        assert!(matches!(outcome, BatchTagDeleteOutcome::Valid { count: 2 }));
+        tx.commit().await.expect("commit");
+
+        assert!(svc.get(a.id).await.is_err());
+        assert!(svc.get(b.id).await.is_err());
+        // Not part of the batch - must survive untouched.
+        assert!(svc.get(c.id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_batch_tx_flags_a_nonexistent_id_and_deletes_nothing() {
+        let (svc, group_id) = setup().await;
+        let a = svc.create(sample_input("DB-D", group_id)).await.unwrap();
+
+        let mut tx = svc.pool.begin().await.expect("begin tx");
+        let outcome = svc
+            .delete_batch_tx(&mut tx, &[a.id, 999_999])
+            .await
+            .expect("delete_batch_tx should not error - a missing id is a row error");
+        match outcome {
+            BatchTagDeleteOutcome::Invalid(errors) => {
+                assert_eq!(errors.len(), 1, "{errors:?}");
+                assert_eq!(errors[0].index, 1);
+                assert_eq!(errors[0].id, 999_999);
+                assert!(errors[0].field_errors.iter().any(|e| e.field == "id"));
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        tx.rollback().await.expect("rollback");
+
+        // All-or-nothing: `a` (individually a valid id) was not deleted either.
+        assert!(svc.get(a.id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_batch_tx_flags_a_duplicate_id_within_the_request() {
+        let (svc, group_id) = setup().await;
+        let a = svc.create(sample_input("DB-E", group_id)).await.unwrap();
+        let b = svc.create(sample_input("DB-F", group_id)).await.unwrap();
+
+        let mut tx = svc.pool.begin().await.expect("begin tx");
+        let outcome = svc
+            .delete_batch_tx(&mut tx, &[a.id, b.id, a.id])
+            .await
+            .expect("delete_batch_tx should not error - a duplicate id is a row error");
+        match outcome {
+            BatchTagDeleteOutcome::Invalid(errors) => {
+                // Every occurrence of the duplicated id is flagged (index 0
+                // and index 2), not just the second one onward.
+                assert_eq!(errors.len(), 2, "{errors:?}");
+                assert_eq!(errors[0].index, 0);
+                assert_eq!(errors[0].id, a.id);
+                assert_eq!(errors[1].index, 2);
+                assert_eq!(errors[1].id, a.id);
+                for err in &errors {
+                    assert!(err.field_errors.iter().any(|e| e.field == "id"));
+                }
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        tx.rollback().await.expect("rollback");
+
+        // All-or-nothing: neither `a` nor `b` was deleted.
+        assert!(svc.get(a.id).await.is_ok());
+        assert!(svc.get(b.id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn delete_batch_tx_with_an_empty_slice_succeeds_trivially() {
+        let (svc, _group_id) = setup().await;
+        let mut tx = svc.pool.begin().await.expect("begin tx");
+        let outcome = svc.delete_batch_tx(&mut tx, &[]).await.unwrap();
+        assert!(matches!(outcome, BatchTagDeleteOutcome::Valid { count: 0 }));
+        tx.rollback().await.expect("rollback");
+    }
+
+    #[tokio::test]
+    async fn delete_batch_tx_rolls_back_on_invalid_leaving_the_transaction_usable() {
+        // All-or-nothing must be enforced by the caller's transaction, not by
+        // this method silently starting/committing its own - confirm the
+        // same `tx` can still be used for something else after an `Invalid`
+        // outcome (i.e. this method never poisons or partially writes to the
+        // connection it was given).
+        let (svc, group_id) = setup().await;
+        let a = svc.create(sample_input("DB-G", group_id)).await.unwrap();
+
+        let mut tx = svc.pool.begin().await.expect("begin tx");
+        let outcome = svc
+            .delete_batch_tx(&mut tx, &[a.id, 999_999])
+            .await
+            .expect("delete_batch_tx should not error");
+        assert!(matches!(outcome, BatchTagDeleteOutcome::Invalid(_)));
+        // The transaction itself is still open and usable (delete_batch_tx
+        // did not write anything and did not roll back on its own - that is
+        // the caller's job, exactly like create_batch_tx/update_batch_tx).
+        let retry = svc
+            .delete_batch_tx(&mut tx, &[a.id])
+            .await
+            .expect("delete_batch_tx should succeed the second time");
+        assert!(matches!(retry, BatchTagDeleteOutcome::Valid { count: 1 }));
+        tx.commit().await.expect("commit");
+        assert!(svc.get(a.id).await.is_err());
     }
 }

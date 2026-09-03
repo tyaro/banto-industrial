@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest';
 import {
 	buildBulkEnableRows,
 	buildBulkMoveRows,
+	formatTagsBulkDeleteConfirmMessage,
 	hasMixedTagKinds,
 	summarizeBulkChange
 } from './tagBulkOps';
@@ -190,5 +191,19 @@ describe('summarizeBulkChange', () => {
 		const tags = [makeTag({ id: 1, enabled: false }), makeTag({ id: 2, enabled: false })];
 		const summary = summarizeBulkChange(tags, 'enabled', true);
 		expect(summary.changedCount).toBe(summary.targetCount);
+	});
+});
+
+describe('formatTagsBulkDeleteConfirmMessage', () => {
+	it('states the exact selected count and that history is kept', () => {
+		const message = formatTagsBulkDeleteConfirmMessage(3);
+		expect(message).toContain('選択した 3 件のタグを削除します。');
+		expect(message).toContain('記録済みの履歴（収集データ）は削除されません。');
+	});
+
+	it('states the count even when it is zero', () => {
+		const message = formatTagsBulkDeleteConfirmMessage(0);
+		expect(message).toContain('選択した 0 件のタグを削除します。');
+		expect(message).toContain('記録済みの履歴（収集データ）は削除されません。');
 	});
 });
