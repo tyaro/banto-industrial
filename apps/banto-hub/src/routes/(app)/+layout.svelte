@@ -7,12 +7,14 @@
 	// （`enforce_loopback_when_commissioning`）ため、無認証のまま外部
 	// ネットワークへ露出することはない。状態を知る手段は
 	// `status/+page.svelte` の「サーバー状態」に事実として残した。
+	import { afterNavigate } from '$app/navigation';
 	import Header from '$lib/components/Header.svelte';
 	import Sidebar from '$lib/components/Sidebar.svelte';
 	import CommandPalette from '$lib/components/CommandPalette.svelte';
 	import { listPendingChanges } from '$lib/banto/pendingChangesAdmin';
 	import { countUnappliedPendingChanges } from '$lib/banto/pendingUnappliedCount';
 	import { commandPaletteStore } from '$lib/commandPalette.svelte';
+	import { mobileNavStore } from '$lib/mobileNav.svelte';
 	import { isAdmin } from '$lib/permissions';
 	import { sessionStore } from '$lib/session.svelte';
 
@@ -27,7 +29,27 @@
 			event.preventDefault();
 			commandPaletteStore.toggle();
 		}
+
+		// T19 S3-a（UX-43）: オフキャンバスが開いていれば Escape で閉じる。
+		if (event.key === 'Escape' && mobileNavStore.open) {
+			mobileNavStore.closeNav();
+		}
 	}
+
+	// T19 S3-a（UX-43）: ビューポート幅の監視を開始する。$effect のクリーン
+	// アップで購読解除する（`viewportWatch.ts` は SSR/matchMedia 未実装
+	// 環境でもガードされている）。`mobileNavStore.watchViewport()` 内部で
+	// `untrack` している理由は mobileNav.svelte.ts のコメント参照
+	// （untrack 無しだと effect_update_depth_exceeded で描画が壊れる罠を
+	// 実機で踏んだ）。
+	$effect(() => {
+		return mobileNavStore.watchViewport();
+	});
+
+	// ルート変更時はオフキャンバスを必ず閉じる（設計の「閉じる契機」の1つ）。
+	afterNavigate(() => {
+		mobileNavStore.closeNav();
+	});
 
 	$effect(() => {
 		if (!hubAdmin) {
@@ -66,6 +88,21 @@
 <svelte:window onkeydown={handleKeydown} />
 
 <div class="shell">
+	{#if mobileNavStore.isNarrow && mobileNavStore.open}
+		<!--
+			T19 S3-a（UX-43）: ≤900px オフキャンバスのバックドロップ。z-index は
+			Drawer/Modal(900)・CommandPalette/ToastHost/TreeContextMenu(1000)
+			より下の 700 に固定する — サイドバーは常設ナビであり、Drawer や
+			CommandPalette 等の一時的な最前面 UI の「下」にとどまるべきなので、
+			それらが開いていればオフキャンバスより手前に表示され続ける。
+		-->
+		<button
+			type="button"
+			class="nav-backdrop"
+			onclick={() => mobileNavStore.closeNav()}
+			aria-label="背景をクリックしてメニューを閉じる"
+		></button>
+	{/if}
 	<Sidebar {pendingCount} />
 	<div class="main">
 		<Header {pendingCount} />
@@ -80,9 +117,20 @@
 {/if}
 
 <style>
+	/*
+	 * T19 S3-a（UX-43、docs/banto-hub-t19-design.md §8.2）: 真の固定。
+	 * ページ全体をスクロールさせるのではなく、シェルをビューポート全高に
+	 * 固定し（`overflow: hidden`）、ヘッダーは縮まない固定領域、本文
+	 * （`main`）だけが独自スクロール領域を持つ。position: fixed は使わない
+	 * - flex + 専用スクロール領域のほうが破綻しにくい（§8.2）。
+	 * `100dvh` はモバイルのアドレスバー増減に追従する動的ビューポート単位。
+	 * 未対応ブラウザ向けに `100vh` を先に書いてフォールバックする。
+	 */
 	.shell {
 		display: flex;
-		min-height: 100vh;
+		height: 100vh;
+		height: 100dvh;
+		overflow: hidden;
 	}
 
 	.main {
@@ -90,10 +138,33 @@
 		display: flex;
 		flex-direction: column;
 		min-width: 0;
+		height: 100%;
 	}
 
 	main {
 		flex: 1;
+		min-height: 0;
+		overflow-y: auto;
 		padding: 1.25rem;
+	}
+
+	/*
+	 * T19 S3-a（UX-43）: ≤900px オフキャンバスのバックドロップ。z-index は
+	 * Drawer/Modal(900) より下の 700 に固定する（サイドバー本体は 710、
+	 * Sidebar.svelte 参照）。理由: サイドバーは常設ナビであり、ユーザーが
+	 * 明示的に開いた Drawer/Modal/CommandPalette 等の一時的な最前面 UI より
+	 * 手前に出てそれらを隠してはならない。
+	 */
+	.nav-backdrop {
+		position: fixed;
+		inset: 0;
+		z-index: 700;
+		display: block;
+		width: 100%;
+		border: none;
+		margin: 0;
+		padding: 0;
+		background: rgba(0, 0, 0, 0.35);
+		cursor: pointer;
 	}
 </style>

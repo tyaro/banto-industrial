@@ -3,6 +3,7 @@
 	import { page } from '$app/state';
 	import { navItems } from '$lib/navigation';
 	import { settings } from '$lib/settings.svelte';
+	import { mobileNavStore } from '$lib/mobileNav.svelte';
 	import { sessionStore } from '$lib/session.svelte';
 	import { isAdmin } from '$lib/permissions';
 	import { APP_NAME } from '$lib/appName';
@@ -17,12 +18,22 @@
 	const visibleItems = $derived(
 		navItems.filter((item) => !item.adminOnly || isAdmin(sessionStore.role))
 	);
+
+	// T19 S3-a（UX-43）: ≤900px では「アイコンのみ折り畳み」に意味が無いので
+	// 適用しない - 狭幅では常にフルラベル表示にする。
+	const collapsed = $derived(!mobileNavStore.isNarrow && settings.sidebarCollapsed);
+
+	// リンクをクリックしたらオフキャンバスを閉じる（設計の「閉じる契機」の
+	// 1つ）。デスクトップ幅では isNarrow が false なので no-op。
+	function handleNavClick(): void {
+		if (mobileNavStore.isNarrow) mobileNavStore.closeNav();
+	}
 </script>
 
-<aside class:collapsed={settings.sidebarCollapsed}>
+<aside class:collapsed class:offcanvas={mobileNavStore.isNarrow} class:open={mobileNavStore.open}>
 	<div class="brand">
 		<span class="brand-icon">🏮</span>
-		{#if !settings.sidebarCollapsed}
+		{#if !collapsed}
 			<span class="brand-name">{APP_NAME}</span>
 		{/if}
 	</div>
@@ -32,10 +43,11 @@
 			<a
 				href={item.path}
 				class:active={isActive(item.path)}
-				title={settings.sidebarCollapsed ? item.label : undefined}
+				title={collapsed ? item.label : undefined}
+				onclick={handleNavClick}
 			>
 				<span class="icon">{item.icon}</span>
-				{#if !settings.sidebarCollapsed}
+				{#if !collapsed}
 					<span class="nav-label">
 						<span>{item.label}</span>
 						{#if item.path === '/status' && pendingCount > 0}
@@ -54,6 +66,9 @@
 		flex-shrink: 0;
 		display: flex;
 		flex-direction: column;
+		/* T19 S3-a（UX-43）: ナビが長くなった場合に備え、サイドバー自身が
+		   独自スクロール領域を持つ（本文と別にスクロールできる）。 */
+		overflow-y: auto;
 		background: var(--banto-surface);
 		border-right: 1px solid var(--banto-border);
 		transition: width 0.15s ease;
@@ -63,6 +78,34 @@
 
 	aside.collapsed {
 		width: var(--banto-shell-sidebar-width-collapsed);
+	}
+
+	/*
+	 * T19 S3-a（UX-43、docs/banto-hub-t19-design.md §8.2）: ≤900px の
+	 * オフキャンバス化。admin-template のパターン（オフキャンバス +
+	 * オーバーレイ）に倣うが、上流コンポーネントの移植ではなく自前実装
+	 * （§7.7 の通り上流にレイアウトコンポーネントは存在しない）。
+	 *
+	 * z-index=710 は Drawer/Modal(900)・CommandPalette/ToastHost/
+	 * TreeContextMenu(1000) より下に固定する - サイドバーは常設ナビであり、
+	 * ユーザーが明示的に開いた一時的な最前面 UI の手前に出て隠してはなら
+	 * ない（バックドロップ=700 は `(app)/+layout.svelte` 側）。
+	 */
+	@media (max-width: 900px) {
+		aside.offcanvas {
+			position: fixed;
+			inset-block: 0;
+			left: 0;
+			z-index: 710;
+			width: min(var(--banto-shell-sidebar-width), 85vw);
+			transform: translateX(-100%);
+			transition: transform 0.2s ease;
+			box-shadow: 12px 0 32px rgba(0, 0, 0, 0.25);
+		}
+
+		aside.offcanvas.open {
+			transform: translateX(0);
+		}
 	}
 
 	.brand {
