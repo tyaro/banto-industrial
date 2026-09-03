@@ -26,6 +26,7 @@
 	import { BantoGrid, type CellEdit, type GridColumn } from '@banto/grid-svelte';
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '$lib/toast.svelte';
+	import { deferredDelete, UNDO_WINDOW_MS } from '$lib/banto/deferredDelete.svelte';
 	import { sessionStore } from '$lib/session.svelte';
 	import { canWriteResources } from '$lib/permissions';
 	import Drawer from '$lib/components/Drawer.svelte';
@@ -405,6 +406,17 @@
 	let groups: CollectionGroup[] = $state([]);
 	let connections: PlcConnection[] = $state([]);
 	let tags: Tag[] = $state([]);
+
+	/**
+	 * T19 S2-c2（UX-40、docs/banto-hub-t19-design.md §3.10）: 削除の取り消し
+	 * 猶予中のタグを一覧から隠す。`deferredDelete.pendingIds` に含まれる id は
+	 * まだサーバー上には存在する（削除リクエストを遅延させているだけ）が、
+	 * 画面上は既に削除済みとして扱う - `filteredTags`/`selectedTags`/
+	 * ツリーの件数表示など、タグ一覧から派生する表示はすべてこの
+	 * `visibleTags` を経由させる（生の `tags` を直接使わない）。
+	 */
+	const visibleTags = $derived(tags.filter((t) => !deferredDelete.pendingIds.has(t.id)));
+
 	let loading = $state(false);
 	/**
 	 * T18-1（TAG-UX-C 6点目、docs/banto-hub-desktop-plan.md §9.4）:
@@ -505,6 +517,27 @@
 	$effect(() => {
 		void reload();
 		void loadHubStatus();
+	});
+
+	/**
+	 * T19 S2-c2（UX-40、docs/banto-hub-t19-design.md §3.10「取り消し猶予中に
+	 * タブを閉じるなどして実行されなかった場合…画面遷移・再読込・次の
+	 * レジストリ操作の直前には猶予を打ち切って即実行する」）: 画面を離れる
+	 * ときは取り消し猶予を打ち切り、遅延させていた削除を確定させる。
+	 * コンポーネント破棄（他画面への遷移）は `$effect` のクリーンアップで、
+	 * タブを閉じる/リロードは `beforeunload` で拾う - `beforeunload` は
+	 * 非同期処理の完了を保証できないので best-effort（間に合わなければ
+	 * 削除は行われないだけで、データが失われる側には倒れない）。
+	 */
+	$effect(() => {
+		const handleBeforeUnload = (): void => {
+			void deferredDelete.flush();
+		};
+		window.addEventListener('beforeunload', handleBeforeUnload);
+		return () => {
+			window.removeEventListener('beforeunload', handleBeforeUnload);
+			void deferredDelete.flush();
+		};
 	});
 
 	// --- create ---
@@ -987,7 +1020,7 @@
 	const pendingCellOverridesById = $derived(mergeTagCellEdits(pendingCellEdits));
 
 	/** `buildTagCellEditBatch` の結果 - 保存確認パネル・保留バーの件数表示・適用行に使う。 */
-	const cellEditBatch = $derived(buildTagCellEditBatch(pendingCellEdits, tags));
+	const cellEditBatch = $derived(buildTagCellEditBatch(pendingCellEdits, visibleTags));
 	const cellEditRowsJson = $derived(JSON.stringify(cellEditBatch.rows));
 
 	/** 連続登録/CSV/一括操作と同じ「検証済みかどうか」の鮮度追跡（`csvUpdateValidatedFresh` 等と同型）。 */
@@ -1241,12 +1274,60 @@
 	}
 
 	/**
-	 * T18-1（TAG-UX-C 続き）: 削除中も `deleting` を立てて `isDrawerBusy()`
-	 * に含める - creating/saving と同じ try/finally パターン。これが無いと
-	 * 削除ボタンを連打できたり、削除中に保存・×で閉じる等の他操作が
-	 * 走ってしまう（相互排他が破れる）。
+	 * T19 S2-c2（UX-40、docs/banto-hub-t19-design.md §3.10）: 削除の取り消し
+	 * 猶予（`UNDO_WINDOW_MS`）を積み、対応する取り消しトーストを出す。
+	 * 単票削除・一括削除の両方から呼ぶ共通処理 - 成功/失敗時の文言だけ
+	 * 呼び出し元（`handleDelete`/`handleApplyBulk`）ごとに変える。
+	 *
+	 * レビュー対応（2026-09-03）: `deferredDelete.undo()` は猶予切れ後・
+	 * `flush()` による前倒し実行後は何もせず `false` を返す（本当に取り消せた
+	 * ときだけ `true`）。取り消しボタンを押した時点で既に本物の削除が実行
+	 * 済みなら、`false` を無視して「取り消しました」と出すのは実行結果に
+	 * 反する嘘になるので、その場合は代わりに「既に削除済みで取り消せな
+	 * かった」ことを伝える info トーストを出す。また、`run` が実際に実行
+	 * された瞬間（`onExecuted`/`onError`）に取り消しトースト自体を
+	 * `dismiss()` する - 猶予切れ・`flush()` 前倒しのどちらでも、実行後に
+	 * 押せない「取り消し」ボタンが画面に残らないようにするため。
+	 * トーストの表示時間（`durationMs`）は猶予（`UNDO_WINDOW_MS`）ちょうどに
+	 * する - 上記の即時 dismiss が効かなかった場合の保険。かつて
+	 * `UNDO_WINDOW_MS + 1000` にしていたが、それだと dismiss が漏れた際に
+	 * 猶予より最大1秒長くボタンが残ってしまうため、猶予より長くしない
+	 * 方針に変更した（意図的な変更 - 「トーストが早く消えすぎる」不具合
+	 * ではないので +1000 を足し戻さないこと）。
 	 */
-	let deleting = $state(false);
+	function scheduleTagDeletion(options: {
+		ids: number[];
+		run: () => Promise<void>;
+		onExecuted: () => void;
+		onError: (err: unknown) => void;
+	}): void {
+		let undoToastId: number | undefined;
+		deferredDelete.schedule({
+			ids: options.ids,
+			run: options.run,
+			onExecuted: () => {
+				if (undoToastId !== undefined) toastStore.dismiss(undoToastId);
+				options.onExecuted();
+			},
+			onError: (err) => {
+				if (undoToastId !== undefined) toastStore.dismiss(undoToastId);
+				options.onError(err);
+			}
+		});
+		undoToastId = toastStore.push('info', `${options.ids.length}件のタグを削除します`, {
+			action: {
+				label: '取り消し',
+				onClick: () => {
+					if (deferredDelete.undo()) {
+						toastStore.push('success', '削除を取り消しました');
+					} else {
+						toastStore.push('info', '取り消せませんでした（削除は既に実行済みです）');
+					}
+				}
+			},
+			durationMs: UNDO_WINDOW_MS
+		});
+	}
 
 	/**
 	 * T18-1（TAG-UX-C 5点目、docs/banto-hub-desktop-plan.md §9.4「削除前に
@@ -1275,34 +1356,51 @@
 		return ids.every((id) => id === first) ? first : null;
 	}
 
-	async function handleDelete(): Promise<void> {
+	/**
+	 * T19 S2-c2（UX-40）: 単票削除。`window.confirm`（参照している演算タグの
+	 * 列挙込み）はこれまでどおり残す - 取り消しトーストでは代替できない
+	 * 情報（削除の影響範囲）を確認 OK の前に必ず見せるため。confirm 通過後は
+	 * 即座に削除する代わりに `scheduleTagDeletion` で数秒遅延させる（画面上は
+	 * ドロワーを閉じる・選択解除するなど即座に削除済みとして振る舞う - 実際の
+	 * `deleteTag` 呼び出しは猶予後、または次のレジストリ操作の直前の
+	 * `flush()` で行われる）。
+	 */
+	function handleDelete(): void {
 		if (!selected) return;
-		const externalName = externalNameForTag(selected);
+		const target = selected;
+		const externalName = externalNameForTag(target);
 		// 削除対象を参照している演算タグを一覧して確認文言に含める - サーバー側の
 		// 削除 preflight（参照切れで失敗）はそのまま正しさの最終バックストップで
 		// あり、クライアント側でハードブロックはしない（確認 OK なら従来どおり
 		// deleteTag を呼ぶ - サーバーが拒否した場合は既存の error toast で通知）。
 		const referencing = findReferencingComputedTags(
-			selected.id,
+			target.id,
 			externalName,
 			tags,
 			groups,
 			connections
 		);
 		if (!window.confirm(formatDeleteConfirmMessage(externalName, referencing))) return;
-		deleting = true;
-		try {
-			await deleteTag(selected.id);
-			toastStore.push('success', '削除しました');
-			selected = null;
-			drawerMode = null; // 削除後は編集対象が無いのでドロワーを閉じる
-			editConflict = null;
-			await reload();
-		} catch (err) {
-			toastStore.push('error', errorMessage(err));
-		} finally {
-			deleting = false;
+
+		selected = null;
+		drawerMode = null; // 削除後は編集対象が無いのでドロワーを閉じる
+		editConflict = null;
+		if (selectedIds.has(target.id)) {
+			selectedIds = new Set([...selectedIds].filter((id) => id !== target.id));
 		}
+
+		scheduleTagDeletion({
+			ids: [target.id],
+			run: () => deleteTag(target.id),
+			onExecuted: () => {
+				toastStore.push('success', '削除しました');
+				void reload();
+			},
+			onError: (err) => {
+				toastStore.push('error', errorMessage(err));
+				void reload();
+			}
+		});
 	}
 
 	// --- T13-1: Drawer の表示制御 (docs/ux-plan.md §4b) ---------------------
@@ -1335,18 +1433,19 @@
 
 	/**
 	 * T18-1（TAG-UX-C 一部、docs/banto-hub-desktop-plan.md §9.4）: 現在開いて
-	 * いる Drawer が busy（作成/保存/削除/検証/登録のいずれかを実行中）
-	 * かどうか。`drawerMode` は常に高々1つしか開いていないため、これらの
-	 * フラグのどれか1つでも立っていれば「今開いている Drawer」の処理中と
-	 * みなせる。削除も busy に含める（TAG-UX-C 続き、
-	 * `cursor/t18-1-drawer-busy-e3cb`）- 削除中に保存や再削除、×での
-	 * クローズができてしまうのを防ぐ。
+	 * いる Drawer が busy（作成/保存/検証/登録のいずれかを実行中）かどうか。
+	 * `drawerMode` は常に高々1つしか開いていないため、これらのフラグの
+	 * どれか1つでも立っていれば「今開いている Drawer」の処理中とみなせる。
+	 *
+	 * T19 S2-c2（UX-40）: 削除は `deleting` フラグでの busy 化をやめた -
+	 * `handleDelete` は confirm 通過後すぐドロワーを閉じる（実削除は
+	 * `deferredDelete` が数秒後に行う）ため、削除中というドロワー開放中の
+	 * 状態そのものが無くなった。
 	 */
 	function isDrawerBusy(): boolean {
 		return (
 			creating ||
 			saving ||
-			deleting ||
 			validating ||
 			applyingContinuous ||
 			csvValidating ||
@@ -1461,7 +1560,7 @@
 		// 他グループの同名タグは合法な同名で、それを理由に `_copy2` へ
 		// 繰り上げるのは不要な事故防止（最終的な一意性検証は既存どおり
 		// サーバー側 `createTag` が正 - `tagDuplicate.ts` の doc comment参照）。
-		const existingNames = tags
+		const existingNames = visibleTags
 			.filter((tag) => tag.collectionGroupId === t.collectionGroupId)
 			.map((tag) => tag.name);
 		const next = buildDuplicateFormValues(formFromTag(t), existingNames);
@@ -1911,7 +2010,7 @@
 	});
 
 	const filteredTags = $derived.by((): Tag[] => {
-		let list = tags;
+		let list = visibleTags;
 		if (treeFilter.type === 'group') {
 			const groupId = treeFilter.id;
 			list = list.filter((t) => t.collectionGroupId === groupId);
@@ -2157,7 +2256,7 @@
 				? selectedTags
 				: csvExportScope === 'filtered'
 					? filteredTags
-					: tags;
+					: visibleTags;
 		const csv = exportTagsCsv(source, connections, groups);
 		downloadCsvText(csv, csvExportFilename());
 	}
@@ -2225,7 +2324,7 @@
 		if (csvMode !== 'update' || !csvParseResult?.ok || csvParseResult.rows.length === 0) {
 			return null;
 		}
-		return classifyCsvUpdate(csvParseResult.rows, tags);
+		return classifyCsvUpdate(csvParseResult.rows, visibleTags);
 	});
 
 	/** プレビュー表の「行番号 → changed 行」引き当て用（エラー表示の index→行番号変換に使う）。 */
@@ -2496,7 +2595,7 @@
 	 */
 	let bulkResult: BatchTagsUpdateResult | BatchTagsDeleteResult | null = $state(null);
 
-	const selectedTags = $derived(tags.filter((t) => selectedIds.has(t.id)));
+	const selectedTags = $derived(visibleTags.filter((t) => selectedIds.has(t.id)));
 	/** T18-3b「選択タグに複数種別混在の場合はグループ移動を無効化」の判定。有効/無効切替は種別混在でも可。 */
 	const selectedTagsMixedKind = $derived(hasMixedTagKinds(selectedTags));
 
@@ -2566,42 +2665,69 @@
 	}
 
 	/**
+	 * `deleteTagsBatch` が `ok: false`（一部の行がエラー、例えば演算タグから
+	 * 参照されているため削除できない）を返したことを表すマーカー。
+	 * `deferredDelete` の `run` は例外だけを失敗として扱う（`onError` を
+	 * 呼ぶ契機は throw のみ）ため、`ok: false` をここで例外化して橋渡しする。
+	 */
+	class BulkDeleteRowErrorResult extends Error {
+		result: BatchTagsDeleteResult;
+		constructor(result: BatchTagsDeleteResult) {
+			super('一部のタグの削除でエラーが発生しました');
+			this.result = result;
+		}
+	}
+
+	/**
 	 * 「この内容で一括反映」— `dryRun: false` で直接適用する（上のコメント
 	 * のとおり、対象件数・差分は既にクライアント側で確認済みという設計）。
 	 * `errors` が返れば（`ok: false`）確認パネルは開いたまま行エラーを
 	 * 表示し、選択・入力はそのまま保持する（連続登録/CSVの「検証」失敗時と
-	 * 同じ「直さず再送信できる」形）。
+	 * 同じ「直さず再送信できる」形）- **これは enable/disable/move にのみ
+	 * 当てはまる**。delete は下のコメント参照。
 	 *
 	 * T19 S2-c1: `bulkAction === 'delete'` のときだけ `deleteTagsBatch` を
 	 * 叩く別経路にする - `updateTagsBatch` 系との違いは「差分プレビューを
-	 * 持たない（対象は id そのもの）」「dry run が無い」の2点のみで、
-	 * 成功/失敗トースト・202キュー時の扱い（稼働中は`QueuedWhileRunningError`
-	 * を他の一括操作と同じ汎用エラートーストに委ねる）は完全に揃える。
+	 * 持たない（対象は id そのもの）」「dry run が無い」の2点のみ。
 	 * トースト文言は既存の単票削除トースト「削除しました」と部分文字列でも
 	 * 被らないよう変えてある（PR #135 の教訓 - 上のコメント参照）。
+	 *
+	 * T19 S2-c2（UX-40）: delete は即時実行せず `scheduleTagDeletion`
+	 * （`deferredDelete`）に委ねる。確認パネルを閉じる・選択解除は即座に
+	 * 行う（画面上はもう削除済み）。この結果、`enable`/`disable`/`move` が
+	 * 持っている「`ok: false` なら確認パネルを開いたまま行エラーを見せる」
+	 * という挙動は delete では維持できない（パネルは既に閉じているため）。
+	 * `ok: false` はエラートーストへ倒し、`reload()` で実際の一覧に戻す
+	 * （§3.10「取り消し猶予中にタブを閉じる等で実行されなかった場合…」と
+	 * 同じ「安全側 = 削除されていない側に倒れる」設計の延長）。
 	 */
 	async function handleApplyBulk(): Promise<void> {
 		if (bulkAction === null) return;
 		if (bulkAction === 'delete') {
 			if (bulkDeleteIds.length === 0) return;
-			bulkApplying = true;
-			bulkResult = null;
-			try {
-				const result = await deleteTagsBatch(bulkDeleteIds);
-				bulkResult = result;
-				if (result.ok) {
-					toastStore.push('success', `選択した${result.count}件のタグの削除が完了しました`);
-					closeBulkPanel();
-					selectedIds = new Set();
-					await reload();
-				} else {
-					toastStore.push('error', '選択タグの一部で削除エラーが発生しました（下の一覧参照）。');
+			const ids = bulkDeleteIds;
+			const count = ids.length;
+			closeBulkPanel();
+			selectedIds = new Set();
+			scheduleTagDeletion({
+				ids,
+				run: async () => {
+					const result = await deleteTagsBatch(ids);
+					if (!result.ok) throw new BulkDeleteRowErrorResult(result);
+				},
+				onExecuted: () => {
+					toastStore.push('success', `選択した${count}件のタグの削除が完了しました`);
+					void reload();
+				},
+				onError: (err) => {
+					const message =
+						err instanceof BulkDeleteRowErrorResult
+							? '選択タグの一部で削除エラーが発生しました。演算タグから参照されていないか確認してください。'
+							: errorMessage(err);
+					toastStore.push('error', message);
+					void reload();
 				}
-			} catch (err) {
-				toastStore.push('error', errorMessage(err));
-			} finally {
-				bulkApplying = false;
-			}
+			});
 			return;
 		}
 
@@ -3541,7 +3667,7 @@
 					<ConnectionTree
 						{connections}
 						{groups}
-						{tags}
+						tags={visibleTags}
 						selectedId={treeSelectedId}
 						onselect={handleTreeSelect}
 						oncontextmenu={handleTreeContextMenu}
@@ -3626,7 +3752,7 @@
 							bind:value={csvExportScope}
 							title="CSVエクスポートの対象範囲"
 						>
-							<option value="all">全件（{tags.length}件）</option>
+							<option value="all">全件（{visibleTags.length}件）</option>
 							<option value="filtered">絞り込み結果（{filteredTags.length}件）</option>
 							<option value="selected" disabled={selectedIds.size === 0}>
 								選択行（{selectedIds.size}件）
@@ -3641,7 +3767,7 @@
 							placeholder="名前・アドレスで検索"
 							bind:value={searchQuery}
 						/>
-						<span class="count">{filteredTags.length} / {tags.length} 件</span>
+						<span class="count">{filteredTags.length} / {visibleTags.length} 件</span>
 					</div>
 					{#if canWrite && hubStatus !== null && !collectionStopped}
 						<!-- T18-3e: 停止中ロックの説明バナー - `hubStatus` 取得前

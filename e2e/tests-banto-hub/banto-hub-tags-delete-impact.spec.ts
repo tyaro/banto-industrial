@@ -14,8 +14,15 @@
  * `crates/banto-tags/src/plc_connection.rs::CALC_CONNECTION_NAME`）配下の
  * 収集グループにしか作れないため、`GET /api/plc-connections` でその id を
  * 取得してから収集グループを作る。
+ *
+ * T19 S2-c2（UX-40、docs/banto-hub-t19-design.md §3.10）追記: タグ削除は
+ * 「削除の遅延実行」になった（confirm 直後は一覧から消えるだけで、実際の
+ * `DELETE` は数秒後）。テスト3（confirm OK → 削除完了）は見た目だけでなく
+ * 実際の `DELETE` レスポンスを待つよう変更し、取り消しトースト
+ * （ロール+ラベル `role: 'button', name: '取り消し'` で取得）を押すケースを
+ * テスト4として追加した。
  */
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page, type Request } from '@playwright/test';
 import { CSRF_HEADERS, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
 
 const CONNECTION_NAME = 'e2e-del-impact-plc';
@@ -199,11 +206,77 @@ test.describe.serial('banto-hub タグ削除前の参照影響表示 (TAG-UX-C)'
 		page.once('dialog', (dialog) => {
 			void dialog.accept();
 		});
+
+		// T19 S2-c2（UX-40、docs/banto-hub-t19-design.md §3.10）: 削除確認 OK
+		// 後も、実際の削除は数秒（`UNDO_WINDOW_MS`）遅延実行される - 一覧から
+		// 消える見た目だけでは「サーバー側でも実際に削除された」ことの
+		// 証明にならない（#216 の教訓 - トースト文言だけの待ち合わせは古い
+		// トーストに誤マッチしうる）。実際の DELETE リクエストの完了を
+		// 待ってから完了とみなす。
+		const deleteRequest = page.waitForResponse(
+			(res) => res.request().method() === 'DELETE' && /\/api\/tags\/\d+$/.test(res.url())
+		);
 		await drawer.getByRole('button', { name: '削除' }).click();
 
+		// ドロワーを閉じる・一覧から隠すのは confirm 直後（猶予中の
+		// 楽観的な見た目）。
 		await expect(drawer).toBeHidden();
 		await expect(
 			page.getByRole('gridcell', { name: UNREFERENCED_TAG_NAME, exact: true })
 		).toHaveCount(0);
+
+		// 猶予後、実際に DELETE が送られて完了することを確認する
+		// （後続テスト/再実行のためのフィクスチャ後始末も兼ねる）。
+		await deleteRequest;
+	});
+
+	test('4. 削除確認で OK 後に「取り消し」を押すと、猶予後もタグは削除されない', async () => {
+		let deleteRequestSeen = false;
+		const onRequest = (req: Request): void => {
+			if (req.method() === 'DELETE' && /\/api\/tags\/\d+$/.test(req.url())) {
+				deleteRequestSeen = true;
+			}
+		};
+		page.on('request', onRequest);
+
+		try {
+			await page.getByRole('gridcell', { name: REFERENCED_TAG_NAME, exact: true }).click();
+			const drawer = page.getByRole('dialog', { name: `${REFERENCED_TAG_NAME} を編集` });
+			await expect(drawer).toBeVisible();
+
+			page.once('dialog', (dialog) => {
+				void dialog.accept();
+			});
+			await drawer.getByRole('button', { name: '削除' }).click();
+
+			// confirm 直後は他の削除同様、ドロワーが閉じ一覧から消える
+			// （猶予中の楽観的な見た目）。
+			await expect(drawer).toBeHidden();
+			await expect(
+				page.getByRole('gridcell', { name: REFERENCED_TAG_NAME, exact: true })
+			).toHaveCount(0);
+
+			const undoButton = page.getByRole('button', { name: '取り消し' });
+			await expect(undoButton).toBeVisible();
+			await undoButton.click();
+
+			// 取り消し後は即座に一覧へ戻る。
+			await expect(
+				page.getByRole('gridcell', { name: REFERENCED_TAG_NAME, exact: true })
+			).toBeVisible();
+
+			// 猶予（`UNDO_WINDOW_MS` = 6秒）を過ぎても実際には削除リクエストが
+			// 送られていないこと、タグが（サーバー側の状態としても）残って
+			// いることまで確認する。
+			await page.waitForTimeout(7000);
+			expect(deleteRequestSeen).toBe(false);
+
+			await page.reload();
+			await expect(
+				page.getByRole('gridcell', { name: REFERENCED_TAG_NAME, exact: true })
+			).toBeVisible();
+		} finally {
+			page.off('request', onRequest);
+		}
 	});
 });
