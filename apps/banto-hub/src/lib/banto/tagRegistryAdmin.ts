@@ -628,6 +628,49 @@ export async function updateTagsBatch(
 	});
 }
 
+// --- T19 S2-c1 一括削除 (UX-37) -----------------------------------------------
+
+/**
+ * 行番号(0起点)付きのフィールドエラー — mirrors
+ * `banto_hub_core::rest::BatchTagDeleteRowErrorResponse`。
+ * {@link BatchTagUpdateRowError} と全く同じ形（`id` を含む）だが、
+ * サーバー側の型が別物（`banto_tags::BatchTagDeleteError`）なので専用の
+ * 型として定義する。
+ */
+export interface BatchTagDeleteRowError {
+	index: number;
+	id: number;
+	fieldErrors: BatchTagFieldError[];
+}
+
+/**
+ * `POST /api/tags/batch-delete` の応答 — mirrors
+ * `banto_hub_core::rest::BatchTagsDeleteResponse`。`BatchTagsUpdateResult`
+ * と同じ「常に HTTP 200、`ok: false` は行ごとエラーの通常応答」契約だが、
+ * `dryRun`/`tags` は持たない（削除に事前検証プレビューの意味が薄いため -
+ * `tags_batch_delete`の doc comment 参照）。
+ */
+export interface BatchTagsDeleteResult {
+	ok: boolean;
+	/** 削除された(または `ok: false` なら常に0の)件数。 */
+	count: number;
+	errors: BatchTagDeleteRowError[];
+}
+
+/**
+ * T19 S2-c1（UX-37）一括削除。`updateTagsBatch`と同型 - 稼働中は 202 で
+ * キュー投入される（`httpRequest` が既存どおり
+ * {@link QueuedWhileRunningError} を投げる）ので、呼び出し元は他の
+ * 書き込み系呼び出しと同じ catch で扱える。`dryRun` パラメータは無い
+ * （`tags_batch_delete`の doc comment 参照）。
+ */
+export async function deleteTagsBatch(ids: number[]): Promise<BatchTagsDeleteResult> {
+	return httpRequest<BatchTagsDeleteResult>('/api/tags/batch-delete', {
+		method: 'POST',
+		body: { ids }
+	});
+}
+
 // --- T12 接続テスト (docs/ux-plan.md §4) -------------------------------------
 
 /**

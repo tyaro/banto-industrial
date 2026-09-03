@@ -45,9 +45,10 @@ pub use plc_connection::{
 };
 pub use scaling::{scale_raw, unscale, Scaling};
 pub use tag::{
-    BatchTagError, BatchTagOutcome, BatchTagUpdateError, BatchTagUpdateOutcome, GroupTagCount, Tag,
-    TagInput, TagService, TagUpdateError, ALLOWED_DATA_TYPES, ALLOWED_TAG_KINDS, COMPUTED_TAG_KIND,
-    INTERNAL_TAG_KIND, NUMERIC_DATA_TYPES, PLC_TAG_KIND, STRING_DATA_TYPE,
+    BatchTagDeleteError, BatchTagDeleteOutcome, BatchTagError, BatchTagOutcome,
+    BatchTagUpdateError, BatchTagUpdateOutcome, GroupTagCount, Tag, TagInput, TagService,
+    TagUpdateError, ALLOWED_DATA_TYPES, ALLOWED_TAG_KINDS, COMPUTED_TAG_KIND, INTERNAL_TAG_KIND,
+    NUMERIC_DATA_TYPES, PLC_TAG_KIND, STRING_DATA_TYPE,
 };
 
 use banto_core::BantoError;

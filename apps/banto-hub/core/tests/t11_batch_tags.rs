@@ -1025,3 +1025,353 @@ async fn batch_update_non_dry_run_while_running_is_accepted_and_queued() {
         .unwrap();
     assert_eq!(queued_count, 1);
 }
+
+// ===========================================================================
+// T19 S2-c1 (UX-37): POST /api/tags/batch-delete （一括削除）
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// D1. 全件成功 + rebuild が1回だけ走る
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_delete_all_succeed_and_rebuilds_exactly_once() {
+    let app = test_app("delete-all-succeed").await;
+    let group_id = seed_group(&app, "d1").await;
+
+    let t1 = create_tag(&app, "dt1", group_id, "40001").await;
+    let t2 = create_tag(&app, "dt2", group_id, "40002").await;
+    let t3 = create_tag(&app, "dt3", group_id, "40003").await;
+
+    let revision_before = app.manager.configured_revision();
+
+    let (status, body) = write_json(
+        &app.router,
+        "POST",
+        "/api/tags/batch-delete",
+        &app.token,
+        json!({ "ids": [t1["id"], t2["id"]] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["count"], json!(2));
+    assert_eq!(body["errors"].as_array().unwrap().len(), 0);
+
+    // 2件削除したにもかかわらず revision はちょうど+1 - rebuild が1回だけ
+    // 走ったことの直接証拠（T11-1/T18-3b と同じ検証方法）。
+    assert_eq!(
+        app.manager.configured_revision(),
+        revision_before + 1,
+        "a 2-tag batch-delete must commit the configured catalog exactly once"
+    );
+
+    let (status, _) = get_json(
+        &app.router,
+        &format!("/api/tags/{}", t1["id"].as_i64().unwrap()),
+        &app.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = get_json(
+        &app.router,
+        &format!("/api/tags/{}", t2["id"].as_i64().unwrap()),
+        &app.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // 対象外だった t3 は残る。
+    let (status, fetched3) = get_json(
+        &app.router,
+        &format!("/api/tags/{}", t3["id"].as_i64().unwrap()),
+        &app.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(fetched3["name"], json!("dt3"));
+}
+
+// ---------------------------------------------------------------------------
+// D2. 存在しない id を含む一括削除は全体 rollback（DB 無変更）
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_delete_rejects_whole_batch_on_a_nonexistent_id() {
+    let app = test_app("delete-bad-id").await;
+    let group_id = seed_group(&app, "d2").await;
+
+    let t1 = create_tag(&app, "dg1", group_id, "40001").await;
+    let revision_before = app.manager.revision();
+
+    let (status, body) = write_json(
+        &app.router,
+        "POST",
+        "/api/tags/batch-delete",
+        &app.token,
+        json!({ "ids": [t1["id"], 999_999] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], json!(false));
+    assert_eq!(body["count"], json!(0));
+
+    let errors = body["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0]["index"], json!(1));
+    assert_eq!(errors[0]["id"], json!(999_999));
+    let field_errors = errors[0]["fieldErrors"].as_array().unwrap();
+    assert!(
+        field_errors.iter().any(|e| e["field"] == "id"),
+        "{field_errors:?}"
+    );
+
+    // All-or-nothing: t1 (individually a valid id) was not deleted either,
+    // and no rebuild happened.
+    assert_eq!(app.manager.revision(), revision_before);
+    let (status, _) = get_json(
+        &app.router,
+        &format!("/api/tags/{}", t1["id"].as_i64().unwrap()),
+        &app.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// D3. 重複 id を含む一括削除は全体 rollback（DB 無変更）
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_delete_rejects_whole_batch_on_a_duplicate_id() {
+    let app = test_app("delete-dup-id").await;
+    let group_id = seed_group(&app, "d3").await;
+
+    let t1 = create_tag(&app, "dd1", group_id, "40001").await;
+    let revision_before = app.manager.revision();
+
+    let (status, body) = write_json(
+        &app.router,
+        "POST",
+        "/api/tags/batch-delete",
+        &app.token,
+        json!({ "ids": [t1["id"], t1["id"]] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], json!(false));
+    let errors = body["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 2, "{errors:?}");
+
+    assert_eq!(app.manager.revision(), revision_before);
+    let (status, _) = get_json(
+        &app.router,
+        &format!("/api/tags/{}", t1["id"].as_i64().unwrap()),
+        &app.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// D4. 空配列は no-op 成功
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_delete_with_empty_ids_array_is_a_harmless_success() {
+    let app = test_app("delete-empty-batch").await;
+    let revision_before = app.manager.revision();
+
+    let (status, body) = write_json(
+        &app.router,
+        "POST",
+        "/api/tags/batch-delete",
+        &app.token,
+        json!({ "ids": [] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], json!(true));
+    assert_eq!(body["count"], json!(0));
+    assert_eq!(
+        app.manager.revision(),
+        revision_before,
+        "no rebuild for an empty batch"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D5. 稼働中は 202 でキューされる
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_delete_while_running_is_accepted_and_queued() {
+    let app = test_app("delete-queued").await;
+    let group_id = seed_group(&app, "d5").await;
+    let t1 = create_tag(&app, "dq1", group_id, "40001").await;
+
+    let start = app
+        .router
+        .clone()
+        .oneshot(
+            HttpRequest::post("/api/collection/start")
+                .header("Authorization", format!("Bearer {}", app.token))
+                .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start.status(), StatusCode::OK);
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            HttpRequest::post("/api/tags/batch-delete")
+                .header("Authorization", format!("Bearer {}", app.token))
+                .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "ids": [t1["id"]] }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["queued"], json!(true));
+
+    let queued_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_changes")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(queued_count, 1);
+
+    // t1 must still exist - queuing while running must not delete anything
+    // itself.
+    let (status, _) = get_json(
+        &app.router,
+        &format!("/api/tags/{}", t1["id"].as_i64().unwrap()),
+        &app.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// D6. 稼働中に積んだ tags.batch_delete の pending を、停止後に適用すると
+// 実際にタグが消える（B-2 の非対称バグ再発防止の直接証拠 -
+// 実装指示「必ずテストで固定してください」）。
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_delete_pending_apply_after_stop_actually_deletes_the_rows() {
+    let app = test_app("delete-pending-apply").await;
+    let group_id = seed_group(&app, "d6").await;
+    let t1 = create_tag(&app, "dp1", group_id, "40001").await;
+    let t2 = create_tag(&app, "dp2", group_id, "40002").await;
+    // A tag outside the batch - must survive both queuing and apply.
+    let t3 = create_tag(&app, "dp3", group_id, "40003").await;
+
+    let start = app
+        .router
+        .clone()
+        .oneshot(
+            HttpRequest::post("/api/collection/start")
+                .header("Authorization", format!("Bearer {}", app.token))
+                .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(start.status(), StatusCode::OK);
+
+    let queued = app
+        .router
+        .clone()
+        .oneshot(
+            HttpRequest::post("/api/tags/batch-delete")
+                .header("Authorization", format!("Bearer {}", app.token))
+                .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "ids": [t1["id"], t2["id"]] }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued.status(), StatusCode::ACCEPTED);
+    let queued_bytes = axum::body::to_bytes(queued.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let queued_body: Value = serde_json::from_slice(&queued_bytes).unwrap();
+    let pending_id = queued_body["pending"]["id"]
+        .as_i64()
+        .expect("pending id should exist");
+
+    let stop = app
+        .router
+        .clone()
+        .oneshot(
+            HttpRequest::post("/api/collection/stop")
+                .header("Authorization", format!("Bearer {}", app.token))
+                .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stop.status(), StatusCode::OK);
+
+    let apply = app
+        .router
+        .clone()
+        .oneshot(
+            HttpRequest::post(format!("/api/pending-changes/{pending_id}/apply"))
+                .header("Authorization", format!("Bearer {}", app.token))
+                .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(apply.status(), StatusCode::OK);
+    let apply_bytes = axum::body::to_bytes(apply.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let apply_body: Value = serde_json::from_slice(&apply_bytes).unwrap();
+    assert_eq!(apply_body["state"], json!("applied"), "{apply_body:?}");
+
+    // The core assertion this test exists for: applying a pending
+    // tags.batch_delete must actually delete the rows, not just mark the
+    // pending change "applied" while leaving the registry untouched.
+    let (status, _) = get_json(
+        &app.router,
+        &format!("/api/tags/{}", t1["id"].as_i64().unwrap()),
+        &app.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "t1 should have been deleted");
+    let (status, _) = get_json(
+        &app.router,
+        &format!("/api/tags/{}", t2["id"].as_i64().unwrap()),
+        &app.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "t2 should have been deleted");
+
+    let (status, fetched3) = get_json(
+        &app.router,
+        &format!("/api/tags/{}", t3["id"].as_i64().unwrap()),
+        &app.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(fetched3["name"], json!("dp3"));
+}
