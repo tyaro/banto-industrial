@@ -6943,6 +6943,22 @@ fn write_rejection_response(tag: String, rejection: crate::write_path::WriteReje
         WriteRejection::AuditWriteFailed | WriteRejection::Internal(_) => {
             StatusCode::INTERNAL_SERVER_ERROR
         }
+        // T20-3a: `execute_write`(単票、この関数が変換する唯一の呼び出し
+        // 元)は `BatchAborted`/`DuplicateTagInBatch` を絶対に返さない -
+        // `crate::write_path`の各バリアントのdoc comment参照。バッチ専用の
+        // `POST /api/v1/values/batch`(`v1_write_values_batch`)は
+        // `WriteRejection::to_json()`をそのまま封筒に載せる別の応答経路
+        // (下記)を使い、この関数は通らない。
+        WriteRejection::BatchAborted => {
+            unreachable!(
+                "execute_write は BatchAborted を返さない - execute_write_batch 専用の結果"
+            )
+        }
+        WriteRejection::DuplicateTagInBatch(_) => {
+            unreachable!(
+                "execute_write は DuplicateTagInBatch を返さない - execute_write_batch 専用の結果"
+            )
+        }
     };
     (status, Json(rejection.to_json())).into_response()
 }
@@ -7050,6 +7066,137 @@ async fn v1_write_value(
     }
 }
 
+// --- レシピ一括書き込み（T20-3a、docs/banto-hub-t20-design.md §3.3） -------
+//
+// `POST /api/v1/values/batch`。ゲート1〜8の本体は
+// `crate::write_path::execute_write_batch` へ丸ごと委譲する（単票
+// `v1_write_value` と同じ「二重実装は絶対に不可」規律、§3.7「ゲートを
+// 迂回しない」）。このハンドラ自身が担うのは REST 固有の前段(セッション
+// token 拒否・**各エントリの** `write:{tag}` スコープ検査・JSON body の
+// 正規化)と、per-entry 結果を常に 200 の封筒へ変換するだけ
+// （`crate::rest`の `POST /api/tags/batch`(`BatchTagsResponse`)と同じ
+// 「1件でも不正なら全体拒否は例外ではなく通常の応答」という思想 -
+// このモジュールの `BatchTagsResponse` doc comment参照）。
+
+/// `POST /api/v1/values/batch` の1エントリぶんの request body。`v` は単票
+/// [`WriteValueRequest::v`]・[`parse_requested_value`] と同じ正規化。
+#[derive(Debug, Deserialize, ToSchema)]
+struct BatchWriteEntryRequest {
+    /// 外部名 `{connection}.{group}.{tag}`。
+    tag: String,
+    /// 書き込む工学値(単票と同じ - 数値タグには数値、bit タグには真偽値)。
+    #[schema(value_type = f64, example = 1)]
+    v: serde_json::Value,
+}
+
+/// `POST /api/v1/values/batch` の request body（設計 §3.3
+/// 「`[{tag, value}, ...]` を受ける」）。
+#[derive(Debug, Deserialize, ToSchema)]
+struct BatchWriteValueRequest {
+    writes: Vec<BatchWriteEntryRequest>,
+}
+
+/// per-entry 結果の1件分。成功時は `ok: true` のみ、失敗時は `ok: false` +
+/// [`crate::write_path::WriteRejection::rest_error_code`]/`detail`
+/// （単票のエラー本文と同じ語彙 - `error`/`detail` フィールド名も揃える）。
+#[derive(Debug, Serialize, ToSchema)]
+struct BatchWriteEntryResponse {
+    tag: String,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+impl From<crate::write_path::BatchEntryOutcome> for BatchWriteEntryResponse {
+    fn from(outcome: crate::write_path::BatchEntryOutcome) -> Self {
+        match outcome.result {
+            Ok(()) => Self {
+                tag: outcome.tag,
+                ok: true,
+                error: None,
+                detail: None,
+            },
+            Err(rejection) => Self {
+                tag: outcome.tag,
+                ok: false,
+                error: Some(rejection.rest_error_code().to_string()),
+                detail: rejection.detail(),
+            },
+        }
+    }
+}
+
+/// `POST /api/v1/values/batch` の応答。**常に 200**（設計 §3.3・このモジュール
+/// の `BatchTagsResponse` doc comment と同じ判断 - 事前ゲート
+/// all-or-nothing による全体中止は例外ではなく通常の応答で、クライアントは
+/// `writes[].ok`/`error`/`detail` を行ごとに見る）。認証エラー(403)や JSON
+/// パース失敗(400)は既存の `ApiError`/`Json` extractor 経路のまま区別する。
+#[derive(Debug, Serialize, ToSchema)]
+struct BatchWriteValuesResponse {
+    writes: Vec<BatchWriteEntryResponse>,
+}
+
+/// `POST /api/v1/values/batch` - レシピ一括書き込み（T20-3a）。
+///
+/// 事前段(a): セッション token では書けない([`v1_write_value`]と同じ)。
+/// 事前段(b): **各エントリの** `write:{tag}` スコープを検査する - 1件でも
+/// スコープ不足なら(事前ゲート all-or-nothing の思想を認証にも適用)
+/// **全体を拒否**して 403 `missing_write_scope` を返し、1件も書かない
+/// (`crate::write_path::execute_write_batch` へは進まない)。
+///
+/// スコープを通過した後は、`v` の正規化(単票と同じ
+/// [`parse_requested_value`])を済ませ、ゲート1〜8の本体をまるごと
+/// `crate::write_path::execute_write_batch` へ委譲する。
+#[utoipa::path(
+    post,
+    path = "/api/v1/values/batch",
+    request_body = BatchWriteValueRequest,
+    responses(
+        (status = 200, description = "常に200 - per-entry の ok/error は writes[] を参照", body = BatchWriteValuesResponse),
+        (status = 403, description = "missing_write_scope（1件でもスコープ不足）/ session_token_cannot_write"),
+    ),
+    tag = "tag-space",
+)]
+async fn v1_write_values_batch(
+    State(state): State<WriteState>,
+    ctx: Option<Extension<ApiKeyContext>>,
+    Json(body): Json<BatchWriteValueRequest>,
+) -> Response {
+    let Some(Extension(ctx)) = ctx else {
+        return session_token_cannot_write_response();
+    };
+    // 事前ゲート all-or-nothing をスコープ検査にも適用する(設計 §3.3
+    // REST 節): 1件でも write スコープが無ければ、どのエントリも
+    // execute_write_batch へ進めず全体を 403 で拒否する。
+    if body.writes.iter().any(|w| !ctx.has_write_scope(&w.tag)) {
+        return missing_write_scope_response();
+    }
+
+    let entries: Vec<(String, Option<crate::write_path::RequestedValue>)> = body
+        .writes
+        .into_iter()
+        .map(|w| (w.tag, parse_requested_value(&w.v)))
+        .collect();
+
+    let deps = crate::write_path::WriteDeps {
+        manager: state.manager.as_ref(),
+        collection_controller: state.collection_controller.as_deref(),
+        api_keys: &state.api_keys,
+        write_audit: &state.write_audit,
+        write_control: state.write_control.as_ref(),
+        rate_limiter: state.rate_limiter.as_ref(),
+        events: &state.events,
+    };
+
+    let outcomes = crate::write_path::execute_write_batch(&deps, &ctx, entries).await;
+    Json(BatchWriteValuesResponse {
+        writes: outcomes.into_iter().map(Into::into).collect(),
+    })
+    .into_response()
+}
+
 // --- OpenAPI 自動生成（設計 §5.1・§10-6、2026-08-04 決定） ------------------
 //
 // catalog（`/api/v1/tags`）はクライアントとの互換性契約（設計 §4.1）なので、
@@ -7070,6 +7217,7 @@ async fn v1_write_value(
         v1_values,
         v1_value_single,
         v1_write_value,
+        v1_write_values_batch,
         v1_status,
         v1_events,
     ),
@@ -7089,6 +7237,10 @@ async fn v1_write_value(
         EventsResponse,
         WriteValueRequest,
         WriteValueResponse,
+        BatchWriteEntryRequest,
+        BatchWriteValueRequest,
+        BatchWriteEntryResponse,
+        BatchWriteValuesResponse,
     ))
 )]
 struct ApiDoc;
@@ -7372,6 +7524,11 @@ fn tag_space_router(
 
     let write_router = Router::new()
         .route("/api/v1/values/{tag}", post(v1_write_value))
+        // T20-3a: 静的セグメント `batch` は axum(matchit)のルーティングで
+        // `{tag}` パラメータより優先して一致する - `"batch"`という外部名の
+        // タグは作れない(`banto_tags`のタグ名バリデーションに依存しない、
+        // ルーティング層の静的優先で保証される)ので衝突しない。
+        .route("/api/v1/values/batch", post(v1_write_values_batch))
         .with_state(write_state);
 
     read_router
