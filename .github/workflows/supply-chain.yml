@@ -1,10 +1,23 @@
 # サプライチェーン検証(2026-08-08 導入、docs/improvement-plan.md H6)。
 # ライセンス・既知脆弱性(advisory)・重複バージョン・依存の取得元(source)を
-# `cargo deny check`(EmbarkStudios/cargo-deny-action)で検証する。設定は
-# リポジトリルートの deny.toml(各セクションに判断理由をコメント済み)。
+# `cargo deny check` で検証する。設定はリポジトリルートの deny.toml
+# (各セクションに判断理由をコメント済み)。
 #
 # ci.yml(rust ジョブ)は絶対に変更しない別作業者管理のファイルのため、本
 # ワークフローは独立ファイルとして追加した。
+#
+# 2026-09-04(#237)まで `EmbarkStudios/cargo-deny-action@v2` を使っていたが、
+# 同アクションは `rust-version` に合わせた musl ツールチェーン
+# (`cargo-1.94.1-x86_64-unknown-linux-musl.tar.xz`)を毎回 static.rust-lang.org
+# からダウンロードするため、そのダウンロードがネットワーク起因で間欠的に
+# タイムアウトし、コードに無関係な PR でも CI を赤くしていた(2日連続で観測、
+# #237)。musl DL を丸ごと無くすため、ci.yml と同じく実績のある
+# `dtolnay/rust-toolchain`(gnu ホスト・musl 不使用)でツールチェーンを入れ、
+# `taiki-e/install-action` でプリビルドの cargo-deny バイナリを取得して
+# `cargo deny` を直接実行する形へ置き換えた。1.94.1 ピン(rust-toolchain.toml
+# と一致させ `cargo metadata` を安定させる意図)と、旧アクション既定の
+# `--all-features`(2026-08-08 実測でこの追加依存は allow 済みライセンスのみ)
+# は保持している。
 name: Supply Chain
 
 on:
@@ -21,12 +34,9 @@ concurrency:
 jobs:
   # advisories だけ独立ジョブにする。理由: advisory DB の新着(既存の
   # 依存が後から vulnerable/unmaintained と判明するケース)は、Rust
-  # コードに無関係な PR でも突然 CI を赤くし得る。cargo-deny-action の
-  # README はこれを `continue-on-error` で握りつぶす例を示しているが、
-  # それだと「advisory が見つかったのに誰も気づかない」状態になり
-  # 産業用途の供給網監視としては本末転倒(H6 の趣旨は可視化)。そこで
-  # continue-on-error は使わず、代わりにジョブを分離するだけに留める:
-  # PR の checks 一覧で「advisories が落ちている」と一目で分かる一方、
+  # コードに無関係な PR でも突然 CI を赤くし得る。continue-on-error は
+  # 使わず(H6 の趣旨は可視化)、ジョブを分離するだけに留める: PR の
+  # checks 一覧で「advisories が落ちている」と一目で分かる一方、
   # licenses/bans/sources 側の合否には影響しない(逆も同様)。
   advisories:
     name: cargo-deny (advisories)
@@ -35,31 +45,25 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # rust-toolchain.toml(2026-08-08 導入、H6)と同じバージョンに固定する。
-      # cargo-deny-action の `rust-version` を省略するとアクション同梱の
-      # イメージ既定バージョン(README 記載時点で 1.85.0)が使われ、この
-      # リポジトリで検証したバージョンと食い違う。`cargo deny` 自体は
-      # コンパイルはしないが `cargo metadata` は実行するため、依存クレート
-      # 側の rust-version/edition 要求によっては古い cargo だと
+      # `cargo deny` 自体はコンパイルしないが `cargo metadata` は実行するため、
+      # 依存クレート側の rust-version/edition 要求によっては古い cargo だと
       # 失敗しうる。ここを rust-toolchain.toml と別管理にしないため固定。
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: taiki-e/install-action@v2
         with:
-          rust-version: '1.94.1'
-          command: check advisories
-          # arguments は既定値 `--all-features` のままにする(明示未指定)。
-          # 2026-08-08 実測: --all-features で増える依存(rust-embed 一式・
-          # sha2 0.11 系など10クレート)は deny.toml の allow 済みライセンス
-          # (MIT/Apache-2.0)のみで、default-features 版と比べて追加の
-          # 判断は不要だったため、素直に既定を使う。
+          tool: cargo-deny
+      - run: cargo deny --all-features check advisories
 
   # licenses / bans / sources は挙動が変わりやすい advisory と切り離し、
-  # まとめて1ジョブにする(cargo-deny-action README の推奨構成と同じ形)。
+  # まとめて1ジョブにする。
   licenses-bans-sources:
     name: cargo-deny (licenses / bans / sources)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: taiki-e/install-action@v2
         with:
-          rust-version: '1.94.1'
-          command: check licenses bans sources
+          tool: cargo-deny
+      - run: cargo deny --all-features check licenses bans sources
