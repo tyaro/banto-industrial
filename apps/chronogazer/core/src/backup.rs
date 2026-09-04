@@ -302,16 +302,35 @@ impl BackupService {
     /// default) rather than the host clock, so `created_at` and the
     /// file-name stamp are always derived from the exact same value.
     pub async fn create(&self) -> Result<BackupInfo, BantoError> {
+        let now: String = sqlx::query_scalar("SELECT datetime('now')")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(banto_storage::storage_error)?;
+        self.create_with_now(&now).await
+    }
+
+    /// Same as [`Self::create`], but with `now` (the `"YYYY-MM-DD HH:MM:SS"`
+    /// stamp that both the file name and `created_at` are derived from)
+    /// passed in rather than read from `SELECT datetime('now')` internally.
+    /// This is a test-only seam (#241) - `create()` still reads the DB's own
+    /// clock in production and simply forwards it here unchanged, so
+    /// `create()`'s external behavior is identical to before this split.
+    /// The seam exists because a test that reads `datetime('now')` itself
+    /// (to predict `create()`'s file name and force a collision) and then
+    /// calls `create()`, which reads `datetime('now')` a second time
+    /// internally, races the two reads across a second boundary - the same
+    /// category of problem banto-tstore's `clock.rs` (`Clock` trait) solves
+    /// for rotation-time tests by making "now" injectable instead of always
+    /// live. Calling this directly from production code would defeat that
+    /// guarantee (the DB's own `datetime('now')` and the injected `now`
+    /// could disagree), so it is `pub(crate)`, not `pub`.
+    pub(crate) async fn create_with_now(&self, now: &str) -> Result<BackupInfo, BantoError> {
         let dir = self.backups_dir();
         tokio::fs::create_dir_all(&dir)
             .await
             .map_err(|err| io_err("バックアップ用ディレクトリの作成に失敗しました", err))?;
 
-        let now: String = sqlx::query_scalar("SELECT datetime('now')")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(banto_storage::storage_error)?;
-        let stamp = compact_stamp(&now);
+        let stamp = compact_stamp(now);
 
         let path = unique_path(&dir, &format!("banto-{stamp}"), "sqlite3");
         let file_name = path
@@ -335,7 +354,7 @@ impl BackupService {
         Ok(BackupInfo {
             file_name,
             size_bytes: metadata.len(),
-            created_at: now,
+            created_at: now.to_string(),
         })
     }
 
@@ -734,24 +753,28 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn create_twice_in_the_same_second_appends_a_numeric_suffix() {
-        let (dir, svc) = service().await;
-        // Force a same-timestamp collision deterministically rather than
-        // relying on two real `create()` calls landing in the same second
-        // (flaky) - pre-create the exact file name the second `create()`
-        // would otherwise pick.
-        let now: String = sqlx::query_scalar("SELECT datetime('now')")
-            .fetch_one(&svc.pool)
-            .await
-            .unwrap();
-        let stamp = compact_stamp(&now);
-        let backups_dir = dir.path().join("backups");
-        tokio::fs::create_dir_all(&backups_dir).await.unwrap();
-        tokio::fs::write(backups_dir.join(format!("banto-{stamp}.sqlite3")), b"stub")
-            .await
-            .unwrap();
+        // #241: 固定スタンプで seam (`create_with_now`) を2回呼び、秒境界レース
+        // を排除して決定的にした。以前はテスト自身が `SELECT datetime('now')`
+        // を1回読んでファイルを事前配置し、その後 `create()` を呼んでいたが、
+        // `create()` が内部でもう一度 `datetime('now')` を読むため、2回の読み
+        // 取りの間に秒境界をまたぐと衝突せずサフィックスが付かず間欠失敗して
+        // いた。ここでは `datetime('now')` を一切読まず、同じ固定スタンプを
+        // 両方の呼び出しに渡すので、衝突は常に起きる。
+        let (_dir, svc) = service().await;
+        let now = "2026-09-04 12:00:00";
+        let stamp = compact_stamp(now);
 
-        let created = svc.create().await.expect("create should succeed");
-        assert_eq!(created.file_name, format!("banto-{stamp}-1.sqlite3"));
+        let first = svc
+            .create_with_now(now)
+            .await
+            .expect("first create should succeed");
+        assert_eq!(first.file_name, format!("banto-{stamp}.sqlite3"));
+
+        let second = svc
+            .create_with_now(now)
+            .await
+            .expect("second create should succeed");
+        assert_eq!(second.file_name, format!("banto-{stamp}-1.sqlite3"));
 
         let listed = svc.list().await.unwrap();
         assert_eq!(listed.len(), 2);
