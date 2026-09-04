@@ -36,9 +36,9 @@ describe('addressHelpFor: slmp', () => {
 		expect(addressHelpFor('slmp', 'string').occupancyHint).toContain('文字列長');
 	});
 
-	it('bit 指定（.N）の書式ヒントを含む', () => {
+	it('bit 指定（.N）の書式ヒントを含む（16進 0〜F）', () => {
 		expect(addressHelpFor('slmp', 'f32').bitHint).toContain('.');
-		expect(addressHelpFor('slmp', 'f32').bitHint).toContain('0〜15');
+		expect(addressHelpFor('slmp', 'f32').bitHint).toContain('0〜F');
 	});
 
 	it('対応デバイスのヒントに主要なビット/ワードデバイスを含む', () => {

@@ -303,22 +303,30 @@ pub const MAX_BIT_POSITION: u8 = 15;
 ///   [`SlmpDevice::radix`] - so `"X1A"` is `X` number 26 while `"M1A"` is
 ///   rejected outright rather than quietly read as `M1`
 /// - a number no greater than [`MAX_DEVICE_NUMBER`]
-/// - optionally, a bit-in-word suffix: `.` followed by 1-2 **decimal**
-///   digits naming a bit position `0..=15` (T8, docs/tag-server-design.md
-///   §6.1) - `"D100.5"` is word device `D100`, bit 5
+/// - optionally, a bit-in-word suffix: `.` followed by exactly one
+///   **hexadecimal** digit (`0-9`, `A-F`/`a-f`) naming a bit position
+///   `0x0..=0xF` (T8, docs/tag-server-design.md §6.1) - `"D100.5"` is word
+///   device `D100`, bit 5, and `"D100.F"` is bit 15
 ///
-/// ## Why the bit suffix is decimal-only, even at a hex-numbered device
+/// ## Why the bit suffix is hexadecimal
 ///
 /// [`SlmpDevice::radix`] governs how the *device number* is written (`X1A` is
-/// hex), but the bit-in-word suffix is a separate axis: MELSEC engineering
-/// tools always write the bit-within-word position in decimal, and `docs/
-/// tag-server-design.md` §6.1 records the reasoning for rejecting a hex
-/// spelling here even though it would be unambiguous: `"D100.A"` reads as
-/// "device D, number 100, hex digit A" to nobody's actual MELSEC tooling, and
-/// allowing it would invite exactly that misreading next to Modbus's
-/// register+bit notation (`"40001.3"`), which is decimal for the same
-/// human-convention reason. So the suffix is validated with
-/// [`char::is_ascii_digit`], never against `device.radix()`.
+/// hex), and the bit-in-word suffix follows the same convention MELSEC
+/// engineering tools (GX Works2/3 and friends) actually use for it: the
+/// bit-within-word position is always written as a single hex digit, `.0`
+/// through `.F`, where `.F` is bit 15. An earlier version of this doc comment
+/// claimed the opposite - that MELSEC tools write this suffix in decimal -
+/// and used that claim to justify rejecting `"D100.A"`. That claim was wrong;
+/// 2026-09-04 owner decision (T20-④) corrected the parser from decimal back
+/// to the notation MELSEC tooling actually emits. A decimal two-digit spelling
+/// like `"D100.10"` or `"D100.15"` is now rejected (only single hex digits are
+/// accepted), and existing tags written in the old decimal `.10`-`.15` range
+/// need to be re-entered in hex (`.A`-`.F`).
+///
+/// This is unrelated to Modbus's own register+bit notation (`"40001.3"`,
+/// `crate::address`), which stays decimal per Modbus tooling convention - the
+/// two protocols simply use different bases for this suffix, see that
+/// module's parser for the corresponding note.
 ///
 /// ## Why only word devices accept the suffix
 ///
@@ -352,16 +360,23 @@ pub(crate) fn parse(raw: &str) -> Result<(SlmpDevice, u32, Option<u8>), PlcError
     // being silently reinterpreted.
     let (base, bit) = match upper.split_once('.') {
         Some((base, bit_text)) => {
-            if bit_text.is_empty()
-                || bit_text.len() > 2
-                || !bit_text.chars().all(|c| c.is_ascii_digit())
-            {
+            // Exactly one hex digit - `.A` not `.0A`, and never decimal
+            // `.10`/`.15` (see this function's doc comment for why the
+            // suffix is hex, not decimal). `upper` already uppercased any
+            // lowercase `a`-`f`, but `is_ascii_hexdigit` accepts both cases
+            // regardless.
+            let mut chars = bit_text.chars();
+            let (Some(bit_char), None) = (chars.next(), chars.next()) else {
+                return Err(invalid());
+            };
+            if !bit_char.is_ascii_hexdigit() {
                 return Err(invalid());
             }
-            // Safe: 1-2 ASCII digits parse as a `u8` with room to spare
-            // (max 99), so this can only fail to construct a value that the
-            // MAX_BIT_POSITION check immediately below rejects anyway.
-            let bit: u8 = bit_text.parse().map_err(|_| invalid())?;
+            // Safe: a single hex digit parses as a `u8` in `0..=15` outright,
+            // so the MAX_BIT_POSITION check below is redundant here but kept
+            // for symmetry with the wire ceiling checks elsewhere in this
+            // function.
+            let bit = bit_char.to_digit(16).ok_or_else(invalid)? as u8;
             if bit > MAX_BIT_POSITION {
                 return Err(invalid());
             }
@@ -407,14 +422,17 @@ pub(crate) fn parse(raw: &str) -> Result<(SlmpDevice, u32, Option<u8>), PlcError
 /// Render `(device, number, bit)` back into the notation [`parse`] accepts.
 /// Used by error messages (and by [`crate::address::Address`]'s
 /// [`Display`](std::fmt::Display)) so a rejected tag is reported in the same
-/// spelling the operator configured, not as a debug dump.
+/// spelling the operator configured, not as a debug dump. The bit position is
+/// rendered as a single uppercase hex digit (`.0`-`.F`), matching [`parse`]'s
+/// hex suffix and keeping the parse/format round trip stable regardless of
+/// whether the original text was upper- or lowercase.
 pub(crate) fn format(device: SlmpDevice, number: u32, bit: Option<u8>) -> String {
     let base = match device.radix() {
         16 => format!("{device}{number:X}"),
         _ => format!("{device}{number}"),
     };
     match bit {
-        Some(b) => format!("{base}.{b}"),
+        Some(b) => format!("{base}.{b:X}"),
         None => base,
     }
 }
@@ -606,30 +624,46 @@ mod tests {
     }
 
     // --- T8, docs/tag-server-design.md §6.1: bit-in-word notation ----------
+    // T20-④ (2026-09-04 owner decision): the bit suffix is hexadecimal
+    // (`.0`-`.F`), correcting an earlier decimal-only implementation that
+    // was based on a factual mistake about MELSEC tooling conventions.
 
-    /// The load-bearing new case: a word device with a decimal bit suffix
-    /// parses to `(device, number, Some(bit))`.
+    /// The load-bearing new case: a word device with a hex bit suffix parses
+    /// to `(device, number, Some(bit))`. `ZR5.F` is bit 15, the top of the
+    /// range - the pre-hex version of this test used `ZR5.15`, which is now
+    /// out of range (see `rejects_decimal_bit_suffixes_past_a_single_digit`).
     #[test]
     fn parses_bit_in_word_notation_at_a_word_device() {
         assert_eq!(parse("D100.5").unwrap(), (SlmpDevice::D, 100, Some(5)));
         assert_eq!(parse("W10.0").unwrap(), (SlmpDevice::W, 0x10, Some(0)));
-        assert_eq!(parse("ZR5.15").unwrap(), (SlmpDevice::ZR, 5, Some(15)));
+        assert_eq!(parse("ZR5.F").unwrap(), (SlmpDevice::ZR, 5, Some(15)));
     }
 
-    /// §6.1's decision, stated as a test: the bit position is always decimal,
-    /// even at a hex-numbered device like `W`/`X`/`Y` - `.A` is never a valid
-    /// bit position, only `.10`.
+    /// T20-④: the bit suffix is hex even at a decimal-numbered device like
+    /// `D`/`ZR` - `.A`-`.F` are valid bit positions (10-15) everywhere a
+    /// suffix is accepted, independent of `SlmpDevice::radix()`.
     #[test]
-    fn bit_suffix_is_decimal_only_even_at_a_hex_numbered_device() {
-        assert!(matches!(parse("W10.A"), Err(PlcError::InvalidAddress(_))));
-        assert!(matches!(parse("X0.F"), Err(PlcError::InvalidAddress(_))));
+    fn bit_suffix_is_hexadecimal_at_both_decimal_and_hex_numbered_devices() {
+        assert_eq!(parse("D100.A").unwrap().2, Some(10));
+        assert_eq!(parse("D0.F").unwrap().2, Some(15));
+        // W is a word device whose *number* is written in hex (unlike D) -
+        // the bit suffix is hex here too, same as at D.
+        assert_eq!(parse("W10.A").unwrap().2, Some(10));
+        assert_eq!(parse("W0.F").unwrap().2, Some(15));
+    }
+
+    /// Hex digits are case-insensitive, same as device numbers.
+    #[test]
+    fn bit_suffix_accepts_lowercase_hex_digits() {
+        assert_eq!(parse("D100.a").unwrap().2, Some(10));
+        assert_eq!(parse("D100.f").unwrap().2, Some(15));
     }
 
     /// §6.1: bit devices already address one bit, so a `.N` suffix on one is
     /// a parse error rather than a redundant no-op.
     #[test]
     fn rejects_a_bit_suffix_on_a_bit_device() {
-        for text in ["M50.0", "X1A.3", "Y0.15", "TS0.0"] {
+        for text in ["M50.0", "X1A.3", "Y0.F", "TS0.0"] {
             assert!(
                 matches!(parse(text), Err(PlcError::InvalidAddress(_))),
                 "{text} should be rejected: bit devices are already bit-granular"
@@ -637,13 +671,37 @@ mod tests {
         }
     }
 
-    /// Bit position `0..=15` is the whole legal range (a MELSEC word is 16
-    /// bits); `16` and above must be rejected, not wrapped or truncated.
+    /// Bit position `0x0..=0xF` is the whole legal range (a MELSEC word is 16
+    /// bits); `.F` (15) is the top of it.
     #[test]
-    fn rejects_a_bit_position_past_fifteen() {
-        assert_eq!(parse("D0.15").unwrap().2, Some(15));
-        assert!(matches!(parse("D0.16"), Err(PlcError::InvalidAddress(_))));
-        assert!(matches!(parse("D0.99"), Err(PlcError::InvalidAddress(_))));
+    fn accepts_the_top_of_the_hex_bit_range() {
+        assert_eq!(parse("D0.F").unwrap().2, Some(15));
+        assert_eq!(parse("D0.f").unwrap().2, Some(15));
+    }
+
+    /// T20-④: the old decimal two-digit spellings (`.10`-`.15`, meant as bit
+    /// positions 10-15) are no longer accepted at all - a bit suffix is now
+    /// always exactly one hex digit, so any two-character suffix is rejected
+    /// outright rather than reinterpreted.
+    #[test]
+    fn rejects_decimal_bit_suffixes_past_a_single_digit() {
+        for text in ["D100.10", "D100.11", "D100.15", "D100.99"] {
+            assert!(
+                matches!(parse(text), Err(PlcError::InvalidAddress(_))),
+                "{text} should be rejected: bit suffix is a single hex digit, not decimal"
+            );
+        }
+    }
+
+    /// A hex character past `F` (`G`-`Z`) is not a valid bit digit at all.
+    #[test]
+    fn rejects_out_of_range_hex_bit_characters() {
+        for text in ["D100.G", "D100.Z", "D100.g"] {
+            assert!(
+                matches!(parse(text), Err(PlcError::InvalidAddress(_))),
+                "{text} should be rejected: not a hex digit"
+            );
+        }
     }
 
     #[test]
@@ -662,10 +720,21 @@ mod tests {
             (SlmpDevice::D, 100u32, 5u8),
             (SlmpDevice::W, 0x10, 0),
             (SlmpDevice::ZR, 5, 15),
+            (SlmpDevice::D, 0, 10),
         ] {
             let text = format(device, number, Some(bit));
             assert_eq!(parse(&text).unwrap(), (device, number, Some(bit)));
         }
+    }
+
+    /// `format` always renders the bit digit uppercase, so a lowercase input
+    /// still round-trips to the same (uppercase) canonical spelling.
+    #[test]
+    fn format_renders_the_bit_digit_uppercase() {
+        assert_eq!(format(SlmpDevice::D, 100, Some(15)), "D100.F");
+        assert_eq!(format(SlmpDevice::D, 100, Some(10)), "D100.A");
+        let (device, number, bit) = parse("d100.f").unwrap();
+        assert_eq!(format(device, number, bit), "D100.F");
     }
 
     /// A number wide enough to overflow `u32` must be rejected the same way

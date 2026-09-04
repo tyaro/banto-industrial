@@ -883,7 +883,7 @@ async fn all_sixteen_bit_positions_set_and_clear_correctly() {
         let mut client = SlmpWriteClient::new(fast_config(&sim));
         client.connect().await.expect("connect");
         let results = client
-            .write_batch_mixed(&[bwreq(&format!("D400.{bit}"), true)])
+            .write_batch_mixed(&[bwreq(&format!("D400.{bit:X}"), true)])
             .await
             .expect("write ok");
         assert_eq!(results, vec![WriteResult::Ok], "set bit {bit}");
@@ -899,7 +899,7 @@ async fn all_sixteen_bit_positions_set_and_clear_correctly() {
         let mut client = SlmpWriteClient::new(fast_config(&sim));
         client.connect().await.expect("connect");
         let results = client
-            .write_batch_mixed(&[bwreq(&format!("D400.{bit}"), false)])
+            .write_batch_mixed(&[bwreq(&format!("D400.{bit:X}"), false)])
             .await
             .expect("write ok");
         assert_eq!(results, vec![WriteResult::Ok], "clear bit {bit}");
@@ -925,7 +925,7 @@ async fn mask_composed_bits_of_one_word_cost_exactly_one_wire_write() {
         .write_batch_mixed(&[
             bwreq("D100.0", true),  // clear -> set
             bwreq("D100.5", false), // set -> clear
-            bwreq("D100.15", true), // clear -> set
+            bwreq("D100.F", true),  // clear -> set (hex bit 15, T20-④)
         ])
         .await
         .expect("write_batch_mixed ok");

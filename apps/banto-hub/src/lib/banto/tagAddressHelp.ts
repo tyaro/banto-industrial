@@ -63,7 +63,7 @@ const SLMP_EXAMPLES: AddressExample[] = [
 	{ address: 'D100', description: 'データレジスタ（ワード）' },
 	{ address: 'M50', description: '内部リレー（ビット）' },
 	{ address: 'X1A', description: '入力リレー（ビット・16進）' },
-	{ address: 'D100.5', description: 'D100 の 5 ビット目（ビット指定）' }
+	{ address: 'D100.5', description: 'D100 の 5 ビット目（ビット指定・16進で0〜F）' }
 ];
 
 const MODBUS_EXAMPLES: AddressExample[] = [
@@ -113,8 +113,9 @@ function modbusOccupancyHint(kind: OccupancyKind): string {
 }
 
 const SLMP_BIT_HINT =
-	'ワードデバイスの特定ビットだけを読み書きするときは「D100.5」のように「.」+ビット位置（0〜15、10進）を付けます' +
-	'（data_type = bit のタグでのみ使えます）。ビットデバイス自体には「.」指定はできません。';
+	'ワードデバイスの特定ビットだけを読み書きするときは「D100.F」のように「.」+ビット位置（0〜F、16進。' +
+	'D100.F は bit 15）を付けます（data_type = bit のタグでのみ使えます）。ビットデバイス自体には' +
+	'「.」指定はできません。';
 
 const MODBUS_BIT_HINT =
 	'保持レジスタ／入力レジスタの特定ビットだけを読み書きするときは「40001.3」のように「.」+ビット位置（0〜15）を付けます' +

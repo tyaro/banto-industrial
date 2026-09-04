@@ -178,10 +178,13 @@ describe('incrementAddress: 16進デバイスの桁上がり（受け入れケ�
 });
 
 describe('incrementAddress: ワード内 bit 連番（受け入れケース）', () => {
-	it('D100.14 → D100.15 → D101.0（bit15 の次はワード+1・bit0）', () => {
-		expect(incrementAddress('D100.14', 1, 0)).toBe('D100.14');
-		expect(incrementAddress('D100.14', 1, 1)).toBe('D100.15');
-		expect(incrementAddress('D100.14', 1, 2)).toBe('D101.0');
+	// T20-④（2026-09-04）: bit サフィックスの表記が16進になったため、
+	// bit 14/15 は D100.E / D100.F と書く（旧テストの D100.14/D100.15 は
+	// 10進表記で、今は2桁として拒否される）。
+	it('D100.E → D100.F → D101.0（bit15 の次はワード+1・bit0）', () => {
+		expect(incrementAddress('D100.E', 1, 0)).toBe('D100.E');
+		expect(incrementAddress('D100.E', 1, 1)).toBe('D100.F');
+		expect(incrementAddress('D100.E', 1, 2)).toBe('D101.0');
 	});
 });
 
@@ -208,7 +211,7 @@ describe('incrementAddress: 範囲外・不正な形式はエラー（null）', 
 
 	it('bit 軸の上限（number が MAX_DEVICE_NUMBER を超える）を超えるとエラー', () => {
 		const nearMax = 'D16777215.0';
-		expect(incrementAddress(nearMax, 1, 15)).toBe('D16777215.15');
+		expect(incrementAddress(nearMax, 1, 15)).toBe('D16777215.F');
 		expect(incrementAddress(nearMax, 1, 16)).toBeNull();
 	});
 
@@ -234,21 +237,21 @@ describe('generateContinuousTags: 16進デバイス・bit 連番がプレビュ�
 		}
 	});
 
-	it('D100.14 を開始アドレスに、bit 型3点で D100.14/D100.15/D101.0 が生成される', () => {
+	it('D100.E を開始アドレスに、bit 型3点で D100.E/D100.F/D101.0 が生成される', () => {
 		const params = buildContinuousParams(
-			baseForm({ startAddress: 'D100.14', dataType: 'bit', count: 3 })
+			baseForm({ startAddress: 'D100.E', dataType: 'bit', count: 3 })
 		);
 		expect(params).not.toBeNull();
 		const result = generateContinuousTags(params!);
 		expect(result.ok).toBe(true);
 		if (result.ok) {
-			expect(result.rows.map((r) => r.address)).toEqual(['D100.14', 'D100.15', 'D101.0']);
+			expect(result.rows.map((r) => r.address)).toEqual(['D100.E', 'D100.F', 'D101.0']);
 		}
 	});
 
 	it('bit サフィックス付きアドレスは data_type が bit 以外だとエラーになる', () => {
 		const params = buildContinuousParams(
-			baseForm({ startAddress: 'D100.14', dataType: 'i16', count: 3 })
+			baseForm({ startAddress: 'D100.E', dataType: 'i16', count: 3 })
 		);
 		expect(params).not.toBeNull();
 		const result = generateContinuousTags(params!);
