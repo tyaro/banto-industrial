@@ -1009,16 +1009,19 @@ async fn gate_writes_disabled_is_503_and_audited() {
     sim.stop();
 }
 
-/// T20-3a 監査対応(2026-09-05)の回帰ガード: `prepare_write` を導入した
-/// 初版は gate 7(値変換・型対称性)を gate 5(write_control off)より前に
-/// 動かしてしまい、「write_control off ＋ 型不一致の値」が本来の
-/// 503(writes_disabled)ではなく 422(unsupported_value_type)になる回帰を
-/// 生んでいた。この場合の意味論は「書き込みが無効なら値の妥当性を見る前に
-/// 拒否する」(gate 7 は gate 5/6 の**後**)であるべきで、`execute_write`は
-/// 現在この元の順序を厳密に守っている - この回帰が再発したら 422 で
-/// 失敗する形で固定する(数値タグに bool を送るケースを使う - 単体では
-/// `gate_bool_value_to_a_numeric_tag_is_422` が 422 を返すことを別途
-/// 固定している、その対になるテスト)。
+/// T20-3a 監査対応(2026-09-05)の回帰ガード: バッチの事前ゲート
+/// all-or-nothing を実現するため、gate 1〜4・値型 present を
+/// `resolve_write_target` へ、gate 7(値変換・型対称性)を `convert_value`
+/// へそれぞれ抽出したリファクタの初版は、`execute_write`(単票)でも
+/// gate 7 を gate 5(write_control off)より前に動かしてしまい、
+/// 「write_control off ＋ 型不一致の値」が本来の 503(writes_disabled)では
+/// なく 422(unsupported_value_type)になる回帰を生んでいた。この場合の
+/// 意味論は「書き込みが無効なら値の妥当性を見る前に拒否する」(gate 7 は
+/// gate 5/6 の**後**)であるべきで、`execute_write`は現在この元の順序
+/// (resolve → gate 5 → gate 6 → convert_value → gate 8)を厳密に守って
+/// いる - この回帰が再発したら 422 で失敗する形で固定する(数値タグに
+/// bool を送るケースを使う - 単体では `gate_bool_value_to_a_numeric_tag_is_422`
+/// が 422 を返すことを別途固定している、その対になるテスト)。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gate_writes_disabled_wins_over_a_type_mismatched_value_and_stays_503() {
     let app = test_app("gate-writes-disabled-vs-type-mismatch").await;

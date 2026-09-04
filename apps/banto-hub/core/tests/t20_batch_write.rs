@@ -45,7 +45,7 @@ use banto_plc_write::slmp::simulator::Simulator;
 use banto_server::{AuthState, Identity};
 use banto_tags::{
     CollectionGroupInput, CollectionGroupService, PlcConnectionInput, PlcConnectionService,
-    TagInput, TagService,
+    TagInput, TagService, MEM_CONNECTION_NAME, VIRTUAL_PROTOCOL,
 };
 use banto_tstore::SystemClock;
 use serde_json::{json, Value};
@@ -125,6 +125,37 @@ fn tag_input(
         enabled,
         writable,
         tag_kind: "plc".to_string(),
+        expression: None,
+        retain: false,
+        expected_revision: None,
+    }
+}
+
+/// internal タグ用の `TagInput`(`tests/computed.rs`の同名ヘルパーと同じ
+/// 形 - address 不要・`tag_kind: "internal"`・`banto_tags::MEM_CONNECTION_NAME`
+/// 配下のグループにのみ作成できる)。PLC 接続・シミュレータが要らないので、
+/// レート制限の record タイミングを検証するテスト(DB 直操作で1エントリを
+/// 意図的に壊す)を単純化するために使う。
+fn internal_tag_input(name: &str, group_id: i64, data_type: &str) -> TagInput {
+    TagInput {
+        name: name.to_string(),
+        collection_group_id: group_id,
+        address: String::new(),
+        data_type: data_type.to_string(),
+        string_length: None,
+        raw_lo: None,
+        raw_hi: None,
+        eng_lo: None,
+        eng_hi: None,
+        unit: None,
+        decimals: 0,
+        threshold_h: None,
+        threshold_hh: None,
+        threshold_l: None,
+        threshold_ll: None,
+        enabled: true,
+        writable: true,
+        tag_kind: "internal".to_string(),
         expression: None,
         retain: false,
         expected_revision: None,
@@ -1000,4 +1031,203 @@ async fn missing_write_scope_on_one_entry_rejects_the_whole_batch() {
     assert!(rows_a.is_empty());
 
     sim.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 9. レート制限 record のタイミング(2026-09-05 レビュー対応)
+// ---------------------------------------------------------------------------
+
+/// mem 予約接続配下に internal タグを1本作り、rebuild まで済ませて
+/// `(tag_id, external_name)` を返す(PLC 接続・シミュレータ不要 - record
+/// タイミングの検証だけが目的なので internal タグで足りる)。
+async fn create_internal_tag(
+    app: &TestApp,
+    group_id: i64,
+    group_name: &str,
+    tag_name: &str,
+) -> (i64, String) {
+    let tag = TagService::new(app.pool.clone())
+        .create(internal_tag_input(tag_name, group_id, "u16"))
+        .await
+        .unwrap();
+    app.manager.rebuild().await.expect("rebuild");
+    (
+        tag.id,
+        format!("{MEM_CONNECTION_NAME}.{group_name}.{tag_name}"),
+    )
+}
+
+/// 2026-09-05 レビュー対応(修正1)の回帰ガード: commit フェーズに入る前に
+/// バッチの全エントリをまとめて `record` していた旧実装は、`tag_row` 読み
+/// 込み失敗などで実際には書き込みを試みなかったエントリの分まで
+/// レート制限バジェットを消費してしまう false rate limiting だった。この
+/// テストは、バッチ内の1エントリ(`a`)がコミット中に(`insert_pending` の
+/// **前**で)失敗しても、そのエントリの分は `record` されない(=グローバル
+/// カウンタが1件分しか進まない)ことを、他の手段では観測できない
+/// レート制限カウンタの状態を「次の書き込みが通るか」で外部から決定的に
+/// 確認する:
+///
+/// 1. グローバル上限(既定30)をあと2件で埋まる28件まで単票書き込みで消費
+///    しておく。
+/// 2. `a`(このバッチで書けるはずのタグ)の行を DB から直接 DELETE して、
+///    catalog キャッシュ(`tag_map`)には残るが実体は無い状態を作る -
+///    commit フェーズの `tag_row` 読み込み(`TagService::get`)がここで
+///    失敗し、`insert_pending`/`record` に到達しない。
+/// 3. `[a, b]` をバッチ書き込みする - `a` は Internal で失敗、`b` は正常に
+///    成功して record される。
+/// 4. もし record がバッチ全体で2回(a・b 両方分)消費されていたら
+///    グローバルカウンタは 28+2=30 に達し、次の単票書き込み(`d`)は
+///    即座に 429 になる。record が `b` の1回分だけ(正しい実装)なら
+///    28+1=29 のままなので `d` は成功し(29→30)、その次(`e`)で初めて
+///    429 になる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn record_only_happens_for_entries_that_actually_reach_insert_pending() {
+    let app = test_app("record-timing").await;
+    app.write_control.enable();
+
+    // T6-2: `mem`(internal タグ用の予約接続)は実バイナリが起動時に自動
+    // 用意する(`bin/banto-hub.rs::ensure_virtual_connection`) - このテスト
+    // ハーネスはそのバイナリを起動しないので、`tests/computed.rs`と同じ
+    // 手順で直接プロビジョニングする。
+    PlcConnectionService::new(app.pool.clone())
+        .create(PlcConnectionInput {
+            name: MEM_CONNECTION_NAME.to_string(),
+            protocol: VIRTUAL_PROTOCOL.to_string(),
+            host: String::new(),
+            port: 0,
+            unit_id: 1,
+            enabled: true,
+            simulation: false,
+            word_order: "low_high".to_string(),
+        })
+        .await
+        .expect("mem connection should be provisioned");
+
+    let mem_id = PlcConnectionService::new(app.pool.clone())
+        .list(banto_core::ListParams::default())
+        .await
+        .unwrap()
+        .rows
+        .into_iter()
+        .find(|c| c.name == MEM_CONNECTION_NAME)
+        .unwrap()
+        .id;
+    let group_name = "t20-rate";
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input(group_name, mem_id, 1_000))
+        .await
+        .unwrap();
+
+    let (_p1, name_p1) = create_internal_tag(&app, group.id, group_name, "p1").await;
+    let (_p2, name_p2) = create_internal_tag(&app, group.id, group_name, "p2").await;
+    let (_p3, name_p3) = create_internal_tag(&app, group.id, group_name, "p3").await;
+    let (tag_a, name_a) = create_internal_tag(&app, group.id, group_name, "a").await;
+    let (_tag_b, name_b) = create_internal_tag(&app, group.id, group_name, "b").await;
+    let (_tag_d, name_d) = create_internal_tag(&app, group.id, group_name, "d").await;
+    let (_tag_e, name_e) = create_internal_tag(&app, group.id, group_name, "e").await;
+
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &[
+            &format!("write:{name_p1}"),
+            &format!("write:{name_p2}"),
+            &format!("write:{name_p3}"),
+            &format!("write:{name_a}"),
+            &format!("write:{name_b}"),
+            &format!("write:{name_d}"),
+            &format!("write:{name_e}"),
+        ],
+    )
+    .await;
+
+    // 1. グローバル上限(既定30)を28まで単票で埋める(per_tag_max=10 を
+    // 個々のタグで超えないよう3タグに分散 - 10+10+8=28)。
+    for _ in 0..10 {
+        let (status, body) = v1_post(
+            &app.router,
+            &format!("/api/v1/values/{name_p1}"),
+            &key,
+            json!({ "v": 1 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+    }
+    for _ in 0..10 {
+        let (status, body) = v1_post(
+            &app.router,
+            &format!("/api/v1/values/{name_p2}"),
+            &key,
+            json!({ "v": 1 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+    }
+    for _ in 0..8 {
+        let (status, body) = v1_post(
+            &app.router,
+            &format!("/api/v1/values/{name_p3}"),
+            &key,
+            json!({ "v": 1 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+    }
+
+    // 2. `a` の行を DB から直接消す(catalog キャッシュには残ったまま) -
+    // commit フェーズの tag_row 読み込みがここで失敗する。
+    sqlx::query("DELETE FROM tags WHERE id = ?")
+        .bind(tag_a)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+
+    // 3. [a, b] をバッチ書き込みする。
+    let (status, body) = v1_post(
+        &app.router,
+        "/api/v1/values/batch",
+        &key,
+        json!({
+            "writes": [
+                { "tag": name_a, "v": 1 },
+                { "tag": name_b, "v": 1 },
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let writes = body["writes"].as_array().unwrap();
+    assert_eq!(writes[0]["tag"], name_a);
+    assert_eq!(writes[0]["ok"], false, "{body:?}");
+    assert_eq!(writes[0]["error"], "internal");
+    assert_eq!(writes[1]["tag"], name_b);
+    assert_eq!(writes[1]["ok"], true, "{body:?}");
+
+    // 4. record が `b` の1回分だけなら(28+1=29)、`d` はまだ成功する。
+    let (status, body) = v1_post(
+        &app.router,
+        &format!("/api/v1/values/{name_d}"),
+        &key,
+        json!({ "v": 1 }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "if `a`'s failed commit had also been recorded, the global budget would already be \
+         exhausted here (28 + 2) instead of 28 + 1 - this write proves only `b` was recorded: \
+         {body:?}"
+    );
+
+    // 29→30 まで来たので、次の `e` でちょうどグローバル上限に達する。
+    let (status, body) = v1_post(
+        &app.router,
+        &format!("/api/v1/values/{name_e}"),
+        &key,
+        json!({ "v": 1 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body:?}");
+    assert_eq!(body["error"], "rate_limited");
 }

@@ -713,23 +713,34 @@ pub struct BatchEntryOutcome {
 /// 3. **gate 5(write_control off)は全エントリで1回だけ判定**: off なら
 ///    全エントリを拒否する。各エントリに単票と同じ流儀で
 ///    `suppressed_disabled` 監査行を残す(1件も PLC へ書かない)。
-/// 4. **gate 6(レート制限)は全エントリを先に peek**: 1件でも
-///    would_exceed なら API キーを1回だけ trip し、**全エントリを拒否**
-///    する(would_exceed だった当該エントリにのみ `rate_limit_tripped`
-///    監査行を残す - 単票が「その1件がトリップの原因になった」ときだけ
-///    監査するのと同じ意味論をバッチへ一般化した)。全件 peek OK なら、
-///    物理書き込み前に全エントリを `record` する。項目0の重複禁止により
-///    バッチ内で同じ tag_id が複数回 peek/record されることは無いので、
-///    この peek は単票の逐次呼び出しと同じ精度を保つ。
-/// 5. **gate 8(commit)は同一接続=1ジョブ**: `tag_row` の読み込みは単票と
-///    同じ位置(gate 7 の後・commit 直前)でエントリ毎に行う。internal
-///    タグは単票と同じ `write_internal_tag` を1件ずつ、PLC タグは接続 id
-///    ごとにグルーピングし、グループ内の全エントリの `insert_pending`
-///    監査 → [`build_plc_write_request`] で組み立てた
+/// 4. **gate 6(レート制限)は全エントリを先に peek**(peek だけ、この時点
+///    では `record` しない): 1件でも would_exceed なら API キーを1回だけ
+///    trip し、**全エントリを拒否**する(would_exceed だった当該エントリ
+///    にのみ `rate_limit_tripped` 監査行を残す - 単票が「その1件が
+///    トリップの原因になった」ときだけ監査するのと同じ意味論をバッチへ
+///    一般化した)。項目0の重複禁止によりバッチ内で同じ tag_id が複数回
+///    peek されることは無いので、この peek は単票の逐次呼び出しと同じ
+///    精度を保つ。
+/// 5. **gate 8(commit)は同一接続=1ジョブ、`record` は per-entry**:
+///    `tag_row` の読み込みは単票と同じ位置(gate 7 の後・commit 直前)で
+///    エントリ毎に行う。**`record` も単票と同じタイミング** - 各エントリの
+///    `insert_pending` 監査が成功した**直後**(物理書き込みを試みる**前**)
+///    に、そのエントリの分だけ `record` する(2026-09-05 監査対応: 以前は
+///    commit フェーズに入る前に全エントリをまとめて record していたが、
+///    `insert_pending` 失敗や(PLC タグの場合)`tag_row` 読み込み失敗・
+///    [`build_plc_write_request`] の拒否で実際には書き込みを試みない
+///    エントリまで消費してしまう false rate limiting だった -
+///    `crate::write_rate` の「record は実際に試みた書き込みのみ消費する」
+///    契約に反していたため是正した)。internal タグは単票と同じ
+///    `write_internal_tag` を1件ずつ、PLC タグは接続 id ごとにグルーピング
+///    し、グループ内で `insert_pending` 成功のたびに record したエントリ
+///    だけを集めて [`build_plc_write_request`] で組み立てた
 ///    `Vec<BatchWriteRequest>` を `BrokerHandle::write` へ**1回**渡す →
 ///    返ってきた `Vec<WriteResult>`(入力順)を各エントリへ割り当てて
 ///    `set_result` で確定する。broker セッションが無い接続は、そのグループ
-///    の全エントリを単票と同じ fail-closed(`WriteFailed`)にする。
+///    の全エントリを単票と同じ fail-closed(`WriteFailed`)にする(この
+///    エントリ達はすでに record 済み - 単票が broker 呼び出し失敗時も
+///    record 済みのまま戻すのと同じ)。
 /// 6. **per-entry 結果を入力順で返す**。
 pub async fn execute_write_batch(
     deps: &WriteDeps<'_>,
@@ -893,14 +904,14 @@ pub async fn execute_write_batch(
             })
             .collect();
     }
-    // 全件 peek OK - 物理書き込み前に全エントリを record する(§6 実装指示
-    // 「ゲート通過後・物理書き込み前」、`crate::write_rate`参照)。
-    {
-        let mut limiter = deps.rate_limiter.lock().await;
-        for p in &prepared {
-            limiter.record(p.tag_id, now);
-        }
-    }
+    // 全件 peek OK。**record はここではまだ行わない**(2026-09-05 監査
+    // 対応) - 以前はここで全エントリをまとめて record していたが、commit
+    // フェーズで実際には書き込みを試みずに終わるエントリ(`tag_row` 読み
+    // 込み失敗・`insert_pending` 失敗・[`build_plc_write_request`] の拒否)
+    // まで消費してしまう false rate limiting だった。record は単票と同じ
+    // タイミング(各エントリの `insert_pending` 成功直後・物理書き込みの
+    // 直前)で、commit ループ内から per-entry に呼ぶ(このモジュール doc
+    // comment「契約」の5番参照)。
 
     // 5. gate 8 commit: internal は1件ずつ、PLC は接続 id ごとにグルーピング。
     let mut outcomes: Vec<Option<BatchEntryOutcome>> = vec![None; prepared.len()];
@@ -951,6 +962,12 @@ pub async fn execute_write_batch(
                 continue;
             }
         };
+        // record は単票と同じタイミング: insert_pending 成功直後・
+        // 物理書き込みの直前(このモジュール doc comment「契約」の5番参照)。
+        {
+            let mut limiter = deps.rate_limiter.lock().await;
+            limiter.record(p.tag_id, now);
+        }
         let outcome = write_internal_tag(
             deps,
             &p.entry,
@@ -1008,7 +1025,18 @@ pub async fn execute_write_batch(
             )
             .with_value_requested(p.value);
             match deps.write_audit.insert_pending(&pending_row).await {
-                Ok(audit_id) => committed.push((i, tag_row, audit_id)),
+                Ok(audit_id) => {
+                    // record は単票と同じタイミング: insert_pending 成功
+                    // 直後・物理書き込みの直前(このモジュール doc comment
+                    // 「契約」の5番参照) - グループ全体の handle.write では
+                    // なく、このエントリの insert_pending が成功した時点で
+                    // 個別に record する。
+                    {
+                        let mut limiter = deps.rate_limiter.lock().await;
+                        limiter.record(p.tag_id, now);
+                    }
+                    committed.push((i, tag_row, audit_id));
+                }
                 Err(err) => {
                     eprintln!(
                         "banto-hub: 書き込み監査(log-before-write、バッチ PLC)の記録に失敗しました: {err}"
@@ -1204,7 +1232,7 @@ async fn write_plc_tag(
 /// TCP の両方 - `banto_collect`の `build_request`と同じ`conn.protocol`分岐)
 /// → `BatchWriteRequest`(`Numeric`/`BitInWord` の作り分け)。**副作用は
 /// 無い**(broker へは渡さない - 呼び出し元が `handle.write` を呼ぶ)。
-/// `entry.data_type == STRING_DATA_TYPE` は [`prepare_write`] の gate 7 で
+/// `entry.data_type == STRING_DATA_TYPE` は [`convert_value`] の gate 7 で
 /// 既に拒否済みなのでここには来ない - `BatchWriteRequest::String` はこの
 /// 関数では組み立てない。
 fn build_plc_write_request(
@@ -1241,9 +1269,9 @@ fn build_plc_write_request(
 
     // #131 (2026-09-01): dispatch on `conn.protocol` exactly like
     // `crates/banto-collect/src/config.rs`'s `build_request` does for reads -
-    // gate 4 (`prepare_write`, above) no longer restricts this function to
-    // SLMP connections alone, so the address notation must be parsed with
-    // the matching protocol's parser.
+    // gate 4 (`resolve_write_target`, above) no longer restricts this
+    // function to SLMP connections alone, so the address notation must be
+    // parsed with the matching protocol's parser.
     let address = match conn.protocol.as_str() {
         "modbus-tcp" => Address::parse(&entry.address),
         // "slmp" and (defensively) anything else the protocol gate above
