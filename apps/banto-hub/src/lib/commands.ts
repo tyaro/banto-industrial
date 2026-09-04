@@ -107,7 +107,7 @@ function configCommands(): PaletteCommand[] {
 					toastStore.push('success', '構成パッケージをダウンロードしました');
 				} catch (err) {
 					const message = err instanceof Error ? err.message : String(err);
-					toastStore.push('error', `構成パッケージの取得に失敗しました: ${message}`);
+					toastStore.push('error', `構成パッケージのダウンロードに失敗しました: ${message}`);
 				}
 			}
 		},

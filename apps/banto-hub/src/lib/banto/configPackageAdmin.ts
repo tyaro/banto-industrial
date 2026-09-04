@@ -110,7 +110,7 @@ export async function loadConfigPackage(): Promise<ConfigPackage> {
 /**
  * T19 S4（UX-42）: 元は `settings/+page.svelte` ローカル関数だったものを、
  * コマンドパレット（`commands.ts`）からも export できるようここへ移設。
- * 純関数なので vitest でテストできる（`configPackage.test.ts` 参照）。
+ * 純関数なので vitest でテストできる（`configPackageAdmin.test.ts` 参照）。
  */
 export function configPackageExportFilename(): string {
 	const now = new Date();

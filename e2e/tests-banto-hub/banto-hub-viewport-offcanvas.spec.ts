@@ -105,10 +105,11 @@ test.describe.serial('banto-hub offcanvas sidebar (narrow viewport)', () => {
 		// 緑だったのは transition 中の一瞬だけクリックできていたタイミング
 		// 依存の偶然で、マシンが遅い/CPU 負荷が高いと aside が定位置に達して
 		// 確実に落ちる（2026-09-04 実測回帰）。aside の右側、確実にバック
-		// ドロップだけが見えている座標を明示してクリックする。
+		// ドロップだけが見えている座標を明示してクリックする（ビューポート幅
+		// に依存するため x は NARROW_VIEWPORT から導出）。
 		await page
 			.getByRole('button', { name: '背景をクリックしてメニューを閉じる' })
-			.click({ position: { x: 390, y: 400 } });
+			.click({ position: { x: NARROW_VIEWPORT.width - 10, y: NARROW_VIEWPORT.height / 2 } });
 
 		await expect(page.getByRole('button', { name: 'メニューを開く' })).toBeVisible();
 		await expectOffscreenLeft(page, 'タグ登録');
