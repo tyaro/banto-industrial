@@ -30,21 +30,23 @@
  *   だけが積極的な衝突回避を行う — 数字を進めるだけで簡単に回避できる上、
  *   構造体を大量複製する運用でコピーごとに手直しさせないため）。
  *
- * ## オフセットの扱い
+ * ## オフセットの扱い（2026-09-05 オーナー決定「正の整数のみ」）
  *
- * `offset` は整数ワード数を想定する。**0や負の値を本ファイルは特別扱いしない**:
- * - `offset === 0` は「ずらさない」＝新アドレスが元アドレスと同一になり、
- *   元タグ自身（`existingTags` に含まれる）と確実にアドレス範囲が重なるため、
- *   {@link buildOffsetCopyRows} の衝突検出が自然にエラーとして検出する
- *   （専用の `offset === 0` チェックは書かない）。
- * - 負のオフセットは、ワードデバイス軸では `incrementAddress` がデバイス
- *   番号 < 0 を `null`（範囲外）として返すため、下限を割る移動は自然に
- *   アドレス算出エラーになる。
- * - 非整数（例 `1.5`）は算術として無意味なので、{@link buildOffsetCopyRows}
- *   が全 source を一括でエラーにする。
- * - UI 側では正の整数のみを入力させる想定（`+page.svelte` の
- *   オフセットコピーパネル）だが、この純関数自体は上記のとおり
- *   0/負/非整数のいずれを渡されても例外を投げず判別可能な結果を返す。
+ * `offset` は **1以上の整数ワード数のみ**を仕様とする。0・負・非整数は
+ * いずれも不正な入力として {@link buildOffsetCopyRows} が**先頭で**弾き、
+ * source を1件も処理せず（アドレス算出も衝突検出も行わない）、全 source を
+ * 対象にした一律のエラー（「オフセットは1以上の整数で指定してください。」
+ * 相当のメッセージ）を返す（`rows` は空）:
+ * - `offset === 0` は「ずらさない」＝新アドレスが元アドレスと同一になり
+ *   衝突検出でも結果的に検出できるが、それに頼らず明示的に弾く。
+ * - 負のオフセットは、小さな負値（例 `-1`）だとデバイス番号が下限
+ *   （0未満）を割らずに `incrementAddress` が成功してしまう場合があり、
+ *   衝突検出にも引っかからない可能性があるため、アドレス算出に委ねず
+ *   明示的に弾く。
+ * - 非整数（例 `1.5`）は算術として無意味なので、これも同じ入口で弾く。
+ * - UI 側（`+page.svelte` のオフセットコピーパネル）も `<input min="1">`
+ *   に加え、JS 側の disabled 条件・エラー表示でこの仕様を弾く（本体は
+ *   この JS 側のバリデーション - `min` 属性は実行時の入力を防がない）。
  *
  * **ビット付きアドレス（例 `M100.5`）の注意**: `incrementAddress` は
  * bit サフィックス付きアドレスを「1ワード=16bit の1本の数直線」として
@@ -220,13 +222,13 @@ export function buildOffsetCopyRows(
 	const rows: OffsetCopyRow[] = [];
 	const errors: OffsetCopyError[] = [];
 
-	if (!Number.isInteger(offset)) {
+	if (!Number.isInteger(offset) || offset < 1) {
 		for (const source of sources) {
 			errors.push({
 				sourceId: source.id,
 				sourceName: source.name,
 				sourceAddress: source.address,
-				message: 'オフセットは整数のワード数で指定してください。'
+				message: 'オフセットは1以上の整数で指定してください。'
 			});
 		}
 		return { rows, errors };

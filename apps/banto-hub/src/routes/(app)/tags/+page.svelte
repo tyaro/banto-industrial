@@ -3018,6 +3018,21 @@
 		return buildOffsetCopyRows(selectedTags, offset, tags);
 	});
 
+	/**
+	 * コードレビュー指摘対応（2026-09-05）: 仕様は「正の整数のみ」
+	 * （`<input min="1">` は表示上のヒントに過ぎず、JS 実行時の入力を
+	 * 弾かない - `offsetCopy.ts::buildOffsetCopyRows` が同じ条件で入口
+	 * 検証を行い `bulkOffsetCopyResult.errors` を返すが、UI 側でも同じ
+	 * 条件を持たせて検証/実行ボタンを無効化し、`title` で理由を示す
+	 * - 「無反応のまま」にしない）。
+	 */
+	const bulkOffsetIsPositiveInteger = $derived.by((): boolean => {
+		const offset = parseOptionalNumber(bulkOffsetWords);
+		return offset !== undefined && Number.isInteger(offset) && offset >= 1;
+	});
+
+	const BULK_OFFSET_INVALID_REASON = 'オフセットは1以上の整数で指定してください';
+
 	/** `createTagsBatch` に渡せる形。衝突が1件でもあれば `null`（実装指示
 	 * 「衝突が1件でもあれば実行を無効化」）。 */
 	const bulkOffsetCopyTagInputs = $derived(
@@ -4413,7 +4428,9 @@
 									onclick={handleValidateBulkOffsetCopy}
 									disabled={bulkOffsetCopyApplying ||
 										bulkOffsetCopyValidating ||
+										!bulkOffsetIsPositiveInteger ||
 										!bulkOffsetCopyTagInputs}
+									title={bulkOffsetIsPositiveInteger ? undefined : BULK_OFFSET_INVALID_REASON}
 								>
 									検証
 								</button>
@@ -4421,7 +4438,10 @@
 									type="button"
 									data-testid="tag-bulk-offset-copy-apply"
 									onclick={handleApplyBulkOffsetCopy}
-									disabled={bulkOffsetCopyApplying || !bulkOffsetCopyValidatedFresh}
+									disabled={bulkOffsetCopyApplying ||
+										!bulkOffsetIsPositiveInteger ||
+										!bulkOffsetCopyValidatedFresh}
+									title={bulkOffsetIsPositiveInteger ? undefined : BULK_OFFSET_INVALID_REASON}
 								>
 									この内容でコピー
 								</button>

@@ -174,18 +174,32 @@ describe('buildOffsetCopyRows', () => {
 		expect(result.errors[0].message).toMatch(/算出できません/);
 	});
 
-	it('負のオフセットで下限を割るとアドレスエラーになる', () => {
+	it('大きな負のオフセットは1件も行を作らず全 source をエラーにする（仕様: 1以上の整数のみ）', () => {
 		const source = makeTag({ id: 4, name: 'D10', address: 'D10', collectionGroupId: 10 });
 		const result = buildOffsetCopyRows([source], -100, [source]);
 		expect(result.rows).toEqual([]);
 		expect(result.errors).toHaveLength(1);
+		expect(result.errors[0].message).toContain('1以上の整数');
 	});
 
-	it('オフセット0は元アドレスと重なるため衝突エラーになる（行は残る）', () => {
+	it('下限を割らない小さな負のオフセット（-1）でも、アドレス算出前に弾かれ行を作らない', () => {
+		// レビュー指摘: incrementAddress 任せだと D10 -1 = D9 は範囲内に
+		// 収まってしまい「成功」してしまう（下限割れにならないため）。
+		// 仕様は「正の整数のみ」なので、アドレス算出に委ねず入口で弾く。
+		const source = makeTag({ id: 17, name: 'D10', address: 'D10', collectionGroupId: 10 });
+		const result = buildOffsetCopyRows([source], -1, [source]);
+		expect(result.rows).toEqual([]);
+		expect(result.errors).toHaveLength(1);
+		expect(result.errors[0].message).toContain('1以上の整数');
+	});
+
+	it('オフセット0は「1以上」を満たさないため、行を作らずエラーになる', () => {
 		const source = makeTag({ id: 5, name: 'D3000', address: 'D3000', collectionGroupId: 10 });
 		const result = buildOffsetCopyRows([source], 0, [source]);
-		expect(result.rows).toHaveLength(1);
-		expect(result.errors.some((e) => e.sourceId === 5)).toBe(true);
+		expect(result.rows).toEqual([]);
+		expect(result.errors).toHaveLength(1);
+		expect(result.errors[0].sourceId).toBe(5);
+		expect(result.errors[0].message).toContain('1以上の整数');
 	});
 
 	it('非整数オフセットは全 source をエラーにする', () => {
