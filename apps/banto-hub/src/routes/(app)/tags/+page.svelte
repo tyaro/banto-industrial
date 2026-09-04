@@ -94,6 +94,15 @@
 		type ContinuousRegistrationResult
 	} from '$lib/banto/continuousRegistration';
 	import {
+		allocateStructFields,
+		detectStructAddressCollisions,
+		manualStructRows,
+		structRowsToTagInputs,
+		type StructAllocationResult,
+		type StructCollision,
+		type StructField
+	} from '$lib/banto/structRegistration';
+	import {
 		exportTagsCsv,
 		parseTagsCsv,
 		parseCsv,
@@ -400,7 +409,7 @@
 	 * 編集パネル常時表示」を、この `drawerMode` 1つに統合した -
 	 * `drawerMode !== null` が Drawer の `open` を駆動する。
 	 */
-	type DrawerMode = 'create' | 'edit' | 'continuous' | 'csv' | null;
+	type DrawerMode = 'create' | 'edit' | 'continuous' | 'struct' | 'csv' | null;
 	let drawerMode: DrawerMode = $state(null);
 
 	let groups: CollectionGroup[] = $state([]);
@@ -1418,6 +1427,8 @@
 				return selected ? `${selected.name} を編集` : '編集';
 			case 'continuous':
 				return '連続登録';
+			case 'struct':
+				return '構造体登録';
 			case 'csv':
 				return 'CSVインポート';
 			default:
@@ -1425,10 +1436,12 @@
 		}
 	});
 
-	// 連続登録・CSVインポートはプレビュー/エラー一覧のテーブルが横に
-	// 広いため、通常登録・編集より少し広いドロワー幅を使う。
+	// 連続登録・構造体登録・CSVインポートはプレビュー/エラー一覧の
+	// テーブルが横に広いため、通常登録・編集より少し広いドロワー幅を使う。
 	const drawerWidth = $derived(
-		drawerMode === 'continuous' || drawerMode === 'csv' ? '640px' : '480px'
+		drawerMode === 'continuous' || drawerMode === 'struct' || drawerMode === 'csv'
+			? '640px'
+			: '480px'
 	);
 
 	/**
@@ -1448,6 +1461,8 @@
 			saving ||
 			validating ||
 			applyingContinuous ||
+			structValidating ||
+			applyingStruct ||
 			csvValidating ||
 			csvApplying ||
 			csvUpdateValidating ||
@@ -1471,6 +1486,8 @@
 				return isFormDirty(editBaseline, editForm);
 			case 'continuous':
 				return isFormDirty(continuousBaseline, continuousForm);
+			case 'struct':
+				return isFormDirty(structBaseline, structForm);
 			case 'csv':
 				return isFormDirty(null, csvParseResult);
 			default:
@@ -2201,6 +2218,185 @@
 			toastStore.push('error', errorMessage(err));
 		} finally {
 			applyingContinuous = false;
+		}
+	}
+
+	// --- T20 ②a 構造体タグ登録 (docs/banto-hub-t20-design.md §3.2、
+	// 2026-09-04 オーナー決定「テンプレートの永続保存は不要」「自動割付・
+	// 手動割付の両方を実装」) ------------------------------------------------
+	//
+	// 連続登録が「1タグをN連番」なのに対し、構造体登録は「複数の異なる
+	// フィールド」を1つのベースアドレスから連続ワード領域へ割り付ける
+	// （自動割付）か、各フィールドのアドレスを個別指定する（手動割付）。
+	// 割付・衝突検出はすべて依存ゼロの純関数（$lib/banto/structRegistration.ts）
+	// に切り出してあり、ここはフォーム状態と `createTagsBatch` への配線のみ。
+
+	interface StructFieldFormRow {
+		name: string;
+		dataType: TagDataType;
+		/** `dataType === 'string'` のときのみ使う（number input 由来）。 */
+		stringLength: string;
+		/** 手動割付モードのときのみ使う。 */
+		address: string;
+	}
+
+	function blankStructFieldRow(): StructFieldFormRow {
+		return { name: '', dataType: 'i16', stringLength: '', address: '' };
+	}
+
+	interface StructFormState {
+		collectionGroupId: string;
+		mode: 'auto' | 'manual';
+		/** 自動割付モードのときのみ使う。 */
+		baseAddress: string;
+		enabled: boolean;
+		writable: boolean;
+		fields: StructFieldFormRow[];
+	}
+
+	function blankStructForm(): StructFormState {
+		return {
+			collectionGroupId: '',
+			mode: 'auto',
+			baseAddress: '',
+			enabled: true,
+			writable: false,
+			fields: [blankStructFieldRow()]
+		};
+	}
+
+	let structForm = $state(blankStructForm());
+	/** T18-1（TAG-UX-C 一部）と同じ役割、構造体登録版。 */
+	let structBaseline: StructFormState = blankStructForm();
+
+	function addStructField(): void {
+		structForm.fields.push(blankStructFieldRow());
+	}
+
+	/** 最低1行は残す — 0行だと `allocateStructFields`/`manualStructRows` が
+	 * 即エラーになるだけで UI 上の意味が無いため。 */
+	function removeStructField(index: number): void {
+		if (structForm.fields.length <= 1) return;
+		structForm.fields.splice(index, 1);
+	}
+
+	/**
+	 * T19 S1-c（UX-33）と同じ理由・同じ挙動 - `openContinuousDrawer` 参照。
+	 * 構造体登録も PLC アドレスの算術前提の機能のため、対象は
+	 * `registrationTarget.supportsContinuous` なグループに限る。
+	 */
+	function openStructDrawer(): void {
+		if (!confirmDiscardIfNeeded()) return;
+		structBaseline = blankStructForm();
+		editConflict = null;
+		if (registrationTarget !== null && registrationTarget.supportsContinuous) {
+			structForm.collectionGroupId = String(registrationTarget.groupId);
+		}
+		drawerMode = 'struct';
+	}
+
+	/** 入力が変わるたびに再計算される、割付前プレビュー本体。 */
+	const structAllocation: StructAllocationResult | null = $derived.by(() => {
+		if (structForm.collectionGroupId === '') return null;
+		const fields: StructField[] = structForm.fields.map((f) => ({
+			name: f.name,
+			dataType: f.dataType,
+			stringLength: f.dataType === 'string' ? (parseOptionalNumber(f.stringLength) ?? null) : null,
+			address: structForm.mode === 'manual' ? f.address : undefined
+		}));
+		return structForm.mode === 'auto'
+			? allocateStructFields(structForm.baseAddress, fields)
+			: manualStructRows(fields);
+	});
+
+	/** フィールド間・既存タグとのアドレス／名前衝突（クライアント側の先取り
+	 * チェック - 最終判定はサーバー側 dry-run/実登録）。 */
+	const structCollisions: StructCollision[] = $derived(
+		structAllocation?.ok
+			? detectStructAddressCollisions(
+					structAllocation.rows,
+					tags,
+					Number(structForm.collectionGroupId)
+				)
+			: []
+	);
+
+	const structTagInputs: TagInput[] | null = $derived(
+		structAllocation?.ok
+			? structRowsToTagInputs(structAllocation.rows, {
+					collectionGroupId: Number(structForm.collectionGroupId),
+					enabled: structForm.enabled,
+					writable: structForm.writable
+				})
+			: null
+	);
+
+	const structTagsJson = $derived(structTagInputs ? JSON.stringify(structTagInputs) : null);
+
+	// dry-run 検証の鮮度管理は連続登録と同じ方式（`continuousValidatedFresh`
+	// 参照）。加えて、クライアント側で衝突を検出している間は検証OKでも
+	// 登録を許可しない（衝突は必ずどちらか一方を直してもらう「拒否」扱い、
+	// 設計 §3.2「重なる場合に警告/拒否」）。
+	let structValidatedTagsJson = $state<string | null>(null);
+	let structValidationResult = $state<BatchTagsResult | null>(null);
+	let structValidating = $state(false);
+	let applyingStruct = $state(false);
+
+	const structValidatedFresh = $derived(
+		structTagsJson !== null &&
+			structTagsJson === structValidatedTagsJson &&
+			structValidationResult?.ok === true &&
+			structCollisions.length === 0
+	);
+
+	function invalidateStructValidation(): void {
+		structValidatedTagsJson = null;
+		structValidationResult = null;
+	}
+
+	async function handleValidateStruct(): Promise<void> {
+		if (!structTagInputs || structCollisions.length > 0) return;
+		structValidating = true;
+		try {
+			const result = await createTagsBatch(structTagInputs, true);
+			structValidationResult = result;
+			structValidatedTagsJson = structTagsJson;
+			if (result.ok) {
+				toastStore.push('success', `構造体タグの検証OK: ${result.count}件登録できます`);
+			} else {
+				toastStore.push('error', 'エラーがあります。下の一覧を確認してください。');
+			}
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			structValidating = false;
+		}
+	}
+
+	async function handleApplyStruct(): Promise<void> {
+		if (!structTagInputs || !structValidatedFresh) return;
+		applyingStruct = true;
+		try {
+			const result = await createTagsBatch(structTagInputs, false);
+			structValidationResult = result;
+			if (result.ok) {
+				toastStore.push('success', `構造体タグを${result.count}件登録しました`);
+				monitorCtaHref = monitorHref({ groupId: Number(structForm.collectionGroupId) });
+				structForm = blankStructForm();
+				structBaseline = blankStructForm();
+				invalidateStructValidation();
+				await reload();
+				// 実装指示: 「成功で一覧 reload()・パネルを閉じる・成功トースト」
+				// - 連続登録（フォームを空にして開いたままにする）とは異なり、
+				// 構造体登録は成功時に Drawer 自体を閉じる。
+				closeDrawer();
+			} else {
+				toastStore.push('error', '一部の行でエラーがあります。下の一覧を確認してください。');
+			}
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			applyingStruct = false;
 		}
 	}
 
@@ -3713,6 +3909,22 @@
 								>
 									連続登録
 								</button>
+								<!--
+									T20 ②a（docs/banto-hub-t20-design.md §3.2、2026-09-04）:
+									構造体タグ登録の起動導線。連続登録と同じく PLC アドレスの
+									算術前提の機能のため、対象グループの制約も同一。
+								-->
+								<button
+									type="button"
+									data-testid="struct-reg-open"
+									onclick={openStructDrawer}
+									disabled={!registrationTarget.supportsContinuous}
+									title={registrationTarget.supportsContinuous
+										? undefined
+										: '構造体登録は PLC アドレスを持つ収集グループでのみ使えます'}
+								>
+									構造体登録
+								</button>
 							{:else}
 								<span class="registration-hint" data-testid="tag-registration-hint">
 									左のツリーで収集グループを選択すると、ここに新規登録・連続登録の操作が表示されます
@@ -4315,7 +4527,10 @@
 </Modal>
 
 <Drawer
-	open={drawerMode === 'edit' || drawerMode === 'continuous' || drawerMode === 'csv'}
+	open={drawerMode === 'edit' ||
+		drawerMode === 'continuous' ||
+		drawerMode === 'struct' ||
+		drawerMode === 'csv'}
 	title={drawerTitle}
 	width={drawerWidth}
 	onclose={closeDrawer}
@@ -4572,6 +4787,203 @@
 						disabled={!continuousValidatedFresh || isDrawerBusy()}>登録</button
 					>
 					{#if !continuousValidatedFresh}
+						<span class="hint"
+							>先に「検証」を実行してください（フォームを変更すると再検証が必要）。</span
+						>
+					{/if}
+				</div>
+			{/if}
+		</div>
+	{:else if drawerMode === 'struct' && canWrite}
+		<div class="drawer-section">
+			<p class="note">
+				複数の異なるフィールド（名前・型）をまとめて登録します。<strong>自動割付</strong>は
+				ベースアドレスから、各フィールドが占有するワード数（bit/i16/u16 は+1、i32/u32/f32
+				は+2、string は文字列長ぶん）だけずつ連続したアドレスへ割り付けます。<strong
+					>手動割付</strong
+				>は各フィールドのアドレスを個別に指定します。
+			</p>
+			{#if structForm.collectionGroupId !== ''}
+				<!-- T19 S1-c（UX-33）と同じ理由 - openContinuousDrawer 参照。 -->
+				<p class="note" data-testid="struct-reg-group-locked-note">
+					「{groupName(Number(structForm.collectionGroupId))}」へ構造体登録します。
+				</p>
+			{/if}
+			<div class="form-grid">
+				<label class="field">
+					対象グループ
+					<select bind:value={structForm.collectionGroupId} disabled>
+						<option value="" disabled>選択してください</option>
+						{#each groupsFor('plc') as group (group.id)}
+							<option value={String(group.id)}>{group.name}</option>
+						{/each}
+					</select>
+				</label>
+				<label class="field">
+					割付モード
+					<select bind:value={structForm.mode} data-testid="struct-reg-mode">
+						<option value="auto">自動割付（ベースアドレスから連続）</option>
+						<option value="manual">手動割付（各行アドレス指定）</option>
+					</select>
+				</label>
+				{#if structForm.mode === 'auto'}
+					<label class="field">
+						ベースアドレス
+						<input
+							type="text"
+							bind:value={structForm.baseAddress}
+							placeholder="D3000"
+							data-testid="struct-reg-base-address"
+						/>
+						<span class="hint">ビットサフィックス（例: D100.5）は指定できません。</span>
+					</label>
+				{/if}
+				<label class="field checkbox">
+					<input type="checkbox" bind:checked={structForm.enabled} />
+					有効
+				</label>
+				<label class="field checkbox">
+					<input type="checkbox" bind:checked={structForm.writable} />
+					書き込み可（writable）
+				</label>
+			</div>
+
+			<h4>フィールド</h4>
+			<div class="struct-fields" data-testid="struct-reg-fields">
+				{#each structForm.fields as field, i (i)}
+					<div class="struct-field-row" data-testid={`struct-reg-field-row-${i}`}>
+						<label class="field">
+							フィールド名
+							<input
+								type="text"
+								bind:value={field.name}
+								placeholder={`field${i + 1}`}
+								data-testid={`struct-reg-field-name-${i}`}
+							/>
+						</label>
+						<label class="field">
+							型
+							<select bind:value={field.dataType} data-testid={`struct-reg-field-type-${i}`}>
+								{#each dataTypeOptions as opt (opt.value)}
+									<option value={opt.value}>{opt.label}</option>
+								{/each}
+							</select>
+						</label>
+						{#if field.dataType === 'string'}
+							<label class="field">
+								文字列長（word数）
+								<input
+									type="number"
+									min={MIN_STRING_LENGTH}
+									max={MAX_STRING_LENGTH}
+									bind:value={field.stringLength}
+									data-testid={`struct-reg-field-strlen-${i}`}
+								/>
+							</label>
+						{/if}
+						{#if structForm.mode === 'manual'}
+							<label class="field">
+								アドレス
+								<input
+									type="text"
+									bind:value={field.address}
+									placeholder="D3000"
+									data-testid={`struct-reg-field-address-${i}`}
+								/>
+							</label>
+						{/if}
+						<button
+							type="button"
+							class="secondary"
+							data-testid={`struct-reg-field-remove-${i}`}
+							onclick={() => removeStructField(i)}
+							disabled={structForm.fields.length <= 1}
+						>
+							この行を削除
+						</button>
+					</div>
+				{/each}
+				<button
+					type="button"
+					class="secondary"
+					data-testid="struct-reg-field-add"
+					onclick={addStructField}
+				>
+					+ フィールドを追加
+				</button>
+			</div>
+
+			{#if groups.length === 0}
+				<p class="note">
+					先に 収集グループ を1件以上登録してください。
+					<button type="button" class="onboarding-cta" onclick={() => openGroupCreateDrawer()}>
+						収集グループを作成
+					</button>
+				</p>
+			{/if}
+
+			{#if structAllocation && !structAllocation.ok}
+				<p class="err" data-testid="struct-reg-error">{structAllocation.error}</p>
+			{:else if structAllocation?.ok}
+				<h4>プレビュー（{structAllocation.rows.length}件）</h4>
+				<div class="preview-wrap">
+					<table class="preview-table" data-testid="struct-reg-preview-table">
+						<thead>
+							<tr>
+								<th>#</th>
+								<th>名前</th>
+								<th>アドレス</th>
+								<th>占有word数</th>
+							</tr>
+						</thead>
+						<tbody>
+							{#each structAllocation.rows as row, i (i)}
+								<tr
+									class={structCollisions.some((c) => c.index === i) ? 'struct-row-collision' : ''}
+								>
+									<td>{i + 1}</td>
+									<td>{row.name}</td>
+									<td>{row.address}</td>
+									<td>{row.words}</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+				</div>
+
+				{#if structCollisions.length > 0}
+					<div class="struct-collisions" data-testid="struct-reg-collisions">
+						<p class="err">アドレスまたは名前が重複しています。修正してください。</p>
+						<ul>
+							{#each structCollisions as c, i (i)}
+								<li>{c.message}</li>
+							{/each}
+						</ul>
+					</div>
+				{/if}
+
+				{#if structValidationResult}
+					{@render batchRowErrors(structValidationResult)}
+				{/if}
+
+				<div class="actions">
+					<button
+						type="button"
+						data-testid="struct-reg-validate"
+						onclick={handleValidateStruct}
+						disabled={isDrawerBusy() || structCollisions.length > 0}
+					>
+						検証
+					</button>
+					<button
+						type="button"
+						data-testid="struct-reg-apply"
+						onclick={handleApplyStruct}
+						disabled={!structValidatedFresh || isDrawerBusy()}
+					>
+						登録
+					</button>
+					{#if !structValidatedFresh}
 						<span class="hint"
 							>先に「検証」を実行してください（フォームを変更すると再検証が必要）。</span
 						>
@@ -5034,6 +5446,47 @@
 	/* T19 S1-b（UX-36）: 連続登録フォームの詳細セクション2つを form-grid 内で全幅にする。 */
 	.continuous-detail-wrap {
 		grid-column: 1 / -1;
+	}
+
+	/* T20 ②a: 構造体登録のフィールド行一覧。連続登録の form-grid とは別に、
+	   1行=1フィールドの横並びグリッドとして独立させてある（フィールド数が
+	   可変で、行の追加/削除ボタンを行末に持つため）。 */
+	.struct-fields {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+		margin-bottom: 0.75rem;
+	}
+
+	.struct-field-row {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: flex-end;
+		gap: 0.5rem;
+		padding: 0.5rem;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+	}
+
+	.struct-field-row .field {
+		min-width: 8rem;
+	}
+
+	.struct-collisions {
+		margin: 0.5rem 0;
+		padding: 0.5rem 0.75rem;
+		border: 1px solid var(--banto-danger);
+		border-radius: var(--banto-radius);
+	}
+
+	.struct-collisions ul {
+		margin: 0.25rem 0 0;
+		padding-left: 1.25rem;
+		font-size: 0.75rem;
+	}
+
+	.struct-row-collision {
+		background: color-mix(in srgb, var(--banto-danger) 12%, transparent);
 	}
 
 	.field input,
