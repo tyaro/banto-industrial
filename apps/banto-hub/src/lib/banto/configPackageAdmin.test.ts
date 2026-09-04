@@ -18,7 +18,7 @@
  * catch/変換ロジックであって、`tagRegistryAdmin.ts` の型ガード実装その
  * ものは `tagRegistryAdmin.test.ts` 側で別途固定済み）。
  */
-import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { ConfigPackage } from './configPackage';
 
 // `vi.mock` ファクトリはファイル先頭に hoist されるため、参照するクラスは
@@ -78,7 +78,8 @@ import { getMqttSettings, saveMqttSettings } from './mqttSettingsAdmin';
 import {
 	applyConfigPackage,
 	isConfigPackageImportAbortedError,
-	ConfigPackageImportAbortedError
+	ConfigPackageImportAbortedError,
+	configPackageExportFilename
 } from './configPackageAdmin';
 
 const pkg: ConfigPackage = {
@@ -242,6 +243,26 @@ describe('applyConfigPackage: 収集稼働中の QueuedWhileRunningError を検�
 		vi.mocked(createPlcConnection).mockRejectedValue(boom);
 
 		await expect(applyConfigPackage(pkg)).rejects.toBe(boom);
+	});
+});
+
+describe('configPackageExportFilename（T19 S4、UX-42: settings/+page.svelte ローカル関数から移設）', () => {
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	it('banto-hub-config-YYYY-MM-DD.json 形式で、月・日をゼロ埋めする', () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date(2026, 0, 5, 12, 0, 0));
+
+		expect(configPackageExportFilename()).toBe('banto-hub-config-2026-01-05.json');
+	});
+
+	it('2桁の月・日でもゼロ埋めが二重にならない', () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date(2026, 10, 23, 0, 0, 0));
+
+		expect(configPackageExportFilename()).toBe('banto-hub-config-2026-11-23.json');
 	});
 });
 

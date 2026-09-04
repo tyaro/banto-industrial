@@ -98,7 +98,17 @@ test.describe.serial('banto-hub offcanvas sidebar (narrow viewport)', () => {
 			page.getByRole('button', { name: '背景をクリックしてメニューを閉じる' })
 		).toBeVisible();
 
-		await page.getByRole('button', { name: '背景をクリックしてメニューを閉じる' }).click();
+		// バックドロップ（`button.nav-backdrop`、position:fixed;inset:0 で全画面
+		// 400x800）はデフォルトの中心座標（≈200,400）だと、スライドイン
+		// transition 完了後の `aside.offcanvas`（幅≈340px、左端固定、z-index
+		// がバックドロップより上）に覆われて intercept される - 実機で常に
+		// 緑だったのは transition 中の一瞬だけクリックできていたタイミング
+		// 依存の偶然で、マシンが遅い/CPU 負荷が高いと aside が定位置に達して
+		// 確実に落ちる（2026-09-04 実測回帰）。aside の右側、確実にバック
+		// ドロップだけが見えている座標を明示してクリックする。
+		await page
+			.getByRole('button', { name: '背景をクリックしてメニューを閉じる' })
+			.click({ position: { x: 390, y: 400 } });
 
 		await expect(page.getByRole('button', { name: 'メニューを開く' })).toBeVisible();
 		await expectOffscreenLeft(page, 'タグ登録');

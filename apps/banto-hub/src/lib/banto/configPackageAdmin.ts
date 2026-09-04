@@ -21,6 +21,7 @@ import { getMqttSettings, saveMqttSettings, type MqttSettings } from './mqttSett
 import {
 	buildConfigPackage,
 	planByName,
+	serializeConfigPackage,
 	type ConfigPackage,
 	type ConfigPackageImportOptions,
 	type ConfigPackageImportSummary,
@@ -104,6 +105,45 @@ export async function loadConfigPackage(): Promise<ConfigPackage> {
 		getGrpcSettings()
 	]);
 	return buildConfigPackage({ plcConnections, collectionGroups, tags, mqtt, grpc });
+}
+
+/**
+ * T19 S4（UX-42）: 元は `settings/+page.svelte` ローカル関数だったものを、
+ * コマンドパレット（`commands.ts`）からも export できるようここへ移設。
+ * 純関数なので vitest でテストできる（`configPackage.test.ts` 参照）。
+ */
+export function configPackageExportFilename(): string {
+	const now = new Date();
+	const y = now.getFullYear();
+	const m = String(now.getMonth() + 1).padStart(2, '0');
+	const d = String(now.getDate()).padStart(2, '0');
+	return `banto-hub-config-${y}-${m}-${d}.json`;
+}
+
+/**
+ * T19 S4（UX-42）: 設定画面の「JSON をダウンロード」ボタンとコマンド
+ * パレットの `config.export` コマンドの両方から呼べる、export の中核処理。
+ * `loadConfigPackage()` → `serializeConfigPackage()` → Blob → ブラウザ
+ * ダウンロードのみを行い、トースト表示やエラー state は呼び出し側の責務
+ * のまま据え置く（設定画面は既存の `configPackageWorking`/
+ * `configPackageLoadError` state、パレットは `toastStore` を使う - 呼び出し
+ * 元ごとに UI フィードバックの手段が違うため）。失敗時は呼び出し元が
+ * catch できるよう例外はそのまま投げる。
+ */
+export async function exportConfigPackageToDownload(): Promise<void> {
+	const pkg = await loadConfigPackage();
+	const blob = new Blob([serializeConfigPackage(pkg)], {
+		type: 'application/json;charset=utf-8'
+	});
+	const url = URL.createObjectURL(blob);
+	try {
+		const a = document.createElement('a');
+		a.href = url;
+		a.download = configPackageExportFilename();
+		a.click();
+	} finally {
+		URL.revokeObjectURL(url);
+	}
 }
 
 export async function inspectConfigPackage(pkg: ConfigPackage): Promise<ConfigPackageInspection> {
