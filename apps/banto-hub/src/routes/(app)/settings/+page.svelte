@@ -9,7 +9,8 @@
 	 * （バックアップ、LAN/認証/自動ログイン設定セクション）に該当する。
 	 */
 	import type { ThemeMode, ThemePreset } from '@banto/theme';
-	import { goto } from '$app/navigation';
+	import { onMount } from 'svelte';
+	import { goto, afterNavigate } from '$app/navigation';
 	import { getAuthProvider, isProviderError } from '@banto/admin-core';
 	import { settings } from '$lib/settings.svelte';
 	import { toastStore } from '$lib/toast.svelte';
@@ -48,12 +49,11 @@
 	import {
 		applyConfigPackage,
 		inspectConfigPackage,
-		loadConfigPackage,
+		exportConfigPackageToDownload,
 		isConfigPackageImportAbortedError
 	} from '$lib/banto/configPackageAdmin';
 	import {
 		parseConfigPackage,
-		serializeConfigPackage,
 		type ConfigPackage,
 		type ConfigPackageInspection,
 		type ConfigPackageImportSummary
@@ -84,6 +84,23 @@
 		{ value: 'standard', label: 'スタンダード' },
 		{ value: 'glass', label: 'ガラス' }
 	];
+
+	/**
+	 * T19 S4（UX-42）: コマンドパレットの `config.import` は
+	 * `/settings#config-package` へ遷移して構成セクションへ誘導する。
+	 * SvelteKit はナビゲーション完了時に URL のハッシュに一致する id 要素へ
+	 * 自動でスクロールする実装を持つが、同一ページ内（既に /settings を
+	 * 開いている状態でパレットからハッシュだけ変えて再実行する）ケースで
+	 * 確実に効くとは限らないため、`onMount`/`afterNavigate` の両方で
+	 * 明示的に `scrollIntoView()` する最小のフォールバックを入れておく。
+	 */
+	function scrollToConfigPackageIfHashed(): void {
+		if (typeof location === 'undefined' || location.hash !== '#config-package') return;
+		document.getElementById('config-package')?.scrollIntoView();
+	}
+
+	onMount(scrollToConfigPackageIfHashed);
+	afterNavigate(scrollToConfigPackageIfHashed);
 
 	const changePassword = getAuthProvider().changePassword;
 
@@ -517,27 +534,17 @@
 		if (configPackageFileEl) configPackageFileEl.value = '';
 	}
 
-	function configPackageExportFilename(): string {
-		const now = new Date();
-		const y = now.getFullYear();
-		const m = String(now.getMonth() + 1).padStart(2, '0');
-		const d = String(now.getDate()).padStart(2, '0');
-		return `banto-hub-config-${y}-${m}-${d}.json`;
-	}
-
+	/**
+	 * T19 S4（UX-42）: export の中核（load → serialize → ダウンロード）は
+	 * コマンドパレットからも呼べるよう `configPackageAdmin.ts` の
+	 * `exportConfigPackageToDownload()` へ切り出した。ここではトースト表示
+	 * とエラー state（`configPackageLoadError`）だけを担う - 挙動は従来と
+	 * 同じ。
+	 */
 	async function handleExportConfigPackage(): Promise<void> {
 		configPackageWorking = true;
 		try {
-			const pkg = await loadConfigPackage();
-			const blob = new Blob([serializeConfigPackage(pkg)], {
-				type: 'application/json;charset=utf-8'
-			});
-			const url = URL.createObjectURL(blob);
-			const a = document.createElement('a');
-			a.href = url;
-			a.download = configPackageExportFilename();
-			a.click();
-			URL.revokeObjectURL(url);
+			await exportConfigPackageToDownload();
 			toastStore.push('success', '構成パッケージをダウンロードしました');
 		} catch (err) {
 			configPackageLoadError = errorMessage(err);
@@ -890,8 +897,8 @@
 	{/if}
 
 	{#if canManageMqtt || canManageGrpc}
-		<section>
-			<h2>構成パッケージ</h2>
+		<section id="config-package">
+			<h2>構成の保存・読み込み（バックアップ）</h2>
 			<p class="note">
 				PLC 接続・収集グループ・タグ・MQTT / gRPC の非秘密設定を JSON で移送します。 MQTT
 				の認証情報は含めないため、必要ならインポート時に再入力してください。
