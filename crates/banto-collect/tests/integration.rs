@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use banto_collect::{
@@ -38,6 +38,17 @@ use sqlx::SqlitePool;
 // ---------------------------------------------------------------------------
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+// #227: この binary の tokio::test は全て multi_thread ランタイムを立てる。
+// cargo test の既定並列で複数ランタイムが同時に走ると、少コア CI で
+// コアを奪い合い収集タスクが starve し、100ms 周期のティックが 10 秒
+// 窓に入らず wait_until がタイムアウトしていた。テストごとに新しい
+// ランタイムを立てるのは維持しつつ、この直列ガードで「同時に走る
+// 重いランタイムは常に1つ」に制限して starvation を無くす。
+// tokio::sync::Mutex を使うのは clippy::await_holding_lock を避けるため
+// (std/parking_lot のガードを .await 跨ぎで持つと lint が出る)。
+static TEST_SERIAL: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// A temp directory holding the registry database and the tstore data dir.
 ///
@@ -261,6 +272,7 @@ async fn read_single_group_rows(data_dir: &Path) -> Vec<banto_tstore::Sample> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collects_values_in_tag_order_with_scaling_applied() {
+    let _serial = TEST_SERIAL.lock().await;
     let env = TempEnv::new("values");
     let sim = Simulator::start().await;
     // t1: raw i16 (unscaled). t2: i16 scaled 0..4095 -> 0..100.
@@ -327,6 +339,7 @@ async fn collects_values_in_tag_order_with_scaling_applied() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bit_tags_record_zero_or_one() {
+    let _serial = TEST_SERIAL.lock().await;
     let env = TempEnv::new("bit");
     let sim = Simulator::start().await;
     sim.set_coil(0, true); // 00001
@@ -375,6 +388,7 @@ async fn bit_tags_record_zero_or_one() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lifecycle_events_are_emitted_and_persisted() {
+    let _serial = TEST_SERIAL.lock().await;
     let env = TempEnv::new("lifecycle");
     let sim = Simulator::start().await;
     let pool = open_registry(&env).await;
@@ -438,6 +452,7 @@ async fn lifecycle_events_are_emitted_and_persisted() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hard_drop_keeps_appending_null_rows_and_marks_reconnecting() {
+    let _serial = TEST_SERIAL.lock().await;
     let env = TempEnv::new("drop");
     let sim = Simulator::start().await;
     sim.set_holding_register(0, 7);
@@ -525,6 +540,7 @@ async fn hard_drop_keeps_appending_null_rows_and_marks_reconnecting() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_reconnects_and_values_resume_after_recovery() {
+    let _serial = TEST_SERIAL.lock().await;
     let env = TempEnv::new("reconnect");
     let sim = Simulator::start().await;
     sim.set_holding_register(0, 55);
@@ -601,6 +617,7 @@ async fn auto_reconnects_and_values_resume_after_recovery() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slmp_collects_values_and_writes_to_tstore() {
+    let _serial = TEST_SERIAL.lock().await;
     let env = TempEnv::new("slmp-values");
     let sim = SlmpSimulator::start().await;
     sim.set_word(SlmpDevice::D, 100, 4321);
@@ -656,6 +673,7 @@ async fn slmp_collects_values_and_writes_to_tstore() {
 /// without tearing the collection loop down.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slmp_hard_drop_keeps_appending_null_rows_and_marks_reconnecting() {
+    let _serial = TEST_SERIAL.lock().await;
     let env = TempEnv::new("slmp-drop");
     let sim = SlmpSimulator::start().await;
     sim.set_word(SlmpDevice::D, 0, 7);
@@ -744,6 +762,7 @@ async fn slmp_hard_drop_keeps_appending_null_rows_and_marks_reconnecting() {
 /// no outside intervention, same `Collector`/socket the whole time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slmp_auto_reconnects_and_values_resume_after_recovery() {
+    let _serial = TEST_SERIAL.lock().await;
     let env = TempEnv::new("slmp-reconnect");
     let sim = SlmpSimulator::start().await;
     sim.set_word(SlmpDevice::D, 0, 55);
@@ -828,6 +847,7 @@ async fn entered_levels(pool: &SqlitePool) -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn threshold_entered_and_cleared_fire_only_on_edges() {
+    let _serial = TEST_SERIAL.lock().await;
     let env = TempEnv::new("threshold");
     let sim = Simulator::start().await;
     sim.set_holding_register(0, 30); // start in the normal band
@@ -924,6 +944,7 @@ async fn threshold_entered_and_cleared_fire_only_on_edges() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn current_value_quality_transitions_good_bad_stale() {
+    let _serial = TEST_SERIAL.lock().await;
     let env = TempEnv::new("quality");
     let sim = Simulator::start().await;
     sim.set_holding_register(0, 42);
@@ -1013,6 +1034,7 @@ async fn current_value_quality_transitions_good_bad_stale() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clock_regression_emits_edge_events_and_overwrites_the_colliding_row() {
+    let _serial = TEST_SERIAL.lock().await;
     let env = TempEnv::new("clock-regression");
     let sim = Simulator::start().await;
     sim.set_holding_register(0, 1); // pre-regression value
@@ -1139,6 +1161,7 @@ async fn clock_regression_emits_edge_events_and_overwrites_the_colliding_row() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_flushes_buffered_rows_so_none_are_lost() {
+    let _serial = TEST_SERIAL.lock().await;
     let env = TempEnv::new("stop-flush");
     let sim = Simulator::start().await;
     sim.set_holding_register(0, 3);
@@ -1198,6 +1221,7 @@ async fn stop_flushes_buffered_rows_so_none_are_lost() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn status_reports_connected_while_running_and_stop_completes_cleanly() {
+    let _serial = TEST_SERIAL.lock().await;
     let env = TempEnv::new("status");
     let sim = Simulator::start().await;
     let pool = open_registry(&env).await;
@@ -1251,6 +1275,7 @@ async fn status_reports_connected_while_running_and_stop_completes_cleanly() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn collect_events_rows_carry_the_full_shape() {
+    let _serial = TEST_SERIAL.lock().await;
     let env = TempEnv::new("events-roundtrip");
     let sim = Simulator::start().await;
     sim.set_holding_register(0, 100);
@@ -1338,6 +1363,7 @@ async fn collect_events_rows_carry_the_full_shape() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mini_soak_100ms_three_groups_row_counts_within_tolerance() {
+    let _serial = TEST_SERIAL.lock().await;
     let env = TempEnv::new("mini-soak");
     let sim = Simulator::start().await;
     for i in 0..3u16 {
@@ -1436,6 +1462,7 @@ async fn mini_soak_100ms_three_groups_row_counts_within_tolerance() {
 #[ignore = "long-running (60s) soak; run explicitly with --ignored"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn long_soak_sixty_seconds() {
+    let _serial = TEST_SERIAL.lock().await;
     let env = TempEnv::new("long-soak");
     let sim = Simulator::start().await;
     sim.set_holding_register(0, 1);
@@ -1675,6 +1702,7 @@ async fn two_conn_setup(label: &str) -> TwoConnEnv {
 /// writer rotates (the aggregate collected tag set changed).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn apply_config_adding_a_tag_to_b_never_restarts_a() {
+    let _serial = TEST_SERIAL.lock().await;
     let mut setup = two_conn_setup("apply-no-restart").await;
     let current = setup.collector.current_values();
 
@@ -1753,6 +1781,7 @@ async fn apply_config_adding_a_tag_to_b_never_restarts_a() {
 /// new group appeared).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn apply_config_adding_a_connection_leaves_the_existing_one_untouched() {
+    let _serial = TEST_SERIAL.lock().await;
     let mut setup = one_conn_setup("apply-add-connection").await;
     let current = setup.collector.current_values();
 
@@ -1827,6 +1856,7 @@ async fn apply_config_adding_a_connection_leaves_the_existing_one_untouched() {
 /// key from the status map - while leaving the other connection untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn apply_config_removing_a_connection_retains_the_rest() {
+    let _serial = TEST_SERIAL.lock().await;
     let mut setup = two_conn_setup("apply-remove-connection").await;
     let current = setup.collector.current_values();
 
@@ -1896,6 +1926,7 @@ async fn apply_config_removing_a_connection_retains_the_rest() {
 /// same), and must leave every other connection untouched.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn apply_config_settings_only_change_does_not_rotate_the_writer() {
+    let _serial = TEST_SERIAL.lock().await;
     let mut setup = two_conn_setup("apply-settings-only").await;
     let current = setup.collector.current_values();
 
@@ -1970,6 +2001,7 @@ async fn apply_config_settings_only_change_does_not_rotate_the_writer() {
 /// privilege, unlike a permission-based sabotage).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn apply_config_writer_open_failure_is_all_or_nothing() {
+    let _serial = TEST_SERIAL.lock().await;
     let mut setup = two_conn_setup("apply-writer-open-fail").await;
     let current = setup.collector.current_values();
 
@@ -2057,6 +2089,7 @@ async fn apply_config_writer_open_failure_is_all_or_nothing() {
 /// spawned).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn apply_config_writer_rotation_preserves_old_and_new_data() {
+    let _serial = TEST_SERIAL.lock().await;
     let mut setup = one_conn_setup("apply-rotation-integrity").await;
 
     // Let a few real rows land on A before rotating.
