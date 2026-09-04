@@ -103,6 +103,11 @@
 		type StructField
 	} from '$lib/banto/structRegistration';
 	import {
+		buildOffsetCopyRows,
+		offsetCopyRowsToTagInputs,
+		type OffsetCopyResult
+	} from '$lib/banto/offsetCopy';
+	import {
 		exportTagsCsv,
 		parseTagsCsv,
 		parseCsv,
@@ -2796,8 +2801,13 @@
 	 * `'delete'`（T19 S2-c1、UX-37）は他の3つと違い `updateTagsBatch` では
 	 * なく `deleteTagsBatch` を叩く - `bulkRows`/`bulkSummary` の「差分」
 	 * 概念を持たず、対象は選択タグの `id` そのもの（`bulkDeleteIds` 参照）。
+	 * `'offset-copy'`（T20 ②b、docs/banto-hub-t20-design.md §3.2）はさらに
+	 * 別種 - 既存タグの「更新」ではなく `createTagsBatch` による「新規作成」
+	 * のため、`bulkRows`/`bulkSummary`/汎用確認パネル（`tag-bulk-confirm-panel`）
+	 * には乗せず、構造体登録②aと同じ「プレビュー→検証(dry-run)→登録」の
+	 * 専用パネル（`tag-bulk-offset-copy-panel`、下記）を別途持つ。
 	 */
-	type BulkAction = 'enable' | 'disable' | 'move' | 'delete' | null;
+	type BulkAction = 'enable' | 'disable' | 'move' | 'delete' | 'offset-copy' | null;
 	let bulkAction: BulkAction = $state(null);
 	/** `bulkAction === 'move'` のときの移動先グループ（`<select>` の値、未選択は `''`）。 */
 	let bulkTargetGroupId = $state('');
@@ -2866,16 +2876,20 @@
 		return value ? '有効' : '無効';
 	}
 
-	function openBulkPanel(action: 'enable' | 'disable' | 'move' | 'delete'): void {
+	function openBulkPanel(action: 'enable' | 'disable' | 'move' | 'delete' | 'offset-copy'): void {
 		bulkAction = action;
 		bulkTargetGroupId = '';
 		bulkResult = null;
+		bulkOffsetWords = '';
+		invalidateBulkOffsetCopyValidation();
 	}
 
 	function closeBulkPanel(): void {
 		bulkAction = null;
 		bulkTargetGroupId = '';
 		bulkResult = null;
+		bulkOffsetWords = '';
+		invalidateBulkOffsetCopyValidation();
 	}
 
 	/**
@@ -2975,6 +2989,124 @@
 			toastStore.push('error', errorMessage(err));
 		} finally {
 			bulkApplying = false;
+		}
+	}
+
+	// --- T20 ②b オフセットコピー (docs/banto-hub-t20-design.md §3.2、
+	// 2026-09-05 オーナー決定「命名ルール」) --------------------------------
+	//
+	// 一括操作バーの追加ボタン。選択済みタグ群を `$lib/banto/offsetCopy.ts`
+	// の純関数でオフセット複製し、構造体登録②aと同じ「プレビュー→
+	// 検証(dry-run)→登録」の2段階フローで `createTagsBatch` へ渡す。
+	// `bulkRows`/`bulkResult`（enable/disable/move/delete が使う
+	// `updateTagsBatch`/`deleteTagsBatch` 用の状態）とは独立した専用の状態を持つ
+	// - 更新ではなく新規作成のため形が異なる（構造体登録②aの
+	// `structForm`/`structValidationResult` 系と同じ役割）。
+
+	/** オフセット（ワード数）の生フォーム入力。TAG-P0-1 と同じ理由で
+	 * number input 由来のため `string | number | null`。 */
+	let bulkOffsetWords: string | number | null = $state('');
+
+	/** 入力が変わるたびに再計算される割付＋衝突検出結果（`selectedTags` を
+	 * source、`tags`（全件）を既存タグ一覧として渡す）。オフセット未入力の
+	 * 間は `null`（プレビューを出さない - 連続登録/構造体登録と同じ
+	 * 「静かに空のまま」方針）。 */
+	const bulkOffsetCopyResult = $derived.by((): OffsetCopyResult | null => {
+		if (bulkAction !== 'offset-copy') return null;
+		const offset = parseOptionalNumber(bulkOffsetWords);
+		if (offset === undefined) return null;
+		return buildOffsetCopyRows(selectedTags, offset, tags);
+	});
+
+	/**
+	 * コードレビュー指摘対応（2026-09-05）: 仕様は「正の整数のみ」
+	 * （`<input min="1">` は表示上のヒントに過ぎず、JS 実行時の入力を
+	 * 弾かない - `offsetCopy.ts::buildOffsetCopyRows` が同じ条件で入口
+	 * 検証を行い `bulkOffsetCopyResult.errors` を返すが、UI 側でも同じ
+	 * 条件を持たせて検証/実行ボタンを無効化し、`title` で理由を示す
+	 * - 「無反応のまま」にしない）。
+	 */
+	const bulkOffsetIsPositiveInteger = $derived.by((): boolean => {
+		const offset = parseOptionalNumber(bulkOffsetWords);
+		return offset !== undefined && Number.isInteger(offset) && offset >= 1;
+	});
+
+	const BULK_OFFSET_INVALID_REASON = 'オフセットは1以上の整数で指定してください';
+
+	/** `createTagsBatch` に渡せる形。衝突が1件でもあれば `null`（実装指示
+	 * 「衝突が1件でもあれば実行を無効化」）。 */
+	const bulkOffsetCopyTagInputs = $derived(
+		bulkOffsetCopyResult && bulkOffsetCopyResult.errors.length === 0
+			? offsetCopyRowsToTagInputs(bulkOffsetCopyResult.rows)
+			: null
+	);
+
+	const bulkOffsetCopyTagsJson = $derived(
+		bulkOffsetCopyTagInputs ? JSON.stringify(bulkOffsetCopyTagInputs) : null
+	);
+
+	// dry-run 検証の鮮度管理は構造体登録②a（`structValidatedFresh`）と同じ方式。
+	let bulkOffsetCopyValidatedTagsJson = $state<string | null>(null);
+	let bulkOffsetCopyValidationResult = $state<BatchTagsResult | null>(null);
+	let bulkOffsetCopyValidating = $state(false);
+	let bulkOffsetCopyApplying = $state(false);
+
+	const bulkOffsetCopyValidatedFresh = $derived(
+		bulkOffsetCopyTagsJson !== null && bulkOffsetCopyTagsJson === bulkOffsetCopyValidatedTagsJson
+			? bulkOffsetCopyValidationResult?.ok === true
+			: false
+	);
+
+	function invalidateBulkOffsetCopyValidation(): void {
+		bulkOffsetCopyValidatedTagsJson = null;
+		bulkOffsetCopyValidationResult = null;
+	}
+
+	async function handleValidateBulkOffsetCopy(): Promise<void> {
+		if (!bulkOffsetCopyTagInputs) return;
+		bulkOffsetCopyValidating = true;
+		try {
+			const result = await createTagsBatch(bulkOffsetCopyTagInputs, true);
+			bulkOffsetCopyValidationResult = result;
+			bulkOffsetCopyValidatedTagsJson = bulkOffsetCopyTagsJson;
+			if (result.ok) {
+				toastStore.push('success', `オフセットコピーの検証OK: ${result.count}件登録できます`);
+			} else {
+				toastStore.push('error', 'エラーがあります。下の一覧を確認してください。');
+			}
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			bulkOffsetCopyValidating = false;
+		}
+	}
+
+	/**
+	 * 「この内容でコピー」。成功で選択解除・パネルを閉じる・一覧 reload()・
+	 * 件数付き成功トースト（構造体登録②aと同じ実装指示）。文言は既存トースト
+	 * と部分文字列が被らないもの（PR #135 の教訓）。
+	 */
+	async function handleApplyBulkOffsetCopy(): Promise<void> {
+		if (!bulkOffsetCopyTagInputs || !bulkOffsetCopyValidatedFresh) return;
+		bulkOffsetCopyApplying = true;
+		try {
+			const result = await createTagsBatch(bulkOffsetCopyTagInputs, false);
+			bulkOffsetCopyValidationResult = result;
+			if (result.ok) {
+				toastStore.push('success', `オフセットコピーで${result.count}件のタグを複製しました`);
+				monitorCtaHref = monitorHref({
+					groupId: soleGroupId(selectedTags.map((t) => t.collectionGroupId))
+				});
+				selectedIds = new Set();
+				closeBulkPanel();
+				await reload();
+			} else {
+				toastStore.push('error', '一部の行でエラーがあります。下の一覧を確認してください。');
+			}
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			bulkOffsetCopyApplying = false;
 		}
 	}
 
@@ -4114,6 +4246,12 @@
 							>
 							<button
 								type="button"
+								class="secondary"
+								data-testid="tag-bulk-offset-copy-open"
+								onclick={() => openBulkPanel('offset-copy')}>オフセットコピー</button
+							>
+							<button
+								type="button"
 								class="danger"
 								data-testid="tag-bulk-delete-open"
 								onclick={() => openBulkPanel('delete')}>一括で削除</button
@@ -4126,7 +4264,7 @@
 							>
 						</div>
 					{/if}
-					{#if canWrite && bulkAction !== null}
+					{#if canWrite && bulkAction !== null && bulkAction !== 'offset-copy'}
 						{@const actionLabel =
 							bulkAction === 'enable'
 								? '選択タグを一括で有効化'
@@ -4206,6 +4344,120 @@
 									disabled={bulkApplying}>キャンセル</button
 								>
 							</div>
+						</div>
+					{/if}
+					{#if canWrite && bulkAction === 'offset-copy'}
+						<!-- T20 ②b（docs/banto-hub-t20-design.md §3.2）: enable/disable/move/
+							delete の確認パネル（`tag-bulk-confirm-panel`、上記）とは別立ての
+							専用パネル - こちらは「更新」ではなく `createTagsBatch` による
+							「新規作成」で、構造体登録②a（`struct-reg-*`）と同じ
+							「プレビュー→検証(dry-run)→登録」の2段階フローを持つため。 -->
+						<div class="confirm-panel" data-testid="tag-bulk-offset-copy-panel">
+							<p class="confirm-title">選択タグをオフセットコピー</p>
+							<label class="field">
+								オフセット（ワード数）
+								<input
+									type="number"
+									step="1"
+									min="1"
+									bind:value={bulkOffsetWords}
+									placeholder="100"
+									data-testid="tag-bulk-offset-copy-words"
+								/>
+								<span class="hint"
+									>正の整数を指定してください（例: 100 → D3000 起点のタグ群を D3100 起点へ複製）。</span
+								>
+							</label>
+
+							{#if bulkOffsetCopyResult}
+								<h4>プレビュー（{bulkOffsetCopyResult.rows.length}件）</h4>
+								<div class="preview-wrap">
+									<table class="preview-table" data-testid="tag-bulk-offset-copy-preview-table">
+										<thead>
+											<tr>
+												<th>#</th>
+												<th>元の名前</th>
+												<th>元のアドレス</th>
+												<th>コピー先名前</th>
+												<th>コピー先アドレス</th>
+											</tr>
+										</thead>
+										<tbody>
+											{#each bulkOffsetCopyResult.rows.slice(0, PREVIEW_DISPLAY_LIMIT) as row, i (row.sourceId)}
+												<tr
+													class={bulkOffsetCopyResult.errors.some(
+														(e) => e.sourceId === row.sourceId
+													)
+														? 'struct-row-collision'
+														: ''}
+												>
+													<td>{i + 1}</td>
+													<td>{row.sourceName}</td>
+													<td>{row.sourceAddress}</td>
+													<td>{row.name}</td>
+													<td>{row.address}</td>
+												</tr>
+											{/each}
+										</tbody>
+									</table>
+								</div>
+								{@render previewLimitNote(bulkOffsetCopyResult.rows.length)}
+
+								{#if bulkOffsetCopyResult.errors.length > 0}
+									<div class="struct-collisions" data-testid="tag-bulk-offset-copy-errors">
+										<p class="err">
+											算出できないアドレス、または名前/アドレスが重複しているタグがあります。修正してください。
+										</p>
+										<ul>
+											{#each bulkOffsetCopyResult.errors as e, i (i)}
+												<li>{e.sourceName}（{e.sourceAddress}）: {e.message}</li>
+											{/each}
+										</ul>
+									</div>
+								{/if}
+							{/if}
+
+							{#if bulkOffsetCopyValidationResult}
+								{@render batchRowErrors(bulkOffsetCopyValidationResult)}
+							{/if}
+
+							<div class="actions">
+								<button
+									type="button"
+									data-testid="tag-bulk-offset-copy-validate"
+									onclick={handleValidateBulkOffsetCopy}
+									disabled={bulkOffsetCopyApplying ||
+										bulkOffsetCopyValidating ||
+										!bulkOffsetIsPositiveInteger ||
+										!bulkOffsetCopyTagInputs}
+									title={bulkOffsetIsPositiveInteger ? undefined : BULK_OFFSET_INVALID_REASON}
+								>
+									検証
+								</button>
+								<button
+									type="button"
+									data-testid="tag-bulk-offset-copy-apply"
+									onclick={handleApplyBulkOffsetCopy}
+									disabled={bulkOffsetCopyApplying ||
+										!bulkOffsetIsPositiveInteger ||
+										!bulkOffsetCopyValidatedFresh}
+									title={bulkOffsetIsPositiveInteger ? undefined : BULK_OFFSET_INVALID_REASON}
+								>
+									この内容でコピー
+								</button>
+								<button
+									type="button"
+									class="secondary"
+									data-testid="tag-bulk-offset-copy-cancel"
+									onclick={closeBulkPanel}
+									disabled={bulkOffsetCopyApplying}>キャンセル</button
+								>
+							</div>
+							{#if bulkOffsetCopyTagInputs && !bulkOffsetCopyValidatedFresh}
+								<span class="hint"
+									>先に「検証」を実行してください（内容を変更すると再検証が必要）。</span
+								>
+							{/if}
 						</div>
 					{/if}
 					{#if monitorCtaHref}
