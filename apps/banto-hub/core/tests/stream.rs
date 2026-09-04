@@ -424,6 +424,59 @@ async fn assert_no_more_data_for(ws: &mut WsStream, id: i64) {
     .expect("timed out waiting for pong");
 }
 
+/// #244: 「スコープ外タグの値変更後、そのタグを含む data が来ないこと」を
+/// 検証する専用ヘルパー。`assert_no_more_data_for` は「その id への data が
+/// 一切来ない」ことを要求するため、スコープ内タグの spurious な on_change
+/// 再送（品質のみの再送や旧値の再送。テスト10/11 のコメント、PR #139 参照）
+/// を拾って誤って失敗する（#244 のフレーク本体）。真に検証すべきは
+/// 「スコープ外タグ(`forbidden_tag`)を含む値が漏れて届かないこと」であって
+/// 「一切何も届かないこと」ではないため、スコープ内タグの再送は drain して
+/// 読み飛ばし、`forbidden_tag` の出現だけを失敗条件にする。
+///
+/// ping を送り、`id` 一致の `pong` が来るまで受信ループする。`op == "data"`
+/// かつ `id` 一致のメッセージが来た場合、その `values[].tag` に
+/// `forbidden_tag` が含まれていればスコープ漏れ＝本物のバグとして即座に
+/// panic する。含まれていなければスコープ内タグの spurious 再送と見なして
+/// drain し、受信を継続する。全体で5秒のタイムアウト（pong すら来ない＝
+/// スタック）で panic する。
+async fn assert_no_data_carrying_tag(ws: &mut WsStream, id: i64, forbidden_tag: &str) {
+    send_json(ws, json!({ "op": "ping" })).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(WsMessage::Text(text))) => {
+                    let value: Value =
+                        serde_json::from_str(&text).expect("server should send valid JSON");
+                    if value["op"] == "data" && value["id"] == id {
+                        let leaked = value["values"]
+                            .as_array()
+                            .map(|values| values.iter().any(|v| v["tag"] == forbidden_tag))
+                            .unwrap_or(false);
+                        if leaked {
+                            panic!(
+                                "scope leak: id {id} received data carrying forbidden tag \
+                                 {forbidden_tag}: {value}"
+                            );
+                        }
+                        // スコープ内タグの spurious な再送。読み飛ばして継続する。
+                        continue;
+                    }
+                    if value["op"] == "pong" {
+                        return;
+                    }
+                    // event/config_changed/別 id の data はそのまま読み飛ばす。
+                }
+                Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => continue,
+                Some(Ok(other)) => panic!("unexpected non-text ws message: {other:?}"),
+                Some(Err(err)) => panic!("ws error: {err}"),
+                None => panic!("connection closed while waiting for pong"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for pong");
+}
+
 // ---------------------------------------------------------------------------
 // 1. subscribe(具体名) → 初期スナップショット → 値変更 → on_change data
 // ---------------------------------------------------------------------------
@@ -1290,10 +1343,14 @@ async fn wildcard_subscription_with_per_tag_read_scope_only_receives_in_scope_ta
     );
     assert_eq!(values[0]["tag"], "line1.fast.temp01");
 
-    // スコープ外(line2.slow.press01)の値変更は届かない。
+    // スコープ外(line2.slow.press01)の値変更は届かない。#244: スコープ内
+    // タグの spurious な on_change 再送を拾って誤って落ちないよう、
+    // 「スコープ外タグを含むデータが来ないこと」だけを検証する
+    // `assert_no_data_carrying_tag` を使う（`assert_no_more_data_for` は
+    // 「一切 data が来ないこと」を要求してしまうため使わない）。
     sim.set_holding_register(1, 99);
     tokio::time::sleep(Duration::from_millis(400)).await; // give the eval loop a chance to (wrongly) fire
-    assert_no_more_data_for(&mut ws, 1).await;
+    assert_no_data_carrying_tag(&mut ws, 1, "line2.slow.press01").await;
 
     // スコープ内(line1.fast.temp01)の値変更は引き続き届く。旧値(1)を載せた
     // spurious な quality-only on_change バッチが先に届きうるレース(H7 ⑤ -
@@ -1435,10 +1492,14 @@ async fn group_wildcard_subscription_only_receives_its_own_group_tag() {
     );
     assert_eq!(values[0]["tag"], "line1.fast.temp01");
 
-    // 別グループ(line2.slow.press01)の値変更は届かない。
+    // 別グループ(line2.slow.press01)の値変更は届かない。#244: スコープ内
+    // タグの spurious な on_change 再送を拾って誤って落ちないよう、
+    // 「スコープ外タグを含むデータが来ないこと」だけを検証する
+    // `assert_no_data_carrying_tag` を使う（`assert_no_more_data_for` は
+    // 「一切 data が来ないこと」を要求してしまうため使わない）。
     sim.set_holding_register(1, 99);
     tokio::time::sleep(Duration::from_millis(400)).await; // give the eval loop a chance to (wrongly) fire
-    assert_no_more_data_for(&mut ws, 1).await;
+    assert_no_data_carrying_tag(&mut ws, 1, "line2.slow.press01").await;
 
     // 自グループ(line1.fast.temp01)の値変更は引き続き届く。旧値(1)を載せた
     // spurious な quality-only on_change バッチが先に届きうるレース(テスト10
