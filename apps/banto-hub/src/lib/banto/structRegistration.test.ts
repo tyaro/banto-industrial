@@ -63,6 +63,13 @@ describe('allocateStructFields: ワード累積の自動割付', () => {
 		if (!result.ok) expect(result.error).toMatch(/文字列長/);
 	});
 
+	it('string 型で文字列長が小数（1.5）はエラー', () => {
+		const fields: StructField[] = [{ name: 'name', dataType: 'string', stringLength: 1.5 }];
+		const result = allocateStructFields('D3000', fields);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.error).toMatch(/文字列長/);
+	});
+
 	it('bit フィールドは1ワード占有として素直に割り付けられる（重ならない）', () => {
 		const fields: StructField[] = [
 			{ name: 'flag1', dataType: 'bit' },

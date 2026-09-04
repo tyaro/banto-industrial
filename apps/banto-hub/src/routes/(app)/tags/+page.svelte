@@ -2232,6 +2232,11 @@
 	// に切り出してあり、ここはフォーム状態と `createTagsBatch` への配線のみ。
 
 	interface StructFieldFormRow {
+		/** `{#each structForm.fields as field (field.id)}` のキー専用の不変
+		 * 値（表示・送信データには使わない）。行削除で配列の途中が抜けても
+		 * 他の行の id は変わらないため、Svelte が行を再利用せず、入力中の
+		 * カーソル位置・IME 変換状態が別の行に化けない（レビュー指摘②）。 */
+		id: number;
 		name: string;
 		dataType: TagDataType;
 		/** `dataType === 'string'` のときのみ使う（number input 由来）。 */
@@ -2240,8 +2245,21 @@
 		address: string;
 	}
 
-	function blankStructFieldRow(): StructFieldFormRow {
-		return { name: '', dataType: 'i16', stringLength: '', address: '' };
+	/**
+	 * 新規行発行用のカウンタ。`id: 0` は「まっさらな1行」専用の固定値として
+	 * 予約し、通し番号は 1 から使う（`addStructField` 参照）。
+	 *
+	 * 固定値にしているのは、`blankStructForm()` が `structForm`/
+	 * `structBaseline` それぞれで独立に呼ばれる（`openStructDrawer` や
+	 * 登録成功後のリセット）ため - もし毎回カウンタで採番すると、中身が
+	 * 空で見た目上まったく同じ1行でも id だけが食い違い、`isFormDirty`
+	 * （JSON.stringify 比較）が「開いた直後なのに変更あり」と誤判定して
+	 * しまう（`isDrawerDirty`/`confirmDiscardIfNeeded` 参照）。
+	 */
+	let nextStructFieldRowId = 1;
+
+	function blankStructFieldRow(id: number = 0): StructFieldFormRow {
+		return { id, name: '', dataType: 'i16', stringLength: '', address: '' };
 	}
 
 	interface StructFormState {
@@ -2270,7 +2288,7 @@
 	let structBaseline: StructFormState = blankStructForm();
 
 	function addStructField(): void {
-		structForm.fields.push(blankStructFieldRow());
+		structForm.fields.push(blankStructFieldRow(nextStructFieldRowId++));
 	}
 
 	/** 最低1行は残す — 0行だと `allocateStructFields`/`manualStructRows` が
@@ -4850,7 +4868,7 @@
 
 			<h4>フィールド</h4>
 			<div class="struct-fields" data-testid="struct-reg-fields">
-				{#each structForm.fields as field, i (i)}
+				{#each structForm.fields as field, i (field.id)}
 					<div class="struct-field-row" data-testid={`struct-reg-field-row-${i}`}>
 						<label class="field">
 							フィールド名
@@ -4971,7 +4989,8 @@
 						type="button"
 						data-testid="struct-reg-validate"
 						onclick={handleValidateStruct}
-						disabled={isDrawerBusy() || structCollisions.length > 0}
+						disabled={isDrawerBusy() || structCollisions.length > 0 || !structTagInputs}
+						title={!structTagInputs ? '割付エラーを解消してから検証してください' : undefined}
 					>
 						検証
 					</button>

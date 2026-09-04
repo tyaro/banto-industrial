@@ -51,8 +51,11 @@ function validateCommonFieldShape(fields: StructField[], index: number): string 
 	if (field.name.trim() === '') {
 		return `${index + 1}行目のフィールド名を入力してください。`;
 	}
-	if (field.dataType === 'string' && (!field.stringLength || field.stringLength < 1)) {
-		return `${index + 1}行目（${field.name}）: string 型では文字列長の指定が必要です。`;
+	if (
+		field.dataType === 'string' &&
+		(!field.stringLength || field.stringLength < 1 || !Number.isInteger(field.stringLength))
+	) {
+		return `${index + 1}行目（${field.name}）: string 型では文字列長を1以上の整数で指定してください。`;
 	}
 	return null;
 }
