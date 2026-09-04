@@ -393,7 +393,7 @@ async fn initialize_returns_tool_capabilities() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tools_list_returns_the_four_tools() {
+async fn tools_list_returns_the_five_tools() {
     let app = test_app("tools-list").await;
     let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
 
@@ -408,6 +408,7 @@ async fn tools_list_returns_the_four_tools() {
             "get_server_status",
             "list_tags",
             "read_tag_values",
+            "write_recipe",
             "write_tag_value",
         ]
     );
@@ -816,4 +817,295 @@ async fn get_server_status_reports_locked_down() {
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     let status: Value = serde_json::from_str(text).unwrap();
     assert_eq!(status["lockedDown"], true);
+}
+
+// ---------------------------------------------------------------------------
+// 8. write_recipe (T20 機能③b、レシピ一括書き込み): `write_tag_value`と同じ
+//    安全ポリシー(ロックダウン連動・per-tag write スコープ)を
+//    `crate::write_path::execute_write_batch`への委譲だけで満たすことを
+//    確認する。
+// ---------------------------------------------------------------------------
+
+/// `write.rs`/`t20_batch_write.rs`と同じ `make_tag` は接続ごと新規に作るため、
+/// レシピテストで「同じグループにもう1本タグが要る」場合はこのヘルパーで
+/// 直接 `TagService` から足す(`per_tag_read_scope_filters_...`と同型)。
+async fn add_tag_to_first_group(
+    app: &TestApp,
+    conn_name: &str,
+    tag_name: &str,
+    address: &str,
+    data_type: &str,
+    writable: bool,
+) -> String {
+    let group_id = CollectionGroupService::new(app.pool.clone())
+        .list(ListParams::default())
+        .await
+        .unwrap()
+        .rows[0]
+        .id;
+    let tag = TagService::new(app.pool.clone())
+        .create(tag_input(
+            tag_name, group_id, address, data_type, writable, true,
+        ))
+        .await
+        .unwrap();
+    app.manager.rebuild().await.expect("rebuild");
+    format!("{conn_name}.fast.{}", tag.name)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_recipe_before_lockdown_writes_multiple_tags_through_execute_write_batch() {
+    let app = test_app("recipe-success").await;
+    let sim = Simulator::start().await;
+    let (_tag_a, name_a) = make_tag(
+        &app,
+        "line1",
+        sim.addr.port(),
+        "a",
+        "D100",
+        "u16",
+        true,
+        true,
+    )
+    .await;
+    let name_b = add_tag_to_first_group(&app, "line1", "b", "D101", "u16", true).await;
+
+    app.write_control.enable();
+    let key = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &[&format!("write:{name_a}"), &format!("write:{name_b}")],
+    )
+    .await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call(
+            "write_recipe",
+            json!({ "writes": [
+                { "tag": name_a, "value": 111 },
+                { "tag": name_b, "value": 222 },
+            ] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["applied"], 2, "{payload:?}");
+    let writes = payload["writes"].as_array().unwrap();
+    assert_eq!(writes.len(), 2);
+    assert_eq!(writes[0]["tag"], name_a);
+    assert_eq!(writes[0]["ok"], true);
+    assert_eq!(writes[1]["tag"], name_b);
+    assert_eq!(writes[1]["ok"], true);
+
+    assert_eq!(
+        sim.get_word(SlmpDevice::D, 100),
+        111,
+        "MCP write_recipe must go through execute_write_batch and land on the wire"
+    );
+    assert_eq!(sim.get_word(SlmpDevice::D, 101), 222);
+
+    sim.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_recipe_after_lockdown_is_advisory_only_and_never_calls_execute_write_batch() {
+    let app = test_app("recipe-lockdown").await;
+    let sim = Simulator::start().await;
+    let (_tag_id, external_name) = make_tag(
+        &app,
+        "line1",
+        sim.addr.port(),
+        "temp01",
+        "D100",
+        "u16",
+        true,
+        true,
+    )
+    .await;
+    app.write_control.enable();
+    let key = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:line1.fast.temp01"],
+    )
+    .await;
+
+    app.commissioning
+        .lock_down()
+        .await
+        .expect("lock_down (an admin account already exists)");
+    assert!(app.commissioning.is_locked_down());
+
+    let audit_rows_before = write_audit_row_count(&app).await;
+    let wire_value_before = sim.get_word(SlmpDevice::D, 100);
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call(
+            "write_recipe",
+            json!({ "writes": [ { "tag": external_name, "value": 9999 } ] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(
+        body["result"]["isError"], true,
+        "locked-down write_recipe must be an advisory (isError), never a real write: {body:?}"
+    );
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("ロックダウン"), "{text}");
+    assert!(text.contains(&external_name), "{text}");
+    assert!(text.contains("9999"), "{text}");
+
+    // 決定的な証拠: `execute_write_batch`(gate 8)を呼んでいれば必ず
+    // write_audit 行が増える(log-before-write)。増えていない = 呼んでいない。
+    assert_eq!(
+        write_audit_row_count(&app).await,
+        audit_rows_before,
+        "execute_write_batch must not run once locked down (no new write_audit row)"
+    );
+    // 決定的な証拠その2: 実機(シミュレータ)の値も変化しない。
+    assert_eq!(
+        sim.get_word(SlmpDevice::D, 100),
+        wire_value_before,
+        "the simulated PLC register must be untouched once locked down"
+    );
+
+    sim.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_recipe_missing_scope_on_one_entry_rejects_the_whole_batch() {
+    let app = test_app("recipe-missing-scope").await;
+    let sim = Simulator::start().await;
+    let (_tag_a, name_a) = make_tag(
+        &app,
+        "line1",
+        sim.addr.port(),
+        "a",
+        "D100",
+        "u16",
+        true,
+        true,
+    )
+    .await;
+    let name_b = add_tag_to_first_group(&app, "line1", "b", "D101", "u16", true).await;
+
+    app.write_control.enable();
+    // キーは a にしか write スコープを持たない - b が事前段で足切りされる
+    // ことを確認する。
+    let key = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &[&format!("write:{name_a}")],
+    )
+    .await;
+
+    let audit_before = write_audit_row_count(&app).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call(
+            "write_recipe",
+            json!({ "writes": [
+                { "tag": name_a, "value": 1 },
+                { "tag": name_b, "value": 2 },
+            ] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("missing_write_scope"), "{text}");
+    assert!(text.contains(&name_b), "{text}");
+
+    assert_eq!(
+        write_audit_row_count(&app).await,
+        audit_before,
+        "execute_write_batch must not run when one entry is missing write scope"
+    );
+    assert_eq!(sim.get_word(SlmpDevice::D, 100), 0, "tag a must not land");
+    assert_eq!(sim.get_word(SlmpDevice::D, 101), 0, "tag b must not land");
+
+    sim.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_recipe_one_bad_entry_aborts_the_whole_batch_with_no_audit_rows_and_no_wire_writes() {
+    let app = test_app("recipe-all-or-nothing").await;
+    let sim = Simulator::start().await;
+    let (_tag_a, name_a) = make_tag(
+        &app,
+        "line1",
+        sim.addr.port(),
+        "a",
+        "D100",
+        "u16",
+        true,
+        true,
+    )
+    .await;
+    // not-writable タグ - gate 2 で NG。
+    let name_bad = add_tag_to_first_group(&app, "line1", "bad", "D101", "u16", false).await;
+
+    app.write_control.enable();
+    let key = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &[&format!("write:{name_a}"), &format!("write:{name_bad}")],
+    )
+    .await;
+
+    let audit_before = write_audit_row_count(&app).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call(
+            "write_recipe",
+            json!({ "writes": [
+                { "tag": name_a, "value": 111 },
+                { "tag": name_bad, "value": 1 },
+            ] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(
+        payload["applied"], 0,
+        "the pre-gate all-or-nothing abort must apply to zero entries: {payload:?}"
+    );
+    let writes = payload["writes"].as_array().unwrap();
+    assert_eq!(writes[0]["tag"], name_a);
+    assert_eq!(writes[0]["ok"], false);
+    assert_eq!(writes[0]["error"], "batch_aborted");
+    assert_eq!(writes[1]["tag"], name_bad);
+    assert_eq!(writes[1]["ok"], false);
+    assert_eq!(writes[1]["error"], "not_writable");
+
+    // 決定的固定: 事前ゲート all-or-nothing により1件も監査 insert されず
+    // (suppressed 系すら発生しない)、シミュレータのレジスタも初期値のまま。
+    assert_eq!(
+        write_audit_row_count(&app).await,
+        audit_before,
+        "no audit row should be inserted when the batch is aborted pre-gate"
+    );
+    assert_eq!(sim.get_word(SlmpDevice::D, 100), 0, "tag a must not land");
+
+    sim.stop();
 }

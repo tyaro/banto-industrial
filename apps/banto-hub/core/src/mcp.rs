@@ -25,25 +25,34 @@
 //! そのまま踏襲）。`parse_requested_value`（REST の `{"v": ...}` 変換と
 //! 同じ関数、`crate::rest`から`pub(crate)`で借りる）も共有する。
 //!
+//! `write_recipe` ツール（T20 機能③b、レシピ一括書き込み）も同じ規律 -
+//! ゲート本体（重複タグ検出・事前ゲート all-or-nothing・レート制限・
+//! commit）を一切再実装せず、`crate::rest::v1_write_values_batch`（REST の
+//! `/api/v1/values/batch`）と全く同じ形で
+//! [`crate::write_path::execute_write_batch`] へ委譲するだけ（[`tool_write_recipe`]
+//! 参照）。
+//!
 //! ## ロックダウン連動の安全ポリシー（オーナー決定 2026-09-04、最重要）
 //!
 //! `crate::commissioning::CommissioningState::is_locked_down()` が唯一の
 //! 分岐点:
 //!
 //! - **ロックダウン前**（試運転モード、`false`）: MCP はフル機能。
-//!   `write_tag_value` は `ctx.has_write_scope(tag)` を検査した後、通常どおり
-//!   `execute_write` を実行する（REST と同じゲート・監査・レート制限）。
-//! - **ロックダウン後**（本番、`true`）: `write_tag_value` は
-//!   **`execute_write` を一切呼ばない**。安全方向にのみ倒し、「何を書き込む
-//!   べきか」を助言する `isError` の `tools/call` 結果だけを返す - 実際の
-//!   操作は人が管理 UI から行う前提（このモジュールの
-//!   [`write_tag_value_advisory`] 参照）。このチェックは write スコープの
-//!   有無より**先**に行う - 助言はロックダウン前から本人が渡した
-//!   `tag`/`value` をそのまま読み上げるだけなので、スコープ不足の API キー
-//!   に見せても新規の情報漏洩にはならない（このモジュールの doc comment
-//!   よりも詳しい理由は [`write_tag_value`] 実装コメント参照）。読み取り系
-//!   3ツールはロックダウンの前後を問わず同じ挙動 - `has_any_read`/
-//!   `can_read_value` によるスコープ判定のみで決まる。
+//!   `write_tag_value`/`write_recipe` は書き込み対象タグそれぞれの
+//!   `ctx.has_write_scope(tag)` を検査した後、通常どおり
+//!   `execute_write`/`execute_write_batch` を実行する（REST と同じゲート・
+//!   監査・レート制限）。
+//! - **ロックダウン後**（本番、`true`）: `write_tag_value`/`write_recipe` は
+//!   **`execute_write`/`execute_write_batch` を一切呼ばない**。安全方向に
+//!   のみ倒し、「何を書き込むべきか」を助言する `isError` の `tools/call`
+//!   結果だけを返す - 実際の操作は人が管理 UI から行う前提（このモジュールの
+//!   [`write_tag_value_advisory`]/[`write_recipe_advisory`] 参照）。この
+//!   チェックは write スコープの有無より**先**に行う - 助言はロックダウン
+//!   前から本人が渡した `tag`/`value` をそのまま読み上げるだけなので、
+//!   スコープ不足の API キーに見せても新規の情報漏洩にはならない（この
+//!   モジュールの doc comment よりも詳しい理由は [`write_tag_value`] 実装
+//!   コメント参照）。読み取り系3ツールはロックダウンの前後を問わず同じ
+//!   挙動 - `has_any_read`/`can_read_value` によるスコープ判定のみで決まる。
 //!
 //! ## 認証（設計 §3.7・実装指示 B）
 //!
@@ -82,7 +91,7 @@ use crate::system_info::SystemInfoSampler;
 use crate::test_output::TestOutputControl;
 use crate::write_audit::WriteAuditService;
 use crate::write_control::WriteControl;
-use crate::write_path::{execute_write, WriteDeps};
+use crate::write_path::{execute_write, execute_write_batch, WriteDeps};
 use crate::write_rate::WriteRateLimiter;
 use banto_server::ServerEvent;
 
@@ -401,6 +410,35 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "write_recipe",
+            "description": "複数タグへ設定値一式(レシピ)を一括書き込みする。ロックダウン後(本番稼働中)は実際には書き込まず、何を書き込むべきかの助言のみを返す - 実行は管理 UI から人が行うこと。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "writes": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "tag": {
+                                    "type": "string",
+                                    "description": "外部名 {connection}.{group}.{tag}",
+                                },
+                                "value": {
+                                    "description": "書き込む工学値。数値タグには数値、bit タグには真偽値。",
+                                },
+                            },
+                            "required": ["tag", "value"],
+                            "additionalProperties": false,
+                        },
+                        "description": "書き込むタグ/値の組のリスト。",
+                    },
+                },
+                "required": ["writes"],
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -421,6 +459,7 @@ async fn handle_tools_call(
         "read_tag_values" => tool_read_tag_values(state, ctx, arguments)?,
         "get_server_status" => tool_get_server_status(state, ctx).await,
         "write_tag_value" => tool_write_tag_value(state, ctx, arguments).await?,
+        "write_recipe" => tool_write_recipe(state, ctx, arguments).await?,
         other => {
             return Err(RpcError::invalid_params(format!("unknown tool: {other}")));
         }
@@ -635,5 +674,124 @@ async fn tool_write_tag_value(
 fn write_tag_value_advisory(tag: &str, value: &Value) -> String {
     format!(
         "本番（ロックダウン済み）では MCP から直接書き込みできません。推奨: タグ `{tag}` に `{value}` を書き込む。実行は管理 UI から人が行ってください。"
+    )
+}
+
+// --- 5. write_recipe (T20 機能③b、レシピ一括書き込み) -----------------------
+
+/// `write_recipe` の1エントリぶんの引数(`{tag, value}`)。`tag`/`value`
+/// のどちらかが欠けている・型が違う要素は個別に`invalid_params`で拒否する -
+/// バッチ全体を「JSON-RPC としては壊れている」ことにはしない([`tool_write_tag_value`]
+/// の単票引数検証と同じ厳格さを配列の各要素へ適用するだけ)。
+async fn tool_write_recipe(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let writes = arguments
+        .get("writes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| RpcError::invalid_params("arguments.writes (array) is required"))?;
+    if writes.is_empty() {
+        return Err(RpcError::invalid_params(
+            "arguments.writes must not be empty",
+        ));
+    }
+
+    let mut parsed: Vec<(String, Value)> = Vec::with_capacity(writes.len());
+    for entry in writes {
+        let tag = entry
+            .get("tag")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::invalid_params("arguments.writes[].tag (string) is required"))?
+            .to_string();
+        let value = entry
+            .get("value")
+            .cloned()
+            .ok_or_else(|| RpcError::invalid_params("arguments.writes[].value is required"))?;
+        parsed.push((tag, value));
+    }
+
+    // ロックダウン連動の安全ポリシー(このモジュールの doc comment・
+    // [`tool_write_tag_value`]と同型・最重要): このチェックはスコープ検査
+    // より**先**に行う - `execute_write_batch`を一切呼ばないという安全側の
+    // 性質は呼び出し元のスコープに関わらず成立させる。助言は呼び出し元が
+    // 渡した`tag`/`value`をそのまま読み上げるだけで、新たな情報を漏らさない。
+    if state.commissioning.is_locked_down() {
+        return Ok(tool_error(write_recipe_advisory(&parsed)));
+    }
+
+    // ロックダウン前: REST の `v1_write_values_batch` と同一の事前段
+    // (`write:{tag}`の完全一致を全エントリぶん検査)。事前ゲート
+    // all-or-nothing の思想を認証にも適用する - 1件でもスコープ不足なら
+    // `execute_write_batch`へは一切進まず、全体を拒否する。
+    let missing_scope: Vec<&str> = parsed
+        .iter()
+        .filter(|(tag, _)| !ctx.has_write_scope(tag))
+        .map(|(tag, _)| tag.as_str())
+        .collect();
+    if !missing_scope.is_empty() {
+        return Ok(tool_error(format!(
+            "missing_write_scope: 次のタグへの write:{{tag}} スコープを持つ API キーが必要です: {}",
+            missing_scope.join(", ")
+        )));
+    }
+
+    let entries: Vec<(String, Option<crate::write_path::RequestedValue>)> = parsed
+        .iter()
+        .map(|(tag, value)| (tag.clone(), parse_requested_value(value)))
+        .collect();
+    let deps = WriteDeps {
+        manager: state.manager.as_ref(),
+        collection_controller: state.collection_controller.as_deref(),
+        api_keys: &state.api_keys,
+        write_audit: &state.write_audit,
+        write_control: state.write_control.as_ref(),
+        rate_limiter: state.rate_limiter.as_ref(),
+        events: &state.events,
+    };
+
+    // §3.7・実装指示「絶対」: ゲート本体(重複タグ検出・事前ゲート
+    // all-or-nothing・write_control・レート限・commit)は一切再実装せず、
+    // REST の `/api/v1/values/batch` と同じこの1関数へそのまま委譲する。
+    let outcomes = execute_write_batch(&deps, ctx, entries).await;
+    // モデルが「バッチ全体として1件も書けなかったのか、一部成功か」を
+    // 一目で判断できるよう、per-entry の配列に加えて成功件数も返す
+    // (REST の `BatchWriteValuesResponse` にはこのフィールドは無いが、MCP
+    // はモデルへの応答なので明示した方が誤読を避けられる)。
+    let applied = outcomes.iter().filter(|o| o.result.is_ok()).count();
+    let writes: Vec<Value> = outcomes
+        .into_iter()
+        .map(|outcome| match outcome.result {
+            Ok(()) => json!({ "tag": outcome.tag, "ok": true }),
+            Err(rejection) => {
+                let mut entry = json!({
+                    "tag": outcome.tag,
+                    "ok": false,
+                    "error": rejection.rest_error_code(),
+                });
+                if let Some(detail) = rejection.detail() {
+                    entry["detail"] = json!(detail);
+                }
+                entry
+            }
+        })
+        .collect();
+
+    Ok(tool_ok(json!({ "writes": writes, "applied": applied })))
+}
+
+/// ロックダウン後の`write_recipe`が返す助言文言 - [`write_tag_value_advisory`]
+/// のバッチ版。呼び出し元が渡した`tag`/`value`をそのまま読み上げるだけで、
+/// 新たな情報は漏らさない(このモジュールの doc comment参照)。
+fn write_recipe_advisory(entries: &[(String, Value)]) -> String {
+    let items: Vec<String> = entries
+        .iter()
+        .map(|(tag, value)| format!("タグ `{tag}` に `{value}` を書き込む"))
+        .collect();
+    format!(
+        "本番（ロックダウン済み）では MCP から直接書き込みできません。推奨レシピ: {}。実行は管理 UI から人が行ってください。",
+        items.join("、")
     )
 }
