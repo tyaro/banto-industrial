@@ -201,3 +201,13 @@ protoc-bin-vendored = "3"
 # （`ReceiverStream`）。tonic 自身が `server`/`transport` feature 経由で
 # 既に木に持っている 0.1 系と同じバージョンを明示する。
 tokio-stream = "0.1"
+# T19 S3-b（docs/banto-hub-t19-design.md §3.9、UX-46 サーバー状態の拡充）:
+# 状態画面（GET /api/status・GET /api/v1/status）に載せる CPU 使用率・
+# メモリ使用量のクロスプラットフォーム取得。`default-features = false` +
+# `system` feature のみを有効にする - CPU/メモリ/プロセス情報だけが必要で、
+# 既定で付いてくる `disk`/`network`/`component`/`user` feature（ディスク・
+# NIC・温度センサー・ユーザー一覧の取得）は使わないため、依存木を無駄に
+# 太らせない。`apps/banto-hub/core` のみが使う（`system_info.rs`）。0.39系は
+# rustc 1.95 を要求しこのワークスペースのツールチェイン(1.94.1)と噛み合わ
+# ないため、rustc 1.88 で足りる 0.38 系に固定する。
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }

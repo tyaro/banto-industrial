@@ -190,6 +190,7 @@ pub mod service_operators;
 pub mod settings;
 pub mod stream;
 pub mod subscribe_core;
+pub mod system_info;
 pub mod test_output;
 #[cfg(test)]
 pub(crate) mod test_support;

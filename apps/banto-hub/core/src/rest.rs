@@ -96,6 +96,7 @@ use crate::hub::{CollectorManager, SimulationCoverageReport, TagEntry, TagMap};
 use crate::mqtt::MqttPublisher;
 use crate::pending_changes::{PendingChange, PendingChangesService};
 use crate::settings::{AuditSettings, MqttSettings, SettingsService, StoreSettings};
+use crate::system_info::{SystemInfoSampler, SystemInfoSnapshot};
 use crate::test_output::TestOutputControl;
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
 use crate::write_audit::{WriteAuditEntry, WriteAuditService};
@@ -5518,6 +5519,14 @@ pub(crate) struct TagSpaceState {
     pub(crate) test_output: Arc<TestOutputControl>,
     /// T3（設計 §5.3）: `GET /api/v1/status` の `mqtt.connected` のため。
     pub(crate) mqtt: Arc<MqttPublisher>,
+    /// T19 S3-b（docs/banto-hub-t19-design.md §3.9、UX-46）: `GET
+    /// /api/v1/status`・`GET /api/status` の `system`（CPU%・メモリ）の
+    /// ため。`admin_status_router`・`admin_tag_stream_router`・
+    /// `tag_space_router`のいずれも[`api_router_with_controller_mode`]が
+    /// 構築した**同じ** `Arc` を受け取る（`mqtt`/`write_control`等と同じ
+    /// 共有規律）- `SystemInfoSampler`のモジュール doc comment が説明する
+    /// 「共有`System`を使い回す」ことの前提。
+    pub(crate) system_info: Arc<SystemInfoSampler>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6071,6 +6080,12 @@ struct StatusResponse {
     /// 成功、または空構成への遷移）は `null`
     /// (`crate::hub::CollectorManager::last_apply` のドキュメント参照)。
     last_apply: Option<LastApplyEntry>,
+    /// T19 S3-b（docs/banto-hub-t19-design.md §3.9、UX-46「サーバー状態の
+    /// 拡充」）: サーバー自身の CPU 使用率・メモリ使用量。
+    /// `crate::system_info::SystemInfoSampler`のモジュール doc comment
+    /// 参照 - プロセス起動直後最初の呼び出しは `cpu_percent` が `0.0`に
+    /// なりうる。
+    system: SystemInfoSnapshot,
 }
 
 /// `GET /api/v1/status`・管理系 `GET /api/status`（2026-08-31 オーナー決定
@@ -6213,6 +6228,7 @@ async fn compute_status(state: &TagSpaceState) -> Result<StatusResponse, ApiErro
             port: grpc_settings.port,
         },
         last_apply: state.manager.last_apply().map(LastApplyEntry::from),
+        system: state.system_info.sample(),
     })
 }
 
@@ -6358,6 +6374,28 @@ impl From<LastApplyEntry> for AdminLastApplyEntry {
     }
 }
 
+/// [`SystemInfoSnapshot`]のcamelCase版（`cpuPercent`・`processMemoryBytes`・
+/// `hostMemoryUsedBytes`・`hostMemoryTotalBytes`）。
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct AdminSystemInfoEntry {
+    cpu_percent: f32,
+    process_memory_bytes: u64,
+    host_memory_used_bytes: u64,
+    host_memory_total_bytes: u64,
+}
+
+impl From<SystemInfoSnapshot> for AdminSystemInfoEntry {
+    fn from(snapshot: SystemInfoSnapshot) -> Self {
+        Self {
+            cpu_percent: snapshot.cpu_percent,
+            process_memory_bytes: snapshot.process_memory_bytes,
+            host_memory_used_bytes: snapshot.host_memory_used_bytes,
+            host_memory_total_bytes: snapshot.host_memory_total_bytes,
+        }
+    }
+}
+
 /// `GET /api/status`の応答 - [`StatusResponse`]（`/api/v1/status`）と
 /// 完全に同じ情報をcamelCaseで運ぶ。`mqtt`/`grpc`は元の型
 /// （`MqttStatusEntry`/`GrpcStatusEntry`）をそのまま再利用する -
@@ -6381,6 +6419,8 @@ struct AdminStatusResponse {
     mqtt: MqttStatusEntry,
     grpc: GrpcStatusEntry,
     last_apply: Option<AdminLastApplyEntry>,
+    /// T19 S3-b（UX-46）: [`SystemInfoSnapshot`]のcamelCase版。
+    system: AdminSystemInfoEntry,
 }
 
 impl From<StatusResponse> for AdminStatusResponse {
@@ -6402,6 +6442,7 @@ impl From<StatusResponse> for AdminStatusResponse {
             mqtt: status.mqtt,
             grpc: status.grpc,
             last_apply: status.last_apply.map(Into::into),
+            system: status.system.into(),
         }
     }
 }
@@ -6580,12 +6621,14 @@ async fn admin_tag_catalog(
 /// [`admin_tag_stream_router`]のdoc comment参照（この Router 全体は最終的に
 /// `require_banto_client_header`(CSRF) レイヤーの内側に組み込まれるが、
 /// ブラウザの`WebSocket`はCSRF用カスタムヘッダを送れないため）。
+#[allow(clippy::too_many_arguments)]
 fn admin_status_router(
     manager: Arc<CollectorManager>,
     controller: Arc<CollectionController>,
     write_control: Arc<WriteControl>,
     test_output: Arc<TestOutputControl>,
     mqtt: Arc<MqttPublisher>,
+    system_info: Arc<SystemInfoSampler>,
     auth: AuthState,
     commissioning: CommissioningState,
 ) -> Router {
@@ -6595,6 +6638,7 @@ fn admin_status_router(
         write_control,
         test_output,
         mqtt,
+        system_info,
     };
     Router::new()
         .route("/api/status", get(admin_status))
@@ -6668,12 +6712,14 @@ const ADMIN_TAG_STREAM_PATH: &str = "/api/tag-stream";
 /// 挙動（`crate::stream::handle_socket`のフィールド doc comment
 /// 「`external = scope.is_some()`」参照）で、管理 UI が今まで手にしていた
 /// アクセス範囲を狭めても広げてもいない。
+#[allow(clippy::too_many_arguments)]
 fn admin_tag_stream_router(
     manager: Arc<CollectorManager>,
     controller: Arc<CollectionController>,
     write_control: Arc<WriteControl>,
     test_output: Arc<TestOutputControl>,
     mqtt: Arc<MqttPublisher>,
+    system_info: Arc<SystemInfoSampler>,
     auth: AuthState,
     commissioning: CommissioningState,
 ) -> Router {
@@ -6683,6 +6729,7 @@ fn admin_tag_stream_router(
         write_control,
         test_output,
         mqtt,
+        system_info,
     };
     Router::new()
         .route(ADMIN_TAG_STREAM_PATH, get(crate::stream::ws_upgrade))
@@ -7273,6 +7320,11 @@ fn tag_space_router(
     // `controller`が保持するものと**同じ** `Arc`（呼び出し元の責務、
     // `test_output_router`のそれと同じ規律）。
     test_output: Arc<TestOutputControl>,
+    // T19 S3-b（docs/banto-hub-t19-design.md §3.9、UX-46）: `GET
+    // /api/v1/status` の `system` のため - `admin_status_router`/
+    // `admin_tag_stream_router`へ渡すものと**同じ** `Arc`（上記
+    // `mqtt`/`write_control`/`test_output`と同じ共有規律）。
+    system_info: Arc<SystemInfoSampler>,
 ) -> Router {
     let state = TagSpaceState {
         manager: manager.clone(),
@@ -7280,6 +7332,7 @@ fn tag_space_router(
         write_control: write_control.clone(),
         test_output,
         mqtt,
+        system_info,
     };
     let auth_state = TagSpaceAuthState {
         auth: auth.clone(),
@@ -7523,6 +7576,12 @@ fn api_router_with_controller_mode(
     profile_id: String,
 ) -> Router {
     let commissioning_state = commissioning.state();
+    // T19 S3-b（docs/banto-hub-t19-design.md §3.9、UX-46）: 1プロセスにつき
+    // 1個だけ構築し、`admin_status_router`・`admin_tag_stream_router`・
+    // `tag_space_router`の3者へ同じ `Arc` を配る - `mqtt`/`write_control`
+    // 等、このファイルの他の共有状態と同じ規律（`SystemInfoSampler`の
+    // モジュール doc comment「共有 System を使い回す」の前提そのもの）。
+    let system_info = Arc::new(SystemInfoSampler::new());
 
     let audited_auth_routes = auth_routes(auth.clone()).layer(middleware::from_fn_with_state(
         LogoutAuditState {
@@ -7649,16 +7708,18 @@ fn api_router_with_controller_mode(
         // `/api/v1/status`・`/api/v1/values`・`/api/v1/tags`と同じ情報を
         // 管理系（試運転モードのバイパスが効く側）から読めるようにする。
         // `admin_status_router`のdoc comment参照。ここで渡す
-        // `manager`/`controller`/`write_control`/`test_output`/`mqtt`の各
-        // `Arc`は、下の`tag_space_router`/`admin_tag_stream_router`へ渡す
-        // ものと**同じ**インスタンスの`clone()` - 別インスタンスを作ると
-        // 状態が分裂する（このファイルの他の`Arc`共有規律と同じ）。
+        // `manager`/`controller`/`write_control`/`test_output`/`mqtt`/
+        // `system_info`の各`Arc`は、下の`tag_space_router`/
+        // `admin_tag_stream_router`へ渡すものと**同じ**インスタンスの
+        // `clone()` - 別インスタンスを作ると状態が分裂する（このファイルの
+        // 他の`Arc`共有規律と同じ）。
         .merge(admin_status_router(
             manager.clone(),
             controller.clone(),
             write_control.clone(),
             test_output.clone(),
             mqtt.clone(),
+            system_info.clone(),
             auth.clone(),
             commissioning_state.clone(),
         ))
@@ -7676,6 +7737,7 @@ fn api_router_with_controller_mode(
             write_control.clone(),
             test_output.clone(),
             mqtt.clone(),
+            system_info.clone(),
             auth.clone(),
             commissioning_state,
         ))
@@ -7692,6 +7754,7 @@ fn api_router_with_controller_mode(
             rate_limiter,
             !legacy_live_reconfigure,
             test_output,
+            system_info,
         ))
         .merge(openapi_router(profile_id))
 }
