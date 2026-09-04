@@ -1,0 +1,182 @@
+# banto-hub T20 設計: 文字列・構造体登録・レシピ・ビットデバイス
+
+作成日: 2026-09-04
+状態: **計画（未着手）。オーナー方針は §2 で確定済み。着手前に §3 の未決点（③の原子性・トランスポート、①の文字列値表現）を詰める。**
+対象: 4つの新機能（①文字列 read/write、②構造体タグ登録＋オフセットコピー、③レシピ一括書き込み、④ワードデバイスのビット `.0〜.F`）
+
+関連: [tag-server-design.md](tag-server-design.md)（タグ空間・書き込み安全の一次ソース）、[banto-hub-t19-design.md](banto-hub-t19-design.md)（直前の UI/UX 群）、[banto-tagclient-design.md](banto-tagclient-design.md) §4.4（③が覆す旧決定）。
+
+---
+
+## 1. 背景と狙い
+
+T19 で UI/UX を整えた後、オーナーから4つの機能追加要望が出た（2026-09-04）。産業用途で
+「設定値一式をまとめて流す（レシピ）」「文字列（品名・ロット等）を読み書きする」「PLC の
+ワードデバイスのビットを個別に操作する」「構造体的なタグ群を素早く登録する」実需要に応える。
+
+**重要な前提（調査で確定、2026-09-04）**: ①と③は**ドライバ層（`banto-plc` / `banto-plc-write` /
+`banto-broker`）が既に下地を持っている**。①③④の難所は主に **hub のパイプライン（収集キャッシュ・
+REST/MCP の値 DTO・書き込み経路）**の側にある。
+
+## 2. オーナー決定（2026-09-04）
+
+| 項目 | 決定                                                                                                                                              |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ①    | 文字列 read/write を実装。**文字コードは既定 UTF-8、タグ単位で Shift-JIS も選択可**                                                               |
+| ②    | 構造体タグ登録を実装。**テンプレートの永続保存は不要**だが、**オフセットコピーは有用**                                                            |
+| ③    | レシピ一括書き込みを実装。**[banto-tagclient-design.md](banto-tagclient-design.md) §4.4「実装しない」決定（2026-09-01）を覆す**（需要が出たため） |
+| ④    | ワードデバイスのビットを **16進 `.0〜.F`** で指定可能にする                                                                                       |
+
+## 3. 各機能の現状と設計
+
+### 3.1 ①文字列 read/write
+
+**現状（調査済み）**:
+
+- **ドライバ層は対応済み**: `banto-plc` に `PlcValue::Str(String)` と `StringReadRequest`、
+  `banto-plc-write` に `StringWriteRequest`（`words`・`value: String`、Shift-JIS bytes + 0x00
+  パディング、registry 上限 128 words / wire 上限 960）がある。registry も `data_type = 'string'`
+  ＋ `string_length` を許可。
+- **hub パイプラインは未対応**: 収集キャッシュ `banto_collect::current::Sample.value` は
+  **`Option<f64>`**。`PlcValue::Str` は f64 変換で `None` に落ちる（`banto-plc` の
+  `PlcValue::Str(_) => None`）。REST/MCP の値 DTO も数値前提（`{ v: f64 }`）。書き込み側は
+  `write_path::RequestedValue` が **`Num`/`Bool` のみ**で String variant が無く、
+  `parse_requested_value` も文字列を扱わない。
+
+**つまり文字列は hub レベルでは read も write も通っていない。** 難所はドライバではなく hub の
+値表現。
+
+**設計**:
+
+- **値表現**: 収集キャッシュと値 DTO を「数値または文字列」を運べる形に拡張する。素直な案は
+  `Sample` の値を `f64` から `enum SampleValue { Num(f64), Str(String), Bit(bool)… }` 相当へ
+  広げる（`Copy` を失うため影響範囲を確認）。あるいは**文字列タグ専用の別キャッシュ**を持ち、
+  数値パイプラインは f64 のまま温存する（影響を局所化できるが二重管理になる）。
+  **未決（§3 の詰め対象）**: どちらを採るか。
+- **read**: 収集タスクが `PlcValue::Str` を上記の値表現に載せ、REST `GET /api/v1/values/*` と
+  MCP `read_tag_values` が文字列値を返せるようにする。
+- **write**: `RequestedValue::Str(String)` を追加し、gate 8 の型対称性（string タグ ↔ string 値）を
+  拡張。`parse_requested_value` が JSON 文字列を受ける。`execute_write` は string タグに対して
+  `banto-plc-write` の `StringWriteRequest`（＝`BatchWriteRequest::String`）を組み立ててブローカーへ
+  渡す（既存経路に載る）。
+- **文字コード**: **既定 UTF-8、タグ単位で Shift-JIS を選択可**。registry に**タグ単位のエンコーディング
+  設定（新カラム、例 `string_encoding TEXT DEFAULT 'utf8' CHECK IN ('utf8','shift_jis')`）**を足す。
+  現行ドライバは Shift-JIS 固定なので、UTF-8 対応と選択の配線が要る。
+  **注意**: 上流 `banto-plc-write` の Shift-JIS 固定を UTF-8 選択可へ広げる必要がある。共有クレートの
+  変更になるので relay-wright への影響（文字列書き込みを使っていないか）を確認する。
+
+**スライス感**: 中〜大。値表現の拡張が要になるため、read パイプライン → write → エンコーディング選択、と
+段階を分ける。
+
+### 3.2 ②構造体タグ登録（デバイス自動割付・手動割付・オフセットコピー）
+
+**現状**: 一括作成 API（`POST /api/tags/batch`）と、フロントの `continuousRegistration.ts`
+（`buildContinuousParams`/`generateContinuousTags`、アドレスの算術で連番タグを生成）がある。
+構造体という概念・自動割付ロジックは無い。
+
+**設計（オーナー決定: テンプレート永続保存なし・オフセットコピーは有用）**:
+
+- **構造体の一括登録**: 複数フィールド（名前・型・任意の相対オフセット）をまとめて登録する
+  UI。ベースアドレスから**ワードサイズ考慮の連番割付**（i16/u16/bit=1ワード相当、i32/u32/f32=2、
+  string=`ceil(string_length*? / 2)` ワード、bit は M デバイス or ワードデバイスのビット）を
+  自動で行う「自動割付」と、各フィールドのアドレスを個別指定する「手動割付」の両方。
+- **オフセットコピー**: 既に登録済みのタグ群（＝構造体1インスタンス）を選び、**アドレスに一定
+  オフセットを加えて複製**する（例: `D3000` 起点の10タグを `+100` して `D3100` 起点に複製）。
+  これは `continuousRegistration` の「アドレス算術」を群単位へ一般化したもの。**テンプレートを
+  保存せずに** 実インスタンスからの複製で再利用性を得る、というオーナー方針に合致。
+- **衝突検出**: 自動割付・オフセットコピーとも、既存タグとアドレス範囲が重なる場合に警告/拒否。
+- 実装は主にフロント＋既存 `tags/batch`。新規サーバー API は原則不要（割付・衝突判定はクライアント側、
+  最終保存は batch）。
+
+**スライス感**: 中。フロント中心。`continuousRegistration` の一般化。
+
+### 3.3 ③レシピ一括書き込み（§4.4 の旧決定を覆す）
+
+**旧決定**: [banto-tagclient-design.md](banto-tagclient-design.md) §4.4 オーナー決定1（2026-09-01）
+「バッチ・レシピ書き込みは実装しない（需要が出るまで保留）」。**本 T20 でこれを覆す**（需要が出た）。
+tagclient 設計文書の当該記述も「T20 で実装へ方針転換」と追記して整合させる。
+
+**現状（調査で判明した強い下地）**: **ブローカーの `write(requests: Vec<BatchWriteRequest>)` が
+既に複数リクエストの一括書き込みを完全サポート**（`Job::Write`、`BatchWriteRequest` は
+Numeric/String/BitInWord 混在可、`plan_slmp_write_batch`/`write_batch_mixed`）。hub は現状
+**毎回1要素の Vec** を送っているだけ。
+
+**設計**:
+
+- **hub にレシピ書き込み経路**を足す。REST（例 `POST /api/v1/values/batch`）と MCP ツール
+  （例 `write_recipe`）で、`[{tag, value}, ...]` を受ける。
+- **各エントリは execute_write と同じ8段ゲートを通す**（catalog/writable/enabled/simulation/
+  protocol/write_enabled/rate limit/値変換）。§3.7（MCP は抜け道を作らない）と同じ思想を
+  バッチにも適用する。ロックダウン後の MCP は既存どおりアドバイザリ（T19 S5）。
+- **原子性（未決・§3 の詰め対象）**: PLC 書き込みは本質的に非トランザクショナル（SLMP に
+  トランザクションは無い）。全 all-or-nothing は不可能に近い。方針候補:
+  - (a) **best-effort ＋ per-entry 結果一覧**（各タグの ok/拒否理由を返す）。ゲート検証は
+    書き込み前に全件行い、1件でもゲート NG なら**1件も書かない**（＝「事前検証は all-or-nothing、
+    実書き込みは best-effort」）。実書き込み中の PLC エラーは以降を中断して結果に記録。
+  - (b) 同一接続分をブローカーの1回の `write_batch` にまとめて**接続内では直列・原子性寄り**に
+    する（`BatchWriteRequest` の Vec を丸ごと1ジョブで送る）。複数接続に跨るレシピは接続ごとに
+    分割。
+  - **推奨**: (a) の事前ゲート all-or-nothing ＋ 同一接続は (b) で1ジョブ化、per-entry 結果を返す。
+- **名前付きレシピの保存（未決）**: 「レシピ」を**保存された設定値セット**として管理するか、
+  単なる**一括書き込みプリミティブ**に留めるか。オーナー決定②（テンプレート保存不要）の思想に
+  倣うなら、まずはプリミティブ（クライアントが値セットを持ち、まとめて送る）で十分。名前付き
+  レシピの永続化は需要が出れば別途。**要オーナー確認。**
+
+**スライス感**: 中。ドライバ下地があるので hub の endpoint ＋ ゲート束ね ＋ 結果集約が主。
+
+### 3.4 ④ワードデバイスのビット `.0〜.F`（16進）
+
+**現状（ほぼ実装済み）**: ビット付きアドレス（T8、`tag-server-design.md` §6.1）は読み書きとも
+実装済み。`banto-plc-write` に `BatchWriteRequest::BitInWord`（SLMP はビット専用書き込みが無いため
+**read-modify-write-confirm**）、テスト `bit_in_word_write_through_the_broker_lands_and_reads_back`
+もある。**ただしビット指数の基数が 10進**: `banto-plc/src/slmp/address.rs:364` は
+`let bit: u8 = bit_text.parse()`（＝10進 `.parse::<u8>()`）で、`D100.15` は通るが `D100.F` は通らない。
+Modbus 側（`banto-plc/src/address.rs:163`）も同様。
+
+**設計（オーナー決定: 16進）**:
+
+- ビット指数を **16進 `.0〜.F`（0〜15）** で受けるよう `u8::from_str_radix(bit_text, 16)` に変える。
+  範囲 0x0〜0xF を検証。SLMP の MELSEC 標準表記に一致する。
+- **意味の変化（要注意）**: 現状 10進の `D100.10`〜`D100.15` は、16進化すると `.10` 以上は
+  範囲外（0xF まで）になり**拒否**される（`.10`＝16進で 16 は範囲外）。既存の10進表記タグが
+  あれば移行が要る。若いプロダクトなので実害は小さい見込みだが、**既存タグの棚卸し**を行う。
+  Modbus 側の基数を 16進に揃えるか 10進のまま残すかは要検討（レジスタ内ビットの慣習）。
+- UI（アドレス入力のヘルプ・バリデーション）とドキュメント（§6.1）を 16進表記に更新。
+
+**スライス感**: 小。パーサの基数変更＋範囲＋テスト＋UI/doc。既存の書き込み経路（RMW）はそのまま。
+
+## 4. スライス構成（提案）
+
+規模と依存の少なさから、着手しやすい順:
+
+1. **④ビット16進**（小・独立・下地あり）
+2. **②構造体登録＋オフセットコピー**（中・フロント中心・`continuousRegistration` の一般化）
+3. **③レシピ一括書き込み**（中・ドライバ下地あり・hub endpoint＋ゲート束ね）
+4. **①文字列 read/write**（中〜大・値表現の拡張が要・共有クレートのエンコーディング変更を含む）
+
+①③④は独立。②も独立。並行可能だが、①は共有クレート（`banto-plc-write` のエンコーディング）に
+触れるため relay-wright への影響確認を伴う。
+
+## 5. 既知事実（調査結果、2026-09-04）
+
+- **文字列**: ドライバは `PlcValue::Str` / `StringReadRequest` / `StringWriteRequest` を持つ（Shift-JIS
+  固定・128 words 上限）。hub の `Sample.value` は `Option<f64>` で文字列を運べない。`RequestedValue`
+  は `Num`/`Bool` のみ。
+- **バッチ**: ブローカー `write(Vec<BatchWriteRequest>)` が混在バッチを完全サポート。hub は1要素 Vec を
+  送っているだけ（＝レシピは hub の配線で足りる）。
+- **ビット**: T8 でビット付きアドレスの読み書き実装済み。基数が 10進なのが唯一の差分。
+- **構造体**: `continuousRegistration.ts` がアドレス算術による連番生成を持つ（オフセットコピーの下地）。
+- **③が覆す旧決定**: banto-tagclient-design.md §4.4 オーナー決定1。
+
+## 6. 着手前に詰める未決点
+
+- **①**: 文字列値の表現（`Sample` を enum 化するか、文字列専用キャッシュを別立てするか）。
+- **③**: 原子性の方針（事前ゲート all-or-nothing ＋ 接続内1ジョブ ＋ per-entry 結果）で確定してよいか。
+  名前付きレシピの永続化を今回入れるか（推奨: 入れない＝プリミティブに留める）。
+- **④**: Modbus 側のビット基数を 16進へ揃えるか 10進のまま残すか。既存10進タグの棚卸し。
+
+## 7. 更新対象ドキュメント
+
+- [tag-server-design.md](tag-server-design.md) §6.1（ビット表記を16進へ）、書き込み安全（バッチ/文字列）。
+- [banto-tagclient-design.md](banto-tagclient-design.md) §4.4（レシピ「実装しない」→ T20 で実装へ方針転換を追記）。
+- [docs/README.md](README.md) 文書地図に本書を追加。
