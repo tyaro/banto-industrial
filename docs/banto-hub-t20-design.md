@@ -132,6 +132,18 @@ Numeric/String/BitInWord 混在可、`plan_slmp_write_batch`/`write_batch_mixed`
 
 **スライス感**: 中。ドライバ下地があるので hub の endpoint ＋ ゲート束ね ＋ 結果集約が主。
 
+**③a（バッチ書き込みコア）: 完了（2026-09-05）。** `write_path.rs` を副作用の無い解決フェーズ
+（`resolve_write_target`＝gate 1〜4）と値変換（`convert_value`＝gate 7）に分割し、単票
+`execute_write` は**元のゲート順（1〜4→5→6→7→8）を厳密に維持**（リファクタで挙動を変えない。
+「write_control off ＋ 型不一致」が 503 のままであることを回帰ガードで固定）。`execute_write_batch`
+は全エントリを解決＋変換で事前検証（1件でも NG なら無書込＝all-or-nothing、成功予定は
+`BatchAborted`）、gate 5/6 をバッチ単位で判定、gate 8 は**接続ごとに1回 `handle.write(Vec)`**。
+per-entry 結果を返す。**同一バッチ内の重複タグは拒否**（`DuplicateTagInBatch`。レシピで同一
+タグに2値は曖昧、かつレート制限 peek の粒度も正確になる）。REST `POST /api/v1/values/batch`
+（単票と同じ認証規律・per-entry の `write:{tag}` スコープ検査・常に200の per-entry 封筒）。
+事前ゲート all-or-nothing は「1件 NG → 監査行数不変＋シミュレータ値不変」でテスト固定。
+**③b（MCP `write_recipe`）・③c（レシピ UI）は別スライス。**
+
 ### 3.4 ④ワードデバイスのビット `.0〜.F`（16進）
 
 **現状（ほぼ実装済み）**: ビット付きアドレス（T8、`tag-server-design.md` §6.1）は読み書きとも

@@ -91,6 +91,7 @@
 //! broker 呼び出しの**前**に record する(`crate::write_rate` のモジュール
 //! doc comment参照)。
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use banto_broker::is_supported_protocol;
@@ -206,6 +207,24 @@ pub enum WriteRejection {
     /// に載っている時点で存在するはずだが、レース(削除)を排除しない -
     /// REST: 元の `BantoError` をそのまま伝播、gRPC: INTERNAL)。
     Internal(String),
+    /// T20-3a(レシピ一括書き込み、docs/banto-hub-t20-design.md §3.3):
+    /// このエントリ自身はゲート(1〜4・値型・gate 7)を通過したが、**同じ
+    /// バッチ内の他のエントリがゲート NG だった**ため、事前ゲート
+    /// all-or-nothing の原則([`execute_write_batch`]のモジュール doc
+    /// comment参照)により物理書き込みを一切試みずバッチ全体を中止した。
+    /// `execute_write`(単票)からは絶対に返らない - [`execute_write_batch`]
+    /// 専用の結果(REST/gRPC の `write_rejection_response`/
+    /// `write_rejection_status` がこの分岐に `unreachable!` を置いている
+    /// 理由)。監査行も一切残らない(§3.3「1件も書かない」)。
+    BatchAborted,
+    /// T20-3a(2026-09-05 監査対応): バッチ内に同じ外部名が2回以上現れた
+    /// (=同じタグに2つの値を書けと言われた・どちらが最終値か曖昧なユーザー
+    /// 誤り)。DB にもレート制限にも一切触れない、最も安価な事前ゲートで
+    /// 全エントリを拒否する([`execute_write_batch`]のモジュール doc
+    /// comment「契約」の0番参照)。値は重複していた外部名そのもの。
+    /// `execute_write`(単票)からは絶対に返らない([`BatchAborted`]と同じ
+    /// 理由でREST/gRPCの変換に `unreachable!` を置く)。
+    DuplicateTagInBatch(String),
 }
 
 /// [`execute_write`] が必要とする共有状態一式への借用。REST/gRPC いずれの
@@ -270,33 +289,68 @@ fn map_registry_error(err: BantoError) -> WriteRejection {
     WriteRejection::Internal(err.to_string())
 }
 
-/// 書き込みゲート1〜8の本体(このモジュールの doc comment 参照)。
+/// [`resolve_write_target`] の出力: 副作用の無い決定的ゲート(1〜4・値型
+/// present)を通過した1エントリぶんの「対象が確定した」状態(T20-3a、
+/// docs/banto-hub-t20-design.md §3.3)。
 ///
-/// `requested`: 呼び出し元が transport 固有の表現(REST の JSON `v`、gRPC の
-/// `oneof num|bool`)から正規化した [`RequestedValue`]。`None` は「型として
-/// 受理できない値」(REST の 422 `unsupported_value_type` に相当)を意味し、
-/// gate 4 の**後**(REST の元実装と同じ位置 - プロトコル非対応の 501 を
-/// 型エラーの 422 より先に返す)で [`WriteRejection::UnsupportedValueType`]
-/// として拒否する。`Some` の場合も、gate 7 で data_type との対称性
-/// (`RequestedValue::Bool` は bit タグのみ、`RequestedValue::Num` は
-/// 数値タグのみ)をさらに検査する - このモジュールの doc comment参照。
-pub async fn execute_write(
+/// **gate 7(値変換)はまだ通していない**: `requested` は正規化前の
+/// [`RequestedValue`] のまま持ち回る(2026-09-05 監査対応: 単票
+/// [`execute_write`] は gate 7 を gate 5/6 の**後**で行う元の順序を厳密に
+/// 保つ必要があり、gate 7 の実行タイミングを呼び出し元に委ねるため)。
+///
+/// 単票・バッチの両方がこれを組み立ててから先へ進む - ここまでの区間は
+/// **DB からの読み取りのみ**で、監査 insert・レート制限の trip/record・
+/// broker への書き込みはまだ一切発生していない。
+struct ResolvedWrite {
+    /// PLC タグなら対象接続、internal タグなら `None`。
+    conn: Option<banto_tags::PlcConnection>,
+    entry: crate::hub::TagEntry,
+    tag_id: i64,
+    /// 呼び出し元が渡した外部名のオウンドコピー - 監査行・
+    /// [`BatchEntryOutcome`]・[`WriteOk`]がそのままエコーバックできるよう
+    /// 保持する。
+    tag_name: String,
+    /// gate 7 未適用の正規化済みリクエスト値([`convert_value`]へ渡す)。
+    requested: RequestedValue,
+}
+
+/// 書き込みゲート1〜4・値型 present の本体(このモジュールの doc comment
+/// 参照)。**副作用は一切無い**(監査行 insert・レート制限の trip/record・
+/// broker への書き込みのいずれも行わない - DB からの読み取り
+/// [`PlcConnectionService::get`]のみ)。T20-3a(docs/banto-hub-t20-design.md
+/// §3.3)でバッチの事前ゲート all-or-nothing を実現するために
+/// [`execute_write`] から抽出した - 単票・バッチの両方がこの関数を呼ぶこと
+/// で「ゲートを再実装しない」(設計 §3.7)を保つ。
+///
+/// **gate 7(値変換・[`convert_value`])はここに含まない**(2026-09-05
+/// 監査対応)。理由: 単票 [`execute_write`] の元実装は gate 7 を gate 5
+/// (受付トグル)・gate 6(レート制限)の**後**で行っており、「write_control
+/// off ＋ 型不一致の値」は 422(型エラー)ではなく 503(writes_disabled)を
+/// 返す。gate 7 を副作用の無いゲートとして早出しした最初の実装
+/// (T20-3a 初版)はこの順序を壊し、単票の外部挙動を変えてしまっていた
+/// (指摘を受けて修正)。gate 7 自体は副作用が無いので事前検証には使える
+/// が、**呼び出し元がいつ呼ぶかを選べる**よう、この関数からは独立した
+/// [`convert_value`] として切り出してある: 単票は gate 5/6 の後に呼び、
+/// バッチは事前ゲート all-or-nothing の一部として resolve と合わせて先に
+/// 呼ぶ(§3.3 は各エントリの事前検証を一括で行うことを要求しており、単票
+/// のような「gate 5/6 が先」という制約はバッチには無い)。
+///
+/// `collection_mode`: 呼び出し元([`execute_write`]/[`execute_write_batch`])
+/// が collection-running チェックの際に読んだ `RunMode`(コントローラが
+/// 無ければ `None`)。バッチでは全エントリで同じ1回の読み取り結果を使い
+/// 回す - このゲート自体はここへは含めない(バッチはエントリ毎ではなく
+/// バッチ全体で1回だけ判定する、§3.3)。
+///
+/// `requested`: 呼び出し元が transport 固有の表現から正規化した
+/// [`RequestedValue`]。`None` は「型として受理できない値」を意味し、
+/// gate 4 の**後**(REST の元実装と同じ位置)で
+/// [`WriteRejection::UnsupportedValueType`] として拒否する。
+async fn resolve_write_target(
     deps: &WriteDeps<'_>,
-    ctx: &ApiKeyContext,
+    collection_mode: Option<RunMode>,
     tag: &str,
     requested: Option<RequestedValue>,
-) -> Result<WriteOk, WriteRejection> {
-    let collection_mode = if let Some(controller) = deps.collection_controller {
-        let status = controller.status();
-        let state = status.state;
-        if state != CollectionState::Running {
-            return Err(WriteRejection::CollectionNotRunning(state));
-        }
-        Some(status.mode)
-    } else {
-        None
-    };
-
+) -> Result<ResolvedWrite, WriteRejection> {
     // gate 1: catalog 解決
     let map = deps.manager.tag_map();
     let Some(entry) = map.get(tag).cloned() else {
@@ -365,28 +419,150 @@ pub async fn execute_write(
         return Err(WriteRejection::UnsupportedValueType(None));
     };
 
-    // gate 5: 書き込み受付(WriteControl)が off
+    Ok(ResolvedWrite {
+        conn,
+        entry,
+        tag_id,
+        tag_name: tag.to_string(),
+        requested,
+    })
+}
+
+/// gate 7 の本体(このモジュールの doc comment 参照): 値変換 - 文字列タグ
+/// は拒否、data_type と [`RequestedValue`] の種別の対称性を検査し(暗黙の
+/// 型変換はしない - §4.2 の設計思想を書き込み経路にも適用)、通れば工学値
+/// を `f64` 1本に潰す。**副作用は一切無い純関数** - [`resolve_write_target`]
+/// から独立させてある理由は、そのdoc comment(2026-09-05 監査対応)参照。
+fn convert_value(
+    entry: &crate::hub::TagEntry,
+    requested: RequestedValue,
+) -> Result<(DataType, f64), WriteRejection> {
+    if entry.data_type == STRING_DATA_TYPE {
+        return Err(WriteRejection::UnsupportedValueType(Some(
+            "文字列タグへの書き込みは対応していません".to_string(),
+        )));
+    }
+    let Some(data_type) = DataType::parse(&entry.data_type) else {
+        // catalog に載っている時点で banto-tags の CHECK 制約を通過済みの
+        // はずなので実運用では到達しない防御的分岐。
+        return Err(WriteRejection::UnsupportedValueType(None));
+    };
+
+    // data_type と RequestedValue の種別の対称性を検査する(2026-08-06
+    // 追加)。bit タグへの数値書き込み(旧実装は `raw != 0.0` で暗黙に
+    // bool 化していた)、および数値タグへの bool 書き込みは、どちらも
+    // 422 として拒否する。
+    let value = match (data_type, requested) {
+        (DataType::Bit, RequestedValue::Num(_)) => {
+            return Err(WriteRejection::UnsupportedValueType(Some(
+                "bit タグには true/false を指定してください".to_string(),
+            )));
+        }
+        (dt, RequestedValue::Bool(_)) if dt != DataType::Bit => {
+            return Err(WriteRejection::UnsupportedValueType(Some(
+                "数値タグに真偽値は指定できません。数値を指定してください".to_string(),
+            )));
+        }
+        (_, value) => value.as_f64(),
+    };
+
+    Ok((data_type, value))
+}
+
+/// [`execute_write_batch`] の事前ゲート all-or-nothing フェーズ1件分:
+/// [`resolve_write_target`](gate 1〜4・値型 present)→ [`convert_value`]
+/// (gate 7)の順に通す。バッチは単票と違い gate 5/6 より**前**にこの2つを
+/// 済ませてよい(§3.3、[`resolve_write_target`]のdoc comment参照)。
+/// **副作用は一切無い**(`tag_row` はここでは読まない - gate 8 commit の
+/// 直前で読む、単票と同じ位置)。
+struct PreparedWrite {
+    conn: Option<banto_tags::PlcConnection>,
+    entry: crate::hub::TagEntry,
+    tag_id: i64,
+    data_type: DataType,
+    value: f64,
+    tag_name: String,
+}
+
+async fn prepare_batch_entry(
+    deps: &WriteDeps<'_>,
+    collection_mode: Option<RunMode>,
+    tag: &str,
+    requested: Option<RequestedValue>,
+) -> Result<PreparedWrite, WriteRejection> {
+    let resolved = resolve_write_target(deps, collection_mode, tag, requested).await?;
+    let (data_type, value) = convert_value(&resolved.entry, resolved.requested)?;
+    Ok(PreparedWrite {
+        conn: resolved.conn,
+        entry: resolved.entry,
+        tag_id: resolved.tag_id,
+        data_type,
+        value,
+        tag_name: resolved.tag_name,
+    })
+}
+
+/// 書き込みゲート1〜8の本体(このモジュールの doc comment 参照)。
+///
+/// T20-3a(docs/banto-hub-t20-design.md §3.3)でゲート1〜4・値型 present を
+/// [`resolve_write_target`] へ、gate 7 を [`convert_value`] へ抽出した -
+/// この関数自身は「collection-running チェック → [`resolve_write_target`]
+/// → gate 5 → gate 6 → [`convert_value`](元の gate 7 の位置)→ `tag_row`
+/// 読み込み(元の位置)→ gate 8」という**リファクタ前と一言一句同じ順序**
+/// を骨組みとして持つ。**外部から見える挙動(ゲート順・監査行・レート
+/// 制限・エラーコード・422/503 の優先順位)はリファクタ前と完全に一致
+/// する**(2026-09-05 監査対応 - 初版は gate 7 を gate 5/6 より前に出して
+/// しまい、「write_control off ＋ 型不一致の値」が 503 でなく 422 に変わる
+/// 回帰があったため、この関数だけは元の直列実装と同じ呼び出し順に戻した。
+/// [`resolve_write_target`]のdoc comment参照)。
+///
+/// `requested`: 呼び出し元が transport 固有の表現(REST の JSON `v`、gRPC の
+/// `oneof num|bool`)から正規化した [`RequestedValue`]。詳細は
+/// [`resolve_write_target`]のdoc comment参照。
+pub async fn execute_write(
+    deps: &WriteDeps<'_>,
+    ctx: &ApiKeyContext,
+    tag: &str,
+    requested: Option<RequestedValue>,
+) -> Result<WriteOk, WriteRejection> {
+    let collection_mode = if let Some(controller) = deps.collection_controller {
+        let status = controller.status();
+        let state = status.state;
+        if state != CollectionState::Running {
+            return Err(WriteRejection::CollectionNotRunning(state));
+        }
+        Some(status.mode)
+    } else {
+        None
+    };
+
+    let resolved = resolve_write_target(deps, collection_mode, tag, requested).await?;
+
+    // gate 5: 書き込み受付(WriteControl)が off。gate 7(値変換)より**前**
+    // - 元実装と同じ順序(このモジュールの上のdoc comment参照)。監査の
+    // `value_requested` は gate 7 未適用の生値(`RequestedValue::as_f64`)。
     if !deps.write_control.is_enabled() {
         let row = WriteAuditRow::new(
             ctx.id,
             ctx.name.clone(),
-            tag_id,
-            tag.to_string(),
+            resolved.tag_id,
+            resolved.tag_name.clone(),
             WriteAuditAction::Write,
             WriteAuditResult::SuppressedDisabled,
         )
-        .with_value_requested(requested.as_f64());
+        .with_value_requested(resolved.requested.as_f64());
         if let Err(err) = deps.write_audit.insert_row(&row).await {
             eprintln!("banto-hub: 書き込み監査(suppressed_disabled)の記録に失敗しました: {err}");
         }
         return Err(WriteRejection::WritesDisabled);
     }
 
-    // gate 6: レート制限(peek のみ - 実際の消費は gate 7 通過後)
+    // gate 6: レート制限(peek のみ - 実際の消費は gate 7 通過後)。
+    // gate 7 より**前** - 元実装と同じ順序。
     let now = Instant::now();
     let would_exceed = {
         let mut limiter = deps.rate_limiter.lock().await;
-        limiter.would_exceed(tag_id, now)
+        limiter.would_exceed(resolved.tag_id, now)
     };
     if would_exceed {
         let trip_result = deps.api_keys.trip(ctx.id).await;
@@ -399,12 +575,12 @@ pub async fn execute_write(
         let row = WriteAuditRow::new(
             ctx.id,
             ctx.name.clone(),
-            tag_id,
-            tag.to_string(),
+            resolved.tag_id,
+            resolved.tag_name.clone(),
             WriteAuditAction::RateLimitTripped,
             WriteAuditResult::SuppressedRateLimited,
         )
-        .with_value_requested(requested.as_f64())
+        .with_value_requested(resolved.requested.as_f64())
         .with_detail(detail);
         if let Err(err) = deps.write_audit.insert_row(&row).await {
             eprintln!("banto-hub: 書き込み監査(rate_limit_tripped)の記録に失敗しました: {err}");
@@ -424,39 +600,12 @@ pub async fn execute_write(
         return Err(WriteRejection::RateLimited);
     }
 
-    // gate 7: 値変換 - 文字列タグは拒否
-    if entry.data_type == STRING_DATA_TYPE {
-        return Err(WriteRejection::UnsupportedValueType(Some(
-            "文字列タグへの書き込みは対応していません".to_string(),
-        )));
-    }
-    let Some(data_type) = DataType::parse(&entry.data_type) else {
-        // catalog に載っている時点で banto-tags の CHECK 制約を通過済みの
-        // はずなので実運用では到達しない防御的分岐。
-        return Err(WriteRejection::UnsupportedValueType(None));
-    };
+    // gate 7: 値変換(元の位置 - gate 5/6 の後)。
+    let (data_type, value) = convert_value(&resolved.entry, resolved.requested)?;
 
-    // gate 7(続き、2026-08-06 追加): data_type と RequestedValue の種別の
-    // 対称性を検査する - 暗黙の型変換はしない(§4.2 の設計思想を書き込み
-    // 経路にも適用)。bit タグへの数値書き込み(旧実装は `raw != 0.0` で
-    // 暗黙に bool 化していた)、および数値タグへの bool 書き込みは、
-    // どちらも 422 として拒否する。
-    let requested = match (data_type, requested) {
-        (DataType::Bit, RequestedValue::Num(_)) => {
-            return Err(WriteRejection::UnsupportedValueType(Some(
-                "bit タグには true/false を指定してください".to_string(),
-            )));
-        }
-        (dt, RequestedValue::Bool(_)) if dt != DataType::Bit => {
-            return Err(WriteRejection::UnsupportedValueType(Some(
-                "数値タグに真偽値は指定できません。数値を指定してください".to_string(),
-            )));
-        }
-        (_, value) => value.as_f64(),
-    };
-
+    // tag_row の読み込みも元の位置(gate 7 の後・gate 8 の前)に戻す。
     let tag_row = TagService::new(deps.manager.pool())
-        .get(tag_id)
+        .get(resolved.tag_id)
         .await
         .map_err(map_registry_error)?;
 
@@ -465,12 +614,12 @@ pub async fn execute_write(
     let pending_row = WriteAuditRow::new(
         ctx.id,
         ctx.name.clone(),
-        tag_id,
-        tag.to_string(),
+        resolved.tag_id,
+        resolved.tag_name.clone(),
         WriteAuditAction::Write,
         WriteAuditResult::Ok,
     )
-    .with_value_requested(requested);
+    .with_value_requested(value);
     let audit_id = match deps.write_audit.insert_pending(&pending_row).await {
         Ok(id) => id,
         Err(err) => {
@@ -483,13 +632,21 @@ pub async fn execute_write(
     // `crate::write_rate` のモジュール doc comment 参照)。
     {
         let mut limiter = deps.rate_limiter.lock().await;
-        limiter.record(tag_id, now);
+        limiter.record(resolved.tag_id, now);
     }
 
-    let outcome = if let Some(conn) = conn {
-        write_plc_tag(deps, &conn, &entry, data_type, &tag_row, requested).await
+    let outcome = if let Some(conn) = &resolved.conn {
+        write_plc_tag(deps, conn, &resolved.entry, data_type, &tag_row, value).await
     } else {
-        write_internal_tag(deps, &entry, tag_id, data_type, tag_row.retain, requested).await
+        write_internal_tag(
+            deps,
+            &resolved.entry,
+            resolved.tag_id,
+            data_type,
+            tag_row.retain,
+            value,
+        )
+        .await
     };
 
     let final_result = match &outcome {
@@ -514,8 +671,513 @@ pub async fn execute_write(
     }
 
     outcome.map(|()| WriteOk {
-        tag: tag.to_string(),
+        tag: resolved.tag_name,
     })
+}
+
+/// 1エントリぶんのバッチ書き込み結果([`execute_write_batch`]の要素)。
+/// `tag` は呼び出し元がそのままエコーバックできるよう外部名を持つ
+/// ([`WriteOk`]と同じ理由)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchEntryOutcome {
+    pub tag: String,
+    pub result: Result<(), WriteRejection>,
+}
+
+/// レシピ一括書き込み(T20-3a、docs/banto-hub-t20-design.md §3.3、
+/// 2026-09-04 オーナー承認)の本体。**単票 [`execute_write`] とゲート実装を
+/// 共有する**([`resolve_write_target`]・[`convert_value`])- ゲートを
+/// 迂回しない(設計 §3.7)。
+///
+/// ## 契約(オーナー承認、勝手に変えない)
+///
+/// 0. **重複タグは全体拒否**(2026-09-05 監査対応): 同じバッチ内に同じ
+///    外部名が2回以上現れたら、DB へは一切触れずに全エントリを拒否する
+///    ([`WriteRejection::DuplicateTagInBatch`])。レシピで同一タグに2つの
+///    値を書くのは曖昧(どちらが最終値か不定)なユーザー誤りであり、かつ
+///    これを禁止すると「1バッチ内で同じタグの `record` が複数回起きる」
+///    ケースが構造的に無くなるため、gate 6(レート制限)peek の粒度問題
+///    (後述)も解消される。
+/// 1. **collection-running チェックは1回**(バッチ全体で)。停止中なら
+///    全エントリを [`WriteRejection::CollectionNotRunning`] にして返す -
+///    1件も書かない。
+/// 2. **事前ゲートは all-or-nothing**: 全エントリに
+///    [`resolve_write_target`](gate 1〜4・値型 present)→ [`convert_value`]
+///    (gate 7)を通す(バッチは単票と違い、この2つを gate 5/6 より前に
+///    行ってよい - [`resolve_write_target`]のdoc comment参照)。**1件でも
+///    Err なら、実書き込みを一切せず**(監査 insert も broker 呼び出しも
+///    発生しない)、Err だったエントリはその [`WriteRejection`]、そうで
+///    なかったエントリは [`WriteRejection::BatchAborted`] として返す -
+///    「事前検証は all-or-nothing」の結果を呼び出し元(REST/MCP)が
+///    「全体 NG・無書込」と表現できるようにするための専用バリアント。
+/// 3. **gate 5(write_control off)は全エントリで1回だけ判定**: off なら
+///    全エントリを拒否する。各エントリに単票と同じ流儀で
+///    `suppressed_disabled` 監査行を残す(1件も PLC へ書かない)。
+/// 4. **gate 6(レート制限)は全エントリを先に peek**(peek だけ、この時点
+///    では `record` しない): 1件でも would_exceed なら API キーを1回だけ
+///    trip し、**全エントリを拒否**する(would_exceed だった当該エントリ
+///    にのみ `rate_limit_tripped` 監査行を残す - 単票が「その1件が
+///    トリップの原因になった」ときだけ監査するのと同じ意味論をバッチへ
+///    一般化した)。項目0の重複禁止によりバッチ内で同じ tag_id が複数回
+///    peek されることは無いので、この peek は単票の逐次呼び出しと同じ
+///    精度を保つ。
+/// 5. **gate 8(commit)は同一接続=1ジョブ、`record` は per-entry**:
+///    `tag_row` の読み込みは単票と同じ位置(gate 7 の後・commit 直前)で
+///    エントリ毎に行う。**`record` も単票と同じタイミング** - 各エントリの
+///    `insert_pending` 監査が成功した**直後**(物理書き込みを試みる**前**)
+///    に、そのエントリの分だけ `record` する(2026-09-05 監査対応: 以前は
+///    commit フェーズに入る前に全エントリをまとめて record していたが、
+///    `insert_pending` 失敗や(PLC タグの場合)`tag_row` 読み込み失敗・
+///    [`build_plc_write_request`] の拒否で実際には書き込みを試みない
+///    エントリまで消費してしまう false rate limiting だった -
+///    `crate::write_rate` の「record は実際に試みた書き込みのみ消費する」
+///    契約に反していたため是正した)。internal タグは単票と同じ
+///    `write_internal_tag` を1件ずつ、PLC タグは接続 id ごとにグルーピング
+///    し、グループ内で `insert_pending` 成功のたびに record したエントリ
+///    だけを集めて [`build_plc_write_request`] で組み立てた
+///    `Vec<BatchWriteRequest>` を `BrokerHandle::write` へ**1回**渡す →
+///    返ってきた `Vec<WriteResult>`(入力順)を各エントリへ割り当てて
+///    `set_result` で確定する。broker セッションが無い接続は、そのグループ
+///    の全エントリを単票と同じ fail-closed(`WriteFailed`)にする(この
+///    エントリ達はすでに record 済み - 単票が broker 呼び出し失敗時も
+///    record 済みのまま戻すのと同じ)。
+/// 6. **per-entry 結果を入力順で返す**。
+pub async fn execute_write_batch(
+    deps: &WriteDeps<'_>,
+    ctx: &ApiKeyContext,
+    entries: Vec<(String, Option<RequestedValue>)>,
+) -> Vec<BatchEntryOutcome> {
+    // 0. 重複タグ検出(2026-09-05 監査対応、このモジュール doc comment
+    // 「契約」の0番参照)。DB にもレート制限にも一切触れない、最も安価な
+    // 事前ゲート - 同じ外部名が2回以上現れたら全エントリを拒否する。
+    // 重複していたタグには理由を特定できる
+    // [`WriteRejection::DuplicateTagInBatch`]、それ以外は
+    // [`WriteRejection::BatchAborted`](項目2の all-or-nothing と同じ表現)。
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    // Owned (not borrowed) so it does not keep `entries` borrowed once we
+    // need to move it in the `return` below.
+    let mut duplicated: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (tag, _) in &entries {
+        if !seen.insert(tag.as_str()) {
+            duplicated.insert(tag.clone());
+        }
+    }
+    if !duplicated.is_empty() {
+        return entries
+            .into_iter()
+            .map(|(tag, _)| {
+                let result = if duplicated.contains(&tag) {
+                    Err(WriteRejection::DuplicateTagInBatch(tag.clone()))
+                } else {
+                    Err(WriteRejection::BatchAborted)
+                };
+                BatchEntryOutcome { tag, result }
+            })
+            .collect();
+    }
+
+    // 1. collection-running チェック(バッチ全体で1回)。
+    let collection_mode = if let Some(controller) = deps.collection_controller {
+        let status = controller.status();
+        let state = status.state;
+        if state != CollectionState::Running {
+            return entries
+                .into_iter()
+                .map(|(tag, _)| BatchEntryOutcome {
+                    tag,
+                    result: Err(WriteRejection::CollectionNotRunning(state)),
+                })
+                .collect();
+        }
+        Some(status.mode)
+    } else {
+        None
+    };
+
+    // 2. 事前ゲート all-or-nothing: 全エントリを prepare_batch_entry
+    // (resolve_write_target → convert_value)へ通す。
+    let mut prepare_results = Vec::with_capacity(entries.len());
+    for (tag, requested) in &entries {
+        prepare_results.push(prepare_batch_entry(deps, collection_mode, tag, *requested).await);
+    }
+
+    if prepare_results.iter().any(Result::is_err) {
+        // 1件でも NG なら実書き込みを一切しない - 監査行も broker 呼び出し
+        // もまだ発生していない(prepare_batch_entry は副作用が無い)ので、
+        // ここで返すだけで「1件も書かない」が成立する。
+        return entries
+            .into_iter()
+            .zip(prepare_results)
+            .map(|((tag, _), prepared)| {
+                let result = match prepared {
+                    Err(rejection) => Err(rejection),
+                    Ok(_) => Err(WriteRejection::BatchAborted),
+                };
+                BatchEntryOutcome { tag, result }
+            })
+            .collect();
+    }
+    let prepared: Vec<PreparedWrite> = prepare_results
+        .into_iter()
+        .map(|r| r.expect("checked above: no Err remains"))
+        .collect();
+
+    // 3. gate 5: write_control off なら全エントリ拒否(単票と同じ監査行)。
+    if !deps.write_control.is_enabled() {
+        for p in &prepared {
+            let row = WriteAuditRow::new(
+                ctx.id,
+                ctx.name.clone(),
+                p.tag_id,
+                p.tag_name.clone(),
+                WriteAuditAction::Write,
+                WriteAuditResult::SuppressedDisabled,
+            )
+            .with_value_requested(p.value);
+            if let Err(err) = deps.write_audit.insert_row(&row).await {
+                eprintln!(
+                    "banto-hub: 書き込み監査(suppressed_disabled、バッチ)の記録に失敗しました: {err}"
+                );
+            }
+        }
+        return prepared
+            .into_iter()
+            .map(|p| BatchEntryOutcome {
+                tag: p.tag_name,
+                result: Err(WriteRejection::WritesDisabled),
+            })
+            .collect();
+    }
+
+    // 4. gate 6: 全エントリの tag を先に peek する(record はまだしない)。
+    let now = Instant::now();
+    let exceeded: Vec<bool> = {
+        let mut limiter = deps.rate_limiter.lock().await;
+        prepared
+            .iter()
+            .map(|p| limiter.would_exceed(p.tag_id, now))
+            .collect()
+    };
+    if exceeded.iter().any(|&x| x) {
+        let trip_result = deps.api_keys.trip(ctx.id).await;
+        let detail = match trip_result {
+            Ok(_) => "レート制限を超過したため API キーをトリップしました".to_string(),
+            Err(err) => {
+                format!("レート制限を超過しましたが、API キーのトリップに失敗しました: {err}")
+            }
+        };
+        for (p, &was_exceeded) in prepared.iter().zip(&exceeded) {
+            if !was_exceeded {
+                continue;
+            }
+            let row = WriteAuditRow::new(
+                ctx.id,
+                ctx.name.clone(),
+                p.tag_id,
+                p.tag_name.clone(),
+                WriteAuditAction::RateLimitTripped,
+                WriteAuditResult::SuppressedRateLimited,
+            )
+            .with_value_requested(p.value)
+            .with_detail(detail.clone());
+            if let Err(err) = deps.write_audit.insert_row(&row).await {
+                eprintln!(
+                    "banto-hub: 書き込み監査(rate_limit_tripped、バッチ)の記録に失敗しました: {err}"
+                );
+            }
+        }
+        let _ = deps.events.send(ServerEvent::Notice {
+            level: "warning".to_string(),
+            message: format!(
+                "書き込みレート制限を超過したため API キー '{}' をトリップしました(バッチ書き込み)",
+                ctx.name
+            ),
+        });
+        let _ = deps.events.send(ServerEvent::ResourceChanged {
+            resource: "api_keys".to_string(),
+        });
+        return prepared
+            .into_iter()
+            .map(|p| BatchEntryOutcome {
+                tag: p.tag_name,
+                result: Err(WriteRejection::RateLimited),
+            })
+            .collect();
+    }
+    // 全件 peek OK。**record はここではまだ行わない**(2026-09-05 監査
+    // 対応) - 以前はここで全エントリをまとめて record していたが、commit
+    // フェーズで実際には書き込みを試みずに終わるエントリ(`tag_row` 読み
+    // 込み失敗・`insert_pending` 失敗・[`build_plc_write_request`] の拒否)
+    // まで消費してしまう false rate limiting だった。record は単票と同じ
+    // タイミング(各エントリの `insert_pending` 成功直後・物理書き込みの
+    // 直前)で、commit ループ内から per-entry に呼ぶ(このモジュール doc
+    // comment「契約」の5番参照)。
+
+    // 5. gate 8 commit: internal は1件ずつ、PLC は接続 id ごとにグルーピング。
+    let mut outcomes: Vec<Option<BatchEntryOutcome>> = vec![None; prepared.len()];
+    let mut plc_groups: HashMap<i64, Vec<usize>> = HashMap::new();
+    let mut internal_indices: Vec<usize> = Vec::new();
+    for (i, p) in prepared.iter().enumerate() {
+        match &p.conn {
+            Some(conn) => plc_groups.entry(conn.id).or_default().push(i),
+            None => internal_indices.push(i),
+        }
+    }
+
+    for i in internal_indices {
+        let p = &prepared[i];
+        // tag_row の読み込みは単票と同じ位置(gate 7 の後・insert_pending の
+        // 前)- ここで読む。読み込みに失敗した場合は単票と同じく監査行を
+        // 一切残さず、このエントリだけ Internal を返す(他のエントリの
+        // commit は続行する)。
+        let tag_row = match TagService::new(deps.manager.pool()).get(p.tag_id).await {
+            Ok(row) => row,
+            Err(err) => {
+                outcomes[i] = Some(BatchEntryOutcome {
+                    tag: p.tag_name.clone(),
+                    result: Err(map_registry_error(err)),
+                });
+                continue;
+            }
+        };
+        let pending_row = WriteAuditRow::new(
+            ctx.id,
+            ctx.name.clone(),
+            p.tag_id,
+            p.tag_name.clone(),
+            WriteAuditAction::Write,
+            WriteAuditResult::Ok,
+        )
+        .with_value_requested(p.value);
+        let audit_id = match deps.write_audit.insert_pending(&pending_row).await {
+            Ok(id) => id,
+            Err(err) => {
+                eprintln!(
+                    "banto-hub: 書き込み監査(log-before-write、バッチ internal)の記録に失敗しました: {err}"
+                );
+                outcomes[i] = Some(BatchEntryOutcome {
+                    tag: p.tag_name.clone(),
+                    result: Err(WriteRejection::AuditWriteFailed),
+                });
+                continue;
+            }
+        };
+        // record は単票と同じタイミング: insert_pending 成功直後・
+        // 物理書き込みの直前(このモジュール doc comment「契約」の5番参照)。
+        {
+            let mut limiter = deps.rate_limiter.lock().await;
+            limiter.record(p.tag_id, now);
+        }
+        let outcome = write_internal_tag(
+            deps,
+            &p.entry,
+            p.tag_id,
+            p.data_type,
+            tag_row.retain,
+            p.value,
+        )
+        .await;
+        let final_result = match &outcome {
+            Ok(()) => WriteAuditResult::Ok,
+            Err(_) => WriteAuditResult::Failed,
+        };
+        let failure_detail = outcome.as_ref().err().and_then(WriteRejection::detail);
+        if let Err(err) = deps
+            .write_audit
+            .set_result(audit_id, final_result, failure_detail.as_deref())
+            .await
+        {
+            eprintln!("banto-hub: 書き込み監査の確定(バッチ internal)に失敗しました: {err}");
+        }
+        outcomes[i] = Some(BatchEntryOutcome {
+            tag: p.tag_name.clone(),
+            result: outcome,
+        });
+    }
+
+    for (connection_id, group_indices) in plc_groups {
+        // tag_row の読み込み(単票と同じ位置)→ log-before-write: グループの
+        // 全エントリに先に pending 監査行を作る(単票と同じ順序 - broker を
+        // 呼ぶ前に必ず先に作る、§6-3)。tag_row の読み込みに失敗した
+        // エントリは監査行を残さず Internal(このエントリだけ、グループの
+        // 他のエントリは続行)。
+        let mut committed: Vec<(usize, banto_tags::Tag, i64)> =
+            Vec::with_capacity(group_indices.len());
+        for &i in &group_indices {
+            let p = &prepared[i];
+            let tag_row = match TagService::new(deps.manager.pool()).get(p.tag_id).await {
+                Ok(row) => row,
+                Err(err) => {
+                    outcomes[i] = Some(BatchEntryOutcome {
+                        tag: p.tag_name.clone(),
+                        result: Err(map_registry_error(err)),
+                    });
+                    continue;
+                }
+            };
+            let pending_row = WriteAuditRow::new(
+                ctx.id,
+                ctx.name.clone(),
+                p.tag_id,
+                p.tag_name.clone(),
+                WriteAuditAction::Write,
+                WriteAuditResult::Ok,
+            )
+            .with_value_requested(p.value);
+            match deps.write_audit.insert_pending(&pending_row).await {
+                Ok(audit_id) => {
+                    // record は単票と同じタイミング: insert_pending 成功
+                    // 直後・物理書き込みの直前(このモジュール doc comment
+                    // 「契約」の5番参照) - グループ全体の handle.write では
+                    // なく、このエントリの insert_pending が成功した時点で
+                    // 個別に record する。
+                    {
+                        let mut limiter = deps.rate_limiter.lock().await;
+                        limiter.record(p.tag_id, now);
+                    }
+                    committed.push((i, tag_row, audit_id));
+                }
+                Err(err) => {
+                    eprintln!(
+                        "banto-hub: 書き込み監査(log-before-write、バッチ PLC)の記録に失敗しました: {err}"
+                    );
+                    outcomes[i] = Some(BatchEntryOutcome {
+                        tag: p.tag_name.clone(),
+                        result: Err(WriteRejection::AuditWriteFailed),
+                    });
+                }
+            }
+        }
+
+        // グループの BatchWriteRequest を組み立てる(単票と共有する
+        // build_plc_write_request)。リクエスト自体が組み立てられない
+        // (範囲外・アドレス不正)エントリは broker には送らず、ここで
+        // 結果を確定する。
+        let mut requests = Vec::with_capacity(committed.len());
+        let mut sent_indices = Vec::with_capacity(committed.len());
+        for (i, tag_row, audit_id) in committed {
+            let p = &prepared[i];
+            let conn = p.conn.as_ref().expect("group is keyed by connection id");
+            match build_plc_write_request(conn, &p.entry, p.data_type, &tag_row, p.value) {
+                Ok(request) => {
+                    requests.push(request);
+                    sent_indices.push((i, audit_id));
+                }
+                Err(rejection) => {
+                    if let Err(err) = deps
+                        .write_audit
+                        .set_result(
+                            audit_id,
+                            WriteAuditResult::Failed,
+                            rejection.detail().as_deref(),
+                        )
+                        .await
+                    {
+                        eprintln!("banto-hub: 書き込み監査の確定(バッチ PLC)に失敗しました: {err}");
+                    }
+                    outcomes[i] = Some(BatchEntryOutcome {
+                        tag: p.tag_name.clone(),
+                        result: Err(rejection),
+                    });
+                }
+            }
+        }
+
+        if sent_indices.is_empty() {
+            continue;
+        }
+
+        // T15-4: 単票と同じ non-spawning peek のみを使う(このモジュール
+        // doc comment「gate 8 は broker セッションを新規に張らない」節参照)。
+        let Some(handle) = deps.manager.write_broker_handle_peek(connection_id) else {
+            for (i, audit_id) in sent_indices {
+                let rejection = WriteRejection::WriteFailed(
+                    "PLC への接続セッションがありません(書き込みは新しいセッションを開始しません。収集が稼働中か確認してください)"
+                        .to_string(),
+                );
+                if let Err(err) = deps
+                    .write_audit
+                    .set_result(
+                        audit_id,
+                        WriteAuditResult::Failed,
+                        rejection.detail().as_deref(),
+                    )
+                    .await
+                {
+                    eprintln!("banto-hub: 書き込み監査の確定(バッチ PLC)に失敗しました: {err}");
+                }
+                outcomes[i] = Some(BatchEntryOutcome {
+                    tag: prepared[i].tag_name.clone(),
+                    result: Err(rejection),
+                });
+            }
+            continue;
+        };
+
+        // 同一接続は1ジョブ(§3.3 の核心) - `requests` を丸ごと1回
+        // `handle.write` へ渡す。
+        match handle.write(requests).await {
+            Ok(results) => {
+                for (k, (i, audit_id)) in sent_indices.into_iter().enumerate() {
+                    let outcome = match results.get(k) {
+                        Some(PlcWriteResult::Ok) => Ok(()),
+                        Some(PlcWriteResult::Bad(write_err)) => {
+                            Err(WriteRejection::WriteFailed(write_err.to_string()))
+                        }
+                        None => Err(WriteRejection::WriteFailed(
+                            "broker から応答がありませんでした".to_string(),
+                        )),
+                    };
+                    let final_result = match &outcome {
+                        Ok(()) => WriteAuditResult::Ok,
+                        Err(_) => WriteAuditResult::Failed,
+                    };
+                    let failure_detail = outcome.as_ref().err().and_then(WriteRejection::detail);
+                    if let Err(err) = deps
+                        .write_audit
+                        .set_result(audit_id, final_result, failure_detail.as_deref())
+                        .await
+                    {
+                        eprintln!("banto-hub: 書き込み監査の確定(バッチ PLC)に失敗しました: {err}");
+                    }
+                    outcomes[i] = Some(BatchEntryOutcome {
+                        tag: prepared[i].tag_name.clone(),
+                        result: outcome,
+                    });
+                }
+            }
+            Err(err) => {
+                // グループ全体が broker 呼び出し自体で失敗(単票の
+                // `handle.write` の `Err(err)` 分岐と同じ扱い)。
+                for (i, audit_id) in sent_indices {
+                    let rejection = WriteRejection::WriteFailed(err.to_string());
+                    if let Err(set_err) = deps
+                        .write_audit
+                        .set_result(
+                            audit_id,
+                            WriteAuditResult::Failed,
+                            rejection.detail().as_deref(),
+                        )
+                        .await
+                    {
+                        eprintln!(
+                            "banto-hub: 書き込み監査の確定(バッチ PLC)に失敗しました: {set_err}"
+                        );
+                    }
+                    outcomes[i] = Some(BatchEntryOutcome {
+                        tag: prepared[i].tag_name.clone(),
+                        result: Err(rejection),
+                    });
+                }
+            }
+        }
+    }
+
+    // 6. per-entry 結果を入力順で返す。
+    outcomes
+        .into_iter()
+        .map(|o| o.expect("every index was assigned an outcome above"))
+        .collect()
 }
 
 /// gate 8 の PLC タグ分岐: 従来どおり `banto_tags::unscale` → プロトコル別
@@ -537,6 +1199,49 @@ async fn write_plc_tag(
     tag_row: &banto_tags::Tag,
     requested: f64,
 ) -> Result<(), WriteRejection> {
+    let request = build_plc_write_request(conn, entry, data_type, tag_row, requested)?;
+
+    let Some(handle) = deps.manager.write_broker_handle_peek(conn.id) else {
+        // T15-4: セッションが無い(収集停止・`stop_and_join`との競合など) -
+        // 新規に実機へダイヤルしてはならないので fail closed する。
+        return Err(WriteRejection::WriteFailed(
+            "PLC への接続セッションがありません(書き込みは新しいセッションを開始しません。収集が稼働中か確認してください)"
+                .to_string(),
+        ));
+    };
+
+    match handle.write(vec![request]).await {
+        Ok(results) => match results.into_iter().next() {
+            Some(PlcWriteResult::Ok) => Ok(()),
+            Some(PlcWriteResult::Bad(write_err)) => {
+                Err(WriteRejection::WriteFailed(write_err.to_string()))
+            }
+            None => Err(WriteRejection::WriteFailed(
+                "broker から応答がありませんでした".to_string(),
+            )),
+        },
+        Err(err) => Err(WriteRejection::WriteFailed(err.to_string())),
+    }
+}
+
+/// gate 8 の PLC タグ分岐が broker へ渡す `BatchWriteRequest` の組み立て
+/// (単票 [`write_plc_tag`] とバッチ [`execute_write_batch`] のコミット段が
+/// **共有する**唯一の場所 - T20-3a、docs/banto-hub-t20-design.md §3.3
+/// 「BatchWriteRequest 構築ロジックを単票と共有する」)。従来どおり
+/// `banto_tags::unscale` → プロトコル別アドレス解決(#131 以降 SLMP/Modbus
+/// TCP の両方 - `banto_collect`の `build_request`と同じ`conn.protocol`分岐)
+/// → `BatchWriteRequest`(`Numeric`/`BitInWord` の作り分け)。**副作用は
+/// 無い**(broker へは渡さない - 呼び出し元が `handle.write` を呼ぶ)。
+/// `entry.data_type == STRING_DATA_TYPE` は [`convert_value`] の gate 7 で
+/// 既に拒否済みなのでここには来ない - `BatchWriteRequest::String` はこの
+/// 関数では組み立てない。
+fn build_plc_write_request(
+    conn: &banto_tags::PlcConnection,
+    entry: &crate::hub::TagEntry,
+    data_type: DataType,
+    tag_row: &banto_tags::Tag,
+    requested: f64,
+) -> Result<BatchWriteRequest, WriteRejection> {
     // スケーリング設定があれば工学値→raw に unscale する(無ければ工学値
     // そのものが raw)。`Scaling::from_parts` は永続化済みの行に対しては
     // 到達不能な Err のみを返す - 防御的に no-scaling へフォールバックする。
@@ -564,9 +1269,9 @@ async fn write_plc_tag(
 
     // #131 (2026-09-01): dispatch on `conn.protocol` exactly like
     // `crates/banto-collect/src/config.rs`'s `build_request` does for reads -
-    // gate 4 (`execute_write`, above) no longer restricts this function to
-    // SLMP connections alone, so the address notation must be parsed with
-    // the matching protocol's parser.
+    // gate 4 (`resolve_write_target`, above) no longer restricts this
+    // function to SLMP connections alone, so the address notation must be
+    // parsed with the matching protocol's parser.
     let address = match conn.protocol.as_str() {
         "modbus-tcp" => Address::parse(&entry.address),
         // "slmp" and (defensively) anything else the protocol gate above
@@ -582,15 +1287,6 @@ async fn write_plc_tag(
             // 表記のはず)。
             return Err(WriteRejection::InvalidAddress(err.to_string()));
         }
-    };
-
-    let Some(handle) = deps.manager.write_broker_handle_peek(conn.id) else {
-        // T15-4: セッションが無い(収集停止・`stop_and_join`との競合など) -
-        // 新規に実機へダイヤルしてはならないので fail closed する。
-        return Err(WriteRejection::WriteFailed(
-            "PLC への接続セッションがありません(書き込みは新しいセッションを開始しません。収集が稼働中か確認してください)"
-                .to_string(),
-        ));
     };
 
     // T8-2 (docs/tag-server-design.md §6.1, 2026-08-06): a bit-in-word
@@ -619,7 +1315,7 @@ async fn write_plc_tag(
     // only ever receives `BatchWriteRequest::Numeric`/`String` from this
     // function, never `BitInWord`, for a Modbus connection).
     let is_bit_in_word = matches!(address, Address::Slmp { bit: Some(_), .. });
-    let request = if is_bit_in_word {
+    if is_bit_in_word {
         let PlcTagValue::Bit(value) = tag_value else {
             // Unreachable: `is_bit_in_word` can only be true when `address`
             // parsed a `.N` suffix, which `Address::parse_slmp`
@@ -632,25 +1328,13 @@ async fn write_plc_tag(
                 "内部エラー: ビット指定アドレスの値が bool ではありません".to_string(),
             ));
         };
-        BatchWriteRequest::BitInWord { address, value }
+        Ok(BatchWriteRequest::BitInWord { address, value })
     } else {
-        BatchWriteRequest::Numeric(PlcWriteRequest {
+        Ok(BatchWriteRequest::Numeric(PlcWriteRequest {
             address,
             data_type,
             value: tag_value,
-        })
-    };
-    match handle.write(vec![request]).await {
-        Ok(results) => match results.into_iter().next() {
-            Some(PlcWriteResult::Ok) => Ok(()),
-            Some(PlcWriteResult::Bad(write_err)) => {
-                Err(WriteRejection::WriteFailed(write_err.to_string()))
-            }
-            None => Err(WriteRejection::WriteFailed(
-                "broker から応答がありませんでした".to_string(),
-            )),
-        },
-        Err(err) => Err(WriteRejection::WriteFailed(err.to_string())),
+        }))
     }
 }
 
@@ -716,6 +1400,8 @@ impl WriteRejection {
             WriteRejection::WriteFailed(_) => "write_failed",
             WriteRejection::AuditWriteFailed => "audit_write_failed",
             WriteRejection::Internal(_) => "internal",
+            WriteRejection::BatchAborted => "batch_aborted",
+            WriteRejection::DuplicateTagInBatch(_) => "duplicate_tag_in_batch",
         }
     }
 
@@ -726,6 +1412,13 @@ impl WriteRejection {
             | WriteRejection::InvalidAddress(detail)
             | WriteRejection::WriteFailed(detail)
             | WriteRejection::Internal(detail) => Some(detail.clone()),
+            WriteRejection::BatchAborted => Some(
+                "同じバッチ内の他のエントリがゲートで拒否されたため、書き込みを行いませんでした"
+                    .to_string(),
+            ),
+            WriteRejection::DuplicateTagInBatch(tag) => {
+                Some(format!("レシピ内でタグ '{tag}' が重複しています"))
+            }
             _ => None,
         }
     }

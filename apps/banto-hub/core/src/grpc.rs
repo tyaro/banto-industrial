@@ -294,6 +294,17 @@ fn write_rejection_status(rejection: WriteRejection) -> Status {
         | WriteRejection::InvalidAddress(_) => tonic::Code::InvalidArgument,
         WriteRejection::WriteFailed(_) => tonic::Code::Unavailable,
         WriteRejection::AuditWriteFailed | WriteRejection::Internal(_) => tonic::Code::Internal,
+        // T20-3a: `execute_write`(単票、この関数が変換する唯一の呼び出し
+        // 元)は `BatchAborted`/`DuplicateTagInBatch` を絶対に返さない -
+        // `write_path`の各バリアントのdoc comment参照。バッチ専用の
+        // [`crate::write_path::execute_write_batch`] は別の応答形
+        // (`crate::rest`の per-entry 封筒)を使い、この関数は通らない。
+        WriteRejection::BatchAborted => unreachable!(
+            "execute_write は BatchAborted を返さない - execute_write_batch 専用の結果"
+        ),
+        WriteRejection::DuplicateTagInBatch(_) => unreachable!(
+            "execute_write は DuplicateTagInBatch を返さない - execute_write_batch 専用の結果"
+        ),
     };
     let rest_code = rejection.rest_error_code();
     let message = match rejection.detail() {
