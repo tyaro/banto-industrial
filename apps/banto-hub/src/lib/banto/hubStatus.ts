@@ -67,6 +67,22 @@ export interface GrpcStatusEntry {
 	port: number;
 }
 
+/**
+ * `GET /api/status` の `system`（T19 S3-b、docs/banto-hub-t19-design.md
+ * §3.9、UX-46「サーバー状態の拡充」）。単位はいずれもサーバー側の生値
+ * （バイト・パーセント） - MB/GB 表記やゲージ表示への整形は
+ * `systemInfoFormat.ts` の純関数が担う（このファイルでは行わない）。
+ * `cpu_percent` は論理コア1個 = 100%換算（`sysinfo::Process::cpu_usage`の
+ * 単位そのまま）で、プロセス起動直後最初のポーリングでは `0` になりうる
+ * （`apps/banto-hub/core/src/system_info.rs`のモジュール doc comment参照）。
+ */
+export interface SystemInfoEntry {
+	cpu_percent: number;
+	process_memory_bytes: number;
+	host_memory_used_bytes: number;
+	host_memory_total_bytes: number;
+}
+
 /** `GET /api/status` の応答。 */
 export interface StatusResponse {
 	version: string;
@@ -100,6 +116,8 @@ export interface StatusResponse {
 	 * 別物（あちらは構成の静的検証エラー）なので混同しないこと。
 	 */
 	last_runtime_error: string | null;
+	/** T19 S3-b（UX-46）: サーバー自身の CPU 使用率・メモリ使用量。 */
+	system: SystemInfoEntry;
 }
 
 /** サーバーから受け取る camelCase の生レスポンス形（`AdminStatusResponse`）。 */
@@ -115,6 +133,12 @@ interface RawStatusResponse {
 	collectionState: string;
 	collectionMode: string;
 	lastRuntimeError: string | null;
+	system: {
+		cpuPercent: number;
+		processMemoryBytes: number;
+		hostMemoryUsedBytes: number;
+		hostMemoryTotalBytes: number;
+	};
 }
 
 /** サーバーの camelCase 応答を、このファイルが公開する既存の型（snake_case
@@ -134,7 +158,13 @@ function fromRawStatus(raw: RawStatusResponse): StatusResponse {
 		grpc: raw.grpc,
 		collection_state: raw.collectionState,
 		collection_mode: raw.collectionMode,
-		last_runtime_error: raw.lastRuntimeError
+		last_runtime_error: raw.lastRuntimeError,
+		system: {
+			cpu_percent: raw.system.cpuPercent,
+			process_memory_bytes: raw.system.processMemoryBytes,
+			host_memory_used_bytes: raw.system.hostMemoryUsedBytes,
+			host_memory_total_bytes: raw.system.hostMemoryTotalBytes
+		}
 	};
 }
 

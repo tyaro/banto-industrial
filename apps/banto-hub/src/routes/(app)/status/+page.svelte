@@ -1,20 +1,24 @@
 <script lang="ts">
 	/**
-	 * 接続状態モニタ画面（実装指示のスコープ主軸機能、新規作成）。
-	 * `GET /api/status`（connections/revision/last_config_error）と
-	 * `GET /api/values`（全タグ現在値）を3秒ポーリングで表示する
-	 * （2026-08-31 オーナー決定「案A」で `/api/v1/status`・`/api/v1/values`
-	 * から管理系エンドポイントへ切替 - 試運転モード中は `/api/v1/*` が
-	 * 401 になるため、`hubStatus.ts`冒頭のdoc comment参照）。
+	 * サーバー状態モニタ画面（実装指示のスコープ主軸機能、新規作成）。
+	 * `GET /api/status`（connections/revision/last_config_error/
+	 * サービス状態/CPU・メモリ）を3秒ポーリングで表示する（2026-08-31
+	 * オーナー決定「案A」で `/api/v1/status` から管理系エンドポイントへ
+	 * 切替 - 試運転モード中は `/api/v1/*` が 401 になるため、
+	 * `hubStatus.ts`冒頭のdoc comment参照）。
+	 *
+	 * **T19 S3-b（UX-47、docs/banto-hub-t19-design.md §3.9、2026-09-04）**:
+	 * 以前はここに `GET /api/values`（全タグ現在値）も3秒ポーリングして
+	 * 表示していたが撤去した - 現在値はタグモニタ画面が担う（同じ情報を
+	 * 複数画面が持つと表示規約の二重管理になる、という UX-30 と同じ理屈）。
+	 * この画面に残すのは「サーバーの状態」に属する情報 -
+	 * 接続状態・pending 変更・各種サービス状態・CPU/メモリ（UX-46、下の
+	 * 「サーバーリソース」セクション）。
 	 *
 	 * ポーリングでよい理由（設計 §5.1）: 読み取りは
 	 * `CollectorManager::current_values` が保持するオンメモリの現在値
-	 * スナップショットを読むだけで、PLC への追加ポーリング要求は一切
-	 * 発生しない（設計 §4: 「/api/v1/values* は current_values を読むだけで
-	 * 完結し、PLC への追加要求を発生させない」- `/api/values`も同じ
-	 * `CollectorManager::current_values`を読むだけの`compute_status`/
-	 * `build_values_response`を共有しているので同じ理屈が成り立つ）。
-	 * つまりこの画面が
+	 * スナップショットや、既に確保済みの `SystemInfoSampler` を読むだけで、
+	 * PLC への追加ポーリング要求は一切発生しない。つまりこの画面が
 	 * リロードする頻度を上げても実機の負荷は増えないので、WebSocket/SSE
 	 * 差分配信を新設するより単純な定期ポーリングで十分（WebSocket は
 	 * 実装指示でも明示的にスコープ外）。
@@ -59,12 +63,10 @@
 	import { isAdmin } from '$lib/permissions';
 	import {
 		getHubStatus,
-		getHubValues,
 		type ConnectionStatusEntry,
-		type StatusResponse,
-		type ValueEntry,
-		type ValuesResponse
+		type StatusResponse
 	} from '$lib/banto/hubStatus';
+	import { formatBytes, formatPercent } from '$lib/banto/systemInfoFormat';
 	import { listPlcConnections, isVirtualConnection } from '$lib/banto/tagRegistryAdmin';
 	import { enableWriteControl, disableWriteControl } from '$lib/banto/writeControlAdmin';
 	import {
@@ -123,37 +125,11 @@
 		return 'bad';
 	}
 
-	const qualityLabels: Record<string, string> = {
-		good: '良好',
-		bad: '不良',
-		stale: '陳腐化'
-	};
-
-	function qualityLabel(q: string): string {
-		return qualityLabels[q] ?? q;
-	}
-
-	/** 品質での色分け（実装指示: good=通常, bad=danger, stale=muted）。 */
-	function qualityClass(q: string): string {
-		if (q === 'bad') return 'bad';
-		if (q === 'stale') return 'stale';
-		return 'good';
-	}
-
-	function formatTime(epochMs: number): string {
-		return new Date(epochMs).toLocaleString('ja-JP');
-	}
-
 	function formatDateTime(value: string): string {
 		return new Date(value).toLocaleString('ja-JP');
 	}
 
-	function formatValue(entry: ValueEntry): string {
-		return entry.v === null ? '-' : String(entry.v);
-	}
-
 	let status: StatusResponse | null = $state(null);
-	let values: ValuesResponse | null = $state(null);
 	let pendingChanges = $state<PendingChange[]>([]);
 	let loading = $state(true);
 	let lastErrorShownAt = 0;
@@ -165,13 +141,11 @@
 
 	async function poll(): Promise<void> {
 		try {
-			const [nextStatus, nextValues, nextPending] = await Promise.all([
+			const [nextStatus, nextPending] = await Promise.all([
 				getHubStatus(),
-				getHubValues(),
 				hubAdmin ? listPendingChanges() : Promise.resolve<PendingChange[]>([])
 			]);
 			status = nextStatus;
-			values = nextValues;
 			pendingChanges = nextPending;
 		} catch (err) {
 			const now = Date.now();
@@ -632,6 +606,26 @@
 		{/if}
 	</section>
 
+	<section>
+		<h2>サーバーリソース</h2>
+		{#if loading && !status}
+			<p class="note">読み込み中…</p>
+		{:else if status}
+			<dl class="summary">
+				<dt>CPU 使用率</dt>
+				<dd>{formatPercent(status.system.cpu_percent)}</dd>
+				<dt>プロセスメモリ（RSS）</dt>
+				<dd>{formatBytes(status.system.process_memory_bytes)}</dd>
+				<dt>ホストメモリ</dt>
+				<dd>
+					{formatBytes(status.system.host_memory_used_bytes)} / {formatBytes(
+						status.system.host_memory_total_bytes
+					)}
+				</dd>
+			</dl>
+		{/if}
+	</section>
+
 	<section id="collection-control">
 		<h2>収集の開始・停止</h2>
 		{#if !status}
@@ -881,43 +875,6 @@
 			</div>
 		{/if}
 	</section>
-
-	<section>
-		<h2>タグ現在値</h2>
-		{#if loading && !values}
-			<p class="note">読み込み中…</p>
-		{:else if values}
-			<p class="note">
-				{values.values.length}件のタグ ・ 更新時刻: {formatTime(values.t)}
-			</p>
-			{#if values.values.length === 0}
-				<p class="note">登録されているタグがありません。</p>
-			{:else}
-				<div class="table-wrap">
-					<table class="values-table">
-						<thead>
-							<tr>
-								<th>外部名</th>
-								<th>値</th>
-								<th>品質</th>
-								<th>時刻</th>
-							</tr>
-						</thead>
-						<tbody>
-							{#each values.values as entry (entry.tag)}
-								<tr>
-									<td class="tag-name">{entry.tag}</td>
-									<td class="value quality-{qualityClass(entry.q)}">{formatValue(entry)}</td>
-									<td class="quality quality-{qualityClass(entry.q)}">{qualityLabel(entry.q)}</td>
-									<td>{formatTime(entry.t)}</td>
-								</tr>
-							{/each}
-						</tbody>
-					</table>
-				</div>
-			{/if}
-		{/if}
-	</section>
 </div>
 
 <style>
@@ -1019,25 +976,8 @@
 		overflow-y: auto;
 	}
 
-	.tag-name {
-		font-family: var(--banto-font-mono, monospace);
-	}
-
 	.pending-source {
 		font-family: var(--banto-font-mono, monospace);
-	}
-
-	.quality-good {
-		color: var(--banto-text);
-	}
-
-	.quality-bad {
-		color: var(--banto-danger);
-		font-weight: 600;
-	}
-
-	.quality-stale {
-		color: var(--banto-text-muted);
 	}
 
 	.state-chip {

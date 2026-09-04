@@ -1030,3 +1030,44 @@ async fn settings_defaults_are_port_8722_and_retention_7_days() {
     assert_eq!(store.retention_days, Some(DEFAULT_RETENTION_DAYS));
     assert_eq!(store.data_dir, "./data");
 }
+
+// ---------------------------------------------------------------------------
+// T19 S3-b（docs/banto-hub-t19-design.md §3.9、UX-46「サーバー状態の拡充」）:
+// `GET /api/v1/status` の `system`（CPU%・メモリ）がもっともらしい値で
+// 載ることを確認する。CPU% は初回サンプルで 0 になりうる
+// （`crate::system_info::SystemInfoSampler`のモジュール doc comment参照）
+// ため `>= 0.0` のみを検証し、メモリはプロセス RSS・ホスト使用/総量が
+// いずれも正の値で、使用量が総量を超えないことを確認する。
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_reports_plausible_system_cpu_and_memory() {
+    let app = test_app("status-system-info").await;
+
+    let (status_code, status_json) = get_json(&app.router, "/api/v1/status", &app.token).await;
+    assert_eq!(status_code, StatusCode::OK);
+
+    let system = &status_json["system"];
+    let cpu_percent = system["cpu_percent"].as_f64().expect("cpu_percent");
+    assert!(cpu_percent >= 0.0, "cpu_percent must not be negative");
+
+    let process_memory_bytes = system["process_memory_bytes"]
+        .as_u64()
+        .expect("process_memory_bytes");
+    assert!(
+        process_memory_bytes > 0,
+        "this process's own RSS should be non-zero"
+    );
+
+    let host_used = system["host_memory_used_bytes"]
+        .as_u64()
+        .expect("host_memory_used_bytes");
+    let host_total = system["host_memory_total_bytes"]
+        .as_u64()
+        .expect("host_memory_total_bytes");
+    assert!(host_total > 0, "host total memory should be non-zero");
+    assert!(
+        host_used <= host_total,
+        "host used memory ({host_used}) must not exceed total ({host_total})"
+    );
+}

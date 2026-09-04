@@ -89,6 +89,9 @@ tonic = { workspace = true }
 tonic-prost = { workspace = true }
 prost = { workspace = true }
 tokio-stream = { workspace = true }
+# T19 S3-b（docs/banto-hub-t19-design.md §3.9、UX-46）: system_info.rs の
+# CPU/メモリサンプラー。
+sysinfo = { workspace = true }
 
 [build-dependencies]
 # T4（docs/tag-server-design.md §5.4）: build.rs が proto/tagserver/v1/*.proto
