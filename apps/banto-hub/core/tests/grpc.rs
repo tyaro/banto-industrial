@@ -1726,7 +1726,7 @@ async fn stream_values_with_a_read_colon_key_only_resolves_the_in_scope_tag() {
     sim.set_word(SlmpDevice::D, 100, 10);
     sim.set_word(SlmpDevice::D, 200, 20);
 
-    let (name1, _name2) = seed_two_connections_two_tags(&app, sim.addr.port()).await;
+    let (name1, name2) = seed_two_connections_two_tags(&app, sim.addr.port()).await;
 
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -1783,14 +1783,35 @@ async fn stream_values_with_a_read_colon_key_only_resolves_the_in_scope_tag() {
     );
     assert_eq!(initial.values[0].tag, name1);
 
-    // スコープ外の値変更ではストリームに何も届かない(タイムアウトで確認 -
-    // `tests/stream.rs`の`assert_no_more_data_for`と同じ意図)。
+    // スコープ外の値変更後、600msのウィンドウ内にスコープ外タグ(name2)を
+    // 含む`ValueBatch`が来ないことを確認する。#244: 素朴に「600ms以内は
+    // 何も届かないこと」を要求すると、スコープ内タグ(name1)の spurious な
+    // on_change再送(品質のみの再送・旧値の再送。下の`drain_until_value`と
+    // 同じレース)を拾って誤って落ちる。真に検証すべきは「スコープ外タグが
+    // 漏れて届かないこと」であって「一切何も届かないこと」ではないため、
+    // ウィンドウ内はメッセージを drain し、`name2`を含むバッチが来た場合
+    // だけ失敗させる(スコープ漏れ=本物のバグ)。
     sim.set_word(SlmpDevice::D, 200, 999);
-    let silence = tokio::time::timeout(Duration::from_millis(600), stream.message()).await;
-    assert!(
-        silence.is_err(),
-        "an out-of-scope tag change must not produce a ValueBatch: {silence:?}"
-    );
+    let silence_deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+    loop {
+        let remaining = silence_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, stream.message()).await {
+            Ok(Ok(Some(batch))) => {
+                let leaked = batch.values.iter().any(|v| v.tag == name2);
+                assert!(
+                    !leaked,
+                    "an out-of-scope tag change must not produce a ValueBatch carrying it: {batch:?}"
+                );
+                // スコープ内タグ(name1)の spurious な再送。drain して継続する。
+            }
+            Ok(Ok(None)) => panic!("stream ended unexpectedly while checking for scope leaks"),
+            Ok(Err(err)) => panic!("stream should not error: {err}"),
+            Err(_) => break, // deadline reached with no (more) messages: no leak observed.
+        }
+    }
 
     // スコープ内の値変更は引き続き届く。旧値(10)を載せた spurious な
     // quality-only on_change バッチが先に届きうるレース(H7 ⑤ - grpc.rs の

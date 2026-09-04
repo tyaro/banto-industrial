@@ -62,6 +62,7 @@ H5 relay-wright E2E 完了・banto-tagclient S4a 統合を反映）。
 | [improvement-plan.md](improvement-plan.md)                 | Hardening（H1〜H10）の設計・進捗ログ。                                                                 |
 | [recorder-requirements.md](recorder-requirements.md)       | 記録計（chronogazer）R0 要件定義。R1〜R4 スコープの正。                                                |
 | [r1-plan.md](r1-plan.md)                                   | 記録計 R1 実施計画。                                                                                   |
+| [real-machine-mcp-2026-09.md](real-machine-mcp-2026-09.md) | **実機 MCP 動作検証（T19 S5/UX-41）**。3接続×全型の読み書きと安全ゲートの実機記録。                    |
 
 ### トピック別の「正」（重複時はここを見る）
 
