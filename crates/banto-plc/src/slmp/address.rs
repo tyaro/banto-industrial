@@ -290,6 +290,79 @@ impl std::fmt::Display for SlmpDevice {
 /// MELSEC words are 16 bits, positions `0..=15`.
 pub const MAX_BIT_POSITION: u8 = 15;
 
+/// The address-notation conventions a *register-based* PLC protocol
+/// declares - SLMP, Modbus, and any future register-addressed protocol this
+/// crate learns to speak. Node-id-based protocols (OPC UA and the like) have
+/// no device-number-plus-bit-suffix shape at all and stay on their own
+/// [`crate::address::Address`] variant and parser; they are not meant to
+/// implement this trait.
+///
+/// A new register protocol declares its bit-suffix convention once, as an
+/// `impl` of this trait on its own zero-sized dialect marker
+/// ([`SlmpDialect`], [`crate::address::ModbusDialect`]), and reuses
+/// [`parse_bit_suffix`] instead of re-deriving the
+/// split/validate/parse/range-check logic from scratch (T20-④ follow-up:
+/// this trait is what the earlier const-plus-shared-helper version of this
+/// refactor grew into once a second register protocol was on the roadmap).
+/// Device-number radix rules ([`SlmpDevice::radix`]) could grow into a
+/// method here too, if a future protocol needs the same treatment.
+pub trait RegisterAddressDialect {
+    /// Radix the bit-in-word suffix (`.N`) is written in. SLMP=16 (MELSEC
+    /// engineering tools always write the bit-within-word position as a
+    /// single hex digit, `.0`-`.F` - independent of [`SlmpDevice::radix`],
+    /// which governs the *device number*'s radix instead); Modbus=10
+    /// (Modbus tooling convention).
+    fn bit_suffix_radix(&self) -> u32;
+
+    /// Maximum digit count the bit-in-word suffix accepts. SLMP=1 (exactly
+    /// one hex digit - `.F`, never the equivalent two-digit `.0F`);
+    /// Modbus=2 (one or two decimal digits, `.3` or `.15`).
+    fn bit_suffix_max_len(&self) -> usize;
+}
+
+/// SLMP's [`RegisterAddressDialect`]: bit suffix is one hexadecimal digit
+/// (`.0`-`.F`), see [`parse`]'s doc comment for why.
+pub struct SlmpDialect;
+
+impl RegisterAddressDialect for SlmpDialect {
+    fn bit_suffix_radix(&self) -> u32 {
+        16
+    }
+
+    fn bit_suffix_max_len(&self) -> usize {
+        1
+    }
+}
+
+/// Parse a bit-in-word suffix - the text after the `.` in e.g. SLMP's
+/// `"D100.5"` or Modbus's `"40001.3"` ([`crate::address::Address::parse`]) -
+/// shared by every [`RegisterAddressDialect`] impl in this crate: not empty,
+/// at most `dialect.bit_suffix_max_len()` characters, every character a
+/// valid digit in `dialect.bit_suffix_radix()`, and the resulting value no
+/// greater than [`MAX_BIT_POSITION`] (15 - a word is 16 bits). Only the
+/// radix and the maximum digit count differ per protocol, and those now live
+/// solely in each dialect's `impl` - this one function is the entire shared
+/// parse/validate skeleton, so a third register protocol needs nothing more
+/// than its own dialect type to reuse it.
+pub(crate) fn parse_bit_suffix(
+    dialect: &impl RegisterAddressDialect,
+    bit_text: &str,
+) -> Option<u8> {
+    let radix = dialect.bit_suffix_radix();
+    let max_len = dialect.bit_suffix_max_len();
+    if bit_text.is_empty() || bit_text.chars().count() > max_len {
+        return None;
+    }
+    if !bit_text.chars().all(|c| c.is_digit(radix)) {
+        return None;
+    }
+    let value = u32::from_str_radix(bit_text, radix).ok()?;
+    if value > MAX_BIT_POSITION as u32 {
+        return None;
+    }
+    Some(value as u8)
+}
+
 /// Parse MELSEC device notation into `(device, number, bit)`.
 ///
 /// Accepts leading/trailing whitespace (trimmed, same as
@@ -363,23 +436,9 @@ pub(crate) fn parse(raw: &str) -> Result<(SlmpDevice, u32, Option<u8>), PlcError
             // Exactly one hex digit - `.A` not `.0A`, and never decimal
             // `.10`/`.15` (see this function's doc comment for why the
             // suffix is hex, not decimal). `upper` already uppercased any
-            // lowercase `a`-`f`, but `is_ascii_hexdigit` accepts both cases
-            // regardless.
-            let mut chars = bit_text.chars();
-            let (Some(bit_char), None) = (chars.next(), chars.next()) else {
-                return Err(invalid());
-            };
-            if !bit_char.is_ascii_hexdigit() {
-                return Err(invalid());
-            }
-            // Safe: a single hex digit parses as a `u8` in `0..=15` outright,
-            // so the MAX_BIT_POSITION check below is redundant here but kept
-            // for symmetry with the wire ceiling checks elsewhere in this
-            // function.
-            let bit = bit_char.to_digit(16).ok_or_else(invalid)? as u8;
-            if bit > MAX_BIT_POSITION {
-                return Err(invalid());
-            }
+            // lowercase `a`-`f`, and `parse_bit_suffix`'s `char::is_digit`
+            // check accepts both cases regardless.
+            let bit = parse_bit_suffix(&SlmpDialect, bit_text).ok_or_else(invalid)?;
             (base, Some(bit))
         }
         None => (upper.as_str(), None),
