@@ -105,7 +105,7 @@ use crate::write_rate::WriteRateLimiter;
 
 // --- shared helpers (users/audit/RBAC - copied from chronogazer/relay-wright's rest.rs) ---
 
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -115,7 +115,9 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 /// `banto_server::require_auth`'s own 401 body, reproduced here for
 /// `require_tag_space_auth` (T0-2's `/api/v1/*` auth middleware below) since
 /// that middleware replaces `require_auth` entirely rather than wrapping it.
-fn unauthorized_response() -> Response {
+/// T19 S5: `crate::mcp`'s `POST /mcp` auth middleware reuses this same body
+/// for all of its (simplified, single-status) auth failure branches.
+pub(crate) fn unauthorized_response() -> Response {
     (StatusCode::UNAUTHORIZED, Json(ErrorBody::Unauthorized)).into_response()
 }
 
@@ -6047,9 +6049,12 @@ impl From<ApplyReport> for LastApplyEntry {
     }
 }
 
-/// `GET /api/v1/status` の応答。
+/// `GET /api/v1/status` の応答。T19 S5: `crate::mcp`の`get_server_status`
+/// ツールが[`compute_status`]をそのまま呼んで`serde_json::to_value`で
+/// 包み直すため`pub(crate)`（フィールド自体へは触れない - トレイト経由の
+/// シリアライズのみ）。
 #[derive(Debug, Serialize, ToSchema)]
-struct StatusResponse {
+pub(crate) struct StatusResponse {
     version: String,
     revision: u64,
     configured_revision: u64,
@@ -6114,7 +6119,7 @@ struct StatusResponse {
 /// `crate::hub::CollectorManager::sync_slmp_sessions_from`'s doc comment for
 /// why such a connection has no broker session to report on in the first
 /// place.
-async fn compute_status(state: &TagSpaceState) -> Result<StatusResponse, ApiError> {
+pub(crate) async fn compute_status(state: &TagSpaceState) -> Result<StatusResponse, ApiError> {
     let runtime = state.controller.status();
     let revision = state.manager.configured_revision();
     let last_config_error = state.manager.last_error();
@@ -6890,7 +6895,9 @@ struct WriteValueResponse {
 /// `unsupported_value_type` を返す）。REST 固有の wire 形式（JSON の `v`）
 /// からの変換であり、gRPC 側は `oneof num|bool` を直接分解するだけで
 /// 済むため、この関数は `crate::write_path` へは移していない。
-fn parse_requested_value(v: &serde_json::Value) -> Option<crate::write_path::RequestedValue> {
+pub(crate) fn parse_requested_value(
+    v: &serde_json::Value,
+) -> Option<crate::write_path::RequestedValue> {
     use crate::write_path::RequestedValue;
     if let Some(b) = v.as_bool() {
         Some(RequestedValue::Bool(b))
@@ -7739,7 +7746,30 @@ fn api_router_with_controller_mode(
             mqtt.clone(),
             system_info.clone(),
             auth.clone(),
+            commissioning_state.clone(),
+        ))
+        // T19 S5（docs/banto-hub-t19-design.md §3.7、UX-41）: `POST /mcp` -
+        // `tag_space_router`と同じ形で、CSRF レイヤー（`admin`）の外側に
+        // `.merge()`する。API キー認証（`bh_`のみ、`crate::mcp`のモジュール
+        // doc comment「認証」節参照）を自前で持つため、CSRF ヘッダは不要
+        // （`/api/v1/*`と同じ扱い）。以降の各引数は他ルーターと同じ
+        // `Arc`/サービスを`.clone()`で配る（`crate::mcp::mcp_router`の
+        // doc comment「呼び出し元は...同じインスタンスを渡すこと」参照）-
+        // 直後の`tag_space_router`呼び出しがこれらの元の値を消費(move)する
+        // ので、ここでは必ず`.clone()`する。
+        .merge(crate::mcp::mcp_router(
+            manager.clone(),
+            controller.clone(),
+            api_keys.clone(),
+            write_audit.clone(),
+            write_control.clone(),
+            rate_limiter.clone(),
+            events.clone(),
             commissioning_state,
+            test_output.clone(),
+            mqtt.clone(),
+            system_info.clone(),
+            !legacy_live_reconfigure,
         ))
         .merge(tag_space_router(
             manager,

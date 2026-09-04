@@ -83,6 +83,14 @@
 //!   （コンソール）と `bin/banto_hub/win_service.rs`（Windows サービス）の
 //!   両ホストから呼ばれる薄い composition root。以前は bin 側の
 //!   `hub_run::run(shutdown)` だった
+//! - [`mcp`]: T19 S5（docs/banto-hub-t19-design.md §3.7、UX-41）。MCP
+//!   （Model Context Protocol）サーバー - 既存の axum サーバーへ `POST /mcp`
+//!   （自前の最小 JSON-RPC 2.0、新規クレート依存なし）として統合する。
+//!   認証は既存の `bh_` API キー機構を流用し、書き込みツールは
+//!   `crate::write_path::execute_write` をそのまま呼んでゲートを一切
+//!   迂回しない。`crate::commissioning::CommissioningState::is_locked_down`
+//!   と連動し、ロックダウン後は書き込みを実行せずアドバイザリのみを返す
+//!   （[`mcp`]のモジュール doc comment参照）
 //! - [`hub_log`]: T14-1 でバイナリクレートからこの lib へ移設した出力
 //!   ヘルパー（[`runtime`] が composition root としてここに来たため）。
 //!   `println!`/`eprintln!` の薄いラッパーで、Windows サービスモードの
@@ -176,6 +184,7 @@ pub mod http_hub_health;
 pub mod hub;
 pub mod hub_health;
 pub mod hub_log;
+pub mod mcp;
 pub mod mqtt;
 pub mod pending_changes;
 pub mod profile_acl;
