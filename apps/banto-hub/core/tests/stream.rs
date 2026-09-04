@@ -532,7 +532,13 @@ async fn subscribe_exact_tag_gets_initial_snapshot_then_on_change_data() {
 
     sim.set_holding_register(0, 200);
 
-    let changed = recv_matching(&mut ws, |m| m["op"] == "data" && m["id"] == 1).await;
+    // #244 と同系統: 値変更直後は旧値(100)を載せた spurious な quality-only
+    // on_change 再送が先に届きうる(grpc.rs の drain_until_value・PR #139 参照)
+    // ため、述語に新値(200)の照合を足して、それが届くまで drain する。
+    let changed = recv_matching(&mut ws, |m| {
+        m["op"] == "data" && m["id"] == 1 && m["values"][0]["v"] == 200.0
+    })
+    .await;
     let values = changed["values"].as_array().unwrap();
     assert_eq!(values.len(), 1);
     assert_eq!(values[0]["v"], 200.0);
@@ -862,7 +868,13 @@ async fn unsubscribe_stops_further_data() {
 
     // Prove data actually flows before we unsubscribe.
     sim.set_holding_register(0, 2);
-    let changed = recv_matching(&mut ws, |m| m["op"] == "data" && m["id"] == 5).await;
+    // #244 と同系統: 値変更直後は旧値(1)を載せた spurious な quality-only
+    // on_change 再送が先に届きうる(grpc.rs の drain_until_value・PR #139 参照)
+    // ため、述語に新値(2)の照合を足して、それが届くまで drain する。
+    let changed = recv_matching(&mut ws, |m| {
+        m["op"] == "data" && m["id"] == 5 && m["values"][0]["v"] == 2.0
+    })
+    .await;
     assert_eq!(changed["values"][0]["v"], 2.0);
 
     send_json(&mut ws, json!({ "op": "unsubscribe", "id": 5 })).await;
