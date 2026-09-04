@@ -2,7 +2,8 @@
  * 連続登録の基数/bit 連番（T18-3c、docs/banto-hub-t18-design.md
  * 「T18-3c 連続登録の基数/bit 連番」、TAG-UX-D）の実 DOM 受け入れテスト。
  * 受け入れ条件: `X1E→X1F→X20`（16進デバイス番号の桁上がり）、
- * `D100.14→D100.15→D101.0`（ワード内 bit 連番）。
+ * `D100.E→D100.F→D101.0`（ワード内 bit 連番。bit サフィックスは T20-④で
+ * 16進表記に是正済み — 旧テストの `D100.14→D100.15` は10進表記だった）。
  *
  * `banto-hub-tags-continuous.spec.ts` のプレビュー検証手法（`.preview-table
  * tbody tr` のセル値を見る）に倣う DOM 専用テスト（登録までは行わない）。
@@ -117,11 +118,11 @@ test.describe.serial('banto-hub 連続登録の基数/bit 連番 (T18-3c)', () =
 		await expectPreviewAddresses(['X1E', 'X1F', 'X20']);
 	});
 
-	test('2. ワード内 bit 連番: 開始 D100.14・bit・点数3 → D100.14, D100.15, D101.0', async () => {
+	test('2. ワード内 bit 連番: 開始 D100.E・bit・点数3 → D100.E, D100.F, D101.0', async () => {
 		const drawer = page.getByRole('dialog', { name: '連続登録' });
 		await drawer.getByLabel('データ型').selectOption({ value: 'bit' });
-		await drawer.getByLabel('開始アドレス').fill('D100.14');
+		await drawer.getByLabel('開始アドレス').fill('D100.E');
 		await drawer.getByLabel('点数').fill('3');
-		await expectPreviewAddresses(['D100.14', 'D100.15', 'D101.0']);
+		await expectPreviewAddresses(['D100.E', 'D100.F', 'D101.0']);
 	});
 });

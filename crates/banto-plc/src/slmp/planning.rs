@@ -721,7 +721,7 @@ mod tests {
     #[test]
     fn all_sixteen_bit_positions_of_one_word_share_a_single_read() {
         let requests: Vec<ReadRequest> = (0..=15)
-            .map(|bit| req(&format!("D200.{bit}"), DataType::Bit))
+            .map(|bit| req(&format!("D200.{bit:X}"), DataType::Bit))
             .collect();
         let outcome = plan_slmp_requests(&requests);
         assert!(outcome.immediate_bad.is_empty());

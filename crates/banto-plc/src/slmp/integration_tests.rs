@@ -93,10 +93,10 @@ async fn bit_in_word_tag_shares_the_ordinary_word_read_and_extracts_its_bit() {
     client.connect().await.expect("connect should succeed");
 
     let requests = [
-        req("D100.5", DataType::Bit),  // set
-        req("D100.0", DataType::Bit),  // clear
-        req("D100.15", DataType::Bit), // clear (top bit)
-        req("D100", DataType::U16),    // plain numeric read of the same word
+        req("D100.5", DataType::Bit), // set
+        req("D100.0", DataType::Bit), // clear
+        req("D100.F", DataType::Bit), // clear (top bit, hex bit 15 - T20-④)
+        req("D100", DataType::U16),   // plain numeric read of the same word
     ];
     let results = client.read_batch(&requests).await.expect("read_batch ok");
 
@@ -118,7 +118,7 @@ async fn bit_in_word_tag_decodes_every_bit_position() {
     client.connect().await.expect("connect should succeed");
 
     let requests: Vec<ReadRequest> = (0..=15)
-        .map(|bit| req(&format!("D200.{bit}"), DataType::Bit))
+        .map(|bit| req(&format!("D200.{bit:X}"), DataType::Bit))
         .collect();
     let results = client.read_batch(&requests).await.expect("read_batch ok");
 

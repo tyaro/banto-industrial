@@ -53,7 +53,7 @@
 //! whole dead batch.
 
 use crate::error::PlcError;
-use crate::slmp::address::{self as slmp_address, SlmpDevice};
+use crate::slmp::address::{self as slmp_address, RegisterAddressDialect, SlmpDevice};
 
 /// Which register/coil space an [`Address`] falls in, and (via
 /// [`crate::planning`]) which Modbus function code reads it.
@@ -67,6 +67,22 @@ use crate::slmp::address::{self as slmp_address, SlmpDevice};
 /// `banto_plc::address::AddressArea` path is unchanged - see
 /// `banto-plc-address`'s module doc for the full reasoning.
 pub use banto_plc_address::AddressArea;
+
+/// Modbus's [`RegisterAddressDialect`]: bit suffix is one or two decimal
+/// digits (`.0`-`.15`), matching Modbus tooling convention - unlike SLMP's
+/// hex convention ([`crate::slmp::address::SlmpDialect`]; see
+/// [`Address::parse`]'s doc comment for why the two protocols differ here).
+pub struct ModbusDialect;
+
+impl RegisterAddressDialect for ModbusDialect {
+    fn bit_suffix_radix(&self) -> u32 {
+        10
+    }
+
+    fn bit_suffix_max_len(&self) -> usize {
+        2
+    }
+}
 
 /// A parsed, protocol-ready PLC address. Which variant a tag gets is decided
 /// once, by which parser the caller ran, which in turn follows the
@@ -140,10 +156,15 @@ impl Address {
     /// [`AddressArea::InputRegister`]/[`AddressArea::HoldingRegister`] - a
     /// coil/discrete-input reference number is already one bit, so a `.N`
     /// there is rejected the same way an unknown area prefix is, rather than
-    /// silently accepted as a redundant no-op. See
-    /// [`crate::slmp::address::parse`]'s doc comment for why the suffix is
-    /// decimal-only even though nothing else about Modbus reference numbers
-    /// is - the same §6.1 reasoning applies to both notations.
+    /// silently accepted as a redundant no-op.
+    ///
+    /// **This stays decimal even though [`crate::slmp::address::parse`]'s bit
+    /// suffix is hexadecimal** (T20-④, 2026-09-04 owner decision) - the two
+    /// protocols simply use different bases for this notation, each matching
+    /// its own tooling's convention (Modbus tooling writes a register's bit
+    /// position in decimal; MELSEC tooling writes it in hex, `.0`-`.F`). This
+    /// is not an inconsistency to "fix" by unifying the two; see that
+    /// module's parser doc comment for the MELSEC side of the story.
     pub fn parse(raw: &str) -> Result<Self, PlcError> {
         let trimmed = raw.trim();
         let invalid = || PlcError::InvalidAddress(raw.to_string());
@@ -154,16 +175,8 @@ impl Address {
         // that the digit check just below rejects.
         let (base, bit) = match trimmed.split_once('.') {
             Some((base, bit_text)) => {
-                if bit_text.is_empty()
-                    || bit_text.len() > 2
-                    || !bit_text.chars().all(|c| c.is_ascii_digit())
-                {
-                    return Err(invalid());
-                }
-                let bit: u8 = bit_text.parse().map_err(|_| invalid())?;
-                if bit > crate::slmp::address::MAX_BIT_POSITION {
-                    return Err(invalid());
-                }
+                let bit =
+                    slmp_address::parse_bit_suffix(&ModbusDialect, bit_text).ok_or_else(invalid)?;
                 (base, Some(bit))
             }
             None => (trimmed, None),

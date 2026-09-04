@@ -10,7 +10,7 @@
 //! （2026-08-08、テスト一時ディレクトリリークの根治）。
 //!
 //! テスト構成:
-//! 1. 収集: 同一ワード（D100 = 0x1234）を D100.5 / D100.12 のビットタグ2本 +
+//! 1. 収集: 同一ワード（D100 = 0x1234）を D100.5 / D100.C のビットタグ2本 +
 //!    D100 のワードタグ1本で読む - 3タグとも正しい値、ワード読みは
 //!    デコード時にビット抽出されるだけで PLC への読み要求自体は共有される
 //!    （§6.1「同一ワードの16ビットを何タグ定義しても PLC 負荷は不変」）
@@ -433,7 +433,7 @@ async fn collection_reads_bit_and_word_tags_off_the_same_word() {
 
     let (_conn_id, group_id) = make_conn_and_group(&app, "line1", sim.addr.port()).await;
     add_tag(&app, group_id, "bit5", "D100.5", "bit", false).await;
-    add_tag(&app, group_id, "bit12", "D100.12", "bit", false).await;
+    add_tag(&app, group_id, "bit12", "D100.C", "bit", false).await;
     add_tag(&app, group_id, "word", "D100", "u16", false).await;
     app.manager.rebuild().await.expect("rebuild");
 

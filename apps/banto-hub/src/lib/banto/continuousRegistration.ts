@@ -60,8 +60,9 @@ export function addressIncrement(dataType: TagDataType, stringLength?: number | 
  *   （`number * 16 + bit`）とみなし、そこへ `index` を足してから
  *   16で割った商・余りに戻す。`step` は使わない（bit 連番は常に1行=1bit
  *   進む — ワード型の `step` を混ぜると「2bit飛ばし」のような意味の
- *   薄い増分になってしまうため）。例: `D100.14` → (i=1) `D100.15` →
- *   (i=2) `D101.0`（bit15 の次はワード+1・bit0）。
+ *   薄い増分になってしまうため）。例: `D100.E` → (i=1) `D100.F` →
+ *   (i=2) `D101.0`（bit15 の次はワード+1・bit0。bit 表記は T20-④で16進化
+ *   済み、`.E`/`.F` はそれぞれ bit 14/15）。
  * - **デバイス番号軸**（bit サフィックスが無い場合）: `number + step *
  *   index` をそのデバイスの基数で整形し直す。16進デバイス
  *   （X/Y/B/W/SB/SW/DX/DY）は16進の桁上がりが自然に起こる

@@ -108,25 +108,40 @@ describe('parseSlmpAddress: 基数', () => {
 	});
 });
 
-describe('parseSlmpAddress: bit サフィックス', () => {
-	it('ワードデバイスは .0〜.15 を受理する', () => {
-		expect(parseSlmpAddress('D100.15')?.bit).toBe(15);
+describe('parseSlmpAddress: bit サフィックス（T20-④: 16進1桁）', () => {
+	it('ワードデバイスは .0〜.F を受理する', () => {
+		expect(parseSlmpAddress('D100.F')?.bit).toBe(15);
 		expect(parseSlmpAddress('D100.0')?.bit).toBe(0);
+		expect(parseSlmpAddress('D100.A')?.bit).toBe(10);
 	});
 
-	it('.16 以上は拒否する', () => {
-		expect(parseSlmpAddress('D100.16')).toBeNull();
+	it('小文字の16進bit桁も受理する', () => {
+		expect(parseSlmpAddress('D100.a')?.bit).toBe(10);
+		expect(parseSlmpAddress('D100.f')?.bit).toBe(15);
+	});
+
+	it('bit サフィックスは16進基数デバイスでも同じ16進1桁を使う', () => {
+		// W はデバイス番号が16進、かつワードデバイス（X はビットデバイスなので
+		// bit サフィックス自体を受け付けない - 別の it で確認済み）。
+		expect(parseSlmpAddress('W10.A')?.bit).toBe(10);
+		expect(parseSlmpAddress('W0.F')?.bit).toBe(15);
+	});
+
+	it('2桁の10進表記（旧仕様の.10〜.15）はもう受理しない', () => {
+		expect(parseSlmpAddress('D100.10')).toBeNull();
+		expect(parseSlmpAddress('D100.15')).toBeNull();
 		expect(parseSlmpAddress('D0.99')).toBeNull();
 	});
 
-	it('ビットデバイスへの .N は拒否する（既にビット粒度のため）', () => {
-		for (const text of ['M50.0', 'X1A.3', 'Y0.15']) {
-			expect(parseSlmpAddress(text)).toBeNull();
-		}
+	it('16進として不正な文字は拒否する', () => {
+		expect(parseSlmpAddress('D100.G')).toBeNull();
+		expect(parseSlmpAddress('D100.Z')).toBeNull();
 	});
 
-	it('bit サフィックスは10進のみ（16進基数デバイスでも）', () => {
-		expect(parseSlmpAddress('W10.A')).toBeNull();
+	it('ビットデバイスへの .N は拒否する（既にビット粒度のため）', () => {
+		for (const text of ['M50.0', 'X1A.3', 'Y0.F']) {
+			expect(parseSlmpAddress(text)).toBeNull();
+		}
 	});
 
 	it('不正な bit サフィックスは拒否する', () => {
@@ -169,5 +184,15 @@ describe('parseSlmpAddress: 境界・その他', () => {
 describe('formatSlmpAddress', () => {
 	it('未知のニーモニックは例外を投げる', () => {
 		expect(() => formatSlmpAddress('Q', 1)).toThrow();
+	});
+
+	it('bit は大文字16進1桁で描画する（T20-④）', () => {
+		expect(formatSlmpAddress('D', 100, 15)).toBe('D100.F');
+		expect(formatSlmpAddress('D', 100, 10)).toBe('D100.A');
+	});
+
+	it('小文字入力でも往復すると大文字16進の正規表記になる', () => {
+		const parsed = parseSlmpAddress('d100.f');
+		expect(formatSlmpAddress(parsed!.mnemonic, parsed!.number, parsed!.bit)).toBe('D100.F');
 	});
 });

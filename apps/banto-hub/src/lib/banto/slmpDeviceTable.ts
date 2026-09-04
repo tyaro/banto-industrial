@@ -14,10 +14,15 @@
  *
  * `parseSlmpAddress`/`formatSlmpAddress` は Rust の `parse`/`format` と
  * 同じ規則（大文字小文字を無視、2文字ニーモニックを1文字より先に照合する
- * 最長一致、デバイスごとの基数、bit サフィックスは10進0〜15かつワード
- * デバイスのみ）を踏襲する。ただし Rust 版が返す `PlcError` は持たず、
+ * 最長一致、デバイスごとの基数、bit サフィックスは**16進1桁の0〜F**かつ
+ * ワードデバイスのみ）を踏襲する。ただし Rust 版が返す `PlcError` は持たず、
  * 失敗はすべて `null` として表現する（フロントの他の `*.ts` 純関数群と
  * 同じ判別共用体寄りの流儀）。
+ *
+ * **T20-④（2026-09-04 オーナー決定）: bit サフィックスの基数を10進→16進へ
+ * 是正**。Rust 側 `crates/banto-plc/src/slmp/address.rs` の同日修正
+ * （「MELSEC はビット位置を10進で書く」という誤った前提の是正 - 実際の
+ * MELSEC ツールは `.0`〜`.F` の16進で書く）に、この写しも追従した。
  */
 
 /** デバイス番号を表記する基数。X/Y/B/W/SB/SW/DX/DY が16、それ以外は10。 */
@@ -78,6 +83,7 @@ export const SLMP_DEVICE_TABLE: readonly SlmpDeviceInfo[] = DEVICE_TABLE;
 /**
  * `.N` bit サフィックスが取り得る最大値。MELSEC のワードは16bitなので
  * 0〜15（`crates/banto-plc/src/slmp/address.rs::MAX_BIT_POSITION` と同値）。
+ * 表記そのものは16進1桁（`.0`〜`.F`、T20-④）。
  */
 export const MAX_BIT_POSITION = 15;
 
@@ -102,8 +108,10 @@ export interface ParsedSlmpAddress {
  *
  * - 前後の空白は無視し、大文字小文字は区別しない。
  * - `.` があれば先に切り離す（最初の `.` で分割 — 複数 `.` を含む不正な
- *   文字列は bit 部分が数字だけにならず自動的に弾かれる）。bit 部分は
- *   1〜2桁の**10進**数字のみ、値は 0〜{@link MAX_BIT_POSITION}。
+ *   文字列は bit 部分が1文字だけにならず自動的に弾かれる）。bit 部分は
+ *   **ちょうど1桁の16進**数字（`0-9A-Fa-f`）のみ、値は 0〜{@link MAX_BIT_POSITION}
+ *   （T20-④、2026-09-04 オーナー決定 - 以前の実装は10進1〜2桁だったが、
+ *   これは MELSEC ツール表記についての事実誤認に基づく誤りだった）。
  * - 残りの先頭から {@link SLMP_DEVICE_TABLE} を順に前方一致で試し、最初に
  *   一致したデバイスを採用する（2文字ニーモニックが先）。
  * - デバイス名の後ろの数字列を、そのデバイスの {@link SlmpRadix} で解釈する
@@ -128,10 +136,10 @@ export function parseSlmpAddress(raw: string): ParsedSlmpAddress | null {
 	if (dotIndex !== -1) {
 		base = upper.slice(0, dotIndex);
 		const bitText = upper.slice(dotIndex + 1);
-		if (bitText.length === 0 || bitText.length > 2 || !/^[0-9]+$/.test(bitText)) {
+		if (bitText.length !== 1 || !/^[0-9A-F]$/.test(bitText)) {
 			return null;
 		}
-		const parsedBit = Number.parseInt(bitText, 10);
+		const parsedBit = Number.parseInt(bitText, 16);
 		if (parsedBit > MAX_BIT_POSITION) return null;
 		bit = parsedBit;
 	}
@@ -172,5 +180,5 @@ export function formatSlmpAddress(mnemonic: string, number: number, bit?: number
 		device.radix === 16
 			? `${device.mnemonic}${number.toString(16).toUpperCase()}`
 			: `${device.mnemonic}${number}`;
-	return bit === undefined ? base : `${base}.${bit}`;
+	return bit === undefined ? base : `${base}.${bit.toString(16).toUpperCase()}`;
 }

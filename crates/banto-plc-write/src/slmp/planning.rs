@@ -989,7 +989,7 @@ mod tests {
             &[
                 bwreq("D100.0", true),
                 bwreq("D100.5", false),
-                bwreq("D100.15", true),
+                bwreq("D100.F", true), // hex bit 15 (T20-④)
             ],
             LH,
         );
