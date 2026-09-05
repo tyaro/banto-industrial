@@ -80,7 +80,7 @@ use tokio::sync::broadcast;
 use tokio::sync::Mutex as AsyncMutex;
 
 use banto_core::ListParams;
-use banto_tags::{CollectionGroupService, PlcConnectionService};
+use banto_tags::{CollectionGroupService, PlcConnectionService, TagService, TagUpdateError};
 
 use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService};
 use crate::audit::{AuditEntry, AuditLogService};
@@ -92,7 +92,8 @@ use crate::pending_changes::PendingChangesService;
 use crate::rest::{
     bearer_token, commit_catalog_and_notify, compute_pending_base_fingerprint, compute_status,
     parse_requested_value, preflight_transaction, run_plc_connection_test, unauthorized_response,
-    CollectionGroupPayload, PlcConnectionPayload, PlcConnectionTestPayload, TagSpaceState,
+    CollectionGroupPayload, PlcConnectionPayload, PlcConnectionTestPayload, TagPayload,
+    TagSpaceState,
 };
 use crate::system_info::SystemInfoSampler;
 use crate::test_output::TestOutputControl;
@@ -189,6 +190,10 @@ struct McpState {
     /// 今スライスでは接続のみ扱うが、この関数の署名（REST と共有）は
     /// group ソースの分岐も持つため必要。
     collection_groups: CollectionGroupService,
+    /// T21 S1-d（docs/banto-hub-t21-design.md §4・§5）: タグ CRUD 用。
+    /// `TagService::new(manager.pool())`で構築（REST の
+    /// `tag_registry_router`と同じ生成方法）。
+    tags: TagService,
     /// `PendingChangesService::new(manager.pool())`で構築。
     pending_changes: PendingChangesService,
     /// 構成操作の監査（`origin:"mcp"`）用 - 呼び出し元
@@ -245,6 +250,8 @@ pub(crate) fn mcp_router(
     // なるだけで、状態は分裂しない。
     let plc_connections = PlcConnectionService::new(manager.pool());
     let collection_groups = CollectionGroupService::new(manager.pool());
+    // T21 S1-d: REST の `tag_registry_router`と同じ生成方法。
+    let tags = TagService::new(manager.pool());
     let pending_changes = PendingChangesService::new(manager.pool());
     let state = McpState {
         manager: manager.clone(),
@@ -258,6 +265,7 @@ pub(crate) fn mcp_router(
         status,
         plc_connections,
         collection_groups,
+        tags,
         pending_changes,
         audit,
         legacy_live_reconfigure,
@@ -705,6 +713,143 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // --- T21 S1-d（docs/banto-hub-t21-design.md §4・§5）: 構成補助ツール
+        // 第三弾（タグ CRUD）。S1-b/S1-c と同じゲート(admin スコープ必須・
+        // 有効化ガードなし)。`create_tag`/`update_tag`/`delete_tag`の
+        // properties は REST の `TagPayload`（`crate::rest`）と同じ wire
+        // フィールド一式。
+        json!({
+            "name": "get_tag",
+            "description": "指定した1タグの全フィールド(revision 含む)を返す(admin スコープ必須)。update_tag は全項目指定の PUT 置換のため、事前にこれで現在値を読んでから必要な項目だけ変更して送り返す read-modify-write に使う。副作用なし・監査対象外。list_tags(read スコープの一覧・サブセット)とは別物。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "取得するタグの id。" },
+                },
+                "required": ["id"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "create_tag",
+            "description": "タグを新規作成する(admin スコープ必須)。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "タグ名(グループ内で一意)。" },
+                    "collectionGroupId": { "type": "integer", "description": "所属する収集グループの id。" },
+                    "address": { "type": "string", "description": "PLC アドレス。" },
+                    "dataType": { "type": "string", "description": "データ型。" },
+                    "stringLength": {
+                        "type": "integer",
+                        "description": "dataType が string のとき必須(1-128、16bit ワード数)。",
+                    },
+                    "stringEncoding": {
+                        "type": "string",
+                        "description": "string タグの文字コード。既定値 utf8。",
+                    },
+                    "rawLo": { "type": "number", "description": "スケーリング入力下限。" },
+                    "rawHi": { "type": "number", "description": "スケーリング入力上限。" },
+                    "engLo": { "type": "number", "description": "スケーリング後工学値下限。" },
+                    "engHi": { "type": "number", "description": "スケーリング後工学値上限。" },
+                    "unit": { "type": "string", "description": "工学単位。" },
+                    "decimals": { "type": "integer", "description": "表示小数桁数。既定値 0。" },
+                    "thresholdH": { "type": "number", "description": "しきい値 H。" },
+                    "thresholdHh": { "type": "number", "description": "しきい値 HH。" },
+                    "thresholdL": { "type": "number", "description": "しきい値 L。" },
+                    "thresholdLl": { "type": "number", "description": "しきい値 LL。" },
+                    "enabled": { "type": "boolean", "description": "既定値 false。" },
+                    "writable": { "type": "boolean", "description": "書き込み許可。既定値 false。" },
+                    "tagKind": {
+                        "type": "string",
+                        "description": "plc/computed/internal のいずれか。既定値 plc。",
+                    },
+                    "expression": { "type": "string", "description": "computed タグの計算式。" },
+                    "retain": { "type": "boolean", "description": "internal タグの再起動時復元。既定値 false。" },
+                },
+                "required": ["name", "collectionGroupId", "address", "dataType"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "update_tag",
+            "description": "既存のタグを更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない) - get_tag で現在値を取得してから全項目を送り返すこと。expectedRevision を付けると楽観ロックになり、他者が先に更新していた場合は revision_conflict エラーで拒否される(get_tag で最新の revision を取り直して再試行)。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "更新するタグの id。" },
+                    "name": { "type": "string", "description": "タグ名(グループ内で一意)。" },
+                    "collectionGroupId": { "type": "integer", "description": "所属する収集グループの id。" },
+                    "address": { "type": "string", "description": "PLC アドレス。" },
+                    "dataType": { "type": "string", "description": "データ型。" },
+                    "stringLength": {
+                        "type": "integer",
+                        "description": "dataType が string のとき必須(1-128、16bit ワード数)。",
+                    },
+                    "stringEncoding": { "type": "string", "description": "string タグの文字コード。" },
+                    "rawLo": { "type": "number", "description": "スケーリング入力下限。" },
+                    "rawHi": { "type": "number", "description": "スケーリング入力上限。" },
+                    "engLo": { "type": "number", "description": "スケーリング後工学値下限。" },
+                    "engHi": { "type": "number", "description": "スケーリング後工学値上限。" },
+                    "unit": { "type": "string", "description": "工学単位。" },
+                    "decimals": { "type": "integer", "description": "表示小数桁数。" },
+                    "thresholdH": { "type": "number", "description": "しきい値 H。" },
+                    "thresholdHh": { "type": "number", "description": "しきい値 HH。" },
+                    "thresholdL": { "type": "number", "description": "しきい値 L。" },
+                    "thresholdLl": { "type": "number", "description": "しきい値 LL。" },
+                    "enabled": { "type": "boolean", "description": "タグを有効にするか。" },
+                    "writable": { "type": "boolean", "description": "書き込み許可。" },
+                    "tagKind": { "type": "string", "description": "plc/computed/internal のいずれか。" },
+                    "expression": { "type": "string", "description": "computed タグの計算式。" },
+                    "retain": { "type": "boolean", "description": "internal タグの再起動時復元。" },
+                    "expectedRevision": {
+                        "type": "integer",
+                        "description": "楽観ロック用(get_tag で取得した現在の revision)。省略するとロック無しで上書きする。",
+                    },
+                },
+                "required": [
+                    "id",
+                    "name",
+                    "collectionGroupId",
+                    "address",
+                    "dataType",
+                    "stringLength",
+                    "stringEncoding",
+                    "rawLo",
+                    "rawHi",
+                    "engLo",
+                    "engHi",
+                    "unit",
+                    "decimals",
+                    "thresholdH",
+                    "thresholdHh",
+                    "thresholdL",
+                    "thresholdLl",
+                    "enabled",
+                    "writable",
+                    "tagKind",
+                    "expression",
+                    "retain",
+                ],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "delete_tag",
+            "description": "タグを削除する(admin スコープ必須)。タグは末端リソースのため配下は無い(cascade ではない)が、収集済み履歴データは残る。不可逆操作のため confirm:true が必須。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "削除するタグの id。" },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "true を明示しないと拒否される(不可逆操作の確認)。",
+                    },
+                },
+                "required": ["id", "confirm"],
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -736,6 +881,10 @@ async fn handle_tools_call(
         "create_group" => tool_create_group(state, ctx, arguments).await?,
         "update_group" => tool_update_group(state, ctx, arguments).await?,
         "delete_group" => tool_delete_group(state, ctx, arguments).await?,
+        "get_tag" => tool_get_tag(state, ctx, arguments).await?,
+        "create_tag" => tool_create_tag(state, ctx, arguments).await?,
+        "update_tag" => tool_update_tag(state, ctx, arguments).await?,
+        "delete_tag" => tool_delete_tag(state, ctx, arguments).await?,
         other => {
             return Err(RpcError::invalid_params(format!("unknown tool: {other}")));
         }
@@ -1499,6 +1648,35 @@ const UPDATE_GROUP_REQUIRED_FIELDS: [&str; 6] = [
     "defaultWritable",
 ];
 
+/// [`tool_update_tag`]の必須キー一覧 - `TagPayload`の wire フィールド
+/// （camelCase）全部 + `id`。`expectedRevision`は楽観ロック用の任意項目
+/// なので含めない（設計 §4 実装指示 T21-S1d 参照）。inputSchema の
+/// `update_tag.required`と同期させること。
+const UPDATE_TAG_REQUIRED_FIELDS: [&str; 22] = [
+    "id",
+    "name",
+    "collectionGroupId",
+    "address",
+    "dataType",
+    "stringLength",
+    "stringEncoding",
+    "rawLo",
+    "rawHi",
+    "engLo",
+    "engHi",
+    "unit",
+    "decimals",
+    "thresholdH",
+    "thresholdHh",
+    "thresholdL",
+    "thresholdLl",
+    "enabled",
+    "writable",
+    "tagKind",
+    "expression",
+    "retain",
+];
+
 // --- 12. update_connection ----------------------------------------------------
 
 /// `crate::rest::plc_connections_update`（admin REST）と全く同じ mutation
@@ -2008,4 +2186,387 @@ async fn tool_delete_group(
     Ok(tool_ok(
         json!({ "deleted": true, "id": id, "cascade": cascade_detail }),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// T21 S1-d（docs/banto-hub-t21-design.md §3・§4）: 構成補助ツール第三弾
+// （タグ CRUD）。S1-b/S1-c（[`tool_create_connection`]/[`tool_update_connection`]/
+// [`tool_delete_connection`]）と全く同じ書き方をそのまま踏襲する - ゲート
+// （admin スコープ・監査・delete 系 confirm・update 系 全項目必須）・
+// mutation フロー（tx → preflight → commit → catalog commit、収集中は
+// pending queue）のどちらも二重実装しない。タグは末端リソースなので
+// delete は非 cascade（`TagService::delete_tx`、[`crate::rest::tags_delete`]
+// と同じ）。`update_tag`だけは他の update 系と異なり
+// `TagService::update_tx`が`TagUpdateError`（`Banto`/`RevisionConflict`の
+// 2バリアント）を返す - REST の `tags_update`（`crate::rest`）の match を
+// そのままミラーする。
+// ---------------------------------------------------------------------------
+
+// --- 18. get_tag ----------------------------------------------------------
+
+/// RMW（read-modify-write）用の読み取り専用ツール - `update_tag`が全項目
+/// 指定の PUT 置換を要求するため、クライアントはまずこれで現在の全
+/// フィールド（`revision`含む）を取得してから必要な項目だけ変更して
+/// 送り返す。副作用が無いので監査もしない（[`tool_list_connections`]と
+/// 同じ「読み取り系は監査しない」規律）。read スコープの一覧ツール
+/// [`tool_list_tags`]とは別物（admin・単一・全フィールド）。
+async fn tool_get_tag(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let id = arguments
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RpcError::invalid_params("arguments.id (integer) is required"))?;
+
+    match state.tags.get(id).await {
+        Ok(tag) => Ok(tool_ok(json!({ "tag": tag }))),
+        Err(err) => Ok(tool_error(format!("タグの取得に失敗しました: {err}"))),
+    }
+}
+
+// --- 19. create_tag ----------------------------------------------------
+
+/// `crate::rest::tags_create`（admin REST）と全く同じ mutation フロー -
+/// [`tool_create_connection`]と同型（対象サービスが`state.tags`、
+/// source/resource が`"tags"`になる点だけが違う）。
+async fn tool_create_tag(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let input: TagPayload = serde_json::from_value(arguments)
+        .map_err(|err| RpcError::invalid_params(format!("タグの入力が不正です: {err}")))?;
+
+    let status = state.status.controller.status();
+    if status.state != CollectionState::Stopped {
+        let payload = json!({ "input": input });
+        let base_fingerprint = compute_pending_base_fingerprint(
+            &state.plc_connections,
+            &state.collection_groups,
+            "tags.create",
+            &payload,
+        )
+        .await;
+        let pending = match state
+            .pending_changes
+            .create_pending(
+                "tags.create",
+                &payload,
+                state.manager.configured_revision() as i64,
+                base_fingerprint.as_deref(),
+                Some(ctx.name.as_str()),
+                Some("api_key"),
+            )
+            .await
+        {
+            Ok(pending) => pending,
+            Err(err) => {
+                return Ok(tool_error(format!(
+                    "未適用キューへの保存に失敗しました: {err}"
+                )));
+            }
+        };
+        audit_config_action(
+            state,
+            ctx,
+            "create",
+            "tags",
+            None,
+            Some(json!({ "queued": true, "pendingId": pending.id, "name": input.name })),
+        )
+        .await;
+        return Ok(tool_ok(json!({
+            "queued": true,
+            "pendingId": pending.id,
+            "message": QUEUED_MESSAGE,
+        })));
+    }
+
+    let mut tx = match state.manager.pool().begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            return Ok(tool_error(format!(
+                "トランザクションの開始に失敗しました: {err}"
+            )));
+        }
+    };
+    let created = match state.tags.create_tx(&mut tx, input.into()).await {
+        Ok(created) => created,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(tool_error(format!("{err}")));
+        }
+    };
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(tool_error(format!("{}", err.0)));
+        }
+    };
+    if let Err(err) = tx.commit().await {
+        return Ok(tool_error(format!("コミットに失敗しました: {err}")));
+    }
+    audit_config_action(
+        state,
+        ctx,
+        "create",
+        "tags",
+        Some(&created.id.to_string()),
+        Some(json!({ "name": created.name, "enabled": created.enabled })),
+    )
+    .await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.status.controller,
+        &state.events,
+        "tags",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
+    Ok(tool_ok(json!({ "created": created })))
+}
+
+// --- 20. update_tag ----------------------------------------------------
+
+/// `crate::rest::tags_update`（admin REST）と全く同じ mutation フロー -
+/// [`tool_update_connection`]と同型だが、`TagService::update_tx`が
+/// `TagUpdateError`（`Banto`/`RevisionConflict`の2バリアント）を返す点が
+/// 違う - REST の `tags_update` の match をそのままミラーする
+/// （[`TagUpdateError`]のdoc comment参照）。
+async fn tool_update_tag(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    if let Some(err) = require_all_fields(&arguments, &UPDATE_TAG_REQUIRED_FIELDS) {
+        return Ok(err);
+    }
+    let id = arguments
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RpcError::invalid_params("arguments.id (integer) is required"))?;
+    let input: TagPayload = serde_json::from_value(arguments)
+        .map_err(|err| RpcError::invalid_params(format!("タグの入力が不正です: {err}")))?;
+
+    let status = state.status.controller.status();
+    if status.state != CollectionState::Stopped {
+        let payload = json!({ "id": id, "input": input });
+        let base_fingerprint = compute_pending_base_fingerprint(
+            &state.plc_connections,
+            &state.collection_groups,
+            "tags.update",
+            &payload,
+        )
+        .await;
+        let pending = match state
+            .pending_changes
+            .create_pending(
+                "tags.update",
+                &payload,
+                state.manager.configured_revision() as i64,
+                base_fingerprint.as_deref(),
+                Some(ctx.name.as_str()),
+                Some("api_key"),
+            )
+            .await
+        {
+            Ok(pending) => pending,
+            Err(err) => {
+                return Ok(tool_error(format!(
+                    "未適用キューへの保存に失敗しました: {err}"
+                )));
+            }
+        };
+        audit_config_action(
+            state,
+            ctx,
+            "update",
+            "tags",
+            Some(&id.to_string()),
+            Some(json!({ "queued": true, "pendingId": pending.id })),
+        )
+        .await;
+        return Ok(tool_ok(json!({
+            "queued": true,
+            "pendingId": pending.id,
+            "message": QUEUED_MESSAGE,
+        })));
+    }
+
+    let mut tx = match state.manager.pool().begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            return Ok(tool_error(format!(
+                "トランザクションの開始に失敗しました: {err}"
+            )));
+        }
+    };
+    let updated = match state.tags.update_tx(&mut tx, id, input.into()).await {
+        Ok(updated) => updated,
+        // T18-1と同じ楽観ロック競合 - REST の `tags_update` の match と
+        // 同じ2分岐（[`TagUpdateError`]のdoc comment参照）。
+        Err(TagUpdateError::RevisionConflict(current)) => {
+            let _ = tx.rollback().await;
+            return Ok(tool_error(format!(
+                "revision_conflict: タグが他で更新されています。get_tag で最新の revision を取得して再試行してください(現在の revision: {})。",
+                current.revision
+            )));
+        }
+        Err(TagUpdateError::Banto(err)) => {
+            let _ = tx.rollback().await;
+            return Ok(tool_error(format!("{err}")));
+        }
+    };
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(tool_error(format!("{}", err.0)));
+        }
+    };
+    if let Err(err) = tx.commit().await {
+        return Ok(tool_error(format!("コミットに失敗しました: {err}")));
+    }
+    audit_config_action(
+        state,
+        ctx,
+        "update",
+        "tags",
+        Some(&id.to_string()),
+        Some(json!({ "name": updated.name, "enabled": updated.enabled })),
+    )
+    .await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.status.controller,
+        &state.events,
+        "tags",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
+    Ok(tool_ok(json!({ "updated": updated })))
+}
+
+// --- 21. delete_tag ----------------------------------------------------
+
+/// `crate::rest::tags_delete`（admin REST）と全く同じ mutation フロー -
+/// [`tool_delete_connection`]と同型だが、タグは末端リソースのため
+/// `TagService::delete_tx`は cascade を持たない（[`banto_tags::TagService`]
+/// のdoc comment「No delete guard is needed here」参照）。不可逆操作のため
+/// `arguments.confirm == true` を要求する。
+async fn tool_delete_tag(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let id = arguments
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RpcError::invalid_params("arguments.id (integer) is required"))?;
+    let confirmed = arguments.get("confirm").and_then(Value::as_bool) == Some(true);
+    if !confirmed {
+        return Ok(tool_error(
+            "confirm_required: 削除は不可逆操作です。arguments.confirm:true を指定してください。",
+        ));
+    }
+
+    let status = state.status.controller.status();
+    if status.state != CollectionState::Stopped {
+        let payload = json!({ "id": id });
+        let base_fingerprint = compute_pending_base_fingerprint(
+            &state.plc_connections,
+            &state.collection_groups,
+            "tags.delete",
+            &payload,
+        )
+        .await;
+        let pending = match state
+            .pending_changes
+            .create_pending(
+                "tags.delete",
+                &payload,
+                state.manager.configured_revision() as i64,
+                base_fingerprint.as_deref(),
+                Some(ctx.name.as_str()),
+                Some("api_key"),
+            )
+            .await
+        {
+            Ok(pending) => pending,
+            Err(err) => {
+                return Ok(tool_error(format!(
+                    "未適用キューへの保存に失敗しました: {err}"
+                )));
+            }
+        };
+        audit_config_action(
+            state,
+            ctx,
+            "delete",
+            "tags",
+            Some(&id.to_string()),
+            Some(json!({ "queued": true, "pendingId": pending.id })),
+        )
+        .await;
+        return Ok(tool_ok(json!({
+            "queued": true,
+            "pendingId": pending.id,
+            "message": QUEUED_MESSAGE,
+        })));
+    }
+
+    let mut tx = match state.manager.pool().begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            return Ok(tool_error(format!(
+                "トランザクションの開始に失敗しました: {err}"
+            )));
+        }
+    };
+    if let Err(err) = state.tags.delete_tx(&mut tx, id).await {
+        let _ = tx.rollback().await;
+        return Ok(tool_error(format!("{err}")));
+    }
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(tool_error(format!("{}", err.0)));
+        }
+    };
+    if let Err(err) = tx.commit().await {
+        return Ok(tool_error(format!("コミットに失敗しました: {err}")));
+    }
+    audit_config_action(state, ctx, "delete", "tags", Some(&id.to_string()), None).await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.status.controller,
+        &state.events,
+        "tags",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
+    Ok(tool_ok(json!({ "deleted": true, "id": id })))
 }
