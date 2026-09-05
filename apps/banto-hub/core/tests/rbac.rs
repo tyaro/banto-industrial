@@ -12,7 +12,10 @@
 //! 1. `require_editor`ゲート(rest.rs 全13箇所)- viewer は全対象で 403
 //! 2. editor は`require_editor`ゲートを通って実際に書ける(admin も同様)
 //! 3. admin 限定ルート(`RoleGuard{min: Role::Admin}`)- editor/viewer は
-//!    403、admin は通過(403 以外)
+//!    403、admin は実際にそのルートへ到達し認可を通過して2xxを返す
+//!    (「403 以外」だけだと 404/405 でも通ってしまい、ルート消失や
+//!    メソッド変更を検出できないため、admin には有効 payload を渡して
+//!    具体的な成功ステータスまで確認する)
 
 use axum::body::Body;
 use axum::http::{Request as HttpRequest, StatusCode};
@@ -446,7 +449,7 @@ async fn admin_can_also_write_through_the_require_editor_gate() {
 
 // ---------------------------------------------------------------------------
 // T3: admin 限定ルート(`RoleGuard{min: Role::Admin}`)- editor/viewer は
-// 403、admin は通過(403 以外)
+// 403、admin は通過して2xxを返す
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -454,27 +457,41 @@ async fn editor_is_forbidden_by_admin_only_role_guard_and_admin_is_allowed() {
     let app = test_app("rbac-t3").await;
     let tokens = role_tokens(&app).await;
 
-    // (method, path, payload-for-admin) - 認可は payload 検証より前に発火
-    // するので viewer/editor の 403 には payload は無関係(空 object で
-    // よい)。admin の正対照だけ、その handler の request 型に対して妥当な
-    // payload を渡す(認可を通過した後、業務検証で 4xx にならない範囲)。
-    let cases: Vec<(&str, &str, Value)> = vec![
+    // (method, path, payload-for-admin, expected admin status) - 認可は
+    // payload 検証より前に発火するので viewer/editor の 403 には payload は
+    // 無関係(空 object でよい)。admin の正対照だけ、その handler の
+    // request 型に対して妥当な payload を渡し、admin が実際にその管理
+    // ルートへ到達して認可を通過したことを示す 2xx(具体的なステータスまで)
+    // を確認する - `apps/banto-hub/core/tests/{write,grpc,mqtt}.rs`の
+    // 同エンドポイント向けテストで実際に 2xx が返ることを確認済みの
+    // payload をそのまま借用している(`scopes: ["read"]`は
+    // `src/api_keys.rs::validate_scope`が唯一トークン無しで許可する
+    // スコープ)。
+    let cases: Vec<(&str, &str, Value, StatusCode)> = vec![
         (
             "POST",
             "/api/api-keys",
-            json!({ "name": "rbac-admin-key", "scopes": [] }),
+            json!({ "name": "rbac-admin-key", "scopes": ["read"] }),
+            StatusCode::CREATED,
         ),
-        ("POST", "/api/collection/start", json!({})),
-        ("POST", "/api/write-control/enable", json!({})),
+        ("POST", "/api/collection/start", json!({}), StatusCode::OK),
+        (
+            "POST",
+            "/api/write-control/enable",
+            json!({}),
+            StatusCode::OK,
+        ),
         (
             "PUT",
             "/api/audit-log/config",
             json!({ "retentionDays": 30, "retentionRows": 1000 }),
+            StatusCode::OK,
         ),
         (
             "PUT",
             "/api/grpc-settings",
             json!({ "enabled": false, "port": 50051 }),
+            StatusCode::OK,
         ),
         (
             "PUT",
@@ -488,10 +505,11 @@ async fn editor_is_forbidden_by_admin_only_role_guard_and_admin_is_allowed() {
                 "qos": 0,
                 "minIntervalMs": 1000,
             }),
+            StatusCode::OK,
         ),
     ];
 
-    for (method, path, admin_payload) in &cases {
+    for (method, path, admin_payload, expected_admin_status) in &cases {
         let (editor_status, editor_body) =
             admin_write(&app.router, method, path, &tokens.editor, json!({})).await;
         assert_eq!(
@@ -516,12 +534,12 @@ async fn editor_is_forbidden_by_admin_only_role_guard_and_admin_is_allowed() {
             admin_payload.clone(),
         )
         .await;
-        assert_ne!(
-            admin_status,
-            StatusCode::FORBIDDEN,
-            "{method} {path} should be allowed (not FORBIDDEN) for admin - the RoleGuard itself \
-             should let it through even if the underlying payload is otherwise rejected, got \
-             {admin_status} ({admin_body:?})"
+        assert_eq!(
+            admin_status, *expected_admin_status,
+            "{method} {path} should let admin through the RoleGuard and reach the handler \
+             (a bare \"not FORBIDDEN\" check would also pass on a lost route or wrong method - \
+             404/405 - so this asserts the actual expected success status), got {admin_status} \
+             ({admin_body:?})"
         );
     }
 }
