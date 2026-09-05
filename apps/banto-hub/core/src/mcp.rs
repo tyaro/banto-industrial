@@ -218,8 +218,8 @@ struct McpState {
     /// `SettingsService::new(manager.pool())`で構築（`crate::rest`の各
     /// 設定ハンドラと同じ生成方法）。
     settings: SettingsService,
-    /// `set_grpc_settings`が`GrpcServer::apply`を呼ぶための共有インスタンス
-    /// - 呼び出し元（`mcp_router`引数）が REST の`grpc_settings_router`と
+    /// `set_grpc_settings`が`GrpcServer::apply`を呼ぶための共有インスタンス。
+    /// 呼び出し元（`mcp_router`引数）が REST の`grpc_settings_router`と
     /// **同じ** `Arc`を渡す。
     grpc_server: Arc<crate::grpc::GrpcServer>,
 }
