@@ -1,16 +1,16 @@
 # banto-rtsp 基礎クレート設計
 
 作成日: 2026-08-13
-状態: Draft（Phase 1コード/ローカルcapability・上位レビュー完了、実機/配布確認待ち）
-最終検証日: 2026-08-14
+状態: Draft（Phase 1 実装は main にマージ済み。実機/配布確認待ち）
+最終検証日: 2026-09-06
 
 ## 位置づけ
 
 `banto-rtsp` は、public な `banto-industrial` で再利用できる RTSP 共通層の
 第一スライスである。アプリケーション固有の Tauri UI や Banto-HUB 接続を
 持たず、値・エラー・JPEG処理とFFmpeg process/supervisor ownershipを提供する。
-`codex/banto-rtsp-foundation`上のPhase 1実装は上位レビューと独立検証まで完了しているが、
-現時点では未コミット・未プッシュである。
+Phase 1実装は上位レビューと独立検証まで完了しており、`crates/banto-rtsp` として
+main にマージ済みである（PR #208、2026-09-06 追記）。
 
 ## 初版の非スコープ
 

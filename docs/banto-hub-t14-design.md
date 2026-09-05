@@ -1,7 +1,11 @@
 # banto-hub T14 詳細設計（ランタイム状態管理・制御面分離）
 
+> **📦 アーカイブ（2026-09-06）**: T14（ランタイム状態管理・制御面分離）は実装完了。現行の設計判断は
+> [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) / [tag-server-design.md](tag-server-design.md)
+> に吸収済み。経緯として保存。
+
 作成日: 2026-08-09
-状態: **設計確定。主要判断 P1〜P6 を 2026-08-09 オーナー承認。** T14-1〜T14-4 実装済み
+状態: **アーカイブ（役目終了・経緯として保存）**。設計確定・主要判断 P1〜P6 を 2026-08-09 オーナー承認。T14-1〜T14-4 実装済み
 （`banto-hub-desktop-plan.md` 冒頭「T14・T15 完了」。`runtime.rs`(T14-1)、
 `controller.rs`(T14-2)、`hub.rs` の `commit_catalog`/`apply_run`/
 `configured_revision`/`running_revision`(T14-3)、`rest.rs` の admin 制御 API +
