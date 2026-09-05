@@ -592,7 +592,7 @@ mod tests {
     /// still planned with their original indices.
     #[test]
     fn a_string_request_is_immediately_bad_on_modbus_without_blocking_batch_mates() {
-        use crate::types::{BatchReadRequest, StringReadRequest};
+        use crate::types::{BatchReadRequest, StringEncoding, StringReadRequest};
 
         let requests = [
             BatchReadRequest::String(StringReadRequest {
@@ -602,6 +602,7 @@ mod tests {
                     bit: None,
                 },
                 words: 4,
+                encoding: StringEncoding::ShiftJis,
             }),
             BatchReadRequest::Numeric(req(AddressArea::HoldingRegister, 10, DataType::I16)),
             BatchReadRequest::Numeric(req(AddressArea::HoldingRegister, 0, DataType::Bit)), // bad

@@ -1299,11 +1299,14 @@ mod tests {
         })
     }
 
-    /// A string read request, the `String` case of the mixed batch.
+    /// A string read request, the `String` case of the mixed batch. T20 ①b:
+    /// Shift-JIS explicitly (this broker's test simulator seeds strings via
+    /// `Simulator::set_string`, which is Shift-JIS-only).
     fn sreq(raw: &str, words: u16) -> BatchReadRequest {
         BatchReadRequest::String(StringReadRequest {
             address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw}: {e}")),
             words,
+            encoding: banto_plc::StringEncoding::ShiftJis,
         })
     }
 

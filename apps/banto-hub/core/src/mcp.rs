@@ -384,6 +384,21 @@ fn tool_definitions() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "read_tag_now",
+            "description": "指定した1タグを PLC からその場で直接読む(収集キャッシュ current_values/tstore を経由しない)。収集パイプラインから除外されている文字列タグを読める唯一の手段(T20 ①b)。数値タグは通常の読み取り値と同じスケール済みの工学値を返す。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tag": {
+                        "type": "string",
+                        "description": "外部名 {connection}.{group}.{tag}",
+                    },
+                },
+                "required": ["tag"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
             "name": "get_server_status",
             "description": "サーバー状態(収集状態・接続一覧・書き込み受付・ロックダウン有無等)を返す。",
             "inputSchema": {
@@ -457,6 +472,7 @@ async fn handle_tools_call(
     let result = match name {
         "list_tags" => tool_list_tags(state, ctx),
         "read_tag_values" => tool_read_tag_values(state, ctx, arguments)?,
+        "read_tag_now" => tool_read_tag_now(state, ctx, arguments).await?,
         "get_server_status" => tool_get_server_status(state, ctx).await,
         "write_tag_value" => tool_write_tag_value(state, ctx, arguments).await?,
         "write_recipe" => tool_write_recipe(state, ctx, arguments).await?,
@@ -585,6 +601,46 @@ fn tool_read_tag_values(
         .collect();
 
     Ok(tool_ok(json!({ "values": values })))
+}
+
+// --- 2b. read_tag_now (T20 ①b、docs/banto-hub-t20-design.md §3.1) ---------
+
+/// `read_tag_now` - `crate::read_path::execute_read_now`をそのまま呼ぶだけ
+/// (`crate::rest::v1_value_read_now`と全く同じ形で委譲する - ①a の
+/// `write_tag_value`が`execute_write`へ委譲するのと同じ規律、二重実装
+/// しない)。ロックダウンの前後を問わず同じ挙動(このモジュールの doc
+/// comment「ロックダウン連動の安全ポリシー」の最後の一文参照 - 読み取り系
+/// ツールはロックダウンに関係しない)。
+async fn tool_read_tag_now(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if !ctx.has_any_read() {
+        return Ok(tool_error(MISSING_READ_SCOPE));
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let tag = arguments
+        .get("tag")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::invalid_params("arguments.tag (string) is required"))?
+        .to_string();
+
+    // H10 ③と同じ規律(`tool_read_tag_values`参照): per-tag read スコープ外
+    // は読ませない。
+    if !ctx.can_read_value(&tag) {
+        return Ok(tool_error(format!(
+            "missing_read_scope: タグ '{tag}' を読む read:{{name}}/read:{{connection}}.{{group}}.* スコープを持つ API キーが必要です。"
+        )));
+    }
+
+    match crate::read_path::execute_read_now(state.manager.as_ref(), &tag).await {
+        Ok(value) => Ok(tool_ok(json!({
+            "tag": value.tag,
+            "value": crate::read_path::plc_value_to_json(&value.value),
+        }))),
+        Err(rejection) => Ok(tool_error(rejection.to_json().to_string())),
+    }
 }
 
 // --- 3. get_server_status ------------------------------------------------

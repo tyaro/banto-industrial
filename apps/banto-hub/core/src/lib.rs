@@ -190,6 +190,7 @@ pub mod pending_changes;
 pub mod profile_acl;
 pub mod profile_lock;
 pub mod profile_paths;
+pub mod read_path;
 pub mod rest;
 pub mod runtime;
 pub mod service_elevated;

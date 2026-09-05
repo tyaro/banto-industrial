@@ -18,7 +18,7 @@
 //! A bespoke `WriteValue { U16(u16), I32(i32), ... }` would push that
 //! validation onto every caller instead.
 
-use banto_plc::{Address, DataType, TagValue};
+use banto_plc::{Address, DataType, StringEncoding, TagValue};
 
 /// One target to write: where, how to interpret it on the wire, and the value.
 /// `Copy` like [`banto_plc::ReadRequest`], so a rule engine can build these in
@@ -65,34 +65,19 @@ impl WriteResult {
 // app-side changes that belong to S2. Strings enter through a parallel layer
 // that wraps the numeric type unchanged.
 
-/// Character encoding used to render a [`StringWriteRequest`]'s text onto the
-/// wire (T20 ①a, docs/banto-hub-t20-design.md §3.1, 2026-09-04 オーナー
-/// 決定: 「文字コードは既定 UTF-8、タグ単位で Shift-JIS も選択可」). Selects
-/// which `encoding_rs` table [`crate::encode::encode_string_value`] uses; the
-/// byte-packing convention itself (low byte first within each word - MELSEC's
-/// storage convention) is unaffected by this choice, exactly as
-/// [`banto_plc::WordOrder`] only ever governs 32-bit numeric word order, never
-/// a string's byte order within a word.
-///
-/// **Why this crate's Shift-JIS-only behaviour predates this enum**: every
-/// site that already built a [`StringWriteRequest`] before T20 ①a (relay-wright's
-/// `apps/relay-wright/core/src/engine/writer.rs`/`monitor.rs`, this crate's own
-/// planner/integration tests, `banto-broker`'s example/tests) wrote Shift-JIS
-/// unconditionally. Adding this field to the struct necessarily touches every
-/// one of those call sites (Rust struct literals cannot omit a new field), so
-/// the owner decision above ("relay-wright の挙動を変えないこと") is kept by
-/// having every pre-existing site pass [`StringEncoding::ShiftJis`] explicitly,
-/// never by giving the field a silently-assumed default. Only
-/// `apps/banto-hub`'s write path (new in this slice) ever passes
-/// [`StringEncoding::Utf8`], and only when the registered tag's
-/// `banto_tags::Tag::string_encoding` says so.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StringEncoding {
-    /// The hub's new default for newly registered string tags.
-    Utf8,
-    /// This crate's pre-T20 behaviour, and relay-wright's only encoding.
-    ShiftJis,
-}
+// `StringEncoding` used to be defined right here (T20 ①a). T20 ①b
+// (docs/banto-hub-t20-design.md §3.1) moved it to `banto-plc` and this crate
+// now re-exports it (`pub use banto_plc::StringEncoding` in this crate's
+// `lib.rs`) instead of defining its own: ①b's `banto_plc::StringReadRequest`
+// needed the identical vocabulary for decoding, and `banto-plc-write` depends
+// on `banto-plc` (never the reverse - see this crate's `Cargo.toml` module
+// doc), so only `banto-plc` can hold a type both directions share. The
+// wire-visible name `banto_plc_write::StringEncoding` is unchanged by this
+// move - every ①a call site (relay-wright's `writer.rs`/`monitor.rs`,
+// `banto-broker`'s driver/examples) keeps compiling unmodified. See
+// `banto_plc::StringEncoding`'s own doc comment for the full rationale
+// (Shift-JIS-only history, why every pre-T20 call site passes it explicitly
+// rather than getting a default).
 
 /// One MELSEC string target to write: where, the fixed span in consecutive
 /// 16-bit word devices (`banto-tags::Tag::string_length`), the text, and the

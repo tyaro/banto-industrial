@@ -424,7 +424,7 @@ async fn initialize_returns_tool_capabilities() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tools_list_returns_the_five_tools() {
+async fn tools_list_returns_the_six_tools() {
     let app = test_app("tools-list").await;
     let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
 
@@ -438,6 +438,7 @@ async fn tools_list_returns_the_five_tools() {
         vec![
             "get_server_status",
             "list_tags",
+            "read_tag_now",
             "read_tag_values",
             "write_recipe",
             "write_tag_value",

@@ -341,6 +341,7 @@ async fn phase3_string_roundtrip() -> Result<(), String> {
     let read_result = read_mixed_once(&[BatchReadRequest::String(StringReadRequest {
         address: addr("D3020"),
         words,
+        encoding: banto_plc::StringEncoding::ShiftJis,
     })])
     .await?;
     println!("[3] 文字列読戻結果: {read_result:?}");

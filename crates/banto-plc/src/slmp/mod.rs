@@ -599,9 +599,11 @@ pub async fn execute_slmp_reads(
 /// String spans are fetched exactly like numeric ones - the group is one raw
 /// `u16` window on the wire - and only the scatter step differs: a
 /// [`ReadKind::Str`] span goes through `decode.rs::decode_string_value`
-/// (low-byte-first per word, Shift-JIS, NUL-trimmed) into
-/// [`PlcValue::Str`]. `word_order` applies to 32-bit *numeric* decoding only;
-/// a string's byte order is fixed by MELSEC's storage convention, not
+/// (low-byte-first per word, NUL-trimmed, decoded per its `encoding` field -
+/// T20 ①b, docs/banto-hub-t20-design.md §3.1; pre-①b this was
+/// unconditionally Shift-JIS) into [`PlcValue::Str`]. `word_order` applies to
+/// 32-bit *numeric* decoding only; a string's byte order is fixed by
+/// MELSEC's storage convention, not
 /// configurable per device family.
 pub async fn execute_slmp_batch_reads(
     client: &mut slmp::SLMPClient,
@@ -629,10 +631,14 @@ pub async fn execute_slmp_batch_reads(
                                     word_order,
                                 )
                                 .map(PlcValue::from),
-                                ReadKind::Str { words: span } => decode_string_value(
+                                ReadKind::Str {
+                                    words: span,
+                                    encoding,
+                                } => decode_string_value(
                                     words,
                                     m.offset_in_read as usize,
                                     span as usize,
+                                    encoding,
                                 )
                                 .map(PlcValue::Str),
                                 // T8 (docs/tag-server-design.md §6.1): one

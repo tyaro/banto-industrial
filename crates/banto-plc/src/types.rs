@@ -113,10 +113,54 @@ pub enum ReadResult {
 // unchanged; the numeric-only API keeps its exact shape and the S2 broker can
 // move to the batch API to mix numeric and string reads in one call.
 
-/// One MELSEC string tag to read: where, and how many consecutive 16-bit word
+/// Character encoding used to decode a [`StringReadRequest`]'s word span off
+/// the wire (T20 ①b, docs/banto-hub-t20-design.md §3.1, read-on-demand -
+/// mirrors ①a's write-side [`StringWriteRequest::encoding`] one-for-one).
+/// Selects which `encoding_rs` table `decode.rs::decode_string_value` uses;
+/// the byte-packing convention itself (low byte first within each word -
+/// MELSEC's storage convention) is unaffected by this choice, exactly as
+/// [`crate::decode::WordOrder`] only ever governs 32-bit numeric word order,
+/// never a string's byte order within a word.
+///
+/// **Defined here, not in `banto-plc-write`, even though ①a's
+/// `StringWriteRequest` needed the identical enum first**: `banto-plc-write`
+/// depends on `banto-plc` (never the reverse - see `banto-plc-write/Cargo.toml`'s
+/// module doc), so only this crate can hold a type both directions share.
+/// `banto-plc-write` now re-exports this one (`pub use banto_plc::StringEncoding`
+/// in its `lib.rs`) instead of defining its own - the wire-visible name
+/// `banto_plc_write::StringEncoding` is unchanged for every ①a call site
+/// (relay-wright's `writer.rs`/`monitor.rs`, `banto-broker`'s driver/examples),
+/// so none of them needed to change for this move.
+///
+/// **Why this crate's Shift-JIS-only read behaviour predates this enum**:
+/// every site that already built a [`StringReadRequest`] before T20 ①b
+/// (relay-wright's `apps/relay-wright/core/src/engine/poller.rs`, this
+/// crate's own planner/integration tests, `banto-broker`'s example/tests)
+/// read Shift-JIS unconditionally. Adding this field to the struct
+/// necessarily touches every one of those call sites (Rust struct literals
+/// cannot omit a new field), so the owner decision ("relay-wright の挙動を
+/// 変えないこと") is kept the same way ①a kept it on the write side: every
+/// pre-existing site passes [`StringEncoding::ShiftJis`] explicitly, never a
+/// silently-assumed default. Only `apps/banto-hub`'s read-on-demand path
+/// (new in this slice) ever passes [`StringEncoding::Utf8`], and only when
+/// the registered tag's `banto_tags::Tag::string_encoding` says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StringEncoding {
+    /// The hub's default for newly registered string tags (matches ①a's
+    /// write-side default).
+    Utf8,
+    /// This crate's pre-T20 read behaviour, and relay-wright's only encoding.
+    ShiftJis,
+}
+
+/// One MELSEC string tag to read: where, how many consecutive 16-bit word
 /// devices it occupies (`banto-tags::Tag::string_length`; SJIS capacity =
-/// 2 bytes per word). Decoding is fixed - Shift-JIS, low byte of each word
-/// first, trimmed at the first NUL - see `decode.rs::decode_string_value`.
+/// 2 bytes per word), and the [`StringEncoding`] to decode it with (T20 ①b -
+/// pre-①b, decoding was unconditionally Shift-JIS; see [`StringEncoding`]'s
+/// doc comment for why every pre-①b call site now passes
+/// `StringEncoding::ShiftJis` explicitly rather than getting a default).
+/// Byte order is fixed regardless of encoding - low byte of each word first,
+/// trimmed at the first NUL - see `decode.rs::decode_string_value`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StringReadRequest {
     pub address: Address,
@@ -124,6 +168,11 @@ pub struct StringReadRequest {
     /// read; the registry caps it at 128). Out-of-range values become a
     /// per-request `Bad`, never a panic.
     pub words: u16,
+    /// T20 ①b: which `encoding_rs` table decodes the word span. Required
+    /// (not `Option`/defaulted) for the same reason
+    /// `StringWriteRequest::encoding` is - see [`StringEncoding`]'s doc
+    /// comment.
+    pub encoding: StringEncoding,
 }
 
 /// One entry of a mixed batch: either an ordinary numeric/bit read (the
