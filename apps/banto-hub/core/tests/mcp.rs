@@ -106,6 +106,7 @@ fn tag_input(
         address: address.to_string(),
         data_type: data_type.to_string(),
         string_length: None,
+        string_encoding: "utf8".to_string(),
         raw_lo: None,
         raw_hi: None,
         eng_lo: None,
@@ -320,6 +321,36 @@ async fn make_tag(
         .create(tag_input(
             tag_name, group.id, address, data_type, writable, enabled,
         ))
+        .await
+        .unwrap();
+    app.manager.rebuild().await.expect("rebuild");
+    (tag.id, format!("{conn_name}.fast.{tag_name}"))
+}
+
+/// [`make_tag`]の string タグ版(T20 ①a、docs/banto-hub-t20-design.md
+/// §3.1)。`writable`/`enabled`は常に true。
+async fn make_string_tag(
+    app: &TestApp,
+    conn_name: &str,
+    port: u16,
+    tag_name: &str,
+    address: &str,
+    string_length: i64,
+) -> (i64, String) {
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(slmp_conn_input(conn_name, port))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn.id, 100))
+        .await
+        .unwrap();
+    let tag = TagService::new(app.pool.clone())
+        .create(TagInput {
+            string_length: Some(string_length),
+            string_encoding: "utf8".to_string(),
+            ..tag_input(tag_name, group.id, address, "string", true, true)
+        })
         .await
         .unwrap();
     app.manager.rebuild().await.expect("rebuild");
@@ -706,6 +737,52 @@ async fn write_before_lockdown_success_lands_on_the_wire_through_execute_write()
         })
         .await,
         "collection should read back the value MCP just wrote"
+    );
+
+    sim.stop();
+}
+
+/// T20 ①a (docs/banto-hub-t20-design.md §3.1): `write_tag_value` は文字列
+/// タグへの書き込みでも(数値と同様に)`execute_write`をそのまま通り、
+/// シミュレータのワイヤへ UTF-8 バイト列が届く。MCP がゲートを独自実装
+/// していない証拠(既存の数値テストと対になる)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_before_lockdown_string_tag_success_lands_utf8_bytes_on_the_wire() {
+    let app = test_app("write-success-string").await;
+    let sim = Simulator::start().await;
+    let (_tag_id, external_name) =
+        make_string_tag(&app, "line1", sim.addr.port(), "recipe", "D3000", 5).await;
+    app.write_control.enable();
+    let key = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:line1.fast.recipe"],
+    )
+    .await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call(
+            "write_tag_value",
+            json!({ "tag": external_name, "value": "テスト" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("\"result\":\"ok\""), "{text}");
+
+    let landed: Vec<u8> = (0..5)
+        .flat_map(|i| sim.get_word(SlmpDevice::D, 3000 + i).to_le_bytes())
+        .collect();
+    let mut expected = "テスト".as_bytes().to_vec();
+    expected.resize(10, 0x00);
+    assert_eq!(
+        landed, expected,
+        "MCP string write must go through the same execute_write gate as REST and land on the wire"
     );
 
     sim.stop();

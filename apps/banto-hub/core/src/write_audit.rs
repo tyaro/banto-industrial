@@ -118,6 +118,18 @@ impl WriteAuditRow {
         self
     }
 
+    /// T20 ①a(docs/banto-hub-t20-design.md §3.1): the `Option`-taking twin of
+    /// [`Self::with_value_requested`], for callers whose value may be a
+    /// string - `value_requested` is a `REAL` column that cannot hold text,
+    /// so a string write's audit row leaves it `NULL` (`None`) rather than a
+    /// misleading `0.0` (`crate::write_path::RequestedValue::as_audit_value`/
+    /// `ConvertedValue::as_audit_value` are the two callers that decide
+    /// `None` vs `Some`).
+    pub fn with_value_requested_opt(mut self, value: Option<f64>) -> Self {
+        self.value_requested = value;
+        self
+    }
+
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
         self

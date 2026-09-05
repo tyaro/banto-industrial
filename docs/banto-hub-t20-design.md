@@ -68,6 +68,24 @@ REST/MCP の値 DTO・書き込み経路）**の側にある。
 **スライス感**: 中〜大。値表現の拡張が要になるため、read パイプライン → write → エンコーディング選択、と
 段階を分ける。
 
+**方向の確定（オーナー決定 2026-09-05）: 案A（分離経路）。** 文字列タグは収集（記録計）
+パイプラインから意図的に除外されている（config.rs S1 制約・数値専用の境界。「文字列の消費者は
+S2 エンジン＝relay-wright」）。この境界を尊重し、**書き込みは write_path 経由**、**読み取りは
+その場読みの新経路**（①b）で扱い、current_values/tstore/収集の string スキップには触れない。
+
+**①a（文字列 write）: 完了（2026-09-05）。** `banto-plc-write` に `StringEncoding`(Utf8/ShiftJis)
+を追加し `StringWriteRequest.encoding` で選択（`encode.rs` の SHIFT_JIS 固定を解消）。共有型なので
+relay-wright の2箇所は `ShiftJis` を明示して**挙動保全**（Shift-JIS のまま・テスト全通過）。
+banto-tags に migration 0013 で `string_encoding` 列（既定 utf8・CHECK）を追加し `Tag`/`TagInput`
+へ配線。write_path は `RequestedValue::Str` を追加、gate 7（`convert_value`）が string タグに文字列
+のみ受け入れ（型対称）、`build_plc_string_write_request` で `BatchWriteRequest::String` を組み立て
+（単票・バッチ・MCP が自動対応）。監査 `value_requested`(REAL) は文字列では NULL（既知の限界＝
+文字列テキストは監査に残らない。将来スキーマ拡張が要る、と記録）。UTF-8/Shift-JIS が実機
+シミュレータのワイヤに正しいバイトで届くことをテスト固定。エンコーディング選択の登録 UI は
+①a では未追加（API/MCP で設定可。UI は任意）。
+
+**①b（文字列 read-on-demand）は別スライス**（current_values を経由しない直接読み）。
+
 ### 3.2 ②構造体タグ登録（デバイス自動割付・手動割付・オフセットコピー）
 
 **現状**: 一括作成 API（`POST /api/tags/batch`）と、フロントの `continuousRegistration.ts`

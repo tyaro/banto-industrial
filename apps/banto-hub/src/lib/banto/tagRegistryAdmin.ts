@@ -155,6 +155,12 @@ export type TagDataType = 'bit' | 'i16' | 'u16' | 'i32' | 'u32' | 'f32' | 'strin
  */
 export type TagKind = 'plc' | 'computed' | 'internal';
 
+/**
+ * `tags.string_encoding` vocabulary (T20 ①a, docs/banto-hub-t20-design.md
+ * §3.1) — mirrors `banto_tags::ALLOWED_STRING_ENCODINGS`.
+ */
+export type StringEncoding = 'utf8' | 'shift_jis';
+
 export const TAG_KIND_OPTIONS: { value: TagKind; label: string }[] = [
 	{ value: 'plc', label: 'plc（PLC 収集）' },
 	{ value: 'computed', label: 'computed（演算タグ）' },
@@ -173,6 +179,13 @@ export interface Tag {
 	 * iff `dataType === 'string'`, `null` otherwise.
 	 */
 	stringLength: number | null;
+	/**
+	 * T20 ①a (docs/banto-hub-t20-design.md §3.1, 2026-09-04 オーナー決定
+	 * 「文字コードは既定 UTF-8、タグ単位で Shift-JIS も選択可」): `string`
+	 * タグの書き込みに使うエンコーディング。数値/bit タグでも列自体は
+	 * 常に持つ（既定 `'utf8'`）が、`dataType !== 'string'` では未使用。
+	 */
+	stringEncoding: StringEncoding;
 	rawLo: number | null;
 	rawHi: number | null;
 	engLo: number | null;
@@ -208,6 +221,14 @@ export interface TagInput {
 	address: string;
 	dataType: TagDataType;
 	stringLength?: number | null;
+	/**
+	 * T20 ①a: `#[serde(default = "default_tag_string_encoding")]`（= `'utf8'`）
+	 * on the backend - omitting this still creates a UTF-8-encoded tag, so
+	 * existing callers of `createTag`/`updateTag` are unaffected. Registration
+	 * UI selection is out of scope for ①a; the field exists so a client can
+	 * opt a tag into `'shift_jis'` via the API directly.
+	 */
+	stringEncoding?: StringEncoding;
 	rawLo?: number | null;
 	rawHi?: number | null;
 	engLo?: number | null;

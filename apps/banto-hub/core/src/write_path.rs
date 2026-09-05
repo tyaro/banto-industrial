@@ -25,8 +25,9 @@
 //!   ここより外側にあるほうが自然 - `crate::api_keys::ApiKeyContext::has_write_scope`
 //!   を各ハンドラの冒頭で呼ぶ)。
 //! - **body/request のワイヤ形式からの値抽出**(REST の JSON
-//!   `{"v": <number|bool>}` パース、gRPC の `oneof num|bool` 分解)は
-//!   呼び出し元が済ませ、型情報を保った [`RequestedValue`] に正規化した
+//!   `{"v": <number|bool|string>}` パース(T20 ①a で文字列を追加)、gRPC の
+//!   `oneof num|bool` 分解(gRPC は本スライスの対象外 - 文字列書き込みは
+//!   REST/MCP のみ))は呼び出し元が済ませ、型情報を保った [`RequestedValue`] に正規化した
 //!   `Option<RequestedValue>`(`None` = 型として受理できない値 - REST の
 //!   422 `unsupported_value_type` に相当)を渡す。
 //!
@@ -50,14 +51,17 @@
 //! 7. レート制限 would_exceed → [`WriteRejection::RateLimited`] + キー
 //!    trip + `rate_limit_tripped` 記録
 //! 8. 値変換: まず [`RequestedValue`] の種別と data_type の対称性を検査する
-//!    (bit タグには bool のみ、数値タグには数値のみ - 暗黙の型変換はしない。
-//!    2026-08-06 追加、§4.2 の「タグ種別を跨いだ暗黙変換をしない」設計思想を
-//!    書き込み経路にも適用した)。一致しなければ
-//!    [`WriteRejection::UnsupportedValueType`]。一致すれば工学値 →
-//!    `banto_tags::unscale`(スケーリング設定があれば) → data_type に応じた
-//!    `banto_plc::TagValue`(数値は範囲チェックで
-//!    [`WriteRejection::ValueOutOfRange`])。文字列タグは
-//!    [`WriteRejection::UnsupportedValueType`] で拒否
+//!    (bit タグには bool のみ、数値タグには数値のみ、string タグには文字列
+//!    のみ - 暗黙の型変換はしない。2026-08-06 追加、§4.2 の「タグ種別を
+//!    跨いだ暗黙変換をしない」設計思想を書き込み経路にも適用した。T20 ①a で
+//!    string タグの対称性検査を追加)。一致しなければ
+//!    [`WriteRejection::UnsupportedValueType`]。数値/bit タグが一致すれば
+//!    工学値 → `banto_tags::unscale`(スケーリング設定があれば) →
+//!    data_type に応じた `banto_plc::TagValue`(数値は範囲チェックで
+//!    [`WriteRejection::ValueOutOfRange`])。string タグはスケーリングを
+//!    経由せず(登録時に禁止されている)、`banto_tags::Tag::string_encoding`
+//!    に応じた `banto_plc_write::StringWriteRequest` を組み立てる(T20 ①a、
+//!    このモジュールの「T20 ①a」節参照)
 //! 9. **log-before-write** → `CollectorManager::write_broker_handle_peek`
 //!    (T15-4、既存セッションの覗き見のみ・新規ダイヤルしない)経由の
 //!    `BrokerHandle::write`(1タグ=1リクエスト)→ set_result →
@@ -90,6 +94,35 @@
 //! 意味論を守るため、gate 7(値変換・拒否になりうる)の**後**、gate 8 の
 //! broker 呼び出しの**前**に record する(`crate::write_rate` のモジュール
 //! doc comment参照)。
+//!
+//! ## T20 ①a: 文字列タグへの書き込み(docs/banto-hub-t20-design.md §3.1、案A)
+//!
+//! [`RequestedValue::Str`] を追加し、gate 7([`convert_value`])が
+//! `data_type == "string"` タグに対して文字列を受け入れる([`ConvertedValue::Str`])。
+//! 書き込みは `banto_plc_write` の write_path 経由(`StringWriteRequest`)のみで、
+//! **記録計の read パス(current_values/tstore/収集タスクの string スキップ)
+//! には一切触れない**(案A の境界。文字列 read は①bの対象)。文字コードは
+//! `banto_tags::Tag::string_encoding`(既定 UTF-8、タグ単位で Shift-JIS も
+//! 選択可)から決まる - `banto-plc-write`の`StringEncoding`参照。
+//!
+//! **気づいた設計上の問題(監査の文字列 value 表現、率直な報告)**:
+//! `hub_write_audit.value_requested` は `REAL` 列で文字列を持てない。この
+//! スライスでは [`RequestedValue::as_audit_value`]/[`ConvertedValue::as_audit_value`]
+//! が文字列書き込みに対して常に `None`(NULL)を返す方針を採った - つまり
+//! **文字列書き込みの実際のテキストは、成功・失敗いずれの場合も
+//! `hub_write_audit` に一切残らない**(action/result/tag_id/api_key 等の
+//! メタデータは通常どおり記録される)。理由: `WriteAuditRow::detail` は
+//! `insert_pending` → `set_result` の2段階で最終的に `set_result` の引数
+//! (失敗理由、成功時は `None`)で必ず上書きされる仕組み(`write_audit.rs`の
+//! モジュール doc comment参照)のため、`insert_pending` 時点で `detail` へ
+//! 文字列テキストを仮置きしても成功時に消えてしまう。テキストを保持したい
+//! なら「成功時の `detail`」の意味を数値タグと非対称に変える(文字列タグの
+//! 成功時だけ `detail` にテキストを残す)か、専用列を追加するかの設計判断が
+//! 必要で、このスライスの範囲では見送った(オーナー確認事項として報告)。
+//! relay-wright の文字列監査(`apps/relay-wright/core/src/engine/monitor.rs`
+//! の `string_write_detail`)は独自の JSON detail 列を持ち、この制約を
+//! 免れている - hub の `hub_write_audit` スキーマを同じ形に広げるのは
+//! 本スライスの scope 外。
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -99,7 +132,8 @@ use banto_collect::Quality;
 use banto_core::BantoError;
 use banto_plc::{Address, DataType, TagValue as PlcTagValue};
 use banto_plc_write::{
-    BatchWriteRequest, WriteRequest as PlcWriteRequest, WriteResult as PlcWriteResult,
+    BatchWriteRequest, StringEncoding, StringWriteRequest, WriteRequest as PlcWriteRequest,
+    WriteResult as PlcWriteResult,
 };
 use banto_server::ServerEvent;
 use banto_tags::{
@@ -124,12 +158,16 @@ use crate::write_rate::WriteRateLimiter;
 /// どちらの型が来たかを潰さずに [`execute_write`] まで運び、gate 7 で
 /// data_type との対称性(bit タグには bool のみ、数値タグには数値のみ)を
 /// 検査するために存在する。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RequestedValue {
     /// 数値タグ向け。
     Num(f64),
     /// bit タグ向け(ビットデバイス・T8 のビット付きアドレスとも共通)。
     Bool(bool),
+    /// T20 ①a(docs/banto-hub-t20-design.md §3.1、案A): string タグ向け。
+    /// gate 7([`convert_value`])で `data_type == "string"` との対称性を
+    /// 検査する(string タグには文字列のみ、他のタグ種別に文字列は 422)。
+    Str(String),
 }
 
 impl RequestedValue {
@@ -137,17 +175,63 @@ impl RequestedValue {
     /// (`unscale`・範囲チェック・監査行の `value_requested` 列)が
     /// 引き続き `f64` 1本で扱えるようにする変換。`Bool` は
     /// `true` → `1.0` / `false` → `0.0`(相互変換の唯一の場所 - gate 7 通過後
-    /// はこの1回だけ `f64` へ潰す)。
-    fn as_f64(self) -> f64 {
+    /// はこの1回だけ `f64` へ潰す)。`Str` は数値として意味を持たないので
+    /// `0.0` を返す - **この戻り値は「文字列だった」ことを表せない**。gate
+    /// 5/6(gate 7 より前)の監査行が値を記録する際は、この関数ではなく
+    /// [`Self::as_audit_value`] を使うこと。
+    fn as_f64(&self) -> f64 {
         match self {
-            RequestedValue::Num(v) => v,
+            RequestedValue::Num(v) => *v,
             RequestedValue::Bool(b) => {
-                if b {
+                if *b {
                     1.0
                 } else {
                     0.0
                 }
             }
+            RequestedValue::Str(_) => 0.0,
+        }
+    }
+
+    /// gate 5/6(gate 7 の値変換より前)の監査行 `value_requested` 列向け。
+    /// `hub_write_audit.value_requested` は `REAL`(f64)専用の列で文字列を
+    /// 持てない - [`Self::Str`] は `None`(NULL)を返し、`0.0` のような
+    /// 数値と紛れさせない。**この段階では string タグへの書き込みかどうか
+    /// さえ未確定**(gate 7 未実行)なので、文字列の中身を`detail`列などへ
+    /// 転記することもしない(このモジュールの doc comment 「気づいた設計上
+    /// の問題」参照 - T20 ①a の既知の限界として報告済み)。
+    fn as_audit_value(&self) -> Option<f64> {
+        match self {
+            RequestedValue::Str(_) => None,
+            other => Some(other.as_f64()),
+        }
+    }
+}
+
+/// gate 7([`convert_value`])の出力: エンジニアリング値の型。数値/bit タグは
+/// 従来どおり `(DataType, f64)`(スケーリング済みではない、raw への unscale
+/// は [`build_plc_write_request`] が行う)。string タグは
+/// `banto_tags::STRING_DATA_TYPE` 以外の `data_type` を持ち得ないため
+/// `DataType` を伴わない(`banto_plc::DataType` に string 相当の variant は
+/// 無い - `banto-tags`の`ALLOWED_DATA_TYPES`のdoc comment参照)。
+///
+/// **string は常に PLC タグ**: `banto_tags::tag::validate_tag_input` が
+/// `computed`/`internal` タグへの `data_type = "string"` を登録時に拒否して
+/// いるため、`Str`はここへ到達した時点で必ず`resolved.conn.is_some()`
+/// (T20 ①a、案A)。
+#[derive(Debug, Clone, PartialEq)]
+enum ConvertedValue {
+    Numeric(DataType, f64),
+    Str(String),
+}
+
+impl ConvertedValue {
+    /// 監査行 `value_requested` 列向け(gate 7 通過後 - [`RequestedValue::as_audit_value`]
+    /// の gate 7 後版)。`Str` は同じ理由で `None`。
+    fn as_audit_value(&self) -> Option<f64> {
+        match self {
+            ConvertedValue::Numeric(_, v) => Some(*v),
+            ConvertedValue::Str(_) => None,
         }
     }
 }
@@ -428,18 +512,32 @@ async fn resolve_write_target(
     })
 }
 
-/// gate 7 の本体(このモジュールの doc comment 参照): 値変換 - 文字列タグ
-/// は拒否、data_type と [`RequestedValue`] の種別の対称性を検査し(暗黙の
-/// 型変換はしない - §4.2 の設計思想を書き込み経路にも適用)、通れば工学値
-/// を `f64` 1本に潰す。**副作用は一切無い純関数** - [`resolve_write_target`]
-/// から独立させてある理由は、そのdoc comment(2026-09-05 監査対応)参照。
+/// gate 7 の本体(このモジュールの doc comment 参照): 値変換 - data_type と
+/// [`RequestedValue`] の種別の対称性を検査し(暗黙の型変換はしない - §4.2
+/// の設計思想を書き込み経路にも適用)、通れば工学値を得る。**副作用は一切
+/// 無い純関数** - [`resolve_write_target`] から独立させてある理由は、その
+/// doc comment(2026-09-05 監査対応)参照。
+///
+/// T20 ①a(docs/banto-hub-t20-design.md §3.1、案A): string タグには
+/// [`RequestedValue::Str`] のみを受け入れる(拒否ではなく [`ConvertedValue::Str`]
+/// を素通しする)。他の全タグ種別には従来どおり数値/bool の対称性検査のみ -
+/// [`RequestedValue::Str`] が来たら 422(数値/bit タグに文字列は書けない、
+/// 型対称性の一般化)。
 fn convert_value(
     entry: &crate::hub::TagEntry,
     requested: RequestedValue,
-) -> Result<(DataType, f64), WriteRejection> {
+) -> Result<ConvertedValue, WriteRejection> {
     if entry.data_type == STRING_DATA_TYPE {
+        return match requested {
+            RequestedValue::Str(s) => Ok(ConvertedValue::Str(s)),
+            _ => Err(WriteRejection::UnsupportedValueType(Some(
+                "string タグには文字列を指定してください".to_string(),
+            ))),
+        };
+    }
+    if matches!(requested, RequestedValue::Str(_)) {
         return Err(WriteRejection::UnsupportedValueType(Some(
-            "文字列タグへの書き込みは対応していません".to_string(),
+            "数値/真偽値タグに文字列は指定できません".to_string(),
         )));
     }
     let Some(data_type) = DataType::parse(&entry.data_type) else {
@@ -463,10 +561,15 @@ fn convert_value(
                 "数値タグに真偽値は指定できません。数値を指定してください".to_string(),
             )));
         }
+        // `Str` は上のガードで既に処理済み(到達しないが、`RequestedValue`
+        // の網羅性のため明示的にunreachableとする)。
+        (_, RequestedValue::Str(_)) => {
+            unreachable!("文字列は関数冒頭で string タグ/非 string タグの両方を既に処理済み")
+        }
         (_, value) => value.as_f64(),
     };
 
-    Ok((data_type, value))
+    Ok(ConvertedValue::Numeric(data_type, value))
 }
 
 /// [`execute_write_batch`] の事前ゲート all-or-nothing フェーズ1件分:
@@ -479,8 +582,9 @@ struct PreparedWrite {
     conn: Option<banto_tags::PlcConnection>,
     entry: crate::hub::TagEntry,
     tag_id: i64,
-    data_type: DataType,
-    value: f64,
+    /// T20 ①a: 数値/bit タグは `Numeric`、string タグは `Str`
+    /// ([`ConvertedValue`]のdoc comment参照)。
+    value: ConvertedValue,
     tag_name: String,
 }
 
@@ -491,12 +595,11 @@ async fn prepare_batch_entry(
     requested: Option<RequestedValue>,
 ) -> Result<PreparedWrite, WriteRejection> {
     let resolved = resolve_write_target(deps, collection_mode, tag, requested).await?;
-    let (data_type, value) = convert_value(&resolved.entry, resolved.requested)?;
+    let value = convert_value(&resolved.entry, resolved.requested)?;
     Ok(PreparedWrite {
         conn: resolved.conn,
         entry: resolved.entry,
         tag_id: resolved.tag_id,
-        data_type,
         value,
         tag_name: resolved.tag_name,
     })
@@ -540,7 +643,9 @@ pub async fn execute_write(
 
     // gate 5: 書き込み受付(WriteControl)が off。gate 7(値変換)より**前**
     // - 元実装と同じ順序(このモジュールの上のdoc comment参照)。監査の
-    // `value_requested` は gate 7 未適用の生値(`RequestedValue::as_f64`)。
+    // `value_requested` は gate 7 未適用の生値(`RequestedValue::as_audit_value`
+    // - 文字列は NULL、このモジュールの doc comment 「気づいた設計上の
+    // 問題」参照)。
     if !deps.write_control.is_enabled() {
         let row = WriteAuditRow::new(
             ctx.id,
@@ -550,7 +655,7 @@ pub async fn execute_write(
             WriteAuditAction::Write,
             WriteAuditResult::SuppressedDisabled,
         )
-        .with_value_requested(resolved.requested.as_f64());
+        .with_value_requested_opt(resolved.requested.as_audit_value());
         if let Err(err) = deps.write_audit.insert_row(&row).await {
             eprintln!("banto-hub: 書き込み監査(suppressed_disabled)の記録に失敗しました: {err}");
         }
@@ -580,7 +685,7 @@ pub async fn execute_write(
             WriteAuditAction::RateLimitTripped,
             WriteAuditResult::SuppressedRateLimited,
         )
-        .with_value_requested(resolved.requested.as_f64())
+        .with_value_requested_opt(resolved.requested.as_audit_value())
         .with_detail(detail);
         if let Err(err) = deps.write_audit.insert_row(&row).await {
             eprintln!("banto-hub: 書き込み監査(rate_limit_tripped)の記録に失敗しました: {err}");
@@ -601,7 +706,7 @@ pub async fn execute_write(
     }
 
     // gate 7: 値変換(元の位置 - gate 5/6 の後)。
-    let (data_type, value) = convert_value(&resolved.entry, resolved.requested)?;
+    let converted = convert_value(&resolved.entry, resolved.requested)?;
 
     // tag_row の読み込みも元の位置(gate 7 の後・gate 8 の前)に戻す。
     let tag_row = TagService::new(deps.manager.pool())
@@ -610,7 +715,9 @@ pub async fn execute_write(
         .map_err(map_registry_error)?;
 
     // gate 8: log-before-write(PLC/internal 共通 - 実行前に必ず監査行を
-    // 先に作る、§6-3)。
+    // 先に作る、§6-3)。T20 ①a: 文字列書き込みは `value_requested` を NULL
+    // にする(`ConvertedValue::as_audit_value`のdoc comment参照 - このモジュール
+    // の doc comment 「気づいた設計上の問題」にも既知の限界として記載)。
     let pending_row = WriteAuditRow::new(
         ctx.id,
         ctx.name.clone(),
@@ -619,7 +726,7 @@ pub async fn execute_write(
         WriteAuditAction::Write,
         WriteAuditResult::Ok,
     )
-    .with_value_requested(value);
+    .with_value_requested_opt(converted.as_audit_value());
     let audit_id = match deps.write_audit.insert_pending(&pending_row).await {
         Ok(id) => id,
         Err(err) => {
@@ -635,18 +742,31 @@ pub async fn execute_write(
         limiter.record(resolved.tag_id, now);
     }
 
-    let outcome = if let Some(conn) = &resolved.conn {
-        write_plc_tag(deps, conn, &resolved.entry, data_type, &tag_row, value).await
-    } else {
-        write_internal_tag(
-            deps,
-            &resolved.entry,
-            resolved.tag_id,
-            data_type,
-            tag_row.retain,
-            value,
-        )
-        .await
+    // T20 ①a(案A): string は常に PLC タグ([`ConvertedValue`]のdoc comment
+    // 参照)なので internal 分岐には絶対に来ない - 到達したら防御的に
+    // `Internal` を返す(banto-tags の登録時検証が緩んだ場合の保険)。
+    let outcome = match &converted {
+        ConvertedValue::Numeric(data_type, value) => {
+            if let Some(conn) = &resolved.conn {
+                write_plc_tag(deps, conn, &resolved.entry, *data_type, &tag_row, *value).await
+            } else {
+                write_internal_tag(
+                    deps,
+                    &resolved.entry,
+                    resolved.tag_id,
+                    *data_type,
+                    tag_row.retain,
+                    *value,
+                )
+                .await
+            }
+        }
+        ConvertedValue::Str(text) => match &resolved.conn {
+            Some(conn) => write_plc_string_tag(deps, conn, &resolved.entry, &tag_row, text).await,
+            None => Err(WriteRejection::Internal(
+                "internal タグへの文字列書き込みが解決されました(想定外)".to_string(),
+            )),
+        },
     };
 
     let final_result = match &outcome {
@@ -798,7 +918,8 @@ pub async fn execute_write_batch(
     // (resolve_write_target → convert_value)へ通す。
     let mut prepare_results = Vec::with_capacity(entries.len());
     for (tag, requested) in &entries {
-        prepare_results.push(prepare_batch_entry(deps, collection_mode, tag, *requested).await);
+        prepare_results
+            .push(prepare_batch_entry(deps, collection_mode, tag, requested.clone()).await);
     }
 
     if prepare_results.iter().any(Result::is_err) {
@@ -833,7 +954,7 @@ pub async fn execute_write_batch(
                 WriteAuditAction::Write,
                 WriteAuditResult::SuppressedDisabled,
             )
-            .with_value_requested(p.value);
+            .with_value_requested_opt(p.value.as_audit_value());
             if let Err(err) = deps.write_audit.insert_row(&row).await {
                 eprintln!(
                     "banto-hub: 書き込み監査(suppressed_disabled、バッチ)の記録に失敗しました: {err}"
@@ -878,7 +999,7 @@ pub async fn execute_write_batch(
                 WriteAuditAction::RateLimitTripped,
                 WriteAuditResult::SuppressedRateLimited,
             )
-            .with_value_requested(p.value)
+            .with_value_requested_opt(p.value.as_audit_value())
             .with_detail(detail.clone());
             if let Err(err) = deps.write_audit.insert_row(&row).await {
                 eprintln!(
@@ -940,6 +1061,22 @@ pub async fn execute_write_batch(
                 continue;
             }
         };
+        // T20 ①a(案A): internal タグに string は絶対に来ない
+        // (`ConvertedValue`のdoc comment参照 - banto-tags の登録時検証が
+        // `data_type = "string"` を internal/computed タグへ拒否している)。
+        // 到達したら防御的に Internal を返す。
+        let (data_type, value) = match p.value {
+            ConvertedValue::Numeric(data_type, value) => (data_type, value),
+            ConvertedValue::Str(_) => {
+                outcomes[i] = Some(BatchEntryOutcome {
+                    tag: p.tag_name.clone(),
+                    result: Err(WriteRejection::Internal(
+                        "internal タグへの文字列書き込みが解決されました(想定外)".to_string(),
+                    )),
+                });
+                continue;
+            }
+        };
         let pending_row = WriteAuditRow::new(
             ctx.id,
             ctx.name.clone(),
@@ -948,7 +1085,7 @@ pub async fn execute_write_batch(
             WriteAuditAction::Write,
             WriteAuditResult::Ok,
         )
-        .with_value_requested(p.value);
+        .with_value_requested(value);
         let audit_id = match deps.write_audit.insert_pending(&pending_row).await {
             Ok(id) => id,
             Err(err) => {
@@ -968,15 +1105,8 @@ pub async fn execute_write_batch(
             let mut limiter = deps.rate_limiter.lock().await;
             limiter.record(p.tag_id, now);
         }
-        let outcome = write_internal_tag(
-            deps,
-            &p.entry,
-            p.tag_id,
-            p.data_type,
-            tag_row.retain,
-            p.value,
-        )
-        .await;
+        let outcome =
+            write_internal_tag(deps, &p.entry, p.tag_id, data_type, tag_row.retain, value).await;
         let final_result = match &outcome {
             Ok(()) => WriteAuditResult::Ok,
             Err(_) => WriteAuditResult::Failed,
@@ -1023,7 +1153,7 @@ pub async fn execute_write_batch(
                 WriteAuditAction::Write,
                 WriteAuditResult::Ok,
             )
-            .with_value_requested(p.value);
+            .with_value_requested_opt(p.value.as_audit_value());
             match deps.write_audit.insert_pending(&pending_row).await {
                 Ok(audit_id) => {
                     // record は単票と同じタイミング: insert_pending 成功
@@ -1058,7 +1188,15 @@ pub async fn execute_write_batch(
         for (i, tag_row, audit_id) in committed {
             let p = &prepared[i];
             let conn = p.conn.as_ref().expect("group is keyed by connection id");
-            match build_plc_write_request(conn, &p.entry, p.data_type, &tag_row, p.value) {
+            let request = match &p.value {
+                ConvertedValue::Numeric(data_type, value) => {
+                    build_plc_write_request(conn, &p.entry, *data_type, &tag_row, *value)
+                }
+                ConvertedValue::Str(text) => {
+                    build_plc_string_write_request(conn, &p.entry, &tag_row, text)
+                }
+            };
+            match request {
                 Ok(request) => {
                     requests.push(request);
                     sent_indices.push((i, audit_id));
@@ -1224,17 +1362,20 @@ async fn write_plc_tag(
     }
 }
 
-/// gate 8 の PLC タグ分岐が broker へ渡す `BatchWriteRequest` の組み立て
-/// (単票 [`write_plc_tag`] とバッチ [`execute_write_batch`] のコミット段が
-/// **共有する**唯一の場所 - T20-3a、docs/banto-hub-t20-design.md §3.3
-/// 「BatchWriteRequest 構築ロジックを単票と共有する」)。従来どおり
+/// gate 8 の PLC タグ分岐(数値/bit)が broker へ渡す `BatchWriteRequest` の
+/// 組み立て(単票 [`write_plc_tag`] とバッチ [`execute_write_batch`] の
+/// コミット段が**共有する**唯一の場所 - T20-3a、docs/banto-hub-t20-design.md
+/// §3.3「BatchWriteRequest 構築ロジックを単票と共有する」)。従来どおり
 /// `banto_tags::unscale` → プロトコル別アドレス解決(#131 以降 SLMP/Modbus
 /// TCP の両方 - `banto_collect`の `build_request`と同じ`conn.protocol`分岐)
 /// → `BatchWriteRequest`(`Numeric`/`BitInWord` の作り分け)。**副作用は
 /// 無い**(broker へは渡さない - 呼び出し元が `handle.write` を呼ぶ)。
-/// `entry.data_type == STRING_DATA_TYPE` は [`convert_value`] の gate 7 で
-/// 既に拒否済みなのでここには来ない - `BatchWriteRequest::String` はこの
-/// 関数では組み立てない。
+///
+/// **T20 ①a**: `entry.data_type == STRING_DATA_TYPE` は [`convert_value`]
+/// の gate 7 で `ConvertedValue::Str` に変換されるため、この関数の呼び出し元
+/// は string タグに対してこの関数を呼ばない([`build_plc_string_write_request`]
+/// を代わりに呼ぶ) - この関数自身が `BatchWriteRequest::String` を組み立てる
+/// ことは無い。
 fn build_plc_write_request(
     conn: &banto_tags::PlcConnection,
     entry: &crate::hub::TagEntry,
@@ -1336,6 +1477,108 @@ fn build_plc_write_request(
             value: tag_value,
         }))
     }
+}
+
+/// gate 8 の文字列タグ分岐(T20 ①a、docs/banto-hub-t20-design.md §3.1、
+/// 案A「書き込みは write_path 経由（記録計の read/cache には触れない）」)。
+/// 数値タグの [`write_plc_tag`] と並ぶ、string タグ専用の書き込み - broker
+/// handle の取得規律(T15-4、non-spawning peek)は完全に同じ。文字列タグには
+/// スケーリング・範囲チェック(`validate_numeric_range`)が存在しない
+/// (`banto_tags::tag::validate_tag_input` が string タグへの raw/eng
+/// 設定自体を登録時に拒否している)。
+async fn write_plc_string_tag(
+    deps: &WriteDeps<'_>,
+    conn: &banto_tags::PlcConnection,
+    entry: &crate::hub::TagEntry,
+    tag_row: &banto_tags::Tag,
+    value: &str,
+) -> Result<(), WriteRejection> {
+    let request = build_plc_string_write_request(conn, entry, tag_row, value)?;
+
+    let Some(handle) = deps.manager.write_broker_handle_peek(conn.id) else {
+        // T15-4: 単票の write_plc_tag と同じ fail-closed(このモジュールの
+        // doc comment「gate 8 は broker セッションを新規に張らない」参照)。
+        return Err(WriteRejection::WriteFailed(
+            "PLC への接続セッションがありません(書き込みは新しいセッションを開始しません。収集が稼働中か確認してください)"
+                .to_string(),
+        ));
+    };
+
+    match handle.write(vec![request]).await {
+        Ok(results) => match results.into_iter().next() {
+            Some(PlcWriteResult::Ok) => Ok(()),
+            Some(PlcWriteResult::Bad(write_err)) => {
+                Err(WriteRejection::WriteFailed(write_err.to_string()))
+            }
+            None => Err(WriteRejection::WriteFailed(
+                "broker から応答がありませんでした".to_string(),
+            )),
+        },
+        Err(err) => Err(WriteRejection::WriteFailed(err.to_string())),
+    }
+}
+
+/// `banto_tags::Tag::string_encoding` の文字列表現を
+/// `banto_plc_write::StringEncoding` へマップする。CHECK 制約
+/// (`migrations/0013_tags_add_string_encoding.sql`)により登録時に
+/// `"utf8"`/`"shift_jis"` 以外は拒否されているはずなので、それ以外の値は
+/// 防御的に既定の UTF-8 へフォールバックする(パニックしない)。
+fn string_encoding_from_tag(tag_row: &banto_tags::Tag) -> StringEncoding {
+    match tag_row.string_encoding.as_str() {
+        "shift_jis" => StringEncoding::ShiftJis,
+        _ => StringEncoding::Utf8,
+    }
+}
+
+/// 文字列タグの `BatchWriteRequest` 組み立て(単票 [`write_plc_string_tag`]
+/// とバッチのコミット段が共有する - 数値の [`build_plc_write_request`] と
+/// 対になる、同じ「共有する唯一の場所」原則)。`tag_row.string_length` から
+/// ワード数を、`tag_row.string_encoding` からエンコーディングを取り、
+/// `banto_plc_write::StringWriteRequest` を組み立てる。**副作用は無い**
+/// (broker へは渡さない)。
+///
+/// 文字列長チェック(422 相当、実装指示「文字列長は string_length を尊重
+/// （超過は 422 相当の範囲エラー）」): `banto_plc_write::encode_string_value`
+/// を直接呼んで(ここは同一クレート内なので `pub(crate)` ではなく `pub` に
+/// 昇格させた実体そのものを呼ぶ - 数値側の `validate_numeric_range` のように
+/// 独立re-implementationを持たない、ロジックが drift しようがない)、ワイヤに
+/// 渡す前に容量オーバー・表現不能文字を検出する。broker/ドライバ内部でも
+/// 同じ関数がもう一度呼ばれる(二重チェック)が、ここでの事前チェックには
+/// 「範囲外の値を write_audit に一切残さず(gate 8 の log-before-write に
+/// 到達する前に)弾ける」という数値側と同じ利点がある。
+fn build_plc_string_write_request(
+    conn: &banto_tags::PlcConnection,
+    entry: &crate::hub::TagEntry,
+    tag_row: &banto_tags::Tag,
+    value: &str,
+) -> Result<BatchWriteRequest, WriteRejection> {
+    // #131 と同じプロトコル別アドレス解決([`build_plc_write_request`]参照)。
+    // Modbus には文字列デバイスの対応が無い(`banto_plc_write`の
+    // `modbus::planning`のモジュール doc 参照) - アドレス自体は解決できても、
+    // broker 側で `PlcWriteError::UnsupportedRequestKind` として per-request
+    // Bad になる(`WriteRejection::WriteFailed`として返る)。
+    let address = match conn.protocol.as_str() {
+        "modbus-tcp" => Address::parse(&entry.address),
+        _ => Address::parse_slmp(&entry.address),
+    };
+    let address = match address {
+        Ok(address) => address,
+        Err(err) => return Err(WriteRejection::InvalidAddress(err.to_string())),
+    };
+
+    let words = tag_row.string_length.unwrap_or(0).clamp(0, u16::MAX as i64) as u16;
+    let encoding = string_encoding_from_tag(tag_row);
+
+    if let Err(err) = banto_plc_write::encode_string_value(value, words, encoding) {
+        return Err(WriteRejection::ValueOutOfRange(err.to_string()));
+    }
+
+    Ok(BatchWriteRequest::String(StringWriteRequest {
+        address,
+        words,
+        value: value.to_string(),
+        encoding,
+    }))
 }
 
 /// gate 8 の internal タグ分岐(T6-2、docs/tag-server-design.md §4.2「内部

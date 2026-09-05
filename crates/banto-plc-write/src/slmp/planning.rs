@@ -378,7 +378,7 @@ pub fn plan_slmp_write_batch(
                     ));
                     continue;
                 }
-                match encode_string_value(&s.value, s.words) {
+                match encode_string_value(&s.value, s.words, s.encoding) {
                     Ok(words) => ItemPayload::Words(words),
                     Err(e) => {
                         immediate_bad.push((index, e));
@@ -1176,10 +1176,22 @@ mod tests {
     use crate::types::{BatchWriteRequest, StringWriteRequest};
 
     fn sreq(raw: &str, words: u16, value: &str) -> BatchWriteRequest {
+        sreq_enc(raw, words, value, crate::types::StringEncoding::ShiftJis)
+    }
+
+    /// Same as [`sreq`] but with an explicit [`crate::types::StringEncoding`]
+    /// - used by the UTF-8 planner tests below (T20 ①a).
+    fn sreq_enc(
+        raw: &str,
+        words: u16,
+        value: &str,
+        encoding: crate::types::StringEncoding,
+    ) -> BatchWriteRequest {
         BatchWriteRequest::String(StringWriteRequest {
             address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw} should parse: {e}")),
             words,
             value: value.to_string(),
+            encoding,
         })
     }
 
@@ -1217,6 +1229,33 @@ mod tests {
             LH,
         );
         assert_eq!(outcome.writes.len(), 2, "D2 must never be written");
+    }
+
+    /// T20 ①a: the planner forwards each request's own `encoding` to
+    /// `encode_string_value` rather than assuming Shift-JIS - a UTF-8 request
+    /// for the same Japanese text as `a_string_spans_its_padded_word_count...`
+    /// above produces different bytes (9 UTF-8 bytes vs. 6 Shift-JIS bytes for
+    /// "テスト"), proving the encoding actually reaches the encoder.
+    #[test]
+    fn a_string_request_is_encoded_with_its_own_encoding() {
+        let outcome = plan_slmp_write_batch(
+            &[sreq_enc(
+                "D0",
+                5,
+                "テスト",
+                crate::types::StringEncoding::Utf8,
+            )],
+            LH,
+        );
+        assert!(outcome.immediate_bad.is_empty());
+        assert_eq!(outcome.writes.len(), 1);
+        let WritePayload::Words(words) = &outcome.writes[0].payload else {
+            panic!("expected a Words payload");
+        };
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut expected = "テスト".as_bytes().to_vec();
+        expected.resize(10, 0x00);
+        assert_eq!(bytes, expected);
     }
 
     /// Text longer than the span is rejected outright - per-item Bad, nothing
@@ -1275,6 +1314,7 @@ mod tests {
                 address: Address::parse("40001").unwrap(),
                 words: 4,
                 value: "AB".to_string(),
+                encoding: crate::types::StringEncoding::ShiftJis,
             })],
             LH,
         );

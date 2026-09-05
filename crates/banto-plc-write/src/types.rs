@@ -65,10 +65,40 @@ impl WriteResult {
 // app-side changes that belong to S2. Strings enter through a parallel layer
 // that wraps the numeric type unchanged.
 
-/// One MELSEC string target to write: where, the fixed span in consecutive
-/// 16-bit word devices (`banto-tags::Tag::string_length`), and the text.
+/// Character encoding used to render a [`StringWriteRequest`]'s text onto the
+/// wire (T20 ①a, docs/banto-hub-t20-design.md §3.1, 2026-09-04 オーナー
+/// 決定: 「文字コードは既定 UTF-8、タグ単位で Shift-JIS も選択可」). Selects
+/// which `encoding_rs` table [`crate::encode::encode_string_value`] uses; the
+/// byte-packing convention itself (low byte first within each word - MELSEC's
+/// storage convention) is unaffected by this choice, exactly as
+/// [`banto_plc::WordOrder`] only ever governs 32-bit numeric word order, never
+/// a string's byte order within a word.
 ///
-/// The encoded Shift-JIS bytes must fit `2 * words` bytes; anything longer is
+/// **Why this crate's Shift-JIS-only behaviour predates this enum**: every
+/// site that already built a [`StringWriteRequest`] before T20 ①a (relay-wright's
+/// `apps/relay-wright/core/src/engine/writer.rs`/`monitor.rs`, this crate's own
+/// planner/integration tests, `banto-broker`'s example/tests) wrote Shift-JIS
+/// unconditionally. Adding this field to the struct necessarily touches every
+/// one of those call sites (Rust struct literals cannot omit a new field), so
+/// the owner decision above ("relay-wright の挙動を変えないこと") is kept by
+/// having every pre-existing site pass [`StringEncoding::ShiftJis`] explicitly,
+/// never by giving the field a silently-assumed default. Only
+/// `apps/banto-hub`'s write path (new in this slice) ever passes
+/// [`StringEncoding::Utf8`], and only when the registered tag's
+/// `banto_tags::Tag::string_encoding` says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StringEncoding {
+    /// The hub's new default for newly registered string tags.
+    Utf8,
+    /// This crate's pre-T20 behaviour, and relay-wright's only encoding.
+    ShiftJis,
+}
+
+/// One MELSEC string target to write: where, the fixed span in consecutive
+/// 16-bit word devices (`banto-tags::Tag::string_length`), the text, and the
+/// [`StringEncoding`] to render it in.
+///
+/// The encoded bytes must fit `2 * words` bytes; anything longer is
 /// a per-request [`crate::error::PlcWriteError::ValueOutOfRange`] and nothing
 /// is written - **never** a silent truncation, because a recipe string cut
 /// mid-way is a real hazard on a live PLC. Shorter strings are padded with
@@ -82,6 +112,11 @@ pub struct StringWriteRequest {
     /// always written: encoded bytes first, 0x00 padding to the end.
     pub words: u16,
     pub value: String,
+    /// T20 ①a: which `encoding_rs` table encodes `value` onto the wire. See
+    /// [`StringEncoding`]'s doc comment for why this is a required field
+    /// (not an `Option`/defaulted one) and how every pre-T20 call site keeps
+    /// writing Shift-JIS unchanged.
+    pub encoding: StringEncoding,
 }
 
 /// One entry of a mixed write batch: an ordinary numeric/bit write (the

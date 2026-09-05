@@ -353,7 +353,7 @@ impl RegistrySnapshot {
         .map_err(|err| CollectError::Registry(banto_core::BantoError::Storage(err.to_string())))?;
         let tags = sqlx::query_as::<_, Tag>(
             "SELECT id, name, collection_group_id, address, data_type, \
-             string_length, raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, \
+             string_length, string_encoding, raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, \
              threshold_h, threshold_hh, threshold_l, threshold_ll, enabled, \
              writable, tag_kind, expression, retain, revision FROM tags ORDER BY id",
         )
@@ -767,6 +767,7 @@ mod tests {
             address: address.to_string(),
             data_type: "i16".to_string(),
             string_length: None,
+            string_encoding: "utf8".to_string(),
             raw_lo: None,
             raw_hi: None,
             eng_lo: None,

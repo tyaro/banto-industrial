@@ -97,6 +97,7 @@ const tagResource: Tag = {
 	address: 'D3000',
 	dataType: 'i16',
 	stringLength: null,
+	stringEncoding: 'utf8',
 	rawLo: null,
 	rawHi: null,
 	engLo: null,
