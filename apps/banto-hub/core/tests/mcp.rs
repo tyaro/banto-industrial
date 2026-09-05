@@ -425,7 +425,7 @@ async fn initialize_returns_tool_capabilities() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tools_list_returns_the_fifteen_tools() {
+async fn tools_list_returns_the_nineteen_tools() {
     let app = test_app("tools-list").await;
     let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
 
@@ -439,9 +439,12 @@ async fn tools_list_returns_the_fifteen_tools() {
         vec![
             "create_connection",
             "create_group",
+            "create_tag",
             "delete_connection",
             "delete_group",
+            "delete_tag",
             "get_server_status",
+            "get_tag",
             "list_connections",
             "list_groups",
             "list_tags",
@@ -450,6 +453,7 @@ async fn tools_list_returns_the_fifteen_tools() {
             "test_connection",
             "update_connection",
             "update_group",
+            "update_tag",
             "write_recipe",
             "write_tag_value",
         ]
@@ -2188,4 +2192,546 @@ async fn test_connection_without_admin_scope_is_rejected() {
     assert_eq!(body["result"]["isError"], true, "{body:?}");
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("missing_admin_scope"), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// 12. T21 S1-d（docs/banto-hub-t21-design.md §3・§4）: 構成補助ツール第三弾
+//    （タグ CRUD）。9節・10節（S1-b/S1-c）と同じ3点を確認する - `admin`
+//    スコープ必須・不可逆操作(delete)は confirm 必須・全操作を
+//    origin="mcp" で監査する。加えて `update_tag`固有の2点
+//    （全項目必須の回帰防止・楽観ロックの revision_conflict）も確認する。
+// ---------------------------------------------------------------------------
+
+async fn tags_row_count(app: &TestApp) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM tags")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap()
+}
+
+/// [`tool_update_tag`]の`arguments`を組み立てる - `TagPayload`の wire
+/// フィールド全部(`update_tag`が要求する全項目指定)を埋めた上で、
+/// `expected_revision`が`Some`なら`expectedRevision`も足す。
+fn full_tag_update_args(
+    id: i64,
+    group_id: i64,
+    name: &str,
+    address: &str,
+    expected_revision: Option<i64>,
+) -> Value {
+    let mut args = json!({
+        "id": id,
+        "name": name,
+        "collectionGroupId": group_id,
+        "address": address,
+        "dataType": "u16",
+        "stringLength": null,
+        "stringEncoding": "utf8",
+        "rawLo": null,
+        "rawHi": null,
+        "engLo": null,
+        "engHi": null,
+        "unit": null,
+        "decimals": 0,
+        "thresholdH": null,
+        "thresholdHh": null,
+        "thresholdL": null,
+        "thresholdLl": null,
+        "enabled": true,
+        "writable": true,
+        "tagKind": "plc",
+        "expression": null,
+        "retain": false,
+    });
+    if let Some(revision) = expected_revision {
+        args["expectedRevision"] = json!(revision);
+    }
+    args
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tag_tools_without_admin_scope_are_rejected_and_change_nothing() {
+    let app = test_app("s1d-no-admin").await;
+    let key = issue_key(
+        &app.router,
+        &app.admin_token,
+        "reader-writer",
+        &["read", "write:line1.fast.temp01"],
+    )
+    .await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+    let tag = TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group.id, "D100", "u16", false, true))
+        .await
+        .unwrap();
+    let before_rows = tags_row_count(&app).await;
+
+    for (name, arguments) in [
+        ("get_tag", json!({ "id": tag.id })),
+        (
+            "create_tag",
+            json!({
+                "name": "temp02",
+                "collectionGroupId": group.id,
+                "address": "D200",
+                "dataType": "u16",
+            }),
+        ),
+        (
+            "update_tag",
+            full_tag_update_args(tag.id, group.id, "renamed", "D300", None),
+        ),
+        ("delete_tag", json!({ "id": tag.id, "confirm": true })),
+    ] {
+        let (status, body) = mcp_post(&app.router, Some(&key), tools_call(name, arguments)).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body:?}");
+        assert_eq!(body["result"]["isError"], true, "{name}: {body:?}");
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("missing_admin_scope"), "{name}: {text}");
+    }
+
+    assert_eq!(
+        tags_row_count(&app).await,
+        before_rows,
+        "none of the rejected tools may touch tags"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_tag_returns_all_fields_including_revision() {
+    let app = test_app("s1d-get-tag").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+    let tag = TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group.id, "D100", "u16", true, true))
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("get_tag", json!({ "id": tag.id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["tag"]["id"], tag.id);
+    assert_eq!(payload["tag"]["name"], "temp01");
+    assert_eq!(payload["tag"]["address"], "D100");
+    assert_eq!(payload["tag"]["writable"], true);
+    assert_eq!(payload["tag"]["revision"], 1, "{payload:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_tag_with_admin_scope_while_stopped_creates_and_audits() {
+    let app = test_app("s1d-create-tag").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+    let before_rows = tags_row_count(&app).await;
+    let audit_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_tag",
+            json!({
+                "name": "temp01",
+                "collectionGroupId": group.id,
+                "address": "D100",
+                "dataType": "u16",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["created"]["name"], "temp01");
+
+    assert_eq!(tags_row_count(&app).await, before_rows + 1);
+
+    let audit_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        audit_count_after,
+        audit_count_before + 1,
+        "create_tag via MCP must add exactly one audit_log row"
+    );
+    assert_eq!(
+        latest_audit_column(&app, "actor_username").await.as_deref(),
+        Some("admin-key")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "actor_role").await.as_deref(),
+        Some("api_key")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "action").await.as_deref(),
+        Some("create")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("tags")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_tag_with_admin_scope_updates_and_audits() {
+    let app = test_app("s1d-update-tag").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+    let tag = TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group.id, "D100", "u16", false, true))
+        .await
+        .unwrap();
+    let audit_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "update_tag",
+            full_tag_update_args(tag.id, group.id, "temp01-renamed", "D200", None),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["updated"]["name"], "temp01-renamed");
+    assert_eq!(payload["updated"]["address"], "D200");
+
+    let stored = TagService::new(app.pool.clone()).get(tag.id).await.unwrap();
+    assert_eq!(stored.name, "temp01-renamed");
+    assert_eq!(stored.address, "D200");
+    assert!(stored.writable, "writable:true must be applied");
+
+    let audit_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(audit_count_after, audit_count_before + 1);
+    assert_eq!(
+        latest_audit_column(&app, "action").await.as_deref(),
+        Some("update")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("tags")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+}
+
+/// [`update_connection_missing_field_is_rejected_and_row_unchanged`]の
+/// タグ版 - `update_tag`は全項目指定の PUT 置換だが、`TagPayload`は
+/// `#[serde(default)]`を多数持つため、省略フィールドをサーバーが拒否
+/// しないと黙って既定値で上書きされてしまう(回帰防止)。ここでは
+/// `enabled`を省いた入力が`missing_fields`で拒否され、対象行が一切
+/// 変化しないことを確認する。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_tag_missing_field_is_rejected_and_row_unchanged() {
+    let app = test_app("s1d-update-tag-missing-field").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+    let tag = TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group.id, "D100", "u16", false, true))
+        .await
+        .unwrap();
+    let audit_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+
+    let mut arguments = full_tag_update_args(tag.id, group.id, "temp01-renamed", "D200", None);
+    arguments
+        .as_object_mut()
+        .unwrap()
+        .remove("enabled")
+        .expect("test fixture must include enabled before removal");
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("update_tag", arguments),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("missing_fields"), "{text}");
+    assert!(text.contains("enabled"), "{text}");
+
+    let stored = TagService::new(app.pool.clone()).get(tag.id).await.unwrap();
+    assert_eq!(stored.name, "temp01", "row must not change");
+    assert_eq!(stored.address, "D100", "row must not change");
+
+    let audit_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        audit_count_after, audit_count_before,
+        "rejected update must not add an audit_log row"
+    );
+}
+
+/// T18-1 の楽観ロック(`expectedRevision`)を MCP 経由でも確認する:
+/// revision が一致していれば成功して +1 され、その後の呼び出しが
+/// (先の呼び出しで既に進んでしまった)古い revision を指定すると
+/// `revision_conflict`で拒否され、行は変化しない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_tag_optimistic_lock_matching_revision_succeeds_then_stale_revision_conflicts() {
+    let app = test_app("s1d-update-tag-revision").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+    let tag = TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group.id, "D100", "u16", false, true))
+        .await
+        .unwrap();
+    assert_eq!(tag.revision, 1);
+
+    // revision が一致する呼び出しは成功して revision が2へ進む。
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "update_tag",
+            full_tag_update_args(tag.id, group.id, "temp01-v2", "D100", Some(1)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["updated"]["revision"], 2, "{payload:?}");
+
+    // 同じ(今や古い) revision=1 を指定した2本目の呼び出しは競合として拒否
+    // される - 行は1本目の更新結果のまま変化しない。
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "update_tag",
+            full_tag_update_args(tag.id, group.id, "temp01-v3", "D100", Some(1)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("revision_conflict"), "{text}");
+
+    let stored = TagService::new(app.pool.clone()).get(tag.id).await.unwrap();
+    assert_eq!(
+        stored.name, "temp01-v2",
+        "the rejected (stale) update must not overwrite the row"
+    );
+    assert_eq!(stored.revision, 2, "revision must not advance on conflict");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_tag_without_confirm_is_rejected_and_tag_remains() {
+    let app = test_app("s1d-delete-tag-no-confirm").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+    let tag = TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group.id, "D100", "u16", false, true))
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("delete_tag", json!({ "id": tag.id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("confirm_required"), "{text}");
+
+    assert_eq!(
+        tags_row_count(&app).await,
+        1,
+        "delete_tag without confirm must not delete the row"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_tag_with_confirm_deletes_and_audits() {
+    let app = test_app("s1d-delete-tag-confirm").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+    let tag = TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group.id, "D100", "u16", false, true))
+        .await
+        .unwrap();
+    let audit_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("delete_tag", json!({ "id": tag.id, "confirm": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["deleted"], true);
+
+    assert_eq!(
+        tags_row_count(&app).await,
+        0,
+        "delete_tag with confirm:true must delete the row"
+    );
+
+    let audit_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(audit_count_after, audit_count_before + 1);
+    assert_eq!(
+        latest_audit_column(&app, "actor_username").await.as_deref(),
+        Some("admin-key")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "actor_role").await.as_deref(),
+        Some("api_key")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "action").await.as_deref(),
+        Some("delete")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("tags")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_tag_while_collection_running_is_queued_not_applied() {
+    let app = test_app("s1d-create-tag-running").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+    start_collection(&app.router, &app.admin_token).await;
+    let before_rows = tags_row_count(&app).await;
+    let audit_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_tag",
+            json!({
+                "name": "temp-running",
+                "collectionGroupId": group.id,
+                "address": "D100",
+                "dataType": "u16",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["queued"], true, "{payload:?}");
+    assert!(payload["pendingId"].is_number(), "{payload:?}");
+
+    assert_eq!(
+        tags_row_count(&app).await,
+        before_rows,
+        "a queued create_tag must not touch tags directly"
+    );
+    let pending_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_changes")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(pending_count, 1);
+
+    let audit_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        audit_count_after,
+        audit_count_before + 1,
+        "queued create_tag via MCP must add exactly one audit_log row"
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("tags")
+    );
 }
