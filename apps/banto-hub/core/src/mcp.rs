@@ -1097,7 +1097,7 @@ async fn tool_create_connection(
             state,
             ctx,
             "create",
-            Some(&pending.id.to_string()),
+            None,
             Some(json!({ "queued": true, "pendingId": pending.id, "name": input.name })),
         )
         .await;

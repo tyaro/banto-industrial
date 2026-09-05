@@ -57,13 +57,13 @@
 //! 発行時に検証するが、**実際の書き込み検査（T2）はここでは行わない**
 //! （書き込み API 自体が T0-2 の時点でまだ存在しない）。
 //!
-//! `admin`（T21 S1-a、docs/banto-hub-t21-design.md §3.1）は、今後 MCP から
-//! 行う構成操作（接続/グループ/タグ CRUD・設定・API キー発行等）専用の
-//! 独立スコープ。read/write のタグ値アクセスとは**意図的に直交**しており、
+//! `admin`（T21 S1-a、docs/banto-hub-t21-design.md §3.1）は、MCP から行う
+//! 構成操作（接続/グループ/タグ CRUD・設定・API キー発行等）専用の独立
+//! スコープ。read/write のタグ値アクセスとは**意図的に直交**しており、
 //! `admin` だけを持つキーはタグの値を一切読み書きできない
-//! （[`ApiKeyContext::has_admin_scope`] 参照）。本スライスではスコープを
-//! 有効化するところまでで、実際に `admin` を要求する構成操作エンドポイント
-//! の配線は後続スライスで行う。
+//! （[`ApiKeyContext::has_admin_scope`] 参照）。T21 S1-b で MCP 構成補助
+//! ツール（接続 CRUD: create/delete/list_connections）が既に `admin` を
+//! 要求する形で配線済み。以降のスライスでグループ/タグ/設定へ拡張予定。
 //!
 //! ### read のタグ単位化（H10 ③、Option B、2026-08-08 オーナー決定・
 //! docs/h10-3-read-scope-proposal.md §5 S1・§6）
@@ -467,8 +467,9 @@ impl ApiKeyContext {
     /// スコープを持つか。`admin` は read/write とは**直交** — `admin`
     /// だけを持つキーは [`has_any_read`](Self::has_any_read)・
     /// [`has_write_scope`](Self::has_write_scope) がいずれも false のまま
-    /// で、タグの値の読み書きは一切できない。ツール本体がこの判定を使う
-    /// 配線は後続スライスで行う。
+    /// で、タグの値の読み書きは一切できない。T21 S1-b で MCP 構成補助
+    /// ツール（接続 CRUD）が既にこの判定を使って配線済み
+    /// （`crate::mcp` の `require_admin_scope` 参照）。
     pub fn has_admin_scope(&self) -> bool {
         self.scopes.iter().any(|s| s == "admin")
     }

@@ -1212,12 +1212,16 @@ async fn latest_audit_column(app: &TestApp, column: &str) -> Option<String> {
     // AssertSqlSafe: `column` is always a fixed literal passed by call sites
     // in this file (never external input) - same pattern as
     // `banto_tags::plc_connection`'s `COLUMNS`-interpolating queries.
+    // `fetch_optional`: audit_log が空(行が無い)場合に `RowNotFound` で
+    // panic しないよう `None` を返す - 列自体が NULL 許容なので
+    // `Option<Option<String>>` になるが `flatten` して意味を一致させる。
     sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT {column} FROM audit_log ORDER BY id DESC LIMIT 1"
     )))
-    .fetch_one(&app.pool)
+    .fetch_optional(&app.pool)
     .await
     .unwrap()
+    .flatten()
 }
 
 /// `POST /api/collection/start` を叩いて controller を `Running` にする -
@@ -1474,6 +1478,10 @@ async fn create_connection_while_collection_running_is_queued_not_applied() {
     let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
     start_collection(&app.router, &app.admin_token).await;
     let before_rows = plc_connections_row_count(&app).await;
+    let audit_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
 
     let (status, body) = mcp_post(
         &app.router,
@@ -1501,4 +1509,25 @@ async fn create_connection_while_collection_running_is_queued_not_applied() {
         .await
         .unwrap();
     assert_eq!(pending_count, 1);
+
+    // 設計 §3.3: 構成操作は queued の場合も含めて全て監査する（回帰防止 -
+    // `create_connection_with_admin_scope_while_stopped_creates_and_audits`
+    // と同じ確認方法）。
+    let audit_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        audit_count_after,
+        audit_count_before + 1,
+        "queued create_connection via MCP must add exactly one audit_log row"
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "actor_username").await.as_deref(),
+        Some("admin-key")
+    );
 }
