@@ -79,7 +79,7 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex as AsyncMutex;
 
-use banto_core::ListParams;
+use banto_core::{FieldError, ListParams};
 use banto_tags::{CollectionGroupService, PlcConnectionService, TagService, TagUpdateError};
 
 use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService};
@@ -92,9 +92,14 @@ use crate::pending_changes::PendingChangesService;
 use crate::rest::{
     bearer_token, commit_catalog_and_notify, compute_pending_base_fingerprint, compute_status,
     parse_requested_value, preflight_transaction, run_plc_connection_test, unauthorized_response,
-    CollectionGroupPayload, PlcConnectionPayload, PlcConnectionTestPayload, TagPayload,
-    TagSpaceState,
+    validate_grpc_settings_body, validate_mqtt_settings_request, validate_store_settings_request,
+    CollectionGroupPayload, GrpcSettingsBody, MqttSettingsRequest, MqttSettingsResponse,
+    PlcConnectionPayload, PlcConnectionTestPayload, StoreSettingsRequest, StoreSettingsResponse,
+    TagPayload, TagSpaceState,
 };
+// T21 S2-b: 設定 get/set ツール用（REST の各設定ハンドラと同じ型を再利用する
+// - このモジュールの doc comment「§3.7」節と同じ「二重実装しない」規律）。
+use crate::settings::{MqttSettings, SettingsService, StoreSettings};
 use crate::system_info::SystemInfoSampler;
 use crate::test_output::TestOutputControl;
 use crate::write_audit::WriteAuditService;
@@ -204,6 +209,19 @@ struct McpState {
     /// 同じ値を渡す（`crate::rest::tag_registry_router`の同名フィールドと
     /// 同じ意味）。
     legacy_live_reconfigure: bool,
+    // T21 S2-b（docs/banto-hub-t21-design.md、構成補助 MCP の設定
+    // get/set）: `get_grpc_settings`/`get_mqtt_settings`/`get_retention`/
+    // `set_grpc_settings`/`set_mqtt_settings`/`set_retention`用の追加状態。
+    // 設定はレジストリ mutation ではなく key-value なので pending
+    // queue/preflight/commit_catalog は通らない（このセクションの doc
+    // comment参照）。
+    /// `SettingsService::new(manager.pool())`で構築（`crate::rest`の各
+    /// 設定ハンドラと同じ生成方法）。
+    settings: SettingsService,
+    /// `set_grpc_settings`が`GrpcServer::apply`を呼ぶための共有インスタンス。
+    /// 呼び出し元（`mcp_router`引数）が REST の`grpc_settings_router`と
+    /// **同じ** `Arc`を渡す。
+    grpc_server: Arc<crate::grpc::GrpcServer>,
 }
 
 /// `POST /mcp`のルーターを組み立てる。呼び出し元
@@ -235,6 +253,13 @@ pub(crate) fn mcp_router(
     // 「呼び出し元は...同じインスタンスを渡すこと」と同じ規律）。
     audit: AuditLogService,
     legacy_live_reconfigure: bool,
+    // T21 S2-b（docs/banto-hub-t21-design.md、構成補助 MCP の設定
+    // get/set）: `set_grpc_settings`が`GrpcServer::apply`を呼ぶために必要 -
+    // 呼び出し元は`crate::rest::grpc_settings_router`へ渡すものと**同じ**
+    // `Arc`を渡すこと（このモジュールの doc comment「呼び出し元は...同じ
+    // インスタンスを渡すこと」と同じ規律）。MQTT publisher は既存の
+    // `status.mqtt`（`TagSpaceState`）をそのまま使うので新規引数は追加しない。
+    grpc_server: Arc<crate::grpc::GrpcServer>,
 ) -> Router {
     let status = TagSpaceState {
         manager: manager.clone(),
@@ -253,6 +278,9 @@ pub(crate) fn mcp_router(
     // T21 S1-d: REST の `tag_registry_router`と同じ生成方法。
     let tags = TagService::new(manager.pool());
     let pending_changes = PendingChangesService::new(manager.pool());
+    // T21 S2-b: REST の各設定ハンドラ（`crate::rest::mqtt_settings_get`等）
+    // と同じ生成方法（`SettingsService::new(manager.pool())`）。
+    let settings = SettingsService::new(manager.pool());
     let state = McpState {
         manager: manager.clone(),
         collection_controller: enforce_collection_state.then_some(controller),
@@ -269,6 +297,8 @@ pub(crate) fn mcp_router(
         pending_changes,
         audit,
         legacy_live_reconfigure,
+        settings,
+        grpc_server,
     };
     let auth_state = McpAuthState { api_keys, manager };
 
@@ -888,6 +918,110 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // --- T21 S2-b（docs/tag-server-design.md §5.3/§5.4、docs/banto-hub-t19-design.md
+        // §5.1想定の設定 get/set）: gRPC/MQTT/データストア保持の構成補助
+        // ツール。ここまでの接続/グループ/タグ系ツールと違い、設定は
+        // レジストリ mutation ではなく key-value（`crate::settings::SettingsService`）
+        // なので pending queue も preflight/commit_catalog も通らない
+        // （[`tool_set_grpc_settings`]/[`tool_set_mqtt_settings`]/
+        // [`tool_set_retention`]のdoc comment参照）。可逆操作のため confirm
+        // は不要（設計の confirm 必須は delete 系の不可逆操作限定、
+        // [`tool_set_collection`]のdoc comment と同じ規律）。
+        json!({
+            "name": "get_grpc_settings",
+            "description": "gRPC サーバー設定(enabled/bind/port)を返す(admin スコープ必須)。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "get_mqtt_settings",
+            "description": "MQTT publish 設定を返す(admin スコープ必須)。password は含まれない。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "get_retention",
+            "description": "データストア(tstore)の保持期間設定を返す(admin スコープ必須)。retentionDays が null の場合は無制限。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "set_grpc_settings",
+            "description": "gRPC サーバー設定を更新し即時適用する(admin スコープ必須)。bind を省略すると現在値を維持する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "gRPC サーバーを有効にするか。",
+                    },
+                    "bind": {
+                        "type": "string",
+                        "description": "bind する IP アドレス(例: 127.0.0.1、0.0.0.0)。省略すると現在値を維持する。",
+                    },
+                    "port": {
+                        "type": "integer",
+                        "description": "1〜65535。",
+                    },
+                },
+                "required": ["enabled", "port"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "set_mqtt_settings",
+            "description": "MQTT publish 設定を更新し即時適用する(admin スコープ必須)。password は空文字または省略で現在値を維持する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "enabled": { "type": "boolean" },
+                    "host": { "type": "string" },
+                    "port": { "type": "integer" },
+                    "clientId": { "type": "string" },
+                    "username": { "type": "string", "description": "省略可。" },
+                    "password": {
+                        "type": "string",
+                        "description": "空文字または省略で現在値を維持。",
+                    },
+                    "prefix": { "type": "string" },
+                    "qos": { "type": "integer", "description": "0 または 1。" },
+                    "minIntervalMs": { "type": "integer", "description": "0 以上。" },
+                },
+                "required": [
+                    "enabled",
+                    "host",
+                    "port",
+                    "clientId",
+                    "prefix",
+                    "qos",
+                    "minIntervalMs",
+                ],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "set_retention",
+            "description": "データストア(tstore)の保持期間設定を更新する(admin スコープ必須)。永続化のみで即時剪定は行わない。retentionDays を省略/null にすると無制限。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "retentionDays": {
+                        "type": ["integer", "null"],
+                        "description": "1〜3650、または無制限は null。",
+                    },
+                },
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -925,6 +1059,12 @@ async fn handle_tools_call(
         "delete_tag" => tool_delete_tag(state, ctx, arguments).await?,
         "set_collection" => tool_set_collection(state, ctx, arguments).await?,
         "set_write_control" => tool_set_write_control(state, ctx, arguments).await?,
+        "get_grpc_settings" => tool_get_grpc_settings(state, ctx).await,
+        "get_mqtt_settings" => tool_get_mqtt_settings(state, ctx).await,
+        "get_retention" => tool_get_retention(state, ctx).await,
+        "set_grpc_settings" => tool_set_grpc_settings(state, ctx, arguments).await?,
+        "set_mqtt_settings" => tool_set_mqtt_settings(state, ctx, arguments).await?,
+        "set_retention" => tool_set_retention(state, ctx, arguments).await?,
         other => {
             return Err(RpcError::invalid_params(format!("unknown tool: {other}")));
         }
@@ -950,6 +1090,23 @@ fn tool_ok(payload: Value) -> Value {
 
 fn tool_error(message: impl Into<String>) -> Value {
     tool_result(message.into(), true)
+}
+
+/// REST の各 `validate_*` (`crate::rest::validate_mqtt_settings_request`等)
+/// が返す `Vec<FieldError>` を単一の `tool_error` テキストへ整形する -
+/// REST は複数件の `FieldError` を `ApiError`(`BantoError::Validation`)の
+/// 配列として返せるが、MCP の `tool_error` は単一メッセージなので
+/// `field: message` を `; ` で連結して1本にまとめる（T21 S2-b の設定
+/// set 系ツール専用 - ここまでの構成 CRUD 系ツールは個々のフィールド名を
+/// 持たないドメインエラーの `Display` をそのまま使っており、この関数は
+/// 使わない）。
+fn field_errors_tool_error(errors: Vec<FieldError>) -> Value {
+    let joined = errors
+        .into_iter()
+        .map(|err| format!("{}: {}", err.field, err.message))
+        .collect::<Vec<_>>()
+        .join("; ");
+    tool_error(format!("入力が不正です: {joined}"))
 }
 
 const MISSING_READ_SCOPE: &str =
@@ -1052,7 +1209,7 @@ fn tool_read_tag_values(
     Ok(tool_ok(json!({ "values": values })))
 }
 
-// --- 2b. read_tag_now (T20 ①b、docs/banto-hub-t20-design.md §3.1) ---------
+// --- 3. read_tag_now (T20 ①b、docs/banto-hub-t20-design.md §3.1) ---------
 
 /// `read_tag_now` - `crate::read_path::execute_read_now`をそのまま呼ぶだけ
 /// (`crate::rest::v1_value_read_now`と全く同じ形で委譲する - ①a の
@@ -1092,7 +1249,7 @@ async fn tool_read_tag_now(
     }
 }
 
-// --- 3. get_server_status ------------------------------------------------
+// --- 4. get_server_status ------------------------------------------------
 
 async fn tool_get_server_status(state: &McpState, ctx: &ApiKeyContext) -> Value {
     if !ctx.has_any_read() {
@@ -1115,7 +1272,7 @@ async fn tool_get_server_status(state: &McpState, ctx: &ApiKeyContext) -> Value 
     }
 }
 
-// --- 4. write_tag_value ----------------------------------------------------
+// --- 5. write_tag_value ----------------------------------------------------
 
 async fn tool_write_tag_value(
     state: &McpState,
@@ -1182,7 +1339,7 @@ fn write_tag_value_advisory(tag: &str, value: &Value) -> String {
     )
 }
 
-// --- 5. write_recipe (T20 機能③b、レシピ一括書き込み) -----------------------
+// --- 6. write_recipe (T20 機能③b、レシピ一括書き込み) -----------------------
 
 /// `write_recipe` の1エントリぶんの引数(`{tag, value}`)。`tag`/`value`
 /// のどちらかが欠けている・型が違う要素は個別に`invalid_params`で拒否する -
@@ -1374,7 +1531,7 @@ async fn audit_config_action(
         .await;
 }
 
-// --- 9. list_connections -----------------------------------------------------
+// --- 7. list_connections -----------------------------------------------------
 
 async fn tool_list_connections(state: &McpState, ctx: &ApiKeyContext) -> Value {
     if let Err(err) = require_admin_scope(ctx) {
@@ -1386,7 +1543,7 @@ async fn tool_list_connections(state: &McpState, ctx: &ApiKeyContext) -> Value {
     }
 }
 
-// --- 10. create_connection ----------------------------------------------------
+// --- 8. create_connection ----------------------------------------------------
 
 /// `crate::rest::plc_connections_create`（admin REST）と全く同じ mutation
 /// フロー - 収集中は [`compute_pending_base_fingerprint`] →
@@ -1498,7 +1655,7 @@ async fn tool_create_connection(
     Ok(tool_ok(json!({ "created": created })))
 }
 
-// --- 11. delete_connection ----------------------------------------------------
+// --- 9. delete_connection ----------------------------------------------------
 
 /// `crate::rest::plc_connections_delete`（admin REST）と全く同じ mutation
 /// フロー（`cascade_delete_tx` - T19 S2-b・UX-38: タグ・グループが
@@ -1717,7 +1874,7 @@ const UPDATE_TAG_REQUIRED_FIELDS: [&str; 22] = [
     "retain",
 ];
 
-// --- 12. update_connection ----------------------------------------------------
+// --- 10. update_connection ----------------------------------------------------
 
 /// `crate::rest::plc_connections_update`（admin REST）と全く同じ mutation
 /// フロー - [`tool_create_connection`]と同型（`update_tx`を使う点と`id`引数
@@ -1839,7 +1996,7 @@ async fn tool_update_connection(
     Ok(tool_ok(json!({ "updated": updated })))
 }
 
-// --- 13. test_connection ----------------------------------------------------
+// --- 11. test_connection ----------------------------------------------------
 
 /// `crate::rest::plc_connections_test`（admin REST）をそのまま呼ぶだけ -
 /// 疎通確認本体（virtual/simulation の即時拒否・プロトコル別ダイヤル・
@@ -1865,7 +2022,7 @@ async fn tool_test_connection(
     ))
 }
 
-// --- 14. list_groups ----------------------------------------------------
+// --- 12. list_groups ----------------------------------------------------
 
 async fn tool_list_groups(state: &McpState, ctx: &ApiKeyContext) -> Value {
     if let Err(err) = require_admin_scope(ctx) {
@@ -1877,7 +2034,7 @@ async fn tool_list_groups(state: &McpState, ctx: &ApiKeyContext) -> Value {
     }
 }
 
-// --- 15. create_group ----------------------------------------------------
+// --- 13. create_group ----------------------------------------------------
 
 /// `crate::rest::collection_groups_create`（admin REST）と全く同じ
 /// mutation フロー - [`tool_create_connection`]と同型（対象サービスが
@@ -1990,7 +2147,7 @@ async fn tool_create_group(
     Ok(tool_ok(json!({ "created": created })))
 }
 
-// --- 16. update_group ----------------------------------------------------
+// --- 14. update_group ----------------------------------------------------
 
 /// `crate::rest::collection_groups_update`（admin REST）と全く同じ
 /// mutation フロー - [`tool_update_connection`]と同型。
@@ -2108,7 +2265,7 @@ async fn tool_update_group(
     Ok(tool_ok(json!({ "updated": updated })))
 }
 
-// --- 17. delete_group ----------------------------------------------------
+// --- 15. delete_group ----------------------------------------------------
 
 /// `crate::rest::collection_groups_delete`（admin REST）と全く同じ
 /// mutation フロー（`cascade_delete_tx` - 配下のタグごと削除・履歴は残す）。
@@ -2242,7 +2399,7 @@ async fn tool_delete_group(
 // そのままミラーする。
 // ---------------------------------------------------------------------------
 
-// --- 18. get_tag ----------------------------------------------------------
+// --- 16. get_tag ----------------------------------------------------------
 
 /// RMW（read-modify-write）用の読み取り専用ツール - `update_tag`が全項目
 /// 指定の PUT 置換を要求するため、クライアントはまずこれで現在の全
@@ -2270,7 +2427,7 @@ async fn tool_get_tag(
     }
 }
 
-// --- 19. create_tag ----------------------------------------------------
+// --- 17. create_tag ----------------------------------------------------
 
 /// `crate::rest::tags_create`（admin REST）と全く同じ mutation フロー -
 /// [`tool_create_connection`]と同型（対象サービスが`state.tags`、
@@ -2378,7 +2535,7 @@ async fn tool_create_tag(
     Ok(tool_ok(json!({ "created": created })))
 }
 
-// --- 20. update_tag ----------------------------------------------------
+// --- 18. update_tag ----------------------------------------------------
 
 /// `crate::rest::tags_update`（admin REST）と全く同じ mutation フロー -
 /// [`tool_update_connection`]と同型だが、`TagService::update_tx`が
@@ -2504,7 +2661,7 @@ async fn tool_update_tag(
     Ok(tool_ok(json!({ "updated": updated })))
 }
 
-// --- 21. delete_tag ----------------------------------------------------
+// --- 19. delete_tag ----------------------------------------------------
 
 /// `crate::rest::tags_delete`（admin REST）と全く同じ mutation フロー -
 /// [`tool_delete_connection`]と同型だが、タグは末端リソースのため
@@ -2640,7 +2797,7 @@ fn collection_status_json(status: &crate::controller::CollectionStatus) -> Value
     })
 }
 
-// --- 19. set_collection -----------------------------------------------------
+// --- 20. set_collection -----------------------------------------------------
 
 async fn tool_set_collection(
     state: &McpState,
@@ -2680,7 +2837,7 @@ async fn tool_set_collection(
     Ok(tool_ok(collection_status_json(&status)))
 }
 
-// --- 20. set_write_control ---------------------------------------------------
+// --- 21. set_write_control ---------------------------------------------------
 
 async fn tool_set_write_control(
     state: &McpState,
@@ -2723,4 +2880,241 @@ async fn tool_set_write_control(
     Ok(tool_ok(
         json!({ "writeEnabled": state.write_control.is_enabled() }),
     ))
+}
+
+// --- T21 S2-b: 構成補助ツール（設定 get/set） ------------------------------
+//
+// `get_grpc_settings`/`get_mqtt_settings`/`get_retention`/
+// `set_grpc_settings`/`set_mqtt_settings`/`set_retention`は
+// `crate::settings::SettingsService`のキーバリュー設定を直接読み書きする -
+// 接続/グループ/タグ系ツールと違いレジストリ mutation ではないため、
+// pending queue（`compute_pending_base_fingerprint`/`create_pending`）も
+// `preflight_transaction`/`commit_catalog_and_notify`も一切通らない
+// （[`tool_set_collection`]のdoc comment「T21 S2-a」節と同じ理由）。
+// REST の `crate::rest::grpc_settings_put`/`mqtt_settings_put`/
+// `store_settings_put`と全く同じ request/response 型・入力検証を再利用し
+// （二重実装しない、このモジュールの doc comment「§3.7」節と同じ規律）、
+// gRPC/MQTT は対応する `apply`（`GrpcServer::apply`/`MqttPublisher::apply`）
+// を呼んで即時適用する（retention はデータストアの保持方針を**保存する
+// だけ** - `crate::rest::store_settings_put`のdoc comment参照、実際の
+// 剪定は次回の周期タスク/起動時に自然に効く）。get 系は監査しない
+// （[`require_admin_scope`]のdoc comment「ゲート拒否は監査しない」と同じ
+// 「読み取り専用ルートは監査しない」規律、`crate::audit`のモジュール doc
+// comment参照）。可逆操作のため confirm は不要。
+
+// --- 22. get_grpc_settings ---------------------------------------------------
+
+async fn tool_get_grpc_settings(state: &McpState, ctx: &ApiKeyContext) -> Value {
+    if let Err(err) = require_admin_scope(ctx) {
+        return err;
+    }
+    match state.settings.grpc_config().await {
+        Ok(config) => tool_ok(json!(GrpcSettingsBody::from(config))),
+        Err(err) => tool_error(format!("gRPC 設定の取得に失敗しました: {err}")),
+    }
+}
+
+// --- 23. get_mqtt_settings ---------------------------------------------------
+
+async fn tool_get_mqtt_settings(state: &McpState, ctx: &ApiKeyContext) -> Value {
+    if let Err(err) = require_admin_scope(ctx) {
+        return err;
+    }
+    match state.settings.mqtt_config().await {
+        Ok(config) => tool_ok(json!(MqttSettingsResponse::from(config))),
+        Err(err) => tool_error(format!("MQTT 設定の取得に失敗しました: {err}")),
+    }
+}
+
+// --- 24. get_retention --------------------------------------------------------
+
+async fn tool_get_retention(state: &McpState, ctx: &ApiKeyContext) -> Value {
+    if let Err(err) = require_admin_scope(ctx) {
+        return err;
+    }
+    match state.settings.store_config().await {
+        Ok(config) => tool_ok(json!(StoreSettingsResponse::from(config))),
+        Err(err) => tool_error(format!("データストア保持設定の取得に失敗しました: {err}")),
+    }
+}
+
+// --- 25. set_grpc_settings ----------------------------------------------------
+
+/// `crate::rest::grpc_settings_put`（admin REST）と同じ検証・保存・即時適用
+/// フロー。`bind`省略時は現在値を維持する（`GrpcSettingsBody::bind`の
+/// doc comment参照 - REST と同じ「既存値を読んでフォールバック」）。
+async fn tool_set_grpc_settings(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let body: GrpcSettingsBody = serde_json::from_value(arguments)
+        .map_err(|err| RpcError::invalid_params(format!("gRPC 設定の入力が不正です: {err}")))?;
+
+    let field_errors = validate_grpc_settings_body(&body);
+    if !field_errors.is_empty() {
+        return Ok(field_errors_tool_error(field_errors));
+    }
+
+    let existing = match state.settings.grpc_config().await {
+        Ok(existing) => existing,
+        Err(err) => {
+            return Ok(tool_error(format!(
+                "既存の gRPC 設定の取得に失敗しました: {err}"
+            )))
+        }
+    };
+    let bind = body.bind.clone().unwrap_or(existing.bind);
+    let config = crate::settings::GrpcSettings {
+        enabled: body.enabled,
+        bind,
+        port: body.port,
+    };
+    if let Err(err) = state.settings.set_grpc_config(&config).await {
+        return Ok(tool_error(format!("gRPC 設定の保存に失敗しました: {err}")));
+    }
+    // 実装指示「保存で即時適用」- REST の `grpc_settings_put`と同じ
+    // `GrpcServer::apply`呼び出し。
+    state.grpc_server.apply(&config).await;
+
+    audit_config_action(
+        state,
+        ctx,
+        "update",
+        "grpc_settings",
+        None,
+        Some(json!({ "enabled": config.enabled, "bind": config.bind, "port": config.port })),
+    )
+    .await;
+    Ok(tool_ok(json!(GrpcSettingsBody::from(config))))
+}
+
+// --- 26. set_mqtt_settings ----------------------------------------------------
+
+/// `crate::rest::mqtt_settings_put`（admin REST）と同じ検証・保存・即時適用
+/// フロー。`password`は空文字/省略で現在値を維持する
+/// （`MqttSettingsRequest::password`のdoc comment参照 - REST と同じ
+/// 「既存値を読んでフォールバック」）。応答は`MqttSettingsResponse`を
+/// 再利用するため`password`は返らない（[`tool_get_mqtt_settings`]と同じ
+/// マスキング）。
+async fn tool_set_mqtt_settings(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let body: MqttSettingsRequest = serde_json::from_value(arguments)
+        .map_err(|err| RpcError::invalid_params(format!("MQTT 設定の入力が不正です: {err}")))?;
+
+    let field_errors = validate_mqtt_settings_request(&body);
+    if !field_errors.is_empty() {
+        return Ok(field_errors_tool_error(field_errors));
+    }
+
+    let existing = match state.settings.mqtt_config().await {
+        Ok(existing) => existing,
+        Err(err) => {
+            return Ok(tool_error(format!(
+                "既存の MQTT 設定の取得に失敗しました: {err}"
+            )))
+        }
+    };
+    let password = match body.password.as_deref() {
+        Some(value) if !value.is_empty() => Some(value.to_string()),
+        _ => existing.password,
+    };
+    let config = MqttSettings {
+        enabled: body.enabled,
+        host: body.host,
+        port: body.port,
+        client_id: body.client_id,
+        username: body.username.filter(|value| !value.is_empty()),
+        password,
+        prefix: body.prefix,
+        qos: body.qos,
+        min_interval_ms: body.min_interval_ms,
+    };
+    if let Err(err) = state.settings.set_mqtt_config(&config).await {
+        return Ok(tool_error(format!("MQTT 設定の保存に失敗しました: {err}")));
+    }
+    // 実装指示「保存で即時適用」- REST の `mqtt_settings_put`と同じ
+    // `MqttPublisher::apply`呼び出し（既存の`status.mqtt`を共有インスタンス
+    // として使う - このモジュールの doc comment「呼び出し元は...同じ
+    // インスタンスを渡すこと」と同じ規律）。
+    state.status.mqtt.apply(&config).await;
+
+    audit_config_action(
+        state,
+        ctx,
+        "update",
+        "mqtt_settings",
+        None,
+        Some(json!({ "enabled": config.enabled })),
+    )
+    .await;
+    Ok(tool_ok(json!(MqttSettingsResponse::from(config))))
+}
+
+// --- 27. set_retention ---------------------------------------------------------
+
+/// `crate::rest::store_settings_put`（admin REST）と同じ検証・保存フロー。
+/// `retentionDays`を省略/`null`にすると無制限になる（REST と同じ規約 -
+/// `StoreSettingsRequest`は「既存値へフォールバック」しない唯一の設定
+/// リクエストで、省略はそのまま無制限を意味する）。REST と同じく保存する
+/// だけで、`banto_tstore::prune_files`/`plan_prune`は一切呼ばない
+/// （`crate::rest::store_settings_put`のdoc comment「2026-09-03 オーナー
+/// 決定1」参照 - 次回の24h周期タスク/起動時に自然に効く）。
+async fn tool_set_retention(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let body: StoreSettingsRequest = serde_json::from_value(arguments).map_err(|err| {
+        RpcError::invalid_params(format!("データストア保持設定の入力が不正です: {err}"))
+    })?;
+
+    let field_errors = validate_store_settings_request(&body);
+    if !field_errors.is_empty() {
+        return Ok(field_errors_tool_error(field_errors));
+    }
+
+    let existing = match state.settings.store_config().await {
+        Ok(existing) => existing,
+        Err(err) => {
+            return Ok(tool_error(format!(
+                "既存のデータストア保持設定の取得に失敗しました: {err}"
+            )))
+        }
+    };
+    let config = StoreSettings {
+        data_dir: existing.data_dir,
+        retention_days: body.retention_days,
+    };
+    if let Err(err) = state.settings.set_store_config(&config).await {
+        return Ok(tool_error(format!(
+            "データストア保持設定の保存に失敗しました: {err}"
+        )));
+    }
+
+    audit_config_action(
+        state,
+        ctx,
+        "update",
+        "store_settings",
+        None,
+        Some(json!({ "retentionDays": config.retention_days })),
+    )
+    .await;
+    Ok(tool_ok(json!(StoreSettingsResponse::from(config))))
 }

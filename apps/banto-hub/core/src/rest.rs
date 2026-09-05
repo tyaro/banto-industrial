@@ -1744,24 +1744,29 @@ struct MqttSettingsAdminState {
 
 /// `GET/PUT /api/mqtt-settings`の request/response body。admin-UI 向け
 /// リソースの流儀（`ApiKeySummary`等）に合わせて camelCase。
+// T21 S2-b（docs/banto-hub-t21-design.md、構成補助 MCP の設定 get/set）:
+// `crate::mcp`が同じ入力検証・apply 挙動を再利用するため、この型と
+// `validate_mqtt_settings_request`を`pub(crate)`にしてある - REST/MCP で
+// 設定の validation/response 形を二重実装しないための共有（このモジュールの
+// 他の`pub(crate)`化と同じ理由）。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct MqttSettingsRequest {
-    enabled: bool,
-    host: String,
-    port: u16,
-    client_id: String,
+pub(crate) struct MqttSettingsRequest {
+    pub(crate) enabled: bool,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) client_id: String,
     #[serde(default)]
-    username: Option<String>,
+    pub(crate) username: Option<String>,
     /// 空文字は「変更なし」（既存のパスワードを維持）- 実装指示どおり
     /// （`crate::settings::MqttSettings`のフィールド doc comment参照）。
     /// `GET`はパスワードを一切返さないので、UI が「今の値」を知らずに
     /// フォームを保存しても上書きされない。
     #[serde(default)]
-    password: Option<String>,
-    prefix: String,
-    qos: u8,
-    min_interval_ms: i64,
+    pub(crate) password: Option<String>,
+    pub(crate) prefix: String,
+    pub(crate) qos: u8,
+    pub(crate) min_interval_ms: i64,
 }
 
 /// `password`フィールドが**存在しない**- 実装指示「password は GET で
@@ -1769,7 +1774,7 @@ struct MqttSettingsRequest {
 /// フィールドに含めていないので、実装ミスで漏らしようがない）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct MqttSettingsResponse {
+pub(crate) struct MqttSettingsResponse {
     enabled: bool,
     host: String,
     port: u16,
@@ -1808,7 +1813,7 @@ async fn mqtt_settings_get(
 /// - `qos`は0/1のみ（「2は使わない」）
 /// - `min_interval_ms`は0以上
 /// - `enabled=true`のときは`host`必須（無効化するだけなら未入力のままでよい）
-fn validate_mqtt_settings_request(body: &MqttSettingsRequest) -> Vec<FieldError> {
+pub(crate) fn validate_mqtt_settings_request(body: &MqttSettingsRequest) -> Vec<FieldError> {
     let mut errors = Vec::new();
     if body.qos > 1 {
         errors.push(FieldError {
@@ -1973,9 +1978,12 @@ struct StoreSettingsAdminState {
 /// 含めない（実装指示「data_dir は今回のスコープ外」）。`retentionDays`が
 /// `null`＝無制限（[`crate::settings::StoreSettings::retention_days`]の
 /// doc comment参照）。
+// T21 S2-b: `crate::mcp`の`get_retention`/`set_retention`が同じ
+// request/response 型・validation を再利用する（`MqttSettingsRequest`等と
+// 同じ`pub(crate)`化の理由）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct StoreSettingsResponse {
+pub(crate) struct StoreSettingsResponse {
     retention_days: Option<i64>,
 }
 
@@ -1989,9 +1997,9 @@ impl From<StoreSettings> for StoreSettingsResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct StoreSettingsRequest {
+pub(crate) struct StoreSettingsRequest {
     #[serde(default)]
-    retention_days: Option<i64>,
+    pub(crate) retention_days: Option<i64>,
 }
 
 /// tstore 保持期間の上限（10年）。実装指示「上限は3650（10年）とする」。
@@ -2000,7 +2008,7 @@ const MAX_STORE_RETENTION_DAYS: i64 = 3650;
 /// 入力検証（実装指示どおり）: `null`（無制限）は常に可。数値は 1 以上
 /// [`MAX_STORE_RETENTION_DAYS`] 以下の整数のみ（0 以下＝「当日のみ」相当は
 /// 今回 UI から提供しない）。
-fn validate_store_settings_request(body: &StoreSettingsRequest) -> Vec<FieldError> {
+pub(crate) fn validate_store_settings_request(body: &StoreSettingsRequest) -> Vec<FieldError> {
     let mut errors = Vec::new();
     if let Some(days) = body.retention_days {
         if !(1..=MAX_STORE_RETENTION_DAYS).contains(&days) {
@@ -2243,16 +2251,19 @@ struct GrpcSettingsAdminState {
 /// (このモジュールの「gRPC 設定」セクション doc comment参照)。`GET` の
 /// 応答には常に現在の設定値が入る(`From<GrpcSettings>`参照 - 省略が
 /// 起きるのは request 側だけ)。
+// T21 S2-b: `crate::mcp`の`get_grpc_settings`/`set_grpc_settings`が同じ
+// request/response 型・validation を再利用する（`MqttSettingsRequest`等と
+// 同じ`pub(crate)`化の理由）。
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
-struct GrpcSettingsBody {
-    enabled: bool,
+pub(crate) struct GrpcSettingsBody {
+    pub(crate) enabled: bool,
     /// 省略時(`None`)は現在値を維持。指定する場合は `IpAddr` として
     /// 解釈できる文字列(例: `"127.0.0.1"`/`"0.0.0.0"`)である必要がある
     /// - 既定は `crate::settings::DEFAULT_GRPC_BIND`(`"127.0.0.1"`)。
     #[serde(default)]
-    bind: Option<String>,
-    port: u16,
+    pub(crate) bind: Option<String>,
+    pub(crate) port: u16,
 }
 
 impl From<crate::settings::GrpcSettings> for GrpcSettingsBody {
@@ -2282,7 +2293,7 @@ async fn grpc_settings_get(
 ///   - `mqtt.password` と違い、空文字は「変更なし」の特別扱いをしない
 ///     (空文字は単に不正な IP として弾かれる) - bind は秘匿情報ではない
 ///     ので `None`/フィールド省略のほうで「維持」の意図を表せば足りる
-fn validate_grpc_settings_body(body: &GrpcSettingsBody) -> Vec<FieldError> {
+pub(crate) fn validate_grpc_settings_body(body: &GrpcSettingsBody) -> Vec<FieldError> {
     let mut errors = Vec::new();
     if body.port == 0 {
         errors.push(FieldError {
@@ -8076,7 +8087,11 @@ fn api_router_with_controller_mode(
         ))
         .merge(grpc_settings_router(
             manager.clone(),
-            grpc_server,
+            // T21 S2-b: `crate::mcp::mcp_router`(下の`.merge`)へも同じ
+            // `Arc<GrpcServer>`を渡す必要があるため、ここでは`.clone()`する
+            // （このファイルの他の共有`Arc`規律と同じ - `grpc_server`自体は
+            // 元のまま下の`mcp_router`呼び出しへ渡す）。
+            grpc_server.clone(),
             audit.clone(),
             auth.clone(),
             commissioning_state.clone(),
@@ -8147,6 +8162,10 @@ fn api_router_with_controller_mode(
             // そのまま共有する（このファイルの `.merge` 呼び出し規律と同じ）。
             audit.clone(),
             legacy_live_reconfigure,
+            // T21 S2-b: 設定 get/set ツール用 - 上の `grpc_settings_router`と
+            // 同じ `Arc<GrpcServer>`（`grpc_server.clone()`）を共有する
+            // （このファイルの `Arc` 共有規律と同じ）。
+            grpc_server,
         ))
         .merge(tag_space_router(
             manager,

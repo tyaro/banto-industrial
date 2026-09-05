@@ -425,7 +425,7 @@ async fn initialize_returns_tool_capabilities() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tools_list_returns_the_twenty_one_tools() {
+async fn tools_list_returns_the_twenty_seven_tools() {
     let app = test_app("tools-list").await;
     let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
 
@@ -443,6 +443,9 @@ async fn tools_list_returns_the_twenty_one_tools() {
             "delete_connection",
             "delete_group",
             "delete_tag",
+            "get_grpc_settings",
+            "get_mqtt_settings",
+            "get_retention",
             "get_server_status",
             "get_tag",
             "list_connections",
@@ -451,6 +454,9 @@ async fn tools_list_returns_the_twenty_one_tools() {
             "read_tag_now",
             "read_tag_values",
             "set_collection",
+            "set_grpc_settings",
+            "set_mqtt_settings",
+            "set_retention",
             "set_write_control",
             "test_connection",
             "update_connection",
@@ -2989,4 +2995,400 @@ async fn starting_collection_resets_write_enabled_and_set_write_control_re_enabl
     let payload: Value = serde_json::from_str(text).unwrap();
     assert_eq!(payload["writeEnabled"], true, "{payload:?}");
     assert!(app.write_control.is_enabled());
+}
+
+// ---------------------------------------------------------------------------
+// T21 S2-b: 構成補助ツール（設定 get/set） - gRPC/MQTT/データストア保持。
+// `crate::rest`の各設定ハンドラ(`grpc_settings_put`/`mqtt_settings_put`/
+// `store_settings_put`)と同じ request/response 型・入力検証を再利用して
+// いるので、ここでは「set→get で往復する・監査行が残る・validation は
+// tool_error で拒否され状態は変わらない」ことだけを確認する（apply
+// 副作用そのものの検証は REST 側テストのスコープ、
+// `docs/banto-hub-t21-design.md`実装指示参照）。
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_tools_without_admin_scope_are_rejected_and_change_nothing() {
+    let app = test_app("settings-no-admin").await;
+    // read/write は持つが admin は持たないキー。
+    let key = issue_key(
+        &app.router,
+        &app.admin_token,
+        "reader-writer",
+        &["read", "write:line1.fast.temp01"],
+    )
+    .await;
+
+    let settings = SettingsService::new(app.pool.clone());
+    let grpc_before = settings.grpc_config().await.unwrap();
+    let mqtt_before = settings.mqtt_config().await.unwrap();
+    let store_before = settings.store_config().await.unwrap();
+
+    for (name, args) in [
+        ("get_grpc_settings", json!({})),
+        ("get_mqtt_settings", json!({})),
+        ("get_retention", json!({})),
+        (
+            "set_grpc_settings",
+            json!({ "enabled": true, "bind": "0.0.0.0", "port": 51000 }),
+        ),
+        (
+            "set_mqtt_settings",
+            json!({
+                "enabled": true,
+                "host": "127.0.0.1",
+                "port": 1884,
+                "clientId": "attacker",
+                "prefix": "x",
+                "qos": 1,
+                "minIntervalMs": 500,
+            }),
+        ),
+        ("set_retention", json!({ "retentionDays": 30 })),
+    ] {
+        let (status, body) = mcp_post(&app.router, Some(&key), tools_call(name, args)).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body:?}");
+        assert_eq!(body["result"]["isError"], true, "{name}: {body:?}");
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("missing_admin_scope"), "{name}: {text}");
+    }
+
+    assert_eq!(settings.grpc_config().await.unwrap(), grpc_before);
+    assert_eq!(settings.mqtt_config().await.unwrap(), mqtt_before);
+    assert_eq!(settings.store_config().await.unwrap(), store_before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_grpc_settings_returns_current_settings() {
+    let app = test_app("settings-get-grpc").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("get_grpc_settings", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["enabled"], false, "{payload:?}");
+    assert_eq!(payload["bind"], "127.0.0.1", "{payload:?}");
+    assert_eq!(payload["port"], 50051, "{payload:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_mqtt_settings_returns_current_settings_without_password() {
+    let app = test_app("settings-get-mqtt").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("get_mqtt_settings", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["enabled"], false, "{payload:?}");
+    assert_eq!(payload["clientId"], "banto-hub", "{payload:?}");
+    assert_eq!(payload["prefix"], "banto", "{payload:?}");
+    assert_eq!(payload["qos"], 1, "{payload:?}");
+    assert!(
+        payload.get("password").is_none(),
+        "get_mqtt_settings must never return the password: {payload:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_retention_returns_current_settings() {
+    let app = test_app("settings-get-retention").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("get_retention", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["retentionDays"], 7, "{payload:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_retention_persists_and_audits_then_round_trips_through_get() {
+    let app = test_app("settings-set-retention").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("set_retention", json!({ "retentionDays": 30 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["retentionDays"], 30, "{payload:?}");
+
+    assert_eq!(
+        latest_audit_column(&app, "action").await.as_deref(),
+        Some("update")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("store_settings")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "actor_username").await.as_deref(),
+        Some("admin-key")
+    );
+
+    let settings = SettingsService::new(app.pool.clone());
+    assert_eq!(
+        settings.store_config().await.unwrap().retention_days,
+        Some(30)
+    );
+
+    // null(省略)は無制限 - REST の`store_settings_put`と同じ規約。
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("set_retention", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["retentionDays"], Value::Null, "{payload:?}");
+    assert_eq!(settings.store_config().await.unwrap().retention_days, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_retention_out_of_range_is_rejected_and_unchanged() {
+    let app = test_app("settings-retention-range").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let settings = SettingsService::new(app.pool.clone());
+    let before = settings.store_config().await.unwrap();
+
+    for bad in [0, -1, 3651] {
+        let (status, body) = mcp_post(
+            &app.router,
+            Some(&admin_key),
+            tools_call("set_retention", json!({ "retentionDays": bad })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{bad}: {body:?}");
+        assert_eq!(body["result"]["isError"], true, "{bad}: {body:?}");
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("retentionDays"), "{bad}: {text}");
+    }
+    assert_eq!(settings.store_config().await.unwrap(), before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_mqtt_settings_persists_and_audits_then_round_trips_through_get() {
+    let app = test_app("settings-set-mqtt").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "set_mqtt_settings",
+            json!({
+                "enabled": true,
+                "host": "mqtt.example.local",
+                "port": 1884,
+                "clientId": "banto-hub-test",
+                "username": "operator",
+                "password": "s3cret",
+                "prefix": "line1",
+                "qos": 1,
+                "minIntervalMs": 500,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["host"], "mqtt.example.local", "{payload:?}");
+    assert_eq!(payload["username"], "operator", "{payload:?}");
+    assert!(
+        payload.get("password").is_none(),
+        "set_mqtt_settings response must never echo the password: {payload:?}"
+    );
+
+    assert_eq!(
+        latest_audit_column(&app, "action").await.as_deref(),
+        Some("update")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("mqtt_settings")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+
+    let settings = SettingsService::new(app.pool.clone());
+    let persisted = settings.mqtt_config().await.unwrap();
+    assert_eq!(persisted.host, "mqtt.example.local");
+    assert_eq!(persisted.password.as_deref(), Some("s3cret"));
+
+    // 空文字パスワードは「変更なし」- REST の`mqtt_settings_put`と同じ規約。
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "set_mqtt_settings",
+            json!({
+                "enabled": true,
+                "host": "mqtt.example.local",
+                "port": 1884,
+                "clientId": "banto-hub-test",
+                "prefix": "line1",
+                "qos": 1,
+                "minIntervalMs": 500,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    assert_eq!(
+        settings.mqtt_config().await.unwrap().password.as_deref(),
+        Some("s3cret"),
+        "omitting password must keep the existing one"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_mqtt_settings_rejects_invalid_qos_and_leaves_settings_unchanged() {
+    let app = test_app("settings-mqtt-invalid").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let settings = SettingsService::new(app.pool.clone());
+    let before = settings.mqtt_config().await.unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "set_mqtt_settings",
+            json!({
+                "enabled": true,
+                "host": "mqtt.example.local",
+                "port": 1884,
+                "clientId": "banto-hub-test",
+                "prefix": "line1",
+                "qos": 2,
+                "minIntervalMs": 500,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("qos"), "{text}");
+    assert_eq!(settings.mqtt_config().await.unwrap(), before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_grpc_settings_persists_and_audits_then_round_trips_through_get() {
+    let app = test_app("settings-set-grpc").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "set_grpc_settings",
+            json!({ "enabled": true, "bind": "0.0.0.0", "port": 51000 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["enabled"], true, "{payload:?}");
+    assert_eq!(payload["bind"], "0.0.0.0", "{payload:?}");
+    assert_eq!(payload["port"], 51000, "{payload:?}");
+
+    assert_eq!(
+        latest_audit_column(&app, "action").await.as_deref(),
+        Some("update")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("grpc_settings")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+
+    let settings = SettingsService::new(app.pool.clone());
+    let persisted = settings.grpc_config().await.unwrap();
+    assert_eq!(persisted.bind, "0.0.0.0");
+    assert_eq!(persisted.port, 51000);
+
+    // bind 省略時は現在値を維持する - REST の`grpc_settings_put`と同じ規約。
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "set_grpc_settings",
+            json!({ "enabled": false, "port": 51001 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(
+        payload["bind"], "0.0.0.0",
+        "omitted bind must keep the existing value: {payload:?}"
+    );
+    assert_eq!(payload["port"], 51001, "{payload:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_grpc_settings_rejects_invalid_bind_and_leaves_settings_unchanged() {
+    let app = test_app("settings-grpc-invalid").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let settings = SettingsService::new(app.pool.clone());
+    let before = settings.grpc_config().await.unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "set_grpc_settings",
+            json!({ "enabled": true, "bind": "not-an-ip", "port": 51000 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("bind"), "{text}");
+    assert_eq!(settings.grpc_config().await.unwrap(), before);
 }
