@@ -2,7 +2,7 @@
 
 作成日: 2026-09-05
 状態: **現行**。T19 S5（UX-41）で実装、T20 で `read_tag_now` / `write_recipe` を追加。
-2026-09-05 に実機 R08ENCPU（SLMP）で 6 ツールを検証済み（結果は §8）。
+2026-09-05 に実機 R08ENCPU（SLMP）でデータ面 6 ツールを検証済み（結果は §9）。構成補助（管理面）ツールは §6。
 関連: [tag-server-design.md](tag-server-design.md)（タグ空間・書き込み安全の一次ソース）、
 [banto-hub-t20-design.md](banto-hub-t20-design.md)（文字列・レシピ・ビットの設計）、
 [banto-hub-operations.md](banto-hub-operations.md)（起動・ポート・運用）。
@@ -193,7 +193,42 @@ string タグは文字列。
 > （事前ゲート）にレンジ検査を組み込んで是正した。単票 `execute_write` のゲート順
 > （write_control の 503 が値エラーの 422 より優先）は変更していない。
 
-## 6. データ型と値表現
+## 6. 構成補助ツール（管理面・T21）
+
+MCP から banto-hub を**構成**するツール群（T21、docs/banto-hub-t21-design.md）。
+上位 SCADA/MES や AI エージェントが、接続作成 → タグ登録 → 設定 → 収集開始 →
+書き込み有効化 → API キー発行 → ロックダウンまで **MCP だけで完結**できる。
+
+**共通の約束**:
+
+- すべて **`admin` スコープ必須**（read/write とは直交＝admin だけのキーはタグ値を
+  読み書きできない）。**ロックダウン後も admin スコープで利用可**（設計 §3.2。write 系
+  データツールは §3 のとおりアドバイザリ化するが、構成ツールは影響を受けない）。
+- **全操作を `audit_log` に記録**（`origin:"mcp"`、actor=API キー名。pending queue へ
+  入った場合も記録）。
+- **不可逆操作は `confirm:true` 必須**（`delete_*`・`revoke_api_key`・`lock_down`）。
+- 接続/グループ/タグの変更は**収集中は pending queue に投入**（REST と同じ。停止中は
+  即時 commit）。既存 REST の検証・commit・監査経路を共有し、抜け道を作らない。
+- **更新（`update_*`）は全項目指定（PUT 置換）**。省略項目が既定値で黙って上書き
+  されるのを防ぐため、サーバー側でも全キーの存在を検証する（欠落は `missing_fields`）。
+  `update_tag` は `expectedRevision` を付けると楽観ロック（他者更新時は `revision_conflict`）。
+
+| ツール                                                                                                                    | 種別     | 備考                                                                                                                                            |
+| ------------------------------------------------------------------------------------------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list_connections` / `create_connection` / `update_connection` / `delete_connection` / `test_connection`                  | 接続     | delete は confirm。test は保存前の疎通確認（副作用なし）                                                                                        |
+| `list_groups` / `create_group` / `update_group` / `delete_group`                                                          | グループ | delete は cascade（配下タグごと）＋confirm                                                                                                      |
+| `get_tag` / `create_tag` / `update_tag` / `delete_tag`                                                                    | タグ     | get_tag は全フィールド＋`revision`（update の RMW 用）。delete は confirm。`list_tags` は §4 の read ツール                                     |
+| `set_collection` / `set_write_control`                                                                                    | 運転制御 | start は `RunMode::Configured`。**収集開始は write_enabled を False にリセット**するので、書き込みは開始後に `set_write_control {enabled:true}` |
+| `get_grpc_settings` / `set_grpc_settings` / `get_mqtt_settings` / `set_mqtt_settings` / `get_retention` / `set_retention` | 設定     | set は REST と同じ validation＋即時 apply（retention は永続のみ）。MQTT パスワード等は応答でマスク                                              |
+| `create_api_key` / `list_api_keys` / `revoke_api_key`                                                                     | API キー | create は**任意スコープ発行可**（admin 含む＝オーナー決定）。応答の平文 `key` は発行時のみ。revoke は confirm。list は平文/hash を含まない      |
+| `lock_down`                                                                                                               | 運用     | **不可逆**・confirm 必須。以降 write 系データツールはアドバイザリのみ（構成ツールは admin で継続可）                                            |
+
+**セキュリティ姿勢（設計 §3・§8）**: `admin` スコープのキー1本が構成全権（任意 host への
+接続作成・別 admin キー発行・設定変更・lock_down）を持つ。ガードは **admin スコープ・
+全操作の監査・不可逆操作の confirm** の3点（有効化ガード/キー発行制限はオーナー決定で
+不採用）。運用は **admin キーの配布を厳格に管理**することが前提。
+
+## 7. データ型と値表現
 
 | data_type               | 値の型       | 備考                                                                  |
 | ----------------------- | ------------ | --------------------------------------------------------------------- |
@@ -202,7 +237,7 @@ string タグは文字列。
 | `bit`                   | 真偽値       | アドレスは `Dxxx.0`〜`Dxxx.F`（16進）                                 |
 | `string`                | 文字列       | `stringEncoding`（utf8/shift_jis）でエンコード。読みは `read_tag_now` |
 
-## 7. エラーコード（書き込み）
+## 8. エラーコード（書き込み）
 
 `write_tag_value` の失敗、および `write_recipe` の per-entry 失敗は `error` フィールドに
 コードを持つ（REST/gRPC と共通）。主なもの:
@@ -212,7 +247,7 @@ string タグは文字列。
 - `missing_write_scope` — API キーに当該タグの write スコープが無い
 - `batch_aborted` — レシピの事前ゲート all-or-nothing で他エントリの NG により中止
 
-## 8. 実機検証（2026-09-05、R08ENCPU / SLMP、MCP 経由のみ）
+## 9. 実機検証（2026-09-05、R08ENCPU / SLMP、MCP 経由のみ）
 
 実 PLC（空プログラム・SLMP）に対し、MCP `POST /mcp`（`bh_` キー）だけで T20 の新機能を検証:
 
