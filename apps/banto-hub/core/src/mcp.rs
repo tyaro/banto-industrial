@@ -85,7 +85,7 @@ use banto_tags::{CollectionGroupService, PlcConnectionService, TagService, TagUp
 use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::commissioning::CommissioningState;
-use crate::controller::{CollectionController, CollectionState};
+use crate::controller::{CollectionController, CollectionState, RunMode};
 use crate::hub::CollectorManager;
 use crate::mqtt::MqttPublisher;
 use crate::pending_changes::PendingChangesService;
@@ -98,7 +98,7 @@ use crate::rest::{
 use crate::system_info::SystemInfoSampler;
 use crate::test_output::TestOutputControl;
 use crate::write_audit::WriteAuditService;
-use crate::write_control::WriteControl;
+use crate::write_control::{persist_enabled, WriteControl};
 use crate::write_path::{execute_write, execute_write_batch, WriteDeps};
 use crate::write_rate::WriteRateLimiter;
 use banto_server::ServerEvent;
@@ -850,6 +850,44 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // --- T21 S2-a（docs/tag-server-design.md §8想定の可逆ランタイム
+        // 制御。ここまでの構成 CRUD 系ツールと違い、レジストリ mutation
+        // ではなく collection controller / write_control を直接叩く
+        // ランタイム制御 - pending queue も preflight も通らない
+        // （[`tool_set_collection`]/[`tool_set_write_control`]のdoc comment
+        // 参照）。可逆操作のため confirm は不要（設計の confirm 必須は
+        // delete 系の不可逆操作限定）。
+        json!({
+            "name": "set_collection",
+            "description": "収集を開始/停止する(admin スコープ必須)。start は実機収集(configured モード)を開始する。既知の運用癖: 収集開始は write_enabled を False にリセットするため、書き込みを行うなら開始後に set_write_control で改めて有効化すること。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["start", "stop"],
+                        "description": "start で収集開始(configured モード)、stop で収集停止。",
+                    },
+                },
+                "required": ["action"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "set_write_control",
+            "description": "書き込み受付の有効/無効を切り替える(admin スコープ必須)。収集開始は write_enabled を False にリセットするため、収集開始直後に書き込みを行うにはこのツールで改めて enabled:true にする必要がある。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "true で書き込み受付を有効化、false で無効化。",
+                    },
+                },
+                "required": ["enabled"],
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -885,6 +923,8 @@ async fn handle_tools_call(
         "create_tag" => tool_create_tag(state, ctx, arguments).await?,
         "update_tag" => tool_update_tag(state, ctx, arguments).await?,
         "delete_tag" => tool_delete_tag(state, ctx, arguments).await?,
+        "set_collection" => tool_set_collection(state, ctx, arguments).await?,
+        "set_write_control" => tool_set_write_control(state, ctx, arguments).await?,
         other => {
             return Err(RpcError::invalid_params(format!("unknown tool: {other}")));
         }
@@ -2569,4 +2609,118 @@ async fn tool_delete_tag(
     )
     .await;
     Ok(tool_ok(json!({ "deleted": true, "id": id })))
+}
+
+// --- T21 S2-a: ランタイム制御ツール（構成 CRUD とは別系統） ---------------
+//
+// `set_collection`/`set_write_control`はレジストリ mutation ではなく
+// `CollectionController`/`WriteControl`というライブ状態を直接切り替える
+// ランタイム制御 - ここまでの接続/グループ/タグ系ツールと違い、
+// pending queue（`compute_pending_base_fingerprint`/`create_pending`）も
+// `preflight_transaction`/`commit_catalog_and_notify`も一切通らない（それらは
+// レジストリの内容が変わる mutation 専用の経路）。REST の
+// `crate::rest::collection_start`/`collection_stop`/`write_control_set`と
+// 全く同じ呼び出し（`state.status.controller.start/stop`・
+// `state.write_control.enable/disable` + `persist_enabled`）を行い、
+// 監査の宛先だけが違う（[`audit_config_action`]のdoc comment参照）。
+// 可逆操作なので他の構成ツールと違い confirm は要求しない（設計の
+// confirm 必須は delete 系の不可逆操作限定）。
+
+/// `crate::rest::CollectionStatusResponse`と同じ形に整形する
+/// （camelCase・フィールド構成を REST と揃えて MCP/REST 間で表現を一致
+/// させる）。
+fn collection_status_json(status: &crate::controller::CollectionStatus) -> Value {
+    json!({
+        "state": status.state.as_str(),
+        "mode": status.mode.as_str(),
+        "runId": status.run_id,
+        "configuredRevision": status.configured_revision,
+        "runningRevision": status.running_revision,
+        "lastError": status.last_error,
+    })
+}
+
+// --- 19. set_collection -----------------------------------------------------
+
+async fn tool_set_collection(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let action = arguments
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::invalid_params("arguments.action (string) is required"))?;
+
+    // `crate::rest::collection_start`/`collection_stop`と同じ呼び分け
+    // （このモジュールの doc comment「§3.7」節と同じ「REST と全く同じ
+    // 呼び出し」規律）。
+    let status = match action {
+        "start" => state.status.controller.start(RunMode::Configured).await,
+        "stop" => state.status.controller.stop().await,
+        other => {
+            return Ok(tool_error(format!(
+                "arguments.action は start または stop を指定してください(受け取った値: {other})"
+            )));
+        }
+    };
+    audit_config_action(
+        state,
+        ctx,
+        action,
+        "collection",
+        None,
+        Some(collection_status_json(&status)),
+    )
+    .await;
+    Ok(tool_ok(collection_status_json(&status)))
+}
+
+// --- 20. set_write_control ---------------------------------------------------
+
+async fn tool_set_write_control(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let enabled = arguments
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| RpcError::invalid_params("arguments.enabled (boolean) is required"))?;
+
+    // `crate::rest::write_control_set`と全く同じ呼び出し（ライブフラグの
+    // 切り替え + 表示専用の永続値更新）- 永続化の失敗は REST と同じく
+    // eprintln で握って処理を続ける（`crate::write_control::persist_enabled`
+    // のdoc comment参照: 表示専用の永続値であり次回起動時のライブフラグには
+    // 影響しないため、致命的に扱う必要がない）。
+    if enabled {
+        state.write_control.enable();
+    } else {
+        state.write_control.disable();
+    }
+    if let Err(err) = persist_enabled(&state.manager.pool(), enabled, Some(ctx.name.as_str())).await
+    {
+        eprintln!("banto-hub: 書き込み受付状態の永続化に失敗しました(MCP): {err}");
+    }
+
+    audit_config_action(
+        state,
+        ctx,
+        if enabled { "enable" } else { "disable" },
+        "write_control",
+        Some("1"),
+        Some(json!({ "writeEnabled": enabled })),
+    )
+    .await;
+    Ok(tool_ok(
+        json!({ "writeEnabled": state.write_control.is_enabled() }),
+    ))
 }
