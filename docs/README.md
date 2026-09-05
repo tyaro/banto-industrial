@@ -47,24 +47,25 @@ H5 relay-wright E2E 完了・banto-tagclient S4a 統合を反映）。
 
 ### 現行（現状の正・参照先）
 
-| 文書                                                       | 何の正か / 役割                                                                                        |
-| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| [plan.md](plan.md)                                         | **全体計画の親**。I/R/W/T 系マイルストーンと依存の一覧。                                               |
-| [tag-server-design.md](tag-server-design.md)               | **banto-hub 設計の一次ソース**。タグ空間モデル・外部 IF・書き込み安全。実装状況は §9（T 系）表が正。   |
-| [banto-tagclient-design.md](banto-tagclient-design.md)     | **banto-tagclient の実装前設計**。読み取り専用SDKのREST/WS、binding、再接続、停止、テストゲートの正。  |
-| [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)     | **banto-hub 運転計画（T14〜T18）・UI/UX 決定台帳**。§9.3〜9.5 が T18 タグ登録 UX の受け入れの正。      |
-| [banto-hub-operations.md](banto-hub-operations.md)         | **banto-hub 運用ガイド**（起動・ポート・API/MQTT/gRPC・サービス化・soak 手順）。現状の運用を引く入口。 |
-| [banto-hub-t14-design.md](banto-hub-t14-design.md)         | T14 詳細設計（ランタイム状態管理・制御面分離）。                                                       |
-| [banto-hub-t16-design.md](banto-hub-t16-design.md)         | T16 詳細設計（デスクトップシェル・タスクトレイ）。                                                     |
-| [banto-hub-t17-design.md](banto-hub-t17-design.md)         | T17 詳細設計（SCM 管理・profile・UAC・インストーラ）。                                                 |
-| [banto-hub-t18-design.md](banto-hub-t18-design.md)         | T18 詳細設計（タグ登録 UI/UX・性能検証）の実装分解索引（受け入れは desktop-plan §9.4 が正）。          |
-| [banto-hub-t19-design.md](banto-hub-t19-design.md)         | T19（UX-30〜48 の UI/UX 群）設計・決定台帳。S1〜S5 完了。                                              |
-| [banto-hub-t20-design.md](banto-hub-t20-design.md)         | **T20 計画**（文字列 read/write・構造体タグ登録・レシピ一括書き込み・ワードデバイスのビット .0〜.F）。 |
-| [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) | banto-hub **残作業の優先順位・着手順の索引**（他文書を正とする）。銘柄横断で現状を掴む最短路。         |
-| [improvement-plan.md](improvement-plan.md)                 | Hardening（H1〜H10）の設計・進捗ログ。                                                                 |
-| [recorder-requirements.md](recorder-requirements.md)       | 記録計（chronogazer）R0 要件定義。R1〜R4 スコープの正。                                                |
-| [r1-plan.md](r1-plan.md)                                   | 記録計 R1 実施計画。                                                                                   |
-| [real-machine-mcp-2026-09.md](real-machine-mcp-2026-09.md) | **実機 MCP 動作検証（T19 S5/UX-41）**。3接続×全型の読み書きと安全ゲートの実機記録。                    |
+| 文書                                                       | 何の正か / 役割                                                                                                      |
+| ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| [plan.md](plan.md)                                         | **全体計画の親**。I/R/W/T 系マイルストーンと依存の一覧。                                                             |
+| [tag-server-design.md](tag-server-design.md)               | **banto-hub 設計の一次ソース**。タグ空間モデル・外部 IF・書き込み安全。実装状況は §9（T 系）表が正。                 |
+| [banto-tagclient-design.md](banto-tagclient-design.md)     | **banto-tagclient の実装前設計**。読み取り専用SDKのREST/WS、binding、再接続、停止、テストゲートの正。                |
+| [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)     | **banto-hub 運転計画（T14〜T18）・UI/UX 決定台帳**。§9.3〜9.5 が T18 タグ登録 UX の受け入れの正。                    |
+| [banto-hub-operations.md](banto-hub-operations.md)         | **banto-hub 運用ガイド**（起動・ポート・API/MQTT/gRPC・サービス化・soak 手順）。現状の運用を引く入口。               |
+| [banto-hub-t14-design.md](banto-hub-t14-design.md)         | T14 詳細設計（ランタイム状態管理・制御面分離）。                                                                     |
+| [banto-hub-t16-design.md](banto-hub-t16-design.md)         | T16 詳細設計（デスクトップシェル・タスクトレイ）。                                                                   |
+| [banto-hub-t17-design.md](banto-hub-t17-design.md)         | T17 詳細設計（SCM 管理・profile・UAC・インストーラ）。                                                               |
+| [banto-hub-t18-design.md](banto-hub-t18-design.md)         | T18 詳細設計（タグ登録 UI/UX・性能検証）の実装分解索引（受け入れは desktop-plan §9.4 が正）。                        |
+| [banto-hub-t19-design.md](banto-hub-t19-design.md)         | T19（UX-30〜48 の UI/UX 群）設計・決定台帳。S1〜S5 完了。                                                            |
+| [banto-hub-t20-design.md](banto-hub-t20-design.md)         | **T20 計画**（文字列 read/write・構造体タグ登録・レシピ一括書き込み・ワードデバイスのビット .0〜.F）。               |
+| [banto-hub-mcp-reference.md](banto-hub-mcp-reference.md)   | **banto-hub MCP リファレンス**。6 ツールの I/F・スコープ・ロックダウン・レシピ原子性（MES/ゲートウェイ実装者向け）。 |
+| [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) | banto-hub **残作業の優先順位・着手順の索引**（他文書を正とする）。銘柄横断で現状を掴む最短路。                       |
+| [improvement-plan.md](improvement-plan.md)                 | Hardening（H1〜H10）の設計・進捗ログ。                                                                               |
+| [recorder-requirements.md](recorder-requirements.md)       | 記録計（chronogazer）R0 要件定義。R1〜R4 スコープの正。                                                              |
+| [r1-plan.md](r1-plan.md)                                   | 記録計 R1 実施計画。                                                                                                 |
+| [real-machine-mcp-2026-09.md](real-machine-mcp-2026-09.md) | **実機 MCP 動作検証（T19 S5/UX-41）**。3接続×全型の読み書きと安全ゲートの実機記録。                                  |
 
 ### トピック別の「正」（重複時はここを見る）
 

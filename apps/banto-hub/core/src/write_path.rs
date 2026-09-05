@@ -588,10 +588,21 @@ fn convert_value(
 
 /// [`execute_write_batch`] の事前ゲート all-or-nothing フェーズ1件分:
 /// [`resolve_write_target`](gate 1〜4・値型 present)→ [`convert_value`]
-/// (gate 7)の順に通す。バッチは単票と違い gate 5/6 より**前**にこの2つを
-/// 済ませてよい(§3.3、[`resolve_write_target`]のdoc comment参照)。
-/// **副作用は一切無い**(`tag_row` はここでは読まない - gate 8 commit の
-/// 直前で読む、単票と同じ位置)。
+/// (gate 7・型対称性)→ 数値レンジ検査(gate 7・[`validate_numeric_range`])
+/// の順に通す。バッチは単票と違い gate 5/6 より**前**にこの3つを済ませて
+/// よい(§3.3、[`resolve_write_target`]のdoc comment参照)。**副作用は一切
+/// 無い**(`tag_row` はここでは読まない - gate 8 commit の直前で読む、単票
+/// と同じ位置)。
+///
+/// 2026-09-05 実機検証で発覚した不具合の是正: 当初は `convert_value`(型
+/// 対称性のみ・レンジは見ない)しかここに含めておらず、レンジ外の値が
+/// この事前ゲートをすり抜けて commit フェーズ([`build_plc_write_request`]
+/// 側のレンジ検査)まで届いていた。commit は entry 毎に順次実行するため、
+/// レンジ外の1件だけがそこで拒否され、他の有効なエントリは書き込み済み
+/// という**部分適用**が実機で確認された(i16 タグ3本中1本に範囲外値
+/// 99999 を混ぜた例で applied=2)。§3.3 が要求する「1件でも NG なら無書込」
+/// を満たすには、レンジ検査までこの事前ゲートで完結させる必要がある
+/// ([`ConvertedValue::Str`] はレンジ検査の対象外なのでスキップする)。
 struct PreparedWrite {
     conn: Option<banto_tags::PlcConnection>,
     entry: crate::hub::TagEntry,
@@ -610,6 +621,14 @@ async fn prepare_batch_entry(
 ) -> Result<PreparedWrite, WriteRejection> {
     let resolved = resolve_write_target(deps, collection_mode, tag, requested).await?;
     let value = convert_value(&resolved.entry, resolved.requested)?;
+    // T20 バッチ事前ゲートで gate 7 のレンジ検査まで完了させる(上の doc
+    // comment参照)。単票 execute_write はこれまでどおり
+    // build_plc_write_request 側でレンジ検査する位置を保つ - ③a で確定した
+    // 「write_control off の 503 が型/範囲の 422 より優先」という単票の
+    // ゲート順を壊さないため、ここには足さない。
+    if let ConvertedValue::Numeric(data_type, x) = &value {
+        validate_numeric_range(*data_type, *x).map_err(WriteRejection::ValueOutOfRange)?;
+    }
     Ok(PreparedWrite {
         conn: resolved.conn,
         entry: resolved.entry,

@@ -11,6 +11,8 @@
 //! すでに固定しているのでここでは重複させない）:
 //! 2. 事前ゲート all-or-nothing（最重要）: 1エントリ NG なら他の正当な
 //!    エントリも一切書かれない（監査行数不変・シミュレータ不変で確認）。
+//!    NG の理由は not-writable（gate 2）と数値レンジ外（gate 7、2026-09-05
+//!    実機検証で発覚した部分適用バグの是正テスト）の両方を固定する。
 //! 3. バッチ成功・同一接続1ジョブ: 複数エントリが実機（シミュレータ）の
 //!    ワイヤへ全て届く。
 //! 4. 複数接続: 接続ごとにグルーピングされ、それぞれ書き込まれる。
@@ -536,6 +538,121 @@ async fn one_bad_entry_aborts_the_whole_batch_with_no_audit_rows_and_no_wire_wri
 
     // 決定的固定その2: シミュレータのレジスタが初期値(0)のまま - a・b
     // いずれも PLC へ届いていない。
+    assert_eq!(sim.get_word(SlmpDevice::D, 100), 0, "tag a must not land");
+    assert_eq!(sim.get_word(SlmpDevice::D, 101), 0, "tag b must not land");
+
+    sim.stop();
+}
+
+/// 2026-09-05 実機検証で発覚した不具合の是正テスト: 3本の i16 タグ
+/// (a, b: 範囲内、bad: 範囲外 99999)を同一接続に登録し、`[a, bad, b]` を
+/// バッチ書き込みする。`bad` は writable/enabled いずれも true(gate 1〜4は
+/// 通過する)で、gate 7 の数値レンジ検査だけが NG になる点が上の
+/// `one_bad_entry_aborts_...`(gate 2 の not-writable で NG)と異なる -
+/// この違いが実機で見つかった不具合そのもの: レンジ外の判定が
+/// `prepare_batch_entry`(事前ゲート)ではなく commit フェーズの
+/// `build_plc_write_request` でしか行われていなかったため、a・b が
+/// 先に書き込まれてから bad だけが弾かれる部分適用が発生していた
+/// (実機で applied=2 を確認)。事前ゲート all-or-nothing が正しく機能して
+/// いれば、bad の rejection は `value_out_of_range`、a・b は
+/// `batch_aborted` になり、監査行・シミュレータのレジスタのいずれも
+/// 変化しない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn range_out_of_bounds_entry_aborts_the_whole_batch_with_no_audit_rows_and_no_wire_writes() {
+    let app = test_app("range-out-of-bounds").await;
+    let sim = Simulator::start().await;
+
+    let (group_id, group_name) = setup_connection(&app, "line1", sim.addr.port()).await;
+    let (_tag_a, name_a) = create_tag(
+        &app,
+        "line1",
+        group_id,
+        &group_name,
+        "a",
+        "D100",
+        "i16",
+        true,
+        true,
+    )
+    .await;
+    let (_tag_b, name_b) = create_tag(
+        &app,
+        "line1",
+        group_id,
+        &group_name,
+        "b",
+        "D101",
+        "i16",
+        true,
+        true,
+    )
+    .await;
+    // i16 の範囲([-32768, 32767])外 - gate 7 の数値レンジ検査で NG。
+    let (_tag_bad, name_bad) = create_tag(
+        &app,
+        "line1",
+        group_id,
+        &group_name,
+        "bad",
+        "D102",
+        "i16",
+        true,
+        true,
+    )
+    .await;
+
+    app.write_control.enable();
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &[
+            &format!("write:{name_a}"),
+            &format!("write:{name_b}"),
+            &format!("write:{name_bad}"),
+        ],
+    )
+    .await;
+
+    let audit_before = audit_row_count(&app.router, &app.admin_token).await;
+
+    let (status, body) = v1_post(
+        &app.router,
+        "/api/v1/values/batch",
+        &key,
+        json!({
+            "writes": [
+                { "tag": name_a, "v": 111 },
+                { "tag": name_bad, "v": 99999 },
+                { "tag": name_b, "v": 222 },
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let writes = body["writes"].as_array().unwrap();
+    assert_eq!(writes.len(), 3);
+    assert_eq!(writes[0]["tag"], name_a);
+    assert_eq!(writes[0]["ok"], false);
+    assert_eq!(writes[0]["error"], "batch_aborted");
+    assert_eq!(writes[1]["tag"], name_bad);
+    assert_eq!(writes[1]["ok"], false);
+    assert_eq!(writes[1]["error"], "value_out_of_range");
+    assert_eq!(writes[2]["tag"], name_b);
+    assert_eq!(writes[2]["ok"], false);
+    assert_eq!(writes[2]["error"], "batch_aborted");
+
+    // 決定的固定その1: write_audit の行数が増えていない(1件も監査 insert
+    // されていない - レンジ外の判定は commit フェーズに到達する前の
+    // 事前ゲートで完結している)。
+    let audit_after = audit_row_count(&app.router, &app.admin_token).await;
+    assert_eq!(
+        audit_before, audit_after,
+        "no audit row should be inserted when the batch is aborted pre-gate"
+    );
+
+    // 決定的固定その2: シミュレータのレジスタが初期値(0)のまま - a・b
+    // いずれも PLC へ届いていない(部分適用の再発防止)。
     assert_eq!(sim.get_word(SlmpDevice::D, 100), 0, "tag a must not land");
     assert_eq!(sim.get_word(SlmpDevice::D, 101), 0, "tag b must not land");
 
