@@ -425,7 +425,7 @@ async fn initialize_returns_tool_capabilities() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tools_list_returns_the_twenty_seven_tools() {
+async fn tools_list_returns_the_thirty_one_tools() {
     let app = test_app("tools-list").await;
     let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
 
@@ -437,6 +437,7 @@ async fn tools_list_returns_the_twenty_seven_tools() {
     assert_eq!(
         names,
         vec![
+            "create_api_key",
             "create_connection",
             "create_group",
             "create_tag",
@@ -448,11 +449,14 @@ async fn tools_list_returns_the_twenty_seven_tools() {
             "get_retention",
             "get_server_status",
             "get_tag",
+            "list_api_keys",
             "list_connections",
             "list_groups",
             "list_tags",
+            "lock_down",
             "read_tag_now",
             "read_tag_values",
+            "revoke_api_key",
             "set_collection",
             "set_grpc_settings",
             "set_mqtt_settings",
@@ -3391,4 +3395,513 @@ async fn set_grpc_settings_rejects_invalid_bind_and_leaves_settings_unchanged() 
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("bind"), "{text}");
     assert_eq!(settings.grpc_config().await.unwrap(), before);
+}
+
+// ---------------------------------------------------------------------------
+// T21 S3（docs/banto-hub-t21-design.md、構成補助 MCP の最終スライス）:
+// API キー発行/一覧/失効・ロックダウン。ここまでの構成補助ツールと同じく
+// `admin` スコープ必須・不可逆操作(revoke/lock_down)は confirm 必須・
+// 全操作を origin="mcp" で監査する。`create_api_key`は admin を含む任意の
+// スコープを制限なく発行できることも固定する。
+// ---------------------------------------------------------------------------
+
+async fn api_keys_row_count(app: &TestApp) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM api_keys")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_key_and_lockdown_tools_without_admin_scope_are_rejected_and_change_nothing() {
+    let app = test_app("keys-lockdown-no-admin").await;
+    // read/write は持つが admin は持たないキー。
+    let key = issue_key(
+        &app.router,
+        &app.admin_token,
+        "reader-writer",
+        &["read", "write:line1.fast.temp01"],
+    )
+    .await;
+    let before_rows = api_keys_row_count(&app).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call(
+            "create_api_key",
+            json!({ "name": "should-not-exist", "scopes": ["read"] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true);
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("missing_admin_scope"), "{text}");
+    assert_eq!(
+        api_keys_row_count(&app).await,
+        before_rows,
+        "create_api_key without admin scope must not touch the DB"
+    );
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call("list_api_keys", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true);
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("missing_admin_scope"), "{text}");
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call("revoke_api_key", json!({ "id": 1, "confirm": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true);
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("missing_admin_scope"), "{text}");
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call("lock_down", json!({ "confirm": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true);
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("missing_admin_scope"), "{text}");
+    assert!(
+        !app.commissioning.is_locked_down(),
+        "a rejected lock_down must not lock the server down"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_api_key_issues_a_usable_key_and_audits() {
+    let app = test_app("keys-create").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_api_key",
+            json!({ "name": "line1-writer", "scopes": ["read", "write:line1.fast.temp01"] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["name"], "line1-writer");
+    assert_eq!(
+        payload["scopes"],
+        json!(["read", "write:line1.fast.temp01"])
+    );
+    let plaintext_key = payload["key"]
+        .as_str()
+        .expect("plaintext key must be in the create_api_key response")
+        .to_string();
+    assert!(plaintext_key.starts_with("bh_"), "{payload:?}");
+    assert!(
+        !payload["prefix"].as_str().unwrap().is_empty(),
+        "{payload:?}"
+    );
+
+    assert_eq!(
+        latest_audit_column(&app, "action").await.as_deref(),
+        Some("create")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("api_keys")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "actor_username").await.as_deref(),
+        Some("admin-key")
+    );
+
+    // 決定的な証拠: 発行された平文キーで実際に MCP 認証が通る。
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&plaintext_key),
+        tools_call("read_tag_values", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_api_key_allows_issuing_an_admin_scoped_key_without_limit() {
+    let app = test_app("keys-create-admin-scope").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_api_key",
+            json!({ "name": "second-admin", "scopes": ["admin"] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(
+        body["result"]["isError"], false,
+        "create_api_key must allow issuing a key with the admin scope itself: {body:?}"
+    );
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["scopes"], json!(["admin"]));
+
+    // 発行された admin キー自身で構成ツールが使えることまで確認する。
+    let new_admin_key = payload["key"].as_str().unwrap();
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(new_admin_key),
+        tools_call("list_connections", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_api_key_rejects_an_invalid_scope_and_creates_nothing() {
+    let app = test_app("keys-create-invalid-scope").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let before = api_keys_row_count(&app).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_api_key",
+            json!({ "name": "bogus-scope", "scopes": ["bogus"] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+
+    assert_eq!(
+        api_keys_row_count(&app).await,
+        before,
+        "an invalid scope must not create a row"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_api_keys_returns_issued_keys_without_plaintext_or_hash() {
+    let app = test_app("keys-list").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_api_key",
+            json!({ "name": "line1-writer", "scopes": ["read"] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("list_api_keys", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    let keys = payload["apiKeys"].as_array().expect("apiKeys array");
+    assert!(keys.iter().any(|k| k["name"] == "admin-key"), "{keys:?}");
+    assert!(keys.iter().any(|k| k["name"] == "line1-writer"), "{keys:?}");
+    let text_lower = text.to_lowercase();
+    assert!(
+        !text_lower.contains("bh_"),
+        "list_api_keys must never include a plaintext key: {text}"
+    );
+    for key_row in keys {
+        assert!(
+            key_row.get("key").is_none(),
+            "list_api_keys row must not include the plaintext key: {key_row:?}"
+        );
+        assert!(
+            key_row.get("keyHash").is_none() && key_row.get("key_hash").is_none(),
+            "list_api_keys row must not include key_hash: {key_row:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_api_key_without_confirm_is_rejected_and_key_remains_valid() {
+    let app = test_app("keys-revoke-no-confirm").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_api_key",
+            json!({ "name": "line1-writer", "scopes": ["read"] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    let target_id = payload["id"].as_i64().unwrap();
+    let target_key = payload["key"].as_str().unwrap().to_string();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("revoke_api_key", json!({ "id": target_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("confirm_required"), "{text}");
+
+    // 決定的な証拠: キーはまだ有効(MCP 認証が通る)。
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&target_key),
+        tools_call("read_tag_values", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(
+        body["result"]["isError"], false,
+        "a rejected revoke_api_key must leave the key usable: {body:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_api_key_with_confirm_revokes_the_key_and_audits() {
+    let app = test_app("keys-revoke-confirm").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_api_key",
+            json!({ "name": "line1-writer", "scopes": ["read"] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    let target_id = payload["id"].as_i64().unwrap();
+    let target_key = payload["key"].as_str().unwrap().to_string();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "revoke_api_key",
+            json!({ "id": target_id, "confirm": true }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert!(payload["revokedAt"].is_string(), "{payload:?}");
+
+    assert_eq!(
+        latest_audit_column(&app, "action").await.as_deref(),
+        Some("revoke")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("api_keys")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+
+    // 決定的な証拠その2: 失効済みキーではもう MCP 認証が通らない(401)。
+    let (status, _body) = mcp_post(
+        &app.router,
+        Some(&target_key),
+        tools_call("read_tag_values", json!({})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a revoked key must fail MCP auth"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_down_without_confirm_is_rejected_and_stays_in_commissioning_mode() {
+    let app = test_app("lockdown-no-confirm").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("lock_down", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("confirm_required"), "{text}");
+    assert!(!app.commissioning.is_locked_down());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lock_down_with_confirm_locks_the_server_down_and_audits() {
+    let app = test_app("lockdown-confirm").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("lock_down", json!({ "confirm": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["lockedDown"], true, "{payload:?}");
+    assert!(app.commissioning.is_locked_down());
+
+    assert_eq!(
+        latest_audit_column(&app, "action").await.as_deref(),
+        Some("lock_down")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("commissioning")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+
+    // `get_server_status`は`read`スコープも要求する
+    // （[`tool_get_server_status`]参照）ため、`admin`のみの`admin_key`とは
+    // 別に`admin`+`read`のキーを使う
+    // （`runtime_control_tools_without_admin_scope_are_rejected_and_change_nothing`
+    // と同じやり方）。
+    let admin_read_key = issue_key(
+        &app.router,
+        &app.admin_token,
+        "admin-reader",
+        &["admin", "read"],
+    )
+    .await;
+    let (_status, body) = mcp_post(
+        &app.router,
+        Some(&admin_read_key),
+        tools_call("get_server_status", json!({})),
+    )
+    .await;
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let status_payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(status_payload["lockedDown"], true, "{status_payload:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn after_lock_down_config_tools_still_work_but_writes_become_advisory() {
+    let app = test_app("lockdown-config-vs-write").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let sim = Simulator::start().await;
+    let (_tag_id, external_name) = make_tag(
+        &app,
+        "line1",
+        sim.addr.port(),
+        "temp01",
+        "D100",
+        "u16",
+        true,
+        true,
+    )
+    .await;
+    app.write_control.enable();
+    let writer_key = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:line1.fast.temp01"],
+    )
+    .await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("lock_down", json!({ "confirm": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    assert!(app.commissioning.is_locked_down());
+
+    // ロックダウン後も admin 構成ツールは引き続き使える(有効化ガードは
+    // 元々不採用 - このモジュールの[`require_admin_scope`]周辺のdoc comment
+    // と同じ規律)。
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("list_connections", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(
+        body["result"]["isError"], false,
+        "admin config tools must keep working after lock_down: {body:?}"
+    );
+
+    // だが write_tag_value はもうアドバイザリのみ(実書き込みしない) -
+    // `write_after_lockdown_is_advisory_only_and_never_calls_execute_write`
+    // (このファイル上部)と同じ確認方法。
+    let audit_rows_before = write_audit_row_count(&app).await;
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&writer_key),
+        tools_call(
+            "write_tag_value",
+            json!({ "tag": external_name, "value": 4242 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(
+        body["result"]["isError"], true,
+        "write_tag_value must become advisory-only once locked down: {body:?}"
+    );
+    assert_eq!(
+        write_audit_row_count(&app).await,
+        audit_rows_before,
+        "execute_write must not run once locked down via the lock_down tool"
+    );
+
+    sim.stop();
 }

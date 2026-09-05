@@ -1059,11 +1059,18 @@ struct ApiKeysAdminState {
     manager: Arc<CollectorManager>,
 }
 
+// T21 S3（docs/banto-hub-t21-design.md、構成補助 MCP の
+// create_api_key）: `crate::mcp`の`create_api_key`ツールが同じ
+// request 型・「現在時刻より未来」検証を再利用する（`GrpcSettingsBody`等と
+// 同じ`pub(crate)`化の理由 - 二重実装しない）。フィールドも
+// `pub(crate)`にする必要がある点が`GrpcSettingsBody`と同じ（応答専用の
+// `IssuedApiKeyResponse`と違い、呼び出し元が`name`/`scopes`/`expires_at`を
+// 個別に読む）。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CreateApiKeyRequest {
-    name: String,
-    scopes: Vec<String>,
+pub(crate) struct CreateApiKeyRequest {
+    pub(crate) name: String,
+    pub(crate) scopes: Vec<String>,
     /// H10 ①（docs/improvement-plan.md、2026-08-08 オーナー決定）: 任意の
     /// 有効期限（絶対 epoch ミリ秒、wire は `expiresAt` -
     /// `crate::api_keys::ApiKeySummary` の `expires_at`/`FieldError::field`
@@ -1072,10 +1079,11 @@ struct CreateApiKeyRequest {
     /// 1語なので実質無変化）。省略/`null` = 無期限（既定・動作不変、
     /// `#[serde(default)]` は既存クライアントの後方互換のため -
     /// `GrpcSettingsBody::bind` 等と同じ規約）。`Some` の場合は
-    /// [`api_keys_create`] が「現在時刻より未来」を検証してから
-    /// [`ApiKeysService::issue`] に渡す（`issue` 自体は再検証しない）。
+    /// [`api_keys_create`]（および`crate::mcp`の`create_api_key`）が
+    /// 「現在時刻より未来」を検証してから[`ApiKeysService::issue`]に渡す
+    /// （`issue` 自体は再検証しない）。
     #[serde(default)]
-    expires_at: Option<i64>,
+    pub(crate) expires_at: Option<i64>,
 }
 
 /// `POST /api/api-keys` の応答 - `IssuedApiKey` をそのまま返すと `key`
@@ -1089,8 +1097,13 @@ struct CreateApiKeyRequest {
 /// key を一度だけ返す」ことが主目的）で、入力どおりの値をそのまま返すだけの
 /// `expiresAt` もこの最小性に合わせた - 必要なら直後の `GET /api/api-keys`
 /// 一覧（`crate::api_keys::ApiKeySummary`）で確認できる。
+// T21 S3: `crate::mcp`の`create_api_key`ツールが同じ応答型を再利用する
+// （`MqttSettingsResponse`等と同じ`pub(crate)`化の理由）。応答専用型
+// なので（`CreateApiKeyRequest`と違い）フィールド自体は`pub(crate)`に
+// しない - `From<IssuedApiKey>`経由で構築し`Serialize`するだけで、
+// 呼び出し元が個々のフィールドを読むことはない。
 #[derive(Debug, Serialize, ToSchema)]
-struct IssuedApiKeyResponse {
+pub(crate) struct IssuedApiKeyResponse {
     id: i64,
     name: String,
     prefix: String,
@@ -7992,7 +8005,11 @@ fn api_router_with_controller_mode(
         ))
         .merge(sse_route(auth.clone(), events.clone()))
         .merge(commissioning_router(
-            commissioning,
+            // T21 S3: `crate::mcp`の`lock_down`ツール用にフル
+            // `CommissioningService`を後段の`mcp_router`呼び出しへも渡す
+            // 必要があるため、ここでは`.clone()`する（このファイルの
+            // `Arc`/サービス共有規律と同じ - `commissioning`自体は`Clone`）。
+            commissioning.clone(),
             audit.clone(),
             auth.clone(),
         ))
@@ -8166,6 +8183,10 @@ fn api_router_with_controller_mode(
             // 同じ `Arc<GrpcServer>`（`grpc_server.clone()`）を共有する
             // （このファイルの `Arc` 共有規律と同じ）。
             grpc_server,
+            // T21 S3: `lock_down`ツール用 - `commissioning_router`に渡した
+            // ものと同じフル `CommissioningService`（上の`.clone()`参照）。
+            // ここが最後の使用箇所なので`.clone()`しない。
+            commissioning,
         ))
         .merge(tag_space_router(
             manager,

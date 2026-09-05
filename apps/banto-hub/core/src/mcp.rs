@@ -84,7 +84,7 @@ use banto_tags::{CollectionGroupService, PlcConnectionService, TagService, TagUp
 
 use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService};
 use crate::audit::{AuditEntry, AuditLogService};
-use crate::commissioning::CommissioningState;
+use crate::commissioning::{CommissioningService, CommissioningState};
 use crate::controller::{CollectionController, CollectionState, RunMode};
 use crate::hub::CollectorManager;
 use crate::mqtt::MqttPublisher;
@@ -93,9 +93,9 @@ use crate::rest::{
     bearer_token, commit_catalog_and_notify, compute_pending_base_fingerprint, compute_status,
     parse_requested_value, preflight_transaction, run_plc_connection_test, unauthorized_response,
     validate_grpc_settings_body, validate_mqtt_settings_request, validate_store_settings_request,
-    CollectionGroupPayload, GrpcSettingsBody, MqttSettingsRequest, MqttSettingsResponse,
-    PlcConnectionPayload, PlcConnectionTestPayload, StoreSettingsRequest, StoreSettingsResponse,
-    TagPayload, TagSpaceState,
+    CollectionGroupPayload, CreateApiKeyRequest, GrpcSettingsBody, IssuedApiKeyResponse,
+    MqttSettingsRequest, MqttSettingsResponse, PlcConnectionPayload, PlcConnectionTestPayload,
+    StoreSettingsRequest, StoreSettingsResponse, TagPayload, TagSpaceState,
 };
 // T21 S2-b: 設定 get/set ツール用（REST の各設定ハンドラと同じ型を再利用する
 // - このモジュールの doc comment「§3.7」節と同じ「二重実装しない」規律）。
@@ -222,6 +222,17 @@ struct McpState {
     /// 呼び出し元（`mcp_router`引数）が REST の`grpc_settings_router`と
     /// **同じ** `Arc`を渡す。
     grpc_server: Arc<crate::grpc::GrpcServer>,
+    // T21 S3（docs/banto-hub-t21-design.md、構成補助 MCP の最終スライス）:
+    // `lock_down`ツール用。`commissioning`（`CommissioningState`、上記）は
+    // write 系ツールの`is_locked_down()`判定専用のまま触らない - `lock_down`
+    // 自体を呼ぶにはフルの`CommissioningService`（`CommissioningState`より
+    // 広い、`settings`/`users`も内包する）が要るため、別フィールドとして
+    // 追加する。
+    /// 呼び出し元（`crate::rest::api_router_with_controller_mode`）が
+    /// `commissioning_router`に渡すものと**同じ** `CommissioningService`
+    /// （`.clone()`）を渡す（このモジュールの doc comment「呼び出し元は
+    /// ...同じインスタンスを渡すこと」と同じ規律）。
+    commissioning_service: CommissioningService,
 }
 
 /// `POST /mcp`のルーターを組み立てる。呼び出し元
@@ -260,6 +271,13 @@ pub(crate) fn mcp_router(
     // インスタンスを渡すこと」と同じ規律）。MQTT publisher は既存の
     // `status.mqtt`（`TagSpaceState`）をそのまま使うので新規引数は追加しない。
     grpc_server: Arc<crate::grpc::GrpcServer>,
+    // T21 S3: `lock_down`ツールが`CommissioningService::lock_down`を呼ぶために
+    // 必要 - 呼び出し元は`crate::rest::commissioning_router`へ渡すものと
+    // **同じ** `CommissioningService`を渡すこと（このモジュールの doc comment
+    // 「呼び出し元は...同じインスタンスを渡すこと」と同じ規律）。既存の
+    // `commissioning`引数（`CommissioningState`）は write 系ツールの
+    // `is_locked_down()`判定専用のまま残す。
+    commissioning_service: CommissioningService,
 ) -> Router {
     let status = TagSpaceState {
         manager: manager.clone(),
@@ -299,6 +317,7 @@ pub(crate) fn mcp_router(
         legacy_live_reconfigure,
         settings,
         grpc_server,
+        commissioning_service,
     };
     let auth_state = McpAuthState { api_keys, manager };
 
@@ -1022,6 +1041,71 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // --- T21 S3（docs/banto-hub-t21-design.md、構成補助 MCP の最終
+        // スライス）: API キー発行/一覧/失効・ロックダウン。ここまでの
+        // ツールと同じ admin スコープ必須。`revoke_api_key`/`lock_down`は
+        // 不可逆操作のため confirm:true が必須(delete 系ツールと同じ規律)。
+        json!({
+            "name": "create_api_key",
+            "description": "API キーを新規発行する(admin スコープ必須)。admin を含む任意のスコープを制限なく発行できる(発行できるスコープに上限は無い)。平文 key はこの応答限りでしか取得できないため必ず控えておくこと。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "キー名(一意)。" },
+                    "scopes": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "少なくとも1つ必須。例: [\"read\", \"write:line1.fast.temp01\", \"admin\"]。",
+                    },
+                    "expiresAt": {
+                        "type": "integer",
+                        "description": "任意の有効期限(epoch ミリ秒)。省略/null で無期限。指定する場合は現在時刻より後である必要がある。",
+                    },
+                },
+                "required": ["name", "scopes"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "list_api_keys",
+            "description": "発行済み API キーの一覧を返す(admin スコープ必須)。平文 key・key_hash は含まれない。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "revoke_api_key",
+            "description": "API キーを失効させる(admin スコープ必須)。失効は取消不可のため confirm:true が必須 - 自分自身が使用中のキーを失効すると締め出されうる点に注意。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "失効させる API キーの id。" },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "true を明示しないと拒否される(不可逆操作の確認)。",
+                    },
+                },
+                "required": ["id", "confirm"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "lock_down",
+            "description": "試運転モードから本番(ロックダウン済み)へ切り替える(admin スコープ必須・不可逆)。confirm:true が必須。ロックダウン後は write_tag_value/write_recipe が実際の書き込みを行わずアドバイザリのみを返すようになる - 構成補助ツール自体は admin スコープさえあれば引き続き利用できる。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "true を明示しないと拒否される(不可逆操作の確認)。",
+                    },
+                },
+                "required": ["confirm"],
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -1065,6 +1149,10 @@ async fn handle_tools_call(
         "set_grpc_settings" => tool_set_grpc_settings(state, ctx, arguments).await?,
         "set_mqtt_settings" => tool_set_mqtt_settings(state, ctx, arguments).await?,
         "set_retention" => tool_set_retention(state, ctx, arguments).await?,
+        "create_api_key" => tool_create_api_key(state, ctx, arguments).await?,
+        "list_api_keys" => tool_list_api_keys(state, ctx).await,
+        "revoke_api_key" => tool_revoke_api_key(state, ctx, arguments).await?,
+        "lock_down" => tool_lock_down(state, ctx, arguments).await?,
         other => {
             return Err(RpcError::invalid_params(format!("unknown tool: {other}")));
         }
@@ -3117,4 +3205,167 @@ async fn tool_set_retention(
     )
     .await;
     Ok(tool_ok(json!(StoreSettingsResponse::from(config))))
+}
+
+// ---------------------------------------------------------------------------
+// T21 S3（docs/banto-hub-t21-design.md、構成補助 MCP の最終スライス）:
+// API キー発行/一覧/失効・ロックダウン。ここまでの構成 CRUD/設定ツールと
+// 同じ `admin` スコープ必須＋監査規律（[`audit_config_action`]）だが、
+// mutation 本体は `crate::api_keys::ApiKeysService`/
+// `crate::commissioning::CommissioningService` を直接叩くランタイム制御
+// （[`tool_set_collection`]/[`tool_set_grpc_settings`]等と同じ「レジストリ
+// mutation ではないので pending queue/preflight/commit_catalog は通らない」
+// 性質）。`create_api_key`は無制限 - admin を含む任意スコープの発行を
+// 制限しない（オーナー決定: 発行できるキーの権限に上限を設けない）。
+// `revoke_api_key`/`lock_down`は不可逆操作のため confirm 必須（delete 系
+// ツールと同じ規律、[`tool_delete_connection`]参照）。
+// ---------------------------------------------------------------------------
+
+// --- 28. create_api_key -------------------------------------------------------
+
+/// `crate::rest::api_keys_create`（admin REST）と同じ検証・発行フロー -
+/// `expiresAt`の「現在時刻より未来」検証も REST と同じ場所（呼び出し側）で
+/// 行う（`ApiKeysService::issue`自体は再検証しない、`crate::rest`の
+/// `api_keys_create`のdoc comment参照）。スコープの検証（構文・空配列）は
+/// `issue`内部の`validate_scopes`が行う - `admin`を含め、どのスコープも
+/// 制限なく発行できる（オーナー決定: 発行できるキーの権限に上限を設けない）。
+async fn tool_create_api_key(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let body: CreateApiKeyRequest = serde_json::from_value(arguments)
+        .map_err(|err| RpcError::invalid_params(format!("API キーの入力が不正です: {err}")))?;
+
+    if let Some(expires_at) = body.expires_at {
+        let now_ms = state.manager.clock().now_ms();
+        if expires_at <= now_ms {
+            return Ok(tool_error(
+                "expiresAt: 有効期限は現在時刻より後の日時を指定してください。",
+            ));
+        }
+    }
+
+    let issued = match state
+        .api_keys
+        .issue(&body.name, body.scopes, body.expires_at)
+        .await
+    {
+        Ok(issued) => issued,
+        Err(err) => return Ok(tool_error(format!("{err}"))),
+    };
+
+    // §3.7と同じ規律: 監査 detail にキー平文・ハッシュを含めない
+    // （`crate::rest::api_keys_create`のdoc comment参照）。
+    audit_config_action(
+        state,
+        ctx,
+        "create",
+        "api_keys",
+        Some(&issued.id.to_string()),
+        Some(json!({
+            "name": issued.name,
+            "scopes": issued.scopes,
+            "expiresAt": body.expires_at,
+        })),
+    )
+    .await;
+    Ok(tool_ok(json!(IssuedApiKeyResponse::from(issued))))
+}
+
+// --- 29. list_api_keys --------------------------------------------------------
+
+/// `crate::rest::api_keys_list`（admin REST）と同じ一覧 - `ApiKeySummary`が
+/// 既に`key_hash`/平文キーを含まない（読み取り専用のため監査しない、
+/// [`require_admin_scope`]のdoc comment「ゲート拒否は監査しない」と同じ
+/// 「読み取り専用ルートは監査しない」規律）。
+async fn tool_list_api_keys(state: &McpState, ctx: &ApiKeyContext) -> Value {
+    if let Err(err) = require_admin_scope(ctx) {
+        return err;
+    }
+    match state.api_keys.list().await {
+        Ok(keys) => tool_ok(json!({ "apiKeys": keys })),
+        Err(err) => tool_error(format!("API キー一覧の取得に失敗しました: {err}")),
+    }
+}
+
+// --- 30. revoke_api_key -------------------------------------------------------
+
+/// `crate::rest::api_keys_revoke`（admin REST）と同じ失効フロー。不可逆
+/// 操作のため`arguments.confirm == true`を要求する（設計「delete 系は
+/// confirm 必須」と同じ規律 - 失効は取消不可で、呼び出しに使っている
+/// キー自身を失効すると締め出されうる）。拒否した場合は mutation に
+/// 一切触れない（監査もしない、[`tool_delete_connection`]と同じ規律）。
+async fn tool_revoke_api_key(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let id = arguments
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RpcError::invalid_params("arguments.id (integer) is required"))?;
+    let confirmed = arguments.get("confirm").and_then(Value::as_bool) == Some(true);
+    if !confirmed {
+        return Ok(tool_error(
+            "confirm_required: 失効は不可逆操作です。arguments.confirm:true を指定してください。",
+        ));
+    }
+
+    let summary = match state.api_keys.revoke(id).await {
+        Ok(summary) => summary,
+        Err(err) => return Ok(tool_error(format!("{err}"))),
+    };
+    audit_config_action(
+        state,
+        ctx,
+        "revoke",
+        "api_keys",
+        Some(&id.to_string()),
+        None,
+    )
+    .await;
+    Ok(tool_ok(json!(summary)))
+}
+
+// --- 31. lock_down -------------------------------------------------------------
+
+/// `crate::rest::commissioning_lock_down`（admin REST）と同じ遷移
+/// （`CommissioningService::lock_down`、既にロックダウン済みなら何もせず
+/// 成功する冪等な操作）。不可逆操作のため`arguments.confirm == true`を
+/// 要求する（設計「delete 系は confirm 必須」と同じ規律、
+/// [`tool_delete_connection`]参照）。ロックダウン後は`write_tag_value`/
+/// `write_recipe`がアドバイザリのみになる - このモジュールの doc comment
+/// 「ロックダウン連動の安全ポリシー」参照。構成補助ツール自体はロック
+/// ダウンの前後を問わず admin スコープがあれば引き続き使える（有効化
+/// ガードは元々不採用、[`require_admin_scope`]周辺のdoc comment参照）。
+async fn tool_lock_down(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let confirmed = arguments.get("confirm").and_then(Value::as_bool) == Some(true);
+    if !confirmed {
+        return Ok(tool_error(
+            "confirm_required: ロックダウンは不可逆操作です。arguments.confirm:true を指定してください。",
+        ));
+    }
+
+    if let Err(err) = state.commissioning_service.lock_down().await {
+        return Ok(tool_error(format!("ロックダウンに失敗しました: {err}")));
+    }
+    audit_config_action(state, ctx, "lock_down", "commissioning", Some("1"), None).await;
+    Ok(tool_ok(json!({ "lockedDown": true })))
 }
