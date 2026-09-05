@@ -79,7 +79,7 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex as AsyncMutex;
 
-use banto_core::{FieldError, ListParams};
+use banto_core::{BantoError, FieldError, ListParams};
 use banto_tags::{CollectionGroupService, PlcConnectionService, TagService, TagUpdateError};
 
 use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService};
@@ -1184,10 +1184,10 @@ fn tool_error(message: impl Into<String>) -> Value {
 /// が返す `Vec<FieldError>` を単一の `tool_error` テキストへ整形する -
 /// REST は複数件の `FieldError` を `ApiError`(`BantoError::Validation`)の
 /// 配列として返せるが、MCP の `tool_error` は単一メッセージなので
-/// `field: message` を `; ` で連結して1本にまとめる（T21 S2-b の設定
-/// set 系ツール専用 - ここまでの構成 CRUD 系ツールは個々のフィールド名を
-/// 持たないドメインエラーの `Display` をそのまま使っており、この関数は
-/// 使わない）。
+/// `field: message` を `; ` で連結して1本にまとめる（元は T21 S2-b の設定
+/// set 系ツール専用だったが、[`banto_error_tool_error`]経由で構成 CRUD 系
+/// ツールの `BantoError::Validation` にも共用する - T21 小改善、実機検証
+/// 2026-09-06 の指摘）。
 fn field_errors_tool_error(errors: Vec<FieldError>) -> Value {
     let joined = errors
         .into_iter()
@@ -1195,6 +1195,19 @@ fn field_errors_tool_error(errors: Vec<FieldError>) -> Value {
         .collect::<Vec<_>>()
         .join("; ");
     tool_error(format!("入力が不正です: {joined}"))
+}
+
+/// サービス層の `BantoError` を `tool_error` に変換する - `Validation`
+/// なら[`field_errors_tool_error`]と同じ整形で field 詳細を展開し、それ
+/// 以外のバリアントは従来通り `Display` をそのまま使う（T21 小改善:
+/// 構成 CRUD 系ツールの mutation エラーが `BantoError::Validation` の
+/// `Display`（"validation failed"）だけになり、どの項目がなぜ不正かが
+/// 落ちていた実機検証 2026-09-06 の指摘への対応）。
+fn banto_error_tool_error(err: &BantoError) -> Value {
+    match err {
+        BantoError::Validation { field_errors } => field_errors_tool_error(field_errors.clone()),
+        other => tool_error(format!("{other}")),
+    }
 }
 
 const MISSING_READ_SCOPE: &str =
@@ -1709,14 +1722,14 @@ async fn tool_create_connection(
         Ok(created) => created,
         Err(err) => {
             let _ = tx.rollback().await;
-            return Ok(tool_error(format!("{err}")));
+            return Ok(banto_error_tool_error(&err));
         }
     };
     let snapshot = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
-            return Ok(tool_error(format!("{}", err.0)));
+            return Ok(banto_error_tool_error(&err.0));
         }
     };
     if let Err(err) = tx.commit().await {
@@ -1828,14 +1841,14 @@ async fn tool_delete_connection(
         Ok(cascade) => cascade,
         Err(err) => {
             let _ = tx.rollback().await;
-            return Ok(tool_error(format!("{err}")));
+            return Ok(banto_error_tool_error(&err));
         }
     };
     let snapshot = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
-            return Ok(tool_error(format!("{}", err.0)));
+            return Ok(banto_error_tool_error(&err.0));
         }
     };
     if let Err(err) = tx.commit().await {
@@ -2050,14 +2063,14 @@ async fn tool_update_connection(
         Ok(updated) => updated,
         Err(err) => {
             let _ = tx.rollback().await;
-            return Ok(tool_error(format!("{err}")));
+            return Ok(banto_error_tool_error(&err));
         }
     };
     let snapshot = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
-            return Ok(tool_error(format!("{}", err.0)));
+            return Ok(banto_error_tool_error(&err.0));
         }
     };
     if let Err(err) = tx.commit().await {
@@ -2201,14 +2214,14 @@ async fn tool_create_group(
         Ok(created) => created,
         Err(err) => {
             let _ = tx.rollback().await;
-            return Ok(tool_error(format!("{err}")));
+            return Ok(banto_error_tool_error(&err));
         }
     };
     let snapshot = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
-            return Ok(tool_error(format!("{}", err.0)));
+            return Ok(banto_error_tool_error(&err.0));
         }
     };
     if let Err(err) = tx.commit().await {
@@ -2319,14 +2332,14 @@ async fn tool_update_group(
         Ok(updated) => updated,
         Err(err) => {
             let _ = tx.rollback().await;
-            return Ok(tool_error(format!("{err}")));
+            return Ok(banto_error_tool_error(&err));
         }
     };
     let snapshot = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
-            return Ok(tool_error(format!("{}", err.0)));
+            return Ok(banto_error_tool_error(&err.0));
         }
     };
     if let Err(err) = tx.commit().await {
@@ -2436,14 +2449,14 @@ async fn tool_delete_group(
         Ok(cascade) => cascade,
         Err(err) => {
             let _ = tx.rollback().await;
-            return Ok(tool_error(format!("{err}")));
+            return Ok(banto_error_tool_error(&err));
         }
     };
     let snapshot = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
-            return Ok(tool_error(format!("{}", err.0)));
+            return Ok(banto_error_tool_error(&err.0));
         }
     };
     if let Err(err) = tx.commit().await {
@@ -2589,14 +2602,14 @@ async fn tool_create_tag(
         Ok(created) => created,
         Err(err) => {
             let _ = tx.rollback().await;
-            return Ok(tool_error(format!("{err}")));
+            return Ok(banto_error_tool_error(&err));
         }
     };
     let snapshot = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
-            return Ok(tool_error(format!("{}", err.0)));
+            return Ok(banto_error_tool_error(&err.0));
         }
     };
     if let Err(err) = tx.commit().await {
@@ -2715,14 +2728,14 @@ async fn tool_update_tag(
         }
         Err(TagUpdateError::Banto(err)) => {
             let _ = tx.rollback().await;
-            return Ok(tool_error(format!("{err}")));
+            return Ok(banto_error_tool_error(&err));
         }
     };
     let snapshot = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
-            return Ok(tool_error(format!("{}", err.0)));
+            return Ok(banto_error_tool_error(&err.0));
         }
     };
     if let Err(err) = tx.commit().await {
@@ -2831,13 +2844,13 @@ async fn tool_delete_tag(
     };
     if let Err(err) = state.tags.delete_tx(&mut tx, id).await {
         let _ = tx.rollback().await;
-        return Ok(tool_error(format!("{err}")));
+        return Ok(banto_error_tool_error(&err));
     }
     let snapshot = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
-            return Ok(tool_error(format!("{}", err.0)));
+            return Ok(banto_error_tool_error(&err.0));
         }
     };
     if let Err(err) = tx.commit().await {
@@ -3256,7 +3269,7 @@ async fn tool_create_api_key(
         .await
     {
         Ok(issued) => issued,
-        Err(err) => return Ok(tool_error(format!("{err}"))),
+        Err(err) => return Ok(banto_error_tool_error(&err)),
     };
 
     // §3.7と同じ規律: 監査 detail にキー平文・ハッシュを含めない
@@ -3322,7 +3335,7 @@ async fn tool_revoke_api_key(
 
     let summary = match state.api_keys.revoke(id).await {
         Ok(summary) => summary,
-        Err(err) => return Ok(tool_error(format!("{err}"))),
+        Err(err) => return Ok(banto_error_tool_error(&err)),
     };
     audit_config_action(
         state,
@@ -3364,7 +3377,7 @@ async fn tool_lock_down(
     }
 
     if let Err(err) = state.commissioning_service.lock_down().await {
-        return Ok(tool_error(format!("ロックダウンに失敗しました: {err}")));
+        return Ok(banto_error_tool_error(&err));
     }
     audit_config_action(state, ctx, "lock_down", "commissioning", Some("1"), None).await;
     Ok(tool_ok(json!({ "lockedDown": true })))
