@@ -1519,11 +1519,15 @@ async fn write_plc_string_tag(
 }
 
 /// `banto_tags::Tag::string_encoding` の文字列表現を
-/// `banto_plc_write::StringEncoding` へマップする。CHECK 制約
+/// `banto_plc_write::StringEncoding`(=`banto_plc::StringEncoding` - T20 ①b
+/// で banto-plc-write は banto-plc の型を再エクスポートするだけになった、
+/// `crate::read_path`のモジュール doc comment参照)へマップする。CHECK 制約
 /// (`migrations/0013_tags_add_string_encoding.sql`)により登録時に
 /// `"utf8"`/`"shift_jis"` 以外は拒否されているはずなので、それ以外の値は
-/// 防御的に既定の UTF-8 へフォールバックする(パニックしない)。
-fn string_encoding_from_tag(tag_row: &banto_tags::Tag) -> StringEncoding {
+/// 防御的に既定の UTF-8 へフォールバックする(パニックしない)。`pub(crate)`
+/// にしてあるのは、T20 ①b の `crate::read_path::execute_read_now` も同じ
+/// マッピングを必要とするため(読み書き対称、二重実装しない)。
+pub(crate) fn string_encoding_from_tag(tag_row: &banto_tags::Tag) -> StringEncoding {
     match tag_row.string_encoding.as_str() {
         "shift_jis" => StringEncoding::ShiftJis,
         _ => StringEncoding::Utf8,

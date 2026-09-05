@@ -1176,16 +1176,16 @@ mod tests {
     use crate::types::{BatchWriteRequest, StringWriteRequest};
 
     fn sreq(raw: &str, words: u16, value: &str) -> BatchWriteRequest {
-        sreq_enc(raw, words, value, crate::types::StringEncoding::ShiftJis)
+        sreq_enc(raw, words, value, crate::StringEncoding::ShiftJis)
     }
 
-    /// Same as [`sreq`] but with an explicit [`crate::types::StringEncoding`]
+    /// Same as [`sreq`] but with an explicit [`crate::StringEncoding`]
     /// - used by the UTF-8 planner tests below (T20 ①a).
     fn sreq_enc(
         raw: &str,
         words: u16,
         value: &str,
-        encoding: crate::types::StringEncoding,
+        encoding: crate::StringEncoding,
     ) -> BatchWriteRequest {
         BatchWriteRequest::String(StringWriteRequest {
             address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw} should parse: {e}")),
@@ -1239,12 +1239,7 @@ mod tests {
     #[test]
     fn a_string_request_is_encoded_with_its_own_encoding() {
         let outcome = plan_slmp_write_batch(
-            &[sreq_enc(
-                "D0",
-                5,
-                "テスト",
-                crate::types::StringEncoding::Utf8,
-            )],
+            &[sreq_enc("D0", 5, "テスト", crate::StringEncoding::Utf8)],
             LH,
         );
         assert!(outcome.immediate_bad.is_empty());
@@ -1314,7 +1309,7 @@ mod tests {
                 address: Address::parse("40001").unwrap(),
                 words: 4,
                 value: "AB".to_string(),
-                encoding: crate::types::StringEncoding::ShiftJis,
+                encoding: crate::StringEncoding::ShiftJis,
             })],
             LH,
         );

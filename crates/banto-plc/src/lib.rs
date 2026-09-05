@@ -85,6 +85,6 @@ pub use slmp::{
     SlmpCpu, SlmpErrorClass,
 };
 pub use types::{
-    BatchReadRequest, BatchReadResult, DataType, PlcValue, ReadRequest, ReadResult,
+    BatchReadRequest, BatchReadResult, DataType, PlcValue, ReadRequest, ReadResult, StringEncoding,
     StringReadRequest, TagValue,
 };

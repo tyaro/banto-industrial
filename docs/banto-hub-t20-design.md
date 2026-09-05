@@ -1,7 +1,7 @@
 # banto-hub T20 設計: 文字列・構造体登録・レシピ・ビットデバイス
 
 作成日: 2026-09-04
-状態: **計画（未着手）。オーナー方針は §2、③の原子性・レシピ非保存は 2026-09-04 承認で確定。④ 完了・② 完了・③ 完了（③c はタグサーバー責務外で不採用）。残るは①（文字列 read/write）のみ。残る未決は①の文字列値表現（最終スライス着手時に確定）。**
+状態: **計画（未着手）。オーナー方針は §2、③の原子性・レシピ非保存は 2026-09-04 承認で確定。④ 完了・② 完了・③ 完了（③c はタグサーバー責務外で不採用）。**T20 全機能完了（2026-09-05）**: ④ ビット16進＋ダイアレクト抽象 / ② 構造体登録＋オフセットコピー / ③ レシピ一括書き込み（REST＋MCP、UI は不採用） / ① 文字列 read/write（案A・分離経路、write＝write_path・read＝read-on-demand）。**
 対象: 4つの新機能（①文字列 read/write、②構造体タグ登録＋オフセットコピー、③レシピ一括書き込み、④ワードデバイスのビット `.0〜.F`）
 
 関連: [tag-server-design.md](tag-server-design.md)（タグ空間・書き込み安全の一次ソース）、[banto-hub-t19-design.md](banto-hub-t19-design.md)（直前の UI/UX 群）、[banto-tagclient-design.md](banto-tagclient-design.md) §4.4（③が覆す旧決定）。
@@ -84,7 +84,15 @@ banto-tags に migration 0013 で `string_encoding` 列（既定 utf8・CHECK）
 シミュレータのワイヤに正しいバイトで届くことをテスト固定。エンコーディング選択の登録 UI は
 ①a では未追加（API/MCP で設定可。UI は任意）。
 
-**①b（文字列 read-on-demand）は別スライス**（current_values を経由しない直接読み）。
+**①b（文字列 read-on-demand）: 完了（2026-09-05）。** current_values/tstore を経由せず PLC から
+直接その場読みする経路。`StringEncoding` を banto-plc に移設（write の①a と read で共有、
+banto-plc-write は re-export）、`decode_string_value` がエンコーディングに従って UTF-8/Shift-JIS を
+選ぶ。relay-wright の文字列読み（poller.rs）は `ShiftJis` を明示して挙動保全。hub は
+`read_path.rs::execute_read_now`（catalog 解決 → 非スポーン peek handle → `BatchReadRequest`
+組み立て〈String はタグの string_encoding〉→ 数値は scale 適用）を追加し、REST
+`GET /api/v1/values/{tag}/read-now`（read スコープ・per-tag can_read_value）と MCP `read_tag_now`
+で公開。write→read-now で UTF-8/Shift-JIS が往復すること、collection cache が持たない値を
+read-now が返せること（cache 非経由の証明）をテスト固定。**これで T20 完了。**
 
 ### 3.2 ②構造体タグ登録（デバイス自動割付・手動割付・オフセットコピー）
 

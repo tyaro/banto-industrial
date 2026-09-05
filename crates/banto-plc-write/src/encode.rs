@@ -22,7 +22,7 @@
 use banto_plc::{DataType, TagValue, WordOrder};
 
 use crate::error::PlcWriteError;
-use crate::types::StringEncoding;
+use crate::StringEncoding;
 
 /// Split a `u32` into its two register words per `order` - the exact inverse of
 /// `banto-plc/src/decode.rs`'s `combine_u32`, which reads

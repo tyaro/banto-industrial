@@ -6003,6 +6003,142 @@ async fn v1_value_single(
     .into_response()
 }
 
+/// `GET /api/v1/values/{tag}/read-now` の応答(T20 ①b、
+/// docs/banto-hub-t20-design.md §3.1)。[`SingleValueResponse`](cache 読み)
+/// と違い `v` は `serde_json::Value` - 数値・真偽値・文字列のいずれも
+/// 表せる(文字列タグはこの経路でしか読めない - このモジュールの
+/// [`v1_value_read_now`] doc comment参照)。`SingleValueResponse` 自体は
+/// 変更しない(既存の cache 読みの応答型を壊さない、実装指示の制約)。
+#[derive(Debug, Serialize, ToSchema)]
+struct ReadNowResponse {
+    tag: String,
+    /// 数値・真偽値・文字列のいずれか(数値タグは scale 済みの工学値 -
+    /// `crate::read_path`のモジュール doc comment「スケーリング」節参照)。
+    #[schema(value_type = f64, example = 1)]
+    v: serde_json::Value,
+    /// その場読みが成功した時点の品質は常に `"good"` - キャッシュ読みと
+    /// 違い、この経路は失敗を `q: "bad"` の200応答ではなく HTTP エラーで
+    /// 表す(`read_now_rejection_response`参照)ので、200応答の`q`は常に
+    /// `"good"`。フィールド自体は cache 読みの `ValueEntry`/`SingleValueResponse`
+    /// と形を揃えるために残す。
+    q: String,
+    /// この読み取りが完了した時刻(ミリ秒epoch) - cache 読みの `t`
+    /// (サンプル採取時刻)と違い、その場読みでは「サンプル時刻」という
+    /// 概念自体が無い(収集サイクルを経由しない)ので、応答組み立て時の
+    /// 時刻をそのまま使う。
+    t: i64,
+}
+
+impl ReadNowResponse {
+    fn from_value(tag: String, value: banto_plc::PlcValue, now_ms: i64) -> Self {
+        Self {
+            tag,
+            v: crate::read_path::plc_value_to_json(&value),
+            q: "good".to_string(),
+            t: now_ms,
+        }
+    }
+}
+
+/// `GET /api/v1/values/{tag}/read-now` - T20 ①b(案A、
+/// docs/banto-hub-t20-design.md §3.1「その場読み」)。`GET
+/// /api/v1/values/{tag}`(cache 読み、[`v1_value_single`]、
+/// current_values/tstore 経由)とは別経路 - **この経路は毎回 PLC から直接
+/// 読み、収集キャッシュ(current_values/tstore)には一切触れない**
+/// (`crate::read_path`のモジュール doc comment参照)。収集パイプラインから
+/// 意図的に除外されている文字列タグを読める唯一の GET エンドポイント。
+///
+/// 認証は [`v1_value_single`]と同じ read ルート規律(`ctx.has_any_read()`
+/// はミドルウェア`require_tag_space_auth`、per-tag `ctx.can_read_value(tag)`
+/// と API キーの simulation 出力除外はこのハンドラ自身)。ゲート・エラー
+/// マッピングの詳細は [`crate::read_path::execute_read_now`]/
+/// [`read_now_rejection_response`] 参照。
+#[utoipa::path(
+    get,
+    path = "/api/v1/values/{tag}/read-now",
+    params(("tag" = String, Path, description = "外部名 {connection}.{group}.{tag}")),
+    responses(
+        (status = 200, description = "その場読みの結果(v は数値・真偽値・文字列のいずれか)", body = ReadNowResponse),
+        (status = 403, description = "per-tag read スコープ外(API キー、H10 ③と同じ規律)"),
+        (status = 404, description = "catalog に存在しない外部名"),
+        (status = 422, description = "internal/computed タグ(PLC 接続を持たない)、またはアドレス不正"),
+        (status = 501, description = "接続のプロトコルに broker ドライバが未対応"),
+        (status = 502, description = "PLC からの読み取りに失敗"),
+        (status = 503, description = "収集セッションが無い(新規にはダイヤルしない)、または simulation 出力は API キー非対象"),
+    ),
+    tag = "tag-space",
+)]
+async fn v1_value_read_now(
+    State(state): State<TagSpaceState>,
+    Path(tag): Path<String>,
+    ctx: Option<Extension<ApiKeyContext>>,
+) -> Response {
+    let map = state.manager.tag_map();
+    let Some(entry) = map.get(&tag).cloned() else {
+        return ApiError(BantoError::NotFound {
+            resource: "tags".to_string(),
+            id: tag,
+        })
+        .into_response();
+    };
+    if let Some(Extension(ctx)) = &ctx {
+        if !ctx.can_read_value(&tag) {
+            return forbidden_response();
+        }
+    }
+    // H10 ③と同じ規律([`v1_value_single`]参照): API キー由来の読み取りは
+    // simulation/derived_simulation の値を外部出力しない。その場読みは
+    // 実際に PLC(または保存済みシミュレーション接続)へ読みに行ってしまう
+    // 前にこのチェックで弾く必要がある - cache 読みと違い、実行してから
+    // 隠すのではなく最初から実行しない。
+    let runtime = state.controller.status();
+    if ctx.is_some() && !api_key_external_output_allowed(&entry, &runtime) {
+        return simulation_output_disabled_response();
+    }
+    match crate::read_path::execute_read_now(&state.manager, &tag).await {
+        Ok(value) => {
+            let now_ms = state.manager.clock().now_ms();
+            Json(ReadNowResponse::from_value(tag, value.value, now_ms)).into_response()
+        }
+        Err(rejection) => read_now_rejection_response(tag, rejection),
+    }
+}
+
+/// [`v1_value_read_now`]の拒否理由 → HTTP 応答マッピング
+/// (`write_rejection_response`の読み取り版・同じ形)。`NotFound` は
+/// [`v1_value_read_now`]がその場読みを試みる前に自前で 404 返しているので
+/// 通常はここへ来ないが、`crate::read_path::execute_read_now`は
+/// 他の呼び出し元(MCP の `read_tag_now`)からも呼ばれる独立した関数であり、
+/// かつ2回の catalog 参照の間に rebuild が挟まる理論上の競合もあり得るため、
+/// `write_rejection_response`と違って`unreachable!`にはしない(素直に404
+/// を返す)。
+fn read_now_rejection_response(
+    tag: String,
+    rejection: crate::read_path::ReadNowRejection,
+) -> Response {
+    use crate::read_path::ReadNowRejection;
+
+    if matches!(rejection, ReadNowRejection::NotFound) {
+        return ApiError(BantoError::NotFound {
+            resource: "tags".to_string(),
+            id: tag,
+        })
+        .into_response();
+    }
+
+    let status = match &rejection {
+        ReadNowRejection::NotFound => StatusCode::NOT_FOUND, // 上で早期returnされるが、network越しの二重呼び出し等に備え防御的に用意
+        ReadNowRejection::NotPlcBacked | ReadNowRejection::InvalidAddress(_) => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        ReadNowRejection::UnsupportedProtocol => StatusCode::NOT_IMPLEMENTED,
+        ReadNowRejection::NoSession => StatusCode::SERVICE_UNAVAILABLE,
+        ReadNowRejection::ReadFailed(_) => StatusCode::BAD_GATEWAY,
+        ReadNowRejection::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(rejection.to_json())).into_response()
+}
+
 /// `GET /api/v1/status` の `connections` 配列1件分。
 #[derive(Debug, Serialize, ToSchema)]
 struct ConnectionStatusEntry {
@@ -7249,6 +7385,7 @@ async fn v1_write_values_batch(
         v1_tags,
         v1_values,
         v1_value_single,
+        v1_value_read_now,
         v1_write_value,
         v1_write_values_batch,
         v1_status,
@@ -7260,6 +7397,7 @@ async fn v1_write_values_batch(
         CatalogTagEntry,
         ValueEntry,
         SingleValueResponse,
+        ReadNowResponse,
         ValuesResponse,
         ConnectionStatusEntry,
         MqttStatusEntry,
@@ -7546,6 +7684,12 @@ fn tag_space_router(
         .route("/api/v1/tags", get(v1_tags))
         .route("/api/v1/values", get(v1_values))
         .route("/api/v1/values/{tag}", get(v1_value_single))
+        // T20 ①b(docs/banto-hub-t20-design.md §3.1): read-on-demand -
+        // 静的セグメント `read-now` は axum(matchit)のルーティングで
+        // `{tag}`より深い階層なので `/api/v1/values/{tag}` とは衝突しない
+        // (T20-3a の `/api/v1/values/batch` と同じ「静的セグメント優先」の
+        // 理屈)。
+        .route("/api/v1/values/{tag}/read-now", get(v1_value_read_now))
         .route("/api/v1/status", get(v1_status))
         .route("/api/v1/events", get(v1_events))
         // T1（設計 §5.2・§5.6の9番）: 認証は他の /api/v1/* と同一の

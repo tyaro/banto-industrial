@@ -85,8 +85,13 @@ pub use slmp::planning::{
     SlmpPlannedWrite, SlmpWritePlanOutcome, WritePayload,
 };
 pub use slmp::{execute_slmp_writes, SlmpWriteClient};
-pub use types::{BatchWriteRequest, StringEncoding, StringWriteRequest, WriteRequest, WriteResult};
+pub use types::{BatchWriteRequest, StringWriteRequest, WriteRequest, WriteResult};
 
 // Re-exported for callers building requests, so they need only depend on this
 // crate for a basic write. The canonical definitions stay in `banto-plc`.
-pub use banto_plc::{Address, DataType, SlmpConfig, SlmpCpu, TagValue, WordOrder};
+// `StringEncoding` moved to `banto-plc` in T20 ①b (docs/banto-hub-t20-design.md
+// §3.1, `types.rs`'s module comment on the `StringWriteRequest` section) so
+// `banto_plc::StringReadRequest` can share it too - re-exported here under
+// its original `banto_plc_write::StringEncoding` name so no ①a call site
+// needed to change.
+pub use banto_plc::{Address, DataType, SlmpConfig, SlmpCpu, StringEncoding, TagValue, WordOrder};

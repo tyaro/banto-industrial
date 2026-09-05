@@ -626,7 +626,8 @@ async fn execute_slmp_writes_runs_on_a_borrowed_client_for_the_broker() {
 
 use banto_plc::{BatchReadRequest, BatchReadResult, PlcValue, StringReadRequest};
 
-use crate::types::{BatchWriteRequest, StringEncoding, StringWriteRequest};
+use crate::types::{BatchWriteRequest, StringWriteRequest};
+use crate::StringEncoding;
 
 fn swreq(raw: &str, words: u16, value: &str) -> BatchWriteRequest {
     swreq_enc(raw, words, value, StringEncoding::ShiftJis)
@@ -643,10 +644,14 @@ fn swreq_enc(raw: &str, words: u16, value: &str, encoding: StringEncoding) -> Ba
     })
 }
 
+/// T20 ①b: reads are decoded per this crate's own pre-①b behavior
+/// (Shift-JIS) - these write-side integration tests only need `srreq` to
+/// read back what `swreq` (also Shift-JIS by default) just wrote.
 fn srreq(raw: &str, words: u16) -> BatchReadRequest {
     BatchReadRequest::String(StringReadRequest {
         address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw} should parse: {e}")),
         words,
+        encoding: StringEncoding::ShiftJis,
     })
 }
 

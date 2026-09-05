@@ -734,7 +734,9 @@ async fn performance_smoke_256_tags_x_1000_read_batch_calls() {
 /// call serves all three kinds in a single planning pass.
 #[tokio::test]
 async fn read_batch_mixed_reads_strings_and_numerics_in_one_call() {
-    use crate::types::{BatchReadRequest, BatchReadResult, PlcValue, StringReadRequest};
+    use crate::types::{
+        BatchReadRequest, BatchReadResult, PlcValue, StringEncoding, StringReadRequest,
+    };
 
     let sim = Simulator::start().await;
     sim.set_string(SlmpDevice::D, 0, 4, "ABC"); // padded with NULs
@@ -746,10 +748,14 @@ async fn read_batch_mixed_reads_strings_and_numerics_in_one_call() {
     let mut client = SlmpClient::new(fast_config(&sim));
     client.connect().await.expect("connect");
 
+    // T20 ①b: `Simulator::set_string` is Shift-JIS-only (its own doc
+    // comment), so every request built by this closure is decoded as
+    // Shift-JIS - matching what was seeded.
     let sreq = |raw: &str, words: u16| {
         BatchReadRequest::String(StringReadRequest {
             address: Address::parse_slmp(raw).unwrap(),
             words,
+            encoding: StringEncoding::ShiftJis,
         })
     };
     let requests = [
@@ -800,6 +806,7 @@ async fn read_batch_mixed_trims_at_an_embedded_nul() {
         .read_batch_mixed(&[BatchReadRequest::String(StringReadRequest {
             address: Address::parse_slmp("D0").unwrap(),
             words: 2,
+            encoding: crate::types::StringEncoding::ShiftJis,
         })])
         .await
         .unwrap();
@@ -830,6 +837,7 @@ async fn string_reads_spanning_the_batching_boundary_split_and_still_decode() {
         BatchReadRequest::String(StringReadRequest {
             address: Address::parse_slmp(raw).unwrap(),
             words,
+            encoding: crate::types::StringEncoding::ShiftJis,
         })
     };
     let results = client
@@ -863,6 +871,7 @@ async fn an_over_cap_string_is_bad_through_the_client_without_blocking_batch_mat
             BatchReadRequest::String(StringReadRequest {
                 address: Address::parse_slmp("D1000").unwrap(),
                 words: 481,
+                encoding: crate::types::StringEncoding::ShiftJis,
             }),
             BatchReadRequest::Numeric(req("D0", DataType::U16)),
         ])
@@ -886,9 +895,154 @@ async fn read_batch_mixed_before_connect_is_not_connected() {
     let requests = [BatchReadRequest::String(StringReadRequest {
         address: Address::parse_slmp("D0").unwrap(),
         words: 4,
+        encoding: crate::types::StringEncoding::ShiftJis,
     })];
     assert!(matches!(
         client.read_batch_mixed(&requests).await,
         Err(PlcError::NotConnected)
     ));
+}
+
+// --- T20 ①b: StringEncoding::Utf8 read (docs/banto-hub-t20-design.md §3.1) ---
+
+/// The load-bearing UTF-8 read proof, mirroring `banto-plc-write`'s
+/// `utf8_string_write_lands_the_correct_bytes_on_the_wire` on the read side:
+/// seed the wire directly with UTF-8 bytes (`Simulator::set_string` is
+/// Shift-JIS-only by design, so it cannot seed this case) and read them back
+/// through the real wire path with `StringEncoding::Utf8`. "テスト" is 9
+/// bytes in UTF-8 vs. 6 in Shift-JIS, so this proves the encoding choice is
+/// actually threaded into the decode step, not merely accepted.
+#[tokio::test]
+async fn read_batch_mixed_decodes_utf8_when_requested() {
+    use crate::types::{
+        BatchReadRequest, BatchReadResult, PlcValue, StringEncoding, StringReadRequest,
+    };
+
+    let sim = Simulator::start().await;
+    let text = "テスト";
+    let words = 5u16; // 9 UTF-8 bytes fit in 5 words (10 bytes), 1 byte of NUL padding.
+    let mut bytes = text.as_bytes().to_vec();
+    bytes.resize(words as usize * 2, 0x00);
+    let regs: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    sim.set_words(SlmpDevice::D, 0, &regs);
+
+    let mut client = SlmpClient::new(fast_config(&sim));
+    client.connect().await.unwrap();
+
+    let results = client
+        .read_batch_mixed(&[BatchReadRequest::String(StringReadRequest {
+            address: Address::parse_slmp("D0").unwrap(),
+            words,
+            encoding: StringEncoding::Utf8,
+        })])
+        .await
+        .unwrap();
+    assert_eq!(
+        results[0],
+        BatchReadResult::Value(PlcValue::Str(text.to_string()))
+    );
+}
+
+/// Companion to the test above (mirrors `banto-plc-write`'s
+/// `a_mixed_batch_encodes_each_string_request_independently`): the exact
+/// same UTF-8 wire bytes, read with `StringEncoding::ShiftJis` instead, must
+/// NOT decode back to the original text - proof the two encodings are not
+/// interchangeable and each request's own `encoding` is honored
+/// independently, not a global per-call setting.
+#[tokio::test]
+async fn the_same_utf8_wire_bytes_do_not_decode_correctly_as_shift_jis() {
+    use crate::types::{
+        BatchReadRequest, BatchReadResult, PlcValue, StringEncoding, StringReadRequest,
+    };
+
+    let sim = Simulator::start().await;
+    let text = "テスト";
+    let words = 5u16;
+    let mut bytes = text.as_bytes().to_vec();
+    bytes.resize(words as usize * 2, 0x00);
+    let regs: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    sim.set_words(SlmpDevice::D, 0, &regs);
+
+    let mut client = SlmpClient::new(fast_config(&sim));
+    client.connect().await.unwrap();
+
+    let results = client
+        .read_batch_mixed(&[BatchReadRequest::String(StringReadRequest {
+            address: Address::parse_slmp("D0").unwrap(),
+            words,
+            encoding: StringEncoding::ShiftJis,
+        })])
+        .await
+        .unwrap();
+    match &results[0] {
+        BatchReadResult::Value(PlcValue::Str(s)) => {
+            assert_ne!(
+                s, text,
+                "UTF-8 wire bytes must not read back as the same text under SJIS"
+            )
+        }
+        // Also an acceptable outcome: the UTF-8 bytes are not valid SJIS at
+        // all (decode.rs's own unit tests cover both possibilities for this
+        // exact text).
+        BatchReadResult::Bad(_) => {}
+        other => panic!("unexpected result: {other:?}"),
+    }
+}
+
+/// A mixed batch reading the same text at two addresses with two different
+/// `encoding`s must decode each independently, not fall back to a single
+/// global choice - the read-side twin of `banto-plc-write`'s per-request
+/// encoding independence test.
+#[tokio::test]
+async fn a_mixed_batch_decodes_each_string_request_independently() {
+    use crate::types::{
+        BatchReadRequest, BatchReadResult, PlcValue, StringEncoding, StringReadRequest,
+    };
+
+    let sim = Simulator::start().await;
+    let text = "テスト";
+    sim.set_string(SlmpDevice::D, 0, 4, text); // Shift-JIS, 6 bytes in 4 words.
+
+    let mut utf8_bytes = text.as_bytes().to_vec();
+    utf8_bytes.resize(10, 0x00); // 5 words.
+    let utf8_regs: Vec<u16> = utf8_bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    sim.set_words(SlmpDevice::D, 100, &utf8_regs);
+
+    let mut client = SlmpClient::new(fast_config(&sim));
+    client.connect().await.unwrap();
+
+    let results = client
+        .read_batch_mixed(&[
+            BatchReadRequest::String(StringReadRequest {
+                address: Address::parse_slmp("D0").unwrap(),
+                words: 4,
+                encoding: StringEncoding::ShiftJis,
+            }),
+            BatchReadRequest::String(StringReadRequest {
+                address: Address::parse_slmp("D100").unwrap(),
+                words: 5,
+                encoding: StringEncoding::Utf8,
+            }),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        results[0],
+        BatchReadResult::Value(PlcValue::Str(text.to_string())),
+        "Shift-JIS span decodes correctly"
+    );
+    assert_eq!(
+        results[1],
+        BatchReadResult::Value(PlcValue::Str(text.to_string())),
+        "UTF-8 span decodes correctly in the same batch"
+    );
 }

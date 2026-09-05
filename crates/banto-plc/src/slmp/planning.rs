@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 
 use super::address::{SlmpAccess, SlmpDevice};
 use crate::error::PlcError;
-use crate::types::{BatchReadRequest, DataType, ReadRequest};
+use crate::types::{BatchReadRequest, DataType, ReadRequest, StringEncoding};
 
 /// Gap tolerance, in the device's own element unit (words for word devices,
 /// bits for bit devices). Same rule and same reasoning as
@@ -100,6 +100,10 @@ pub enum ReadKind {
     Numeric(DataType),
     Str {
         words: u16,
+        /// T20 ①b (docs/banto-hub-t20-design.md §3.1): which table
+        /// `decode.rs::decode_string_value` uses to decode the span -
+        /// threaded straight through from [`crate::types::StringReadRequest::encoding`].
+        encoding: StringEncoding,
     },
     /// A single bit of a *word* device (T8, docs/tag-server-design.md §6.1:
     /// `"D100.5"`) - the group is still an ordinary word-unit bulk read
@@ -239,7 +243,13 @@ pub fn plan_slmp_batch(requests: &[BatchReadRequest]) -> SlmpPlanOutcome {
     for (index, req) in requests.iter().enumerate() {
         let (address, mut kind) = match req {
             BatchReadRequest::Numeric(r) => (r.address, ReadKind::Numeric(r.data_type)),
-            BatchReadRequest::String(s) => (s.address, ReadKind::Str { words: s.words }),
+            BatchReadRequest::String(s) => (
+                s.address,
+                ReadKind::Str {
+                    words: s.words,
+                    encoding: s.encoding,
+                },
+            ),
         };
         let Some((device, number, bit_pos)) = address.as_slmp() else {
             immediate_bad.push((
@@ -279,7 +289,7 @@ pub fn plan_slmp_batch(requests: &[BatchReadRequest]) -> SlmpPlanOutcome {
                     continue;
                 }
             },
-            ReadKind::Str { words } => {
+            ReadKind::Str { words, .. } => {
                 // Strings live in word devices only - same v1 rule as every
                 // non-bit numeric type - and never carry a bit qualifier of
                 // their own (a string occupies a whole span of words, not
@@ -344,7 +354,7 @@ pub fn plan_slmp_batch(requests: &[BatchReadRequest]) -> SlmpPlanOutcome {
                 SlmpAccess::Bit => 1u64,
                 SlmpAccess::Word => match kind {
                     ReadKind::Numeric(data_type) => data_type.register_span() as u64,
-                    ReadKind::Str { words } => words as u64,
+                    ReadKind::Str { words, .. } => words as u64,
                     // T8: one bit out of one word is still exactly one
                     // register - the same span a plain 16-bit numeric tag
                     // would occupy at this device/number.
@@ -782,10 +792,19 @@ mod tests {
 
     use crate::types::{BatchReadRequest, StringReadRequest};
 
+    /// Every pre-①b test below is Shift-JIS, this crate's pre-①b-only
+    /// encoding (T20 ①b, docs/banto-hub-t20-design.md §3.1) - planning
+    /// itself never inspects `encoding` (only `decode.rs` does), so these
+    /// tests do not need a UTF-8 counterpart.
     fn sreq(raw: &str, words: u16) -> BatchReadRequest {
+        sreq_enc(raw, words, StringEncoding::ShiftJis)
+    }
+
+    fn sreq_enc(raw: &str, words: u16, encoding: StringEncoding) -> BatchReadRequest {
         BatchReadRequest::String(StringReadRequest {
             address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw} should parse: {e}")),
             words,
+            encoding,
         })
     }
 
@@ -803,10 +822,33 @@ mod tests {
         let g = &outcome.reads[0];
         assert_eq!(g.start, 0);
         assert_eq!(g.count, 5); // D0..D3 (string) + D4 (u16)
-        assert_eq!(g.mapping[0].kind, ReadKind::Str { words: 4 });
+        assert_eq!(
+            g.mapping[0].kind,
+            ReadKind::Str {
+                words: 4,
+                encoding: StringEncoding::ShiftJis,
+            }
+        );
         assert_eq!(g.mapping[0].offset_in_read, 0);
         assert_eq!(g.mapping[1].kind, ReadKind::Numeric(DataType::U16));
         assert_eq!(g.mapping[1].offset_in_read, 4);
+    }
+
+    /// T20 ①b: `plan_slmp_batch` threads `StringReadRequest::encoding`
+    /// through to `ReadKind::Str` unchanged - the planner itself never
+    /// interprets it (only `decode.rs` does), but a dropped/overwritten
+    /// field here would silently decode every string as the wrong encoding.
+    #[test]
+    fn plan_slmp_batch_preserves_the_requested_string_encoding() {
+        let outcome = plan_slmp_batch(&[sreq_enc("D0", 4, StringEncoding::Utf8)]);
+        assert!(outcome.immediate_bad.is_empty());
+        assert_eq!(
+            outcome.reads[0].mapping[0].kind,
+            ReadKind::Str {
+                words: 4,
+                encoding: StringEncoding::Utf8,
+            }
+        );
     }
 
     /// A string wider than one bulk read can carry is a per-request Bad, not a
@@ -867,6 +909,7 @@ mod tests {
         let outcome = plan_slmp_batch(&[BatchReadRequest::String(StringReadRequest {
             address: Address::parse("40001").unwrap(),
             words: 4,
+            encoding: StringEncoding::ShiftJis,
         })]);
         assert!(outcome.reads.is_empty());
         assert!(matches!(

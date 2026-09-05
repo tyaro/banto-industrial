@@ -5,7 +5,7 @@
 //! arrays so the decoding math is proven independent of any socket.
 
 use crate::error::PlcError;
-use crate::types::{DataType, TagValue};
+use crate::types::{DataType, StringEncoding, TagValue};
 
 /// Which register holds the high 16 bits of a 32-bit value (docs/plan.md I2
 /// §5). Byte order *within* a register is fixed by Modbus itself
@@ -116,14 +116,18 @@ pub(crate) fn decode_register_bit(
 /// The byte stream is cut at the first NUL (0x00) - MELSEC's terminator
 /// convention, and the same rule the wrapped crate's `PLCString` applies -
 /// which also removes any trailing 0x00 padding of the fixed span. The
-/// remainder is Shift-JIS decoded via `encoding_rs`; bytes that are not valid
-/// SJIS are a per-request decode error (delivered as `Bad` by the executor,
-/// like any other decode failure) rather than silently replaced text - a
-/// mangled recipe string that still "reads fine" is worse than a Bad quality.
+/// remainder is decoded via `encoding_rs` using the table `encoding` selects
+/// (T20 ①b, docs/banto-hub-t20-design.md §3.1 - pre-①b this was
+/// unconditionally Shift-JIS, mirroring `banto-plc-write/src/encode.rs`'s own
+/// ①a widening on the write side); bytes that are not valid in that encoding
+/// are a per-request decode error (delivered as `Bad` by the executor, like
+/// any other decode failure) rather than silently replaced text - a mangled
+/// recipe string that still "reads fine" is worse than a Bad quality.
 pub(crate) fn decode_string_value(
     regs: &[u16],
     start: usize,
     words: usize,
+    encoding: StringEncoding,
 ) -> Result<String, PlcError> {
     let window = regs.get(start..start + words).ok_or_else(|| {
         PlcError::Protocol(format!(
@@ -138,10 +142,14 @@ pub(crate) fn decode_string_value(
     }
     let end = bytes.iter().position(|&b| b == 0x00).unwrap_or(bytes.len());
 
-    let (text, _, had_errors) = encoding_rs::SHIFT_JIS.decode(&bytes[..end]);
+    let (table, label) = match encoding {
+        StringEncoding::Utf8 => (encoding_rs::UTF_8, "UTF-8"),
+        StringEncoding::ShiftJis => (encoding_rs::SHIFT_JIS, "Shift-JIS"),
+    };
+    let (text, _, had_errors) = table.decode(&bytes[..end]);
     if had_errors {
         return Err(PlcError::Protocol(format!(
-            "文字列デバイスの内容が Shift-JIS として不正です ({end} バイト)"
+            "文字列デバイスの内容が {label} として不正です ({end} バイト)"
         )));
     }
     Ok(text.into_owned())
@@ -280,6 +288,12 @@ mod tests {
     }
 
     // --- decode_string_value (S1 文字列タグ) -------------------------------
+    //
+    // Every test below passes `StringEncoding::ShiftJis` explicitly (T20
+    // ①b, docs/banto-hub-t20-design.md §3.1) - this crate's pre-①b behavior
+    // was unconditionally Shift-JIS, and these tests fix that behavior in
+    // place rather than silently switching to a default. The UTF-8 tests
+    // further down are the new ①b coverage.
 
     /// The load-bearing byte-order case, exact words spelled out: "AB" =
     /// SJIS/ASCII [0x41, 0x42], low byte first within the word -> 0x4241
@@ -287,7 +301,10 @@ mod tests {
     #[test]
     fn decodes_ascii_string_low_byte_first_within_each_word() {
         let regs = [0x4241u16, 0x4443u16]; // "ABCD"
-        assert_eq!(decode_string_value(&regs, 0, 2).unwrap(), "ABCD");
+        assert_eq!(
+            decode_string_value(&regs, 0, 2, StringEncoding::ShiftJis).unwrap(),
+            "ABCD"
+        );
     }
 
     /// Multi-byte SJIS: "テスト" = [0x83, 0x65, 0x83, 0x58, 0x83, 0x67],
@@ -295,7 +312,10 @@ mod tests {
     #[test]
     fn decodes_multibyte_sjis_string() {
         let regs = [0x6583u16, 0x5883u16, 0x6783u16];
-        assert_eq!(decode_string_value(&regs, 0, 3).unwrap(), "テスト");
+        assert_eq!(
+            decode_string_value(&regs, 0, 3, StringEncoding::ShiftJis).unwrap(),
+            "テスト"
+        );
     }
 
     /// The stream is cut at the *first* NUL: an embedded terminator hides
@@ -304,14 +324,20 @@ mod tests {
     fn trims_at_the_first_nul_terminator() {
         // "AB" + NUL + "C" -> bytes [0x41, 0x42, 0x00, 0x43].
         let regs = [0x4241u16, 0x4300u16];
-        assert_eq!(decode_string_value(&regs, 0, 2).unwrap(), "AB");
+        assert_eq!(
+            decode_string_value(&regs, 0, 2, StringEncoding::ShiftJis).unwrap(),
+            "AB"
+        );
     }
 
     /// Trailing NUL padding of the fixed span never reaches the value.
     #[test]
     fn trims_trailing_nul_padding() {
         let regs = [0x4241u16, 0x0000u16, 0x0000u16]; // "AB" in a 3-word span
-        assert_eq!(decode_string_value(&regs, 0, 3).unwrap(), "AB");
+        assert_eq!(
+            decode_string_value(&regs, 0, 3, StringEncoding::ShiftJis).unwrap(),
+            "AB"
+        );
     }
 
     /// A span filled to the brim (no terminator anywhere) is legal - the
@@ -319,19 +345,28 @@ mod tests {
     #[test]
     fn decodes_a_full_span_with_no_terminator() {
         let regs = [0x4241u16, 0x4443u16]; // "ABCD", exactly 2L bytes
-        assert_eq!(decode_string_value(&regs, 0, 2).unwrap(), "ABCD");
+        assert_eq!(
+            decode_string_value(&regs, 0, 2, StringEncoding::ShiftJis).unwrap(),
+            "ABCD"
+        );
     }
 
     #[test]
     fn respects_a_nonzero_start_offset() {
         let regs = [0xDEADu16, 0x4241u16]; // window starts at 1
-        assert_eq!(decode_string_value(&regs, 1, 1).unwrap(), "AB");
+        assert_eq!(
+            decode_string_value(&regs, 1, 1, StringEncoding::ShiftJis).unwrap(),
+            "AB"
+        );
     }
 
     #[test]
     fn empty_string_decodes_as_empty() {
         let regs = [0x0000u16];
-        assert_eq!(decode_string_value(&regs, 0, 1).unwrap(), "");
+        assert_eq!(
+            decode_string_value(&regs, 0, 1, StringEncoding::ShiftJis).unwrap(),
+            ""
+        );
     }
 
     /// Invalid SJIS bytes are an error, not silently-substituted text
@@ -339,14 +374,83 @@ mod tests {
     #[test]
     fn invalid_sjis_bytes_are_a_decode_error_not_replacement_text() {
         let regs = [0x00FFu16]; // bytes [0xFF, 0x00] -> trimmed to [0xFF]
-        let err = decode_string_value(&regs, 0, 1).unwrap_err();
+        let err = decode_string_value(&regs, 0, 1, StringEncoding::ShiftJis).unwrap_err();
         assert!(matches!(err, PlcError::Protocol(_)));
     }
 
     #[test]
     fn out_of_bounds_string_window_is_a_protocol_error_not_a_panic() {
         let regs = [0x4241u16];
-        let err = decode_string_value(&regs, 0, 2).unwrap_err();
+        let err = decode_string_value(&regs, 0, 2, StringEncoding::ShiftJis).unwrap_err();
+        assert!(matches!(err, PlcError::Protocol(_)));
+    }
+
+    // --- decode_string_value: StringEncoding::Utf8 (T20 ①b, new) ----------
+
+    /// The UTF-8 twin of `decodes_ascii_string_low_byte_first_within_each_word`.
+    /// ASCII bytes are identical under UTF-8 and Shift-JIS, so this alone
+    /// does not prove the encoding switch actually happened; the multibyte
+    /// test below does.
+    #[test]
+    fn decodes_ascii_string_as_utf8() {
+        let regs = [0x4241u16, 0x4443u16]; // "ABCD"
+        assert_eq!(
+            decode_string_value(&regs, 0, 2, StringEncoding::Utf8).unwrap(),
+            "ABCD"
+        );
+    }
+
+    /// The load-bearing UTF-8 case: "テスト" is 9 bytes in UTF-8 (vs 6 in
+    /// SJIS - `decodes_multibyte_sjis_string`), packed low-byte-first into
+    /// 5 words (padded with one trailing 0x00 byte, trimmed as a terminator
+    /// like any other). Decoding these exact wire bytes as Shift-JIS would
+    /// produce mojibake, not this text - proving the encoding switch is
+    /// real, not a no-op.
+    #[test]
+    fn decodes_multibyte_utf8_string() {
+        let bytes = "テスト".as_bytes(); // 9 bytes: E3 83 86 E3 82 B9 E3 83 88
+        assert_eq!(bytes.len(), 9);
+        let mut padded = bytes.to_vec();
+        padded.push(0x00); // pad to 10 bytes = 5 words
+        let regs: Vec<u16> = padded
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(
+            decode_string_value(&regs, 0, regs.len(), StringEncoding::Utf8).unwrap(),
+            "テスト"
+        );
+    }
+
+    /// Same wire bytes as `decodes_multibyte_utf8_string`, decoded as
+    /// Shift-JIS instead - proves the two encodings are not interchangeable
+    /// and `encoding` genuinely selects between them (rather than, say, both
+    /// silently falling back to one table). Either outcome proves the point:
+    /// a different (mojibake) string, or an outright decode error because
+    /// the UTF-8 bytes are not valid Shift-JIS at all - what must never
+    /// happen is decoding back to the original "テスト".
+    #[test]
+    fn utf8_wire_bytes_are_not_the_same_text_under_shift_jis() {
+        let bytes = "テスト".as_bytes();
+        let mut padded = bytes.to_vec();
+        padded.push(0x00);
+        let regs: Vec<u16> = padded
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        // `Err` also proves the point: the bytes are not valid Shift-JIS at all.
+        if let Ok(sjis) = decode_string_value(&regs, 0, regs.len(), StringEncoding::ShiftJis) {
+            assert_ne!(sjis, "テスト");
+        }
+    }
+
+    /// Invalid UTF-8 bytes are a decode error under `StringEncoding::Utf8`,
+    /// same contract as `invalid_sjis_bytes_are_a_decode_error_not_replacement_text`
+    /// for Shift-JIS. 0xFF is never valid as a UTF-8 lead byte.
+    #[test]
+    fn invalid_utf8_bytes_are_a_decode_error_not_replacement_text() {
+        let regs = [0x00FFu16]; // bytes [0xFF, 0x00] -> trimmed to [0xFF]
+        let err = decode_string_value(&regs, 0, 1, StringEncoding::Utf8).unwrap_err();
         assert!(matches!(err, PlcError::Protocol(_)));
     }
 }

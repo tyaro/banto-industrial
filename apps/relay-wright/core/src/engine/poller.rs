@@ -57,9 +57,17 @@ impl ResolvedSource {
                 address: self.address,
                 data_type,
             }),
+            // T20 ①b (docs/banto-hub-t20-design.md §3.1): `StringReadRequest`
+            // gained a required `encoding` field so hub's read-on-demand can
+            // choose UTF-8. relay-wright must keep decoding Shift-JIS
+            // unconditionally - this is the "①a を保全" 方針の read-side
+            // counterpart - so this is the one call site in this engine that
+            // explicitly pins `StringEncoding::ShiftJis` rather than
+            // deriving it from anywhere else.
             WireShape::Str { words } => BatchReadRequest::String(StringReadRequest {
                 address: self.address,
                 words,
+                encoding: banto_plc::StringEncoding::ShiftJis,
             }),
         }
     }
