@@ -448,10 +448,7 @@ mod tests {
         assert_eq!(result.total_count, 1);
         let stored = &result.rows[0];
         assert_eq!(stored.value_requested, None);
-        assert_eq!(
-            stored.value_requested_text.as_deref(),
-            Some("書いた文字列")
-        );
+        assert_eq!(stored.value_requested_text.as_deref(), Some("書いた文字列"));
     }
 
     #[tokio::test]
