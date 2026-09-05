@@ -1,7 +1,10 @@
 # 実機テスト手順書（2026-09-01 実装分）
 
+> **📦 アーカイブ（2026-09-06）**: #130/#131/#123 の一回性実機検証記録。結果は
+> [tag-server-design.md](tag-server-design.md) §6.2 等に吸収済み。経緯として保存。
+
 作成日: 2026-09-01
-状態: **A・B・C 実施完了（2026-09-01）、C は別マシンからの LAN 検証も完了（2026-09-02、§9 C-LAN）**。A は全項目合格、B は合格4/一部合格1/検証不能3（理由は §8）、C は全項目合格
+状態: **アーカイブ（役目終了・経緯として保存）**。A・B・C 実施完了（2026-09-01）、C は別マシンからの LAN 検証も完了（2026-09-02、§9 C-LAN）。A は全項目合格、B は合格4/一部合格1/検証不能3（理由は §8）、C は全項目合格
 対象: [#130](https://github.com/tyaro/banto-industrial/issues/130) broker プロトコル抽象化 / [#131](https://github.com/tyaro/banto-industrial/issues/131) Modbus 書き込み（[#219](https://github.com/tyaro/banto-industrial/issues/219)） / [#123](https://github.com/tyaro/banto-industrial/issues/123) banto-tagclient
 
 ---

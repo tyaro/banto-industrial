@@ -13,6 +13,11 @@ UI 実装が完了（起動時ガード・認証バイパス・ロックダウ�
 迂回・消せない警告バナー）。同節に管理 UI と `/api/v1/*` の認証境界（案A）
 を追記。§4 のタグ名一意性を全体一意→収集グループ内一意へ緩和
 （migration `0011`、実機で判明した複数台同型構成の不具合対応）。
+
+**2026-09-06 更新**: T19（UX 群）・T20（文字列/構造体/レシピ/ビット）・T21（構成補助 MCP 管理面）
+完了。MCP の IF 一覧は [banto-hub-mcp-reference.md](banto-hub-mcp-reference.md)。§9 表は T12 までの
+粒度で、T13 以降の運転計画は [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) 側が正
+（既存の委譲方針どおり）。
 **2026-09-01 追記**: #131 前半スライス（broker 配線を除く）を実装 - §6.2 に
 「Modbus 読み取り専用領域への writable 拒否」をオーナー決定Aとして追記
 （banto-tags 登録時検証）。`crates/banto-plc-write` に Modbus 書き込み

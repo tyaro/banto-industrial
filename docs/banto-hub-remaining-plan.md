@@ -21,6 +21,10 @@ Drawer とツリー意匠）も完了（#173/#174/#176/#177）。banto-tagclient
 Issue #123 として起票済み（起票は完了・着手は SCADA 計画具体化と同時、
 下記「別途スケジュール」参照）。残るは Phase 2 実機検証系（T18-5c/d 含む）と
 Phase 4 リリースゲート（H7① 実機 soak）のみ。**
+**進捗追記（2026-09-02〜06）**: その後 T19（UX-30〜48 の UI/UX 群、S1〜S5）・T20（文字列
+read/write・構造体タグ登録＋オフセットコピー・レシピ一括書き込み・ワードデバイスのビット
+.0〜.F、原子性バグ修正 #265）・T21（構成補助 MCP＝管理面 31 ツール、#266〜#274）を実装。
+現時点の残件は実機・需要待ちの #219/#210/#211/#123/#201（詳細は各設計書・README.md）のみ。
 個別スライスの詳細設計は既存の
 [plan.md](plan.md)・[tag-server-design.md](tag-server-design.md)・[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)・
 [banto-hub-t16-design.md](banto-hub-t16-design.md)・[banto-hub-t17-design.md](banto-hub-t17-design.md)・
@@ -147,7 +151,9 @@ Phase 0 マージ後の main を実機で確認。テスト PLC の複数ポー�
   T18-5c/d（実機/soak・性能ハーネス基準機実行）を除き完了済み
   （[banto-hub-t18-design.md](banto-hub-t18-design.md) 参照）。
 - NSIS インストーラからの `banto-hub-elev.exe` 呼び出し統合。
-- banto-tagclient SDK の実装（Issue #123 として起票済み・着手は SCADA 計画具体化と同時、v1.x）。
+- banto-tagclient SDK（Issue #123）は **S4a まで実装完了**（2026-09-01。読み取り専用 DTO・
+  REST/WS transport・再接続・rebinding 等。README.md 参照）。残課題は実 Hub/LAN 統合検証・
+  S4 互換 tag 固定・配布サイズ確認等（S4b-1 以降）。
 
 ### 保留・オーナー決定（2026-08-12 に一部を決定）
 
@@ -160,8 +166,8 @@ Phase 0 マージ後の main を実機で確認。テスト PLC の複数ポー�
   将来の堅牢化タスクとして切り出し（同 §5 に記録）。
 - **ux-plan §5 UI バックログ** → **Swagger UI 同梱のみ着手**（低コスト・高価値、`GET /api/v1/openapi.json`
   を Swagger UI で提供）。スパークライン／イベント一覧／手動書き込みは引き続き保留。
-- **banto-tagclient SDK** → 決定の実行漏れ（未起票）を埋めるため Issue #123 を起票（着手は SCADA
-  計画具体化と同時、v1.x）。
+- **banto-tagclient SDK**（Issue #123）→ 起票済みの決定を受けて **S4a まで実装完了**
+  （2026-09-01）。残課題は実 Hub/LAN 統合検証・S4 互換 tag 固定・配布サイズ確認等。
 
 **引き続き保留（着手時期未定）:** NSIS「インストール後に実行」チェックボックス（現状の運用回避で
 許容）、UAC split-token 判定（見送り済み）、OPC UA、MQTT 組み込みブローカー、タグブリッジ・
