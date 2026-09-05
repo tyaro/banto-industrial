@@ -34,6 +34,7 @@ use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
 use banto_hub_core::write_control::WriteControl;
 use banto_hub_core::write_rate::{WriteRateLimitConfig, WriteRateLimiter};
+use banto_plc::modbus::simulator::Simulator as ModbusSimulator;
 use banto_plc::slmp::address::SlmpDevice;
 use banto_plc_write::slmp::simulator::Simulator;
 use banto_server::{AuthState, Identity};
@@ -424,7 +425,7 @@ async fn initialize_returns_tool_capabilities() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tools_list_returns_the_nine_tools() {
+async fn tools_list_returns_the_fifteen_tools() {
     let app = test_app("tools-list").await;
     let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
 
@@ -437,12 +438,18 @@ async fn tools_list_returns_the_nine_tools() {
         names,
         vec![
             "create_connection",
+            "create_group",
             "delete_connection",
+            "delete_group",
             "get_server_status",
             "list_connections",
+            "list_groups",
             "list_tags",
             "read_tag_now",
             "read_tag_values",
+            "test_connection",
+            "update_connection",
+            "update_group",
             "write_recipe",
             "write_tag_value",
         ]
@@ -1530,4 +1537,529 @@ async fn create_connection_while_collection_running_is_queued_not_applied() {
         latest_audit_column(&app, "actor_username").await.as_deref(),
         Some("admin-key")
     );
+}
+
+// ---------------------------------------------------------------------------
+// 10. T21 S1-c（docs/banto-hub-t21-design.md §3・§4）: 構成補助ツール第二弾
+//    （接続 update/test・グループ CRUD）。9節（S1-b・接続 create/delete）と
+//    同じ3点を確認する - `admin` スコープ必須・不可逆操作(delete)は confirm
+//    必須・全操作を origin="mcp" で監査する。
+// ---------------------------------------------------------------------------
+
+async fn collection_groups_row_count(app: &TestApp) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM collection_groups")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap()
+}
+
+/// テスト用に接続を1本作る(グループ系ツールの`plcConnectionId`用)。
+async fn create_test_connection(app: &TestApp, name: &str, port: u16) -> i64 {
+    PlcConnectionService::new(app.pool.clone())
+        .create(slmp_conn_input(name, port))
+        .await
+        .unwrap()
+        .id
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn group_and_update_connection_tools_without_admin_scope_are_rejected_and_change_nothing() {
+    let app = test_app("s1c-no-admin").await;
+    let key = issue_key(
+        &app.router,
+        &app.admin_token,
+        "reader-writer",
+        &["read", "write:line1.fast.temp01"],
+    )
+    .await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+    let before_groups = collection_groups_row_count(&app).await;
+    let before_conn_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plc_connections")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+
+    for (name, arguments) in [
+        (
+            "update_connection",
+            json!({ "id": conn_id, "name": "renamed", "host": "127.0.0.1", "port": 15022 }),
+        ),
+        (
+            "create_group",
+            json!({ "name": "new-group", "plcConnectionId": conn_id, "periodMs": 100 }),
+        ),
+        (
+            "update_group",
+            json!({ "id": group.id, "name": "renamed", "plcConnectionId": conn_id, "periodMs": 200 }),
+        ),
+        ("delete_group", json!({ "id": group.id, "confirm": true })),
+        ("list_groups", json!({})),
+    ] {
+        let (status, body) = mcp_post(&app.router, Some(&key), tools_call(name, arguments)).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body:?}");
+        assert_eq!(body["result"]["isError"], true, "{name}: {body:?}");
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("missing_admin_scope"), "{name}: {text}");
+    }
+
+    assert_eq!(
+        collection_groups_row_count(&app).await,
+        before_groups,
+        "none of the rejected tools may touch collection_groups"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM plc_connections")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap(),
+        before_conn_count,
+        "update_connection without admin scope must not touch plc_connections"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_groups_returns_created_groups() {
+    let app = test_app("s1c-list-groups").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("list_groups", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    let groups = payload["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1, "{payload:?}");
+    assert_eq!(groups[0]["name"], "fast");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_group_with_admin_scope_while_stopped_creates_and_audits() {
+    let app = test_app("s1c-create-group").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    let before_rows = collection_groups_row_count(&app).await;
+    let audit_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_group",
+            json!({ "name": "fast", "plcConnectionId": conn_id, "periodMs": 100 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["created"]["name"], "fast");
+
+    assert_eq!(collection_groups_row_count(&app).await, before_rows + 1);
+
+    let audit_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        audit_count_after,
+        audit_count_before + 1,
+        "create_group via MCP must add exactly one audit_log row"
+    );
+    assert_eq!(
+        latest_audit_column(&app, "action").await.as_deref(),
+        Some("create")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("collection_groups")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "actor_username").await.as_deref(),
+        Some("admin-key")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_group_with_admin_scope_updates_and_audits() {
+    let app = test_app("s1c-update-group").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+    let audit_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "update_group",
+            json!({
+                "id": group.id,
+                "name": "fast-renamed",
+                "plcConnectionId": conn_id,
+                "periodMs": 200,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["updated"]["name"], "fast-renamed");
+    assert_eq!(payload["updated"]["periodMs"], 200);
+
+    let stored = CollectionGroupService::new(app.pool.clone())
+        .get(group.id)
+        .await
+        .unwrap();
+    assert_eq!(stored.name, "fast-renamed");
+    assert_eq!(stored.period_ms, 200);
+
+    let audit_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(audit_count_after, audit_count_before + 1);
+    assert_eq!(
+        latest_audit_column(&app, "action").await.as_deref(),
+        Some("update")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("collection_groups")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_connection_with_admin_scope_updates_and_audits() {
+    let app = test_app("s1c-update-conn").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    let audit_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "update_connection",
+            json!({
+                "id": conn_id,
+                "name": "line1-renamed",
+                "protocol": "slmp",
+                "host": "127.0.0.1",
+                "port": 15099,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["updated"]["name"], "line1-renamed");
+    assert_eq!(payload["updated"]["port"], 15099);
+
+    let stored = PlcConnectionService::new(app.pool.clone())
+        .get(conn_id)
+        .await
+        .unwrap();
+    assert_eq!(stored.name, "line1-renamed");
+    assert_eq!(stored.port, 15099);
+
+    let audit_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(audit_count_after, audit_count_before + 1);
+    assert_eq!(
+        latest_audit_column(&app, "action").await.as_deref(),
+        Some("update")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("plc_connections")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_group_without_confirm_is_rejected_and_group_remains() {
+    let app = test_app("s1c-delete-group-no-confirm").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("delete_group", json!({ "id": group.id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("confirm_required"), "{text}");
+
+    assert_eq!(
+        collection_groups_row_count(&app).await,
+        1,
+        "delete_group without confirm must not delete the row"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_group_with_confirm_cascades_and_audits() {
+    let app = test_app("s1c-delete-group-confirm").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("t1", group.id, "D100", "u16", false, true))
+        .await
+        .unwrap();
+    let audit_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("delete_group", json!({ "id": group.id, "confirm": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["deleted"], true);
+    assert_eq!(payload["cascade"]["deletedTags"], 1);
+
+    assert_eq!(
+        collection_groups_row_count(&app).await,
+        0,
+        "delete_group with confirm:true must delete the row"
+    );
+    let tag_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        tag_count, 0,
+        "cascade delete must also remove the group's tags"
+    );
+
+    let audit_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(audit_count_after, audit_count_before + 1);
+    assert_eq!(
+        latest_audit_column(&app, "action").await.as_deref(),
+        Some("delete")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("collection_groups")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_group_while_collection_running_is_queued_not_applied() {
+    let app = test_app("s1c-create-group-running").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    start_collection(&app.router, &app.admin_token).await;
+    let before_rows = collection_groups_row_count(&app).await;
+    let audit_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_group",
+            json!({ "name": "fast-running", "plcConnectionId": conn_id, "periodMs": 100 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["queued"], true, "{payload:?}");
+    assert!(payload["pendingId"].is_number(), "{payload:?}");
+
+    assert_eq!(
+        collection_groups_row_count(&app).await,
+        before_rows,
+        "a queued create_group must not touch collection_groups directly"
+    );
+    let pending_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_changes")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(pending_count, 1);
+
+    let audit_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        audit_count_after,
+        audit_count_before + 1,
+        "queued create_group via MCP must add exactly one audit_log row"
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("collection_groups")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 11. test_connection（T12 の疎通確認を MCP から呼べるようにしたもの） -
+//    `tests/t12_connection_test.rs`の Modbus 成功/失敗ケースと同じ検証方法を
+//    流用する(疎通確認本体は`crate::rest::run_plc_connection_test`を共有する
+//    だけなので、ここでは「MCP 経由でも同じ結果が返ること」だけを見ればよい)。
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_connection_reports_ok_for_a_reachable_modbus_simulator() {
+    let app = test_app("s1c-test-conn-ok").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let sim = ModbusSimulator::start().await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "test_connection",
+            json!({
+                "protocol": "modbus-tcp",
+                "host": "127.0.0.1",
+                "port": sim.addr.port(),
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["ok"], true, "{payload:?}");
+    assert!(payload["error"].is_null(), "{payload:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_connection_reports_failure_for_an_unreachable_port() {
+    let app = test_app("s1c-test-conn-fail").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let closed_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.local_addr().expect("local_addr").port()
+    };
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "test_connection",
+            json!({
+                "protocol": "modbus-tcp",
+                "host": "127.0.0.1",
+                "port": closed_port,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["ok"], false, "{payload:?}");
+    let kind = payload["error"]["kind"].as_str().expect("error.kind");
+    assert!(
+        kind == "tcp" || kind == "timeout",
+        "expected tcp or timeout, got {kind} ({payload:?})"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_connection_without_admin_scope_is_rejected() {
+    let app = test_app("s1c-test-conn-no-admin").await;
+    let key = issue_key(
+        &app.router,
+        &app.admin_token,
+        "reader-writer",
+        &["read", "write:line1.fast.temp01"],
+    )
+    .await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call(
+            "test_connection",
+            json!({ "protocol": "modbus-tcp", "host": "127.0.0.1", "port": 1 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("missing_admin_scope"), "{text}");
 }
