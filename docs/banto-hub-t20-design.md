@@ -168,6 +168,17 @@ per-entry 結果を返す。**同一バッチ内の重複タグは拒否**（`Du
 タグに2値は曖昧、かつレート制限 peek の粒度も正確になる）。REST `POST /api/v1/values/batch`
 （単票と同じ認証規律・per-entry の `write:{tag}` スコープ検査・常に200の per-entry 封筒）。
 事前ゲート all-or-nothing は「1件 NG → 監査行数不変＋シミュレータ値不変」でテスト固定。
+
+**原子性の是正（2026-09-05、実機検証で発覚）**: 当初 gate 7 のうち数値レンジ検査
+（`validate_numeric_range`）が commit フェーズの `build_plc_write_request` でしか
+行われず、事前ゲート（`prepare_batch_entry`＝resolve＋`convert_value`）に含まれて
+いなかった。このためレシピ中の1値がレジスタ型レンジ外のとき、有効な値だけが先に
+書かれる**部分適用**が実機で発生した（applied=2 を確認）。`prepare_batch_entry` に
+レンジ検査を組み込み、レンジ NG も all-or-nothing で全件中止するよう是正
+（単票 `execute_write` のゲート順＝write_control off の 503 が値エラーの 422 より
+優先、は不変）。実機で bad レシピ→applied=0・他タグ不変を再確認。回帰テスト
+`range_out_of_bounds_entry_aborts_the_whole_batch...`（tests/t20_batch_write.rs）で固定。
+
 **③b（MCP `write_recipe`）: 完了（2026-09-05）。** `execute_write_batch` を叩く MCP ツール `write_recipe`（`{writes:[{tag,value}]}`）を追加。`write_tag_value` と同型の安全ポリシー: **ロックダウン後はアドバイザリのみ**（`execute_write_batch` を呼ばず、推奨レシピを助言。監査/レジスタ不変をテスト固定）、ロックダウン前は per-entry の `write:{tag}` スコープ検査→`execute_write_batch`。応答は per-entry 封筒＋`applied` 件数。
 
 **③c（レシピ UI）: 不採用（オーナー決定 2026-09-05）。** タグサーバーの責務は
