@@ -91,8 +91,8 @@ use crate::mqtt::MqttPublisher;
 use crate::pending_changes::PendingChangesService;
 use crate::rest::{
     bearer_token, commit_catalog_and_notify, compute_pending_base_fingerprint, compute_status,
-    parse_requested_value, preflight_transaction, unauthorized_response, PlcConnectionPayload,
-    TagSpaceState,
+    parse_requested_value, preflight_transaction, run_plc_connection_test, unauthorized_response,
+    CollectionGroupPayload, PlcConnectionPayload, PlcConnectionTestPayload, TagSpaceState,
 };
 use crate::system_info::SystemInfoSampler;
 use crate::test_output::TestOutputControl;
@@ -563,6 +563,148 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // --- T21 S1-c（docs/banto-hub-t21-design.md §4・§5）: 構成補助ツール
+        // 第二弾(接続 update/test・グループ CRUD)。S1-b と同じゲート
+        // (admin スコープ必須・有効化ガードなし)。
+        json!({
+            "name": "update_connection",
+            "description": "既存の PLC 接続を更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない)。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "更新する接続の id。" },
+                    "name": { "type": "string", "description": "接続名(一意)。" },
+                    "protocol": {
+                        "type": "string",
+                        "enum": ["modbus-tcp", "slmp"],
+                        "description": "modbus-tcp または slmp。",
+                    },
+                    "host": { "type": "string", "description": "接続先ホスト名/IP。" },
+                    "port": { "type": "integer", "description": "接続先ポート番号。" },
+                    "unitId": { "type": "integer", "description": "Modbus のユニット ID。" },
+                    "enabled": { "type": "boolean", "description": "接続を有効にするか。" },
+                    "simulation": {
+                        "type": "boolean",
+                        "description": "true でシミュレータ接続にする。",
+                    },
+                    "wordOrder": {
+                        "type": "string",
+                        "enum": ["low_high", "high_low"],
+                        "description": "SLMP のワード順。",
+                    },
+                },
+                "required": [
+                    "id",
+                    "name",
+                    "protocol",
+                    "host",
+                    "port",
+                    "unitId",
+                    "enabled",
+                    "simulation",
+                    "wordOrder",
+                ],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "test_connection",
+            "description": "保存前に PLC 接続の疎通を確認する(admin スコープ必須)。TCP 接続だけでなく実プロトコルで軽い読み出しを1回試みる。レジストリへの保存は行わない副作用の無い操作。virtual/シミュレーション接続はテスト対象外(即座に ok:false)。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "protocol": {
+                        "type": "string",
+                        "enum": ["modbus-tcp", "slmp", "virtual"],
+                        "description": "virtual は常に ok:false(テスト対象外)。",
+                    },
+                    "host": { "type": "string", "description": "接続先ホスト名/IP。" },
+                    "port": { "type": "integer", "description": "接続先ポート番号。" },
+                    "unitId": { "type": "integer", "description": "既定値 1(Modbus のみ使用)。" },
+                    "simulation": {
+                        "type": "boolean",
+                        "description": "true の場合は常に ok:false(内蔵シミュレータは常に成功するためテスト不要)。既定値 false。",
+                    },
+                    "connectionId": {
+                        "type": "integer",
+                        "description": "保存済み接続を編集中にテストする場合のみ指定。SLMP で既存の broker セッションがあればそれを再利用し、2本目をダイヤルしない。",
+                    },
+                },
+                "required": ["protocol", "host", "port"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "list_groups",
+            "description": "収集グループの一覧を返す(admin スコープ必須)。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "create_group",
+            "description": "収集グループを新規作成する(admin スコープ必須)。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "グループ名(接続内で一意)。" },
+                    "plcConnectionId": { "type": "integer", "description": "所属する接続の id。" },
+                    "periodMs": { "type": "integer", "description": "収集周期(ミリ秒)。" },
+                    "enabled": { "type": "boolean", "description": "既定値 true。" },
+                    "defaultWritable": {
+                        "type": "boolean",
+                        "description": "このグループへ新規登録するタグの writable 既定値。既定値 true。",
+                    },
+                },
+                "required": ["name", "plcConnectionId", "periodMs"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "update_group",
+            "description": "既存の収集グループを更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない)。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "更新するグループの id。" },
+                    "name": { "type": "string", "description": "グループ名(接続内で一意)。" },
+                    "plcConnectionId": { "type": "integer", "description": "所属する接続の id。" },
+                    "periodMs": { "type": "integer", "description": "収集周期(ミリ秒)。" },
+                    "enabled": { "type": "boolean", "description": "グループを有効にするか。" },
+                    "defaultWritable": {
+                        "type": "boolean",
+                        "description": "このグループへ新規登録するタグの writable 既定値。",
+                    },
+                },
+                "required": [
+                    "id",
+                    "name",
+                    "plcConnectionId",
+                    "periodMs",
+                    "enabled",
+                    "defaultWritable",
+                ],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "delete_group",
+            "description": "収集グループを削除する(admin スコープ必須)。配下のタグも一括削除するが、収集済み履歴データは残る。不可逆操作のため confirm:true が必須。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "削除するグループの id。" },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "true を明示しないと拒否される(不可逆操作の確認)。",
+                    },
+                },
+                "required": ["id", "confirm"],
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -588,6 +730,12 @@ async fn handle_tools_call(
         "list_connections" => tool_list_connections(state, ctx).await,
         "create_connection" => tool_create_connection(state, ctx, arguments).await?,
         "delete_connection" => tool_delete_connection(state, ctx, arguments).await?,
+        "update_connection" => tool_update_connection(state, ctx, arguments).await?,
+        "test_connection" => tool_test_connection(state, ctx, arguments).await?,
+        "list_groups" => tool_list_groups(state, ctx).await,
+        "create_group" => tool_create_group(state, ctx, arguments).await?,
+        "update_group" => tool_update_group(state, ctx, arguments).await?,
+        "delete_group" => tool_delete_group(state, ctx, arguments).await?,
         other => {
             return Err(RpcError::invalid_params(format!("unknown tool: {other}")));
         }
@@ -1009,10 +1157,16 @@ const QUEUED_MESSAGE: &str = "収集中のため変更を未適用キューに�
 /// `queue_pending_registry_change`は audit_log を書かない - pending_changes
 /// テーブル自身が記録になるため - が、設計 §3.3 は MCP に「全構成操作」の
 /// audit_log 記録を求めているため、queued 成功もここで監査する）。
+///
+/// `resource`は REST の各ハンドラの`record_write`呼び出しに渡す
+/// resource 文字列と同じ値を呼び出し元が渡す（接続系ツールは
+/// `"plc_connections"`、グループ系ツールは`"collection_groups"` - T21
+/// S1-c で S1-b 当時の接続専用固定値から一般化した）。
 async fn audit_config_action(
     state: &McpState,
     ctx: &ApiKeyContext,
     action: &str,
+    resource: &'static str,
     entity_id: Option<&str>,
     detail: Option<Value>,
 ) {
@@ -1022,7 +1176,7 @@ async fn audit_config_action(
             actor_username: Some(ctx.name.as_str()),
             actor_role: Some("api_key"),
             action,
-            resource: "plc_connections",
+            resource,
             entity_id,
             detail,
             origin: "mcp",
@@ -1097,6 +1251,7 @@ async fn tool_create_connection(
             state,
             ctx,
             "create",
+            "plc_connections",
             None,
             Some(json!({ "queued": true, "pendingId": pending.id, "name": input.name })),
         )
@@ -1137,6 +1292,7 @@ async fn tool_create_connection(
         state,
         ctx,
         "create",
+        "plc_connections",
         Some(&created.id.to_string()),
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
@@ -1214,6 +1370,7 @@ async fn tool_delete_connection(
             state,
             ctx,
             "delete",
+            "plc_connections",
             Some(&id.to_string()),
             Some(json!({ "queued": true, "pendingId": pending.id })),
         )
@@ -1258,6 +1415,7 @@ async fn tool_delete_connection(
         state,
         ctx,
         "delete",
+        "plc_connections",
         Some(&id.to_string()),
         Some(json!({ "cascade": cascade_detail.clone() })),
     )
@@ -1267,6 +1425,582 @@ async fn tool_delete_connection(
         &state.status.controller,
         &state.events,
         "plc_connections",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
+    Ok(tool_ok(
+        json!({ "deleted": true, "id": id, "cascade": cascade_detail }),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// T21 S1-c（docs/banto-hub-t21-design.md §3・§4）: 構成補助ツール第二弾
+// （接続 update/test・グループ CRUD）。S1-b（[`tool_create_connection`]/
+// [`tool_delete_connection`]）と全く同じ書き方をそのまま踏襲する - ゲート
+// （admin スコープ・監査・delete 系 confirm）・mutation フロー（tx →
+// preflight → commit → catalog commit、収集中は pending queue）のどちらも
+// 二重実装しない。
+// ---------------------------------------------------------------------------
+
+/// Copilot 指摘（PR #268）対応: `update_connection`/`update_group`は
+/// フォームと同じ「全項目指定(PUT 置換)」の設計だが、`PlcConnectionPayload`/
+/// `CollectionGroupPayload`は`#[serde(default = ...)]`を持つため、
+/// `serde_json::from_value`に直接通すと省略フィールドが黙って既定値に
+/// 上書きされてしまう（例: `update_group`で`enabled`省略→既定 true に
+/// 戻る）。inputSchema の`required`だけでは MCP クライアントが無視した
+/// 場合に防げないため、デシリアライズ前に`arguments`（JSON object）へ
+/// この関数で必須キーの充足を確認し、1つでも欠けていれば拒否する。
+fn require_all_fields(arguments: &Value, required: &[&str]) -> Option<Value> {
+    let Some(obj) = arguments.as_object() else {
+        return Some(tool_error(
+            "missing_fields: arguments はオブジェクトである必要があります。",
+        ));
+    };
+    let missing: Vec<&str> = required
+        .iter()
+        .filter(|key| !obj.contains_key(**key))
+        .copied()
+        .collect();
+    if missing.is_empty() {
+        None
+    } else {
+        Some(tool_error(format!(
+            "missing_fields: update は全項目指定が必要です(省略項目の既定値上書きを防ぐため)。不足: {}",
+            missing.join(", ")
+        )))
+    }
+}
+
+/// [`tool_update_connection`]の必須キー一覧 - `PlcConnectionPayload`の
+/// wire フィールド（camelCase）全部 + `id`。inputSchema の
+/// `update_connection.required`と同期させること。
+const UPDATE_CONNECTION_REQUIRED_FIELDS: [&str; 9] = [
+    "id",
+    "name",
+    "protocol",
+    "host",
+    "port",
+    "unitId",
+    "enabled",
+    "simulation",
+    "wordOrder",
+];
+
+/// [`tool_update_group`]の必須キー一覧 - `CollectionGroupPayload`の
+/// wire フィールド（camelCase）全部 + `id`。inputSchema の
+/// `update_group.required`と同期させること。
+const UPDATE_GROUP_REQUIRED_FIELDS: [&str; 6] = [
+    "id",
+    "name",
+    "plcConnectionId",
+    "periodMs",
+    "enabled",
+    "defaultWritable",
+];
+
+// --- 12. update_connection ----------------------------------------------------
+
+/// `crate::rest::plc_connections_update`（admin REST）と全く同じ mutation
+/// フロー - [`tool_create_connection`]と同型（`update_tx`を使う点と`id`引数
+/// を取る点だけが違う）。`arguments`には`id`と`PlcConnectionPayload`の各
+/// フィールドを同じオブジェクトに混在させる（`PlcConnectionPayload`は
+/// `deny_unknown_fields`ではないので、`id`が混ざっていても
+/// `serde_json::from_value`は無視して問題なくデシリアライズできる）。
+async fn tool_update_connection(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    if let Some(err) = require_all_fields(&arguments, &UPDATE_CONNECTION_REQUIRED_FIELDS) {
+        return Ok(err);
+    }
+    let id = arguments
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RpcError::invalid_params("arguments.id (integer) is required"))?;
+    let input: PlcConnectionPayload = serde_json::from_value(arguments)
+        .map_err(|err| RpcError::invalid_params(format!("接続の入力が不正です: {err}")))?;
+
+    let status = state.status.controller.status();
+    if status.state != CollectionState::Stopped {
+        let payload = json!({ "id": id, "input": input });
+        let base_fingerprint = compute_pending_base_fingerprint(
+            &state.plc_connections,
+            &state.collection_groups,
+            "plc_connections.update",
+            &payload,
+        )
+        .await;
+        let pending = match state
+            .pending_changes
+            .create_pending(
+                "plc_connections.update",
+                &payload,
+                state.manager.configured_revision() as i64,
+                base_fingerprint.as_deref(),
+                Some(ctx.name.as_str()),
+                Some("api_key"),
+            )
+            .await
+        {
+            Ok(pending) => pending,
+            Err(err) => {
+                return Ok(tool_error(format!(
+                    "未適用キューへの保存に失敗しました: {err}"
+                )));
+            }
+        };
+        audit_config_action(
+            state,
+            ctx,
+            "update",
+            "plc_connections",
+            Some(&id.to_string()),
+            Some(json!({ "queued": true, "pendingId": pending.id })),
+        )
+        .await;
+        return Ok(tool_ok(json!({
+            "queued": true,
+            "pendingId": pending.id,
+            "message": QUEUED_MESSAGE,
+        })));
+    }
+
+    let mut tx = match state.manager.pool().begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            return Ok(tool_error(format!(
+                "トランザクションの開始に失敗しました: {err}"
+            )));
+        }
+    };
+    let updated = match state
+        .plc_connections
+        .update_tx(&mut tx, id, input.into())
+        .await
+    {
+        Ok(updated) => updated,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(tool_error(format!("{err}")));
+        }
+    };
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(tool_error(format!("{}", err.0)));
+        }
+    };
+    if let Err(err) = tx.commit().await {
+        return Ok(tool_error(format!("コミットに失敗しました: {err}")));
+    }
+    audit_config_action(
+        state,
+        ctx,
+        "update",
+        "plc_connections",
+        Some(&id.to_string()),
+        Some(json!({ "name": updated.name, "enabled": updated.enabled })),
+    )
+    .await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.status.controller,
+        &state.events,
+        "plc_connections",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
+    Ok(tool_ok(json!({ "updated": updated })))
+}
+
+// --- 13. test_connection ----------------------------------------------------
+
+/// `crate::rest::plc_connections_test`（admin REST）をそのまま呼ぶだけ -
+/// 疎通確認本体（virtual/simulation の即時拒否・プロトコル別ダイヤル・
+/// broker セッション再利用・エラー分類・所要時間計測）は一切再実装せず
+/// [`run_plc_connection_test`]（REST ハンドラと共有、`crate::rest`）へ
+/// 委譲する。レジストリへの書き込みが一切発生しない読み取り専用の疎通確認
+/// なので、REST 同様 pending queue・commit・監査のいずれも行わない。
+async fn tool_test_connection(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let payload: PlcConnectionTestPayload = serde_json::from_value(arguments)
+        .map_err(|err| RpcError::invalid_params(format!("接続テストの入力が不正です: {err}")))?;
+
+    let result = run_plc_connection_test(&state.manager, &payload).await;
+    Ok(tool_ok(
+        serde_json::to_value(result).unwrap_or_else(|_| json!({})),
+    ))
+}
+
+// --- 14. list_groups ----------------------------------------------------
+
+async fn tool_list_groups(state: &McpState, ctx: &ApiKeyContext) -> Value {
+    if let Err(err) = require_admin_scope(ctx) {
+        return err;
+    }
+    match state.collection_groups.list(ListParams::default()).await {
+        Ok(result) => tool_ok(json!({ "groups": result.rows })),
+        Err(err) => tool_error(format!("グループ一覧の取得に失敗しました: {err}")),
+    }
+}
+
+// --- 15. create_group ----------------------------------------------------
+
+/// `crate::rest::collection_groups_create`（admin REST）と全く同じ
+/// mutation フロー - [`tool_create_connection`]と同型（対象サービスが
+/// `state.collection_groups`、source/resource が`"collection_groups"`
+/// になる点だけが違う）。
+async fn tool_create_group(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let input: CollectionGroupPayload = serde_json::from_value(arguments)
+        .map_err(|err| RpcError::invalid_params(format!("グループの入力が不正です: {err}")))?;
+
+    let status = state.status.controller.status();
+    if status.state != CollectionState::Stopped {
+        let payload = json!({ "input": input });
+        let base_fingerprint = compute_pending_base_fingerprint(
+            &state.plc_connections,
+            &state.collection_groups,
+            "collection_groups.create",
+            &payload,
+        )
+        .await;
+        let pending = match state
+            .pending_changes
+            .create_pending(
+                "collection_groups.create",
+                &payload,
+                state.manager.configured_revision() as i64,
+                base_fingerprint.as_deref(),
+                Some(ctx.name.as_str()),
+                Some("api_key"),
+            )
+            .await
+        {
+            Ok(pending) => pending,
+            Err(err) => {
+                return Ok(tool_error(format!(
+                    "未適用キューへの保存に失敗しました: {err}"
+                )));
+            }
+        };
+        audit_config_action(
+            state,
+            ctx,
+            "create",
+            "collection_groups",
+            None,
+            Some(json!({ "queued": true, "pendingId": pending.id, "name": input.name })),
+        )
+        .await;
+        return Ok(tool_ok(json!({
+            "queued": true,
+            "pendingId": pending.id,
+            "message": QUEUED_MESSAGE,
+        })));
+    }
+
+    let mut tx = match state.manager.pool().begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            return Ok(tool_error(format!(
+                "トランザクションの開始に失敗しました: {err}"
+            )));
+        }
+    };
+    let created = match state
+        .collection_groups
+        .create_tx(&mut tx, input.into())
+        .await
+    {
+        Ok(created) => created,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(tool_error(format!("{err}")));
+        }
+    };
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(tool_error(format!("{}", err.0)));
+        }
+    };
+    if let Err(err) = tx.commit().await {
+        return Ok(tool_error(format!("コミットに失敗しました: {err}")));
+    }
+    audit_config_action(
+        state,
+        ctx,
+        "create",
+        "collection_groups",
+        Some(&created.id.to_string()),
+        Some(json!({ "name": created.name, "enabled": created.enabled })),
+    )
+    .await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.status.controller,
+        &state.events,
+        "collection_groups",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
+    Ok(tool_ok(json!({ "created": created })))
+}
+
+// --- 16. update_group ----------------------------------------------------
+
+/// `crate::rest::collection_groups_update`（admin REST）と全く同じ
+/// mutation フロー - [`tool_update_connection`]と同型。
+async fn tool_update_group(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    if let Some(err) = require_all_fields(&arguments, &UPDATE_GROUP_REQUIRED_FIELDS) {
+        return Ok(err);
+    }
+    let id = arguments
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RpcError::invalid_params("arguments.id (integer) is required"))?;
+    let input: CollectionGroupPayload = serde_json::from_value(arguments)
+        .map_err(|err| RpcError::invalid_params(format!("グループの入力が不正です: {err}")))?;
+
+    let status = state.status.controller.status();
+    if status.state != CollectionState::Stopped {
+        let payload = json!({ "id": id, "input": input });
+        let base_fingerprint = compute_pending_base_fingerprint(
+            &state.plc_connections,
+            &state.collection_groups,
+            "collection_groups.update",
+            &payload,
+        )
+        .await;
+        let pending = match state
+            .pending_changes
+            .create_pending(
+                "collection_groups.update",
+                &payload,
+                state.manager.configured_revision() as i64,
+                base_fingerprint.as_deref(),
+                Some(ctx.name.as_str()),
+                Some("api_key"),
+            )
+            .await
+        {
+            Ok(pending) => pending,
+            Err(err) => {
+                return Ok(tool_error(format!(
+                    "未適用キューへの保存に失敗しました: {err}"
+                )));
+            }
+        };
+        audit_config_action(
+            state,
+            ctx,
+            "update",
+            "collection_groups",
+            Some(&id.to_string()),
+            Some(json!({ "queued": true, "pendingId": pending.id })),
+        )
+        .await;
+        return Ok(tool_ok(json!({
+            "queued": true,
+            "pendingId": pending.id,
+            "message": QUEUED_MESSAGE,
+        })));
+    }
+
+    let mut tx = match state.manager.pool().begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            return Ok(tool_error(format!(
+                "トランザクションの開始に失敗しました: {err}"
+            )));
+        }
+    };
+    let updated = match state
+        .collection_groups
+        .update_tx(&mut tx, id, input.into())
+        .await
+    {
+        Ok(updated) => updated,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(tool_error(format!("{err}")));
+        }
+    };
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(tool_error(format!("{}", err.0)));
+        }
+    };
+    if let Err(err) = tx.commit().await {
+        return Ok(tool_error(format!("コミットに失敗しました: {err}")));
+    }
+    audit_config_action(
+        state,
+        ctx,
+        "update",
+        "collection_groups",
+        Some(&id.to_string()),
+        Some(json!({ "name": updated.name, "enabled": updated.enabled })),
+    )
+    .await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.status.controller,
+        &state.events,
+        "collection_groups",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
+    Ok(tool_ok(json!({ "updated": updated })))
+}
+
+// --- 17. delete_group ----------------------------------------------------
+
+/// `crate::rest::collection_groups_delete`（admin REST）と全く同じ
+/// mutation フロー（`cascade_delete_tx` - 配下のタグごと削除・履歴は残す）。
+/// [`tool_delete_connection`]と同型。不可逆操作のため
+/// `arguments.confirm == true` を要求する。
+async fn tool_delete_group(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let id = arguments
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RpcError::invalid_params("arguments.id (integer) is required"))?;
+    let confirmed = arguments.get("confirm").and_then(Value::as_bool) == Some(true);
+    if !confirmed {
+        return Ok(tool_error(
+            "confirm_required: 削除は不可逆操作です。arguments.confirm:true を指定してください。",
+        ));
+    }
+
+    let status = state.status.controller.status();
+    if status.state != CollectionState::Stopped {
+        let payload = json!({ "id": id });
+        let base_fingerprint = compute_pending_base_fingerprint(
+            &state.plc_connections,
+            &state.collection_groups,
+            "collection_groups.delete",
+            &payload,
+        )
+        .await;
+        let pending = match state
+            .pending_changes
+            .create_pending(
+                "collection_groups.delete",
+                &payload,
+                state.manager.configured_revision() as i64,
+                base_fingerprint.as_deref(),
+                Some(ctx.name.as_str()),
+                Some("api_key"),
+            )
+            .await
+        {
+            Ok(pending) => pending,
+            Err(err) => {
+                return Ok(tool_error(format!(
+                    "未適用キューへの保存に失敗しました: {err}"
+                )));
+            }
+        };
+        audit_config_action(
+            state,
+            ctx,
+            "delete",
+            "collection_groups",
+            Some(&id.to_string()),
+            Some(json!({ "queued": true, "pendingId": pending.id })),
+        )
+        .await;
+        return Ok(tool_ok(json!({
+            "queued": true,
+            "pendingId": pending.id,
+            "message": QUEUED_MESSAGE,
+        })));
+    }
+
+    let mut tx = match state.manager.pool().begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            return Ok(tool_error(format!(
+                "トランザクションの開始に失敗しました: {err}"
+            )));
+        }
+    };
+    let cascade = match state.collection_groups.cascade_delete_tx(&mut tx, id).await {
+        Ok(cascade) => cascade,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(tool_error(format!("{err}")));
+        }
+    };
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(tool_error(format!("{}", err.0)));
+        }
+    };
+    if let Err(err) = tx.commit().await {
+        return Ok(tool_error(format!("コミットに失敗しました: {err}")));
+    }
+    let cascade_detail = json!({ "deletedTags": cascade.deleted_tags });
+    audit_config_action(
+        state,
+        ctx,
+        "delete",
+        "collection_groups",
+        Some(&id.to_string()),
+        Some(json!({ "cascade": cascade_detail.clone() })),
+    )
+    .await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.status.controller,
+        &state.events,
+        "collection_groups",
         snapshot,
         state.legacy_live_reconfigure,
     )

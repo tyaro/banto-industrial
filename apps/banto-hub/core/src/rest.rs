@@ -3378,11 +3378,11 @@ async fn test_modbus_connection(
 /// 誤診しないための対策。このモジュール冒頭のコメント参照)。無ければ直接
 /// ダイヤルにフォールバックする。
 async fn test_slmp_connection(
-    state: &TagRegistryState,
+    manager: &CollectorManager,
     payload: &PlcConnectionTestPayload,
 ) -> (bool, Option<PlcConnectionTestError>) {
     if let Some(connection_id) = payload.connection_id {
-        if let Some(handle) = state.manager.sessions().handle_for(connection_id) {
+        if let Some(handle) = manager.sessions().handle_for(connection_id) {
             let requests = vec![BatchReadRequest::Numeric(ReadRequest {
                 address: Address::parse_slmp("D0").expect("valid literal"),
                 data_type: DataType::U16,
@@ -3527,6 +3527,13 @@ async fn test_slmp_connection(
 /// 「ok:false は通常の応答」という判断) - レジストリへの書き込みが一切
 /// 発生しない読み取り専用の疎通確認なので、監査ログ記録(`record_write`)や
 /// `rebuild_and_notify`は呼ばない。
+///
+/// 疎通確認そのもの(virtual/simulation の即時拒否・プロトコル別ダイヤル・
+/// 所要時間計測)は[`run_plc_connection_test`]へ切り出してある - T21
+/// S1-c（docs/banto-hub-t21-design.md）の MCP `test_connection`ツール
+/// ([`crate::mcp`]の`tool_test_connection`)がこの REST ハンドラと**全く同じ
+/// 疎通確認**を行うために共有する(二重実装しない、このファイル冒頭
+/// 「§3.7」節と同じ規律)。
 async fn plc_connections_test(
     State(state): State<TagRegistryState>,
     headers: HeaderMap,
@@ -3543,6 +3550,19 @@ async fn plc_connections_test(
     )
     .await?;
 
+    Ok(Json(
+        run_plc_connection_test(&state.manager, &payload).await,
+    ))
+}
+
+/// [`plc_connections_test`]のdoc comment参照 - REST ハンドラと MCP の
+/// `test_connection`ツールが共有する疎通確認本体。認可判定
+/// (`require_editor`/MCP 側の`require_admin_scope`)は呼び出し元の責務で、
+/// ここでは行わない。
+pub(crate) async fn run_plc_connection_test(
+    manager: &CollectorManager,
+    payload: &PlcConnectionTestPayload,
+) -> PlcConnectionTestResponse {
     let started = std::time::Instant::now();
 
     // ガード: virtual / simulation / 未知プロトコルは即座に ok:false, kind:
@@ -3566,8 +3586,8 @@ async fn plc_connections_test(
         )
     } else {
         match payload.protocol.as_str() {
-            "modbus-tcp" => test_modbus_connection(&payload).await,
-            "slmp" => test_slmp_connection(&state, &payload).await,
+            "modbus-tcp" => test_modbus_connection(payload).await,
+            "slmp" => test_slmp_connection(manager, payload).await,
             other => (
                 false,
                 Some(PlcConnectionTestError {
@@ -3578,11 +3598,11 @@ async fn plc_connections_test(
         }
     };
 
-    Ok(Json(PlcConnectionTestResponse {
+    PlcConnectionTestResponse {
         ok,
         elapsed_ms: started.elapsed().as_millis() as u64,
         error,
-    }))
+    }
 }
 
 async fn collection_groups_list(
