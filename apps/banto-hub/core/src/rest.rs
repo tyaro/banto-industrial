@@ -2693,7 +2693,10 @@ impl From<TagPayload> for TagInput {
 /// production (non-legacy) case would defeat the entire point of 案B - see
 /// that method's doc comment for the full derivation, including why this is
 /// safe against the T15-4 stop-vs-write race.
-async fn commit_catalog_and_notify(
+// T21 S1-b（docs/banto-hub-t21-design.md §5）: `pub(crate)` にして
+// `crate::mcp` の構成補助ツール（`create_connection`/`delete_connection`）
+// からも同じ経路を呼べるようにする - シグネチャ・本体は不変。
+pub(crate) async fn commit_catalog_and_notify(
     manager: &CollectorManager,
     controller: &CollectionController,
     events: &broadcast::Sender<ServerEvent>,
@@ -2766,21 +2769,31 @@ struct QueuedPendingChangeResponse {
 /// `expectedRevision` optimistic-lock mechanism — see
 /// `TagUpdateError::RevisionConflict` — adding a second guard here would be
 /// redundant).
-async fn compute_pending_base_fingerprint(
-    state: &TagRegistryState,
+///
+/// T21 S1-b（docs/banto-hub-t21-design.md §5）: made `pub(crate)` and takes
+/// the two services it actually reads directly (`&PlcConnectionService`/
+/// `&CollectionGroupService`) instead of the full `TagRegistryState` - this
+/// crate's private, admin-REST-only god-struct that also carries `AuthState`
+/// (which needs a live login-verification closure and cannot be cheaply
+/// fabricated from `crate::mcp`, whose API-key auth never touches it). The
+/// body and the two behaviors it implements (`plc_connections.*` /
+/// `collection_groups.*`) are otherwise unchanged - this is the minimal
+/// decoupling needed so [`crate::mcp`]'s config tools can call the exact same
+/// fingerprint logic REST uses, rather than re-implementing it.
+pub(crate) async fn compute_pending_base_fingerprint(
+    plc_connections: &PlcConnectionService,
+    collection_groups: &CollectionGroupService,
     source: &str,
     payload: &serde_json::Value,
 ) -> Option<String> {
     let id = payload.get("id")?.as_i64()?;
     match source {
-        "plc_connections.update" | "plc_connections.delete" => state
-            .plc_connections
+        "plc_connections.update" | "plc_connections.delete" => plc_connections
             .get(id)
             .await
             .ok()
             .and_then(|row| serde_json::to_string(&row).ok()),
-        "collection_groups.update" | "collection_groups.delete" => state
-            .collection_groups
+        "collection_groups.update" | "collection_groups.delete" => collection_groups
             .get(id)
             .await
             .ok()
@@ -2797,7 +2810,13 @@ async fn queue_pending_registry_change(
     status: CollectionStatus,
 ) -> RegistryMutationResult<Response> {
     let identity = actor_identity(headers, &state.auth, &state.commissioning);
-    let base_fingerprint = compute_pending_base_fingerprint(state, source, &payload).await;
+    let base_fingerprint = compute_pending_base_fingerprint(
+        &state.plc_connections,
+        &state.collection_groups,
+        source,
+        &payload,
+    )
+    .await;
     let pending = state
         .pending_changes
         .create_pending(
@@ -8103,6 +8122,11 @@ fn api_router_with_controller_mode(
             mqtt.clone(),
             system_info.clone(),
             !legacy_live_reconfigure,
+            // T21 S1-b（docs/banto-hub-t21-design.md §5）: 構成補助ツール用
+            // - REST の他ルーターと同じ `audit`/`legacy_live_reconfigure` を
+            // そのまま共有する（このファイルの `.merge` 呼び出し規律と同じ）。
+            audit.clone(),
+            legacy_live_reconfigure,
         ))
         .merge(tag_space_router(
             manager,
@@ -8150,7 +8174,11 @@ fn storage_api_error(error: sqlx::Error) -> ApiError {
     ApiError(BantoError::Storage(error.to_string()))
 }
 
-async fn preflight_transaction(
+// T21 S1-b（docs/banto-hub-t21-design.md §5）: `pub(crate)` so
+// `crate::mcp`'s config tools (`create_connection`/`delete_connection`) can
+// run the exact same in-transaction preflight REST does - signature and body
+// unchanged.
+pub(crate) async fn preflight_transaction(
     connection: &mut sqlx::SqliteConnection,
 ) -> Result<RegistrySnapshot, ApiError> {
     let snapshot = RegistrySnapshot::load_connection(connection)
