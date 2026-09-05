@@ -1407,6 +1407,40 @@ async fn create_connection_with_admin_scope_while_stopped_creates_and_audits() {
     );
 }
 
+/// T21 小改善（実機検証 2026-09-06）: `PlcConnectionService::create_tx`が
+/// `BantoError::Validation { field_errors }`を返したとき、`tool_error`の
+/// 文言が`Display`（"validation failed"）だけに潰れず、field 名/メッセージ
+/// （`crates/banto-tags/src/plc_connection.rs`の`create_rejects_out_of_range_port`
+/// と同じ「port が範囲外」検証）が出ることを確認する
+/// - `crate::mcp::banto_error_tool_error`の固定テスト。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_connection_validation_error_includes_field_detail() {
+    let app = test_app("config-create-validation").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let before_rows = plc_connections_row_count(&app).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_connection",
+            json!({ "name": "line1", "host": "127.0.0.1", "port": 70000, "protocol": "slmp" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("port"), "{text}");
+    assert!(!text.contains("validation failed"), "{text}");
+
+    assert_eq!(
+        plc_connections_row_count(&app).await,
+        before_rows,
+        "validation エラーは何も作成してはいけない"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_connection_without_confirm_is_rejected_and_connection_remains() {
     let app = test_app("config-delete-no-confirm").await;
@@ -2409,6 +2443,53 @@ async fn create_tag_with_admin_scope_while_stopped_creates_and_audits() {
     assert_eq!(
         latest_audit_column(&app, "origin").await.as_deref(),
         Some("mcp")
+    );
+}
+
+/// T21 小改善（実機検証 2026-09-06）: `TagService::create_tx`が
+/// `TagUpdateError`とは別に`BantoError::Validation`（しきい値の大小関係
+/// 違反、`crates/banto-tags/src/tag.rs`の`validate_thresholds`）を返した
+/// とき、field 詳細（どのしきい値がなぜ不正か）が`tool_error`に出ることを
+/// 確認する - `create_connection_validation_error_includes_field_detail`
+/// と同じ`crate::mcp::banto_error_tool_error`の固定テストだが、こちらは
+/// `banto_tags::tag`側の Validation を通す。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_tag_validation_error_includes_field_detail() {
+    let app = test_app("s1d-create-tag-validation").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+    let before_rows = tags_row_count(&app).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_tag",
+            json!({
+                "name": "temp01",
+                "collectionGroupId": group.id,
+                "address": "D100",
+                "dataType": "u16",
+                "thresholdLl": 100,
+                "thresholdL": 10,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("thresholdL"), "{text}");
+    assert!(!text.contains("validation failed"), "{text}");
+
+    assert_eq!(
+        tags_row_count(&app).await,
+        before_rows,
+        "validation エラーは何も作成してはいけない"
     );
 }
 
