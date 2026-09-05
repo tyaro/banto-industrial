@@ -425,7 +425,7 @@ async fn initialize_returns_tool_capabilities() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tools_list_returns_the_nineteen_tools() {
+async fn tools_list_returns_the_twenty_one_tools() {
     let app = test_app("tools-list").await;
     let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
 
@@ -450,6 +450,8 @@ async fn tools_list_returns_the_nineteen_tools() {
             "list_tags",
             "read_tag_now",
             "read_tag_values",
+            "set_collection",
+            "set_write_control",
             "test_connection",
             "update_connection",
             "update_group",
@@ -2734,4 +2736,257 @@ async fn create_tag_while_collection_running_is_queued_not_applied() {
         latest_audit_column(&app, "resource").await.as_deref(),
         Some("tags")
     );
+}
+
+// ---------------------------------------------------------------------------
+// 13. T21 S2-a（`set_collection`/`set_write_control`）: レジストリ mutation
+//    ではなくランタイム制御（`CollectionController`/`WriteControl`を直接
+//    切り替える）。9〜12節の構成 CRUD ツールと同じく `admin` スコープ必須・
+//    全操作を origin="mcp" で監査するが、可逆操作のため confirm は無い。
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_control_tools_without_admin_scope_are_rejected_and_change_nothing() {
+    let app = test_app("runtime-no-admin").await;
+    // read/write は持つが admin は持たないキー。
+    let key = issue_key(
+        &app.router,
+        &app.admin_token,
+        "reader-writer",
+        &["read", "write:line1.fast.temp01"],
+    )
+    .await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call("set_collection", json!({ "action": "start" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true);
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("missing_admin_scope"), "{text}");
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call("set_write_control", json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true);
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("missing_admin_scope"), "{text}");
+    assert!(
+        !app.write_control.is_enabled(),
+        "a rejected set_write_control must not flip the live flag"
+    );
+
+    // 収集状態も変化していないことを`get_server_status`(admin+read)で確認する。
+    let admin_read_key = issue_key(
+        &app.router,
+        &app.admin_token,
+        "admin-reader",
+        &["admin", "read"],
+    )
+    .await;
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_read_key),
+        tools_call("get_server_status", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(
+        payload["collection_state"], "stopped",
+        "a rejected set_collection must not change collection state: {payload:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_collection_start_and_stop_transition_state_and_audit() {
+    let app = test_app("runtime-collection-start-stop").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("set_collection", json!({ "action": "start" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["state"], "running", "{payload:?}");
+    assert_eq!(payload["mode"], "configured", "{payload:?}");
+
+    assert_eq!(
+        latest_audit_column(&app, "action").await.as_deref(),
+        Some("start")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("collection")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "actor_username").await.as_deref(),
+        Some("admin-key")
+    );
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("set_collection", json!({ "action": "stop" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["state"], "stopped", "{payload:?}");
+
+    assert_eq!(
+        latest_audit_column(&app, "action").await.as_deref(),
+        Some("stop")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("collection")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_collection_rejects_an_invalid_action() {
+    let app = test_app("runtime-collection-invalid-action").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("set_collection", json!({ "action": "pause" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("start"), "{text}");
+    assert!(text.contains("stop"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_write_control_enable_and_disable_persist_and_audit() {
+    let app = test_app("runtime-write-control").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("set_write_control", json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["writeEnabled"], true, "{payload:?}");
+    assert!(app.write_control.is_enabled());
+
+    assert_eq!(
+        latest_audit_column(&app, "action").await.as_deref(),
+        Some("enable")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("write_control")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "entity_id").await.as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("set_write_control", json!({ "enabled": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["writeEnabled"], false, "{payload:?}");
+    assert!(!app.write_control.is_enabled());
+
+    assert_eq!(
+        latest_audit_column(&app, "action").await.as_deref(),
+        Some("disable")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("write_control")
+    );
+}
+
+/// 既知の運用癖（実装指示・`docs/mcp-real-machine-2026-09-04`メモリ参照）:
+/// `CollectionController::start`は遷移のたびに`WriteControl::disable`を
+/// 呼ぶ（`crate::controller`参照）ため、収集開始直後は書き込み受付が
+/// 強制的に無効化される。`set_collection{action:start}`の直後に
+/// `write_enabled`が`false`へ戻ること、そこから`set_write_control`で
+/// 改めて有効化できることを固定する。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn starting_collection_resets_write_enabled_and_set_write_control_re_enables_it() {
+    let app = test_app("runtime-start-resets-write-control").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("set_write_control", json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    assert!(app.write_control.is_enabled());
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("set_collection", json!({ "action": "start" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    assert!(
+        !app.write_control.is_enabled(),
+        "collection start must reset write_enabled to false (known operational quirk)"
+    );
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("set_write_control", json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["writeEnabled"], true, "{payload:?}");
+    assert!(app.write_control.is_enabled());
 }
