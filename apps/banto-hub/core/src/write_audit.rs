@@ -87,6 +87,9 @@ pub struct WriteAuditRow {
     pub tag_id: i64,
     pub external_name_snapshot: String,
     pub value_requested: Option<f64>,
+    /// T20 宿題#1: `value_requested`(REAL)には入らない文字列書き込みの
+    /// テキストをここに残す(`with_value_requested_text` 参照)。
+    pub value_requested_text: Option<String>,
     pub action: WriteAuditAction,
     pub result: WriteAuditResult,
     pub detail: Option<String>,
@@ -107,6 +110,7 @@ impl WriteAuditRow {
             tag_id,
             external_name_snapshot: external_name_snapshot.into(),
             value_requested: None,
+            value_requested_text: None,
             action,
             result,
             detail: None,
@@ -130,6 +134,15 @@ impl WriteAuditRow {
         self
     }
 
+    /// T20 宿題#1: `value_requested`(REAL)に入らない文字列書き込みの
+    /// テキストを残す([`Self::with_value_requested_opt`]の隣。
+    /// `crate::write_path::RequestedValue::as_audit_text`/
+    /// `ConvertedValue::as_audit_text` が呼び出し元)。
+    pub fn with_value_requested_text(mut self, value: Option<String>) -> Self {
+        self.value_requested_text = value;
+        self
+    }
+
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
         self
@@ -148,6 +161,7 @@ pub struct WriteAuditEntry {
     pub tag_id: i64,
     pub external_name_snapshot: String,
     pub value_requested: Option<f64>,
+    pub value_requested_text: Option<String>,
     pub action: String,
     pub result: String,
     pub detail: Option<String>,
@@ -162,6 +176,7 @@ fn column_map() -> ColumnMap {
         .column("tagId", "tag_id")
         .column("externalNameSnapshot", "external_name_snapshot")
         .column("valueRequested", "value_requested")
+        .column("valueRequestedText", "value_requested_text")
         .column("action", "action")
         .column("result", "result")
         .column("detail", "detail")
@@ -185,14 +200,15 @@ impl WriteAuditService {
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO hub_write_audit (\
                 api_key_id, api_key_name_snapshot, tag_id, external_name_snapshot, \
-                value_requested, action, result, detail\
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                value_requested, value_requested_text, action, result, detail\
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(row.api_key_id)
         .bind(&row.api_key_name_snapshot)
         .bind(row.tag_id)
         .bind(&row.external_name_snapshot)
         .bind(row.value_requested)
+        .bind(&row.value_requested_text)
         .bind(row.action.as_str())
         .bind(row.result.as_str())
         .bind(&row.detail)
@@ -251,7 +267,7 @@ impl WriteAuditService {
 
         let mut rows_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
             "SELECT id, ts, api_key_id, api_key_name_snapshot, tag_id, external_name_snapshot, \
-             value_requested, action, result, detail FROM hub_write_audit",
+             value_requested, value_requested_text, action, result, detail FROM hub_write_audit",
         );
         banto_storage::list_query::sqlite::apply_list_params(&mut rows_builder, &columns, &params)?;
         let rows: Vec<WriteAuditEntry> = rows_builder
@@ -404,6 +420,37 @@ mod tests {
         assert_eq!(
             result.rows[0].detail.as_deref(),
             Some("rate limit exceeded; key tripped")
+        );
+    }
+
+    /// T20 宿題#1: 文字列書き込み(`hub_write_audit.value_requested` は
+    /// `REAL` 専用のため NULL のまま)でも、専用列 `value_requested_text` に
+    /// 実際のテキストが残ることを確認する(`RequestedValue::Str`/
+    /// `ConvertedValue::Str` の呼び出し元 `crate::write_path` が組み立てる
+    /// 行を模した形 - `with_value_requested_opt(None)` + テキストを渡す
+    /// `with_value_requested_text`)。
+    #[tokio::test]
+    async fn string_write_leaves_value_requested_null_but_records_text() {
+        let svc = service().await;
+        let row = WriteAuditRow::new(
+            1,
+            "mes-gateway",
+            10,
+            "line1.recipe_name",
+            WriteAuditAction::Write,
+            WriteAuditResult::Ok,
+        )
+        .with_value_requested_opt(None)
+        .with_value_requested_text(Some("書いた文字列".to_string()));
+        svc.insert_row(&row).await.unwrap();
+
+        let result = svc.list(ListParams::default()).await.unwrap();
+        assert_eq!(result.total_count, 1);
+        let stored = &result.rows[0];
+        assert_eq!(stored.value_requested, None);
+        assert_eq!(
+            stored.value_requested_text.as_deref(),
+            Some("書いた文字列")
         );
     }
 
