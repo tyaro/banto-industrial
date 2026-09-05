@@ -142,7 +142,7 @@ per-entry 結果を返す。**同一バッチ内の重複タグは拒否**（`Du
 タグに2値は曖昧、かつレート制限 peek の粒度も正確になる）。REST `POST /api/v1/values/batch`
 （単票と同じ認証規律・per-entry の `write:{tag}` スコープ検査・常に200の per-entry 封筒）。
 事前ゲート all-or-nothing は「1件 NG → 監査行数不変＋シミュレータ値不変」でテスト固定。
-**③b（MCP `write_recipe`）・③c（レシピ UI）は別スライス。**
+**③b（MCP `write_recipe`）: 完了（2026-09-05）。** `execute_write_batch` を叩く MCP ツール `write_recipe`（`{writes:[{tag,value}]}`）を追加。`write_tag_value` と同型の安全ポリシー: **ロックダウン後はアドバイザリのみ**（`execute_write_batch` を呼ばず、推奨レシピを助言。監査/レジスタ不変をテスト固定）、ロックダウン前は per-entry の `write:{tag}` スコープ検査→`execute_write_batch`。応答は per-entry 封筒＋`applied` 件数。**③c（レシピ UI）は別スライス。**
 
 ### 3.4 ④ワードデバイスのビット `.0〜.F`（16進）
 
