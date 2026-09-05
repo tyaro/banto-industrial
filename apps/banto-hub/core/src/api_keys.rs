@@ -49,13 +49,21 @@
 //! つながらない（`secret` 自体は DB のどこにも保存されていない）。とはいえ
 //! コストがほぼゼロなので、早期リターンする単純な `==` より安全側に倒す。
 //!
-//! ## スコープ構文検証（設計 §5.6・T0-2 スコープ外の明示、H10 ③ で拡張）
+//! ## スコープ構文検証（設計 §5.6・T0-2 スコープ外の明示、H10 ③・T21 で拡張）
 //!
 //! `read`・`read:{connection}.{group}.{tag}`・`read:{connection}.{group}.*`・
-//! `write:{connection}.{group}.{tag}` のみを許可する。write スコープは
-//! ワイルドカード不可・3セグメントちょうど・各セグメント非空を発行時に
-//! 検証するが、**実際の書き込み検査（T2）はここでは行わない**（書き込み
-//! API 自体が T0-2 の時点でまだ存在しない）。
+//! `write:{connection}.{group}.{tag}`・`admin` のみを許可する。write
+//! スコープはワイルドカード不可・3セグメントちょうど・各セグメント非空を
+//! 発行時に検証するが、**実際の書き込み検査（T2）はここでは行わない**
+//! （書き込み API 自体が T0-2 の時点でまだ存在しない）。
+//!
+//! `admin`（T21 S1-a、docs/banto-hub-t21-design.md §3.1）は、今後 MCP から
+//! 行う構成操作（接続/グループ/タグ CRUD・設定・API キー発行等）専用の
+//! 独立スコープ。read/write のタグ値アクセスとは**意図的に直交**しており、
+//! `admin` だけを持つキーはタグの値を一切読み書きできない
+//! （[`ApiKeyContext::has_admin_scope`] 参照）。本スライスではスコープを
+//! 有効化するところまでで、実際に `admin` を要求する構成操作エンドポイント
+//! の配線は後続スライスで行う。
 //!
 //! ### read のタグ単位化（H10 ③、Option B、2026-08-08 オーナー決定・
 //! docs/h10-3-read-scope-proposal.md §5 S1・§6）
@@ -135,6 +143,9 @@ const LAST_USED_THROTTLE_MS: i64 = 60_000;
 ///   （グループ・ワイルドカード、read に限り許可）。
 /// - `"write:{connection}.{group}.{tag}"`: ワイルドカード（`*`）禁止・
 ///   ピリオド区切りでちょうど3セグメント・各セグメント非空。
+/// - `"admin"`: そのまま許可（T21 S1-a、構成操作専用 - このモジュールの
+///   doc comment「スコープ構文検証」参照。read/write とは直交で、
+///   データアクセスは付与しない）。
 /// - それ以外は全て不正。
 ///
 /// **実際の読み取り/書き込み可否判定（値ハンドラ側）はここでは行わない**
@@ -143,14 +154,17 @@ fn validate_scope(scope: &str) -> Result<(), String> {
     if scope == "read" {
         return Ok(());
     }
+    if scope == "admin" {
+        return Ok(());
+    }
     if let Some(pattern) = scope.strip_prefix("read:") {
         return validate_read_scope(pattern, scope);
     }
     let Some(pattern) = scope.strip_prefix("write:") else {
         return Err(format!(
             "不明なスコープです（'read'、'read:{{connection}}.{{group}}.{{tag}}'、\
-             'read:{{connection}}.{{group}}.*'、'write:{{connection}}.{{group}}.{{tag}}' の\
-             いずれかのみ許可）: {scope}"
+             'read:{{connection}}.{{group}}.*'、'write:{{connection}}.{{group}}.{{tag}}'、\
+             'admin' のいずれかのみ許可）: {scope}"
         ));
     };
     if pattern.contains('*') {
@@ -446,6 +460,17 @@ impl ApiKeyContext {
     pub fn has_write_scope(&self, external_name: &str) -> bool {
         let needle = format!("write:{external_name}");
         self.scopes.iter().any(|scope| scope == &needle)
+    }
+
+    /// T21 S1-a（docs/banto-hub-t21-design.md §3.1）: 構成補助 MCP ツール
+    /// （接続/グループ/タグ CRUD・設定・API キー発行等）が要求する管理
+    /// スコープを持つか。`admin` は read/write とは**直交** — `admin`
+    /// だけを持つキーは [`has_any_read`](Self::has_any_read)・
+    /// [`has_write_scope`](Self::has_write_scope) がいずれも false のまま
+    /// で、タグの値の読み書きは一切できない。ツール本体がこの判定を使う
+    /// 配線は後続スライスで行う。
+    pub fn has_admin_scope(&self) -> bool {
+        self.scopes.iter().any(|s| s == "admin")
     }
 }
 
@@ -862,8 +887,15 @@ mod tests {
 
     #[test]
     fn validate_scope_rejects_unknown_kind() {
-        assert!(validate_scope("admin").is_err());
+        assert!(validate_scope("unknown").is_err());
         assert!(validate_scope("").is_err());
+    }
+
+    // --- T21 S1-a: admin スコープ -------------------------------------------
+
+    #[test]
+    fn validate_scope_accepts_admin() {
+        assert!(validate_scope("admin").is_ok());
     }
 
     // --- H10 ③: read のタグ単位スコープ構文（S1） -----------------------
@@ -1320,6 +1352,32 @@ mod tests {
         assert!(ctx.can_read_value("line2.slow.press01"));
         assert!(!ctx.can_read_value("line1.fast.temp02"));
         assert!(!ctx.can_read_value("line3.fast.temp01"));
+    }
+
+    // --- T21 S1-a: has_admin_scope ------------------------------------------
+
+    #[test]
+    fn has_admin_scope_is_true_when_admin_is_present() {
+        assert!(ctx_with(&["admin"]).has_admin_scope());
+        assert!(ctx_with(&["read", "admin"]).has_admin_scope());
+    }
+
+    #[test]
+    fn has_admin_scope_is_false_without_admin() {
+        assert!(!ctx_with(&["read"]).has_admin_scope());
+        assert!(!ctx_with(&["write:line1.fast.temp01"]).has_admin_scope());
+        assert!(!ctx_with(&[]).has_admin_scope());
+    }
+
+    /// admin は read/write と直交 - admin だけを持つキーはデータの
+    /// 読み書きを一切許可しない（このモジュールの doc comment
+    /// 「スコープ構文検証」参照）。
+    #[test]
+    fn admin_only_key_has_no_read_or_write_access() {
+        let ctx = ctx_with(&["admin"]);
+        assert!(!ctx.has_any_read());
+        assert!(!ctx.can_read_value("line1.fast.temp01"));
+        assert!(!ctx.has_write_scope("line1.fast.temp01"));
     }
 
     // --- T2-4: trip/clear_trip/lookup ordering -----------------------------
