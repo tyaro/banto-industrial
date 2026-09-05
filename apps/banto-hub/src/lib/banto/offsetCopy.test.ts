@@ -268,6 +268,22 @@ describe('buildOffsetCopyRows', () => {
 			expect.objectContaining({ sourceId: 16, name: 'pressure2', address: 'D3101' })
 		]);
 	});
+
+	it('string タグをコピーすると source の stringEncoding をそのまま引き継ぐ', () => {
+		const source = makeTag({
+			id: 20,
+			name: 'strTag',
+			address: 'D4000',
+			dataType: 'string',
+			stringLength: 16,
+			stringEncoding: 'shift_jis'
+		});
+		// stringLength=16 の source は D4000-D4015 を占有するため、オフセットは
+		// 重ならない先(+20)にする。
+		const result = buildOffsetCopyRows([source], 20, [source]);
+		expect(result.errors).toEqual([]);
+		expect(result.rows[0].stringEncoding).toBe('shift_jis');
+	});
 });
 
 describe('offsetCopyRowsToTagInputs', () => {
@@ -318,5 +334,26 @@ describe('offsetCopyRowsToTagInputs', () => {
 				writable: true
 			}
 		]);
+	});
+
+	it('string タグの stringEncoding をそのまま引き継ぐ', () => {
+		const rows: OffsetCopyRow[] = [
+			{
+				sourceId: 1,
+				sourceName: 'str01',
+				sourceAddress: 'D3000',
+				name: 'str02',
+				address: 'D3100',
+				collectionGroupId: 10,
+				dataType: 'string',
+				stringLength: 16,
+				stringEncoding: 'shift_jis',
+				decimals: 0,
+				enabled: true,
+				writable: false
+			}
+		];
+		const inputs = offsetCopyRowsToTagInputs(rows);
+		expect(inputs[0].stringEncoding).toBe('shift_jis');
 	});
 });

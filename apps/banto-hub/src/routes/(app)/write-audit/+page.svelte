@@ -117,7 +117,7 @@
 							<td>{row.ts}</td>
 							<td>{row.apiKeyNameSnapshot}</td>
 							<td class="tag-name">{row.externalNameSnapshot}</td>
-							<td class="value">{row.valueRequested ?? '-'}</td>
+							<td class="value">{row.valueRequested ?? row.valueRequestedText ?? '-'}</td>
 							<td>{actionLabel(row.action)}</td>
 							<td class:alert={isAlertResult(row.result)}>{resultLabel(row.result)}</td>
 						</tr>
@@ -143,7 +143,7 @@
 				<dt>タグ</dt>
 				<dd>{selected.externalNameSnapshot}（ID: {selected.tagId}）</dd>
 				<dt>要求値</dt>
-				<dd>{selected.valueRequested ?? '-'}</dd>
+				<dd>{selected.valueRequested ?? selected.valueRequestedText ?? '-'}</dd>
 				<dt>アクション</dt>
 				<dd>{actionLabel(selected.action)}</dd>
 				<dt>結果</dt>

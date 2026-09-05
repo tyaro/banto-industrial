@@ -16,7 +16,7 @@
  * （vitest、`tagFormNumeric.test.ts` と同じ describe/it スタイル。
  * TAG-P0-1、2026-08-09 に追加）。
  */
-import type { TagDataType, TagInput } from './tagRegistryAdmin';
+import type { StringEncoding, TagDataType, TagInput } from './tagRegistryAdmin';
 import { parseOptionalNumber, toOptionalNumberOrNull } from './tagFormNumeric';
 import { formatSlmpAddress, MAX_DEVICE_NUMBER, parseSlmpAddress } from './slmpDeviceTable';
 
@@ -129,6 +129,8 @@ export interface ContinuousRegistrationCommon {
 	collectionGroupId: number;
 	dataType: TagDataType;
 	stringLength?: number | null;
+	/** T20 ①a-UI: `dataType === 'string'` のときのみ意味を持つ。既定 `'utf8'`。 */
+	stringEncoding?: StringEncoding | null;
 	unit?: string | null;
 	decimals: number;
 	rawLo?: number | null;
@@ -183,6 +185,8 @@ export interface ContinuousFormState {
 	count: string | number | null;
 	dataType: TagDataType;
 	stringLength: string | number | null;
+	/** select 由来のため常に `string`（{@link StringEncoding}）を保つ。 */
+	stringEncoding: StringEncoding;
 	unit: string;
 	decimals: string | number | null;
 	rawLo: string | number | null;
@@ -379,6 +383,7 @@ export function generateContinuousTags(
 		address: row.address,
 		dataType: params.dataType,
 		stringLength: params.dataType === 'string' ? params.stringLength : undefined,
+		stringEncoding: params.dataType === 'string' ? (params.stringEncoding ?? undefined) : undefined,
 		rawLo: params.rawLo,
 		rawHi: params.rawHi,
 		engLo: params.engLo,
@@ -434,6 +439,7 @@ export function buildContinuousParams(
 		count,
 		dataType: form.dataType,
 		stringLength: form.dataType === 'string' ? toOptionalNumberOrNull(form.stringLength) : null,
+		stringEncoding: form.dataType === 'string' ? form.stringEncoding : null,
 		unit: form.unit === '' ? undefined : form.unit,
 		decimals: parseOptionalNumber(form.decimals) ?? 0,
 		rawLo: toOptionalNumberOrNull(form.rawLo),

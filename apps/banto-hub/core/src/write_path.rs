@@ -105,24 +105,19 @@
 //! `banto_tags::Tag::string_encoding`(既定 UTF-8、タグ単位で Shift-JIS も
 //! 選択可)から決まる - `banto-plc-write`の`StringEncoding`参照。
 //!
-//! **気づいた設計上の問題(監査の文字列 value 表現、率直な報告)**:
-//! `hub_write_audit.value_requested` は `REAL` 列で文字列を持てない。この
-//! スライスでは [`RequestedValue::as_audit_value`]/[`ConvertedValue::as_audit_value`]
-//! が文字列書き込みに対して常に `None`(NULL)を返す方針を採った - つまり
-//! **文字列書き込みの実際のテキストは、成功・失敗いずれの場合も
-//! `hub_write_audit` に一切残らない**(action/result/tag_id/api_key 等の
-//! メタデータは通常どおり記録される)。理由: `WriteAuditRow::detail` は
-//! `insert_pending` → `set_result` の2段階で最終的に `set_result` の引数
-//! (失敗理由、成功時は `None`)で必ず上書きされる仕組み(`write_audit.rs`の
-//! モジュール doc comment参照)のため、`insert_pending` 時点で `detail` へ
-//! 文字列テキストを仮置きしても成功時に消えてしまう。テキストを保持したい
-//! なら「成功時の `detail`」の意味を数値タグと非対称に変える(文字列タグの
-//! 成功時だけ `detail` にテキストを残す)か、専用列を追加するかの設計判断が
-//! 必要で、このスライスの範囲では見送った(オーナー確認事項として報告)。
-//! relay-wright の文字列監査(`apps/relay-wright/core/src/engine/monitor.rs`
-//! の `string_write_detail`)は独自の JSON detail 列を持ち、この制約を
-//! 免れている - hub の `hub_write_audit` スキーマを同じ形に広げるのは
-//! 本スライスの scope 外。
+//! **監査の文字列 value 表現(T20 宿題#1、解消済み)**:
+//! `hub_write_audit.value_requested` は `REAL` 列で文字列を持てないため、
+//! [`RequestedValue::as_audit_value`]/[`ConvertedValue::as_audit_value`] は
+//! 文字列書き込みに対して常に `None`(NULL)を返す(`detail` 列は
+//! `insert_pending` → `set_result` の2段階で `set_result` の引数に必ず
+//! 上書きされる仕組みのため、仮置きしても成功時に消える - `write_audit.rs`
+//! のモジュール doc comment参照)。当初はこの制約により文字列書き込みの
+//! テキストが監査に一切残らなかったが、専用列 `hub_write_audit.value_requested_text`
+//! (`db.rs::apply_app_schema` の `ALTER TABLE ADD COLUMN`)を追加し、
+//! [`RequestedValue::as_audit_text`]/[`ConvertedValue::as_audit_text`] が
+//! そのテキストを `WriteAuditRow::with_value_requested_text` 経由で
+//! `insert_pending`/`insert_row` 時点に書き込むことで解消した(`set_result`
+//! は `value_requested_text` に触れないので、後段の更新で消えない)。
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -206,6 +201,16 @@ impl RequestedValue {
             other => Some(other.as_f64()),
         }
     }
+
+    /// T20 宿題#1: [`Self::as_audit_value`] が `None` を返す文字列書き込み
+    /// について、監査行の `value_requested_text` 列へ残すテキストを返す
+    /// (`Num`/`Bool` は数値列に記録済みなので `None`)。
+    fn as_audit_text(&self) -> Option<String> {
+        match self {
+            RequestedValue::Str(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
 }
 
 /// gate 7([`convert_value`])の出力: エンジニアリング値の型。数値/bit タグは
@@ -232,6 +237,15 @@ impl ConvertedValue {
         match self {
             ConvertedValue::Numeric(_, v) => Some(*v),
             ConvertedValue::Str(_) => None,
+        }
+    }
+
+    /// [`RequestedValue::as_audit_text`] の gate 7 後版。`Numeric` は数値列に
+    /// 記録済みなので `None`。
+    fn as_audit_text(&self) -> Option<String> {
+        match self {
+            ConvertedValue::Numeric(_, _) => None,
+            ConvertedValue::Str(s) => Some(s.clone()),
         }
     }
 }
@@ -655,7 +669,8 @@ pub async fn execute_write(
             WriteAuditAction::Write,
             WriteAuditResult::SuppressedDisabled,
         )
-        .with_value_requested_opt(resolved.requested.as_audit_value());
+        .with_value_requested_opt(resolved.requested.as_audit_value())
+        .with_value_requested_text(resolved.requested.as_audit_text());
         if let Err(err) = deps.write_audit.insert_row(&row).await {
             eprintln!("banto-hub: 書き込み監査(suppressed_disabled)の記録に失敗しました: {err}");
         }
@@ -686,6 +701,7 @@ pub async fn execute_write(
             WriteAuditResult::SuppressedRateLimited,
         )
         .with_value_requested_opt(resolved.requested.as_audit_value())
+        .with_value_requested_text(resolved.requested.as_audit_text())
         .with_detail(detail);
         if let Err(err) = deps.write_audit.insert_row(&row).await {
             eprintln!("banto-hub: 書き込み監査(rate_limit_tripped)の記録に失敗しました: {err}");
@@ -726,7 +742,8 @@ pub async fn execute_write(
         WriteAuditAction::Write,
         WriteAuditResult::Ok,
     )
-    .with_value_requested_opt(converted.as_audit_value());
+    .with_value_requested_opt(converted.as_audit_value())
+    .with_value_requested_text(converted.as_audit_text());
     let audit_id = match deps.write_audit.insert_pending(&pending_row).await {
         Ok(id) => id,
         Err(err) => {
@@ -954,7 +971,8 @@ pub async fn execute_write_batch(
                 WriteAuditAction::Write,
                 WriteAuditResult::SuppressedDisabled,
             )
-            .with_value_requested_opt(p.value.as_audit_value());
+            .with_value_requested_opt(p.value.as_audit_value())
+            .with_value_requested_text(p.value.as_audit_text());
             if let Err(err) = deps.write_audit.insert_row(&row).await {
                 eprintln!(
                     "banto-hub: 書き込み監査(suppressed_disabled、バッチ)の記録に失敗しました: {err}"
@@ -1000,6 +1018,7 @@ pub async fn execute_write_batch(
                 WriteAuditResult::SuppressedRateLimited,
             )
             .with_value_requested_opt(p.value.as_audit_value())
+            .with_value_requested_text(p.value.as_audit_text())
             .with_detail(detail.clone());
             if let Err(err) = deps.write_audit.insert_row(&row).await {
                 eprintln!(
@@ -1153,7 +1172,8 @@ pub async fn execute_write_batch(
                 WriteAuditAction::Write,
                 WriteAuditResult::Ok,
             )
-            .with_value_requested_opt(p.value.as_audit_value());
+            .with_value_requested_opt(p.value.as_audit_value())
+            .with_value_requested_text(p.value.as_audit_text());
             match deps.write_audit.insert_pending(&pending_row).await {
                 Ok(audit_id) => {
                     // record は単票と同じタイミング: insert_pending 成功
@@ -1707,5 +1727,35 @@ mod tests {
             rejection.to_json(),
             json!({"error": "simulation_write_rejected"})
         );
+    }
+
+    /// T20 宿題#1: `RequestedValue::Str` は `value_requested`(REAL列)向けの
+    /// `as_audit_value` では `None` のままだが、新設した `as_audit_text` は
+    /// テキストをそのまま返す(`Num`/`Bool` はその逆)。
+    #[test]
+    fn requested_value_str_has_no_audit_f64_but_has_audit_text() {
+        let requested = RequestedValue::Str("recipe-A".to_string());
+        assert_eq!(requested.as_audit_value(), None);
+        assert_eq!(requested.as_audit_text(), Some("recipe-A".to_string()));
+
+        let num = RequestedValue::Num(1.5);
+        assert_eq!(num.as_audit_value(), Some(1.5));
+        assert_eq!(num.as_audit_text(), None);
+
+        let boolean = RequestedValue::Bool(true);
+        assert_eq!(boolean.as_audit_value(), Some(1.0));
+        assert_eq!(boolean.as_audit_text(), None);
+    }
+
+    /// [`ConvertedValue`] 側(gate 7 通過後)も同じ非対称性を持つことの確認。
+    #[test]
+    fn converted_value_str_has_no_audit_f64_but_has_audit_text() {
+        let converted = ConvertedValue::Str("recipe-A".to_string());
+        assert_eq!(converted.as_audit_value(), None);
+        assert_eq!(converted.as_audit_text(), Some("recipe-A".to_string()));
+
+        let numeric = ConvertedValue::Numeric(DataType::F32, 1.5);
+        assert_eq!(numeric.as_audit_value(), Some(1.5));
+        assert_eq!(numeric.as_audit_text(), None);
     }
 }

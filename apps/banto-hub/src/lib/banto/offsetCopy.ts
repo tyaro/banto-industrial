@@ -56,7 +56,7 @@
  * 本実装ではこの分岐を特別に禁止しない（`incrementAddress` の既存の
  * 意味論をそのまま踏襲する）。
  */
-import type { Tag, TagDataType, TagInput } from './tagRegistryAdmin';
+import type { StringEncoding, Tag, TagDataType, TagInput } from './tagRegistryAdmin';
 import { addressIncrement, incrementAddress } from './continuousRegistration';
 import { detectStructAddressCollisions, type StructAllocatedRow } from './structRegistration';
 import { formatSlmpAddress, parseSlmpAddress } from './slmpDeviceTable';
@@ -159,6 +159,7 @@ export interface OffsetCopyRow {
 	collectionGroupId: number;
 	dataType: TagDataType;
 	stringLength?: number | null;
+	stringEncoding?: StringEncoding | null;
 	unit?: string | null;
 	decimals: number;
 	rawLo?: number | null;
@@ -268,6 +269,7 @@ export function buildOffsetCopyRows(
 			collectionGroupId: source.collectionGroupId,
 			dataType: source.dataType,
 			stringLength: source.dataType === 'string' ? source.stringLength : undefined,
+			stringEncoding: source.dataType === 'string' ? source.stringEncoding : undefined,
 			unit: source.unit,
 			decimals: source.decimals,
 			rawLo: source.rawLo,
@@ -333,6 +335,7 @@ export function offsetCopyRowsToTagInputs(rows: OffsetCopyRow[]): TagInput[] {
 		address: row.address,
 		dataType: row.dataType,
 		stringLength: row.stringLength,
+		stringEncoding: row.stringEncoding ?? undefined,
 		unit: row.unit,
 		decimals: row.decimals,
 		rawLo: row.rawLo,

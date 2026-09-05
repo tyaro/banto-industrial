@@ -22,6 +22,7 @@ export interface WriteAuditEntry {
 	tagId: number;
 	externalNameSnapshot: string;
 	valueRequested: number | null;
+	valueRequestedText: string | null;
 	action: 'write' | 'rate_limit_tripped' | string;
 	result: 'ok' | 'failed' | 'suppressed_disabled' | 'suppressed_rate_limited' | string;
 	detail: string | null;

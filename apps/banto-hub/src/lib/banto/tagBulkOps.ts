@@ -36,6 +36,7 @@ function tagToInput(tag: Tag): TagInput {
 		address: tag.address,
 		dataType: tag.dataType,
 		stringLength: tag.stringLength,
+		stringEncoding: tag.stringEncoding,
 		rawLo: tag.rawLo,
 		rawHi: tag.rawHi,
 		engLo: tag.engLo,

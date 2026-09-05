@@ -160,6 +160,7 @@ describe('configPackage', () => {
 				address: 'D100',
 				dataType: 'i16',
 				stringLength: null,
+				stringEncoding: 'utf8',
 				rawLo: null,
 				rawHi: null,
 				engLo: null,
@@ -182,6 +183,7 @@ describe('configPackage', () => {
 				address: '',
 				dataType: 'i16',
 				stringLength: null,
+				stringEncoding: 'utf8',
 				rawLo: null,
 				rawHi: null,
 				engLo: null,
@@ -293,6 +295,47 @@ describe('configPackage', () => {
 		};
 		expect(() => parseConfigPackage(JSON.stringify(withBadDefaultWritable))).toThrow(
 			/defaultWritable/
+		);
+	});
+
+	// --- stringEncoding は既存のタグ登録経路には存在するが config package の
+	// バックアップ/復元だけ未対応だった潜在バグの修正（2026-09-05）:
+	// shift_jis のタグをバックアップ→復元すると暗黙的に utf8 へ戻ってしまう
+	// データ損失を防ぐ。stringLength と同じ後方互換方針（省略時は utf8 既定）
+	// を適用する。
+
+	it('shift_jis の stringEncoding を持つタグが往復できる', () => {
+		const pkg = buildConfigPackage({
+			plcConnections: [BASE_CONNECTION],
+			collectionGroups: [BASE_GROUP],
+			tags: [{ ...BASE_TAG, stringEncoding: 'shift_jis' }],
+			mqtt: MQTT,
+			grpc: GRPC,
+			exportedAt: '2026-08-11T00:00:00.000Z'
+		});
+		expect(pkg.tags[0].stringEncoding).toBe('shift_jis');
+		const parsed = parseConfigPackage(serializeConfigPackage(pkg));
+		expect(parsed.tags[0].stringEncoding).toBe('shift_jis');
+	});
+
+	it('parseConfigPackage は stringEncoding を持たない旧パッケージを utf8 既定で受け入れる', () => {
+		const pkg = makePackage();
+		const withoutStringEncoding = {
+			...pkg,
+			tags: pkg.tags.map(({ stringEncoding: _stringEncoding, ...rest }) => rest)
+		};
+		const parsed = parseConfigPackage(JSON.stringify(withoutStringEncoding));
+		expect(parsed.tags[0].stringEncoding).toBe('utf8');
+	});
+
+	it('parseConfigPackage は不正な stringEncoding を拒否する', () => {
+		const pkg = makePackage();
+		const withBadStringEncoding = {
+			...pkg,
+			tags: pkg.tags.map((t) => ({ ...t, stringEncoding: 'euc' }))
+		};
+		expect(() => parseConfigPackage(JSON.stringify(withBadStringEncoding))).toThrow(
+			/stringEncoding/
 		);
 	});
 

@@ -127,6 +127,7 @@ const DEFAULT_ROW: CsvRowFields = {
 	address: 'D100',
 	dataType: 'i16',
 	stringLength: '',
+	stringEncoding: '',
 	unit: '',
 	decimals: '',
 	rawLo: '',
@@ -421,8 +422,8 @@ describe('serializeCsv', () => {
 // ==============================================================================
 
 describe('TAG_CSV_COLUMNS', () => {
-	it('21 列である', () => {
-		expect(TAG_CSV_COLUMNS.length).toBe(21);
+	it('22 列である', () => {
+		expect(TAG_CSV_COLUMNS.length).toBe(22);
 	});
 
 	it('列順のスナップショット', () => {
@@ -433,6 +434,7 @@ describe('TAG_CSV_COLUMNS', () => {
 			'address',
 			'dataType',
 			'stringLength',
+			'stringEncoding',
 			'unit',
 			'decimals',
 			'rawLo',
@@ -593,6 +595,7 @@ describe('exportTagsCsv', () => {
 				address: 'D200',
 				dataType: 'f32',
 				stringLength: undefined,
+				stringEncoding: undefined,
 				rawLo: 0,
 				rawHi: 4095,
 				engLo: -10.5,
@@ -619,12 +622,14 @@ describe('exportTagsCsv', () => {
 				address: 'D300',
 				dataType: 'string',
 				stringLength: 16,
+				stringEncoding: 'shift_jis',
 				decimals: 0
 			});
 			const csv = exportTagsCsv([tag], CONNECTIONS, GROUPS);
 			const rows = expectOk(parseTagsCsv(csv, CONNECTIONS, GROUPS));
 			expect(rows[0].tag.dataType).toBe('string');
 			expect(rows[0].tag.stringLength).toBe(16);
+			expect(rows[0].tag.stringEncoding).toBe('shift_jis');
 		});
 
 		it('computed タグ(address/writable が強制される)', () => {
@@ -748,6 +753,7 @@ describe('parseTagsCsv', () => {
 					address: 'D100',
 					dataType: 'i16',
 					stringLength: undefined,
+					stringEncoding: undefined,
 					rawLo: undefined,
 					rawHi: undefined,
 					engLo: undefined,
@@ -948,6 +954,47 @@ describe('parseTagsCsv', () => {
 			const text = buildCsv([row({ dataType: 'i16', stringLength: 'garbage' })]);
 			const rows = expectOk(parseTagsCsv(text, CONNECTIONS, GROUPS));
 			expect(rows[0].tag.stringLength).toBeUndefined();
+		});
+	});
+
+	describe('stringEncoding', () => {
+		it('dataType=string で空欄 -> 既定値 utf8 になる', () => {
+			const text = buildCsv([row({ dataType: 'string', stringLength: '8', stringEncoding: '' })]);
+			const rows = expectOk(parseTagsCsv(text, CONNECTIONS, GROUPS));
+			expect(rows[0].tag.stringEncoding).toBe('utf8');
+		});
+
+		it('dataType=string で "utf8" -> 受理される', () => {
+			const text = buildCsv([
+				row({ dataType: 'string', stringLength: '8', stringEncoding: 'utf8' })
+			]);
+			const rows = expectOk(parseTagsCsv(text, CONNECTIONS, GROUPS));
+			expect(rows[0].tag.stringEncoding).toBe('utf8');
+		});
+
+		it('dataType=string で "shift_jis" -> 受理される', () => {
+			const text = buildCsv([
+				row({ dataType: 'string', stringLength: '8', stringEncoding: 'shift_jis' })
+			]);
+			const rows = expectOk(parseTagsCsv(text, CONNECTIONS, GROUPS));
+			expect(rows[0].tag.stringEncoding).toBe('shift_jis');
+		});
+
+		it('dataType=string で不正な値 -> エラー', () => {
+			const text = buildCsv([
+				row({ dataType: 'string', stringLength: '8', stringEncoding: 'euc-jp' })
+			]);
+			const errors = expectErr(parseTagsCsv(text, CONNECTIONS, GROUPS));
+			expect(errors).toContainEqual({
+				lineNumber: 2,
+				message: 'stringEncoding は utf8 または shift_jis のいずれかです。'
+			});
+		});
+
+		it('dataType が string 以外の場合は列内容にかかわらず undefined になる', () => {
+			const text = buildCsv([row({ dataType: 'i16', stringEncoding: 'shift_jis' })]);
+			const rows = expectOk(parseTagsCsv(text, CONNECTIONS, GROUPS));
+			expect(rows[0].tag.stringEncoding).toBeUndefined();
 		});
 	});
 

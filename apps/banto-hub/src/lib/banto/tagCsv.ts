@@ -22,6 +22,7 @@
 import type {
 	CollectionGroup,
 	PlcConnection,
+	StringEncoding,
 	Tag,
 	TagDataType,
 	TagInput,
@@ -151,6 +152,7 @@ export const TAG_CSV_COLUMNS = [
 	'address',
 	'dataType',
 	'stringLength',
+	'stringEncoding',
 	'unit',
 	'decimals',
 	'rawLo',
@@ -201,6 +203,7 @@ export function exportTagsCsv(
 			t.address,
 			t.dataType,
 			numCell(t.stringLength),
+			t.stringEncoding,
 			t.unit ?? '',
 			String(t.decimals),
 			numCell(t.rawLo),
@@ -388,6 +391,19 @@ export function parseTagsCsv(
 		}
 		// string 以外では stringLength 列の内容は無視する（送信しない）。
 
+		let stringEncoding: StringEncoding | undefined;
+		if (dataType === 'string') {
+			const seRaw = col('stringEncoding');
+			if (seRaw === '') {
+				stringEncoding = 'utf8';
+			} else if (seRaw === 'utf8' || seRaw === 'shift_jis') {
+				stringEncoding = seRaw;
+			} else {
+				rowErrors.push('stringEncoding は utf8 または shift_jis のいずれかです。');
+			}
+		}
+		// string 以外では stringEncoding 列の内容は無視する（送信しない）。
+
 		const decimalsRaw = col('decimals');
 		let decimals = 0;
 		if (decimalsRaw !== '') {
@@ -456,6 +472,7 @@ export function parseTagsCsv(
 			address,
 			dataType,
 			stringLength: dataType === 'string' ? stringLength : undefined,
+			stringEncoding: dataType === 'string' ? stringEncoding : undefined,
 			rawLo,
 			rawHi,
 			engLo,

@@ -1,7 +1,7 @@
 # banto-hub T20 設計: 文字列・構造体登録・レシピ・ビットデバイス
 
 作成日: 2026-09-04
-状態: **T20 全機能完了（2026-09-05）**: ④ ワードデバイスのビット16進＋レジスタ・ダイアレクト抽象 / ② 構造体タグ登録＋オフセットコピー / ③ レシピ一括書き込み（REST＋MCP・UI は不採用） / ① 文字列 read/write（案A・分離経路: write＝write_path、read＝read-on-demand）。オーナー決定は §2、設計判断は §3・§8、調査結果は §7。
+状態: **T20 全機能完了（2026-09-05）**: ④ ワードデバイスのビット16進＋レジスタ・ダイアレクト抽象 / ② 構造体タグ登録＋オフセットコピー / ③ レシピ一括書き込み（REST＋MCP・UI は不採用） / ① 文字列 read/write（案A・分離経路: write＝write_path、read＝read-on-demand）。オーナー決定は §2、設計判断は §3・§8、調査結果は §7。①完了時の小さな宿題（監査テキスト保持・エンコ選択 UI・config 往復・read-on-demand 監査の方針）は 2026-09-05 に片付け済み（§3.1 末尾）。
 対象: 4つの新機能（①文字列 read/write、②構造体タグ登録＋オフセットコピー、③レシピ一括書き込み、④ワードデバイスのビット `.0〜.F`）
 
 関連: [tag-server-design.md](tag-server-design.md)（タグ空間・書き込み安全の一次ソース）、[banto-hub-t19-design.md](banto-hub-t19-design.md)（直前の UI/UX 群）、[banto-tagclient-design.md](banto-tagclient-design.md) §4.4（③が覆す旧決定）。
@@ -79,10 +79,8 @@ relay-wright の2箇所は `ShiftJis` を明示して**挙動保全**（Shift-JI
 banto-tags に migration 0013 で `string_encoding` 列（既定 utf8・CHECK）を追加し `Tag`/`TagInput`
 へ配線。write_path は `RequestedValue::Str` を追加、gate 7（`convert_value`）が string タグに文字列
 のみ受け入れ（型対称）、`build_plc_string_write_request` で `BatchWriteRequest::String` を組み立て
-（単票・バッチ・MCP が自動対応）。監査 `value_requested`(REAL) は文字列では NULL（既知の限界＝
-文字列テキストは監査に残らない。将来スキーマ拡張が要る、と記録）。UTF-8/Shift-JIS が実機
-シミュレータのワイヤに正しいバイトで届くことをテスト固定。エンコーディング選択の登録 UI は
-①a では未追加（API/MCP で設定可。UI は任意）。
+（単票・バッチ・MCP が自動対応）。監査 `value_requested`(REAL) は文字列では NULL だが、**宿題#1（2026-09-05）で専用列 `value_requested_text`（`db.rs` の後追い ADD COLUMN・冪等）を追加し、文字列書き込みのテキストを監査に残すよう解消**（`RequestedValue`/`ConvertedValue::as_audit_text` 経由で全6監査サイトに配線・`set_result` 非干渉・write-audit UI にも表示）。UTF-8/Shift-JIS が実機
+シミュレータのワイヤに正しいバイトで届くことをテスト固定。エンコーディング選択の登録 UI は**宿題#2（2026-09-05）で全登録経路（単票・連続・構造体・CSV）＋設定バックアップ/復元に追加**（併せて `tagCellEdit`/`tagBulkOps` の暗黙 utf8 リセット・`tagCsvDiff` の変更誤判定・`configPackage` 往復欠落の潜在バグも修正）。
 
 **①b（文字列 read-on-demand）: 完了（2026-09-05）。** current_values/tstore を経由せず PLC から
 直接その場読みする経路。`StringEncoding` を banto-plc に移設（write の①a と read で共有、
@@ -93,6 +91,8 @@ banto-plc-write は re-export）、`decode_string_value` がエンコーディ�
 `GET /api/v1/values/{tag}/read-now`（read スコープ・per-tag can_read_value）と MCP `read_tag_now`
 で公開。write→read-now で UTF-8/Shift-JIS が往復すること、collection cache が持たない値を
 read-now が返せること（cache 非経由の証明）をテスト固定。**これで T20 完了。**
+
+**宿題（2026-09-05・完了）**: ①完了時に残した小さな限界を片付けた — (1) 監査の文字列テキスト保持（宿題#1、上記）、(2) エンコーディング選択の登録 UI ＋ config 往復（宿題#2、上記）、(3) read-on-demand の監査は**意図的に残さない**（`GET .../read-now`・MCP `read_tag_now`）: `hub_write_audit` は「書き込み（変更）」の記録であり、collection cache 読みを含め読み取りは元々監査対象外＝一貫した設計。読み取りアクセスログが要る場合は別機能として設計する。
 
 ### 3.2 ②構造体タグ登録（デバイス自動割付・手動割付・オフセットコピー）
 

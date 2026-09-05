@@ -234,6 +234,15 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
         .await
         .map_err(banto_storage::storage_error)?;
 
+    // T20-HW1（宿題#1）: `value_requested` は REAL 専用のため文字列書き込み
+    // （`RequestedValue::Str`/`ConvertedValue::Str`）では NULL のままになり、
+    // 「何を書いたか」が監査に残らない。そのテキストを別列に残す。
+    // `hub_write_audit` は本モジュールで既に `CREATE TABLE IF NOT EXISTS`
+    // 済みのため、`tripped_at`/`expires_at`/`base_fingerprint` と同じ理由で
+    // `add_column_if_missing` の後追い ADD COLUMN にする(新規 DB では次回の
+    // `CREATE TABLE` 定義更新までは無関係 - 既存 DB への非破壊追加)。
+    add_column_if_missing(pool, "hub_write_audit", "value_requested_text", "TEXT").await?;
+
     // T6-2 (docs/tag-server-design.md §4.2「retain フラグで再起動時の最終値
     // 復元」): `retain = true` の内部タグの最終値。`tag_id` を主キーにする
     // （`crate::computed::ServerTagStore`のキー`"tag:{id}"`と同じidを使う -

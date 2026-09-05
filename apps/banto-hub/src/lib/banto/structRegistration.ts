@@ -15,7 +15,7 @@
  * してある。単体テストは `structRegistration.test.ts`
  * （vitest、`continuousRegistration.test.ts` と同じ describe/it スタイル）。
  */
-import type { TagDataType, TagInput } from './tagRegistryAdmin';
+import type { StringEncoding, TagDataType, TagInput } from './tagRegistryAdmin';
 import { addressIncrement, incrementAddress } from './continuousRegistration';
 import { parseSlmpAddress } from './slmpDeviceTable';
 
@@ -24,6 +24,8 @@ export interface StructField {
 	name: string;
 	dataType: TagDataType;
 	stringLength?: number | null;
+	/** `dataType === 'string'` のときのみ意味を持つ。既定 `'utf8'`。 */
+	stringEncoding?: StringEncoding | null;
 	/** 手動割付モードでのみ参照する。自動割付モードでは無視される。 */
 	address?: string;
 }
@@ -40,6 +42,7 @@ export interface StructAllocatedRow {
 	address: string;
 	dataType: TagDataType;
 	stringLength?: number | null;
+	stringEncoding?: StringEncoding | null;
 	words: number;
 }
 
@@ -117,6 +120,7 @@ export function allocateStructFields(
 			address,
 			dataType: field.dataType,
 			stringLength: field.dataType === 'string' ? field.stringLength : undefined,
+			stringEncoding: field.dataType === 'string' ? field.stringEncoding : undefined,
 			words
 		});
 		cumulativeWords += words;
@@ -149,6 +153,7 @@ export function manualStructRows(fields: StructField[]): StructAllocationResult 
 			address,
 			dataType: field.dataType,
 			stringLength: field.dataType === 'string' ? field.stringLength : undefined,
+			stringEncoding: field.dataType === 'string' ? field.stringEncoding : undefined,
 			words: addressIncrement(field.dataType, field.stringLength)
 		});
 	}
@@ -328,6 +333,7 @@ export function structRowsToTagInputs(
 		address: row.address,
 		dataType: row.dataType,
 		stringLength: row.dataType === 'string' ? row.stringLength : undefined,
+		stringEncoding: row.dataType === 'string' ? (row.stringEncoding ?? undefined) : undefined,
 		decimals: 0,
 		enabled: common.enabled,
 		writable: common.writable
