@@ -21,6 +21,7 @@ function makeTag(overrides: Partial<Tag> = {}): Tag {
 		address: 'D100',
 		dataType: 'f32',
 		stringLength: null,
+		stringEncoding: 'utf8',
 		rawLo: 0,
 		rawHi: 100,
 		engLo: 0,

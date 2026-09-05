@@ -19,6 +19,7 @@ function makeTag(overrides: Partial<Tag> & Pick<Tag, 'id' | 'name' | 'address'>)
 		collectionGroupId: 1,
 		dataType: 'i16',
 		stringLength: null,
+		stringEncoding: 'utf8',
 		rawLo: null,
 		rawHi: null,
 		engLo: null,

@@ -112,6 +112,7 @@ fn tag_input(
         address: address.to_string(),
         data_type: data_type.to_string(),
         string_length: None,
+        string_encoding: "utf8".to_string(),
         raw_lo: None,
         raw_hi: None,
         eng_lo: None,
@@ -143,6 +144,7 @@ fn internal_tag_input(name: &str, group_id: i64, data_type: &str) -> TagInput {
         address: String::new(),
         data_type: data_type.to_string(),
         string_length: None,
+        string_encoding: "utf8".to_string(),
         raw_lo: None,
         raw_hi: None,
         eng_lo: None,
@@ -400,6 +402,31 @@ async fn create_tag(
         .create(tag_input(
             tag_name, group_id, address, data_type, writable, enabled,
         ))
+        .await
+        .unwrap();
+    app.manager.rebuild().await.expect("rebuild");
+    (tag.id, format!("{conn_name}.{group_name}.{tag_name}"))
+}
+
+/// [`create_tag`]の string タグ版(T20 ①a、docs/banto-hub-t20-design.md
+/// §3.1)。`writable`/`enabled`は常に true。
+#[allow(clippy::too_many_arguments)]
+async fn create_string_tag(
+    app: &TestApp,
+    conn_name: &str,
+    group_id: i64,
+    group_name: &str,
+    tag_name: &str,
+    address: &str,
+    string_length: i64,
+    string_encoding: &str,
+) -> (i64, String) {
+    let tag = TagService::new(app.pool.clone())
+        .create(TagInput {
+            string_length: Some(string_length),
+            string_encoding: string_encoding.to_string(),
+            ..tag_input(tag_name, group_id, address, "string", true, true)
+        })
         .await
         .unwrap();
     app.manager.rebuild().await.expect("rebuild");
@@ -1230,4 +1257,79 @@ async fn record_only_happens_for_entries_that_actually_reach_insert_pending() {
     .await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body:?}");
     assert_eq!(body["error"], "rate_limited");
+}
+
+// ---------------------------------------------------------------------------
+// T20 ①a (docs/banto-hub-t20-design.md §3.1): a recipe batch mixing numeric
+// and string tags on the same connection - one `handle.write` job carries
+// both `BatchWriteRequest::Numeric` and `BatchWriteRequest::String` entries,
+// and both land on the simulator's wire correctly.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batch_mixing_a_string_tag_and_a_numeric_tag_lands_both_on_the_wire() {
+    let app = test_app("mixed-string-numeric-batch").await;
+    let sim = Simulator::start().await;
+
+    let (group_id, group_name) = setup_connection(&app, "line1", sim.addr.port()).await;
+    let (_tag_num, name_num) = create_tag(
+        &app,
+        "line1",
+        group_id,
+        &group_name,
+        "temp01",
+        "D100",
+        "u16",
+        true,
+        true,
+    )
+    .await;
+    let (_tag_str, name_str) = create_string_tag(
+        &app,
+        "line1",
+        group_id,
+        &group_name,
+        "recipe",
+        "D3000",
+        5,
+        "utf8",
+    )
+    .await;
+
+    app.write_control.enable();
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &[&format!("write:{name_num}"), &format!("write:{name_str}")],
+    )
+    .await;
+
+    let (status, body) = v1_post(
+        &app.router,
+        "/api/v1/values/batch",
+        &key,
+        json!({
+            "writes": [
+                { "tag": name_num, "v": 999 },
+                { "tag": name_str, "v": "テスト" },
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let writes = body["writes"].as_array().unwrap();
+    for w in writes {
+        assert_eq!(w["ok"], true, "{w:?}");
+    }
+
+    assert_eq!(sim.get_word(SlmpDevice::D, 100), 999);
+    let landed: Vec<u8> = (0..5)
+        .flat_map(|i| sim.get_word(SlmpDevice::D, 3000 + i).to_le_bytes())
+        .collect();
+    let mut expected = "テスト".as_bytes().to_vec();
+    expected.resize(10, 0x00);
+    assert_eq!(landed, expected);
+
+    sim.stop();
 }

@@ -40,6 +40,19 @@ pub const NUMERIC_DATA_TYPES: &[&str] = &["bit", "i16", "u16", "i32", "u32", "f3
 /// below and any consumer reads as prose.
 pub const STRING_DATA_TYPE: &str = "string";
 
+/// `tags.string_encoding` vocabulary (T20 ①a, docs/banto-hub-t20-design.md
+/// §3.1, 2026-09-04 オーナー決定「文字コードは既定 UTF-8、タグ単位で
+/// Shift-JIS も選択可」) - mirrors the SQL `CHECK` in
+/// `migrations/0013_tags_add_string_encoding.sql`. Meaningful only for
+/// `data_type == "string"` tags; every other tag simply carries the column's
+/// default (`"utf8"`) unused, the same "default-only, never validated
+/// against data_type" treatment as `decimals` on a bit tag.
+pub const ALLOWED_STRING_ENCODINGS: &[&str] = &["utf8", "shift_jis"];
+
+fn default_string_encoding() -> String {
+    "utf8".to_string()
+}
+
 const MAX_NAME_LEN: usize = 100;
 const MIN_DECIMALS: i64 = 0;
 const MAX_DECIMALS: i64 = 6;
@@ -112,6 +125,16 @@ pub struct Tag {
     /// `data_type == "string"`, `None` otherwise - enforced by
     /// [`validate_tag_input`], same all-or-nothing style as scaling.
     pub string_length: Option<i64>,
+    /// T20 ①a (docs/banto-hub-t20-design.md §3.1): character encoding used to
+    /// render this tag's value onto the wire when writing a `"string"` tag
+    /// (`banto_plc_write::StringEncoding` at the write path -
+    /// `apps/banto-hub/core/src/write_path.rs`). One of
+    /// [`ALLOWED_STRING_ENCODINGS`], defaulting to `"utf8"`
+    /// (`migrations/0013_tags_add_string_encoding.sql`). Carried on every tag
+    /// row (not just string ones) the same way `decimals` is - unused by a
+    /// non-string tag, never validated against `data_type` beyond the CHECK's
+    /// own vocabulary.
+    pub string_encoding: String,
     pub raw_lo: Option<f64>,
     pub raw_hi: Option<f64>,
     pub eng_lo: Option<f64>,
@@ -200,6 +223,13 @@ pub struct TagInput {
     pub data_type: String,
     #[serde(default)]
     pub string_length: Option<i64>,
+    /// `#[serde(default = "default_string_encoding")]` (= `"utf8"`): an
+    /// existing API client's payload (written before this field existed)
+    /// still deserializes and creates a UTF-8-encoded tag - the new hub
+    /// default (T20 ①a, 2026-09-04 オーナー決定), same "old payload still
+    /// works" treatment as `writable`/`tag_kind` below.
+    #[serde(default = "default_string_encoding")]
+    pub string_encoding: String,
     #[serde(default)]
     pub raw_lo: Option<f64>,
     #[serde(default)]
@@ -579,6 +609,22 @@ fn validate_tag_input(input: &TagInput) -> Result<ValidatedTag, BantoError> {
     // error rather than silently ignored. The ordinary scaling/threshold
     // validation below is skipped for string tags so a violation surfaces as
     // the one intended message, not twice.
+    // T20 ①a: `string_encoding` vocabulary check applies to every tag (the
+    // column carries a default regardless of `data_type`, same as
+    // `decimals`) - unlike `string_length`, an out-of-vocabulary value is
+    // rejected even on a non-string tag, since the field is always present
+    // with a real value (never `None`) and a typo should not silently sit
+    // unused on a numeric tag.
+    if !ALLOWED_STRING_ENCODINGS.contains(&input.string_encoding.as_str()) {
+        errors.push(FieldError {
+            field: "stringEncoding".to_string(),
+            message: format!(
+                "対応エンコーディングは {} のいずれかです",
+                ALLOWED_STRING_ENCODINGS.join(", ")
+            ),
+        });
+    }
+
     let is_string = input.data_type == STRING_DATA_TYPE;
     if is_string {
         match input.string_length {
@@ -788,6 +834,7 @@ fn column_map() -> ColumnMap {
         .column("address", "address")
         .column("dataType", "data_type")
         .column("stringLength", "string_length")
+        .column("stringEncoding", "string_encoding")
         .column("rawLo", "raw_lo")
         .column("rawHi", "raw_hi")
         .column("engLo", "eng_lo")
@@ -808,7 +855,7 @@ fn column_map() -> ColumnMap {
 
 const RESOURCE: &str = "tags";
 const COLUMNS: &str = "id, name, collection_group_id, address, data_type, string_length, \
-     raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, \
+     string_encoding, raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, \
      threshold_h, threshold_hh, threshold_l, threshold_ll, enabled, \
      writable, tag_kind, expression, retain, revision";
 const FK_MESSAGE: &str = "指定された収集グループが見つかりません";
@@ -829,10 +876,10 @@ fn insert_tag_sql() -> String {
     format!(
         "INSERT INTO tags (\
             name, collection_group_id, address, data_type, string_length, \
-            raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, \
+            string_encoding, raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, \
             threshold_h, threshold_hh, threshold_l, threshold_ll, enabled, \
             writable, tag_kind, expression, retain\
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          RETURNING {COLUMNS}"
     )
 }
@@ -858,7 +905,7 @@ fn update_tag_sql(with_expected_revision: bool) -> String {
     format!(
         "UPDATE tags SET \
             name = ?, collection_group_id = ?, address = ?, data_type = ?, \
-            string_length = ?, raw_lo = ?, raw_hi = ?, eng_lo = ?, eng_hi = ?, unit = ?, decimals = ?, \
+            string_length = ?, string_encoding = ?, raw_lo = ?, raw_hi = ?, eng_lo = ?, eng_hi = ?, unit = ?, decimals = ?, \
             threshold_h = ?, threshold_hh = ?, threshold_l = ?, threshold_ll = ?, enabled = ?, \
             writable = ?, tag_kind = ?, expression = ?, retain = ?, revision = revision + 1 \
          {where_clause} RETURNING {COLUMNS}"
@@ -1101,6 +1148,7 @@ impl TagService {
             .bind(&validated.address)
             .bind(&input.data_type)
             .bind(input.string_length)
+            .bind(&input.string_encoding)
             .bind(input.raw_lo)
             .bind(input.raw_hi)
             .bind(input.eng_lo)
@@ -1146,6 +1194,7 @@ impl TagService {
             .bind(&validated.address)
             .bind(&input.data_type)
             .bind(input.string_length)
+            .bind(&input.string_encoding)
             .bind(input.raw_lo)
             .bind(input.raw_hi)
             .bind(input.eng_lo)
@@ -1205,6 +1254,7 @@ impl TagService {
             .bind(&validated.address)
             .bind(&input.data_type)
             .bind(input.string_length)
+            .bind(&input.string_encoding)
             .bind(input.raw_lo)
             .bind(input.raw_hi)
             .bind(input.eng_lo)
@@ -1297,6 +1347,7 @@ impl TagService {
             .bind(&validated.address)
             .bind(&input.data_type)
             .bind(input.string_length)
+            .bind(&input.string_encoding)
             .bind(input.raw_lo)
             .bind(input.raw_hi)
             .bind(input.eng_lo)
@@ -1588,6 +1639,7 @@ impl TagService {
                 .bind(&value.address)
                 .bind(&input.data_type)
                 .bind(input.string_length)
+                .bind(&input.string_encoding)
                 .bind(input.raw_lo)
                 .bind(input.raw_hi)
                 .bind(input.eng_lo)
@@ -1929,6 +1981,7 @@ impl TagService {
                 .bind(&value.address)
                 .bind(&input.data_type)
                 .bind(input.string_length)
+                .bind(&input.string_encoding)
                 .bind(input.raw_lo)
                 .bind(input.raw_hi)
                 .bind(input.eng_lo)
@@ -2148,6 +2201,7 @@ impl TagService {
                 .bind(&validated.address)
                 .bind(&input.data_type)
                 .bind(input.string_length)
+                .bind(&input.string_encoding)
                 .bind(input.raw_lo)
                 .bind(input.raw_hi)
                 .bind(input.eng_lo)
@@ -2238,6 +2292,7 @@ mod tests {
             address: "40001".to_string(),
             data_type: "i16".to_string(),
             string_length: None,
+            string_encoding: default_string_encoding(),
             raw_lo: None,
             raw_hi: None,
             eng_lo: None,
@@ -2750,6 +2805,140 @@ mod tests {
                 other => panic!("expected Validation for len={len}, got {other:?}"),
             }
         }
+    }
+
+    // --- validation: string_encoding (T20 ①a, docs/banto-hub-t20-design.md
+    // §3.1, migrations/0013_tags_add_string_encoding.sql) ------------------
+
+    /// `sample_input`/`string_input` leave `string_encoding` at its
+    /// `default_string_encoding()` value - a plain create round-trips it as
+    /// `"utf8"`, matching the migration's column default and the 2026-09-04
+    /// オーナー決定「文字コードは既定 UTF-8」.
+    #[tokio::test]
+    async fn create_defaults_string_encoding_to_utf8() {
+        let (svc, group_id) = setup().await;
+        let created = svc
+            .create(string_input("Recipe", group_id, Some(16)))
+            .await
+            .expect("string tag should be accepted");
+        assert_eq!(created.string_encoding, "utf8");
+
+        let fetched = svc.get(created.id).await.expect("get");
+        assert_eq!(fetched.string_encoding, "utf8");
+        let json = serde_json::to_value(&fetched).expect("serialize");
+        assert_eq!(json["stringEncoding"], json!("utf8"));
+    }
+
+    /// A tag can opt into `shift_jis` explicitly (per-tag choice, オーナー
+    /// 決定「タグ単位で Shift-JIS も選択可」) and it round-trips through
+    /// create -> get and through update.
+    #[tokio::test]
+    async fn string_encoding_round_trips_shift_jis_through_create_and_update() {
+        let (svc, group_id) = setup().await;
+        let mut input = string_input("Recipe", group_id, Some(16));
+        input.string_encoding = "shift_jis".to_string();
+        let created = svc
+            .create(input)
+            .await
+            .expect("shift_jis should be accepted");
+        assert_eq!(created.string_encoding, "shift_jis");
+        let fetched = svc.get(created.id).await.expect("get");
+        assert_eq!(fetched.string_encoding, "shift_jis");
+
+        // Update back to utf8.
+        let mut update_input = string_input("Recipe", group_id, Some(16));
+        update_input.string_encoding = "utf8".to_string();
+        let updated = svc
+            .update(created.id, update_input)
+            .await
+            .expect("update back to utf8");
+        assert_eq!(updated.string_encoding, "utf8");
+    }
+
+    /// A non-string (numeric) tag also carries `string_encoding` (the column
+    /// has no `data_type`-conditional NULL - it always has a real value,
+    /// unused by a numeric tag) and it still round-trips its default.
+    #[tokio::test]
+    async fn a_numeric_tag_also_carries_the_default_string_encoding_unused() {
+        let (svc, group_id) = setup().await;
+        let created = svc
+            .create(sample_input("T", group_id))
+            .await
+            .expect("numeric tag should be accepted");
+        assert_eq!(created.data_type, "i16");
+        assert_eq!(created.string_encoding, "utf8");
+    }
+
+    /// [`ALLOWED_STRING_ENCODINGS`] vocabulary check rejects an out-of-list
+    /// value with a `stringEncoding` field error - applies even to a numeric
+    /// tag (the check does not condition on `data_type`, this function's doc
+    /// comment above explains why).
+    #[tokio::test]
+    async fn create_rejects_an_unknown_string_encoding() {
+        let (svc, group_id) = setup().await;
+        let mut input = sample_input("T", group_id);
+        input.string_encoding = "utf16".to_string();
+        let err = svc.create(input).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "stringEncoding");
+                assert_eq!(
+                    field_errors[0].message,
+                    format!(
+                        "対応エンコーディングは {} のいずれかです",
+                        ALLOWED_STRING_ENCODINGS.join(", ")
+                    )
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// The 0013 SQL `CHECK` and [`ALLOWED_STRING_ENCODINGS`] must agree in
+    /// the rejection direction too: a value the Rust list rejects must also
+    /// be rejected by the schema when the service layer is bypassed (mirrors
+    /// `the_sql_check_accepts_nothing_beyond_allowed_data_types` below).
+    #[tokio::test]
+    async fn the_sql_check_accepts_nothing_beyond_allowed_string_encodings() {
+        let (svc, group_id) = setup().await;
+        for encoding in ["utf16", "UTF8", "shiftjis", ""] {
+            let result = sqlx::query(
+                "INSERT INTO tags (name, collection_group_id, address, data_type, string_encoding) \
+                 VALUES (?, ?, '40001', 'i16', ?)",
+            )
+            .bind(format!("raw-{encoding}"))
+            .bind(group_id)
+            .bind(encoding)
+            .execute(&svc.pool)
+            .await;
+            assert!(
+                result.is_err(),
+                "the SQL CHECK accepted {encoding:?}, which is not in ALLOWED_STRING_ENCODINGS"
+            );
+        }
+    }
+
+    /// A row inserted before 0013 (no explicit `string_encoding`) backfills
+    /// to the column default `'utf8'` - the same "ADD COLUMN with a DEFAULT"
+    /// backfill guarantee as 0012's `default_writable` test.
+    #[tokio::test]
+    async fn a_row_inserted_without_string_encoding_defaults_to_utf8() {
+        let (svc, group_id) = setup().await;
+        sqlx::query(
+            "INSERT INTO tags (name, collection_group_id, address, data_type) \
+             VALUES ('legacy', ?, '40001', 'i16')",
+        )
+        .bind(group_id)
+        .execute(&svc.pool)
+        .await
+        .expect("insert without string_encoding should use the column default");
+
+        let encoding: String =
+            sqlx::query_scalar("SELECT string_encoding FROM tags WHERE name = 'legacy'")
+                .fetch_one(&svc.pool)
+                .await
+                .expect("fetch string_encoding");
+        assert_eq!(encoding, "utf8");
     }
 
     #[tokio::test]

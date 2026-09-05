@@ -120,6 +120,7 @@ fn tag_input(
         address: address.to_string(),
         data_type: data_type.to_string(),
         string_length: None,
+        string_encoding: "utf8".to_string(),
         raw_lo: None,
         raw_hi: None,
         eng_lo: None,
@@ -1592,4 +1593,285 @@ async fn rest_enable_disable_round_trip_and_reflects_in_status() {
     let (status, json) = get_json(&app.router, "/api/v1/status", &app.admin_token).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["write_enabled"], false);
+}
+
+// ---------------------------------------------------------------------------
+// T20 ①a (docs/banto-hub-t20-design.md §3.1, 案A): 文字列タグへの単票書き込み
+// (`POST /api/v1/values/{tag}`)。`make_tag`/`tag_input`(数値/bit 専用)とは別
+// に string タグ専用のフィクスチャを立て、UTF-8/Shift-JIS それぞれで
+// シミュレータのワイヤに正しいバイト列が届くことを確認する - `encode.rs`の
+// ユニットテストが証明済みの符号化ロジックが、実際に REST -> write_path ->
+// broker -> banto-plc-write という実経路を通っても壊れないことの E2E 証拠。
+// 記録計(banto-collect の`current_values`)は数値専用のまま(案Aの境界)なので、
+// 数値タグの happy path テストと違って読み戻し検証は行わない。
+// ---------------------------------------------------------------------------
+
+/// `tag_input`(数値/bit 専用)の string タグ版。`writable`/`enabled`は常に
+/// true(このファイルの string タグテストは全て書き込み成功系のため)。
+fn string_tag_input(
+    name: &str,
+    group_id: i64,
+    address: &str,
+    string_length: i64,
+    string_encoding: &str,
+) -> TagInput {
+    TagInput {
+        string_length: Some(string_length),
+        string_encoding: string_encoding.to_string(),
+        ..tag_input(name, group_id, address, "string", true, true)
+    }
+}
+
+/// `make_tag`の string タグ版。
+async fn make_string_tag(
+    app: &TestApp,
+    conn_name: &str,
+    port: u16,
+    tag_name: &str,
+    address: &str,
+    string_length: i64,
+    string_encoding: &str,
+) -> String {
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(slmp_conn_input(conn_name, port))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(string_tag_input(
+            tag_name,
+            group.id,
+            address,
+            string_length,
+            string_encoding,
+        ))
+        .await
+        .unwrap();
+    app.manager.rebuild().await.expect("rebuild");
+    format!("{conn_name}.fast.{tag_name}")
+}
+
+/// The raw bytes landed at `words` consecutive `D`-device words on `sim`,
+/// low byte first per word (mirrors `encode_string_value`'s packing - see
+/// that function's doc comment in `banto-plc-write/src/encode.rs`).
+fn read_wire_bytes(sim: &Simulator, start: u32, words: u16) -> Vec<u8> {
+    (0..words as u32)
+        .flat_map(|i| sim.get_word(SlmpDevice::D, start + i).to_le_bytes())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn string_tag_write_lands_utf8_bytes_on_the_wire() {
+    let app = test_app("string-write-utf8").await;
+    let sim = Simulator::start().await;
+
+    let words = 5u16; // "テスト" is 9 UTF-8 bytes; 5 words (10 bytes) leaves 1 NUL pad byte.
+    let external_name = make_string_tag(
+        &app,
+        "line1",
+        sim.addr.port(),
+        "recipe",
+        "D3000",
+        words as i64,
+        "utf8",
+    )
+    .await;
+    app.write_control.enable();
+
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:line1.fast.recipe"],
+    )
+    .await;
+
+    let (status, body) = v1_post(
+        &app.router,
+        &format!("/api/v1/values/{external_name}"),
+        &key,
+        json!({ "v": "テスト" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"], "ok");
+
+    let landed = read_wire_bytes(&sim, 3000, words);
+    let mut expected = "テスト".as_bytes().to_vec();
+    expected.resize(words as usize * 2, 0x00);
+    assert_eq!(
+        landed, expected,
+        "UTF-8 bytes must land on the wire, NUL-padded, low byte first"
+    );
+
+    sim.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn string_tag_write_lands_shift_jis_bytes_on_the_wire() {
+    let app = test_app("string-write-sjis").await;
+    let sim = Simulator::start().await;
+
+    let words = 4u16; // "テスト" is 6 Shift-JIS bytes; 4 words (8 bytes) leaves 2 NUL pad bytes.
+    let external_name = make_string_tag(
+        &app,
+        "line1",
+        sim.addr.port(),
+        "recipe",
+        "D3000",
+        words as i64,
+        "shift_jis",
+    )
+    .await;
+    app.write_control.enable();
+
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:line1.fast.recipe"],
+    )
+    .await;
+
+    let (status, body) = v1_post(
+        &app.router,
+        &format!("/api/v1/values/{external_name}"),
+        &key,
+        json!({ "v": "テスト" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"], "ok");
+
+    let landed = read_wire_bytes(&sim, 3000, words);
+    // "テスト" in Shift-JIS = [0x83, 0x65, 0x83, 0x58, 0x83, 0x67] (same
+    // fixed value `banto-plc-write/src/encode.rs`'s own unit tests pin down -
+    // hardcoded here rather than pulling in `encoding_rs` as a direct
+    // dependency of this test crate just to recompute it).
+    let mut expected: Vec<u8> = vec![0x83, 0x65, 0x83, 0x58, 0x83, 0x67];
+    expected.resize(words as usize * 2, 0x00);
+    assert_eq!(
+        landed, expected,
+        "Shift-JIS bytes must land on the wire, NUL-padded, low byte first"
+    );
+
+    sim.stop();
+}
+
+/// gate 7 の型対称性(string タグには文字列のみ): 数値を string タグへ書こう
+/// とすると 422 `unsupported_value_type`(convert_value のdoc comment参照)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn string_tag_rejects_a_numeric_value_as_422() {
+    let app = test_app("string-write-type-mismatch").await;
+    let sim = Simulator::start().await;
+
+    let external_name =
+        make_string_tag(&app, "line1", sim.addr.port(), "recipe", "D3000", 4, "utf8").await;
+    app.write_control.enable();
+
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:line1.fast.recipe"],
+    )
+    .await;
+
+    let (status, body) = v1_post(
+        &app.router,
+        &format!("/api/v1/values/{external_name}"),
+        &key,
+        json!({ "v": 123 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert_eq!(body["error"], "unsupported_value_type");
+
+    sim.stop();
+}
+
+/// 型対称性の逆方向: 文字列を数値タグへ書こうとすると 422。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn numeric_tag_rejects_a_string_value_as_422() {
+    let app = test_app("numeric-write-rejects-string").await;
+    let sim = Simulator::start().await;
+
+    let (_tag_id, external_name) = make_tag(
+        &app,
+        "line1",
+        "slmp",
+        sim.addr.port(),
+        "temp01",
+        "D100",
+        "u16",
+        true,
+        true,
+    )
+    .await;
+    app.write_control.enable();
+
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:line1.fast.temp01"],
+    )
+    .await;
+
+    let (status, body) = v1_post(
+        &app.router,
+        &format!("/api/v1/values/{external_name}"),
+        &key,
+        json!({ "v": "not a number" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert_eq!(body["error"], "unsupported_value_type");
+
+    sim.stop();
+}
+
+/// 文字列長超過は 422 相当の範囲エラー(`value_out_of_range`)- broker を
+/// 呼ぶ前の事前チェック(`build_plc_string_write_request`のdoc comment参照)
+/// で弾かれ、ワイヤには一切触れない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn string_tag_write_over_capacity_is_a_value_out_of_range_error() {
+    let app = test_app("string-write-overflow").await;
+    let sim = Simulator::start().await;
+
+    // 1 word = 2 bytes capacity; "ABC" (3 ASCII bytes) does not fit.
+    let external_name =
+        make_string_tag(&app, "line1", sim.addr.port(), "recipe", "D3000", 1, "utf8").await;
+    app.write_control.enable();
+
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:line1.fast.recipe"],
+    )
+    .await;
+
+    // Seed the word so we can prove it was never touched.
+    sim.set_word(SlmpDevice::D, 3000, 0xBEEF);
+
+    let (status, body) = v1_post(
+        &app.router,
+        &format!("/api/v1/values/{external_name}"),
+        &key,
+        json!({ "v": "ABC" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert_eq!(body["error"], "value_out_of_range");
+    assert_eq!(
+        sim.get_word(SlmpDevice::D, 3000),
+        0xBEEF,
+        "an out-of-range string write must never touch the wire"
+    );
+
+    sim.stop();
 }

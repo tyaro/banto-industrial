@@ -22,6 +22,7 @@
 use banto_plc::{DataType, TagValue, WordOrder};
 
 use crate::error::PlcWriteError;
+use crate::types::StringEncoding;
 
 /// Split a `u32` into its two register words per `order` - the exact inverse of
 /// `banto-plc/src/decode.rs`'s `combine_u32`, which reads
@@ -144,30 +145,47 @@ pub(crate) fn encode_bit_value(value: TagValue) -> Result<bool, PlcWriteError> {
     }
 }
 
-/// Encode a string bound for a `words`-word span of a word device (S1
-/// 文字列タグ): Shift-JIS bytes, 0x00-padded to exactly `2 * words` bytes,
-/// packed **low byte first** into each word - the exact inverse of
+/// Encode a string bound for a `words`-word span of a word device (S1/T20 ①a
+/// 文字列タグ): `encoding`-chosen bytes (UTF-8 or Shift-JIS,
+/// [`StringEncoding`]), 0x00-padded to exactly `2 * words` bytes, packed **low
+/// byte first** into each word - the exact inverse of
 /// `banto-plc/src/decode.rs::decode_string_value` (see there for the wire
 /// evidence from the wrapped `slmp` crate), so a write→read round trip is
-/// byte-for-byte. Note [`banto_plc::WordOrder`] plays no part here: it orders
-/// the two words of a 32-bit *numeric* value, whereas a string's byte order
-/// within each word is fixed by MELSEC's storage convention.
+/// byte-for-byte **when the reader decodes with the same encoding** (T20 ①a
+/// keeps the recorder's read path Shift-JIS-only by design -
+/// docs/banto-hub-t20-design.md §3.1's 案A - so a UTF-8-written tag round-trips
+/// only through this crate's own read helpers, not the recorder). Note
+/// [`banto_plc::WordOrder`] plays no part here: it orders the two words of a
+/// 32-bit *numeric* value, whereas a string's byte order within each word is
+/// fixed by MELSEC's storage convention regardless of character encoding.
 ///
 /// Two rejections, both per-request `Bad`s and both about never mangling text
 /// onto a live PLC:
-/// - a character with no Shift-JIS representation
+/// - a character with no representation in `encoding`
 ///   ([`PlcWriteError::ValueOutOfRange`]) rather than encoding_rs's HTML
-///   escape substitution
+///   escape substitution - **UTF-8 can represent every `char` a Rust `&str`
+///   can hold, so this branch is unreachable for [`StringEncoding::Utf8`]**
+///   and only ever fires for [`StringEncoding::ShiftJis`]; it is still
+///   checked uniformly for both rather than special-cased away, so this
+///   function's contract does not depend on that fact holding forever.
 /// - encoded bytes longer than the span's `2 * words` capacity
 ///   ([`PlcWriteError::ValueOutOfRange`]) rather than silent truncation - a
 ///   cut-off recipe string is a real hazard
-pub(crate) fn encode_string_value(value: &str, words: u16) -> Result<Vec<u16>, PlcWriteError> {
-    let (bytes, _, had_errors) = encoding_rs::SHIFT_JIS.encode(value);
+pub fn encode_string_value(
+    value: &str,
+    words: u16,
+    encoding: StringEncoding,
+) -> Result<Vec<u16>, PlcWriteError> {
+    let (table, label) = match encoding {
+        StringEncoding::Utf8 => (encoding_rs::UTF_8, "UTF-8"),
+        StringEncoding::ShiftJis => (encoding_rs::SHIFT_JIS, "Shift-JIS"),
+    };
+    let (bytes, _, had_errors) = table.encode(value);
     if had_errors {
         return Err(PlcWriteError::ValueOutOfRange {
             data_type: "string".to_string(),
             value: value.to_string(),
-            detail: "Shift-JIS で表現できない文字を含みます".to_string(),
+            detail: format!("{label} で表現できない文字を含みます"),
         });
     }
     let capacity = words as usize * 2;
@@ -176,7 +194,7 @@ pub(crate) fn encode_string_value(value: &str, words: u16) -> Result<Vec<u16>, P
             data_type: "string".to_string(),
             value: value.to_string(),
             detail: format!(
-                "Shift-JIS で {} バイトになり、{words} 語（{capacity} バイト）に収まりません",
+                "{label} で {} バイトになり、{words} 語（{capacity} バイト）に収まりません",
                 bytes.len()
             ),
         });
@@ -317,7 +335,13 @@ mod tests {
         assert!(matches!(err, PlcWriteError::ValueTypeMismatch { .. }));
     }
 
-    // --- encode_string_value (S1 文字列タグ) -------------------------------
+    // --- encode_string_value (S1/T20 ①a 文字列タグ) ------------------------
+    //
+    // Every pre-T20 test below passes `StringEncoding::ShiftJis` explicitly -
+    // this is the load-bearing proof that relay-wright's existing (Shift-JIS
+    // only) behaviour is exactly reproduced by naming the encoding rather than
+    // relying on any default. The `_utf8` block further down is the new T20
+    // ①a coverage.
 
     /// The load-bearing byte-order case: "AB" = [0x41, 0x42], low byte first
     /// within the word -> 0x4241 (NOT 0x4142) - the mirror of decode.rs's
@@ -325,7 +349,7 @@ mod tests {
     #[test]
     fn encodes_ascii_low_byte_first_within_each_word() {
         assert_eq!(
-            encode_string_value("ABCD", 2).unwrap(),
+            encode_string_value("ABCD", 2, StringEncoding::ShiftJis).unwrap(),
             vec![0x4241, 0x4443]
         );
     }
@@ -334,7 +358,7 @@ mod tests {
     fn pads_the_remainder_of_the_span_with_nul() {
         // "ABC" = 3 bytes into a 4-word (8-byte) span: [0x41,0x42,0x43,0,0,0,0,0].
         assert_eq!(
-            encode_string_value("ABC", 4).unwrap(),
+            encode_string_value("ABC", 4, StringEncoding::ShiftJis).unwrap(),
             vec![0x4241, 0x0043, 0x0000, 0x0000]
         );
     }
@@ -343,20 +367,23 @@ mod tests {
     #[test]
     fn encodes_multibyte_sjis() {
         assert_eq!(
-            encode_string_value("テスト", 4).unwrap(),
+            encode_string_value("テスト", 4, StringEncoding::ShiftJis).unwrap(),
             vec![0x6583, 0x5883, 0x6783, 0x0000]
         );
     }
 
     #[test]
     fn a_string_of_exactly_the_span_capacity_is_accepted_unpadded() {
-        assert_eq!(encode_string_value("AB", 1).unwrap(), vec![0x4241]);
+        assert_eq!(
+            encode_string_value("AB", 1, StringEncoding::ShiftJis).unwrap(),
+            vec![0x4241]
+        );
     }
 
     /// One byte over capacity is rejected outright - never truncated.
     #[test]
     fn rejects_a_string_longer_than_the_span_without_truncating() {
-        let err = encode_string_value("ABC", 1).unwrap_err();
+        let err = encode_string_value("ABC", 1, StringEncoding::ShiftJis).unwrap_err();
         match err {
             PlcWriteError::ValueOutOfRange {
                 data_type, value, ..
@@ -372,7 +399,7 @@ mod tests {
     #[test]
     fn rejects_multibyte_overflow() {
         assert!(matches!(
-            encode_string_value("テスト", 2),
+            encode_string_value("テスト", 2, StringEncoding::ShiftJis),
             Err(PlcWriteError::ValueOutOfRange { .. })
         ));
     }
@@ -381,13 +408,88 @@ mod tests {
     /// (encoding_rs would otherwise emit an HTML numeric escape).
     #[test]
     fn rejects_characters_not_representable_in_shift_jis() {
-        let err = encode_string_value("🚀", 8).unwrap_err();
+        let err = encode_string_value("🚀", 8, StringEncoding::ShiftJis).unwrap_err();
         assert!(matches!(err, PlcWriteError::ValueOutOfRange { .. }));
     }
 
     #[test]
     fn empty_string_becomes_an_all_nul_span() {
-        assert_eq!(encode_string_value("", 2).unwrap(), vec![0x0000, 0x0000]);
+        assert_eq!(
+            encode_string_value("", 2, StringEncoding::ShiftJis).unwrap(),
+            vec![0x0000, 0x0000]
+        );
+    }
+
+    // --- encode_string_value: StringEncoding::Utf8 (T20 ①a, new) ----------
+
+    /// ASCII round-trips identically in UTF-8 and Shift-JIS (both are ASCII
+    /// supersets), so the byte-order convention (low byte first per word)
+    /// carries over unchanged from the Shift-JIS test of the same shape.
+    #[test]
+    fn utf8_encodes_ascii_low_byte_first_within_each_word() {
+        assert_eq!(
+            encode_string_value("ABCD", 2, StringEncoding::Utf8).unwrap(),
+            vec![0x4241, 0x4443]
+        );
+    }
+
+    /// Multi-byte UTF-8: "テスト" is 9 bytes in UTF-8 (3 bytes/char) - unlike
+    /// Shift-JIS's 6 bytes for the same text, so this is also the case that
+    /// proves UTF-8 and Shift-JIS are not silently interchangeable spans.
+    #[test]
+    fn utf8_encodes_multibyte_japanese_text() {
+        let encoded = encode_string_value("テスト", 5, StringEncoding::Utf8).unwrap();
+        // 9 UTF-8 bytes padded to 10 (5 words), NUL-padded last byte.
+        let bytes: Vec<u8> = encoded.iter().flat_map(|w| w.to_le_bytes()).collect();
+        assert_eq!(bytes, {
+            let mut expected = "テスト".as_bytes().to_vec();
+            expected.push(0x00);
+            expected
+        });
+    }
+
+    /// UTF-8 can represent every Unicode scalar value, including ones with no
+    /// Shift-JIS mapping (e.g. an emoji) - the mirror of
+    /// `rejects_characters_not_representable_in_shift_jis` showing the same
+    /// input now succeeds under `StringEncoding::Utf8`.
+    #[test]
+    fn utf8_accepts_characters_shift_jis_cannot_represent() {
+        assert!(encode_string_value("🚀", 8, StringEncoding::Utf8).is_ok());
+    }
+
+    /// Same overflow/no-truncation guarantee as Shift-JIS's
+    /// `rejects_a_string_longer_than_the_span_without_truncating`, exercised
+    /// under UTF-8.
+    #[test]
+    fn utf8_rejects_a_string_longer_than_the_span_without_truncating() {
+        let err = encode_string_value("ABC", 1, StringEncoding::Utf8).unwrap_err();
+        assert!(matches!(err, PlcWriteError::ValueOutOfRange { .. }));
+    }
+
+    #[test]
+    fn utf8_empty_string_becomes_an_all_nul_span() {
+        assert_eq!(
+            encode_string_value("", 2, StringEncoding::Utf8).unwrap(),
+            vec![0x0000, 0x0000]
+        );
+    }
+
+    /// Round-trip proof at the byte level: encode then manually decode (low
+    /// byte first per word, per this function's doc comment) reproduces the
+    /// original text - the write-side half of the "UTF-8 round-trips through
+    /// this crate's own read helpers" claim in `encode_string_value`'s doc
+    /// comment.
+    #[test]
+    fn utf8_round_trips_through_manual_byte_level_decode() {
+        let text = "Recipe #1: テスト";
+        let words = 12u16;
+        let encoded = encode_string_value(text, words, StringEncoding::Utf8).unwrap();
+        let mut bytes: Vec<u8> = encoded.iter().flat_map(|w| w.to_le_bytes()).collect();
+        // Trim the NUL padding the same way a decoder would.
+        while bytes.last() == Some(&0) {
+            bytes.pop();
+        }
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), text);
     }
 
     #[test]

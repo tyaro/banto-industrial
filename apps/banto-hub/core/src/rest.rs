@@ -2483,6 +2483,15 @@ fn default_tag_decimals() -> i64 {
     0
 }
 
+/// T20 ①a: [`TagPayload::string_encoding`]'s serde default - mirrors
+/// `banto_tags::tag`'s own `default_string_encoding()` (private to that
+/// crate), so an existing client's payload (written before this field
+/// existed) still deserializes and creates a UTF-8-encoded tag, the same
+/// "old payload still works" treatment as `writable`/`tag_kind`.
+fn default_tag_string_encoding() -> String {
+    "utf8".to_string()
+}
+
 /// T2-3: mirrors `banto_tags::tag`'s own `default_tag_kind` (not reused
 /// directly - that one is private to `banto-tags`) so a `TagPayload` missing
 /// `tagKind` builds the same `"plc"` `TagInput` an old client always got.
@@ -2581,6 +2590,15 @@ pub struct TagPayload {
     pub data_type: String,
     #[serde(default)]
     pub string_length: Option<i64>,
+    /// T20 ①a（docs/banto-hub-t20-design.md §3.1、2026-09-04 オーナー決定
+    /// 「文字コードは既定 UTF-8、タグ単位で Shift-JIS も選択可」）。
+    /// `#[serde(default = "default_tag_string_encoding")]`（= `"utf8"`）
+    /// なので既存クライアントのペイロードは無変更で通る（`writable`等と
+    /// 同じ「旧ペイロード互換」の作法）。管理 UI にエンコーディング選択
+    /// フォームを足すのは①aでは任意 - このフィールドは型として通すことを
+    /// 優先し、値は API 経由で直接指定できる。
+    #[serde(default = "default_tag_string_encoding")]
+    pub string_encoding: String,
     #[serde(default)]
     pub raw_lo: Option<f64>,
     #[serde(default)]
@@ -2635,6 +2653,7 @@ impl From<TagPayload> for TagInput {
             address: payload.address,
             data_type: payload.data_type,
             string_length: payload.string_length,
+            string_encoding: payload.string_encoding,
             raw_lo: payload.raw_lo,
             raw_hi: payload.raw_hi,
             eng_lo: payload.eng_lo,
@@ -6863,16 +6882,16 @@ async fn v1_events(
 // へ変換する [`write_rejection_response`] のみ。
 
 /// `POST /api/v1/values/{tag}` の request body（設計 §5.1「body
-/// `{ "v": <number|bool> }`」）。`v` は `serde_json::Value` のまま保持し、
-/// [`parse_requested_value`] で数値/真偽値のみを受理する（文字列・配列・
-/// オブジェクトは 422）— `bool` と `number` を1つの Rust 型に素直に
-/// マップする serde 表現がなく、utoipa の untagged enum サポートも弱いため、
-/// 検証はハンドラ内で行う。
+/// `{ "v": <number|bool> }`」、T20 ①a で文字列を追加 - docs/banto-hub-t20-design.md
+/// §3.1）。`v` は `serde_json::Value` のまま保持し、[`parse_requested_value`]
+/// で数値/真偽値/文字列のみを受理する（配列・オブジェクトは 422）—
+/// `bool`/`number`/`string` を1つの Rust 型に素直にマップする serde 表現が
+/// なく、utoipa の untagged enum サポートも弱いため、検証はハンドラ内で行う。
 #[derive(Debug, Deserialize, ToSchema)]
 struct WriteValueRequest {
-    /// 書き込む工学値。数値タグには数値、bit タグには真偽値
-    /// （2026-08-06〜: 型が data_type と一致しない場合は 422
-    /// `unsupported_value_type` - 暗黙の型変換はしない）。
+    /// 書き込む工学値。数値タグには数値、bit タグには真偽値、string タグ
+    /// には文字列（T20 ①a）。（2026-08-06〜: 型が data_type と一致しない
+    /// 場合は 422 `unsupported_value_type` - 暗黙の型変換はしない）。
     #[schema(value_type = f64, example = 1)]
     v: serde_json::Value,
 }
@@ -6887,20 +6906,25 @@ struct WriteValueResponse {
 }
 
 /// リクエスト body の `v` を [`crate::write_path::RequestedValue`] に正規化
-/// する。`bool` は [`RequestedValue::Bool`]、数値は [`RequestedValue::Num`]。
-/// どちらの型が来たかは gate 7（`crate::write_path::execute_write`）が
-/// data_type との対称性検査に使うので、ここで `f64` へ潰さない（2026-08-06
-/// 変更: 従来は `bool` を `1.0`/`0.0` に潰して数値と区別せずに渡していた）。
-/// 文字列・配列・オブジェクト・`null` は `None`（呼び出し元が 422
-/// `unsupported_value_type` を返す）。REST 固有の wire 形式（JSON の `v`）
-/// からの変換であり、gRPC 側は `oneof num|bool` を直接分解するだけで
-/// 済むため、この関数は `crate::write_path` へは移していない。
+/// する。`bool` は [`RequestedValue::Bool`]、数値は [`RequestedValue::Num`]、
+/// 文字列は [`RequestedValue::Str`](T20 ①a、docs/banto-hub-t20-design.md
+/// §3.1 で追加 - string タグへの書き込みに使う)。どちらの型が来たかは
+/// gate 7（`crate::write_path::execute_write`）が data_type との対称性検査に
+/// 使うので、ここで `f64` へ潰さない（2026-08-06 変更: 従来は `bool` を
+/// `1.0`/`0.0` に潰して数値と区別せずに渡していた）。配列・オブジェクト・
+/// `null` は `None`（呼び出し元が 422 `unsupported_value_type` を返す）。
+/// REST 固有の wire 形式（JSON の `v`）からの変換であり、gRPC 側は
+/// `oneof num|bool` を直接分解するだけで済む（文字列は本スライスの対象外 -
+/// gRPC の `WriteValueRequest` に文字列 oneof が無い）ため、この関数は
+/// `crate::write_path` へは移していない。
 pub(crate) fn parse_requested_value(
     v: &serde_json::Value,
 ) -> Option<crate::write_path::RequestedValue> {
     use crate::write_path::RequestedValue;
     if let Some(b) = v.as_bool() {
         Some(RequestedValue::Bool(b))
+    } else if let Some(s) = v.as_str() {
+        Some(RequestedValue::Str(s.to_string()))
     } else {
         v.as_f64().map(RequestedValue::Num)
     }

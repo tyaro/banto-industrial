@@ -344,6 +344,7 @@ mod tests {
                     threshold_l: None,
                     threshold_ll: None,
                     string_length: None,
+                    string_encoding: "utf8".to_string(),
                     enabled: true,
                     writable: false,
                     tag_kind: "plc".to_string(),

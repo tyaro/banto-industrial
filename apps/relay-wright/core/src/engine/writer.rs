@@ -260,6 +260,14 @@ fn build_request(target: &ResolvedTarget, value: &PlcValue) -> Option<BatchWrite
                 address: target.address,
                 words,
                 value: text.clone(),
+                // T20 ①a (docs/banto-hub-t20-design.md §3.1): banto-tags grew a
+                // per-tag `string_encoding` column, but relay-wright's own
+                // registry/write-rule plumbing has no such concept and has
+                // always spoken Shift-JIS only (`crate::support::sjis_text_error`
+                // validates every string write against Shift-JIS capacity) -
+                // this stays hardcoded so relay-wright's behavior is
+                // byte-for-byte unchanged by the shared-crate field addition.
+                encoding: banto_plc_write::StringEncoding::ShiftJis,
             })),
             _ => None,
         },

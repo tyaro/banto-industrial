@@ -650,6 +650,11 @@ impl EngineControl {
                         address,
                         words,
                         value: input.to_string(),
+                        // T20 ①a: kept hardcoded Shift-JIS - see
+                        // `crate::engine::writer::build_request`'s identical
+                        // comment for why relay-wright never adopts the new
+                        // per-tag `string_encoding` concept.
+                        encoding: banto_plc_write::StringEncoding::ShiftJis,
                     }))
                 }
             }

@@ -76,6 +76,7 @@ pub mod slmp;
 pub mod types;
 
 pub use client::PlcWriteClient;
+pub use encode::encode_string_value;
 pub use error::PlcWriteError;
 pub use modbus::planning::{plan_modbus_writes, ModbusPlannedWrite, ModbusWritePlanOutcome};
 pub use modbus::{execute_modbus_writes, ModbusWriteClient};
@@ -84,7 +85,7 @@ pub use slmp::planning::{
     SlmpPlannedWrite, SlmpWritePlanOutcome, WritePayload,
 };
 pub use slmp::{execute_slmp_writes, SlmpWriteClient};
-pub use types::{BatchWriteRequest, StringWriteRequest, WriteRequest, WriteResult};
+pub use types::{BatchWriteRequest, StringEncoding, StringWriteRequest, WriteRequest, WriteResult};
 
 // Re-exported for callers building requests, so they need only depend on this
 // crate for a basic write. The canonical definitions stay in `banto-plc`.

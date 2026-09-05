@@ -333,6 +333,7 @@ async fn phase3_string_roundtrip() -> Result<(), String> {
         address: addr("D3020"),
         words,
         value: test_string.to_string(),
+        encoding: banto_plc_write::StringEncoding::ShiftJis,
     })])
     .await?;
     println!("[3] 文字列書込結果: {write_result:?}");
@@ -354,6 +355,7 @@ async fn phase3_string_roundtrip() -> Result<(), String> {
         address: addr("D3020"),
         words,
         value: String::new(),
+        encoding: banto_plc_write::StringEncoding::ShiftJis,
     })])
     .await?;
     println!("[cleanup] D3020 文字列領域クリア: {clear_result:?}");

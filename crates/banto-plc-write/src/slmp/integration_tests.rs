@@ -626,13 +626,20 @@ async fn execute_slmp_writes_runs_on_a_borrowed_client_for_the_broker() {
 
 use banto_plc::{BatchReadRequest, BatchReadResult, PlcValue, StringReadRequest};
 
-use crate::types::{BatchWriteRequest, StringWriteRequest};
+use crate::types::{BatchWriteRequest, StringEncoding, StringWriteRequest};
 
 fn swreq(raw: &str, words: u16, value: &str) -> BatchWriteRequest {
+    swreq_enc(raw, words, value, StringEncoding::ShiftJis)
+}
+
+/// Same as [`swreq`] but with an explicit [`StringEncoding`] - used by the
+/// UTF-8 wire test below (T20 ①a).
+fn swreq_enc(raw: &str, words: u16, value: &str, encoding: StringEncoding) -> BatchWriteRequest {
     BatchWriteRequest::String(StringWriteRequest {
         address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw} should parse: {e}")),
         words,
         value: value.to_string(),
+        encoding,
     })
 }
 
@@ -705,6 +712,87 @@ async fn string_write_lands_low_byte_first_with_nul_padding_on_the_device() {
     assert_eq!(sim.get_word(SlmpDevice::D, 0), 0x4241, "low byte first");
     assert_eq!(sim.get_word(SlmpDevice::D, 1), 0x0000, "padding overwrites");
     assert_eq!(sim.get_word(SlmpDevice::D, 2), 0x0000, "padding overwrites");
+}
+
+/// T20 ①a: the load-bearing proof that `StringEncoding::Utf8` actually
+/// changes what lands on the wire - written through the real write path
+/// (`write_batch_mixed` -> wrapped `slmp` crate -> real SLMP bytes on the
+/// simulator's own memory, inspected directly rather than through the
+/// (Shift-JIS-only, by design - docs/banto-hub-t20-design.md §3.1's 案A)
+/// read path). "テスト" is 9 bytes in UTF-8 vs. 6 bytes in Shift-JIS
+/// (`string_write_then_read_back_round_trips_ascii_sjis_and_full_spans`
+/// above uses the same text under Shift-JIS), so this test's expected words
+/// necessarily differ from that one's - proof the encoding choice is not
+/// merely accepted but actually threaded through to the wire bytes.
+#[tokio::test]
+async fn utf8_string_write_lands_the_correct_bytes_on_the_wire() {
+    let sim = Simulator::start().await;
+    let mut writer = SlmpWriteClient::new(fast_config(&sim));
+    writer.connect().await.unwrap();
+
+    let text = "テスト";
+    let words = 5u16; // 9 UTF-8 bytes fit in 5 words (10 bytes), 1 byte of NUL padding.
+    let results = writer
+        .write_batch_mixed(&[swreq_enc("D0", words, text, StringEncoding::Utf8)])
+        .await
+        .unwrap();
+    assert_eq!(results, vec![WriteResult::Ok]);
+
+    let landed: Vec<u8> = (0..words)
+        .flat_map(|i| sim.get_word(SlmpDevice::D, i as u32).to_le_bytes())
+        .collect();
+    let mut expected = text.as_bytes().to_vec();
+    expected.resize(words as usize * 2, 0x00);
+    assert_eq!(landed, expected, "UTF-8 bytes, NUL-padded, low byte first");
+
+    // The same bytes, decoded as UTF-8 (trimming the NUL padding the way a
+    // UTF-8-aware reader would), reproduce the original text.
+    let mut trimmed = landed.clone();
+    while trimmed.last() == Some(&0) {
+        trimmed.pop();
+    }
+    assert_eq!(std::str::from_utf8(&trimmed).unwrap(), text);
+}
+
+/// T20 ①a companion to the UTF-8 wire test above: writing the *same* text
+/// under `StringEncoding::ShiftJis` at a different address in the same batch
+/// lands *different* bytes (6 SJIS bytes vs. 9 UTF-8 bytes for "テスト") -
+/// proof each request's own `encoding` is honored independently within one
+/// mixed batch, not just as a global per-call setting.
+#[tokio::test]
+async fn a_mixed_batch_encodes_each_string_request_independently() {
+    let sim = Simulator::start().await;
+    let mut writer = SlmpWriteClient::new(fast_config(&sim));
+    writer.connect().await.unwrap();
+
+    let text = "テスト";
+    let results = writer
+        .write_batch_mixed(&[
+            swreq_enc("D0", 5, text, StringEncoding::Utf8),
+            swreq_enc("D100", 4, text, StringEncoding::ShiftJis),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(results, vec![WriteResult::Ok, WriteResult::Ok]);
+
+    let utf8_bytes: Vec<u8> = (0..5)
+        .flat_map(|i| sim.get_word(SlmpDevice::D, i).to_le_bytes())
+        .collect();
+    let mut expected_utf8 = text.as_bytes().to_vec();
+    expected_utf8.resize(10, 0x00);
+    assert_eq!(utf8_bytes, expected_utf8);
+
+    let sjis_bytes: Vec<u8> = (100..104)
+        .flat_map(|i| sim.get_word(SlmpDevice::D, i).to_le_bytes())
+        .collect();
+    let (expected_sjis, _, _) = encoding_rs::SHIFT_JIS.encode(text);
+    let mut expected_sjis = expected_sjis.into_owned();
+    expected_sjis.resize(8, 0x00);
+    assert_eq!(sjis_bytes, expected_sjis);
+    assert_ne!(
+        utf8_bytes, sjis_bytes,
+        "UTF-8 and Shift-JIS must not silently agree on the same text"
+    );
 }
 
 /// A string over its span's capacity is a per-request Bad and NOTHING of it is

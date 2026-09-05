@@ -407,6 +407,7 @@ mod tests {
                 address: modbus_ref(AddressArea::HoldingRegister, 40),
                 words: 4,
                 value: "hi".to_string(),
+                encoding: banto_plc_write::StringEncoding::ShiftJis,
             }),
             BatchWriteRequest::BitInWord {
                 address: modbus_ref(AddressArea::HoldingRegister, 50),

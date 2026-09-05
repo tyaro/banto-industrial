@@ -144,6 +144,7 @@ fn tag_input(name: &str, group_id: i64, address: &str, data_type: &str) -> TagIn
         address: address.to_string(),
         data_type: data_type.to_string(),
         string_length: None,
+        string_encoding: "utf8".to_string(),
         raw_lo: None,
         raw_hi: None,
         eng_lo: None,

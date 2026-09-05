@@ -1659,6 +1659,13 @@ fn default_tag_kind() -> String {
     "plc".to_string()
 }
 
+/// T20 ①a: [`TagPayload::string_encoding`]'s serde default - mirrors
+/// `banto_tags::tag`'s own `default_string_encoding()` (private to that
+/// crate).
+fn default_tag_string_encoding() -> String {
+    "utf8".to_string()
+}
+
 /// Wire-shaped (camelCase) create/update payload for `plc_connections`.
 ///
 /// banto-tags' own `PlcConnectionInput`/`CollectionGroupInput`/`TagInput`
@@ -1785,6 +1792,16 @@ pub struct TagPayload {
     // 共有しているので、ここに載せるだけで両経路が対応する）。
     #[serde(default)]
     pub string_length: Option<i64>,
+    // T20 ①a (banto-hub の同名フィールドと同じ理由): `banto_tags::TagInput`
+    // が `string_encoding` 列を要求するため、ワイヤ形状にも additive に
+    // 足しておく（`#[serde(default = "default_tag_string_encoding")]` = `"utf8"`
+    // なので既存クライアントのペイロードは無変更で通る）。relay-wright 自身の
+    // タグ登録 UI にエンコーディング選択は無い（S2 の文字列タグ書き込みは
+    // write_targets/write_rules 経由で、`tags` テーブルの `string_encoding`
+    // は使わない - `crate::engine::writer`/`monitor`が Shift-JIS 固定のまま
+    // なのはそのため）が、値そのものは payload 経由で渡せば通る。
+    #[serde(default = "default_tag_string_encoding")]
+    pub string_encoding: String,
     #[serde(default = "default_payload_enabled")]
     pub enabled: bool,
     // T2-3 (docs/tag-server-design.md §10-2): banto-tags' `TagInput` grew 4
@@ -1830,6 +1847,7 @@ impl From<TagPayload> for TagInput {
             threshold_l: payload.threshold_l,
             threshold_ll: payload.threshold_ll,
             string_length: payload.string_length,
+            string_encoding: payload.string_encoding,
             enabled: payload.enabled,
             writable: payload.writable,
             tag_kind: payload.tag_kind,
@@ -5608,6 +5626,7 @@ mod tests {
                 address: "D100".to_string(),
                 data_type: "u16".to_string(),
                 string_length: None,
+                string_encoding: "utf8".to_string(),
                 raw_lo: None,
                 raw_hi: None,
                 eng_lo: None,

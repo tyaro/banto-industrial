@@ -1320,6 +1320,7 @@ mod tests {
             address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw}: {e}")),
             words,
             value: value.to_string(),
+            encoding: banto_plc_write::StringEncoding::ShiftJis,
         })
     }
 
