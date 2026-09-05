@@ -1,7 +1,7 @@
 # banto-hub T20 設計: 文字列・構造体登録・レシピ・ビットデバイス
 
 作成日: 2026-09-04
-状態: **計画（未着手）。オーナー方針は §2、③の原子性・レシピ非保存は 2026-09-04 承認で確定。④ 完了・② 完了・③ 完了（③c はタグサーバー責務外で不採用）。**T20 全機能完了（2026-09-05）**: ④ ビット16進＋ダイアレクト抽象 / ② 構造体登録＋オフセットコピー / ③ レシピ一括書き込み（REST＋MCP、UI は不採用） / ① 文字列 read/write（案A・分離経路、write＝write_path・read＝read-on-demand）。**
+状態: **T20 全機能完了（2026-09-05）**: ④ ワードデバイスのビット16進＋レジスタ・ダイアレクト抽象 / ② 構造体タグ登録＋オフセットコピー / ③ レシピ一括書き込み（REST＋MCP・UI は不採用） / ① 文字列 read/write（案A・分離経路: write＝write_path、read＝read-on-demand）。オーナー決定は §2、設計判断は §3・§8、調査結果は §7。
 対象: 4つの新機能（①文字列 read/write、②構造体タグ登録＋オフセットコピー、③レシピ一括書き込み、④ワードデバイスのビット `.0〜.F`）
 
 関連: [tag-server-design.md](tag-server-design.md)（タグ空間・書き込み安全の一次ソース）、[banto-hub-t19-design.md](banto-hub-t19-design.md)（直前の UI/UX 群）、[banto-tagclient-design.md](banto-tagclient-design.md) §4.4（③が覆す旧決定）。

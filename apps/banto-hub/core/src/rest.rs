@@ -6014,7 +6014,6 @@ struct ReadNowResponse {
     tag: String,
     /// 数値・真偽値・文字列のいずれか(数値タグは scale 済みの工学値 -
     /// `crate::read_path`のモジュール doc comment「スケーリング」節参照)。
-    #[schema(value_type = f64, example = 1)]
     v: serde_json::Value,
     /// その場読みが成功した時点の品質は常に `"good"` - キャッシュ読みと
     /// 違い、この経路は失敗を `q: "bad"` の200応答ではなく HTTP エラーで
