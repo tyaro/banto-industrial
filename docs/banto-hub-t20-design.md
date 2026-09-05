@@ -1,7 +1,7 @@
 # banto-hub T20 設計: 文字列・構造体登録・レシピ・ビットデバイス
 
 作成日: 2026-09-04
-状態: **計画（未着手）。オーナー方針は §2、③の原子性・レシピ非保存は 2026-09-04 承認で確定。残る未決は①の文字列値表現（最終スライス着手時に確定）と④の Modbus 側基数のみ。**
+状態: **計画（未着手）。オーナー方針は §2、③の原子性・レシピ非保存は 2026-09-04 承認で確定。④ 完了・② 完了・③ 完了（③c はタグサーバー責務外で不採用）。残るは①（文字列 read/write）のみ。残る未決は①の文字列値表現（最終スライス着手時に確定）。**
 対象: 4つの新機能（①文字列 read/write、②構造体タグ登録＋オフセットコピー、③レシピ一括書き込み、④ワードデバイスのビット `.0〜.F`）
 
 関連: [tag-server-design.md](tag-server-design.md)（タグ空間・書き込み安全の一次ソース）、[banto-hub-t19-design.md](banto-hub-t19-design.md)（直前の UI/UX 群）、[banto-tagclient-design.md](banto-tagclient-design.md) §4.4（③が覆す旧決定）。
@@ -142,7 +142,12 @@ per-entry 結果を返す。**同一バッチ内の重複タグは拒否**（`Du
 タグに2値は曖昧、かつレート制限 peek の粒度も正確になる）。REST `POST /api/v1/values/batch`
 （単票と同じ認証規律・per-entry の `write:{tag}` スコープ検査・常に200の per-entry 封筒）。
 事前ゲート all-or-nothing は「1件 NG → 監査行数不変＋シミュレータ値不変」でテスト固定。
-**③b（MCP `write_recipe`）: 完了（2026-09-05）。** `execute_write_batch` を叩く MCP ツール `write_recipe`（`{writes:[{tag,value}]}`）を追加。`write_tag_value` と同型の安全ポリシー: **ロックダウン後はアドバイザリのみ**（`execute_write_batch` を呼ばず、推奨レシピを助言。監査/レジスタ不変をテスト固定）、ロックダウン前は per-entry の `write:{tag}` スコープ検査→`execute_write_batch`。応答は per-entry 封筒＋`applied` 件数。**③c（レシピ UI）は別スライス。**
+**③b（MCP `write_recipe`）: 完了（2026-09-05）。** `execute_write_batch` を叩く MCP ツール `write_recipe`（`{writes:[{tag,value}]}`）を追加。`write_tag_value` と同型の安全ポリシー: **ロックダウン後はアドバイザリのみ**（`execute_write_batch` を呼ばず、推奨レシピを助言。監査/レジスタ不変をテスト固定）、ロックダウン前は per-entry の `write:{tag}` スコープ検査→`execute_write_batch`。応答は per-entry 封筒＋`applied` 件数。
+
+**③c（レシピ UI）: 不採用（オーナー決定 2026-09-05）。** タグサーバーの責務は
+一括書き込みの手段（REST `POST /api/v1/values/batch` ＋ MCP `write_recipe`）を提供する
+ところまでで、レシピの編集・保存・呼び出しといった UI は**下流アプリ（レシピ DL アプリ等）の
+領分**とする。よって **③ は ③a＋③b で完了**。
 
 ### 3.4 ④ワードデバイスのビット `.0〜.F`（16進）
 
