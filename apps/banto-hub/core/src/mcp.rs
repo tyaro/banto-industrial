@@ -79,13 +79,20 @@ use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex as AsyncMutex;
 
+use banto_core::ListParams;
+use banto_tags::{CollectionGroupService, PlcConnectionService};
+
 use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService};
+use crate::audit::{AuditEntry, AuditLogService};
 use crate::commissioning::CommissioningState;
-use crate::controller::CollectionController;
+use crate::controller::{CollectionController, CollectionState};
 use crate::hub::CollectorManager;
 use crate::mqtt::MqttPublisher;
+use crate::pending_changes::PendingChangesService;
 use crate::rest::{
-    bearer_token, compute_status, parse_requested_value, unauthorized_response, TagSpaceState,
+    bearer_token, commit_catalog_and_notify, compute_pending_base_fingerprint, compute_status,
+    parse_requested_value, preflight_transaction, unauthorized_response, PlcConnectionPayload,
+    TagSpaceState,
 };
 use crate::system_info::SystemInfoSampler;
 use crate::test_output::TestOutputControl;
@@ -164,8 +171,34 @@ struct McpState {
     events: broadcast::Sender<ServerEvent>,
     commissioning: CommissioningState,
     /// `get_server_status`専用 - `crate::rest::compute_status`をそのまま
-    /// 呼ぶための借用一式（このモジュールの doc comment参照）。
+    /// 呼ぶための借用一式（このモジュールの doc comment参照）。`status.controller`
+    /// は構成ツール（[`tool_create_connection`]等）の収集状態判定にも使う -
+    /// `collection_controller`と違い`enforce_collection_state`に関わらず
+    /// 常に実体を持つ（このモジュールの doc comment「安全境界」節参照）。
     status: TagSpaceState,
+    // --- T21 S1-b（docs/banto-hub-t21-design.md §4・§5）: 構成補助ツール
+    // （接続 CRUD）用の追加状態。REST の `plc_connections_create`/
+    // `plc_connections_delete`（`crate::rest`）と全く同じ mutation フロー
+    // （tx → preflight → commit → catalog commit・pending queue）を再利用
+    // するための最小限のサービス一式 - 二重実装しない（モジュール doc
+    // comment「§3.7」節と同じ規律）。
+    /// `PlcConnectionService::new(manager.pool())`で構築（REST の
+    /// `tag_registry_router`と同じ生成方法）。
+    plc_connections: PlcConnectionService,
+    /// [`compute_pending_base_fingerprint`]が要求する2引数目 - 構成ツールは
+    /// 今スライスでは接続のみ扱うが、この関数の署名（REST と共有）は
+    /// group ソースの分岐も持つため必要。
+    collection_groups: CollectionGroupService,
+    /// `PendingChangesService::new(manager.pool())`で構築。
+    pending_changes: PendingChangesService,
+    /// 構成操作の監査（`origin:"mcp"`）用 - 呼び出し元
+    /// （`crate::rest::api_router_with_controller_mode`）が REST と同じ
+    /// `Arc`/`SqlitePool`ベースの `AuditLogService` をそのまま渡す。
+    audit: AuditLogService,
+    /// `commit_catalog_and_notify`へそのまま渡す - 呼び出し元が REST と
+    /// 同じ値を渡す（`crate::rest::tag_registry_router`の同名フィールドと
+    /// 同じ意味）。
+    legacy_live_reconfigure: bool,
 }
 
 /// `POST /mcp`のルーターを組み立てる。呼び出し元
@@ -191,6 +224,12 @@ pub(crate) fn mcp_router(
     // T14-4 由来: `crate::rest::tag_space_router`の`enforce_collection_state`
     // と同じ意味 - `!legacy_live_reconfigure`を渡す（呼び出し元の責務）。
     enforce_collection_state: bool,
+    // T21 S1-b（docs/banto-hub-t21-design.md §5）: 構成補助ツール用に追加。
+    // 呼び出し元（`crate::rest::api_router_with_controller_mode`）が REST の
+    // 他ルーターと**同じ** `Arc`/値を渡すこと（このモジュールの doc comment
+    // 「呼び出し元は...同じインスタンスを渡すこと」と同じ規律）。
+    audit: AuditLogService,
+    legacy_live_reconfigure: bool,
 ) -> Router {
     let status = TagSpaceState {
         manager: manager.clone(),
@@ -200,6 +239,13 @@ pub(crate) fn mcp_router(
         mqtt,
         system_info,
     };
+    // T21 S1-b: REST の `tag_registry_router`と同じ生成方法
+    // （`PlcConnectionService::new(manager.pool())`等）- `SqlitePool`は
+    // `Arc`-backed なので REST 側のサービスと同じ DB を指す別ハンドルに
+    // なるだけで、状態は分裂しない。
+    let plc_connections = PlcConnectionService::new(manager.pool());
+    let collection_groups = CollectionGroupService::new(manager.pool());
+    let pending_changes = PendingChangesService::new(manager.pool());
     let state = McpState {
         manager: manager.clone(),
         collection_controller: enforce_collection_state.then_some(controller),
@@ -210,6 +256,11 @@ pub(crate) fn mcp_router(
         events,
         commissioning,
         status,
+        plc_connections,
+        collection_groups,
+        pending_changes,
+        audit,
+        legacy_live_reconfigure,
     };
     let auth_state = McpAuthState { api_keys, manager };
 
@@ -454,6 +505,64 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // --- T21 S1-b（docs/banto-hub-t21-design.md §4）: 構成補助ツール
+        // （接続 CRUD の第一弾）。いずれも `admin` スコープ必須 - ロック
+        // ダウンの前後を問わず常時可（設計 §3.2「有効化ガードは不採用」）。
+        json!({
+            "name": "list_connections",
+            "description": "PLC 接続の一覧を返す(admin スコープ必須)。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "create_connection",
+            "description": "PLC 接続を新規作成する(admin スコープ必須)。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "接続名(一意)。" },
+                    "protocol": {
+                        "type": "string",
+                        "enum": ["modbus-tcp", "slmp"],
+                        "description": "既定値 modbus-tcp。",
+                    },
+                    "host": { "type": "string", "description": "接続先ホスト名/IP。" },
+                    "port": { "type": "integer", "description": "接続先ポート番号。" },
+                    "unitId": { "type": "integer", "description": "既定値 1。" },
+                    "enabled": { "type": "boolean", "description": "既定値 true。" },
+                    "simulation": {
+                        "type": "boolean",
+                        "description": "true でシミュレータ接続にする。既定値 false。",
+                    },
+                    "wordOrder": {
+                        "type": "string",
+                        "enum": ["low_high", "high_low"],
+                        "description": "SLMP のワード順。既定値 low_high。",
+                    },
+                },
+                "required": ["name", "host", "port"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "delete_connection",
+            "description": "PLC 接続を削除する(admin スコープ必須)。配下のグループ・タグも一括削除するが、収集済み履歴データは残る。不可逆操作のため confirm:true が必須。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "削除する接続の id。" },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "true を明示しないと拒否される(不可逆操作の確認)。",
+                    },
+                },
+                "required": ["id", "confirm"],
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -476,6 +585,9 @@ async fn handle_tools_call(
         "get_server_status" => tool_get_server_status(state, ctx).await,
         "write_tag_value" => tool_write_tag_value(state, ctx, arguments).await?,
         "write_recipe" => tool_write_recipe(state, ctx, arguments).await?,
+        "list_connections" => tool_list_connections(state, ctx).await,
+        "create_connection" => tool_create_connection(state, ctx, arguments).await?,
+        "delete_connection" => tool_delete_connection(state, ctx, arguments).await?,
         other => {
             return Err(RpcError::invalid_params(format!("unknown tool: {other}")));
         }
@@ -850,4 +962,316 @@ fn write_recipe_advisory(entries: &[(String, Value)]) -> String {
         "本番（ロックダウン済み）では MCP から直接書き込みできません。推奨レシピ: {}。実行は管理 UI から人が行ってください。",
         items.join("、")
     )
+}
+
+// ---------------------------------------------------------------------------
+// T21 S1-b（docs/banto-hub-t21-design.md §3・§4）: 構成補助ツール（接続
+// CRUD の第一弾）。すべて `admin` スコープを要求する - 有効化ガードは無く
+// （設計 §3.2「不採用」オーナー決定）、`admin` スコープ＋監査＋（delete 系は）
+// confirm が唯一のガード。mutation 本体（tx・preflight・catalog commit・
+// pending queue）は `crate::rest` の `plc_connections_create`/
+// `plc_connections_delete`（admin REST）が使うヘルパー
+// （[`preflight_transaction`]/[`commit_catalog_and_notify`]/
+// [`compute_pending_base_fingerprint`]）をそのまま呼ぶ - 二重実装しない
+// （このモジュール doc comment「§3.7」節と同じ規律）。監査だけは MCP 固有
+// （`origin:"mcp"`・actor は API キー名）- REST の `record_write`
+// （`crate::rest`）と同じ形の `AuditEntry` を [`audit_config_action`] が
+// 組み立てる。
+// ---------------------------------------------------------------------------
+
+const MISSING_ADMIN_SCOPE: &str = "missing_admin_scope: admin スコープを持つ API キーが必要です。";
+
+/// 構成ツール共通の admin ゲート - [`MISSING_READ_SCOPE`]/`missing_write_scope`
+/// と同じ流儀（JSON-RPC エラーにせず `isError` の `tools/call` 結果で返す、
+/// [`tool_error`]参照）。ゲート拒否は監査しない（成功した mutation だけを
+/// audit_log に残す - REST の `record_write`が成功後にしか呼ばれないのと
+/// 同じ規律、[`audit_config_action`]のdoc comment参照）。
+fn require_admin_scope(ctx: &ApiKeyContext) -> Result<(), Value> {
+    if ctx.has_admin_scope() {
+        Ok(())
+    } else {
+        Err(tool_error(MISSING_ADMIN_SCOPE))
+    }
+}
+
+/// 収集中に pending queue へ保存できたときの応答文言 - REST の
+/// `QueuedPendingChangeResponse.message`（`crate::rest`）と同じ文言にして
+/// REST/MCP で表現を揃える。
+const QUEUED_MESSAGE: &str = "収集中のため変更を未適用キューに保存しました。";
+
+/// 構成操作の監査（設計 §3.3「全構成操作を audit_log に記録する」）- REST の
+/// `record_write`（`crate::rest`）と同じ `AuditEntry` の組み立て方だが、
+/// actor は bearer セッションの identity ではなく **API キー名**
+/// （`ctx.name`）、`actor_role` は固定文字列 `"api_key"`、`origin` は
+/// `"mcp"`（REST は `"rest"`）。呼び出し元は実際に mutation が確定した後
+/// （直接コミット・pending queue 投入のいずれかの成功後）にのみ呼ぶこと -
+/// pending queue 投入も監査する点は意図的に REST と異なる（REST の
+/// `queue_pending_registry_change`は audit_log を書かない - pending_changes
+/// テーブル自身が記録になるため - が、設計 §3.3 は MCP に「全構成操作」の
+/// audit_log 記録を求めているため、queued 成功もここで監査する）。
+async fn audit_config_action(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    action: &str,
+    entity_id: Option<&str>,
+    detail: Option<Value>,
+) {
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(ctx.name.as_str()),
+            actor_role: Some("api_key"),
+            action,
+            resource: "plc_connections",
+            entity_id,
+            detail,
+            origin: "mcp",
+            result: "ok",
+        })
+        .await;
+}
+
+// --- 9. list_connections -----------------------------------------------------
+
+async fn tool_list_connections(state: &McpState, ctx: &ApiKeyContext) -> Value {
+    if let Err(err) = require_admin_scope(ctx) {
+        return err;
+    }
+    match state.plc_connections.list(ListParams::default()).await {
+        Ok(result) => tool_ok(json!({ "connections": result.rows })),
+        Err(err) => tool_error(format!("接続一覧の取得に失敗しました: {err}")),
+    }
+}
+
+// --- 10. create_connection ----------------------------------------------------
+
+/// `crate::rest::plc_connections_create`（admin REST）と全く同じ mutation
+/// フロー - 収集中は [`compute_pending_base_fingerprint`] →
+/// `state.pending_changes.create_pending` で pending queue に保存し、停止中は
+/// `state.plc_connections.create_tx` → [`preflight_transaction`] →
+/// `tx.commit` → [`commit_catalog_and_notify`] を1トランザクションで実行する
+/// （順序も REST と同一）。REST との違いは監査の宛先だけ
+/// （[`audit_config_action`]のdoc comment参照）。
+async fn tool_create_connection(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let input: PlcConnectionPayload = serde_json::from_value(arguments)
+        .map_err(|err| RpcError::invalid_params(format!("接続の入力が不正です: {err}")))?;
+
+    let status = state.status.controller.status();
+    if status.state != CollectionState::Stopped {
+        let payload = json!({ "input": input });
+        let base_fingerprint = compute_pending_base_fingerprint(
+            &state.plc_connections,
+            &state.collection_groups,
+            "plc_connections.create",
+            &payload,
+        )
+        .await;
+        let pending = match state
+            .pending_changes
+            .create_pending(
+                "plc_connections.create",
+                &payload,
+                state.manager.configured_revision() as i64,
+                base_fingerprint.as_deref(),
+                Some(ctx.name.as_str()),
+                Some("api_key"),
+            )
+            .await
+        {
+            Ok(pending) => pending,
+            Err(err) => {
+                return Ok(tool_error(format!(
+                    "未適用キューへの保存に失敗しました: {err}"
+                )));
+            }
+        };
+        audit_config_action(
+            state,
+            ctx,
+            "create",
+            None,
+            Some(json!({ "queued": true, "pendingId": pending.id, "name": input.name })),
+        )
+        .await;
+        return Ok(tool_ok(json!({
+            "queued": true,
+            "pendingId": pending.id,
+            "message": QUEUED_MESSAGE,
+        })));
+    }
+
+    let mut tx = match state.manager.pool().begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            return Ok(tool_error(format!(
+                "トランザクションの開始に失敗しました: {err}"
+            )));
+        }
+    };
+    let created = match state.plc_connections.create_tx(&mut tx, input.into()).await {
+        Ok(created) => created,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(tool_error(format!("{err}")));
+        }
+    };
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(tool_error(format!("{}", err.0)));
+        }
+    };
+    if let Err(err) = tx.commit().await {
+        return Ok(tool_error(format!("コミットに失敗しました: {err}")));
+    }
+    audit_config_action(
+        state,
+        ctx,
+        "create",
+        Some(&created.id.to_string()),
+        Some(json!({ "name": created.name, "enabled": created.enabled })),
+    )
+    .await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.status.controller,
+        &state.events,
+        "plc_connections",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
+    Ok(tool_ok(json!({ "created": created })))
+}
+
+// --- 11. delete_connection ----------------------------------------------------
+
+/// `crate::rest::plc_connections_delete`（admin REST）と全く同じ mutation
+/// フロー（`cascade_delete_tx` - T19 S2-b・UX-38: タグ・グループが
+/// あっても削除でき、履歴は残す）。不可逆操作のため
+/// `arguments.confirm == true` を要求する（設計 §8「delete 系は confirm
+/// 必須」）- 拒否した場合は mutation に一切触れない（監査もしない、
+/// [`require_admin_scope`]と同じ「ゲート拒否は監査しない」規律）。
+async fn tool_delete_connection(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let id = arguments
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RpcError::invalid_params("arguments.id (integer) is required"))?;
+    let confirmed = arguments.get("confirm").and_then(Value::as_bool) == Some(true);
+    if !confirmed {
+        return Ok(tool_error(
+            "confirm_required: 削除は不可逆操作です。arguments.confirm:true を指定してください。",
+        ));
+    }
+
+    let status = state.status.controller.status();
+    if status.state != CollectionState::Stopped {
+        let payload = json!({ "id": id });
+        let base_fingerprint = compute_pending_base_fingerprint(
+            &state.plc_connections,
+            &state.collection_groups,
+            "plc_connections.delete",
+            &payload,
+        )
+        .await;
+        let pending = match state
+            .pending_changes
+            .create_pending(
+                "plc_connections.delete",
+                &payload,
+                state.manager.configured_revision() as i64,
+                base_fingerprint.as_deref(),
+                Some(ctx.name.as_str()),
+                Some("api_key"),
+            )
+            .await
+        {
+            Ok(pending) => pending,
+            Err(err) => {
+                return Ok(tool_error(format!(
+                    "未適用キューへの保存に失敗しました: {err}"
+                )));
+            }
+        };
+        audit_config_action(
+            state,
+            ctx,
+            "delete",
+            Some(&id.to_string()),
+            Some(json!({ "queued": true, "pendingId": pending.id })),
+        )
+        .await;
+        return Ok(tool_ok(json!({
+            "queued": true,
+            "pendingId": pending.id,
+            "message": QUEUED_MESSAGE,
+        })));
+    }
+
+    let mut tx = match state.manager.pool().begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            return Ok(tool_error(format!(
+                "トランザクションの開始に失敗しました: {err}"
+            )));
+        }
+    };
+    let cascade = match state.plc_connections.cascade_delete_tx(&mut tx, id).await {
+        Ok(cascade) => cascade,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(tool_error(format!("{err}")));
+        }
+    };
+    let snapshot = match preflight_transaction(&mut tx).await {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            let _ = tx.rollback().await;
+            return Ok(tool_error(format!("{}", err.0)));
+        }
+    };
+    if let Err(err) = tx.commit().await {
+        return Ok(tool_error(format!("コミットに失敗しました: {err}")));
+    }
+    let cascade_detail = json!({
+        "deletedGroups": cascade.deleted_groups,
+        "deletedTags": cascade.deleted_tags,
+    });
+    audit_config_action(
+        state,
+        ctx,
+        "delete",
+        Some(&id.to_string()),
+        Some(json!({ "cascade": cascade_detail.clone() })),
+    )
+    .await;
+    commit_catalog_and_notify(
+        &state.manager,
+        &state.status.controller,
+        &state.events,
+        "plc_connections",
+        snapshot,
+        state.legacy_live_reconfigure,
+    )
+    .await;
+    Ok(tool_ok(
+        json!({ "deleted": true, "id": id, "cascade": cascade_detail }),
+    ))
 }

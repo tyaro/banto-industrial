@@ -424,7 +424,7 @@ async fn initialize_returns_tool_capabilities() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tools_list_returns_the_six_tools() {
+async fn tools_list_returns_the_nine_tools() {
     let app = test_app("tools-list").await;
     let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
 
@@ -436,7 +436,10 @@ async fn tools_list_returns_the_six_tools() {
     assert_eq!(
         names,
         vec![
+            "create_connection",
+            "delete_connection",
             "get_server_status",
+            "list_connections",
             "list_tags",
             "read_tag_now",
             "read_tag_values",
@@ -1186,4 +1189,345 @@ async fn write_recipe_one_bad_entry_aborts_the_whole_batch_with_no_audit_rows_an
     assert_eq!(sim.get_word(SlmpDevice::D, 100), 0, "tag a must not land");
 
     sim.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 9. T21 S1-b（docs/banto-hub-t21-design.md §3・§4）: 構成補助ツール（接続
+//    CRUD）。`admin` スコープ必須・不可逆操作(delete)は confirm 必須・
+//    全操作を origin="mcp" で監査する、の3点を固定する。
+// ---------------------------------------------------------------------------
+
+async fn plc_connections_row_count(app: &TestApp) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM plc_connections")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap()
+}
+
+/// 最新の audit_log 1行の1列を返す(`id DESC LIMIT 1`) - `AUTOINCREMENT`の`id`は
+/// 挿入順と一致する(`AuditLogService::prune`のdoc commentと同じ前提)。
+/// `column`は固定文字列(呼び出し元はこのファイル内のみ)なので SQL 文字列
+/// 補間で問題ない。
+async fn latest_audit_column(app: &TestApp, column: &str) -> Option<String> {
+    // AssertSqlSafe: `column` is always a fixed literal passed by call sites
+    // in this file (never external input) - same pattern as
+    // `banto_tags::plc_connection`'s `COLUMNS`-interpolating queries.
+    // `fetch_optional`: audit_log が空(行が無い)場合に `RowNotFound` で
+    // panic しないよう `None` を返す - 列自体が NULL 許容なので
+    // `Option<Option<String>>` になるが `flatten` して意味を一致させる。
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT {column} FROM audit_log ORDER BY id DESC LIMIT 1"
+    )))
+    .fetch_optional(&app.pool)
+    .await
+    .unwrap()
+    .flatten()
+}
+
+/// `POST /api/collection/start` を叩いて controller を `Running` にする -
+/// `crate::rest`の`plc_connections_create_while_running_is_accepted_and_queued`
+/// (REST 側の同種テスト)と同じやり方。
+async fn start_collection(router: &Router, admin_token: &str) {
+    let response = router
+        .clone()
+        .oneshot(
+            HttpRequest::post("/api/collection/start")
+                .header("Authorization", format!("Bearer {admin_token}"))
+                .header("X-Banto-Client", "banto")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_tools_without_admin_scope_are_rejected_and_change_nothing() {
+    let app = test_app("config-no-admin").await;
+    // read/write は持つが admin は持たないキー。
+    let key = issue_key(
+        &app.router,
+        &app.admin_token,
+        "reader-writer",
+        &["read", "write:line1.fast.temp01"],
+    )
+    .await;
+    let before = plc_connections_row_count(&app).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call(
+            "create_connection",
+            json!({ "name": "line1", "host": "127.0.0.1", "port": 15022 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true);
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("missing_admin_scope"), "{text}");
+    assert_eq!(
+        plc_connections_row_count(&app).await,
+        before,
+        "create_connection without admin scope must not touch the DB"
+    );
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call("delete_connection", json!({ "id": 1, "confirm": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true);
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("missing_admin_scope"), "{text}");
+    assert_eq!(
+        plc_connections_row_count(&app).await,
+        before,
+        "delete_connection without admin scope must not touch the DB"
+    );
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call("list_connections", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true);
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("missing_admin_scope"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_connections_returns_created_connections() {
+    let app = test_app("config-list").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    PlcConnectionService::new(app.pool.clone())
+        .create(slmp_conn_input("line1", 15022))
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("list_connections", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    let connections = payload["connections"].as_array().unwrap();
+    assert_eq!(connections.len(), 1, "{payload:?}");
+    assert_eq!(connections[0]["name"], "line1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_connection_with_admin_scope_while_stopped_creates_and_audits() {
+    let app = test_app("config-create").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let before_rows = plc_connections_row_count(&app).await;
+    let audit_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_connection",
+            json!({ "name": "line1", "host": "127.0.0.1", "port": 15022, "protocol": "slmp" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["created"]["name"], "line1");
+
+    assert_eq!(plc_connections_row_count(&app).await, before_rows + 1);
+
+    let audit_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        audit_count_after,
+        audit_count_before + 1,
+        "create_connection via MCP must add exactly one audit_log row"
+    );
+    assert_eq!(
+        latest_audit_column(&app, "actor_username").await.as_deref(),
+        Some("admin-key")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "actor_role").await.as_deref(),
+        Some("api_key")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "action").await.as_deref(),
+        Some("create")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("plc_connections")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_connection_without_confirm_is_rejected_and_connection_remains() {
+    let app = test_app("config-delete-no-confirm").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(slmp_conn_input("line1", 15022))
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("delete_connection", json!({ "id": conn.id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("confirm_required"), "{text}");
+
+    assert_eq!(
+        plc_connections_row_count(&app).await,
+        1,
+        "delete_connection without confirm must not delete the row"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_connection_with_confirm_deletes_and_audits() {
+    let app = test_app("config-delete-confirm").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(slmp_conn_input("line1", 15022))
+        .await
+        .unwrap();
+    let audit_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "delete_connection",
+            json!({ "id": conn.id, "confirm": true }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["deleted"], true);
+
+    assert_eq!(
+        plc_connections_row_count(&app).await,
+        0,
+        "delete_connection with confirm:true must delete the row"
+    );
+
+    let audit_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(audit_count_after, audit_count_before + 1);
+    assert_eq!(
+        latest_audit_column(&app, "actor_username").await.as_deref(),
+        Some("admin-key")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "actor_role").await.as_deref(),
+        Some("api_key")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "action").await.as_deref(),
+        Some("delete")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("plc_connections")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_connection_while_collection_running_is_queued_not_applied() {
+    let app = test_app("config-create-running").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    start_collection(&app.router, &app.admin_token).await;
+    let before_rows = plc_connections_row_count(&app).await;
+    let audit_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_connection",
+            json!({ "name": "line-running", "host": "127.0.0.1", "port": 15022 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["queued"], true, "{payload:?}");
+    assert!(payload["pendingId"].is_number(), "{payload:?}");
+
+    assert_eq!(
+        plc_connections_row_count(&app).await,
+        before_rows,
+        "a queued create must not touch plc_connections directly"
+    );
+    let pending_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_changes")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(pending_count, 1);
+
+    // 設計 §3.3: 構成操作は queued の場合も含めて全て監査する（回帰防止 -
+    // `create_connection_with_admin_scope_while_stopped_creates_and_audits`
+    // と同じ確認方法）。
+    let audit_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        audit_count_after,
+        audit_count_before + 1,
+        "queued create_connection via MCP must add exactly one audit_log row"
+    );
+    assert_eq!(
+        latest_audit_column(&app, "origin").await.as_deref(),
+        Some("mcp")
+    );
+    assert_eq!(
+        latest_audit_column(&app, "actor_username").await.as_deref(),
+        Some("admin-key")
+    );
 }
