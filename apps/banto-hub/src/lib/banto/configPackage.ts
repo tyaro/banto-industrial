@@ -5,6 +5,7 @@ import {
 	type PlcConnectionInput,
 	type PlcProtocol,
 	type SlmpWordOrder,
+	type StringEncoding,
 	type Tag,
 	type TagInput
 } from './tagRegistryAdmin';
@@ -191,6 +192,21 @@ function expectWordOrder(value: unknown, path: string): SlmpWordOrder {
 }
 
 /**
+ * `stringEncoding` は既存のエクスポート済み構成パッケージ（この項目を
+ * 持たない旧スキーマ）にはまだ存在しない可能性があるので、
+ * `expectWordOrder` と同じ理由で省略を許容する — 省略時は既定値
+ * `'utf8'` にフォールバックし、旧パッケージのインポートを壊さない
+ * （`CONFIG_PACKAGE_SCHEMA_VERSION` は据え置き — 後方互換な追加
+ * フィールドなのでバージョンを上げる理由がない）。値が存在する場合は
+ * `utf8`/`shift_jis` のいずれかであることを検証する。
+ */
+function expectStringEncoding(value: unknown, path: string): StringEncoding {
+	if (value === undefined || value === null) return 'utf8';
+	if (value === 'utf8' || value === 'shift_jis') return value;
+	throw new ConfigPackageParseError(`${path} は utf8 または shift_jis のいずれかです`);
+}
+
+/**
  * T19 S1-b（UX-34、2026-09-02 オーナー決定）: `defaultWritable` は既存の
  * エクスポート済み構成パッケージ（この項目を持たない旧スキーマ）には
  * まだ存在しない可能性があるので、`expectWordOrder` と同じ理由で省略を
@@ -244,6 +260,7 @@ function sanitizeTag(input: Tag, groupName: string): ConfigPackageTag {
 		address: input.address,
 		dataType: input.dataType,
 		stringLength: input.stringLength,
+		stringEncoding: input.stringEncoding,
 		rawLo: input.rawLo,
 		rawHi: input.rawHi,
 		engLo: input.engLo,
@@ -389,6 +406,7 @@ function parseTags(raw: unknown): ConfigPackageTag[] {
 			address: expectString(item.address, `tags[${index}].address`),
 			dataType: expectString(item.dataType, `tags[${index}].dataType`) as TagInput['dataType'],
 			stringLength: expectNullableNumber(item.stringLength, `tags[${index}].stringLength`),
+			stringEncoding: expectStringEncoding(item.stringEncoding, `tags[${index}].stringEncoding`),
 			rawLo: expectNullableNumber(item.rawLo, `tags[${index}].rawLo`),
 			rawHi: expectNullableNumber(item.rawHi, `tags[${index}].rawHi`),
 			expression: expectNullableString(item.expression, `tags[${index}].expression`),

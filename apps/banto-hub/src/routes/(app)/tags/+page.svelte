@@ -60,6 +60,7 @@
 		type TagInput,
 		type TagDataType,
 		type TagKind,
+		type StringEncoding,
 		type CollectionGroup,
 		type PlcConnection,
 		type BatchTagsResult,
@@ -205,6 +206,7 @@
 		address: string;
 		dataType: TagDataType;
 		stringLength: string;
+		stringEncoding: StringEncoding;
 		rawLo: string;
 		rawHi: string;
 		engLo: string;
@@ -238,6 +240,7 @@
 			address: '',
 			dataType: 'f32',
 			stringLength: '',
+			stringEncoding: 'utf8',
 			rawLo: '',
 			rawHi: '',
 			engLo: '',
@@ -267,6 +270,7 @@
 			address: t.address,
 			dataType: t.dataType,
 			stringLength: numOrEmpty(t.stringLength),
+			stringEncoding: t.stringEncoding,
 			rawLo: numOrEmpty(t.rawLo),
 			rawHi: numOrEmpty(t.rawHi),
 			engLo: numOrEmpty(t.engLo),
@@ -297,6 +301,7 @@
 		address: 'アドレス',
 		dataType: 'データ型',
 		stringLength: '文字列長',
+		stringEncoding: '文字コード',
 		rawLo: 'RawLo',
 		rawHi: 'RawHi',
 		engLo: 'EngLo',
@@ -340,6 +345,7 @@
 			address: isPlc ? form.address : '',
 			dataType: form.dataType,
 			stringLength: form.dataType === 'string' ? parseOptionalNumber(form.stringLength) : undefined,
+			stringEncoding: form.dataType === 'string' ? form.stringEncoding : undefined,
 			rawLo: parseOptionalNumber(form.rawLo),
 			rawHi: parseOptionalNumber(form.rawHi),
 			engLo: parseOptionalNumber(form.engLo),
@@ -2091,6 +2097,7 @@
 			count: '1',
 			dataType: 'i16',
 			stringLength: '',
+			stringEncoding: 'utf8',
 			unit: '',
 			decimals: '0',
 			rawLo: '',
@@ -2246,6 +2253,8 @@
 		dataType: TagDataType;
 		/** `dataType === 'string'` のときのみ使う（number input 由来）。 */
 		stringLength: string;
+		/** `dataType === 'string'` のときのみ使う（select 由来）。既定 `'utf8'`。 */
+		stringEncoding: StringEncoding;
 		/** 手動割付モードのときのみ使う。 */
 		address: string;
 	}
@@ -2264,7 +2273,7 @@
 	let nextStructFieldRowId = 1;
 
 	function blankStructFieldRow(id: number = 0): StructFieldFormRow {
-		return { id, name: '', dataType: 'i16', stringLength: '', address: '' };
+		return { id, name: '', dataType: 'i16', stringLength: '', stringEncoding: 'utf8', address: '' };
 	}
 
 	interface StructFormState {
@@ -2325,6 +2334,7 @@
 			name: f.name,
 			dataType: f.dataType,
 			stringLength: f.dataType === 'string' ? (parseOptionalNumber(f.stringLength) ?? null) : null,
+			stringEncoding: f.dataType === 'string' ? f.stringEncoding : null,
 			address: structForm.mode === 'manual' ? f.address : undefined
 		}));
 		return structForm.mode === 'auto'
@@ -3469,6 +3479,13 @@
 						>{errors.stringLength}</span
 					>{/if}
 			</label>
+			<label class="field">
+				文字コード
+				<select id="tag-string-encoding" bind:value={form.stringEncoding}>
+					<option value="utf8">UTF-8</option>
+					<option value="shift_jis">Shift-JIS</option>
+				</select>
+			</label>
 		{/if}
 		<label class="field">
 			単位
@@ -3741,6 +3758,13 @@
 				bind:value={continuousForm.stringLength}
 			/>
 			<span class="hint">{MIN_STRING_LENGTH}〜{MAX_STRING_LENGTH} word。連番の増分もこの値。</span>
+		</label>
+		<label class="field">
+			文字コード
+			<select bind:value={continuousForm.stringEncoding}>
+				<option value="utf8">UTF-8</option>
+				<option value="shift_jis">Shift-JIS</option>
+			</select>
 		</label>
 	{/if}
 	<label class="field">
@@ -5149,6 +5173,16 @@
 									bind:value={field.stringLength}
 									data-testid={`struct-reg-field-strlen-${i}`}
 								/>
+							</label>
+							<label class="field">
+								文字コード
+								<select
+									bind:value={field.stringEncoding}
+									data-testid={`struct-reg-field-strenc-${i}`}
+								>
+									<option value="utf8">UTF-8</option>
+									<option value="shift_jis">Shift-JIS</option>
+								</select>
 							</label>
 						{/if}
 						{#if structForm.mode === 'manual'}

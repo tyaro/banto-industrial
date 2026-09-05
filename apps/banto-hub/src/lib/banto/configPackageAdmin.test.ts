@@ -322,4 +322,66 @@ describe('applyConfigPackage: 全件成功する通常の import（回帰ガー�
 		expect(summary.grpcApplied).toBe(true);
 		expect(summary.warnings).toEqual([]);
 	});
+
+	// stringEncoding が config package のバックアップ/復元経路だけ未対応で、
+	// shift_jis のタグを復元すると暗黙的に utf8 へ戻ってしまう潜在バグの
+	// 回帰ガード（2026-09-05）: pkg.tags[].stringEncoding が createTag に渡す
+	// TagInput までそのまま伝播することを固定する。
+	it('tag の stringEncoding が createTag に渡す TagInput にそのまま伝播する（shift_jis が utf8 に落ちない）', async () => {
+		vi.mocked(createPlcConnection).mockResolvedValue({
+			id: 1,
+			name: 'plc1',
+			protocol: 'modbus-tcp',
+			host: '192.168.11.200',
+			port: 502,
+			unitId: 1,
+			enabled: true,
+			simulation: false,
+			wordOrder: 'low_high'
+		});
+		vi.mocked(createCollectionGroup).mockResolvedValue({
+			id: 1,
+			name: 'group1',
+			plcConnectionId: 1,
+			periodMs: 1000,
+			enabled: true,
+			defaultWritable: true
+		});
+		vi.mocked(createTag).mockResolvedValue({
+			id: 1,
+			name: 'tag1',
+			collectionGroupId: 1,
+			address: 'D3000',
+			dataType: 'i16',
+			stringLength: null,
+			stringEncoding: 'shift_jis',
+			rawLo: null,
+			rawHi: null,
+			engLo: null,
+			engHi: null,
+			unit: null,
+			decimals: 0,
+			thresholdH: null,
+			thresholdHh: null,
+			thresholdL: null,
+			thresholdLl: null,
+			enabled: true,
+			writable: false,
+			tagKind: 'plc',
+			expression: null,
+			retain: false,
+			revision: 1
+		});
+
+		const pkgWithShiftJis: ConfigPackage = {
+			...pkg,
+			tags: pkg.tags.map((tag) => ({ ...tag, stringEncoding: 'shift_jis' }))
+		};
+
+		await applyConfigPackage(pkgWithShiftJis);
+
+		expect(createTag).toHaveBeenCalledWith(
+			expect.objectContaining({ name: 'tag1', stringEncoding: 'shift_jis' })
+		);
+	});
 });

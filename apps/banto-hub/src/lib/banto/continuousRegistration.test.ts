@@ -35,6 +35,7 @@ function baseForm(overrides: Partial<ContinuousFormState> = {}): ContinuousFormS
 		count: '1',
 		dataType: 'i16',
 		stringLength: '',
+		stringEncoding: 'utf8',
 		unit: '',
 		decimals: '0',
 		rawLo: '',

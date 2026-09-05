@@ -84,6 +84,7 @@ const DEFAULT_ROW: CsvRowFields = {
 	address: 'D100',
 	dataType: 'i16',
 	stringLength: '',
+	stringEncoding: '',
 	unit: '',
 	decimals: '',
 	rawLo: '',
@@ -214,6 +215,18 @@ describe('classifyCsvUpdate: changed', () => {
 		const result = classifyCsvUpdate(rows, [existing]);
 		const enabledDiff = result.rows[0].diffs?.find((d) => d.field === 'enabled');
 		expect(enabledDiff).toEqual({ field: 'enabled', from: 'オン', to: 'オフ' });
+	});
+
+	it('stringEncoding だけが変わった行も changed になる(T20 ①a-UI)', () => {
+		const existing = makeTag({ dataType: 'string', stringLength: 8, stringEncoding: 'utf8' });
+		const rows = parsed([
+			csvRow({ dataType: 'string', stringLength: '8', stringEncoding: 'shift_jis' })
+		]);
+		const result = classifyCsvUpdate(rows, [existing]);
+		expect(result.rows[0].category).toBe('changed');
+		expect(result.rows[0].diffs).toEqual([
+			{ field: 'stringEncoding', from: 'utf8', to: 'shift_jis' }
+		]);
 	});
 });
 

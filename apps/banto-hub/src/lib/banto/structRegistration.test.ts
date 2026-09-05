@@ -56,6 +56,17 @@ describe('allocateStructFields: ワード累積の自動割付', () => {
 		}
 	});
 
+	it('string 型の stringEncoding をそのまま引き継ぐ（既定 utf8 以外も可）', () => {
+		const fields: StructField[] = [
+			{ name: 'name', dataType: 'string', stringLength: 8, stringEncoding: 'shift_jis' }
+		];
+		const result = allocateStructFields('D3000', fields);
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			expect(result.rows[0]).toMatchObject({ stringEncoding: 'shift_jis' });
+		}
+	});
+
 	it('string 型で文字列長未指定はエラー', () => {
 		const fields: StructField[] = [{ name: 'name', dataType: 'string' }];
 		const result = allocateStructFields('D3000', fields);
@@ -261,5 +272,19 @@ describe('structRowsToTagInputs', () => {
 				writable: false
 			}
 		]);
+	});
+
+	it('string フィールドの stringEncoding を TagInput へ引き継ぐ', () => {
+		const alloc = allocateStructFields('D3000', [
+			{ name: 'name', dataType: 'string', stringLength: 8, stringEncoding: 'shift_jis' }
+		]);
+		expect(alloc.ok).toBe(true);
+		if (!alloc.ok) return;
+		const inputs = structRowsToTagInputs(alloc.rows, {
+			collectionGroupId: 7,
+			enabled: true,
+			writable: false
+		});
+		expect(inputs[0].stringEncoding).toBe('shift_jis');
 	});
 });
