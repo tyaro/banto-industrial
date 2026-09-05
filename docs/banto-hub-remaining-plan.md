@@ -29,7 +29,7 @@ read/write・構造体タグ登録＋オフセットコピー・レシピ一括�
 [plan.md](plan.md)・[tag-server-design.md](tag-server-design.md)・[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)・
 [banto-hub-t16-design.md](banto-hub-t16-design.md)・[banto-hub-t17-design.md](banto-hub-t17-design.md)・
 [improvement-plan.md](improvement-plan.md) を正とし、本書はそれらの残項目の**優先順位と着手順**を定める索引。
-最終検証日(監査): 2026-08-12（進捗行の同期: 2026-09-01）
+最終検証日(監査): 2026-08-12（進捗行の同期: 2026-09-06）
 基準コミット: 889f622（監査時）／`d5ba55e`（T18-5a 判定記録後の現 main、2026-08-14）
 
 ## 0. 前提と現況
