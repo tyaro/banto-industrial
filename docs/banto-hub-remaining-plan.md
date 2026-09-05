@@ -24,7 +24,7 @@ Phase 4 リリースゲート（H7① 実機 soak）のみ。**
 **進捗追記（2026-09-02〜06）**: その後 T19（UX-30〜48 の UI/UX 群、S1〜S5）・T20（文字列
 read/write・構造体タグ登録＋オフセットコピー・レシピ一括書き込み・ワードデバイスのビット
 .0〜.F、原子性バグ修正 #265）・T21（構成補助 MCP＝管理面 31 ツール、#266〜#274）を実装。
-現時点の残件は実機・需要待ちの #219/#210/#211/#123/#201（詳細は各設計書・README.md）のみ。
+現時点の残件は実機・需要待ちの #210/#211/#123/#201（詳細は各設計書・README.md）のみ。**#219（Modbus 書き込みの実機検証）は 2026-09-06 に実機確認済み・クローズ**（MELSEC を Modbus TCP スレーブ port 502 で公開し、MCP 管理面ツール経由で FC5/6/16 write・保持/コイル/入力 read が実機一致）。
 個別スライスの詳細設計は既存の
 [plan.md](plan.md)・[tag-server-design.md](tag-server-design.md)・[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)・
 [banto-hub-t16-design.md](banto-hub-t16-design.md)・[banto-hub-t17-design.md](banto-hub-t17-design.md)・
