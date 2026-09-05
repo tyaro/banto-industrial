@@ -568,7 +568,7 @@ fn tool_definitions() -> Vec<Value> {
         // (admin スコープ必須・有効化ガードなし)。
         json!({
             "name": "update_connection",
-            "description": "既存の PLC 接続を更新する(admin スコープ必須)。フォームと同じ全項目指定(PUT 相当) - 省略した項目は既定値に戻る。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
+            "description": "既存の PLC 接続を更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない)。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -577,23 +577,33 @@ fn tool_definitions() -> Vec<Value> {
                     "protocol": {
                         "type": "string",
                         "enum": ["modbus-tcp", "slmp"],
-                        "description": "既定値 modbus-tcp。",
+                        "description": "modbus-tcp または slmp。",
                     },
                     "host": { "type": "string", "description": "接続先ホスト名/IP。" },
                     "port": { "type": "integer", "description": "接続先ポート番号。" },
-                    "unitId": { "type": "integer", "description": "既定値 1。" },
-                    "enabled": { "type": "boolean", "description": "既定値 true。" },
+                    "unitId": { "type": "integer", "description": "Modbus のユニット ID。" },
+                    "enabled": { "type": "boolean", "description": "接続を有効にするか。" },
                     "simulation": {
                         "type": "boolean",
-                        "description": "true でシミュレータ接続にする。既定値 false。",
+                        "description": "true でシミュレータ接続にする。",
                     },
                     "wordOrder": {
                         "type": "string",
                         "enum": ["low_high", "high_low"],
-                        "description": "SLMP のワード順。既定値 low_high。",
+                        "description": "SLMP のワード順。",
                     },
                 },
-                "required": ["id", "name", "host", "port"],
+                "required": [
+                    "id",
+                    "name",
+                    "protocol",
+                    "host",
+                    "port",
+                    "unitId",
+                    "enabled",
+                    "simulation",
+                    "wordOrder",
+                ],
                 "additionalProperties": false,
             },
         }),
@@ -654,7 +664,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "update_group",
-            "description": "既存の収集グループを更新する(admin スコープ必須)。フォームと同じ全項目指定(PUT 相当)。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
+            "description": "既存の収集グループを更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない)。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -662,13 +672,20 @@ fn tool_definitions() -> Vec<Value> {
                     "name": { "type": "string", "description": "グループ名(接続内で一意)。" },
                     "plcConnectionId": { "type": "integer", "description": "所属する接続の id。" },
                     "periodMs": { "type": "integer", "description": "収集周期(ミリ秒)。" },
-                    "enabled": { "type": "boolean", "description": "既定値 true。" },
+                    "enabled": { "type": "boolean", "description": "グループを有効にするか。" },
                     "defaultWritable": {
                         "type": "boolean",
-                        "description": "このグループへ新規登録するタグの writable 既定値。既定値 true。",
+                        "description": "このグループへ新規登録するタグの writable 既定値。",
                     },
                 },
-                "required": ["id", "name", "plcConnectionId", "periodMs"],
+                "required": [
+                    "id",
+                    "name",
+                    "plcConnectionId",
+                    "periodMs",
+                    "enabled",
+                    "defaultWritable",
+                ],
                 "additionalProperties": false,
             },
         }),
@@ -1426,6 +1443,62 @@ async fn tool_delete_connection(
 // 二重実装しない。
 // ---------------------------------------------------------------------------
 
+/// Copilot 指摘（PR #268）対応: `update_connection`/`update_group`は
+/// フォームと同じ「全項目指定(PUT 置換)」の設計だが、`PlcConnectionPayload`/
+/// `CollectionGroupPayload`は`#[serde(default = ...)]`を持つため、
+/// `serde_json::from_value`に直接通すと省略フィールドが黙って既定値に
+/// 上書きされてしまう（例: `update_group`で`enabled`省略→既定 true に
+/// 戻る）。inputSchema の`required`だけでは MCP クライアントが無視した
+/// 場合に防げないため、デシリアライズ前に`arguments`（JSON object）へ
+/// この関数で必須キーの充足を確認し、1つでも欠けていれば拒否する。
+fn require_all_fields(arguments: &Value, required: &[&str]) -> Option<Value> {
+    let Some(obj) = arguments.as_object() else {
+        return Some(tool_error(
+            "missing_fields: arguments はオブジェクトである必要があります。",
+        ));
+    };
+    let missing: Vec<&str> = required
+        .iter()
+        .filter(|key| !obj.contains_key(**key))
+        .copied()
+        .collect();
+    if missing.is_empty() {
+        None
+    } else {
+        Some(tool_error(format!(
+            "missing_fields: update は全項目指定が必要です(省略項目の既定値上書きを防ぐため)。不足: {}",
+            missing.join(", ")
+        )))
+    }
+}
+
+/// [`tool_update_connection`]の必須キー一覧 - `PlcConnectionPayload`の
+/// wire フィールド（camelCase）全部 + `id`。inputSchema の
+/// `update_connection.required`と同期させること。
+const UPDATE_CONNECTION_REQUIRED_FIELDS: [&str; 9] = [
+    "id",
+    "name",
+    "protocol",
+    "host",
+    "port",
+    "unitId",
+    "enabled",
+    "simulation",
+    "wordOrder",
+];
+
+/// [`tool_update_group`]の必須キー一覧 - `CollectionGroupPayload`の
+/// wire フィールド（camelCase）全部 + `id`。inputSchema の
+/// `update_group.required`と同期させること。
+const UPDATE_GROUP_REQUIRED_FIELDS: [&str; 6] = [
+    "id",
+    "name",
+    "plcConnectionId",
+    "periodMs",
+    "enabled",
+    "defaultWritable",
+];
+
 // --- 12. update_connection ----------------------------------------------------
 
 /// `crate::rest::plc_connections_update`（admin REST）と全く同じ mutation
@@ -1443,6 +1516,9 @@ async fn tool_update_connection(
         return Ok(err);
     }
     let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    if let Some(err) = require_all_fields(&arguments, &UPDATE_CONNECTION_REQUIRED_FIELDS) {
+        return Ok(err);
+    }
     let id = arguments
         .get("id")
         .and_then(Value::as_i64)
@@ -1709,6 +1785,9 @@ async fn tool_update_group(
         return Ok(err);
     }
     let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    if let Some(err) = require_all_fields(&arguments, &UPDATE_GROUP_REQUIRED_FIELDS) {
+        return Ok(err);
+    }
     let id = arguments
         .get("id")
         .and_then(Value::as_i64)

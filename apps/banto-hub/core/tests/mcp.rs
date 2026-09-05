@@ -1725,6 +1725,8 @@ async fn update_group_with_admin_scope_updates_and_audits() {
                 "name": "fast-renamed",
                 "plcConnectionId": conn_id,
                 "periodMs": 200,
+                "enabled": true,
+                "defaultWritable": true,
             }),
         ),
     )
@@ -1783,6 +1785,10 @@ async fn update_connection_with_admin_scope_updates_and_audits() {
                 "protocol": "slmp",
                 "host": "127.0.0.1",
                 "port": 15099,
+                "unitId": 1,
+                "enabled": true,
+                "simulation": false,
+                "wordOrder": "low_high",
             }),
         ),
     )
@@ -1817,6 +1823,126 @@ async fn update_connection_with_admin_scope_updates_and_audits() {
     assert_eq!(
         latest_audit_column(&app, "origin").await.as_deref(),
         Some("mcp")
+    );
+}
+
+/// Copilot 指摘（PR #268）の回帰防止:`update_connection`は全項目指定の
+/// PUT 置換だが、`PlcConnectionPayload`は`#[serde(default = ...)]`を
+/// 持つため、省略フィールドをサーバーが拒否しないと黙って既定値で
+/// 上書きされてしまう（例: `enabled`省略で既定 true に戻る）。ここでは
+/// `enabled`を省いた入力が`missing_fields`で拒否され、対象行が一切
+/// 変化しないことを確認する。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_connection_missing_field_is_rejected_and_row_unchanged() {
+    let app = test_app("s1c-update-conn-missing-field").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    let before = PlcConnectionService::new(app.pool.clone())
+        .get(conn_id)
+        .await
+        .unwrap();
+    let audit_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "update_connection",
+            json!({
+                "id": conn_id,
+                "name": "line1-renamed",
+                "protocol": "slmp",
+                "host": "127.0.0.1",
+                "port": 15099,
+                "unitId": 1,
+                // "enabled" を意図的に省略。
+                "simulation": false,
+                "wordOrder": "low_high",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("missing_fields"), "{text}");
+    assert!(text.contains("enabled"), "{text}");
+
+    let after = PlcConnectionService::new(app.pool.clone())
+        .get(conn_id)
+        .await
+        .unwrap();
+    assert_eq!(after.name, before.name, "row must not change");
+    assert_eq!(after.port, before.port, "row must not change");
+    assert_eq!(after.enabled, before.enabled, "row must not change");
+
+    let audit_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        audit_count_after, audit_count_before,
+        "rejected update must not add an audit_log row"
+    );
+}
+
+/// Copilot 指摘（PR #268）の回帰防止:`update_group`版。`enabled`を省いた
+/// 入力が`missing_fields`で拒否され、対象行が一切変化しないことを確認
+/// する（[`update_connection_missing_field_is_rejected_and_row_unchanged`]
+/// と同型）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_group_missing_field_is_rejected_and_row_unchanged() {
+    let app = test_app("s1c-update-group-missing-field").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+    let audit_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "update_group",
+            json!({
+                "id": group.id,
+                "name": "fast-renamed",
+                "plcConnectionId": conn_id,
+                "periodMs": 200,
+                // "enabled" を意図的に省略。
+                "defaultWritable": true,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("missing_fields"), "{text}");
+    assert!(text.contains("enabled"), "{text}");
+
+    let stored = CollectionGroupService::new(app.pool.clone())
+        .get(group.id)
+        .await
+        .unwrap();
+    assert_eq!(stored.name, "fast", "row must not change");
+    assert_eq!(stored.period_ms, 100, "row must not change");
+
+    let audit_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        audit_count_after, audit_count_before,
+        "rejected update must not add an audit_log row"
     );
 }
 
