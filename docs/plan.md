@@ -3,15 +3,16 @@
 作成日: 2026-07-12（過去アプリ棚卸しと記録計構想の議論に基づく）
 状態: **進行中。I系（I0〜I6）実装済み（I6 = banto-broker として抽出済み）、
 W系（relay-wright）は W5 まで実装済み（実機検証のみ残、§4b）。T系（タグサーバー、
-§4c）は T0〜T18-6 実装済み（試運転モード/ロックダウン・収集開始停止 UI・タグ名
-一意性の収集グループ内一意への緩和を含む、2026-08-31）。残 T18-5c/d（Windows
-実機往復・72h soak = 実機必須）と P3-b の残件（SLMP CPU 種別/アクセスルート露出
-= バックログ。word order 自体は #127 で完了済み）。T13〜T18 の詳細と最新の全体像は
+§4c）は T0〜T21 実装済み（試運転モード/ロックダウン・収集開始停止 UI・タグ名
+一意性の収集グループ内一意への緩和・T19 UX 群・T20 文字列/構造体/レシピ/ビット・
+T21 構成補助 MCP 管理面を含む、2026-09-06）。残 T18-5c/d（Windows
+実機往復・72h soak = 実機必須）と実機・需要待ちの #219/#210/#211/#123/#201。
+T13〜T18 の詳細と最新の全体像は
 [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) と
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
 T13-1 までの粒度で、以降は同書へ移管）。Hardening（H1〜H10）は H7 の① 実機 soak
 のみ残（詳細は improvement-plan.md）。docs 全体の
-地図は [README.md](README.md)**（2026-09-01 更新。本文の T 系表は 2026-08-08 時点の
+地図は [README.md](README.md)**（2026-09-06 更新。本文の T 系表は 2026-08-08 時点の
 まま — 実装状況の正は banto-hub-remaining-plan.md/banto-hub-desktop-plan.md）
 最終検証日(コード照合): 2026-09-01
 
@@ -112,7 +113,7 @@ Three 判断の経緯は本節と W1〜W5 実装（下表）に集約済み）: 
 | W4    | 監視・操作画面（エンジン制御・書き込み監査ログ・ナビゲーション、実装済み）                                                       | W3-B2   |                                                                                                                  |
 | W5    | 安全性強化（サイクル検出網羅テスト・レート制限の決定論テスト・フレークテスト決定論化・ドキュメント整合・インストーラ確認、本PR） | W1〜W4  | **実機検証が残**: 実機 SLMP 互換・同時セッション数上限・`TypedDevice`/`PLCString`(Shift-JIS) 検証 — オーナー実施 |
 
-## 4c. タグサーバーアプリ banto-hub（T系）— T0〜T18-6 実装済み・残るは T18-5c/d・T5-5 等の実機依存項目のみ
+## 4c. タグサーバーアプリ banto-hub（T系）— T0〜T21 実装済み・残るは T18-5c/d・実機依存項目（#219/#210/#211/#123/#201）のみ
 
 （詳細と最新の全体像は [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md)・
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする。以下の T13 以降を含む表は

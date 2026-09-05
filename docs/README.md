@@ -4,14 +4,13 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
 1 画面で引くための地図。詳細は各文書へ辿る。
 
 状態: **地図として現行**。索引に徹し、実装状況・設計判断の本体は各文書側で管理する。
-最終更新: 2026-09-01（T18-6・試運転モード/ロックダウン・収集開始停止 UI・タグ名一意性緩和・
-H5 relay-wright E2E 完了・banto-tagclient S4a 統合を反映）。
-最終検証日(コード照合): 2026-09-01
+最終更新: 2026-09-06（T19（UX-30〜48）・T20（文字列/構造体/レシピ/ビット .0〜.F）・T21（構成補助 MCP 管理面）完了、MCP 31 ツール実機検証を反映）。
+最終検証日(コード照合): 2026-09-06
 
 > この地図は索引に徹する。実装状況・設計判断の本体は各文書側にあり、状態の**正**は
 > 常にリンク先の `状態:` 行と各表とする（CLAUDE.md H8 の状態欄同期規約）。
 
-## 現状ひとめ（2026-09-01）
+## 現状ひとめ（2026-09-06）
 
 - **構成**: Rust workspace + SvelteKit/Tauri。アプリは **banto-hub**（タグサーバー）/ **chronogazer**
   （記録計）/ **relay-wright**。上流 `banto` は git tag / `@banto/*` を消費（Rust クレート・npm
@@ -20,12 +19,15 @@ H5 relay-wright E2E 完了・banto-tagclient S4a 統合を反映）。
   （2026-09-01、Issue #220 — npm 側だけ v1.2.0 に取り残されていたのを是正した教訓）。
 - **I 系（基盤 I0〜I6）**: 実装済み（I6 = banto-broker として抽出済み）。
 - **W 系（relay-wright）**: W5 まで実装済み（実機検証のみ残）。
-- **T 系（banto-hub、T0〜T18）**: T0〜T18-6 実装済み。試運転モード/ロックダウン
-  （2026-08-31、tag-server-design.md §5.6）・収集の開始/停止 UI・タグ名一意性の
-  収集グループ内一意への緩和（migration 0011）も反映済み。**残るは T18-5c/d（Windows 実機往復・
-  狭幅/倍率・72h soak = オーナー同席の実機検証）と P3-b の残件（SLMP CPU 種別/アクセスルート露出 =
-  需要ドリブンのバックログ。word order 自体は #127 で完了済み）**。T18-5a は「全タグのクライアント保持
-  （上限 10,000 タグ）」を正式仕様化（windowed 化はバックログ降格）。
+- **T 系（banto-hub、T0〜T21）**: T0〜T18-6 に加え、**T19（UX-30〜48 の UI/UX 群、S1〜S5）・T20（文字列
+  read/write・構造体タグ登録＋オフセットコピー・レシピ一括書き込み・ワードデバイスのビット .0〜.F）・
+  T21（構成補助 MCP＝管理面ツール）まで完了**（2026-09-06）。**残るは T18-5c/d（Windows 実機往復・
+  狭幅/倍率・72h soak = オーナー同席の実機検証）と、実機・需要待ちの #219/#210/#211/#123/#201 のみ**。
+  T18-5a は「全タグのクライアント保持（上限 10,000 タグ）」を正式仕様化（windowed 化はバックログ降格）。
+- **MCP（機械/AI 向け外部 IF）**: `POST /mcp`（API キー認証）で **31 ツール** — データ面（値の
+  read/write・レシピ・状態参照）＋管理面（接続/グループ/タグ CRUD・設定 gRPC/MQTT/retention・
+  収集/write 制御・API キー発行/失効・lock_down）。実機 R08ENCPU で全ツール検証済み
+  （2026-09-06、実バグ0）。IF 詳細は [banto-hub-mcp-reference.md](banto-hub-mcp-reference.md)。
 - **Hardening（H1〜H10）**: H1〜H6・H8・H10 完了。H9 は 2026-08-14 に完全完了。H5 は relay-wright の
   組み込みサーバーモード E2E を含め完了（2026-08-30、PR #193。Tauri 固有経路の E2E は WebDriver 課題と
   して別スコープに分離）。**残るは H7 の① 実機 soak のみ**（詳細は improvement-plan.md）。
@@ -52,9 +54,9 @@ H5 relay-wright E2E 完了・banto-tagclient S4a 統合を反映）。
 | [plan.md](plan.md)                                         | **全体計画の親**。I/R/W/T 系マイルストーンと依存の一覧。                                                                                                          |
 | [tag-server-design.md](tag-server-design.md)               | **banto-hub 設計の一次ソース**。タグ空間モデル・外部 IF・書き込み安全。実装状況は §9（T 系）表が正。                                                              |
 | [banto-tagclient-design.md](banto-tagclient-design.md)     | **banto-tagclient の実装前設計**。読み取り専用SDKのREST/WS、binding、再接続、停止、テストゲートの正。                                                             |
+| [banto-rtsp-design.md](banto-rtsp-design.md)               | RTSP 映像取り込み設計（Draft、Phase 1 実装済み・実機/配布確認待ち）。                                                                                             |
 | [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)     | **banto-hub 運転計画（T14〜T18）・UI/UX 決定台帳**。§9.3〜9.5 が T18 タグ登録 UX の受け入れの正。                                                                 |
 | [banto-hub-operations.md](banto-hub-operations.md)         | **banto-hub 運用ガイド**（起動・ポート・API/MQTT/gRPC・サービス化・soak 手順）。現状の運用を引く入口。                                                            |
-| [banto-hub-t14-design.md](banto-hub-t14-design.md)         | T14 詳細設計（ランタイム状態管理・制御面分離）。                                                                                                                  |
 | [banto-hub-t16-design.md](banto-hub-t16-design.md)         | T16 詳細設計（デスクトップシェル・タスクトレイ）。                                                                                                                |
 | [banto-hub-t17-design.md](banto-hub-t17-design.md)         | T17 詳細設計（SCM 管理・profile・UAC・インストーラ）。                                                                                                            |
 | [banto-hub-t18-design.md](banto-hub-t18-design.md)         | T18 詳細設計（タグ登録 UI/UX・性能検証）の実装分解索引（受け入れは desktop-plan §9.4 が正）。                                                                     |
@@ -65,8 +67,6 @@ H5 relay-wright E2E 完了・banto-tagclient S4a 統合を反映）。
 | [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) | banto-hub **残作業の優先順位・着手順の索引**（他文書を正とする）。銘柄横断で現状を掴む最短路。                                                                    |
 | [improvement-plan.md](improvement-plan.md)                 | Hardening（H1〜H10）の設計・進捗ログ。                                                                                                                            |
 | [recorder-requirements.md](recorder-requirements.md)       | 記録計（chronogazer）R0 要件定義。R1〜R4 スコープの正。                                                                                                           |
-| [r1-plan.md](r1-plan.md)                                   | 記録計 R1 実施計画。                                                                                                                                              |
-| [real-machine-mcp-2026-09.md](real-machine-mcp-2026-09.md) | **実機 MCP 動作検証（T19 S5/UX-41）**。3接続×全型の読み書きと安全ゲートの実機記録。                                                                               |
 
 ### トピック別の「正」（重複時はここを見る）
 
@@ -80,12 +80,16 @@ H5 relay-wright E2E 完了・banto-tagclient S4a 統合を反映）。
 
 各文書の冒頭に**アーカイブ・バナー**を付与済み。リンクは生きている（過去の rationale として参照可）。
 
-| 文書                                                         | 状態                                                                                                  |
-| ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- |
-| [ux-plan.md](ux-plan.md)                                     | UX 改善計画（T9〜T13）。T13-2/3 は desktop-plan/T18 へ移管済み。T9〜T12 の rationale として参照のみ。 |
-| [h10-3-read-scope-proposal.md](h10-3-read-scope-proposal.md) | H10③ read スコープの比較検討（案 B 採用、PR #75 で決着済み）。                                        |
-| [t5-handoff.md](t5-handoff.md)                               | T5 セッション引き継ぎメモ（内容は operations / desktop-plan に反映済み）。                            |
-| [r1a-readme-gaps.md](r1a-readme-gaps.md)                     | 上流 banto の README 手順の穴（外部フィードバック用チェックリスト。本リポの仕様ではない）。           |
+| 文書                                                         | 状態                                                                                                            |
+| ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| [ux-plan.md](ux-plan.md)                                     | UX 改善計画（T9〜T13）。T13-2/3 は desktop-plan/T18 へ移管済み。T9〜T12 の rationale として参照のみ。           |
+| [h10-3-read-scope-proposal.md](h10-3-read-scope-proposal.md) | H10③ read スコープの比較検討（案 B 採用、PR #75 で決着済み）。                                                  |
+| [t5-handoff.md](t5-handoff.md)                               | T5 セッション引き継ぎメモ（内容は operations / desktop-plan に反映済み）。                                      |
+| [banto-hub-t14-design.md](banto-hub-t14-design.md)           | T14（ランタイム状態管理・制御面分離）は実装完了。現行の設計判断は desktop-plan / tag-server-design へ吸収済み。 |
+| [r1-plan.md](r1-plan.md)                                     | 記録計 R1 実施計画。実施完了、記録として保存。                                                                  |
+| [real-machine-test-2026-09.md](real-machine-test-2026-09.md) | #130/#131/#123 の一回性実機検証記録。結果は tag-server-design.md §6.2 等に吸収済み。                            |
+| [real-machine-mcp-2026-09.md](real-machine-mcp-2026-09.md)   | T19 S5 の MCP 実機検証（2026-09-04）の一回性記録。現行 IF・実機検証索引は banto-hub-mcp-reference.md。          |
+| [r1a-readme-gaps.md](r1a-readme-gaps.md)                     | 上流 banto の README 手順の穴（外部フィードバック用チェックリスト。本リポの仕様ではない）。                     |
 
 ## 補足: なぜ状態ヘッダが厚くなるか
 

@@ -1,7 +1,11 @@
 # 実機 MCP 動作検証（T19 S5 / UX-41）
 
+> **📦 アーカイブ（2026-09-06）**: T19 S5 の MCP 実機検証（2026-09-04）の一回性記録。MCP の
+> 現行 IF・実機検証の索引は [banto-hub-mcp-reference.md](banto-hub-mcp-reference.md)（§9 に
+> T21 分も追記済み）。経緯として保存。
+
 作成日: 2026-09-04
-状態: **実施完了（2026-09-04）**。MCP `POST /mcp` 経由のみで、3接続 × 複数収集グループ × 全データ型（i16/u16/i32/u32/f32/bit）の書き込み→実機読み戻しが全一致。ゲート（writes_disabled / value_out_of_range / missing_write_scope）も MCP 経由で作動＝REST と同じ `execute_write` を通り抜け道なし。ロックダウン後の「アドバイザリのみ」は管理者アカウント要のため未実演（S5 統合テストで固定済み）
+状態: **アーカイブ（役目終了・経緯として保存）**。実施完了（2026-09-04）。MCP `POST /mcp` 経由のみで、3接続 × 複数収集グループ × 全データ型（i16/u16/i32/u32/f32/bit）の書き込み→実機読み戻しが全一致。ゲート（writes_disabled / value_out_of_range / missing_write_scope）も MCP 経由で作動＝REST と同じ `execute_write` を通り抜け道なし。ロックダウン後の「アドバイザリのみ」は管理者アカウント要のため未実演（S5 統合テストで固定済み）
 対象: [#247](https://github.com/tyaro/banto-industrial/pull/247) T19 S5 MCP（UX-41）
 
 ---

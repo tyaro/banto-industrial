@@ -3,8 +3,9 @@
 状態: **運用中の実務ガイド。§19「試運転モードとロックダウン」
 （docs/tag-server-design.md §5.6、2026-08-30 オーナー決定・2026-08-31
 実装完了）の運用手順を追記、§1 環境変数表を T17-1 profile path 一本化後の
-実装に合わせて修正済み（2026-09-01）。**
-最終検証日(コード照合): 2026-09-01
+実装に合わせて修正済み（2026-09-01）。§5 の Modbus 書き込み記述を実態
+（#131 で対応済み）に是正、§20「MCP 外部インターフェース」を追加（2026-09-06）。**
+最終検証日(コード照合): 2026-09-06
 
 対象読者: banto-hub を現場に導入・運用するオペレータ／導入担当者。
 banto-hub は Rust(axum) + SQLite の**単一 exe・ヘッドレスサーバー**です
@@ -37,6 +38,7 @@ REST / WebSocket / MQTT / gRPC の4経路で外部へ公開する「タグサー
 17. [タグの CSV インポート/エクスポート](#17-タグの-csv-インポートエクスポート)
 18. [PLC 接続テスト](#18-plc-接続テスト)
 19. [試運転モードとロックダウン](#19-試運転モードとロックダウン)
+20. [MCP 外部インターフェース（データ面＋構成補助）](#20-mcp-外部インターフェースデータ面構成補助)
 
 ## 1. 起動・環境変数
 
@@ -339,9 +341,9 @@ banto-hub は競合を**検出**します。書き戻し後の確認読みで期
 新規にビット書き込み用のワードを設計する際は、専用の予備ワードを
 割り当ててください。
 
-（Modbus 対応のビット書き込みを実装する場合は FC22 Mask Write
-Register がアトミックなためこの制約自体が不要になりますが、v1 時点で
-Modbus への書き込みは未対応です）。
+（Modbus TCP 配下タグの Numeric（数値/ビット、FC5/6/15/16）書き込みは対応済みです
+〈#131、詳細は tag-server-design.md §6.2〉。FC22 Mask Write Register によるアトミックな
+ビット書き込みは未対応で、上記の RMW 競合規約は Modbus でも同様に適用されます）。
 
 ## 6. TLS / リバースプロキシ
 
@@ -1457,3 +1459,26 @@ profile（`"default"`、§11 と同じ）が対象になります。対象 profi
 （ネットワーク越しに認証を外されてしまう）。UAC 昇格（ローカル管理者
 トークンへの同意）を要求するツールだけに経路を閉じることで、「ネット
 ワーク越しに試運転モードへ戻される」攻撃を構造的に排除しています。
+
+## 20. MCP 外部インターフェース（データ面＋構成補助）
+
+`POST /mcp`（JSON-RPC over Streamable HTTP、API キー `bh_` の Bearer 認証）で
+機械/AI クライアント向け MCP を公開しています。IF 詳細は
+[banto-hub-mcp-reference.md](banto-hub-mcp-reference.md) を参照してください。
+
+- **データ面**（T19 S5/T20）: `list_tags` / `read_tag_values` / `read_tag_now` /
+  `get_server_status` / `write_tag_value` / `write_recipe`。read/write は既存の
+  read/write スコープ・`execute_write` ゲートを通ります（抜け道はありません）。
+- **管理面（構成補助・T21）**: 接続/グループ/タグ CRUD、設定（gRPC/MQTT/retention）、
+  収集 start/stop・write-control、API キー発行/失効、`lock_down`。**新スコープ
+  `admin` を要求**します（read/write とは直交）。全操作を監査ログに記録します
+  （`origin=mcp`）。不可逆操作（delete 系・revoke・lock_down）は `{"confirm":true}`
+  必須です。更新系（`update_*`）は全項目指定（PUT 置換）です。
+- **ロックダウンとの関係**: ロックダウン後も `admin` スコープのキーで構成 MCP は
+  利用できます（§19 の「構成凍結」の意図的な緩和。tag-server-design.md §5.6 の
+  2026-09-06 追記参照）。write 系データツールは §19 のとおりアドバイザリ化します。
+  運用上、**admin スコープのキーはサーバー全権に相当するため配布を厳格に管理**
+  してください。
+- **運用の型**: 試運転（commissioning）起動中は admin REST が開くので初回 admin
+  キーは REST で発行し、以降は `/mcp` で構成できます（収集開始→write 有効化の順。
+  収集開始は write_enabled をリセットします）。

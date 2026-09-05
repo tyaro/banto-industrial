@@ -2,7 +2,8 @@
 
 作成日: 2026-09-05
 状態: **現行**。T19 S5（UX-41）で実装、T20 で `read_tag_now` / `write_recipe` を追加。
-2026-09-05 に実機 R08ENCPU（SLMP）でデータ面 6 ツールを検証済み（結果は §9）。構成補助（管理面）ツールは §6。
+2026-09-05 に実機 R08ENCPU（SLMP）でデータ面 6 ツールを検証済み、2026-09-06 に T21
+管理面を含む 31 ツール全数を実機で end-to-end 検証済み（結果は §9）。構成補助（管理面）ツールは §6。
 関連: [tag-server-design.md](tag-server-design.md)（タグ空間・書き込み安全の一次ソース）、
 [banto-hub-t20-design.md](banto-hub-t20-design.md)（文字列・レシピ・ビットの設計）、
 [banto-hub-operations.md](banto-hub-operations.md)（起動・ポート・運用）。
@@ -262,3 +263,11 @@ MCP から banto-hub を**構成**するツール群（T21、docs/banto-hub-t21-
 
 （実機 IP・ポートは本文書には残さない。運用手順は banto-hub-operations.md、
 実機接続の癖は運用メモを参照。）
+
+**2026-09-06（T21 管理面を実機で総当たり）**: 現 main の 31 ツールを実機
+R08ENCPU/SLMP に対し全 MCP 経由で end-to-end 検証（接続 create/test〈実機疎通〉→
+グループ/タグ CRUD → 収集開始 → write 有効化 → MCP で write 鍵発行 → 実機
+write/read/recipe 往復 → update 全項目必須/欠落拒否/停止時 revision 競合 →
+設定 get/set＋validation → API キー発行/一覧/失効〈confirm・失効後 401〉→
+lock_down）。**実バグ0**。lock_down は管理者アカウント未作成時に安全に拒否
+されることを確認（正しい挙動）。実機 IP は本書に残さない。
