@@ -949,6 +949,13 @@
 							のユーザー名・パスワードはパッケージに含まれません。必要なら下で再入力してください。
 						</p>
 					{/if}
+					{#if configPackageInspection.dbConnectionsPasswordRequired.length > 0}
+						<p class="note warning">
+							以下の PostgreSQL（DB Source）接続はパスワードを含みません（新規作成、または
+							既存接続でパスワード未設定のもの）。インポート後にパスワードの再設定が必要です:
+							{configPackageInspection.dbConnectionsPasswordRequired.join('、')}
+						</p>
+					{/if}
 					{#if configPackageInspection.warnings.length > 0}
 						<ul class="warnings">
 							{#each configPackageInspection.warnings as warning (warning)}

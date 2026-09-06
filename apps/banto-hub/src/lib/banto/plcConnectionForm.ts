@@ -36,26 +36,48 @@ import type {
 } from './tagRegistryAdmin';
 import { nextSequentialName } from './sequentialName';
 
+/**
+ * S1: `banto_tags::plc_connection::POSTGRES_PROTOCOL`/
+ * `tagRegistryAdmin.ts::POSTGRES_PROTOCOL`と同じ値をここに複製する
+ * （`tagTreeContextMenu.ts`の「依存ゼロ」方針と同じ理由 - このモジュールは
+ * `PlcConnection`等を**型としてのみ** import しており、`tagRegistryAdmin.ts`
+ * を値として import すると、そちらが `@banto/admin-core`/`./setup`/
+ * `./deferredDelete.svelte`（Svelte 5 rune を使う`.svelte.ts`）をトップ
+ * レベルで import するせいで、このモジュール単体のテスト
+ * （`plcConnectionForm.test.ts`、`vi.mock`無し）が`ReferenceError: $state
+ * is not defined`で落ちる - `tagRegistryAdmin.test.ts`のdoc comment
+ * 「vitest 制約の回避について」参照）。
+ */
+const POSTGRES_PROTOCOL: PlcProtocol = 'postgres';
+
 // "virtual" is intentionally NOT offered here — the two virtual connections
 // (calc/mem) are auto-provisioned by the backend, not created through this
 // form (plc-connections/+page.svelte の元コメントを踏襲)。
+//
+// S1（docs/banto-hub-external-db-design.md §4.1・§6-4）: 'postgres'
+// （PostgreSQL への DB Source 接続）はここに追加する - PLC ではないが、
+// 案A（既存3階層の流用、design §3.1）どおり同じ plc_connections
+// テーブル・同じ作成 Drawer から作る。
 export const PROTOCOL_OPTIONS: { value: PlcProtocol; label: string }[] = [
 	{ value: 'modbus-tcp', label: 'Modbus TCP' },
-	{ value: 'slmp', label: 'SLMP（MELSEC）' }
+	{ value: 'slmp', label: 'SLMP（MELSEC）' },
+	{ value: 'postgres', label: 'PostgreSQL（DB Source）' }
 ];
 
 /**
  * プロトコルごとの既定ポート。上のモジュール doc comment に根拠を記載。
  * `virtual` はここに含めない（新規作成の選択肢に出さないプロトコルであり、
- * ポートの意味を持たない接続のため）。
+ * ポートの意味を持たない接続のため）。`postgres` = 5432 は PostgreSQL の
+ * 標準ポート（design §4.2）。
  */
-export const DEFAULT_PORTS: Record<'modbus-tcp' | 'slmp', number> = {
+export const DEFAULT_PORTS: Record<'modbus-tcp' | 'slmp' | 'postgres', number> = {
 	'modbus-tcp': 502,
-	slmp: 5007
+	slmp: 5007,
+	postgres: 5432
 };
 
 function hasDefaultPort(protocol: PlcProtocol): protocol is keyof typeof DEFAULT_PORTS {
-	return protocol === 'modbus-tcp' || protocol === 'slmp';
+	return protocol === 'modbus-tcp' || protocol === 'slmp' || protocol === POSTGRES_PROTOCOL;
 }
 
 /** `protocol` の既定ポート。`virtual` など既定を持たないプロトコルは `undefined`。 */
@@ -105,6 +127,15 @@ export function nextConnectionName(
 	return nextSequentialName([...existingNames, ...pendingNames], prefix);
 }
 
+/**
+ * S1（docs/banto-hub-external-db-design.md §4.1、`crates/banto-tags/src
+ * /plc_connection.rs`の`MAX_DATABASE_LEN`/`MAX_USERNAME_LEN`）: サーバー側
+ * バリデーションの上限文字数をそのままミラーする。{@link validatePostgresFields}
+ * が使う。
+ */
+export const MAX_DATABASE_LEN = 128;
+export const MAX_USERNAME_LEN = 128;
+
 /** 編集フォーム状態（作成/編集共通）。数値入力は文字列で保持し、空欄=未設定。 */
 export interface PlcConnectionFormState {
 	name: string;
@@ -115,6 +146,26 @@ export interface PlcConnectionFormState {
 	enabled: boolean;
 	simulation: boolean;
 	wordOrder: SlmpWordOrder;
+	/** S1: `protocol === 'postgres'` のときだけ意味を持つ。DB 名。 */
+	database: string;
+	/** S1: `protocol === 'postgres'` のときだけ意味を持つ。DB ユーザー名。 */
+	username: string;
+	/**
+	 * S1: パスワード欄の生の入力値。**編集フォームでは絶対にプリフィル
+	 * しない** - `connectionToForm` は常に空文字列を返す（保存済みの
+	 * パスワードを一度も画面に出さないための設計、
+	 * `PlcConnection::password`の doc comment「外部呼び出し元へ決して
+	 * シリアライズしない」と同じ理由）。空欄のまま送信すると
+	 * `passwordForSubmit` が「現在のパスワードを変更しない」（update）/
+	 * 「パスワード無し」（create）に変換する。
+	 */
+	password: string;
+	/**
+	 * S1: 「パスワードを消去する」チェックボックス（編集フォームのみ表示）。
+	 * `true` のとき `passwordForSubmit` は `password` 欄の中身を無視して
+	 * 常に空文字列（=消去）を送る。
+	 */
+	clearPassword: boolean;
 }
 
 /**
@@ -137,11 +188,19 @@ export function blankConnectionForm(): PlcConnectionFormState {
 		// P3-b（監査指摘 2026-08-12）: バックエンドの既定
 		// （default_plc_word_order / SlmpConfig::default().word_order）と
 		// 一致させる。
-		wordOrder: 'low_high'
+		wordOrder: 'low_high',
+		database: '',
+		username: '',
+		password: '',
+		clearPassword: false
 	};
 }
 
-/** 保存済み接続をフォーム状態へ変換する（編集フォームの初期値）。 */
+/**
+ * 保存済み接続をフォーム状態へ変換する（編集フォームの初期値）。
+ * S1: `password`は常に空文字列で返す（上の`PlcConnectionFormState::password`
+ * の doc comment参照 - 保存済みのパスワードを画面に出さない）。
+ */
 export function connectionToForm(c: PlcConnection): PlcConnectionFormState {
 	return {
 		name: c.name,
@@ -151,13 +210,78 @@ export function connectionToForm(c: PlcConnection): PlcConnectionFormState {
 		unitId: String(c.unitId),
 		enabled: c.enabled,
 		simulation: c.simulation,
-		wordOrder: c.wordOrder
+		wordOrder: c.wordOrder,
+		database: c.database ?? '',
+		username: c.username ?? '',
+		password: '',
+		clearPassword: false
 	};
 }
 
-/** フォーム状態を API 入力（`PlcConnectionInput`）へ変換する。 */
+/**
+ * S1: `form.password`/`form.clearPassword` から`PlcConnectionInput::password`
+ * の tri-state を組み立てる - mirrors
+ * `banto_tags::PlcConnectionInput::password`のdoc comment（create/updateで
+ * 意味が違う点も含め）。
+ *
+ * - `clearPassword` が `true`: 常に `""`（消去。update専用の意味だが、
+ *   create側は`""`も「パスワード無し」として扱うので同じ値で安全）。
+ * - `password` が空文字列（未入力）: `undefined` を返す - update では
+ *   「現在のパスワードを変更しない」、create では「パスワード無し」と、
+ *   どちらの意味でも安全な既定値になる。
+ * - それ以外（非空文字列を入力）: その値をそのまま返す（置き換え/新規設定）。
+ */
+export function passwordForSubmit(
+	form: Pick<PlcConnectionFormState, 'password' | 'clearPassword'>
+): string | undefined {
+	if (form.clearPassword) return '';
+	return form.password === '' ? undefined : form.password;
+}
+
+/**
+ * S1（docs/banto-hub-external-db-design.md §4.1）: クライアント側の事前
+ * 検証 - サーバー側`validate_plc_connection_input`の postgres 必須ルール
+ * （`database`/`username`が trim 後空でないこと、`MAX_DATABASE_LEN`/
+ * `MAX_USERNAME_LEN`以内であること）だけをミラーする。他プロトコルでは
+ * 常に空オブジェクトを返す（このモジュールは非 postgres 用の禁止ルール
+ * ―`database`/`username`/`password`は postgres 以外では指定不可― を検証
+ * しない。`formToConnectionInput`がそもそも非 postgres ではこれらの
+ * フィールドを送らないため、フォーム側でこの逆ルールに違反しようがない）。
+ * メッセージは`crates/banto-tags/src/support.rs`の
+ * `required_message`/`max_length_message`と一字一句揃える。
+ */
+export function validatePostgresFields(
+	form: Pick<PlcConnectionFormState, 'protocol' | 'database' | 'username'>
+): Record<string, string> {
+	const errors: Record<string, string> = {};
+	if (form.protocol !== POSTGRES_PROTOCOL) return errors;
+
+	const database = form.database.trim();
+	if (database === '') {
+		errors.database = '必須項目です';
+	} else if (database.length > MAX_DATABASE_LEN) {
+		errors.database = `${MAX_DATABASE_LEN}文字以内で入力してください`;
+	}
+
+	const username = form.username.trim();
+	if (username === '') {
+		errors.username = '必須項目です';
+	} else if (username.length > MAX_USERNAME_LEN) {
+		errors.username = `${MAX_USERNAME_LEN}文字以内で入力してください`;
+	}
+
+	return errors;
+}
+
+/**
+ * フォーム状態を API 入力（`PlcConnectionInput`）へ変換する。S1: `protocol
+ * === 'postgres'`のときだけ`database`/`username`/`password`を足す - 他
+ * プロトコルではこの3フィールドを一切送らない（サーバーが非 postgres での
+ * 指定を拒否するため、そもそも送らないのが最も安全 -
+ * `validatePostgresFields`のdoc comment参照）。
+ */
 export function formToConnectionInput(form: PlcConnectionFormState): PlcConnectionInput {
-	return {
+	const base: PlcConnectionInput = {
 		name: form.name,
 		protocol: form.protocol,
 		host: form.host,
@@ -166,5 +290,12 @@ export function formToConnectionInput(form: PlcConnectionFormState): PlcConnecti
 		enabled: form.enabled,
 		simulation: form.simulation,
 		wordOrder: form.wordOrder
+	};
+	if (form.protocol !== POSTGRES_PROTOCOL) return base;
+	return {
+		...base,
+		database: form.database,
+		username: form.username,
+		password: passwordForSubmit(form)
 	};
 }

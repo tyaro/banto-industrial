@@ -193,7 +193,29 @@ export async function inspectConfigPackage(pkg: ConfigPackage): Promise<ConfigPa
 		warnings: uniqueWarnings(warnings),
 		mqttCredentialsRequired: pkg.mqtt.enabled,
 		mqttSettings,
-		grpcSettings
+		grpcSettings,
+		// S1（実装指示5）: export に password を含めない
+		// （`CONFIG_PACKAGE_EXCLUDED_SECRETS`の`'plc_connections.password'`）
+		// ので、パッケージが持つ postgres 接続は必ずパスワード無しで
+		// import される。ただし apply 側は name が一致する既存接続を
+		// `password` 省略で update するだけなら保存済みパスワードを
+		// そのまま維持する（S1a tri-state、`updatePlcConnection`参照）ため、
+		// 既に `passwordSet: true` の既存 postgres 接続を更新するだけの
+		// ケースでは再入力は不要 - 過剰に「全件再設定要」と案内しない
+		// よう、実際に再設定が必要な接続だけに絞る（2026-09 レビュー是正）:
+		// (a) 新規作成される postgres 接続（このパッケージにしか存在しない）
+		// (b) 既存 postgres 接続を更新するが、サーバー側で現在
+		//     `passwordSet: false`（未設定）のもの
+		dbConnectionsPasswordRequired: [
+			...connectionPlans.create
+				.filter((connection) => connection.protocol === 'postgres')
+				.map((connection) => connection.name),
+			...connectionPlans.update
+				.filter(
+					({ incoming, existing }) => incoming.protocol === 'postgres' && !existing.passwordSet
+				)
+				.map(({ incoming }) => incoming.name)
+		]
 	};
 }
 

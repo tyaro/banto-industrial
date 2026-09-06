@@ -42,7 +42,10 @@ const CONN_A: PlcConnection = {
 	unitId: 1,
 	enabled: true,
 	simulation: false,
-	wordOrder: 'low_high'
+	wordOrder: 'low_high',
+	database: null,
+	username: null,
+	passwordSet: false
 };
 const CONN_B: PlcConnection = {
 	id: 2,
@@ -53,7 +56,10 @@ const CONN_B: PlcConnection = {
 	unitId: 1,
 	enabled: true,
 	simulation: false,
-	wordOrder: 'low_high'
+	wordOrder: 'low_high',
+	database: null,
+	username: null,
+	passwordSet: false
 };
 const CONNECTIONS: PlcConnection[] = [CONN_A, CONN_B];
 

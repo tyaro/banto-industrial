@@ -69,6 +69,7 @@
 	import {
 		createCollectionGroup,
 		deleteCollectionGroup,
+		isDbSourceConnection,
 		isQueuedWhileRunningError,
 		updateCollectionGroup,
 		ALLOWED_PERIOD_MS,
@@ -155,6 +156,16 @@
 		onSaved,
 		onDeleted
 	}: Props = $props();
+
+	/**
+	 * S1（docs/banto-hub-external-db-design.md §3 項目13、実装指示4「サーバー
+	 * の422だけに頼らない」）: postgres（DB Source）接続配下には S1 では
+	 * グループを作れないため、選択肢自体から外す。`ConnectionTree.svelte`
+	 * 右クリックの「収集グループを作成」は既に disabled 化済み
+	 * （`tagTreeContextMenu.ts`）だが、この Drawer は他経路（将来の直接
+	 * 起動含む）からも開けるため、ここでも独立に防御する。
+	 */
+	const selectableConnections = $derived(connections.filter((c) => !isDbSourceConnection(c)));
 
 	const isCreate = $derived(group === null);
 	const drawerTitle = $derived(
@@ -399,7 +410,7 @@
 			PLC接続
 			<select bind:value={form.plcConnectionId} disabled={readOnly}>
 				<option value="" disabled>選択してください</option>
-				{#each connections as conn (conn.id)}
+				{#each selectableConnections as conn (conn.id)}
 					<option value={String(conn.id)}>{conn.name}</option>
 				{/each}
 			</select>

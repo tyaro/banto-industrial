@@ -79,7 +79,13 @@ const connectionInput: PlcConnectionInput = {
 	wordOrder: 'low_high'
 };
 
-const connectionResource: PlcConnection = { id: 1, ...connectionInput };
+const connectionResource: PlcConnection = {
+	id: 1,
+	...connectionInput,
+	database: null,
+	username: null,
+	passwordSet: false
+};
 
 const tagInput: TagInput = {
 	name: 'tag1',

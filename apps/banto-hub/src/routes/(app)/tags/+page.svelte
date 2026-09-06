@@ -1993,6 +1993,12 @@
 				openConnectionCreateDrawer();
 				break;
 			case 'createGroup':
+				// S1（docs/banto-hub-external-db-design.md §3 項目13）: 防御的
+				// ガード - 通常はメニュー項目自体が`disabled`でクリック/Enter
+				// を受け付けない（`TreeContextMenu.svelte::activate`側の
+				// ガード）が、万一ここに来ても postgres 接続配下では Drawer
+				// を開かない。
+				if (action.disabled) break;
 				openGroupCreateDrawer(action.connectionId);
 				break;
 			case 'reconfigureConnection':
@@ -4641,6 +4647,12 @@
 		items={treeContextMenu.items.map((action) => ({
 			id: action.kind,
 			label: action.label,
+			// S1（docs/banto-hub-external-db-design.md §3 項目13）: postgres
+			// 接続配下の`createGroup`だけが`disabled`/`disabledReason`を
+			// 持ちうる（`tagTreeContextMenu.ts`参照）- 他 kind は常に
+			// `undefined`なので`TreeContextMenu`側は常時有効のまま。
+			disabled: 'disabled' in action ? action.disabled : undefined,
+			title: 'disabledReason' in action ? action.disabledReason : undefined,
 			onSelect: () => activateTreeContextMenuAction(action)
 		}))}
 		onClose={closeTreeContextMenu}
