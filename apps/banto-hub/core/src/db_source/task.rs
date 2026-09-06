@@ -5,9 +5,13 @@
 //!
 //! [`run_connection`] は「接続する → 各グループの SQL を describe する →
 //! 最小デッドライン方式で回す → 接続レベルの失敗で抜ける → バックオフして
-//! 最初へ戻る」という**終わらないループ**。停止は
-//! [`crate::db_source::DbSourceEngine`] が `JoinHandle::abort` で行う
-//! （`crate::runtime::RunningHub::shutdown` の順序 - モジュール doc 参照）。
+//! 最初へ戻る」という**終わらないループ**。停止は abort で行う
+//! （S2b 以降、この future を直接 spawn するのは
+//! [`crate::db_source::supervisor::supervise`] で、abort もそこ経由 -
+//! 収集停止・plan 差し替え・シャットダウンの3経路すべてが
+//! [`crate::db_source::DbSourceEngine`] から supervisor へ届く）。
+//! **戻ってはいけない**: 戻った場合 supervisor はそれを異常とみなして
+//! バックオフ付きで作り直す（§4.8・§6-17）。
 //!
 //! グループのスケジューリングは「次に期限が来るグループまで眠る」最小
 //! デッドライン方式で、`banto-collect` の収集タスクと考え方は同じだが
@@ -271,6 +275,7 @@ async fn connect(plan: &DbConnectionPlan) -> Result<PgPool, PgFailure> {
         &plan.database,
         &plan.username,
         &plan.password,
+        &plan.connection_name,
     );
     PgPoolOptions::new()
         .max_connections(POOL_MAX_CONNECTIONS)
@@ -736,10 +741,18 @@ fn record_connection_failure(
 
 /// §4.3「接続断（バックオフ中）→ 接続単位で全タグ Bad」。
 fn mark_all_bad(plan: &DbConnectionPlan, deps: &TaskDeps) {
-    let now_ms = deps.clock.now_ms();
+    mark_connection_bad(plan, &deps.store, deps.clock.now_ms());
+}
+
+/// 1接続の計画に載っている全タグへ Bad を書く、たった1つの実装。
+/// [`mark_all_bad`]（接続断）と
+/// [`crate::db_source::DbSourceEngine::stop`]（S2b の収集停止、§4.8・
+/// §6-16）が共有する - どちらも「この接続はいま値を作れない」を意味する
+/// ので、書き方が食い違ってはいけない。
+pub(crate) fn mark_connection_bad(plan: &DbConnectionPlan, store: &ServerTagStore, now_ms: i64) {
     for group in &plan.groups {
         for tag in &group.tags {
-            deps.store.set(&tag.tag_key, None, Quality::Bad, now_ms);
+            store.set(&tag.tag_key, None, Quality::Bad, now_ms);
         }
     }
 }
@@ -858,6 +871,7 @@ mod tests {
                 disabled: Vec::new(),
             },
             &std::collections::HashSet::new(),
+            true,
         );
         let mut group = group_runtime();
 
@@ -920,6 +934,8 @@ mod tests {
             last_poll_at: Some(1_000),
             last_error: None,
             consecutive_failures: 0,
+            restarts: 0,
+            last_restart_reason: None,
             groups: Vec::new(),
         };
 

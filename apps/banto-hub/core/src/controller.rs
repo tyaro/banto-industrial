@@ -4,6 +4,13 @@
 //! [`crate::hub::CollectorManager`]. The manager keeps ownership of the
 //! collector, broker sessions, simulators, and computed engine; this module
 //! owns only lifecycle state, transition serialization, and run identifiers.
+//!
+//! 外部 DB 連携 S2b（docs/banto-hub-external-db-design.md §4.8・§6-16、
+//! 2026-09-06 オーナー決定）以降、ここは「収集が Running か」に連動して
+//! 動く**唯一の**もう1つの機構、`crate::db_source::DbSourceEngine` の
+//! 起動・停止点でもある（`CollectionController::db_source` のフィールド
+//! doc comment に、なぜ `CollectorManager` 側ではなくここなのかを書いて
+//! ある）。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,6 +20,7 @@ use serde::Serialize;
 use tokio::sync::watch;
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::db_source::DbSourceEngine;
 use crate::hub::CollectorManager;
 use crate::test_output::TestOutputControl;
 use crate::write_control::WriteControl;
@@ -93,6 +101,23 @@ pub struct CollectionController {
     /// run コンテキストのみ」に留まることをここで保証する
     /// （`crate::test_output`のモジュール doc comment参照）。
     test_output: Arc<TestOutputControl>,
+    /// 外部 DB 連携 S2b（docs/banto-hub-external-db-design.md §4.8・§6-16、
+    /// 2026-09-06 オーナー決定「DB Source は収集が Running のときだけ
+    /// 動く」）: `manager` が所有する `Arc` の複製
+    /// （[`CollectorManager::db_source_engine`]）。
+    ///
+    /// **ここに置く理由**: 「収集が Running か」の唯一の権威はこの
+    /// controller であり、Running へ入る・出る遷移は必ず
+    /// [`Self::start_locked`]/[`Self::stop_locked`] のどちらかを通る
+    /// （`start`/`stop`/`set_mode` の3つの公開入口 - REST の
+    /// `POST /api/collection/{start,start-simulation,stop}` と
+    /// `PUT /api/collection/mode`、MCP の `collection_control`、Windows
+    /// サービス起動時の自動 start がすべてそこへ集まる）。`CollectorManager`
+    /// 側（`apply_run`/`stop`）に置くと、収集の遷移ではない
+    /// `crate::rest::commit_catalog_and_notify` の legacy live reconfigure
+    /// も `apply_run` を呼ぶため、「停止中なのに DB へ繋ぐ」経路が1本
+    /// 残ってしまう。
+    db_source: Arc<DbSourceEngine>,
     state: Mutex<ControllerState>,
     transition: AsyncMutex<()>,
     run_seq: AtomicU64,
@@ -122,10 +147,12 @@ impl CollectionController {
             running_revision: manager.running_revision(),
         };
         let (status_tx, _status_rx) = watch::channel(initial);
+        let db_source = manager.db_source_engine();
         Self {
             manager,
             write_control,
             test_output,
+            db_source,
             state: Mutex::new(ControllerState {
                 state: CollectionState::Stopped,
                 mode: RunMode::Configured,
@@ -324,17 +351,28 @@ impl CollectionController {
             .state
             .lock()
             .expect("collection controller state lock poisoned");
-        match result {
+        let started = match result {
             Ok(()) => {
                 state.state = CollectionState::Running;
                 state.last_error = None;
+                true
             }
             Err(error) => {
                 state.state = CollectionState::Faulted;
                 state.last_error = Some(error);
+                false
             }
-        }
+        };
         drop(state);
+        // 外部 DB 連携 S2b（§4.8・§6-16）: 収集が実際に Running になった
+        // ときだけ DB Source のタスクを起こす。`Faulted`（`apply_run` が
+        // 失敗して収集が始まらなかった）では起こさない - 「収集開始で
+        // 起動」の意味は「Running になったら」であり、片系だけ動いている
+        // 状態を作らないため。決定 §4.8「片方が落ちても Running 状態は
+        // 変わらない」の裏返しで、そもそも Running になっていない。
+        if started {
+            self.db_source.start();
+        }
         self.publish_status();
         self.status()
     }
@@ -350,6 +388,14 @@ impl CollectionController {
         self.write_control.disable();
         self.test_output.disable();
         self.publish_status();
+        // 外部 DB 連携 S2b（§4.8・§6-16）: `manager.stop()` より**前**に
+        // 止める - DB Source のタスクは `ServerTagStore` への書き手なので、
+        // `crate::runtime::RunningHub::shutdown` が `db_source.shutdown()` を
+        // `manager.shutdown()` の前に置いているのと同じ順序（そちらの
+        // モジュール doc comment「シャットダウン順序」節）。`stop` は
+        // タスクを join し終えてから計画上の全 `db` タグへ Bad を書くので、
+        // これが返った時点で読み手が古い Good を見ることはない。
+        self.db_source.stop().await;
         self.manager.stop().await;
         self.manager.advance_running_revision();
         let mut state = self

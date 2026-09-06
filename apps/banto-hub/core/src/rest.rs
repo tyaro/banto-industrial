@@ -6526,12 +6526,19 @@ impl From<ApplyReport> for LastApplyEntry {
 struct DbSourceStatusEntry {
     connection_id: i64,
     connection_name: String,
-    /// `connected` / `backoff` / `disabled` / `error`
-    /// （`crate::db_source::DbConnectionState`）。
+    /// `connected` / `backoff` / `disabled` / `error` / `stopped`
+    /// （`crate::db_source::DbConnectionState`）。`stopped` は S2b
+    /// （設計 §4.8・§6-16）: 収集が Running でないのでタスクを起動して
+    /// いない（DB へ繋いでいない・配下のタグは Bad）。
     state: String,
     last_poll_at: Option<i64>,
     last_error: Option<String>,
     consecutive_failures: u32,
+    /// S2b（§4.8・§6-17）: この接続のタスクが異常終了して supervisor に
+    /// 作り直された回数と、その最後の理由
+    /// （`crate::db_source::DbConnectionStatus::restarts`）。
+    restarts: u32,
+    last_restart_reason: Option<String>,
     groups: Vec<DbSourceGroupStatusEntry>,
 }
 
@@ -6556,6 +6563,8 @@ impl From<crate::db_source::DbConnectionStatus> for DbSourceStatusEntry {
             last_poll_at: status.last_poll_at,
             last_error: status.last_error,
             consecutive_failures: status.consecutive_failures,
+            restarts: status.restarts,
+            last_restart_reason: status.last_restart_reason,
             groups: status
                 .groups
                 .into_iter()
@@ -6942,6 +6951,9 @@ struct AdminDbSourceStatusEntry {
     last_poll_at: Option<i64>,
     last_error: Option<String>,
     consecutive_failures: u32,
+    /// S2b（§4.8・§6-17）: JSON では `restarts` / `lastRestartReason`。
+    restarts: u32,
+    last_restart_reason: Option<String>,
     groups: Vec<AdminDbSourceGroupStatusEntry>,
 }
 
@@ -6965,6 +6977,8 @@ impl From<DbSourceStatusEntry> for AdminDbSourceStatusEntry {
             last_poll_at: entry.last_poll_at,
             last_error: entry.last_error,
             consecutive_failures: entry.consecutive_failures,
+            restarts: entry.restarts,
+            last_restart_reason: entry.last_restart_reason,
             groups: entry
                 .groups
                 .into_iter()
