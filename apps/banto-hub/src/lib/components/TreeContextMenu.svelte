@@ -21,11 +21,15 @@
 		onSelect: () => void;
 		/**
 		 * S1（docs/banto-hub-external-db-design.md §3 項目13、実装指示4）:
-		 * `true`のとき項目は選択不可（ボタンに`disabled`属性を付け、
-		 * クリック・Enter/Spaceのどちらでも`onSelect`を呼ばない）。項目
-		 * 自体は表示したまま無効化する - 「なぜ無いのか」を`title`
-		 * ツールチップで示すため（`tagTreeContextMenu.ts`の
-		 * `createGroup`/postgres接続 参照）。既定`false`（他の呼び出し元の
+		 * `true`のとき項目は選択不可（クリック・Enter/Spaceのどちらでも
+		 * `onSelect`を呼ばない - `activate`のガード参照）。項目自体は表示
+		 * したまま無効化する - 「なぜ無いのか」を`title`ツールチップで示す
+		 * ため（`tagTreeContextMenu.ts`の`createGroup`/postgres接続 参照）。
+		 * ARIA `menu` パターンに従いネイティブ`disabled`属性は付けない
+		 * （2026-09 レビュー是正: ネイティブ`disabled`はフォーカス自体を
+		 * 受け取れなくしてしまい、キーボードユーザーが項目にたどり着けず
+		 * `title`のツールチップも読めなくなる。スクリーンリーダーには
+		 * `aria-disabled`で無効を伝える）。既定`false`（他の呼び出し元の
 		 * 挙動は変えない）。
 		 */
 		disabled?: boolean;
@@ -62,37 +66,27 @@
 	function focusFirst(node: HTMLDivElement): void {
 		menuEl = node;
 		clampPosition(node);
-		// S1: 先頭項目が無効化されている場合（postgres接続配下の「収集
-		// グループを作成」）にそのまま`itemEls[0]?.focus()`すると、
-		// ネイティブ`disabled`ボタンは絶対にフォーカスを受け取れないため
-		// メニュー内のどこにもフォーカスが移らず、キーボード操作（矢印
-		// キー・Escape - このコンポーネントのkeydownハンドラはメニュー内の
-		// フォーカス経由でしか発火しない）が丸ごと効かなくなる。
-		// `focusIndex`（下）に「無効項目は飛ばす」ロジックを持たせ、ここも
-		// それに委ねる。
 		focusIndex(0);
 	}
 
 	function focusIndex(index: number): void {
 		const count = items.length;
 		if (count === 0) return;
-		let next = ((index % count) + count) % count;
-		// S1: 無効化された項目はフォーカス先の候補から外す（上の
-		// `focusFirst`のコメント参照）。全項目が無効ということは現状無い
-		// 前提（`createGroup`だけが無効化されうる - `tagTreeContextMenu.ts`
-		// 参照）だが、念のため`count`回で打ち切る。
-		for (let i = 0; i < count && items[next]?.disabled; i++) {
-			next = (next + 1) % count;
-		}
-		activeIndex = next;
+		// S1（2026-09 レビュー是正）: 無効化された項目もネイティブ`disabled`
+		// を付けていないためフォーカスを受け取れる - ARIA `menu` パターン
+		// 通り、キーボードユーザーがその項目までたどり着いて`title`の
+		// ツールチップを読めるようにする（無効項目を飛ばすのは「なぜ
+		// 選べないか」を伝える手段を奪うことになるため、ここでは飛ばさ
+		// ない。実行の抑止は`activate`のガードが担う）。
+		activeIndex = ((index % count) + count) % count;
 		itemEls[activeIndex]?.focus();
 	}
 
 	function activate(item: ContextMenuItem): void {
-		// S1: 無効化された項目はキーボード操作（Enter/Space、下の
-		// handleKeydown参照）経由でも実行できない - ネイティブ`disabled`
-		// 属性がクリック/フォーカスは防ぐが、`activeIndex`経由のEnterは
-		// このガードが無いと呼べてしまうため。
+		// S1（2026-09 レビュー是正）: ネイティブ`disabled`を付けていない
+		// ため、クリック・Enter/Space（下のhandleKeydown参照）のどちらの
+		// 経路でも`onSelect`が呼べてしまう - 実行の抑止はこのガード1箇所に
+		// 集約する（`onclick`側にも別ガードを重複させない）。
 		if (item.disabled) return;
 		item.onSelect();
 		onClose();
@@ -156,10 +150,9 @@
 		<button
 			type="button"
 			role="menuitem"
-			aria-disabled={item.disabled}
+			aria-disabled={item.disabled ? 'true' : 'false'}
 			title={item.title}
 			tabindex={i === activeIndex ? 0 : -1}
-			disabled={item.disabled}
 			bind:this={itemEls[i]}
 			onmouseenter={() => (activeIndex = i)}
 			onclick={() => activate(item)}
@@ -207,13 +200,18 @@
 		outline: none;
 	}
 
-	.context-menu button:disabled {
+	/*
+	 * 2026-09 レビュー是正: ネイティブ`disabled`を付けなくなった
+	 * （フォーカス不能化を避けるため - script側コメント参照）ので、無効
+	 * スタイルは`:disabled`ではなく`aria-disabled="true"`をキーにする。
+	 */
+	.context-menu button[aria-disabled='true'] {
 		color: var(--banto-text-muted);
 		cursor: not-allowed;
 	}
 
-	.context-menu button:disabled:hover,
-	.context-menu button:disabled:focus-visible {
+	.context-menu button[aria-disabled='true']:hover,
+	.context-menu button[aria-disabled='true']:focus-visible {
 		background: transparent;
 		color: var(--banto-text-muted);
 	}

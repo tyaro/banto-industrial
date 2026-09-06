@@ -178,7 +178,11 @@ test.describe
 		await expect(menu).toBeVisible();
 		const createGroupItem = menu.getByRole('menuitem', { name: '収集グループを作成', exact: true });
 		await expect(createGroupItem).toBeVisible();
-		await expect(createGroupItem).toBeDisabled();
+		// 2026-09 レビュー是正: ARIA menu パターンに従いネイティブ`disabled`
+		// は付けない（キーボードユーザーがフォーカスして`title`を読める
+		// ようにするため - `TreeContextMenu.svelte`のS1コメント参照）ので、
+		// `toBeDisabled()`ではなく`aria-disabled="true"`を固定する。
+		await expect(createGroupItem).toHaveAttribute('aria-disabled', 'true');
 		await expect(createGroupItem).toHaveAttribute(
 			'title',
 			'DB 接続配下のグループは S2（DB Source）で対応予定です'
@@ -188,6 +192,32 @@ test.describe
 		// 接続なので - `tagTreeContextMenu.ts`のS1コメント参照）。
 		await expect(menu.getByRole('menuitem', { name: '接続を再設定', exact: true })).toBeVisible();
 		await expect(menu.getByRole('menuitem', { name: '接続を削除', exact: true })).toBeVisible();
+
+		// クリックしても無効化されたままなので「新規作成」ダイアログ
+		// （収集グループ作成ウィザード）は開かない。Playwright 自身の
+		// actionability チェックは`aria-disabled="true"`を`disabled`と同様に
+		// 「enabled ではない」と判定してクリック前に待ち続けてしまう
+		// （まさにこの無効化を尊重した挙動）ため、`force: true`で
+		// アクショナビリティ判定を迂回し、実際に`click`イベントを発火させて
+		// アプリ側（`activate`のガード）が無効化を守ることを確認する。
+		await createGroupItem.click({ force: true });
+		await expect(adminPage.getByRole('dialog', { name: '新規作成', exact: true })).toHaveCount(0);
+		await expect(menu).toBeVisible();
+
+		// 2026-09 レビュー是正: ネイティブ`disabled`を付けていないため、
+		// メニューを開いた直後（`focusFirst`が先頭項目へフォーカス）から
+		// 無効化された「収集グループを作成」（先頭項目）自体にフォーカスが
+		// 乗る - キーボードユーザーが`title`のツールチップの内容に
+		// たどり着けることの固定（是正前はネイティブ`disabled`のため
+		// フォーカスできず、`focusIndex`が次の項目へ飛ばしていた）。
+		await expect(createGroupItem).toBeFocused();
+
+		// 矢印キーで無効化された項目からも普通に抜けられる（フォーカス
+		// トラップに落ちない）ことを固定する。
+		await adminPage.keyboard.press('ArrowDown');
+		await expect(
+			adminPage.getByRole('menuitem', { name: '接続を再設定', exact: true })
+		).toBeFocused();
 
 		await adminPage.keyboard.press('Escape');
 		await expect(menu).toHaveCount(0);

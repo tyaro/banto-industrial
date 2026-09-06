@@ -951,8 +951,8 @@
 					{/if}
 					{#if configPackageInspection.dbConnectionsPasswordRequired.length > 0}
 						<p class="note warning">
-							以下の PostgreSQL（DB
-							Source）接続はパスワードを含みません。インポート後にパスワードの再設定が必要です:
+							以下の PostgreSQL（DB Source）接続はパスワードを含みません（新規作成、または
+							既存接続でパスワード未設定のもの）。インポート後にパスワードの再設定が必要です:
 							{configPackageInspection.dbConnectionsPasswordRequired.join('、')}
 						</p>
 					{/if}

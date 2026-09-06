@@ -77,6 +77,7 @@ import { getGrpcSettings, saveGrpcSettings } from './grpcSettingsAdmin';
 import { getMqttSettings, saveMqttSettings } from './mqttSettingsAdmin';
 import {
 	applyConfigPackage,
+	inspectConfigPackage,
 	isConfigPackageImportAbortedError,
 	ConfigPackageImportAbortedError,
 	configPackageExportFilename
@@ -460,5 +461,132 @@ describe('applyConfigPackage: postgres（DB Source）接続の import はパス�
 			username: 'appuser'
 		});
 		expect(calledWith).not.toHaveProperty('password');
+	});
+});
+
+// --- 2026-09 レビュー是正: `dbConnectionsPasswordRequired` の過剰報告修正 ---
+// apply 側は既存接続を `password` 省略で update すると保存済みパスワードを
+// 維持する（S1a tri-state）ため、既に `passwordSet: true` の既存 postgres
+// 接続を更新するだけの場合は再入力不要 - 通知は「新規作成される postgres
+// 接続」と「既存 postgres 接続で現在 `passwordSet: false` のもの」だけに
+// 絞られることを固定する（`configPackageAdmin.ts` の `inspectConfigPackage`
+// 参照）。
+
+describe('inspectConfigPackage: dbConnectionsPasswordRequired は再設定が必要な postgres 接続だけを列挙する', () => {
+	function pkgWithConnections(connections: ConfigPackage['plcConnections']): ConfigPackage {
+		return { ...pkg, plcConnections: connections, collectionGroups: [], tags: [] };
+	}
+
+	const pgConnection = {
+		name: 'pg1',
+		protocol: 'postgres' as const,
+		host: '10.0.0.5',
+		port: 5432,
+		unitId: 1,
+		enabled: true,
+		simulation: false,
+		wordOrder: 'low_high' as const,
+		database: 'appdb',
+		username: 'appuser'
+	};
+
+	it('新規作成される postgres 接続（既存に同名が無い）は列挙される', async () => {
+		vi.mocked(listPlcConnections).mockResolvedValue([]);
+
+		const inspection = await inspectConfigPackage(pkgWithConnections([pgConnection]));
+
+		expect(inspection.dbConnectionsPasswordRequired).toEqual(['pg1']);
+	});
+
+	it('既存 postgres 接続を更新するだけで、現在 passwordSet: true なら列挙されない', async () => {
+		vi.mocked(listPlcConnections).mockResolvedValue([
+			{
+				id: 1,
+				name: 'pg1',
+				protocol: 'postgres',
+				host: '10.0.0.5',
+				port: 5432,
+				unitId: 1,
+				enabled: true,
+				simulation: false,
+				wordOrder: 'low_high',
+				database: 'appdb',
+				username: 'appuser',
+				passwordSet: true
+			}
+		]);
+
+		const inspection = await inspectConfigPackage(pkgWithConnections([pgConnection]));
+
+		expect(inspection.dbConnectionsPasswordRequired).toEqual([]);
+	});
+
+	it('既存 postgres 接続を更新するだけでも、現在 passwordSet: false なら列挙される', async () => {
+		vi.mocked(listPlcConnections).mockResolvedValue([
+			{
+				id: 1,
+				name: 'pg1',
+				protocol: 'postgres',
+				host: '10.0.0.5',
+				port: 5432,
+				unitId: 1,
+				enabled: true,
+				simulation: false,
+				wordOrder: 'low_high',
+				database: 'appdb',
+				username: 'appuser',
+				passwordSet: false
+			}
+		]);
+
+		const inspection = await inspectConfigPackage(pkgWithConnections([pgConnection]));
+
+		expect(inspection.dbConnectionsPasswordRequired).toEqual(['pg1']);
+	});
+
+	it('postgres 以外の接続は create/update いずれでも列挙されない', async () => {
+		vi.mocked(listPlcConnections).mockResolvedValue([
+			{
+				id: 1,
+				name: 'plc1',
+				protocol: 'modbus-tcp',
+				host: '192.168.11.200',
+				port: 502,
+				unitId: 1,
+				enabled: true,
+				simulation: false,
+				wordOrder: 'low_high',
+				database: null,
+				username: null,
+				passwordSet: false
+			}
+		]);
+
+		const inspection = await inspectConfigPackage(
+			pkgWithConnections([
+				{
+					name: 'plc1',
+					protocol: 'modbus-tcp',
+					host: '192.168.11.200',
+					port: 502,
+					unitId: 1,
+					enabled: true,
+					simulation: false,
+					wordOrder: 'low_high'
+				},
+				{
+					name: 'plc2',
+					protocol: 'modbus-tcp',
+					host: '192.168.11.201',
+					port: 502,
+					unitId: 1,
+					enabled: true,
+					simulation: false,
+					wordOrder: 'low_high'
+				}
+			])
+		);
+
+		expect(inspection.dbConnectionsPasswordRequired).toEqual([]);
 	});
 });
