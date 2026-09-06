@@ -1,7 +1,7 @@
 # banto-hub 外部 DB 連携 設計: DB Source（#228）と DB Sink（#229）
 
 作成日: 2026-09-06
-状態: **オーナー決定済み（2026-09-06、§6 の 15 項目）・実装は S0（依存実測）から着手**。Sink は Hub 内モジュールではなく**別プロセスのサイドカー**とする（§5.1、2026-09-06 決定）。コード調査（§3）は 2026-09-06 の main（`9c26b3a`、toolchain 1.98.1）に対して実施済み。
+状態: **オーナー決定済み（2026-09-06、§6 の 15 項目）・S0 完了（§3.1、同日）・S1a（DB 接続エンティティの Rust 側）実装中**。Sink は Hub 内モジュールではなく**別プロセスのサイドカー**とする（§5.1、2026-09-06 決定）。コード調査（§3）は 2026-09-06 の main（`9c26b3a`、toolchain 1.98.1）に対して実施済み。
 対象: Issue [#228](https://github.com/tyaro/banto-industrial/issues/228)（外部 RDB の値をタグ空間へ取り込む Source）と [#229](https://github.com/tyaro/banto-industrial/issues/229)（タグ値を外部 RDB へ保存する Sink / Logger）。**2 件はペアで 1 設計**とし、DB 接続エンティティを共有する。
 
 関連: [tag-server-design.md](tag-server-design.md)（タグ空間・書き込み安全の一次ソース。§2 非スコープの「ロガー作らない」決定を本書 §2.1 で扱う）、[banto-hub-t20-design.md](banto-hub-t20-design.md)（値表現と read-on-demand の先例）、[banto-hub-t21-design.md](banto-hub-t21-design.md)（構成操作の MCP と監査の型）、[plan.md](plan.md) §1（「外部時系列DB読み出し・保存」は 3〜4 案件で再利用される共通資産）。
@@ -52,6 +52,28 @@ Hub には暗号化保管や OS keyring の機構が存在しない。MQTT の�
 11. **config パッケージは TS 側の機能**（`apps/banto-hub/src/lib/banto/configPackage.ts`）。新エンティティは `plcConnections` / `mqtt` と同様に往復対象へミラーし、資格情報は除外リストへ足す。適用は非トランザクション（T19 の既知の隙間）。
 12. **監査は log-before-write の 2 段**（`write_audit.rs` の `insert_pending` → 結果 `UPDATE`）。Sink の INSERT 試行を監査したい場合の型。
 13. **CSV はヘッダ厳密検証**（列を足すと旧 CSV が import 不可＝非後方互換。#264 の教訓）。タグに新しい列を増やす設計は避けたい。
+
+### 3.1 S0 実測: PostgreSQL ドライバの依存コスト（2026-09-06）
+
+`banto-hub-core` の `--bin banto-hub --release`（`embed-ui` 無し、両側同条件）で実測した。
+
+| 項目                                                           | 基準      | + `postgres` + `tls-rustls-ring-native-roots` | 増分                   |
+| -------------------------------------------------------------- | --------- | --------------------------------------------- | ---------------------- |
+| `cargo tree -p banto-hub-core --edges normal` の外部クレート数 | 224       | 250                                           | **+26**                |
+| `banto-hub.exe`                                                | 28.20 MiB | 28.51 MiB                                     | **+317 KiB（+1.1%）**  |
+| `cargo deny check advisories`                                  | ok        | ok（既存の yanked 警告 2 件のみ、変化なし）   |                        |
+| `cargo deny check licenses bans sources`                       | ok        | ok（重複版数の警告 47 件は既存と同一集合）    | **deny.toml 変更不要** |
+
+**TLS feature の選定**: ワークスペースには TLS スタックが 1 つも無かった（`Cargo.lock` に rustls / ring / aws-lc-rs / native-tls / openssl のいずれも無し）ので、ここで入れるものが最初の 1 つになる。
+
+- `tls-native-tls`: Linux CI で OpenSSL（`openssl-sys`）を引き込むため不採用。
+- `tls-rustls-aws-lc-rs`: Windows で cmake / NASM が要るため不採用。
+- `tls-rustls`（= `tls-rustls-ring-webpki`）: 1 クレート少ないが `webpki-roots` の license **CDLA-Permissive-2.0 が deny.toml の allow に無く `cargo deny check licenses` が赤**になる。
+- **採用: `tls-rustls-ring-native-roots`**。OS の証明書ストア（Windows は schannel 経由）を使うので顧客 CA の追加にも自然に対応し、deny.toml 無変更で通る。
+
+追加される主なクレート: `sqlx-postgres`、`rustls 0.23`、`ring 0.17`、`rustls-native-certs`、`schannel`、`hkdf` / `hmac` / `md-5` / `stringprep`（SCRAM 認証）、`whoami`、`zeroize` ほか。
+
+**SQL Server（`tiberius`）の調査結果（第 2 段の材料）**: 最新版 0.12.3 は **2024-07-19 公開で以後更新なし**。`default-features = false` にしないと `native-tls` と `rustls` の両方を引き込む（TLS 二重化）。rustls 指定でも **rustls 0.21 に固定**され、sqlx-postgres の 0.23 と**メジャーが 2 つ違う 2 系列並存**になる。単独では 58 クレート・ビルド可。§6-2（v1 は PostgreSQL のみ、SQL Server は後回し）の判断を裏付ける結果で、採用するなら保守状況の再確認と rustls の版数一致が条件になる。
 
 ## 4. DB Source（#228）の設計
 
