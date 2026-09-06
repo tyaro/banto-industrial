@@ -99,6 +99,7 @@ fn group_input(name: &str, conn_id: i64, period_ms: i64) -> CollectionGroupInput
         period_ms,
         enabled: true,
         default_writable: true,
+        query_sql: None,
     }
 }
 

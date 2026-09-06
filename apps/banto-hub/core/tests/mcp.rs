@@ -92,6 +92,7 @@ fn group_input(name: &str, conn_id: i64, period_ms: i64) -> CollectionGroupInput
         period_ms,
         enabled: true,
         default_writable: true,
+        query_sql: None,
     }
 }
 
@@ -1781,6 +1782,9 @@ async fn update_group_with_admin_scope_updates_and_audits() {
                 "periodMs": 200,
                 "enabled": true,
                 "defaultWritable": true,
+                // 外部 DB 連携 S2: PUT 置換なので全項目必須 - PLC 配下の
+                // グループでは `null` が正しい値。
+                "querySql": null,
             }),
         ),
     )
@@ -2213,6 +2217,106 @@ async fn test_saved_connection_against_a_real_postgresql_returns_the_server_vers
     eprintln!("test_saved_connection -> {server_version}");
 }
 
+/// 外部 DB 連携 S2（docs/banto-hub-external-db-design.md §4.1・§4.2）:
+/// `update_group` の必須キー一覧に `querySql` が入った（PUT 置換の既存規約
+/// 「全項目必須 + null 許容」どおり）ことの回帰テスト -
+/// [`update_group_missing_field_is_rejected_and_row_unchanged`] の
+/// `querySql` 版。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_group_without_query_sql_is_rejected_as_a_missing_field() {
+    let app = test_app("s2-update-group-missing-query-sql").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "update_group",
+            json!({
+                "id": group.id,
+                "name": "fast-renamed",
+                "plcConnectionId": conn_id,
+                "periodMs": 200,
+                "enabled": true,
+                "defaultWritable": true,
+                // "querySql" を意図的に省略。
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("missing_fields"), "{text}");
+    assert!(text.contains("querySql"), "{text}");
+}
+
+/// 外部 DB 連携 S2: `create_group` は `postgres` 接続配下では `querySql` を
+/// 要求し、与えれば作成できる（`banto_tags` の `validate_query_sql` が両方向
+/// を強制していることを MCP 面から確認する）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_group_under_a_postgres_connection_requires_query_sql() {
+    let app = test_app("s2-create-group-query-sql").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let pg_conn = PlcConnectionService::new(app.pool.clone())
+        .create(banto_tags::PlcConnectionInput {
+            name: "erp".to_string(),
+            protocol: banto_tags::POSTGRES_PROTOCOL.to_string(),
+            host: "10.0.0.50".to_string(),
+            port: 5432,
+            unit_id: 1,
+            enabled: true,
+            simulation: false,
+            word_order: "low_high".to_string(),
+            database: Some("erp".to_string()),
+            username: Some("reader".to_string()),
+            password: None,
+        })
+        .await
+        .expect("postgres connection");
+
+    // querySql 無し -> 検証エラー。
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_group",
+            json!({ "name": "q1", "plcConnectionId": pg_conn.id, "periodMs": 1000 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("querySql"), "{text}");
+
+    // querySql 付き -> 作成できる。
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_group",
+            json!({
+                "name": "q1",
+                "plcConnectionId": pg_conn.id,
+                "periodMs": 1000,
+                "querySql": "SELECT a FROM v1",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["created"]["querySql"], json!("SELECT a FROM v1"));
+}
+
 /// Copilot 指摘（PR #268）の回帰防止:`update_group`版。`enabled`を省いた
 /// 入力が`missing_fields`で拒否され、対象行が一切変化しないことを確認
 /// する（[`update_connection_missing_field_is_rejected_and_row_unchanged`]
@@ -2243,6 +2347,7 @@ async fn update_group_missing_field_is_rejected_and_row_unchanged() {
                 "periodMs": 200,
                 // "enabled" を意図的に省略。
                 "defaultWritable": true,
+                "querySql": null,
             }),
         ),
     )

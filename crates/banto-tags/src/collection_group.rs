@@ -3,6 +3,23 @@
 //! [`crate::tag::Tag`] belongs to exactly one group, and a group's
 //! `period_ms` (one of [`ALLOWED_PERIOD_MS`]) is how often the collection
 //! engine (I3) reads every tag in it in one PLC round-trip.
+//!
+//! ## DB Source のグループ（S2、docs/banto-hub-external-db-design.md §4.1・
+//! §4.2、2026-09-06 オーナー決定「案A: 既存3階層の流用」）
+//!
+//! `protocol = `[`crate::plc_connection::POSTGRES_PROTOCOL`] の接続配下の
+//! グループは「1 周期 = 1 SELECT = N タグ」の単位になる - [`CollectionGroup::
+//! query_sql`] がその SELECT 文で、`period_ms` は PLC グループと全く同じ
+//! 意味（何 ms ごとに1回実行するか）を持つ。配下に置けるのは
+//! `tag_kind = "db"` のタグだけで、その `address` は結果**列名**になる
+//! （[`crate::tag::DB_TAG_KIND`]、配置制約は
+//! `crate::tag::validate_tag_kind_placement`）。
+//!
+//! S1a の時点ではこの protocol 配下にグループを作ること自体を拒否していた
+//! （`query_sql` も `db` タグも無く、置き場が存在しなかったため）。S2 が
+//! その予告どおり解禁し、代わりに [`validate_query_sql`] が「postgres 配下
+//! では `query_sql` 必須・それ以外では指定不可」という2方向のルールを
+//! 強制する。
 
 use banto_core::{BantoError, FieldError, ListParams, ListResult};
 use banto_storage::ColumnMap;
@@ -52,6 +69,13 @@ pub struct CollectionGroup {
     /// 収集・書き込み動作はこの列を一切参照しない（`migrations/0012_
     /// collection_groups_add_default_writable.sql` 参照）。
     pub default_writable: bool,
+    /// 外部 DB 連携 S2（docs/banto-hub-external-db-design.md §4.1・§4.2、
+    /// 2026-09-06 オーナー決定「案A」）: このグループが1周期ごとに実行する
+    /// SELECT 文（「1 グループ = 1 SELECT = N タグ」）。
+    /// `protocol = "postgres"` の接続配下のグループでは**必須**、それ以外の
+    /// 接続配下では常に `None` - 両方向とも [`validate_query_sql`] が強制
+    /// する（`migrations/0015_db_source_query_sql_and_tag_kind.sql`）。
+    pub query_sql: Option<String>,
 }
 
 /// Create/update payload.
@@ -66,6 +90,11 @@ pub struct CollectionGroupInput {
     /// migration 0012 の列既定値と同じ）。
     #[serde(default = "default_writable_true")]
     pub default_writable: bool,
+    /// S2: [`CollectionGroup::query_sql`] の入力側。省略時は `None`
+    /// （PLC 接続配下のグループはこれが正しい - `postgres` 接続配下で
+    /// 省略した場合は [`validate_query_sql`] が「必須です」エラーにする）。
+    #[serde(default)]
+    pub query_sql: Option<String>,
 }
 
 /// Validate a [`CollectionGroupInput`]: `name` trimmed non-empty and capped
@@ -111,25 +140,91 @@ fn validate_collection_group_input(input: &CollectionGroupInput) -> Result<(), B
     }
 }
 
-/// S1 (docs/banto-hub-external-db-design.md §7 スライス表「S1」・
-/// `crate::plc_connection`モジュール doc comment「`\"postgres\"`」節、
-/// 2026-09-06): この段階では `protocol = "postgres"` の接続配下に収集
-/// グループを作れない - S2（DB Source 本体、`query_sql` 列と
-/// `tag_kind = "db"` の追加）がこの制約を解除するまで、DB 接続には
-/// タグを置く場所が存在しないままにする。`plc_connection_id` が存在しない
-/// 行を指す場合（`protocol` が `None`）は何もしない - そちらは既存の
-/// `ON DELETE RESTRICT` FK 制約が `FK_MESSAGE` 付きで拒否する、この関数の
-/// 関心事ではない。
-fn reject_group_under_postgres_connection(protocol: Option<String>) -> Result<(), BantoError> {
-    if protocol.as_deref() == Some(POSTGRES_PROTOCOL) {
-        return Err(BantoError::Validation {
+/// [`CollectionGroupInput::query_sql`] の長さ上限（外部 DB 連携設計 §4.2
+/// 「文の検証はベストエフォート」）。8 KiB は「人が書いた1本の SELECT」に
+/// 対しては十分に大きく、それでも無制限ではない、という anti-abuse の境界
+/// （[`MAX_NAME_LEN`] が `name` に対して果たしているのと同じ役割）。
+const MAX_QUERY_SQL_LEN: usize = 8192;
+
+/// S2（docs/banto-hub-external-db-design.md §4.1・§4.2、2026-09-06 オーナー
+/// 決定「案A」）: グループの `query_sql` を、そのグループが属する接続の
+/// `protocol` に照らして検証し、**保存する値**（`postgres` 配下なら trim 済み
+/// の `Some`、それ以外は常に `None`）を返す。S1a の
+/// `reject_group_under_postgres_connection`（「DB 接続配下にグループを作れ
+/// ない」）を置き換えるもので、S2 で解禁するというその関数の doc comment の
+/// 予告そのもの。
+///
+/// 2方向の1つのルール:
+///
+/// - `protocol == `[`POSTGRES_PROTOCOL`]: `query_sql` は**必須**（「1 グループ
+///   = 1 SELECT = N タグ」§4.2 - SQL の無いグループには回すものが無い）。
+/// - それ以外のプロトコル: `query_sql` は**指定できない**（PLC グループが
+///   迷子の SQL 文を抱えないようにする - `plc_connection.rs` の
+///   `database`/`username`/`password` が `postgres` 以外で禁止されているのと
+///   同型の対称ルール）。空文字/空白のみは「未指定」と同じ扱いにして、
+///   フォームが常に空文字を送ってくるクライアントを弾かない。
+///
+/// **文そのものの検証はベストエフォート**（§4.2）: trim して非空・
+/// [`MAX_QUERY_SQL_LEN`] 以内・先頭キーワードが `SELECT` または `WITH`
+/// （大文字小文字を問わない）・`;` を含まない（単文であること）だけを見る。
+/// SQL パーサは持たない - **本当の防御は DB 側の read-only ユーザー**であり、
+/// ここの検証は「うっかり UPDATE を貼り付けた」を早期に気づかせるための
+/// ものに過ぎない。この方針は UI と docs にも明記する（§4.2）。
+///
+/// `plc_connection_id` が存在しない行を指す場合（`protocol` が `None`）は
+/// 何も検証せず `Ok(None)` を返す - そちらは既存の FK 制約が
+/// [`FK_MESSAGE`] 付きで拒否する、この関数の関心事ではない（S1a の同じ
+/// 判断を引き継ぐ）。
+fn validate_query_sql(
+    protocol: Option<&str>,
+    query_sql: Option<&str>,
+) -> Result<Option<String>, BantoError> {
+    let trimmed = query_sql.map(str::trim).filter(|s| !s.is_empty());
+
+    let error = |message: String| -> BantoError {
+        BantoError::Validation {
             field_errors: vec![FieldError {
-                field: "plcConnectionId".to_string(),
-                message: "DB 接続配下のグループは S2（DB Source）で対応予定です".to_string(),
+                field: "querySql".to_string(),
+                message,
             }],
-        });
+        }
+    };
+
+    match protocol {
+        None => Ok(None),
+        Some(POSTGRES_PROTOCOL) => {
+            let Some(sql) = trimmed else {
+                return Err(error(required_message()));
+            };
+            if sql.chars().count() > MAX_QUERY_SQL_LEN {
+                return Err(error(max_length_message(MAX_QUERY_SQL_LEN)));
+            }
+            if sql.contains(';') {
+                return Err(error(
+                    "SQL は単文で指定してください（';' は使用できません）".to_string(),
+                ));
+            }
+            let first_keyword: String = sql
+                .chars()
+                .take_while(|c| c.is_ascii_alphabetic())
+                .collect::<String>()
+                .to_ascii_uppercase();
+            if first_keyword != "SELECT" && first_keyword != "WITH" {
+                return Err(error(
+                    "SQL は SELECT または WITH で始まる必要があります".to_string(),
+                ));
+            }
+            Ok(Some(sql.to_string()))
+        }
+        Some(_) => {
+            if trimmed.is_some() {
+                return Err(error(
+                    "querySql は postgres 接続配下のグループでのみ指定できます".to_string(),
+                ));
+            }
+            Ok(None)
+        }
     }
-    Ok(())
 }
 
 fn column_map() -> ColumnMap {
@@ -140,10 +235,12 @@ fn column_map() -> ColumnMap {
         .column("periodMs", "period_ms")
         .column("enabled", "enabled")
         .column("defaultWritable", "default_writable")
+        .column("querySql", "query_sql")
 }
 
 const RESOURCE: &str = "collection_groups";
-const COLUMNS: &str = "id, name, plc_connection_id, period_ms, enabled, default_writable";
+const COLUMNS: &str =
+    "id, name, plc_connection_id, period_ms, enabled, default_writable, query_sql";
 const FK_MESSAGE: &str = "指定されたPLC接続が見つかりません";
 
 /// Service layer for the `collection_groups` resource.
@@ -211,18 +308,20 @@ impl CollectionGroupService {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(banto_storage::storage_error)?;
-        reject_group_under_postgres_connection(existing_protocol)?;
+        let stored_query_sql =
+            validate_query_sql(existing_protocol.as_deref(), input.query_sql.as_deref())?;
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
-            "INSERT INTO collection_groups (name, plc_connection_id, period_ms, enabled, default_writable) \
-             VALUES (?, ?, ?, ?, ?) RETURNING {COLUMNS}"
+            "INSERT INTO collection_groups (name, plc_connection_id, period_ms, enabled, default_writable, query_sql) \
+             VALUES (?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
         )))
         .bind(input.name.trim())
         .bind(input.plc_connection_id)
         .bind(input.period_ms)
         .bind(input.enabled)
         .bind(input.default_writable)
+        .bind(stored_query_sql)
         .fetch_one(&self.pool)
         .await
         .map_err(|err| {
@@ -249,18 +348,20 @@ impl CollectionGroupService {
                 .fetch_optional(&mut *connection)
                 .await
                 .map_err(banto_storage::storage_error)?;
-        reject_group_under_postgres_connection(existing_protocol)?;
+        let stored_query_sql =
+            validate_query_sql(existing_protocol.as_deref(), input.query_sql.as_deref())?;
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
-            "INSERT INTO collection_groups (name, plc_connection_id, period_ms, enabled, default_writable) \
-             VALUES (?, ?, ?, ?, ?) RETURNING {COLUMNS}"
+            "INSERT INTO collection_groups (name, plc_connection_id, period_ms, enabled, default_writable, query_sql) \
+             VALUES (?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
         )))
         .bind(input.name.trim())
         .bind(input.plc_connection_id)
         .bind(input.period_ms)
         .bind(input.enabled)
         .bind(input.default_writable)
+        .bind(stored_query_sql)
         .fetch_one(&mut *connection)
         .await
         .map_err(|err| {
@@ -286,11 +387,12 @@ impl CollectionGroupService {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(banto_storage::storage_error)?;
-        reject_group_under_postgres_connection(existing_protocol)?;
+        let stored_query_sql =
+            validate_query_sql(existing_protocol.as_deref(), input.query_sql.as_deref())?;
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
-            "UPDATE collection_groups SET name = ?, plc_connection_id = ?, period_ms = ?, enabled = ?, default_writable = ? \
+            "UPDATE collection_groups SET name = ?, plc_connection_id = ?, period_ms = ?, enabled = ?, default_writable = ?, query_sql = ? \
              WHERE id = ? RETURNING {COLUMNS}"
         )))
         .bind(input.name.trim())
@@ -298,6 +400,7 @@ impl CollectionGroupService {
         .bind(input.period_ms)
         .bind(input.enabled)
         .bind(input.default_writable)
+        .bind(stored_query_sql)
         .bind(id)
         .fetch_one(&self.pool)
         .await
@@ -324,11 +427,12 @@ impl CollectionGroupService {
                 .fetch_optional(&mut *connection)
                 .await
                 .map_err(banto_storage::storage_error)?;
-        reject_group_under_postgres_connection(existing_protocol)?;
+        let stored_query_sql =
+            validate_query_sql(existing_protocol.as_deref(), input.query_sql.as_deref())?;
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
-            "UPDATE collection_groups SET name = ?, plc_connection_id = ?, period_ms = ?, enabled = ?, default_writable = ? \
+            "UPDATE collection_groups SET name = ?, plc_connection_id = ?, period_ms = ?, enabled = ?, default_writable = ?, query_sql = ? \
              WHERE id = ? RETURNING {COLUMNS}"
         )))
         .bind(input.name.trim())
@@ -336,6 +440,7 @@ impl CollectionGroupService {
         .bind(input.period_ms)
         .bind(input.enabled)
         .bind(input.default_writable)
+        .bind(stored_query_sql)
         .bind(id)
         .fetch_one(&mut *connection)
         .await
@@ -522,6 +627,25 @@ mod tests {
             period_ms: 1_000,
             enabled: true,
             default_writable: true,
+            query_sql: None,
+        }
+    }
+
+    /// S2: a ready-made `"postgres"` connection input - the DB Source tests
+    /// below all need one and only differ in the connection `name`.
+    fn postgres_connection_input(name: &str) -> PlcConnectionInput {
+        PlcConnectionInput {
+            name: name.to_string(),
+            protocol: POSTGRES_PROTOCOL.to_string(),
+            host: "10.0.0.50".to_string(),
+            port: 5432,
+            unit_id: 1,
+            enabled: true,
+            simulation: false,
+            word_order: "low_high".to_string(),
+            database: Some("erp".to_string()),
+            username: Some("reader".to_string()),
+            password: None,
         }
     }
 
@@ -664,27 +788,15 @@ mod tests {
         }
     }
 
-    /// S1 (docs/banto-hub-external-db-design.md §7 スライス表「S1」、
-    /// `crate::plc_connection`モジュール doc comment「`\"postgres\"`」節):
-    /// この段階では `protocol = "postgres"` の接続配下にグループを作れない -
-    /// S2 がこの制約を解除するまで、DB 接続にはタグを置く場所が無い。
+    /// S2 (docs/banto-hub-external-db-design.md §4.2): `postgres` 接続配下の
+    /// グループは `query_sql` **必須** - S1a の「DB 接続配下にはそもそも
+    /// グループを作れない」拒否を置き換えたルール（このモジュール doc
+    /// comment の「DB Source のグループ」節参照）。
     #[tokio::test]
-    async fn create_rejects_a_group_under_a_postgres_connection() {
+    async fn create_rejects_a_group_under_a_postgres_connection_without_query_sql() {
         let (plc_svc, svc, _conn_id) = setup().await;
         let pg_conn = plc_svc
-            .create(PlcConnectionInput {
-                name: "ERP DB".to_string(),
-                protocol: "postgres".to_string(),
-                host: "10.0.0.50".to_string(),
-                port: 5432,
-                unit_id: 1,
-                enabled: true,
-                simulation: false,
-                word_order: "low_high".to_string(),
-                database: Some("erp".to_string()),
-                username: Some("reader".to_string()),
-                password: None,
-            })
+            .create(postgres_connection_input("ERP DB"))
             .await
             .unwrap();
 
@@ -694,34 +806,34 @@ mod tests {
             .unwrap_err();
         match err {
             BantoError::Validation { field_errors } => {
-                assert_eq!(field_errors[0].field, "plcConnectionId");
-                assert!(field_errors[0].message.contains("S2"));
+                assert_eq!(field_errors[0].field, "querySql");
+                assert_eq!(field_errors[0].message, required_message());
             }
             other => panic!("expected Validation, got {other:?}"),
         }
+
+        // ...and succeeds once the SELECT is supplied.
+        let mut ok_input = sample_input("G1", pg_conn.id);
+        ok_input.query_sql = Some("  SELECT a, b FROM v_line1  ".to_string());
+        let created = svc
+            .create(ok_input)
+            .await
+            .expect("a postgres group with a SELECT should be accepted");
+        assert_eq!(
+            created.query_sql.as_deref(),
+            Some("SELECT a, b FROM v_line1")
+        );
     }
 
-    /// The `update`-side twin: switching an *existing* group's
-    /// `plc_connection_id` onto a `"postgres"` connection is rejected the
-    /// same way create is.
+    /// The `update`-side twin: moving an *existing* group onto a
+    /// `"postgres"` connection needs the same `query_sql` the create path
+    /// does.
     #[tokio::test]
-    async fn update_rejects_moving_a_group_onto_a_postgres_connection() {
+    async fn update_rejects_moving_a_group_onto_a_postgres_connection_without_query_sql() {
         let (plc_svc, svc, conn_id) = setup().await;
         let group = svc.create(sample_input("G1", conn_id)).await.unwrap();
         let pg_conn = plc_svc
-            .create(PlcConnectionInput {
-                name: "ERP DB".to_string(),
-                protocol: "postgres".to_string(),
-                host: "10.0.0.50".to_string(),
-                port: 5432,
-                unit_id: 1,
-                enabled: true,
-                simulation: false,
-                word_order: "low_high".to_string(),
-                database: Some("erp".to_string()),
-                username: Some("reader".to_string()),
-                password: None,
-            })
+            .create(postgres_connection_input("ERP DB"))
             .await
             .unwrap();
 
@@ -731,7 +843,7 @@ mod tests {
             .unwrap_err();
         match err {
             BantoError::Validation { field_errors } => {
-                assert_eq!(field_errors[0].field, "plcConnectionId");
+                assert_eq!(field_errors[0].field, "querySql");
             }
             other => panic!("expected Validation, got {other:?}"),
         }
@@ -926,5 +1038,164 @@ mod tests {
         assert_eq!(result.total_count, 2);
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].name, "C");
+    }
+
+    // --- S2 (docs/banto-hub-external-db-design.md §4.2): `query_sql` の
+    // ベストエフォート検証。純関数なので DB を触らない unit test で固定する
+    // （`validate_query_sql` の doc comment: 本当の防御は DB 側の read-only
+    // ユーザーであり、ここは「うっかり UPDATE」を早期に気づかせるだけ）。
+
+    #[test]
+    fn validate_query_sql_accepts_select_and_with_case_insensitively() {
+        for sql in [
+            "SELECT a FROM t",
+            "select a from t",
+            "  \n select a from t \n ",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "with x as (select 1) select * from x",
+        ] {
+            let stored = validate_query_sql(Some(POSTGRES_PROTOCOL), Some(sql))
+                .unwrap_or_else(|e| panic!("{sql:?} should be accepted: {e:?}"));
+            assert_eq!(stored.as_deref(), Some(sql.trim()));
+        }
+    }
+
+    #[test]
+    fn validate_query_sql_rejects_non_select_statements() {
+        for sql in [
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "INSERT INTO t VALUES (1)",
+            "-- SELECT a FROM t",
+            "(SELECT a FROM t)",
+        ] {
+            let err = validate_query_sql(Some(POSTGRES_PROTOCOL), Some(sql)).unwrap_err();
+            match err {
+                BantoError::Validation { field_errors } => {
+                    assert_eq!(field_errors[0].field, "querySql", "sql: {sql:?}");
+                    assert!(
+                        field_errors[0].message.contains("SELECT"),
+                        "sql: {sql:?} -> {:?}",
+                        field_errors[0].message
+                    );
+                }
+                other => panic!("expected Validation for {sql:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_query_sql_rejects_multiple_statements() {
+        let err = validate_query_sql(
+            Some(POSTGRES_PROTOCOL),
+            Some("SELECT a FROM t; DROP TABLE t"),
+        )
+        .unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "querySql");
+                assert!(field_errors[0].message.contains("単文"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_query_sql_rejects_an_over_long_statement() {
+        let sql = format!("SELECT {}", "a".repeat(MAX_QUERY_SQL_LEN));
+        let err = validate_query_sql(Some(POSTGRES_PROTOCOL), Some(&sql)).unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "querySql");
+                assert_eq!(
+                    field_errors[0].message,
+                    max_length_message(MAX_QUERY_SQL_LEN)
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_query_sql_forbids_a_statement_on_a_non_postgres_connection() {
+        let err = validate_query_sql(Some("modbus-tcp"), Some("SELECT a FROM t")).unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "querySql");
+                assert!(field_errors[0].message.contains("postgres"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        // Blank/absent is the normal PLC case and stores as NULL.
+        assert_eq!(validate_query_sql(Some("modbus-tcp"), None).unwrap(), None);
+        assert_eq!(
+            validate_query_sql(Some("modbus-tcp"), Some("   ")).unwrap(),
+            None
+        );
+    }
+
+    /// A dangling `plc_connection_id` (protocol `None`) is the FK's problem,
+    /// not this function's - same stance S1a took.
+    #[test]
+    fn validate_query_sql_is_silent_for_an_unknown_connection() {
+        assert_eq!(
+            validate_query_sql(None, Some("SELECT a FROM t")).unwrap(),
+            None
+        );
+    }
+
+    /// A PLC group that sends a stray SQL statement is rejected end to end
+    /// (not just in the pure helper above).
+    #[tokio::test]
+    async fn create_rejects_query_sql_under_a_plc_connection() {
+        let (_plc_svc, svc, conn_id) = setup().await;
+        let mut input = sample_input("G1", conn_id);
+        input.query_sql = Some("SELECT a FROM t".to_string());
+        let err = svc.create(input).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "querySql");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// `query_sql` round-trips through create -> get -> update on a postgres
+    /// group (the column is really persisted and really read back - the S1a
+    /// `plc_connections` credential columns hit exactly this class of
+    /// "forgot the column in a hand-written SELECT" bug).
+    #[tokio::test]
+    async fn query_sql_round_trips_through_create_get_and_update() {
+        let (plc_svc, svc, _conn_id) = setup().await;
+        let pg_conn = plc_svc
+            .create(postgres_connection_input("ERP DB"))
+            .await
+            .unwrap();
+
+        let mut input = sample_input("G1", pg_conn.id);
+        input.query_sql = Some("SELECT a FROM v1".to_string());
+        let created = svc.create(input).await.expect("create should succeed");
+        assert_eq!(created.query_sql.as_deref(), Some("SELECT a FROM v1"));
+
+        let fetched = svc.get(created.id).await.expect("get should succeed");
+        assert_eq!(fetched, created);
+
+        let mut update_input = sample_input("G1", pg_conn.id);
+        update_input.query_sql = Some("SELECT b FROM v2".to_string());
+        let updated = svc
+            .update(created.id, update_input)
+            .await
+            .expect("update should succeed");
+        assert_eq!(updated.query_sql.as_deref(), Some("SELECT b FROM v2"));
+
+        let listed = svc.list(ListParams::default()).await.expect("list");
+        assert_eq!(
+            listed
+                .rows
+                .iter()
+                .find(|g| g.id == created.id)
+                .and_then(|g| g.query_sql.as_deref()),
+            Some("SELECT b FROM v2")
+        );
     }
 }

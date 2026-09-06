@@ -317,6 +317,7 @@ mod tests {
                     period_ms: 1_000,
                     enabled: true,
                     default_writable: true,
+                    query_sql: None,
                 })
                 .await
                 .expect("seed group");

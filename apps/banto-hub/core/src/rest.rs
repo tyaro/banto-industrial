@@ -2662,6 +2662,14 @@ pub struct CollectionGroupPayload {
     /// 同じ既定値）。
     #[serde(default = "default_group_writable")]
     pub default_writable: bool,
+    /// 外部 DB 連携 S2（docs/banto-hub-external-db-design.md §4.1・§4.2）:
+    /// `protocol = "postgres"` の接続配下のグループが1周期ごとに実行する
+    /// SELECT 文。`#[serde(default)]`（= `None`）なので、この列を知らない
+    /// 既存クライアントの PLC グループ payload は無変更で通る
+    /// （`defaultWritable`/`writable`/`tagKind` と同じ後方互換の扱い）。
+    /// 必須/禁止の2方向の検証は `banto_tags` 側の `validate_query_sql`。
+    #[serde(default)]
+    pub query_sql: Option<String>,
 }
 
 impl From<CollectionGroupPayload> for CollectionGroupInput {
@@ -2674,6 +2682,10 @@ impl From<CollectionGroupPayload> for CollectionGroupInput {
             // T19 S1-b: wired through - see `CollectionGroupPayload::
             // default_writable`'s doc comment.
             default_writable: payload.default_writable,
+            // 外部 DB 連携 S2: 同上 - `postgres` 接続配下のグループでは必須、
+            // それ以外では指定不可（`banto_tags` 側の `validate_query_sql`
+            // が両方向を強制する）。
+            query_sql: payload.query_sql,
         }
     }
 }
@@ -5912,6 +5924,11 @@ fn value_source_for_tag(entry: &TagEntry, runtime: &CollectionStatus) -> &'stati
         banto_tags::PLC_TAG_KIND => "real",
         banto_tags::COMPUTED_TAG_KIND => "derived_simulation",
         banto_tags::INTERNAL_TAG_KIND => "internal",
+        // 外部 DB 連携 §6-11（2026-09-06 オーナー決定「足す」）: 外部 DB
+        // 由来の値は実機でもシミュレーションでも内部書き込みでもないので
+        // 独自ラベルを持つ。banto-tagclient SDK は未知ラベルを
+        // `Unknown(raw)` で保持するので、旧 SDK との互換も保たれる。
+        banto_tags::DB_TAG_KIND => "db",
         // Tag registration validates tag_kind, but keep the wire contract
         // fail-safe if a future kind is introduced without this DTO update.
         _ => "internal",
@@ -6499,6 +6516,61 @@ impl From<ApplyReport> for LastApplyEntry {
     }
 }
 
+/// `GET /api/v1/status` の `db_source`（外部 DB 連携 S2、
+/// docs/banto-hub-external-db-design.md §4.2・§4.3）: DB Source の接続ごとの
+/// 運転状態。`crate::db_source::status` のプロセス内メモリをそのまま写した
+/// もので、**秘密は含まない**（`last_error` は
+/// `crate::db_source::sanitize_postgres_error` を通した文字列だけ）ため、
+/// `mqtt`/`grpc` 節と同じく admin 限定にはしていない。
+#[derive(Debug, Serialize, ToSchema)]
+struct DbSourceStatusEntry {
+    connection_id: i64,
+    connection_name: String,
+    /// `connected` / `backoff` / `disabled` / `error`
+    /// （`crate::db_source::DbConnectionState`）。
+    state: String,
+    last_poll_at: Option<i64>,
+    last_error: Option<String>,
+    consecutive_failures: u32,
+    groups: Vec<DbSourceGroupStatusEntry>,
+}
+
+/// [`DbSourceStatusEntry`] のグループ1件分。
+#[derive(Debug, Serialize, ToSchema)]
+struct DbSourceGroupStatusEntry {
+    group_id: i64,
+    group_name: String,
+    last_ok_at: Option<i64>,
+    last_error: Option<String>,
+    /// 直近の実行で取れた行数。生成 SQL が `LIMIT 2` を付けるので `2` は
+    /// 「2 行以上」を意味する（`crate::db_source::convert::build_wrapper_sql`）。
+    row_count_last: Option<i64>,
+}
+
+impl From<crate::db_source::DbConnectionStatus> for DbSourceStatusEntry {
+    fn from(status: crate::db_source::DbConnectionStatus) -> Self {
+        Self {
+            connection_id: status.connection_id,
+            connection_name: status.connection_name,
+            state: status.state.as_str().to_string(),
+            last_poll_at: status.last_poll_at,
+            last_error: status.last_error,
+            consecutive_failures: status.consecutive_failures,
+            groups: status
+                .groups
+                .into_iter()
+                .map(|group| DbSourceGroupStatusEntry {
+                    group_id: group.group_id,
+                    group_name: group.group_name,
+                    last_ok_at: group.last_ok_at,
+                    last_error: group.last_error,
+                    row_count_last: group.row_count_last,
+                })
+                .collect(),
+        }
+    }
+}
+
 /// `GET /api/v1/status` の応答。T19 S5: `crate::mcp`の`get_server_status`
 /// ツールが[`compute_status`]をそのまま呼んで`serde_json::to_value`で
 /// 包み直すため`pub(crate)`（フィールド自体へは触れない - トレイト経由の
@@ -6535,6 +6607,9 @@ pub(crate) struct StatusResponse {
     /// 成功、または空構成への遷移）は `null`
     /// (`crate::hub::CollectorManager::last_apply` のドキュメント参照)。
     last_apply: Option<LastApplyEntry>,
+    /// 外部 DB 連携 S2（§4.2・§4.3）: DB Source の接続ごとの運転状態。
+    /// `postgres` 接続が1つも無い通常構成では空配列。
+    db_source: Vec<DbSourceStatusEntry>,
     /// T19 S3-b（docs/banto-hub-t19-design.md §3.9、UX-46「サーバー状態の
     /// 拡充」）: サーバー自身の CPU 使用率・メモリ使用量。
     /// `crate::system_info::SystemInfoSampler`のモジュール doc comment
@@ -6683,6 +6758,12 @@ pub(crate) async fn compute_status(state: &TagSpaceState) -> Result<StatusRespon
             port: grpc_settings.port,
         },
         last_apply: state.manager.last_apply().map(LastApplyEntry::from),
+        db_source: state
+            .manager
+            .db_source_status()
+            .into_iter()
+            .map(DbSourceStatusEntry::from)
+            .collect(),
         system: state.system_info.sample(),
     })
 }
@@ -6851,6 +6932,54 @@ impl From<SystemInfoSnapshot> for AdminSystemInfoEntry {
     }
 }
 
+/// [`DbSourceStatusEntry`]のcamelCase版（外部 DB 連携 S2）。
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct AdminDbSourceStatusEntry {
+    connection_id: i64,
+    connection_name: String,
+    state: String,
+    last_poll_at: Option<i64>,
+    last_error: Option<String>,
+    consecutive_failures: u32,
+    groups: Vec<AdminDbSourceGroupStatusEntry>,
+}
+
+/// [`DbSourceGroupStatusEntry`]のcamelCase版。
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct AdminDbSourceGroupStatusEntry {
+    group_id: i64,
+    group_name: String,
+    last_ok_at: Option<i64>,
+    last_error: Option<String>,
+    row_count_last: Option<i64>,
+}
+
+impl From<DbSourceStatusEntry> for AdminDbSourceStatusEntry {
+    fn from(entry: DbSourceStatusEntry) -> Self {
+        Self {
+            connection_id: entry.connection_id,
+            connection_name: entry.connection_name,
+            state: entry.state,
+            last_poll_at: entry.last_poll_at,
+            last_error: entry.last_error,
+            consecutive_failures: entry.consecutive_failures,
+            groups: entry
+                .groups
+                .into_iter()
+                .map(|group| AdminDbSourceGroupStatusEntry {
+                    group_id: group.group_id,
+                    group_name: group.group_name,
+                    last_ok_at: group.last_ok_at,
+                    last_error: group.last_error,
+                    row_count_last: group.row_count_last,
+                })
+                .collect(),
+        }
+    }
+}
+
 /// `GET /api/status`の応答 - [`StatusResponse`]（`/api/v1/status`）と
 /// 完全に同じ情報をcamelCaseで運ぶ。`mqtt`/`grpc`は元の型
 /// （`MqttStatusEntry`/`GrpcStatusEntry`）をそのまま再利用する -
@@ -6874,6 +7003,8 @@ struct AdminStatusResponse {
     mqtt: MqttStatusEntry,
     grpc: GrpcStatusEntry,
     last_apply: Option<AdminLastApplyEntry>,
+    /// 外部 DB 連携 S2: [`DbSourceStatusEntry`]のcamelCase版。
+    db_source: Vec<AdminDbSourceStatusEntry>,
     /// T19 S3-b（UX-46）: [`SystemInfoSnapshot`]のcamelCase版。
     system: AdminSystemInfoEntry,
 }
@@ -6897,6 +7028,7 @@ impl From<StatusResponse> for AdminStatusResponse {
             mqtt: status.mqtt,
             grpc: status.grpc,
             last_apply: status.last_apply.map(Into::into),
+            db_source: status.db_source.into_iter().map(Into::into).collect(),
             system: status.system.into(),
         }
     }
@@ -9285,6 +9417,10 @@ mod tests {
                     period_ms: group.period_ms,
                     enabled: false,
                     default_writable: group.default_writable,
+                    // 外部 DB 連携 S2: 既存行の SQL 文をそのまま持ち回る
+                    // （この経路はグループを無効化するだけで、SQL 文を
+                    // 書き換える意図は無い）。
+                    query_sql: group.query_sql.clone(),
                 },
             )
             .await
@@ -12568,6 +12704,7 @@ mod tests {
                     period_ms: 100,
                     enabled: true,
                     default_writable: true,
+                    query_sql: None,
                 },
             )
             .await

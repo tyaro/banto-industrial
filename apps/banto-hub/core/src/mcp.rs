@@ -757,6 +757,10 @@ fn tool_definitions() -> Vec<Value> {
                         "type": "boolean",
                         "description": "このグループへ新規登録するタグの writable 既定値。既定値 true。",
                     },
+                    "querySql": {
+                        "type": ["string", "null"],
+                        "description": "postgres 接続配下のグループが1周期ごとに実行する SELECT 文(1グループ = 1 SELECT = N タグ)。先頭が SELECT または WITH の単文のみ。PLC 接続配下のグループでは指定できない(null)。",
+                    },
                 },
                 "required": ["name", "plcConnectionId", "periodMs"],
                 "additionalProperties": false,
@@ -777,6 +781,10 @@ fn tool_definitions() -> Vec<Value> {
                         "type": "boolean",
                         "description": "このグループへ新規登録するタグの writable 既定値。",
                     },
+                    "querySql": {
+                        "type": ["string", "null"],
+                        "description": "postgres 接続配下のグループが1周期ごとに実行する SELECT 文(1グループ = 1 SELECT = N タグ)。先頭が SELECT または WITH の単文のみ。PLC 接続配下のグループでは指定できない(null)。",
+                    },
                 },
                 "required": [
                     "id",
@@ -785,6 +793,7 @@ fn tool_definitions() -> Vec<Value> {
                     "periodMs",
                     "enabled",
                     "defaultWritable",
+                    "querySql",
                 ],
                 "additionalProperties": false,
             },
@@ -830,7 +839,7 @@ fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "name": { "type": "string", "description": "タグ名(グループ内で一意)。" },
                     "collectionGroupId": { "type": "integer", "description": "所属する収集グループの id。" },
-                    "address": { "type": "string", "description": "PLC アドレス。" },
+                    "address": { "type": "string", "description": "PLC アドレス(tagKind=db では結果列名)。" },
                     "dataType": { "type": "string", "description": "データ型。" },
                     "stringLength": {
                         "type": ["integer", "null"],
@@ -854,7 +863,7 @@ fn tool_definitions() -> Vec<Value> {
                     "writable": { "type": "boolean", "description": "書き込み許可。既定値 false。" },
                     "tagKind": {
                         "type": "string",
-                        "description": "plc/computed/internal のいずれか。既定値 plc。",
+                        "description": "plc/computed/internal/db のいずれか。既定値 plc。db は postgres 接続配下専用で、address には結果列名を入れる(読み取り専用・数値/bool/timestamp のみ)。",
                     },
                     "expression": { "type": ["string", "null"], "description": "computed タグの計算式。未使用時は null。" },
                     "retain": { "type": "boolean", "description": "internal タグの再起動時復元。既定値 false。" },
@@ -891,7 +900,7 @@ fn tool_definitions() -> Vec<Value> {
                     "thresholdLl": { "type": ["number", "null"], "description": "しきい値 LL。未使用時は null。" },
                     "enabled": { "type": "boolean", "description": "タグを有効にするか。" },
                     "writable": { "type": "boolean", "description": "書き込み許可。" },
-                    "tagKind": { "type": "string", "description": "plc/computed/internal のいずれか。" },
+                    "tagKind": { "type": "string", "description": "plc/computed/internal/db のいずれか。" },
                     "expression": { "type": ["string", "null"], "description": "computed タグの計算式。未使用時は null。" },
                     "retain": { "type": "boolean", "description": "internal タグの再起動時復元。" },
                     "expectedRevision": {
@@ -2005,13 +2014,17 @@ const UPDATE_CONNECTION_REQUIRED_FIELDS: [&str; 12] = [
 /// [`tool_update_group`]の必須キー一覧 - `CollectionGroupPayload`の
 /// wire フィールド（camelCase）全部 + `id`。inputSchema の
 /// `update_group.required`と同期させること。
-const UPDATE_GROUP_REQUIRED_FIELDS: [&str; 6] = [
+const UPDATE_GROUP_REQUIRED_FIELDS: [&str; 7] = [
     "id",
     "name",
     "plcConnectionId",
     "periodMs",
     "enabled",
     "defaultWritable",
+    // 外部 DB 連携 S2: PUT 置換の規約どおり「全項目必須 + null 許容」-
+    // PLC グループでは `null` が正しい値、postgres グループでは `null` は
+    // `banto_tags` 側の検証で「必須です」として弾かれる。
+    "querySql",
 ];
 
 /// [`tool_update_tag`]の必須キー一覧 - `TagPayload`の wire フィールド

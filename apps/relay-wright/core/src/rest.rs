@@ -1829,6 +1829,7 @@ impl From<CollectionGroupPayload> for CollectionGroupInput {
             // doc comment on `banto_tags::CollectionGroup`), so hardcoding
             // it here cannot change any relay-wright behavior.
             default_writable: true,
+            query_sql: None,
         }
     }
 }
@@ -5047,6 +5048,7 @@ mod tests {
                 period_ms: 1_000,
                 enabled: true,
                 default_writable: true,
+                query_sql: None,
             })
             .await
             .expect("seed collection group");
@@ -5770,6 +5772,7 @@ mod tests {
                 period_ms: 1000,
                 enabled: true,
                 default_writable: true,
+                query_sql: None,
             })
             .await
             .expect("create collection group");

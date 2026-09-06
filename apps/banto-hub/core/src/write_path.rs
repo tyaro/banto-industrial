@@ -465,6 +465,20 @@ async fn resolve_write_target(
         return Err(WriteRejection::TagDisabled);
     }
 
+    // 外部 DB 連携 S2（docs/banto-hub-external-db-design.md §6-10「v1 は
+    // 読み取り専用」）: `db` タグへの書き込みは常に拒否する。実際には
+    // banto-tags 側が `db` タグの `writable` を常に false へ正規化するので
+    // gate 2 が既に 403 を返しており、この分岐は**到達しない**はずの二重の
+    // 防御 - `internal` タグと同じ「PLC 接続を持たない」形をしているため、
+    // 万一 writable な `db` 行が生まれると gate 8 が internal タグ扱いで
+    // `ServerTagStore` へ書き込んでしまい、次のポーリングで上書きされる
+    // 「書けたように見えて消える」挙動になる。ここで先に止めておく。
+    // 拒否理由は gate 2 と同じ `NotWritable`（403）- 呼び出し側から見た
+    // 意味は「このタグは書けない」で変わらないため、応答の形を分岐させない。
+    if entry.tag_kind == banto_tags::DB_TAG_KIND {
+        return Err(WriteRejection::NotWritable);
+    }
+
     let (connection_id, _group_id, tag_id) = entry.ids;
 
     // Simulation is a safety boundary, not a transport error. Check it before
