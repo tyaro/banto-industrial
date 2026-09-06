@@ -1,7 +1,7 @@
 # banto-hub 外部 DB 連携 設計: DB Source（#228）と DB Sink（#229）
 
 作成日: 2026-09-06
-状態: **Draft・オーナー決定待ち（§6）**。コード調査（§3）は 2026-09-06 の main（`9c26b3a`、toolchain 1.98.1）に対して実施済み。実装は未着手。
+状態: **オーナー決定済み（2026-09-06、§6 の 15 項目）・実装は S0（依存実測）から着手**。Sink は Hub 内モジュールではなく**別プロセスのサイドカー**とする（§5.1、2026-09-06 決定）。コード調査（§3）は 2026-09-06 の main（`9c26b3a`、toolchain 1.98.1）に対して実施済み。
 対象: Issue [#228](https://github.com/tyaro/banto-industrial/issues/228)（外部 RDB の値をタグ空間へ取り込む Source）と [#229](https://github.com/tyaro/banto-industrial/issues/229)（タグ値を外部 RDB へ保存する Sink / Logger）。**2 件はペアで 1 設計**とし、DB 接続エンティティを共有する。
 
 関連: [tag-server-design.md](tag-server-design.md)（タグ空間・書き込み安全の一次ソース。§2 非スコープの「ロガー作らない」決定を本書 §2.1 で扱う）、[banto-hub-t20-design.md](banto-hub-t20-design.md)（値表現と read-on-demand の先例）、[banto-hub-t21-design.md](banto-hub-t21-design.md)（構成操作の MCP と監査の型）、[plan.md](plan.md) §1（「外部時系列DB読み出し・保存」は 3〜4 案件で再利用される共通資産）。
@@ -29,7 +29,7 @@
 - 保存した履歴を Hub が読み返す API・トレンド表示・帳票は作らない
 - 保持期間管理・間引き・バックフィルは作らない（ChronoGazer / tstore の領分）
 
-**この位置づけで 2026-08-04 決定を部分的に覆すかは §6-1 のオーナー決定。** 覆す場合は tag-server-design.md §2 の該当行に日付付きで追記する（T20 が banto-tagclient-design.md §4.4 の旧決定を覆したときと同じ扱い）。
+**2026-09-06 オーナー決定: 上記の線引きで部分的に覆す。** 理由は次の 2 点。(1) 24/365 で動くエンジンには起動停止と運転状態を見る UI が必ず要り、その基盤（トレイ・SCM サービス・状態画面・pending queue・試運転モード）は T16〜T19 で Hub にだけ作り込まれている。別製品として作れば同じ投資を繰り返し、Tauri アプリにすれば ChronoGazer と同じ「寿命が UI と同じ」問題に戻る。(2) ただし Sink のエンジン自体は、キューと遅い SQL を持つ唯一の重い消費者であり、メモリ枯渇やランタイム閉塞といった物理的な巻き込みは同一プロセスでは防げないため、**別プロセスのサイドカー**とする（§5.1）。設定・UI・監視は Hub が持つ。tag-server-design.md §2 の該当行に同日付で追記済み（T20 が banto-tagclient-design.md §4.4 の旧決定を覆したときと同じ扱い）。
 
 ### 2.2 資格情報の保管（v1 平文・閉域 LAN 前提）
 
@@ -115,15 +115,19 @@ Hub には暗号化保管や OS keyring の機構が存在しない。MQTT の�
 
 REST / WS / MQTT / gRPC からは PLC タグと区別しない（受け入れ条件「Source 差異を外部 API に漏らさない」）。`value_source` の表示ラベル（`real` / `simulation` / `internal`）に `db` を足すかは §6-11。
 
-## 5. DB Sink（#229）の設計
+## 5. DB Sink（#229）の設計（2026-09-06 決定: サイドカー方式）
 
-### 5.1 位置づけ
+### 5.1 位置づけとプロセス配置
 
-MQTT 発行（`apps/banto-hub/core/src/mqtt.rs`）と同型の**読み取り専用の消費者**。タグ空間には一切書かず、`read_current` を 250ms で評価して変化・周期を検出し、外部 DB へ INSERT する。収集・演算・書き込み経路に依存も影響も持たない（障害分離の要）。ChronoGazer との線引きは §2.1。
+- **Hub とは別プロセスのサイドカー** `banto-hub-sink`（仮称。`apps/banto-hub-sink`、UI を持たない Rust バイナリ。Windows サービスとして Hub と同じ MSI で登録し、Hub の後に起動する）。
+- 原則は「**タグ空間を定義する側は Hub の中、消費するだけの側は外**」。Source は演算タグと同じくタグ値を定義するので Hub 内（§4）、Sink は消費者なので外。機能ごとの全面分割は SCM 登録・UAC・設定同期・版数ズレ・ログ場所の運用コストを機能数倍にするので採らない（2026-09-06 オーナー議論）。
+- Hub からの値の取得は **banto-tagclient SDK**（REST snapshot + WS `on_change` 購読、再接続バックオフ込み）。SDK の最初の本番利用者になり、#123 で「利用アプリが出た時点で」と保留した組み込み確認を兼ねる。
+- **サイドカーは状態を持たない**。起動時に Hub から設定を取得 → 購読 → INSERT の繰り返しで、落ちれば SCM が再起動して設定を取り直す。Hub が未起動なら SDK のバックオフで待つ。
+- MQTT / gRPC は当面 Hub 内のまま。72 h soak（#210）の結果で必要なら同じ型（設定は Hub、エンジンは外）で外へ出す。
 
-### 5.2 エンティティ
+### 5.2 エンティティと Hub 側 API（設定・監視は Hub が持つ）
 
-DB 接続は **#228 と同じ `plc_connections`（`protocol = "postgres"`）を共有**する（Source を使わず Sink だけを使う案件でも、接続の登録・接続テスト・資格情報の扱いが 1 つで済む）。Sink 固有に `logger_groups` テーブルを新設する。
+DB 接続は **#228 と同じ `plc_connections`（`protocol = "postgres"`）を共有**する（接続の登録・接続テスト・資格情報の扱いが 1 つで済む）。Sink 固有に `logger_groups` を Hub の SQLite に新設する。
 
 | 列                  | 内容                                                                       |
 | ------------------- | -------------------------------------------------------------------------- |
@@ -138,67 +142,82 @@ DB 接続は **#228 と同じ `plc_connections`（`protocol = "postgres"`）を�
 
 タグ選択は「グループ単位」だけを v1 とし、「接続配下のすべて」「名前のワイルドカード」は入れない（catalog の rename 追従を安定 ID で担保するため）。
 
-### 5.3 保存スキーマ（v1 は long 固定、DDL は Hub が発行しない）
+Hub 側に足す API（すべて `admin` スコープ、T21 §3.1）:
+
+- `GET /api/sink/config`: 有効な `logger_groups`・対象タグの安定 ID・DB 接続情報（**パスワードを含む**）を返す。サイドカー専用に発行した admin キーで呼ぶ。パスワードが平文で HTTP を流れるため、**サイドカーは Hub と同一マシンでループバック接続する運用を前提**とし、docs と UI に明記する（§2.2 の閉域 LAN 前提の延長）。
+- `PUT /api/sink/status`: サイドカーが 5 秒ごとに `state` / `queued` / `dropped` / `last_flush_at` / `last_error` をグループ単位で push する。Hub はメモリに保持し、`GET /api/status` の sink 節と状態画面に出す。15 秒以上 push が無ければ `unknown`（サービス停止の疑い）と表示する。
+- `logger_groups` の CRUD は既存の REST / MCP の型（`*_tx` → commit → SSE `ResourceChanged`）に載せる。**pending queue には載せない**（§6-13）。サイドカーは SSE か定期ポーリングで変更を検知して設定を取り直す。
+
+### 5.3 保存スキーマ（v1 は long 固定、DDL は発行しない）
 
 ```text
 ts (timestamptz) | tag_id (bigint) | external_name (text) | value (double precision) | quality (text)
 ```
 
-- **long / narrow を v1 とする。** タグ追加でスキーマが変わらない・グループ間でテーブルを共有できる・Hub 側の実装が 1 種類で済む。wide（列 = タグ）は SQL 利用者には便利だが、グループごとの DDL 管理と rename 追従が要るので第 2 段（§6-6）。
-- **Hub は CREATE TABLE を発行しない。** テーブルは利用者（DBA）が用意し、Hub は起動時と設定変更時に `SELECT ... LIMIT 0` で列の存在と型を検査して、合わなければグループを `error` 状態にして止める（他グループと収集には影響しない）。理由: Hub の DB ユーザーに DDL 権限を持たせない（「必要最小限の INSERT 権限」の受け入れ条件）ため。UI には推奨 DDL を**表示**する（§6-7）。
-- `external_name` を毎行に持たせるのは、DB 側だけで人が読めるようにするため（tag_id だけだと Hub の catalog を引かないと意味が分からない）。rename 後の行は新しい名前になる（履歴の名前を書き換えない）。
+- **long / narrow を v1 とする。** タグ追加でスキーマが変わらない・グループ間でテーブルを共有できる・実装が 1 種類で済む。wide（列 = タグ）はグループごとの DDL 管理と rename 追従が要るので第 2 段（§6-6）。
+- **CREATE TABLE は発行しない。** テーブルは利用者（DBA）が用意し、サイドカーは起動時と設定変更時に `SELECT ... LIMIT 0` で列の存在と型を検査して、合わなければそのグループを `error` にして止める（他グループには影響しない）。DB ユーザーは INSERT 権限だけで済む。Hub の UI には推奨 DDL を**表示**する（§6-7）。
+- `external_name` を毎行に持たせるのは、DB 側だけで人が読めるようにするため。rename 後の行は新しい名前になる（履歴の名前は書き換えない）。
 
 ### 5.4 バッチとバックプレッシャ
 
 - グループごとに **bounded queue**（既定 10,000 行、設定可）を持ち、`flush_interval_ms`（既定 1,000）または `batch_size`（既定 500）で 1 回の multi-row INSERT にまとめる。
-- DB 停止・INSERT 失敗は指数バックオフ（Source と同じ定数）。**キューが満杯なら最も古い行を捨てて `dropped` カウンタを増やす**（メモリを無制限に使わない。§6-8）。ディスクスプールは将来。
-- 1 回の INSERT はトランザクション 1 つ。失敗したバッチは丸ごと再試行し、重複挿入を避けるため成功確認前にキューから外さない（at-least-once。DB 側で `(ts, tag_id)` の一意制約を張るかは利用者の選択）。
+- DB 停止・INSERT 失敗は指数バックオフ（Source と同じ定数）。**キューが満杯なら最も古い行を捨てて `dropped` を増やす**（メモリを無制限に使わない。§6-8）。ディスクスプールは将来。
+- 1 回の INSERT はトランザクション 1 つ。失敗したバッチは丸ごと再試行し、成功確認前にキューから外さない（at-least-once。`(ts, tag_id)` の一意制約は利用者の選択）。
+- キューが膨らんでもサイドカーのプロセス内で閉じ、Hub の収集・購読配信には波及しない（これがサイドカー方式の目的）。
 
-### 5.5 可観測性
+### 5.5 可観測性と統合監視
 
-- `GET /api/status`（T19 の状態画面）に Sink の節を足す: グループごとの `state`（running / backoff / error / disabled）、`queued`、`dropped`、`last_flush_at`、`last_error`。
-- 行単位の INSERT は監査しない（量が多く監査の意味を薄める）。**設定変更は既存の構成監査**に載る。INSERT の試行・結果を追いたい場合は `write_audit.rs` の log-before-write の型（§3-12）で `hub_sink_audit` を足せるが、v1 では入れない（§6-12）。
-- ログは `warn` を初回とバックオフ段階の変化時のみ（連続失敗で毎周期 warn を出さない。MQTT と同じ抑制）。
+- **状態画面**（T19 の `GET /api/status`）に sink 節を足し、§5.2 の push 内容を表示する。
+- **デスクトップシェル（T16）に「サービス」一覧を足す**。Hub と sink の SCM 状態（running / stopped）と起動停止をトレイから扱えるようにする。SCM の状態照会・起動停止は T17 の実装を流用する。新しい監視アプリは作らない。
+- 行単位の INSERT は監査しない（§6-12）。`logger_groups` の設定変更は既存の構成監査に載る。
+- ログは `warn` を初回とバックオフ段階の変化時のみ（MQTT と同じ抑制）。
 
 ### 5.6 ライフサイクル
 
-`HubRuntime::start` / `RunningHub::shutdown` で MQTT・gRPC と同じ位置（純粋な消費者として `manager` より先に止める）。停止時は残キューを最大 5 秒だけ flush して諦める（残りは `dropped` に計上して `warn`）。Sink の設定変更は収集に影響しないので **pending queue に載せず即時適用**とする（§6-13）。
+- サービス起動順は Hub → sink。sink は Hub 未起動なら SDK のバックオフで待ち、Hub の再起動（`config_changed` / 切断）にも SDK の再解決・再購読で追従する。
+- 停止時は残キューを最大 5 秒だけ flush して諦める（残りは `dropped` に計上して `warn`）。
+- 設定は exe 隣の `banto-hub-sink.toml`（Hub の URL と admin API キー、hanger-finder と同じ置き方）。それ以外の設定はすべて Hub 側。
 
-## 6. オーナー決定項目
+## 6. オーナー決定項目（2026-09-06 決定済み）
 
-| #   | 項目                                                             | 推奨                                                                                      | 影響                                                                   |
-| --- | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| 1   | #229 が 2026-08-04「ロガー作らない」決定を覆すことの確認（§2.1） | §2.1 の線引き（外部 DB への出口のみ、Hub は履歴を持たず読み返さない）で**覆す**           | tag-server-design.md §2 に日付付きで追記。否なら #229 はクローズ       |
-| 2   | v1 で対応する DB                                                 | **PostgreSQL のみ**。SQL Server は `tiberius` の依存・保守状況を S0 で実測してから第 2 段 | 依存増分と CI 時間。MySQL / SQLite は需要待ち                          |
-| 3   | 資格情報の保管（§2.2）                                           | **MQTT と同じ v1 平文**。暗号化・keyring は別 issue                                       | config パッケージの除外リストに追加                                    |
-| 4   | Source のエンティティ配置（§4.1）                                | **案 A**（既存 3 階層の流用）                                                             | protocol CHECK の再構築マイグレーション 1 本                           |
-| 5   | 文字列列の扱い（§4.4）                                           | **v1 は数値・bool・timestamp のみ**。文字列は要件が出た時点で (a)/(b) を選ぶ              | `string` の `db` タグは登録拒否                                        |
-| 6   | Sink の保存スキーマ（§5.3）                                      | **long 固定**。wide は第 2 段                                                             |                                                                        |
-| 7   | Sink の DDL                                                      | **Hub は発行しない**（起動時検査＋推奨 DDL の表示のみ）                                   | DB ユーザーは INSERT 権限だけで済む                                    |
-| 8   | キュー溢れ・複数行結果の扱い（§4.2 / §5.4）                      | Source: 先頭行採用＋warn 1 回。Sink: **最古を捨てて `dropped` 計上**                      |                                                                        |
-| 9   | グループ周期の上限（§3-8）                                       | v1 は既存集合（最大 60 s）のまま。5 分・1 時間は要望が出たら CHECK を拡張                 | 拡張はテーブル再構築                                                   |
-| 10  | Source タグの書き込み（UPDATE）                                  | **v1 は読み取り専用**（#228 の非スコープどおり）                                          | `db` タグは `writable = false` 固定                                    |
-| 11  | `value_source` ラベルに `db` を足すか                            | 足す（`real` と区別できる方が現場の切り分けに効く）                                       | SDK（banto-tagclient）は未知ラベルを `Unknown(raw)` で保持するので互換 |
-| 12  | Sink の INSERT 監査                                              | v1 は入れない（状態 API の `dropped` / `last_error` で足りる）                            |                                                                        |
-| 13  | Sink 設定変更の pending queue                                    | **載せない**（収集に影響しないため即時適用）                                              |                                                                        |
+2026-09-06 に本節の 1〜13 は推奨どおり、14〜15 は同日のオーナー議論（サービス分割と統合監視）を受けて決定した。
 
-## 7. スライス構成（案）
+| #   | 項目                                                     | 決定（2026-09-06）                                                                                       | 影響                                                            |
+| --- | -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| 1   | #229 が 2026-08-04「ロガー作らない」決定を覆すか（§2.1） | §2.1 の線引き（外部 DB への出口のみ、Hub は履歴を持たず読み返さない）で**覆す**                          | tag-server-design.md §2 に追記済み                              |
+| 2   | v1 で対応する DB                                         | **PostgreSQL のみ**。SQL Server は `tiberius` の依存・保守状況を S0 で実測してから第 2 段                | MySQL / SQLite は需要待ち                                       |
+| 3   | 資格情報の保管（§2.2）                                   | **MQTT と同じ v1 平文**。暗号化・keyring は別 issue                                                      | config パッケージの除外リストに追加                             |
+| 4   | Source のエンティティ配置（§4.1）                        | **案 A**（既存 3 階層の流用）                                                                            | protocol CHECK の再構築マイグレーション 1 本                    |
+| 5   | 文字列列の扱い（§4.4）                                   | **v1 は数値・bool・timestamp のみ**。文字列は要件が出た時点で (a)/(b) を選ぶ                             | `string` の `db` タグは登録拒否                                 |
+| 6   | Sink の保存スキーマ（§5.3）                              | **long 固定**。wide は第 2 段                                                                            |                                                                 |
+| 7   | Sink の DDL                                              | **発行しない**（起動時検査＋推奨 DDL の表示のみ）                                                        | DB ユーザーは INSERT 権限だけで済む                             |
+| 8   | キュー溢れ・複数行結果の扱い（§4.2 / §5.4）              | Source: 先頭行採用＋warn 1 回。Sink: **最古を捨てて `dropped` 計上**                                     |                                                                 |
+| 9   | グループ周期の上限（§3-8）                               | v1 は既存集合（最大 60 s）のまま。5 分・1 時間は要望が出たら CHECK を拡張                                | 拡張はテーブル再構築                                            |
+| 10  | Source タグの書き込み（UPDATE）                          | **v1 は読み取り専用**                                                                                    | `db` タグは `writable = false` 固定                             |
+| 11  | `value_source` ラベルに `db` を足すか                    | **足す**                                                                                                 | SDK は未知ラベルを `Unknown(raw)` で保持するので互換            |
+| 12  | Sink の INSERT 監査                                      | **v1 は入れない**（状態 push の `dropped` / `last_error` で足りる）                                      |                                                                 |
+| 13  | Sink 設定変更の pending queue                            | **載せない**（収集に影響しないため即時適用）                                                             |                                                                 |
+| 14  | Sink のプロセス配置（§5.1）                              | **別プロセスのサイドカー**。設定・UI・監視は Hub、エンジンは `banto-hub-sink`。MQTT / gRPC は当面 Hub 内 | SDK の本番利用。MSI に 2 つ目のサービス                         |
+| 15  | サイドカーへの設定配布と監視（§5.2）                     | **admin スコープの専用 API キー + ループバック**で `GET /api/sink/config` / `PUT /api/sink/status`       | パスワードが平文で流れるためループバック運用を docs / UI に明記 |
 
-| slice | 内容                                                                                                                                                         | 完了条件                                                                                          |
-| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
-| S0    | 依存の実測: sqlx `postgres` + TLS feature の依存増分・license（cargo-deny）・配布バイナリ増分。`tiberius` の同上（第 2 段の判断材料）                        | 実測値を本書 §3 末尾に追記。cargo-deny 緑                                                         |
-| S1    | DB 接続エンティティ: protocol `postgres` のマイグレーション（再構築）、`PlcConnection` の追加項目、接続テスト API、config パッケージ往復と除外、MCP の受け口 | 既存 PLC 接続の CRUD・CSV・E2E に回帰なし。接続テストが `SELECT 1` と列一覧を返す                 |
-| S2    | Source 本体: `query_sql` 列、`db` tag_kind と配置制約、ポーリング task、Quality 変換、バックオフ、`commit_catalog` 連動                                      | ローカル PostgreSQL（Docker）に対する統合テスト: 正常・NULL・0 行・クエリエラー・接続断からの復帰 |
-| S3    | Source の UI / CSV / MCP: Drawer の DB フィールド、列名候補の提示、`db` タグの登録 UI、E2E                                                                   | 手動 smoke 手順を docs に追加                                                                     |
-| S4    | Sink 本体: `logger_groups` テーブル、消費 task、long スキーマ INSERT、bounded queue、バックオフ、起動時のテーブル検査、状態 API                              | 統合テスト: interval / on_change・DB 停止中のキュー上限・復帰後の flush・停止時の flush           |
-| S5    | Sink の UI / MCP / docs: グループ CRUD 画面、推奨 DDL 表示、状態画面の節、T21 ツール追加                                                                     |                                                                                                   |
-| S6    | 実 DB 検証: 顧客相当の PostgreSQL（別マシン・LAN 越し）で Source / Sink を 24 h 連続動作。切断・再接続・DB 再起動                                            | 結果を real-machine 系 docs に記録                                                                |
+## 7. スライス構成
 
-S0 と S1 は実機不要。S2 / S4 の統合テストは CI で PostgreSQL のサービスコンテナを使う（GitHub Actions の `services:`）。
+| slice | 内容                                                                                                                                                                | 完了条件                                                                                                    |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| S0    | 依存の実測: sqlx `postgres` + TLS feature の依存増分・license（cargo-deny）・配布バイナリ増分。`tiberius` の同上（第 2 段の判断材料）                               | 実測値を本書 §3 末尾に追記。cargo-deny 緑                                                                   |
+| S1    | DB 接続エンティティ（Hub）: protocol `postgres` のマイグレーション（再構築）、`PlcConnection` の追加項目、接続テスト API、config パッケージ往復と除外、MCP の受け口 | 既存 PLC 接続の CRUD・CSV・E2E に回帰なし。接続テストが `SELECT 1` と列一覧を返す                           |
+| S2    | Source 本体（Hub）: `query_sql` 列、`db` tag_kind と配置制約、ポーリング task、Quality 変換、バックオフ、`commit_catalog` 連動                                      | ローカル PostgreSQL（Docker）に対する統合テスト: 正常・NULL・0 行・クエリエラー・接続断からの復帰           |
+| S3    | Source の UI / CSV / MCP: Drawer の DB フィールド、列名候補の提示、`db` タグの登録 UI、E2E                                                                          | 手動 smoke 手順を docs に追加                                                                               |
+| S4    | Sink の Hub 側: `logger_groups` テーブルと CRUD（REST / MCP）、`GET /api/sink/config`、`PUT /api/sink/status`、状態 API の sink 節、config パッケージ往復           | CRUD の REST / MCP テスト。config が admin 以外で 403                                                       |
+| S5    | サイドカー本体 `apps/banto-hub-sink`: SDK 購読、long INSERT、bounded queue、バックオフ、テーブル検査、status push、exe 隣 toml、SCM サービス化と MSI 登録           | 統合テスト: interval / on_change・DB 停止中のキュー上限・復帰後の flush・停止時の flush・Hub 再起動への追従 |
+| S6    | UI: logger group 画面、推奨 DDL 表示、状態画面の sink 節、デスクトップシェルのサービス一覧（Hub / sink の SCM 状態と起動停止）                                      | E2E と Windows 実機での手動確認                                                                             |
+| S7    | 実 DB 検証: 顧客相当の PostgreSQL（別マシン・LAN 越し）で Source / Sink を 24 h 連続動作。切断・再接続・DB 再起動・sink 単独の停止と再起動                          | 結果を real-machine 系 docs に記録                                                                          |
+
+S0 / S1 / S4 は実機不要。S2 / S5 の統合テストは CI で PostgreSQL のサービスコンテナを使う（GitHub Actions の `services:`）。S6 のシェル部分は Windows 実機が要る。着手順は S0 → S1 → S2 → S4 → S5 → S3 → S6 → S7（Source の UI より先に Sink の骨格を通し、SDK の本番利用を早く始める）。
 
 ## 8. 更新対象ドキュメント
 
-- [tag-server-design.md](tag-server-design.md) §2 非スコープ（§6-1 の決定を反映）、§4.1 タグ種別の表に `db` を追加、§5 外部 IF に Sink を追加
+- [tag-server-design.md](tag-server-design.md) §2 非スコープ（§6-1 の決定、**2026-09-06 追記済み**）、§4.1 タグ種別の表に `db` を追加、§5 外部 IF に Sink を追加（S2 / S4 の PR で）
 - [README.md](README.md) の文書一覧に本書を追加（本 PR で実施）
 - [banto-hub-remaining-plan.md](banto-hub-remaining-plan.md) の進捗追記
 - [banto-hub-mcp-reference.md](banto-hub-mcp-reference.md) / [banto-hub-t21-design.md](banto-hub-t21-design.md)（MCP ツールの追加時）
