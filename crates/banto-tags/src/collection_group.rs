@@ -9,6 +9,7 @@ use banto_storage::ColumnMap;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
+use crate::plc_connection::POSTGRES_PROTOCOL;
 use crate::support::{map_write_error, max_length_message, required_message, NAME_ALREADY_USED};
 
 /// Selectable collection periods, milliseconds (recorder-requirements.md
@@ -110,6 +111,27 @@ fn validate_collection_group_input(input: &CollectionGroupInput) -> Result<(), B
     }
 }
 
+/// S1 (docs/banto-hub-external-db-design.md §7 スライス表「S1」・
+/// `crate::plc_connection`モジュール doc comment「`\"postgres\"`」節、
+/// 2026-09-06): この段階では `protocol = "postgres"` の接続配下に収集
+/// グループを作れない - S2（DB Source 本体、`query_sql` 列と
+/// `tag_kind = "db"` の追加）がこの制約を解除するまで、DB 接続には
+/// タグを置く場所が存在しないままにする。`plc_connection_id` が存在しない
+/// 行を指す場合（`protocol` が `None`）は何もしない - そちらは既存の
+/// `ON DELETE RESTRICT` FK 制約が `FK_MESSAGE` 付きで拒否する、この関数の
+/// 関心事ではない。
+fn reject_group_under_postgres_connection(protocol: Option<String>) -> Result<(), BantoError> {
+    if protocol.as_deref() == Some(POSTGRES_PROTOCOL) {
+        return Err(BantoError::Validation {
+            field_errors: vec![FieldError {
+                field: "plcConnectionId".to_string(),
+                message: "DB 接続配下のグループは S2（DB Source）で対応予定です".to_string(),
+            }],
+        });
+    }
+    Ok(())
+}
+
 fn column_map() -> ColumnMap {
     ColumnMap::new()
         .column("id", "id")
@@ -183,6 +205,13 @@ impl CollectionGroupService {
 
     pub async fn create(&self, input: CollectionGroupInput) -> Result<CollectionGroup, BantoError> {
         validate_collection_group_input(&input)?;
+        let existing_protocol: Option<String> =
+            sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
+                .bind(input.plc_connection_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(banto_storage::storage_error)?;
+        reject_group_under_postgres_connection(existing_protocol)?;
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
@@ -214,6 +243,13 @@ impl CollectionGroupService {
         input: CollectionGroupInput,
     ) -> Result<CollectionGroup, BantoError> {
         validate_collection_group_input(&input)?;
+        let existing_protocol: Option<String> =
+            sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
+                .bind(input.plc_connection_id)
+                .fetch_optional(&mut *connection)
+                .await
+                .map_err(banto_storage::storage_error)?;
+        reject_group_under_postgres_connection(existing_protocol)?;
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
@@ -244,6 +280,13 @@ impl CollectionGroupService {
         input: CollectionGroupInput,
     ) -> Result<CollectionGroup, BantoError> {
         validate_collection_group_input(&input)?;
+        let existing_protocol: Option<String> =
+            sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
+                .bind(input.plc_connection_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(banto_storage::storage_error)?;
+        reject_group_under_postgres_connection(existing_protocol)?;
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
@@ -275,6 +318,13 @@ impl CollectionGroupService {
         input: CollectionGroupInput,
     ) -> Result<CollectionGroup, BantoError> {
         validate_collection_group_input(&input)?;
+        let existing_protocol: Option<String> =
+            sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
+                .bind(input.plc_connection_id)
+                .fetch_optional(&mut *connection)
+                .await
+                .map_err(banto_storage::storage_error)?;
+        reject_group_under_postgres_connection(existing_protocol)?;
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
@@ -456,6 +506,9 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .unwrap();
@@ -606,6 +659,79 @@ mod tests {
             BantoError::Validation { field_errors } => {
                 assert_eq!(field_errors[0].field, "plcConnectionId");
                 assert_eq!(field_errors[0].message, FK_MESSAGE);
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// S1 (docs/banto-hub-external-db-design.md §7 スライス表「S1」、
+    /// `crate::plc_connection`モジュール doc comment「`\"postgres\"`」節):
+    /// この段階では `protocol = "postgres"` の接続配下にグループを作れない -
+    /// S2 がこの制約を解除するまで、DB 接続にはタグを置く場所が無い。
+    #[tokio::test]
+    async fn create_rejects_a_group_under_a_postgres_connection() {
+        let (plc_svc, svc, _conn_id) = setup().await;
+        let pg_conn = plc_svc
+            .create(PlcConnectionInput {
+                name: "ERP DB".to_string(),
+                protocol: "postgres".to_string(),
+                host: "10.0.0.50".to_string(),
+                port: 5432,
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+                word_order: "low_high".to_string(),
+                database: Some("erp".to_string()),
+                username: Some("reader".to_string()),
+                password: None,
+            })
+            .await
+            .unwrap();
+
+        let err = svc
+            .create(sample_input("G1", pg_conn.id))
+            .await
+            .unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "plcConnectionId");
+                assert!(field_errors[0].message.contains("S2"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// The `update`-side twin: switching an *existing* group's
+    /// `plc_connection_id` onto a `"postgres"` connection is rejected the
+    /// same way create is.
+    #[tokio::test]
+    async fn update_rejects_moving_a_group_onto_a_postgres_connection() {
+        let (plc_svc, svc, conn_id) = setup().await;
+        let group = svc.create(sample_input("G1", conn_id)).await.unwrap();
+        let pg_conn = plc_svc
+            .create(PlcConnectionInput {
+                name: "ERP DB".to_string(),
+                protocol: "postgres".to_string(),
+                host: "10.0.0.50".to_string(),
+                port: 5432,
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+                word_order: "low_high".to_string(),
+                database: Some("erp".to_string()),
+                username: Some("reader".to_string()),
+                password: None,
+            })
+            .await
+            .unwrap();
+
+        let err = svc
+            .update(group.id, sample_input("G1", pg_conn.id))
+            .await
+            .unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "plcConnectionId");
             }
             other => panic!("expected Validation, got {other:?}"),
         }

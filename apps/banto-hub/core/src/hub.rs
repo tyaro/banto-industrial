@@ -1945,6 +1945,9 @@ mod tests {
                     simulation: false,
 
                     word_order: "low_high".to_string(),
+                    database: None,
+                    username: None,
+                    password: None,
                 },
                 PlcConnection {
                     id: 2,
@@ -1957,6 +1960,9 @@ mod tests {
                     simulation: false,
 
                     word_order: "low_high".to_string(),
+                    database: None,
+                    username: None,
+                    password: None,
                 },
                 PlcConnection {
                     id: 3,
@@ -1969,6 +1975,9 @@ mod tests {
                     simulation: false,
 
                     word_order: "low_high".to_string(),
+                    database: None,
+                    username: None,
+                    password: None,
                 },
                 PlcConnection {
                     id: 4,
@@ -1981,6 +1990,9 @@ mod tests {
                     simulation: false,
 
                     word_order: "low_high".to_string(),
+                    database: None,
+                    username: None,
+                    password: None,
                 },
             ],
             groups: Vec::new(),
@@ -2024,6 +2036,9 @@ mod tests {
             simulation: false,
 
             word_order: "low_high".to_string(),
+            database: None,
+            username: None,
+            password: None,
         };
         let conn2 = PlcConnection {
             id: 2,
@@ -2036,6 +2051,9 @@ mod tests {
             simulation: false,
 
             word_order: "low_high".to_string(),
+            database: None,
+            username: None,
+            password: None,
         };
         let group1 = banto_tags::CollectionGroup {
             id: 10,
@@ -2123,6 +2141,9 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .unwrap();
@@ -2207,6 +2228,9 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .unwrap();
@@ -2254,6 +2278,9 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .unwrap();
@@ -2330,6 +2357,9 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .unwrap();
@@ -2430,6 +2460,9 @@ mod tests {
                 simulation: true,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .unwrap();

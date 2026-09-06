@@ -176,6 +176,7 @@ pub mod commissioning;
 pub mod computed;
 pub mod controller;
 pub mod db;
+pub mod db_source;
 pub mod diag_log;
 pub mod events;
 pub mod grpc;

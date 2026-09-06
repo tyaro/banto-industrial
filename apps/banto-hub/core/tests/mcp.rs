@@ -79,6 +79,9 @@ fn slmp_conn_input(name: &str, port: u16) -> PlcConnectionInput {
         enabled: true,
         simulation: false,
         word_order: "low_high".to_string(),
+        database: None,
+        username: None,
+        password: None,
     }
 }
 
@@ -425,7 +428,7 @@ async fn initialize_returns_tool_capabilities() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tools_list_returns_the_thirty_one_tools() {
+async fn tools_list_returns_the_thirty_two_tools() {
     let app = test_app("tools-list").await;
     let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
 
@@ -463,6 +466,7 @@ async fn tools_list_returns_the_thirty_one_tools() {
             "set_retention",
             "set_write_control",
             "test_connection",
+            "test_saved_connection",
             "update_connection",
             "update_group",
             "update_tag",
@@ -1839,6 +1843,9 @@ async fn update_connection_with_admin_scope_updates_and_audits() {
                 "enabled": true,
                 "simulation": false,
                 "wordOrder": "low_high",
+                "database": null,
+                "username": null,
+                "password": null,
             }),
         ),
     )
@@ -1849,6 +1856,14 @@ async fn update_connection_with_admin_scope_updates_and_audits() {
     let payload: Value = serde_json::from_str(text).unwrap();
     assert_eq!(payload["updated"]["name"], "line1-renamed");
     assert_eq!(payload["updated"]["port"], 15099);
+    assert_eq!(
+        payload["updated"]["passwordSet"], false,
+        "a non-postgres connection carries no password"
+    );
+    assert!(
+        payload["updated"].get("password").is_none(),
+        "the response must never contain a raw password field: {payload:?}"
+    );
 
     let stored = PlcConnectionService::new(app.pool.clone())
         .get(conn_id)
@@ -1911,6 +1926,9 @@ async fn update_connection_missing_field_is_rejected_and_row_unchanged() {
                 // "enabled" を意図的に省略。
                 "simulation": false,
                 "wordOrder": "low_high",
+                "database": null,
+                "username": null,
+                "password": null,
             }),
         ),
     )
@@ -1937,6 +1955,208 @@ async fn update_connection_missing_field_is_rejected_and_row_unchanged() {
         audit_count_after, audit_count_before,
         "rejected update must not add an audit_log row"
     );
+}
+
+// --- S1 (docs/banto-hub-external-db-design.md §4.1・§4.6・§6): PostgreSQL
+// 接続エンティティ・接続テスト API の MCP 面 -------------------------------
+
+/// `create_connection`で`protocol: "postgres"`を作成すると、応答に
+/// `passwordSet: true`が入り、生の`password`は返らない
+/// (`crate::rest::PlcConnectionResponse`への変換の MCP 面の確認)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_connection_postgres_returns_password_set_without_password_field() {
+    let app = test_app("s1-mcp-create-pg").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_connection",
+            json!({
+                "name": "erp-db",
+                "protocol": "postgres",
+                "host": "10.0.0.50",
+                "port": 5432,
+                "database": "erp",
+                "username": "reader",
+                "password": "s3cret",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["created"]["passwordSet"], true);
+    assert!(
+        payload["created"].get("password").is_none(),
+        "the response must never contain the raw password: {payload:?}"
+    );
+    assert_eq!(payload["created"]["database"], "erp");
+}
+
+/// `update_connection`で`password: null`を送ると既存のパスワードが保持され、
+/// `""`を送ると消去される(`banto_tags::PlcConnectionInput::password`の
+/// tri-state PATCH 意味論の MCP 経由の確認)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_connection_password_tri_state_semantics() {
+    let app = test_app("s1-mcp-update-pg-password").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let created = PlcConnectionService::new(app.pool.clone())
+        .create(banto_tags::PlcConnectionInput {
+            name: "erp-db".to_string(),
+            protocol: "postgres".to_string(),
+            host: "10.0.0.50".to_string(),
+            port: 5432,
+            unit_id: 1,
+            enabled: true,
+            simulation: false,
+            word_order: "low_high".to_string(),
+            database: Some("erp".to_string()),
+            username: Some("reader".to_string()),
+            password: Some("original-secret".to_string()),
+        })
+        .await
+        .unwrap();
+
+    // password: null -> 既存のパスワードを維持する。
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "update_connection",
+            json!({
+                "id": created.id,
+                "name": "erp-db-renamed",
+                "protocol": "postgres",
+                "host": "10.0.0.50",
+                "port": 5432,
+                "unitId": 1,
+                "enabled": true,
+                "simulation": false,
+                "wordOrder": "low_high",
+                "database": "erp",
+                "username": "reader",
+                "password": null,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["updated"]["passwordSet"], true);
+    let stored = PlcConnectionService::new(app.pool.clone())
+        .get(created.id)
+        .await
+        .unwrap();
+    assert_eq!(stored.password.as_deref(), Some("original-secret"));
+
+    // password: "" -> 消去する。
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "update_connection",
+            json!({
+                "id": created.id,
+                "name": "erp-db-renamed",
+                "protocol": "postgres",
+                "host": "10.0.0.50",
+                "port": 5432,
+                "unitId": 1,
+                "enabled": true,
+                "simulation": false,
+                "wordOrder": "low_high",
+                "database": "erp",
+                "username": "reader",
+                "password": "",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["updated"]["passwordSet"], false);
+    let stored = PlcConnectionService::new(app.pool.clone())
+        .get(created.id)
+        .await
+        .unwrap();
+    assert_eq!(stored.password, None);
+}
+
+/// `test_saved_connection`: 非 postgres 接続に対しては`unsupported`エラーで
+/// 拒否する。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_saved_connection_rejects_non_postgres() {
+    let app = test_app("s1-mcp-test-non-pg").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("test_saved_connection", json!({ "id": conn_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("unsupported"), "{text}");
+}
+
+/// `test_saved_connection`の実 PostgreSQL 経路。`BANTO_TEST_PG_URL`が
+/// 未設定ならスキップする(`crate::db_source`と同じ慣習)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_saved_connection_against_a_real_postgresql_returns_the_server_version() {
+    let Ok(url) = std::env::var("BANTO_TEST_PG_URL") else {
+        eprintln!("skipped: BANTO_TEST_PG_URL unset");
+        return;
+    };
+    let options: sqlx::postgres::PgConnectOptions = url
+        .parse()
+        .expect("BANTO_TEST_PG_URL should be a valid postgres:// URL");
+    let password = url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split_once('@'))
+        .and_then(|(userinfo, _)| userinfo.split_once(':'))
+        .map(|(_, password)| password.to_string());
+
+    let app = test_app("s1-mcp-test-real-pg").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let created = PlcConnectionService::new(app.pool.clone())
+        .create(banto_tags::PlcConnectionInput {
+            name: "real-pg".to_string(),
+            protocol: "postgres".to_string(),
+            host: options.get_host().to_string(),
+            port: options.get_port() as i64,
+            unit_id: 1,
+            enabled: true,
+            simulation: false,
+            word_order: "low_high".to_string(),
+            database: options.get_database().map(|s| s.to_string()),
+            username: Some(options.get_username().to_string()),
+            password,
+        })
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("test_saved_connection", json!({ "id": created.id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["ok"], true, "{payload:?}");
+    let server_version = payload["serverVersion"].as_str().expect("serverVersion");
+    eprintln!("test_saved_connection -> {server_version}");
 }
 
 /// Copilot 指摘（PR #268）の回帰防止:`update_group`版。`enabled`を省いた

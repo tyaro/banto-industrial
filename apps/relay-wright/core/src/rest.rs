@@ -1716,6 +1716,9 @@ impl From<PlcConnectionPayload> for PlcConnectionInput {
             // the behavior every relay-wright connection already had before
             // this column existed.
             word_order: "low_high".to_string(),
+            database: None,
+            username: None,
+            password: None,
         }
     }
 }
@@ -4652,6 +4655,9 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .expect("seed plc connection");
@@ -4948,6 +4954,9 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .expect("seed plc connection");
@@ -5606,6 +5615,9 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .expect("create slmp connection");

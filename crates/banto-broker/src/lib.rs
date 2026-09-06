@@ -1274,6 +1274,9 @@ mod tests {
             simulation: false,
 
             word_order: "low_high".to_string(),
+            database: None,
+            username: None,
+            password: None,
         }
     }
 

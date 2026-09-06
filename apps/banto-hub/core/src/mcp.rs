@@ -94,8 +94,9 @@ use crate::rest::{
     parse_requested_value, preflight_transaction, run_plc_connection_test, unauthorized_response,
     validate_grpc_settings_body, validate_mqtt_settings_request, validate_store_settings_request,
     CollectionGroupPayload, CreateApiKeyRequest, GrpcSettingsBody, IssuedApiKeyResponse,
-    MqttSettingsRequest, MqttSettingsResponse, PlcConnectionPayload, PlcConnectionTestPayload,
-    StoreSettingsRequest, StoreSettingsResponse, TagPayload, TagSpaceState,
+    MqttSettingsRequest, MqttSettingsResponse, PlcConnectionPayload, PlcConnectionResponse,
+    PlcConnectionTestPayload, StoreSettingsRequest, StoreSettingsResponse, TagPayload,
+    TagSpaceState,
 };
 // T21 S2-b: 設定 get/set ツール用（REST の各設定ハンドラと同じ型を再利用する
 // - このモジュールの doc comment「§3.7」節と同じ「二重実装しない」規律）。
@@ -583,21 +584,33 @@ fn tool_definitions() -> Vec<Value> {
                     "name": { "type": "string", "description": "接続名(一意)。" },
                     "protocol": {
                         "type": "string",
-                        "enum": ["modbus-tcp", "slmp"],
-                        "description": "既定値 modbus-tcp。",
+                        "enum": ["modbus-tcp", "slmp", "postgres"],
+                        "description": "既定値 modbus-tcp。postgres は外部 DB 連携 S1 (database/username 必須)。",
                     },
                     "host": { "type": "string", "description": "接続先ホスト名/IP。" },
                     "port": { "type": "integer", "description": "接続先ポート番号。" },
-                    "unitId": { "type": "integer", "description": "既定値 1。" },
+                    "unitId": { "type": "integer", "description": "既定値 1。postgres では無視される(既定値で固定)。" },
                     "enabled": { "type": "boolean", "description": "既定値 true。" },
                     "simulation": {
                         "type": "boolean",
-                        "description": "true でシミュレータ接続にする。既定値 false。",
+                        "description": "true でシミュレータ接続にする。既定値 false。postgres では無視される(常に false)。",
                     },
                     "wordOrder": {
                         "type": "string",
                         "enum": ["low_high", "high_low"],
-                        "description": "SLMP のワード順。既定値 low_high。",
+                        "description": "SLMP のワード順。既定値 low_high。postgres では無視される(既定値で固定)。",
+                    },
+                    "database": {
+                        "type": ["string", "null"],
+                        "description": "protocol: postgres 接続の DB 名(必須)。他プロトコルでは null。",
+                    },
+                    "username": {
+                        "type": ["string", "null"],
+                        "description": "protocol: postgres 接続の DB ユーザー名(必須)。他プロトコルでは null。",
+                    },
+                    "password": {
+                        "type": ["string", "null"],
+                        "description": "protocol: postgres 接続のパスワード(平文保存)。省略/null は「パスワード無し」。他プロトコルでは null。",
                     },
                 },
                 "required": ["name", "host", "port"],
@@ -633,21 +646,33 @@ fn tool_definitions() -> Vec<Value> {
                     "name": { "type": "string", "description": "接続名(一意)。" },
                     "protocol": {
                         "type": "string",
-                        "enum": ["modbus-tcp", "slmp"],
-                        "description": "modbus-tcp または slmp。",
+                        "enum": ["modbus-tcp", "slmp", "postgres"],
+                        "description": "modbus-tcp、slmp、または postgres。",
                     },
                     "host": { "type": "string", "description": "接続先ホスト名/IP。" },
                     "port": { "type": "integer", "description": "接続先ポート番号。" },
-                    "unitId": { "type": "integer", "description": "Modbus のユニット ID。" },
+                    "unitId": { "type": "integer", "description": "Modbus のユニット ID。postgres では無視される。" },
                     "enabled": { "type": "boolean", "description": "接続を有効にするか。" },
                     "simulation": {
                         "type": "boolean",
-                        "description": "true でシミュレータ接続にする。",
+                        "description": "true でシミュレータ接続にする。postgres では無視される。",
                     },
                     "wordOrder": {
                         "type": "string",
                         "enum": ["low_high", "high_low"],
-                        "description": "SLMP のワード順。",
+                        "description": "SLMP のワード順。postgres では無視される。",
+                    },
+                    "database": {
+                        "type": ["string", "null"],
+                        "description": "protocol: postgres 接続の DB 名(必須)。他プロトコルでは null。",
+                    },
+                    "username": {
+                        "type": ["string", "null"],
+                        "description": "protocol: postgres 接続の DB ユーザー名(必須)。他プロトコルでは null。",
+                    },
+                    "password": {
+                        "type": ["string", "null"],
+                        "description": "protocol: postgres 接続のパスワード。null は「現在のパスワードを変更しない」、空文字列は「消去」、それ以外の文字列は「置き換え」(banto_tags::PlcConnectionInput::password のtri-state PATCH意味論)。他プロトコルでは null。",
                     },
                 },
                 "required": [
@@ -660,6 +685,9 @@ fn tool_definitions() -> Vec<Value> {
                     "enabled",
                     "simulation",
                     "wordOrder",
+                    "database",
+                    "username",
+                    "password",
                 ],
                 "additionalProperties": false,
             },
@@ -688,6 +716,21 @@ fn tool_definitions() -> Vec<Value> {
                     },
                 },
                 "required": ["protocol", "host", "port"],
+                "additionalProperties": false,
+            },
+        }),
+        // S1a（docs/banto-hub-external-db-design.md §4.6）: 保存済み接続の
+        // 接続テスト - 上の`test_connection`（保存前のフォーム値、PLC 専用）
+        // とは別ツール。
+        json!({
+            "name": "test_saved_connection",
+            "description": "保存済みの PLC/DB 接続 id に対して接続テストを行う(admin スコープ必須)。S1a では protocol: postgres のみ対応(SELECT version() を1回実行)。レジストリへの保存は行わない副作用の無い操作。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "テストする接続の id。" },
+                },
+                "required": ["id"],
                 "additionalProperties": false,
             },
         }),
@@ -1133,6 +1176,7 @@ async fn handle_tools_call(
         "delete_connection" => tool_delete_connection(state, ctx, arguments).await?,
         "update_connection" => tool_update_connection(state, ctx, arguments).await?,
         "test_connection" => tool_test_connection(state, ctx, arguments).await?,
+        "test_saved_connection" => tool_test_saved_connection(state, ctx, arguments).await?,
         "list_groups" => tool_list_groups(state, ctx).await,
         "create_group" => tool_create_group(state, ctx, arguments).await?,
         "update_group" => tool_update_group(state, ctx, arguments).await?,
@@ -1639,7 +1683,18 @@ async fn tool_list_connections(state: &McpState, ctx: &ApiKeyContext) -> Value {
         return err;
     }
     match state.plc_connections.list(ListParams::default()).await {
-        Ok(result) => tool_ok(json!({ "connections": result.rows })),
+        // S1（docs/banto-hub-external-db-design.md §2.2）: 生の`PlcConnection`
+        // を返さない - `password`列を持たない`PlcConnectionResponse`
+        // （`passwordSet`のみ）へ変換してから返す
+        // （`crate::rest::PlcConnectionResponse`の doc comment参照、REST の
+        // `plc_connections_list`と同じ変換）。
+        Ok(result) => tool_ok(json!({
+            "connections": result
+                .rows
+                .into_iter()
+                .map(PlcConnectionResponse::from)
+                .collect::<Vec<_>>()
+        })),
         Err(err) => tool_error(format!("接続一覧の取得に失敗しました: {err}")),
     }
 }
@@ -1753,7 +1808,10 @@ async fn tool_create_connection(
         state.legacy_live_reconfigure,
     )
     .await;
-    Ok(tool_ok(json!({ "created": created })))
+    // S1: 生の`PlcConnection`を返さない - `tool_list_connections`と同じ変換。
+    Ok(tool_ok(
+        json!({ "created": PlcConnectionResponse::from(created) }),
+    ))
 }
 
 // --- 9. delete_connection ----------------------------------------------------
@@ -1922,7 +1980,14 @@ fn require_all_fields(arguments: &Value, required: &[&str]) -> Option<Value> {
 /// [`tool_update_connection`]の必須キー一覧 - `PlcConnectionPayload`の
 /// wire フィールド（camelCase）全部 + `id`。inputSchema の
 /// `update_connection.required`と同期させること。
-const UPDATE_CONNECTION_REQUIRED_FIELDS: [&str; 9] = [
+///
+/// S1（docs/banto-hub-external-db-design.md §4.1）: `database`/`username`/
+/// `password`を追加。`password`はキーの**存在**だけを要求する
+/// （`require_all_fields`は`contains_key`で見るので値が`null`でも通る) -
+/// `null`が「変更しない」を意味する tri-state PATCH 意味論
+/// （`banto_tags::PlcConnectionInput::password`の doc comment）はここでは
+/// 崩さない。
+const UPDATE_CONNECTION_REQUIRED_FIELDS: [&str; 12] = [
     "id",
     "name",
     "protocol",
@@ -1932,6 +1997,9 @@ const UPDATE_CONNECTION_REQUIRED_FIELDS: [&str; 9] = [
     "enabled",
     "simulation",
     "wordOrder",
+    "database",
+    "username",
+    "password",
 ];
 
 /// [`tool_update_group`]の必須キー一覧 - `CollectionGroupPayload`の
@@ -2094,7 +2162,10 @@ async fn tool_update_connection(
         state.legacy_live_reconfigure,
     )
     .await;
-    Ok(tool_ok(json!({ "updated": updated })))
+    // S1: 生の`PlcConnection`を返さない - `tool_list_connections`と同じ変換。
+    Ok(tool_ok(
+        json!({ "updated": PlcConnectionResponse::from(updated) }),
+    ))
 }
 
 // --- 11. test_connection ----------------------------------------------------
@@ -2120,6 +2191,46 @@ async fn tool_test_connection(
     let result = run_plc_connection_test(&state.manager, &payload).await;
     Ok(tool_ok(
         serde_json::to_value(result).unwrap_or_else(|_| json!({})),
+    ))
+}
+
+// --- 11b. test_saved_connection (S1a) ---------------------------------------
+
+/// `crate::rest::plc_connections_test_saved`（そちらの doc comment参照）と
+/// 全く同じ本体を呼ぶだけ - `crate::db_source::test_connection`（S1a の
+/// PostgreSQL 接続テスト、二重実装しない）。[`tool_test_connection`]
+/// （保存前のフォーム値を直接受け取る、PLC 専用）とは別物 - こちらは
+/// **保存済み**の接続 `id` を対象にし、S1a では `protocol == "postgres"`
+/// のみ対応する。レジストリへの書き込みが一切発生しない読み取り専用の
+/// 疎通確認なので、[`tool_test_connection`]・[`tool_list_connections`]と
+/// 同じく監査は行わない（読み取り系 admin ツールの既存規律）。
+async fn tool_test_saved_connection(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let id = arguments
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RpcError::invalid_params("arguments.id (integer) is required"))?;
+
+    let conn = match state.plc_connections.get(id).await {
+        Ok(conn) => conn,
+        Err(err) => return Ok(banto_error_tool_error(&err)),
+    };
+    if !conn.is_db_source() {
+        return Ok(tool_error(
+            "unsupported: S1ではpostgres接続のみ接続テストに対応しています。",
+        ));
+    }
+
+    let outcome = crate::db_source::test_connection(&conn).await;
+    Ok(tool_ok(
+        serde_json::to_value(outcome).unwrap_or_else(|_| json!({})),
     ))
 }
 

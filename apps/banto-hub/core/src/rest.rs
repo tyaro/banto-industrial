@@ -2554,6 +2554,28 @@ pub struct PlcConnectionPayload {
     /// （`plc-connections/+page.svelte`）。
     #[serde(default = "default_plc_word_order")]
     pub word_order: String,
+    /// S1（docs/banto-hub-external-db-design.md §4.1）: `protocol: "postgres"`
+    /// 接続の DB 名。他プロトコルでは省略（`None`）のままにする -
+    /// `banto_tags::plc_connection::validate_plc_connection_input`が
+    /// postgres 以外での指定を拒否する。
+    #[serde(default)]
+    pub database: Option<String>,
+    /// S1: `protocol: "postgres"` 接続の DB ユーザー名。[`Self::database`]と
+    /// 同じ省略時ルール。
+    #[serde(default)]
+    pub username: Option<String>,
+    /// S1: `protocol: "postgres"` 接続のパスワード（平文保存、§2.2）。
+    /// **create と update で意味が異なる** -
+    /// `banto_tags::PlcConnectionInput::password`の doc comment 参照:
+    /// - create: 省略/`null`/空文字列はいずれも「パスワード無し」。
+    /// - update: 省略/`null`は「現在のパスワードを変更しない」、空文字列は
+    ///   「消去」、それ以外の文字列は「置き換え」。
+    ///
+    /// GET/list のレスポンスにはこのフィールドは無く、代わりに
+    /// [`PlcConnectionResponse::password_set`]（bool）を返す - 平文
+    /// パスワードを一度保存した接続を読み返すだけで露出させないため。
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 impl From<PlcConnectionPayload> for PlcConnectionInput {
@@ -2571,6 +2593,57 @@ impl From<PlcConnectionPayload> for PlcConnectionInput {
             // P3-b: wired through - see `PlcConnectionPayload::word_order`'s
             // doc comment.
             word_order: payload.word_order,
+            // S1: wired through verbatim - see `PlcConnectionPayload::database`/
+            // `::username`/`::password`'s doc comments for the (create vs.
+            // update) semantics of `password` specifically.
+            database: payload.database,
+            username: payload.username,
+            password: payload.password,
+        }
+    }
+}
+
+/// S1（docs/banto-hub-external-db-design.md §4.1・§2.2）: GET/list が返す
+/// `plc_connections` の読み取り DTO。`banto_tags::PlcConnection`をそのまま
+/// `Serialize`すると`password`列（平文）がそのまま応答に出てしまうため、
+/// 代わりにこの型へ変換してから返す - `password`は決して外部へ出さず、
+/// [`Self::password_set`]（非空パスワードが保存されているかの bool）だけを
+/// 返す。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlcConnectionResponse {
+    pub id: i64,
+    pub name: String,
+    pub protocol: String,
+    pub host: String,
+    pub port: i64,
+    pub unit_id: i64,
+    pub enabled: bool,
+    pub simulation: bool,
+    pub word_order: String,
+    pub database: Option<String>,
+    pub username: Option<String>,
+    /// S1: true のとき、この接続には非空のパスワードが保存されている
+    /// （値そのものは返さない）。
+    pub password_set: bool,
+}
+
+impl From<PlcConnection> for PlcConnectionResponse {
+    fn from(conn: PlcConnection) -> Self {
+        let password_set = conn.password.as_deref().is_some_and(|s| !s.is_empty());
+        Self {
+            id: conn.id,
+            name: conn.name,
+            protocol: conn.protocol,
+            host: conn.host,
+            port: conn.port,
+            unit_id: conn.unit_id,
+            enabled: conn.enabled,
+            simulation: conn.simulation,
+            word_order: conn.word_order,
+            database: conn.database,
+            username: conn.username,
+            password_set,
         }
     }
 }
@@ -2812,10 +2885,21 @@ pub(crate) async fn compute_pending_base_fingerprint(
 ) -> Option<String> {
     let id = payload.get("id")?.as_i64()?;
     match source {
+        // S1（§2.2、`PlcConnection::password`の doc comment）: フィンガー
+        // プリントは「enqueue 時点と比べて行が変わったか」だけを見る比較用
+        // 文字列であり、`pending_changes.base_fingerprint`列（DB に平文で
+        // 残る・将来 GET で読めても構わない設計ではない）に平文パスワードを
+        // 書き込まないよう、生の`PlcConnection`ではなく`PlcConnectionResponse`
+        // （`passwordSet`のみ）をシリアライズする。パスワードだけを変える
+        // 編集は fingerprint 上「変化なし」に見えうるが、既存の
+        // `check_fingerprint_unchanged`はそもそも「同一エディタでの連続編集を
+        // 弾く」ための粗い比較であり、この程度の取りこぼしは平文永続化を
+        // 増やす代償に見合わない。
         "plc_connections.update" | "plc_connections.delete" => plc_connections
             .get(id)
             .await
             .ok()
+            .map(PlcConnectionResponse::from)
             .and_then(|row| serde_json::to_string(&row).ok()),
         "collection_groups.update" | "collection_groups.delete" => collection_groups
             .get(id)
@@ -2938,21 +3022,24 @@ fn require_collection_stopped(state: &TagRegistryState) -> RegistryMutationResul
 
 async fn plc_connections_list(
     State(state): State<TagRegistryState>,
-) -> Result<Json<Vec<PlcConnection>>, ApiError> {
+) -> Result<Json<Vec<PlcConnectionResponse>>, ApiError> {
     Ok(Json(
         state
             .plc_connections
             .list(ListParams::default())
             .await?
-            .rows,
+            .rows
+            .into_iter()
+            .map(PlcConnectionResponse::from)
+            .collect(),
     ))
 }
 
 async fn plc_connections_get(
     State(state): State<TagRegistryState>,
     Path(id): Path<i64>,
-) -> Result<Json<PlcConnection>, ApiError> {
-    Ok(Json(state.plc_connections.get(id).await?))
+) -> Result<Json<PlcConnectionResponse>, ApiError> {
+    Ok(Json(state.plc_connections.get(id).await?.into()))
 }
 
 async fn plc_connections_create(
@@ -3023,7 +3110,7 @@ async fn plc_connections_create(
         state.legacy_live_reconfigure,
     )
     .await;
-    Ok(Json(created).into_response())
+    Ok(Json(PlcConnectionResponse::from(created)).into_response())
 }
 
 async fn plc_connections_update(
@@ -3099,7 +3186,7 @@ async fn plc_connections_update(
         state.legacy_live_reconfigure,
     )
     .await;
-    Ok(Json(updated).into_response())
+    Ok(Json(PlcConnectionResponse::from(updated)).into_response())
 }
 
 async fn plc_connections_delete(
@@ -3184,6 +3271,61 @@ async fn plc_connections_delete(
     )
     .await;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+/// `POST /api/plc-connections/{id}/test` - S1a
+/// （docs/banto-hub-external-db-design.md §4.6・§7 スライス表「S1」:
+/// 「接続テストが `SELECT 1`〈実際は `SELECT version()`〉と列一覧を
+/// 返す」の PostgreSQL 側実装。**保存済み**の接続 `id` を対象にする点で
+/// T12 の `POST /api/plc-connections/test`（保存前のフォーム値を直接
+/// 受け取る、PLC 専用）とは別物 - 名前を分けて共存させている
+/// (`plc_connections_test`が既存、こちらは`plc_connections_test_saved`)。
+///
+/// 認可は他の `plc_connections` 書き込みハンドラ（create/update/delete）と
+/// 同じ`require_editor`に揃える - このリソースの REST 面は既に role
+/// ベースの editor ゲートで統一されており（T21 の MCP 側だけが admin
+/// スコープを使う別体系）、ここだけ新しいゲートを持ち込まない。
+///
+/// S1a では `protocol == "postgres"` の接続のみ対応する
+/// （[`banto_tags::PlcConnection::is_db_source`]）。それ以外は`400`で
+/// 「S1では postgres のみ対応」と明示する - `ok:false`の200ではなく
+/// 明確なリクエストエラーにする（T12の`test_connection`が`virtual`/
+/// `simulation`を`ok:false`の200で表現するのとは意図的に区別: あちらは
+/// 「テスト対象として意味を成さないが正常な入力」、こちらは「この
+/// エンドポイントがそもそも対応しないプロトコル」）。
+///
+/// レジストリへの書き込みは一切発生しない読み取り専用の疎通確認なので、
+/// `record_write`/`commit_catalog_and_notify`は呼ばない -
+/// `plc_connections_test`（T12）と同じ判断。
+async fn plc_connections_test_saved(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.commissioning,
+        &state.audit,
+        &headers,
+        "plc_connections",
+        "POST",
+        "/api/plc-connections/{id}/test",
+    )
+    .await?;
+
+    let conn = state.plc_connections.get(id).await?;
+    if !conn.is_db_source() {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "message": "S1ではpostgres接続のみ接続テストに対応しています。",
+            })),
+        )
+            .into_response());
+    }
+
+    let outcome = crate::db_source::test_connection(&conn).await;
+    Ok((StatusCode::OK, Json(outcome)).into_response())
 }
 
 // --- T12 (docs/ux-plan.md §4): 保存前の接続テスト ---------------------------
@@ -4485,8 +4627,17 @@ async fn execute_pending_apply(
                 // other, which is the concurrency case this guard closes
                 // (edits made *before* Apply was clicked, not sub-request
                 // races during Apply itself).
+                // S1: compare against the same redacted DTO
+                // `compute_pending_base_fingerprint` used at enqueue time
+                // (this crate's own comment there) - never the raw
+                // `PlcConnection` (which would serialize the plaintext
+                // password).
                 check_fingerprint_unchanged(
-                    state.plc_connections.get(body.id).await,
+                    state
+                        .plc_connections
+                        .get(body.id)
+                        .await
+                        .map(PlcConnectionResponse::from),
                     expected,
                     "plc_connections",
                 )
@@ -4503,8 +4654,13 @@ async fn execute_pending_apply(
         "plc_connections.delete" => {
             let body: PendingChangeWithId = decode_pending_payload(pending)?;
             if let Some(expected) = &pending.base_fingerprint {
+                // S1: same redacted-DTO comparison as the `.update` arm above.
                 check_fingerprint_unchanged(
-                    state.plc_connections.get(body.id).await,
+                    state
+                        .plc_connections
+                        .get(body.id)
+                        .await
+                        .map(PlcConnectionResponse::from),
                     expected,
                     "plc_connections",
                 )
@@ -5528,6 +5684,14 @@ fn tag_registry_router(
         // 固定パスなので `/api/plc-connections/{id}` と衝突しない
         // (下の `/api/tags/batch` と同型のパス設計)。
         .route("/api/plc-connections/test", post(plc_connections_test))
+        // S1a (docs/banto-hub-external-db-design.md §4.6): 保存済み接続の
+        // 接続テスト - `{id}` の下の固定サブパスなので
+        // `/api/plc-connections/{id}` の GET/PUT/DELETE とは axum のルート
+        // マッチングで衝突しない。
+        .route(
+            "/api/plc-connections/{id}/test",
+            post(plc_connections_test_saved),
+        )
         .route(
             "/api/collection-groups",
             get(collection_groups_list).post(collection_groups_create),
@@ -9553,6 +9717,36 @@ mod tests {
         (status, json)
     }
 
+    /// `admin_post` の `PUT` 版 - S1（外部 DB 連携）のパスワード意味論
+    /// テスト（`password: None`が既存値維持、`Some("")`が消去、
+    /// `Some(s)`が置換）がまとめて必要とするため追加。
+    async fn admin_put(
+        router: &Router,
+        path: &str,
+        token: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                HttpRequest::put(path)
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
     /// `admin_post` の `DELETE` 版 - T19 S2-b（UX-38）のカスケード削除
     /// テストがまとめて必要とするため追加。
     async fn admin_delete(
@@ -11107,6 +11301,9 @@ mod tests {
                 enabled: true,
                 simulation: false,
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .unwrap();
@@ -11123,6 +11320,321 @@ mod tests {
             .get(calc.id)
             .await
             .expect("calc should survive");
+    }
+
+    // --- S1 (docs/banto-hub-external-db-design.md §4.1・§4.6・§6・§7):
+    // PostgreSQL 接続エンティティ・接続テスト API ------------------------
+
+    /// `POST /api/plc-connections` で `protocol: "postgres"` を作成すると、
+    /// 応答に `passwordSet: true` が入り、`password` フィールド自体は
+    /// 出ない（`PlcConnectionResponse`が生の`password`を決して外部へ
+    /// 出さないことの回帰テスト）。
+    #[tokio::test]
+    async fn create_postgres_connection_returns_password_set_without_password_field() {
+        let env = test_env().await;
+        let (status, body) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({
+                "name": "erp-db",
+                "protocol": "postgres",
+                "host": "10.0.0.50",
+                "port": 5432,
+                "database": "erp",
+                "username": "reader",
+                "password": "s3cret",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["passwordSet"], true);
+        assert!(
+            body.get("password").is_none(),
+            "the response must never contain the raw password: {body:?}"
+        );
+        assert_eq!(body["database"], "erp");
+        assert_eq!(body["username"], "reader");
+    }
+
+    /// `PUT`で`password`を省略（`null`/未指定）すると、既存のパスワードは
+    /// 変更されない（`banto_tags::PlcConnectionInput::password`の doc
+    /// comment、update の tri-state PATCH 意味論の REST 経由での確認）。
+    #[tokio::test]
+    async fn update_omitting_password_keeps_the_existing_password() {
+        let env = test_env().await;
+        let (status, created) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({
+                "name": "erp-db-keep",
+                "protocol": "postgres",
+                "host": "10.0.0.50",
+                "port": 5432,
+                "database": "erp",
+                "username": "reader",
+                "password": "original-secret",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created:?}");
+        let conn_id = created["id"].as_i64().unwrap();
+        assert_eq!(created["passwordSet"], true);
+
+        // password フィールドを省略した PUT（他は全項目必須）。
+        let (status, updated) = admin_put(
+            &env.router,
+            &format!("/api/plc-connections/{conn_id}"),
+            &env.admin_token,
+            json!({
+                "name": "erp-db-keep-renamed",
+                "protocol": "postgres",
+                "host": "10.0.0.50",
+                "port": 5432,
+                "unitId": 1,
+                "enabled": true,
+                "simulation": false,
+                "wordOrder": "low_high",
+                "database": "erp",
+                "username": "reader",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated:?}");
+        assert_eq!(
+            updated["passwordSet"], true,
+            "omitting password must keep it set"
+        );
+
+        let stored = PlcConnectionService::new(env.pool.clone())
+            .get(conn_id)
+            .await
+            .unwrap();
+        assert_eq!(stored.password.as_deref(), Some("original-secret"));
+    }
+
+    /// `PUT`で`password: ""`を送ると、パスワードが消去される。
+    #[tokio::test]
+    async fn update_with_empty_password_clears_it() {
+        let env = test_env().await;
+        let (status, created) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({
+                "name": "erp-db-clear",
+                "protocol": "postgres",
+                "host": "10.0.0.50",
+                "port": 5432,
+                "database": "erp",
+                "username": "reader",
+                "password": "original-secret",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created:?}");
+        let conn_id = created["id"].as_i64().unwrap();
+
+        let (status, updated) = admin_put(
+            &env.router,
+            &format!("/api/plc-connections/{conn_id}"),
+            &env.admin_token,
+            json!({
+                "name": "erp-db-clear",
+                "protocol": "postgres",
+                "host": "10.0.0.50",
+                "port": 5432,
+                "unitId": 1,
+                "enabled": true,
+                "simulation": false,
+                "wordOrder": "low_high",
+                "database": "erp",
+                "username": "reader",
+                "password": "",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated:?}");
+        assert_eq!(updated["passwordSet"], false);
+
+        let stored = PlcConnectionService::new(env.pool.clone())
+            .get(conn_id)
+            .await
+            .unwrap();
+        assert_eq!(stored.password, None);
+    }
+
+    /// 非 postgres 接続に`database`を付けると`422 Validation`で拒否される
+    /// (`banto_tags::plc_connection::validate_plc_connection_input`の
+    /// postgres-only ルール、REST 経由の確認)。
+    #[tokio::test]
+    async fn create_non_postgres_with_database_is_rejected() {
+        let env = test_env().await;
+        let (status, body) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({
+                "name": "not-pg",
+                "protocol": "modbus-tcp",
+                "host": "127.0.0.1",
+                "port": 15070,
+                "database": "somedb",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+        assert_eq!(body["kind"], "validation");
+    }
+
+    /// S1（この段階では postgres 接続配下にグループを作れない）: REST 経由の
+    /// 確認 - `banto_tags::collection_group`側の単体テストの REST 版。
+    #[tokio::test]
+    async fn create_group_under_a_postgres_connection_is_rejected() {
+        let env = test_env().await;
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({
+                "name": "erp-db-group-guard",
+                "protocol": "postgres",
+                "host": "10.0.0.50",
+                "port": 5432,
+                "database": "erp",
+                "username": "reader",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+        let conn_id = conn["id"].as_i64().unwrap();
+
+        let (status, body) = admin_post(
+            &env.router,
+            "/api/collection-groups",
+            &env.admin_token,
+            json!({ "name": "g-on-pg", "plcConnectionId": conn_id, "periodMs": 1000 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+        assert_eq!(body["kind"], "validation");
+    }
+
+    /// `POST /api/plc-connections/{id}/test` - S1a の接続テスト API。
+    /// 非 postgres 接続に対しては 400 で拒否する（design §4.6・実装指示
+    /// 「for non-postgres protocols respond 400」）。
+    #[tokio::test]
+    async fn test_saved_connection_rejects_non_postgres_with_400() {
+        let env = test_env().await;
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "not-pg-test", "host": "127.0.0.1", "port": 15071 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+        let conn_id = conn["id"].as_i64().unwrap();
+
+        let (status, body) = admin_post(
+            &env.router,
+            &format!("/api/plc-connections/{conn_id}/test"),
+            &env.admin_token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    }
+
+    /// `POST /api/plc-connections/{id}/test` の実 PostgreSQL 経路。
+    /// `BANTO_TEST_PG_URL`が未設定なら`eprintln!`してスキップする
+    /// （`crate::db_source`の同種テストと同じ慣習）。
+    #[tokio::test]
+    async fn test_saved_connection_against_a_real_postgresql_returns_the_server_version() {
+        let Ok(url) = std::env::var("BANTO_TEST_PG_URL") else {
+            eprintln!("skipped: BANTO_TEST_PG_URL unset");
+            return;
+        };
+        let options: sqlx::postgres::PgConnectOptions = url
+            .parse()
+            .expect("BANTO_TEST_PG_URL should be a valid postgres:// URL");
+        let password = url
+            .split_once("://")
+            .and_then(|(_, rest)| rest.split_once('@'))
+            .and_then(|(userinfo, _)| userinfo.split_once(':'))
+            .map(|(_, password)| password.to_string());
+
+        let env = test_env().await;
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({
+                "name": "real-pg-test",
+                "protocol": "postgres",
+                "host": options.get_host(),
+                "port": options.get_port(),
+                "database": options.get_database(),
+                "username": options.get_username(),
+                "password": password,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+        let conn_id = conn["id"].as_i64().unwrap();
+
+        let (status, body) = admin_post(
+            &env.router,
+            &format!("/api/plc-connections/{conn_id}/test"),
+            &env.admin_token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["ok"], true, "{body:?}");
+        let server_version = body["serverVersion"].as_str().expect("serverVersion");
+        eprintln!("POST /api/plc-connections/{{id}}/test -> {server_version}");
+        assert!(body.get("error").is_none());
+    }
+
+    /// `POST /api/plc-connections/{id}/test`の失敗経路: 閉じたポートに
+    /// 対して`ok:false`かつパスワードを含まないエラー文言を返す。
+    #[tokio::test]
+    async fn test_saved_connection_against_a_closed_port_reports_failure_without_the_password() {
+        let env = test_env().await;
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({
+                "name": "closed-port-pg",
+                "protocol": "postgres",
+                "host": "127.0.0.1",
+                "port": 1,
+                "database": "erp",
+                "username": "reader",
+                "password": "s3cret-password",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+        let conn_id = conn["id"].as_i64().unwrap();
+
+        let (status, body) = admin_post(
+            &env.router,
+            &format!("/api/plc-connections/{conn_id}/test"),
+            &env.admin_token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["ok"], false, "{body:?}");
+        let error = body["error"].as_str().expect("error message");
+        assert!(
+            !error.contains("s3cret-password"),
+            "error text must never contain the plaintext password: {error}"
+        );
     }
 
     /// キューされた削除（収集稼働中に 202 で保留し、停止後に適用）も同じ
@@ -11453,6 +11965,9 @@ mod tests {
                     simulation: false,
 
                     word_order: "low_high".to_string(),
+                    database: None,
+                    username: None,
+                    password: None,
                 },
             )
             .await
@@ -11608,6 +12123,9 @@ mod tests {
                     simulation: false,
 
                     word_order: "low_high".to_string(),
+                    database: None,
+                    username: None,
+                    password: None,
                 },
             )
             .await

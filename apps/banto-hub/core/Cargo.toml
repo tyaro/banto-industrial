@@ -51,7 +51,14 @@ banto-plc-write = { path = "../../../crates/banto-plc-write" }
 # expression engine itself has no registry/tokio dependency, hub wires it to
 # the tag space.
 banto-expr = { path = "../../../crates/banto-expr" }
-sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+# S1 (docs/banto-hub-external-db-design.md §3.1, 2026-09-06): PostgreSQL
+# driver for the DB Source/Sink. TLS は `tls-rustls-ring-native-roots` -
+# `tls-rustls` の `webpki-roots`（CDLA-Permissive-2.0）は cargo-deny の
+# license allow list に無く落ちる、native-tls は Linux CI に OpenSSL を
+# 引き込む、aws-lc-rs は Windows で cmake/NASM を要求する、のいずれも
+# 避けられる。この組み合わせは S0 で `cargo deny check licenses bans
+# sources`/`advisories` が deny.toml 無改造で green と確認済み。
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros", "migrate", "postgres", "tls-rustls-ring-native-roots"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # T14-1 (docs/banto-hub-t14-design.md §3「D1」): runtime.rs の

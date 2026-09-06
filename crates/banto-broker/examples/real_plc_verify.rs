@@ -387,6 +387,9 @@ async fn phase4_session_limit() -> Result<(), String> {
         simulation: false,
 
         word_order: "low_high".to_string(),
+        database: None,
+        username: None,
+        password: None,
     };
 
     let supervisor = BrokerSupervisor::spawn(&[connection], BackoffConfig::default())
