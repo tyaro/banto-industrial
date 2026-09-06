@@ -29,6 +29,10 @@ describe('canDefaultWritable', () => {
 		expect(canDefaultWritable('internal')).toBe(false);
 	});
 
+	it('S3: db タグは常に false（v1 は読み取り専用）', () => {
+		expect(canDefaultWritable('db')).toBe(false);
+	});
+
 	it('S1-b0 契約: plc タグ + writableArea=false は false（将来の配線用、現状はどこからも渡されない）', () => {
 		expect(canDefaultWritable('plc', false)).toBe(false);
 	});
@@ -45,6 +49,10 @@ describe('writableDefaultBlockedReason', () => {
 
 	it('internal タグは理由を返さない（禁止ではなく単に適用対象外なため）', () => {
 		expect(writableDefaultBlockedReason('internal')).toBeNull();
+	});
+
+	it('S3: db タグは理由を返す（v1 は読み取り専用）', () => {
+		expect(writableDefaultBlockedReason('db')).toMatch(/db タグ/);
 	});
 
 	it('plc タグ + writableArea 未指定（現状の呼び出し）は理由なし（null）', () => {

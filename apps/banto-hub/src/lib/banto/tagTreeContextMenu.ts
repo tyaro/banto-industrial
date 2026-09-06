@@ -68,16 +68,6 @@ function isVirtual(connection: { protocol: string }): boolean {
 	return connection.protocol === 'virtual';
 }
 
-/**
- * S1（docs/banto-hub-external-db-design.md §3 項目13「S1 ではこの接続の下に
- * 収集グループを作れない」、実装指示4）: `PlcConnection.protocol ===
- * 'postgres'`判定。`isVirtual`と同じ理由（本ファイルの「依存ゼロ」方針）で
- * `tagRegistryAdmin.isDbSourceConnection`は呼ばず、同じ判定をここに複製する。
- */
-function isDbSource(connection: { protocol: string }): boolean {
-	return connection.protocol === 'postgres';
-}
-
 export type TagTreeContextMenuAction =
 	| { kind: 'createConnection'; label: string }
 	| { kind: 'createGroup'; label: string; connectionId: number }
@@ -166,23 +156,16 @@ export function resolveTagTreeContextMenuAction(
  * 扱ってよいため。
  */
 /**
- * S1（実装指示4「グループを追加アクションは disabled + ヒントで示す」）:
- * `createGroup`だけが持ちうる、無効化とその理由。他の kind は常に
- * `disabled`を持たない（=常に実行可能）ため、この2フィールドだけを
- * `createGroup`変種に足す - 全variantへ広げず「無効化されうるのは
- * postgres接続配下のグループ作成だけ」という事実をそのまま型に表す。
+ * S3（docs/banto-hub-external-db-design.md §7 row S3、実装指示1「S1 の
+ * ガードを解除する」）: S1 は postgres（DB Source）接続配下のグループ作成を
+ * `disabled` + ツールチップで先取り無効化していたが、S2/S2b で DB Source
+ * 本体（`query_sql`・`db` タグ・ポーリング）が実装済みのため、その制限は
+ * 不要になった。`createGroup` はどの接続配下でも常に実行可能な項目に戻す
+ * （`disabled`/`disabledReason` フィールドと `isDbSource` 判定を削除）。
  */
 export type TreeContextMenuItemAction =
 	| { kind: 'createConnection'; label: string }
-	| {
-			kind: 'createGroup';
-			label: string;
-			connectionId: number;
-			/** `true`のとき、S1では postgres 接続配下にグループを作れない（サーバー側422のクライアント側先取り）。 */
-			disabled?: boolean;
-			/** `disabled`が`true`のときだけ存在 - メニュー項目のツールチップに使う。 */
-			disabledReason?: string;
-	  }
+	| { kind: 'createGroup'; label: string; connectionId: number }
 	| { kind: 'reconfigureConnection'; label: string; connectionId: number }
 	| { kind: 'deleteConnection'; label: string; connectionId: number }
 	| { kind: 'createTag'; label: string; groupId: number }
@@ -190,15 +173,6 @@ export type TreeContextMenuItemAction =
 	| { kind: 'deleteGroup'; label: string; groupId: number }
 	| { kind: 'viewConnection'; label: string; connectionId: number }
 	| { kind: 'viewGroup'; label: string; groupId: number };
-
-/**
- * S1: postgres 接続配下の「収集グループを作成」に付ける無効化理由。design
- * §3 項目13「S1 ではこの接続の下に収集グループを作れない（S2 で解禁）」の
- * 案内文言 - サーバー側 422（`CollectionGroupService`）のメッセージと同じ
- * 趣旨を、実行前にクライアント側で示す。
- */
-export const DB_SOURCE_GROUP_CREATE_DISABLED_REASON =
-	'DB 接続配下のグループは S2（DB Source）で対応予定です';
 
 export function resolveTreeContextMenuItems(
 	data: ConnectionTreeNodeData
@@ -214,27 +188,15 @@ export function resolveTreeContextMenuItems(
 		return [{ kind: 'createConnection', label: createAction.label }];
 	}
 	if (createAction.kind === 'createGroup') {
-		// S1（docs/banto-hub-external-db-design.md §3 項目13、実装指示4）:
-		// postgres（DB Source）接続配下のグループ作成は、S2 まで
-		// クライアント側で先に無効化する（サーバー422を待たない - 実装指示
-		// 「サーバーの422だけに頼らない」）。virtual と違い項目自体は残し
-		// つつ`disabled`にする - 「なぜ無いのか」がツールチップで分かる方が
-		// 「メニューに項目が無い」より親切なため。
-		const dbSource = data.kind === 'connection' && isDbSource(data.connection);
+		// S3: postgres（DB Source）接続配下でも通常の接続と同じ権限で
+		// グループ作成を許可する（上記型 doc comment 参照。S1 の disabled
+		// ガードは撤去済み）。
 		const items: TreeContextMenuItemAction[] = [
-			dbSource
-				? {
-						kind: 'createGroup',
-						label: '収集グループを作成',
-						connectionId: createAction.connectionId,
-						disabled: true,
-						disabledReason: DB_SOURCE_GROUP_CREATE_DISABLED_REASON
-					}
-				: {
-						kind: 'createGroup',
-						label: '収集グループを作成',
-						connectionId: createAction.connectionId
-					}
+			{
+				kind: 'createGroup',
+				label: '収集グループを作成',
+				connectionId: createAction.connectionId
+			}
 		];
 		// T19 S1-a: virtual（calc/mem）接続そのものの再設定・削除は禁止の
 		// まま（上記 doc comment 参照）。配下のグループ作成（上の1項目）は

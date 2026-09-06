@@ -20,12 +20,17 @@
 		label: string;
 		onSelect: () => void;
 		/**
-		 * S1（docs/banto-hub-external-db-design.md §3 項目13、実装指示4）:
-		 * `true`のとき項目は選択不可（クリック・Enter/Spaceのどちらでも
-		 * `onSelect`を呼ばない - `activate`のガード参照）。項目自体は表示
-		 * したまま無効化する - 「なぜ無いのか」を`title`ツールチップで示す
-		 * ため（`tagTreeContextMenu.ts`の`createGroup`/postgres接続 参照）。
-		 * ARIA `menu` パターンに従いネイティブ`disabled`属性は付けない
+		 * S1（docs/banto-hub-external-db-design.md §3 項目13、実装指示4）で
+		 * 導入した汎用フィールド。`true`のとき項目は選択不可（クリック・
+		 * Enter/Spaceのどちらでも`onSelect`を呼ばない - `activate`のガード
+		 * 参照）。項目自体は表示したまま無効化する - 「なぜ無いのか」を
+		 * `title`ツールチップで示すため。S3（docs/banto-hub-external-db-design.md
+		 * §7 row S3）で唯一の呼び出し元（`tagTreeContextMenu.ts`の
+		 * `createGroup`/postgres接続の無効化）が撤去されたため、現状は
+		 * どの呼び出し元も`disabled: true`を渡さない - コンポーネント自体の
+		 * 汎用機能として残す（将来また無効化が要る項目が出た時のための
+		 * 受け口）。ARIA `menu` パターンに従いネイティブ`disabled`属性は
+		 * 付けない
 		 * （2026-09 レビュー是正: ネイティブ`disabled`はフォーカス自体を
 		 * 受け取れなくしてしまい、キーボードユーザーが項目にたどり着けず
 		 * `title`のツールチップも読めなくなる。スクリーンリーダーには

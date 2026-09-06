@@ -160,6 +160,16 @@
 			<span class="label">{node.data.group.name}</span>
 			<span class="count">({tagCountForGroup(node.data.group.id)})</span>
 			<span class="period">{formatPeriod(node.data.group.periodMs)}</span>
+			{#if node.data.group.querySql !== null}
+				<!--
+					S3（docs/banto-hub-external-db-design.md §7 row S3、実装指示5
+					「postgres グループは小さな『SQL』バッジを出す」）:
+					`querySql` が非 `null`（= postgres 接続配下）のグループにだけ
+					出す。接続ノードの「DB」バッジ（上）と同じ位置づけ - グループ
+					一覧の中でどれが DB Source かを一目で区別できるようにする。
+				-->
+				<span class="badge db" title="SQL（query_sql）を持つグループ（DB Source、S2）">SQL</span>
+			{/if}
 		{/if}
 	{/snippet}
 	{#snippet emptyState(node)}

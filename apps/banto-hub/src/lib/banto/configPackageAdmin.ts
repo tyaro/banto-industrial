@@ -277,7 +277,13 @@ async function applyConfigPackageInner(
 			plcConnectionId: connection.id,
 			periodMs: group.periodMs,
 			enabled: group.enabled,
-			defaultWritable: group.defaultWritable
+			defaultWritable: group.defaultWritable,
+			// S3（docs/banto-hub-external-db-design.md §4.1・§4.2）: postgres
+			// 接続配下のグループでは非 undefined、それ以外では `pkg` 側が
+			// 既に省略している（`configPackage.ts::sanitizeGroup`）ので
+			// そのまま渡すだけでよい - `database`/`username`（S1）と同じ
+			// 「pkg の値をそのまま転記する」扱い。
+			querySql: group.querySql
 		};
 		const existing = groupByName.get(group.name);
 		if (existing) {

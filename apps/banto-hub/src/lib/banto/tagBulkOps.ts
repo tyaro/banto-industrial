@@ -70,8 +70,8 @@ export function buildBulkEnableRows(tags: readonly Tag[], enabled: boolean): Bat
 
 /**
  * 選択タグ全件を、`collectionGroupId` だけ差し替えた batch-update 行に
- * 変換する（一括グループ移動）。配置検証（`plc`/`computed`/`internal` の
- * 接続配置ルール、`banto_tags::tag::validate_tag_kind_placement`）は
+ * 変換する（一括グループ移動）。配置検証（`plc`/`computed`/`internal`/`db`
+ * の接続配置ルール、`banto_tags::tag::validate_tag_kind_placement`）は
  * サーバー側が正 - この関数自体は移動先が種別に整合するかを検証しない
  * （呼び出し側 `+page.svelte` が `groupsFor(kind)` で候補を絞り込み、
  * 種別混在の選択ではそもそもグループ移動 UI を無効化する -
@@ -90,7 +90,7 @@ export function buildBulkMoveRows(
 }
 
 /**
- * 選択タグに複数の {@link Tag.tagKind}（`plc`/`computed`/`internal`）が
+ * 選択タグに複数の {@link Tag.tagKind}（`plc`/`computed`/`internal`/`db`）が
  * 混在しているか。グループ移動 UI の gate に使う（有効/無効切替は種別
  * 混在でも実行できるため、こちらでは使わない）。
  */

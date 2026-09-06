@@ -33,6 +33,17 @@ function isVirtual(connection: Pick<PlcConnection, 'protocol'>): boolean {
 	return connection.protocol === 'virtual';
 }
 
+/**
+ * S3（docs/banto-hub-external-db-design.md §4.1）: `PlcConnection.protocol
+ * === "postgres"`（DB Source）かどうか。`isVirtual`と同じ「依存ゼロ」方針で
+ * `tagRegistryAdmin.isDbSourceConnection`は呼ばず同じ判定をここに複製する -
+ * {@link resolveRegistrationTarget}がグループの`tagKind`を`'db'`へ確定
+ * するために使う。
+ */
+function isDbSource(connection: Pick<PlcConnection, 'protocol'>): boolean {
+	return connection.protocol === 'postgres';
+}
+
 /** `tagRegistryAdmin.CALC_CONNECTION_NAME`/`MEM_CONNECTION_NAME` と同じ値を
  * ここに複製する（`isVirtual` と同じ「依存ゼロ」方針 - 冒頭コメント参照）。
  * {@link resolveRegistrationTarget} がグループの `tagKind` を確定するために
@@ -171,8 +182,9 @@ export interface RegistrationTarget {
 	/**
 	 * 連続登録フォームを提示してよいか。連続登録は PLC アドレスの算術
 	 * （増分・桁上がり）を前提にした機能で `tagKind` は常に `'plc'`
-	 * （`ContinuousFormState` 冒頭コメント参照）- `computed`/`internal` タグは
-	 * アドレスを持てないため、virtual 配下のグループでは常に `false`。
+	 * （`ContinuousFormState` 冒頭コメント参照）- `computed`/`internal`/
+	 * `db` タグはこの意味でのアドレスを持てないため、それらの配下では
+	 * 常に `false`。
 	 */
 	supportsContinuous: boolean;
 }
@@ -192,7 +204,9 @@ export function resolveRegistrationTarget(
 			? 'computed'
 			: conn.name === MEM_CONNECTION_NAME
 				? 'internal'
-				: 'plc';
+				: isDbSource(conn)
+					? 'db'
+					: 'plc';
 	return {
 		groupId: group.id,
 		groupName: group.name,

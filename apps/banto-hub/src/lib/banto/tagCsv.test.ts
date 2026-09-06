@@ -61,7 +61,23 @@ const CONN_B: PlcConnection = {
 	username: null,
 	passwordSet: false
 };
-const CONNECTIONS: PlcConnection[] = [CONN_A, CONN_B];
+// S3（docs/banto-hub-external-db-design.md §7 row S3）: postgres（DB
+// Source）接続のフィクスチャ - `tagKind=db` の配置規則テストに使う。
+const CONN_PG: PlcConnection = {
+	id: 3,
+	name: 'ConnPg',
+	protocol: 'postgres',
+	host: '10.0.0.5',
+	port: 5432,
+	unitId: 1,
+	enabled: true,
+	simulation: false,
+	wordOrder: 'low_high',
+	database: 'appdb',
+	username: 'appuser',
+	passwordSet: true
+};
+const CONNECTIONS: PlcConnection[] = [CONN_A, CONN_B, CONN_PG];
 
 // 同名グループ「GroupX」を ConnA/ConnB の双方に置き、接続スコープでの名前
 // 解決を区別できるようにする。
@@ -71,7 +87,8 @@ const GROUP_A_X: CollectionGroup = {
 	plcConnectionId: CONN_A.id,
 	periodMs: 1000,
 	enabled: true,
-	defaultWritable: true
+	defaultWritable: true,
+	querySql: null
 };
 const GROUP_A_Y: CollectionGroup = {
 	id: 11,
@@ -79,7 +96,8 @@ const GROUP_A_Y: CollectionGroup = {
 	plcConnectionId: CONN_A.id,
 	periodMs: 1000,
 	enabled: true,
-	defaultWritable: true
+	defaultWritable: true,
+	querySql: null
 };
 const GROUP_B_X: CollectionGroup = {
 	id: 20,
@@ -87,9 +105,20 @@ const GROUP_B_X: CollectionGroup = {
 	plcConnectionId: CONN_B.id,
 	periodMs: 1000,
 	enabled: true,
-	defaultWritable: true
+	defaultWritable: true,
+	querySql: null
 };
-const GROUPS: CollectionGroup[] = [GROUP_A_X, GROUP_A_Y, GROUP_B_X];
+// S3: postgres 接続配下のグループ - `tagKind=db` の唯一の正当な配置先。
+const GROUP_PG: CollectionGroup = {
+	id: 30,
+	name: 'GroupPg',
+	plcConnectionId: CONN_PG.id,
+	periodMs: 1000,
+	enabled: true,
+	defaultWritable: false,
+	querySql: 'SELECT id, temperature FROM sensors'
+};
+const GROUPS: CollectionGroup[] = [GROUP_A_X, GROUP_A_Y, GROUP_B_X, GROUP_PG];
 
 function makeTag(overrides: Partial<Tag> = {}): Tag {
 	return {
@@ -560,7 +589,8 @@ describe('exportTagsCsv', () => {
 			plcConnectionId: 999999,
 			periodMs: 1000,
 			enabled: true,
-			defaultWritable: true
+			defaultWritable: true,
+			querySql: null
 		};
 		const tag = makeTag({ collectionGroupId: orphanGroup.id });
 		const csv = exportTagsCsv([tag], CONNECTIONS, [...GROUPS, orphanGroup]);
@@ -892,6 +922,30 @@ describe('parseTagsCsv', () => {
 			expect(rows[0].tag.tagKind).toBe('internal');
 		});
 
+		it('S3: "db" を postgres 接続配下のグループでは受理する', () => {
+			const text = buildCsv([
+				row({ connection: 'ConnPg', group: 'GroupPg', tagKind: 'db', address: 'temperature' })
+			]);
+			const rows = expectOk(parseTagsCsv(text, CONNECTIONS, GROUPS));
+			expect(rows[0].tag.tagKind).toBe('db');
+			expect(rows[0].tag.address).toBe('temperature');
+			// §6-10: db タグは常に writable=false に強制される（CSV に何が
+			// 書いてあっても無視する - computed と同じ扱い）。
+			expect(rows[0].tag.writable).toBe(false);
+		});
+
+		it('S3: "db" は postgres 以外の接続配下ではエラー（配置規則）', () => {
+			const text = buildCsv([
+				row({ connection: 'ConnA', group: 'GroupX', tagKind: 'db', address: 'temperature' })
+			]);
+			const errors = expectErr(parseTagsCsv(text, CONNECTIONS, GROUPS));
+			expect(errors).toContainEqual({
+				lineNumber: 2,
+				message:
+					'tagKind=db は postgres 接続配下のグループにのみ登録できます（接続 "ConnA" は modbus-tcp）。'
+			});
+		});
+
 		it('不正な値はエラー', () => {
 			const text = buildCsv([row({ tagKind: 'foo' })]);
 			const errors = expectErr(parseTagsCsv(text, CONNECTIONS, GROUPS));
@@ -919,6 +973,17 @@ describe('parseTagsCsv', () => {
 			const textInternal = buildCsv([row({ tagKind: 'internal', address: 'D999' })]);
 			const rowsInternal = expectOk(parseTagsCsv(textInternal, CONNECTIONS, GROUPS));
 			expect(rowsInternal[0].tag.address).toBe('');
+		});
+
+		it('S3: tagKind=db で空欄 -> エラー（結果列名は必須）', () => {
+			const text = buildCsv([
+				row({ connection: 'ConnPg', group: 'GroupPg', tagKind: 'db', address: '' })
+			]);
+			const errors = expectErr(parseTagsCsv(text, CONNECTIONS, GROUPS));
+			expect(errors).toContainEqual({
+				lineNumber: 2,
+				message: 'address は tagKind=db のとき必須です。'
+			});
 		});
 	});
 

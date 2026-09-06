@@ -16,8 +16,12 @@
  * 3. 再設定 Drawer を開くと「パスワード: 設定済み」（作成時に入力した
  *    パスワードがある）と出て、パスワード欄は空欄のまま（絶対にプリ
  *    フィルしない）。
- * 4. 「収集グループを作成」メニュー項目は無効化され、ヒントを持つ
- *    （実装指示4「サーバーの422だけに頼らない」）。
+ * 4. **S3（docs/banto-hub-external-db-design.md §7 row S3）で更新**:
+ *    「収集グループを作成」メニュー項目は S1 時点では無効化されていた
+ *    （実装指示4「サーバーの422だけに頼らない」）が、S2/S2b で DB Source
+ *    本体が実装されたため S3 でその制限を撤去した - この項目は常時有効に
+ *    戻り、クリックすると収集グループ作成ウィザードが開くことを固定する
+ *    （`tagTreeContextMenu.ts`の`resolveTreeContextMenuItems`参照）。
  *
  * `banto-hub-tags-tree-context-menu.spec.ts` と同じパターン: 別
  * `describe.serial` ブロック、前提データは `page.request` で直接 REST を
@@ -69,7 +73,7 @@ async function cleanupFixtures(
 }
 
 test.describe
-	.serial('banto-hub postgres（DB Source）接続の作成・ツリー表示・グループ作成禁止 (S1)', () => {
+	.serial('banto-hub postgres（DB Source）接続の作成・ツリー表示・グループ作成（S1/S3）', () => {
 	let adminPage: Page;
 	let adminHeaders: Record<string, string>;
 
@@ -169,7 +173,7 @@ test.describe
 		await adminPage.keyboard.press('Escape');
 	});
 
-	test('4. 「収集グループを作成」は無効化され、ヒントを持つ', async () => {
+	test('4. S3: 「収集グループを作成」は常時有効になり、クリックすると作成ウィザードが開く', async () => {
 		await adminPage.goto('/tags');
 		const node = connectionNodeByName(adminPage, DB_CONN);
 		await node.click({ button: 'right' });
@@ -178,48 +182,18 @@ test.describe
 		await expect(menu).toBeVisible();
 		const createGroupItem = menu.getByRole('menuitem', { name: '収集グループを作成', exact: true });
 		await expect(createGroupItem).toBeVisible();
-		// 2026-09 レビュー是正: ARIA menu パターンに従いネイティブ`disabled`
-		// は付けない（キーボードユーザーがフォーカスして`title`を読める
-		// ようにするため - `TreeContextMenu.svelte`のS1コメント参照）ので、
-		// `toBeDisabled()`ではなく`aria-disabled="true"`を固定する。
-		await expect(createGroupItem).toHaveAttribute('aria-disabled', 'true');
-		await expect(createGroupItem).toHaveAttribute(
-			'title',
-			'DB 接続配下のグループは S2（DB Source）で対応予定です'
-		);
+		// S3: S1 の disabled ガードは撤去済み（`tagTreeContextMenu.ts`参照）
+		// - `aria-disabled`/`title` のどちらも付かない。
+		await expect(createGroupItem).not.toHaveAttribute('aria-disabled', 'true');
+		await expect(createGroupItem).not.toHaveAttribute('title');
 
-		// 接続そのものの再設定・削除は禁止されない（予約接続ではない通常の
-		// 接続なので - `tagTreeContextMenu.ts`のS1コメント参照）。
+		// 接続そのものの再設定・削除は引き続き禁止されない（予約接続では
+		// ない通常の接続なので）。
 		await expect(menu.getByRole('menuitem', { name: '接続を再設定', exact: true })).toBeVisible();
 		await expect(menu.getByRole('menuitem', { name: '接続を削除', exact: true })).toBeVisible();
 
-		// クリックしても無効化されたままなので「新規作成」ダイアログ
-		// （収集グループ作成ウィザード）は開かない。Playwright 自身の
-		// actionability チェックは`aria-disabled="true"`を`disabled`と同様に
-		// 「enabled ではない」と判定してクリック前に待ち続けてしまう
-		// （まさにこの無効化を尊重した挙動）ため、`force: true`で
-		// アクショナビリティ判定を迂回し、実際に`click`イベントを発火させて
-		// アプリ側（`activate`のガード）が無効化を守ることを確認する。
-		await createGroupItem.click({ force: true });
-		await expect(adminPage.getByRole('dialog', { name: '新規作成', exact: true })).toHaveCount(0);
-		await expect(menu).toBeVisible();
-
-		// 2026-09 レビュー是正: ネイティブ`disabled`を付けていないため、
-		// メニューを開いた直後（`focusFirst`が先頭項目へフォーカス）から
-		// 無効化された「収集グループを作成」（先頭項目）自体にフォーカスが
-		// 乗る - キーボードユーザーが`title`のツールチップの内容に
-		// たどり着けることの固定（是正前はネイティブ`disabled`のため
-		// フォーカスできず、`focusIndex`が次の項目へ飛ばしていた）。
-		await expect(createGroupItem).toBeFocused();
-
-		// 矢印キーで無効化された項目からも普通に抜けられる（フォーカス
-		// トラップに落ちない）ことを固定する。
-		await adminPage.keyboard.press('ArrowDown');
-		await expect(
-			adminPage.getByRole('menuitem', { name: '接続を再設定', exact: true })
-		).toBeFocused();
-
+		await createGroupItem.click();
+		await expect(adminPage.getByRole('dialog', { name: '新規作成', exact: true })).toBeVisible();
 		await adminPage.keyboard.press('Escape');
-		await expect(menu).toHaveCount(0);
 	});
 });

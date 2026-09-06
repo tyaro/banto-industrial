@@ -83,6 +83,7 @@
 		formToGroupInput,
 		groupToForm,
 		nextGroupName,
+		validateQuerySql,
 		type CollectionGroupFormState
 	} from '$lib/banto/collectionGroupForm';
 	import {
@@ -158,16 +159,15 @@
 	}: Props = $props();
 
 	/**
-	 * S1（docs/banto-hub-external-db-design.md §3 項目13、実装指示4「サーバー
-	 * の422だけに頼らない」）: postgres（DB Source）接続配下には S1 では
-	 * グループを作れないため、選択肢自体から外す。`ConnectionTree.svelte`
-	 * 右クリックの「収集グループを作成」は既に disabled 化済み
-	 * （`tagTreeContextMenu.ts`）だが、この Drawer は他経路（将来の直接
-	 * 起動含む）からも開けるため、ここでも独立に防御する。
+	 * S3（docs/banto-hub-external-db-design.md §7 row S3）: postgres
+	 * （DB Source）接続配下のグループ作成は S2/S2b で解禁済みのため、S1 の
+	 * 選択肢除外ガードは撤去した。接続の選択肢は「すべての接続」（PLC・
+	 * virtual・postgres 問わず）に戻す。
 	 */
-	const selectableConnections = $derived(connections.filter((c) => !isDbSourceConnection(c)));
+	const selectableConnections = $derived(connections);
 
 	const isCreate = $derived(group === null);
+
 	const drawerTitle = $derived(
 		isCreate ? '新規作成' : readOnly ? `${group?.name} の詳細` : `${group?.name} を編集`
 	);
@@ -186,6 +186,20 @@
 	}
 
 	let form: CollectionGroupFormState = $state(blankGroupForm(DEFAULT_PERIOD_MS));
+
+	/**
+	 * S3: フォームが選択している PLC 接続が postgres（DB Source）かどうか。
+	 * `querySql` フィールドの表示・検証・送信時の出し分けに使う - `group`
+	 * prop（再設定時に非 `null`）ではなく常に `form.plcConnectionId`
+	 * （現在の選択、新規作成のウィザード中に変わりうる）から都度判定する。
+	 */
+	const selectedIsDbSource = $derived.by((): boolean => {
+		const id = Number(form.plcConnectionId);
+		if (!Number.isFinite(id)) return false;
+		const conn = connections.find((c) => c.id === id);
+		return conn !== undefined && isDbSourceConnection(conn);
+	});
+
 	let errors: Record<string, string> = $state({});
 	let saving = $state(false);
 	let deleting = $state(false);
@@ -278,7 +292,10 @@
 	const FIELD_STEP: Record<string, 1 | 2 | 3> = {
 		name: 1,
 		plcConnectionId: 2,
-		periodMs: 2
+		periodMs: 2,
+		// S3: `querySql` フィールドは接続先/周期と同じステップ2に置く
+		// （postgres 選択時にだけ表示される、下の destinationFields 参照）。
+		querySql: 2
 	};
 
 	function stepForFieldErrors(fieldErrors: Record<string, string>): 1 | 2 | 3 | null {
@@ -291,7 +308,15 @@
 	}
 
 	const canAdvanceFromStep1 = $derived(form.name.trim() !== '');
-	const canAdvanceFromStep2 = $derived(form.plcConnectionId !== '');
+	/**
+	 * S3: postgres 接続を選んでいる間は `querySql` も非空でないと次へ進めない
+	 * （`ConnectionDrawer.svelte::canAdvanceFromStep2` が postgres 選択時に
+	 * `database`/`username` も要求するのと同じ考え方 - 実際のフィールドごとの
+	 * エラー文言は送信時の {@link validateBeforeSubmit} が出す）。
+	 */
+	const canAdvanceFromStep2 = $derived(
+		form.plcConnectionId !== '' && (!selectedIsDbSource || form.querySql.trim() !== '')
+	);
 
 	function goNext(): void {
 		if (step === 1 && canAdvanceFromStep1) step = 2;
@@ -307,11 +332,27 @@
 		return connections.find((c) => c.id === numId)?.name ?? '（未選択）';
 	}
 
+	/**
+	 * S3（実装指示2「クライアント側検証はサーバー側のルールを反映する」）:
+	 * `validateQuerySql`（サーバー側 `validate_query_sql` のミラー）を送信前
+	 * に走らせる - `ConnectionDrawer.svelte::validateBeforeSubmit`と同じ
+	 * パターン。
+	 */
+	function validateBeforeSubmit(): boolean {
+		const fieldErrors = validateQuerySql(form, selectedIsDbSource);
+		if (Object.keys(fieldErrors).length === 0) return true;
+		errors = fieldErrors;
+		const target = stepForFieldErrors(fieldErrors);
+		if (target !== null) step = target;
+		return false;
+	}
+
 	async function handleCreate(): Promise<void> {
+		if (!validateBeforeSubmit()) return;
 		saving = true;
 		errors = {};
 		try {
-			const created = await createCollectionGroup(formToGroupInput(form));
+			const created = await createCollectionGroup(formToGroupInput(form, selectedIsDbSource));
 			toastStore.push('success', '作成しました');
 			onSaved(created);
 			onClose();
@@ -336,10 +377,14 @@
 
 	async function handleSave(): Promise<void> {
 		if (!group) return;
+		if (!validateBeforeSubmit()) return;
 		saving = true;
 		errors = {};
 		try {
-			const updated = await updateCollectionGroup(group.id, formToGroupInput(form));
+			const updated = await updateCollectionGroup(
+				group.id,
+				formToGroupInput(form, selectedIsDbSource)
+			);
 			toastStore.push('success', '更新しました');
 			// 保存成功後はサーバーの正規化値を基準に取り直す（ConnectionDrawer
 			// の handleSave と同じ方針）。Drawer は閉じない。
@@ -425,6 +470,34 @@
 			</select>
 			{#if errors.periodMs}<span class="err">{errors.periodMs}</span>{/if}
 		</label>
+		{#if selectedIsDbSource}
+			<!--
+				S3（docs/banto-hub-external-db-design.md §4.1・§4.2、実装指示2）:
+				postgres（DB Source）接続配下のグループだけが `query_sql` を
+				持つ - 「1 グループ = 1 SELECT = N タグ」（§4.2）。PLC グループ
+				では非表示（送信時も `formToGroupInput` が `undefined` にする、
+				サーバー側 `validate_query_sql` の「非 postgres では指定不可」
+				と対称）。
+			-->
+			<label class="field wide">
+				SQL（SELECT 文）
+				<textarea
+					id="group-query-sql"
+					class="monospace"
+					bind:value={form.querySql}
+					rows="4"
+					required
+					disabled={readOnly}
+					placeholder="SELECT id, temperature, running FROM sensors"
+					aria-invalid={errors.querySql ? 'true' : undefined}
+					aria-describedby={errors.querySql ? 'group-query-sql-err' : undefined}></textarea>
+				{#if errors.querySql}<span class="err" id="group-query-sql-err">{errors.querySql}</span
+					>{/if}
+			</label>
+			<span class="hint wide">
+				読み取り専用の DB ユーザーで実行してください。先頭 1 行のみ採用。
+			</span>
+		{/if}
 		<label class="field checkbox">
 			<input type="checkbox" bind:checked={form.enabled} disabled={readOnly} />
 			有効
@@ -463,6 +536,10 @@
 		<dd>{form.plcConnectionId ? connectionName(form.plcConnectionId) : '（未選択）'}</dd>
 		<dt>収集周期</dt>
 		<dd>{form.periodMs} ms</dd>
+		{#if selectedIsDbSource}
+			<dt>SQL</dt>
+			<dd class="monospace">{form.querySql.trim() || '（未入力）'}</dd>
+		{/if}
 		<dt>有効</dt>
 		<dd>{form.enabled ? 'はい' : 'いいえ'}</dd>
 		<dt>新規タグの書込可既定</dt>
@@ -550,7 +627,8 @@
 	}
 
 	.field input,
-	.field select {
+	.field select,
+	.field textarea {
 		padding: 0.4rem 0.5rem;
 		border: 1px solid var(--banto-border);
 		border-radius: var(--banto-radius);
@@ -562,9 +640,19 @@
 		width: auto;
 	}
 
-	/* T19 S1-b（UX-34）: 「このグループの新規タグは既定で書込可」チェックボックスと補足文を全幅にする。 */
+	/* T19 S1-b（UX-34）: 「このグループの新規タグは既定で書込可」チェックボックスと補足文を全幅にする。
+	   S3: `query-sql` テキストエリアとその確認表示行も同じ全幅クラスを使う。 */
 	.field.wide {
 		grid-column: 1 / -1;
+	}
+
+	/* S3（docs/banto-hub-external-db-design.md §4.2）: SQL 文は等幅フォントで
+	   読みやすくする - 入力欄（textarea）と確認パネルの表示（dd）の両方に使う。 */
+	.monospace {
+		font-family:
+			ui-monospace, SFMono-Regular, 'SF Mono', Consolas, 'Liberation Mono', Menlo, monospace;
+		white-space: pre-wrap;
+		word-break: break-word;
 	}
 
 	.hint {

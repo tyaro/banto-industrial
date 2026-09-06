@@ -83,6 +83,42 @@ export interface SystemInfoEntry {
 	host_memory_total_bytes: number;
 }
 
+/**
+ * S3（docs/banto-hub-external-db-design.md §7 row S3、実装指示8）: `GET
+ * /api/status` の `dbSource` 配列1件の中の `groups` 配列1件分 - mirrors
+ * `banto_hub_core::rest::AdminDbSourceGroupStatusEntry`。`row_count_last`
+ * は生成 SQL が `LIMIT 2` を付けるため `2` は「2行以上」を意味する
+ * （`banto_hub_core::db_source::convert::build_wrapper_sql`）。
+ */
+export interface DbSourceGroupStatusEntry {
+	group_id: number;
+	group_name: string;
+	last_ok_at: number | null;
+	last_error: string | null;
+	row_count_last: number | null;
+}
+
+/**
+ * S3: `GET /api/status` の `dbSource` 配列1件分（接続ごとの運転状態） -
+ * mirrors `banto_hub_core::rest::AdminDbSourceStatusEntry`。
+ * `state`（`banto_hub_core::db_source::DbConnectionState::as_str`）は
+ * `connected`/`backoff`/`error`/`stopped`/`disabled` のいずれか -
+ * `stopped` は S2b（§4.8・§6-16「収集が Running でない」）、`disabled` は
+ * 構成上無効（接続自体の `enabled = false`）で、両者は意図的に区別する。
+ */
+export interface DbSourceStatusEntry {
+	connection_id: number;
+	connection_name: string;
+	state: 'connected' | 'backoff' | 'error' | 'stopped' | 'disabled' | string;
+	last_poll_at: number | null;
+	last_error: string | null;
+	consecutive_failures: number;
+	/** S2b（§4.8・§6-17）: この接続のタスクが異常終了して supervisor に作り直された回数。 */
+	restarts: number;
+	last_restart_reason: string | null;
+	groups: DbSourceGroupStatusEntry[];
+}
+
 /** `GET /api/status` の応答。 */
 export interface StatusResponse {
 	version: string;
@@ -118,6 +154,30 @@ export interface StatusResponse {
 	last_runtime_error: string | null;
 	/** T19 S3-b（UX-46）: サーバー自身の CPU 使用率・メモリ使用量。 */
 	system: SystemInfoEntry;
+	/** S3（docs/banto-hub-external-db-design.md §7 row S3）: DB Source の接続ごとの運転状態。 */
+	db_source: DbSourceStatusEntry[];
+}
+
+/** サーバーの camelCase 応答（`AdminDbSourceGroupStatusEntry`）の生形。 */
+interface RawDbSourceGroupStatusEntry {
+	groupId: number;
+	groupName: string;
+	lastOkAt: number | null;
+	lastError: string | null;
+	rowCountLast: number | null;
+}
+
+/** サーバーの camelCase 応答（`AdminDbSourceStatusEntry`）の生形。 */
+interface RawDbSourceStatusEntry {
+	connectionId: number;
+	connectionName: string;
+	state: string;
+	lastPollAt: number | null;
+	lastError: string | null;
+	consecutiveFailures: number;
+	restarts: number;
+	lastRestartReason: string | null;
+	groups: RawDbSourceGroupStatusEntry[];
 }
 
 /** サーバーから受け取る camelCase の生レスポンス形（`AdminStatusResponse`）。 */
@@ -139,6 +199,7 @@ interface RawStatusResponse {
 		hostMemoryUsedBytes: number;
 		hostMemoryTotalBytes: number;
 	};
+	dbSource: RawDbSourceStatusEntry[];
 }
 
 /** サーバーの camelCase 応答を、このファイルが公開する既存の型（snake_case
@@ -164,7 +225,24 @@ function fromRawStatus(raw: RawStatusResponse): StatusResponse {
 			process_memory_bytes: raw.system.processMemoryBytes,
 			host_memory_used_bytes: raw.system.hostMemoryUsedBytes,
 			host_memory_total_bytes: raw.system.hostMemoryTotalBytes
-		}
+		},
+		db_source: raw.dbSource.map((entry) => ({
+			connection_id: entry.connectionId,
+			connection_name: entry.connectionName,
+			state: entry.state,
+			last_poll_at: entry.lastPollAt,
+			last_error: entry.lastError,
+			consecutive_failures: entry.consecutiveFailures,
+			restarts: entry.restarts,
+			last_restart_reason: entry.lastRestartReason,
+			groups: entry.groups.map((group) => ({
+				group_id: group.groupId,
+				group_name: group.groupName,
+				last_ok_at: group.lastOkAt,
+				last_error: group.lastError,
+				row_count_last: group.rowCountLast
+			}))
+		}))
 	};
 }
 

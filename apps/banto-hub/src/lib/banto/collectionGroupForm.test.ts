@@ -11,6 +11,7 @@ import {
 	formToGroupInput,
 	groupToForm,
 	nextGroupName,
+	validateQuerySql,
 	type CollectionGroupFormState
 } from './collectionGroupForm';
 import type { CollectionGroup } from './tagRegistryAdmin';
@@ -79,50 +80,126 @@ describe('nextGroupName（修正1: pendingNames — 実機で再現した不具�
 });
 
 describe('blankGroupForm / groupToForm / formToGroupInput', () => {
-	it('blankGroupForm は渡された既定周期を文字列化した初期値を返す（defaultWritable も既定 ON）', () => {
+	it('blankGroupForm は渡された既定周期を文字列化した初期値を返す（defaultWritable も既定 ON、querySql は空文字列）', () => {
 		expect(blankGroupForm(100)).toEqual({
 			name: '',
 			plcConnectionId: '',
 			periodMs: '100',
 			enabled: true,
-			defaultWritable: true
+			defaultWritable: true,
+			querySql: ''
 		});
 	});
 
-	it('groupToForm は保存済みグループを文字列化したフォーム状態へ変換する（defaultWritable も引き継ぐ）', () => {
+	it('groupToForm は保存済みグループを文字列化したフォーム状態へ変換する（defaultWritable も引き継ぐ、querySql は null→空文字列）', () => {
 		const group: CollectionGroup = {
 			id: 7,
 			name: 'Group1',
 			plcConnectionId: 3,
 			periodMs: 5000,
 			enabled: true,
-			defaultWritable: false
+			defaultWritable: false,
+			querySql: null
 		};
 		expect(groupToForm(group)).toEqual({
 			name: 'Group1',
 			plcConnectionId: '3',
 			periodMs: '5000',
 			enabled: true,
-			defaultWritable: false
+			defaultWritable: false,
+			querySql: ''
 		});
 	});
 
-	it('formToGroupInput は数値フィールドを number へ戻す（往復変換、defaultWritable も含む）', () => {
+	it('groupToForm は querySql が設定されているグループでは値をそのまま引き継ぐ（postgres 配下）', () => {
+		const group: CollectionGroup = {
+			id: 8,
+			name: 'PgGroup',
+			plcConnectionId: 5,
+			periodMs: 5000,
+			enabled: true,
+			defaultWritable: false,
+			querySql: 'SELECT a, b FROM v1'
+		};
+		expect(groupToForm(group).querySql).toBe('SELECT a, b FROM v1');
+	});
+
+	it('formToGroupInput は数値フィールドを number へ戻す（往復変換、defaultWritable も含む、非 postgres では querySql を送らない）', () => {
 		const group: CollectionGroup = {
 			id: 1,
 			name: 'X',
 			plcConnectionId: 2,
 			periodMs: 1000,
 			enabled: false,
-			defaultWritable: true
+			defaultWritable: true,
+			querySql: null
 		};
 		const form: CollectionGroupFormState = groupToForm(group);
-		expect(formToGroupInput(form)).toEqual({
+		expect(formToGroupInput(form, false)).toEqual({
 			name: 'X',
 			plcConnectionId: 2,
 			periodMs: 1000,
 			enabled: false,
-			defaultWritable: true
+			defaultWritable: true,
+			querySql: undefined
+		});
+	});
+
+	it('formToGroupInput は postgres 配下かつ入力ありのとき trim 済み querySql を送る', () => {
+		const form: CollectionGroupFormState = {
+			...blankGroupForm(1000),
+			plcConnectionId: '5',
+			querySql: '  SELECT a FROM v1  '
+		};
+		expect(formToGroupInput(form, true).querySql).toBe('SELECT a FROM v1');
+	});
+
+	it('formToGroupInput は postgres 配下でも空白のみの querySql は送らない（undefined、サーバー側必須チェックへ委ねる）', () => {
+		const form: CollectionGroupFormState = {
+			...blankGroupForm(1000),
+			plcConnectionId: '5',
+			querySql: '   '
+		};
+		expect(formToGroupInput(form, true).querySql).toBeUndefined();
+	});
+});
+
+describe('validateQuerySql（S3、crates/banto-tags/src/collection_group.rs::validate_query_sql のミラー）', () => {
+	it('postgres 以外の接続配下では常にエラー無し', () => {
+		expect(validateQuerySql({ querySql: '' }, false)).toEqual({});
+		expect(validateQuerySql({ querySql: 'DELETE FROM x' }, false)).toEqual({});
+	});
+
+	it('postgres 配下で空欄（trim 後空）は必須エラー', () => {
+		expect(validateQuerySql({ querySql: '   ' }, true)).toEqual({ querySql: '必須項目です' });
+	});
+
+	it('postgres 配下で SELECT/WITH 以外の先頭キーワードはエラー', () => {
+		expect(validateQuerySql({ querySql: 'DELETE FROM x' }, true)).toEqual({
+			querySql: 'SQL は SELECT または WITH で始まる必要があります'
+		});
+		expect(validateQuerySql({ querySql: 'update x set y=1' }, true)).toEqual({
+			querySql: 'SQL は SELECT または WITH で始まる必要があります'
+		});
+	});
+
+	it('postgres 配下で SELECT/WITH は大文字小文字を問わず受理される', () => {
+		expect(validateQuerySql({ querySql: 'select a from v1' }, true)).toEqual({});
+		expect(validateQuerySql({ querySql: 'With q as (select 1) select * from q' }, true)).toEqual(
+			{}
+		);
+	});
+
+	it('postgres 配下で ";" を含む文はエラー（単文のみ）', () => {
+		expect(validateQuerySql({ querySql: 'SELECT 1; SELECT 2' }, true)).toEqual({
+			querySql: "SQL は単文で指定してください（';' は使用できません）"
+		});
+	});
+
+	it('postgres 配下で MAX_QUERY_SQL_LEN を超える文はエラー', () => {
+		const sql = `SELECT ${'a'.repeat(8192)}`;
+		expect(validateQuerySql({ querySql: sql }, true)).toEqual({
+			querySql: '8192文字以内で入力してください'
 		});
 	});
 });

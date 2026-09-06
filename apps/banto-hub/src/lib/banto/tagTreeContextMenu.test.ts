@@ -10,8 +10,7 @@ import {
 	resolveTagTreeContextMenuAction,
 	resolveTreeContextMenuItems,
 	resolveReadOnlyTreeContextMenuItems,
-	resolveTreeContextMenuItemsForRole,
-	DB_SOURCE_GROUP_CREATE_DISABLED_REASON
+	resolveTreeContextMenuItemsForRole
 } from './tagTreeContextMenu';
 import { canWriteResources } from '../permissions';
 
@@ -41,6 +40,7 @@ function group(overrides: Partial<CollectionGroup> = {}): CollectionGroup {
 		periodMs: 1000,
 		enabled: true,
 		defaultWritable: true,
+		querySql: null,
 		...overrides
 	};
 }
@@ -150,17 +150,11 @@ describe('resolveTreeContextMenuItems', () => {
 		]);
 	});
 
-	it('S1: postgres（DB Source）接続ノードは「収集グループを作成」が disabled で、接続自体の再設定・削除は禁止されない（予約接続ではない通常の接続のため）', () => {
+	it('S3: postgres（DB Source）接続ノードは通常の接続と同じ3項目を返す（S1 の disabled ガードは撤去済み）', () => {
 		const pg = connection({ id: 5, name: 'pg-a', protocol: 'postgres' });
 		const data: ConnectionTreeNodeData = { kind: 'connection', connection: pg };
 		expect(resolveTreeContextMenuItems(data)).toEqual([
-			{
-				kind: 'createGroup',
-				label: '収集グループを作成',
-				connectionId: 5,
-				disabled: true,
-				disabledReason: DB_SOURCE_GROUP_CREATE_DISABLED_REASON
-			},
+			{ kind: 'createGroup', label: '収集グループを作成', connectionId: 5 },
 			{ kind: 'reconfigureConnection', label: '接続を再設定', connectionId: 5 },
 			{ kind: 'deleteConnection', label: '接続を削除', connectionId: 5 }
 		]);

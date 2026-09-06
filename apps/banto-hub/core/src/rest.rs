@@ -3875,6 +3875,70 @@ async fn collection_groups_get(
     Ok(Json(state.collection_groups.get(id).await?))
 }
 
+/// `POST /api/collection-groups/{id}/describe` - S3
+/// (docs/banto-hub-external-db-design.md §4.6・§7 スライス表「S3: 列名候補の
+/// 提示」): 保存済みグループの `query_sql` を対象に、`db_source::describe_group`
+/// （5秒タイムアウトの `describe` 1回、実行はしない）を呼び、列名・
+/// PostgreSQL型・v1 対応可否を返す。タグ登録 UI の「列を取得」ボタンが
+/// 「結果列名」候補（`db` タグの `address`）を提示するために呼ぶ。
+///
+/// 認可は保存済み接続の接続テスト（[`plc_connections_test_saved`]）と
+/// 同じ `require_editor` に揃える - こちらも DB へ接続してクエリ（読み取り
+/// 専用の `describe`）を実行する操作である点は接続テストと同じ性質のため。
+///
+/// 対象グループが `protocol == "postgres"` の接続配下でない場合、または
+/// （通常到達しない防御として）`query_sql` が `None` の場合は `400` で
+/// 明示する - `plc_connections_test_saved` が非 postgres を `400` にする
+/// のと同じ判断（`ok: false` の `200` ではなく、このエンドポイントが
+/// そもそも対応しない入力であることを明確にする）。
+///
+/// レジストリへの書き込みは一切発生しない読み取り専用の疎通確認なので、
+/// `record_write`/`commit_catalog_and_notify` は呼ばない -
+/// `plc_connections_test_saved` と同じ判断。
+async fn collection_groups_describe(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.commissioning,
+        &state.audit,
+        &headers,
+        "collection_groups",
+        "POST",
+        "/api/collection-groups/{id}/describe",
+    )
+    .await?;
+
+    let group = state.collection_groups.get(id).await?;
+    let conn = state.plc_connections.get(group.plc_connection_id).await?;
+    if !conn.is_db_source() {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "message": "postgres接続配下のグループのみdescribeに対応しています。",
+            })),
+        )
+            .into_response());
+    }
+    let Some(query_sql) = group.query_sql.as_deref() else {
+        // 通常到達しない: postgres 配下のグループは `validate_query_sql`
+        // （crates/banto-tags/src/collection_group.rs）が `query_sql` を
+        // 必須にしている（§4.1）。念のための防御。
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "message": "このグループにはquerySqlが設定されていません。",
+            })),
+        )
+            .into_response());
+    };
+
+    let outcome = crate::db_source::describe_group(&conn, query_sql).await;
+    Ok((StatusCode::OK, Json(outcome)).into_response())
+}
+
 async fn collection_groups_create(
     State(state): State<TagRegistryState>,
     headers: HeaderMap,
@@ -5831,6 +5895,15 @@ fn tag_registry_router(
             get(collection_groups_get)
                 .put(collection_groups_update)
                 .delete(collection_groups_delete),
+        )
+        // S3（docs/banto-hub-external-db-design.md §7 row S3）: 保存済み
+        // グループの `query_sql` describe - `{id}` の下の固定サブパスなので
+        // `/api/collection-groups/{id}` の GET/PUT/DELETE とは axum の
+        // ルートマッチングで衝突しない（`/api/plc-connections/{id}/test`
+        // と同じ形）。
+        .route(
+            "/api/collection-groups/{id}/describe",
+            post(collection_groups_describe),
         )
         .route("/api/tags", get(tags_list).post(tags_create))
         .route(

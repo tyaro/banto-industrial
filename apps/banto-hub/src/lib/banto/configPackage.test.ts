@@ -67,7 +67,8 @@ const BASE_GROUP: CollectionGroup = {
 	plcConnectionId: BASE_CONNECTION.id,
 	periodMs: 1000,
 	enabled: true,
-	defaultWritable: true
+	defaultWritable: true,
+	querySql: null
 };
 
 const VIRTUAL_GROUP: CollectionGroup = {
@@ -76,7 +77,21 @@ const VIRTUAL_GROUP: CollectionGroup = {
 	plcConnectionId: VIRTUAL_CONNECTION.id,
 	periodMs: 1000,
 	enabled: true,
-	defaultWritable: true
+	defaultWritable: true,
+	querySql: null
+};
+
+// S3（docs/banto-hub-external-db-design.md §7 row S3）: postgres（DB
+// Source）接続配下の収集グループのフィクスチャ - `querySql`が export に
+// 含まれ、往復できることを確認する用。
+const DB_GROUP: CollectionGroup = {
+	id: 12,
+	name: 'group-pg',
+	plcConnectionId: DB_CONNECTION.id,
+	periodMs: 1000,
+	enabled: true,
+	defaultWritable: false,
+	querySql: 'SELECT id, temperature, running FROM sensors'
 };
 
 const BASE_TAG: Tag = {
@@ -113,6 +128,19 @@ const VIRTUAL_TAG: Tag = {
 	tagKind: 'computed',
 	address: '',
 	expression: 'tag-a * 2'
+};
+
+// S3: `tagKind: 'db'`のタグのフィクスチャ - `address`は結果列名。
+const DB_TAG: Tag = {
+	...BASE_TAG,
+	id: 102,
+	name: 'tag-db',
+	collectionGroupId: DB_GROUP.id,
+	tagKind: 'db',
+	address: 'temperature',
+	dataType: 'f32',
+	writable: false,
+	expression: null
 };
 
 const MQTT: MqttSettings = {
@@ -443,6 +471,67 @@ describe('configPackage', () => {
 			plcConnections: pkg.plcConnections.map((c) => ({ ...c, protocol: 'mysql' }))
 		};
 		expect(() => parseConfigPackage(JSON.stringify(withBadProtocol))).toThrow(/protocol/);
+	});
+
+	// --- S3（docs/banto-hub-external-db-design.md §7 row S3）: 収集グループの
+	// `querySql`（postgres 配下限定）と `tagKind: 'db'` のタグが export/import
+	// で往復できること、非 postgres グループでは `querySql` が現れないことを
+	// 固定する。
+
+	it('S3: buildConfigPackage は postgres 配下グループの querySql を含み、非 postgres グループには含まない', () => {
+		const pkg = buildConfigPackage({
+			plcConnections: [BASE_CONNECTION, DB_CONNECTION],
+			collectionGroups: [BASE_GROUP, DB_GROUP],
+			tags: [BASE_TAG, DB_TAG],
+			mqtt: MQTT,
+			grpc: GRPC,
+			exportedAt: '2026-09-06T00:00:00.000Z'
+		});
+		const plcGroup = pkg.collectionGroups.find((g) => g.name === 'group-a');
+		const dbGroup = pkg.collectionGroups.find((g) => g.name === 'group-pg');
+		expect(plcGroup?.querySql).toBeUndefined();
+		// JSON へシリアライズした時点で `querySql: undefined` のキー自体が
+		// 落ちることを固定する（`JSON.stringify` は undefined 値のプロパティを
+		// 出力しない）- S1 の password 非漏洩テストと同じ考え方。
+		expect(JSON.stringify(plcGroup)).not.toMatch(/querySql/);
+		expect(dbGroup).toEqual({
+			name: 'group-pg',
+			plcConnectionName: 'pg-a',
+			periodMs: 1000,
+			enabled: true,
+			defaultWritable: false,
+			querySql: 'SELECT id, temperature, running FROM sensors'
+		});
+		const dbTag = pkg.tags.find((t) => t.name === 'tag-db');
+		expect(dbTag).toMatchObject({
+			tagKind: 'db',
+			address: 'temperature',
+			writable: false,
+			expression: null
+		});
+	});
+
+	it('S3: postgres 配下グループ・db タグを含むパッケージは serializeConfigPackage/parseConfigPackage で往復できる', () => {
+		const original = buildConfigPackage({
+			plcConnections: [DB_CONNECTION],
+			collectionGroups: [DB_GROUP],
+			tags: [DB_TAG],
+			mqtt: MQTT,
+			grpc: GRPC,
+			exportedAt: '2026-09-06T00:00:00.000Z'
+		});
+		const parsed = parseConfigPackage(serializeConfigPackage(original));
+		expect(parsed).toEqual(original);
+		expect(parsed.collectionGroups[0].querySql).toBe(
+			'SELECT id, temperature, running FROM sensors'
+		);
+		expect(parsed.tags[0].tagKind).toBe('db');
+	});
+
+	it('S3: parseConfigPackage は querySql を持たない旧パッケージ（非 postgres グループのみ）を受け入れる', () => {
+		const pkg = makePackage();
+		expect(() => parseConfigPackage(JSON.stringify(pkg))).not.toThrow();
+		expect(pkg.collectionGroups[0].querySql).toBeUndefined();
 	});
 
 	it('planByName は name ベースで create/update を分ける', () => {
