@@ -80,13 +80,12 @@ impl DbConnectionTestOutcome {
 /// `"postgres"`かどうかの判定・認可（REST の`require_editor`/MCP の
 /// `require_admin_scope`）はここでは行わない - 疎通確認そのものだけを担う。
 pub async fn test_connection(conn: &PlcConnection) -> DbConnectionTestOutcome {
-    let port = match u16::try_from(conn.port) {
-        Ok(port) => port,
-        Err(_) => {
-            return DbConnectionTestOutcome::failed(
-                "ポート番号が不正です(1〜65535の範囲で指定してください)。".to_string(),
-            );
-        }
+    let port = if conn.port < 1 || conn.port > 65535 {
+        return DbConnectionTestOutcome::failed(
+            "ポート番号が不正です(1〜65535の範囲で指定してください)。".to_string(),
+        );
+    } else {
+        conn.port as u16
     };
 
     let options = PgConnectOptions::new()
@@ -200,7 +199,15 @@ mod tests {
     #[tokio::test]
     async fn test_connection_rejects_an_out_of_range_port() {
         let mut conn = base_conn();
+
+        // Test port > 65535
         conn.port = 70_000;
+        let outcome = test_connection(&conn).await;
+        assert!(!outcome.ok);
+        assert!(outcome.error.expect("error").contains("1〜65535"));
+
+        // Test port = 0
+        conn.port = 0;
         let outcome = test_connection(&conn).await;
         assert!(!outcome.ok);
         assert!(outcome.error.expect("error").contains("1〜65535"));
