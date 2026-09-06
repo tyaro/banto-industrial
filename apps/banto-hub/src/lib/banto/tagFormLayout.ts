@@ -131,13 +131,15 @@ export function environmentLabel(simulation: boolean | undefined): string {
 }
 
 /**
- * 保存前確認領域の「書き込み許可」行。`computed` タグは式が値を決めるため
- * 常に書き込み不可（`toInput` が送信直前にも強制する規則と同じ、
- * `+page.svelte` の `toInput` コメント参照）— フォームのチェックボックス値
- * に関わらずここでも「不許可」で表示を揃える。
+ * 保存前確認領域の「書き込み許可」行。`computed` タグは式が値を決めるため、
+ * `db` タグは v1 が読み取り専用（§6-10）のため、どちらも常に書き込み不可
+ * （`toInput` が送信直前にも強制する規則と同じ、`+page.svelte` の `toInput`
+ * コメント参照）— フォームのチェックボックス値に関わらずここでも「不許可」
+ * で表示を揃える。
  */
 export function writePermissionLabel(tagKind: TagKind, writable: boolean): string {
 	if (tagKind === 'computed') return '不許可（演算タグは書き込み不可）';
+	if (tagKind === 'db') return '不許可（db タグは読み取り専用）';
 	return writable ? '許可' : '不許可';
 }
 

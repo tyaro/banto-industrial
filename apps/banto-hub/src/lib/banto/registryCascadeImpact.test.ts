@@ -19,6 +19,7 @@ function makeGroup(overrides: Partial<CollectionGroup>): CollectionGroup {
 		periodMs: 1000,
 		enabled: true,
 		defaultWritable: true,
+		querySql: null,
 		...overrides
 	};
 }

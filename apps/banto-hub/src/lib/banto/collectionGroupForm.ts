@@ -32,6 +32,15 @@ import { nextSequentialName } from './sequentialName';
 import type { CollectionGroup, CollectionGroupInput } from './tagRegistryAdmin';
 
 /**
+ * S3（docs/banto-hub-external-db-design.md §4.2、2026-09-06 オーナー決定）:
+ * `querySql` の長さ上限 - mirrors
+ * `crates/banto-tags/src/collection_group.rs::MAX_QUERY_SQL_LEN`。この
+ * ファイルの「依存ゼロ」方針（`DEFAULT_PERIOD_MS`の doc comment参照）に
+ * 合わせ、`tagRegistryAdmin.ts` から値 import せずここに複製する。
+ */
+export const MAX_QUERY_SQL_LEN = 8192;
+
+/**
  * T19 S1-b（UX-32、docs/banto-hub-t19-design.md §5.2「現行は
  * `ALLOWED_PERIOD_MS[0]` = 100ms。UX-32 で 1s へ変更する」、2026-09-02
  * オーナー決定）: 収集グループ新規作成フォームの収集周期の既定値。
@@ -77,6 +86,13 @@ export interface CollectionGroupFormState {
 	 * と1対1（`periodMs`/`enabled` と同じ、単純なフォームフィールド）。
 	 */
 	defaultWritable: boolean;
+	/**
+	 * S3（docs/banto-hub-external-db-design.md §4.1・§4.2）: `protocol ===
+	 * 'postgres'` 接続配下のグループが1周期ごとに実行する SELECT 文。
+	 * postgres 以外の接続配下では常に空文字列（未使用）のまま - サーバー側
+	 * `CollectionGroup.querySql` と同じ「postgres でだけ意味を持つ」規約。
+	 */
+	querySql: string;
 }
 
 /**
@@ -108,7 +124,11 @@ export function blankGroupForm(defaultPeriodMs: number): CollectionGroupFormStat
 		// T19 S1-b（UX-34 全体方針「既定 ON」）: 新規グループ自体の既定値
 		// も ON から始める（サーバー側の列既定値、`banto_tags::
 		// collection_group::default_writable_true` と揃える）。
-		defaultWritable: true
+		defaultWritable: true,
+		// S3: 新規作成は接続を選ぶまで postgres かどうか決まらないため
+		// 空文字列から始める（`selectedIsDbSource`側で表示を出し分ける -
+		// `CollectionGroupDrawer.svelte`参照）。
+		querySql: ''
 	};
 }
 
@@ -119,17 +139,78 @@ export function groupToForm(g: CollectionGroup): CollectionGroupFormState {
 		plcConnectionId: String(g.plcConnectionId),
 		periodMs: String(g.periodMs),
 		enabled: g.enabled,
-		defaultWritable: g.defaultWritable
+		defaultWritable: g.defaultWritable,
+		querySql: g.querySql ?? ''
 	};
 }
 
-/** フォーム状態を API 入力（`CollectionGroupInput`）へ変換する。 */
-export function formToGroupInput(form: CollectionGroupFormState): CollectionGroupInput {
+/**
+ * フォーム状態を API 入力（`CollectionGroupInput`）へ変換する。
+ *
+ * S3: `isDbSource`（選択中の PLC 接続が `protocol === 'postgres'` か）を
+ * 明示的に渡す - このモジュールは「依存ゼロの純関数」方針
+ * （冒頭コメント）のため `tagRegistryAdmin.ts::isDbSourceConnection`を
+ * 呼ばず、呼び出し側（`CollectionGroupDrawer.svelte`）が接続一覧から
+ * 判定済みの真偽値だけを渡す。postgres でなければ `querySql` を送らない
+ * （非 postgres での指定はサーバーが拒否する - `validateQuerySql`の
+ * doc comment参照）。postgres で `form.querySql` が空白のみの場合も
+ * 送らない（`undefined` にしてサーバー側の必須チェックへ委ねる - 空文字列
+ * を送ると「空文字列を指定した」と「未指定」が区別できなくなるのを
+ * 避ける）。
+ */
+export function formToGroupInput(
+	form: CollectionGroupFormState,
+	isDbSource: boolean
+): CollectionGroupInput {
+	const trimmedSql = form.querySql.trim();
 	return {
 		name: form.name,
 		plcConnectionId: Number(form.plcConnectionId),
 		periodMs: Number(form.periodMs),
 		enabled: form.enabled,
-		defaultWritable: form.defaultWritable
+		defaultWritable: form.defaultWritable,
+		querySql: isDbSource && trimmedSql !== '' ? trimmedSql : undefined
 	};
+}
+
+/**
+ * S3（docs/banto-hub-external-db-design.md §4.2「文の検証はベストエフォート」、
+ * 実装指示2）: クライアント側の事前検証 - サーバー側
+ * `crates/banto-tags/src/collection_group.rs::validate_query_sql` の
+ * postgres 配下ルールをミラーする。
+ * `plcConnectionForm.ts::validatePostgresFields`と同じ方針（サーバーの
+ * 422を待たずクライアント側で弾く）。
+ *
+ * - postgres 以外の接続配下では常に空オブジェクト（このモジュールが送信時
+ *   に`querySql`自体を送らないため、逆ルール「postgres以外での指定不可」に
+ *   違反しようがない - `validatePostgresFields`の doc comment と同じ理由）。
+ * - postgres配下: trim後非空・{@link MAX_QUERY_SQL_LEN}以内・先頭キーワードが
+ *   `SELECT`/`WITH`（大文字小文字を問わない）・`;`を含まない、の4点。
+ *   メッセージはサーバー側`validate_query_sql`と一字一句揃える。
+ */
+export function validateQuerySql(
+	form: Pick<CollectionGroupFormState, 'querySql'>,
+	isDbSource: boolean
+): Record<string, string> {
+	const errors: Record<string, string> = {};
+	if (!isDbSource) return errors;
+
+	const trimmed = form.querySql.trim();
+	if (trimmed === '') {
+		errors.querySql = '必須項目です';
+		return errors;
+	}
+	if (Array.from(trimmed).length > MAX_QUERY_SQL_LEN) {
+		errors.querySql = `${MAX_QUERY_SQL_LEN}文字以内で入力してください`;
+		return errors;
+	}
+	if (trimmed.includes(';')) {
+		errors.querySql = "SQL は単文で指定してください（';' は使用できません）";
+		return errors;
+	}
+	const firstKeyword = /^[A-Za-z]+/.exec(trimmed)?.[0]?.toUpperCase() ?? '';
+	if (firstKeyword !== 'SELECT' && firstKeyword !== 'WITH') {
+		errors.querySql = 'SQL は SELECT または WITH で始まる必要があります';
+	}
+	return errors;
 }

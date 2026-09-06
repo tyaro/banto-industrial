@@ -252,7 +252,14 @@ const TAG_DATA_TYPES: ReadonlySet<string> = new Set<TagDataType>([
 	'string'
 ]);
 
-const TAG_KINDS: ReadonlySet<string> = new Set<TagKind>(['plc', 'computed', 'internal']);
+/**
+ * S3（docs/banto-hub-external-db-design.md §7 row S3）: `db` を CSV の
+ * `tagKind` 列として受理する - `TAG_CSV_COLUMNS` は変更しない（実装指示
+ * 「strict header, non-backward-compatible」、#264 の教訓）ので、既存の
+ * `tagKind` 列がそのまま `db` も表現できる。配置規則（postgres 接続配下の
+ * グループのみ）は下の `parseTagsCsv` 本体で別途検証する。
+ */
+const TAG_KINDS: ReadonlySet<string> = new Set<TagKind>(['plc', 'computed', 'internal', 'db']);
 
 /**
  * 真偽値セルのパース。空欄は `defaultValue`、大小文字区別なしの
@@ -370,10 +377,25 @@ export function parseTagsCsv(
 			rowErrors.push(`tagKind "${tagKindRaw}" は不正な値です。`);
 		}
 
+		// S3（docs/banto-hub-external-db-design.md §4.1「db は postgres 接続
+		// 配下のみ」、`banto_tags::tag::validate_tag_kind_placement`と同じ
+		// 配置規則）: この規則だけは CSV パース時点で先取りする（他の
+		// tagKind の配置規則 - computed は calc 配下のみ・internal は mem
+		// 配下のみ - はサーバー側 dry-run に委ねている既存方針のままだが、
+		// db は「postgres 以外の接続配下に間違って CSV を適用する」事故が
+		// 特に起きやすい - `connection` 列は自由記入のため、接続を追加
+		// した直後にタイプミスしたまま気づかず適用してしまう恐れがある
+		// ため、ここで明示的にエラーにする）。
+		if (tagKind === 'db' && connection && connection.protocol !== 'postgres') {
+			rowErrors.push(
+				`tagKind=db は postgres 接続配下のグループにのみ登録できます（接続 "${connectionName}" は ${connection.protocol}）。`
+			);
+		}
+
 		const addressRaw = col('address');
 		let address = '';
-		if (tagKind === 'plc') {
-			if (addressRaw === '') rowErrors.push('address は tagKind=plc のとき必須です。');
+		if (tagKind === 'plc' || tagKind === 'db') {
+			if (addressRaw === '') rowErrors.push(`address は tagKind=${tagKind} のとき必須です。`);
 			address = addressRaw;
 		}
 		// computed/internal は toInput() と同じく強制的に空文字（address は
@@ -484,8 +506,9 @@ export function parseTagsCsv(
 			thresholdL,
 			thresholdLl,
 			enabled,
-			// computed は toInput() と同じく常に writable=false（値は式が決める）。
-			writable: tagKind === 'computed' ? false : writableRaw,
+			// computed/db は toInput() と同じく常に writable=false（computed:
+			// 値は式が決める。db: v1 は読み取り専用 §6-10）。
+			writable: tagKind === 'computed' || tagKind === 'db' ? false : writableRaw,
 			tagKind,
 			expression,
 			retain

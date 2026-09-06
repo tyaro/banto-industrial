@@ -233,7 +233,8 @@ describe('applyConfigPackage: 収集稼働中の QueuedWhileRunningError を検�
 				plcConnectionId: 1,
 				periodMs: 500,
 				enabled: true,
-				defaultWritable: true
+				defaultWritable: true,
+				querySql: null
 			}
 		]);
 		vi.mocked(updateCollectionGroup).mockRejectedValue(
@@ -296,7 +297,8 @@ describe('applyConfigPackage: 全件成功する通常の import（回帰ガー�
 			plcConnectionId: 1,
 			periodMs: 1000,
 			enabled: true,
-			defaultWritable: true
+			defaultWritable: true,
+			querySql: null
 		});
 		vi.mocked(createTag).mockResolvedValue({
 			id: 1,
@@ -358,7 +360,8 @@ describe('applyConfigPackage: 全件成功する通常の import（回帰ガー�
 			plcConnectionId: 1,
 			periodMs: 1000,
 			enabled: true,
-			defaultWritable: true
+			defaultWritable: true,
+			querySql: null
 		});
 		vi.mocked(createTag).mockResolvedValue({
 			id: 1,
@@ -461,6 +464,77 @@ describe('applyConfigPackage: postgres（DB Source）接続の import はパス�
 			username: 'appuser'
 		});
 		expect(calledWith).not.toHaveProperty('password');
+	});
+});
+
+// --- S3（docs/banto-hub-external-db-design.md §7 row S3）: 収集グループの
+// `querySql`（postgres 配下限定）が import 経路（`applyConfigPackage`）で
+// `createCollectionGroup`/`updateCollectionGroup` へそのまま渡ることを固定
+// する - S1 の database/username と同じ「pkg の値を転記するだけ」の経路。
+
+describe('applyConfigPackage: postgres（DB Source）グループの querySql を CollectionGroupInput へ転記する', () => {
+	it('createCollectionGroup には querySql をそのまま渡す', async () => {
+		const pkgWithDbGroup: ConfigPackage = {
+			...pkg,
+			plcConnections: [
+				{
+					name: 'pg1',
+					protocol: 'postgres',
+					host: '10.0.0.5',
+					port: 5432,
+					unitId: 1,
+					enabled: true,
+					simulation: false,
+					wordOrder: 'low_high',
+					database: 'appdb',
+					username: 'appuser'
+				}
+			],
+			collectionGroups: [
+				{
+					name: 'group-pg',
+					plcConnectionName: 'pg1',
+					periodMs: 1000,
+					enabled: true,
+					defaultWritable: false,
+					querySql: 'SELECT id, temperature FROM sensors'
+				}
+			],
+			tags: []
+		};
+		vi.mocked(createPlcConnection).mockResolvedValue({
+			id: 1,
+			name: 'pg1',
+			protocol: 'postgres',
+			host: '10.0.0.5',
+			port: 5432,
+			unitId: 1,
+			enabled: true,
+			simulation: false,
+			wordOrder: 'low_high',
+			database: 'appdb',
+			username: 'appuser',
+			passwordSet: false
+		});
+		vi.mocked(createCollectionGroup).mockResolvedValue({
+			id: 1,
+			name: 'group-pg',
+			plcConnectionId: 1,
+			periodMs: 1000,
+			enabled: true,
+			defaultWritable: false,
+			querySql: 'SELECT id, temperature FROM sensors'
+		});
+
+		await applyConfigPackage(pkgWithDbGroup);
+
+		expect(createCollectionGroup).toHaveBeenCalledWith(
+			expect.objectContaining({
+				name: 'group-pg',
+				plcConnectionId: 1,
+				querySql: 'SELECT id, temperature FROM sensors'
+			})
+		);
 	});
 });
 

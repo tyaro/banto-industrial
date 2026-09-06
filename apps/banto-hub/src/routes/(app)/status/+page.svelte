@@ -129,6 +129,41 @@
 		return new Date(value).toLocaleString('ja-JP');
 	}
 
+	/**
+	 * S3（docs/banto-hub-external-db-design.md §7 row S3、実装指示8）: DB
+	 * Source 節（`status.db_source`）の epoch ミリ秒（`last_poll_at`/
+	 * `last_ok_at`）表示。`formatDateTime`（ISO 文字列専用）とは別に持つ -
+	 * こちらは `number | null` を受け取り、`null`（一度もポーリング/成功
+	 * していない）は「-」で表す。
+	 */
+	function formatEpochMs(value: number | null): string {
+		return value === null ? '-' : new Date(value).toLocaleString('ja-JP');
+	}
+
+	const DB_SOURCE_STATE_LABELS: Record<string, string> = {
+		connected: '接続中',
+		backoff: '再接続待ち',
+		error: 'エラー',
+		stopped: '停止中（収集停止）',
+		disabled: '無効（構成）'
+	};
+
+	function dbSourceStateLabel(state: string): string {
+		return DB_SOURCE_STATE_LABELS[state] ?? state;
+	}
+
+	/**
+	 * 既存の pending changes 節が使う `.state-chip`/`.state-good`/
+	 * `.state-warn`/`.state-bad`/`.state-stale`（下の style ブロック参照）
+	 * をそのまま流用する - 新しいバッジ意匠を増やさない。
+	 */
+	function dbSourceStateClass(state: string): string {
+		if (state === 'connected') return 'state-good';
+		if (state === 'backoff') return 'state-warn';
+		if (state === 'stopped' || state === 'disabled') return 'state-stale';
+		return 'state-bad';
+	}
+
 	let status: StatusResponse | null = $state(null);
 	let pendingChanges = $state<PendingChange[]>([]);
 	let loading = $state(true);
@@ -626,6 +661,75 @@
 		{/if}
 	</section>
 
+	<section>
+		<!--
+			S3（docs/banto-hub-external-db-design.md §7 row S3、実装指示8）:
+			`GET /api/status` の `dbSource` 節（接続ごとの運転状態・配下
+			グループの直近成功時刻/エラー/行数）を表示する。接続一覧
+			（PLC）と同じ「状態バッジ + 表」の見た目に揃える -
+			`state`（connected/backoff/error/stopped/disabled）は
+			`crate::db_source::DbConnectionState`の5値そのまま。
+		-->
+		<h2>DB Source</h2>
+		{#if loading && !status}
+			<p class="note">読み込み中…</p>
+		{:else if status}
+			{#if status.db_source.length === 0}
+				<p class="note">postgres（DB Source）接続が登録されていません。</p>
+			{:else}
+				{#each status.db_source as conn (conn.connection_id)}
+					<div class="db-source-connection">
+						<h3>
+							{conn.connection_name}
+							<span class="state-chip {dbSourceStateClass(conn.state)}"
+								>{dbSourceStateLabel(conn.state)}</span
+							>
+						</h3>
+						<dl class="summary">
+							<dt>直近ポーリング</dt>
+							<dd>{formatEpochMs(conn.last_poll_at)}</dd>
+							{#if conn.last_error}
+								<dt>直近エラー</dt>
+								<dd class="config-error">{conn.last_error}</dd>
+							{/if}
+							<dt>連続失敗回数</dt>
+							<dd>{conn.consecutive_failures}</dd>
+							<dt>タスク再生成回数</dt>
+							<dd>
+								{conn.restarts}
+								{#if conn.last_restart_reason}
+									（最後の理由: {conn.last_restart_reason}）
+								{/if}
+							</dd>
+						</dl>
+						{#if conn.groups.length > 0}
+							<table class="conn-table">
+								<thead>
+									<tr>
+										<th>収集グループ</th>
+										<th>直近成功</th>
+										<th>直近エラー</th>
+										<th>直近行数</th>
+									</tr>
+								</thead>
+								<tbody>
+									{#each conn.groups as group (group.group_id)}
+										<tr>
+											<td>{group.group_name}</td>
+											<td>{formatEpochMs(group.last_ok_at)}</td>
+											<td>{group.last_error ?? '-'}</td>
+											<td>{group.row_count_last ?? '-'}</td>
+										</tr>
+									{/each}
+								</tbody>
+							</table>
+						{/if}
+					</div>
+				{/each}
+			{/if}
+		{/if}
+	</section>
+
 	<section id="collection-control">
 		<h2>収集の開始・停止</h2>
 		{#if !status}
@@ -978,6 +1082,21 @@
 
 	.pending-source {
 		font-family: var(--banto-font-mono, monospace);
+	}
+
+	/* S3（docs/banto-hub-external-db-design.md §7 row S3）: DB Source 節、接続1件分の区切り。 */
+	.db-source-connection {
+		margin-bottom: 1rem;
+	}
+
+	.db-source-connection:last-child {
+		margin-bottom: 0;
+	}
+
+	.db-source-connection h3 {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
 	}
 
 	.state-chip {

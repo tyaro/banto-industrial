@@ -35,7 +35,8 @@ const GROUP_A: CollectionGroup = {
 	plcConnectionId: CONN_A.id,
 	periodMs: 1000,
 	enabled: true,
-	defaultWritable: true
+	defaultWritable: true,
+	querySql: null
 };
 const GROUP_B: CollectionGroup = {
 	id: 11,
@@ -43,7 +44,8 @@ const GROUP_B: CollectionGroup = {
 	plcConnectionId: CONN_A.id,
 	periodMs: 1000,
 	enabled: true,
-	defaultWritable: true
+	defaultWritable: true,
+	querySql: null
 };
 const GROUPS: CollectionGroup[] = [GROUP_A, GROUP_B];
 

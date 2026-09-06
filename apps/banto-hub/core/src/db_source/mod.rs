@@ -74,7 +74,7 @@ use banto_tags::PlcConnection;
 use banto_tstore::Clock;
 use serde::Serialize;
 use sqlx::postgres::{PgConnectOptions, PgSslMode};
-use sqlx::{Connection, Error as SqlxError};
+use sqlx::{Connection, Error as SqlxError, Executor, SqlSafeStr};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -501,6 +501,144 @@ async fn run_test(options: PgConnectOptions) -> DbConnectionTestOutcome {
     }
 }
 
+/// S3（docs/banto-hub-external-db-design.md §7 row S3）: `describe` した
+/// 1列の応答。`banto_hub_core::rest`（`POST
+/// /api/collection-groups/{id}/describe`）がそのまま JSON へ変換する -
+/// `kind` は [`convert::ColumnKind::classify`] の3値を文字列化したもの
+/// （未対応型は`None`→JSON `null`）で、タグ登録 UI が「結果列名」候補の
+/// 一覧と、各候補が v1 で使えるかどうかの判定に使う。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DescribeColumnOutcome {
+    /// 結果列名（大文字小文字はそのまま - `db` タグの `address` が比較する
+    /// 値と同じ表記）。
+    pub name: String,
+    /// `sqlx` の `PgTypeInfo::name()` が返す PostgreSQL 型名（例 `"INT4"`）。
+    pub pg_type: String,
+    /// `kind.is_some()` と同値 - UI が未対応列をグレーアウトする判定に
+    /// 使う（`kind` があれば別途 JSON をパースしなくて済むよう冗長に持つ）。
+    pub supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'static str>,
+}
+
+impl DescribeColumnOutcome {
+    fn from_pg_type(name: String, pg_type: String) -> Self {
+        let kind = convert::ColumnKind::classify(&pg_type);
+        Self {
+            name,
+            pg_type,
+            supported: kind.is_some(),
+            kind: kind.map(|k| match k {
+                convert::ColumnKind::Numeric => "numeric",
+                convert::ColumnKind::Bool => "bool",
+                convert::ColumnKind::Epoch => "epoch",
+            }),
+        }
+    }
+}
+
+/// [`describe_group`]の結果。REST は`200 {"ok": true, "columns": [...]}`
+/// または`200 {"ok": false, "error": "..."}`としてそのまま返す
+/// （[`DbConnectionTestOutcome`]と同じ判断 - 疎通/文の失敗は異常系
+/// （4xx/5xx）ではなく通常応答として扱う）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DescribeGroupOutcome {
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub columns: Option<Vec<DescribeColumnOutcome>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl DescribeGroupOutcome {
+    fn ok(columns: Vec<DescribeColumnOutcome>) -> Self {
+        Self {
+            ok: true,
+            columns: Some(columns),
+            error: None,
+        }
+    }
+
+    fn failed(message: String) -> Self {
+        Self {
+            ok: false,
+            columns: None,
+            error: Some(message),
+        }
+    }
+}
+
+/// `conn`（`protocol == "postgres"`である前提 - 呼び出し側が
+/// [`banto_tags::PlcConnection::is_db_source`]で確認する）へ接続し、
+/// `query_sql`を[`convert::describe_wrapper_sql`]で包んだ文を`describe`
+/// する（実行はしない - `task::describe_group`と同じ「型だけを覗く」
+/// 手筋）。接続・describe を合わせて[`DB_TEST_TIMEOUT`]（5秒、[`test_connection`]
+/// と同じ値）でタイムアウトする。
+///
+/// タグ登録 UI（S3、「列を取得」ボタン）が保存済みグループの `query_sql`
+/// に対して呼ぶ - 結果列名を`db`タグの`address`候補として提示し、
+/// [`DescribeColumnOutcome::supported`]が`false`の列（v1が非対応の型）は
+/// グレーアウトして選べないようにする。呼び出し側の責務
+/// （`protocol`が`postgres`かどうかの判定・認可・`query_sql`が`Some`か
+/// どうかの確認）はここでは行わない - [`test_connection`]と同じ役割分担。
+pub async fn describe_group(conn: &PlcConnection, query_sql: &str) -> DescribeGroupOutcome {
+    let port = if conn.port < 1 || conn.port > 65535 {
+        return DescribeGroupOutcome::failed(
+            "ポート番号が不正です(1〜65535の範囲で指定してください)。".to_string(),
+        );
+    } else {
+        conn.port as u16
+    };
+
+    let options = pg_connect_options(
+        &conn.host,
+        port,
+        conn.database.as_deref().unwrap_or(""),
+        conn.username.as_deref().unwrap_or(""),
+        conn.password.as_deref().unwrap_or(""),
+        &conn.name,
+    );
+
+    match tokio::time::timeout(DB_TEST_TIMEOUT, run_describe(options, query_sql)).await {
+        Ok(outcome) => outcome,
+        Err(_elapsed) => DescribeGroupOutcome::failed(format!(
+            "接続タイムアウトです({}秒)。ホスト/ポート、ネットワーク到達性を確認してください。",
+            DB_TEST_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+async fn run_describe(options: PgConnectOptions, query_sql: &str) -> DescribeGroupOutcome {
+    let mut pg_conn = match sqlx::postgres::PgConnection::connect_with(&options).await {
+        Ok(pg_conn) => pg_conn,
+        Err(err) => return DescribeGroupOutcome::failed(sanitize_postgres_error(&err)),
+    };
+
+    let sql = convert::describe_wrapper_sql(query_sql);
+    // AssertSqlSafe: `task::describe_group`と同じ理由 - 文の本体は運用者が
+    // 登録した`query_sql`（`banto_tags`が「先頭 SELECT/WITH・単文」まで
+    // ベストエフォート検証済み）で、外から与えられた値を文字列連結して
+    // いるわけではない。**本当の防御は DB 側の read-only ユーザー**
+    // （設計 §4.2）。
+    let described = pg_conn
+        .describe(sqlx::AssertSqlSafe(sql).into_sql_str())
+        .await;
+    // ベストエフォートで閉じる - `run_test`と同じ扱い。
+    let _ = pg_conn.close().await;
+
+    match described {
+        Ok(described) => DescribeGroupOutcome::ok(
+            convert::describe_columns(&described)
+                .into_iter()
+                .map(|(name, pg_type)| DescribeColumnOutcome::from_pg_type(name, pg_type))
+                .collect(),
+        ),
+        Err(err) => DescribeGroupOutcome::failed(sanitize_postgres_error(&err)),
+    }
+}
+
 /// `sqlx::Error`を「短いカテゴリ + DB 自身のメッセージ」へ変換する。この
 /// モジュールの doc comment「資格情報の扱い」節参照 -
 /// パスワード・接続文字列全体を含めない。
@@ -639,6 +777,112 @@ mod tests {
         let userinfo = after_scheme.split_once('@')?.0;
         let password = userinfo.split_once(':')?.1;
         Some(password.to_string())
+    }
+
+    /// A closed port fails fast with `ok: false`, and the error text never
+    /// contains the plaintext password (same guarantee as
+    /// `test_connection_against_a_closed_port_fails_without_leaking_the_password`
+    /// above - S3's describe endpoint reaches the network exactly the same
+    /// way `test_connection` does).
+    #[tokio::test]
+    async fn describe_group_against_a_closed_port_fails_without_leaking_the_password() {
+        let conn = base_conn();
+        let outcome = describe_group(&conn, "SELECT 1 AS a").await;
+        assert!(!outcome.ok);
+        assert!(outcome.columns.is_none());
+        let error = outcome
+            .error
+            .expect("a failed describe should carry an error");
+        assert!(
+            !error.contains("s3cret-password"),
+            "error text must never contain the plaintext password: {error}"
+        );
+    }
+
+    /// An invalid port number is rejected before any connection attempt
+    /// (mirrors `test_connection_rejects_an_out_of_range_port`).
+    #[tokio::test]
+    async fn describe_group_rejects_an_out_of_range_port() {
+        let mut conn = base_conn();
+        conn.port = 70_000;
+        let outcome = describe_group(&conn, "SELECT 1 AS a").await;
+        assert!(!outcome.ok);
+        assert!(outcome.error.expect("error").contains("1〜65535"));
+    }
+
+    /// `DescribeColumnOutcome::from_pg_type` maps each `ColumnKind` bucket
+    /// (§4.4's table) to the wire `kind` string, and leaves unsupported
+    /// types `supported: false`/`kind: None` - the mapping the REST handler
+    /// (`collection_groups_describe`) and the tag registration UI's column
+    /// candidate list both depend on.
+    #[test]
+    fn describe_column_outcome_maps_pg_types_to_the_v1_kind_vocabulary() {
+        let numeric = DescribeColumnOutcome::from_pg_type("a".to_string(), "INT4".to_string());
+        assert!(numeric.supported);
+        assert_eq!(numeric.kind, Some("numeric"));
+
+        let boolean = DescribeColumnOutcome::from_pg_type("b".to_string(), "BOOL".to_string());
+        assert!(boolean.supported);
+        assert_eq!(boolean.kind, Some("bool"));
+
+        let epoch = DescribeColumnOutcome::from_pg_type("c".to_string(), "TIMESTAMPTZ".to_string());
+        assert!(epoch.supported);
+        assert_eq!(epoch.kind, Some("epoch"));
+
+        let unsupported = DescribeColumnOutcome::from_pg_type("d".to_string(), "TEXT".to_string());
+        assert!(!unsupported.supported);
+        assert_eq!(unsupported.kind, None);
+    }
+
+    /// Integration test against a real PostgreSQL - only runs when
+    /// `BANTO_TEST_PG_URL` is set (same gate/convention as
+    /// `test_connection_against_a_real_postgresql_returns_the_server_version`).
+    /// Exercises one column of each v1-supported kind plus one unsupported
+    /// (`text`) column in a single statement.
+    #[tokio::test]
+    async fn describe_group_against_a_real_postgresql_classifies_every_column() {
+        let Ok(url) = std::env::var("BANTO_TEST_PG_URL") else {
+            eprintln!("skipped: BANTO_TEST_PG_URL unset");
+            return;
+        };
+        let options: PgConnectOptions = url
+            .parse()
+            .expect("BANTO_TEST_PG_URL should be a valid postgres:// URL");
+        let conn = PlcConnection {
+            id: 1,
+            name: "Real PG".to_string(),
+            protocol: "postgres".to_string(),
+            host: options.get_host().to_string(),
+            port: options.get_port() as i64,
+            unit_id: 1,
+            enabled: true,
+            simulation: false,
+            word_order: "low_high".to_string(),
+            database: options.get_database().map(|s| s.to_string()),
+            username: Some(options.get_username().to_string()),
+            password: url_password(&url),
+        };
+
+        let outcome = describe_group(
+            &conn,
+            "SELECT 1::int4 AS n, true AS b, now() AS t, 'x'::text AS s",
+        )
+        .await;
+        assert!(outcome.ok, "expected ok, got: {outcome:?}");
+        let columns = outcome
+            .columns
+            .expect("a successful describe should carry columns");
+        assert_eq!(columns.len(), 4, "unexpected columns: {columns:?}");
+
+        let by_name = |name: &str| columns.iter().find(|c| c.name == name).unwrap();
+        assert_eq!(by_name("n").kind, Some("numeric"));
+        assert!(by_name("n").supported);
+        assert_eq!(by_name("b").kind, Some("bool"));
+        assert!(by_name("b").supported);
+        assert_eq!(by_name("t").kind, Some("epoch"));
+        assert!(by_name("t").supported);
+        assert_eq!(by_name("s").kind, None);
+        assert!(!by_name("s").supported);
     }
 
     fn engine() -> DbSourceEngine {

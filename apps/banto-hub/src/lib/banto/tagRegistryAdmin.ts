@@ -201,6 +201,14 @@ export interface CollectionGroup {
 	 * 決める（`$lib/banto/writableDefault.ts` 参照）。
 	 */
 	defaultWritable: boolean;
+	/**
+	 * S3（docs/banto-hub-external-db-design.md §4.1・§4.2、2026-09-06
+	 * オーナー決定「案A」）: このグループが1周期ごとに実行する SELECT 文
+	 * （「1 グループ = 1 SELECT = N タグ」）。`protocol === 'postgres'` の
+	 * 接続配下のグループでは常に非 `null`、それ以外の接続配下では常に
+	 * `null` - mirrors `banto_tags::CollectionGroup::query_sql`。
+	 */
+	querySql: string | null;
 }
 
 /** Mirrors `banto_hub_core::rest::CollectionGroupPayload`. */
@@ -211,6 +219,14 @@ export interface CollectionGroupInput {
 	enabled: boolean;
 	/** {@link CollectionGroup.defaultWritable} 参照。 */
 	defaultWritable: boolean;
+	/**
+	 * S3: `protocol: 'postgres'` 接続配下のグループでは必須、それ以外では
+	 * 省略する（サーバーは非 postgres での指定を拒否する - mirrors
+	 * `banto_hub_core::rest::CollectionGroupPayload::query_sql`、
+	 * `crates/banto-tags/src/collection_group.rs::validate_query_sql`）。
+	 * `undefined`/省略と空文字列はどちらも「未指定」として扱われる。
+	 */
+	querySql?: string;
 }
 
 /**
@@ -221,6 +237,22 @@ export interface CollectionGroupInput {
 export const ALLOWED_PERIOD_MS: readonly number[] = [100, 200, 500, 1000, 2000, 5000, 10000, 60000];
 
 export type TagDataType = 'bit' | 'i16' | 'u16' | 'i32' | 'u32' | 'f32' | 'string';
+
+/**
+ * S3（docs/banto-hub-external-db-design.md §4.4・§6-5「v1 は数値・bool・
+ * timestamp のみ」）: `db` タグに設定できる `dataType` - `'string'` を除く
+ * 全種（`banto_tags::tag::validate_tag_input`の`DB_TAG_KIND`アームが
+ * `string`だけを拒否するのをそのまま反映。`internal`タグの同じ除外規則と
+ * 同型）。
+ */
+export const DB_TAG_ALLOWED_DATA_TYPES: readonly TagDataType[] = [
+	'bit',
+	'i16',
+	'u16',
+	'i32',
+	'u32',
+	'f32'
+];
 
 /**
  * Tag species (T6-2, docs/tag-server-design.md §4.2's table) — mirrors
@@ -234,12 +266,62 @@ export type TagDataType = 'bit' | 'i16' | 'u16' | 'i32' | 'u32' | 'f32' | 'strin
  * - `internal`: value from client writes, held entirely in the tag space
  *   (never sent to a PLC); `address`/`expression` both forbidden, `retain`
  *   selects restart persistence.
+ * - `db` (S3, docs/banto-hub-external-db-design.md §4.1/§4.4): value from
+ *   the DB Source poll of the group's `query_sql`; `address` is the
+ *   **result column name** (not a PLC address, `^[A-Za-z_][A-Za-z0-9_]*$`,
+ *   ≤ {@link MAX_DB_COLUMN_NAME_LEN} chars, compared verbatim), `expression`
+ *   forbidden, `dataType !== 'string'` (v1 is numeric/bool/timestamp only),
+ *   `writable` normalized to `false` server-side (not an error, unlike
+ *   `computed` — mirrors `banto_tags::tag::validate_tag_input`'s `DB_TAG_KIND`
+ *   arm).
  *
  * Placement is enforced server-side (`banto_tags::tag::validate_tag_kind_placement`):
  * `computed` only under the `calc` connection, `internal` only under `mem`,
- * `plc` under neither.
+ * `db` only under a `protocol === 'postgres'` connection, `plc` under none
+ * of those three.
  */
-export type TagKind = 'plc' | 'computed' | 'internal';
+export type TagKind = 'plc' | 'computed' | 'internal' | 'db';
+
+/**
+ * S3: mirrors `banto_tags::tag::DB_TAG_KIND`. Used wherever code needs to
+ * compare `TagKind`/`Tag.tagKind` against the literal without retyping the
+ * string (parallels {@link POSTGRES_PROTOCOL}).
+ */
+export const DB_TAG_KIND: TagKind = 'db';
+
+/**
+ * S3: mirrors `banto_tags::tag::MAX_DB_COLUMN_NAME_LEN` (PostgreSQL's bare
+ * identifier limit) — the length cap on a `db` tag's `address` (= result
+ * column name).
+ */
+export const MAX_DB_COLUMN_NAME_LEN = 63;
+
+/**
+ * S3: mirrors `banto_tags::tag`'s `is_db_column_identifier` — a bare
+ * PostgreSQL identifier (letter/underscore, then letters/digits/underscores).
+ * Client-side pre-check only; the server re-validates and is the source of
+ * truth.
+ */
+const DB_COLUMN_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * S3: client-side mirror of `is_db_column_identifier` +
+ * `MAX_DB_COLUMN_NAME_LEN` (both in `crates/banto-tags/src/tag.rs`'s
+ * `DB_TAG_KIND` validation arm). Returns `true` for a syntactically valid
+ * `db` tag `address` (a non-empty result column name within the length
+ * cap) — does not check whether the column actually exists in the group's
+ * `query_sql` result (that requires a `describeCollectionGroup` round trip).
+ */
+export function isValidDbColumnAddress(address: string): boolean {
+	const trimmed = address.trim();
+	// `Array.from` を経由するのは Rust 側 `chars().count()`（Unicode スカラ値
+	// 単位）に合わせるため — `.length`（UTF-16 コード単位）だと日本語混じり
+	// の不正な列名候補で上限判定がわずかにずれうる。
+	const charCount = Array.from(trimmed).length;
+	return (
+		charCount > 0 && charCount <= MAX_DB_COLUMN_NAME_LEN && DB_COLUMN_IDENTIFIER_RE.test(trimmed)
+	);
+}
 
 /**
  * `tags.string_encoding` vocabulary (T20 ①a, docs/banto-hub-t20-design.md
@@ -562,6 +644,45 @@ export async function deleteCollectionGroup(id: number): Promise<void> {
 	await httpRequest<void>(`/api/collection-groups/${id}`, {
 		method: 'DELETE',
 		expectNoContent: true
+	});
+}
+
+/**
+ * S3（docs/banto-hub-external-db-design.md §7 row S3）: `POST
+ * /api/collection-groups/{id}/describe` の1列分 - mirrors
+ * `banto_hub_core::db_source::DescribeColumnOutcome`。`kind` は
+ * `banto_hub_core::db_source::convert::ColumnKind::classify` の3値
+ * （未対応型は `null`）で、タグ登録 UI が「結果列名」候補の一覧描画・
+ * 未対応列のグレーアウトに使う。
+ */
+export interface DescribeColumn {
+	name: string;
+	pgType: string;
+	supported: boolean;
+	kind?: 'numeric' | 'bool' | 'epoch';
+}
+
+/**
+ * S3: `POST /api/collection-groups/{id}/describe` の応答 - mirrors
+ * `banto_hub_core::db_source::DescribeGroupOutcome`。{@link DbConnectionTestOutcome}
+ * と同じ「`ok: false` も 200 で返る」規約（接続テストと同じ性質の疎通確認）。
+ */
+export interface DescribeGroupOutcome {
+	ok: boolean;
+	columns?: DescribeColumn[];
+	error?: string;
+}
+
+/**
+ * S3: 保存済み postgres グループの `query_sql` を describe する。保存前
+ * （新規作成ウィザード中）のグループには呼べない - 呼び出し側
+ * （タグ登録フォーム）は `group` が非 `null` のときだけ「列を取得」
+ * ボタンを有効にする（`testSavedPlcConnection` と同じ「保存済みのみ」
+ * 制約）。
+ */
+export async function describeCollectionGroup(groupId: number): Promise<DescribeGroupOutcome> {
+	return httpRequest<DescribeGroupOutcome>(`/api/collection-groups/${groupId}/describe`, {
+		method: 'POST'
 	});
 }
 

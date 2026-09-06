@@ -56,6 +56,12 @@
 		TAG_KIND_OPTIONS,
 		CALC_CONNECTION_NAME,
 		MEM_CONNECTION_NAME,
+		DB_TAG_KIND,
+		DB_TAG_ALLOWED_DATA_TYPES,
+		MAX_DB_COLUMN_NAME_LEN,
+		isDbSourceConnection,
+		isValidDbColumnAddress,
+		describeCollectionGroup,
 		type Tag,
 		type TagInput,
 		type TagDataType,
@@ -63,6 +69,7 @@
 		type StringEncoding,
 		type CollectionGroup,
 		type PlcConnection,
+		type DescribeColumn,
 		type BatchTagsResult,
 		type BatchTagsUpdateResult,
 		type BatchTagsDeleteResult,
@@ -335,14 +342,24 @@
 	 * whatever the (hidden) address field still holds from a prior `plc`
 	 * selection, so switching `tagKind` in the form can never leak a stale
 	 * address into a payload the backend would reject.
+	 *
+	 * S3（docs/banto-hub-external-db-design.md §4.1・§4.4）追記: `db` タグは
+	 * `address`（結果列名）を持つ点は `plc` と同じ（PLC アドレスと意味が
+	 * 違うだけ）だが、`expression` は禁止・`writable` は常に false・
+	 * `retain` は無意味という点は `computed`/`internal` と同じ扱いにする
+	 * （`banto_tags::tag::validate_tag_input`の`DB_TAG_KIND`アーム参照 -
+	 * `writable`はエラーにせず黙って false へ正規化されるだけだが、クライ
+	 * アント側でも同じ値を送るほうが確認パネル（`confirmWriteLabel`）の
+	 * 表示と実送信値を一致させられる）。
 	 */
 	function toInput(form: FormState): TagInput {
 		const isPlc = form.tagKind === 'plc';
 		const isComputed = form.tagKind === 'computed';
+		const isDb = form.tagKind === DB_TAG_KIND;
 		return {
 			name: form.name,
 			collectionGroupId: Number(form.collectionGroupId),
-			address: isPlc ? form.address : '',
+			address: isPlc || isDb ? form.address : '',
 			dataType: form.dataType,
 			stringLength: form.dataType === 'string' ? parseOptionalNumber(form.stringLength) : undefined,
 			stringEncoding: form.dataType === 'string' ? form.stringEncoding : undefined,
@@ -357,9 +374,10 @@
 			thresholdL: parseOptionalNumber(form.thresholdL),
 			thresholdLl: parseOptionalNumber(form.thresholdLl),
 			enabled: form.enabled,
-			// computed タグは常に writable=false（値は式が決める、§4.2表）-
-			// フォーム自体もこのチェックボックスを隠すが、送信直前にも強制する。
-			writable: isComputed ? false : form.writable,
+			// computed/db タグは常に writable=false（computed: 値は式が決める、
+			// db: v1 は読み取り専用 §6-10）- フォーム自体もこの2種でチェック
+			// ボックスを隠すが、送信直前にも強制する。
+			writable: isComputed || isDb ? false : form.writable,
 			tagKind: form.tagKind,
 			expression: isComputed ? form.expression : undefined,
 			retain: form.tagKind === 'internal' ? form.retain : false
@@ -490,13 +508,26 @@
 	 * 配下、`internal` は `mem` 接続配下、`plc` はそのどちらでもない接続配下
 	 * のみ（`banto_tags::tag::validate_tag_kind_placement` と同じ規則）。
 	 * サーバー側検証の先取りであって、これ自体が正の唯一の判定源ではない。
+	 *
+	 * S3（docs/banto-hub-external-db-design.md §4.1）追記: `db` は
+	 * `protocol === 'postgres'` 接続配下のみ。`plc` 側も postgres 接続配下を
+	 * 除外するよう修正した - 修正前は「calc/mem 以外の接続配下すべて」を
+	 * `plc` の候補にしていたため、S2 で postgres 接続が使えるようになった
+	 * 時点で postgres 配下のグループが誤って `plc` タグの候補に混ざって
+	 * いた（`db` タグが実在しなかった S1 まではこの区別が要らなかった）。
 	 */
 	function groupsFor(kind: TagKind): CollectionGroup[] {
 		return groups.filter((g) => {
-			const name = connectionName(g.plcConnectionId);
+			const conn = connections.find((c) => c.id === g.plcConnectionId);
+			const name = conn?.name;
 			if (kind === 'computed') return name === CALC_CONNECTION_NAME;
 			if (kind === 'internal') return name === MEM_CONNECTION_NAME;
-			return name !== CALC_CONNECTION_NAME && name !== MEM_CONNECTION_NAME;
+			if (kind === 'db') return conn !== undefined && isDbSourceConnection(conn);
+			return (
+				name !== CALC_CONNECTION_NAME &&
+				name !== MEM_CONNECTION_NAME &&
+				!(conn !== undefined && isDbSourceConnection(conn))
+			);
 		});
 	}
 
@@ -891,6 +922,49 @@
 	let addressPreflightTimer: ReturnType<typeof setTimeout> | undefined;
 
 	/**
+	 * S3（docs/banto-hub-external-db-design.md §7 row S3、実装指示4「列を
+	 * 取得」ボタン）: `db` タグ登録フォームの「結果列名」候補一覧 -
+	 * `POST /api/collection-groups/{id}/describe`（`describeCollectionGroup`）
+	 * の応答をそのまま保持する。`AddressPreflightState` と同じ「create/edit
+	 * それぞれ独立した状態を持つ」構造 - この Drawer は create/edit 両方が
+	 * 同じ `tagFields` snippet を render するため。
+	 */
+	interface DescribeState {
+		loading: boolean;
+		columns: DescribeColumn[] | null;
+		error: string | null;
+	}
+	function blankDescribeState(): DescribeState {
+		return { loading: false, columns: null, error: null };
+	}
+	let createDescribeState: DescribeState = $state(blankDescribeState());
+	let editDescribeState: DescribeState = $state(blankDescribeState());
+
+	/**
+	 * S3: 「列を取得」ボタンの実処理。`groupId` が数値化できない（グループ
+	 * 未選択）間は何もしない - ボタン自体は `disabled` にする想定だが、
+	 * 二重の防御として関数側でも早期 return する。
+	 */
+	async function runDescribeGroup(groupId: string, target: 'create' | 'edit'): Promise<void> {
+		const id = Number(groupId);
+		if (!Number.isFinite(id)) return;
+		if (target === 'create') createDescribeState = { ...createDescribeState, loading: true };
+		else editDescribeState = { ...editDescribeState, loading: true };
+		try {
+			const outcome = await describeCollectionGroup(id);
+			const next: DescribeState = outcome.ok
+				? { loading: false, columns: outcome.columns ?? [], error: null }
+				: { loading: false, columns: null, error: outcome.error ?? '列の取得に失敗しました' };
+			if (target === 'create') createDescribeState = next;
+			else editDescribeState = next;
+		} catch (err) {
+			const next: DescribeState = { loading: false, columns: null, error: errorMessage(err) };
+			if (target === 'create') createDescribeState = next;
+			else editDescribeState = next;
+		}
+	}
+
+	/**
 	 * アドレス欄の `oninput` から呼ぶ。名前・収集グループ・アドレスの
 	 * いずれかが未入力ならまだ有効なプレビュー対象を作れないので、直前の
 	 * 結果を消して何もしない（グループ未選択で protocol が定まらない状態の
@@ -903,7 +977,12 @@
 	function scheduleAddressPreflight(form: FormState, target: 'create' | 'edit'): void {
 		if (addressPreflightTimer !== undefined) clearTimeout(addressPreflightTimer);
 		const ready =
-			form.tagKind === 'plc' &&
+			// S3: `db` タグも結果列名（`address`）を preflight で検証する対象に
+			// 加える - `plc` と同じ dry-run 経路（`createTagsBatch(...,
+			// dryRun=true)`）が `banto_tags` 側の識別子検証・配置規則をそのまま
+			// 先取りしてくれる（`toInput` は既に `db` の `address` をそのまま
+			// 送るよう対応済み）。
+			(form.tagKind === 'plc' || form.tagKind === DB_TAG_KIND) &&
 			form.name.trim() !== '' &&
 			form.collectionGroupId !== '' &&
 			form.address.trim() !== '';
@@ -974,6 +1053,9 @@
 		editErrors = {};
 		editConflict = null;
 		editAddressPreflight = blankAddressPreflight();
+		// S3: 編集対象が変わるたびに「列を取得」の結果もリセットする -
+		// 前に開いていたタグと収集グループが違えば候補列も違うため。
+		editDescribeState = blankDescribeState();
 		drawerMode = 'edit'; // T13-1: 行クリック編集はドロワーで開く
 	}
 
@@ -1551,6 +1633,9 @@
 		createBaseline = { ...next };
 		createErrors = {};
 		createAddressPreflight = blankAddressPreflight();
+		// S3: 前回開いたときの「列を取得」結果を引き継がない - 対象グループが
+		// 変わりうるため。
+		createDescribeState = blankDescribeState();
 		editConflict = null;
 		duplicateSource = null; // T18-3a: 通常の新規作成では複製元差分パネルを出さない
 		createGroupLocked = target !== null;
@@ -1596,6 +1681,11 @@
 		createBaseline = { ...next };
 		createErrors = {};
 		createAddressPreflight = blankAddressPreflight();
+		// S3: 複製元と同じ収集グループを引き継ぐが、db タグの複製は無い
+		// （db タグに「このタグを複製」導線が無い前提 - #264と同じ「無い
+		// はずの経路でも壊れないよう安全側にリセットする」判断）ため、念の
+		// ため空へ戻す。
+		createDescribeState = blankDescribeState();
 		editConflict = null;
 		duplicateSource = t;
 		// 2026-09-01: 複製名（`{元名}_copy` 等）は既に意味のある値が入って
@@ -1993,12 +2083,9 @@
 				openConnectionCreateDrawer();
 				break;
 			case 'createGroup':
-				// S1（docs/banto-hub-external-db-design.md §3 項目13）: 防御的
-				// ガード - 通常はメニュー項目自体が`disabled`でクリック/Enter
-				// を受け付けない（`TreeContextMenu.svelte::activate`側の
-				// ガード）が、万一ここに来ても postgres 接続配下では Drawer
-				// を開かない。
-				if (action.disabled) break;
+				// S3: postgres（DB Source）接続配下でも通常どおり Drawer を開く
+				// - S1 の disabled ガード（`action.disabled`）は撤去済み
+				// （`tagTreeContextMenu.ts`参照）。
 				openGroupCreateDrawer(action.connectionId);
 				break;
 			case 'reconfigureConnection':
@@ -3233,7 +3320,9 @@
 	onAddressInput: () => void,
 	onNameInput: () => void,
 	onWritableInput: () => void,
-	groupLocked: boolean
+	groupLocked: boolean,
+	describeState: DescribeState,
+	onDescribeClick: () => void
 )}
 	<!--
 		TAG-P0-2（docs/banto-hub-desktop-plan.md §9.3、2026-08-10 実装メモ）:
@@ -3267,24 +3356,39 @@
 	<div class="form-grid">
 		<label class="field">
 			タグ種別
-			<select
-				id="tag-kind"
-				bind:value={form.tagKind}
-				disabled={groupLocked}
-				aria-invalid={errors.tagKind ? 'true' : undefined}
-				aria-describedby={describedBy(errors.tagKind && 'tag-kind-err')}
-				onchange={() => {
-					// タグ種別を切り替えたら、もう選択できないグループ ID は
-					// クリアする（`groupsFor` の絞り込みと矛盾する選択を残さない）。
-					if (!groupsFor(form.tagKind).some((g) => String(g.id) === form.collectionGroupId)) {
-						form.collectionGroupId = '';
-					}
-				}}
-			>
-				{#each TAG_KIND_OPTIONS as opt (opt.value)}
-					<option value={opt.value}>{opt.label}</option>
-				{/each}
-			</select>
+			{#if form.tagKind === DB_TAG_KIND}
+				<!--
+					S3（docs/banto-hub-external-db-design.md §7 row S3、実装指示4
+					「tagKind は固定表示（バッジ）にし、select にはしない」）: db
+					タグは postgres 配下のグループを選んだ時点で
+					`resolveRegistrationTarget`（`tagOnboarding.ts`）が種別を確定
+					させる - ユーザーが手で選ぶものではないため、他のタグ種別と
+					違い `<select>` ではなく読み取り専用のバッジで表示する
+					（`TAG_KIND_OPTIONS` にも `db` を加えない）。
+				-->
+				<span class="db-tag-kind-badge" id="tag-kind" data-testid="tag-kind-db-badge">
+					db（DB Source）
+				</span>
+			{:else}
+				<select
+					id="tag-kind"
+					bind:value={form.tagKind}
+					disabled={groupLocked}
+					aria-invalid={errors.tagKind ? 'true' : undefined}
+					aria-describedby={describedBy(errors.tagKind && 'tag-kind-err')}
+					onchange={() => {
+						// タグ種別を切り替えたら、もう選択できないグループ ID は
+						// クリアする（`groupsFor` の絞り込みと矛盾する選択を残さない）。
+						if (!groupsFor(form.tagKind).some((g) => String(g.id) === form.collectionGroupId)) {
+							form.collectionGroupId = '';
+						}
+					}}
+				>
+					{#each TAG_KIND_OPTIONS as opt (opt.value)}
+						<option value={opt.value}>{opt.label}</option>
+					{/each}
+				</select>
+			{/if}
 			{#if errors.tagKind}<span class="err" id="tag-kind-err">{errors.tagKind}</span>{/if}
 		</label>
 		<label class="field">
@@ -3313,6 +3417,12 @@
 				<span class="hint" id="tag-group-hint"
 					>{MEM_CONNECTION_NAME} 接続配下のグループのみ選択できます。</span
 				>
+			{:else if form.tagKind === DB_TAG_KIND}
+				<!--
+					S3: db タグは postgres（DB Source）接続配下のグループのみ
+					選択できる（`groupsFor('db')`参照）。
+				-->
+				<span class="hint" id="tag-group-hint">postgres 接続配下のグループのみ選択できます。</span>
 			{:else if form.tagKind === 'plc' && form.collectionGroupId !== ''}
 				<!--
 					T18-2a（TAG-UX-B 拡張）: plc タグは収集グループから接続が
@@ -3427,6 +3537,116 @@
 				{#if errors.address}<span class="err" id="tag-address-err">{errors.address}</span>{/if}
 			</div>
 		{/if}
+		{#if form.tagKind === DB_TAG_KIND}
+			<!--
+				S3（docs/banto-hub-external-db-design.md §7 row S3、実装指示4）:
+				db タグの `address` は PLC アドレスではなく**結果列名**
+				（グループの `query_sql` が返す列のうちの1つ）。「列を取得」
+				ボタンで `describeCollectionGroup`（`POST
+				/api/collection-groups/{id}/describe`）を呼び、対応列（v1は
+				数値・bool・日時のみ）を候補として提示する - 未対応列（例
+				`text`）はクリックできないグレーアウト表示にし、なぜ選べないか
+				（pgType と「未対応（v1 は数値・bool・日時のみ）」）をその場に
+				出す。手入力も引き続き可能（`isValidDbColumnAddress` による
+				クライアント側の事前検証のみ - 実列名との一致は保存時の
+				サーバー検証・preflight に委ねる）。
+			-->
+			{@const trimmedAddress = form.address.trim()}
+			{@const addressFormatInvalid =
+				trimmedAddress !== '' && !isValidDbColumnAddress(trimmedAddress)}
+			{@const preflightFieldErrors = addressPreflight.result
+				? fieldErrorsFromList(addressPreflight.result.errors[0]?.fieldErrors ?? [])
+				: {}}
+			{@const preflightMessage = addressPreflight.checking
+				? '確認中…'
+				: addressPreflight.result?.ok
+					? '検証OK'
+					: (preflightFieldErrors.address ?? null)}
+			<div class="field">
+				<label for="tag-address">結果列名<span class="required">*</span></label>
+				<input
+					id="tag-address"
+					type="text"
+					bind:value={form.address}
+					oninput={onAddressInput}
+					required
+					placeholder="temperature"
+					aria-invalid={errors.address || addressFormatInvalid ? 'true' : undefined}
+					aria-describedby={describedBy(
+						'tag-address-db-hint',
+						addressFormatInvalid && 'tag-address-db-format-err',
+						preflightMessage !== null && 'tag-address-preflight',
+						errors.address && 'tag-address-err'
+					)}
+				/>
+				<span class="hint" id="tag-address-db-hint">
+					グループの SQL
+					が返す列名をそのまま入力してください（大文字小文字はそのまま区別されます）。
+				</span>
+				{#if addressFormatInvalid}
+					<span class="err" id="tag-address-db-format-err">
+						結果列名は英字またはアンダースコアで始まる英数字/アンダースコア（{MAX_DB_COLUMN_NAME_LEN}文字以内）で指定してください。
+					</span>
+				{/if}
+				{#if preflightMessage !== null}
+					<span
+						class="hint address-preflight"
+						class:address-preflight-checking={addressPreflight.checking}
+						class:address-preflight-ok={addressPreflight.result?.ok === true}
+						class:address-preflight-error={addressPreflight.result?.ok === false}
+						id="tag-address-preflight"
+						aria-live="polite">{preflightMessage}</span
+					>
+				{/if}
+				{#if errors.address}<span class="err" id="tag-address-err">{errors.address}</span>{/if}
+				<div class="db-column-candidates">
+					<button
+						type="button"
+						class="secondary"
+						disabled={form.collectionGroupId === '' || describeState.loading}
+						onclick={onDescribeClick}
+					>
+						列を取得
+					</button>
+					{#if describeState.loading}
+						<span class="hint">取得中…</span>
+					{:else if describeState.error !== null}
+						<span class="err">{describeState.error}</span>
+					{:else if describeState.columns !== null}
+						{#if describeState.columns.length === 0}
+							<span class="hint">列がありません（SQL の結果が0列です）。</span>
+						{:else}
+							<ul class="db-column-list" aria-label="結果列名の候補">
+								{#each describeState.columns as col (col.name)}
+									<li>
+										{#if col.supported}
+											<button
+												type="button"
+												class="db-column-candidate"
+												data-testid={`db-column-candidate-${col.name}`}
+												onclick={() => {
+													form.address = col.name;
+													onAddressInput();
+												}}
+											>
+												{col.name}（{col.pgType}）
+											</button>
+										{:else}
+											<span
+												class="db-column-candidate db-column-candidate-unsupported"
+												data-testid={`db-column-candidate-${col.name}`}
+											>
+												{col.name}（{col.pgType}） - 未対応（v1 は数値・bool・日時のみ）
+											</span>
+										{/if}
+									</li>
+								{/each}
+							</ul>
+						{/if}
+					{/if}
+				</div>
+			</div>
+		{/if}
 		{#if form.tagKind === 'computed'}
 			<label class="field wide">
 				式（expression）<span class="required">*</span>
@@ -3457,7 +3677,14 @@
 				aria-invalid={errors.dataType ? 'true' : undefined}
 				aria-describedby={describedBy(errors.dataType && 'tag-data-type-err')}
 			>
-				{#each dataTypeOptions as opt (opt.value)}
+				<!--
+					S3（docs/banto-hub-external-db-design.md §4.4・§6-5「v1 は
+					数値・bool・timestamp のみ」）: db タグは `string` 型を
+					選べない - `DB_TAG_ALLOWED_DATA_TYPES`（`dataTypeOptions`
+					から`string`を除いたもの、サーバー側`validate_tag_input`の
+					`DB_TAG_KIND`アームと同じ除外規則）で選択肢自体を絞る。
+				-->
+				{#each dataTypeOptions.filter((opt) => form.tagKind !== DB_TAG_KIND || DB_TAG_ALLOWED_DATA_TYPES.includes(opt.value)) as opt (opt.value)}
 					<option value={opt.value}>{opt.label}</option>
 				{/each}
 			</select>
@@ -3658,8 +3885,15 @@
 			</label>
 		</div>
 	</details>
-	{#if form.tagKind !== 'computed'}
+	{#if form.tagKind !== 'computed' && form.tagKind !== DB_TAG_KIND}
 		<!--
+			S3（docs/banto-hub-external-db-design.md §6-10「v1 は読み取り
+			専用」、実装指示4「writable は隠す」）: db タグも computed と
+			同じく「書き込み安全設定」セクション自体を非表示にする -
+			`writableDefaultBlockedReason('db')`が理由文言を持つのは
+			`toInput`/確認パネル側の一貫性のためであり、このセクションは
+			そもそも出ない。
+
 			T19 S1-b（UX-34）: `writableDefaultBlockedReason` の第2引数
 			（アドレス領域がサーバー的に書き込み可能かどうか）は
 			2026-09-02 オーナー判断（S1-b0 分離）によりここでは意図的に
@@ -4647,12 +4881,10 @@
 		items={treeContextMenu.items.map((action) => ({
 			id: action.kind,
 			label: action.label,
-			// S1（docs/banto-hub-external-db-design.md §3 項目13）: postgres
-			// 接続配下の`createGroup`だけが`disabled`/`disabledReason`を
-			// 持ちうる（`tagTreeContextMenu.ts`参照）- 他 kind は常に
-			// `undefined`なので`TreeContextMenu`側は常時有効のまま。
-			disabled: 'disabled' in action ? action.disabled : undefined,
-			title: 'disabledReason' in action ? action.disabledReason : undefined,
+			// S3: `TreeContextMenuItemAction` に `disabled`/`disabledReason` を
+			// 持つ variant は無くなった（S1 の postgres グループ作成禁止ガードは
+			// 撤去済み - `tagTreeContextMenu.ts` 参照）ため、メニュー項目は
+			// 常時有効のまま。
 			onSelect: () => activateTreeContextMenuAction(action)
 		}))}
 		onClose={closeTreeContextMenu}
@@ -4793,7 +5025,9 @@
 					createWritableTouched = true;
 				},
 				// T19 S1-c（UX-33）: `createGroupLocked` 宣言のコメント参照。
-				createGroupLocked
+				createGroupLocked,
+				createDescribeState,
+				() => void runDescribeGroup(createForm.collectionGroupId, 'create')
 			)}
 			<div class="actions">
 				<!--
@@ -4918,7 +5152,9 @@
 				// T19 S1-c（UX-33）: 編集フォームはグループ確定の対象外
 				// （`createGroupLocked` 宣言のコメント参照 - ロックは create
 				// Drawer 限定）。
-				false
+				false,
+				editDescribeState,
+				() => void runDescribeGroup(editForm.collectionGroupId, 'edit')
 			)}
 			<div class="actions">
 				<button type="submit" disabled={isDrawerBusy()}>保存</button>
@@ -5908,6 +6144,66 @@
 		color: var(--banto-primary);
 		background: color-mix(in srgb, var(--banto-primary) 14%, transparent);
 		vertical-align: middle;
+	}
+
+	/*
+	 * S3（docs/banto-hub-external-db-design.md §7 row S3）: db タグ種別の
+	 * 読み取り専用バッジ（`<select>` の代わり）。`.detail-value-badge` と
+	 * 同じ「primary 系の丸バッジ」の見た目を流用する。
+	 */
+	.db-tag-kind-badge {
+		display: inline-block;
+		padding: 0.3rem 0.6rem;
+		border-radius: var(--banto-radius);
+		font-size: 0.85rem;
+		font-weight: 600;
+		color: var(--banto-primary);
+		background: color-mix(in srgb, var(--banto-primary) 14%, transparent);
+		width: fit-content;
+	}
+
+	/* S3: 「列を取得」で提示する結果列名候補。 */
+	.db-column-candidates {
+		margin-top: 0.4rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.3rem;
+	}
+
+	.db-column-list {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.35rem;
+	}
+
+	.db-column-candidate {
+		font-size: 0.75rem;
+		padding: 0.2rem 0.5rem;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+		background: var(--banto-bg);
+		color: var(--banto-text);
+	}
+
+	button.db-column-candidate {
+		cursor: pointer;
+	}
+
+	button.db-column-candidate:hover {
+		background: color-mix(in srgb, var(--banto-primary) 8%, transparent);
+	}
+
+	/*
+	 * 未対応列（v1 が扱えない pgType）はグレーアウトし、クリックできない
+	 * ことを見た目でも示す（実装指示4「unsupported columns shown greyed」）。
+	 */
+	.db-column-candidate-unsupported {
+		color: var(--banto-text-muted);
+		background: transparent;
+		font-style: italic;
 	}
 
 	/* T18-2a（TAG-UX-B「書き込み許可…ON 時に安全上の影響を説明する」）。 */

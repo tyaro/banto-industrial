@@ -47,6 +47,7 @@ function group(overrides: Partial<CollectionGroup> = {}): CollectionGroup {
 		periodMs: 1000,
 		enabled: true,
 		defaultWritable: true,
+		querySql: null,
 		...overrides
 	};
 }
@@ -173,11 +174,16 @@ describe('resolveRegistrationTarget', () => {
 	// T19 S1-c（UX-33）: `resolveGroupIdFromTreeSelection` と違い、virtual
 	// （calc/mem）配下のグループも登録対象として扱う - 右クリック「グループ
 	// 配下にタグを作成」（tagTreeContextMenu.ts）と同じ権限に揃えるため。
-	const connections = [connection({ id: 1 }), CALC, MEM];
+	// S3（docs/banto-hub-external-db-design.md §7 row S3）: postgres（DB
+	// Source）接続配下のグループも登録対象として扱う - tagKind は 'db' に
+	// 確定し、連続登録は使えない（`db` は PLC アドレスの算術を持たない）。
+	const PG = connection({ id: 5, name: 'pg-a', protocol: 'postgres' });
+	const connections = [connection({ id: 1 }), CALC, MEM, PG];
 	const plcGroup = group({ id: 10, name: 'plc-group', plcConnectionId: 1 });
 	const calcGroup = group({ id: 20, name: 'calc-group', plcConnectionId: CALC.id });
 	const memGroup = group({ id: 30, name: 'mem-group', plcConnectionId: MEM.id });
-	const groups = [plcGroup, calcGroup, memGroup];
+	const dbGroup = group({ id: 40, name: 'pg-group', plcConnectionId: PG.id });
+	const groups = [plcGroup, calcGroup, memGroup, dbGroup];
 
 	it('"all" 選択は null（登録操作を提示しない）', () => {
 		expect(resolveRegistrationTarget({ type: 'all' }, groups, connections)).toBeNull();
@@ -219,6 +225,16 @@ describe('resolveRegistrationTarget', () => {
 			groupId: 30,
 			groupName: 'mem-group',
 			tagKind: 'internal',
+			supportsContinuous: false
+		});
+	});
+
+	it('S3: postgres（DB Source）配下のグループ選択: tagKind=db・連続登録は使えない', () => {
+		const target = resolveRegistrationTarget({ type: 'group', id: 40 }, groups, connections);
+		expect(target).toEqual({
+			groupId: 40,
+			groupName: 'pg-group',
+			tagKind: 'db',
 			supportsContinuous: false
 		});
 	});

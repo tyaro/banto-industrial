@@ -179,6 +179,14 @@ describe('writePermissionLabel', () => {
 	it('internal かつ writable=false は不許可', () => {
 		expect(writePermissionLabel('internal', false)).toBe('不許可');
 	});
+
+	it('S3: db は writable=true でも常に不許可（読み取り専用）', () => {
+		expect(writePermissionLabel('db', true)).toBe('不許可（db タグは読み取り専用）');
+	});
+
+	it('S3: db は writable=false でも不許可（読み取り専用）', () => {
+		expect(writePermissionLabel('db', false)).toBe('不許可（db タグは読み取り専用）');
+	});
 });
 
 describe('fieldErrorsFromList', () => {

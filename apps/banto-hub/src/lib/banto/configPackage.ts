@@ -296,7 +296,14 @@ function sanitizeGroup(
 		plcConnectionName: connectionName,
 		periodMs: input.periodMs,
 		enabled: input.enabled,
-		defaultWritable: input.defaultWritable
+		defaultWritable: input.defaultWritable,
+		// S3（docs/banto-hub-external-db-design.md §4.1・§4.2）: `database`/
+		// `username`（S1）と同じ「postgres 以外では常に null → undefined」
+		// の変換（`CollectionGroupInput::querySql`は`string | undefined`）。
+		// `querySql`自体はパスワードのような秘密情報ではないため
+		// `CONFIG_PACKAGE_EXCLUDED_SECRETS`の対象にしない - そのまま export
+		// する。
+		querySql: input.querySql ?? undefined
 	};
 }
 
@@ -461,7 +468,16 @@ function parseCollectionGroups(raw: unknown): ConfigPackageCollectionGroup[] {
 			defaultWritable: expectDefaultWritable(
 				item.defaultWritable,
 				`collectionGroups[${index}].defaultWritable`
-			)
+			),
+			// S3: `querySql`は既存のエクスポート済み構成パッケージ（この項目を
+			// 持たない旧スキーマ、または postgres 以外の接続配下のグループ）
+			// にはまだ存在しない可能性があるので、`database`/`username`
+			// （S1、`expectOptionalString`）と同じ理由で省略を許容する -
+			// 省略/`null`時は`undefined`にフォールバックする（postgres 配下
+			// での必須チェックはここでは行わない - `expectOptionalString`の
+			// doc comment と同じ方針、実際の作成/更新時のサーバー側
+			// バリデーションに委ねる）。
+			querySql: expectOptionalString(item.querySql, `collectionGroups[${index}].querySql`)
 		};
 	});
 }
