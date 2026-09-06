@@ -180,12 +180,8 @@ impl Simulator {
         );
         let mut padded = bytes.into_owned();
         padded.resize(capacity, 0x00);
-        for (i, chunk) in padded.chunks_exact(2).enumerate() {
-            self.set_word(
-                device,
-                start + i as u32,
-                u16::from_le_bytes([chunk[0], chunk[1]]),
-            );
+        for (i, chunk) in padded.as_chunks::<2>().0.iter().enumerate() {
+            self.set_word(device, start + i as u32, u16::from_le_bytes(*chunk));
         }
     }
 

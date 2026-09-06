@@ -924,8 +924,10 @@ async fn read_batch_mixed_decodes_utf8_when_requested() {
     let mut bytes = text.as_bytes().to_vec();
     bytes.resize(words as usize * 2, 0x00);
     let regs: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     sim.set_words(SlmpDevice::D, 0, &regs);
 
@@ -964,8 +966,10 @@ async fn the_same_utf8_wire_bytes_do_not_decode_correctly_as_shift_jis() {
     let mut bytes = text.as_bytes().to_vec();
     bytes.resize(words as usize * 2, 0x00);
     let regs: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     sim.set_words(SlmpDevice::D, 0, &regs);
 
@@ -1012,8 +1016,10 @@ async fn a_mixed_batch_decodes_each_string_request_independently() {
     let mut utf8_bytes = text.as_bytes().to_vec();
     utf8_bytes.resize(10, 0x00); // 5 words.
     let utf8_regs: Vec<u16> = utf8_bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     sim.set_words(SlmpDevice::D, 100, &utf8_regs);
 

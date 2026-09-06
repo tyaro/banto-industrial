@@ -208,6 +208,7 @@ tokio-stream = "0.1"
 # 既定で付いてくる `disk`/`network`/`component`/`user` feature（ディスク・
 # NIC・温度センサー・ユーザー一覧の取得）は使わないため、依存木を無駄に
 # 太らせない。`apps/banto-hub/core` のみが使う（`system_info.rs`）。0.39系は
-# rustc 1.95 を要求しこのワークスペースのツールチェイン(1.94.1)と噛み合わ
-# ないため、rustc 1.88 で足りる 0.38 系に固定する。
+# rustc 1.95 を要求していたが、2026-09-06 にワークスペースのツールチェイン
+# を 1.98.1 へ引き上げたためこの制約は解消した。0.39 系への移行自体は
+# dependabot PR #283 で別途行う。
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }

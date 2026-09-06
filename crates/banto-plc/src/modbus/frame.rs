@@ -295,8 +295,10 @@ pub(crate) fn parse_response_pdu(
                 )));
             }
             let regs = data
-                .chunks_exact(2)
-                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_be_bytes(*c))
                 .collect();
             Ok(ParsedResponse::Registers(regs))
         }
