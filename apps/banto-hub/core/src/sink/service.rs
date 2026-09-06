@@ -1,10 +1,10 @@
 //! `hub_sink_groups`/`hub_sink_group_tags` の CRUD（`crate::sink`のモジュール
 //! doc comment参照）。`banto_tags`の各サービス（`PlcConnectionService`等）と
-//! 同じ形（`pool`を1個持つ`Clone`可能なサービス構造体、`create`/`update`は
-//! 自前で`self.pool.begin()`する）だが、この2テーブルは Hub 専用（レジストリ
-//! 側 `banto_tags` の管轄外）なので `apps/banto-hub/core`側に置く - 他の
-//! Hub 専用テーブルのサービス（`crate::write_audit`・`crate::pending_changes`）
-//! と同じ配置。
+//! 同じ形（`pool`を1個持つ`Clone`可能なサービス構造体）だが、`create`/
+//! `update`/`delete` は下記「**`BEGIN IMMEDIATE`**」の説明通りトランザクション
+//! を開始する。また、この2テーブルは Hub 専用（レジストリ側 `banto_tags` の
+//! 管轄外）なので `apps/banto-hub/core`側に置く - 他の Hub 専用テーブルのサービス
+//! （`crate::write_audit`・`crate::pending_changes`）と同じ配置。
 //!
 //! **`BEGIN IMMEDIATE`（2026-09-07 追記、CI flake 修正）**: `create`/
 //! `update`/`delete` は`self.pool.begin_with("BEGIN IMMEDIATE")`で
