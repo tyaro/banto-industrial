@@ -1,7 +1,7 @@
 # banto-hub 外部 DB 連携 設計: DB Source（#228）と DB Sink（#229）
 
 作成日: 2026-09-06
-状態: **オーナー決定済み（2026-09-06、§6 の 15 項目）・S0 完了（§3.1、同日）・S1a（DB 接続エンティティの Rust 側）実装中**。Sink は Hub 内モジュールではなく**別プロセスのサイドカー**とする（§5.1、2026-09-06 決定）。コード調査（§3）は 2026-09-06 の main（`9c26b3a`、toolchain 1.98.1）に対して実施済み。
+状態: **オーナー決定済み（2026-09-06、§6 の 17 項目）・S0 完了（§3.1）・S1 完了（#299 / #300）・S2 は PR #301 レビュー対応中・S2b（収集 Running との連動 + task supervisor、§4.8）を同日決定**。Sink は Hub 内モジュールではなく**別プロセスのサイドカー**とする（§5.1、2026-09-06 決定）。コード調査（§3）は 2026-09-06 の main（`9c26b3a`、toolchain 1.98.1）に対して実施済み。
 対象: Issue [#228](https://github.com/tyaro/banto-industrial/issues/228)（外部 RDB の値をタグ空間へ取り込む Source）と [#229](https://github.com/tyaro/banto-industrial/issues/229)（タグ値を外部 RDB へ保存する Sink / Logger）。**2 件はペアで 1 設計**とし、DB 接続エンティティを共有する。
 
 関連: [tag-server-design.md](tag-server-design.md)（タグ空間・書き込み安全の一次ソース。§2 非スコープの「ロガー作らない」決定を本書 §2.1 で扱う）、[banto-hub-t20-design.md](banto-hub-t20-design.md)（値表現と read-on-demand の先例）、[banto-hub-t21-design.md](banto-hub-t21-design.md)（構成操作の MCP と監査の型）、[plan.md](plan.md) §1（「外部時系列DB読み出し・保存」は 3〜4 案件で再利用される共通資産）。
@@ -137,6 +137,14 @@ Hub には暗号化保管や OS keyring の機構が存在しない。MQTT の�
 
 REST / WS / MQTT / gRPC からは PLC タグと区別しない（受け入れ条件「Source 差異を外部 API に漏らさない」）。`value_source` の表示ラベル（`real` / `simulation` / `internal`）に `db` を足すかは §6-11。
 
+### 4.8 収集 Running との連動と task の監督（2026-09-06 オーナー決定、S2b）
+
+S2 の初版（PR #301）は演算タグと同じく **Hub 起動中は常時ポーリング**し、収集の「開始 / 停止」とは連動していなかった。運用者の期待は「収集停止 = 外部通信をすべて止める」であるため、次を決定した。
+
+- **DB Source は収集が Running のときだけ動く。** 「収集開始」で PLC 収集と DB Source の task が起動し、「収集停止」で両方止まる。停止中は DB へ接続せず、`db` タグは Bad（`effective_sample` の既存規則で表示）。
+- **片方が落ちても Running 状態は変わらない。** PLC 接続は broker の世代管理で、DB 接続は接続ごとの task が独立に再接続（1s → 30s バックオフ）する。DB 停止で PLC 収集は影響を受けず、DB 復帰で自動的に Good へ戻る。再開のために両方を止めて起動し直す必要はない。人が関わるのは設定変更が要る場合（パスワード変更など）だけで、稼働中なら pending queue → apply でその接続の task だけが再起動する。
+- **task の異常終了は supervisor が再生成する。** S2 初版では DB task が panic するとその接続は次の設定変更まで停止したままになる。PLC 側の broker と同様に、`JoinHandle` の異常終了（panic）を検知してバックオフ付きで再 spawn し、状態 API に `restarts` 回数と最後の理由を出す。abort による正常停止（停止・plan 差し替え）は再生成しない。
+
 ## 5. DB Sink（#229）の設計（2026-09-06 決定: サイドカー方式）
 
 ### 5.1 位置づけとプロセス配置
@@ -202,7 +210,7 @@ ts (timestamptz) | tag_id (bigint) | external_name (text) | value (double precis
 
 ## 6. オーナー決定項目（2026-09-06 決定済み）
 
-2026-09-06 に本節の 1〜13 は推奨どおり、14〜15 は同日のオーナー議論（サービス分割と統合監視）を受けて決定した。
+2026-09-06 に本節の 1〜13 は推奨どおり、14〜15 は同日のオーナー議論（サービス分割と統合監視）を受けて、16〜17 は S2 初版のレビュー議論（収集停止と片系障害の挙動）を受けて決定した。
 
 | #   | 項目                                                     | 決定（2026-09-06）                                                                                       | 影響                                                            |
 | --- | -------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------- |
@@ -221,6 +229,8 @@ ts (timestamptz) | tag_id (bigint) | external_name (text) | value (double precis
 | 13  | Sink 設定変更の pending queue                            | **載せない**（収集に影響しないため即時適用）                                                             |                                                                 |
 | 14  | Sink のプロセス配置（§5.1）                              | **別プロセスのサイドカー**。設定・UI・監視は Hub、エンジンは `banto-hub-sink`。MQTT / gRPC は当面 Hub 内 | SDK の本番利用。MSI に 2 つ目のサービス                         |
 | 15  | サイドカーへの設定配布と監視（§5.2）                     | **admin スコープの専用 API キー + ループバック**で `GET /api/sink/config` / `PUT /api/sink/status`       | パスワードが平文で流れるためループバック運用を docs / UI に明記 |
+| 16  | DB Source と収集 Running の連動（§4.8）                  | **連動する**。収集開始で起動・停止で停止。停止中は DB へ接続せず `db` タグは Bad                         | S2b で実装。片系障害では Running は変わらず自動復帰             |
+| 17  | DB task の異常終了（§4.8）                               | **supervisor でバックオフ付き再生成**。状態 API に `restarts` と最後の理由を出す                         | S2b で実装。abort による正常停止は再生成しない                  |
 
 ## 7. スライス構成
 
@@ -229,13 +239,14 @@ ts (timestamptz) | tag_id (bigint) | external_name (text) | value (double precis
 | S0    | 依存の実測: sqlx `postgres` + TLS feature の依存増分・license（cargo-deny）・配布バイナリ増分。`tiberius` の同上（第 2 段の判断材料）                               | 実測値を本書 §3 末尾に追記。cargo-deny 緑                                                                   |
 | S1    | DB 接続エンティティ（Hub）: protocol `postgres` のマイグレーション（再構築）、`PlcConnection` の追加項目、接続テスト API、config パッケージ往復と除外、MCP の受け口 | 既存 PLC 接続の CRUD・CSV・E2E に回帰なし。接続テストが `SELECT 1` と列一覧を返す                           |
 | S2    | Source 本体（Hub）: `query_sql` 列、`db` tag_kind と配置制約、ポーリング task、Quality 変換、バックオフ、`commit_catalog` 連動                                      | ローカル PostgreSQL（Docker）に対する統合テスト: 正常・NULL・0 行・クエリエラー・接続断からの復帰           |
+| S2b   | 収集 Running との連動と task supervisor（§4.8、2026-09-06 決定）: 収集開始/停止で DB task を起動/停止、panic 時のバックオフ付き再 spawn、状態 API の `restarts`     | 統合テスト: 停止中は接続しない・開始で復帰・task panic 注入で再生成される                                   |
 | S3    | Source の UI / CSV / MCP: Drawer の DB フィールド、列名候補の提示、`db` タグの登録 UI、E2E                                                                          | 手動 smoke 手順を docs に追加                                                                               |
 | S4    | Sink の Hub 側: `logger_groups` テーブルと CRUD（REST / MCP）、`GET /api/sink/config`、`PUT /api/sink/status`、状態 API の sink 節、config パッケージ往復           | CRUD の REST / MCP テスト。config が admin 以外で 403                                                       |
 | S5    | サイドカー本体 `apps/banto-hub-sink`: SDK 購読、long INSERT、bounded queue、バックオフ、テーブル検査、status push、exe 隣 toml、SCM サービス化と MSI 登録           | 統合テスト: interval / on_change・DB 停止中のキュー上限・復帰後の flush・停止時の flush・Hub 再起動への追従 |
 | S6    | UI: logger group 画面、推奨 DDL 表示、状態画面の sink 節、デスクトップシェルのサービス一覧（Hub / sink の SCM 状態と起動停止）                                      | E2E と Windows 実機での手動確認                                                                             |
 | S7    | 実 DB 検証: 顧客相当の PostgreSQL（別マシン・LAN 越し）で Source / Sink を 24 h 連続動作。切断・再接続・DB 再起動・sink 単独の停止と再起動                          | 結果を real-machine 系 docs に記録                                                                          |
 
-S0 / S1 / S4 は実機不要。S2 / S5 の統合テストは CI で PostgreSQL のサービスコンテナを使う（GitHub Actions の `services:`）。S6 のシェル部分は Windows 実機が要る。着手順は S0 → S1 → S2 → S4 → S5 → S3 → S6 → S7（Source の UI より先に Sink の骨格を通し、SDK の本番利用を早く始める）。
+S0 / S1 / S4 は実機不要。S2 / S5 の統合テストは CI で PostgreSQL のサービスコンテナを使う（GitHub Actions の `services:`）。S6 のシェル部分は Windows 実機が要る。着手順は S0 → S1 → S2 → S2b → S4 → S5 → S3 → S6 → S7（Source の UI より先に Sink の骨格を通し、SDK の本番利用を早く始める）。
 
 ## 8. 更新対象ドキュメント
 
