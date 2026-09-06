@@ -54,7 +54,7 @@ use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use banto_broker::{is_supported_protocol, BrokerConnectionStatus, BrokerError};
 use banto_collect::{
@@ -96,6 +96,10 @@ use crate::hub::{CollectorManager, SimulationCoverageReport, TagEntry, TagMap};
 use crate::mqtt::MqttPublisher;
 use crate::pending_changes::{PendingChange, PendingChangesService};
 use crate::settings::{AuditSettings, MqttSettings, SettingsService, StoreSettings};
+use crate::sink::{
+    reject_delete_if_referenced_by_sink_group, remove_tag_from_all_sink_groups, SinkGroup,
+    SinkGroupInput, SinkGroupService, SinkGroupStatusPush, SinkStatusSnapshot, SinkStatusStore,
+};
 use crate::system_info::{SystemInfoSampler, SystemInfoSnapshot};
 use crate::test_output::TestOutputControl;
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
@@ -3293,6 +3297,16 @@ async fn plc_connections_delete(
         .begin()
         .await
         .map_err(storage_api_error)?;
+    // 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2、
+    // `crate::sink`のモジュール doc comment「FK を張らない理由」参照）:
+    // この接続を参照する sink group が1件でもあれば削除を拒否する
+    // （RESTRICT 相当）。`banto_tags`はこの接続の下にある Hub 専用
+    // テーブルを知らないため、`cascade_delete_tx`を呼ぶ**前**にここで
+    // チェックする。
+    if let Err(err) = reject_delete_if_referenced_by_sink_group(&mut tx, id).await {
+        let _ = tx.rollback().await;
+        return Err(ApiError(err).into());
+    }
     // T19 S2-b（UX-38、docs/banto-hub-t19-design.md §3.4・§7.5、2026-09-02
     // オーナー決定）: 「タグがあってもグループ・接続を削除可。定義のみ削除
     // し、履歴は残す」- `delete_tx`（子が居れば拒否）ではなく
@@ -4418,6 +4432,13 @@ async fn tags_delete(
         let _ = tx.rollback().await;
         return Err(ApiError(err).into());
     }
+    // 外部 DB 連携 S4（`crate::sink`のモジュール doc comment「FK を張らない
+    // 理由」参照）: `hub_sink_group_tags`は`tags(id)`へ FK を張っていない
+    // ため、単体タグ削除の経路では能動的にメンバーシップ行を消す。
+    if let Err(err) = remove_tag_from_all_sink_groups(&mut tx, id).await {
+        let _ = tx.rollback().await;
+        return Err(ApiError(err).into());
+    }
     let snapshot = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
@@ -4737,6 +4758,13 @@ async fn execute_pending_apply(
                 )
                 .await?;
             }
+            // 外部 DB 連携 S4: `plc_connections_delete`（即時削除の REST
+            // ハンドラ）と同じ理由 - `cascade_delete_tx`の前に sink group
+            // からの参照を拒否する。
+            reject_delete_if_referenced_by_sink_group(&mut tx, body.id)
+                .await
+                .map_err(ApiError)
+                .map_err(PendingApplyError::Api)?;
             // T19 S2-b（UX-38）: `plc_connections_delete`（即時削除の REST
             // ハンドラ）と同じく `cascade_delete_tx` を使う - 収集稼働中に
             // キューされ、後で（停止後に）適用される削除も同じ「子ごと削除」
@@ -4834,6 +4862,12 @@ async fn execute_pending_apply(
             state
                 .tags
                 .delete_tx(&mut tx, body.id)
+                .await
+                .map_err(ApiError)
+                .map_err(PendingApplyError::Api)?;
+            // 外部 DB 連携 S4: `tags_delete`（即時削除の REST ハンドラ）と
+            // 同じ理由でメンバーシップ行を能動的に消す。
+            remove_tag_from_all_sink_groups(&mut tx, body.id)
                 .await
                 .map_err(ApiError)
                 .map_err(PendingApplyError::Api)?;
@@ -4937,6 +4971,13 @@ async fn execute_pending_apply(
                 return Err(PendingApplyError::Api(ApiError(BantoError::Validation {
                     field_errors,
                 })));
+            }
+            // 外部 DB 連携 S4: 即時削除（`tags_batch_delete`）と同じ理由。
+            for id in &body.ids {
+                remove_tag_from_all_sink_groups(&mut tx, *id)
+                    .await
+                    .map_err(ApiError)
+                    .map_err(PendingApplyError::Api)?;
             }
             "tags"
         }
@@ -5678,6 +5719,14 @@ async fn tags_batch_delete(
             .into_response())
         }
         BatchTagDeleteOutcome::Valid { count } => {
+            // 外部 DB 連携 S4: `tags_delete`と同じ理由 - all-or-nothing で
+            // 消えた`ids`全件について、対応するメンバーシップ行も消す。
+            for id in &ids {
+                if let Err(err) = remove_tag_from_all_sink_groups(&mut tx, *id).await {
+                    let _ = tx.rollback().await;
+                    return Err(ApiError(err).into());
+                }
+            }
             let snapshot = match preflight_transaction(&mut tx).await {
                 Ok(snapshot) => snapshot,
                 Err(err) => {
@@ -5821,6 +5870,508 @@ fn tag_registry_router(
         ))
 }
 
+// --- 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2・§6-13）:
+// `hub_sink_groups` の CRUD ---------------------------------------------------
+//
+// `plc_connections`/`collection_groups`/`tags`（[`tag_registry_router`]）と
+// 同じ認可（`require_editor`書き込み・viewer 読み取り）だが、**pending queue
+// には載らない**（§6-13「収集に影響しないため即時適用」・`crate::sink`の
+// モジュール doc comment参照）: sink group は PLC 収集パイプラインに一切
+// 関わらないので、`queue_pending_registry_change`分岐を持たない。カタログの
+// 再構築（`commit_catalog_and_notify`）も呼ばない - 変更の伝搬は SSE
+// `ResourceChanged { resource: "sink_groups" }` の送出のみで足りる
+// （サイドカーはこれを検知して`GET /api/sink/config`を取り直す）。
+
+#[derive(Clone)]
+struct SinkGroupsState {
+    sink_groups: SinkGroupService,
+    auth: AuthState,
+    commissioning: CommissioningState,
+    audit: AuditLogService,
+    events: broadcast::Sender<ServerEvent>,
+}
+
+async fn sink_groups_list(
+    State(state): State<SinkGroupsState>,
+) -> Result<Json<Vec<SinkGroup>>, ApiError> {
+    Ok(Json(state.sink_groups.list().await?))
+}
+
+async fn sink_groups_get(
+    State(state): State<SinkGroupsState>,
+    Path(id): Path<i64>,
+) -> Result<Json<SinkGroup>, ApiError> {
+    Ok(Json(state.sink_groups.get(id).await?))
+}
+
+async fn sink_groups_create(
+    State(state): State<SinkGroupsState>,
+    headers: HeaderMap,
+    Json(input): Json<SinkGroupInput>,
+) -> Result<Response, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.commissioning,
+        &state.audit,
+        &headers,
+        "sink_groups",
+        "POST",
+        "/api/sink/groups",
+    )
+    .await?;
+    let created = state.sink_groups.create(input).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &state.commissioning,
+        &headers,
+        "create",
+        "sink_groups",
+        &created.id.to_string(),
+        Some(json!({ "name": created.name, "enabled": created.enabled })),
+    )
+    .await;
+    let _ = state.events.send(ServerEvent::ResourceChanged {
+        resource: "sink_groups".to_string(),
+    });
+    Ok(Json(created).into_response())
+}
+
+async fn sink_groups_update(
+    State(state): State<SinkGroupsState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(input): Json<SinkGroupInput>,
+) -> Result<Response, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.commissioning,
+        &state.audit,
+        &headers,
+        "sink_groups",
+        "PUT",
+        "/api/sink/groups/{id}",
+    )
+    .await?;
+    let updated = state.sink_groups.update(id, input).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &state.commissioning,
+        &headers,
+        "update",
+        "sink_groups",
+        &id.to_string(),
+        Some(json!({ "name": updated.name, "enabled": updated.enabled })),
+    )
+    .await;
+    let _ = state.events.send(ServerEvent::ResourceChanged {
+        resource: "sink_groups".to_string(),
+    });
+    Ok(Json(updated).into_response())
+}
+
+async fn sink_groups_delete(
+    State(state): State<SinkGroupsState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.commissioning,
+        &state.audit,
+        &headers,
+        "sink_groups",
+        "DELETE",
+        "/api/sink/groups/{id}",
+    )
+    .await?;
+    state.sink_groups.delete(id).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &state.commissioning,
+        &headers,
+        "delete",
+        "sink_groups",
+        &id.to_string(),
+        None,
+    )
+    .await;
+    let _ = state.events.send(ServerEvent::ResourceChanged {
+        resource: "sink_groups".to_string(),
+    });
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+fn sink_groups_router(
+    sink_groups: SinkGroupService,
+    audit: AuditLogService,
+    auth: AuthState,
+    commissioning: CommissioningState,
+    events: broadcast::Sender<ServerEvent>,
+) -> Router {
+    let state = SinkGroupsState {
+        sink_groups,
+        auth: auth.clone(),
+        commissioning: commissioning.clone(),
+        audit,
+        events,
+    };
+    Router::new()
+        .route(
+            "/api/sink/groups",
+            get(sink_groups_list).post(sink_groups_create),
+        )
+        .route(
+            "/api/sink/groups/{id}",
+            get(sink_groups_get)
+                .put(sink_groups_update)
+                .delete(sink_groups_delete),
+        )
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            AuthGate {
+                auth,
+                commissioning,
+            },
+            require_auth_or_commissioning,
+        ))
+}
+
+// --- 外部 DB 連携 S4（design §5.2・§6-15）: サイドカー専用の admin 面
+// `GET /api/sink/config`・`PUT /api/sink/status` -----------------------------
+//
+// admin スコープを持つ API キー（`bh_`、サイドカー専用に発行する想定）か、
+// admin ロールのセッション（動作確認用）のいずれかを要求する -
+// `crate::mcp::require_admin_scope`（MCP の構成ツールは admin スコープの
+// API キーしか経路がない）と同じ「admin のみ」判定を、REST では
+// API キー/セッションの両方に対して行う点だけが違う。`/api/v1/*`の
+// `require_tag_space_auth`（read/write スコープ）とも、管理系ルーターの
+// `RoleGuard`（セッションのみ）とも異なる、この2エンドポイント専用の
+// ゲート。
+
+/// [`require_sink_admin`]の判定結果。`Err`はそのまま返せる`Response`
+/// （401/403）を運ぶ - 呼び出し元のハンドラは`if let Err(resp) = ... { return
+/// resp; }`の1行で済む。`Response`は大きい（axum の`http::Response<Body>`）
+/// ため`clippy::result_large_err`が付くが、この関数は2エンドポイントだけが
+/// 呼ぶ低頻度のゲートで、ボックス化するほどのホットパスではない。
+#[allow(clippy::result_large_err)]
+async fn require_sink_admin(
+    api_keys: &ApiKeysService,
+    auth: &AuthState,
+    commissioning: &CommissioningState,
+    headers: &HeaderMap,
+    now_ms: i64,
+) -> Result<(), Response> {
+    let Some(token) = bearer_token(headers) else {
+        return Err(unauthorized_response());
+    };
+    if token.starts_with("bh_") {
+        match api_keys.lookup(token, now_ms).await {
+            Ok(ApiKeyLookup::Valid(ctx)) => {
+                if let Err(err) = api_keys
+                    .touch_last_used(ctx.id, now_ms, ctx.last_used_at_ms)
+                    .await
+                {
+                    eprintln!(
+                        "banto-hub: sink admin API キーの last_used_at 更新に失敗しました: {err}"
+                    );
+                }
+                if ctx.has_admin_scope() {
+                    Ok(())
+                } else {
+                    Err(forbidden_response())
+                }
+            }
+            // Revoked/Tripped/Expired/NotFound はいずれも一律401
+            // （`crate::mcp::require_mcp_auth`と同じ判断 - この2
+            // エンドポイントもサイドカー専用の機械アクセスで、拒否理由の
+            // 細分は必須ではない）。
+            _ => Err(unauthorized_response()),
+        }
+    } else {
+        match actor_identity(headers, auth, commissioning) {
+            Some(identity)
+                if Role::from_str(&identity.role)
+                    .map(|role| role.at_least(Role::Admin))
+                    .unwrap_or(false) =>
+            {
+                Ok(())
+            }
+            Some(_) => Err(forbidden_response()),
+            None => Err(unauthorized_response()),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SinkAdminState {
+    sink_groups: SinkGroupService,
+    plc_connections: PlcConnectionService,
+    manager: Arc<CollectorManager>,
+    sink_status: Arc<SinkStatusStore>,
+    api_keys: ApiKeysService,
+    auth: AuthState,
+    commissioning: CommissioningState,
+}
+
+/// `GET /api/sink/config`の応答（設計 §5.2）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SinkConfigResponse {
+    generated_at: i64,
+    groups: Vec<SinkConfigGroupEntry>,
+    connections: Vec<SinkConfigConnectionEntry>,
+}
+
+/// 有効な sink group 1件分。`db_connection_id`は`connections`から対応する
+/// 行を引くためのキー（設計本文の例には無いが、サイドカーがどの接続へ
+/// INSERT するかを決める唯一の手掛かりなのでここに含める - S4 実装指示の
+/// 逸脱点、PR 本文に記載）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SinkConfigGroupEntry {
+    id: i64,
+    name: String,
+    db_connection_id: i64,
+    mode: String,
+    interval_ms: i64,
+    table_name: String,
+    store_bad: bool,
+    tags: Vec<SinkConfigTagEntry>,
+}
+
+/// 対象タグ1件分。`connectionId`/`groupId`/`tagId`は
+/// `crates/banto-tagclient/src/types.rs`の`StableTagId::new(connection_id,
+/// group_id, tag_id)`と完全に同じ3つ組 - サイドカーは banto-tagclient SDK
+/// でこの3つ組から購読する（設計 §5.1「Hub からの値の取得は
+/// banto-tagclient SDK」）。`externalName`はログ・推奨DDL表示など人が読む
+///用途のためのおまけ。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SinkConfigTagEntry {
+    connection_id: i64,
+    group_id: i64,
+    tag_id: i64,
+    external_name: String,
+}
+
+/// 接続1件分。**パスワードを平文で含む**（設計 §6-15、2026-09-06 オーナー
+/// 決定「admin スコープの専用 API キー + ループバック」）- このエンドポイント
+/// 自体が admin スコープ限定であることと、Hub・サイドカーが同一マシンで
+/// ループバック接続する運用前提（docs/banto-hub-external-db-design.md
+/// §2.2・§5.2）がその埋め合わせ。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SinkConfigConnectionEntry {
+    id: i64,
+    name: String,
+    host: String,
+    port: i64,
+    database: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+async fn build_sink_config_response(
+    state: &SinkAdminState,
+) -> Result<SinkConfigResponse, BantoError> {
+    let groups = state.sink_groups.list_enabled().await?;
+
+    let map = state.manager.tag_map();
+    let by_tag_id: std::collections::HashMap<i64, &TagEntry> =
+        map.iter().map(|entry| (entry.ids.2, entry)).collect();
+
+    let mut connection_ids: Vec<i64> = groups.iter().map(|group| group.db_connection_id).collect();
+    connection_ids.sort_unstable();
+    connection_ids.dedup();
+    let mut connections = Vec::with_capacity(connection_ids.len());
+    for connection_id in connection_ids {
+        let conn = state.plc_connections.get(connection_id).await?;
+        connections.push(SinkConfigConnectionEntry {
+            id: conn.id,
+            name: conn.name,
+            host: conn.host,
+            port: conn.port,
+            database: conn.database,
+            username: conn.username,
+            password: conn.password,
+        });
+    }
+
+    let group_entries = groups
+        .into_iter()
+        .map(|group| SinkConfigGroupEntry {
+            id: group.id,
+            name: group.name,
+            db_connection_id: group.db_connection_id,
+            mode: group.mode,
+            interval_ms: group.interval_ms,
+            table_name: group.table_name,
+            store_bad: group.store_bad,
+            // §5.2「行の削除で行も消える」の孤児許容分 - `crate::sink`の
+            // モジュール doc comment参照: 現在の catalog に無い tag_id は
+            // ここで単に読み飛ばす（サイドカー側は存在するタグだけを
+            // 購読することになる）。
+            tags: group
+                .tag_ids
+                .iter()
+                .filter_map(|tag_id| {
+                    by_tag_id.get(tag_id).map(|entry| SinkConfigTagEntry {
+                        connection_id: entry.ids.0,
+                        group_id: entry.ids.1,
+                        tag_id: entry.ids.2,
+                        external_name: entry.external_name.clone(),
+                    })
+                })
+                .collect(),
+        })
+        .collect();
+
+    Ok(SinkConfigResponse {
+        generated_at: state.manager.clock().now_ms(),
+        groups: group_entries,
+        connections,
+    })
+}
+
+/// `GET /api/sink/config`のパスワード平文返却はループバック専用という
+/// 前提（設計 §6-15）をプロセス起動後の初回呼び出し1回だけ`warn`する -
+/// このコードベースにログレベル機構は無い（`eprintln!`のみ）ため、
+/// 「初回だけ」は`std::sync::Once`で表現する。
+static SINK_CONFIG_LOOPBACK_WARNING: std::sync::Once = std::sync::Once::new();
+
+async fn sink_config_get(State(state): State<SinkAdminState>, headers: HeaderMap) -> Response {
+    let now_ms = state.manager.clock().now_ms();
+    if let Err(resp) = require_sink_admin(
+        &state.api_keys,
+        &state.auth,
+        &state.commissioning,
+        &headers,
+        now_ms,
+    )
+    .await
+    {
+        return resp;
+    }
+    SINK_CONFIG_LOOPBACK_WARNING.call_once(|| {
+        eprintln!(
+            "banto-hub: warn: GET /api/sink/config はDB接続のパスワードを平文で返します。\
+             サイドカーは Hub と同一マシンからのループバック接続のみを前提とします\
+             （docs/banto-hub-external-db-design.md §2.2・§5.2・§6-15）。"
+        );
+    });
+    match build_sink_config_response(&state).await {
+        Ok(body) => Json(body).into_response(),
+        Err(err) => ApiError(err).into_response(),
+    }
+}
+
+/// `PUT /api/sink/status`のボディ（設計 §5.2）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SinkStatusPushRequest {
+    groups: Vec<SinkGroupStatusPush>,
+}
+
+async fn sink_status_put(
+    State(state): State<SinkAdminState>,
+    headers: HeaderMap,
+    Json(body): Json<SinkStatusPushRequest>,
+) -> Response {
+    let now_ms = state.manager.clock().now_ms();
+    if let Err(resp) = require_sink_admin(
+        &state.api_keys,
+        &state.auth,
+        &state.commissioning,
+        &headers,
+        now_ms,
+    )
+    .await
+    {
+        return resp;
+    }
+
+    let mut field_errors = Vec::new();
+    for group in &body.groups {
+        if !crate::sink::is_valid_sink_group_state(&group.state) {
+            field_errors.push(FieldError {
+                field: "groups".to_string(),
+                message: format!(
+                    "group {} の state が不正です（{}）: {}",
+                    group.id,
+                    crate::sink::ALLOWED_SINK_GROUP_STATES.join(", "),
+                    group.state
+                ),
+            });
+        }
+    }
+    if !field_errors.is_empty() {
+        return ApiError(BantoError::Validation { field_errors }).into_response();
+    }
+
+    // 未知の sink group id は列挙して422で拒否する（実装指示）。
+    let known_ids: std::collections::HashSet<i64> = match state.sink_groups.list().await {
+        Ok(groups) => groups.into_iter().map(|group| group.id).collect(),
+        Err(err) => return ApiError(err).into_response(),
+    };
+    let mut unknown_ids: Vec<i64> = body
+        .groups
+        .iter()
+        .map(|group| group.id)
+        .filter(|id| !known_ids.contains(id))
+        .collect();
+    unknown_ids.sort_unstable();
+    unknown_ids.dedup();
+    if !unknown_ids.is_empty() {
+        return ApiError(BantoError::Validation {
+            field_errors: vec![FieldError {
+                field: "groups".to_string(),
+                message: format!(
+                    "未知の sink group id が含まれています: {}",
+                    unknown_ids
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }],
+        })
+        .into_response();
+    }
+
+    // T2-4/§5.5「行単位の INSERT は監査しない」・実装指示「本文は info
+    // レベルでもログしない」と同じ抑制 - push 本文（`lastError`に接続文字列
+    // の断片が混ざりうる）を一切ログに出さない。
+    state.sink_status.record(body.groups, now_ms);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+fn sink_admin_router(
+    sink_groups: SinkGroupService,
+    plc_connections: PlcConnectionService,
+    manager: Arc<CollectorManager>,
+    sink_status: Arc<SinkStatusStore>,
+    api_keys: ApiKeysService,
+    auth: AuthState,
+    commissioning: CommissioningState,
+) -> Router {
+    let state = SinkAdminState {
+        sink_groups,
+        plc_connections,
+        manager,
+        sink_status,
+        api_keys,
+        auth,
+        commissioning,
+    };
+    Router::new()
+        .route("/api/sink/config", get(sink_config_get))
+        .route("/api/sink/status", put(sink_status_put))
+        .with_state(state)
+}
+
 // --- /api/v1/* タグ空間 API（設計 §5.1） ------------------------------------
 //
 // T0-2（設計 §10-6、utoipa 採用 2026-08-04 決定）: 以下の応答型はすべて
@@ -5856,6 +6407,11 @@ pub(crate) struct TagSpaceState {
     /// 共有規律）- `SystemInfoSampler`のモジュール doc comment が説明する
     /// 「共有`System`を使い回す」ことの前提。
     pub(crate) system_info: Arc<SystemInfoSampler>,
+    /// 外部 DB 連携 S4（design §5.2・§5.5）: `GET /api/v1/status`・
+    /// `GET /api/status` の `sink` 節のため。上記の各 `Arc` と同じ共有規律 -
+    /// `sink_admin_router`（`PUT /api/sink/status`）が書き込むものと**同じ**
+    /// `Arc`を受け取る。
+    pub(crate) sink_status: Arc<SinkStatusStore>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6580,6 +7136,59 @@ impl From<crate::db_source::DbConnectionStatus> for DbSourceStatusEntry {
     }
 }
 
+/// `GET /api/v1/status`の`sink.sidecar`（外部 DB 連携 S4、design §5.2・
+/// §5.5）。`crate::sink::status::SinkStatusSnapshot`のwire形。
+#[derive(Debug, Serialize, ToSchema)]
+struct SinkSidecarStatusEntry {
+    /// `"online"`（[`crate::sink::SINK_SIDECAR_STALE_AFTER_MS`]以内に
+    /// `PUT /api/sink/status`の push があった）か`"unknown"`（無い、または
+    /// 一度も push が無い）。
+    state: String,
+    last_seen_at: Option<i64>,
+}
+
+/// `GET /api/v1/status`の`sink.groups`の1件分 - サイドカーが最後に push
+/// した内容をそのまま映す（`crate::sink::SinkGroupStatusPush`のwire形）。
+#[derive(Debug, Serialize, ToSchema)]
+struct SinkGroupStatusEntry {
+    id: i64,
+    state: String,
+    queued: u64,
+    dropped: u64,
+    last_flush_at: Option<i64>,
+    last_error: Option<String>,
+}
+
+/// `GET /api/v1/status`の`sink`節（外部 DB 連携 S4）。
+#[derive(Debug, Serialize, ToSchema)]
+struct SinkStatusEntry {
+    sidecar: SinkSidecarStatusEntry,
+    groups: Vec<SinkGroupStatusEntry>,
+}
+
+impl From<SinkStatusSnapshot> for SinkStatusEntry {
+    fn from(snapshot: SinkStatusSnapshot) -> Self {
+        Self {
+            sidecar: SinkSidecarStatusEntry {
+                state: snapshot.sidecar_state.to_string(),
+                last_seen_at: snapshot.last_seen_at,
+            },
+            groups: snapshot
+                .groups
+                .into_iter()
+                .map(|push| SinkGroupStatusEntry {
+                    id: push.id,
+                    state: push.state,
+                    queued: push.queued,
+                    dropped: push.dropped,
+                    last_flush_at: push.last_flush_at,
+                    last_error: push.last_error,
+                })
+                .collect(),
+        }
+    }
+}
+
 /// `GET /api/v1/status` の応答。T19 S5: `crate::mcp`の`get_server_status`
 /// ツールが[`compute_status`]をそのまま呼んで`serde_json::to_value`で
 /// 包み直すため`pub(crate)`（フィールド自体へは触れない - トレイト経由の
@@ -6625,6 +7234,11 @@ pub(crate) struct StatusResponse {
     /// 参照 - プロセス起動直後最初の呼び出しは `cpu_percent` が `0.0`に
     /// なりうる。
     system: SystemInfoSnapshot,
+    /// 外部 DB 連携 S4（design §5.2・§5.5）: DB Sink サイドカーの運転状態。
+    /// サイドカーが1度も`PUT /api/sink/status`を push していない、または
+    /// 15秒以上 push が無ければ`sidecar.state == "unknown"`
+    /// （`crate::sink::status`のモジュール doc comment参照）。
+    sink: SinkStatusEntry,
 }
 
 /// `GET /api/v1/status`・管理系 `GET /api/status`（2026-08-31 オーナー決定
@@ -6774,6 +7388,10 @@ pub(crate) async fn compute_status(state: &TagSpaceState) -> Result<StatusRespon
             .map(DbSourceStatusEntry::from)
             .collect(),
         system: state.system_info.sample(),
+        sink: state
+            .sink_status
+            .snapshot(state.manager.clock().now_ms())
+            .into(),
     })
 }
 
@@ -7021,6 +7639,59 @@ struct AdminStatusResponse {
     db_source: Vec<AdminDbSourceStatusEntry>,
     /// T19 S3-b（UX-46）: [`SystemInfoSnapshot`]のcamelCase版。
     system: AdminSystemInfoEntry,
+    /// 外部 DB 連携 S4: [`SinkStatusEntry`]のcamelCase版。
+    sink: AdminSinkStatusEntry,
+}
+
+/// [`SinkSidecarStatusEntry`]のcamelCase版。
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct AdminSinkSidecarStatusEntry {
+    state: String,
+    last_seen_at: Option<i64>,
+}
+
+/// [`SinkGroupStatusEntry`]のcamelCase版。
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct AdminSinkGroupStatusEntry {
+    id: i64,
+    state: String,
+    queued: u64,
+    dropped: u64,
+    last_flush_at: Option<i64>,
+    last_error: Option<String>,
+}
+
+/// [`SinkStatusEntry`]のcamelCase版。
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct AdminSinkStatusEntry {
+    sidecar: AdminSinkSidecarStatusEntry,
+    groups: Vec<AdminSinkGroupStatusEntry>,
+}
+
+impl From<SinkStatusEntry> for AdminSinkStatusEntry {
+    fn from(entry: SinkStatusEntry) -> Self {
+        Self {
+            sidecar: AdminSinkSidecarStatusEntry {
+                state: entry.sidecar.state,
+                last_seen_at: entry.sidecar.last_seen_at,
+            },
+            groups: entry
+                .groups
+                .into_iter()
+                .map(|group| AdminSinkGroupStatusEntry {
+                    id: group.id,
+                    state: group.state,
+                    queued: group.queued,
+                    dropped: group.dropped,
+                    last_flush_at: group.last_flush_at,
+                    last_error: group.last_error,
+                })
+                .collect(),
+        }
+    }
 }
 
 impl From<StatusResponse> for AdminStatusResponse {
@@ -7044,6 +7715,7 @@ impl From<StatusResponse> for AdminStatusResponse {
             last_apply: status.last_apply.map(Into::into),
             db_source: status.db_source.into_iter().map(Into::into).collect(),
             system: status.system.into(),
+            sink: status.sink.into(),
         }
     }
 }
@@ -7230,6 +7902,7 @@ fn admin_status_router(
     test_output: Arc<TestOutputControl>,
     mqtt: Arc<MqttPublisher>,
     system_info: Arc<SystemInfoSampler>,
+    sink_status: Arc<SinkStatusStore>,
     auth: AuthState,
     commissioning: CommissioningState,
 ) -> Router {
@@ -7240,6 +7913,7 @@ fn admin_status_router(
         test_output,
         mqtt,
         system_info,
+        sink_status,
     };
     Router::new()
         .route("/api/status", get(admin_status))
@@ -7321,6 +7995,7 @@ fn admin_tag_stream_router(
     test_output: Arc<TestOutputControl>,
     mqtt: Arc<MqttPublisher>,
     system_info: Arc<SystemInfoSampler>,
+    sink_status: Arc<SinkStatusStore>,
     auth: AuthState,
     commissioning: CommissioningState,
 ) -> Router {
@@ -7331,6 +8006,7 @@ fn admin_tag_stream_router(
         test_output,
         mqtt,
         system_info,
+        sink_status,
     };
     Router::new()
         .route(ADMIN_TAG_STREAM_PATH, get(crate::stream::ws_upgrade))
@@ -8096,6 +8772,10 @@ fn tag_space_router(
     // `admin_tag_stream_router`へ渡すものと**同じ** `Arc`（上記
     // `mqtt`/`write_control`/`test_output`と同じ共有規律）。
     system_info: Arc<SystemInfoSampler>,
+    // 外部 DB 連携 S4: `GET /api/v1/status` の `sink` 節のため -
+    // `admin_status_router`/`admin_tag_stream_router`/`sink_admin_router`
+    // へ渡すものと**同じ** `Arc`。
+    sink_status: Arc<SinkStatusStore>,
 ) -> Router {
     let state = TagSpaceState {
         manager: manager.clone(),
@@ -8104,6 +8784,7 @@ fn tag_space_router(
         test_output,
         mqtt,
         system_info,
+        sink_status,
     };
     let auth_state = TagSpaceAuthState {
         auth: auth.clone(),
@@ -8364,6 +9045,16 @@ fn api_router_with_controller_mode(
     // 等、このファイルの他の共有状態と同じ規律（`SystemInfoSampler`の
     // モジュール doc comment「共有 System を使い回す」の前提そのもの）。
     let system_info = Arc::new(SystemInfoSampler::new());
+    // 外部 DB 連携 S4（`crate::sink`のモジュール doc comment参照）:
+    // `system_info`と同じ「ここで1個だけ構築し、複数ルーターへ同じ`Arc`/
+    // サービスを配る」規律。`sink_groups`（`SqlitePool`ベース、`Clone`可能）
+    // は `sink_groups_router`（CRUD）と `sink_admin_router`
+    // （`GET /api/sink/config`）の両方が使う。`sink_status`は
+    // `sink_admin_router`（`PUT /api/sink/status`が書く）・
+    // `admin_status_router`/`admin_tag_stream_router`/`tag_space_router`
+    // （`GET /api/status`・`GET /api/v1/status`が読む）で共有する。
+    let sink_groups = SinkGroupService::new(manager.pool());
+    let sink_status = SinkStatusStore::new();
 
     let audited_auth_routes = auth_routes(auth.clone()).layer(middleware::from_fn_with_state(
         LogoutAuditState {
@@ -8424,9 +9115,24 @@ fn api_router_with_controller_mode(
             events.clone(),
             legacy_live_reconfigure,
         ))
+        // 外部 DB 連携 S4（design §5.2・§6-13）: `hub_sink_groups`の CRUD -
+        // `tag_registry_router`と同じ認可（require_editor 書き込み・viewer
+        // 読み取り）だが pending queue には載らない
+        // （`sink_groups_router`のdoc comment参照）。`sink_groups`は下の
+        // `mcp_router`・末尾の`sink_admin_router`でも使うため`.clone()`。
+        .merge(sink_groups_router(
+            sink_groups.clone(),
+            audit.clone(),
+            auth.clone(),
+            commissioning_state.clone(),
+            events.clone(),
+        ))
         .merge(pending_changes_router(
             pending_changes,
-            plc_connections,
+            // `sink_admin_router`（末尾）が`GET /api/sink/config`で
+            // 接続情報（パスワード含む）を読むために`plc_connections`を
+            // 再利用する - ここで`.clone()`して1つ先に残す。
+            plc_connections.clone(),
             collection_groups,
             tags,
             audit.clone(),
@@ -8510,6 +9216,7 @@ fn api_router_with_controller_mode(
             test_output.clone(),
             mqtt.clone(),
             system_info.clone(),
+            sink_status.clone(),
             auth.clone(),
             commissioning_state.clone(),
         ))
@@ -8528,6 +9235,7 @@ fn api_router_with_controller_mode(
             test_output.clone(),
             mqtt.clone(),
             system_info.clone(),
+            sink_status.clone(),
             auth.clone(),
             commissioning_state.clone(),
         ))
@@ -8548,7 +9256,10 @@ fn api_router_with_controller_mode(
             write_control.clone(),
             rate_limiter.clone(),
             events.clone(),
-            commissioning_state,
+            // 外部 DB 連携 S4: `sink_admin_router`（下）でも使うため
+            // `.clone()`にする（従来は最後の使用箇所だったので bare move
+            // だった）。
+            commissioning_state.clone(),
             test_output.clone(),
             mqtt.clone(),
             system_info.clone(),
@@ -8566,6 +9277,23 @@ fn api_router_with_controller_mode(
             // ものと同じフル `CommissioningService`（上の`.clone()`参照）。
             // ここが最後の使用箇所なので`.clone()`しない。
             commissioning,
+            // 外部 DB 連携 S4: `list_sink_groups`等 T21 系 MCP ツール用。
+            // `sink_admin_router`（下）でも使うため`.clone()`する。
+            sink_groups.clone(),
+            sink_status.clone(),
+        ))
+        // 外部 DB 連携 S4（design §5.2・§6-15）: サイドカー専用の admin 面。
+        // `tag_space_router`/`mcp_router`と同じ形で、CSRF レイヤー（`admin`）
+        // の外側に`.merge()`する - 認証は`require_sink_admin`が自前で
+        // 行うため CSRF ヘッダは不要（`/api/v1/*`・`POST /mcp`と同じ扱い）。
+        .merge(sink_admin_router(
+            sink_groups,
+            plc_connections,
+            manager.clone(),
+            sink_status.clone(),
+            api_keys.clone(),
+            auth.clone(),
+            commissioning_state,
         ))
         .merge(tag_space_router(
             manager,
@@ -8581,6 +9309,7 @@ fn api_router_with_controller_mode(
             !legacy_live_reconfigure,
             test_output,
             system_info,
+            sink_status,
         ))
         .merge(openapi_router(profile_id))
 }
@@ -9993,6 +10722,33 @@ mod tests {
         (status, json)
     }
 
+    /// `admin_post`/`admin_put`/`admin_delete`の`GET`版 - 外部 DB 連携 S4の
+    /// sink group テストがまとめて必要とするため追加。
+    async fn admin_get(
+        router: &Router,
+        path: &str,
+        token: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                HttpRequest::get(path)
+                    .header("Authorization", format!("Bearer {token}"))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
     /// 認証ヘッダ付きで `/api/v1/*` に `GET` する小さなヘルパ。`/api/v1/*`
     /// は CSRF 対象外なので `X-Banto-Client` は付けない
     /// （`v1_tags_requires_auth_but_not_the_csrf_header` 参照）。
@@ -10003,6 +10759,35 @@ mod tests {
                 HttpRequest::get(path)
                     .header("Authorization", format!("Bearer {key}"))
                     .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// `v1_get`の`PUT`版 - 外部 DB 連携 S4の`PUT /api/sink/status`テスト用。
+    /// `/api/sink/*`も`require_sink_admin`が自前で認証するため CSRF 対象外
+    /// （`/api/v1/*`・`POST /mcp`と同じ扱い）。
+    async fn v1_put(
+        router: &Router,
+        key: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                HttpRequest::put(path)
+                    .header("Authorization", format!("Bearer {key}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
                     .unwrap(),
             )
             .await
@@ -14420,5 +15205,535 @@ mod tests {
             v1_first["effective_simulation"]
         );
         assert_eq!(admin_first["valueSource"], v1_first["value_source"]);
+    }
+
+    // --- 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2・§6-13・
+    // §6-15）: DB Sink の Hub 側（`hub_sink_groups` CRUD、`GET
+    // /api/sink/config`、`PUT /api/sink/status`、`GET /api/status`の
+    // `sink`節） ------------------------------------------------------------
+
+    /// PLC 接続1つ+収集グループ+タグ1つ、および postgres 接続1つを作る -
+    /// sink group のテストが共通に必要とするフィクスチャ
+    /// （`seed_scope_fixture`と同じ「admin REST 経由で組み立てる」方針）。
+    /// 戻り値は `(postgres 接続の id, タグの id)`。
+    async fn seed_sink_fixture(router: &Router, admin_token: &str) -> (i64, i64) {
+        let (status, conn) = admin_post(
+            router,
+            "/api/plc-connections",
+            admin_token,
+            json!({ "name": "line1", "host": "127.0.0.1", "port": 15201 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+        let (status, group) = admin_post(
+            router,
+            "/api/collection-groups",
+            admin_token,
+            json!({ "name": "fast", "plcConnectionId": conn["id"], "periodMs": 100 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{group:?}");
+        let (status, tag) = admin_post(
+            router,
+            "/api/tags",
+            admin_token,
+            json!({
+                "name": "temp01",
+                "collectionGroupId": group["id"],
+                "address": "40001",
+                "dataType": "i16",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{tag:?}");
+
+        let (status, pg) = admin_post(
+            router,
+            "/api/plc-connections",
+            admin_token,
+            json!({
+                "name": "erp-db",
+                "protocol": "postgres",
+                "host": "10.0.0.50",
+                "port": 5432,
+                "database": "erp",
+                "username": "reader",
+                "password": "s3cret",
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{pg:?}");
+
+        (pg["id"].as_i64().unwrap(), tag["id"].as_i64().unwrap())
+    }
+
+    fn sink_group_body(db_connection_id: i64, tag_id: i64) -> serde_json::Value {
+        json!({
+            "name": "line1-log",
+            "dbConnectionId": db_connection_id,
+            "mode": "interval",
+            "intervalMs": 1000,
+            "tableName": "public.tag_history",
+            "storeBad": false,
+            "enabled": true,
+            "tagIds": [tag_id],
+        })
+    }
+
+    #[tokio::test]
+    async fn sink_groups_crud_happy_path() {
+        let env = test_env().await;
+        let (db_connection_id, tag_id) = seed_sink_fixture(&env.router, &env.admin_token).await;
+
+        let (status, created) = admin_post(
+            &env.router,
+            "/api/sink/groups",
+            &env.admin_token,
+            sink_group_body(db_connection_id, tag_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created:?}");
+        assert_eq!(created["name"], "line1-log");
+        assert_eq!(created["dbConnectionId"], db_connection_id);
+        assert_eq!(created["tagIds"], json!([tag_id]));
+        let id = created["id"].as_i64().unwrap();
+
+        let (status, listed) = admin_get(&env.router, "/api/sink/groups", &env.admin_token).await;
+        assert_eq!(status, StatusCode::OK, "{listed:?}");
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+
+        let (status, fetched) = admin_get(
+            &env.router,
+            &format!("/api/sink/groups/{id}"),
+            &env.admin_token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{fetched:?}");
+        assert_eq!(fetched, created);
+
+        let mut updated_body = sink_group_body(db_connection_id, tag_id);
+        updated_body["intervalMs"] = json!(2000);
+        updated_body["enabled"] = json!(false);
+        let (status, updated) = admin_put(
+            &env.router,
+            &format!("/api/sink/groups/{id}"),
+            &env.admin_token,
+            updated_body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated:?}");
+        assert_eq!(updated["intervalMs"], 2000);
+        assert_eq!(updated["enabled"], false);
+
+        let (status, _) = admin_delete(
+            &env.router,
+            &format!("/api/sink/groups/{id}"),
+            &env.admin_token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, _) = admin_get(
+            &env.router,
+            &format!("/api/sink/groups/{id}"),
+            &env.admin_token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn sink_groups_create_requires_editor() {
+        let env = test_env().await;
+        let (db_connection_id, tag_id) = seed_sink_fixture(&env.router, &env.admin_token).await;
+        let (status, body) = admin_post(
+            &env.router,
+            "/api/sink/groups",
+            &env.viewer_token,
+            sink_group_body(db_connection_id, tag_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body:?}");
+    }
+
+    #[tokio::test]
+    async fn sink_groups_create_rejects_empty_name() {
+        let env = test_env().await;
+        let (db_connection_id, tag_id) = seed_sink_fixture(&env.router, &env.admin_token).await;
+        let mut body = sink_group_body(db_connection_id, tag_id);
+        body["name"] = json!("   ");
+        let (status, body) =
+            admin_post(&env.router, "/api/sink/groups", &env.admin_token, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    }
+
+    #[tokio::test]
+    async fn sink_groups_create_rejects_too_long_name() {
+        let env = test_env().await;
+        let (db_connection_id, tag_id) = seed_sink_fixture(&env.router, &env.admin_token).await;
+        let mut body = sink_group_body(db_connection_id, tag_id);
+        body["name"] = json!("x".repeat(65));
+        let (status, body) =
+            admin_post(&env.router, "/api/sink/groups", &env.admin_token, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    }
+
+    #[tokio::test]
+    async fn sink_groups_create_rejects_duplicate_name() {
+        let env = test_env().await;
+        let (db_connection_id, tag_id) = seed_sink_fixture(&env.router, &env.admin_token).await;
+        let (status, _) = admin_post(
+            &env.router,
+            "/api/sink/groups",
+            &env.admin_token,
+            sink_group_body(db_connection_id, tag_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = admin_post(
+            &env.router,
+            "/api/sink/groups",
+            &env.admin_token,
+            sink_group_body(db_connection_id, tag_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    }
+
+    #[tokio::test]
+    async fn sink_groups_create_rejects_bad_mode() {
+        let env = test_env().await;
+        let (db_connection_id, tag_id) = seed_sink_fixture(&env.router, &env.admin_token).await;
+        let mut body = sink_group_body(db_connection_id, tag_id);
+        body["mode"] = json!("hourly");
+        let (status, body) =
+            admin_post(&env.router, "/api/sink/groups", &env.admin_token, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    }
+
+    #[tokio::test]
+    async fn sink_groups_create_rejects_out_of_range_interval_ms() {
+        let env = test_env().await;
+        let (db_connection_id, tag_id) = seed_sink_fixture(&env.router, &env.admin_token).await;
+        let mut body = sink_group_body(db_connection_id, tag_id);
+        body["intervalMs"] = json!(10);
+        let (status, body) =
+            admin_post(&env.router, "/api/sink/groups", &env.admin_token, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    }
+
+    #[tokio::test]
+    async fn sink_groups_create_rejects_invalid_table_name() {
+        let env = test_env().await;
+        let (db_connection_id, tag_id) = seed_sink_fixture(&env.router, &env.admin_token).await;
+        let mut body = sink_group_body(db_connection_id, tag_id);
+        body["tableName"] = json!("\"quoted\"");
+        let (status, body) =
+            admin_post(&env.router, "/api/sink/groups", &env.admin_token, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    }
+
+    #[tokio::test]
+    async fn sink_groups_create_rejects_empty_tag_ids() {
+        let env = test_env().await;
+        let (db_connection_id, tag_id) = seed_sink_fixture(&env.router, &env.admin_token).await;
+        let _ = tag_id;
+        let mut body = sink_group_body(db_connection_id, tag_id);
+        body["tagIds"] = json!([]);
+        let (status, body) =
+            admin_post(&env.router, "/api/sink/groups", &env.admin_token, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    }
+
+    #[tokio::test]
+    async fn sink_groups_create_rejects_duplicate_tag_ids() {
+        let env = test_env().await;
+        let (db_connection_id, tag_id) = seed_sink_fixture(&env.router, &env.admin_token).await;
+        let mut body = sink_group_body(db_connection_id, tag_id);
+        body["tagIds"] = json!([tag_id, tag_id]);
+        let (status, body) =
+            admin_post(&env.router, "/api/sink/groups", &env.admin_token, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    }
+
+    #[tokio::test]
+    async fn sink_groups_create_rejects_unknown_tag_id() {
+        let env = test_env().await;
+        let (db_connection_id, tag_id) = seed_sink_fixture(&env.router, &env.admin_token).await;
+        let mut body = sink_group_body(db_connection_id, tag_id);
+        body["tagIds"] = json!([999_999]);
+        let (status, body) =
+            admin_post(&env.router, "/api/sink/groups", &env.admin_token, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    }
+
+    /// 接続が `protocol: postgres` でなければ422（実装指示: 「connection
+    /// that is not postgres → 422」）。
+    #[tokio::test]
+    async fn sink_groups_create_rejects_non_postgres_connection() {
+        let env = test_env().await;
+        let (_db_connection_id, tag_id) = seed_sink_fixture(&env.router, &env.admin_token).await;
+        let (status, plc) = admin_get(&env.router, "/api/plc-connections", &env.admin_token).await;
+        assert_eq!(status, StatusCode::OK, "{plc:?}");
+        let modbus_connection_id = plc
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["protocol"] == "modbus-tcp")
+            .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+
+        let mut body = sink_group_body(modbus_connection_id, tag_id);
+        body["dbConnectionId"] = json!(modbus_connection_id);
+        let (status, body) =
+            admin_post(&env.router, "/api/sink/groups", &env.admin_token, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    }
+
+    #[tokio::test]
+    async fn sink_groups_create_rejects_unknown_connection() {
+        let env = test_env().await;
+        let (_db_connection_id, tag_id) = seed_sink_fixture(&env.router, &env.admin_token).await;
+        let body = sink_group_body(999_999, tag_id);
+        let (status, body) =
+            admin_post(&env.router, "/api/sink/groups", &env.admin_token, body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    }
+
+    /// この接続を参照する sink group がある間は `plc_connections` の削除を
+    /// 拒否する（RESTRICT 相当、実装指示: 「connection that a sink group
+    /// references is rejected with a clear message」）。
+    #[tokio::test]
+    async fn deleting_a_connection_referenced_by_a_sink_group_is_rejected() {
+        let env = test_env().await;
+        let (db_connection_id, tag_id) = seed_sink_fixture(&env.router, &env.admin_token).await;
+        let (status, _) = admin_post(
+            &env.router,
+            "/api/sink/groups",
+            &env.admin_token,
+            sink_group_body(db_connection_id, tag_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = admin_delete(
+            &env.router,
+            &format!("/api/plc-connections/{db_connection_id}"),
+            &env.admin_token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+        let message = body["field_errors"][0]["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("sink group"),
+            "expected the message to mention sink group: {body:?}"
+        );
+
+        // 実際にまだ存在すること。
+        PlcConnectionService::new(env.pool.clone())
+            .get(db_connection_id)
+            .await
+            .expect("connection should survive");
+    }
+
+    /// 対象タグを削除すると、`hub_sink_group_tags`の対応する行も消える
+    /// （`crate::sink`のモジュール doc comment「タグ削除の経路では能動的に
+    /// 消す」）。
+    #[tokio::test]
+    async fn deleting_a_tag_removes_it_from_sink_group_membership() {
+        let env = test_env().await;
+        let (db_connection_id, tag_id) = seed_sink_fixture(&env.router, &env.admin_token).await;
+        let (status, created) = admin_post(
+            &env.router,
+            "/api/sink/groups",
+            &env.admin_token,
+            sink_group_body(db_connection_id, tag_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created:?}");
+        let group_id = created["id"].as_i64().unwrap();
+
+        let (status, _) = admin_delete(
+            &env.router,
+            &format!("/api/tags/{tag_id}"),
+            &env.admin_token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, fetched) = admin_get(
+            &env.router,
+            &format!("/api/sink/groups/{group_id}"),
+            &env.admin_token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{fetched:?}");
+        assert_eq!(fetched["tagIds"], json!([]));
+    }
+
+    /// `GET /api/sink/config` は admin 以外 403、admin なら200でパスワード
+    /// を含み、タグは stable id（connectionId/groupId/tagId）を運ぶ
+    /// （実装指示）。
+    #[tokio::test]
+    async fn sink_config_get_requires_admin_and_carries_password_and_stable_ids() {
+        let env = test_env().await;
+        let (db_connection_id, tag_id) = seed_sink_fixture(&env.router, &env.admin_token).await;
+        let (status, _) = admin_post(
+            &env.router,
+            "/api/sink/groups",
+            &env.admin_token,
+            sink_group_body(db_connection_id, tag_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = v1_get(&env.router, &env.viewer_token, "/api/sink/config").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body:?}");
+
+        let (status, body) = v1_get(&env.router, &env.admin_token, "/api/sink/config").await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert!(body["generatedAt"].as_i64().is_some());
+        let groups = body["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        let tags = groups[0]["tags"].as_array().unwrap();
+        assert_eq!(tags.len(), 1);
+        assert!(tags[0]["connectionId"].as_i64().is_some());
+        assert!(tags[0]["groupId"].as_i64().is_some());
+        assert_eq!(tags[0]["tagId"], tag_id);
+        assert!(tags[0]["externalName"].as_str().unwrap().contains("temp01"));
+
+        let connections = body["connections"].as_array().unwrap();
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0]["id"], db_connection_id);
+        assert_eq!(connections[0]["password"], "s3cret");
+
+        // admin スコープを持つ API キーでも通ること(サイドカーの本来の
+        // 経路)。admin スコープ無しのキーは403。
+        let (status, issued) =
+            issue_api_key(&env.router, &env.admin_token, "sidecar", &["admin"]).await;
+        assert_eq!(status, StatusCode::CREATED, "{issued:?}");
+        let admin_key = issued["key"].as_str().unwrap();
+        let (status, body) = v1_get(&env.router, admin_key, "/api/sink/config").await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+
+        let (status, issued) =
+            issue_api_key(&env.router, &env.admin_token, "reader-only", &["read"]).await;
+        assert_eq!(status, StatusCode::CREATED, "{issued:?}");
+        let read_key = issued["key"].as_str().unwrap();
+        let (status, body) = v1_get(&env.router, read_key, "/api/sink/config").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body:?}");
+    }
+
+    /// 無効な sink group のみの構成では`groups`/`connections`とも空配列。
+    #[tokio::test]
+    async fn sink_config_get_excludes_disabled_groups() {
+        let env = test_env().await;
+        let (db_connection_id, tag_id) = seed_sink_fixture(&env.router, &env.admin_token).await;
+        let mut body = sink_group_body(db_connection_id, tag_id);
+        body["enabled"] = json!(false);
+        let (status, _) = admin_post(&env.router, "/api/sink/groups", &env.admin_token, body).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = v1_get(&env.router, &env.admin_token, "/api/sink/config").await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["groups"].as_array().unwrap().len(), 0);
+        assert_eq!(body["connections"].as_array().unwrap().len(), 0);
+    }
+
+    fn sink_status_push_body(group_id: i64) -> serde_json::Value {
+        json!({
+            "groups": [{
+                "id": group_id,
+                "state": "running",
+                "queued": 3,
+                "dropped": 0,
+                "lastFlushAt": 1_000,
+                "lastError": null,
+            }],
+        })
+    }
+
+    #[tokio::test]
+    async fn sink_status_put_requires_admin() {
+        let env = test_env().await;
+        let (db_connection_id, tag_id) = seed_sink_fixture(&env.router, &env.admin_token).await;
+        let (status, created) = admin_post(
+            &env.router,
+            "/api/sink/groups",
+            &env.admin_token,
+            sink_group_body(db_connection_id, tag_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let group_id = created["id"].as_i64().unwrap();
+
+        let (status, body) = v1_put(
+            &env.router,
+            &env.viewer_token,
+            "/api/sink/status",
+            sink_status_push_body(group_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body:?}");
+    }
+
+    #[tokio::test]
+    async fn sink_status_put_rejects_unknown_group_id() {
+        let env = test_env().await;
+        let (status, body) = v1_put(
+            &env.router,
+            &env.admin_token,
+            "/api/sink/status",
+            sink_status_push_body(999_999),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+        let message = body["field_errors"][0]["message"].as_str().unwrap_or("");
+        assert!(message.contains("999999"), "{body:?}");
+    }
+
+    /// push 後は `GET /api/status` の `sink.sidecar.state == "online"` と
+    /// 対応するグループ行が見え、15秒以上経過すると`"unknown"`に戻る
+    /// （実装指示 - `ManualClock`で決定的に検証する）。
+    #[tokio::test]
+    async fn sink_status_push_then_status_shows_online_then_unknown_after_stale_window() {
+        let now_ms = 1_700_000_000_000i64;
+        let clock = Arc::new(ManualClock::new(now_ms, 0));
+        let env = test_env_with_clock(clock.clone()).await;
+        let (db_connection_id, tag_id) = seed_sink_fixture(&env.router, &env.admin_token).await;
+        let (status, created) = admin_post(
+            &env.router,
+            "/api/sink/groups",
+            &env.admin_token,
+            sink_group_body(db_connection_id, tag_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let group_id = created["id"].as_i64().unwrap();
+
+        let (status, _) = v1_put(
+            &env.router,
+            &env.admin_token,
+            "/api/sink/status",
+            sink_status_push_body(group_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, admin_status_body) =
+            admin_get(&env.router, "/api/status", &env.admin_token).await;
+        assert_eq!(status, StatusCode::OK, "{admin_status_body:?}");
+        assert_eq!(admin_status_body["sink"]["sidecar"]["state"], "online");
+        let groups = admin_status_body["sink"]["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["id"], group_id);
+        assert_eq!(groups[0]["queued"], 3);
+
+        clock.advance_ms(crate::sink::SINK_SIDECAR_STALE_AFTER_MS);
+        let (status, admin_status_body) =
+            admin_get(&env.router, "/api/status", &env.admin_token).await;
+        assert_eq!(status, StatusCode::OK, "{admin_status_body:?}");
+        assert_eq!(admin_status_body["sink"]["sidecar"]["state"], "unknown");
     }
 }

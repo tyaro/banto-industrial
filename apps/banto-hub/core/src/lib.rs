@@ -199,6 +199,7 @@ pub mod service_install;
 pub mod service_manager;
 pub mod service_operators;
 pub mod settings;
+pub mod sink;
 pub mod stream;
 pub mod subscribe_core;
 pub mod system_info;

@@ -98,6 +98,7 @@ use crate::rest::{
     PlcConnectionTestPayload, StoreSettingsRequest, StoreSettingsResponse, TagPayload,
     TagSpaceState,
 };
+use crate::sink::{SinkGroupInput, SinkGroupService, SinkStatusStore};
 // T21 S2-b: 設定 get/set ツール用（REST の各設定ハンドラと同じ型を再利用する
 // - このモジュールの doc comment「§3.7」節と同じ「二重実装しない」規律）。
 use crate::settings::{MqttSettings, SettingsService, StoreSettings};
@@ -234,6 +235,12 @@ struct McpState {
     /// （`.clone()`）を渡す（このモジュールの doc comment「呼び出し元は
     /// ...同じインスタンスを渡すこと」と同じ規律）。
     commissioning_service: CommissioningService,
+    // 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2）:
+    // `list_sink_groups`等5ツール用。`SinkGroupService::new(manager.pool())`
+    // で構築（REST の `crate::rest::sink_groups_router`と同じ生成方法）。
+    // `get_server_status`の`sink`節は`status`（`TagSpaceState`、下）が既に
+    // `sink_status`を持つので、ここに二重で持たない。
+    sink_groups: SinkGroupService,
 }
 
 /// `POST /mcp`のルーターを組み立てる。呼び出し元
@@ -279,6 +286,12 @@ pub(crate) fn mcp_router(
     // `commissioning`引数（`CommissioningState`）は write 系ツールの
     // `is_locked_down()`判定専用のまま残す。
     commissioning_service: CommissioningService,
+    // 外部 DB 連携 S4: `list_sink_groups`等5ツール用 - 呼び出し元
+    // （`crate::rest::api_router_with_controller_mode`）が
+    // `crate::rest::sink_groups_router`/`sink_admin_router`へ渡すものと
+    // **同じ** `SqlitePool`ベースのサービス/`Arc`を渡すこと。
+    sink_groups: SinkGroupService,
+    sink_status: Arc<SinkStatusStore>,
 ) -> Router {
     let status = TagSpaceState {
         manager: manager.clone(),
@@ -287,6 +300,7 @@ pub(crate) fn mcp_router(
         test_output,
         mqtt,
         system_info,
+        sink_status,
     };
     // T21 S1-b: REST の `tag_registry_router`と同じ生成方法
     // （`PlcConnectionService::new(manager.pool())`等）- `SqlitePool`は
@@ -319,6 +333,7 @@ pub(crate) fn mcp_router(
         settings,
         grpc_server,
         commissioning_service,
+        sink_groups,
     };
     let auth_state = McpAuthState { api_keys, manager };
 
@@ -1158,6 +1173,134 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // --- 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2）:
+        // DB Sink の Hub 側構成補助ツール。他の構成 CRUD ツールと同じゲート
+        // (admin スコープ必須)・同じ監査だが、pending queue には載らない
+        // （`crate::rest::sink_groups_router`のdoc comment参照 - sink group
+        // は PLC 収集パイプラインに一切関わらないため常に即時適用）。
+        json!({
+            "name": "list_sink_groups",
+            "description": "DB Sink（外部 DB への記録）の sink group 一覧を返す(admin スコープ必須)。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "get_sink_group",
+            "description": "DB Sink の sink group を1件取得する(admin スコープ必須)。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "取得する sink group の id。" },
+                },
+                "required": ["id"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "create_sink_group",
+            "description": "DB Sink の sink group を新規作成する(admin スコープ必須)。即時適用(pending queue には載らない)。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "sink group 名(一意、64文字以内)。" },
+                    "dbConnectionId": {
+                        "type": "integer",
+                        "description": "保存先 DB を指す plc_connections の id(protocol: postgres のみ許可)。",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["interval", "on_change"],
+                        "description": "interval は定周期記録、on_change は変化時記録(intervalMs は最短発行間隔)。",
+                    },
+                    "intervalMs": {
+                        "type": "integer",
+                        "description": "interval モードの周期、または on_change モードの最短発行間隔(ミリ秒、100〜3600000)。",
+                    },
+                    "tableName": {
+                        "type": "string",
+                        "description": "保存先テーブル名。schema.table のスキーマ修飾を1回まで許可。引用符付き識別子は不可。",
+                    },
+                    "storeBad": {
+                        "type": "boolean",
+                        "description": "Bad/Stale の行も保存するか。既定値 false(Good のみ)。",
+                    },
+                    "enabled": { "type": "boolean", "description": "既定値 true。" },
+                    "tagIds": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "対象タグの id 一覧(1件以上、重複不可、いずれも実在するタグであること)。",
+                    },
+                },
+                "required": ["name", "dbConnectionId", "mode", "intervalMs", "tableName", "tagIds"],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "update_sink_group",
+            "description": "既存の sink group を更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない)。即時適用(pending queue には載らない)。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "更新する sink group の id。" },
+                    "name": { "type": "string", "description": "sink group 名(一意、64文字以内)。" },
+                    "dbConnectionId": {
+                        "type": "integer",
+                        "description": "保存先 DB を指す plc_connections の id(protocol: postgres のみ許可)。",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["interval", "on_change"],
+                        "description": "interval は定周期記録、on_change は変化時記録。",
+                    },
+                    "intervalMs": {
+                        "type": "integer",
+                        "description": "周期または最短発行間隔(ミリ秒、100〜3600000)。",
+                    },
+                    "tableName": {
+                        "type": "string",
+                        "description": "保存先テーブル名。schema.table のスキーマ修飾を1回まで許可。",
+                    },
+                    "storeBad": { "type": "boolean", "description": "Bad/Stale の行も保存するか。" },
+                    "enabled": { "type": "boolean", "description": "sink group を有効にするか。" },
+                    "tagIds": {
+                        "type": "array",
+                        "items": { "type": "integer" },
+                        "description": "対象タグの id 一覧(1件以上、重複不可)。既存の集合を丸ごと置き換える。",
+                    },
+                },
+                "required": [
+                    "id",
+                    "name",
+                    "dbConnectionId",
+                    "mode",
+                    "intervalMs",
+                    "tableName",
+                    "storeBad",
+                    "enabled",
+                    "tagIds",
+                ],
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "delete_sink_group",
+            "description": "sink group を削除する(admin スコープ必須)。不可逆操作のため confirm:true が必須。即時適用(pending queue には載らない)。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "削除する sink group の id。" },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "true を明示しないと拒否される(不可逆操作の確認)。",
+                    },
+                },
+                "required": ["id", "confirm"],
+                "additionalProperties": false,
+            },
+        }),
     ]
 }
 
@@ -1206,6 +1349,11 @@ async fn handle_tools_call(
         "list_api_keys" => tool_list_api_keys(state, ctx).await,
         "revoke_api_key" => tool_revoke_api_key(state, ctx, arguments).await?,
         "lock_down" => tool_lock_down(state, ctx, arguments).await?,
+        "list_sink_groups" => tool_list_sink_groups(state, ctx).await,
+        "get_sink_group" => tool_get_sink_group(state, ctx, arguments).await?,
+        "create_sink_group" => tool_create_sink_group(state, ctx, arguments).await?,
+        "update_sink_group" => tool_update_sink_group(state, ctx, arguments).await?,
+        "delete_sink_group" => tool_delete_sink_group(state, ctx, arguments).await?,
         other => {
             return Err(RpcError::invalid_params(format!("unknown tool: {other}")));
         }
@@ -3505,4 +3653,183 @@ async fn tool_lock_down(
     }
     audit_config_action(state, ctx, "lock_down", "commissioning", Some("1"), None).await;
     Ok(tool_ok(json!({ "lockedDown": true })))
+}
+
+// ---------------------------------------------------------------------------
+// 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2）: DB Sink の
+// Hub 側構成補助ツール。他の構成 CRUD ツール（[`tool_create_connection`]等）
+// と同じゲート（admin スコープ必須）・同じ監査（[`audit_config_action`]、
+// resource は`"sink_groups"`）だが、**pending queue には載らない**
+// （`crate::rest::sink_groups_router`のdoc comment参照 - sink group は PLC
+// 収集パイプラインに一切関わらないため常に即時適用。`compute_pending_base_fingerprint`
+// も`commit_catalog_and_notify`も呼ばない - 変更後は
+// `state.events.send(ServerEvent::ResourceChanged { resource: "sink_groups"
+// })`を送るだけで、REST の`sink_groups_router`と全く同じ伝搬経路を使う）。
+// ---------------------------------------------------------------------------
+
+/// [`tool_update_sink_group`]の必須キー一覧 - `SinkGroupInput`のwireフィールド
+/// （camelCase）全部 + `id`。inputSchema の`update_sink_group.required`と
+/// 同期させること（[`UPDATE_CONNECTION_REQUIRED_FIELDS`]と同じ規約）。
+const UPDATE_SINK_GROUP_REQUIRED_FIELDS: [&str; 9] = [
+    "id",
+    "name",
+    "dbConnectionId",
+    "mode",
+    "intervalMs",
+    "tableName",
+    "storeBad",
+    "enabled",
+    "tagIds",
+];
+
+async fn tool_list_sink_groups(state: &McpState, ctx: &ApiKeyContext) -> Value {
+    if let Err(err) = require_admin_scope(ctx) {
+        return err;
+    }
+    match state.sink_groups.list().await {
+        Ok(groups) => tool_ok(json!({ "groups": groups })),
+        Err(err) => tool_error(format!("sink group 一覧の取得に失敗しました: {err}")),
+    }
+}
+
+async fn tool_get_sink_group(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let id = arguments
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RpcError::invalid_params("arguments.id (integer) is required"))?;
+
+    match state.sink_groups.get(id).await {
+        Ok(group) => Ok(tool_ok(json!({ "group": group }))),
+        Err(err) => Ok(tool_error(format!(
+            "sink group の取得に失敗しました: {err}"
+        ))),
+    }
+}
+
+/// `crate::rest::sink_groups_create`（admin REST）と全く同じ mutation
+/// フロー - [`tool_create_connection`]と違い pending queue 分岐が無い
+/// （このセクション冒頭のdoc comment参照）。
+async fn tool_create_sink_group(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let input: SinkGroupInput = serde_json::from_value(arguments)
+        .map_err(|err| RpcError::invalid_params(format!("sink group の入力が不正です: {err}")))?;
+
+    match state.sink_groups.create(input).await {
+        Ok(created) => {
+            audit_config_action(
+                state,
+                ctx,
+                "create",
+                "sink_groups",
+                Some(&created.id.to_string()),
+                Some(json!({ "name": created.name, "enabled": created.enabled })),
+            )
+            .await;
+            let _ = state.events.send(ServerEvent::ResourceChanged {
+                resource: "sink_groups".to_string(),
+            });
+            Ok(tool_ok(json!({ "created": created })))
+        }
+        Err(err) => Ok(banto_error_tool_error(&err)),
+    }
+}
+
+/// `crate::rest::sink_groups_update`（admin REST）と全く同じ mutation
+/// フロー - [`tool_update_connection`]と同型（`require_all_fields`で全項目
+/// 必須を強制する点も同じ）。
+async fn tool_update_sink_group(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    if let Some(err) = require_all_fields(&arguments, &UPDATE_SINK_GROUP_REQUIRED_FIELDS) {
+        return Ok(err);
+    }
+    let id = arguments
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RpcError::invalid_params("arguments.id (integer) is required"))?;
+    let input: SinkGroupInput = serde_json::from_value(arguments)
+        .map_err(|err| RpcError::invalid_params(format!("sink group の入力が不正です: {err}")))?;
+
+    match state.sink_groups.update(id, input).await {
+        Ok(updated) => {
+            audit_config_action(
+                state,
+                ctx,
+                "update",
+                "sink_groups",
+                Some(&id.to_string()),
+                Some(json!({ "name": updated.name, "enabled": updated.enabled })),
+            )
+            .await;
+            let _ = state.events.send(ServerEvent::ResourceChanged {
+                resource: "sink_groups".to_string(),
+            });
+            Ok(tool_ok(json!({ "updated": updated })))
+        }
+        Err(err) => Ok(banto_error_tool_error(&err)),
+    }
+}
+
+/// `crate::rest::sink_groups_delete`（admin REST）と全く同じ mutation
+/// フロー - [`tool_delete_group`]と同型。不可逆操作のため
+/// `arguments.confirm == true`を要求する。
+async fn tool_delete_sink_group(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let id = arguments
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RpcError::invalid_params("arguments.id (integer) is required"))?;
+    let confirmed = arguments.get("confirm").and_then(Value::as_bool) == Some(true);
+    if !confirmed {
+        return Ok(tool_error(
+            "confirm_required: 削除は不可逆操作です。arguments.confirm:true を指定してください。",
+        ));
+    }
+
+    match state.sink_groups.delete(id).await {
+        Ok(()) => {
+            audit_config_action(
+                state,
+                ctx,
+                "delete",
+                "sink_groups",
+                Some(&id.to_string()),
+                None,
+            )
+            .await;
+            let _ = state.events.send(ServerEvent::ResourceChanged {
+                resource: "sink_groups".to_string(),
+            });
+            Ok(tool_ok(json!({ "deleted": true })))
+        }
+        Err(err) => Ok(banto_error_tool_error(&err)),
+    }
 }
