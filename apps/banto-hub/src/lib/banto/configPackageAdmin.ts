@@ -19,6 +19,13 @@ import {
 import { getGrpcSettings, saveGrpcSettings } from './grpcSettingsAdmin';
 import { getMqttSettings, saveMqttSettings, type MqttSettings } from './mqttSettingsAdmin';
 import {
+	createSinkGroup,
+	listSinkGroups,
+	updateSinkGroup,
+	type SinkGroup,
+	type SinkGroupInput
+} from './sinkGroupsAdmin';
+import {
 	buildConfigPackage,
 	planByName,
 	serializeConfigPackage,
@@ -65,6 +72,11 @@ function buildTagMap(tags: readonly Tag[]): Map<string, Tag> {
 	return new Map(tags.map((tag) => [tag.name, tag]));
 }
 
+/** S6: `sinkGroups`の plan/apply 用（`buildConnectionMap`等と同じ形）。 */
+function buildSinkGroupMap(groups: readonly SinkGroup[]): Map<string, SinkGroup> {
+	return new Map(groups.map((group) => [group.name, group]));
+}
+
 function collectConnectionNames(
 	current: readonly PlcConnection[],
 	pkg: ConfigPackage
@@ -97,14 +109,15 @@ function resolveMqttCredentials(
 }
 
 export async function loadConfigPackage(): Promise<ConfigPackage> {
-	const [plcConnections, collectionGroups, tags, mqtt, grpc] = await Promise.all([
+	const [plcConnections, collectionGroups, tags, sinkGroups, mqtt, grpc] = await Promise.all([
 		listPlcConnections(),
 		listCollectionGroups(),
 		listTags(),
+		listSinkGroups(),
 		getMqttSettings(),
 		getGrpcSettings()
 	]);
-	return buildConfigPackage({ plcConnections, collectionGroups, tags, mqtt, grpc });
+	return buildConfigPackage({ plcConnections, collectionGroups, tags, sinkGroups, mqtt, grpc });
 }
 
 /**
@@ -147,14 +160,21 @@ export async function exportConfigPackageToDownload(): Promise<void> {
 }
 
 export async function inspectConfigPackage(pkg: ConfigPackage): Promise<ConfigPackageInspection> {
-	const [currentConnections, currentGroups, currentTags, mqttSettings, grpcSettings] =
-		await Promise.all([
-			listPlcConnections(),
-			listCollectionGroups(),
-			listTags(),
-			getMqttSettings(),
-			getGrpcSettings()
-		]);
+	const [
+		currentConnections,
+		currentGroups,
+		currentTags,
+		currentSinkGroups,
+		mqttSettings,
+		grpcSettings
+	] = await Promise.all([
+		listPlcConnections(),
+		listCollectionGroups(),
+		listTags(),
+		listSinkGroups(),
+		getMqttSettings(),
+		getGrpcSettings()
+	]);
 
 	const currentConnectionNames = collectConnectionNames(currentConnections, pkg);
 	const currentGroupNames = collectGroupNames(currentGroups, pkg);
@@ -164,6 +184,7 @@ export async function inspectConfigPackage(pkg: ConfigPackage): Promise<ConfigPa
 	);
 	const groupPlans = planByName(pkg.collectionGroups, currentGroups);
 	const tagPlans = planByName(pkg.tags, currentTags);
+	const sinkGroupPlans = planByName(pkg.sinkGroups, currentSinkGroups);
 	const warnings: string[] = [];
 
 	for (const group of pkg.collectionGroups) {
@@ -180,6 +201,25 @@ export async function inspectConfigPackage(pkg: ConfigPackage): Promise<ConfigPa
 			);
 		}
 	}
+	// S6: sink group が参照する接続・タグ名が現在の環境に存在するか
+	// （このパッケージ内で作成される予定のものも許容 - `currentConnectionNames`
+	// は`collectConnectionNames`がパッケージ内の名前も既に足し込んでいる）。
+	const currentTagNames = new Set(currentTags.map((tag) => tag.name));
+	for (const tag of pkg.tags) currentTagNames.add(tag.name);
+	for (const sinkGroup of pkg.sinkGroups) {
+		if (!currentConnectionNames.has(sinkGroup.dbConnectionName)) {
+			warnings.push(
+				`sink group '${sinkGroup.name}' の接続 '${sinkGroup.dbConnectionName}' は現在の環境で見つかりません`
+			);
+		}
+		for (const tagName of sinkGroup.tagNames) {
+			if (!currentTagNames.has(tagName)) {
+				warnings.push(
+					`sink group '${sinkGroup.name}' のタグ '${tagName}' は現在の環境で見つかりません`
+				);
+			}
+		}
+	}
 
 	return {
 		counts: {
@@ -188,7 +228,8 @@ export async function inspectConfigPackage(pkg: ConfigPackage): Promise<ConfigPa
 				update: connectionPlans.update.length
 			},
 			collectionGroups: { create: groupPlans.create.length, update: groupPlans.update.length },
-			tags: { create: tagPlans.create.length, update: tagPlans.update.length }
+			tags: { create: tagPlans.create.length, update: tagPlans.update.length },
+			sinkGroups: { create: sinkGroupPlans.create.length, update: sinkGroupPlans.update.length }
 		},
 		warnings: uniqueWarnings(warnings),
 		mqttCredentialsRequired: pkg.mqtt.enabled,
@@ -239,12 +280,14 @@ async function applyConfigPackageInner(
 	pkg: ConfigPackage,
 	options: ConfigPackageImportOptions
 ): Promise<ConfigPackageImportSummary> {
-	const [currentConnections, currentGroups, currentTags, currentMqtt] = await Promise.all([
-		listPlcConnections(),
-		listCollectionGroups(),
-		listTags(),
-		getMqttSettings()
-	]);
+	const [currentConnections, currentGroups, currentTags, currentSinkGroups, currentMqtt] =
+		await Promise.all([
+			listPlcConnections(),
+			listCollectionGroups(),
+			listTags(),
+			listSinkGroups(),
+			getMqttSettings()
+		]);
 
 	const warnings: string[] = [];
 	const connectionByName = buildConnectionMap(currentConnections);
@@ -340,6 +383,56 @@ async function applyConfigPackageInner(
 		}
 	}
 
+	// S6（docs/banto-hub-external-db-design.md §5.2・§6 item 6）: sink group
+	// はタグ・接続の両方を参照するため、上の両ループ（`connectionByName`/
+	// `tagByName`が最新化済み）の**後**に適用する - `collectionGroups`が
+	// `connectionByName`の後に来るのと同じ順序の理由。
+	const sinkGroupByName = buildSinkGroupMap(currentSinkGroups);
+	for (const sinkGroup of pkg.sinkGroups) {
+		const connection = connectionByName.get(sinkGroup.dbConnectionName);
+		if (!connection) {
+			warnings.push(
+				`sink group '${sinkGroup.name}' の接続 '${sinkGroup.dbConnectionName}' を解決できませんでした`
+			);
+			continue;
+		}
+		const tagIds: number[] = [];
+		let missingTag = false;
+		for (const tagName of sinkGroup.tagNames) {
+			const tag = tagByName.get(tagName);
+			if (!tag) {
+				warnings.push(`sink group '${sinkGroup.name}' のタグ '${tagName}' を解決できませんでした`);
+				missingTag = true;
+				continue;
+			}
+			tagIds.push(tag.id);
+		}
+		if (missingTag && tagIds.length === 0) {
+			// タグを1件も解決できなければ create/update 自体を送らない -
+			// サーバー側 `tagIds` 必須（1件以上）検証に必ず落ちるだけなので、
+			// 分かりやすい warning（上のループで既に積んでいる）で足りる。
+			continue;
+		}
+		const input: SinkGroupInput = {
+			name: sinkGroup.name,
+			dbConnectionId: connection.id,
+			mode: sinkGroup.mode,
+			intervalMs: sinkGroup.intervalMs,
+			tableName: sinkGroup.tableName,
+			storeBad: sinkGroup.storeBad,
+			enabled: sinkGroup.enabled,
+			tagIds
+		};
+		const existing = sinkGroupByName.get(sinkGroup.name);
+		if (existing) {
+			const updated = await updateSinkGroup(existing.id, input);
+			sinkGroupByName.set(updated.name, updated);
+		} else {
+			const created = await createSinkGroup(input);
+			sinkGroupByName.set(created.name, created);
+		}
+	}
+
 	const mqtt = resolveMqttCredentials(currentMqtt, options);
 	await saveMqttSettings({
 		enabled: pkg.mqtt.enabled,
@@ -377,6 +470,14 @@ async function applyConfigPackageInner(
 					.length,
 				update: pkg.tags.filter((tag) => currentTags.some((current) => current.name === tag.name))
 					.length
+			},
+			sinkGroups: {
+				create: pkg.sinkGroups.filter(
+					(group) => !currentSinkGroups.some((current) => current.name === group.name)
+				).length,
+				update: pkg.sinkGroups.filter((group) =>
+					currentSinkGroups.some((current) => current.name === group.name)
+				).length
 			}
 		},
 		mqttApplied: true,

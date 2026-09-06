@@ -91,6 +91,12 @@
 		type HostSwitchProgress,
 		type HostSwitchStatus
 	} from '$lib/banto/hostSwitchShell';
+	import {
+		getSinkServiceStatus,
+		startSinkService,
+		stopSinkService,
+		type SinkServiceStatus
+	} from '$lib/banto/sinkServiceShell';
 
 	const canManageWriteControl = $derived(isAdmin(sessionStore.role));
 	const localShell = isLocalShell();
@@ -150,6 +156,49 @@
 
 	function dbSourceStateLabel(state: string): string {
 		return DB_SOURCE_STATE_LABELS[state] ?? state;
+	}
+
+	/**
+	 * S6（docs/banto-hub-external-db-design.md §5.2・§5.5・§7 row S6）: `sink`
+	 * 節の表示ラベル・バッジクラス。サイドカーの`sidecar.state`は
+	 * `"online"`/`"unknown"`の2値のみ（`crate::sink::status`のモジュール doc
+	 * 参照 - 15秒以上 push が無ければ`unknown`）。
+	 */
+	const SINK_SIDECAR_STATE_LABELS: Record<string, string> = {
+		online: 'オンライン',
+		unknown: 'サイドカー未接続（15 秒以上 push なし）'
+	};
+
+	function sinkSidecarStateLabel(state: string): string {
+		return SINK_SIDECAR_STATE_LABELS[state] ?? state;
+	}
+
+	function sinkSidecarStateClass(state: string): string {
+		return state === 'online' ? 'state-good' : 'state-bad';
+	}
+
+	/**
+	 * sink group の`state`は`ALLOWED_SINK_GROUP_STATES`
+	 * （`apps/banto-hub/core/src/sink/status.rs`）の4値
+	 * （running/backoff/error/disabled）- 未知の値が来ても素通しする
+	 * （`dbSourceStateLabel`と同じ方針）。
+	 */
+	const SINK_GROUP_STATE_LABELS: Record<string, string> = {
+		running: '正常',
+		backoff: '再接続待ち',
+		error: 'エラー',
+		disabled: '無効（構成）'
+	};
+
+	function sinkGroupStateLabel(state: string): string {
+		return SINK_GROUP_STATE_LABELS[state] ?? state;
+	}
+
+	function sinkGroupStateClass(state: string): string {
+		if (state === 'running') return 'state-good';
+		if (state === 'backoff') return 'state-warn';
+		if (state === 'disabled') return 'state-stale';
+		return 'state-bad';
 	}
 
 	/**
@@ -442,6 +491,73 @@
 	let hostSwitchError: string | null = $state(null);
 	let autostartBusy = $state(false);
 
+	// --- サービス一覧（S6、docs/banto-hub-external-db-design.md §5.5・§7 row
+	// S6、ローカルシェル限定）: BantoHub は上の hostSwitch カードが持つ状態
+	// をそのまま表示専用の1行として流用し、BantoHubSink（外部 DB 連携 S5 の
+	// サイドカー）だけをこのセクション固有に start/stop する
+	// （`sinkServiceShell.ts`のモジュール doc参照）。BantoHub 自体の
+	// 起動・停止は上のカードが持つ「サービスへ切り替えて開始」/
+	// 「サービスを停止してアプリで開く」（ホスト切替、意味が異なる）に
+	// 委ねる - このセクションで二重の操作導線は作らない。
+	let sinkService: SinkServiceStatus | null = $state(null);
+	let sinkServiceBusy = $state(false);
+	let sinkServiceError: string | null = $state(null);
+
+	async function refreshSinkService(): Promise<void> {
+		if (!localShell) return;
+		try {
+			sinkService = await getSinkServiceStatus();
+			sinkServiceError = null;
+		} catch (err) {
+			sinkServiceError = errorMessage(err);
+		}
+	}
+
+	function sinkServiceStateLabel(): string {
+		if (!sinkService) return '不明';
+		return scmStateLabel(sinkService.scmState);
+	}
+
+	// 関数越しに読む理由: 上の`computeIsCollectionTransitioning`と同じ -
+	// `sinkService?.canOperate === true && sinkService.scmState === ...`を
+	// `$derived(...)`へ直接書くと svelte-check が`sinkService`を`never`と
+	// 誤って推論するケースがある。
+	function computeCanStartSinkService(): boolean {
+		return sinkService?.canOperate === true && sinkService.scmState === 'Stopped';
+	}
+	const canStartSinkService = $derived(computeCanStartSinkService());
+
+	function computeCanStopSinkService(): boolean {
+		return sinkService?.canOperate === true && sinkService.scmState === 'Running';
+	}
+	const canStopSinkService = $derived(computeCanStopSinkService());
+
+	async function handleStartSinkService(): Promise<void> {
+		sinkServiceBusy = true;
+		try {
+			await startSinkService();
+			toastStore.push('success', 'BantoHubSink を開始しました');
+			await refreshSinkService();
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			sinkServiceBusy = false;
+		}
+	}
+
+	async function handleStopSinkService(): Promise<void> {
+		sinkServiceBusy = true;
+		try {
+			await stopSinkService();
+			toastStore.push('success', 'BantoHubSink を停止しました');
+			await refreshSinkService();
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			sinkServiceBusy = false;
+		}
+	}
+
 	const scmStateLabels: Record<string, string> = {
 		NotInstalled: '未インストール',
 		Stopped: '停止',
@@ -495,8 +611,10 @@
 	$effect(() => {
 		if (!localShell) return;
 		void refreshHostSwitch();
+		void refreshSinkService();
 		const timer = setInterval(() => {
 			if (!hostSwitchBusy) void refreshHostSwitch();
+			if (!sinkServiceBusy) void refreshSinkService();
 		}, POLL_INTERVAL_MS);
 		let unlisten: (() => void) | undefined;
 		void listenHostSwitchProgress((ev) => {
@@ -726,6 +844,66 @@
 						{/if}
 					</div>
 				{/each}
+			{/if}
+		{/if}
+	</section>
+
+	<section>
+		<!--
+			S6（docs/banto-hub-external-db-design.md §5.2・§5.5・§7 row S6）:
+			`GET /api/status` の `sink` 節（DB Sink サイドカーの運転状態）を
+			表示する。DB Source 節と同じ「状態バッジ + 表」の見た目に揃える。
+			サイドカーは別プロセス（`apps/banto-hub-sink`）なので、この画面
+			からは起動・停止できない - 「サービス一覧」セクション（ローカル
+			シェル限定）が SCM 上の start/stop を担う。
+		-->
+		<h2>DB Sink</h2>
+		{#if loading && !status}
+			<p class="note">読み込み中…</p>
+		{:else if status}
+			<dl class="summary">
+				<dt>サイドカー</dt>
+				<dd>
+					<span class="state-chip {sinkSidecarStateClass(status.sink.sidecar.state)}">
+						{sinkSidecarStateLabel(status.sink.sidecar.state)}
+					</span>
+				</dd>
+				<dt>直近 push</dt>
+				<dd>{formatEpochMs(status.sink.sidecar.last_seen_at)}</dd>
+			</dl>
+			{#if status.sink.groups.length === 0}
+				<p class="note">
+					sink group が登録されていません（<a href="/sink">DB Sink</a> 画面から作成できます）。
+				</p>
+			{:else}
+				<table class="conn-table">
+					<thead>
+						<tr>
+							<th>sink group</th>
+							<th>状態</th>
+							<th>キュー滞留</th>
+							<th>破棄件数</th>
+							<th>直近 flush</th>
+							<th>直近エラー</th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each status.sink.groups as group (group.id)}
+							<tr>
+								<td>#{group.id}</td>
+								<td>
+									<span class="state-chip {sinkGroupStateClass(group.state)}">
+										{sinkGroupStateLabel(group.state)}
+									</span>
+								</td>
+								<td>{group.queued}</td>
+								<td>{group.dropped}</td>
+								<td>{formatEpochMs(group.last_flush_at)}</td>
+								<td>{group.last_error ?? '-'}</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
 			{/if}
 		{/if}
 	</section>
@@ -977,6 +1155,70 @@
 					この設定を変更しても、現在のサービスは開始・停止しません。変更時は管理者昇格（UAC）が必要です。
 				</p>
 			</div>
+		{/if}
+	</section>
+
+	<!--
+		S6（docs/banto-hub-external-db-design.md §5.5・§7 row S6）: 「サービス」
+		一覧 - BantoHub（上のカードの状態を表示専用の1行として流用）と
+		BantoHubSink（外部 DB 連携 S5 のサイドカー、この行だけ起動・停止を
+		行う）の SCM 状態をまとめて見せる。ローカルシェル限定
+		（`sinkServiceShell.ts`は Tauri invoke を使うため、通常ブラウザでは
+		呼べない）。
+	-->
+	<section>
+		<h2>サービス一覧</h2>
+		{#if !localShell}
+			<p class="note">ローカルシェルが必要です（ブラウザ遠隔からは操作できません）。</p>
+		{:else}
+			<table class="conn-table">
+				<thead>
+					<tr>
+						<th>サービス</th>
+						<th>状態</th>
+						<th>操作</th>
+					</tr>
+				</thead>
+				<tbody>
+					<tr>
+						<td>BantoHub</td>
+						<td>{hostSwitch ? scmStateLabel(hostSwitch.scmState) : '読み込み中…'}</td>
+						<td class="note"> 起動・停止は上の「Windows サービス」カードから行ってください。 </td>
+					</tr>
+					<tr>
+						<td>BantoHubSink</td>
+						<td>{sinkServiceStateLabel()}</td>
+						<td>
+							{#if sinkServiceError}
+								<span class="config-error">{sinkServiceError}</span>
+							{:else}
+								<div class="write-control-actions">
+									<button
+										type="button"
+										onclick={() => void handleStartSinkService()}
+										disabled={!canStartSinkService || sinkServiceBusy}
+									>
+										開始
+									</button>
+									<button
+										type="button"
+										class="danger"
+										onclick={() => void handleStopSinkService()}
+										disabled={!canStopSinkService || sinkServiceBusy}
+									>
+										停止
+									</button>
+								</div>
+							{/if}
+						</td>
+					</tr>
+				</tbody>
+			</table>
+			<p class="note">
+				BantoHubSink は「サービス」一覧・DB Sink サイドカー（<a href="/sink">DB Sink</a>画面参照）の
+				Windows サービスです。インストールは
+				<code>banto-hub-sink.exe install</code> を管理者権限で実行してください（本画面からは行えません）。
+			</p>
 		{/if}
 	</section>
 </div>

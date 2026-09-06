@@ -119,6 +119,38 @@ export interface DbSourceStatusEntry {
 	groups: DbSourceGroupStatusEntry[];
 }
 
+/**
+ * S6（docs/banto-hub-external-db-design.md §5.2・§5.5・§7 row S6）: `GET
+ * /api/status` の `sink.groups` 配列1件分 - mirrors
+ * `banto_hub_core::rest::AdminSinkGroupStatusEntry`（サイドカーが最後に
+ * `PUT /api/sink/status` で push した内容をそのまま映す）。
+ */
+export interface SinkGroupStatusEntry {
+	id: number;
+	state: string;
+	queued: number;
+	dropped: number;
+	last_flush_at: number | null;
+	last_error: string | null;
+}
+
+/**
+ * S6: `GET /api/status` の `sink.sidecar` - mirrors
+ * `banto_hub_core::rest::AdminSinkSidecarStatusEntry`。`state` は
+ * `"online"`（`SINK_SIDECAR_STALE_AFTER_MS`（15秒）以内に push があった）
+ * または `"unknown"`（無い、または一度も push が無い）。
+ */
+export interface SinkSidecarStatusEntry {
+	state: 'online' | 'unknown' | string;
+	last_seen_at: number | null;
+}
+
+/** S6: `GET /api/status` の `sink` 節。 */
+export interface SinkStatusEntry {
+	sidecar: SinkSidecarStatusEntry;
+	groups: SinkGroupStatusEntry[];
+}
+
 /** `GET /api/status` の応答。 */
 export interface StatusResponse {
 	version: string;
@@ -156,6 +188,8 @@ export interface StatusResponse {
 	system: SystemInfoEntry;
 	/** S3（docs/banto-hub-external-db-design.md §7 row S3）: DB Source の接続ごとの運転状態。 */
 	db_source: DbSourceStatusEntry[];
+	/** S6（docs/banto-hub-external-db-design.md §5.2・§5.5・§7 row S6）: DB Sink サイドカーの運転状態。 */
+	sink: SinkStatusEntry;
 }
 
 /** サーバーの camelCase 応答（`AdminDbSourceGroupStatusEntry`）の生形。 */
@@ -165,6 +199,28 @@ interface RawDbSourceGroupStatusEntry {
 	lastOkAt: number | null;
 	lastError: string | null;
 	rowCountLast: number | null;
+}
+
+/** サーバーの camelCase 応答（`AdminSinkGroupStatusEntry`）の生形。 */
+interface RawSinkGroupStatusEntry {
+	id: number;
+	state: string;
+	queued: number;
+	dropped: number;
+	lastFlushAt: number | null;
+	lastError: string | null;
+}
+
+/** サーバーの camelCase 応答（`AdminSinkSidecarStatusEntry`）の生形。 */
+interface RawSinkSidecarStatusEntry {
+	state: string;
+	lastSeenAt: number | null;
+}
+
+/** サーバーの camelCase 応答（`AdminSinkStatusEntry`）の生形。 */
+interface RawSinkStatusEntry {
+	sidecar: RawSinkSidecarStatusEntry;
+	groups: RawSinkGroupStatusEntry[];
 }
 
 /** サーバーの camelCase 応答（`AdminDbSourceStatusEntry`）の生形。 */
@@ -200,6 +256,7 @@ interface RawStatusResponse {
 		hostMemoryTotalBytes: number;
 	};
 	dbSource: RawDbSourceStatusEntry[];
+	sink: RawSinkStatusEntry;
 }
 
 /** サーバーの camelCase 応答を、このファイルが公開する既存の型（snake_case
@@ -242,7 +299,21 @@ function fromRawStatus(raw: RawStatusResponse): StatusResponse {
 				last_error: group.lastError,
 				row_count_last: group.rowCountLast
 			}))
-		}))
+		})),
+		sink: {
+			sidecar: {
+				state: raw.sink.sidecar.state,
+				last_seen_at: raw.sink.sidecar.lastSeenAt
+			},
+			groups: raw.sink.groups.map((group) => ({
+				id: group.id,
+				state: group.state,
+				queued: group.queued,
+				dropped: group.dropped,
+				last_flush_at: group.lastFlushAt,
+				last_error: group.lastError
+			}))
+		}
 	};
 }
 

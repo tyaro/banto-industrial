@@ -28,6 +28,36 @@
 //! - `install`/`uninstall`自体は trait に含めていない（設計 §4 の契約が
 //!   要求する最小面は query/start/stop/restart/set_auto_start のみ - 実装
 //!   指示のとおり、必須ではない拡張は避けた）。
+//!
+//! ## S6（docs/banto-hub-external-db-design.md §5.5・§7 row S6、2026-09-07）:
+//! サービス名の汎化
+//!
+//! デスクトップシェルの「サービス」一覧（`BantoHub`・`BantoHubSink`の両方の
+//! SCM 状態を表示し、`BantoHubSink`は起動・停止も行う）のために、
+//! [`WindowsServiceManager`]が対象にするサービス名・表示名・起動引数を
+//! コンストラクタ引数へ持ち上げた（[`WindowsServiceManager::for_service`]）。
+//! 既存の[`WindowsServiceManager::new`]は`for_service(SERVICE_NAME,
+//! SERVICE_DISPLAY_NAME, executable_path, vec![RUN_SERVICE_ARG])`の薄い
+//! ラッパーになっただけで、`BantoHub`向けの挙動は一切変えていない -
+//! `win_service.rs`・トレイのサービス切替（`apps/banto-hub/src-tauri`）と
+//! いった既存呼び出し元は無改造で動く。[`SINK_SERVICE_NAME`]/
+//! [`SINK_SERVICE_DISPLAY_NAME`]は`apps/banto-hub-sink/src/service.rs`の
+//! 同名定数と同じ値を複製したもの - Tauri シェルは`banto-hub-sink`クレートに
+//! 依存させたくない（デスクトップシェルは`banto-hub-core`だけに依存する設計、
+//! 本ファイル冒頭の doc 参照）ため、値の複製で済ませる
+//! （`plcConnectionForm.ts`が`POSTGRES_PROTOCOL`を複製するのと同じ判断）。
+//!
+//! **既知の制限（PR 本文にも記載）**: `BantoHubSink`の SCM オブジェクトには
+//! `banto-hub-elev.exe grant-service-acl`が付与する ACE
+//! （`service_elevated.rs`参照、`BantoHub`固定）が付与されていない - この
+//! スライスは`grant-service-acl`自体の対象拡張は行わないため、
+//! `BantoHub Operators`グループのメンバー（管理者ではない一般オペレータ）が
+//! `BantoHubSink`を起動・停止しようとすると Win32 の`ERROR_ACCESS_DENIED`
+//! （[`ServiceManagerError::AccessDenied`]）になる可能性が高い。フルの
+//! Windows 管理者（既定で全サービスの SC_MANAGER_ALL_ACCESS 相当を持つ）で
+//! あれば操作できる。実機（Windows）で`BantoHubSink`を実際にインストールした
+//! 状態での検証は本 PR の範囲外（この worktree には実サービスをインストール
+//! しない制約があるため）。
 
 use std::time::{Duration, Instant};
 
@@ -37,6 +67,21 @@ use thiserror::Error;
 /// `uninstall`/`run-service`と[`WindowsServiceManager`]が共通で使う単一の
 /// ソース（以前は`win_service.rs`だけが`"BantoHub"`を定義していた）。
 pub const SERVICE_NAME: &str = "BantoHub";
+
+/// `BantoHub`の SCM 表示名（`win_service.rs::install`と同じ値）。S6 の
+/// [`WindowsServiceManager::for_service`]汎化に伴い、`windows_impl`内部
+/// 専用だった定数をここへ公開した（モジュール doc「サービス名の汎化」節
+/// 参照）。
+pub const SERVICE_DISPLAY_NAME: &str = "banto-hub タグサーバー";
+
+/// `BantoHubSink`（外部 DB 連携 S5 のサイドカー）の SCM サービス名。
+/// `apps/banto-hub-sink/src/service.rs::SERVICE_NAME`と同じ値の複製（モジュール
+/// doc「サービス名の汎化」節参照）。
+pub const SINK_SERVICE_NAME: &str = "BantoHubSink";
+
+/// `BantoHubSink`の SCM 表示名。`apps/banto-hub-sink/src/service.rs
+/// ::SERVICE_DISPLAY_NAME`と同じ値の複製。
+pub const SINK_SERVICE_DISPLAY_NAME: &str = "banto-hub DB Sink サイドカー";
 
 /// SCM がサービス開始時に子プロセスへ渡す起動引数
 /// （`bin/banto-hub.rs`の`run-service`サブコマンド）。[`WindowsServiceManager`]
@@ -355,9 +400,17 @@ impl ServiceManager for MockServiceManager {
 /// 持つ）。
 #[cfg(windows)]
 pub struct WindowsServiceManager {
+    /// SCM 上のサービス名（S6・モジュール doc「サービス名の汎化」節参照）。
+    service_name: &'static str,
+    /// `set_auto_start`の`ServiceInfo`再構築で使う表示名。
+    display_name: &'static str,
     /// `set_auto_start`がサービス再登録時に使う実行ファイルパス（上記
     /// 制約参照）。
     executable_path: std::path::PathBuf,
+    /// `set_auto_start`の`ServiceInfo`再構築で使う起動引数（`BantoHub`は
+    /// `[RUN_SERVICE_ARG]`固定、`for_service`経由の他サービスは呼び出し側が
+    /// 指定する）。
+    launch_arguments: Vec<std::ffi::OsString>,
 }
 
 #[cfg(windows)]
@@ -375,14 +428,9 @@ mod windows_impl {
 
     use super::{
         ScmState, ServiceManager, ServiceManagerError, ServiceStatusSummary, TransitionHandle,
-        WindowsServiceManager, RUN_SERVICE_ARG, SERVICE_NAME,
+        WindowsServiceManager, RUN_SERVICE_ARG, SERVICE_DISPLAY_NAME, SERVICE_NAME,
     };
 
-    /// `win_service.rs`の`SERVICE_DISPLAY_NAME`/`SERVICE_TYPE`と同じ値
-    /// （このモジュール冒頭の doc「`set_auto_start`の制約」参照 -
-    /// 再登録時に`win_service.rs::install`と同じ`ServiceInfo`を再現する
-    /// ために必要）。値を変えるときは両ファイルを同時に直すこと。
-    const SERVICE_DISPLAY_NAME: &str = "banto-hub タグサーバー";
     const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 
     /// Win32 エラーコード（`ERROR_SERVICE_DOES_NOT_EXIST`）- サービス未登録
@@ -395,16 +443,40 @@ mod windows_impl {
     impl WindowsServiceManager {
         /// `executable_path`は`set_auto_start`での再登録に使う実行ファイル
         /// パス（構造体 doc 参照）。通常は`std::env::current_exe()`を渡す。
+        /// `BantoHub`固定 - [`Self::for_service`]の薄いラッパー（S6・
+        /// モジュール冒頭 doc「サービス名の汎化」節参照）。
         pub fn new(executable_path: PathBuf) -> Self {
-            Self { executable_path }
+            Self::for_service(
+                SERVICE_NAME,
+                SERVICE_DISPLAY_NAME,
+                executable_path,
+                vec![OsString::from(RUN_SERVICE_ARG)],
+            )
+        }
+
+        /// S6: `BantoHub`以外の任意のサービス（`BantoHubSink`等）を対象に
+        /// する汎用コンストラクタ。モジュール冒頭 doc「サービス名の汎化」
+        /// 節参照 - [`Self::new`]はこれの`BantoHub`固定版。
+        pub fn for_service(
+            service_name: &'static str,
+            display_name: &'static str,
+            executable_path: PathBuf,
+            launch_arguments: Vec<OsString>,
+        ) -> Self {
+            Self {
+                service_name,
+                display_name,
+                executable_path,
+                launch_arguments,
+            }
         }
     }
 
-    fn map_win_err(err: windows_service::Error) -> ServiceManagerError {
+    fn map_win_err(service_name: &str, err: windows_service::Error) -> ServiceManagerError {
         if let windows_service::Error::Winapi(io_err) = &err {
             match io_err.raw_os_error() {
                 Some(ERROR_SERVICE_DOES_NOT_EXIST) => {
-                    return ServiceManagerError::NotFound(SERVICE_NAME.to_string());
+                    return ServiceManagerError::NotFound(service_name.to_string());
                 }
                 Some(ERROR_ACCESS_DENIED) => return ServiceManagerError::AccessDenied,
                 _ => {}
@@ -413,8 +485,8 @@ mod windows_impl {
         ServiceManagerError::Other(err.to_string())
     }
 
-    fn open_scm(access: WinScmAccess) -> Result<WinScm, ServiceManagerError> {
-        WinScm::local_computer(None::<&str>, access).map_err(map_win_err)
+    fn open_scm(service_name: &str, access: WinScmAccess) -> Result<WinScm, ServiceManagerError> {
+        WinScm::local_computer(None::<&str>, access).map_err(|err| map_win_err(service_name, err))
     }
 
     /// `open_service`失敗を「未登録」と「その他のエラー」に分ける共通処理。
@@ -423,9 +495,10 @@ mod windows_impl {
     /// の契約「サービス未登録はエラーではない」）。
     fn try_open_service(
         manager: &WinScm,
+        service_name: &str,
         access: ServiceAccess,
     ) -> Result<Option<Service>, ServiceManagerError> {
-        match manager.open_service(SERVICE_NAME, access) {
+        match manager.open_service(service_name, access) {
             Ok(service) => Ok(Some(service)),
             Err(err) => {
                 if let windows_service::Error::Winapi(io_err) = &err {
@@ -433,7 +506,7 @@ mod windows_impl {
                         return Ok(None);
                     }
                 }
-                Err(map_win_err(err))
+                Err(map_win_err(service_name, err))
             }
         }
     }
@@ -450,9 +523,9 @@ mod windows_impl {
 
     impl ServiceManager for WindowsServiceManager {
         fn query_status(&self) -> Result<ServiceStatusSummary, ServiceManagerError> {
-            let manager = open_scm(WinScmAccess::CONNECT)?;
+            let manager = open_scm(self.service_name, WinScmAccess::CONNECT)?;
             let access = ServiceAccess::QUERY_STATUS | ServiceAccess::QUERY_CONFIG;
-            let service = match try_open_service(&manager, access)? {
+            let service = match try_open_service(&manager, self.service_name, access)? {
                 Some(service) => service,
                 None => {
                     return Ok(ServiceStatusSummary {
@@ -462,8 +535,12 @@ mod windows_impl {
                     });
                 }
             };
-            let status = service.query_status().map_err(map_win_err)?;
-            let config = service.query_config().map_err(map_win_err)?;
+            let status = service
+                .query_status()
+                .map_err(|err| map_win_err(self.service_name, err))?;
+            let config = service
+                .query_config()
+                .map_err(|err| map_win_err(self.service_name, err))?;
             Ok(ServiceStatusSummary {
                 state: map_state(status.current_state),
                 auto_start: matches!(config.start_type, ServiceStartType::AutoStart),
@@ -472,26 +549,34 @@ mod windows_impl {
         }
 
         fn start(&self) -> Result<TransitionHandle, ServiceManagerError> {
-            let manager = open_scm(WinScmAccess::CONNECT)?;
+            let manager = open_scm(self.service_name, WinScmAccess::CONNECT)?;
             let access = ServiceAccess::START | ServiceAccess::QUERY_STATUS;
-            let service = try_open_service(&manager, access)?
-                .ok_or_else(|| ServiceManagerError::NotFound(SERVICE_NAME.to_string()))?;
-            let status = service.query_status().map_err(map_win_err)?;
+            let service = try_open_service(&manager, self.service_name, access)?
+                .ok_or_else(|| ServiceManagerError::NotFound(self.service_name.to_string()))?;
+            let status = service
+                .query_status()
+                .map_err(|err| map_win_err(self.service_name, err))?;
             // 冪等（設計 §4「多重クリック対策」）。
             if status.current_state != ServiceState::Running {
-                service.start::<&str>(&[]).map_err(map_win_err)?;
+                service
+                    .start::<&str>(&[])
+                    .map_err(|err| map_win_err(self.service_name, err))?;
             }
             Ok(TransitionHandle::new(ScmState::Running))
         }
 
         fn stop(&self) -> Result<TransitionHandle, ServiceManagerError> {
-            let manager = open_scm(WinScmAccess::CONNECT)?;
+            let manager = open_scm(self.service_name, WinScmAccess::CONNECT)?;
             let access = ServiceAccess::STOP | ServiceAccess::QUERY_STATUS;
-            let service = try_open_service(&manager, access)?
-                .ok_or_else(|| ServiceManagerError::NotFound(SERVICE_NAME.to_string()))?;
-            let status = service.query_status().map_err(map_win_err)?;
+            let service = try_open_service(&manager, self.service_name, access)?
+                .ok_or_else(|| ServiceManagerError::NotFound(self.service_name.to_string()))?;
+            let status = service
+                .query_status()
+                .map_err(|err| map_win_err(self.service_name, err))?;
             if status.current_state != ServiceState::Stopped {
-                service.stop().map_err(map_win_err)?;
+                service
+                    .stop()
+                    .map_err(|err| map_win_err(self.service_name, err))?;
             }
             Ok(TransitionHandle::new(ScmState::Stopped))
         }
@@ -510,10 +595,10 @@ mod windows_impl {
         }
 
         fn set_auto_start(&self, enabled: bool) -> Result<(), ServiceManagerError> {
-            let manager = open_scm(WinScmAccess::CONNECT)?;
+            let manager = open_scm(self.service_name, WinScmAccess::CONNECT)?;
             let access = ServiceAccess::CHANGE_CONFIG;
-            let service = try_open_service(&manager, access)?
-                .ok_or_else(|| ServiceManagerError::NotFound(SERVICE_NAME.to_string()))?;
+            let service = try_open_service(&manager, self.service_name, access)?
+                .ok_or_else(|| ServiceManagerError::NotFound(self.service_name.to_string()))?;
             let start_type = if enabled {
                 ServiceStartType::AutoStart
             } else {
@@ -522,18 +607,20 @@ mod windows_impl {
             // このファイル冒頭のモジュール doc「`set_auto_start`の制約」
             // 参照 - `win_service.rs::install`と同じ組み立て方で再構築する。
             let service_info = ServiceInfo {
-                name: OsString::from(SERVICE_NAME),
-                display_name: OsString::from(SERVICE_DISPLAY_NAME),
+                name: OsString::from(self.service_name),
+                display_name: OsString::from(self.display_name),
                 service_type: SERVICE_TYPE,
                 start_type,
                 error_control: ServiceErrorControl::Normal,
                 executable_path: self.executable_path.clone(),
-                launch_arguments: vec![OsString::from(RUN_SERVICE_ARG)],
+                launch_arguments: self.launch_arguments.clone(),
                 dependencies: vec![],
                 account_name: None,
                 account_password: None,
             };
-            service.change_config(&service_info).map_err(map_win_err)?;
+            service
+                .change_config(&service_info)
+                .map_err(|err| map_win_err(self.service_name, err))?;
             if enabled {
                 // 自動起動を明示的に有効化する経路では、install()の
                 // AutoStart 既定（T17-4 以前）と同じ判断（遅延自動開始、
@@ -541,7 +628,9 @@ mod windows_impl {
                 // T17-4 で install() 自体の既定は OnDemand に変わったが、
                 // AutoStart=遅延あり、OnDemand=該当なし、の対応関係は
                 // 変えていない（OnDemand には遅延自動開始の概念が無い）。
-                service.set_delayed_auto_start(true).map_err(map_win_err)?;
+                service
+                    .set_delayed_auto_start(true)
+                    .map_err(|err| map_win_err(self.service_name, err))?;
             }
             Ok(())
         }
@@ -707,5 +796,57 @@ mod tests {
             ScmState::Other("Paused".to_string()).to_string(),
             "Other(Paused)"
         );
+    }
+
+    // S6（docs/banto-hub-external-db-design.md §5.5・§7 row S6）:
+    // `WindowsServiceManager::for_service`のパラメータ化を、非破壊な
+    // 読み取り専用操作（`query_status`）だけで実機 Windows 上で検証する。
+    // インストール・起動・停止は一切行わない（本 PR のスコープ外・
+    // このワークスペースでは禁止されている操作）。
+    #[cfg(windows)]
+    mod windows_for_service_tests {
+        use crate::service_manager::{ScmState, ServiceManager, WindowsServiceManager};
+
+        /// 実在しないサービス名を渡しても`SERVICE_NAME`（`"BantoHub"`）
+        /// 固定ではなく、渡した名前でSCMへ問い合わせていることの確認 -
+        /// もし内部で`SERVICE_NAME`定数へ固定されたままだったら、この
+        /// テストはこの環境に実際に`BantoHub`サービスが登録されている限り
+        /// `NotInstalled`ではなく実際の状態を返してしまい検出できるはず
+        /// だった箇所（`for_service`導入前の`new`はまさにこの固定だった）。
+        #[test]
+        fn for_service_queries_the_given_service_name_not_the_bantohub_default() {
+            let manager = WindowsServiceManager::for_service(
+                "BantoHubDoesNotExist12345",
+                "存在しないテスト用サービス",
+                std::path::PathBuf::new(),
+                vec![],
+            );
+            let status = manager
+                .query_status()
+                .expect("query_status against SCM must succeed (read-only, no privilege needed)");
+            assert_eq!(status.state, ScmState::NotInstalled);
+            assert!(!status.auto_start);
+            assert_eq!(status.pid, None);
+        }
+
+        /// `SINK_SERVICE_NAME`/`SINK_SERVICE_DISPLAY_NAME`定数がそのまま
+        /// `for_service`に渡せる形（`&'static str`）であることの型チェック
+        /// を兼ねる - デスクトップシェルの「サービス」一覧が使う構築経路と
+        /// 同じ形。
+        #[test]
+        fn for_service_accepts_the_sink_service_constants() {
+            use crate::service_manager::{SINK_SERVICE_DISPLAY_NAME, SINK_SERVICE_NAME};
+            let manager = WindowsServiceManager::for_service(
+                SINK_SERVICE_NAME,
+                SINK_SERVICE_DISPLAY_NAME,
+                std::path::PathBuf::new(),
+                vec![],
+            );
+            // `BantoHubSink`が本当にこの環境へインストールされている場合
+            // （通常は無い想定）でも、どちらの状態でも失敗しないことだけ
+            // 確認する（インストール有無を前提にしない）。
+            let status = manager.query_status();
+            assert!(status.is_ok());
+        }
     }
 }

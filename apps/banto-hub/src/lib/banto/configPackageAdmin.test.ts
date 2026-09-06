@@ -62,6 +62,16 @@ vi.mock('./mqttSettingsAdmin', () => ({
 	saveMqttSettings: vi.fn()
 }));
 
+// S6（docs/banto-hub-external-db-design.md §5.2・§6 item 6）: 上の
+// `tagRegistryAdmin`/`grpcSettingsAdmin`/`mqttSettingsAdmin` と同じ理由
+// （`@banto/admin-core`を経由させない）でモックする。
+vi.mock('./sinkGroupsAdmin', () => ({
+	listSinkGroups: vi.fn(),
+	createSinkGroup: vi.fn(),
+	updateSinkGroup: vi.fn(),
+	deleteSinkGroup: vi.fn()
+}));
+
 import {
 	listPlcConnections,
 	createPlcConnection,
@@ -75,6 +85,7 @@ import {
 } from './tagRegistryAdmin';
 import { getGrpcSettings, saveGrpcSettings } from './grpcSettingsAdmin';
 import { getMqttSettings, saveMqttSettings } from './mqttSettingsAdmin';
+import { listSinkGroups, createSinkGroup, updateSinkGroup } from './sinkGroupsAdmin';
 import {
 	applyConfigPackage,
 	inspectConfigPackage,
@@ -134,6 +145,7 @@ const pkg: ConfigPackage = {
 			retain: false
 		}
 	],
+	sinkGroups: [],
 	mqtt: {
 		enabled: false,
 		host: '',
@@ -167,6 +179,9 @@ beforeEach(() => {
 	vi.mocked(listTags).mockReset().mockResolvedValue([]);
 	vi.mocked(createTag).mockReset();
 	vi.mocked(updateTag).mockReset();
+	vi.mocked(listSinkGroups).mockReset().mockResolvedValue([]);
+	vi.mocked(createSinkGroup).mockReset();
+	vi.mocked(updateSinkGroup).mockReset();
 	vi.mocked(getGrpcSettings)
 		.mockReset()
 		.mockResolvedValue({ enabled: false, bind: '127.0.0.1', port: 50051 });
@@ -662,5 +677,220 @@ describe('inspectConfigPackage: dbConnectionsPasswordRequired は再設定が必
 		);
 
 		expect(inspection.dbConnectionsPasswordRequired).toEqual([]);
+	});
+});
+
+// --- S6（docs/banto-hub-external-db-design.md §5.2・§6 item 6）: sink group
+// の import/inspect - 接続名・タグ名からサーバー側 id への解決を含む点が
+// 他のエンティティと違うため個別に固定する。
+
+describe('applyConfigPackage: sink group は接続名・タグ名を id へ解決してから CRUD する', () => {
+	const pkgWithSinkGroup: ConfigPackage = {
+		...pkg,
+		plcConnections: [
+			{
+				name: 'pg1',
+				protocol: 'postgres',
+				host: '10.0.0.5',
+				port: 5432,
+				unitId: 1,
+				enabled: true,
+				simulation: false,
+				wordOrder: 'low_high',
+				database: 'appdb',
+				username: 'appuser'
+			}
+		],
+		collectionGroups: [],
+		tags: [],
+		sinkGroups: [
+			{
+				name: 'line1-log',
+				dbConnectionName: 'pg1',
+				mode: 'interval',
+				intervalMs: 1000,
+				tableName: 'public.tag_history',
+				storeBad: false,
+				enabled: true,
+				tagNames: ['temp01']
+			}
+		]
+	};
+
+	function seedPgConnectionAndTag(): void {
+		vi.mocked(createPlcConnection).mockResolvedValue({
+			id: 1,
+			name: 'pg1',
+			protocol: 'postgres',
+			host: '10.0.0.5',
+			port: 5432,
+			unitId: 1,
+			enabled: true,
+			simulation: false,
+			wordOrder: 'low_high',
+			database: 'appdb',
+			username: 'appuser',
+			passwordSet: false
+		});
+		vi.mocked(listTags).mockResolvedValue([
+			{
+				id: 55,
+				name: 'temp01',
+				collectionGroupId: 1,
+				address: 'D100',
+				dataType: 'i16',
+				stringLength: null,
+				stringEncoding: 'utf8',
+				rawLo: null,
+				rawHi: null,
+				engLo: null,
+				engHi: null,
+				unit: null,
+				decimals: 0,
+				thresholdH: null,
+				thresholdHh: null,
+				thresholdL: null,
+				thresholdLl: null,
+				enabled: true,
+				writable: false,
+				tagKind: 'plc',
+				expression: null,
+				retain: false,
+				revision: 1
+			}
+		]);
+	}
+
+	it('createSinkGroup には接続 id・タグ id 配列を解決して渡す（新規作成）', async () => {
+		seedPgConnectionAndTag();
+		vi.mocked(listSinkGroups).mockResolvedValue([]);
+		vi.mocked(createSinkGroup).mockResolvedValue({
+			id: 9,
+			name: 'line1-log',
+			dbConnectionId: 1,
+			mode: 'interval',
+			intervalMs: 1000,
+			tableName: 'public.tag_history',
+			storeBad: false,
+			enabled: true,
+			tagIds: [55]
+		});
+
+		await applyConfigPackage(pkgWithSinkGroup);
+
+		expect(createSinkGroup).toHaveBeenCalledWith({
+			name: 'line1-log',
+			dbConnectionId: 1,
+			mode: 'interval',
+			intervalMs: 1000,
+			tableName: 'public.tag_history',
+			storeBad: false,
+			enabled: true,
+			tagIds: [55]
+		});
+		expect(updateSinkGroup).not.toHaveBeenCalled();
+	});
+
+	it('同名の既存 sink group があれば updateSinkGroup を呼ぶ（作成ではなく更新）', async () => {
+		seedPgConnectionAndTag();
+		vi.mocked(listSinkGroups).mockResolvedValue([
+			{
+				id: 9,
+				name: 'line1-log',
+				dbConnectionId: 1,
+				mode: 'interval',
+				intervalMs: 5000,
+				tableName: 'public.tag_history',
+				storeBad: false,
+				enabled: true,
+				tagIds: [55]
+			}
+		]);
+		vi.mocked(updateSinkGroup).mockResolvedValue({
+			id: 9,
+			name: 'line1-log',
+			dbConnectionId: 1,
+			mode: 'interval',
+			intervalMs: 1000,
+			tableName: 'public.tag_history',
+			storeBad: false,
+			enabled: true,
+			tagIds: [55]
+		});
+
+		await applyConfigPackage(pkgWithSinkGroup);
+
+		expect(updateSinkGroup).toHaveBeenCalledWith(9, {
+			name: 'line1-log',
+			dbConnectionId: 1,
+			mode: 'interval',
+			intervalMs: 1000,
+			tableName: 'public.tag_history',
+			storeBad: false,
+			enabled: true,
+			tagIds: [55]
+		});
+		expect(createSinkGroup).not.toHaveBeenCalled();
+	});
+
+	it('接続を解決できない sink group は warning を積んで CRUD を呼ばない', async () => {
+		vi.mocked(listSinkGroups).mockResolvedValue([]);
+		// `createPlcConnection`をモックしないため接続は解決されない
+		// （pg1接続自体の作成は素通りするが `connectionByName` には乗らない）。
+		vi.mocked(createPlcConnection).mockResolvedValue({
+			id: 1,
+			name: 'different-name',
+			protocol: 'postgres',
+			host: '10.0.0.5',
+			port: 5432,
+			unitId: 1,
+			enabled: true,
+			simulation: false,
+			wordOrder: 'low_high',
+			database: 'appdb',
+			username: 'appuser',
+			passwordSet: false
+		});
+
+		const summary = await applyConfigPackage(pkgWithSinkGroup);
+
+		expect(createSinkGroup).not.toHaveBeenCalled();
+		expect(updateSinkGroup).not.toHaveBeenCalled();
+		expect(summary.warnings.some((w) => w.includes('line1-log'))).toBe(true);
+	});
+
+	it('inspectConfigPackage は sinkGroups の create/update 件数を数える', async () => {
+		vi.mocked(listPlcConnections).mockResolvedValue([]);
+		vi.mocked(listCollectionGroups).mockResolvedValue([]);
+		vi.mocked(listTags).mockResolvedValue([]);
+		vi.mocked(listSinkGroups).mockResolvedValue([]);
+
+		const inspection = await inspectConfigPackage(pkgWithSinkGroup);
+
+		expect(inspection.counts.sinkGroups).toEqual({ create: 1, update: 0 });
+	});
+
+	it('inspectConfigPackage は未解決の接続・タグを warning に積む', async () => {
+		vi.mocked(listPlcConnections).mockResolvedValue([]);
+		vi.mocked(listCollectionGroups).mockResolvedValue([]);
+		vi.mocked(listTags).mockResolvedValue([]);
+		vi.mocked(listSinkGroups).mockResolvedValue([]);
+
+		const pkgWithUnresolvedRefs: ConfigPackage = {
+			...pkgWithSinkGroup,
+			plcConnections: [],
+			sinkGroups: [
+				{
+					...pkgWithSinkGroup.sinkGroups[0],
+					dbConnectionName: 'no-such-connection',
+					tagNames: ['no-such-tag']
+				}
+			]
+		};
+
+		const inspection = await inspectConfigPackage(pkgWithUnresolvedRefs);
+
+		expect(inspection.warnings.some((w) => w.includes('no-such-connection'))).toBe(true);
+		expect(inspection.warnings.some((w) => w.includes('no-such-tag'))).toBe(true);
 	});
 });

@@ -32,6 +32,13 @@ export const navItems: NavItem[] = [
 	{ path: '/status', label: '状態', icon: '📡' },
 	{ path: '/tags', label: 'タグ登録', icon: '🏷️' },
 	{ path: '/monitor', label: 'タグモニタ', icon: '📈' },
+	// S6（docs/banto-hub-external-db-design.md §5.2・§7 row S6）: DB Sink の
+	// sink group 管理画面。`GET /api/sink/groups`はロール不問（閲覧は
+	// viewer も可）・作成/更新/削除は editor 以上（`require_editor`）と
+	// サーバー側の権限に合わせ、ここでは admin 限定にしない - ページ内の
+	// 「サイドカー用 API キー」セクションだけを admin 限定で出す
+	// （`/api-keys`自体が admin 限定なのと同じ理由、`sink/+page.svelte`参照）。
+	{ path: '/sink', label: 'DB Sink', icon: '🗄️' },
 	{ path: '/api-keys', label: 'APIキー', icon: '🔑', adminOnly: true },
 	{ path: '/users', label: 'ユーザー管理', icon: '👤', adminOnly: true },
 	{ path: '/audit-log', label: '監査ログ', icon: '🧾', adminOnly: true },

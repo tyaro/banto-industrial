@@ -221,6 +221,7 @@ use tauri_plugin_notification::NotificationExt;
 use tokio::sync::Mutex as AsyncMutex;
 
 mod host_switch_ipc;
+mod sink_service_ipc;
 mod tray_status;
 
 /// メインウィンドウのラベル - `tauri.conf.json` の `app.windows[0].label` と
@@ -1355,6 +1356,12 @@ pub fn run() {
             host_switch_ipc::switch_to_service,
             host_switch_ipc::switch_to_desktop,
             host_switch_ipc::set_service_autostart,
+            // S6（docs/banto-hub-external-db-design.md §5.5・§7 row S6）:
+            // 「サービス」一覧の BantoHubSink 側（`sink_service_ipc`のモジュール
+            // doc参照）。
+            sink_service_ipc::sink_service_status,
+            sink_service_ipc::sink_service_start,
+            sink_service_ipc::sink_service_stop,
         ])
         .manage(AppState {
             hub: AsyncMutex::new(None),

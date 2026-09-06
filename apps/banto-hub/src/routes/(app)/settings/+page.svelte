@@ -934,7 +934,9 @@
 						{configPackageInspection.counts.collectionGroups.create} 追加 /
 						{configPackageInspection.counts.collectionGroups.update} 更新、タグ
 						{configPackageInspection.counts.tags.create} 追加 /
-						{configPackageInspection.counts.tags.update} 更新。
+						{configPackageInspection.counts.tags.update} 更新、sink group
+						{configPackageInspection.counts.sinkGroups.create} 追加 /
+						{configPackageInspection.counts.sinkGroups.update} 更新。
 					</p>
 					<p class="note">
 						MQTT は
@@ -985,7 +987,9 @@
 							{configPackageImportSummary.counts.collectionGroups.create} 追加 /
 							{configPackageImportSummary.counts.collectionGroups.update} 更新、タグ
 							{configPackageImportSummary.counts.tags.create} 追加 /
-							{configPackageImportSummary.counts.tags.update} 更新。
+							{configPackageImportSummary.counts.tags.update} 更新、sink group
+							{configPackageImportSummary.counts.sinkGroups.create} 追加 /
+							{configPackageImportSummary.counts.sinkGroups.update} 更新。
 						</p>
 					{/if}
 
