@@ -5,7 +5,7 @@
 S4統合ゲートの5項目（本書§7冒頭）はすべて済んだ。依存グラフ・license/保守状況・
 Windows配布バイナリ増分・workspace feature整合の実測は§7.1、**5（Hubのrelease tag
 への固定）は 2026-09-02 オーナー決定で `v0.1.0` に固定**した（§7.2）。
-残るのはLAN越しの接続確認とprivate appへの固定である。S1bのREST catalog/values transport、S2aの
+LAN越しの接続確認は 2026-09-02 に完了（PR #225）し、残るのはprivate appへの固定のみである。実機で判明したHubの挙動（on-change配信・書き込み直後の旧値）は§4.5に記録した（2026-09-06）。S1bのREST catalog/values transport、S2aの
 Hub WS wire純粋解析・bounded pending map・latest-wins publish gate・非LIVE current抑止に加え、
 S2b-1の認証付きWebSocket handshake、S2b-2aのon_change subscribe送信と1フレーム受信、
 S2b-2bのcrate-private単一世代worker・tokio watchによるlatest snapshot配信・atomic publishを
@@ -17,7 +17,7 @@ S4b-1互換候補では、`origin/main` 509bf0e（Banto v1.4.0）との統合検
 解消は未push・未mergeの候補上の確認であり、Issue自体は完了扱いにしない。
 **実Hub接続は2026-09-01に検証済み**（`docs/real-machine-test-2026-09.md`、6項目すべて合格。
 403/503の区別を含む）、**配布サイズは§7.1、release tagは§7.2で確定**した。
-**LAN越しの接続確認とprivate appへの固定は未完**で、RTSPの別worktree/別履歴も含めない。
+**private appへの固定は未完**で、RTSPの別worktree/別履歴も含めない。
 **W1（2026-09-01）**では、Issue #123の残スコープだった単一タグ書き込み
 （`RestClient::write_tag`）を実装した。stable IDから外部名を都度re解決し、
 `POST /api/v1/values/{tag}`を1回送るだけで、`worker.rs`の再接続・backoff機構には
@@ -295,6 +295,27 @@ log-before-write）と衝突する。監査行をバッチ単位でまとめる�
 両関数の戻り値は不変である。加えて書き込みは`worker.rs`のsupervisorループを一切
 通らない独立経路なので、そもそも呼ばれる機会がない。`ErrorKind`が`#[non_exhaustive]`
 であることも確認済みで、variant追加はコンパイル互換である。
+
+### 4.5 利用上の注意: 実Hubで確認したHubの挙動（2026-09-01 実機検証、2026-09-06 反映）
+
+いずれも Hub の設計どおりで SDK の不具合ではないが、**SDK 利用者が最初に踏む**
+ものなので、実機検証（`docs/real-machine-test-2026-09.md` §9、Issue #123）で
+判明した時点の申し送りを本節に記録する。
+
+- **購読は on-change 配信である。** Hub 側の購読は
+  `apps/banto-hub/core/src/subscribe_core.rs` の `Mode::OnChange` で、値も
+  quality も変化しなければ WS フレームは **1つも来ない**。「購読したのに何も
+  届かない」は静止した環境では正常であり、Live 到達後の初期値は REST snapshot
+  （§5 の publish gate）で得る。購読が機能しているかを確かめるには、**別クライアント
+  から値を変える**必要がある。
+- **書き込み直後の読み取りは旧値を返しうる。** `RestClient::write_tag` は PLC への
+  書き込み完了で成功を返すが、Hub の current 値は**次回ポーリングで更新される**。
+  収集周期が 1000ms なら最大1周期ぶん遅れるため、書き込み → 即読み戻しで一致を
+  期待する検証は失敗する。読み戻しは収集周期を跨いで行う（`real_hub_smoke` は
+  この前提で待ち時間を入れている）。
+- **書き込みは自動リトライしない**（§4.4）。PLC の観点から書き込みは冪等でなく、
+  再送は二重書き込みになる。タイムアウト等で結果が不明なときの再試行判断は
+  利用側が値を読み戻して行う。読み戻しには上記の周期遅れが効く。
 
 ## 5. 状態機械と再接続
 
