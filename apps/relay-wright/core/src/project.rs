@@ -278,6 +278,14 @@ async fn validate_by_replay(project: &ProjectFile) -> Result<(), BantoError> {
                 // doc comment - it has no effect on collection/write
                 // behavior, only on banto-hub's own new-tag form default.
                 default_writable: g.default_writable,
+                // 外部 DB 連携 S2 (banto-industrial, 2026-09-06): relay-wright
+                // は PLC 専用プロダクトで `postgres` 接続の作成自体を
+                // `reject_postgres_connection_protocol` が拒否している
+                // (`crate::rest`) ため、そのプロジェクトに DB Source の
+                // グループが含まれることはない - 常に `None` が正しい
+                // (`banto_tags::CollectionGroup::query_sql` の doc comment
+                // 参照: `postgres` 接続配下でのみ意味を持つ列)。
+                query_sql: None,
             })
             .await?;
         group_map.insert(g.id, created.id);
@@ -698,6 +706,7 @@ mod tests {
                 period_ms: 1000,
                 enabled: true,
                 default_writable: true,
+                query_sql: None,
             })
             .await
             .unwrap();

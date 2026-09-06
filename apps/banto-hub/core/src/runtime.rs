@@ -88,11 +88,23 @@
 //! ## シャットダウン順序（T2-2、設計 §6-5 / T3、設計 §5.3 / T4、設計 §5.4）
 //!
 //! [`RunningHub::shutdown`]の中身: （T14-1 で追加した常駐ループ2本の
-//! `abort`（このモジュール doc の「T14-1 での唯一の挙動変化」節参照）→）
-//! `mqtt.shutdown()`（MQTT publish タスク停止）→ `grpc_server.shutdown()`
-//! （gRPC サーバータスク停止）→ `manager.shutdown()`（`Collector` 停止・
-//! tstore flush）→ `sessions.shutdown()`（broker タスク停止）→
+//! `abort`（このモジュール doc の「T14-1 での唯一の挙動変化」節参照）→
+//! **`db_source.shutdown()`（外部 DB 連携 S2、DB Source の接続タスクを
+//! abort して join）**→）`mqtt.shutdown()`（MQTT publish タスク停止）→
+//! `grpc_server.shutdown()`（gRPC サーバータスク停止）→
+//! `manager.shutdown()`（`Collector` 停止・tstore flush）→
+//! `sessions.shutdown()`（broker タスク停止）→
 //! `sim_registry.shutdown()`（T9-2、SLMP シミュレータ停止）の順を守る。
+//!
+//! **DB Source の位置**（S2、docs/banto-hub-external-db-design.md §4.2）:
+//! eval/prune ループの abort と同じ「消費者を先に止める」区画に置く -
+//! DB Source のタスクは `ServerTagStore`（`manager` が
+//! `computed_engine` 越しに共有するもの）へ値を書く**書き手**なので、
+//! `manager.shutdown()` より確実に前で止める必要がある（順序が逆だと、
+//! 畳んだ後のタグ空間へ1周期分だけ値が書き戻されうる）。eval ループの
+//! `abort()` と違って `shutdown()` は abort 後に join まで待つ - タスクが
+//! `PgPool` を持っており、待たずに落とすとプール解放が
+//! プロセス終了任せになるため。
 //! `manager`→`sessions`の順が先に必要な理由（逆順だと broker セッションが
 //! 消えた後もまだ実行中の収集タスクが `BrokerReadClient::read_batch` を
 //! 呼び、`BrokerError::TaskGone` 由来の `PlcError` を毎回受け取ってから
@@ -663,6 +675,7 @@ impl HubRuntime {
             mqtt,
             grpc_server,
             controller,
+            db_source: manager.db_source_engine(),
             manager,
             sessions,
             sim_registry,
@@ -692,6 +705,10 @@ pub struct RunningHub {
     eval_handle: JoinHandle<()>,
     /// tstore 剪定24hループの `JoinHandle`（同上）。
     prune_handle: JoinHandle<()>,
+    /// 外部 DB 連携 S2: DB Source のポーリングエンジン
+    /// （`crate::hub::CollectorManager` が所有する `Arc` の複製 -
+    /// [`RunningHub::shutdown`] が接続タスクを止めるために持つ）。
+    db_source: Arc<crate::db_source::DbSourceEngine>,
     /// T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P2）: 保持するだけの
     /// フィールド - `RunningHub`（延いては[`RunningHub::shutdown`]消費後の
     /// `self`）が drop される時点で`ProfileLockGuard`自身の`Drop`が
@@ -730,6 +747,10 @@ impl RunningHub {
         // の読み取り専用消費者だから。
         self.eval_handle.abort();
         self.prune_handle.abort();
+        // 外部 DB 連携 S2: DB Source の接続タスクは `ServerTagStore` への
+        // 書き手なので、`manager.shutdown()` より前で止める（このモジュール
+        // doc の「シャットダウン順序」節「DB Source の位置」参照）。
+        self.db_source.shutdown().await;
 
         // T3: stop the MQTT publisher (a consumer of `manager`) before
         // `manager.shutdown()` - same dependency-order reasoning as

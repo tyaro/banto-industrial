@@ -49,7 +49,8 @@ pub use tag::{
     BatchTagDeleteError, BatchTagDeleteOutcome, BatchTagError, BatchTagOutcome,
     BatchTagUpdateError, BatchTagUpdateOutcome, GroupTagCount, Tag, TagInput, TagService,
     TagUpdateError, ALLOWED_DATA_TYPES, ALLOWED_STRING_ENCODINGS, ALLOWED_TAG_KINDS,
-    COMPUTED_TAG_KIND, INTERNAL_TAG_KIND, NUMERIC_DATA_TYPES, PLC_TAG_KIND, STRING_DATA_TYPE,
+    COMPUTED_TAG_KIND, DB_TAG_KIND, INTERNAL_TAG_KIND, MAX_DB_COLUMN_NAME_LEN, NUMERIC_DATA_TYPES,
+    PLC_TAG_KIND, STRING_DATA_TYPE,
 };
 
 use banto_core::BantoError;

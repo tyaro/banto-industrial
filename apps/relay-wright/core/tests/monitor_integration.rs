@@ -86,6 +86,7 @@ impl Fixture {
                 period_ms: 1000,
                 enabled: true,
                 default_writable: true,
+                query_sql: None,
             })
             .await
             .expect("create collection group");
@@ -449,6 +450,7 @@ async fn monitor_rejects_a_modbus_connection_via_relay_wrights_own_slmp_only_gat
             period_ms: 1000,
             enabled: true,
             default_writable: true,
+            query_sql: None,
         })
         .await
         .expect("create modbus group");

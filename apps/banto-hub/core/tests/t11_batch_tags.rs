@@ -106,6 +106,7 @@ fn group_input(name: &str, conn_id: i64) -> CollectionGroupInput {
         period_ms: 1_000,
         enabled: false,
         default_writable: true,
+        query_sql: None,
     }
 }
 

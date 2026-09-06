@@ -206,6 +206,7 @@ use utoipa::ToSchema;
 
 use crate::broker_glue::{hub_client_factory, HubSessions, SlmpSimRegistry};
 use crate::computed::{self, ComputedEngine, ServerTagStore};
+use crate::db_source::{self, DbConnectionStatus, DbSourceEngine};
 use crate::diag_log::DiagLog;
 
 /// Build the non-persistent runtime snapshot for a collection mode.
@@ -611,6 +612,26 @@ pub struct CollectorManager {
     /// 影響半径 = 触ったものだけ" - a bad computed-tag expression must leave
     /// the entire rebuild, not just the computed engine, on the old state).
     computed: Arc<ComputedEngine>,
+    /// 外部 DB 連携 S2（docs/banto-hub-external-db-design.md §4.2・§4.5）:
+    /// DB Source のポーリングエンジン。`computed` と**全く同じ扱い**で
+    /// [`Self::rebuild`]/[`Self::commit_catalog`] が
+    /// `crate::db_source::build_plan`（純関数）の結果を catalog/`Collector`/
+    /// 演算 plan の入れ替えと同じ all-or-nothing の1ステップで commit する
+    /// （§4.5「Source の task は `commit_catalog` の完了を受けて配下の
+    /// グループ集合を再読込する」）。
+    ///
+    /// `computed` と違い**この manager の内部で構築する**（`Self::new` の
+    /// 引数に足していない）: 演算エンジンは `crate::runtime` が
+    /// `ServerTagStore` の retain 復元と250ms 評価ループのために外から
+    /// 所有する必要があるが、DB Source はタスクを自前で持つので、外の
+    /// 所有者が要るのは「シャットダウン時に止める」ためだけであり、それは
+    /// [`Self::db_source_engine`] で足りる。既存の26箇所の
+    /// `CollectorManager::new` 呼び出し（テスト含む）に引数を足さずに済む
+    /// という実利もある。ストアは `computed.server_store()` を共有する -
+    /// `db` タグの値は `computed`/`internal` と同じ `ServerTagStore` へ書く
+    /// （設計 §3-3: `read_current` は `tag_kind != "plc"` を全部そこから
+    /// 読むので、新しい種別を足しても読み出し側は無改造）。
+    db_source: Arc<DbSourceEngine>,
     /// The running `Collector` itself (`None` when nothing is enabled to
     /// collect - a normal state, not an error, see
     /// [`CollectorManager::rebuild`]). **`tokio::sync::Mutex`, not
@@ -774,6 +795,7 @@ impl CollectorManager {
     ) -> Self {
         let events = EventSink::new(pool.clone());
         let (revision_tx, _revision_rx) = watch::channel(0);
+        let db_source = Arc::new(DbSourceEngine::new(computed.server_store(), clock.clone()));
         Self {
             pool,
             data_dir,
@@ -783,6 +805,7 @@ impl CollectorManager {
             sessions,
             sim_registry,
             computed,
+            db_source,
             collector: AsyncMutex::new(None),
             inner: Mutex::new(Inner {
                 map: Arc::new(TagMap::empty()),
@@ -806,6 +829,10 @@ impl CollectorManager {
     /// `println!`/`eprintln!` 相当のまま（`crate::diag_log` モジュール doc
     /// 参照）。
     pub fn with_diag_log(mut self, diag_log: DiagLog) -> Self {
+        // 外部 DB 連携 S2: DB Source のタスクも同じ宛先へ流す（`db_source`
+        // フィールドの doc comment 参照 - Windows サービスモードで warn が
+        // サービスログファイルに残るのは、この配線があってこそ）。
+        self.db_source.set_diag_log(diag_log.clone());
         self.diag_log = diag_log;
         self
     }
@@ -824,6 +851,19 @@ impl CollectorManager {
     /// single `rebuild`, but the tick loop itself is not part of `rebuild`).
     pub fn computed_engine(&self) -> Arc<ComputedEngine> {
         self.computed.clone()
+    }
+
+    /// 外部 DB 連携 S2: DB Source エンジン - `crate::runtime::RunningHub`
+    /// がシャットダウン時に `DbSourceEngine::shutdown` を呼ぶために取る
+    /// （`db_source` フィールドの doc comment 参照）。
+    pub fn db_source_engine(&self) -> Arc<DbSourceEngine> {
+        self.db_source.clone()
+    }
+
+    /// 外部 DB 連携 S2: `GET /api/v1/status`・`GET /api/status` の
+    /// `db_source`/`dbSource` 節が読む運転状態（`crate::db_source::status`）。
+    pub fn db_source_status(&self) -> Vec<DbConnectionStatus> {
+        self.db_source.status_snapshot()
     }
 
     /// The shared registry pool - handed to callers (e.g. `rest.rs`'s
@@ -933,6 +973,20 @@ impl CollectorManager {
             }
         };
 
+        // 外部 DB 連携 S2 (docs/banto-hub-external-db-design.md §4.2・§4.5):
+        // `computed_plan` と全く同じ扱い - 純粋な組み立てだけをここで行い、
+        // commit は catalog/`Collector` の入れ替えと同じ点で行う。DB Source
+        // の計画が不整合なら rebuild 全体が失敗し、走行中のタスクは
+        // 一切触られない（§4.3(a) の all-or-nothing）。
+        let db_source_plan = match db_source::build_plan(&snapshot) {
+            Ok(plan) => plan,
+            Err(err) => {
+                let message = format!("DB Source の検証に失敗しました: {err}");
+                self.set_last_error(message.clone());
+                return Err(message);
+            }
+        };
+
         let mut config = match build_config_from(&snapshot) {
             Ok(config) => config,
             Err(err) => {
@@ -1015,6 +1069,7 @@ impl CollectorManager {
             // all-or-nothing step as the catalog swap below - see
             // `computed_plan`'s own comment above.
             self.computed.commit(computed_plan);
+            self.db_source.commit(db_source_plan);
             let old_collector = self.collector.lock().await.take();
             let new_revision = {
                 let mut inner = self.inner.lock().expect("hub state lock poisoned");
@@ -1098,6 +1153,7 @@ impl CollectorManager {
         // T6-2: commit alongside the catalog/`Collector` state - same
         // reasoning as the `group_count() == 0` branch above.
         self.computed.commit(computed_plan);
+        self.db_source.commit(db_source_plan);
         let new_revision = {
             let mut inner = self.inner.lock().expect("hub state lock poisoned");
             inner.map = Arc::new(new_map);
@@ -1561,6 +1617,18 @@ impl CollectorManager {
                 return Err(message);
             }
         };
+        // 外部 DB 連携 S2: `Self::rebuild` と同じ位置・同じ理由
+        // （§4.5「Source の task は `commit_catalog` の完了を受けて配下の
+        // グループ集合を再読込する」- 稼働中の pending queue 適用がここを
+        // 通るので、走行中の DB Source もこの1点で追従する）。
+        let db_source_plan = match db_source::build_plan(snapshot) {
+            Ok(plan) => plan,
+            Err(err) => {
+                let message = format!("DB Source の検証に失敗しました: {err}");
+                self.set_last_error(message.clone());
+                return Err(message);
+            }
+        };
         if let Err(err) = build_config_from(snapshot) {
             let message = err.to_string();
             self.set_last_error(message.clone());
@@ -1568,6 +1636,7 @@ impl CollectorManager {
         }
 
         self.computed.commit(computed_plan);
+        self.db_source.commit(db_source_plan);
         let revision = {
             let mut inner = self.inner.lock().expect("hub state lock poisoned");
             inner.map = Arc::new(new_map);
@@ -1592,6 +1661,12 @@ impl CollectorManager {
             .map_err(|err| format!("catalog の検証に失敗しました: {err}"))?;
         computed::build_plan(&new_map)
             .map_err(|err| format!("演算タグの検証に失敗しました: {err}"))?;
+        // 外部 DB 連携 S2: ここは `computed` と同じく**検証だけ**行い commit
+        // はしない - 収集の開始/停止は DB Source のポーリングとは独立で
+        // （設計 §4.2 の task は収集 run に紐付かない）、構成の反映は
+        // `Self::rebuild`/`Self::commit_catalog` の担当だから。
+        db_source::build_plan(&snapshot)
+            .map_err(|err| format!("DB Source の検証に失敗しました: {err}"))?;
         let runtime_snapshot = runtime_snapshot_for_mode(&snapshot, mode);
         let mut config = build_config_from(&runtime_snapshot).map_err(|err| err.to_string())?;
 
@@ -2062,6 +2137,7 @@ mod tests {
             period_ms: 1_000,
             enabled: true,
             default_writable: true,
+            query_sql: None,
         };
         let group2 = banto_tags::CollectionGroup {
             id: 20,
@@ -2070,6 +2146,7 @@ mod tests {
             period_ms: 1_000,
             enabled: true,
             default_writable: true,
+            query_sql: None,
         };
         let tag_in_group1 = Tag {
             id: 100,
@@ -2154,6 +2231,7 @@ mod tests {
                 period_ms: 100,
                 enabled: true,
                 default_writable: true,
+                query_sql: None,
             })
             .await
             .unwrap();
@@ -2291,6 +2369,7 @@ mod tests {
                 period_ms: 1_000,
                 enabled: true,
                 default_writable: true,
+                query_sql: None,
             })
             .await
             .unwrap();
@@ -2370,6 +2449,7 @@ mod tests {
                 period_ms: 100,
                 enabled: true,
                 default_writable: true,
+                query_sql: None,
             })
             .await
             .unwrap();

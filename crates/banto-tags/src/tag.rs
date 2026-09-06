@@ -10,7 +10,9 @@ use banto_storage::ColumnMap;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
-use crate::plc_connection::{CALC_CONNECTION_NAME, MEM_CONNECTION_NAME, VIRTUAL_PROTOCOL};
+use crate::plc_connection::{
+    CALC_CONNECTION_NAME, MEM_CONNECTION_NAME, POSTGRES_PROTOCOL, VIRTUAL_PROTOCOL,
+};
 use crate::scaling::Scaling;
 use crate::support::{map_write_error, max_length_message, range_message, required_message};
 
@@ -77,12 +79,15 @@ fn default_tag_kind() -> String {
 }
 
 /// Full `tag_kind` vocabulary from design §4.2's table (`plc` / `computed` /
-/// `internal`) - mirrors the SQL `CHECK` added in
-/// `migrations/0006_tags_writable_kind.sql`. All three are accepted by
-/// [`validate_tag_input`] as of T6-2 (design §6 item 9's "computed/internal
-/// の受理は T6 で解禁" is now in effect) - see [`PLC_TAG_KIND`]/
-/// [`COMPUTED_TAG_KIND`]/[`INTERNAL_TAG_KIND`] for each species' own rules.
-pub const ALLOWED_TAG_KINDS: &[&str] = &["plc", "computed", "internal"];
+/// `internal`), widened by the DB Source slice S2 with `db`
+/// (docs/banto-hub-external-db-design.md §4.1) - mirrors the SQL `CHECK`
+/// added in `migrations/0006_tags_writable_kind.sql` and widened by
+/// `migrations/0015_db_source_query_sql_and_tag_kind.sql`. All four are
+/// accepted by [`validate_tag_input`] (design §6 item 9's "computed/internal
+/// の受理は T6 で解禁" has been in effect since T6-2) - see [`PLC_TAG_KIND`]/
+/// [`COMPUTED_TAG_KIND`]/[`INTERNAL_TAG_KIND`]/[`DB_TAG_KIND`] for each
+/// species' own rules.
+pub const ALLOWED_TAG_KINDS: &[&str] = &["plc", "computed", "internal", "db"];
 
 /// A collection-driven tag (design §4.2's table): value comes from the
 /// collection task, `address` is required, `expression` must be absent.
@@ -109,6 +114,40 @@ pub const COMPUTED_TAG_KIND: &str = "computed";
 /// connection named [`crate::plc_connection::MEM_CONNECTION_NAME`] (`"mem"`)
 /// - same enforcement point as [`COMPUTED_TAG_KIND`].
 pub const INTERNAL_TAG_KIND: &str = "internal";
+
+/// An external-database tag (外部 DB 連携 S2,
+/// docs/banto-hub-external-db-design.md §4.1・§4.4, 2026-09-06 オーナー決定
+/// 「案A: 既存3階層の流用」): value comes from **one result column of its
+/// group's SELECT** (`crate::collection_group::CollectionGroup::query_sql`),
+/// polled by the hub's DB Source engine (`apps/banto-hub/core/src/db_source`)
+/// and written into the same `ServerTagStore` `computed`/`internal` tags use.
+///
+/// - `address` is the **result column name**, not a PLC address: it must
+///   match `^[A-Za-z_][A-Za-z0-9_]*$` and be at most
+///   [`MAX_DB_COLUMN_NAME_LEN`] characters (PostgreSQL's identifier limit),
+///   and it is compared to the query's column names **case-sensitively**
+///   (§4.1「大文字小文字は DB 側の規則に委ねずそのまま比較」).
+/// - `expression` must be absent (like `plc`/`internal` - the value is read,
+///   not derived).
+/// - `data_type` may not be [`STRING_DATA_TYPE`]: v1 carries numeric/bool/
+///   timestamp columns only, because `ServerTagStore` holds `Option<f64>`
+///   (§4.4・§6-5). Text columns are a second-stage decision.
+/// - `writable` is **normalized to `false`** rather than rejected (§6-10
+///   「v1 は読み取り専用」) - see [`validate_tag_input`]'s DB branch for why
+///   normalizing beats erroring here.
+///
+/// Placement: the tag's group must live under a connection whose `protocol`
+/// is [`crate::plc_connection::POSTGRES_PROTOCOL`] - enforced by
+/// [`validate_tag_kind_placement`], the same cross-table step that keeps
+/// `computed`/`internal` under `calc`/`mem`.
+pub const DB_TAG_KIND: &str = "db";
+
+/// PostgreSQL's identifier length limit (`NAMEDATALEN - 1` = 63), used as the
+/// cap on a [`DB_TAG_KIND`] tag's `address` (= result column name). A longer
+/// name cannot come back from PostgreSQL at all - the server truncates its
+/// own identifiers at this length - so accepting one would only ever produce
+/// a tag that can never match a column.
+pub const MAX_DB_COLUMN_NAME_LEN: usize = 63;
 
 /// A row of the `tags` table, wire-shaped (camelCase) for a future settings
 /// grid (recorder-requirements.md §6 "タグ設定" screen).
@@ -282,6 +321,13 @@ struct ValidatedTag {
     name: String,
     address: String,
     unit: Option<String>,
+    /// 外部 DB 連携 S2 (§6-10): the value actually persisted into
+    /// `tags.writable` - identical to `TagInput::writable` for every tag
+    /// kind except [`DB_TAG_KIND`], which is always normalized to `false`
+    /// (see [`validate_tag_input`]'s DB branch). Every INSERT/UPDATE binds
+    /// this field rather than the raw input so the normalization cannot be
+    /// forgotten on one of the (single/tx/batch) write paths.
+    writable: bool,
 }
 
 /// Check `ll <= l <= h <= hh`, comparing only the thresholds that are
@@ -590,6 +636,61 @@ fn validate_tag_input(input: &TagInput) -> Result<ValidatedTag, BantoError> {
                 });
             }
         }
+        DB_TAG_KIND => {
+            // 外部 DB 連携 S2 (docs/banto-hub-external-db-design.md §4.1・
+            // §4.4): `address` はここでは PLC アドレスではなく**結果列名**。
+            // 識別子として検証し（PostgreSQL の bare identifier 文法 +
+            // 63 文字上限）、大文字小文字はそのまま保存する - DB Source
+            // エンジンは `describe` が返した列名とこの文字列を**そのまま**
+            // 比較する（[`DB_TAG_KIND`] の doc comment 参照）。
+            if trimmed_address.is_empty() {
+                errors.push(FieldError {
+                    field: "address".to_string(),
+                    message: required_message(),
+                });
+            } else if trimmed_address.chars().count() > MAX_DB_COLUMN_NAME_LEN {
+                errors.push(FieldError {
+                    field: "address".to_string(),
+                    message: max_length_message(MAX_DB_COLUMN_NAME_LEN),
+                });
+            } else if !is_db_column_identifier(trimmed_address) {
+                errors.push(FieldError {
+                    field: "address".to_string(),
+                    message: "db タグの address は結果列名（英字またはアンダースコアで始まる \
+                              英数字/アンダースコア）で指定してください"
+                        .to_string(),
+                });
+            }
+            if input.expression.is_some() {
+                errors.push(FieldError {
+                    field: "expression".to_string(),
+                    message: "db タグには expression を設定できません".to_string(),
+                });
+            }
+            // §4.4・§6-5「v1 は数値・bool・timestamp のみ」: `ServerTagStore`
+            // が `Option<f64>` である以上、文字列列を現在値として載せる先が
+            // 無い。第2段で (a) ストアの値型拡張 / (b) read-on-demand の
+            // どちらを採るかが決まるまで、登録時点で拒否する。
+            if input.data_type == STRING_DATA_TYPE {
+                errors.push(FieldError {
+                    field: "dataType".to_string(),
+                    message: "string 型は db タグに設定できません（v1 は数値・bool・\
+                              timestamp のみ）"
+                        .to_string(),
+                });
+            }
+            // §6-10「v1 は読み取り専用」: `computed` は `writable` を**エラー**
+            // にするが、`db` は**黙って false へ正規化する**。両者の差は
+            // `plc_connection.rs` の `"virtual"` (simulation を拒否) と
+            // `"postgres"` (unit_id/word_order/simulation を正規化) の差と
+            // 同じ判断: `computed` の writable は「式が値を決める」という
+            // 意味論と正面から矛盾する設定ミスだが、`db` の writable は
+            // 汎用 UI / MCP クライアントがグループの `default_writable`
+            // （既定 ON）をそのまま送ってくるだけの副産物であり、DB 種別を
+            // 知らないクライアントに postgres 専用の分岐を強いてまで
+            // エラーにする価値が無い。正規化した値は
+            // [`ValidatedTag::writable`] 経由で INSERT/UPDATE に渡る。
+        }
         // Unknown tag_kind: already reported above; no species-specific rule
         // applies.
         _ => {}
@@ -713,7 +814,28 @@ fn validate_tag_input(input: &TagInput) -> Result<ValidatedTag, BantoError> {
         name: trimmed_name.to_string(),
         address: trimmed_address.to_string(),
         unit,
+        // 外部 DB 連携 S2 (§6-10「v1 は読み取り専用」): the one normalization
+        // this function performs on a boolean - see the `DB_TAG_KIND` arm
+        // above for why `db` normalizes where `computed` errors.
+        writable: input.writable && input.tag_kind != DB_TAG_KIND,
     })
+}
+
+/// A bare PostgreSQL column identifier: an ASCII letter or `_` followed by
+/// ASCII letters/digits/`_` (外部 DB 連携 S2, §4.1). Deliberately narrower
+/// than PostgreSQL's own quoted-identifier grammar - a `db` tag's `address`
+/// is matched against the column names a query actually returns, and every
+/// name the engine's generated wrapper can quote and select safely fits this
+/// shape. Rejecting the rest at registration keeps the wrapper SQL builder
+/// (`apps/banto-hub/core/src/db_source/convert.rs`) free of quoting corner
+/// cases.
+fn is_db_column_identifier(address: &str) -> bool {
+    let mut chars = address.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Cross-table placement check (T6-2, design §4.2's reserved `calc`/`mem`
@@ -770,9 +892,19 @@ async fn validate_tag_kind_placement(
         })
     };
 
+    let is_postgres = protocol == POSTGRES_PROTOCOL;
+
     match tag_kind {
         PLC_TAG_KIND if is_virtual => {
             placement_error("plc タグは予約接続（calc/mem）配下に作成できません".to_string())
+        }
+        // 外部 DB 連携 S2 (docs/banto-hub-external-db-design.md §4.1「配置
+        // 制約」): `postgres` 接続は PLC 収集パイプラインに一切参加しない
+        // (`banto_collect::build_config_from` が除外する) ので、その配下の
+        // `plc` タグは永久に収集されない - `"virtual"` 配下の `plc` タグを
+        // 拒否するのと全く同じ理由で登録時に拒否する。
+        PLC_TAG_KIND if is_postgres => {
+            placement_error("plc タグは DB 接続（postgres）配下に作成できません".to_string())
         }
         COMPUTED_TAG_KIND if !is_virtual || conn_name != CALC_CONNECTION_NAME => placement_error(
             format!("computed タグは予約接続 {CALC_CONNECTION_NAME} 配下にのみ作成できます"),
@@ -780,6 +912,9 @@ async fn validate_tag_kind_placement(
         INTERNAL_TAG_KIND if !is_virtual || conn_name != MEM_CONNECTION_NAME => placement_error(
             format!("internal タグは予約接続 {MEM_CONNECTION_NAME} 配下にのみ作成できます"),
         ),
+        DB_TAG_KIND if !is_postgres => placement_error(format!(
+            "db タグは {POSTGRES_PROTOCOL} 接続配下にのみ作成できます"
+        )),
         // Unknown tag_kind is already rejected by validate_tag_input; no
         // placement rule to apply.
         _ => Ok(()),
@@ -812,9 +947,19 @@ async fn validate_tag_kind_placement_tx(
             }],
         })
     };
+    let is_postgres = protocol == POSTGRES_PROTOCOL;
+
     match tag_kind {
         PLC_TAG_KIND if is_virtual => {
             placement_error("plc タグは予約接続（calc/mem）配下に作成できません".to_string())
+        }
+        // 外部 DB 連携 S2 (docs/banto-hub-external-db-design.md §4.1「配置
+        // 制約」): `postgres` 接続は PLC 収集パイプラインに一切参加しない
+        // (`banto_collect::build_config_from` が除外する) ので、その配下の
+        // `plc` タグは永久に収集されない - `"virtual"` 配下の `plc` タグを
+        // 拒否するのと全く同じ理由で登録時に拒否する。
+        PLC_TAG_KIND if is_postgres => {
+            placement_error("plc タグは DB 接続（postgres）配下に作成できません".to_string())
         }
         COMPUTED_TAG_KIND if !is_virtual || conn_name != CALC_CONNECTION_NAME => placement_error(
             format!("computed タグは予約接続 {CALC_CONNECTION_NAME} 配下にのみ作成できます"),
@@ -822,6 +967,9 @@ async fn validate_tag_kind_placement_tx(
         INTERNAL_TAG_KIND if !is_virtual || conn_name != MEM_CONNECTION_NAME => placement_error(
             format!("internal タグは予約接続 {MEM_CONNECTION_NAME} 配下にのみ作成できます"),
         ),
+        DB_TAG_KIND if !is_postgres => placement_error(format!(
+            "db タグは {POSTGRES_PROTOCOL} 接続配下にのみ作成できます"
+        )),
         _ => Ok(()),
     }
 }
@@ -1160,7 +1308,7 @@ impl TagService {
             .bind(input.threshold_l)
             .bind(input.threshold_ll)
             .bind(input.enabled)
-            .bind(input.writable)
+            .bind(validated.writable)
             .bind(&input.tag_kind)
             .bind(&input.expression)
             .bind(input.retain)
@@ -1206,7 +1354,7 @@ impl TagService {
             .bind(input.threshold_l)
             .bind(input.threshold_ll)
             .bind(input.enabled)
-            .bind(input.writable)
+            .bind(validated.writable)
             .bind(&input.tag_kind)
             .bind(&input.expression)
             .bind(input.retain)
@@ -1266,7 +1414,7 @@ impl TagService {
             .bind(input.threshold_l)
             .bind(input.threshold_ll)
             .bind(input.enabled)
-            .bind(input.writable)
+            .bind(validated.writable)
             .bind(&input.tag_kind)
             .bind(&input.expression)
             .bind(input.retain)
@@ -1359,7 +1507,7 @@ impl TagService {
             .bind(input.threshold_l)
             .bind(input.threshold_ll)
             .bind(input.enabled)
-            .bind(input.writable)
+            .bind(validated.writable)
             .bind(&input.tag_kind)
             .bind(&input.expression)
             .bind(input.retain)
@@ -1651,7 +1799,7 @@ impl TagService {
                 .bind(input.threshold_l)
                 .bind(input.threshold_ll)
                 .bind(input.enabled)
-                .bind(input.writable)
+                .bind(value.writable)
                 .bind(&input.tag_kind)
                 .bind(&input.expression)
                 .bind(input.retain)
@@ -1993,7 +2141,7 @@ impl TagService {
                 .bind(input.threshold_l)
                 .bind(input.threshold_ll)
                 .bind(input.enabled)
-                .bind(input.writable)
+                .bind(value.writable)
                 .bind(&input.tag_kind)
                 .bind(&input.expression)
                 .bind(input.retain)
@@ -2213,7 +2361,7 @@ impl TagService {
                 .bind(input.threshold_l)
                 .bind(input.threshold_ll)
                 .bind(input.enabled)
-                .bind(input.writable)
+                .bind(validated.writable)
                 .bind(&input.tag_kind)
                 .bind(&input.expression)
                 .bind(input.retain)
@@ -2281,6 +2429,7 @@ mod tests {
                 period_ms: 1_000,
                 enabled: true,
                 default_writable: true,
+                query_sql: None,
             })
             .await
             .unwrap();
@@ -2689,6 +2838,7 @@ mod tests {
                 period_ms: 1_000,
                 enabled: true,
                 default_writable: true,
+                query_sql: None,
             })
             .await
             .unwrap();
@@ -3300,6 +3450,7 @@ mod tests {
                 period_ms: 1_000,
                 enabled: true,
                 default_writable: true,
+                query_sql: None,
             })
             .await
             .expect("group under a virtual connection should be creatable");
@@ -3653,14 +3804,17 @@ mod tests {
         }
     }
 
-    /// The SQL `CHECK` on `tag_kind` (migration 0006) must agree with
-    /// [`ALLOWED_TAG_KINDS`] in the rejection direction, bypassing
-    /// `validate_tag_input` entirely - same style as
-    /// `the_sql_check_accepts_nothing_beyond_allowed_data_types` above.
+    /// The SQL `CHECK` on `tag_kind` (migration 0006, widened by 0015 with
+    /// `\'db\'`) must agree with [`ALLOWED_TAG_KINDS`] in **both** directions,
+    /// bypassing `validate_tag_input` entirely - same style as
+    /// `the_sql_check_accepts_nothing_beyond_allowed_data_types` above. The
+    /// accept loop iterates [`ALLOWED_TAG_KINDS`] itself (rather than a
+    /// hand-written list) so a future kind added to the Rust constant
+    /// without the matching migration fails here immediately.
     #[tokio::test]
     async fn the_sql_check_accepts_nothing_beyond_allowed_tag_kinds() {
         let (svc, group_id) = setup().await;
-        for tag_kind in ["computed", "internal"] {
+        for tag_kind in ALLOWED_TAG_KINDS.iter().copied() {
             let result = sqlx::query(
                 "INSERT INTO tags (name, collection_group_id, address, data_type, tag_kind) \
                  VALUES (?, ?, '40001', 'i16', ?)",
@@ -4186,6 +4340,441 @@ mod tests {
         .is_err());
     }
 
+    // --- 外部 DB 連携 S2 (docs/banto-hub-external-db-design.md §4.1・§4.4・
+    // §6-10): `tag_kind = "db"` の登録時検証と配置制約 --------------------
+
+    /// A `db` group under a `"postgres"` connection - the placement the DB
+    /// Source slice unlocks (`crate::collection_group` のモジュール doc
+    /// comment「DB Source のグループ」節)。
+    async fn postgres_group(pool: &SqlitePool) -> i64 {
+        sqlx::query(
+            "INSERT INTO plc_connections (name, protocol, host, port, unit_id, enabled, \
+             database, username, password) \
+             VALUES ('erp', 'postgres', '10.0.0.50', 5432, 1, 1, 'erp', 'reader', 'pw')",
+        )
+        .execute(pool)
+        .await
+        .expect("seed postgres connection");
+        let conn_id: i64 = sqlx::query_scalar("SELECT id FROM plc_connections WHERE name = 'erp'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO collection_groups (name, plc_connection_id, period_ms, enabled, query_sql) \
+             VALUES ('q1', ?, 1000, 1, 'SELECT a FROM v1')",
+        )
+        .bind(conn_id)
+        .execute(pool)
+        .await
+        .expect("seed postgres group");
+        sqlx::query_scalar("SELECT id FROM collection_groups WHERE name = 'q1'")
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    fn db_tag_input(name: &str, group_id: i64, column: &str) -> TagInput {
+        let mut input = sample_input(name, group_id);
+        input.tag_kind = DB_TAG_KIND.to_string();
+        input.address = column.to_string();
+        input.data_type = "f32".to_string();
+        input
+    }
+
+    #[tokio::test]
+    async fn create_accepts_a_db_tag_under_a_postgres_connection() {
+        let (svc, _group_id) = setup().await;
+        let group_id = postgres_group(&svc.pool).await;
+        let created = svc
+            .create(db_tag_input("Rate", group_id, "rate_per_min"))
+            .await
+            .expect("a db tag under a postgres group should be accepted");
+        assert_eq!(created.tag_kind, DB_TAG_KIND);
+        assert_eq!(created.address, "rate_per_min");
+        assert!(!created.writable);
+    }
+
+    /// §6-10「v1 は読み取り専用」: `writable: true` は**エラーにせず**
+    /// `false` へ正規化される（`computed` との違いは
+    /// `validate_tag_input` の DB 分岐の doc comment 参照）。
+    #[tokio::test]
+    async fn create_normalizes_writable_to_false_for_a_db_tag() {
+        let (svc, _group_id) = setup().await;
+        let group_id = postgres_group(&svc.pool).await;
+        let mut input = db_tag_input("Rate", group_id, "rate");
+        input.writable = true;
+        let created = svc
+            .create(input)
+            .await
+            .expect("writable must be normalized, not rejected");
+        assert!(!created.writable);
+
+        // ...and the same on the update path (a tag flipped writable later
+        // must not become writable either).
+        let mut update = db_tag_input("Rate", group_id, "rate");
+        update.writable = true;
+        let updated = svc.update(created.id, update).await.expect("update");
+        assert!(!updated.writable);
+    }
+
+    #[tokio::test]
+    async fn create_rejects_a_db_tag_with_an_invalid_column_name() {
+        let (svc, _group_id) = setup().await;
+        let group_id = postgres_group(&svc.pool).await;
+        for column in ["1abc", "a-b", "a b", "a\"b", "スキーマ", "a.b"] {
+            let err = svc
+                .create(db_tag_input("T", group_id, column))
+                .await
+                .unwrap_err();
+            match err {
+                BantoError::Validation { field_errors } => {
+                    assert_eq!(field_errors[0].field, "address", "column: {column:?}");
+                }
+                other => panic!("expected Validation for {column:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_a_db_tag_with_an_empty_or_over_long_column_name() {
+        let (svc, _group_id) = setup().await;
+        let group_id = postgres_group(&svc.pool).await;
+
+        let err = svc
+            .create(db_tag_input("T", group_id, "  "))
+            .await
+            .unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "address");
+                assert_eq!(field_errors[0].message, required_message());
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+
+        let long = "a".repeat(MAX_DB_COLUMN_NAME_LEN + 1);
+        let err = svc
+            .create(db_tag_input("T2", group_id, &long))
+            .await
+            .unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "address");
+                assert_eq!(
+                    field_errors[0].message,
+                    max_length_message(MAX_DB_COLUMN_NAME_LEN)
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+
+        // Exactly at the limit is accepted.
+        let at_limit = "a".repeat(MAX_DB_COLUMN_NAME_LEN);
+        svc.create(db_tag_input("T3", group_id, &at_limit))
+            .await
+            .expect("a 63-character column name should be accepted");
+    }
+
+    /// §4.4・§6-5: `string` 型の db タグは登録時に拒否する。
+    #[tokio::test]
+    async fn create_rejects_a_string_db_tag() {
+        let (svc, _group_id) = setup().await;
+        let group_id = postgres_group(&svc.pool).await;
+        let mut input = db_tag_input("S", group_id, "lot_no");
+        input.data_type = STRING_DATA_TYPE.to_string();
+        input.string_length = Some(8);
+        let err = svc.create(input).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert!(
+                    field_errors.iter().any(|e| e.field == "dataType"),
+                    "expected a dataType error, got {field_errors:?}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_a_db_tag_with_an_expression() {
+        let (svc, _group_id) = setup().await;
+        let group_id = postgres_group(&svc.pool).await;
+        let mut input = db_tag_input("E", group_id, "a");
+        input.expression = Some("1 + 1".to_string());
+        let err = svc.create(input).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "expression");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// 配置制約その1: `db` タグは postgres 接続配下にしか置けない。
+    #[tokio::test]
+    async fn create_rejects_a_db_tag_outside_a_postgres_connection() {
+        let (svc, group_id) = setup().await;
+        let err = svc
+            .create(db_tag_input("T", group_id, "a"))
+            .await
+            .unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "tagKind");
+                assert!(field_errors[0].message.contains("postgres"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// 配置制約その2: `plc` タグは postgres 接続配下に置けない。
+    #[tokio::test]
+    async fn create_rejects_a_plc_tag_under_a_postgres_connection() {
+        let (svc, _group_id) = setup().await;
+        let group_id = postgres_group(&svc.pool).await;
+        let err = svc.create(sample_input("P", group_id)).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors[0].field, "tagKind");
+                assert!(field_errors[0].message.contains("DB 接続"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    // --- migration 0015 (table rebuild: tag_kind に \'db\' を追加) ----------
+
+    /// Migration 0015 rebuilds `tags` a third time (SQLite cannot `ALTER` a
+    /// `CHECK`), so this test follows
+    /// `migration_0011_preserves_rows_and_allows_the_same_name_in_a_different_group`\'s
+    /// exact recipe: the whole 0001-0014 chain applied first (a faithful
+    /// stand-in for a deployed pre-0015 database), non-default values
+    /// throughout the seeded row so a dropped/transposed column shows up as a
+    /// mismatch, then 0015 applied on its own pinned connection inside one
+    /// transaction exactly as sqlx\'s own `Migrate::apply` runs it.
+    #[tokio::test]
+    async fn migration_0015_preserves_rows_and_foreign_keys_on_a_populated_database() {
+        use sqlx::{Acquire, Executor};
+
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect_sqlite_memory");
+        let mut conn = pool.acquire().await.expect("acquire one pinned connection");
+
+        for (label, sql) in [
+            (
+                "0001",
+                include_str!("../migrations/0001_plc_connections.sql"),
+            ),
+            (
+                "0002",
+                include_str!("../migrations/0002_collection_groups.sql"),
+            ),
+            ("0003", include_str!("../migrations/0003_tags.sql")),
+            (
+                "0004",
+                include_str!("../migrations/0004_plc_connections_allow_slmp.sql"),
+            ),
+            (
+                "0005",
+                include_str!("../migrations/0005_tags_allow_string.sql"),
+            ),
+            (
+                "0006",
+                include_str!("../migrations/0006_tags_writable_kind.sql"),
+            ),
+            (
+                "0007",
+                include_str!("../migrations/0007_plc_connections_allow_virtual.sql"),
+            ),
+            (
+                "0008",
+                include_str!("../migrations/0008_plc_connections_add_simulation.sql"),
+            ),
+            ("0009", include_str!("../migrations/0009_tags_revision.sql")),
+            (
+                "0010",
+                include_str!("../migrations/0010_plc_connections_add_word_order.sql"),
+            ),
+            (
+                "0011",
+                include_str!("../migrations/0011_tags_unique_name_per_group.sql"),
+            ),
+            (
+                "0012",
+                include_str!("../migrations/0012_collection_groups_add_default_writable.sql"),
+            ),
+            (
+                "0013",
+                include_str!("../migrations/0013_tags_add_string_encoding.sql"),
+            ),
+            (
+                "0014",
+                include_str!("../migrations/0014_plc_connections_allow_postgres.sql"),
+            ),
+        ] {
+            conn.execute(sql)
+                .await
+                .unwrap_or_else(|e| panic!("pre-0015 migration {label} failed: {e}"));
+        }
+
+        conn.execute(
+            "INSERT INTO plc_connections (id, name, protocol, host, port, unit_id, enabled, \
+             simulation, word_order) \
+             VALUES (7, 'Line1 PLC', 'slmp', '192.168.1.10', 5007, 3, 0, 1, 'high_low')",
+        )
+        .await
+        .expect("seed connection");
+        conn.execute(
+            "INSERT INTO collection_groups (id, name, plc_connection_id, period_ms, enabled, \
+             default_writable) VALUES (4, 'G1', 7, 2000, 0, 0)",
+        )
+        .await
+        .expect("seed collection group");
+        conn.execute(
+            "INSERT INTO tags (id, name, collection_group_id, address, data_type, string_length, \
+             raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, threshold_h, threshold_hh, \
+             threshold_l, threshold_ll, enabled, writable, tag_kind, expression, retain, revision, \
+             string_encoding) \
+             VALUES (9, 'D100', 4, 'D100', 'i16', NULL, 0, 100, 0, 50, 'degC', 2, 45, 50, 10, 5, \
+             1, 1, 'plc', NULL, 0, 3, 'shift_jis')",
+        )
+        .await
+        .expect("seed tag");
+
+        let migration = include_str!("../migrations/0015_db_source_query_sql_and_tag_kind.sql");
+        let mut tx = conn.begin().await.expect("begin, as the migrator does");
+        tx.execute(migration).await.expect("0015 should apply");
+        tx.commit().await.expect("0015 should commit");
+
+        // Every column of the existing tag survived, values and all
+        // (including 0013\'s `string_encoding`, the column most likely to be
+        // dropped by a stale column list).
+        #[allow(clippy::type_complexity)]
+        let tag: (
+            i64,
+            String,
+            i64,
+            String,
+            String,
+            i64,
+            bool,
+            String,
+            Option<String>,
+            bool,
+            i64,
+            String,
+        ) = sqlx::query_as(
+            "SELECT id, name, collection_group_id, address, data_type, decimals, \
+             writable, tag_kind, expression, retain, revision, string_encoding \
+             FROM tags WHERE id = 9",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the seeded tag should have been copied across");
+        assert_eq!(
+            tag,
+            (
+                9,
+                "D100".to_string(),
+                4,
+                "D100".to_string(),
+                "i16".to_string(),
+                2,
+                true,
+                "plc".to_string(),
+                None,
+                false,
+                3,
+                "shift_jis".to_string(),
+            )
+        );
+
+        // The new `collection_groups.query_sql` column exists and defaults to
+        // NULL on the pre-existing row.
+        let query_sql: Option<String> =
+            sqlx::query_scalar("SELECT query_sql FROM collection_groups WHERE id = 4")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("query_sql column should exist");
+        assert_eq!(query_sql, None);
+
+        let violations: Vec<(String,)> = sqlx::query_as("PRAGMA foreign_key_check")
+            .fetch_all(&mut *conn)
+            .await
+            .expect("foreign_key_check");
+        assert!(
+            violations.is_empty(),
+            "the rebuild left dangling foreign keys: {violations:?}"
+        );
+
+        assert!(
+            sqlx::query(
+                "INSERT INTO tags (name, collection_group_id, address, data_type) \
+                 VALUES ('orphan', 999, 'D0', 'i16')",
+            )
+            .execute(&mut *conn)
+            .await
+            .is_err(),
+            "foreign keys should still be enforced after the migration"
+        );
+
+        let index_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+             AND name = 'idx_tags_collection_group_id'",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("index lookup");
+        assert_eq!(index_count, 1);
+
+        // 0011\'s UNIQUE(collection_group_id, name) survived.
+        assert!(
+            sqlx::query(
+                "INSERT INTO tags (name, collection_group_id, address, data_type) \
+                 VALUES ('D100', 4, 'D200', 'i16')",
+            )
+            .execute(&mut *conn)
+            .await
+            .is_err(),
+            "UNIQUE(collection_group_id, name) should still reject a same-group duplicate"
+        );
+
+        // The point of the whole exercise: `\'db\'` is now accepted...
+        sqlx::query(
+            "INSERT INTO tags (name, collection_group_id, address, data_type, tag_kind) \
+             VALUES ('rate', 4, 'rate_per_min', 'f32', 'db')",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("the widened CHECK should accept \'db\'");
+
+        // ...while every earlier CHECK still rejects what it always did
+        // (0005\'s data_type, 0006\'s tag_kind, 0013\'s string_encoding).
+        for (label, sql) in [
+            (
+                "data_type",
+                "INSERT INTO tags (name, collection_group_id, address, data_type) \
+                 VALUES ('Nope', 4, 'D300', 'f64')",
+            ),
+            (
+                "tag_kind",
+                "INSERT INTO tags (name, collection_group_id, address, data_type, tag_kind) \
+                 VALUES ('Nope2', 4, 'D400', 'i16', 'bogus')",
+            ),
+            (
+                "string_encoding",
+                "INSERT INTO tags (name, collection_group_id, address, data_type, \
+                 string_encoding) VALUES ('Nope3', 4, 'D500', 'i16', 'euc_jp')",
+            ),
+        ] {
+            assert!(
+                sqlx::query(sql).execute(&mut *conn).await.is_err(),
+                "the {label} CHECK should have survived the rebuild"
+            );
+        }
+    }
+
     // --- list -------------------------------------------------------------
 
     #[tokio::test]
@@ -4264,6 +4853,7 @@ mod tests {
                 period_ms: 1_000,
                 enabled: true,
                 default_writable: true,
+                query_sql: None,
             })
             .await
             .unwrap();
@@ -4460,6 +5050,7 @@ mod tests {
                 period_ms: 1_000,
                 enabled: true,
                 default_writable: true,
+                query_sql: None,
             })
             .await
             .unwrap();
@@ -4502,6 +5093,7 @@ mod tests {
                 period_ms: 1_000,
                 enabled: true,
                 default_writable: true,
+                query_sql: None,
             })
             .await
             .unwrap();
@@ -4583,6 +5175,7 @@ mod tests {
                 period_ms: 1_000,
                 enabled: true,
                 default_writable: true,
+                query_sql: None,
             })
             .await
             .unwrap();
@@ -4773,6 +5366,7 @@ mod tests {
                 period_ms: 1_000,
                 enabled: true,
                 default_writable: true,
+                query_sql: None,
             })
             .await
             .unwrap();
@@ -4819,6 +5413,7 @@ mod tests {
                 period_ms: 1_000,
                 enabled: true,
                 default_writable: true,
+                query_sql: None,
             })
             .await
             .unwrap();

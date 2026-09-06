@@ -138,6 +138,7 @@ impl Fixture {
                 period_ms: 1000,
                 enabled: true,
                 default_writable: true,
+                query_sql: None,
             })
             .await
             .expect("create collection group");

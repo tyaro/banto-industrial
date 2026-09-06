@@ -85,6 +85,49 @@ jobs:
       - name: test
         run: cargo test --workspace
 
+  # 外部 DB 連携 S2（docs/banto-hub-external-db-design.md §7「S2 / S5 の統合
+  # テストは CI で PostgreSQL のサービスコンテナを使う」）。上の `rust` ジョブ
+  # は windows-latest で、GitHub Actions のサービスコンテナは Linux ランナー
+  # でしか使えないため、DB Source の実 PostgreSQL テストだけを ubuntu-latest
+  # の別ジョブに切り出す。`BANTO_TEST_PG_URL` が無いときは各テストが
+  # `eprintln!("skipped: ...")` で素通りするので、このジョブが無くても
+  # `rust` ジョブは緑のまま（ゲートの意味は
+  # apps/banto-hub/core/tests/db_source.rs のモジュール doc 参照）。
+  #
+  # apt でのシステムパッケージ導入は不要: banto-hub-core は Tauri/WebKitGTK に
+  # 依存しない（`e2e` ジョブが同じ ubuntu-latest で
+  # `cargo build -p banto-hub-core --bin banto-hub` を素で通しているのが実証）。
+  rust-db-source:
+    name: Rust (db-source / PostgreSQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      BANTO_TEST_PG_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # 統合テスト（実 PostgreSQL に対する正常/NULL/未対応型/0行/クエリ
+      # エラー/接続断/構成変更/状態API/書き込み拒否）。
+      - name: test (db_source integration)
+        run: cargo test -p banto-hub-core --test db_source
+      # `db_source` モジュール自身のユニットテスト（S1a の接続テストを
+      # 含む - こちらも BANTO_TEST_PG_URL があるときだけ実 DB を触る）。
+      - name: test (db_source unit)
+        run: cargo test -p banto-hub-core --lib db_source
+
   e2e:
     name: E2E (Playwright smoke)
     runs-on: ubuntu-latest
