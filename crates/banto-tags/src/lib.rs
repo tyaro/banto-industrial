@@ -41,7 +41,8 @@ pub use collection_group::{
 };
 pub use plc_connection::{
     PlcConnection, PlcConnectionCascadeOutcome, PlcConnectionInput, PlcConnectionService,
-    ALLOWED_PROTOCOLS, CALC_CONNECTION_NAME, MEM_CONNECTION_NAME, VIRTUAL_PROTOCOL,
+    ALLOWED_PROTOCOLS, CALC_CONNECTION_NAME, MEM_CONNECTION_NAME, POSTGRES_PROTOCOL,
+    VIRTUAL_PROTOCOL,
 };
 pub use scaling::{scale_raw, unscale, Scaling};
 pub use tag::{

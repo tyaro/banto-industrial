@@ -111,6 +111,9 @@ fn slmp_conn_input(name: &str, port: u16) -> PlcConnectionInput {
         simulation: false,
 
         word_order: "low_high".to_string(),
+        database: None,
+        username: None,
+        password: None,
     }
 }
 

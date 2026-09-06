@@ -71,6 +71,9 @@ impl Fixture {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .expect("create slmp connection");
@@ -432,6 +435,9 @@ async fn monitor_rejects_a_modbus_connection_via_relay_wrights_own_slmp_only_gat
             simulation: false,
 
             word_order: "low_high".to_string(),
+            database: None,
+            username: None,
+            password: None,
         })
         .await
         .expect("create modbus connection");

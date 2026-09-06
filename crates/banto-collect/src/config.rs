@@ -338,7 +338,8 @@ impl RegistrySnapshot {
     /// all three registry reads observe one transaction-local state.
     pub async fn load_connection(connection: &mut SqliteConnection) -> Result<Self, CollectError> {
         let connections = sqlx::query_as::<_, PlcConnection>(
-            "SELECT id, name, protocol, host, port, unit_id, enabled, simulation, word_order \
+            "SELECT id, name, protocol, host, port, unit_id, enabled, simulation, word_order, \
+             database, username, password \
              FROM plc_connections ORDER BY id",
         )
         .fetch_all(&mut *connection)
@@ -463,9 +464,22 @@ pub fn build_config_from(snapshot: &RegistrySnapshot) -> Result<CollectorConfig,
     // `calc`/`mem` placement rule) are evaluated/stored entirely by
     // `apps/banto-hub/core/src/computed.rs`'s `ComputedEngine`/
     // `ServerTagStore`, never by this recorder pipeline.
+    //
+    // S1 (docs/banto-hub-external-db-design.md §4.1・§7 スライス表「S1」,
+    // 2026-09-06): a `"postgres"` connection ([`PlcConnection::is_db_source`])
+    // gets the identical exclusion, for the identical reason - it is not a
+    // wire-protocol PLC connection either, and `parse_protocol` below has no
+    // variant for it. This is defense-in-depth as much as anything: S1 also
+    // forbids creating any collection group under a `"postgres"` connection
+    // (`banto_tags::collection_group::CollectionGroupService`), so in
+    // practice such a connection is always tagless - but without this
+    // exclusion, merely *enabling* a `"postgres"` connection (zero groups or
+    // not) would make `parse_protocol` reject the whole config, since the
+    // loop below runs over every enabled connection regardless of whether it
+    // has any groups yet.
     let mut enabled_connections: Vec<&PlcConnection> = connections
         .iter()
-        .filter(|c| c.enabled && c.protocol != "virtual")
+        .filter(|c| c.enabled && c.protocol != "virtual" && !c.is_db_source())
         .collect();
     enabled_connections.sort_by_key(|c| c.id);
 
@@ -747,6 +761,9 @@ mod tests {
             simulation: false,
 
             word_order: "low_high".to_string(),
+            database: None,
+            username: None,
+            password: None,
         }
     }
 
@@ -1365,6 +1382,9 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .unwrap();
@@ -1389,6 +1409,55 @@ mod tests {
             "only the real connection should be collected"
         );
         assert_eq!(config.tag_count(), 1);
+        assert_eq!(config.connections[0].key, format!("conn:{}", real_conn.id));
+    }
+
+    /// S1 (docs/banto-hub-external-db-design.md §4.1・§7): the `"postgres"`
+    /// twin of `a_virtual_connection_is_excluded_from_collection_without_erroring`
+    /// - if `"postgres"` were not excluded here, `build_config` would fail
+    /// the moment the connection is merely *enabled* (`parse_protocol` has no
+    /// variant for it), even with zero groups under it (S1 forbids creating
+    /// any collection group under a `"postgres"` connection in the first
+    /// place, so this connection stays groupless for real).
+    #[tokio::test]
+    async fn a_postgres_connection_is_excluded_from_collection_without_erroring() {
+        let pool = registry().await;
+        let plc_svc = PlcConnectionService::new(pool.clone());
+        let real_conn = plc_svc.create(conn_input("PLC1", 502)).await.unwrap();
+        let group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", real_conn.id, 1_000))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input("T1", group.id, "40001"))
+            .await
+            .unwrap();
+
+        plc_svc
+            .create(PlcConnectionInput {
+                name: "ERP DB".to_string(),
+                protocol: "postgres".to_string(),
+                host: "10.0.0.50".to_string(),
+                port: 5432,
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+                word_order: "low_high".to_string(),
+                database: Some("erp".to_string()),
+                username: Some("reader".to_string()),
+                password: None,
+            })
+            .await
+            .unwrap();
+
+        let config = build_config(&pool)
+            .await
+            .expect("an enabled postgres connection must not fail config build");
+        assert_eq!(
+            config.connections.len(),
+            1,
+            "only the PLC connection should be collected - the postgres one is not a PLC pipeline participant"
+        );
         assert_eq!(config.connections[0].key, format!("conn:{}", real_conn.id));
     }
 

@@ -123,6 +123,9 @@ impl Fixture {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .expect("create slmp connection");

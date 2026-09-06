@@ -247,6 +247,9 @@ async fn validate_by_replay(project: &ProjectFile) -> Result<(), BantoError> {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await?;
         conn_map.insert(c.id, created.id);
@@ -682,6 +685,9 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .unwrap();
@@ -925,6 +931,9 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .unwrap();

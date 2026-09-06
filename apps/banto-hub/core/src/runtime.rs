@@ -788,6 +788,9 @@ async fn ensure_virtual_connection(pool: &SqlitePool, name: &str) {
             simulation: false,
 
             word_order: "low_high".to_string(),
+            database: None,
+            username: None,
+            password: None,
         })
         .await
     {

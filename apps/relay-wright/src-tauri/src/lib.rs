@@ -46,8 +46,9 @@ use relay_wright_core::registry_cascade::{
     GroupCascadeSummary,
 };
 use relay_wright_core::rest::{
-    api_router, audited_credential_verifier, CollectionGroupPayload, PlcConnectionPayload,
-    QrStringsReorderPayload, TagPayload,
+    api_router, audited_credential_verifier, reject_postgres_connection_protocol,
+    CollectionGroupPayload, PlcConnectionPayload, PlcConnectionResponse, QrStringsReorderPayload,
+    TagPayload,
 };
 use relay_wright_core::settings::{
     ArmSettings, AuditSettings, AuthSettings, MonitorSettings, ServerSettings, SettingsService,
@@ -62,7 +63,7 @@ use relay_wright_core::write_targets::{WriteTarget, WriteTargetInput, WriteTarge
 // create/update payloads (`*Payload`, imported from `rest` above) are shared
 // with the REST handlers so the two paths' wire shape cannot drift.
 use relay_wright_core::{
-    CollectionGroup, CollectionGroupService, PlcConnection, PlcConnectionService, Tag, TagService,
+    CollectionGroup, CollectionGroupService, PlcConnectionService, Tag, TagService,
 };
 use serde::Serialize;
 use std::str::FromStr;
@@ -1642,13 +1643,16 @@ async fn write_rules_delete(state: State<'_, AppState>, id: i64) -> Result<(), B
 #[tauri::command]
 async fn plc_connections_list(
     state: State<'_, AppState>,
-) -> Result<Vec<PlcConnection>, BantoError> {
+) -> Result<Vec<PlcConnectionResponse>, BantoError> {
     require_role(&state, Role::Viewer, "plc_connections").await?;
     Ok(state
         .plc_connections
         .list(ListParams::default())
         .await?
-        .rows)
+        .rows
+        .into_iter()
+        .map(PlcConnectionResponse::from)
+        .collect())
 }
 
 /// `viewer`+ (spec M10): fetch one PLC connection.
@@ -1656,16 +1660,22 @@ async fn plc_connections_list(
 async fn plc_connections_get(
     state: State<'_, AppState>,
     id: i64,
-) -> Result<PlcConnection, BantoError> {
+) -> Result<PlcConnectionResponse, BantoError> {
     require_role(&state, Role::Viewer, "plc_connections").await?;
-    state.plc_connections.get(id).await
+    Ok(PlcConnectionResponse::from(
+        state.plc_connections.get(id).await?,
+    ))
 }
 
 async fn plc_connections_create_body(
     state: &AppState,
     input: PlcConnectionPayload,
-) -> Result<PlcConnection, BantoError> {
+) -> Result<PlcConnectionResponse, BantoError> {
     let actor = require_role(state, Role::Editor, "plc_connections").await?;
+    // S1a レビュー対応: REST 側の `plc_connections_create` と対称
+    // （`relay_wright_core::rest::reject_postgres_connection_protocol`の doc
+    // comment - 両経路で呼ばないと片方から postgres 行を作れてしまう）。
+    reject_postgres_connection_protocol(&input.protocol)?;
     let created = state.plc_connections.create(input.into()).await?;
     state
         .audit
@@ -1680,7 +1690,7 @@ async fn plc_connections_create_body(
             result: "ok",
         })
         .await;
-    Ok(created)
+    Ok(PlcConnectionResponse::from(created))
 }
 
 /// `editor`+ (spec M10): create a PLC connection.
@@ -1688,7 +1698,7 @@ async fn plc_connections_create_body(
 async fn plc_connections_create(
     state: State<'_, AppState>,
     input: PlcConnectionPayload,
-) -> Result<PlcConnection, BantoError> {
+) -> Result<PlcConnectionResponse, BantoError> {
     plc_connections_create_body(&state, input).await
 }
 
@@ -1696,8 +1706,10 @@ async fn plc_connections_update_body(
     state: &AppState,
     id: i64,
     input: PlcConnectionPayload,
-) -> Result<PlcConnection, BantoError> {
+) -> Result<PlcConnectionResponse, BantoError> {
     let actor = require_role(state, Role::Editor, "plc_connections").await?;
+    // S1a レビュー対応: create と同じ理由（上記コメント参照）。
+    reject_postgres_connection_protocol(&input.protocol)?;
     let updated = state.plc_connections.update(id, input.into()).await?;
     state
         .audit
@@ -1712,7 +1724,7 @@ async fn plc_connections_update_body(
             result: "ok",
         })
         .await;
-    Ok(updated)
+    Ok(PlcConnectionResponse::from(updated))
 }
 
 /// `editor`+ (spec M10): update a PLC connection.
@@ -1721,7 +1733,7 @@ async fn plc_connections_update(
     state: State<'_, AppState>,
     id: i64,
     input: PlcConnectionPayload,
-) -> Result<PlcConnection, BantoError> {
+) -> Result<PlcConnectionResponse, BantoError> {
     plc_connections_update_body(&state, id, input).await
 }
 
@@ -3537,6 +3549,9 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .expect("seed plc connection");
@@ -4213,6 +4228,9 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .expect("create slmp connection");

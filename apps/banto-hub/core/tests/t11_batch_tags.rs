@@ -93,6 +93,9 @@ fn disabled_conn_input(name: &str) -> PlcConnectionInput {
         simulation: false,
 
         word_order: "low_high".to_string(),
+        database: None,
+        username: None,
+        password: None,
     }
 }
 

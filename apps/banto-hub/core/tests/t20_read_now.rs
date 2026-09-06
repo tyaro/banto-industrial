@@ -73,6 +73,9 @@ fn slmp_conn_input(name: &str, port: u16) -> PlcConnectionInput {
         enabled: true,
         simulation: false,
         word_order: "low_high".to_string(),
+        database: None,
+        username: None,
+        password: None,
     }
 }
 
@@ -487,6 +490,9 @@ async fn make_internal_tag(app: &TestApp, tag_name: &str) -> String {
             enabled: true,
             simulation: false,
             word_order: "low_high".to_string(),
+            database: None,
+            username: None,
+            password: None,
         })
         .await
         .expect("mem connection should be provisioned");

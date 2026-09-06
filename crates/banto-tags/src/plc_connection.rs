@@ -79,6 +79,51 @@
 //! `FieldError`s for editing/deleting a reserved connection): a clear
 //! validation error at write time is more honest than a flag that is
 //! silently truthy in the database but never observed by anything.
+//!
+//! ## `"postgres"` (S1, docs/banto-hub-external-db-design.md §4.1・§6-4,
+//! 2026-09-06 オーナー決定「案A: 既存3階層の流用」)
+//!
+//! A fourth protocol joins the other three in migration
+//! `0014_plc_connections_allow_postgres.sql`: `"postgres"` names a
+//! connection to an external PostgreSQL database, backing the future DB
+//! Source (#228)/DB Sink (#229) rather than a PLC. Unlike `"virtual"`, a
+//! `"postgres"` row *does* dial something real (`host`/`port` stay required,
+//! same rule as `"modbus-tcp"`/`"slmp"`) - what it never does is join the PLC
+//! collection pipeline: `banto_collect::build_config_from` excludes it from
+//! collection entirely (same treatment as `"virtual"`, see that crate's own
+//! doc comment), and `banto_broker`'s `DRIVERS` table has no entry for it
+//! either, so nothing ever tries to open a broker session against it.
+//!
+//! Three columns exist only for this protocol: [`PlcConnection::database`]/
+//! [`PlcConnection::username`]/[`PlcConnection::password`] (§2.2's "v1 は
+//! MQTT と同じ平文" decision - plaintext storage, no encryption/keyring in
+//! this version). [`validate_plc_connection_input`] enforces the two
+//! directions of one rule: `database`/`username` are required (non-empty,
+//! trimmed, capped) when `protocol == `[`POSTGRES_PROTOCOL`], and all three
+//! columns must be empty/`None` for every other protocol - a `"modbus-tcp"`
+//! row can never carry a stray DB password.
+//!
+//! `unit_id`/`word_order`/`simulation` are meaningless for a DB connection
+//! (they are wire-protocol/PLC concepts) - but instead of `"virtual"`'s
+//! reject-outright stance for `simulation`, a `"postgres"`
+//! [`PlcConnectionInput`] simply has these three fields **silently
+//! normalized** to their column defaults before validation/write
+//! ([`normalize_postgres_input`]), regardless of what the caller sent. This
+//! is the more lenient of the two treatments this module uses for
+//! protocol-inapplicable fields (contrast `"virtual"`'s `host`/`port`
+//! relaxation, which still validates the caller's value when one is given,
+//! and `simulation`'s outright rejection for `"virtual"`) - chosen because a
+//! generic UI/MCP caller that always sends its modbus-tcp defaults
+//! (`unitId: 1`, `wordOrder: "low_high"`) for every protocol should not need
+//! postgres-specific branching just to avoid a validation error.
+//!
+//! **In this slice (S1a), no [`crate::collection_group::CollectionGroup`]
+//! may be created under a `"postgres"` connection** -
+//! `crate::collection_group::CollectionGroupService::create`/`create_tx`/
+//! `update`/`update_tx` reject it with a `FieldError` on `plcConnectionId`
+//! (S2, the DB Source polling engine itself, lifts this once `query_sql`
+//! and `tag_kind = "db"` exist to give such a group somewhere to put its
+//! results).
 
 use banto_core::{BantoError, FieldError, ListParams, ListResult};
 use banto_storage::ColumnMap;
@@ -96,7 +141,7 @@ use crate::support::{
 /// of surfacing the raw SQLite CHECK constraint violation. The two must be
 /// changed together; `every_allowed_protocol_is_accepted_by_the_sql_check` is
 /// the tripwire if they drift.
-pub const ALLOWED_PROTOCOLS: &[&str] = &["modbus-tcp", "slmp", "virtual"];
+pub const ALLOWED_PROTOCOLS: &[&str] = &["modbus-tcp", "slmp", "virtual", "postgres"];
 
 /// Values accepted in `plc_connections.word_order` (P3-b, 監査指摘
 /// 2026-08-12). Mirrors the SQL `CHECK` added by
@@ -122,6 +167,13 @@ pub const ALLOWED_WORD_ORDERS: &[&str] = &["low_high", "high_low"];
 /// [`crate::tag::TagService`]'s `calc`/`mem` placement check.
 pub const VIRTUAL_PROTOCOL: &str = "virtual";
 
+/// The DB Source/Sink protocol (S1, this module's doc comment "`\"postgres\"`"
+/// section). Used by [`validate_plc_connection_input`] (required
+/// `database`/`username`, normalized `unit_id`/`word_order`/`simulation`),
+/// [`PlcConnection::is_db_source`], and by
+/// `crate::collection_group::CollectionGroupService`'s group-placement guard.
+pub const POSTGRES_PROTOCOL: &str = "postgres";
+
 /// The reserved connection name for computed tags (design §4.2's `calc`
 /// external-name segment). `banto-hub` auto-provisions a `"virtual"`-protocol
 /// row with this exact name at startup; [`crate::tag::TagService`] requires
@@ -140,6 +192,14 @@ const MAX_PORT: i64 = 65535;
 // slaves - RTU/TCP gateways sometimes also accept up to 255).
 const MIN_UNIT_ID: i64 = 0;
 const MAX_UNIT_ID: i64 = 255;
+// S1 (this module's doc comment, "`\"postgres\"`" section): generous but
+// bounded caps for `database`/`username` - PostgreSQL identifiers themselves
+// cap at 63 bytes, but `database`/`username` here are the *client-side*
+// connection parameters (sqlx quotes them, they need not be bare
+// identifiers), so the cap is a plain anti-abuse bound, not a PostgreSQL
+// grammar limit. Matches [`MAX_NAME_LEN`]'s role for `name`.
+const MAX_DATABASE_LEN: usize = 128;
+const MAX_USERNAME_LEN: usize = 128;
 
 fn default_protocol() -> String {
     "modbus-tcp".to_string()
@@ -170,6 +230,50 @@ fn default_word_order() -> String {
     "low_high".to_string()
 }
 
+/// S1 (this module's doc comment, "`\"postgres\"`" section): a `"postgres"`
+/// connection has no meaningful `unit_id`/`word_order`/`simulation` (all
+/// three are wire-protocol/PLC concepts), so a payload's values for them are
+/// silently replaced with the column defaults - not validated, not rejected,
+/// just ignored. Called before [`validate_plc_connection_input`] by every
+/// [`PlcConnectionService`] write method, so those three fields' ordinary
+/// range/enum checks below never actually have anything to reject for a
+/// `"postgres"` row (they always see the default, which is always valid).
+///
+/// A no-op for every other protocol (returns `input` unchanged).
+fn normalize_postgres_input(mut input: PlcConnectionInput) -> PlcConnectionInput {
+    if input.protocol == POSTGRES_PROTOCOL {
+        input.unit_id = default_unit_id();
+        input.word_order = default_word_order();
+        input.simulation = false;
+    }
+    input
+}
+
+/// [`PlcConnectionService::create`]'s password rule (this crate's
+/// `PlcConnectionInput::password` doc comment, "create" case): `None` and
+/// `Some("")` both mean "no password yet" (stored as SQL `NULL`); any other
+/// `Some(s)` is stored verbatim.
+fn stored_password_for_create(password: &Option<String>) -> Option<String> {
+    match password {
+        Some(s) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// [`PlcConnectionService::update`]'s password rule (this crate's
+/// `PlcConnectionInput::password` doc comment, "update" case): `None` keeps
+/// `existing`, `Some("")` clears it, any other `Some(s)` replaces it.
+fn stored_password_for_update(
+    password: &Option<String>,
+    existing: Option<String>,
+) -> Option<String> {
+    match password {
+        None => existing,
+        Some(s) if s.is_empty() => None,
+        Some(s) => Some(s.clone()),
+    }
+}
+
 /// A row of the `plc_connections` table, wire-shaped (camelCase) for a
 /// future settings grid (docs/recorder-requirements.md §6 "タグ設定"
 /// screen: "PLC 接続設定含む").
@@ -190,6 +294,41 @@ pub struct PlcConnection {
     /// carry the column's default, the same treatment `unit_id` gets for
     /// SLMP (this module's doc comment, above).
     pub word_order: String,
+    /// S1 (this module's doc comment, "`\"postgres\"`" section): the DB name
+    /// a `"postgres"` connection targets. Always `None` for every other
+    /// protocol.
+    pub database: Option<String>,
+    /// S1: the DB user a `"postgres"` connection authenticates as. Always
+    /// `None` for every other protocol.
+    pub username: Option<String>,
+    /// S1: the DB password, stored **in plain text** (§2.2 of
+    /// docs/banto-hub-external-db-design.md, 2026-09-06 決定「v1 は MQTT と
+    /// 同じ平文」- same posture as `apps/banto-hub/core/src/settings.rs`'s
+    /// MQTT password). Always `None` for every other protocol.
+    ///
+    /// **Never serialize this field to an external caller.** `PlcConnection`
+    /// derives `Serialize` for internal use (config-package export, the
+    /// registry's own round-trip), but every REST/MCP surface that reads a
+    /// connection back (`apps/banto-hub/core/src/rest.rs`'s response DTO,
+    /// `crate::mcp`'s `list_connections`/`create_connection` results) must
+    /// redact this to a `passwordSet: bool` before it leaves the process -
+    /// see this crate's `PlcConnectionService::update`/`update_tx` doc
+    /// comment for the write-side semantics this field participates in.
+    pub password: Option<String>,
+}
+
+impl PlcConnection {
+    /// S1 (this module's doc comment, "`\"postgres\"`" section): whether this
+    /// row is a DB Source/Sink connection (`protocol == `[`POSTGRES_PROTOCOL`])
+    /// rather than a wire-protocol PLC connection. Downstream code that must
+    /// keep DB connections out of a pipeline built for a socket - the PLC
+    /// collection filter in `banto_collect::config::build_config_from`, the
+    /// group-placement guard in
+    /// `crate::collection_group::CollectionGroupService` - uses this instead
+    /// of re-deriving the equality check inline.
+    pub fn is_db_source(&self) -> bool {
+        self.protocol == POSTGRES_PROTOCOL
+    }
 }
 
 /// Create/update payload. `protocol`/`unit_id`/`enabled` default (spec:
@@ -214,6 +353,39 @@ pub struct PlcConnectionInput {
     /// P3-b. See [`PlcConnection::word_order`]'s doc comment.
     #[serde(default = "default_word_order")]
     pub word_order: String,
+    /// S1. See [`PlcConnection::database`]'s doc comment. Required
+    /// (non-empty after trim) when `protocol == `[`POSTGRES_PROTOCOL`],
+    /// forbidden (must be `None`/empty) otherwise.
+    #[serde(default)]
+    pub database: Option<String>,
+    /// S1. See [`PlcConnection::username`]'s doc comment. Same
+    /// required-for-postgres/forbidden-otherwise rule as [`Self::database`].
+    #[serde(default)]
+    pub username: Option<String>,
+    /// S1. See [`PlcConnection::password`]'s doc comment. Optional even for
+    /// `protocol == `[`POSTGRES_PROTOCOL`] (a DB Source may be configured
+    /// before its password is known), forbidden (must be `None`/empty)
+    /// otherwise.
+    ///
+    /// **This field's meaning is not the same on every call** -
+    /// [`PlcConnectionService::create`]/[`PlcConnectionService::create_tx`]
+    /// treat it as a plain "the password to store" (`None`/`Some("")` both
+    /// mean "no password yet"). [`PlcConnectionService::update`]/
+    /// [`PlcConnectionService::update_tx`] treat it as a **tri-state PATCH**
+    /// instead, because a bare `PUT`-style "always echo the current value"
+    /// contract would force every editor UI/MCP caller to have already
+    /// fetched (and therefore received) the plaintext password just to
+    /// leave it unchanged - exactly the exposure [`PlcConnection::password`]'s
+    /// own doc comment says to avoid:
+    ///
+    /// - `None` (omitted, or explicit JSON `null`): **keep** the row's
+    ///   current password unchanged.
+    /// - `Some("")` (empty string): **clear** the stored password (set the
+    ///   column to `NULL`).
+    /// - `Some(s)` for non-empty `s`: **replace** the stored password with
+    ///   `s`.
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 /// Validate a [`PlcConnectionInput`]: `name`/`host` trimmed non-empty (name
@@ -221,6 +393,14 @@ pub struct PlcConnectionInput {
 /// `port` in `1..=65535`, `unit_id` in `0..=255`, `word_order` in
 /// [`ALLOWED_WORD_ORDERS`]. Returns every violation, not just the first
 /// (mirrors `items::validate_item_input` in the banto template repo).
+///
+/// S1 (this module's doc comment, "`\"postgres\"`" section) adds one more
+/// pair of rules, applied **after** the caller has already run the input
+/// through [`normalize_postgres_input`] (so `unit_id`/`word_order`/
+/// `simulation` never fail their own checks above for a `"postgres"` row):
+/// `database`/`username` are required (trimmed non-empty, capped) when
+/// `protocol == `[`POSTGRES_PROTOCOL`], and `database`/`username`/`password`
+/// must all be empty/`None` for every other protocol.
 fn validate_plc_connection_input(input: &PlcConnectionInput) -> Result<(), BantoError> {
     let mut errors: Vec<FieldError> = Vec::new();
 
@@ -301,6 +481,68 @@ fn validate_plc_connection_input(input: &PlcConnectionInput) -> Result<(), Banto
         });
     }
 
+    // S1 (this module's doc comment, "`\"postgres\"`" section): database/
+    // username required (and capped) for postgres, forbidden for everyone
+    // else. password has no format rule of its own (any string, including
+    // empty, is acceptable for postgres - see `PlcConnectionInput::password`'s
+    // doc comment) but is still forbidden outside postgres, same as the
+    // other two.
+    let is_postgres = input.protocol == POSTGRES_PROTOCOL;
+    if is_postgres {
+        let database = input.database.as_deref().unwrap_or("").trim();
+        if database.is_empty() {
+            errors.push(FieldError {
+                field: "database".to_string(),
+                message: required_message(),
+            });
+        } else if database.chars().count() > MAX_DATABASE_LEN {
+            errors.push(FieldError {
+                field: "database".to_string(),
+                message: max_length_message(MAX_DATABASE_LEN),
+            });
+        }
+
+        let username = input.username.as_deref().unwrap_or("").trim();
+        if username.is_empty() {
+            errors.push(FieldError {
+                field: "username".to_string(),
+                message: required_message(),
+            });
+        } else if username.chars().count() > MAX_USERNAME_LEN {
+            errors.push(FieldError {
+                field: "username".to_string(),
+                message: max_length_message(MAX_USERNAME_LEN),
+            });
+        }
+    } else {
+        if input
+            .database
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            errors.push(FieldError {
+                field: "database".to_string(),
+                message: "postgres接続以外では指定できません".to_string(),
+            });
+        }
+        if input
+            .username
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            errors.push(FieldError {
+                field: "username".to_string(),
+                message: "postgres接続以外では指定できません".to_string(),
+            });
+        }
+        if input.password.as_deref().is_some_and(|s| !s.is_empty()) {
+            errors.push(FieldError {
+                field: "password".to_string(),
+                message: "postgres接続以外では指定できません".to_string(),
+            });
+        }
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -321,10 +563,17 @@ fn column_map() -> ColumnMap {
         .column("enabled", "enabled")
         .column("simulation", "simulation")
         .column("wordOrder", "word_order")
+        .column("database", "database")
+        .column("username", "username")
+    // S1: `password` is deliberately NOT listed here - filtering/sorting
+    // a list by password value would let a caller confirm a guess about
+    // its content through a side channel (an otherwise-plain `list`
+    // parameter), which nothing else in this API needs to support.
 }
 
 const RESOURCE: &str = "plc_connections";
-const COLUMNS: &str = "id, name, protocol, host, port, unit_id, enabled, simulation, word_order";
+const COLUMNS: &str =
+    "id, name, protocol, host, port, unit_id, enabled, simulation, word_order, database, username, password";
 
 /// Service layer for the `plc_connections` resource. `Clone` is cheap
 /// (`SqlitePool` is `Arc`-backed), matching the pattern of every resource
@@ -383,12 +632,21 @@ impl PlcConnectionService {
     }
 
     pub async fn create(&self, input: PlcConnectionInput) -> Result<PlcConnection, BantoError> {
+        let input = normalize_postgres_input(input);
         validate_plc_connection_input(&input)?;
+        let is_postgres = input.protocol == POSTGRES_PROTOCOL;
+        let stored_database =
+            is_postgres.then(|| input.database.as_deref().unwrap_or("").trim().to_string());
+        let stored_username =
+            is_postgres.then(|| input.username.as_deref().unwrap_or("").trim().to_string());
+        let stored_password = is_postgres
+            .then(|| stored_password_for_create(&input.password))
+            .flatten();
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
-            "INSERT INTO plc_connections (name, protocol, host, port, unit_id, enabled, simulation, word_order) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
+            "INSERT INTO plc_connections (name, protocol, host, port, unit_id, enabled, simulation, word_order, database, username, password) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
         )))
         .bind(input.name.trim())
         .bind(&input.protocol)
@@ -398,6 +656,9 @@ impl PlcConnectionService {
         .bind(input.enabled)
         .bind(input.simulation)
         .bind(&input.word_order)
+        .bind(stored_database)
+        .bind(stored_username)
+        .bind(stored_password)
         .fetch_one(&self.pool)
         .await
         .map_err(|err| map_write_error(err, "name", NAME_ALREADY_USED, "", ""))
@@ -411,12 +672,21 @@ impl PlcConnectionService {
         connection: &mut SqliteConnection,
         input: PlcConnectionInput,
     ) -> Result<PlcConnection, BantoError> {
+        let input = normalize_postgres_input(input);
         validate_plc_connection_input(&input)?;
+        let is_postgres = input.protocol == POSTGRES_PROTOCOL;
+        let stored_database =
+            is_postgres.then(|| input.database.as_deref().unwrap_or("").trim().to_string());
+        let stored_username =
+            is_postgres.then(|| input.username.as_deref().unwrap_or("").trim().to_string());
+        let stored_password = is_postgres
+            .then(|| stored_password_for_create(&input.password))
+            .flatten();
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
-            "INSERT INTO plc_connections (name, protocol, host, port, unit_id, enabled, simulation, word_order) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
+            "INSERT INTO plc_connections (name, protocol, host, port, unit_id, enabled, simulation, word_order, database, username, password) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
         )))
         .bind(input.name.trim())
         .bind(&input.protocol)
@@ -426,6 +696,9 @@ impl PlcConnectionService {
         .bind(input.enabled)
         .bind(input.simulation)
         .bind(&input.word_order)
+        .bind(stored_database)
+        .bind(stored_username)
+        .bind(stored_password)
         .fetch_one(&mut *connection)
         .await
         .map_err(|err| map_write_error(err, "name", NAME_ALREADY_USED, "", ""))
@@ -440,15 +713,16 @@ impl PlcConnectionService {
         id: i64,
         input: PlcConnectionInput,
     ) -> Result<PlcConnection, BantoError> {
+        let input = normalize_postgres_input(input);
         validate_plc_connection_input(&input)?;
 
-        let existing_protocol: Option<String> =
-            sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
+        let existing: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT protocol, password FROM plc_connections WHERE id = ?")
                 .bind(id)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(banto_storage::storage_error)?;
-        if existing_protocol.as_deref() == Some(VIRTUAL_PROTOCOL) {
+        if existing.as_ref().map(|(protocol, _)| protocol.as_str()) == Some(VIRTUAL_PROTOCOL) {
             return Err(BantoError::Validation {
                 field_errors: vec![FieldError {
                     field: "id".to_string(),
@@ -456,11 +730,23 @@ impl PlcConnectionService {
                 }],
             });
         }
+        let existing_password = existing.and_then(|(_, password)| password);
+
+        let is_postgres = input.protocol == POSTGRES_PROTOCOL;
+        let stored_database =
+            is_postgres.then(|| input.database.as_deref().unwrap_or("").trim().to_string());
+        let stored_username =
+            is_postgres.then(|| input.username.as_deref().unwrap_or("").trim().to_string());
+        let stored_password = if is_postgres {
+            stored_password_for_update(&input.password, existing_password)
+        } else {
+            None
+        };
 
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
-            "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ?, simulation = ?, word_order = ? \
+            "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ?, simulation = ?, word_order = ?, database = ?, username = ?, password = ? \
              WHERE id = ? RETURNING {COLUMNS}"
         )))
         .bind(input.name.trim())
@@ -471,6 +757,9 @@ impl PlcConnectionService {
         .bind(input.enabled)
         .bind(input.simulation)
         .bind(&input.word_order)
+        .bind(stored_database)
+        .bind(stored_username)
+        .bind(stored_password)
         .bind(id)
         .fetch_one(&self.pool)
         .await
@@ -490,14 +779,15 @@ impl PlcConnectionService {
         id: i64,
         input: PlcConnectionInput,
     ) -> Result<PlcConnection, BantoError> {
+        let input = normalize_postgres_input(input);
         validate_plc_connection_input(&input)?;
-        let existing_protocol: Option<String> =
-            sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
+        let existing: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT protocol, password FROM plc_connections WHERE id = ?")
                 .bind(id)
                 .fetch_optional(&mut *connection)
                 .await
                 .map_err(banto_storage::storage_error)?;
-        if existing_protocol.as_deref() == Some(VIRTUAL_PROTOCOL) {
+        if existing.as_ref().map(|(protocol, _)| protocol.as_str()) == Some(VIRTUAL_PROTOCOL) {
             return Err(BantoError::Validation {
                 field_errors: vec![FieldError {
                     field: "id".to_string(),
@@ -505,10 +795,23 @@ impl PlcConnectionService {
                 }],
             });
         }
+        let existing_password = existing.and_then(|(_, password)| password);
+
+        let is_postgres = input.protocol == POSTGRES_PROTOCOL;
+        let stored_database =
+            is_postgres.then(|| input.database.as_deref().unwrap_or("").trim().to_string());
+        let stored_username =
+            is_postgres.then(|| input.username.as_deref().unwrap_or("").trim().to_string());
+        let stored_password = if is_postgres {
+            stored_password_for_update(&input.password, existing_password)
+        } else {
+            None
+        };
+
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
         sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
-            "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ?, simulation = ?, word_order = ? \
+            "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ?, simulation = ?, word_order = ?, database = ?, username = ?, password = ? \
              WHERE id = ? RETURNING {COLUMNS}"
         )))
         .bind(input.name.trim())
@@ -519,6 +822,9 @@ impl PlcConnectionService {
         .bind(input.enabled)
         .bind(input.simulation)
         .bind(&input.word_order)
+        .bind(stored_database)
+        .bind(stored_username)
+        .bind(stored_password)
         .bind(id)
         .fetch_one(&mut *connection)
         .await
@@ -791,6 +1097,9 @@ mod tests {
             simulation: false,
 
             word_order: "low_high".to_string(),
+            database: None,
+            username: None,
+            password: None,
         }
     }
 
@@ -906,6 +1215,14 @@ mod tests {
         for (i, protocol) in ALLOWED_PROTOCOLS.iter().enumerate() {
             let mut input = sample_input(&format!("conn{i}"));
             input.protocol = (*protocol).to_string();
+            // S1: "postgres" additionally requires database/username (this
+            // module's doc comment, "`\"postgres\"`" section) - fill them in
+            // so this test still exercises the SQL CHECK specifically,
+            // rather than failing validation for an unrelated reason.
+            if *protocol == POSTGRES_PROTOCOL {
+                input.database = Some("appdb".to_string());
+                input.username = Some("appuser".to_string());
+            }
             let created = svc.create(input).await.unwrap_or_else(|e| {
                 panic!("{protocol} is in ALLOWED_PROTOCOLS but the SQL CHECK rejected it: {e:?}")
             });
@@ -1122,6 +1439,9 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .expect("a virtual connection should accept empty host / port 0");
@@ -1166,6 +1486,9 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .unwrap();
@@ -1197,6 +1520,9 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .unwrap();
@@ -1382,6 +1708,377 @@ mod tests {
         .is_err());
     }
 
+    // --- S1: "postgres" protocol (migration 0014) ---------------------------
+
+    /// Migration 0014 rebuilds `plc_connections` again (SQLite cannot `ALTER`
+    /// a `CHECK`) - the direct sibling of
+    /// `migration_0007_preserves_rows_and_foreign_keys_on_a_populated_database`,
+    /// but against the full post-0013 schema (`collection_groups.default_writable`
+    /// from 0012, `tags.revision`/the 0011 rebuild/`string_encoding` from
+    /// 0013) - a stale column list here would silently truncate every
+    /// existing row, exactly the risk 0007's own header warns about.
+    #[tokio::test]
+    async fn migration_0014_preserves_rows_and_foreign_keys_on_a_populated_database() {
+        use sqlx::{Acquire, Executor};
+
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect_sqlite_memory");
+        let mut conn = pool.acquire().await.expect("acquire one pinned connection");
+
+        for (label, sql) in [
+            (
+                "0001",
+                include_str!("../migrations/0001_plc_connections.sql"),
+            ),
+            (
+                "0002",
+                include_str!("../migrations/0002_collection_groups.sql"),
+            ),
+            ("0003", include_str!("../migrations/0003_tags.sql")),
+            (
+                "0004",
+                include_str!("../migrations/0004_plc_connections_allow_slmp.sql"),
+            ),
+            (
+                "0005",
+                include_str!("../migrations/0005_tags_allow_string.sql"),
+            ),
+            (
+                "0006",
+                include_str!("../migrations/0006_tags_writable_kind.sql"),
+            ),
+            (
+                "0007",
+                include_str!("../migrations/0007_plc_connections_allow_virtual.sql"),
+            ),
+            (
+                "0008",
+                include_str!("../migrations/0008_plc_connections_add_simulation.sql"),
+            ),
+            ("0009", include_str!("../migrations/0009_tags_revision.sql")),
+            (
+                "0010",
+                include_str!("../migrations/0010_plc_connections_add_word_order.sql"),
+            ),
+            (
+                "0011",
+                include_str!("../migrations/0011_tags_unique_name_per_group.sql"),
+            ),
+            (
+                "0012",
+                include_str!("../migrations/0012_collection_groups_add_default_writable.sql"),
+            ),
+            (
+                "0013",
+                include_str!("../migrations/0013_tags_add_string_encoding.sql"),
+            ),
+        ] {
+            conn.execute(sql)
+                .await
+                .unwrap_or_else(|e| panic!("pre-0014 migration {label} failed: {e}"));
+        }
+
+        conn.execute(
+            "INSERT INTO plc_connections \
+             (id, name, protocol, host, port, unit_id, enabled, simulation, word_order) \
+             VALUES (7, 'Line1 PLC', 'slmp', '192.168.1.10', 5007, 3, 0, 1, 'high_low')",
+        )
+        .await
+        .expect("seed connection");
+        conn.execute(
+            "INSERT INTO collection_groups \
+             (id, name, plc_connection_id, period_ms, enabled, default_writable) \
+             VALUES (4, 'G1', 7, 1000, 1, 0)",
+        )
+        .await
+        .expect("seed collection group");
+        conn.execute(
+            "INSERT INTO tags (\
+                id, name, collection_group_id, address, data_type, string_length, \
+                raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, threshold_h, enabled, \
+                writable, tag_kind, expression, retain, revision, string_encoding\
+             ) VALUES (\
+                9, 'T1', 4, 'D100', 'i16', NULL, \
+                0, 100, 0, 50, 'degC', 2, 45, 1, \
+                1, 'plc', NULL, 0, 1, 'shift_jis'\
+             )",
+        )
+        .await
+        .expect("seed tag");
+
+        let migration = include_str!("../migrations/0014_plc_connections_allow_postgres.sql");
+        let mut tx = conn.begin().await.expect("begin, as the migrator does");
+        tx.execute(migration).await.expect("0014 should apply");
+        tx.commit().await.expect("0014 should commit");
+
+        #[allow(clippy::type_complexity)]
+        let row: (i64, String, String, String, i64, i64, bool, bool, String) = sqlx::query_as(
+            "SELECT id, name, protocol, host, port, unit_id, enabled, simulation, word_order \
+             FROM plc_connections",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the seeded connection should have been copied across");
+        assert_eq!(
+            row,
+            (
+                7,
+                "Line1 PLC".to_string(),
+                "slmp".to_string(),
+                "192.168.1.10".to_string(),
+                5007,
+                3,
+                false,
+                true,
+                "high_low".to_string(),
+            )
+        );
+        // The three new columns start out NULL for a pre-existing row.
+        let creds: (Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT database, username, password FROM plc_connections WHERE id = 7")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("credential columns should exist and be NULL");
+        assert_eq!(creds, (None, None, None));
+
+        let group: (i64, String, i64, i64, bool, bool) = sqlx::query_as(
+            "SELECT id, name, plc_connection_id, period_ms, enabled, default_writable \
+             FROM collection_groups",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the collection group should survive");
+        assert_eq!(group, (4, "G1".to_string(), 7, 1000, true, false));
+
+        #[allow(clippy::type_complexity)]
+        let tag: (
+            i64,
+            String,
+            i64,
+            String,
+            bool,
+            String,
+            Option<String>,
+            bool,
+            i64,
+            String,
+        ) = sqlx::query_as(
+            "SELECT id, name, collection_group_id, address, writable, tag_kind, expression, \
+                 retain, revision, string_encoding FROM tags",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the seeded tag should survive with every T2/T6/T18/T20 column intact");
+        assert_eq!(
+            tag,
+            (
+                9,
+                "T1".to_string(),
+                4,
+                "D100".to_string(),
+                true,
+                "plc".to_string(),
+                None,
+                false,
+                1,
+                "shift_jis".to_string(),
+            )
+        );
+
+        let violations: Vec<(String,)> = sqlx::query_as("PRAGMA foreign_key_check")
+            .fetch_all(&mut *conn)
+            .await
+            .expect("foreign_key_check");
+        assert!(
+            violations.is_empty(),
+            "the rebuild left dangling foreign keys: {violations:?}"
+        );
+
+        assert!(
+            sqlx::query(
+                "INSERT INTO collection_groups (name, plc_connection_id, period_ms) \
+                 VALUES ('orphan', 999, 1000)",
+            )
+            .execute(&mut *conn)
+            .await
+            .is_err(),
+            "foreign keys should still be enforced after the migration"
+        );
+
+        // The point of the whole exercise: 'postgres' (with credentials) is
+        // now insertable, and nothing else new is.
+        sqlx::query(
+            "INSERT INTO plc_connections (name, protocol, host, port, database, username, password) \
+             VALUES ('ERP DB', 'postgres', '10.0.0.50', 5432, 'erp', 'reader', 'secret')",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("postgres should be accepted after the rebuild");
+        assert!(sqlx::query(
+            "INSERT INTO plc_connections (name, protocol, host, port) \
+             VALUES ('Nope', 'ethernet-ip', '192.168.1.30', 44818)",
+        )
+        .execute(&mut *conn)
+        .await
+        .is_err());
+    }
+
+    /// [`ALLOWED_PROTOCOLS`]/the SQL `CHECK` widened by migration 0014, plus
+    /// this crate's own application-layer rule (this module's doc comment,
+    /// "`\"postgres\"`" section): `database`/`username` required for
+    /// `"postgres"`, forbidden for every other protocol.
+    #[tokio::test]
+    async fn create_rejects_postgres_without_database_or_username() {
+        let svc = service().await;
+        let mut input = sample_input("PgNoCreds");
+        input.protocol = POSTGRES_PROTOCOL.to_string();
+        let err = svc.create(input).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                let fields: Vec<&str> = field_errors.iter().map(|e| e.field.as_str()).collect();
+                assert!(fields.contains(&"database"));
+                assert!(fields.contains(&"username"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// The reverse direction: a non-postgres connection may not carry
+    /// `database`/`username`/`password` - a `"modbus-tcp"` row can never
+    /// smuggle in a stray DB credential.
+    #[tokio::test]
+    async fn create_rejects_database_username_password_on_a_non_postgres_connection() {
+        let svc = service().await;
+        let mut input = sample_input("NotPg");
+        input.database = Some("somedb".to_string());
+        input.username = Some("someone".to_string());
+        input.password = Some("secret".to_string());
+        let err = svc.create(input).await.unwrap_err();
+        match err {
+            BantoError::Validation { field_errors } => {
+                let fields: Vec<&str> = field_errors.iter().map(|e| e.field.as_str()).collect();
+                assert!(fields.contains(&"database"));
+                assert!(fields.contains(&"username"));
+                assert!(fields.contains(&"password"));
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    fn postgres_input(name: &str) -> PlcConnectionInput {
+        PlcConnectionInput {
+            name: name.to_string(),
+            protocol: POSTGRES_PROTOCOL.to_string(),
+            host: "10.0.0.50".to_string(),
+            port: 5432,
+            unit_id: 1,
+            enabled: true,
+            simulation: false,
+            word_order: "low_high".to_string(),
+            database: Some("appdb".to_string()),
+            username: Some("appuser".to_string()),
+            password: None,
+        }
+    }
+
+    /// A `"postgres"` connection created with `password: None` stores no
+    /// password (this crate's `PlcConnectionInput::password` doc comment,
+    /// "create" case) - round-trips as `None`, not an empty string.
+    #[tokio::test]
+    async fn create_postgres_without_password_stores_none() {
+        let svc = service().await;
+        let created = svc
+            .create(postgres_input("PgNoPassword"))
+            .await
+            .expect("postgres without a password should be accepted");
+        assert_eq!(created.database.as_deref(), Some("appdb"));
+        assert_eq!(created.username.as_deref(), Some("appuser"));
+        assert_eq!(created.password, None);
+    }
+
+    /// A `"postgres"` connection created with `Some(s)` stores `s` verbatim.
+    #[tokio::test]
+    async fn create_postgres_with_password_stores_it() {
+        let svc = service().await;
+        let mut input = postgres_input("PgWithPassword");
+        input.password = Some("s3cret".to_string());
+        let created = svc.create(input).await.expect("create should succeed");
+        assert_eq!(created.password.as_deref(), Some("s3cret"));
+    }
+
+    /// Update's tri-state PATCH semantics (this crate's
+    /// `PlcConnectionInput::password` doc comment, "update" case): omitting
+    /// `password` (`None`) keeps whatever is already stored.
+    #[tokio::test]
+    async fn update_with_password_none_keeps_the_existing_password() {
+        let svc = service().await;
+        let mut create_input = postgres_input("PgKeep");
+        create_input.password = Some("original".to_string());
+        let created = svc.create(create_input).await.unwrap();
+
+        let mut update_input = postgres_input("PgKeep");
+        update_input.password = None;
+        let updated = svc.update(created.id, update_input).await.unwrap();
+        assert_eq!(updated.password.as_deref(), Some("original"));
+    }
+
+    /// `Some("")` clears a previously-stored password.
+    #[tokio::test]
+    async fn update_with_password_empty_string_clears_it() {
+        let svc = service().await;
+        let mut create_input = postgres_input("PgClear");
+        create_input.password = Some("original".to_string());
+        let created = svc.create(create_input).await.unwrap();
+
+        let mut update_input = postgres_input("PgClear");
+        update_input.password = Some(String::new());
+        let updated = svc.update(created.id, update_input).await.unwrap();
+        assert_eq!(updated.password, None);
+    }
+
+    /// `Some(s)` for a non-empty `s` replaces the stored password.
+    #[tokio::test]
+    async fn update_with_password_some_replaces_it() {
+        let svc = service().await;
+        let mut create_input = postgres_input("PgReplace");
+        create_input.password = Some("original".to_string());
+        let created = svc.create(create_input).await.unwrap();
+
+        let mut update_input = postgres_input("PgReplace");
+        update_input.password = Some("replacement".to_string());
+        let updated = svc.update(created.id, update_input).await.unwrap();
+        assert_eq!(updated.password.as_deref(), Some("replacement"));
+    }
+
+    /// `unit_id`/`word_order`/`simulation` are silently normalized to their
+    /// defaults for a `"postgres"` connection, regardless of what the caller
+    /// sent (this module's doc comment, "`\"postgres\"`" section,
+    /// [`normalize_postgres_input`]) - no validation error, just ignored.
+    #[tokio::test]
+    async fn postgres_connection_normalizes_unit_id_word_order_and_simulation() {
+        let svc = service().await;
+        let mut input = postgres_input("PgNormalize");
+        input.unit_id = 200;
+        input.word_order = "high_low".to_string();
+        input.simulation = true;
+        let created = svc.create(input).await.expect("create should succeed");
+        assert_eq!(created.unit_id, 1);
+        assert_eq!(created.word_order, "low_high");
+        assert!(!created.simulation);
+    }
+
+    /// [`PlcConnection::is_db_source`]: true only for `"postgres"` rows.
+    #[tokio::test]
+    async fn is_db_source_is_true_only_for_postgres() {
+        let svc = service().await;
+        let pg = svc.create(postgres_input("PgIsDbSource")).await.unwrap();
+        assert!(pg.is_db_source());
+
+        let plc = svc.create(sample_input("NotDbSource")).await.unwrap();
+        assert!(!plc.is_db_source());
+    }
+
     // --- T9-1: "simulation" column (migration 0008) ------------------------
 
     /// A `PlcConnectionInput` built with `simulation: false` (this file's
@@ -1433,6 +2130,9 @@ mod tests {
                 simulation: true,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .unwrap_err();
@@ -1463,6 +2163,9 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .expect("simulation: false must not be affected by the new check");
@@ -1830,6 +2533,9 @@ mod tests {
                 simulation: false,
 
                 word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
             })
             .await
             .unwrap();
