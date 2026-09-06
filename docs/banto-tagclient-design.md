@@ -5,7 +5,7 @@
 S4統合ゲートの5項目（本書§7冒頭）はすべて済んだ。依存グラフ・license/保守状況・
 Windows配布バイナリ増分・workspace feature整合の実測は§7.1、**5（Hubのrelease tag
 への固定）は 2026-09-02 オーナー決定で `v0.1.0` に固定**した（§7.2）。
-LAN越しの接続確認は 2026-09-02 に完了（PR #225）し、残るのはprivate appへの固定のみである。実機で判明したHubの挙動（on-change配信・書き込み直後の旧値）は§4.5に記録した（2026-09-06）。S1bのREST catalog/values transport、S2aの
+LAN越しの接続確認は 2026-09-02 に完了（PR #225）した。**private appへの固定は、SDKを利用する非公開アプリがまだ存在しないため「利用アプリが出た時点で組み込み確認のissueを別途起票する」に読み替え、Issue #123 は 2026-09-06 オーナー決定でクローズした。**実機で判明したHubの挙動（on-change配信・書き込み直後の旧値）は§4.5に記録した（2026-09-06）。S1bのREST catalog/values transport、S2aの
 Hub WS wire純粋解析・bounded pending map・latest-wins publish gate・非LIVE current抑止に加え、
 S2b-1の認証付きWebSocket handshake、S2b-2aのon_change subscribe送信と1フレーム受信、
 S2b-2bのcrate-private単一世代worker・tokio watchによるlatest snapshot配信・atomic publishを
@@ -17,7 +17,7 @@ S4b-1互換候補では、`origin/main` 509bf0e（Banto v1.4.0）との統合検
 解消は未push・未mergeの候補上の確認であり、Issue自体は完了扱いにしない。
 **実Hub接続は2026-09-01に検証済み**（`docs/real-machine-test-2026-09.md`、6項目すべて合格。
 403/503の区別を含む）、**配布サイズは§7.1、release tagは§7.2で確定**した。
-**private appへの固定は未完**で、RTSPの別worktree/別履歴も含めない。
+**private appへの固定は利用アプリの出現待ち**（上記）で、RTSPの別worktree/別履歴も含めない。
 **W1（2026-09-01）**では、Issue #123の残スコープだった単一タグ書き込み
 （`RestClient::write_tag`）を実装した。stable IDから外部名を都度re解決し、
 `POST /api/v1/values/{tag}`を1回送るだけで、`worker.rs`の再接続・backoff機構には
