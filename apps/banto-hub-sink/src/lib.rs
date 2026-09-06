@@ -61,7 +61,10 @@
 //!   監督・停止時の flush）。テスト可能にするため `main.rs` ではなくこの
 //!   lib 側に置いてある。
 //! - [`service`][]（Windows のみ）: banto-hub と同じ `windows-service` の
-//!   SCM パターン（`install`/`uninstall`/`run-service`）。
+//!   SCM パターン（`install`/`uninstall`/`run-service`）に加え、
+//!   `banto-hub-elev.exe`（banto-hub 側の UAC 昇格ヘルパー）を子プロセスで
+//!   呼ぶだけの `grant-service-acl`（S6 レビュー指摘の follow-up、
+//!   `service` のモジュール doc「サービス ACL の付与」節参照）。
 //!
 //! ## 資格情報の扱い（§2.2・§6-3・§6-15）
 //!

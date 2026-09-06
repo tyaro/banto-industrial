@@ -22,14 +22,17 @@
 //! `revert-to-commissioning`）- フリーフォームなコマンド文字列は
 //! 一切受け付けない（昇格プロセスへ任意コマンドを渡させないための
 //! セキュリティ境界）。`setup-operators`は追加ユーザー名を1個まで、
-//! `grant-profile-acl`は`[username] [profile-id]`を2個まで、
-//! `reset-password`は`<username> [profile-id]`を1〜2個（`username`は省略
-//! 不可）、`revert-to-commissioning`は`[profile-id]`を1個まで、それぞれ
-//! 引数として受け付ける（省略時は現在の対話ユーザー／既定 profile -
-//! `service_elevated`のモジュール doc参照）。**`reset-password`の新パスワード
-//! 自体は引数に含めない** - プロセス一覧・シェル履歴に残さないため、実行後に
-//! 標準入力から対話的に読む（`service_elevated`モジュール doc「ロックダウン
-//! 回復アクション」節参照）。
+//! `grant-service-acl`は`[service-name]`を1個まで（省略時は`BantoHub`固定 -
+//! S6 申し送りの follow-up、`service_elevated`モジュール doc「S6 申し送りの
+//! follow-up」節参照。`apps/banto-hub-sink`が`grant-service-acl
+//! BantoHubSink`として呼ぶ）、`grant-profile-acl`は`[username] [profile-id]`
+//! を2個まで、`reset-password`は`<username> [profile-id]`を1〜2個
+//! （`username`は省略不可）、`revert-to-commissioning`は`[profile-id]`を
+//! 1個まで、それぞれ引数として受け付ける（省略時は現在の対話ユーザー／
+//! 既定 profile - `service_elevated`のモジュール doc参照）。
+//! **`reset-password`の新パスワード自体は引数に含めない** - プロセス
+//! 一覧・シェル履歴に残さないため、実行後に標準入力から対話的に読む
+//! （`service_elevated`モジュール doc「ロックダウン回復アクション」節参照）。
 //!
 //! 実装本体は[`banto_hub_core::service_elevated`]（lib crate 側に置き、
 //! `banto-hub.exe`とテストコードの両方から検証しやすくしている）- この
@@ -82,6 +85,9 @@ fn print_usage() {
     );
     eprintln!(
         "banto-hub-elev:   例: banto-hub-elev.exe setup-operators [ユーザー名（省略時は現在の対話ユーザー）]"
+    );
+    eprintln!(
+        "banto-hub-elev:   例: banto-hub-elev.exe grant-service-acl [サービス名（省略時は BantoHub。BantoHubSink 等も指定可）]"
     );
     eprintln!(
         "banto-hub-elev:   例: banto-hub-elev.exe grant-profile-acl [ユーザー名] [profile-id]（両方省略時は現在の対話ユーザー・既定 profile）"

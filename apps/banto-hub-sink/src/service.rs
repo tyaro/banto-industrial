@@ -23,13 +23,50 @@
 //! banto-hub の `service_install::install` と同じ（アップグレード時に
 //! 既存の起動種別を上書きしないため）。
 //!
+//! ## サービス ACL の付与（`grant-service-acl`、S6 レビュー指摘の follow-up）
+//!
+//! banto-hub は `BantoHub` サービスの DACL に `BantoHub Operators`
+//! ローカルグループへの限定 ACE（query-config/query-status/start/stop の
+//! みで、設定変更・削除・ACL 自体の変更は許可しない）を、`install` の中では
+//! なく **別の昇格ステップ**（`banto-hub-elev.exe grant-service-acl`、
+//! `apps/banto-hub/core/src/service_elevated.rs` 参照）で付与する。
+//! デスクトップシェルの「サービス」一覧（S6、
+//! `docs/banto-hub-external-db-design.md` §5.5）は
+//! `WindowsServiceManager::for_service` 経由で `BantoHubSink` の
+//! 起動・停止も扱えるが、`BantoHubSink` にはこの ACE が一切付与されて
+//! いなかった（PR #313 レビュー指摘）ため、Operators（管理者ではない
+//! 一般ユーザー）がシェルからサイドカーを起動・停止しようとすると Win32 の
+//! `ERROR_ACCESS_DENIED` になりうる。
+//!
+//! [`grant_service_acl`] はこの gap を埋める `banto-hub-sink.exe
+//! grant-service-acl` サブコマンドの本体 - **SDDL/ACE を組み立てる Win32
+//! コードはこのクレートに一切持たない**（banto-hub と同じ実装を複製しない）。
+//! 代わりに、同じ MSI で隣にインストールされる `banto-hub-elev.exe`
+//! （`apps/banto-hub/core/src/bin/banto-hub-elev.rs`、
+//! `requireAdministrator` マニフェスト済み）を
+//! `grant-service-acl BantoHubSink`（[`SERVICE_NAME`]をそのまま渡す）
+//! 引数付きの子プロセスとして起動するだけ - 実際の ACE は
+//! `banto_hub_core::service_elevated::grant_service_acl_for` が
+//! `BantoHub` 向けと全く同じ SDDL（`OPERATORS_SERVICE_ACCESS_MASK`）で
+//! 組み立てる。これにより `banto-hub-sink.exe` を tonic/grpc・sqlx の
+//! postgres+sqlite・axum 等を抱える重い `banto-hub-core` に本番依存
+//! させずに済む（このクレートの設計方針「新規依存なし・release 約
+//! 6.2 MiB」、`lib.rs` モジュール doc参照）。
+//!
+//! **MSI/インストーラは、`banto-hub-sink.exe install` の後にこの
+//! サブコマンド（`banto-hub-sink.exe grant-service-acl`）も呼ぶこと** -
+//! banto-hub 側の `grant-service-acl` と同様、`install` 自体には含めて
+//! いない（アップグレード時に既存 ACL を無条件に触らないため）。手動でも
+//! 実行できる（管理者権限の PowerShell から、`banto-hub-elev.exe` と
+//! 同じディレクトリで `.\banto-hub-sink.exe grant-service-acl`）。
+//!
 //! **このファイル全体が Windows 専用** - `lib.rs` 側で
 //! `#[cfg(windows)] pub mod service;` としてしか読み込まれないので、
 //! 非 Windows ビルドにはこのコードも `windows-service` への依存も一切
 //! 含まれない。
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -55,6 +92,13 @@ const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 pub const INSTALL_ARG: &str = "install";
 pub const UNINSTALL_ARG: &str = "uninstall";
 pub const RUN_SERVICE_ARG: &str = "run-service";
+/// モジュール doc「サービス ACL の付与」節参照。
+pub const GRANT_SERVICE_ACL_ARG: &str = "grant-service-acl";
+
+/// 同じ MSI で隣にインストールされる UAC 昇格ヘルパーの実行ファイル名
+/// （`apps/banto-hub/core/src/bin/banto-hub-elev.rs`）。モジュール doc
+/// 「サービス ACL の付与」節参照。
+pub const ELEV_EXE_NAME: &str = "banto-hub-elev.exe";
 
 /// サービスログの出力先ディレクトリを上書きする環境変数。既定は exe と
 /// 同じディレクトリ（設定ファイルと同じ置き場所）。
@@ -126,6 +170,66 @@ pub fn install() {
         "banto-hub-sink: 設定ファイル（{}）を exe と同じディレクトリに置いてから `Start-Service {SERVICE_NAME}` してください",
         crate::config::DEFAULT_CONFIG_FILE_NAME
     );
+}
+
+/// `grant-service-acl` サブコマンドの本体（モジュール doc「サービス ACL の
+/// 付与」節参照）。`banto-hub-elev.exe grant-service-acl BantoHubSink`を
+/// 子プロセスとして実行するだけで、Win32 の SDDL/ACE コードはこの関数に
+/// 一切持たない - 実装は
+/// `banto_hub_core::service_elevated::grant_service_acl_for`
+/// （`apps/banto-hub/core/src/service_elevated.rs`）の1箇所のまま。
+pub fn grant_service_acl() {
+    let elev_path = match resolve_elev_exe() {
+        Some(path) => path,
+        None => fail(&format!(
+            "banto-hub-sink: {ELEV_EXE_NAME} が見つかりません（banto-hub と同じ MSI で\
+             このバイナリと同じディレクトリにインストールされているはずです）"
+        )),
+    };
+
+    println!(
+        "banto-hub-sink: {} 経由で '{SERVICE_NAME}' サービスへ Operators のサービス ACL を付与します...",
+        elev_path.display()
+    );
+
+    let status = std::process::Command::new(&elev_path)
+        .arg(GRANT_SERVICE_ACL_ARG)
+        .arg(SERVICE_NAME)
+        .status();
+
+    match status {
+        Ok(status) if status.success() => {
+            println!("banto-hub-sink: '{SERVICE_NAME}' への Operators サービス ACL 付与が完了しました");
+        }
+        Ok(status) => fail(&format!(
+            "banto-hub-sink: {ELEV_EXE_NAME} {GRANT_SERVICE_ACL_ARG} {SERVICE_NAME} が失敗しました（終了コード {:?}）",
+            status.code()
+        )),
+        Err(err) => fail(&format!(
+            "banto-hub-sink: {ELEV_EXE_NAME} の起動に失敗しました: {err}"
+        )),
+    }
+}
+
+/// [`grant_service_acl`]が使う`banto-hub-elev.exe`の探索。自分自身
+/// （`banto-hub-sink.exe`）と同じディレクトリのみを見る - MSI が両方を
+/// 同じ INSTDIR へ置く前提（モジュール doc「サービス ACL の付与」節参照。
+/// Tauri シェル側`host_switch_ipc.rs::resolve_elev_exe`のような開発時
+/// staging ディレクトリの探索は行わない - こちらは MSI 経由の運用のみを
+/// 想定するため）。
+fn resolve_elev_exe() -> Option<PathBuf> {
+    let current_exe = std::env::current_exe().ok()?;
+    let dir = current_exe.parent()?;
+    find_elev_exe_in(dir)
+}
+
+/// `dir`直下の[`ELEV_EXE_NAME`]を探す（存在確認込み）。[`resolve_elev_exe`]
+/// から`current_exe()`の親ディレクトリの解決を切り離した、テスト容易性
+/// のためだけの純粋なヘルパー（`tempfile`で作った任意のディレクトリを
+/// 渡してテストできる）。
+fn find_elev_exe_in(dir: &Path) -> Option<PathBuf> {
+    let candidate = dir.join(ELEV_EXE_NAME);
+    candidate.is_file().then_some(candidate)
 }
 
 /// サービス登録を解除する（管理者権限が必要）。実行中なら先に停止する。
@@ -293,4 +397,51 @@ fn run_service_body(_arguments: Vec<OsString>) {
 
     log_line("banto-hub-sink: Windows サービスを停止しました");
     report_status(ServiceState::Stopped, ServiceExitCode::Win32(0));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// このクレートは`banto-hub-core`を本番依存に加えない（モジュール doc
+    /// 「サービス ACL の付与」節参照）ため、シェル側の
+    /// `service_manager::SINK_SERVICE_NAME`とこのクレートの[`SERVICE_NAME`]
+    /// は値を複製している（`service_manager.rs`のモジュール doc「値の
+    /// 複製で済ませる」節と同じ判断）。複製は許容するが値のドリフトは
+    /// 許容しない - `banto-hub-core`は既にこのクレートの
+    /// dev-dependency（`tests/sidecar.rs`用）にあるので、このテストで
+    /// 一致を固定する。
+    #[test]
+    fn service_name_matches_shell_side_sink_constant() {
+        assert_eq!(
+            SERVICE_NAME,
+            banto_hub_core::service_manager::SINK_SERVICE_NAME
+        );
+    }
+
+    #[test]
+    fn find_elev_exe_in_locates_sibling_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let expected = dir.path().join(ELEV_EXE_NAME);
+        std::fs::write(&expected, b"stub").expect("write stub exe");
+
+        assert_eq!(find_elev_exe_in(dir.path()), Some(expected));
+    }
+
+    #[test]
+    fn find_elev_exe_in_returns_none_when_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(find_elev_exe_in(dir.path()), None);
+    }
+
+    /// ディレクトリと同名の`banto-hub-elev.exe`（ファイルではない）は
+    /// 「見つからない」扱いにする - `is_file()`を使っているため、壊れた
+    /// インストール（同名ディレクトリが誤って存在する等）を実行ファイルと
+    /// 誤認しないことの回帰テスト。
+    #[test]
+    fn find_elev_exe_in_ignores_directory_with_same_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join(ELEV_EXE_NAME)).expect("mkdir");
+        assert_eq!(find_elev_exe_in(dir.path()), None);
+    }
 }
