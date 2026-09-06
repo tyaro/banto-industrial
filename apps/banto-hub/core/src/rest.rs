@@ -2846,6 +2846,65 @@ struct QueuedPendingChangeResponse {
     message: String,
 }
 
+/// S1a レビュー対応（`docs/banto-hub-external-db-design.md`§2.2、
+/// `banto_tags::PlcConnection::password`の doc comment「外部呼び出し元へ
+/// 決してシリアライズしない」）: `pending_changes.payload`列は
+/// `plc_connections.create`/`.update`の`PlcConnectionPayload`をそのまま
+/// JSON 化して保存する（`queue_pending_registry_change`/`crate::mcp`の
+/// `tool_create_connection`/`tool_update_connection`参照）ため、`password`
+/// を含みうる。**DB に保存する値・`decode_pending_payload`/
+/// `execute_pending_apply`が適用時に読む値は一切変更しない**（適用には
+/// 平文パスワードそのものが必要）- この関数は外部へ返す直前のコピーにだけ
+/// 適用する。
+///
+/// `payload.input.password`を取り除き、代わりに`passwordSet`を挿入する:
+/// - `"plc_connections.create"`: `password`が非空文字列なら`true`、
+///   省略/`null`/空文字列なら`false`
+///   （`banto_tags::plc_connection`の`stored_password_for_create`と同じ
+///   「`None`も空文字列も『まだ無し』」の扱い）。
+/// - `"plc_connections.update"`: **tri-state** - 非空文字列なら`true`
+///   （置き換え）、空文字列なら`false`（消去）、省略/`null`なら`null`
+///   （`stored_password_for_update`の「`None`は現在のパスワードを維持」の
+///   意味をそのまま反映 - この pending change 自体は「今の保存状態」を
+///   持たないので、`true`/`false`のどちらでもなく`null`とする。現在値は
+///   `GET /api/plc-connections/{id}`の`passwordSet`で別途確認できる）。
+///
+/// それ以外の`source`（`"plc_connections.delete"`、`collection_groups.*`、
+/// `tags.*`）は無変更でそのまま返す - password を持ちうるのは
+/// `plc_connections.create`/`.update`の2つだけ。
+fn redact_pending_payload(source: &str, payload: &serde_json::Value) -> serde_json::Value {
+    if source != "plc_connections.create" && source != "plc_connections.update" {
+        return payload.clone();
+    }
+    let mut payload = payload.clone();
+    let Some(input) = payload.get_mut("input").and_then(|v| v.as_object_mut()) else {
+        return payload;
+    };
+    let password_set = match input.remove("password") {
+        None | Some(serde_json::Value::Null) => {
+            if source == "plc_connections.create" {
+                serde_json::Value::Bool(false)
+            } else {
+                serde_json::Value::Null
+            }
+        }
+        Some(serde_json::Value::String(s)) => serde_json::Value::Bool(!s.is_empty()),
+        // 文字列でない不正な値が来た場合(本来は起こらない)も、少なくとも
+        // 平文パスワードそのものを外に漏らさないことだけは保つ。
+        Some(_) => serde_json::Value::Bool(false),
+    };
+    input.insert("passwordSet".to_string(), password_set);
+    payload
+}
+
+/// [`redact_pending_payload`]を`PendingChange`全体に適用したコピーを返す -
+/// list/get/cancel/requeue/apply/enqueue のあらゆる応答が、DB の生の行では
+/// なく必ずこの関数を通した後の値を返すための唯一の入口。
+fn redact_pending_change_for_response(pending: PendingChange) -> PendingChange {
+    let payload = redact_pending_payload(&pending.source, &pending.payload);
+    PendingChange { payload, ..pending }
+}
+
 /// Per-resource staleness guard for the pending-change queue (TAG-P0-3
 /// follow-up, 2026-08-12): captures the current DB state of the resource a
 /// `plc_connections.update`/`.delete` or `collection_groups.update`/`.delete`
@@ -2941,7 +3000,7 @@ async fn queue_pending_registry_change(
         StatusCode::ACCEPTED,
         Json(QueuedPendingChangeResponse {
             queued: true,
-            pending,
+            pending: redact_pending_change_for_response(pending),
             status: status.into(),
             message: "収集中のため変更を未適用キューに保存しました。".to_string(),
         }),
@@ -4906,14 +4965,24 @@ async fn pending_changes_list(
     Query(query): Query<PendingChangesQuery>,
 ) -> Result<Json<Vec<PendingChange>>, ApiError> {
     let limit = query.limit.unwrap_or(100).clamp(1, 1000);
-    Ok(Json(state.pending_changes.list(limit).await?))
+    Ok(Json(
+        state
+            .pending_changes
+            .list(limit)
+            .await?
+            .into_iter()
+            .map(redact_pending_change_for_response)
+            .collect(),
+    ))
 }
 
 async fn pending_changes_get(
     State(state): State<PendingChangesAdminState>,
     Path(id): Path<i64>,
 ) -> Result<Json<PendingChange>, ApiError> {
-    Ok(Json(state.pending_changes.get(id).await?))
+    Ok(Json(redact_pending_change_for_response(
+        state.pending_changes.get(id).await?,
+    )))
 }
 
 async fn pending_changes_cancel(
@@ -4933,7 +5002,7 @@ async fn pending_changes_cancel(
         None,
     )
     .await;
-    Ok(Json(pending))
+    Ok(Json(redact_pending_change_for_response(pending)))
 }
 
 async fn pending_changes_requeue(
@@ -4953,7 +5022,7 @@ async fn pending_changes_requeue(
         None,
     )
     .await;
-    Ok(Json(pending))
+    Ok(Json(redact_pending_change_for_response(pending)))
 }
 
 async fn pending_changes_apply(
@@ -4970,7 +5039,7 @@ async fn pending_changes_apply(
     if let Err(err) = execute_pending_apply(&state, &applying).await {
         let failure_reason = err.reason();
         let failed = match state.pending_changes.mark_failed(id, &failure_reason).await {
-            Ok(failed) => Some(failed),
+            Ok(failed) => Some(redact_pending_change_for_response(failed)),
             Err(mark_err) => {
                 eprintln!(
                     "banto-hub: pending_change={id} の failed 遷移に失敗しました: {mark_err}"
@@ -5016,7 +5085,7 @@ async fn pending_changes_apply(
         Some(json!({ "source": applying.source })),
     )
     .await;
-    Json(applied).into_response()
+    Json(redact_pending_change_for_response(applied)).into_response()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10685,6 +10754,203 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending.state, PendingChangeState::Applied);
+    }
+
+    /// S1a レビュー対応（`banto_tags::PlcConnection::password`の doc
+    /// comment「外部呼び出し元へ決してシリアライズしない」）: 収集稼働中に
+    /// パスワード付きの`plc_connections.create`をキューへ入れると、
+    /// (a) `202 Accepted`の応答、(b) `GET /api/pending-changes`、
+    /// (c) `GET /api/pending-changes/{id}` のいずれの JSON にも平文
+    /// パスワードが一切現れず（`passwordSet: true`だけが出る）、それでいて
+    /// (d) 適用（apply）後は`PlcConnectionService::get`で見える実際の
+    /// 保存済み行にはパスワードがちゃんと入っている（＝DB へ保存された
+    /// `pending_changes.payload`自体は redact していない）ことを確認する。
+    #[tokio::test]
+    async fn pending_changes_endpoints_never_leak_a_queued_plc_connection_password() {
+        const SECRET: &str = "s3cret-pw-do-not-leak";
+
+        let env = test_env().await;
+
+        // Collection needs to be running for a write to be queued instead of
+        // applied immediately - seed an unrelated (non-postgres) connection +
+        // group for that, same as the other pending-changes tests above.
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line-pw-redact-seed", "host": "127.0.0.1", "port": 15040 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+        let (status, group) = admin_post(
+            &env.router,
+            "/api/collection-groups",
+            &env.admin_token,
+            json!({ "name": "fast", "plcConnectionId": conn["id"], "periodMs": 100 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{group:?}");
+
+        let start = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/start")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        // Queue a postgres connection create WITH a password while running.
+        let (status, queued_body) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({
+                "name": "pgdb-pw-redact",
+                "protocol": "postgres",
+                "host": "10.0.0.9",
+                "port": 5432,
+                "database": "appdb",
+                "username": "appuser",
+                "password": SECRET
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{queued_body:?}");
+        assert!(
+            !queued_body.to_string().contains(SECRET),
+            "202 body must never contain the plaintext password: {queued_body:?}"
+        );
+        assert_eq!(
+            queued_body["pending"]["payload"]["input"]["passwordSet"], true,
+            "{queued_body:?}"
+        );
+        assert!(
+            queued_body["pending"]["payload"]["input"]
+                .get("password")
+                .is_none(),
+            "{queued_body:?}"
+        );
+        let pending_id = queued_body["pending"]["id"]
+            .as_i64()
+            .expect("pending id should exist");
+
+        // GET /api/pending-changes (list): the secret must not appear
+        // anywhere in the serialized body.
+        let list_response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::get("/api/pending-changes")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_bytes = axum::body::to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list_text = String::from_utf8(list_bytes.to_vec()).unwrap();
+        assert!(
+            !list_text.contains(SECRET),
+            "GET /api/pending-changes must never contain the plaintext password: {list_text}"
+        );
+        let list_body: serde_json::Value = serde_json::from_str(&list_text).unwrap();
+        let listed = list_body
+            .as_array()
+            .expect("array body")
+            .iter()
+            .find(|row| row["id"] == pending_id)
+            .expect("queued pending change should be listed");
+        assert_eq!(listed["payload"]["input"]["passwordSet"], true);
+        assert!(listed["payload"]["input"].get("password").is_none());
+
+        // GET /api/pending-changes/{id}: same guarantee.
+        let get_response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::get(format!("/api/pending-changes/{pending_id}"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let get_bytes = axum::body::to_bytes(get_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let get_text = String::from_utf8(get_bytes.to_vec()).unwrap();
+        assert!(
+            !get_text.contains(SECRET),
+            "GET /api/pending-changes/{{id}} must never contain the plaintext password: {get_text}"
+        );
+        let get_body: serde_json::Value = serde_json::from_str(&get_text).unwrap();
+        assert_eq!(get_body["payload"]["input"]["passwordSet"], true);
+        assert!(get_body["payload"]["input"].get("password").is_none());
+
+        // Stop and apply: the queued create must actually go through with
+        // the real password - only the OUTBOUND representation is redacted,
+        // never the stored `pending_changes.payload` the apply path reads.
+        let stop = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/stop")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop.status(), StatusCode::OK);
+
+        let apply_response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{pending_id}/apply"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(apply_response.status(), StatusCode::OK);
+        let apply_bytes = axum::body::to_bytes(apply_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let apply_text = String::from_utf8(apply_bytes.to_vec()).unwrap();
+        assert!(
+            !apply_text.contains(SECRET),
+            "apply response must never contain the plaintext password: {apply_text}"
+        );
+        let apply_body: serde_json::Value = serde_json::from_str(&apply_text).unwrap();
+        assert_eq!(apply_body["state"], "applied");
+
+        // But the actually-stored row DOES have the password - proving the
+        // stored payload itself was never touched by the redaction above.
+        let created = PlcConnectionService::new(env.pool.clone())
+            .list(ListParams::default())
+            .await
+            .unwrap()
+            .rows
+            .into_iter()
+            .find(|c| c.name == "pgdb-pw-redact")
+            .expect("the queued postgres connection should have been created");
+        assert_eq!(created.password.as_deref(), Some(SECRET));
     }
 
     #[tokio::test]

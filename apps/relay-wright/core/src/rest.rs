@@ -115,14 +115,14 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use banto_core::{BantoError, ErrorBody, ListParams, ListResult};
+use banto_core::{BantoError, ErrorBody, FieldError, ListParams, ListResult};
 use banto_server::{
     auth_routes, require_auth, require_banto_client_header, sse_route, ApiError, AuthState,
     Identity, ServerEvent,
 };
 use banto_tags::{
     CollectionGroup, CollectionGroupInput, CollectionGroupService, PlcConnection,
-    PlcConnectionInput, PlcConnectionService, Tag, TagInput, TagService,
+    PlcConnectionInput, PlcConnectionService, Tag, TagInput, TagService, POSTGRES_PROTOCOL,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1723,6 +1723,79 @@ impl From<PlcConnectionPayload> for PlcConnectionInput {
     }
 }
 
+/// S1a レビュー対応: relay-wright は PLC 専用プロダクトで、`"postgres"`
+/// （DB Source/Sink、`banto_tags::POSTGRES_PROTOCOL`）接続には一切対応しない。
+/// `engine::monitor`の`require_slmp`（タグモニタは SLMP 限定）と同じ製品
+/// 境界を、この登録 API の書き込み側にも明示する。[`PlcConnectionPayload`]
+/// には元々`database`/`username`/`password`が無く（`From`impl 参照）、
+/// postgres 用の必須項目が常に空になるため、今のところ postgres 行の作成は
+/// `banto_tags::validate_plc_connection_input`の「database/username 必須」
+/// 検証に副次的に落ちて失敗する。ただしそれは「たまたま失敗する」であって
+/// 「relay-wright は postgres を拒否する」という意図を表明していない。この
+/// 関数はその意図を`protocol`フィールドの`FieldError`として明示し、将来
+/// `PlcConnectionPayload`が拡張されても境界が黙って崩れないようにする。
+///
+/// REST の create/update ハンドラ（下記）と、双方向対称の Tauri コマンド
+/// （`apps/relay-wright/src-tauri/src/lib.rs`の`plc_connections_create_body`/
+/// `plc_connections_update_body`）の両方から呼ばれる - 一方だけに書くと
+/// もう一方の経路から postgres 行を作れてしまう。
+pub fn reject_postgres_connection_protocol(protocol: &str) -> Result<(), BantoError> {
+    if protocol == POSTGRES_PROTOCOL {
+        return Err(BantoError::Validation {
+            field_errors: vec![FieldError {
+                field: "protocol".to_string(),
+                message: "relay-wright は DB 接続(postgres)に対応していません".to_string(),
+            }],
+        });
+    }
+    Ok(())
+}
+
+/// S1a レビュー対応: `plc_connections`の GET/list/create/update が返す
+/// 読み取り DTO。`banto_tags::PlcConnection`をそのまま`Serialize`すると
+/// `password`列（`banto_hub`の同名 DTO と共有する平文カラム、
+/// `banto_tags::PlcConnection::password`の doc comment「外部呼び出し元へ
+/// 決してシリアライズしない」）がそのまま応答に出てしまう。relay-wright は
+/// この接続を作成できない（[`reject_postgres_connection_protocol`]）ので、
+/// 通常運用でこの列が非空になることは無いはずだが、防御的に - 何らかの
+/// 経路（データベースファイルの直接操作等）で非空の`password`を持つ行が
+/// 紛れ込んでいても外へ出さない。`banto_hub`の同名 DTO と異なり
+/// `passwordSet`は持たない - relay-wright はこの情報を必要とする UI/機能を
+/// 一切持たないため。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlcConnectionResponse {
+    pub id: i64,
+    pub name: String,
+    pub protocol: String,
+    pub host: String,
+    pub port: i64,
+    pub unit_id: i64,
+    pub enabled: bool,
+    pub simulation: bool,
+    pub word_order: String,
+    pub database: Option<String>,
+    pub username: Option<String>,
+}
+
+impl From<PlcConnection> for PlcConnectionResponse {
+    fn from(conn: PlcConnection) -> Self {
+        Self {
+            id: conn.id,
+            name: conn.name,
+            protocol: conn.protocol,
+            host: conn.host,
+            port: conn.port,
+            unit_id: conn.unit_id,
+            enabled: conn.enabled,
+            simulation: conn.simulation,
+            word_order: conn.word_order,
+            database: conn.database,
+            username: conn.username,
+        }
+    }
+}
+
 /// Wire-shaped (camelCase) create/update payload for `collection_groups` -
 /// see [`PlcConnectionPayload`]'s doc comment for why these DTOs exist.
 #[derive(Debug, Clone, Deserialize)]
@@ -1882,28 +1955,33 @@ struct TagRegistryState {
 
 async fn plc_connections_list(
     State(state): State<TagRegistryState>,
-) -> Result<Json<Vec<PlcConnection>>, ApiError> {
+) -> Result<Json<Vec<PlcConnectionResponse>>, ApiError> {
     Ok(Json(
         state
             .plc_connections
             .list(ListParams::default())
             .await?
-            .rows,
+            .rows
+            .into_iter()
+            .map(PlcConnectionResponse::from)
+            .collect(),
     ))
 }
 
 async fn plc_connections_get(
     State(state): State<TagRegistryState>,
     Path(id): Path<i64>,
-) -> Result<Json<PlcConnection>, ApiError> {
-    Ok(Json(state.plc_connections.get(id).await?))
+) -> Result<Json<PlcConnectionResponse>, ApiError> {
+    Ok(Json(PlcConnectionResponse::from(
+        state.plc_connections.get(id).await?,
+    )))
 }
 
 async fn plc_connections_create(
     State(state): State<TagRegistryState>,
     headers: HeaderMap,
     Json(input): Json<PlcConnectionPayload>,
-) -> Result<Json<PlcConnection>, ApiError> {
+) -> Result<Json<PlcConnectionResponse>, ApiError> {
     require_editor(
         &state.auth,
         &state.audit,
@@ -1913,6 +1991,7 @@ async fn plc_connections_create(
         "/api/plc-connections",
     )
     .await?;
+    reject_postgres_connection_protocol(&input.protocol)?;
     let created = state.plc_connections.create(input.into()).await?;
     record_write(
         &state.audit,
@@ -1924,7 +2003,7 @@ async fn plc_connections_create(
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
-    Ok(Json(created))
+    Ok(Json(PlcConnectionResponse::from(created)))
 }
 
 async fn plc_connections_update(
@@ -1932,7 +2011,7 @@ async fn plc_connections_update(
     headers: HeaderMap,
     Path(id): Path<i64>,
     Json(input): Json<PlcConnectionPayload>,
-) -> Result<Json<PlcConnection>, ApiError> {
+) -> Result<Json<PlcConnectionResponse>, ApiError> {
     require_editor(
         &state.auth,
         &state.audit,
@@ -1942,6 +2021,7 @@ async fn plc_connections_update(
         "/api/plc-connections/{id}",
     )
     .await?;
+    reject_postgres_connection_protocol(&input.protocol)?;
     let updated = state.plc_connections.update(id, input.into()).await?;
     record_write(
         &state.audit,
@@ -1953,7 +2033,7 @@ async fn plc_connections_update(
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
-    Ok(Json(updated))
+    Ok(Json(PlcConnectionResponse::from(updated)))
 }
 
 async fn plc_connections_delete(
@@ -5113,6 +5193,68 @@ mod tests {
                 "GET {path} row count"
             );
         }
+    }
+
+    /// S1a レビュー対応: relay-wright は PLC 専用プロダクトで`"postgres"`
+    /// （DB Source/Sink）接続に対応しない - `protocol: "postgres"`を渡した
+    /// `POST /api/plc-connections`は`reject_postgres_connection_protocol`に
+    /// より`protocol`フィールドの Validation エラー（422）で拒否される。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rest_create_plc_connection_rejects_postgres_protocol() {
+        let (router, _audit, _group_id, editor, _viewer) = tag_registry_router_test().await;
+        let response = router
+            .oneshot(post_json_auth(
+                "/api/plc-connections",
+                &editor,
+                json!({
+                    "name": "DB1",
+                    "protocol": "postgres",
+                    "host": "10.0.0.5",
+                    "port": 5432
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let json = body_json(response).await;
+        assert_eq!(json["field_errors"][0]["field"], "protocol");
+    }
+
+    /// S1a レビュー対応: `plc_connections`の list/get 応答は
+    /// `PlcConnectionResponse`（`password`列を持たない DTO）を経由するので、
+    /// 通常の（postgres ではない）接続でも応答 JSON に`password`キーは
+    /// 一切現れない - `banto_tags::PlcConnection::password`の doc comment
+    /// 「外部呼び出し元へ決してシリアライズしない」の relay-wright 側の
+    /// 検証。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rest_plc_connection_list_and_get_responses_never_carry_a_password_key() {
+        let (router, _audit, _group_id, editor, _viewer) = tag_registry_router_test().await;
+
+        let response = router
+            .clone()
+            .oneshot(get_auth("/api/plc-connections", &editor))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let rows = body_json(response).await;
+        let rows = rows.as_array().expect("array body");
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].get("password").is_none(),
+            "list response must never contain a password key: {rows:?}"
+        );
+
+        let response = router
+            .clone()
+            .oneshot(get_auth("/api/plc-connections/1", &editor))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let row = body_json(response).await;
+        assert!(
+            row.get("password").is_none(),
+            "get response must never contain a password key: {row:?}"
+        );
     }
 
     /// feature/easy-delete: an `editor` can cascade-preview then

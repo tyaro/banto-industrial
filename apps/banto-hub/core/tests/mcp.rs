@@ -1997,6 +1997,60 @@ async fn create_connection_postgres_returns_password_set_without_password_field(
     assert_eq!(payload["created"]["database"], "erp");
 }
 
+/// S1a レビュー対応（`banto_tags::PlcConnection::password`の doc comment
+/// 「外部呼び出し元へ決してシリアライズしない」）: `create_connection`を
+/// パスワード付きで呼んでも、audit_log のどの列にも平文パスワードが残らない
+/// ことを確認する回帰テスト - `crate::mcp::audit_config_action`が組み立てる
+/// `detail`は`name`/`enabled`のような限られたフィールドだけを含み、呼び出し
+/// 元の生の`arguments`(`password`を含む)をまるごと書き込まないことを、
+/// `detail`だけでなく全列を対象に検証する。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_connection_postgres_audit_log_never_stores_the_password() {
+    const SECRET: &str = "audit-must-not-see-me";
+    let app = test_app("s1-mcp-create-pg-audit").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_connection",
+            json!({
+                "name": "erp-db-audit",
+                "protocol": "postgres",
+                "host": "10.0.0.51",
+                "port": 5432,
+                "database": "erp",
+                "username": "reader",
+                "password": SECRET,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+
+    // Every column of every audit_log row, concatenated into one string per
+    // row - not just `detail`, in case a future change starts logging raw
+    // arguments into some other column.
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT COALESCE(actor_username,'') || '|' || COALESCE(actor_role,'') || '|' || action \
+         || '|' || resource || '|' || COALESCE(entity_id,'') || '|' || COALESCE(detail,'') || \
+         '|' || origin || '|' || result \
+         FROM audit_log",
+    )
+    .fetch_all(&app.pool)
+    .await
+    .unwrap();
+    assert!(!rows.is_empty(), "expected at least one audit_log row");
+    for row in rows {
+        assert!(
+            !row.contains(SECRET),
+            "audit_log row must never contain the plaintext password: {row}"
+        );
+    }
+}
+
 /// `update_connection`で`password: null`を送ると既存のパスワードが保持され、
 /// `""`を送ると消去される(`banto_tags::PlcConnectionInput::password`の
 /// tri-state PATCH 意味論の MCP 経由の確認)。
