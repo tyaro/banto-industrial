@@ -29,7 +29,20 @@
 	 * 「現在時刻より未来」のサーバー側検証に落ちてしまう）。未入力なら
 	 * `null`（無期限、既定・動作不変）。一覧の警告バッジは
 	 * `apiKeysAdmin.ts` の `apiKeyWarnings`（純関数）で判定する。
+	 *
+	 * **S6（docs/banto-hub-external-db-design.md §5.2・§7 row S6、
+	 * 実装指示3）追記**: DB Sink サイドカー用キーの発行導線として、
+	 * `admin` スコープのチェックボックス（従来 UI に無かった - `admin` は
+	 * `create_sink_group`等の T21 系構成操作専用スコープで、通常の運用者は
+	 * ほぼ使わない）と、クエリパラメータ経由のプリセット
+	 * （`?presetName=...&presetScopes=admin,read`）を追加した。
+	 * `sink/+page.svelte`の「サイドカー用 API キー」セクションがこの画面へ
+	 * プリセット付きで遷移し、名前・スコープを開いた時点で埋めておく
+	 * （実際の発行操作自体はこの画面で行う - キー全体はこの画面の応答
+	 * でしか手に入らないため、遷移元に平文キーを持ち帰らせない設計は
+	 * 変えていない）。
 	 */
+	import { page } from '$app/state';
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '$lib/toast.svelte';
 	import {
@@ -82,6 +95,15 @@
 	// --- create ---
 	let name = $state('');
 	let readScope = $state(true);
+	/**
+	 * S6（実装指示3）: `admin`スコープ（T21系構成操作専用、DB Sink
+	 * サイドカーが`GET /api/sink/config`・`PUT /api/sink/status`を叩くのに
+	 * 必要 - `docs/banto-hub-external-db-design.md`§5.2「サイドカー用 API
+	 * キーには`admin`に加えて`read`スコープも必要」）。既定 `false` -
+	 * 通常の運用者が誤って強い権限を付与しないよう、明示的なチェックを
+	 * 要求する。
+	 */
+	let adminScope = $state(false);
 	/** H10 ③（Option B）: `read:{connection}.{group}.{tag}` /
 	 *  `read:{connection}.{group}.*` の per-tag read スコープ（任意、`read`
 	 *  チェックボックスとは独立に併用できる）。 */
@@ -91,6 +113,33 @@
 	let expiresAtInput = $state('');
 	let createErrors: Record<string, string> = $state({});
 	let creating = $state(false);
+
+	/**
+	 * S6（実装指示3）: `sink/+page.svelte`からの遷移
+	 * （`?presetName=...&presetScopes=admin,read`）を1回だけ読み取り、
+	 * 発行フォームへ反映する。`presetScopes`はカンマ区切りで
+	 * `admin`/`read`のみ認識する（他のスコープ種別はプリセット対象外 -
+	 * per-tag read/write はテキスト欄が必要で URL プリセットに向かない）。
+	 * ページ内で再度呼ばれても副作用が無いよう、フォームの初期値設定のみ
+	 * 行う（読み込み後にユーザーが編集した内容を上書きしない）。
+	 */
+	function applyPresetFromQuery(): void {
+		const params = page.url.searchParams;
+		const presetName = params.get('presetName');
+		if (presetName) name = presetName;
+		const presetScopes = params.get('presetScopes');
+		if (presetScopes) {
+			const scopes = new Set(
+				presetScopes
+					.split(',')
+					.map((s) => s.trim())
+					.filter((s) => s !== '')
+			);
+			readScope = scopes.has('read');
+			adminScope = scopes.has('admin');
+		}
+	}
+	applyPresetFromQuery();
 
 	/** `expiresAtInput` を「その日のローカル終わり」の epoch ミリ秒へ変換
 	 *  する（このファイル冒頭の docblock「H10 ①」参照）。空/不正な日付なら
@@ -109,6 +158,7 @@
 	function parseScopes(): string[] {
 		const scopes: string[] = [];
 		if (readScope) scopes.push('read');
+		if (adminScope) scopes.push('admin');
 		// H10 ③（Option B）: read:{connection}.{group}.{tag} / read:{connection}.
 		// {group}.* - 完全一致・グループ・ワイルドカードどちらも許可（サーバー
 		// 側の文法検証は api_keys.rs::validate_scope、この入力欄はワイルドカード
@@ -140,6 +190,7 @@
 			toastStore.push('success', '発行しました');
 			name = '';
 			readScope = true;
+			adminScope = false;
 			readScopesText = '';
 			writeScopesText = '';
 			expiresAtInput = '';
@@ -245,6 +296,10 @@
 			<label class="field checkbox">
 				<input type="checkbox" bind:checked={readScope} />
 				read（全タグの現在値・状態の読み取り）
+			</label>
+			<label class="field checkbox">
+				<input type="checkbox" bind:checked={adminScope} />
+				admin（構成操作。DB Sink サイドカー用キーはこれと read の両方が必要）
 			</label>
 			<label class="field wide">
 				read

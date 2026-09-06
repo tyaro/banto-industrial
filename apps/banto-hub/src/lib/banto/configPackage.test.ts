@@ -12,6 +12,7 @@ import {
 import type { CollectionGroup, PlcConnection, Tag } from './tagRegistryAdmin';
 import type { GrpcSettings } from './grpcSettingsAdmin';
 import type { MqttSettings } from './mqttSettingsAdmin';
+import type { SinkGroup } from './sinkGroupsAdmin';
 
 const BASE_CONNECTION: PlcConnection = {
 	id: 1,
@@ -141,6 +142,21 @@ const DB_TAG: Tag = {
 	dataType: 'f32',
 	writable: false,
 	expression: null
+};
+
+// S6（docs/banto-hub-external-db-design.md §5.2・§6 item 6）: sink group の
+// フィクスチャ - `dbConnectionId`は`DB_CONNECTION`（postgres）、`tagIds`は
+// `BASE_TAG`/`DB_TAG`の2件を参照する。
+const SINK_GROUP: SinkGroup = {
+	id: 200,
+	name: 'line1-log',
+	dbConnectionId: DB_CONNECTION.id,
+	mode: 'interval',
+	intervalMs: 1000,
+	tableName: 'public.tag_history',
+	storeBad: false,
+	enabled: true,
+	tagIds: [BASE_TAG.id, DB_TAG.id]
 };
 
 const MQTT: MqttSettings = {
@@ -532,6 +548,110 @@ describe('configPackage', () => {
 		const pkg = makePackage();
 		expect(() => parseConfigPackage(JSON.stringify(pkg))).not.toThrow();
 		expect(pkg.collectionGroups[0].querySql).toBeUndefined();
+	});
+
+	it('S6: buildConfigPackage は sink group を接続名・タグ名で参照する形に変換する', () => {
+		const pkg = buildConfigPackage({
+			plcConnections: [BASE_CONNECTION, DB_CONNECTION],
+			collectionGroups: [BASE_GROUP, DB_GROUP],
+			tags: [BASE_TAG, DB_TAG],
+			sinkGroups: [SINK_GROUP],
+			mqtt: MQTT,
+			grpc: GRPC,
+			exportedAt: '2026-09-07T00:00:00.000Z'
+		});
+		expect(pkg.sinkGroups).toEqual([
+			{
+				name: 'line1-log',
+				dbConnectionName: 'pg-a',
+				mode: 'interval',
+				intervalMs: 1000,
+				tableName: 'public.tag_history',
+				storeBad: false,
+				enabled: true,
+				tagNames: ['tag-a', 'tag-db']
+			}
+		]);
+	});
+
+	it('S6: sinkGroups を省略した buildConfigPackage 呼び出しは空配列になる（後方互換）', () => {
+		const pkg = makePackage();
+		expect(pkg.sinkGroups).toEqual([]);
+	});
+
+	it('S6: sink group を含むパッケージは serializeConfigPackage/parseConfigPackage で往復できる', () => {
+		const original = buildConfigPackage({
+			plcConnections: [BASE_CONNECTION, DB_CONNECTION],
+			collectionGroups: [BASE_GROUP, DB_GROUP],
+			tags: [BASE_TAG, DB_TAG],
+			sinkGroups: [SINK_GROUP],
+			mqtt: MQTT,
+			grpc: GRPC,
+			exportedAt: '2026-09-07T00:00:00.000Z'
+		});
+		const parsed = parseConfigPackage(serializeConfigPackage(original));
+		expect(parsed).toEqual(original);
+		expect(parsed.sinkGroups[0].tagNames).toEqual(['tag-a', 'tag-db']);
+	});
+
+	it('S6: parseConfigPackage は sinkGroups キーを持たない旧パッケージを空配列として受け入れる（後方互換）', () => {
+		const pkg = makePackage();
+		const raw = JSON.parse(serializeConfigPackage(pkg)) as Record<string, unknown>;
+		delete raw.sinkGroups;
+		expect(raw.sinkGroups).toBeUndefined();
+		const parsed = parseConfigPackage(JSON.stringify(raw));
+		expect(parsed.sinkGroups).toEqual([]);
+	});
+
+	it('S6: parseConfigPackage は不正な sinkGroups.mode を拒否する', () => {
+		const original = buildConfigPackage({
+			plcConnections: [BASE_CONNECTION, DB_CONNECTION],
+			collectionGroups: [BASE_GROUP, DB_GROUP],
+			tags: [BASE_TAG, DB_TAG],
+			sinkGroups: [SINK_GROUP],
+			mqtt: MQTT,
+			grpc: GRPC,
+			exportedAt: '2026-09-07T00:00:00.000Z'
+		});
+		const raw = JSON.parse(serializeConfigPackage(original)) as {
+			sinkGroups: Array<Record<string, unknown>>;
+		};
+		raw.sinkGroups[0].mode = 'hourly';
+		expect(() => parseConfigPackage(JSON.stringify(raw))).toThrow(/interval \/ on_change/);
+	});
+
+	it('S6: parseConfigPackage は存在しない接続を参照する sinkGroups を拒否する', () => {
+		const original = buildConfigPackage({
+			plcConnections: [BASE_CONNECTION, DB_CONNECTION],
+			collectionGroups: [BASE_GROUP, DB_GROUP],
+			tags: [BASE_TAG, DB_TAG],
+			sinkGroups: [SINK_GROUP],
+			mqtt: MQTT,
+			grpc: GRPC,
+			exportedAt: '2026-09-07T00:00:00.000Z'
+		});
+		const raw = JSON.parse(serializeConfigPackage(original)) as {
+			sinkGroups: Array<Record<string, unknown>>;
+		};
+		raw.sinkGroups[0].dbConnectionName = 'unknown-connection';
+		expect(() => parseConfigPackage(JSON.stringify(raw))).toThrow(/connection/);
+	});
+
+	it('S6: parseConfigPackage は存在しないタグを参照する sinkGroups を拒否する', () => {
+		const original = buildConfigPackage({
+			plcConnections: [BASE_CONNECTION, DB_CONNECTION],
+			collectionGroups: [BASE_GROUP, DB_GROUP],
+			tags: [BASE_TAG, DB_TAG],
+			sinkGroups: [SINK_GROUP],
+			mqtt: MQTT,
+			grpc: GRPC,
+			exportedAt: '2026-09-07T00:00:00.000Z'
+		});
+		const raw = JSON.parse(serializeConfigPackage(original)) as {
+			sinkGroups: Array<Record<string, unknown>>;
+		};
+		raw.sinkGroups[0].tagNames = ['no-such-tag'];
+		expect(() => parseConfigPackage(JSON.stringify(raw))).toThrow(/tag/);
 	});
 
 	it('planByName は name ベースで create/update を分ける', () => {

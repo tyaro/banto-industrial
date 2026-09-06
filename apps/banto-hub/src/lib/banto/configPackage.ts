@@ -11,6 +11,7 @@ import {
 } from './tagRegistryAdmin';
 import { type GrpcSettings } from './grpcSettingsAdmin';
 import { type MqttSettings } from './mqttSettingsAdmin';
+import type { SinkGroup, SinkGroupMode } from './sinkGroupsAdmin';
 
 export const CONFIG_PACKAGE_SCHEMA_VERSION = 1 as const;
 export const CONFIG_PACKAGE_PRODUCT = 'banto-hub' as const;
@@ -55,6 +56,29 @@ export interface ConfigPackageTag extends Omit<TagInput, 'collectionGroupId' | '
 export type ConfigPackageMqttSettings = Omit<MqttSettings, 'username'>;
 export type ConfigPackageGrpcSettings = GrpcSettings;
 
+/**
+ * S6（docs/banto-hub-external-db-design.md §5.2・§6 item 6、実装指示6）: DB
+ * Sink group 1件分 - `SinkGroup`から`id`/`dbConnectionId`/`tagIds`
+ * （数値 id、環境をまたぐと再現できない）を除き、代わりに**名前で**参照する
+ * （`ConfigPackageCollectionGroup::plcConnectionName`と同じ考え方 - タグの
+ * 参照は他のエンティティ（`ConfigPackageTag`）と同じく`name`をキーにする
+ * ことで、タグ id が環境間で異なっても import 側で解決できる）。
+ * `storeBad`/`enabled`/`mode`/`intervalMs`/`tableName`は秘密情報を含まない
+ * ためそのまま export する（`CONFIG_PACKAGE_EXCLUDED_SECRETS`に追加項目は
+ * 無い - sink group 自体に資格情報は無く、参照する DB 接続のパスワードは
+ * 既に`plc_connections.password`として除外済み）。
+ */
+export interface ConfigPackageSinkGroup {
+	name: string;
+	dbConnectionName: string;
+	mode: SinkGroupMode;
+	intervalMs: number;
+	tableName: string;
+	storeBad: boolean;
+	enabled: boolean;
+	tagNames: string[];
+}
+
 export interface ConfigPackage {
 	schemaVersion: typeof CONFIG_PACKAGE_SCHEMA_VERSION;
 	product: typeof CONFIG_PACKAGE_PRODUCT;
@@ -65,12 +89,22 @@ export interface ConfigPackage {
 	tags: ConfigPackageTag[];
 	mqtt: ConfigPackageMqttSettings;
 	grpc: ConfigPackageGrpcSettings;
+	/**
+	 * S6: 旧スキーマ（この項目を持たないパッケージ）との後方互換のため、
+	 * パース後は常に配列（空配列を含む）で埋める - `parseConfigPackage`の
+	 * `parseSinkGroups`が省略時に`[]`へフォールバックする
+	 * （`expectWordOrder`等と同じ「後方互換な追加フィールドはバージョンを
+	 * 上げない」方針、実装指示6「old packages without the key still
+	 * import」）。
+	 */
+	sinkGroups: ConfigPackageSinkGroup[];
 }
 
 export interface ConfigPackageInspectionCounts {
 	plcConnections: { create: number; update: number };
 	collectionGroups: { create: number; update: number };
 	tags: { create: number; update: number };
+	sinkGroups: { create: number; update: number };
 }
 
 export interface ConfigPackageInspection {
@@ -333,18 +367,54 @@ function sanitizeTag(input: Tag, groupName: string): ConfigPackageTag {
 	};
 }
 
+/**
+ * S6: `SinkGroup`（GET応答、`dbConnectionId`/`tagIds`は数値 id）から export
+ * 用の形へ詰め替える。`dbConnectionName`は呼び出し元（`buildConfigPackage`）
+ * が解決済みの接続名を渡す - `sanitizeGroup`が`connectionName`を引数で
+ * 受け取るのと同じ形。`tagIds`は`tagNameById`で名前へ変換し、解決できない
+ * id（`hub_sink_group_tags`の孤児許容 - `crate::sink`のモジュール doc「FK を
+ * 張らない理由」参照。タグ削除時は能動的にクリーンアップされるため、
+ * export 時点でこの分岐へ入ることは通常無い）は黙って読み飛ばす -
+ * `build_sink_config_response`（Hub側）と同じ「読み飛ばす」方針。
+ */
+function sanitizeSinkGroup(
+	input: SinkGroup,
+	dbConnectionName: string,
+	tagNameById: ReadonlyMap<number, string>
+): ConfigPackageSinkGroup {
+	return {
+		name: input.name,
+		dbConnectionName,
+		mode: input.mode,
+		intervalMs: input.intervalMs,
+		tableName: input.tableName,
+		storeBad: input.storeBad,
+		enabled: input.enabled,
+		tagNames: input.tagIds
+			.map((tagId) => tagNameById.get(tagId))
+			.filter((name): name is string => name !== undefined)
+	};
+}
+
 export function buildConfigPackage(input: {
 	plcConnections: readonly PlcConnection[];
 	collectionGroups: readonly CollectionGroup[];
 	tags: readonly Tag[];
 	mqtt: MqttSettings;
 	grpc: GrpcSettings;
+	/**
+	 * S6（実装指示6）: 省略時は`[]`（sink group を持たない環境からの
+	 * export と同じ形になる - `parseConfigPackage`側の後方互換フォール
+	 * バックと対称）。
+	 */
+	sinkGroups?: readonly SinkGroup[];
 	exportedAt?: string;
 }): ConfigPackage {
 	const connectionById = new Map(
 		input.plcConnections.map((connection) => [connection.id, connection])
 	);
 	const groupById = new Map(input.collectionGroups.map((group) => [group.id, group]));
+	const tagNameById = new Map(input.tags.map((tag) => [tag.id, tag.name]));
 
 	const collectionGroups = input.collectionGroups.map((group) => {
 		const connection = connectionById.get(group.plcConnectionId);
@@ -366,6 +436,16 @@ export function buildConfigPackage(input: {
 		return sanitizeTag(tag, group.name);
 	});
 
+	const sinkGroups = (input.sinkGroups ?? []).map((group) => {
+		const connection = connectionById.get(group.dbConnectionId);
+		if (!connection) {
+			throw new ConfigPackageParseError(
+				`sink group '${group.name}' の接続 id=${group.dbConnectionId} に対応する connection が見つかりません`
+			);
+		}
+		return sanitizeSinkGroup(group, connection.name, tagNameById);
+	});
+
 	return {
 		schemaVersion: CONFIG_PACKAGE_SCHEMA_VERSION,
 		product: CONFIG_PACKAGE_PRODUCT,
@@ -374,6 +454,7 @@ export function buildConfigPackage(input: {
 		plcConnections: filterVirtualConnections(input.plcConnections).map(sanitizeConnection),
 		collectionGroups,
 		tags,
+		sinkGroups,
 		mqtt: {
 			enabled: input.mqtt.enabled,
 			host: input.mqtt.host,
@@ -517,6 +598,49 @@ function parseTags(raw: unknown): ConfigPackageTag[] {
 	});
 }
 
+/**
+ * S6（実装指示6「old packages without the key still import」）:
+ * `sinkGroups`は既存のエクスポート済み構成パッケージ（この項目を持たない
+ * 旧スキーマ）にはまだ存在しない可能性があるので、`querySql`/`database`と
+ * 同じ理由で省略を許容する - 省略時は`[]`にフォールバックする
+ * （`CONFIG_PACKAGE_SCHEMA_VERSION`は据え置き - 後方互換な追加フィールド
+ * なのでバージョンを上げる理由がない）。
+ */
+function parseSinkGroups(raw: unknown): ConfigPackageSinkGroup[] {
+	if (raw === undefined) return [];
+	if (!Array.isArray(raw)) {
+		throw new ConfigPackageParseError('sinkGroups は配列である必要があります');
+	}
+	return raw.map((entry, index) => {
+		const item = expectRecord(entry, `sinkGroups[${index}]`);
+		const mode = expectString(item.mode, `sinkGroups[${index}].mode`);
+		if (mode !== 'interval' && mode !== 'on_change') {
+			throw new ConfigPackageParseError(
+				`sinkGroups[${index}].mode は interval / on_change のいずれかである必要があります`
+			);
+		}
+		const tagNamesRaw = item.tagNames;
+		if (!Array.isArray(tagNamesRaw)) {
+			throw new ConfigPackageParseError(`sinkGroups[${index}].tagNames は配列である必要があります`);
+		}
+		return {
+			name: expectString(item.name, `sinkGroups[${index}].name`),
+			dbConnectionName: expectString(
+				item.dbConnectionName,
+				`sinkGroups[${index}].dbConnectionName`
+			),
+			mode: mode as SinkGroupMode,
+			intervalMs: expectInteger(item.intervalMs, `sinkGroups[${index}].intervalMs`),
+			tableName: expectString(item.tableName, `sinkGroups[${index}].tableName`),
+			storeBad: expectBoolean(item.storeBad, `sinkGroups[${index}].storeBad`),
+			enabled: expectBoolean(item.enabled, `sinkGroups[${index}].enabled`),
+			tagNames: tagNamesRaw.map((value, tagIndex) =>
+				expectString(value, `sinkGroups[${index}].tagNames[${tagIndex}]`)
+			)
+		};
+	});
+}
+
 function parseMqtt(raw: unknown): ConfigPackageMqttSettings {
 	const item = expectRecord(raw, 'mqtt');
 	const enabled = expectBoolean(item.enabled, 'mqtt.enabled');
@@ -545,6 +669,7 @@ function validateReferences(pkg: ConfigPackage): void {
 	ensureUniqueNames(pkg.plcConnections, 'plcConnections');
 	ensureUniqueNames(pkg.collectionGroups, 'collectionGroups');
 	ensureUniqueNames(pkg.tags, 'tags');
+	ensureUniqueNames(pkg.sinkGroups, 'sinkGroups');
 
 	const connectionNames = new Set(pkg.plcConnections.map((connection) => connection.name));
 	connectionNames.add('calc');
@@ -562,6 +687,23 @@ function validateReferences(pkg: ConfigPackage): void {
 			throw new ConfigPackageParseError(
 				`tags '${tag.name}' が参照する group '${tag.collectionGroupName}' が見つかりません`
 			);
+		}
+	}
+
+	// S6: sink group が参照する接続・タグ名がパッケージ内で解決できること。
+	const tagNames = new Set(pkg.tags.map((tag) => tag.name));
+	for (const sinkGroup of pkg.sinkGroups) {
+		if (!connectionNames.has(sinkGroup.dbConnectionName)) {
+			throw new ConfigPackageParseError(
+				`sinkGroups '${sinkGroup.name}' が参照する connection '${sinkGroup.dbConnectionName}' が見つかりません`
+			);
+		}
+		for (const tagName of sinkGroup.tagNames) {
+			if (!tagNames.has(tagName)) {
+				throw new ConfigPackageParseError(
+					`sinkGroups '${sinkGroup.name}' が参照する tag '${tagName}' が見つかりません`
+				);
+			}
 		}
 	}
 }
@@ -590,6 +732,7 @@ export function parseConfigPackage(text: string): ConfigPackage {
 		plcConnections: parsePlcConnections(root.plcConnections),
 		collectionGroups: parseCollectionGroups(root.collectionGroups),
 		tags: parseTags(root.tags),
+		sinkGroups: parseSinkGroups(root.sinkGroups),
 		mqtt: parseMqtt(root.mqtt),
 		grpc: parseGrpc(root.grpc)
 	};
