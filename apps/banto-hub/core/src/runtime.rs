@@ -90,7 +90,7 @@
 //! [`RunningHub::shutdown`]の中身: （T14-1 で追加した常駐ループ2本の
 //! `abort`（このモジュール doc の「T14-1 での唯一の挙動変化」節参照）→
 //! **`db_source.shutdown()`（外部 DB 連携 S2、DB Source の接続タスクを
-//! abort して join）**→）`mqtt.shutdown()`（MQTT publish タスク停止）→
+//! abort して join）** → `mqtt.shutdown()`（MQTT publish タスク停止）→
 //! `grpc_server.shutdown()`（gRPC サーバータスク停止）→
 //! `manager.shutdown()`（`Collector` 停止・tstore flush）→
 //! `sessions.shutdown()`（broker タスク停止）→

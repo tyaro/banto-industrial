@@ -36,6 +36,14 @@ pub enum DbConnectionState {
     /// `sqlx::Error::Database`）。再試行はするが、構成を直さない限り直らない
     /// ので [`DbConnectionState::Backoff`] と区別して見せる。
     Error,
+    /// S2b（設計 §4.8・§6-16、2026-09-06 オーナー決定）: 構成としては有効
+    /// だが、**収集が Running でない**のでタスクを起動していない。DB へは
+    /// 一切接続しておらず、配下の全タグは Bad
+    /// （[`crate::db_source::DbSourceEngine::stop`] が明示的に書く - 停止は
+    /// `crate::hub::effective_sample` の `!enabled` 規則では表せないため）。
+    /// [`DbConnectionState::Disabled`] と分けてあるのは、運用者が「設定で
+    /// 無効にした」と「収集を止めているだけ」を状態画面で取り違えないため。
+    Stopped,
 }
 
 impl DbConnectionState {
@@ -45,6 +53,7 @@ impl DbConnectionState {
             DbConnectionState::Backoff => "backoff",
             DbConnectionState::Disabled => "disabled",
             DbConnectionState::Error => "error",
+            DbConnectionState::Stopped => "stopped",
         }
     }
 }
@@ -61,6 +70,18 @@ pub struct DbConnectionStatus {
     pub last_error: Option<String>,
     /// 連続した接続失敗回数（バックオフ段数 - 成功で 0 に戻る）。
     pub consecutive_failures: u32,
+    /// S2b（設計 §4.8・§6-17）: この接続のタスクが**異常終了して
+    /// supervisor に作り直された**回数（`crate::db_source::supervisor`）。
+    /// [`Self::consecutive_failures`]（DB へ繋がらない = 正常な障害）とは
+    /// 別物で、0 以外はプロセス内のバグ（panic）か、`run_connection` が
+    /// 戻ってはいけないのに戻ったことを意味する。タスク世代を跨がない
+    /// （設定変更で接続のタスクを作り直すと 0 に戻る）。
+    pub restarts: u32,
+    /// 直近の再起動理由（`crate::db_source::supervisor::InnerExit` の
+    /// メッセージ）。秘密は含まない - panic のペイロードはこのクレートの
+    /// リテラル文字列（`expect` のメッセージ等）だけで、資格情報を
+    /// 含まない（`crate::db_source` の doc comment「資格情報の扱い」）。
+    pub last_restart_reason: Option<String>,
     pub groups: Vec<DbGroupStatus>,
 }
 
@@ -109,17 +130,29 @@ impl DbSourceStatusStore {
             .expect("DbSourceStatusStore lock poisoned (a writer panicked)")
     }
 
-    /// commit のたびに作り直す: 計画に無い接続の行は消え、新しく起動する
-    /// 接続は [`DbConnectionState::Backoff`]（まだ繋いでいない = 値は Bad）、
-    /// 無効な接続は [`DbConnectionState::Disabled`] から始まる。タスク側が
-    /// 直後に接続を試み、成功すれば `connected` へ進む。
+    /// commit / 収集の開始・停止のたびに作り直す: 計画に無い接続の行は消え、
+    /// 新しく起動する接続は [`DbConnectionState::Backoff`]（まだ繋いで
+    /// いない = 値は Bad）、無効な接続は [`DbConnectionState::Disabled`]
+    /// から始まる。タスク側が直後に接続を試み、成功すれば `connected` へ
+    /// 進む。
+    ///
+    /// **S2b（§4.8・§6-16）**: `running` が `false`（収集が Running でない）
+    /// なら、有効な接続も [`DbConnectionState::Stopped`] から始める -
+    /// タスクを1本も起動しないので `backoff`（= これから繋ぎに行く）は
+    /// 嘘になるため。`disabled` の扱いは `running` に依らない（構成上の
+    /// 事実であって運転状態ではない）。
     ///
     /// `preserve` に入っている接続 id は**そのまま残す** -
     /// [`crate::db_source::DbSourceEngine::commit`] が「設定の変わっていない
     /// 接続のタスクは再起動しない」と判断した接続のこと。走り続けている
     /// タスクの `connected` を commit のたびに `backoff` へ巻き戻すと、
     /// 状態画面が実態と食い違う（そして次のポーリングまで直らない）。
-    pub fn apply_plan(&self, plan: &DbSourcePlan, preserve: &HashSet<i64>) {
+    pub fn apply_plan(&self, plan: &DbSourcePlan, preserve: &HashSet<i64>, running: bool) {
+        let initial = if running {
+            DbConnectionState::Backoff
+        } else {
+            DbConnectionState::Stopped
+        };
         let mut map = self.write();
         map.retain(|id, _| preserve.contains(id));
         for conn in &plan.connections {
@@ -131,10 +164,14 @@ impl DbSourceStatusStore {
                 DbConnectionStatus {
                     connection_id: conn.connection_id,
                     connection_name: conn.connection_name.clone(),
-                    state: DbConnectionState::Backoff,
+                    state: initial,
                     last_poll_at: None,
                     last_error: None,
                     consecutive_failures: 0,
+                    // タスク世代が変わるので再起動回数も 0 から
+                    // （`DbConnectionStatus::restarts` の doc comment）。
+                    restarts: 0,
+                    last_restart_reason: None,
                     groups: conn
                         .groups
                         .iter()
@@ -162,6 +199,8 @@ impl DbSourceStatusStore {
                     last_poll_at: None,
                     last_error: None,
                     consecutive_failures: 0,
+                    restarts: 0,
+                    last_restart_reason: None,
                     groups: Vec::new(),
                 },
             );
@@ -228,21 +267,36 @@ mod tests {
     #[test]
     fn apply_plan_seeds_backoff_and_disabled_entries() {
         let store = DbSourceStatusStore::new();
-        store.apply_plan(&plan(), &HashSet::new());
+        store.apply_plan(&plan(), &HashSet::new(), true);
         let snapshot = store.snapshot();
         assert_eq!(snapshot.len(), 2);
         assert_eq!(snapshot[0].connection_id, 1);
         assert_eq!(snapshot[0].state, DbConnectionState::Backoff);
         assert_eq!(snapshot[0].groups.len(), 1);
+        assert_eq!(snapshot[0].restarts, 0);
+        assert_eq!(snapshot[0].last_restart_reason, None);
         assert_eq!(snapshot[1].state, DbConnectionState::Disabled);
         assert!(snapshot[1].groups.is_empty());
+    }
+
+    /// S2b（§4.8・§6-16）: 収集が Running でないときの seed は
+    /// [`DbConnectionState::Stopped`]。無効な接続は `running` に依らず
+    /// `disabled` のまま。
+    #[test]
+    fn apply_plan_seeds_stopped_entries_while_collection_is_not_running() {
+        let store = DbSourceStatusStore::new();
+        store.apply_plan(&plan(), &HashSet::new(), false);
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot[0].state, DbConnectionState::Stopped);
+        assert!(snapshot[0].last_error.is_none());
+        assert_eq!(snapshot[1].state, DbConnectionState::Disabled);
     }
 
     #[test]
     fn apply_plan_replaces_the_previous_generation() {
         let store = DbSourceStatusStore::new();
-        store.apply_plan(&plan(), &HashSet::new());
-        store.apply_plan(&DbSourcePlan::default(), &HashSet::new());
+        store.apply_plan(&plan(), &HashSet::new(), true);
+        store.apply_plan(&DbSourcePlan::default(), &HashSet::new(), true);
         assert!(store.snapshot().is_empty());
     }
 
@@ -251,17 +305,24 @@ mod tests {
     #[test]
     fn apply_plan_keeps_preserved_connections_untouched() {
         let store = DbSourceStatusStore::new();
-        store.apply_plan(&plan(), &HashSet::new());
-        store.update_connection(1, |status| status.state = DbConnectionState::Connected);
-        store.apply_plan(&plan(), &HashSet::from([1]));
+        store.apply_plan(&plan(), &HashSet::new(), true);
+        store.update_connection(1, |status| {
+            status.state = DbConnectionState::Connected;
+            status.restarts = 3;
+        });
+        store.apply_plan(&plan(), &HashSet::from([1]), true);
         let snapshot = store.snapshot();
         assert_eq!(snapshot[0].state, DbConnectionState::Connected);
+        assert_eq!(
+            snapshot[0].restarts, 3,
+            "preserved rows keep their counters"
+        );
     }
 
     #[test]
     fn updates_reach_the_named_connection_and_group_only() {
         let store = DbSourceStatusStore::new();
-        store.apply_plan(&plan(), &HashSet::new());
+        store.apply_plan(&plan(), &HashSet::new(), true);
         store.update_connection(1, |status| {
             status.state = DbConnectionState::Connected;
             status.last_poll_at = Some(1_000);

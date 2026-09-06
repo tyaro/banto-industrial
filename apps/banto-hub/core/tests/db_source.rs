@@ -1,6 +1,12 @@
-//! 外部 DB 連携 S2 の統合テスト（docs/banto-hub-external-db-design.md §7 の
-//! スライス表「S2 の完了条件: ローカル PostgreSQL に対する統合テスト -
-//! 正常・NULL・0 行・クエリエラー・接続断からの復帰」）。
+//! 外部 DB 連携 S2 / S2b の統合テスト（docs/banto-hub-external-db-design.md
+//! §7 のスライス表「S2 の完了条件: ローカル PostgreSQL に対する統合テスト -
+//! 正常・NULL・0 行・クエリエラー・接続断からの復帰」と「S2b の完了条件:
+//! 停止中は接続しない・開始で復帰」）。
+//!
+//! **S2b（§4.8・§6-16、2026-09-06 オーナー決定）以降、DB Source は収集が
+//! Running のときだけ動く。** そのため値を待つシナリオは `seed` のあとに
+//! [`start_collection`] を呼ぶ（S2 の時点では rebuild だけで値が流れ始めて
+//! いた）。
 //!
 //! **実 PostgreSQL が要る。** `BANTO_TEST_PG_URL` が設定されていなければ
 //! 各テストは `eprintln!("skipped: BANTO_TEST_PG_URL unset")` を出して即
@@ -434,8 +440,44 @@ async fn value_of(app: &TestApp, external: &str) -> (Option<f64>, String) {
     )
 }
 
+/// S2b（設計 §4.8・§6-16、2026-09-06 オーナー決定「DB Source は収集が
+/// Running のときだけ動く」）: 値を期待するシナリオは、まずここで収集を
+/// 開始する。`api_router` が内部に持つ `CollectionController`（`rest.rs` の
+/// `api_router`）が Running へ遷移し、その `start_locked` が
+/// `DbSourceEngine::start` を呼ぶ。
+async fn start_collection(app: &TestApp) {
+    let (status, body) = write_json(
+        &app.router,
+        "POST",
+        "/api/collection/start",
+        &app.token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["state"], json!("running"), "{body:?}");
+}
+
+/// S2b: 収集停止（`DbSourceEngine::stop` - タスクを止めて `db` タグへ
+/// Bad を書く）。
+async fn stop_collection(app: &TestApp) {
+    let (status, body) = write_json(
+        &app.router,
+        "POST",
+        "/api/collection/stop",
+        &app.token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["state"], json!("stopped"), "{body:?}");
+}
+
 /// レジストリを直接叩いて「接続1つ + グループ1つ + タグ N 本」を作り、
 /// rebuild する（REST 経由の登録は S3 の UI が来るまで使わない）。
+///
+/// **rebuild するだけで収集は開始しない** - S2b 以降、値を待つテストは
+/// この後に [`start_collection`] を呼ぶ必要がある（停止中は DB へ繋がない）。
 async fn seed(app: &TestApp, conn: PlcConnectionInput, sql: &str, columns: &[&str]) -> i64 {
     let conn = PlcConnectionService::new(app.pool.clone())
         .create(conn)
@@ -470,6 +512,7 @@ async fn values_qualities_and_unsupported_columns_from_a_real_postgresql() {
         &["a", "b", "c", "ts", "s"],
     )
     .await;
+    start_collection(&app).await;
 
     let ready = wait_until(WAIT, || async {
         value_of(&app, "erp.q1.a").await.1 == "good"
@@ -524,6 +567,7 @@ async fn zero_rows_marks_the_whole_group_bad() {
         &["a"],
     )
     .await;
+    start_collection(&app).await;
 
     let reported = wait_until(WAIT, || async {
         let (_, body) = get_json(&app.router, "/api/status", &app.token).await;
@@ -563,6 +607,7 @@ async fn a_statement_that_cannot_be_prepared_marks_its_group_bad_without_killing
         &["a"],
     )
     .await;
+    start_collection(&app).await;
 
     let reported = wait_until(WAIT, || async {
         let (_, body) = get_json(&app.router, "/api/status", &app.token).await;
@@ -609,6 +654,7 @@ async fn a_query_that_starts_failing_goes_stale_then_bad() {
         &["a"],
     )
     .await;
+    start_collection(&app).await;
 
     let good = wait_until(WAIT, || async {
         value_of(&app, "erp.q1.a").await == (Some(7.25), "good".into())
@@ -672,6 +718,7 @@ async fn a_group_whose_table_appears_later_recovers_without_reconnecting() {
         &["a"],
     )
     .await;
+    start_collection(&app).await;
 
     // 表がまだ無いので起動時の describe が Statement 失敗で落ち、グループの
     // lastError が埋まる（`describe_group` の失敗経路 -
@@ -741,6 +788,7 @@ async fn an_unreachable_endpoint_marks_every_tag_bad_and_reports_backoff() {
     // 止めない」の受け入れ条件そのもの - Hub は動き続ける）。
     conn.port = 1;
     seed(&app, conn, "SELECT 1.5 AS a, 2.5 AS b", &["a", "b"]).await;
+    start_collection(&app).await;
 
     let backing_off = wait_until(WAIT, || async {
         let (_, body) = get_json(&app.router, "/api/status", &app.token).await;
@@ -788,6 +836,7 @@ async fn a_tag_added_through_the_pending_queue_starts_getting_values() {
         &["a"],
     )
     .await;
+    start_collection(&app).await;
 
     let good = wait_until(WAIT, || async {
         value_of(&app, "erp.q1.a").await == (Some(1.5), "good".into())
@@ -795,18 +844,8 @@ async fn a_tag_added_through_the_pending_queue_starts_getting_values() {
     .await;
     assert!(good, "the seeded tag should read Good first");
 
-    // 収集稼働中は構成変更が pending queue へ積まれる（設計 §4.5 -
-    // DB Source も PLC 側と同じこの1本の経路に乗る）。
-    let (status, _) = write_json(
-        &app.router,
-        "POST",
-        "/api/collection/start",
-        &app.token,
-        json!({}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
+    // 収集稼働中（`start_collection` 済み）は構成変更が pending queue へ
+    // 積まれる（設計 §4.5 - DB Source も PLC 側と同じこの1本の経路に乗る）。
     let (status, body) = write_json(
         &app.router,
         "POST",
@@ -827,15 +866,11 @@ async fn a_tag_added_through_the_pending_queue_starts_getting_values() {
         .as_i64()
         .unwrap_or_else(|| panic!("pending id should exist: {body:?}"));
 
-    let (status, _) = write_json(
-        &app.router,
-        "POST",
-        "/api/collection/stop",
-        &app.token,
-        json!({}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
+    // pending queue の適用は収集停止中に行う（運用どおり）。S2b（§4.8・
+    // §6-16）以降、この停止で DB Source のタスクも止まり `db` タグは Bad に
+    // なる - 適用後は改めて収集を開始する必要がある。
+    stop_collection(&app).await;
+    assert_eq!(value_of(&app, "erp.q1.a").await, (None, "bad".into()));
 
     let (status, body) = write_json(
         &app.router,
@@ -847,8 +882,11 @@ async fn a_tag_added_through_the_pending_queue_starts_getting_values() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
 
+    start_collection(&app).await;
+
     // 適用後、新しいタグが値を取り始める（`commit_catalog` が
-    // `DbSourceEngine::commit` を呼ぶ - §4.5）。
+    // `DbSourceEngine::commit` を呼び、`start` がその計画から起こす -
+    // §4.5・§4.8）。
     let good = wait_until(WAIT, || async {
         value_of(&app, "erp.q1.b").await == (Some(2.5), "good".into())
     })
@@ -875,6 +913,7 @@ async fn status_exposes_the_db_source_section_and_writes_are_rejected() {
         &["a"],
     )
     .await;
+    start_collection(&app).await;
 
     // `connected` はプールが張れた時点で立つので、最初の1周期が終わった
     // ことまで確かめる（`lastOkAt` はポーリング成功でしか埋まらない）。
@@ -929,4 +968,97 @@ async fn status_exposes_the_db_source_section_and_writes_are_rejected() {
     assert_eq!(body["error"], json!("not_writable"));
 
     app.stop_db_source().await;
+}
+
+// ---------------------------------------------------------------------------
+// 8. S2b: 収集 Running との連動（設計 §4.8・§6-16、2026-09-06 オーナー決定）
+// ---------------------------------------------------------------------------
+
+/// このテスト専用の接続名。`pg_stat_activity.application_name` は
+/// `banto_hub_core::db_source::application_name`（= `banto-hub-db-source
+/// {接続名}`）なので、接続名を固有にしておけば**同じファイルの他テストが
+/// 並行して張っているセッションと混ざらない**（`cargo test` は同一
+/// バイナリ内のテストを並行実行する）。
+const S2B_CONNECTION_NAME: &str = "s2b-running-linkage";
+
+/// この接続が DB へ張っているセッション数。0 なら「本当に1本も繋いで
+/// いない」。
+async fn open_source_sessions(admin: &sqlx::postgres::PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity \
+         WHERE application_name = 'banto-hub-db-source s2b-running-linkage'",
+    )
+    .fetch_one(admin)
+    .await
+    .expect("pg_stat_activity should be readable")
+}
+
+/// 設計 §4.8・§6-16「DB Source は収集が Running のときだけ動く。収集開始で
+/// 起動・停止で停止。停止中は DB へ接続せず `db` タグは Bad」の受け入れ
+/// 条件そのもの: (a) 停止中は接続しない → (b) 開始で Good → (c) 停止で
+/// Bad・セッションが消える → (d) 再開でまた Good。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_db_source_runs_only_while_collection_is_running() {
+    let target = require_pg!();
+    let admin = sqlx::postgres::PgPool::connect(&target.url)
+        .await
+        .expect("connect to BANTO_TEST_PG_URL");
+
+    let app = test_app("running-linkage").await;
+    seed(
+        &app,
+        pg_conn_input(S2B_CONNECTION_NAME, &target),
+        "SELECT 1.5 AS a",
+        &["a"],
+    )
+    .await;
+    let external = format!("{S2B_CONNECTION_NAME}.q1.a");
+
+    // --- (a) 停止中: 1本も繋がない・状態は stopped・タグは Bad -------------
+    // 数周期ぶん待っても接続が増えないことを確かめる（`seed` は rebuild
+    // まで済ませているので、S2 の挙動ならここで既に繋ぎに行っている）。
+    tokio::time::sleep(Duration::from_millis(PERIOD_MS as u64 * 4)).await;
+    assert_eq!(
+        open_source_sessions(&admin).await,
+        0,
+        "a stopped hub must not open any DB session"
+    );
+    let (_, body) = get_json(&app.router, "/api/status", &app.token).await;
+    assert_eq!(body["dbSource"][0]["state"], json!("stopped"), "{body:?}");
+    assert!(body["dbSource"][0]["lastError"].is_null(), "{body:?}");
+    assert_eq!(body["dbSource"][0]["restarts"], json!(0), "{body:?}");
+    assert_eq!(value_of(&app, &external).await, (None, "bad".into()));
+
+    // --- (b) 開始: Good になり、DB 側にもセッションが見える ----------------
+    start_collection(&app).await;
+    let good = wait_until(WAIT, || async {
+        value_of(&app, &external).await == (Some(1.5), "good".into())
+    })
+    .await;
+    assert!(good, "starting collection must bring the db tag to Good");
+    let connected = wait_until(WAIT, || async { open_source_sessions(&admin).await >= 1 }).await;
+    assert!(connected, "a running hub must hold a DB session");
+    let (_, body) = get_json(&app.router, "/api/status", &app.token).await;
+    assert_eq!(body["dbSource"][0]["state"], json!("connected"), "{body:?}");
+
+    // --- (c) 停止: タグは Bad・状態は stopped・セッションが消える ----------
+    stop_collection(&app).await;
+    // `DbSourceEngine::stop` はタスクを join してから Bad を書くので、
+    // `POST /api/collection/stop` が返った時点で既に反映されている。
+    assert_eq!(value_of(&app, &external).await, (None, "bad".into()));
+    let (_, body) = get_json(&app.router, "/api/status", &app.token).await;
+    assert_eq!(body["dbSource"][0]["state"], json!("stopped"), "{body:?}");
+    let gone = wait_until(WAIT, || async { open_source_sessions(&admin).await == 0 }).await;
+    assert!(gone, "stopping collection must close every DB session");
+
+    // --- (d) 再開: また Good ----------------------------------------------
+    start_collection(&app).await;
+    let good_again = wait_until(WAIT, || async {
+        value_of(&app, &external).await == (Some(1.5), "good".into())
+    })
+    .await;
+    assert!(good_again, "restarting collection must recover the db tag");
+
+    app.stop_db_source().await;
+    admin.close().await;
 }

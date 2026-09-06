@@ -620,12 +620,19 @@ pub struct CollectorManager {
     /// （§4.5「Source の task は `commit_catalog` の完了を受けて配下の
     /// グループ集合を再読込する」）。
     ///
+    /// **S2b（§4.8・§6-16、2026-09-06 オーナー決定）**: この manager は
+    /// 引き続き**計画の commit だけ**を担い、タスクの起動・停止は
+    /// `crate::controller::CollectionController` が収集の Running 遷移に
+    /// 合わせて行う（[`Self::db_source_engine`] 経由。理由はあちらの
+    /// `db_source` フィールド doc comment）。停止中の commit は「計画を
+    /// 覚えるだけ」になるので、ここのコードは S2 から一切変わらない。
+    ///
     /// `computed` と違い**この manager の内部で構築する**（`Self::new` の
     /// 引数に足していない）: 演算エンジンは `crate::runtime` が
     /// `ServerTagStore` の retain 復元と250ms 評価ループのために外から
     /// 所有する必要があるが、DB Source はタスクを自前で持つので、外の
-    /// 所有者が要るのは「シャットダウン時に止める」ためだけであり、それは
-    /// [`Self::db_source_engine`] で足りる。既存の26箇所の
+    /// 所有者が要るのは「収集の開始/停止とシャットダウンで起こす・止める」
+    /// ためだけであり、それは [`Self::db_source_engine`] で足りる。既存の26箇所の
     /// `CollectorManager::new` 呼び出し（テスト含む）に引数を足さずに済む
     /// という実利もある。ストアは `computed.server_store()` を共有する -
     /// `db` タグの値は `computed`/`internal` と同じ `ServerTagStore` へ書く
@@ -854,8 +861,11 @@ impl CollectorManager {
     }
 
     /// 外部 DB 連携 S2: DB Source エンジン - `crate::runtime::RunningHub`
-    /// がシャットダウン時に `DbSourceEngine::shutdown` を呼ぶために取る
-    /// （`db_source` フィールドの doc comment 参照）。
+    /// がシャットダウン時に `DbSourceEngine::shutdown` を呼ぶために、
+    /// また S2b（§4.8・§6-16）以降は
+    /// `crate::controller::CollectionController` が収集の Running 遷移で
+    /// `start`/`stop` を呼ぶために取る（`db_source` フィールドの doc
+    /// comment 参照）。
     pub fn db_source_engine(&self) -> Arc<DbSourceEngine> {
         self.db_source.clone()
     }
@@ -1662,9 +1672,16 @@ impl CollectorManager {
         computed::build_plan(&new_map)
             .map_err(|err| format!("演算タグの検証に失敗しました: {err}"))?;
         // 外部 DB 連携 S2: ここは `computed` と同じく**検証だけ**行い commit
-        // はしない - 収集の開始/停止は DB Source のポーリングとは独立で
-        // （設計 §4.2 の task は収集 run に紐付かない）、構成の反映は
+        // はしない - 構成の反映（= 計画の入れ替え）は
         // `Self::rebuild`/`Self::commit_catalog` の担当だから。
+        //
+        // S2b（§4.8・§6-16）: 収集開始で DB Source の task を起こすのは
+        // `crate::controller::CollectionController::start_locked` であって
+        // ここではない - この `apply_run` は「収集の遷移」以外に
+        // `crate::rest::commit_catalog_and_notify` の legacy live
+        // reconfigure からも呼ばれるので、ここを起動点にすると停止中でも
+        // DB へ繋いでしまう（controller の `db_source` フィールド doc
+        // comment 参照）。
         db_source::build_plan(&snapshot)
             .map_err(|err| format!("DB Source の検証に失敗しました: {err}"))?;
         let runtime_snapshot = runtime_snapshot_for_mode(&snapshot, mode);

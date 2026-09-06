@@ -121,7 +121,12 @@ embed-resource = "3.0"
 # （空きポートへ bind → drop → その番号で rumqttd を起動）と起動確認用の
 # TCP プローブ接続のため - `axum`側の推移的依存で実質的にはこれまでも
 # unify されていたが、明示しておく。
-tokio = { workspace = true, features = ["rt", "macros", "time", "net"] }
+# 外部 DB 連携 S2b（docs/banto-hub-external-db-design.md §4.8・§6-17）:
+# `test-util` は `#[tokio::test(start_paused = true)]` の仮想時計のため -
+# `crate::db_source::supervisor` のバックオフ（1s → 30s）と「60 秒以上
+# 動いたら連続回数を戻す」を実時間ゼロで検証する。**dev 限定**なので
+# 配布バイナリの依存には入らない。
+tokio = { workspace = true, features = ["rt", "macros", "time", "net", "test-util"] }
 tower = { workspace = true, features = ["util"] }
 tempfile = { workspace = true }
 # T1: `/api/v1/stream` の統合テスト用 WebSocket クライアント
