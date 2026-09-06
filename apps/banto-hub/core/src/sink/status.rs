@@ -78,13 +78,12 @@ impl SinkStatusStore {
 
     /// `PUT /api/sink/status`の1呼び出し分を記録する。呼び出し元
     /// （`crate::rest`）が既知の sink group id 集合との突き合わせ
-    /// （未知の id を422で拒否）を済ませてから呼ぶ - ここでは常に渡された
-    /// 全件をそのまま上書きする。
+    /// （未知の id を422で拒否）を済ませてから呼ぶ - 渡された全グループの
+    /// セットを全量スナップショットとして受け取り、`inner.groups`を置換する
+    /// （push に含まれない既存グループは削除される）。
     pub fn record(&self, groups: Vec<SinkGroupStatusPush>, received_at_ms: i64) {
         let mut inner = self.inner.lock().expect("SinkStatusStore mutex poisoned");
-        for push in groups {
-            inner.groups.insert(push.id, push);
-        }
+        inner.groups = groups.into_iter().map(|g| (g.id, g)).collect();
         inner.last_received_at_ms = Some(received_at_ms);
     }
 
@@ -162,6 +161,19 @@ mod tests {
         let snapshot = store.snapshot(2_000);
         assert_eq!(snapshot.groups.len(), 1);
         assert_eq!(snapshot.groups[0].queued, 42);
+    }
+
+    #[test]
+    fn record_replaces_all_groups_not_in_the_new_push() {
+        let store = SinkStatusStore::new();
+        store.record(vec![push(1), push(2)], 1_000);
+        assert_eq!(store.snapshot(1_000).groups.len(), 2);
+
+        // push に group 1 だけが含まれる場合、group 2 は削除される
+        store.record(vec![push(1)], 2_000);
+        let snapshot = store.snapshot(2_000);
+        assert_eq!(snapshot.groups.len(), 1);
+        assert_eq!(snapshot.groups[0].id, 1);
     }
 
     #[test]

@@ -184,9 +184,7 @@ async fn validate_sink_group_input(
     if !is_valid_table_name(&input.table_name) {
         errors.push(FieldError {
             field: "tableName".to_string(),
-            message: "tableName は英字/アンダースコアで始まる識別子（省略可能な1回のスキーマ修飾 \
-                 `schema.table` を含む）を指定してください。引用符は使用できません"
-                .to_string(),
+            message: "tableName は英字/アンダースコアで始まる識別子（省略可能な1回のスキーマ修飾 `schema.table` を含む）を指定してください。引用符は使用できません".to_string(),
         });
     }
 
@@ -746,7 +744,13 @@ mod tests {
             .expect_err("quoted table_name must be rejected");
         match err {
             BantoError::Validation { field_errors } => {
-                assert!(field_errors.iter().any(|e| e.field == "tableName"));
+                let table_name_error = field_errors.iter().find(|e| e.field == "tableName");
+                assert!(table_name_error.is_some(), "expected tableName field error");
+                // エラーメッセージに連続する空白（ダブルスペース）がないことを確認
+                assert!(
+                    !table_name_error.unwrap().message.contains("  "),
+                    "error message should not contain double spaces"
+                );
             }
             other => panic!("expected validation error, got {other:?}"),
         }
