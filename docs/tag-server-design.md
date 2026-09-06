@@ -853,6 +853,14 @@ FA-Server との比較で最も見劣りする欠落だが、v1 から外す:
    `tag_space_router` と同様に CSRF 層の外側で merge する専用ルーターに
    する必要があった）。
 
+### 5.7 DB Sink サイドカー（外部 DB 連携、2026-09-06）
+
+タグ値を外部 PostgreSQL へ保存する出口。§2 の「ロガー作らない」決定を 2026-09-06 に部分的に覆したもので、位置づけは MQTT publish と同列の「方針を持たない出口」（Hub は履歴を持たず読み返さない）。
+
+- **設定と監視は Hub**（`hub_sink_groups`、`/api/sink/groups` CRUD、状態画面の DB Sink 節）、**エンジンは別プロセス** `apps/banto-hub-sink`（Windows サービス `BantoHubSink`）。サイドカーは `GET /api/sink/config`（`admin` + `read` スコープの API キー、平文パスワードを含むためループバック前提）で設定を取り、banto-tagclient SDK で購読し、`PUT /api/sink/status` で 5 秒ごとに状態を返す。
+- 保存形式は long 固定（`ts, tag_id, external_name, value, quality`）、DDL は発行しない、キューは上限付きで溢れは `dropped` に計上。
+- 詳細・決定事項は [banto-hub-external-db-design.md](banto-hub-external-db-design.md) §5 / §6、検証手順は [external-db-test-2026-09.md](external-db-test-2026-09.md)。
+
 ## 6. 書き込み経路の安全設計
 
 relay-wright が確立した規律を、タグサーバーの文脈に翻訳して引き継ぐ。
