@@ -150,7 +150,8 @@ impl FlusherHandle {
     /// commit 前なので abort しても二重書き込みにはならない）。
     pub async fn stop(self, timeout: Duration) {
         self.stop.notify_one();
-        match tokio::time::timeout(timeout, self.task).await {
+        let mut task = self.task;
+        match tokio::time::timeout(timeout, &mut task).await {
             Ok(_) => {}
             Err(_) => {
                 log_err_line(&format!(
@@ -158,6 +159,8 @@ impl FlusherHandle {
                     self.connection_id,
                     timeout.as_secs_f64()
                 ));
+                task.abort();
+                let _ = task.await;
             }
         }
         self.pool.close().await;
@@ -454,5 +457,33 @@ mod tests {
         assert!(!err.contains("s3cret"), "{err}");
         assert!(build_pool(&connection(0)).is_err());
         assert!(build_pool(&connection(-1)).is_err());
+    }
+
+    /// flusher が止まらない場合、タイムアウト後に abort して join する。
+    #[tokio::test]
+    async fn stop_aborts_and_joins_a_task_that_does_not_respond() {
+        // pending() は永遠に待つタスク - stop 信号を無視する。
+        let task = tokio::spawn(std::future::pending::<()>());
+        let handle = FlusherHandle {
+            connection_id: 1,
+            connection: connection(5432),
+            pool: build_pool(&connection(5432)).expect("pool"),
+            wake: Arc::new(Notify::new()),
+            stop: Arc::new(Notify::new()),
+            draining: Arc::new(AtomicBool::new(false)),
+            task,
+        };
+
+        let start = tokio::time::Instant::now();
+        handle.stop(Duration::from_millis(50)).await;
+        let elapsed = start.elapsed();
+
+        // タイムアウト時間は大幅に超えていないはず（abort + await は速い）。
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "stop は {}ms で返るべき（elapsed: {:?}）",
+            50,
+            elapsed
+        );
     }
 }
