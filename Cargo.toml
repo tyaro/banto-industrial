@@ -211,4 +211,4 @@ tokio-stream = "0.1"
 # rustc 1.95 を要求していたが、2026-09-06 にワークスペースのツールチェイン
 # を 1.98.1 へ引き上げたためこの制約は解消した。0.39 系への移行自体は
 # dependabot PR #283 で別途行う。
-sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
