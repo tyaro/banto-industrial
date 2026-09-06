@@ -646,6 +646,88 @@ async fn a_query_that_starts_failing_goes_stale_then_bad() {
     admin.close().await;
 }
 
+/// PR レビュー対応（Fix 1）: 「グループは describe 失敗後・Bad の梯子に
+/// 乗った後、二度と再 describe しない」の裏取り。表がまだ無いグループは
+/// 起動時の describe が `Statement` 失敗で落ち、`wrapper_sql: None` の
+/// まま毎ティック Bad を書くだけになる - そこへ表を作っても、
+/// `crate::db_source::task::maybe_redescribe` の再試行
+/// （`describe_retry_interval` = `max(period, 5s)` ごと）が無ければ
+/// 二度と気づけない。設定変更（再 rebuild）も接続の再接続も無しに、
+/// 次の再試行タイミングだけで Good に戻ることを確認する。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_group_whose_table_appears_later_recovers_without_reconnecting() {
+    let target = require_pg!();
+    let admin = sqlx::postgres::PgPool::connect(&target.url)
+        .await
+        .expect("connect to BANTO_TEST_PG_URL");
+    let _ = sqlx::query("DROP TABLE IF EXISTS banto_s2_late_table")
+        .execute(&admin)
+        .await;
+
+    let app = test_app("late-table").await;
+    seed(
+        &app,
+        pg_conn_input("erp", &target),
+        "SELECT a FROM banto_s2_late_table",
+        &["a"],
+    )
+    .await;
+
+    // 表がまだ無いので起動時の describe が Statement 失敗で落ち、グループの
+    // lastError が埋まる（`describe_group` の失敗経路 -
+    // `a_statement_that_cannot_be_prepared_...` と同じ形）。**タグの値では
+    // なく lastError を待つ** - タグはまだ一度も書かれていない間も
+    // `(None, "bad")` を返す（`ServerTagStore` の未設定キーの既定値）ので、
+    // 値だけを見ると describe を待たずに素通りしてしまう。
+    let described_as_bad = wait_until(WAIT, || async {
+        let (_, body) = get_json(&app.router, "/api/status", &app.token).await;
+        body["dbSource"][0]["groups"][0]["lastError"].is_string()
+    })
+    .await;
+    assert!(
+        described_as_bad,
+        "the group's lastError should be filled in"
+    );
+
+    assert_eq!(value_of(&app, "erp.q1.a").await, (None, "bad".into()));
+    let (_, body) = get_json(&app.router, "/api/status", &app.token).await;
+    // 接続そのものは生きている（文の失敗を接続断に格上げしない）。
+    assert_eq!(body["dbSource"][0]["state"], json!("connected"));
+
+    // 表を作って値を1本入れる - この後、設定変更（`/api/pending-changes`
+    // 経由の rebuild）も接続の再接続も一切行わない。
+    sqlx::query("CREATE TABLE banto_s2_late_table (a double precision)")
+        .execute(&admin)
+        .await
+        .expect("create the scenario table");
+    sqlx::query("INSERT INTO banto_s2_late_table (a) VALUES (3.5)")
+        .execute(&admin)
+        .await
+        .expect("seed one row");
+
+    // `describe_retry_interval` は `max(period, 5s)`（`PERIOD_MS` = 500ms
+    // なので 5s の下限が効く）。次の周期分の余裕を見て待つ。
+    let recovery_wait = Duration::from_secs(5) + Duration::from_millis(PERIOD_MS as u64) + WAIT;
+    let recovered = wait_until(recovery_wait, || async {
+        value_of(&app, "erp.q1.a").await == (Some(3.5), "good".into())
+    })
+    .await;
+    assert!(
+        recovered,
+        "the tag should recover once the table exists, without any config change or reconnect"
+    );
+
+    // グループの lastError も晴れている。
+    let (_, body) = get_json(&app.router, "/api/status", &app.token).await;
+    assert!(body["dbSource"][0]["groups"][0]["lastError"].is_null());
+
+    app.stop_db_source().await;
+    let _ = sqlx::query("DROP TABLE IF EXISTS banto_s2_late_table")
+        .execute(&admin)
+        .await;
+    admin.close().await;
+}
+
 // ---------------------------------------------------------------------------
 // 4. 接続断（§4.3「接続断（バックオフ中）→ 接続単位 Bad」・§4.2 バックオフ）
 // ---------------------------------------------------------------------------

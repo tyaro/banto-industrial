@@ -52,7 +52,7 @@ use crate::computed::ServerTagStore;
 use crate::diag_log::DiagLog;
 
 use super::plan::{resolve_group, DbConnectionPlan, DbGroupPlan, DbTagPlan, ResolvedGroup};
-use super::status::{DbConnectionState, DbSourceStatusStore};
+use super::status::{DbConnectionState, DbConnectionStatus, DbSourceStatusStore};
 use super::{pg_connect_options, sanitize_postgres_error};
 
 /// 接続プールの最大接続数（§4.2「最大接続数は小さく固定、例 2」）。
@@ -89,6 +89,18 @@ pub(crate) fn backoff_delay(attempt: u32) -> Duration {
         .unwrap_or(u64::MAX);
     let ms = (BACKOFF_BASE.as_millis() as u64).saturating_mul(growth);
     Duration::from_millis(ms).min(BACKOFF_CAP)
+}
+
+/// describe 再試行の最短間隔（レビュー対応: 「groups never re-describe
+/// after a describe failure or after degrading to Bad」）。周期が極端に
+/// 短いグループ（100ms 等）で describe を毎ティック投げ続けないための
+/// 下限 - `query_timeout` が `period_ms` を下げ方向に丸めるのと対称に、
+/// こちらは上げ方向に丸める。
+const DESCRIBE_RETRY_MIN: Duration = Duration::from_secs(5);
+
+/// 1グループが再 describe を試みてよい最短間隔 - `max(period, 5s)`。
+fn describe_retry_interval(period_ms: u64) -> Duration {
+    Duration::from_millis(period_ms).max(DESCRIBE_RETRY_MIN)
 }
 
 /// 1グループのクエリタイムアウト（§4.2）。
@@ -157,6 +169,17 @@ struct GroupRuntime {
     /// 「2行以上」の `warn` をこの接続世代で既に出したか（§6-8「先頭行採用
     /// ＋warn 1回」）。
     warned_multi_row: bool,
+    /// 次に `describe_group` を再試行してよい時刻（レビュー対応）。`None`
+    /// は「まだ一度もこの世代で再試行していない」-
+    /// `consecutive_failures` が初めて 2 に達したティックでは即座に
+    /// 再試行してよい、という意味で使う（`wrapper_sql: None` のグループは
+    /// [`poll_forever`] の起動時 describe が失敗した時点で `Some` を積む -
+    /// そちらは「直前の describe からまだ間隔が空いていない」の意味）。
+    next_describe_retry: Option<Instant>,
+    /// 直近の再 describe 失敗メッセージ（`Statement` のみ）。同じ理由で
+    /// 何度も `status.last_error` を書き換えない・`warn` を出さないための
+    /// 抑制（このモジュール doc comment「ログの抑制」節と同じ考え方）。
+    last_describe_error: Option<String>,
 }
 
 /// このモジュール doc comment の「構造」節そのもの。**戻らない**。
@@ -185,11 +208,19 @@ pub(crate) async fn run_connection(plan: DbConnectionPlan, deps: TaskDeps) {
                 // プールは接続断で捨てる（次のループで張り直す）。
                 pool.close().await;
                 mark_all_bad(&plan, &deps);
-                deps.status.update_connection(plan.connection_id, |status| {
-                    status.state = DbConnectionState::Backoff;
-                    status.last_error = Some(failure.clone());
-                });
                 attempt = attempt.saturating_add(1);
+                deps.status.update_connection(plan.connection_id, |status| {
+                    // レビュー対応: `Err` 分岐（下）と同じ
+                    // `record_connection_failure` を通す - 接続が張れた後の
+                    // 切断でも `consecutive_failures` を `attempt` と揃える
+                    // （以前はここだけ 0 のまま取り残されていた）。
+                    record_connection_failure(
+                        status,
+                        DbConnectionState::Backoff,
+                        attempt,
+                        failure.clone(),
+                    );
+                });
                 deps.log.err_line(&format!(
                     "banto-hub: [WARN] DB Source: 接続 {} が切断されました: {failure}",
                     plan.connection_name
@@ -205,13 +236,12 @@ pub(crate) async fn run_connection(plan: DbConnectionPlan, deps: TaskDeps) {
                     // なら `error` - 再試行はするが構成を直さない限り直らない
                     // ことを状態画面で区別できるようにする
                     // （`DbConnectionState::Error` の doc comment）。
-                    status.state = if rejected {
+                    let state = if rejected {
                         DbConnectionState::Error
                     } else {
                         DbConnectionState::Backoff
                     };
-                    status.consecutive_failures = attempt;
-                    status.last_error = Some(message.clone());
+                    record_connection_failure(status, state, attempt, message.clone());
                 });
             }
         }
@@ -255,13 +285,20 @@ async fn poll_forever(pool: &PgPool, plan: &DbConnectionPlan, deps: &TaskDeps) -
     let now = Instant::now();
     let mut groups: Vec<GroupRuntime> = Vec::with_capacity(plan.groups.len());
     for group in &plan.groups {
+        let mut next_describe_retry = None;
+        let mut last_describe_error = None;
         let resolved = match describe_group(pool, group).await {
             Ok(resolved) => resolved,
             Err(PgFailure::Connection(message)) => return message,
             Err(PgFailure::Statement(message)) => {
                 // 文が壊れている（構文エラー・存在しない表・権限）。
                 // 他のグループには波及させず、このグループだけ「SQL を
-                // 投げない」形にしてティックごとに Bad を書く。
+                // 投げない」形にしてティックごとに Bad を書く。起動時の
+                // describe をこの瞬間の1回に数え、次に試せるのは
+                // `describe_retry_interval` 後（レビュー対応 - このティック
+                // で即座に再試行しない）。
+                next_describe_retry = Some(now + describe_retry_interval(group.period_ms));
+                last_describe_error = Some(message.clone());
                 deps.status
                     .update_group(plan.connection_id, group.group_id, |status| {
                         status.last_error = Some(message.clone());
@@ -303,6 +340,8 @@ async fn poll_forever(pool: &PgPool, plan: &DbConnectionPlan, deps: &TaskDeps) -
             next_due: now,
             consecutive_failures: 0,
             warned_multi_row: false,
+            next_describe_retry,
+            last_describe_error,
         });
     }
 
@@ -342,6 +381,26 @@ async fn poll_forever(pool: &PgPool, plan: &DbConnectionPlan, deps: &TaskDeps) -
     }
 }
 
+/// `describe` 再試行のレート制限を判定する純関数（ユニットテスト用に
+/// [`maybe_redescribe`] の呼び出し可否からも分離してある - 実 DB なしで
+/// 「間隔内は再試行しない・間隔を過ぎたら再試行する」を確認できる）。
+/// `None`（まだこの世代で一度も再試行していない）は常に「試してよい」。
+fn describe_retry_due(next_describe_retry: Option<Instant>, now: Instant) -> bool {
+    match next_describe_retry {
+        None => true,
+        Some(due) => now >= due,
+    }
+}
+
+/// 再 describe が成功したとき、その結果を採用してよいかを判定する純関数
+/// （レビュー対応）。`wrapper_sql: None` から復帰する場合は無条件に採用、
+/// 既に `Some` だったグループ（2周期連続失敗のグループ）では describe の
+/// 結果が実際に変わったとき（列・型が変わった）だけ - 変わっていなければ
+/// 黙って既存の `resolved` のまま次のクエリへ進む。
+fn should_adopt_redescribed(current: &ResolvedGroup, candidate: &ResolvedGroup) -> bool {
+    current.wrapper_sql.is_none() || candidate != current
+}
+
 async fn describe_group(pool: &PgPool, group: &DbGroupPlan) -> Result<ResolvedGroup, PgFailure> {
     let sql = super::convert::describe_wrapper_sql(&group.query_sql);
     // AssertSqlSafe: 文の本体は運用者が登録した `query_sql`（`banto_tags` が
@@ -358,6 +417,129 @@ async fn describe_group(pool: &PgPool, group: &DbGroupPlan) -> Result<ResolvedGr
     ))
 }
 
+/// [`apply_redescribe_result`] が呼び出し元へ返す「何をすべきか」。
+/// DB I/O を持たない純粋なデータなので、ユニットテストが
+/// [`apply_redescribe_result`] を直接叩いて実 DB なしに検証できる。
+#[derive(Debug, PartialEq)]
+enum RedescribeEffect {
+    /// 接続レベルの失敗 - 呼び出し元は `poll_forever` を抜ける。
+    ConnectionFailure(String),
+    /// 何もしない（レート制限内で呼ばれることは無いが、Statement 失敗の
+    /// メッセージが前回と同じ・または describe の結果が変わらなかった）。
+    NoChange,
+    /// Statement 失敗で、メッセージが前回から変わった - `status.last_error`
+    /// だけ書き換える（「no repeated warn spam」なので `warn` は出さない）。
+    ErrorMessageChanged(String),
+    /// `wrapper_sql: None` から復帰、または `Some` のまま describe の結果が
+    /// 変わった（列・型が変わった）- resolved は既に差し替え済みで、ここに
+    /// 積んだログを呼び出し側が実際に出す。
+    Recovered {
+        info_log: String,
+        bad_tag_warnings: Vec<String>,
+    },
+}
+
+/// [`maybe_redescribe`] から DB I/O を除いた、状態遷移そのものを持つ純関数
+/// （レビュー対応）。`group` を書き換え、呼び出し側が行うべきログ出力・
+/// 状態ストア更新を [`RedescribeEffect`] として返す。
+fn apply_redescribe_result(
+    group: &mut GroupRuntime,
+    connection_name: &str,
+    outcome: Result<ResolvedGroup, PgFailure>,
+) -> RedescribeEffect {
+    match outcome {
+        Err(PgFailure::Connection(message)) => RedescribeEffect::ConnectionFailure(message),
+        Err(PgFailure::Statement(message)) => {
+            // 「no repeated warn spam」: `warn` はここでは一切出さない -
+            // 初回の describe 失敗（`poll_forever` の起動時）または直近の
+            // クエリ失敗（`on_group_failure`）で既に知らせている。
+            // `status.last_error` もメッセージが変わったときだけ書く。
+            if group.last_describe_error.as_deref() == Some(message.as_str()) {
+                RedescribeEffect::NoChange
+            } else {
+                group.last_describe_error = Some(message.clone());
+                RedescribeEffect::ErrorMessageChanged(message)
+            }
+        }
+        Ok(resolved) => {
+            // `wrapper_sql: None` から復帰する場合は無条件に、`Some` の
+            // ままだった場合（2周期連続失敗のグループ）は describe の
+            // 結果が実際に変わったとき（列・型が変わった）だけ差し替える
+            // - 変わっていなければ黙って既存の `resolved` のまま次の
+            // クエリへ進む（このモジュールのレビュー対応節）。
+            if !should_adopt_redescribed(&group.resolved, &resolved) {
+                return RedescribeEffect::NoChange;
+            }
+            group.resolved = resolved;
+            group.consecutive_failures = 0;
+            group.last_describe_error = None;
+            let info_log = format!(
+                "banto-hub: DB Source: {}.{} の SQL を再解析して復帰しました",
+                connection_name, group.plan.group_name
+            );
+            let bad_tag_warnings = group
+                .resolved
+                .bad_tags
+                .iter()
+                .map(|(tag, reason)| {
+                    format!(
+                        "banto-hub: [WARN] DB Source: タグ {} は値を取得できません: {}",
+                        tag.external_name,
+                        reason.message()
+                    )
+                })
+                .collect();
+            RedescribeEffect::Recovered {
+                info_log,
+                bad_tag_warnings,
+            }
+        }
+    }
+}
+
+/// レビュー対応: `describe` に失敗したまま・または2周期以上 Bad の梯子に
+/// 乗ったままのグループを、レート制限（`describe_retry_interval`）付きで
+/// 再 describe する。呼び出し前に `next_describe_retry` を次の間隔へ
+/// 進めておく - 成功・失敗いずれでも「次に試せるのは1間隔後」という
+/// レート制限を守るため。`Err` は**接続レベル**の失敗（`run_group_tick`
+/// 経由で [`poll_forever`] を抜ける）。
+async fn maybe_redescribe(
+    pool: &PgPool,
+    plan: &DbConnectionPlan,
+    group: &mut GroupRuntime,
+    deps: &TaskDeps,
+    now: Instant,
+) -> Result<(), String> {
+    group.next_describe_retry = Some(now + describe_retry_interval(group.plan.period_ms));
+    let outcome = describe_group(pool, &group.plan).await;
+
+    match apply_redescribe_result(group, &plan.connection_name, outcome) {
+        RedescribeEffect::ConnectionFailure(message) => Err(message),
+        RedescribeEffect::NoChange => Ok(()),
+        RedescribeEffect::ErrorMessageChanged(message) => {
+            deps.status
+                .update_group(plan.connection_id, group.plan.group_id, |status| {
+                    status.last_error = Some(message);
+                });
+            Ok(())
+        }
+        RedescribeEffect::Recovered {
+            info_log,
+            bad_tag_warnings,
+        } => {
+            deps.status
+                .update_group(plan.connection_id, group.plan.group_id, |status| {
+                    status.last_error = None;
+                });
+            deps.log.line(&info_log);
+            for warning in &bad_tag_warnings {
+                deps.log.err_line(warning);
+            }
+            Ok(())
+        }
+    }
+}
+
 /// 1グループ1周期分。`Err` は**接続レベル**の失敗（呼び出し元が
 /// [`poll_forever`] を抜けて再接続へ入る）。
 async fn run_group_tick(
@@ -366,6 +548,19 @@ async fn run_group_tick(
     group: &mut GroupRuntime,
     deps: &TaskDeps,
 ) -> Result<(), String> {
+    // レビュー対応: SQL を投げていない（`wrapper_sql: None`）グループ、
+    // および Bad の梯子に乗って2周期以上経つグループは、クエリの前に
+    // レート制限付きで再 describe する - `describe` 失敗のまま・古い
+    // wrapper のまま固定されないようにする（このモジュール doc comment
+    // 「構造」節・PR レビュー指摘）。
+    let needs_redescribe = group.resolved.wrapper_sql.is_none() || group.consecutive_failures >= 2;
+    if needs_redescribe {
+        let now = Instant::now();
+        if describe_retry_due(group.next_describe_retry, now) {
+            maybe_redescribe(pool, plan, group, deps, now).await?;
+        }
+    }
+
     let Some(sql) = group.resolved.wrapper_sql.clone() else {
         // 値の取れる列が1つも無いグループ - SQL は投げず、Bad だけ書く。
         let now_ms = deps.clock.now_ms();
@@ -521,6 +716,24 @@ fn write_bad_tags(
     }
 }
 
+/// レビュー対応 (Fix 2): 接続レベルの失敗を状態ストアへ書く、たった1つの
+/// 経路。「プールは張れたが `poll_forever` が接続断で抜けた」（`Ok(pool)`
+/// 分岐）と「プールがそもそも張れなかった」（`Err` 分岐）の両方が同じ
+/// 意味で `consecutive_failures` を更新するようにここへ集約した -
+/// 以前は前者だけこの代入を欠いていて、`state != Connected` なのに
+/// `consecutive_failures == 0` のまま（`attempt` は 1 以上）という
+/// 矛盾した状態を書いていた。
+fn record_connection_failure(
+    status: &mut DbConnectionStatus,
+    state: DbConnectionState,
+    attempt: u32,
+    message: String,
+) {
+    status.state = state;
+    status.consecutive_failures = attempt;
+    status.last_error = Some(message);
+}
+
 /// §4.3「接続断（バックオフ中）→ 接続単位で全タグ Bad」。
 fn mark_all_bad(plan: &DbConnectionPlan, deps: &TaskDeps) {
     let now_ms = deps.clock.now_ms();
@@ -585,6 +798,8 @@ mod tests {
             next_due: Instant::now(),
             consecutive_failures: 0,
             warned_multi_row: false,
+            next_describe_retry: None,
+            last_describe_error: None,
         }
     }
 
@@ -689,6 +904,52 @@ mod tests {
         assert_eq!(sample.quality, Quality::Bad);
     }
 
+    /// Fix 2 のレビュー対応: 「プールは張れたが `poll_forever` が接続断で
+    /// 抜けた」場合も「プールがそもそも張れなかった」場合も、
+    /// `record_connection_failure` を通せば `consecutive_failures` が
+    /// `attempt` と一致する - 以前は前者の経路（`run_connection` の
+    /// `Ok(pool)` 分岐）だけこの代入を欠き、`state == Backoff` なのに
+    /// `consecutive_failures == 0` のまま（`attempt` は 1 以上）という
+    /// 矛盾した状態を書いていた。
+    #[test]
+    fn record_connection_failure_keeps_consecutive_failures_in_step_with_state() {
+        let mut status = DbConnectionStatus {
+            connection_id: 1,
+            connection_name: "erp".to_string(),
+            state: DbConnectionState::Connected,
+            last_poll_at: Some(1_000),
+            last_error: None,
+            consecutive_failures: 0,
+            groups: Vec::new(),
+        };
+
+        // 「プールは張れたが poll_forever が接続断で抜けた」経路
+        // （`run_connection` の `Ok(pool)` 分岐）を模す。
+        record_connection_failure(
+            &mut status,
+            DbConnectionState::Backoff,
+            1,
+            "切断されました".to_string(),
+        );
+        assert_eq!(status.state, DbConnectionState::Backoff);
+        assert_eq!(
+            status.consecutive_failures, 1,
+            "attempt と揃っているはず（以前は 0 のまま取り残されていた）"
+        );
+        assert_eq!(status.last_error.as_deref(), Some("切断されました"));
+
+        // 続けて再接続そのものが失敗する経路（`Err` 分岐）でも同じ関数を
+        // 通るので、段数がそのまま積み上がる。
+        record_connection_failure(
+            &mut status,
+            DbConnectionState::Backoff,
+            2,
+            "接続できません".to_string(),
+        );
+        assert_eq!(status.consecutive_failures, 2);
+        assert_eq!(status.last_error.as_deref(), Some("接続できません"));
+    }
+
     /// 「列が無い / 型が未対応」のタグは毎ティック Bad が書かれる。
     #[test]
     fn bad_tags_are_written_bad_every_tick() {
@@ -699,5 +960,175 @@ mod tests {
         assert_eq!(sample.value, None);
         assert_eq!(sample.quality, Quality::Bad);
         assert_eq!(sample.ptime_ms, 5_000);
+    }
+
+    // --- レビュー対応: describe の再試行 -----------------------------------
+
+    /// `describe_retry_interval` は `max(period, 5s)`（このモジュール doc
+    /// comment の `DESCRIBE_RETRY_MIN`）。
+    #[test]
+    fn describe_retry_interval_is_at_least_five_seconds() {
+        assert_eq!(describe_retry_interval(1_000), Duration::from_secs(5));
+        assert_eq!(describe_retry_interval(5_000), Duration::from_secs(5));
+        assert_eq!(describe_retry_interval(10_000), Duration::from_secs(10));
+    }
+
+    /// レート制限そのもの: 間隔内は再試行しない・間隔を過ぎたら再試行する。
+    #[test]
+    fn describe_retry_due_respects_the_rate_limit() {
+        let now = Instant::now();
+        // まだ一度も再試行していない世代は常に「試してよい」。
+        assert!(describe_retry_due(None, now));
+
+        let due = now + Duration::from_secs(5);
+        assert!(!describe_retry_due(Some(due), now), "before the interval");
+        assert!(
+            describe_retry_due(Some(due), due),
+            "exactly at the deadline"
+        );
+        assert!(
+            describe_retry_due(Some(due), due + Duration::from_millis(1)),
+            "after the interval"
+        );
+    }
+
+    /// `should_adopt_redescribed`: `wrapper_sql: None` からの復帰は無条件、
+    /// `Some` のままなら結果が変わったときだけ採用する。
+    #[test]
+    fn should_adopt_redescribed_covers_recovery_and_drift_only() {
+        let broken = ResolvedGroup {
+            wrapper_sql: None,
+            value_tags: Vec::new(),
+            bad_tags: vec![(
+                tag(1),
+                TagBadReason::StatementNotPrepared("boom".to_string()),
+            )],
+        };
+        let healthy = ResolvedGroup {
+            wrapper_sql: Some("SELECT 1".to_string()),
+            value_tags: vec![tag(1)],
+            bad_tags: Vec::new(),
+        };
+        // 復帰: None → Some は無条件で採用。
+        assert!(should_adopt_redescribed(&broken, &healthy));
+        // 同一の結果なら採用しない（黙って既存のまま）。
+        assert!(!should_adopt_redescribed(&healthy, &healthy.clone()));
+        // 列が変わった（同じ SQL でも型が変わった等）なら採用する。
+        let drifted = ResolvedGroup {
+            wrapper_sql: Some("SELECT 1, 2".to_string()),
+            ..healthy.clone()
+        };
+        assert!(should_adopt_redescribed(&healthy, &drifted));
+    }
+
+    /// §4.3 拡張: `wrapper_sql: None` のグループが再 describe に成功すると
+    /// 復帰する - `resolved` が差し替わり、`last_describe_error` が消え、
+    /// `consecutive_failures` が 0 に戻り、`Recovered` を返す。
+    #[test]
+    fn apply_redescribe_result_recovers_a_group_whose_statement_was_broken() {
+        let mut group = group_runtime();
+        group.resolved = ResolvedGroup {
+            wrapper_sql: None,
+            value_tags: Vec::new(),
+            bad_tags: vec![(
+                tag(1),
+                TagBadReason::StatementNotPrepared("relation does not exist".to_string()),
+            )],
+        };
+        group.consecutive_failures = 0;
+        group.last_describe_error = Some("relation does not exist".to_string());
+
+        let recovered = ResolvedGroup {
+            wrapper_sql: Some("SELECT (\"c1\")::float8 AS c0".to_string()),
+            value_tags: vec![tag(1)],
+            bad_tags: Vec::new(),
+        };
+        let effect = apply_redescribe_result(&mut group, "erp", Ok(recovered.clone()));
+
+        assert_eq!(group.resolved, recovered);
+        assert_eq!(group.consecutive_failures, 0);
+        assert_eq!(group.last_describe_error, None);
+        match effect {
+            RedescribeEffect::Recovered {
+                info_log,
+                bad_tag_warnings,
+            } => {
+                assert!(info_log.contains("再解析して復帰"), "{info_log}");
+                assert!(bad_tag_warnings.is_empty());
+            }
+            other => panic!("expected Recovered, got {other:?}"),
+        }
+    }
+
+    /// 2周期連続で失敗したグループが再 describe しても結果が変わらなければ
+    /// 黙って既存の `resolved` のまま（`should_adopt_redescribed` の doc
+    /// comment）- 古い prepared wrapper のまま固定される、というレビュー
+    /// 指摘の裏側（変わらない限りは差し替えない）を確認する。
+    #[test]
+    fn apply_redescribe_result_keeps_the_old_wrapper_when_describe_is_unchanged() {
+        let mut group = group_runtime();
+        group.consecutive_failures = 2;
+        let before = group.resolved.clone();
+
+        let same = before.clone();
+        let effect = apply_redescribe_result(&mut group, "erp", Ok(same));
+
+        assert_eq!(
+            group.resolved, before,
+            "unchanged describe keeps the wrapper"
+        );
+        assert_eq!(
+            group.consecutive_failures, 2,
+            "no reset without an actual change"
+        );
+        assert_eq!(effect, RedescribeEffect::NoChange);
+    }
+
+    /// Statement 失敗が続くとき: 同じメッセージなら `NoChange`
+    /// （「no repeated warn spam」）、メッセージが変われば
+    /// `ErrorMessageChanged` を1回だけ返す。
+    #[test]
+    fn apply_redescribe_result_suppresses_repeated_identical_statement_errors() {
+        let mut group = group_runtime();
+        group.resolved.wrapper_sql = None;
+        group.last_describe_error = Some("boom".to_string());
+
+        let unchanged = apply_redescribe_result(
+            &mut group,
+            "erp",
+            Err(PgFailure::Statement("boom".to_string())),
+        );
+        assert_eq!(unchanged, RedescribeEffect::NoChange);
+
+        let changed = apply_redescribe_result(
+            &mut group,
+            "erp",
+            Err(PgFailure::Statement(
+                "still broken, differently".to_string(),
+            )),
+        );
+        assert_eq!(
+            changed,
+            RedescribeEffect::ErrorMessageChanged("still broken, differently".to_string())
+        );
+        assert_eq!(
+            group.last_describe_error.as_deref(),
+            Some("still broken, differently")
+        );
+    }
+
+    /// 接続レベルの失敗はそのまま伝播する（`poll_forever` を抜ける契約）。
+    #[test]
+    fn apply_redescribe_result_propagates_connection_failures() {
+        let mut group = group_runtime();
+        let effect = apply_redescribe_result(
+            &mut group,
+            "erp",
+            Err(PgFailure::Connection("connection reset".to_string())),
+        );
+        assert_eq!(
+            effect,
+            RedescribeEffect::ConnectionFailure("connection reset".to_string())
+        );
     }
 }
