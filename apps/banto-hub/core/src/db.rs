@@ -312,6 +312,76 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
     // (新規 DB では上の CREATE TABLE で既に列があるため no-op)。
     add_column_if_missing(pool, "pending_changes", "base_fingerprint", "TEXT").await?;
 
+    // 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2）: DB Sink
+    // の設定エンティティ。`logger_groups`（設計の呼称）は Hub 専用の設定で
+    // あって PLC 収集レジストリ（`banto_tags`）の一部ではないため、
+    // `plc_connections`/`collection_groups`/`tags` と同じ3階層には乗せず、
+    // 本モジュールの「この app 自身のテーブル」として持つ - 名前は他の
+    // Hub 専用テーブル（`hub_write_audit`/`hub_retained_values`）と同じ
+    // `hub_` 接頭辞に揃える（`crate::sink`のモジュール doc comment参照）。
+    //
+    // `db_connection_id` は `plc_connections(id)` を指すが、**FOREIGN KEY は
+    // 張らない** - `hub_retained_values.tag_id`のこの関数内の doc comment
+    // と同じ判断（このテーブルは`banto_tags::migrate`より先に走る
+    // `apply_app_schema`の一部なので、CREATE TABLE 時点では参照先が
+    // まだ存在しない）に加え、SQLite の FK 解決自体は DML 時点まで遅延する
+    // ため技術的には後から張っても動くが、既存の Hub 専用テーブルの慣行
+    // （レジストリ側の生存確認はサービス層で行う）に揃えて一貫させる。
+    // 存在確認・削除拒否（この接続を使う sink group がある間は
+    // `plc_connections` の削除を拒否する）は `crate::sink::service` が
+    // 担う（`crate::sink`のモジュール doc comment参照）。
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS hub_sink_groups (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL UNIQUE,
+          db_connection_id INTEGER NOT NULL,
+          mode TEXT NOT NULL CHECK (mode IN ('interval', 'on_change')),
+          interval_ms INTEGER NOT NULL,
+          table_name TEXT NOT NULL,
+          store_bad INTEGER NOT NULL DEFAULT 0,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+    )
+    .execute(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_hub_sink_groups_db_connection_id \
+         ON hub_sink_groups(db_connection_id)",
+    )
+    .execute(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+
+    // `hub_sink_groups` ↔ `tags` の多対多。`sink_group_id` は同じ
+    // `apply_app_schema`内で直前に作った Hub 専用テーブルを指すため FK を
+    // 張れる（`ON DELETE CASCADE` - グループ削除で行ごと消える）。
+    // `tag_id` は上と同じ理由で `tags(id)` への FK を張らない -
+    // タグ削除時のクリーンアップは `crate::sink::service` 側で行う
+    // （単体/一括のタグ削除経路で明示的に削除する。グループ/接続の
+    // カスケード削除経路で残る可能性がある古い行は `hub_retained_values`
+    // と同じ扱い - 実害なく無視される、`crate::sink`のモジュール doc
+    // comment参照）。
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS hub_sink_group_tags (
+          sink_group_id INTEGER NOT NULL REFERENCES hub_sink_groups(id) ON DELETE CASCADE,
+          tag_id INTEGER NOT NULL,
+          PRIMARY KEY (sink_group_id, tag_id)
+        )",
+    )
+    .execute(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_hub_sink_group_tags_tag_id \
+         ON hub_sink_group_tags(tag_id)",
+    )
+    .execute(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+
     Ok(())
 }
 
@@ -376,6 +446,8 @@ mod tests {
             "hub_write_audit",
             "hub_retained_values",
             "pending_changes",
+            "hub_sink_groups",
+            "hub_sink_group_tags",
         ] {
             let exists: Option<String> = sqlx::query_scalar(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",

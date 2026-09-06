@@ -429,7 +429,7 @@ async fn initialize_returns_tool_capabilities() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tools_list_returns_the_thirty_two_tools() {
+async fn tools_list_returns_the_thirty_seven_tools() {
     let app = test_app("tools-list").await;
     let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
 
@@ -444,18 +444,22 @@ async fn tools_list_returns_the_thirty_two_tools() {
             "create_api_key",
             "create_connection",
             "create_group",
+            "create_sink_group",
             "create_tag",
             "delete_connection",
             "delete_group",
+            "delete_sink_group",
             "delete_tag",
             "get_grpc_settings",
             "get_mqtt_settings",
             "get_retention",
             "get_server_status",
+            "get_sink_group",
             "get_tag",
             "list_api_keys",
             "list_connections",
             "list_groups",
+            "list_sink_groups",
             "list_tags",
             "lock_down",
             "read_tag_now",
@@ -470,6 +474,7 @@ async fn tools_list_returns_the_thirty_two_tools() {
             "test_saved_connection",
             "update_connection",
             "update_group",
+            "update_sink_group",
             "update_tag",
             "write_recipe",
             "write_tag_value",
@@ -4364,4 +4369,252 @@ async fn after_lock_down_config_tools_still_work_but_writes_become_advisory() {
     );
 
     sim.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 外部 DB 連携 S4（docs/banto-hub-external-db-design.md §5.2）: DB Sink の
+// Hub 側構成補助ツール5本。他の構成 CRUD ツールと同じ2点(admin スコープ
+// 必須・全操作を origin="mcp" で監査する)を固定する - pending queue は
+// 関与しないため、稼働中/停止中の分岐は無い(§6-13)。
+// ---------------------------------------------------------------------------
+
+fn postgres_conn_input(name: &str) -> PlcConnectionInput {
+    PlcConnectionInput {
+        name: name.to_string(),
+        protocol: "postgres".to_string(),
+        host: "10.0.0.50".to_string(),
+        port: 5432,
+        unit_id: 1,
+        enabled: true,
+        simulation: false,
+        word_order: "low_high".to_string(),
+        database: Some("erp".to_string()),
+        username: Some("reader".to_string()),
+        password: Some("s3cret".to_string()),
+    }
+}
+
+fn sink_group_arguments(db_connection_id: i64, tag_id: i64) -> Value {
+    json!({
+        "name": "line1-log",
+        "dbConnectionId": db_connection_id,
+        "mode": "interval",
+        "intervalMs": 1000,
+        "tableName": "public.tag_history",
+        "storeBad": false,
+        "enabled": true,
+        "tagIds": [tag_id],
+    })
+}
+
+async fn sink_groups_row_count(app: &TestApp) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM hub_sink_groups")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sink_group_tools_without_admin_scope_are_rejected_and_change_nothing() {
+    let app = test_app("sink-no-admin").await;
+    let (tag_id, _external_name) =
+        make_tag(&app, "line1", 15301, "temp01", "D100", "u16", true, true).await;
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(postgres_conn_input("erp-db"))
+        .await
+        .unwrap();
+    let key = issue_key(
+        &app.router,
+        &app.admin_token,
+        "reader-writer",
+        &["read", "write:line1.fast.temp01"],
+    )
+    .await;
+    let before = sink_groups_row_count(&app).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call("create_sink_group", sink_group_arguments(conn.id, tag_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true);
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("missing_admin_scope"), "{text}");
+    assert_eq!(sink_groups_row_count(&app).await, before);
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call("list_sink_groups", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true);
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("missing_admin_scope"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sink_group_tools_crud_round_trip_and_are_audited_without_a_password() {
+    let app = test_app("sink-crud").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let (tag_id, external_name) =
+        make_tag(&app, "line1", 15302, "temp01", "D100", "u16", true, true).await;
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(postgres_conn_input("erp-db"))
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("create_sink_group", sink_group_arguments(conn.id, tag_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let created: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(created["created"]["name"], "line1-log");
+    let group_id = created["created"]["id"].as_i64().unwrap();
+    assert_eq!(sink_groups_row_count(&app).await, 1);
+
+    // 監査は audit_log に残るが、値そのもの(postgres 接続のパスワード
+    // "s3cret")は一切含まない - `SinkGroupInput`自体がパスワードを持たない
+    // ため当然ではあるが、実装指示のとおり明示的に確認する。
+    let detail = latest_audit_column(&app, "detail").await.unwrap();
+    assert!(!detail.contains("s3cret"), "{detail}");
+    assert_eq!(
+        latest_audit_column(&app, "resource").await.as_deref(),
+        Some("sink_groups")
+    );
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("get_sink_group", json!({ "id": group_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let fetched: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(fetched["group"]["tagIds"], json!([tag_id]));
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("list_sink_groups", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let listed: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(listed["groups"].as_array().unwrap().len(), 1);
+
+    let mut update_args = sink_group_arguments(conn.id, tag_id);
+    update_args["id"] = json!(group_id);
+    update_args["intervalMs"] = json!(5000);
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("update_sink_group", update_args),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let updated: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(updated["updated"]["intervalMs"], 5000);
+    let detail = latest_audit_column(&app, "detail").await.unwrap();
+    assert!(!detail.contains("s3cret"), "{detail}");
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "delete_sink_group",
+            json!({ "id": group_id, "confirm": true }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    assert_eq!(sink_groups_row_count(&app).await, 0);
+
+    let _ = external_name;
+}
+
+/// `update_sink_group` は全項目必須(PUT 置換) - 1項目でも欠けると
+/// `missing_fields`で拒否され、DB は変更されない
+/// （[`UPDATE_SINK_GROUP_REQUIRED_FIELDS`]の実装指示どおり）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_sink_group_requires_every_field() {
+    let app = test_app("sink-update-partial").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let (tag_id, _) = make_tag(&app, "line1", 15303, "temp01", "D100", "u16", true, true).await;
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(postgres_conn_input("erp-db"))
+        .await
+        .unwrap();
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("create_sink_group", sink_group_arguments(conn.id, tag_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let created: Value = serde_json::from_str(text).unwrap();
+    let group_id = created["created"]["id"].as_i64().unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "update_sink_group",
+            json!({ "id": group_id, "name": "line1-log-renamed" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true);
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("missing_fields"), "{text}");
+}
+
+/// `delete_sink_group` は不可逆操作のため`confirm:true`が無いと拒否される
+/// （他の`delete_*`ツールと同じ規約）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_sink_group_requires_confirm() {
+    let app = test_app("sink-delete-confirm").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let (tag_id, _) = make_tag(&app, "line1", 15304, "temp01", "D100", "u16", true, true).await;
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(postgres_conn_input("erp-db"))
+        .await
+        .unwrap();
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("create_sink_group", sink_group_arguments(conn.id, tag_id)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let created: Value = serde_json::from_str(text).unwrap();
+    let group_id = created["created"]["id"].as_i64().unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("delete_sink_group", json!({ "id": group_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true);
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("confirm_required"), "{text}");
+    assert_eq!(sink_groups_row_count(&app).await, 1);
 }
