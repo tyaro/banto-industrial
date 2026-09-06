@@ -14,7 +14,7 @@
 # #237)。musl DL を丸ごと無くすため、ci.yml と同じく実績のある
 # `dtolnay/rust-toolchain`(gnu ホスト・musl 不使用)でツールチェーンを入れ、
 # `taiki-e/install-action` でプリビルドの cargo-deny バイナリを取得して
-# `cargo deny` を直接実行する形へ置き換えた。1.94.1 ピン(rust-toolchain.toml
+# `cargo deny` を直接実行する形へ置き換えた。1.98.1 ピン(rust-toolchain.toml
 # と一致させ `cargo metadata` を安定させる意図)と、旧アクション既定の
 # `--all-features`(2026-08-08 実測でこの追加依存は allow 済みライセンスのみ)
 # は保持している。
@@ -48,7 +48,7 @@ jobs:
       # `cargo deny` 自体はコンパイルしないが `cargo metadata` は実行するため、
       # 依存クレート側の rust-version/edition 要求によっては古い cargo だと
       # 失敗しうる。ここを rust-toolchain.toml と別管理にしないため固定。
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@1.98.1
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny
@@ -62,7 +62,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@1.98.1
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny

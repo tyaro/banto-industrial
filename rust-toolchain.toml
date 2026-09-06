@@ -7,9 +7,12 @@
 # green であることを確認済みのバージョンにピン留めする。
 #
 # channel の値はこのコンテナの `rustc --version --verbose` の実測
-# (1.94.1, commit e408947bf, 2026-03-25 付け)に合わせた。将来の更新は
+# (1.98.1, commit 48a229cea, 2026-09-01 付け)に合わせた。将来の更新は
 # 「意図したコミット」でこのファイルの channel を書き換えて行う
 # (自動追従はさせない)。
+#
+# 2026-09-06 オーナー決定で 1.94.1 → 1.98.1 に更新。契機は sysinfo 0.39 系の
+# rustc 1.95 要求(dependabot #283)。
 #
 # `dtolnay/rust-toolchain@stable`(ci.yml、本ファイルの対象外・変更禁止)は
 # `rustup toolchain install stable` + `rustup default stable` を行うのみで、
@@ -27,5 +30,5 @@
 # 明示指定しているのと揃え、pin 後も fmt/clippy が同一 toolchain に含まれる
 # ようにする。
 [toolchain]
-channel = "1.94.1"
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]

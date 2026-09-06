@@ -39,7 +39,7 @@
 
 ### Rust ツールチェイン
 
-- `rust-toolchain.toml` で **1.94.1 にピン留め**（rustup が自動同期）。
+- `rust-toolchain.toml` で **1.98.1 にピン留め**（rustup が自動同期）。
 - CI の Rust ジョブは **windows-latest** で全ワークスペースを回す。この Linux VM でも
   `cargo build/test --workspace` は通る（3 つの `src-tauri` クレートを含む）。ただし
   それには **Tauri/WebKitGTK のシステム依存**が必要で、本スナップショットには

@@ -413,8 +413,10 @@ mod tests {
         let mut padded = bytes.to_vec();
         padded.push(0x00); // pad to 10 bytes = 5 words
         let regs: Vec<u16> = padded
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         assert_eq!(
             decode_string_value(&regs, 0, regs.len(), StringEncoding::Utf8).unwrap(),
@@ -435,8 +437,10 @@ mod tests {
         let mut padded = bytes.to_vec();
         padded.push(0x00);
         let regs: Vec<u16> = padded
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         // `Err` also proves the point: the bytes are not valid Shift-JIS at all.
         if let Ok(sjis) = decode_string_value(&regs, 0, regs.len(), StringEncoding::ShiftJis) {
