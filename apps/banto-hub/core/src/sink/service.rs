@@ -5,6 +5,31 @@
 //! 側 `banto_tags` の管轄外）なので `apps/banto-hub/core`側に置く - 他の
 //! Hub 専用テーブルのサービス（`crate::write_audit`・`crate::pending_changes`）
 //! と同じ配置。
+//!
+//! **`BEGIN IMMEDIATE`（2026-09-07 追記、CI flake 修正）**: `create`/
+//! `update`/`delete` は`self.pool.begin_with("BEGIN IMMEDIATE")`で
+//! トランザクションを開始する - 素の`self.pool.begin()`（SQLite の既定
+//! `BEGIN DEFERRED`）は書き込みロックの取得を最初の書き込み文まで遅らせる。
+//! `update`はその書き込み文の前に検証用`SELECT`を複数回（既存行取得・
+//! 名前重複チェック・接続の存在/`protocol`チェック・タグ存在チェックを
+//! タグ数ぶんループ）挟むため、その間に別コネクションがコミットすると、
+//! このトランザクションが確立した読み取りスナップショットが古くなり、
+//! `UPDATE`実行時に`SQLITE_BUSY`（"database is locked"、code 5）を
+//! *待たずに即座に*返す（WAL モードで「読み取りスナップショット確立後に
+//! 別コネクションが書き込みをコミットした」ケースは、SQLite がビジー
+//! ハンドラを呼ばず即時 `SQLITE_BUSY` を返す仕様のため、
+//! `busy_timeout`（既定 5秒、`banto_storage::sqlite::connect`/
+//! `connect_memory`）が長くても解決しない）。`BEGIN IMMEDIATE`は
+//! トランザクション開始時点で書き込みロックを取得するため、「後から
+//! アップグレードしようとして失敗する」窓自体を無くす（先に開始した側が
+//! 完了するまで、後続の`BEGIN IMMEDIATE`は`busy_timeout`の通常の待ち合わせ
+//! でブロックされるだけになる）。`banto_tags`の各サービスの素の`create`/
+//! `update`（`create_tx`/`update_tx`ではない方）がこの問題を踏まなかった
+//! のは、検証用`SELECT`と書き込み文をそれぞれ独立した単発オートコミットと
+//! して`&self.pool`に投げており、複数の`SELECT`を1つの明示トランザクション
+//! に束ねていなかったため - このモジュールは`hub_sink_groups`と
+//! `hub_sink_group_tags`をまたぐ複数文を原子的に更新する必要があるため
+//! 同じ形にはできず、`BEGIN IMMEDIATE`で解決する。
 
 use banto_core::{BantoError, FieldError};
 use serde::{Deserialize, Serialize};
@@ -385,9 +410,13 @@ impl SinkGroupService {
     }
 
     pub async fn create(&self, input: SinkGroupInput) -> Result<SinkGroup, BantoError> {
+        // `BEGIN IMMEDIATE`: このモジュールの doc comment「BEGIN IMMEDIATE」
+        // 参照 - 書き込み文の前に検証用`SELECT`を複数回挟むため、素の
+        // `BEGIN DEFERRED`だと WAL のスナップショット競合で
+        // 即時`SQLITE_BUSY`になり得る。
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(banto_storage::storage_error)?;
         validate_sink_group_input(&mut tx, &input, None).await?;
@@ -414,9 +443,16 @@ impl SinkGroupService {
     }
 
     pub async fn update(&self, id: i64, input: SinkGroupInput) -> Result<SinkGroup, BantoError> {
+        // `BEGIN IMMEDIATE`: このモジュールの doc comment「BEGIN IMMEDIATE」
+        // 参照 - CI で観測された "database is locked" flake の修正
+        // （2026-09-07）。存在確認・名前重複・接続/タグ存在チェックと
+        // いった複数回の`SELECT`を書き込み文の前に挟むため、素の
+        // `BEGIN DEFERRED`だと、その間に他コネクションがコミットした
+        // ときに読み取りスナップショットが古くなり、`UPDATE`実行時に
+        // `busy_timeout`で待たされず即座に`SQLITE_BUSY`を返しうる。
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(banto_storage::storage_error)?;
         // 存在確認を先に行う - 見つからなければ検証より先に404を返す
@@ -448,9 +484,13 @@ impl SinkGroupService {
     }
 
     pub async fn delete(&self, id: i64) -> Result<(), BantoError> {
+        // `BEGIN IMMEDIATE`: `create`/`update`と揃える（このモジュールの
+        // doc comment「BEGIN IMMEDIATE」参照）- `delete`自体は書き込み文が
+        // 1つだけで同じ危険は薄いが、素の`BEGIN DEFERRED`のままにする理由も
+        // ないため同じ形にする。
         let mut tx = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(banto_storage::storage_error)?;
         // `hub_sink_group_tags`は`ON DELETE CASCADE`（`crate::db`参照）なので
