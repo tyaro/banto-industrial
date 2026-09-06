@@ -1,7 +1,7 @@
 # banto-hub 外部 DB 連携 設計: DB Source（#228）と DB Sink（#229）
 
 作成日: 2026-09-06
-状態: **オーナー決定済み（2026-09-06、§6 の 17 項目）・S0〜S6 は完了**（S1 = #299 / #300、S2 = #301、S2b = #303、S3 = #310、S4 = #305、S5 = #306、S6 = #313、docs #302 / #304 / #307 / #308 / #312）。**残りは S7（実 DB 検証、オーナー同席。手順は [external-db-test-2026-09.md](external-db-test-2026-09.md)）**。S6 の申し送り: `BantoHubSink` への Operators 向けサービス ACL 付与（追従 PR）、シェルからの start / stop は実サービス未検証（S7 で確認）。Sink は別プロセスのサイドカー `apps/banto-hub-sink`（§5、2026-09-06 決定）。コード調査（§3）は 2026-09-06 の main（`9c26b3a`、toolchain 1.98.1）に対して実施済み。
+状態: **オーナー決定済み（2026-09-06、§6 の 17 項目）・S0〜S6 は完了**（S1 = #299 / #300、S2 = #301、S2b = #303、S3 = #310、S4 = #305、S5 = #306、S6 = #313、docs #302 / #304 / #307 / #308 / #312）。**残りは S7（実 DB 検証、オーナー同席。手順は [external-db-test-2026-09.md](external-db-test-2026-09.md)）**。S6 の申し送り: `BantoHubSink` への Operators 向けサービス ACL 付与は #316 で対応済み（`banto-hub-sink grant-service-acl` が同梱の `banto-hub-elev` を呼ぶ）、シェルからの start / stop は実サービス未検証（S7 で確認）。Sink は別プロセスのサイドカー `apps/banto-hub-sink`（§5、2026-09-06 決定）。コード調査（§3）は 2026-09-06 の main（`9c26b3a`、toolchain 1.98.1）に対して実施済み。
 対象: Issue [#228](https://github.com/tyaro/banto-industrial/issues/228)（外部 RDB の値をタグ空間へ取り込む Source）と [#229](https://github.com/tyaro/banto-industrial/issues/229)（タグ値を外部 RDB へ保存する Sink / Logger）。**2 件はペアで 1 設計**とし、DB 接続エンティティを共有する。
 
 関連: [tag-server-design.md](tag-server-design.md)（タグ空間・書き込み安全の一次ソース。§2 非スコープの「ロガー作らない」決定を本書 §2.1 で扱う）、[banto-hub-t20-design.md](banto-hub-t20-design.md)（値表現と read-on-demand の先例）、[banto-hub-t21-design.md](banto-hub-t21-design.md)（構成操作の MCP と監査の型）、[plan.md](plan.md) §1（「外部時系列DB読み出し・保存」は 3〜4 案件で再利用される共通資産）。
