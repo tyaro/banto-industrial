@@ -47,17 +47,24 @@
 //! 本ファイル冒頭の doc 参照）ため、値の複製で済ませる
 //! （`plcConnectionForm.ts`が`POSTGRES_PROTOCOL`を複製するのと同じ判断）。
 //!
-//! **既知の制限（PR 本文にも記載）**: `BantoHubSink`の SCM オブジェクトには
+//! **既知の制限（このスライス時点、PR 本文にも記載）→ S6 レビュー指摘で
+//! 解消済み**: この S6 スライス時点では`BantoHubSink`の SCM オブジェクトに
 //! `banto-hub-elev.exe grant-service-acl`が付与する ACE
-//! （`service_elevated.rs`参照、`BantoHub`固定）が付与されていない - この
-//! スライスは`grant-service-acl`自体の対象拡張は行わないため、
+//! （`service_elevated.rs`参照、当時`BantoHub`固定）が付与されておらず、
 //! `BantoHub Operators`グループのメンバー（管理者ではない一般オペレータ）が
 //! `BantoHubSink`を起動・停止しようとすると Win32 の`ERROR_ACCESS_DENIED`
-//! （[`ServiceManagerError::AccessDenied`]）になる可能性が高い。フルの
-//! Windows 管理者（既定で全サービスの SC_MANAGER_ALL_ACCESS 相当を持つ）で
-//! あれば操作できる。実機（Windows）で`BantoHubSink`を実際にインストールした
-//! 状態での検証は本 PR の範囲外（この worktree には実サービスをインストール
-//! しない制約があるため）。
+//! （[`ServiceManagerError::AccessDenied`]）になりうる gap があった。
+//! 直後の follow-up（`service_elevated.rs`のモジュール doc「S6 申し送りの
+//! follow-up」節）で`grant-service-acl`を`[service-name]`引数付きへ一般化し、
+//! `apps/banto-hub-sink/src/service.rs::grant_service_acl`
+//! （`banto-hub-sink.exe grant-service-acl`サブコマンド）が
+//! `banto-hub-elev.exe grant-service-acl BantoHubSink`を呼ぶことで
+//! `BantoHubSink`にも同じ ACE を付与できるようにした - フルの Windows
+//! 管理者（既定で全サービスの SC_MANAGER_ALL_ACCESS 相当を持つ）は元々
+//! 操作できていた。実機（Windows）で`BantoHubSink`を実際にインストールし
+//! `sc sdshow BantoHubSink`で ACE の付与・Operators でのシェル起動停止を
+//! 確認するのは、この worktree には実サービスをインストールしない制約が
+//! あるため引き続き手動確認事項（PR 本文の手動確認手順参照）。
 
 use std::time::{Duration, Instant};
 

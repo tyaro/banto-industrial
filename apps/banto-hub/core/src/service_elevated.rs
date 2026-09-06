@@ -20,7 +20,7 @@
 //! | action                      | 処理内容                                                              |
 //! |------------------------------|------------------------------------------------------------------------|
 //! | `setup-operators`            | ローカルグループ`BantoHub Operators`を（無ければ）作成し、指定ユーザー（省略時は現在の対話ユーザー）をメンバーに追加する。冪等 |
-//! | `grant-service-acl`          | `BantoHub`サービスの DACL に`BantoHub Operators`への限定 ACE を追加する（下記「SDDL」節） |
+//! | `grant-service-acl`          | `[service-name]`（省略時は`BantoHub`）のサービス DACL に`BantoHub Operators`への限定 ACE を追加する（下記「SDDL」節・下部「S6 申し送りの follow-up」節） |
 //! | `grant-profile-acl`          | profile ディレクトリ（`[username] [profile-id]`、両方省略時は現在の対話ユーザー・既定 profile）へ owner 用 DACL を付与する（[`crate::profile_acl`]、下記「profile ACL」節） |
 //! | `service-install`            | [`crate::service_install::install`]（`banto-hub.exe`本体を対象）→`setup-operators`→`grant-service-acl`→`grant-profile-acl`（既定ユーザー・既定 profile）の順で実行 |
 //! | `service-uninstall`          | [`crate::service_install::uninstall`]をそのまま呼ぶ                    |
@@ -161,6 +161,40 @@
 //! `#[cfg(windows)]`のみで提供する - 呼び出し元は`bin/banto-hub-elev.rs`の
 //! `#[cfg(windows)] fn main()`のみで、非 Windows 側の`main`はそもそも
 //! これらを呼ばない。
+//!
+//! ## S6 申し送りの follow-up（docs/banto-hub-external-db-design.md §5.5・
+//! §7 row S6、PR #313 レビュー指摘）: `grant-service-acl`のサービス名
+//! パラメータ化
+//!
+//! S6（`service_manager.rs`の`WindowsServiceManager::for_service`汎化）で
+//! デスクトップシェルが`BantoHubSink`の起動・停止を扱えるようになったが、
+//! `grant-service-acl`（このモジュール）は`BantoHub`固定のままだった -
+//! `BantoHubSink`の SCM オブジェクトには`BantoHub Operators`への ACE が
+//! 一切付与されず、Operators（管理者ではない一般ユーザー）がシェルから
+//! サイドカーを起動・停止しようとすると Win32 の`ERROR_ACCESS_DENIED`に
+//! なっていた（`service_manager.rs`のモジュール doc「既知の制限」節に
+//! 記載されていた gap）。
+//!
+//! この follow-up は[`grant_service_acl`]の実装本体を
+//! [`grant_service_acl_for`]（サービス名を引数に取る）へ一般化し、
+//! [`grant_service_acl`]自体は`grant_service_acl_for(crate::service_manager::
+//! SERVICE_NAME)`の薄いラッパーにした - `BantoHub`向けの SDDL/ACE 組み立て
+//! （[`OPERATORS_SERVICE_ACCESS_MASK`]・`SetEntriesInAclW`によるマージ等、
+//! 上記「SDDL」節）は1バイトも変えていない。`ElevatedAction::GrantServiceAcl`
+//! の CLI 引数も`[service-name]`（省略時は`BantoHub`）を受け付けるように
+//! 拡張した（`run`の dispatch・`resolve_service_acl_target`参照）。
+//!
+//! **`apps/banto-hub-sink`はこの関数を直接呼ばない** -
+//! `banto-hub-sink`はリリースバイナリを小さく保つ設計
+//! （docs/banto-hub-external-db-design.md §5.6「新規依存なし」）のため、
+//! `banto-hub-core`（tonic/grpc・sqlx の postgres+sqlite・axum 等を抱える
+//! 大きな crate）を本番依存に加えたくない。代わりに
+//! `banto-hub-sink.exe grant-service-acl`サブコマンド
+//! （`apps/banto-hub-sink/src/service.rs::grant_service_acl`）が、同じ MSI で
+//! 隣にインストールされる`banto-hub-elev.exe`を子プロセスとして
+//! `grant-service-acl BantoHubSink`引数付きで起動するだけ - Win32 の
+//! SDDL/ACE コードはこのモジュールの実装1箇所のままで、サイドカー側は
+//! 一切複製しない。
 
 use thiserror::Error;
 
@@ -417,10 +451,26 @@ pub fn setup_operators(user: Option<&str>) -> Result<(), ElevatedError> {
     windows_impl::setup_operators(user)
 }
 
-/// [`ElevatedAction::GrantServiceAcl`]の本体（モジュール doc「SDDL」節参照）。
+/// [`ElevatedAction::GrantServiceAcl`]の本体（`BantoHub`固定）。モジュール
+/// doc「SDDL」節参照 - [`grant_service_acl_for`]の薄いラッパー（モジュール
+/// doc「S6 申し送りの follow-up」節参照）。`banto-hub-elev.exe
+/// grant-service-acl`（引数無し）はこの関数を呼ぶため、挙動は S6 以前と
+/// 1バイトも変えていない。
 #[cfg(windows)]
 pub fn grant_service_acl() -> Result<(), ElevatedError> {
-    windows_impl::grant_service_acl()
+    grant_service_acl_for(crate::service_manager::SERVICE_NAME)
+}
+
+/// [`ElevatedAction::GrantServiceAcl`]の一般化版本体（モジュール doc「S6
+/// 申し送りの follow-up」節参照）。`service_name`で指定した任意のサービス
+/// （`BantoHub`・`BantoHubSink`等）へ、[`grant_service_acl`]と全く同じ
+/// SDDL/ACE（[`OPERATORS_SERVICE_ACCESS_MASK`]・
+/// [`OPERATORS_SERVICE_ACL_SDDL_TEMPLATE`]）を付与する - 対象サービスが
+/// 異なるだけで、ACE の中身（`BantoHub Operators`への
+/// query-config/query-status/start/stop のみ許可）は完全に同一。
+#[cfg(windows)]
+pub fn grant_service_acl_for(service_name: &str) -> Result<(), ElevatedError> {
+    windows_impl::grant_service_acl_for(service_name)
 }
 
 /// [`ElevatedAction::GrantProfileAcl`]の本体（`user`/`profile_id`省略時は
@@ -701,8 +751,10 @@ pub fn run(action: ElevatedAction, args: &[String]) -> Result<(), ElevatedError>
             setup_operators(args.first().map(String::as_str))
         }
         ElevatedAction::GrantServiceAcl => {
-            reject_extra_args(action, args)?;
-            grant_service_acl()
+            if args.len() > 1 {
+                return Err(too_many_args(action, args.len(), "0〜1"));
+            }
+            grant_service_acl_for(resolve_service_acl_target(args))
         }
         ElevatedAction::GrantProfileAcl => {
             if args.len() > 2 {
@@ -765,6 +817,23 @@ fn too_many_args(action: ElevatedAction, got: usize, expected: &str) -> Elevated
     ))
 }
 
+/// [`ElevatedAction::GrantServiceAcl`]の`[service-name]`引数（省略可・0〜1
+/// 個、`run`の`args.len() > 1`検証を通過済みの前提）から対象サービス名を
+/// 解決する（モジュール doc「S6 申し送りの follow-up」節参照）。省略時は
+/// `crate::service_manager::SERVICE_NAME`（`"BantoHub"`）- 既存の
+/// `banto-hub-elev.exe grant-service-acl`（引数無し）呼び出しが今までどおり
+/// `BantoHub`を対象にする（挙動不変）ことを保証する。
+///
+/// Win32 API を一切呼ばない純粋な文字列解決なので`#[cfg(windows)]`を
+/// 掛けていない - 非 Windows でもこのロジック自体は単体テストできる
+/// （`service_operators.rs`等の「Win32 非依存部分だけは cfg 無しでテスト
+/// する」既存方針と同じ）。
+fn resolve_service_acl_target(args: &[String]) -> &str {
+    args.first()
+        .map(String::as_str)
+        .unwrap_or(crate::service_manager::SERVICE_NAME)
+}
+
 /// Win32 API を直接叩く実装本体（`#[cfg(windows)]`）。上位の
 /// [`setup_operators`]/[`grant_service_acl`]から薄く呼ばれるだけで、
 /// 公開関数からは直接見えない実装詳細。
@@ -796,7 +865,6 @@ mod windows_impl {
     use windows_sys::Win32::System::WindowsProgramming::GetUserNameW;
 
     use super::{ElevatedError, OPERATORS_SERVICE_ACCESS_MASK};
-    use crate::service_manager::SERVICE_NAME;
     use crate::service_operators::{windows_impl::lookup_account_sid, OPERATORS_GROUP_NAME};
 
     /// `DACL_SECURITY_INFORMATION`（`windows-sys`は`Win32_System_Services`
@@ -1021,14 +1089,16 @@ mod windows_impl {
         })
     }
 
-    /// [`super::grant_service_acl`]の本体（モジュール doc「SDDL」節参照）。
-    pub(super) fn grant_service_acl() -> Result<(), ElevatedError> {
+    /// [`super::grant_service_acl_for`]の本体（モジュール doc「SDDL」節・
+    /// 「S6 申し送りの follow-up」節参照）。`service_name`以外は
+    /// パラメータ化前の`grant_service_acl`から1バイトも変えていない。
+    pub(super) fn grant_service_acl_for(service_name: &str) -> Result<(), ElevatedError> {
         let mut operators_sid = lookup_account_sid(OPERATORS_GROUP_NAME)?.ok_or_else(|| {
             ElevatedError::OperatorsGroupNotFound(OPERATORS_GROUP_NAME.to_string())
         })?;
 
         let scm = open_scm()?;
-        let result = grant_service_acl_with_scm(scm, &mut operators_sid);
+        let result = grant_service_acl_with_scm(scm, service_name, &mut operators_sid);
         // SAFETY: `scm`は`open_scm`が返した有効なハンドル。
         unsafe { CloseServiceHandle(scm) };
         result
@@ -1082,20 +1152,21 @@ mod windows_impl {
 
     fn grant_service_acl_with_scm(
         scm: SC_HANDLE,
+        service_name: &str,
         operators_sid: &mut [u8],
     ) -> Result<(), ElevatedError> {
-        let service_wide = to_wide(SERVICE_NAME);
+        let service_wide = to_wide(service_name);
         // SAFETY: `scm`は呼び出し元が確保した有効なハンドル。
         let service = unsafe { OpenServiceW(scm, service_wide.as_ptr(), READ_CONTROL | WRITE_DAC) };
         if service.is_null() {
             let os_error = unsafe { GetLastError() };
             return Err(ElevatedError::OpenServiceFailed {
-                service: SERVICE_NAME.to_string(),
+                service: service_name.to_string(),
                 os_error,
             });
         }
 
-        let result = grant_service_acl_with_service(service, operators_sid);
+        let result = grant_service_acl_with_service(service, service_name, operators_sid);
         // SAFETY: `service`は直前に`OpenServiceW`が返した有効なハンドル。
         unsafe { CloseServiceHandle(service) };
         result
@@ -1103,6 +1174,7 @@ mod windows_impl {
 
     fn grant_service_acl_with_service(
         service: SC_HANDLE,
+        service_name: &str,
         operators_sid: &mut [u8],
     ) -> Result<(), ElevatedError> {
         // 1回目: 必要バッファサイズの問い合わせ（`QueryServiceObjectSecurity`
@@ -1123,7 +1195,7 @@ mod windows_impl {
         if needed == 0 {
             let os_error = unsafe { GetLastError() };
             return Err(ElevatedError::QuerySecurityFailed {
-                service: SERVICE_NAME.to_string(),
+                service: service_name.to_string(),
                 os_error,
             });
         }
@@ -1143,7 +1215,7 @@ mod windows_impl {
         if ok == 0 {
             let os_error = unsafe { GetLastError() };
             return Err(ElevatedError::QuerySecurityFailed {
-                service: SERVICE_NAME.to_string(),
+                service: service_name.to_string(),
                 os_error,
             });
         }
@@ -1253,7 +1325,7 @@ mod windows_impl {
         if ok == 0 {
             let os_error = unsafe { GetLastError() };
             return Err(ElevatedError::SetServiceSecurityFailed {
-                service: SERVICE_NAME.to_string(),
+                service: service_name.to_string(),
                 os_error,
             });
         }
@@ -1367,6 +1439,35 @@ mod tests {
         }
     }
 
+    /// [`resolve_service_acl_target`]（S6 申し送りの follow-up、モジュール
+    /// doc参照）: 引数省略時は`BantoHub`固定 - 既存の`banto-hub-elev.exe
+    /// grant-service-acl`（引数無し）呼び出しの挙動が変わっていないことを
+    /// 保証する回帰テスト。Win32 API を呼ばない純粋関数なので
+    /// `#[cfg(windows)]`を掛けていない。
+    #[test]
+    fn grant_service_acl_target_defaults_to_bantohub_when_omitted() {
+        assert_eq!(
+            resolve_service_acl_target(&[]),
+            crate::service_manager::SERVICE_NAME
+        );
+        assert_eq!(resolve_service_acl_target(&[]), "BantoHub");
+    }
+
+    /// 引数を渡した場合はその値をそのまま使う - `BantoHubSink`はもちろん、
+    /// 将来増えうる他サービスにも対応できることを確認する
+    /// （実装指示「SDDL/ACE builder produces the same string for both
+    /// service names except the name」に対応するテスト - このモジュールの
+    /// ACE 組み立て自体はサービス名を含まない共有定数
+    /// [`OPERATORS_SERVICE_ACCESS_MASK`]・[`OPERATORS_SERVICE_ACL_SDDL_TEMPLATE`]
+    /// なので、対象サービス名が変わっても付与される ACE の中身は変わらない。
+    /// その値そのものは`sddl_rights_string_matches_access_mask_letters`等が
+    /// 既に固定している）。
+    #[test]
+    fn grant_service_acl_target_uses_given_service_name() {
+        let args = vec!["BantoHubSink".to_string()];
+        assert_eq!(resolve_service_acl_target(&args), "BantoHubSink");
+    }
+
     /// `create_group_if_missing`/`add_member_if_missing`が「既に存在する」
     /// 判定に使う追加の Win32 エラーコードの実値を固定する - T17-2 実機
     /// 検証（2回目の`setup-operators`実行）で`NetLocalGroupAdd`が
@@ -1404,15 +1505,31 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn run_rejects_extra_args_for_no_arg_actions() {
+        // `GrantServiceAcl`は S6 申し送りの follow-up でここから外れた -
+        // `[service-name]`（0〜1個）を受け付けるようになったため、1個の
+        // 追加引数はもはやエラーではない
+        // （`run_rejects_too_many_args_for_grant_service_acl`参照）。
         let extra = vec!["unexpected".to_string()];
         for action in [
-            ElevatedAction::GrantServiceAcl,
             ElevatedAction::AutostartEnable,
             ElevatedAction::AutostartDisable,
         ] {
             let err = run(action, &extra).expect_err("extra args should be rejected");
             assert!(matches!(err, ElevatedError::InvalidArgs(_)));
         }
+    }
+
+    /// `grant-service-acl`は`[service-name]`を0〜1個受け付ける（モジュール
+    /// doc「S6 申し送りの follow-up」節参照）- 2個以上はエラー。実際に
+    /// Win32 API を呼ぶところまでは到達しない前に弾かれることを確認する
+    /// （`run_rejects_too_many_args_for_setup_operators`等と同じ形）。
+    #[cfg(windows)]
+    #[test]
+    fn run_rejects_too_many_args_for_grant_service_acl() {
+        let extra = vec!["BantoHub".to_string(), "unexpected-second".to_string()];
+        let err = run(ElevatedAction::GrantServiceAcl, &extra)
+            .expect_err("grant-service-acl only accepts 0-1 args");
+        assert!(matches!(err, ElevatedError::InvalidArgs(_)));
     }
 
     #[cfg(windows)]
@@ -1652,6 +1769,24 @@ mod tests {
     fn grant_service_acl_applies_without_error() {
         setup_operators(None).expect("setup-operators should succeed first");
         grant_service_acl().expect("grant-service-acl should succeed against an installed service");
+    }
+
+    /// S6 申し送りの follow-up: [`grant_service_acl_for`]が`BantoHub`以外の
+    /// サービス名（`BantoHubSink`）にも同じ ACE を付与できることを実機で
+    /// 確認する - `BantoHubSink`サービスの事前インストールが必要なため
+    /// `#[ignore]`（このワークスペースの制約でこのタスク自体は実サービスを
+    /// インストールしない - `apps/banto-hub-sink/src/service.rs::
+    /// grant_service_acl`が`banto-hub-elev.exe grant-service-acl
+    /// BantoHubSink`として実行するのと同じ経路）。実行後は
+    /// `sc sdshow BantoHubSink`で`BantoHub Operators`の SID に対する
+    /// `(A;;CCLCRPWP;;;<SID>)`の存在を確認する（PR 本文の手動確認手順）。
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "管理者権限・BantoHubSink サービスの事前インストールが必要 - Windows 実機で手動実行"]
+    fn grant_service_acl_for_applies_to_sink_service() {
+        setup_operators(None).expect("setup-operators should succeed first");
+        grant_service_acl_for("BantoHubSink")
+            .expect("grant-service-acl should succeed against an installed BantoHubSink service");
     }
 
     /// 実際に`%ProgramData%\BantoHub\profiles\<profile-id>\`へ ACL を
