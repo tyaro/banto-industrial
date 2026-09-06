@@ -18,7 +18,9 @@
 # (banto docs/publishing.md). T19 S1-b0: crates/banto-plc-address (AddressArea
 # の書き込み可否を1箇所で定義する依存ゼロ crate。banto-plc/banto-tags/
 # banto-plc-write が共有する - crates/banto-plc-address/src/lib.rs のモジュール
-# doc 参照).
+# doc 参照). 外部 DB 連携 S5: apps/banto-hub-sink (DB Sink サイドカー -
+# banto-tagclient SDK で Hub を購読し外部 PostgreSQL へ long スキーマで
+# バッチ INSERT する別プロセス. docs/banto-hub-external-db-design.md §5).
 [workspace]
 resolver = "2"
 members = [
@@ -39,6 +41,7 @@ members = [
     "apps/relay-wright/src-tauri",
     "apps/banto-hub/core",
     "apps/banto-hub/src-tauri",
+    "apps/banto-hub-sink",
 ]
 
 [workspace.package]

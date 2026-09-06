@@ -1,0 +1,70 @@
+[package]
+name = "banto-hub-sink"
+description = "S5 (docs/banto-hub-external-db-design.md §5): banto-hub DB Sink sidecar - subscribes to the Hub tag space through banto-tagclient and batch-INSERTs into an external PostgreSQL"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# 設計 §5.1「Hub からの値の取得は banto-tagclient SDK」: サイドカーは
+# REST/WS を直接叩かず、SDK の再接続・rebinding・publish gate に乗る。
+# SDK の最初の本番利用者（#123 で保留した組み込み確認を兼ねる）。
+banto-tagclient = { path = "../../crates/banto-tagclient" }
+# 設計 §5.3 の long スキーマへの multi-row INSERT と `SELECT ... LIMIT 0` の
+# テーブル検査。feature の選定理由（`tls-rustls-ring-native-roots`）は
+# `apps/banto-hub/core/Cargo.toml` の同じ依存のコメント（S0 の実測）参照 -
+# sqlite/macros/migrate はサイドカーには不要なので付けない。
+sqlx = { workspace = true, features = [
+    "runtime-tokio",
+    "postgres",
+    "tls-rustls-ring-native-roots",
+] }
+# `GET /api/sink/config` / `PUT /api/sink/status`（設計 §5.2）。SDK が既に
+# 同じ版を持っているので新規ノードは増えない。`json` feature は使わない
+# （本文は `serde_json` で組み立てて `body()` に渡す）。
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "signal",
+    "time",
+] }
+# exe 隣の `banto-hub-sink.toml`（設計 §5.6）。`deny_unknown_fields` で
+# 未知キーを拒否するため serde 統合が要る。Cargo.lock には既に 1.1.2 系が
+# （他の推移的依存経由で）存在するので新規バージョン系列は増えない。
+toml = "1"
+# サービスログ行のローカル時刻表示。`banto-tstore` が同じ理由・同じ
+# feature 構成でこのクレートを使っている（`crates/banto-tstore/Cargo.toml`
+# の依存コメント参照: Windows 専用製品なので `local-offset` の Unix 側の
+# 制約は当たらない）。`banto-tstore` 自体を依存に足すと sqlx-sqlite が
+# サイドカーの exe へ入ってしまうため、そちらは使わず `time` を直接持つ。
+time = { version = "0.3", default-features = false, features = ["local-offset"] }
+
+# 設計 §5.6「サービス起動順は Hub → sink」: banto-hub と**同じ**
+# `windows-service` クレート・同じ SCM パターン（`install`/`uninstall`/
+# `run-service` サブコマンド、`service_dispatcher::start` +
+# `service_control_handler::register`）を使う。banto-hub 側の理由は
+# `apps/banto-hub/core/Cargo.toml` の同名依存のコメント参照 - 非 Windows
+# ビルドにはこの依存もそれを使うコードも一切含まれない。
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8.1"
+
+[dev-dependencies]
+# 統合テスト（tests/sidecar.rs）が Hub を**プロセス内**に立てるため。
+# 本番のサイドカーは Hub に HTTP で繋ぐだけで、この依存は dev 限定
+# （配布バイナリには入らない）。
+banto-hub-core = { path = "../banto-hub/core" }
+banto-server = { workspace = true }
+banto-tags = { path = "../../crates/banto-tags" }
+banto-tstore = { path = "../../crates/banto-tstore" }
+banto-collect = { path = "../../crates/banto-collect" }
+banto-broker = { path = "../../crates/banto-broker" }
+axum = { workspace = true }
+tower = { workspace = true, features = ["util"] }
+sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "sqlite"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tempfile = { workspace = true }

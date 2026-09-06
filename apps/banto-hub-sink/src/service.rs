@@ -1,0 +1,296 @@
+//! Windows サービス化（設計 §5.1「Windows サービスとして Hub と同じ MSI で
+//! 登録し、Hub の後に起動する」・§5.6）。
+//!
+//! **banto-hub と同じクレート・同じパターン**を使う: `windows-service` の
+//! `service_dispatcher::start` + `service_control_handler::register`、
+//! サブコマンドは `install` / `uninstall` / `run-service`
+//! （`apps/banto-hub/core/src/bin/banto_hub/win_service.rs` と
+//! `apps/banto-hub/core/src/service_install.rs` の写し）。MSI への同梱
+//! （2 つ目のサービスの登録）は S6/S7 のスコープで、ここでは触らない。
+//!
+//! ## サービス名・起動種別
+//!
+//! サービス名 `BantoHubSink`・表示名「banto-hub DB Sink サイドカー」。
+//! 起動種別は banto-hub と同じ**手動開始**（`OnDemand`、T17-4 の
+//! 「OS 再起動だけで収集が始まらない」方針）。Hub が先に上がっている
+//! 必要はある（設計 §5.6「サービス起動順は Hub → sink」）が、上がって
+//! いなくてもサイドカーは待つだけなので `dependencies` には入れない -
+//! SCM の依存関係は「停止順序」も縛るため、Hub の再起動でサイドカーまで
+//! 巻き込まれる方が困る。
+//!
+//! ## 既にインストール済みなら何もしない
+//!
+//! banto-hub の `service_install::install` と同じ（アップグレード時に
+//! 既存の起動種別を上書きしないため）。
+//!
+//! **このファイル全体が Windows 専用** - `lib.rs` 側で
+//! `#[cfg(windows)] pub mod service;` としてしか読み込まれないので、
+//! 非 Windows ビルドにはこのコードも `windows-service` への依存も一切
+//! 含まれない。
+
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use windows_service::service::{
+    ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
+    ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
+};
+use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+use windows_service::service_manager::{ServiceManager as WinScm, ServiceManagerAccess};
+use windows_service::{define_windows_service, service_dispatcher};
+
+use crate::config::load_config;
+use crate::log::{self, log_err_line, log_line};
+use crate::run::{run, SidecarOptions};
+
+/// SCM 上のサービス名。
+pub const SERVICE_NAME: &str = "BantoHubSink";
+const SERVICE_DISPLAY_NAME: &str = "banto-hub DB Sink サイドカー";
+const SERVICE_DESCRIPTION: &str = "banto-hub のタグ値を外部 PostgreSQL へ記録します（DB Sink）。設定・監視は banto-hub 側にあります。docs/banto-hub-external-db-design.md §5 参照。";
+const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+
+/// `main.rs` のサブコマンド用リテラル（banto-hub と同じ綴り）。
+pub const INSTALL_ARG: &str = "install";
+pub const UNINSTALL_ARG: &str = "uninstall";
+pub const RUN_SERVICE_ARG: &str = "run-service";
+
+/// サービスログの出力先ディレクトリを上書きする環境変数。既定は exe と
+/// 同じディレクトリ（設定ファイルと同じ置き場所）。
+pub const ENV_LOG_DIR: &str = "BANTO_HUB_SINK_LOG_DIR";
+
+fn fail(message: &str) -> ! {
+    eprintln!("{message}");
+    eprintln!("banto-hub-sink: 管理者権限の PowerShell から実行してください");
+    std::process::exit(1);
+}
+
+/// Windows サービスとして登録する（管理者権限が必要）。
+pub fn install() {
+    let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
+    let service_manager = match WinScm::local_computer(None::<&str>, manager_access) {
+        Ok(manager) => manager,
+        Err(err) => fail(&format!(
+            "banto-hub-sink: Service Control Manager への接続に失敗しました: {err}"
+        )),
+    };
+
+    if service_manager
+        .open_service(SERVICE_NAME, ServiceAccess::QUERY_CONFIG)
+        .is_ok()
+    {
+        println!(
+            "banto-hub-sink: Windows サービス '{SERVICE_NAME}' は既に登録されています（既存の設定は変更していません）"
+        );
+        return;
+    }
+
+    let exe_path = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(err) => fail(&format!(
+            "banto-hub-sink: 自身の実行ファイルパスの取得に失敗しました: {err}"
+        )),
+    };
+
+    let service_info = ServiceInfo {
+        name: OsString::from(SERVICE_NAME),
+        display_name: OsString::from(SERVICE_DISPLAY_NAME),
+        service_type: SERVICE_TYPE,
+        start_type: ServiceStartType::OnDemand,
+        error_control: ServiceErrorControl::Normal,
+        executable_path: exe_path.clone(),
+        launch_arguments: vec![OsString::from(RUN_SERVICE_ARG)],
+        dependencies: vec![],
+        // LocalSystem として実行（banto-hub と同じ）。
+        account_name: None,
+        account_password: None,
+    };
+
+    let service = match service_manager.create_service(&service_info, ServiceAccess::CHANGE_CONFIG)
+    {
+        Ok(service) => service,
+        Err(err) => fail(&format!(
+            "banto-hub-sink: サービスの登録に失敗しました: {err}"
+        )),
+    };
+    if let Err(err) = service.set_description(SERVICE_DESCRIPTION) {
+        eprintln!("banto-hub-sink: サービスの説明文の設定に失敗しました（登録自体は完了）: {err}");
+    }
+
+    println!("banto-hub-sink: Windows サービス '{SERVICE_NAME}' を登録しました");
+    println!("banto-hub-sink:   表示名: {SERVICE_DISPLAY_NAME}");
+    println!("banto-hub-sink:   実行ファイル: {}", exe_path.display());
+    println!("banto-hub-sink:   起動種別: 手動（Demand）");
+    println!(
+        "banto-hub-sink: 設定ファイル（{}）を exe と同じディレクトリに置いてから `Start-Service {SERVICE_NAME}` してください",
+        crate::config::DEFAULT_CONFIG_FILE_NAME
+    );
+}
+
+/// サービス登録を解除する（管理者権限が必要）。実行中なら先に停止する。
+pub fn uninstall() {
+    let service_manager = match WinScm::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+    {
+        Ok(manager) => manager,
+        Err(err) => fail(&format!(
+            "banto-hub-sink: Service Control Manager への接続に失敗しました: {err}"
+        )),
+    };
+    let access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
+    let service = match service_manager.open_service(SERVICE_NAME, access) {
+        Ok(service) => service,
+        Err(err) => fail(&format!(
+            "banto-hub-sink: サービス '{SERVICE_NAME}' を開けませんでした: {err}"
+        )),
+    };
+    if let Ok(status) = service.query_status() {
+        if status.current_state != ServiceState::Stopped {
+            if let Err(err) = service.stop() {
+                eprintln!("banto-hub-sink: サービスの停止に失敗しました: {err}");
+            }
+        }
+    }
+    match service.delete() {
+        Ok(()) => {
+            println!("banto-hub-sink: Windows サービス '{SERVICE_NAME}' の登録を解除しました")
+        }
+        Err(err) => fail(&format!(
+            "banto-hub-sink: サービスの登録解除に失敗しました: {err}"
+        )),
+    }
+}
+
+/// SCM がサービス開始時に呼ぶ内部エントリポイント（`run-service`）。
+pub fn run_service_dispatcher() {
+    if let Err(err) = service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
+        eprintln!("banto-hub-sink: service_dispatcher の起動に失敗しました: {err}");
+        eprintln!(
+            "banto-hub-sink: 'run-service' は SCM 専用の内部エントリポイントです（`install` → `Start-Service` から起動してください）"
+        );
+        std::process::exit(1);
+    }
+}
+
+define_windows_service!(ffi_service_main, service_main);
+
+/// FFI 境界を越えるアンワインドを防ぐ（banto-hub の `service_main` と
+/// 同じ理由・同じ形）。
+fn service_main(arguments: Vec<OsString>) {
+    if let Err(err) = std::panic::catch_unwind(|| run_service_body(arguments)) {
+        eprintln!("banto-hub-sink: サービス本体が予期せず panic しました: {err:?}");
+    }
+}
+
+fn log_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os(ENV_LOG_DIR) {
+        return PathBuf::from(dir);
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn run_service_body(_arguments: Vec<OsString>) {
+    let log_path = log_dir().join(log::SERVICE_LOG_FILE_NAME);
+    if let Err(err) = log::enable_service_log_file(&log_path) {
+        eprintln!(
+            "banto-hub-sink: サービスログファイル {} を開けませんでした: {err}",
+            log_path.display()
+        );
+    }
+
+    let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+    let handler_notify = shutdown_notify.clone();
+    let event_handler = move |control_event| -> ServiceControlHandlerResult {
+        match control_event {
+            ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+            ServiceControl::Stop => {
+                handler_notify.notify_one();
+                ServiceControlHandlerResult::NoError
+            }
+            _ => ServiceControlHandlerResult::NotImplemented,
+        }
+    };
+
+    let status_handle = match service_control_handler::register(SERVICE_NAME, event_handler) {
+        Ok(handle) => handle,
+        Err(err) => {
+            log_err_line(&format!(
+                "banto-hub-sink: サービスコントロールハンドラの登録に失敗しました: {err}"
+            ));
+            return;
+        }
+    };
+
+    let report_status = |current_state: ServiceState, exit_code: ServiceExitCode| {
+        let controls_accepted = if current_state == ServiceState::Running {
+            ServiceControlAccept::STOP
+        } else {
+            ServiceControlAccept::empty()
+        };
+        if let Err(err) = status_handle.set_service_status(ServiceStatus {
+            service_type: SERVICE_TYPE,
+            current_state,
+            controls_accepted,
+            exit_code,
+            checkpoint: 0,
+            // 停止処理は残キューの flush（既定 5 秒）を含むので、SCM に
+            // 待ち時間のヒントを渡す（設計 §5.6）。
+            wait_hint: if current_state == ServiceState::StopPending {
+                Duration::from_secs(15)
+            } else {
+                Duration::default()
+            },
+            process_id: None,
+        }) {
+            log_err_line(&format!(
+                "banto-hub-sink: サービス状態の報告に失敗しました: {err}"
+            ));
+        }
+    };
+
+    // 設定ファイルが無い/壊れているのは復旧不能なので、SCM へ失敗を報告
+    // して終わる（Hub 未起動のような「待てば直る」状態とは区別する）。
+    let config = match load_config() {
+        Ok(config) => config,
+        Err(err) => {
+            log_err_line(&format!("banto-hub-sink: {err}"));
+            report_status(ServiceState::Stopped, ServiceExitCode::ServiceSpecific(2));
+            return;
+        }
+    };
+
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            log_err_line(&format!(
+                "banto-hub-sink: tokio ランタイムの構築に失敗しました: {err}"
+            ));
+            report_status(ServiceState::Stopped, ServiceExitCode::ServiceSpecific(1));
+            return;
+        }
+    };
+
+    report_status(ServiceState::Running, ServiceExitCode::Win32(0));
+    log_line("banto-hub-sink: Windows サービスとして起動しました");
+
+    let notify = shutdown_notify.clone();
+    let result = runtime.block_on(async move {
+        run(config, SidecarOptions::default(), async move {
+            notify.notified().await;
+        })
+        .await
+    });
+    if let Err(err) = result {
+        log_err_line(&format!(
+            "banto-hub-sink: 実行を開始できませんでした: {err}"
+        ));
+        report_status(ServiceState::Stopped, ServiceExitCode::ServiceSpecific(1));
+        return;
+    }
+
+    log_line("banto-hub-sink: Windows サービスを停止しました");
+    report_status(ServiceState::Stopped, ServiceExitCode::Win32(0));
+}
