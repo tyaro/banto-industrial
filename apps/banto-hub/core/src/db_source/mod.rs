@@ -132,6 +132,17 @@ pub(crate) fn pg_connect_options(
 /// DB Source のエンジン本体（このモジュールの doc comment「エンジンの
 /// ライフサイクル」節）。`crate::computed::ComputedEngine` と同じく
 /// `Arc` で共有され、[`Self::commit`] が唯一の書き込み口。
+///
+/// **並行呼び出しは想定していない**: [`Self::start`]・[`Self::stop`]・
+/// [`Self::commit`] は互いに排他される前提で書かれており、特に
+/// [`Self::stop`] の（内側 task の）join と Bad 書き込みは、その途中に
+/// 別スレッドから [`Self::start`] が割り込まないことに依存している。
+/// banto-hub では `crate::controller::CollectionController` が自分の
+/// ロック（`start_locked`/`stop_locked`）越しにしか `start`/`stop` を
+/// 呼ばず、`commit` は `crate::hub::CollectorManager::commit_catalog`
+/// （および同じロック配下の rebuild 経路）経由でしか呼ばないので、この
+/// 前提はこの2つの呼び出し元だけで担保されている - 将来もう1つ呼び出し元
+/// を追加するときは、この直列化を崩さないこと。
 pub struct DbSourceEngine {
     store: Arc<ServerTagStore>,
     status: Arc<DbSourceStatusStore>,

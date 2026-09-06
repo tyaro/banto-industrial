@@ -56,7 +56,7 @@ use tokio::task::{JoinError, JoinHandle};
 // ので仮想時計の恩恵が無いという違い。
 use tokio::time::Instant;
 
-use super::status::DbSourceStatusStore;
+use super::status::{DbConnectionState, DbSourceStatusStore};
 use crate::diag_log::DiagLog;
 
 use std::sync::Arc;
@@ -213,6 +213,16 @@ pub(crate) async fn supervise<F, Fut>(
         ctx.status.update_connection(ctx.connection_id, |status| {
             status.restarts = status.restarts.saturating_add(1);
             status.last_restart_reason = Some(reason.clone());
+            // task が死んでいる間は接続もタスクも実在しないので、それまで
+            // `connected` のままだった状態表示を `backoff` に落とす（さもな
+            // いと `GET /api/status` がバックオフ待ちの間も `connected` を
+            // 報告してしまう - Copilot 指摘、PR #303）。内側が再接続に成功
+            // すれば `run_connection` が `Connected` へ進め、`last_error` も
+            // 消す（`crate::db_source::task`）。`consecutive_failures` は
+            // 「DB へ繋がらない」という別の失敗種別のカウンタなので、ここ
+            // では触らない - タスクの panic/異常終了と DB 接続失敗は別物。
+            status.state = DbConnectionState::Backoff;
+            status.last_error = Some(reason.clone());
         });
         // §4.8「状態 API に `restarts` 回数と最後の理由を出す」。ログは
         // 1回の異常終了につき1行だけ（`crate::db_source::task` の
@@ -279,6 +289,10 @@ mod tests {
         status.snapshot()[0].restarts
     }
 
+    fn state(status: &DbSourceStatusStore) -> DbConnectionState {
+        status.snapshot()[0].state
+    }
+
     /// §6-17「supervisor でバックオフ付き再生成」: 内側が panic するたび
     /// 作り直され、待ち時間は `backoff_delay`（1s → 2s → 4s …）どおり。
     ///
@@ -290,6 +304,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_panicking_task_is_respawned_with_the_documented_backoff() {
         let status = seeded_status();
+        // 落ちる前は `connected` だったことにする - Copilot 指摘（PR #303）の
+        // 再現条件そのもの: バックオフに入ってもここが `connected` のまま
+        // だと `GET /api/status` が「task も DB セッションも無いのに
+        // connected」と嘘をつく。
+        status.update_connection(1, |s| s.state = DbConnectionState::Connected);
         let calls = Arc::new(AtomicU32::new(0));
         let (cancel_tx, cancel_rx) = watch::channel(false);
 
@@ -313,6 +332,21 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(restarts(&status), 1);
+        // バックオフ待機中は `backoff` へ落ち、`last_error` に再起動理由が
+        // 出る - task も DB セッションも実在しないので `connected` を報告
+        // し続けてはいけない（Copilot 指摘、PR #303）。内側がまだ一度も
+        // 繋ぎ直せていないので `Connected` はここでは絶対に出ない。
+        assert_eq!(state(&status), DbConnectionState::Backoff);
+        let last_error = status.snapshot()[0]
+            .last_error
+            .clone()
+            .expect("backoff must record the restart reason as last_error");
+        assert!(last_error.contains("boom #1"), "{last_error}");
+        assert_eq!(
+            Some(last_error),
+            status.snapshot()[0].last_restart_reason.clone(),
+            "last_error mirrors last_restart_reason while backing off"
+        );
 
         // t=2.5s: 1s 後に2回目が走って panic し、いまは 2 秒のバックオフ中。
         tokio::time::sleep(Duration::from_millis(2_000)).await;
@@ -337,6 +371,16 @@ mod tests {
             .expect("a restart must record its reason");
         assert!(reason.contains("panic"), "{reason}");
         assert!(reason.contains("boom #3"), "{reason}");
+        // task の再起動と DB 接続の成否は別カウンタ - ここでは一度も DB へ
+        // 接続を試みていない（偽の future が panic するだけ）ので、
+        // `consecutive_failures` は触られていないはず。
+        assert_eq!(status.snapshot()[0].consecutive_failures, 0);
+        // 4回目は park する = 内側がまだ「繋がった」を報告していないので、
+        // supervisor が `state` を `Connected` に進めることは一切ない
+        // （`run_connection` が実際に繋がったときだけ `Connected` にする -
+        // このモジュール doc comment、supervisor 自身は状態を Connected に
+        // 進める権限を持たない）。
+        assert_eq!(state(&status), DbConnectionState::Backoff);
 
         cancel_tx.send_replace(true);
         handle
