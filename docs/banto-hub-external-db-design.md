@@ -1,7 +1,7 @@
 # banto-hub 外部 DB 連携 設計: DB Source（#228）と DB Sink（#229）
 
 作成日: 2026-09-06
-状態: **オーナー決定済み（2026-09-06、§6 の 17 項目）・S0〜S5 は完了**（S1 = #299 / #300、S2 = #301、S2b = #303、S3 = #310、S4 = #305、S5 = #306、docs #302 / #304 / #307 / #308）。**残りは S6（Sink の UI とシェルのサービス一覧、実装中）・S7（実 DB 検証）**。Sink は別プロセスのサイドカー `apps/banto-hub-sink`（§5、2026-09-06 決定）。コード調査（§3）は 2026-09-06 の main（`9c26b3a`、toolchain 1.98.1）に対して実施済み。
+状態: **オーナー決定済み（2026-09-06、§6 の 17 項目）・S0〜S6 は完了**（S1 = #299 / #300、S2 = #301、S2b = #303、S3 = #310、S4 = #305、S5 = #306、S6 = #313、docs #302 / #304 / #307 / #308 / #312）。**残りは S7（実 DB 検証、オーナー同席。手順は [external-db-test-2026-09.md](external-db-test-2026-09.md)）**。S6 の申し送り: `BantoHubSink` への Operators 向けサービス ACL 付与（追従 PR）、シェルからの start / stop は実サービス未検証（S7 で確認）。Sink は別プロセスのサイドカー `apps/banto-hub-sink`（§5、2026-09-06 決定）。コード調査（§3）は 2026-09-06 の main（`9c26b3a`、toolchain 1.98.1）に対して実施済み。
 対象: Issue [#228](https://github.com/tyaro/banto-industrial/issues/228)（外部 RDB の値をタグ空間へ取り込む Source）と [#229](https://github.com/tyaro/banto-industrial/issues/229)（タグ値を外部 RDB へ保存する Sink / Logger）。**2 件はペアで 1 設計**とし、DB 接続エンティティを共有する。
 
 関連: [tag-server-design.md](tag-server-design.md)（タグ空間・書き込み安全の一次ソース。§2 非スコープの「ロガー作らない」決定を本書 §2.1 で扱う）、[banto-hub-t20-design.md](banto-hub-t20-design.md)（値表現と read-on-demand の先例）、[banto-hub-t21-design.md](banto-hub-t21-design.md)（構成操作の MCP と監査の型）、[plan.md](plan.md) §1（「外部時系列DB読み出し・保存」は 3〜4 案件で再利用される共通資産）。
@@ -245,7 +245,7 @@ ts (timestamptz) | tag_id (bigint) | external_name (text) | value (double precis
 | S3    | **完了（#310）** Source の UI / CSV / MCP: Drawer の DB フィールド、列名候補の提示、`db` タグの登録 UI、E2E                                                                | 手動 smoke 手順を docs に追加                                                                                  |
 | S4    | **完了（#305）** Sink の Hub 側: `logger_groups` テーブルと CRUD（REST / MCP）、`GET /api/sink/config`、`PUT /api/sink/status`、状態 API の sink 節、config パッケージ往復 | （実装中）                                                                                                     |
 | S5    | **完了（#306）** サイドカー本体 `apps/banto-hub-sink`: SDK 購読、long INSERT、bounded queue、バックオフ、テーブル検査、status push、exe 隣 toml、SCM サービス化と MSI 登録 | 統合テスト: interval / on_change・DB 停止中のキュー上限・復帰後の flush・停止時の flush・Hub 再起動への追従    |
-| S6    | UI: logger group 画面、推奨 DDL 表示、状態画面の sink 節、デスクトップシェルのサービス一覧（Hub / sink の SCM 状態と起動停止）                                             | E2E と Windows 実機での手動確認                                                                                |
+| S6    | **完了（#313）** UI: logger group 画面、推奨 DDL 表示、状態画面の sink 節、デスクトップシェルのサービス一覧（Hub / sink の SCM 状態と起動停止）                            | E2E と Windows 実機での手動確認                                                                                |
 | S7    | 実 DB 検証: 顧客相当の PostgreSQL（別マシン・LAN 越し）で Source / Sink を 24 h 連続動作。切断・再接続・DB 再起動・sink 単独の停止と再起動                                 | 結果を real-machine 系 docs に記録                                                                             |
 
 S0 / S1 / S4 は実機不要。S2 / S5 の統合テストは CI で PostgreSQL のサービスコンテナを使う（GitHub Actions の `services:`）。S6 のシェル部分は Windows 実機が要る。着手順は S0 → S1 → S2 → S2b → S4 → S5 → S3 → S6 → S7（Source の UI より先に Sink の骨格を通し、SDK の本番利用を早く始める）。
