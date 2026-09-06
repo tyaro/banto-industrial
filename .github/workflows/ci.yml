@@ -88,8 +88,9 @@ jobs:
   # 外部 DB 連携 S2（docs/banto-hub-external-db-design.md §7「S2 / S5 の統合
   # テストは CI で PostgreSQL のサービスコンテナを使う」）。上の `rust` ジョブ
   # は windows-latest で、GitHub Actions のサービスコンテナは Linux ランナー
-  # でしか使えないため、DB Source の実 PostgreSQL テストだけを ubuntu-latest
-  # の別ジョブに切り出す。`BANTO_TEST_PG_URL` が無いときは各テストが
+  # でしか使えないため、DB Source（S2）と DB Sink サイドカー（S5、
+  # `apps/banto-hub-sink`）の実 PostgreSQL テストを ubuntu-latest の別ジョブへ
+  # 切り出す。`BANTO_TEST_PG_URL` が無いときは各テストが
   # `eprintln!("skipped: ...")` で素通りするので、このジョブが無くても
   # `rust` ジョブは緑のまま（ゲートの意味は
   # apps/banto-hub/core/tests/db_source.rs のモジュール doc 参照）。
@@ -127,6 +128,13 @@ jobs:
       # 含む - こちらも BANTO_TEST_PG_URL があるときだけ実 DB を触る）。
       - name: test (db_source unit)
         run: cargo test -p banto-hub-core --lib db_source
+      # 外部 DB 連携 S5（サイドカー `banto-hub-sink`）: 単体テストと、
+      # プロセス内の Hub + 実 PostgreSQL に対する統合テスト
+      # （tests/sidecar.rs - interval/on_change・テーブル消失からの復帰・
+      # 停止時の最終 status push）。banto-hub-core を dev-dependency として
+      # ビルドするので、上の2ステップとキャッシュを共有できるこの位置に置く。
+      - name: test (banto-hub-sink)
+        run: cargo test -p banto-hub-sink
 
   e2e:
     name: E2E (Playwright smoke)
