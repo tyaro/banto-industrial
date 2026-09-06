@@ -101,8 +101,7 @@ async function cleanupFixtures(
 	}
 }
 
-test.describe
-	.serial('banto-hub postgres（DB Source）グループ作成・db タグ登録 (S3)', () => {
+test.describe.serial('banto-hub postgres（DB Source）グループ作成・db タグ登録 (S3)', () => {
 	let adminPage: Page;
 	let adminHeaders: Record<string, string>;
 	let pgConnectionId: number;
@@ -181,7 +180,9 @@ test.describe
 		await expect(wizard.getByRole('button', { name: '次へ', exact: true })).toBeEnabled();
 		await wizard.getByRole('button', { name: '次へ', exact: true }).click();
 
-		await expect(wizard.getByText(`SELECT id, ${RESULT_COLUMN}, running FROM sensors`)).toBeVisible();
+		await expect(
+			wizard.getByText(`SELECT id, ${RESULT_COLUMN}, running FROM sensors`)
+		).toBeVisible();
 
 		const created = adminPage.waitForResponse(
 			(r) => r.url().includes('/api/collection-groups') && r.request().method() === 'POST'
