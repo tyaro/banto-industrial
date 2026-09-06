@@ -19,6 +19,18 @@
 		id: string;
 		label: string;
 		onSelect: () => void;
+		/**
+		 * S1（docs/banto-hub-external-db-design.md §3 項目13、実装指示4）:
+		 * `true`のとき項目は選択不可（ボタンに`disabled`属性を付け、
+		 * クリック・Enter/Spaceのどちらでも`onSelect`を呼ばない）。項目
+		 * 自体は表示したまま無効化する - 「なぜ無いのか」を`title`
+		 * ツールチップで示すため（`tagTreeContextMenu.ts`の
+		 * `createGroup`/postgres接続 参照）。既定`false`（他の呼び出し元の
+		 * 挙動は変えない）。
+		 */
+		disabled?: boolean;
+		/** `disabled`が`true`のときのツールチップ文言。ネイティブ`title`属性で出す。 */
+		title?: string;
 	}
 
 	interface Props {
@@ -50,17 +62,38 @@
 	function focusFirst(node: HTMLDivElement): void {
 		menuEl = node;
 		clampPosition(node);
-		itemEls[0]?.focus();
+		// S1: 先頭項目が無効化されている場合（postgres接続配下の「収集
+		// グループを作成」）にそのまま`itemEls[0]?.focus()`すると、
+		// ネイティブ`disabled`ボタンは絶対にフォーカスを受け取れないため
+		// メニュー内のどこにもフォーカスが移らず、キーボード操作（矢印
+		// キー・Escape - このコンポーネントのkeydownハンドラはメニュー内の
+		// フォーカス経由でしか発火しない）が丸ごと効かなくなる。
+		// `focusIndex`（下）に「無効項目は飛ばす」ロジックを持たせ、ここも
+		// それに委ねる。
+		focusIndex(0);
 	}
 
 	function focusIndex(index: number): void {
 		const count = items.length;
 		if (count === 0) return;
-		activeIndex = ((index % count) + count) % count;
+		let next = ((index % count) + count) % count;
+		// S1: 無効化された項目はフォーカス先の候補から外す（上の
+		// `focusFirst`のコメント参照）。全項目が無効ということは現状無い
+		// 前提（`createGroup`だけが無効化されうる - `tagTreeContextMenu.ts`
+		// 参照）だが、念のため`count`回で打ち切る。
+		for (let i = 0; i < count && items[next]?.disabled; i++) {
+			next = (next + 1) % count;
+		}
+		activeIndex = next;
 		itemEls[activeIndex]?.focus();
 	}
 
 	function activate(item: ContextMenuItem): void {
+		// S1: 無効化された項目はキーボード操作（Enter/Space、下の
+		// handleKeydown参照）経由でも実行できない - ネイティブ`disabled`
+		// 属性がクリック/フォーカスは防ぐが、`activeIndex`経由のEnterは
+		// このガードが無いと呼べてしまうため。
+		if (item.disabled) return;
 		item.onSelect();
 		onClose();
 	}
@@ -123,7 +156,10 @@
 		<button
 			type="button"
 			role="menuitem"
+			aria-disabled={item.disabled}
+			title={item.title}
 			tabindex={i === activeIndex ? 0 : -1}
+			disabled={item.disabled}
 			bind:this={itemEls[i]}
 			onmouseenter={() => (activeIndex = i)}
 			onclick={() => activate(item)}
@@ -169,6 +205,17 @@
 		background: color-mix(in srgb, var(--banto-primary) 12%, transparent);
 		color: var(--banto-primary);
 		outline: none;
+	}
+
+	.context-menu button:disabled {
+		color: var(--banto-text-muted);
+		cursor: not-allowed;
+	}
+
+	.context-menu button:disabled:hover,
+	.context-menu button:disabled:focus-visible {
+		background: transparent;
+		color: var(--banto-text-muted);
 	}
 
 	:global([data-banto-preset='glass']) .context-menu button:hover,

@@ -205,7 +205,10 @@ describe('applyConfigPackage: 収集稼働中の QueuedWhileRunningError を検�
 				unitId: 1,
 				enabled: true,
 				simulation: false,
-				wordOrder: 'low_high'
+				wordOrder: 'low_high',
+				database: null,
+				username: null,
+				passwordSet: false
 			}
 		]);
 		vi.mocked(updatePlcConnection).mockResolvedValue({
@@ -217,7 +220,10 @@ describe('applyConfigPackage: 収集稼働中の QueuedWhileRunningError を検�
 			unitId: 1,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'low_high'
+			wordOrder: 'low_high',
+			database: null,
+			username: null,
+			passwordSet: false
 		});
 		vi.mocked(listCollectionGroups).mockResolvedValue([
 			{
@@ -278,7 +284,10 @@ describe('applyConfigPackage: 全件成功する通常の import（回帰ガー�
 			unitId: 1,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'low_high'
+			wordOrder: 'low_high',
+			database: null,
+			username: null,
+			passwordSet: false
 		});
 		vi.mocked(createCollectionGroup).mockResolvedValue({
 			id: 1,
@@ -337,7 +346,10 @@ describe('applyConfigPackage: 全件成功する通常の import（回帰ガー�
 			unitId: 1,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'low_high'
+			wordOrder: 'low_high',
+			database: null,
+			username: null,
+			passwordSet: false
 		});
 		vi.mocked(createCollectionGroup).mockResolvedValue({
 			id: 1,
@@ -383,5 +395,70 @@ describe('applyConfigPackage: 全件成功する通常の import（回帰ガー�
 		expect(createTag).toHaveBeenCalledWith(
 			expect.objectContaining({ name: 'tag1', stringEncoding: 'shift_jis' })
 		);
+	});
+});
+
+// --- S1（docs/banto-hub-external-db-design.md §4.1・§2.2、実装指示5）:
+// 構成パッケージは postgres 接続のパスワードを一切含まない
+// （`configPackage.test.ts`側で export 自体を固定済み）ので、import 経路
+// （`applyConfigPackage`）が実際に「パスワード無しで作成する」呼び出しに
+// なることをここで固定する。
+
+describe('applyConfigPackage: postgres（DB Source）接続の import はパスワード無しで作成する', () => {
+	it('createPlcConnection にはパッケージが持つ database/username だけを渡し、password キー自体を渡さない', async () => {
+		const pkgWithDbConnection: ConfigPackage = {
+			...pkg,
+			plcConnections: [
+				{
+					name: 'pg1',
+					protocol: 'postgres',
+					host: '10.0.0.5',
+					port: 5432,
+					unitId: 1,
+					enabled: true,
+					simulation: false,
+					wordOrder: 'low_high',
+					database: 'appdb',
+					username: 'appuser'
+				}
+			],
+			// このパッケージの postgres 接続にグループを繋げると
+			// `applyConfigPackageInner`が接続解決に成功してしまい紛らわしい
+			// ので、この回帰テストでは接続だけを見る（グループ/タグは空）。
+			collectionGroups: [],
+			tags: []
+		};
+		vi.mocked(createPlcConnection).mockResolvedValue({
+			id: 1,
+			name: 'pg1',
+			protocol: 'postgres',
+			host: '10.0.0.5',
+			port: 5432,
+			unitId: 1,
+			enabled: true,
+			simulation: false,
+			wordOrder: 'low_high',
+			database: 'appdb',
+			username: 'appuser',
+			passwordSet: false
+		});
+
+		await applyConfigPackage(pkgWithDbConnection);
+
+		expect(createPlcConnection).toHaveBeenCalledTimes(1);
+		const calledWith = vi.mocked(createPlcConnection).mock.calls[0][0];
+		expect(calledWith).toEqual({
+			name: 'pg1',
+			protocol: 'postgres',
+			host: '10.0.0.5',
+			port: 5432,
+			unitId: 1,
+			enabled: true,
+			simulation: false,
+			wordOrder: 'low_high',
+			database: 'appdb',
+			username: 'appuser'
+		});
+		expect(calledWith).not.toHaveProperty('password');
 	});
 });

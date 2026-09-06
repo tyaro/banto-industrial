@@ -73,8 +73,11 @@
 		deletePlcConnection,
 		isQueuedWhileRunningError,
 		testPlcConnection,
+		testSavedPlcConnection,
 		updatePlcConnection,
+		POSTGRES_PROTOCOL,
 		WORD_ORDER_OPTIONS,
+		type DbConnectionTestOutcome,
 		type PlcConnection,
 		type PlcConnectionTestResult
 	} from '$lib/banto/tagRegistryAdmin';
@@ -86,6 +89,7 @@
 		formToConnectionInput,
 		isDefaultPortForProtocol,
 		nextConnectionName,
+		validatePostgresFields,
 		type PlcConnectionFormState
 	} from '$lib/banto/plcConnectionForm';
 	import {
@@ -187,11 +191,26 @@
 		return { testing: false, result: null };
 	}
 
+	/**
+	 * S1（docs/banto-hub-external-db-design.md §4.6）: 保存済み postgres
+	 * 接続専用の接続テスト状態。`TestState`（T12、PLC の保存前テスト）とは
+	 * 別に持つ - 対象エンドポイントも応答形も違う
+	 * （`testSavedPlcConnection`/{@link DbConnectionTestOutcome}）ため。
+	 */
+	interface DbTestState {
+		testing: boolean;
+		result: DbConnectionTestOutcome | null;
+	}
+	function blankDbTestState(): DbTestState {
+		return { testing: false, result: null };
+	}
+
 	let form: PlcConnectionFormState = $state(blankConnectionForm());
 	let errors: Record<string, string> = $state({});
 	let saving = $state(false);
 	let deleting = $state(false);
 	let testState: TestState = $state(blankTestState());
+	let dbTestState: DbTestState = $state(blankDbTestState());
 	let step: 1 | 2 | 3 = $state(1);
 	/**
 	 * 現在のポートがまだ「プロトコルの既定値のまま（未編集）」かどうか。
@@ -247,6 +266,7 @@
 		}
 		errors = {};
 		testState = blankTestState();
+		dbTestState = blankDbTestState();
 		step = 1;
 		portTouched = !isDefaultPortForProtocol(form.port, form.protocol);
 
@@ -308,7 +328,13 @@
 		host: 2,
 		port: 2,
 		unitId: 2,
-		wordOrder: 2
+		wordOrder: 2,
+		// S1（docs/banto-hub-external-db-design.md §4.1）: postgres 接続の
+		// 追加フィールドも「2. プロトコルと接続先」ステップに置く
+		// （destinationFields スニペット内、下記マークアップ参照）。
+		database: 2,
+		username: 2,
+		password: 2
 	};
 
 	function stepForFieldErrors(fieldErrors: Record<string, string>): 1 | 2 | 3 | null {
@@ -321,7 +347,18 @@
 	}
 
 	const canAdvanceFromStep1 = $derived(form.name.trim() !== '');
-	const canAdvanceFromStep2 = $derived(form.host.trim() !== '');
+	/**
+	 * S1: postgres 接続は`host`に加えて`database`/`username`も必須
+	 * （サーバー側`validate_plc_connection_input`と同じ要件 -
+	 * `validatePostgresFields`の doc comment参照）。ここでは「次へ」ボタンの
+	 * 活性化判定だけを軽く行い、実際のフィールドごとのエラー文言は
+	 * 送信時（`handleCreate`/`handleSave`）の`validatePostgresFields`が出す。
+	 */
+	const canAdvanceFromStep2 = $derived(
+		form.host.trim() !== '' &&
+			(form.protocol !== POSTGRES_PROTOCOL ||
+				(form.database.trim() !== '' && form.username.trim() !== ''))
+	);
 
 	function goNext(): void {
 		if (step === 1 && canAdvanceFromStep1) step = 2;
@@ -358,7 +395,51 @@
 		}
 	}
 
+	/**
+	 * S1（docs/banto-hub-external-db-design.md §4.6）:
+	 * `POST /api/plc-connections/{id}/test`（保存済み postgres 接続専用）を
+	 * 呼ぶ。**未保存の接続では呼ばない** - マークアップ側で`connection`が
+	 * `null`のときはボタン自体を disabled にし、「保存後にテストできます」
+	 * のヒントを出す（実装指示3）。フォームの現在入力値ではなく、常に
+	 * 保存済みの値（サーバー側で再取得）をテストする点が T12 の
+	 * `runConnectionTest`（フォームの現在値をそのまま送る）と違う - 設計上
+	 * postgres 接続はパスワードをフォームに再表示しないため、そもそも
+	 * フォームの現在値だけではテストしようがない。
+	 */
+	async function runDbConnectionTest(): Promise<void> {
+		if (!connection || dbTestState.testing) return; // 多重クリック防止・未保存ガード
+		dbTestState.testing = true;
+		dbTestState.result = null;
+		try {
+			dbTestState.result = await testSavedPlcConnection(connection.id);
+		} catch (err) {
+			// 401/403・CSRF拒否・ネットワークエラー・400（postgres以外）など
+			// （`ok: false` はここに来ない通常応答 — 上の try 内で result に
+			// そのまま入る）。
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			dbTestState.testing = false;
+		}
+	}
+
+	/**
+	 * S1: `validatePostgresFields`（サーバー側 postgres 必須ルールのミラー）
+	 * を送信前に走らせる。エラーがあれば`errors`へ積んで対応ステップへ誘導
+	 * し、`false`を返してAPI呼び出し自体を止める - サーバーの422を待たず
+	 * クライアント側で弾く（実装指示2「クライアント側検証はサーバー側の
+	 * ルールを反映する」）。
+	 */
+	function validateBeforeSubmit(): boolean {
+		const fieldErrors = validatePostgresFields(form);
+		if (Object.keys(fieldErrors).length === 0) return true;
+		errors = fieldErrors;
+		const target = stepForFieldErrors(fieldErrors);
+		if (target !== null) step = target;
+		return false;
+	}
+
 	async function handleCreate(): Promise<void> {
+		if (!validateBeforeSubmit()) return;
 		saving = true;
 		errors = {};
 		try {
@@ -387,6 +468,7 @@
 
 	async function handleSave(): Promise<void> {
 		if (!connection) return;
+		if (!validateBeforeSubmit()) return;
 		saving = true;
 		errors = {};
 		try {
@@ -440,7 +522,7 @@
 	}
 
 	function isBusy(): boolean {
-		return saving || deleting || testState.testing;
+		return saving || deleting || testState.testing || dbTestState.testing;
 	}
 
 	/** 処理中は ×・Esc・オーバーレイクリックでの close を抑止する。 */
@@ -483,40 +565,98 @@
 				oninput={onPortInput}
 				disabled={readOnly}
 			/>
+			{#if form.protocol === POSTGRES_PROTOCOL}
+				<span class="hint">PostgreSQL の待受ポート（既定 5432）。</span>
+			{/if}
 			{#if errors.port}<span class="err">{errors.port}</span>{/if}
 		</label>
-		<label class="field">
-			ユニットID
-			<input type="number" min="0" max="255" bind:value={form.unitId} disabled={readOnly} />
-			<span class="hint">Modbus 用のスレーブID（0〜255）。SLMP では未使用（既定 1 のまま）。</span>
-			{#if errors.unitId}<span class="err">{errors.unitId}</span>{/if}
-		</label>
-		{#if form.protocol === 'slmp'}
+		{#if form.protocol === POSTGRES_PROTOCOL}
+			<!--
+				S1（docs/banto-hub-external-db-design.md §4.1）: postgres 接続
+				専用フィールド。unitId/wordOrder/simulation は PLC 固有の意味
+				しか持たないため（後述の {:else} 分岐）ここでは出さない。
+			-->
 			<label class="field">
-				ワード順
-				<select bind:value={form.wordOrder} disabled={readOnly}>
-					{#each WORD_ORDER_OPTIONS as opt (opt.value)}
-						<option value={opt.value}>{opt.label}</option>
-					{/each}
-				</select>
-				<span class="hint">
-					32bit値（u32/f32等）の上位/下位ワードの並び。機種のマニュアルで確認してください —
-					間違えると値が化けます（上位/下位が入れ替わります）。
-				</span>
-				{#if errors.wordOrder}<span class="err">{errors.wordOrder}</span>{/if}
+				データベース
+				<input type="text" bind:value={form.database} placeholder="appdb" disabled={readOnly} />
+				{#if errors.database}<span class="err">{errors.database}</span>{/if}
 			</label>
+			<label class="field">
+				ユーザー名
+				<input
+					type="text"
+					bind:value={form.username}
+					placeholder="appuser"
+					disabled={readOnly}
+					autocomplete="off"
+				/>
+				{#if errors.username}<span class="err">{errors.username}</span>{/if}
+			</label>
+			{#if !readOnly}
+				{#if isCreate}
+					<label class="field">
+						パスワード
+						<input type="password" bind:value={form.password} autocomplete="new-password" />
+						<span class="hint">空欄のままでも作成できます（後から設定できます）。</span>
+					</label>
+				{:else}
+					<div class="field password-status">
+						パスワード: {connection?.passwordSet ? '設定済み' : '未設定'}
+					</div>
+					<label class="field">
+						新しいパスワード（変更する場合のみ入力）
+						<input
+							type="password"
+							bind:value={form.password}
+							placeholder="変更しない"
+							autocomplete="new-password"
+							disabled={form.clearPassword}
+						/>
+					</label>
+					<label class="field checkbox">
+						<input type="checkbox" bind:checked={form.clearPassword} />
+						パスワードを消去する
+					</label>
+				{/if}
+				{#if errors.password}<span class="err">{errors.password}</span>{/if}
+			{/if}
+		{:else}
+			<label class="field">
+				ユニットID
+				<input type="number" min="0" max="255" bind:value={form.unitId} disabled={readOnly} />
+				<span class="hint">Modbus 用のスレーブID（0〜255）。SLMP では未使用（既定 1 のまま）。</span
+				>
+				{#if errors.unitId}<span class="err">{errors.unitId}</span>{/if}
+			</label>
+			{#if form.protocol === 'slmp'}
+				<label class="field">
+					ワード順
+					<select bind:value={form.wordOrder} disabled={readOnly}>
+						{#each WORD_ORDER_OPTIONS as opt (opt.value)}
+							<option value={opt.value}>{opt.label}</option>
+						{/each}
+					</select>
+					<span class="hint">
+						32bit値（u32/f32等）の上位/下位ワードの並び。機種のマニュアルで確認してください —
+						間違えると値が化けます（上位/下位が入れ替わります）。
+					</span>
+					{#if errors.wordOrder}<span class="err">{errors.wordOrder}</span>{/if}
+				</label>
+			{/if}
 		{/if}
 		<label class="field checkbox">
 			<input type="checkbox" bind:checked={form.enabled} disabled={readOnly} />
 			有効
 		</label>
-		<label class="field checkbox">
-			<input type="checkbox" bind:checked={form.simulation} disabled={readOnly} />
-			シミュレーションモード
-		</label>
-		<span class="hint sim-hint">
-			実PLCの代わりに内蔵シミュレータに接続します（開発・検証用）。本番運用では有効にしないでください。
-		</span>
+		{#if form.protocol !== POSTGRES_PROTOCOL}
+			<label class="field checkbox">
+				<input type="checkbox" bind:checked={form.simulation} disabled={readOnly} />
+				シミュレーションモード
+			</label>
+			<span class="hint sim-hint">
+				実PLCの代わりに内蔵シミュレータに接続します（開発・検証用）。本番運用では有効にしないでください。
+			</span>
+		{/if}
 	</div>
 {/snippet}
 
@@ -540,6 +680,44 @@
 	</div>
 {/snippet}
 
+{#snippet dbTestConnectionBlock()}
+	<!--
+		S1（docs/banto-hub-external-db-design.md §4.6、実装指示3）: 保存済み
+		postgres 接続専用の接続テスト。T12 の`testConnectionBlock`（保存前の
+		フォーム値をそのまま送る）とは違い、`POST /api/plc-connections/{id}
+		/test`は保存済みの行しか対象にできない（サーバー側がパスワードを
+		DBから読み直す設計 - パスワードをフォームへ再表示しないため）ので、
+		未保存（新規作成ウィザード中）はボタンを disabled にし「保存後に
+		テストできます」のヒントを出す。
+	-->
+	<div class="test-connection">
+		<button
+			type="button"
+			class="test-btn"
+			onclick={runDbConnectionTest}
+			disabled={!connection || dbTestState.testing}
+		>
+			{#if dbTestState.testing}<span class="spinner" aria-hidden="true"></span>{/if}
+			接続テスト
+		</button>
+		{#if !connection}
+			<span class="hint">保存後にテストできます</span>
+		{:else if dbTestState.testing}
+			<span class="test-result testing">テスト中…</span>
+		{:else if dbTestState.result}
+			{#if dbTestState.result.ok}
+				<span class="test-result ok"
+					>接続成功{dbTestState.result.serverVersion
+						? `（${dbTestState.result.serverVersion}）`
+						: ''}</span
+				>
+			{:else}
+				<span class="test-result error">{dbTestState.result.error ?? '接続に失敗しました'}</span>
+			{/if}
+		{/if}
+	</div>
+{/snippet}
+
 {#snippet confirmSummary()}
 	<dl class="summary">
 		<dt>名前</dt>
@@ -548,16 +726,29 @@
 		<dd>{PROTOCOL_OPTIONS.find((o) => o.value === form.protocol)?.label ?? form.protocol}</dd>
 		<dt>ホスト</dt>
 		<dd>{form.host || '（未入力）'}:{form.port}</dd>
-		<dt>ユニットID</dt>
-		<dd>{form.unitId}</dd>
-		{#if form.protocol === 'slmp'}
-			<dt>ワード順</dt>
-			<dd>{WORD_ORDER_OPTIONS.find((o) => o.value === form.wordOrder)?.label ?? form.wordOrder}</dd>
+		{#if form.protocol === POSTGRES_PROTOCOL}
+			<dt>データベース</dt>
+			<dd>{form.database || '（未入力）'}</dd>
+			<dt>ユーザー名</dt>
+			<dd>{form.username || '（未入力）'}</dd>
+			<dt>パスワード</dt>
+			<dd>{form.password ? '入力あり' : '（未入力・後で設定できます）'}</dd>
+		{:else}
+			<dt>ユニットID</dt>
+			<dd>{form.unitId}</dd>
+			{#if form.protocol === 'slmp'}
+				<dt>ワード順</dt>
+				<dd>
+					{WORD_ORDER_OPTIONS.find((o) => o.value === form.wordOrder)?.label ?? form.wordOrder}
+				</dd>
+			{/if}
 		{/if}
 		<dt>有効</dt>
 		<dd>{form.enabled ? 'はい' : 'いいえ'}</dd>
-		<dt>シミュレーション</dt>
-		<dd>{form.simulation ? '⚠ シミュレーション中' : 'いいえ'}</dd>
+		{#if form.protocol !== POSTGRES_PROTOCOL}
+			<dt>シミュレーション</dt>
+			<dd>{form.simulation ? '⚠ シミュレーション中' : 'いいえ'}</dd>
+		{/if}
 	</dl>
 {/snippet}
 
@@ -581,7 +772,11 @@
 			{@render destinationFields()}
 		{:else}
 			{@render confirmSummary()}
-			{@render testConnectionBlock()}
+			{#if form.protocol === POSTGRES_PROTOCOL}
+				{@render dbTestConnectionBlock()}
+			{:else}
+				{@render testConnectionBlock()}
+			{/if}
 		{/if}
 
 		<div class="wizard-actions">
@@ -608,7 +803,11 @@
 		{@render nameField()}
 		{@render destinationFields()}
 		{#if !readOnly}
-			{@render testConnectionBlock()}
+			{#if form.protocol === POSTGRES_PROTOCOL}
+				{@render dbTestConnectionBlock()}
+			{:else}
+				{@render testConnectionBlock()}
+			{/if}
 			<div class="actions">
 				<button type="button" onclick={handleSave} disabled={saving || deleting}>保存</button>
 				<button type="button" class="danger" onclick={handleDelete} disabled={saving || deleting}>
@@ -664,6 +863,12 @@
 		grid-column: 1 / -1;
 		margin-top: -0.4rem;
 		color: var(--banto-warning);
+	}
+
+	.password-status {
+		font-size: 0.8rem;
+		color: var(--banto-text-muted);
+		align-self: flex-end;
 	}
 
 	.err {

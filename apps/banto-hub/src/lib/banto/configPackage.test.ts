@@ -22,7 +22,10 @@ const BASE_CONNECTION: PlcConnection = {
 	unitId: 1,
 	enabled: true,
 	simulation: false,
-	wordOrder: 'low_high'
+	wordOrder: 'low_high',
+	database: null,
+	username: null,
+	passwordSet: false
 };
 
 const VIRTUAL_CONNECTION: PlcConnection = {
@@ -34,7 +37,28 @@ const VIRTUAL_CONNECTION: PlcConnection = {
 	unitId: 0,
 	enabled: true,
 	simulation: false,
-	wordOrder: 'low_high'
+	wordOrder: 'low_high',
+	database: null,
+	username: null,
+	passwordSet: false
+};
+
+// S1（docs/banto-hub-external-db-design.md §4.1・§2.2）: postgres（DB
+// Source）接続のフィクスチャ - `passwordSet: true`（保存済みパスワードあり）
+// でも export には一切パスワードが乗らないことを確認する用。
+const DB_CONNECTION: PlcConnection = {
+	id: 3,
+	name: 'pg-a',
+	protocol: 'postgres',
+	host: '10.0.0.5',
+	port: 5432,
+	unitId: 1,
+	enabled: true,
+	simulation: false,
+	wordOrder: 'low_high',
+	database: 'appdb',
+	username: 'appuser',
+	passwordSet: true
 };
 
 const BASE_GROUP: CollectionGroup = {
@@ -337,6 +361,88 @@ describe('configPackage', () => {
 		expect(() => parseConfigPackage(JSON.stringify(withBadStringEncoding))).toThrow(
 			/stringEncoding/
 		);
+	});
+
+	// --- S1（docs/banto-hub-external-db-design.md §4.1・§2.2、実装指示5）:
+	// postgres（DB Source）接続は database/username を export に含むが、
+	// パスワードは絶対に含まない - `CONFIG_PACKAGE_EXCLUDED_SECRETS`に
+	// `'plc_connections.password'`が追加されていること、実際に`password`
+	// キーが export の JSON に一切現れないことの両方を固定する。
+
+	it('S1: buildConfigPackage は postgres 接続の database/username を含み、password は一切含まない', () => {
+		const pkg = buildConfigPackage({
+			plcConnections: [BASE_CONNECTION, DB_CONNECTION],
+			collectionGroups: [BASE_GROUP],
+			tags: [BASE_TAG],
+			mqtt: MQTT,
+			grpc: GRPC,
+			exportedAt: '2026-09-06T00:00:00.000Z'
+		});
+		const exported = pkg.plcConnections.find((c) => c.name === 'pg-a');
+		expect(exported).toEqual({
+			name: 'pg-a',
+			protocol: 'postgres',
+			host: '10.0.0.5',
+			port: 5432,
+			unitId: 1,
+			enabled: true,
+			simulation: false,
+			wordOrder: 'low_high',
+			database: 'appdb',
+			username: 'appuser'
+		});
+		expect(exported).not.toHaveProperty('password');
+		expect(exported).not.toHaveProperty('passwordSet');
+		// シリアライズした JSON テキストの plcConnections 部分自体にも
+		// "password" という文字列が一切現れないことを固定する
+		// （フィールド名の綴りミスでうっかり別の場所から漏れる、といった
+		// 事故の防止線）。`excludedSecrets`（'plc_connections.password' /
+		// 'mqtt.password'という文字列そのもの）はこの一致対象から除く -
+		// あちらは「除外した」ことの宣言であって漏洩ではない。
+		const plcConnectionsJson = JSON.stringify(pkg.plcConnections);
+		expect(plcConnectionsJson).not.toMatch(/password/i);
+	});
+
+	it('S1: CONFIG_PACKAGE_EXCLUDED_SECRETS は plc_connections.password を含む', () => {
+		expect(CONFIG_PACKAGE_EXCLUDED_SECRETS).toContain('plc_connections.password');
+	});
+
+	it('S1: postgres 接続を含むパッケージは serializeConfigPackage/parseConfigPackage で往復できる（password 抜きのまま）', () => {
+		const original = buildConfigPackage({
+			plcConnections: [DB_CONNECTION],
+			collectionGroups: [],
+			tags: [],
+			mqtt: MQTT,
+			grpc: GRPC,
+			exportedAt: '2026-09-06T00:00:00.000Z'
+		});
+		const parsed = parseConfigPackage(serializeConfigPackage(original));
+		expect(parsed).toEqual(original);
+		expect(parsed.plcConnections[0]).toMatchObject({
+			protocol: 'postgres',
+			database: 'appdb',
+			username: 'appuser'
+		});
+	});
+
+	it('S1: parseConfigPackage は database/username を持たない旧パッケージ（非postgres接続のみ）を受け入れる', () => {
+		const pkg = makePackage();
+		const withoutDbFields = {
+			...pkg,
+			plcConnections: pkg.plcConnections.map(
+				({ database: _database, username: _username, ...rest }) => rest
+			)
+		};
+		expect(() => parseConfigPackage(JSON.stringify(withoutDbFields))).not.toThrow();
+	});
+
+	it('S1: parseConfigPackage は不正な protocol（postgres 追加後の許容値外）を拒否する', () => {
+		const pkg = makePackage();
+		const withBadProtocol = {
+			...pkg,
+			plcConnections: pkg.plcConnections.map((c) => ({ ...c, protocol: 'mysql' }))
+		};
+		expect(() => parseConfigPackage(JSON.stringify(withBadProtocol))).toThrow(/protocol/);
 	});
 
 	it('planByName は name ベースで create/update を分ける', () => {

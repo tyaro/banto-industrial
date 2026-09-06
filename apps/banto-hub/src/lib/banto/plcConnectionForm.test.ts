@@ -5,12 +5,16 @@
 import { describe, expect, it } from 'vitest';
 import {
 	DEFAULT_PORTS,
+	PROTOCOL_OPTIONS,
 	blankConnectionForm,
 	connectionToForm,
 	defaultPortFor,
 	formToConnectionInput,
 	isDefaultPortForProtocol,
-	nextConnectionName
+	nextConnectionName,
+	passwordForSubmit,
+	validatePostgresFields,
+	type PlcConnectionFormState
 } from './plcConnectionForm';
 import type { PlcConnection } from './tagRegistryAdmin';
 
@@ -75,6 +79,11 @@ describe('defaultPortFor / isDefaultPortForProtocol', () => {
 		expect(defaultPortFor('virtual')).toBeUndefined();
 	});
 
+	it('S1: postgres の既定ポートは 5432（PostgreSQL の標準ポート）', () => {
+		expect(defaultPortFor('postgres')).toBe(5432);
+		expect(DEFAULT_PORTS.postgres).toBe(5432);
+	});
+
 	it('isDefaultPortForProtocol: 既定値と一致すれば true', () => {
 		expect(isDefaultPortForProtocol('502', 'modbus-tcp')).toBe(true);
 		expect(isDefaultPortForProtocol('5007', 'slmp')).toBe(true);
@@ -99,7 +108,11 @@ describe('blankConnectionForm / connectionToForm / formToConnectionInput', () =>
 			unitId: '1',
 			enabled: true,
 			simulation: false,
-			wordOrder: 'low_high'
+			wordOrder: 'low_high',
+			database: '',
+			username: '',
+			password: '',
+			clearPassword: false
 		});
 	});
 
@@ -113,7 +126,10 @@ describe('blankConnectionForm / connectionToForm / formToConnectionInput', () =>
 			unitId: 3,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'high_low'
+			wordOrder: 'high_low',
+			database: null,
+			username: null,
+			passwordSet: false
 		};
 		expect(connectionToForm(conn)).toEqual({
 			name: 'Line1',
@@ -123,7 +139,11 @@ describe('blankConnectionForm / connectionToForm / formToConnectionInput', () =>
 			unitId: '3',
 			enabled: true,
 			simulation: false,
-			wordOrder: 'high_low'
+			wordOrder: 'high_low',
+			database: '',
+			username: '',
+			password: '',
+			clearPassword: false
 		});
 	});
 
@@ -137,7 +157,10 @@ describe('blankConnectionForm / connectionToForm / formToConnectionInput', () =>
 			unitId: 1,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'low_high'
+			wordOrder: 'low_high',
+			database: null,
+			username: null,
+			passwordSet: false
 		};
 		expect(formToConnectionInput(connectionToForm(conn))).toEqual({
 			name: 'X',
@@ -149,5 +172,132 @@ describe('blankConnectionForm / connectionToForm / formToConnectionInput', () =>
 			simulation: false,
 			wordOrder: 'low_high'
 		});
+	});
+
+	it('S1: connectionToForm は保存済みパスワードを絶対にプリフィルしない（passwordSet: true でも password は常に空文字列）', () => {
+		const conn: PlcConnection = {
+			id: 9,
+			name: 'pg1',
+			protocol: 'postgres',
+			host: '127.0.0.1',
+			port: 5432,
+			unitId: 1,
+			enabled: true,
+			simulation: false,
+			wordOrder: 'low_high',
+			database: 'appdb',
+			username: 'appuser',
+			passwordSet: true
+		};
+		const form = connectionToForm(conn);
+		expect(form.password).toBe('');
+		expect(form.clearPassword).toBe(false);
+		expect(form.database).toBe('appdb');
+		expect(form.username).toBe('appuser');
+	});
+
+	it('S1: formToConnectionInput は postgres のときだけ database/username/password を含む', () => {
+		const form: PlcConnectionFormState = {
+			...blankConnectionForm(),
+			protocol: 'postgres',
+			host: '127.0.0.1',
+			port: '5432',
+			database: 'appdb',
+			username: 'appuser',
+			password: 'hunter2'
+		};
+		expect(formToConnectionInput(form)).toEqual({
+			name: '',
+			protocol: 'postgres',
+			host: '127.0.0.1',
+			port: 5432,
+			unitId: 1,
+			enabled: true,
+			simulation: false,
+			wordOrder: 'low_high',
+			database: 'appdb',
+			username: 'appuser',
+			password: 'hunter2'
+		});
+	});
+
+	it('S1: formToConnectionInput は非 postgres では database/username/password を一切送らない', () => {
+		const form: PlcConnectionFormState = {
+			...blankConnectionForm(),
+			protocol: 'modbus-tcp',
+			host: '127.0.0.1',
+			// これらが仮に埋まっていても（フォームを postgres→modbus と
+			// 切り替えた直後の残留値等）非postgresでは送らない。
+			database: 'leftover-db',
+			username: 'leftover-user',
+			password: 'leftover-pw'
+		};
+		const input = formToConnectionInput(form);
+		expect(input).not.toHaveProperty('database');
+		expect(input).not.toHaveProperty('username');
+		expect(input).not.toHaveProperty('password');
+	});
+});
+
+describe('S1: passwordForSubmit（パスワード tri-state の組み立て）', () => {
+	it('clearPassword が true なら password の中身に関わらず "" を返す（消去）', () => {
+		expect(passwordForSubmit({ password: 'ignored', clearPassword: true })).toBe('');
+		expect(passwordForSubmit({ password: '', clearPassword: true })).toBe('');
+	});
+
+	it('password が空文字列（未入力）なら undefined を返す（create: パスワード無し / update: 現在のパスワードを維持）', () => {
+		expect(passwordForSubmit({ password: '', clearPassword: false })).toBeUndefined();
+	});
+
+	it('password に非空文字列があればそのまま返す（新規設定/置き換え）', () => {
+		expect(passwordForSubmit({ password: 'hunter2', clearPassword: false })).toBe('hunter2');
+	});
+});
+
+describe('S1: validatePostgresFields（サーバー側必須ルールのクライアント側ミラー）', () => {
+	it('非 postgres では常にエラー無し', () => {
+		expect(validatePostgresFields({ protocol: 'modbus-tcp', database: '', username: '' })).toEqual(
+			{}
+		);
+	});
+
+	it('postgres で database/username が空なら必須エラー（サーバーの required_message と同文言）', () => {
+		expect(validatePostgresFields({ protocol: 'postgres', database: '', username: '' })).toEqual({
+			database: '必須項目です',
+			username: '必須項目です'
+		});
+	});
+
+	it('postgres で database/username が空白のみでも必須エラー（trim 後で判定）', () => {
+		expect(
+			validatePostgresFields({ protocol: 'postgres', database: '  ', username: '  ' })
+		).toEqual({
+			database: '必須項目です',
+			username: '必須項目です'
+		});
+	});
+
+	it('postgres で database/username が MAX_..._LEN（128）を超えると文字数エラー', () => {
+		const tooLong = 'a'.repeat(129);
+		expect(
+			validatePostgresFields({ protocol: 'postgres', database: tooLong, username: tooLong })
+		).toEqual({
+			database: '128文字以内で入力してください',
+			username: '128文字以内で入力してください'
+		});
+	});
+
+	it('postgres で database/username が両方とも妥当ならエラー無し', () => {
+		expect(
+			validatePostgresFields({ protocol: 'postgres', database: 'appdb', username: 'appuser' })
+		).toEqual({});
+	});
+});
+
+describe('S1: PROTOCOL_OPTIONS に postgres（DB Source）が含まれる', () => {
+	it('postgres オプションを日本語ラベル付きで持つ', () => {
+		const postgresOption = PROTOCOL_OPTIONS.find((opt) => opt.value === 'postgres');
+		expect(postgresOption).toBeDefined();
+		expect(postgresOption?.label).toBe('PostgreSQL（DB Source）');
 	});
 });

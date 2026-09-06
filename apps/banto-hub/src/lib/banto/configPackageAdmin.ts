@@ -193,7 +193,15 @@ export async function inspectConfigPackage(pkg: ConfigPackage): Promise<ConfigPa
 		warnings: uniqueWarnings(warnings),
 		mqttCredentialsRequired: pkg.mqtt.enabled,
 		mqttSettings,
-		grpcSettings
+		grpcSettings,
+		// S1（実装指示5）: export に password を含めない
+		// （`CONFIG_PACKAGE_EXCLUDED_SECRETS`の`'plc_connections.password'`）
+		// ので、パッケージが持つ postgres 接続は必ずパスワード無しで
+		// import される - 名前を集めて呼び出し元（settings画面）に
+		// 「再設定が必要」と案内させる。
+		dbConnectionsPasswordRequired: pkg.plcConnections
+			.filter((connection) => connection.protocol === 'postgres')
+			.map((connection) => connection.name)
 	};
 }
 

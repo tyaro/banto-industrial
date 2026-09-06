@@ -28,7 +28,19 @@ import { deferredDelete } from './deferredDelete.svelte';
 
 // --- wire types (camelCase, matching the Rust serde shapes) -----------------
 
-export type PlcProtocol = 'modbus-tcp' | 'slmp' | 'virtual';
+/**
+ * S1（docs/banto-hub-external-db-design.md §4.1・§6-4）: `'postgres'` は
+ * PLC ではなく PostgreSQL への DB Source 接続 - mirrors
+ * `banto_tags::plc_connection::POSTGRES_PROTOCOL`。
+ */
+export type PlcProtocol = 'modbus-tcp' | 'slmp' | 'virtual' | 'postgres';
+
+/**
+ * S1: mirrors `banto_tags::plc_connection::POSTGRES_PROTOCOL`。この文字列を
+ * ハードコードで比較する箇所（フォーム既定ポート・ツリーの DB バッジ・
+ * コンテキストメニューのグループ作成禁止等）はすべてこの定数を使う。
+ */
+export const POSTGRES_PROTOCOL: PlcProtocol = 'postgres';
 
 /**
  * P3-b（監査指摘 2026-08-12）: SLMP 接続のワード順（32bit値の上位/下位ワードの
@@ -64,6 +76,21 @@ export interface PlcConnection {
 	simulation: boolean;
 	/** P3-b（監査指摘 2026-08-12）。{@link SlmpWordOrder}参照。 */
 	wordOrder: SlmpWordOrder;
+	/**
+	 * S1（docs/banto-hub-external-db-design.md §4.1・§2.2）: `protocol ===
+	 * 'postgres'` 接続が対象とする DB 名。他プロトコルでは常に `null` -
+	 * mirrors `banto_hub_core::rest::PlcConnectionResponse::database`。
+	 */
+	database: string | null;
+	/** S1: `protocol === 'postgres'` 接続が使う DB ユーザー名。他プロトコルでは常に `null`。 */
+	username: string | null;
+	/**
+	 * S1: `true` なら非空のパスワードが保存されている（値そのものは
+	 * サーバーが決して返さない - `PlcConnectionResponse::password_set`の
+	 * doc comment参照）。`ConnectionDrawer.svelte`の「パスワード: 設定済み/
+	 * 未設定」表示に使う。
+	 */
+	passwordSet: boolean;
 }
 
 /**
@@ -85,6 +112,16 @@ export function isVirtualConnection(conn: Pick<PlcConnection, 'protocol'>): bool
 	return conn.protocol === 'virtual';
 }
 
+/**
+ * S1（docs/banto-hub-external-db-design.md §4.1）: `protocol === 'postgres'`
+ * 判定 - mirrors `banto_tags::PlcConnection::is_db_source`。ツリーの DB
+ * バッジ・グループ作成禁止・接続 Drawer のフィールド出し分け（database/
+ * username/password を出す・unitId/wordOrder/simulation を隠す）が使う。
+ */
+export function isDbSourceConnection(conn: Pick<PlcConnection, 'protocol'>): boolean {
+	return conn.protocol === POSTGRES_PROTOCOL;
+}
+
 /** Mirrors `banto_hub_core::rest::PlcConnectionPayload`. */
 export interface PlcConnectionInput {
 	name: string;
@@ -97,6 +134,55 @@ export interface PlcConnectionInput {
 	simulation: boolean;
 	/** P3-b（監査指摘 2026-08-12）. See {@link PlcConnection.wordOrder}. */
 	wordOrder: SlmpWordOrder;
+	/**
+	 * S1（docs/banto-hub-external-db-design.md §4.1）: `protocol: 'postgres'`
+	 * 接続の DB 名 - mirrors `banto_hub_core::rest::PlcConnectionPayload
+	 * ::database`。他プロトコルでは省略する（サーバーは非 postgres での指定を
+	 * 拒否する）。
+	 */
+	database?: string;
+	/** S1: `protocol: 'postgres'` 接続の DB ユーザー名。{@link database}と同じ省略時ルール。 */
+	username?: string;
+	/**
+	 * S1: `protocol: 'postgres'` 接続のパスワード（平文送信、TLS 越しの
+	 * HTTPS 前提は既存の CSRF/認証と同じ）。**create と update で意味が
+	 * 異なる tri-state** - mirrors `banto_hub_core::rest::PlcConnectionPayload
+	 * ::password`のdoc comment:
+	 * - create: 省略/空文字列はいずれも「パスワード無し」。
+	 * - update: 省略（キー自体を送らない = `undefined`）は「現在のパスワードを
+	 *   変更しない」、空文字列は「消去」、それ以外の文字列は「置き換え」。
+	 *
+	 * `$lib/banto/plcConnectionForm.ts::passwordForSubmit`がフォーム状態
+	 * からこの3値を組み立てる - 呼び出し側は生の `form.password`/
+	 * `form.clearPassword` をここへ直接詰めない。
+	 */
+	password?: string;
+}
+
+/**
+ * S1（docs/banto-hub-external-db-design.md §4.6）: `POST
+ * /api/plc-connections/{id}/test`（保存済み postgres 接続の接続テスト）の
+ * 応答 - mirrors `banto_hub_core::db_source::DbConnectionTestOutcome`。
+ * T12 の {@link PlcConnectionTestResult}（保存前、PLC 専用）とは別物 -
+ * こちらは常に `protocol === 'postgres'` の保存済み接続が対象で、
+ * `elapsedMs`/`kind` は持たない代わりに成功時 `serverVersion`
+ * （`SELECT version()`の結果）を持つ。
+ */
+export interface DbConnectionTestOutcome {
+	ok: boolean;
+	serverVersion?: string;
+	error?: string;
+}
+
+/**
+ * S1: 保存済み postgres 接続の接続テスト。未保存（新規作成ウィザード中）の
+ * 接続には呼べない - 呼び出し側（`ConnectionDrawer.svelte`）は `connection`
+ * が非 `null` のときだけボタンを有効にする。
+ */
+export async function testSavedPlcConnection(id: number): Promise<DbConnectionTestOutcome> {
+	return httpRequest<DbConnectionTestOutcome>(`/api/plc-connections/${id}/test`, {
+		method: 'POST'
+	});
 }
 
 /** Mirrors `banto_tags::CollectionGroup`. */

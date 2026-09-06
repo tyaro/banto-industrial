@@ -24,6 +24,7 @@
 	import { buildTagCountsByGroup, buildGroupsByConnection } from './connectionTreeBuild';
 	import {
 		isVirtualConnection,
+		isDbSourceConnection,
 		CALC_CONNECTION_NAME,
 		MEM_CONNECTION_NAME,
 		type PlcConnection,
@@ -84,11 +85,16 @@
 	 * T18-6c: ノード種別アイコン（行頭）。実 PLC 接続は 🔌、`calc`/`mem`
 	 * 予約接続はそれぞれ 🧮/💾（末尾バッジ側の絵文字と重複させないため、
 	 * `connectionBadge` からは絵文字を外しテキストのみにした - 下記参照）。
+	 *
+	 * S1（docs/banto-hub-external-db-design.md §4.1、実装指示4）追記:
+	 * `protocol === 'postgres'`（DB Source 接続）は 🗄 - PLC とは全く別の
+	 * 接続先（RDB）であることを行頭で即座に区別できるようにする。
 	 */
 	function connectionIcon(connection: PlcConnection): string {
 		if (isVirtualConnection(connection)) {
 			return connection.name === CALC_CONNECTION_NAME ? '🧮' : '💾';
 		}
+		if (isDbSourceConnection(connection)) return '🗄';
 		return '🔌';
 	}
 
@@ -100,9 +106,17 @@
 	 * 「calc calc」/「mem mem」のように名前と二重になってしまうと実機
 	 * 確認で判明したため）。`⚠ SIM` バッジは種別ではなく状態（実機では
 	 * ない）を表すので、アイコン化の対象外のまま従来どおり維持する。
+	 *
+	 * S1（実装指示4「postgres 接続は distinct な label/badge（例: 'DB'）を
+	 * 出す」）追記: `postgres` 接続は行頭アイコン（🗄）に加え、末尾に
+	 * テキストバッジ「DB」も出す - `calc`/`mem`と違い接続名が「DB」を含む
+	 * とは限らないため、アイコンだけでは種別の見落としが起きうる
+	 * （calc/mem は名前自体が種別を語るので二重表示を避けたが、postgres は
+	 * 任意の名前を付けられるため二重にはならない）。
 	 */
 	function connectionBadge(connection: PlcConnection): string | null {
 		if (isVirtualConnection(connection)) return null;
+		if (isDbSourceConnection(connection)) return 'DB';
 		return connection.simulation ? '⚠ SIM' : null;
 	}
 
@@ -130,10 +144,15 @@
 			{#if connectionBadge(node.data.connection)}
 				<span
 					class="badge"
-					class:sim={node.data.connection.simulation && !isVirtualConnection(node.data.connection)}
-					title={node.data.connection.simulation && !isVirtualConnection(node.data.connection)
-						? 'シミュレーション接続（実機ではありません）'
-						: undefined}>{connectionBadge(node.data.connection)}</span
+					class:sim={node.data.connection.simulation &&
+						!isVirtualConnection(node.data.connection) &&
+						!isDbSourceConnection(node.data.connection)}
+					class:db={isDbSourceConnection(node.data.connection)}
+					title={isDbSourceConnection(node.data.connection)
+						? 'PostgreSQL 接続（DB Source、S1）'
+						: node.data.connection.simulation && !isVirtualConnection(node.data.connection)
+							? 'シミュレーション接続（実機ではありません）'
+							: undefined}>{connectionBadge(node.data.connection)}</span
 				>
 			{/if}
 		{:else if node.data.kind === 'group'}
@@ -170,6 +189,11 @@
 
 	.badge.sim {
 		color: var(--banto-warning);
+		font-weight: 700;
+	}
+
+	.badge.db {
+		color: var(--banto-primary);
 		font-weight: 700;
 	}
 
