@@ -80,6 +80,20 @@
 ; `service-install` を呼んでも既存設定は変更しない（T17-4、
 ; apps/banto-hub/core/src/service_install.rs 参照）。
 ;
+; (6) デスクトップショートカットの削除（I4 追従、
+;     docs/banto-hub-installer-design.md §7-3「デスクトップショートカット
+;     は作らない」・§8.2）。tauri-bundler 2.9.4 の installer.nsi テンプレ
+;     ートは `$DESKTOP\${PRODUCTNAME}.lnk` を2経路で作る（ソース確認済み）:
+;     (a) silent / passive（`/S` `/P`）では Section Install 内の
+;         CreateOrUpdateDesktopShortcut を**無条件**に呼ぶ（行 726-731、
+;         POSTINSTALL 挿入位置 733-734 より前）。
+;     (b) 対話モードでは完了ページの「デスクトップにショートカットを作成」
+;         チェック（MUI_FINISHPAGE_SHOWREADME、既定 ON）で、Section の
+;         **後**に利用者操作で作る - フックからは介入できない。
+;     よってこのフック（Section 末尾）では (a) の分だけ削除する。(b) は
+;     利用者の選択に委ねる（設計 §7-3 の補足、§8.2）。PerMachine では
+;     `SetShellVarContext all` により `$DESKTOP` はパブリックデスクトップ。
+;
 ; ## PREUNINSTALL（§4.3 表・§7 決定7）
 ;
 ; シェルを終了し、サイドカー→Hub の順でサービス登録を解除する。
@@ -261,6 +275,11 @@ Var StopWaitCounter
     DetailPrint "banto-hub: 上書き前に稼働していた BantoHubSink サービスを再開します..."
     nsExec::ExecToStack 'sc start "BantoHubSink"'
     Pop $0
+  ${EndIf}
+  ; (6) silent / passive でテンプレートが作ったデスクトップショートカットを削除
+  ${If} ${FileExists} "$DESKTOP\${PRODUCTNAME}.lnk"
+    Delete "$DESKTOP\${PRODUCTNAME}.lnk"
+    DetailPrint "banto-hub: デスクトップショートカットを削除しました（スタートメニューのみ作成、設計 §7-3）"
   ${EndIf}
 !macroend
 

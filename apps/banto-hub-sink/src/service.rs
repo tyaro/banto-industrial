@@ -100,10 +100,6 @@ pub const GRANT_SERVICE_ACL_ARG: &str = "grant-service-acl";
 /// 「サービス ACL の付与」節参照。
 pub const ELEV_EXE_NAME: &str = "banto-hub-elev.exe";
 
-/// サービスログの出力先ディレクトリを上書きする環境変数。既定は exe と
-/// 同じディレクトリ（設定ファイルと同じ置き場所）。
-pub const ENV_LOG_DIR: &str = "BANTO_HUB_SINK_LOG_DIR";
-
 fn fail(message: &str) -> ! {
     eprintln!("{message}");
     eprintln!("banto-hub-sink: 管理者権限の PowerShell から実行してください");
@@ -288,18 +284,11 @@ fn service_main(arguments: Vec<OsString>) {
     }
 }
 
-fn log_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os(ENV_LOG_DIR) {
-        return PathBuf::from(dir);
-    }
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("."))
-}
-
 fn run_service_body(_arguments: Vec<OsString>) {
-    let log_path = log_dir().join(log::SERVICE_LOG_FILE_NAME);
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(PathBuf::from));
+    let log_path = log::resolve_service_log_path(exe_dir.as_deref());
     if let Err(err) = log::enable_service_log_file(&log_path) {
         eprintln!(
             "banto-hub-sink: サービスログファイル {} を開けませんでした: {err}",
