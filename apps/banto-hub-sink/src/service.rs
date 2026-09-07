@@ -167,7 +167,9 @@ pub fn install() {
     println!("banto-hub-sink:   実行ファイル: {}", exe_path.display());
     println!("banto-hub-sink:   起動種別: 手動（Demand）");
     println!(
-        "banto-hub-sink: 設定ファイル（{}）を exe と同じディレクトリに置いてから `Start-Service {SERVICE_NAME}` してください",
+        "banto-hub-sink: 設定ファイル（{}）を %ProgramData%\\BantoHub\\ （インストーラの既定、\
+         推奨）か exe と同じディレクトリ（後方互換）に置いてから \
+         `Start-Service {SERVICE_NAME}` してください",
         crate::config::DEFAULT_CONFIG_FILE_NAME
     );
 }

@@ -14,9 +14,10 @@
 //!
 //! **設定・UI・監視は Hub が持つ**（§5.2）。このプロセスは状態を持たない:
 //! 起動時に Hub から設定を取得 → 購読 → INSERT を繰り返すだけで、落ちれば
-//! SCM が再起動して設定を取り直す。exe 隣の `banto-hub-sink.toml`
-//! （[`config`]）が持つのは Hub の URL と API キーだけで、それ以外の設定
-//! （どのタグをどのテーブルへ、どの周期で）はすべて Hub 側の
+//! SCM が再起動して設定を取り直す。`banto-hub-sink.toml`（[`config`]、
+//! インストーラ設計 §4.4 の I2 で `env → %ProgramData%\BantoHub\ → exe 隣`
+//! の順に探索するようになった）が持つのは Hub の URL と API キーだけで、
+//! それ以外の設定（どのタグをどのテーブルへ、どの周期で）はすべて Hub 側の
 //! `hub_sink_groups`（`banto_hub_core::sink`、S4）にある。
 //!
 //! ## 構成（データの流れ）
@@ -37,8 +38,8 @@
 //!   PUT /api/sink/status  ◀─────────── [status] 5秒ごとの状態 push
 //! ```
 //!
-//! - [`config`][]: exe 隣の toml（未知キーは拒否、範囲検証、`api_key` は
-//!   `Debug` にも出さない）。
+//! - [`config`][]: `env → %ProgramData%\BantoHub\ → exe 隣` の順に探す
+//!   toml（未知キーは拒否、範囲検証、`api_key` は `Debug` にも出さない）。
 //! - [`hub_api`][]: `GET /api/sink/config` / `PUT /api/sink/status`（admin
 //!   スコープの API キー + ループバック運用、§6-15）。
 //! - [`values`][]: banto-tagclient の `TagClientHandle` を1本だけ持ち、全

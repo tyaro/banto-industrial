@@ -217,7 +217,8 @@
 			</a>
 			<p class="note">
 				発行直後の画面にしか平文キーは表示されません。コピーしたら
-				<code>banto-hub-sink.toml</code>（サイドカー exe と同じディレクトリ）へ設定してください。
+				<code>banto-hub-sink.toml</code>（<code>%ProgramData%\BantoHub\</code>、インストーラが
+				雛形を用意します。無い場合はサイドカー exe と同じディレクトリでも可）へ設定してください。
 			</p>
 			<div class="config-snippet">
 				<pre>hub_url = "http://127.0.0.1:&lt;Hub のポート&gt;"
