@@ -1,7 +1,7 @@
 # banto-hub 一体インストーラ設計（シェル・Hub・elev・サイドカー同梱）
 
 作成日: 2026-09-07
-状態: **オーナー決定済み（2026-09-07、§7 の 10 項目すべて推奨どおり）・I1 / I2 実装中**。現状調査（§2）は main `3fa1824`（v0.2.0-alpha.2）に対して実施済み。
+状態: **オーナー決定済み（2026-09-07、§7 の 10 項目すべて推奨どおり）。I1 = #322（レビュー中）、I2 = #321 完了、I3 = 本 PR、I4 は S7 と同日**。現状調査（§2）は main `3fa1824`（v0.2.0-alpha.2）に対して実施済み。
 対象: Windows 向け NSIS インストーラ 1 本で、デスクトップシェル（`banto-hub-shell.exe`）・Hub 本体（`banto-hub.exe`）・UAC ヘルパ（`banto-hub-elev.exe`）・DB Sink サイドカー（`banto-hub-sink.exe`）を同じディレクトリに配置し、サービス登録と権限設定まで行う。
 
 関連: [banto-hub-t17-design.md](banto-hub-t17-design.md)（SCM 管理・profile・UAC・インストーラ再設計。§2.3 に現行インストーラの棚卸し）、[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §16.3（配布まわりの未決事項）、[banto-hub-operations.md](banto-hub-operations.md) §12（現行インストーラのビルド手順と挙動）、[banto-hub-external-db-design.md](banto-hub-external-db-design.md) §5（サイドカー）。

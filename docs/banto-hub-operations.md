@@ -4,8 +4,10 @@
 （docs/tag-server-design.md §5.6、2026-08-30 オーナー決定・2026-08-31
 実装完了）の運用手順を追記、§1 環境変数表を T17-1 profile path 一本化後の
 実装に合わせて修正済み（2026-09-01）。§5 の Modbus 書き込み記述を実態
-（#131 で対応済み）に是正、§20「MCP 外部インターフェース」を追加（2026-09-06）。**
-最終検証日(コード照合): 2026-09-06
+（#131 で対応済み）に是正、§20「MCP 外部インターフェース」を追加
+（2026-09-06）。§12「インストーラ」を一体インストーラ（I1〜I3、
+docs/banto-hub-installer-design.md）に合わせて全面改訂（2026-09-07）。**
+最終検証日(コード照合): 2026-09-07
 
 対象読者: banto-hub を現場に導入・運用するオペレータ／導入担当者。
 banto-hub は Rust(axum) + SQLite の**単一 exe・ヘッドレスサーバー**です
@@ -726,24 +728,70 @@ WebSocket の 8722 番、gRPC を有効化した場合は 50051 番）。コン�
 
 ## 12. インストーラ
 
-T5-2（docs/t5-handoff.md §3「インストーラ（既存2アプリのインストーラ
-構成を踏襲）」）。banto-hub は Tauri アプリではない（`src-tauri` を
-持たない、T0 決定）ため `cargo tauri build` は使えないが、既存2アプリ
-（ChronoGazer / relay-wright）と同じ NSIS 形式のインストーラを、
+T5-2 で始まり、I1（docs/banto-hub-installer-design.md、2026-09-07）で
+**一体インストーラ**へ拡張済みです。banto-hub はもともと Tauri アプリ
+ではないヘッドレスサーバー（`src-tauri` を持たない、T0 決定）でしたが、
+その後デスクトップシェル（`banto-hub-shell.exe`、T16-0）が追加され、
+インストーラも「シェル・Hub 本体・UAC ヘルパー・DB Sink サイドカーの
+4 実行ファイルを 1 本の NSIS インストーラにまとめ、サービス登録と権限
+設定まで済ませる」形に置き換わりました。生成ツール自体は変わらず
 `tauri-bundler` クレートを単体ライブラリとして呼び出す専用ツール
-（`apps/banto-hub/installer/`）で生成する。本節はこのインストーラを
-オーナーが実際にビルド・入手する手順と、インストール時の挙動を
-まとめたものです。
+（`apps/banto-hub/installer/`）です。本節はこのインストーラの中身・
+ビルド手順・インストール時の挙動をまとめたものです。設計の一次ソースは
+[banto-hub-installer-design.md](banto-hub-installer-design.md) §4、
+実機検証の記録は同 §6 row I4 に追記されます。
+
+### 何が入るか
+
+`C:\Program Files\BantoHub\` に次の 4 実行ファイルが揃います。
+
+| 実行ファイル          | main | 役割                                                     |
+| --------------------- | ---- | -------------------------------------------------------- |
+| `banto-hub-shell.exe` | ○    | デスクトップシェル。スタートメニューにショートカットあり |
+| `banto-hub.exe`       |      | Hub 本体（ヘッドレス axum サーバー、Service モード用）   |
+| `banto-hub-elev.exe`  |      | UAC 昇格ヘルパー（サービス登録・ACL 付与）               |
+| `banto-hub-sink.exe`  |      | DB Sink サイドカー（外部 PostgreSQL 連携、§20 参照）     |
+
+スタートメニューのショートカットは **BantoHub（シェル）** のみで、
+デスクトップショートカットは（対話的インストールでは）作りません。
+`banto-hub-sink.toml.example`（サイドカー設定の雛形）が
+`%ProgramData%\BantoHub\` に配置されますが、**実ファイルの
+`banto-hub-sink.toml` はインストーラが作りません** - 下記「サイドカーの
+初回セットアップ」で発行する API キーが要るため、インストール時点では
+書けません。
 
 ### ビルド手順
 
-```powershell
-# 1. banto-hub.exe をリリースビルド（§1 と同じ、既存の標準手順）
-pnpm --filter banto-hub build
-cargo build -p banto-hub-core --bin banto-hub --features embed-ui --release
+**通常はこのスクリプトを実行するだけです**（Windows 実機、`pwsh` 7 系）。
 
-# 2. インストーラを生成（既定で target/release/banto-hub.exe を対象にする）
-cargo run --manifest-path apps/banto-hub/installer/Cargo.toml --release
+```powershell
+./scripts/build-release.ps1
+# バージョンを明示したい場合
+./scripts/build-release.ps1 -Version 0.2.0-alpha.3
+# UI ビルド・インストーラ生成を省きたい場合（exe 単体配布のみ欲しい等）
+./scripts/build-release.ps1 -SkipFrontend -SkipInstaller
+```
+
+4 バイナリのビルド → インストーラ生成 → `dist/<version>/` へのリリース
+名リネーム（`banto-hub-v<version>-windows-x86_64.exe` 等）→
+`SHA256SUMS.txt` 生成まで一括で行います。参考として、内部で実行している
+手順（alpha.2 で実際に踏んだもの）は次のとおりです。
+
+```powershell
+# 1. フロントエンド（UI）
+pnpm --filter banto-hub build
+
+# 2. Hub 本体・elev（同じ banto-hub-core クレートの2バイナリ）
+cargo build --release -p banto-hub-core --bin banto-hub --bin banto-hub-elev --features embed-ui
+
+# 3. デスクトップシェル
+cargo build --release -p banto-hub-shell --features banto-hub-core/embed-ui
+
+# 4. DB Sink サイドカー
+cargo build --release -p banto-hub-sink
+
+# 5. インストーラ生成（対象ディレクトリの4 exe を拾う。既定は target/release/）
+cargo run --manifest-path apps/banto-hub/installer/Cargo.toml --release -- target/release
 ```
 
 生成物は `target/release/bundle/nsis/BantoHub_<version>_x64-setup.exe`
@@ -751,8 +799,10 @@ cargo run --manifest-path apps/banto-hub/installer/Cargo.toml --release
 ワークスペースの member ではなく（独立した Cargo ワークスペース -
 `apps/banto-hub/installer/Cargo.toml` のコメント参照）、
 `cargo check --workspace --all-targets`（CI が ubuntu-latest 上で回す
-コマンド）には一切含まれません。このインストーラのビルドは Windows
-上でのパッケージング専用の作業であり、Windows 実機でのみ実行します。
+コマンド）には一切含まれません。4 exe のいずれかが見つからない場合、
+生成ツールはどれが無いかを名指しした日本語エラーで即座に止まります
+（4 バイナリ化で「どれか1つだけビルドし忘れた」事故が起きやすいため）。
+このビルド・パッケージングは Windows 実機でのみ実行します。
 
 初回ビルド時、NSIS ツールセットがローカルにキャッシュされていない場合は
 自動的にダウンロードされます（インターネット接続が必要 -
@@ -761,56 +811,124 @@ cargo run --manifest-path apps/banto-hub/installer/Cargo.toml --release
 
 ### インストール時の挙動
 
-- **インストールモード**: 「全ユーザー（PerMachine、`C:\Program
-Files\BantoHub\`）」固定です。ChronoGazer/relay-wright の既定
-  （ユーザー単位インストールも選べる `Both` モード）とは異なり、
-  banto-hub は Windows サービスとして常駐させる前提のアプリのため、
-  インストーラ自体を管理者権限で実行する必要があります（UAC
-  プロンプトが出ます）。
-- **Windows サービスの自動登録**: インストール完了時（post-install
-  フック）に `banto-hub.exe install`（§11 参照）が自動的に実行され、
-  `BantoHub` サービスが登録されます。登録に失敗した場合もインストーラ
-  自体は中断せず、進捗画面に案内メッセージを表示するだけに留まります -
-  失敗した場合は §11「サービスの登録（install）」の手順で手動登録して
-  ください。**既に同名サービスが存在する場合（アップグレード等）は
-  エラー扱いにはならず、既存の設定を変更せずに正常終了します**
-  （2026-08-10、T17-4。docs/banto-hub-t17-design.md §11 参照）。
-  同様に、アンインストール開始時（pre-uninstall フック）には
-  `banto-hub.exe uninstall` が自動的に実行され、サービス登録を解除します。
-  サービスの**起動**（`Start-Service BantoHub`）はインストーラの範囲外
-  です - §11「起動確認」の手順で別途行ってください。**新規インストールの
-  既定起動種別は手動（Demand）のため、OS 再起動では自動的に立ち上がり
-  ません**（2026-08-10、T17-4 - 起動には `Start-Service` または管理 UI
-  からの明示操作が必要です）。
-- **「インストール後に BantoHub を実行する」チェックボックス（既知の
-  制約）**: tauri-bundler の NSIS テンプレートには、GUI アプリを前提と
-  した「完了ページでアプリを起動する」チェックボックスが標準で
-  含まれており、banto-hub 向けにこれを消す設定項目は tauri-bundler
-  側に用意されていません（`NsisSettings` を調査済み - 完全に消すには
-  テンプレート全体を独自の `.nsi` に差し替える必要があり、T5-2 の
-  スコープでは見送った）。**このチェックボックスをオンのまま完了すると、
-  `banto-hub.exe` がコンソール無しの前面プロセスとして直接起動します**
-  （サービス経由ではない）。既にサービスが起動している状態でこれを行うと
-  ポート（既定 8722）の二重 bind で失敗します。インストール完了画面では
-  **このチェックボックスを外す**ことを推奨します。誤って起動してしまった
-  場合は、そのプロセスを終了してから `Start-Service BantoHub`
-  でサービス経由に切り替えてください。
-- 環境変数（`PORT`/`BANTO_BIND`等）はサービス登録後のプロセスには
+- **インストールモード**: 「全ユーザー（PerMachine、
+  `C:\Program Files\BantoHub\`）」固定です。banto-hub は Windows
+  サービスとして常駐させる前提のアプリのため、インストーラ自体を
+  管理者権限で実行する必要があります（UAC プロンプトが出ます）。
+- **WebView2**: シェルが WebView2 を使うため、`EmbedBootstrapper`
+  方式（+約2MB）を同梱します。Windows 10/11 でランタイムが既に入って
+  いれば追加のダウンロードは発生せず、無い場合だけインストーラが取得
+  しに行きます（完全オフライン環境向けの `OfflineInstaller` 版は
+  要望が出た時点で別途用意 - design §4.2）。
+- **上書き前の停止**（post-install の前、pre-install フック）: 稼働中
+  なら `BantoHubSink` → `BantoHub` の順でサービスを停止し（`STOPPED`
+  まで最大30秒待つ）、`banto-hub-shell.exe` が動いていれば
+  `taskkill` で終了します。新規インストール（未登録）では何も起きず
+  静かに素通りします。
+- **Windows サービスの自動登録**（post-install フック）: 次の順で
+  実行され、**いずれも起動はしません**（T17-4「収集を勝手に始めない」
+  方針の継続）。
+  1. `banto-hub-elev.exe service-install` - `BantoHub` サービス登録・
+     `BantoHub Operators` グループ作成と対話ユーザー追加・サービス
+     ACL・profile ACL を一括で行います（§11「サービスの登録」を
+     置き換え）。
+  2. `banto-hub-sink.exe install` - `BantoHubSink` サービス登録
+     （`OnDemand`、LocalSystem）。
+  3. `banto-hub-sink.exe grant-service-acl` - 同梱の elev 経由で
+     `BantoHubSink` にも Operators 向けの ACE を付与します（#316）。
+  4. `%ProgramData%\BantoHub\` を作成し、`banto-hub-sink.toml.example`
+     が無ければ配置します（既にあれば上書きしません）。
+  5. pre-install で止めたものだけ `sc start` で再開します（Hub →
+     Sink の順）。**新規インストールでは何も起動しません** - 上書き
+     インストールで、稼働していたものだけ元に戻す動作です。
+
+  上記のいずれのステップも失敗してインストーラ全体を中断させません -
+  進捗画面に手動対応の案内（`DetailPrint`）が出るだけです。失敗した
+  場合は下記「各フックの手動フォールバック」を参照してください。
+  **既に同名サービスが存在する場合（アップグレード等）はエラー扱いには
+  ならず、既存の設定を変更せずに正常終了します**（2026-08-10、T17-4）。
+
+- **「インストール後に BantoHub を実行する」チェックボックス**: I1 で
+  main バイナリがシェル（`banto-hub-shell.exe`）になったため、tauri-
+  bundler の NSIS テンプレート標準のこのチェックボックスは**意味のある
+  動作**になりました - オンのまま完了するとデスクトップシェルが起動
+  します（旧仕様のようなコンソール無しの `banto-hub.exe` 前面起動・
+  ポート二重 bind の問題は解消済みです）。
+- 環境変数（`PORT`/`BANTO_BIND` 等）はサービス登録後のプロセスには
   引き継がれません（§11 に記載の制約と同じ）。固定したい場合は
   インストール前に OS のシステム環境変数として設定しておいてください。
+
+### サイドカーの初回セットアップ
+
+インストーラは `BantoHubSink` サービスを**登録するだけ**で、設定ファイル
+（API キー）は書きません。初回は次の手順で行います。
+
+1. スタートメニューから **BantoHub** を起動し（シェル）、Hub を起動する。
+2. Hub の API キー画面（§3「API キー運用」）で `admin` + `read`
+   スコープのキーを発行する。
+3. `%ProgramData%\BantoHub\banto-hub-sink.toml.example` を
+   `banto-hub-sink.toml` にリネーム（またはコピー）し、`hub_url` と
+   発行した `api_key` を書き込む（設定探索順は `BANTO_HUB_SINK_CONFIG`
+   環境変数 → `%ProgramData%\BantoHub\banto-hub-sink.toml` → exe と
+   同じディレクトリ、I2・docs/banto-hub-external-db-design.md §5 参照）。
+4. シェルのサービス一覧画面から `BantoHubSink` を開始する（S6、
+   docs/banto-hub-external-db-design.md §6 row S6）。
+
+### 各フックの手動フォールバック
+
+いずれのステップも失敗時はインストーラを止めません。管理者権限の
+PowerShell から `C:\Program Files\BantoHub\` で手動実行してください。
+
+| 失敗したステップ                  | 手動コマンド                                    |
+| --------------------------------- | ----------------------------------------------- |
+| `BantoHub` サービス登録・ACL 一式 | `.\banto-hub-elev.exe service-install`          |
+| `BantoHubSink` サービス登録       | `.\banto-hub-sink.exe install`                  |
+| `BantoHubSink` への ACL 付与      | `.\banto-hub-sink.exe grant-service-acl`        |
+| `BantoHub` サービス登録解除       | `.\banto-hub-elev.exe service-uninstall`        |
+| `BantoHubSink` サービス登録解除   | `.\banto-hub-sink.exe uninstall`                |
+| profile ACL のみ再付与したい場合  | `.\banto-hub-elev.exe grant-profile-acl`（§11） |
+
+サービスの**起動**自体はインストーラの範囲外です（上記のとおり意図的に
+自動起動しません）- `Start-Service BantoHub`/`Start-Service
+BantoHubSink` または管理 UI・シェルのサービス一覧から明示的に行って
+ください。
 
 ### アンインストール
 
 「アプリと機能」（Windows 設定）または `C:\Program
 Files\BantoHub\uninstall.exe` からアンインストールできます。
-前述のとおり、アンインストール開始時に自動的に `banto-hub.exe
-uninstall`（サービス登録解除）が実行されます。DB
-（`banto-hub.sqlite3`）・データディレクトリ・サービスログファイルは
-削除されません（§11「アンインストール」と同じ - 必要ならファイル自体を
-手動で削除してください）。
+アンインストール開始時（pre-uninstall フック）に、シェルを終了し、
+`BantoHubSink` → `BantoHub` の順でサービス登録を解除します
+（`banto-hub-elev.exe` が見つからない壊れたインストールでは
+`banto-hub.exe uninstall` にフォールバック）。**`%ProgramData%\BantoHub\`
+（DB・サイドカー設定・サービスログ）は削除されません** - 再インストール
+すれば設定・データがそのまま戻ります。完全に削除したい場合はアン
+インストール後に `%ProgramData%\BantoHub\` を手動で削除してください。
 
-### 既知の制約（tauri-bundler 単体利用について）
+### 既知の制約
 
+- **未署名（コード署名なし）**: 配布物は署名されていないため、
+  インストーラ・4 exe いずれも初回実行時に Windows SmartScreen の
+  「発行元不明」警告が出ます（「詳細情報」→「実行」で進めます）。
+  コード署名の導入は banto-hub-desktop-plan.md §16.3 の別件で未着手です。
+- **サイレント/パッシブインストール時のデスクトップショートカット**:
+  tauri-bundler の NSIS テンプレートは、対話的インストールでは
+  「スタートメニューのみ・デスクトップは作らない」設定に従いますが、
+  `/S`（サイレント）または `/P`（パッシブ）でインストールした場合は
+  完了ページ自体がスキップされるため、**デスクトップショートカットを
+  無条件に作成します**（tauri-bundler 2.9.4
+  `nsis/installer.nsi` の `CreateOrUpdateDesktopShortcut` 呼び出し、
+  「Create desktop shortcut for silent and passive installers because
+  finish page will be skipped」というコメントどおりの既定動作、
+  ソース確認済み）。無人インストール（キッティング等）でデスクトップ
+  ショートカットを作りたくない場合は、コマンドラインに `/NS` を追加
+  してください（例: `BantoHub_<version>_x64-setup.exe /S /NS`）。
+- **「インストール後に BantoHub を実行する」チェックボックス**:
+  上記「インストール時の挙動」のとおり I1 で意味のある動作になりました
+  が、tauri-bundler 側にこのチェックボックス自体を消す設定項目は
+  用意されていません（`NsisSettings` を調査済み - 完全に消すには
+  テンプレート全体を独自の `.nsi` に差し替える必要があり、見送って
+  います）。
 - `apps/banto-hub/installer/` は完全な Tauri アプリ（`src-tauri`）を
   作らず、`tauri_bundler::{SettingsBuilder, bundle_project}` を直接
   呼び出す小さな Rust バイナリです。`tauri-bundler` クレートの安定な
@@ -818,20 +936,10 @@ uninstall`（サービス登録解除）が実行されます。DB
   `WindowsSettings`/`NsisSettings`/`PackageType`/`BundleBinary`/
   `bundle_project`）だけで完結しており、`tauri.conf.json` や
   `cargo tauri` CLI は一切経由しません。
-- `WindowsSettings::webview_install_mode`/`NsisSettings::install_mode`
-  の型（`WebviewInstallMode`/`NSISInstallerMode`）は `tauri-bundler`
-  のクレートルートからは再エクスポートされていないため、`tauri-utils`
-  （tauri-bundler 2.9.4 が実際に依存している 2.9.3 系）を直接の依存に
-  追加する必要があった。
-- NSIS の post-install/pre-uninstall フックへのカスタムスクリプト差し込み
-  （`NsisSettings::installer_hooks`）は tauri-bundler が公式にサポートする
-  拡張点で、`${MAINBINARYNAME}`/`$INSTDIR` 変数がその時点で参照できる
-  （`apps/banto-hub/installer/hooks/service-hooks.nsh` 参照）。この機構の
-  おかげで T5-1 の `install`/`uninstall` サブコマンドとの連携が実装できた
-  （上記「Windows サービスの自動登録」）。
-- 前述の「インストール後に実行」チェックボックスのように、GUI
-  アプリ前提の挙動を完全には消せない拡張点も存在する（`installer_hooks`
-  は4つの固定フックポイントのみで、任意の UI 変更はできない）。
+- NSIS の pre-install/post-install/pre-uninstall フックへのカスタム
+  スクリプト差し込み（`NsisSettings::installer_hooks`）は
+  tauri-bundler が公式にサポートする拡張点です
+  （`apps/banto-hub/installer/hooks/service-hooks.nsh` 参照）。
 
 ## 13. 72h 出荷判定ソークテスト
 
