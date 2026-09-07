@@ -123,7 +123,7 @@ const REQUIRED_BINARY_NAMES: [&str; 4] = [
 /// ワークスペース外にあるため `version.workspace = true` が使えず、
 /// 手動で追従させる必要がある - バージョンを上げたら、ここも合わせて
 /// 更新すること。
-const PRODUCT_VERSION: &str = "0.2.0-alpha.4";
+const PRODUCT_VERSION: &str = "0.2.0-alpha.5";
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
