@@ -84,7 +84,9 @@
 //! `banto_hub_core::hub_log` と同じ方針で、サービスモードの間だけ同じ内容を
 //! ファイルへミラーする（コンソールが無いサービスでは標準出力が誰にも
 //! 見えないため）。`warn` は**初回とバックオフ段階・状態が変わったときだけ**
-//! （§5.5「MQTT と同じ抑制」）。
+//! （§5.5「MQTT と同じ抑制」）。サービスログファイルの置き場は
+//! `%ProgramData%\BantoHub\logs\banto-hub-sink-service.log`（[`log`]の
+//! モジュール doc「サービスログファイルの置き場」節参照、I4 追従）。
 
 pub mod config;
 pub mod flush;

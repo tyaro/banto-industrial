@@ -48,7 +48,7 @@ v0.2.0-alpha.2 の配布物は、NSIS インストーラ（**Hub 本体のみ**�
 
 - インストール先: `C:\Program Files\BantoHub\`（PerMachine 固定、現状どおり）。
 - 同梱: `banto-hub-shell.exe`（main）、`banto-hub.exe`、`banto-hub-elev.exe`、`banto-hub-sink.exe`、`banto-hub-sink.toml.example`、ライセンス・README 抜粋。
-- スタートメニューに **BantoHub（シェル）** のショートカット。デスクトップショートカットは作らない（§7-3）。
+- スタートメニューに **BantoHub（シェル）** のショートカット。デスクトップショートカットは既定では作らない（§7-3）。**補足（2026-09-07、I4 追従）**: tauri-bundler のテンプレートは silent / passive ではセクション内で無条件に作り、対話モードでは完了ページの「デスクトップにショートカットを作成」チェック（既定 ON、フックより後に実行）で作る。前者は POSTINSTALL で削除し、後者は利用者の選択に委ねる（フックからは介入できない）。
 - 完了ページの「インストール後に BantoHub を実行する」は、main がシェルになることで**意味のある動作**になる（現状の Hub 単体では消せない既知の制約だったもの）。
 - 製品名 `BantoHub`、ファイル名 `BantoHub_<version>_x64-setup.exe`、識別子 `dev.tyaro.banto-hub`（現状どおり）。
 
@@ -145,6 +145,6 @@ cargo run --manifest-path apps/banto-hub/installer/Cargo.toml --release
 ### 8.2 判明した事項と追従
 
 - **サービス起動の固着（#3）**: `try_acquire_profile_lock` が `AlreadyHeld` のときにサービス本体が SCM へ `Stopped` を報告せずに留まる経路の疑い。修正 PR を別途作成（即時失敗・サービス固有の終了コード・ログ出力）。運用上の回避は「シェルを閉じてから `sc start`」または「シェルの切替操作を使う」。
-- **サイドカーのサービスログ置き場**: `banto-hub-sink-service.log` が exe 隣（`Program Files`）に書かれ、アンインストール後にフォルダが残る。`%ProgramData%\BantoHub\logs\` へ移す（追従）。
-- **デスクトップショートカット**: tauri-bundler のテンプレートは対話インストールでも作る。§7-3（スタートメニューのみ）に合わせて POSTINSTALL で削除する（追従）。
+- **サイドカーのサービスログ置き場**: `banto-hub-sink-service.log` が exe 隣（`Program Files`）に書かれ、アンインストール後にフォルダが残る。`%ProgramData%\BantoHub\logs\` へ移した（追従、`BANTO_HUB_SINK_LOG` で上書き可）。
+- **デスクトップショートカット**: 対話インストールで作られたのは完了ページのチェック（既定 ON）による利用者操作で、フックより後に走るため介入できない。silent / passive で無条件に作られる分は POSTINSTALL で削除する（追従、§4.1 補足）。
 - 事前に残っていた `profile.lock` の内容は診断用で、実体は名前付きミューテックス。プロセス終了で解放される（表示上の pid が古くても異常ではない）。
