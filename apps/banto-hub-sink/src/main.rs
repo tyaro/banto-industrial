@@ -57,6 +57,11 @@ fn main() {
 fn print_usage() {
     eprintln!("使い方: banto-hub-sink.exe [run|install|uninstall|run-service|grant-service-acl]");
     eprintln!("  （引数なし）/ run  コンソールモードで起動（Ctrl-C で停止）");
+    eprintln!(
+        "  設定ファイル（{}）は BANTO_HUB_SINK_CONFIG → %ProgramData%\\BantoHub\\ → exe と\
+         同じディレクトリ の順に探索します",
+        banto_hub_sink::DEFAULT_CONFIG_FILE_NAME
+    );
     #[cfg(windows)]
     {
         eprintln!("  install            Windows サービスとして登録（管理者権限が必要）");
@@ -83,7 +88,8 @@ fn run_console() {
         Err(err) => {
             eprintln!("banto-hub-sink: {err}");
             eprintln!(
-                "banto-hub-sink: 設定ファイルの雛形は docs/banto-hub-external-db-design.md §5.6 と \
+                "banto-hub-sink: 設定ファイルの雛形は docs/banto-hub-external-db-design.md §5.6、\
+                 探索順は docs/banto-hub-installer-design.md §4.4 と \
                  このバイナリの README 相当（`banto_hub_sink::config` のモジュール doc）を参照してください"
             );
             std::process::exit(1);

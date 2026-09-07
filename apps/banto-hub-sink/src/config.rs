@@ -1,6 +1,27 @@
-//! exe 隣の `banto-hub-sink.toml`（設計 §5.6「設定は exe 隣の
-//! `banto-hub-sink.toml`（Hub の URL と admin API キー、hanger-finder と
-//! 同じ置き方）。それ以外の設定はすべて Hub 側」）。
+//! 設定ファイル `banto-hub-sink.toml`（Hub の URL と admin API キー）。
+//! それ以外の設定はすべて Hub 側。
+//!
+//! ## 探索順（インストーラ設計 §4.4、I2、2026-09-07 オーナー決定）
+//!
+//! 旧仕様（設計 §5.6）は exe 隣（`Program Files` 配下）固定だったが、
+//! そこは管理者権限でしか書けない一方、API キーは Hub を起動してから
+//! 発行するため、インストーラが値を埋めて置いてやることができなかった。
+//! そこで探索順を次の3段に変えた:
+//!
+//! 1. [`ENV_CONFIG_PATH`]（`BANTO_HUB_SINK_CONFIG`）- テスト・複数インス
+//!    タンス検証用の明示指定。設定されていれば**存在確認せず即採用**する。
+//! 2. `%ProgramData%\BantoHub\banto-hub-sink.toml`（Windows。
+//!    [`std::env::var_os`] `"ProgramData"` 起点）。非 Windows ビルドは
+//!    探索順ロジック自体をクロスプラットフォームでテストできるよう
+//!    `/etc/banto-hub/banto-hub-sink.toml` を同じ役割の代替として使う
+//!    （本番は Windows 専用製品なのでこのパス自体が使われることはない）。
+//!    ここは**利用者権限で書ける**ため、インストーラが `.example` を
+//!    置き、利用者が Hub 起動後に取得した API キーを書き込める。
+//! 3. exe と同じディレクトリ（旧仕様、後方互換のフォールバック）。
+//!
+//! どこにも見つからなければ [`ConfigError::NotFound`] で3箇所すべてを
+//! 案内する。実際にどのパスを採用したかは起動時に1行ログする
+//! （[`load_config`]。パスのみ・内容は絶対に出さない）。
 //!
 //! ## このファイルに置くもの / 置かないもの
 //!
@@ -63,11 +84,21 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-/// exe 隣に置く設定ファイル名（設計 §5.6）。
+/// 設定ファイル名（探索順のどの段でも同じ名前を使う。モジュール doc
+/// 「探索順」参照）。
 pub const DEFAULT_CONFIG_FILE_NAME: &str = "banto-hub-sink.toml";
 
+/// `%ProgramData%` 配下でインストーラが作るサブディレクトリ名
+/// （インストーラ設計 §4.4）。
+const PROGRAM_DATA_SUBDIR: &str = "BantoHub";
+
+/// 非 Windows ビルドで `%ProgramData%\BantoHub\` 相当として使うパス
+/// （モジュール doc「探索順」参照。本番では使われない）。
+#[cfg(not(windows))]
+const NON_WINDOWS_PROGRAM_DATA_EQUIVALENT: &str = "/etc/banto-hub";
+
 /// 設定ファイルのパスを上書きする環境変数（テスト・複数インスタンス検証用。
-/// 本番は exe 隣の既定パスで足りる）。
+/// 本番は探索順の2番目・3番目の既定パスで足りる）。
 pub const ENV_CONFIG_PATH: &str = "BANTO_HUB_SINK_CONFIG";
 
 // --- 既定値（設計 §5.4 の「既定 10,000 行 / 1,000ms / 500 行」と
@@ -118,6 +149,15 @@ pub enum ConfigError {
         field: &'static str,
         message: String,
     },
+    /// 探索順（モジュール doc「探索順」）の3箇所いずれにも設定ファイルが
+    /// 無い。`program_data_path`/`exe_path` はそれぞれの候補パスが計算
+    /// できなかった異常系（`%ProgramData%` 未設定・exe パス取得失敗）で
+    /// `None` になる。
+    NotFound {
+        env_var: &'static str,
+        program_data_path: Option<PathBuf>,
+        exe_path: Option<PathBuf>,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -134,6 +174,31 @@ impl fmt::Display for ConfigError {
                 path.display()
             ),
             Self::Invalid { field, message } => write!(f, "設定 {field} が不正です: {message}"),
+            Self::NotFound {
+                env_var,
+                program_data_path,
+                exe_path,
+            } => {
+                writeln!(
+                    f,
+                    "設定ファイル {DEFAULT_CONFIG_FILE_NAME} が見つかりません。次の3箇所を探しましたが、どこにもありませんでした:"
+                )?;
+                writeln!(f, "  1. 環境変数 {env_var}（未設定）")?;
+                match program_data_path {
+                    Some(path) => writeln!(f, "  2. {}", path.display())?,
+                    None => writeln!(
+                        f,
+                        "  2. %ProgramData%\\{PROGRAM_DATA_SUBDIR}\\{DEFAULT_CONFIG_FILE_NAME}（%ProgramData% を取得できませんでした）"
+                    )?,
+                }
+                match exe_path {
+                    Some(path) => write!(f, "  3. {}", path.display()),
+                    None => write!(
+                        f,
+                        "  3. 実行ファイルと同じディレクトリの {DEFAULT_CONFIG_FILE_NAME}（実行ファイルの場所を取得できませんでした）"
+                    ),
+                }
+            }
         }
     }
 }
@@ -352,26 +417,90 @@ fn range_usize(
     Ok(())
 }
 
-/// 設定ファイルのパスを解決する: [`ENV_CONFIG_PATH`] があればそれ、
-/// 無ければ **exe と同じディレクトリ**の [`DEFAULT_CONFIG_FILE_NAME`]
-/// （設計 §5.6）。exe パスが取れない異常時だけカレントディレクトリへ
-/// 退避する。
-pub fn resolve_config_path() -> PathBuf {
-    if let Some(path) = std::env::var_os(ENV_CONFIG_PATH) {
-        return PathBuf::from(path);
-    }
-    match std::env::current_exe() {
-        Ok(exe) => exe
-            .parent()
-            .map(|dir| dir.join(DEFAULT_CONFIG_FILE_NAME))
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILE_NAME)),
-        Err(_) => PathBuf::from(DEFAULT_CONFIG_FILE_NAME),
-    }
+/// `%ProgramData%\BantoHub\banto-hub-sink.toml`（Windows）。
+/// `%ProgramData%` 環境変数が取得できない異常系では `None`
+/// （探索順の3番目・exe 隣へフォールバックする）。
+#[cfg(windows)]
+fn program_data_config_path() -> Option<PathBuf> {
+    std::env::var_os("ProgramData").map(|root| {
+        PathBuf::from(root)
+            .join(PROGRAM_DATA_SUBDIR)
+            .join(DEFAULT_CONFIG_FILE_NAME)
+    })
 }
 
-/// [`resolve_config_path`] のファイルを読んで検証する。
+/// 非 Windows ビルドでの `%ProgramData%\BantoHub\` 相当（モジュール doc
+/// 「探索順」参照）。固定パスなので常に `Some`。
+#[cfg(not(windows))]
+fn program_data_config_path() -> Option<PathBuf> {
+    Some(PathBuf::from(NON_WINDOWS_PROGRAM_DATA_EQUIVALENT).join(DEFAULT_CONFIG_FILE_NAME))
+}
+
+/// 設定ファイルのパスを解決する: [`ENV_CONFIG_PATH`] →
+/// `%ProgramData%\BantoHub\banto-hub-sink.toml` → exe と同じディレクトリ
+/// （モジュール doc「探索順」参照）。
+pub fn resolve_config_path() -> Result<PathBuf, ConfigError> {
+    let env_value = std::env::var_os(ENV_CONFIG_PATH).map(PathBuf::from);
+    let program_data_config = program_data_config_path();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    resolve_config_path_with(env_value, program_data_config, exe_dir.as_deref(), |p| {
+        p.exists()
+    })
+}
+
+/// [`resolve_config_path`] の探索順ロジック本体。ファイルの存在確認を
+/// `exists` に切り出してあるので、実際のファイルシステムの状態（や
+/// Windows 専用の `%ProgramData%`）に依存せずテストできる - 単体テストは
+/// `exists` に tempfile ディレクトリ配下のパスを渡す。
+///
+/// - `env_value`: [`ENV_CONFIG_PATH`] の値。設定されていれば**存在確認せず
+///   即採用**する（テスト・複数インスタンス検証用の明示指定のため -
+///   ファイルが無ければ後続の読み込みでそのパスを名指しした
+///   [`ConfigError::Read`] になる）。
+/// - `program_data_config`: 探索順2番目の候補（フルパス）。
+/// - `exe_dir`: 探索順3番目の候補のディレクトリ（[`DEFAULT_CONFIG_FILE_NAME`]
+///   と結合する）。
+fn resolve_config_path_with(
+    env_value: Option<PathBuf>,
+    program_data_config: Option<PathBuf>,
+    exe_dir: Option<&Path>,
+    exists: impl Fn(&Path) -> bool,
+) -> Result<PathBuf, ConfigError> {
+    if let Some(path) = env_value {
+        return Ok(path);
+    }
+
+    if let Some(path) = &program_data_config {
+        if exists(path) {
+            return Ok(path.clone());
+        }
+    }
+
+    let exe_config = exe_dir.map(|dir| dir.join(DEFAULT_CONFIG_FILE_NAME));
+    if let Some(path) = &exe_config {
+        if exists(path) {
+            return Ok(path.clone());
+        }
+    }
+
+    Err(ConfigError::NotFound {
+        env_var: ENV_CONFIG_PATH,
+        program_data_path: program_data_config,
+        exe_path: exe_config,
+    })
+}
+
+/// [`resolve_config_path`] のファイルを読んで検証する。採用したパスは
+/// 起動時に1行ログする（[`crate::log::log_line`]。パスのみ・内容は
+/// 一切出さない）。
 pub fn load_config() -> Result<SidecarConfig, ConfigError> {
-    let path = resolve_config_path();
+    let path = resolve_config_path()?;
+    crate::log::log_line(&format!(
+        "banto-hub-sink: 設定ファイル {} を使用します",
+        path.display()
+    ));
     load_config_from(&path)
 }
 
@@ -553,5 +682,160 @@ shutdown_flush_secs = 0
         let raw = "hub_url = \"nope\"\napi_key = \"bh_test.secret\"\n";
         let err = SidecarConfig::from_toml_str(raw, &path()).expect_err("bad url");
         assert!(!err.to_string().contains("bh_test.secret"), "{err}");
+    }
+
+    // --- 設定ファイルの探索順（モジュール doc「探索順」・インストーラ
+    // --- 設計 §4.4、I2）。`resolve_config_path_with` を直接呼び、
+    // --- `exists` に tempfile 配下のパスを渡すことで、実際の
+    // --- `%ProgramData%`/exe パスに触れずに探索順のロジックだけを検証する。
+
+    /// 存在するファイルの集合から `exists` クロージャを作る。
+    fn exists_among(existing: Vec<PathBuf>) -> impl Fn(&Path) -> bool {
+        move |p: &Path| existing.iter().any(|e| e == p)
+    }
+
+    #[test]
+    fn env_var_wins_even_when_the_file_does_not_exist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let program_data = dir
+            .path()
+            .join("program-data")
+            .join(DEFAULT_CONFIG_FILE_NAME);
+        let exe_dir = dir.path().join("exe-dir");
+        std::fs::create_dir_all(exe_dir.parent().unwrap_or(&exe_dir)).ok();
+        let exe_config = exe_dir.join(DEFAULT_CONFIG_FILE_NAME);
+        let env_path = dir.path().join("explicit.toml");
+
+        // ProgramData/exe 隣の両方にファイルがあっても、env 変数が最優先。
+        let resolved = resolve_config_path_with(
+            Some(env_path.clone()),
+            Some(program_data.clone()),
+            Some(&exe_dir),
+            exists_among(vec![program_data, exe_config]),
+        )
+        .expect("env var should resolve without an existence check");
+        assert_eq!(resolved, env_path);
+    }
+
+    #[test]
+    fn program_data_beats_exe_dir_when_both_exist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let program_data = dir
+            .path()
+            .join("program-data")
+            .join(DEFAULT_CONFIG_FILE_NAME);
+        let exe_dir = dir.path().join("exe-dir");
+        let exe_config = exe_dir.join(DEFAULT_CONFIG_FILE_NAME);
+
+        let resolved = resolve_config_path_with(
+            None,
+            Some(program_data.clone()),
+            Some(&exe_dir),
+            exists_among(vec![program_data.clone(), exe_config]),
+        )
+        .expect("program data candidate exists");
+        assert_eq!(resolved, program_data);
+    }
+
+    #[test]
+    fn exe_dir_is_used_when_program_data_is_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let program_data = dir
+            .path()
+            .join("program-data")
+            .join(DEFAULT_CONFIG_FILE_NAME);
+        let exe_dir = dir.path().join("exe-dir");
+        let exe_config = exe_dir.join(DEFAULT_CONFIG_FILE_NAME);
+
+        // ProgramData 側は候補として渡すが、存在するのは exe 隣だけ。
+        let resolved = resolve_config_path_with(
+            None,
+            Some(program_data),
+            Some(&exe_dir),
+            exists_among(vec![exe_config.clone()]),
+        )
+        .expect("exe dir candidate exists");
+        assert_eq!(resolved, exe_config);
+    }
+
+    #[test]
+    fn exe_dir_is_used_when_program_data_candidate_is_unavailable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exe_dir = dir.path().join("exe-dir");
+        let exe_config = exe_dir.join(DEFAULT_CONFIG_FILE_NAME);
+
+        // %ProgramData% 自体が取れない異常系（program_data_config = None）。
+        let resolved = resolve_config_path_with(
+            None,
+            None,
+            Some(&exe_dir),
+            exists_among(vec![exe_config.clone()]),
+        )
+        .expect("exe dir candidate exists");
+        assert_eq!(resolved, exe_config);
+    }
+
+    #[test]
+    fn none_found_reports_all_three_candidates_in_japanese() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let program_data = dir
+            .path()
+            .join("program-data")
+            .join(DEFAULT_CONFIG_FILE_NAME);
+        let exe_dir = dir.path().join("exe-dir");
+        let exe_config = exe_dir.join(DEFAULT_CONFIG_FILE_NAME);
+
+        let err = resolve_config_path_with(
+            None,
+            Some(program_data.clone()),
+            Some(&exe_dir),
+            exists_among(vec![]),
+        )
+        .expect_err("nothing exists");
+
+        assert!(
+            matches!(
+                err,
+                ConfigError::NotFound {
+                    env_var: ENV_CONFIG_PATH,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let rendered = err.to_string();
+        assert!(rendered.contains(ENV_CONFIG_PATH), "{rendered}");
+        assert!(
+            rendered.contains(&program_data.display().to_string()),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&exe_config.display().to_string()),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn none_found_still_renders_three_lines_when_program_data_and_exe_are_unavailable() {
+        let err = resolve_config_path_with(None, None, None, |_| false)
+            .expect_err("nothing available at all");
+        let rendered = err.to_string();
+        // 見出し1行 + 番号付きの3候補（各1行）であることと、ProgramData/exe の
+        // 両方が取得できなかった旨を案内すること。
+        assert_eq!(rendered.lines().count(), 4, "{rendered}");
+        assert!(rendered.contains("1. 環境変数"), "{rendered}");
+        assert!(rendered.contains("2. %ProgramData%"), "{rendered}");
+        assert!(
+            rendered.contains("3. 実行ファイルと同じディレクトリ"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("%ProgramData% を取得できませんでした"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("実行ファイルの場所を取得できませんでした"),
+            "{rendered}"
+        );
     }
 }
