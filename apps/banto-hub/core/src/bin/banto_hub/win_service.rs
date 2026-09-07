@@ -43,6 +43,7 @@
 //! 判断）。`OnDemand`には遅延自動開始の概念が無い（Windows API 仕様）ため
 //! `install`ではこの呼び出しを行わない。
 
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Duration;
@@ -133,6 +134,69 @@ fn describe_start_failure(err: &HubStartError) -> (u32, String) {
         EXIT_CODE_START_FAILED,
         format!("banto-hub: 起動に失敗しました: {err}"),
     )
+}
+
+/// [`run_service_body`]の`report_status`が「一度`Stopped`を報告したら、
+/// それ以降の状態報告を SCM へ送らない」ようにするためのゲート
+/// （2026-09-07 I4 実機検証で見つかった「停止の二重報告」バグ、issue #330）。
+///
+/// **なぜ必要か（async ブロック内の`return`は関数を抜けない）**:
+/// [`run_service_body`]の起動失敗パスは`runtime.block_on(async move { .. })`
+/// に渡した async ブロックの中にあるため、そこでの`return`は
+/// **async ブロックから抜けるだけ**で`run_service_body`自体は続行し、
+/// 関数末尾の
+/// `log_line("..停止しました")` + `report_status(Stopped, Win32(0))`が必ず
+/// 実行されてしまう。つまり起動失敗時は`Stopped`が2回報告される。
+/// 実機ログにはその2回目が「サービス状態の報告に失敗しました:
+/// IO error in winapi call」として残っていた。
+///
+/// **なぜ終了コードの上書きが危険か**: 2回目の報告は
+/// `ServiceExitCode::Win32(0)`（= 正常終了）である。今のところ 1回目の
+/// `Stopped`で SCM 側のハンドルが無効化され、2回目の Win32 API 呼び出しが
+/// **失敗するおかげで**1回目のサービス固有終了コード
+/// （[`EXIT_CODE_PROFILE_LOCK_HELD`] / [`EXIT_CODE_START_FAILED`]）が
+/// SCM に残っているだけで、この「API が失敗してくれること」に依存した
+/// 状態になっている。もし 2回目が成功すれば、#327 で入れた
+/// 「起動失敗をサービス固有コードで SCM に伝える」設計が終了コード 0 で
+/// 上書きされて壊れる（`sc query`や`Get-EventLog`から失敗種別が読めなく
+/// なる）。API 呼び出しの失敗頼みをやめ、こちら側で明示的に止めるのが
+/// このゲートの目的。
+///
+/// SCM に一切触れない純粋なロジックなので単体テストできる
+/// （`windows-service`の`service_control_handler::register`等は実サービス
+/// プロセスのスレッドでしか呼べず単体テストできない - このファイルの
+/// モジュール doc 参照）。[`run_service_body`]の中だけで、単一スレッドから
+/// 使う想定なので[`Cell`]で足りる（`Arc<AtomicBool>`は不要）。
+#[derive(Default)]
+struct StoppedGate {
+    stopped_reported: Cell<bool>,
+}
+
+impl StoppedGate {
+    /// `current_state`の報告を SCM へ送ってよいかを判定する。送ってよい
+    /// 場合、それが`Stopped`なら「報告済み」として記録する（＝以降は
+    /// `Stopped`かどうかに関わらず`false`を返す）。
+    ///
+    /// 呼び出し側は`false`のとき **SCM 呼び出しもエラーログも行わずに**
+    /// 何もしないこと - 「二重報告が API エラーになった」という紛らわしい
+    /// ログを消すのも、このバグ修正の一部だから。
+    fn accept_report(&self, current_state: ServiceState) -> bool {
+        if self.stopped_reported.get() {
+            return false;
+        }
+        if current_state == ServiceState::Stopped {
+            self.stopped_reported.set(true);
+        }
+        true
+    }
+
+    /// 既に`Stopped`を報告済みか（読み取り専用、記録は変えない）。
+    /// [`run_service_body`]末尾の「Windows サービスを停止しました」ログを
+    /// 出すかどうかの判定に使う - 起動失敗で終わったのに「停止しました」と
+    /// 書かれるのは誤解を招く（実機ログで実際に紛らわしかった）。
+    fn has_reported_stopped(&self) -> bool {
+        self.stopped_reported.get()
+    }
 }
 
 /// `bin/banto-hub.rs`の`install`サブコマンド用引数リテラル。
@@ -235,7 +299,18 @@ fn run_service_body(_arguments: Vec<OsString>) {
         }
     };
 
+    // 起動失敗パスの`return`が async ブロックからしか抜けないせいで
+    // `Stopped`が2回報告される問題を止めるゲート（[`StoppedGate`]の doc に
+    // 「なぜ必要か」「なぜ終了コードの上書きが危険か」を書いた）。
+    let stopped_gate = StoppedGate::default();
     let report_status = |current_state: ServiceState, exit_code: ServiceExitCode| {
+        // 2回目以降（＝既に`Stopped`を報告済み）は SCM を呼ばずに黙って
+        // 戻る。SCM を呼ぶと最初に報告した非0終了コードを Win32(0) で
+        // 上書きしかねない上、実際には API エラーになって紛らわしい
+        // エラーログだけが残る。
+        if !stopped_gate.accept_report(current_state) {
+            return;
+        }
         let controls_accepted = if current_state == ServiceState::Running {
             ServiceControlAccept::STOP
         } else {
@@ -316,7 +391,13 @@ fn run_service_body(_arguments: Vec<OsString>) {
         hub.shutdown().await;
     });
 
-    log_line("banto-hub: Windows サービスを停止しました");
+    // 起動失敗パス（async ブロック内で`Stopped`を報告済み）でここへ落ちて
+    // きた場合は「停止しました」を出さない - 起動できていないのだから
+    // 誤解を招く。`report_status`側もゲートが弾くので、SCM への二重報告
+    // （非0終了コードの Win32(0) 上書き）も起きない。
+    if !stopped_gate.has_reported_stopped() {
+        log_line("banto-hub: Windows サービスを停止しました");
+    }
     report_status(ServiceState::Stopped, ServiceExitCode::Win32(0));
 }
 
@@ -370,6 +451,62 @@ mod tests {
             message.contains("test diagnostic message"),
             "message: {message}"
         );
+    }
+
+    /// issue #330 の回帰テスト（起動失敗パス）: `Stopped`を一度報告したら、
+    /// 次の`Stopped`報告は拒否される。これが`run_service_body`の
+    /// 「async ブロック内の`return`が関数を抜けない」ことによる二重報告を
+    /// 止めている本体で、拒否しないと関数末尾の
+    /// `ServiceExitCode::Win32(0)`が 1回目のサービス固有終了コードを
+    /// 上書きし得る。
+    #[test]
+    fn stopped_gate_rejects_second_stopped_report() {
+        let gate = StoppedGate::default();
+
+        assert!(gate.accept_report(ServiceState::Stopped));
+        assert!(!gate.accept_report(ServiceState::Stopped));
+    }
+
+    /// issue #330: `Stopped`報告後は`Stopped`以外（`Running`等）の報告も
+    /// 拒否する - 一度 SCM へ停止を伝えたハンドルへの追加報告は、
+    /// 状態種別に関わらず行わない。
+    #[test]
+    fn stopped_gate_rejects_any_report_after_stopped() {
+        let gate = StoppedGate::default();
+
+        assert!(gate.accept_report(ServiceState::Stopped));
+        assert!(!gate.accept_report(ServiceState::Running));
+        assert!(!gate.accept_report(ServiceState::StopPending));
+    }
+
+    /// 正常系（`Running`報告 → 停止時に`Stopped`報告）が従来どおり通ることを
+    /// 固定する - ゲートは`Stopped`を通した後だけ閉じる。
+    #[test]
+    fn stopped_gate_allows_running_then_stopped() {
+        let gate = StoppedGate::default();
+
+        assert!(gate.accept_report(ServiceState::Running));
+        assert!(gate.accept_report(ServiceState::Stopped));
+    }
+
+    /// `has_reported_stopped`（末尾の「停止しました」ログを出すかの判定に
+    /// 使う読み取り専用メソッド）が期待どおりの値を返し、かつ問い合わせ
+    /// 自体はゲートの状態を変えないことを固定する。
+    #[test]
+    fn stopped_gate_reports_whether_stopped_was_already_reported() {
+        let gate = StoppedGate::default();
+        assert!(!gate.has_reported_stopped());
+
+        assert!(gate.accept_report(ServiceState::Running));
+        assert!(
+            !gate.has_reported_stopped(),
+            "Running の報告だけではゲートは閉じない"
+        );
+
+        assert!(gate.accept_report(ServiceState::Stopped));
+        assert!(gate.has_reported_stopped());
+        // 読み取り専用であることの確認（問い合わせ後も値は変わらない）。
+        assert!(gate.has_reported_stopped());
     }
 
     /// 2026-09-07 I4 実機検証で見つかったバグの回帰テスト:
