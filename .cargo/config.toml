@@ -1,0 +1,30 @@
+# MSVC 向けに C ランタイム（VCRUNTIME140 / VCRUNTIME140_1）と UCRT を
+# 静的リンクする指定。
+#
+# ## なぜ
+#
+# banto-hub の配布物は (a) NSIS インストーラ経由と (b) 単体 exe 配布の
+# 両方がある（docs/banto-hub-installer-design.md）。デフォルトの MSVC
+# ターゲットは C ランタイムを動的リンクするため、実行環境に VC++ 再頒布可能
+# パッケージ（vc_redist）が入っていないと "VCRUNTIME140_1.dll が見つかりま
+# せん" のようなエラーで起動できない。インストーラ経由の配布であれば
+# vc_redist の同梱・サイレントインストールで踏み倒せるが、(b) の単体 exe
+# 配布にはそもそもインストーラが無く、利用者（オフライン工場 PC の現場作
+# 業者を想定）が redist を自力で導入する手段を持たない。そのため
+# `crt-static` でランタイムを exe に静的に埋め込み、redist の有無に依存し
+# ないようにする。
+#
+# ## トレードオフ
+#
+# vcruntime に脆弱性修正等の更新が入っても、Windows Update では配布先の
+# exe に反映されない。banto-hub 側で再ビルド・再配布して初めて更新が届く
+# ことになる点は認識した上で許容する（オーナー承認済み）。
+#
+# ## 影響範囲
+#
+# このワークスペースの Cargo.toml がある場所からの相対設定のため、
+# ワークスペース全体（テスト・proc macro・apps/chronogazer や
+# apps/relay-wright の src-tauri crate も含む）のビルドに効く。
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

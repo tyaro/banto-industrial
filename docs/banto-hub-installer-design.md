@@ -1,7 +1,7 @@
 # banto-hub 一体インストーラ設計（シェル・Hub・elev・サイドカー同梱）
 
 作成日: 2026-09-07
-状態: **I1〜I4 完了（2026-09-07）**。I4（Windows 実機検証、§8）で新規 / 稼働中の上書き / Hub 単体インストーラからの更新 / アンインストールが設計どおり動くことを確認。判明した不具合（シェルがロック保持中の `sc start BantoHub` が `START_PENDING` で固まる）と追従 2 件（サイドカーのサービスログ置き場、デスクトップショートカット抑止）は §8.2 参照。
+状態: **I1〜I4 完了（2026-09-07）**。I4（Windows 実機検証、§8）で新規 / 稼働中の上書き / Hub 単体インストーラからの更新 / アンインストールが設計どおり動くことを確認。判明した不具合（シェルがロック保持中の `sc start BantoHub` が `START_PENDING` で固まる）と追従 2 件（サイドカーのサービスログ置き場、デスクトップショートカット抑止）は §8.2 参照。併せて VC++ ランタイム前提を `+crt-static` で排除（決定 11、§4.7、2026-09-07）。**配布物の再ビルドが必要**（既存の `dist/0.2.0-alpha.2` の exe は動的リンクのまま）。
 対象: Windows 向け NSIS インストーラ 1 本で、デスクトップシェル（`banto-hub-shell.exe`）・Hub 本体（`banto-hub.exe`）・UAC ヘルパ（`banto-hub-elev.exe`）・DB Sink サイドカー（`banto-hub-sink.exe`）を同じディレクトリに配置し、サービス登録と権限設定まで行う。
 
 関連: [banto-hub-t17-design.md](banto-hub-t17-design.md)（SCM 管理・profile・UAC・インストーラ再設計。§2.3 に現行インストーラの棚卸し）、[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §16.3（配布まわりの未決事項）、[banto-hub-operations.md](banto-hub-operations.md) §12（現行インストーラのビルド手順と挙動）、[banto-hub-external-db-design.md](banto-hub-external-db-design.md) §5（サイドカー）。
@@ -31,7 +31,7 @@ v0.2.0-alpha.2 の配布物は、NSIS インストーラ（**Hub 本体のみ**�
 | サイドカー                 | `install` / `uninstall`（冪等、`OnDemand`、LocalSystem）、`grant-service-acl`（同梱 elev を呼ぶ）。設定は **exe 隣の `banto-hub-sink.toml`**（`BANTO_HUB_SINK_CONFIG` で上書き可）                                              |
 | シェル                     | Tauri v2 の薄いシェル。`frontendDist` は `src-tauri/ui`（静的 1 ページ）。Hub は in-process。`banto-hub-elev.exe` を同ディレクトリで探す。`tauri.conf.json` の `bundle.targets = "all"` だが `cargo tauri build` は使っていない |
 | 版数                       | 4 箇所（workspace、package.json、インストーラの `PRODUCT_VERSION`、`tauri.conf.json` は数値のみ）。NSIS は `0.2.0-alpha.2` のプレリリース識別子を受理（alpha.2 で実証）                                                         |
-| 未決（desktop-plan §16.3） | コード署名（未署名 NSIS は SmartScreen 警告）、WebView2 の同梱方式（オフライン工場 PC）、自動更新は初版スコープ外                                                                                                               |
+| 未決（desktop-plan §16.3） | コード署名（未署名 NSIS は SmartScreen 警告）、自動更新は初版スコープ外。WebView2 の同梱方式は決定 2（`EmbedBootstrapper`）、VC++ ランタイム前提は決定 11（静的リンクで排除、§4.7）で決着                                       |
 
 ## 3. 方式の選択
 
@@ -55,6 +55,8 @@ v0.2.0-alpha.2 の配布物は、NSIS インストーラ（**Hub 本体のみ**�
 ### 4.2 WebView2
 
 シェルは WebView2 が要る。現状の `Skip` は Hub 単体だから許されていた。選択肢は `DownloadBootstrapper`（既定、要ネット）、`EmbedBootstrapper`（+約 2 MB、ランタイム未導入時のみネット）、`OfflineInstaller`（+約 130 MB、完全オフライン）、`FixedRuntime`（固定版同梱）。**推奨は `EmbedBootstrapper`**: Windows 10/11 の工場 PC は Edge 由来の WebView2 が入っていることがほとんどで、無い場合だけ取得に行く。完全オフライン要件が実案件で出た時点で `OfflineInstaller` 版を別途作る（§7-2）。
+
+なお、もう 1 つの実行時前提だった VC++ ランタイムは §4.7 で静的リンクにより排除した（WebView2 と違い、こちらは前提そのものが無くなる）。
 
 ### 4.3 フック（NSIS）
 
@@ -96,6 +98,18 @@ cargo run --manifest-path apps/banto-hub/installer/Cargo.toml --release
 
 生成ツールは `target/release/` の 4 exe を既定で拾い、無ければ明確なエラーで止める。
 
+### 4.7 VC++ ランタイム（C ランタイムの静的リンク）
+
+WebView2（§4.2）と並ぶもう 1 つの実行時前提が **Microsoft Visual C++ 再頒布可能パッケージ**だった。MSVC ターゲットの Rust バイナリは既定で C ランタイムを動的リンクするため、4 exe すべてが `VCRUNTIME140.dll` を、シェルは加えて `VCRUNTIME140_1.dll`（x64 の C++ 例外処理ランタイム、VS2019 = 14.20 で追加）をインポートしていた（`MSVCP140.dll` はどれも未使用）。redist 未導入の PC ではシェルだけが「`VCRUNTIME140_1.dll` が見つかりません」で起動できない。
+
+**採用: `+crt-static` による静的リンク**（`.cargo/config.toml`、決定 11）。redist を同梱する案は**インストーラ経由の配布しか救えない**のが決め手だった。§7 決定 9 で exe 単体配布を継続すると決めており、そちらにはインストーラが無いため、利用者が redist を自力で導入する手段を持たない。静的リンクは両方の配布経路を一度に解決する。
+
+- 併せて UCRT（`api-ms-win-crt-*.dll`）も静的リンクされるため、Windows 8.1 / 7 での KB2999226（Universal CRT 更新）前提も消える。
+- 代償は、vcruntime に更新が入っても Windows Update では配布先に届かず、再ビルド・再配布が要ること。対象は `memcpy` や例外処理レベルの薄い層で、攻撃面は WebView2（OS 更新で維持される）側にあるため許容する。
+- 設定はワークスペース全体（テスト・proc macro・chronogazer / relay-wright の src-tauri も含む）に効く。CI の `rust` ジョブは windows-latest で `cargo clippy --workspace --all-targets` と `cargo test --workspace` を回すため、`cargo test --workspace --no-run` がローカルで通ることを確認済み（`sqlx-macros` 等の proc macro dylib もリンク可）。
+
+検証（2026-09-07、この開発 PC）: 4 exe の PE インポートテーブルを実測し、`VCRUNTIME140*` と `api-ms-win-crt-*` がすべて消えたことを確認した。残る `api-ms-win-core-synch-l1-2-0.dll` は OS の API セットで redist とは無関係。サイズ増は 1 exe あたり +110〜145 KB にとどまる。`banto-hub.exe` / `banto-hub-sink.exe` は再ビルド後も使い方表示まで正常に起動する。
+
 ## 5. 非スコープ
 
 - コード署名（未署名のため SmartScreen の「発行元不明」は残る。desktop-plan §16.3 の別件）。
@@ -112,20 +126,21 @@ cargo run --manifest-path apps/banto-hub/installer/Cargo.toml --release
 | I3    | `scripts/build-release.ps1` と docs（operations.md §12 の全面改訂、README の配布物説明）                                                                                                                          | スクリプト 1 回でインストーラと SHA256SUMS が揃う                                                                                                        |
 | I4    | 実機検証: 新規インストール / 稼働中の上書き / アンインストール / 再インストールで設定が戻る。S7（外部 DB 検証）と同日に実施                                                                                       | 結果を docs に記録                                                                                                                                       |
 
-## 7. オーナー決定項目（2026-09-07 決定済み: 1〜10 すべて推奨どおり）
+## 7. オーナー決定項目（2026-09-07 決定済み: 1〜11 すべて推奨どおり）
 
-| #   | 項目                                 | 推奨                                                                              |
-| --- | ------------------------------------ | --------------------------------------------------------------------------------- |
-| 1   | 方式（§3）                           | **案 A**（既存ツールの複数バイナリ化）                                            |
-| 2   | WebView2 の導入方式（§4.2）          | **`EmbedBootstrapper`**。完全オフライン版は要望が出てから                         |
-| 3   | ショートカット                       | スタートメニューのみ。デスクトップには作らない                                    |
-| 4   | 上書き時のサービス停止・再開（§4.3） | **自動で停止し、動いていたものだけ再開**                                          |
-| 5   | サイドカー設定の置き場（§4.4）       | **`%ProgramData%\BantoHub\banto-hub-sink.toml`** を優先、exe 隣は後方互換         |
-| 6   | サイドカーのサービス登録（§4.3）     | **インストーラが登録**（起動はしない、Hub と同じ）                                |
-| 7   | アンインストール時のデータ（§4.5）   | **ProgramData と profile は残す**（現状どおり）                                   |
-| 8   | ビルドスクリプト（§4.6）             | 作る（`scripts/build-release.ps1`）                                               |
-| 9   | exe 単体配布の継続                   | インストーラと**併記**して続ける（サービス化しない評価用途向け）                  |
-| 10  | 着手時期                             | S7（実 DB 検証）と同じ実機セッションで I4 を消化できるよう、I1〜I3 を先に済ませる |
+| #   | 項目                                 | 推奨                                                                                 |
+| --- | ------------------------------------ | ------------------------------------------------------------------------------------ |
+| 1   | 方式（§3）                           | **案 A**（既存ツールの複数バイナリ化）                                               |
+| 2   | WebView2 の導入方式（§4.2）          | **`EmbedBootstrapper`**。完全オフライン版は要望が出てから                            |
+| 3   | ショートカット                       | スタートメニューのみ。デスクトップには作らない                                       |
+| 4   | 上書き時のサービス停止・再開（§4.3） | **自動で停止し、動いていたものだけ再開**                                             |
+| 5   | サイドカー設定の置き場（§4.4）       | **`%ProgramData%\BantoHub\banto-hub-sink.toml`** を優先、exe 隣は後方互換            |
+| 6   | サイドカーのサービス登録（§4.3）     | **インストーラが登録**（起動はしない、Hub と同じ）                                   |
+| 7   | アンインストール時のデータ（§4.5）   | **ProgramData と profile は残す**（現状どおり）                                      |
+| 8   | ビルドスクリプト（§4.6）             | 作る（`scripts/build-release.ps1`）                                                  |
+| 9   | exe 単体配布の継続                   | インストーラと**併記**して続ける（サービス化しない評価用途向け）                     |
+| 10  | 着手時期                             | S7（実 DB 検証）と同じ実機セッションで I4 を消化できるよう、I1〜I3 を先に済ませる    |
+| 11  | VC++ ランタイム（§4.7）              | **`+crt-static` で静的リンク**。redist の同梱はしない（単体 exe 配布を救えないため） |
 
 ## 8. 実機検証結果（I4、2026-09-07、この開発 PC）
 
