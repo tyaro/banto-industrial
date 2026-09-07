@@ -1,7 +1,7 @@
 # banto-hub 一体インストーラ設計（シェル・Hub・elev・サイドカー同梱）
 
 作成日: 2026-09-07
-状態: **I1〜I4 完了（2026-09-07）**。I4（Windows 実機検証、§8）で新規 / 稼働中の上書き / Hub 単体インストーラからの更新 / アンインストールが設計どおり動くことを確認。判明した不具合（シェルがロック保持中の `sc start BantoHub` が `START_PENDING` で固まる）と追従 2 件（サイドカーのサービスログ置き場、デスクトップショートカット抑止）は §8.2 参照。併せて VC++ ランタイム前提を `+crt-static` で排除（決定 11、§4.7、2026-09-07）。**配布物の再ビルドが必要**（既存の `dist/0.2.0-alpha.2` の exe は動的リンクのまま）。
+状態: **I1〜I4 完了（2026-09-07）**。I4（Windows 実機検証、§8）で新規 / 稼働中の上書き / Hub 単体インストーラからの更新 / アンインストールが設計どおり動くことを確認。判明した不具合（シェルがロック保持中の `sc start BantoHub` が `START_PENDING` で固まる）と追従 2 件（サイドカーのサービスログ置き場、デスクトップショートカット抑止）は §8.2 参照。併せて VC++ ランタイム前提を `+crt-static` で排除（決定 11、§4.7、2026-09-07）。v0.2.0-alpha.3 の配布物で実機再確認済み（§8.3）。
 対象: Windows 向け NSIS インストーラ 1 本で、デスクトップシェル（`banto-hub-shell.exe`）・Hub 本体（`banto-hub.exe`）・UAC ヘルパ（`banto-hub-elev.exe`）・DB Sink サイドカー（`banto-hub-sink.exe`）を同じディレクトリに配置し、サービス登録と権限設定まで行う。
 
 関連: [banto-hub-t17-design.md](banto-hub-t17-design.md)（SCM 管理・profile・UAC・インストーラ再設計。§2.3 に現行インストーラの棚卸し）、[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §16.3（配布まわりの未決事項）、[banto-hub-operations.md](banto-hub-operations.md) §12（現行インストーラのビルド手順と挙動）、[banto-hub-external-db-design.md](banto-hub-external-db-design.md) §5（サイドカー）。
@@ -163,3 +163,21 @@ WebView2（§4.2）と並ぶもう 1 つの実行時前提が **Microsoft Visual
 - **サイドカーのサービスログ置き場**: `banto-hub-sink-service.log` が exe 隣（`Program Files`）に書かれ、アンインストール後にフォルダが残る。`%ProgramData%\BantoHub\logs\` へ移した（追従、`BANTO_HUB_SINK_LOG` で上書き可）。
 - **デスクトップショートカット**: 対話インストールで作られたのは完了ページのチェック（既定 ON）による利用者操作で、フックより後に走るため介入できない。silent / passive で無条件に作られる分は POSTINSTALL で削除する（追従、§4.1 補足）。
 - 事前に残っていた `profile.lock` の内容は診断用で、実体は名前付きミューテックス。プロセス終了で解放される（表示上の pid が古くても異常ではない）。
+
+### 8.3 alpha.3（C ランタイム静的リンク）の実機確認（2026-09-07、この開発 PC）
+
+`dist/0.2.0-alpha.3/BantoHub_0.2.0-alpha.3_x64-setup.exe`（21.3 MB、§4.7 の `+crt-static` を入れたブランチでビルド）を、I4 のアンインストール直後の状態（サービス未登録・`C:\Program Files\BantoHub` 無し）から対話モードで実行した。
+
+| #   | 手順                                        | 結果                                                                                                                                                                                      |
+| --- | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | 新規インストール                            | **合格**。4 exe + `banto-hub-sink.toml.example` + `uninstall.exe`、両サービスとも登録済み・`DEMAND_START`・停止、`BantoHub Operators` の ACE（`CCLCRPWP`）                                |
+| 2   | シェルの GUI（WebView2 × 静的 CRT）         | **合格**。ウィンドウに Hub の UI が描画され、状態画面のバージョンは `0.2.0-alpha.3`。in-process Hub が `GET /` と `/openapi.json` に 200                                                  |
+| 3   | 稼働中プロセスのモジュール実測              | **合格**。シェルの 69 モジュールのうち CRT 系は `C:\Windows\System32` の `ucrtbase.dll` / `msvcp_win.dll`（OS インボックス）のみで、redist の `VCRUNTIME140*` / `MSVCP140.dll` は未ロード |
+| 4   | シェル稼働中の `sc start BantoHub`          | **合格**（#327 の修正確認）。I4 の `START_PENDING` 固着は再現せず、即座に失敗して `Stopped`。ログに `profile 'default' は既に別プロセスが使用中です（owner: pid=..., host_kind=shell）`   |
+| 5   | シェル終了後のサービス起動                  | **合格**。0.3 秒で `Running`、`/openapi.json` 200                                                                                                                                         |
+| 6   | `BantoHubSink` の起動（設定ファイル未配置） | **合格**。自ら停止し、`%ProgramData%\BantoHub\logs\banto-hub-sink-service.log` に探索した 3 パスを記録（I2 の探索順と #328 のログ置き場を同時に確認）                                     |
+| 7   | サービス稼働中のアンインストール            | **合格**。両サービスの登録解除、exe / スタートメニュー / インストール先の削除。`%ProgramData%\BantoHub`（profile の DB）と `BantoHub Operators` グループは保持                            |
+
+配布物 4 exe は、通常インポート・**遅延ロードインポート**・実行時ロード用の文字列のいずれにも `vcruntime` / `msvcp` を含まない（NSIS インストーラ本体も同様）。redist 未導入 PC そのものでの確認は、この開発 PC に redist が入っているため未実施だが、ローダが参照する経路が無いことは上記で確定している。
+
+小さな観察: 手順 4 の起動失敗の直後、サービスログに `サービス状態の報告に失敗しました: IO error in winapi call` が残る。起動失敗そのものは正しく処理されており（SCM は `Stopped`、`Start-Service` はエラーを返す）実害は確認されていないが、#327 の経路で SCM への最終報告が空振りしている可能性がある。
