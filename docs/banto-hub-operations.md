@@ -6,7 +6,9 @@
 実装に合わせて修正済み（2026-09-01）。§5 の Modbus 書き込み記述を実態
 （#131 で対応済み）に是正、§20「MCP 外部インターフェース」を追加
 （2026-09-06）。§12「インストーラ」を一体インストーラ（I1〜I3、
-docs/banto-hub-installer-design.md）に合わせて全面改訂（2026-09-07）。**
+docs/banto-hub-installer-design.md）に合わせて全面改訂（2026-09-07）。
+§12 に VC++ ランタイム不要（C ランタイム静的リンク、design §4.7）を追記
+（2026-09-07）。**
 最終検証日(コード照合): 2026-09-07
 
 対象読者: banto-hub を現場に導入・運用するオペレータ／導入担当者。
@@ -820,6 +822,10 @@ cargo run --manifest-path apps/banto-hub/installer/Cargo.toml --release -- targe
   いれば追加のダウンロードは発生せず、無い場合だけインストーラが取得
   しに行きます（完全オフライン環境向けの `OfflineInstaller` 版は
   要望が出た時点で別途用意 - design §4.2）。
+- **VC++ ランタイム**: **不要です**。4 つの exe は C ランタイム
+  （`VCRUNTIME140.dll` 系）と UCRT を静的リンクしており、Visual C++
+  再頒布可能パッケージが入っていない PC でも動きます（インストーラ
+  経由・exe 単体配布のどちらでも同じ - design §4.7）。
 - **上書き前の停止**（post-install の前、pre-install フック）: 稼働中
   なら `BantoHubSink` → `BantoHub` の順でサービスを停止し（`STOPPED`
   まで最大30秒待つ）、`banto-hub-shell.exe` が動いていれば
