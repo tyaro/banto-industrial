@@ -160,9 +160,60 @@ Var StopWaitCounter
   ${EndIf}
 !macroend
 
+; alpha.2 で公開済みの Hub単体インストーラ（main=`banto-hub.exe`）から I1
+; 一体インストーラ（main=`banto-hub-shell.exe`）へ上書きインストールすると
+; `banto-hub.exe` が消える経路を塞ぐ（PR #322 レポートで発見）。
+;
+; tauri-bundler 2.9.4 の installer.nsi テンプレート（crates.io から取得した
+; ソースで確認済み: bundle/windows/nsis/installer.nsi、Section Install）は
+; File 命令での本体コピー（テンプレート行648）より後、行690-698 で次を行う:
+;
+;   ; Remove old main binary if it doesn't match new main binary name
+;   ReadRegStr $OldMainBinaryName SHCTX "${UNINSTKEY}" "MainBinaryName"
+;   ${If} $OldMainBinaryName != ""
+;   ${AndIf} $OldMainBinaryName != "${MAINBINARYNAME}.exe"
+;     Delete "$INSTDIR\$OldMainBinaryName"
+;   ${EndIf}
+;
+;   ; Save current MAINBINARYNAME for future updates
+;   WriteRegStr SHCTX "${UNINSTKEY}" "MainBinaryName" "${MAINBINARYNAME}.exe"
+;
+; `${UNINSTKEY}` は `Software\Microsoft\Windows\CurrentVersion\Uninstall\
+; ${PRODUCTNAME}`（テンプレート行66、このプロジェクトでは "...\Uninstall\
+; BantoHub"）、`${MAINBINARYNAME}` は I1 では `banto-hub-shell`
+; （main.rs の `SHELL_BINARY_NAME`、テンプレート行52 で埋め込まれる）。
+; alpha.2 の Hub単体インストーラはここに "MainBinaryName"="banto-hub.exe"
+; を書き込み済みなので、そこから I1 へ上書きすると
+; `$OldMainBinaryName`="banto-hub.exe" != "banto-hub-shell.exe" と判定され、
+; File 命令でコピーしたばかりの `$INSTDIR\banto-hub.exe`
+; （I1 では main ではなく同梱バイナリの1つ）が `Delete` される -
+; Hub 本体が消えたまま「インストール完了」になってしまう。
+;
+; 対策方式: `NSIS_HOOK_PREINSTALL` はテンプレートの File コピー・上記削除
+; 判定（テンプレート行641-643 で挿入 → 648 → 690-698、いずれも
+; NSIS_HOOK_PREINSTALL より後）より**前**に実行される。ここでレジストリの
+; "MainBinaryName" を先読みし、旧 Hub単体インストーラの値 "banto-hub.exe"
+; と一致する場合は新 main の値 "banto-hub-shell.exe" に書き換えてしまう
+; ことで、テンプレート側の
+; `$OldMainBinaryName != "${MAINBINARYNAME}.exe"` 判定を先に「一致」に
+; させ、削除処理そのものをスキップさせる（POSTINSTALL でテンプレートが
+; 改めて同じ値を書き直すだけなので副作用は無い）。
+; ファイルコピー後に走る削除自体をフックから直接止める手段は無い
+; （NSIS_HOOK_POSTINSTALL はテンプレート行733-734 挿入 = 削除判定より
+; さらに後なので手遅れ）ため、判定の入力（レジストリ値）を先に無害化する
+; このレジストリ先読み方式を選んだ。
+!macro FixupHubOnlyInstallerMainBinaryName
+  ReadRegStr $0 SHCTX "${UNINSTKEY}" "MainBinaryName"
+  ${If} $0 == "banto-hub.exe"
+    DetailPrint "banto-hub: alpha.2 の Hub単体インストーラからの上書きを検出しました。banto-hub.exe が誤って削除されないようレジストリの MainBinaryName を更新します..."
+    WriteRegStr SHCTX "${UNINSTKEY}" "MainBinaryName" "banto-hub-shell.exe"
+  ${EndIf}
+!macroend
+
 ; --- フック本体 ---------------------------------------------------------
 
 !macro NSIS_HOOK_PREINSTALL
+  !insertmacro FixupHubOnlyInstallerMainBinaryName
   !insertmacro StopServiceIfRunning "BantoHubSink" $SinkWasRunning
   !insertmacro StopServiceIfRunning "BantoHub" $BantoHubWasRunning
   !insertmacro TerminateShellIfRunning
