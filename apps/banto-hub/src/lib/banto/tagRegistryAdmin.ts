@@ -49,7 +49,7 @@ export const POSTGRES_PROTOCOL: PlcProtocol = 'postgres';
  * `"modbus-tcp"`/`"slmp"` 接続でのみ意味を持つ（virtual/postgres では
  * 無意味 — `unitId` と同じ扱い）。
  *
- * 2026-09-08 オーナー決定（issue #330 の修正に伴う整理）:
+ * 2026-09-08 オーナー決定（issue #325 の修正に伴う整理）:
  * 当初 `SlmpWordOrder` という名前だったが、SLMP専用ではなく modbus-tcp
  * 接続にも同じ意味で存在する（従来は UI が modbus-tcp では出さず常に既定値
  * `low_high` のまま保存していたが、Rust側の収集ポーリング経路は modbus-tcp
@@ -139,7 +139,7 @@ export function isDbSourceConnection(conn: Pick<PlcConnection, 'protocol'>): boo
  * 2026-09-08 オーナー決定: `wordOrder` が意味を持つプロトコル判定
  * （`modbus-tcp`/`slmp` のみ - `virtual`/`postgres` では `unitId` と同じく
  * 無意味）。`ConnectionDrawer.svelte` のフィールド出し分けが使う - 以前は
- * `slmp` のみだったが、issue #330 の修正で `modbus-tcp` にも UI から
+ * `slmp` のみだったが、issue #325 の修正で `modbus-tcp` にも UI から
  * ワード順を設定できるようにした。
  */
 export function hasWordOrder(conn: Pick<PlcConnection, 'protocol'>): boolean {

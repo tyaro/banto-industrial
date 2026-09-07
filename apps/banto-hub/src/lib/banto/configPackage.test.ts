@@ -357,7 +357,7 @@ describe('configPackage', () => {
 		expect(() => parseConfigPackage(JSON.stringify(withBadWordOrder))).toThrow(/wordOrder/);
 	});
 
-	// --- 2026-09-08 オーナー決定（issue #330 の修正）: modbus-tcp 接続の
+	// --- 2026-09-08 オーナー決定（issue #325 の修正）: modbus-tcp 接続の
 	// wordOrder（既定が high_low に変わった）が export/import で正しく
 	// 往復すること。以前は UI が modbus-tcp でこのフィールドを一切編集させず
 	// 常に列の初期値 'low_high' が保存されていたため、この経路は事実上

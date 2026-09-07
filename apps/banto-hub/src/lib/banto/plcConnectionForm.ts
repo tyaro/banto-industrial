@@ -28,7 +28,7 @@
  *    実機 R08ENCPU は `192.168.11.200:5200` だが、これは実機固有の値であり
  *    既定値には採用しない（実装指示のとおり）。
  * 4. **プロトコルに応じた既定ワード順の追従**（2026-09-08 オーナー決定、
- *    issue #330 の修正 - ポートの追従（上記3）と同じ「未編集なら追従、
+ *    issue #325 の修正 - ポートの追従（上記3）と同じ「未編集なら追従、
  *    明示的に編集した後は上書きしない」方式）: {@link DEFAULT_WORD_ORDERS}・
  *    {@link defaultWordOrderFor}・{@link isDefaultWordOrderForProtocol}。
  *    `modbus-tcp` = `high_low`（Modbus/IEEE慣習に統一 - 収集ポーリング経路と
@@ -100,7 +100,7 @@ export function isDefaultPortForProtocol(port: string, protocol: PlcProtocol): b
 }
 
 /**
- * プロトコルごとの既定ワード順（2026-09-08 オーナー決定、issue #330 の修正）。
+ * プロトコルごとの既定ワード順（2026-09-08 オーナー決定、issue #325 の修正）。
  * `modbus-tcp` = `high_low`（Modbus/IEEE 慣習に統一 - 収集ポーリング経路が
  * 常に HighLow 固定で読んでいたのに read-on-demand/書き込み経路は列の値
  * （旧既定 `low_high`）を読んでいたため、同じ u32/f32 タグが経路によって
@@ -136,6 +136,26 @@ export function isDefaultWordOrderForProtocol(
 ): boolean {
 	const def = defaultWordOrderFor(protocol);
 	return def !== undefined && wordOrder === def;
+}
+
+/**
+ * フォームを開いた時点で「ユーザーがワード順を明示的に選んだ状態」とみなすか
+ * （`ConnectionDrawer.svelte` の `wordOrderTouched` の初期値）。`true` を返すと
+ * 以後プロトコルを切り替えてもワード順は追従しなくなる。
+ *
+ * `virtual`/`postgres` は**ワード順の欄がそもそもフォームに出ない**
+ * （`hasWordOrder` 参照）ので、保存されている値が何であれ「ユーザーは触って
+ * いない」= `false` とする。ここを
+ * `!isDefaultWordOrderForProtocol(...)` だけで決めると、既定を持たない
+ * プロトコルでは常に `true` になり、そこから `modbus-tcp` へ切り替えたときに
+ * 既定ワード順の追従が効かない - 例えば既存の postgres 接続（DB 上は
+ * `word_order='low_high'` 固定）を Modbus に変更すると、ユーザーがワード順を
+ * 触らない限り `low_high` のまま保存され、Modbus の既定 `high_low`
+ * （2026-09-08 オーナー決定）と食い違う。
+ */
+export function initialWordOrderTouched(wordOrder: WordOrder, protocol: PlcProtocol): boolean {
+	if (defaultWordOrderFor(protocol) === undefined) return false;
+	return !isDefaultWordOrderForProtocol(wordOrder, protocol);
 }
 
 /**
@@ -226,7 +246,7 @@ export function blankConnectionForm(): PlcConnectionFormState {
 		unitId: '1',
 		enabled: true,
 		simulation: false,
-		// 2026-09-08 オーナー決定（issue #330 の修正）: プロトコルごとの既定
+		// 2026-09-08 オーナー決定（issue #325 の修正）: プロトコルごとの既定
 		// ワード順（{@link DEFAULT_WORD_ORDERS}）に一致させる - ここでの既定
 		// protocol は 'modbus-tcp' なので、その既定 'high_low' を使う。
 		wordOrder: DEFAULT_WORD_ORDERS['modbus-tcp'],

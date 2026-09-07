@@ -18,7 +18,7 @@
 	 * 1. 識別: 名前（TAG-UX-8 の連番プリフィル対象）
 	 * 2. プロトコルと接続先: プロトコル/ホスト/ポート/ユニットID/
 	 *    （modbus-tcp/slmpのみ、2026-09-08 オーナー決定で modbus-tcp にも
-	 *    拡大 - issue #330 の修正）ワード順/有効/シミュレーション
+	 *    拡大 - issue #325 の修正）ワード順/有効/シミュレーション
 	 * 3. 接続テスト・確認: 入力内容の確認表示 + 接続テスト + 「作成」
 	 *
 	 * **T19 S1-b（UX-31、2026-09-02 オーナー決定「作成＝中央モーダル、
@@ -91,7 +91,7 @@
 		defaultWordOrderFor,
 		formToConnectionInput,
 		isDefaultPortForProtocol,
-		isDefaultWordOrderForProtocol,
+		initialWordOrderTouched,
 		nextConnectionName,
 		validatePostgresFields,
 		type PlcConnectionFormState
@@ -228,7 +228,7 @@
 
 	/**
 	 * 現在のワード順がまだ「プロトコルの既定値のまま（未編集）」かどうか。
-	 * `portTouched` と同じ設計（2026-09-08 オーナー決定、issue #330 の修正）:
+	 * `portTouched` と同じ設計（2026-09-08 オーナー決定、issue #325 の修正）:
 	 * `false` の間だけ `onProtocolChange` がワード順を新プロトコルの既定値へ
 	 * 書き換える。ユーザーがワード順セレクトを直接操作した時点で `true` に
 	 * 固定する。
@@ -282,7 +282,7 @@
 		dbTestState = blankDbTestState();
 		step = 1;
 		portTouched = !isDefaultPortForProtocol(form.port, form.protocol);
-		wordOrderTouched = !isDefaultWordOrderForProtocol(form.wordOrder, form.protocol);
+		wordOrderTouched = initialWordOrderTouched(form.wordOrder, form.protocol);
 
 		// T18-6d: 「接続を削除」からの起動 - フォーム初期化直後に既存の
 		// handleDelete を1回だけ呼ぶ（上の Props.requestDelete 参照）。
