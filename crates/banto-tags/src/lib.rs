@@ -41,16 +41,16 @@ pub use collection_group::{
 };
 pub use plc_connection::{
     PlcConnection, PlcConnectionCascadeOutcome, PlcConnectionInput, PlcConnectionService,
-    ALLOWED_PROTOCOLS, CALC_CONNECTION_NAME, MEM_CONNECTION_NAME, POSTGRES_PROTOCOL,
-    VIRTUAL_PROTOCOL,
+    ALLOWED_PROTOCOLS, ALLOWED_WORD_ORDERS, CALC_CONNECTION_NAME, MEM_CONNECTION_NAME,
+    MODBUS_PROTOCOL, POSTGRES_PROTOCOL, VIRTUAL_PROTOCOL, WORD_ORDER_HIGH_LOW, WORD_ORDER_LOW_HIGH,
 };
 pub use scaling::{scale_raw, unscale, Scaling};
 pub use tag::{
     BatchTagDeleteError, BatchTagDeleteOutcome, BatchTagError, BatchTagOutcome,
     BatchTagUpdateError, BatchTagUpdateOutcome, GroupTagCount, Tag, TagInput, TagService,
     TagUpdateError, ALLOWED_DATA_TYPES, ALLOWED_STRING_ENCODINGS, ALLOWED_TAG_KINDS,
-    COMPUTED_TAG_KIND, DB_TAG_KIND, INTERNAL_TAG_KIND, MAX_DB_COLUMN_NAME_LEN, NUMERIC_DATA_TYPES,
-    PLC_TAG_KIND, STRING_DATA_TYPE,
+    COMPUTED_TAG_KIND, DB_TAG_KIND, INTERNAL_TAG_KIND, MAX_DB_COLUMN_NAME_LEN,
+    MODBUS_ONLY_DATA_TYPES, NUMERIC_DATA_TYPES, PLC_TAG_KIND, STRING_DATA_TYPE,
 };
 
 use banto_core::BantoError;

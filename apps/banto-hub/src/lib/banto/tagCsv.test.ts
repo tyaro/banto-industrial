@@ -668,6 +668,25 @@ describe('exportTagsCsv', () => {
 			expect(rows[0].tag.stringEncoding).toBe('shift_jis');
 		});
 
+		test.each(['i64', 'u64', 'f64'] as const)(
+			'#325: %s タグ(64bit 型、modbus 参照番号アドレス)',
+			(dt) => {
+				const tag = makeTag({
+					id: 103,
+					name: 'BigTag',
+					collectionGroupId: GROUP_A_X.id,
+					address: '40001',
+					dataType: dt,
+					decimals: 0,
+					tagKind: 'plc'
+				});
+				const csv = exportTagsCsv([tag], CONNECTIONS, GROUPS);
+				const rows = expectOk(parseTagsCsv(csv, CONNECTIONS, GROUPS));
+				expect(rows[0].tag.dataType).toBe(dt);
+				expect(rows[0].tag.address).toBe('40001');
+			}
+		);
+
 		it('computed タグ(address/writable が強制される)', () => {
 			const tag = makeTag({
 				id: 102,
@@ -883,11 +902,14 @@ describe('parseTagsCsv', () => {
 			expect(errors).toContainEqual({ lineNumber: 2, message: 'dataType "xyz" は不正な値です。' });
 		});
 
-		test.each(['bit', 'i16', 'u16', 'i32', 'u32', 'f32'] as const)('%s は受理される', (dt) => {
-			const text = buildCsv([row({ dataType: dt })]);
-			const rows = expectOk(parseTagsCsv(text, CONNECTIONS, GROUPS));
-			expect(rows[0].tag.dataType).toBe(dt);
-		});
+		test.each(['bit', 'i16', 'u16', 'i32', 'u32', 'f32', 'i64', 'u64', 'f64'] as const)(
+			'%s は受理される',
+			(dt) => {
+				const text = buildCsv([row({ dataType: dt })]);
+				const rows = expectOk(parseTagsCsv(text, CONNECTIONS, GROUPS));
+				expect(rows[0].tag.dataType).toBe(dt);
+			}
+		);
 
 		it('string は stringLength とあわせて受理される', () => {
 			const text = buildCsv([row({ dataType: 'string', stringLength: '8' })]);

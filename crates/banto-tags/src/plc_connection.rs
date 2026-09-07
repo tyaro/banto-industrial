@@ -113,9 +113,42 @@
 //! protocol-inapplicable fields (contrast `"virtual"`'s `host`/`port`
 //! relaxation, which still validates the caller's value when one is given,
 //! and `simulation`'s outright rejection for `"virtual"`) - chosen because a
-//! generic UI/MCP caller that always sends its modbus-tcp defaults
-//! (`unitId: 1`, `wordOrder: "low_high"`) for every protocol should not need
-//! postgres-specific branching just to avoid a validation error.
+//! generic UI/MCP caller that always sends its own defaults (`unitId: 1`,
+//! some `wordOrder`) for every protocol should not need postgres-specific
+//! branching just to avoid a validation error.
+//!
+//! ## `word_order` is a Modbus setting too (#325, 2026-09-08 オーナー決定)
+//!
+//! Migration `0010` added `word_order` **for SLMP** and said as much: its
+//! header calls the column "modbus-tcp/virtual 接続では無意味な列". For
+//! `"virtual"` that is still true; for `"modbus-tcp"` it was simply wrong,
+//! and the mistake was load-bearing. Modbus multi-word values (`u32`/`f32`,
+//! and since #325 the 64-bit types) have exactly the same high-word/low-word
+//! ambiguity SLMP does, and the two code paths that build a Modbus client
+//! disagreed about it: `banto_collect::config::modbus_config_for` (the
+//! collection poller) ignored the column and hard-coded
+//! `WordOrder::default()` = `HighLow`, while `banto_broker`'s own
+//! `modbus_config_for` (read-on-demand and writes) read the column - which,
+//! because `banto-hub`'s connection form only ever showed the word-order
+//! control for `"slmp"`, was always the column default `"low_high"`. The
+//! same tag therefore decoded one way into history and the opposite way on a
+//! read-now/write.
+//!
+//! The owner's decision is `"high_low"` (the Modbus/IEEE convention) for
+//! Modbus: that keeps the collection path's actual behaviour - and hence the
+//! interpretation of every already-recorded history sample - untouched, and
+//! moves the broker onto it. Three changes implement it, of which this
+//! module owns the last two:
+//!
+//! 1. the collection path starts reading the column (`banto-collect`);
+//! 2. migration `0017_modbus_word_order_high_low.sql` back-fills every
+//!    existing `"modbus-tcp"` row to `"high_low"`, so step 1 does not
+//!    silently flip every deployed connection (that migration's header has
+//!    the full reasoning);
+//! 3. a **new** `"modbus-tcp"` connection now defaults to `"high_low"`
+//!    instead of `"low_high"` - see [`default_word_order_for`] and
+//!    [`normalize_word_order_input`] for how a protocol-dependent default is
+//!    applied to a field serde cannot default protocol-dependently.
 //!
 //! **In this slice (S1a), no [`crate::collection_group::CollectionGroup`]
 //! may be created under a `"postgres"` connection** -
@@ -141,6 +174,13 @@ use crate::support::{
 /// of surfacing the raw SQLite CHECK constraint violation. The two must be
 /// changed together; `every_allowed_protocol_is_accepted_by_the_sql_check` is
 /// the tripwire if they drift.
+///
+/// The four entries are, in order, [`MODBUS_PROTOCOL`], `"slmp"`,
+/// [`VIRTUAL_PROTOCOL`] and [`POSTGRES_PROTOCOL`] - spelled out as literals
+/// here (rather than built from those constants) so this list still reads as
+/// the vocabulary itself, exactly like the SQL `CHECK` it mirrors;
+/// `the_named_protocol_constants_are_all_in_allowed_protocols` is the
+/// tripwire that keeps the two spellings from drifting.
 pub const ALLOWED_PROTOCOLS: &[&str] = &["modbus-tcp", "slmp", "virtual", "postgres"];
 
 /// Values accepted in `plc_connections.word_order` (P3-b, 監査指摘
@@ -157,10 +197,38 @@ pub const ALLOWED_PROTOCOLS: &[&str] = &["modbus-tcp", "slmp", "virtual", "postg
 /// client) and because `protocol` already established the "TEXT + CHECK, not
 /// a Rust enum" convention for exactly this kind of small closed vocabulary
 /// (this module's doc comment). [`crate::plc_connection`]'s only job is to
-/// store and validate the string; `banto-broker`
-/// (`SessionDirectory::ensure_connection`) is what actually parses it into a
-/// `WordOrder` when building an `SlmpConfig`.
+/// store and validate the string; the consumers are what parse it into a
+/// `WordOrder` - `banto-broker` (`SessionDirectory::ensure_connection`) when
+/// building an `SlmpConfig`/`ModbusConfig`, and `banto_collect::config` when
+/// building the collection poller's own client configs.
+///
+/// **Both values are meaningful for `"slmp"` *and* `"modbus-tcp"`** (#325,
+/// 2026-09-08 - this module's doc comment, "`word_order` is a Modbus setting
+/// too"); only `"virtual"`/`"postgres"` rows carry a value nothing reads.
 pub const ALLOWED_WORD_ORDERS: &[&str] = &["low_high", "high_low"];
+
+/// Low word first (MELSEC's own convention: `D0` holds the low half of a
+/// 32-bit value, `D1` the high half) - migration `0010`'s column default, and
+/// the default a new non-Modbus connection still gets
+/// ([`default_word_order_for`]).
+pub const WORD_ORDER_LOW_HIGH: &str = "low_high";
+
+/// High word first - the Modbus/IEEE convention, and since 2026-09-08 the
+/// default for a new [`MODBUS_PROTOCOL`] connection (this module's doc
+/// comment, "`word_order` is a Modbus setting too"; migration `0017` for the
+/// matching back-fill of existing rows).
+pub const WORD_ORDER_HIGH_LOW: &str = "high_low";
+
+/// Modbus TCP - the first protocol this registry ever spoke (plan.md §3's I2
+/// decision) and the first entry of [`ALLOWED_PROTOCOLS`]. Named as a
+/// constant (rather than left as a bare literal at its use sites) because
+/// #325 gave it a second job beyond connection validation: the 64-bit data
+/// types ([`crate::tag::MODBUS_ONLY_DATA_TYPES`]) may only be used by tags
+/// whose group sits under a connection with this protocol, a rule
+/// [`crate::tag::TagService`] enforces the same way it enforces the
+/// `calc`/`mem`/`postgres` placement rules (see
+/// [`VIRTUAL_PROTOCOL`]/[`POSTGRES_PROTOCOL`] below).
+pub const MODBUS_PROTOCOL: &str = "modbus-tcp";
 
 /// The one non-wire protocol (T6-2, this module's doc comment). Used both by
 /// [`validate_plc_connection_input`] (relaxed host/port) and by
@@ -221,13 +289,59 @@ fn default_simulation() -> bool {
     false
 }
 
-/// P3-b: a `PlcConnectionInput` missing `wordOrder` (an old client, or a
-/// direct Rust construction predating this field) builds with MELSEC's own
-/// low-word-first order - the same value migration `0010`'s column default
-/// takes, and the same value `banto_plc::slmp::SlmpConfig::default()` already
-/// used before this field existed, so an old client is unaffected.
+/// Migration `0010`'s column default, [`WORD_ORDER_LOW_HIGH`]. Still what a
+/// `"postgres"` row is normalized to ([`normalize_postgres_input`]) - for
+/// that protocol the column is inert, so "whatever the schema would have
+/// written" is the right value to store.
+///
+/// This is **no longer** the default a deserialized payload gets: since
+/// 2026-09-08 that default depends on `protocol`
+/// ([`default_word_order_for`]).
 fn default_word_order() -> String {
-    "low_high".to_string()
+    WORD_ORDER_LOW_HIGH.to_string()
+}
+
+/// #325 (2026-09-08 オーナー決定, this module's doc comment "`word_order` is
+/// a Modbus setting too"): the `word_order` a **new** connection gets when
+/// its payload does not name one. Protocol-dependent, which is the whole
+/// difficulty - `"modbus-tcp"` wants the Modbus/IEEE convention
+/// ([`WORD_ORDER_HIGH_LOW`]) while `"slmp"` keeps MELSEC's
+/// ([`WORD_ORDER_LOW_HIGH`], also migration `0010`'s column default, so
+/// `"slmp"` behaviour is unchanged).
+///
+/// `"virtual"`/`"postgres"` fall in the `else` arm and get
+/// [`WORD_ORDER_LOW_HIGH`]; neither ever reads the column, and
+/// [`normalize_postgres_input`] overwrites it for `"postgres"` anyway.
+fn default_word_order_for(protocol: &str) -> String {
+    if protocol == MODBUS_PROTOCOL {
+        WORD_ORDER_HIGH_LOW.to_string()
+    } else {
+        WORD_ORDER_LOW_HIGH.to_string()
+    }
+}
+
+/// Apply [`default_word_order_for`] to a payload that left `wordOrder`
+/// unspecified.
+///
+/// **Why a normalization step rather than `#[serde(default = ..)]`**: serde's
+/// field defaults are computed per field, with no access to the rest of the
+/// struct, so "default that depends on `protocol`" is not expressible there
+/// at all. The same problem `normalize_postgres_input` already solves for
+/// `unit_id`/`word_order`/`simulation`, solved the same way - which is why
+/// both run from one [`normalize_plc_connection_input`] entry point, this one
+/// first so `"postgres"` still wins.
+///
+/// **How "unspecified" is represented**: [`PlcConnectionInput::word_order`]
+/// is `#[serde(default)]`, i.e. the empty string, and *empty means
+/// unspecified* (see that field's doc comment for why this sentinel rather
+/// than `Option<String>`). An empty `word_order` therefore never reaches
+/// [`validate_plc_connection_input`] - by the time validation runs it has
+/// been replaced by a real member of [`ALLOWED_WORD_ORDERS`].
+fn normalize_word_order_input(mut input: PlcConnectionInput) -> PlcConnectionInput {
+    if input.word_order.is_empty() {
+        input.word_order = default_word_order_for(&input.protocol);
+    }
+    input
 }
 
 /// S1 (this module's doc comment, "`\"postgres\"`" section): a `"postgres"`
@@ -247,6 +361,18 @@ fn normalize_postgres_input(mut input: PlcConnectionInput) -> PlcConnectionInput
         input.simulation = false;
     }
     input
+}
+
+/// The single normalization entry point every [`PlcConnectionService`] write
+/// method runs a payload through before [`validate_plc_connection_input`].
+///
+/// Order matters: [`normalize_word_order_input`] first (it only fills in an
+/// *unspecified* `word_order`), then [`normalize_postgres_input`] (which
+/// overrides `word_order` unconditionally for `"postgres"`), so a
+/// `"postgres"` row still ends up carrying the plain column default no matter
+/// what - or whether - the caller sent.
+fn normalize_plc_connection_input(input: PlcConnectionInput) -> PlcConnectionInput {
+    normalize_postgres_input(normalize_word_order_input(input))
 }
 
 /// [`PlcConnectionService::create`]'s password rule (this crate's
@@ -290,9 +416,12 @@ pub struct PlcConnection {
     /// T9-1 (this module's doc comment, "simulation" section).
     pub simulation: bool,
     /// P3-b (this module's doc comment, [`ALLOWED_WORD_ORDERS`]). Meaningful
-    /// for `"slmp"` connections only - `"modbus-tcp"`/`"virtual"` rows simply
-    /// carry the column's default, the same treatment `unit_id` gets for
-    /// SLMP (this module's doc comment, above).
+    /// for `"slmp"` **and `"modbus-tcp"`** connections (#325, 2026-09-08 -
+    /// this module's doc comment, "`word_order` is a Modbus setting too";
+    /// migration `0010` originally claimed it was SLMP-only and migration
+    /// `0017` is where that was corrected). `"virtual"`/`"postgres"` rows
+    /// simply carry a value nothing reads, the same treatment `unit_id` gets
+    /// for SLMP (this module's doc comment, above).
     pub word_order: String,
     /// S1 (this module's doc comment, "`\"postgres\"`" section): the DB name
     /// a `"postgres"` connection targets. Always `None` for every other
@@ -350,8 +479,48 @@ pub struct PlcConnectionInput {
     /// T9-1 (this module's doc comment, "simulation" section).
     #[serde(default = "default_simulation")]
     pub simulation: bool,
-    /// P3-b. See [`PlcConnection::word_order`]'s doc comment.
-    #[serde(default = "default_word_order")]
+    /// P3-b. See [`PlcConnection::word_order`]'s doc comment for what the
+    /// value means.
+    ///
+    /// **The empty string means "unspecified"** (#325, 2026-09-08 - this
+    /// module's doc comment, "`word_order` is a Modbus setting too"). Since
+    /// the default now depends on `protocol` - `"high_low"` for
+    /// [`MODBUS_PROTOCOL`], `"low_high"` for everything else - and serde
+    /// cannot compute a field default from a sibling field, the `serde`
+    /// default here is deliberately a *sentinel* (`String::default()`, i.e.
+    /// `""`) rather than a real word order, and
+    /// [`normalize_word_order_input`] turns it into the protocol's default
+    /// before validation. A payload that *does* name a word order keeps it
+    /// verbatim, so an operator who deliberately picks `"low_high"` for a
+    /// Modbus connection gets `"low_high"` stored.
+    ///
+    /// **A `""` sentinel, not `Option<String>`**: making this field optional
+    /// would be the tidier encoding of "unspecified", but the field is
+    /// non-optional in ~100 direct Rust constructions of this struct across
+    /// `banto-hub`, `relay-wright`, `banto-collect` and this crate's own
+    /// tests, and this crate is shared by all of them - the type change alone
+    /// would be a workspace-wide edit for a defaulting rule. `""` is
+    /// unambiguous as a sentinel because it is not, and never was, a legal
+    /// stored value: it is absent from [`ALLOWED_WORD_ORDERS`] *and* rejected
+    /// by migration `0010`'s SQL `CHECK`.
+    ///
+    /// The one behaviour this costs: a payload with an explicit
+    /// `"word_order": ""` used to be a `wordOrder` validation error and is
+    /// now silently treated as omitted. Nothing legitimate sends that.
+    ///
+    /// A **direct Rust construction** (a test, an app's own DTO conversion)
+    /// naturally spells out a real value and therefore counts as explicit;
+    /// pass `String::new()` to ask for the protocol's default instead. This
+    /// matters more than it looks, because every app in this workspace
+    /// deserializes its *own* wire DTO and converts: `banto-hub`'s
+    /// `rest::PlcConnectionPayload` and relay-wright's namesake both carry
+    /// their own `#[serde(default)]` for `wordOrder` and hand this struct a
+    /// fully-populated `String`. Until those defaults become the same
+    /// sentinel, an omitted `wordOrder` on **their** wire is still filled in
+    /// as `"low_high"` before it ever reaches this crate - the
+    /// protocol-dependent default below only governs callers that construct
+    /// or deserialize a `PlcConnectionInput` directly.
+    #[serde(default)]
     pub word_order: String,
     /// S1. See [`PlcConnection::database`]'s doc comment. Required
     /// (non-empty after trim) when `protocol == `[`POSTGRES_PROTOCOL`],
@@ -393,6 +562,11 @@ pub struct PlcConnectionInput {
 /// `port` in `1..=65535`, `unit_id` in `0..=255`, `word_order` in
 /// [`ALLOWED_WORD_ORDERS`]. Returns every violation, not just the first
 /// (mirrors `items::validate_item_input` in the banto template repo).
+///
+/// Every caller runs the input through [`normalize_plc_connection_input`]
+/// first, so `word_order` is never the `""` "unspecified" sentinel by the
+/// time it is checked against [`ALLOWED_WORD_ORDERS`] here
+/// ([`PlcConnectionInput::word_order`]'s doc comment).
 ///
 /// S1 (this module's doc comment, "`\"postgres\"`" section) adds one more
 /// pair of rules, applied **after** the caller has already run the input
@@ -454,12 +628,13 @@ fn validate_plc_connection_input(input: &PlcConnectionInput) -> Result<(), Banto
         });
     }
 
-    // P3-b: validated for every protocol, not just "slmp" - same stance
+    // P3-b: validated for every protocol, not just the two that read it
+    // ("slmp" and - since #325/2026-09-08 - "modbus-tcp") - same stance
     // `unit_id` already takes (validated even though SLMP never reads it).
     // Keeping it unconditional avoids a second implicit "which values are
-    // legal" rule that only applies sometimes; a modbus-tcp/virtual row
-    // simply carries whatever value it was given (normally the default) and
-    // nothing ever reads it.
+    // legal" rule that only applies sometimes; a virtual/postgres row simply
+    // carries whatever value it was given (normally the default) and nothing
+    // ever reads it.
     if !ALLOWED_WORD_ORDERS.contains(&input.word_order.as_str()) {
         errors.push(FieldError {
             field: "wordOrder".to_string(),
@@ -632,7 +807,7 @@ impl PlcConnectionService {
     }
 
     pub async fn create(&self, input: PlcConnectionInput) -> Result<PlcConnection, BantoError> {
-        let input = normalize_postgres_input(input);
+        let input = normalize_plc_connection_input(input);
         validate_plc_connection_input(&input)?;
         let is_postgres = input.protocol == POSTGRES_PROTOCOL;
         let stored_database =
@@ -672,7 +847,7 @@ impl PlcConnectionService {
         connection: &mut SqliteConnection,
         input: PlcConnectionInput,
     ) -> Result<PlcConnection, BantoError> {
-        let input = normalize_postgres_input(input);
+        let input = normalize_plc_connection_input(input);
         validate_plc_connection_input(&input)?;
         let is_postgres = input.protocol == POSTGRES_PROTOCOL;
         let stored_database =
@@ -713,7 +888,7 @@ impl PlcConnectionService {
         id: i64,
         input: PlcConnectionInput,
     ) -> Result<PlcConnection, BantoError> {
-        let input = normalize_postgres_input(input);
+        let input = normalize_plc_connection_input(input);
         validate_plc_connection_input(&input)?;
 
         let existing: Option<(String, Option<String>)> =
@@ -779,7 +954,7 @@ impl PlcConnectionService {
         id: i64,
         input: PlcConnectionInput,
     ) -> Result<PlcConnection, BantoError> {
-        let input = normalize_postgres_input(input);
+        let input = normalize_plc_connection_input(input);
         validate_plc_connection_input(&input)?;
         let existing: Option<(String, Option<String>)> =
             sqlx::query_as("SELECT protocol, password FROM plc_connections WHERE id = ?")
@@ -1228,6 +1403,22 @@ mod tests {
             });
             assert_eq!(&created.protocol, protocol);
         }
+    }
+
+    /// The named protocol constants ([`MODBUS_PROTOCOL`]/[`VIRTUAL_PROTOCOL`]/
+    /// [`POSTGRES_PROTOCOL`]) are spellings of entries that also appear as
+    /// literals inside [`ALLOWED_PROTOCOLS`] (see that constant's doc
+    /// comment). This pins the relationship so a rename of either copy cannot
+    /// pass silently.
+    #[test]
+    fn the_named_protocol_constants_are_all_in_allowed_protocols() {
+        for protocol in [MODBUS_PROTOCOL, VIRTUAL_PROTOCOL, POSTGRES_PROTOCOL] {
+            assert!(
+                ALLOWED_PROTOCOLS.contains(&protocol),
+                "{protocol:?} is a named constant but missing from ALLOWED_PROTOCOLS"
+            );
+        }
+        assert_eq!(ALLOWED_PROTOCOLS[0], MODBUS_PROTOCOL);
     }
 
     /// The reverse direction: a protocol the SQL `CHECK` would accept must not
@@ -2360,6 +2551,378 @@ mod tests {
             .await
             .expect("list should succeed");
         assert_eq!(rows.rows[0].word_order, "low_high");
+    }
+
+    // --- #325 (2026-09-08): Modbus defaults to "high_low" ------------------
+
+    /// A `PlcConnectionInput` that leaves `wordOrder` out deserializes with
+    /// the `""` sentinel, *not* with a real word order - the mechanism the
+    /// protocol-dependent default is built on
+    /// ([`PlcConnectionInput::word_order`]'s doc comment). Asserted at the
+    /// serde layer specifically, because every behavioural test below would
+    /// still pass if the sentinel silently became `"low_high"` again for
+    /// non-Modbus protocols.
+    #[test]
+    fn an_omitted_word_order_deserializes_to_the_unspecified_sentinel() {
+        let input: PlcConnectionInput = serde_json::from_value(json!({
+            "name": "Line1",
+            "protocol": "modbus-tcp",
+            "host": "192.168.1.10",
+            "port": 502,
+        }))
+        .expect("a payload without wordOrder should still deserialize");
+        assert_eq!(input.word_order, "");
+    }
+
+    /// The headline of #325's registry half: a **new** `"modbus-tcp"`
+    /// connection whose payload does not name a word order is stored as
+    /// `"high_low"`, the Modbus/IEEE convention the collection path was
+    /// already using in practice (this module's doc comment, "`word_order` is
+    /// a Modbus setting too"). Driven through `serde` rather than by setting
+    /// `String::new()` by hand, so it exercises the same path a REST/MCP
+    /// payload takes.
+    #[tokio::test]
+    async fn a_new_modbus_connection_defaults_to_high_low() {
+        let svc = service().await;
+        let input: PlcConnectionInput = serde_json::from_value(json!({
+            "name": "Modbus default",
+            "protocol": "modbus-tcp",
+            "host": "192.168.1.10",
+            "port": 502,
+        }))
+        .expect("deserialize");
+        let created = svc.create(input).await.expect("create should succeed");
+        assert_eq!(created.word_order, WORD_ORDER_HIGH_LOW);
+        assert_eq!(
+            svc.get(created.id).await.unwrap().word_order,
+            WORD_ORDER_HIGH_LOW
+        );
+    }
+
+    /// The other half of the same rule: `"slmp"` is untouched by #325 and
+    /// still defaults to MELSEC's own `"low_high"` (migration `0010`'s column
+    /// default), so no existing SLMP client changes behaviour.
+    #[tokio::test]
+    async fn a_new_slmp_connection_still_defaults_to_low_high() {
+        let svc = service().await;
+        let input: PlcConnectionInput = serde_json::from_value(json!({
+            "name": "SLMP default",
+            "protocol": "slmp",
+            "host": "192.168.1.20",
+            "port": 5007,
+        }))
+        .expect("deserialize");
+        let created = svc.create(input).await.expect("create should succeed");
+        assert_eq!(created.word_order, WORD_ORDER_LOW_HIGH);
+    }
+
+    /// The default must not become a *policy*: an operator who deliberately
+    /// picks `"low_high"` for a Modbus connection (a gateway that presents
+    /// MELSEC-order registers, say) gets `"low_high"` stored, on `create` and
+    /// on a later `update` alike. This is the distinction the `""` sentinel
+    /// exists to make - "omitted" and "explicitly low_high" are different
+    /// payloads and must stay different.
+    #[tokio::test]
+    async fn an_explicit_low_high_is_kept_on_a_modbus_connection() {
+        let svc = service().await;
+        let input: PlcConnectionInput = serde_json::from_value(json!({
+            "name": "Modbus explicit",
+            "protocol": "modbus-tcp",
+            "host": "192.168.1.10",
+            "port": 502,
+            "word_order": "low_high",
+        }))
+        .expect("deserialize");
+        let created = svc.create(input).await.expect("create should succeed");
+        assert_eq!(created.word_order, WORD_ORDER_LOW_HIGH);
+
+        let update: PlcConnectionInput = serde_json::from_value(json!({
+            "name": "Modbus explicit",
+            "protocol": "modbus-tcp",
+            "host": "192.168.1.10",
+            "port": 502,
+            "word_order": "low_high",
+        }))
+        .expect("deserialize");
+        let updated = svc
+            .update(created.id, update)
+            .await
+            .expect("update should succeed");
+        assert_eq!(updated.word_order, WORD_ORDER_LOW_HIGH);
+        assert_eq!(
+            svc.get(created.id).await.unwrap().word_order,
+            WORD_ORDER_LOW_HIGH
+        );
+    }
+
+    /// `update` is a full replacement (`PUT`-shaped, not a PATCH - see
+    /// `PlcConnectionInput::password`'s doc comment for the one field that
+    /// deviates), so an update payload that omits `wordOrder` gets the same
+    /// protocol-dependent default a create would: a Modbus row switches back
+    /// to `"high_low"`.
+    #[tokio::test]
+    async fn an_omitted_word_order_on_update_falls_back_to_the_protocol_default() {
+        let svc = service().await;
+        let mut input = sample_input("Modbus update");
+        input.word_order = WORD_ORDER_LOW_HIGH.to_string();
+        let created = svc.create(input).await.expect("create should succeed");
+        assert_eq!(created.word_order, WORD_ORDER_LOW_HIGH);
+
+        let update: PlcConnectionInput = serde_json::from_value(json!({
+            "name": "Modbus update",
+            "protocol": "modbus-tcp",
+            "host": "192.168.1.10",
+            "port": 502,
+        }))
+        .expect("deserialize");
+        let updated = svc
+            .update(created.id, update)
+            .await
+            .expect("update should succeed");
+        assert_eq!(updated.word_order, WORD_ORDER_HIGH_LOW);
+    }
+
+    /// Switching an existing connection's protocol re-decides the default
+    /// too, since the default is a function of the payload's `protocol` and
+    /// nothing else - `update_can_switch_a_connection_between_protocols`'s
+    /// `word_order` counterpart.
+    #[tokio::test]
+    async fn the_default_follows_the_protocol_across_an_update() {
+        let svc = service().await;
+        let created = svc
+            .create(
+                serde_json::from_value(json!({
+                    "name": "Switcher",
+                    "protocol": "modbus-tcp",
+                    "host": "192.168.1.10",
+                    "port": 502,
+                }))
+                .expect("deserialize"),
+            )
+            .await
+            .expect("create should succeed");
+        assert_eq!(created.word_order, WORD_ORDER_HIGH_LOW);
+
+        let updated = svc
+            .update(
+                created.id,
+                serde_json::from_value(json!({
+                    "name": "Switcher",
+                    "protocol": "slmp",
+                    "host": "192.168.1.10",
+                    "port": 5007,
+                }))
+                .expect("deserialize"),
+            )
+            .await
+            .expect("update should succeed");
+        assert_eq!(updated.word_order, WORD_ORDER_LOW_HIGH);
+    }
+
+    /// `"postgres"` keeps winning: `normalize_postgres_input` runs *after*
+    /// the word-order default (see `normalize_plc_connection_input`), so a DB
+    /// connection carries the plain column default no matter what the caller
+    /// sent - including nothing at all.
+    #[tokio::test]
+    async fn a_postgres_connection_ignores_the_word_order_default() {
+        let svc = service().await;
+        for word_order in [None, Some("high_low"), Some("low_high")] {
+            let mut payload = json!({
+                "name": format!("db-{word_order:?}"),
+                "protocol": "postgres",
+                "host": "db.example.com",
+                "port": 5432,
+                "database": "appdb",
+                "username": "appuser",
+            });
+            if let Some(word_order) = word_order {
+                payload["word_order"] = json!(word_order);
+            }
+            let created = svc
+                .create(serde_json::from_value(payload).expect("deserialize"))
+                .await
+                .expect("create should succeed");
+            assert_eq!(created.word_order, WORD_ORDER_LOW_HIGH);
+        }
+    }
+
+    /// [`WORD_ORDER_LOW_HIGH`]/[`WORD_ORDER_HIGH_LOW`] are spellings of the
+    /// entries that also appear as literals inside [`ALLOWED_WORD_ORDERS`] -
+    /// the `word_order` twin of
+    /// `the_named_protocol_constants_are_all_in_allowed_protocols`.
+    #[test]
+    fn the_named_word_order_constants_are_all_in_allowed_word_orders() {
+        for word_order in [WORD_ORDER_LOW_HIGH, WORD_ORDER_HIGH_LOW] {
+            assert!(
+                ALLOWED_WORD_ORDERS.contains(&word_order),
+                "{word_order:?} is a named constant but missing from ALLOWED_WORD_ORDERS"
+            );
+        }
+        assert_eq!(ALLOWED_WORD_ORDERS[0], WORD_ORDER_LOW_HIGH);
+        // The sentinel must never collide with a real value.
+        assert!(!ALLOWED_WORD_ORDERS.contains(&""));
+    }
+
+    // --- migration 0017 (backfill: modbus-tcp -> 'high_low') ---------------
+
+    /// Migration `0017` is a plain `UPDATE`, not a table rebuild, so this is
+    /// not a "did the rebuild drop a column" test like
+    /// `migration_0014_preserves_rows_and_foreign_keys_on_a_populated_database`
+    /// - it is a "did the `WHERE` clause hit exactly the right rows" test.
+    /// The recipe is the same one `tag.rs`'s
+    /// `migration_0016_preserves_rows_and_widens_data_type_on_a_populated_database`
+    /// uses: run the whole 0001-0016 chain by hand (a faithful stand-in for a
+    /// deployed pre-0017 database), seed rows, then apply 0017 the way sqlx's
+    /// `Migrate::apply` does - the whole file as one multi-statement
+    /// `execute`, on a single pinned connection, inside one transaction.
+    ///
+    /// The seeded rows are the three cases the migration's header calls out:
+    /// a `"modbus-tcp"` row at the old default `'low_high'` (the row the
+    /// back-fill exists for - every deployed Modbus connection looks like
+    /// this, because `banto-hub`'s form never offered the control), an
+    /// `"slmp"` row at `'low_high'` (correct as-is, must not move), and a
+    /// `"virtual"` row (the column is inert for it, must not move either).
+    /// A second `"modbus-tcp"` row already at `'high_low'` is seeded too, to
+    /// pin that the migration is a no-op for it rather than accidentally
+    /// inverting.
+    #[tokio::test]
+    async fn migration_0017_backfills_only_modbus_rows_to_high_low() {
+        use sqlx::{Acquire, Executor};
+
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect_sqlite_memory");
+        let mut conn = pool.acquire().await.expect("acquire one pinned connection");
+
+        for (label, sql) in [
+            (
+                "0001",
+                include_str!("../migrations/0001_plc_connections.sql"),
+            ),
+            (
+                "0002",
+                include_str!("../migrations/0002_collection_groups.sql"),
+            ),
+            ("0003", include_str!("../migrations/0003_tags.sql")),
+            (
+                "0004",
+                include_str!("../migrations/0004_plc_connections_allow_slmp.sql"),
+            ),
+            (
+                "0005",
+                include_str!("../migrations/0005_tags_allow_string.sql"),
+            ),
+            (
+                "0006",
+                include_str!("../migrations/0006_tags_writable_kind.sql"),
+            ),
+            (
+                "0007",
+                include_str!("../migrations/0007_plc_connections_allow_virtual.sql"),
+            ),
+            (
+                "0008",
+                include_str!("../migrations/0008_plc_connections_add_simulation.sql"),
+            ),
+            ("0009", include_str!("../migrations/0009_tags_revision.sql")),
+            (
+                "0010",
+                include_str!("../migrations/0010_plc_connections_add_word_order.sql"),
+            ),
+            (
+                "0011",
+                include_str!("../migrations/0011_tags_unique_name_per_group.sql"),
+            ),
+            (
+                "0012",
+                include_str!("../migrations/0012_collection_groups_add_default_writable.sql"),
+            ),
+            (
+                "0013",
+                include_str!("../migrations/0013_tags_add_string_encoding.sql"),
+            ),
+            (
+                "0014",
+                include_str!("../migrations/0014_plc_connections_allow_postgres.sql"),
+            ),
+            (
+                "0015",
+                include_str!("../migrations/0015_db_source_query_sql_and_tag_kind.sql"),
+            ),
+            (
+                "0016",
+                include_str!("../migrations/0016_tags_allow_64bit.sql"),
+            ),
+        ] {
+            conn.execute(sql)
+                .await
+                .unwrap_or_else(|e| panic!("pre-0017 migration {label} failed: {e}"));
+        }
+
+        conn.execute(
+            "INSERT INTO plc_connections (id, name, protocol, host, port, word_order) VALUES \
+             (1, 'Modbus legacy', 'modbus-tcp', '192.168.1.10', 502, 'low_high'), \
+             (2, 'Modbus already correct', 'modbus-tcp', '192.168.1.11', 502, 'high_low'), \
+             (3, 'MELSEC', 'slmp', '192.168.1.20', 5007, 'low_high'), \
+             (4, 'calc', 'virtual', '', 0, 'low_high'), \
+             (5, 'ext db', 'postgres', 'db.example.com', 5432, 'low_high')",
+        )
+        .await
+        .expect("seed connections");
+        conn.execute(
+            "UPDATE plc_connections SET database = 'appdb', username = 'appuser' WHERE id = 5",
+        )
+        .await
+        .expect("seed postgres credentials");
+
+        let migration = include_str!("../migrations/0017_modbus_word_order_high_low.sql");
+        let mut tx = conn.begin().await.expect("begin, as the migrator does");
+        tx.execute(migration).await.expect("0017 should apply");
+        tx.commit().await.expect("0017 should commit");
+
+        let rows: Vec<(i64, String, String)> =
+            sqlx::query_as("SELECT id, protocol, word_order FROM plc_connections ORDER BY id")
+                .fetch_all(&mut *conn)
+                .await
+                .expect("read back every seeded connection");
+        assert_eq!(
+            rows,
+            vec![
+                (1, "modbus-tcp".to_string(), "high_low".to_string()),
+                (2, "modbus-tcp".to_string(), "high_low".to_string()),
+                (3, "slmp".to_string(), "low_high".to_string()),
+                (4, "virtual".to_string(), "low_high".to_string()),
+                (5, "postgres".to_string(), "low_high".to_string()),
+            ]
+        );
+    }
+
+    /// The back-fill must be a one-shot historical correction, not a standing
+    /// rule: once `migrate` has run, an operator may deliberately set a
+    /// Modbus connection back to `"low_high"`, and re-running `migrate` (i.e.
+    /// the next process start - `migrate_is_idempotent` at the crate root
+    /// covers the "does not error" half) must leave that choice alone.
+    /// sqlx's `_sqlx_migrations` bookkeeping is what guarantees this; this
+    /// test pins the consequence rather than the mechanism.
+    #[tokio::test]
+    async fn rerunning_migrate_does_not_reapply_the_0017_backfill() {
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect_sqlite_memory");
+        migrate(&pool).await.expect("migrate");
+
+        let svc = PlcConnectionService::new(pool.clone());
+        let mut input = sample_input("Deliberate low_high");
+        input.word_order = WORD_ORDER_LOW_HIGH.to_string();
+        let created = svc.create(input).await.expect("create should succeed");
+        assert_eq!(created.word_order, WORD_ORDER_LOW_HIGH);
+
+        migrate(&pool).await.expect("migrate should be idempotent");
+
+        assert_eq!(
+            svc.get(created.id).await.unwrap().word_order,
+            WORD_ORDER_LOW_HIGH
+        );
     }
 
     #[tokio::test]

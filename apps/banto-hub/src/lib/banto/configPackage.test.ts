@@ -319,11 +319,30 @@ describe('configPackage', () => {
 	// は据え置きのまま追加した後方互換フィールドなので、既存のエクスポート済み
 	// ファイルは wordOrder を一切含まない。
 
-	it('parseConfigPackage は wordOrder を持たない旧パッケージを low_high 既定で受け入れる', () => {
+	// 2026-09-08 オーナー決定（issue #325 の作業中に発覚した既存バグ）: 省略時の
+	// 既定はプロトコル依存になった。modbus-tcp は high_low - 旧パッケージが
+	// 書き出された当時、収集経路は Modbus のこの列を無視して HighLow で動いて
+	// いたので、high_low を埋めるほうが当時の実挙動と一致する（migration 0017 の
+	// backfill と同じ「実態への同期」）。
+	it('parseConfigPackage は wordOrder を持たない旧 modbus パッケージを high_low 既定で受け入れる', () => {
 		const pkg = makePackage();
 		const withoutWordOrder = {
 			...pkg,
 			plcConnections: pkg.plcConnections.map(({ wordOrder: _wordOrder, ...rest }) => rest)
+		};
+		expect(withoutWordOrder.plcConnections[0].protocol).toBe('modbus-tcp');
+		const parsed = parseConfigPackage(JSON.stringify(withoutWordOrder));
+		expect(parsed.plcConnections[0].wordOrder).toBe('high_low');
+	});
+
+	it('parseConfigPackage は wordOrder を持たない旧 slmp パッケージを low_high 既定で受け入れる', () => {
+		const pkg = makePackage();
+		const withoutWordOrder = {
+			...pkg,
+			plcConnections: pkg.plcConnections.map(({ wordOrder: _wordOrder, ...rest }) => ({
+				...rest,
+				protocol: 'slmp'
+			}))
 		};
 		const parsed = parseConfigPackage(JSON.stringify(withoutWordOrder));
 		expect(parsed.plcConnections[0].wordOrder).toBe('low_high');
@@ -336,6 +355,29 @@ describe('configPackage', () => {
 			plcConnections: pkg.plcConnections.map((c) => ({ ...c, wordOrder: 'middle_endian' }))
 		};
 		expect(() => parseConfigPackage(JSON.stringify(withBadWordOrder))).toThrow(/wordOrder/);
+	});
+
+	// --- 2026-09-08 オーナー決定（issue #330 の修正）: modbus-tcp 接続の
+	// wordOrder（既定が high_low に変わった）が export/import で正しく
+	// 往復すること。以前は UI が modbus-tcp でこのフィールドを一切編集させず
+	// 常に列の初期値 'low_high' が保存されていたため、この経路は事実上
+	// 'low_high' しか通っていなかった - 'high_low' を明示的に持つ modbus-tcp
+	// 接続が壊れずに往復することを固定する。
+
+	it('buildConfigPackage/parseConfigPackage は modbus-tcp 接続の wordOrder（high_low）を正しく往復する', () => {
+		const modbusHighLow: PlcConnection = { ...BASE_CONNECTION, wordOrder: 'high_low' };
+		const pkg = buildConfigPackage({
+			plcConnections: [modbusHighLow],
+			collectionGroups: [],
+			tags: [],
+			mqtt: MQTT,
+			grpc: GRPC,
+			exportedAt: '2026-08-11T00:00:00.000Z'
+		});
+		expect(pkg.plcConnections[0].wordOrder).toBe('high_low');
+
+		const parsed = parseConfigPackage(serializeConfigPackage(pkg));
+		expect(parsed.plcConnections[0].wordOrder).toBe('high_low');
 	});
 
 	// --- T19 S1-b（UX-34、2026-09-02 オーナー決定）: defaultWritable は

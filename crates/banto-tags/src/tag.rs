@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
 use crate::plc_connection::{
-    CALC_CONNECTION_NAME, MEM_CONNECTION_NAME, POSTGRES_PROTOCOL, VIRTUAL_PROTOCOL,
+    CALC_CONNECTION_NAME, MEM_CONNECTION_NAME, MODBUS_PROTOCOL, POSTGRES_PROTOCOL, VIRTUAL_PROTOCOL,
 };
 use crate::scaling::Scaling;
 use crate::support::{map_write_error, max_length_message, range_message, required_message};
@@ -27,15 +27,53 @@ use crate::support::{map_write_error, max_length_message, range_message, require
 /// frozen numeric-only), and `banto_plc::DataType::parse("string")` returns
 /// `None` on purpose. The consumer is relay-wright's engine (S2), which reads
 /// string tags through `banto_plc`'s batch API using [`Tag::string_length`].
-pub const ALLOWED_DATA_TYPES: &[&str] = &["bit", "i16", "u16", "i32", "u32", "f32", "string"];
+///
+/// **#325 (2026-09-08 オーナー決定)** widened this with the three 64-bit
+/// types `"i64"`/`"u64"`/`"f64"` (mirrored by
+/// `migrations/0016_tags_allow_64bit.sql`). Being in this list makes them
+/// *well-formed* values for the column; **where** such a tag may be placed is
+/// a second, narrower rule - see [`MODBUS_ONLY_DATA_TYPES`].
+pub const ALLOWED_DATA_TYPES: &[&str] = &[
+    "bit", "i16", "u16", "i32", "u32", "f32", "i64", "u64", "f64", "string",
+];
 
-/// The numeric/bit subset of [`ALLOWED_DATA_TYPES`] - i.e. the pre-S1 list.
-/// For consumers whose own schema is numeric-only and must NOT widen with the
-/// tag registry: relay-wright's `write_targets` validation (its SQL `CHECK`
-/// has no `'string'`; string write targets are S2 work) and any similar
-/// resource that borrowed the tag vocabulary. `allowed_is_numeric_plus_string`
-/// below pins the relationship so the two lists cannot drift apart silently.
-pub const NUMERIC_DATA_TYPES: &[&str] = &["bit", "i16", "u16", "i32", "u32", "f32"];
+/// The numeric/bit subset of [`ALLOWED_DATA_TYPES`] - i.e. everything except
+/// `"string"`. For consumers whose own vocabulary is numeric-only:
+/// `banto-expr`'s type checker treats exactly these as numeric tag
+/// references, and any similar consumer that borrowed the tag vocabulary
+/// minus strings. `allowed_is_numeric_plus_string` below pins the
+/// relationship so the two lists cannot drift apart silently.
+///
+/// Note this list widened with #325's 64-bit types too - it is "not a
+/// string", nothing more. A consumer whose own SQL `CHECK` must stay frozen
+/// (relay-wright's `write_targets`) filters this further at its own call
+/// site rather than leaning on this constant; see
+/// [`MODBUS_ONLY_DATA_TYPES`].
+pub const NUMERIC_DATA_TYPES: &[&str] = &[
+    "bit", "i16", "u16", "i32", "u32", "f32", "i64", "u64", "f64",
+];
+
+/// The 64-bit data types, which may only be used by a tag whose collection
+/// group sits under a [`crate::plc_connection::MODBUS_PROTOCOL`] connection
+/// (#325, **2026-09-08 オーナー決定**).
+///
+/// Two halves of that decision, both deliberate:
+///
+/// 1. **Modbus only.** 64-bit values occupy four consecutive registers
+///    (`banto_plc::DataType::register_span() == 4`), which the Modbus
+///    decoder handles like any other multi-register type; SLMP, the
+///    `"virtual"` `calc`/`mem` connections and `"postgres"` DB Source have
+///    no such story, so a 64-bit tag under any of them is rejected at
+///    registration rather than silently never decoding. Enforced by
+///    [`validate_tag_placement`] (which can join a tag's group back to its
+///    connection), not by the SQL `CHECK` - exactly the same split, and for
+///    exactly the same reason, as the `calc`/`mem`/`postgres` `tag_kind`
+///    placement rules.
+/// 2. **Precision loss is accepted.** Every tag value in this system travels
+///    as `f64` (`banto_plc::TagValue::F64`), so an `i64`/`u64` beyond 2^53
+///    loses low-order bits. The owner accepted this rather than widening the
+///    whole value pipeline to a 64-bit integer variant.
+pub const MODBUS_ONLY_DATA_TYPES: &[&str] = &["i64", "u64", "f64"];
 
 /// The one data type with a mandatory companion column (`string_length`) and
 /// no scaling/threshold story. Kept as a named constant so the validation
@@ -838,6 +876,106 @@ fn is_db_column_identifier(address: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// The one `SELECT` behind both [`validate_tag_kind_placement`] and
+/// [`validate_tag_kind_placement_tx`]: a tag's collection group joined back
+/// to the connection it collects from. Kept as a constant so the pool-taking
+/// and transaction-taking twins cannot query different things.
+const PLACEMENT_CONNECTION_SQL: &str = "SELECT pc.name, pc.protocol FROM collection_groups cg \
+     JOIN plc_connections pc ON pc.id = cg.plc_connection_id \
+     WHERE cg.id = ?";
+
+/// Every placement rule, decided once against an already-fetched connection
+/// row - the shared body of [`validate_tag_kind_placement`] and
+/// [`validate_tag_kind_placement_tx`], which differ only in *how* they get
+/// that row (a pool vs. a caller's transaction). Before #325 the rule set
+/// was written out twice, once in each twin; it is written here exactly once
+/// so a rule added to one can never be missing from the other.
+///
+/// Two families of rule live here:
+///
+/// - **`tag_kind` placement** (T6-2 / DB Source S2): which species of tag may
+///   live under which connection - reported on `"tagKind"`.
+/// - **`data_type` placement** (#325, 2026-09-08 オーナー決定): the 64-bit
+///   types ([`MODBUS_ONLY_DATA_TYPES`]) only under a
+///   [`MODBUS_PROTOCOL`] connection - reported on `"dataType"`.
+///
+/// Both are checked, and the `tag_kind` verdict is returned first when both
+/// fail: a `computed` tag misplaced *and* typed `i64` is misplaced first and
+/// foremost, and the caller's field-error list stays as short as the existing
+/// twins' did.
+fn placement_verdict(
+    conn_name: &str,
+    protocol: &str,
+    tag_kind: &str,
+    data_type: &str,
+) -> Result<(), BantoError> {
+    let is_virtual = protocol == VIRTUAL_PROTOCOL;
+    let is_postgres = protocol == POSTGRES_PROTOCOL;
+
+    let placement_error = |field: &str, message: String| -> Result<(), BantoError> {
+        Err(BantoError::Validation {
+            field_errors: vec![FieldError {
+                field: field.to_string(),
+                message,
+            }],
+        })
+    };
+
+    match tag_kind {
+        PLC_TAG_KIND if is_virtual => {
+            return placement_error(
+                "tagKind",
+                "plc タグは予約接続（calc/mem）配下に作成できません".to_string(),
+            )
+        }
+        // 外部 DB 連携 S2 (docs/banto-hub-external-db-design.md §4.1「配置
+        // 制約」): `postgres` 接続は PLC 収集パイプラインに一切参加しない
+        // (`banto_collect::build_config_from` が除外する) ので、その配下の
+        // `plc` タグは永久に収集されない - `"virtual"` 配下の `plc` タグを
+        // 拒否するのと全く同じ理由で登録時に拒否する。
+        PLC_TAG_KIND if is_postgres => {
+            return placement_error(
+                "tagKind",
+                "plc タグは DB 接続（postgres）配下に作成できません".to_string(),
+            )
+        }
+        COMPUTED_TAG_KIND if !is_virtual || conn_name != CALC_CONNECTION_NAME => {
+            return placement_error(
+                "tagKind",
+                format!("computed タグは予約接続 {CALC_CONNECTION_NAME} 配下にのみ作成できます"),
+            )
+        }
+        INTERNAL_TAG_KIND if !is_virtual || conn_name != MEM_CONNECTION_NAME => {
+            return placement_error(
+                "tagKind",
+                format!("internal タグは予約接続 {MEM_CONNECTION_NAME} 配下にのみ作成できます"),
+            )
+        }
+        DB_TAG_KIND if !is_postgres => {
+            return placement_error(
+                "tagKind",
+                format!("db タグは {POSTGRES_PROTOCOL} 接続配下にのみ作成できます"),
+            )
+        }
+        // Unknown tag_kind is already rejected by validate_tag_input; no
+        // placement rule to apply.
+        _ => {}
+    }
+
+    // #325 (2026-09-08 オーナー決定): 64bit 型は Modbus 接続配下限定 -
+    // `MODBUS_ONLY_DATA_TYPES` の doc comment 参照。`tag_kind` と独立した
+    // 規則なので、上の match を抜けた（＝種別としては正しい配置の）タグにも
+    // 必ず適用される。
+    if MODBUS_ONLY_DATA_TYPES.contains(&data_type) && protocol != MODBUS_PROTOCOL {
+        return placement_error(
+            "dataType",
+            "64bit 型（i64/u64/f64）は Modbus 接続配下のタグでのみ使用できます".to_string(),
+        );
+    }
+
+    Ok(())
+}
+
 /// Cross-table placement check (T6-2, design §4.2's reserved `calc`/`mem`
 /// namespace): `tag_kind` alone (checked in [`validate_tag_input`], which has
 /// no database access) cannot tell whether a tag's group sits under the
@@ -863,115 +1001,51 @@ fn is_db_column_identifier(address: &str) -> bool {
 /// ([`crate::support::map_write_error`]) instead - this function returns
 /// `Ok(())` for that case rather than manufacturing a second, duplicate
 /// error for the same underlying problem.
+///
+/// **#325 (2026-09-08 オーナー決定)**: this step now also owns the 64-bit
+/// `data_type` placement rule (hence the `data_type` parameter) - see
+/// [`placement_verdict`], which holds the whole rule set for both this
+/// function and its transaction-taking twin. The function keeps its
+/// `_tag_kind_` name because `tag_kind` is still the bulk of what it decides
+/// and every call site/doc reference in this crate and its consumers points
+/// at that name.
 async fn validate_tag_kind_placement(
     pool: &SqlitePool,
     collection_group_id: i64,
     tag_kind: &str,
+    data_type: &str,
 ) -> Result<(), BantoError> {
-    let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT pc.name, pc.protocol FROM collection_groups cg \
-         JOIN plc_connections pc ON pc.id = cg.plc_connection_id \
-         WHERE cg.id = ?",
-    )
-    .bind(collection_group_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(banto_storage::storage_error)?;
+    let row: Option<(String, String)> = sqlx::query_as(PLACEMENT_CONNECTION_SQL)
+        .bind(collection_group_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(banto_storage::storage_error)?;
 
     let Some((conn_name, protocol)) = row else {
         return Ok(());
     };
-    let is_virtual = protocol == VIRTUAL_PROTOCOL;
-
-    let placement_error = |message: String| -> Result<(), BantoError> {
-        Err(BantoError::Validation {
-            field_errors: vec![FieldError {
-                field: "tagKind".to_string(),
-                message,
-            }],
-        })
-    };
-
-    let is_postgres = protocol == POSTGRES_PROTOCOL;
-
-    match tag_kind {
-        PLC_TAG_KIND if is_virtual => {
-            placement_error("plc タグは予約接続（calc/mem）配下に作成できません".to_string())
-        }
-        // 外部 DB 連携 S2 (docs/banto-hub-external-db-design.md §4.1「配置
-        // 制約」): `postgres` 接続は PLC 収集パイプラインに一切参加しない
-        // (`banto_collect::build_config_from` が除外する) ので、その配下の
-        // `plc` タグは永久に収集されない - `"virtual"` 配下の `plc` タグを
-        // 拒否するのと全く同じ理由で登録時に拒否する。
-        PLC_TAG_KIND if is_postgres => {
-            placement_error("plc タグは DB 接続（postgres）配下に作成できません".to_string())
-        }
-        COMPUTED_TAG_KIND if !is_virtual || conn_name != CALC_CONNECTION_NAME => placement_error(
-            format!("computed タグは予約接続 {CALC_CONNECTION_NAME} 配下にのみ作成できます"),
-        ),
-        INTERNAL_TAG_KIND if !is_virtual || conn_name != MEM_CONNECTION_NAME => placement_error(
-            format!("internal タグは予約接続 {MEM_CONNECTION_NAME} 配下にのみ作成できます"),
-        ),
-        DB_TAG_KIND if !is_postgres => placement_error(format!(
-            "db タグは {POSTGRES_PROTOCOL} 接続配下にのみ作成できます"
-        )),
-        // Unknown tag_kind is already rejected by validate_tag_input; no
-        // placement rule to apply.
-        _ => Ok(()),
-    }
+    placement_verdict(&conn_name, &protocol, tag_kind, data_type)
 }
 
+/// Transaction-taking twin of [`validate_tag_kind_placement`] - identical
+/// rules (both delegate to [`placement_verdict`]), differing only in reading
+/// the connection row through the caller's `connection` so it sees that
+/// transaction's uncommitted writes.
 async fn validate_tag_kind_placement_tx(
     connection: &mut SqliteConnection,
     collection_group_id: i64,
     tag_kind: &str,
+    data_type: &str,
 ) -> Result<(), BantoError> {
-    let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT pc.name, pc.protocol FROM collection_groups cg \
-         JOIN plc_connections pc ON pc.id = cg.plc_connection_id \
-         WHERE cg.id = ?",
-    )
-    .bind(collection_group_id)
-    .fetch_optional(&mut *connection)
-    .await
-    .map_err(banto_storage::storage_error)?;
+    let row: Option<(String, String)> = sqlx::query_as(PLACEMENT_CONNECTION_SQL)
+        .bind(collection_group_id)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(banto_storage::storage_error)?;
     let Some((conn_name, protocol)) = row else {
         return Ok(());
     };
-    let is_virtual = protocol == VIRTUAL_PROTOCOL;
-    let placement_error = |message: String| -> Result<(), BantoError> {
-        Err(BantoError::Validation {
-            field_errors: vec![FieldError {
-                field: "tagKind".to_string(),
-                message,
-            }],
-        })
-    };
-    let is_postgres = protocol == POSTGRES_PROTOCOL;
-
-    match tag_kind {
-        PLC_TAG_KIND if is_virtual => {
-            placement_error("plc タグは予約接続（calc/mem）配下に作成できません".to_string())
-        }
-        // 外部 DB 連携 S2 (docs/banto-hub-external-db-design.md §4.1「配置
-        // 制約」): `postgres` 接続は PLC 収集パイプラインに一切参加しない
-        // (`banto_collect::build_config_from` が除外する) ので、その配下の
-        // `plc` タグは永久に収集されない - `"virtual"` 配下の `plc` タグを
-        // 拒否するのと全く同じ理由で登録時に拒否する。
-        PLC_TAG_KIND if is_postgres => {
-            placement_error("plc タグは DB 接続（postgres）配下に作成できません".to_string())
-        }
-        COMPUTED_TAG_KIND if !is_virtual || conn_name != CALC_CONNECTION_NAME => placement_error(
-            format!("computed タグは予約接続 {CALC_CONNECTION_NAME} 配下にのみ作成できます"),
-        ),
-        INTERNAL_TAG_KIND if !is_virtual || conn_name != MEM_CONNECTION_NAME => placement_error(
-            format!("internal タグは予約接続 {MEM_CONNECTION_NAME} 配下にのみ作成できます"),
-        ),
-        DB_TAG_KIND if !is_postgres => placement_error(format!(
-            "db タグは {POSTGRES_PROTOCOL} 接続配下にのみ作成できます"
-        )),
-        _ => Ok(()),
-    }
+    placement_verdict(&conn_name, &protocol, tag_kind, data_type)
 }
 
 fn column_map() -> ColumnMap {
@@ -1287,7 +1361,13 @@ impl TagService {
 
     pub async fn create(&self, input: TagInput) -> Result<Tag, BantoError> {
         let validated = validate_tag_input(&input)?;
-        validate_tag_kind_placement(&self.pool, input.collection_group_id, &input.tag_kind).await?;
+        validate_tag_kind_placement(
+            &self.pool,
+            input.collection_group_id,
+            &input.tag_kind,
+            &input.data_type,
+        )
+        .await?;
         // AssertSqlSafe: insert_tag_sql() は固定の列名・プレースホルダのみで
         // 構築される文字列で外部入力は含まれない（本ファイル内の関数定義参照）。
         sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(insert_tag_sql()))
@@ -1332,8 +1412,13 @@ impl TagService {
         input: TagInput,
     ) -> Result<Tag, BantoError> {
         let validated = validate_tag_input(&input)?;
-        validate_tag_kind_placement_tx(connection, input.collection_group_id, &input.tag_kind)
-            .await?;
+        validate_tag_kind_placement_tx(
+            connection,
+            input.collection_group_id,
+            &input.tag_kind,
+            &input.data_type,
+        )
+        .await?;
         // AssertSqlSafe: insert_tag_sql() は固定の列名・プレースホルダのみで
         // 構築される文字列で外部入力は含まれない（本ファイル内の関数定義参照）。
         sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(insert_tag_sql()))
@@ -1390,7 +1475,13 @@ impl TagService {
     /// hub REST layer, via [`Self::update_tx`]).
     pub async fn update(&self, id: i64, input: TagInput) -> Result<Tag, BantoError> {
         let validated = validate_tag_input(&input)?;
-        validate_tag_kind_placement(&self.pool, input.collection_group_id, &input.tag_kind).await?;
+        validate_tag_kind_placement(
+            &self.pool,
+            input.collection_group_id,
+            &input.tag_kind,
+            &input.data_type,
+        )
+        .await?;
         let expected_revision = input.expected_revision;
         let sql = update_tag_sql(expected_revision.is_some());
         // AssertSqlSafe: update_tag_sql() は expected_revision の有無で固定の
@@ -1482,8 +1573,13 @@ impl TagService {
         input: TagInput,
     ) -> Result<Tag, TagUpdateError> {
         let validated = validate_tag_input(&input)?;
-        validate_tag_kind_placement_tx(connection, input.collection_group_id, &input.tag_kind)
-            .await?;
+        validate_tag_kind_placement_tx(
+            connection,
+            input.collection_group_id,
+            &input.tag_kind,
+            &input.data_type,
+        )
+        .await?;
         let expected_revision = input.expected_revision;
         let sql = update_tag_sql(expected_revision.is_some());
         // AssertSqlSafe: update() と同じ理由 - update_tag_sql() は固定の
@@ -1617,6 +1713,7 @@ impl TagService {
                 connection,
                 input.collection_group_id,
                 &input.tag_kind,
+                &input.data_type,
             )
             .await
             {
@@ -2027,6 +2124,7 @@ impl TagService {
                 connection,
                 input.collection_group_id,
                 &input.tag_kind,
+                &input.data_type,
             )
             .await
             {
@@ -2234,6 +2332,7 @@ impl TagService {
                 &self.pool,
                 input.collection_group_id,
                 &input.tag_kind,
+                &input.data_type,
             )
             .await
             {
@@ -2746,6 +2845,11 @@ mod tests {
         }
     }
 
+    /// [`setup`]'s fixture connection is `modbus-tcp`, which is exactly the
+    /// placement #325's [`MODBUS_ONLY_DATA_TYPES`] require - so under it
+    /// **every** entry of [`ALLOWED_DATA_TYPES`] is creatable, 64-bit types
+    /// included. The narrower "…and nowhere else" half of that rule is fixed
+    /// separately by the `rejects_a_64bit_tag_under_*` tests below.
     #[tokio::test]
     async fn create_accepts_every_allowed_data_type() {
         let (svc, group_id) = setup().await;
@@ -2764,7 +2868,7 @@ mod tests {
     async fn create_rejects_unknown_data_type() {
         let (svc, group_id) = setup().await;
         let mut input = sample_input("X", group_id);
-        input.data_type = "f64".to_string();
+        input.data_type = "f128".to_string();
         let err = svc.create(input).await.unwrap_err();
         match err {
             BantoError::Validation { field_errors } => {
@@ -2878,6 +2982,235 @@ mod tests {
         let mut expected: Vec<&str> = NUMERIC_DATA_TYPES.to_vec();
         expected.push(STRING_DATA_TYPE);
         assert_eq!(ALLOWED_DATA_TYPES, expected.as_slice());
+    }
+
+    /// The relationship [`MODBUS_ONLY_DATA_TYPES`]'s doc comment promises
+    /// (#325): the placement-restricted set is a subset of the accepted
+    /// vocabulary, and it is exactly the three 64-bit types - so a future
+    /// data type added to [`ALLOWED_DATA_TYPES`] cannot accidentally inherit
+    /// the Modbus-only restriction (or accidentally escape it) unnoticed.
+    #[test]
+    fn modbus_only_is_the_64bit_subset_of_allowed() {
+        assert_eq!(MODBUS_ONLY_DATA_TYPES, &["i64", "u64", "f64"]);
+        for data_type in MODBUS_ONLY_DATA_TYPES {
+            assert!(
+                ALLOWED_DATA_TYPES.contains(data_type),
+                "{data_type:?} is Modbus-only but not in ALLOWED_DATA_TYPES at all"
+            );
+        }
+    }
+
+    // --- #325: 64bit 型の配置制約（Modbus 接続配下限定） ------------------
+    //
+    // 2026-09-08 オーナー決定の2点目: `i64`/`u64`/`f64` は `modbus-tcp`
+    // 接続配下のタグでのみ登録できる。SQL CHECK は3型を素通しする（0016 の
+    // header 参照）ので、ここで固定するのは `validate_tag_kind_placement`
+    // (`placement_verdict`) の側だけである。
+
+    /// Test helper: a `"slmp"` connection plus one group under it - the
+    /// non-Modbus PLC placement 64-bit tags must be rejected from. Built with
+    /// the services (not raw SQL) so it also proves an SLMP group is
+    /// perfectly creatable; only the *tag* is refused.
+    async fn slmp_group(pool: &SqlitePool) -> i64 {
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(PlcConnectionInput {
+                name: "SLMP1".to_string(),
+                protocol: "slmp".to_string(),
+                host: "192.168.1.10".to_string(),
+                port: 5007,
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+                word_order: "low_high".to_string(),
+                database: None,
+                username: None,
+                password: None,
+            })
+            .await
+            .expect("slmp connection should be creatable");
+        CollectionGroupService::new(pool.clone())
+            .create(CollectionGroupInput {
+                name: "SlmpGroup".to_string(),
+                plc_connection_id: conn.id,
+                period_ms: 1_000,
+                enabled: true,
+                default_writable: true,
+                query_sql: None,
+            })
+            .await
+            .expect("group under an slmp connection should be creatable")
+            .id
+    }
+
+    /// Assert the `Validation` error a misplaced 64-bit tag must produce:
+    /// one `dataType` field error carrying the owner-worded message.
+    fn assert_64bit_placement_error(err: BantoError) {
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors.len(), 1, "{field_errors:?}");
+                assert_eq!(field_errors[0].field, "dataType");
+                assert_eq!(
+                    field_errors[0].message,
+                    "64bit 型（i64/u64/f64）は Modbus 接続配下のタグでのみ使用できます"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// The permitted half of the rule: under [`setup`]'s `modbus-tcp`
+    /// connection all three 64-bit types register and round-trip.
+    #[tokio::test]
+    async fn create_accepts_64bit_data_types_under_modbus() {
+        let (svc, group_id) = setup().await;
+        for data_type in MODBUS_ONLY_DATA_TYPES {
+            let mut input = sample_input(&format!("W{data_type}"), group_id);
+            input.data_type = (*data_type).to_string();
+            let created = svc.create(input).await.unwrap_or_else(|e| {
+                panic!("{data_type} under a modbus-tcp group should be accepted: {e:?}")
+            });
+            assert_eq!(&created.data_type, data_type);
+            assert_eq!(svc.get(created.id).await.unwrap().data_type, *data_type);
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_a_64bit_tag_under_an_slmp_connection() {
+        let (svc, _modbus_group) = setup().await;
+        let group_id = slmp_group(&svc.pool).await;
+        for data_type in MODBUS_ONLY_DATA_TYPES {
+            let mut input = sample_input(&format!("S{data_type}"), group_id);
+            input.address = "D100".to_string();
+            input.data_type = (*data_type).to_string();
+            assert_64bit_placement_error(svc.create(input).await.unwrap_err());
+        }
+        // ...and a 32-bit tag in the same place is still perfectly fine, so
+        // the rejection is about the type, not about SLMP groups at large.
+        let mut ok = sample_input("S32", group_id);
+        ok.address = "D200".to_string();
+        ok.data_type = "i32".to_string();
+        svc.create(ok).await.expect("i32 under slmp is unaffected");
+    }
+
+    /// The reserved `calc`/`mem` virtual connections: a `computed`/`internal`
+    /// tag is correctly placed as far as `tag_kind` goes, so this exercises
+    /// the 64-bit rule on its own rather than piggybacking on a `tagKind`
+    /// rejection.
+    #[tokio::test]
+    async fn create_rejects_a_64bit_tag_under_the_virtual_connections() {
+        let (svc, _modbus_group) = setup().await;
+
+        let calc_group = virtual_group(&svc.pool, CALC_CONNECTION_NAME).await;
+        let mut computed = sample_input("c64", calc_group);
+        computed.tag_kind = COMPUTED_TAG_KIND.to_string();
+        computed.address = String::new();
+        computed.expression = Some("1 + 1".to_string());
+        computed.data_type = "f64".to_string();
+        assert_64bit_placement_error(svc.create(computed).await.unwrap_err());
+
+        let mem_group = virtual_group(&svc.pool, MEM_CONNECTION_NAME).await;
+        let mut internal = sample_input("m64", mem_group);
+        internal.tag_kind = INTERNAL_TAG_KIND.to_string();
+        internal.address = String::new();
+        internal.data_type = "u64".to_string();
+        assert_64bit_placement_error(svc.create(internal).await.unwrap_err());
+    }
+
+    #[tokio::test]
+    async fn create_rejects_a_64bit_tag_under_a_postgres_connection() {
+        let (svc, _modbus_group) = setup().await;
+        let group_id = postgres_group(&svc.pool).await;
+        let mut input = db_tag_input("Big", group_id, "big_count");
+        input.data_type = "i64".to_string();
+        assert_64bit_placement_error(svc.create(input).await.unwrap_err());
+    }
+
+    /// `update` runs the same placement step as `create` (both call
+    /// [`validate_tag_kind_placement`]), so an existing SLMP tag cannot be
+    /// re-typed into a 64-bit type after the fact.
+    #[tokio::test]
+    async fn update_rejects_retyping_an_slmp_tag_to_64bit() {
+        let (svc, _modbus_group) = setup().await;
+        let group_id = slmp_group(&svc.pool).await;
+        let mut original = sample_input("Retype", group_id);
+        original.address = "D100".to_string();
+        let created = svc.create(original.clone()).await.expect("i16 under slmp");
+
+        let mut retyped = original;
+        retyped.data_type = "i64".to_string();
+        assert_64bit_placement_error(svc.update(created.id, retyped).await.unwrap_err());
+
+        // The stored row is untouched.
+        assert_eq!(svc.get(created.id).await.unwrap().data_type, "i16");
+    }
+
+    /// The other direction of the same rule under `update`: the tag keeps its
+    /// 64-bit type but is moved to a group under a non-Modbus connection.
+    /// `collection_group_id` is part of [`TagInput`], so a re-parent goes
+    /// through exactly the same placement step.
+    #[tokio::test]
+    async fn update_rejects_moving_a_64bit_tag_to_a_non_modbus_group() {
+        let (svc, modbus_group) = setup().await;
+        let mut input = sample_input("Moved", modbus_group);
+        input.data_type = "f64".to_string();
+        let created = svc.create(input.clone()).await.expect("f64 under modbus");
+
+        let slmp = slmp_group(&svc.pool).await;
+        let mut moved = input;
+        moved.collection_group_id = slmp;
+        moved.address = "D100".to_string();
+        assert_64bit_placement_error(svc.update(created.id, moved).await.unwrap_err());
+
+        // The stored row still sits in its original (modbus) group.
+        let fetched = svc.get(created.id).await.unwrap();
+        assert_eq!(fetched.collection_group_id, modbus_group);
+        assert_eq!(fetched.data_type, "f64");
+    }
+
+    /// The transaction-taking twin ([`validate_tag_kind_placement_tx`], the
+    /// path the hub REST layer and every batch operation take) must reach the
+    /// same verdict as the pool-taking one - they share
+    /// [`placement_verdict`], and this is the tripwire for that sharing being
+    /// undone.
+    #[tokio::test]
+    async fn the_transaction_path_rejects_a_64bit_tag_the_same_way() {
+        let (svc, _modbus_group) = setup().await;
+        let group_id = slmp_group(&svc.pool).await;
+        let mut input = sample_input("TxS", group_id);
+        input.address = "D100".to_string();
+        input.data_type = "u64".to_string();
+
+        let mut tx = svc.pool.begin().await.expect("begin tx");
+        let err = svc.create_tx(&mut tx, input).await.unwrap_err();
+        tx.rollback().await.expect("rollback");
+        assert_64bit_placement_error(err);
+    }
+
+    /// The batch path collects the same field error per row (the hub's CSV
+    /// import surface), rather than erroring out the whole call.
+    #[tokio::test]
+    async fn create_batch_reports_the_64bit_placement_error_per_row() {
+        let (svc, modbus_group) = setup().await;
+        let slmp = slmp_group(&svc.pool).await;
+
+        let mut bad = sample_input("B64", slmp);
+        bad.address = "D100".to_string();
+        bad.data_type = "i64".to_string();
+        let mut good = sample_input("G64", modbus_group);
+        good.data_type = "i64".to_string();
+
+        let outcome = svc
+            .create_batch(vec![good, bad], false)
+            .await
+            .expect("create_batch reports invalid rows instead of erroring");
+        match outcome {
+            BatchTagOutcome::Invalid(errors) => {
+                assert_eq!(errors.len(), 1, "{errors:?}");
+                assert_eq!(errors[0].index, 1);
+                assert!(errors[0].field_errors.iter().any(|e| e.field == "dataType"));
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     // --- validation: string tags (S1) -----------------------------------
@@ -3191,10 +3524,19 @@ mod tests {
         assert_eq!(back.string_length, None);
     }
 
-    /// The 0005 SQL `CHECK` and [`ALLOWED_DATA_TYPES`] must agree in the
-    /// rejection direction too: a type the Rust list rejects must also be
-    /// rejected by the schema when the service layer is bypassed (mirrors
-    /// `plc_connection.rs`'s CHECK symmetry tests).
+    /// The SQL `CHECK` (0005, widened by 0016) and [`ALLOWED_DATA_TYPES`]
+    /// must agree in the rejection direction too: a type the Rust list
+    /// rejects must also be rejected by the schema when the service layer is
+    /// bypassed (mirrors `plc_connection.rs`'s CHECK symmetry tests).
+    ///
+    /// **#325**: the probe list no longer contains `"f64"` - that is now a
+    /// legal *value* for the column (the SQL `CHECK` accepts it), merely one
+    /// whose *placement* is restricted. The two sets are deliberately pinned
+    /// separately: this test and
+    /// `every_allowed_data_type_is_accepted_by_the_sql_check` fix what the
+    /// schema allows, while `create_accepts_64bit_data_types_under_modbus`
+    /// and the `rejects_a_64bit_tag_under_*` tests fix what
+    /// [`validate_tag_kind_placement`] allows on top of it.
     #[tokio::test]
     async fn the_sql_check_accepts_nothing_beyond_allowed_data_types() {
         let (svc, group_id) = setup().await;
@@ -3202,7 +3544,7 @@ mod tests {
         // raw SQL to bypass validate_tag_input.
         let created = svc.create(sample_input("probe", group_id)).await.unwrap();
         let _ = created;
-        for data_type in ["f64", "STRING", "str", ""] {
+        for data_type in ["f128", "int64", "STRING", "str", "I64", ""] {
             let result = sqlx::query(
                 "INSERT INTO tags (name, collection_group_id, address, data_type) \
                  VALUES (?, ?, '40001', ?)",
@@ -3216,6 +3558,32 @@ mod tests {
                 result.is_err(),
                 "the SQL CHECK accepted {data_type:?}, which is not in ALLOWED_DATA_TYPES"
             );
+        }
+    }
+
+    /// The other direction of the same pairing, and the one that would have
+    /// caught a missing migration 0016: **every** entry of
+    /// [`ALLOWED_DATA_TYPES`] must pass the SQL `CHECK` when the service
+    /// layer (and therefore the Modbus-only placement rule) is bypassed
+    /// entirely - the schema's job is "is this row well-formed", nothing
+    /// more (see 0016's header).
+    #[tokio::test]
+    async fn every_allowed_data_type_is_accepted_by_the_sql_check() {
+        let (svc, group_id) = setup().await;
+        for (i, data_type) in ALLOWED_DATA_TYPES.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO tags (name, collection_group_id, address, data_type, string_length) \
+                 VALUES (?, ?, '40001', ?, ?)",
+            )
+            .bind(format!("raw{i}"))
+            .bind(group_id)
+            .bind(data_type)
+            .bind((*data_type == STRING_DATA_TYPE).then_some(8_i64))
+            .execute(&svc.pool)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{data_type:?} is in ALLOWED_DATA_TYPES but the SQL CHECK rejected it: {e}")
+            });
         }
     }
 
@@ -4775,6 +5143,284 @@ mod tests {
         }
     }
 
+    // --- migration 0016 (table rebuild: data_type に 64bit 3型を追加) ------
+
+    /// Migration 0016 rebuilds `tags` a fourth time for the same reason as
+    /// 0011/0015 (SQLite cannot `ALTER` a `CHECK`), so this follows
+    /// `migration_0015_preserves_rows_and_foreign_keys_on_a_populated_database`'s
+    /// exact recipe: the whole 0001-0015 chain first (a faithful stand-in for
+    /// a deployed pre-0016 database), non-default values throughout the
+    /// seeded rows so a dropped/transposed column shows up as a mismatch,
+    /// then 0016 applied on its own pinned connection inside one transaction
+    /// exactly as sqlx's `Migrate::apply` runs it.
+    ///
+    /// The seeded tag deliberately uses `tag_kind = 'db'` - 0015's addition,
+    /// i.e. the newest thing 0016 has to carry across.
+    #[tokio::test]
+    async fn migration_0016_preserves_rows_and_widens_data_type_on_a_populated_database() {
+        use sqlx::{Acquire, Executor};
+
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect_sqlite_memory");
+        let mut conn = pool.acquire().await.expect("acquire one pinned connection");
+
+        for (label, sql) in [
+            (
+                "0001",
+                include_str!("../migrations/0001_plc_connections.sql"),
+            ),
+            (
+                "0002",
+                include_str!("../migrations/0002_collection_groups.sql"),
+            ),
+            ("0003", include_str!("../migrations/0003_tags.sql")),
+            (
+                "0004",
+                include_str!("../migrations/0004_plc_connections_allow_slmp.sql"),
+            ),
+            (
+                "0005",
+                include_str!("../migrations/0005_tags_allow_string.sql"),
+            ),
+            (
+                "0006",
+                include_str!("../migrations/0006_tags_writable_kind.sql"),
+            ),
+            (
+                "0007",
+                include_str!("../migrations/0007_plc_connections_allow_virtual.sql"),
+            ),
+            (
+                "0008",
+                include_str!("../migrations/0008_plc_connections_add_simulation.sql"),
+            ),
+            ("0009", include_str!("../migrations/0009_tags_revision.sql")),
+            (
+                "0010",
+                include_str!("../migrations/0010_plc_connections_add_word_order.sql"),
+            ),
+            (
+                "0011",
+                include_str!("../migrations/0011_tags_unique_name_per_group.sql"),
+            ),
+            (
+                "0012",
+                include_str!("../migrations/0012_collection_groups_add_default_writable.sql"),
+            ),
+            (
+                "0013",
+                include_str!("../migrations/0013_tags_add_string_encoding.sql"),
+            ),
+            (
+                "0014",
+                include_str!("../migrations/0014_plc_connections_allow_postgres.sql"),
+            ),
+            (
+                "0015",
+                include_str!("../migrations/0015_db_source_query_sql_and_tag_kind.sql"),
+            ),
+        ] {
+            conn.execute(sql)
+                .await
+                .unwrap_or_else(|e| panic!("pre-0016 migration {label} failed: {e}"));
+        }
+
+        conn.execute(
+            "INSERT INTO plc_connections (id, name, protocol, host, port, unit_id, enabled, \
+             simulation, word_order) \
+             VALUES (7, 'Line1 PLC', 'modbus-tcp', '192.168.1.10', 502, 3, 0, 1, 'high_low')",
+        )
+        .await
+        .expect("seed connection");
+        conn.execute(
+            "INSERT INTO collection_groups (id, name, plc_connection_id, period_ms, enabled, \
+             default_writable, query_sql) VALUES (4, 'G1', 7, 2000, 0, 0, 'SELECT a FROM v1')",
+        )
+        .await
+        .expect("seed collection group");
+        conn.execute(
+            "INSERT INTO tags (id, name, collection_group_id, address, data_type, string_length, \
+             raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, threshold_h, threshold_hh, \
+             threshold_l, threshold_ll, enabled, writable, tag_kind, expression, retain, revision, \
+             string_encoding) \
+             VALUES (9, 'D100', 4, 'D100', 'i16', NULL, 0, 100, 0, 50, 'degC', 2, 45, 50, 10, 5, \
+             1, 1, 'db', NULL, 0, 3, 'shift_jis')",
+        )
+        .await
+        .expect("seed tag");
+
+        let migration = include_str!("../migrations/0016_tags_allow_64bit.sql");
+        let mut tx = conn.begin().await.expect("begin, as the migrator does");
+        tx.execute(migration).await.expect("0016 should apply");
+        tx.commit().await.expect("0016 should commit");
+
+        #[allow(clippy::type_complexity)]
+        let tag: (
+            i64,
+            String,
+            i64,
+            String,
+            String,
+            i64,
+            bool,
+            String,
+            Option<String>,
+            bool,
+            i64,
+            String,
+        ) = sqlx::query_as(
+            "SELECT id, name, collection_group_id, address, data_type, decimals, \
+             writable, tag_kind, expression, retain, revision, string_encoding \
+             FROM tags WHERE id = 9",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("the seeded tag should have been copied across");
+        assert_eq!(
+            tag,
+            (
+                9,
+                "D100".to_string(),
+                4,
+                "D100".to_string(),
+                "i16".to_string(),
+                2,
+                true,
+                "db".to_string(),
+                None,
+                false,
+                3,
+                "shift_jis".to_string(),
+            )
+        );
+
+        // Scaling/threshold columns survived too (they are not in the tuple
+        // above, and a transposed column list is exactly what would scramble
+        // them).
+        #[allow(clippy::type_complexity)]
+        let scaling: (
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<String>,
+        ) = sqlx::query_as("SELECT raw_lo, raw_hi, eng_lo, eng_hi, unit FROM tags WHERE id = 9")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("scaling columns");
+        assert_eq!(
+            scaling,
+            (
+                Some(0.0),
+                Some(100.0),
+                Some(0.0),
+                Some(50.0),
+                Some("degC".to_string())
+            )
+        );
+
+        // 0015's `collection_groups.query_sql` is untouched by this migration
+        // (it does not rebuild that table at all).
+        let query_sql: Option<String> =
+            sqlx::query_scalar("SELECT query_sql FROM collection_groups WHERE id = 4")
+                .fetch_one(&mut *conn)
+                .await
+                .expect("query_sql column should exist");
+        assert_eq!(query_sql, Some("SELECT a FROM v1".to_string()));
+
+        let violations: Vec<(String,)> = sqlx::query_as("PRAGMA foreign_key_check")
+            .fetch_all(&mut *conn)
+            .await
+            .expect("foreign_key_check");
+        assert!(
+            violations.is_empty(),
+            "the rebuild left dangling foreign keys: {violations:?}"
+        );
+
+        assert!(
+            sqlx::query(
+                "INSERT INTO tags (name, collection_group_id, address, data_type) \
+                 VALUES ('orphan', 999, 'D0', 'i16')",
+            )
+            .execute(&mut *conn)
+            .await
+            .is_err(),
+            "foreign keys should still be enforced after the migration"
+        );
+
+        let index_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' \
+             AND name = 'idx_tags_collection_group_id'",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("index lookup");
+        assert_eq!(index_count, 1);
+
+        // 0011's UNIQUE(collection_group_id, name) survived.
+        assert!(
+            sqlx::query(
+                "INSERT INTO tags (name, collection_group_id, address, data_type) \
+                 VALUES ('D100', 4, 'D200', 'i16')",
+            )
+            .execute(&mut *conn)
+            .await
+            .is_err(),
+            "UNIQUE(collection_group_id, name) should still reject a same-group duplicate"
+        );
+
+        // The point of the whole exercise: the three 64-bit types are now
+        // accepted by the column's CHECK.
+        for data_type in ["i64", "u64", "f64"] {
+            sqlx::query(
+                "INSERT INTO tags (name, collection_group_id, address, data_type) \
+                 VALUES (?, 4, '40001', ?)",
+            )
+            .bind(format!("wide-{data_type}"))
+            .bind(data_type)
+            .execute(&mut *conn)
+            .await
+            .unwrap_or_else(|e| panic!("the widened CHECK should accept {data_type:?}: {e}"));
+        }
+
+        // ...while every other CHECK still rejects what it always did
+        // (0005/0016's data_type, 0015's tag_kind, 0013's string_encoding,
+        // 0005's string_length range, 0003's decimals range).
+        for (label, sql) in [
+            (
+                "data_type",
+                "INSERT INTO tags (name, collection_group_id, address, data_type) \
+                 VALUES ('Nope', 4, 'D300', 'f128')",
+            ),
+            (
+                "tag_kind",
+                "INSERT INTO tags (name, collection_group_id, address, data_type, tag_kind) \
+                 VALUES ('Nope2', 4, 'D400', 'i16', 'bogus')",
+            ),
+            (
+                "string_encoding",
+                "INSERT INTO tags (name, collection_group_id, address, data_type, \
+                 string_encoding) VALUES ('Nope3', 4, 'D500', 'i16', 'euc_jp')",
+            ),
+            (
+                "string_length",
+                "INSERT INTO tags (name, collection_group_id, address, data_type, \
+                 string_length) VALUES ('Nope4', 4, 'D600', 'string', 129)",
+            ),
+            (
+                "decimals",
+                "INSERT INTO tags (name, collection_group_id, address, data_type, decimals) \
+                 VALUES ('Nope5', 4, 'D700', 'i16', 7)",
+            ),
+        ] {
+            assert!(
+                sqlx::query(sql).execute(&mut *conn).await.is_err(),
+                "the {label} CHECK should have survived the rebuild"
+            );
+        }
+    }
+
     // --- list -------------------------------------------------------------
 
     #[tokio::test]
@@ -4914,7 +5560,7 @@ mod tests {
     async fn create_batch_rejects_everything_when_one_row_is_invalid() {
         let (svc, group_id) = setup().await;
         let mut bad = sample_input("Bad", group_id);
-        bad.data_type = "f64".to_string(); // not in ALLOWED_DATA_TYPES
+        bad.data_type = "f128".to_string(); // not in ALLOWED_DATA_TYPES
         let inputs = vec![
             sample_input("Good1", group_id),
             bad,
@@ -5282,7 +5928,7 @@ mod tests {
         let b = svc.create(sample_input("UB-G", group_id)).await.unwrap();
 
         let mut bad = sample_input("UB-F2", group_id);
-        bad.data_type = "f64".to_string(); // not in ALLOWED_DATA_TYPES
+        bad.data_type = "f128".to_string(); // not in ALLOWED_DATA_TYPES
 
         let mut tx = svc.pool.begin().await.expect("begin tx");
         let outcome = svc

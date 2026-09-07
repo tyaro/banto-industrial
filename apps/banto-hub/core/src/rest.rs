@@ -2485,14 +2485,22 @@ fn default_plc_simulation() -> bool {
     false
 }
 
-/// P3-b（監査指摘 2026-08-12）: a `PlcConnectionPayload` missing `wordOrder`
-/// (an old client, or a create/update that never mentions it) keeps MELSEC's
-/// own low-word-first order - the same default
-/// `banto_tags::plc_connection::default_word_order` and migration `0010`'s
-/// column default already use, so an old client's connections behave exactly
-/// as they did before this field existed.
+/// P3-b（監査指摘 2026-08-12）/ 2026-09-08 オーナー決定: a
+/// `PlcConnectionPayload` missing `wordOrder` (an old client, or a
+/// create/update that never mentions it) defers to
+/// `banto_tags::plc_connection`'s **protocol-aware** default - `"high_low"`
+/// for `modbus-tcp`, `"low_high"` for everything else - by handing it the
+/// empty-string "unspecified" sentinel rather than a concrete order.
+///
+/// Returning `"low_high"` here (as this fn did until 2026-09-08) would mask
+/// that default entirely: the payload would arrive at
+/// `PlcConnectionInput` already filled in, so an omitted `wordOrder` on a
+/// Modbus connection could never reach the `"high_low"` default the owner
+/// decision requires. `""` is a safe sentinel because it is not in
+/// `ALLOWED_WORD_ORDERS` and migration `0010`'s SQL `CHECK` rejects it, so
+/// it was never a storable value.
 fn default_plc_word_order() -> String {
-    "low_high".to_string()
+    String::new()
 }
 
 /// T19 S1-b（UX-34、docs/banto-hub-t19-design.md §2）: a
@@ -2550,12 +2558,22 @@ pub struct PlcConnectionPayload {
     /// connections specifically, `crate::broker_glue::SlmpSimRegistry`.
     #[serde(default = "default_plc_simulation")]
     pub simulation: bool,
-    /// P3-b（監査指摘 2026-08-12）: SLMP のワード順（32bit値の上位/下位ワードの
-    /// 並び）。`"low_high"`（既定・MELSEC標準）/ `"high_low"`（Modbus/IEEE慣習）
-    /// のいずれか - 検証は `banto_tags::plc_connection::validate_plc_connection_input`
-    /// 側（`ALLOWED_WORD_ORDERS`）に委ねる。modbus-tcp/virtual 接続では無意味
-    /// （`unit_id` と同じ扱い）だが、フォームは "slmp" 選択時のみ表示する
-    /// （`plc-connections/+page.svelte`）。
+    /// P3-b（監査指摘 2026-08-12）: ワード順（32bit値 u32/f32 等、および
+    /// issue #325 で追加された 64bit 値 i64/u64/f64（4レジスタ）の上位/下位
+    /// ワードの並び）。`"low_high"` / `"high_low"` のいずれか - 検証は
+    /// `banto_tags::plc_connection::validate_plc_connection_input` 側
+    /// （`ALLOWED_WORD_ORDERS`）に委ねる。
+    ///
+    /// 2026-09-08 オーナー決定: **modbus-tcp でも有効な設定**（既定は
+    /// `"high_low"` = Modbus/IEEE 慣習、SLMP は `"low_high"` = MELSEC 標準）。
+    /// それ以前は収集経路が Modbus のこの列を無視して `HighLow` 固定で動く
+    /// 一方 read-on-demand/書き込み経路は列を読んでおり、同じタグの値が経路
+    /// ごとにワード反転して食い違っていた。フォームも "slmp" 選択時しか
+    /// 表示していなかったが、現在は modbus-tcp でも表示する。virtual/postgres
+    /// 接続では引き続き無意味（`unit_id` と同じ扱い）。
+    ///
+    /// 省略時は [`default_plc_word_order`] の "unspecified" 番兵を経由して
+    /// プロトコル依存の既定が適用される。
     #[serde(default = "default_plc_word_order")]
     pub word_order: String,
     /// S1（docs/banto-hub-external-db-design.md §4.1）: `protocol: "postgres"`

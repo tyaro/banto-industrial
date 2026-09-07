@@ -400,7 +400,7 @@ async fn batch_create_rejects_whole_batch_on_one_invalid_row() {
     let before_count = tag_count(&app).await;
 
     let mut bad = tag_payload("bt_bad", group_id, "40002");
-    bad["dataType"] = json!("f64"); // ALLOWED_DATA_TYPES にない
+    bad["dataType"] = json!("f128"); // ALLOWED_DATA_TYPES にない（f64 は #325 で追加された）
 
     let (status, body) = write_json(
         &app.router,

@@ -12,6 +12,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
+	addressIncrement,
 	buildContinuousParams,
 	defaultNamePatternFromAddress,
 	defaultStartNumberFromAddress,
@@ -259,6 +260,54 @@ describe('generateContinuousTags: 16進デバイス・bit 連番がプレビュ�
 		expect(result.ok).toBe(false);
 		if (!result.ok) {
 			expect(result.error).toMatch(/bit/);
+		}
+	});
+});
+
+// #325（2026-09-08 オーナー決定）: 64bit 型（i64/u64/f64、Modbus の4レジスタ
+// 値）はアドレス増分 +4 になる - addressIncrement 本体と、
+// generateContinuousTags 経由（プレビューまで通す）の両方で固定する。
+
+describe('addressIncrement: 64bit 型（i64/u64/f64）は+4', () => {
+	it.each(['i64', 'u64', 'f64'] as const)('%s は addressIncrement で 4 を返す', (dataType) => {
+		expect(addressIncrement(dataType)).toBe(4);
+	});
+
+	it('既存の32bit型（i32/u32/f32）は引き続き+2のまま（回帰防止）', () => {
+		expect(addressIncrement('i32')).toBe(2);
+		expect(addressIncrement('u32')).toBe(2);
+		expect(addressIncrement('f32')).toBe(2);
+	});
+
+	it('既存の16bit/bit型は引き続き+1のまま（回帰防止）', () => {
+		expect(addressIncrement('bit')).toBe(1);
+		expect(addressIncrement('i16')).toBe(1);
+		expect(addressIncrement('u16')).toBe(1);
+	});
+});
+
+describe('generateContinuousTags: 64bit 型（i64/u64/f64）はアドレスが4ずつ増える', () => {
+	it('D100 を開始アドレスに、f64 型3点で D100/D104/D108 が生成される', () => {
+		const params = buildContinuousParams(
+			baseForm({ startAddress: 'D100', dataType: 'f64', count: 3 })
+		);
+		expect(params).not.toBeNull();
+		const result = generateContinuousTags(params!);
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			expect(result.rows.map((r) => r.address)).toEqual(['D100', 'D104', 'D108']);
+		}
+	});
+
+	it('Modbus 参照番号（40001）を開始アドレスに、i64 型3点で 40001/40005/40009 が生成される', () => {
+		const params = buildContinuousParams(
+			baseForm({ startAddress: '40001', dataType: 'i64', count: 3 })
+		);
+		expect(params).not.toBeNull();
+		const result = generateContinuousTags(params!);
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			expect(result.rows.map((r) => r.address)).toEqual(['40001', '40005', '40009']);
 		}
 	});
 });

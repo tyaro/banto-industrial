@@ -27,13 +27,15 @@
  *    サンプル値でありバイナリ4Eフレームでよく使われる」）。テスト環境の
  *    実機 R08ENCPU は `192.168.11.200:5200` だが、これは実機固有の値であり
  *    既定値には採用しない（実装指示のとおり）。
+ * 4. **プロトコルに応じた既定ワード順の追従**（2026-09-08 オーナー決定、
+ *    issue #330 の修正 - ポートの追従（上記3）と同じ「未編集なら追従、
+ *    明示的に編集した後は上書きしない」方式）: {@link DEFAULT_WORD_ORDERS}・
+ *    {@link defaultWordOrderFor}・{@link isDefaultWordOrderForProtocol}。
+ *    `modbus-tcp` = `high_low`（Modbus/IEEE慣習に統一 - 収集ポーリング経路と
+ *    read-on-demand/書き込み経路とでワード順の解釈が食い違っていた実バグの
+ *    是正）、`slmp` = `low_high`（MELSEC標準、従来どおり変更無し）。
  */
-import type {
-	PlcConnection,
-	PlcConnectionInput,
-	PlcProtocol,
-	SlmpWordOrder
-} from './tagRegistryAdmin';
+import type { PlcConnection, PlcConnectionInput, PlcProtocol, WordOrder } from './tagRegistryAdmin';
 import { nextSequentialName } from './sequentialName';
 
 /**
@@ -98,6 +100,45 @@ export function isDefaultPortForProtocol(port: string, protocol: PlcProtocol): b
 }
 
 /**
+ * プロトコルごとの既定ワード順（2026-09-08 オーナー決定、issue #330 の修正）。
+ * `modbus-tcp` = `high_low`（Modbus/IEEE 慣習に統一 - 収集ポーリング経路が
+ * 常に HighLow 固定で読んでいたのに read-on-demand/書き込み経路は列の値
+ * （旧既定 `low_high`）を読んでいたため、同じ u32/f32 タグが経路によって
+ * ワード反転して食い違う実バグがあった。migration で既存 modbus-tcp 行も
+ * `high_low` へ backfill 済み）。`slmp` = `low_high`（MELSEC標準、従来どおり
+ * 変更無し）。`virtual`/`postgres` はワード順を持たない
+ * （{@link hasDefaultPort}と同じ形の判定 - `tagRegistryAdmin.ts::hasWordOrder`
+ * 参照）。
+ */
+export const DEFAULT_WORD_ORDERS: Record<'modbus-tcp' | 'slmp', WordOrder> = {
+	'modbus-tcp': 'high_low',
+	slmp: 'low_high'
+};
+
+function hasDefaultWordOrder(protocol: PlcProtocol): protocol is keyof typeof DEFAULT_WORD_ORDERS {
+	return protocol === 'modbus-tcp' || protocol === 'slmp';
+}
+
+/** `protocol` の既定ワード順。既定を持たないプロトコル（virtual/postgres）は `undefined`。 */
+export function defaultWordOrderFor(protocol: PlcProtocol): WordOrder | undefined {
+	return hasDefaultWordOrder(protocol) ? DEFAULT_WORD_ORDERS[protocol] : undefined;
+}
+
+/**
+ * `wordOrder`（フォームの現在値）が `protocol` の既定ワード順と一致しているか。
+ * `isDefaultPortForProtocol` と同じ役割 - `ConnectionDrawer.svelte` はこれを
+ * 使って、フォームを開いた時点やプロトコル切り替え時に「ワード順追従」を
+ * 続けてよいかどうかの初期値（`wordOrderTouched`）を決める。
+ */
+export function isDefaultWordOrderForProtocol(
+	wordOrder: WordOrder,
+	protocol: PlcProtocol
+): boolean {
+	const def = defaultWordOrderFor(protocol);
+	return def !== undefined && wordOrder === def;
+}
+
+/**
  * TAG-UX-8: 新規作成フォームの名前プリフィル。`prefix`（既定 `"connection"`）
  * に続く数字部分だけを見て、`existingNames` に含まれない**最小の正整数**を
  * 選ぶ（「次の連番」＝最大値+1 ではなく、歯抜けがあれば埋める - 実装指示の
@@ -145,7 +186,7 @@ export interface PlcConnectionFormState {
 	unitId: string;
 	enabled: boolean;
 	simulation: boolean;
-	wordOrder: SlmpWordOrder;
+	wordOrder: WordOrder;
 	/** S1: `protocol === 'postgres'` のときだけ意味を持つ。DB 名。 */
 	database: string;
 	/** S1: `protocol === 'postgres'` のときだけ意味を持つ。DB ユーザー名。 */
@@ -185,10 +226,10 @@ export function blankConnectionForm(): PlcConnectionFormState {
 		unitId: '1',
 		enabled: true,
 		simulation: false,
-		// P3-b（監査指摘 2026-08-12）: バックエンドの既定
-		// （default_plc_word_order / SlmpConfig::default().word_order）と
-		// 一致させる。
-		wordOrder: 'low_high',
+		// 2026-09-08 オーナー決定（issue #330 の修正）: プロトコルごとの既定
+		// ワード順（{@link DEFAULT_WORD_ORDERS}）に一致させる - ここでの既定
+		// protocol は 'modbus-tcp' なので、その既定 'high_low' を使う。
+		wordOrder: DEFAULT_WORD_ORDERS['modbus-tcp'],
 		database: '',
 		username: '',
 		password: '',

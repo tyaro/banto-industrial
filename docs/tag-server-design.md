@@ -1,10 +1,10 @@
 # タグサーバーアプリ 設計ドキュメント（草案）
 
 作成日: 2026-08-04
-状態: **実装追従中（2026-09-06 更新）**。起案時は設計先行だったが、
+状態: **実装追従中（2026-09-08 更新）**。起案時は設計先行だったが、
 apps/banto-hub として実装が進行 — T0〜T21 実装済み（T19 UX 群・T20 文字列/構造体/レシピ/ビット・T21 構成補助 MCP 管理面まで完了、詳細は下の 2026-09-06 更新）・残 T18-5c/d
 （Windows 実機往復・72h soak）と P3-b の残件（SLMP CPU 種別/アクセスルート露出、
-バックログ。word order 自体は #127 で完了済み）。実装状況は §9（T系）の表を正とする。マイルストーンは §9、
+バックログ。SLMP の word order 自体は #127 で完了済み）。実装状況は §9（T系）の表を正とする。マイルストーンは §9、
 オーナー判断待ちの未決事項は §10。T14 以降の運転計画・UI/UX 決定台帳は
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)、docs 全体の地図は
 [README.md](README.md)。UX 改善（T9〜T13）の経緯は [ux-plan.md](ux-plan.md)（アーカイブ）。
@@ -18,6 +18,11 @@ UI 実装が完了（起動時ガード・認証バイパス・ロックダウ�
 完了。MCP の IF 一覧は [banto-hub-mcp-reference.md](banto-hub-mcp-reference.md)。§9 表は T12 までの
 粒度で、T13 以降の運転計画は [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) 側が正
 （既存の委譲方針どおり）。
+
+**2026-09-08 更新（issue #325）**: `data_type` に **64bit 型 `i64`/`u64`/`f64`** を追加した
+（§4 のデータ型一覧、§6.3）。追加の過程で **Modbus のワード順（`word_order`）が収集経路と
+read-on-demand/書き込み経路で食い違っていた既存バグ**を発見・是正した（§9 P3-b 追記）。
+
 **2026-09-01 追記**: #131 前半スライス（broker 配線を除く）を実装 - §6.2 に
 「Modbus 読み取り専用領域への writable 拒否」をオーナー決定Aとして追記
 （banto-tags 登録時検証）。`crates/banto-plc-write` に Modbus 書き込み
@@ -302,8 +307,11 @@ main ──┬── Collector（banto-collect: PLC接続毎に1タスク、既�
   不具合として発覚した。**接続名・収集グループ名は今も全体一意のまま**
   なので、外部名の一意性（catalog のバインディングキー、§4.1）は保たれる。
 - **値**: スケーリング適用後の工学値（`banto-collect` が格納する値そのまま）。
-  生値は公開しない。型は I1 の `data_type`（i16/u16/i32/u32/f32/string）に
-  由来し、数値は JSON では number、gRPC では oneof。
+  生値は公開しない。型は I1 の `data_type`（i16/u16/i32/u32/f32/string、
+  加えて 2026-09-08 追加の 64bit 型 i64/u64/f64 — §6.3）に由来し、数値は
+  JSON では number、gRPC では oneof。64bit 整数（i64/u64）はワイヤ上も
+  サーバー内部も `f64`（`TagValue::F64`）で運ばれるため、2^53 を超える整数
+  は精度が落ちる（§6.3 に既知の制限として明記）。
 - **品質**: `Good` / `Bad` / `Stale` の3値（`banto-collect` の `Quality`。
   Stale は読み出し時判定 = 最終更新から周期×2.5 超）。全プロトコルで値と
   必ず対にして返す — **品質なしの値は返さない**（記録計と同じ規律）。
@@ -1068,6 +1076,82 @@ BitInWord（ビット単体）は引き続き broker の Modbus ドライバが�
 この登録時ガードの実効性はむしろ上がった。収集の**読み取り**は本スライスで
 変えていない（§6 項目5の #131 追記参照）。
 
+### 6.3 Modbus の 64bit データ型（i64/u64/f64）の追加（2026-09-08 オーナー決定、issue #325）
+
+**動機となった実機**: オムロン 電力量モニタ＆ロガー **KM-D1-ETN**。Modbus/TCP
+（FC04）で全計測項目が「1 項目 = 4 ワードの IEEE754 倍精度」で提供され、
+既存の `i16`/`u16`/`i32`/`u32`/`f32` では表現できなかった。
+
+- タグの `data_type` に `i64`/`u64`/`f64` を追加した（migration `0016`、
+  `tags.data_type` の CHECK に3値追加。列は増やさない）。**4 レジスタ（64bit）
+  を占有**する。
+- **登録できるのは `modbus-tcp` プロトコルの PLC 接続配下のタグのみ**。
+  SLMP / virtual（`calc`・`mem`）/ `postgres` 配下で `i64`/`u64`/`f64` を
+  指定すると `field: "dataType"` のバリデーションエラーになる。
+  **この制約は SQL の CHECK 制約には入れていない**（判定にタグ →
+  `collection_groups` → `plc_connections` の JOIN が要り、SQLite の CHECK
+  では表現できないため）。強制は `banto-tags`（`crates/banto-tags/src/tag.rs`
+  の `placement_verdict`）の配置バリデーションで行う — `tag_kind` の
+  `calc`/`mem`/`postgres` 配置ルール（§4.2 の表）と**全く同じ理由・同じ場所**
+  の方式である。
+- 値は既存どおり `f64`（`TagValue::F64`）で運ばれる。したがって **`i64`/`u64`
+  は 2^53（9,007,199,254,740,992）を超える整数で精度が落ちる**。これは
+  受容した既知の制限であり、バグではない（§4 にも既知の制限として記載）。
+- **ワード順（`WordOrder`）は4ワードにも適用される**: `high_low` は先頭
+  レジスタが最上位ワード（1レジスタ目〜4レジスタ目がそのまま最上位→
+  最下位）、`low_high` は4ワードの並びを反転する（受信順を反転して結合）。
+  実装は `crates/banto-plc/src/decode.rs::combine_u64`。KM-D1-ETN は
+  受信順 A,B,C,D を D,C,B,A に並べ替えて double 化する機種で、これは
+  `low_high` 相当（メーカーマニュアル KANC-718B §12.5）。
+- **書き込みにも対応**（`apps/banto-hub/core/src/write_path.rs::validate_numeric_range`）:
+  `i64`/`u64` は整数・範囲チェックあり（`u64` は `[0, u64::MAX]`、`i64` は
+  `[i64::MIN, i64::MAX]` — ただし `f64` 表現の丸めを避けるため境界は
+  `TWO_POW_63` 等の厳密表現可能な値で判定する）、`f64` は有限性（`is_finite`）
+  のみを検証する。
+- **relay-wright の `write_targets` は 64bit 型を受け付けない**: relay-wright
+  は独自の SLMP 前提リソース（`apps/relay-wright/core/src/db.rs` の
+  `write_targets` テーブル、独自の SQL CHECK）を持ち、今回そちらの CHECK は
+  広げていない。
+
+### 6.4 Modbus のワード順（`word_order`）不整合の是正（2026-09-08 オーナー決定、#325 作業中に発見）
+
+64bit 型追加の作業中に、`plc_connections.word_order`（migration `0010`、
+§9 P3-b で SLMP 向けに導入した列）が **Modbus では実質機能していなかった**
+ことが判明した。二重の取りこぼしがあった:
+
+- `banto-collect`（**収集ポーリング**、`crates/banto-collect/src/config.rs::modbus_config_for`）
+  がこの列を無視し、`WordOrder::default()` = `HighLow` 固定で動いていた。
+- `banto-broker`（**read-on-demand / 書き込み**、`crates/banto-broker/src/lib.rs::modbus_config_for`）
+  は列を読んでいたため、列の既定値 `'low_high'` がそのまま効いて `LowHigh`
+  で動いていた。
+- banto-hub の接続フォームがワード順を **`slmp` 選択時にしか表示していなかった**
+  ため、新規の modbus-tcp 接続には事実上必ず既定の `'low_high'` が保存されて
+  いた。
+
+結果、既定設定の Modbus 接続では**同一の u32/f32/64bit タグの値が収集経路
+（実際は HighLow 解釈）と read-on-demand/書き込み経路（LowHigh 解釈）で
+ワード反転して食い違っていた**。
+
+**オーナー決定: Modbus は `'high_low'`（Modbus/IEEE の慣習）に統一する。**
+
+- 収集経路（`banto-collect`）が列を読むよう修正した。
+- migration `0017` で既存の `modbus-tcp` 行を `'high_low'` に backfill した
+  （収集経路の現行動作＝ `HighLow` と、その経路が既に書き込んだ蓄積済み
+  履歴データの解釈を変えないため — 値の意味の変更ではなく実態への同期）。
+  `slmp`/`virtual`/`postgres` 行は対象外。
+- 新規 Modbus 接続の既定も `'high_low'` になる。
+- banto-hub の接続フォームは Modbus でもワード順を選択できるようにした。
+  KM-D1-ETN のような `low_high` 相当の機種は、接続の設定で明示的に
+  `'low_high'` を選ぶ運用とする。
+- `banto_tags::migrate` を呼ぶ全アプリ（banto-hub / relay-wright /
+  chronogazer）の DB に migration `0017` が適用される。relay-wright も
+  modbus-tcp 接続を持ち、write/monitor 経路は `banto-broker` の同じ
+  `modbus_config_for` を通るため、同じ扱いでよい。
+- migration `0010` のコメントにあった「modbus-tcp/virtual 接続では無意味な
+  列」という当時の記述は、**Modbus については 2026-09-08 に覆った**
+  （virtual については引き続き正しい。`0010` のファイル自体は当時の判断の
+  歴史的記録として書き換えず、`0017` のコメントで上書きする形にしている）。
+
 ## 7. アプリ群の中でのタグサーバー — 中央レジストリ構想と移行ロードマップ
 
 **方針（2026-08-04 オーナー決定）**: タグサーバーは製品群の**タグ定義の
@@ -1164,6 +1248,13 @@ SLMP 接続の収集が有効になった（管理 UI の「収集は未対応�
 アクセスルート（network/PC/IO/area id）は今回のスコープ外
 （`banto-collect::config::slmp_config_for` の doc comment に "Known
 limitation" として明記、別スライス候補）。
+
+**2026-09-08 追記**: 上の `plc_connections.word_order` 列は SLMP 向けに
+導入したものだったが、同じ列を Modbus 経路が正しく参照していなかった
+（`banto-collect` は無視、`banto-broker` は参照するが接続フォームが列を
+Modbus では見せていなかった）ため、Modbus では同種の「ワード反転で値が
+静かに化ける」不整合が別に存在していた。issue #325（64bit 型追加）の作業中に
+発見・是正した。詳細・是正内容は §6.4 を参照。
 
 T0/T1 だけでも「読み取り専用タグサーバー」として出荷可能な形を保つ
 （書き込み・MQTT・gRPC は積み増し）。**実機なしで進められる範囲が広い**のが

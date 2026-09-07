@@ -453,8 +453,10 @@ mod capability_tests {
 
     #[test]
     fn unknown_data_type_is_unsupported() {
+        // 番兵は実在しないデータ型であること: `"f64"` は issue #325 で正式な
+        // データ型になった（`DataType::parse` が `Some` を返す）ため使えない。
         assert!(matches!(
-            classify_plc_tag("modbus-tcp", "40001", "f64"),
+            classify_plc_tag("modbus-tcp", "40001", "f128"),
             SimulationCoverage::Unsupported { .. }
         ));
     }

@@ -43,20 +43,33 @@ export type PlcProtocol = 'modbus-tcp' | 'slmp' | 'virtual' | 'postgres';
 export const POSTGRES_PROTOCOL: PlcProtocol = 'postgres';
 
 /**
- * P3-b（監査指摘 2026-08-12）: SLMP 接続のワード順（32bit値の上位/下位ワードの
- * 並び）— mirrors `banto_plc::decode::WordOrder`（`banto_tags::PlcConnection`
+ * P3-b（監査指摘 2026-08-12）: PLC接続のワード順（32bit値/64bit値の上位/下位
+ * ワードの並び）— mirrors `banto_plc::decode::WordOrder`（`banto_tags::PlcConnection`
  * では検証済みの文字列として保存される。`ALLOWED_WORD_ORDERS` 参照）。
- * `"slmp"` 接続でのみ意味を持つ（modbus-tcp/virtual では無意味 — `unitId` と
- * 同じ扱い）。
+ * `"modbus-tcp"`/`"slmp"` 接続でのみ意味を持つ（virtual/postgres では
+ * 無意味 — `unitId` と同じ扱い）。
+ *
+ * 2026-09-08 オーナー決定（issue #330 の修正に伴う整理）:
+ * 当初 `SlmpWordOrder` という名前だったが、SLMP専用ではなく modbus-tcp
+ * 接続にも同じ意味で存在する（従来は UI が modbus-tcp では出さず常に既定値
+ * `low_high` のまま保存していたが、Rust側の収集ポーリング経路は modbus-tcp
+ * を常に `high_low` 固定で読んでいたため、read-on-demand/書き込み経路との
+ * ワード順不一致で u32/f32 タグが化ける実バグがあった）。型名を `WordOrder`
+ * に改名し、UI 側も modbus-tcp で編集可能にした。#325 で追加された
+ * `i64`/`u64`/`f64`（4レジスタ=64bit値、modbus-tcp専用）にも同じワード順が
+ * 適用される。
  */
-export type SlmpWordOrder = 'low_high' | 'high_low';
+export type WordOrder = 'low_high' | 'high_low';
 
 /**
  * ワード順のセレクト肢 — mirrors `banto_tags::plc_connection::ALLOWED_WORD_ORDERS`。
- * 既定は `low_high`（MELSEC 標準、D0=下位/D1=上位）。
+ * 既定はプロトコルにより異なる（2026-09-08 オーナー決定）: `slmp` は
+ * `low_high`（MELSEC標準、D0=下位/D1=上位、従来どおり）、`modbus-tcp` は
+ * `high_low`（Modbus/IEEE慣習に統一 - 上のモジュール doc comment 参照）。
+ * `$lib/banto/plcConnectionForm.ts::DEFAULT_WORD_ORDERS` 参照。
  */
-export const WORD_ORDER_OPTIONS: { value: SlmpWordOrder; label: string }[] = [
-	{ value: 'low_high', label: 'low_high（MELSEC標準・既定）' },
+export const WORD_ORDER_OPTIONS: { value: WordOrder; label: string }[] = [
+	{ value: 'low_high', label: 'low_high（MELSEC標準）' },
 	{ value: 'high_low', label: 'high_low（Modbus/IEEE慣習）' }
 ];
 
@@ -74,8 +87,8 @@ export interface PlcConnection {
 	 * 実PLCの代わりに内蔵シミュレータへ接続する（開発・検証用、本番非推奨）。
 	 */
 	simulation: boolean;
-	/** P3-b（監査指摘 2026-08-12）。{@link SlmpWordOrder}参照。 */
-	wordOrder: SlmpWordOrder;
+	/** P3-b（監査指摘 2026-08-12）。{@link WordOrder}参照。 */
+	wordOrder: WordOrder;
 	/**
 	 * S1（docs/banto-hub-external-db-design.md §4.1・§2.2）: `protocol ===
 	 * 'postgres'` 接続が対象とする DB 名。他プロトコルでは常に `null` -
@@ -122,6 +135,17 @@ export function isDbSourceConnection(conn: Pick<PlcConnection, 'protocol'>): boo
 	return conn.protocol === POSTGRES_PROTOCOL;
 }
 
+/**
+ * 2026-09-08 オーナー決定: `wordOrder` が意味を持つプロトコル判定
+ * （`modbus-tcp`/`slmp` のみ - `virtual`/`postgres` では `unitId` と同じく
+ * 無意味）。`ConnectionDrawer.svelte` のフィールド出し分けが使う - 以前は
+ * `slmp` のみだったが、issue #330 の修正で `modbus-tcp` にも UI から
+ * ワード順を設定できるようにした。
+ */
+export function hasWordOrder(conn: Pick<PlcConnection, 'protocol'>): boolean {
+	return conn.protocol === 'modbus-tcp' || conn.protocol === 'slmp';
+}
+
 /** Mirrors `banto_hub_core::rest::PlcConnectionPayload`. */
 export interface PlcConnectionInput {
 	name: string;
@@ -133,7 +157,7 @@ export interface PlcConnectionInput {
 	/** T9-2 (docs/ux-plan.md §1). See {@link PlcConnection.simulation}. */
 	simulation: boolean;
 	/** P3-b（監査指摘 2026-08-12）. See {@link PlcConnection.wordOrder}. */
-	wordOrder: SlmpWordOrder;
+	wordOrder: WordOrder;
 	/**
 	 * S1（docs/banto-hub-external-db-design.md §4.1）: `protocol: 'postgres'`
 	 * 接続の DB 名 - mirrors `banto_hub_core::rest::PlcConnectionPayload
@@ -236,7 +260,19 @@ export interface CollectionGroupInput {
  */
 export const ALLOWED_PERIOD_MS: readonly number[] = [100, 200, 500, 1000, 2000, 5000, 10000, 60000];
 
-export type TagDataType = 'bit' | 'i16' | 'u16' | 'i32' | 'u32' | 'f32' | 'string';
+export type TagDataType =
+	'bit' | 'i16' | 'u16' | 'i32' | 'u32' | 'f32' | 'i64' | 'u64' | 'f64' | 'string';
+
+/**
+ * #325（2026-09-08 オーナー決定）: `i64`/`u64`/`f64`（Modbus の4レジスタ=64bit
+ * 値）は `modbus-tcp` プロトコルの PLC 接続配下のタグでのみ登録できる -
+ * mirrors `banto_tags::plc_connection::MODBUS_PROTOCOL`/
+ * `banto_tags::tag::MODBUS_ONLY_DATA_TYPES`（サーバー側が最終防衛線として
+ * 拒否する）。UI 側はこの定数でデータ型プルダウンの選択肢自体を絞る
+ * （`+page.svelte` の `dataTypeOptionsFor` 参照）ほか、`i64`/`u64`
+ * の精度注記の要否判定にも使う。
+ */
+export const MODBUS_ONLY_DATA_TYPES: readonly TagDataType[] = ['i64', 'u64', 'f64'];
 
 /**
  * S3（docs/banto-hub-external-db-design.md §4.4・§6-5「v1 は数値・bool・
@@ -244,6 +280,9 @@ export type TagDataType = 'bit' | 'i16' | 'u16' | 'i32' | 'u32' | 'f32' | 'strin
  * 全種（`banto_tags::tag::validate_tag_input`の`DB_TAG_KIND`アームが
  * `string`だけを拒否するのをそのまま反映。`internal`タグの同じ除外規則と
  * 同型）。
+ *
+ * #325: `i64`/`u64`/`f64` は含めない - `db` タグは PLC 接続配下に置かれない
+ * ため（{@link MODBUS_ONLY_DATA_TYPES} 参照）、64bit 型はそもそも対象外。
  */
 export const DB_TAG_ALLOWED_DATA_TYPES: readonly TagDataType[] = [
 	'bit',

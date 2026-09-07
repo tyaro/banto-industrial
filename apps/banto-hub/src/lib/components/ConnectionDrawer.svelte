@@ -17,7 +17,8 @@
 	 * 編集パネル構成、T9/T12/P3-bの成果）から1つも落としていない。
 	 * 1. 識別: 名前（TAG-UX-8 の連番プリフィル対象）
 	 * 2. プロトコルと接続先: プロトコル/ホスト/ポート/ユニットID/
-	 *    （SLMPのみ）ワード順/有効/シミュレーション
+	 *    （modbus-tcp/slmpのみ、2026-09-08 オーナー決定で modbus-tcp にも
+	 *    拡大 - issue #330 の修正）ワード順/有効/シミュレーション
 	 * 3. 接続テスト・確認: 入力内容の確認表示 + 接続テスト + 「作成」
 	 *
 	 * **T19 S1-b（UX-31、2026-09-02 オーナー決定「作成＝中央モーダル、
@@ -77,6 +78,7 @@
 		updatePlcConnection,
 		POSTGRES_PROTOCOL,
 		WORD_ORDER_OPTIONS,
+		hasWordOrder,
 		type DbConnectionTestOutcome,
 		type PlcConnection,
 		type PlcConnectionTestResult
@@ -86,8 +88,10 @@
 		blankConnectionForm,
 		connectionToForm,
 		defaultPortFor,
+		defaultWordOrderFor,
 		formToConnectionInput,
 		isDefaultPortForProtocol,
+		isDefaultWordOrderForProtocol,
 		nextConnectionName,
 		validatePostgresFields,
 		type PlcConnectionFormState
@@ -223,6 +227,15 @@
 	let portTouched = $state(false);
 
 	/**
+	 * 現在のワード順がまだ「プロトコルの既定値のまま（未編集）」かどうか。
+	 * `portTouched` と同じ設計（2026-09-08 オーナー決定、issue #330 の修正）:
+	 * `false` の間だけ `onProtocolChange` がワード順を新プロトコルの既定値へ
+	 * 書き換える。ユーザーがワード順セレクトを直接操作した時点で `true` に
+	 * 固定する。
+	 */
+	let wordOrderTouched = $state(false);
+
+	/**
 	 * Drawer を開いた対象（新規作成 or どの接続の再設定か）を表すキー。
 	 * `open` が false→true になった時、または既に開いた状態のまま
 	 * 別の接続（`connection.id` が変わる = 一覧で別の行を選び直した）へ
@@ -269,6 +282,7 @@
 		dbTestState = blankDbTestState();
 		step = 1;
 		portTouched = !isDefaultPortForProtocol(form.port, form.protocol);
+		wordOrderTouched = !isDefaultWordOrderForProtocol(form.wordOrder, form.protocol);
 
 		// T18-6d: 「接続を削除」からの起動 - フォーム初期化直後に既存の
 		// handleDelete を1回だけ呼ぶ（上の Props.requestDelete 参照）。
@@ -312,13 +326,22 @@
 	}
 
 	function onProtocolChange(): void {
-		if (portTouched) return;
-		const def = defaultPortFor(form.protocol);
-		if (def !== undefined) form.port = String(def);
+		if (!portTouched) {
+			const def = defaultPortFor(form.protocol);
+			if (def !== undefined) form.port = String(def);
+		}
+		if (!wordOrderTouched) {
+			const def = defaultWordOrderFor(form.protocol);
+			if (def !== undefined) form.wordOrder = def;
+		}
 	}
 
 	function onPortInput(): void {
 		portTouched = true;
+	}
+
+	function onWordOrderInput(): void {
+		wordOrderTouched = true;
 	}
 
 	/** 送信前のフィールド → 該当ウィザードステップの対応（作成時のエラー誘導用）。 */
@@ -573,8 +596,9 @@
 		{#if form.protocol === POSTGRES_PROTOCOL}
 			<!--
 				S1（docs/banto-hub-external-db-design.md §4.1）: postgres 接続
-				専用フィールド。unitId/wordOrder/simulation は PLC 固有の意味
-				しか持たないため（後述の {:else} 分岐）ここでは出さない。
+				専用フィールド。unitId/wordOrder/simulation は modbus-tcp/slmp
+				固有の意味しか持たないため（後述の {:else} 分岐）ここでは
+				出さない。
 			-->
 			<label class="field">
 				データベース
@@ -628,17 +652,19 @@
 				>
 				{#if errors.unitId}<span class="err">{errors.unitId}</span>{/if}
 			</label>
-			{#if form.protocol === 'slmp'}
+			{#if hasWordOrder(form)}
 				<label class="field">
 					ワード順
-					<select bind:value={form.wordOrder} disabled={readOnly}>
+					<select bind:value={form.wordOrder} onchange={onWordOrderInput} disabled={readOnly}>
 						{#each WORD_ORDER_OPTIONS as opt (opt.value)}
 							<option value={opt.value}>{opt.label}</option>
 						{/each}
 					</select>
 					<span class="hint">
-						32bit値（u32/f32等）の上位/下位ワードの並び。機種のマニュアルで確認してください —
-						間違えると値が化けます（上位/下位が入れ替わります）。
+						32bit値（u32/f32等）および64bit値（i64/u64/f64、4レジスタ）の上位/下位ワードの並び。既定は
+						Modbus が high_low（Modbus/IEEE慣習）、MELSEC/SLMPが
+						low_high。機種のマニュアルで確認してください — 例: オムロン KM-D1-ETN（電力量モニタ）は
+						low_high が必要です。間違えると値が化けます（上位/下位が入れ替わります）。
 					</span>
 					{#if errors.wordOrder}<span class="err">{errors.wordOrder}</span>{/if}
 				</label>
@@ -736,7 +762,7 @@
 		{:else}
 			<dt>ユニットID</dt>
 			<dd>{form.unitId}</dd>
-			{#if form.protocol === 'slmp'}
+			{#if hasWordOrder(form)}
 				<dt>ワード順</dt>
 				<dd>
 					{WORD_ORDER_OPTIONS.find((o) => o.value === form.wordOrder)?.label ?? form.wordOrder}
