@@ -249,6 +249,13 @@ const TAG_DATA_TYPES: ReadonlySet<string> = new Set<TagDataType>([
 	'i32',
 	'u32',
 	'f32',
+	// #325（2026-09-08 オーナー決定）: 64bit 型（Modbus の4レジスタ値）。
+	// modbus-tcp 接続配下のタグのみ登録できる制約はサーバー側検証（および
+	// `POST /api/tags/batch` の preflight）が担い、CSV パーサ自体は他の
+	// dataType と同じく形式チェックのみを行う。
+	'i64',
+	'u64',
+	'f64',
 	'string'
 ]);
 

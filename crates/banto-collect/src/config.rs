@@ -601,6 +601,36 @@ fn parse_protocol(protocol: &str, conn_name: &str) -> Result<Protocol, CollectEr
     }
 }
 
+/// Build a [`ModbusTcpConfig`] from a `"modbus-tcp"`-protocol
+/// [`PlcConnection`] row. `host`/`port`/`unit_id`/`word_order` all come from
+/// the registry - `word_order` from the same `word_order` column
+/// [`slmp_config_for`] reads (migration `0010_plc_connections_add_word_order.sql`,
+/// P3-b, 2026-08-12); it is a registry field for Modbus exactly as much as
+/// it is for SLMP.
+///
+/// **Bug fixed 2026-09-08**: until this change, this fn ignored that column
+/// and hardcoded `word_order: WordOrder::default()`
+/// (`ModbusTcpConfig::default()`'s `WordOrder::HighLow`) with a comment
+/// claiming the column did not exist - stale ever since P3-b actually added
+/// it. Meanwhile `banto_broker::modbus_config_for` (the read-on-demand and
+/// write path) already called `parse_word_order(&conn.word_order)` for
+/// Modbus. So a Modbus connection left at the column's then-default
+/// (`'low_high'`) got `WordOrder::LowHigh` for on-demand reads/writes but
+/// `WordOrder::HighLow` for collection polling - the same u32/f32 tag
+/// decoded with its two registers swapped depending on which path touched
+/// it. The mismatch surfaced while adding the 64bit types (`i64`/`u64`/
+/// `f64`, 4 registers) for issue #325.
+///
+/// Owner decision (2026-09-08): Modbus is standardized on `'high_low'`.
+/// Existing `modbus-tcp` rows are backfilled to `'high_low'` and new Modbus
+/// connections now default to `'high_low'` too, both by a `banto-tags`-side
+/// migration (out of scope here) - this fn's job is only to stop ignoring
+/// the column, which is what the `parse_word_order` call below now does.
+///
+/// The 64bit types added for #325 apply this same `word_order` across their
+/// two register pairs exactly like the existing 32bit types do - there is no
+/// separate word-order concept for them. A real device that needs
+/// `'low_high'` here: the OMRON KM-D1-ETN power meter.
 fn modbus_config_for(conn: &PlcConnection) -> Result<ModbusTcpConfig, CollectError> {
     let port = u16::try_from(conn.port).map_err(|_| {
         CollectError::Config(format!(
@@ -618,10 +648,14 @@ fn modbus_config_for(conn: &PlcConnection) -> Result<ModbusTcpConfig, CollectErr
         host: conn.host.clone(),
         port,
         unit_id,
-        // Word order is not a registry field (banto-tags has no column for
-        // it); v1 uses the Modbus/IEEE default. Revisit if a device profile
-        // ever needs per-connection word order.
-        word_order: WordOrder::default(),
+        // `parse_word_order`'s fallback to `WordOrder::LowHigh` for an
+        // unrecognized string is unconditional regardless of protocol, so a
+        // hand-edited/pre-migration-0010 Modbus row fails open to
+        // `WordOrder::LowHigh` here too - not to `ModbusTcpConfig::default()`'s
+        // `WordOrder::HighLow`. This matches `banto_broker::modbus_config_for`,
+        // which reaches the same fallback through its own copy of
+        // `parse_word_order`.
+        word_order: parse_word_order(&conn.word_order),
         ..ModbusTcpConfig::default()
     })
 }
@@ -665,8 +699,11 @@ fn slmp_config_for(conn: &PlcConnection) -> Result<SlmpConfig, CollectError> {
     })
 }
 
-/// See [`slmp_config_for`]'s doc comment for why this exists and why it is
-/// not shared with `banto_broker`'s identical fn.
+/// Shared by both [`slmp_config_for`] and [`modbus_config_for`] - originally
+/// written for SLMP only (see [`slmp_config_for`]'s doc comment for why this
+/// is a copy of `banto_broker`'s identical fn rather than a shared helper),
+/// extended to Modbus by the 2026-09-08 fix documented on
+/// [`modbus_config_for`].
 fn parse_word_order(value: &str) -> WordOrder {
     match value {
         "high_low" => WordOrder::HighLow,
@@ -1274,6 +1311,99 @@ mod tests {
             ProtocolConfig::Slmp(slmp) => assert_eq!(slmp.word_order, WordOrder::LowHigh),
             ProtocolConfig::ModbusTcp(_) => panic!("expected Slmp config"),
         }
+    }
+
+    /// Regression test for the bug fixed 2026-09-08 (see [`modbus_config_for`]'s
+    /// doc comment for the full history): `modbus_config_for` must carry the
+    /// connection's own `word_order` column into the built `ModbusTcpConfig`,
+    /// not silently fix every connection to
+    /// `ModbusTcpConfig::default()`'s `WordOrder::HighLow` regardless of what
+    /// the registry says - which is exactly what it did before this fix,
+    /// even though the column had existed since P3-b and
+    /// `banto_broker::modbus_config_for` already read it correctly for its
+    /// read-on-demand/write path. Mirrors
+    /// `slmp_config_reflects_the_connections_own_word_order` above, checking
+    /// both directions (not just the non-default one) because Modbus's own
+    /// default word order disagreed with SLMP's before the fix.
+    #[tokio::test]
+    async fn modbus_config_reflects_the_connections_own_word_order() {
+        let pool = registry().await;
+        let plc_svc = PlcConnectionService::new(pool.clone());
+
+        let mut high_low_input = conn_input("HighLow", 502);
+        high_low_input.word_order = "high_low".to_string();
+        let high_low_conn = plc_svc.create(high_low_input).await.unwrap();
+        CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", high_low_conn.id, 1_000))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input("T1", high_low_conn.id, "40001"))
+            .await
+            .unwrap();
+
+        let mut low_high_input = conn_input("LowHigh", 503);
+        low_high_input.word_order = "low_high".to_string();
+        let low_high_conn = plc_svc.create(low_high_input).await.unwrap();
+        CollectionGroupService::new(pool.clone())
+            .create(group_input("G2", low_high_conn.id, 1_000))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input("T2", low_high_conn.id, "40001"))
+            .await
+            .unwrap();
+
+        let config = build_config(&pool)
+            .await
+            .expect("modbus config should build");
+
+        let high_low_plan = config
+            .connections
+            .iter()
+            .find(|c| c.key == format!("conn:{}", high_low_conn.id))
+            .unwrap();
+        match &high_low_plan.config {
+            ProtocolConfig::ModbusTcp(modbus) => assert_eq!(
+                modbus.word_order,
+                WordOrder::HighLow,
+                "a connection asking for high_low must not silently get low_high"
+            ),
+            ProtocolConfig::Slmp(_) => panic!("expected ModbusTcp config"),
+        }
+
+        let low_high_plan = config
+            .connections
+            .iter()
+            .find(|c| c.key == format!("conn:{}", low_high_conn.id))
+            .unwrap();
+        match &low_high_plan.config {
+            ProtocolConfig::ModbusTcp(modbus) => assert_eq!(
+                modbus.word_order,
+                WordOrder::LowHigh,
+                "a connection asking for low_high must not silently get \
+                 ModbusTcpConfig::default()'s high_low"
+            ),
+            ProtocolConfig::Slmp(_) => panic!("expected ModbusTcp config"),
+        }
+    }
+
+    /// `parse_word_order`'s fallback for an unrecognized string is
+    /// `WordOrder::LowHigh`, and this must hold for Modbus exactly as it
+    /// does for SLMP (see this file's `parse_word_order` doc comment and
+    /// `banto_broker`'s identical fn) - not `ModbusTcpConfig::default()`'s
+    /// `WordOrder::HighLow`. Calls `parse_word_order` directly rather than
+    /// going through `build_config`/the registry because
+    /// `banto_tags::plc_connection::ALLOWED_WORD_ORDERS` plus the SQL
+    /// `CHECK` added by migration `0010` make an unrecognized `word_order`
+    /// value unreachable through normal CRUD (see
+    /// `PlcConnectionService::create`'s own `create_rejects_unknown_word_order`
+    /// test) - this is pinning down defense-in-depth behavior, not a
+    /// reachable-through-the-registry scenario.
+    #[test]
+    fn parse_word_order_falls_back_to_low_high_for_an_unrecognized_value() {
+        assert_eq!(parse_word_order("sideways"), WordOrder::LowHigh);
+        assert_eq!(parse_word_order(""), WordOrder::LowHigh);
     }
 
     /// T9-1 (docs/ux-plan.md §1): `PlcConnection::simulation` carries through

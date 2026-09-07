@@ -32,6 +32,12 @@ describe('addressHelpFor: slmp', () => {
 		}
 	});
 
+	it('#325: i64/u64/f64: ワード4点連続のヒント', () => {
+		for (const dt of ['i64', 'u64', 'f64'] as const) {
+			expect(addressHelpFor('slmp', dt).occupancyHint).toContain('4点');
+		}
+	});
+
 	it('string: 文字列長に応じた占有のヒント', () => {
 		expect(addressHelpFor('slmp', 'string').occupancyHint).toContain('文字列長');
 	});
@@ -74,6 +80,12 @@ describe('addressHelpFor: modbus-tcp（TAG-UX-B 受け入れ条件）', () => {
 	it('i32/u32/f32: レジスタ2点連続のヒント', () => {
 		for (const dt of ['i32', 'u32', 'f32'] as const) {
 			expect(addressHelpFor('modbus-tcp', dt).occupancyHint).toContain('2点');
+		}
+	});
+
+	it('#325: i64/u64/f64: レジスタ4点連続のヒント', () => {
+		for (const dt of ['i64', 'u64', 'f64'] as const) {
+			expect(addressHelpFor('modbus-tcp', dt).occupancyHint).toContain('4点');
 		}
 	});
 

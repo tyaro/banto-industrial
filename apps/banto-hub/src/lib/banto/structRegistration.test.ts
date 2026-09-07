@@ -43,6 +43,21 @@ describe('allocateStructFields: ワード累積の自動割付', () => {
 		}
 	});
 
+	it('#325: i64/u64/f64 は4ワード占有し、後続フィールドは4ワード分ずれる', () => {
+		const fields: StructField[] = [
+			{ name: 'temp', dataType: 'f64' },
+			{ name: 'count', dataType: 'i64' },
+			{ name: 'flag', dataType: 'bit' }
+		];
+		const result = allocateStructFields('D3000', fields);
+		expect(result.ok).toBe(true);
+		if (result.ok) {
+			// temp: D3000-D3003 (4word), count: D3004-D3007 (4word), flag: D3008 (1word)
+			expect(result.rows.map((r) => r.address)).toEqual(['D3000', 'D3004', 'D3008']);
+			expect(result.rows.map((r) => r.words)).toEqual([4, 4, 1]);
+		}
+	});
+
 	it('string 型は文字列長ぶんのワードを占有する', () => {
 		const fields: StructField[] = [
 			{ name: 'name', dataType: 'string', stringLength: 8 },

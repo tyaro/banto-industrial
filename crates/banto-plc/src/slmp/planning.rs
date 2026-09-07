@@ -346,10 +346,15 @@ pub fn plan_slmp_batch(requests: &[BatchReadRequest]) -> SlmpPlanOutcome {
         for (index, number, kind) in items {
             // Bit devices are read one point at a time regardless of the tag's
             // width (a `bit` tag is the only thing that can live there), so the
-            // span is 1; word devices span 1-2 words per
+            // span is 1; word devices span 1-4 words per
             // `DataType::register_span` (reused verbatim from the Modbus side
             // because "how many 16-bit words does an i32 occupy" has no
             // protocol in it), or the string's own word count.
+            // `register_span` now also answers 4 for `I64`/`U64`/`F64`
+            // (owner decision 2026-09-08), but `banto-tags` restricts those
+            // three types to Modbus connections, so in practice no SLMP tag
+            // is ever registered with one - this arm handles them only
+            // because `register_span` is total over `DataType`.
             let span = match device.access() {
                 SlmpAccess::Bit => 1u64,
                 SlmpAccess::Word => match kind {

@@ -35,6 +35,35 @@ const MAX_DECIMALS: i64 = 6;
 const MIN_STRING_LENGTH: i64 = 1;
 const MAX_STRING_LENGTH: i64 = 128;
 
+/// The data types a `write_targets` row may carry: `banto-tags`' canonical
+/// [`banto_tags::ALLOWED_DATA_TYPES`] **minus**
+/// [`banto_tags::MODBUS_ONLY_DATA_TYPES`] (the 64-bit `i64`/`u64`/`f64`
+/// added by #325). Derived from those two lists rather than restated, so a
+/// future data type is picked up here automatically and the two crates
+/// cannot drift into disagreement unnoticed.
+///
+/// **Why the 64-bit types are excluded** (#325, 2026-09-08 オーナー決定):
+/// they were added as a *read* vocabulary for Modbus tags only - a 64-bit
+/// tag is legal only under a `modbus-tcp` connection, which `banto-tags`
+/// enforces by joining a tag's group back to its connection. A write target
+/// has no such structure to lean on: it is a relay-wright-specific resource
+/// built for this app's SLMP write path (it names a `plc_connection_id`
+/// directly, with no group in between, and the whole engine around it -
+/// `banto_plc_write`'s planner, the monitor drawer - is SLMP-shaped). Its
+/// own SQL `CHECK` in `db.rs` (`0011_write_targets_allow_string.sql`) was
+/// deliberately **not** widened by #325 either, so accepting a 64-bit type
+/// here would only produce the worst possible failure: Rust validation
+/// passes, then SQLite rejects the INSERT with a raw constraint-violation
+/// message instead of a field error. Contrast `"string"`, which S2 added to
+/// both sides together.
+fn write_target_data_types() -> Vec<&'static str> {
+    banto_tags::ALLOWED_DATA_TYPES
+        .iter()
+        .copied()
+        .filter(|dt| !banto_tags::MODBUS_ONLY_DATA_TYPES.contains(dt))
+        .collect()
+}
+
 fn default_decimals() -> i64 {
     0
 }
@@ -147,19 +176,13 @@ fn collect_errors(input: &WriteTargetInput) -> (Vec<FieldError>, Normalized) {
         });
     }
 
-    // Reuse banto-tags' canonical data-type list so the two never drift
-    // (this app's SQL CHECK in 0011 is the same set). Back to the FULL
-    // ALLOWED_DATA_TYPES: S1 held write targets at the numeric subset until
-    // the engine could actually write strings; S2 is that engine work, so
-    // "string" is accepted here again, with the same companion-column rules
-    // as `banto_tags::tag::validate_tag_input`.
-    if !banto_tags::ALLOWED_DATA_TYPES.contains(&input.data_type.as_str()) {
+    // Derived from banto-tags' canonical list so the two never drift
+    // silently, but NOT equal to it - see `write_target_data_types`.
+    let accepted = write_target_data_types();
+    if !accepted.contains(&input.data_type.as_str()) {
         errors.push(FieldError {
             field: "dataType".to_string(),
-            message: format!(
-                "対応データ型は {} のいずれかです",
-                banto_tags::ALLOWED_DATA_TYPES.join(", ")
-            ),
+            message: format!("対応データ型は {} のいずれかです", accepted.join(", ")),
         });
     }
 
@@ -630,14 +653,75 @@ mod tests {
     #[tokio::test]
     async fn create_accepts_every_allowed_data_type() {
         let (svc, plc) = setup().await;
-        for (i, dt) in banto_tags::ALLOWED_DATA_TYPES.iter().enumerate() {
+        for (i, dt) in write_target_data_types().iter().enumerate() {
             let mut input = sample(&format!("T{i}"), plc);
-            input.data_type = dt.to_string();
+            input.data_type = (*dt).to_string();
             // "string" carries its mandatory companion length (S2).
             input.string_length = (*dt == banto_tags::STRING_DATA_TYPE).then_some(8);
             svc.create(input)
                 .await
                 .unwrap_or_else(|e| panic!("data_type {dt} should be accepted: {e:?}"));
+        }
+    }
+
+    /// The set this app accepts is exactly banto-tags' list minus the
+    /// 64-bit types (#325) - see [`write_target_data_types`]'s doc comment
+    /// for why. Pinned as its own assertion so a future widening of
+    /// `ALLOWED_DATA_TYPES` shows up here as a deliberate decision rather
+    /// than silently flowing through.
+    #[test]
+    fn write_target_data_types_is_banto_tags_minus_the_64bit_types() {
+        let accepted = write_target_data_types();
+        assert_eq!(
+            accepted,
+            vec!["bit", "i16", "u16", "i32", "u32", "f32", "string"]
+        );
+        for dt in banto_tags::MODBUS_ONLY_DATA_TYPES {
+            assert!(!accepted.contains(dt), "{dt} must not be a write target");
+        }
+    }
+
+    /// #325: a 64-bit type is legal in the tag registry (under a Modbus
+    /// connection) but never here - and it must be rejected as a `dataType`
+    /// field error by the Rust validation, not by this app's own SQL `CHECK`
+    /// (which was deliberately left unwidened, see
+    /// [`write_target_data_types`]).
+    #[tokio::test]
+    async fn create_rejects_the_64bit_data_types() {
+        let (svc, plc) = setup().await;
+        for dt in banto_tags::MODBUS_ONLY_DATA_TYPES {
+            let mut input = sample(&format!("W{dt}"), plc);
+            input.data_type = (*dt).to_string();
+            match svc.create(input).await.unwrap_err() {
+                BantoError::Validation { field_errors } => {
+                    assert_eq!(field_errors.len(), 1, "{field_errors:?}");
+                    assert_eq!(field_errors[0].field, "dataType");
+                }
+                other => panic!("expected Validation for {dt}, got {other:?}"),
+            }
+        }
+    }
+
+    /// The rejection direction of the same pairing: this app's SQL `CHECK`
+    /// must not have quietly widened either, or the Rust list above would be
+    /// the only thing standing between a caller and a 64-bit write target.
+    #[tokio::test]
+    async fn the_sql_check_still_rejects_the_64bit_data_types() {
+        let (svc, plc) = setup().await;
+        for dt in banto_tags::MODBUS_ONLY_DATA_TYPES {
+            let result = sqlx::query(
+                "INSERT INTO write_targets (name, plc_connection_id, address, data_type) \
+                 VALUES (?, ?, 'D100', ?)",
+            )
+            .bind(format!("raw-{dt}"))
+            .bind(plc)
+            .bind(dt)
+            .execute(&svc.pool)
+            .await;
+            assert!(
+                result.is_err(),
+                "the write_targets SQL CHECK accepted {dt:?}"
+            );
         }
     }
 

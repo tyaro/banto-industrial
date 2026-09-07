@@ -4,11 +4,28 @@
 use crate::address::Address;
 
 /// A tag's wire data type. Mirrors `banto-tags::ALLOWED_DATA_TYPES`
-/// (`"bit" | "i16" | "u16" | "i32" | "u32" | "f32"`) one-for-one by design -
-/// this crate does not depend on `banto-tags` (I2 does not depend on I1 in
-/// docs/plan.md's dependency graph; I3 is the one that bridges them), so the
-/// correspondence is kept in sync by convention and by [`DataType::parse`]'s
-/// tests rather than a shared type.
+/// (`"bit" | "i16" | "u16" | "i32" | "u32" | "f32" | "i64" | "u64" | "f64"`)
+/// one-for-one by design - this crate does not depend on `banto-tags` (I2
+/// does not depend on I1 in docs/plan.md's dependency graph; I3 is the one
+/// that bridges them), so the correspondence is kept in sync by convention
+/// and by [`DataType::parse`]'s tests rather than a shared type.
+///
+/// This crate decodes bytes off the wire and does not know which
+/// `PlcConnection` protocol a tag belongs to - `register_span` and
+/// [`crate::decode::decode_register_value`] treat every variant here
+/// (including `I64`/`U64`/`F64`) the same regardless of protocol. Whether a
+/// given data type is *allowed to be registered* for a given protocol is a
+/// `banto-tags` decision, not this crate's: `banto-tags` restricts
+/// `I64`/`U64`/`F64` to Modbus connections (owner decision, 2026-09-08) by
+/// checking the connection's protocol at tag-registration time, so in
+/// practice these three variants never reach the SLMP decode path even
+/// though nothing in this crate itself enforces that.
+///
+/// `I64`/`U64` values are widened to [`TagValue::F64`] like every other
+/// numeric type (see that type's doc comment) - integers beyond
+/// `2^53` lose precision once represented as `f64`. This is an accepted
+/// limitation (owner decision, 2026-09-08), not a bug: a KM-D1-ETN-class
+/// instrument's readings never approach that magnitude in practice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {
     Bit,
@@ -17,6 +34,9 @@ pub enum DataType {
     I32,
     U32,
     F32,
+    I64,
+    U64,
+    F64,
 }
 
 impl DataType {
@@ -34,6 +54,9 @@ impl DataType {
             "i32" => Some(DataType::I32),
             "u32" => Some(DataType::U32),
             "f32" => Some(DataType::F32),
+            "i64" => Some(DataType::I64),
+            "u64" => Some(DataType::U64),
+            "f64" => Some(DataType::F64),
             _ => None,
         }
     }
@@ -48,6 +71,7 @@ impl DataType {
             DataType::Bit => 1,
             DataType::I16 | DataType::U16 => 1,
             DataType::I32 | DataType::U32 | DataType::F32 => 2,
+            DataType::I64 | DataType::U64 | DataType::F64 => 4,
         }
     }
 }
@@ -61,6 +85,9 @@ impl std::fmt::Display for DataType {
             DataType::I32 => "i32",
             DataType::U32 => "u32",
             DataType::F32 => "f32",
+            DataType::I64 => "i64",
+            DataType::U64 => "u64",
+            DataType::F64 => "f64",
         };
         f.write_str(s)
     }
@@ -82,6 +109,11 @@ pub struct ReadRequest {
 /// `i16`/`u32`/`f32` past this crate's boundary. `Bit` stays a `bool`
 /// because "scaled bit" is not a meaningful concept (recorder-requirements.md
 /// has no scaling story for bit tags).
+///
+/// `I64`/`U64` values are widened into this same `f64` unchanged (owner
+/// decision, 2026-09-08: no new variant for 64-bit integers) - values beyond
+/// `2^53` lose precision as a result. See [`DataType`]'s doc comment for why
+/// this is accepted rather than fixed.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TagValue {
     Bit(bool),
@@ -119,8 +151,8 @@ pub enum ReadResult {
 /// Selects which `encoding_rs` table `decode.rs::decode_string_value` uses;
 /// the byte-packing convention itself (low byte first within each word -
 /// MELSEC's storage convention) is unaffected by this choice, exactly as
-/// [`crate::decode::WordOrder`] only ever governs 32-bit numeric word order,
-/// never a string's byte order within a word.
+/// [`crate::decode::WordOrder`] only ever governs 32-bit/64-bit numeric word
+/// order, never a string's byte order within a word.
 ///
 /// **Defined here, not in `banto-plc-write`, even though ①a's
 /// `StringWriteRequest` needed the identical enum first**: `banto-plc-write`
@@ -245,7 +277,9 @@ mod tests {
         // a data type to banto-tags without adding it here, this list (not a
         // shared constant) is what has to be remembered to update, and this
         // test at least proves the reverse direction (Display) matches too.
-        for s in ["bit", "i16", "u16", "i32", "u32", "f32"] {
+        for s in [
+            "bit", "i16", "u16", "i32", "u32", "f32", "i64", "u64", "f64",
+        ] {
             let dt = DataType::parse(s).unwrap_or_else(|| panic!("{s} should parse"));
             assert_eq!(dt.to_string(), s);
         }
@@ -253,16 +287,20 @@ mod tests {
 
     #[test]
     fn data_type_parse_rejects_unknown_string() {
-        assert_eq!(DataType::parse("f64"), None);
+        assert_eq!(DataType::parse("i128"), None);
+        assert_eq!(DataType::parse("f16"), None);
         assert_eq!(DataType::parse(""), None);
     }
 
     #[test]
-    fn register_span_is_one_for_16_bit_and_two_for_32_bit() {
+    fn register_span_is_one_for_16_bit_two_for_32_bit_and_four_for_64_bit() {
         assert_eq!(DataType::I16.register_span(), 1);
         assert_eq!(DataType::U16.register_span(), 1);
         assert_eq!(DataType::I32.register_span(), 2);
         assert_eq!(DataType::U32.register_span(), 2);
         assert_eq!(DataType::F32.register_span(), 2);
+        assert_eq!(DataType::I64.register_span(), 4);
+        assert_eq!(DataType::U64.register_span(), 4);
+        assert_eq!(DataType::F64.register_span(), 4);
     }
 }

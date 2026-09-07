@@ -625,6 +625,10 @@ impl EngineControl {
                         }
                         None => eng,
                     };
+                    // Every integer wire type, 64-bit ones included (#325):
+                    // a Modbus connection can carry `i64`/`u64` tags, and a
+                    // scaled raw value left fractional would be rejected by
+                    // the encoder rather than written.
                     if scaling.is_some()
                         && matches!(
                             data_type,
@@ -632,6 +636,8 @@ impl EngineControl {
                                 | banto_plc::DataType::U16
                                 | banto_plc::DataType::I32
                                 | banto_plc::DataType::U32
+                                | banto_plc::DataType::I64
+                                | banto_plc::DataType::U64
                         )
                     {
                         raw = raw.round();

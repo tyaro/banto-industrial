@@ -7,18 +7,26 @@
 use crate::error::PlcError;
 use crate::types::{DataType, StringEncoding, TagValue};
 
-/// Which register holds the high 16 bits of a 32-bit value (docs/plan.md I2
-/// §5). Byte order *within* a register is fixed by Modbus itself
-/// (big-endian) and is not a parameter - only the order of the *two
-/// registers* varies by device, which is what this controls.
+/// Which register holds the high 16 bits of a 32-bit value, or (since the
+/// 64-bit `I64`/`U64`/`F64` types, owner decision 2026-09-08) the highest 16
+/// bits of a 4-register 64-bit value (docs/plan.md I2 §5). Byte order
+/// *within* a register is fixed by Modbus itself (big-endian) and is not a
+/// parameter - only the order of the register group varies by device, which
+/// is what this controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WordOrder {
-    /// First register (lower offset) holds the high word - the Modbus/IEEE
-    /// convention and this crate's default.
+    /// First register (lowest offset) holds the highest word - the
+    /// Modbus/IEEE convention and this crate's default. For a 4-register
+    /// value this means `regs[0]` is the most significant word and
+    /// `regs[3]` the least significant.
     #[default]
     HighLow,
-    /// First register holds the low word - common on drives/instruments
-    /// that treat the register pair as a little-endian machine word.
+    /// First register holds the lowest word - common on drives/instruments
+    /// that treat the register group as a little-endian machine word. For a
+    /// 4-register value this reverses the whole group: `regs[3]` is the
+    /// most significant word and `regs[0]` the least significant. The
+    /// Omron KM-D1-ETN power meter (KANC-718B §12.5) uses this ordering for
+    /// its `f64` measurement registers.
     LowHigh,
 }
 
@@ -31,7 +39,18 @@ fn combine_u32(regs: [u16; 2], order: WordOrder) -> u32 {
     ((hi as u32) << 16) | (lo as u32)
 }
 
-/// Decode the value at `regs[start..]` (1 or 2 registers, per `data_type`)
+/// Combine four registers into a `u64` per `order`, the same convention as
+/// [`combine_u32`] extended to a 4-word group (64-bit types, owner decision
+/// 2026-09-08).
+fn combine_u64(regs: [u16; 4], order: WordOrder) -> u64 {
+    let [a, b, c, d] = match order {
+        WordOrder::HighLow => regs,
+        WordOrder::LowHigh => [regs[3], regs[2], regs[1], regs[0]],
+    };
+    ((a as u64) << 48) | ((b as u64) << 32) | ((c as u64) << 16) | (d as u64)
+}
+
+/// Decode the value at `regs[start..]` (1, 2 or 4 registers, per `data_type`)
 /// into a [`TagValue::F64`]. `start` is a [`crate::planning::MappedRequest::offset_in_read`],
 /// an offset into the *response* window, not a PLC address, so bounds
 /// checking here only guards against a planning bug, not a malformed PLC
@@ -64,6 +83,14 @@ pub(crate) fn decode_register_value(
         DataType::I32 => combine_u32([window[0], window[1]], order) as i32 as f64,
         DataType::U32 => combine_u32([window[0], window[1]], order) as f64,
         DataType::F32 => f32::from_bits(combine_u32([window[0], window[1]], order)) as f64,
+        DataType::I64 => {
+            combine_u64([window[0], window[1], window[2], window[3]], order) as i64 as f64
+        }
+        DataType::U64 => combine_u64([window[0], window[1], window[2], window[3]], order) as f64,
+        DataType::F64 => f64::from_bits(combine_u64(
+            [window[0], window[1], window[2], window[3]],
+            order,
+        )),
         DataType::Bit => {
             return Err(PlcError::Protocol(
                 "decode_register_value called with DataType::Bit".to_string(),
@@ -226,6 +253,113 @@ mod tests {
         let regs = [0x0000u16, 0x3FC0u16];
         let v = decode_register_value(&regs, 0, DataType::F32, WordOrder::LowHigh).unwrap();
         assert_eq!(v, TagValue::F64(1.5));
+    }
+
+    // --- 64-bit types (I64/U64/F64, owner decision 2026-09-08) ------------
+
+    /// u64 value 0x0001_0002_0003_0004 as four registers, both word orders,
+    /// exact bytes spelled out (same style as the 32-bit word-order tests
+    /// above).
+    #[test]
+    fn decodes_u64_high_low_word_order() {
+        let regs = [0x0001u16, 0x0002u16, 0x0003u16, 0x0004u16]; // highest word first
+        let v = decode_register_value(&regs, 0, DataType::U64, WordOrder::HighLow).unwrap();
+        assert_eq!(v, TagValue::F64(0x0001_0002_0003_0004_u64 as f64));
+    }
+
+    #[test]
+    fn decodes_u64_low_high_word_order() {
+        let regs = [0x0004u16, 0x0003u16, 0x0002u16, 0x0001u16]; // lowest word first
+        let v = decode_register_value(&regs, 0, DataType::U64, WordOrder::LowHigh).unwrap();
+        assert_eq!(v, TagValue::F64(0x0001_0002_0003_0004_u64 as f64));
+    }
+
+    #[test]
+    fn decodes_i64_negative_across_both_word_orders() {
+        // -1 as i64 = 0xFFFF_FFFF_FFFF_FFFF, same bytes regardless of word order.
+        let hl = [0xFFFFu16, 0xFFFFu16, 0xFFFFu16, 0xFFFFu16];
+        assert_eq!(
+            decode_register_value(&hl, 0, DataType::I64, WordOrder::HighLow).unwrap(),
+            TagValue::F64(-1.0)
+        );
+        let lh = [0xFFFFu16, 0xFFFFu16, 0xFFFFu16, 0xFFFFu16];
+        assert_eq!(
+            decode_register_value(&lh, 0, DataType::I64, WordOrder::LowHigh).unwrap(),
+            TagValue::F64(-1.0)
+        );
+    }
+
+    /// f64 1.5 = 0x3FF8_0000_0000_0000 (IEEE 754), both word orders.
+    #[test]
+    fn decodes_f64_high_low_word_order() {
+        let regs = [0x3FF8u16, 0x0000u16, 0x0000u16, 0x0000u16];
+        let v = decode_register_value(&regs, 0, DataType::F64, WordOrder::HighLow).unwrap();
+        assert_eq!(v, TagValue::F64(1.5));
+    }
+
+    #[test]
+    fn decodes_f64_low_high_word_order() {
+        let regs = [0x0000u16, 0x0000u16, 0x0000u16, 0x3FF8u16];
+        let v = decode_register_value(&regs, 0, DataType::F64, WordOrder::LowHigh).unwrap();
+        assert_eq!(v, TagValue::F64(1.5));
+    }
+
+    /// Omron KM-D1-ETN power meter (KANC-718B §12.5) real-world case: its
+    /// `f64` measurement registers use `WordOrder::LowHigh` - the received
+    /// word order A,B,C,D (highest to lowest) must be re-ordered to D,C,B,A
+    /// before the bits are reinterpreted as a double. Uses a couple of
+    /// realistic measurement values (not just round bit patterns) to prove
+    /// the round trip end to end.
+    #[test]
+    fn decodes_km_d1_etn_style_f64_measurement_with_low_high_word_order() {
+        for value in [100.5_f64, 1234.5678_f64] {
+            let bits = value.to_bits();
+            let a = (bits >> 48) as u16; // most significant word
+            let b = (bits >> 32) as u16;
+            let c = (bits >> 16) as u16;
+            let d = bits as u16; // least significant word
+                                 // KM-D1-ETN transmits the word order reversed relative to the
+                                 // straightforward high-to-low layout, i.e. LowHigh: the register
+                                 // array below is [d, c, b, a] so that WordOrder::LowHigh
+                                 // (which reverses regs) reconstructs [a, b, c, d].
+            let regs = [d, c, b, a];
+            let decoded =
+                decode_register_value(&regs, 0, DataType::F64, WordOrder::LowHigh).unwrap();
+            assert_eq!(decoded, TagValue::F64(value));
+        }
+    }
+
+    /// Known/accepted limitation (owner decision 2026-09-08, see
+    /// `DataType`'s doc comment): `U64`/`I64` values beyond `2^53` lose
+    /// precision once widened to `f64`. `2^53 + 1` is the smallest integer
+    /// that cannot be represented exactly as `f64`, and rounds down to
+    /// `2^53` here.
+    #[test]
+    fn u64_beyond_2_pow_53_loses_precision_as_a_known_limitation() {
+        let value: u64 = 9_007_199_254_740_993; // 2^53 + 1
+        let regs = [
+            (value >> 48) as u16,
+            (value >> 32) as u16,
+            (value >> 16) as u16,
+            value as u16,
+        ];
+        let v = decode_register_value(&regs, 0, DataType::U64, WordOrder::HighLow).unwrap();
+        assert_eq!(v, TagValue::F64(9_007_199_254_740_992.0));
+    }
+
+    #[test]
+    fn decode_respects_a_nonzero_start_offset_for_64_bit_types() {
+        let regs = [0xDEADu16, 0x0000u16, 0x0000u16, 0x0000u16, 0x0042u16];
+        let v = decode_register_value(&regs, 1, DataType::U64, WordOrder::HighLow).unwrap();
+        assert_eq!(v, TagValue::F64(0x0042 as f64));
+    }
+
+    #[test]
+    fn out_of_bounds_64_bit_window_is_a_protocol_error_not_a_panic() {
+        // Only 3 registers available, but U64 needs 4.
+        let regs = [0x0000u16, 0x0000u16, 0x0000u16];
+        let err = decode_register_value(&regs, 0, DataType::U64, WordOrder::HighLow).unwrap_err();
+        assert!(matches!(err, PlcError::Protocol(_)));
     }
 
     #[test]

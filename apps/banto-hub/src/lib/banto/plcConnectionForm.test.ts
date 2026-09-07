@@ -5,12 +5,16 @@
 import { describe, expect, it } from 'vitest';
 import {
 	DEFAULT_PORTS,
+	DEFAULT_WORD_ORDERS,
 	PROTOCOL_OPTIONS,
 	blankConnectionForm,
 	connectionToForm,
 	defaultPortFor,
+	defaultWordOrderFor,
 	formToConnectionInput,
 	isDefaultPortForProtocol,
+	initialWordOrderTouched,
+	isDefaultWordOrderForProtocol,
 	nextConnectionName,
 	passwordForSubmit,
 	validatePostgresFields,
@@ -98,8 +102,61 @@ describe('defaultPortFor / isDefaultPortForProtocol', () => {
 	});
 });
 
+describe('initialWordOrderTouched（Copilot レビュー指摘: プロトコル切替時の追従漏れ）', () => {
+	it('既定と一致していれば「未編集」= false（切替時に追従する）', () => {
+		expect(initialWordOrderTouched('high_low', 'modbus-tcp')).toBe(false);
+		expect(initialWordOrderTouched('low_high', 'slmp')).toBe(false);
+	});
+
+	it('既定と異なれば「ユーザーが選んだ」= true（切替時に上書きしない）', () => {
+		expect(initialWordOrderTouched('low_high', 'modbus-tcp')).toBe(true);
+		expect(initialWordOrderTouched('high_low', 'slmp')).toBe(true);
+	});
+
+	// 回帰防止: ワード順の欄が出ないプロトコル（virtual/postgres）で true に
+	// なると、そこから modbus-tcp へ切り替えたときに既定 high_low への追従が
+	// 効かず、postgres 由来の low_high がそのまま Modbus 接続として保存される。
+	it('既定を持たないプロトコル（virtual/postgres）は保存値によらず false', () => {
+		for (const wordOrder of ['low_high', 'high_low'] as const) {
+			expect(initialWordOrderTouched(wordOrder, 'virtual')).toBe(false);
+			expect(initialWordOrderTouched(wordOrder, 'postgres')).toBe(false);
+		}
+	});
+});
+
+describe('defaultWordOrderFor / isDefaultWordOrderForProtocol（2026-09-08 オーナー決定、issue #325 で発見した既存バグの修正）', () => {
+	it('modbus-tcp の既定ワード順は high_low（Modbus/IEEE慣習に統一）', () => {
+		expect(defaultWordOrderFor('modbus-tcp')).toBe('high_low');
+		expect(DEFAULT_WORD_ORDERS['modbus-tcp']).toBe('high_low');
+	});
+
+	it('slmp の既定ワード順は low_high（MELSEC標準、従来どおり）', () => {
+		expect(defaultWordOrderFor('slmp')).toBe('low_high');
+		expect(DEFAULT_WORD_ORDERS.slmp).toBe('low_high');
+	});
+
+	it('virtual/postgres は既定ワード順を持たない', () => {
+		expect(defaultWordOrderFor('virtual')).toBeUndefined();
+		expect(defaultWordOrderFor('postgres')).toBeUndefined();
+	});
+
+	it('isDefaultWordOrderForProtocol: 既定値と一致すれば true', () => {
+		expect(isDefaultWordOrderForProtocol('high_low', 'modbus-tcp')).toBe(true);
+		expect(isDefaultWordOrderForProtocol('low_high', 'slmp')).toBe(true);
+	});
+
+	it('isDefaultWordOrderForProtocol: 既定値と異なれば false', () => {
+		expect(isDefaultWordOrderForProtocol('low_high', 'modbus-tcp')).toBe(false);
+		expect(isDefaultWordOrderForProtocol('high_low', 'slmp')).toBe(false);
+	});
+
+	it('isDefaultWordOrderForProtocol: 既定を持たないプロトコルは常に false', () => {
+		expect(isDefaultWordOrderForProtocol('low_high', 'virtual')).toBe(false);
+	});
+});
+
 describe('blankConnectionForm / connectionToForm / formToConnectionInput', () => {
-	it('blankConnectionForm はバックエンドの既定と一致する初期値を返す', () => {
+	it('blankConnectionForm は既定プロトコル（modbus-tcp）の既定ワード順 high_low で初期化する（2026-09-08 オーナー決定、issue #325 の修正）', () => {
 		expect(blankConnectionForm()).toEqual({
 			name: '',
 			protocol: 'modbus-tcp',
@@ -108,7 +165,7 @@ describe('blankConnectionForm / connectionToForm / formToConnectionInput', () =>
 			unitId: '1',
 			enabled: true,
 			simulation: false,
-			wordOrder: 'low_high',
+			wordOrder: 'high_low',
 			database: '',
 			username: '',
 			password: '',
@@ -214,7 +271,11 @@ describe('blankConnectionForm / connectionToForm / formToConnectionInput', () =>
 			unitId: 1,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'low_high',
+			// blankConnectionForm() の既定プロトコル modbus-tcp のワード順
+			// （high_low）を protocol 切り替え後もそのまま引き継ぐ - この
+			// フォーム自体は onProtocolChange を経由しない素の状態遷移
+			// （spread による直接上書き）なので、追従ロジックの対象外。
+			wordOrder: 'high_low',
 			database: 'appdb',
 			username: 'appuser',
 			password: 'hunter2'

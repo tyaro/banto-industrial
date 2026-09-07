@@ -45,17 +45,20 @@ export interface AddressHelp {
 
 /**
  * `data_type` の占有 word 数区分。`crates/banto-plc/src/types.rs`
- * `DataType::register_span`（`bit`/`i16`/`u16` = 1、`i32`/`u32`/`f32` = 2）と
+ * `DataType::register_span`（`bit`/`i16`/`u16` = 1、`i32`/`u32`/`f32` = 2、
+ * `i64`/`u64`/`f64` = 4 - #325、2026-09-08 オーナー決定）と
  * `TagInput.stringLength`（`dataType === 'string'` のときのみ意味を持つ）を
- * まとめて3区分に落とす - ここではワード数の正確な計算式ではなく、
- * 「1点」「2点連続」「指定した word 数だけ連続」のどれかだけを言えればよい。
+ * まとめて4区分に落とす - ここではワード数の正確な計算式ではなく、
+ * 「1点」「2点連続」「4点連続」「指定した word 数だけ連続」のどれかだけを
+ * 言えればよい。
  */
-type OccupancyKind = 'bit' | 'single-word' | 'double-word' | 'string';
+type OccupancyKind = 'bit' | 'single-word' | 'double-word' | 'quad-word' | 'string';
 
 function occupancyKindOf(dataType: TagDataType): OccupancyKind {
 	if (dataType === 'bit') return 'bit';
 	if (dataType === 'string') return 'string';
 	if (dataType === 'i32' || dataType === 'u32' || dataType === 'f32') return 'double-word';
+	if (dataType === 'i64' || dataType === 'u64' || dataType === 'f64') return 'quad-word';
 	return 'single-word';
 }
 
@@ -90,6 +93,11 @@ function slmpOccupancyHint(kind: OccupancyKind): string {
 			return 'bit 型はビットデバイスのアドレスをそのまま1点指定します（例: M50）。';
 		case 'double-word':
 			return '32bit 型（i32/u32/f32）はワードデバイス2点分を連続して占有します（例: D100 なら D100・D101）。';
+		case 'quad-word':
+			// #325: 64bit 型は modbus-tcp 接続配下でしか選択できないため実際に
+			// SLMP でこの分岐が表示されることは無い想定だが、`OccupancyKind`
+			// の網羅性チェックのため防御的に用意する。
+			return '64bit 型（i64/u64/f64）はワードデバイス4点分を連続して占有します（例: D100 なら D100〜D103）。';
 		case 'string':
 			return 'string 型は「文字列長（word数）」で指定した word 数を先頭アドレスから連続して占有します。';
 		case 'single-word':
@@ -104,6 +112,10 @@ function modbusOccupancyHint(kind: OccupancyKind): string {
 			return 'bit 型はコイル（0xxxx）またはディスクリート入力（1xxxx）を1点指定します。';
 		case 'double-word':
 			return '32bit 型（i32/u32/f32）は入力レジスタ／保持レジスタ2点分を連続して占有します（例: 40001 なら 40001・40002）。';
+		case 'quad-word':
+			// #325（2026-09-08 オーナー決定）: 64bit 型は modbus-tcp 接続配下の
+			// タグでのみ登録できる。
+			return '64bit 型（i64/u64/f64）は入力レジスタ／保持レジスタ4点分を連続して占有します（例: 40001 なら 40001〜40004）。';
 		case 'string':
 			return 'string 型は「文字列長（word数）」で指定した word 数（入力／保持レジスタ）を先頭アドレスから連続して占有します。';
 		case 'single-word':

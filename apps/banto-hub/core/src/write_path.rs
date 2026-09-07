@@ -354,6 +354,17 @@ pub struct WriteDeps<'a> {
 /// log-before-write に到達する前に)弾ける」という利点がある。
 /// `DataType::Bit` はこの関数の呼び出し元([`execute_write`])で既に
 /// 分岐済みなので扱わない。
+///
+/// `I64`/`U64`(64bit 整数型、オーナー決定 2026-09-08)は `integral_in_range`
+/// クロージャに乗せていない: そのクロージャの `hi` は `f64` として厳密に
+/// 表現できる値である前提だが(`i16`/`u16`/`i32`/`u32` の `MIN`/`MAX` は全て
+/// 厳密表現可能)、`i64::MAX as f64` は `2^63` に、`u64::MAX as f64` は
+/// `2^64` に切り上げられ、どちらも本来の範囲より 1 大きい値になる。これを
+/// そのまま `hi` に使うと本来範囲外の値(`2^63`/`2^64` そのもの)を誤って
+/// 受理してしまう(`banto_plc_write::encode::require_u64_in_range`/
+/// `require_i64_in_range` の doc comment参照 - 同じ落とし穴の詳細な説明が
+/// ある)。代わりに `2^63`/`2^64` 自体との厳密な `<` 比較で上限を判定する
+/// (下限側は `i64::MIN`=`-2^63` が厳密表現可能なのでそのまま使える)。
 fn validate_numeric_range(data_type: DataType, x: f64) -> Result<(), String> {
     if !x.is_finite() {
         return Err("値が有限ではありません".to_string());
@@ -379,7 +390,69 @@ fn validate_numeric_range(data_type: DataType, x: f64) -> Result<(), String> {
                 Err("f32 で表現するには大きすぎます".to_string())
             }
         }
+        DataType::U64 => {
+            // 2^64, f64 で厳密に表現できる値(doc comment参照)。
+            const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
+            if x.fract() != 0.0 {
+                return Err("整数ではありません".to_string());
+            }
+            if x < 0.0 || x >= TWO_POW_64 {
+                return Err(format!("範囲 [0, {}] の外です", u64::MAX));
+            }
+            Ok(())
+        }
+        DataType::I64 => {
+            // 2^63, f64 で厳密に表現できる値(doc comment参照)。
+            const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+            if x.fract() != 0.0 {
+                return Err("整数ではありません".to_string());
+            }
+            if x < i64::MIN as f64 || x >= TWO_POW_63 {
+                return Err(format!("範囲 [{}, {}] の外です", i64::MIN, i64::MAX));
+            }
+            Ok(())
+        }
+        DataType::F64 => Ok(()), // 有限性は関数冒頭で既に確認済み。
         DataType::Bit => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod validate_numeric_range_tests {
+    use super::validate_numeric_range;
+    use banto_plc::DataType;
+
+    #[test]
+    fn accepts_u64_and_i64_within_range() {
+        assert!(validate_numeric_range(DataType::U64, 0.0).is_ok());
+        assert!(validate_numeric_range(DataType::U64, u64::MAX as f64 - 2048.0).is_ok());
+        assert!(validate_numeric_range(DataType::I64, i64::MIN as f64).is_ok());
+        assert!(validate_numeric_range(DataType::I64, -1.0).is_ok());
+    }
+
+    #[test]
+    fn rejects_u64_negative_non_integral_and_at_or_above_two_pow_64() {
+        assert!(validate_numeric_range(DataType::U64, -1.0).is_err());
+        assert!(validate_numeric_range(DataType::U64, 1.5).is_err());
+        // u64::MAX as f64 rounds up to 2^64 - out of range, same pitfall as
+        // encode.rs's require_u64_in_range.
+        assert!(validate_numeric_range(DataType::U64, u64::MAX as f64).is_err());
+    }
+
+    #[test]
+    fn rejects_i64_out_of_range_including_i64_max_as_f64() {
+        assert!(validate_numeric_range(DataType::I64, i64::MIN as f64 - 1.0e10).is_err());
+        // i64::MAX as f64 rounds up to 2^63 - out of range, same pitfall as
+        // encode.rs's require_i64_in_range.
+        assert!(validate_numeric_range(DataType::I64, i64::MAX as f64).is_err());
+    }
+
+    #[test]
+    fn f64_accepts_non_integral_and_rejects_non_finite() {
+        assert!(validate_numeric_range(DataType::F64, 1.5).is_ok());
+        assert!(validate_numeric_range(DataType::F64, 1234.5678).is_ok());
+        assert!(validate_numeric_range(DataType::F64, f64::NAN).is_err());
+        assert!(validate_numeric_range(DataType::F64, f64::INFINITY).is_err());
     }
 }
 

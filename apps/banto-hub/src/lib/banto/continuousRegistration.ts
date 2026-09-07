@@ -26,18 +26,26 @@ export const MAX_CONTINUOUS_COUNT = 1000;
 const TWO_WORD_DATA_TYPES: ReadonlySet<TagDataType> = new Set(['i32', 'u32', 'f32']);
 
 /**
+ * #325（2026-09-08 オーナー決定）: `i64`/`u64`/`f64`（Modbus の4レジスタ=64bit
+ * 値、`modbus-tcp` 接続配下のタグのみ登録可 -
+ * `tagRegistryAdmin.ts::MODBUS_ONLY_DATA_TYPES` 参照）は4ワード占有する。
+ */
+const FOUR_WORD_DATA_TYPES: ReadonlySet<TagDataType> = new Set(['i64', 'u64', 'f64']);
+
+/**
  * データ型からアドレス増分を決める（docs/ux-plan.md §3）: ワード系
- * （bit/i16/u16）は+1、2ワード型（i32/u32/f32）は+2、string は
- * +string_length。`crates/banto-tags/src/tag.rs::ALLOWED_DATA_TYPES` に
- * 存在するデータ型はこの3分岐で尽くされる（bit タグがビットデバイス
- * （M100 等）に置かれるかワードのビット位置（D100.5）に置かれるかは
- * アドレス書式の話であって data_type の話ではないので、増分自体は
- * bit/i16/u16 のどれでも同じ「+1」でよい — 実際にどちらの形かは
- * {@link incrementAddress} がアドレス自体の形（`.N` 付きかどうか）から
- * 判別する）。
+ * （bit/i16/u16）は+1、2ワード型（i32/u32/f32）は+2、4ワード型
+ * （i64/u64/f64、#325）は+4、string は+string_length。
+ * `crates/banto-tags/src/tag.rs::ALLOWED_DATA_TYPES` に存在するデータ型は
+ * この4分岐で尽くされる（bit タグがビットデバイス（M100 等）に置かれるか
+ * ワードのビット位置（D100.5）に置かれるかはアドレス書式の話であって
+ * data_type の話ではないので、増分自体は bit/i16/u16 のどれでも同じ「+1」
+ * でよい — 実際にどちらの形かは {@link incrementAddress} がアドレス自体の
+ * 形（`.N` 付きかどうか）から判別する）。
  */
 export function addressIncrement(dataType: TagDataType, stringLength?: number | null): number {
 	if (dataType === 'string') return Math.max(1, stringLength ?? 1);
+	if (FOUR_WORD_DATA_TYPES.has(dataType)) return 4;
 	if (TWO_WORD_DATA_TYPES.has(dataType)) return 2;
 	return 1;
 }

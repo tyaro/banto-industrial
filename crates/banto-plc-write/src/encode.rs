@@ -37,6 +37,24 @@ fn split_u32(val: u32, order: WordOrder) -> [u16; 2] {
     }
 }
 
+/// Split a `u64` into its four register words per `order` - the exact inverse
+/// of `banto-plc/src/decode.rs`'s `combine_u64` (64-bit types, owner decision
+/// 2026-09-08), which reads `HighLow => regs` verbatim as `[a, b, c, d]` (`a`
+/// most significant) and `LowHigh => [regs[3], regs[2], regs[1], regs[0]]`
+/// reversed to `[a, b, c, d]`. So for `HighLow` the wire order is `[a, b, c,
+/// d]` directly, and for `LowHigh` it is the reverse, `[d, c, b, a]` - the
+/// same `HighLow`/`LowHigh` shape as [`split_u32`], extended to four words.
+fn split_u64(val: u64, order: WordOrder) -> [u16; 4] {
+    let a = (val >> 48) as u16;
+    let b = (val >> 32) as u16;
+    let c = (val >> 16) as u16;
+    let d = val as u16;
+    match order {
+        WordOrder::HighLow => [a, b, c, d],
+        WordOrder::LowHigh => [d, c, b, a],
+    }
+}
+
 /// Pull the `f64` out of a numeric [`TagValue`], or report the caller handed a
 /// `Bit` value for a numeric `data_type`.
 fn require_f64(value: TagValue, data_type: DataType) -> Result<f64, PlcWriteError> {
@@ -50,9 +68,15 @@ fn require_f64(value: TagValue, data_type: DataType) -> Result<f64, PlcWriteErro
 }
 
 /// Reject a value that cannot land exactly in an integer register: non-finite,
-/// non-integral, or outside `[lo, hi]`. `lo`/`hi` are passed as `f64` (every
-/// 16-/32-bit integer bound is exactly representable) so one helper serves
-/// every integer width.
+/// non-integral, or outside `[lo, hi]`. `lo`/`hi` are passed as `f64` and must
+/// themselves be exactly representable as `f64` - true of every 16-/32-bit
+/// integer bound (`i16`/`u16`/`i32`/`u32` `MIN`/`MAX`), which is all this
+/// helper is used for. **Not used for the 64-bit integer types** (`I64`/
+/// `U64`): `i64::MAX as f64` and `u64::MAX as f64` are *not* exactly
+/// representable (they round up to `2^63` and `2^64` respectively, both
+/// one-past the real bound), so passing them here as `hi` would silently
+/// accept an out-of-range value. See [`require_u64_in_range`] and
+/// [`require_i64_in_range`], which handle that case explicitly.
 fn require_integral_in_range(
     x: f64,
     lo: f64,
@@ -78,11 +102,87 @@ fn require_integral_in_range(
     Ok(())
 }
 
+/// Reject a value that cannot land exactly in a `u64` register group:
+/// non-finite, non-integral, negative, or `>= 2^64`.
+///
+/// Deliberately **not** built on [`require_integral_in_range`]: that helper
+/// compares against an inclusive `hi` bound that must itself be exactly
+/// representable as `f64`, which holds for `u16::MAX`/`u32::MAX` but not for
+/// `u64::MAX`. `u64::MAX` (`2^64 - 1`) sits between two `f64` values that are
+/// `2048` apart at that magnitude, and rounds *up* to the nearer one -
+/// `u64::MAX as f64` is exactly `2^64`, one past every real `u64` value.
+/// Using that as an inclusive upper bound would wrongly accept `x == 2^64`
+/// (which does not fit in a `u64` - `2^64_f64 as u64` silently saturates to
+/// `u64::MAX` under Rust's saturating float-to-int cast rather than
+/// panicking or erroring).
+///
+/// The fix is to compare against `2^64` itself with a **strict** `<`: every
+/// `f64` integer strictly below `2^64` does fit in a `u64` once truncated
+/// (there is no representable `f64` between the true `u64::MAX` and `2^64`
+/// to slip through), so this correctly accepts the full range and rejects
+/// only what is genuinely out of bounds.
+fn require_u64_in_range(x: f64, data_type: DataType) -> Result<(), PlcWriteError> {
+    // 2^64, exactly representable as f64 - see doc comment above.
+    const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
+    let bad = |detail: String| {
+        Err(PlcWriteError::ValueOutOfRange {
+            data_type: data_type.to_string(),
+            value: format!("{x}"),
+            detail,
+        })
+    };
+    if !x.is_finite() {
+        return bad("値が有限ではありません".to_string());
+    }
+    if x.fract() != 0.0 {
+        return bad("整数ではありません".to_string());
+    }
+    if x < 0.0 || x >= TWO_POW_64 {
+        return bad(format!("範囲 [0, {}] の外です", u64::MAX));
+    }
+    Ok(())
+}
+
+/// Reject a value that cannot land exactly in an `i64` register group:
+/// non-finite, non-integral, or outside `i64`'s true range.
+///
+/// Same pitfall as [`require_u64_in_range`], mirrored on the signed side:
+/// `i64::MIN` (`-2^63`) *is* exactly representable as `f64`, so the lower
+/// bound can safely be the plain inclusive `i64::MIN as f64`. But
+/// `i64::MAX` (`2^63 - 1`) is not - it rounds *up* to `2^63`, one past every
+/// real `i64` value - so the upper bound is instead a strict `< 2^63`. As
+/// with the `u64` case, no representable `f64` integer falls strictly
+/// between the true `i64::MAX` and `2^63`, so this is exact: every `f64`
+/// integer in `[-2^63, 2^63)` fits in an `i64` once truncated.
+fn require_i64_in_range(x: f64, data_type: DataType) -> Result<(), PlcWriteError> {
+    // 2^63, exactly representable as f64 - see doc comment above. i64::MIN as
+    // f64 is exactly -2^63, so it is used directly as the lower bound.
+    const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+    let bad = |detail: String| {
+        Err(PlcWriteError::ValueOutOfRange {
+            data_type: data_type.to_string(),
+            value: format!("{x}"),
+            detail,
+        })
+    };
+    if !x.is_finite() {
+        return bad("値が有限ではありません".to_string());
+    }
+    if x.fract() != 0.0 {
+        return bad("整数ではありません".to_string());
+    }
+    if x < i64::MIN as f64 || x >= TWO_POW_63 {
+        return bad(format!("範囲 [{}, {}] の外です", i64::MIN, i64::MAX));
+    }
+    Ok(())
+}
+
 /// Encode a value bound for a **word** device into its register window (1 word
-/// for 16-bit types, 2 for 32-bit, ordered per `order`). `data_type` is
-/// guaranteed non-`Bit` by the planner's compatibility check before this is
-/// called; a `Bit` here would be a planner bug and is reported as a value error
-/// rather than panicking.
+/// for 16-bit types, 2 for 32-bit, 4 for 64-bit (`I64`/`U64`/`F64`, owner
+/// decision 2026-09-08), ordered per `order`). `data_type` is guaranteed
+/// non-`Bit` by the planner's compatibility check before this is called; a
+/// `Bit` here would be a planner bug and is reported as a value error rather
+/// than panicking.
 pub(crate) fn encode_word_value(
     value: TagValue,
     data_type: DataType,
@@ -120,6 +220,30 @@ pub(crate) fn encode_word_value(
                 });
             }
             split_u32(f.to_bits(), order).to_vec()
+        }
+        DataType::U64 => {
+            require_u64_in_range(x, data_type)?;
+            split_u64(x as u64, order).to_vec()
+        }
+        DataType::I64 => {
+            require_i64_in_range(x, data_type)?;
+            split_u64((x as i64) as u64, order).to_vec()
+        }
+        DataType::F64 => {
+            // f64 -> f64 is lossless (unlike the F32 arm above): the only
+            // rejection is non-finite input (NaN/Inf), which `to_bits` would
+            // otherwise happily encode onto the wire as a well-formed but
+            // meaningless bit pattern. Unlike the integer 64-bit arms, no
+            // integral check applies - F64 is the one 64-bit type meant to
+            // carry fractional values.
+            if !x.is_finite() {
+                return Err(PlcWriteError::ValueOutOfRange {
+                    data_type: data_type.to_string(),
+                    value: format!("{x}"),
+                    detail: "値が有限ではありません".to_string(),
+                });
+            }
+            split_u64(x.to_bits(), order).to_vec()
         }
         DataType::Bit => {
             return Err(PlcWriteError::ValueOutOfRange {
@@ -522,6 +646,249 @@ mod tests {
             )
             .unwrap(),
             vec![0xFFFF, 0xFFFF]
+        );
+    }
+
+    // --- 64-bit types (I64/U64/F64, owner decision 2026-09-08) ------------
+
+    /// Mirror of `decode.rs`'s `combine_u64`, reimplemented locally rather
+    /// than called across the crate boundary (it is `pub(crate)` to
+    /// `banto-plc`) - used only to prove `split_u64`'s round trip below.
+    fn recombine_u64(regs: [u16; 4], order: WordOrder) -> u64 {
+        let [a, b, c, d] = match order {
+            WordOrder::HighLow => regs,
+            WordOrder::LowHigh => [regs[3], regs[2], regs[1], regs[0]],
+        };
+        ((a as u64) << 48) | ((b as u64) << 32) | ((c as u64) << 16) | (d as u64)
+    }
+
+    /// u64 value 0x0001_0002_0003_0004 as four registers, both word orders,
+    /// exact words spelled out (same style as `encodes_u32_in_both_word_orders`).
+    #[test]
+    fn encodes_u64_in_both_word_orders() {
+        assert_eq!(
+            encode_word_value(
+                TagValue::F64(0x0001_0002_0003_0004u64 as f64),
+                DataType::U64,
+                WordOrder::HighLow
+            )
+            .unwrap(),
+            vec![0x0001, 0x0002, 0x0003, 0x0004]
+        );
+        assert_eq!(
+            encode_word_value(
+                TagValue::F64(0x0001_0002_0003_0004u64 as f64),
+                DataType::U64,
+                WordOrder::LowHigh
+            )
+            .unwrap(),
+            vec![0x0004, 0x0003, 0x0002, 0x0001]
+        );
+    }
+
+    /// -1 as i64 = 0xFFFF_FFFF_FFFF_FFFF, symmetric, so all four words are
+    /// 0xFFFF either way - the 64-bit twin of `encodes_i32_negative_same_bytes_in_both_orders`.
+    #[test]
+    fn encodes_i64_negative_same_bytes_in_both_orders() {
+        for order in [WordOrder::HighLow, WordOrder::LowHigh] {
+            assert_eq!(
+                encode_word_value(TagValue::F64(-1.0), DataType::I64, order).unwrap(),
+                vec![0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF]
+            );
+        }
+    }
+
+    /// f64 1.5 = 0x3FF8_0000_0000_0000 (IEEE 754), both word orders - the
+    /// 64-bit twin of `encodes_f32_in_both_word_orders`.
+    #[test]
+    fn encodes_f64_in_both_word_orders() {
+        assert_eq!(
+            encode_word_value(TagValue::F64(1.5), DataType::F64, WordOrder::HighLow).unwrap(),
+            vec![0x3FF8, 0x0000, 0x0000, 0x0000]
+        );
+        assert_eq!(
+            encode_word_value(TagValue::F64(1.5), DataType::F64, WordOrder::LowHigh).unwrap(),
+            vec![0x0000, 0x0000, 0x0000, 0x3FF8]
+        );
+    }
+
+    /// Round trip through `split_u64` + a locally reimplemented `combine_u64`
+    /// (the real one is `pub(crate)` to `banto-plc` and not reachable from
+    /// here) for a representative set of `f64` values, both word orders -
+    /// proves `split_u64` is the exact inverse the module doc comment claims.
+    #[test]
+    fn f64_round_trips_through_split_u64_both_word_orders() {
+        for value in [
+            0.0_f64,
+            1.5,
+            -1.5,
+            100.5,
+            1234.5678,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            f64::MIN,
+        ] {
+            for order in [WordOrder::HighLow, WordOrder::LowHigh] {
+                let regs = split_u64(value.to_bits(), order);
+                let bits = recombine_u64(regs, order);
+                assert_eq!(
+                    f64::from_bits(bits),
+                    value,
+                    "round trip failed for {value} under {order:?}"
+                );
+            }
+        }
+    }
+
+    /// Same round-trip proof for `u64`/`i64` integral values via
+    /// `encode_word_value` itself (rather than `split_u64` directly), so the
+    /// range-checking arms are exercised too.
+    #[test]
+    fn u64_and_i64_round_trip_through_encode_word_value_both_word_orders() {
+        // 2^64 - 2048 / 2^63 - 1024: the largest u64/i64 values that are
+        // *exactly* representable as f64 at their magnitude (spacing 2048/1024
+        // respectively - see `require_u64_in_range`'s doc comment). Plain
+        // `u64::MAX - 2048` or `i64::MAX - 1024` would NOT be exactly
+        // representable (u64::MAX/i64::MAX are themselves odd, off the 2048/
+        // 1024 grid), so `value as f64` would silently round to a different
+        // value before ever reaching `encode_word_value` - the wrong thing to
+        // assert a round trip against.
+        for order in [WordOrder::HighLow, WordOrder::LowHigh] {
+            for value in [
+                0u64,
+                1,
+                42,
+                18_446_744_073_709_549_568,
+                0x0001_0002_0003_0004,
+            ] {
+                let regs =
+                    encode_word_value(TagValue::F64(value as f64), DataType::U64, order).unwrap();
+                let bits = recombine_u64(regs.try_into().unwrap(), order);
+                assert_eq!(bits, value);
+            }
+            for value in [0i64, -1, i64::MIN, 9_223_372_036_854_774_784, -1234567] {
+                let regs =
+                    encode_word_value(TagValue::F64(value as f64), DataType::I64, order).unwrap();
+                let bits = recombine_u64(regs.try_into().unwrap(), order);
+                assert_eq!(bits as i64, value);
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_negative_into_u64() {
+        let err =
+            encode_word_value(TagValue::F64(-1.0), DataType::U64, WordOrder::HighLow).unwrap_err();
+        assert!(matches!(err, PlcWriteError::ValueOutOfRange { .. }));
+    }
+
+    #[test]
+    fn rejects_non_integral_into_u64() {
+        let err =
+            encode_word_value(TagValue::F64(1.5), DataType::U64, WordOrder::HighLow).unwrap_err();
+        assert!(matches!(err, PlcWriteError::ValueOutOfRange { .. }));
+    }
+
+    /// The load-bearing 64-bit boundary case (see `require_u64_in_range`'s doc
+    /// comment): `u64::MAX as f64` is *not* an exact representation of
+    /// `u64::MAX` - it rounds up to `2^64`, one past every real `u64` value -
+    /// so it must be rejected, not silently accepted or saturated.
+    #[test]
+    fn rejects_u64_max_as_f64_because_it_rounds_up_to_two_pow_64() {
+        let err = encode_word_value(
+            TagValue::F64(u64::MAX as f64),
+            DataType::U64,
+            WordOrder::HighLow,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PlcWriteError::ValueOutOfRange { .. }));
+    }
+
+    #[test]
+    fn rejects_two_pow_64_into_u64() {
+        let err = encode_word_value(
+            TagValue::F64(18_446_744_073_709_551_616.0), // 2^64
+            DataType::U64,
+            WordOrder::HighLow,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PlcWriteError::ValueOutOfRange { .. }));
+    }
+
+    /// The largest `f64` integer strictly below `2^64` (`2^64 - 2048`, the
+    /// representable spacing at that magnitude) is a genuinely valid `u64`
+    /// and must be accepted - the boundary just inside the range that
+    /// `rejects_u64_max_as_f64_because_it_rounds_up_to_two_pow_64` sits just
+    /// outside of.
+    #[test]
+    fn accepts_the_largest_representable_f64_below_two_pow_64() {
+        // 2^64 - 2048: the largest u64 value exactly representable as f64 (the
+        // f64 spacing at this magnitude is 2048) - NOT `u64::MAX - 2048`,
+        // which is off the representable grid (u64::MAX is odd).
+        let value: u64 = 18_446_744_073_709_549_568;
+        assert_eq!(value as f64 as u64, value); // sanity: exactly representable
+        assert!(encode_word_value(
+            TagValue::F64(value as f64),
+            DataType::U64,
+            WordOrder::HighLow
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_i64_out_of_range() {
+        for x in [
+            i64::MIN as f64 - 1.0e10,    // well below i64::MIN
+            9_223_372_036_854_775_808.0, // 2^63, one past i64::MAX
+        ] {
+            let err =
+                encode_word_value(TagValue::F64(x), DataType::I64, WordOrder::HighLow).unwrap_err();
+            assert!(matches!(err, PlcWriteError::ValueOutOfRange { .. }));
+        }
+    }
+
+    /// The signed twin of `rejects_u64_max_as_f64_because_it_rounds_up_to_two_pow_64`:
+    /// `i64::MAX as f64` rounds up to `2^63`, one past every real `i64`
+    /// value, so it must be rejected.
+    #[test]
+    fn rejects_i64_max_as_f64_because_it_rounds_up_to_two_pow_63() {
+        let err = encode_word_value(
+            TagValue::F64(i64::MAX as f64),
+            DataType::I64,
+            WordOrder::HighLow,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PlcWriteError::ValueOutOfRange { .. }));
+    }
+
+    /// `i64::MIN` (`-2^63`) *is* exactly representable as `f64`, unlike
+    /// `i64::MAX` - this must be accepted at the boundary.
+    #[test]
+    fn accepts_i64_min_boundary_exactly() {
+        assert!(encode_word_value(
+            TagValue::F64(i64::MIN as f64),
+            DataType::I64,
+            WordOrder::HighLow
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_nan_and_infinity_into_f64() {
+        for x in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err =
+                encode_word_value(TagValue::F64(x), DataType::F64, WordOrder::HighLow).unwrap_err();
+            assert!(matches!(err, PlcWriteError::ValueOutOfRange { .. }));
+        }
+    }
+
+    /// Unlike the integer 64-bit types, `F64` must accept non-integral
+    /// values - that is the entire point of the type.
+    #[test]
+    fn f64_accepts_non_integral_values() {
+        assert!(encode_word_value(TagValue::F64(1.5), DataType::F64, WordOrder::HighLow).is_ok());
+        assert!(
+            encode_word_value(TagValue::F64(1234.5678), DataType::F64, WordOrder::LowHigh).is_ok()
         );
     }
 }

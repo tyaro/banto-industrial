@@ -1,0 +1,62 @@
+-- #325（Modbus の 64bit 型追加）の作業中に発見された不整合の是正
+-- （2026-09-08 オーナー決定「Modbus は 'high_low' に統一する」）。
+--
+-- `plc_connections.word_order`（migration 0010）は SLMP のワード順を接続単位で
+-- 指定するために追加された列で、既定値は 'low_high'（MELSEC の標準）だった。
+-- しかし実際には Modbus 経路でも 32/64bit 値のワード並びを決めるパラメータで
+-- あり、次の3つが噛み合っていなかった:
+--
+--   * `crates/banto-collect/src/config.rs::modbus_config_for`（収集ポーリング）は
+--     この列を読まず、`WordOrder::default()` = HighLow 固定で動いていた。
+--   * `crates/banto-broker/src/lib.rs::modbus_config_for`（read-on-demand /
+--     書き込み）はこの列を読むため、列の既定 'low_high' がそのまま効いて
+--     LowHigh で動いていた。
+--   * banto-hub の接続フォームはワード順を "slmp" 選択時しか表示しなかったので、
+--     modbus-tcp 接続には事実上必ず列の既定 'low_high' が保存されていた。
+--
+-- 結果、既定設定の Modbus 接続では同じ u32/f32 タグが**経路によってワード反転
+-- して食い違う**という状態だった（収集履歴は HighLow 解釈、read-on-demand と
+-- 書き込みは LowHigh 解釈）。オーナー決定は Modbus/IEEE の慣習である
+-- 'high_low' への統一で、これは収集経路（HighLow）の現行動作と、その収集経路が
+-- 既に書き込んだ蓄積済み履歴データの解釈をそのまま保ち、broker 側をそれに
+-- 揃える方向である。
+--
+-- したがってこの UPDATE は**値の意味の変更ではなく「実態への同期」**にあたる。
+-- 既存 modbus-tcp 行に入っている 'low_high' は「実際にそう収集していた」ことを
+-- 表しておらず（収集経路はそもそも列を読んでいなかった）、収集経路が列を読む
+-- ようになるのと同じタイミングで既存行を 'high_low' に揃えることで、収集される
+-- 値も、蓄積済み履歴の解釈も一切変わらない。逆にここで backfill しないと、
+-- 収集経路が列を読み始めた瞬間に既存の全 Modbus 接続の多ワード型が静かに
+-- 反転する - migration 0010 のヘッダが SLMP について警戒していたのと同じ
+-- 「静かに化ける」事故そのものになる。
+--
+-- 明示的に 'low_high' を選んでいた modbus-tcp 行（MCP や REST を直接叩けば
+-- 設定できた）も一律に 'high_low' へ揃える。上記のとおり収集経路は実際には
+-- HighLow で動いていたので、その 'low_high' もまた実態を表していなかった。
+--
+-- 対象は modbus-tcp 行のみ:
+--   * 'slmp' 行は触らない。SLMP 側は 0010 の時点から列が実際に読まれており、
+--     'low_high' は MELSEC の標準として正しい既定のままでよい。
+--   * 'virtual'/'postgres' 行も触らない。どちらもワイヤ上の PLC プロトコルを
+--     話さないので（'virtual' はソケットを開かず、'postgres' は DB 接続）、
+--     この列は誰も読まない無意味な列であり、値を動かす理由が無い。
+--
+-- なお migration 0010 のヘッダにある「modbus-tcp/virtual 接続では無意味な列」
+-- という記述は、modbus-tcp については 2026-09-08 に覆った（virtual について
+-- は引き続き正しい）。0010 のファイル自体は当時の判断の歴史的記録なので
+-- 書き換えず、この 0017 のコメントで上書きする形にしている。
+--
+-- CHECK も列定義も変更しないため、0004/0007/0014 のようなテーブル再構築は
+-- 不要 - UPDATE 1本で済む（0008/0010 と同じ「軽い」migration）。
+--
+-- 注意: この migration は `banto_tags::migrate` を呼ぶ全アプリ
+-- （banto-hub / relay-wright / chronogazer）のデータベースに適用される。
+-- relay-wright も modbus-tcp 接続を持つ（`apps/relay-wright/core/src/rest.rs`
+-- の PlcConnection CRUD）ので同じ扱いでよい - Modbus のワード順の慣習は
+-- アプリによらず同じであり、relay-wright の write/monitor 経路も
+-- `banto-broker` 経由で同じ `modbus_config_for` を通る。
+
+UPDATE plc_connections
+   SET word_order = 'high_low'
+ WHERE protocol = 'modbus-tcp'
+   AND word_order <> 'high_low';

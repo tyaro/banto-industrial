@@ -65,8 +65,9 @@ CRUD/一覧サービス + スケーリング純関数（`scale_raw`/`unscale`）
   要求へ結合（間隙許容・プロトコル毎の上限で分割）、応答→各タグへの逆写像
   まで純関数で設計。256タグ/100ms 収集の実現可否はここが握る
 - デコード（`crates/banto-plc/src/decode.rs`）: i16/u16/i32/u32/f32 +
-  32bit ワード順。両プロトコルで共用するが既定値が異なる
-  （Modbus=HighLow / SLMP=LowHigh - MELSEC は下位ワードが先）
+  i64/u64/f64（2026-09-08 追加、issue #325。Modbus 接続配下のタグのみ
+  登録可、4レジスタ占有）+ 32bit/64bit ワード順。両プロトコルで共用するが
+  既定値が異なる（Modbus=HighLow / SLMP=LowHigh - MELSEC は下位ワードが先）
 - シミュレータ（`simulator` feature、`modbus/simulator.rs` /
   `slmp/simulator.rs`）: in-process テストダブル。SLMP 側は実バイト列で
   4E バイナリフレームを話す（ラップ先クレートの内部を通すため）。I3 の
@@ -181,7 +182,7 @@ PLC **書き込み**クライアント。`banto-plc`（読み取り）とは**�
 書き込み API を一切リンクしない — 書き込めるのは意図してこの crate を
 依存に加えたアプリ（relay-wright）だけ。SLMP 一括書き込み
 （`slmp/planning.rs` で read 側と対称の要求結合）、`TagValue` → レジスタ/
-ビット列エンコード（read 側 `decode` の逆写像、32bit ワード順対応）、
+ビット列エンコード（read 側 `decode` の逆写像、32bit/64bit ワード順対応）、
 read/write 両対応のシミュレータ拡張を持つ。`Address`/`DataType`/
 `SlmpConfig` 等の語彙は `banto-plc` から再利用し、依存は
 banto-plc-write → banto-plc の一方向のみ。

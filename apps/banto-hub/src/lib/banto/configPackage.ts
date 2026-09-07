@@ -4,7 +4,7 @@ import {
 	type PlcConnection,
 	type PlcConnectionInput,
 	type PlcProtocol,
-	type SlmpWordOrder,
+	type WordOrder,
 	type StringEncoding,
 	type Tag,
 	type TagInput
@@ -242,9 +242,24 @@ function expectNullableNumber(value: unknown, path: string): number | null {
  * （`CONFIG_PACKAGE_SCHEMA_VERSION` は据え置き — 後方互換な追加フィールド
  * なのでバージョンを上げる理由がない）。値が存在する場合は
  * `low_high`/`high_low` のいずれかであることを検証する。
+ *
+ * 2026-09-08 オーナー決定（issue #325 の作業中に発覚した既存バグの修正）で
+ * ワード順はプロトコル依存になった: modbus-tcp は `high_low`、それ以外は
+ * `low_high`。省略時フォールバックも**同じくプロトコル依存**にしてある。
+ *
+ * ここを無条件 `low_high` にしてはいけない理由: 省略が起きるのは
+ * 「`wordOrder` 自体を一度も知らない極めて古いパッケージ」だが、そのパッケージが
+ * 書き出された当時、modbus-tcp 接続の収集経路は列を無視して `HighLow` で
+ * 動いていた（`banto-collect` の取りこぼし）。つまり当時の実挙動は
+ * `high_low` であり、`low_high` を埋めるとインポート時に静かに挙動が反転して
+ * しまう。migration 0017 が既存 modbus 行を `high_low` へ backfill するのと
+ * 全く同じ「実態への同期」をここでも行う。
+ *
+ * この関数が返す型名は元 `SlmpWordOrder` から `WordOrder` に改名した
+ * （SLMP専用ではなくなったため）。
  */
-function expectWordOrder(value: unknown, path: string): SlmpWordOrder {
-	if (value === undefined) return 'low_high';
+function expectWordOrder(value: unknown, path: string, protocol: PlcProtocol): WordOrder {
+	if (value === undefined) return protocol === 'modbus-tcp' ? 'high_low' : 'low_high';
 	if (value === 'low_high' || value === 'high_low') return value;
 	throw new ConfigPackageParseError(
 		`${path} は low_high / high_low のいずれかである必要があります`
@@ -525,7 +540,7 @@ function parsePlcConnections(raw: unknown): ConfigPackagePlcConnection[] {
 			unitId: expectInteger(item.unitId, `plcConnections[${index}].unitId`),
 			enabled: expectBoolean(item.enabled, `plcConnections[${index}].enabled`),
 			simulation: expectBoolean(item.simulation, `plcConnections[${index}].simulation`),
-			wordOrder: expectWordOrder(item.wordOrder, `plcConnections[${index}].wordOrder`),
+			wordOrder: expectWordOrder(item.wordOrder, `plcConnections[${index}].wordOrder`, protocol),
 			database: expectOptionalString(item.database, `plcConnections[${index}].database`),
 			username: expectOptionalString(item.username, `plcConnections[${index}].username`)
 		};

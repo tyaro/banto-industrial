@@ -225,6 +225,32 @@ describe('buildOffsetCopyRows', () => {
 		expect(result.errors.some((e) => e.sourceId === 8 && e.message.includes('other'))).toBe(true);
 	});
 
+	it('#325: i64/u64/f64 は4ワード占有するため、コピー先の4word範囲内にある既存タグとも重なりを検出する', () => {
+		// source（f64、コピー元は D3000-D3003 の4word占有）を +6 すると
+		// D3006-D3009 になる（コピー元自身の範囲とは重ならない距離）。
+		// D3008 に置かれた1word分の既存タグ（blocker）はコピー先の新
+		// アドレス（D3006）そのものとは一致しないが、4word占有の範囲内には
+		// 入る - i16 相当の1word占有なら重ならない距離なので、4word占有が
+		// 効いていないとこの衝突は検出できない。
+		const source = makeTag({
+			id: 18,
+			name: 'temp01',
+			address: 'D3000',
+			collectionGroupId: 10,
+			dataType: 'f64'
+		});
+		const blocker = makeTag({
+			id: 19,
+			name: 'other',
+			address: 'D3008',
+			collectionGroupId: 10
+		});
+		const result = buildOffsetCopyRows([source], 6, [source, blocker]);
+		expect(result.rows).toHaveLength(1);
+		expect(result.rows[0].address).toBe('D3006');
+		expect(result.errors.some((e) => e.sourceId === 18 && e.message.includes('other'))).toBe(true);
+	});
+
 	it('別グループの既存タグとはアドレスが重なっても衝突扱いしない', () => {
 		const source = makeTag({ id: 10, name: 'temp01', address: 'D3000', collectionGroupId: 10 });
 		const otherGroupTag = makeTag({

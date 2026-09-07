@@ -1706,16 +1706,19 @@ impl From<PlcConnectionPayload> for PlcConnectionInput {
             // relay-wright never sets it - every connection this app
             // creates/updates keeps the database default (`false`).
             simulation: false,
-            // P3-b (banto-industrial 監査指摘 2026-08-12): `word_order` is a
-            // banto-hub-only exposed setting so far (its plc-connections form
-            // - `apps/banto-hub/src/routes/(app)/plc-connections/+page.svelte`
-            // - is the only UI offering it). relay-wright never sets it -
-            // same stance as `simulation` above - every connection this app
-            // creates/updates keeps the database default (`"low_high"`,
-            // `banto_tags::plc_connection::default_word_order`), i.e. exactly
-            // the behavior every relay-wright connection already had before
-            // this column existed.
-            word_order: "low_high".to_string(),
+            // P3-b (banto-industrial 監査指摘 2026-08-12) / 2026-09-08 オーナー
+            // 決定: `word_order` is still a banto-hub-only *exposed* setting
+            // (its connection form is the only UI offering it). relay-wright
+            // never sets it explicitly - same stance as `simulation` above -
+            // but it now passes the empty-string "unspecified" sentinel
+            // instead of a hardcoded `"low_high"`, so `banto_tags` applies its
+            // protocol-aware default: `"high_low"` for a modbus-tcp
+            // connection (the Modbus/IEEE convention, and what the collection
+            // path has always actually done), `"low_high"` for SLMP - which is
+            // exactly the behavior every relay-wright SLMP connection already
+            // had. Hardcoding `"low_high"` here would have silently opted
+            // relay-wright's Modbus connections out of that decision.
+            word_order: String::new(),
             database: None,
             username: None,
             password: None,

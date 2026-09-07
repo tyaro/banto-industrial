@@ -431,6 +431,22 @@ mod tests {
     }
 
     #[test]
+    fn sixty_four_bit_type_occupies_four_registers_in_the_mapping() {
+        // Two F64 tags placed back-to-back should merge into one group of
+        // 2*4 = 8 registers (64-bit types, owner decision 2026-09-08).
+        let requests = [
+            req(AddressArea::HoldingRegister, 0, DataType::F64),
+            req(AddressArea::HoldingRegister, 4, DataType::F64),
+        ];
+        let outcome = plan_requests(&requests);
+        assert_eq!(outcome.reads.len(), 1);
+        let g = &outcome.reads[0];
+        assert_eq!(g.count, 8); // registers 0..4 + 4..8
+        assert_eq!(g.mapping[0].offset_in_read, 0);
+        assert_eq!(g.mapping[1].offset_in_read, 4);
+    }
+
+    #[test]
     fn splits_on_a_gap_far_larger_than_tolerance() {
         let requests = [
             req(AddressArea::HoldingRegister, 0, DataType::I16),

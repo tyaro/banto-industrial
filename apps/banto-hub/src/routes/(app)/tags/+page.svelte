@@ -58,6 +58,7 @@
 		MEM_CONNECTION_NAME,
 		DB_TAG_KIND,
 		DB_TAG_ALLOWED_DATA_TYPES,
+		MODBUS_ONLY_DATA_TYPES,
 		MAX_DB_COLUMN_NAME_LEN,
 		isDbSourceConnection,
 		isValidDbColumnAddress,
@@ -69,6 +70,7 @@
 		type StringEncoding,
 		type CollectionGroup,
 		type PlcConnection,
+		type PlcProtocol,
 		type DescribeColumn,
 		type BatchTagsResult,
 		type BatchTagsUpdateResult,
@@ -179,8 +181,24 @@
 		{ value: 'i32', label: 'i32（符号あり32bit）' },
 		{ value: 'u32', label: 'u32（符号なし32bit）' },
 		{ value: 'f32', label: 'f32（浮動小数点32bit）' },
+		{ value: 'i64', label: 'i64（符号あり64bit）' },
+		{ value: 'u64', label: 'u64（符号なし64bit）' },
+		{ value: 'f64', label: 'f64（浮動小数点64bit・倍精度）' },
 		{ value: 'string', label: 'string（文字列）' }
 	];
+
+	/**
+	 * #325（2026-09-08 オーナー決定）: 64bit 型（`MODBUS_ONLY_DATA_TYPES`）は
+	 * `modbus-tcp` プロトコルの PLC 接続配下のタグでのみ登録できる
+	 * （サーバー側 `banto-tags` が最終防衛線として拒否する）。UI 側でも
+	 * データ型プルダウンの選択肢自体をここで絞る - `protocol` が未確定
+	 * （収集グループ未選択、または `computed`/`internal`/`db` タグのように
+	 * そもそも PLC 接続配下にないグループ）のときは安全側で64bit型を出さない。
+	 */
+	function dataTypeOptionsFor(protocol: PlcProtocol | undefined): typeof dataTypeOptions {
+		if (protocol === 'modbus-tcp') return dataTypeOptions;
+		return dataTypeOptions.filter((opt) => !MODBUS_ONLY_DATA_TYPES.includes(opt.value));
+	}
 
 	/**
 	 * T18-5a（docs/banto-hub-t18-design.md「T18-5a 大量タグ性能」第1段）:
@@ -3669,6 +3687,16 @@
 					>{/if}
 			</label>
 		{/if}
+		<!--
+			#325（2026-09-08 オーナー決定）: i64/u64/f64 は modbus-tcp 接続配下
+			のタグでのみ登録できる。`dataTypeOptionsFor` が選択中グループの
+			接続プロトコルからその選択肢自体を絞る（未選択・非 modbus-tcp な
+			ら64bit型を出さない） - サーバー側 `banto-tags` の拒否が最終防衛線
+			である点は変わらない。`{@const}` は直近の親が `<div class="form-grid">`
+			になってしまい使えないため（Svelte の制約 - `{@const}` は
+			`{#snippet}`/`{#if}`/`{#each}` 等の直接の子でなければならない）、
+			ここは `connectionForGroupId` をその都度呼ぶだけに留める。
+		-->
 		<label class="field">
 			データ型
 			<select
@@ -3684,12 +3712,25 @@
 					から`string`を除いたもの、サーバー側`validate_tag_input`の
 					`DB_TAG_KIND`アームと同じ除外規則）で選択肢自体を絞る。
 				-->
-				{#each dataTypeOptions.filter((opt) => form.tagKind !== DB_TAG_KIND || DB_TAG_ALLOWED_DATA_TYPES.includes(opt.value)) as opt (opt.value)}
+				{#each dataTypeOptionsFor(connectionForGroupId(form.collectionGroupId)?.protocol).filter((opt) => form.tagKind !== DB_TAG_KIND || DB_TAG_ALLOWED_DATA_TYPES.includes(opt.value)) as opt (opt.value)}
 					<option value={opt.value}>{opt.label}</option>
 				{/each}
 			</select>
 			{#if errors.dataType}<span class="err" id="tag-data-type-err">{errors.dataType}</span>{/if}
 		</label>
+		{#if MODBUS_ONLY_DATA_TYPES.includes(form.dataType)}
+			<!--
+				#325（2026-09-08 オーナー決定）: 64bit 型選択時の注記
+				（占有レジスタ数・精度制約・ワード順）。
+			-->
+			<p class="hint wide" id="tag-data-type-64bit-hint">
+				4 レジスタ（64bit）を占有します。
+				{#if form.dataType === 'i64' || form.dataType === 'u64'}
+					値は倍精度浮動小数点で保持されるため、2^53（9,007,199,254,740,992）を超える整数は精度が落ちます。
+				{/if}
+				ワード順は PLC 接続の設定（ワード順）に従います - 例えばオムロン KM-D1-ETN のような機種は先頭レジスタが最下位ワード（LowHigh）です。機種のマニュアルで確認してください。
+			</p>
+		{/if}
 		{#if form.dataType === 'string'}
 			<label class="field">
 				文字列長（word数）
@@ -3980,14 +4021,29 @@
 {/snippet}
 
 {#snippet continuousCommonFields()}
+	<!--
+		#325（2026-09-08 オーナー決定）: 64bit 型は modbus-tcp 接続配下の
+		タグでのみ登録できる - `dataTypeOptionsFor` 参照（`tagFields` の
+		単票フォームと同じ方針）。
+	-->
+	{@const continuousProtocol = connectionForGroupId(continuousForm.collectionGroupId)?.protocol}
 	<label class="field">
 		データ型
 		<select bind:value={continuousForm.dataType}>
-			{#each dataTypeOptions as opt (opt.value)}
+			{#each dataTypeOptionsFor(continuousProtocol) as opt (opt.value)}
 				<option value={opt.value}>{opt.label}</option>
 			{/each}
 		</select>
 	</label>
+	{#if MODBUS_ONLY_DATA_TYPES.includes(continuousForm.dataType)}
+		<p class="hint wide">
+			4 レジスタ（64bit）を占有します。
+			{#if continuousForm.dataType === 'i64' || continuousForm.dataType === 'u64'}
+				値は倍精度浮動小数点で保持されるため、2^53（9,007,199,254,740,992）を超える整数は精度が落ちます。
+			{/if}
+			ワード順は PLC 接続の設定（ワード順）に従います。
+		</p>
+	{/if}
 	{#if continuousForm.dataType === 'string'}
 		<label class="field">
 			文字列長（word数）
@@ -5185,7 +5241,7 @@
 				名前パターン（<code>{'{n}'}</code>が連番に置き換わります。例:
 				<code>temp{'{n}'}</code> + 開始1 + 3点 → temp1, temp2,
 				temp3）・開始アドレス・点数・共通設定から連続タグを一括生成します。アドレスの増分はデータ型から自動決定（i16/u16
-				等のワード型は+1、i32/u32/f32 は+2、string は文字列長分）。<code>.N</code
+				等のワード型は+1、i32/u32/f32 は+2、i64/u64/f64 は+4、string は文字列長分）。<code>.N</code
 				>（ビット位置）付きのアドレス（例: <code>D100.5</code>）はワード内 bit 連番になります（bit15
 				の次は次ワードの bit0）。<code>X</code>/<code>Y</code>/<code>B</code>/<code>W</code>/<code
 					>SB</code
@@ -5337,11 +5393,19 @@
 			{/if}
 		</div>
 	{:else if drawerMode === 'struct' && canWrite}
+		<!--
+			#325（2026-09-08 オーナー決定）: 64bit 型は modbus-tcp 接続配下の
+			タグでのみ登録できる - `dataTypeOptionsFor` 参照（`tagFields` の
+			単票フォームと同じ方針）。`structForm.collectionGroupId` は
+			（下の select が disabled で示す通り）ツリーで選択済みグループに
+			固定されるため、フィールドごとではなく構造体全体で1つの protocol。
+		-->
+		{@const structProtocol = connectionForGroupId(structForm.collectionGroupId)?.protocol}
 		<div class="drawer-section">
 			<p class="note">
 				複数の異なるフィールド（名前・型）をまとめて登録します。<strong>自動割付</strong>は
 				ベースアドレスから、各フィールドが占有するワード数（bit/i16/u16 は+1、i32/u32/f32
-				は+2、string は文字列長ぶん）だけずつ連続したアドレスへ割り付けます。<strong
+				は+2、i64/u64/f64 は+4、string は文字列長ぶん）だけずつ連続したアドレスへ割り付けます。<strong
 					>手動割付</strong
 				>は各フィールドのアドレスを個別に指定します。
 			</p>
@@ -5406,11 +5470,20 @@
 						<label class="field">
 							型
 							<select bind:value={field.dataType} data-testid={`struct-reg-field-type-${i}`}>
-								{#each dataTypeOptions as opt (opt.value)}
+								{#each dataTypeOptionsFor(structProtocol) as opt (opt.value)}
 									<option value={opt.value}>{opt.label}</option>
 								{/each}
 							</select>
 						</label>
+						{#if MODBUS_ONLY_DATA_TYPES.includes(field.dataType)}
+							<p class="hint">
+								4 レジスタ（64bit）を占有します。
+								{#if field.dataType === 'i64' || field.dataType === 'u64'}
+									値は倍精度浮動小数点で保持されるため、2^53（9,007,199,254,740,992）を超える整数は精度が落ちます。
+								{/if}
+								ワード順は PLC 接続の設定（ワード順）に従います。
+							</p>
+						{/if}
 						{#if field.dataType === 'string'}
 							<label class="field">
 								文字列長（word数）
