@@ -55,9 +55,9 @@ use windows_service::{define_windows_service, service_dispatcher};
 
 use banto_hub_core::controller::{CollectionState, RunMode};
 use banto_hub_core::hub_log::{self, log_err_line, log_line};
-use banto_hub_core::profile_lock::HubHostKind;
+use banto_hub_core::profile_lock::{HubHostKind, ProfileLockError};
 use banto_hub_core::profile_paths::{build_hub_config_from_env, resolve_profile_paths_from_env};
-use banto_hub_core::runtime::HubRuntime;
+use banto_hub_core::runtime::{HubRuntime, HubStartError};
 // T17-0（docs/banto-hub-t17-design.md §3「T17-0」）: サービス名・起動引数は
 // `banto_hub_core::service_manager`（`WindowsServiceManager`が実 SCM 再登録
 // 時に使う値と同じもの）を単一のソースとして再利用する - このファイルは
@@ -76,6 +76,64 @@ pub use banto_hub_core::service_manager::{RUN_SERVICE_ARG, SERVICE_NAME};
 // `service_install.rs`側にも同じ値の複製が1つ増えている（そちら側の
 // モジュール doc 参照、値を変えるときは両方直すこと）。
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+
+/// 2026-09-07 I4 実機検証で見つかったバグの修正で新設した
+/// `report_status(Stopped, ServiceExitCode::ServiceSpecific(_))`用の非0
+/// exit code。`sc query`の`ERROR CONTROL`や `Get-EventLog`から起動失敗の
+/// 種別を後から区別できるようにするための診断値（Win32 予約値との衝突は
+/// 無い - アプリ定義の小さい整数）。既存の`1`（tokio ランタイム構築失敗・
+/// 「Configured 収集開始失敗」の2箇所、[`run_service_body`]参照）は
+/// このバグ修正のスコープ外のため変更していない。
+///
+/// - [`EXIT_CODE_PROFILE_LOCK_HELD`]:
+///   `HubStartError::ProfileLock(ProfileLockError::AlreadyHeld { .. })` -
+///   既にシェル/別サービスが同じ profile を保持している（Operator の
+///   `sc start`操作ミス等、日常的に起こり得る - バグではない）。
+/// - [`EXIT_CODE_START_FAILED`]: 上記以外の`HubStartError`（DB open 失敗・
+///   ポート bind 失敗等）。
+const EXIT_CODE_PROFILE_LOCK_HELD: u32 = 2;
+const EXIT_CODE_START_FAILED: u32 = 3;
+
+/// [`HubStartError`]から、SCM へ報告する非0 exit code とサービスログへ
+/// 書く診断メッセージを組み立てる純関数（I/O・SCM 呼び出しを一切行わない
+/// ので単体テストできる - 2026-09-07 I4 実機検証で見つかったバグの修正、
+/// [`run_service_body`]のモジュール doc 参照）。
+///
+/// **観測されたバグ**: `run_service_body`は以前、`HubRuntime::start`が
+/// 失敗した場合に`panic!`していた（旧 `hub_run::run`の`expect()`群と
+/// 「同等の異常終了」を意図した実装 - 実装指示 T14-1 §6）。しかし
+/// `HubStartError::ProfileLock(AlreadyHeld)`は「シェルが既に profile
+/// ロックを握っている状態で Operator が`sc start BantoHub`した」という
+/// 日常的に起こり得る操作であり、プログラミングバグではない。この`panic!`
+/// は`service_main`（このファイル）の`catch_unwind`に捕まるだけで、
+/// `report_status(ServiceState::Stopped, ...)`が一度も呼ばれないまま
+/// 処理が終わる - SCM は最後に報告された状態（`register`直後の暗黙の
+/// `START_PENDING`、checkpoint 0）を信じ続け、`sc query`が
+/// `START_PENDING`のまま固まって見える（実機観察: `taskkill /F`でしか
+/// プロセスを止められなかった）。
+///
+/// この関数はその`panic!`分岐の代わりに、[`run_service_body`]が
+/// `log_err_line`→`report_status(Stopped, ServiceSpecific(_))`→
+/// `return`という、隣の「Configured 収集開始失敗」分岐と同じ（既に
+/// 実機で動作実績のある）作法で失敗を報告できるようにする。
+fn describe_start_failure(err: &HubStartError) -> (u32, String) {
+    if let HubStartError::ProfileLock(ProfileLockError::AlreadyHeld { profile_id, owner }) = err {
+        let owner_desc = owner
+            .as_ref()
+            .map(|info| format!("pid={} host_kind={}", info.pid, info.host_kind))
+            .unwrap_or_else(|| "unknown".to_string());
+        return (
+            EXIT_CODE_PROFILE_LOCK_HELD,
+            format!(
+                "banto-hub: 起動に失敗しました - profile '{profile_id}' は既に別プロセスが使用中です（owner: {owner_desc}）"
+            ),
+        );
+    }
+    (
+        EXIT_CODE_START_FAILED,
+        format!("banto-hub: 起動に失敗しました: {err}"),
+    )
+}
 
 /// `bin/banto-hub.rs`の`install`サブコマンド用引数リテラル。
 pub const INSTALL_ARG: &str = "install";
@@ -216,16 +274,31 @@ fn run_service_body(_arguments: Vec<OsString>) {
     let config = build_hub_config_from_env(HubHostKind::Service);
     runtime.block_on(async move {
         // 旧 `hub_run::run`はここで `expect("init_db should succeed")`等の
-        // 4箇所が panic していた（設計 §2「現行コード地図」）。
-        // `run_service_body`全体は`service_main`で`catch_unwind`されており
-        // （このファイル冒頭のモジュール doc 参照）、panic した場合
-        // `report_status(Stopped, ...)`は実行されない（＝SCM への正常終了
-        // 報告なしにプロセスが終わる）まま変えない - T14-1 は`Result`化した
-        // ものの、ここで明示的に`panic!`し直すことで挙動不変を保つ
-        // （実装指示 T14-1 §6「同等の異常終了」）。
+        // 4箇所が panic していた（設計 §2「現行コード地図」）。T14-1 は
+        // `Result`化した際、いったんは「同等の異常終了」として明示的に
+        // `panic!`し直す実装にしていた（実装指示 T14-1 §6）が、2026-09-07
+        // I4 実機検証でこれがバグと判明した:
+        // `HubStartError::ProfileLock(AlreadyHeld)`（シェルが既に profile
+        // ロックを握っている状態で Operator が`sc start`する、日常的な
+        // 操作ミス）ですら`panic!`扱いになり、`catch_unwind`（このファイル
+        // 冒頭のモジュール doc 参照）に捕まるだけで
+        // `report_status(Stopped, ...)`が一度も呼ばれないため、SCM 側は
+        // `START_PENDING`のまま固まって見える（実機観察:
+        // `taskkill /F`でしかプロセスを止められなかった）。
+        // 直下の「Configured 収集開始失敗」分岐と同じ作法
+        // （`log_err_line`→`report_status(Stopped, ServiceSpecific(_))`→
+        // `return`）に統一する - [`describe_start_failure`]参照。
         let hub = match HubRuntime::start(config).await {
             Ok(hub) => hub,
-            Err(err) => panic!("banto-hub: 起動に失敗しました: {err}"),
+            Err(err) => {
+                let (exit_code, message) = describe_start_failure(&err);
+                log_err_line(&message);
+                report_status(
+                    ServiceState::Stopped,
+                    ServiceExitCode::ServiceSpecific(exit_code),
+                );
+                return;
+            }
         };
         let start_status = hub.controller().start(RunMode::Configured).await;
         if start_status.state != CollectionState::Running {
@@ -245,4 +318,120 @@ fn run_service_body(_arguments: Vec<OsString>) {
 
     log_line("banto-hub: Windows サービスを停止しました");
     report_status(ServiceState::Stopped, ServiceExitCode::Win32(0));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use banto_hub_core::profile_lock::{try_acquire_profile_lock, ProfileOwnerInfo};
+    use banto_hub_core::profile_paths::resolve_profile_paths;
+    use banto_hub_core::runtime::HubConfig;
+
+    #[test]
+    fn describe_start_failure_reports_profile_lock_with_owner_diagnostics() {
+        let err = HubStartError::ProfileLock(ProfileLockError::AlreadyHeld {
+            profile_id: "default".to_string(),
+            owner: Some(ProfileOwnerInfo {
+                pid: 4242,
+                host_kind: "shell".to_string(),
+                acquired_at_unix_ms: 0,
+            }),
+        });
+
+        let (exit_code, message) = describe_start_failure(&err);
+
+        assert_eq!(exit_code, EXIT_CODE_PROFILE_LOCK_HELD);
+        assert!(message.contains("default"), "message: {message}");
+        assert!(message.contains("4242"), "message: {message}");
+        assert!(message.contains("shell"), "message: {message}");
+    }
+
+    #[test]
+    fn describe_start_failure_reports_profile_lock_with_unknown_owner() {
+        let err = HubStartError::ProfileLock(ProfileLockError::AlreadyHeld {
+            profile_id: "default".to_string(),
+            owner: None,
+        });
+
+        let (exit_code, message) = describe_start_failure(&err);
+
+        assert_eq!(exit_code, EXIT_CODE_PROFILE_LOCK_HELD);
+        assert!(message.contains("unknown"), "message: {message}");
+    }
+
+    #[test]
+    fn describe_start_failure_reports_generic_code_for_other_start_errors() {
+        let err = HubStartError::UnsafeCommissioningBind("test diagnostic message".to_string());
+
+        let (exit_code, message) = describe_start_failure(&err);
+
+        assert_eq!(exit_code, EXIT_CODE_START_FAILED);
+        assert!(
+            message.contains("test diagnostic message"),
+            "message: {message}"
+        );
+    }
+
+    /// 2026-09-07 I4 実機検証で見つかったバグの回帰テスト:
+    /// `run_service_body`が呼ぶのと同じ`HubRuntime::start`を、シェルが
+    /// 既に profile ロックを保持している状態で叩くと、`START_PENDING`の
+    /// まま固まらず即座（5秒未満）に`HubStartError::ProfileLock(AlreadyHeld)`
+    /// で返ることを確認する - `windows-service`クレートの SCM 連携
+    /// （`service_control_handler::register`等）は実サービスプロセスの
+    /// スレッドでしか呼べないため単体テストできない（このファイルの
+    /// モジュール doc 参照）が、SCM 連携より前段の「起動処理そのもの」は
+    /// この形で検証できる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hub_runtime_start_fails_fast_when_profile_lock_already_held() {
+        let unique = format!(
+            "win-service-lock-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let profile_id = "locked";
+
+        let paths = resolve_profile_paths(&root, profile_id).expect("valid profile id");
+        // シェルが既にこの profile を握っている状態を模す（バグ報告の
+        // 観測条件そのもの: `host_kind: shell`のロック保持中に service が
+        // 起動しようとする）。
+        let _existing_lock = try_acquire_profile_lock(&paths, HubHostKind::Shell)
+            .expect("first acquire should succeed");
+
+        let config = HubConfig {
+            db_path: root.join("registry.sqlite3").to_string_lossy().into_owned(),
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_string()),
+            data_dir_override: Some(root.join("data")),
+            profile_id: profile_id.to_string(),
+            host_kind: HubHostKind::Service,
+            skip_profile_lock: false,
+        };
+
+        // `HubRuntime::start`の profile root 解決は`BANTO_HUB_ROOT`を読む
+        // （`crate::runtime`のモジュール doc「T17-1 での唯一の例外」節と
+        // 同じ仕組み、`banto_hub_core::runtime`のテストが使うのと同じ手法）。
+        std::env::set_var("BANTO_HUB_ROOT", root.to_string_lossy().as_ref());
+        let outcome = tokio::time::timeout(Duration::from_secs(5), HubRuntime::start(config)).await;
+        std::env::remove_var("BANTO_HUB_ROOT");
+
+        let result = outcome.expect(
+            "HubRuntime::start must return within 5s instead of hanging like the observed bug",
+        );
+        match result {
+            Err(err @ HubStartError::ProfileLock(ProfileLockError::AlreadyHeld { .. })) => {
+                let (exit_code, _message) = describe_start_failure(&err);
+                assert_eq!(exit_code, EXIT_CODE_PROFILE_LOCK_HELD);
+            }
+            Err(other) => panic!("expected ProfileLock(AlreadyHeld), got: {other}"),
+            Ok(hub) => {
+                hub.shutdown().await;
+                panic!("expected HubRuntime::start to fail while the profile lock is held");
+            }
+        }
+    }
 }
