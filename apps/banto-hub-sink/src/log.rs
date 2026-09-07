@@ -195,7 +195,10 @@ mod tests {
         );
         assert_eq!(
             resolved,
-            PathBuf::from(r"C:\ProgramData\BantoHub\logs\banto-hub-sink-service.log")
+            PathBuf::from(r"C:\ProgramData")
+                .join("BantoHub")
+                .join("logs")
+                .join(SERVICE_LOG_FILE_NAME)
         );
     }
 
@@ -209,7 +212,7 @@ mod tests {
         );
         assert_eq!(
             resolved,
-            PathBuf::from(r"C:\Program Files\BantoHub\banto-hub-sink-service.log")
+            Path::new(r"C:\Program Files\BantoHub").join(SERVICE_LOG_FILE_NAME)
         );
     }
 
