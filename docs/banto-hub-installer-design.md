@@ -1,7 +1,7 @@
 # banto-hub 一体インストーラ設計（シェル・Hub・elev・サイドカー同梱）
 
 作成日: 2026-09-07
-状態: **オーナー決定済み（2026-09-07、§7 の 10 項目すべて推奨どおり）・I1〜I3 完了**（I1 = #322 生成ツールの 4 バイナリ化とフック、I2 = #321 サイドカー設定の探索順、I3 = #323 `scripts/build-release.ps1` と operations §12）。**残りは I4（Windows 実機での新規 / 上書き / アンインストール検証、S7 と同日）**。I1 で判明した制約: tauri-bundler テンプレートは上書き時に旧 `MainBinaryName` と異なる exe を削除するため、alpha.2 の Hub 単体インストーラからの更新は PREINSTALL でレジストリ値を書き換えて回避（#322）。
+状態: **I1〜I4 完了（2026-09-07）**。I4（Windows 実機検証、§8）で新規 / 稼働中の上書き / Hub 単体インストーラからの更新 / アンインストールが設計どおり動くことを確認。判明した不具合（シェルがロック保持中の `sc start BantoHub` が `START_PENDING` で固まる）と追従 2 件（サイドカーのサービスログ置き場、デスクトップショートカット抑止）は §8.2 参照。
 対象: Windows 向け NSIS インストーラ 1 本で、デスクトップシェル（`banto-hub-shell.exe`）・Hub 本体（`banto-hub.exe`）・UAC ヘルパ（`banto-hub-elev.exe`）・DB Sink サイドカー（`banto-hub-sink.exe`）を同じディレクトリに配置し、サービス登録と権限設定まで行う。
 
 関連: [banto-hub-t17-design.md](banto-hub-t17-design.md)（SCM 管理・profile・UAC・インストーラ再設計。§2.3 に現行インストーラの棚卸し）、[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §16.3（配布まわりの未決事項）、[banto-hub-operations.md](banto-hub-operations.md) §12（現行インストーラのビルド手順と挙動）、[banto-hub-external-db-design.md](banto-hub-external-db-design.md) §5（サイドカー）。
@@ -126,3 +126,25 @@ cargo run --manifest-path apps/banto-hub/installer/Cargo.toml --release
 | 8   | ビルドスクリプト（§4.6）             | 作る（`scripts/build-release.ps1`）                                               |
 | 9   | exe 単体配布の継続                   | インストーラと**併記**して続ける（サービス化しない評価用途向け）                  |
 | 10  | 着手時期                             | S7（実 DB 検証）と同じ実機セッションで I4 を消化できるよう、I1〜I3 を先に済ませる |
+
+## 8. 実機検証結果（I4、2026-09-07、この開発 PC）
+
+`scripts/build-release.ps1` で生成した `dist/0.2.0-alpha.2/BantoHub_0.2.0-alpha.2_x64-setup.exe`（21.1 MB、main = I1〜I3 マージ後）を、既存の Hub をアンインストールした状態から対話モードで実行した。
+
+### 8.1 結果
+
+| #   | 手順                                                                                                           | 結果                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| --- | -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | 新規インストール（UAC、47 秒）                                                                                 | **合格**。`C:\Program Files\BantoHub\` に 4 exe + `banto-hub-sink.toml.example` + `uninstall.exe`、スタートメニューのショートカット、レジストリ `MainBinaryName = banto-hub-shell.exe`、`BantoHub` / `BantoHubSink` とも登録済み・手動起動・LocalSystem、両サービスに `BantoHub Operators` の ACE（`CCLCRPWP`）。既存の `.example` は上書きされない。完了ページの「実行する」でシェル起動、Hub が 127.0.0.1:8722 で応答 |
+| 2   | Operators 権限（非管理者）で `sc start BantoHubSink`                                                           | **合格**。SCM に受理され、設定ファイル未配置のため終了コード 2 で自ら停止。ログに探索した 3 パスが列挙される                                                                                                                                                                                                                                                                                                            |
+| 3   | シェル稼働中（ロック保持）に `sc start BantoHub`                                                               | **不具合**。サービスプロセスは起動するが `START_PENDING`（`NOT_STOPPABLE`、checkpoint 0）のまま固まり、シェルを終了してロックが解放されても回復しない。`sc stop` 1052 / `sc start` 1056。管理者で `taskkill /F` して初めて STOPPED（1067）。その後の通常起動は 2 秒で RUNNING                                                                                                                                           |
+| 4   | サービス稼働中の上書きインストール（29 秒）                                                                    | **合格**。PREINSTALL で停止 → 差し替え → POSTINSTALL で `BantoHub` だけ再開（新 PID、lock は `service`、openapi 200）。停止していた `BantoHubSink` は停止のまま。ACE・レジストリ・雛形は保持。完了後に起動したシェルはサービス稼働を検知して Desktop Hub を起動しない                                                                                                                                                   |
+| 5   | Hub 単体インストーラ（alpha.2）からの更新経路（レジストリの `MainBinaryName` を `banto-hub.exe` に戻して再現） | **合格**。上書き後も `banto-hub.exe` が残り、`MainBinaryName` は `banto-hub-shell.exe` に更新                                                                                                                                                                                                                                                                                                                           |
+| 6   | アンインストール（サービス稼働中・シェル起動中）                                                               | **合格**。シェル終了、両サービスの登録解除、exe / ショートカット / レジストリ削除。`%ProgramData%\BantoHub`（profile・雛形）と Operators グループは保持                                                                                                                                                                                                                                                                 |
+
+### 8.2 判明した事項と追従
+
+- **サービス起動の固着（#3）**: `try_acquire_profile_lock` が `AlreadyHeld` のときにサービス本体が SCM へ `Stopped` を報告せずに留まる経路の疑い。修正 PR を別途作成（即時失敗・サービス固有の終了コード・ログ出力）。運用上の回避は「シェルを閉じてから `sc start`」または「シェルの切替操作を使う」。
+- **サイドカーのサービスログ置き場**: `banto-hub-sink-service.log` が exe 隣（`Program Files`）に書かれ、アンインストール後にフォルダが残る。`%ProgramData%\BantoHub\logs\` へ移す（追従）。
+- **デスクトップショートカット**: tauri-bundler のテンプレートは対話インストールでも作る。§7-3（スタートメニューのみ）に合わせて POSTINSTALL で削除する（追従）。
+- 事前に残っていた `profile.lock` の内容は診断用で、実体は名前付きミューテックス。プロセス終了で解放される（表示上の pid が古くても異常ではない）。
