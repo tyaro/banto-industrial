@@ -2,6 +2,42 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
+## v0.2.0-alpha.2 — 2026-09-07（アルファ）
+
+第 2 アルファ。`v0.2.0-alpha.1` 以降の 36 コミット分。**外部 DB 連携（#228 DB Source / #229 DB Sink）を実装**し、**デスクトップシェル（Tauri）を配布物に含めた**。評価用であり、実 DB 検証（S7）・72h soak・実機サインオフ（#210）等のリリースゲートは未完了。
+
+### 外部 DB 連携（[docs/banto-hub-external-db-design.md](docs/banto-hub-external-db-design.md)）
+
+- **DB 接続**（`protocol = postgres`）: 既存の接続→グループ→タグの 3 階層に PostgreSQL 接続を追加。パスワードは応答に出さず `passwordSet` のみ、更新は省略で保持・空文字で消去。接続テスト（`SELECT version()`）と MCP `test_saved_connection`。
+- **DB Source**（Hub 内）: グループの SQL（`querySql`、1 グループ = 1 SELECT）と `db` タグ（address = 結果列名、数値 / bool / 日時、読み取り専用）。describe + cast 方式で列型を吸収、Quality 変換（NULL / 0 行 / クエリ失敗 = Stale → 2 回で Bad / 接続断 = バックオフ）、収集の開始 / 停止に連動、task の異常終了は supervisor が再生成。UI（Drawer の SQL 入力・列名候補・ツリーの SQL バッジ・状態画面の dbSource 節）、CSV（`tagKind=db` を既存列で受理）、config パッケージ。
+- **DB Sink**（別プロセスのサイドカー `apps/banto-hub-sink`）: Hub 側に sink group の設定（`/api/sink/groups`、pending queue に載らず即時適用）と `GET /api/sink/config`（`admin` + `read` の API キー、ループバック前提）/ `PUT /api/sink/status`。サイドカーは banto-tagclient SDK で購読し、long 形式（`ts, tag_id, external_name, value, quality`）へバッチ INSERT（上限付きキュー、at-least-once、1s→30s バックオフ、テーブル検査と推奨 DDL の表示、DDL は発行しない）。Windows サービス `BantoHubSink`（`install` / `grant-service-acl` は同梱の `banto-hub-elev` で Operators の ACE を付与）。UI（sink 画面・推奨 DDL・API キーのプリセット・状態画面の DB Sink 節）とデスクトップシェルの**サービス一覧**（Hub / Sink の SCM 状態と起動停止）。
+- **MCP**: sink group 管理 5 ツールを追加し **計 37 ツール**（[docs/banto-hub-mcp-reference.md](docs/banto-hub-mcp-reference.md)）。
+- **CI**: ubuntu の PostgreSQL サービスコンテナで Source / Sink の統合テストを常時実行。
+- 検証手順: [docs/external-db-test-2026-09.md](docs/external-db-test-2026-09.md)（S3 の手動 smoke A-1〜A-14、S7 の B-1〜B-13）。
+
+### その他
+
+- Rust toolchain を 1.94.1 → **1.98.1** に更新（#294）。sysinfo 0.39、vite-plugin-svelte 7、eslint 10.9 ほか dependabot 8 件。
+- banto-tagclient SDK（#123）は機能・実 Hub / LAN 検証・配布サイズ・`v0.1.0` 固定まで完了しクローズ。設計文書 §4.5 に実機で判明した挙動（on-change 配信・書き込み直後の旧値）を記録。
+- `Cargo.lock` を版数に同期（#292）。sink group 更新の SQLite `database is locked` 競合を `BEGIN IMMEDIATE` で修正（#309）。
+
+### 配布物（Windows x86_64、ローカルビルド）
+
+- `banto-hub-<ver>-windows-x86_64.exe` — Hub 本体（UI 埋め込み）。
+- `banto-hub-shell-<ver>-windows-x86_64.exe` — **デスクトップシェル（Tauri、UI 埋め込み）**。同じディレクトリに `banto-hub-elev.exe` を置く。
+- `banto-hub-elev-<ver>-windows-x86_64.exe` — UAC ヘルパ。
+- `banto-hub-sink-<ver>-windows-x86_64.exe` — DB Sink サイドカー。
+- `BantoHub_<ver>_x64-setup.exe` — NSIS インストーラ（**Hub 本体のみ**。シェル / サイドカーは未同梱、T17 §2.3 のとおり）。
+- `SHA256SUMS.txt`。
+- Tauri バンドル（`tauri.conf.json`）の版数は数値制約のため `0.2.0`（プレリリース識別子なし）。
+
+### 既知の制限（アルファ）
+
+- **外部 DB 連携の実 DB 検証（S7、別マシン PostgreSQL・24h）は未実施**。シェルのサービス一覧からの Sink の起動停止も実サービス未検証。
+- `admin` スコープの API キーはサーバー全権。サイドカーは DB パスワードを平文で受け取るため Hub と同一マシンのループバック運用が前提。
+- 72h soak・実機サインオフ（#210）、Windows 実機往復・性能ハーネス（#211）は未実施。通信は平文 + 閉域 LAN 前提。
+- 未実装: OPC UA Server（#201）、SQL Server（設計 §6-2、第 2 段）、SLMP イベント PUSH（#258）。
+
 ## v0.2.0-alpha.1 — 2026-09-06（アルファ）
 
 初のアルファ評価版。**banto-hub（タグサーバー）**を中心に、MELSEC SLMP / Modbus TCP からの収集・書き込みと多様な外部インターフェースを、**実機検証済み**で提供する。**評価用**であり、72h soak・実機サインオフ（#210）等のリリースゲートは未完了。`v0.1.0`（2026-09-02、最初のリリースタグ）以降の 46 コミット分。
