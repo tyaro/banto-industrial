@@ -193,6 +193,17 @@ fn slmp_conn_input(name: &str, port: u16) -> PlcConnectionInput {
     }
 }
 
+/// #334 regression coverage: [`conn_input`] always registers
+/// `word_order = "low_high"`, which cannot exercise the "high_low" contrast
+/// `word_order_low_high_is_honored_by_the_polling_path` needs to prove the
+/// setting is actually read, not just defaulted-and-happened-to-match.
+fn conn_input_with_word_order(name: &str, port: u16, word_order: &str) -> PlcConnectionInput {
+    PlcConnectionInput {
+        word_order: word_order.to_string(),
+        ..conn_input(name, port)
+    }
+}
+
 fn group_input(name: &str, conn_id: i64, period_ms: i64) -> CollectionGroupInput {
     CollectionGroupInput {
         name: name.to_string(),
@@ -340,6 +351,175 @@ async fn collects_values_in_tag_order_with_scaling_applied() {
         (t2 - 50.012).abs() < 0.1,
         "t2 scaled 2048 -> ~50.01, got {t2}"
     );
+}
+
+/// #334 regression: `plc_connections.word_order` was ignored on the
+/// collection-polling path even after #333 wired it into
+/// `banto_collect::config`'s `ModbusTcpConfig`/`SlmpConfig` builders. The
+/// missing link was `crate::task::ClientSpec` - it had no `word_order`
+/// field, so `crate::task::client_spec` silently dropped the value and
+/// `crate::task::default_client_factory` rebuilt the polled client with
+/// `..ModbusTcpConfig::default()`, i.e. always `WordOrder::HighLow`,
+/// regardless of what the connection was registered with. Read-on-demand
+/// (the `banto_broker` path) reads `ProtocolConfig` directly and was never
+/// affected, so the two paths silently disagreed on the same tag's value.
+///
+/// This pins the *polling* path end to end, against a real simulator socket:
+/// an f32 tag and an f64 tag (#325, 4 registers) on a `word_order =
+/// "low_high"` connection must decode correctly, and the exact same wire
+/// bits on a `"high_low"` connection - reading the identical registers -
+/// must decode to a different, specific (and wrong, for this data) value.
+/// That contrast is the part a naive "does it decode to *something*" test
+/// would miss: before the fix, both connections above decoded via
+/// `WordOrder::HighLow` (the hardcoded default), so a test that only
+/// exercised `"low_high"` without a `"high_low"` counter-example could pass
+/// by coincidence if the fix were reverted to a value that happened to still
+/// look plausible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn word_order_low_high_is_honored_by_the_polling_path() {
+    let _serial = TEST_SERIAL.lock().await;
+    let env = TempEnv::new("word-order");
+
+    // 85.0f32 = 0x42AA0000. A "low_high" device puts the low register of the
+    // pair first on the wire, so the correct byte-for-byte placement here is
+    // [low, high] = [0x0000, 0x42AA].
+    let f32_regs_low_high: [u16; 2] = [0x0000, 0x42AA];
+    // 50.0f64 = 0x4049000000000000, as 4 registers [msw..lsw] = [0x4049,
+    // 0x0000, 0x0000, 0x0000]. "low_high" reverses the whole 4-register
+    // group (see `banto_plc::decode::WordOrder`'s doc comment), so the wire
+    // placement is [0x0000, 0x0000, 0x0000, 0x4049].
+    let f64_regs_low_high: [u16; 4] = [0x0000, 0x0000, 0x0000, 0x4049];
+
+    // Two independent PLCs (independent sockets/registries), holding the
+    // exact same register bytes, one registered "low_high" and one
+    // "high_low" - proving the *setting*, not the wire data, drives the
+    // decoded value.
+    let sim_lh = Simulator::start().await;
+    sim_lh.set_holding_registers(0, &f32_regs_low_high); // 40001-40002
+    sim_lh.set_holding_registers(2, &f64_regs_low_high); // 40003-40006
+
+    let sim_hl = Simulator::start().await;
+    sim_hl.set_holding_registers(0, &f32_regs_low_high);
+    sim_hl.set_holding_registers(2, &f64_regs_low_high);
+
+    let pool = open_registry(&env).await;
+    let tag_svc = TagService::new(pool.clone());
+
+    let conn_lh = PlcConnectionService::new(pool.clone())
+        .create(conn_input_with_word_order(
+            "PLC-LH",
+            sim_lh.addr.port(),
+            "low_high",
+        ))
+        .await
+        .unwrap();
+    let group_lh = CollectionGroupService::new(pool.clone())
+        .create(group_input("G-LH", conn_lh.id, 100))
+        .await
+        .unwrap();
+    let tag_f32_lh = tag_svc
+        .create(tag_input("f32_lh", group_lh.id, "40001", "f32"))
+        .await
+        .unwrap();
+    let tag_f64_lh = tag_svc
+        .create(tag_input("f64_lh", group_lh.id, "40003", "f64"))
+        .await
+        .unwrap();
+
+    let conn_hl = PlcConnectionService::new(pool.clone())
+        .create(conn_input_with_word_order(
+            "PLC-HL",
+            sim_hl.addr.port(),
+            "high_low",
+        ))
+        .await
+        .unwrap();
+    let group_hl = CollectionGroupService::new(pool.clone())
+        .create(group_input("G-HL", conn_hl.id, 100))
+        .await
+        .unwrap();
+    let tag_f32_hl = tag_svc
+        .create(tag_input("f32_hl", group_hl.id, "40001", "f32"))
+        .await
+        .unwrap();
+    let tag_f64_hl = tag_svc
+        .create(tag_input("f64_hl", group_hl.id, "40003", "f64"))
+        .await
+        .unwrap();
+
+    let config = build_config(&pool).await.unwrap();
+    let collector = Collector::start(
+        config,
+        &env.data_dir(),
+        Arc::new(SystemClock),
+        EventSink::new(pool.clone()),
+        fast_options(),
+    )
+    .await
+    .unwrap();
+
+    let current = collector.current_values();
+    let f32_lh_key = format!("tag:{}", tag_f32_lh.id);
+    let f64_lh_key = format!("tag:{}", tag_f64_lh.id);
+    let f32_hl_key = format!("tag:{}", tag_f32_hl.id);
+    let f64_hl_key = format!("tag:{}", tag_f64_hl.id);
+
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            current.get(&f32_lh_key).map(|s| s.value) == Some(Some(85.0))
+        })
+        .await,
+        "f32 tag on the low_high connection should decode to 85.0"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            current.get(&f64_lh_key).map(|s| s.value) == Some(Some(50.0))
+        })
+        .await,
+        "f64 tag on the low_high connection should decode to 50.0"
+    );
+
+    // Same wire bits, decoded high_low: `combine_u32`/`combine_u64` read the
+    // register group in the opposite order, so this must NOT be 85.0/50.0 -
+    // it lands on a specific denormal value computed straight from the same
+    // bits, deterministically.
+    let wrong_f32 =
+        f32::from_bits(u32::from(f32_regs_low_high[0]) << 16 | u32::from(f32_regs_low_high[1]))
+            as f64;
+    let wrong_f64 = f64::from_bits(
+        (u64::from(f64_regs_low_high[0]) << 48)
+            | (u64::from(f64_regs_low_high[1]) << 32)
+            | (u64::from(f64_regs_low_high[2]) << 16)
+            | u64::from(f64_regs_low_high[3]),
+    );
+    assert_ne!(
+        wrong_f32, 85.0,
+        "sanity: the contrast value must actually differ"
+    );
+    assert_ne!(
+        wrong_f64, 50.0,
+        "sanity: the contrast value must actually differ"
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            current.get(&f32_hl_key).map(|s| s.value) == Some(Some(wrong_f32))
+        })
+        .await,
+        "f32 tag on the high_low connection must decode to {wrong_f32} (not 85.0) - \
+         proving word_order actually changes what the polling path decodes"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            current.get(&f64_hl_key).map(|s| s.value) == Some(Some(wrong_f64))
+        })
+        .await,
+        "f64 tag on the high_low connection must decode to {wrong_f64} (not 50.0)"
+    );
+
+    collector.stop().await.unwrap();
+    sim_lh.stop();
+    sim_hl.stop();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

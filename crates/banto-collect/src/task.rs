@@ -69,7 +69,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use banto_plc::{ModbusTcpClient, PlcClient, PlcError, ReadResult, SlmpClient, TagValue};
+use banto_plc::{
+    ModbusTcpClient, PlcClient, PlcError, ReadResult, SlmpClient, TagValue, WordOrder,
+};
 use banto_tags::scale_raw;
 use banto_tstore::{Clock, TsWriter};
 use tokio::sync::watch;
@@ -181,11 +183,16 @@ pub enum ClientProtocol {
 /// carries everything [`default_client_factory`] needs to reproduce the exact
 /// client the old hardcoded `build_client` built: not just "host/port" but
 /// every field that actually varies a constructed client's behavior
-/// (`unit_id` for Modbus, and the per-[`crate::collector::CollectorOptions`]
-/// timeout overrides [`crate::collector::Collector::start_with_client_factory`]
-/// already folded into `plan.config` before this is derived). `unit_id` is
-/// meaningless for SLMP and always `0` there (SLMP has no such concept - see
+/// (`unit_id` for Modbus, `word_order` for both, and the
+/// per-[`crate::collector::CollectorOptions`] timeout overrides
+/// [`crate::collector::Collector::start_with_client_factory`] already folded
+/// into `plan.config` before this is derived). `unit_id` is meaningless for
+/// SLMP and always `0` there (SLMP has no such concept - see
 /// `crate::config::slmp_config_for`'s doc comment).
+///
+/// This list is maintained **by hand**, not enforced by the compiler - see
+/// [`ClientFactory`]'s doc comment ("issue #334") for how that bit us the
+/// first time and what to do when `ProtocolConfig` grows again.
 #[derive(Debug, Clone)]
 pub struct ClientSpec {
     /// `"conn:{id}"` - matches [`ConnectionPlan::key`] and every other
@@ -197,6 +204,23 @@ pub struct ClientSpec {
     pub unit_id: u8,
     pub connect_timeout: Duration,
     pub response_timeout: Duration,
+    /// Register-group word order for multi-register (32/64-bit) values.
+    ///
+    /// Meaningful for **both** protocols, and a fixed default for neither:
+    /// `crate::config`'s `modbus_config_for` and `slmp_config_for` each
+    /// resolve it from that connection's own `plc_connections.word_order`
+    /// column (migration `0010`, P3-b) before building the `ProtocolConfig`
+    /// this is derived from. The registry's per-protocol *defaults* differ
+    /// (`high_low` for `modbus-tcp` since 2026-09-08, `low_high` for SLMP),
+    /// but either protocol can be configured with either value, so
+    /// [`default_client_factory`] must read this field rather than lean on
+    /// `ModbusTcpConfig::default()`/`SlmpConfig::default()`.
+    ///
+    /// See issue #334: this field's addition is the fix for `ClientSpec`
+    /// having silently dropped `word_order`, which made every polled client
+    /// decode with `WordOrder::default()` no matter what the connection was
+    /// registered with.
+    pub word_order: WordOrder,
 }
 
 /// A caller-supplied seam for building the `PlcClient` a connection task
@@ -205,17 +229,35 @@ pub struct ClientSpec {
 /// (新設)から注入する」). [`crate::collector::Collector::start`] delegates to
 /// [`crate::collector::Collector::start_with_client_factory`] with
 /// [`default_client_factory`] - the same `ModbusTcpClient`/`SlmpClient`
-/// construction the old hardcoded `build_client` did, byte-for-byte (every
-/// field [`ClientSpec`] carries was already a field `build_client` read off
-/// `plan.config`). banto-hub's own factory calls this crate's default for
-/// Modbus connections and swaps in a `banto_broker`-backed adapter for SLMP
-/// ones - see `apps/banto-hub/core/src/broker_glue.rs`'s module doc.
+/// construction the old hardcoded `build_client` did, reproduced field by
+/// field from what [`ClientSpec`] carries. banto-hub's own factory calls
+/// this crate's default for Modbus connections and swaps in a
+/// `banto_broker`-backed adapter for SLMP ones - see
+/// `apps/banto-hub/core/src/broker_glue.rs`'s module doc.
 ///
 /// Called once per connect attempt (same call site `build_client` used to
 /// occupy, inside `run_connection`'s `ConnEvent::Due` arm) - a factory may
 /// freely return a fresh client every time, or close over shared state (e.g.
 /// a `banto_broker::BrokerHandle` clone) to hand back an adapter around a
 /// session that outlives any single attempt.
+///
+/// **Trap that caused issue #334, do not repeat it**: [`ClientSpec`] is a
+/// *hand-picked subset* of `ProtocolConfig`'s fields, not a structural
+/// mirror of it - there is no compiler check tying the two together. When
+/// `ModbusTcpConfig`/`SlmpConfig` gains a new field that actually affects
+/// decoding/behavior (as `word_order` did, T2-2 predating it), it is not
+/// enough to thread it through `crate::config`'s `modbus_config_for`/
+/// `slmp_config_for`; [`ClientSpec`] and [`client_spec`] must also grow a
+/// matching field, and [`default_client_factory`] must read it from `spec`
+/// explicitly rather than leaning on `..Default::default()`. Miss any one of
+/// those three spots and the new field silently reverts to its `Default`
+/// value on every poll - exactly what happened here: `word_order` reached
+/// `ProtocolConfig` correctly, but `ClientSpec` had no field to carry it, so
+/// `default_client_factory` rebuilt the client with `WordOrder::default()`
+/// regardless of what the connection was configured with, while the
+/// read-on-demand (broker) path - which reads `ProtocolConfig` directly,
+/// never through `ClientSpec` - decoded correctly. The two paths silently
+/// disagreed on the same tag's value until this comment's fix.
 pub type ClientFactory = Arc<dyn Fn(&ClientSpec) -> Box<dyn PlcClient> + Send + Sync>;
 
 /// Project a [`ConnectionPlan`]'s protocol config down to the public
@@ -231,6 +273,7 @@ fn client_spec(plan: &ConnectionPlan) -> ClientSpec {
             unit_id: cfg.unit_id,
             connect_timeout: cfg.connect_timeout,
             response_timeout: cfg.response_timeout,
+            word_order: cfg.word_order,
         },
         ProtocolConfig::Slmp(cfg) => ClientSpec {
             connection_key: plan.key.clone(),
@@ -240,6 +283,7 @@ fn client_spec(plan: &ConnectionPlan) -> ClientSpec {
             unit_id: 0,
             connect_timeout: cfg.connect_timeout,
             response_timeout: cfg.response_timeout,
+            word_order: cfg.word_order,
         },
     }
 }
@@ -261,7 +305,7 @@ pub fn default_client_factory() -> ClientFactory {
                     unit_id: spec.unit_id,
                     connect_timeout: spec.connect_timeout,
                     response_timeout: spec.response_timeout,
-                    ..banto_plc::ModbusTcpConfig::default()
+                    word_order: spec.word_order,
                 }))
             }
             ClientProtocol::Slmp => Box::new(SlmpClient::new(banto_plc::SlmpConfig {
@@ -269,6 +313,7 @@ pub fn default_client_factory() -> ClientFactory {
                 port: spec.port,
                 connect_timeout: spec.connect_timeout,
                 response_timeout: spec.response_timeout,
+                word_order: spec.word_order,
                 ..banto_plc::SlmpConfig::default()
             })),
         }
@@ -1283,5 +1328,60 @@ mod tests {
         )
         .await;
         assert!(live.try_recv().is_err());
+    }
+
+    // --- #334: `client_spec` must carry `word_order` through, for both
+    // protocols and both values - the regression this issue was filed
+    // against was `ClientSpec` silently dropping the field, so
+    // `default_client_factory` always rebuilt the client with
+    // `WordOrder::default()` no matter what the connection was configured
+    // with. See [`ClientFactory`]'s doc comment for the full story. ---
+
+    fn modbus_plan(word_order: WordOrder) -> ConnectionPlan {
+        ConnectionPlan {
+            key: "conn:1".to_string(),
+            config: ProtocolConfig::ModbusTcp(banto_plc::ModbusTcpConfig {
+                word_order,
+                ..banto_plc::ModbusTcpConfig::default()
+            }),
+            groups: Vec::new(),
+            simulation: false,
+        }
+    }
+
+    fn slmp_plan(word_order: WordOrder) -> ConnectionPlan {
+        ConnectionPlan {
+            key: "conn:2".to_string(),
+            config: ProtocolConfig::Slmp(banto_plc::SlmpConfig {
+                word_order,
+                ..banto_plc::SlmpConfig::default()
+            }),
+            groups: Vec::new(),
+            simulation: false,
+        }
+    }
+
+    #[test]
+    fn client_spec_carries_modbus_word_order_high_low() {
+        let spec = client_spec(&modbus_plan(WordOrder::HighLow));
+        assert_eq!(spec.word_order, WordOrder::HighLow);
+    }
+
+    #[test]
+    fn client_spec_carries_modbus_word_order_low_high() {
+        let spec = client_spec(&modbus_plan(WordOrder::LowHigh));
+        assert_eq!(spec.word_order, WordOrder::LowHigh);
+    }
+
+    #[test]
+    fn client_spec_carries_slmp_word_order_high_low() {
+        let spec = client_spec(&slmp_plan(WordOrder::HighLow));
+        assert_eq!(spec.word_order, WordOrder::HighLow);
+    }
+
+    #[test]
+    fn client_spec_carries_slmp_word_order_low_high() {
+        let spec = client_spec(&slmp_plan(WordOrder::LowHigh));
+        assert_eq!(spec.word_order, WordOrder::LowHigh);
     }
 }

@@ -2,6 +2,22 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
+## v0.2.0-alpha.6 — 2026-09-08（アルファ）
+
+`v0.2.0-alpha.5` の不具合修正のみ。配布物の構成・前提ランタイムは alpha.3 以降と同じ。
+
+### 修正
+
+- **収集ポーリングが接続のワード順設定を無視し続けていた**（#334）。alpha.5（#325 / #333）で `banto-collect` の config ビルダーに `word_order` を通したが、**ポーリングタスクはその値を使っていなかった**。`task.rs` の `ClientSpec` が `ProtocolConfig` の手作業の部分コピーで `word_order` フィールドを持たず、`client_spec()` が値を捨て、`default_client_factory()` が `..ModbusTcpConfig::default()` / `..SlmpConfig::default()` でクライアントを組み直す際に既定値（Modbus = `HighLow` / SLMP = `LowHigh`）へ静かに戻っていた。
+  - **alpha.5 では `wordOrder: "low_high"` の Modbus 接続の f32 / f64 収集値が壊れたままだった**（f32 の `85.0` を下位ワード先行で置くと `2.39e-41` になる）。read-on-demand は broker 経路で `ProtocolConfig` を直接読むため正しくデコードしており、**同一タグの値が経路によって食い違っていた**。オムロン KM-D1-ETN や KEYENCE TR-W550 のように `low_high` で公開する機器が該当する。
+  - `ClientSpec` に `word_order` を追加し、`client_spec()` と `default_client_factory()` の Modbus / SLMP 両アームで明示的に受け渡す。Modbus 側は `..ModbusTcpConfig::default()` を削除して全フィールドを列挙したので、**今後フィールドが増えたらコンパイルエラーで気づける**。
+  - 回帰テストとして、実シミュレータのソケットに対して同一のワイヤビット列を `low_high` 接続と `high_low` 接続の両方で収集し、値が期待どおり分かれることをエンドツーエンドで固定した（f64 を含む）。
+  - **既存環境への影響は無い**: migration 0017 適用後の Modbus 接続は `high_low` で修正前のハードコード値と一致し、SLMP はレジストリ既定 `low_high` が `SlmpConfig::default()` と一致する。挙動が変わるのは**明示的に既定と異なるワード順を設定した接続**、つまりこれまで壊れていた接続だけ。banto-hub は SLMP に broker アダプタを使うため、このバグを踏むのは **Modbus のポーリングのみ**。
+
+### 既知の制限（アルファ）
+
+alpha.5 と同じ（実 DB 検証 S7 未実施、`admin` スコープ API キーはサーバー全権、サイドカーはループバック運用前提、72h soak・実機サインオフ #210・性能ハーネス #211 未実施、通信は平文 + 閉域 LAN 前提、OPC UA #201 / SQL Server / SLMP イベント PUSH #258 は未実装、`i64`/`u64` は 2^53 超で精度低下）。**KM-D1-ETN 実機での 64bit 読み取り確認は引き続き未実施。**
+
 ## v0.2.0-alpha.5 — 2026-09-08（アルファ）
 
 機能追加 1 件（Modbus の 64bit データ型）と、その作業中に発見した既存バグの修正 1 件（Modbus のワード順）。配布物の構成・前提ランタイムは alpha.3 以降と同じ。
