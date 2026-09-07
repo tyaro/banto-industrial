@@ -204,12 +204,22 @@ pub struct ClientSpec {
     pub unit_id: u8,
     pub connect_timeout: Duration,
     pub response_timeout: Duration,
-    /// Register-group word order for multi-register (32/64-bit) values -
-    /// meaningful for Modbus, and carried through (currently always
-    /// [`WordOrder::LowHigh`], `SlmpConfig::default()`'s value) for SLMP too
-    /// so [`default_client_factory`] never has to special-case which
-    /// protocol actually varies it. See issue #334: this field's addition is
-    /// the fix for `ClientSpec` having silently dropped `word_order` before.
+    /// Register-group word order for multi-register (32/64-bit) values.
+    ///
+    /// Meaningful for **both** protocols, and a fixed default for neither:
+    /// `crate::config`'s `modbus_config_for` and `slmp_config_for` each
+    /// resolve it from that connection's own `plc_connections.word_order`
+    /// column (migration `0010`, P3-b) before building the `ProtocolConfig`
+    /// this is derived from. The registry's per-protocol *defaults* differ
+    /// (`high_low` for `modbus-tcp` since 2026-09-08, `low_high` for SLMP),
+    /// but either protocol can be configured with either value, so
+    /// [`default_client_factory`] must read this field rather than lean on
+    /// `ModbusTcpConfig::default()`/`SlmpConfig::default()`.
+    ///
+    /// See issue #334: this field's addition is the fix for `ClientSpec`
+    /// having silently dropped `word_order`, which made every polled client
+    /// decode with `WordOrder::default()` no matter what the connection was
+    /// registered with.
     pub word_order: WordOrder,
 }
 
