@@ -1,0 +1,22 @@
+# banto-hub-sink（DB Sink サイドカー）設定ファイルの雛形。
+#
+# インストーラが %ProgramData%\BantoHub\ に、このファイルを
+# `banto-hub-sink.toml.example` という名前のまま複製します（実際の
+# `banto-hub-sink.toml` は作成しません - API キーは Hub を起動して
+# 発行するまで存在しないため）。この雛形を同じフォルダで
+# `banto-hub-sink.toml` にリネームし、`api_key` を埋めてから
+# `Start-Service BantoHubSink` してください。
+#
+# 設定ファイルの探索順（I2 実装、docs/banto-hub-installer-design.md §4.4）:
+#   1. 環境変数 BANTO_HUB_SINK_CONFIG が指すパス
+#   2. %ProgramData%\BantoHub\banto-hub-sink.toml（このファイルの本来の置き場所）
+#   3. exe と同じディレクトリの banto-hub-sink.toml（後方互換）
+#
+# 必須。Hub のループバック URL（§6-15: パスワードが平文で流れるため
+# Hub と同一マシンでの運用が前提）。既定ポートは 8722。
+hub_url = "http://127.0.0.1:8722"
+
+# 必須。Hub の管理 UI で発行した API キー。スコープは `admin` と
+# `read` の両方が必要（admin だけでは /api/v1/{tags,values,stream} が
+# 403 になる）。このファイルに平文で置かれる - ファイルの ACL で守ること。
+api_key = ""

@@ -1,6 +1,6 @@
 [package]
 name = "banto-hub-installer"
-description = "banto-hub 用 Windows インストーラ生成ツール（T5-2、docs/t5-handoff.md §3）。tauri-bundler をライブラリとして単体呼び出しし、リリースビルド済み banto-hub.exe を NSIS インストーラに包む。フル Tauri アプリ化はしない（T0 決定）ので `cargo tauri build` は使えず、このバイナリが xtask 的な代替になる。"
+description = "banto-hub 用 Windows インストーラ生成ツール（T5-2 → I1、docs/banto-hub-installer-design.md §3 案 A）。tauri-bundler をライブラリとして単体呼び出しし、リリースビルド済みのシェル・Hub・elev・サイドカーの4 exe を1本の NSIS インストーラに包む。フル Tauri アプリ化はしない（T0 決定）ので `cargo tauri build` は使えず、このバイナリが xtask 的な代替になる。"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
@@ -45,3 +45,9 @@ anyhow = "1"
 # 簡易ロガーを繋ぐ（このバイナリ専用、他クレートには影響しない）。
 env_logger = "0.11"
 log = "0.4"
+
+[dev-dependencies]
+# `missing_binaries` の単体テスト（対象ディレクトリの exe 有無判定）用
+# - Win32 API を呼ばない純粋なファイルシステム確認なので、一時ディレクトリ
+# を使ってクロスプラットフォームでテストできる。
+tempfile = "3"

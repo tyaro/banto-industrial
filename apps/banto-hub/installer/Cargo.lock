@@ -475,6 +475,7 @@ dependencies = [
  "log",
  "tauri-bundler",
  "tauri-utils",
+ "tempfile",
 ]
 
 [[package]]
