@@ -3440,13 +3440,17 @@ async fn plc_connections_test_saved(
 // 発生しない読み取り専用の疎通確認なので、`record_write`/`rebuild_and_notify`
 // は呼ばない。
 //
-// 重要な制約(実機 R08ENCPU、`crates/banto-broker/src/lib.rs`のモジュール
-// doc、`crate::broker_glue`のモジュール doc「Session sync policy」節参照):
-// 三菱 SLMP は対象ポートが既に別の接続で使用中だと同じポートへの2本目を
-// 受け付けない(2026-08-07 実機確認: ポート毎に1接続、CPU側で複数ポートを
-// 開けていれば複数同時セッションは可能)ため、保存済み接続(`connectionId`
-// あり)のテストは、既存の broker セッションが生きていればそれを再利用して
-// 読み、無い場合のみ直接ダイヤルする([`test_slmp_connection`]参照)。
+// 重要な制約(実機 R08ENCPU・オムロン KM-D1-ETN、`crates/banto-broker/src/lib.rs`
+// のモジュール doc、`crate::broker_glue`のモジュール doc「Session sync
+// policy」節参照): 三菱 SLMP は対象ポートが既に別の接続で使用中だと同じ
+// ポートへの2本目を受け付けない(2026-08-07 実機確認: ポート毎に1接続、CPU
+// 側で複数ポートを開けていれば複数同時セッションは可能)。Modbus TCP も
+// #337 で収集読み取りが broker セッションに相乗りするようになった結果、
+// KM-D1-ETN(KANC-718B 12-1)のような1対1接続しか受け付けない機器では同じ
+// 制約が生じる(2026-09-08 オーナー決定)。そのため、保存済み接続
+// (`connectionId`あり)のテストはプロトコルを問わず、既存の broker
+// セッションが生きていればそれを再利用して読み、無い場合のみ直接ダイヤル
+// する([`test_slmp_connection`]/[`test_modbus_connection`]参照)。
 
 /// 接続テストの疎通確認に使うタイムアウト(接続・応答とも共通)。数秒固定
 /// (ux-plan.md §4「タイムアウトは短め（数秒）に固定」)。
@@ -3560,23 +3564,92 @@ fn classify_plc_error(err: &PlcError, hint: Option<&str>) -> PlcConnectionTestEr
     }
 }
 
-/// Modbus TCP の接続テスト - 直接ダイヤルのみ。ポート/ユニットIDの範囲検証 →
-/// `ModbusTcpClient::connect` → 保持レジスタ先頭1点の`read_batch` → 必ず
-/// `disconnect`、の順で行う。
+/// Modbus TCP の接続テスト。`payload.connection_id`があり、その接続の broker
+/// セッションが既に生きていれば、それを再利用して読む(新規ダイヤルしない -
+/// [`test_slmp_connection`]と同じ対策)。無ければ直接ダイヤルにフォールバック
+/// する(ポート/ユニットIDの範囲検証 → `ModbusTcpClient::connect` → 保持
+/// レジスタ先頭1点の`read_batch` → 必ず`disconnect`、の順)。
 ///
-/// **既知のギャップ(#337、2026-09-08)**: この doc は元々「Modbus には
-/// broker/共有セッションの概念がない」と書いていたが、#131 で Modbus TCP も
-/// broker 管理対象になり、#337 で収集読み取りまで同じセッションを通るように
-/// なったため、その前提はもう成り立たない。したがってこのテストは
-/// [`test_slmp_connection`]が持つ「既存 broker セッションを再利用し、2本目を
-/// ダイヤルしない」対策を持たないままであり、1対1接続しか受け付けない機器
-/// (オムロン KM-D1-ETN、#337 参照)に対して収集稼働中に接続テストを実行すると
-/// 失敗と誤診する。[`MODBUS_SESSION_HINT`]がその場合のヒント文言を添えるに
-/// 留まっている。SLMP と同じセッション再利用へ揃えるのは #337 のスコープ外
-/// として別途扱う。
+/// 2026-09-08 オーナー決定: #337 で Modbus TCP の収集読み取りも broker
+/// セッションへ相乗りするようになり、Modbus も1接続=1ソケットになった。
+/// SLMP の R08ENCPU と同様、1対1接続しか受け付けない機器(オムロン
+/// KM-D1-ETN、KANC-718B 12-1、#337 参照)では、収集稼働中に接続テストを
+/// 押すと2本目のダイヤルが拒否され、収集は正常なのに「失敗」と誤診断
+/// されていた。SLMP と同じセッション再利用へ揃えてこれを解消する。
 async fn test_modbus_connection(
+    manager: &CollectorManager,
     payload: &PlcConnectionTestPayload,
 ) -> (bool, Option<PlcConnectionTestError>) {
+    if let Some(connection_id) = payload.connection_id {
+        if let Some(handle) = manager.sessions().handle_for(connection_id) {
+            let requests = vec![BatchReadRequest::Numeric(ReadRequest {
+                address: Address::parse("40001").expect("valid literal"),
+                data_type: DataType::U16,
+            })];
+            // `ReadOnlyHandle::read`自体には外側タイムアウトが無いため、
+            // ここで明示的に包む(`test_slmp_connection`と同じ)。
+            return match tokio::time::timeout(PLC_TEST_TIMEOUT, handle.read(requests)).await {
+                Err(_elapsed) => (
+                    false,
+                    Some(PlcConnectionTestError {
+                        kind: "timeout".to_string(),
+                        message: "応答タイムアウトです(3秒)。共有セッションが応答しませんでした。"
+                            .to_string(),
+                    }),
+                ),
+                Ok(Err(BrokerError::Disconnected { .. })) => (
+                    false,
+                    Some(PlcConnectionTestError {
+                        kind: "tcp".to_string(),
+                        message: "この接続の共有セッションは現在切断中です(再接続待機中)。PLCの電源やネットワーク、または他アプリとのセッション競合を確認してください。"
+                            .to_string(),
+                    }),
+                ),
+                Ok(Err(BrokerError::ConnectionFailed { reason, .. })) => (
+                    false,
+                    Some(PlcConnectionTestError {
+                        kind: "tcp".to_string(),
+                        message: format!("共有セッションが接続断で失敗しました: {reason}"),
+                    }),
+                ),
+                Ok(Err(BrokerError::TaskGone { .. })) => (
+                    false,
+                    Some(PlcConnectionTestError {
+                        kind: "tcp".to_string(),
+                        message: "内部エラー: セッションタスクが終了しています。".to_string(),
+                    }),
+                ),
+                // 防御的フォールバック: この経路では通常発生しない
+                // (UnsupportedProtocol/InvalidPortはensure_connection時点で
+                // 弾かれているはず)。
+                Ok(Err(err @ BrokerError::UnsupportedProtocol { .. }))
+                | Ok(Err(err @ BrokerError::InvalidPort { .. })) => (
+                    false,
+                    Some(PlcConnectionTestError {
+                        kind: "protocol".to_string(),
+                        message: err.to_string(),
+                    }),
+                ),
+                // 既存セッション再利用経路: セッション上限ヒントは付けない
+                // (design の意図: 「2本目をダイヤルしない」こと自体が対策)。
+                Ok(Ok(mut results)) => match results.pop() {
+                    Some(BatchReadResult::Value(_)) => (true, None),
+                    Some(BatchReadResult::Bad(err)) => {
+                        (false, Some(classify_plc_error(&err, None)))
+                    }
+                    None => (
+                        false,
+                        Some(PlcConnectionTestError {
+                            kind: "device".to_string(),
+                            message: "読み出し結果が空でした。".to_string(),
+                        }),
+                    ),
+                },
+            };
+        }
+    }
+
+    // 直接ダイヤル(connectionId が無い、またはセッションが見つからない場合)。
     let port = match u16::try_from(payload.port) {
         Ok(port) => port,
         Err(_) => {
@@ -3865,7 +3938,7 @@ pub(crate) async fn run_plc_connection_test(
         )
     } else {
         match payload.protocol.as_str() {
-            "modbus-tcp" => test_modbus_connection(payload).await,
+            "modbus-tcp" => test_modbus_connection(manager, payload).await,
             "slmp" => test_slmp_connection(manager, payload).await,
             other => (
                 false,
