@@ -243,12 +243,22 @@ impl CollectorConfig {
 
     /// T9-2 (found necessary by this crate's own E2E coverage of the T9-2
     /// simulation-toggle path, `apps/banto-hub/core/tests/t9_simulation.rs`):
-    /// overwrite the `host`/`port` of the SLMP connection plan keyed by
-    /// `key` (no-op if `key` is absent, or present but not an SLMP plan).
+    /// overwrite the `host`/`port` of the broker-routed connection plan keyed
+    /// by `key` (no-op if `key` is absent).
+    ///
+    /// **#337 (2026-09-08)**: this used to touch `ProtocolConfig::Slmp` plans
+    /// only, deliberately - a Modbus plan's `simulation` flag was never
+    /// suppressed back then (its collection reads were not broker-routed), so
+    /// `apply_config`'s diff already noticed a simulation toggle on its own
+    /// and no synthetic diff signal was needed. Once #337 made Modbus reads
+    /// broker-routed, `CollectorManager` started calling
+    /// [`Self::suppress_simulation_for`] for Modbus plans too, which flattens
+    /// that natural signal away - so a Modbus plan now needs exactly the same
+    /// stamping as an SLMP one, for exactly the reasons below.
     ///
     /// This is purely a *diffing* signal for [`crate::Collector::apply_config`],
-    /// not a real dial instruction - a broker-routed SLMP connection is never
-    /// actually dialed from this `SlmpConfig` (its `banto_collect::PlcClient`
+    /// not a real dial instruction - a broker-routed connection is never
+    /// actually dialed from this `ProtocolConfig` (its `banto_collect::PlcClient`
     /// is always the injected `BrokerReadClient`, wrapping a
     /// `banto_broker::ReadOnlyHandle` banto-hub already resolved - see
     /// `crate::task::ClientFactory`/`apps/banto-hub/core/src/broker_glue.rs`'s
@@ -261,11 +271,11 @@ impl CollectorConfig {
     /// is fixed for the task's whole lifetime; a factory rebuilt on a later
     /// rebuild is simply never seen by an "unchanged" task).
     ///
-    /// For a broker-routed SLMP connection, `ConnectionPlan::simulation` is
+    /// For a broker-routed connection, `ConnectionPlan::simulation` is
     /// unconditionally forced `false` by [`Self::suppress_simulation_for`]
     /// (both before and after any simulation toggle), and this plan's
-    /// `ProtocolConfig::Slmp` `host`/`port` otherwise mirror the registry row
-    /// verbatim (`crate::config::slmp_config_for`) - neither field reflects
+    /// `host`/`port` otherwise mirror the registry row verbatim
+    /// (`crate::config::slmp_config_for`/`modbus_config_for`) - neither field reflects
     /// the *actual resolved dial target* a broker-routed connection uses,
     /// which lives entirely outside this plan (`apps/banto-hub/core/src/broker_glue.rs`'s
     /// `SlmpSimRegistry`). So toggling `simulation` on/off (or editing the
@@ -279,7 +289,7 @@ impl CollectorConfig {
     ///
     /// banto-hub's `CollectorManager` calls this with the SAME resolved
     /// `(host, port)` `SlmpSimRegistry::resolve` just computed for every
-    /// broker-routed SLMP connection (regardless of whether `resolve`
+    /// broker-routed connection (regardless of whether `resolve`
     /// reported `changed` - applying it unconditionally is harmless: for an
     /// unchanged target the value written back is identical to what was
     /// already there, so the plan still compares equal and the connection
@@ -293,10 +303,19 @@ impl CollectorConfig {
     /// own doc comment relies on to make the swap actually observable.
     pub fn set_broker_dial_target(&mut self, key: &str, host: String, port: i64) {
         if let Some(conn) = self.connections.iter_mut().find(|c| c.key == key) {
-            if let ProtocolConfig::Slmp(cfg) = &mut conn.config {
-                cfg.host = host;
-                if let Ok(port) = u16::try_from(port) {
-                    cfg.port = port;
+            let port = u16::try_from(port).ok();
+            match &mut conn.config {
+                ProtocolConfig::Slmp(cfg) => {
+                    cfg.host = host;
+                    if let Some(port) = port {
+                        cfg.port = port;
+                    }
+                }
+                ProtocolConfig::ModbusTcp(cfg) => {
+                    cfg.host = host;
+                    if let Some(port) = port {
+                        cfg.port = port;
+                    }
                 }
             }
         }
@@ -1684,14 +1703,20 @@ mod tests {
         );
     }
 
-    /// T9-2: `set_broker_dial_target` overwrites an SLMP plan's `host`/`port`
-    /// (used purely so `Collector::apply_config`'s `PartialEq` diff notices a
-    /// resolved-target change and respawns the connection's task with a
-    /// fresh `ClientFactory` - see the method's own doc comment for the full
-    /// derivation), leaves a non-matching key and a non-SLMP plan untouched,
-    /// and is a silent no-op for an absent key.
+    /// T9-2: `set_broker_dial_target` overwrites a broker-routed plan's
+    /// `host`/`port` (used purely so `Collector::apply_config`'s `PartialEq`
+    /// diff notices a resolved-target change and respawns the connection's
+    /// task with a fresh `ClientFactory` - see the method's own doc comment
+    /// for the full derivation), leaves a non-matching key untouched, and is
+    /// a silent no-op for an absent key.
+    ///
+    /// #337 (2026-09-08): the Modbus plan is now stamped too - it used to be
+    /// asserted here as an explicit no-op, which stopped being correct once
+    /// Modbus collection reads became broker-routed (and therefore
+    /// `suppress_simulation_for`-suppressed, flattening away the natural
+    /// `simulation`-toggle diff signal the Modbus plan used to carry).
     #[tokio::test]
-    async fn set_broker_dial_target_overwrites_only_the_matching_slmp_plan() {
+    async fn set_broker_dial_target_overwrites_the_matching_broker_routed_plan() {
         let pool = registry().await;
         let plc_svc = PlcConnectionService::new(pool.clone());
 
@@ -1720,8 +1745,8 @@ mod tests {
         let modbus_key = format!("conn:{}", modbus_conn.id);
 
         config.set_broker_dial_target(&slmp_key, "127.0.0.1".to_string(), 19999);
-        // A non-SLMP plan and an absent key must both be silent no-ops.
         config.set_broker_dial_target(&modbus_key, "127.0.0.1".to_string(), 19998);
+        // An absent key must still be a silent no-op.
         config.set_broker_dial_target("conn:999999", "127.0.0.1".to_string(), 1);
 
         let slmp_plan = config
@@ -1741,8 +1766,8 @@ mod tests {
             .unwrap();
         match &modbus_plan.config {
             ProtocolConfig::ModbusTcp(cfg) => assert_eq!(
-                cfg.port, 502,
-                "a Modbus plan must be untouched by an SLMP-only target overwrite"
+                cfg.port, 19998,
+                "#337: a broker-routed Modbus plan is stamped just like an SLMP one"
             ),
             ProtocolConfig::Slmp(_) => panic!("expected ModbusTcp config"),
         }

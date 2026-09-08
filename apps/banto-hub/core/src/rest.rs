@@ -3560,10 +3560,20 @@ fn classify_plc_error(err: &PlcError, hint: Option<&str>) -> PlcConnectionTestEr
     }
 }
 
-/// Modbus TCP の接続テスト - 直接ダイヤルのみ(Modbusには broker/共有
-/// セッションの概念がない)。ポート/ユニットIDの範囲検証 →
+/// Modbus TCP の接続テスト - 直接ダイヤルのみ。ポート/ユニットIDの範囲検証 →
 /// `ModbusTcpClient::connect` → 保持レジスタ先頭1点の`read_batch` → 必ず
 /// `disconnect`、の順で行う。
+///
+/// **既知のギャップ(#337、2026-09-08)**: この doc は元々「Modbus には
+/// broker/共有セッションの概念がない」と書いていたが、#131 で Modbus TCP も
+/// broker 管理対象になり、#337 で収集読み取りまで同じセッションを通るように
+/// なったため、その前提はもう成り立たない。したがってこのテストは
+/// [`test_slmp_connection`]が持つ「既存 broker セッションを再利用し、2本目を
+/// ダイヤルしない」対策を持たないままであり、1対1接続しか受け付けない機器
+/// (オムロン KM-D1-ETN、#337 参照)に対して収集稼働中に接続テストを実行すると
+/// 失敗と誤診する。[`MODBUS_SESSION_HINT`]がその場合のヒント文言を添えるに
+/// 留まっている。SLMP と同じセッション再利用へ揃えるのは #337 のスコープ外
+/// として別途扱う。
 async fn test_modbus_connection(
     payload: &PlcConnectionTestPayload,
 ) -> (bool, Option<PlcConnectionTestError>) {

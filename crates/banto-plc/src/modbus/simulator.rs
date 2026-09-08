@@ -163,6 +163,21 @@ impl Simulator {
         self.state.lock().unwrap().hang = false;
     }
 
+    /// How many connections this simulator has accepted in total, including
+    /// ones that have since closed - the `connections` field is append-only
+    /// (see its own doc comment), so this counts sockets ever accepted, not
+    /// sockets currently open.
+    ///
+    /// Exists for banto-hub's #337 regression test (2026-09-08): a Modbus
+    /// connection must occupy exactly **one** socket while collecting, since
+    /// some real Modbus/TCP servers (オムロン KM-D1-ETN) accept only a single
+    /// client connection and drop any second one immediately. Counting
+    /// cumulative accepts is what makes that assertion meaningful - a
+    /// second, immediately-closed socket still shows up here.
+    pub fn connection_count(&self) -> usize {
+        self.connections.lock().unwrap().len()
+    }
+
     /// Stop accepting new connections and sever every connection already
     /// open, simulating a PLC power-cycle/network drop mid-session.
     /// Aborting each handler task drops its `TcpStream`, which closes the

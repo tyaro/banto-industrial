@@ -59,13 +59,15 @@
 //! この集合に無いものを `HubSessions::remove` する。この順序
 //! （collect タスク停止 → broker セッション削除）が逆転すると、まだ
 //! `read_batch` を呼んでいる `BrokerReadClient` の下でセッションが消える
-//! 危険がある - 詳細は `crate::broker_glue` のモジュール doc参照。この
-//! 削除同期の対象拡大は Modbus の**収集読み取り**を broker 経由にはしない
-//! （`crate::broker_glue::hub_client_factory`のモジュール doc「Read/write
-//! asymmetry for Modbus TCP」参照）- 書き込み・ステータス用セッションの
-//! ライフサイクル管理が対象なだけである。
+//! 危険がある - 詳細は `crate::broker_glue` のモジュール doc参照。#131 当時
+//! この対象拡大は「書き込み・ステータス用セッションのライフサイクル管理」
+//! だけを意味し、Modbus の**収集読み取り**は broker 経由ではなかったが、
+//! #337（2026-09-08）でその収集読み取りも broker セッションへ相乗りした
+//! ため、現在は SLMP と Modbus TCP で扱いが完全に同一である
+//! （`crate::broker_glue::hub_client_factory`の doc comment 参照）。
 //!
-//! ## SLMP 接続単位のシミュレーションモード（T9-2、2026-08-06/07）
+//! ## 接続単位のシミュレーションモード（T9-2、2026-08-06/07。#337 で
+//! Modbus TCP にも同じ扱いが及ぶ）
 //!
 //! `crate::broker_glue::SlmpSimRegistry`（`sim_registry` フィールド）は
 //! `sessions`（`HubSessions`）と対の、`CollectorManager` の外で構築・生存する
@@ -79,19 +81,22 @@
 //! `ensure_connection` して古いセッションの使い回しを防ぐ（#131、
 //! 2026-09-01 以降この resolve/ensure_connection 自体は Modbus TCP 接続にも
 //! 及ぶ - `sync_slmp_sessions_from`のモジュール doc参照）。[`Self::rebuild`]
-//! はさらに、`sync_slmp_sessions_from`の第4戻り値（SLMP 接続キーだけに
-//! 絞った狭い集合 - **broker が担当した接続キー全体ではない**、下記参照）を
+//! はさらに、`sync_slmp_sessions_from`の第4戻り値（`read_routed_keys` =
+//! *収集読み取り*が broker 経由になっている接続キーの集合）を
 //! `banto_collect::CollectorConfig::suppress_simulation_for` に渡し、
 //! `Collector` 自身が同じ接続に対して二重にシミュレータを起動しないようにする
 //! （`crates/banto-collect/src/config.rs`の`suppress_simulation_for`の doc
-//! comment参照）。#131 でこの絞り込みが必須になった: Modbus TCP 接続の
-//! *収集読み取り*は broker 経由にならず（`hub_client_factory`のモジュール
-//! doc「Read/write asymmetry for Modbus TCP」参照）引き続き`Collector`自身の
-//! `ModbusTcpClient`が使うため、`simulation = true`な Modbus 接続をこの
-//! suppress 対象に含めてしまうと、その接続の収集読み取りだけが
-//! `Collector`自身のシミュレータ起動を抑制されて実機（大抵は開発/テスト
-//! 環境では到達不能）へダイヤルしてしまう - 書き込み側は正しくシミュレータへ
-//! 向くのに読み取り側だけ壊れる、という回帰になる。
+//! comment参照）。#131 では、この集合を SLMP だけに絞ることが必須だった:
+//! 当時 Modbus TCP 接続の*収集読み取り*は broker 経由にならず`Collector`自身の
+//! `ModbusTcpClient`が使っていたため、`simulation = true`な Modbus 接続を
+//! suppress 対象に含めると、読み取りだけがシミュレータ起動を抑制されて実機
+//! （大抵は開発/テスト環境では到達不能）へダイヤルしてしまうからである。
+//! **#337（2026-09-08）でその絞り込みは不要になった**: Modbus の収集読み取りも
+//! broker セッション経由になり、`SlmpSimRegistry::resolve`が Modbus 用の
+//! シミュレータを起動する（#131 以降）ので、`Collector`側のシミュレータを
+//! 止めるのがむしろ正しい。現在 `read_routed_keys` は
+//! `sync_slmp_sessions_from` が `slmp_handles` から導出する（二度と食い違わ
+//! ないように、独立に積み上げない）- 同 fn の doc comment 参照。
 //!
 //! **ここまでだけでは実は不十分**（自前の E2E テスト
 //! `apps/banto-hub/core/tests/t9_simulation.rs`で発覚）: `simulation`を
@@ -171,11 +176,13 @@
 //! フィールド）を保持する - **`CollectorManager` の外**（`bin/banto-hub.rs`）
 //! で構築・生存する共有 `Arc` で、`rebuild` を跨いでも SLMP セッションが
 //! 切れない。`rebuild` は毎回 [`CollectorManager::sync_slmp_sessions`] で
-//! レジストリの現在の SLMP 接続集合を `sessions` に
+//! レジストリの現在の broker 管理対象接続集合を `sessions` に
 //! `ensure_connection`（新規なら起動・既存ならそのまま）し、得た
-//! ハンドル群を `crate::broker_glue::hub_client_factory` に渡す - SLMP 接続は
-//! [`crate::broker_glue::BrokerReadClient`]、Modbus 接続は従来どおりの
-//! 直接クライアントで読む。旧 T0〜T6 の全体再構築方式では「新旧 `Collector`
+//! ハンドル群を `crate::broker_glue::hub_client_factory` に渡す - broker
+//! 管理対象の接続（SLMP、および #337 以降は Modbus TCP）は
+//! [`crate::broker_glue::BrokerReadClient`] で、その共有セッションを通して
+//! 読む（セッションが張れなかった接続だけが防御的に直接クライアントへ
+//! フォールバックする）。旧 T0〜T6 の全体再構築方式では「新旧 `Collector`
 //! が同じ PLC へ同時にソケットを張る瞬間」を SLMP について解消する役目も
 //! 兼ねていたが、T7 の部分適用移行後は新旧 `Collector` という概念自体が
 //! 無くなったため、この節の主眼は「broker セッションの追加+削除の完全同期」
@@ -1034,26 +1041,25 @@ impl CollectorManager {
         let (slmp_handles, stale_slmp_ids, resolved_slmp_targets, read_routed_keys) =
             self.sync_slmp_sessions_from(&snapshot).await;
 
-        // T9-2/#131: `read_routed_keys` (the fourth return value) is
-        // deliberately narrower than `slmp_handles.keys()` - it is only the
-        // connections whose *collection reads* are broker-routed (SLMP
-        // today), whose dial target `Self::sync_slmp_sessions_from` already
-        // resolved (simulator substitution included, via
-        // `SlmpSimRegistry::resolve`) before `ensure_connection` ran. Telling
-        // `Collector` to treat these as `simulation = false` stops it from
-        // starting a second, redundant in-process simulator for a connection
-        // `SlmpSimRegistry` already simulates - see
-        // `CollectorConfig::suppress_simulation_for`'s doc comment
-        // (`crates/banto-collect/src/config.rs`) and this module's doc
-        // comment ("SLMP 接続単位のシミュレーションモード") for the full
-        // derivation, including why passing the WIDER `slmp_handles.keys()`
-        // here (which as of #131 also contains Modbus connection keys) would
-        // be a bug: a Modbus connection's collection reads are not
-        // broker-routed, so suppressing `Collector`'s own simulator for one
-        // would leave it dialing the real, generally-unreachable host/port.
+        // T9-2/#131/#337: `read_routed_keys` (the fourth return value) is
+        // the set of connections whose *collection reads* are broker-routed,
+        // whose dial target `Self::sync_slmp_sessions_from` already resolved
+        // (simulator substitution included, via `SlmpSimRegistry::resolve`)
+        // before `ensure_connection` ran. Telling `Collector` to treat these
+        // as `simulation = false` stops it from starting a second, redundant
+        // in-process simulator for a connection `SlmpSimRegistry` already
+        // simulates - see `CollectorConfig::suppress_simulation_for`'s doc
+        // comment (`crates/banto-collect/src/config.rs`) and this module's
+        // doc comment ("接続単位のシミュレーションモード") for the full
+        // derivation. Under #131 this set was deliberately narrower than
+        // `slmp_handles.keys()` (SLMP only, because Modbus reads were not
+        // broker-routed); since #337 they coincide, and
+        // `sync_slmp_sessions_from` derives this one from `slmp_handles`
+        // precisely so the two cannot drift apart again - see that fn's
+        // `read_routed_keys` doc paragraph.
         config.suppress_simulation_for(&read_routed_keys);
 
-        // T9-2: also stamp each broker-routed SLMP plan with the SAME
+        // T9-2: also stamp each broker-routed connection plan with the SAME
         // resolved dial target `sync_slmp_sessions` just used, so a
         // simulation toggle (or a simulator restart, or an in-place host/port
         // edit) that actually moved the broker session makes `apply_config`'s
@@ -1199,13 +1205,14 @@ impl CollectorManager {
     /// `self.sessions` still tracks that are NOT in that set (deleted from
     /// the registry, disabled, or changed to a protocol the broker no longer
     /// manages), resolved dial targets, and (see the fourth return value's
-    /// own doc paragraph below) a narrower read-routed subset. Widening this
-    /// past SLMP does NOT move a Modbus connection's *collection reads* onto
-    /// the broker - those stay on banto-collect's own direct `ModbusTcpClient`
-    /// (`crate::broker_glue::hub_client_factory`'s doc comment, "Read/write
-    /// asymmetry for Modbus TCP") - this fn's widened scope is what makes a
-    /// Modbus connection's *writes* (`crate::write_path`) and *status*
-    /// (`Self::broker_status`) broker-routed. See
+    /// own doc paragraph below) the read-routed subset. Widening this past
+    /// SLMP is what made a Modbus connection's *writes*
+    /// (`crate::write_path`) and *status* (`Self::broker_status`)
+    /// broker-routed under #131; **#337 (2026-09-08)** then moved a Modbus
+    /// connection's *collection reads* onto the same session too
+    /// (`crate::broker_glue::hub_client_factory`'s doc comment), so the
+    /// read-routed subset is no longer narrower than the handle map - see the
+    /// fourth return value's own doc paragraph. See
     /// `crate::broker_glue::HubSessions`'s doc comment
     /// ("Session sync policy") for the full T7-2 policy this implements.
     ///
@@ -1267,24 +1274,48 @@ impl CollectorManager {
     /// `CollectorConfig::set_broker_dial_target`'s own doc comment for the
     /// full derivation (found necessary by this crate's own E2E coverage of
     /// the toggle path, `apps/banto-hub/core/tests/t9_simulation.rs`).
-    /// `set_broker_dial_target` itself only ever mutates an SLMP plan (no-op
-    /// for Modbus - see that fn's own doc comment), so this entry is
-    /// harmless-but-unused for a Modbus connection's plan; it is still
-    /// collected uniformly for every broker-routed connection here because
-    /// this fn's job is resolving dial targets, not deciding who consumes
-    /// them.
+    /// `set_broker_dial_target` used to mutate SLMP plans only, which was
+    /// correct while a Modbus plan's `simulation` flag still varied across a
+    /// toggle (it was never suppressed, so `apply_config`'s diff noticed the
+    /// toggle on its own). #337 made Modbus reads broker-routed and therefore
+    /// `suppress_simulation_for`-suppressed too, which flattened that signal
+    /// away - so `set_broker_dial_target` now stamps a Modbus plan as well
+    /// (see that fn's own doc comment).
     ///
-    /// **T9-2 fourth return value (#131, 2026-09-01)**: `read_routed_ids` is
-    /// a narrower subset of the wanted-connection set (see below) - only the
-    /// ids whose *collection reads* are actually broker-routed today, which
-    /// is `protocol == "slmp"` specifically, not every protocol this
-    /// function otherwise treats uniformly (session sync, dial-target
-    /// resolution, simulator substitution). [`Self::rebuild`]/[`Self::apply_run`]
-    /// feed *this* narrower set into
-    /// `banto_collect::CollectorConfig::suppress_simulation_for`, NOT the
-    /// full `handles.keys()` set - see this fn's protocol-filter comment
-    /// below for why conflating the two would silently break a simulated
-    /// Modbus connection's collection reads.
+    /// **T9-2 fourth return value (`read_routed_keys`; #131 2026-09-01,
+    /// reworked by #337 2026-09-08)**: the connection keys whose *collection
+    /// reads* are broker-routed - the set [`Self::rebuild`]/[`Self::apply_run`]
+    /// feed into `banto_collect::CollectorConfig::suppress_simulation_for`
+    /// ("something else already substitutes this connection's simulator,
+    /// stand down your own").
+    ///
+    /// Under #131 this was strictly narrower than `handles.keys()`: it was
+    /// accumulated with a direct `protocol == "slmp"` check, because a Modbus
+    /// connection held a broker session for writes/status while its reads
+    /// stayed on banto-collect's own direct `ModbusTcpClient`. #337 moved
+    /// Modbus reads onto the broker session too
+    /// (`crate::broker_glue::hub_client_factory`), so "holds a broker
+    /// session" and "reads through the broker" are now the same set, and
+    /// this value is **derived from `handles`** at the end of this fn instead
+    /// of accumulated alongside it.
+    ///
+    /// It is still returned as its own value rather than having the callers
+    /// write `handles.keys()` themselves, because the two answer different
+    /// questions - "which sessions did this sync establish" vs. "whose
+    /// simulator must `Collector` stand down for" - and only this fn is in a
+    /// position to say that they currently coincide. Deriving one from the
+    /// other (rather than building both) is what makes the coincidence
+    /// structural instead of a rule two loops have to keep agreeing on.
+    ///
+    /// Deriving it from `handles` also closes a latent hole in the accumulate
+    /// version: a key was inserted *before* `ensure_connection` ran, so a
+    /// connection whose session failed to spawn was still reported
+    /// read-routed even though `hub_client_factory` would fall back to a
+    /// direct client for it - a `simulation = true` connection in that state
+    /// had `Collector`'s own simulator suppressed and dialed its real
+    /// host/port. `handles` only contains connections whose
+    /// `ensure_connection` actually succeeded, which is exactly the condition
+    /// `hub_client_factory` routes on.
     ///
     /// **T19 S2-a (UX-48, docs/banto-hub-t19-design.md §3.8)**: a connection
     /// with nothing to collect - no *enabled* [`banto_tags::CollectionGroup`]
@@ -1340,7 +1371,6 @@ impl CollectorManager {
         let mut handles = HashMap::new();
         let mut resolved_targets = HashMap::new();
         let mut wanted_ids: HashSet<i64> = HashSet::new();
-        let mut read_routed_keys: HashSet<String> = HashSet::new();
         // T19 S2-a (UX-48): see this fn's own doc comment above - the same
         // predicate `build_config_from` uses to decide "does this connection
         // have anything to collect", shared via banto-collect so the two
@@ -1349,11 +1379,12 @@ impl CollectorManager {
         // #131 (2026-09-01): every connection whose protocol the broker has a
         // driver for - not just SLMP - gets a session synced here (needed for
         // write/status routing, `crate::write_path`/`CollectorManager::broker_status`).
-        // `hub_client_factory`'s own doc comment ("Read/write asymmetry for
-        // Modbus TCP") is the cross-reference for why this widening does NOT
-        // mean a Modbus connection's *collection reads* moved onto the
-        // broker too - they have not; see the `read_routed_keys` comment
-        // below for the one place that distinction still matters.
+        // #337 (2026-09-08) removed the one remaining exception: a Modbus
+        // connection's *collection reads* now go through this same session
+        // too, so "the broker manages this protocol" and "this connection's
+        // reads are broker-routed" have become one and the same question -
+        // see this fn's `read_routed_keys` doc paragraph and
+        // `crate::broker_glue::hub_client_factory`'s doc comment.
         for conn in snapshot.connections.iter().filter(|c| {
             c.enabled
                 && is_supported_protocol(&c.protocol)
@@ -1373,28 +1404,29 @@ impl CollectorManager {
             let key = format!("conn:{}", conn.id);
             resolved_targets.insert(key.clone(), (host.clone(), port));
 
-            // Deliberately a direct `"slmp"` string check, NOT
-            // `is_supported_protocol` (the filter above): this is asking a
-            // strictly narrower question - "is THIS connection's collection
-            // *read* path broker-routed" - which today is true only for
-            // SLMP. `hub_client_factory`'s `ModbusTcp` arm still calls
-            // banto-collect's own direct `ModbusTcpClient` for reads (#131
-            // did not move Modbus reads onto the broker, only writes/status),
-            // so a Modbus connection must NOT end up in the set
-            // `Self::rebuild`/`Self::apply_run` feed into
-            // `CollectorConfig::suppress_simulation_for` - that call tells
+            // #337 (2026-09-08): there used to be a `if conn.protocol ==
+            // "slmp"` filter here, deliberately narrower than the
+            // `is_supported_protocol` filter above, building a separate
+            // `read_routed_keys` set. Its reason: `hub_client_factory`'s
+            // `ModbusTcp` arm read through banto-collect's own direct
+            // `ModbusTcpClient` (#131 moved only Modbus writes/status onto
+            // the broker), so putting a Modbus key into the set
+            // `Self::rebuild`/`Self::apply_run` feed to
+            // `CollectorConfig::suppress_simulation_for` - which tells
             // `Collector` "something else already handles this connection's
-            // simulation, stand down your own simulator". If a Modbus
-            // connection were included here, a `simulation = true` Modbus
-            // connection's *writes* would correctly reach the in-process
-            // simulator (via `SlmpSimRegistry`/the broker session above),
-            // while its *collection reads* would have `Collector`'s own
-            // simulator start suppressed and try to dial the connection's
-            // real (and, in dev/test, generally unreachable) host/port
-            // instead - a real regression this direct check exists to avoid.
-            if conn.protocol == "slmp" {
-                read_routed_keys.insert(key.clone());
-            }
+            // simulation, stand down your own simulator" - would have left a
+            // `simulation = true` Modbus connection's reads dialing the real
+            // (in dev/test, unreachable) host while only its writes reached
+            // the in-process simulator.
+            //
+            // That reason is gone: #337 routes Modbus collection reads
+            // through the broker session too, and
+            // `crate::broker_glue::SlmpSimRegistry::resolve` has started a
+            // Modbus-flavoured simulator for such a connection since #131 -
+            // so suppressing `Collector`'s own simulator is now exactly the
+            // right thing for Modbus as well. The set is therefore no longer
+            // accumulated here at all; it is derived from `handles` below,
+            // which is what actually decides read routing.
 
             let dial_conn = PlcConnection {
                 host,
@@ -1427,6 +1459,12 @@ impl CollectorManager {
             .into_iter()
             .filter(|id| !wanted_ids.contains(id))
             .collect();
+
+        // #337: derived from `handles`, never accumulated separately - see
+        // this fn's `read_routed_keys` doc paragraph for why deriving is what
+        // keeps the two sets from drifting, and why a connection whose
+        // `ensure_connection` failed above must be excluded.
+        let read_routed_keys: HashSet<String> = handles.keys().cloned().collect();
 
         (handles, stale_ids, resolved_targets, read_routed_keys)
     }
@@ -1520,10 +1558,10 @@ impl CollectorManager {
     /// （`ReadOnlyHandle`、`banto_collect::PlcClient` 経由）のと対称的に、
     /// こちらは書き込み可能なフル `BrokerHandle` をそのまま返す（SLMP は
     /// 収集と書き込みが同じ物理セッションを通る、というのがこの broker
-    /// 統合方針の核心 - 設計 §6 item 5。Modbus TCP は#131以降、書き込みは
-    /// この同じセッションを通るが、収集読み取りは引き続き別の直接
-    /// クライアント - `crate::broker_glue::hub_client_factory`のモジュール
-    /// doc「Read/write asymmetry for Modbus TCP」参照）。
+    /// 統合方針の核心 - 設計 §6 item 5。Modbus TCP は #131 で書き込みが、
+    /// #337（2026-09-08）で収集読み取りもこの同じセッションを通るように
+    /// なり、現在は SLMP と完全に同じ扱いである -
+    /// `crate::broker_glue::hub_client_factory`の doc comment 参照）。
     ///
     /// `HubSessions::ensure_connection` は冪等（既存セッションがあれば
     /// それをそのまま返す）なので、直近の `rebuild` が既に確保済みの
@@ -1689,9 +1727,9 @@ impl CollectorManager {
 
         let (slmp_handles, stale_slmp_ids, resolved_slmp_targets, read_routed_keys) =
             self.sync_slmp_sessions_from(&runtime_snapshot).await;
-        // See `Self::rebuild`'s matching call for why this must be the
-        // narrower `read_routed_keys`, not `slmp_handles.keys()` (#131,
-        // Modbus regression this narrowing avoids).
+        // See `Self::rebuild`'s matching call for what `read_routed_keys` is
+        // and why it is `sync_slmp_sessions_from`'s job to derive it (#131's
+        // narrowing, reworked by #337).
         config.suppress_simulation_for(&read_routed_keys);
         for (key, (host, port)) in &resolved_slmp_targets {
             config.set_broker_dial_target(key, host.clone(), *port);
@@ -1922,13 +1960,10 @@ impl CollectorManager {
     /// session (this module's doc comment, "SLMP broker セッションの削除
     /// 同期"). This fn never touches the `Collector` at all (that is the
     /// whole point - it must not disturb a run that is not being
-    /// restarted), so that ordering guarantee does not hold here: if the
-    /// connection whose last enabled group was just removed is an SLMP
-    /// connection (the one protocol whose *collection reads* are
-    /// broker-routed - see [`Self::sync_slmp_sessions_from`]'s
-    /// `read_routed_keys` doc paragraph), a still-running collect task from
-    /// the PREVIOUS `apply_run` may still be reading through the very
-    /// session this removes. That read would then fail (an ordinary
+    /// restarted), so that ordering guarantee does not hold here: for a
+    /// connection whose last enabled group was just removed, a still-running
+    /// collect task from the PREVIOUS `apply_run` may still be reading
+    /// through the very session this removes. That read would then fail (an ordinary
     /// reconnect/backoff cycle - `banto_broker::BrokerError::Disconnected`
     /// on the next `read_batch` - not a panic, and not the write-path hazard
     /// the paragraph above guards against) until the next `apply_run`/
@@ -1939,12 +1974,14 @@ impl CollectorManager {
     /// writes advance the configured revision only"), and closing it fully
     /// would require this fn to also drive `apply_config`, i.e. become a
     /// second `apply_run` - out of scope for 案B, which targets the write
-    /// path specifically. A Modbus TCP connection (today's other
-    /// broker-managed protocol) never hits this gap at all - its collection
-    /// reads stay on `banto-collect`'s own direct `ModbusTcpClient`
-    /// regardless of this fn's broker-session bookkeeping
-    /// (`crate::broker_glue::hub_client_factory`'s "Read/write asymmetry
-    /// for Modbus TCP").
+    /// path specifically. **#337 (2026-09-08) widened who can hit this gap**:
+    /// this paragraph used to exempt Modbus TCP connections, whose collection
+    /// reads stayed on `banto-collect`'s own direct `ModbusTcpClient`
+    /// regardless of this fn's broker-session bookkeeping. Since #337 their
+    /// reads go through the broker session as well
+    /// (`crate::broker_glue::hub_client_factory`), so a Modbus connection now
+    /// behaves exactly like an SLMP one here - same narrow, self-healing
+    /// window, same accepted reasoning.
     pub(crate) async fn resync_broker_sessions(
         &self,
         snapshot: &RegistrySnapshot,

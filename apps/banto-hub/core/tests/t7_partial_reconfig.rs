@@ -793,11 +793,10 @@ async fn deleting_a_connection_untracks_its_broker_session_and_leaves_others_run
     // broker session for every connection whose protocol
     // `banto_broker::is_supported_protocol` covers - `"slmp"` (B) AND
     // `"modbus-tcp"` (A) - not SLMP alone as when this test (and its literal
-    // "for B" assertion) was written. A's session exists purely for
-    // write/status routing (its *collection reads* still go through
-    // banto-collect's own direct `ModbusTcpClient`, unaffected - see
-    // `crate::broker_glue::hub_client_factory`'s doc comment), so this count
-    // is now 2, not 1.
+    // "for B" assertion) was written, so this count is now 2, not 1. A's
+    // session started out (#131) as write/status routing only; since #337
+    // (2026-09-08) its collection reads share that same session too - see
+    // `banto_hub_core::broker_glue::hub_client_factory`'s doc comment.
     assert_eq!(
         app.sessions.connection_count(),
         2,

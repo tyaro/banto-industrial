@@ -288,9 +288,10 @@ impl Collector {
     /// Modbus/SLMP construction (T2-2, docs/tag-server-design.md §6-5: "hub
     /// が SLMP 接続の読み取りを broker アダプタへ差し替えるための注入口。既定は
     /// 従来どおりの直接クライアント"). banto-hub's `CollectorManager` calls this
-    /// directly with a factory that routes SLMP connections through
-    /// `banto_broker` (see `apps/banto-hub/core/src/broker_glue.rs`) while
-    /// leaving Modbus connections on the default client - see
+    /// directly with a factory that routes broker-managed connections through
+    /// `banto_broker` (see `apps/banto-hub/core/src/broker_glue.rs`) - SLMP
+    /// since T2-2, and Modbus TCP too since #337 (2026-09-08), leaving only
+    /// connections without a broker session on the default client - see
     /// [`crate::task::ClientFactory`]'s doc comment for the seam's exact
     /// contract (called once per connect attempt, receives a [`crate::task::ClientSpec`]
     /// with every field the pre-T2-2 hardcoded dispatch used).

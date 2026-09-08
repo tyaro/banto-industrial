@@ -246,11 +246,14 @@ S2-c2 の実装後に改めて判断する。
 張り直してしまう」という T15-4 と同型のレースを再導入しかねない - `resync_sessions_for_catalog_change`
 がまさにこれを防ぐために `transition` ロックを使う設計になっている（詳細は同メソッドの doc comment、
 `apps/banto-hub/core/src/controller.rs`）。**唯一の既知の残存ギャップ**: この resync は稼働中の
-`Collector` 本体には一切触れないため、SLMP 接続（収集読み取りが broker 経由の唯一のプロトコル）で
+`Collector` 本体には一切触れないため、収集読み取りが broker 経由の接続で
 最後の有効グループが消えたタイミングでは、旧設定のまま読み取りを続けている collect タスクが読んでいる
 セッションを止めてしまう可能性がある（read エラーとして現れ、次の rebuild/apply_run で自己解消する -
-パニックや書き込み側のハザードではない）。Modbus TCP 接続はこの影響を受けない（収集読み取りは
-broker を経由しないため）。詳細は `CollectorManager::resync_broker_sessions` の doc comment参照。
+パニックや書き込み側のハザードではない）。**2026-09-08 追記（issue #337）**: 当初この段落は
+「SLMP 接続（収集読み取りが broker 経由の唯一のプロトコル）」と書き、Modbus TCP 接続は収集読み取りが
+broker を経由しないためこの影響を受けない、としていた。#337 で Modbus TCP の収集読み取りも broker
+セッションへ相乗りしたため、現在は Modbus TCP 接続も SLMP と同じくこの残存ギャップの対象である
+（性質・自己解消の仕方も同じ）。詳細は `CollectorManager::resync_broker_sessions` の doc comment参照。
 
 **S2-b（UX-38、§3.4・§7.5）: 完了（2026-09-03）。** 当初案の「既存の
 `delete`/`delete_tx`（拒否）を書き換える」ではなく、**新しいメソッド
