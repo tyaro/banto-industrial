@@ -1076,3 +1076,78 @@ async fn status_reports_plausible_system_cpu_and_memory() {
         "host used memory ({host_used}) must not exceed total ({host_total})"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #337 (2026-09-08): Modbus TCP 接続は収集中も**ソケット1本**しか使わない。
+//
+// 顛末: #131 で Modbus TCP の書き込み/ステータスが broker セッション経由に
+// なった一方、*収集読み取り*だけは banto-collect の直結 `ModbusTcpClient`
+// のままだったため、収集を開始した Modbus 接続は「broker セッション1本 +
+// 収集用の直結1本」の**2本**を張っていた。「多くの Modbus TCP サーバは
+// 同時接続を許す」という当時の前提は、許さない機器では機能不全になる:
+// オムロン KM-D1-ETN 電力量モニタ（マニュアル KANC-718B 12-1）は1対1接続
+// しか受け付けず、実機では broker セッションが先に張られたまま12秒無通信で
+// 居座り、収集用の2本目が即切断され、以後1秒ごとに再接続→即切断を繰り返して
+// 全タグが Bad のままになった（TCP プロキシで観測）。
+//
+// 修正（案1、2026-09-08 オーナー決定、docs/tag-server-design.md §6-5）は
+// Modbus の収集読み取りも SLMP と同様 broker セッションへ相乗りさせること。
+// このテストはその結果を固定する: 「収集が実際に成立している（値が Good で
+// 取れている）状態で、シミュレータが受理した接続は累計1本だけ」。値が取れる
+// ところまで待つのが重要 - 接続0本でも「1本より少ない」は成立してしまうので、
+// 「収集が成立したうえで1本」でなければ回帰を捕まえられない。
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn modbus_collection_uses_exactly_one_socket() {
+    let app = test_app("modbus-single-socket").await;
+    let sim = Simulator::start().await;
+    sim.set_holding_register(0, 4321); // 40001
+
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(conn_input("line1", sim.addr.port()))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group.id, "40001", "i16"))
+        .await
+        .unwrap();
+
+    app.manager.rebuild().await.expect("rebuild after seeding");
+
+    // 収集が実際に成立していること（= 少なくとも1本は張られ、読めている）。
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            app.manager
+                .current_values()
+                .and_then(|c| c.get("tag:1"))
+                .map(|s| s.value)
+                == Some(Some(4321.0))
+        })
+        .await,
+        "collector should observe the simulator value through the broker session"
+    );
+
+    // broker セッションもこの接続について確かに1本張られている（=「収集用
+    // 1本だけで、broker が張っていない」という別の壊れ方でも通ってしまう
+    // ことを防ぐ）。
+    assert_eq!(
+        app.sessions.connection_count(),
+        1,
+        "the Modbus connection should have exactly one broker session"
+    );
+
+    // 本命: シミュレータが受理した接続の累計が1本。修正前はここが 2 になる
+    // （broker セッション + 収集用の直結クライアント）。
+    assert_eq!(
+        sim.connection_count(),
+        1,
+        "a collecting Modbus connection must occupy exactly one socket (#337)"
+    );
+
+    sim.stop();
+}

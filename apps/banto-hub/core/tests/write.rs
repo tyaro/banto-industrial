@@ -525,15 +525,17 @@ async fn e2e_write_then_collection_reads_the_value_back_through_the_same_broker_
 //    proves banto-broker's new "modbus-tcp" driver actually lets a Modbus
 //    connection's writable tag be written through
 //    POST /api/v1/values/{tag}, landing on the wire via
-//    `banto_plc_write::modbus::simulator::Simulator`. Unlike the SLMP test
-//    above, Modbus reads stay on banto-collect's own direct `ModbusTcpClient`
-//    (`crate::broker_glue::hub_client_factory`'s doc comment, "Read/write
-//    asymmetry for Modbus TCP") - the collection read-back below still
-//    succeeds because both the broker's write socket and banto-collect's own
-//    read socket dial the SAME external simulator process, just over two
-//    independent TCP connections (the accepted tradeoff docs/tag-server-design.md
-//    §6 item 5 documents for Modbus, in contrast to SLMP's single shared
-//    session).
+//    `banto_plc_write::modbus::simulator::Simulator`. #131 left Modbus reads
+//    on banto-collect's own direct `ModbusTcpClient`, so the collection
+//    read-back below used to travel over a SECOND socket to the same external
+//    simulator process (the two-socket tradeoff docs/tag-server-design.md §6
+//    item 5 accepted at the time). **#337 (2026-09-08) reversed that**: reads
+//    and writes now share the one broker session, exactly like the SLMP test
+//    above, so this test is now a genuine "読み書き単一セッション" round trip
+//    for Modbus too (see `banto_hub_core::broker_glue::hub_client_factory`'s
+//    doc comment, and `tests/integration.rs`'s
+//    `modbus_collection_uses_exactly_one_socket` for the socket-count
+//    assertion itself).
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -580,11 +582,10 @@ async fn e2e_modbus_write_then_collection_reads_the_value_back() {
         "value must land on the wire (via the broker's modbus-tcp driver)"
     );
 
-    // 収集(banto-collect の直接 ModbusTcpClient、broker とは別ソケット)が
-    // 同じシミュレータから読み戻すことの確認 - Modbus は読み取りが broker
-    // 経由にならない、という #131 のスコープ境界を裏側から裏づける
-    // (書き込みは broker、読み取りは直接クライアントの、別々のソケット
-    // 経由で、どちらも同じ実体を見ている)。
+    // 収集が同じシミュレータから読み戻すことの確認。#131 当時これは
+    // 「書き込みは broker、読み取りは直接クライアント」の別々のソケット
+    // 経由だったが、#337(2026-09-08)以降は同じ broker セッション1本を
+    // 共有する - SLMP と同じ「読み書き単一セッション」の往復になった。
     let tag_key = format!("tag:{tag_id}");
     assert!(
         wait_until(Duration::from_secs(10), || async {

@@ -45,8 +45,11 @@
 //! ## SLMP + banto-hub の broker 経路について(T9-2 で実装済み)
 //!
 //! T9-1 の時点でこのモジュールがカバーしていたのは(1)Modbus 接続
-//! (常に直接クライアント、broker を経由しない)と(2)banto-hub の broker を
-//! 経由しない SLMP 接続(このクレート単体・将来の非 hub コンシューマ)のみで、
+//! (当時は常に直接クライアントで broker を経由しなかった - banto-hub では
+//! #337、2026-09-08 で Modbus の収集読み取りも broker 経由になったため、
+//! 現在この(1)に該当するのは非 hub コンシューマだけである)と(2)banto-hub の
+//! broker を経由しない SLMP 接続(このクレート単体・将来の非 hub
+//! コンシューマ)のみで、
 //! hub の broker 経由 SLMP 接続(`HubSessions::ensure_connection`)は
 //! `CollectorManager::rebuild`の中で`Collector::apply_config`より*前*に
 //! セッションを確立するため、この`Collector`が起動するシミュレータの

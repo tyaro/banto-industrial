@@ -16,9 +16,12 @@
 //! 3. SLMP 成功(直接ダイヤル、connectionId なし)
 //! 4. SLMP 成功(broker 経由の既存セッション再利用、2本目をダイヤルしない
 //!    ことを`connection_count()`の不変性で確認)
-//! 5. virtual 拒否
-//! 6. simulation 拒否
-//! 7. 権限(viewer は 403、CSRF ヘッダ無しは拒否)
+//! 5. Modbus 成功(broker 経由の既存セッション再利用、2本目のソケットを
+//!    張らないことを`banto_plc::modbus::simulator::Simulator::connection_count()`
+//!    の不変性で確認 - #337、2026-09-08 オーナー決定)
+//! 6. virtual 拒否
+//! 7. simulation 拒否
+//! 8. 権限(viewer は 403、CSRF ヘッダ無しは拒否)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -81,6 +84,25 @@ fn slmp_conn_input(name: &str, port: u16) -> PlcConnectionInput {
     PlcConnectionInput {
         name: name.to_string(),
         protocol: "slmp".to_string(),
+        host: "127.0.0.1".to_string(),
+        port: port as i64,
+        unit_id: 1,
+        enabled: true,
+        simulation: false,
+
+        word_order: "low_high".to_string(),
+        database: None,
+        username: None,
+        password: None,
+    }
+}
+
+/// [`slmp_conn_input`]の Modbus TCP 版(`tests/integration.rs`の`conn_input`と
+/// 同じ形) - ケース5(broker セッション再利用)で収集を成立させるために使う。
+fn modbus_conn_input(name: &str, port: u16) -> PlcConnectionInput {
+    PlcConnectionInput {
+        name: name.to_string(),
+        protocol: "modbus-tcp".to_string(),
         host: "127.0.0.1".to_string(),
         port: port as i64,
         unit_id: 1,
@@ -484,7 +506,96 @@ async fn slmp_test_reuses_existing_broker_session_without_dialing_a_second_conne
 }
 
 // ---------------------------------------------------------------------------
-// 5. virtual 拒否
+// 5. Modbus 成功(broker 経由の既存セッション再利用、2本目のソケットを張らない)
+// ---------------------------------------------------------------------------
+
+/// #337(2026-09-08 オーナー決定): Modbus TCP の収集読み取りも broker
+/// セッションへ相乗りするようになり、Modbus も1接続=1ソケットになった。
+/// しかし接続テストボタン(`test_modbus_connection`)だけは既存 broker
+/// セッションを再利用せず毎回新規ダイヤルしていたため、KM-D1-ETN のような
+/// 1対1接続しか受け付けない機器では、収集稼働中に接続テストを押すと2本目が
+/// 拒否され、収集は正常なのに「失敗」と誤診断されていた。
+///
+/// このテストは「収集を実際に稼働させた状態(broker セッションが生きている
+/// 状態)で接続テストを実行しても、
+/// `banto_plc::modbus::simulator::Simulator::connection_count()`(累計受理
+/// ソケット数)が増えない」ことを直接確認する - `app.sessions.connection_count()`
+/// (ケース4の SLMP テストが使う broker 側の指標)は直結クライアントの
+/// ダイヤルを検出できないため、ここでは実ソケット数を数えるシミュレータ側の
+/// カウンタを使う([`tests/integration.rs`]の
+/// `modbus_collection_uses_exactly_one_socket`と同じ考え方)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn modbus_test_reuses_existing_broker_session_without_dialing_a_second_socket() {
+    let app = test_app("t12-modbus-broker-reuse").await;
+    let sim = ModbusSimulator::start().await;
+
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(modbus_conn_input("line1", sim.addr.port()))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group.id, "40001", "u16"))
+        .await
+        .unwrap();
+    app.manager.rebuild().await.expect("rebuild after seeding");
+
+    // broker セッションが実際に張られる(= 収集が稼働している)のを待つ
+    // (ケース4の SLMP テストと同じ手順)。
+    let mut status_watch = app
+        .sessions
+        .status_watch(conn.id)
+        .expect("a broker session should exist for this connection after rebuild");
+    status_watch
+        .wait_for(|s| *s == banto_broker::BrokerConnectionStatus::Connected)
+        .await
+        .expect("broker session should report Connected");
+
+    assert_eq!(
+        sim.connection_count(),
+        1,
+        "collection should hold one socket"
+    );
+
+    // 接続テストを実行 - `connectionId`を渡し、既存 broker セッションを
+    // 再利用させる。
+    let (status, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections/test",
+        &app.admin_token,
+        json!({
+            "protocol": "modbus-tcp",
+            "host": "127.0.0.1",
+            "port": sim.addr.port(),
+            "unitId": 1,
+            "simulation": false,
+            "connectionId": conn.id,
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], true, "{body:?}");
+    assert!(body["error"].is_null(), "{body:?}");
+
+    // 本命: シミュレータが受理した接続の累計が収集開始時のまま(1本)である
+    // こと。修正前はここが2になる(broker セッション + 接続テスト用の直結
+    // クライアント)。
+    assert_eq!(
+        sim.connection_count(),
+        1,
+        "the connection test must reuse the existing broker session, not open a second socket (#337)"
+    );
+
+    sim.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 6. virtual 拒否
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -506,7 +617,7 @@ async fn virtual_protocol_is_rejected_as_unsupported() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. simulation 拒否
+// 7. simulation 拒否
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -528,7 +639,7 @@ async fn simulation_flag_is_rejected_as_unsupported() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. 権限: viewer は 403、CSRF ヘッダ無しは拒否
+// 8. 権限: viewer は 403、CSRF ヘッダ無しは拒否
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

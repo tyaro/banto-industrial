@@ -34,11 +34,12 @@
 //!   （[`computed::ServerTagStore`]）。`hub::CollectorManager::rebuild` が
 //!   catalog/`Collector` と同じ all-or-nothing で式のコンパイル・DAG 検証
 //!   結果を commit する
-//! - [`broker_glue`]: T2-2（設計 §6-5）。SLMP 接続の収集読み取りを
+//! - [`broker_glue`]: T2-2（設計 §6-5）。broker 管理対象接続の収集読み取りを
 //!   `banto-broker`（I6）経由にするアダプタ（[`broker_glue::BrokerReadClient`]）
 //!   と、`CollectorManager` の外で生存するブローカーセッション directory
-//!   （[`broker_glue::HubSessions`]）。Modbus 接続は現行の直接クライアントの
-//!   まま
+//!   （[`broker_glue::HubSessions`]）。T2-2 当時は SLMP 専用で Modbus 接続は
+//!   直接クライアントのままだったが、#337（2026-09-08）で Modbus TCP の
+//!   収集読み取りも同じ broker セッションへ相乗りした（1接続 = 1ソケット）
 //! - [`events`]: 管理 UI の SSE 用 `banto_server::ServerEvent` チャンネル。
 //!   `banto_collect::CollectEvent` とは別物（そちらは `/api/v1/events` が
 //!   `collect_events` テーブルを直接読む）

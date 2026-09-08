@@ -1,7 +1,7 @@
 //! T9-2 フォローアップ（PR #43 監査指摘、2026-08-06 対応）: `hub.rs` の
 //! [`crate::hub::CollectorManager`] は、稼働中の SLMP シミュレーションモード
 //! 接続を知らせる警告（`log_simulation_warnings`）や `rebuild`/
-//! `sync_slmp_sessions` の診断ログを素の `println!`/`eprintln!` で出力して
+//! `sync_broker_sessions_from` の診断ログを素の `println!`/`eprintln!` で出力して
 //! いた - 当時 `hub_log`（`{data_dir}/banto-hub-service.log`へのミラー、
 //! `crate::hub_log` のモジュール doc 参照）は `bin/banto_hub` 側のバイナリ
 //! クレート限定で、ライブラリクレート `banto-hub-core` からは届かな
