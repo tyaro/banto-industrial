@@ -86,8 +86,9 @@
 //! broker-managed connection is not a lie exactly, but it answers a less
 //! useful question ("is banto-collect's own retry loop momentarily backing
 //! off") than the broker's status answers ("is the physical session up") -
-//! so `/api/v1/status` surfaces the broker's answer for SLMP connections,
-//! per the design decision this module implements.
+//! so `/api/v1/status` surfaces the broker's answer for every broker-managed
+//! connection (SLMP since T2-2, Modbus TCP since #131), per the design
+//! decision this module implements.
 //!
 //! ## T9-1/T9-2 note: SLMP simulation mode, wired via [`SlmpSimRegistry`]
 //!
@@ -299,7 +300,7 @@ impl PlcClient for BrokerReadClient {
 /// connection with zero enabled groups no longer falls in the wanted set, so
 /// it now goes through the exact same removal path described above the
 /// moment it stops qualifying - no new mechanism, just a narrower wanted
-/// set. See `CollectorManager::sync_slmp_sessions_from`'s doc comment for the
+/// set. See `CollectorManager::sync_broker_sessions_from`'s doc comment for the
 /// full derivation. **T19 S2-a 案B (2026-09-03)**: a tag added to a
 /// still-unsynced connection no longer has to wait for the next
 /// rebuild/apply_run to become writable - `crate::rest::commit_catalog_and_notify`
@@ -323,7 +324,8 @@ impl HubSessions {
     /// [`BrokerError::UnsupportedProtocol`], requires a connection to reject)
     /// and gives a real, empty [`SessionDirectory`] that
     /// [`Self::ensure_connection`] grows on demand as `CollectorManager`
-    /// discovers SLMP connections during its first (and every later) rebuild.
+    /// discovers broker-managed connections during its first (and every
+    /// later) rebuild.
     pub fn new(backoff: banto_broker::BackoffConfig) -> Self {
         let supervisor = BrokerSupervisor::spawn(&[], backoff)
             .expect("spawning a broker supervisor with zero connections cannot fail");
@@ -475,7 +477,7 @@ impl HubSessions {
 /// (`crates/banto-broker/src/lib.rs`)は接続 id だけで既存セッションを
 /// 再利用する - `conn.host`/`conn.port`を毎回読み直しはしない。したがって
 /// `simulation = true`への切り替えでシミュレータの実アドレスを知るのは
-/// `ensure_connection`を呼ぶ*前*でなければならない。`crate::hub::CollectorManager::sync_slmp_sessions`
+/// `ensure_connection`を呼ぶ*前*でなければならない。`crate::hub::CollectorManager::sync_broker_sessions_from`
 /// は接続ごとに [`Self::resolve`] を先に呼び、その結果(シミュレータの
 /// loopback アドレス、または実接続の host/port そのまま)を
 /// `ensure_connection`に渡す`banto_tags::PlcConnection`のコピーへ差し込む。
@@ -532,7 +534,7 @@ impl SlmpSimRegistry {
     /// (`if let Some(handle) = handles.get(&conn.id) { return Ok(handle.clone()); }`) -
     /// 既にその id のセッションが生きていれば、host/port が変わっていても
     /// 再ダイヤルも検知もしない。したがって呼び出し側
-    /// (`CollectorManager::sync_slmp_sessions`)は、`resolve`が
+    /// (`CollectorManager::sync_broker_sessions_from`)は、`resolve`が
     /// `changed == true`を返すたびに、`ensure_connection`を呼ぶ*前*に必ず
     /// [`HubSessions::remove`]`(conn.id)`を呼ばなければならない - そうしな
     /// ければ`ensure_connection`は同じ id の古いセッション(シミュレーション
@@ -634,10 +636,10 @@ impl Default for SlmpSimRegistry {
 /// `banto_collect::Collector::start_with_client_factory`: every
 /// broker-managed connection (looked up by
 /// `banto_collect::ClientSpec::connection_key`, the same `"conn:{id}"` key
-/// `slmp_handles` is keyed by - see `crate::hub::CollectorManager`'s
+/// `broker_handles` is keyed by - see `crate::hub::CollectorManager`'s
 /// session-sync step) gets a [`BrokerReadClient`] reading through that
 /// connection's shared broker session; only the defensive fallback for a
-/// connection somehow missing from `slmp_handles` gets banto-collect's own
+/// connection somehow missing from `broker_handles` gets banto-collect's own
 /// `default_client_factory` - the same direct `ModbusTcpClient`/`SlmpClient`
 /// construction every non-hub caller still gets.
 ///
@@ -679,14 +681,14 @@ impl Default for SlmpSimRegistry {
 /// Regression coverage: `apps/banto-hub/core/tests/integration.rs`'s
 /// `modbus_collection_uses_exactly_one_socket`.
 pub fn hub_client_factory(
-    slmp_handles: Arc<HashMap<String, ReadOnlyHandle>>,
+    broker_handles: Arc<HashMap<String, ReadOnlyHandle>>,
 ) -> banto_collect::ClientFactory {
     let default = banto_collect::default_client_factory();
     Arc::new(
         move |spec: &banto_collect::ClientSpec| -> Box<dyn PlcClient> {
             match spec.protocol {
                 banto_collect::ClientProtocol::Slmp => {
-                    match slmp_handles.get(&spec.connection_key) {
+                    match broker_handles.get(&spec.connection_key) {
                         Some(handle) => Box::new(BrokerReadClient::new(handle.clone())),
                         // Defensive only: every enabled SLMP connection was
                         // ensure_connection'd (and inserted here) earlier in the
@@ -701,7 +703,7 @@ pub fn hub_client_factory(
                 }
                 // #337: same shape as the SLMP arm above, including the same
                 // defensive fallback - a Modbus connection missing from
-                // `slmp_handles` (only possible if its `ensure_connection`
+                // `broker_handles` (only possible if its `ensure_connection`
                 // failed earlier in the same rebuild) still collects through
                 // its own direct socket rather than silently not collecting
                 // at all. That fallback is the one path that can still open a
@@ -709,7 +711,7 @@ pub fn hub_client_factory(
                 // for a device that does allow it; for a 1対1 device it
                 // simply fails the same way it would have anyway.
                 banto_collect::ClientProtocol::ModbusTcp => {
-                    match slmp_handles.get(&spec.connection_key) {
+                    match broker_handles.get(&spec.connection_key) {
                         Some(handle) => Box::new(BrokerReadClient::new(handle.clone())),
                         None => default(spec),
                     }

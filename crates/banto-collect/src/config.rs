@@ -298,7 +298,7 @@ impl CollectorConfig {
     /// classifies the connection "replaced" - stopping the stale task and
     /// spawning a fresh one with the freshly-built `ClientFactory`
     /// (`CollectorManager::rebuild` builds it from this same rebuild's
-    /// `slmp_handles`, i.e. the NEW broker session) - exactly the "this
+    /// `broker_handles`, i.e. the NEW broker session) - exactly the "this
     /// connection's task gets stopped and respawned" path `SlmpSimRegistry::resolve`'s
     /// own doc comment relies on to make the swap actually observable.
     pub fn set_broker_dial_target(&mut self, key: &str, host: String, port: i64) {

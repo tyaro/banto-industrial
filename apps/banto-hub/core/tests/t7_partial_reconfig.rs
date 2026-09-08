@@ -789,7 +789,7 @@ async fn deleting_a_connection_untracks_its_broker_session_and_leaves_others_run
         })
         .await
     );
-    // #131 (2026-09-01): `HubSessions`/`sync_slmp_sessions_from` now manages a
+    // #131 (2026-09-01): `HubSessions`/`sync_broker_sessions_from` now manages a
     // broker session for every connection whose protocol
     // `banto_broker::is_supported_protocol` covers - `"slmp"` (B) AND
     // `"modbus-tcp"` (A) - not SLMP alone as when this test (and its literal

@@ -74,14 +74,14 @@
 //! `Arc` - broker 経由 SLMP 接続の `simulation = true` を実際に有効化する
 //! T9-2 の実装本体（詳しくは `SlmpSimRegistry` 自身の doc comment、および
 //! `crate::broker_glue` のモジュール doc「T9-1/T9-2 note」節を参照）。
-//! [`CollectorManager::sync_slmp_sessions_from`] は `ensure_connection` を
+//! [`CollectorManager::sync_broker_sessions_from`] は `ensure_connection` を
 //! 呼ぶ前に接続ごとに `SlmpSimRegistry::resolve` を呼び、シミュレーション中
 //! なら実際のダイヤル先をシミュレータの loopback アドレスへ差し替え、宛先が
 //! 変わっていれば（`changed == true`）`HubSessions::remove` してから
 //! `ensure_connection` して古いセッションの使い回しを防ぐ（#131、
 //! 2026-09-01 以降この resolve/ensure_connection 自体は Modbus TCP 接続にも
-//! 及ぶ - `sync_slmp_sessions_from`のモジュール doc参照）。[`Self::rebuild`]
-//! はさらに、`sync_slmp_sessions_from`の第4戻り値（`read_routed_keys` =
+//! 及ぶ - `sync_broker_sessions_from`のモジュール doc参照）。[`Self::rebuild`]
+//! はさらに、`sync_broker_sessions_from`の第4戻り値（`read_routed_keys` =
 //! *収集読み取り*が broker 経由になっている接続キーの集合）を
 //! `banto_collect::CollectorConfig::suppress_simulation_for` に渡し、
 //! `Collector` 自身が同じ接続に対して二重にシミュレータを起動しないようにする
@@ -95,7 +95,7 @@
 //! broker セッション経由になり、`SlmpSimRegistry::resolve`が Modbus 用の
 //! シミュレータを起動する（#131 以降）ので、`Collector`側のシミュレータを
 //! 止めるのがむしろ正しい。現在 `read_routed_keys` は
-//! `sync_slmp_sessions_from` が `slmp_handles` から導出する（二度と食い違わ
+//! `sync_broker_sessions_from` が `broker_handles` から導出する（二度と食い違わ
 //! ないように、独立に積み上げない）- 同 fn の doc comment 参照。
 //!
 //! **ここまでだけでは実は不十分**（自前の E2E テスト
@@ -109,7 +109,7 @@
 //! セッションが`SlmpSimRegistry::resolve`の`changed`検出で実際には
 //! 入れ替わっていても、動き続けている収集タスクは古い（既に directory
 //! から外れた）セッションを黙って読み続けてしまう。そこで`Self::rebuild`は
-//! `sync_slmp_sessions`が返す解決済みダイヤル先を
+//! `sync_broker_sessions_from`が返す解決済みダイヤル先を
 //! `banto_collect::CollectorConfig::set_broker_dial_target`で該当接続の
 //! plan に書き戻す - `ProtocolConfig`（実際の接続には使われない、diff 専用の
 //! 値）が変わることで`apply_config`が正しく「replaced」に分類し、新しい
@@ -175,7 +175,7 @@
 //! [`CollectorManager`] は [`crate::broker_glue::HubSessions`]（`sessions`
 //! フィールド）を保持する - **`CollectorManager` の外**（`bin/banto-hub.rs`）
 //! で構築・生存する共有 `Arc` で、`rebuild` を跨いでも SLMP セッションが
-//! 切れない。`rebuild` は毎回 [`CollectorManager::sync_slmp_sessions`] で
+//! 切れない。`rebuild` は毎回 [`CollectorManager::sync_broker_sessions_from`] で
 //! レジストリの現在の broker 管理対象接続集合を `sessions` に
 //! `ensure_connection`（新規なら起動・既存ならそのまま）し、得た
 //! ハンドル群を `crate::broker_glue::hub_client_factory` に渡す - broker
@@ -186,7 +186,7 @@
 //! が同じ PLC へ同時にソケットを張る瞬間」を SLMP について解消する役目も
 //! 兼ねていたが、T7 の部分適用移行後は新旧 `Collector` という概念自体が
 //! 無くなったため、この節の主眼は「broker セッションの追加+削除の完全同期」
-//! に移った - このモジュールの doc 冒頭「SLMP broker セッションの削除同期
+//! に移った - このモジュールの doc 冒頭「broker セッションの削除同期
 //! （T7-2）」参照。
 
 use std::collections::{HashMap, HashSet};
@@ -592,12 +592,15 @@ pub struct CollectorManager {
     events: EventSink,
     /// T2-2 (docs/tag-server-design.md §6-5): the broker session directory,
     /// owned OUTSIDE this manager (`bin/banto-hub.rs` constructs it and holds
-    /// its own `Arc` clone for final shutdown) so an SLMP session survives a
+    /// its own `Arc` clone for final shutdown) so a broker session (SLMP
+    /// since T2-2, Modbus TCP since #131/#337) survives a
     /// `rebuild` - see `crate::broker_glue::HubSessions`'s doc comment for
     /// the full rationale and the session-sync policy `rebuild` follows.
     sessions: Arc<HubSessions>,
-    /// T9-2 (docs/ux-plan.md §1): the SLMP simulator registry, owned OUTSIDE
-    /// this manager for exactly the same reason `sessions` is - it must
+    /// T9-2 (docs/ux-plan.md §1): the broker session simulator registry
+    /// (`SlmpSimRegistry` - see that type's own doc comment for why the name
+    /// still says SLMP even though it also drives Modbus TCP since #131),
+    /// owned OUTSIDE this manager for exactly the same reason `sessions` is - it must
     /// survive every `rebuild` (a simulator started for a connection stays
     /// up across rebuilds that leave it `simulation = true`, mirroring how a
     /// broker session stays up), and `bin/banto_hub` needs its own `Arc`
@@ -605,7 +608,7 @@ pub struct CollectorManager {
     /// process shutdown (after `sessions.shutdown()` - simulators must
     /// outlive the broker sessions that dial them). See
     /// `crate::broker_glue::SlmpSimRegistry`'s doc comment for the full
-    /// mechanism, and this module's doc comment ("SLMP 接続単位の
+    /// mechanism, and this module's doc comment ("接続単位の
     /// シミュレーションモード") for how `rebuild` uses it.
     sim_registry: Arc<SlmpSimRegistry>,
     /// T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): owned OUTSIDE this
@@ -680,7 +683,7 @@ pub struct CollectorManager {
     /// once per intermediate revision.
     revision_tx: watch::Sender<u64>,
     /// T9-2 フォローアップ（2026-08-06、`crate::diag_log` モジュール doc
-    /// 参照）: `rebuild`/`sync_slmp_sessions`/`log_simulation_warnings` の
+    /// 参照）: `rebuild`/`sync_broker_sessions_from`/`log_simulation_warnings` の
     /// 診断ログの出力先。[`Self::new`] では [`DiagLog::default`]（素の
     /// `println!`/`eprintln!` と同じ）で初期化され、[`Self::with_diag_log`]
     /// を呼んだ場合のみ差し替わる - `bin/banto_hub` はここへ
@@ -836,7 +839,7 @@ impl CollectorManager {
     }
 
     /// T9-2 フォローアップ (2026-08-06): この manager の診断ログ
-    /// （`rebuild`/`sync_slmp_sessions`/`log_simulation_warnings`）を
+    /// （`rebuild`/`sync_broker_sessions_from`/`log_simulation_warnings`）を
     /// `hub_log::log_line`/`log_err_line` 経由にルーティングし、Windows
     /// サービスモードでもサービスログファイルへ届くようにする - `bin/
     /// banto_hub` が呼ぶ。これを呼ばなければ既定の素の
@@ -1017,7 +1020,7 @@ impl CollectorManager {
         // ensure_connection (unchanged from T2-2, now covers every
         // broker-managed protocol - `banto_broker::is_supported_protocol`,
         // not just SLMP) plus the set of tracked ids that are no longer
-        // wanted - see `Self::sync_slmp_sessions_from`'s doc comment.
+        // wanted - see `Self::sync_broker_sessions_from`'s doc comment.
         // Deliberately unconditional (runs even when `config.group_count()
         // == 0` just below) - independent of whether the resulting
         // collector config ends up empty, every OTHER still-collectible
@@ -1026,7 +1029,7 @@ impl CollectorManager {
         // `inner`/`collector` so it carries no all-or-nothing risk either
         // way. **Since T19 S2-a (UX-48)**, a connection with zero enabled
         // collection groups no longer gets a session synced here at all -
-        // see `Self::sync_slmp_sessions_from`'s own doc comment (this
+        // see `Self::sync_broker_sessions_from`'s own doc comment (this
         // paragraph used to claim the opposite - "a connection can be
         // enabled with no collectible groups yet and still deserve a live
         // broker session" - which stopped being true the moment that fn
@@ -1034,16 +1037,16 @@ impl CollectorManager {
         // `CollectionController::resync_sessions_for_catalog_change`'s doc
         // comment (T19 S2-a 案B) covers how such a connection can still get
         // a session before the next rebuild, via a catalog-only commit made
-        // while a run is already `Running`. `stale_slmp_ids` is only
+        // while a run is already `Running`. `stale_broker_ids` is only
         // actually removed AFTER a successful commit below - see
-        // `Self::remove_stale_slmp_sessions`'s doc comment for why the
+        // `Self::remove_stale_broker_sessions`'s doc comment for why the
         // ordering matters.
-        let (slmp_handles, stale_slmp_ids, resolved_slmp_targets, read_routed_keys) =
-            self.sync_slmp_sessions_from(&snapshot).await;
+        let (broker_handles, stale_broker_ids, resolved_broker_targets, read_routed_keys) =
+            self.sync_broker_sessions_from(&snapshot).await;
 
         // T9-2/#131/#337: `read_routed_keys` (the fourth return value) is
         // the set of connections whose *collection reads* are broker-routed,
-        // whose dial target `Self::sync_slmp_sessions_from` already resolved
+        // whose dial target `Self::sync_broker_sessions_from` already resolved
         // (simulator substitution included, via `SlmpSimRegistry::resolve`)
         // before `ensure_connection` ran. Telling `Collector` to treat these
         // as `simulation = false` stops it from starting a second, redundant
@@ -1052,15 +1055,15 @@ impl CollectorManager {
         // comment (`crates/banto-collect/src/config.rs`) and this module's
         // doc comment ("接続単位のシミュレーションモード") for the full
         // derivation. Under #131 this set was deliberately narrower than
-        // `slmp_handles.keys()` (SLMP only, because Modbus reads were not
+        // `broker_handles.keys()` (SLMP only, because Modbus reads were not
         // broker-routed); since #337 they coincide, and
-        // `sync_slmp_sessions_from` derives this one from `slmp_handles`
+        // `sync_broker_sessions_from` derives this one from `broker_handles`
         // precisely so the two cannot drift apart again - see that fn's
         // `read_routed_keys` doc paragraph.
         config.suppress_simulation_for(&read_routed_keys);
 
         // T9-2: also stamp each broker-routed connection plan with the SAME
-        // resolved dial target `sync_slmp_sessions` just used, so a
+        // resolved dial target `sync_broker_sessions_from` just used, so a
         // simulation toggle (or a simulator restart, or an in-place host/port
         // edit) that actually moved the broker session makes `apply_config`'s
         // `PartialEq` diff notice and respawn that connection's task with a
@@ -1070,7 +1073,7 @@ impl CollectorManager {
         // task wired to a now-superseded broker session forever. See
         // `CollectorConfig::set_broker_dial_target`'s doc comment
         // (`crates/banto-collect/src/config.rs`) for the full derivation.
-        for (key, (host, port)) in &resolved_slmp_targets {
+        for (key, (host, port)) in &resolved_broker_targets {
             config.set_broker_dial_target(key, host.clone(), *port);
         }
 
@@ -1105,7 +1108,7 @@ impl CollectorManager {
             if let Some(collector) = old_collector {
                 let _ = collector.stop().await;
             }
-            self.remove_stale_slmp_sessions(&stale_slmp_ids).await;
+            self.remove_stale_broker_sessions(&stale_broker_ids).await;
             self.log_simulation_warnings().await;
             return Ok(());
         }
@@ -1118,11 +1121,13 @@ impl CollectorManager {
         // on failure), matching the pre-T7 "start the new one before
         // touching the old one" discipline - `apply_config` and
         // `start_with_client_factory` both carry that same "no partial
-        // effect on failure" contract themselves now. T2-2: the client
-        // factory routes SLMP connections through the broker sessions just
-        // synced above and leaves Modbus connections on the default direct
-        // client (`crate::broker_glue::hub_client_factory`'s doc comment).
-        let factory = hub_client_factory(Arc::new(slmp_handles));
+        // effect on failure" contract themselves now. T2-2/#337: the client
+        // factory routes every broker-managed connection (SLMP since T2-2,
+        // Modbus TCP since #337) through the broker sessions just synced
+        // above, falling back to a direct client only when a connection is
+        // defensively missing from the handle map
+        // (`crate::broker_glue::hub_client_factory`'s doc comment).
+        let factory = hub_client_factory(Arc::new(broker_handles));
         let mut collector_guard = self.collector.lock().await;
         let commit: Result<(Option<ApplyReport>, CurrentValuesHandle), String> =
             if let Some(collector) = collector_guard.as_mut() {
@@ -1181,7 +1186,7 @@ impl CollectorManager {
         };
         let _ = self.revision_tx.send(new_revision);
 
-        self.remove_stale_slmp_sessions(&stale_slmp_ids).await;
+        self.remove_stale_broker_sessions(&stale_broker_ids).await;
         self.log_simulation_warnings().await;
 
         Ok(())
@@ -1194,13 +1199,20 @@ impl CollectorManager {
             .last_error = Some(message);
     }
 
+    /// **Naming note (#337, 2026-09-08)**: this fn's name used to name the
+    /// SLMP protocol specifically, from T2-2 until this rename to
+    /// `sync_broker_sessions_from`. It started SLMP-only; #131 (2026-09-01)
+    /// widened it to also manage Modbus TCP's broker session (write/status
+    /// routing only at the time), and #337 then moved Modbus's *collection
+    /// reads* onto that same session too, closing the last gap where the old
+    /// SLMP-flavoured name was misleading.
+    ///
     /// T2-2/T7-2/T9-2/#131 (docs/tag-server-design.md §6-5/§4.3, docs/ux-plan.md
     /// §1): additive `ensure_connection` (unchanged from T2-2) over
     /// `self.sessions`'s broker tasks against the registry's current
     /// enabled-and-broker-managed-protocol connection set (`#131`,
     /// 2026-09-01: `banto_broker::is_supported_protocol` - `"slmp"` and
-    /// `"modbus-tcp"` today, no longer SLMP-only despite this fn's name),
-    /// returning the `"conn:{id}"`-keyed handle map
+    /// `"modbus-tcp"` today), returning the `"conn:{id}"`-keyed handle map
     /// [`crate::broker_glue::hub_client_factory`] needs, the connection ids
     /// `self.sessions` still tracks that are NOT in that set (deleted from
     /// the registry, disabled, or changed to a protocol the broker no longer
@@ -1236,10 +1248,10 @@ impl CollectorManager {
     /// of why this matters.
     ///
     /// The stale ids are returned, not removed here - [`Self::rebuild`]
-    /// only calls [`Self::remove_stale_slmp_sessions`] with them AFTER the
+    /// only calls [`Self::remove_stale_broker_sessions`] with them AFTER the
     /// collector-side commit for this same rebuild has succeeded (so any
     /// collect task reading through that connection's session is already
-    /// confirmed stopped - see this module's doc comment "SLMP broker
+    /// confirmed stopped - see this module's doc comment "broker
     /// セッションの削除同期").
     ///
     /// A registry read failure here is logged and treated as "no SLMP
@@ -1334,7 +1346,7 @@ impl CollectorManager {
     /// group got disabled, or its last group/tag was deleted) is handled by
     /// the SAME pre-existing mechanism as any other now-unwanted connection:
     /// it lands in the `stale_ids` this fn already computes below and gets
-    /// torn down via [`Self::remove_stale_slmp_sessions`] after the caller's
+    /// torn down via [`Self::remove_stale_broker_sessions`] after the caller's
     /// collector-side commit succeeds (T7-2's "add + remove" full sync) - no
     /// new removal path was needed.
     ///
@@ -1359,7 +1371,7 @@ impl CollectorManager {
     /// stop-vs-write race this fn's caller ([`Self::rebuild`]) already had
     /// to reckon with, and the narrower removal-ordering caveat it carries
     /// that `Self::rebuild` itself does not.
-    async fn sync_slmp_sessions_from(
+    async fn sync_broker_sessions_from(
         &self,
         snapshot: &RegistrySnapshot,
     ) -> (
@@ -1469,16 +1481,20 @@ impl CollectorManager {
         (handles, stale_ids, resolved_targets, read_routed_keys)
     }
 
+    /// **Naming note (#337, 2026-09-08)**: renamed alongside
+    /// [`Self::sync_broker_sessions_from`] from an SLMP-specific name - see
+    /// that fn's doc comment for why the old name stopped matching reality.
+    ///
     /// T14-2/T7-2/T9-2: [`crate::broker_glue::HubSessions::stop_and_join`] and
     /// [`crate::broker_glue::SlmpSimRegistry::remove`] for every id in
     /// `stale`. Must only be called AFTER the collector-side commit for the
     /// same rebuild has succeeded (see
-    /// [`Self::rebuild`]/[`Self::sync_slmp_sessions`]'s doc comments) - by
+    /// [`Self::rebuild`]/[`Self::sync_broker_sessions_from`]'s doc comments) - by
     /// then, `apply_config`/the pre-commit `Collector` stop has already
     /// stopped any collect task that was reading through one of these
     /// connections' broker sessions. `async` (T9-2: `SlmpSimRegistry::remove`
     /// is `.await`-heavy, stopping a simulator's ramp task) - was sync before.
-    async fn remove_stale_slmp_sessions(&self, stale: &[i64]) {
+    async fn remove_stale_broker_sessions(&self, stale: &[i64]) {
         for &connection_id in stale {
             let _ = self.sessions.stop_and_join(connection_id).await;
             self.sim_registry.remove(connection_id).await;
@@ -1552,9 +1568,9 @@ impl CollectorManager {
     /// `conn`（broker が管理するプロトコルの接続 - 現状 slmp と
     /// modbus-tcp）の書き込み可能な [`BrokerHandle`] を取得する。
     /// `crate::rest` の書き込みハンドラの唯一の入口 - `self.sessions`
-    /// （`Self::sync_slmp_sessions_from`が rebuild の度に確保する broker
+    /// （`Self::sync_broker_sessions_from`が rebuild の度に確保する broker
     /// セッション directory）に委譲するだけで、
-    /// `Self::sync_slmp_sessions_from`が読み取り専用ハンドルへ絞る
+    /// `Self::sync_broker_sessions_from`が読み取り専用ハンドルへ絞る
     /// （`ReadOnlyHandle`、`banto_collect::PlcClient` 経由）のと対称的に、
     /// こちらは書き込み可能なフル `BrokerHandle` をそのまま返す（SLMP は
     /// 収集と書き込みが同じ物理セッションを通る、というのがこの broker
@@ -1725,13 +1741,13 @@ impl CollectorManager {
         let runtime_snapshot = runtime_snapshot_for_mode(&snapshot, mode);
         let mut config = build_config_from(&runtime_snapshot).map_err(|err| err.to_string())?;
 
-        let (slmp_handles, stale_slmp_ids, resolved_slmp_targets, read_routed_keys) =
-            self.sync_slmp_sessions_from(&runtime_snapshot).await;
+        let (broker_handles, stale_broker_ids, resolved_broker_targets, read_routed_keys) =
+            self.sync_broker_sessions_from(&runtime_snapshot).await;
         // See `Self::rebuild`'s matching call for what `read_routed_keys` is
-        // and why it is `sync_slmp_sessions_from`'s job to derive it (#131's
+        // and why it is `sync_broker_sessions_from`'s job to derive it (#131's
         // narrowing, reworked by #337).
         config.suppress_simulation_for(&read_routed_keys);
-        for (key, (host, port)) in &resolved_slmp_targets {
+        for (key, (host, port)) in &resolved_broker_targets {
             config.set_broker_dial_target(key, host.clone(), *port);
         }
 
@@ -1746,12 +1762,12 @@ impl CollectorManager {
                 inner.last_apply = None;
                 inner.last_error = None;
             }
-            self.remove_stale_slmp_sessions(&stale_slmp_ids).await;
+            self.remove_stale_broker_sessions(&stale_broker_ids).await;
             self.advance_running_revision();
             return Ok(());
         }
 
-        let factory = hub_client_factory(Arc::new(slmp_handles));
+        let factory = hub_client_factory(Arc::new(broker_handles));
         let mut collector_guard = self.collector.lock().await;
         let commit: Result<(Option<ApplyReport>, CurrentValuesHandle), String> =
             if let Some(collector) = collector_guard.as_mut() {
@@ -1788,7 +1804,7 @@ impl CollectorManager {
             inner.last_apply = apply_report;
             inner.last_error = None;
         }
-        self.remove_stale_slmp_sessions(&stale_slmp_ids).await;
+        self.remove_stale_broker_sessions(&stale_broker_ids).await;
         self.log_simulation_warnings().await;
         self.advance_running_revision();
         Ok(())
@@ -1915,7 +1931,7 @@ impl CollectorManager {
     /// [`Self::rebuild`]/[`Self::apply_run`] for a catalog-only commit
     /// (`crate::rest::commit_catalog_and_notify`) that happens while a
     /// collection run is already `Running`. Reuses
-    /// [`Self::sync_slmp_sessions_from`]/[`Self::remove_stale_slmp_sessions`]
+    /// [`Self::sync_broker_sessions_from`]/[`Self::remove_stale_broker_sessions`]
     /// verbatim - the exact same add-then-remove semantics `Self::rebuild`
     /// already uses for every broker session, just invoked from a different
     /// trigger. `mode` mirrors [`Self::apply_run`]'s own handling
@@ -1923,7 +1939,7 @@ impl CollectorManager {
     /// run keeps resolving simulator dial targets instead of the
     /// connections' real host/port.
     ///
-    /// This is what closes the write-path gap [`Self::sync_slmp_sessions_from`]'s
+    /// This is what closes the write-path gap [`Self::sync_broker_sessions_from`]'s
     /// own doc comment used to describe (T19 S2-a's original slice, before
     /// 案B): a tag registered under a previously-tagless connection now gets
     /// a broker session synced the moment its catalog change commits while
@@ -1954,10 +1970,10 @@ impl CollectorManager {
     /// and a real stop can never run concurrently.
     ///
     /// **Narrower safety envelope than `Self::rebuild`'s removal step**:
-    /// `Self::rebuild` only calls `Self::remove_stale_slmp_sessions` AFTER
+    /// `Self::rebuild` only calls `Self::remove_stale_broker_sessions` AFTER
     /// the collector-side commit for the SAME snapshot has already stopped
     /// any collect task reading through a to-be-removed connection's
-    /// session (this module's doc comment, "SLMP broker セッションの削除
+    /// session (this module's doc comment, "broker セッションの削除
     /// 同期"). This fn never touches the `Collector` at all (that is the
     /// whole point - it must not disturb a run that is not being
     /// restarted), so that ordering guarantee does not hold here: for a
@@ -1990,8 +2006,8 @@ impl CollectorManager {
         let _guard = self.rebuild_lock.lock().await;
         let runtime_snapshot = runtime_snapshot_for_mode(snapshot, mode);
         let (_handles, stale_ids, _resolved_targets, _read_routed_keys) =
-            self.sync_slmp_sessions_from(&runtime_snapshot).await;
-        self.remove_stale_slmp_sessions(&stale_ids).await;
+            self.sync_broker_sessions_from(&runtime_snapshot).await;
+        self.remove_stale_broker_sessions(&stale_ids).await;
     }
 }
 

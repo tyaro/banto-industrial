@@ -7438,7 +7438,7 @@ pub(crate) struct StatusResponse {
 /// with zero enabled collection groups reports `"unused"` here instead of
 /// falling through to `broker_status` (which would read `None`/`Stopped`
 /// indistinguishably from a disabled connection) - see
-/// `crate::hub::CollectorManager::sync_slmp_sessions_from`'s doc comment for
+/// `crate::hub::CollectorManager::sync_broker_sessions_from`'s doc comment for
 /// why such a connection has no broker session to report on in the first
 /// place.
 pub(crate) async fn compute_status(state: &TagSpaceState) -> Result<StatusResponse, ApiError> {
@@ -7452,7 +7452,7 @@ pub(crate) async fn compute_status(state: &TagSpaceState) -> Result<StatusRespon
         .await?
         .rows;
     // T19 S2-a (UX-48): same predicate the session sync
-    // (`CollectorManager::sync_slmp_sessions_from`) and the collector itself
+    // (`CollectorManager::sync_broker_sessions_from`) and the collector itself
     // (`banto_collect::build_config_from`) use to decide "does this
     // connection have anything to collect" - reused here so the status
     // screen can tell a genuinely-unused connection ("unused" below) apart
@@ -7477,7 +7477,7 @@ pub(crate) async fn compute_status(state: &TagSpaceState) -> Result<StatusRespon
             let (status_str, attempt) = if is_supported_protocol(&conn.protocol) {
                 // T19 S2-a (UX-48): a connection with no enabled collection
                 // group gets no broker session pre-synced at all (see
-                // `CollectorManager::sync_slmp_sessions_from`'s doc comment),
+                // `CollectorManager::sync_broker_sessions_from`'s doc comment),
                 // so `broker_status` would otherwise round it down to
                 // "stopped" indistinguishably from a disabled or genuinely
                 // failing connection. Surface it as its own "unused" status
@@ -10045,7 +10045,7 @@ mod tests {
         // T19 S2-a (UX-48): a connection with zero collection groups (this
         // one - it was created with no group at all) reports "unused", not
         // "stopped"/"reconnecting" - it never gets a broker session synced
-        // in the first place (`CollectorManager::sync_slmp_sessions_from`'s
+        // in the first place (`CollectorManager::sync_broker_sessions_from`'s
         // doc comment), so lumping it in with "stopped" would read as
         // broken rather than simply not set up yet.
         assert_eq!(json["connections"][0]["status"], "unused");
