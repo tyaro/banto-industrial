@@ -104,7 +104,7 @@ axum = { version = "0.8", default-features = true, features = ["json"] }
 tower = "0.5"
 futures-util = "0.3"
 rust-embed = "8"
-argon2 = "0.5"
+argon2 = "0.6"
 password-hash = { version = "0.5", features = ["getrandom"] }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 # Desktop-only (apps/chronogazer/src-tauri and apps/relay-wright/src-tauri,
