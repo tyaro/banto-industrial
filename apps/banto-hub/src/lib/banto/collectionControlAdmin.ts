@@ -4,18 +4,22 @@
  * `POST /api/collection/start|start-all-simulation|stop` に対応する -
  * `writeControlAdmin.ts` と同じ httpPost 雛形（レスポンス型が違うだけ）。
  *
- * **なぜこのファイルが要る（実装指示の背景）**: `rest.rs` の
- * `commit_catalog_and_notify` の doc comment のとおり、本番経路では
- * `legacy_live_reconfigure` は無効で「registry writes advance the
- * configured revision only」 - PLC接続・収集グループ・タグを作成/変更しても
- * configured revision が上がるだけで、動いている収集機（あるいはまだ一度も
- * 開始していない収集機）には反映されない。反映させるには収集を
- * `RunMode::Configured`（実機）で開始/再開始する必要があるが、
- * `POST /api/collection/start` 自体は元々 API にしか無く、UI から叩く導線が
- * 1つも無かった - 実機での試運転の最後の一歩「PLC に接続開始し、タグに
- * アクセスできているか確認する」がまさにこの未実装導線を必要としていた。
- * このファイルはその導線用クライアント（`(app)/status/+page.svelte` から
- * 使う）。
+ * **なぜこのファイルが要る（実装指示の背景）**: 実機での試運転の最後の一歩
+ * 「PLC に接続開始し、タグにアクセスできているか確認する」を UI から行う
+ * 導線が1つも無かった（`POST /api/collection/start` は元々 API にしか
+ * 無かった）。このファイルはその導線用クライアント
+ * （`(app)/status/+page.svelte` から使う）。
+ *
+ * **#341（オーナー決定 2026-09-09 / 2026-09-14）で前提が変わった**: 以前は
+ * 「PLC接続・収集グループ・タグを作成/変更しても configured revision が
+ * 上がるだけで、動いている収集機には反映されない。反映させるには収集を
+ * 開始/再開始するしかない」と書いてあったが、これは撤回された。現在は
+ * `rest.rs` の `commit_catalog_and_notify` が
+ * `CollectionController::commit_catalog_and_apply_live` を通し、収集が
+ * `Running` なら**収集を止めずに**実行構成まで反映する（試運転中は CRUD が
+ * そのまま、ロックダウン後は未適用キューの明示適用が契機）。したがって
+ * このファイルの start/stop は「変更を反映させるための再起動」ではなく、
+ * 純粋な収集ライフサイクル操作である。
  *
  * 現在の収集状態自体（`collectionState`/`collectionMode`）は
  * `GET /api/status`（`hubStatus.ts`）を見る - このファイルは

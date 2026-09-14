@@ -1034,10 +1034,12 @@ impl CollectorManager {
         // enabled with no collectible groups yet and still deserve a live
         // broker session" - which stopped being true the moment that fn
         // started filtering on `banto_collect::connections_with_collected_groups`).
-        // `CollectionController::resync_sessions_for_catalog_change`'s doc
-        // comment (T19 S2-a 案B) covers how such a connection can still get
-        // a session before the next rebuild, via a catalog-only commit made
-        // while a run is already `Running`. `stale_broker_ids` is only
+        // `CollectionController::commit_catalog_and_apply_live`'s doc
+        // comment (#341, T19 S2-a 案B の後継) covers how such a connection
+        // can still get a session before the next start/stop cycle, via a
+        // registry change committed while a run is already `Running` -
+        // that path now goes all the way through `Self::apply_run`, so this
+        // very fn is what runs. `stale_broker_ids` is only
         // actually removed AFTER a successful commit below - see
         // `Self::remove_stale_broker_sessions`'s doc comment for why the
         // ordering matters.
@@ -1358,19 +1360,22 @@ impl CollectorManager {
     /// avoid resurrecting a session a concurrent `stop` just tore down).
     ///
     /// **T19 S2-a 案B (2026-09-03) closed the write-gap this paragraph used
-    /// to describe**: a connection with zero enabled groups the last time
-    /// `Self::rebuild`/`Self::apply_run` ran no longer has to wait for the
-    /// next rebuild/apply_run (typically: stopping and restarting the
-    /// collection run) to get a session once a group/tag is registered
-    /// under it - [`crate::rest::commit_catalog_and_notify`] now also drives
-    /// [`crate::controller::CollectionController::resync_sessions_for_catalog_change`]
-    /// after every catalog-only commit, which re-runs this very fn (via
-    /// [`Self::resync_broker_sessions`]) whenever a collection run is
-    /// already `Running` - see that method's doc comment for the full
-    /// derivation, including why it is safe against the same T15-4
+    /// to describe, and #341 (2026-09-14) widened that fix**: a connection
+    /// with zero enabled groups the last time `Self::rebuild`/
+    /// `Self::apply_run` ran no longer has to wait for the next
+    /// rebuild/apply_run (typically: stopping and restarting the collection
+    /// run) to get a session once a group/tag is registered under it -
+    /// [`crate::rest::commit_catalog_and_notify`] drives
+    /// [`crate::controller::CollectionController::commit_catalog_and_apply_live`]
+    /// after every registry change, which re-runs this very fn via
+    /// [`Self::apply_run`] whenever a collection run is already `Running`.
+    /// 案B only re-synced sessions (leaving the running `Collector`'s task
+    /// set alone, with the removal-ordering caveat that came with it);
+    /// since #341 the whole `apply_run` runs, so the session sync and the
+    /// collect tasks move together - see that method's doc comment for the
+    /// full derivation, including why it is safe against the same T15-4
     /// stop-vs-write race this fn's caller ([`Self::rebuild`]) already had
-    /// to reckon with, and the narrower removal-ordering caveat it carries
-    /// that `Self::rebuild` itself does not.
+    /// to reckon with.
     async fn sync_broker_sessions_from(
         &self,
         snapshot: &RegistrySnapshot,
@@ -1732,10 +1737,11 @@ impl CollectorManager {
         // S2b（§4.8・§6-16）: 収集開始で DB Source の task を起こすのは
         // `crate::controller::CollectionController::start_locked` であって
         // ここではない - この `apply_run` は「収集の遷移」以外に
-        // `crate::rest::commit_catalog_and_notify` の legacy live
-        // reconfigure からも呼ばれるので、ここを起動点にすると停止中でも
-        // DB へ繋いでしまう（controller の `db_source` フィールド doc
-        // comment 参照）。
+        // `crate::controller::CollectionController::commit_catalog_and_apply_live`
+        // （#341 の live re-apply。2026-09-14 より前は
+        // `commit_catalog_and_notify` の legacy live reconfigure）からも
+        // 呼ばれるので、ここを起動点にすると停止中でも DB へ繋いでしまう
+        // （controller の `db_source` フィールド doc comment 参照）。
         db_source::build_plan(&snapshot)
             .map_err(|err| format!("DB Source の検証に失敗しました: {err}"))?;
         let runtime_snapshot = runtime_snapshot_for_mode(&snapshot, mode);
@@ -1925,90 +1931,14 @@ impl CollectorManager {
         }
     }
 
-    /// T19 S2-a 案B (UX-48, docs/banto-hub-t19-design.md §3.8, 2026-09-03):
-    /// re-sync broker sessions against `snapshot` WITHOUT touching the
-    /// running `Collector`'s own task set - the counterpart to
-    /// [`Self::rebuild`]/[`Self::apply_run`] for a catalog-only commit
-    /// (`crate::rest::commit_catalog_and_notify`) that happens while a
-    /// collection run is already `Running`. Reuses
-    /// [`Self::sync_broker_sessions_from`]/[`Self::remove_stale_broker_sessions`]
-    /// verbatim - the exact same add-then-remove semantics `Self::rebuild`
-    /// already uses for every broker session, just invoked from a different
-    /// trigger. `mode` mirrors [`Self::apply_run`]'s own handling
-    /// (`runtime_snapshot_for_mode`) so a resync during an `AllSimulation`
-    /// run keeps resolving simulator dial targets instead of the
-    /// connections' real host/port.
-    ///
-    /// This is what closes the write-path gap [`Self::sync_broker_sessions_from`]'s
-    /// own doc comment used to describe (T19 S2-a's original slice, before
-    /// 案B): a tag registered under a previously-tagless connection now gets
-    /// a broker session synced the moment its catalog change commits while
-    /// already running, not only at the next `rebuild`/`apply_run` (in
-    /// practice: the next start/stop cycle) -
-    /// `crate::write_path::write_plc_tag`'s `write_broker_handle_peek` call
-    /// no longer fails closed for a tag added while already running.
-    ///
-    /// **Caller discipline is what keeps this safe against T15-4's
-    /// stop-vs-write race** (see `crate::write_path`'s module doc comment,
-    /// "T15-4: gate 8 は broker セッションを新規に張らない"): this must only
-    /// ever be called while [`crate::controller::CollectionController`]'s
-    /// `transition` lock is held for the duration AND its state has already
-    /// been confirmed `Running` -
-    /// [`crate::controller::CollectionController::resync_sessions_for_catalog_change`]
-    /// is the only intended caller and carries that discipline; nothing in
-    /// `crate::rest` should call this directly. Without that guard, a
-    /// catalog-triggered resync racing `CollectionController::stop()`
-    /// (whose [`Self::stop`] does NOT take `rebuild_lock` - notice this fn's
-    /// own `rebuild_lock` acquisition below only serializes against
-    /// `rebuild`/`commit_catalog`/`apply_run`, not against `Self::stop`)
-    /// could re-`ensure_connection` a session moments after `stop`
-    /// intentionally tore it down - exactly the "PLC we meant to leave
-    /// stopped gets dialed anyway" mistake T15-4 already fixed once for the
-    /// write path itself. The controller-level `transition` lock is what
-    /// actually prevents that: `CollectionController::stop`'s `stop_locked`
-    /// holds the very same lock for the whole of `Self::stop`, so this fn
-    /// and a real stop can never run concurrently.
-    ///
-    /// **Narrower safety envelope than `Self::rebuild`'s removal step**:
-    /// `Self::rebuild` only calls `Self::remove_stale_broker_sessions` AFTER
-    /// the collector-side commit for the SAME snapshot has already stopped
-    /// any collect task reading through a to-be-removed connection's
-    /// session (this module's doc comment, "broker セッションの削除
-    /// 同期"). This fn never touches the `Collector` at all (that is the
-    /// whole point - it must not disturb a run that is not being
-    /// restarted), so that ordering guarantee does not hold here: for a
-    /// connection whose last enabled group was just removed, a still-running
-    /// collect task from the PREVIOUS `apply_run` may still be reading
-    /// through the very session this removes. That read would then fail (an ordinary
-    /// reconnect/backoff cycle - `banto_broker::BrokerError::Disconnected`
-    /// on the next `read_batch` - not a panic, and not the write-path hazard
-    /// the paragraph above guards against) until the next `apply_run`/
-    /// `rebuild` actually stops that task - a narrow, self-healing gap
-    /// accepted here because catalog-only commits have never updated the
-    /// running `Collector`'s task set at all
-    /// (`crate::rest::commit_catalog_and_notify`'s doc comment, "registry
-    /// writes advance the configured revision only"), and closing it fully
-    /// would require this fn to also drive `apply_config`, i.e. become a
-    /// second `apply_run` - out of scope for 案B, which targets the write
-    /// path specifically. **#337 (2026-09-08) widened who can hit this gap**:
-    /// this paragraph used to exempt Modbus TCP connections, whose collection
-    /// reads stayed on `banto-collect`'s own direct `ModbusTcpClient`
-    /// regardless of this fn's broker-session bookkeeping. Since #337 their
-    /// reads go through the broker session as well
-    /// (`crate::broker_glue::hub_client_factory`), so a Modbus connection now
-    /// behaves exactly like an SLMP one here - same narrow, self-healing
-    /// window, same accepted reasoning.
-    pub(crate) async fn resync_broker_sessions(
-        &self,
-        snapshot: &RegistrySnapshot,
-        mode: crate::controller::RunMode,
-    ) {
-        let _guard = self.rebuild_lock.lock().await;
-        let runtime_snapshot = runtime_snapshot_for_mode(snapshot, mode);
-        let (_handles, stale_ids, _resolved_targets, _read_routed_keys) =
-            self.sync_broker_sessions_from(&runtime_snapshot).await;
-        self.remove_stale_broker_sessions(&stale_ids).await;
-    }
+    // #341 (2026-09-14): T19 S2-a 案B の `resync_broker_sessions` はここに
+    // あったが、catalog-only commit そのものが無くなった（稼働中の commit は
+    // `crate::controller::CollectionController::commit_catalog_and_apply_live`
+    // が [`Self::apply_run`] まで通す）ため撤去した。broker セッションの
+    // 追加/削除同期は `apply_run` が内包しており、しかも collector 側の
+    // コミット後に `remove_stale_broker_sessions` するので、案B が受け入れて
+    // いた「最後のグループを失った接続の collect タスクが、削除済みセッションを
+    // しばらく読み続けうる」隙間も同時に閉じている。
 }
 
 #[cfg(test)]

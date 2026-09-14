@@ -2,6 +2,33 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
+## v0.2.0-alpha.9 — 2026-09-14（アルファ）
+
+構成変更（CRUD）が実行構成へ届くまでの契約の変更。配布物の構成・前提ランタイムは alpha.3 以降と同じ。
+
+### 変更
+
+- **試運転中は接続・グループ・タグの CRUD を収集中でも即時・無停止で反映し、ロックダウン後のみ pending queue + 明示適用にする**（#341、オーナー決定 2026-09-09 / 2026-09-14）。試運転は配線の誤りを直しながらタグを足す工程で、変更のたびに収集停止・適用・再開を挟む契約は工程と噛み合わないため。ロックダウン後は「構成凍結」の意図どおり queue + 明示適用のワンクッションを必ず挟む。
+
+  | 状態                     | CRUD の受付                  | 実行構成への反映                                                 |
+  | ------------------------ | ---------------------------- | ---------------------------------------------------------------- |
+  | 試運転（未ロックダウン） | 収集中でもそのまま受け付ける | preflight 合格後に即時・無停止反映（pending queue を経由しない） |
+  | ロックダウン済み         | pending queue へ保存（202）  | 明示適用したときのみ反映。**適用も無停止**                       |
+  - 受付側の判定を `rest::registry_change_should_queue`（REST 12 箇所・MCP 9 箇所が共有）に集約。条件は「収集中 かつ ロックダウン済み」のときだけ queue。収集中を一律 409 `collection_edit_locked` にしていた `require_collection_stopped` は撤去した。
+  - 反映側は `CollectionController::commit_catalog_and_apply_live` に一本化。catalog/演算 plan/DB Source plan/`configured_revision` をコミットし、収集が `Running` のときだけ `CollectorManager::apply_run(現在の run mode)` で実行構成まで無停止更新する（T7 の `apply_config` による接続単位の部分再構成。run mode のオーバーライドを尊重するので `AllSimulation` 運転中に実機へダイヤルし直すことはない）。`start`/`stop` と同じ `transition` ロックで直列化する。
+  - `POST /api/pending-changes/{id}/apply` の収集停止要求（409 `collection_edit_locked`）を撤廃。適用しても収集は `Running` のまま、run mode も変わらない。
+  - DB へはコミットできたが実行構成へ反映できなかった場合、200 + 警告ではなく `500 live_reconfigure_failed` を返す（走行中の収集は元の構成のまま無傷。理由は `GET /api/status` の `lastConfigError` にも残る）。
+  - 管理 UI: タグ画面の表編集モードを「停止中、または試運転中」に緩和。状態ページに構成変更がいつ反映されるかの注記を追加。
+  - 互換ルーター専用だった `legacy_live_reconfigure`（pre-T14-3 の live apply opt-in）は、この新経路に置き換わったため撤去した。
+
+### 修正
+
+- **`banto_collect::Collector::apply_config` で、唯一の接続が置き換えられたときに新しい writer が収集タスクへ届かない不具合**（#341 で発覚）。`watch::Sender::send` は受信者が 0 人だと値を更新せずに `Err` を返すが、置き換え対象タスクを join した直後のこの地点では受信者が 0 になりうる（`Collector` 自身は受信者を保持しない）。結果、既存グループにタグを1本足すと、新タスクは毎周期 2 値を append するのに writer のスキーマは 1 列のままで、その接続の**履歴書き込みが列数不一致で全滅**していた（現在値と live event は流れ続けるため「値は見えるのに履歴が残らない」症状）。`send_replace` に変更して常に配布する。#341 以前は本番から到達しない経路だったため表面化していなかった。
+
+### 既知の制限（アルファ）
+
+alpha.8 と同じ。
+
 ## v0.2.0-alpha.8 — 2026-09-14（アルファ）
 
 書き込み受付（`write_enabled`）トグルの挙動変更のみ。配布物の構成・前提ランタイムは alpha.3 以降と同じ。

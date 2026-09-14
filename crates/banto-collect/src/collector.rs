@@ -475,9 +475,33 @@ impl Collector {
         }
 
         // --- 4. Distribute the new writer, then retire the old one ---------
+        //
+        // **`send_replace`, NOT `send`** (#341 で発覚、2026-09-14): step 3 が
+        // 直前に「置き換え対象の接続タスク」を全部 join しており、それが
+        // *唯一の*接続だった場合、この時点で `writer_tx` の受信者は 0 人に
+        // なっている（`Collector` 自身は `watch::Receiver` を保持しない -
+        // `start_with_client_factory` の `_writer_rx` はその関数を抜けた
+        // 時点で drop される）。`watch::Sender::send` は受信者が 0 だと
+        // **値を更新せずに** `Err` を返す仕様なので、`let _ =` で握り潰すと
+        // step 5 で spawn した新タスクが `subscribe()` から**古い writer**を
+        // 受け取ってしまう。既存タグ1本のグループにタグを1本足した場合で
+        // 言えば、新タスクは毎周期2値を append するのに writer のスキーマは
+        // 1列のままなので、`TstoreError::ValueCountMismatch` で
+        // **履歴が一切書けなくなる**（現在値キャッシュと live event は
+        // 流れ続けるので、症状は「値は見えるのに履歴が残らない」）。
+        // `send_replace` は受信者の有無に関わらず必ず値を差し替えるため、
+        // この経路でも新タスクは確実に新しい writer を見る。
+        //
+        // 発覚が #341 まで遅れた理由: 既存の回帰テスト
+        // （`tests/integration.rs` の
+        // `apply_config_writer_rotation_preserves_old_and_new_data`）は
+        // 「接続 B を*追加*する」形なので接続 A のタスクが生き残り、受信者が
+        // 0 にならない。「唯一の接続が replaced になる」= 既存グループへの
+        // タグ追加という、#341 で初めて本番から到達可能になった形でしか
+        // 踏めなかった。
         if let Some(new_writer) = new_writer {
             let old_writer = self.writer_tx.borrow().clone();
-            let _ = self.writer_tx.send(new_writer);
+            self.writer_tx.send_replace(new_writer);
             close_or_flush_writer(old_writer).await?;
         }
 

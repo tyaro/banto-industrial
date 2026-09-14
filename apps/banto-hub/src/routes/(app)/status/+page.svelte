@@ -53,7 +53,6 @@
 	import {
 		applyPendingChange,
 		cancelPendingChange,
-		isPendingApplyConflictError,
 		listPendingChanges,
 		requeuePendingChange,
 		type PendingChange
@@ -105,7 +104,6 @@
 	const POLL_INTERVAL_MS = 3000;
 
 	function errorMessage(err: unknown): string {
-		if (isPendingApplyConflictError(err)) return err.failureReason ?? err.message;
 		return isProviderError(err) ? err.message : String(err);
 	}
 
@@ -283,9 +281,10 @@
 			await poll();
 		} catch (err) {
 			toastStore.push('error', errorMessage(err));
-			if (isPendingApplyConflictError(err)) {
-				await poll();
-			}
+			// #341: 適用が失敗しても（フィンガープリント不一致で failed へ
+			// 落ちた、実行構成への反映だけ失敗した等）行の状態は変わって
+			// いるので、必ず取り直す。
+			await poll();
 		} finally {
 			pendingActionId = null;
 		}
@@ -729,6 +728,20 @@
 					{/if}
 				</dd>
 			</dl>
+			<!--
+				#341（オーナー決定 2026-09-09 / 2026-09-14、docs/tag-server-design.md
+				§4.3）: 構成変更（接続・グループ・タグ）がいつ実行構成へ届くかの契約を、
+				試運転モードの表示のすぐ近くに事実として置く。issue 本文は
+				`CommissioningBanner` に添えることを想定していたが、そのバナーは
+				T19 S1-d（UX-45）で撤去済みなので、状態が読めるこの場所に置く。
+			-->
+			<p class="note" data-testid="registry-change-contract-note">
+				{#if sessionStore.commissioningMode}
+					試運転中は構成変更（接続・グループ・タグ）が収集中でも即時反映されます。ロックダウン後は未適用の変更として保存され、明示的に適用するまで反映されません（適用時も収集は止まりません）。
+				{:else}
+					ロックダウン済みのため、収集中の構成変更（接続・グループ・タグ）は未適用の変更として保存され、下の「未適用の変更」から明示的に適用するまで反映されません（適用時も収集は止まりません）。
+				{/if}
+			</p>
 			{#if status.last_config_error}
 				<p class="config-error">設定エラー: {status.last_config_error}</p>
 			{/if}

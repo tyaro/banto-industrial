@@ -115,12 +115,12 @@ test.describe.serial('banto-hub pending apply/cancel', () => {
 		expect(stopRes.ok()).toBe(true);
 	});
 
-	test('2. Pending changes 画面から適用できる（停止中）', async () => {
+	// #341（2026-09-14 オーナー回答「明示適用も無停止」）: 以前はここで
+	// 収集を止めてから適用していた（止めないと 409 だったため）。適用の
+	// 収集停止要求は撤廃されたので、稼働させたまま適用する形へ改めた。
+	test('2. Pending changes 画面から適用できる（収集を止めずに）', async () => {
 		const pendingId = await queueTagWhileRunning(`e2e-pending-apply-${RUN_ID}`);
 		const authedHeaders = { ...CSRF_HEADERS, Authorization: `Bearer ${token}` };
-
-		const stopRes = await page.request.post('/api/collection/stop', { headers: authedHeaders });
-		expect(stopRes.ok()).toBe(true);
 
 		await page.goto('/status');
 		await expect(page.getByRole('heading', { level: 2, name: 'Pending changes' })).toBeVisible();
@@ -136,11 +136,41 @@ test.describe.serial('banto-hub pending apply/cancel', () => {
 		expect(tagsRes.ok()).toBe(true);
 		const tags = (await tagsRes.json()) as Array<{ name: string }>;
 		expect(tags.some((tag) => tag.name === `e2e-pending-apply-${RUN_ID}`)).toBe(true);
+
+		// 収集は止まっていない（無停止適用）。
+		const statusRes = await page.request.get('/api/status', { headers: authedHeaders });
+		expect(statusRes.ok()).toBe(true);
+		const runtime = (await statusRes.json()) as { collectionState?: string };
+		expect(runtime.collectionState).toBe('running');
+
+		const stopRes = await page.request.post('/api/collection/stop', { headers: authedHeaders });
+		expect(stopRes.ok()).toBe(true);
 	});
 
+	// #341（2026-09-14）: 一過性の失敗の作り方を差し替えた。以前は
+	// 「収集稼働中に適用 → 409 collection_edit_locked」を使っていたが、
+	// その 409 自体が撤廃された（適用は無停止で通る）。代わりに、同じ名前の
+	// タグを先に作っておいて一意制約で失敗させる - requeue 導線が対象と
+	// している「一過性の失敗」の実例そのもの。
 	test('3. 失敗した提案を再試行して適用できる（一過性失敗からの回復）', async () => {
-		const pendingId = await queueTagWhileRunning(`e2e-pending-requeue-${RUN_ID}`);
+		const tagName = `e2e-pending-requeue-${RUN_ID}`;
+		const pendingId = await queueTagWhileRunning(tagName);
 		const authedHeaders = { ...CSRF_HEADERS, Authorization: `Bearer ${token}` };
+
+		// 収集を止めて（＝ queue を経由しない状態にして）同名タグを直接作る。
+		const stopRes = await page.request.post('/api/collection/stop', { headers: authedHeaders });
+		expect(stopRes.ok()).toBe(true);
+		const blockerRes = await page.request.post('/api/tags', {
+			headers: authedHeaders,
+			data: {
+				name: tagName,
+				collectionGroupId: groupId,
+				address: '40002',
+				dataType: 'i16'
+			}
+		});
+		expect(blockerRes.ok()).toBe(true);
+		const blocker = (await blockerRes.json()) as { id: number };
 
 		await page.goto('/status');
 		await expect(page.getByRole('heading', { level: 2, name: 'Pending changes' })).toBeVisible();
@@ -148,7 +178,7 @@ test.describe.serial('banto-hub pending apply/cancel', () => {
 		const row = page.locator('tbody tr', { hasText: `#${pendingId}` });
 		await expect(row).toBeVisible();
 
-		// 収集稼働中に適用 → 409 collection_edit_locked で failed になる。
+		// 一意制約に阻まれて failed になる。
 		await row.getByRole('button', { name: '適用' }).click();
 		await expect(row).toContainText('失敗');
 
@@ -157,9 +187,11 @@ test.describe.serial('banto-hub pending apply/cancel', () => {
 		await expect(row).toContainText('保留中');
 		await expect(row.getByRole('button', { name: '再試行' })).toHaveCount(0);
 
-		// 収集を止めてから適用すると成功する。
-		const stopRes = await page.request.post('/api/collection/stop', { headers: authedHeaders });
-		expect(stopRes.ok()).toBe(true);
+		// 失敗要因（同名タグ）を取り除くと適用できる。
+		const deleteRes = await page.request.delete(`/api/tags/${blocker.id}`, {
+			headers: authedHeaders
+		});
+		expect(deleteRes.ok()).toBe(true);
 
 		await row.getByRole('button', { name: '適用' }).click();
 		await expect(row).toContainText('適用済み');

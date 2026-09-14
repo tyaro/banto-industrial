@@ -2897,56 +2897,54 @@ impl From<TagPayload> for TagInput {
     }
 }
 
-/// Commit the catalog already preflighted in the write transaction and notify
-/// admin-UI SSE subscribers. Production callers leave
-/// `legacy_live_reconfigure` disabled: registry writes advance the configured
-/// revision only. The compatibility router can opt into the pre-T14-3 live
-/// apply for existing embedders/tests.
+/// Commit the catalog already preflighted in the write transaction, apply it
+/// to the running collection if one is in flight, and notify admin-UI SSE
+/// subscribers.
 ///
-/// **T19 S2-a 案B (UX-48, docs/banto-hub-t19-design.md §3.8, 2026-09-03)**:
-/// the single function every registry-mutation handler in this file AND
-/// `execute_pending_apply` (the `/api/pending-changes/{id}/apply` handler's
-/// worker) funnel through - see this fn's call sites - so this is also the
-/// one place that needs to re-sync broker sessions for a catalog change made
-/// while a collection run is already `Running`. That resync
-/// (`CollectionController::resync_sessions_for_catalog_change`) runs in the
-/// `else` branch below unconditionally (not just for `legacy_live_reconfigure`
-/// callers): it is a no-op unless the controller is actually `Running` (its
-/// own doc comment), so it is always safe to call, and skipping it for the
-/// production (non-legacy) case would defeat the entire point of 案B - see
-/// that method's doc comment for the full derivation, including why this is
-/// safe against the T15-4 stop-vs-write race.
+/// **#341（オーナー決定 2026-09-09 / 2026-09-14、docs/tag-server-design.md
+/// §4.3）**: the single function every registry-mutation handler in this file,
+/// every `crate::mcp` config tool AND `execute_pending_apply` (the
+/// `/api/pending-changes/{id}/apply` handler's worker) funnel through - see
+/// this fn's call sites - so this is the one place that turns a committed
+/// registry change into a live, **non-stopping** reconfiguration of the
+/// running collection. The whole of that work lives in
+/// [`CollectionController::commit_catalog_and_apply_live`] (transition-lock
+/// discipline, run-mode safety, `apply_config` partial reconfiguration,
+/// broker-session sync, `configured_revision` + `config_changed`) - read that
+/// method's doc comment before changing anything here.
+///
+/// Before #341 this fn only advanced the configured revision (plus the T19
+/// S2-a 案B broker-session resync), and the pre-T14-3 live apply was hidden
+/// behind a `legacy_live_reconfigure` flag that production always left off;
+/// both are gone - the new path covers every caller, legacy router included
+/// (it simply does nothing extra unless the controller reports `Running`).
+///
+/// `Err` means "the registry row is committed but the live/catalog apply
+/// failed"; callers turn it into an API error rather than a silent 200 so an
+/// operator never believes a change took effect when it did not. The message
+/// is also recorded in `CollectorManager::last_error`
+/// (`/api/v1/status` の `last_config_error`).
 // T21 S1-b（docs/banto-hub-t21-design.md §5）: `pub(crate)` にして
 // `crate::mcp` の構成補助ツール（`create_connection`/`delete_connection`）
-// からも同じ経路を呼べるようにする - シグネチャ・本体は不変。
+// からも同じ経路を呼べるようにする。
 pub(crate) async fn commit_catalog_and_notify(
-    manager: &CollectorManager,
     controller: &CollectionController,
     events: &broadcast::Sender<ServerEvent>,
     resource: &str,
     snapshot: RegistrySnapshot,
-    legacy_live_reconfigure: bool,
-) {
-    if let Err(err) = manager.commit_catalog(&snapshot).await {
-        eprintln!("banto-hub: {resource} 変更後の catalog commit に失敗しました: {err}");
-    } else {
-        controller.refresh_status();
-        if legacy_live_reconfigure && manager.current_values().is_some() {
-            if let Err(err) = manager
-                .apply_run(crate::controller::RunMode::Configured)
-                .await
-            {
-                eprintln!("banto-hub: {resource} 変更後の live reconfigure に失敗しました: {err}");
-            }
-        } else {
-            controller
-                .resync_sessions_for_catalog_change(&snapshot)
-                .await;
-        }
-    }
+) -> Result<(), String> {
+    let result = controller.commit_catalog_and_apply_live(&snapshot).await;
+    // 成否によらず status watch を更新する - 失敗時も `configured_revision`
+    // だけは進んでいる（catalog commit は成功したが実行構成への適用で
+    // 失敗した）場合があり、購読者にはその事実をそのまま見せる。
+    controller.refresh_status();
     let _ = events.send(ServerEvent::ResourceChanged {
         resource: resource.to_string(),
     });
+    if let Err(err) = &result {
+        eprintln!("banto-hub: {resource} 変更の実行構成への反映に失敗しました: {err}");
+    }
+    result
 }
 
 #[derive(Clone)]
@@ -2961,7 +2959,35 @@ struct TagRegistryState {
     controller: Arc<CollectionController>,
     events: broadcast::Sender<ServerEvent>,
     pending_changes: PendingChangesService,
-    legacy_live_reconfigure: bool,
+}
+
+/// #341（オーナー決定 2026-09-09、docs/tag-server-design.md §4.3）:
+/// 接続・グループ・タグの CRUD を pending queue へ回すかどうかの**唯一の
+/// 判定**。`Some(status)` なら [`queue_pending_registry_change`]（REST）
+/// あるいは `crate::mcp` の同等処理へ、`None` ならその場で DB へ書いて
+/// [`commit_catalog_and_notify`] で反映する。
+///
+/// 条件は「**収集中 かつ ロックダウン済み**」の1つだけ:
+///
+/// - 試運転中（`locked_down == false`）は配線の誤りを直しながらタグを足す
+///   工程なので、収集中でも queue を挟まず即時・無停止で反映する。護りは
+///   トランザクション内 preflight・`revision` 楽観ロック・監査ログで足りる
+///   （queue のフィンガープリントガードは queue を経由しない経路では不要）。
+/// - ロックダウン済みは「構成凍結」の意図どおり、queue + 明示適用の
+///   ワンクッションを必ず挟む（ヒューマンエラー防止）。
+/// - 収集停止中はどちらの状態でもそのまま即時反映（従来どおり）。
+///
+/// REST（[`TagRegistryState`] 経由）と MCP（`crate::mcp::McpState` 経由）の
+/// 両方から呼べるよう、全体の状態ではなく実際に読む2つだけを受け取る
+/// （[`compute_pending_base_fingerprint`] と同じ理由・同じ規律）。二重実装を
+/// 避けるのは**判定条件**であり、queue への保存処理自体は REST/MCP で
+/// それぞれの応答形式に合わせて別実装のままである。
+pub(crate) fn registry_change_should_queue(
+    controller: &CollectionController,
+    commissioning: &CommissioningState,
+) -> Option<CollectionStatus> {
+    let status = controller.status();
+    (status.state != CollectionState::Stopped && commissioning.is_locked_down()).then_some(status)
 }
 
 #[derive(Debug, Serialize)]
@@ -3128,7 +3154,8 @@ async fn queue_pending_registry_change(
             queued: true,
             pending: redact_pending_change_for_response(pending),
             status: status.into(),
-            message: "収集中のため変更を未適用キューに保存しました。".to_string(),
+            message: "ロックダウン済みで収集中のため、変更を未適用キューに保存しました。"
+                .to_string(),
         }),
     )
         .into_response())
@@ -3136,7 +3163,15 @@ async fn queue_pending_registry_change(
 
 enum RegistryMutationError {
     Api(ApiError),
-    CollectionEditLocked(CollectionStatusResponse),
+    /// #341（2026-09-14）: DB へのコミットは成功したが、その内容を catalog /
+    /// 走行中の収集へ反映できなかった（[`commit_catalog_and_notify`] の
+    /// `Err`）。レジストリ行自体は既に存在するので「作成/更新に失敗した」
+    /// ではなく「反映に失敗した」ことを伝える専用のエラー - 走行中の収集は
+    /// `apply_config` の all-or-nothing により元の構成のまま無傷で、
+    /// 詳細は `/api/v1/status` の `last_config_error` にも残る。200 +
+    /// 警告にしないのは、オペレータが「反映された」と誤解したまま次の
+    /// 作業へ進むのを防ぐため。
+    LiveApplyFailed(String),
     /// T18-1（docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目）:
     /// [`TagService::update_tx`] が `TagUpdateError::RevisionConflict` を
     /// 返した場合の REST 表現 - `CollectionEditLocked` と同じ `409`
@@ -3172,13 +3207,13 @@ impl IntoResponse for RegistryMutationError {
     fn into_response(self) -> Response {
         match self {
             Self::Api(error) => error.into_response(),
-            Self::CollectionEditLocked(status) => (
-                StatusCode::CONFLICT,
+            Self::LiveApplyFailed(message) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({
-                    "error": "collection_edit_locked",
-                    "state": status.state,
-                    "status": status,
-                    "message": "収集中は構成を編集できません。停止してから再試行してください。"
+                    "error": "live_reconfigure_failed",
+                    "message": format!(
+                        "変更は保存しましたが、実行構成への反映に失敗しました: {message}"
+                    ),
                 })),
             )
                 .into_response(),
@@ -3197,14 +3232,11 @@ impl IntoResponse for RegistryMutationError {
 
 type RegistryMutationResult<T> = Result<T, RegistryMutationError>;
 
-fn require_collection_stopped(state: &TagRegistryState) -> RegistryMutationResult<()> {
-    let status = state.controller.status();
-    if status.state != CollectionState::Stopped {
-        return Err(RegistryMutationError::CollectionEditLocked(status.into()));
-    }
-    Ok(())
-}
-
+// #341（2026-09-14）: `require_collection_stopped`（収集中なら一律 409
+// `collection_edit_locked`）はここにあったが撤去した。従来は queue 分岐の
+// 直後にあって到達不能だったところ、[`registry_change_should_queue`] の
+// 新しい条件では「試運転中 + 収集中」がここへ到達してしまい、即時反映の
+// 決定と真っ向から矛盾するため残せない。
 async fn plc_connections_list(
     State(state): State<TagRegistryState>,
 ) -> Result<Json<Vec<PlcConnectionResponse>>, ApiError> {
@@ -3242,8 +3274,7 @@ async fn plc_connections_create(
         "/api/plc-connections",
     )
     .await?;
-    let status = state.controller.status();
-    if status.state != CollectionState::Stopped {
+    if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
         return queue_pending_registry_change(
             &state,
             &headers,
@@ -3253,7 +3284,6 @@ async fn plc_connections_create(
         )
         .await;
     }
-    require_collection_stopped(&state)?;
     let mut tx = state
         .manager
         .pool()
@@ -3287,14 +3317,13 @@ async fn plc_connections_create(
     )
     .await;
     commit_catalog_and_notify(
-        &state.manager,
         &state.controller,
         &state.events,
         "plc_connections",
         snapshot,
-        state.legacy_live_reconfigure,
     )
-    .await;
+    .await
+    .map_err(RegistryMutationError::LiveApplyFailed)?;
     Ok(Json(PlcConnectionResponse::from(created)).into_response())
 }
 
@@ -3314,8 +3343,7 @@ async fn plc_connections_update(
         "/api/plc-connections/{id}",
     )
     .await?;
-    let status = state.controller.status();
-    if status.state != CollectionState::Stopped {
+    if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
         return queue_pending_registry_change(
             &state,
             &headers,
@@ -3325,7 +3353,6 @@ async fn plc_connections_update(
         )
         .await;
     }
-    require_collection_stopped(&state)?;
     let mut tx = state
         .manager
         .pool()
@@ -3363,14 +3390,13 @@ async fn plc_connections_update(
     )
     .await;
     commit_catalog_and_notify(
-        &state.manager,
         &state.controller,
         &state.events,
         "plc_connections",
         snapshot,
-        state.legacy_live_reconfigure,
     )
-    .await;
+    .await
+    .map_err(RegistryMutationError::LiveApplyFailed)?;
     Ok(Json(PlcConnectionResponse::from(updated)).into_response())
 }
 
@@ -3389,8 +3415,7 @@ async fn plc_connections_delete(
         "/api/plc-connections/{id}",
     )
     .await?;
-    let status = state.controller.status();
-    if status.state != CollectionState::Stopped {
+    if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
         return queue_pending_registry_change(
             &state,
             &headers,
@@ -3400,7 +3425,6 @@ async fn plc_connections_delete(
         )
         .await;
     }
-    require_collection_stopped(&state)?;
     let mut tx = state
         .manager
         .pool()
@@ -3457,14 +3481,13 @@ async fn plc_connections_delete(
     )
     .await;
     commit_catalog_and_notify(
-        &state.manager,
         &state.controller,
         &state.events,
         "plc_connections",
         snapshot,
-        state.legacy_live_reconfigure,
     )
-    .await;
+    .await
+    .map_err(RegistryMutationError::LiveApplyFailed)?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -4147,8 +4170,7 @@ async fn collection_groups_create(
         "/api/collection-groups",
     )
     .await?;
-    let status = state.controller.status();
-    if status.state != CollectionState::Stopped {
+    if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
         return queue_pending_registry_change(
             &state,
             &headers,
@@ -4158,7 +4180,6 @@ async fn collection_groups_create(
         )
         .await;
     }
-    require_collection_stopped(&state)?;
     let mut tx = state
         .manager
         .pool()
@@ -4196,14 +4217,13 @@ async fn collection_groups_create(
     )
     .await;
     commit_catalog_and_notify(
-        &state.manager,
         &state.controller,
         &state.events,
         "collection_groups",
         snapshot,
-        state.legacy_live_reconfigure,
     )
-    .await;
+    .await
+    .map_err(RegistryMutationError::LiveApplyFailed)?;
     Ok(Json(created).into_response())
 }
 
@@ -4223,8 +4243,7 @@ async fn collection_groups_update(
         "/api/collection-groups/{id}",
     )
     .await?;
-    let status = state.controller.status();
-    if status.state != CollectionState::Stopped {
+    if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
         return queue_pending_registry_change(
             &state,
             &headers,
@@ -4234,7 +4253,6 @@ async fn collection_groups_update(
         )
         .await;
     }
-    require_collection_stopped(&state)?;
     let mut tx = state
         .manager
         .pool()
@@ -4272,14 +4290,13 @@ async fn collection_groups_update(
     )
     .await;
     commit_catalog_and_notify(
-        &state.manager,
         &state.controller,
         &state.events,
         "collection_groups",
         snapshot,
-        state.legacy_live_reconfigure,
     )
-    .await;
+    .await
+    .map_err(RegistryMutationError::LiveApplyFailed)?;
     Ok(Json(updated).into_response())
 }
 
@@ -4298,8 +4315,7 @@ async fn collection_groups_delete(
         "/api/collection-groups/{id}",
     )
     .await?;
-    let status = state.controller.status();
-    if status.state != CollectionState::Stopped {
+    if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
         return queue_pending_registry_change(
             &state,
             &headers,
@@ -4309,7 +4325,6 @@ async fn collection_groups_delete(
         )
         .await;
     }
-    require_collection_stopped(&state)?;
     let mut tx = state
         .manager
         .pool()
@@ -4349,14 +4364,13 @@ async fn collection_groups_delete(
     )
     .await;
     commit_catalog_and_notify(
-        &state.manager,
         &state.controller,
         &state.events,
         "collection_groups",
         snapshot,
-        state.legacy_live_reconfigure,
     )
-    .await;
+    .await
+    .map_err(RegistryMutationError::LiveApplyFailed)?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -4522,8 +4536,7 @@ async fn tags_create(
         "/api/tags",
     )
     .await?;
-    let status = state.controller.status();
-    if status.state != CollectionState::Stopped {
+    if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
         return queue_pending_registry_change(
             &state,
             &headers,
@@ -4565,15 +4578,9 @@ async fn tags_create(
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
-    commit_catalog_and_notify(
-        &state.manager,
-        &state.controller,
-        &state.events,
-        "tags",
-        snapshot,
-        state.legacy_live_reconfigure,
-    )
-    .await;
+    commit_catalog_and_notify(&state.controller, &state.events, "tags", snapshot)
+        .await
+        .map_err(RegistryMutationError::LiveApplyFailed)?;
     Ok(Json(created).into_response())
 }
 
@@ -4593,8 +4600,7 @@ async fn tags_update(
         "/api/tags/{id}",
     )
     .await?;
-    let status = state.controller.status();
-    if status.state != CollectionState::Stopped {
+    if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
         return queue_pending_registry_change(
             &state,
             &headers,
@@ -4641,15 +4647,9 @@ async fn tags_update(
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
-    commit_catalog_and_notify(
-        &state.manager,
-        &state.controller,
-        &state.events,
-        "tags",
-        snapshot,
-        state.legacy_live_reconfigure,
-    )
-    .await;
+    commit_catalog_and_notify(&state.controller, &state.events, "tags", snapshot)
+        .await
+        .map_err(RegistryMutationError::LiveApplyFailed)?;
     Ok(Json(updated).into_response())
 }
 
@@ -4668,8 +4668,7 @@ async fn tags_delete(
         "/api/tags/{id}",
     )
     .await?;
-    let status = state.controller.status();
-    if status.state != CollectionState::Stopped {
+    if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
         return queue_pending_registry_change(
             &state,
             &headers,
@@ -4715,15 +4714,9 @@ async fn tags_delete(
         None,
     )
     .await;
-    commit_catalog_and_notify(
-        &state.manager,
-        &state.controller,
-        &state.events,
-        "tags",
-        snapshot,
-        state.legacy_live_reconfigure,
-    )
-    .await;
+    commit_catalog_and_notify(&state.controller, &state.events, "tags", snapshot)
+        .await
+        .map_err(RegistryMutationError::LiveApplyFailed)?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -4737,7 +4730,6 @@ struct PendingChangesAdminState {
     controller: Arc<CollectionController>,
     events: broadcast::Sender<ServerEvent>,
     apply_lock: Arc<AsyncMutex<()>>,
-    legacy_live_reconfigure: bool,
     auth: AuthState,
     commissioning: CommissioningState,
     audit: AuditLogService,
@@ -4795,7 +4787,13 @@ struct PendingBatchTagsDeletePayload {
 
 enum PendingApplyError {
     Api(ApiError),
-    CollectionEditLocked(CollectionStatusResponse),
+    /// #341（2026-09-14 オーナー回答）: 適用（DB への書き込み）は成功した
+    /// が、その内容を catalog / 走行中の収集へ反映できなかった
+    /// （[`commit_catalog_and_notify`] の `Err`）。`Api`/`Conflict` と違い
+    /// **pending change は `applied` へ遷移させる**（レジストリ行は既に
+    /// コミット済みで、`failed` にして再適用させると二重適用になる） -
+    /// [`pending_changes_apply`] がこの1件だけ特別扱いしている。
+    LiveApplyFailed(String),
     /// TAG-P0-3 follow-up（2026-08-12）: この pending change の
     /// `base_fingerprint` が、適用直前に再取得した対象リソースの現在値と
     /// 一致しない（＝ enqueue 後に別経路で変更または削除された）場合の
@@ -4865,8 +4863,8 @@ impl PendingApplyError {
                 "pending change の適用に失敗しました: {}",
                 banto_error_detail(&err.0)
             ),
-            Self::CollectionEditLocked(status) => {
-                format!("収集中は構成を編集できません(state={})", status.state)
+            Self::LiveApplyFailed(message) => {
+                format!("変更は保存しましたが、実行構成への反映に失敗しました: {message}")
             }
             Self::Conflict { resource } => pending_apply_conflict_message(resource),
         }
@@ -4877,13 +4875,13 @@ impl IntoResponse for PendingApplyError {
     fn into_response(self) -> Response {
         match self {
             Self::Api(err) => err.into_response(),
-            Self::CollectionEditLocked(status) => (
-                StatusCode::CONFLICT,
+            Self::LiveApplyFailed(message) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({
-                    "error": "collection_edit_locked",
-                    "state": status.state,
-                    "status": status,
-                    "message": "収集中は構成を編集できません。停止してから再試行してください。"
+                    "error": "live_reconfigure_failed",
+                    "message": format!(
+                        "変更は保存しましたが、実行構成への反映に失敗しました: {message}"
+                    ),
                 })),
             )
                 .into_response(),
@@ -4936,15 +4934,20 @@ async fn check_fingerprint_unchanged<T: Serialize>(
     }
 }
 
+/// #341（2026-09-14 オーナー回答「明示適用も無停止」）: かつてここには
+/// `CollectionState::Stopped` 要求（収集中は 409 `collection_edit_locked`）が
+/// あったが撤去した。ロックダウン済みで求められるワンクッションは
+/// 「pending queue + 人による明示適用」そのものであり、適用のために収集を
+/// 止める技術的な理由は T7（`Collector::apply_config` による接続単位の
+/// 部分再構成、二重接続窓の解消）以降もう無い - 反映は他の全 mutation と
+/// 同じく [`commit_catalog_and_notify`] に任せる（走行中なら
+/// [`CollectionController::commit_catalog_and_apply_live`] が無停止で
+/// 実行構成まで更新する）。per-resource フィンガープリントガード・
+/// キャンセル・requeue の導線はそのまま維持している。
 async fn execute_pending_apply(
     state: &PendingChangesAdminState,
     pending: &PendingChange,
 ) -> Result<(), PendingApplyError> {
-    let status = state.controller.status();
-    if status.state != CollectionState::Stopped {
-        return Err(PendingApplyError::CollectionEditLocked(status.into()));
-    }
-
     let mut tx = state
         .manager
         .pool()
@@ -5257,15 +5260,9 @@ async fn execute_pending_apply(
         return Err(PendingApplyError::Api(storage_api_error(err)));
     }
 
-    commit_catalog_and_notify(
-        &state.manager,
-        &state.controller,
-        &state.events,
-        resource,
-        snapshot,
-        state.legacy_live_reconfigure,
-    )
-    .await;
+    commit_catalog_and_notify(&state.controller, &state.events, resource, snapshot)
+        .await
+        .map_err(PendingApplyError::LiveApplyFailed)?;
 
     Ok(())
 }
@@ -5348,35 +5345,47 @@ async fn pending_changes_apply(
 
     if let Err(err) = execute_pending_apply(&state, &applying).await {
         let failure_reason = err.reason();
-        let failed = match state.pending_changes.mark_failed(id, &failure_reason).await {
-            Ok(failed) => Some(redact_pending_change_for_response(failed)),
-            Err(mark_err) => {
-                eprintln!(
-                    "banto-hub: pending_change={id} の failed 遷移に失敗しました: {mark_err}"
-                );
-                None
-            }
-        };
-
-        return match err {
-            PendingApplyError::CollectionEditLocked(status) => (
-                StatusCode::CONFLICT,
+        // #341: 実行構成への反映だけが失敗した場合、レジストリ行は既に
+        // コミット済みなので `failed`（= requeue して再適用しうる）へは
+        // 落とさず `applied` にする - 二重適用を作らないため。反映失敗
+        // 自体は 500 で伝え、詳細は `/api/v1/status` の
+        // `last_config_error` にも残る。
+        if let PendingApplyError::LiveApplyFailed(message) = &err {
+            let applied = match state.pending_changes.mark_applied(id).await {
+                Ok(applied) => Some(redact_pending_change_for_response(applied)),
+                Err(mark_err) => {
+                    eprintln!(
+                        "banto-hub: pending_change={id} の applied 遷移に失敗しました: {mark_err}"
+                    );
+                    None
+                }
+            };
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({
-                    "error": "collection_edit_locked",
-                    "state": status.state,
-                    "status": status,
-                    "message": "収集中は構成を編集できません。停止してから再試行してください。",
+                    "error": "live_reconfigure_failed",
+                    "message": format!(
+                        "変更は保存しましたが、実行構成への反映に失敗しました: {message}"
+                    ),
                     "failureReason": failure_reason,
-                    "pending": failed,
+                    "pending": applied,
                 })),
             )
-                .into_response(),
+                .into_response();
+        }
+        if let Err(mark_err) = state.pending_changes.mark_failed(id, &failure_reason).await {
+            eprintln!("banto-hub: pending_change={id} の failed 遷移に失敗しました: {mark_err}");
+        }
+
+        return match err {
             PendingApplyError::Api(err) => err.into_response(),
             // TAG-P0-3 follow-up（2026-08-12）: `IntoResponse` 実装がそのまま
             // 409 + conflict body を返す。`failure_reason` は既に
             // `mark_failed` で DB へ記録済みなので、`GET
             // /api/pending-changes/{id}` から後追いで確認できる。
             err @ PendingApplyError::Conflict { .. } => err.into_response(),
+            // #341: 上の分岐で早期 return 済み。
+            PendingApplyError::LiveApplyFailed(_) => unreachable!(),
         };
     }
 
@@ -5410,7 +5419,6 @@ fn pending_changes_router(
     manager: Arc<CollectorManager>,
     controller: Arc<CollectionController>,
     events: broadcast::Sender<ServerEvent>,
-    legacy_live_reconfigure: bool,
 ) -> Router {
     let state = PendingChangesAdminState {
         pending_changes,
@@ -5421,7 +5429,6 @@ fn pending_changes_router(
         controller,
         events,
         apply_lock: Arc::new(AsyncMutex::new(())),
-        legacy_live_reconfigure,
         auth: auth.clone(),
         commissioning: commissioning.clone(),
         audit: audit.clone(),
@@ -5560,8 +5567,8 @@ async fn tags_batch(
     .await?;
 
     if !body.dry_run {
-        let status = state.controller.status();
-        if status.state != CollectionState::Stopped {
+        if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning)
+        {
             return queue_pending_registry_change(
                 &state,
                 &headers,
@@ -5571,7 +5578,6 @@ async fn tags_batch(
             )
             .await;
         }
-        require_collection_stopped(&state)?;
     }
 
     let dry_run = body.dry_run;
@@ -5637,15 +5643,9 @@ async fn tags_batch(
                 )
                 .await;
                 // T11-1 の核心: n 件でも catalog commit はここで1回だけ。
-                commit_catalog_and_notify(
-                    &state.manager,
-                    &state.controller,
-                    &state.events,
-                    "tags",
-                    snapshot,
-                    state.legacy_live_reconfigure,
-                )
-                .await;
+                commit_catalog_and_notify(&state.controller, &state.events, "tags", snapshot)
+                    .await
+                    .map_err(RegistryMutationError::LiveApplyFailed)?;
             }
             Ok(Json(BatchTagsResponse {
                 ok: true,
@@ -5756,8 +5756,8 @@ async fn tags_batch_update(
     .await?;
 
     if !body.dry_run {
-        let status = state.controller.status();
-        if status.state != CollectionState::Stopped {
+        if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning)
+        {
             return queue_pending_registry_change(
                 &state,
                 &headers,
@@ -5767,7 +5767,6 @@ async fn tags_batch_update(
             )
             .await;
         }
-        require_collection_stopped(&state)?;
     }
 
     let dry_run = body.dry_run;
@@ -5834,15 +5833,9 @@ async fn tags_batch_update(
                 .await;
                 // T18-3b の核心 (tags_batch/T11-1 と同じ): n 件でも catalog
                 // commit はここで1回だけ。
-                commit_catalog_and_notify(
-                    &state.manager,
-                    &state.controller,
-                    &state.events,
-                    "tags",
-                    snapshot,
-                    state.legacy_live_reconfigure,
-                )
-                .await;
+                commit_catalog_and_notify(&state.controller, &state.events, "tags", snapshot)
+                    .await
+                    .map_err(RegistryMutationError::LiveApplyFailed)?;
             }
             Ok(Json(BatchTagsUpdateResponse {
                 ok: true,
@@ -5930,8 +5923,7 @@ async fn tags_batch_delete(
     )
     .await?;
 
-    let status = state.controller.status();
-    if status.state != CollectionState::Stopped {
+    if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
         return queue_pending_registry_change(
             &state,
             &headers,
@@ -6007,15 +5999,9 @@ async fn tags_batch_delete(
             .await;
             // tags_batch/tags_batch_update と同じ核心: n 件でも catalog
             // commit はここで1回だけ。
-            commit_catalog_and_notify(
-                &state.manager,
-                &state.controller,
-                &state.events,
-                "tags",
-                snapshot,
-                state.legacy_live_reconfigure,
-            )
-            .await;
+            commit_catalog_and_notify(&state.controller, &state.events, "tags", snapshot)
+                .await
+                .map_err(RegistryMutationError::LiveApplyFailed)?;
             Ok(Json(BatchTagsDeleteResponse {
                 ok: true,
                 count,
@@ -6041,7 +6027,6 @@ fn tag_registry_router(
     manager: Arc<CollectorManager>,
     controller: Arc<CollectionController>,
     events: broadcast::Sender<ServerEvent>,
-    legacy_live_reconfigure: bool,
 ) -> Router {
     let state = TagRegistryState {
         plc_connections,
@@ -6054,7 +6039,6 @@ fn tag_registry_router(
         controller: controller.clone(),
         events,
         pending_changes,
-        legacy_live_reconfigure,
     };
     Router::new()
         .route(
@@ -9291,7 +9275,18 @@ fn api_router_with_controller_mode(
     // `tag_space_router` のフィールド doc comment参照。ここで新規に
     // 構築すると REST/gRPC でレート制限のバジェットが分裂してしまう。
     rate_limiter: Arc<AsyncMutex<WriteRateLimiter>>,
-    legacy_live_reconfigure: bool,
+    // 互換ルーター（`api_router`、自前の `CollectionController` を内部で
+    // 作る既存の埋め込み先/テスト向け）として組み立てるか。
+    //
+    // #341（2026-09-14）までは `legacy_live_reconfigure` という名前で、
+    // `commit_catalog_and_notify` の「registry write でそのまま `apply_run`
+    // する」pre-T14-3 挙動の opt-in も兼ねていた。その役割は
+    // `crate::controller::CollectionController::commit_catalog_and_apply_live`
+    // （全ルーター共通の live re-apply）が引き取ったので削除し、**残る唯一の
+    // 意味**である T14-4 の `enforce_collection_state`（書き込みが収集状態を
+    // 見るか ＝ `tag_space_router`/`crate::mcp::mcp_router` へ
+    // `!legacy_compat_router` として渡す）に名前を合わせた。
+    legacy_compat_router: bool,
     // T15-3（設計 §6.3）: テスト出力の非永続フラグ - `controller`が保持
     // するものと**同じ** `Arc` を渡すこと（呼び出し元の責務、
     // `write_control`/`mqtt`/`grpc_server`と同じ規約）。ここで新規に
@@ -9380,7 +9375,6 @@ fn api_router_with_controller_mode(
             manager.clone(),
             controller.clone(),
             events.clone(),
-            legacy_live_reconfigure,
         ))
         // 外部 DB 連携 S4（design §5.2・§6-13）: `hub_sink_groups`の CRUD -
         // `tag_registry_router`と同じ認可（require_editor 書き込み・viewer
@@ -9408,7 +9402,6 @@ fn api_router_with_controller_mode(
             manager.clone(),
             controller.clone(),
             events.clone(),
-            legacy_live_reconfigure,
         ))
         .merge(write_control_router(
             write_control.clone(),
@@ -9530,12 +9523,11 @@ fn api_router_with_controller_mode(
             test_output.clone(),
             mqtt.clone(),
             system_info.clone(),
-            !legacy_live_reconfigure,
+            !legacy_compat_router,
             // T21 S1-b（docs/banto-hub-t21-design.md §5）: 構成補助ツール用
-            // - REST の他ルーターと同じ `audit`/`legacy_live_reconfigure` を
-            // そのまま共有する（このファイルの `.merge` 呼び出し規律と同じ）。
+            // - REST の他ルーターと同じ `audit` をそのまま共有する
+            // （このファイルの `.merge` 呼び出し規律と同じ）。
             audit.clone(),
-            legacy_live_reconfigure,
             // T21 S2-b: 設定 get/set ツール用 - 上の `grpc_settings_router`と
             // 同じ `Arc<GrpcServer>`（`grpc_server.clone()`）を共有する
             // （このファイルの `Arc` 共有規律と同じ）。
@@ -9573,7 +9565,7 @@ fn api_router_with_controller_mode(
             events,
             mqtt,
             rate_limiter,
-            !legacy_live_reconfigure,
+            !legacy_compat_router,
             test_output,
             system_info,
             sink_status,
@@ -10189,25 +10181,21 @@ mod tests {
         assert_ne!(status_body["connections"][0]["status"], "unused");
     }
 
-    /// T19 S2-a 案B (UX-48, docs/banto-hub-t19-design.md §3.8, 2026-09-03):
-    /// a manager/controller pair without the router/RBAC/session layer
-    /// around it, so the tests below can call `commit_catalog_and_notify`
-    /// (this file's own catalog-commit entry point - the ONE function every
-    /// registry-mutation handler and `execute_pending_apply` funnel
-    /// through, this fn's own doc comment) directly while the controller is
-    /// `Running`. That is a state none of this file's own HTTP handlers can
-    /// ever reach for a catalog-only commit: every one of them checks
-    /// `state.controller.status().state == CollectionState::Stopped`
-    /// first and queues the change as a pending one otherwise
-    /// (`require_collection_stopped`/`queue_pending_registry_change`), and
-    /// `execute_pending_apply` itself refuses to apply a queued change
-    /// unless the controller is `Stopped` too
-    /// (`PendingApplyError::CollectionEditLocked`). Calling the shared
-    /// commit function directly here is what lets these tests prove out the
-    /// underlying safety net (`CollectionController::
-    /// resync_sessions_for_catalog_change`) on its own terms, independent of
-    /// that REST-level policy layer - see that method's doc comment for why
-    /// the safety net has to exist regardless.
+    /// T19 S2-a 案B (UX-48, docs/banto-hub-t19-design.md §3.8, 2026-09-03)
+    /// で追加、#341 (2026-09-14) で live re-apply 経路の回帰テストとして
+    /// 引き継いだ: a manager/controller pair without the router/RBAC/session
+    /// layer around it, so the tests below can call
+    /// `commit_catalog_and_notify` (this file's own commit entry point - the
+    /// ONE function every registry-mutation handler and
+    /// `execute_pending_apply` funnel through, this fn's own doc comment)
+    /// directly while the controller is `Running`, without going through a
+    /// router whose `registry_change_should_queue` policy (試運転か
+    /// ロックダウン済みか) would decide for them. What these tests pin down
+    /// is the layer underneath that policy:
+    /// `CollectionController::commit_catalog_and_apply_live` must sync
+    /// broker sessions for a change committed while `Running` (案B の要件)
+    /// and must NOT dial anything while `Stopped` (T15-4 の要件) - both
+    /// regardless of which REST-level policy sent the change here.
     async fn catalog_resync_test_env() -> (
         Arc<CollectorManager>,
         Arc<CollectionController>,
@@ -10226,8 +10214,8 @@ mod tests {
     /// T19 S2-a 案B, "most important" per the implementation instructions:
     /// a catalog change committed while collection is `Stopped` must NOT
     /// dial a broker session - `CollectionController::
-    /// resync_sessions_for_catalog_change` only acts while `Running` (its
-    /// own doc comment). This is the direct evidence that 案B does not
+    /// commit_catalog_and_apply_live` only touches the collector/broker
+    /// sessions while `Running` (its own doc comment). This is the direct evidence that 案B does not
     /// reopen the T15-4 hazard (`crate::write_path`'s module doc comment,
     /// "gate 8 は broker セッションを新規に張らない") of dialing a PLC the
     /// operator meant to leave stopped.
@@ -10275,7 +10263,9 @@ mod tests {
             .unwrap();
 
         let snapshot = RegistrySnapshot::load(&pool).await.expect("snapshot");
-        commit_catalog_and_notify(&manager, &controller, &events, "tags", snapshot, false).await;
+        commit_catalog_and_notify(&controller, &events, "tags", snapshot)
+            .await
+            .expect("live apply");
 
         assert!(
             !manager.sessions().connection_ids().contains(&conn.id),
@@ -10342,7 +10332,9 @@ mod tests {
             .unwrap();
 
         let snapshot = RegistrySnapshot::load(&pool).await.expect("snapshot");
-        commit_catalog_and_notify(&manager, &controller, &events, "tags", snapshot, false).await;
+        commit_catalog_and_notify(&controller, &events, "tags", snapshot)
+            .await
+            .expect("live apply");
 
         assert!(
             manager.sessions().connection_ids().contains(&conn.id),
@@ -10431,15 +10423,9 @@ mod tests {
             .unwrap();
 
         let snapshot = RegistrySnapshot::load(&pool).await.expect("snapshot");
-        commit_catalog_and_notify(
-            &manager,
-            &controller,
-            &events,
-            "collection_groups",
-            snapshot,
-            false,
-        )
-        .await;
+        commit_catalog_and_notify(&controller, &events, "collection_groups", snapshot)
+            .await
+            .expect("live apply");
 
         assert!(
             !manager.sessions().connection_ids().contains(&conn.id),
@@ -11504,18 +11490,28 @@ mod tests {
         );
     }
 
-    #[test]
-    fn collection_edit_lock_is_http_409_with_current_status() {
-        let status = CollectionStatusResponse::from(CollectionStatus {
-            state: CollectionState::Running,
-            mode: RunMode::Configured,
-            run_id: Some(1),
-            last_error: None,
-            configured_revision: 4,
-            running_revision: 4,
-        });
-        let response = RegistryMutationError::CollectionEditLocked(status).into_response();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+    /// #341（2026-09-14）: 旧 `collection_edit_lock_is_http_409_with_current_status`
+    /// の置き換え。「収集中は一律 409」は撤回されたので、代わりに検証するのは
+    /// 「DB へは入ったが実行構成へ反映できなかった」ときの応答形
+    /// （200 + 警告ではなく 500 + `live_reconfigure_failed`）。
+    #[tokio::test]
+    async fn live_apply_failure_is_http_500_with_live_reconfigure_failed() {
+        let response =
+            RegistryMutationError::LiveApplyFailed("catalog の検証に失敗しました".to_string())
+                .into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "live_reconfigure_failed");
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("catalog の検証に失敗しました"),
+            "{body:?}"
+        );
     }
 
     #[tokio::test]
@@ -11674,7 +11670,7 @@ mod tests {
         assert_eq!(body["queued"], true);
         assert_eq!(
             body["message"],
-            "収集中のため変更を未適用キューに保存しました。"
+            "ロックダウン済みで収集中のため、変更を未適用キューに保存しました。"
         );
 
         let queued_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_changes")
@@ -11806,6 +11802,183 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(queued_count, 1);
+    }
+
+    /// #341（オーナー決定 2026-09-09、docs/tag-server-design.md §4.3）: 上の
+    /// `*_while_running_is_accepted_and_queued` 3本の**試運転中の兄弟** -
+    /// 同じ「収集中」でも、ロックダウン前（`test_env_unlocked`）なら pending
+    /// queue を経由せずその場で反映される。202 ではなく 200、
+    /// `pending_changes` 行は増えず、`configured_revision` が進む。
+    #[tokio::test]
+    async fn tags_create_while_running_and_commissioning_is_applied_immediately() {
+        let env = test_env_unlocked().await;
+
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line1", "host": "127.0.0.1", "port": 15122 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+
+        let (status, group) = admin_post(
+            &env.router,
+            "/api/collection-groups",
+            &env.admin_token,
+            json!({ "name": "fast", "plcConnectionId": conn["id"], "periodMs": 100 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{group:?}");
+
+        let start = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/start")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        let (_, before) = admin_get(&env.router, "/api/status", &env.admin_token).await;
+        let revision_before = before["configuredRevision"].as_u64().unwrap();
+
+        let (status, created) = admin_post(
+            &env.router,
+            "/api/tags",
+            &env.admin_token,
+            json!({
+                "name": "temp01",
+                "collectionGroupId": group["id"],
+                "address": "40001",
+                "dataType": "i16",
+                "enabled": true
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created:?}");
+        assert_eq!(created["name"], "temp01", "{created:?}");
+        assert!(created["queued"].is_null(), "{created:?}");
+
+        let queued_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_changes")
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+        assert_eq!(queued_count, 0, "試運転中は pending queue を経由しない");
+
+        let (_, after) = admin_get(&env.router, "/api/status", &env.admin_token).await;
+        assert!(
+            after["configuredRevision"].as_u64().unwrap() > revision_before,
+            "{after:?}"
+        );
+        // 収集は止まっていない（無停止反映）。
+        assert_eq!(after["collectionState"], "running", "{after:?}");
+    }
+
+    /// #341: 接続の作成版（[`tags_create_while_running_and_commissioning_is_applied_immediately`]
+    /// と同じ契約）。
+    #[tokio::test]
+    async fn plc_connections_create_while_running_and_commissioning_is_applied_immediately() {
+        let env = test_env_unlocked().await;
+
+        let start = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/start")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        let (status, created) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line-commissioning", "host": "127.0.0.1", "port": 15123 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created:?}");
+        assert_eq!(created["name"], "line-commissioning", "{created:?}");
+
+        let queued_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_changes")
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+        assert_eq!(queued_count, 0);
+    }
+
+    /// #341: 一括作成版（`tags.batch_create`）。
+    #[tokio::test]
+    async fn tags_batch_non_dry_run_while_running_and_commissioning_is_applied_immediately() {
+        let env = test_env_unlocked().await;
+
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line1", "host": "127.0.0.1", "port": 15124 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+
+        let (status, group) = admin_post(
+            &env.router,
+            "/api/collection-groups",
+            &env.admin_token,
+            json!({ "name": "fast", "plcConnectionId": conn["id"], "periodMs": 100 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{group:?}");
+
+        let start = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/start")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        let (status, body) = admin_post(
+            &env.router,
+            "/api/tags/batch",
+            &env.admin_token,
+            json!({
+                "dryRun": false,
+                "tags": [{
+                    "name": "temp01",
+                    "collectionGroupId": group["id"],
+                    "address": "40001",
+                    "dataType": "i16",
+                    "enabled": true
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["ok"], true, "{body:?}");
+        assert_eq!(body["count"], 1, "{body:?}");
+
+        let queued_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_changes")
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+        assert_eq!(queued_count, 0);
     }
 
     #[tokio::test]
@@ -12149,8 +12322,13 @@ mod tests {
         assert_eq!(created.password.as_deref(), Some(SECRET));
     }
 
+    /// #341（2026-09-14 オーナー回答「明示適用も無停止」）: 旧
+    /// `pending_changes_apply_while_running_returns_409_and_keeps_queue_row`
+    /// の置き換え。ロックダウン済み + 収集中に積まれた pending change は、
+    /// **収集を止めずに**明示適用でき、queue 行は `applied` へ遷移し、
+    /// 収集は `Running` のまま続く。
     #[tokio::test]
-    async fn pending_changes_apply_while_running_returns_409_and_keeps_queue_row() {
+    async fn pending_changes_apply_while_running_applies_without_stopping() {
         let env = test_env().await;
 
         let (status, conn) = admin_post(
@@ -12227,26 +12405,34 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(response.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"], "collection_edit_locked");
-        assert!(body["failureReason"].is_string());
-        assert_eq!(body["pending"]["state"], "failed");
+        assert_eq!(body["state"], "applied", "{body:?}");
 
         let pending = PendingChangesService::new(env.pool.clone())
             .get(pending_id)
             .await
             .unwrap();
-        assert_eq!(pending.state, PendingChangeState::Failed);
+        assert_eq!(pending.state, PendingChangeState::Applied);
 
-        let queued_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_changes")
-            .fetch_one(&env.pool)
-            .await
-            .unwrap();
-        assert_eq!(queued_count, 1);
+        // 適用されたタグが実際にレジストリへ入っている。
+        let (status, tags) = admin_get(&env.router, "/api/tags", &env.admin_token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            tags.as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == "temp-apply-running-01"),
+            "{tags:?}"
+        );
+
+        // 収集は止まっていない。
+        let (status, collection) = admin_get(&env.router, "/api/status", &env.admin_token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(collection["collectionState"], "running", "{collection:?}");
     }
 
     /// TAG-P0-3 follow-up（2026-08-14）: failed 状態の提案を requeue すると
@@ -12317,10 +12503,39 @@ mod tests {
             .as_i64()
             .expect("pending id should exist");
 
-        // 収集稼働中に apply → 409 collection_edit_locked で failed へ遷移
-        // （pending_changes_apply_while_running_returns_409_and_keeps_queue_row
-        // と同じ経路で failed 行を用意する）。
-        let apply_while_running = env
+        // #341（2026-09-14）: failed 行の作り方を差し替えた。以前は
+        // 「収集稼働中の apply は 409」を使っていたが、その 409 自体が
+        // 撤廃された（適用は無停止で通る）ので、代わりに**同じ名前のタグを
+        // 先に直接作っておく**ことで、適用時に一意制約で失敗させる
+        // （requeue が対象とする「一過性の失敗」の実例そのもの）。
+        let stop = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/stop")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop.status(), StatusCode::OK);
+        let (status, blocker) = admin_post(
+            &env.router,
+            "/api/tags",
+            &env.admin_token,
+            json!({
+                "name": "temp-requeue-basic-01",
+                "collectionGroupId": group["id"],
+                "address": "40002",
+                "dataType": "i16"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{blocker:?}");
+
+        let apply_conflicting = env
             .router
             .clone()
             .oneshot(
@@ -12332,7 +12547,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(apply_while_running.status(), StatusCode::CONFLICT);
+        assert!(
+            !apply_conflicting.status().is_success(),
+            "{:?}",
+            apply_conflicting.status()
+        );
 
         let pending_changes = PendingChangesService::new(env.pool.clone());
         let failed = pending_changes.get(pending_id).await.unwrap();
@@ -12362,8 +12581,9 @@ mod tests {
         assert_eq!(requeued.state, PendingChangeState::Pending);
     }
 
-    /// TAG-P0-3 follow-up（2026-08-14）: 一過性の失敗（収集稼働中の 409）は
-    /// requeue → 収集停止 → 再 apply で回復できることを確認する。
+    /// TAG-P0-3 follow-up（2026-08-14）: 一過性の失敗は requeue → 失敗要因の
+    /// 解消 → 再 apply で回復できることを確認する（#341 で「収集稼働中の
+    /// 409」が無くなったため、失敗要因は同名タグの一意制約違反に差し替えた）。
     #[tokio::test]
     async fn pending_changes_requeue_then_apply_succeeds_after_transient_failure_clears() {
         let env = test_env().await;
@@ -12430,7 +12650,39 @@ mod tests {
             .as_i64()
             .expect("pending id should exist");
 
-        let apply_while_running = env
+        // #341（2026-09-14）: 一過性の失敗の作り方を差し替えた（上の
+        // `pending_changes_requeue_endpoint_returns_pending_state` と同じ
+        // 理由）- 同名タグを先に直接作って一意制約違反で失敗させ、その
+        // 邪魔者を消してから requeue → 再 apply が通ることを確認する。
+        let stop = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/stop")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop.status(), StatusCode::OK);
+        let (status, blocker) = admin_post(
+            &env.router,
+            "/api/tags",
+            &env.admin_token,
+            json!({
+                "name": "temp-requeue-transient-01",
+                "collectionGroupId": group["id"],
+                "address": "40002",
+                "dataType": "i16"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{blocker:?}");
+        let blocker_id = blocker["id"].as_i64().expect("blocker tag id");
+
+        let apply_conflicting = env
             .router
             .clone()
             .oneshot(
@@ -12442,7 +12694,11 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(apply_while_running.status(), StatusCode::CONFLICT);
+        assert!(
+            !apply_conflicting.status().is_success(),
+            "{:?}",
+            apply_conflicting.status()
+        );
 
         let pending_changes = PendingChangesService::new(env.pool.clone());
         let failed = pending_changes.get(pending_id).await.unwrap();
@@ -12467,11 +12723,12 @@ mod tests {
         let requeue_body: serde_json::Value = serde_json::from_slice(&requeue_bytes).unwrap();
         assert_eq!(requeue_body["state"], "pending");
 
-        let stop = env
+        // 失敗要因（同名タグ）を取り除く = 一過性の失敗が解消した状態。
+        let delete_blocker = env
             .router
             .clone()
             .oneshot(
-                HttpRequest::post("/api/collection/stop")
+                HttpRequest::delete(format!("/api/tags/{blocker_id}"))
                     .header("Authorization", format!("Bearer {}", env.admin_token))
                     .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
                     .body(Body::empty())
@@ -12479,7 +12736,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(stop.status(), StatusCode::OK);
+        assert!(delete_blocker.status().is_success());
 
         let reapply = env
             .router

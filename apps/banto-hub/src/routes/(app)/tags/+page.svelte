@@ -500,6 +500,17 @@
 		const s = hubStatus;
 		return s !== null && s.collection_state === 'stopped';
 	});
+	/**
+	 * #341（オーナー決定 2026-09-09、`docs/tag-server-design.md` §4.3）:
+	 * 表編集を許すかどうか。**停止中、または試運転中（未ロックダウン）**。
+	 * 試運転中はサーバー側が収集中の CRUD をそのまま受け付けて無停止で
+	 * 反映する（`registry_change_should_queue` は「収集中 かつ ロック
+	 * ダウン済み」のときだけ queue する）ので、ここで停止を強いる理由が
+	 * 無くなった - 試運転は配線を直しながらタグを足す工程そのもの。
+	 * ロックダウン後は従来どおり「停止中のみ」に戻る（収集中の保存は 202
+	 * で未適用キューに積まれ、`QueuedWhileRunningError` になる）。
+	 */
+	const gridEditAllowed = $derived(collectionStopped || sessionStore.commissioningMode);
 
 	async function loadHubStatus(): Promise<void> {
 		try {
@@ -1175,14 +1186,15 @@
 
 	/**
 	 * 表編集モードのトグル。ONにするには収集停止中である必要がある
-	 * （実装指示「停止中ロック」、ボタン自体も `!collectionStopped` で
+	 * （実装指示「停止中ロック」。#341 以降は「停止中または試運転中」-
+	 * `gridEditAllowed` 参照。ボタン自体も `!gridEditAllowed` で
 	 * disabled にする - これは二重ガード）。ONにする前に選択モードが
 	 * 立っていれば終了する（相互排他、`toggleSelectionMode` と対称）。
 	 * OFFにするときは保留編集があれば破棄確認する。
 	 */
 	function toggleGridEditMode(): void {
 		if (!gridEditMode) {
-			if (!collectionStopped) return;
+			if (!gridEditAllowed) return;
 			if (selectionMode) {
 				selectionMode = false;
 				selectedIds = new Set();
@@ -1197,7 +1209,7 @@
 	/**
 	 * BantoGrid `onCellEdit`（1セル編集）。BantoGrid の列 `validate` が既に
 	 * 不正値を弾いた後にしか呼ばれないため、ここでは保留バッファへ積むだけ
-	 * （即保存しない）。`editable` は `gridEditMode && collectionStopped` の
+	 * （即保存しない）。`editable` は `gridEditMode && gridEditAllowed` の
 	 * ときしか true にならないので、このハンドラ自体は常時登録したままで
 	 * 安全（`editable` が false のセルはそもそも edit セッションへ入れない）。
 	 */
@@ -1241,16 +1253,17 @@
 	 * 「保存」— `buildTagCellEditBatch` で組み立てた行を `updateTagsBatch`
 	 * の dry-run（全構成 preflight）にかけ、結果を確認パネルに表示する
 	 * （実装指示「保留バッファ→preflight→差分確認→all-or-nothing 適用」）。
-	 * 保存直前に収集状態を再確認する - 稼働中に切り替わっていれば preflight
-	 * すら投げず、確認パネルも開かない（停止中ロックの最終防波堤）。
+	 * 保存直前に収集状態を再確認する - 編集できない状態（ロックダウン済み
+	 * かつ稼働中）に切り替わっていれば preflight すら投げず、確認パネルも
+	 * 開かない（ロックの最終防波堤）。
 	 */
 	async function handleSaveGridEdits(): Promise<void> {
 		if (cellEditBatch.rows.length === 0) return;
 		await loadHubStatus();
-		if (!collectionStopped) {
+		if (!gridEditAllowed) {
 			toastStore.push(
 				'error',
-				'収集稼働中は表編集を保存できません。収集を停止してから再度お試しください。'
+				'ロックダウン後は収集稼働中に表編集を保存できません。収集を停止してから再度お試しください。'
 			);
 			return;
 		}
@@ -3254,11 +3267,12 @@
 	 * 重く、単票 Drawer に誘導する設計判断、実装指示 T18-3e 参照）。
 	 *
 	 * 各 editable 列の `editable` は関数形 `() => gridEditMode &&
-	 * collectionStopped` - 「表編集モードON」かつ「収集停止中」の両方を
-	 * 満たす間だけ実際に編集できる（停止中ロック）。
+	 * gridEditAllowed` - 「表編集モードON」かつ「収集停止中または試運転中」
+	 * （#341、`gridEditAllowed` の doc comment 参照）の両方を満たす間だけ
+	 * 実際に編集できる。
 	 */
 	const columns = $derived.by((): GridColumn<Tag>[] => {
-		const cellEditable = () => gridEditMode && collectionStopped;
+		const cellEditable = () => gridEditMode && gridEditAllowed;
 		const base: GridColumn<Tag>[] = [
 			{ id: 'id', header: 'ID', accessor: 'id', width: 60, align: 'right' },
 			{
@@ -4412,15 +4426,18 @@
 							>
 								{selectionMode ? '複数選択を終了' : '複数選択'}
 							</button>
-							<!-- T18-3e: セル編集/TSV貼付の表編集モード。収集停止中のみON にできる
-								（停止中ロック、`toggleGridEditMode` の doc comment 参照）。ON中は
+							<!-- T18-3e: セル編集/TSV貼付の表編集モード。収集停止中、または
+								試運転中（#341）のみ ON にできる（`gridEditAllowed` /
+								`toggleGridEditMode` の doc comment 参照）。ON中は
 								selectionMode と相互排他。 -->
 							<button
 								type="button"
 								class="secondary"
 								data-testid="tag-grid-edit-mode-toggle"
-								disabled={!gridEditMode && !collectionStopped}
-								title={!collectionStopped ? '収集停止中のみ表編集できます' : undefined}
+								disabled={!gridEditMode && !gridEditAllowed}
+								title={!gridEditAllowed
+									? 'ロックダウン後は収集停止中のみ表編集できます'
+									: undefined}
 								onclick={toggleGridEditMode}
 							>
 								{gridEditMode ? '表編集を終了' : '表編集'}
@@ -4451,12 +4468,14 @@
 						/>
 						<span class="count">{filteredTags.length} / {visibleTags.length} 件</span>
 					</div>
-					{#if canWrite && hubStatus !== null && !collectionStopped}
-						<!-- T18-3e: 停止中ロックの説明バナー - `hubStatus` 取得前
+					{#if canWrite && hubStatus !== null && !gridEditAllowed}
+						<!-- T18-3e: ロックの説明バナー - `hubStatus` 取得前
 							（`null`）は誤って「稼働中」と表示しないよう、取得済みの
-							ときだけ出す（実装指示「稼働中は編集不可で…バナー/無効表示」）。 -->
+							ときだけ出す（実装指示「稼働中は編集不可で…バナー/無効表示」）。
+							#341: 試運転中は収集中でも表編集できるので、このバナーは
+							ロックダウン済み + 稼働中のときだけ出る。 -->
 						<p class="note" data-testid="tag-grid-edit-locked-note">
-							収集稼働中のため表編集はできません（収集を停止すると表編集を有効にできます）。
+							ロックダウン後は収集稼働中に表編集はできません（収集を停止すると表編集を有効にできます）。
 						</p>
 					{/if}
 					{#if canWrite && gridEditMode && pendingCellEdits.length > 0}

@@ -1539,10 +1539,16 @@ async fn delete_connection_with_confirm_deletes_and_audits() {
     );
 }
 
+/// #341（オーナー決定 2026-09-09、docs/tag-server-design.md §4.3）:
+/// **ロックダウン済み**のときだけ pending queue を経由する - `test_app` は
+/// 試運転モード（未ロックダウン）が既定なので、このテストは明示的に
+/// `lock_down()` してからでないと queue の挙動を検証できない（試運転中の
+/// 即時反映版は下の `*_while_running_and_commissioning_is_applied_immediately`）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_connection_while_collection_running_is_queued_not_applied() {
     let app = test_app("config-create-running").await;
     let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    app.commissioning.lock_down().await.expect("lock_down");
     start_collection(&app.router, &app.admin_token).await;
     let before_rows = plc_connections_row_count(&app).await;
     let audit_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
@@ -2472,11 +2478,17 @@ async fn delete_group_with_confirm_cascades_and_audits() {
     );
 }
 
+/// #341（オーナー決定 2026-09-09、docs/tag-server-design.md §4.3）:
+/// **ロックダウン済み**のときだけ pending queue を経由する - `test_app` は
+/// 試運転モード（未ロックダウン）が既定なので、このテストは明示的に
+/// `lock_down()` してからでないと queue の挙動を検証できない（試運転中の
+/// 即時反映版は下の `*_while_running_and_commissioning_is_applied_immediately`）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_group_while_collection_running_is_queued_not_applied() {
     let app = test_app("s1c-create-group-running").await;
     let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
     let conn_id = create_test_connection(&app, "line1", 15022).await;
+    app.commissioning.lock_down().await.expect("lock_down");
     start_collection(&app.router, &app.admin_token).await;
     let before_rows = collection_groups_row_count(&app).await;
     let audit_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
@@ -3146,6 +3158,11 @@ async fn delete_tag_with_confirm_deletes_and_audits() {
     );
 }
 
+/// #341（オーナー決定 2026-09-09、docs/tag-server-design.md §4.3）:
+/// **ロックダウン済み**のときだけ pending queue を経由する - `test_app` は
+/// 試運転モード（未ロックダウン）が既定なので、このテストは明示的に
+/// `lock_down()` してからでないと queue の挙動を検証できない（試運転中の
+/// 即時反映版は下の `*_while_running_and_commissioning_is_applied_immediately`）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_tag_while_collection_running_is_queued_not_applied() {
     let app = test_app("s1d-create-tag-running").await;
@@ -3155,6 +3172,7 @@ async fn create_tag_while_collection_running_is_queued_not_applied() {
         .create(group_input("fast", conn_id, 100))
         .await
         .unwrap();
+    app.commissioning.lock_down().await.expect("lock_down");
     start_collection(&app.router, &app.admin_token).await;
     let before_rows = tags_row_count(&app).await;
     let audit_count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
@@ -3211,6 +3229,118 @@ async fn create_tag_while_collection_running_is_queued_not_applied() {
         latest_audit_column(&app, "resource").await.as_deref(),
         Some("tags")
     );
+}
+
+/// #341: 上の queue 版の**試運転中の兄弟** - `test_app` の既定（未ロック
+/// ダウン）のまま収集中に `create_connection` を呼ぶと、queue を経由せず
+/// その場で作成される。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_connection_while_running_and_commissioning_is_applied_immediately() {
+    let app = test_app("config-create-running-commissioning").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    start_collection(&app.router, &app.admin_token).await;
+    let before_rows = plc_connections_row_count(&app).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_connection",
+            json!({ "name": "line-commissioning", "host": "127.0.0.1", "port": 15022 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert!(payload["queued"].is_null(), "{payload:?}");
+    assert_eq!(
+        payload["created"]["name"], "line-commissioning",
+        "{payload:?}"
+    );
+
+    assert_eq!(plc_connections_row_count(&app).await, before_rows + 1);
+    let pending_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_changes")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(pending_count, 0, "試運転中は pending queue を経由しない");
+}
+
+/// #341: グループ版（[`create_connection_while_running_and_commissioning_is_applied_immediately`]
+/// と同じ契約）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_group_while_running_and_commissioning_is_applied_immediately() {
+    let app = test_app("s1c-create-group-running-commissioning").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    start_collection(&app.router, &app.admin_token).await;
+    let before_rows = collection_groups_row_count(&app).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_group",
+            json!({ "name": "fast-commissioning", "plcConnectionId": conn_id, "periodMs": 100 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert!(payload["queued"].is_null(), "{payload:?}");
+
+    assert_eq!(collection_groups_row_count(&app).await, before_rows + 1);
+    let pending_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_changes")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(pending_count, 0);
+}
+
+/// #341: タグ版（同上）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_tag_while_running_and_commissioning_is_applied_immediately() {
+    let app = test_app("s1d-create-tag-running-commissioning").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+    start_collection(&app.router, &app.admin_token).await;
+    let before_rows = tags_row_count(&app).await;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_tag",
+            json!({
+                "name": "temp-commissioning",
+                "collectionGroupId": group.id,
+                "address": "D100",
+                "dataType": "u16",
+                "enabled": true,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert!(payload["queued"].is_null(), "{payload:?}");
+
+    assert_eq!(tags_row_count(&app).await, before_rows + 1);
+    let pending_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_changes")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(pending_count, 0);
 }
 
 // ---------------------------------------------------------------------------

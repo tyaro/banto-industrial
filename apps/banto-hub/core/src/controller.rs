@@ -114,9 +114,14 @@ pub struct CollectionController {
     /// `PUT /api/collection/mode`、MCP の `collection_control`、Windows
     /// サービス起動時の自動 start がすべてそこへ集まる）。`CollectorManager`
     /// 側（`apply_run`/`stop`）に置くと、収集の遷移ではない
-    /// `crate::rest::commit_catalog_and_notify` の legacy live reconfigure
-    /// も `apply_run` を呼ぶため、「停止中なのに DB へ繋ぐ」経路が1本
-    /// 残ってしまう。
+    /// [`Self::commit_catalog_and_apply_live`]（#341 の live re-apply。
+    /// 2026-09-14 より前は `commit_catalog_and_notify` の legacy live
+    /// reconfigure）も `apply_run` を呼ぶため、「停止中なのに DB へ繋ぐ」
+    /// 経路が1本残ってしまう。なお `commit_catalog_and_apply_live` は
+    /// `Running` のときしか `apply_run` を呼ばないので、DB Source の
+    /// task を起こす/落とす点が増えることはない（plan の入れ替えは
+    /// `commit_catalog` が担当し、走行中なら接続単位の差分で task を
+    /// 作り直す - `crate::db_source` のモジュール doc comment 参照）。
     db_source: Arc<DbSourceEngine>,
     state: Mutex<ControllerState>,
     transition: AsyncMutex<()>,
@@ -189,52 +194,91 @@ impl CollectionController {
         self.status_tx.send_replace(self.status());
     }
 
-    /// T19 S2-a 案B (UX-48, docs/banto-hub-t19-design.md §3.8, 2026-09-03):
-    /// re-sync broker sessions against `snapshot` after a catalog-only
-    /// commit (`crate::rest::commit_catalog_and_notify`, the only intended
-    /// caller), closing the gap where a tag added to a previously-tagless
-    /// connection (or the last tag/group removed from one) would not affect
-    /// broker sessions - and therefore the write path
-    /// (`crate::hub::CollectorManager::write_broker_handle_peek`) - until
-    /// the next `start`/`stop` cycle.
+    /// #341（オーナー決定 2026-09-09 / 2026-09-14、`docs/tag-server-design.md`
+    /// §4.3）: 直前にコミットされたレジストリ変更を catalog へ反映し、収集が
+    /// 実際に `Running` なら**収集を止めずに実行構成へも反映する** -
+    /// [`crate::rest::commit_catalog_and_notify`]（REST/MCP の全レジストリ
+    /// mutation と `execute_pending_apply` が必ず通る唯一の点）専用の
+    /// primitive で、他に呼び出し元を作らないこと。
     ///
-    /// **Serialized against `start`/`stop` via the SAME `transition` lock
-    /// those use** (`try_lock`, identical discipline to
-    /// [`Self::start`]/[`Self::stop`] above): if a start or stop is already
-    /// in flight, this does nothing - that in-flight transition is itself
-    /// about to either establish or tear down every broker session
-    /// correctly (via [`CollectorManager::apply_run`]/[`CollectorManager::stop`]),
-    /// so there is nothing left for this call to add, and calling
-    /// [`CollectorManager::resync_broker_sessions`] concurrently with it
-    /// would be exactly the hazard the next paragraph describes. This is
-    /// what keeps a catalog-driven resync from ever racing
-    /// [`Self::stop_locked`]'s call into `CollectorManager::stop` - the
-    /// T15-4-shaped danger 案B has to avoid re-introducing (see
-    /// `CollectorManager::resync_broker_sessions`'s own doc comment for the
-    /// full derivation: `CollectorManager::stop` does not take the
-    /// manager's own `rebuild_lock`, so only this `transition` lock stands
-    /// between "stop just tore a session down" and "resync re-dials it a
-    /// moment later").
+    /// # なぜ `commit_catalog` + `apply_run` で、`rebuild` ではないのか
     ///
-    /// **Only resyncs while the controller reports `Running`** - a
-    /// `Stopped`/`Starting`/`Stopping`/`Faulted` controller has no broker
-    /// sessions that should exist at all (a `Stopped` controller in
-    /// particular has none at all - `CollectorManager::stop` already tore
-    /// every one of them down), and dialing one here on a catalog commit
-    /// made while stopped would be exactly the "PLC we meant to leave
-    /// stopped gets dialed anyway" mistake T15-4 fixed once already for the
-    /// write path.
-    pub async fn resync_sessions_for_catalog_change(&self, snapshot: &RegistrySnapshot) {
-        let Ok(_guard) = self.transition.try_lock() else {
-            return;
-        };
+    /// - [`CollectorManager::commit_catalog`] が catalog・演算タグ plan・
+    ///   DB Source plan を同じ点で入れ替え、`configured_revision` を進めて
+    ///   `config_changed`（`revision_tx`）を飛ばす = 外部クライアントが
+    ///   catalog を取り直す契機（設計 §4.1）。
+    /// - [`CollectorManager::apply_run`] が `runtime_snapshot_for_mode` で
+    ///   **今の run mode のオーバーライドを尊重した**構成を組み立ててから
+    ///   [`banto_collect::Collector::apply_config`]（T7 の接続単位の部分
+    ///   再構成）へ通し、broker セッションの追加/削除も同じ順序
+    ///   （collect タスク停止 → セッション削除）で同期する。
+    /// - [`CollectorManager::rebuild`] は run mode を一切見ず
+    ///   `RegistrySnapshot` をそのまま `build_config_from` へ渡すため、
+    ///   `AllSimulation` で稼働中にこれを呼ぶと**シミュレーション中のはずの
+    ///   接続が実機へダイヤルされる**。live re-apply の primitive には
+    ///   絶対に使えない（これが `apply_run` を選んだ決定的な理由）。
+    ///
+    /// この構成により、T19 S2-a 案B の `resync_sessions_for_catalog_change`
+    /// （catalog-only commit のときに broker セッションだけ同期していた、
+    /// #341 で撤去）が抱えていた「最後のグループを失った接続の collect
+    /// タスクが、セッション削除後もしばらく古いセッションを読み続けうる」
+    /// 隙間も閉じる - `apply_run` は collector 側のコミット（= 当該タスクの
+    /// 停止）が終わってから `remove_stale_broker_sessions` する。
+    ///
+    /// # 並行性の前提と保証
+    ///
+    /// - **`start`/`stop`/`set_mode` と同じ `transition` ロックを取る**
+    ///   （`try_lock` ではなく `lock().await` - 進行中の遷移が終わるのを
+    ///   待って必ず適用する。`try_lock` で諦めると「DB にはあるのに走って
+    ///   いる構成には無い」状態を無言で残してしまい、#341 が塞ごうとして
+    ///   いる穴そのものになる）。ロック順序は常に `transition` →
+    ///   `CollectorManager::rebuild_lock` の一方向で、逆順に取る経路は
+    ///   存在しない（`rebuild`/`commit_catalog`/`apply_run` はこの
+    ///   controller を一切参照しない）ためデッドロックしない。呼び出し元
+    ///   （REST ハンドラ）は DB トランザクションを既にコミット済みで、
+    ///   他のロックを保持していないことも前提。
+    /// - 逆に、この適用中に届いた `start`/`stop` は（両者の `try_lock` が
+    ///   外れて）現在の状態を返すだけの no-op になる - 撤去した
+    ///   `resync_sessions_for_catalog_change` と同じ既知の性質で、
+    ///   `CollectorManager::stop` は `rebuild_lock` を取らないため、
+    ///   「stop が落としたセッションを直後に張り直す」T15-4 型の事故を
+    ///   防いでいるのはこの `transition` ロックだけである。
+    /// - **適用順序**: `commit_catalog` と `apply_run` の対がこのロックで
+    ///   直列化されるので、連続した CRUD が適用を追い越し合うことはない。
+    ///   `apply_run` は自分でレジストリを読み直す（`RegistrySnapshot::load`）
+    ///   ため、**最後に走った適用は常に最新の DB 状態を反映する**。
+    /// - 既知の（#341 以前からある）狭い窓: `commit_catalog` に渡すのは
+    ///   呼び出し元のトランザクション内 snapshot なので、2つの CRUD が
+    ///   「A が tx commit → B が tx commit → B が catalog commit → A が
+    ///   catalog commit」の順に並ぶと catalog だけ一瞬 B の行を欠く。
+    ///   collector 側は `apply_run` の読み直しで常に最新、次のどの CRUD の
+    ///   catalog commit でも解消する。#341 はこの既存の性質を変えない。
+    ///
+    /// # 失敗時
+    ///
+    /// `Err` は「DB には入ったが実行構成へ反映できなかった」ことだけを
+    /// 意味する（レジストリ行そのものは既にコミット済み）。`apply_config`
+    /// は all-or-nothing なので走行中の収集は元の構成のまま無傷で、
+    /// 状態も `Running` のまま（`Faulted` にはしない - 収集自体は正常に
+    /// 続いている）。`CollectorManager` 側が `last_error`
+    /// （`/api/v1/status` の `last_config_error`）に記録し、呼び出し元は
+    /// これを API のエラーとして返す。
+    ///
+    /// `Running` 以外（`Stopped`/`Starting`/`Stopping`/`Faulted`）では
+    /// catalog だけをコミットして返る - 停止中の catalog commit で PLC へ
+    /// ダイヤルしてしまう T15-4 型の事故を起こさないため、**`Running` の
+    /// 確認は必ずこのロックの下で行う**。
+    pub async fn commit_catalog_and_apply_live(
+        &self,
+        snapshot: &RegistrySnapshot,
+    ) -> Result<(), String> {
+        let _guard = self.transition.lock().await;
+        self.manager.commit_catalog(snapshot).await?;
         let current = self.status();
         if current.state != CollectionState::Running {
-            return;
+            return Ok(());
         }
-        self.manager
-            .resync_broker_sessions(snapshot, current.mode)
-            .await;
+        self.manager.apply_run(current.mode).await
     }
 
     /// Start the requested mode. A request arriving during another transition

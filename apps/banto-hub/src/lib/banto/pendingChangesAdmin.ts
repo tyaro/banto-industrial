@@ -24,32 +24,14 @@ export interface PendingChange {
 	failureReason: string | null;
 }
 
-/** 409 `collection_edit_locked` の応答本体。 */
-export interface PendingApplyConflict {
-	error: 'collection_edit_locked';
-	state: unknown;
-	status: unknown;
-	message: string;
-	failureReason?: string;
-	pending?: PendingChange;
-}
-
-export class PendingApplyConflictError extends Error implements PendingApplyConflict {
-	readonly error = 'collection_edit_locked';
-	readonly state: unknown;
-	readonly status: unknown;
-	readonly failureReason?: string;
-	readonly pending?: PendingChange;
-
-	constructor(body: PendingApplyConflict) {
-		super(body.message);
-		this.name = 'PendingApplyConflictError';
-		this.state = body.state;
-		this.status = body.status;
-		this.failureReason = body.failureReason;
-		this.pending = body.pending;
-	}
-}
+// #341（2026-09-14 オーナー回答「明示適用も無停止」）: ここには 409
+// `collection_edit_locked`（収集稼働中の適用拒否）の応答型
+// `PendingApplyConflict` / `PendingApplyConflictError` と、その 409 を
+// 判別する `isPendingApplyConflictBody` / `mapApplyConflict` /
+// `isPendingApplyConflictError` があったが、サーバー側がその 409 を返さなく
+// なったので丸ごと撤去した（適用は収集を止めずに通る）。適用時に残る 409 は
+// per-resource フィンガープリント不一致（`pending_apply_conflict`）だけで、
+// これは従来どおり汎用エラーとして表示する。
 
 const NETWORK_ERROR_MESSAGE = 'サーバーに接続できません';
 
@@ -66,52 +48,6 @@ function isErrorBody(value: unknown): value is ErrorBody {
 	if (typeof value !== 'object' || value === null) return false;
 	const kind = (value as { kind?: unknown }).kind;
 	return typeof kind === 'string' && ERROR_KINDS.has(kind);
-}
-
-function isPendingChange(value: unknown): value is PendingChange {
-	if (typeof value !== 'object' || value === null) return false;
-	const candidate = value as {
-		id?: unknown;
-		state?: unknown;
-		source?: unknown;
-		createdAt?: unknown;
-	};
-	return (
-		typeof candidate.id === 'number' &&
-		typeof candidate.state === 'string' &&
-		typeof candidate.source === 'string' &&
-		typeof candidate.createdAt === 'string'
-	);
-}
-
-function isPendingApplyConflictBody(value: unknown): value is PendingApplyConflict {
-	if (typeof value !== 'object' || value === null) return false;
-	const candidate = value as {
-		error?: unknown;
-		state?: unknown;
-		status?: unknown;
-		message?: unknown;
-		failureReason?: unknown;
-		pending?: unknown;
-	};
-	if (candidate.error !== 'collection_edit_locked' || typeof candidate.message !== 'string') {
-		return false;
-	}
-	if (
-		candidate.failureReason !== undefined &&
-		candidate.failureReason !== null &&
-		typeof candidate.failureReason !== 'string'
-	) {
-		return false;
-	}
-	if (
-		candidate.pending !== undefined &&
-		candidate.pending !== null &&
-		!isPendingChange(candidate.pending)
-	) {
-		return false;
-	}
-	return true;
 }
 
 function currentToken(): string | null {
@@ -165,13 +101,20 @@ async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
 	return (await response.json()) as T;
 }
 
-function mapApplyConflict(body: unknown, status: number): Error | undefined {
-	if (status !== 409 || !isPendingApplyConflictBody(body)) return undefined;
-	return new PendingApplyConflictError(body);
-}
-
-export function isPendingApplyConflictError(error: unknown): error is PendingApplyConflictError {
-	return error instanceof PendingApplyConflictError;
+/**
+ * #341（2026-09-14）: 適用そのものは成功したが、実行構成への反映に失敗した
+ * ときの 500 `live_reconfigure_failed`。`message` にサーバー側の理由が入って
+ * いるので、汎用の「500 Internal Server Error」ではなくそれを見せる
+ * （pending change 自体は `applied` になっている - サーバー側
+ * `pending_changes_apply` のコメント参照）。
+ */
+function mapLiveReconfigureFailure(body: unknown, status: number): Error | undefined {
+	if (status !== 500 || typeof body !== 'object' || body === null) return undefined;
+	const candidate = body as { error?: unknown; message?: unknown };
+	if (candidate.error !== 'live_reconfigure_failed' || typeof candidate.message !== 'string') {
+		return undefined;
+	}
+	return new ProviderError({ kind: 'other', message: candidate.message });
 }
 
 export async function listPendingChanges(limit = 100): Promise<PendingChange[]> {
@@ -182,7 +125,7 @@ export async function listPendingChanges(limit = 100): Promise<PendingChange[]> 
 export async function applyPendingChange(id: number): Promise<PendingChange> {
 	return httpRequest<PendingChange>(`/api/pending-changes/${id}/apply`, {
 		method: 'POST',
-		mapErrorBody: mapApplyConflict
+		mapErrorBody: mapLiveReconfigureFailure
 	});
 }
 
