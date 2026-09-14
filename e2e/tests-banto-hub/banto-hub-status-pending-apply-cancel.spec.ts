@@ -4,14 +4,24 @@
  * - 収集中に構成変更を送ると pending へ積まれる
  * - status 画面の Pending changes からキャンセル/適用できる
  *
- * ファイル名について: 全 spec は単一 webServer / 単一 SQLite DB を共有し、
- * `banto-hub-smoke.spec.ts` の test 1「first-run setup」だけが「DB 未初期化
- * ＝初回セットアップ画面が出る」ことを実 DOM で検証する（`banto-hub-auth.ts`
- * の `fetchAuthToken` 参照）。本 spec の `beforeAll` は `fetchAuthToken` で
- * 認証を取得する際に DB を初期化してしまうため、ファイル名順で smoke より
- * 先に実行されると smoke test 1 を壊す。そのため `banto-hub-pending-...`
- * ではなく `banto-hub-status-pending-...`（`st` > `sm`）とし、辞書順で
- * smoke より後にソートされるようにしている。
+ * **この spec だけ「ロックダウン済み専用サーバー」で走る（#341、2026-09-14）**:
+ * 2026-09-09 オーナー決定により、**試運転モード（未ロックダウン）では収集中の
+ * 構成 CRUD が未適用キューを経由せず即時・無停止で反映される**ようになった
+ * （`docs/tag-server-design.md` §4.3）。このスイートの webServer は一度も
+ * ロックダウンしないので、そのままだと `queueTagWhileRunning` が 202 ではなく
+ * 200 を受け取って成立しない。かといって共有サーバーを途中でロックダウンすると
+ * 後続の spec（初回セットアップ前提の smoke、認証バイパス前提のもの）が壊れる。
+ * そこで `banto-hub.playwright.config.ts` に**別ポート・別 profile の2台目**と
+ * `chromium-locked-down` プロジェクトを用意し、この spec だけをそこで実行する
+ * （upstream banto の e2e `public-viewer` プロジェクトと同じ型）。下の
+ * `beforeAll` が初回セットアップ直後にそのサーバーをロックダウンする。
+ *
+ * ファイル名について: `banto-hub-smoke.spec.ts` の test 1「first-run setup」
+ * だけが「DB 未初期化＝初回セットアップ画面が出る」ことを実 DOM で検証する
+ * （`banto-hub-auth.ts` の `fetchAuthToken` 参照）。本 spec は #341 以降
+ * 別サーバー・別 DB になったので smoke とは干渉しなくなったが、ファイル名は
+ * `banto-hub-status-pending-...`（`st` > `sm`）のまま据え置く（辞書順の前提を
+ * 崩さない）。
  */
 import { expect, test, type Page } from '@playwright/test';
 import { CSRF_HEADERS, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
@@ -32,6 +42,25 @@ test.describe.serial('banto-hub pending apply/cancel', () => {
 		token = await fetchAuthToken(page.request);
 		await injectAuthToken(page, token);
 		const authedHeaders = { ...CSRF_HEADERS, Authorization: `Bearer ${token}` };
+
+		// #341: この spec は**ロックダウン済み**の契約（収集中の CRUD は
+		// 未適用キューへ、適用は明示操作で・ただし無停止）を固定する。
+		// 専用サーバー（`chromium-locked-down` プロジェクトの baseURL）
+		// なので、ここで不可逆のロックダウンを実行してよい。冪等なので
+		// Playwright の retry で2回目に入っても失敗しない。
+		const lockDownRes = await page.request.post('/api/commissioning/lock-down', {
+			headers: authedHeaders
+		});
+		expect(lockDownRes.ok(), await lockDownRes.text()).toBe(true);
+		const commissioningRes = await page.request.get('/api/commissioning/status', {
+			headers: CSRF_HEADERS
+		});
+		expect(commissioningRes.ok()).toBe(true);
+		const commissioning = (await commissioningRes.json()) as { lockedDown?: boolean };
+		expect(
+			commissioning.lockedDown,
+			'この spec はロックダウン済み専用サーバーで走る前提（#341）'
+		).toBe(true);
 
 		const connectionRes = await page.request.post('/api/plc-connections', {
 			headers: authedHeaders,

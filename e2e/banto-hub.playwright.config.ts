@@ -47,6 +47,26 @@ const repoRoot = path.resolve(dirname, '..');
 const PORT = 8799;
 const BASE_URL = `http://127.0.0.1:${PORT}`;
 
+// #341（2026-09-14）: **ロックダウン済み専用の2台目**。試運転中（未ロック
+// ダウン）は収集中の構成 CRUD が即時・無停止で反映されるようになったため、
+// 「収集中の CRUD は未適用キューへ積まれる」ことを見る
+// `banto-hub-status-pending-apply-cancel.spec.ts` だけは**ロックダウン済み**の
+// サーバーが要る。一方このスイートの他の spec は試運転モード（＝認証バイパス
+// 無しでも admin トークンで動くが、ロックダウンすると初回セットアップ前提の
+// smoke が壊れる）を前提に組まれていて、同じサーバーを途中でロックダウンする
+// と後続が壊れる（`banto-hub-tags-tree-context-menu.spec.ts` 冒頭の注記と
+// 同じ理由）。そこで upstream banto の e2e `public-viewer`（別ポートの2本目
+// banto-serve）と同じ型で、サーバーごと分ける。
+//
+// ポートは 8802 - 8798 chronogazer / 8799 banto-hub 本体 /
+// 8800 relay-wright / 8801 banto-hub perf（`banto-hub-perf.playwright.config.ts`）
+// のいずれとも衝突しない（指示の 8801 は perf が既に使用済みのため1つずらした）。
+const LOCKED_DOWN_PORT = 8802;
+const LOCKED_DOWN_BASE_URL = `http://127.0.0.1:${LOCKED_DOWN_PORT}`;
+
+/** ロックダウン済みサーバーで走らせる唯一の spec（下記 `projects` 参照）。 */
+const LOCKED_DOWN_SPEC = '**/banto-hub-status-pending-apply-cancel.spec.ts';
+
 // chronogazer の `BANTO_E2E_DB_DIR`/`dbDir` と同じ理由（SqliteConnectOptions::
 // create_if_missing はファイルは作るが親ディレクトリは作らない）で、一時
 // ディレクトリ自体を先に用意してから `BANTO_DB` に渡す。env 変数名は
@@ -56,6 +76,21 @@ const BASE_URL = `http://127.0.0.1:${PORT}`;
 const dbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'banto-hub-e2e-'));
 const dbPath = path.join(dbDir, 'banto-hub-e2e.sqlite3');
 process.env.BANTO_HUB_E2E_DB_DIR = dbDir;
+
+// 2台目の DB も**同じ**一時ディレクトリ配下に置く - `global-teardown-banto-hub.ts`
+// は `BANTO_HUB_E2E_DB_DIR` を丸ごと消すので、これだけで両方が片付く。
+const lockedDownDbPath = path.join(dbDir, 'banto-hub-e2e-locked-down.sqlite3');
+
+// 2台目は **profile を分ける**必要がある: `HubRuntime::start` は
+// `BANTO_HUB_PROFILE`（既定 `default`）ごとに profile 排他ロックを取るので
+// （`apps/banto-hub/core/src/profile_lock.rs`）、同じ profile の2プロセスは
+// 同時に起動できない。あわせて `BANTO_HUB_ROOT` も一時ディレクトリへ向け、
+// lock ファイル・logs・tstore データが実機の `%ProgramData%\BantoHub` を
+// 汚さず teardown で消えるようにする（1台目は従来どおり既定 root/profile の
+// ままで挙動を変えない）。`BANTO_DB` と違って root はディレクトリなので、
+// `mkdtempSync` と同じ理由で先に作っておく。
+const lockedDownRoot = path.join(dbDir, 'locked-down-root');
+fs.mkdirSync(lockedDownRoot, { recursive: true });
 
 const bantoHubBin = path.join(
 	repoRoot,
@@ -93,23 +128,65 @@ export default defineConfig({
 		trace: 'retain-on-failure',
 		screenshot: 'only-on-failure'
 	},
-	projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
-	webServer: {
-		command: bantoHubBin,
-		url: BASE_URL,
-		// 前回実行の(既にセットアップ済みの)DB を引き継ぐと、setup 画面の
-		// 「ユーザー0件」前提が崩れる - chronogazer 側と同じ理由で常に
-		// 新規サーバー/新規DBを起動する。
-		reuseExistingServer: false,
-		timeout: 30_000,
-		env: {
-			PORT: String(PORT),
-			BANTO_BIND: '127.0.0.1',
-			BANTO_DB: dbPath,
-			// apps/banto-hub/core/src/bin/banto-hub.rs: POST /api/auth/setup は
-			// 明示的に opt-in しないと 403 になる - 初回セットアップ画面の
-			// シナリオに必要。
-			BANTO_ALLOW_SETUP: '1'
+	// #341: 試運転モードのサーバー（既定）と、ロックダウン済み専用サーバーの
+	// 2プロジェクト。`LOCKED_DOWN_SPEC` だけが後者で走り、他の spec は前者で
+	// 走る（`testIgnore`/`testMatch` で厳密に排他にしてあるので、どちらの
+	// プロジェクトでも二重に走る spec は無い）。`workers: 1` /
+	// `fullyParallel: false` は維持しているため、2つのプロジェクトも順番に
+	// 実行される（同時に2つのサーバーが**起動**してはいるが、テストが同時に
+	// 走ることはない）。
+	projects: [
+		{
+			name: 'chromium',
+			testIgnore: LOCKED_DOWN_SPEC,
+			use: { ...devices['Desktop Chrome'] }
+		},
+		{
+			name: 'chromium-locked-down',
+			testMatch: LOCKED_DOWN_SPEC,
+			use: { ...devices['Desktop Chrome'], baseURL: LOCKED_DOWN_BASE_URL }
 		}
-	}
+	],
+	webServer: [
+		{
+			command: bantoHubBin,
+			url: BASE_URL,
+			// 前回実行の(既にセットアップ済みの)DB を引き継ぐと、setup 画面の
+			// 「ユーザー0件」前提が崩れる - chronogazer 側と同じ理由で常に
+			// 新規サーバー/新規DBを起動する。
+			reuseExistingServer: false,
+			timeout: 30_000,
+			env: {
+				PORT: String(PORT),
+				BANTO_BIND: '127.0.0.1',
+				BANTO_DB: dbPath,
+				// apps/banto-hub/core/src/bin/banto-hub.rs: POST /api/auth/setup は
+				// 明示的に opt-in しないと 403 になる - 初回セットアップ画面の
+				// シナリオに必要。
+				BANTO_ALLOW_SETUP: '1'
+			}
+		},
+		{
+			// #341: ロックダウン済み専用（`chromium-locked-down` プロジェクト）。
+			// 起動時点では1台目と同じ試運転モードで、spec の `beforeAll` が
+			// 初回セットアップ → `POST /api/commissioning/lock-down` まで進める
+			// （ロックダウンは不可逆なので、専用サーバーでしかできない）。
+			command: bantoHubBin,
+			url: LOCKED_DOWN_BASE_URL,
+			reuseExistingServer: false,
+			timeout: 30_000,
+			env: {
+				PORT: String(LOCKED_DOWN_PORT),
+				// 試運転モードのまま起動するので loopback 必須
+				// （`enforce_loopback_when_commissioning`、設計 §5.6）。
+				BANTO_BIND: '127.0.0.1',
+				BANTO_DB: lockedDownDbPath,
+				BANTO_ALLOW_SETUP: '1',
+				// 上記 `lockedDownRoot` のコメント参照（profile 排他ロックを
+				// 1台目と分ける）。
+				BANTO_HUB_ROOT: lockedDownRoot,
+				BANTO_HUB_PROFILE: 'e2e-locked-down'
+			}
+		}
+	]
 });
