@@ -73,11 +73,6 @@
 //! - [`pending_changes`]: TAG-P0-3（2026-08-11 方針改定）。運転中編集の
 //!   提案変更（pending queue）を保持する service 層。実行構成への反映
 //!   （手動 apply）と破棄（cancel）の前提となる永続化基盤
-//! - [`test_output`]: T15-3（docs/banto-hub-desktop-plan.md §6.3）。現在の
-//!   収集 run コンテキストにのみ opt-in する「テスト出力」フラグ
-//!   （[`write_control::WriteControl`]と同型・非永続）。`crate::mqtt`の
-//!   専用 test トピック・`crate::grpc`の`StreamValues(test_output=true)`
-//!   がこれを読む
 //! - [`runtime`]: T14-1（docs/banto-hub-t14-design.md §3「D1」）。
 //!   composition root（[`runtime::HubRuntime::start`]/
 //!   [`runtime::RunningHub::shutdown`]）- DB初期化〜各サービス構築〜
@@ -205,7 +200,6 @@ pub mod sink;
 pub mod stream;
 pub mod subscribe_core;
 pub mod system_info;
-pub mod test_output;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod users;

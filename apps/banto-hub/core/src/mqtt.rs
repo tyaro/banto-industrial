@@ -38,20 +38,20 @@
 //!   （workspace Cargo.toml のコメント参照）。§5.6 の「v1 は平文」前提と
 //!   一致する - TLS が要る場合はリバースプロキシでの終端に委譲する設計。
 //!
-//! ## T15-3 → 2026-09-15 オーナー決定（#335 追補）で撤回: AllSimulation の出力抑止
+//! ## T15-3 → 2026-09-15 オーナー決定（#335 追補）で撤回、#362 で機構ごと撤去:
+//! AllSimulation の出力抑止
 //!
-//! 旧仕様（T15-3、docs/banto-hub-desktop-plan.md §6.3）は「`AllSimulation`中は
-//! 通常トピック（[`topic_for`]、retain=true）を抑止し、
-//! [`crate::test_output::TestOutputControl`]が現在の run_id に対して有効な
-//! 間だけ`{prefix}/test/{run_id}/...`という別トピックへ`retain=false`で発行
-//! する」というものだった（「外部出力を PLC への出力と勘違いしていた」との
+//! 旧仕様（T15-3、docs/banto-hub-desktop-plan.md §6.3、撤去済み・経緯として
+//! 保存）は「`AllSimulation`中は通常トピック（[`topic_for`]、retain=true）を
+//! 抑止し、`TestOutputControl`が現在の run_id に対して有効な間だけ
+//! `{prefix}/test/{run_id}/...`という別トピックへ`retain=false`で発行する」
+//! というものだった（「外部出力を PLC への出力と勘違いしていた」との
 //! オーナー判断で撤回）。**現在は`Running`なら`AllSimulation`中も含め常に
 //! 通常トピックへ発行する** - MQTT publish は読み取り専用の外部出力であり、
 //! シミュレーション中の値も他の経路（REST/WS/gRPC）と同様に無条件で
 //! 配信する。テスト出力専用トピック・ペイロード（旧`test_topic_for`関数・
-//! `TestOutputPayload`型・`PublishTarget::Test`列挙子）は撤去した
-//! （`TestOutputControl`自体の制御プレーンは他経路と同様に維持するが、この
-//! モジュールからはもう一切参照しない）。
+//! `TestOutputPayload`型・`PublishTarget::Test`列挙子）と`TestOutputControl`
+//! 自体の制御プレーンは #362 で撤去済み。
 //! ## タスク構成（設計 §3.4「収集に背圧をかけない」）
 //!
 //! [`MqttPublisher`] は [`CollectorManager`] の `tag_map`/`current_values`/
@@ -97,7 +97,6 @@ use banto_collect::Quality;
 use crate::controller::{CollectionController, CollectionState, CollectionStatus, RunMode};
 use crate::hub::{quality_str, read_current, CollectorManager, TagEntry};
 use crate::settings::MqttSettings;
-use crate::test_output::TestOutputControl;
 use crate::value_source::value_source_for_tag;
 
 /// 評価タイマの固定周期 - `crate::stream::EVAL_TICK_MS` と同じ値・同じ理由
@@ -215,13 +214,8 @@ impl PublishTarget {
 /// 参照）。`Stopped`/`Starting`/`Stopping`/`Faulted`はいずれも`None`
 /// （発行しない）。`Running`なら`mode`（`Configured`/`AllSimulation`）を
 /// 問わず常に`Some`（2026-09-15 オーナー決定: 外部への読み取り出力は
-/// シミュレーションでゲートしない）。`test_output`は wire/呼び出し元
-/// 互換のため引数として残すが、もう判定に使わない（deprecated -
-/// [`current_status`]・[`run_eval_loop`]のフィールド doc comment参照）。
-fn eval_target(
-    status: &CollectionStatus,
-    _test_output: Option<&TestOutputControl>,
-) -> Option<PublishTarget> {
+/// シミュレーションでゲートしない）。
+fn eval_target(status: &CollectionStatus) -> Option<PublishTarget> {
     (status.state == CollectionState::Running).then_some(PublishTarget)
 }
 
@@ -281,11 +275,6 @@ struct RunningPublisher {
 pub struct MqttPublisher {
     manager: Arc<CollectorManager>,
     controller: Option<Arc<CollectionController>>,
-    /// T15-3: `controller`とセットで注入する - `controller`が`None`
-    /// （互換パス）なら`AllSimulation`という概念自体が観測できないため、
-    /// こちらも常に`None`のままでよい（このモジュールの doc comment
-    /// 「T15-3」参照）。
-    test_output: Option<Arc<TestOutputControl>>,
     connected_tx: watch::Sender<bool>,
     running: AsyncMutex<Option<RunningPublisher>>,
 }
@@ -299,7 +288,6 @@ impl MqttPublisher {
         Self {
             manager,
             controller: None,
-            test_output: None,
             connected_tx,
             running: AsyncMutex::new(None),
         }
@@ -307,18 +295,13 @@ impl MqttPublisher {
 
     /// Construct the production publisher with the lifecycle watch. Full
     /// catalog publication is then driven by a Running transition, not by a
-    /// stopped catalog commit. `test_output`（T15-3）は`controller`と同じ
-    /// `Arc`を`crate::runtime`が配る - `crate::controller::CollectionController::test_output`
-    /// が返すものと同一インスタンスでなければ、REST 側の有効化がこの eval
-    /// ループへ反映されない。
+    /// stopped catalog commit.
     pub fn new_with_controller(
         manager: Arc<CollectorManager>,
         controller: Arc<CollectionController>,
-        test_output: Arc<TestOutputControl>,
     ) -> Self {
         let mut publisher = Self::new(manager);
         publisher.controller = Some(controller);
-        publisher.test_output = Some(test_output);
         publisher
     }
 
@@ -400,7 +383,6 @@ impl MqttPublisher {
         let eval_task = tokio::spawn(run_eval_loop(
             self.manager.clone(),
             self.controller.clone(),
-            self.test_output.clone(),
             client,
             settings.prefix,
             qos,
@@ -458,22 +440,14 @@ async fn run_eventloop(
 
 /// eval タスク本体 - このモジュールの doc comment「タスク構成」参照。
 ///
-/// T15-3: `test_output`は`controller`が`Some`のときのみ意味を持つ（T15-3の
-/// doc comment参照）。`last_active_target`は「いま発行している
-/// [`PublishTarget`]」を追跡し、これが変わった瞬間（新しい run が始まった・
-/// `AllSimulation`へ切り替わった・[`TestOutputControl`]が有効化/無効化
-/// された等）だけ[`publish_all`]（diff・スロットル無視の一斉発行）を呼ぶ -
-/// それ以外の tick では[`publish_changed`]（diff + スロットル）を呼ぶ。
-/// テスト出力の有効化/無効化は`TestOutputControl`自身が watch チャネルを
-/// 持たない（`crate::test_output`のモジュール doc comment「Pure, sync,
-/// DB-free」参照）ため、250ms の tick 自体がこの遷移を検知する唯一の場
-/// になる - `changed`/`resync`アームは`runtime_rx`（`CollectionController`
-/// の状態遷移）由来の通知でしか起きない事象しか拾えない。
+/// `last_active_target`は「いま発行している[`PublishTarget`]」を追跡し、
+/// これが変わった瞬間（新しい run が始まった・`AllSimulation`へ切り替わった
+/// 等）だけ[`publish_all`]（diff・スロットル無視の一斉発行）を呼ぶ - それ
+/// 以外の tick では[`publish_changed`]（diff + スロットル）を呼ぶ。
 #[allow(clippy::too_many_arguments)]
 async fn run_eval_loop(
     manager: Arc<CollectorManager>,
     controller: Option<Arc<CollectionController>>,
-    test_output: Option<Arc<TestOutputControl>>,
     client: AsyncClient,
     prefix: String,
     qos: QoS,
@@ -494,7 +468,7 @@ async fn run_eval_loop(
         tokio::select! {
             _ = tick.tick() => {
                 let status = current_status(runtime_rx.as_ref());
-                match eval_target(&status, test_output.as_deref()) {
+                match eval_target(&status) {
                     None => {
                         last.clear();
                         last_active_target = None;
@@ -519,7 +493,7 @@ async fn run_eval_loop(
                 let Ok(running_notification) = changed else { break; };
                 if running_notification {
                     let status = current_status(runtime_rx.as_ref());
-                    match eval_target(&status, test_output.as_deref()) {
+                    match eval_target(&status) {
                         None => {
                             last.clear();
                             last_active_target = None;
@@ -545,7 +519,7 @@ async fn run_eval_loop(
                     break;
                 }
                 let status = current_status(runtime_rx.as_ref());
-                match eval_target(&status, test_output.as_deref()) {
+                match eval_target(&status) {
                     None => {
                         last.clear();
                         last_active_target = None;
@@ -751,12 +725,11 @@ mod tests {
 
     /// 2026-09-15 オーナー決定（#335 追補、「外部出力を PLC への出力と
     /// 勘違いしていた」）: 以前ここにあった「`Running`+`AllSimulation`は
-    /// `TestOutputControl`が非アクティブなら発行しない」という抑止（旧
-    /// PR #95 挙動）は撤去した - `Running`なら`AllSimulation`中も常に
-    /// 発行する（`test_output`引数はもう判定に使わない、
-    /// [`eval_target`]のdoc comment参照）。
+    /// テスト出力機構が非アクティブなら発行しない」という抑止（旧 PR #95
+    /// 挙動、T15-3）は撤去した - `Running`なら`AllSimulation`中も常に
+    /// 発行する。
     #[test]
-    fn eval_target_all_simulation_running_is_always_some_regardless_of_test_output() {
+    fn eval_target_all_simulation_running_is_some() {
         let status = CollectionStatus {
             state: CollectionState::Running,
             mode: RunMode::AllSimulation,
@@ -765,19 +738,7 @@ mod tests {
             configured_revision: 1,
             running_revision: 1,
         };
-        assert_eq!(eval_target(&status, None), Some(PublishTarget));
-
-        let test_output = TestOutputControl::new();
-        assert_eq!(
-            eval_target(&status, Some(&test_output)),
-            Some(PublishTarget)
-        );
-
-        test_output.enable(9);
-        assert_eq!(
-            eval_target(&status, Some(&test_output)),
-            Some(PublishTarget)
-        );
+        assert_eq!(eval_target(&status), Some(PublishTarget));
     }
 
     #[test]
@@ -790,7 +751,7 @@ mod tests {
             configured_revision: 1,
             running_revision: 1,
         };
-        assert_eq!(eval_target(&status, None), Some(PublishTarget));
+        assert_eq!(eval_target(&status), Some(PublishTarget));
     }
 
     #[test]
@@ -803,7 +764,7 @@ mod tests {
             configured_revision: 1,
             running_revision: 1,
         };
-        assert_eq!(eval_target(&status, None), None);
+        assert_eq!(eval_target(&status), None);
     }
 
     #[test]

@@ -3,8 +3,8 @@
 //!
 //! **プロセス内メモリのみ**（DB にも tstore にも書かない）: 状態は「今この
 //! プロセスが何をしているか」であって構成でも履歴でもない -
-//! `crate::write_control::WriteControl` / `crate::test_output::TestOutputControl`
-//! と同じ非永続の扱い。`GET /api/v1/status`・`GET /api/status` が
+//! `crate::write_control::WriteControl` と同じ非永続の扱い。
+//! `GET /api/v1/status`・`GET /api/status` が
 //! [`DbSourceStatusStore::snapshot`] を読んで `db_source` / `dbSource` 節
 //! として出す（`crate::rest`）。
 //!

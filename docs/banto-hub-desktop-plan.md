@@ -116,21 +116,25 @@ TAG-UX-C の4点目を完成させた（`banto-hub-tags-revision.spec.ts` を拡
 緩和（migration `0011`、詳細は tag-server-design.md §4）。**2026-09-14**:
 書き込み受付（write_enabled）の遷移時 OFF・自動リセット記述は 2026-09-09
 オーナー決定（#340）で撤回。既定は有効、再起動で永続値を復元、遷移では
-変えない（test_output の OFF 連動は維持）。詳細は
+変えない。詳細は
 [tag-server-design.md](tag-server-design.md) §6-6。**2026-09-15**（#335
 追補、「外部出力を PLC への出力と勘違いしていた」）: §6.3「履歴と外部出力」の
 出力ゲート（API キー経由の REST/WS/MQTT/gRPC が SIM 値・derived_simulation
 値を既定除外・専用テスト出力 namespace・全 PLC SIM 中の通常 stream 強制終了）
 を撤回し、外部への読み取り出力はシミュレーションで一切ゲートしない契約へ
-改定（書き込みゲートは変更なし）。`test_output`（T15-3）の制御プレーンは
-残すが効果を持たない deprecated 状態。詳細は §6.3・
+改定（書き込みゲートは変更なし）。詳細は §6.3・
 [tag-server-design.md](tag-server-design.md) §4.2。**2026-09-15**（#363、
 v0.2.0-alpha.11）: §6.3・T15 受け入れ条件の「SIM／SIM 依存値への書き込みを
 fail-closed で拒否する」も撤回。シミュレーションデバイスのタグへの外部
 書き込みは PC 上の in-process シミュレータへ反映し、書いた番地は held として
 ランプ波の更新対象から外れる（読み戻せる）。実機向けの護りはすべてそのまま
 （撤回したのは「シミュレーション中は拒否」の1段だけ）。詳細は §6.3・
-[tag-server-design.md](tag-server-design.md) §6。
+[tag-server-design.md](tag-server-design.md) §6。**2026-09-15**（#362、
+v0.2.0-alpha.12）: 上記で効果を失っていた T15-3 テスト出力
+（`TestOutputControl`、`POST /api/test-output/enable|disable`、status の
+`test_output`、gRPC `StreamValues.test_output`／`ValueBatch.simulation`・
+`run_id`）を機構ごと撤去した（撤去済み・経緯として保存）。詳細は §6.3・
+T15 節。
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [banto-hub-t16-design.md](banto-hub-t16-design.md)、
@@ -298,9 +302,10 @@ UI/UX 6項目は、いずれも 2026-08-09 に決定済みである。
   ではないうえ PLC へのダイヤルを含んで数秒かかりうるため、その間に来た
   運用者の「停止」を落としてはならない（`CollectionController::acquire_transition`）。
   冪等契約が効くのは相手が本物のライフサイクル遷移のときだけ。
-- どの遷移でも書き込み受付を OFF にしない（test_output は引き続き OFF に戻す）。
+- どの遷移でも書き込み受付を OFF にしない。
   （旧: どの遷移でも最初に書き込み受付を OFF へ戻す、としていた。2026-09-09
-  オーナー決定 #340 で撤回）
+  オーナー決定 #340 で撤回。旧 test_output の OFF 連動は #362 で機構ごと
+  撤去済み・経緯として保存）
 - `faulted` から実機収集を自動再開しない。診断を表示し、ユーザーの明示操作を
   待つ。
 
@@ -440,12 +445,12 @@ SIM と、その値に推移的に依存する演算タグにも同じ規則を�
   切替、サービス再起動で自動解除する。」**2026-09-15 オーナー決定で撤回** →
   上記のとおり通常出力がシミュレーションでゲートされなくなったため、この
   専用テスト出力機構（専用 topic/stream namespace・`simulation`/`run_id`
-  メタデータ・MQTT の`retain=false`）は撤去した。`TestOutputControl` の
-  enable/disable API（`POST /api/test-output/{enable,disable}`）・
-  `GET /api/v1/status` の `test_output` 表示・UI トグル自体は当面残すが、
-  どの出力経路にも効果を持たない **deprecated** 状態（撤去は後続 issue）。
-  gRPC `StreamValuesRequest.test_output` フィールドは wire 互換のため残すが
-  無視する。
+  メタデータ・MQTT の`retain=false`）は撤去した。**撤去済み（2026-09-15、
+  #362。経緯として保存）**: `TestOutputControl`・enable/disable API
+  （`POST /api/test-output/{enable,disable}`）・`GET /api/v1/status` の
+  `test_output` 表示・gRPC `StreamValuesRequest.test_output`／
+  `ValueBatch.simulation`/`run_id`（proto は `reserved` 化）をすべて機構
+  ごと撤去した（v0.2.0-alpha.12）。管理 UI に該当トグルは元々無かった。
 - 旧: 「SIM／SIM 依存値への REST / gRPC 書き込みは運転状態ゲートで拒否する。
   テスト出力を有効にしても書き込み安全規則は緩和しない。」**2026-09-15 オーナー
   決定（#363）で撤回** → シミュレーションデバイス（接続単位 `simulation: true`、
@@ -464,11 +469,12 @@ SIM と、その値に推移的に依存する演算タグにも同じ規則を�
 収集開始、停止、モード変更、デスクトップ／サービス切替では、次の順序を守る。
 
 1. 新しい操作を直列化し、遷移状態を公開する。
-2. test_output を OFF にする（T15-3、`CollectionController` が遷移のたびに
-   `TestOutputControl::disable` する既存の実装はそのまま維持 - 2026-09-15
-   オーナー決定で `test_output` はどの出力経路にも効果を持たなくなった
-   ため、この手順自体はもう実質的な意味を持たない状態遷移だが、撤去は
-   後続 issue で行う）。
+2. 旧: 「test_output を OFF にする（T15-3、`CollectionController` が遷移の
+   たびに `TestOutputControl::disable` する）」としていた手順。2026-09-15
+   オーナー決定で `test_output` はどの出力経路にも効果を持たなくなり、
+   #362（v0.2.0-alpha.12）で `TestOutputControl` 自体を機構ごと撤去した
+   ため、この手順は無い（撤去済み・経緯として保存。番号は既存の他ステップ
+   参照との整合のため詰めていない）。
    （旧: ここで書き込み受付も OFF にする、としていた。2026-09-09 オーナー決定 #340 で撤回
    - 書き込み受付は遷移で変えない）
 3. MQTT 等の値消費・外部 publish を停止または停止状態へ遷移させる。
@@ -485,9 +491,10 @@ SIM と、その値に推移的に依存する演算タグにも同じ規則を�
   `crate::hub::CollectorManager::write_broker_handle_peek`）。停止処理の
   step5（broker セッション切断）と書き込みリクエストの監査・レート制限
   区間が競合しても、実機へ意図しない新規 TCP 接続をダイヤルしない。
-- SIM から configured へ戻す遷移も含め、書き込み受付は遷移で変えない（test_output は
-  遷移のたびに OFF へ戻す）。（旧: SIM から configured へ戻す際にも書き込み受付を自動
-  復元しない、としていた。2026-09-09 オーナー決定 #340 で撤回）
+- SIM から configured へ戻す遷移も含め、書き込み受付は遷移で変えない。（旧: SIM
+  から configured へ戻す際にも書き込み受付を自動復元しない、としていた。
+  2026-09-09 オーナー決定 #340 で撤回。旧 test_output の OFF 連動は #362 で
+  機構ごと撤去済み・経緯として保存）
 - 同一プロファイルを名前付き mutex または同等の OS ロックで排他する。
 - ポート競合だけを二重起動検知に使わない。
 - サービス切替失敗時は停止状態へ戻し、実機収集を勝手に再開しない。
@@ -1365,13 +1372,13 @@ flowchart LR
 
 主要ナビゲーションと現行 route の移設先:
 
-| 項目     | 含む画面                                                    | 現行 route の扱い                                                    |
-| -------- | ----------------------------------------------------------- | -------------------------------------------------------------------- |
-| 運転     | 状態、開始／停止、全 PLC SIM、preflight、初回チェックリスト | `/status` を新しい `/operation` へ統合し、旧 URL は redirect         |
-| 設定     | PLC 接続、収集グループ、タグ、profile export / import       | `/plc-connections`、`/collection-groups`、`/tags`                    |
-| モニタ   | 現在値、品質、時刻、実効 SIM、確認対象                      | `/monitor`                                                           |
-| 外部連携 | REST / WS、MQTT、gRPC、API キー、SIM テスト出力             | `/api-keys` と `/settings` の MQTT / gRPC 部分を再配置               |
-| 管理     | サービス、ユーザー、監査、ログ、診断、アプリ設定            | `/users`、`/audit-log`、`/write-audit` と `/settings` の残りを再配置 |
+| 項目     | 含む画面                                                               | 現行 route の扱い                                                    |
+| -------- | ---------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| 運転     | 状態、開始／停止、全 PLC SIM、preflight、初回チェックリスト            | `/status` を新しい `/operation` へ統合し、旧 URL は redirect         |
+| 設定     | PLC 接続、収集グループ、タグ、profile export / import                  | `/plc-connections`、`/collection-groups`、`/tags`                    |
+| モニタ   | 現在値、品質、時刻、実効 SIM、確認対象                                 | `/monitor`                                                           |
+| 外部連携 | REST / WS、MQTT、gRPC、API キー（旧: SIM テスト出力。#362 で撤去済み） | `/api-keys` と `/settings` の MQTT / gRPC 部分を再配置               |
+| 管理     | サービス、ユーザー、監査、ログ、診断、アプリ設定                       | `/users`、`/audit-log`、`/write-audit` と `/settings` の残りを再配置 |
 
 共通運転バーは5区分の外側へ置き、どの route でも同じ位置と Tab 順序にする。
 現在区分とページ名を文字で示し、権限のない区分／項目は表示しない。直接 URL には
@@ -1645,9 +1652,11 @@ fallback を開いた時の初期フォーカスは見出し、失敗後はエ�
   （**2026-09-09 オーナー決定・#341 で改定**: ロックダウン済みのときだけ。試運転中は
   運転中でもその場で受け付け、収集を止めずに即時反映する。）
 - status と admin control API を追加する。
-- 状態遷移と test_output の OFF を連動させる（書き込み受付は遷移で変えない）。
-  （旧: 状態遷移と書き込み受付 OFF を連動させる、としていた。2026-09-09 オーナー決定
-  #340 で撤回）
+- 旧: 「状態遷移と test_output の OFF を連動させる」としていた（書き込み受付は
+  遷移で変えない）。test_output 機構自体は #362（v0.2.0-alpha.12）で撤去済み
+  - 経緯として保存。
+    （旧: 状態遷移と書き込み受付 OFF を連動させる、としていた。2026-09-09 オーナー決定
+    #340 で撤回）
 
 受け入れ条件:
 
@@ -1721,7 +1730,12 @@ admin 限定）として実装済み。プランどおり表示専用で、`star
 未対応タグの有無に関わらずブロックしない。
 
 **T15-3 実装メモ（2026-08-09）**: テスト出力専用 namespace（上記「テスト出力は
-専用 namespace...」の受け入れ条件部分）を実装した。
+専用 namespace...」の受け入れ条件部分）を実装した。**撤去済み（2026-09-15、
+#362。経緯として保存）**: 2026-09-15 オーナー決定（#335 追補）で出力ゲート
+自体が撤回されて以降 deprecated だったこの機構（`TestOutputControl`・REST の
+`/api/test-output/*`・status の `test_output`・gRPC の `test_output`／
+`simulation`／`run_id`）を、#362（v0.2.0-alpha.12）でコード・proto ごと
+完全に撤去した。以下は撤去前の実装メモとして履歴に残す。
 
 - 新規モジュール `crate::test_output::TestOutputControl`（`AtomicBool` +
   `AtomicU64` のみ、DB 非依存 - `write_control.rs` と同型だが
@@ -2086,14 +2100,18 @@ owner ACL を設定する。グループ変更、profile owner 追加、ACL 変�
 - configured / 全体 SIM / stopped の往復統合テスト
 - Modbus / SLMP、直接接続 / broker 経路の双方
 - 収集停止中は REST / gRPC 書き込みが fail-closed で拒否されること
-  （`CollectionNotRunning` ゲート）、test_output が遷移のたびに OFF へ戻ることの回帰。
+  （`CollectionNotRunning` ゲート）の回帰。
   （旧: 書き込み受付 OFF、REST / gRPC fail-closed の回帰、としていた。2026-09-09
-  オーナー決定 #340 で撤回 - 書き込み受付は遷移で変えなくなったため）
+  オーナー決定 #340 で撤回 - 書き込み受付は遷移で変えなくなったため。旧
+  test_output が遷移のたびに OFF へ戻ることの回帰は、機構自体が #362 で
+  撤去されたため無い - 経緯として保存）
 - 停止処理と書き込みリクエストが競合しても新規 TCP 接続を発生させないこと
   （T15-4、`apps/banto-hub/core/tests/t15_write_peek.rs`）
 - MQTT / gRPC / WS の停止中・SIM 中の契約
 - 接続別 SIM と SIM 依存演算タグの source 伝播、実機履歴／通常外部出力からの除外
-- SIM テスト出力の専用 namespace、MQTT `retain=false`、run 終了時の自動解除
+- 旧: 「SIM テスト出力の専用 namespace、MQTT `retain=false`、run 終了時の
+  自動解除」の検証項目。機構自体が #362（v0.2.0-alpha.12）で撤去されたため
+  無い - 経緯として保存
 - profile lock と二重起動
 - tstore 作成／日次・構成ローテーションと raw / decimate / aggregate / catalog
   の並行問い合わせ、未初期化ファイルの猶予超過警告
@@ -2134,18 +2152,18 @@ owner ACL を設定する。グループ変更、profile owner 追加、ACL 変�
 
 ## 13. 主なリスク
 
-| リスク                      | 影響                               | 対策                                                                    |
-| --------------------------- | ---------------------------------- | ----------------------------------------------------------------------- |
-| `rebuild()` 責務分割の回帰  | 開始・将来反映時に接続が不要に瞬断 | 内部 `apply_config` 基盤を維持し、公開 CRUD ロックと状態別テストを追加  |
-| Desktop / Service 二重起動  | DB、ポート、PLC セッション競合     | profile mutex、SCM / health 確認、切替トランザクション                  |
-| profile path / ACL の誤り   | 設定不一致またはローカル改変       | 絶対パス、profile owner と SCM 権限の分離、移行バックアップ、権限テスト |
-| 未初期化 tstore の黙示 skip | 移行後の履歴欠落を正常0件と誤認    | 移行 preflight、猶予後の再検査、パス付き health 警告                    |
-| SIM 履歴・外部出力混入      | 帳票・SCADA が模擬値を実績扱い     | source の推移伝播、実機系列から除外、専用非 retain テスト出力           |
-| 現行 SIM の範囲不足         | 「全 PLC」でも Bad 値が残る        | 登録構成から生成範囲を作り、未対応を開始前に表示                        |
-| サービス停止で Web UI 消失  | 再開操作ができない                 | サービス外のシェル／トレイを管理主体にする                              |
-| UAC / SCM 失敗              | 切替が中途半端になる               | 限定 helper、タイムアウト、health 検証、安全側 rollback                 |
-| UI が状態を隠す             | 実機／SIM／停止を誤認する          | 共通運転表示、文字 + アイコン、確認文、監査ログ                         |
-| WebView 導入                | 配布サイズ、WebView2 依存が増える  | Windows 実機スパイク後に bundler 設定を確定                             |
+| リスク                      | 影響                               | 対策                                                                                                                          |
+| --------------------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `rebuild()` 責務分割の回帰  | 開始・将来反映時に接続が不要に瞬断 | 内部 `apply_config` 基盤を維持し、公開 CRUD ロックと状態別テストを追加                                                        |
+| Desktop / Service 二重起動  | DB、ポート、PLC セッション競合     | profile mutex、SCM / health 確認、切替トランザクション                                                                        |
+| profile path / ACL の誤り   | 設定不一致またはローカル改変       | 絶対パス、profile owner と SCM 権限の分離、移行バックアップ、権限テスト                                                       |
+| 未初期化 tstore の黙示 skip | 移行後の履歴欠落を正常0件と誤認    | 移行 preflight、猶予後の再検査、パス付き health 警告                                                                          |
+| SIM 履歴・外部出力混入      | 帳票・SCADA が模擬値を実績扱い     | source の推移伝播、実機系列から除外、`value_source`/`collection_mode` で判別（旧: 専用非 retain テスト出力。#362 で撤去済み） |
+| 現行 SIM の範囲不足         | 「全 PLC」でも Bad 値が残る        | 登録構成から生成範囲を作り、未対応を開始前に表示                                                                              |
+| サービス停止で Web UI 消失  | 再開操作ができない                 | サービス外のシェル／トレイを管理主体にする                                                                                    |
+| UAC / SCM 失敗              | 切替が中途半端になる               | 限定 helper、タイムアウト、health 検証、安全側 rollback                                                                       |
+| UI が状態を隠す             | 実機／SIM／停止を誤認する          | 共通運転表示、文字 + アイコン、確認文、監査ログ                                                                               |
+| WebView 導入                | 配布サイズ、WebView2 依存が増える  | Windows 実機スパイク後に bundler 設定を確定                                                                                   |
 
 ## 14. 更新対象ドキュメント
 

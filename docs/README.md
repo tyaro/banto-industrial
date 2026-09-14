@@ -4,7 +4,7 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
 1 画面で引くための地図。詳細は各文書へ辿る。
 
 状態: **地図として現行**。索引に徹し、実装状況・設計判断の本体は各文書側で管理する。
-最終更新: 2026-09-15（T19（UX-30〜48）・T20（文字列/構造体/レシピ/ビット .0〜.F）・T21（構成補助 MCP 管理面）完了、MCP 31 ツール実機検証、外部 DB 連携 S0〜S2b・S4・S5 完了、S3/S6/S7 残（MCP は 37 ツールに。追加分はローカル PostgreSQL で検証）に加え、v0.2.0-alpha.8: 書き込み受付の既定を「可」に変更し、再起動・収集操作での自動無効化を撤回（#340）、v0.2.0-alpha.9: 試運転中は構成 CRUD を収集中でも即時・無停止反映（#341）、v0.2.0-alpha.10: computed タグの catalog 公開・外部読み取り出力のシミュレーションゲート撤廃（#335）、v0.2.0-alpha.11: シミュレーションデバイスへの外部書き込みをシミュレータへ反映（#363）を反映）。
+最終更新: 2026-09-15（T19（UX-30〜48）・T20（文字列/構造体/レシピ/ビット .0〜.F）・T21（構成補助 MCP 管理面）完了、MCP 31 ツール実機検証、外部 DB 連携 S0〜S2b・S4・S5 完了、S3/S6/S7 残（MCP は 37 ツールに。追加分はローカル PostgreSQL で検証）に加え、v0.2.0-alpha.8: 書き込み受付の既定を「可」に変更し、再起動・収集操作での自動無効化を撤回（#340）、v0.2.0-alpha.9: 試運転中は構成 CRUD を収集中でも即時・無停止反映（#341）、v0.2.0-alpha.10: computed タグの catalog 公開・外部読み取り出力のシミュレーションゲート撤廃（#335）、v0.2.0-alpha.11: シミュレーションデバイスへの外部書き込みをシミュレータへ反映（#363）、v0.2.0-alpha.12: T15-3 テスト出力（test_output）機構を撤去（#362）を反映）。
 最終検証日(コード照合): 2026-09-15
 
 > この地図は索引に徹する。実装状況・設計判断の本体は各文書側にあり、状態の**正**は
@@ -54,8 +54,9 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
   中のときだけの情報ラベルに変更）。さらに 2026-09-15 オーナー決定「外部出力を PLC への出力と
   勘違いしていた」で、外部への**読み取り**出力（REST/WS/gRPC/MQTT）はシミュレーションで一切
   ゲートしない契約へ改定（全 PLC シミュレーション中も catalog・値読み取り・購読・publish を
-  常に配信）。T15-3 の `test_output` opt-in は効果を失い deprecated（制御プレーン自体は残す、
-  撤去は後続 issue）。詳細は [tag-server-design.md](tag-server-design.md) §4.2、
+  常に配信）。T15-3 の `test_output` opt-in は効果を失い deprecated となったが、
+  **撤去済み（2026-09-15、#362。v0.2.0-alpha.12）**: `TestOutputControl` の制御
+  プレーンごと撤去した。詳細は [tag-server-design.md](tag-server-design.md) §4.2、
   [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §6.3。
 - **v0.2.0-alpha.11（2026-09-15、#363）**: シミュレーションデバイス（接続単位
   `simulation: true`・全シミュレーション運転中）のタグへの外部書き込みを拒否せず、PC 上の
@@ -69,6 +70,15 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
   [banto-hub-operations.md](banto-hub-operations.md) §4。 **ローカル確認済み（2026-09-15、alpha.11 ビルド）**: 実機 R08ENCPU への書き込みは
   監査 `target: plc`、収集中に live 追加した SLMP シミュレーション接続への D0 書き込みは 200 で
   1.5 秒後も保持（隣の D1 はランプ継続）・監査 `target: simulator`。
+- **v0.2.0-alpha.12（2026-09-15、#362）**: alpha.10（#335）で外部への読み取り出力の
+  シミュレーションゲートを撤廃して以降どの経路からも参照されなくなっていた T15-3
+  「テスト出力」（`TestOutputControl`）機構を撤去した。`apps/banto-hub/core/src/test_output.rs`
+  削除、REST `POST /api/test-output/{enable,disable}` 削除、`GET /api/v1/status`・
+  `GET /api/status` の `test_output`/`testOutput` 削除、gRPC proto の
+  `StreamValuesRequest.test_output`・`ValueBatch.simulation`/`run_id` を `reserved` 化。
+  **wire 変更（破壊的）**。MQTT/WS は #364 までに完了済みで追加変更なし。詳細は
+  [tag-server-design.md](tag-server-design.md) §4.2、
+  [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §6.3。
 - **出荷ゲート**: T5-5（実機での 72h soak 実行 + 実機最終サインオフ）のみ残（実機必須）。
 - **banto-tagclient**: **S4a完了（2026-09-01）**。読み取り専用DTO、Endpoint/Secret境界、
   stable ID resolver、REST catalog/values transport、WS wire純粋解析、bounded publish gate、認証付き

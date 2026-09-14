@@ -57,7 +57,6 @@ use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::rest::api_router;
 use banto_hub_core::settings::GrpcSettings;
 use banto_hub_core::settings::SettingsService;
-use banto_hub_core::test_output::TestOutputControl;
 use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
 use banto_hub_core::write_control::WriteControl;
@@ -195,9 +194,6 @@ struct TestApp {
     manager: Arc<CollectorManager>,
     write_control: Arc<WriteControl>,
     controller: Arc<CollectionController>,
-    // T15-3: `controller`が保持するものと同一の `Arc` - `StreamValues`の
-    // `test_output=true`をテストから直接有効化/無効化するため。
-    test_output: Arc<TestOutputControl>,
     grpc_server: Arc<GrpcServer>,
     _env: TempEnv,
 }
@@ -262,11 +258,7 @@ async fn test_app(label: &str) -> TestApp {
     let rate_limiter = Arc::new(AsyncMutex::new(WriteRateLimiter::new(
         WriteRateLimitConfig::default(),
     )));
-    let test_output = Arc::new(TestOutputControl::new());
-    let controller = Arc::new(CollectionController::new(
-        manager.clone(),
-        test_output.clone(),
-    ));
+    let controller = Arc::new(CollectionController::new(manager.clone()));
     let status = controller.start(RunMode::Configured).await;
     assert_eq!(status.state, CollectionState::Running);
 
@@ -279,8 +271,7 @@ async fn test_app(label: &str) -> TestApp {
         rate_limiter.clone(),
         events_tx.clone(),
     )
-    .with_controller(controller.clone())
-    .with_test_output(test_output.clone());
+    .with_controller(controller.clone());
     let grpc_server = Arc::new(GrpcServer::new(grpc_service));
 
     let settings = SettingsService::new(pool.clone());
@@ -319,7 +310,6 @@ async fn test_app(label: &str) -> TestApp {
         manager,
         write_control,
         controller,
-        test_output,
         grpc_server,
         _env: env,
     }
@@ -662,7 +652,6 @@ async fn stream_values_sends_initial_snapshot_then_on_change() {
                 tags: vec![external_name.clone()],
                 mode: SubscribeMode::OnChange as i32,
                 interval_ms: 0,
-                test_output: false,
             },
             &key,
         ))
@@ -745,7 +734,6 @@ async fn stream_values_keeps_streaming_when_all_simulation_starts() {
                 tags: vec![external_name.clone()],
                 mode: SubscribeMode::OnChange as i32,
                 interval_ms: 0,
-                test_output: false,
             },
             &key,
         ))
@@ -786,7 +774,6 @@ async fn stream_values_keeps_streaming_when_all_simulation_starts() {
                 tags: vec![external_name],
                 mode: SubscribeMode::OnChange as i32,
                 interval_ms: 0,
-                test_output: false,
             },
             &key,
         ))
@@ -806,18 +793,15 @@ async fn stream_values_keeps_streaming_when_all_simulation_starts() {
 }
 
 // ---------------------------------------------------------------------------
-// T15-3: StreamValues(test_output=true) - 専用 stream namespace
+// 旧 T15-3 テスト出力機構の撤去（#362）後も残る AllSimulation 時の挙動
 // ---------------------------------------------------------------------------
 
-/// 2026-09-15 オーナー決定（#335 追補）: `test_output`リクエストフィールド
-/// は wire 互換のため受け付けるが、もう一切の判定に使わない（deprecated -
-/// `crate::grpc::GrpcService::test_output`のフィールド doc comment参照）。
-/// `true`でも`false`でも、収集停止中・Configured・AllSimulation の
-/// いずれでも同じように成功し、バッチに`simulation=true`/`run_id`が乗る
-/// ことはもう無い（旧`TestOutputControl`armed 時の特別扱いは撤去済み）。
+/// 2026-09-15 オーナー決定（#335 追補）・#362（旧`test_output`opt-in
+/// フィールド・`TestOutputControl`連動の撤去）後も、AllSimulation 中に
+/// 開始した stream は通常どおり成功し、配信を続ける。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stream_values_test_output_field_is_accepted_but_ignored() {
-    let app = test_app("stream-values-test-output-ignored").await;
+async fn stream_values_succeeds_and_continues_during_all_simulation() {
+    let app = test_app("stream-values-succeeds-during-all-simulation").await;
     let sim = Simulator::start().await;
     sim.set_word(SlmpDevice::D, 100, 10);
 
@@ -833,44 +817,12 @@ async fn stream_values_test_output_field_is_accepted_but_ignored() {
     )
     .await;
 
-    let (key, _id) = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
-    let (_port, mut client) = start_grpc_and_connect(&app.grpc_server).await;
-
-    // Stopped(既定) + test_output=true -> 以前は test_output_disabled で
-    // 拒否されていたが、今は無視されるので通常どおり成功する。
-    let mut stream = client
-        .stream_values(bearer_request(
-            StreamValuesRequest {
-                tags: vec![external_name.clone()],
-                mode: SubscribeMode::OnChange as i32,
-                interval_ms: 0,
-                test_output: true,
-            },
-            &key,
-        ))
-        .await
-        .expect("test_output=true no longer requires TestOutputControl to be armed")
-        .into_inner();
-    let batch = stream
-        .message()
-        .await
-        .expect("stream should not error")
-        .expect("initial snapshot should be sent");
-    assert!(
-        !batch.simulation,
-        "simulation metadata is never set anymore"
-    );
-    assert_eq!(batch.run_id, None);
-
-    // AllSimulation へ遷移し、TestOutputControl を明示的に enable しても
-    // もう効果は無い(deprecated) - test_output=true でも false と同じ
-    // 通常バッチが届く。
     let status = app.controller.start(RunMode::AllSimulation).await;
     assert_eq!(status.state, CollectionState::Running);
-    let run_id = status
-        .run_id
-        .expect("AllSimulation run should have a run_id");
-    app.test_output.enable(run_id);
+    assert_eq!(status.mode, RunMode::AllSimulation);
+
+    let (key, _id) = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+    let (_port, mut client) = start_grpc_and_connect(&app.grpc_server).await;
 
     let mut stream = client
         .stream_values(bearer_request(
@@ -878,107 +830,100 @@ async fn stream_values_test_output_field_is_accepted_but_ignored() {
                 tags: vec![external_name],
                 mode: SubscribeMode::OnChange as i32,
                 interval_ms: 0,
-                test_output: true,
             },
             &key,
         ))
         .await
-        .expect("stream_values must succeed during all-simulation regardless of test_output")
+        .expect("stream_values should succeed during all-simulation")
         .into_inner();
-    let batch = stream
-        .message()
-        .await
-        .expect("stream should not error")
-        .expect("initial snapshot should be sent");
+
     assert!(
-        !batch.simulation,
-        "simulation metadata is never set anymore"
+        stream
+            .message()
+            .await
+            .expect("stream should not error")
+            .is_some(),
+        "initial snapshot should be sent"
     );
-    assert_eq!(batch.run_id, None);
+
+    let next = tokio::time::timeout(Duration::from_secs(5), stream.message())
+        .await
+        .expect("stream must not end during all-simulation")
+        .expect("stream termination should not be a gRPC error");
+    assert!(
+        next.is_some(),
+        "stream must keep sending batches during all-simulation"
+    );
 
     sim.stop();
 }
 
-/// 2026-09-15 オーナー決定（#335 追補）: 旧テスト出力専用 stream の
-/// 「disable/収集停止で自動終了する」という挙動（T15-3）は、その専用
-/// stream 概念自体の撤去に伴い無くなった - 通常の stream は
-/// `test_output`の enable/disable にも収集の stop/start にも反応して
-/// 自動終了しない（クライアント切断か `tx` が閉じるまで生き続ける）。
+/// 2026-09-15 オーナー決定（#335 追補）・#362 後: 通常の stream は収集の
+/// stop にも反応して自動終了しない（クライアント切断か `tx` が閉じるまで
+/// 生き続ける - 旧テスト出力専用 stream の「収集停止で自動終了する」
+/// （T15-3）という挙動は、その専用 stream 概念自体の撤去に伴い無い）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stream_values_does_not_auto_end_on_test_output_disable_or_collection_stop() {
-    for scenario in ["explicit_disable", "collection_stop"] {
-        let app = test_app(&format!("stream-values-no-auto-end-{scenario}")).await;
-        let sim = Simulator::start().await;
-        sim.set_word(SlmpDevice::D, 100, 10);
+async fn stream_values_does_not_auto_end_on_collection_stop() {
+    let app = test_app("stream-values-no-auto-end-collection-stop").await;
+    let sim = Simulator::start().await;
+    sim.set_word(SlmpDevice::D, 100, 10);
 
-        let (_tag_id, external_name) = make_tag(
-            &app,
-            "line1",
-            sim.addr.port(),
-            "temp01",
-            "D100",
-            "u16",
-            false,
-            true,
-        )
-        .await;
+    let (_tag_id, external_name) = make_tag(
+        &app,
+        "line1",
+        sim.addr.port(),
+        "temp01",
+        "D100",
+        "u16",
+        false,
+        true,
+    )
+    .await;
 
-        let status = app.controller.start(RunMode::AllSimulation).await;
-        let run_id = status
-            .run_id
-            .expect("AllSimulation run should have a run_id");
-        app.test_output.enable(run_id);
+    app.controller.start(RunMode::AllSimulation).await;
 
-        let (key, _id) = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
-        let (_port, mut client) = start_grpc_and_connect(&app.grpc_server).await;
+    let (key, _id) = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+    let (_port, mut client) = start_grpc_and_connect(&app.grpc_server).await;
 
-        let mut stream = client
-            .stream_values(bearer_request(
-                StreamValuesRequest {
-                    tags: vec![external_name],
-                    mode: SubscribeMode::OnChange as i32,
-                    interval_ms: 0,
-                    test_output: true,
-                },
-                &key,
-            ))
+    let mut stream = client
+        .stream_values(bearer_request(
+            StreamValuesRequest {
+                tags: vec![external_name],
+                mode: SubscribeMode::OnChange as i32,
+                interval_ms: 0,
+            },
+            &key,
+        ))
+        .await
+        .expect("stream should succeed")
+        .into_inner();
+
+    assert!(
+        stream
+            .message()
             .await
-            .expect("stream should succeed")
-            .into_inner();
+            .expect("stream should not error")
+            .is_some(),
+        "initial snapshot should be sent"
+    );
 
-        assert!(
-            stream
-                .message()
-                .await
-                .expect("stream should not error")
-                .is_some(),
-            "initial snapshot should be sent"
-        );
+    app.controller.stop().await;
 
-        match scenario {
-            "explicit_disable" => app.test_output.disable(),
-            "collection_stop" => {
-                app.controller.stop().await;
-            }
-            other => unreachable!("unexpected scenario: {other}"),
+    // The stream must not end on its own: a read either times out (still
+    // open, no new tick-driven batch yet) or, if a tick already produced
+    // one, still returns `Some` - never `None` (end-of-stream).
+    match tokio::time::timeout(Duration::from_millis(500), stream.message()).await {
+        Err(_) => {} // timed out waiting for the next tick - still open, as expected.
+        Ok(result) => {
+            let batch = result.expect("stream termination should not be a gRPC error");
+            assert!(
+                batch.is_some(),
+                "stream must not end on its own after collection stop"
+            );
         }
-
-        // The stream must not end on its own: a read either times out (still
-        // open, no new tick-driven batch yet) or, if a tick already produced
-        // one, still returns `Some` - never `None` (end-of-stream).
-        match tokio::time::timeout(Duration::from_millis(500), stream.message()).await {
-            Err(_) => {} // timed out waiting for the next tick - still open, as expected.
-            Ok(result) => {
-                let batch = result.expect("stream termination should not be a gRPC error");
-                assert!(
-                    batch.is_some(),
-                    "stream must not end on its own after {scenario}"
-                );
-            }
-        }
-
-        sim.stop();
     }
+
+    sim.stop();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1005,7 +950,6 @@ async fn stream_values_wildcard_picks_up_a_tag_added_after_config_changed() {
                 tags: vec!["line1.fast.*".to_string()],
                 mode: SubscribeMode::OnChange as i32,
                 interval_ms: 0,
-                test_output: false,
             },
             &key,
         ))
@@ -1752,7 +1696,6 @@ async fn stream_values_with_a_read_colon_key_only_resolves_the_in_scope_tag() {
                 tags: vec!["*".to_string()],
                 mode: SubscribeMode::OnChange as i32,
                 interval_ms: 0,
-                test_output: false,
             },
             &key,
         ))

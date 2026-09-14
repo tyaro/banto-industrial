@@ -103,7 +103,6 @@ use crate::sink::{SinkGroupInput, SinkGroupService, SinkStatusStore};
 // - このモジュールの doc comment「§3.7」節と同じ「二重実装しない」規律）。
 use crate::settings::{MqttSettings, SettingsService, StoreSettings};
 use crate::system_info::SystemInfoSampler;
-use crate::test_output::TestOutputControl;
 use crate::write_audit::WriteAuditService;
 use crate::write_control::{persist_enabled, WriteControl};
 use crate::write_path::{execute_write, execute_write_batch, WriteDeps};
@@ -242,7 +241,7 @@ struct McpState {
 /// `POST /mcp`のルーターを組み立てる。呼び出し元
 /// （`crate::rest::api_router_with_controller_mode`）は他の共有 `Arc`
 /// （`manager`/`controller`/`write_control`/`write_audit`/`rate_limiter`/
-/// `events`/`test_output`/`mqtt`/`system_info`）と**同じインスタンス**を
+/// `events`/`mqtt`/`system_info`）と**同じインスタンス**を
 /// 渡すこと - `current_values`/レート制限/監査/`compute_status`が REST と
 /// 一貫するために必須（`crate::rest::tag_space_router`の同種の引数と同じ
 /// 共有規律）。
@@ -256,7 +255,6 @@ pub(crate) fn mcp_router(
     rate_limiter: Arc<AsyncMutex<WriteRateLimiter>>,
     events: broadcast::Sender<ServerEvent>,
     commissioning: CommissioningState,
-    test_output: Arc<TestOutputControl>,
     mqtt: Arc<MqttPublisher>,
     system_info: Arc<SystemInfoSampler>,
     // T14-4 由来: `crate::rest::tag_space_router`の`enforce_collection_state`
@@ -293,7 +291,6 @@ pub(crate) fn mcp_router(
         manager: manager.clone(),
         controller: controller.clone(),
         write_control: write_control.clone(),
-        test_output,
         mqtt,
         system_info,
         sink_status,

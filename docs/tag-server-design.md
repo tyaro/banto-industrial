@@ -8,7 +8,9 @@
 （v0.2.0-alpha.11）: シミュレーション中の書き込みを拒否せずシミュレータへ
 反映する契約を §6.5 に追加（書いた番地はランプ更新から外れ保持される。
 ワイヤ変更: `simulation_write_rejected` は返らない）。2026-09-14 更新:
-#341 の CRUD 契約改定を §4.3 に反映）**。
+#341 の CRUD 契約改定を §4.3 に反映。2026-09-15 更新: #362
+（v0.2.0-alpha.12）- 旧 T15-3 テスト出力（`test_output`）機構を
+`TestOutputControl`・REST・gRPC proto ごと撤去、§4.2 に反映）**。
 起案時は設計先行だったが、
 apps/banto-hub として実装が進行 — T0〜T21 実装済み（T19 UX 群・T20 文字列/構造体/レシピ/ビット・T21 構成補助 MCP 管理面まで完了、詳細は下の 2026-09-06 更新）・残 T18-5c/d
 （Windows 実機往復・72h soak）と P3-b の残件（SLMP CPU 種別/アクセスルート露出、
@@ -404,8 +406,11 @@ I1 に**タグ種別**を導入する（§10-2 の `writable` と合わせて1�
 catalog・値読み取りは常に無条件で配信し、呼び出し側が `value_source` /
 `collection_mode` で判別する。旧 T15-3（`docs/banto-hub-desktop-plan.md`
 §6.3）の「test_output で opt-in」という run 単位ゲートは効力を失い
-deprecated（`TestOutputControl` 自体の制御プレーンは残すが、どの経路も
-参照しない。撤去は後続 issue）。`value_source` の既知値は
+deprecated となっていたが、**撤去済み（2026-09-15、#362。経緯として保存）**:
+`TestOutputControl`・REST の `/api/test-output/*`・status の `test_output`・
+gRPC `StreamValuesRequest.test_output`／`ValueBatch.simulation`・`run_id`を
+機構ごと撤去した（v0.2.0-alpha.12、proto は該当フィールドを `reserved`
+化）。`value_source` の既知値は
 real / simulation / computed / derived_simulation / internal / db。
 
 演算タグの意味論:

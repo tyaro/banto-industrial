@@ -46,7 +46,6 @@ use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::mqtt::MqttPublisher;
 use banto_hub_core::rest::{api_router, api_router_with_controller};
 use banto_hub_core::settings::SettingsService;
-use banto_hub_core::test_output::TestOutputControl;
 use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
 use banto_hub_core::write_control::WriteControl;
@@ -469,33 +468,27 @@ async fn test_app(label: &str) -> TestApp {
 }
 
 /// [`TestApp`]は`MqttPublisher::new`（コントローラ非注入 - このモジュールの
-/// 他のテストは`AllSimulation`/`test_output`を一切対象としないため常に
-/// `PublishTarget`扱いでよい）を使うが、`AllSimulation`運転・
-/// `POST /api/test-output/{enable,disable}`（`Running`+`AllSimulation`必須、
-/// `crate::controller::CollectionController`が前提条件を検査する）を
-/// 検証するテストにはこの構成では足りない。このテスト専用に、
+/// 他のテストは`AllSimulation`を一切対象としないため常に`PublishTarget`
+/// 扱いでよい）を使うが、`AllSimulation`運転を検証するテストにはこの構成
+/// では足りない。このテスト専用に、
 /// `MqttPublisher::new_with_controller`+`api_router_with_controller`で実際の
-/// `CollectionController`/`TestOutputControl`を配線した別構成を用意する
-/// （2026-09-15 オーナー決定 #335 追補以降、`test_output`は MQTT publish には
-/// もう影響しない - `crate::mqtt`のモジュール doc comment「T15-3 →
-/// 2026-09-15 オーナー決定」参照）。
-struct TestOutputTestApp {
+/// `CollectionController`を配線した別構成を用意する。
+struct AllSimulationTestApp {
     router: Router,
     token: String,
     pool: SqlitePool,
     manager: Arc<CollectorManager>,
     controller: Arc<CollectionController>,
-    test_output: Arc<TestOutputControl>,
     _env: TempEnv,
 }
 
-impl Drop for TestOutputTestApp {
+impl Drop for AllSimulationTestApp {
     fn drop(&mut self) {
         common::shutdown_test_app(&self.manager, &self.pool);
     }
 }
 
-async fn test_output_test_app(label: &str) -> TestOutputTestApp {
+async fn all_simulation_test_app(label: &str) -> AllSimulationTestApp {
     let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
 
@@ -541,16 +534,11 @@ async fn test_output_test_app(label: &str) -> TestOutputTestApp {
 
     let (events_tx, _rx) = broadcast::channel(16);
     let write_control = Arc::new(WriteControl::new(false));
-    let test_output = Arc::new(TestOutputControl::new());
-    let controller = Arc::new(CollectionController::new(
-        manager.clone(),
-        test_output.clone(),
-    ));
+    let controller = Arc::new(CollectionController::new(manager.clone()));
     let write_audit = WriteAuditService::new(pool.clone());
     let mqtt = Arc::new(MqttPublisher::new_with_controller(
         manager.clone(),
         controller.clone(),
-        test_output.clone(),
     ));
     let api_keys = ApiKeysService::new(pool.clone());
     let rate_limiter = Arc::new(tokio::sync::Mutex::new(WriteRateLimiter::new(
@@ -593,17 +581,15 @@ async fn test_output_test_app(label: &str) -> TestOutputTestApp {
         mqtt,
         grpc_server,
         rate_limiter,
-        test_output.clone(),
         banto_hub_core::profile_paths::DEFAULT_PROFILE_ID.to_string(),
     );
 
-    TestOutputTestApp {
+    AllSimulationTestApp {
         router,
         token,
         pool,
         manager,
         controller,
-        test_output,
         _env: env,
     }
 }
@@ -684,8 +670,9 @@ async fn write_json(
 }
 
 /// `PUT /api/mqtt-settings`を叩いて即時適用させる。`router`/`token`を直接
-/// 取るのは、T15-3 のテスト出力テストが`TestApp`とは別の構成
-/// （`TestOutputTestApp`、下記）を使うため - 両方から共有できるようにした。
+/// 取るのは、AllSimulation を検証するテストが`TestApp`とは別の構成
+/// （[`AllSimulationTestApp`]、下記）を使うため - 両方から共有できるように
+/// した。
 async fn put_mqtt_settings(
     router: &Router,
     token: &str,
@@ -1100,34 +1087,18 @@ async fn disabled_publishes_nothing_and_enabling_via_put_starts_publishing_immed
 }
 
 // ---------------------------------------------------------------------------
-// T15-3: テスト出力専用トピック（設計 §6.3）
+// AllSimulation 運転中の通常トピック publish（旧 T15-3 テスト出力専用
+// トピックは #362 で撤去済み - 経緯として保存）
 // ---------------------------------------------------------------------------
 
-/// `POST /api/test-output/enable`|`disable`のレスポンス
-/// (`crate::rest::TestOutputStatusEntry`)。
-async fn post_test_output(router: &Router, token: &str, action: &str) -> (StatusCode, Value) {
-    write_json(
-        router,
-        "POST",
-        &format!("/api/test-output/{action}"),
-        token,
-        json!({}),
-    )
-    .await
-}
-
 /// 2026-09-15 オーナー決定（#335 追補、「外部出力を PLC への出力と勘違い
-/// していた」）: 以前は`AllSimulation`中、`test_output`が armed でない限り
-/// 通常トピックへの発行を抑止し（旧 PR #95 挙動）、armed 中だけ専用の
-/// `{prefix}/test/{run_id}/...`トピックへ発行していた（実装指示のテスト
-/// 計画1〜3、旧テスト名
-/// `test_output_topics_carry_simulation_payloads_only_while_armed_during_all_simulation`）。
-/// その抑止・専用トピックの仕組みは撤去された - 通常トピックは run mode
-/// によらず常に発行し、専用トピックには二度と何も来ない。
+/// していた」）・#362（テスト出力専用トピック・`test_output`opt-in 機構の
+/// 撤去）後: 通常トピックは run mode によらず常に発行する - AllSimulation
+/// 中も抑止されない（旧 PR #95 抑止は撤去済み）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn normal_topic_publishes_during_all_simulation_regardless_of_test_output() {
+async fn normal_topic_publishes_during_all_simulation() {
     let broker_port = start_test_broker().await;
-    let app = test_output_test_app("test-output-deprecated").await;
+    let app = all_simulation_test_app("normal-topic-all-simulation").await;
 
     let conn = PlcConnectionService::new(app.pool.clone())
         .create(conn_input("line1", 1)) // AllSimulation はホスト/ポートに接続しない
@@ -1147,7 +1118,7 @@ async fn normal_topic_publishes_during_all_simulation_regardless_of_test_output(
         &app.router,
         &app.token,
         broker_port,
-        "hub-test-output",
+        "hub-all-simulation",
         0,
         true,
     )
@@ -1156,9 +1127,6 @@ async fn normal_topic_publishes_during_all_simulation_regardless_of_test_output(
 
     let run_status = app.controller.start(RunMode::AllSimulation).await;
     assert_eq!(run_status.state, CollectionState::Running);
-    let run_id = run_status
-        .run_id
-        .expect("AllSimulation run should have a run_id");
 
     assert!(
         wait_until(Duration::from_secs(6), || async {
@@ -1170,10 +1138,7 @@ async fn normal_topic_publishes_during_all_simulation_regardless_of_test_output(
 
     let live = LiveSubscriber::subscribe(broker_port, "sub-normal-during-sim", "banto/#").await;
     let normal_topic = "banto/line1/fast/temp01";
-    let test_topic = format!("banto/test/{run_id}/line1/fast/temp01");
 
-    // test_output を一切 enable しないまま、通常トピックに発行され続ける
-    // (以前はここで一切発行されなかった - 既存 PR #95 抑止は撤去済み)。
     assert!(
         wait_until(Duration::from_secs(6), || async {
             live.snapshot()
@@ -1182,46 +1147,16 @@ async fn normal_topic_publishes_during_all_simulation_regardless_of_test_output(
                 .any(|(topic, _)| topic == normal_topic)
         })
         .await,
-        "the normal topic must keep publishing during all-simulation even without test_output"
-    );
-    let messages = live.snapshot().await;
-    assert!(
-        !messages.iter().any(|(topic, _)| topic == &test_topic),
-        "the deprecated test-output topic must never receive a publish: {messages:?}"
-    );
-
-    // test_output を明示的に enable しても、通常トピックの発行にも専用
-    // トピックの不在にも変化は無い(deprecated - 効果なし)。
-    let (status, body) = post_test_output(&app.router, &app.token, "enable").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["run_id"], run_id);
-
-    let baseline = live.snapshot().await.len();
-    assert!(
-        wait_until(Duration::from_secs(6), || async {
-            live.snapshot().await.len() > baseline
-        })
-        .await,
-        "the normal topic should keep receiving fresh publishes after enabling test_output"
-    );
-    let messages = live.snapshot().await;
-    assert!(
-        !messages.iter().any(|(topic, _)| topic == &test_topic),
-        "enabling test_output must not resurrect the deprecated test-output topic: {messages:?}"
+        "the normal topic must keep publishing during all-simulation"
     );
 }
 
-/// 2026-09-15 オーナー決定: `test_output`の enable/disable・収集の
-/// stop/start は、もう MQTT publish に一切影響しない。`TestOutputControl`
-/// 自体の制御プレーン（`Running`+`AllSimulation`必須・停止時の自動無効化）
-/// は`crate::controller`の
-/// `test_output_auto_disables_on_every_lifecycle_transition`で別途確認済み
-/// （このモジュールで重複させない）- ここでは「その遷移が MQTT の通常
-/// トピック発行を乱さない」ことだけを確認する。
+/// 2026-09-15 オーナー決定: 収集の stop/start は MQTT の通常トピック発行を
+/// 乱さない - 停止後に Configured で再開すれば発行が続く。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn mqtt_publishing_is_unaffected_by_test_output_enable_disable_or_collection_stop() {
+async fn mqtt_publishing_continues_after_collection_stop_and_restart() {
     let broker_port = start_test_broker().await;
-    let app = test_output_test_app("test-output-stop-clears").await;
+    let app = all_simulation_test_app("all-simulation-stop-restart").await;
 
     let conn = PlcConnectionService::new(app.pool.clone())
         .create(conn_input("line1", 1))
@@ -1241,28 +1176,20 @@ async fn mqtt_publishing_is_unaffected_by_test_output_enable_disable_or_collecti
         &app.router,
         &app.token,
         broker_port,
-        "hub-test-output-stop",
+        "hub-stop-restart",
         0,
         true,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let run_status = app.controller.start(RunMode::AllSimulation).await;
-    let run_id = run_status
-        .run_id
-        .expect("AllSimulation run should have a run_id");
+    app.controller.start(RunMode::AllSimulation).await;
     assert!(
         wait_until(Duration::from_secs(6), || async {
             status_mqtt_connected(&app.router, &app.token).await
         })
         .await
     );
-
-    let (status, body) = post_test_output(&app.router, &app.token, "enable").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["run_id"], run_id);
-    assert!(app.test_output.is_active_for(Some(run_id)));
 
     let normal_topic = "banto/line1/fast/temp01";
     let live = LiveSubscriber::subscribe(broker_port, "sub-unaffected-live", "banto/#").await;
@@ -1274,16 +1201,12 @@ async fn mqtt_publishing_is_unaffected_by_test_output_enable_disable_or_collecti
                 .any(|(topic, _)| topic == normal_topic)
         })
         .await,
-        "the normal topic should publish while test_output is enabled"
+        "the normal topic should publish during all-simulation"
     );
 
     app.controller.stop().await;
-    // 設計「停止...後に必ず無効へ戻る」: ライブフラグ自身がクリアされる
-    // (`crate::controller`の doc comment参照、MQTT とは無関係の既存挙動)。
-    assert!(!app.test_output.is_active_for(Some(run_id)));
 
-    // 通常運転で再開 - 直前の test_output 状態やクリアには一切左右されず
-    // 通常トピックへの発行が続く。
+    // 通常運転で再開 - 通常トピックへの発行が続く。
     app.controller.start(RunMode::Configured).await;
     let baseline = live.snapshot().await.len();
     assert!(
@@ -1291,7 +1214,7 @@ async fn mqtt_publishing_is_unaffected_by_test_output_enable_disable_or_collecti
             live.snapshot().await.len() > baseline
         })
         .await,
-        "the normal topic should keep publishing after a stop/restart cycle, unaffected by test_output"
+        "the normal topic should keep publishing after a stop/restart cycle"
     );
 }
 
@@ -1306,7 +1229,7 @@ async fn mqtt_publishing_is_unaffected_by_test_output_enable_disable_or_collecti
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mqtt_payload_carries_value_source_across_run_modes() {
     let broker_port = start_test_broker().await;
-    let app = test_output_test_app("mqtt-value-source").await;
+    let app = all_simulation_test_app("mqtt-value-source").await;
 
     let conn = PlcConnectionService::new(app.pool.clone())
         .create(conn_input("line1", 1))

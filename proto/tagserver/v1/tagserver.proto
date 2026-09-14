@@ -136,16 +136,10 @@ message StreamValuesRequest {
   repeated string tags = 1;
   SubscribeMode mode = 2;
   int64 interval_ms = 3;
-  // Deprecated（2026-09-15 オーナー決定、#335 追補「外部出力を PLC への
-  // 出力と勘違いしていた」）: 外部への読み取り出力はもうシミュレーション
-  // でゲートしない（`AllSimulation`中も無条件で配信する）ため、この
-  // フィールドは`crate::grpc::stream_values`からもう一切参照されない -
-  // どんな値を送っても効果は無い（wire 互換のため残すのみ、削除は後続
-  // issue）。旧仕様（T15-3、docs/banto-hub-desktop-plan.md §6.3）: テスト
-  // 出力の gRPC stream namespace への opt-in。既定 false =
-  // `AllSimulation`中は`simulation_output_disabled`で拒否、true なら
-  // `TestOutputControl`が有効化されていれば通す、というゲートだった。
-  bool test_output = 4;
+  // 撤去済み（2026-09-15、#362）。旧 `test_output`（T15-3 のテスト出力
+  // opt-in フラグ）。番号・名前とも再利用禁止。
+  reserved 4;
+  reserved "test_output";
 }
 
 // 1回の送信(初期スナップショット必須・250ms 評価・スロットルなし - 設計
@@ -154,11 +148,10 @@ message StreamValuesRequest {
 message ValueBatch {
   int64 timestamp_ms = 1;
   repeated TagValue values = 2;
-  // Deprecated（2026-09-15 オーナー決定、上記`StreamValuesRequest.test_output`
-  // 参照）: `stream_values`はもう常に`false`/`run_id`未設定でしか送らない。
-  bool simulation = 3;
-  // Deprecated（同上）。
-  optional uint64 run_id = 4;
+  // 撤去済み（2026-09-15、#362）。旧 `simulation` / `run_id`
+  // （T15-3 テスト出力の付随フィールド）。番号・名前とも再利用禁止。
+  reserved 3, 4;
+  reserved "simulation", "run_id";
 }
 
 // --- StreamEvents -------------------------------------------------------------

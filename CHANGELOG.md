@@ -2,6 +2,20 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
+## v0.2.0-alpha.12 — 2026-09-15（アルファ）
+
+alpha.10（#335）で外部への読み取り出力のシミュレーションゲートを撤廃したため、どの経路からも参照されなくなっていた T15-3「テスト出力」（`test_output`）機構を撤去した。配布物の構成・前提ランタイムは alpha.3 以降と同じ。
+
+### 変更（2026-09-15、#362）
+
+- **`TestOutputControl`・REST の `POST /api/test-output/{enable,disable}`・`GET /api/v1/status`/`GET /api/status` の `test_output`/`testOutput`・gRPC `StreamValuesRequest.test_output`・`ValueBatch.simulation`/`run_id` を機構ごと撤去した**。`apps/banto-hub/core/src/test_output.rs` を削除。`CollectionController`/`GrpcService`/`MqttPublisher` の test_output 連動配線もすべて削除。
+- **wire 変更（破壊的）**: `GET /api/v1/status`・`GET /api/status` の応答から `test_output`/`testOutput` フィールドが消える。`POST /api/test-output/enable`・`POST /api/test-output/disable` は 404 になる。gRPC proto の `StreamValuesRequest.test_output`（旧 field 4）・`ValueBatch.simulation`（旧 field 3）・`ValueBatch.run_id`（旧 field 4）は `reserved` 化し、これらのフィールドを送っても無視される（送信自体は失敗しない）。
+- MQTT publish・WebSocket（`/api/v1/stream`）は #364（alpha.10）までに「run mode によらず常時配信」へ移行済みで、本リリースでの追加変更は無い。
+
+### 既知の制限（アルファ）
+
+alpha.9 と同じ。
+
 ## v0.2.0-alpha.11 — 2026-09-15（アルファ）
 
 シミュレーションデバイスのタグへの外部書き込みを、拒否せず PC 上のシミュレータへ反映するようにした。配布物の構成・前提ランタイムは alpha.3 以降と同じ。

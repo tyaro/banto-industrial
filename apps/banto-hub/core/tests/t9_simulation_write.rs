@@ -48,7 +48,6 @@ use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::rest::api_router_with_controller;
 use banto_hub_core::settings::SettingsService;
-use banto_hub_core::test_output::TestOutputControl;
 use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
 use banto_hub_core::write_control::WriteControl;
@@ -237,11 +236,7 @@ async fn test_app(label: &str) -> TestApp {
     let rate_limiter = Arc::new(AsyncMutex::new(WriteRateLimiter::new(
         WriteRateLimitConfig::default(),
     )));
-    let test_output = Arc::new(TestOutputControl::new());
-    let controller = Arc::new(CollectionController::new(
-        manager.clone(),
-        test_output.clone(),
-    ));
+    let controller = Arc::new(CollectionController::new(manager.clone()));
 
     let grpc_service = GrpcService::new(
         manager.clone(),
@@ -252,8 +247,7 @@ async fn test_app(label: &str) -> TestApp {
         rate_limiter.clone(),
         events_tx.clone(),
     )
-    .with_controller(controller.clone())
-    .with_test_output(test_output.clone());
+    .with_controller(controller.clone());
     let grpc_server = Arc::new(GrpcServer::new(grpc_service));
 
     let settings = SettingsService::new(pool.clone());
@@ -283,7 +277,6 @@ async fn test_app(label: &str) -> TestApp {
         mqtt,
         grpc_server,
         rate_limiter,
-        test_output,
         banto_hub_core::profile_paths::DEFAULT_PROFILE_ID.to_string(),
     );
 

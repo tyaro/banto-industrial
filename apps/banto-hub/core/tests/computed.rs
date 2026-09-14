@@ -45,7 +45,6 @@ use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::rest::{api_router, api_router_with_controller};
 use banto_hub_core::settings::SettingsService;
-use banto_hub_core::test_output::TestOutputControl;
 use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
 use banto_hub_core::write_control::WriteControl;
@@ -966,14 +965,12 @@ async fn ws_stream_carries_a_computed_tag_value() {
 //    2026-09-14 オーナー決定）。
 //
 // [`test_app`]（上記1〜4が使う既存ハーネス）は`api_router`（内部で自前の
-// `CollectionController`/`TestOutputControl`を作り、外へは公開しない）を
-// 使っているため、このセクションのテストのように「REST 経由で観測する
-// `CollectionController`の run_id/mode を外側から直接操作したい（
-// `controller.start(RunMode::AllSimulation)`・`test_output.enable(run_id)`）」
+// `CollectionController`を作り、外へは公開しない）を使っているため、この
+// セクションのテストのように「REST 経由で観測する`CollectionController`の
+// run_id/mode を外側から直接操作したい（`controller.start(RunMode::AllSimulation)`）」
 // 用途には使えない。`tests/stream.rs`/`tests/grpc.rs`と同じ構成
-// （`api_router_with_controller`に外部所有の`controller`/`test_output`を
-// 渡す）で専用ハーネスを別途用意する - 既存1〜4のテスト・ハーネスには
-// 一切手を入れない。
+// （`api_router_with_controller`に外部所有の`controller`を渡す）で専用
+// ハーネスを別途用意する - 既存1〜4のテスト・ハーネスには一切手を入れない。
 // ---------------------------------------------------------------------------
 
 struct ControllerTestApp {
@@ -991,7 +988,7 @@ impl Drop for ControllerTestApp {
     }
 }
 
-/// [`test_app`]相当だが、`controller`/`test_output`を呼び出し元へ公開する
+/// [`test_app`]相当だが、`controller`を呼び出し元へ公開する
 /// （`tests/stream.rs`の`test_app_with_lock`と同じ構成）。起動直後は
 /// `RunMode::Configured`で`Running`（[`tests/stream.rs`]と同じ規約）。
 async fn controller_test_app(label: &str) -> ControllerTestApp {
@@ -1056,11 +1053,7 @@ async fn controller_test_app(label: &str) -> ControllerTestApp {
     let rate_limiter = Arc::new(tokio::sync::Mutex::new(WriteRateLimiter::new(
         WriteRateLimitConfig::default(),
     )));
-    let test_output = Arc::new(TestOutputControl::new());
-    let controller = Arc::new(CollectionController::new(
-        manager.clone(),
-        test_output.clone(),
-    ));
+    let controller = Arc::new(CollectionController::new(manager.clone()));
     let status = controller.start(RunMode::Configured).await;
     assert_eq!(status.state, CollectionState::Running);
 
@@ -1102,7 +1095,6 @@ async fn controller_test_app(label: &str) -> ControllerTestApp {
         mqtt,
         grpc_server,
         rate_limiter,
-        test_output,
         banto_hub_core::profile_paths::DEFAULT_PROFILE_ID.to_string(),
     );
 

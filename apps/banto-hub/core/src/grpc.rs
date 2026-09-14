@@ -96,13 +96,12 @@ use tonic::{Request, Response, Status};
 use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::computed::ServerTagStore;
-use crate::controller::{CollectionController, RunId};
+use crate::controller::CollectionController;
 use crate::hub::{read_current, CollectorManager, TagEntry};
 use crate::settings::GrpcSettings;
 use crate::subscribe_core::{
     self, interval_floor_ms, Mode, Subscription, TagPattern, EVAL_TICK_MS,
 };
-use crate::test_output::TestOutputControl;
 use crate::write_audit::WriteAuditService;
 use crate::write_control::WriteControl;
 use crate::write_path::{self, WriteRejection};
@@ -207,13 +206,9 @@ async fn to_proto_event(
     }
 }
 
-/// T15-3: `test_run_id`が`Some`のときだけ`simulation=true`かつその
-/// `run_id`を乗せる - 通常 stream（`test_run_id == None`）の `ValueBatch`
-/// には`simulation`/`run_id`が決して立たない。
 fn to_proto_value_batch(
     timestamp_ms: i64,
     values: Vec<subscribe_core::ResolvedValue>,
-    test_run_id: Option<RunId>,
 ) -> ValueBatch {
     ValueBatch {
         timestamp_ms,
@@ -226,8 +221,6 @@ fn to_proto_value_batch(
                 timestamp_ms: rv.t,
             })
             .collect(),
-        simulation: test_run_id.is_some(),
-        run_id: test_run_id,
     }
 }
 
@@ -307,14 +300,6 @@ enum RequireScope {
 pub struct GrpcService {
     manager: Arc<CollectorManager>,
     collection_controller: Option<Arc<CollectionController>>,
-    /// **Deprecated（2026-09-15 オーナー決定、#335 追補）**:
-    /// `StreamValues(test_output=true)`のゲートは撤去され、この`Arc`は
-    /// もう`stream_values`から一切参照されない。撤去自体は後続 issue -
-    /// このフィールドと[`Self::with_test_output`]・`GET /api/v1/status`の
-    /// `test_output`表示・`POST /api/test-output/{enable,disable}`は今回は
-    /// 残す（`TestOutputControl`自体の制御プレーンは維持する、という
-    /// オーナー判断）。
-    test_output: Option<Arc<TestOutputControl>>,
     api_keys: ApiKeysService,
     audit: AuditLogService,
     write_audit: WriteAuditService,
@@ -337,7 +322,6 @@ impl GrpcService {
         Self {
             manager,
             collection_controller: None,
-            test_output: None,
             api_keys,
             audit,
             write_audit,
@@ -352,15 +336,6 @@ impl GrpcService {
     /// embedders that construct the service directly.
     pub fn with_controller(mut self, controller: Arc<CollectionController>) -> Self {
         self.collection_controller = Some(controller);
-        self
-    }
-
-    /// **Deprecated（2026-09-15 オーナー決定、#335 追補）**: 配線しても
-    /// もう`stream_values`の挙動には効かない（[`Self::test_output`]の
-    /// フィールド doc comment参照）。既存の呼び出し元（`bin/banto-hub.rs`
-    /// 等）が壊れないよう、この build メソッド自体は撤去しない。
-    pub fn with_test_output(mut self, test_output: Arc<TestOutputControl>) -> Self {
-        self.test_output = Some(test_output);
         self
     }
 
@@ -610,13 +585,10 @@ impl TagServiceTrait for GrpcService {
         };
 
         // 2026-09-15 オーナー決定（#335 追補、「外部出力を PLC への出力と
-        // 勘違いしていた」）: 以前ここにあった「run が AllSimulation 中は
-        // 拒否、`test_output=true`＋`TestOutputControl`armed のときだけ
-        // 例外的に通す」ゲートは撤去した - 外部への読み取り出力は run mode
-        // によらず常に配信する。`req.test_output`は wire 互換のため
-        // proto フィールドとしては残すが、deprecated（効果なし） -
-        // `StreamValuesRequest.test_output`の proto コメント・
-        // [`GrpcService`]のフィールド doc comment参照。
+        // 勘違いしていた」）: run が AllSimulation 中でも外部への読み取り
+        // 出力は常に配信する - run mode によるゲートは持たない。旧
+        // `test_output` opt-in ゲートは #362 で撤去済み
+        // （`StreamValuesRequest`の proto コメント参照）。
 
         let now_ms = self.manager.clock().now_ms();
         let current = self.manager.current_values();
@@ -645,15 +617,10 @@ impl TagServiceTrait for GrpcService {
         };
 
         let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
-        // 2026-09-15 オーナー決定（上記参照）: `test_output`はもう
-        // gate にも `ValueBatch` の `simulation`/`run_id` メタデータにも
-        // 効かない - このストリームは常に通常ストリーム扱い（`test_run_id
-        // = None`）。
-        let test_run_id: Option<RunId> = None;
         // 設計「初期スナップショット必須」- subscribe 直後に必ず1回送る
         // (空でも)。作ったばかりのチャネルなので `try_send` が失敗する
         // ことは通常ない(防御的に失敗時は素直にストリームを終える)。
-        let _ = tx.try_send(Ok(to_proto_value_batch(now_ms, initial, test_run_id)));
+        let _ = tx.try_send(Ok(to_proto_value_batch(now_ms, initial)));
 
         let manager = self.manager.clone();
         let mut runtime_rx = self
@@ -677,10 +644,9 @@ impl TagServiceTrait for GrpcService {
                         }
                     }
                 }
-                // 2026-09-15 オーナー決定（上記参照）: 以前ここにあった
-                // 「AllSimulation へ遷移したら通常ストリームを打ち切る」
-                // （`test_run_id`が`None`の場合の旧分岐）は撤去した -
-                // このストリームは run mode によらず配信を続ける。
+                // 2026-09-15 オーナー決定（上記参照）: このストリームは
+                // run mode によらず配信を続ける（AllSimulation でも
+                // 打ち切らない）。
                 if tx.is_closed() {
                     break;
                 }
@@ -700,7 +666,7 @@ impl TagServiceTrait for GrpcService {
                     // `try_send` が `Full`(または受信側 drop 済みの
                     // `Closed`)ならこのタスクを畳む = ストリーム終了。
                     if tx
-                        .try_send(Ok(to_proto_value_batch(now_ms, values, test_run_id)))
+                        .try_send(Ok(to_proto_value_batch(now_ms, values)))
                         .is_err()
                     {
                         break;
@@ -892,18 +858,5 @@ mod tests {
         ));
         assert_eq!(status.code(), tonic::Code::Unavailable);
         assert!(status.message().contains("collection_not_running"));
-    }
-
-    /// T15-3: `test_run_id`が`Some`のときだけ`simulation=true`かつその
-    /// `run_id`が乗る。通常 stream(`None`)は決して混入しない。
-    #[test]
-    fn to_proto_value_batch_sets_simulation_metadata_only_for_test_streams() {
-        let normal = to_proto_value_batch(1000, Vec::new(), None);
-        assert!(!normal.simulation);
-        assert_eq!(normal.run_id, None);
-
-        let test = to_proto_value_batch(1000, Vec::new(), Some(7));
-        assert!(test.simulation);
-        assert_eq!(test.run_id, Some(7));
     }
 }
