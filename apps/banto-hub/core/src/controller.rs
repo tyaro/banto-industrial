@@ -305,13 +305,24 @@ impl CollectionController {
     /// ダイヤルしてしまう T15-4 型の事故を起こさないため、**`Running` の
     /// 確認は必ずこのロックの下で行う**。
     pub async fn commit_catalog_and_apply_live(&self) -> Result<(), String> {
-        let _guard = self.transition.lock().await;
-        // #341 レビュー対応2: ここから解放までの間に来た start/stop/set_mode は
-        // no-op ではなく「待って実行」させる（`live_apply_in_progress` の
-        // フィールド doc comment・[`Self::acquire_transition`] 参照）。
-        // `_reset` の `Drop` が、この後のどの早期 return でも必ず下ろす。
+        // #341 レビュー対応2: ここから下で来た start/stop/set_mode は no-op では
+        // なく「待って実行」させる（`live_apply_in_progress` のフィールド doc
+        // comment・[`Self::acquire_transition`] 参照）。`_reset` の `Drop` が、
+        // この後のどの早期 return でも必ず下ろす。
+        //
+        // **フラグを立てるのは `transition` を取る前**（#341 監査、2026-09-14）:
+        // ローカル変数は宣言の逆順で drop されるので、ロックの後で宣言すると
+        // 関数終了時に「フラグ解除 → ロック解放」の順になり、その隙間に来た
+        // ライフサイクル要求が `try_lock` に失敗しつつフラグも false を見て
+        // no-op に落ちる（塞いだはずの穴が幅マイクロ秒で残る）。先に立てれば
+        // drop 順が「ロック解放 → フラグ解除」になり、解放直後の要求は
+        // `try_lock` に成功するか、別遷移に取られていた場合でも余計に待つだけで
+        // 済む。副作用は「ロック取得を待っている間に来た要求が、先行する別の
+        // ライフサイクル遷移の完了まで余計に待つことがある」だけで、無害
+        // （待った後にその時点の状態で判断するため、二重実行にはならない）。
         self.live_apply_in_progress.store(true, Ordering::SeqCst);
         let _reset = LiveApplyFlagGuard(&self.live_apply_in_progress);
+        let _guard = self.transition.lock().await;
         // ロックを取った**後**に読み直す（上の「古い snapshot の窓」）。
         // `RegistrySnapshot::load` は読み取りだけなので、失敗しても catalog・
         // 実行構成のどちらにも副作用は無い。
