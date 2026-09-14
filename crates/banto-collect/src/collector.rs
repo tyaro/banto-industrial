@@ -63,8 +63,8 @@
 //! 3. **Stop and join removed/replaced connections' tasks.** Done before the
 //!    writer is redistributed so that a connection whose *plan* changed
 //!    never gets a chance to read stale data with its old task.
-//! 4. **Distribute the new writer, then retire the old one.** Must happen
-//!    *before* step 5 (spawning new tasks): `TsWriter::append`'s
+//! 4. **Distribute the new writer** (the old one is retired later, in step
+//!    5b). Must happen *before* step 5 (spawning new tasks): `TsWriter::append`'s
 //!    unknown-group error never stops the hot loop
 //!    (`task.rs::record_group`; H4, 2026-08-08 owner decision,
 //!    docs/improvement-plan.md - the failure itself is now recorded, an
@@ -73,14 +73,27 @@
 //!    newly spawned task reading a brand-new group must never see the *old*
 //!    writer, which has no schema for that group at all - every row it tried
 //!    to write would still be permanently lost (no retry, no backfill),
-//!    merely no longer silently so. Retiring the old writer reuses `stop`'s own
-//!    `Arc::try_unwrap`-or-flush fallback (`close_or_flush_writer`): an
-//!    unchanged connection may be mid-append on the old writer at the exact
-//!    moment of rotation, so failing to get sole ownership here is an
-//!    expected occasional outcome, not a bug - either branch guarantees no
-//!    buffered row is silently dropped, which is the invariant that matters.
+//!    merely no longer silently so. **Distributed with `send_replace`, not
+//!    `send`** - see step 4's own comment in the code (#341: `send` silently
+//!    keeps the old value when the channel momentarily has no receivers,
+//!    which happens whenever the only connection is `replaced`).
 //! 5. **Spawn tasks for added/replaced connections** - now guaranteed to
 //!    subscribe to a writer that already knows about every group they read.
+//!    **Step 5b - retire the old writer, non-fatally** (#341 レビュー対応,
+//!    2026-09-14). Reuses `stop`'s own `Arc::try_unwrap`-or-flush fallback
+//!    (`close_or_flush_writer`): an unchanged connection may be mid-append on
+//!    the old writer at the exact moment of rotation, so failing to get sole
+//!    ownership here is an expected occasional outcome, not a bug - either
+//!    branch guarantees no buffered row is silently dropped, which is the
+//!    invariant that matters. **It runs after the spawn (not before) and its
+//!    failure is logged rather than returned**: when it sat before step 5 and
+//!    propagated with `?`, a failing final flush of the *old* file left the
+//!    collector with the new writer distributed, `self.config` still the old
+//!    one, and **no task at all** for every added/replaced connection - the
+//!    caller (`banto-hub`'s `CollectorManager`) would report failure while
+//!    the run silently collected nothing. The rows at risk are the old
+//!    file's last unflushed buffer, which no longer affects whether the new
+//!    configuration is running.
 //! 6. **`retain` the current-value cache and status map** down to the new
 //!    config's live tag/connection keys, so a removed tag or connection does
 //!    not linger forever with a slowly-staling last-known value.
@@ -393,6 +406,19 @@ impl Collector {
     /// - `factory` is used only for tasks this call spawns (added/replaced
     ///   connections); already-running unchanged tasks keep whatever factory
     ///   they were originally spawned with.
+    ///
+    /// **`Err` の意味（#341 レビュー対応で正確に書き直した、2026-09-14）**:
+    /// このメソッドが `Err` を返すのは、**新しい writer を開けなかったとき
+    /// だけ**（ステップ2の all-or-nothing アンカー）。そのときは何一つ
+    /// 触っていない - `self.config`・全タスク・writer とも呼び出し前の
+    /// ままで、呼び出し元（banto-hub の `CollectorManager::apply_run`）が
+    /// 走行中の収集をそのまま続けられる。逆に、そのアンカーを越えた後の
+    /// 失敗はもう `Err` にしない: **旧 writer の最終 flush 失敗**
+    /// （ステップ5b）はログに出すだけで `Ok` を返す。失われうるのは旧
+    /// ファイルの最後の未フラッシュ分だけで、その時点で新構成のタスクは
+    /// 既に全部立っており、ここで `Err` を返すと「タスクは新構成・
+    /// `self.config` は旧構成・呼び出し元は失敗と判断」という、はるかに
+    /// 悪い不整合が残るため（モジュール doc のステップ 5b 参照）。
     pub async fn apply_config(
         &mut self,
         new_config: CollectorConfig,
@@ -474,12 +500,36 @@ impl Collector {
             }
         }
 
-        // --- 4. Distribute the new writer, then retire the old one ---------
-        if let Some(new_writer) = new_writer {
+        // --- 4. Distribute the new writer (retired in 5b, below) -----------
+        //
+        // **`send_replace`, NOT `send`** (#341 で発覚、2026-09-14): step 3 が
+        // 直前に「置き換え対象の接続タスク」を全部 join しており、それが
+        // *唯一の*接続だった場合、この時点で `writer_tx` の受信者は 0 人に
+        // なっている（`Collector` 自身は `watch::Receiver` を保持しない -
+        // `start_with_client_factory` の `_writer_rx` はその関数を抜けた
+        // 時点で drop される）。`watch::Sender::send` は受信者が 0 だと
+        // **値を更新せずに** `Err` を返す仕様なので、`let _ =` で握り潰すと
+        // step 5 で spawn した新タスクが `subscribe()` から**古い writer**を
+        // 受け取ってしまう。既存タグ1本のグループにタグを1本足した場合で
+        // 言えば、新タスクは毎周期2値を append するのに writer のスキーマは
+        // 1列のままなので、`TstoreError::ValueCountMismatch` で
+        // **履歴が一切書けなくなる**（現在値キャッシュと live event は
+        // 流れ続けるので、症状は「値は見えるのに履歴が残らない」）。
+        // `send_replace` は受信者の有無に関わらず必ず値を差し替えるため、
+        // この経路でも新タスクは確実に新しい writer を見る。
+        //
+        // 発覚が #341 まで遅れた理由: 既存の回帰テスト
+        // （`tests/integration.rs` の
+        // `apply_config_writer_rotation_preserves_old_and_new_data`）は
+        // 「接続 B を*追加*する」形なので接続 A のタスクが生き残り、受信者が
+        // 0 にならない。「唯一の接続が replaced になる」= 既存グループへの
+        // タグ追加という、#341 で初めて本番から到達可能になった形でしか
+        // 踏めなかった。
+        let retired_writer = new_writer.map(|new_writer| {
             let old_writer = self.writer_tx.borrow().clone();
-            let _ = self.writer_tx.send(new_writer);
-            close_or_flush_writer(old_writer).await?;
-        }
+            self.writer_tx.send_replace(new_writer);
+            old_writer
+        });
 
         // --- 5. Spawn tasks for added/replaced connections ------------------
         // T9-1: start a fresh simulator first (if the new plan wants one) so
@@ -513,6 +563,20 @@ impl Collector {
             ));
             self.tasks
                 .insert(key.clone(), ConnectionTask { handle, stop_tx });
+        }
+
+        // --- 5b. Retire the old writer (non-fatal) -------------------------
+        // #341 レビュー対応（2026-09-14）: この retire は step 5（新タスクの
+        // spawn）の**後**に置き、失敗しても `Err` を返さない - このモジュール
+        // doc の step 5b 参照。旧ファイルの最後の未フラッシュ分が失われうる
+        // ことと、「新構成のタスクが1本も立っていないのに config は旧のまま」
+        // という中途半端な状態を残すことを天秤にかけ、後者を避ける。
+        if let Some(old_writer) = retired_writer {
+            if let Err(err) = close_or_flush_writer(old_writer).await {
+                eprintln!(
+                    "banto-collect: 旧 writer の最終 flush に失敗しました（新しい構成の収集は継続します）: {err}"
+                );
+            }
         }
 
         // --- 6. Retain cache/status down to the new config's live keys ------

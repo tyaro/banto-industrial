@@ -12,7 +12,7 @@
 //! doc comment に、なぜ `CollectorManager` 側ではなくここなのかを書いて
 //! ある）。
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use banto_collect::RegistrySnapshot;
@@ -114,12 +114,33 @@ pub struct CollectionController {
     /// `PUT /api/collection/mode`、MCP の `collection_control`、Windows
     /// サービス起動時の自動 start がすべてそこへ集まる）。`CollectorManager`
     /// 側（`apply_run`/`stop`）に置くと、収集の遷移ではない
-    /// `crate::rest::commit_catalog_and_notify` の legacy live reconfigure
-    /// も `apply_run` を呼ぶため、「停止中なのに DB へ繋ぐ」経路が1本
-    /// 残ってしまう。
+    /// [`Self::commit_catalog_and_apply_live`]（#341 の live re-apply。
+    /// 2026-09-14 より前は `commit_catalog_and_notify` の legacy live
+    /// reconfigure）も `apply_run` を呼ぶため、「停止中なのに DB へ繋ぐ」
+    /// 経路が1本残ってしまう。なお `commit_catalog_and_apply_live` は
+    /// `Running` のときしか `apply_run` を呼ばないので、DB Source の
+    /// task を起こす/落とす点が増えることはない（plan の入れ替えは
+    /// `commit_catalog` が担当し、走行中なら接続単位の差分で task を
+    /// 作り直す - `crate::db_source` のモジュール doc comment 参照）。
     db_source: Arc<DbSourceEngine>,
     state: Mutex<ControllerState>,
     transition: AsyncMutex<()>,
+    /// #341 レビュー対応2（2026-09-14）: `transition` を保持しているのが
+    /// **live apply**（[`Self::commit_catalog_and_apply_live`]）かどうか。
+    ///
+    /// ライフサイクル操作（[`Self::start`]/[`Self::stop`]/[`Self::set_mode`]）は
+    /// 「遷移中に重ねて来た要求は待たずに現在状態を返す」という冪等契約
+    /// （docs/banto-hub-desktop-plan.md）を持つため `try_lock` する。ところが
+    /// #341 で live apply が同じロックを**保持して待つ**ようになった結果、
+    /// live apply 中（PLC へのダイヤルを含み数秒かかりうる）に運用者の
+    /// 「停止」が来ると黙って無視され、収集が続いてしまう。
+    ///
+    /// そこで、ロックが取れなかった相手が live apply のときだけ**待って
+    /// から**実行する（[`Self::acquire_transition`]）。相手が本物の
+    /// ライフサイクル遷移（start/stop/set_mode）のときは従来どおり
+    /// no-op のまま - そちらは「同じことを二重にやらない」ための冪等契約
+    /// そのもので、待って実行すると start→start が2回走ってしまう。
+    live_apply_in_progress: AtomicBool,
     run_seq: AtomicU64,
     status_tx: watch::Sender<RuntimeStatus>,
 }
@@ -155,6 +176,7 @@ impl CollectionController {
                 last_error: None,
             }),
             transition: AsyncMutex::new(()),
+            live_apply_in_progress: AtomicBool::new(false),
             run_seq: AtomicU64::new(0),
             status_tx,
         }
@@ -189,59 +211,183 @@ impl CollectionController {
         self.status_tx.send_replace(self.status());
     }
 
-    /// T19 S2-a 案B (UX-48, docs/banto-hub-t19-design.md §3.8, 2026-09-03):
-    /// re-sync broker sessions against `snapshot` after a catalog-only
-    /// commit (`crate::rest::commit_catalog_and_notify`, the only intended
-    /// caller), closing the gap where a tag added to a previously-tagless
-    /// connection (or the last tag/group removed from one) would not affect
-    /// broker sessions - and therefore the write path
-    /// (`crate::hub::CollectorManager::write_broker_handle_peek`) - until
-    /// the next `start`/`stop` cycle.
+    /// #341（オーナー決定 2026-09-09 / 2026-09-14、`docs/tag-server-design.md`
+    /// §4.3）: 直前にコミットされたレジストリ変更を catalog へ反映し、収集が
+    /// 実際に `Running` なら**収集を止めずに実行構成へも反映する** -
+    /// [`crate::rest::commit_catalog_and_notify`]（REST/MCP の全レジストリ
+    /// mutation と `execute_pending_apply` が必ず通る唯一の点）専用の
+    /// primitive で、他に呼び出し元を作らないこと。
     ///
-    /// **Serialized against `start`/`stop` via the SAME `transition` lock
-    /// those use** (`try_lock`, identical discipline to
-    /// [`Self::start`]/[`Self::stop`] above): if a start or stop is already
-    /// in flight, this does nothing - that in-flight transition is itself
-    /// about to either establish or tear down every broker session
-    /// correctly (via [`CollectorManager::apply_run`]/[`CollectorManager::stop`]),
-    /// so there is nothing left for this call to add, and calling
-    /// [`CollectorManager::resync_broker_sessions`] concurrently with it
-    /// would be exactly the hazard the next paragraph describes. This is
-    /// what keeps a catalog-driven resync from ever racing
-    /// [`Self::stop_locked`]'s call into `CollectorManager::stop` - the
-    /// T15-4-shaped danger 案B has to avoid re-introducing (see
-    /// `CollectorManager::resync_broker_sessions`'s own doc comment for the
-    /// full derivation: `CollectorManager::stop` does not take the
-    /// manager's own `rebuild_lock`, so only this `transition` lock stands
-    /// between "stop just tore a session down" and "resync re-dials it a
-    /// moment later").
+    /// # なぜ `commit_catalog` + `apply_run` で、`rebuild` ではないのか
     ///
-    /// **Only resyncs while the controller reports `Running`** - a
-    /// `Stopped`/`Starting`/`Stopping`/`Faulted` controller has no broker
-    /// sessions that should exist at all (a `Stopped` controller in
-    /// particular has none at all - `CollectorManager::stop` already tore
-    /// every one of them down), and dialing one here on a catalog commit
-    /// made while stopped would be exactly the "PLC we meant to leave
-    /// stopped gets dialed anyway" mistake T15-4 fixed once already for the
-    /// write path.
-    pub async fn resync_sessions_for_catalog_change(&self, snapshot: &RegistrySnapshot) {
-        let Ok(_guard) = self.transition.try_lock() else {
-            return;
-        };
+    /// - [`CollectorManager::commit_catalog`] が catalog・演算タグ plan・
+    ///   DB Source plan を同じ点で入れ替え、`configured_revision` を進めて
+    ///   `config_changed`（`revision_tx`）を飛ばす = 外部クライアントが
+    ///   catalog を取り直す契機（設計 §4.1）。
+    /// - [`CollectorManager::apply_run`] が `runtime_snapshot_for_mode` で
+    ///   **今の run mode のオーバーライドを尊重した**構成を組み立ててから
+    ///   [`banto_collect::Collector::apply_config`]（T7 の接続単位の部分
+    ///   再構成）へ通し、broker セッションの追加/削除も同じ順序
+    ///   （collect タスク停止 → セッション削除）で同期する。
+    /// - [`CollectorManager::rebuild`] は run mode を一切見ず
+    ///   `RegistrySnapshot` をそのまま `build_config_from` へ渡すため、
+    ///   `AllSimulation` で稼働中にこれを呼ぶと**シミュレーション中のはずの
+    ///   接続が実機へダイヤルされる**。live re-apply の primitive には
+    ///   絶対に使えない（これが `apply_run` を選んだ決定的な理由）。
+    ///
+    /// この構成により、T19 S2-a 案B の `resync_sessions_for_catalog_change`
+    /// （catalog-only commit のときに broker セッションだけ同期していた、
+    /// #341 で撤去）が抱えていた「最後のグループを失った接続の collect
+    /// タスクが、セッション削除後もしばらく古いセッションを読み続けうる」
+    /// 隙間も閉じる - `apply_run` は collector 側のコミット（= 当該タスクの
+    /// 停止）が終わってから `remove_stale_broker_sessions` する。
+    ///
+    /// # 並行性の前提と保証
+    ///
+    /// - **`start`/`stop`/`set_mode` と同じ `transition` ロックを取る**
+    ///   （`try_lock` ではなく `lock().await` - 進行中の遷移が終わるのを
+    ///   待って必ず適用する。`try_lock` で諦めると「DB にはあるのに走って
+    ///   いる構成には無い」状態を無言で残してしまい、#341 が塞ごうとして
+    ///   いる穴そのものになる）。ロック順序は常に `transition` →
+    ///   `CollectorManager::rebuild_lock` の一方向で、逆順に取る経路は
+    ///   存在しない（`rebuild`/`commit_catalog`/`apply_run` はこの
+    ///   controller を一切参照しない）ためデッドロックしない。呼び出し元
+    ///   （REST ハンドラ）は DB トランザクションを既にコミット済みで、
+    ///   他のロックを保持していないことも前提。
+    /// - 逆に、この適用中に届いた `start`/`stop` は（両者の `try_lock` が
+    ///   外れて）現在の状態を返すだけの no-op になる - 撤去した
+    ///   `resync_sessions_for_catalog_change` と同じ既知の性質で、
+    ///   `CollectorManager::stop` は `rebuild_lock` を取らないため、
+    ///   「stop が落としたセッションを直後に張り直す」T15-4 型の事故を
+    ///   防いでいるのはこの `transition` ロックだけである。
+    /// - **適用順序**: `commit_catalog` と `apply_run` の対がこのロックで
+    ///   直列化されるので、連続した CRUD が適用を追い越し合うことはない。
+    ///   `apply_run` は自分でレジストリを読み直す（`RegistrySnapshot::load`）
+    ///   ため、**最後に走った適用は常に最新の DB 状態を反映する**。
+    /// - **古い snapshot の窓は閉じてある**（#341 レビュー対応、
+    ///   2026-09-14）: catalog へコミットするのは呼び出し元のトランザク
+    ///   ション内 snapshot ではなく、**この `transition` ロックを取った後に
+    ///   読み直した最新の `RegistrySnapshot`**。呼び出し元の in-tx snapshot
+    ///   は preflight（保存前検証）専用で、反映には使わない。これが無いと
+    ///   「A が tx commit → B が tx commit → B が catalog commit → A が
+    ///   catalog commit」の順に並んだときに catalog だけ B の行を欠く
+    ///   （collector 側は `apply_run` が元から読み直しているので常に最新
+    ///   ＝ catalog と collector が食い違う）。読み直しに失敗した場合は
+    ///   何も変更せずに `Err` を返す。
+    ///
+    /// # 失敗時
+    ///
+    /// `Err` は「DB には入ったが実行構成へ反映できなかった」ことだけを
+    /// 意味する（レジストリ行そのものは既にコミット済み）。`apply_config`
+    /// は all-or-nothing なので走行中の収集は元の構成のまま無傷で、
+    /// 状態も `Running` のまま（`Faulted` にはしない - 収集自体は正常に
+    /// 続いている）。`CollectorManager` 側が `last_error`
+    /// （`/api/v1/status` の `last_config_error`）に記録し、呼び出し元は
+    /// これを API のエラーとして返す。
+    ///
+    /// **ロールバックの範囲（#341 レビュー対応2、2026-09-14）**: `apply_run`
+    /// が失敗した場合、
+    /// (a) collector のタスク集合は `apply_config` の all-or-nothing で元の
+    /// まま、(b) broker セッション集合は
+    /// [`CollectorManager::apply_run`] 自身が直前の成功構成へ戻し、
+    /// (c) catalog・演算タグ plan・DB Source plan は
+    /// [`CollectorManager::rollback_catalog`] が直前の成功構成へ戻す。
+    /// つまり失敗後の runtime 側は**全部まとめて旧構成**で一貫し、
+    /// **DB だけが新**という状態になる（レジストリ行は保存済み）。
+    /// 再反映の手段は `crate::rest::LIVE_APPLY_RECOVERY_HINT` のとおり
+    /// （次の構成変更 / 収集の停止→開始 / `POST /api/collection/reapply`）。
+    /// (c) のロールバックでも `configured_revision` は進み
+    /// `config_changed` が飛ぶ - 新 catalog を取得済みのクライアントに
+    /// 「戻った」ことを知らせる契機として意図的。
+    ///
+    /// `Running` 以外（`Stopped`/`Starting`/`Stopping`/`Faulted`）では
+    /// catalog だけをコミットして返る - 停止中の catalog commit で PLC へ
+    /// ダイヤルしてしまう T15-4 型の事故を起こさないため、**`Running` の
+    /// 確認は必ずこのロックの下で行う**。
+    pub async fn commit_catalog_and_apply_live(&self) -> Result<(), String> {
+        // #341 レビュー対応2: ここから下で来た start/stop/set_mode は no-op では
+        // なく「待って実行」させる（`live_apply_in_progress` のフィールド doc
+        // comment・[`Self::acquire_transition`] 参照）。`_reset` の `Drop` が、
+        // この後のどの早期 return でも必ず下ろす。
+        //
+        // **フラグを立てるのは `transition` を取る前**（#341 監査、2026-09-14）:
+        // ローカル変数は宣言の逆順で drop されるので、ロックの後で宣言すると
+        // 関数終了時に「フラグ解除 → ロック解放」の順になり、その隙間に来た
+        // ライフサイクル要求が `try_lock` に失敗しつつフラグも false を見て
+        // no-op に落ちる（塞いだはずの穴が幅マイクロ秒で残る）。先に立てれば
+        // drop 順が「ロック解放 → フラグ解除」になり、解放直後の要求は
+        // `try_lock` に成功するか、別遷移に取られていた場合でも余計に待つだけで
+        // 済む。副作用は「ロック取得を待っている間に来た要求が、先行する別の
+        // ライフサイクル遷移の完了まで余計に待つことがある」だけで、無害
+        // （待った後にその時点の状態で判断するため、二重実行にはならない）。
+        self.live_apply_in_progress.store(true, Ordering::SeqCst);
+        let _reset = LiveApplyFlagGuard(&self.live_apply_in_progress);
+        let _guard = self.transition.lock().await;
+        // ロックを取った**後**に読み直す（上の「古い snapshot の窓」）。
+        // `RegistrySnapshot::load` は読み取りだけなので、失敗しても catalog・
+        // 実行構成のどちらにも副作用は無い。
+        let snapshot = RegistrySnapshot::load(&self.manager.pool())
+            .await
+            .map_err(|err| format!("レジストリのスナップショット取得に失敗しました: {err}"))?;
+        self.manager.commit_catalog(&snapshot).await?;
         let current = self.status();
         if current.state != CollectionState::Running {
-            return;
+            return Ok(());
         }
-        self.manager
-            .resync_broker_sessions(snapshot, current.mode)
-            .await;
+        if let Err(err) = self.manager.apply_run(current.mode).await {
+            // #341 レビュー対応2（2026-09-14）: ここまでで catalog・演算 plan・
+            // DB Source plan は**新構成**になっているが、収集側は
+            // `apply_run` 自身のロールバック（collector は all-or-nothing、
+            // broker セッションは `rollback_broker_sessions`）で**旧構成**の
+            // まま。読み側と収集側が食い違ったままにしないため、catalog 側も
+            // 直前の成功構成へ戻す（`CollectorManager::rollback_catalog` の
+            // doc comment に保証の範囲と `config_changed` の意図を書いてある）。
+            self.manager.rollback_catalog().await;
+            return Err(err);
+        }
+        Ok(())
     }
 
-    /// Start the requested mode. A request arriving during another transition
-    /// is not queued; it returns the state already published by that
-    /// transition. Starting the same mode while running is idempotent.
+    /// #341 レビュー対応2（2026-09-14）: ライフサイクル操作
+    /// （[`Self::start`]/[`Self::stop`]/[`Self::set_mode`]）が `transition`
+    /// ロックを取る唯一の入口。
+    ///
+    /// - **取れた**: そのまま実行（従来どおり）。
+    /// - **取れず、保持者が live apply**（[`Self::commit_catalog_and_apply_live`]）:
+    ///   `lock().await` で**待ってから**実行する。live apply は「収集の遷移」
+    ///   ではなく構成の反映で、しかも PLC へのダイヤルを含んで数秒かかり
+    ///   うるため、その間に来た運用者の「停止」を無視してはいけない。
+    ///   待ったあとは**その時点の状態で**判断する（呼び出し元が
+    ///   `self.status()` を読み直す）- ループは不要で、ロックを取った
+    ///   時点の状態が唯一の判断材料。
+    /// - **取れず、保持者が別のライフサイクル遷移**: 従来どおり `None`
+    ///   （呼び出し元は現在状態を返して終わる）。これは「遷移中に重ねて
+    ///   来た開始・停止要求は待たずに現在状態を返す」という冪等契約
+    ///   （docs/banto-hub-desktop-plan.md §9.1・T14）そのもので、待って
+    ///   実行すると start→start が2回走ってしまう。
+    ///
+    /// 競合について: `try_lock` 失敗 → フラグ確認の間に live apply が
+    /// 終わって別のライフサイクル遷移がロックを取ることはありうる。その
+    /// 場合はそちらの完了も待ってから状態を見るだけで、誤った二重実行には
+    /// ならない（ロック取得後に状態を評価するため）。
+    async fn acquire_transition(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        match self.transition.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(_) if self.live_apply_in_progress.load(Ordering::SeqCst) => {
+                Some(self.transition.lock().await)
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Start the requested mode. A request arriving during another lifecycle
+    /// transition is not queued; it returns the state already published by
+    /// that transition. A request arriving during a live apply
+    /// ([`Self::commit_catalog_and_apply_live`]) **waits** for it and then
+    /// runs normally - see [`Self::acquire_transition`]. Starting the same
+    /// mode while running is idempotent.
     pub async fn start(&self, mode: RunMode) -> CollectionStatus {
-        let Ok(_guard) = self.transition.try_lock() else {
+        let Some(_guard) = self.acquire_transition().await else {
             return self.status();
         };
 
@@ -265,7 +411,7 @@ impl CollectionController {
     /// Stop the current run. The collector is flushed first, then every
     /// broker session is stopped and joined. Repeated stops are no-ops.
     pub async fn stop(&self) -> CollectionStatus {
-        let Ok(_guard) = self.transition.try_lock() else {
+        let Some(_guard) = self.acquire_transition().await else {
             return self.status();
         };
 
@@ -284,7 +430,7 @@ impl CollectionController {
     /// stop → stopped → start, so configured and all-simulation never switch
     /// in place.
     pub async fn set_mode(&self, mode: RunMode) -> CollectionStatus {
-        let Ok(_guard) = self.transition.try_lock() else {
+        let Some(_guard) = self.acquire_transition().await else {
             return self.status();
         };
 
@@ -403,6 +549,17 @@ impl CollectionController {
 
     fn publish_status(&self) {
         self.status_tx.send_replace(self.status());
+    }
+}
+
+/// [`CollectionController::live_apply_in_progress`] を必ず下ろすための
+/// RAII ガード（live apply がどの早期 return / パニックで抜けても、
+/// 「live apply 中」と誤認されたままにならないようにする）。
+struct LiveApplyFlagGuard<'a>(&'a AtomicBool);
+
+impl Drop for LiveApplyFlagGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
@@ -563,6 +720,105 @@ mod tests {
         assert_eq!(stopped.state, CollectionState::Stopped);
         assert_eq!(stopped.configured_revision, 1);
         assert_eq!(stopped.running_revision, 2);
+    }
+
+    /// #341 レビュー対応2（2026-09-14）: **live apply 中に来た `stop` は
+    /// 無視されず、live apply の完了を待ってから実行される**
+    /// （[`CollectionController::acquire_transition`]）。
+    ///
+    /// #341 で `commit_catalog_and_apply_live` が `transition` ロックを
+    /// **保持して待つ**ようになったため、`try_lock` のままだと運用者の
+    /// 「停止」が黙って落ちて収集が続いてしまう、というレビュー指摘への
+    /// 回帰テスト。live apply は `CollectorManager::delay_next_apply_for_test`
+    /// で意図的に遅らせ、その最中に `stop()` を投げる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stop_during_a_live_apply_waits_instead_of_being_ignored() {
+        let (_dir, controller) = controller_env().await;
+        let running = controller.start(RunMode::Configured).await;
+        assert_eq!(running.state, CollectionState::Running);
+
+        // 次の `apply_run`（= live apply の中身）を 500ms 止める。
+        controller
+            .manager
+            .delay_next_apply_for_test(Duration::from_millis(500));
+
+        let applying = {
+            let controller = controller.clone();
+            tokio::spawn(async move { controller.commit_catalog_and_apply_live().await })
+        };
+
+        // live apply がロックを掴むまで待つ（掴む前に stop を投げると
+        // そもそも競合にならずテストの意味が無い）。
+        assert!(
+            wait_until(Duration::from_secs(5), || async {
+                controller
+                    .live_apply_in_progress
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            })
+            .await,
+            "live apply が transition ロックを取るはず"
+        );
+
+        let stopped = controller.stop().await;
+        assert_eq!(
+            stopped.state,
+            CollectionState::Stopped,
+            "live apply 中の stop は無視されず、完了を待って実行されること"
+        );
+        assert!(applying.await.expect("join").is_ok());
+        assert_eq!(controller.status().state, CollectionState::Stopped);
+    }
+
+    /// 対照実験（#341 レビュー対応2）: **ライフサイクル遷移**同士は従来
+    /// どおり no-op のまま - `acquire_transition` が待つのは live apply の
+    /// ときだけで、start→start を二重に走らせたりしない。
+    /// `concurrent_starts_do_not_allocate_two_running_ids`（上）と同じ
+    /// 性質を、`acquire_transition` 導入後も保つことの明示。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_second_start_during_a_start_is_still_a_no_op() {
+        let (_dir, controller) = controller_env().await;
+        let left = controller.clone();
+        let right = controller.clone();
+        let (left, right) = tokio::join!(
+            left.start(RunMode::Configured),
+            right.start(RunMode::Configured)
+        );
+        assert!(matches!(
+            left.state,
+            CollectionState::Starting | CollectionState::Running
+        ));
+        assert!(matches!(
+            right.state,
+            CollectionState::Starting | CollectionState::Running
+        ));
+        let settled = wait_until(Duration::from_secs(5), || async {
+            controller.status().state == CollectionState::Running
+        })
+        .await;
+        assert!(settled);
+        assert_eq!(
+            controller.status().run_id,
+            Some(1),
+            "run_id が2つ払い出されていない = 二重起動していない"
+        );
+    }
+
+    /// Poll `predicate` every 10ms until it returns true or `timeout` elapses.
+    async fn wait_until<F, Fut>(timeout: Duration, mut predicate: F) -> bool
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if predicate().await {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// T15-3（設計 §6.3「停止／終了／切替／サービス再起動後に必ず無効へ

@@ -279,3 +279,47 @@ describe('T19 S2-c2（UX-40、docs/banto-hub-t19-design.md §3.10）: httpReques
 		expect(deferredDeleteFlush).toHaveBeenCalledTimes(1);
 	});
 });
+
+describe('#341 レビュー対応2: httpRequest の 500 live_reconfigure_failed 処理', () => {
+	const liveApplyFailedBody = {
+		error: 'live_reconfigure_failed',
+		message:
+			'変更は保存しましたが、実行構成への反映に失敗しました: テスト用の理由（変更は保存済みです。次の構成変更、収集の停止→開始、または POST /api/collection/reapply で再反映できます）'
+	};
+
+	it('タグ作成: サーバーの message をそのまま見せる（「500 Internal Server Error」にしない）', async () => {
+		mockFetchOnce({ status: 500, ok: false, body: liveApplyFailedBody });
+		await expect(createTag(tagInput)).rejects.toThrow(/変更は保存しました/);
+	});
+
+	it('タグ作成: 再反映の案内が文言に残る（保存済みなので同じ操作をやり直させない）', async () => {
+		mockFetchOnce({ status: 500, ok: false, body: liveApplyFailedBody });
+		await expect(createTag(tagInput)).rejects.toThrow(/POST \/api\/collection\/reapply/);
+	});
+
+	it('接続更新（PUT）でも同じ扱いになる', async () => {
+		mockFetchOnce({ status: 500, ok: false, body: liveApplyFailedBody });
+		await expect(updatePlcConnection(1, connectionInput)).rejects.toThrow(/変更は保存しました/);
+	});
+
+	it('一括更新（batch）でも同じ扱いになる', async () => {
+		mockFetchOnce({ status: 500, ok: false, body: liveApplyFailedBody });
+		const rows: BatchTagUpdateRow[] = [
+			{
+				id: 1,
+				name: 'tag1',
+				collectionGroupId: 1,
+				address: 'D3000',
+				dataType: 'i16',
+				decimals: 0,
+				enabled: false
+			}
+		];
+		await expect(updateTagsBatch(rows, false)).rejects.toThrow(/変更は保存しました/);
+	});
+
+	it('無関係な 500 は従来どおりの汎用エラーのまま（回帰ガード）', async () => {
+		mockFetchOnce({ status: 500, ok: false, body: { kind: 'storage', message: 'disk full' } });
+		await expect(createTag(tagInput)).rejects.toThrow(/disk full/);
+	});
+});

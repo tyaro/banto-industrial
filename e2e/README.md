@@ -13,12 +13,24 @@ relay-wright は Tauri アプリだが、`relay-wright-serve`（`apps/relay-wrig
 
 ## ポート割り当て
 
-| アプリ         | ポート |
-| -------------- | ------ |
-| chronogazer    | 8798   |
-| banto-hub      | 8799   |
-| relay-wright   | 8800   |
-| banto-hub-perf | 8801   |
+| アプリ                        | ポート |
+| ----------------------------- | ------ |
+| chronogazer                   | 8798   |
+| banto-hub                     | 8799   |
+| relay-wright                  | 8800   |
+| banto-hub-perf                | 8801   |
+| banto-hub（ロックダウン済み） | 8802   |
+
+`pnpm e2e:banto-hub` は **2台**の banto-hub を起動する（#341、2026-09-14）。
+8799 は従来どおり試運転モード（未ロックダウン）のままで、スイートの大半が
+これを使う。8802 は `banto-hub-status-pending-apply-cancel.spec.ts` 専用で、
+その spec の `beforeAll` が初回セットアップ直後にロックダウンする —
+「収集中の構成 CRUD は未適用キューへ積まれる」契約が #341 以降
+**ロックダウン済みのときだけ**成り立つため（試運転中は即時・無停止反映）。
+プロジェクト名は `chromium`（8799）と `chromium-locked-down`（8802）で、
+片方だけ走らせたいときは `pnpm e2e:banto-hub --project=chromium-locked-down`
+のように指定する。2台目は `BANTO_HUB_PROFILE`/`BANTO_HUB_ROOT` も分けてある
+（profile 排他ロックが1台目と衝突しないようにするため）。
 
 ## ビルド前提
 

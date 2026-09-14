@@ -36,14 +36,19 @@
 	 * セクション・`commissioning_lock_down_fails_without_any_admin_account`
 	 * 参照）。
 	 *
-	 * **2026-08-31 オーナー指摘（収集の開始/停止 UI の追加）**: `rest.rs` の
-	 * `commit_catalog_and_notify` の doc comment のとおり、本番経路では
-	 * PLC接続/収集グループ/タグの登録・変更は configured revision を
+	 * **2026-08-31 オーナー指摘（収集の開始/停止 UI の追加）**: 当時は
+	 * PLC接続/収集グループ/タグの登録・変更が configured revision を
 	 * 進めるだけで、動いている（あるいはまだ一度も開始していない）収集機
-	 * には反映されない。`POST /api/collection/start|stop` 自体は元々 API
+	 * には反映されなかった。`POST /api/collection/start|stop` 自体は元々 API
 	 * にしか無く、UI から叩く導線が1つも無かった - 実機での試運転の最後の
 	 * 一歩「PLC に接続開始し、タグにアクセスできているか確認する」を画面
-	 * から行えなかった。「収集の開始・停止」セクション（`#collection-control`、
+	 * から行えなかった。**#341（2026-09-14）でその前提は変わった**:
+	 * `rest.rs` の `commit_catalog_and_notify` は
+	 * `CollectionController::commit_catalog_and_apply_live` を通し、収集が
+	 * 稼働中なら**止めずに**実行構成まで反映する（試運転中は CRUD が
+	 * そのまま、ロックダウン後は未適用キューの明示適用が契機）。したがって
+	 * このセクションの start/stop は「変更を反映させるための再起動」では
+	 * なく純粋な収集ライフサイクル操作である。「収集の開始・停止」セクション（`#collection-control`、
 	 * `collectionControlAdmin.ts` 使用）はその導線。接続単位のシミュレーション
 	 * （`PlcConnection.simulation`、T9-2、接続 Drawer のチェックボックス）は
 	 * 今回のオーナー指摘とは無関係で
@@ -53,7 +58,6 @@
 	import {
 		applyPendingChange,
 		cancelPendingChange,
-		isPendingApplyConflictError,
 		listPendingChanges,
 		requeuePendingChange,
 		type PendingChange
@@ -105,7 +109,6 @@
 	const POLL_INTERVAL_MS = 3000;
 
 	function errorMessage(err: unknown): string {
-		if (isPendingApplyConflictError(err)) return err.failureReason ?? err.message;
 		return isProviderError(err) ? err.message : String(err);
 	}
 
@@ -283,9 +286,10 @@
 			await poll();
 		} catch (err) {
 			toastStore.push('error', errorMessage(err));
-			if (isPendingApplyConflictError(err)) {
-				await poll();
-			}
+			// #341: 適用が失敗しても（フィンガープリント不一致で failed へ
+			// 落ちた、実行構成への反映だけ失敗した等）行の状態は変わって
+			// いるので、必ず取り直す。
+			await poll();
 		} finally {
 			pendingActionId = null;
 		}
@@ -729,6 +733,20 @@
 					{/if}
 				</dd>
 			</dl>
+			<!--
+				#341（オーナー決定 2026-09-09 / 2026-09-14、docs/tag-server-design.md
+				§4.3）: 構成変更（接続・グループ・タグ）がいつ実行構成へ届くかの契約を、
+				試運転モードの表示のすぐ近くに事実として置く。issue 本文は
+				`CommissioningBanner` に添えることを想定していたが、そのバナーは
+				T19 S1-d（UX-45）で撤去済みなので、状態が読めるこの場所に置く。
+			-->
+			<p class="note" data-testid="registry-change-contract-note">
+				{#if sessionStore.commissioningMode}
+					試運転中は構成変更（接続・グループ・タグ）が収集中でも即時反映されます。ロックダウン後は未適用の変更として保存され、明示的に適用するまで反映されません（適用時も収集は止まりません）。
+				{:else}
+					ロックダウン済みのため、収集中の構成変更（接続・グループ・タグ）は未適用の変更として保存され、下の「未適用の変更」から明示的に適用するまで反映されません（適用時も収集は止まりません）。
+				{/if}
+			</p>
 			{#if status.last_config_error}
 				<p class="config-error">設定エラー: {status.last_config_error}</p>
 			{/if}

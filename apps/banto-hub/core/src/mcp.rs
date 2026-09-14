@@ -85,7 +85,7 @@ use banto_tags::{CollectionGroupService, PlcConnectionService, TagService, TagUp
 use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::commissioning::{CommissioningService, CommissioningState};
-use crate::controller::{CollectionController, CollectionState, RunMode};
+use crate::controller::{CollectionController, RunMode};
 use crate::hub::CollectorManager;
 use crate::mqtt::MqttPublisher;
 use crate::pending_changes::PendingChangesService;
@@ -207,10 +207,6 @@ struct McpState {
     /// （`crate::rest::api_router_with_controller_mode`）が REST と同じ
     /// `Arc`/`SqlitePool`ベースの `AuditLogService` をそのまま渡す。
     audit: AuditLogService,
-    /// `commit_catalog_and_notify`へそのまま渡す - 呼び出し元が REST と
-    /// 同じ値を渡す（`crate::rest::tag_registry_router`の同名フィールドと
-    /// 同じ意味）。
-    legacy_live_reconfigure: bool,
     // T21 S2-b（docs/banto-hub-t21-design.md、構成補助 MCP の設定
     // get/set）: `get_grpc_settings`/`get_mqtt_settings`/`get_retention`/
     // `set_grpc_settings`/`set_mqtt_settings`/`set_retention`用の追加状態。
@@ -264,14 +260,13 @@ pub(crate) fn mcp_router(
     mqtt: Arc<MqttPublisher>,
     system_info: Arc<SystemInfoSampler>,
     // T14-4 由来: `crate::rest::tag_space_router`の`enforce_collection_state`
-    // と同じ意味 - `!legacy_live_reconfigure`を渡す（呼び出し元の責務）。
+    // と同じ意味 - `!legacy_compat_router`を渡す（呼び出し元の責務）。
     enforce_collection_state: bool,
     // T21 S1-b（docs/banto-hub-t21-design.md §5）: 構成補助ツール用に追加。
     // 呼び出し元（`crate::rest::api_router_with_controller_mode`）が REST の
     // 他ルーターと**同じ** `Arc`/値を渡すこと（このモジュールの doc comment
     // 「呼び出し元は...同じインスタンスを渡すこと」と同じ規律）。
     audit: AuditLogService,
-    legacy_live_reconfigure: bool,
     // T21 S2-b（docs/banto-hub-t21-design.md、構成補助 MCP の設定
     // get/set）: `set_grpc_settings`が`GrpcServer::apply`を呼ぶために必要 -
     // 呼び出し元は`crate::rest::grpc_settings_router`へ渡すものと**同じ**
@@ -329,7 +324,6 @@ pub(crate) fn mcp_router(
         tags,
         pending_changes,
         audit,
-        legacy_live_reconfigure,
         settings,
         grpc_server,
         commissioning_service,
@@ -592,7 +586,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "create_connection",
-            "description": "PLC 接続を新規作成する(admin スコープ必須)。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
+            "description": "PLC 接続を新規作成する(admin スコープ必須)。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -634,7 +628,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "delete_connection",
-            "description": "PLC 接続を削除する(admin スコープ必須)。配下のグループ・タグも一括削除するが、収集済み履歴データは残る。不可逆操作のため confirm:true が必須。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
+            "description": "PLC 接続を削除する(admin スコープ必須)。配下のグループ・タグも一括削除するが、収集済み履歴データは残る。不可逆操作のため confirm:true が必須。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -653,7 +647,7 @@ fn tool_definitions() -> Vec<Value> {
         // (admin スコープ必須・有効化ガードなし)。
         json!({
             "name": "update_connection",
-            "description": "既存の PLC 接続を更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない)。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
+            "description": "既存の PLC 接続を更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない)。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -760,7 +754,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "create_group",
-            "description": "収集グループを新規作成する(admin スコープ必須)。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
+            "description": "収集グループを新規作成する(admin スコープ必須)。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -783,7 +777,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "update_group",
-            "description": "既存の収集グループを更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない)。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
+            "description": "既存の収集グループを更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない)。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -815,7 +809,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "delete_group",
-            "description": "収集グループを削除する(admin スコープ必須)。配下のタグも一括削除するが、収集済み履歴データは残る。不可逆操作のため confirm:true が必須。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
+            "description": "収集グループを削除する(admin スコープ必須)。配下のタグも一括削除するが、収集済み履歴データは残る。不可逆操作のため confirm:true が必須。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -848,7 +842,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "create_tag",
-            "description": "タグを新規作成する(admin スコープ必須)。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
+            "description": "タグを新規作成する(admin スコープ必須)。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -889,7 +883,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "update_tag",
-            "description": "既存のタグを更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない) - get_tag で現在値を取得してから全項目を送り返すこと。expectedRevision を付けると楽観ロックになり、他者が先に更新していた場合は revision_conflict エラーで拒否される(get_tag で最新の revision を取り直して再試行)。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
+            "description": "既存のタグを更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない) - get_tag で現在値を取得してから全項目を送り返すこと。expectedRevision を付けると楽観ロックになり、他者が先に更新していた場合は revision_conflict エラーで拒否される(get_tag で最新の revision を取り直して再試行)。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -952,7 +946,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "delete_tag",
-            "description": "タグを削除する(admin スコープ必須)。タグは末端リソースのため配下は無い(cascade ではない)が、収集済み履歴データは残る。不可逆操作のため confirm:true が必須。収集中は直接反映せず、未適用キュー(pending queue)に保存する。",
+            "description": "タグを削除する(admin スコープ必須)。タグは末端リソースのため配下は無い(cascade ではない)が、収集済み履歴データは残る。不可逆操作のため confirm:true が必須。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1790,10 +1784,10 @@ fn require_admin_scope(ctx: &ApiKeyContext) -> Result<(), Value> {
     }
 }
 
-/// 収集中に pending queue へ保存できたときの応答文言 - REST の
+/// ロックダウン済み + 収集中に pending queue へ保存できたときの応答文言 - REST の
 /// `QueuedPendingChangeResponse.message`（`crate::rest`）と同じ文言にして
 /// REST/MCP で表現を揃える。
-const QUEUED_MESSAGE: &str = "収集中のため変更を未適用キューに保存しました。";
+const QUEUED_MESSAGE: &str = "ロックダウン済みで収集中のため、変更を未適用キューに保存しました。";
 
 /// 構成操作の監査（設計 §3.3「全構成操作を audit_log に記録する」）- REST の
 /// `record_write`（`crate::rest`）と同じ `AuditEntry` の組み立て方だが、
@@ -1859,8 +1853,8 @@ async fn tool_list_connections(state: &McpState, ctx: &ApiKeyContext) -> Value {
 // --- 8. create_connection ----------------------------------------------------
 
 /// `crate::rest::plc_connections_create`（admin REST）と全く同じ mutation
-/// フロー - 収集中は [`compute_pending_base_fingerprint`] →
-/// `state.pending_changes.create_pending` で pending queue に保存し、停止中は
+/// フロー - ロックダウン済みで収集中なら [`compute_pending_base_fingerprint`] →
+/// `state.pending_changes.create_pending` で pending queue に保存し、それ以外は
 /// `state.plc_connections.create_tx` → [`preflight_transaction`] →
 /// `tx.commit` → [`commit_catalog_and_notify`] を1トランザクションで実行する
 /// （順序も REST と同一）。REST との違いは監査の宛先だけ
@@ -1877,8 +1871,9 @@ async fn tool_create_connection(
     let input: PlcConnectionPayload = serde_json::from_value(arguments)
         .map_err(|err| RpcError::invalid_params(format!("接続の入力が不正です: {err}")))?;
 
-    let status = state.status.controller.status();
-    if status.state != CollectionState::Stopped {
+    if crate::rest::registry_change_should_queue(&state.status.controller, &state.commissioning)
+        .is_some()
+    {
         let payload = json!({ "input": input });
         let base_fingerprint = compute_pending_base_fingerprint(
             &state.plc_connections,
@@ -1937,7 +1932,8 @@ async fn tool_create_connection(
             return Ok(banto_error_tool_error(&err));
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -1956,15 +1952,13 @@ async fn tool_create_connection(
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
-    commit_catalog_and_notify(
-        &state.manager,
-        &state.status.controller,
-        &state.events,
-        "plc_connections",
-        snapshot,
-        state.legacy_live_reconfigure,
-    )
-    .await;
+    if let Err(err) =
+        commit_catalog_and_notify(&state.status.controller, &state.events, "plc_connections").await
+    {
+        return Ok(tool_error(format!(
+            "変更は保存しましたが、実行構成への反映に失敗しました: {err}"
+        )));
+    }
     // S1: 生の`PlcConnection`を返さない - `tool_list_connections`と同じ変換。
     Ok(tool_ok(
         json!({ "created": PlcConnectionResponse::from(created) }),
@@ -1999,8 +1993,9 @@ async fn tool_delete_connection(
         ));
     }
 
-    let status = state.status.controller.status();
-    if status.state != CollectionState::Stopped {
+    if crate::rest::registry_change_should_queue(&state.status.controller, &state.commissioning)
+        .is_some()
+    {
         let payload = json!({ "id": id });
         let base_fingerprint = compute_pending_base_fingerprint(
             &state.plc_connections,
@@ -2059,7 +2054,8 @@ async fn tool_delete_connection(
             return Ok(banto_error_tool_error(&err));
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2082,15 +2078,13 @@ async fn tool_delete_connection(
         Some(json!({ "cascade": cascade_detail.clone() })),
     )
     .await;
-    commit_catalog_and_notify(
-        &state.manager,
-        &state.status.controller,
-        &state.events,
-        "plc_connections",
-        snapshot,
-        state.legacy_live_reconfigure,
-    )
-    .await;
+    if let Err(err) =
+        commit_catalog_and_notify(&state.status.controller, &state.events, "plc_connections").await
+    {
+        return Ok(tool_error(format!(
+            "変更は保存しましたが、実行構成への反映に失敗しました: {err}"
+        )));
+    }
     Ok(tool_ok(
         json!({ "deleted": true, "id": id, "cascade": cascade_detail }),
     ))
@@ -2101,7 +2095,8 @@ async fn tool_delete_connection(
 // （接続 update/test・グループ CRUD）。S1-b（[`tool_create_connection`]/
 // [`tool_delete_connection`]）と全く同じ書き方をそのまま踏襲する - ゲート
 // （admin スコープ・監査・delete 系 confirm）・mutation フロー（tx →
-// preflight → commit → catalog commit、収集中は pending queue）のどちらも
+// preflight → commit → catalog commit、ロックダウン済み + 収集中は pending
+// queue）のどちらも
 // 二重実装しない。
 // ---------------------------------------------------------------------------
 
@@ -2231,8 +2226,9 @@ async fn tool_update_connection(
     let input: PlcConnectionPayload = serde_json::from_value(arguments)
         .map_err(|err| RpcError::invalid_params(format!("接続の入力が不正です: {err}")))?;
 
-    let status = state.status.controller.status();
-    if status.state != CollectionState::Stopped {
+    if crate::rest::registry_change_should_queue(&state.status.controller, &state.commissioning)
+        .is_some()
+    {
         let payload = json!({ "id": id, "input": input });
         let base_fingerprint = compute_pending_base_fingerprint(
             &state.plc_connections,
@@ -2295,7 +2291,8 @@ async fn tool_update_connection(
             return Ok(banto_error_tool_error(&err));
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2314,15 +2311,13 @@ async fn tool_update_connection(
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
-    commit_catalog_and_notify(
-        &state.manager,
-        &state.status.controller,
-        &state.events,
-        "plc_connections",
-        snapshot,
-        state.legacy_live_reconfigure,
-    )
-    .await;
+    if let Err(err) =
+        commit_catalog_and_notify(&state.status.controller, &state.events, "plc_connections").await
+    {
+        return Ok(tool_error(format!(
+            "変更は保存しましたが、実行構成への反映に失敗しました: {err}"
+        )));
+    }
     // S1: 生の`PlcConnection`を返さない - `tool_list_connections`と同じ変換。
     Ok(tool_ok(
         json!({ "updated": PlcConnectionResponse::from(updated) }),
@@ -2425,8 +2420,9 @@ async fn tool_create_group(
     let input: CollectionGroupPayload = serde_json::from_value(arguments)
         .map_err(|err| RpcError::invalid_params(format!("グループの入力が不正です: {err}")))?;
 
-    let status = state.status.controller.status();
-    if status.state != CollectionState::Stopped {
+    if crate::rest::registry_change_should_queue(&state.status.controller, &state.commissioning)
+        .is_some()
+    {
         let payload = json!({ "input": input });
         let base_fingerprint = compute_pending_base_fingerprint(
             &state.plc_connections,
@@ -2489,7 +2485,8 @@ async fn tool_create_group(
             return Ok(banto_error_tool_error(&err));
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2508,15 +2505,14 @@ async fn tool_create_group(
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
-    commit_catalog_and_notify(
-        &state.manager,
-        &state.status.controller,
-        &state.events,
-        "collection_groups",
-        snapshot,
-        state.legacy_live_reconfigure,
-    )
-    .await;
+    if let Err(err) =
+        commit_catalog_and_notify(&state.status.controller, &state.events, "collection_groups")
+            .await
+    {
+        return Ok(tool_error(format!(
+            "変更は保存しましたが、実行構成への反映に失敗しました: {err}"
+        )));
+    }
     Ok(tool_ok(json!({ "created": created })))
 }
 
@@ -2543,8 +2539,9 @@ async fn tool_update_group(
     let input: CollectionGroupPayload = serde_json::from_value(arguments)
         .map_err(|err| RpcError::invalid_params(format!("グループの入力が不正です: {err}")))?;
 
-    let status = state.status.controller.status();
-    if status.state != CollectionState::Stopped {
+    if crate::rest::registry_change_should_queue(&state.status.controller, &state.commissioning)
+        .is_some()
+    {
         let payload = json!({ "id": id, "input": input });
         let base_fingerprint = compute_pending_base_fingerprint(
             &state.plc_connections,
@@ -2607,7 +2604,8 @@ async fn tool_update_group(
             return Ok(banto_error_tool_error(&err));
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2626,15 +2624,14 @@ async fn tool_update_group(
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
-    commit_catalog_and_notify(
-        &state.manager,
-        &state.status.controller,
-        &state.events,
-        "collection_groups",
-        snapshot,
-        state.legacy_live_reconfigure,
-    )
-    .await;
+    if let Err(err) =
+        commit_catalog_and_notify(&state.status.controller, &state.events, "collection_groups")
+            .await
+    {
+        return Ok(tool_error(format!(
+            "変更は保存しましたが、実行構成への反映に失敗しました: {err}"
+        )));
+    }
     Ok(tool_ok(json!({ "updated": updated })))
 }
 
@@ -2664,8 +2661,9 @@ async fn tool_delete_group(
         ));
     }
 
-    let status = state.status.controller.status();
-    if status.state != CollectionState::Stopped {
+    if crate::rest::registry_change_should_queue(&state.status.controller, &state.commissioning)
+        .is_some()
+    {
         let payload = json!({ "id": id });
         let base_fingerprint = compute_pending_base_fingerprint(
             &state.plc_connections,
@@ -2724,7 +2722,8 @@ async fn tool_delete_group(
             return Ok(banto_error_tool_error(&err));
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2744,15 +2743,14 @@ async fn tool_delete_group(
         Some(json!({ "cascade": cascade_detail.clone() })),
     )
     .await;
-    commit_catalog_and_notify(
-        &state.manager,
-        &state.status.controller,
-        &state.events,
-        "collection_groups",
-        snapshot,
-        state.legacy_live_reconfigure,
-    )
-    .await;
+    if let Err(err) =
+        commit_catalog_and_notify(&state.status.controller, &state.events, "collection_groups")
+            .await
+    {
+        return Ok(tool_error(format!(
+            "変更は保存しましたが、実行構成への反映に失敗しました: {err}"
+        )));
+    }
     Ok(tool_ok(
         json!({ "deleted": true, "id": id, "cascade": cascade_detail }),
     ))
@@ -2763,7 +2761,8 @@ async fn tool_delete_group(
 // （タグ CRUD）。S1-b/S1-c（[`tool_create_connection`]/[`tool_update_connection`]/
 // [`tool_delete_connection`]）と全く同じ書き方をそのまま踏襲する - ゲート
 // （admin スコープ・監査・delete 系 confirm・update 系 全項目必須）・
-// mutation フロー（tx → preflight → commit → catalog commit、収集中は
+// mutation フロー（tx → preflight → commit → catalog commit、ロックダウン済み +
+// 収集中は
 // pending queue）のどちらも二重実装しない。タグは末端リソースなので
 // delete は非 cascade（`TagService::delete_tx`、[`crate::rest::tags_delete`]
 // と同じ）。`update_tag`だけは他の update 系と異なり
@@ -2817,8 +2816,9 @@ async fn tool_create_tag(
     let input: TagPayload = serde_json::from_value(arguments)
         .map_err(|err| RpcError::invalid_params(format!("タグの入力が不正です: {err}")))?;
 
-    let status = state.status.controller.status();
-    if status.state != CollectionState::Stopped {
+    if crate::rest::registry_change_should_queue(&state.status.controller, &state.commissioning)
+        .is_some()
+    {
         let payload = json!({ "input": input });
         let base_fingerprint = compute_pending_base_fingerprint(
             &state.plc_connections,
@@ -2877,7 +2877,8 @@ async fn tool_create_tag(
             return Ok(banto_error_tool_error(&err));
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2896,15 +2897,13 @@ async fn tool_create_tag(
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
-    commit_catalog_and_notify(
-        &state.manager,
-        &state.status.controller,
-        &state.events,
-        "tags",
-        snapshot,
-        state.legacy_live_reconfigure,
-    )
-    .await;
+    if let Err(err) =
+        commit_catalog_and_notify(&state.status.controller, &state.events, "tags").await
+    {
+        return Ok(tool_error(format!(
+            "変更は保存しましたが、実行構成への反映に失敗しました: {err}"
+        )));
+    }
     Ok(tool_ok(json!({ "created": created })))
 }
 
@@ -2934,8 +2933,9 @@ async fn tool_update_tag(
     let input: TagPayload = serde_json::from_value(arguments)
         .map_err(|err| RpcError::invalid_params(format!("タグの入力が不正です: {err}")))?;
 
-    let status = state.status.controller.status();
-    if status.state != CollectionState::Stopped {
+    if crate::rest::registry_change_should_queue(&state.status.controller, &state.commissioning)
+        .is_some()
+    {
         let payload = json!({ "id": id, "input": input });
         let base_fingerprint = compute_pending_base_fingerprint(
             &state.plc_connections,
@@ -3003,7 +3003,8 @@ async fn tool_update_tag(
             return Ok(banto_error_tool_error(&err));
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -3022,15 +3023,13 @@ async fn tool_update_tag(
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
-    commit_catalog_and_notify(
-        &state.manager,
-        &state.status.controller,
-        &state.events,
-        "tags",
-        snapshot,
-        state.legacy_live_reconfigure,
-    )
-    .await;
+    if let Err(err) =
+        commit_catalog_and_notify(&state.status.controller, &state.events, "tags").await
+    {
+        return Ok(tool_error(format!(
+            "変更は保存しましたが、実行構成への反映に失敗しました: {err}"
+        )));
+    }
     Ok(tool_ok(json!({ "updated": updated })))
 }
 
@@ -3061,8 +3060,9 @@ async fn tool_delete_tag(
         ));
     }
 
-    let status = state.status.controller.status();
-    if status.state != CollectionState::Stopped {
+    if crate::rest::registry_change_should_queue(&state.status.controller, &state.commissioning)
+        .is_some()
+    {
         let payload = json!({ "id": id });
         let base_fingerprint = compute_pending_base_fingerprint(
             &state.plc_connections,
@@ -3118,7 +3118,8 @@ async fn tool_delete_tag(
         let _ = tx.rollback().await;
         return Ok(banto_error_tool_error(&err));
     }
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -3129,15 +3130,13 @@ async fn tool_delete_tag(
         return Ok(tool_error(format!("コミットに失敗しました: {err}")));
     }
     audit_config_action(state, ctx, "delete", "tags", Some(&id.to_string()), None).await;
-    commit_catalog_and_notify(
-        &state.manager,
-        &state.status.controller,
-        &state.events,
-        "tags",
-        snapshot,
-        state.legacy_live_reconfigure,
-    )
-    .await;
+    if let Err(err) =
+        commit_catalog_and_notify(&state.status.controller, &state.events, "tags").await
+    {
+        return Ok(tool_error(format!(
+            "変更は保存しましたが、実行構成への反映に失敗しました: {err}"
+        )));
+    }
     Ok(tool_ok(json!({ "deleted": true, "id": id })))
 }
 

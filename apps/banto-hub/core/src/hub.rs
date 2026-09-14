@@ -565,6 +565,28 @@ struct Inner {
     /// [`CollectorManager::rebuild`]'s doc comment). Cleared together with
     /// `current` whenever a rebuild does not call `apply_config`.
     last_apply: Option<ApplyReport>,
+    /// #341 レビュー対応（2026-09-14）: **直近で実際に適用に成功した
+    /// 「runtime snapshot」**（= run mode のオーバーライド適用後。
+    /// [`runtime_snapshot_for_mode`] の出力そのもの）。
+    /// [`CollectorManager::apply_run`] が collector 側のコミットに失敗した
+    /// ときの broker セッション集合のロールバック基準として**だけ**使う
+    /// （同 fn の「失敗時のロールバック」段落参照）。まだ一度も適用に
+    /// 成功していない場合と [`CollectorManager::stop`] 直後は
+    /// `RegistrySnapshot::default()`（空 = セッションを1本も張らない状態）。
+    applied_runtime: RegistrySnapshot,
+    /// #341 レビュー対応2（2026-09-14）: `applied_runtime` の**生の**
+    /// （run mode を適用する前の）相方。catalog・演算 plan・DB Source plan
+    /// のロールバック基準で、[`CollectorManager::rollback_catalog`] が
+    /// [`CollectorManager::commit_catalog`] へ渡す。
+    ///
+    /// `applied_runtime` と分けているのは、`commit_catalog` が受け取るのが
+    /// レジストリそのもの（run mode 非依存の catalog 導出）だからで、
+    /// 実際には catalog は run mode に依存しない（`simulation` の実効値は
+    /// 応答時に controller の mode から導出され、`TagMap` には焼き込まれ
+    /// ない）ため `applied_runtime` でも同じ結果になる。それでも「catalog
+    /// には生の registry を渡す」という `commit_catalog` の前提をコードの
+    /// 形で保つために別に持つ。更新点・クリア点は `applied_runtime` と同じ。
+    applied_registry: RegistrySnapshot,
 }
 
 /// Owns the running [`Collector`]'s lifecycle end to end (design §3.2 table
@@ -577,6 +599,21 @@ struct Inner {
 /// itself is deliberately not supported - a `Collector` is not `Clone` and
 /// there must be exactly one lifecycle owner per process).
 pub struct CollectorManager {
+    /// #341 レビュー対応（2026-09-14）: **テスト専用の失敗注入**。
+    /// `true` のとき、次の [`Self::apply_run`] は collector 側のコミットを
+    /// 実際には行わずに `Err` を返す（フラグはその場で降りる）。
+    /// `crate::rest` の endpoint 越しのテスト
+    /// （`pending_apply_live_reconfigure_failure_is_500_and_marks_applied`）
+    /// が「実行構成への反映だけが失敗した」状態を決定的に作るために要る -
+    /// 本物の失敗要因（tstore の writer を開けない）を外から再現するのは
+    /// OS 依存が強すぎる。`#[cfg(test)]` なのでライブラリのユニットテスト
+    /// からしか触れず、`cargo build`（統合テスト・本番）には一切残らない。
+    #[cfg(test)]
+    fail_next_apply: std::sync::atomic::AtomicBool,
+    /// テスト専用（[`Self::fail_next_apply`] と同じ流儀）: 次の
+    /// [`Self::apply_run`] をこのミリ秒だけ遅らせる。0 なら遅らせない。
+    #[cfg(test)]
+    delay_next_apply: std::sync::atomic::AtomicU64,
     pool: SqlitePool,
     data_dir: PathBuf,
     clock: Arc<dyn Clock>,
@@ -814,6 +851,10 @@ impl CollectorManager {
         let (revision_tx, _revision_rx) = watch::channel(0);
         let db_source = Arc::new(DbSourceEngine::new(computed.server_store(), clock.clone()));
         Self {
+            #[cfg(test)]
+            fail_next_apply: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            delay_next_apply: std::sync::atomic::AtomicU64::new(0),
             pool,
             data_dir,
             clock,
@@ -831,6 +872,8 @@ impl CollectorManager {
                 last_error: None,
                 current: None,
                 last_apply: None,
+                applied_runtime: RegistrySnapshot::default(),
+                applied_registry: RegistrySnapshot::default(),
             }),
             rebuild_lock: AsyncMutex::new(()),
             revision_tx,
@@ -1034,10 +1077,12 @@ impl CollectorManager {
         // enabled with no collectible groups yet and still deserve a live
         // broker session" - which stopped being true the moment that fn
         // started filtering on `banto_collect::connections_with_collected_groups`).
-        // `CollectionController::resync_sessions_for_catalog_change`'s doc
-        // comment (T19 S2-a 案B) covers how such a connection can still get
-        // a session before the next rebuild, via a catalog-only commit made
-        // while a run is already `Running`. `stale_broker_ids` is only
+        // `CollectionController::commit_catalog_and_apply_live`'s doc
+        // comment (#341, T19 S2-a 案B の後継) covers how such a connection
+        // can still get a session before the next start/stop cycle, via a
+        // registry change committed while a run is already `Running` -
+        // that path now goes all the way through `Self::apply_run`, so this
+        // very fn is what runs. `stale_broker_ids` is only
         // actually removed AFTER a successful commit below - see
         // `Self::remove_stale_broker_sessions`'s doc comment for why the
         // ordering matters.
@@ -1097,6 +1142,11 @@ impl CollectorManager {
                 inner.last_error = None;
                 inner.current = None;
                 inner.last_apply = None;
+                // #341 レビュー対応: `Self::apply_run` と同じロールバック
+                // 基準をここでも更新する（`rebuild` は run mode を持たない
+                // ので snapshot そのものが runtime snapshot）。
+                inner.applied_runtime = snapshot.clone();
+                inner.applied_registry = snapshot.clone();
                 inner.revision
             };
             // Sent while still holding `rebuild_lock` (not `inner`'s lock,
@@ -1159,6 +1209,9 @@ impl CollectorManager {
         let (apply_report, current_handle) = match commit {
             Ok(pair) => pair,
             Err(message) => {
+                // #341 レビュー対応: `Self::apply_run` と同じ理由・同じ
+                // 手当て（同 fn の「失敗時のロールバック」節）。
+                self.rollback_broker_sessions().await;
                 self.set_last_error(message.clone());
                 return Err(message);
             }
@@ -1182,6 +1235,8 @@ impl CollectorManager {
             inner.last_error = None;
             inner.current = Some(current_handle);
             inner.last_apply = apply_report;
+            inner.applied_runtime = snapshot.clone();
+            inner.applied_registry = snapshot.clone();
             inner.revision
         };
         let _ = self.revision_tx.send(new_revision);
@@ -1197,6 +1252,132 @@ impl CollectorManager {
             .lock()
             .expect("hub state lock poisoned")
             .last_error = Some(message);
+    }
+
+    /// [`Self::fail_next_apply`] を読んで下ろす（テスト専用）。本番ビルドでは
+    /// `None` を返すだけの `#[inline]` な関数になり、分岐ごと最適化で消える。
+    #[cfg(test)]
+    fn take_injected_apply_failure(&self) -> Option<String> {
+        self.fail_next_apply
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+            .then(|| "テスト用に注入された実行構成の適用失敗".to_string())
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn take_injected_apply_failure(&self) -> Option<String> {
+        None
+    }
+
+    /// 次の [`Self::apply_run`] を失敗させる（テスト専用 -
+    /// [`Self::fail_next_apply`] の doc comment 参照）。
+    #[cfg(test)]
+    pub(crate) fn fail_next_apply_for_test(&self) {
+        self.fail_next_apply
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 次の [`Self::apply_run`] を指定ミリ秒だけ遅らせる（テスト専用）。
+    /// #341 レビュー対応2: 「live apply の最中に来た stop が無視されない」
+    /// ことを決定的に確かめるために要る（`crate::controller` の
+    /// `stop_during_a_live_apply_waits_instead_of_being_ignored`）。
+    /// `fail_next_apply_for_test` と同じ流儀で `#[cfg(test)]`。
+    #[cfg(test)]
+    pub(crate) fn delay_next_apply_for_test(&self, delay: std::time::Duration) {
+        self.delay_next_apply.store(
+            delay.as_millis() as u64,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// [`Self::delay_next_apply`] を読んで下ろす（テスト専用）。
+    #[cfg(test)]
+    async fn take_injected_apply_delay(&self) {
+        let millis = self
+            .delay_next_apply
+            .swap(0, std::sync::atomic::Ordering::SeqCst);
+        if millis > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    async fn take_injected_apply_delay(&self) {}
+
+    /// #341 レビュー対応2（2026-09-14）: catalog・演算タグ plan・DB Source
+    /// plan を `inner.applied_registry`（直近で適用に成功した registry
+    /// snapshot）へ**戻す** - live 経路
+    /// （`crate::controller::CollectionController::commit_catalog_and_apply_live`）
+    /// が `commit_catalog` に成功したあと [`Self::apply_run`] で失敗した
+    /// ときだけ呼ばれる。
+    ///
+    /// これが無いと「読み側（catalog・演算・DB Source）は新構成、収集側は
+    /// 旧構成」という食い違いが残る（collector/broker のロールバックだけ
+    /// では埋まらない）。戻したあとの状態は「**DB は新・runtime 側は全部
+    /// 旧**」で一貫し、回復手段は `crate::rest::LIVE_APPLY_RECOVERY_HINT`
+    /// のとおり（次の CRUD / 収集の停止→開始 / `POST /api/collection/reapply`）。
+    ///
+    /// `configured_revision` がこのロールバックでもう一度進み
+    /// `config_changed` が飛ぶのは**意図どおり** - 新 catalog を取りに来た
+    /// クライアントに「戻った」ことを知らせる契機が要る。
+    ///
+    /// ベストエフォート: 戻す `commit_catalog` 自体が失敗しても元の失敗
+    /// 理由を上書きしない（`last_error` は呼び出し前の値＝ `apply_run` の
+    /// 失敗理由へ必ず復元する。`commit_catalog` は成功すると
+    /// `last_error` を `None` にしてしまうため）。
+    pub(crate) async fn rollback_catalog(&self) {
+        let (previous, last_error) = {
+            let inner = self.inner.lock().expect("hub state lock poisoned");
+            (inner.applied_registry.clone(), inner.last_error.clone())
+        };
+        let result = self.commit_catalog(&previous).await;
+        {
+            let mut inner = self.inner.lock().expect("hub state lock poisoned");
+            inner.last_error = last_error;
+        }
+        match result {
+            Ok(_) => self.diag_log.err_line(
+                "banto-hub: 実行構成の適用に失敗したため、catalog を直前の構成へ戻しました",
+            ),
+            Err(err) => self.diag_log.err_line(&format!(
+                "banto-hub: catalog を直前の構成へ戻せませんでした（DB の内容と catalog が食い違ったままです。POST /api/collection/reapply で再適用してください）: {err}"
+            )),
+        }
+    }
+
+    /// #341 レビュー対応（2026-09-14）: broker セッション集合を
+    /// `inner.applied_runtime`（直近で適用に成功した runtime snapshot）へ
+    /// 戻す - [`Self::apply_run`] が collector 側のコミットに失敗したときの
+    /// ベストエフォートのロールバック（同 fn の doc comment
+    /// 「失敗時のロールバック」節に保証の範囲を書いてある）。
+    ///
+    /// [`Self::sync_broker_sessions_from`] + [`Self::remove_stale_broker_sessions`]
+    /// を**失敗した適用のときと同じ順序で**、ただし旧 snapshot に対して
+    /// 呼び直すだけ - 新しい構成のためだけに張られたセッションは
+    /// 「wanted に無い」＝ stale として落ち、ダイヤル先を差し替えられて
+    /// いた接続は元の宛先で張り直される。まだ一度も適用に成功していない
+    /// （`applied_runtime` が `RegistrySnapshot::default()`）場合は
+    /// 「セッションを1本も張らない状態」が正しい戻し先なので、結果として
+    /// 今回張ったものが全部落ちる。
+    ///
+    /// セッション同期そのものは `Err` を返さない（個々の
+    /// `ensure_connection` 失敗は `HubSessions` 側でログに出るだけ）ので、
+    /// この関数も戻り値を持たない - 呼び出し元は元の失敗理由をそのまま
+    /// `last_error`/`Err` として返す。
+    async fn rollback_broker_sessions(&self) {
+        let previous = self
+            .inner
+            .lock()
+            .expect("hub state lock poisoned")
+            .applied_runtime
+            .clone();
+        let (_handles, stale_ids, _targets, _read_routed) =
+            self.sync_broker_sessions_from(&previous).await;
+        self.remove_stale_broker_sessions(&stale_ids).await;
+        self.diag_log.err_line(
+            "banto-hub: 実行構成の適用に失敗したため、broker セッションを直前の構成へ戻しました",
+        );
     }
 
     /// **Naming note (#337, 2026-09-08)**: this fn's name used to name the
@@ -1358,19 +1539,22 @@ impl CollectorManager {
     /// avoid resurrecting a session a concurrent `stop` just tore down).
     ///
     /// **T19 S2-a 案B (2026-09-03) closed the write-gap this paragraph used
-    /// to describe**: a connection with zero enabled groups the last time
-    /// `Self::rebuild`/`Self::apply_run` ran no longer has to wait for the
-    /// next rebuild/apply_run (typically: stopping and restarting the
-    /// collection run) to get a session once a group/tag is registered
-    /// under it - [`crate::rest::commit_catalog_and_notify`] now also drives
-    /// [`crate::controller::CollectionController::resync_sessions_for_catalog_change`]
-    /// after every catalog-only commit, which re-runs this very fn (via
-    /// [`Self::resync_broker_sessions`]) whenever a collection run is
-    /// already `Running` - see that method's doc comment for the full
-    /// derivation, including why it is safe against the same T15-4
+    /// to describe, and #341 (2026-09-14) widened that fix**: a connection
+    /// with zero enabled groups the last time `Self::rebuild`/
+    /// `Self::apply_run` ran no longer has to wait for the next
+    /// rebuild/apply_run (typically: stopping and restarting the collection
+    /// run) to get a session once a group/tag is registered under it -
+    /// [`crate::rest::commit_catalog_and_notify`] drives
+    /// [`crate::controller::CollectionController::commit_catalog_and_apply_live`]
+    /// after every registry change, which re-runs this very fn via
+    /// [`Self::apply_run`] whenever a collection run is already `Running`.
+    /// 案B only re-synced sessions (leaving the running `Collector`'s task
+    /// set alone, with the removal-ordering caveat that came with it);
+    /// since #341 the whole `apply_run` runs, so the session sync and the
+    /// collect tasks move together - see that method's doc comment for the
+    /// full derivation, including why it is safe against the same T15-4
     /// stop-vs-write race this fn's caller ([`Self::rebuild`]) already had
-    /// to reckon with, and the narrower removal-ordering caveat it carries
-    /// that `Self::rebuild` itself does not.
+    /// to reckon with.
     async fn sync_broker_sessions_from(
         &self,
         snapshot: &RegistrySnapshot,
@@ -1716,15 +1900,68 @@ impl CollectorManager {
     /// snapshot is validated for the catalog, while the selected mode may
     /// provide a non-persistent runtime override before collector and broker
     /// side effects begin.
+    ///
+    /// # run mode は **collector 構成と broker セッションの両方**に効く
+    ///
+    /// （#341 レビューでの指摘に対する明示。指摘は「セッション同期は生の
+    /// registry snapshot で行われるので `AllSimulation` でも実機へダイヤル
+    /// する」だったが、**事実ではない**）: このメソッドは
+    /// [`runtime_snapshot_for_mode`] を**先に**適用し、その `runtime_snapshot`
+    /// を `build_config_from` と [`Self::sync_broker_sessions_from`] の
+    /// **両方**へ渡す。したがって `AllSimulation` 運転中は、永続設定が
+    /// `simulation: false` の接続でも
+    /// `crate::broker_glue::SlmpSimRegistry::resolve` がシミュレータの
+    /// loopback アドレスを解決し、broker セッションはそちらへ張られる
+    /// （実機の host/port へは一度もダイヤルしない）。
+    /// 生の `snapshot` を使うのは catalog / 演算タグ / DB Source の
+    /// **検証**だけで、これらは run mode に依存しない。
+    /// （run mode を一切見ないのは [`Self::rebuild`] の方で、だからこそ
+    /// 稼働中の live re-apply には使えない -
+    /// `crate::controller::CollectionController::commit_catalog_and_apply_live`
+    /// の doc comment 参照。）
+    ///
+    /// # 失敗時のロールバック（#341 レビュー対応、2026-09-14）
+    ///
+    /// 順序は「セッション同期（新規 ensure・ダイヤル先変更の差し替え）→
+    /// collector 側のコミット（`apply_config` / `start_with_client_factory`）
+    /// → stale セッション削除」。collector 側が失敗すると、**セッション
+    /// 変更だけが残る**（新しい構成のために張ったセッションが、走り続けて
+    /// いる旧構成の下に残る）。これを避けるため、collector 側が `Err` を
+    /// 返したら `inner.applied_runtime`（直近で適用に成功した runtime
+    /// snapshot）でセッション同期をやり直し、**セッション集合を旧構成へ
+    /// 戻す**（[`Self::rollback_broker_sessions`]）。
+    ///
+    /// **保証の範囲はベストエフォート**: 戻し操作自体も I/O なので失敗
+    /// しうる（その場合は `last_error` に追記するだけで、元の失敗理由を
+    /// 上書きしない）。また戻せるのは**セッション集合**（どの接続に
+    /// セッションが存在するか・どこへダイヤルしているか）だけで、
+    /// 戻す過程で張り直したセッションは新しい TCP 接続になる。collector
+    /// 側は `apply_config`/`start_with_client_factory` 自身の
+    /// all-or-nothing 契約により元のまま無傷で、catalog/`revision` は
+    /// そもそもこのメソッドが触らない。
     pub async fn apply_run(&self, mode: crate::controller::RunMode) -> Result<(), String> {
         let _guard = self.rebuild_lock.lock().await;
-        let snapshot = RegistrySnapshot::load(&self.pool)
-            .await
-            .map_err(|err| format!("レジストリのスナップショット取得に失敗しました: {err}"))?;
-        let new_map = build_catalog_from(&snapshot)
-            .map_err(|err| format!("catalog の検証に失敗しました: {err}"))?;
-        computed::build_plan(&new_map)
-            .map_err(|err| format!("演算タグの検証に失敗しました: {err}"))?;
+        // #341 レビュー対応（2026-09-14）: 検証失敗も必ず `last_error`
+        // （`/api/v1/status` の `last_config_error`）へ残す - 以前はここだけ
+        // `map_err(..)?` で素通りしていて、`crate::rest::commit_catalog_and_notify`
+        // の契約（「500 の詳細は `last_config_error` にも残る」）と食い違って
+        // いた。`Self::rebuild`/`Self::commit_catalog` は元から同じ扱い。
+        let snapshot = RegistrySnapshot::load(&self.pool).await.map_err(|err| {
+            self.set_last_error(format!(
+                "レジストリのスナップショット取得に失敗しました: {err}"
+            ));
+            format!("レジストリのスナップショット取得に失敗しました: {err}")
+        })?;
+        let new_map = build_catalog_from(&snapshot).map_err(|err| {
+            let message = format!("catalog の検証に失敗しました: {err}");
+            self.set_last_error(message.clone());
+            message
+        })?;
+        computed::build_plan(&new_map).map_err(|err| {
+            let message = format!("演算タグの検証に失敗しました: {err}");
+            self.set_last_error(message.clone());
+            message
+        })?;
         // 外部 DB 連携 S2: ここは `computed` と同じく**検証だけ**行い commit
         // はしない - 構成の反映（= 計画の入れ替え）は
         // `Self::rebuild`/`Self::commit_catalog` の担当だから。
@@ -1732,14 +1969,26 @@ impl CollectorManager {
         // S2b（§4.8・§6-16）: 収集開始で DB Source の task を起こすのは
         // `crate::controller::CollectionController::start_locked` であって
         // ここではない - この `apply_run` は「収集の遷移」以外に
-        // `crate::rest::commit_catalog_and_notify` の legacy live
-        // reconfigure からも呼ばれるので、ここを起動点にすると停止中でも
-        // DB へ繋いでしまう（controller の `db_source` フィールド doc
-        // comment 参照）。
-        db_source::build_plan(&snapshot)
-            .map_err(|err| format!("DB Source の検証に失敗しました: {err}"))?;
+        // `crate::controller::CollectionController::commit_catalog_and_apply_live`
+        // （#341 の live re-apply。2026-09-14 より前は
+        // `commit_catalog_and_notify` の legacy live reconfigure）からも
+        // 呼ばれるので、ここを起動点にすると停止中でも DB へ繋いでしまう
+        // （controller の `db_source` フィールド doc comment 参照）。
+        db_source::build_plan(&snapshot).map_err(|err| {
+            let message = format!("DB Source の検証に失敗しました: {err}");
+            self.set_last_error(message.clone());
+            message
+        })?;
         let runtime_snapshot = runtime_snapshot_for_mode(&snapshot, mode);
-        let mut config = build_config_from(&runtime_snapshot).map_err(|err| err.to_string())?;
+        let mut config = build_config_from(&runtime_snapshot).map_err(|err| {
+            let message = err.to_string();
+            self.set_last_error(message.clone());
+            message
+        })?;
+
+        // テスト専用の遅延注入（`Self::delay_next_apply`）- 本番ビルドでは
+        // 空の `async fn` になり消える。
+        self.take_injected_apply_delay().await;
 
         let (broker_handles, stale_broker_ids, resolved_broker_targets, read_routed_keys) =
             self.sync_broker_sessions_from(&runtime_snapshot).await;
@@ -1761,6 +2010,11 @@ impl CollectorManager {
                 inner.current = None;
                 inner.last_apply = None;
                 inner.last_error = None;
+                // #341 レビュー対応: この分岐も「適用に成功した」状態なので
+                // ロールバック基準を更新する（この runtime snapshot に対して
+                // 同期済みのセッション集合が、以後の正しい戻し先）。
+                inner.applied_runtime = runtime_snapshot.clone();
+                inner.applied_registry = snapshot.clone();
             }
             self.remove_stale_broker_sessions(&stale_broker_ids).await;
             self.advance_running_revision();
@@ -1770,7 +2024,11 @@ impl CollectorManager {
         let factory = hub_client_factory(Arc::new(broker_handles));
         let mut collector_guard = self.collector.lock().await;
         let commit: Result<(Option<ApplyReport>, CurrentValuesHandle), String> =
-            if let Some(collector) = collector_guard.as_mut() {
+            if let Some(message) = self.take_injected_apply_failure() {
+                // テスト専用の注入（`Self::fail_next_apply`）。セッション同期は
+                // 既に走っているので、下のロールバック経路もそのまま通る。
+                Err(message)
+            } else if let Some(collector) = collector_guard.as_mut() {
                 match collector.apply_config(config, factory).await {
                     Ok(report) => Ok((Some(report), collector.current_values())),
                     Err(err) => Err(err.to_string()),
@@ -1795,14 +2053,27 @@ impl CollectorManager {
                 }
             };
         drop(collector_guard);
-        let (apply_report, current_handle) = commit.inspect_err(|message| {
-            self.set_last_error(message.clone());
-        })?;
+        let (apply_report, current_handle) = match commit {
+            Ok(pair) => pair,
+            Err(message) => {
+                // #341 レビュー対応（2026-09-14、このメソッドの doc comment
+                // 「失敗時のロールバック」）: collector 側が失敗した時点で、
+                // このメソッドが上で行ったセッション変更（新規 ensure・
+                // ダイヤル先の差し替え）だけが残っている。走り続けている
+                // 旧構成に合わせて戻す。
+                self.rollback_broker_sessions().await;
+                self.set_last_error(message.clone());
+                return Err(message);
+            }
+        };
         {
             let mut inner = self.inner.lock().expect("hub state lock poisoned");
             inner.current = Some(current_handle);
             inner.last_apply = apply_report;
             inner.last_error = None;
+            // #341 レビュー対応: 次に失敗したときの戻し先はこの構成。
+            inner.applied_runtime = runtime_snapshot.clone();
+            inner.applied_registry = snapshot.clone();
         }
         self.remove_stale_broker_sessions(&stale_broker_ids).await;
         self.log_simulation_warnings().await;
@@ -1918,6 +2189,15 @@ impl CollectorManager {
     /// broker handle while the per-connection broker tasks are joined.
     pub async fn stop(&self) {
         self.shutdown().await;
+        // #341 レビュー対応: セッションを全部落とすので、以後のロール
+        // バック基準も「1本も張っていない状態」に戻す（次の
+        // `Self::apply_run` が失敗したときに、止めたはずのセッションを
+        // 復活させないため）。
+        {
+            let mut inner = self.inner.lock().expect("hub state lock poisoned");
+            inner.applied_runtime = RegistrySnapshot::default();
+            inner.applied_registry = RegistrySnapshot::default();
+        }
         let connection_ids = self.sessions.connection_ids();
         for connection_id in connection_ids {
             let _ = self.sessions.stop_and_join(connection_id).await;
@@ -1925,90 +2205,14 @@ impl CollectorManager {
         }
     }
 
-    /// T19 S2-a 案B (UX-48, docs/banto-hub-t19-design.md §3.8, 2026-09-03):
-    /// re-sync broker sessions against `snapshot` WITHOUT touching the
-    /// running `Collector`'s own task set - the counterpart to
-    /// [`Self::rebuild`]/[`Self::apply_run`] for a catalog-only commit
-    /// (`crate::rest::commit_catalog_and_notify`) that happens while a
-    /// collection run is already `Running`. Reuses
-    /// [`Self::sync_broker_sessions_from`]/[`Self::remove_stale_broker_sessions`]
-    /// verbatim - the exact same add-then-remove semantics `Self::rebuild`
-    /// already uses for every broker session, just invoked from a different
-    /// trigger. `mode` mirrors [`Self::apply_run`]'s own handling
-    /// (`runtime_snapshot_for_mode`) so a resync during an `AllSimulation`
-    /// run keeps resolving simulator dial targets instead of the
-    /// connections' real host/port.
-    ///
-    /// This is what closes the write-path gap [`Self::sync_broker_sessions_from`]'s
-    /// own doc comment used to describe (T19 S2-a's original slice, before
-    /// 案B): a tag registered under a previously-tagless connection now gets
-    /// a broker session synced the moment its catalog change commits while
-    /// already running, not only at the next `rebuild`/`apply_run` (in
-    /// practice: the next start/stop cycle) -
-    /// `crate::write_path::write_plc_tag`'s `write_broker_handle_peek` call
-    /// no longer fails closed for a tag added while already running.
-    ///
-    /// **Caller discipline is what keeps this safe against T15-4's
-    /// stop-vs-write race** (see `crate::write_path`'s module doc comment,
-    /// "T15-4: gate 8 は broker セッションを新規に張らない"): this must only
-    /// ever be called while [`crate::controller::CollectionController`]'s
-    /// `transition` lock is held for the duration AND its state has already
-    /// been confirmed `Running` -
-    /// [`crate::controller::CollectionController::resync_sessions_for_catalog_change`]
-    /// is the only intended caller and carries that discipline; nothing in
-    /// `crate::rest` should call this directly. Without that guard, a
-    /// catalog-triggered resync racing `CollectionController::stop()`
-    /// (whose [`Self::stop`] does NOT take `rebuild_lock` - notice this fn's
-    /// own `rebuild_lock` acquisition below only serializes against
-    /// `rebuild`/`commit_catalog`/`apply_run`, not against `Self::stop`)
-    /// could re-`ensure_connection` a session moments after `stop`
-    /// intentionally tore it down - exactly the "PLC we meant to leave
-    /// stopped gets dialed anyway" mistake T15-4 already fixed once for the
-    /// write path itself. The controller-level `transition` lock is what
-    /// actually prevents that: `CollectionController::stop`'s `stop_locked`
-    /// holds the very same lock for the whole of `Self::stop`, so this fn
-    /// and a real stop can never run concurrently.
-    ///
-    /// **Narrower safety envelope than `Self::rebuild`'s removal step**:
-    /// `Self::rebuild` only calls `Self::remove_stale_broker_sessions` AFTER
-    /// the collector-side commit for the SAME snapshot has already stopped
-    /// any collect task reading through a to-be-removed connection's
-    /// session (this module's doc comment, "broker セッションの削除
-    /// 同期"). This fn never touches the `Collector` at all (that is the
-    /// whole point - it must not disturb a run that is not being
-    /// restarted), so that ordering guarantee does not hold here: for a
-    /// connection whose last enabled group was just removed, a still-running
-    /// collect task from the PREVIOUS `apply_run` may still be reading
-    /// through the very session this removes. That read would then fail (an ordinary
-    /// reconnect/backoff cycle - `banto_broker::BrokerError::Disconnected`
-    /// on the next `read_batch` - not a panic, and not the write-path hazard
-    /// the paragraph above guards against) until the next `apply_run`/
-    /// `rebuild` actually stops that task - a narrow, self-healing gap
-    /// accepted here because catalog-only commits have never updated the
-    /// running `Collector`'s task set at all
-    /// (`crate::rest::commit_catalog_and_notify`'s doc comment, "registry
-    /// writes advance the configured revision only"), and closing it fully
-    /// would require this fn to also drive `apply_config`, i.e. become a
-    /// second `apply_run` - out of scope for 案B, which targets the write
-    /// path specifically. **#337 (2026-09-08) widened who can hit this gap**:
-    /// this paragraph used to exempt Modbus TCP connections, whose collection
-    /// reads stayed on `banto-collect`'s own direct `ModbusTcpClient`
-    /// regardless of this fn's broker-session bookkeeping. Since #337 their
-    /// reads go through the broker session as well
-    /// (`crate::broker_glue::hub_client_factory`), so a Modbus connection now
-    /// behaves exactly like an SLMP one here - same narrow, self-healing
-    /// window, same accepted reasoning.
-    pub(crate) async fn resync_broker_sessions(
-        &self,
-        snapshot: &RegistrySnapshot,
-        mode: crate::controller::RunMode,
-    ) {
-        let _guard = self.rebuild_lock.lock().await;
-        let runtime_snapshot = runtime_snapshot_for_mode(snapshot, mode);
-        let (_handles, stale_ids, _resolved_targets, _read_routed_keys) =
-            self.sync_broker_sessions_from(&runtime_snapshot).await;
-        self.remove_stale_broker_sessions(&stale_ids).await;
-    }
+    // #341 (2026-09-14): T19 S2-a 案B の `resync_broker_sessions` はここに
+    // あったが、catalog-only commit そのものが無くなった（稼働中の commit は
+    // `crate::controller::CollectionController::commit_catalog_and_apply_live`
+    // が [`Self::apply_run`] まで通す）ため撤去した。broker セッションの
+    // 追加/削除同期は `apply_run` が内包しており、しかも collector 側の
+    // コミット後に `remove_stale_broker_sessions` するので、案B が受け入れて
+    // いた「最後のグループを失った接続の collect タスクが、削除済みセッションを
+    // しばらく読み続けうる」隙間も同時に閉じている。
 }
 
 #[cfg(test)]

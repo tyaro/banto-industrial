@@ -1,7 +1,7 @@
 # タグサーバーアプリ 設計ドキュメント（草案）
 
 作成日: 2026-08-04
-状態: **実装追従中（2026-09-14 更新）**。起案時は設計先行だったが、
+状態: **実装追従中（2026-09-14 更新: #341 の CRUD 契約改定を §4.3 に反映）**。起案時は設計先行だったが、
 apps/banto-hub として実装が進行 — T0〜T21 実装済み（T19 UX 群・T20 文字列/構造体/レシピ/ビット・T21 構成補助 MCP 管理面まで完了、詳細は下の 2026-09-06 更新）・残 T18-5c/d
 （Windows 実機往復・72h soak）と P3-b の残件（SLMP CPU 種別/アクセスルート露出、
 バックログ。SLMP の word order 自体は #127 で完了済み）。実装状況は §9（T系）の表を正とする。マイルストーンは §9、
@@ -508,6 +508,78 @@ T7-1）を `apps/banto-hub/core/src/hub.rs`（`CollectorManager::rebuild`、T7-2
 > 後に別経路で変更・削除されていないかを確認する per-resource の
 > フィンガープリントガードを追加した。詳細・不一致時の挙動は
 > [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §9.3 を正とする。
+>
+> **2026-09-09 オーナー決定 / 2026-09-14 実装（#341、v0.2.0-alpha.9）**:
+> 2026-08-09 / 08-11 の運用規律を**試運転モードとロックダウンで分ける**。
+> 「適用には収集停止が必要」という要求（`execute_pending_apply` の 409）は
+> 撤廃する（2026-09-14 オーナー回答）— T7 が二重接続窓を解消して以降、
+> 停止しなければならない技術的根拠は無い。
+>
+> | 状態                                      | CRUD の受付                  | 実行構成への反映                                                                   |
+> | ----------------------------------------- | ---------------------------- | ---------------------------------------------------------------------------------- |
+> | 試運転（`locked_down == false`）          | 収集中でもそのまま受け付ける | preflight 合格後に**即時・無停止**反映。pending queue を経由しない                 |
+> | ロックダウン済み（`locked_down == true`） | pending queue へ保存         | 人が明示 `POST /api/pending-changes/{id}/apply` したときのみ反映。**適用も無停止** |
+>
+> 試運転は配線の誤りを直しながらタグを足す工程なので、変更のたびに収集停止・
+> 適用・再開を挟む契約は工程と噛み合わない。ロックダウン後は「構成凍結」の
+> 意図どおり queue + 明示適用のワンクッションを必ず挟む。
+>
+> 実装（`apps/banto-hub/core`）:
+>
+> - 受付側の判定は `rest::registry_change_should_queue`（REST 12 箇所・MCP 9
+>   箇所が共有）1 箇所に集約。条件は「**収集中 かつ ロックダウン済み**」の
+>   ときだけ queue。`require_collection_stopped`（収集中は一律 409
+>   `collection_edit_locked`）は撤去した。
+> - 反映側は `rest::commit_catalog_and_notify` →
+>   `controller::CollectionController::commit_catalog_and_apply_live`。
+>   `CollectorManager::commit_catalog`（catalog・演算 plan・DB Source plan・
+>   `configured_revision`・`config_changed`）に続けて、収集が `Running` の
+>   ときだけ `CollectorManager::apply_run(現在の run mode)` を呼ぶ。
+>   `apply_run` は `runtime_snapshot_for_mode` で **run mode の
+>   オーバーライドを尊重**したうえで本節の `apply_config` を通すので、
+>   `AllSimulation` 運転中の構成変更が実機へダイヤルし直すことはない
+>   （run mode を見ない `CollectorManager::rebuild` は live re-apply には
+>   使えない）。broker セッションの追加/削除同期も `apply_run` が内包する
+>   ため、T19 S2-a 案B の `resync_broker_sessions`（catalog-only commit 用の
+>   セッション同期だけを行う経路）は撤去した。
+> - 直列化は `CollectionController` の `transition` ロック（start/stop/
+>   set_mode と同じ）。catalog commit と live apply の対がこのロックの下で
+>   実行されるので、連続した CRUD が適用を追い越し合うことはなく、
+>   `apply_run` が毎回レジストリを読み直すため最後の適用は常に最新の DB
+>   状態を反映する。
+> - DB へはコミットできたが実行構成へ反映できなかった場合は 200 + 警告では
+>   なく `500 live_reconfigure_failed` を返す（走行中の収集は `apply_config`
+>   の all-or-nothing により元の構成のまま無傷。詳細は `/api/v1/status` の
+>   `last_config_error`）。**変更は保存済み**なので、回復は「次の構成変更」
+>   「収集の停止→開始」「`POST /api/collection/reapply`（admin、#341
+>   レビュー対応で追加した冪等な再適用。収集 `Running` なら無停止、
+>   `Stopped` なら catalog のみ）」のいずれでも行える - どれも同じ
+>   `commit_catalog_and_apply_live` を通る。
+>
+> **#341 レビュー対応（2026-09-14、同 PR 内）**:
+>
+> - catalog へ反映する `RegistrySnapshot` は、呼び出し元のトランザクション内
+>   snapshot ではなく `transition` ロック取得後に読み直した最新のものを使う
+>   （並行 CRUD で catalog だけが古い行集合になる窓を閉じる）。in-tx snapshot
+>   は保存前検証（preflight）専用。その preflight には DB Source の計画検証も
+>   加え、「保存成功 ＝ 実行可能」の保証を catalog・演算・DB Source の3つで
+>   揃えた（`commit_catalog` が検証で落ちる余地を無くす）。
+> - `CollectorManager::apply_run` は collector 側の適用に失敗したとき、broker
+>   セッション集合を直前に適用成功した runtime snapshot へ戻す（ベスト
+>   エフォート。収集開始の失敗時にも効く）。検証失敗も `last_error` に残す。
+> - `banto_collect::Collector::apply_config` の旧 writer 退避を新タスクの
+>   spawn 後へ移し、その失敗を致命にしないようにした（「タスクが1本も
+>   立っていないのに `Err`」を避ける。`Err` を返すのは新 writer を開けな
+>   かったときだけ、という all-or-nothing の定義自体は変えていない）。
+>
+> あわせて `banto_collect::Collector::apply_config` の writer 配布で
+> **唯一の接続が replaced になったときに新 writer が届かない**不具合を修正した
+> （`watch::Sender::send` は受信者が 0 だと値を更新しない → `send_replace`）。
+> 既存グループへのタグ追加でこの経路に入ると、以後その接続の履歴書き込みが
+> 列数不一致で全滅していた（現在値と live event は流れ続けるため
+> 「値は見えるのに履歴が残らない」症状）。#341 で初めて本番から到達可能に
+> なった経路で、回帰テストは
+> `apps/banto-hub/core/tests/live_reconfig.rs`。
 
 ## 5. 外部インターフェース設計
 

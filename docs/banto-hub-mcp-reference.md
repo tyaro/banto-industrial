@@ -4,7 +4,7 @@
 状態: **現行**。T19 S5（UX-41）で実装、T20 で `read_tag_now` / `write_recipe` を追加。
 2026-09-05 に実機 R08ENCPU（SLMP）でデータ面 6 ツールを検証済み、2026-09-06 に T21
 管理面を含む 31 ツール全数を実機で end-to-end 検証済み（結果は §9）。2026-09-06 に外部 DB 連携（[banto-hub-external-db-design.md](banto-hub-external-db-design.md) §5.2）で `test_saved_connection`（32 ツール目）・接続の `database`/`username`/`password`・グループの `querySql`・`db` tag_kind を同期。S4 で Sink グループ管理の 5 ツール追加で **37 ツール**となる。構成補助（管理面）ツールは §6。
-2026-09-08 に issue #325 で `data_type` に 64bit 型 `i64`/`u64`/`f64` を追加（§7）。Modbus 接続配下のタグのみ登録可（`create_tag`/`update_tag` は §6）。2026-09-14 に issue #340（v0.2.0-alpha.8）で §3「write-control」の記述を、write_enabled が既定で有効・収集操作で変わらない新挙動に更新。
+2026-09-08 に issue #325 で `data_type` に 64bit 型 `i64`/`u64`/`f64` を追加（§7）。Modbus 接続配下のタグのみ登録可（`create_tag`/`update_tag` は §6）。2026-09-14 に issue #340（v0.2.0-alpha.8）で §3「write-control」の記述を、write_enabled が既定で有効・収集操作で変わらない新挙動に更新。同日 issue #341（v0.2.0-alpha.9）で §6 の pending queue 注記を「ロックダウン済みのときのみ」に更新。
 関連: [tag-server-design.md](tag-server-design.md)（タグ空間・書き込み安全の一次ソース）、
 [banto-hub-t20-design.md](banto-hub-t20-design.md)（文字列・レシピ・ビットの設計）、
 [banto-hub-operations.md](banto-hub-operations.md)（起動・ポート・運用）。
@@ -211,8 +211,12 @@ MCP から banto-hub を**構成**するツール群（T21、docs/banto-hub-t21-
 - **全操作を `audit_log` に記録**（`origin:"mcp"`、actor=API キー名。pending queue へ
   入った場合も記録）。
 - **不可逆操作は `confirm:true` 必須**（`delete_*`・`revoke_api_key`・`lock_down`）。
-- 接続/グループ/タグの変更は**収集中は pending queue に投入**（REST と同じ。停止中は
-  即時 commit）。既存 REST の検証・commit・監査経路を共有し、抜け道を作らない。
+- 接続/グループ/タグの変更は、**ロックダウン済みで収集中のときだけ** pending queue に
+  投入される（REST と同じ）。**試運転中（未ロックダウン）は収集中でもその場で
+  commit され、収集を止めずに実行構成へ反映される**（2026-09-09 オーナー決定・#341、
+  2026-09-14 実装。[tag-server-design.md](tag-server-design.md) §4.3）。収集停止中は
+  どちらの状態でも即時 commit。既存 REST の検証・commit・監査経路を共有し、抜け道を
+  作らない。
 - **更新（`update_*`）は全項目指定（PUT 置換）**。省略項目が既定値で黙って上書き
   されるのを防ぐため、サーバー側でも全キーの存在を検証する（欠落は `missing_fields`）。
   `update_tag` は `expectedRevision` を付けると楽観ロック（他者更新時は `revision_conflict`）。

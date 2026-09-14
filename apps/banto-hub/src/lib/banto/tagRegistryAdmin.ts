@@ -23,6 +23,7 @@ import {
 	type ListParams,
 	type ListResult
 } from '@banto/admin-core';
+import { mapLiveReconfigureFailure } from './liveReconfigure';
 import { CSRF_HEADER } from './setup';
 import { deferredDelete } from './deferredDelete.svelte';
 
@@ -571,6 +572,13 @@ async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
 		}
 		const mapped = init.mapErrorBody?.(body, response.status);
 		if (mapped) throw mapped;
+		// #341 レビュー対応2（2026-09-14）: 「保存はできたが走行中の収集へ
+		// 反映できなかった」500 は全レジストリ CRUD（単票・一括とも）が返し
+		// うるので、呼び出しごとの `mapErrorBody` ではなくここで一律に解釈
+		// する - 汎用の「500 Internal Server Error」を見せると、保存済みの
+		// 変更をやり直して二重に作ってしまう（`liveReconfigure.ts` 参照）。
+		const liveApplyFailure = mapLiveReconfigureFailure(body, response.status);
+		if (liveApplyFailure) throw liveApplyFailure;
 		if (isErrorBody(body)) throw new ProviderError(body);
 		throw new ProviderError({
 			kind: 'other',
@@ -600,9 +608,10 @@ async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
 }
 
 /**
- * 監査③（2026-08-12）是正: 収集稼働中は plc-connections/collection-groups/tags
- * の作成・更新・削除が即時適用されず `queue_pending_registry_change`
- * （`apps/banto-hub/core/src/rest.rs`）が 202 Accepted +
+ * 監査③（2026-08-12）是正: **ロックダウン済みで**収集稼働中のときは
+ * plc-connections/collection-groups/tags の作成・更新・削除が即時適用されず
+ * `queue_pending_registry_change`（`apps/banto-hub/core/src/rest.rs`）が
+ * 202 Accepted +
  * `QueuedPendingChangeResponse { queued: true, pending, status, message }`
  * を返す。`response.ok` は 202 も真になるため、これを検出せず素通しすると
  * 呼び出し元が「作成済みリソース」型（`PlcConnection`/`CollectionGroup`/
@@ -610,6 +619,12 @@ async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
  * （configPackageAdmin.ts の import がこれで壊れていた）。この 202 を
  * 検出して判別可能な例外に変換し、呼び出し元に「作成済みではなくキュー
  * 投入された」ことを必ず伝える。
+ *
+ * #341（オーナー決定 2026-09-09）: この 202 が返るのは**ロックダウン済みの
+ * ときだけ**になった - 試運転中（未ロックダウン）は収集稼働中でも queue を
+ * 経由せず即時・無停止で反映され、通常どおり作成済みリソースが返る
+ * （サーバー側 `registry_change_should_queue` の doc comment 参照）。この
+ * 例外クラス自体はロックダウン後の契約として残す。
  */
 export class QueuedWhileRunningError extends Error {
 	readonly pending: unknown;

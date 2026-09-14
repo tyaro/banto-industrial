@@ -1,7 +1,7 @@
 # banto-hub T21 設計: 構成補助 MCP（管理面ツール）
 
 作成日: 2026-09-05
-状態: **完了（2026-09-06）、2026-09-14 #340 で §4 の write_enabled 記述を更新**。S1（接続/グループ/タグ CRUD、#267-269）/ S2（収集・write 制御 #270、設定 gRPC/MQTT/retention #271）/ S3（API キー発行/失効・lock_down #272）を実装済み。実装は既存 admin REST の mutation/検証/監査経路を再利用（`crate::mcp`）。IF 一覧は banto-hub-mcp-reference.md §6。オーナー決定は §2・§8、安全境界の設計は §3。**§4 の「start は write_enabled をリセット」は 2026-09-09 オーナー決定（#340）で撤回済み** - 下表の該当行参照。
+状態: **完了（2026-09-06）、2026-09-14 #340 で §4 の write_enabled 記述を更新、同日 #341 で §4/§5 の pending queue 注記を「ロックダウン済みのときのみ」に更新**。S1（接続/グループ/タグ CRUD、#267-269）/ S2（収集・write 制御 #270、設定 gRPC/MQTT/retention #271）/ S3（API キー発行/失効・lock_down #272）を実装済み。実装は既存 admin REST の mutation/検証/監査経路を再利用（`crate::mcp`）。IF 一覧は banto-hub-mcp-reference.md §6。オーナー決定は §2・§8、安全境界の設計は §3。**§4 の「start は write_enabled をリセット」は 2026-09-09 オーナー決定（#340）で撤回済み** - 下表の該当行参照。
 対象: MCP から接続/グループ/タグ・各種設定・収集/書き込み制御・API キーを操作する
 「構成補助」ツール群。AI エージェントや MES セットアップツールが**会話的に banto-hub を
 構成**できるようにする。
@@ -90,7 +90,7 @@ write 有効化・API キー発行を admin REST で手作業した — これ�
 | `list_connections`                                | GET /api/plc-connections                 | 読み取り                                                         |
 | `create_connection`                               | POST /api/plc-connections                | 任意 host:port                                                   |
 | `update_connection`                               | PUT /api/plc-connections/{id}            |                                                                  |
-| `delete_connection`                               | DELETE /api/plc-connections/{id}         | 収集中は pending queue 挙動を継承                                |
+| `delete_connection`                               | DELETE /api/plc-connections/{id}         | ロックダウン済み + 収集中は pending queue 挙動を継承（#341）     |
 | `test_connection`                                 | POST /api/plc-connections/test           | 保存前の疎通確認（副作用なし）                                   |
 | `list_groups`                                     | GET /api/collection-groups               |                                                                  |
 | `create_group`                                    | POST /api/collection-groups              |                                                                  |
@@ -114,8 +114,12 @@ MCP に載せない。既存の安全規約と一致。）
 - 既存 admin ハンドラのロジック（`banto_tags` の CRUD、検証、pending queue 投入）を
   共有し、MCP ツールは入力スキーマ → 既存ハンドラ相当の呼び出し → 構造化 JSON 応答、の
   薄いラッパーにする（`crate::mcp` に追加）。REST と二重実装しない。
-- 収集中の登録変更は REST と同じく **pending queue（202 相当）**になる。MCP 応答でも
-  「pending に入った」ことを明示する。
+- **ロックダウン済みで**収集中の登録変更は REST と同じく **pending queue（202 相当）**に
+  なる。MCP 応答でも「pending に入った」ことを明示する（判定は REST と共有の
+  `rest::registry_change_should_queue`）。試運転中（未ロックダウン）は収集中でも queue を
+  経由せずその場で commit され、収集を止めずに実行構成へ反映される
+  （2026-09-09 オーナー決定・#341、2026-09-14 実装。**旧記述**は「収集中の登録変更は
+  常に pending queue」だった）。
 - エラーは既存の wire コード（`value_out_of_range` 等）と揃える。
 
 ## 6. スライス構成（案）

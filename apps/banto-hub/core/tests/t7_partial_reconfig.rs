@@ -13,6 +13,17 @@
 //! `tests/computed.rs` と同型。`TempEnv` は `tests/common/mod.rs` に集約済み
 //! （2026-08-08、テスト一時ディレクトリリークの根治）。
 //!
+//! **#341（2026-09-14）でこのファイルの前提が1つ変わった**: 1〜3番の
+//! テストが見ている「REST の CRUD が走行中の `Collector` へ届く」経路は、
+//! 以前は `legacy_live_reconfigure`（互換ルーター専用の pre-T14-3 挙動）が
+//! 担っていた。#341 でそのフラグごと撤去し、`CollectionController` が
+//! `Running` のときだけ走る `commit_catalog_and_apply_live` に一本化した
+//! ので、各テストは (a) `test_app` をロックダウンしない（試運転中 =
+//! 収集中でも即時反映）、(b) `rebuild` で catalog を用意したうえで
+//! `start_collection` で controller を `Running` にする、という形に
+//! 揃えてある。ロックダウン済み（queue + 明示適用、こちらも無停止）の
+//! 対になる E2E は `tests/live_reconfig.rs`。
+//!
 //! テスト構成:
 //! 1. 本命: 無関係接続の無停止 - シミュレータ2台(A: modbus, B: slmp)稼働中に
 //!    B へタグ追加(REST CRUD) → A の PlcDisconnected が出ない・
@@ -279,13 +290,17 @@ async fn test_app(label: &str) -> TestApp {
     );
     let grpc_server = Arc::new(GrpcServer::new(grpc_service));
     let settings = SettingsService::new(pool.clone());
+    // #341（2026-09-14）: **意図的にロックダウンしない**（試運転モードの
+    // まま）。このファイルの1〜3番は「REST の CRUD が走行中の収集へ
+    // そのまま反映される」ことを見るテストで、ロックダウン済みだと
+    // `registry_change_should_queue` が pending queue へ回してしまい、
+    // そもそも apply_config が走らない。ロックダウン済み側の契約
+    // （queue + 明示適用、こちらも無停止）は `tests/live_reconfig.rs` が
+    // 受け持つ。認証そのものは各リクエストが `token` を送るので、
+    // 試運転モードのバイパスがあっても従来どおり通る。
     let commissioning = CommissioningService::load(settings, users.clone())
         .await
         .expect("CommissioningService::load");
-    commissioning
-        .lock_down()
-        .await
-        .expect("lock_down the test environment");
 
     let router = api_router(
         users,
@@ -416,6 +431,26 @@ async fn recv_matching(ws: &mut WsStream, predicate: impl Fn(&Value) -> bool) ->
     .expect("timed out waiting for the expected ws message")
 }
 
+/// #341（2026-09-14）: 収集を `CollectionController` 経由で開始する。
+///
+/// 以前はどのテストも `app.manager.rebuild()` を直接呼んで収集を起こして
+/// いたが、それだと `CollectionController` は `Stopped` のままなので、
+/// REST の CRUD が `commit_catalog_and_apply_live` の live 分岐へ入らない
+/// （= 走行中の `Collector` が更新されない）。本番と同じく controller を
+/// `Running` にしてから CRUD を打つ形へ揃える。
+async fn start_collection(app: &TestApp) {
+    let (status, started) = write_json(
+        &app.router,
+        "POST",
+        "/api/collection/start",
+        &app.token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{started:?}");
+    assert_eq!(started["state"], "running", "{started:?}");
+}
+
 fn str_array_contains(value: &Value, needle: &str) -> bool {
     value
         .as_array()
@@ -465,7 +500,14 @@ async fn unrelated_connection_is_uninterrupted_by_a_partial_reconfigure() {
         .await
         .unwrap();
 
+    // このファイルのテストはレジストリをサービス層で直接作る（REST を
+    // 通さない）ので、catalog を進めるのはこの `rebuild` だけ - これが
+    // 無いと `/api/v1/values/{tag}` が 404 になる。その上で収集を
+    // controller 経由で `Running` にする（`start_collection` の doc
+    // comment 参照）。`apply_run` は同じ構成を差分適用するだけなので、
+    // ここで走っているタスクは一切揺さぶられない。
     app.manager.rebuild().await.expect("initial rebuild");
+    start_collection(&app).await;
 
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -647,7 +689,14 @@ async fn server_side_tag_only_change_never_touches_the_collector() {
         .await
         .unwrap();
 
+    // このファイルのテストはレジストリをサービス層で直接作る（REST を
+    // 通さない）ので、catalog を進めるのはこの `rebuild` だけ - これが
+    // 無いと `/api/v1/values/{tag}` が 404 になる。その上で収集を
+    // controller 経由で `Running` にする（`start_collection` の doc
+    // comment 参照）。`apply_run` は同じ構成を差分適用するだけなので、
+    // ここで走っているタスクは一切揺さぶられない。
     app.manager.rebuild().await.expect("initial rebuild");
+    start_collection(&app).await;
     assert!(
         wait_until(Duration::from_secs(10), || async {
             let (s, v) = get_json(&app.router, "/api/v1/values/line1.fast.t1", &app.token).await;
@@ -771,7 +820,14 @@ async fn deleting_a_connection_untracks_its_broker_session_and_leaves_others_run
         .await
         .unwrap();
 
+    // このファイルのテストはレジストリをサービス層で直接作る（REST を
+    // 通さない）ので、catalog を進めるのはこの `rebuild` だけ - これが
+    // 無いと `/api/v1/values/{tag}` が 404 になる。その上で収集を
+    // controller 経由で `Running` にする（`start_collection` の doc
+    // comment 参照）。`apply_run` は同じ構成を差分適用するだけなので、
+    // ここで走っているタスクは一切揺さぶられない。
     app.manager.rebuild().await.expect("initial rebuild");
+    start_collection(&app).await;
 
     assert!(
         wait_until(Duration::from_secs(10), || async {
