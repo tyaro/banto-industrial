@@ -6,6 +6,7 @@
  * バックエンドの `PendingChange` / 409 conflict 応答に合わせて camelCase を使う。
  */
 import { getAuthProvider, ProviderError, type ErrorBody } from '@banto/admin-core';
+import { mapLiveReconfigureFailure } from './liveReconfigure';
 import { CSRF_HEADER } from './setup';
 
 export type PendingChangeState = 'pending' | 'applying' | 'applied' | 'canceled' | 'failed';
@@ -99,22 +100,6 @@ async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
 	}
 
 	return (await response.json()) as T;
-}
-
-/**
- * #341（2026-09-14）: 適用そのものは成功したが、実行構成への反映に失敗した
- * ときの 500 `live_reconfigure_failed`。`message` にサーバー側の理由が入って
- * いるので、汎用の「500 Internal Server Error」ではなくそれを見せる
- * （pending change 自体は `applied` になっている - サーバー側
- * `pending_changes_apply` のコメント参照）。
- */
-function mapLiveReconfigureFailure(body: unknown, status: number): Error | undefined {
-	if (status !== 500 || typeof body !== 'object' || body === null) return undefined;
-	const candidate = body as { error?: unknown; message?: unknown };
-	if (candidate.error !== 'live_reconfigure_failed' || typeof candidate.message !== 'string') {
-		return undefined;
-	}
-	return new ProviderError({ kind: 'other', message: candidate.message });
 }
 
 export async function listPendingChanges(limit = 100): Promise<PendingChange[]> {

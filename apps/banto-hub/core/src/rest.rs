@@ -3052,6 +3052,12 @@ struct TagRegistryState {
 /// - ロックダウン済みは「構成凍結」の意図どおり、queue + 明示適用の
 ///   ワンクッションを必ず挟む（ヒューマンエラー防止）。
 /// - 収集停止中はどちらの状態でもそのまま即時反映（従来どおり）。
+/// - 判定は `state != Stopped`、つまり `Starting`/`Stopping`/`Faulted` も
+///   ロックダウン済みでは queue 扱いにする（#341 レビュー対応2 で明示。
+///   挙動は #341 以前から変えていない）。遷移の途中や失敗直後に直接
+///   書き込みを始めるより、キューに載せて人の明示適用を待つ方が保守的で
+///   あり、`Running` だけを特別扱いすると「開始中に滑り込んだ CRUD だけ
+///   即座に反映される」という説明しづらい穴ができるため。
 ///
 /// REST（[`TagRegistryState`] 経由）と MCP（`crate::mcp::McpState` 経由）の
 /// 両方から呼べるよう、全体の状態ではなく実際に読む2つだけを受け取る
@@ -12822,6 +12828,21 @@ mod tests {
             "レジストリ行自体は入っていること: {tags:?}"
         );
 
+        // #341 レビュー対応2: catalog も直前の成功構成へ戻っている
+        // （読み側だけ新構成、という食い違いを残さない -
+        // `CollectorManager::rollback_catalog`）。DB には在るが catalog
+        // （`/api/v1/tags`）には**まだ現れない**のが正。
+        let (status, catalog) = admin_get(&env.router, "/api/v1/tags", &env.admin_token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !catalog["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == "temp-live-fail-01"),
+            "反映に失敗したので catalog へは載らない: {catalog:?}"
+        );
+
         // 3. 監査ログに失敗行が残る。
         let audited: Vec<(String, String)> = sqlx::query_as(
             "SELECT action, result FROM audit_log WHERE resource = 'pending_changes' ORDER BY id",
@@ -12848,6 +12869,31 @@ mod tests {
         );
         // 収集自体は止まっていない。
         assert_eq!(runtime["collectionState"], "running", "{runtime:?}");
+
+        // 回復手段（`LIVE_APPLY_RECOVERY_HINT`）どおり、再適用すれば載る。
+        let reapply = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/reapply")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reapply.status(), StatusCode::OK);
+        let (status, catalog) = admin_get(&env.router, "/api/v1/tags", &env.admin_token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            catalog["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == "temp-live-fail-01"),
+            "reapply で catalog へ載ること: {catalog:?}"
+        );
     }
 
     /// #341 レビュー対応（2026-09-14）: 反映失敗からの回復手段

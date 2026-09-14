@@ -94,6 +94,7 @@
 		type TagCellEditInput
 	} from '$lib/banto/tagCellEdit';
 	import { getHubStatus, type StatusResponse } from '$lib/banto/hubStatus';
+	import { getCommissioningStatus, type CommissioningStatus } from '$lib/banto/commissioning';
 	import {
 		buildContinuousParams,
 		generateContinuousTags,
@@ -494,12 +495,28 @@
 	 * 別画面から行われうるため、このページを開いたまま状態が変わる可能性が
 	 * ある。取得に失敗した場合は `hubStatus` を `null` のままにし、
 	 * `collectionStopped` は安全側（`false` = 編集不可）にフォールバックする。
+	 * #341 レビュー対応2（2026-09-14）: 同じタイミングでロックダウン状態
+	 * （`commissioningStatus`）も取り直す - こちらも失敗時は `null` ＝
+	 * ロックダウン済み扱い（編集不可）へ倒す。
 	 */
 	let hubStatus: StatusResponse | null = $state(null);
 	const collectionStopped = $derived.by((): boolean => {
 		const s = hubStatus;
 		return s !== null && s.collection_state === 'stopped';
 	});
+	/**
+	 * #341 レビュー対応2（2026-09-14）: 試運転中かどうかを
+	 * `sessionStore.commissioningMode`（ログイン時に一度決まる値）ではなく
+	 * **サーバーから読み直した値**で判断するための保持先。ロックダウンは
+	 * 別のタブ・別の端末からも実行でき、そのときセッション側の値は古い
+	 * ままになる。`hubStatus` と同じタイミング（初期ロード時と保存直前）で
+	 * 取り直す。`/api/status` には `lockedDown` が無いので
+	 * `GET /api/commissioning/status`（未認証で呼べる軽い1本）を使う。
+	 * 取得に失敗したら `null` のままにし、`hubStatus` と同じく安全側
+	 * （＝ロックダウン済み扱い＝編集不可）へ倒す。
+	 */
+	let commissioningStatus = $state<CommissioningStatus | null>(null);
+
 	/**
 	 * #341（オーナー決定 2026-09-09、`docs/tag-server-design.md` §4.3）:
 	 * 表編集を許すかどうか。**停止中、または試運転中（未ロックダウン）**。
@@ -510,9 +527,19 @@
 	 * ロックダウン後は従来どおり「停止中のみ」に戻る（収集中の保存は 202
 	 * で未適用キューに積まれ、`QueuedWhileRunningError` になる）。
 	 */
-	const gridEditAllowed = $derived(collectionStopped || sessionStore.commissioningMode);
+	const gridEditAllowed = $derived(
+		collectionStopped || (commissioningStatus !== null && !commissioningStatus.lockedDown)
+	);
 
 	async function loadHubStatus(): Promise<void> {
+		// #341 レビュー対応2: ロックダウン状態も同じタイミングで取り直す
+		// （`commissioningStatus` の doc comment 参照）。失敗時は安全側
+		// （編集不可）へ倒すため `null` のままにする。
+		try {
+			commissioningStatus = await getCommissioningStatus();
+		} catch {
+			commissioningStatus = null;
+		}
 		try {
 			hubStatus = await getHubStatus();
 		} catch {

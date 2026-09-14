@@ -23,6 +23,7 @@ import {
 	type ListParams,
 	type ListResult
 } from '@banto/admin-core';
+import { mapLiveReconfigureFailure } from './liveReconfigure';
 import { CSRF_HEADER } from './setup';
 import { deferredDelete } from './deferredDelete.svelte';
 
@@ -571,6 +572,13 @@ async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
 		}
 		const mapped = init.mapErrorBody?.(body, response.status);
 		if (mapped) throw mapped;
+		// #341 レビュー対応2（2026-09-14）: 「保存はできたが走行中の収集へ
+		// 反映できなかった」500 は全レジストリ CRUD（単票・一括とも）が返し
+		// うるので、呼び出しごとの `mapErrorBody` ではなくここで一律に解釈
+		// する - 汎用の「500 Internal Server Error」を見せると、保存済みの
+		// 変更をやり直して二重に作ってしまう（`liveReconfigure.ts` 参照）。
+		const liveApplyFailure = mapLiveReconfigureFailure(body, response.status);
+		if (liveApplyFailure) throw liveApplyFailure;
 		if (isErrorBody(body)) throw new ProviderError(body);
 		throw new ProviderError({
 			kind: 'other',

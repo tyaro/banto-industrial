@@ -574,6 +574,19 @@ struct Inner {
     /// 成功していない場合と [`CollectorManager::stop`] 直後は
     /// `RegistrySnapshot::default()`（空 = セッションを1本も張らない状態）。
     applied_runtime: RegistrySnapshot,
+    /// #341 レビュー対応2（2026-09-14）: `applied_runtime` の**生の**
+    /// （run mode を適用する前の）相方。catalog・演算 plan・DB Source plan
+    /// のロールバック基準で、[`CollectorManager::rollback_catalog`] が
+    /// [`CollectorManager::commit_catalog`] へ渡す。
+    ///
+    /// `applied_runtime` と分けているのは、`commit_catalog` が受け取るのが
+    /// レジストリそのもの（run mode 非依存の catalog 導出）だからで、
+    /// 実際には catalog は run mode に依存しない（`simulation` の実効値は
+    /// 応答時に controller の mode から導出され、`TagMap` には焼き込まれ
+    /// ない）ため `applied_runtime` でも同じ結果になる。それでも「catalog
+    /// には生の registry を渡す」という `commit_catalog` の前提をコードの
+    /// 形で保つために別に持つ。更新点・クリア点は `applied_runtime` と同じ。
+    applied_registry: RegistrySnapshot,
 }
 
 /// Owns the running [`Collector`]'s lifecycle end to end (design §3.2 table
@@ -597,6 +610,10 @@ pub struct CollectorManager {
     /// からしか触れず、`cargo build`（統合テスト・本番）には一切残らない。
     #[cfg(test)]
     fail_next_apply: std::sync::atomic::AtomicBool,
+    /// テスト専用（[`Self::fail_next_apply`] と同じ流儀）: 次の
+    /// [`Self::apply_run`] をこのミリ秒だけ遅らせる。0 なら遅らせない。
+    #[cfg(test)]
+    delay_next_apply: std::sync::atomic::AtomicU64,
     pool: SqlitePool,
     data_dir: PathBuf,
     clock: Arc<dyn Clock>,
@@ -836,6 +853,8 @@ impl CollectorManager {
         Self {
             #[cfg(test)]
             fail_next_apply: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            delay_next_apply: std::sync::atomic::AtomicU64::new(0),
             pool,
             data_dir,
             clock,
@@ -854,6 +873,7 @@ impl CollectorManager {
                 current: None,
                 last_apply: None,
                 applied_runtime: RegistrySnapshot::default(),
+                applied_registry: RegistrySnapshot::default(),
             }),
             rebuild_lock: AsyncMutex::new(()),
             revision_tx,
@@ -1126,6 +1146,7 @@ impl CollectorManager {
                 // 基準をここでも更新する（`rebuild` は run mode を持たない
                 // ので snapshot そのものが runtime snapshot）。
                 inner.applied_runtime = snapshot.clone();
+                inner.applied_registry = snapshot.clone();
                 inner.revision
             };
             // Sent while still holding `rebuild_lock` (not `inner`'s lock,
@@ -1215,6 +1236,7 @@ impl CollectorManager {
             inner.current = Some(current_handle);
             inner.last_apply = apply_report;
             inner.applied_runtime = snapshot.clone();
+            inner.applied_registry = snapshot.clone();
             inner.revision
         };
         let _ = self.revision_tx.send(new_revision);
@@ -1253,6 +1275,75 @@ impl CollectorManager {
     pub(crate) fn fail_next_apply_for_test(&self) {
         self.fail_next_apply
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 次の [`Self::apply_run`] を指定ミリ秒だけ遅らせる（テスト専用）。
+    /// #341 レビュー対応2: 「live apply の最中に来た stop が無視されない」
+    /// ことを決定的に確かめるために要る（`crate::controller` の
+    /// `stop_during_a_live_apply_waits_instead_of_being_ignored`）。
+    /// `fail_next_apply_for_test` と同じ流儀で `#[cfg(test)]`。
+    #[cfg(test)]
+    pub(crate) fn delay_next_apply_for_test(&self, delay: std::time::Duration) {
+        self.delay_next_apply.store(
+            delay.as_millis() as u64,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// [`Self::delay_next_apply`] を読んで下ろす（テスト専用）。
+    #[cfg(test)]
+    async fn take_injected_apply_delay(&self) {
+        let millis = self
+            .delay_next_apply
+            .swap(0, std::sync::atomic::Ordering::SeqCst);
+        if millis > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    async fn take_injected_apply_delay(&self) {}
+
+    /// #341 レビュー対応2（2026-09-14）: catalog・演算タグ plan・DB Source
+    /// plan を `inner.applied_registry`（直近で適用に成功した registry
+    /// snapshot）へ**戻す** - live 経路
+    /// （`crate::controller::CollectionController::commit_catalog_and_apply_live`）
+    /// が `commit_catalog` に成功したあと [`Self::apply_run`] で失敗した
+    /// ときだけ呼ばれる。
+    ///
+    /// これが無いと「読み側（catalog・演算・DB Source）は新構成、収集側は
+    /// 旧構成」という食い違いが残る（collector/broker のロールバックだけ
+    /// では埋まらない）。戻したあとの状態は「**DB は新・runtime 側は全部
+    /// 旧**」で一貫し、回復手段は `crate::rest::LIVE_APPLY_RECOVERY_HINT`
+    /// のとおり（次の CRUD / 収集の停止→開始 / `POST /api/collection/reapply`）。
+    ///
+    /// `configured_revision` がこのロールバックでもう一度進み
+    /// `config_changed` が飛ぶのは**意図どおり** - 新 catalog を取りに来た
+    /// クライアントに「戻った」ことを知らせる契機が要る。
+    ///
+    /// ベストエフォート: 戻す `commit_catalog` 自体が失敗しても元の失敗
+    /// 理由を上書きしない（`last_error` は呼び出し前の値＝ `apply_run` の
+    /// 失敗理由へ必ず復元する。`commit_catalog` は成功すると
+    /// `last_error` を `None` にしてしまうため）。
+    pub(crate) async fn rollback_catalog(&self) {
+        let (previous, last_error) = {
+            let inner = self.inner.lock().expect("hub state lock poisoned");
+            (inner.applied_registry.clone(), inner.last_error.clone())
+        };
+        let result = self.commit_catalog(&previous).await;
+        {
+            let mut inner = self.inner.lock().expect("hub state lock poisoned");
+            inner.last_error = last_error;
+        }
+        match result {
+            Ok(_) => self.diag_log.err_line(
+                "banto-hub: 実行構成の適用に失敗したため、catalog を直前の構成へ戻しました",
+            ),
+            Err(err) => self.diag_log.err_line(&format!(
+                "banto-hub: catalog を直前の構成へ戻せませんでした（DB の内容と catalog が食い違ったままです。POST /api/collection/reapply で再適用してください）: {err}"
+            )),
+        }
     }
 
     /// #341 レビュー対応（2026-09-14）: broker セッション集合を
@@ -1895,6 +1986,10 @@ impl CollectorManager {
             message
         })?;
 
+        // テスト専用の遅延注入（`Self::delay_next_apply`）- 本番ビルドでは
+        // 空の `async fn` になり消える。
+        self.take_injected_apply_delay().await;
+
         let (broker_handles, stale_broker_ids, resolved_broker_targets, read_routed_keys) =
             self.sync_broker_sessions_from(&runtime_snapshot).await;
         // See `Self::rebuild`'s matching call for what `read_routed_keys` is
@@ -1919,6 +2014,7 @@ impl CollectorManager {
                 // ロールバック基準を更新する（この runtime snapshot に対して
                 // 同期済みのセッション集合が、以後の正しい戻し先）。
                 inner.applied_runtime = runtime_snapshot.clone();
+                inner.applied_registry = snapshot.clone();
             }
             self.remove_stale_broker_sessions(&stale_broker_ids).await;
             self.advance_running_revision();
@@ -1977,6 +2073,7 @@ impl CollectorManager {
             inner.last_error = None;
             // #341 レビュー対応: 次に失敗したときの戻し先はこの構成。
             inner.applied_runtime = runtime_snapshot.clone();
+            inner.applied_registry = snapshot.clone();
         }
         self.remove_stale_broker_sessions(&stale_broker_ids).await;
         self.log_simulation_warnings().await;
@@ -2096,10 +2193,11 @@ impl CollectorManager {
         // バック基準も「1本も張っていない状態」に戻す（次の
         // `Self::apply_run` が失敗したときに、止めたはずのセッションを
         // 復活させないため）。
-        self.inner
-            .lock()
-            .expect("hub state lock poisoned")
-            .applied_runtime = RegistrySnapshot::default();
+        {
+            let mut inner = self.inner.lock().expect("hub state lock poisoned");
+            inner.applied_runtime = RegistrySnapshot::default();
+            inner.applied_registry = RegistrySnapshot::default();
+        }
         let connection_ids = self.sessions.connection_ids();
         for connection_id in connection_ids {
             let _ = self.sessions.stop_and_join(connection_id).await;

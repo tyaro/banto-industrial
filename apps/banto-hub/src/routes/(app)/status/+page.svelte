@@ -36,14 +36,19 @@
 	 * セクション・`commissioning_lock_down_fails_without_any_admin_account`
 	 * 参照）。
 	 *
-	 * **2026-08-31 オーナー指摘（収集の開始/停止 UI の追加）**: `rest.rs` の
-	 * `commit_catalog_and_notify` の doc comment のとおり、本番経路では
-	 * PLC接続/収集グループ/タグの登録・変更は configured revision を
+	 * **2026-08-31 オーナー指摘（収集の開始/停止 UI の追加）**: 当時は
+	 * PLC接続/収集グループ/タグの登録・変更が configured revision を
 	 * 進めるだけで、動いている（あるいはまだ一度も開始していない）収集機
-	 * には反映されない。`POST /api/collection/start|stop` 自体は元々 API
+	 * には反映されなかった。`POST /api/collection/start|stop` 自体は元々 API
 	 * にしか無く、UI から叩く導線が1つも無かった - 実機での試運転の最後の
 	 * 一歩「PLC に接続開始し、タグにアクセスできているか確認する」を画面
-	 * から行えなかった。「収集の開始・停止」セクション（`#collection-control`、
+	 * から行えなかった。**#341（2026-09-14）でその前提は変わった**:
+	 * `rest.rs` の `commit_catalog_and_notify` は
+	 * `CollectionController::commit_catalog_and_apply_live` を通し、収集が
+	 * 稼働中なら**止めずに**実行構成まで反映する（試運転中は CRUD が
+	 * そのまま、ロックダウン後は未適用キューの明示適用が契機）。したがって
+	 * このセクションの start/stop は「変更を反映させるための再起動」では
+	 * なく純粋な収集ライフサイクル操作である。「収集の開始・停止」セクション（`#collection-control`、
 	 * `collectionControlAdmin.ts` 使用）はその導線。接続単位のシミュレーション
 	 * （`PlcConnection.simulation`、T9-2、接続 Drawer のチェックボックス）は
 	 * 今回のオーナー指摘とは無関係で
