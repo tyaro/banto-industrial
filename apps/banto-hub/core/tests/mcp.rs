@@ -3418,6 +3418,75 @@ async fn set_write_control_enable_and_disable_persist_and_audit() {
     );
 }
 
+/// #340 レビュー対応（2026-09-14）: `enabled_persisted` が次回起動時の
+/// ライブ値そのものになったため、enable は永続化に成功したときだけ
+/// ライブフラグを立てる。`persist_enabled` を強制失敗させ、`isError: true`
+/// を返しつつライブフラグは disabled のままであることを確認する
+/// （ハンドラが panic しないことも同時に確認する）。
+///
+/// REST 版（`tests/write.rs`）は `app.pool.close()` で丸ごと止めているが、
+/// MCP の API キー認証はセッション bearer と違い**リクエスト毎に DB へ
+/// 問い合わせる**（`crate::api_keys`）ため、pool を閉じると
+/// `set_write_control` 呼び出し自体が認証エラー（401）になってしまい
+/// `persist_enabled` の失敗を検証できない。そこで `write_control_state`
+/// テーブルだけを drop し、`api_keys`（→認証）と `audit_log`（→監査）は
+/// 生かしたまま `persist_enabled` の UPDATE だけを失敗させる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_write_control_enable_returns_tool_error_and_stays_disabled_when_persistence_fails() {
+    let app = test_app("write-control-persist-fail-enable").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    assert!(!app.write_control.is_enabled());
+
+    sqlx::query("DROP TABLE write_control_state")
+        .execute(&app.pool)
+        .await
+        .expect("drop write_control_state");
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("set_write_control", json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    assert!(
+        !app.write_control.is_enabled(),
+        "enable must not flip the live flag when persistence fails"
+    );
+}
+
+/// #340 レビュー対応（2026-09-14）: disable（非常停止）はライブフラグを
+/// 先に落とすため、永続化が失敗しても書き込みは止まったままになる -
+/// `isError: true` を返しつつライブフラグは disabled（止まっている）こと
+/// を確認する。上のテストと同じ理由で `app.pool.close()` ではなく
+/// `write_control_state` テーブルの drop で永続化だけを失敗させる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_write_control_disable_returns_tool_error_but_stays_disabled_when_persistence_fails() {
+    let app = test_app("write-control-persist-fail-disable").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    app.write_control.enable();
+    assert!(app.write_control.is_enabled());
+
+    sqlx::query("DROP TABLE write_control_state")
+        .execute(&app.pool)
+        .await
+        .expect("drop write_control_state");
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("set_write_control", json!({ "enabled": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    assert!(
+        !app.write_control.is_enabled(),
+        "disable must fail closed (live flag stays off) even when persistence fails"
+    );
+}
+
 /// 2026-09-09 オーナー決定（#340、`docs/mcp-real-machine-2026-09-04`メモリの
 /// 旧記録を撤回）: `CollectionController::start`/`stop`/`set_mode` はもはや
 /// `WriteControl::disable`を呼ばない。`set_collection{action:start}`の前後

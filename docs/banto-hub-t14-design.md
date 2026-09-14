@@ -133,24 +133,30 @@ impl RunningHub {
 ## 4. D2 — 収集状態機械と直列化 controller
 
 新規 `CollectionController` を導入する。**P3 の推奨に従い `CollectorManager` を再ホームせず**、
-その上位の薄い状態層とする（`Arc<CollectorManager>` と `Arc<WriteControl>` を保持）。理由: collector /
-sessions / sim_registry / computed の Arc 所有と `rebuild_lock` の直列化は既に機能しており、全再ホームは
-`rest.rs`(4.8k 行)・`hub.rs`(1.5k 行) 横断の高リスク改修になる。controller は「状態・遷移直列化・
-run_id」だけを新たに所有し、実処理は `CollectorManager` の分割後 API（D3）を駆動する。
+その上位の薄い状態層とする（`Arc<CollectorManager>` を保持。設計当初は `Arc<WriteControl>` も
+保持する想定だったが、2026-09-09 オーナー決定 #340 で controller から write_control を完全に
+外したため、現行の `CollectionController` は `write_control` を持たない - 下のコード例参照）。
+理由: collector / sessions / sim_registry / computed の Arc 所有と `rebuild_lock` の直列化は
+既に機能しており、全再ホームは `rest.rs`(4.8k 行)・`hub.rs`(1.5k 行) 横断の高リスク改修になる。
+controller は「状態・遷移直列化・run_id」だけを新たに所有し、実処理は `CollectorManager` の
+分割後 API（D3）を駆動する。
 
 ```rust
 enum CollectionState { Stopped, Starting, Running, Stopping, Faulted }
 enum RunMode { Configured, AllSimulation }        // AllSimulation の実装は T15
 struct RunContext { mode: RunMode, run_id: RunId } // Starting / Running のとき Some
 
+// 現行（2026-09-14、#340 反映後、`apps/banto-hub/core/src/controller.rs` と一致）:
 struct CollectionController {
     manager: Arc<CollectorManager>,
-    write_control: Arc<WriteControl>,
+    test_output: Arc<TestOutputControl>,    // T15-3、遷移点で OFF に連動（維持）
     state: Mutex<RuntimeState>,             // 現在状態 + RunContext
     transition: AsyncMutex<()>,             // 遷移の直列化（rebuild_lock とは別レイヤ）
     status_tx: watch::Sender<RuntimeStatus>,// D4 の running 側 watch
     run_seq: AtomicU64,                      // run_id 採番（単調・非再利用）
 }
+// （履歴、2026-09-09 #340 で撤回）設計当初は `write_control: Arc<WriteControl>` も
+// フィールドとして保持し、全遷移の先頭で `write_control.disable()` を呼ぶ想定だった。
 ```
 
 決定:
@@ -293,20 +299,34 @@ test_output の OFF 連動は維持。停止中の書き込みは本節が既に
 独立）と gate 8 の no-spawn peek（T15-4）が引き続き拒否するため、
 write_control 側の自動 OFF は安全上不要だった。）
 
-決定:
+決定（2026-09-14 現行契約に更新。旧決定は取り消し線代わりに「（履歴、2026-09-09
+#340 で撤回）」を付して残す）:
 
-- `CollectionController` が `Arc<WriteControl>` を保持し、**全遷移（start/stop/mode 切替）の先頭で
-  `write_control.disable()` を呼ぶ**（§7 step2）。`WriteControl` は薄い AtomicBool のまま
-  （relay-wright arming との同型を維持、P5）。
-- **自動復元しない**（plan §7）: SIM→configured 復帰や start 成功で write を自動 ON にしない。運転開始後の
-  書き込みは管理画面から明示的に再度 enable する運用。
-- **no-spawn-while-stopped**: gate5（write_enabled）は gate8（`write_broker_handle`→`ensure_connection`
-  spawn）より前（write_path.rs:295-308）。遷移で write_control を OFF にし自動復元しないため、
-  **停止中の書き込みは gate5 で弾かれ spawn に到達しない**。write_path 自体は無改修。
+- **`CollectionController` は `write_control` を持たない**。start/stop/mode 切替の
+  遷移点で書き込み受付を OFF にすることはない（test_output の OFF 連動のみ維持、
+  T15-3）。書き込み可否は per-tag `writable` と API キーの `write` スコープが担う
+  （tag-server-design.md §6-6）。
+  - （履歴、2026-09-09 #340 で撤回）`CollectionController` が `Arc<WriteControl>` を
+    保持し、全遷移（start/stop/mode 切替）の先頭で `write_control.disable()` を
+    呼んでいた（§7 step2 相当）。`WriteControl` は薄い AtomicBool のまま
+    （relay-wright arming との同型、P5）。
+- **write_control は再起動を跨いで永続値をそのまま復元する**（2026-09-09
+  オーナー決定 #340）。
+  - （履歴、2026-09-09 #340 で撤回）自動復元しない（plan §7）: SIM→configured
+    復帰や start 成功で write を自動 ON にしない、運転開始後の書き込みは管理画面
+    から明示的に再度 enable する運用、としていた。
+- **no-spawn-while-stopped は write_control とは独立に維持される**: gate5
+  （write_enabled）は gate8（`write_broker_handle`→`ensure_connection` spawn）より
+  前（write_path.rs:295-308）という順序自体は変わっていないが、停止中の書き込みを
+  実際に止めているのは `execute_write` 冒頭の `CollectionNotRunning` ゲート
+  （write_control とは独立）と gate 8 の no-spawn peek（T15-4）であり、write_control
+  の自動 OFF には依存しない。write_path 自体は無改修。
+  - （履歴、2026-09-09 #340 で撤回）遷移で write_control を OFF にし自動復元しない
+    ことで「停止中の書き込みは gate5 で弾かれ spawn に到達しない」としていた。
 - もう一つの spawn 経路 `sync_slmp_sessions`（hub.rs:1009-1048、enabled+slmp へ無条件 ensure）は
-  D3 で `apply_run`（開始時のみ）へ移るため、**停止中は走らず spawn しない**。
+  D3 で `apply_run`（開始時のみ）へ移るため、**停止中は走らず spawn しない**（変更なし）。
 - SIM 中に「既存 SIM セッションへの書き込みのみ許可し新規 spawn しない」ための HubSessions の
-  write 可能 peek API（spawn 無し）は **T15 の write-during-SIM で追加**する（T14 では停止時ゲートで十分）。
+  write 可能 peek API（spawn 無し）は **T15 の write-during-SIM で追加**する（T14 では停止時ゲートで十分、変更なし）。
 
 ## 9. D7 — 常駐タスクのライフサイクル（P6）
 
@@ -376,7 +396,10 @@ impl SessionDirectory {
 controller の stop / mode 切替は次の順で実行する（plan §7 を本設計の API へ具体化）:
 
 1. `transition` ロックで直列化し、`Stopping` を公開（`status_tx`）。
-2. `write_control.disable()`（自動復元しない）。
+2. `test_output.disable()`（T15-3、現在の run コンテキスト限定のテスト出力を無効化）。
+   （履歴、2026-09-09 #340 で撤回）以前はここで `write_control.disable()`（自動復元しない）を
+   呼んでいた。現行は write_control を停止シーケンスで触らない
+   （tag-server-design.md §6-6、controller.rs は write_control 自体を持たない）。
 3. 値消費・外部 publish を停止/停止状態へ: MQTT は running watch で自然に停止側へ、gRPC 値 stream は
    （T15 で SIM 対応時に能動終了、T14 では収集停止に伴い Bad 化）。
 4. `Collector::stop()` で収集タスク停止 + tstore flush（collector.rs:577）。

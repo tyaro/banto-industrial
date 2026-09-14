@@ -565,13 +565,12 @@ impl HubRuntime {
         let write_audit = WriteAuditService::new(pool.clone());
 
         // T3 (docs/tag-server-design.md §5.3): construct stopped, then
-        // apply the persisted settings - same "constructed disabled, then
-        // explicitly brought up" shape as `WriteControl` above, but here
-        // `enabled` itself (not just a display-only history flag) comes
-        // straight from settings - MQTT publish has no "restart always
-        // disables" safety rule like the write path does (design has no
-        // such requirement for T3; publishing is read-only against the tag
-        // space).
+        // apply the persisted settings - `enabled` comes straight from
+        // settings (`SettingsService::mqtt_config`, applied a few lines
+        // below), read fresh on every startup. MQTT publish has no
+        // "restart always disables" safety rule like the write path does
+        // (design has no such requirement for T3; publishing is read-only
+        // against the tag space).
         let mqtt = Arc::new(MqttPublisher::new_with_controller(
             manager.clone(),
             controller.clone(),

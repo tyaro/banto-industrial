@@ -1600,6 +1600,51 @@ async fn rest_enable_disable_round_trip_and_reflects_in_status() {
     assert_eq!(json["write_enabled"], false);
 }
 
+/// #340 レビュー対応（2026-09-14）: `enabled_persisted` が次回起動時の
+/// ライブ値そのものになったため、enable は永続化に成功したときだけ
+/// ライブフラグを立てる。DB プールを閉じて `persist_enabled` を強制失敗
+/// させ、500 `write_control_persist_failed` を返しつつライブフラグは
+/// disabled のままであることを確認する（ハンドラが panic しないことも
+/// 同時に確認する - 監査書き込みも同じ理由で失敗するため）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rest_enable_returns_500_and_stays_disabled_when_persistence_fails() {
+    let app = test_app("write-control-persist-fail-enable").await;
+    assert!(!app.write_control.is_enabled());
+
+    app.pool.close().await;
+
+    let (status, body) =
+        admin_post_empty(&app.router, "/api/write-control/enable", &app.admin_token).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body:?}");
+    assert_eq!(body["error"], "write_control_persist_failed");
+    assert!(
+        !app.write_control.is_enabled(),
+        "enable must not flip the live flag when persistence fails"
+    );
+}
+
+/// #340 レビュー対応（2026-09-14）: disable（非常停止）はライブフラグを
+/// 先に落とすため、永続化が失敗しても書き込みは止まったままになる -
+/// 500 `write_control_persist_failed` を返しつつライブフラグは disabled
+/// （止まっている）ことを確認する。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rest_disable_returns_500_but_stays_disabled_when_persistence_fails() {
+    let app = test_app("write-control-persist-fail-disable").await;
+    app.write_control.enable();
+    assert!(app.write_control.is_enabled());
+
+    app.pool.close().await;
+
+    let (status, body) =
+        admin_post_empty(&app.router, "/api/write-control/disable", &app.admin_token).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body:?}");
+    assert_eq!(body["error"], "write_control_persist_failed");
+    assert!(
+        !app.write_control.is_enabled(),
+        "disable must fail closed (live flag stays off) even when persistence fails"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // T20 ①a (docs/banto-hub-t20-design.md §3.1, 案A): 文字列タグへの単票書き込み
 // (`POST /api/v1/values/{tag}`)。`make_tag`/`tag_input`(数値/bit 専用)とは別

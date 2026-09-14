@@ -1307,27 +1307,71 @@ struct WriteControlStatusResponse {
     write_was_enabled_before_restart: bool,
 }
 
+/// #340 レビュー対応（2026-09-14）: `enabled_persisted` は次回起動時の
+/// ライブ値そのものとして復元されるようになったため（`WriteControl` の
+/// モジュール doc comment参照）、永続化の失敗を握りつぶして 200 を返すと
+/// 「今は効いているが再起動すると黙って元に戻る」状態を作ってしまう。
+/// disable/enable で非対称に扱う:
+/// - **disable（非常停止）**: 先にライブフラグを `disable()` する(DB 障害
+///   があっても書き込みは必ず即座に止まる)。永続化が失敗しても無効化
+///   そのものは成功しているので、その旨を含めた 500 を返す。
+/// - **enable**: 先に `persist_enabled(true)` を試す。失敗したらライブ
+///   フラグには触れない(disabled のまま)。永続化が確認できてから
+///   `enable()` する。
+///
+/// どちらの分岐でも監査ログは成功/失敗の両方を記録する(失敗時は
+/// `detail.persisted = false` + `detail.error`)。`ServerEvent::ResourceChanged`
+/// はライブ状態が実際に変わった場合にのみ送る。
 async fn write_control_set(
     state: &WriteControlAdminState,
     headers: &HeaderMap,
     enabled: bool,
     action: &str,
-) -> Json<WriteControlStatusResponse> {
+) -> Response {
+    let identity = actor_identity(headers, &state.auth, &state.commissioning);
+    let actor_id = identity.as_ref().map(|i| i.id.as_str());
+
     if enabled {
+        if let Err(err) =
+            crate::write_control::persist_enabled(&state.manager.pool(), true, actor_id).await
+        {
+            record_write_control_failure(
+                &state.audit,
+                &state.auth,
+                &state.commissioning,
+                headers,
+                action,
+                true,
+                err.to_string(),
+            )
+            .await;
+            return write_control_persist_failed_response(
+                "永続化に失敗したため有効化しませんでした。",
+            );
+        }
         state.write_control.enable();
     } else {
         state.write_control.disable();
-    }
-
-    let identity = actor_identity(headers, &state.auth, &state.commissioning);
-    if let Err(err) = crate::write_control::persist_enabled(
-        &state.manager.pool(),
-        enabled,
-        identity.as_ref().map(|i| i.id.as_str()),
-    )
-    .await
-    {
-        eprintln!("banto-hub: 書き込み受付状態の永続化に失敗しました: {err}");
+        if let Err(err) =
+            crate::write_control::persist_enabled(&state.manager.pool(), false, actor_id).await
+        {
+            record_write_control_failure(
+                &state.audit,
+                &state.auth,
+                &state.commissioning,
+                headers,
+                action,
+                false,
+                err.to_string(),
+            )
+            .await;
+            let _ = state.events.send(ServerEvent::ResourceChanged {
+                resource: "write_control".to_string(),
+            });
+            return write_control_persist_failed_response(
+                "書き込み受付は無効化しましたが永続化に失敗したため再起動後は前回の永続値に戻ります。",
+            );
+        }
     }
 
     record_write(
@@ -1338,7 +1382,7 @@ async fn write_control_set(
         action,
         "write_control",
         "1",
-        Some(json!({ "enabled": enabled })),
+        Some(json!({ "enabled": enabled, "persisted": true })),
     )
     .await;
     let _ = state.events.send(ServerEvent::ResourceChanged {
@@ -1349,19 +1393,63 @@ async fn write_control_set(
         write_enabled: state.write_control.is_enabled(),
         write_was_enabled_before_restart: state.write_control.was_enabled_before_restart(),
     })
+    .into_response()
+}
+
+/// [`write_control_set`] の永続化失敗時の監査行 - `record_write`（成功専用、
+/// `result: "ok"` 固定）とは別に、`result: "failed"` と
+/// `detail.persisted = false` / `detail.error` を記録する。
+#[allow(clippy::too_many_arguments)]
+async fn record_write_control_failure(
+    audit: &AuditLogService,
+    auth: &AuthState,
+    commissioning: &CommissioningState,
+    headers: &HeaderMap,
+    action: &str,
+    enabled: bool,
+    error: String,
+) {
+    let identity = actor_identity(headers, auth, commissioning);
+    audit
+        .record(AuditEntry {
+            actor_username: identity.as_ref().map(|i| i.id.as_str()),
+            actor_role: identity.as_ref().map(|i| i.role.as_str()),
+            action,
+            resource: "write_control",
+            entity_id: Some("1"),
+            detail: Some(json!({ "enabled": enabled, "persisted": false, "error": error })),
+            origin: "rest",
+            result: "failed",
+        })
+        .await;
+}
+
+/// #340: `write_control_set` の永続化失敗を伝える 500。`writes_disabled`
+/// 等（このファイル上部の `*_response` 群）と同じ `{"error": ..., "message": ...}`
+/// 形の ad hoc JSON - `WriteControlStatusResponse` の `kind` タグ付き
+/// `BantoError`/`ApiError` 系とは別の、この機能専用の安定した機械可読コード。
+fn write_control_persist_failed_response(message: &str) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": "write_control_persist_failed",
+            "message": message
+        })),
+    )
+        .into_response()
 }
 
 async fn write_control_enable(
     State(state): State<WriteControlAdminState>,
     headers: HeaderMap,
-) -> Json<WriteControlStatusResponse> {
+) -> Response {
     write_control_set(&state, &headers, true, "enable").await
 }
 
 async fn write_control_disable(
     State(state): State<WriteControlAdminState>,
     headers: HeaderMap,
-) -> Json<WriteControlStatusResponse> {
+) -> Response {
     write_control_set(&state, &headers, false, "disable").await
 }
 

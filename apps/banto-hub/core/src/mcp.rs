@@ -3226,19 +3226,31 @@ async fn tool_set_write_control(
         .and_then(Value::as_bool)
         .ok_or_else(|| RpcError::invalid_params("arguments.enabled (boolean) is required"))?;
 
-    // `crate::rest::write_control_set`と全く同じ呼び出し（ライブフラグの
-    // 切り替え + 表示専用の永続値更新）- 永続化の失敗は REST と同じく
-    // eprintln で握って処理を続ける（`crate::write_control::persist_enabled`
-    // のdoc comment参照: 表示専用の永続値であり次回起動時のライブフラグには
-    // 影響しないため、致命的に扱う必要がない）。
+    // `crate::rest::write_control_set`と同じ非対称な扱い（#340 レビュー
+    // 対応、2026-09-14）: `enabled_persisted` は次回起動時のライブ値
+    // そのものになったため、永続化の失敗を握りつぶして成功を返すと
+    // 「今は効いているが再起動すると黙って元に戻る」状態を作ってしまう。
+    // disable（非常停止）はライブフラグを先に落としてから永続化を試み、
+    // 失敗しても無効化自体は有効（fail-closed）。enable は永続化に
+    // 成功したときだけライブフラグを立てる（失敗時は disabled のまま）。
     if enabled {
+        if let Err(err) =
+            persist_enabled(&state.manager.pool(), true, Some(ctx.name.as_str())).await
+        {
+            audit_write_control_failure(state, ctx, "enable", true, err.to_string()).await;
+            return Ok(tool_error("永続化に失敗したため有効化しませんでした。"));
+        }
         state.write_control.enable();
     } else {
         state.write_control.disable();
-    }
-    if let Err(err) = persist_enabled(&state.manager.pool(), enabled, Some(ctx.name.as_str())).await
-    {
-        eprintln!("banto-hub: 書き込み受付状態の永続化に失敗しました(MCP): {err}");
+        if let Err(err) =
+            persist_enabled(&state.manager.pool(), false, Some(ctx.name.as_str())).await
+        {
+            audit_write_control_failure(state, ctx, "disable", false, err.to_string()).await;
+            return Ok(tool_error(
+                "書き込み受付は無効化しましたが永続化に失敗したため再起動後は前回の永続値に戻ります。",
+            ));
+        }
     }
 
     audit_config_action(
@@ -3247,12 +3259,38 @@ async fn tool_set_write_control(
         if enabled { "enable" } else { "disable" },
         "write_control",
         Some("1"),
-        Some(json!({ "writeEnabled": enabled })),
+        Some(json!({ "writeEnabled": enabled, "persisted": true })),
     )
     .await;
     Ok(tool_ok(
         json!({ "writeEnabled": state.write_control.is_enabled() }),
     ))
+}
+
+/// [`tool_set_write_control`] の永続化失敗時の監査行 - [`audit_config_action`]
+/// （成功専用、`result: "ok"` 固定）とは別に、`result: "failed"` と
+/// `detail.persisted = false` / `detail.error` を記録する
+/// （`crate::rest::record_write_control_failure` と同じ形）。
+async fn audit_write_control_failure(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    action: &str,
+    enabled: bool,
+    error: String,
+) {
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(ctx.name.as_str()),
+            actor_role: Some("api_key"),
+            action,
+            resource: "write_control",
+            entity_id: Some("1"),
+            detail: Some(json!({ "enabled": enabled, "persisted": false, "error": error })),
+            origin: "mcp",
+            result: "failed",
+        })
+        .await;
 }
 
 // --- T21 S2-b: 構成補助ツール（設定 get/set） ------------------------------
