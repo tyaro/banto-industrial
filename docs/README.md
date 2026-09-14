@@ -34,14 +34,20 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
 - **v0.2.0-alpha.8（2026-09-14、#340）**: 書き込み受付（write_enabled）の既定を「可」に変更し、
   プロセス再起動・収集の開始/停止/モード変更での自動無効化を撤回（オーナー決定 2026-09-09）。
   トグルは運用者が手で止める非常停止スイッチに徹する。詳細は
-  [tag-server-design.md](tag-server-design.md) §6-6。
+  [tag-server-design.md](tag-server-design.md) §6-6。**実機確認済み（2026-09-14、R08ENCPU）**:
+  起動直後 `writeEnabled: true`、収集開始後も変わらず enable 不要で書き込み → 読み戻し一致、
+  disable → 再起動 → 無効のまま復元、enable → 再起動 → 有効で復元。
 - **v0.2.0-alpha.9（2026-09-14、#341）**: 試運転中（未ロックダウン）は接続・グループ・タグの
   CRUD を収集中でも即時・無停止で反映し、ロックダウン後のみ pending queue + 明示適用にする
   （オーナー決定 2026-09-09 / 2026-09-14）。明示適用も収集を止めない。あわせて
   `banto_collect::Collector::apply_config` の writer 配布不具合（唯一の接続が replaced に
   なると新 writer が届かず履歴書き込みが列数不一致で全滅）を修正。詳細は
   [tag-server-design.md](tag-server-design.md) §4.3・
-  [banto-hub-operations.md](banto-hub-operations.md) §19。
+  [banto-hub-operations.md](banto-hub-operations.md) §19。**実機確認済み（2026-09-14、R08ENCPU、
+  試運転モード）**: 収集中のタグ削除・作成・作成（writable）がいずれも 200 で即時反映され、
+  `runId` 不変・既存タグは good のまま・pending 0 件・新タグは数秒で good/real。
+  `POST /api/collection/reapply` も 200・`runId` 不変。ロックダウン後の queue + 無停止適用は
+  admin ログインが要るためローカルでは未実施（CI の `chromium-locked-down` E2E と統合テストで担保）。
 - **出荷ゲート**: T5-5（実機での 72h soak 実行 + 実機最終サインオフ）のみ残（実機必須）。
 - **banto-tagclient**: **S4a完了（2026-09-01）**。読み取り専用DTO、Endpoint/Secret境界、
   stable ID resolver、REST catalog/values transport、WS wire純粋解析、bounded publish gate、認証付き

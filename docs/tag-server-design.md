@@ -580,6 +580,12 @@ T7-1）を `apps/banto-hub/core/src/hub.rs`（`CollectorManager::rebuild`、T7-2
 > 「値は見えるのに履歴が残らない」症状）。#341 で初めて本番から到達可能に
 > なった経路で、回帰テストは
 > `apps/banto-hub/core/tests/live_reconfig.rs`。
+>
+> **実機確認（2026-09-14、R08ENCPU、SLMP、試運転モード、alpha.9）**: 収集中（1s 周期）に
+> タグの削除・作成・作成（writable）を行い、いずれも 200 で即時反映・`runId` 不変・
+> 既存タグ good 維持・pending 0 件・新タグは数秒で good/real。`POST /api/collection/reapply`
+> は 200・`runId` 不変。ロックダウン後の queue + 無停止適用は CI の E2E
+> （`chromium-locked-down` プロジェクト）で確認。
 
 ## 5. 外部インターフェース設計
 
@@ -1036,6 +1042,10 @@ relay-wright の専管）。
    は撤回済み。relay-wright のアーミング（`engine/arming.rs`）は自律実行
    のリスクがあるため、従来どおり「再起動で必ず安全側」を維持する
    （banto-hub とは前提が異なるため対象外）。
+   **実機確認（2026-09-14、R08ENCPU、alpha.9）**: 起動直後 `writeEnabled: true`、収集開始後も
+   不変で enable 無しに書き込み → 読み戻し一致、disable → 再起動 → 無効復元、enable → 再起動 →
+   有効復元。
+
 7. **プロトコル整合（2026-08-05 オーナー承認、2026-09-01 #131 で解消）**:
    書き込みスタック（banto-plc-write / broker）は SLMP 専用、収集は
    Modbus のみ（I8 前）で重なりがなかったため、**I8（banto-collect の SLMP
