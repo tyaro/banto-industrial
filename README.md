@@ -224,15 +224,15 @@ banto のパッケージ/クレートの消費は **両方とも git タグ参�
 レジストリ発行は棚上げ。banto の docs/publishing.md 参照）。
 両者は別マニフェスト（`package.json`/`Cargo.toml`）で独立に追従できるが、
 **上げるときは揃えて上げる運用**とする（2026-09-01、Issue #220 — npm 側
-だけ v1.2.0 に取り残されていたのを是正した教訓）。2026-09-01 時点で両者とも
-`v1.4.0`（実際の値は各 `package.json`/`Cargo.toml` を正とする）:
+だけ v1.2.0 に取り残されていたのを是正した教訓）。2026-09-14 時点で両者とも
+`v1.5.0`（実際の値は各 `package.json`/`Cargo.toml` を正とする）:
 
 ```sh
-pnpm add "github:tyaro/banto#v1.4.0&path:packages/admin-core"
+pnpm add "github:tyaro/banto#v1.5.0&path:packages/admin-core"
 ```
 
 ```toml
-banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v1.4.0" }
+banto-core = { git = "https://github.com/tyaro/banto.git", tag = "v1.5.0" }
 ```
 
 ### `apps/banto-hub`（T系）
