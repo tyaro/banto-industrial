@@ -1334,6 +1334,12 @@ MCP からの書き込みは 503 `simulation_write_rejected`（gRPC は `UNAVAIL
   held）、`apps/banto-hub/core/src/write_path.rs`（旧ゲート4の撤去と `target`）。
   E2E は `apps/banto-hub/core/tests/t9_simulation_write.rs`。
 
+**ローカル確認（2026-09-15、alpha.11 ビルド、実機 R08ENCPU + in-process シミュレータ）**: 実機 D3002 への
+書き込みは 200 で読み戻し一致・監査 `{"target":"plc"}`。収集 Running 中に SLMP のシミュレーション接続を
+live 追加し D0 へ書き込み → 200、1.5 秒（ランプ 15 周期）後も値を保持、隣の D1 はランプ継続、監査
+`{"target":"simulator"}`。ランプ波形の生成窓は先頭 16 番地のみで、窓外の番地は常に 0（保持の観測には
+窓内の番地を使う）。
+
 ## 7. アプリ群の中でのタグサーバー — 中央レジストリ構想と移行ロードマップ
 
 **方針（2026-08-04 オーナー決定）**: タグサーバーは製品群の**タグ定義の

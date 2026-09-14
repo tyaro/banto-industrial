@@ -66,7 +66,9 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
   撤去したのは「シミュレーション中は拒否」の 1 段だけ。**wire 変更**: エラーコード
   `simulation_write_rejected` は返らなくなった。監査 `detail` に `target: simulator|plc` を記録。
   詳細は [tag-server-design.md](tag-server-design.md) §6.5、
-  [banto-hub-operations.md](banto-hub-operations.md) §4。
+  [banto-hub-operations.md](banto-hub-operations.md) §4。 **ローカル確認済み（2026-09-15、alpha.11 ビルド）**: 実機 R08ENCPU への書き込みは
+  監査 `target: plc`、収集中に live 追加した SLMP シミュレーション接続への D0 書き込みは 200 で
+  1.5 秒後も保持（隣の D1 はランプ継続）・監査 `target: simulator`。
 - **出荷ゲート**: T5-5（実機での 72h soak 実行 + 実機最終サインオフ）のみ残（実機必須）。
 - **banto-tagclient**: **S4a完了（2026-09-01）**。読み取り専用DTO、Endpoint/Secret境界、
   stable ID resolver、REST catalog/values transport、WS wire純粋解析、bounded publish gate、認証付き
