@@ -46,7 +46,6 @@
 //! 強制的に `q: "bad", v: null` を返す（欠測を隠さない）。404 になるのは
 //! catalog に定義そのものが存在しない外部名だけ。
 
-use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -105,6 +104,7 @@ use crate::sink::{
 use crate::system_info::{SystemInfoSampler, SystemInfoSnapshot};
 use crate::test_output::TestOutputControl;
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
+use crate::value_source::{effective_simulation_for_tag, value_source_for_tag};
 use crate::write_audit::{WriteAuditEntry, WriteAuditService};
 use crate::write_control::WriteControl;
 use crate::write_rate::WriteRateLimiter;
@@ -6840,104 +6840,6 @@ fn effective_simulation_for_connection(
         && runtime.state == CollectionState::Running
         && matches!(protocol, "modbus-tcp" | "slmp")
         && (configured_simulation || runtime.mode == RunMode::AllSimulation)
-}
-
-/// タグ1件の `effective_simulation`（#335、2026-09-14 オーナー決定）。
-/// PLC タグは従来どおり「有効・収集中・(simulation 設定 または
-/// AllSimulation 運転中)」。computed タグは「収集中・(AllSimulation 運転中
-/// または、式が参照する入力タグのいずれかが真にシミュレーション中)」-
-/// computed 自体は PLC 接続を持たないので、入力側の判定へ委譲する
-/// ([`effective_simulation_for_tag_inner`]の computed 分岐)。
-fn effective_simulation_for_tag(
-    entry: &TagEntry,
-    runtime: &CollectionStatus,
-    map: &TagMap,
-    computed: &ComputedEngine,
-) -> bool {
-    effective_simulation_for_tag_inner(entry, runtime, map, computed, &mut HashSet::new())
-}
-
-/// [`effective_simulation_for_tag`]の実体。computed → 入力タグの再帰を
-/// `visited` で防御する - `banto_expr::validate_dag`が登録時に循環を拒否
-/// しているので理論上到達しないが、`map`（`TagMap`スナップショット）と
-/// `computed`（`ComputedEngine`の現在の plan）は別々に読むため、rebuild の
-/// 合間に読めば理論上ずれ得る - そのずれが循環に見えても無限再帰にしない
-/// ための防御。
-fn effective_simulation_for_tag_inner(
-    entry: &TagEntry,
-    runtime: &CollectionStatus,
-    map: &TagMap,
-    computed: &ComputedEngine,
-    visited: &mut HashSet<String>,
-) -> bool {
-    match entry.tag_kind.as_str() {
-        banto_tags::PLC_TAG_KIND => {
-            entry.enabled
-                && runtime.state == CollectionState::Running
-                && (entry.simulation || runtime.mode == RunMode::AllSimulation)
-        }
-        banto_tags::COMPUTED_TAG_KIND => {
-            if runtime.state != CollectionState::Running {
-                return false;
-            }
-            if runtime.mode == RunMode::AllSimulation {
-                return true;
-            }
-            if !visited.insert(entry.external_name.clone()) {
-                return false;
-            }
-            computed
-                .referenced_tags(&entry.external_name)
-                .map(|inputs| {
-                    inputs.iter().any(|name| {
-                        map.get(name)
-                            .map(|input| {
-                                effective_simulation_for_tag_inner(
-                                    input, runtime, map, computed, visited,
-                                )
-                            })
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false)
-        }
-        _ => false,
-    }
-}
-
-/// タグ1件の `value_source`（#335、2026-09-14 オーナー決定）。computed は
-/// 既定 `"computed"` - [`effective_simulation_for_tag`]が true になる場合
-/// （AllSimulation 運転中、または入力のいずれかが真にシミュレーション中）
-/// だけ情報ラベル `"derived_simulation"` に切り替わる（隠す・抑止する意味は
-/// 持たない - 値そのものは常時返す、この関数の呼び出し元のどこにも
-/// フィルタは無い）。
-fn value_source_for_tag(
-    entry: &TagEntry,
-    runtime: &CollectionStatus,
-    map: &TagMap,
-    computed: &ComputedEngine,
-) -> &'static str {
-    match entry.tag_kind.as_str() {
-        banto_tags::PLC_TAG_KIND if effective_simulation_for_tag(entry, runtime, map, computed) => {
-            "simulation"
-        }
-        banto_tags::PLC_TAG_KIND => "real",
-        banto_tags::COMPUTED_TAG_KIND
-            if effective_simulation_for_tag(entry, runtime, map, computed) =>
-        {
-            "derived_simulation"
-        }
-        banto_tags::COMPUTED_TAG_KIND => "computed",
-        banto_tags::INTERNAL_TAG_KIND => "internal",
-        // 外部 DB 連携 §6-11（2026-09-06 オーナー決定「足す」）: 外部 DB
-        // 由来の値は実機でもシミュレーションでも内部書き込みでもないので
-        // 独自ラベルを持つ。banto-tagclient SDK は未知ラベルを
-        // `Unknown(raw)` で保持するので、旧 SDK との互換も保たれる。
-        banto_tags::DB_TAG_KIND => "db",
-        // Tag registration validates tag_kind, but keep the wire contract
-        // fail-safe if a future kind is introduced without this DTO update.
-        _ => "internal",
-    }
 }
 
 /// `GET /api/v1/tags`・管理系 `GET /api/tag-catalog`（[`admin_tag_catalog`]、

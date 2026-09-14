@@ -3,7 +3,9 @@
 作成日: 2026-08-04
 状態: **実装追従中（2026-09-15 更新: #335 - computed タグ・接続単位シミュレー
 ション値の catalog 常時公開、外部読み取り出力のシミュレーションゲート撤廃を
-§4.2 に反映。2026-09-14 更新: #341 の CRUD 契約改定を §4.3 に反映）**。
+§4.2 に反映。同日追補: MQTT ペイロードに `value_source` を追加し
+（§5.3）、判定関数を `crate::value_source` へ共有化。2026-09-14 更新:
+#341 の CRUD 契約改定を §4.3 に反映）**。
 起案時は設計先行だったが、
 apps/banto-hub として実装が進行 — T0〜T21 実装済み（T19 UX 群・T20 文字列/構造体/レシピ/ビット・T21 構成補助 MCP 管理面まで完了、詳細は下の 2026-09-06 更新）・残 T18-5c/d
 （Windows 実機往復・72h soak）と P3-b の残件（SLMP CPU 種別/アクセスルート露出、
@@ -702,7 +704,12 @@ axum の `ws` アップグレードで `/api/v1/stream`。メッセージは JSO
 クライアントモードのみ。組み込みは §10-4 の判断待ち。
 
 - トピック: `{prefix}/{connection}/{group}/{tag}`（prefix 既定 `banto`、設定可）
-- ペイロード: `{"v": 25.4, "q": "good", "t": 1722758400100}`（WebSocket と同形）
+- ペイロード: `{"v": 25.4, "q": "good", "t": 1722758400100, "value_source": "real"}`
+  （`v`/`q`/`t` は WebSocket と同形。`value_source` は2026-09-15 オーナー
+  追補・#335 で追加した新規フィールド - REST/WS/gRPC と同じ
+  `crate::value_source::value_source_for_tag` を共有し、既知値は
+  §4.2 のとおり real / simulation / computed / derived_simulation /
+  internal / db。JSON への追加フィールドのみで既存の購読者は無視できる）
 - 発行モード: タグ毎に `on_change` / `interval` を設定（既定 on_change、
   最短発行間隔でスロットル）。retain 有効（新規購読者が即座に最終値を得る）
 - QoS: 既定 1。設定で 0/1 切り替え（2 は使わない）

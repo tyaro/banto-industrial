@@ -94,10 +94,11 @@ use tokio::time::MissedTickBehavior;
 
 use banto_collect::Quality;
 
-use crate::controller::{CollectionController, CollectionState, CollectionStatus};
+use crate::controller::{CollectionController, CollectionState, CollectionStatus, RunMode};
 use crate::hub::{quality_str, read_current, CollectorManager, TagEntry};
 use crate::settings::MqttSettings;
 use crate::test_output::TestOutputControl;
+use crate::value_source::value_source_for_tag;
 
 /// 評価タイマの固定周期 - `crate::stream::EVAL_TICK_MS` と同じ値・同じ理由
 /// （このモジュールの doc comment「タスク構成」参照）。
@@ -126,17 +127,21 @@ const STATE_TOPIC_SUFFIX: &str = "$state";
 const ONLINE_PAYLOAD: &str = "online";
 const OFFLINE_PAYLOAD: &str = "offline";
 
-/// `{"v": ..., "q": ..., "t": ...}`（設計 §5.3「ペイロード...WebSocket と
-/// 同形」）- `crate::stream::ValueWire`/`crate::rest::ValueEntry` と同じ
-/// 3フィールドをこのモジュール専用に持つ（型を共有すると `serde` の
-/// 派生機能やフィールド名の意味が3モジュールで結合してしまうため、ワイヤ
-/// 形式が同じでも型は independently に定義する - 各モジュールの既存の
-/// 流儀を踏襲）。
+/// `{"v": ..., "q": ..., "t": ..., "value_source": ...}`（設計 §5.3
+/// 「ペイロード...WebSocket と同形」）- `crate::stream::ValueWire`/
+/// `crate::rest::ValueEntry` と同じフィールドをこのモジュール専用に持つ
+/// （型を共有すると `serde` の派生機能やフィールド名の意味が3モジュールで
+/// 結合してしまうため、ワイヤ形式が同じでも型は independently に定義する -
+/// 各モジュールの既存の流儀を踏襲）。`value_source`は2026-09-15 オーナー
+/// 追補（#335、「クライアントは value_source で判別する」契約を MQTT にも
+/// 揃える）で追加した新規フィールド - 既存の購読者は無視できる追加のみ
+/// （JSON の後方互換）。
 #[derive(Debug, Serialize)]
 struct ValuePayload {
     v: Option<f64>,
     q: &'static str,
     t: i64,
+    value_source: &'static str,
 }
 
 fn qos_from_setting(qos: u8) -> QoS {
@@ -188,11 +193,18 @@ impl PublishTarget {
         true
     }
 
-    fn payload_bytes(&self, value: Option<f64>, quality: Quality, ts_ms: i64) -> Vec<u8> {
+    fn payload_bytes(
+        &self,
+        value: Option<f64>,
+        quality: Quality,
+        ts_ms: i64,
+        value_source: &'static str,
+    ) -> Vec<u8> {
         serde_json::to_vec(&ValuePayload {
             v: value,
             q: quality_str(quality),
             t: ts_ms,
+            value_source,
         })
         .expect("ValuePayload は常にシリアライズ可能")
     }
@@ -204,8 +216,8 @@ impl PublishTarget {
 /// （発行しない）。`Running`なら`mode`（`Configured`/`AllSimulation`）を
 /// 問わず常に`Some`（2026-09-15 オーナー決定: 外部への読み取り出力は
 /// シミュレーションでゲートしない）。`test_output`は wire/呼び出し元
-/// 互換のため引数として残すが、もう判定に使わない（deprecated - 呼び出し元
-/// [`current_target`]・[`run_eval_loop`]のフィールド doc comment参照）。
+/// 互換のため引数として残すが、もう判定に使わない（deprecated -
+/// [`current_status`]・[`run_eval_loop`]のフィールド doc comment参照）。
 fn eval_target(
     status: &CollectionStatus,
     _test_output: Option<&TestOutputControl>,
@@ -215,15 +227,28 @@ fn eval_target(
 
 /// [`eval_target`]の`runtime_rx`有無の分岐をまとめる - コントローラを
 /// 注入していない互換パス（`MqttPublisher::new`、レガシー呼び出し元・
-/// 一部テスト）は常に[`PublishTarget`]（従来どおり revision 変化だけで
-/// 動く - このモジュールの doc comment「タスク構成」参照）。
-fn current_target(
-    runtime_rx: Option<&watch::Receiver<CollectionStatus>>,
-    test_output: Option<&TestOutputControl>,
-) -> Option<PublishTarget> {
+/// 一部テスト）は常に`Running`+`Configured`を仮定する（このモジュールの
+/// doc comment「タスク構成」参照。`eval_target`に渡せば常に`Some`になる、
+/// という従来の`current_target`の判断と同値）。`crate::value_source`の
+/// `value_source_for_tag`が使う `CollectionStatus` はこの関数が返すものと
+/// 同一- 呼び出し元（[`run_eval_loop`]）は1 tick / 1 イベントにつき1回だけ
+/// ここを呼び、その tick 内の[`eval_target`]判定と全タグの payload 算出の
+/// 両方へ使い回す（タグごとに取り直さない）。接続単位の simulation は
+/// `TagEntry::simulation`側で判定されるため、`runtime_rx`が無いときの
+/// `Configured`固定でも connection-level simulation の
+/// `value_source: "simulation"`判定は正しく機能する - `AllSimulation`相当の
+/// グローバル上書きだけがこの互換パスでは表現できない。
+fn current_status(runtime_rx: Option<&watch::Receiver<CollectionStatus>>) -> CollectionStatus {
     match runtime_rx {
-        Some(receiver) => eval_target(&receiver.borrow(), test_output),
-        None => Some(PublishTarget),
+        Some(receiver) => receiver.borrow().clone(),
+        None => CollectionStatus {
+            state: CollectionState::Running,
+            mode: RunMode::Configured,
+            run_id: None,
+            last_error: None,
+            configured_revision: 0,
+            running_revision: 0,
+        },
     }
 }
 
@@ -468,7 +493,8 @@ async fn run_eval_loop(
     loop {
         tokio::select! {
             _ = tick.tick() => {
-                match current_target(runtime_rx.as_ref(), test_output.as_deref()) {
+                let status = current_status(runtime_rx.as_ref());
+                match eval_target(&status, test_output.as_deref()) {
                     None => {
                         last.clear();
                         last_active_target = None;
@@ -477,9 +503,9 @@ async fn run_eval_loop(
                         if last_active_target != Some(target) {
                             last.clear();
                             last_active_target = Some(target);
-                            publish_all(&manager, &client, target, &prefix, qos, &mut last).await;
+                            publish_all(&manager, &client, target, &status, &prefix, qos, &mut last).await;
                         } else {
-                            publish_changed(&manager, &client, target, &prefix, qos, min_interval_ms, &mut last).await;
+                            publish_changed(&manager, &client, target, &status, &prefix, qos, min_interval_ms, &mut last).await;
                         }
                     }
                 }
@@ -492,7 +518,8 @@ async fn run_eval_loop(
             } => {
                 let Ok(running_notification) = changed else { break; };
                 if running_notification {
-                    match current_target(runtime_rx.as_ref(), test_output.as_deref()) {
+                    let status = current_status(runtime_rx.as_ref());
+                    match eval_target(&status, test_output.as_deref()) {
                         None => {
                             last.clear();
                             last_active_target = None;
@@ -500,14 +527,15 @@ async fn run_eval_loop(
                         Some(target) if last_active_target != Some(target) => {
                             last.clear();
                             last_active_target = Some(target);
-                            publish_all(&manager, &client, target, &prefix, qos, &mut last).await;
+                            publish_all(&manager, &client, target, &status, &prefix, qos, &mut last).await;
                         }
                         Some(_) => {}
                     }
                 } else {
                     // Compatibility path for test/legacy callers that do not
                     // inject a lifecycle controller.
-                    publish_all(&manager, &client, PublishTarget, &prefix, qos, &mut last).await;
+                    let status = current_status(None);
+                    publish_all(&manager, &client, PublishTarget, &status, &prefix, qos, &mut last).await;
                 }
             }
             signal = resync_rx.recv() => {
@@ -516,14 +544,15 @@ async fn run_eval_loop(
                     // このタスクも畳む。
                     break;
                 }
-                match current_target(runtime_rx.as_ref(), test_output.as_deref()) {
+                let status = current_status(runtime_rx.as_ref());
+                match eval_target(&status, test_output.as_deref()) {
                     None => {
                         last.clear();
                         last_active_target = None;
                     }
                     Some(target) => {
                         last_active_target = Some(target);
-                        publish_all(&manager, &client, target, &prefix, qos, &mut last).await;
+                        publish_all(&manager, &client, target, &status, &prefix, qos, &mut last).await;
                     }
                 }
             }
@@ -537,17 +566,23 @@ async fn run_eval_loop(
 /// スロットル抑止中のタグは`last`を更新しない（発行できていないので直近の
 /// 発行状態は変わっていない）- 次の tick でも現在値と`last`を比較し続け、
 /// スロットル窓が明けた最初の tick でその時点の最新値を送る（設計
-/// §5.3「抑止された最新値はスロットル明け最初の tick で発行」）。
+/// §5.3「抑止された最新値はスロットル明け最初の tick で発行」）。`runtime`
+/// は呼び出し元（[`current_status`]）が1 tick につき1回だけ取得したものを
+/// 受け取る - タグごとに取り直さない（[`current_status`]のdoc comment
+/// 参照）。
+#[allow(clippy::too_many_arguments)]
 async fn publish_changed(
     manager: &CollectorManager,
     client: &AsyncClient,
     target: PublishTarget,
+    runtime: &CollectionStatus,
     prefix: &str,
     qos: QoS,
     min_interval_ms: i64,
     last: &mut HashMap<String, PublishedState>,
 ) {
     let map = manager.tag_map();
+    let computed = manager.computed_engine();
     let now_ms = manager.clock().now_ms();
     let current = manager.current_values();
     let server_store = manager.server_store();
@@ -570,12 +605,13 @@ async fn publish_changed(
             continue;
         }
 
+        let value_source = value_source_for_tag(entry, runtime, &map, &computed);
         publish_one(
             client,
             target.topic(prefix, entry),
             qos,
             target.retain(),
-            target.payload_bytes(value, quality, ts_ms),
+            target.payload_bytes(value, quality, ts_ms, value_source),
         )
         .await;
         last.insert(
@@ -595,28 +631,33 @@ async fn publish_changed(
 /// タグ（`TagEntry::enabled == false`）も含めて全件発行する -
 /// `effective_sample`が`(None, Quality::Bad, ...)`を返すので、REST/WS と
 /// 同じ「欠測を隠さない」規律のまま`q: "bad"`が飛ぶ（`hub.rs`の
-/// `effective_sample`doc comment参照）。
+/// `effective_sample`doc comment参照）。`runtime`は[`publish_changed`]と
+/// 同じ規律 - 呼び出し元が1回だけ取得したものを受け取る。
+#[allow(clippy::too_many_arguments)]
 async fn publish_all(
     manager: &CollectorManager,
     client: &AsyncClient,
     target: PublishTarget,
+    runtime: &CollectionStatus,
     prefix: &str,
     qos: QoS,
     last: &mut HashMap<String, PublishedState>,
 ) {
     let map = manager.tag_map();
+    let computed = manager.computed_engine();
     let now_ms = manager.clock().now_ms();
     let current = manager.current_values();
     let server_store = manager.server_store();
 
     for entry in map.iter() {
         let (value, quality, ts_ms) = read_current(entry, current.as_ref(), &server_store, now_ms);
+        let value_source = value_source_for_tag(entry, runtime, &map, &computed);
         publish_one(
             client,
             target.topic(prefix, entry),
             qos,
             target.retain(),
-            target.payload_bytes(value, quality, ts_ms),
+            target.payload_bytes(value, quality, ts_ms, value_source),
         )
         .await;
         last.insert(
@@ -695,12 +736,15 @@ mod tests {
 
     /// 2026-09-15 オーナー決定: payload に`simulation`/`run_id`が混入する
     /// 経路はもう無い（旧`Test`列挙子・`TestOutputPayload`は撤去済み）。
+    /// 代わりに`value_source`（同オーナー追補、「クライアントは
+    /// value_source で判別する」契約を MQTT にも揃える）がそのまま乗る。
     #[test]
-    fn publish_target_payload_has_no_simulation_fields() {
-        let bytes = PublishTarget.payload_bytes(Some(1.5), Quality::Good, 1000);
+    fn publish_target_payload_carries_value_source_and_no_simulation_fields() {
+        let bytes = PublishTarget.payload_bytes(Some(1.5), Quality::Good, 1000, "simulation");
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(json["v"], 1.5);
         assert_eq!(json["q"], "good");
+        assert_eq!(json["value_source"], "simulation");
         assert!(json.get("simulation").is_none());
         assert!(json.get("run_id").is_none());
     }

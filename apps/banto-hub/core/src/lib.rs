@@ -209,6 +209,10 @@ pub mod test_output;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod users;
+/// #335（2026-09-15 追補）: `value_source_for_tag`/`effective_simulation_for_tag`
+/// を `crate::rest` と `crate::mqtt` が共有するための crate 内限定モジュール
+/// （`pub(crate) mod`）。
+pub(crate) mod value_source;
 pub mod write_audit;
 pub mod write_control;
 pub mod write_path;

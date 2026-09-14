@@ -33,6 +33,7 @@ use axum::body::Body;
 use axum::http::{Request as HttpRequest, StatusCode};
 use axum::Router;
 use banto_collect::{BackoffConfig, CollectorOptions};
+use banto_core::ListParams;
 use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::{HubSessions, SlmpSimRegistry};
@@ -54,7 +55,7 @@ use banto_plc::modbus::simulator::Simulator;
 use banto_server::{AuthState, Identity};
 use banto_tags::{
     CollectionGroupInput, CollectionGroupService, PlcConnectionInput, PlcConnectionService,
-    TagInput, TagService,
+    TagInput, TagService, CALC_CONNECTION_NAME, VIRTUAL_PROTOCOL,
 };
 use banto_tstore::SystemClock;
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS};
@@ -1291,6 +1292,148 @@ async fn mqtt_publishing_is_unaffected_by_test_output_enable_disable_or_collecti
         })
         .await,
         "the normal topic should keep publishing after a stop/restart cycle, unaffected by test_output"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// MQTT ペイロードの value_source（#335、2026-09-15 オーナー追補）
+// ---------------------------------------------------------------------------
+
+/// 「クライアントは value_source で判別する」という #335 の契約を MQTT にも
+/// 揃える回帰確認: Configured 運転中は実機タグ(plc)が `"real"`・演算タグが
+/// `"computed"`、AllSimulation 運転中は実機タグが `"simulation"` になる
+/// （`crate::value_source::value_source_for_tag`を`crate::rest`と共有）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mqtt_payload_carries_value_source_across_run_modes() {
+    let broker_port = start_test_broker().await;
+    let app = test_output_test_app("mqtt-value-source").await;
+
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(conn_input("line1", 1))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group.id, "40001", "i16"))
+        .await
+        .unwrap();
+
+    // 演算タグ用の予約接続(calc) - 本番は`bin/banto-hub.rs::ensure_virtual_connection`
+    // が起動時に自動投入する（`tests/computed.rs`と同じ判断でここでは直接
+    // 投入する）。
+    PlcConnectionService::new(app.pool.clone())
+        .create(PlcConnectionInput {
+            name: CALC_CONNECTION_NAME.to_string(),
+            protocol: VIRTUAL_PROTOCOL.to_string(),
+            host: String::new(),
+            port: 0,
+            unit_id: 1,
+            enabled: true,
+            simulation: false,
+            word_order: "low_high".to_string(),
+            database: None,
+            username: None,
+            password: None,
+        })
+        .await
+        .unwrap();
+    let calc_id = PlcConnectionService::new(app.pool.clone())
+        .list(ListParams::default())
+        .await
+        .unwrap()
+        .rows
+        .into_iter()
+        .find(|c| c.name == CALC_CONNECTION_NAME)
+        .expect("calc connection should have been provisioned")
+        .id;
+    let calc_group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("x", calc_id, 1_000))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(TagInput {
+            name: "avg".to_string(),
+            collection_group_id: calc_group.id,
+            address: String::new(),
+            data_type: "f32".to_string(),
+            string_length: None,
+            string_encoding: "utf8".to_string(),
+            raw_lo: None,
+            raw_hi: None,
+            eng_lo: None,
+            eng_hi: None,
+            unit: None,
+            decimals: 2,
+            threshold_h: None,
+            threshold_hh: None,
+            threshold_l: None,
+            threshold_ll: None,
+            enabled: true,
+            writable: false,
+            tag_kind: "computed".to_string(),
+            expression: Some("line1.fast.temp01 * 1".to_string()),
+            retain: false,
+            expected_revision: None,
+        })
+        .await
+        .unwrap();
+
+    app.manager.rebuild().await.expect("rebuild after seeding");
+
+    let (status, _) = put_mqtt_settings(
+        &app.router,
+        &app.token,
+        broker_port,
+        "hub-value-source",
+        0,
+        true,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let run_status = app.controller.start(RunMode::Configured).await;
+    assert_eq!(run_status.state, CollectionState::Running);
+    assert!(
+        wait_until(Duration::from_secs(6), || async {
+            status_mqtt_connected(&app.router, &app.token).await
+        })
+        .await
+    );
+
+    let live = LiveSubscriber::subscribe(broker_port, "sub-value-source", "banto/#").await;
+    let real_topic = "banto/line1/fast/temp01";
+    let computed_topic = "banto/calc/x/avg";
+
+    assert!(
+        wait_until(Duration::from_secs(6), || async {
+            let messages = live.snapshot().await;
+            payload_json(&messages, real_topic).is_some()
+                && payload_json(&messages, computed_topic).is_some()
+        })
+        .await,
+        "both the plc and computed topics should publish while Configured"
+    );
+    let messages = live.snapshot().await;
+    let real_payload = payload_json(&messages, real_topic).expect("real payload");
+    assert_eq!(real_payload["value_source"], "real");
+    let computed_payload = payload_json(&messages, computed_topic).expect("computed payload");
+    assert_eq!(computed_payload["value_source"], "computed");
+
+    // --- AllSimulation: 実機タグの value_source が simulation へ切り替わる ---
+    let sim_status = app.controller.start(RunMode::AllSimulation).await;
+    assert_eq!(sim_status.mode, RunMode::AllSimulation);
+
+    assert!(
+        wait_until(Duration::from_secs(6), || async {
+            payload_json(&live.snapshot().await, real_topic)
+                .map(|payload| payload["value_source"] == "simulation")
+                .unwrap_or(false)
+        })
+        .await,
+        "the plc tag's topic should report value_source=simulation during all-simulation"
     );
 }
 

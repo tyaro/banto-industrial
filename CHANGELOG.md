@@ -25,6 +25,7 @@ API キー経由の catalog/REST から computed タグとシミュレーショ�
   - MQTT（`mqtt.rs`）: `eval_target` の「AllSimulation 中は test_output が有効なときだけ publish」ゲートを撤去し、run mode によらず通常トピックへ publish する。テスト出力専用トピック（`{prefix}/test/{run_id}/...`）・`TestOutputPayload`・`PublishTarget::Test` は撤去した。
   - 書き込み経路（`POST /api/v1/values/{tag}`・gRPC `WriteValue`・MCP）の simulation 判定は変更していない - 今回の決定は読み取り出力のみが対象。
 - `test_output`（T15-3）の制御プレーン自体（`TestOutputControl`、`POST /api/test-output/{enable,disable}`、`GET /api/v1/status` の `test_output` 表示、UI トグル）は今回は残すが、どの出力経路も参照しなくなったため **deprecated**（効果なし）。撤去は後続 issue で行う。
+- **MQTT ペイロードに `value_source` を追加**（JSON への追加フィールド、既存購読者は無視可）。`value_source_for_tag`/`effective_simulation_for_tag` を `crate::value_source`（`apps/banto-hub/core/src/value_source.rs`）へ共有モジュール化し、REST と MQTT の両方から同じ判定を使う。
 
 ### 既知の制限（アルファ）
 
