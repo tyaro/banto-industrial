@@ -975,7 +975,7 @@ fn tool_definitions() -> Vec<Value> {
         // delete 系の不可逆操作限定）。
         json!({
             "name": "set_collection",
-            "description": "収集を開始/停止する(admin スコープ必須)。start は実機収集(configured モード)を開始する。既知の運用癖: 収集開始は write_enabled を False にリセットするため、書き込みを行うなら開始後に set_write_control で改めて有効化すること。",
+            "description": "収集を開始/停止する(admin スコープ必須)。start は実機収集(configured モード)を開始する。書き込み受付(write_enabled)は既定で有効で、収集の開始/停止では変わらない(#340)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -991,7 +991,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "set_write_control",
-            "description": "書き込み受付の有効/無効を切り替える(admin スコープ必須)。収集開始は write_enabled を False にリセットするため、収集開始直後に書き込みを行うにはこのツールで改めて enabled:true にする必要がある。",
+            "description": "書き込み受付の有効/無効を切り替える(admin スコープ必須)。write_enabled は既定で有効で、プロセス再起動や収集の開始/停止では変わらない(#340)。無効化は運用者が書き込みを止めるための非常停止用で、無効なら enabled:true で再度有効化する。",
             "inputSchema": {
                 "type": "object",
                 "properties": {

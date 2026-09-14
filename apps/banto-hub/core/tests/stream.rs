@@ -234,7 +234,6 @@ async fn test_app_with_lock(label: &str, locked_down: bool) -> TestApp {
     let test_output = std::sync::Arc::new(banto_hub_core::test_output::TestOutputControl::new());
     let controller = std::sync::Arc::new(CollectionController::new(
         manager.clone(),
-        write_control.clone(),
         test_output.clone(),
     ));
     let status = controller.start(RunMode::Configured).await;

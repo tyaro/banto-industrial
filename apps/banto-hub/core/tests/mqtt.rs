@@ -540,7 +540,6 @@ async fn test_output_test_app(label: &str) -> TestOutputTestApp {
     let test_output = Arc::new(TestOutputControl::new());
     let controller = Arc::new(CollectionController::new(
         manager.clone(),
-        write_control.clone(),
         test_output.clone(),
     ));
     let write_audit = WriteAuditService::new(pool.clone());

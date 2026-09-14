@@ -9,8 +9,10 @@
 （`banto-hub-desktop-plan.md` 冒頭「T14・T15 完了」。`runtime.rs`(T14-1)、
 `controller.rs`(T14-2)、`hub.rs` の `commit_catalog`/`apply_run`/
 `configured_revision`/`running_revision`(T14-3)、`rest.rs` の admin 制御 API +
-運転中編集の 409/queue 化(T14-4) を実コードで確認）。
-最終検証日(コード照合): 2026-08-12
+運転中編集の 409/queue 化(T14-4) を実コードで確認）。D6（§8）の
+「書き込み受付 OFF 連動」は 2026-09-09 オーナー決定（#340）で撤回済み
+（詳細は §8 の注記・tag-server-design.md §6-6）。
+最終検証日(コード照合): 2026-09-14
 基準コミット: `7a6fb40`（main）
 
 関連: [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)（§4 状態モデル / §5 共通
@@ -162,7 +164,7 @@ struct CollectionController {
   「遷移中なら即座に現在状態を返す」形で実装する。
 - **run_id**: `run_seq` の `fetch_add` で採番（`Date`/乱数に依存しない単調 ID）。開始ごとに変わり
   再利用しない（plan §5.4）。
-- **遷移の先頭で必ず書き込み受付を OFF**（D6、§7 step2）。
+- **遷移の先頭で必ず書き込み受付を OFF**（D6、§7 step2）。（2026-09-09 オーナー決定 #340 で撤回: 書き込み受付は遷移で OFF にしない。test_output の OFF 連動は維持）
 - **`configured` ⇄ `all_simulation` の切替は必ず `stopped` を経由**（plan §4.3）。
 - **`faulted`**: start / stop / 切替の失敗で入る。実機収集を自動再開しない。診断（`last_runtime_error`）
   を残し、明示操作を待つ。特に **SCM がサービスを起動して `apply_run(Configured)` が失敗した場合は
@@ -284,6 +286,12 @@ async fn apply_run(&self, mode: RunMode) -> Result<RunReport, ConfigError>;
    これで解消 — 既存 `dry_run` は banto-tags 検証のみでアドレス parse を含まない）。
 
 ## 8. D6 — 書き込み受付 OFF 連動と no-spawn（P5）
+
+（2026-09-09 オーナー決定 #340 で撤回: 書き込み受付は遷移で OFF にしない。
+test_output の OFF 連動は維持。停止中の書き込みは本節が既に別に持っている
+`CollectionNotRunning` ゲート（`execute_write` 冒頭、write_control とは
+独立）と gate 8 の no-spawn peek（T15-4）が引き続き拒否するため、
+write_control 側の自動 OFF は安全上不要だった。）
 
 決定:
 

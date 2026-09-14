@@ -278,6 +278,7 @@ BANTO_HUB_DATA=<scratch>/hub-smoke-data
 
 - **ゲート7（レート制限）が実機で作動**した。1秒間に 10 回の書き込みで API キーが trip し、以降 403 `key_tripped`。`POST /api/api-keys/{id}/clear-trip` で解除。設計どおりの安全機構。
 - **収集を再起動すると書き込み受付が無効に戻る**（`write_was_enabled_before_restart:false`、503 `writes_disabled`）。安全側の既定として正しい。
+  → 2026-09-14 #340（v0.2.0-alpha.8）で撤回。収集開始・再起動で書き込み受付は変わらなくなった。
 - 到達不能な接続のタグは `q:"bad"`、正常な接続は `q:"good"` と正しく区別された。
 
 ### 実機運用上の注意（2026-09-01 オーナー指摘）

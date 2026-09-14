@@ -59,8 +59,9 @@
 //!   購読の状態機械・250ms 評価ループ。`hub::CollectorManager` の
 //!   `current_values`/`tag_map`/`subscribe_events`/`subscribe_revision` を
 //!   読むだけの消費者で、収集エンジンには一切書き込まない
-//! - [`write_control`]: T2-4（設計 §6-6）。書き込み受付の起動時
-//!   disabled フラグ（relay-wright の arming 同型）
+//! - [`write_control`]: T2-4（設計 §6-6）。書き込み受付フラグ - 既定で
+//!   有効、プロセス再起動では永続値を復元し、収集操作では変わらない
+//!   （非常停止スイッチ。2026-09-09 オーナー決定 #340）
 //! - [`write_rate`]: T2-4（設計 §6-4）。タグ毎 + 全体の2段書き込み
 //!   レート制限（relay-wright の rate_limiter をタグ単位に読み替え）
 //! - [`write_audit`]: T2-4（設計 §6-3）。`hub_write_audit` の

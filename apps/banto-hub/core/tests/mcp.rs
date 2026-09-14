@@ -3418,15 +3418,14 @@ async fn set_write_control_enable_and_disable_persist_and_audit() {
     );
 }
 
-/// 既知の運用癖（実装指示・`docs/mcp-real-machine-2026-09-04`メモリ参照）:
-/// `CollectionController::start`は遷移のたびに`WriteControl::disable`を
-/// 呼ぶ（`crate::controller`参照）ため、収集開始直後は書き込み受付が
-/// 強制的に無効化される。`set_collection{action:start}`の直後に
-/// `write_enabled`が`false`へ戻ること、そこから`set_write_control`で
-/// 改めて有効化できることを固定する。
+/// 2026-09-09 オーナー決定（#340、`docs/mcp-real-machine-2026-09-04`メモリの
+/// 旧記録を撤回）: `CollectionController::start`/`stop`/`set_mode` はもはや
+/// `WriteControl::disable`を呼ばない。`set_collection{action:start}`の前後
+/// で`write_enabled`が変わらないこと、明示的に`set_write_control`で無効化
+/// した場合はその値が維持されることを固定する。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn starting_collection_resets_write_enabled_and_set_write_control_re_enables_it() {
-    let app = test_app("runtime-start-resets-write-control").await;
+async fn starting_collection_does_not_change_write_enabled() {
+    let app = test_app("runtime-start-does-not-reset-write-control").await;
     let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
 
     let (status, body) = mcp_post(
@@ -3448,22 +3447,32 @@ async fn starting_collection_resets_write_enabled_and_set_write_control_re_enabl
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["result"]["isError"], false, "{body:?}");
     assert!(
-        !app.write_control.is_enabled(),
-        "collection start must reset write_enabled to false (known operational quirk)"
+        app.write_control.is_enabled(),
+        "collection start must not change write_enabled (#340)"
     );
 
     let (status, body) = mcp_post(
         &app.router,
         Some(&admin_key),
-        tools_call("set_write_control", json!({ "enabled": true })),
+        tools_call("set_write_control", json!({ "enabled": false })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["result"]["isError"], false, "{body:?}");
-    let text = body["result"]["content"][0]["text"].as_str().unwrap();
-    let payload: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(payload["writeEnabled"], true, "{payload:?}");
-    assert!(app.write_control.is_enabled());
+    assert!(!app.write_control.is_enabled());
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("set_collection", json!({ "action": "stop" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    assert!(
+        !app.write_control.is_enabled(),
+        "collection stop must not change write_enabled either (#340)"
+    );
 }
 
 // ---------------------------------------------------------------------------

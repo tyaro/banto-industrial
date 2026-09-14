@@ -113,7 +113,11 @@ TAG-UX-C の4点目を完成させた（`banto-hub-tags-revision.spec.ts` を拡
 ション」は必須ステップから外れ、任意の副次操作として維持する（§9.6・
 §9.8 を更新。接続単位のシミュレーション `PlcConnection.simulation` とは
 別物で変更なし）。あわせてタグ名の一意性を全体一意→収集グループ内一意へ
-緩和（migration `0011`、詳細は tag-server-design.md §4）。
+緩和（migration `0011`、詳細は tag-server-design.md §4）。**2026-09-14**:
+書き込み受付（write_enabled）の遷移時 OFF・自動リセット記述は 2026-09-09
+オーナー決定（#340）で撤回。既定は有効、再起動で永続値を復元、遷移では
+変えない（test_output の OFF 連動は維持）。詳細は
+[tag-server-design.md](tag-server-design.md) §6-6。
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [banto-hub-t16-design.md](banto-hub-t16-design.md)、
@@ -275,7 +279,8 @@ UI/UX 6項目は、いずれも 2026-08-09 に決定済みである。
 - 遷移は単一 controller で直列化し、多重クリック、HTTP、トレイ操作の競合を
   防ぐ。
 - 遷移中は新しい開始・停止要求を重ねず、現在状態を返す冪等 API とする。
-- どの遷移でも最初に書き込み受付を OFF へ戻す。
+- どの遷移でも最初に書き込み受付を OFF へ戻す。（2026-09-09 オーナー決定 #340 で撤回:
+  書き込み受付は遷移で OFF にしない。test_output の OFF 連動は維持）
 - `faulted` から実機収集を自動再開しない。診断を表示し、ユーザーの明示操作を
   待つ。
 
@@ -401,7 +406,8 @@ SIM と、その値に推移的に依存する演算タグにも同じ規則を�
 収集開始、停止、モード変更、デスクトップ／サービス切替では、次の順序を守る。
 
 1. 新しい操作を直列化し、遷移状態を公開する。
-2. 書き込み受付を OFF にする。
+2. 書き込み受付を OFF にする。（2026-09-09 オーナー決定 #340 で撤回: 書き込み受付は
+   遷移で OFF にしない。test_output の OFF 連動は維持）
 3. MQTT 等の値消費・外部 publish を停止または停止状態へ遷移させる。
 4. Collector を停止し、tstore を flush する。
 5. broker セッションを切断する。
@@ -416,7 +422,8 @@ SIM と、その値に推移的に依存する演算タグにも同じ規則を�
   `crate::hub::CollectorManager::write_broker_handle_peek`）。停止処理の
   step5（broker セッション切断）と書き込みリクエストの監査・レート制限
   区間が競合しても、実機へ意図しない新規 TCP 接続をダイヤルしない。
-- SIM から configured へ戻す際にも書き込み受付を自動復元しない。
+- SIM から configured へ戻す際にも書き込み受付を自動復元しない。（2026-09-09 オーナー
+  決定 #340 で撤回: 書き込み受付は遷移で OFF にしない。test_output の OFF 連動は維持）
 - 同一プロファイルを名前付き mutex または同等の OS ロックで排他する。
 - ポート競合だけを二重起動検知に使わない。
 - サービス切替失敗時は停止状態へ戻し、実機収集を勝手に再開しない。
@@ -1542,7 +1549,8 @@ fallback を開いた時の初期フォーカスは見出し、失敗後はエ�
 - 単票、連続、CSV、運転開始で共有する全構成 preflight を追加する。
 - 運転中の構成編集は pending queue として受け付け、反映は明示的な適用操作に限定する。
 - status と admin control API を追加する。
-- 状態遷移と書き込み受付 OFF を連動させる。
+- 状態遷移と書き込み受付 OFF を連動させる。（2026-09-09 オーナー決定 #340 で撤回:
+  書き込み受付は遷移で OFF にしない。test_output の OFF 連動は維持）
 
 受け入れ条件:
 
@@ -1959,7 +1967,8 @@ owner ACL を設定する。グループ変更、profile owner 追加、ACL 変�
 - 停止中 CRUD、全構成 preflight、catalog、revision、computed 検証
 - configured / 全体 SIM / stopped の往復統合テスト
 - Modbus / SLMP、直接接続 / broker 経路の双方
-- 書き込み受付 OFF、REST / gRPC fail-closed の回帰
+- 書き込み受付 OFF、REST / gRPC fail-closed の回帰（2026-09-09 オーナー決定 #340 で
+  撤回: 書き込み受付は遷移で OFF にしない。test_output の OFF 連動は維持）
 - 停止処理と書き込みリクエストが競合しても新規 TCP 接続を発生させないこと
   （T15-4、`apps/banto-hub/core/tests/t15_write_peek.rs`）
 - MQTT / gRPC / WS の停止中・SIM 中の契約

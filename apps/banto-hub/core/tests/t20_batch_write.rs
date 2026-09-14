@@ -937,7 +937,8 @@ async fn writes_disabled_rejects_the_whole_batch_and_audits_each_entry() {
     )
     .await;
 
-    // write_control は既定 disabled のまま。
+    // このテスト用アプリの write_control は `WriteControl::new(false)` で
+    // 構築されているため disabled のまま(enable() を呼んでいない)。
     let (key, _id) = issue_key(
         &app.router,
         &app.admin_token,

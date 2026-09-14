@@ -180,15 +180,16 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
     // doc comment「有効期限」参照。
     add_column_if_missing(pool, "api_keys", "expires_at", "TEXT").await?;
 
-    // T2-4 (docs/tag-server-design.md §6-6「再起動での安全側復帰」):
-    // 書き込み受付フラグの永続値(表示専用 - `crate::write_control` の
-    // モジュール doc 参照。**ライブフラグは常に起動時 disabled** で、この
-    // テーブルは `was_enabled_before_restart` の履歴表示にしか使わない)。
-    // `armed_state`(relay-wright)と同じ id=1 単一行パターン。
+    // T2-4 (docs/tag-server-design.md §6-6)。2026-09-09 オーナー決定 (#340)
+    // で「起動時は必ず disabled」ルールを撤回: 書き込み受付フラグの永続値
+    // (`crate::write_control` のモジュール doc 参照) は起動時にライブ
+    // フラグへそのまま復元される。既定は「書き込み可」なので seed は
+    // `enabled_persisted = 1`。`armed_state`(relay-wright)と同じ id=1
+    // 単一行パターン。
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS write_control_state (
           id INTEGER PRIMARY KEY CHECK (id = 1),
-          enabled_persisted INTEGER NOT NULL DEFAULT 0,
+          enabled_persisted INTEGER NOT NULL DEFAULT 1,
           last_changed_at TEXT,
           last_changed_by TEXT
         )",
@@ -196,10 +197,22 @@ async fn apply_app_schema(pool: &SqlitePool) -> Result<(), BantoError> {
     .execute(pool)
     .await
     .map_err(banto_storage::storage_error)?;
-    sqlx::query("INSERT OR IGNORE INTO write_control_state (id, enabled_persisted) VALUES (1, 0)")
+    sqlx::query("INSERT OR IGNORE INTO write_control_state (id, enabled_persisted) VALUES (1, 1)")
         .execute(pool)
         .await
         .map_err(banto_storage::storage_error)?;
+    // #340: 既存 DB 向けの引き上げ。旧既定 (`enabled_persisted = 0`) の
+    // seed のままで、運用者が一度も enable/disable を操作していない行
+    // (`last_changed_at IS NULL` で判定) だけを新既定の 1 へ引き上げる。
+    // 明示的に disable した行は `last_changed_at` が入っているので、
+    // このステートメントの対象外のまま保持される。
+    sqlx::query(
+        "UPDATE write_control_state SET enabled_persisted = 1 \
+         WHERE id = 1 AND last_changed_at IS NULL",
+    )
+    .execute(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
 
     // T2-4 (docs/tag-server-design.md §6-3「log-before-write」): 書き込み
     // 監査ログ。列の意味・log-before-write の2段挿入パターンは
@@ -520,17 +533,72 @@ mod tests {
         run_migrations(&pool).await.unwrap();
     }
 
-    /// T2-4 (§6-6): `write_control_state` は起動時に id=1 の1行を必ず seed し、
-    /// `enabled_persisted = 0` から始まる - `crate::write_control::WriteControl`
-    /// が「再起動は常に disabled」を守るための前提。
+    /// T2-4 (§6-6)。2026-09-09 オーナー決定 (#340): `write_control_state` は
+    /// 起動時に id=1 の1行を必ず seed し、`enabled_persisted = 1`
+    /// (既定「書き込み可」) から始まる - `crate::write_control::WriteControl`
+    /// がこの値をそのままライブフラグへ復元する前提。
     #[tokio::test]
-    async fn write_control_state_seeds_a_single_disabled_row() {
+    async fn write_control_state_seeds_a_single_enabled_row() {
         let pool = init_db_memory().await.unwrap();
         let enabled: i64 =
             sqlx::query_scalar("SELECT enabled_persisted FROM write_control_state WHERE id = 1")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(enabled, 0);
+        assert_eq!(enabled, 1);
+    }
+
+    /// #340: 既存 DB の引き上げ挙動。旧既定のまま (`enabled_persisted = 0`,
+    /// `last_changed_at IS NULL`) の未操作行は `apply_app_schema` の再実行で
+    /// 1 へ引き上げられる。一方、運用者が明示的に disable した行
+    /// (`last_changed_at` あり) は 0 のまま保持される。
+    #[tokio::test]
+    async fn apply_app_schema_upgrades_only_untouched_rows_to_enabled() {
+        let pool = init_db_memory().await.unwrap();
+
+        // 未操作行を旧既定 (0) に巻き戻して「まだ誰も触っていない既存 DB」
+        // を模す。
+        sqlx::query(
+            "UPDATE write_control_state SET enabled_persisted = 0, last_changed_at = NULL \
+             WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        apply_app_schema(&pool).await.unwrap();
+
+        let enabled: i64 =
+            sqlx::query_scalar("SELECT enabled_persisted FROM write_control_state WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            enabled, 1,
+            "untouched row (no last_changed_at) must be upgraded to the new default"
+        );
+
+        // 明示的に disable した行 (last_changed_at あり) を模す。
+        sqlx::query(
+            "UPDATE write_control_state \
+             SET enabled_persisted = 0, last_changed_at = datetime('now'), \
+                 last_changed_by = 'admin' \
+             WHERE id = 1",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        apply_app_schema(&pool).await.unwrap();
+
+        let enabled: i64 =
+            sqlx::query_scalar("SELECT enabled_persisted FROM write_control_state WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            enabled, 0,
+            "explicitly disabled row (last_changed_at set) must be preserved"
+        );
     }
 }
