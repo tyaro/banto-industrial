@@ -4,7 +4,7 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
 1 画面で引くための地図。詳細は各文書へ辿る。
 
 状態: **地図として現行**。索引に徹し、実装状況・設計判断の本体は各文書側で管理する。
-最終更新: 2026-09-15（T19（UX-30〜48）・T20（文字列/構造体/レシピ/ビット .0〜.F）・T21（構成補助 MCP 管理面）完了、MCP 31 ツール実機検証、外部 DB 連携 S0〜S2b・S4・S5 完了、S3/S6/S7 残（MCP は 37 ツールに。追加分はローカル PostgreSQL で検証）に加え、v0.2.0-alpha.8: 書き込み受付の既定を「可」に変更し、再起動・収集操作での自動無効化を撤回（#340）、v0.2.0-alpha.9: 試運転中は構成 CRUD を収集中でも即時・無停止反映（#341）、v0.2.0-alpha.10: computed タグの catalog 公開・外部読み取り出力のシミュレーションゲート撤廃（#335）を反映）。
+最終更新: 2026-09-15（T19（UX-30〜48）・T20（文字列/構造体/レシピ/ビット .0〜.F）・T21（構成補助 MCP 管理面）完了、MCP 31 ツール実機検証、外部 DB 連携 S0〜S2b・S4・S5 完了、S3/S6/S7 残（MCP は 37 ツールに。追加分はローカル PostgreSQL で検証）に加え、v0.2.0-alpha.8: 書き込み受付の既定を「可」に変更し、再起動・収集操作での自動無効化を撤回（#340）、v0.2.0-alpha.9: 試運転中は構成 CRUD を収集中でも即時・無停止反映（#341）、v0.2.0-alpha.10: computed タグの catalog 公開・外部読み取り出力のシミュレーションゲート撤廃（#335）、v0.2.0-alpha.11: シミュレーションデバイスへの外部書き込みをシミュレータへ反映（#363）を反映）。
 最終検証日(コード照合): 2026-09-15
 
 > この地図は索引に徹する。実装状況・設計判断の本体は各文書側にあり、状態の**正**は
@@ -57,6 +57,16 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
   常に配信）。T15-3 の `test_output` opt-in は効果を失い deprecated（制御プレーン自体は残す、
   撤去は後続 issue）。詳細は [tag-server-design.md](tag-server-design.md) §4.2、
   [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §6.3。
+- **v0.2.0-alpha.11（2026-09-15、#363）**: シミュレーションデバイス（接続単位
+  `simulation: true`・全シミュレーション運転中）のタグへの外部書き込みを拒否せず、PC 上の
+  in-process シミュレータへ反映する契約へ改定（オーナー決定 2026-09-15）。`banto-plc` の
+  シミュレータに Modbus FC5/6/15/16 と SLMP `0x1401` を実装し、ワイヤ経由で書いた番地は
+  held としてランプ波の更新対象から外れるため読み戻せる。実機向けの護り（writable /
+  write スコープ / レート制限 / 値検査 / log-before-write / write_enabled）はすべて据え置きで、
+  撤去したのは「シミュレーション中は拒否」の 1 段だけ。**wire 変更**: エラーコード
+  `simulation_write_rejected` は返らなくなった。監査 `detail` に `target: simulator|plc` を記録。
+  詳細は [tag-server-design.md](tag-server-design.md) §6.5、
+  [banto-hub-operations.md](banto-hub-operations.md) §4。
 - **出荷ゲート**: T5-5（実機での 72h soak 実行 + 実機最終サインオフ）のみ残（実機必須）。
 - **banto-tagclient**: **S4a完了（2026-09-01）**。読み取り専用DTO、Endpoint/Secret境界、
   stable ID resolver、REST catalog/values transport、WS wire純粋解析、bounded publish gate、認証付き

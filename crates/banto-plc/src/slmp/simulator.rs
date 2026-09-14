@@ -5,12 +5,29 @@
 //! crate tests, I5's write client, and W3's engine integration tests rather
 //! than each standing up its own fake CPU.
 //!
-//! Not an SLMP conformance tool: it implements exactly the one command this
-//! crate's client issues - bulk read (`0x0401`), both bit-unit and word-unit -
-//! keeps device state in plain `HashMap`s (sparse: any device never explicitly
-//! set reads back as `0`/`false`, convenient for tests that care about a
-//! handful of addresses), and can be told to return a canned end code, emit a
-//! deliberately malformed frame, or hang instead of answering.
+//! Not an SLMP conformance tool: it implements exactly the two commands this
+//! repository's clients issue - bulk read (`0x0401`) and, since #363, bulk
+//! write (`0x1401`), both bit-unit and word-unit - keeps device state in
+//! plain `HashMap`s (sparse: any device never explicitly set reads back as
+//! `0`/`false`, convenient for tests that care about a handful of addresses),
+//! and can be told to return a canned end code, emit a deliberately
+//! malformed frame, or hang instead of answering.
+//!
+//! ## Write support and the "held" set (#363、2026-09-15 オーナー決定)
+//!
+//! The MELSEC twin of `modbus/simulator.rs`'s section of the same name - read
+//! that one for the full rationale. In short: the owner decision of
+//! 2026-09-15 makes an external write to a PC-side simulated device *land on
+//! the simulator* rather than be refused (banto-hub's old write gate 4,
+//! `WriteRejection::SimulationWriteRejected`, is gone), so this simulator
+//! needs to accept `0x1401`; and because `banto-collect`'s
+//! `simulation::slmp_ramp_task` rewrites `D0..D15`/`M0..M15` every 100 ms, a
+//! device written over the wire is recorded in a held set and the seeding
+//! setters ([`Simulator::set_word`], [`Simulator::set_words`],
+//! [`Simulator::set_string`], [`Simulator::set_bit`]) become no-ops for it.
+//! The ramp therefore keeps running on every device the operator has *not*
+//! taken over, and the value that was written reads back on the next poll.
+//! The held set lives and dies with the simulator instance.
 //!
 //! ## Why this speaks real SLMP bytes rather than mocking the crate
 //!
@@ -32,7 +49,7 @@
 //! `create_subheader` / `validate_response`): a 15-byte prefix, then a 2-byte
 //! end code, then payload.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -51,6 +68,11 @@ const FRAME_PREFIX_LEN: usize = 15;
 /// SLMP bulk read command code, little-endian on the wire.
 const COMMAND_BULK_READ: u16 = 0x0401;
 
+/// SLMP bulk write command code (#363) - the write twin of
+/// [`COMMAND_BULK_READ`], same device-field layout, payload instead of point
+/// count only.
+const COMMAND_BULK_WRITE: u16 = 0x1401;
+
 /// Subcommand bit 0: set = bit-unit access, clear = word-unit access.
 const SUBCOMMAND_BIT_ACCESS: u16 = 0x0001;
 /// Subcommand bit 1: set = R series (6-byte device field), clear = Q/L series
@@ -67,6 +89,16 @@ const END_CODE_WRONG_COMMAND: u16 = 0xC059;
 struct State {
     words: HashMap<(SlmpDevice, u32), u16>,
     bits: HashMap<(SlmpDevice, u32), bool>,
+    /// Word devices written over the wire (`0x1401`, word unit) - see this
+    /// module's "Write support and the held set" section. [`Simulator::set_word`]
+    /// is a no-op for these, so the ramp task stops overwriting them.
+    held_words: HashSet<(SlmpDevice, u32)>,
+    /// Bit devices written over the wire (`0x1401`, bit unit), the bit twin
+    /// of `held_words`.
+    held_bits: HashSet<(SlmpDevice, u32)>,
+    /// How many bulk *write* commands have been served - test support,
+    /// exposed as [`Simulator::write_command_count`].
+    write_commands: usize,
     /// Exact `(device, start_number)` match -> end code to return instead of
     /// data, for injecting CPU-side refusals (the SLMP analogue of
     /// `modbus/simulator.rs`'s `exceptions`).
@@ -142,17 +174,22 @@ impl Simulator {
     /// word to `M100` is a mistake in the *test*, not a condition worth
     /// simulating, and a silent no-op there would show up as a confusing
     /// all-zeros assertion failure much later.
+    ///
+    /// **No-op if the device is held** (it was written over the wire, #363) -
+    /// see this module's "Write support and the held set" section: this is
+    /// what stops `banto-collect`'s ramp task from erasing a value an
+    /// external client just wrote.
     pub fn set_word(&self, device: SlmpDevice, number: u32, value: u16) {
         assert_eq!(
             device.access(),
             super::SlmpAccess::Word,
             "{device} is a bit device - use set_bit"
         );
-        self.state
-            .lock()
-            .unwrap()
-            .words
-            .insert((device, number), value);
+        let mut state = self.state.lock().unwrap();
+        if state.held_words.contains(&(device, number)) {
+            return;
+        }
+        state.words.insert((device, number), value);
     }
 
     /// Set consecutive word devices starting at `start`.
@@ -186,18 +223,55 @@ impl Simulator {
     }
 
     /// Set one bit device (`M`/`X`/`Y`/...). Panics on a word device, mirroring
-    /// [`Simulator::set_word`].
+    /// [`Simulator::set_word`], and is likewise a no-op for a held device
+    /// (#363).
     pub fn set_bit(&self, device: SlmpDevice, number: u32, value: bool) {
         assert_eq!(
             device.access(),
             super::SlmpAccess::Bit,
             "{device} is a word device - use set_word"
         );
-        self.state
+        let mut state = self.state.lock().unwrap();
+        if state.held_bits.contains(&(device, number)) {
+            return;
+        }
+        state.bits.insert((device, number), value);
+    }
+
+    /// Current value of one word device, as a read would see it. Unset
+    /// devices read back as `0`.
+    pub fn get_word(&self, device: SlmpDevice, number: u32) -> u16 {
+        *self
+            .state
+            .lock()
+            .unwrap()
+            .words
+            .get(&(device, number))
+            .unwrap_or(&0)
+    }
+
+    /// Current value of one bit device. Unset devices read back as `false`.
+    pub fn get_bit(&self, device: SlmpDevice, number: u32) -> bool {
+        *self
+            .state
             .lock()
             .unwrap()
             .bits
-            .insert((device, number), value);
+            .get(&(device, number))
+            .unwrap_or(&false)
+    }
+
+    /// How many devices (words plus bits) have been written over the wire
+    /// and are therefore excluded from the seeding setters - the observation
+    /// API for the held-set behaviour described in this module's doc comment.
+    pub fn held_count(&self) -> usize {
+        let state = self.state.lock().unwrap();
+        state.held_words.len() + state.held_bits.len()
+    }
+
+    /// How many bulk write commands (`0x1401`) this simulator has served.
+    pub fn write_command_count(&self) -> usize {
+        self.state.lock().unwrap().write_commands
     }
 
     /// Every request whose group *starts* at `(device, start_number)` gets this
@@ -264,12 +338,17 @@ fn device_from_wire_code(code: u8) -> Option<SlmpDevice> {
         .find(|d| d.to_wire().to_code() == code)
 }
 
-/// One parsed bulk read request.
-struct BulkRead {
+/// One parsed bulk read/write request: the device field plus the point
+/// count, which sit in the same place in both commands (`0x0401` ends
+/// there, `0x1401` carries the payload after it).
+struct BulkRequest {
     device: SlmpDevice,
     start: u32,
     count: usize,
     bit_access: bool,
+    /// Byte offset just past the point count - where a bulk write's payload
+    /// begins, and the end of a bulk read's command.
+    payload_at: usize,
 }
 
 async fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<State>>) {
@@ -324,12 +403,8 @@ struct Route {
     area_id: u8,
 }
 
-fn parse_bulk_read(command: &[u8]) -> Option<BulkRead> {
+fn parse_bulk_request(command: &[u8]) -> Option<BulkRequest> {
     if command.len() < 4 {
-        return None;
-    }
-    let code = u16::from_le_bytes([command[0], command[1]]);
-    if code != COMMAND_BULK_READ {
         return None;
     }
     let subcommand = u16::from_le_bytes([command[2], command[3]]);
@@ -350,18 +425,35 @@ fn parse_bulk_read(command: &[u8]) -> Option<BulkRead> {
     let device = device_from_wire_code(body[device_code_index])?;
     let count = u16::from_le_bytes([body[device_field_len], body[device_field_len + 1]]) as usize;
 
-    Some(BulkRead {
+    Some(BulkRequest {
         device,
         start,
         count,
         bit_access,
+        payload_at: 4 + device_field_len + 2,
     })
 }
 
 fn build_response(state: &Arc<Mutex<State>>, route: &Route, command: &[u8]) -> Vec<u8> {
-    let state = state.lock().unwrap();
+    let mut state = state.lock().unwrap();
 
-    let Some(request) = parse_bulk_read(command) else {
+    let code = if command.len() >= 2 {
+        u16::from_le_bytes([command[0], command[1]])
+    } else {
+        0
+    };
+    match code {
+        COMMAND_BULK_READ => build_read_response(&state, route, command),
+        COMMAND_BULK_WRITE => {
+            state.write_commands += 1;
+            build_write_response(&mut state, route, command)
+        }
+        _ => frame(route, END_CODE_WRONG_COMMAND, &[], state.malformed),
+    }
+}
+
+fn build_read_response(state: &State, route: &Route, command: &[u8]) -> Vec<u8> {
+    let Some(request) = parse_bulk_request(command) else {
         return frame(route, END_CODE_WRONG_COMMAND, &[], state.malformed);
     };
 
@@ -413,6 +505,65 @@ fn build_response(state: &Arc<Mutex<State>>, route: &Route, command: &[u8]) -> V
     frame(route, 0, &payload, state.malformed)
 }
 
+/// Bulk write (`0x1401`, #363): the same device field and point count as a
+/// bulk read, followed by the payload - `count` little-endian words
+/// (word unit) or `count` points packed two per byte with the earlier point
+/// in the high nibble (bit unit, the layout the wrapped `slmp` crate emits).
+/// A successful write answers end code `0` with no payload.
+///
+/// Every device this commits is recorded as **held**, which is what takes it
+/// out of `banto-collect`'s ramp updates - see this module's "Write support
+/// and the held set" section.
+fn build_write_response(state: &mut State, route: &Route, command: &[u8]) -> Vec<u8> {
+    let Some(request) = parse_bulk_request(command) else {
+        return frame(route, END_CODE_WRONG_COMMAND, &[], state.malformed);
+    };
+
+    if let Some(&code) = state.end_codes.get(&(request.device, request.start)) {
+        return frame(route, code, &[], state.malformed);
+    }
+
+    // Same access-unit symmetry check the read path makes, and for the same
+    // reason: a real CPU refuses a bit-unit write to a word device.
+    let expects_bit = request.device.access() == super::SlmpAccess::Bit;
+    if expects_bit != request.bit_access {
+        return frame(route, END_CODE_WRONG_COMMAND, &[], state.malformed);
+    }
+
+    let data = &command[request.payload_at.min(command.len())..];
+    let needed = if request.bit_access {
+        request.count.div_ceil(2)
+    } else {
+        request.count * 2
+    };
+    if request.count == 0 || data.len() < needed {
+        return frame(route, END_CODE_WRONG_COMMAND, &[], state.malformed);
+    }
+
+    if request.bit_access {
+        for point in 0..request.count {
+            let byte = data[point / 2];
+            let bit = if point.is_multiple_of(2) {
+                (byte >> 4) & 0x01
+            } else {
+                byte & 0x01
+            };
+            let number = request.start + point as u32;
+            state.bits.insert((request.device, number), bit == 1);
+            state.held_bits.insert((request.device, number));
+        }
+    } else {
+        for i in 0..request.count {
+            let word = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
+            let number = request.start + i as u32;
+            state.words.insert((request.device, number), word);
+            state.held_words.insert((request.device, number));
+        }
+    }
+
+    frame(route, 0, &[], state.malformed)
+}
+
 /// Assemble a 4E binary response frame. `end_code` of `0` means success;
 /// anything else is a CPU-side refusal and carries no payload.
 ///
@@ -438,4 +589,227 @@ fn frame(route: &Route, end_code: u16, payload: &[u8], malformed: bool) -> Vec<u
     out.extend_from_slice(&end_code.to_le_bytes());
     out.extend_from_slice(payload);
     out
+}
+
+/// Wire-level tests for bulk write (`0x1401`) and the held set (#363).
+/// Hand-built 4E request frames rather than a client: `banto-plc` has no
+/// write client (it is read-only on purpose - see this crate's `lib.rs`) and
+/// `banto-plc-write` cannot be a dependency here, so the bytes go on the
+/// socket directly.
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+    use tokio::net::TcpStream;
+
+    /// Q/L-series 4E binary request: 15-byte prefix (the last two bytes of
+    /// which are the CPU timer) followed by the command.
+    fn request_frame(command: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(FRAME_PREFIX_LEN + command.len());
+        out.extend_from_slice(&[0x54, 0x00]); // 4E request subheader
+        out.extend_from_slice(&1u16.to_le_bytes()); // serial id
+        out.extend_from_slice(&[0x00, 0x00]); // blank
+        out.push(0x00); // network id
+        out.push(0xFF); // PC id
+        out.extend_from_slice(&0x03FFu16.to_le_bytes()); // I/O id
+        out.push(0x00); // area id
+        out.extend_from_slice(&((command.len() + 2) as u16).to_le_bytes());
+        out.extend_from_slice(&0x0010u16.to_le_bytes()); // CPU timer
+        out.extend_from_slice(command);
+        out
+    }
+
+    fn bulk_command(
+        code: u16,
+        device: SlmpDevice,
+        start: u32,
+        count: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&code.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // word unit, Q/L series
+        out.extend_from_slice(&start.to_le_bytes()[..3]);
+        out.push(device.to_wire().to_code());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn bulk_bit_command(
+        code: u16,
+        device: SlmpDevice,
+        start: u32,
+        count: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&code.to_le_bytes());
+        out.extend_from_slice(&SUBCOMMAND_BIT_ACCESS.to_le_bytes());
+        out.extend_from_slice(&start.to_le_bytes()[..3]);
+        out.push(device.to_wire().to_code());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Send one command and return `(end_code, payload)`.
+    async fn roundtrip(stream: &mut TcpStream, command: &[u8]) -> (u16, Vec<u8>) {
+        stream
+            .write_all(&request_frame(command))
+            .await
+            .expect("write request");
+        let mut prefix = [0u8; FRAME_PREFIX_LEN];
+        stream.read_exact(&mut prefix).await.expect("read prefix");
+        let end_code = u16::from_le_bytes([prefix[13], prefix[14]]);
+        let declared = u16::from_le_bytes([prefix[11], prefix[12]]) as usize;
+        let mut payload = vec![0u8; declared.saturating_sub(2)];
+        if !payload.is_empty() {
+            stream
+                .read_exact(&mut payload)
+                .await
+                .expect("read response payload");
+        }
+        (end_code, payload)
+    }
+
+    async fn connect(sim: &Simulator) -> TcpStream {
+        TcpStream::connect(sim.addr).await.expect("connect")
+    }
+
+    #[tokio::test]
+    async fn bulk_write_lands_consecutive_words_and_reads_back() {
+        let sim = Simulator::start().await;
+        let mut stream = connect(&sim).await;
+
+        // Two consecutive words - the shape a 32-bit tag's write takes.
+        let payload = [0x34, 0x12, 0x78, 0x56];
+        let (end_code, body) = roundtrip(
+            &mut stream,
+            &bulk_command(COMMAND_BULK_WRITE, SlmpDevice::D, 100, 2, &payload),
+        )
+        .await;
+        assert_eq!(end_code, 0, "a successful write answers end code 0");
+        assert!(body.is_empty(), "a successful write carries no payload");
+        assert_eq!(sim.get_word(SlmpDevice::D, 100), 0x1234);
+        assert_eq!(sim.get_word(SlmpDevice::D, 101), 0x5678);
+        assert_eq!(sim.write_command_count(), 1);
+
+        let (end_code, body) = roundtrip(
+            &mut stream,
+            &bulk_command(COMMAND_BULK_READ, SlmpDevice::D, 100, 2, &[]),
+        )
+        .await;
+        assert_eq!(end_code, 0);
+        assert_eq!(body, vec![0x34, 0x12, 0x78, 0x56]);
+    }
+
+    #[tokio::test]
+    async fn bulk_bit_write_lands_points_two_per_byte() {
+        let sim = Simulator::start().await;
+        let mut stream = connect(&sim).await;
+
+        // M20 = on, M21 = off, M22 = on: the earlier point of each pair sits
+        // in the high nibble.
+        let payload = [0x10, 0x10];
+        let (end_code, _) = roundtrip(
+            &mut stream,
+            &bulk_bit_command(COMMAND_BULK_WRITE, SlmpDevice::M, 20, 3, &payload),
+        )
+        .await;
+        assert_eq!(end_code, 0);
+        assert!(sim.get_bit(SlmpDevice::M, 20));
+        assert!(!sim.get_bit(SlmpDevice::M, 21));
+        assert!(sim.get_bit(SlmpDevice::M, 22));
+    }
+
+    #[tokio::test]
+    async fn a_bit_unit_write_to_a_word_device_is_refused() {
+        let sim = Simulator::start().await;
+        let mut stream = connect(&sim).await;
+
+        let (end_code, _) = roundtrip(
+            &mut stream,
+            &bulk_bit_command(COMMAND_BULK_WRITE, SlmpDevice::D, 0, 2, &[0x11]),
+        )
+        .await;
+        assert_eq!(end_code, END_CODE_WRONG_COMMAND);
+        assert_eq!(sim.held_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_truncated_write_payload_is_refused_without_landing() {
+        let sim = Simulator::start().await;
+        let mut stream = connect(&sim).await;
+
+        // Claims two words but carries one.
+        let (end_code, _) = roundtrip(
+            &mut stream,
+            &bulk_command(COMMAND_BULK_WRITE, SlmpDevice::D, 0, 2, &[0x01, 0x00]),
+        )
+        .await;
+        assert_eq!(end_code, END_CODE_WRONG_COMMAND);
+        assert_eq!(sim.get_word(SlmpDevice::D, 0), 0);
+        assert_eq!(sim.held_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_injected_end_code_still_pre_empts_a_write() {
+        let sim = Simulator::start().await;
+        sim.inject_end_code(SlmpDevice::D, 7, 0xC051);
+        let mut stream = connect(&sim).await;
+
+        let (end_code, _) = roundtrip(
+            &mut stream,
+            &bulk_command(COMMAND_BULK_WRITE, SlmpDevice::D, 7, 1, &[0x99, 0x00]),
+        )
+        .await;
+        assert_eq!(end_code, 0xC051);
+        assert_eq!(sim.get_word(SlmpDevice::D, 7), 0, "the write must not land");
+        assert_eq!(sim.held_count(), 0, "a refused write holds nothing");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_command_is_still_wrong_command() {
+        let sim = Simulator::start().await;
+        let mut stream = connect(&sim).await;
+
+        let (end_code, _) =
+            roundtrip(&mut stream, &bulk_command(0x1001, SlmpDevice::D, 0, 1, &[])).await;
+        assert_eq!(end_code, END_CODE_WRONG_COMMAND);
+    }
+
+    #[tokio::test]
+    async fn a_wire_written_device_is_held_against_the_seeding_setters() {
+        let sim = Simulator::start().await;
+        let mut stream = connect(&sim).await;
+
+        roundtrip(
+            &mut stream,
+            &bulk_command(COMMAND_BULK_WRITE, SlmpDevice::D, 5, 1, &[0x92, 0x10]),
+        )
+        .await;
+        roundtrip(
+            &mut stream,
+            &bulk_bit_command(COMMAND_BULK_WRITE, SlmpDevice::M, 3, 1, &[0x10]),
+        )
+        .await;
+        assert_eq!(sim.held_count(), 2);
+
+        // `banto-collect`'s ramp task drives exactly these setters.
+        sim.set_word(SlmpDevice::D, 5, 1);
+        sim.set_words(SlmpDevice::D, 4, &[7, 7, 7]);
+        sim.set_bit(SlmpDevice::M, 3, false);
+        assert_eq!(
+            sim.get_word(SlmpDevice::D, 5),
+            0x1092,
+            "a held word keeps the written value"
+        );
+        assert!(sim.get_bit(SlmpDevice::M, 3), "a held bit keeps its value");
+
+        // Neighbours are untouched by holding and keep ramping.
+        assert_eq!(sim.get_word(SlmpDevice::D, 4), 7);
+        assert_eq!(sim.get_word(SlmpDevice::D, 6), 7);
+        sim.set_bit(SlmpDevice::M, 4, true);
+        assert!(sim.get_bit(SlmpDevice::M, 4));
+    }
 }

@@ -37,20 +37,17 @@
 //! 2. `writable == false` → [`WriteRejection::NotWritable`](監査不要 -
 //!    定義上の拒否)
 //! 3. 実効 enabled == false → [`WriteRejection::TagDisabled`]
-//! 4. シミュレーション中の PLC タグ → [`WriteRejection::SimulationWriteRejected`]
-//!    (保存済み simulation または production controller の AllSimulation。
-//!    internal/mem タグはこのゲートの対象外)
-//! 5. 接続のプロトコルに broker ドライバが登録されていない →
+//! 4. 接続のプロトコルに broker ドライバが登録されていない →
 //!    [`WriteRejection::UnsupportedProtocol`](`banto_broker::is_supported_protocol`/
 //!    `banto_broker::DRIVERS` が唯一の正 - #131（2026-09-01）以降、slmp と
 //!    modbus-tcp の両方がこのゲートを通過する。Modbus は Numeric（数値/
 //!    ビット、FC5/6/15/16）のみ対応、String は broker 側で per-request Bad
 //!    になる）
-//! 6. write_enabled(受付)off → [`WriteRejection::WritesDisabled`] +
+//! 5. write_enabled(受付)off → [`WriteRejection::WritesDisabled`] +
 //!    write_audit に `suppressed_disabled`
-//! 7. レート制限 would_exceed → [`WriteRejection::RateLimited`] + キー
+//! 6. レート制限 would_exceed → [`WriteRejection::RateLimited`] + キー
 //!    trip + `rate_limit_tripped` 記録
-//! 8. 値変換: まず [`RequestedValue`] の種別と data_type の対称性を検査する
+//! 7. 値変換: まず [`RequestedValue`] の種別と data_type の対称性を検査する
 //!    (bit タグには bool のみ、数値タグには数値のみ、string タグには文字列
 //!    のみ - 暗黙の型変換はしない。2026-08-06 追加、§4.2 の「タグ種別を
 //!    跨いだ暗黙変換をしない」設計思想を書き込み経路にも適用した。T20 ①a で
@@ -62,10 +59,44 @@
 //!    経由せず(登録時に禁止されている)、`banto_tags::Tag::string_encoding`
 //!    に応じた `banto_plc_write::StringWriteRequest` を組み立てる(T20 ①a、
 //!    このモジュールの「T20 ①a」節参照)
-//! 9. **log-before-write** → `CollectorManager::write_broker_handle_peek`
+//! 8. **log-before-write** → `CollectorManager::write_broker_handle_peek`
 //!    (T15-4、既存セッションの覗き見のみ・新規ダイヤルしない)経由の
 //!    `BrokerHandle::write`(1タグ=1リクエスト)→ set_result →
 //!    [`WriteOk`] または [`WriteRejection::WriteFailed`]
+//!
+//! ### 撤去: 旧ゲート4「シミュレーション中は拒否」(#363、2026-09-15 オーナー決定)
+//!
+//! 2026-09-15 のオーナー決定(#363)まで、gate 3 と現 gate 4 の間に
+//! 「PLC タグが `simulation = true` の接続配下、または production
+//! controller が `RunMode::AllSimulation` で走っている場合は
+//! `WriteRejection::SimulationWriteRejected` で fail-closed する」という
+//! ゲートがあった。この決定でそのゲートだけを撤去し、**シミュレーション中の
+//! 書き込みは PC 上のシミュレータへ反映する**(実機が無い状態で SCADA 等の
+//! クライアントが書き込み経路まで試験できるようにするため。#335 で
+//! 「外部出力＝読み取り出力であって PLC 書き込みではない」と整理したことに
+//! 伴う追加決定)。
+//!
+//! - **ワイヤ変更**: REST の 503 `simulation_write_rejected` / gRPC の
+//!   `UNAVAILABLE`(同メッセージ)はもう返らない。シミュレーション接続への
+//!   書き込みは他の接続とまったく同じ応答形になる。
+//! - **実機向けの護りは一切変わらない**: per-tag `writable`(gate 2)、
+//!   API キーの `write` スコープ(呼び出し元)、実効 enabled(gate 3)、
+//!   プロトコル(gate 4)、`write_enabled`(gate 5)、レート制限とトリップ
+//!   (gate 6)、値変換・レンジ検査(gate 7)、log-before-write(gate 8)は
+//!   シミュレーション書き込みにもそのまま適用される。変わったのは
+//!   「シミュレーション中は拒否」の1段だけ。
+//! - **実際に書ける理由**: シミュレーション接続の broker セッションは
+//!   `crate::broker_glue::SlmpSimRegistry` がダイヤル先を in-process
+//!   シミュレータへ差し替えて張ってあるので、gate 8 の
+//!   `write_broker_handle_peek` → `BrokerHandle::write` がそのまま
+//!   シミュレータに届く。`banto_plc::{modbus,slmp}::simulator::Simulator`
+//!   は #363 で書き込みコマンド(Modbus FC5/6/15/16・SLMP `0x1401`)に対応し、
+//!   書かれた番地を held としてランプ波の更新対象から外すので、次の
+//!   ポーリング/`read-now` で書いた値がそのまま読み戻せる。
+//! - **監査**: log-before-write の `detail` に `{"target":"simulator"}` /
+//!   `{"target":"plc"}` を記録する([`write_target_detail`])。判定は旧
+//!   ゲート4と同じ条件(`entry.simulation || collection_mode ==
+//!   AllSimulation`、PLC タグのみ)。列は追加しない。
 //!
 //! ### T15-4: gate 8 は broker セッションを新規に張らない(no-spawn peek)
 //!
@@ -269,11 +300,6 @@ pub enum WriteRejection {
     /// only installed by production composition; the legacy compatibility
     /// router intentionally leaves it unset for existing embedders/tests.
     CollectionNotRunning(CollectionState),
-    /// PLC タグがシミュレーション接続配下、または production controller
-    /// の AllSimulation 実行中。実機へ誤書き込みしないため、broker handle
-    /// の取得・レート制限消費・監査行作成より前に fail-closed する。
-    /// internal/mem タグはこの拒否の対象外。
-    SimulationWriteRejected,
     /// gate 1: catalog に存在しない外部名(REST: 404, gRPC: NOT_FOUND)。
     NotFound,
     /// gate 2: `writable == false`(REST: 403, gRPC: PERMISSION_DENIED)。
@@ -483,6 +509,64 @@ struct ResolvedWrite {
     tag_name: String,
     /// gate 7 未適用の正規化済みリクエスト値([`convert_value`]へ渡す)。
     requested: RequestedValue,
+    /// #363: 監査 `detail` に載せる書き込み先の種別
+    /// ([`write_target_detail`])。PLC タグ以外は `None`。
+    target: Option<WriteTarget>,
+}
+
+/// #363(2026-09-15 オーナー決定): この書き込みが実際に届く先。旧ゲート4
+/// (シミュレーション中は拒否)が見ていた条件そのものを、拒否ではなく
+/// **監査への記録**として使う - 「その書き込みは実機に出たのか、PC 上の
+/// シミュレータに留まったのか」は運用者が後から知る必要がある唯一の情報
+/// なので、ゲートを外しても監査からは落とさない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteTarget {
+    /// 実機 PLC(`simulation = false` かつ全シミュレーション運転中でない)。
+    Plc,
+    /// PC 上の in-process シミュレータ(接続単位の `simulation = true`、
+    /// または production controller の `RunMode::AllSimulation` 実行中)。
+    Simulator,
+}
+
+impl WriteTarget {
+    fn as_str(self) -> &'static str {
+        match self {
+            WriteTarget::Plc => "plc",
+            WriteTarget::Simulator => "simulator",
+        }
+    }
+}
+
+/// 旧ゲート4と同じ条件で書き込み先を判定する(#363)。`internal`/`mem` タグ
+/// は PLC 接続を持たないので対象外(`None`)。
+fn resolve_write_target_kind(
+    entry: &crate::hub::TagEntry,
+    collection_mode: Option<RunMode>,
+) -> Option<WriteTarget> {
+    if entry.tag_kind != PLC_TAG_KIND {
+        return None;
+    }
+    if entry.simulation || collection_mode == Some(RunMode::AllSimulation) {
+        Some(WriteTarget::Simulator)
+    } else {
+        Some(WriteTarget::Plc)
+    }
+}
+
+/// log-before-write の監査 `detail` 文字列(#363)。成功時は
+/// `{"target":"simulator"}`、失敗時は失敗理由を同じ JSON に併記する
+/// (`{"target":"plc","detail":"..."}`)- `write_audit.set_result` は
+/// `detail` 列を必ず上書きするので、target を残すにはここで合成するしか
+/// ない(専用列は追加しない、という #363 の指示)。PLC タグでない書き込み
+/// (internal/mem)は従来どおり失敗理由だけを、無ければ `None` を返す。
+fn write_target_detail(target: Option<WriteTarget>, failure: Option<&str>) -> Option<String> {
+    match (target, failure) {
+        (None, failure) => failure.map(str::to_string),
+        (Some(target), None) => Some(json!({ "target": target.as_str() }).to_string()),
+        (Some(target), Some(failure)) => {
+            Some(json!({ "target": target.as_str(), "detail": failure }).to_string())
+        }
+    }
 }
 
 /// 書き込みゲート1〜4・値型 present の本体(このモジュールの doc comment
@@ -554,15 +638,13 @@ async fn resolve_write_target(
 
     let (connection_id, _group_id, tag_id) = entry.ids;
 
-    // Simulation is a safety boundary, not a transport error. Check it before
-    // loading the PLC connection or touching the broker, audit, or rate-limit
-    // paths. Internal/mem tags deliberately remain writable as server-local
-    // values; computed tags are already rejected by `writable == false`.
-    if entry.tag_kind == PLC_TAG_KIND
-        && (entry.simulation || collection_mode == Some(RunMode::AllSimulation))
-    {
-        return Err(WriteRejection::SimulationWriteRejected);
-    }
+    // #363 (2026-09-15 オーナー決定): ここにあった「シミュレーション中の
+    // PLC タグは fail-closed で拒否する」ゲート(旧 gate 4)は撤去した -
+    // シミュレーションデバイスへの書き込みは PC 上のシミュレータへ反映する。
+    // 詳細はこのモジュールの doc comment「撤去: 旧ゲート4」節。実効
+    // シミュレーション中かどうかは拒否判断ではなくなったが、監査
+    // (log-before-write の `detail`)には残すので、同じ条件を
+    // [`write_target_detail`] が使う。
 
     // gate 4: 接続のプロトコルに broker ドライバが登録されていなければ
     // 非対応(#131、2026-09-01: `banto_broker::is_supported_protocol`/
@@ -604,12 +686,15 @@ async fn resolve_write_target(
         return Err(WriteRejection::UnsupportedValueType(None));
     };
 
+    let target = resolve_write_target_kind(&entry, collection_mode);
+
     Ok(ResolvedWrite {
         conn,
         entry,
         tag_id,
         tag_name: tag.to_string(),
         requested,
+        target,
     })
 }
 
@@ -698,6 +783,9 @@ struct PreparedWrite {
     /// ([`ConvertedValue`]のdoc comment参照)。
     value: ConvertedValue,
     tag_name: String,
+    /// #363: 監査 `detail` に載せる書き込み先の種別
+    /// ([`ResolvedWrite::target`] からそのまま持ち越す)。
+    target: Option<WriteTarget>,
 }
 
 async fn prepare_batch_entry(
@@ -722,6 +810,7 @@ async fn prepare_batch_entry(
         tag_id: resolved.tag_id,
         value,
         tag_name: resolved.tag_name,
+        target: resolved.target,
     })
 }
 
@@ -904,10 +993,15 @@ pub async fn execute_write(
     // the caller - so the write_audit record and the failed response always
     // agree on why. `Ok(())` has no detail (`None`), matching every other
     // successful write's audit row before this change.
+    //
+    // #363: the detail also carries `target` (simulator/plc) for a PLC tag -
+    // see `write_target_detail`. A successful simulated write therefore
+    // leaves `{"target":"simulator"}` behind rather than a NULL detail.
     let failure_detail = outcome.as_ref().err().and_then(WriteRejection::detail);
+    let detail = write_target_detail(resolved.target, failure_detail.as_deref());
     if let Err(err) = deps
         .write_audit
-        .set_result(audit_id, final_result, failure_detail.as_deref())
+        .set_result(audit_id, final_result, detail.as_deref())
         .await
     {
         eprintln!("banto-hub: 書き込み監査の確定に失敗しました: {err}");
@@ -1237,9 +1331,12 @@ pub async fn execute_write_batch(
             Err(_) => WriteAuditResult::Failed,
         };
         let failure_detail = outcome.as_ref().err().and_then(WriteRejection::detail);
+        // #363: internal タグの `target` は `None` なので、この合成は
+        // 従来どおり失敗理由だけを残す(`write_target_detail`参照)。
+        let detail = write_target_detail(p.target, failure_detail.as_deref());
         if let Err(err) = deps
             .write_audit
-            .set_result(audit_id, final_result, failure_detail.as_deref())
+            .set_result(audit_id, final_result, detail.as_deref())
             .await
         {
             eprintln!("banto-hub: 書き込み監査の確定(バッチ internal)に失敗しました: {err}");
@@ -1328,13 +1425,10 @@ pub async fn execute_write_batch(
                     sent_indices.push((i, audit_id));
                 }
                 Err(rejection) => {
+                    let detail = write_target_detail(p.target, rejection.detail().as_deref());
                     if let Err(err) = deps
                         .write_audit
-                        .set_result(
-                            audit_id,
-                            WriteAuditResult::Failed,
-                            rejection.detail().as_deref(),
-                        )
+                        .set_result(audit_id, WriteAuditResult::Failed, detail.as_deref())
                         .await
                     {
                         eprintln!("banto-hub: 書き込み監査の確定(バッチ PLC)に失敗しました: {err}");
@@ -1359,13 +1453,10 @@ pub async fn execute_write_batch(
                     "PLC への接続セッションがありません(書き込みは新しいセッションを開始しません。収集が稼働中か確認してください)"
                         .to_string(),
                 );
+                let detail = write_target_detail(prepared[i].target, rejection.detail().as_deref());
                 if let Err(err) = deps
                     .write_audit
-                    .set_result(
-                        audit_id,
-                        WriteAuditResult::Failed,
-                        rejection.detail().as_deref(),
-                    )
+                    .set_result(audit_id, WriteAuditResult::Failed, detail.as_deref())
                     .await
                 {
                     eprintln!("banto-hub: 書き込み監査の確定(バッチ PLC)に失敗しました: {err}");
@@ -1397,9 +1488,10 @@ pub async fn execute_write_batch(
                         Err(_) => WriteAuditResult::Failed,
                     };
                     let failure_detail = outcome.as_ref().err().and_then(WriteRejection::detail);
+                    let detail = write_target_detail(prepared[i].target, failure_detail.as_deref());
                     if let Err(err) = deps
                         .write_audit
-                        .set_result(audit_id, final_result, failure_detail.as_deref())
+                        .set_result(audit_id, final_result, detail.as_deref())
                         .await
                     {
                         eprintln!("banto-hub: 書き込み監査の確定(バッチ PLC)に失敗しました: {err}");
@@ -1415,13 +1507,11 @@ pub async fn execute_write_batch(
                 // `handle.write` の `Err(err)` 分岐と同じ扱い)。
                 for (i, audit_id) in sent_indices {
                     let rejection = WriteRejection::WriteFailed(err.to_string());
+                    let detail =
+                        write_target_detail(prepared[i].target, rejection.detail().as_deref());
                     if let Err(set_err) = deps
                         .write_audit
-                        .set_result(
-                            audit_id,
-                            WriteAuditResult::Failed,
-                            rejection.detail().as_deref(),
-                        )
+                        .set_result(audit_id, WriteAuditResult::Failed, detail.as_deref())
                         .await
                     {
                         eprintln!(
@@ -1760,7 +1850,6 @@ impl WriteRejection {
     pub fn rest_error_code(&self) -> &'static str {
         match self {
             WriteRejection::CollectionNotRunning(_) => "collection_not_running",
-            WriteRejection::SimulationWriteRejected => "simulation_write_rejected",
             WriteRejection::NotFound => "not_found",
             WriteRejection::NotWritable => "not_writable",
             WriteRejection::TagDisabled => "tag_disabled",
@@ -1823,15 +1912,26 @@ mod tests {
         );
     }
 
+    /// #363 (2026-09-15 オーナー決定): 実効シミュレーション中かどうかは
+    /// 拒否理由ではなく、log-before-write の監査 `detail` に載る
+    /// `target` になった。成功時は `target` のみ、失敗時は失敗理由を
+    /// 同じ JSON に併記する（`set_result` が `detail` 列を必ず上書きする
+    /// ため、target を残すには合成するしかない）。PLC 以外のタグ
+    /// （`target == None`）は従来どおり失敗理由だけを残す。
     #[test]
-    fn simulation_write_rejection_has_a_stable_wire_code() {
-        let rejection = WriteRejection::SimulationWriteRejected;
-
-        assert_eq!(rejection.rest_error_code(), "simulation_write_rejected");
-        assert_eq!(rejection.detail(), None);
+    fn the_audit_detail_carries_the_write_target() {
         assert_eq!(
-            rejection.to_json(),
-            json!({"error": "simulation_write_rejected"})
+            write_target_detail(Some(WriteTarget::Simulator), None).as_deref(),
+            Some(r#"{"target":"simulator"}"#)
+        );
+        assert_eq!(
+            write_target_detail(Some(WriteTarget::Plc), Some("応答タイムアウト")).as_deref(),
+            Some(r#"{"detail":"応答タイムアウト","target":"plc"}"#)
+        );
+        assert_eq!(write_target_detail(None, None), None);
+        assert_eq!(
+            write_target_detail(None, Some("書き戻し競合の可能性があります")).as_deref(),
+            Some("書き戻し競合の可能性があります")
         );
     }
 

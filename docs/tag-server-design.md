@@ -4,7 +4,10 @@
 状態: **実装追従中（2026-09-15 更新: #335 - computed タグ・接続単位シミュレー
 ション値の catalog 常時公開、外部読み取り出力のシミュレーションゲート撤廃を
 §4.2 に反映。同日追補: MQTT ペイロードに `value_source` を追加し
-（§5.3）、判定関数を `crate::value_source` へ共有化。2026-09-14 更新:
+（§5.3）、判定関数を `crate::value_source` へ共有化。同日追補 #363
+（v0.2.0-alpha.11）: シミュレーション中の書き込みを拒否せずシミュレータへ
+反映する契約を §6.5 に追加（書いた番地はランプ更新から外れ保持される。
+ワイヤ変更: `simulation_write_rejected` は返らない）。2026-09-14 更新:
 #341 の CRUD 契約改定を §4.3 に反映）**。
 起案時は設計先行だったが、
 apps/banto-hub として実装が進行 — T0〜T21 実装済み（T19 UX 群・T20 文字列/構造体/レシピ/ビット・T21 構成補助 MCP 管理面まで完了、詳細は下の 2026-09-06 更新）・残 T18-5c/d
@@ -1293,6 +1296,43 @@ BitInWord（ビット単体）は引き続き broker の Modbus ドライバが�
   列」という当時の記述は、**Modbus については 2026-09-08 に覆った**
   （virtual については引き続き正しい。`0010` のファイル自体は当時の判断の
   歴史的記録として書き換えず、`0017` のコメントで上書きする形にしている）。
+
+### 6.5 シミュレーション中の書き込みはシミュレータへ反映する（2026-09-15 オーナー決定、#363）
+
+**旧契約（撤回）**: PLC タグが `simulation = true` の接続配下にある、または
+全シミュレーション運転（`RunMode::AllSimulation`）中のとき、REST / gRPC /
+MCP からの書き込みは 503 `simulation_write_rejected`（gRPC は `UNAVAILABLE`）
+で fail-closed に拒否していた（`write_path.rs` の旧ゲート4。broker・監査・
+レート制限へ触れる前に短絡するため**監査ログにも残らなかった**）。
+
+**新契約**: PC 上のシミュレーションデバイスのタグへの外部書き込みは拒否せず、
+**in-process シミュレータへ反映する**。実機が無い状態で SCADA 等のクライアント
+が書き込み経路まで試験できるようにするための決定で、#335（外部出力＝読み取り
+出力であって PLC 書き込みではない、という整理）に伴う追補である。
+
+- **8段ゲートのうち撤回したのは「シミュレーション中は拒否」の1段だけ**。
+  per-tag `writable`・API キーの `write` スコープ・実効 enabled・プロトコル・
+  `write_enabled`（受付トグル）・レート制限とトリップ・値変換とレンジ検査・
+  log-before-write は、シミュレーション書き込みにも**そのまま**適用される。
+  収集停止中の fail-closed（`collection_not_running`）も変わらない。
+- **書いた番地はランプ更新から外れ保持される（held）**: シミュレーション接続の
+  broker セッションは `SlmpSimRegistry` がダイヤル先を in-process シミュレータ
+  へ差し替えて張ってあるので、gate 8 の `BrokerHandle::write` がそのまま
+  シミュレータに届く。`banto-plc` のシミュレータは #363 で書き込みコマンド
+  （Modbus FC5/6/15/16・SLMP `0x1401`）に対応し、ワイヤ経由で書かれた番地を
+  held として記録して `banto-collect` のランプ波更新（100ms 周期）の対象から
+  外す。したがって次のポーリングや `GET /api/v1/values/{tag}/read-now` で
+  書いた値がそのまま読み戻せる一方、書いていない隣の番地はランプで動き続ける。
+  held はシミュレータインスタンスと寿命を共にするので、接続の `simulation`
+  切替や全シミュレーション運転の開始・停止で消える。
+- **ワイヤ変更**: エラーコード `simulation_write_rejected`（REST 503 /
+  gRPC `UNAVAILABLE`）はもう返らない。
+- **監査**: log-before-write の `detail` に `{"target":"simulator"}` /
+  `{"target":"plc"}` を記録する（失敗時は `{"target":"...","detail":"失敗理由"}`）。
+  専用カラムは追加していない。
+- 実装: `crates/banto-plc/src/{modbus,slmp}/simulator.rs`（書き込みコマンドと
+  held）、`apps/banto-hub/core/src/write_path.rs`（旧ゲート4の撤去と `target`）。
+  E2E は `apps/banto-hub/core/tests/t9_simulation_write.rs`。
 
 ## 7. アプリ群の中でのタグサーバー — 中央レジストリ構想と移行ロードマップ
 

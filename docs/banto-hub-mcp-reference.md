@@ -4,7 +4,7 @@
 状態: **現行**。T19 S5（UX-41）で実装、T20 で `read_tag_now` / `write_recipe` を追加。
 2026-09-05 に実機 R08ENCPU（SLMP）でデータ面 6 ツールを検証済み、2026-09-06 に T21
 管理面を含む 31 ツール全数を実機で end-to-end 検証済み（結果は §9）。2026-09-06 に外部 DB 連携（[banto-hub-external-db-design.md](banto-hub-external-db-design.md) §5.2）で `test_saved_connection`（32 ツール目）・接続の `database`/`username`/`password`・グループの `querySql`・`db` tag_kind を同期。S4 で Sink グループ管理の 5 ツール追加で **37 ツール**となる。構成補助（管理面）ツールは §6。
-2026-09-08 に issue #325 で `data_type` に 64bit 型 `i64`/`u64`/`f64` を追加（§7）。Modbus 接続配下のタグのみ登録可（`create_tag`/`update_tag` は §6）。2026-09-14 に issue #340（v0.2.0-alpha.8）で §3「write-control」の記述を、write_enabled が既定で有効・収集操作で変わらない新挙動に更新。同日 issue #341（v0.2.0-alpha.9）で §6 の pending queue 注記を「ロックダウン済みのときのみ」に更新。
+2026-09-08 に issue #325 で `data_type` に 64bit 型 `i64`/`u64`/`f64` を追加（§7）。Modbus 接続配下のタグのみ登録可（`create_tag`/`update_tag` は §6）。2026-09-14 に issue #340（v0.2.0-alpha.8）で §3「write-control」の記述を、write_enabled が既定で有効・収集操作で変わらない新挙動に更新。同日 issue #341（v0.2.0-alpha.9）で §6 の pending queue 注記を「ロックダウン済みのときのみ」に更新。2026-09-15 に issue #363（v0.2.0-alpha.11）で §3 に「シミュレーション中の書き込みは拒否されずシミュレータへ反映される」を追記。
 関連: [tag-server-design.md](tag-server-design.md)（タグ空間・書き込み安全の一次ソース）、
 [banto-hub-t20-design.md](banto-hub-t20-design.md)（文字列・レシピ・ビットの設計）、
 [banto-hub-operations.md](banto-hub-operations.md)（起動・ポート・運用）。
@@ -61,8 +61,15 @@ MCP は REST/gRPC と**同じ `execute_write` / `execute_write_batch` を通り�
    旧記述「収集開始は write_enabled をリセットする」は撤回）。無効なら
    `set_write_control {enabled:true}` または `POST /api/write-control/enable`
    で有効化する。
-4. 各書き込みは per-tag の `writable` フラグ、write スコープ、シミュレーション/プロトコル、
+4. 各書き込みは per-tag の `writable` フラグ、write スコープ、プロトコル、
    レート制限、値変換（型対称性・レンジ）を通る。詳細は tag-server-design.md §6。
+5. **シミュレーション中の書き込みは拒否されない**（2026-09-15 オーナー決定
+   #363、v0.2.0-alpha.11 - 旧挙動「シミュレーション接続配下・全 PLC
+   シミュレーション運転中のタグへの書き込みを拒否する」は撤回）。値は PC 上の
+   内蔵シミュレータへ反映され、実機には出ない。書いた番地はシミュレータの
+   ランプ生成から外れて保持されるので、`read_tag_now` や通常の読み取りで
+   そのまま読み戻せる。上記の護り（1〜4）はシミュレーション書き込みにも
+   そのまま適用される。詳細は tag-server-design.md §6.5。
 
 ## 4. 読み取りツール
 

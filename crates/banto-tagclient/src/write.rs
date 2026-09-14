@@ -140,8 +140,10 @@ fn log_write_send_failure(endpoint: &Endpoint, error: &reqwest::Error) -> Error 
 ///   owner decision): 403 is a configuration/permission problem
 ///   (`not_writable` / `missing_write_scope` / `session_token_cannot_write` /
 ///   `key_tripped`) that will not go away on retry, while 503 is a transient
-///   server state (`writes_disabled` / `collection_not_running` /
-///   `simulation_write_rejected`) that may clear on its own.
+///   server state (`writes_disabled` / `collection_not_running`) that may
+///   clear on its own. (`simulation_write_rejected` was a third 503 code
+///   until #363, 2026-09-15, retired it - banto-hub now applies a write to a
+///   simulated device to the simulator instead of refusing it.)
 /// - 401 reuses [`ErrorKind::Unauthorized`], matching the read path's
 ///   treatment of an outright-rejected credential.
 /// - 404/409/422/429/501/502 collapse into [`ErrorKind::WriteRejected`]: each
