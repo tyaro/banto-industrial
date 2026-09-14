@@ -468,7 +468,8 @@ banto-hub は MQTT ブローカーへ接続しに行く**クライアント**と
 `internal` / `db`（詳細は [tag-server-design.md](tag-server-design.md)
 §4.2・§5.3）。全 PLC シミュレーション運転中も含め、この通常トピックへの
 publish はシミュレーションでゲートされない（同オーナー決定、旧テスト出力
-専用トピックは撤去済み）。
+専用トピック・その制御プレーン（`TestOutputControl`、`POST
+/api/test-output/*`）は #362 で撤去済み）。
 
 ### 運用上の注意
 

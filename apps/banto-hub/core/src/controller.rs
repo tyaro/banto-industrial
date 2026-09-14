@@ -22,7 +22,6 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::db_source::DbSourceEngine;
 use crate::hub::CollectorManager;
-use crate::test_output::TestOutputControl;
 
 /// A collection lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -94,13 +93,6 @@ pub type RuntimeStatus = CollectionStatus;
 /// The serialized collection lifecycle controller.
 pub struct CollectionController {
     manager: Arc<CollectorManager>,
-    /// T15-3（設計 §6.3）: `start_locked`/`stop_locked`/モード切替の遷移点で
-    /// `disable()`する - テスト出力が「現在の run コンテキストのみ」に
-    /// 留まることをここで保証する（`crate::test_output`のモジュール doc
-    /// comment参照）。2026-09-09 オーナー決定（#340）で `write_control` は
-    /// これらの遷移点から外れたが、`test_output` はここで引き続き連動する
-    /// （T15-3、変更なし）。
-    test_output: Arc<TestOutputControl>,
     /// 外部 DB 連携 S2b（docs/banto-hub-external-db-design.md §4.8・§6-16、
     /// 2026-09-06 オーナー決定「DB Source は収集が Running のときだけ
     /// 動く」）: `manager` が所有する `Arc` の複製
@@ -154,7 +146,7 @@ struct ControllerState {
 }
 
 impl CollectionController {
-    pub fn new(manager: Arc<CollectorManager>, test_output: Arc<TestOutputControl>) -> Self {
+    pub fn new(manager: Arc<CollectorManager>) -> Self {
         let initial = CollectionStatus {
             state: CollectionState::Stopped,
             mode: RunMode::Configured,
@@ -167,7 +159,6 @@ impl CollectionController {
         let db_source = manager.db_source_engine();
         Self {
             manager,
-            test_output,
             db_source,
             state: Mutex::new(ControllerState {
                 state: CollectionState::Stopped,
@@ -180,12 +171,6 @@ impl CollectionController {
             run_seq: AtomicU64::new(0),
             status_tx,
         }
-    }
-
-    /// T15-3: `crate::rest`の`GET /api/v1/status`の`test_output`欄と
-    /// `POST /api/test-output/enable|disable`ハンドラのため。
-    pub fn test_output(&self) -> Arc<TestOutputControl> {
-        self.test_output.clone()
     }
 
     /// Return the current state without waiting for an in-flight transition.
@@ -436,9 +421,6 @@ impl CollectionController {
 
         let current = self.status();
         if current.state == CollectionState::Stopped {
-            if current.mode != mode {
-                self.test_output.disable();
-            }
             self.set_mode_locked(mode);
             self.publish_status();
             return self.status();
@@ -481,7 +463,6 @@ impl CollectionController {
             state.context = Some(context);
             state.last_error = None;
         }
-        self.test_output.disable();
         self.publish_status();
 
         let result = self.manager.apply_run(mode).await;
@@ -524,7 +505,6 @@ impl CollectionController {
                 .expect("collection controller state lock poisoned");
             state.state = CollectionState::Stopping;
         }
-        self.test_output.disable();
         self.publish_status();
         // 外部 DB 連携 S2b（§4.8・§6-16）: `manager.stop()` より**前**に
         // 止める - DB Source のタスクは `ServerTagStore` への書き手なので、
@@ -604,8 +584,7 @@ mod tests {
             Arc::new(SlmpSimRegistry::new()),
             Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new()))),
         ));
-        let test_output = Arc::new(TestOutputControl::new());
-        let controller = Arc::new(CollectionController::new(manager, test_output));
+        let controller = Arc::new(CollectionController::new(manager));
         (dir, controller)
     }
 
@@ -819,47 +798,5 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    }
-
-    /// T15-3（設計 §6.3「停止／終了／切替／サービス再起動後に必ず無効へ
-    /// 戻る」）: `start_locked`/`stop_locked`/停止中のモード切替の遷移点で
-    /// `test_output`は必ず disable される（write_control は 2026-09-09
-    /// オーナー決定 #340 でこれらの遷移点から外れたが、test_output の
-    /// 連動は変更なし）。
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_output_auto_disables_on_every_lifecycle_transition() {
-        let (_dir, controller) = controller_env().await;
-        let test_output = controller.test_output();
-
-        let running = controller.start(RunMode::AllSimulation).await;
-        assert_eq!(running.state, CollectionState::Running);
-        let run_id = running.run_id.expect("running has a run_id");
-        test_output.enable(run_id);
-        assert!(test_output.is_active_for(Some(run_id)));
-
-        // 新規 start (別 run_id への切替) - 既存 run 用のアーミングは
-        // 引き継がれない。
-        let restarted = controller.start(RunMode::Configured).await;
-        assert_eq!(restarted.state, CollectionState::Running);
-        assert_ne!(restarted.run_id, running.run_id);
-        assert!(!test_output.is_enabled());
-        assert!(!test_output.is_active_for(restarted.run_id));
-
-        test_output.enable(restarted.run_id.expect("running has a run_id"));
-        assert!(test_output.is_enabled());
-        let stopped = controller.stop().await;
-        assert_eq!(stopped.state, CollectionState::Stopped);
-        assert!(!test_output.is_enabled(), "stop must disable test_output");
-
-        // 停止中のモード切替も disable する(要件「モード切替」)。
-        controller.set_mode(RunMode::AllSimulation).await;
-        let running_again = controller.start(RunMode::AllSimulation).await;
-        test_output.enable(running_again.run_id.expect("running has a run_id"));
-        assert!(test_output.is_enabled());
-        controller.set_mode(RunMode::Configured).await;
-        assert!(
-            !test_output.is_enabled(),
-            "a running->stopped mode switch must disable test_output"
-        );
     }
 }

@@ -146,10 +146,9 @@ enum CollectionState { Stopped, Starting, Running, Stopping, Faulted }
 enum RunMode { Configured, AllSimulation }        // AllSimulation の実装は T15
 struct RunContext { mode: RunMode, run_id: RunId } // Starting / Running のとき Some
 
-// 現行（2026-09-14、#340 反映後、`apps/banto-hub/core/src/controller.rs` と一致）:
+// 現行（2026-09-15、#362 反映後、`apps/banto-hub/core/src/controller.rs` と一致）:
 struct CollectionController {
     manager: Arc<CollectorManager>,
-    test_output: Arc<TestOutputControl>,    // T15-3、遷移点で OFF に連動（維持）
     state: Mutex<RuntimeState>,             // 現在状態 + RunContext
     transition: AsyncMutex<()>,             // 遷移の直列化（rebuild_lock とは別レイヤ）
     status_tx: watch::Sender<RuntimeStatus>,// D4 の running 側 watch
@@ -157,6 +156,9 @@ struct CollectionController {
 }
 // （履歴、2026-09-09 #340 で撤回）設計当初は `write_control: Arc<WriteControl>` も
 // フィールドとして保持し、全遷移の先頭で `write_control.disable()` を呼ぶ想定だった。
+// （履歴、2026-09-15 #362 で撤去）2026-09-14 時点までは
+// `test_output: Arc<TestOutputControl>`（T15-3、遷移点で OFF に連動）も
+// フィールドとして持っていたが、`TestOutputControl` 機構自体を撤去した。
 ```
 
 決定:
@@ -170,7 +172,7 @@ struct CollectionController {
   「遷移中なら即座に現在状態を返す」形で実装する。
 - **run_id**: `run_seq` の `fetch_add` で採番（`Date`/乱数に依存しない単調 ID）。開始ごとに変わり
   再利用しない（plan §5.4）。
-- **遷移の先頭で必ず書き込み受付を OFF**（D6、§7 step2）。（2026-09-09 オーナー決定 #340 で撤回: 書き込み受付は遷移で OFF にしない。test_output の OFF 連動は維持）
+- **遷移の先頭で必ず書き込み受付を OFF**（D6、§7 step2）。（2026-09-09 オーナー決定 #340 で撤回: 書き込み受付は遷移で OFF にしない。test_output の OFF 連動は #362 で機構ごと撤去）
 - **`configured` ⇄ `all_simulation` の切替は必ず `stopped` を経由**（plan §4.3）。
 - **`faulted`**: start / stop / 切替の失敗で入る。実機収集を自動再開しない。診断（`last_runtime_error`）
   を残し、明示操作を待つ。特に **SCM がサービスを起動して `apply_run(Configured)` が失敗した場合は
@@ -294,7 +296,7 @@ async fn apply_run(&self, mode: RunMode) -> Result<RunReport, ConfigError>;
 ## 8. D6 — 書き込み受付 OFF 連動と no-spawn（P5）
 
 （2026-09-09 オーナー決定 #340 で撤回: 書き込み受付は遷移で OFF にしない。
-test_output の OFF 連動は維持。停止中の書き込みは本節が既に別に持っている
+test_output の OFF 連動は #362 で機構ごと撤去。停止中の書き込みは本節が既に別に持っている
 `CollectionNotRunning` ゲート（`execute_write` 冒頭、write_control とは
 独立）と gate 8 の no-spawn peek（T15-4）が引き続き拒否するため、
 write_control 側の自動 OFF は安全上不要だった。）
@@ -303,8 +305,8 @@ write_control 側の自動 OFF は安全上不要だった。）
 #340 で撤回）」を付して残す）:
 
 - **`CollectionController` は `write_control` を持たない**。start/stop/mode 切替の
-  遷移点で書き込み受付を OFF にすることはない（test_output の OFF 連動のみ維持、
-  T15-3）。書き込み可否は per-tag `writable` と API キーの `write` スコープが担う
+  遷移点で書き込み受付を OFF にすることはない（旧 test_output の OFF 連動、
+  T15-3、も #362 で機構ごと撤去）。書き込み可否は per-tag `writable` と API キーの `write` スコープが担う
   （tag-server-design.md §6-6）。
   - （履歴、2026-09-09 #340 で撤回）`CollectionController` が `Arc<WriteControl>` を
     保持し、全遷移（start/stop/mode 切替）の先頭で `write_control.disable()` を
@@ -396,7 +398,10 @@ impl SessionDirectory {
 controller の stop / mode 切替は次の順で実行する（plan §7 を本設計の API へ具体化）:
 
 1. `transition` ロックで直列化し、`Stopping` を公開（`status_tx`）。
-2. `test_output.disable()`（T15-3、現在の run コンテキスト限定のテスト出力を無効化）。
+2. 旧: `test_output.disable()`（T15-3、現在の run コンテキスト限定のテスト出力を
+   無効化）していたが、`TestOutputControl` 機構自体が #362（v0.2.0-alpha.12）で
+   撤去されたため、この手順は無い（撤去済み・経緯として保存。番号は既存の他
+   ステップ参照との整合のため詰めていない）。
    （履歴、2026-09-09 #340 で撤回）以前はここで `write_control.disable()`（自動復元しない）を
    呼んでいた。現行は write_control を停止シーケンスで触らない
    （tag-server-design.md §6-6、controller.rs は write_control 自体を持たない）。
@@ -457,7 +462,9 @@ plan §15「大規模項目は1サブスライス1PR」を T14 へ適用（rest.
 
 - **全 PLC シミュレーション（`RunMode::AllSimulation` の実体）**は T15。本設計は enum と遷移の器だけ用意。
 - **MQTT/gRPC の SIM 時ポリシー**（全 PLC SIM 中は既定 OFF・既存 stream 能動終了・テスト出力）は T15。
-  T14 では MQTT を running 発火へ寄せる配線までを行う。
+  T14 では MQTT を running 発火へ寄せる配線までを行う（このポリシー自体は
+  2026-09-15 オーナー決定 #335 で撤回、テスト出力機構は #362 で撤去済み -
+  現行契約は tag-server-design.md §4.2 を正とする）。
 - **HubSessions の write 可能 peek（spawn 無し）** は T15（write-during-SIM）で追加。
 - **desktop⇔service 切替の中間状態**（2プロセス + SCM を跨ぐ）は T16/T17。本設計の状態機械は単一
   プロセス内に閉じる。切替進行はシェル（ネイティブ側）が所有する（plan §16.3 参照）。
