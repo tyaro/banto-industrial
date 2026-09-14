@@ -1743,6 +1743,70 @@ async fn collection_stop(
     collection_control_result(&state, &headers, "stop", status).await
 }
 
+/// #341 レビュー対応（2026-09-14）: `POST /api/collection/reapply`（admin）-
+/// **最新の DB 内容を catalog と実行構成へ適用し直す**。他の
+/// `/api/collection/*` と違い、収集のライフサイクル（start/stop/mode）には
+/// 一切触らない。
+///
+/// 用途は「`live_reconfigure_failed`（500）で反映だけ失敗した後の回復」。
+/// レジストリ行は既にコミット済みなので、同じ
+/// [`CollectionController::commit_catalog_and_apply_live`]
+/// をもう一度通せばよい（収集 `Running` なら無停止で実行構成まで、
+/// `Stopped` 等なら catalog だけ）- 収集を止めて開始し直す必要はない。
+/// 冪等（何度呼んでも同じ DB 状態を適用し直すだけ）。
+///
+/// MCP には**あえて足していない**: 回復操作であって構成操作ではなく、
+/// `crate::mcp` の構成ツールはどれも自分の mutation の直後に同じ経路を
+/// 通るため（T21 の「REST と二重実装しない」規律）。
+async fn collection_reapply(
+    State(state): State<CollectionAdminState>,
+    headers: HeaderMap,
+) -> Response {
+    match state.controller.commit_catalog_and_apply_live().await {
+        Ok(()) => {
+            let status = state.controller.status();
+            collection_control_result(&state, &headers, "reapply", status)
+                .await
+                .into_response()
+        }
+        Err(message) => {
+            record_collection_reapply_failure(&state, &headers, &message).await;
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "live_reconfigure_failed",
+                    "message": format!("実行構成への反映に失敗しました: {message}"),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// [`collection_reapply`] の失敗時の監査行 - `record_write`（成功専用、
+/// `result: "ok"` 固定）とは別に `result: "failed"` で記録する
+/// （#340 の [`record_write_control_failure`] と同じ型）。
+async fn record_collection_reapply_failure(
+    state: &CollectionAdminState,
+    headers: &HeaderMap,
+    error: &str,
+) {
+    let identity = actor_identity(headers, &state.auth, &state.commissioning);
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: identity.as_ref().map(|i| i.id.as_str()),
+            actor_role: identity.as_ref().map(|i| i.role.as_str()),
+            action: "reapply",
+            resource: "collection",
+            entity_id: Some("1"),
+            detail: Some(json!({ "error": error })),
+            origin: "rest",
+            result: "failed",
+        })
+        .await;
+}
+
 async fn collection_set_mode(
     State(state): State<CollectionAdminState>,
     headers: HeaderMap,
@@ -1805,6 +1869,10 @@ fn collection_control_router(
             post(collection_start_all_simulation),
         )
         .route("/api/collection/stop", post(collection_stop))
+        // #341 レビュー対応（2026-09-14）: 反映失敗からの回復手段
+        // （`LIVE_APPLY_RECOVERY_HINT`）。`collection_reapply` の doc
+        // comment 参照。
+        .route("/api/collection/reapply", post(collection_reapply))
         .route(
             "/api/collection/mode",
             post(collection_set_mode).put(collection_set_mode),
@@ -2927,13 +2995,21 @@ impl From<TagPayload> for TagInput {
 // T21 S1-b（docs/banto-hub-t21-design.md §5）: `pub(crate)` にして
 // `crate::mcp` の構成補助ツール（`create_connection`/`delete_connection`）
 // からも同じ経路を呼べるようにする。
+/// #341 レビュー対応（2026-09-14）: 実行構成への反映に失敗したときの
+/// **回復手段**をエラー文言に必ず添える。DB には既に入っているので、
+/// 反映は「もう一度何か構成を変える」「収集を止めて開始し直す」
+/// 「`POST /api/collection/reapply`（admin）を叩く」のいずれでも再試行
+/// できる - どれも同じ `CollectionController::commit_catalog_and_apply_live`
+/// を通るため。
+pub(crate) const LIVE_APPLY_RECOVERY_HINT: &str =
+    "（変更は保存済みです。次の構成変更、収集の停止→開始、または POST /api/collection/reapply で再反映できます）";
+
 pub(crate) async fn commit_catalog_and_notify(
     controller: &CollectionController,
     events: &broadcast::Sender<ServerEvent>,
     resource: &str,
-    snapshot: RegistrySnapshot,
 ) -> Result<(), String> {
-    let result = controller.commit_catalog_and_apply_live(&snapshot).await;
+    let result = controller.commit_catalog_and_apply_live().await;
     // 成否によらず status watch を更新する - 失敗時も `configured_revision`
     // だけは進んでいる（catalog commit は成功したが実行構成への適用で
     // 失敗した）場合があり、購読者にはその事実をそのまま見せる。
@@ -3212,7 +3288,7 @@ impl IntoResponse for RegistryMutationError {
                 Json(json!({
                     "error": "live_reconfigure_failed",
                     "message": format!(
-                        "変更は保存しましたが、実行構成への反映に失敗しました: {message}"
+                        "変更は保存しましたが、実行構成への反映に失敗しました: {message}{LIVE_APPLY_RECOVERY_HINT}"
                     ),
                 })),
             )
@@ -3297,7 +3373,11 @@ async fn plc_connections_create(
             return Err(ApiError(err).into());
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: この snapshot は**保存前検証（preflight）専用**。
+    // catalog へ反映するのは `CollectionController::commit_catalog_and_apply_live`
+    // が transition ロックの下で読み直す最新の snapshot（同 fn の doc
+    // comment「古い snapshot の窓」節）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -3316,14 +3396,9 @@ async fn plc_connections_create(
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
-    commit_catalog_and_notify(
-        &state.controller,
-        &state.events,
-        "plc_connections",
-        snapshot,
-    )
-    .await
-    .map_err(RegistryMutationError::LiveApplyFailed)?;
+    commit_catalog_and_notify(&state.controller, &state.events, "plc_connections")
+        .await
+        .map_err(RegistryMutationError::LiveApplyFailed)?;
     Ok(Json(PlcConnectionResponse::from(created)).into_response())
 }
 
@@ -3370,7 +3445,11 @@ async fn plc_connections_update(
             return Err(ApiError(err).into());
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: この snapshot は**保存前検証（preflight）専用**。
+    // catalog へ反映するのは `CollectionController::commit_catalog_and_apply_live`
+    // が transition ロックの下で読み直す最新の snapshot（同 fn の doc
+    // comment「古い snapshot の窓」節）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -3389,14 +3468,9 @@ async fn plc_connections_update(
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
-    commit_catalog_and_notify(
-        &state.controller,
-        &state.events,
-        "plc_connections",
-        snapshot,
-    )
-    .await
-    .map_err(RegistryMutationError::LiveApplyFailed)?;
+    commit_catalog_and_notify(&state.controller, &state.events, "plc_connections")
+        .await
+        .map_err(RegistryMutationError::LiveApplyFailed)?;
     Ok(Json(PlcConnectionResponse::from(updated)).into_response())
 }
 
@@ -3456,7 +3530,11 @@ async fn plc_connections_delete(
             return Err(ApiError(err).into());
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: この snapshot は**保存前検証（preflight）専用**。
+    // catalog へ反映するのは `CollectionController::commit_catalog_and_apply_live`
+    // が transition ロックの下で読み直す最新の snapshot（同 fn の doc
+    // comment「古い snapshot の窓」節）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -3480,14 +3558,9 @@ async fn plc_connections_delete(
         })),
     )
     .await;
-    commit_catalog_and_notify(
-        &state.controller,
-        &state.events,
-        "plc_connections",
-        snapshot,
-    )
-    .await
-    .map_err(RegistryMutationError::LiveApplyFailed)?;
+    commit_catalog_and_notify(&state.controller, &state.events, "plc_connections")
+        .await
+        .map_err(RegistryMutationError::LiveApplyFailed)?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -4197,7 +4270,11 @@ async fn collection_groups_create(
             return Err(ApiError(err).into());
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: この snapshot は**保存前検証（preflight）専用**。
+    // catalog へ反映するのは `CollectionController::commit_catalog_and_apply_live`
+    // が transition ロックの下で読み直す最新の snapshot（同 fn の doc
+    // comment「古い snapshot の窓」節）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -4216,14 +4293,9 @@ async fn collection_groups_create(
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
-    commit_catalog_and_notify(
-        &state.controller,
-        &state.events,
-        "collection_groups",
-        snapshot,
-    )
-    .await
-    .map_err(RegistryMutationError::LiveApplyFailed)?;
+    commit_catalog_and_notify(&state.controller, &state.events, "collection_groups")
+        .await
+        .map_err(RegistryMutationError::LiveApplyFailed)?;
     Ok(Json(created).into_response())
 }
 
@@ -4270,7 +4342,11 @@ async fn collection_groups_update(
             return Err(ApiError(err).into());
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: この snapshot は**保存前検証（preflight）専用**。
+    // catalog へ反映するのは `CollectionController::commit_catalog_and_apply_live`
+    // が transition ロックの下で読み直す最新の snapshot（同 fn の doc
+    // comment「古い snapshot の窓」節）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -4289,14 +4365,9 @@ async fn collection_groups_update(
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
-    commit_catalog_and_notify(
-        &state.controller,
-        &state.events,
-        "collection_groups",
-        snapshot,
-    )
-    .await
-    .map_err(RegistryMutationError::LiveApplyFailed)?;
+    commit_catalog_and_notify(&state.controller, &state.events, "collection_groups")
+        .await
+        .map_err(RegistryMutationError::LiveApplyFailed)?;
     Ok(Json(updated).into_response())
 }
 
@@ -4342,7 +4413,11 @@ async fn collection_groups_delete(
             return Err(ApiError(err).into());
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: この snapshot は**保存前検証（preflight）専用**。
+    // catalog へ反映するのは `CollectionController::commit_catalog_and_apply_live`
+    // が transition ロックの下で読み直す最新の snapshot（同 fn の doc
+    // comment「古い snapshot の窓」節）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -4363,14 +4438,9 @@ async fn collection_groups_delete(
         })),
     )
     .await;
-    commit_catalog_and_notify(
-        &state.controller,
-        &state.events,
-        "collection_groups",
-        snapshot,
-    )
-    .await
-    .map_err(RegistryMutationError::LiveApplyFailed)?;
+    commit_catalog_and_notify(&state.controller, &state.events, "collection_groups")
+        .await
+        .map_err(RegistryMutationError::LiveApplyFailed)?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -4559,7 +4629,11 @@ async fn tags_create(
             return Err(ApiError(err).into());
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: この snapshot は**保存前検証（preflight）専用**。
+    // catalog へ反映するのは `CollectionController::commit_catalog_and_apply_live`
+    // が transition ロックの下で読み直す最新の snapshot（同 fn の doc
+    // comment「古い snapshot の窓」節）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -4578,7 +4652,7 @@ async fn tags_create(
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
-    commit_catalog_and_notify(&state.controller, &state.events, "tags", snapshot)
+    commit_catalog_and_notify(&state.controller, &state.events, "tags")
         .await
         .map_err(RegistryMutationError::LiveApplyFailed)?;
     Ok(Json(created).into_response())
@@ -4628,7 +4702,11 @@ async fn tags_update(
             return Err(err.into());
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: この snapshot は**保存前検証（preflight）専用**。
+    // catalog へ反映するのは `CollectionController::commit_catalog_and_apply_live`
+    // が transition ロックの下で読み直す最新の snapshot（同 fn の doc
+    // comment「古い snapshot の窓」節）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -4647,7 +4725,7 @@ async fn tags_update(
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
-    commit_catalog_and_notify(&state.controller, &state.events, "tags", snapshot)
+    commit_catalog_and_notify(&state.controller, &state.events, "tags")
         .await
         .map_err(RegistryMutationError::LiveApplyFailed)?;
     Ok(Json(updated).into_response())
@@ -4695,7 +4773,11 @@ async fn tags_delete(
         let _ = tx.rollback().await;
         return Err(ApiError(err).into());
     }
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: この snapshot は**保存前検証（preflight）専用**。
+    // catalog へ反映するのは `CollectionController::commit_catalog_and_apply_live`
+    // が transition ロックの下で読み直す最新の snapshot（同 fn の doc
+    // comment「古い snapshot の窓」節）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -4714,7 +4796,7 @@ async fn tags_delete(
         None,
     )
     .await;
-    commit_catalog_and_notify(&state.controller, &state.events, "tags", snapshot)
+    commit_catalog_and_notify(&state.controller, &state.events, "tags")
         .await
         .map_err(RegistryMutationError::LiveApplyFailed)?;
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -4864,7 +4946,9 @@ impl PendingApplyError {
                 banto_error_detail(&err.0)
             ),
             Self::LiveApplyFailed(message) => {
-                format!("変更は保存しましたが、実行構成への反映に失敗しました: {message}")
+                format!(
+                    "変更は保存しましたが、実行構成への反映に失敗しました: {message}{LIVE_APPLY_RECOVERY_HINT}"
+                )
             }
             Self::Conflict { resource } => pending_apply_conflict_message(resource),
         }
@@ -4880,7 +4964,7 @@ impl IntoResponse for PendingApplyError {
                 Json(json!({
                     "error": "live_reconfigure_failed",
                     "message": format!(
-                        "変更は保存しましたが、実行構成への反映に失敗しました: {message}"
+                        "変更は保存しましたが、実行構成への反映に失敗しました: {message}{LIVE_APPLY_RECOVERY_HINT}"
                     ),
                 })),
             )
@@ -5248,7 +5332,11 @@ async fn execute_pending_apply(
         }
     };
 
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: この snapshot は**保存前検証（preflight）専用**。
+    // catalog へ反映するのは `CollectionController::commit_catalog_and_apply_live`
+    // が transition ロックの下で読み直す最新の snapshot（同 fn の doc
+    // comment「古い snapshot の窓」節）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -5260,7 +5348,7 @@ async fn execute_pending_apply(
         return Err(PendingApplyError::Api(storage_api_error(err)));
     }
 
-    commit_catalog_and_notify(&state.controller, &state.events, resource, snapshot)
+    commit_catalog_and_notify(&state.controller, &state.events, resource)
         .await
         .map_err(PendingApplyError::LiveApplyFailed)?;
 
@@ -5360,12 +5448,35 @@ async fn pending_changes_apply(
                     None
                 }
             };
+            // #341 レビュー対応（2026-09-14）: 成功時の `record_write`
+            // （`result: "ok"`）と対になる失敗の監査行。DB へは適用済み
+            // （行は `applied`）で実行構成への反映だけが失敗した、という
+            // 事実がここだけからしか追えないため、必ず残す
+            // （#340 の `record_write_control_failure` と同じ型）。
+            let identity = actor_identity(&headers, &state.auth, &state.commissioning);
+            state
+                .audit
+                .record(AuditEntry {
+                    actor_username: identity.as_ref().map(|i| i.id.as_str()),
+                    actor_role: identity.as_ref().map(|i| i.role.as_str()),
+                    action: "apply",
+                    resource: "pending_changes",
+                    entity_id: Some(&id.to_string()),
+                    detail: Some(json!({
+                        "source": applying.source,
+                        "failureReason": failure_reason,
+                        "note": "DB への適用は成功したが、実行構成への反映に失敗した",
+                    })),
+                    origin: "rest",
+                    result: "failed",
+                })
+                .await;
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({
                     "error": "live_reconfigure_failed",
                     "message": format!(
-                        "変更は保存しましたが、実行構成への反映に失敗しました: {message}"
+                        "変更は保存しましたが、実行構成への反映に失敗しました: {message}{LIVE_APPLY_RECOVERY_HINT}"
                     ),
                     "failureReason": failure_reason,
                     "pending": applied,
@@ -5620,7 +5731,8 @@ async fn tags_batch(
             .into_response())
         }
         BatchTagOutcome::Valid { count, tags } => {
-            let snapshot = match preflight_transaction(&mut tx).await {
+            // #341 レビュー対応: 上記と同じ - preflight 専用。
+            let _preflighted = match preflight_transaction(&mut tx).await {
                 Ok(snapshot) => snapshot,
                 Err(err) => {
                     let _ = tx.rollback().await;
@@ -5643,7 +5755,7 @@ async fn tags_batch(
                 )
                 .await;
                 // T11-1 の核心: n 件でも catalog commit はここで1回だけ。
-                commit_catalog_and_notify(&state.controller, &state.events, "tags", snapshot)
+                commit_catalog_and_notify(&state.controller, &state.events, "tags")
                     .await
                     .map_err(RegistryMutationError::LiveApplyFailed)?;
             }
@@ -5809,7 +5921,8 @@ async fn tags_batch_update(
             .into_response())
         }
         BatchTagUpdateOutcome::Valid { count, tags } => {
-            let snapshot = match preflight_transaction(&mut tx).await {
+            // #341 レビュー対応: 上記と同じ - preflight 専用。
+            let _preflighted = match preflight_transaction(&mut tx).await {
                 Ok(snapshot) => snapshot,
                 Err(err) => {
                     let _ = tx.rollback().await;
@@ -5833,7 +5946,7 @@ async fn tags_batch_update(
                 .await;
                 // T18-3b の核心 (tags_batch/T11-1 と同じ): n 件でも catalog
                 // commit はここで1回だけ。
-                commit_catalog_and_notify(&state.controller, &state.events, "tags", snapshot)
+                commit_catalog_and_notify(&state.controller, &state.events, "tags")
                     .await
                     .map_err(RegistryMutationError::LiveApplyFailed)?;
             }
@@ -5976,7 +6089,8 @@ async fn tags_batch_delete(
                     return Err(ApiError(err).into());
                 }
             }
-            let snapshot = match preflight_transaction(&mut tx).await {
+            // #341 レビュー対応: 上記と同じ - preflight 専用。
+            let _preflighted = match preflight_transaction(&mut tx).await {
                 Ok(snapshot) => snapshot,
                 Err(err) => {
                     let _ = tx.rollback().await;
@@ -5999,7 +6113,7 @@ async fn tags_batch_delete(
             .await;
             // tags_batch/tags_batch_update と同じ核心: n 件でも catalog
             // commit はここで1回だけ。
-            commit_catalog_and_notify(&state.controller, &state.events, "tags", snapshot)
+            commit_catalog_and_notify(&state.controller, &state.events, "tags")
                 .await
                 .map_err(RegistryMutationError::LiveApplyFailed)?;
             Ok(Json(BatchTagsDeleteResponse {
@@ -9583,6 +9697,16 @@ fn preflight_snapshot(snapshot: &RegistrySnapshot) -> Result<(), ApiError> {
         .map_err(|err| preflight_api_error(format!("catalog の検証に失敗しました: {err}")))?;
     crate::computed::build_plan(&map)
         .map_err(|err| preflight_api_error(format!("演算タグの検証に失敗しました: {err}")))?;
+    // #341 レビュー対応（2026-09-14）: DB Source の計画もここで検証する。
+    // `CollectorManager::commit_catalog` は catalog・演算 plan・DB Source
+    // plan の3つを検証してから入れ替えるが、preflight が前2つしか見て
+    // いなかったため「保存は通ったのに commit_catalog が検証で落ちる」
+    // （= `commit_catalog_and_notify` が 500 を返す）余地が残っていた。
+    // 3つ揃えたことで、保存後の commit で残る失敗要因はストレージ障害と
+    // 走行中の collector 側の適用失敗だけになる（保存前検証が「保存成功 ＝
+    // 実行可能」を保証する T14-3 の設計どおり）。
+    crate::db_source::build_plan(snapshot)
+        .map_err(|err| preflight_api_error(format!("DB Source の検証に失敗しました: {err}")))?;
     build_config_from(snapshot)
         .map(|_| ())
         .map_err(|err| preflight_api_error(err.to_string()))
@@ -9789,6 +9913,11 @@ mod tests {
         viewer_token: String,
         api_keys: ApiKeysService,
         pool: sqlx::SqlitePool,
+        /// #341 レビュー対応: router が使っているものと**同じ**
+        /// `CollectorManager`。`fail_next_apply_for_test`（テスト専用の
+        /// 失敗注入、`crate::hub` 参照）を endpoint 越しのテストから
+        /// 呼ぶために持つ。
+        manager: Arc<CollectorManager>,
         _dir: tempfile::TempDir,
     }
 
@@ -9909,7 +10038,7 @@ mod tests {
             collection_groups,
             tags,
             api_keys.clone(),
-            manager,
+            manager.clone(),
             auth,
             commissioning,
             tx,
@@ -9927,6 +10056,7 @@ mod tests {
             viewer_token,
             api_keys,
             pool,
+            manager,
             _dir: dir,
         }
     }
@@ -10262,8 +10392,7 @@ mod tests {
             .await
             .unwrap();
 
-        let snapshot = RegistrySnapshot::load(&pool).await.expect("snapshot");
-        commit_catalog_and_notify(&controller, &events, "tags", snapshot)
+        commit_catalog_and_notify(&controller, &events, "tags")
             .await
             .expect("live apply");
 
@@ -10331,8 +10460,7 @@ mod tests {
             .await
             .unwrap();
 
-        let snapshot = RegistrySnapshot::load(&pool).await.expect("snapshot");
-        commit_catalog_and_notify(&controller, &events, "tags", snapshot)
+        commit_catalog_and_notify(&controller, &events, "tags")
             .await
             .expect("live apply");
 
@@ -10422,8 +10550,7 @@ mod tests {
             .await
             .unwrap();
 
-        let snapshot = RegistrySnapshot::load(&pool).await.expect("snapshot");
-        commit_catalog_and_notify(&controller, &events, "collection_groups", snapshot)
+        commit_catalog_and_notify(&controller, &events, "collection_groups")
             .await
             .expect("live apply");
 
@@ -12579,6 +12706,215 @@ mod tests {
 
         let requeued = pending_changes.get(pending_id).await.unwrap();
         assert_eq!(requeued.state, PendingChangeState::Pending);
+    }
+
+    /// #341 レビュー対応（2026-09-14）: エラー変換だけを見る
+    /// `live_apply_failure_is_http_500_with_live_reconfigure_failed` とは別に、
+    /// **endpoint 越し**に「DB への適用は成功したが実行構成への反映だけが
+    /// 失敗した」状態を作り、契約4点を一度に固定する:
+    ///
+    /// 1. `POST /api/pending-changes/{id}/apply` は 500
+    ///    `live_reconfigure_failed`（回復手段の案内つき）
+    /// 2. pending change の行は **`applied`**（`failed` にしない - DB へは
+    ///    入っているので requeue で二重適用させない）
+    /// 3. 監査ログに `result = "failed"` の行が残る
+    /// 4. 理由が `/api/status` の `lastConfigError` からも読める
+    ///
+    /// 反映失敗は `CollectorManager` のテスト専用フック
+    /// （`fail_next_apply_for_test`、同モジュール参照）で決定的に起こす -
+    /// 本物の失敗要因（tstore の writer を開けない）を OS 越しに再現するのは
+    /// プラットフォーム依存が強すぎるため。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_apply_live_reconfigure_failure_is_500_and_marks_applied() {
+        let env = test_env().await;
+
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line-live-fail", "host": "127.0.0.1", "port": 15026 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+
+        let (status, group) = admin_post(
+            &env.router,
+            "/api/collection-groups",
+            &env.admin_token,
+            json!({ "name": "fast", "plcConnectionId": conn["id"], "periodMs": 100 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{group:?}");
+
+        let start = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/start")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+
+        // ロックダウン済み + 収集中なので queue へ。
+        let (status, queued) = admin_post(
+            &env.router,
+            "/api/tags",
+            &env.admin_token,
+            json!({
+                "name": "temp-live-fail-01",
+                "collectionGroupId": group["id"],
+                "address": "40001",
+                "dataType": "i16",
+                "enabled": true
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{queued:?}");
+        let pending_id = queued["pending"]["id"].as_i64().expect("pending id");
+
+        // 次の `apply_run`（= 明示適用の live re-apply）だけを失敗させる。
+        env.manager.fail_next_apply_for_test();
+
+        let response = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post(format!("/api/pending-changes/{pending_id}/apply"))
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "live_reconfigure_failed", "{body:?}");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("テスト用に注入された"), "{body:?}");
+        assert!(
+            message.contains("POST /api/collection/reapply"),
+            "回復手段が案内されること: {body:?}"
+        );
+
+        // 2. DB へは適用済みなので行は applied（failed にしない）。
+        assert_eq!(body["pending"]["state"], "applied", "{body:?}");
+        let pending = PendingChangesService::new(env.pool.clone())
+            .get(pending_id)
+            .await
+            .unwrap();
+        assert_eq!(pending.state, PendingChangeState::Applied);
+        let (status, tags) = admin_get(&env.router, "/api/tags", &env.admin_token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            tags.as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == "temp-live-fail-01"),
+            "レジストリ行自体は入っていること: {tags:?}"
+        );
+
+        // 3. 監査ログに失敗行が残る。
+        let audited: Vec<(String, String)> = sqlx::query_as(
+            "SELECT action, result FROM audit_log WHERE resource = 'pending_changes' ORDER BY id",
+        )
+        .fetch_all(&env.pool)
+        .await
+        .unwrap();
+        assert!(
+            audited
+                .iter()
+                .any(|(action, result)| action == "apply" && result == "failed"),
+            "{audited:?}"
+        );
+
+        // 4. 理由が `/api/status` からも読める。
+        let (status, runtime) = admin_get(&env.router, "/api/status", &env.admin_token).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            runtime["lastConfigError"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("テスト用に注入された"),
+            "{runtime:?}"
+        );
+        // 収集自体は止まっていない。
+        assert_eq!(runtime["collectionState"], "running", "{runtime:?}");
+    }
+
+    /// #341 レビュー対応（2026-09-14）: 反映失敗からの回復手段
+    /// `POST /api/collection/reapply` が、収集を止めずに最新の DB 内容を
+    /// 適用し直せること（`collection_reapply` の doc comment）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collection_reapply_reapplies_the_latest_registry_without_stopping() {
+        let env = test_env().await;
+
+        let (status, conn) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": "line-reapply", "host": "127.0.0.1", "port": 15027 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{conn:?}");
+
+        let start = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/start")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(start.status(), StatusCode::OK);
+        let (_, before) = admin_get(&env.router, "/api/status", &env.admin_token).await;
+        let run_id_before = before["runId"].as_u64();
+
+        let reapply = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/reapply")
+                    .header("Authorization", format!("Bearer {}", env.admin_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reapply.status(), StatusCode::OK);
+
+        let (_, after) = admin_get(&env.router, "/api/status", &env.admin_token).await;
+        assert_eq!(after["collectionState"], "running", "{after:?}");
+        assert_eq!(after["runId"].as_u64(), run_id_before, "{after:?}");
+        assert!(after["lastConfigError"].is_null(), "{after:?}");
+
+        // viewer は admin 専用ルーターに弾かれる。
+        let forbidden = env
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::post("/api/collection/reapply")
+                    .header("Authorization", format!("Bearer {}", env.viewer_token))
+                    .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
     }
 
     /// TAG-P0-3 follow-up（2026-08-14）: 一過性の失敗は requeue → 失敗要因の

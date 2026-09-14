@@ -20,9 +20,14 @@ banto-industrial のリリースノート。日付は JST。バージョンは [
   - DB へはコミットできたが実行構成へ反映できなかった場合、200 + 警告ではなく `500 live_reconfigure_failed` を返す（走行中の収集は元の構成のまま無傷。理由は `GET /api/status` の `lastConfigError` にも残る）。
   - 管理 UI: タグ画面の表編集モードを「停止中、または試運転中」に緩和。状態ページに構成変更がいつ反映されるかの注記を追加。
   - 互換ルーター専用だった `legacy_live_reconfigure`（pre-T14-3 の live apply opt-in）は、この新経路に置き換わったため撤去した。
+  - **`POST /api/collection/reapply`（admin）を追加**。反映だけが失敗した後の回復用に、最新の DB 内容を catalog と実行構成へ適用し直す（収集 `Running` なら無停止、`Stopped` なら catalog のみ）。収集のライフサイクル（start/stop/mode）には触らない冪等な操作で、`live_reconfigure_failed` のエラー文言からも案内する。MCP には追加していない。
+  - catalog へ反映する registry snapshot は、呼び出し元のトランザクション内のものではなく `transition` ロック取得後に読み直した最新のものを使う（並行 CRUD で catalog だけが古くなる窓を閉じる）。呼び出し元の in-tx snapshot は保存前検証（preflight）専用。保存前検証には DB Source の計画検証も追加し、「保存成功 ＝ 実行可能」の保証を catalog・演算・DB Source の3つに揃えた。
+  - `CollectorManager::apply_run` は collector 側の適用に失敗したとき、broker セッション集合を直前に適用成功した構成へ戻す（ベストエフォート。収集開始の失敗時にも効く）。catalog / 演算 / DB Source の検証失敗も `last_config_error` に残すようにした。
+  - 未適用キューの適用が「DB は成功・実行構成への反映だけ失敗」で終わった場合、`result: "failed"` の監査行を残す（行自体は二重適用を防ぐため `applied` のまま）。
 
 ### 修正
 
+- **`banto_collect::Collector::apply_config` の旧 writer 退避が、新タスクの spawn より前で `?` 伝播していた**（#341 レビュー）。旧ファイルの最終 flush に失敗すると「writer は新・`self.config` は旧・追加/置換した接続のタスクが1本も立っていない」状態で `Err` が返り、呼び出し元は失敗と判断する一方で収集は何も行わなくなる。退避を spawn の後へ移し、失敗はログのみで `Ok` を返すようにした（失われうるのは旧ファイルの最後の未フラッシュ分だけ）。
 - **`banto_collect::Collector::apply_config` で、唯一の接続が置き換えられたときに新しい writer が収集タスクへ届かない不具合**（#341 で発覚）。`watch::Sender::send` は受信者が 0 人だと値を更新せずに `Err` を返すが、置き換え対象タスクを join した直後のこの地点では受信者が 0 になりうる（`Collector` 自身は受信者を保持しない）。結果、既存グループにタグを1本足すと、新タスクは毎周期 2 値を append するのに writer のスキーマは 1 列のままで、その接続の**履歴書き込みが列数不一致で全滅**していた（現在値と live event は流れ続けるため「値は見えるのに履歴が残らない」症状）。`send_replace` に変更して常に配布する。#341 以前は本番から到達しない経路だったため表面化していなかった。
 
 ### 既知の制限（アルファ）

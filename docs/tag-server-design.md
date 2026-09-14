@@ -550,7 +550,27 @@ T7-1）を `apps/banto-hub/core/src/hub.rs`（`CollectorManager::rebuild`、T7-2
 > - DB へはコミットできたが実行構成へ反映できなかった場合は 200 + 警告では
 >   なく `500 live_reconfigure_failed` を返す（走行中の収集は `apply_config`
 >   の all-or-nothing により元の構成のまま無傷。詳細は `/api/v1/status` の
->   `last_config_error`）。
+>   `last_config_error`）。**変更は保存済み**なので、回復は「次の構成変更」
+>   「収集の停止→開始」「`POST /api/collection/reapply`（admin、#341
+>   レビュー対応で追加した冪等な再適用。収集 `Running` なら無停止、
+>   `Stopped` なら catalog のみ）」のいずれでも行える - どれも同じ
+>   `commit_catalog_and_apply_live` を通る。
+>
+> **#341 レビュー対応（2026-09-14、同 PR 内）**:
+>
+> - catalog へ反映する `RegistrySnapshot` は、呼び出し元のトランザクション内
+>   snapshot ではなく `transition` ロック取得後に読み直した最新のものを使う
+>   （並行 CRUD で catalog だけが古い行集合になる窓を閉じる）。in-tx snapshot
+>   は保存前検証（preflight）専用。その preflight には DB Source の計画検証も
+>   加え、「保存成功 ＝ 実行可能」の保証を catalog・演算・DB Source の3つで
+>   揃えた（`commit_catalog` が検証で落ちる余地を無くす）。
+> - `CollectorManager::apply_run` は collector 側の適用に失敗したとき、broker
+>   セッション集合を直前に適用成功した runtime snapshot へ戻す（ベスト
+>   エフォート。収集開始の失敗時にも効く）。検証失敗も `last_error` に残す。
+> - `banto_collect::Collector::apply_config` の旧 writer 退避を新タスクの
+>   spawn 後へ移し、その失敗を致命にしないようにした（「タスクが1本も
+>   立っていないのに `Err`」を避ける。`Err` を返すのは新 writer を開けな
+>   かったときだけ、という all-or-nothing の定義自体は変えていない）。
 >
 > あわせて `banto_collect::Collector::apply_config` の writer 配布で
 > **唯一の接続が replaced になったときに新 writer が届かない**不具合を修正した

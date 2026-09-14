@@ -1932,7 +1932,8 @@ async fn tool_create_connection(
             return Ok(banto_error_tool_error(&err));
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -1951,13 +1952,8 @@ async fn tool_create_connection(
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
-    if let Err(err) = commit_catalog_and_notify(
-        &state.status.controller,
-        &state.events,
-        "plc_connections",
-        snapshot,
-    )
-    .await
+    if let Err(err) =
+        commit_catalog_and_notify(&state.status.controller, &state.events, "plc_connections").await
     {
         return Ok(tool_error(format!(
             "変更は保存しましたが、実行構成への反映に失敗しました: {err}"
@@ -2058,7 +2054,8 @@ async fn tool_delete_connection(
             return Ok(banto_error_tool_error(&err));
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2081,13 +2078,8 @@ async fn tool_delete_connection(
         Some(json!({ "cascade": cascade_detail.clone() })),
     )
     .await;
-    if let Err(err) = commit_catalog_and_notify(
-        &state.status.controller,
-        &state.events,
-        "plc_connections",
-        snapshot,
-    )
-    .await
+    if let Err(err) =
+        commit_catalog_and_notify(&state.status.controller, &state.events, "plc_connections").await
     {
         return Ok(tool_error(format!(
             "変更は保存しましたが、実行構成への反映に失敗しました: {err}"
@@ -2299,7 +2291,8 @@ async fn tool_update_connection(
             return Ok(banto_error_tool_error(&err));
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2318,13 +2311,8 @@ async fn tool_update_connection(
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
-    if let Err(err) = commit_catalog_and_notify(
-        &state.status.controller,
-        &state.events,
-        "plc_connections",
-        snapshot,
-    )
-    .await
+    if let Err(err) =
+        commit_catalog_and_notify(&state.status.controller, &state.events, "plc_connections").await
     {
         return Ok(tool_error(format!(
             "変更は保存しましたが、実行構成への反映に失敗しました: {err}"
@@ -2497,7 +2485,8 @@ async fn tool_create_group(
             return Ok(banto_error_tool_error(&err));
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2516,13 +2505,9 @@ async fn tool_create_group(
         Some(json!({ "name": created.name, "enabled": created.enabled })),
     )
     .await;
-    if let Err(err) = commit_catalog_and_notify(
-        &state.status.controller,
-        &state.events,
-        "collection_groups",
-        snapshot,
-    )
-    .await
+    if let Err(err) =
+        commit_catalog_and_notify(&state.status.controller, &state.events, "collection_groups")
+            .await
     {
         return Ok(tool_error(format!(
             "変更は保存しましたが、実行構成への反映に失敗しました: {err}"
@@ -2619,7 +2604,8 @@ async fn tool_update_group(
             return Ok(banto_error_tool_error(&err));
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2638,13 +2624,9 @@ async fn tool_update_group(
         Some(json!({ "name": updated.name, "enabled": updated.enabled })),
     )
     .await;
-    if let Err(err) = commit_catalog_and_notify(
-        &state.status.controller,
-        &state.events,
-        "collection_groups",
-        snapshot,
-    )
-    .await
+    if let Err(err) =
+        commit_catalog_and_notify(&state.status.controller, &state.events, "collection_groups")
+            .await
     {
         return Ok(tool_error(format!(
             "変更は保存しましたが、実行構成への反映に失敗しました: {err}"
@@ -2740,7 +2722,8 @@ async fn tool_delete_group(
             return Ok(banto_error_tool_error(&err));
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2760,13 +2743,9 @@ async fn tool_delete_group(
         Some(json!({ "cascade": cascade_detail.clone() })),
     )
     .await;
-    if let Err(err) = commit_catalog_and_notify(
-        &state.status.controller,
-        &state.events,
-        "collection_groups",
-        snapshot,
-    )
-    .await
+    if let Err(err) =
+        commit_catalog_and_notify(&state.status.controller, &state.events, "collection_groups")
+            .await
     {
         return Ok(tool_error(format!(
             "変更は保存しましたが、実行構成への反映に失敗しました: {err}"
@@ -2898,7 +2877,8 @@ async fn tool_create_tag(
             return Ok(banto_error_tool_error(&err));
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2918,7 +2898,7 @@ async fn tool_create_tag(
     )
     .await;
     if let Err(err) =
-        commit_catalog_and_notify(&state.status.controller, &state.events, "tags", snapshot).await
+        commit_catalog_and_notify(&state.status.controller, &state.events, "tags").await
     {
         return Ok(tool_error(format!(
             "変更は保存しましたが、実行構成への反映に失敗しました: {err}"
@@ -3023,7 +3003,8 @@ async fn tool_update_tag(
             return Ok(banto_error_tool_error(&err));
         }
     };
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -3043,7 +3024,7 @@ async fn tool_update_tag(
     )
     .await;
     if let Err(err) =
-        commit_catalog_and_notify(&state.status.controller, &state.events, "tags", snapshot).await
+        commit_catalog_and_notify(&state.status.controller, &state.events, "tags").await
     {
         return Ok(tool_error(format!(
             "変更は保存しましたが、実行構成への反映に失敗しました: {err}"
@@ -3137,7 +3118,8 @@ async fn tool_delete_tag(
         let _ = tx.rollback().await;
         return Ok(banto_error_tool_error(&err));
     }
-    let snapshot = match preflight_transaction(&mut tx).await {
+    // #341 レビュー対応: preflight 専用（REST 側の同型コメント参照）。
+    let _preflighted = match preflight_transaction(&mut tx).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -3149,7 +3131,7 @@ async fn tool_delete_tag(
     }
     audit_config_action(state, ctx, "delete", "tags", Some(&id.to_string()), None).await;
     if let Err(err) =
-        commit_catalog_and_notify(&state.status.controller, &state.events, "tags", snapshot).await
+        commit_catalog_and_notify(&state.status.controller, &state.events, "tags").await
     {
         return Ok(tool_error(format!(
             "変更は保存しましたが、実行構成への反映に失敗しました: {err}"

@@ -247,12 +247,16 @@ impl CollectionController {
     ///   直列化されるので、連続した CRUD が適用を追い越し合うことはない。
     ///   `apply_run` は自分でレジストリを読み直す（`RegistrySnapshot::load`）
     ///   ため、**最後に走った適用は常に最新の DB 状態を反映する**。
-    /// - 既知の（#341 以前からある）狭い窓: `commit_catalog` に渡すのは
-    ///   呼び出し元のトランザクション内 snapshot なので、2つの CRUD が
+    /// - **古い snapshot の窓は閉じてある**（#341 レビュー対応、
+    ///   2026-09-14）: catalog へコミットするのは呼び出し元のトランザク
+    ///   ション内 snapshot ではなく、**この `transition` ロックを取った後に
+    ///   読み直した最新の `RegistrySnapshot`**。呼び出し元の in-tx snapshot
+    ///   は preflight（保存前検証）専用で、反映には使わない。これが無いと
     ///   「A が tx commit → B が tx commit → B が catalog commit → A が
-    ///   catalog commit」の順に並ぶと catalog だけ一瞬 B の行を欠く。
-    ///   collector 側は `apply_run` の読み直しで常に最新、次のどの CRUD の
-    ///   catalog commit でも解消する。#341 はこの既存の性質を変えない。
+    ///   catalog commit」の順に並んだときに catalog だけ B の行を欠く
+    ///   （collector 側は `apply_run` が元から読み直しているので常に最新
+    ///   ＝ catalog と collector が食い違う）。読み直しに失敗した場合は
+    ///   何も変更せずに `Err` を返す。
     ///
     /// # 失敗時
     ///
@@ -268,12 +272,15 @@ impl CollectionController {
     /// catalog だけをコミットして返る - 停止中の catalog commit で PLC へ
     /// ダイヤルしてしまう T15-4 型の事故を起こさないため、**`Running` の
     /// 確認は必ずこのロックの下で行う**。
-    pub async fn commit_catalog_and_apply_live(
-        &self,
-        snapshot: &RegistrySnapshot,
-    ) -> Result<(), String> {
+    pub async fn commit_catalog_and_apply_live(&self) -> Result<(), String> {
         let _guard = self.transition.lock().await;
-        self.manager.commit_catalog(snapshot).await?;
+        // ロックを取った**後**に読み直す（上の「古い snapshot の窓」）。
+        // `RegistrySnapshot::load` は読み取りだけなので、失敗しても catalog・
+        // 実行構成のどちらにも副作用は無い。
+        let snapshot = RegistrySnapshot::load(&self.manager.pool())
+            .await
+            .map_err(|err| format!("レジストリのスナップショット取得に失敗しました: {err}"))?;
+        self.manager.commit_catalog(&snapshot).await?;
         let current = self.status();
         if current.state != CollectionState::Running {
             return Ok(());
