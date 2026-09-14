@@ -39,11 +39,13 @@ use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::commissioning::CommissioningService;
 use banto_hub_core::computed::{load_retained_values, ComputedEngine, ServerTagStore};
+use banto_hub_core::controller::{CollectionController, CollectionState, RunMode};
 use banto_hub_core::db::init_db;
 use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
-use banto_hub_core::rest::api_router;
+use banto_hub_core::rest::{api_router, api_router_with_controller};
 use banto_hub_core::settings::SettingsService;
+use banto_hub_core::test_output::TestOutputControl;
 use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
 use banto_hub_core::write_control::WriteControl;
@@ -957,4 +959,331 @@ async fn ws_stream_carries_a_computed_tag_value() {
     assert_eq!(values[0]["q"], "good");
 
     ticker.abort();
+}
+
+// ---------------------------------------------------------------------------
+// 5. computed タグの catalog 公開・run 単位 AllSimulation ゲート（#335、
+//    2026-09-14 オーナー決定）。
+//
+// [`test_app`]（上記1〜4が使う既存ハーネス）は`api_router`（内部で自前の
+// `CollectionController`/`TestOutputControl`を作り、外へは公開しない）を
+// 使っているため、このセクションのテストのように「REST 経由で観測する
+// `CollectionController`の run_id/mode を外側から直接操作したい（
+// `controller.start(RunMode::AllSimulation)`・`test_output.enable(run_id)`）」
+// 用途には使えない。`tests/stream.rs`/`tests/grpc.rs`と同じ構成
+// （`api_router_with_controller`に外部所有の`controller`/`test_output`を
+// 渡す）で専用ハーネスを別途用意する - 既存1〜4のテスト・ハーネスには
+// 一切手を入れない。
+// ---------------------------------------------------------------------------
+
+struct ControllerTestApp {
+    router: Router,
+    admin_token: String,
+    pool: SqlitePool,
+    manager: Arc<CollectorManager>,
+    controller: Arc<CollectionController>,
+    _env: TempEnv,
+}
+
+impl Drop for ControllerTestApp {
+    fn drop(&mut self) {
+        common::shutdown_test_app(&self.manager, &self.pool);
+    }
+}
+
+/// [`test_app`]相当だが、`controller`/`test_output`を呼び出し元へ公開する
+/// （`tests/stream.rs`の`test_app_with_lock`と同じ構成）。起動直後は
+/// `RunMode::Configured`で`Running`（[`tests/stream.rs`]と同じ規約）。
+async fn controller_test_app(label: &str) -> ControllerTestApp {
+    let env = TempEnv::new(TEMP_ENV_PREFIX, label);
+    let pool = init_db(env.registry_path()).await.expect("init_db");
+
+    let users = UsersService::new(pool.clone());
+    let audit = AuditLogService::new(pool.clone());
+    users
+        .setup_first_user("admin", "password123", "管理者")
+        .await
+        .expect("setup_first_user");
+
+    let verify_users = users.clone();
+    let auth = AuthState::new(move |u: String, p: String| {
+        let users = verify_users.clone();
+        Box::pin(async move {
+            match users.verify(&u, &p).await {
+                Ok(Some(identity)) => Some(Identity {
+                    id: identity.username,
+                    name: identity.display_name,
+                    role: identity.role.to_string(),
+                }),
+                _ => None,
+            }
+        })
+    });
+    let admin_token = auth
+        .login("admin", "password123")
+        .await
+        .expect("admin login");
+
+    let sessions = Arc::new(banto_hub_core::broker_glue::HubSessions::new(
+        banto_broker::BackoffConfig::default(),
+    ));
+    let sim_registry = Arc::new(banto_hub_core::broker_glue::SlmpSimRegistry::new());
+    let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
+    let manager = Arc::new(CollectorManager::new(
+        pool.clone(),
+        env.data_dir(),
+        Arc::new(SystemClock),
+        fast_options(),
+        sessions,
+        sim_registry,
+        computed,
+    ));
+
+    for name in [CALC_CONNECTION_NAME, MEM_CONNECTION_NAME] {
+        PlcConnectionService::new(pool.clone())
+            .create(virtual_conn_input(name))
+            .await
+            .expect("virtual connection should be provisioned");
+    }
+
+    manager.rebuild().await.expect("initial rebuild");
+
+    let api_keys = ApiKeysService::new(pool.clone());
+    let (events_tx, _rx) = broadcast::channel(16);
+    let write_control = Arc::new(WriteControl::new(false));
+    let write_audit = WriteAuditService::new(pool.clone());
+    let mqtt = Arc::new(banto_hub_core::mqtt::MqttPublisher::new(manager.clone()));
+    let rate_limiter = Arc::new(tokio::sync::Mutex::new(WriteRateLimiter::new(
+        WriteRateLimitConfig::default(),
+    )));
+    let test_output = Arc::new(TestOutputControl::new());
+    let controller = Arc::new(CollectionController::new(
+        manager.clone(),
+        test_output.clone(),
+    ));
+    let status = controller.start(RunMode::Configured).await;
+    assert_eq!(status.state, CollectionState::Running);
+
+    let grpc_service = GrpcService::new(
+        manager.clone(),
+        api_keys.clone(),
+        audit.clone(),
+        write_audit.clone(),
+        write_control.clone(),
+        rate_limiter.clone(),
+        events_tx.clone(),
+    );
+    let grpc_server = Arc::new(GrpcServer::new(grpc_service));
+
+    let settings = SettingsService::new(pool.clone());
+    let commissioning = CommissioningService::load(settings, users.clone())
+        .await
+        .expect("CommissioningService::load");
+    commissioning
+        .lock_down()
+        .await
+        .expect("lock_down the test environment");
+
+    let router = api_router_with_controller(
+        users,
+        audit,
+        PlcConnectionService::new(pool.clone()),
+        CollectionGroupService::new(pool.clone()),
+        TagService::new(pool.clone()),
+        api_keys,
+        manager.clone(),
+        controller.clone(),
+        auth,
+        commissioning,
+        events_tx,
+        false,
+        write_control,
+        write_audit,
+        mqtt,
+        grpc_server,
+        rate_limiter,
+        test_output,
+        banto_hub_core::profile_paths::DEFAULT_PROFILE_ID.to_string(),
+    );
+
+    ControllerTestApp {
+        router,
+        admin_token,
+        pool,
+        manager,
+        controller,
+        _env: env,
+    }
+}
+
+/// [`t9_simulation.rs`]の`plc_connection_payload_json`と同じ判断（接続
+/// 単位のシミュレーション、design §1）を`PlcConnectionInput`（REST を
+/// 経由せず`PlcConnectionService`へ直接投入するこのファイルの流儀）で
+/// 表したもの。`simulation: true`なら`SlmpSimRegistry`がダイヤル先を
+/// hub 内蔵シミュレータへ差し替えるので、host/port はダミーでよい
+/// （このテスト自身は SLMP シミュレータを一切起動しない）。
+fn slmp_conn_input(name: &str, simulation: bool) -> PlcConnectionInput {
+    PlcConnectionInput {
+        name: name.to_string(),
+        protocol: "slmp".to_string(),
+        host: "127.0.0.1".to_string(),
+        port: 1,
+        unit_id: 1,
+        enabled: true,
+        simulation,
+
+        word_order: "low_high".to_string(),
+        database: None,
+        username: None,
+        password: None,
+    }
+}
+
+/// #335 の中心的な回帰確認（2026-09-14 決定 + 2026-09-15 追補「外部出力を
+/// PLC への出力と勘違いしていた」で run 単位のゲートも撤回）:
+/// (a)/(d) API キー経由の catalog（`GET /api/v1/tags`）は、接続単位で
+///     simulation 設定済みの PLC タグと computed タグを、収集停止中・
+///     Configured 運転中・AllSimulation 運転中のいずれでも一切隠さない。
+/// (b) Configured 運転中は `GET /api/v1/values/{computed}` が 200 を返す
+///     （タグ単位の抑止はもう無い）。
+/// (c) AllSimulation 運転中も `/api/v1/values`（一括）・
+///     `/api/v1/values/{tag}` は 200 のまま - 外部への読み取り出力は
+///     シミュレーションで一切ゲートしない（run 単位の 503 ゲートも撤去済
+///     み）。`value_source: "simulation"`/`"derived_simulation"`で
+///     呼び出し側が判別する。
+/// (e) computed タグの入力（式が参照する PLC タグ）が接続単位で実際に
+///     シミュレーション中なら、run が Configured のままでも
+///     `value_source`/`effective_simulation`は`derived_simulation`/`true`
+///     に昇格する - AllSimulation 運転中でなくても計算タグは「入力の
+///     状態を追う」設計どおり。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn api_key_catalog_and_values_follow_335_contract() {
+    let app = controller_test_app("335-catalog").await;
+
+    // 接続単位で simulation: true の PLC タグを1本用意する(t9_simulation.rs
+    // と同じ判断: SlmpSimRegistry がダイヤル先を差し替えるので、テスト自身
+    // は SLMP シミュレータを起動しない)。
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(slmp_conn_input("line1", true))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("io", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(plc_tag_input("temp", group.id, "D100", "i16"))
+        .await
+        .unwrap();
+
+    // この PLC タグを直接参照する computed タグ(入力が真にシミュレーション
+    // 中かどうかを rest.rs が辿れることの確認 - (e))。
+    let calc_id = PlcConnectionService::new(app.pool.clone())
+        .list(banto_core::ListParams::default())
+        .await
+        .unwrap()
+        .rows
+        .into_iter()
+        .find(|c| c.name == CALC_CONNECTION_NAME)
+        .unwrap()
+        .id;
+    let calc_group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("x", calc_id, 1_000))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(computed_tag_input(
+            "avg",
+            calc_group.id,
+            "line1.io.temp * 1",
+        ))
+        .await
+        .unwrap();
+
+    app.manager.rebuild().await.expect("rebuild after seeding");
+
+    let key = issue_key(&app.router, &app.admin_token, "sdk", &["read"]).await;
+
+    // --- 収集停止中でも catalog は全件見える(既存の維持事項) ---
+    app.controller.stop().await;
+    let (status, body) = get_json(&app.router, "/api/v1/tags", &key).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let names: Vec<&str> = body["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["external_name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"line1.io.temp"),
+        "収集停止中も simulation 設定済み PLC タグは catalog に残る: {names:?}"
+    );
+    assert!(
+        names.contains(&"calc.x.avg"),
+        "収集停止中も computed タグは catalog に残る: {names:?}"
+    );
+
+    // --- Configured 運転中: catalog 全件 + (b)/(e) ---
+    let status = app.controller.start(RunMode::Configured).await;
+    assert_eq!(status.state, CollectionState::Running);
+
+    let (status_code, body) = get_json(&app.router, "/api/v1/tags", &key).await;
+    assert_eq!(status_code, StatusCode::OK);
+    let tags = body["tags"].as_array().unwrap();
+    let temp_entry = tags
+        .iter()
+        .find(|t| t["external_name"] == "line1.io.temp")
+        .expect("line1.io.temp should be in the catalog while Configured");
+    assert_eq!(temp_entry["value_source"], "simulation");
+    assert_eq!(temp_entry["effective_simulation"], true);
+
+    let avg_entry = tags
+        .iter()
+        .find(|t| t["external_name"] == "calc.x.avg")
+        .expect("calc.x.avg should be in the catalog while Configured");
+    assert_eq!(
+        avg_entry["value_source"], "derived_simulation",
+        "入力(line1.io.temp)が真にシミュレーション中なら、Configured でも derived_simulation: {avg_entry:?}"
+    );
+    assert_eq!(avg_entry["effective_simulation"], true);
+
+    // (b): タグ単位の抑止はもう無いので、computed の値読みは 200。
+    let (status_code, _body) = get_json(&app.router, "/api/v1/values/calc.x.avg", &key).await;
+    assert_eq!(status_code, StatusCode::OK);
+
+    // --- AllSimulation 運転中: catalog もタグ単位の値読みも一切ゲートしない ---
+    let status = app.controller.start(RunMode::AllSimulation).await;
+    assert_eq!(status.state, CollectionState::Running);
+    assert_eq!(status.mode, RunMode::AllSimulation);
+
+    // (d): catalog はここでも全件。
+    let (status_code, body) = get_json(&app.router, "/api/v1/tags", &key).await;
+    assert_eq!(status_code, StatusCode::OK);
+    let tags = body["tags"].as_array().unwrap();
+    let names: Vec<&str> = tags
+        .iter()
+        .map(|t| t["external_name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"line1.io.temp"));
+    assert!(names.contains(&"calc.x.avg"));
+    let avg_entry = tags
+        .iter()
+        .find(|t| t["external_name"] == "calc.x.avg")
+        .expect("calc.x.avg should be in the catalog during all-simulation");
+    assert_eq!(avg_entry["value_source"], "derived_simulation");
+
+    // (c): AllSimulation 中も 503 ではなく 200 - run 単位のゲートは撤去
+    // 済み(2026-09-15 追補)。値は `value_source: "simulation"` で判別する。
+    let (status_code, body) = get_json(&app.router, "/api/v1/values/line1.io.temp", &key).await;
+    assert_eq!(status_code, StatusCode::OK, "{body:?}");
+    assert_eq!(body["value_source"], "simulation");
+
+    let (status_code, body) = get_json(&app.router, "/api/v1/values", &key).await;
+    assert_eq!(status_code, StatusCode::OK, "{body:?}");
+    let bulk_values = body["values"].as_array().unwrap();
+    let temp_value = bulk_values
+        .iter()
+        .find(|v| v["tag"] == "line1.io.temp")
+        .expect("line1.io.temp should be in the bulk values response");
+    assert_eq!(temp_value["value_source"], "simulation");
 }

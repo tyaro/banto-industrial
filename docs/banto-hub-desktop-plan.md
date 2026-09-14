@@ -117,7 +117,14 @@ TAG-UX-C の4点目を完成させた（`banto-hub-tags-revision.spec.ts` を拡
 書き込み受付（write_enabled）の遷移時 OFF・自動リセット記述は 2026-09-09
 オーナー決定（#340）で撤回。既定は有効、再起動で永続値を復元、遷移では
 変えない（test_output の OFF 連動は維持）。詳細は
-[tag-server-design.md](tag-server-design.md) §6-6。
+[tag-server-design.md](tag-server-design.md) §6-6。**2026-09-15**（#335
+追補、「外部出力を PLC への出力と勘違いしていた」）: §6.3「履歴と外部出力」の
+出力ゲート（API キー経由の REST/WS/MQTT/gRPC が SIM 値・derived_simulation
+値を既定除外・専用テスト出力 namespace・全 PLC SIM 中の通常 stream 強制終了）
+を撤回し、外部への読み取り出力はシミュレーションで一切ゲートしない契約へ
+改定（書き込みゲートは変更なし）。`test_output`（T15-3）の制御プレーンは
+残すが効果を持たない deprecated 状態。詳細は §6.3・
+[tag-server-design.md](tag-server-design.md) §4.2。
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [banto-hub-t16-design.md](banto-hub-t16-design.md)、
@@ -407,27 +414,46 @@ SIM と、その値に推移的に依存する演算タグにも同じ規則を�
 - Hub セッションで認証した管理画面用 REST / WS は SIM 値を返す。値 batch と
   catalog に `run_id`、`collection_mode`、`value_source`、接続ごとの
   `effective_simulation` を含め、実機値と識別できるようにする。
-- API キーで利用する外部 REST / WS、MQTT、gRPC の通常出力は、SIM 値と
+- 旧: 「API キーで利用する外部 REST / WS、MQTT、gRPC の通常出力は、SIM 値と
   `derived_simulation` 値を既定で除外する。混在運転では実機由来値だけを通常出力し、
-  全 PLC SIM では通常出力を0件とする。
+  全 PLC SIM では通常出力を0件とする。」**2026-09-15 オーナー決定（#335 追補、
+  「外部出力を PLC への出力と勘違いしていた」）で撤回** → 外部 REST / WS /
+  gRPC / MQTT の**読み取り**出力もシミュレーションで一切ゲートしない。SIM 値・
+  `derived_simulation` 値も常時配信し、呼び出し側は `value_source` /
+  `collection_mode` で判別する（catalog は元々ゲート対象外）。
 - 実機用 tstore へ SIM／SIM 依存サンプルを append しない。初版では SIM 履歴を
   永続化せず、停止後に通常の実機履歴へ混ざらないようにする。
-- MQTT publish と gRPC の値 stream は全 PLC シミュレーション中の既定を OFF と
-  する。切替時に既存 stream を能動終了し、設定済みの通常 topic / stream へ SIM
-  値を無印で流さない。
-- 外部 IF を含む E2E 検証時だけ、現在の run context に限る「テスト出力」を明示
-  有効化できる。専用 topic prefix / stream namespace、`simulation=true`、
-  `run_id` を付け、MQTT は `retain=false` とする。停止、アプリ終了、サービス切替、
-  サービス再起動で自動解除する。
+- 旧: 「MQTT publish と gRPC の値 stream は全 PLC シミュレーション中の既定を
+  OFF とする。切替時に既存 stream を能動終了し、設定済みの通常 topic /
+  stream へ SIM 値を無印で流さない。」**2026-09-15 オーナー決定で撤回** →
+  全 PLC シミュレーション中も通常 topic / stream は既存の接続を切断せず配信
+  し続け、新規の subscribe/stream も通常どおり成立する。
+- 旧: 「外部 IF を含む E2E 検証時だけ、現在の run context に限る『テスト出力』
+  を明示有効化できる。専用 topic prefix / stream namespace、`simulation=true`、
+  `run_id` を付け、MQTT は `retain=false` とする。停止、アプリ終了、サービス
+  切替、サービス再起動で自動解除する。」**2026-09-15 オーナー決定で撤回** →
+  上記のとおり通常出力がシミュレーションでゲートされなくなったため、この
+  専用テスト出力機構（専用 topic/stream namespace・`simulation`/`run_id`
+  メタデータ・MQTT の`retain=false`）は撤去した。`TestOutputControl` の
+  enable/disable API（`POST /api/test-output/{enable,disable}`）・
+  `GET /api/v1/status` の `test_output` 表示・UI トグル自体は当面残すが、
+  どの出力経路にも効果を持たない **deprecated** 状態（撤去は後続 issue）。
+  gRPC `StreamValuesRequest.test_output` フィールドは wire 互換のため残すが
+  無視する。
 - SIM／SIM 依存値への REST / gRPC 書き込みは運転状態ゲートで拒否する。テスト出力を
-  有効にしても書き込み安全規則は緩和しない。
+  有効にしても書き込み安全規則は緩和しない（この書き込みゲート自体は今回の
+  変更の対象外 - 2026-09-15 オーナー決定は読み取り出力のみに関するもの）。
 
 ## 7. 安全規則
 
 収集開始、停止、モード変更、デスクトップ／サービス切替では、次の順序を守る。
 
 1. 新しい操作を直列化し、遷移状態を公開する。
-2. test_output を OFF にする（T15-3、現在の run コンテキスト限定のテスト出力を無効化）。
+2. test_output を OFF にする（T15-3、`CollectionController` が遷移のたびに
+   `TestOutputControl::disable` する既存の実装はそのまま維持 - 2026-09-15
+   オーナー決定で `test_output` はどの出力経路にも効果を持たなくなった
+   ため、この手順自体はもう実質的な意味を持たない状態遷移だが、撤去は
+   後続 issue で行う）。
    （旧: ここで書き込み受付も OFF にする、としていた。2026-09-09 オーナー決定 #340 で撤回
    - 書き込み受付は遷移で変えない）
 3. MQTT 等の値消費・外部 publish を停止または停止状態へ遷移させる。
@@ -1654,6 +1680,12 @@ fallback を開いた時の初期フォーカスは見出し、失敗後はエ�
   `retain=false` とする。停止／終了／切替／サービス再起動後に必ず無効へ戻る。
 - SIM 切替で既存 MQTT / gRPC stream を能動終了し、SIM／SIM 依存値への書き込みを
   fail-closed で拒否する。
+
+**2026-09-15 オーナー決定（#335 追補）でこの受け入れ条件のうち出力ゲート関連
+（「API キーの通常 REST / WS では既定で除外」「テスト出力は専用 namespace...」
+「SIM 切替で既存 MQTT / gRPC stream を能動終了」）を撤回** - 詳細と現行の契約は
+上記 §6.3「履歴と外部出力」を正とする（書き込み側の fail-closed 拒否・tstore
+非永続化は撤回対象外、変更なし）。以下は撤回前の実装メモとして履歴に残す。
 
 実装メモ(T15-2、2026-08-09): 「未対応タグを開始前に人間可読な形で表示する」は
 `crates/banto-collect/src/simulation.rs`の`classify_plc_tag`（Modbus/SLMP の

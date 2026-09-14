@@ -4,13 +4,13 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
 1 画面で引くための地図。詳細は各文書へ辿る。
 
 状態: **地図として現行**。索引に徹し、実装状況・設計判断の本体は各文書側で管理する。
-最終更新: 2026-09-14（T19（UX-30〜48）・T20（文字列/構造体/レシピ/ビット .0〜.F）・T21（構成補助 MCP 管理面）完了、MCP 31 ツール実機検証、外部 DB 連携 S0〜S2b・S4・S5 完了、S3/S6/S7 残（MCP は 37 ツールに。追加分はローカル PostgreSQL で検証）に加え、v0.2.0-alpha.8: 書き込み受付の既定を「可」に変更し、再起動・収集操作での自動無効化を撤回（#340）、v0.2.0-alpha.9: 試運転中は構成 CRUD を収集中でも即時・無停止反映（#341）を反映）。
-最終検証日(コード照合): 2026-09-14
+最終更新: 2026-09-15（T19（UX-30〜48）・T20（文字列/構造体/レシピ/ビット .0〜.F）・T21（構成補助 MCP 管理面）完了、MCP 31 ツール実機検証、外部 DB 連携 S0〜S2b・S4・S5 完了、S3/S6/S7 残（MCP は 37 ツールに。追加分はローカル PostgreSQL で検証）に加え、v0.2.0-alpha.8: 書き込み受付の既定を「可」に変更し、再起動・収集操作での自動無効化を撤回（#340）、v0.2.0-alpha.9: 試運転中は構成 CRUD を収集中でも即時・無停止反映（#341）、v0.2.0-alpha.10: computed タグの catalog 公開・外部読み取り出力のシミュレーションゲート撤廃（#335）を反映）。
+最終検証日(コード照合): 2026-09-15
 
 > この地図は索引に徹する。実装状況・設計判断の本体は各文書側にあり、状態の**正**は
 > 常にリンク先の `状態:` 行と各表とする（CLAUDE.md H8 の状態欄同期規約）。
 
-## 現状ひとめ（2026-09-14）
+## 現状ひとめ（2026-09-15）
 
 - **構成**: Rust workspace + SvelteKit/Tauri。アプリは **banto-hub**（タグサーバー）/ **chronogazer**
   （記録計）/ **relay-wright**。上流 `banto` は git tag / `@banto/*` を消費（Rust クレート・npm
@@ -48,6 +48,15 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
   `runId` 不変・既存タグは good のまま・pending 0 件・新タグは数秒で good/real。
   `POST /api/collection/reapply` も 200・`runId` 不変。ロックダウン後の queue + 無停止適用は
   admin ログインが要るためローカルでは未実施（CI の `chromium-locked-down` E2E と統合テストで担保）。
+- **v0.2.0-alpha.10（2026-09-14/15、#335）**: API キー経由の catalog（`GET /api/v1/tags`）から
+  computed タグと接続単位のシミュレーション設定済み PLC タグが常時隠れていた不具合を修正
+  （`value_source` に新ラベル `computed` を追加し、`derived_simulation` は真にシミュレーション
+  中のときだけの情報ラベルに変更）。さらに 2026-09-15 オーナー決定「外部出力を PLC への出力と
+  勘違いしていた」で、外部への**読み取り**出力（REST/WS/gRPC/MQTT）はシミュレーションで一切
+  ゲートしない契約へ改定（全 PLC シミュレーション中も catalog・値読み取り・購読・publish を
+  常に配信）。T15-3 の `test_output` opt-in は効果を失い deprecated（制御プレーン自体は残す、
+  撤去は後続 issue）。詳細は [tag-server-design.md](tag-server-design.md) §4.2、
+  [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §6.3。
 - **出荷ゲート**: T5-5（実機での 72h soak 実行 + 実機最終サインオフ）のみ残（実機必須）。
 - **banto-tagclient**: **S4a完了（2026-09-01）**。読み取り専用DTO、Endpoint/Secret境界、
   stable ID resolver、REST catalog/values transport、WS wire純粋解析、bounded publish gate、認証付き

@@ -1,7 +1,12 @@
 # タグサーバーアプリ 設計ドキュメント（草案）
 
 作成日: 2026-08-04
-状態: **実装追従中（2026-09-14 更新: #341 の CRUD 契約改定を §4.3 に反映）**。起案時は設計先行だったが、
+状態: **実装追従中（2026-09-15 更新: #335 - computed タグ・接続単位シミュレー
+ション値の catalog 常時公開、外部読み取り出力のシミュレーションゲート撤廃を
+§4.2 に反映。同日追補: MQTT ペイロードに `value_source` を追加し
+（§5.3）、判定関数を `crate::value_source` へ共有化。2026-09-14 更新:
+#341 の CRUD 契約改定を §4.3 に反映）**。
+起案時は設計先行だったが、
 apps/banto-hub として実装が進行 — T0〜T21 実装済み（T19 UX 群・T20 文字列/構造体/レシピ/ビット・T21 構成補助 MCP 管理面まで完了、詳細は下の 2026-09-06 更新）・残 T18-5c/d
 （Windows 実機往復・72h soak）と P3-b の残件（SLMP CPU 種別/アクセスルート露出、
 バックログ。SLMP の word order 自体は #127 で完了済み）。実装状況は §9（T系）の表を正とする。マイルストーンは §9、
@@ -384,6 +389,22 @@ I1 に**タグ種別**を導入する（§10-2 の `writable` と合わせて1�
 | `internal`                          | クライアントの書き込み                         | タグ空間内で完結（PLC へ送らない） | SCADA の設定値・アプリ間の状態共有用。`retain` フラグで再起動時の最終値復元を選択                                                                                                    |
 | `db`（2026-09-06、外部 DB 連携 S2） | 外部 DB Source のポーリング（SELECT の結果列） | 不可（v1 は読み取り専用）          | `address` は結果列名。`protocol = "postgres"` の接続配下のみ。値は演算タグと同じサーバー側ストアに載る。設計は [banto-hub-external-db-design.md](banto-hub-external-db-design.md) §4 |
 
+**2026-09-14 オーナー決定（#335）・2026-09-15 追補**: 接続単位のシミュレー
+ション値と computed タグは API キー経由でも隠さず、`value_source` で明示す
+る。`value_source` は既定 `computed`（演算タグ）／`real`／`internal`／`db`
+で、`derived_simulation` は「全 PLC シミュレーション運転中、または式が参照
+する入力タグのいずれかが真にシミュレーション中（PLC タグの
+`effective_simulation == true`）」のときだけの**情報ラベル**（抑止フラグで
+はない）。2026-09-15 追補（「外部出力を PLC への出力と勘違いしていた」との
+オーナー判断）でさらに、外部への**読み取り**出力（REST/WS/gRPC/MQTT）は
+シミュレーションで一切ゲートしない — 全 PLC シミュレーション運転中でも
+catalog・値読み取りは常に無条件で配信し、呼び出し側が `value_source` /
+`collection_mode` で判別する。旧 T15-3（`docs/banto-hub-desktop-plan.md`
+§6.3）の「test_output で opt-in」という run 単位ゲートは効力を失い
+deprecated（`TestOutputControl` 自体の制御プレーンは残すが、どの経路も
+参照しない。撤去は後続 issue）。`value_source` の既知値は
+real / simulation / computed / derived_simulation / internal / db。
+
 演算タグの意味論:
 
 - **純関数のみ**: 入力は他タグの現在値、出力は自タグの値。副作用なし・
@@ -683,7 +704,12 @@ axum の `ws` アップグレードで `/api/v1/stream`。メッセージは JSO
 クライアントモードのみ。組み込みは §10-4 の判断待ち。
 
 - トピック: `{prefix}/{connection}/{group}/{tag}`（prefix 既定 `banto`、設定可）
-- ペイロード: `{"v": 25.4, "q": "good", "t": 1722758400100}`（WebSocket と同形）
+- ペイロード: `{"v": 25.4, "q": "good", "t": 1722758400100, "value_source": "real"}`
+  （`v`/`q`/`t` は WebSocket と同形。`value_source` は2026-09-15 オーナー
+  追補・#335 で追加した新規フィールド - REST/WS/gRPC と同じ
+  `crate::value_source::value_source_for_tag` を共有し、既知値は
+  §4.2 のとおり real / simulation / computed / derived_simulation /
+  internal / db。JSON への追加フィールドのみで既存の購読者は無視できる）
 - 発行モード: タグ毎に `on_change` / `interval` を設定（既定 on_change、
   最短発行間隔でスロットル）。retain 有効（新規購読者が即座に最終値を得る）
 - QoS: 既定 1。設定で 0/1 切り替え（2 は使わない）

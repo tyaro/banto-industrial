@@ -703,8 +703,13 @@ async fn stream_values_sends_initial_snapshot_then_on_change() {
     sim.stop();
 }
 
+/// 2026-09-15 オーナー決定（#335 追補、「外部出力を PLC への出力と勘違い
+/// していた」）: 以前はここで `AllSimulation` 突入時に通常 stream が
+/// 強制終了され、新規 stream も `simulation_output_disabled` で拒否
+/// されていた（旧 PR #95 挙動）。その抑止は撤去済み - 既存 stream は
+/// run mode によらず配信を継続し、新規 stream も通常どおり開始できる。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stream_values_ends_when_all_simulation_starts() {
+async fn stream_values_keeps_streaming_when_all_simulation_starts() {
     let app = test_app("stream-values-all-simulation").await;
     let sim = Simulator::start().await;
     sim.set_word(SlmpDevice::D, 100, 10);
@@ -760,25 +765,22 @@ async fn stream_values_ends_when_all_simulation_starts() {
     assert_eq!(status.state, CollectionState::Running);
     assert_eq!(status.mode, RunMode::AllSimulation);
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        assert!(
-            remaining > Duration::ZERO,
-            "stream should end after all-simulation starts"
-        );
-        let next = tokio::time::timeout(remaining, stream.message())
-            .await
-            .expect("stream should end after all-simulation starts")
-            .expect("stream termination should not be a gRPC error");
-        if next.is_none() {
-            break;
-        }
-        // A batch already queued just before the lifecycle notification may
-        // still drain; the stream must close before any later tick can emit.
-    }
+    // 既存 stream は生きたまま - AllSimulation 突入後は接続そのものが
+    // hub 内蔵シミュレータ(ランプ波)へ切り替わる(このテストが外部
+    // シミュレータに書いた値はもう反映されない、という仕様どおりの副作用)
+    // ので、特定の値ではなく「stream が終了せず新しいバッチを送り続ける」
+    // ことだけを確認する。
+    let next = tokio::time::timeout(Duration::from_secs(5), stream.message())
+        .await
+        .expect("stream must not end after all-simulation starts")
+        .expect("stream termination should not be a gRPC error");
+    assert!(
+        next.is_some(),
+        "stream must keep sending batches during all-simulation"
+    );
 
-    let err = client
+    // 新規 stream も通常どおり開始できる（以前の 503 拒否は撤去済み）。
+    let mut new_stream = client
         .stream_values(bearer_request(
             StreamValuesRequest {
                 tags: vec![external_name],
@@ -789,9 +791,16 @@ async fn stream_values_ends_when_all_simulation_starts() {
             &key,
         ))
         .await
-        .expect_err("new normal stream must be disabled during all-simulation");
-    assert_eq!(err.code(), tonic::Code::Unavailable);
-    assert_eq!(err.message(), "simulation_output_disabled");
+        .expect("new normal stream should still succeed during all-simulation")
+        .into_inner();
+    assert!(
+        new_stream
+            .message()
+            .await
+            .expect("initial read should not error")
+            .is_some(),
+        "new stream should send an initial batch during all-simulation"
+    );
 
     sim.stop();
 }
@@ -800,14 +809,15 @@ async fn stream_values_ends_when_all_simulation_starts() {
 // T15-3: StreamValues(test_output=true) - 専用 stream namespace
 // ---------------------------------------------------------------------------
 
-/// `test_output=true`は`TestOutputControl`が現在の run_id に対して明示的に
-/// `enable`されるまで honored されない - `Stopped`でも`AllSimulation`の
-/// `Running`でも、`enable`前は常に`test_output_disabled`（`FAILED_PRECONDITION`）
-/// で拒否される（`crate::grpc::stream_values`の doc comment「T15-3」参照）。
-/// `enable`後は初回バッチに`simulation=true`・一致する`run_id`が乗る。
+/// 2026-09-15 オーナー決定（#335 追補）: `test_output`リクエストフィールド
+/// は wire 互換のため受け付けるが、もう一切の判定に使わない（deprecated -
+/// `crate::grpc::GrpcService::test_output`のフィールド doc comment参照）。
+/// `true`でも`false`でも、収集停止中・Configured・AllSimulation の
+/// いずれでも同じように成功し、バッチに`simulation=true`/`run_id`が乗る
+/// ことはもう無い（旧`TestOutputControl`armed 時の特別扱いは撤去済み）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stream_values_test_output_requires_enabling_before_it_is_honored() {
-    let app = test_app("stream-values-test-output-gate").await;
+async fn stream_values_test_output_field_is_accepted_but_ignored() {
+    let app = test_app("stream-values-test-output-ignored").await;
     let sim = Simulator::start().await;
     sim.set_word(SlmpDevice::D, 100, 10);
 
@@ -826,8 +836,9 @@ async fn stream_values_test_output_requires_enabling_before_it_is_honored() {
     let (key, _id) = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
     let (_port, mut client) = start_grpc_and_connect(&app.grpc_server).await;
 
-    // Stopped(既定) + test_output=true -> 拒否。
-    let err = client
+    // Stopped(既定) + test_output=true -> 以前は test_output_disabled で
+    // 拒否されていたが、今は無視されるので通常どおり成功する。
+    let mut stream = client
         .stream_values(bearer_request(
             StreamValuesRequest {
                 tags: vec![external_name.clone()],
@@ -838,55 +849,29 @@ async fn stream_values_test_output_requires_enabling_before_it_is_honored() {
             &key,
         ))
         .await
-        .expect_err("test_output=true without an active TestOutputControl must be rejected");
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(err.message(), "test_output_disabled");
+        .expect("test_output=true no longer requires TestOutputControl to be armed")
+        .into_inner();
+    let batch = stream
+        .message()
+        .await
+        .expect("stream should not error")
+        .expect("initial snapshot should be sent");
+    assert!(
+        !batch.simulation,
+        "simulation metadata is never set anymore"
+    );
+    assert_eq!(batch.run_id, None);
 
-    // AllSimulation を起動しても、明示的に enable するまでは依然拒否
-    // (`TestOutputControl`自身は mode を見ない - REST の
-    // `POST /api/test-output/enable`が有効化時に前提条件を検査する側
-    // であって、gRPC 側のゲートは`is_active_for`だけを見る設計 -
-    // `crate::grpc::test_output_active_run_id`の doc comment参照)。
+    // AllSimulation へ遷移し、TestOutputControl を明示的に enable しても
+    // もう効果は無い(deprecated) - test_output=true でも false と同じ
+    // 通常バッチが届く。
     let status = app.controller.start(RunMode::AllSimulation).await;
     assert_eq!(status.state, CollectionState::Running);
     let run_id = status
         .run_id
         .expect("AllSimulation run should have a run_id");
-
-    let err = client
-        .stream_values(bearer_request(
-            StreamValuesRequest {
-                tags: vec![external_name.clone()],
-                mode: SubscribeMode::OnChange as i32,
-                interval_ms: 0,
-                test_output: true,
-            },
-            &key,
-        ))
-        .await
-        .expect_err("test_output=true is still rejected until explicitly enabled");
-    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(err.message(), "test_output_disabled");
-
-    // 通常 stream（test_output=false）は既存 PR #95 挙動どおり
-    // `AllSimulation`中は拒否されたままであること(回帰確認)。
-    let err = client
-        .stream_values(bearer_request(
-            StreamValuesRequest {
-                tags: vec![external_name.clone()],
-                mode: SubscribeMode::OnChange as i32,
-                interval_ms: 0,
-                test_output: false,
-            },
-            &key,
-        ))
-        .await
-        .expect_err("normal stream must remain disabled during all-simulation");
-    assert_eq!(err.code(), tonic::Code::Unavailable);
-    assert_eq!(err.message(), "simulation_output_disabled");
-
-    // enable() すれば通り、バッチに simulation=true・一致する run_id が乗る。
     app.test_output.enable(run_id);
+
     let mut stream = client
         .stream_values(bearer_request(
             StreamValuesRequest {
@@ -898,7 +883,7 @@ async fn stream_values_test_output_requires_enabling_before_it_is_honored() {
             &key,
         ))
         .await
-        .expect("test_output=true should succeed once TestOutputControl is armed for this run_id")
+        .expect("stream_values must succeed during all-simulation regardless of test_output")
         .into_inner();
     let batch = stream
         .message()
@@ -906,24 +891,23 @@ async fn stream_values_test_output_requires_enabling_before_it_is_honored() {
         .expect("stream should not error")
         .expect("initial snapshot should be sent");
     assert!(
-        batch.simulation,
-        "test-output batches must set simulation=true"
+        !batch.simulation,
+        "simulation metadata is never set anymore"
     );
-    assert_eq!(batch.run_id, Some(run_id));
+    assert_eq!(batch.run_id, None);
 
     sim.stop();
 }
 
-/// テスト出力 stream は、明示的な`disable`（設計「明示操作でも無効化」）でも
-/// 収集停止（設計「停止／終了／切替後に必ず無効へ戻る」・
-/// `CollectionController::stop_locked`が`test_output.disable()`する）でも
-/// 終了する - どちらも`TestOutputControl::is_active_for`をこのバッチの
-/// `run_id`に対して false にする、という同じ経路（`crate::grpc::stream_values`
-/// の spawn したタスクの doc comment「T15-3」参照）。
+/// 2026-09-15 オーナー決定（#335 追補）: 旧テスト出力専用 stream の
+/// 「disable/収集停止で自動終了する」という挙動（T15-3）は、その専用
+/// stream 概念自体の撤去に伴い無くなった - 通常の stream は
+/// `test_output`の enable/disable にも収集の stop/start にも反応して
+/// 自動終了しない（クライアント切断か `tx` が閉じるまで生き続ける）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stream_values_test_output_ends_when_disabled_or_collection_stops() {
+async fn stream_values_does_not_auto_end_on_test_output_disable_or_collection_stop() {
     for scenario in ["explicit_disable", "collection_stop"] {
-        let app = test_app(&format!("stream-values-test-output-end-{scenario}")).await;
+        let app = test_app(&format!("stream-values-no-auto-end-{scenario}")).await;
         let sim = Simulator::start().await;
         sim.set_word(SlmpDevice::D, 100, 10);
 
@@ -959,16 +943,17 @@ async fn stream_values_test_output_ends_when_disabled_or_collection_stops() {
                 &key,
             ))
             .await
-            .expect("test_output stream should succeed while armed")
+            .expect("stream should succeed")
             .into_inner();
 
-        let initial = stream
-            .message()
-            .await
-            .expect("stream should not error")
-            .expect("initial snapshot should be sent");
-        assert!(initial.simulation);
-        assert_eq!(initial.run_id, Some(run_id));
+        assert!(
+            stream
+                .message()
+                .await
+                .expect("stream should not error")
+                .is_some(),
+            "initial snapshot should be sent"
+        );
 
         match scenario {
             "explicit_disable" => app.test_output.disable(),
@@ -978,19 +963,17 @@ async fn stream_values_test_output_ends_when_disabled_or_collection_stops() {
             other => unreachable!("unexpected scenario: {other}"),
         }
 
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            assert!(
-                remaining > Duration::ZERO,
-                "test-output stream should end after {scenario}"
-            );
-            let next = tokio::time::timeout(remaining, stream.message())
-                .await
-                .unwrap_or_else(|_| panic!("test-output stream should end after {scenario}"))
-                .expect("stream termination should not be a gRPC error");
-            if next.is_none() {
-                break;
+        // The stream must not end on its own: a read either times out (still
+        // open, no new tick-driven batch yet) or, if a tick already produced
+        // one, still returns `Some` - never `None` (end-of-stream).
+        match tokio::time::timeout(Duration::from_millis(500), stream.message()).await {
+            Err(_) => {} // timed out waiting for the next tick - still open, as expected.
+            Ok(result) => {
+                let batch = result.expect("stream termination should not be a gRPC error");
+                assert!(
+                    batch.is_some(),
+                    "stream must not end on its own after {scenario}"
+                );
             }
         }
 

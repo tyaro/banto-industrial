@@ -91,6 +91,7 @@ use utoipa_swagger_ui::{Config, SwaggerUi};
 use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService, IssuedApiKey};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::commissioning::{CommissioningService, CommissioningState};
+use crate::computed::ComputedEngine;
 use crate::controller::{CollectionController, CollectionState, CollectionStatus, RunMode};
 use crate::hub::{CollectorManager, SimulationCoverageReport, TagEntry, TagMap};
 use crate::mqtt::MqttPublisher;
@@ -103,6 +104,7 @@ use crate::sink::{
 use crate::system_info::{SystemInfoSampler, SystemInfoSnapshot};
 use crate::test_output::TestOutputControl;
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
+use crate::value_source::{effective_simulation_for_tag, value_source_for_tag};
 use crate::write_audit::{WriteAuditEntry, WriteAuditService};
 use crate::write_control::WriteControl;
 use crate::write_rate::WriteRateLimiter;
@@ -301,14 +303,6 @@ struct RoleGuard {
 
 fn forbidden_response() -> Response {
     (StatusCode::FORBIDDEN, Json(ErrorBody::Forbidden)).into_response()
-}
-
-fn simulation_output_disabled_response() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({ "error": "simulation_output_disabled" })),
-    )
-        .into_response()
 }
 
 /// T2-4（設計 §6-4「トリップ」）: トリップ中の API キーでの
@@ -6782,6 +6776,12 @@ pub(crate) struct TagSpaceState {
     /// `sink_admin_router`（`PUT /api/sink/status`）が書き込むものと**同じ**
     /// `Arc`を受け取る。
     pub(crate) sink_status: Arc<SinkStatusStore>,
+    /// #335（2026-09-14 オーナー決定）: computed タグの `value_source`/
+    /// `effective_simulation` 判定に、式が参照する入力タグの現在の
+    /// simulation 状態が要るため（[`ComputedEngine::referenced_tags`]）。
+    /// `manager.computed_engine()` と**同じ** `Arc`（他の共有フィールドと
+    /// 同じ規律）。
+    pub(crate) computed: Arc<ComputedEngine>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6815,12 +6815,17 @@ struct CatalogTagEntry {
 }
 
 impl CatalogTagEntry {
-    fn from_runtime(entry: &TagEntry, runtime: &CollectionStatus) -> Self {
+    fn from_runtime(
+        entry: &TagEntry,
+        runtime: &CollectionStatus,
+        map: &TagMap,
+        computed: &ComputedEngine,
+    ) -> Self {
         Self {
             entry: entry.clone(),
             configured_simulation: entry.simulation,
-            effective_simulation: effective_simulation_for_tag(entry, runtime),
-            value_source: value_source_for_tag(entry, runtime).to_string(),
+            effective_simulation: effective_simulation_for_tag(entry, runtime, map, computed),
+            value_source: value_source_for_tag(entry, runtime, map, computed).to_string(),
         }
     }
 }
@@ -6837,63 +6842,26 @@ fn effective_simulation_for_connection(
         && (configured_simulation || runtime.mode == RunMode::AllSimulation)
 }
 
-fn effective_simulation_for_tag(entry: &TagEntry, runtime: &CollectionStatus) -> bool {
-    entry.tag_kind == banto_tags::PLC_TAG_KIND
-        && entry.enabled
-        && runtime.state == CollectionState::Running
-        && (entry.simulation || runtime.mode == RunMode::AllSimulation)
-}
-
-fn value_source_for_tag(entry: &TagEntry, runtime: &CollectionStatus) -> &'static str {
-    match entry.tag_kind.as_str() {
-        banto_tags::PLC_TAG_KIND if effective_simulation_for_tag(entry, runtime) => "simulation",
-        banto_tags::PLC_TAG_KIND => "real",
-        banto_tags::COMPUTED_TAG_KIND => "derived_simulation",
-        banto_tags::INTERNAL_TAG_KIND => "internal",
-        // 外部 DB 連携 §6-11（2026-09-06 オーナー決定「足す」）: 外部 DB
-        // 由来の値は実機でもシミュレーションでも内部書き込みでもないので
-        // 独自ラベルを持つ。banto-tagclient SDK は未知ラベルを
-        // `Unknown(raw)` で保持するので、旧 SDK との互換も保たれる。
-        banto_tags::DB_TAG_KIND => "db",
-        // Tag registration validates tag_kind, but keep the wire contract
-        // fail-safe if a future kind is introduced without this DTO update.
-        _ => "internal",
-    }
-}
-
-/// API-key reads expose only the normal external value space.  Saved PLC
-/// simulation configuration is hidden even while the controller is stopped,
-/// while computed tags remain hidden because their source is always
-/// `derived_simulation`.  Internal tags are intentionally retained for
-/// backwards compatibility with existing API-key clients.
-fn api_key_external_output_allowed(entry: &TagEntry, runtime: &CollectionStatus) -> bool {
-    if entry.simulation {
-        return false;
-    }
-    !matches!(
-        value_source_for_tag(entry, runtime),
-        "simulation" | "derived_simulation"
-    )
-}
-
 /// `GET /api/v1/tags`・管理系 `GET /api/tag-catalog`（[`admin_tag_catalog`]、
 /// 試運転モード対応・設計 §5.6・2026-08-31 オーナー決定「案A」の続き）が
-/// 共有する本体。`api_key_request` が true の場合のみ
-/// [`api_key_external_output_allowed`] でシミュレーション系タグを隠す
-/// （機械クライアント向けの絞り込み、design §5.1）。管理 UI 側の呼び出し
-/// （`admin_tag_catalog`、`api_key_request = false` 固定）は他の管理系
-/// エンドポイントと同様、シミュレーション設定も含め全件を返す。
-fn build_catalog_response(
-    state: &TagSpaceState,
-    query: &TagsQuery,
-    api_key_request: bool,
-) -> CatalogResponse {
+/// 共有する本体。**API キー・セッション token のいずれでも、収集状態を
+/// 問わず常に全タグを返す**（2026-09-14/15 オーナー決定 #335 - 接続単位の
+/// simulation 設定済み PLC タグも computed タグも、catalog からは一切
+/// 隠さない。「WS/gRPC では購読できるのに catalog からは発見できない」と
+/// いう不整合を解消するための決定であり、以前ここにあった
+/// `api_key_external_output_allowed`（API キー要求だけシミュレーション系
+/// タグを除外していた関数、および呼び出し元だったこの関数の
+/// `api_key_request` 引数）は撤去済み。2026-09-15 オーナー決定（「外部出力を
+/// PLC への出力と勘違いしていた」）でさらに、[`v1_values`]・
+/// [`v1_value_single`]・[`v1_value_read_now`]の run 単位 AllSimulation
+/// ゲートも撤去した - 外部への読み取り出力はシミュレーションで一切
+/// ゲートしない（catalog は元々ゲート対象外だった）。
+fn build_catalog_response(state: &TagSpaceState, query: &TagsQuery) -> CatalogResponse {
     let map = state.manager.tag_map();
     let revision = state.manager.revision();
     let runtime = state.controller.status();
     let tags: Vec<CatalogTagEntry> = map
         .iter()
-        .filter(|entry| !api_key_request || api_key_external_output_allowed(entry, &runtime))
         .filter(|entry| {
             query
                 .connection
@@ -6908,7 +6876,7 @@ fn build_catalog_response(
                 .map(|g| g == entry.group)
                 .unwrap_or(true)
         })
-        .map(|entry| CatalogTagEntry::from_runtime(entry, &runtime))
+        .map(|entry| CatalogTagEntry::from_runtime(entry, &runtime, &map, &state.computed))
         .collect();
     CatalogResponse {
         revision,
@@ -6922,11 +6890,12 @@ fn build_catalog_response(
 /// "collection_mode", "tags": [CatalogTagEntry...] }`,
 /// optionally filtered by `?connection=`/`?group=` (matched against the
 /// entry's connection/group *name*, design §5.1's route table). API-key
-/// requests additionally omit simulation and derived-simulation entries.
-/// ロジックは[`build_catalog_response`]側にあり、ここでは`ctx`から
-/// `api_key_request`を判定して渡すだけ - 管理系の[`admin_tag_catalog`]は
-/// 同じ関数を`api_key_request = false`固定で呼ぶ（二重管理を避けるための
-/// 分離、`compute_status`/[`v1_status`]と同じ構成）。
+/// requests see exactly the same tags as session/admin requests（2026-09-14
+/// オーナー決定 #335、[`build_catalog_response`]のdoc comment参照）。
+/// ロジックは[`build_catalog_response`]側にあり、ここでは`ctx`を受け取る
+/// だけ（catalog は API キー・セッションの別を判定しない） - 管理系の
+/// [`admin_tag_catalog`]も同じ関数を呼ぶ（二重管理を避けるための分離、
+/// `compute_status`/[`v1_status`]と同じ構成）。
 #[utoipa::path(
     get,
     path = "/api/v1/tags",
@@ -6940,9 +6909,9 @@ fn build_catalog_response(
 async fn v1_tags(
     State(state): State<TagSpaceState>,
     Query(query): Query<TagsQuery>,
-    ctx: Option<Extension<ApiKeyContext>>,
+    _ctx: Option<Extension<ApiKeyContext>>,
 ) -> Json<CatalogResponse> {
-    Json(build_catalog_response(&state, &query, ctx.is_some()))
+    Json(build_catalog_response(&state, &query))
 }
 
 /// One `/api/v1/values*` entry's wire shape (design §5.1's route table:
@@ -6961,6 +6930,7 @@ struct ValueEntry {
 /// `data` messages" helper the T1 実装指示 asked to share rather than
 /// duplicate; T6-2 widened it to also cover computed/internal tags via
 /// `read_current` instead of calling `effective_sample` directly).
+#[allow(clippy::too_many_arguments)]
 fn value_entry(
     external_name: &str,
     entry: &TagEntry,
@@ -6968,6 +6938,8 @@ fn value_entry(
     server_store: &crate::computed::ServerTagStore,
     now_ms: i64,
     runtime: &CollectionStatus,
+    map: &TagMap,
+    computed: &ComputedEngine,
 ) -> ValueEntry {
     let (v, q, t) = crate::hub::read_current(entry, current, server_store, now_ms);
     ValueEntry {
@@ -6975,7 +6947,7 @@ fn value_entry(
         v,
         q: crate::hub::quality_str(q).to_string(),
         t,
-        value_source: value_source_for_tag(entry, runtime).to_string(),
+        value_source: value_source_for_tag(entry, runtime, map, computed).to_string(),
     }
 }
 
@@ -7037,8 +7009,14 @@ impl SingleValueResponse {
 /// いないのに403」を避ける)。`?tags=` で明示的にスコープ外タグを挙げたら
 /// [`v1_value_single`] と同じ**403**(存在は catalog 経由で既知なので
 /// 404 ではない)。セッション token(`ctx` 無し)は従来どおり全件(管理 UI
-/// 不変)。API キー時はこのスコープ判定後に simulation / derived_simulation
-/// を値一覧から除外する。
+/// 不変)。2026-09-15 オーナー決定（#335 追補、「外部出力を PLC への出力と
+/// 勘違いしていた」）: simulation / derived_simulation / computed をタグ
+/// 単位で除外することはもう無く、run が AllSimulation 中でも無条件で
+/// 値を返す - 外部への**読み取り**出力（REST/WS/gRPC/MQTT）はシミュレー
+/// ションでゲートしない。呼び出し側は`value_source`/`collectionMode`で
+/// 判別する。T15-3 の`test_output`opt-in はこの経路にはもはや効果が無い
+/// （`TestOutputControl`自体は残すが deprecated、`docs/tag-server-design.md`
+/// §6.3参照）。
 #[utoipa::path(
     get,
     path = "/api/v1/values",
@@ -7085,19 +7063,6 @@ async fn v1_values(
                 .filter(|name| ctx.can_read_value(name))
                 .collect()
         }
-    } else {
-        names
-    };
-
-    let names: Vec<String> = if ctx.is_some() {
-        names
-            .into_iter()
-            .filter(|name| {
-                map.get(name)
-                    .map(|entry| api_key_external_output_allowed(entry, &runtime))
-                    .unwrap_or(false)
-            })
-            .collect()
     } else {
         names
     };
@@ -7166,6 +7131,8 @@ fn build_values_response(
                 &server_store,
                 now_ms,
                 runtime,
+                map,
+                &state.computed,
             )
         })
         .collect();
@@ -7188,9 +7155,10 @@ fn build_values_response(
 /// catalog に見えている(=存在は既知)ので、per-tag read スコープ外は 404
 /// ではなく**403**(`forbidden_response`)。API キー起因の読み取り
 /// (`ctx` あり)だけがこの判定を受ける - セッション token(`ctx` 無し)は
-/// 従来どおり全アクセス(管理 UI 不変)。API キー時は simulation /
-/// derived_simulation の値を返さず、単一値では `503
-/// simulation_output_disabled` とし、catalog からも除外する。
+/// 従来どおり全アクセス(管理 UI 不変)。2026-09-15 オーナー決定（#335 追補）:
+/// simulation / derived_simulation / computed をタグ単位で隠すことはもう
+/// 無く、run が AllSimulation 中でも無条件で値を返す（外部への読み取り
+/// 出力はシミュレーションでゲートしない - `value_source`で判別させる）。
 #[utoipa::path(
     get,
     path = "/api/v1/values/{tag}",
@@ -7198,7 +7166,6 @@ fn build_values_response(
     responses(
         (status = 200, description = "単一タグの現在値", body = SingleValueResponse),
         (status = 403, description = "per-tag read スコープ外(API キー、H10 ③)"),
-        (status = 503, description = "simulation / derived_simulation は API キーの外部出力対象外"),
         (status = 404, description = "catalog に存在しない外部名"),
     ),
     tag = "tag-space",
@@ -7223,9 +7190,6 @@ async fn v1_value_single(
     }
     let now_ms = state.manager.clock().now_ms();
     let runtime = state.controller.status();
-    if ctx.is_some() && !api_key_external_output_allowed(entry, &runtime) {
-        return simulation_output_disabled_response();
-    }
     let current = state.manager.current_values();
     let server_store = state.manager.server_store();
     Json(SingleValueResponse::from_value(
@@ -7236,6 +7200,8 @@ async fn v1_value_single(
             &server_store,
             now_ms,
             &runtime,
+            &map,
+            &state.computed,
         ),
         &runtime,
     ))
@@ -7288,9 +7254,11 @@ impl ReadNowResponse {
 ///
 /// 認証は [`v1_value_single`]と同じ read ルート規律(`ctx.has_any_read()`
 /// はミドルウェア`require_tag_space_auth`、per-tag `ctx.can_read_value(tag)`
-/// と API キーの simulation 出力除外はこのハンドラ自身)。ゲート・エラー
-/// マッピングの詳細は [`crate::read_path::execute_read_now`]/
-/// [`read_now_rejection_response`] 参照。
+/// はこのハンドラ自身)。エラーマッピングの詳細は
+/// [`crate::read_path::execute_read_now`]/[`read_now_rejection_response`]
+/// 参照。2026-09-15 オーナー決定（#335 追補）: タグ単位の simulation /
+/// derived_simulation / computed 除外も、run 単位の AllSimulation ゲートも
+/// 撤去済み - 外部への読み取り出力はシミュレーションで一切ゲートしない。
 #[utoipa::path(
     get,
     path = "/api/v1/values/{tag}/read-now",
@@ -7302,7 +7270,7 @@ impl ReadNowResponse {
         (status = 422, description = "internal/computed タグ(PLC 接続を持たない)、またはアドレス不正"),
         (status = 501, description = "接続のプロトコルに broker ドライバが未対応"),
         (status = 502, description = "PLC からの読み取りに失敗"),
-        (status = 503, description = "収集セッションが無い(新規にはダイヤルしない)、または simulation 出力は API キー非対象"),
+        (status = 503, description = "収集セッションが無い(新規にはダイヤルしない)"),
     ),
     tag = "tag-space",
 )]
@@ -7312,26 +7280,17 @@ async fn v1_value_read_now(
     ctx: Option<Extension<ApiKeyContext>>,
 ) -> Response {
     let map = state.manager.tag_map();
-    let Some(entry) = map.get(&tag).cloned() else {
+    if map.get(&tag).is_none() {
         return ApiError(BantoError::NotFound {
             resource: "tags".to_string(),
             id: tag,
         })
         .into_response();
-    };
+    }
     if let Some(Extension(ctx)) = &ctx {
         if !ctx.can_read_value(&tag) {
             return forbidden_response();
         }
-    }
-    // H10 ③と同じ規律([`v1_value_single`]参照): API キー由来の読み取りは
-    // simulation/derived_simulation の値を外部出力しない。その場読みは
-    // 実際に PLC(または保存済みシミュレーション接続)へ読みに行ってしまう
-    // 前にこのチェックで弾く必要がある - cache 読みと違い、実行してから
-    // 隠すのではなく最初から実行しない。
-    let runtime = state.controller.status();
-    if ctx.is_some() && !api_key_external_output_allowed(&entry, &runtime) {
-        return simulation_output_disabled_response();
     }
     match crate::read_path::execute_read_now(&state.manager, &tag).await {
         Ok(value) => {
@@ -8241,14 +8200,16 @@ impl From<CatalogResponse> for AdminCatalogResponse {
 /// （`tagMonitorAdmin.ts`）が本来必要としていたのはこれ - 元々は
 /// `/api/v1/tags`を直接叩いていたため、試運転モード中は行が1つも表示され
 /// ない不具合の原因だった。[`build_catalog_response`]を`/api/v1/tags`
-/// （[`v1_tags`]）と共有し、`api_key_request = false`固定（管理系ルーター
-/// にAPIキーの概念は無い）で呼ぶ - シミュレーション設定を含め全件を返す
-/// （[`admin_values`]と同じ判断）。
+/// （[`v1_tags`]）と共有する - 2026-09-14 オーナー決定（#335）で
+/// `build_catalog_response`は API キー・セッションの別を判定しなくなった
+/// ため、この管理 UI 経路と`/api/v1/tags`は常に同じ結果を返す
+/// （シミュレーション設定・computed を含め全件、[`admin_values`]と同じ
+/// 判断）。
 async fn admin_tag_catalog(
     State(state): State<TagSpaceState>,
     Query(query): Query<TagsQuery>,
 ) -> Json<AdminCatalogResponse> {
-    Json(build_catalog_response(&state, &query, false).into())
+    Json(build_catalog_response(&state, &query).into())
 }
 
 /// [`admin_status`]・[`admin_values`]・[`admin_tag_catalog`]用ルーター -
@@ -8277,6 +8238,7 @@ fn admin_status_router(
     auth: AuthState,
     commissioning: CommissioningState,
 ) -> Router {
+    let computed = manager.computed_engine();
     let state = TagSpaceState {
         manager,
         controller,
@@ -8285,6 +8247,7 @@ fn admin_status_router(
         mqtt,
         system_info,
         sink_status,
+        computed,
     };
     Router::new()
         .route("/api/status", get(admin_status))
@@ -8370,6 +8333,7 @@ fn admin_tag_stream_router(
     auth: AuthState,
     commissioning: CommissioningState,
 ) -> Router {
+    let computed = manager.computed_engine();
     let state = TagSpaceState {
         manager,
         controller,
@@ -8378,6 +8342,7 @@ fn admin_tag_stream_router(
         mqtt,
         system_info,
         sink_status,
+        computed,
     };
     Router::new()
         .route(ADMIN_TAG_STREAM_PATH, get(crate::stream::ws_upgrade))
@@ -9156,6 +9121,7 @@ fn tag_space_router(
         mqtt,
         system_info,
         sink_status,
+        computed: manager.computed_engine(),
     };
     let auth_state = TagSpaceAuthState {
         auth: auth.clone(),
@@ -11417,16 +11383,34 @@ mod tests {
         }
     }
 
+    /// #335 のテスト用 - `computed`/`map` を要求するようになった
+    /// `value_source_for_tag`/`effective_simulation_for_tag`/
+    /// `CatalogTagEntry::from_runtime` に渡す「何もコミットされていない」
+    /// `ComputedEngine`。PLC/internal/db タグの分類は `map`/`computed` を
+    /// 見ないので影響を受けない - computed タグは「入力なし」(`None`)扱いに
+    /// なり、真にシミュレーション中の入力から`derived_simulation`に
+    /// 昇格する経路は通らない(その経路は`tests/computed.rs`の統合テストで
+    /// 検証する)。
+    fn empty_computed_engine() -> ComputedEngine {
+        ComputedEngine::new(Arc::new(crate::computed::ServerTagStore::new()))
+    }
+
     #[test]
     fn rest_catalog_dto_separates_configured_and_effective_simulation() {
         let tag = metadata_test_tag(banto_tags::PLC_TAG_KIND, false, true);
         let all_simulation = metadata_test_status(CollectionState::Running, RunMode::AllSimulation);
         let configured = metadata_test_status(CollectionState::Running, RunMode::Configured);
         let stopped = metadata_test_status(CollectionState::Stopped, RunMode::AllSimulation);
+        let map = TagMap::default();
+        let computed = empty_computed_engine();
 
-        let all_simulation_json =
-            serde_json::to_value(CatalogTagEntry::from_runtime(&tag, &all_simulation))
-                .expect("catalog DTO serializes");
+        let all_simulation_json = serde_json::to_value(CatalogTagEntry::from_runtime(
+            &tag,
+            &all_simulation,
+            &map,
+            &computed,
+        ))
+        .expect("catalog DTO serializes");
         assert_eq!(all_simulation_json["simulation"], false);
         assert_eq!(all_simulation_json["configured_simulation"], false);
         assert_eq!(all_simulation_json["effective_simulation"], true);
@@ -11436,7 +11420,12 @@ mod tests {
             revision: 4,
             run_id: all_simulation.run_id,
             collection_mode: all_simulation.mode.as_str().to_string(),
-            tags: vec![CatalogTagEntry::from_runtime(&tag, &all_simulation)],
+            tags: vec![CatalogTagEntry::from_runtime(
+                &tag,
+                &all_simulation,
+                &map,
+                &computed,
+            )],
         })
         .expect("catalog response serializes");
         assert_eq!(all_simulation_catalog["run_id"], 9);
@@ -11450,28 +11439,39 @@ mod tests {
             revision: 4,
             run_id: configured.run_id,
             collection_mode: configured.mode.as_str().to_string(),
-            tags: vec![CatalogTagEntry::from_runtime(&tag, &configured)],
+            tags: vec![CatalogTagEntry::from_runtime(
+                &tag,
+                &configured,
+                &map,
+                &computed,
+            )],
         })
         .expect("configured catalog response serializes");
         assert_eq!(configured_catalog["run_id"], 9);
         assert_eq!(configured_catalog["collection_mode"], "configured");
         assert_eq!(configured_catalog["tags"][0]["value_source"], "real");
 
-        assert!(!CatalogTagEntry::from_runtime(&tag, &configured).effective_simulation);
-        assert!(!CatalogTagEntry::from_runtime(&tag, &stopped).effective_simulation);
+        assert!(
+            !CatalogTagEntry::from_runtime(&tag, &configured, &map, &computed).effective_simulation
+        );
+        assert!(
+            !CatalogTagEntry::from_runtime(&tag, &stopped, &map, &computed).effective_simulation
+        );
         assert_eq!(
-            CatalogTagEntry::from_runtime(&tag, &configured).value_source,
+            CatalogTagEntry::from_runtime(&tag, &configured, &map, &computed).value_source,
             "real"
         );
         assert_eq!(
-            CatalogTagEntry::from_runtime(&tag, &stopped).value_source,
+            CatalogTagEntry::from_runtime(&tag, &stopped, &map, &computed).value_source,
             "real"
         );
         let stopped_catalog = serde_json::to_value(CatalogResponse {
             revision: 4,
             run_id: stopped.run_id,
             collection_mode: stopped.mode.as_str().to_string(),
-            tags: vec![CatalogTagEntry::from_runtime(&tag, &stopped)],
+            tags: vec![CatalogTagEntry::from_runtime(
+                &tag, &stopped, &map, &computed,
+            )],
         })
         .expect("stopped catalog response serializes");
         assert!(stopped_catalog["run_id"].is_null());
@@ -11494,49 +11494,48 @@ mod tests {
             true,
             &stopped,
         ));
-        assert!(!CatalogTagEntry::from_runtime(&saved_simulation, &stopped).effective_simulation);
+        assert!(
+            !CatalogTagEntry::from_runtime(&saved_simulation, &stopped, &map, &computed)
+                .effective_simulation
+        );
     }
 
+    /// #335（2026-09-14 オーナー決定）: computed の既定ラベルは
+    /// `"computed"` - `derived_simulation`は AllSimulation 運転中（または
+    /// 入力が真にシミュレーション中、`tests/computed.rs`の統合テスト参照）
+    /// だけの情報ラベルに変わった。
     #[test]
     fn rest_value_source_uses_safe_tag_kind_classification() {
         let all_simulation = metadata_test_status(CollectionState::Running, RunMode::AllSimulation);
         let configured = metadata_test_status(CollectionState::Running, RunMode::Configured);
         let plc = metadata_test_tag(banto_tags::PLC_TAG_KIND, false, true);
-        let computed = metadata_test_tag(banto_tags::COMPUTED_TAG_KIND, false, true);
+        let computed_tag = metadata_test_tag(banto_tags::COMPUTED_TAG_KIND, false, true);
         let internal = metadata_test_tag(banto_tags::INTERNAL_TAG_KIND, false, true);
+        let map = TagMap::default();
+        let computed = empty_computed_engine();
 
-        assert_eq!(value_source_for_tag(&plc, &all_simulation), "simulation");
-        assert_eq!(value_source_for_tag(&plc, &configured), "real");
         assert_eq!(
-            value_source_for_tag(&computed, &all_simulation),
-            "derived_simulation"
+            value_source_for_tag(&plc, &all_simulation, &map, &computed),
+            "simulation"
         );
-        assert_eq!(value_source_for_tag(&internal, &all_simulation), "internal");
-    }
-
-    #[test]
-    fn api_key_external_output_hides_simulation_and_derived_values() {
-        let all_simulation = metadata_test_status(CollectionState::Running, RunMode::AllSimulation);
-        let configured = metadata_test_status(CollectionState::Running, RunMode::Configured);
-        let stopped = metadata_test_status(CollectionState::Stopped, RunMode::AllSimulation);
-        let physical = metadata_test_tag(banto_tags::PLC_TAG_KIND, false, true);
-        let saved_simulation = metadata_test_tag(banto_tags::PLC_TAG_KIND, true, true);
-        let computed = metadata_test_tag(banto_tags::COMPUTED_TAG_KIND, false, true);
-        let internal = metadata_test_tag(banto_tags::INTERNAL_TAG_KIND, false, true);
-
-        assert!(!api_key_external_output_allowed(&physical, &all_simulation));
-        assert!(api_key_external_output_allowed(&physical, &configured));
-        assert!(!api_key_external_output_allowed(
-            &saved_simulation,
-            &configured
-        ));
-        assert!(!api_key_external_output_allowed(
-            &saved_simulation,
-            &stopped
-        ));
-        assert!(!api_key_external_output_allowed(&computed, &configured));
-        assert!(!api_key_external_output_allowed(&computed, &all_simulation));
-        assert!(api_key_external_output_allowed(&internal, &all_simulation));
+        assert_eq!(
+            value_source_for_tag(&plc, &configured, &map, &computed),
+            "real"
+        );
+        assert_eq!(
+            value_source_for_tag(&computed_tag, &all_simulation, &map, &computed),
+            "derived_simulation",
+            "AllSimulation 運転中は入力の有無によらず derived_simulation"
+        );
+        assert_eq!(
+            value_source_for_tag(&computed_tag, &configured, &map, &computed),
+            "computed",
+            "Configured 運転中・入力がコミットされていない computed の既定は computed"
+        );
+        assert_eq!(
+            value_source_for_tag(&internal, &all_simulation, &map, &computed),
+            "internal"
+        );
     }
 
     #[test]
@@ -11605,21 +11604,6 @@ mod tests {
         assert_eq!(
             body,
             serde_json::json!({"error": "simulation_write_rejected"})
-        );
-    }
-
-    #[tokio::test]
-    async fn simulation_output_rejection_is_http_503_with_machine_code() {
-        let response = simulation_output_disabled_response();
-
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            body,
-            serde_json::json!({"error": "simulation_output_disabled"})
         );
     }
 

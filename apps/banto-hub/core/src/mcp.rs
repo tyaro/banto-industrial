@@ -289,6 +289,7 @@ pub(crate) fn mcp_router(
     sink_status: Arc<SinkStatusStore>,
 ) -> Router {
     let status = TagSpaceState {
+        computed: manager.computed_engine(),
         manager: manager.clone(),
         controller: controller.clone(),
         write_control: write_control.clone(),
