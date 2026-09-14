@@ -14,7 +14,7 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
 
 - **構成**: Rust workspace + SvelteKit/Tauri。アプリは **banto-hub**（タグサーバー）/ **chronogazer**
   （記録計）/ **relay-wright**。上流 `banto` は git tag / `@banto/*` を消費（Rust クレート・npm
-  `@banto/*` とも現行 **v1.5.0** で揃っている。`Cargo.toml`/`package.json` を正とする）。
+  `@banto/*` とも現行 **v1.6.0** で揃っている。`Cargo.toml`/`package.json` を正とする）。
   Rust と npm は別マニフェストで独立に追従できるが、**上げるときは揃えて上げる運用**とする
   （2026-09-01、Issue #220 — npm 側だけ v1.2.0 に取り残されていたのを是正した教訓）。
 - **I 系（基盤 I0〜I6）**: 実装済み（I6 = banto-broker として抽出済み）。
