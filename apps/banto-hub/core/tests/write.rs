@@ -172,11 +172,7 @@ struct TestApp {
     /// so a test can reach `HubSessions::write_handle_for` directly, the way
     /// `tests/t15_write_peek.rs`/`tests/t9_simulation.rs` already do, to
     /// exercise the broker session below `write_path::execute_write`'s own
-    /// gates (e.g. the simulation-write safety gate, which unconditionally
-    /// rejects writes to ANY `simulation = true` PLC tag over REST regardless
-    /// of protocol - unrelated to and unchanged by this task, but it means a
-    /// test proving `SlmpSimRegistry::resolve`'s Modbus fix cannot go through
-    /// `POST /api/v1/values/{tag}` at all and must call the broker directly).
+    /// gates.
     sessions: Arc<HubSessions>,
     _env: TempEnv,
 }
@@ -618,45 +614,30 @@ async fn e2e_modbus_write_then_collection_reads_the_value_back() {
 //    `simulation = true` must have its broker session dial the in-process
 //    MODBUS-speaking simulator `SlmpSimRegistry` substitutes, NOT the
 //    connection's configured (real, unreachable in this test) host/port, and
-//    NOT (the bug this fixes) an SLMP-speaking simulator mismatched against
-//    the Modbus wire protocol the broker's `ModbusSession` actually speaks.
+//    NOT (the bug that fix closed) an SLMP-speaking simulator mismatched
+//    against the Modbus wire protocol the broker's `ModbusSession` actually
+//    speaks.
 //
-//    This deliberately does NOT go through `POST /api/v1/values/{tag}` (the
-//    way the other E2E tests in this file do) - `write_path::execute_write`'s
-//    simulation-write safety gate (module doc gate 4,
-//    `WriteRejection::SimulationWriteRejected`) unconditionally rejects a
-//    write to ANY `simulation = true` PLC tag over REST, for every protocol,
-//    both before and after this task (that gate is a deliberate,
-//    protocol-agnostic UX safety rule - "don't let an operator write to what
-//    might look like a real device but is actually a dev-mode simulator" -
-//    and this task does not touch it). So this test instead reaches the
-//    broker session the same way `tests/t15_write_peek.rs` does: directly via
-//    `HubSessions::write_handle_for`, bypassing `execute_write`'s gates
-//    entirely, to isolate exactly what this task changed -
-//    `SlmpSimRegistry::resolve`'s protocol-aware simulator selection - from
-//    the unrelated REST-level safety gate.
-//
-//    What "success" means here is subtler than "the write returns Ok":
-//    `banto_collect::simulation::start`'s in-process simulators
-//    (`banto_plc::{modbus,slmp}::simulator::Simulator`) are READ-ONLY - they
-//    exist for `Collector`'s own T9-1 read-side simulation feature, and
-//    `banto_plc::modbus::simulator::Simulator` answers any write function
-//    code (FC5/6/15/16) with a clean Modbus "illegal function" exception
-//    (verified by reading `crates/banto-plc/src/modbus/simulator.rs`'s
-//    `build_response`). So a *well-formed* `WriteResult::Bad(ModbusException)`
-//    response is actually the strongest available proof this fix works: it
-//    means the broker's `ModbusSession` dialed something that speaks valid
-//    Modbus TCP framing well enough to construct a proper MBAP-framed
-//    exception reply. Verified empirically (temporarily reverting the Part 1
-//    fix and rerunning this exact test) that the OLD, buggy behavior is
-//    `BrokerError::ConnectionFailed { reason: "応答タイムアウト" }` - the
-//    Modbus session times out waiting for a response it can parse, because
-//    `resolve` had dialed an SLMP-speaking simulator that never produces
-//    anything shaped like a Modbus TCP response frame at all.
+//    #363 (2026-09-15 オーナー決定) rewrote what "success" means here. The
+//    original version of this test could not use `POST /api/v1/values/{tag}`
+//    at all, because `write_path::execute_write`'s old gate 4
+//    (`WriteRejection::SimulationWriteRejected`) rejected every write to a
+//    `simulation = true` PLC tag, and the in-process simulator was read-only
+//    on the wire - so the strongest available assertion was a *well-formed*
+//    `WriteResult::Bad(ModbusException { code: 1 })` from the broker-direct
+//    path (proof the broker had dialed a peer that speaks valid Modbus TCP
+//    framing). Both halves of that are gone: the gate is removed and
+//    `banto_plc::modbus::simulator::Simulator` now serves FC5/6/15/16 and
+//    holds what was written against the ramp task. So this test now takes
+//    the ordinary REST route and asserts the whole thing end to end - the
+//    write is accepted, it lands on the substituted Modbus simulator, and it
+//    reads back through `read-now` - which subsumes the old assertion (a
+//    value can only read back if the broker dialed a real Modbus-speaking
+//    peer) while also covering the new contract.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn simulated_modbus_connection_write_dials_the_in_process_simulator_not_the_real_host() {
+async fn simulated_modbus_connection_write_lands_on_the_in_process_simulator_and_reads_back() {
     let app = test_app("e2e-modbus-sim-write").await;
 
     let conn = PlcConnectionService::new(app.pool.clone())
@@ -675,11 +656,17 @@ async fn simulated_modbus_connection_write_dials_the_in_process_simulator_not_th
         .create(group_input("fast", conn.id, 100))
         .await
         .unwrap();
+    // Offset 16 ("40017") is deliberately outside
+    // `banto_collect::simulation::RAMP_ADDRESS_COUNT` (16) so this test says
+    // nothing about the held set either way - that is
+    // `tests/t9_simulation_write.rs`'s subject. Here the point is only that
+    // the substituted simulator speaks Modbus writes at all.
     TagService::new(app.pool.clone())
         .create(tag_input("temp01", group.id, "40017", "u16", true, true))
         .await
         .unwrap();
     app.manager.rebuild().await.expect("rebuild");
+    app.write_control.enable();
 
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -693,54 +680,43 @@ async fn simulated_modbus_connection_write_dials_the_in_process_simulator_not_th
          trying to dial the unreachable real host/port"
     );
 
-    let handle = app
-        .sessions
-        .write_handle_for(conn.id)
-        .expect("a live broker session should be peekable for this connection");
-    let results = handle
-        .write(vec![banto_plc_write::BatchWriteRequest::Numeric(
-            banto_plc_write::WriteRequest {
-                address: banto_plc::Address::ModbusRef {
-                    area: banto_plc::AddressArea::HoldingRegister,
-                    // Offset 16 ("40017") is deliberately outside
-                    // `banto_collect::simulation::RAMP_ADDRESS_COUNT` (16),
-                    // so nothing else is racing to overwrite it - not load-
-                    // bearing here (this test does not read the value back),
-                    // but keeps this test's address choice consistent with
-                    // `e2e_modbus_write_then_collection_reads_the_value_back`'s
-                    // and avoids any doubt about ramp interference.
-                    offset: 16,
-                    bit: None,
-                },
-                data_type: banto_plc::DataType::U16,
-                value: banto_plc::TagValue::F64(4242.0),
-            },
-        )])
-        .await
-        .expect(
-            "the write must reach a live, Modbus-speaking session and get back a well-formed \
-             response - NOT BrokerError::ConnectionFailed/Disconnected, which is what the pre-fix \
-             SLMP-simulator mismatch produced (verified empirically - see this test's own doc \
-             comment above)",
-        );
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "writer",
+        &["write:line1.fast.temp01", "read:line1.fast.temp01"],
+    )
+    .await;
+    let (status, body) = v1_post(
+        &app.router,
+        "/api/v1/values/line1.fast.temp01",
+        &key,
+        json!({ "v": 4242 }),
+    )
+    .await;
     assert_eq!(
-        results.len(),
-        1,
-        "one request in, one result out: {results:?}"
+        status,
+        StatusCode::OK,
+        "#363: a write to a simulated connection is applied, not rejected: {body:?}"
     );
+    assert_eq!(body["result"], "ok");
+
+    // The broker session is still peekable and Modbus-speaking (the #131
+    // property), and a read through it returns what was just written.
     assert!(
-        matches!(
-            &results[0],
-            banto_plc_write::WriteResult::Bad(banto_plc_write::PlcWriteError::ModbusException {
-                function: 6,
-                code: 1,
-                ..
-            })
-        ),
-        "expected a well-formed Modbus \"illegal function\" exception from the read-only \
-         in-process simulator (proof the broker dialed a real Modbus-speaking peer - see this \
-         test's doc comment for why this Bad, not an Ok, is the correct expectation here), got \
-         {results:?}"
+        app.sessions.write_handle_for(conn.id).is_some(),
+        "a live broker session should be peekable for this connection"
+    );
+    let (status, read_now) = get_json(
+        &app.router,
+        "/api/v1/values/line1.fast.temp01/read-now",
+        &key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{read_now:?}");
+    assert_eq!(
+        read_now["v"], 4242.0,
+        "the written value must read back off the in-process simulator"
     );
 }
 

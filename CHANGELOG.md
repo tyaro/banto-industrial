@@ -2,6 +2,23 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
+## v0.2.0-alpha.11 — 2026-09-15（アルファ）
+
+シミュレーションデバイスのタグへの外部書き込みを、拒否せず PC 上のシミュレータへ反映するようにした。配布物の構成・前提ランタイムは alpha.3 以降と同じ。
+
+### 変更（2026-09-15 オーナー決定、#363）
+
+- **シミュレーションデバイス（接続単位 `simulation: true`、および全シミュレーション運転中の接続）のタグへの外部書き込み（REST `POST /api/v1/values/{tag}` とバッチ、gRPC `WriteValue`、MCP）を拒否せず、PC 上の in-process シミュレータへ反映する**。実機が無い状態で SCADA 等のクライアントが書き込み経路まで試験できるようにするため。#335 で「外部出力＝読み取り出力であって PLC 書き込みではない」と整理したことに伴う追加決定。
+- **実機向けの護りはすべてそのまま**適用する（per-tag `writable`、API キーの `write` スコープ、実効 enabled、プロトコル、`write_enabled`（受付トグル）、レート制限とトリップ、値変換・レンジ検査、log-before-write 監査、収集停止中の fail-closed）。撤去したのは「シミュレーション中は拒否」の 1 段（旧ゲート 4）だけ。
+- **`banto-plc` のシミュレータが書き込みコマンドに対応**: Modbus は FC5（single coil）/ FC6（single register）/ FC15（multiple coils）/ FC16（multiple registers）、SLMP はデバイス一括書き込み `0x1401`（ワード単位・ビット単位の両サブコマンド）。
+- **書いた番地は「保持（held）」される**: ワイヤ経由で書き込まれた番地は `banto-collect` のランプ波生成（100ms 周期、先頭 16 番地）の更新対象から外れるため、書いた値が次のポーリング・`GET /api/v1/values/{tag}/read-now` でそのまま読み戻せる。書いていない隣の番地はランプで動き続ける。保持はシミュレータインスタンスの寿命と同じで、接続の `simulation` 切替や全シミュレーション運転の開始・停止で消える。
+- **wire 変更**: エラーコード `simulation_write_rejected`（REST 503 / gRPC `UNAVAILABLE`）は**返らなくなった**。このコードで分岐していた外部クライアントは、その分岐が不要になる。
+- **監査**: log-before-write の `detail` に書き込み先の種別を記録するようにした（成功時 `{"target":"simulator"}` / `{"target":"plc"}`、失敗時は `{"target":"...","detail":"失敗理由"}`）。DB スキーマの変更（カラム追加）は無し。
+
+### 既知の制限（アルファ）
+
+alpha.9 と同じ。
+
 ## v0.2.0-alpha.10 — 2026-09-15（アルファ）
 
 API キー経由の catalog/REST から computed タグとシミュレーション値が消えていた不具合の修正 + 外部への読み取り出力のシミュレーションゲート撤廃。配布物の構成・前提ランタイムは alpha.3 以降と同じ。

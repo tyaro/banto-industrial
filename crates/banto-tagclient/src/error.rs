@@ -27,8 +27,10 @@ pub enum ErrorKind {
     /// server state - retrying the same request will not help.
     WriteForbidden,
     /// Write rejected with HTTP 503 (`writes_disabled` /
-    /// `collection_not_running` / `simulation_write_rejected`,
-    /// tag-server-design.md §6 gate 5). A transient server-side state; the
+    /// `collection_not_running`, tag-server-design.md §6 gate 5;
+    /// `simulation_write_rejected` was retired by #363, 2026-09-15 - a write
+    /// to a simulated device is applied to the simulator rather than
+    /// refused). A transient server-side state; the
     /// caller may choose to retry later, but this crate never does so
     /// automatically (2026-09-01 owner decision - see the `write` module doc).
     WriteUnavailable,

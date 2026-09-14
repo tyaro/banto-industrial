@@ -244,7 +244,7 @@ fn to_proto_value_batch(
 /// | 429 | `RESOURCE_EXHAUSTED` |
 /// | 501 | `UNIMPLEMENTED` |
 /// | 502 | `UNAVAILABLE` |
-/// | 503 | `UNAVAILABLE`(collection_not_running / simulation_write_rejected) / `FAILED_PRECONDITION`(writes_disabled) |
+/// | 503 | `UNAVAILABLE`(collection_not_running) / `FAILED_PRECONDITION`(writes_disabled) |
 /// | 500(監査書き込み失敗等、防御的分岐) | `INTERNAL` |
 ///
 /// message は常に `"{rest_error_code}: {detail}"`(detail が無ければ
@@ -252,10 +252,6 @@ fn to_proto_value_batch(
 fn write_rejection_status(rejection: WriteRejection) -> Status {
     let code = match &rejection {
         WriteRejection::CollectionNotRunning(_) => tonic::Code::Unavailable,
-        // Keep the simulation safety gate fail-closed at the transport
-        // boundary. It is a stable runtime safety condition, but the REST
-        // mapping is 503; UNAVAILABLE keeps the two transports aligned.
-        WriteRejection::SimulationWriteRejected => tonic::Code::Unavailable,
         WriteRejection::NotFound => tonic::Code::NotFound,
         WriteRejection::NotWritable => tonic::Code::PermissionDenied,
         WriteRejection::TagDisabled => tonic::Code::FailedPrecondition,
@@ -896,13 +892,6 @@ mod tests {
         ));
         assert_eq!(status.code(), tonic::Code::Unavailable);
         assert!(status.message().contains("collection_not_running"));
-    }
-
-    #[test]
-    fn simulation_write_rejection_maps_to_unavailable() {
-        let status = write_rejection_status(WriteRejection::SimulationWriteRejected);
-        assert_eq!(status.code(), tonic::Code::Unavailable);
-        assert!(status.message().contains("simulation_write_rejected"));
     }
 
     /// T15-3: `test_run_id`が`Some`のときだけ`simulation=true`かつその

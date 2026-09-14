@@ -253,7 +253,7 @@ shutdownはそのエラーを返す。公開Handleによるcatalog起点の再�
 | `invalid_tag_selection`         | カンマを含む外部タグ名（Hubの単一queryで曖昧になるため拒否）                                            | 入力を修正する。                                                                         |
 | `stopped`                       | 呼出側の停止または正常shutdown                                                                          | 再接続しない。                                                                           |
 | `write_forbidden`               | 書き込みHTTP 403（`not_writable`/`missing_write_scope`/`session_token_cannot_write`/`key_tripped`、W1） | 設定・権限の問題。SDKは再試行しない。呼出側がタグ設定/APIキーscopeを直してから再度呼ぶ。 |
-| `write_unavailable`             | 書き込みHTTP 503（`writes_disabled`/`collection_not_running`/`simulation_write_rejected`、W1）          | 一時的なサーバー状態。SDKは再試行しない。呼出側の判断で後で再試行してよい。              |
+| `write_unavailable`             | 書き込みHTTP 503（`writes_disabled`/`collection_not_running`、W1）                                      | 一時的なサーバー状態。SDKは再試行しない。呼出側の判断で後で再試行してよい。              |
 | `write_rejected`                | 書き込みのその他の拒否（404/409/422/429/501/502、W1）                                                   | リクエストの内容（タグ・値・timing）を直さない限り再試行しても成功しない。               |
 
 `Debug`/`Display`、エラー、ログにtokenを含めない。endpointについてもhost以外のpathや
@@ -287,8 +287,10 @@ log-before-write）と衝突する。監査行をバッチ単位でまとめる�
 
 **403と503の区別（オーナー指示）**: HTTP 403（`not_writable`/`missing_write_scope`/
 `session_token_cannot_write`/`key_tripped`）は設定・権限の問題で、リトライしても解決
-しない。HTTP 503（`writes_disabled`/`collection_not_running`/
-`simulation_write_rejected`）は一時的なサーバー状態で、時間を置けば解消しうる。この2つ
+しない。HTTP 503（`writes_disabled`/`collection_not_running`）は一時的な
+サーバー状態で、時間を置けば解消しうる（`simulation_write_rejected` は
+2026-09-15 オーナー決定 #363 で撤去 — シミュレーションデバイスへの書き込みは
+拒否されずシミュレータへ反映されるようになった）。この2つ
 は意味も呼出側の対処も異なるため、`ErrorKind::WriteForbidden`（403）と
 `ErrorKind::WriteUnavailable`（503）として区別する。それ以外の書き込み時拒否
 （404/409/422/429/501/502）は`ErrorKind::WriteRejected`へ集約する - リクエストの

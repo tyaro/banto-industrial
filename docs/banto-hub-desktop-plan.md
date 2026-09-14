@@ -124,7 +124,13 @@ TAG-UX-C の4点目を完成させた（`banto-hub-tags-revision.spec.ts` を拡
 を撤回し、外部への読み取り出力はシミュレーションで一切ゲートしない契約へ
 改定（書き込みゲートは変更なし）。`test_output`（T15-3）の制御プレーンは
 残すが効果を持たない deprecated 状態。詳細は §6.3・
-[tag-server-design.md](tag-server-design.md) §4.2。
+[tag-server-design.md](tag-server-design.md) §4.2。**2026-09-15**（#363、
+v0.2.0-alpha.11）: §6.3・T15 受け入れ条件の「SIM／SIM 依存値への書き込みを
+fail-closed で拒否する」も撤回。シミュレーションデバイスのタグへの外部
+書き込みは PC 上の in-process シミュレータへ反映し、書いた番地は held として
+ランプ波の更新対象から外れる（読み戻せる）。実機向けの護りはすべてそのまま
+（撤回したのは「シミュレーション中は拒否」の1段だけ）。詳細は §6.3・
+[tag-server-design.md](tag-server-design.md) §6。
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [banto-hub-t16-design.md](banto-hub-t16-design.md)、
@@ -440,9 +446,18 @@ SIM と、その値に推移的に依存する演算タグにも同じ規則を�
   どの出力経路にも効果を持たない **deprecated** 状態（撤去は後続 issue）。
   gRPC `StreamValuesRequest.test_output` フィールドは wire 互換のため残すが
   無視する。
-- SIM／SIM 依存値への REST / gRPC 書き込みは運転状態ゲートで拒否する。テスト出力を
-  有効にしても書き込み安全規則は緩和しない（この書き込みゲート自体は今回の
-  変更の対象外 - 2026-09-15 オーナー決定は読み取り出力のみに関するもの）。
+- 旧: 「SIM／SIM 依存値への REST / gRPC 書き込みは運転状態ゲートで拒否する。
+  テスト出力を有効にしても書き込み安全規則は緩和しない。」**2026-09-15 オーナー
+  決定（#363）で撤回** → シミュレーションデバイス（接続単位 `simulation: true`、
+  および全シミュレーション運転中の接続）のタグへの外部書き込みは拒否せず、
+  PC 上の in-process シミュレータへ反映する（実機が無い状態で SCADA 等の
+  クライアントが書き込み経路まで試験できるようにするため）。書いた番地は
+  シミュレータ側で held としてランプ波の更新対象から外れるので、そのまま
+  読み戻せる。実機向けの護り（per-tag `writable`・API キーの `write` スコープ・
+  レート制限とトリップ・値変換／レンジ検査・log-before-write 監査・
+  `write_enabled`・収集停止中の fail-closed）は**すべてそのまま**適用する -
+  撤回したのは「シミュレーション中は拒否」の1段だけ。監査の `detail` には
+  `{"target":"simulator"}` / `{"target":"plc"}` が残る。
 
 ## 7. 安全規則
 
@@ -1684,8 +1699,17 @@ fallback を開いた時の初期フォーカスは見出し、失敗後はエ�
 **2026-09-15 オーナー決定（#335 追補）でこの受け入れ条件のうち出力ゲート関連
 （「API キーの通常 REST / WS では既定で除外」「テスト出力は専用 namespace...」
 「SIM 切替で既存 MQTT / gRPC stream を能動終了」）を撤回** - 詳細と現行の契約は
-上記 §6.3「履歴と外部出力」を正とする（書き込み側の fail-closed 拒否・tstore
-非永続化は撤回対象外、変更なし）。以下は撤回前の実装メモとして履歴に残す。
+上記 §6.3「履歴と外部出力」を正とする（tstore 非永続化は撤回対象外、変更なし）。
+以下は撤回前の実装メモとして履歴に残す。
+
+**2026-09-15 オーナー決定（#363）で「SIM／SIM 依存値への書き込みを fail-closed で
+拒否する」も撤回** - シミュレーションデバイスのタグへの外部書き込みは拒否せず
+PC 上のシミュレータへ反映し、書いた番地は held としてランプ波の更新対象から
+外れるので読み戻せる。実機向けの護り（per-tag `writable`・`write` スコープ・
+レート制限・値検査・log-before-write・`write_enabled`・収集停止中の fail-closed）
+はすべてそのまま。詳細は §6.3 と
+`apps/banto-hub/core/src/write_path.rs` のモジュール doc comment
+「撤去: 旧ゲート4」節を正とする。
 
 実装メモ(T15-2、2026-08-09): 「未対応タグを開始前に人間可読な形で表示する」は
 `crates/banto-collect/src/simulation.rs`の`classify_plc_tag`（Modbus/SLMP の
