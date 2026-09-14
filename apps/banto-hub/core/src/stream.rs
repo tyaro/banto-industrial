@@ -94,7 +94,6 @@ use tokio::time::MissedTickBehavior;
 use banto_collect::CollectEvent;
 
 use crate::api_keys::ApiKeyContext;
-use crate::controller::{CollectionController, RunMode};
 use crate::hub::{quality_str, CollectorManager};
 use crate::rest::TagSpaceState;
 use crate::subscribe_core::{
@@ -134,7 +133,6 @@ pub(crate) async fn ws_upgrade(
     ctx: Option<Extension<ApiKeyContext>>,
 ) -> Response {
     let manager = state.manager;
-    let controller = state.controller;
     let scope = ctx.map(|Extension(ctx)| ctx);
     // T10（判断の記録、2026-08-07、`rest.rs::extract_ws_protocol_token` の
     // doc comment も参照）: `.protocols(["bearer"])` は**選択**であって
@@ -157,13 +155,12 @@ pub(crate) async fn ws_upgrade(
     // `Sec-WebSocket-Protocol` 認証を使う全クライアント（ブラウザ・この
     // テストスイート）でハンドシェイクが一貫して成功するようにする。
     ws.protocols(["bearer"])
-        .on_upgrade(move |socket| handle_socket(socket, manager, controller, scope))
+        .on_upgrade(move |socket| handle_socket(socket, manager, scope))
 }
 
 async fn handle_socket(
     socket: WebSocket,
     manager: Arc<CollectorManager>,
-    controller: Arc<CollectionController>,
     scope: Option<ApiKeyContext>,
 ) {
     let (sink, mut incoming) = socket.split();
@@ -174,8 +171,6 @@ async fn handle_socket(
     let mut events = manager.subscribe_events();
     let mut revision_rx = manager.subscribe_revision();
     let mut subscriptions: HashMap<i64, Subscription> = HashMap::new();
-    let external = scope.is_some();
-    let mut runtime_rx = external.then(|| controller.subscribe_status());
 
     let mut tick = tokio::time::interval(Duration::from_millis(EVAL_TICK_MS as u64));
     // Delay（Skip 相当）: タスクが一時的に詰まっても、詰まった分をまとめて
@@ -192,7 +187,6 @@ async fn handle_socket(
                     handle_text(
                         &text,
                         &manager,
-                        &controller,
                         &mut subscriptions,
                         &data_tx,
                         &close_tx,
@@ -211,14 +205,7 @@ async fn handle_socket(
                 Some(Err(_)) | None => false,
             },
             _ = tick.tick() => {
-                if external
-                    && !subscriptions.is_empty()
-                    && controller.status().mode == RunMode::AllSimulation
-                {
-                    false
-                } else {
-                    evaluate(&manager, &mut subscriptions, &data_tx, &close_tx, scope.as_ref())
-                }
+                evaluate(&manager, &mut subscriptions, &data_tx, &close_tx, scope.as_ref())
             },
             event = events.recv() => match event {
                 Ok(event) => send_event(&event, &manager.pool(), &data_tx, &close_tx).await,
@@ -232,20 +219,6 @@ async fn handle_socket(
             changed = revision_rx.changed() => match changed {
                 Ok(()) => send_config_changed(*revision_rx.borrow(), &data_tx, &close_tx),
                 Err(_) => false,
-            },
-            changed = async {
-                match runtime_rx.as_mut() {
-                    Some(receiver) => receiver.changed().await.map_err(|_| ()),
-                    None => std::future::pending::<Result<(), ()>>().await,
-                }
-            } => match changed {
-                Ok(())
-                    if external
-                        && !subscriptions.is_empty()
-                        && controller.status().mode == RunMode::AllSimulation =>
-                    false,
-                Ok(()) => true,
-                Err(()) => false,
             },
         };
         if !should_continue {
@@ -326,7 +299,6 @@ struct UnsubscribeWire {
 async fn handle_text(
     text: &str,
     manager: &CollectorManager,
-    controller: &CollectionController,
     subscriptions: &mut HashMap<i64, Subscription>,
     data_tx: &mpsc::Sender<Message>,
     close_tx: &mpsc::Sender<CloseFrame>,
@@ -350,16 +322,7 @@ async fn handle_text(
     match op {
         "subscribe" => match serde_json::from_value::<SubscribeWire>(value) {
             Ok(msg) => {
-                handle_subscribe(
-                    msg,
-                    manager,
-                    controller,
-                    subscriptions,
-                    data_tx,
-                    close_tx,
-                    scope,
-                )
-                .await
+                handle_subscribe(msg, manager, subscriptions, data_tx, close_tx, scope).await
             }
             Err(err) => send_error(
                 id_hint,
@@ -400,7 +363,6 @@ async fn handle_text(
 async fn handle_subscribe(
     msg: SubscribeWire,
     manager: &CollectorManager,
-    controller: &CollectionController,
     subscriptions: &mut HashMap<i64, Subscription>,
     data_tx: &mpsc::Sender<Message>,
     close_tx: &mpsc::Sender<CloseFrame>,
@@ -416,16 +378,14 @@ async fn handle_subscribe(
         );
     }
 
-    if scope.is_some() && controller.status().mode == RunMode::AllSimulation {
-        return send_error(
-            Some(msg.id),
-            "simulation_output_disabled",
-            "全PLCシミュレーション中は通常WS出力を利用できません".to_string(),
-            data_tx,
-            close_tx,
-        );
-    }
-
+    // 2026-09-15 オーナー決定（#335 追補、「外部出力を PLC への出力と
+    // 勘違いしていた」）: 以前ここにあった「API キー購読は run が
+    // AllSimulation 中なら simulation_output_disabled で拒否」は撤去した -
+    // 外部購読も run mode によらず継続する。値の `value_source`/
+    // `collection_mode`（`ValueWire`/`crate::rest`の`GET /api/v1/status`）で
+    // 判別させる。T15-3 の `TestOutputControl`/`test_output` opt-in は元々
+    // WS には無かった（gRPC 専用の仕組み）ので、この変更で WS 固有の
+    // deprecated 概念は増えない。
     let mut patterns = Vec::with_capacity(msg.tags.len());
     for raw in &msg.tags {
         match TagPattern::parse(raw) {

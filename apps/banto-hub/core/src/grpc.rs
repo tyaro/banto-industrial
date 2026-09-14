@@ -96,7 +96,7 @@ use tonic::{Request, Response, Status};
 use crate::api_keys::{ApiKeyContext, ApiKeyLookup, ApiKeysService};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::computed::ServerTagStore;
-use crate::controller::{CollectionController, RunId, RunMode};
+use crate::controller::{CollectionController, RunId};
 use crate::hub::{read_current, CollectorManager, TagEntry};
 use crate::settings::GrpcSettings;
 use crate::subscribe_core::{
@@ -231,33 +231,6 @@ fn to_proto_value_batch(
     }
 }
 
-fn simulation_output_disabled_status(status: &crate::controller::CollectionStatus) -> bool {
-    status.mode == RunMode::AllSimulation
-}
-
-fn simulation_output_disabled(controller: Option<&CollectionController>) -> bool {
-    controller.is_some_and(|controller| simulation_output_disabled_status(&controller.status()))
-}
-
-/// T15-3（設計 §6.3）: `StreamValues(test_output=true)`の gate 本体。
-/// `test_output`が未注入(`None`)なら常に`None`（fail-closed -
-/// テスト出力を配線していないホスト/テストでは`test_output=true`を
-/// honored しない）。`run_id`が`None`（`collection_controller`が未注入、
-/// または収集停止中）のときも
-/// [`TestOutputControl::is_active_for`]自体が`None`にマッチしないため、
-/// 同じ fail-closed が自然に成り立つ - `controller`の有無をここで
-/// 個別に分岐する必要がない。有効なら`run_id`をそのまま返す - これが以後
-/// その stream の`ValueBatch.run_id`に乗る。
-fn test_output_active_run_id(
-    run_id: Option<RunId>,
-    test_output: Option<&TestOutputControl>,
-) -> Option<RunId> {
-    test_output?
-        .is_active_for(run_id)
-        .then_some(run_id)
-        .flatten()
-}
-
 /// [`crate::write_path::WriteRejection`] を `tonic::Status` へ変換する
 /// (設計 §5.4「gRPC 側のエラー写像」)。REST 側の対応物は
 /// `crate::rest::write_rejection_response`。コード対応表:
@@ -338,10 +311,13 @@ enum RequireScope {
 pub struct GrpcService {
     manager: Arc<CollectorManager>,
     collection_controller: Option<Arc<CollectionController>>,
-    /// T15-3: `collection_controller`とセットで注入する
-    /// （[`Self::with_test_output`]）。`StreamValues(test_output=true)`は
-    /// これが`None`のままだと常に`test_output_disabled`で拒否される
-    /// （`test_output_active_run_id`の doc comment参照 - fail-closed）。
+    /// **Deprecated（2026-09-15 オーナー決定、#335 追補）**:
+    /// `StreamValues(test_output=true)`のゲートは撤去され、この`Arc`は
+    /// もう`stream_values`から一切参照されない。撤去自体は後続 issue -
+    /// このフィールドと[`Self::with_test_output`]・`GET /api/v1/status`の
+    /// `test_output`表示・`POST /api/test-output/{enable,disable}`は今回は
+    /// 残す（`TestOutputControl`自体の制御プレーンは維持する、という
+    /// オーナー判断）。
     test_output: Option<Arc<TestOutputControl>>,
     api_keys: ApiKeysService,
     audit: AuditLogService,
@@ -383,11 +359,10 @@ impl GrpcService {
         self
     }
 
-    /// T15-3: `StreamValues(test_output=true)`を有効化する - `controller`
-    /// と同じ`Arc`（`crate::controller::CollectionController::test_output`
-    /// が返すもの）を渡すこと。渡さない限り、`test_output=true`の要求は
-    /// 常に`test_output_disabled`で拒否される（fail-closed、
-    /// `test_output_active_run_id`の doc comment参照）。
+    /// **Deprecated（2026-09-15 オーナー決定、#335 追補）**: 配線しても
+    /// もう`stream_values`の挙動には効かない（[`Self::test_output`]の
+    /// フィールド doc comment参照）。既存の呼び出し元（`bin/banto-hub.rs`
+    /// 等）が壊れないよう、この build メソッド自体は撤去しない。
     pub fn with_test_output(mut self, test_output: Arc<TestOutputControl>) -> Self {
         self.test_output = Some(test_output);
         self
@@ -638,24 +613,14 @@ impl TagServiceTrait for GrpcService {
             }
         };
 
-        // T15-3（設計 §6.3）: `test_output=true`はテスト出力専用の別ゲート
-        // - 通常の`simulation_output_disabled`（`AllSimulation`中は拒否）
-        // とは逆に、`AllSimulation`中であることが前提かつ
-        // `TestOutputControl`が現在の run_id に対して有効化されている
-        // ことを要求する（`test_output_active_run_id`の doc comment
-        // 参照）。`test_output=false`(既定)は既存の PR #95 挙動を1バイトも
-        // 変えない。
-        if req.test_output {
-            let run_id = self
-                .collection_controller
-                .as_deref()
-                .and_then(|controller| controller.status().run_id);
-            if test_output_active_run_id(run_id, self.test_output.as_deref()).is_none() {
-                return Err(Status::failed_precondition("test_output_disabled"));
-            }
-        } else if simulation_output_disabled(self.collection_controller.as_deref()) {
-            return Err(Status::unavailable("simulation_output_disabled"));
-        }
+        // 2026-09-15 オーナー決定（#335 追補、「外部出力を PLC への出力と
+        // 勘違いしていた」）: 以前ここにあった「run が AllSimulation 中は
+        // 拒否、`test_output=true`＋`TestOutputControl`armed のときだけ
+        // 例外的に通す」ゲートは撤去した - 外部への読み取り出力は run mode
+        // によらず常に配信する。`req.test_output`は wire 互換のため
+        // proto フィールドとしては残すが、deprecated（効果なし） -
+        // `StreamValuesRequest.test_output`の proto コメント・
+        // [`GrpcService`]のフィールド doc comment参照。
 
         let now_ms = self.manager.clock().now_ms();
         let current = self.manager.current_values();
@@ -684,27 +649,11 @@ impl TagServiceTrait for GrpcService {
         };
 
         let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
-        // The lifecycle can switch between the initial status check and the
-        // first batch. Re-check immediately before exposing the stream so a
-        // newly entered all-simulation run does not receive an initial SIM
-        // value through the normal gRPC path. T15-3: this second,
-        // closest-to-use check is also the one whose result (`test_run_id`)
-        // is threaded through the rest of this stream's lifetime.
-        let test_run_id = if req.test_output {
-            let run_id = self
-                .collection_controller
-                .as_deref()
-                .and_then(|controller| controller.status().run_id);
-            match test_output_active_run_id(run_id, self.test_output.as_deref()) {
-                Some(run_id) => Some(run_id),
-                None => return Err(Status::failed_precondition("test_output_disabled")),
-            }
-        } else {
-            if simulation_output_disabled(self.collection_controller.as_deref()) {
-                return Err(Status::unavailable("simulation_output_disabled"));
-            }
-            None
-        };
+        // 2026-09-15 オーナー決定（上記参照）: `test_output`はもう
+        // gate にも `ValueBatch` の `simulation`/`run_id` メタデータにも
+        // 効かない - このストリームは常に通常ストリーム扱い（`test_run_id
+        // = None`）。
+        let test_run_id: Option<RunId> = None;
         // 設計「初期スナップショット必須」- subscribe 直後に必ず1回送る
         // (空でも)。作ったばかりのチャネルなので `try_send` が失敗する
         // ことは通常ない(防御的に失敗時は素直にストリームを終える)。
@@ -715,7 +664,6 @@ impl TagServiceTrait for GrpcService {
             .collection_controller
             .as_ref()
             .map(|controller| controller.subscribe_status());
-        let test_output_control = self.test_output.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(EVAL_TICK_MS as u64));
             tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -733,27 +681,10 @@ impl TagServiceTrait for GrpcService {
                         }
                     }
                 }
-                // T15-3: a test-output stream ends the moment
-                // `TestOutputControl` no longer matches this stream's fixed
-                // `run_id` - `CollectionController` disables it on every
-                // lifecycle transition (stop/new start/mode switch), and an
-                // explicit `POST /api/test-output/disable` clears it
-                // directly, so this single check covers all of "test output
-                // becomes inactive or collection stops / leaves
-                // AllSimulation" without needing to inspect `runtime_rx`
-                // separately. A normal stream keeps the pre-T15-3 check
-                // (ends when `AllSimulation` starts).
-                let should_end = match test_run_id {
-                    Some(run_id) => !test_output_control
-                        .as_deref()
-                        .is_some_and(|control| control.is_active_for(Some(run_id))),
-                    None => runtime_rx
-                        .as_ref()
-                        .is_some_and(|receiver| receiver.borrow().mode == RunMode::AllSimulation),
-                };
-                if should_end {
-                    break;
-                }
+                // 2026-09-15 オーナー決定（上記参照）: 以前ここにあった
+                // 「AllSimulation へ遷移したら通常ストリームを打ち切る」
+                // （`test_run_id`が`None`の場合の旧分岐）は撤去した -
+                // このストリームは run mode によらず配信を続ける。
                 if tx.is_closed() {
                     break;
                 }
@@ -956,28 +887,7 @@ impl GrpcServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::controller::{CollectionState, CollectionStatus};
-
-    fn status(mode: RunMode) -> CollectionStatus {
-        CollectionStatus {
-            state: CollectionState::Running,
-            mode,
-            run_id: Some(1),
-            last_error: None,
-            configured_revision: 1,
-            running_revision: 1,
-        }
-    }
-
-    #[test]
-    fn simulation_output_gate_disables_only_all_simulation() {
-        assert!(!simulation_output_disabled_status(&status(
-            RunMode::Configured
-        )));
-        assert!(simulation_output_disabled_status(&status(
-            RunMode::AllSimulation
-        )));
-    }
+    use crate::controller::CollectionState;
 
     #[test]
     fn stopped_collection_rejection_maps_to_unavailable() {
@@ -993,28 +903,6 @@ mod tests {
         let status = write_rejection_status(WriteRejection::SimulationWriteRejected);
         assert_eq!(status.code(), tonic::Code::Unavailable);
         assert!(status.message().contains("simulation_write_rejected"));
-    }
-
-    /// T15-3: `test_output`未注入なら fail-closed(`None`)。
-    #[test]
-    fn test_output_active_run_id_requires_test_output_to_be_wired() {
-        assert_eq!(test_output_active_run_id(Some(1), None), None);
-    }
-
-    /// T15-3: 有効化されていない・別 run_id・run_id 無し(収集停止中相当)は
-    /// いずれも`None`。
-    #[test]
-    fn test_output_active_run_id_requires_a_matching_armed_run_id() {
-        let test_output = TestOutputControl::new();
-        assert_eq!(test_output_active_run_id(Some(1), Some(&test_output)), None);
-
-        test_output.enable(1);
-        assert_eq!(
-            test_output_active_run_id(Some(1), Some(&test_output)),
-            Some(1)
-        );
-        assert_eq!(test_output_active_run_id(Some(2), Some(&test_output)), None);
-        assert_eq!(test_output_active_run_id(None, Some(&test_output)), None);
     }
 
     /// T15-3: `test_run_id`が`Some`のときだけ`simulation=true`かつその

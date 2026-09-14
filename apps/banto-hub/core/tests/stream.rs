@@ -550,8 +550,13 @@ async fn subscribe_exact_tag_gets_initial_snapshot_then_on_change_data() {
     sim.stop();
 }
 
+/// 2026-09-15 オーナー決定（#335 追補、「外部出力を PLC への出力と勘違い
+/// していた」）: 以前はここで API キー WS が `AllSimulation` 突入時に
+/// 強制切断され、新規 subscribe も `simulation_output_disabled` で拒否
+/// されていた（旧 PR #95 挙動）。その抑止は撤去済み - API キー WS も
+/// run mode によらず配信を継続し、新規 subscribe も通常どおり成功する。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn api_key_ws_ends_and_rejects_normal_output_during_all_simulation() {
+async fn api_key_ws_keeps_streaming_normal_output_during_all_simulation() {
     let app = test_app("api-key-all-simulation").await;
     let sim = Simulator::start().await;
     sim.set_holding_register(0, 100);
@@ -597,32 +602,18 @@ async fn api_key_ws_ends_and_rejects_normal_output_during_all_simulation() {
     let snapshot = recv_matching(&mut api_key_ws, |m| m["op"] == "data" && m["id"] == 1).await;
     assert_eq!(snapshot["values"][0]["v"], 100.0);
 
-    let mut session_ws = connect_ws(&app.ws_url("/api/v1/stream"), Some(&app.token))
-        .await
-        .expect("session WS handshake should succeed");
-    send_json(
-        &mut session_ws,
-        json!({ "op": "subscribe", "id": 2, "tags": ["line1.fast.temp01"], "mode": "on_change" }),
-    )
-    .await;
-    recv_matching(&mut session_ws, |m| m["op"] == "data" && m["id"] == 2).await;
-
     let status = app.controller.start(RunMode::AllSimulation).await;
     assert_eq!(status.state, CollectionState::Running);
     assert_eq!(status.mode, RunMode::AllSimulation);
 
-    let closed = tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            match api_key_ws.next().await {
-                None | Some(Err(_)) | Some(Ok(WsMessage::Close(_))) => break true,
-                Some(Ok(_)) => {}
-            }
-        }
-    })
-    .await
-    .expect("API-key WS should actively end during all-simulation");
-    assert!(closed);
+    // 既存の API キー WS 購読は AllSimulation 突入後も生きたまま - ping/pong
+    // が通ることで接続が能動的に切断されていないことを確認する。
+    send_json(&mut api_key_ws, json!({ "op": "ping" })).await;
+    let pong = recv_matching(&mut api_key_ws, |m| m["op"] == "pong").await;
+    assert_eq!(pong["op"], "pong", "existing API-key WS must stay open");
 
+    // 新規 API キー WS の subscribe も AllSimulation 中に通常どおり成功する
+    // （以前の `simulation_output_disabled` 拒否は撤去済み）。
     let mut new_api_key_ws = connect_ws(&app.ws_url("/api/v1/stream"), Some(&issued.key))
         .await
         .expect("new API-key WS handshake should still succeed");
@@ -631,12 +622,8 @@ async fn api_key_ws_ends_and_rejects_normal_output_during_all_simulation() {
         json!({ "op": "subscribe", "id": 3, "tags": ["line1.fast.temp01"], "mode": "on_change" }),
     )
     .await;
-    let error = recv_matching(&mut new_api_key_ws, |m| m["op"] == "error" && m["id"] == 3).await;
-    assert_eq!(error["code"], "simulation_output_disabled");
-
-    send_json(&mut session_ws, json!({ "op": "ping" })).await;
-    let pong = recv_matching(&mut session_ws, |m| m["op"] == "pong").await;
-    assert_eq!(pong["op"], "pong", "management session WS must remain open");
+    let snapshot = recv_matching(&mut new_api_key_ws, |m| m["op"] == "data" && m["id"] == 3).await;
+    assert_eq!(snapshot["values"][0]["tag"], "line1.fast.temp01");
 
     sim.stop();
 }

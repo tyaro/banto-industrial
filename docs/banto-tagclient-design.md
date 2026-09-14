@@ -23,6 +23,10 @@ S4b-1互換候補では、`origin/main` 509bf0e（Banto v1.4.0）との統合検
 `POST /api/v1/values/{tag}`を1回送るだけで、`worker.rs`の再接続・backoff機構には
 一切乗せない（自動再送をしない、§4.4のオーナー決定）。バッチ・レシピ書き込みは
 実装していない（同§のオーナー決定）。
+**2026-09-14/15追記（#335）**: `ValueSource`に`Computed`（`"computed"`）・`Db`（`"db"`、
+既存ギャップ対応）を追加（§4.4付近の型定義）。Hub側は2026-09-15オーナー決定で外部への
+読み取り出力をシミュレーションでゲートしなくなったため、`derived_simulation`は抑止
+フラグではなく情報ラベルとして扱うこと（`docs/tag-server-design.md` §4.2参照）。
 設計時参照baseline: `b9552627a86015b354b3c5651184fb108ba89e44`
 実API確認日: 2026-08-30（`apps/banto-hub/core/src/rest.rs` / `stream.rs`）、
 書き込み経路は2026-09-01に`apps/banto-hub/core/src/rest.rs`の`v1_write_value`・
@@ -154,13 +158,21 @@ pub enum CollectionMode { Configured, AllSimulation, Unknown(String) }
 pub enum ValueSource {
 	Real,
 	Simulation,
+	Computed,
 	DerivedSimulation,
 	Internal,
+	Db,
 	Unknown(String),
 }
 ```
 
-`value_source`の既知値は`real` / `simulation` / `derived_simulation` / `internal`。
+`value_source`の既知値は`real` / `simulation` / `computed` / `derived_simulation` /
+`internal` / `db`（`computed`・`db`は2026-09-14/15、#335で追加 - `computed`は演算タグの
+既定ラベル、`db`は外部DB連携(2026-09-06決定)由来のタグの既存ギャップ対応。
+`derived_simulation`は「全PLCシミュレーション運転中、または演算タグの入力が実際に
+シミュレーション中」だけの情報ラベルで、値の抑止は意味しない - 2026-09-15オーナー決定で
+外部への読み取り出力はシミュレーションで一切ゲートされなくなった、
+`docs/tag-server-design.md` §4.2参照）。
 未知値はraw値を保持した`Unknown(String)`として扱い、`Real`や実機のcurrentへ昇格させない。
 `collection_mode`も未知値を`Unknown(String)`として保持するが、Unknownまたはcatalogと
 valuesで異なる場合はcurrentを公開しない。catalogとvaluesは`revision`だけでなく

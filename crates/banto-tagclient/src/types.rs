@@ -92,12 +92,23 @@ impl<'de> Deserialize<'de> for CollectionMode {
 }
 
 /// The authoritative source classification carried by Hub values.
+///
+/// `Computed` and `Db` were added 2026-09-14（#335 / 既存ギャップ対応）:
+/// `Computed`は banto-hub の `value_source_for_tag`が computed タグの既定
+/// ラベルとして返すようになった値（`derived_simulation`は真に
+/// シミュレーション中のときだけの情報ラベルに変わった）。`Db`は外部 DB
+/// 連携（2026-09-06 オーナー決定）で hub が既に送っていたが、この enum に
+/// 対応する variant が無く`Unknown("db")`へ落ちていたギャップを埋めた。
+/// `Unknown(raw)`は今後もフォールバックとして残す - 将来 hub 側に新しい
+/// ラベルが増えても、このクレートを更新するまでは`Unknown`で読める。
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum ValueSource {
     Real,
     Simulation,
+    Computed,
     DerivedSimulation,
     Internal,
+    Db,
     Unknown(String),
 }
 
@@ -106,8 +117,10 @@ impl ValueSource {
         match raw.into().as_str() {
             "real" => Self::Real,
             "simulation" => Self::Simulation,
+            "computed" => Self::Computed,
             "derived_simulation" => Self::DerivedSimulation,
             "internal" => Self::Internal,
+            "db" => Self::Db,
             raw => Self::Unknown(raw.to_owned()),
         }
     }
@@ -116,8 +129,10 @@ impl ValueSource {
         match self {
             Self::Real => "real",
             Self::Simulation => "simulation",
+            Self::Computed => "computed",
             Self::DerivedSimulation => "derived_simulation",
             Self::Internal => "internal",
+            Self::Db => "db",
             Self::Unknown(raw) => raw,
         }
     }
@@ -387,6 +402,29 @@ mod tests {
         assert!(
             matches!(value.value_source, ValueSource::Unknown(ref raw) if raw == "future_source")
         );
+    }
+
+    /// #335（2026-09-14）: `computed`は computed タグの既定 `value_source`
+    /// ラベル、`db`は外部 DB 連携（2026-09-06 オーナー決定）由来のタグの
+    /// ラベル - どちらも以前は`Unknown(raw)`へ落ちていた既存ギャップ。
+    #[test]
+    fn computed_and_db_value_sources_parse_to_dedicated_variants() {
+        assert_eq!(ValueSource::parse("computed"), ValueSource::Computed);
+        assert_eq!(ValueSource::parse("computed").as_str(), "computed");
+        assert_eq!(ValueSource::parse("db"), ValueSource::Db);
+        assert_eq!(ValueSource::parse("db").as_str(), "db");
+
+        let value: ValueEntry = serde_json::from_str(
+            r#"{"tag":"tag-a","v":1.0,"q":"good","t":17,"value_source":"computed"}"#,
+        )
+        .unwrap();
+        assert_eq!(value.value_source, ValueSource::Computed);
+
+        let value: ValueEntry = serde_json::from_str(
+            r#"{"tag":"tag-b","v":2.0,"q":"good","t":18,"value_source":"db"}"#,
+        )
+        .unwrap();
+        assert_eq!(value.value_source, ValueSource::Db);
     }
 
     #[test]

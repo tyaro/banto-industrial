@@ -2,6 +2,34 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
+## v0.2.0-alpha.10 — 2026-09-15（アルファ）
+
+API キー経由の catalog/REST から computed タグとシミュレーション値が消えていた不具合の修正 + 外部への読み取り出力のシミュレーションゲート撤廃。配布物の構成・前提ランタイムは alpha.3 以降と同じ。
+
+### 修正
+
+- **API キー経由の `GET /api/v1/tags`（catalog）から computed タグが常に消えていた不具合を修正**（#335）。原因は `value_source_for_tag` が computed タグに実行状態を問わず常に `derived_simulation` を返し、「シミュレーション由来の値は外部出力しない」というフィルタ（`api_key_external_output_allowed`）へ恒久的に引っかかっていたこと。同じフィルタの先頭 `if entry.simulation { return false; }` により、接続単位で simulation 設定済みの PLC タグも収集停止中は catalog から消えていた。WS/gRPC の購読経路にはこのフィルタが無く、値は届くのに catalog からは発見できない、という不整合があった（#332 の検討中に発覚）。
+
+### 変更（2026-09-14 オーナー決定）
+
+- `value_source` に新ラベル `computed` を追加。computed タグの既定は `computed`（wire 追加 - 既存クライアントは未知値として扱えること、`banto-tagclient` の `ValueSource::Unknown` は維持）。`derived_simulation` は「全 PLC シミュレーション運転中、または式が参照する入力タグのいずれかが実際にシミュレーション中（PLC タグの `effective_simulation == true`）」のときだけの**情報ラベル**に変更 - もう抑止フィルタの対象ではない。
+- API キー経由でも catalog（`GET /api/v1/tags`）は収集状態を問わず常に全タグを返すようにした。`api_key_external_output_allowed` を撤去。
+- `banto-tagclient` の `ValueSource` に `Computed`（`"computed"`）・`Db`（`"db"`、外部 DB 連携 2026-09-06 決定由来の既存ギャップ）を追加。
+
+### 変更（2026-09-15 オーナー決定「外部出力を PLC への出力と勘違いしていた」で追補）
+
+- **外部への読み取り出力（REST の `/api/v1/values` 系・WS・gRPC・MQTT）はシミュレーションで一切ゲートしないよう統一**。全 PLC シミュレーション運転中でも catalog・値読み取り・購読・publish を無条件で配信し、呼び出し側は `value_source`/`collection_mode` で判別する。
+  - REST: `/api/v1/values`（一括）・`/api/v1/values/{tag}`・read-now の run 単位 503 `simulation_output_disabled` ゲートを撤去。
+  - WS（`stream.rs`）: `handle_subscribe` の `RunMode::AllSimulation` 拒否、および tick/`runtime_rx.changed()` での「AllSimulation 突入時に外部購読を能動切断する」分岐を撤去。
+  - gRPC（`grpc.rs`）: `simulation_output_disabled`/`simulation_output_disabled_status` ゲートと、テスト出力ストリームの自動終了ロジックを撤去。`StreamValuesRequest.test_output` は wire 互換のため受け付けるが無視する（**wire 変更なし、意味論のみ変更** - proto コメントに deprecated と明記）。
+  - MQTT（`mqtt.rs`）: `eval_target` の「AllSimulation 中は test_output が有効なときだけ publish」ゲートを撤去し、run mode によらず通常トピックへ publish する。テスト出力専用トピック（`{prefix}/test/{run_id}/...`）・`TestOutputPayload`・`PublishTarget::Test` は撤去した。
+  - 書き込み経路（`POST /api/v1/values/{tag}`・gRPC `WriteValue`・MCP）の simulation 判定は変更していない - 今回の決定は読み取り出力のみが対象。
+- `test_output`（T15-3）の制御プレーン自体（`TestOutputControl`、`POST /api/test-output/{enable,disable}`、`GET /api/v1/status` の `test_output` 表示、UI トグル）は今回は残すが、どの出力経路も参照しなくなったため **deprecated**（効果なし）。撤去は後続 issue で行う。
+
+### 既知の制限（アルファ）
+
+alpha.9 と同じ。
+
 ## v0.2.0-alpha.9 — 2026-09-14（アルファ）
 
 構成変更（CRUD）が実行構成へ届くまでの契約の変更。配布物の構成・前提ランタイムは alpha.3 以降と同じ。

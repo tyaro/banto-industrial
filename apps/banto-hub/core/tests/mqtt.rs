@@ -467,14 +467,17 @@ async fn test_app(label: &str) -> TestApp {
     }
 }
 
-/// T15-3（設計 §6.3）: [`TestApp`]は`MqttPublisher::new`（コントローラ非注入 -
-/// このモジュールの他のテストは`AllSimulation`/テスト出力を一切対象としない
-/// ため常に`PublishTarget::Normal`扱いでよい）を使うが、テスト出力トピック
-/// は`Running`+`AllSimulation`+`TestOutputControl`有効時のみ選ばれる
-/// （`crate::mqtt::eval_target`参照）ので、この構成では検証できない。
-/// このテスト専用に、`MqttPublisher::new_with_controller`+
-/// `api_router_with_controller`で実際の`CollectionController`/
-/// `TestOutputControl`を配線した別構成を用意する。
+/// [`TestApp`]は`MqttPublisher::new`（コントローラ非注入 - このモジュールの
+/// 他のテストは`AllSimulation`/`test_output`を一切対象としないため常に
+/// `PublishTarget`扱いでよい）を使うが、`AllSimulation`運転・
+/// `POST /api/test-output/{enable,disable}`（`Running`+`AllSimulation`必須、
+/// `crate::controller::CollectionController`が前提条件を検査する）を
+/// 検証するテストにはこの構成では足りない。このテスト専用に、
+/// `MqttPublisher::new_with_controller`+`api_router_with_controller`で実際の
+/// `CollectionController`/`TestOutputControl`を配線した別構成を用意する
+/// （2026-09-15 オーナー決定 #335 追補以降、`test_output`は MQTT publish には
+/// もう影響しない - `crate::mqtt`のモジュール doc comment「T15-3 →
+/// 2026-09-15 オーナー決定」参照）。
 struct TestOutputTestApp {
     router: Router,
     token: String,
@@ -1112,14 +1115,18 @@ async fn post_test_output(router: &Router, token: &str, action: &str) -> (Status
     .await
 }
 
-/// `AllSimulation`かつ`Running`でなければ有効化を拒否し、有効化後は通常
-/// トピックを一切汚さず専用トピック（`{prefix}/test/{run_id}/...`）だけに
-/// `simulation=true`・一致する`run_id`付きで`retain=false`発行する - 実装
-/// 指示のテスト計画1〜3を1本の統合テストにまとめたもの。
+/// 2026-09-15 オーナー決定（#335 追補、「外部出力を PLC への出力と勘違い
+/// していた」）: 以前は`AllSimulation`中、`test_output`が armed でない限り
+/// 通常トピックへの発行を抑止し（旧 PR #95 挙動）、armed 中だけ専用の
+/// `{prefix}/test/{run_id}/...`トピックへ発行していた（実装指示のテスト
+/// 計画1〜3、旧テスト名
+/// `test_output_topics_carry_simulation_payloads_only_while_armed_during_all_simulation`）。
+/// その抑止・専用トピックの仕組みは撤去された - 通常トピックは run mode
+/// によらず常に発行し、専用トピックには二度と何も来ない。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_output_topics_carry_simulation_payloads_only_while_armed_during_all_simulation() {
+async fn normal_topic_publishes_during_all_simulation_regardless_of_test_output() {
     let broker_port = start_test_broker().await;
-    let app = test_output_test_app("test-output-happy-path").await;
+    let app = test_output_test_app("test-output-deprecated").await;
 
     let conn = PlcConnectionService::new(app.pool.clone())
         .create(conn_input("line1", 1)) // AllSimulation はホスト/ポートに接続しない
@@ -1146,11 +1153,6 @@ async fn test_output_topics_carry_simulation_payloads_only_while_armed_during_al
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    // 収集停止中は有効化の前提を満たさない(`Running`+`AllSimulation`必須)。
-    let (status, body) = post_test_output(&app.router, &app.token, "enable").await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(body["error"], "test_output_not_available");
-
     let run_status = app.controller.start(RunMode::AllSimulation).await;
     assert_eq!(run_status.state, CollectionState::Running);
     let run_id = run_status
@@ -1162,110 +1164,61 @@ async fn test_output_topics_carry_simulation_payloads_only_while_armed_during_al
             status_mqtt_connected(&app.router, &app.token).await
         })
         .await,
-        "mqtt should connect once enabled, independent of test-output"
+        "mqtt should connect once enabled"
     );
 
-    // 有効化前: `AllSimulation`中なので通常トピックには何も来ない
-    // (既存 PR #95 挙動)し、まだ有効化していないのでテスト出力トピックにも
-    // 何も来ない。
-    let nothing = collect_messages(
-        broker_port,
-        "sub-before-enable",
-        "banto/#",
-        1,
-        Duration::from_millis(500),
-    )
-    .await;
-    let stray_state = nothing
-        .iter()
-        .filter(|(topic, _)| topic != "banto/$state")
-        .count();
-    assert_eq!(
-        stray_state, 0,
-        "no tag topic (normal or test) should publish before test-output is enabled: {nothing:?}"
-    );
-
-    // 有効化: `enabled: true`・`run_id`が一致するレスポンス。
-    let (status, body) = post_test_output(&app.router, &app.token, "enable").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["enabled"], true);
-    assert_eq!(body["run_id"], run_id);
-
-    let live = LiveSubscriber::subscribe(broker_port, "sub-test-live", "banto/#").await;
+    let live = LiveSubscriber::subscribe(broker_port, "sub-normal-during-sim", "banto/#").await;
+    let normal_topic = "banto/line1/fast/temp01";
     let test_topic = format!("banto/test/{run_id}/line1/fast/temp01");
-    // 初回サイクルは `q:"bad", v:null`(シミュレーション値サンプル前)で
-    // publish されることがあるため、トピック到達だけでなく最新payloadの
-    // `v`が数値になる(=goodなサンプル到達)まで待つ。
+
+    // test_output を一切 enable しないまま、通常トピックに発行され続ける
+    // (以前はここで一切発行されなかった - 既存 PR #95 抑止は撤去済み)。
     assert!(
         wait_until(Duration::from_secs(6), || async {
-            let messages = live.snapshot().await;
-            payload_json(&messages, &test_topic)
-                .map(|payload| payload["v"].is_number())
-                .unwrap_or(false)
+            live.snapshot()
+                .await
+                .iter()
+                .any(|(topic, _)| topic == normal_topic)
         })
         .await,
-        "the test-output topic should carry a numeric sample once armed"
+        "the normal topic must keep publishing during all-simulation even without test_output"
     );
-
     let messages = live.snapshot().await;
-    let payload = payload_json(&messages, &test_topic).expect("test-output payload");
-    assert_eq!(payload["simulation"], true);
-    assert_eq!(payload["run_id"], run_id);
-    assert!(payload["v"].is_number(), "payload: {payload:?}");
-
-    // 通常トピックには一度も来ていないこと(`AllSimulation`中は抑止のまま)。
     assert!(
-        !messages
-            .iter()
-            .any(|(topic, _)| topic == "banto/line1/fast/temp01"),
-        "the normal topic must stay silent during all-simulation: {messages:?}"
+        !messages.iter().any(|(topic, _)| topic == &test_topic),
+        "the deprecated test-output topic must never receive a publish: {messages:?}"
     );
 
-    // 明示的な disable: 以後テスト出力トピックへの新規発行が止まる。
-    let (status, body) = post_test_output(&app.router, &app.token, "disable").await;
+    // test_output を明示的に enable しても、通常トピックの発行にも専用
+    // トピックの不在にも変化は無い(deprecated - 効果なし)。
+    let (status, body) = post_test_output(&app.router, &app.token, "enable").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["enabled"], false);
+    assert_eq!(body["run_id"], run_id);
 
     let baseline = live.snapshot().await.len();
-    tokio::time::sleep(Duration::from_millis(700)).await;
-    let after_disable = live.snapshot().await.split_off(baseline);
     assert!(
-        after_disable.is_empty(),
-        "no further test-output publish should happen after disable: {after_disable:?}"
+        wait_until(Duration::from_secs(6), || async {
+            live.snapshot().await.len() > baseline
+        })
+        .await,
+        "the normal topic should keep receiving fresh publishes after enabling test_output"
     );
-
-    // retain=false: 発行が止まった後に**新規**購読しても、broker には
-    // テスト出力トピックの最終値が残っていない(通常トピックの
-    // `retain_delivers_last_value_to_a_fresh_subscriber`と対照的な挙動 -
-    // 実装指示「retain=false always」)。発行中の新規購読では「たまたま
-    // タイミング内に生きた発行が来た」だけで retain の有無を判別できない
-    // ため、発行が完全に止まった後で確認する。
-    let fresh = collect_messages(
-        broker_port,
-        "sub-test-fresh",
-        &test_topic,
-        1,
-        Duration::from_millis(700),
-    )
-    .await;
+    let messages = live.snapshot().await;
     assert!(
-        fresh.is_empty(),
-        "a fresh subscriber must NOT receive a retained test-output message: {fresh:?}"
+        !messages.iter().any(|(topic, _)| topic == &test_topic),
+        "enabling test_output must not resurrect the deprecated test-output topic: {messages:?}"
     );
-
-    let (status, body) = get_json(&app.router, "/api/v1/status", &app.token).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["test_output"]["enabled"], false);
-    assert_eq!(body["test_output"]["run_id"], Value::Null);
 }
 
-/// 収集停止は明示的な`disable`と同じ結果になる - `CollectionController`の
-/// `stop_locked`が`test_output.disable()`する（設計「停止／終了／切替後に
-/// 必ず無効へ戻る」）。停止後は再度`AllSimulation`が`Running`に戻るまで
-/// 有効化が拒否される。
+/// 2026-09-15 オーナー決定: `test_output`の enable/disable・収集の
+/// stop/start は、もう MQTT publish に一切影響しない。`TestOutputControl`
+/// 自体の制御プレーン（`Running`+`AllSimulation`必須・停止時の自動無効化）
+/// は`crate::controller`の
+/// `test_output_auto_disables_on_every_lifecycle_transition`で別途確認済み
+/// （このモジュールで重複させない）- ここでは「その遷移が MQTT の通常
+/// トピック発行を乱さない」ことだけを確認する。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_output_auto_disables_on_stop_and_re_enable_is_rejected_until_all_simulation_runs_again(
-) {
+async fn mqtt_publishing_is_unaffected_by_test_output_enable_disable_or_collection_stop() {
     let broker_port = start_test_broker().await;
     let app = test_output_test_app("test-output-stop-clears").await;
 
@@ -1310,38 +1263,34 @@ async fn test_output_auto_disables_on_stop_and_re_enable_is_rejected_until_all_s
     assert_eq!(body["run_id"], run_id);
     assert!(app.test_output.is_active_for(Some(run_id)));
 
-    let test_topic = format!("banto/test/{run_id}/line1/fast/temp01");
-    let live = LiveSubscriber::subscribe(broker_port, "sub-test-stop-live", "banto/#").await;
+    let normal_topic = "banto/line1/fast/temp01";
+    let live = LiveSubscriber::subscribe(broker_port, "sub-unaffected-live", "banto/#").await;
     assert!(
         wait_until(Duration::from_secs(6), || async {
             live.snapshot()
                 .await
                 .iter()
-                .any(|(topic, _)| topic == &test_topic)
+                .any(|(topic, _)| topic == normal_topic)
         })
         .await,
-        "the test-output topic should receive a publish once armed"
+        "the normal topic should publish while test_output is enabled"
     );
 
     app.controller.stop().await;
-
-    // 設計「停止...後に必ず無効へ戻る」: ライブフラグ自身がクリアされる。
+    // 設計「停止...後に必ず無効へ戻る」: ライブフラグ自身がクリアされる
+    // (`crate::controller`の doc comment参照、MQTT とは無関係の既存挙動)。
     assert!(!app.test_output.is_active_for(Some(run_id)));
-    let (status, body) = get_json(&app.router, "/api/v1/status", &app.token).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["test_output"]["enabled"], false);
 
-    // 停止直後は`Stopped`なので再有効化は前提条件を満たさず拒否される。
-    let (status, body) = post_test_output(&app.router, &app.token, "enable").await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(body["error"], "test_output_not_available");
-
+    // 通常運転で再開 - 直前の test_output 状態やクリアには一切左右されず
+    // 通常トピックへの発行が続く。
+    app.controller.start(RunMode::Configured).await;
     let baseline = live.snapshot().await.len();
-    tokio::time::sleep(Duration::from_millis(700)).await;
-    let after_stop = live.snapshot().await.split_off(baseline);
     assert!(
-        after_stop.is_empty(),
-        "no further test-output publish should happen after the collection stops: {after_stop:?}"
+        wait_until(Duration::from_secs(6), || async {
+            live.snapshot().await.len() > baseline
+        })
+        .await,
+        "the normal topic should keep publishing after a stop/restart cycle, unaffected by test_output"
     );
 }
 

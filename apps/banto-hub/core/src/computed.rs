@@ -273,6 +273,22 @@ impl ComputedEngine {
         self.store.clone()
     }
 
+    /// 演算タグ `external_name` が式で直接参照しているタグの外部名一覧
+    /// （`rest.rs` の `value_source`/`effective_simulation` 判定 - #335、
+    /// 2026-09-14 オーナー決定 - 「computed の入力が真のシミュレーション中
+    /// か」を辿るために公開する）。現在コミット済みの `plan` に無い名前
+    /// （未登録・非 computed・rebuild 直後でまだ `commit` されていない等）
+    /// は `None` - 呼び出し側は「入力なし」＝シミュレーションではない、
+    /// として扱う。
+    pub fn referenced_tags(&self, external_name: &str) -> Option<Vec<String>> {
+        let state = self.state.lock().expect("ComputedEngine lock poisoned");
+        state
+            .plan
+            .exprs
+            .get(external_name)
+            .map(|expr| expr.referenced_tags().to_vec())
+    }
+
     /// `build_plan` が成功したときだけ呼ぶこと - 新しい plan に入れ替え、
     /// baseline を全消去する（§4.3(a) の all-or-nothing は呼び出し元
     /// `crate::hub::CollectorManager::rebuild` が担保する - このメソッド
