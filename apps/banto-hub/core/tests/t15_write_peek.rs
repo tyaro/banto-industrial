@@ -246,7 +246,6 @@ async fn test_app(label: &str) -> TestApp {
     let test_output = Arc::new(TestOutputControl::new());
     let controller = Arc::new(CollectionController::new(
         manager.clone(),
-        write_control.clone(),
         test_output.clone(),
     ));
     // 収集を Running にしておく - このテストの核心は「外側の

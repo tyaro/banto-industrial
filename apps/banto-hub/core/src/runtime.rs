@@ -537,12 +537,15 @@ impl HubRuntime {
         let tags = TagService::new(pool.clone());
         let api_keys = ApiKeysService::new(pool.clone());
 
-        // T2-4 (docs/tag-server-design.md §6-6): the live write-acceptance
-        // flag ALWAYS constructs disabled, no matter what was persisted -
-        // only `was_enabled_before_restart` (display-only,
-        // `/api/v1/status`) reads the persisted value. See `WriteControl`'s
-        // module doc for the one rule this exists to enforce (a restart
-        // must never silently resume write acceptance).
+        // T2-4 (docs/tag-server-design.md §6-6)。2026-09-09 オーナー決定
+        // (#340) で「起動時は必ず disabled」ルールを撤回: the live
+        // write-acceptance flag is restored straight from the persisted
+        // value on construction. `was_enabled_before_restart` (displayed at
+        // `/api/v1/status`) is the same value the live flag was restored
+        // to. banto-hub is a rule-engine-free pass-through with no
+        // autonomous-resume risk, so a restart no longer needs to force
+        // write acceptance off; the global toggle is an operator-driven
+        // emergency stop whose persisted state now survives restarts.
         let write_was_enabled_persisted =
             load_persisted_enabled(&pool).await.unwrap_or_else(|err| {
                 log_err_line(&format!(
@@ -551,25 +554,23 @@ impl HubRuntime {
                 false
             });
         let write_control = Arc::new(WriteControl::new(write_was_enabled_persisted));
-        // T15-3（設計 §6.3）: `write_control`と同じく非永続 - `enabled`は
-        // 常に`false`で構築する（DB/settings から読むものが無いので
+        // T15-3（設計 §6.3）: こちらは引き続き非永続 - `enabled`は常に
+        // `false`で構築する（DB/settings から読むものが無いので
         // `WriteControl`の`was_enabled_before_restart`に相当するものも無い）。
         let test_output = Arc::new(TestOutputControl::new());
         let controller = Arc::new(CollectionController::new(
             manager.clone(),
-            write_control.clone(),
             test_output.clone(),
         ));
         let write_audit = WriteAuditService::new(pool.clone());
 
         // T3 (docs/tag-server-design.md §5.3): construct stopped, then
-        // apply the persisted settings - same "constructed disabled, then
-        // explicitly brought up" shape as `WriteControl` above, but here
-        // `enabled` itself (not just a display-only history flag) comes
-        // straight from settings - MQTT publish has no "restart always
-        // disables" safety rule like the write path does (design has no
-        // such requirement for T3; publishing is read-only against the tag
-        // space).
+        // apply the persisted settings - `enabled` comes straight from
+        // settings (`SettingsService::mqtt_config`, applied a few lines
+        // below), read fresh on every startup. MQTT publish has no
+        // "restart always disables" safety rule like the write path does
+        // (design has no such requirement for T3; publishing is read-only
+        // against the tag space).
         let mqtt = Arc::new(MqttPublisher::new_with_controller(
             manager.clone(),
             controller.clone(),

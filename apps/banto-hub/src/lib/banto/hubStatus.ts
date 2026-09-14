@@ -157,9 +157,11 @@ export interface StatusResponse {
 	revision: number;
 	last_config_error: string | null;
 	connections: ConnectionStatusEntry[];
-	/** T2-4（設計 §6-6）: 書き込み受付のライブフラグ（起動時は必ず false）。 */
+	/** T2-4（設計 §6-6）: 書き込み受付のライブフラグ（既定で有効。再起動では
+	 * 永続値を復元し、収集の開始/停止では変わらない。2026-09-09 オーナー
+	 * 決定 #340）。 */
 	write_enabled: boolean;
-	/** T2-4（設計 §6-6）: プロセス再起動前は有効だったか（表示専用の履歴）。 */
+	/** T2-4（設計 §6-6）: 起動時に永続テーブルから復元した値。 */
 	write_was_enabled_before_restart: boolean;
 	/** T3（設計 §5.3）: MQTT publish の設定/接続状態。 */
 	mqtt: MqttStatusEntry;

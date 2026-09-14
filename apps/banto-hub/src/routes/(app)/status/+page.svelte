@@ -969,8 +969,9 @@
 		<section>
 			<h2>書き込み受付（管理者限定）</h2>
 			<p class="note">
-				プロセス再起動時は必ず無効化されます（安全側の既定 - 明示的に有効化するまで
-				<code>POST /api/v1/values/&#123;tag&#125;</code> は 503 を返します）。
+				書き込み受付は既定で有効です。再起動しても前回の状態を復元します。無効化は運用者が
+				書き込みを止めるための非常停止スイッチで、無効の間は
+				<code>POST /api/v1/values/&#123;tag&#125;</code> が 503 を返します。
 			</p>
 			<dl class="summary">
 				<dt>現在の状態</dt>
@@ -979,8 +980,8 @@
 						? '有効（書き込みを受け付けています）'
 						: '無効（書き込みを拒否しています）'}
 				</dd>
-				<dt>再起動前の状態</dt>
-				<dd>{status.write_was_enabled_before_restart ? '有効だった' : '無効だった'}</dd>
+				<dt>起動時に復元した状態</dt>
+				<dd>{status.write_was_enabled_before_restart ? '有効' : '無効'}</dd>
 			</dl>
 			<div class="write-control-actions">
 				<button

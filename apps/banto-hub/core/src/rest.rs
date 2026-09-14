@@ -1280,10 +1280,11 @@ fn api_keys_router(
 // --- 書き込み受付トグル (T2-4、設計 §6-6): admin 限定、CSRF + bearer -------
 //
 // `POST /api/write-control/enable`/`disable` は
-// `crate::write_control::WriteControl`（ライブフラグ、起動時 disabled）を
-// 切り替え、`crate::write_control::persist_enabled` で表示専用の永続値も
-// 更新する（`WriteControl` のモジュール doc comment 参照 - 永続値は次回
-// 起動時のライブフラグには一切影響しない）。
+// `crate::write_control::WriteControl`（ライブフラグ、既定 enabled・再起動
+// で永続値を復元）を切り替え、`crate::write_control::persist_enabled` で
+// 永続値も更新する（`WriteControl` のモジュール doc comment 参照 - 永続値は
+// 次回起動時のライブフラグの初期値としてそのまま復元される。2026-09-09
+// オーナー決定 #340）。
 
 #[derive(Clone)]
 struct WriteControlAdminState {
@@ -1297,33 +1298,80 @@ struct WriteControlAdminState {
 
 /// `GET /api/v1/status` の `write_enabled`/`write_was_enabled_before_restart`
 /// と同じ形の応答（`POST /api/write-control/enable|disable` の応答）。
+/// `write_was_enabled_before_restart` は「起動時に永続テーブルから復元した
+/// 値」を指す（フィールド名は外部クライアント Thermal Monitor との互換の
+/// ため変更しない。2026-09-09 オーナー決定 #340）。
 #[derive(Debug, Serialize, ToSchema)]
 struct WriteControlStatusResponse {
     write_enabled: bool,
     write_was_enabled_before_restart: bool,
 }
 
+/// #340 レビュー対応（2026-09-14）: `enabled_persisted` は次回起動時の
+/// ライブ値そのものとして復元されるようになったため（`WriteControl` の
+/// モジュール doc comment参照）、永続化の失敗を握りつぶして 200 を返すと
+/// 「今は効いているが再起動すると黙って元に戻る」状態を作ってしまう。
+/// disable/enable で非対称に扱う:
+/// - **disable（非常停止）**: 先にライブフラグを `disable()` する(DB 障害
+///   があっても書き込みは必ず即座に止まる)。永続化が失敗しても無効化
+///   そのものは成功しているので、その旨を含めた 500 を返す。
+/// - **enable**: 先に `persist_enabled(true)` を試す。失敗したらライブ
+///   フラグには触れない(disabled のまま)。永続化が確認できてから
+///   `enable()` する。
+///
+/// どちらの分岐でも監査ログは成功/失敗の両方を記録する(失敗時は
+/// `detail.persisted = false` + `detail.error`)。`ServerEvent::ResourceChanged`
+/// はライブ状態が実際に変わった場合にのみ送る。
 async fn write_control_set(
     state: &WriteControlAdminState,
     headers: &HeaderMap,
     enabled: bool,
     action: &str,
-) -> Json<WriteControlStatusResponse> {
+) -> Response {
+    let identity = actor_identity(headers, &state.auth, &state.commissioning);
+    let actor_id = identity.as_ref().map(|i| i.id.as_str());
+
     if enabled {
+        if let Err(err) =
+            crate::write_control::persist_enabled(&state.manager.pool(), true, actor_id).await
+        {
+            record_write_control_failure(
+                &state.audit,
+                &state.auth,
+                &state.commissioning,
+                headers,
+                action,
+                true,
+                err.to_string(),
+            )
+            .await;
+            return write_control_persist_failed_response(
+                "永続化に失敗したため有効化しませんでした。",
+            );
+        }
         state.write_control.enable();
     } else {
         state.write_control.disable();
-    }
-
-    let identity = actor_identity(headers, &state.auth, &state.commissioning);
-    if let Err(err) = crate::write_control::persist_enabled(
-        &state.manager.pool(),
-        enabled,
-        identity.as_ref().map(|i| i.id.as_str()),
-    )
-    .await
-    {
-        eprintln!("banto-hub: 書き込み受付状態の永続化に失敗しました: {err}");
+        if let Err(err) =
+            crate::write_control::persist_enabled(&state.manager.pool(), false, actor_id).await
+        {
+            record_write_control_failure(
+                &state.audit,
+                &state.auth,
+                &state.commissioning,
+                headers,
+                action,
+                false,
+                err.to_string(),
+            )
+            .await;
+            let _ = state.events.send(ServerEvent::ResourceChanged {
+                resource: "write_control".to_string(),
+            });
+            return write_control_persist_failed_response(
+                "書き込み受付は無効化しましたが永続化に失敗したため再起動後は前回の永続値に戻ります。",
+            );
+        }
     }
 
     record_write(
@@ -1334,7 +1382,7 @@ async fn write_control_set(
         action,
         "write_control",
         "1",
-        Some(json!({ "enabled": enabled })),
+        Some(json!({ "enabled": enabled, "persisted": true })),
     )
     .await;
     let _ = state.events.send(ServerEvent::ResourceChanged {
@@ -1345,19 +1393,63 @@ async fn write_control_set(
         write_enabled: state.write_control.is_enabled(),
         write_was_enabled_before_restart: state.write_control.was_enabled_before_restart(),
     })
+    .into_response()
+}
+
+/// [`write_control_set`] の永続化失敗時の監査行 - `record_write`（成功専用、
+/// `result: "ok"` 固定）とは別に、`result: "failed"` と
+/// `detail.persisted = false` / `detail.error` を記録する。
+#[allow(clippy::too_many_arguments)]
+async fn record_write_control_failure(
+    audit: &AuditLogService,
+    auth: &AuthState,
+    commissioning: &CommissioningState,
+    headers: &HeaderMap,
+    action: &str,
+    enabled: bool,
+    error: String,
+) {
+    let identity = actor_identity(headers, auth, commissioning);
+    audit
+        .record(AuditEntry {
+            actor_username: identity.as_ref().map(|i| i.id.as_str()),
+            actor_role: identity.as_ref().map(|i| i.role.as_str()),
+            action,
+            resource: "write_control",
+            entity_id: Some("1"),
+            detail: Some(json!({ "enabled": enabled, "persisted": false, "error": error })),
+            origin: "rest",
+            result: "failed",
+        })
+        .await;
+}
+
+/// #340: `write_control_set` の永続化失敗を伝える 500。`writes_disabled`
+/// 等（このファイル上部の `*_response` 群）と同じ `{"error": ..., "message": ...}`
+/// 形の ad hoc JSON - `WriteControlStatusResponse` の `kind` タグ付き
+/// `BantoError`/`ApiError` 系とは別の、この機能専用の安定した機械可読コード。
+fn write_control_persist_failed_response(message: &str) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "error": "write_control_persist_failed",
+            "message": message
+        })),
+    )
+        .into_response()
 }
 
 async fn write_control_enable(
     State(state): State<WriteControlAdminState>,
     headers: HeaderMap,
-) -> Json<WriteControlStatusResponse> {
+) -> Response {
     write_control_set(&state, &headers, true, "enable").await
 }
 
 async fn write_control_disable(
     State(state): State<WriteControlAdminState>,
     headers: HeaderMap,
-) -> Json<WriteControlStatusResponse> {
+) -> Response {
     write_control_set(&state, &headers, false, "disable").await
 }
 
@@ -7381,9 +7473,10 @@ pub(crate) struct StatusResponse {
     connections: Vec<ConnectionStatusEntry>,
     /// T2-4（設計 §6-6）: 書き込み受付が今いま有効かどうか(ライブフラグ)。
     write_enabled: bool,
-    /// T2-4（設計 §6-6）: プロセス再起動前は有効だったか(表示専用の履歴 -
-    /// `crate::write_control::WriteControl` のモジュール doc comment
-    /// 参照。ライブの `write_enabled` には一切影響しない)。
+    /// T2-4（設計 §6-6）: 起動時に永続テーブルから復元した値
+    /// (`crate::write_control::WriteControl` のモジュール doc comment
+    /// 参照。以後の enable/disable ではこの値自体は変わらない。
+    /// 2026-09-09 オーナー決定 #340)。
     write_was_enabled_before_restart: bool,
     /// T15-3（設計 §6.3）: テスト出力（現在の run コンテキスト限定・
     /// 非永続）が今いま有効かどうかと、有効な場合はどの run に紐付いて
@@ -9179,10 +9272,10 @@ fn api_router_with_controller_mode(
     commissioning: CommissioningService,
     events: broadcast::Sender<ServerEvent>,
     allow_setup: bool,
-    // T2-4（設計 §6）: 書き込み受付の起動時 disabled フラグと書き込み監査
-    // サービス - どちらも `bin/banto-hub.rs`（本番）または各テストの
-    // セットアップで一度だけ構築し、ここに注入する（`ApiKeysService` 等の
-    // 他サービスと同じ規約）。
+    // T2-4（設計 §6）: 書き込み受付フラグ（既定 enabled、起動時に永続値を
+    // 復元。2026-09-09 オーナー決定 #340）と書き込み監査サービス - どちらも
+    // `bin/banto-hub.rs`（本番）または各テストのセットアップで一度だけ
+    // 構築し、ここに注入する（`ApiKeysService` 等の他サービスと同じ規約）。
     write_control: Arc<WriteControl>,
     write_audit: WriteAuditService,
     // T3（設計 §5.3）: MQTT publish - `bin/banto-hub.rs`（本番）または各
@@ -9615,7 +9708,6 @@ pub fn api_router(
     let test_output = Arc::new(TestOutputControl::new());
     let controller = Arc::new(crate::controller::CollectionController::new(
         manager.clone(),
-        write_control.clone(),
         test_output.clone(),
     ));
     api_router_with_controller_mode(
@@ -10125,13 +10217,8 @@ mod tests {
     ) {
         let pool = migrate_memory().await.expect("migrate_memory");
         let (manager, dir) = test_manager_with_clock(pool.clone(), Arc::new(SystemClock));
-        let write_control = Arc::new(WriteControl::new(false));
         let test_output = Arc::new(TestOutputControl::new());
-        let controller = Arc::new(CollectionController::new(
-            manager.clone(),
-            write_control,
-            test_output,
-        ));
+        let controller = Arc::new(CollectionController::new(manager.clone(), test_output));
         let (events, _rx) = tokio_broadcast::channel(16);
         (manager, controller, events, pool, dir)
     }

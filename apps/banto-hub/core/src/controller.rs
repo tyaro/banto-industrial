@@ -23,7 +23,6 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::db_source::DbSourceEngine;
 use crate::hub::CollectorManager;
 use crate::test_output::TestOutputControl;
-use crate::write_control::WriteControl;
 
 /// A collection lifecycle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -95,11 +94,12 @@ pub type RuntimeStatus = CollectionStatus;
 /// The serialized collection lifecycle controller.
 pub struct CollectionController {
     manager: Arc<CollectorManager>,
-    write_control: Arc<WriteControl>,
-    /// T15-3（設計 §6.3）: `write_control`と同じ遷移点（`start_locked`/
-    /// `stop_locked`/モード切替）で`disable()`する - テスト出力が「現在の
-    /// run コンテキストのみ」に留まることをここで保証する
-    /// （`crate::test_output`のモジュール doc comment参照）。
+    /// T15-3（設計 §6.3）: `start_locked`/`stop_locked`/モード切替の遷移点で
+    /// `disable()`する - テスト出力が「現在の run コンテキストのみ」に
+    /// 留まることをここで保証する（`crate::test_output`のモジュール doc
+    /// comment参照）。2026-09-09 オーナー決定（#340）で `write_control` は
+    /// これらの遷移点から外れたが、`test_output` はここで引き続き連動する
+    /// （T15-3、変更なし）。
     test_output: Arc<TestOutputControl>,
     /// 外部 DB 連携 S2b（docs/banto-hub-external-db-design.md §4.8・§6-16、
     /// 2026-09-06 オーナー決定「DB Source は収集が Running のときだけ
@@ -133,11 +133,7 @@ struct ControllerState {
 }
 
 impl CollectionController {
-    pub fn new(
-        manager: Arc<CollectorManager>,
-        write_control: Arc<WriteControl>,
-        test_output: Arc<TestOutputControl>,
-    ) -> Self {
+    pub fn new(manager: Arc<CollectorManager>, test_output: Arc<TestOutputControl>) -> Self {
         let initial = CollectionStatus {
             state: CollectionState::Stopped,
             mode: RunMode::Configured,
@@ -150,7 +146,6 @@ impl CollectionController {
         let db_source = manager.db_source_engine();
         Self {
             manager,
-            write_control,
             test_output,
             db_source,
             state: Mutex::new(ControllerState {
@@ -296,7 +291,6 @@ impl CollectionController {
         let current = self.status();
         if current.state == CollectionState::Stopped {
             if current.mode != mode {
-                self.write_control.disable();
                 self.test_output.disable();
             }
             self.set_mode_locked(mode);
@@ -341,7 +335,6 @@ impl CollectionController {
             state.context = Some(context);
             state.last_error = None;
         }
-        self.write_control.disable();
         self.test_output.disable();
         self.publish_status();
 
@@ -385,7 +378,6 @@ impl CollectionController {
                 .expect("collection controller state lock poisoned");
             state.state = CollectionState::Stopping;
         }
-        self.write_control.disable();
         self.test_output.disable();
         self.publish_status();
         // 外部 DB 連携 S2b（§4.8・§6-16）: `manager.stop()` より**前**に
@@ -455,14 +447,8 @@ mod tests {
             Arc::new(SlmpSimRegistry::new()),
             Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new()))),
         ));
-        let write_control = Arc::new(WriteControl::new(true));
         let test_output = Arc::new(TestOutputControl::new());
-        let controller = Arc::new(CollectionController::new(
-            manager,
-            write_control.clone(),
-            test_output,
-        ));
-        write_control.enable();
+        let controller = Arc::new(CollectionController::new(manager, test_output));
         (dir, controller)
     }
 
@@ -473,7 +459,6 @@ mod tests {
         let first = controller.start(RunMode::Configured).await;
         assert_eq!(first.state, CollectionState::Running);
         assert_eq!(first.run_id, Some(1));
-        assert!(!controller.write_control.is_enabled());
 
         let repeated = controller.start(RunMode::Configured).await;
         assert_eq!(repeated, first);
@@ -581,9 +566,10 @@ mod tests {
     }
 
     /// T15-3（設計 §6.3「停止／終了／切替／サービス再起動後に必ず無効へ
-    /// 戻る」）: `write_control`と同じ遷移点(`start_locked`/
-    /// `stop_locked`/停止中のモード切替)で`test_output`も必ず disable
-    /// される。
+    /// 戻る」）: `start_locked`/`stop_locked`/停止中のモード切替の遷移点で
+    /// `test_output`は必ず disable される（write_control は 2026-09-09
+    /// オーナー決定 #340 でこれらの遷移点から外れたが、test_output の
+    /// 連動は変更なし）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_output_auto_disables_on_every_lifecycle_transition() {
         let (_dir, controller) = controller_env().await;

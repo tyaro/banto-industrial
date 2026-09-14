@@ -3418,15 +3418,83 @@ async fn set_write_control_enable_and_disable_persist_and_audit() {
     );
 }
 
-/// 既知の運用癖（実装指示・`docs/mcp-real-machine-2026-09-04`メモリ参照）:
-/// `CollectionController::start`は遷移のたびに`WriteControl::disable`を
-/// 呼ぶ（`crate::controller`参照）ため、収集開始直後は書き込み受付が
-/// 強制的に無効化される。`set_collection{action:start}`の直後に
-/// `write_enabled`が`false`へ戻ること、そこから`set_write_control`で
-/// 改めて有効化できることを固定する。
+/// #340 レビュー対応（2026-09-14）: `enabled_persisted` が次回起動時の
+/// ライブ値そのものになったため、enable は永続化に成功したときだけ
+/// ライブフラグを立てる。`persist_enabled` を強制失敗させ、`isError: true`
+/// を返しつつライブフラグは disabled のままであることを確認する
+/// （ハンドラが panic しないことも同時に確認する）。
+///
+/// REST 版（`tests/write.rs`）は `app.pool.close()` で丸ごと止めているが、
+/// MCP の API キー認証はセッション bearer と違い**リクエスト毎に DB へ
+/// 問い合わせる**（`crate::api_keys`）ため、pool を閉じると
+/// `set_write_control` 呼び出し自体が認証エラー（401）になってしまい
+/// `persist_enabled` の失敗を検証できない。そこで `write_control_state`
+/// テーブルだけを drop し、`api_keys`（→認証）と `audit_log`（→監査）は
+/// 生かしたまま `persist_enabled` の UPDATE だけを失敗させる。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn starting_collection_resets_write_enabled_and_set_write_control_re_enables_it() {
-    let app = test_app("runtime-start-resets-write-control").await;
+async fn set_write_control_enable_returns_tool_error_and_stays_disabled_when_persistence_fails() {
+    let app = test_app("write-control-persist-fail-enable").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    assert!(!app.write_control.is_enabled());
+
+    sqlx::query("DROP TABLE write_control_state")
+        .execute(&app.pool)
+        .await
+        .expect("drop write_control_state");
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("set_write_control", json!({ "enabled": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    assert!(
+        !app.write_control.is_enabled(),
+        "enable must not flip the live flag when persistence fails"
+    );
+}
+
+/// #340 レビュー対応（2026-09-14）: disable（非常停止）はライブフラグを
+/// 先に落とすため、永続化が失敗しても書き込みは止まったままになる -
+/// `isError: true` を返しつつライブフラグは disabled（止まっている）こと
+/// を確認する。上のテストと同じ理由で `app.pool.close()` ではなく
+/// `write_control_state` テーブルの drop で永続化だけを失敗させる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_write_control_disable_returns_tool_error_but_stays_disabled_when_persistence_fails() {
+    let app = test_app("write-control-persist-fail-disable").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    app.write_control.enable();
+    assert!(app.write_control.is_enabled());
+
+    sqlx::query("DROP TABLE write_control_state")
+        .execute(&app.pool)
+        .await
+        .expect("drop write_control_state");
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("set_write_control", json!({ "enabled": false })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    assert!(
+        !app.write_control.is_enabled(),
+        "disable must fail closed (live flag stays off) even when persistence fails"
+    );
+}
+
+/// 2026-09-09 オーナー決定（#340、`docs/mcp-real-machine-2026-09-04`メモリの
+/// 旧記録を撤回）: `CollectionController::start`/`stop`/`set_mode` はもはや
+/// `WriteControl::disable`を呼ばない。`set_collection{action:start}`の前後
+/// で`write_enabled`が変わらないこと、明示的に`set_write_control`で無効化
+/// した場合はその値が維持されることを固定する。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn starting_collection_does_not_change_write_enabled() {
+    let app = test_app("runtime-start-does-not-reset-write-control").await;
     let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
 
     let (status, body) = mcp_post(
@@ -3448,22 +3516,32 @@ async fn starting_collection_resets_write_enabled_and_set_write_control_re_enabl
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["result"]["isError"], false, "{body:?}");
     assert!(
-        !app.write_control.is_enabled(),
-        "collection start must reset write_enabled to false (known operational quirk)"
+        app.write_control.is_enabled(),
+        "collection start must not change write_enabled (#340)"
     );
 
     let (status, body) = mcp_post(
         &app.router,
         Some(&admin_key),
-        tools_call("set_write_control", json!({ "enabled": true })),
+        tools_call("set_write_control", json!({ "enabled": false })),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["result"]["isError"], false, "{body:?}");
-    let text = body["result"]["content"][0]["text"].as_str().unwrap();
-    let payload: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(payload["writeEnabled"], true, "{payload:?}");
-    assert!(app.write_control.is_enabled());
+    assert!(!app.write_control.is_enabled());
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("set_collection", json!({ "action": "stop" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    assert!(
+        !app.write_control.is_enabled(),
+        "collection stop must not change write_enabled either (#340)"
+    );
 }
 
 // ---------------------------------------------------------------------------

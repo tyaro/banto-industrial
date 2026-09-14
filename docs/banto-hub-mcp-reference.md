@@ -4,7 +4,7 @@
 状態: **現行**。T19 S5（UX-41）で実装、T20 で `read_tag_now` / `write_recipe` を追加。
 2026-09-05 に実機 R08ENCPU（SLMP）でデータ面 6 ツールを検証済み、2026-09-06 に T21
 管理面を含む 31 ツール全数を実機で end-to-end 検証済み（結果は §9）。2026-09-06 に外部 DB 連携（[banto-hub-external-db-design.md](banto-hub-external-db-design.md) §5.2）で `test_saved_connection`（32 ツール目）・接続の `database`/`username`/`password`・グループの `querySql`・`db` tag_kind を同期。S4 で Sink グループ管理の 5 ツール追加で **37 ツール**となる。構成補助（管理面）ツールは §6。
-2026-09-08 に issue #325 で `data_type` に 64bit 型 `i64`/`u64`/`f64` を追加（§7）。Modbus 接続配下のタグのみ登録可（`create_tag`/`update_tag` は §6）。
+2026-09-08 に issue #325 で `data_type` に 64bit 型 `i64`/`u64`/`f64` を追加（§7）。Modbus 接続配下のタグのみ登録可（`create_tag`/`update_tag` は §6）。2026-09-14 に issue #340（v0.2.0-alpha.8）で §3「write-control」の記述を、write_enabled が既定で有効・収集操作で変わらない新挙動に更新。
 関連: [tag-server-design.md](tag-server-design.md)（タグ空間・書き込み安全の一次ソース）、
 [banto-hub-t20-design.md](banto-hub-t20-design.md)（文字列・レシピ・ビットの設計）、
 [banto-hub-operations.md](banto-hub-operations.md)（起動・ポート・運用）。
@@ -56,9 +56,11 @@ MCP は REST/gRPC と**同じ `execute_write` / `execute_write_batch` を通り�
 2. **ロックダウン後**: 書き込みツール（`write_tag_value` / `write_recipe`）は
    **アドバイザリのみ**（`execute_write` を呼ばず、推奨だけ返す）。読み取りツールは通常どおり。
    `get_server_status` の `lockedDown` で現在の状態が分かる。
-3. **write-control**: `POST /api/write-control/enable` で書き込み受付を ON にする。
-   **収集開始（新しい run）は `write_enabled` を False にリセットする**（安全設計）ので、
-   有効化は**収集開始の後**に行う。
+3. **write-control**: `write_enabled` は既定で有効。プロセス再起動や収集の
+   開始/停止・モード変更では変わらない（2026-09-09 オーナー決定 #340 -
+   旧記述「収集開始は write_enabled をリセットする」は撤回）。無効なら
+   `set_write_control {enabled:true}` または `POST /api/write-control/enable`
+   で有効化する。
 4. 各書き込みは per-tag の `writable` フラグ、write スコープ、シミュレーション/プロトコル、
    レート制限、値変換（型対称性・レンジ）を通る。詳細は tag-server-design.md §6。
 
@@ -220,7 +222,7 @@ MCP から banto-hub を**構成**するツール群（T21、docs/banto-hub-t21-
 | `list_connections` / `create_connection` / `update_connection` / `delete_connection` / `test_connection` / `test_saved_connection` | 接続                | delete は confirm。test は保存前の疎通確認（副作用なし）。test_saved_connection は保存済み `postgres` 接続の疎通確認（admin スコープ、`SELECT version()`、S1a）。`postgres` 接続は `database`/`username` 必須・`password` 任意で、応答は `passwordSet` のみ（update の `password` は null=保持・""=消去・文字列=置換）                                                                                  |
 | `list_groups` / `create_group` / `update_group` / `delete_group`                                                                   | グループ            | delete は cascade（配下タグごと）＋confirm。postgres 接続配下のグループは `querySql` 必須（S2）                                                                                                                                                                                                                                                                                                         |
 | `get_tag` / `create_tag` / `update_tag` / `delete_tag`                                                                             | タグ                | get_tag は全フィールド＋`revision`（update の RMW 用）。delete は confirm。`list_tags` は §4 の read ツール。`tagKind: "db"` は postgres 接続配下専用で `address` は SELECT の結果列名・読み取り専用（S2）。`dataType: "i64"/"u64"/"f64"`（2026-09-08、issue #325）は `modbus-tcp` 接続配下専用（§7）                                                                                                   |
-| `set_collection` / `set_write_control`                                                                                             | 運転制御            | start は `RunMode::Configured`。**収集開始は write_enabled を False にリセット**するので、書き込みは開始後に `set_write_control {enabled:true}`                                                                                                                                                                                                                                                         |
+| `set_collection` / `set_write_control`                                                                                             | 運転制御            | start は `RunMode::Configured`。write_enabled は既定で有効・収集の開始/停止では変わらない（2026-09-09 オーナー決定 #340）。無効なら `set_write_control {enabled:true}`                                                                                                                                                                                                                                  |
 | `get_grpc_settings` / `set_grpc_settings` / `get_mqtt_settings` / `set_mqtt_settings` / `get_retention` / `set_retention`          | 設定                | set は REST と同じ validation＋即時 apply（retention は永続のみ）。MQTT パスワード等は応答でマスク                                                                                                                                                                                                                                                                                                      |
 | `create_api_key` / `list_api_keys` / `revoke_api_key`                                                                              | API キー            | create は**任意スコープ発行可**（admin 含む＝オーナー決定）。応答の平文 `key` は発行時のみ。revoke は confirm。list は平文/hash を含まない                                                                                                                                                                                                                                                              |
 | `lock_down`                                                                                                                        | 運用                | **不可逆**・confirm 必須。以降 write 系データツールはアドバイザリのみ（構成ツールは admin で継続可）                                                                                                                                                                                                                                                                                                    |

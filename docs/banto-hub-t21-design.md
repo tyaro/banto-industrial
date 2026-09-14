@@ -1,7 +1,7 @@
 # banto-hub T21 設計: 構成補助 MCP（管理面ツール）
 
 作成日: 2026-09-05
-状態: **完了（2026-09-06）**。S1（接続/グループ/タグ CRUD、#267-269）/ S2（収集・write 制御 #270、設定 gRPC/MQTT/retention #271）/ S3（API キー発行/失効・lock_down #272）を実装済み。実装は既存 admin REST の mutation/検証/監査経路を再利用（`crate::mcp`）。IF 一覧は banto-hub-mcp-reference.md §6。オーナー決定は §2・§8、安全境界の設計は §3。
+状態: **完了（2026-09-06）、2026-09-14 #340 で §4 の write_enabled 記述を更新**。S1（接続/グループ/タグ CRUD、#267-269）/ S2（収集・write 制御 #270、設定 gRPC/MQTT/retention #271）/ S3（API キー発行/失効・lock_down #272）を実装済み。実装は既存 admin REST の mutation/検証/監査経路を再利用（`crate::mcp`）。IF 一覧は banto-hub-mcp-reference.md §6。オーナー決定は §2・§8、安全境界の設計は §3。**§4 の「start は write_enabled をリセット」は 2026-09-09 オーナー決定（#340）で撤回済み** - 下表の該当行参照。
 対象: MCP から接続/グループ/タグ・各種設定・収集/書き込み制御・API キーを操作する
 「構成補助」ツール群。AI エージェントや MES セットアップツールが**会話的に banto-hub を
 構成**できるようにする。
@@ -98,7 +98,7 @@ write 有効化・API キー発行を admin REST で手作業した — これ�
 | `create_tag`                                      | POST /api/tags                           | `list_tags` は既存                                               |
 | `update_tag`/`delete_tag`                         | PUT/DELETE /api/tags/{id}                |                                                                  |
 | `create_tags_batch`                               | POST /api/tags/batch                     | 連続/構造体/CSV 相当の一括登録                                   |
-| `set_collection`                                  | POST /api/collection/start, /stop        | start は write_enabled をリセット                                |
+| `set_collection`                                  | POST /api/collection/start, /stop        | （2026-09-09 撤回、#340）write_enabled は変えない                |
 | `set_write_control`                               | POST /api/write-control/enable, /disable |                                                                  |
 | `get_grpc_settings`/`set_grpc_settings`           | GET/PUT /api/grpc-settings               |                                                                  |
 | `get_mqtt_settings`/`set_mqtt_settings`           | GET/PUT /api/mqtt-settings               |                                                                  |

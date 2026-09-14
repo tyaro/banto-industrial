@@ -265,7 +265,6 @@ async fn test_app(label: &str) -> TestApp {
     let test_output = Arc::new(TestOutputControl::new());
     let controller = Arc::new(CollectionController::new(
         manager.clone(),
-        write_control.clone(),
         test_output.clone(),
     ));
     let status = controller.start(RunMode::Configured).await;
@@ -1234,7 +1233,10 @@ async fn write_value_writes_disabled_is_failed_precondition_and_audited() {
         true,
     )
     .await;
-    // write_control は起動時 disabled のまま(§6-6) - enable() を呼ばない。
+    // このテスト用アプリの write_control は `WriteControl::new(false)` で
+    // 構築されているため disabled のまま - enable() を呼ばない
+    // (#340 で「起動時は必ず disabled」という一般ルールは撤回されたが、
+    // ここでは明示的に false で構築しているので disabled のままになる)。
 
     let (key, _id) = issue_key(
         &app.router,

@@ -2,6 +2,23 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
+## v0.2.0-alpha.8 — 2026-09-14（アルファ）
+
+書き込み受付（`write_enabled`）トグルの挙動変更のみ。配布物の構成・前提ランタイムは alpha.3 以降と同じ。
+
+### 変更
+
+- **書き込み受付の既定を「可」に変更し、再起動・収集操作での自動無効化を撤回**（#340、オーナー決定 2026-09-09）。banto-hub はルールエンジンを持たないパススルーで自律再開の危険が無く、書き込み可否の実体は per-tag `writable`（既定 false）と API キーの `write` スコープが担うため、グローバルトグルは運用者が手で止める非常停止スイッチに徹することにした。
+  - `write_control_state.enabled_persisted` の seed を `1`（可）に変更。プロセス起動時はこの永続値をそのままライブフラグへ復元する（従来は永続値を無視して常に無効から始まっていた）。
+  - 既存 DB では、運用者が一度も enable/disable を操作していない未操作行（`last_changed_at IS NULL`）だけを新既定の「可」へ引き上げる。明示的に無効化した設定（`last_changed_at` あり）はそのまま保持される。
+  - 収集の開始・停止・モード変更（`CollectionController::start`/`stop`/`set_mode`）はもはや書き込み受付を無効化しない（test_output の OFF 連動は変更なし）。
+  - `GET /api/v1/status` の `write_was_enabled_before_restart` は互換のためフィールド名を維持し、意味を「起動時に永続テーブルから復元した値」に変更した。
+  - **永続化失敗時の挙動も同時に見直した**: `enabled_persisted` が次回起動時のライブ値そのものになったため、`POST /api/write-control/enable|disable`（MCP `set_write_control` も同様）は永続化の失敗を握りつぶさず、REST は 500 `write_control_persist_failed`、MCP は `isError: true` を返すようにした。disable は先にライブフラグを落としてから永続化を試みる（fail-closed。失敗してもトグル自体は無効のまま）。enable は永続化に成功したときだけライブフラグを立てる（失敗時は無効のまま変えない）。
+
+### 既知の制限（アルファ）
+
+alpha.7 と同じ（実 DB 検証 S7 未実施、`admin` スコープ API キーはサーバー全権、サイドカーはループバック運用前提、72h soak・実機サインオフ #210・性能ハーネス #211 未実施、通信は平文 + 閉域 LAN 前提、OPC UA #201 / SQL Server / SLMP イベント PUSH #258 は未実装、`i64`/`u64` は 2^53 超で精度低下）。
+
 ## v0.2.0-alpha.7 — 2026-09-08（アルファ）
 
 `v0.2.0-alpha.6` の不具合修正のみ。配布物の構成・前提ランタイムは alpha.3 以降と同じ。
