@@ -429,7 +429,7 @@ async fn initialize_returns_tool_capabilities() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tools_list_returns_the_thirty_seven_tools() {
+async fn tools_list_returns_the_thirty_eight_tools() {
     let app = test_app("tools-list").await;
     let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
 
@@ -441,6 +441,7 @@ async fn tools_list_returns_the_thirty_seven_tools() {
     assert_eq!(
         names,
         vec![
+            "check_expression",
             "create_api_key",
             "create_connection",
             "create_group",

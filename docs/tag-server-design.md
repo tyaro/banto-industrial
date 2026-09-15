@@ -13,7 +13,11 @@
 `TestOutputControl`・REST・gRPC proto ごと撤去、§4.2 に反映。同日追補 #344
 （v0.2.0-alpha.13）: 二重バックオフの接続規約を §6 項目5 に是正 -
 `BrokerReadClient::connect()` は broker の実状態を返し、`plc_reconnected`
-は「切断後、最初の読み取り成功」で 1 回だけ記録する）**。
+は「切断後、最初の読み取り成功」で 1 回だけ記録する）。2026-09-15 追補
+（v0.2.0-alpha.15、#342 段階A）: 演算タグの式チェック API
+（`POST /api/tags/expression/check`）を §4.2 に追加。あわせて §4.2 の
+組み込み関数一覧から `bit()` が抜けていたドキュメントドリフトを是正
+（`typecheck.rs` の `KNOWN_FUNCTIONS` が正）**。
 起案時は設計先行だったが、
 apps/banto-hub として実装が進行 — T0〜T21 実装済み（T19 UX 群・T20 文字列/構造体/レシピ/ビット・T21 構成補助 MCP 管理面まで完了、詳細は下の 2026-09-06 更新）・残 T18-5c/d
 （Windows 実機往復・72h soak）と P3-b の残件（SLMP CPU 種別/アクセスルート露出、
@@ -423,7 +427,11 @@ real / simulation / computed / derived_simulation / internal / db。
   メール送信等）とは明確に一線を引く。自動書き込みへ演算結果を使いたければ
   relay-wright が演算タグを**購読**すればよい（責務分担は崩れない）
 - **式言語は最小の宣言的文法**: 四則演算・比較・論理・条件（`if(c,a,b)`）・
-  `min/max/abs/round/clamp` 程度から始める。外部式評価クレートではなく
+  `min/max/abs/round/clamp`・`bit(tag, n)`（タグの生ワード値からのビット
+  抽出、T20 で追加）程度から始める（正確な関数一覧は
+  `crates/banto-expr/src/typecheck.rs` の `KNOWN_FUNCTIONS` が正 -
+  2026-09-15 追補: 本節がこのリストから `bit()` を落としていたドキュメント
+  ドリフトを是正、#342 段階A）。外部式評価クレートではなく
   **自前の小さな AST + 純関数評価器**を推奨 — I 系の流儀（scaling / planning が
   純関数）と一致し、文法が閉じているので監査可能・決定論的。ループ・
   ユーザー定義関数は入れない（アクション化への滑り坂）
@@ -436,6 +444,52 @@ real / simulation / computed / derived_simulation / internal / db。
 - **外部名**: 接続に属さないため、予約セグメント `calc` / `mem` を第1階層に
   使う（例: `calc.line1.temp_avg`、`mem.ui.setpoint1`）。実接続名との衝突は
   登録時検証で拒否
+
+**式チェック API（2026-09-15、#342 段階A、v0.2.0-alpha.15）**: 演算タグの
+式は保存して初めて登録時検証（`build_plan`）に掛かるため、UI 上で式を
+書いている最中は構文・型・参照タグの誤りに気付けなかった。
+`POST /api/tags/expression/check`（管理系ルーター、`require_editor`。同じ
+検証を行う MCP ツール `check_expression` は `require_admin_scope`）は保存を
+伴わずに式1本を検証する - body は `{ expression, externalName? }`、応答は
+**常に 200**（式が不正でも `ok: false` で返す。保存 API ではなくプレビュー
+用のため HTTP エラーにしない）で、
+
+```json
+{
+	"ok": true,
+	"resultType": "num",
+	"refs": [{ "name": "line1.fast.a", "dataType": "i16", "unit": "℃", "tagKind": "plc" }],
+	"preview": { "value": 23.5, "evaluated": true, "reason": null },
+	"error": null
+}
+```
+
+の形。`error.kind` は `banto_expr::CompileError` の全 variant
+（`syntax`/`type_mismatch`/`unknown_function`/`arity_mismatch`/
+`bad_bit_index`/`bad_bit_target`/`source_too_long`/`too_deep`）に加え、
+参照タグの解決失敗（`unknown_tag`/`string_ref`）・循環参照（`cycle`）を表す。
+`error.pos` は**バイトオフセット = 文字オフセット**（本文法は ASCII のみ、
+`crates/banto-expr/src/error.rs` 冒頭コメント参照）- `CompileError::SourceTooLong`
+と、参照タグ・循環系のエラー（位置という概念を持たない）だけ `null`。
+
+実装は issue 原文が前提にしていた「`banto_expr::typecheck::check` を直接呼び、
+参照タグの型解決を渡す」という形にはなっていない - `typecheck` は
+`banto-expr` の非公開モジュールで、公開 API は `compile(source) ->
+Result<CompiledExpr, CompileError>` のみであり、`banto-expr` 自体はレジストリ
+を持たずタグ参照の型は常に `Type::Num` 固定（本節冒頭「タグ参照は常に Num
+型」の設計どおり）。そのため実装は `compile()` の後、`CompiledExpr::
+referenced_tags()` を `TagMap` と突き合わせる**2段構成**にしてある
+（`apps/banto-hub/core/src/computed.rs` の `build_plan` と同じ形 - 文字列タグ
+拒否の判定条件は `resolve_referenced_tag` として両者で共有）。
+
+**循環参照の判定**は `externalName`（この式を保存する予定のタグの完全名）が
+与えられたときだけ行う: 現在の `TagMap` の computed タグの依存グラフ
+（`ComputedEngine` の直近 commit 済み plan から引く）に、`externalName` の
+ノードだけ今回の式の参照先で置き換えて `banto_expr::validate_dag` に通す。
+
+**プレビュー試算**は参照タグが全件 Good で値を持つときだけ行う（1つでも
+Bad/値なしなら `preview.evaluated: false` + 日本語の `reason`）。参照0件の
+定数式は常に評価できる。
 
 **FA-Server の演算機構との比較（マニュアル v6.0.17 一次調査 2026-08-04）**:
 FA-Server のサーバー側演算はスクリプト言語「ロボスクリプト」の3構文で行う —

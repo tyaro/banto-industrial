@@ -7,7 +7,10 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
 最終更新: 2026-09-15（T19（UX-30〜48）・T20（文字列/構造体/レシピ/ビット .0〜.F）・T21（構成補助 MCP 管理面）完了、MCP 31 ツール実機検証、外部 DB 連携 S0〜S2b・S4・S5 完了、S3/S6/S7 残（MCP は 37 ツールに。追加分はローカル PostgreSQL で検証）に加え、v0.2.0-alpha.8: 書き込み受付の既定を「可」に変更し、再起動・収集操作での自動無効化を撤回（#340）、v0.2.0-alpha.9: 試運転中は構成 CRUD を収集中でも即時・無停止反映（#341）、v0.2.0-alpha.10: computed タグの catalog 公開・外部読み取り出力のシミュレーションゲート撤廃（#335）、v0.2.0-alpha.11: シミュレーションデバイスへの外部書き込みをシミュレータへ反映（#363）、v0.2.0-alpha.12: T15-3 テスト出力（test_output）機構を撤去（#362）、v0.2.0-alpha.13: PLC 到達不能中の plc_reconnected / plc_disconnected フラップを修正（#344）、
 v0.2.0-alpha.14: banto-hub の設定画面をカテゴリ別ルートへ分割（#359 banto-hub 分）を反映、
 chronogazer の設定画面をカテゴリ別ルートへ分割（#359 chronogazer 分）を反映、
-relay-wright の設定画面をカテゴリ別ルートへ分割（#359 relay-wright 分、issue #359 は3アプリ分完了）を反映）。
+relay-wright の設定画面をカテゴリ別ルートへ分割（#359 relay-wright 分、issue #359 は3アプリ分完了）を反映、
+v0.2.0-alpha.15: 演算タグの式チェック API（`POST /api/tags/expression/check`）・
+エラー位置のインライン表示・ライブプレビューを追加（#342 段階A。MCP `check_expression`
+ツールを追加し 38 ツールに）を反映）。
 最終検証日(コード照合): 2026-09-15
 
 > この地図は索引に徹する。実装状況・設計判断の本体は各文書側にあり、状態の**正**は
@@ -27,10 +30,13 @@ relay-wright の設定画面をカテゴリ別ルートへ分割（#359 relay-wr
   T21（構成補助 MCP＝管理面ツール）まで完了**（2026-09-06）。**残るは T18-5c/d（Windows 実機往復・
   狭幅/倍率・72h soak = オーナー同席の実機検証）と、実機・需要待ちの #210/#211/#123/#201 のみ**。
   T18-5a は「全タグのクライアント保持（上限 10,000 タグ）」を正式仕様化（windowed 化はバックログ降格）。
-- **MCP（機械/AI 向け外部 IF）**: `POST /mcp`（API キー認証）で **37 ツール** — データ面（値の
-  read/write・レシピ・状態参照）＋管理面（接続/グループ/タグ CRUD・設定 gRPC/MQTT/retention・
-  収集/write 制御・API キー発行/失効・lock_down・Sink グループ管理）。実機 R08ENCPU で 31 ツール検証済み（外部 DB 連携で追加した 6 ツールはローカル PostgreSQL で検証）
-  （2026-09-06、実バグ0）。IF 詳細は [banto-hub-mcp-reference.md](banto-hub-mcp-reference.md)。
+- **MCP（機械/AI 向け外部 IF）**: `POST /mcp`（API キー認証）で **38 ツール** — データ面（値の
+  read/write・レシピ・状態参照）＋管理面（接続/グループ/タグ CRUD・式チェック・設定
+  gRPC/MQTT/retention・収集/write 制御・API キー発行/失効・lock_down・Sink グループ管理）。実機
+  R08ENCPU で 31 ツール検証済み（外部 DB 連携で追加した 6 ツール・#342 の `check_expression` は
+  ローカル/ローカル PostgreSQL で検証）（2026-09-06、実バグ0）。IF 詳細は
+  [banto-hub-mcp-reference.md](banto-hub-mcp-reference.md)（#342 の `check_expression`
+  ツール追加は本 PR の時点で同文書へ未反映 - 別途反映が要る）。
 - **Hardening（H1〜H10）**: H1〜H6・H8・H10 完了。H9 は 2026-08-14 に完全完了。H5 は relay-wright の
   組み込みサーバーモード E2E を含め完了（2026-08-30、PR #193。Tauri 固有経路の E2E は WebDriver 課題と
   して別スコープに分離）。**残るは H7 の① 実機 soak のみ**（詳細は improvement-plan.md）。
@@ -113,6 +119,17 @@ relay-wright の設定画面をカテゴリ別ルートへ分割（#359 relay-wr
   時限失効（H10）は、どちらも意図しない PLC 書き込みを防ぐ安全装置なので、6番目のカテゴリを増やさず
   認証と同じ `security` に同居させた。`AuthSettings` を Account/Connectivity/Security の3カテゴリで
   共有する `authSettingsStore` を新設した。挙動・API・DB は無変更。
+- **v0.2.0-alpha.15（2026-09-15、#342 段階A）**: 演算タグの式入力 UX 改善の第1段。
+  `POST /api/tags/expression/check`（editor 以上、常に 200 で `ok`/`resultType`/`refs`/
+  `preview`/`error` を返す）と同ロジックを共有する MCP `check_expression` ツールを追加し、
+  保存前に式を検証・試算できるようにした。フロント（`(app)/tags/+page.svelte`）は式欄
+  （`#tag-expression`）に 300ms debounce のライブチェックを配線し、`pos`（バイト = 文字
+  オフセット）でエラー位置に下線を出し、結果型・参照タグ一覧・試算値をプレビュー表示する。
+  issue #342 原文の「キャレット自動移動」は打鍵の邪魔になるため見送り、エラーメッセージを
+  クリックしたときだけ移動する挙動に変更した。段階 B（セグメント補完）・C（ツリーからの
+  挿入）は別 PR。**wire 追加のみ**（新エンドポイント・新 MCP ツール、既存 API は無変更）。
+  詳細は [tag-server-design.md](tag-server-design.md) §4.2、
+  [banto-hub-operations.md](banto-hub-operations.md)。
 - **出荷ゲート**: T5-5（実機での 72h soak 実行 + 実機最終サインオフ）のみ残（実機必須）。
 - **banto-tagclient**: **S4a完了（2026-09-01）**。読み取り専用DTO、Endpoint/Secret境界、
   stable ID resolver、REST catalog/values transport、WS wire純粋解析、bounded publish gate、認証付き

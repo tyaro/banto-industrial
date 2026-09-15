@@ -174,6 +174,12 @@
 		type TreeContextMenuItemAction
 	} from '$lib/banto/tagTreeContextMenu';
 	import { beforeNavigate } from '$app/navigation';
+	import {
+		checkExpression,
+		shouldCheckExpression,
+		ExpressionCheckController,
+		type ExpressionCheckResult
+	} from '$lib/banto/expressionCheck';
 
 	const dataTypeOptions: { value: TagDataType; label: string }[] = [
 		{ value: 'bit', label: 'bit（真偽値1点）' },
@@ -257,6 +263,20 @@
 		expression: string;
 		/** T6-2: 内部タグの再起動時復元フラグ（`tagKind === 'internal'` のときのみ表示）。 */
 		retain: boolean;
+	}
+
+	/**
+	 * #342 段階A: `tagFields` snippet の式欄（`#tag-expression`）へ渡す、
+	 * create/edit それぞれの `ExpressionCheckController` インスタンスの
+	 * 薄いラッパー。snippet 自体は create/edit のどちらの form/controller を
+	 * 見ているか知らなくてよいようにするための間接層（`createExprFieldHandlers`/
+	 * `editExprFieldHandlers` 参照）。
+	 */
+	interface ExpressionCheckFieldHandlers {
+		preview: ExpressionCheckResult | null;
+		onInput: () => void;
+		onCompositionStart: () => void;
+		onCompositionEnd: () => void;
 	}
 
 	function blankForm(): FormState {
@@ -417,6 +437,23 @@
 		if (!Number.isFinite(gid)) return undefined;
 		const group = groups.find((g) => g.id === gid);
 		return group ? connections.find((c) => c.id === group.plcConnectionId) : undefined;
+	}
+
+	/**
+	 * #342 段階A: 式チェック API の `externalName`（この式を保存する予定の
+	 * タグの完全名 - 循環参照の判定にだけ使う、`$lib/banto/expressionCheck.ts`
+	 * 参照）。接続・グループが未選択、またはタグ名が未入力（前後空白のみ
+	 * 含む）の間は組み立てようがないので `null`（サーバー側は省略可 -
+	 * その場合は単に循環判定をスキップするだけで安全）。`confirmExternalName`
+	 * と違いプレースホルダ（`(未選択)`等）では絶対に埋めない - プレース
+	 * ホルダ入りの文字列を実在のタグ名として送ると誤判定になるため。
+	 */
+	function expressionCheckExternalName(form: FormState): string | null {
+		const conn = connectionForGroupId(form.collectionGroupId);
+		const group = groups.find((g) => String(g.id) === form.collectionGroupId);
+		const name = form.name.trim();
+		if (!conn || !group || name === '') return null;
+		return buildExternalName(conn.name, group.name, name);
 	}
 
 	function confirmExternalName(form: FormState): string {
@@ -660,6 +697,59 @@
 	let creating = $state(false);
 
 	/**
+	 * #342 段階A（docs/tag-server-design.md §4.2「演算タグの式チェック
+	 * API」）: create Drawer の式欄（`#tag-expression`、`tagKind === 'computed'`
+	 * のときだけ表示）向けのライブチェック結果。`null` は「未実行/クリア
+	 * 済み」（式が空、またはまだ一度もチェックが返っていない）。
+	 */
+	let createExprPreview: ExpressionCheckResult | null = $state(null);
+	const createExprController = new ExpressionCheckController({
+		run: (expression, externalName) => checkExpression(expression, externalName),
+		onResult: (result) => {
+			createExprPreview = result;
+			// 既存の `errors.expression` スロット（`tagFields` snippet）を
+			// 埋める - これまでサーバーから来なかったため実質デッドパス
+			// だった（issue #342 の前提食い違い、実装指示参照）。保存時の
+			// `errors.configuration` ヒューリスティック表示はそのまま残す。
+			if (result && !result.ok && result.error) {
+				createErrors = { ...createErrors, expression: result.error.message };
+			} else if (createErrors.expression) {
+				const { expression: _drop, ...rest } = createErrors;
+				createErrors = rest;
+			}
+		}
+	});
+
+	/** Drawer を開き直す・保存確定するたびに呼ぶ - 前回のプレビューを持ち越さない。 */
+	function resetCreateExprCheck(): void {
+		createExprController.cancel();
+		createExprPreview = null;
+	}
+
+	/**
+	 * `{@render tagFields(createForm, ...)}` 呼び出し側で毎レンダー呼ぶ -
+	 * `createExprPreview`（`$state`）を読むのでテンプレート内で呼び出す
+	 * ことで依存追跡される（関数自体は非リアクティブだが、呼び出し箇所が
+	 * リアクティブなテンプレートの中にある）。
+	 */
+	function createExprFieldHandlers(): ExpressionCheckFieldHandlers {
+		return {
+			preview: createExprPreview,
+			onInput: () =>
+				createExprController.scheduleCheck(
+					createForm.expression,
+					expressionCheckExternalName(createForm)
+				),
+			onCompositionStart: () => createExprController.onCompositionStart(),
+			onCompositionEnd: () =>
+				createExprController.onCompositionEnd(
+					createForm.expression,
+					expressionCheckExternalName(createForm)
+				)
+		};
+	}
+
+	/**
 	 * 2026-09-01 オーナー要望「タグ名が空欄のままならアドレスをタグ名として
 	 * 使う」: create Drawer 専用の「名前欄をユーザーが直接編集したか」の
 	 * 追跡フラグ。`ConnectionDrawer.svelte` の `portTouched` と同じ設計
@@ -875,6 +965,7 @@
 	async function handleCreate(closeAfterSave: boolean): Promise<void> {
 		creating = true;
 		createErrors = {};
+		resetCreateExprCheck();
 		try {
 			const created = await createTag(toInput(createForm));
 			toastStore.push('success', '作成しました');
@@ -930,6 +1021,45 @@
 	let editBaseline: FormState = blankForm();
 	let editErrors: Record<string, string> = $state({});
 	let saving = $state(false);
+
+	/** #342 段階A: `createExprPreview`/`createExprController` の edit Drawer 版。 */
+	let editExprPreview: ExpressionCheckResult | null = $state(null);
+	const editExprController = new ExpressionCheckController({
+		run: (expression, externalName) => checkExpression(expression, externalName),
+		onResult: (result) => {
+			editExprPreview = result;
+			if (result && !result.ok && result.error) {
+				editErrors = { ...editErrors, expression: result.error.message };
+			} else if (editErrors.expression) {
+				const { expression: _drop, ...rest } = editErrors;
+				editErrors = rest;
+			}
+		}
+	});
+
+	/** Drawer を開き直す・保存確定するたびに呼ぶ - 前回のプレビューを持ち越さない。 */
+	function resetEditExprCheck(): void {
+		editExprController.cancel();
+		editExprPreview = null;
+	}
+
+	/** `createExprFieldHandlers` の edit Drawer 版。 */
+	function editExprFieldHandlers(): ExpressionCheckFieldHandlers {
+		return {
+			preview: editExprPreview,
+			onInput: () =>
+				editExprController.scheduleCheck(
+					editForm.expression,
+					expressionCheckExternalName(editForm)
+				),
+			onCompositionStart: () => editExprController.onCompositionStart(),
+			onCompositionEnd: () =>
+				editExprController.onCompositionEnd(
+					editForm.expression,
+					expressionCheckExternalName(editForm)
+				)
+		};
+	}
 
 	/**
 	 * T18-2a（TAG-UX-B「詳細を閉じても値保持・詳細エラー時は自動展開」）:
@@ -1107,6 +1237,7 @@
 		editForm = formFromTag(t);
 		editBaseline = formFromTag(t);
 		editErrors = {};
+		resetEditExprCheck();
 		editConflict = null;
 		editAddressPreflight = blankAddressPreflight();
 		// S3: 編集対象が変わるたびに「列を取得」の結果もリセットする -
@@ -1354,6 +1485,7 @@
 		if (!selected) return;
 		saving = true;
 		editErrors = {};
+		resetEditExprCheck();
 		try {
 			const updated = await updateTag(selected.id, {
 				...toInput(editForm),
@@ -1690,6 +1822,7 @@
 		createForm = next;
 		createBaseline = { ...next };
 		createErrors = {};
+		resetCreateExprCheck();
 		createAddressPreflight = blankAddressPreflight();
 		// S3: 前回開いたときの「列を取得」結果を引き継がない - 対象グループが
 		// 変わりうるため。
@@ -1738,6 +1871,7 @@
 		createForm = next;
 		createBaseline = { ...next };
 		createErrors = {};
+		resetCreateExprCheck();
 		createAddressPreflight = blankAddressPreflight();
 		// S3: 複製元と同じ収集グループを引き継ぐが、db タグの複製は無い
 		// （db タグに「このタグを複製」導線が無い前提 - #264と同じ「無い
@@ -3381,7 +3515,8 @@
 	onWritableInput: () => void,
 	groupLocked: boolean,
 	describeState: DescribeState,
-	onDescribeClick: () => void
+	onDescribeClick: () => void,
+	exprCheck: ExpressionCheckFieldHandlers
 )}
 	<!--
 		TAG-P0-2（docs/banto-hub-desktop-plan.md §9.3、2026-08-10 実装メモ）:
@@ -3707,25 +3842,102 @@
 			</div>
 		{/if}
 		{#if form.tagKind === 'computed'}
+			{@const errPos =
+				exprCheck.preview && !exprCheck.preview.ok && exprCheck.preview.error
+					? exprCheck.preview.error.pos
+					: null}
 			<label class="field wide">
 				式（expression）<span class="required">*</span>
-				<textarea
-					id="tag-expression"
-					bind:value={form.expression}
-					rows="2"
-					required
-					placeholder="(line1.fast.a + line1.fast.b) / 2"
-					aria-invalid={errors.expression ? 'true' : undefined}
-					aria-describedby={describedBy(
-						'tag-expression-hint',
-						errors.expression && 'tag-expression-err'
-					)}></textarea>
+				<!--
+					#342 段階A: textarea の下にミラー要素（同じフォント・パディング・
+					折り返し）を重ね、`pos`（バイト = 文字オフセット、
+					`crates/banto-expr/src/error.rs` 冒頭コメント参照）の1文字だけに
+					下線を出す。ミラー側の文字色は透明にし、下線を付けた1文字だけ
+					`.expr-error-char` で見える背景/下線を出す - textarea 自体の
+					背景を透明にして下から透かす（`.expr-field-wrap` 側の doc
+					comment参照）。`pos: null`（`SourceTooLong`、または参照タグ・
+					循環エラーのように位置を持たないエラー種別）のときは下線を出さず
+					メッセージだけにする（実装指示どおり）。
+				-->
+				<div class="expr-field-wrap">
+					<div class="expr-mirror" aria-hidden="true">
+						{#if errPos !== null}{form.expression.slice(0, errPos)}<span class="expr-error-char"
+								>{form.expression.slice(errPos, errPos + 1) || ' '}</span
+							>{form.expression.slice(errPos + 1)}{:else}{form.expression}{/if}
+					</div>
+					<textarea
+						id="tag-expression"
+						bind:value={form.expression}
+						rows="2"
+						required
+						placeholder="(line1.fast.a + line1.fast.b) / 2"
+						aria-invalid={errors.expression ? 'true' : undefined}
+						aria-describedby={describedBy(
+							'tag-expression-hint',
+							errors.expression && 'tag-expression-err'
+						)}
+						oninput={exprCheck.onInput}
+						oncompositionstart={exprCheck.onCompositionStart}
+						oncompositionend={exprCheck.onCompositionEnd}></textarea>
+				</div>
 				<span class="hint" id="tag-expression-hint"
 					>四則・比較・論理・if(c,a,b)・min/max/abs/round/clamp/bit(tag,n)。参照する外部名は他タグ
-					（plc/computed/internal）の完全名。</span
+					（plc/computed/internal）の完全名。保存前に自動でチェックされます。</span
 				>
-				{#if errors.expression}<span class="err" id="tag-expression-err">{errors.expression}</span
-					>{/if}
+				{#if errors.expression}
+					<!--
+						issue #342 からの意図的な変更（PR 本文にも記載）: issue は
+						「入力のたびにキャレットを自動で飛ばす」としていたが、それでは
+						打鍵の邪魔になるため自動では飛ばさない - エラーメッセージを
+						クリック可能にし、クリックしたときだけキャレットを移動して
+						式欄へフォーカスを戻す。
+					-->
+					<button
+						type="button"
+						class="err expr-error-jump"
+						id="tag-expression-err"
+						disabled={errPos === null}
+						title={errPos !== null ? 'クリックでエラー位置へ移動' : undefined}
+						onclick={() => {
+							if (errPos === null) return;
+							const el = document.getElementById('tag-expression');
+							if (!(el instanceof HTMLTextAreaElement)) return;
+							el.focus();
+							el.setSelectionRange(errPos, errPos);
+						}}
+					>
+						{errors.expression}
+					</button>
+				{/if}
+				{#if exprCheck.preview && exprCheck.preview.ok}
+					<div class="expr-preview" data-testid="expression-preview">
+						<p class="note">
+							結果型: <strong>{exprCheck.preview.resultType}</strong>
+						</p>
+						{#if exprCheck.preview.refs.length > 0}
+							<p class="note">参照タグ:</p>
+							<ul class="expr-refs">
+								{#each exprCheck.preview.refs as ref (ref.name)}
+									<li>
+										<code>{ref.name}</code>（{ref.dataType}{ref.unit
+											? `・${ref.unit}`
+											: ''}・{ref.tagKind}）
+									</li>
+								{/each}
+							</ul>
+						{/if}
+						<p class="note">
+							試算値:
+							{#if exprCheck.preview.preview.evaluated}
+								<strong>{exprCheck.preview.preview.value}</strong>
+							{:else}
+								—{#if exprCheck.preview.preview.reason}
+									<span class="hint">（{exprCheck.preview.preview.reason}）</span>
+								{/if}
+							{/if}
+						</p>
+					</div>
+				{/if}
 			</label>
 		{/if}
 		<!--
@@ -5129,7 +5341,8 @@
 				// T19 S1-c（UX-33）: `createGroupLocked` 宣言のコメント参照。
 				createGroupLocked,
 				createDescribeState,
-				() => void runDescribeGroup(createForm.collectionGroupId, 'create')
+				() => void runDescribeGroup(createForm.collectionGroupId, 'create'),
+				createExprFieldHandlers()
 			)}
 			<div class="actions">
 				<!--
@@ -5256,7 +5469,8 @@
 				// Drawer 限定）。
 				false,
 				editDescribeState,
-				() => void runDescribeGroup(editForm.collectionGroupId, 'edit')
+				() => void runDescribeGroup(editForm.collectionGroupId, 'edit'),
+				editExprFieldHandlers()
 			)}
 			<div class="actions">
 				<button type="submit" disabled={isDrawerBusy()}>保存</button>
@@ -6174,6 +6388,85 @@
 
 	.field textarea {
 		resize: vertical;
+	}
+
+	/*
+	 * #342 段階A: 式欄のエラー位置インライン表示（`#tag-expression` の
+	 * doc comment参照）。`.expr-mirror` は textarea と全く同じ box model
+	 * （padding/border/font）で重ね、下線を付けたい1文字だけ見える色を
+	 * 持たせる（それ以外は `color: transparent`）。textarea 側の背景を
+	 * 透明にすることでミラーの下線がその下から透ける - 背景色そのものは
+	 * `.expr-field-wrap` へ移した（`.field input, .field select, .field
+	 * textarea` の既定背景と視覚的に同じにするため、同じ変数を使う）。
+	 */
+	.expr-field-wrap {
+		position: relative;
+		border-radius: var(--banto-radius);
+		background: var(--banto-bg);
+	}
+
+	.expr-field-wrap .expr-mirror {
+		position: absolute;
+		inset: 0;
+		margin: 0;
+		padding: 0.4rem 0.5rem;
+		border: 1px solid transparent;
+		border-radius: var(--banto-radius);
+		font-family: inherit;
+		font-size: inherit;
+		line-height: inherit;
+		white-space: pre-wrap;
+		overflow-wrap: break-word;
+		overflow: hidden;
+		color: transparent;
+		pointer-events: none;
+	}
+
+	.expr-field-wrap .expr-error-char {
+		color: transparent;
+		border-bottom: 2px solid var(--banto-danger);
+		background: color-mix(in srgb, var(--banto-danger) 18%, transparent);
+	}
+
+	.expr-field-wrap textarea#tag-expression {
+		position: relative;
+		background: transparent;
+	}
+
+	/* エラーメッセージをクリック可能にする（エラー位置へキャレット移動、`errPos` 宣言のコメント参照）。 */
+	.expr-error-jump {
+		display: block;
+		background: none;
+		border: none;
+		padding: 0;
+		margin: 0;
+		font: inherit;
+		text-align: left;
+		text-decoration: underline;
+		cursor: pointer;
+	}
+
+	.expr-error-jump:disabled {
+		text-decoration: none;
+		cursor: default;
+	}
+
+	.expr-preview {
+		margin-top: 0.35rem;
+		padding: 0.5rem 0.6rem;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+		background: var(--banto-bg);
+	}
+
+	.expr-preview .note {
+		margin: 0.15rem 0;
+	}
+
+	.expr-refs {
+		margin: 0.15rem 0;
+		padding-left: 1.25rem;
+		font-size: 0.75rem;
 	}
 
 	.field.checkbox input {
