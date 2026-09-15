@@ -981,6 +981,227 @@ mod tests {
         config
     }
 
+    // --- #344 (2026-09-15): connection-event edges must not flap ----------
+    //
+    // These drive `crate::task::run_connection`'s state machine through a
+    // client shaped exactly like the bug: `connect()` always succeeds while
+    // `read_batch` keeps failing - which is precisely what banto-hub's
+    // `BrokerReadClient` did before #344 whenever its broker session was
+    // down. See `crate::task`'s module doc ("What `plc_reconnected` means")
+    // for the rule these pin down.
+
+    /// A fake `PlcClient` whose `connect()` always succeeds instantly (no
+    /// socket) and whose `read_batch` fails for the first `fail_reads` calls
+    /// and succeeds afterwards. The call counter is shared across every
+    /// instance the factory hands out, so it keeps counting across the
+    /// reconnects `run_connection` performs between ticks.
+    struct FlappingClient {
+        reads: Arc<AtomicUsize>,
+        fail_reads: usize,
+    }
+
+    impl PlcClient for FlappingClient {
+        fn connect(&mut self) -> BoxFuture<'_, Result<(), PlcError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn read_batch<'a>(
+            &'a mut self,
+            requests: &'a [ReadRequest],
+        ) -> BoxFuture<'a, Result<Vec<ReadResult>, PlcError>> {
+            let nth = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
+            let fail = nth <= self.fail_reads;
+            Box::pin(async move {
+                if fail {
+                    // The exact shape banto-hub's broker adapter produces
+                    // for a session that is down.
+                    Err(PlcError::Connection(
+                        "PLC接続 1 は現在未接続です（再接続待機中…）".to_string(),
+                    ))
+                } else {
+                    Ok(requests
+                        .iter()
+                        .map(|_| ReadResult::Value(TagValue::F64(7.0)))
+                        .collect())
+                }
+            })
+        }
+
+        fn disconnect(&mut self) -> BoxFuture<'_, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    fn flapping_factory(reads: Arc<AtomicUsize>, fail_reads: usize) -> ClientFactory {
+        Arc::new(move |_spec| {
+            Box::new(FlappingClient {
+                reads: reads.clone(),
+                fail_reads,
+            }) as Box<dyn PlcClient>
+        })
+    }
+
+    /// Start a collector on [`one_tag_config`] with the given client factory,
+    /// plus a live event receiver subscribed *before* anything can emit.
+    async fn start_flapping(
+        dir: &TempDir,
+        factory: ClientFactory,
+    ) -> (
+        Collector,
+        tokio::sync::broadcast::Receiver<crate::event::CollectEvent>,
+    ) {
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect sqlite memory");
+        let events = EventSink::new(pool);
+        let rx = events.subscribe();
+        let collector = Collector::start_with_client_factory(
+            one_tag_config(),
+            dir.path(),
+            Arc::new(SystemClock),
+            events,
+            CollectorOptions {
+                connect_timeout: Duration::from_millis(200),
+                response_timeout: Duration::from_millis(200),
+                ..CollectorOptions::default()
+            },
+            factory,
+        )
+        .await
+        .expect("start_with_client_factory should succeed");
+        (collector, rx)
+    }
+
+    /// Drain everything currently buffered on the live channel.
+    fn drain_events(
+        rx: &mut tokio::sync::broadcast::Receiver<crate::event::CollectEvent>,
+    ) -> Vec<crate::event::CollectEvent> {
+        let mut out = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            out.push(event);
+        }
+        out
+    }
+
+    fn count_kind(events: &[crate::event::CollectEvent], kind: crate::event::EventKind) -> usize {
+        events.iter().filter(|e| e.kind == kind).count()
+    }
+
+    /// Wait until the shared read counter reaches `target`, or panic.
+    async fn wait_for_reads(reads: &Arc<AtomicUsize>, target: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while reads.load(Ordering::SeqCst) < target {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "only {} of the expected {target} read_batch calls happened",
+                reads.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// **The #344 regression itself.** A client that connects successfully
+    /// but can never read (the pre-fix `BrokerReadClient` against a down
+    /// broker session) must produce exactly ONE `plc_disconnected` and NEVER
+    /// a `plc_reconnected`, no matter how many collection periods elapse.
+    /// Before the fix this emitted one `plc_reconnected`/`plc_disconnected`
+    /// pair per tick - 13,000 rows/hour on real hardware.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_that_never_reads_reports_one_disconnect_and_no_reconnect() {
+        let dir = TempDir::new();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (collector, mut rx) =
+            start_flapping(&dir, flapping_factory(reads.clone(), usize::MAX)).await;
+
+        // `one_tag_config`'s group period is 20ms, so 8 reads is well past
+        // the point where the old code would have emitted 7 bogus pairs.
+        wait_for_reads(&reads, 8).await;
+        collector.stop().await.expect("stop should succeed");
+
+        let events = drain_events(&mut rx);
+        assert_eq!(
+            count_kind(&events, crate::event::EventKind::PlcConnected),
+            1,
+            "the first connect is still announced exactly once: {events:?}"
+        );
+        assert_eq!(
+            count_kind(&events, crate::event::EventKind::PlcDisconnected),
+            1,
+            "one outage must produce exactly one plc_disconnected, however many \
+             ticks fail inside it: {events:?}"
+        );
+        assert_eq!(
+            count_kind(&events, crate::event::EventKind::PlcReconnected),
+            0,
+            "nothing ever read successfully, so nothing reconnected: {events:?}"
+        );
+    }
+
+    /// The companion edge: once reads start succeeding again, exactly one
+    /// `plc_reconnected` is emitted - at the successful read, and only once
+    /// however many further successful ticks follow.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_first_successful_read_after_an_outage_emits_one_reconnect() {
+        let dir = TempDir::new();
+        let reads = Arc::new(AtomicUsize::new(0));
+        // Reads 1..=4 fail, everything from the 5th on succeeds.
+        let (collector, mut rx) = start_flapping(&dir, flapping_factory(reads.clone(), 4)).await;
+
+        let current = collector.current_values();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while current.get("tag:1").and_then(|s| s.value) != Some(7.0) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "reads never recovered"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Several more successful ticks, to prove the edge does not repeat.
+        wait_for_reads(&reads, 12).await;
+        collector.stop().await.expect("stop should succeed");
+
+        let events = drain_events(&mut rx);
+        assert_eq!(
+            count_kind(&events, crate::event::EventKind::PlcConnected),
+            1,
+            "{events:?}"
+        );
+        assert_eq!(
+            count_kind(&events, crate::event::EventKind::PlcDisconnected),
+            1,
+            "the 4 failing reads are one outage, not four: {events:?}"
+        );
+        assert_eq!(
+            count_kind(&events, crate::event::EventKind::PlcReconnected),
+            1,
+            "recovery must be announced exactly once, at the first successful \
+             read: {events:?}"
+        );
+
+        // Ordering: connected -> disconnected -> reconnected, in that order.
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|e| e.kind)
+            .filter(|k| {
+                matches!(
+                    k,
+                    crate::event::EventKind::PlcConnected
+                        | crate::event::EventKind::PlcDisconnected
+                        | crate::event::EventKind::PlcReconnected
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                crate::event::EventKind::PlcConnected,
+                crate::event::EventKind::PlcDisconnected,
+                crate::event::EventKind::PlcReconnected,
+            ],
+            "{events:?}"
+        );
+    }
+
     /// T9-1 (docs/ux-plan.md §1) end to end: a `simulation: true` connection,
     /// started through the *default* client factory (real `ModbusTcpClient`,
     /// no injected fake - unlike the test above), still collects live,

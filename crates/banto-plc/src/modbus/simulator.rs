@@ -137,9 +137,28 @@ impl Simulator {
     /// connections. Supports multiple concurrent/sequential connections
     /// (each handled by its own spawned task).
     pub async fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        Self::start_on("127.0.0.1:0".parse().expect("valid loopback address"))
             .await
-            .expect("bind loopback listener");
+            .expect("bind loopback listener")
+    }
+
+    /// As [`Simulator::start`], but binds `addr` instead of letting the OS
+    /// pick - so a test can **bring the same PLC back on the same port**
+    /// after a [`Simulator::stop`], which is what an outage-then-recovery
+    /// test needs (a client that reconnects must find the device where it
+    /// left it; a fresh OS-assigned port would instead look like a different
+    /// device).
+    ///
+    /// Returns the bind error rather than panicking, because that is a state
+    /// a caller legitimately has to retry through: the previous instance's
+    /// severed connections can still hold the port for a short window after
+    /// `stop()`, so a restart loop should retry on `AddrInUse` for a second
+    /// or two rather than fail the test. Added for banto-hub #344
+    /// (2026-09-15), whose E2E test stops the simulator, asserts no bogus
+    /// `plc_reconnected` while it is down, then restarts it here and asserts
+    /// exactly one once it is back.
+    pub async fn start_on(addr: SocketAddr) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr().expect("local_addr");
         let state = Arc::new(Mutex::new(State::default()));
         let connections: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -160,12 +179,12 @@ impl Simulator {
             }
         });
 
-        Simulator {
+        Ok(Simulator {
             addr,
             state,
             accept_task,
             connections,
-        }
+        })
     }
 
     /// Seed one coil. **No-op if the coil is held** (it was written over the

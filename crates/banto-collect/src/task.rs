@@ -37,6 +37,43 @@
 //! scheduler) with exponential backoff (1s, 2s, 4s ... capped at 30s),
 //! reset to immediate on a fresh drop and on any success.
 //!
+//! ## What `plc_reconnected` means (#344, 2026-09-15)
+//!
+//! The connection events this task emits are **episode edges**, not per-tick
+//! records, and `plc_reconnected` in particular means *"reading works
+//! again"* - not *"`connect()` returned `Ok`"*. Concretely:
+//!
+//! - `plc_connected` - emitted once, when the very first `connect()` of this
+//!   task's lifetime succeeds. Unchanged.
+//! - `plc_disconnected` - emitted when a `read_batch` fails **while this
+//!   connection was last known to be working**. A read that fails while the
+//!   connection has not yet been confirmed working again emits nothing: the
+//!   outage that is already on record simply continues.
+//! - `plc_reconnected` - emitted on the **first `read_batch` that succeeds
+//!   after a `plc_disconnected`**, carrying that tick's `ptime_ms`. A
+//!   successful `connect()` only *arms* it (`pending_reconnect_event`).
+//!
+//! That indirection exists because a successful `connect()` is a claim about
+//! the transport, and for a client whose transport is a *shared session* it
+//! can be a stale one. banto-hub's `BrokerReadClient`
+//! (`apps/banto-hub/core/src/broker_glue.rs`) reads through a session owned
+//! by a separate `banto-broker` task; its `connect()` answers from that
+//! task's status watch, which can legitimately still say `Connected` for the
+//! brief moment between a session failing and the broker task noticing. Under
+//! the previous rule ("emit `plc_reconnected` the moment `connect()`
+//! succeeds") that window produced a `plc_reconnected`/`plc_disconnected`
+//! pair that described nothing real - and before #344 fixed that adapter's
+//! `connect()` as well, the window was permanent: one bogus pair *per
+//! connection per collection period*, ≈13,000 rows/hour at 1 s over two
+//! connections, drowning the genuine edges in `collect_events` and bloating
+//! the table through a multi-hour outage.
+//!
+//! Anchoring the edge to an actual successful read closes that window for
+//! every client, shared-session or not, and costs a direct
+//! `ModbusTcpClient`/`SlmpClient` nothing: its next tick reads immediately
+//! after a successful connect anyway, so the event simply lands one tick
+//! later with a `ptime_ms` that is now provably backed by data.
+//!
 //! ## H4 (owner decision 2026-08-08): clock regression and append failure are
 //! ## recorded anomalies, not silence
 //!
@@ -520,6 +557,10 @@ pub(crate) async fn run_connection(
     // Start out wanting to connect immediately.
     let mut attempt: u32 = 0;
     let mut ever_connected = false;
+    // #344: a reconnect that `connect()` reported but no `read_batch` has
+    // confirmed yet - see this module's doc comment ("What
+    // `plc_reconnected` means").
+    let mut pending_reconnect_event = false;
     let mut state = ConnState::Backoff { at: start };
     set_status(
         &ctx,
@@ -566,19 +607,30 @@ pub(crate) async fn run_connection(
                         state = ConnState::Connecting(handle);
                     }
                     ConnEvent::Finished((client, Ok(()))) => {
-                        let now_ms = ctx.clock.now_ms();
-                        let kind = if ever_connected {
-                            EventKind::PlcReconnected
-                        } else {
-                            EventKind::PlcConnected
-                        };
-                        ever_connected = true;
                         attempt = 0;
                         state = ConnState::Connected(client);
                         set_status(&ctx, &conn_key, ConnectionStatus::Connected);
-                        ctx.events
-                            .emit(CollectEvent::connection(now_ms, kind, conn_key.clone(), None))
-                            .await;
+                        if ever_connected {
+                            // #344: do NOT announce the recovery here. A
+                            // successful `connect()` is a claim about the
+                            // transport, and for a shared-session client
+                            // (banto-hub's `BrokerReadClient`) that claim can
+                            // be momentarily stale. Arm the edge instead and
+                            // let the first successful read below fire it -
+                            // see this module's doc comment.
+                            pending_reconnect_event = true;
+                        } else {
+                            ever_connected = true;
+                            let now_ms = ctx.clock.now_ms();
+                            ctx.events
+                                .emit(CollectEvent::connection(
+                                    now_ms,
+                                    EventKind::PlcConnected,
+                                    conn_key.clone(),
+                                    None,
+                                ))
+                                .await;
+                        }
                     }
                     ConnEvent::Finished((_, Err(_))) | ConnEvent::JoinError => {
                         // Failed attempt: drop the client, back off before the
@@ -656,6 +708,20 @@ pub(crate) async fn run_connection(
 
                     match read_outcome {
                         Some(Ok(results)) => {
+                            // #344: the reconnect edge fires here - the first
+                            // read that actually came back after a drop -
+                            // never at `connect()` time.
+                            if pending_reconnect_event {
+                                pending_reconnect_event = false;
+                                ctx.events
+                                    .emit(CollectEvent::connection(
+                                        ptime_ms,
+                                        EventKind::PlcReconnected,
+                                        conn_key.clone(),
+                                        None,
+                                    ))
+                                    .await;
+                            }
                             record_group(
                                 &plan.groups[i],
                                 Some(&results),
@@ -681,14 +747,23 @@ pub(crate) async fn run_connection(
                                 &mut append_health[i],
                             )
                             .await;
-                            ctx.events
-                                .emit(CollectEvent::connection(
-                                    ptime_ms,
-                                    EventKind::PlcDisconnected,
-                                    conn_key.clone(),
-                                    Some(err.to_string()),
-                                ))
-                                .await;
+                            // #344: only a *transition out of a working
+                            // connection* is a disconnect. If the reconnect
+                            // edge is still armed, this connection has never
+                            // actually come back since the disconnect we
+                            // already reported - stay silent and keep it
+                            // armed rather than emitting a second
+                            // `plc_disconnected` for the same outage.
+                            if !pending_reconnect_event {
+                                ctx.events
+                                    .emit(CollectEvent::connection(
+                                        ptime_ms,
+                                        EventKind::PlcDisconnected,
+                                        conn_key.clone(),
+                                        Some(err.to_string()),
+                                    ))
+                                    .await;
+                            }
                             attempt = 0;
                             state = ConnState::Backoff { at: Instant::now() };
                             set_status(

@@ -37,11 +37,23 @@ pub enum EventKind {
     CollectionStopped,
     /// A connection established its socket for the first time.
     PlcConnected,
-    /// A previously-connected connection lost its socket (`detail` carries
-    /// the reason).
+    /// A connection that was last known to be working failed a read
+    /// (`detail` carries the reason). Episode-edge: a read that fails while
+    /// the connection has not yet been confirmed working again emits nothing,
+    /// because the outage already on record simply continues (#344).
     PlcDisconnected,
-    /// A connection re-established its socket after a disconnect
+    /// A connection is working again after a [`EventKind::PlcDisconnected`]
     /// (recorder-requirements.md §3.1: "復旧後に自動再接続").
+    ///
+    /// **Anchored to the first successful `read_batch` after the disconnect,
+    /// not to a successful `connect()` (#344, 2026-09-15)** - i.e. it means
+    /// "reading works again", and its `ts_ms` is the `ptime_ms` of the tick
+    /// that proved it. Emitting it at connect time instead made this event
+    /// meaningless for a client reading through a shared session, where a
+    /// `connect()` can succeed against a session that is no longer usable;
+    /// see `task.rs`'s module doc ("What `plc_reconnected` means") for the
+    /// full derivation and the ≈13,000-rows/hour flap it produced in
+    /// banto-hub.
     PlcReconnected,
     /// A tag's scaled value crossed into a threshold band (`level`/`value`
     /// set).

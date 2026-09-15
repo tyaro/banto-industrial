@@ -4,7 +4,7 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
 1 画面で引くための地図。詳細は各文書へ辿る。
 
 状態: **地図として現行**。索引に徹し、実装状況・設計判断の本体は各文書側で管理する。
-最終更新: 2026-09-15（T19（UX-30〜48）・T20（文字列/構造体/レシピ/ビット .0〜.F）・T21（構成補助 MCP 管理面）完了、MCP 31 ツール実機検証、外部 DB 連携 S0〜S2b・S4・S5 完了、S3/S6/S7 残（MCP は 37 ツールに。追加分はローカル PostgreSQL で検証）に加え、v0.2.0-alpha.8: 書き込み受付の既定を「可」に変更し、再起動・収集操作での自動無効化を撤回（#340）、v0.2.0-alpha.9: 試運転中は構成 CRUD を収集中でも即時・無停止反映（#341）、v0.2.0-alpha.10: computed タグの catalog 公開・外部読み取り出力のシミュレーションゲート撤廃（#335）、v0.2.0-alpha.11: シミュレーションデバイスへの外部書き込みをシミュレータへ反映（#363）、v0.2.0-alpha.12: T15-3 テスト出力（test_output）機構を撤去（#362）を反映）。
+最終更新: 2026-09-15（T19（UX-30〜48）・T20（文字列/構造体/レシピ/ビット .0〜.F）・T21（構成補助 MCP 管理面）完了、MCP 31 ツール実機検証、外部 DB 連携 S0〜S2b・S4・S5 完了、S3/S6/S7 残（MCP は 37 ツールに。追加分はローカル PostgreSQL で検証）に加え、v0.2.0-alpha.8: 書き込み受付の既定を「可」に変更し、再起動・収集操作での自動無効化を撤回（#340）、v0.2.0-alpha.9: 試運転中は構成 CRUD を収集中でも即時・無停止反映（#341）、v0.2.0-alpha.10: computed タグの catalog 公開・外部読み取り出力のシミュレーションゲート撤廃（#335）、v0.2.0-alpha.11: シミュレーションデバイスへの外部書き込みをシミュレータへ反映（#363）、v0.2.0-alpha.12: T15-3 テスト出力（test_output）機構を撤去（#362）、v0.2.0-alpha.13: PLC 到達不能中の plc_reconnected / plc_disconnected フラップを修正（#344）を反映）。
 最終検証日(コード照合): 2026-09-15
 
 > この地図は索引に徹する。実装状況・設計判断の本体は各文書側にあり、状態の**正**は
@@ -79,6 +79,15 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
   **wire 変更（破壊的）**。MQTT/WS は #364 までに完了済みで追加変更なし。詳細は
   [tag-server-design.md](tag-server-design.md) §4.2、
   [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §6.3。
+- **v0.2.0-alpha.13（2026-09-15、#344）**: PLC 到達不能の間、`plc_reconnected` と
+  `plc_disconnected` が収集周期ごとに 1 組ずつフラップし続ける不具合を修正した（実測で
+  1000ms 周期・2 接続で約 13,000 件/時）。hub の `BrokerReadClient::connect()` が broker
+  セッションの実状態を見ずに常に即 `Ok` を返していたのが原因。以後 `connect()` は broker の
+  `status_watch` を見て `Reconnecting` なら 3 秒待って復帰しなければ失敗を返し、
+  `plc_reconnected` は「切断後、最初の読み取りが成功した時点」で 1 回だけ記録する。
+  **wire 変更なし**（記録のタイミングと件数のみ変更）。詳細は
+  [tag-server-design.md](tag-server-design.md) §6 項目5、
+  [banto-hub-operations.md](banto-hub-operations.md) §10。
 - **出荷ゲート**: T5-5（実機での 72h soak 実行 + 実機最終サインオフ）のみ残（実機必須）。
 - **banto-tagclient**: **S4a完了（2026-09-01）**。読み取り専用DTO、Endpoint/Secret境界、
   stable ID resolver、REST catalog/values transport、WS wire純粋解析、bounded publish gate、認証付き

@@ -37,58 +37,82 @@
 //!   `CollectorManager::rebuild` never tears down a live SLMP socket - only
 //!   `bin/banto-hub.rs`'s own shutdown does, via [`HubSessions::shutdown`].
 //!
-//! ## Why `connect()` always returns `Ok` immediately
+//! ## Why `connect()` reports the broker session's real state (#344)
 //!
-//! [`BrokerReadClient::connect`] never touches the network - the broker task
+//! [`BrokerReadClient::connect`] never dials anything itself - the broker task
 //! behind the wrapped handle owns the actual TCP session end-to-end
 //! (connect/reconnect/backoff, `banto-broker`'s own `run_broker_task`) and
 //! that task is *already running* by the time any `BrokerReadClient` exists
 //! (spawned by [`HubSessions::ensure_connection`] during
 //! `CollectorManager::rebuild`, independent of when banto-collect's
-//! connection task happens to call `connect()`). Reporting immediate success
-//! here just means banto-collect's own `ConnState` moves straight to
-//! `Connected` and starts calling `read_batch` - which is exactly what should
-//! happen, because whether the *broker's* session is actually up is a
-//! question `read_batch`/[`banto_broker::BrokerError::Disconnected`] answers
-//! per call, not something `connect()` could usefully pre-check (a check now
-//! would just describe a state that may have already changed by the time the
-//! next `read_batch` runs).
+//! connection task happens to call `connect()`). What it does instead is
+//! *observe* that task: it reads
+//! [`banto_broker::ReadOnlyHandle::status_watch`] and answers `Ok` only while
+//! the broker's session is actually [`BrokerConnectionStatus::Connected`],
+//! waiting up to [`BROKER_RECONNECT_GRACE`] for a session that is currently
+//! `Reconnecting` before giving up with a [`PlcError::Connection`].
 //!
-//! ## The two-backoff double bookkeeping this deliberately creates
+//! **This replaced an unconditional immediate `Ok`, and #344 is why.** The
+//! original T2-2 reasoning was that whether the broker's session is up is a
+//! question `read_batch`/[`banto_broker::BrokerError::Disconnected`] answers
+//! per call, so `connect()` could not usefully pre-check it. That is true as
+//! far as it goes, but it ignored what an always-succeeding `connect()` does
+//! to banto-collect's *event* stream. While a PLC was unreachable, every
+//! single collection tick ran this cycle:
+//!
+//! 1. the tick's `read_batch` failed with the broker's `Disconnected`, so
+//!    `task.rs` emitted `plc_disconnected` and dropped into `Backoff{now}`;
+//! 2. the immediately-due connect attempt returned `Ok` unconditionally, so
+//!    `task.rs` (already `ever_connected`) emitted `plc_reconnected` and went
+//!    straight back to `Connected`;
+//! 3. the next tick's `read_batch` failed again - back to 1.
+//!
+//! One `plc_reconnected`/`plc_disconnected` pair **per connection per
+//! collection period** (≈13,000 rows/hour at a 1 s period over two
+//! connections, measured on real hardware), none of which corresponded to an
+//! actual reconnect: `plc_reconnected` became meaningless to anyone reading
+//! `collect_events`, and a multi-hour outage bloated the table. Reporting the
+//! broker's real state keeps banto-collect's `ConnState` in `Backoff`
+//! (1 s → 30 s) for as long as the physical session is down, which is what
+//! the backoff ladder was always for.
+//!
+//! [`BROKER_RECONNECT_GRACE`] exists so the *common* case - a session that
+//! blips and comes right back - still looks like one uninterrupted connect
+//! attempt rather than a spurious failure.
+//!
+//! ## The two-backoff double bookkeeping this still creates
 //!
 //! banto-collect's own per-connection task (`crates/banto-collect/src/task.rs`)
 //! still runs its own `ConnState`/backoff loop against this adapter, exactly
 //! as it does for a direct `ModbusTcpClient`/`SlmpClient` - T2-2's
 //! instructions are explicit that "banto-collect の接続タスク構造は変えず"
 //! ("それ以外のタスク構造(ConnState/バックオフ/イベント)は一切変更しない" per
-//! I8/T2-2's shared discipline). So there end up being **two** independent
-//! backoff loops for one physical SLMP session once a connection is
+//! I8/T2-2's shared discipline). So there are still **two** independent
+//! backoff loops for one physical session once a connection is
 //! broker-managed:
 //!
 //! 1. **banto-broker's own** (`crates/banto-broker/src/lib.rs`'s
-//!    `run_broker_task`) - the one that actually owns the socket and
-//!    reconnects it.
-//! 2. **banto-collect's** (`task.rs`'s `run_connection`) - which, from this
-//!    adapter's perspective, only ever sees "read succeeded" or "read
-//!    failed" (`BrokerReadClient::connect` never fails, so banto-collect's
-//!    own `ConnState` is `Connected` almost all the time; a `read_batch`
-//!    `Err` drops it into `Backoff` for one cycle, then the very next
-//!    connect attempt succeeds immediately per the point above and it is
-//!    right back to calling `read_batch`).
+//!    `run_broker_task`) - the one that actually owns the socket, reconnects
+//!    it, and publishes the status this adapter reads.
+//! 2. **banto-collect's** (`task.rs`'s `run_connection`) - which, since #344,
+//!    *follows* that status rather than ignoring it: while the broker session
+//!    is down, `connect()` fails, so banto-collect stays in `Backoff` and
+//!    climbs its own 1 s → 30 s ladder instead of retrying `read_batch` every
+//!    period.
 //!
-//! This is not a bug or wasted work: banto-collect's loop degrades into a
-//! **retry-interval governor** for "how often to try `read_batch` again while
-//! the broker is down" (its backoff no longer gates an actual socket connect,
-//! just the polling cadence), while the broker's loop is the one true
-//! reconnect/backoff authority for the physical session. The design's own
+//! The division of labour is unchanged, only the coupling is: the broker's
+//! loop is the one true reconnect/backoff authority for the physical session,
+//! and banto-collect's loop is a **retry-interval governor** for "how often
+//! to try reading again while the broker is down". The design's own
 //! `/api/v1/status` decision (see `crate::hub::CollectorManager::broker_status`'s
-//! doc comment) follows from this: banto-collect's `ConnectionStatus` for a
-//! broker-managed connection is not a lie exactly, but it answers a less
-//! useful question ("is banto-collect's own retry loop momentarily backing
-//! off") than the broker's status answers ("is the physical session up") -
-//! so `/api/v1/status` surfaces the broker's answer for every broker-managed
-//! connection (SLMP since T2-2, Modbus TCP since #131), per the design
-//! decision this module implements.
+//! doc comment) still follows from this: banto-collect's `ConnectionStatus`
+//! for a broker-managed connection answers a less useful question ("is
+//! banto-collect's own retry loop momentarily backing off") than the broker's
+//! status answers ("is the physical session up") - so `/api/v1/status`
+//! surfaces the broker's answer for every broker-managed connection (SLMP
+//! since T2-2, Modbus TCP since #131), per the design decision this module
+//! implements. Since #344 the two agree far more often than they used to,
+//! but the broker remains the source of truth.
 //!
 //! ## T9-1/T9-2 note: SLMP simulation mode, wired via [`SlmpSimRegistry`]
 //!
@@ -156,6 +180,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use banto_broker::{
     BrokerConnectionStatus, BrokerError, BrokerHandle, BrokerSupervisor, ReadOnlyHandle,
@@ -167,6 +192,22 @@ use banto_plc::{
 };
 use banto_tags::PlcConnection;
 use tokio::sync::{watch, Mutex as AsyncMutex};
+
+/// How long [`BrokerReadClient::connect`] waits for a broker session that is
+/// currently [`BrokerConnectionStatus::Reconnecting`] to come back before it
+/// reports the connect attempt as failed (#344, 2026-09-15).
+///
+/// Sized against `banto_broker`'s own backoff ladder
+/// (`banto_broker::BackoffConfig::default()`: 1 s, doubling, capped at 30 s):
+/// 3 s covers the first two rungs, so a session that drops and is
+/// re-established on the broker's first or second retry still looks like one
+/// slightly slow connect attempt to banto-collect - no `plc_disconnected`
+/// cycle, no backoff climb. Anything longer than that is a real outage, and
+/// the right answer is to fail this attempt and let banto-collect's own
+/// backoff (1 s → 30 s) govern how often it asks again. Deliberately **not**
+/// tied to `connect_timeout`: that one bounds a real TCP dial, which this
+/// adapter never performs.
+const BROKER_RECONNECT_GRACE: Duration = Duration::from_secs(3);
 
 /// A `banto_collect::PlcClient` that reads through a shared broker session
 /// instead of owning a socket - see this module's doc comment for the full
@@ -201,11 +242,71 @@ fn to_read_result(result: BatchReadResult) -> ReadResult {
 }
 
 impl PlcClient for BrokerReadClient {
-    /// Always succeeds immediately without touching the network - see this
-    /// module's doc comment ("Why `connect()` always returns `Ok`
-    /// immediately").
+    /// Report whether the shared broker session is actually up, without
+    /// dialling anything - see this module's doc comment ("Why `connect()`
+    /// reports the broker session's real state (#344)") for the full
+    /// derivation and the event-flapping bug that forced it.
+    ///
+    /// - [`BrokerConnectionStatus::Connected`] -> `Ok(())` immediately (the
+    ///   overwhelmingly common case: no timer, no allocation beyond the
+    ///   `watch::Receiver` clone).
+    /// - [`BrokerConnectionStatus::Reconnecting`] -> wait up to
+    ///   [`BROKER_RECONNECT_GRACE`] for it to become `Connected`; if it does
+    ///   not, `Err(PlcError::Connection)` naming the broker's own attempt
+    ///   counter, so banto-collect's `ConnState` stays in `Backoff` instead of
+    ///   flapping back to `Connected`.
+    /// - [`BrokerConnectionStatus::Stopped`], or every `watch` sender gone
+    ///   (the broker task has exited) -> `Err` immediately; there is nothing
+    ///   left to wait for.
     fn connect(&mut self) -> BoxFuture<'_, Result<(), PlcError>> {
-        Box::pin(async { Ok(()) })
+        let mut status = self.handle.status_watch();
+        Box::pin(async move {
+            // Fast path, and the reason this can never regress the healthy
+            // case into a timer wake-up.
+            match *status.borrow_and_update() {
+                BrokerConnectionStatus::Connected => return Ok(()),
+                BrokerConnectionStatus::Stopped => {
+                    return Err(PlcError::Connection(
+                        "broker セッションは停止しています".to_string(),
+                    ))
+                }
+                BrokerConnectionStatus::Reconnecting { .. } => {}
+            }
+
+            // `wait_for` borrows `status`; copy the observed value straight
+            // out so nothing is still borrowed when the timeout arm below
+            // re-reads the (possibly newer) attempt counter for its message.
+            let waited = tokio::time::timeout(
+                BROKER_RECONNECT_GRACE,
+                status.wait_for(|s| !matches!(s, BrokerConnectionStatus::Reconnecting { .. })),
+            )
+            .await
+            .map(|result| result.map(|seen| *seen));
+
+            match waited {
+                Ok(Ok(BrokerConnectionStatus::Connected)) => Ok(()),
+                // Only reachable as `Stopped` - `wait_for`'s predicate
+                // excludes `Reconnecting`, and `Connected` is the arm above.
+                Ok(Ok(_)) => Err(PlcError::Connection(
+                    "broker セッションは停止しています".to_string(),
+                )),
+                // `wait_for` only errors when every sender is gone, i.e. the
+                // broker task itself has exited (session removed mid-rebuild,
+                // or the whole supervisor shut down).
+                Ok(Err(_)) => Err(PlcError::Connection(
+                    "broker セッションのタスクが終了しています".to_string(),
+                )),
+                Err(_elapsed) => {
+                    let attempt = match *status.borrow() {
+                        BrokerConnectionStatus::Reconnecting { attempt } => attempt,
+                        _ => 0,
+                    };
+                    Err(PlcError::Connection(format!(
+                        "broker セッションが再接続待機中です（試行 {attempt} 回目）"
+                    )))
+                }
+            }
+        })
     }
 
     /// Every request in `requests` is numeric/bit (see this module's doc
@@ -815,17 +916,23 @@ mod tests {
     /// get a [`BrokerReadClient`] - the same routing SLMP has had since
     /// T2-2 - so a collecting Modbus connection occupies exactly one socket
     /// (see [`hub_client_factory`]'s doc comment for the KM-D1-ETN failure
-    /// that forced this). Distinguished from `default(spec)`'s direct
-    /// `ModbusTcpClient` by the one behavior only `BrokerReadClient` has:
-    /// `connect()` succeeds immediately without touching the network, so it
-    /// succeeds even though no server is listening on `port` here.
+    /// that forced this).
+    ///
+    /// **Discriminator, rewritten for #344 (2026-09-15)**: this used to lean
+    /// on "`BrokerReadClient::connect()` always succeeds without touching the
+    /// network", asserting `Ok` even against a closed port. That behavior is
+    /// exactly what #344 removed, so the test now distinguishes the two
+    /// clients by *whose* failure it is - a `BrokerReadClient` pointed at a
+    /// down session reports the broker's own wording (and never dials), while
+    /// the direct fallback client reports a real TCP dial failure against the
+    /// closed port. A live-simulator connection is kept alongside it so the
+    /// success path is covered too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn modbus_reads_route_through_the_broker_handle_like_slmp() {
         let sim = Simulator::start().await;
         let sessions = HubSessions::new(banto_broker::BackoffConfig::default());
 
-        // A closed port: a direct client's `connect()` must fail against it,
-        // a `BrokerReadClient`'s must not.
+        // A closed port: nothing will ever answer here, for either client.
         let dead_port = {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
             let port = listener.local_addr().expect("local_addr").port();
@@ -847,25 +954,148 @@ mod tests {
 
         let factory = hub_client_factory(Arc::new(handles));
 
-        for conn in [&slmp, &modbus] {
-            let mut client = factory(&spec_for(conn));
-            assert!(
-                client.connect().await.is_ok(),
-                "a connection with a broker handle ({}) must be routed to BrokerReadClient",
-                conn.protocol
-            );
-        }
+        // SLMP, live simulator: the broker session comes up on its own, so
+        // the routed `BrokerReadClient` reports success.
+        let mut slmp_client = factory(&spec_for(&slmp));
+        assert!(
+            slmp_client.connect().await.is_ok(),
+            "an SLMP connection with a live broker session must connect through it"
+        );
+
+        // Modbus, dead port: routed to a `BrokerReadClient`, proven by the
+        // error naming the broker session rather than a socket.
+        let mut modbus_client = factory(&spec_for(&modbus));
+        let err = modbus_client
+            .connect()
+            .await
+            .expect_err("a down broker session must fail the connect (#344)");
+        assert!(
+            err.to_string().contains("broker"),
+            "a Modbus connection with a broker handle must be routed to BrokerReadClient, \
+             whose failure names the broker session - got {err}"
+        );
 
         // Defensive fallback: no handle for this connection key, so the
         // factory hands back banto-collect's own direct client - which
-        // really dials, and really fails against the closed port.
+        // really dials, and really fails against the closed port with a
+        // socket-level error that says nothing about the broker.
         let mut fallback = factory(&spec_for(&unhandled_modbus));
+        let fallback_err = fallback
+            .connect()
+            .await
+            .expect_err("a direct client must fail against a closed port");
         assert!(
-            fallback.connect().await.is_err(),
-            "a Modbus connection missing from the handle map must fall back to a direct client"
+            !fallback_err.to_string().contains("broker"),
+            "a Modbus connection missing from the handle map must fall back to a direct \
+             client, whose failure is a socket error - got {fallback_err}"
         );
 
         sessions.shutdown().await;
         sim.stop();
+    }
+
+    // --- #344 (2026-09-15): `connect()` follows the broker's real state ----
+    //
+    // Driven through `banto_broker::spawn_test_handle_with_status`, whose
+    // `watch::Sender` lets these tests move the session through exactly the
+    // transitions a real broker task would publish, with no socket and no
+    // backoff timing to race against. See this module's doc comment ("Why
+    // `connect()` reports the broker session's real state") for what each of
+    // these pins down and why it matters to `collect_events`.
+
+    /// The healthy case, unchanged from before #344: a `Connected` session
+    /// answers immediately (no [`BROKER_RECONNECT_GRACE`] wait at all - this
+    /// completes well inside it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_succeeds_immediately_while_the_broker_session_is_connected() {
+        let (handle, _status_tx, _task) = banto_broker::spawn_test_handle_with_status(
+            1,
+            banto_broker::BrokerConnectionStatus::Connected,
+        );
+        let mut client = BrokerReadClient::new(handle.read_only());
+
+        let started = std::time::Instant::now();
+        assert!(client.connect().await.is_ok());
+        assert!(
+            started.elapsed() < BROKER_RECONNECT_GRACE,
+            "a Connected session must not wait out the reconnect grace"
+        );
+    }
+
+    /// The transient blip [`BROKER_RECONNECT_GRACE`] exists for: the session
+    /// is `Reconnecting` when `connect()` is called and comes back inside the
+    /// grace window, so banto-collect sees one slightly slow connect attempt
+    /// instead of a disconnect/reconnect event pair.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_waits_out_a_reconnecting_session_that_recovers_in_time() {
+        let (handle, status_tx, _task) = banto_broker::spawn_test_handle_with_status(
+            1,
+            banto_broker::BrokerConnectionStatus::Reconnecting { attempt: 1 },
+        );
+        let mut client = BrokerReadClient::new(handle.read_only());
+
+        let flip = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = status_tx.send(banto_broker::BrokerConnectionStatus::Connected);
+        });
+
+        let started = std::time::Instant::now();
+        assert!(
+            client.connect().await.is_ok(),
+            "a session that recovers inside the grace window must connect"
+        );
+        assert!(
+            started.elapsed() < BROKER_RECONNECT_GRACE,
+            "it must return as soon as the session is back, not at the end of the window"
+        );
+        flip.await.expect("the status flipper should not panic");
+    }
+
+    /// The #344 case itself: a session that is still `Reconnecting` when the
+    /// grace window expires must fail the connect, so banto-collect's
+    /// `ConnState` stays in `Backoff` and no `plc_reconnected` is emitted.
+    /// The error carries the broker's own attempt counter so the operator can
+    /// tell a genuinely retrying session from a stopped one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_fails_when_the_broker_session_stays_reconnecting() {
+        let (handle, _status_tx, _task) = banto_broker::spawn_test_handle_with_status(
+            1,
+            banto_broker::BrokerConnectionStatus::Reconnecting { attempt: 7 },
+        );
+        let mut client = BrokerReadClient::new(handle.read_only());
+
+        let started = std::time::Instant::now();
+        let err = client
+            .connect()
+            .await
+            .expect_err("a session that never recovers must fail the connect");
+        assert!(
+            started.elapsed() >= BROKER_RECONNECT_GRACE - Duration::from_millis(100),
+            "the grace window must actually be waited out before giving up"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("再接続待機中") && text.contains('7'),
+            "the error should name the broker's own attempt counter - got {text}"
+        );
+    }
+
+    /// A session the directory has stopped (or a broker task that has exited)
+    /// fails immediately - there is nothing left to wait for, so burning the
+    /// grace window on it would only slow every collection tick down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_fails_immediately_for_a_stopped_broker_session() {
+        let (handle, _status_tx, _task) = banto_broker::spawn_test_handle_with_status(
+            1,
+            banto_broker::BrokerConnectionStatus::Stopped,
+        );
+        let mut client = BrokerReadClient::new(handle.read_only());
+
+        let started = std::time::Instant::now();
+        assert!(client.connect().await.is_err());
+        assert!(
+            started.elapsed() < BROKER_RECONNECT_GRACE,
+            "a Stopped session must not wait out the reconnect grace"
+        );
     }
 }

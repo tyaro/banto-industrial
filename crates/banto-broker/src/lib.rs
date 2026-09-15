@@ -556,8 +556,39 @@ impl ReadOnlyHandle {
 /// fake never disconnects, so there is nothing to transition to.
 #[cfg(any(test, feature = "test-util"))]
 pub fn spawn_test_handle_answering_ok(connection_id: i64) -> (BrokerHandle, JoinHandle<()>) {
+    let (handle, _status_tx, task) =
+        spawn_test_handle_with_status(connection_id, BrokerConnectionStatus::Connected);
+    (handle, task)
+}
+
+/// As [`spawn_test_handle_answering_ok`], but the caller keeps the
+/// [`watch::Sender`] driving [`BrokerHandle::status_watch`] and picks the
+/// status the handle starts in - so a consumer's tests can walk a session
+/// through `Reconnecting -> Connected -> Stopped` deterministically, with no
+/// socket and no backoff timing to race against.
+///
+/// Added for banto-hub #344 (2026-09-15): `broker_glue::BrokerReadClient::connect`
+/// now answers from this very watch channel (it used to return `Ok`
+/// unconditionally, which made banto-collect emit a bogus
+/// `plc_reconnected`/`plc_disconnected` pair on every collection tick while a
+/// PLC was unreachable), and that behavior is only testable if a test can
+/// publish the statuses a real `run_broker_task` would.
+///
+/// **Keep the returned sender alive for as long as the test needs the
+/// status.** Dropping it closes the watch channel, which is exactly how a
+/// consumer observes "the broker task has exited" - useful on purpose, but
+/// surprising if it happens by accident.
+#[cfg(any(test, feature = "test-util"))]
+pub fn spawn_test_handle_with_status(
+    connection_id: i64,
+    initial: BrokerConnectionStatus,
+) -> (
+    BrokerHandle,
+    watch::Sender<BrokerConnectionStatus>,
+    JoinHandle<()>,
+) {
     let (tx, mut rx) = mpsc::channel::<Job>(JOB_CHANNEL_CAPACITY);
-    let (_status_tx, status_rx) = watch::channel(BrokerConnectionStatus::Connected);
+    let (status_tx, status_rx) = watch::channel(initial);
     let task = tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
             match job {
@@ -579,6 +610,7 @@ pub fn spawn_test_handle_answering_ok(connection_id: i64) -> (BrokerHandle, Join
             tx,
             status_rx,
         },
+        status_tx,
         task,
     )
 }
