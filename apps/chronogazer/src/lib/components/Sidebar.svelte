@@ -1,12 +1,17 @@
 <script lang="ts">
 	import { page } from '$app/state';
-	import { navItems } from '$lib/navigation';
+	import { navItems, type NavItem } from '$lib/navigation';
 	import { settings } from '$lib/settings.svelte';
 	import { sessionStore } from '$lib/session.svelte';
 	import { isAdmin } from '$lib/permissions';
 
-	function isActive(path: string): boolean {
-		return page.url.pathname === path || page.url.pathname.startsWith(path + '/');
+	// #359 chronogazer 分: `item.activeMatch`（無ければ `item.path`）を基準に
+	// 前方一致判定する - `navigation.ts` の doc comment参照（`設定` は
+	// 遷移先が `/settings/appearance` でも `/settings` 配下ならハイライト
+	// させたい）。
+	function isActive(item: NavItem): boolean {
+		const match = item.activeMatch ?? item.path;
+		return page.url.pathname === match || page.url.pathname.startsWith(match + '/');
 	}
 
 	// Spec M10 RBAC: hide admin-only entries (「ユーザー管理」) rather than
@@ -30,7 +35,7 @@
 		{#each visibleItems as item (item.path)}
 			<a
 				href={item.path}
-				class:active={isActive(item.path)}
+				class:active={isActive(item)}
 				title={settings.sidebarCollapsed ? item.label : undefined}
 			>
 				<span class="icon">{item.icon}</span>
