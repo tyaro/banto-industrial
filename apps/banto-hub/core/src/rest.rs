@@ -58,7 +58,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use banto_broker::{is_supported_protocol, BrokerConnectionStatus, BrokerError};
 use banto_collect::{
-    build_config_from, connections_with_collected_groups, ApplyReport, ConnectionStatus,
+    build_config_from, connections_with_collected_groups, ApplyReport, ConnectionStatus, Quality,
     RegistrySnapshot,
 };
 use banto_core::{BantoError, ErrorBody, FieldError, ListParams, ListResult};
@@ -78,7 +78,7 @@ use banto_server::{
 use banto_tags::{
     BatchTagDeleteOutcome, BatchTagOutcome, BatchTagUpdateOutcome, CollectionGroup,
     CollectionGroupInput, CollectionGroupService, GroupTagCount, PlcConnection, PlcConnectionInput,
-    PlcConnectionService, Tag, TagInput, TagService, TagUpdateError,
+    PlcConnectionService, Tag, TagInput, TagService, TagUpdateError, COMPUTED_TAG_KIND,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -4438,6 +4438,344 @@ async fn tags_get(
     Ok(Json(state.tags.get(id).await?))
 }
 
+// --- #342 段階A: 演算タグの式チェック API（保存前検証・エラー位置・プレビュー）
+// -----------------------------------------------------------------------
+//
+// issue #342 は「`banto_expr::typecheck::check` をそのまま呼び、参照タグの
+// 型は現行 catalog から解決する」前提で書かれていたが、これはコード事実と
+// 食い違う: `typecheck` は `banto-expr` の非公開モジュール（`lib.rs` の
+// `mod typecheck;`）で、公開 API は `compile(source) -> Result<CompiledExpr,
+// CompileError>` だけ。しかも `banto-expr` はレジストリを持たない設計で、
+// タグ参照の型は常に `Type::Num` 固定（`crates/banto-expr/src/lib.rs` 冒頭
+// doc「タグ参照は常に Num 型」参照）なので「参照タグの型解決を渡す」引数
+// 自体が存在しない。そのためここでは `compile()` を呼び、
+// `CompiledExpr::referenced_tags()` を `TagMap` と突き合わせる**2段構成**に
+// する - `crate::computed::build_plan` が既にこの形（`resolve_referenced_tag`
+// を両者で共有 - 判定条件を新しく発明しない）。`build_plan` 自体は呼ばない:
+// あれは登録済み computed タグ全件の rebuild 検証用で、単発式のプレビューには
+// 過剰（未登録の全タグを毎回コンパイルし直す）なうえ `String` エラーしか
+// 返さない。
+
+/// `POST /api/tags/expression/check` の body。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExpressionCheckRequest {
+    expression: String,
+    /// この式を保存する予定のタグの完全名（省略可）。循環参照の判定にだけ
+    /// 使う（[`cycle_check_nodes`] 参照）。
+    #[serde(default)]
+    external_name: Option<String>,
+}
+
+/// 参照タグ1件の要約（コンパイル成功後、存在確認・文字列タグ拒否を通った
+/// ものだけが入る）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExpressionRefEntry {
+    name: String,
+    data_type: String,
+    unit: Option<String>,
+    tag_kind: String,
+}
+
+/// 現在値による試算結果 - `evaluated: false` のときは `value: null` で
+/// `reason` に日本語の理由（参照が Bad/Stale・`eval` 失敗のいずれか）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExpressionPreview {
+    value: Option<f64>,
+    evaluated: bool,
+    reason: Option<String>,
+}
+
+/// `banto_expr::CompileError` の全 variant 名を写した `kind` 文字列 - `pos`
+/// は `CompileError::SourceTooLong` だけ持たない（バイトオフセット =
+/// 文字オフセット、`crates/banto-expr/src/error.rs` 冒頭のコメント参照）。
+/// `message` は `CompileError`/`CycleError` の `Display`（既に日本語）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExpressionCheckError {
+    kind: String,
+    pos: Option<usize>,
+    message: String,
+}
+
+/// `POST /api/tags/expression/check` の応答。**常に 200** - 式が不正でも
+/// `ok: false` で返す（保存 API ではなくプレビュー用のため、HTTP エラーに
+/// しない。#342 実装指示「レスポンス」節）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ExpressionCheckResponse {
+    ok: bool,
+    result_type: Option<String>,
+    refs: Vec<ExpressionRefEntry>,
+    preview: ExpressionPreview,
+    error: Option<ExpressionCheckError>,
+}
+
+impl ExpressionCheckResponse {
+    /// 参照解決・循環検査で失敗したときの共通ショートカット - コンパイル
+    /// 自体は成功しているので `result_type`/`refs`（そこまでに解決できた分）
+    /// は埋めたまま返す（「ok: false のときは resultType/refs/preview を
+    /// 可能な範囲で埋める」の実装）。
+    fn resolution_error(
+        result_type: Option<String>,
+        refs: Vec<ExpressionRefEntry>,
+        kind: &'static str,
+        message: String,
+    ) -> Self {
+        Self {
+            ok: false,
+            result_type,
+            refs,
+            preview: ExpressionPreview {
+                value: None,
+                evaluated: false,
+                reason: None,
+            },
+            error: Some(ExpressionCheckError {
+                kind: kind.to_string(),
+                pos: None,
+                message,
+            }),
+        }
+    }
+}
+
+fn expression_result_type_wire(ty: banto_expr::Type) -> String {
+    match ty {
+        banto_expr::Type::Num => "num".to_string(),
+        banto_expr::Type::Bool => "bool".to_string(),
+    }
+}
+
+/// `banto_expr::CompileError` → [`ExpressionCheckError`]。全 variant を
+/// 網羅（`match` に `_` を置かない - 新しい variant が増えたらコンパイル
+/// エラーで気づけるようにする）。
+fn expression_compile_error(err: &banto_expr::CompileError) -> ExpressionCheckError {
+    use banto_expr::CompileError;
+    let message = err.to_string();
+    let (kind, pos) = match err {
+        CompileError::Syntax { pos, .. } => ("syntax", Some(*pos)),
+        CompileError::TypeMismatch { pos, .. } => ("type_mismatch", Some(*pos)),
+        CompileError::UnknownFunction { pos, .. } => ("unknown_function", Some(*pos)),
+        CompileError::ArityMismatch { pos, .. } => ("arity_mismatch", Some(*pos)),
+        CompileError::BadBitIndex { pos, .. } => ("bad_bit_index", Some(*pos)),
+        CompileError::BadBitTarget { pos, .. } => ("bad_bit_target", Some(*pos)),
+        // 唯一 `pos` を持たない variant - 式全体の長さについてのエラーで、
+        // 特定の文字位置を指す意味がないため（`error.rs` の doc comment）。
+        CompileError::SourceTooLong { .. } => ("source_too_long", None),
+        CompileError::TooDeep { pos, .. } => ("too_deep", Some(*pos)),
+    };
+    ExpressionCheckError {
+        kind: kind.to_string(),
+        pos,
+        message,
+    }
+}
+
+/// 循環参照の判定に使うノード集合を組み立てる（#342 実装指示「循環参照の
+/// 判定」節）。現在の `TagMap` の computed タグそれぞれについて、既に
+/// commit 済みの [`ComputedEngine`] の plan から参照先一覧を引く
+/// （`build_plan` を呼び直して全タグを再コンパイルしない - 既存タグは
+/// 登録時に検証済みで、この plan がその正）。`external_name` のノードだけ
+/// 今回の式の参照先（`new_refs`）で置き換える - 存在しなければ追加する。
+fn cycle_check_nodes(
+    map: &TagMap,
+    computed: &ComputedEngine,
+    external_name: &str,
+    new_refs: &[String],
+) -> Vec<(String, Vec<String>)> {
+    let mut nodes: Vec<(String, Vec<String>)> = Vec::new();
+    let mut replaced = false;
+    for entry in map.iter() {
+        if entry.tag_kind != COMPUTED_TAG_KIND {
+            continue;
+        }
+        if entry.external_name == external_name {
+            nodes.push((external_name.to_string(), new_refs.to_vec()));
+            replaced = true;
+        } else {
+            let deps = computed
+                .referenced_tags(&entry.external_name)
+                .unwrap_or_default();
+            nodes.push((entry.external_name.clone(), deps));
+        }
+    }
+    if !replaced {
+        nodes.push((external_name.to_string(), new_refs.to_vec()));
+    }
+    nodes
+}
+
+/// REST ハンドラ（[`tags_expression_check`]）と MCP ツール（`crate::mcp` の
+/// `check_expression`）が共有する検証本体。認可・pending queue 判定は行わ
+/// ない（呼び出し側の責務 - REST は `require_editor`、MCP は
+/// `require_admin_scope`）。同期処理のみ（DB I/O も await もない）なので
+/// 非同期にしていない - 呼び出し元が async 関数であっても素通しで呼べる。
+pub(crate) fn evaluate_expression_check(
+    manager: &CollectorManager,
+    expression: &str,
+    external_name: Option<&str>,
+) -> ExpressionCheckResponse {
+    let compiled = match banto_expr::compile(expression) {
+        Ok(compiled) => compiled,
+        Err(err) => {
+            return ExpressionCheckResponse {
+                ok: false,
+                result_type: None,
+                refs: Vec::new(),
+                preview: ExpressionPreview {
+                    value: None,
+                    evaluated: false,
+                    reason: None,
+                },
+                error: Some(expression_compile_error(&err)),
+            };
+        }
+    };
+
+    let result_type = Some(expression_result_type_wire(compiled.result_type()));
+    let map = manager.tag_map();
+
+    // 参照タグの解決（存在確認・文字列タグ拒否) - `build_plan` と同じ判定を
+    // `crate::computed::resolve_referenced_tag` で共有する。
+    let mut refs = Vec::with_capacity(compiled.referenced_tags().len());
+    for name in compiled.referenced_tags() {
+        match crate::computed::resolve_referenced_tag(&map, name) {
+            Ok(entry) => refs.push(ExpressionRefEntry {
+                name: entry.external_name.clone(),
+                data_type: entry.data_type.clone(),
+                unit: entry.unit.clone(),
+                tag_kind: entry.tag_kind.clone(),
+            }),
+            Err(crate::computed::ReferencedTagError::Missing) => {
+                return ExpressionCheckResponse::resolution_error(
+                    result_type,
+                    refs,
+                    "unknown_tag",
+                    format!("参照先タグが存在しません: {name}"),
+                );
+            }
+            Err(crate::computed::ReferencedTagError::StringType) => {
+                return ExpressionCheckResponse::resolution_error(
+                    result_type,
+                    refs,
+                    "string_ref",
+                    format!("文字列タグは参照できません: {name}"),
+                );
+            }
+        }
+    }
+
+    // 循環参照の判定（externalName が与えられたときだけ）。
+    if let Some(ext_name) = external_name {
+        let computed = manager.computed_engine();
+        let nodes = cycle_check_nodes(&map, &computed, ext_name, compiled.referenced_tags());
+        if let Err(cycle_err) = banto_expr::validate_dag(&nodes) {
+            return ExpressionCheckResponse::resolution_error(
+                result_type,
+                refs,
+                "cycle",
+                cycle_err.to_string(),
+            );
+        }
+    }
+
+    // プレビュー試算: 参照が全件 Good で値を持つときだけ評価する。
+    let now_ms = manager.clock().now_ms();
+    let current = manager.current_values();
+    let server_store = manager.server_store();
+    let mut inputs: Vec<(String, banto_expr::Value)> =
+        Vec::with_capacity(compiled.referenced_tags().len());
+    let mut blocked_reason: Option<String> = None;
+    for name in compiled.referenced_tags() {
+        // 上のループで解決済み（存在確認・文字列タグ拒否を通過済み）。
+        let entry = map
+            .get(name)
+            .expect("#342: referenced tag resolved above via resolve_referenced_tag");
+        let (value, quality, _t) =
+            crate::hub::read_current(entry, current.as_ref(), &server_store, now_ms);
+        if blocked_reason.is_some() {
+            continue;
+        }
+        match (value, quality) {
+            (Some(v), Quality::Good) => inputs.push((name.clone(), banto_expr::Value::Num(v))),
+            (Some(_), Quality::Stale) => {
+                blocked_reason = Some(format!("参照タグ {name} の値が Stale です"));
+            }
+            _ => {
+                blocked_reason = Some(format!("参照タグ {name} の値が Bad です"));
+            }
+        }
+    }
+
+    let preview = match blocked_reason {
+        Some(reason) => ExpressionPreview {
+            value: None,
+            evaluated: false,
+            reason: Some(reason),
+        },
+        None => {
+            let closure = |tag: &str| inputs.iter().find(|(n, _)| n == tag).map(|(_, v)| *v);
+            match compiled.eval(&closure) {
+                Ok(banto_expr::Value::Num(x)) => ExpressionPreview {
+                    value: Some(x),
+                    evaluated: true,
+                    reason: None,
+                },
+                // 結果型 Bool は `computed.rs::evaluate_tick` と同じ規約で
+                // 1.0/0.0 に変換する（I1 に bool データ型はない）。
+                Ok(banto_expr::Value::Bool(b)) => ExpressionPreview {
+                    value: Some(if b { 1.0 } else { 0.0 }),
+                    evaluated: true,
+                    reason: None,
+                },
+                Err(err) => ExpressionPreview {
+                    value: None,
+                    evaluated: false,
+                    reason: Some(err.to_string()),
+                },
+            }
+        }
+    };
+
+    ExpressionCheckResponse {
+        ok: true,
+        result_type,
+        refs,
+        preview,
+        error: None,
+    }
+}
+
+/// `plc_connections_test`と同じ理由で意図的に `#[utoipa::path]` を付けず
+/// `ApiDoc` にも加えない（`tags_address_writable` の doc comment参照 -
+/// `/api/v1/*` のみを文書化する既存方針。このエンドポイントも同じ
+/// `tag_registry_router`＝管理系ルーター配下）。
+async fn tags_expression_check(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Json(input): Json<ExpressionCheckRequest>,
+) -> Result<Json<ExpressionCheckResponse>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.commissioning,
+        &state.audit,
+        &headers,
+        "tags",
+        "POST",
+        "/api/tags/expression/check",
+    )
+    .await
+    .map_err(ApiError)?;
+    Ok(Json(evaluate_expression_check(
+        &state.manager,
+        &input.expression,
+        input.external_name.as_deref(),
+    )))
+}
+
 async fn tags_create(
     State(state): State<TagRegistryState>,
     headers: HeaderMap,
@@ -6071,6 +6409,10 @@ fn tag_registry_router(
         // 書き込み可能な領域かどうかの判定（`tags_address_writable`の doc
         // comment 参照）。
         .route("/api/tags/address-writable", get(tags_address_writable))
+        // #342 段階A: 保存前の式検証（エラー位置・参照タグ解決・循環判定・
+        // 現在値によるプレビュー試算）。同じく `/api/tags` 直下の固定セグ
+        // メントで `/api/tags/{id}` (i64) とは衝突しない。
+        .route("/api/tags/expression/check", post(tags_expression_check))
         .with_state(state)
         .layer(middleware::from_fn_with_state(
             AuthGate {

@@ -2,6 +2,16 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
+## v0.2.0-alpha.15 — 2026-09-15（アルファ）
+
+演算タグの式チェック API・エラー位置のインライン表示・ライブプレビューを追加した（issue #342 段階A。段階B「セグメント補完」・段階C「ツリーからの挿入」は別 PR）。配布物の構成・前提ランタイムは alpha.3 以降と同じ。既存 API・wire は無変更（今回は追加のみ）。
+
+### 追加（2026-09-15、#342 段階A）
+
+- **`POST /api/tags/expression/check`**（管理系ルーター、editor 以上）: 演算タグの式1本を保存せずに検証する。body は `{ expression, externalName? }`、応答は常に 200 で `{ ok, resultType, refs, preview, error }`（式が不正でも `ok: false` で返す - プレビュー用 API のため HTTP エラーにしない）。構文・型検査に加え、参照タグの存在確認・型/単位の解決・文字列タグ参照の拒否、`externalName` 指定時の循環参照判定、現在値による試算（参照が全件 Good のときだけ）を行う。
+- **MCP ツール `check_expression`**（admin スコープ必須）: REST と同じ検証ロジックを共有する（`crate::rest::evaluate_expression_check`）。MCP ツール数は 37 → 38。
+- **管理 UI（タグ登録画面）**: 演算タグの式欄が入力のたびに 300ms debounce で上記 API を叩き、構文・型エラーの位置（`pos`、バイト = 文字オフセット）に下線を表示し、結果型・参照タグ一覧（型・単位）・試算値をその場でプレビューする。IME 変換中は送信しない。エラーメッセージはクリック可能で、クリックしたときだけキャレットがエラー位置へ移動する（issue 原文の「入力のたびに自動でキャレットを飛ばす」は打鍵の邪魔になるため見送った）。
+
 ## v0.2.0-alpha.14 — 2026-09-15（アルファ）
 
 banto-hub の管理 UI「設定」画面を、上流テンプレート v1.6.0（#358 で追従）と同じカテゴリ別ルートへ分割した（issue #359 の banto-hub 分。chronogazer・relay-wright への展開は別 PR）。配布物の構成・前提ランタイムは alpha.3 以降と同じ。API・DB・wire は無変更。

@@ -82,7 +82,7 @@ use banto_expr::{CompiledExpr, Value};
 use banto_tags::{COMPUTED_TAG_KIND, STRING_DATA_TYPE};
 use sqlx::SqlitePool;
 
-use crate::hub::{read_current, TagMap};
+use crate::hub::{read_current, TagEntry, TagMap};
 
 /// computed/internal タグの現在値ストア（このモジュールの doc comment
 /// 参照）。`banto_collect::CurrentValuesHandle` の非 PLC 版 - キーは同じ
@@ -168,6 +168,33 @@ impl ComputedPlan {
     }
 }
 
+/// 演算タグの参照先タグ1件を検証できなかった理由（[`resolve_referenced_tag`]
+/// 参照）。
+pub(crate) enum ReferencedTagError {
+    /// `TagMap` に存在しない外部名。
+    Missing,
+    /// 存在するが文字列タグ（演算タグは文字列タグを参照できない）。
+    StringType,
+}
+
+/// 演算タグが参照する外部名1件を `TagMap` に照会し、存在確認と文字列タグ
+/// 拒否の両方を行う（[`build_plan`] と #342 の単発式チェック API
+/// `crate::rest::evaluate_expression_check` が同じ判定条件を共有するための
+/// 唯一の実装 - 「条件を新しく発明しない」という #342 実装指示どおり、
+/// ここを両者の呼び出し先にする）。
+pub(crate) fn resolve_referenced_tag<'a>(
+    map: &'a TagMap,
+    referenced: &str,
+) -> Result<&'a TagEntry, ReferencedTagError> {
+    match map.get(referenced) {
+        None => Err(ReferencedTagError::Missing),
+        Some(ref_entry) if ref_entry.data_type == STRING_DATA_TYPE => {
+            Err(ReferencedTagError::StringType)
+        }
+        Some(ref_entry) => Ok(ref_entry),
+    }
+}
+
 /// `map` から `tag_kind == "computed"` のタグを集め、式をコンパイル
 /// （`banto_expr::compile`）・参照タグの存在確認（文字列タグの参照は拒否）・
 /// DAG 検証（`banto_expr::validate_dag`）まで行う純関数（`self` を取らない
@@ -201,22 +228,23 @@ pub fn build_plan(map: &TagMap) -> Result<ComputedPlan, String> {
         // 文字列タグの参照は拒否（banto_expr 自身はレジストリを持たないため
         // 判定できない - このクレートの `crate` トップレベル doc comment
         // 「文字列タグの参照拒否は T6-2 の登録時検証の責務」どおり、ここが
-        // その実装位置）。
+        // その実装位置。判定条件そのものは [`resolve_referenced_tag`] に
+        // 集約）。
         for referenced in compiled.referenced_tags() {
-            match map.get(referenced) {
-                None => {
+            match resolve_referenced_tag(map, referenced) {
+                Ok(_) => {}
+                Err(ReferencedTagError::Missing) => {
                     return Err(format!(
                         "演算タグ {} の参照先タグが存在しません: {referenced}",
                         entry.external_name
                     ));
                 }
-                Some(ref_entry) if ref_entry.data_type == STRING_DATA_TYPE => {
+                Err(ReferencedTagError::StringType) => {
                     return Err(format!(
                         "演算タグ {} は文字列タグ {referenced} を参照できません",
                         entry.external_name
                     ));
                 }
-                Some(_) => {}
             }
         }
 
@@ -426,7 +454,6 @@ pub async fn load_retained_values(pool: &SqlitePool) -> Result<Vec<(i64, f64, i6
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hub::TagEntry;
     use banto_tags::PLC_TAG_KIND;
 
     /// Test-only `TagMap` builder - `crate::hub::TagMap` has no public

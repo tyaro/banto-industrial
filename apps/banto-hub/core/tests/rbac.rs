@@ -9,7 +9,8 @@
 //! (t12 のものをベースにした)。
 //!
 //! テスト構成:
-//! 1. `require_editor`ゲート(rest.rs 全13箇所)- viewer は全対象で 403
+//! 1. `require_editor`ゲート(rest.rs 全14箇所 - #342 段階Aで
+//!    `POST /api/tags/expression/check` が加わった)- viewer は全対象で 403
 //! 2. editor は`require_editor`ゲートを通って実際に書ける(admin も同様)
 //! 3. admin 限定ルート(`RoleGuard{min: Role::Admin}`)- editor/viewer は
 //!    403、admin は実際にそのルートへ到達し認可を通過して2xxを返す
@@ -285,7 +286,8 @@ fn valid_tag_payload(name: &str, group_id: i64) -> Value {
 
 // ---------------------------------------------------------------------------
 // T1: `require_editor`ゲート - viewer は全対象で 403(rest.rs の
-// `require_editor`呼び出し全13箇所、method+path)
+// `require_editor`呼び出し全14箇所、method+path。#342 段階Aで
+// `POST /api/tags/expression/check` が13→14箇所目として加わった)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -331,6 +333,14 @@ async fn viewer_is_forbidden_by_require_editor_on_every_gated_write_endpoint() {
         ("POST", "/api/tags/batch", json!({ "tags": [] })),
         ("POST", "/api/tags/batch-update", json!({ "tags": [] })),
         ("POST", "/api/tags/batch-delete", json!({ "ids": [] })),
+        // #342 段階A: 保存はしないが`require_editor`ゲート自体は他の
+        // `/api/tags/*`書き込み系と揃えている(実装指示「認可は同ルーターの
+        // 他の書き込み系と揃えて require_editor」)。
+        (
+            "POST",
+            "/api/tags/expression/check",
+            json!({ "expression": "1" }),
+        ),
     ];
 
     for (method, path, payload) in cases {

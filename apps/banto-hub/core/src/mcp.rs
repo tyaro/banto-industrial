@@ -942,6 +942,27 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // #342 段階A（オーナー決定 2026-09-15）: MCP 管理面にも REST
+        // `POST /api/tags/expression/check` と同じ検証を追加する。保存は
+        // しない - 演算タグを作る前にこれで式を確かめられる。ロジックは
+        // `crate::rest::evaluate_expression_check` を呼ぶだけで REST と
+        // 共有する（二重実装しない）。
+        json!({
+            "name": "check_expression",
+            "description": "演算タグの式を保存せず検証する(admin スコープ必須)。構文・型検査、参照タグの存在確認と型解決、循環参照判定(externalName 指定時)、現在値による試算を行い常に成功で返す(式が不正でも ok:false でエラー内容を返すだけで、ツール呼び出し自体は失敗にしない)。create_tag/update_tag で expression 付きの演算タグを作る前にこれで確かめられる。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "expression": { "type": "string", "description": "検証する式のソース。" },
+                    "externalName": {
+                        "type": ["string", "null"],
+                        "description": "この式を保存する予定のタグの完全名(省略可)。循環参照の判定にのみ使う - 既存の演算タグの依存グラフの中で、このノードだけ今回の式の参照先に置き換えて検査する。",
+                    },
+                },
+                "required": ["expression"],
+                "additionalProperties": false,
+            },
+        }),
         json!({
             "name": "delete_tag",
             "description": "タグを削除する(admin スコープ必須)。タグは末端リソースのため配下は無い(cascade ではない)が、収集済み履歴データは残る。不可逆操作のため confirm:true が必須。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
@@ -1328,6 +1349,7 @@ async fn handle_tools_call(
         "get_tag" => tool_get_tag(state, ctx, arguments).await?,
         "create_tag" => tool_create_tag(state, ctx, arguments).await?,
         "update_tag" => tool_update_tag(state, ctx, arguments).await?,
+        "check_expression" => tool_check_expression(state, ctx, arguments)?,
         "delete_tag" => tool_delete_tag(state, ctx, arguments).await?,
         "set_collection" => tool_set_collection(state, ctx, arguments).await?,
         "set_write_control" => tool_set_write_control(state, ctx, arguments).await?,
@@ -3029,6 +3051,43 @@ async fn tool_update_tag(
         )));
     }
     Ok(tool_ok(json!({ "updated": updated })))
+}
+
+// --- 18b. check_expression（#342 段階A、2026-09-15 オーナー決定） --------
+//
+// 保存を伴わない検証専用ツール - `create_tag`/`update_tag` と違い
+// pending queue にも catalog commit にも触れない。REST
+// `POST /api/tags/expression/check`（`crate::rest::tags_expression_check`）
+// と検証ロジックを共有する: どちらも純粋関数
+// `crate::rest::evaluate_expression_check` を呼ぶだけで、式のコンパイル・
+// 参照タグ解決・循環判定・プレビュー試算はそこ1箇所にしかない
+// （実装指示「検証ロジックは REST と共有する」）。
+
+/// `crate::rest::evaluate_expression_check` を呼ぶだけの薄いラッパー。
+/// 常に成功で返す（式が不正でも `ok: false` の payload を返すだけ - REST
+/// 版と同じ「プレビュー用 API はエラーにしない」方針、`ExpressionCheckResponse`
+/// の doc comment参照）。DB I/O も await も無いため非同期にしていない
+/// （`crate::rest::evaluate_expression_check` 自身の doc comment と同じ判断）。
+fn tool_check_expression(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let expression = arguments
+        .get("expression")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::invalid_params("arguments.expression (string) is required"))?;
+    let external_name = arguments.get("externalName").and_then(Value::as_str);
+
+    let response =
+        crate::rest::evaluate_expression_check(&state.manager, expression, external_name);
+    let payload = serde_json::to_value(&response)
+        .expect("ExpressionCheckResponse only carries JSON-safe fields (String/f64/bool/Option)");
+    Ok(tool_ok(payload))
 }
 
 // --- 19. delete_tag ----------------------------------------------------
