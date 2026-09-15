@@ -1,7 +1,7 @@
 <script lang="ts">
 	// relay-wright の同名コンポーネントから無改変で複製。
 	import { page } from '$app/state';
-	import { navItems } from '$lib/navigation';
+	import { navItems, type NavItem } from '$lib/navigation';
 	import { settings } from '$lib/settings.svelte';
 	import { mobileNavStore } from '$lib/mobileNav.svelte';
 	import { sessionStore } from '$lib/session.svelte';
@@ -10,8 +10,12 @@
 
 	let { pendingCount = 0 }: { pendingCount?: number } = $props();
 
-	function isActive(path: string): boolean {
-		return page.url.pathname === path || page.url.pathname.startsWith(path + '/');
+	// #359 段階2: `item.activeMatch`（無ければ `item.path`）を基準に前方一致
+	// 判定する - `navigation.ts` の doc comment参照（`設定` は遷移先が
+	// `/settings/appearance` でも `/settings` 配下ならハイライトさせたい）。
+	function isActive(item: NavItem): boolean {
+		const match = item.activeMatch ?? item.path;
+		return page.url.pathname === match || page.url.pathname.startsWith(match + '/');
 	}
 
 	// RBAC: admin-only 項目は表示自体を隠す（無効化して見せない）。
@@ -42,7 +46,7 @@
 		{#each visibleItems as item (item.path)}
 			<a
 				href={item.path}
-				class:active={isActive(item.path)}
+				class:active={isActive(item)}
 				title={collapsed ? item.label : undefined}
 				onclick={handleNavClick}
 			>

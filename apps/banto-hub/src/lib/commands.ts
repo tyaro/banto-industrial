@@ -118,7 +118,8 @@ function configCommands(): PaletteCommand[] {
 			keywords: ['import', 'インポート', '復元', '読み込み', 'リストア'],
 			visible: () => isAdmin(sessionStore.role),
 			run: () => {
-				void goto('/settings#config-package');
+				// #359 段階2: 構成パッケージのセクションは data カテゴリへ移設。
+				void goto('/settings/data#config-package');
 			}
 		}
 	];
