@@ -203,7 +203,11 @@ test.describe.serial('banto-hub postgres（DB Source）グループ作成・db �
 		await groupNode.click({ button: 'right' });
 		await adminPage.getByRole('menuitem', { name: /配下にタグを作成/, exact: false }).click();
 
-		const drawer = adminPage.getByRole('dialog', { name: '新規作成', exact: true });
+		// #342 段階C: タグの新規作成フォームも広幅では非モーダルの右ペイン
+		// （`<aside aria-label>` = role `complementary`）へ移ったため
+		// `role="dialog"` では取れない（上のグループ作成ウィザードは
+		// `CollectionGroupDrawer` = 従来どおり `dialog` のまま）。
+		const drawer = adminPage.getByRole('complementary', { name: '新規作成', exact: true });
 		await expect(drawer).toBeVisible();
 
 		// S3（実装指示4）: タグ種別は `<select>` ではなく読み取り専用バッジ。

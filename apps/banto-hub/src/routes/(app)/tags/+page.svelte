@@ -181,6 +181,7 @@
 		ExpressionCheckController,
 		type ExpressionCheckResult
 	} from '$lib/banto/expressionCheck';
+	import { blockedInsertTargets, type InsertCandidateTag } from '$lib/banto/expressionInsert';
 
 	const dataTypeOptions: { value: TagDataType; label: string }[] = [
 		{ value: 'bit', label: 'bit（真偽値1点）' },
@@ -278,6 +279,23 @@
 		onInput: () => void;
 		onCompositionStart: () => void;
 		onCompositionEnd: () => void;
+		/**
+		 * #342 段階C: 式欄の `<textarea>` への参照受け口（`bind:this` の
+		 * 関数形 setter）。キャレット位置への挿入（`setRangeText`）に実要素が
+		 * 要るため、`preview`/`onInput` と同じくこの間接層を経由して
+		 * create/edit のどちらの式欄かを snippet から隠す。
+		 */
+		bindTextarea: (el: HTMLTextAreaElement | null) => void;
+		/**
+		 * #342 段階C: 「一覧から挿入」トグルを出すか。広幅でフォームが
+		 * 右ペインに出ているときだけ `true`（狭幅の `<Modal>`/`<Drawer>` では
+		 * オーバーレイの下のグリッドを触れないので、トグル自体を出さない）。
+		 */
+		insertToggleVisible: boolean;
+		/** #342 段階C: トグルの ON/OFF（`aria-pressed`）。 */
+		insertArmed: boolean;
+		/** #342 段階C: トグルのクリック。 */
+		onToggleInsert: () => void;
 	}
 
 	function blankForm(): FormState {
@@ -746,7 +764,14 @@
 				createExprController.onCompositionEnd(
 					createForm.expression,
 					expressionCheckExternalName(createForm)
-				)
+				),
+			// #342 段階C（下の「一覧から挿入」節）。create/edit で同じ受け口を
+			// 共有できるのは `drawerMode` が常に高々1つで、式欄の `<textarea>`
+			// も同時に1つしかマウントされないため。
+			bindTextarea: (el) => (exprTextareaEl = el),
+			insertToggleVisible: insertToggleAvailable,
+			insertArmed,
+			onToggleInsert: toggleInsertArmed
 		};
 	}
 
@@ -1058,7 +1083,12 @@
 				editExprController.onCompositionEnd(
 					editForm.expression,
 					expressionCheckExternalName(editForm)
-				)
+				),
+			// #342 段階C: `createExprFieldHandlers` と同じ受け口（そちらのコメント参照）。
+			bindTextarea: (el) => (exprTextareaEl = el),
+			insertToggleVisible: insertToggleAvailable,
+			insertArmed,
+			onToggleInsert: toggleInsertArmed
 		};
 	}
 
@@ -1244,6 +1274,9 @@
 		// S3: 編集対象が変わるたびに「列を取得」の結果もリセットする -
 		// 前に開いていたタグと収集グループが違えば候補列も違うため。
 		editDescribeState = blankDescribeState();
+		// #342 段階C: 編集対象が変わったら「一覧から挿入」は解除する
+		// （自タグ・循環の判定基準が変わるため、暗黙に持ち越さない）。
+		insertArmed = false;
 		drawerMode = 'edit'; // T13-1: 行クリック編集はドロワーで開く
 	}
 
@@ -1274,9 +1307,21 @@
 		selectedIds = next;
 	}
 
-	/** T18-3b: 選択中の行を BantoGrid の `rowClass` 経由で強調表示する（M14/T9-2 と同じ仕組み、下の CSS 参照）。 */
+	/**
+	 * T18-3b: 選択中の行を BantoGrid の `rowClass` 経由で強調表示する（M14/T9-2
+	 * と同じ仕組み、下の CSS 参照）。
+	 *
+	 * #342 段階C: 「一覧から挿入」が ON の間は、挿入できない行
+	 * （自タグ・文字列型・循環になる参照）も淡色にする。色だけに頼らず、
+	 * クリックすれば理由のトーストも出る（`insertTagRefIntoExpression`）。
+	 * BantoGrid は `class="row {rowClass?.(row) ?? ''}"` と展開するので
+	 * 空白区切りで複数クラスを返してよい。
+	 */
 	function tagRowClass(t: Tag): string | undefined {
-		return selectedIds.has(t.id) ? 'tag-row-selected' : undefined;
+		const classes: string[] = [];
+		if (selectedIds.has(t.id)) classes.push('tag-row-selected');
+		if (insertArmed && insertBlockedReasons.has(t.id)) classes.push('tag-row-insert-blocked');
+		return classes.length > 0 ? classes.join(' ') : undefined;
 	}
 
 	// --- T18-3e: BantoGrid セル編集/TSV貼付 (docs/banto-hub-t18-design.md
@@ -1742,10 +1787,144 @@
 	 * （`NARROW_BREAKPOINT_QUERY = '(max-width: 900px)'`、T19 S3-a / UX-43、
 	 * `e2e/tests-banto-hub/banto-hub-viewport-offcanvas.spec.ts` が固定して
 	 * いる 400px ビューポートもこれに含まれる）をそのまま使う。
+	 *
+	 * #342 段階C 追補（2026-09-15 オーナー決定）: **新規作成（`create`）も
+	 * 同じ型で右ペインへ移す** - 新しい演算タグの式を書く一番多い場面が
+	 * 新規作成であり、「一覧から挿入」（下の節）はフォームが非モーダルで
+	 * 出ていて初めて成立するため。狭幅のフォールバック先だけは `create`
+	 * だけ従来どおり中央モーダル（`<Modal>`、T19 S1-b/UX-31 の判断）で、
+	 * `edit`/`continuous` の `<Drawer>` とは分ける（`createInModal`）。
 	 */
-	const paneCapableMode = $derived(drawerMode === 'edit' || drawerMode === 'continuous');
+	const paneCapableMode = $derived(
+		drawerMode === 'create' || drawerMode === 'edit' || drawerMode === 'continuous'
+	);
 	const editPaneOpen = $derived(paneCapableMode && !mobileNavStore.isNarrow);
-	const editInDrawer = $derived(paneCapableMode && mobileNavStore.isNarrow);
+	/** 狭幅フォールバック（`edit`/`continuous` のみ - `create` は `createInModal`）。 */
+	const editInDrawer = $derived(
+		paneCapableMode && drawerMode !== 'create' && mobileNavStore.isNarrow
+	);
+	/** 狭幅フォールバック（`create` のみ - 従来どおり中央モーダル）。 */
+	const createInModal = $derived(drawerMode === 'create' && mobileNavStore.isNarrow);
+
+	// --- #342 段階C: 一覧から式欄への click-to-insert ------------------------
+	//
+	// issue #342 C の原案は「`ConnectionTree` でタグをクリックして挿入」
+	// だったが、`ConnectionTree` は接続→収集グループの2階層でタグを出さない
+	// 設計（T18-6c、`ConnectionTree.svelte` 冒頭 doc）であり、#375 で編集
+	// フォームが非モーダルになってグリッドをそのまま触れるようになった。
+	// そこで**ツリーの3階層化はせず、中央グリッドの行クリックで完全名を
+	// 挿入する**（2026-09-15 オーナー決定、docs/tag-server-design.md §4.2）。
+
+	/**
+	 * 式欄（`#tag-expression`）の `<textarea>` 実体。キャレット位置への挿入
+	 * （`setRangeText`）に要る。`tagFields` snippet から
+	 * `ExpressionCheckFieldHandlers.bindTextarea` 経由で入る。
+	 */
+	let exprTextareaEl: HTMLTextAreaElement | null = $state(null);
+
+	/** 「一覧から挿入」トグルの ON/OFF。ON の間だけ行クリックの意味が変わる。 */
+	let insertArmed = $state(false);
+
+	/**
+	 * トグルを出してよいか＝「式欄が非モーダルのペインに出ている」かどうか。
+	 * 狭幅（`<Modal>`/`<Drawer>`）ではオーバーレイの下のグリッドを触れない
+	 * ので出さない。`tagKind` が `computed` でなければ式欄自体が無い。
+	 */
+	const insertToggleAvailable = $derived(
+		canWrite &&
+			editPaneOpen &&
+			((drawerMode === 'create' && createForm.tagKind === 'computed') ||
+				(drawerMode === 'edit' && selected !== null && editForm.tagKind === 'computed'))
+	);
+
+	function toggleInsertArmed(): void {
+		insertArmed = !insertArmed;
+	}
+
+	/**
+	 * トグルが自動で OFF になる条件のうち「ペインを閉じた」「`tagKind` が
+	 * `computed` 以外に変わった」「別モードの Drawer を開いた」「狭幅へ
+	 * リサイズした」をまとめて拾う（「編集対象が変わった」は `selectTag`、
+	 * 「Esc」は下の keydown で個別に落とす）。
+	 */
+	$effect(() => {
+		if (!insertToggleAvailable) insertArmed = false;
+	});
+
+	/**
+	 * Esc でトグルを解除する（**ペインは閉じない** - #375 で「ペインは Esc を
+	 * 受けない」と決めた枠に収まる、ペイン内で開いた状態を1つ閉じるだけの
+	 * 扱い）。ON の間だけリスナーを張る。
+	 */
+	$effect(() => {
+		if (!insertArmed) return;
+		const onKeydown = (e: KeyboardEvent): void => {
+			if (e.key === 'Escape') insertArmed = false;
+		};
+		window.addEventListener('keydown', onKeydown);
+		return () => window.removeEventListener('keydown', onKeydown);
+	});
+
+	/**
+	 * 挿入先が自タグになるのは編集のときだけ（新規作成のタグはまだ
+	 * 存在しないので自タグ・循環の判定対象が無い）。
+	 *
+	 * `$derived(...)` ではなく `$derived.by(() => ...)` なのは、素の式だと
+	 * TS の制御フロー解析が `selected` を宣言時の初期値（`null`）へ絞り込んで
+	 * しまい `selected?.id` が `never` になるため（`drawerTitle` の
+	 * `$derived.by` と同じ回避）。
+	 */
+	const insertSelfId = $derived.by((): number | null =>
+		drawerMode === 'edit' ? (selected?.id ?? null) : null
+	);
+
+	/**
+	 * 挿入をブロックする行（`id -> 理由`）。判定は純関数
+	 * `blockedInsertTargets`（`$lib/banto/expressionInsert.ts`、**正は段階A
+	 * のサーバチェック**）。トグルが OFF の間は空 Map にして、一覧全件ぶんの
+	 * 依存グラフ構築を走らせない。
+	 */
+	const insertBlockedReasons = $derived.by((): Map<number, string> => {
+		if (!insertArmed) return new Map();
+		const candidates: InsertCandidateTag[] = visibleTags.map((t) => ({
+			id: t.id,
+			dataType: t.dataType,
+			tagKind: t.tagKind,
+			expression: t.expression,
+			externalName: externalNameForTag(t)
+		}));
+		return blockedInsertTargets(candidates, insertSelfId);
+	});
+
+	/**
+	 * トグル ON 中の行クリック。**編集対象は切り替えない**（`selectTag` を
+	 * 呼ばない＝未保存確認も出ない）。
+	 *
+	 * 挿入は `setRangeText` + `input` イベントの再送で行う - `bind:value` の
+	 * 値を直接書き換えるだけだとキャレットが末尾へ飛び、段階Aの
+	 * `ExpressionCheckController`（`oninput` 駆動の debounce チェック）も
+	 * 走らない。前後の空白補完はしない（演算子はユーザーが打つ）。
+	 */
+	function insertTagRefIntoExpression(t: Tag): void {
+		const reason = insertBlockedReasons.get(t.id);
+		if (reason !== undefined) {
+			toastStore.push('info', reason);
+			return;
+		}
+		const el = exprTextareaEl;
+		if (!el) return;
+		const name = externalNameForTag(t);
+		// 行クリックでフォーカスはグリッドへ移っているが、`selectionStart`/
+		// `selectionEnd` は textarea 側に保持されたままなので、そこへ挿入して
+		// からフォーカスを式欄へ戻す（受け入れ条件「キャレット位置に挿入・
+		// フォーカスは式欄に残る」）。
+		const start = el.selectionStart ?? el.value.length;
+		const end = el.selectionEnd ?? start;
+		el.setRangeText(name, start, end, 'end');
+		// `bind:value` の更新と `oninput`（段階Aのチェック）の両方を発火させる。
+		el.dispatchEvent(new Event('input', { bubbles: true }));
+		el.focus();
+	}
 
 	/**
 	 * #375: 編集ペインのヘッダー「閉じる」ボタン。現行 Drawer の `×` と同じ
@@ -1967,6 +2146,9 @@
 
 	function closeDrawer(): void {
 		drawerMode = null;
+		// #342 段階C: ペインを閉じたら「一覧から挿入」も解除する（`$effect` でも
+		// 落ちるが、ここで明示しておく - 閉じる経路はこの1本に集約されている）。
+		insertArmed = false;
 		// T18-1（TAG-UX-C 4点目、差分表示 UI）: Drawer を閉じたら競合パネルの
 		// 状態も破棄する（`confirmDiscardIfNeeded` 経由の破棄確認は
 		// `onRequestClose` が既に済ませている — ここは後始末のみ）。
@@ -3908,6 +4090,7 @@
 					<textarea
 						id="tag-expression"
 						bind:value={form.expression}
+						bind:this={() => exprTextareaEl, exprCheck.bindTextarea}
 						rows="2"
 						required
 						placeholder="(line1.fast.a + line1.fast.b) / 2"
@@ -3920,6 +4103,32 @@
 						oncompositionstart={exprCheck.onCompositionStart}
 						oncompositionend={exprCheck.onCompositionEnd}></textarea>
 				</div>
+				{#if exprCheck.insertToggleVisible}
+					<!--
+						#342 段階C: 「一覧から挿入」トグル。ON の間だけ中央グリッドの
+						行クリックが「完全名をキャレット位置へ挿入」になる
+						（`insertTagRefIntoExpression`）- 編集対象は切り替わらない。
+						**フォームが非モーダルのペインに出ているときしか出さない**
+						（`insertToggleAvailable`）: 狭幅の `<Modal>`/`<Drawer>` では
+						オーバーレイの下のグリッドを触れないため。
+					-->
+					<div class="expr-insert-row">
+						<button
+							type="button"
+							class="secondary expr-insert-toggle"
+							data-testid="tag-expression-insert-toggle"
+							aria-pressed={exprCheck.insertArmed}
+							onclick={exprCheck.onToggleInsert}
+						>
+							一覧から挿入
+						</button>
+						<span class="hint">
+							{exprCheck.insertArmed
+								? '一覧の行をクリックすると、この欄のキャレット位置に完全名が入ります（Esc で解除）。'
+								: 'ON にすると、一覧の行クリックでタグの完全名をこの欄へ挿入できます。'}
+						</span>
+					</div>
+				{/if}
 				<span class="hint" id="tag-expression-hint"
 					>四則・比較・論理・if(c,a,b)・min/max/abs/round/clamp/bit(tag,n)。参照する外部名は他タグ
 					（plc/computed/internal）の完全名。保存前に自動でチェックされます。</span
@@ -5375,6 +5584,17 @@
 						<p class="note">
 							{#if !canWrite}
 								閲覧のみ（編集には編集者以上の権限が必要です）。
+							{:else if insertArmed}
+								<!--
+									#342 段階C: 「一覧から挿入」が ON の間だけ出す状態表示
+									（トグルはペイン側にあるため、グリッド側にも1つだけ
+									意味が変わっていることを出す）。
+								-->
+								<span class="insert-armed-badge" data-testid="tag-insert-armed-badge">
+									一覧から挿入:
+									行をクリックすると式欄のキャレット位置にそのタグの完全名が入ります（Esc
+									で解除。淡色の行は自タグ・文字列型・循環になる参照で挿入できません）。
+								</span>
 							{:else if gridEditMode}
 								セルをダブルクリックまたは選択して直接編集できます（Excel等からの貼り付けにも対応）。行を開くにはダブルクリックしてください。「保存」を押すまで反映されません。
 							{:else if selectionMode}
@@ -5486,9 +5706,11 @@
 											{columns}
 											getRowId={(t) => t.id}
 											onRowClick={canWrite
-												? selectionMode
-													? toggleSelectRow
-													: selectTag
+												? insertArmed
+													? insertTagRefIntoExpression
+													: selectionMode
+														? toggleSelectRow
+														: selectTag
 												: undefined}
 											rowClass={tagRowClass}
 											onCellEdit={canWrite && gridEditMode ? handleGridCellEdit : undefined}
@@ -5527,6 +5749,9 @@
 							<div class="edit-pane-body">
 								{#if drawerMode === 'edit' && selected && canWrite}
 									{@render editFormBody()}
+								{:else if drawerMode === 'create' && canWrite}
+									<!-- #342 段階C: 新規作成も広幅では同じペインへ（下の `<Modal>` は狭幅専用）。 -->
+									{@render createFormBody()}
 								{:else if drawerMode === 'continuous' && canWrite}
 									{@render continuousFormBody()}
 								{/if}
@@ -5589,41 +5814,29 @@
 />
 
 <!--
-	T19 S1-b（UX-31、docs/banto-hub-t19-design.md §3.2「作成は前後関係を
-	必要としない一方向の作業なので中央モーダルで集中させる」）: タグの
-	新規登録（`drawerMode === 'create'` - 複製もここに含む、上の
-	`openDuplicateDrawer` コメント参照）だけを中央モーダル（`Modal.svelte`）
-	へ切り出す。編集・連続登録・CSVインポートは引き続き右ペイン
-	（`Drawer.svelte`）のまま - 一覧を見ながら直す/取り込む作業のため
-	（同designの§3.2）。`onclose`/`onRequestClose` は既存の
-	`closeDrawer`/`confirmDiscardIfNeeded` をそのまま共有する（破棄確認・
-	busy 中クローズ抑止のロジックは変えない）。
+	#342 段階C（2026-09-15 オーナー決定）: 新規登録（`drawerMode === 'create'`
+	- 複製もここに含む、上の `openDuplicateDrawer` コメント参照）のフォーム
+	本体。広幅では #375 と同じ型で非モーダルの右ペイン（`.edit-pane`）へ、
+	狭幅では従来どおり中央モーダル（下の `<Modal>`）から呼ぶため snippet に
+	切り出した。**中身は移動しただけで無変更** - 「登録して次へ」/「登録して
+	閉じる」の挙動・複製元差分パネル・preflight 表示は一切変えていない。
 -->
-<Modal
-	open={drawerMode === 'create'}
-	title={drawerTitle}
-	width="560px"
-	onclose={closeDrawer}
-	onRequestClose={confirmDiscardIfNeeded}
-	dirty={drawerMode === 'create' && isDrawerDirty()}
-	onBlockedClose={notifyBlockedClose}
->
-	{#if drawerMode === 'create' && canWrite}
-		<form
-			class="drawer-section"
-			onsubmit={(e) => {
-				e.preventDefault();
-				// T18-2c: どちらのボタンが送信を起こしたかは
-				// `SubmitEvent.submitter` から判定する - `undefined`/`null`
-				// （submitter を返さない実装での Enter 実装送信等）の場合は
-				// DOM 上で先に置いた「登録して次へ」（closeAfterSave=false）を
-				// 既定にする。`handleCreate` 側のコメントも参照。
-				const submitter = (e as SubmitEvent).submitter;
-				void handleCreate(submitter?.id === 'create-register-close');
-			}}
-		>
-			{#if duplicateSource}
-				<!--
+{#snippet createFormBody()}
+	<form
+		class="drawer-section"
+		onsubmit={(e) => {
+			e.preventDefault();
+			// T18-2c: どちらのボタンが送信を起こしたかは
+			// `SubmitEvent.submitter` から判定する - `undefined`/`null`
+			// （submitter を返さない実装での Enter 実装送信等）の場合は
+			// DOM 上で先に置いた「登録して次へ」（closeAfterSave=false）を
+			// 既定にする。`handleCreate` 側のコメントも参照。
+			const submitter = (e as SubmitEvent).submitter;
+			void handleCreate(submitter?.id === 'create-register-close');
+		}}
+	>
+		{#if duplicateSource}
+			<!--
 					T18-3a（docs/banto-hub-t18-design.md「T18-3a タグ複製」、
 					TAG-UX-D 前半「保存前に複製元との差分と外部名を確認できる」）:
 					複製元タグと複製後フォームのフィールド単位差分。既存の
@@ -5632,105 +5845,134 @@
 					流用し、新規 CSS は追加しない - 列見出しだけ「あなたの入力/
 					サーバー最新」ではなく「複製元/複製後」に読み替える。
 				-->
-				<div class="conflict-panel">
-					<h4 class="conflict-title">複製元との差分</h4>
-					<p class="note">複製元: {externalNameForTag(duplicateSource)}</p>
-					{#if duplicateDiff && duplicateDiff.length === 0}
-						<p class="note">複製元と同じ内容です（名前・アドレスも含め差分はまだありません）。</p>
-					{:else if duplicateDiff}
-						<table class="preview-table">
-							<thead>
+			<div class="conflict-panel">
+				<h4 class="conflict-title">複製元との差分</h4>
+				<p class="note">複製元: {externalNameForTag(duplicateSource)}</p>
+				{#if duplicateDiff && duplicateDiff.length === 0}
+					<p class="note">複製元と同じ内容です（名前・アドレスも含め差分はまだありません）。</p>
+				{:else if duplicateDiff}
+					<table class="preview-table">
+						<thead>
+							<tr>
+								<th>項目</th>
+								<th>複製元</th>
+								<th>複製後</th>
+							</tr>
+						</thead>
+						<tbody>
+							{#each duplicateDiff as f (f.key)}
 								<tr>
-									<th>項目</th>
-									<th>複製元</th>
-									<th>複製後</th>
+									<td>{f.label}</td>
+									<td>{f.local}</td>
+									<td>{f.server}</td>
 								</tr>
-							</thead>
-							<tbody>
-								{#each duplicateDiff as f (f.key)}
-									<tr>
-										<td>{f.label}</td>
-										<td>{f.local}</td>
-										<td>{f.server}</td>
-									</tr>
-								{/each}
-							</tbody>
-						</table>
-					{/if}
-				</div>
-			{/if}
-			{@render tagFields(
-				createForm,
-				createErrors,
-				createDetailOpen,
-				createAddressPreflight,
-				() => {
-					// 2026-09-01 オーナー要望: アドレス欄の入力に追従して名前欄を
-					// プリフィルする（`createNameTouched` が false の間だけ、
-					// `$lib/banto/tagNamePrefill.ts` 参照）。`scheduleAddressPreflight`
-					// より先に行うことで、プリフィルで名前欄が埋まった直後の
-					// 入力から preflight の実行条件（`form.name.trim() !== ''`、
-					// 下の `scheduleAddressPreflight` 定義参照）を満たせるように
-					// する。
-					const nextName = nextTagNameOnAddressChange(
-						createForm.tagKind === 'plc',
-						createForm.address,
-						createNameTouched
-					);
-					if (nextName !== null) createForm.name = nextName;
-					scheduleAddressPreflight(createForm, 'create');
-				},
-				() => {
-					// 名前欄をユーザーが直接編集した合図 - 以後はアドレス入力に
-					// 追従させない（`createNameTouched` 宣言のコメント参照）。
-					createNameTouched = true;
-				},
-				() => {
-					// T19 S1-b（UX-34）: `writable` チェックボックスをユーザーが
-					// 直接クリックした合図 - 以後は自動計算しない
-					// （`createWritableTouched` 宣言のコメント参照）。
-					createWritableTouched = true;
-				},
-				// T19 S1-c（UX-33）: `createGroupLocked` 宣言のコメント参照。
-				createGroupLocked,
-				createDescribeState,
-				() => void runDescribeGroup(createForm.collectionGroupId, 'create'),
-				createExprFieldHandlers()
-			)}
-			<div class="actions">
-				<!--
+							{/each}
+						</tbody>
+					</table>
+				{/if}
+			</div>
+		{/if}
+		{@render tagFields(
+			createForm,
+			createErrors,
+			createDetailOpen,
+			createAddressPreflight,
+			() => {
+				// 2026-09-01 オーナー要望: アドレス欄の入力に追従して名前欄を
+				// プリフィルする（`createNameTouched` が false の間だけ、
+				// `$lib/banto/tagNamePrefill.ts` 参照）。`scheduleAddressPreflight`
+				// より先に行うことで、プリフィルで名前欄が埋まった直後の
+				// 入力から preflight の実行条件（`form.name.trim() !== ''`、
+				// 下の `scheduleAddressPreflight` 定義参照）を満たせるように
+				// する。
+				const nextName = nextTagNameOnAddressChange(
+					createForm.tagKind === 'plc',
+					createForm.address,
+					createNameTouched
+				);
+				if (nextName !== null) createForm.name = nextName;
+				scheduleAddressPreflight(createForm, 'create');
+			},
+			() => {
+				// 名前欄をユーザーが直接編集した合図 - 以後はアドレス入力に
+				// 追従させない（`createNameTouched` 宣言のコメント参照）。
+				createNameTouched = true;
+			},
+			() => {
+				// T19 S1-b（UX-34）: `writable` チェックボックスをユーザーが
+				// 直接クリックした合図 - 以後は自動計算しない
+				// （`createWritableTouched` 宣言のコメント参照）。
+				createWritableTouched = true;
+			},
+			// T19 S1-c（UX-33）: `createGroupLocked` 宣言のコメント参照。
+			createGroupLocked,
+			createDescribeState,
+			() => void runDescribeGroup(createForm.collectionGroupId, 'create'),
+			createExprFieldHandlers()
+		)}
+		<div class="actions">
+			<!--
 					T18-2c（TAG-UX-2「作成後は『登録して次へ』と『登録して閉じる』を
 					分け…」）: 「登録して次へ」を先に置き、Enter 押下時の既定
 					送信ボタンにする（`handleCreate` のコメント参照）。
 				-->
-				<button
-					type="submit"
-					id="create-register-next"
-					disabled={isDrawerBusy() || groups.length === 0}
-				>
-					登録して次へ
-				</button>
-				<button
-					type="submit"
-					id="create-register-close"
-					class="secondary"
-					disabled={isDrawerBusy() || groups.length === 0}
-				>
-					登録して閉じる
-				</button>
-			</div>
-			{#if groups.length === 0}
-				<p class="note">
-					先に 収集グループ を1件以上登録してください。
-					<!-- T19 S1-d（UX-30、2026-09-03）: 上の empty-state と同じ理由で
+			<button
+				type="submit"
+				id="create-register-next"
+				disabled={isDrawerBusy() || groups.length === 0}
+			>
+				登録して次へ
+			</button>
+			<button
+				type="submit"
+				id="create-register-close"
+				class="secondary"
+				disabled={isDrawerBusy() || groups.length === 0}
+			>
+				登録して閉じる
+			</button>
+		</div>
+		{#if groups.length === 0}
+			<p class="note">
+				先に 収集グループ を1件以上登録してください。
+				<!-- T19 S1-d（UX-30、2026-09-03）: 上の empty-state と同じ理由で
 					     `/collection-groups` への遷移をその場で Drawer を開くボタンへ
 					     差し替えた。 -->
-					<button type="button" class="onboarding-cta" onclick={() => openGroupCreateDrawer()}>
-						収集グループを作成
-					</button>
-				</p>
-			{/if}
-		</form>
+				<button type="button" class="onboarding-cta" onclick={() => openGroupCreateDrawer()}>
+					収集グループを作成
+				</button>
+			</p>
+		{/if}
+	</form>
+{/snippet}
+
+<!--
+	T19 S1-b（UX-31、docs/banto-hub-t19-design.md §3.2「作成は前後関係を
+	必要としない一方向の作業なので中央モーダルで集中させる」）: タグの
+	新規登録を中央モーダル（`Modal.svelte`）へ切り出した名残。
+
+	#342 段階C（2026-09-15 オーナー決定）で、広幅では新規登録も非モーダルの
+	右ペイン（上の `.edit-pane`）へ移した - 式を書きながら一覧の行をクリック
+	して完全名を挿入する、という段階Cの本題が非モーダルでしか成立しないため。
+	**この `<Modal>` は狭幅（`createInModal`）のフォールバック専用**になった:
+	400px 幅に固定 480px のペインを並べる余地が無いのは `edit`/`continuous`
+	の `<Drawer>` フォールバックと同じ理由で、その幅では UX-31 の「作成は
+	中央モーダル」という判断も引き続き有効。`onclose`/`onRequestClose` は
+	既存の `closeDrawer`/`confirmDiscardIfNeeded` をそのまま共有する
+	（破棄確認・busy 中クローズ抑止のロジックは変えない）。#376 の
+	`dirty`/`onBlockedClose` の誤爆ガードもそのまま効く。
+-->
+<Modal
+	open={createInModal}
+	title={drawerTitle}
+	width="560px"
+	onclose={closeDrawer}
+	onRequestClose={confirmDiscardIfNeeded}
+	dirty={drawerMode === 'create' && isDrawerDirty()}
+	onBlockedClose={notifyBlockedClose}
+>
+	{#if drawerMode === 'create' && canWrite}
+		{@render createFormBody()}
 	{/if}
 </Modal>
 
@@ -6629,6 +6871,32 @@
 		cursor: default;
 	}
 
+	/*
+	 * #342 段階C: 「一覧から挿入」トグル（式欄の直下）。ボタンと説明文を
+	 * 1行に並べるだけで、ON/OFF の見た目は `aria-pressed` に対する
+	 * `[aria-pressed='true']` で出す（新しい状態クラスを増やさない）。
+	 */
+	.expr-insert-row {
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+		flex-wrap: wrap;
+		margin-top: 0.35rem;
+	}
+
+	.expr-insert-toggle {
+		flex: none;
+		padding: 0.2rem 0.5rem;
+		font-size: 0.75rem;
+	}
+
+	.expr-insert-toggle[aria-pressed='true'] {
+		/* `.tag-row-selected` と同じ「primary の薄い塗り + primary の枠」で、
+		   文字色はテーマ既定のまま（`--banto-on-primary` は theme に無い）。 */
+		background: color-mix(in srgb, var(--banto-primary) 18%, transparent);
+		border-color: var(--banto-primary);
+	}
+
 	.expr-preview {
 		margin-top: 0.35rem;
 		padding: 0.5rem 0.6rem;
@@ -7002,5 +7270,21 @@
 	:global(.row.tag-row-selected) {
 		background: color-mix(in srgb, var(--banto-primary) 14%, transparent);
 		border-left: 3px solid var(--banto-primary);
+	}
+
+	/*
+	 * #342 段階C: 「一覧から挿入」が ON の間、挿入できない行（自タグ・
+	 * 文字列型・循環になる参照）を淡色にする。`.tag-row-selected` と同じ
+	 * rowClass 仕組み（`:global` が要る理由もそちらのコメント参照）。
+	 * 色だけに頼らず、クリックすれば理由のトーストも出る。
+	 */
+	:global(.row.tag-row-insert-blocked) {
+		opacity: 0.45;
+	}
+
+	/* #342 段階C: 「一覧から挿入」ON のときだけ出るグリッド側の状態表示。 */
+	.insert-armed-badge {
+		color: var(--banto-primary);
+		font-weight: 600;
 	}
 </style>

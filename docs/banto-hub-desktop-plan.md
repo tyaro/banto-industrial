@@ -148,7 +148,10 @@ T15 節。**2026-09-15**（#359 banto-hub 分）: 設定画面（`/settings`）�
 「連続登録」をモーダルの Drawer から**非モーダルの右ペイン**へ移した
 （編集中も左ツリーと中央グリッドを操作できる。狭幅 ≤900px は従来どおり
 オーバーレイ、構造体展開と CSV 取り込みはモーダルのまま）。詳細は §9.4
-TAG-UX-C の 2026-09-15 追補その2。
+TAG-UX-C の 2026-09-15 追補その2。**2026-09-15**（#342 段階C、
+v0.2.0-alpha.18）: タグの**新規作成フォームも非モーダルの右ペイン**へ移し、
+演算タグの式欄に「一覧から挿入」（グリッドの行クリックで完全名をキャレット
+位置へ挿入）を追加した。詳細は §9.4 TAG-UX-C の 2026-09-15 追補その3。
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [banto-hub-t16-design.md](banto-hub-t16-design.md)、
@@ -1324,6 +1327,34 @@ enqueue 後に対象行が別経路で変わっている真のコンフリクト
 >   Drawer** へ付け替えて #376 の回帰ガードを維持した。非モーダルであること
 >   自体（オーバーレイが無い／Esc で閉じない／狭幅フォールバック）は新規の
 >   `e2e/tests-banto-hub/banto-hub-tags-edit-pane.spec.ts` で固定した。
+
+> **2026-09-15 追補その3（#342 段階C、v0.2.0-alpha.18、
+> `feat/342-stage-c-click-insert`）: 新規作成フォームも非モーダルの右ペインへ
+> 移した（オーナー決定）。**
+>
+> - **理由**: 演算タグの式を書く場面が一番多いのは新規作成で、#342 段階Cの
+>   「一覧から挿入」（グリッドの行クリックで完全名を式欄へ入れる、
+>   [tag-server-design.md](tag-server-design.md) §4.2）は**フォームが
+>   非モーダルでなければ成立しない**。追補その2で `edit`/`continuous` だけを
+>   ペイン化した時点では `create` を中央モーダル（T19 S1-b / UX-31
+>   「作成は前後関係を必要としない一方向の作業なので中央モーダルで集中
+>   させる」）のまま残していたが、段階Cで前提が変わった。
+> - **範囲**: 広幅では `create` も `edit`/`continuous` と同じ
+>   `<aside class="edit-pane">` に出す（幅は現行どおり `drawerWidth` =
+>   480px）。フォーム本体は `createFormBody` snippet へ切り出しただけで、
+>   「登録して次へ」/「登録して閉じる」の挙動・複製元差分パネル・preflight
+>   表示は無変更。`struct`/`csv` は引き続きモーダル。
+> - **狭幅**: ≤900px では `create` だけ従来どおり**中央モーダル**
+>   （`Modal.svelte`、`createInModal`）へフォールバックする
+>   （`edit`/`continuous` の `<Drawer>` とは分ける） - その幅では UX-31 の
+>   判断が引き続き有効なため。#376 の `dirty`/`onBlockedClose` の誤爆ガードも
+>   そのまま効く。
+> - **E2E**: create フォームを `role="dialog"` で掴んでいた既存スペック
+>   （`banto-hub-tags-form` / `-onboarding-cta` / `-p0-2-preflight` /
+>   `-expression-check` / `-duplicate` / `-db-source-group-and-tag`）を
+>   追補その2と同じ作法で `role="complementary"` へ付け替えた。
+>   「一覧から挿入」そのものは新規の
+>   `e2e/tests-banto-hub/banto-hub-tags-expression-insert.spec.ts` で固定した。
 
 受け入れ条件:
 
