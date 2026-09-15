@@ -11,7 +11,7 @@ banto-hub の管理 UI「設定」画面を、上流テンプレート v1.6.0（
 - **管理 UI の設定画面をカテゴリ別ルートへ分割**。`/settings` は `/settings/{appearance,account,connectivity,data,security}` の実ルートに分かれ、`/settings` 自体と非可視カテゴリへの直接遷移は先頭の可視カテゴリへ 307 redirect する（**ブックマークは引き続き有効**）。カテゴリナビは 1024px 以上で左レール（sticky）、それ未満で横タブ。
 - カテゴリ割り当て: テーマ/プリセット→`appearance`、アカウント（パスワード変更）→`account`、MQTT 発行/QoS・gRPC→`connectivity`、データ保持・構成の保存/読み込み（バックアップ）→`data`、試運転モードのロックダウン→`security`。
 - コマンドパレット `config.import` の誘導先が `/settings#config-package` から **`/settings/data#config-package`** に変わった（`id="config-package"` の要素自体は無改変）。
-- 挙動・DOM・文言・API は変更していない（section 単位のコンポーネント分割 + ルート化のみ）。
+- 各設定セクションの markup・文言・API は変更していない（section 単位のコンポーネント分割のみ）。ページ全体で見るとカテゴリナビとルートのラッパー（`.settings-layout` 等）が新たに加わっている（PR #371 の Copilot レビュー指摘を受けて記述を訂正）。
 
 ## v0.2.0-alpha.13 — 2026-09-15（アルファ）
 

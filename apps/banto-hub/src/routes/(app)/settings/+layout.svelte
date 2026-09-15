@@ -14,8 +14,22 @@
 	 * 絞り込み済みなので、ナビには常にアクセス可能なカテゴリしか出ない
 	 * （段階1の `{#if}` ガードと同じ「見せない」方針を実ルートに適用した
 	 * もの）。
+	 *
+	 * PR #371 の Copilot レビュー是正: `hubStatusStore`（収集状態・MQTT
+	 * 接続状態の共有ストア）の5秒ポーリングをここへ引き上げる。段階1では
+	 * ConnectivitySection の admin 限定 `$effect` が担っていたが、
+	 * カテゴリを実ルートに分割した結果 `/settings/data` へ直接遷移すると
+	 * ConnectivitySection がマウントされずポーリングが始まらず、
+	 * `hubStatusStore.collectionState` が `null` のまま = DataSection の
+	 * 構成パッケージ import ガードが効かなくなっていた（詳細は
+	 * `hubStatusStore.svelte.ts` の doc comment、上流 PR #198 の Copilot
+	 * レビューにならった対処）。admin 限定という既存条件は
+	 * ConnectivitySection の元の `$effect` から変えずに移す。
 	 */
 	import { page } from '$app/state';
+	import { isAdmin } from '$lib/permissions';
+	import { sessionStore } from '$lib/session.svelte';
+	import { hubStatusStore } from './hubStatusStore.svelte';
 	import type { SettingsCategory } from './categories';
 	import type { LayoutProps } from './$types';
 	import './settings.css';
@@ -26,6 +40,26 @@
 	function isActive(category: SettingsCategory): boolean {
 		return page.url.pathname === category.path || page.url.pathname.startsWith(category.path + '/');
 	}
+
+	// hubStatusStore の5秒ポーリング（admin 限定 - 旧 ConnectivitySection の
+	// `$effect` と同じガード条件）。設定画面のどのカテゴリを開いていても
+	// （connectivity/data 以外でも）常にマウントされている +layout.svelte
+	// 側で行うことで、直接遷移でも `collectionState`/`mqttConnected` が
+	// 必ず埋まるようにする。
+	const canViewHubStatus = $derived(isAdmin(sessionStore.role));
+
+	$effect(() => {
+		if (!canViewHubStatus) return;
+		const refresh = () => {
+			void hubStatusStore.load().catch(() => {
+				// 状態表示・import ガードの補助情報 - 取得失敗はエラー表示せず黙って保持する
+				// （元 ConnectivitySection の `loadMqttStatus` と同じ方針）。
+			});
+		};
+		refresh();
+		const interval = setInterval(refresh, 5000);
+		return () => clearInterval(interval);
+	});
 </script>
 
 <div class="settings-layout">

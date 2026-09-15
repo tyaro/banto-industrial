@@ -17,12 +17,15 @@
  * サーバーでは常に可視**で、5カテゴリ全てが揃う - 実装当初「admin ログイン
  * では commissioningMode は false」と誤って想定していたが誤りだったため
  * 修正した。ロックダウン済みサーバー（`chromium-locked-down` プロジェクト、
- * port 8802）は `banto-hub-status-pending-apply-cancel.spec.ts` 専用に
- * `testMatch` で固定されており、他 spec と共有する設計ではないため、
- * 「非可視カテゴリへの直接 URL は先頭の可視カテゴリへ弾かれる」ケース
- * （`guardCategory`）はこの E2E からは検証していない（`categories.ts` の
- * `guardCategory` 自体は appearance/account 側の `+page.ts` が「常に可視でも
- * 呼ぶ」形で経路自体は毎回通っている）。
+ * port 8802）は当初 `banto-hub-status-pending-apply-cancel.spec.ts` 専用に
+ * `testMatch` で固定されていたため、「非可視カテゴリへの直接 URL は先頭の
+ * 可視カテゴリへ弾かれる」ケース（`guardCategory`）はこの spec（メイン
+ * サーバー）からは検証できなかった（`categories.ts` の `guardCategory`
+ * 自体は appearance/account 側の `+page.ts` が「常に可視でも呼ぶ」形で
+ * 経路自体は毎回通っている）。この回帰ケースは PR #371 の Copilot レビュー
+ * 是正で `banto-hub-settings-guard.spec.ts` を新設し、`chromium-locked-down`
+ * プロジェクトの `testMatch` にそちらも加える形で固定した（ロックダウン後は
+ * `commissioningMode` が false になり `security` が非可視になるため）。
  */
 import { expect, test, type Page } from '@playwright/test';
 import { ensureLoggedIn } from './banto-hub-auth';

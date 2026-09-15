@@ -1,8 +1,9 @@
 <script lang="ts">
 	/**
-	 * 接続カテゴリ（MQTT 発行・gRPC）（#359 段階1）。元 `+page.svelte` の
-	 * 「MQTT 発行」「gRPC」セクションから markup・state・関数を無改変で
-	 * 移した。いずれも admin 限定（T3/T4、設計 §5.3/§5.4）。
+	 * 接続カテゴリ（MQTT 発行・gRPC）（#359 段階1、PR #371 の Copilot
+	 * レビュー是正で段階2改修）。元 `+page.svelte` の「MQTT 発行」「gRPC」
+	 * セクションから markup・state・関数を無改変で移した。いずれも admin
+	 * 限定（T3/T4、設計 §5.3/§5.4）。
 	 *
 	 * MQTT/gRPC の設定値そのものは `mqttSettingsStore`/`grpcSettingsStore`
 	 * （2つ以上の section から参照される state）に出した - DataSection の
@@ -10,8 +11,16 @@
 	 * `mqttSettingsStore.load()`/`grpcSettingsStore.load()` を呼んで最新値を
 	 * 反映する（元 `+page.svelte` の `applyMqttSettings`/`applyGrpcSettings`
 	 * 直接呼び出しと同じ挙動）。フォーム送信中フラグ・エラー文言・
-	 * `password` 入力欄・接続状態表示はこの section にしか要らないので
-	 * ローカルのまま残す。
+	 * `password` 入力欄はこの section にしか要らないのでローカルのまま残す。
+	 *
+	 * 接続状態表示（MQTT の「接続中/未接続」ピル）は、この section が
+	 * ローカルに5秒ポーリングしていた `mqttConnected` を廃止し、
+	 * `hubStatusStore.mqttConnected` を直接読むように変えた
+	 * （`hubStatusStore.svelte.ts` の doc comment参照）。ポーリング自体は
+	 * `/settings/data` へ直接遷移してもこの section を経由せず動くよう
+	 * `settings/+layout.svelte`（admin 限定という既存条件は同じ）へ引き上げ
+	 * 済みなので、この section 側は保存直後の即時反映のためだけに
+	 * `hubStatusStore.load()` を呼ぶ。
 	 */
 	import { isAdmin } from '$lib/permissions';
 	import { sessionStore } from '$lib/session.svelte';
@@ -36,12 +45,11 @@
 	let mqttLoaded = $state(false);
 	let mqttSaving = $state(false);
 	let mqttError: string | null = $state(null);
-	let mqttConnected = $state(false);
 
-	async function loadMqttStatus(): Promise<void> {
+	/** 保存直後の即時反映用（5秒ポーリング自体は `settings/+layout.svelte` が担う）。 */
+	async function refreshHubStatus(): Promise<void> {
 		try {
-			const status = await hubStatusStore.load();
-			mqttConnected = status.mqtt.connected;
+			await hubStatusStore.load();
 		} catch {
 			// 状態表示だけの補助情報 - 取得失敗はエラー表示せず黙って保持する。
 		}
@@ -58,12 +66,9 @@
 			} finally {
 				if (!cancelled) mqttLoaded = true;
 			}
-			await loadMqttStatus();
 		})();
-		const interval = setInterval(() => void loadMqttStatus(), 5000);
 		return () => {
 			cancelled = true;
-			clearInterval(interval);
 		};
 	});
 
@@ -86,7 +91,7 @@
 			mqttSettingsStore.applyLoaded(saved);
 			mqttPassword = '';
 			toastStore.push('success', 'MQTT 設定を保存しました(即時適用されます)');
-			await loadMqttStatus();
+			await refreshHubStatus();
 		} catch (err) {
 			mqttError = errorMessage(err);
 		} finally {
@@ -139,8 +144,12 @@
 	<section>
 		<h2>
 			MQTT 発行
-			<span class="status-pill" class:ok={mqttConnected} class:bad={!mqttConnected}>
-				{mqttConnected ? '接続中' : '未接続'}
+			<span
+				class="status-pill"
+				class:ok={hubStatusStore.mqttConnected}
+				class:bad={!hubStatusStore.mqttConnected}
+			>
+				{hubStatusStore.mqttConnected ? '接続中' : '未接続'}
 			</span>
 		</h2>
 		{#if mqttLoaded}

@@ -1,25 +1,41 @@
 /*
  * 設定画面の section コンポーネント（AppearanceSection/AccountSection/
  * ConnectivitySection/DataSection/SecuritySection.svelte）が2つ以上から
- * 使う共通クラス（#359 段階1）。元 `+page.svelte` の単一 `<style>` ブロック
- * から「複数 section で使われているルール」だけをここに出した - 1つの
- * section にしか要らないルール（`.status-pill` 系・`.note code`・
- * `.package-actions` 系・`.note.warning`/`.note.success`・
- * `section.commissioning`）はその section 自身の `<style>` に残している。
- * ファイル名・役割は上流テンプレート v1.6.0 の settings/settings.css と
- * 同じだが、中身はテンプレートの UI キット（SurfaceCard 等）ではなく
- * banto-hub 独自の既存デザイン（DOM構造・見た目を変えない）をそのまま
- * 再配置したもの。
+ * 使う共通クラス（#359 段階1、PR #371 の Copilot レビュー是正で段階2改修）。
+ * 元 `+page.svelte` の単一 `<style>` ブロックから「複数 section で使われて
+ * いるルール」だけをここに出した - 1つの section にしか要らないルール
+ * （`.status-pill` 系・`.note code`・`.package-actions` 系・
+ * `.note.warning`/`.note.success`・`section.commissioning`）はその section
+ * 自身の `<style>` に残している。ファイル名・役割は上流テンプレート v1.6.0
+ * の settings/settings.css と同じだが、中身はテンプレートの UI キット
+ * （SurfaceCard 等）ではなく banto-hub 独自の既存デザイン（DOM構造・見た目を
+ * 変えない）をそのまま再配置したもの。
+ *
+ * `+layout.svelte` から `import './settings.css';` するプレーン CSS であり、
+ * Svelte の per-component scoping はコンポーネントを跨いでは効かない
+ * （5つの section コンポーネント + 5つのカテゴリルートの `+page.svelte` に
+ * 分かれた card markup が、このファイルを import する +layout.svelte 自身の
+ * <style> スコープには入らない）。段階1では `section`/`h2`/`h3`/`button`/
+ * `.field`/`.note`/`.error`/`.options` のような裸のセレクタのまま置いて
+ * いたため、設定画面を一度でも開くとグローバルへ漏れ、tags/users/
+ * api-keys/status など他画面の同名クラス・要素まで上書きしていた
+ * （SPA なので一度読み込むと以後ずっと影響する - PR #371 の Copilot
+ * レビュー指摘）。上流テンプレートの settings.css も同じ理由で全セレクタを
+ * `.settings-page` 祖先で名前空間化しているのにならい、ここでは
+ * `+layout.svelte` のルート div が持つ `.settings-layout` を祖先にして
+ * 名前空間化した（`.settings-layout` は設定画面のどのカテゴリでも共通の
+ * ルートで、ナビ自体は別クラス名の scoped `<style>` を使っているため
+ * 衝突しない）。
  */
 
-.sections {
+.settings-layout .sections {
 	display: flex;
 	flex-direction: column;
 	gap: 1rem;
 	max-width: 560px;
 }
 
-section {
+.settings-layout section {
 	background: var(--banto-surface);
 	border: 1px solid var(--banto-border);
 	border-radius: calc(var(--banto-radius) * 2);
@@ -28,7 +44,7 @@ section {
 	-webkit-backdrop-filter: var(--banto-backdrop, none);
 }
 
-h2 {
+.settings-layout h2 {
 	margin: 0 0 0.75rem;
 	font-size: 1rem;
 	display: flex;
@@ -36,18 +52,18 @@ h2 {
 	gap: 0.5rem;
 }
 
-h3 {
+.settings-layout h3 {
 	margin: 1rem 0 0.5rem;
 	font-size: 0.875rem;
 	color: var(--banto-text-muted);
 }
 
-.options {
+.settings-layout .options {
 	display: flex;
 	gap: 0.5rem;
 }
 
-.options label {
+.settings-layout .options label {
 	display: flex;
 	align-items: center;
 	gap: 0.4rem;
@@ -58,26 +74,26 @@ h3 {
 	font-size: 0.875rem;
 }
 
-.options label.selected {
+.settings-layout .options label.selected {
 	border-color: var(--banto-primary);
 	color: var(--banto-primary);
 	background: color-mix(in srgb, var(--banto-primary) 10%, transparent);
 }
 
-.options input {
+.settings-layout .options input {
 	position: absolute;
 	opacity: 0;
 	pointer-events: none;
 }
 
-section form {
+.settings-layout section form {
 	display: flex;
 	flex-direction: column;
 	gap: 0.75rem;
 	max-width: 320px;
 }
 
-.field {
+.settings-layout .field {
 	display: flex;
 	flex-direction: column;
 	gap: 0.3rem;
@@ -85,7 +101,7 @@ section form {
 	color: var(--banto-text-muted);
 }
 
-.field input {
+.settings-layout .field input {
 	padding: 0.4rem 0.5rem;
 	border: 1px solid var(--banto-border);
 	border-radius: var(--banto-radius);
@@ -93,17 +109,17 @@ section form {
 	color: var(--banto-text);
 }
 
-.field.checkbox {
+.settings-layout .field.checkbox {
 	flex-direction: row;
 	align-items: center;
 	gap: 0.5rem;
 }
 
-.field.checkbox input {
+.settings-layout .field.checkbox input {
 	width: auto;
 }
 
-button {
+.settings-layout button {
 	padding: 0.5rem 1rem;
 	border: none;
 	border-radius: var(--banto-radius);
@@ -113,11 +129,11 @@ button {
 	cursor: pointer;
 }
 
-button:hover:not(:disabled) {
+.settings-layout button:hover:not(:disabled) {
 	background: var(--banto-primary-hover);
 }
 
-button:disabled {
+.settings-layout button:disabled {
 	opacity: 0.6;
 	cursor: not-allowed;
 }
@@ -125,21 +141,21 @@ button:disabled {
 /* ロックダウン・今すぐ削除は不可逆な操作 - 通常の primary ボタンと見た目を
    分け、誤って他の保存ボタンと同じ感覚で押させないようにする
    （SecuritySection・DataSection の両方が使う）。 */
-button.danger {
+.settings-layout button.danger {
 	background: var(--banto-danger);
 }
 
-button.danger:hover:not(:disabled) {
+.settings-layout button.danger:hover:not(:disabled) {
 	background: color-mix(in srgb, var(--banto-danger) 85%, black);
 }
 
-.error {
+.settings-layout .error {
 	margin: 0.5rem 0 0;
 	color: var(--banto-danger);
 	font-size: 0.8rem;
 }
 
-.note {
+.settings-layout .note {
 	margin: 0.75rem 0 0;
 	color: var(--banto-text-muted);
 	font-size: 0.8rem;
