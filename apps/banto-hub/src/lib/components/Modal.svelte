@@ -22,9 +22,19 @@
 	 * 分岐だらけになるため（`ConnectionDrawer.svelte`/
 	 * `CollectionGroupDrawer.svelte` 冒頭コメントに合わせ、用途でコンポーネント
 	 * 自体を分ける方針を踏襲）。
+	 *
+	 * 2026-09-15 追補（誤爆防止、TAG-UX-C 追補 - 「編集中に操作ミスで閉じて
+	 * 入力が消える」事故対策）: `Drawer.svelte` と同じ `dirty`/`onBlockedClose`
+	 * 契約をそのまま踏襲する - `dirty` が `true` の間は Esc・オーバーレイ
+	 * クリックでは閉じない（`drawerCloseGuard.ts::isCloseAllowed`）。**`×`
+	 * ボタン経由だけは塞がない** - 未保存確認は従来どおり `onRequestClose`
+	 * に委ねたまま。3ステップの作成ウィザードでも同じロジックで効く
+	 * （`open` が変わらない限りステップを跨いでも `dirty` は呼び出し側の
+	 * baseline 比較に従う）。
 	 */
 	import type { Snippet } from 'svelte';
 	import { fade, scale } from 'svelte/transition';
+	import { isCloseAllowed } from './drawerCloseGuard';
 
 	interface Props {
 		open: boolean;
@@ -42,6 +52,14 @@
 		 * 即 `onclose`（後方互換）。
 		 */
 		onRequestClose?: () => boolean;
+		/**
+		 * `Drawer.svelte` と同じ契約（そちらの doc コメント参照）: 未保存の
+		 * 変更があるか。`true` の間は Esc とオーバーレイクリックでは閉じない
+		 * （誤爆防止）。`×` の経路は塞がない。既定 `false`（後方互換）。
+		 */
+		dirty?: boolean;
+		/** `Drawer.svelte` と同じ契約: `dirty` によりブロックされたことを呼び出し側へ知らせる。 */
+		onBlockedClose?: () => void;
 		children?: Snippet;
 	}
 
@@ -52,6 +70,8 @@
 		closeOnOverlayClick = true,
 		onclose,
 		onRequestClose,
+		dirty = false,
+		onBlockedClose,
 		children
 	}: Props = $props();
 
@@ -64,6 +84,10 @@
 	function handleWindowKeydown(event: KeyboardEvent): void {
 		if (open && event.key === 'Escape') {
 			event.preventDefault();
+			if (!isCloseAllowed('escape', dirty)) {
+				onBlockedClose?.();
+				return;
+			}
 			requestClose();
 		}
 	}
@@ -73,7 +97,12 @@
 	// 同じ理由 - a11y 的にクリックハンドラを持つ非インタラクティブ要素を
 	// 増やさずに済む。
 	function handleOverlayClick(event: MouseEvent): void {
-		if (closeOnOverlayClick && event.target === event.currentTarget) requestClose();
+		if (!closeOnOverlayClick || event.target !== event.currentTarget) return;
+		if (!isCloseAllowed('overlay', dirty)) {
+			onBlockedClose?.();
+			return;
+		}
+		requestClose();
 	}
 
 	/** 開いた直後、パネル内の最初のフォーカス可能要素へフォーカスする。 */

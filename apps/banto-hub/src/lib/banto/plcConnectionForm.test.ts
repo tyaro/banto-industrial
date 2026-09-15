@@ -20,6 +20,7 @@ import {
 	validatePostgresFields,
 	type PlcConnectionFormState
 } from './plcConnectionForm';
+import { isFormDirty } from './formDirty';
 import type { PlcConnection } from './tagRegistryAdmin';
 
 describe('nextConnectionName', () => {
@@ -360,5 +361,90 @@ describe('S1: PROTOCOL_OPTIONS に postgres（DB Source）が含まれる', () =
 		const postgresOption = PROTOCOL_OPTIONS.find((opt) => opt.value === 'postgres');
 		expect(postgresOption).toBeDefined();
 		expect(postgresOption?.label).toBe('PostgreSQL（DB Source）');
+	});
+});
+
+/**
+ * 2026-09-15 追補（誤爆防止、`ConnectionDrawer.svelte::baseline`/`dirty`）:
+ * `ConnectionDrawer.svelte` 自体は Svelte コンポーネントでユニットテスト
+ * 対象外（`formDirty.test.ts` 冒頭コメント参照）のため、実際に使う
+ * `blankConnectionForm`/`connectionToForm`（baseline の作り方そのもの）と
+ * `isFormDirty` を組み合わせて、Drawer が行う判定と同じ形をここで固定する。
+ * 実 DOM での確認は
+ * `e2e/tests-banto-hub/banto-hub-tags-drawer-accidental-close.spec.ts` に譲る。
+ */
+describe('ConnectionDrawer の dirty 判定（baseline は開いた時点のフォームスナップショット）', () => {
+	it('新規作成: 開いた直後（baseline = blankConnectionForm 相当）は dirty ではない', () => {
+		const baseline = blankConnectionForm();
+		const form = { ...baseline };
+		expect(isFormDirty(baseline, form)).toBe(false);
+	});
+
+	it('新規作成: 名前を1文字変えると dirty になる', () => {
+		const baseline = blankConnectionForm();
+		const form = { ...baseline, name: 'a' };
+		expect(isFormDirty(baseline, form)).toBe(true);
+	});
+
+	it('再設定: 開いた直後（baseline = connectionToForm(connection)）は dirty ではない', () => {
+		const conn: PlcConnection = {
+			id: 7,
+			name: 'Line1',
+			protocol: 'slmp',
+			host: '192.168.1.10',
+			port: 5007,
+			unitId: 3,
+			enabled: true,
+			simulation: false,
+			wordOrder: 'high_low',
+			database: null,
+			username: null,
+			passwordSet: false
+		};
+		const baseline = connectionToForm(conn);
+		const form = { ...baseline };
+		expect(isFormDirty(baseline, form)).toBe(false);
+	});
+
+	it('再設定: ホストを1文字変えると dirty になる', () => {
+		const conn: PlcConnection = {
+			id: 7,
+			name: 'Line1',
+			protocol: 'slmp',
+			host: '192.168.1.10',
+			port: 5007,
+			unitId: 3,
+			enabled: true,
+			simulation: false,
+			wordOrder: 'high_low',
+			database: null,
+			username: null,
+			passwordSet: false
+		};
+		const baseline = connectionToForm(conn);
+		const form = { ...baseline, host: '192.168.1.11' };
+		expect(isFormDirty(baseline, form)).toBe(true);
+	});
+
+	it('readOnly: 入力欄が disabled で form が変わらない前提なら、baseline と同一のまま dirty にならない（readOnly 専用の分岐は無く isFormDirty だけで足りる）', () => {
+		const conn: PlcConnection = {
+			id: 9,
+			name: 'ViewOnly',
+			protocol: 'modbus-tcp',
+			host: '10.0.0.1',
+			port: 502,
+			unitId: 1,
+			enabled: true,
+			simulation: false,
+			wordOrder: 'high_low',
+			database: null,
+			username: null,
+			passwordSet: false
+		};
+		const baseline = connectionToForm(conn);
+		// readOnly では <input disabled> によりユーザーは form を変更できない
+		// - つまり form は常に baseline と同一のまま。
+		const form = baseline;
+		expect(isFormDirty(baseline, form)).toBe(false);
 	});
 });

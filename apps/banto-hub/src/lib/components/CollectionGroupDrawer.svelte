@@ -52,6 +52,12 @@
 	 * （実装指示6）: `ConnectionDrawer.svelte` と同じく失敗ではなく案内として
 	 * `toastStore.push('info', ...)` を使う。Drawer は閉じずフォームを保持する。
 	 *
+	 * **2026-09-15 追補（誤爆防止）**: `ConnectionDrawer.svelte` の同名の
+	 * 追補コメントと同じ理由・同じ実装 - この Drawer/Modal も元々
+	 * `onRequestClose` が `!isBusy()` のみで未保存確認が無かった。`baseline`
+	 * （開いた時点のフォームスナップショット）を持ち、`isFormDirty(baseline,
+	 * form)` を `dirty` として `Drawer.svelte`/`Modal.svelte` へ渡す。
+	 *
 	 * **所属する PLC 接続の既定値**（実装指示4）: `presetPlcConnectionId` prop
 	 * を通じて、Drawer を開いた文脈（ページの `?connectionId=` クエリ、または
 	 * 将来 T18-6d のツリー接続ノードからの起動）を尊重する。新規作成フォームを
@@ -66,6 +72,7 @@
 	import { sessionStore } from '$lib/session.svelte';
 	import { listPendingChanges, type PendingChange } from '$lib/banto/pendingChangesAdmin';
 	import { pendingCreateNames } from '$lib/banto/pendingCreateNames';
+	import { isFormDirty } from '$lib/banto/formDirty';
 	import {
 		createCollectionGroup,
 		deleteCollectionGroup,
@@ -186,6 +193,13 @@
 	}
 
 	let form: CollectionGroupFormState = $state(blankGroupForm(DEFAULT_PERIOD_MS));
+	/**
+	 * 2026-09-15 追補: `ConnectionDrawer.svelte::baseline` と同じ役割・同じ
+	 * 流儀（通常の `let`、`$state` にしない）。
+	 */
+	let baseline: CollectionGroupFormState = blankGroupForm(DEFAULT_PERIOD_MS);
+	/** `dirty` の間は Esc・オーバーレイクリックで閉じない（`Drawer.svelte`/`Modal.svelte` の `dirty` prop）。 */
+	const dirty = $derived(isFormDirty(baseline, form));
 
 	/**
 	 * S3: フォームが選択している PLC 接続が postgres（DB Source）かどうか。
@@ -245,6 +259,7 @@
 			form = blank;
 			void refinePendingNamePrefill(key);
 		}
+		baseline = { ...form };
 		errors = {};
 		step = 1;
 
@@ -284,7 +299,13 @@
 		const pendingNames = pendingCreateNames(pending, PENDING_SOURCE);
 		if (pendingNames.length === 0) return;
 		const refined = nextGroupName(existingNames, 'group', pendingNames);
-		if (form.name === provisionalName) form.name = refined;
+		if (form.name === provisionalName) {
+			// baseline も一緒に差し替える - システム側のプリフィル更新であって
+			// ユーザーの未保存編集ではないため、dirty 扱いにしてはいけない
+			// （`ConnectionDrawer.svelte::refinePendingNamePrefill` と同じ配慮）。
+			form.name = refined;
+			baseline.name = refined;
+		}
 		provisionalName = refined;
 	}
 
@@ -387,8 +408,10 @@
 			);
 			toastStore.push('success', '更新しました');
 			// 保存成功後はサーバーの正規化値を基準に取り直す（ConnectionDrawer
-			// の handleSave と同じ方針）。Drawer は閉じない。
+			// の handleSave と同じ方針）。Drawer は閉じない。baseline も同じ値へ
+			// 揃えることで、保存直後は dirty ではない状態に戻す。
 			form = groupToForm(updated);
+			baseline = { ...form };
 			onSaved(updated);
 		} catch (err) {
 			if (isQueuedWhileRunningError(err)) {
@@ -435,9 +458,20 @@
 		return saving || deleting;
 	}
 
-	/** 処理中は ×・Esc・オーバーレイクリックでの close を抑止する。 */
+	/**
+	 * 2026-09-15 追補: `ConnectionDrawer.svelte::onRequestClose` と同じ理由・
+	 * 同じ実装 - 処理中は閉じさせず、未保存の変更（`dirty`）があれば
+	 * `confirmDiscardIfNeeded` と同じ文言・同じ順序で破棄確認する。
+	 */
 	function onRequestClose(): boolean {
-		return !isBusy();
+		if (isBusy()) return false;
+		if (dirty && !window.confirm('変更を破棄しますか？')) return false;
+		return true;
+	}
+
+	/** `dirty` のため Esc/オーバーレイクリックが弾かれたことを案内する。 */
+	function notifyBlockedClose(): void {
+		toastStore.push('info', '未保存の変更があります。閉じるには × を押してください。');
 	}
 </script>
 
@@ -554,6 +588,8 @@
 		{onRequestClose}
 		onclose={onClose}
 		width="560px"
+		{dirty}
+		onBlockedClose={notifyBlockedClose}
 	>
 		<ol class="wizard-steps" aria-label="作成手順">
 			<li class:active={step === 1} class:done={step > 1}>1. 識別</li>
@@ -589,6 +625,8 @@
 		{onRequestClose}
 		onclose={onClose}
 		width="480px"
+		{dirty}
+		onBlockedClose={notifyBlockedClose}
 	>
 		{@render nameField()}
 		{@render destinationFields()}

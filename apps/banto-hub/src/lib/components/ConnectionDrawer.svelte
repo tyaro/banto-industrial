@@ -60,6 +60,22 @@
 	 * そのままなので、ここでは文言はそちらと揃えたまま toast の種別だけ
 	 * 'info' に分けている。Drawer は閉じない（tags 側の他の書き込みハンドラ
 	 * と同じく、キュー投入時はフォームを保持したまま案内するだけ）。
+	 *
+	 * **2026-09-15 追補（誤爆防止 - オーナー報告「設定中に操作ミスで閉じて
+	 * しまい最初からやり直しになる」）**: この Drawer/Modal は元々
+	 * `onRequestClose` が `!isBusy()` のみで、**未保存確認そのものが無く**
+	 * Esc・オーバーレイクリックで確認なしに即閉じていた
+	 * （`tags/+page.svelte` のタグ編集 Drawer は `confirmDiscardIfNeeded`
+	 * で確認していたのに、ここには揃っていなかった）。`tags/+page.svelte`
+	 * と同じ流儀で `baseline`（Drawer/Modal を開いた時点のフォーム
+	 * スナップショット）を持ち、`isFormDirty(baseline, form)` を
+	 * `Drawer.svelte`/`Modal.svelte` の `dirty` prop へ渡す - `dirty` の間は
+	 * Esc・オーバーレイクリックでは閉じない（`drawerCloseGuard.ts`）。
+	 * `onRequestClose`（`×` 経由）も `!isBusy()` だけでなく `dirty` なら
+	 * `window.confirm` で確認するよう改めた（`confirmDiscardIfNeeded` と
+	 * 同じ文言・同じ順序）。3ステップの作成ウィザードでも `baseline` は
+	 * 開いた時点のまま変わらないため、ステップを進めて入力するだけで自然に
+	 * `dirty` になる。
 	 */
 	import { isProviderError } from '@banto/admin-core';
 	import Drawer from './Drawer.svelte';
@@ -69,6 +85,7 @@
 	import { sessionStore } from '$lib/session.svelte';
 	import { listPendingChanges, type PendingChange } from '$lib/banto/pendingChangesAdmin';
 	import { pendingCreateNames } from '$lib/banto/pendingCreateNames';
+	import { isFormDirty } from '$lib/banto/formDirty';
 	import {
 		createPlcConnection,
 		deletePlcConnection,
@@ -210,6 +227,16 @@
 	}
 
 	let form: PlcConnectionFormState = $state(blankConnectionForm());
+	/**
+	 * 2026-09-15 追補: Drawer/Modal を開いた（または保存が成功した）時点の
+	 * `form` スナップショット。`tags/+page.svelte::createBaseline` と同じ
+	 * 流儀で通常の `let`（`$state` にしない） - `dirty` の `$derived` は
+	 * `form`（`$state`）の変化で再評価されるため、`baseline` は毎回その
+	 * 時点の最新値を読めれば十分。
+	 */
+	let baseline: PlcConnectionFormState = blankConnectionForm();
+	/** `dirty` の間は Esc・オーバーレイクリックで閉じない（`Drawer.svelte`/`Modal.svelte` の `dirty` prop）。 */
+	const dirty = $derived(isFormDirty(baseline, form));
 	let errors: Record<string, string> = $state({});
 	let saving = $state(false);
 	let deleting = $state(false);
@@ -277,6 +304,7 @@
 			form = blank;
 			void refinePendingNamePrefill(key);
 		}
+		baseline = { ...form };
 		errors = {};
 		testState = blankTestState();
 		dbTestState = blankDbTestState();
@@ -321,7 +349,14 @@
 		const pendingNames = pendingCreateNames(pending, PENDING_SOURCE);
 		if (pendingNames.length === 0) return;
 		const refined = nextConnectionName(existingNames, 'connection', pendingNames);
-		if (form.name === provisionalName) form.name = refined;
+		if (form.name === provisionalName) {
+			// baseline も一緒に差し替える - これはシステム側のプリフィル
+			// 更新であってユーザーの未保存編集ではないため、dirty 扱いに
+			// してはいけない（`tags/+page.svelte::openCreateDrawer` の
+			// 「プリセットした値は createBaseline にも入れる」と同じ配慮）。
+			form.name = refined;
+			baseline.name = refined;
+		}
 		provisionalName = refined;
 	}
 
@@ -498,8 +533,10 @@
 			const updated = await updatePlcConnection(connection.id, formToConnectionInput(form));
 			toastStore.push('success', '更新しました');
 			// 保存成功後はサーバーの正規化値を基準に取り直す（tags/+page.svelte
-			// の saveEdit と同じ方針）。Drawer は閉じない。
+			// の saveEdit と同じ方針）。Drawer は閉じない。baseline も同じ値へ
+			// 揃えることで、保存直後は dirty ではない状態に戻す。
 			form = connectionToForm(updated);
+			baseline = { ...form };
 			onSaved(updated);
 		} catch (err) {
 			if (isQueuedWhileRunningError(err)) {
@@ -548,9 +585,21 @@
 		return saving || deleting || testState.testing || dbTestState.testing;
 	}
 
-	/** 処理中は ×・Esc・オーバーレイクリックでの close を抑止する。 */
+	/**
+	 * 2026-09-15 追補: 処理中は閉じさせない（従来どおり）。加えて、未保存の
+	 * 変更（`dirty`）があれば `tags/+page.svelte::confirmDiscardIfNeeded` と
+	 * 同じ文言・同じ順序で `window.confirm` による破棄確認を行う - 従来は
+	 * この確認自体が無く、`×` を含むすべての経路で無確認に閉じていた。
+	 */
 	function onRequestClose(): boolean {
-		return !isBusy();
+		if (isBusy()) return false;
+		if (dirty && !window.confirm('変更を破棄しますか？')) return false;
+		return true;
+	}
+
+	/** `dirty` のため Esc/オーバーレイクリックが弾かれたことを案内する。 */
+	function notifyBlockedClose(): void {
+		toastStore.push('info', '未保存の変更があります。閉じるには × を押してください。');
 	}
 </script>
 
@@ -785,6 +834,8 @@
 		{onRequestClose}
 		onclose={onClose}
 		width="560px"
+		{dirty}
+		onBlockedClose={notifyBlockedClose}
 	>
 		<ol class="wizard-steps" aria-label="作成手順">
 			<li class:active={step === 1} class:done={step > 1}>1. 識別</li>
@@ -825,6 +876,8 @@
 		{onRequestClose}
 		onclose={onClose}
 		width="480px"
+		{dirty}
+		onBlockedClose={notifyBlockedClose}
 	>
 		{@render nameField()}
 		{@render destinationFields()}
