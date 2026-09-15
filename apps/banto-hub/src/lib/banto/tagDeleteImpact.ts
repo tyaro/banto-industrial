@@ -19,8 +19,9 @@
  * が「3セグメント（接続.グループ.タグ）までです」を強制）で、各セグメントは
  * 字句規則上 ASCII の英字/`_`始まりで、英数字・`_`・内部の`-`のみを許す
  * （`crates/banto-expr/src/lexer.rs`）。完璧なレキサ移植はしない
- * （実装指示）が、この字句規則を単純化した正規表現で1トークンずつ抽出し、
- * 前後が識別子継続文字（`A-Za-z0-9_.-`）でないことを境界条件として課す
+ * （実装指示）が、この字句規則を写した正規表現で1トークンずつ抽出し、
+ * 前後の境界条件（**`-` は減算演算子にも識別子の一部にもなるため非対称** -
+ * {@link IDENT_SEGMENT} と `TAG_REF_PATTERN` の doc 参照）を課す
  * ことで、`a.b.c` が `a.b.c2` の一部として誤マッチすることを防ぐ
  * （境界チェックにより、正規表現のグリーディマッチが自然に全体の識別子を
  * 飲み込むため、部分文字列一致にはならない）。
@@ -39,8 +40,27 @@ export function buildExternalName(
 	return `${connectionName}.${groupName}.${tagName}`;
 }
 
-/** banto-expr の識別子セグメント（ASCII、英字/`_`始まり、内部ハイフン許可の簡略版）。 */
-const IDENT_SEGMENT = '[A-Za-z_][A-Za-z0-9_-]*';
+/**
+ * banto-expr の識別子セグメント（ASCII）。**`crates/banto-expr/src/lexer.rs`
+ * の識別子規則をそのまま写す**: 開始は英字か `_`、継続は英数字か `_`、
+ * **`-` は直後に継続文字が続くときだけ吸収される**（同モジュール doc
+ * 「識別子とハイフンの綱引き」）。
+ *
+ * #379 レビュー対応（2回目）で `[A-Za-z_][A-Za-z0-9_-]*` の簡略版から
+ * ここまで厳密にした - 簡略版だと末尾・連続のハイフンまで貪欲に飲み込み、
+ * `a.b.c--line1.fast.tag`（lexer では `a.b.c` と `line1.fast.tag` の2参照）で
+ * `a.b.c` を落とす・`a.b.c--1` を1トークンとして拾う、といった食い違いが出る。
+ */
+const IDENT_SEGMENT = '[A-Za-z_][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)*';
+
+/**
+ * 「ハイフンを含まない識別子文字の連続」（`TAG_REF_PATTERN` の後読み専用）。
+ * `IDENT_SEGMENT` をそのまま後読みに使うと、それ自身が `-` を含むため
+ * `a.b.c--line1...` の `c--` にも一致して参照を落とす（#379 レビュー指摘）。
+ * `-` の直前が**識別子の一部**かどうかだけを見たいので、run にはハイフンを
+ * 含めない。
+ */
+const IDENT_RUN_NO_HYPHEN = '[A-Za-z_][A-Za-z0-9_]*';
 
 /**
  * 式中の3セグメントのタグ参照トークン（`接続.グループ.タグ`）を検出する
@@ -59,12 +79,18 @@ const IDENT_SEGMENT = '[A-Za-z_][A-Za-z0-9_-]*';
  * 循環除外が効かない不具合）。後読みを2段に分けて lexer と一致させる:
  *
  * - `(?<![A-Za-z0-9_.])` … 識別子の途中・ドット連結の途中から切り出さない
- * - `(?<!IDENT-)` … **識別子に吸収された `-`** の直後から切り出さない
- *   （`a-line1.fast.tag` の参照は `a-line1.fast.tag` であって
- *   `line1.fast.tag` ではない）
+ * - `(?<!IDENT_RUN_NO_HYPHEN-)` … **識別子に吸収された `-`** の直後から
+ *   切り出さない（`a-line1.fast.tag` の参照は `a-line1.fast.tag` であって
+ *   `line1.fast.tag` ではない）。run にハイフンを含めない理由は
+ *   {@link IDENT_RUN_NO_HYPHEN} 参照。
+ *
+ * 後ろ側も同じ非対称性を持つ（`(?![A-Za-z0-9_.])(?!-[A-Za-z0-9_])`）:
+ * 続く `-` が識別子の一部なのは「その後ろに継続文字があるとき」だけなので、
+ * `a.b.c--1` や `a.b.c--line1.fast.tag` の `a.b.c` はちゃんと参照として
+ * 切り出される（`a.b.c-1` は1トークンのまま）。
  */
 const TAG_REF_PATTERN = new RegExp(
-	`(?<![A-Za-z0-9_.])(?<!${IDENT_SEGMENT}-)${IDENT_SEGMENT}\\.${IDENT_SEGMENT}\\.${IDENT_SEGMENT}(?![A-Za-z0-9_.-])`,
+	`(?<![A-Za-z0-9_.])(?<!${IDENT_RUN_NO_HYPHEN}-)${IDENT_SEGMENT}\\.${IDENT_SEGMENT}\\.${IDENT_SEGMENT}(?![A-Za-z0-9_.])(?!-[A-Za-z0-9_])`,
 	'g'
 );
 
@@ -85,21 +111,14 @@ const TAG_REF_PATTERN = new RegExp(
 const FULL_TAG_REF_PATTERN = new RegExp(`^${IDENT_SEGMENT}\\.${IDENT_SEGMENT}\\.${IDENT_SEGMENT}$`);
 
 /**
- * `IDENT_SEGMENT` が近似である唯一の実害ある差: **ハイフンは後ろに識別子
- * 継続文字が続くときだけ識別子へ吸収される**（`crates/banto-expr/src/lexer.rs`
- * の `trailing_hyphen_is_not_absorbed_into_identifier`）。`IDENT_SEGMENT` は
- * `[A-Za-z0-9_-]*` なので `abc-` や `a--b` も通してしまうが、実 lexer は
- * そこでハイフンを減算演算子として切り出すため、そのタグ名は式から参照
- * できない。`extractTagRefTokens`（文中からの切り出し）ではこの差は無害
- * （近似で拾いすぎても削除確認が1件多く出るだけ）なので `IDENT_SEGMENT`
- * 自体は変えず、「名前全体が参照トークンそのものか」を見るこちらでだけ
- * 追加で弾く。
+ * {@link FULL_TAG_REF_PATTERN} 参照。`abc-`（末尾ハイフン）や `a--b`
+ * （連続ハイフン）が弾かれるのは、{@link IDENT_SEGMENT} が lexer の
+ * 「`-` は直後に継続文字があるときだけ吸収」規則をそのまま写しているため
+ * （#379 レビュー対応の2回目までは別の `DANGLING_HYPHEN_PATTERN` で後から
+ * 弾いていたが、`IDENT_SEGMENT` 側を厳密にしたので不要になった）。
  */
-const DANGLING_HYPHEN_PATTERN = /-(?![A-Za-z0-9_])/;
-
-/** {@link FULL_TAG_REF_PATTERN} / {@link DANGLING_HYPHEN_PATTERN} 参照。 */
 export function isExpressionRepresentableName(externalName: string): boolean {
-	return FULL_TAG_REF_PATTERN.test(externalName) && !DANGLING_HYPHEN_PATTERN.test(externalName);
+	return FULL_TAG_REF_PATTERN.test(externalName);
 }
 
 /** 式中に現れる3セグメントのタグ参照トークンをすべて抽出する（重複含む）。 */

@@ -542,6 +542,34 @@ fn tag_ref_after_minus_operator_is_a_separate_reference() {
 }
 
 #[test]
+fn hyphen_not_followed_by_ident_char_is_not_absorbed() {
+    // 連続ハイフンは1つも識別子へ吸収されない（1つ目は直後が `-` で継続
+    // 文字ではないため）。前後どちらの参照も独立して切り出される -
+    // フロント側の後読みを `IDENT_SEGMENT` で書くと `c--` に一致して
+    // `a.b.c` を落としていた（#379 レビュー指摘）。
+    assert_eq!(
+        referenced("a.b.c--line1.fast.tag"),
+        vec!["a.b.c", "line1.fast.tag"]
+    );
+    assert_eq!(
+        referenced("a.b.c---line1.fast.tag"),
+        vec!["a.b.c", "line1.fast.tag"]
+    );
+    // 直前の参照の末尾セグメントがハイフンを含んでいても同じ。
+    assert_eq!(
+        referenced("a.b.c-d--line1.fast.tag"),
+        vec!["a.b.c-d", "line1.fast.tag"]
+    );
+    assert_eq!(
+        referenced("line-1.grp.tag--other.g.t"),
+        vec!["line-1.grp.tag", "other.g.t"]
+    );
+    // 後ろが数値でも、ハイフンが2つ並べば識別子へは入らない
+    // （`a.b.c-1` は1トークン、`a.b.c--1` は `a.b.c` と減算×2）。
+    assert_eq!(referenced("a.b.c--1"), vec!["a.b.c"]);
+}
+
+#[test]
 fn hyphen_between_identifiers_is_absorbed_into_the_reference() {
     // 直前が識別子なら `-` は識別子へ吸収される（最長一致） - 参照は
     // `line1.fast.tag` では**なく** `a-line1.fast.tag` の方。

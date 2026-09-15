@@ -135,6 +135,22 @@ describe('extractTagRefTokens', () => {
 		expect(expressionReferencesExternalName('1-line1.fast.tag', 'line1.fast.tag')).toBe(true);
 	});
 
+	it('吸収されないハイフン連続の前後どちらの参照も落とさない（#379、正は banto-expr のテスト）', () => {
+		// 連続ハイフンは1つも識別子へ吸収されないので、前後とも独立した参照。
+		// 旧実装は後読みに `IDENT_SEGMENT`（`-` を含む）を使っていたため
+		// `c--` に一致し、前側の `a.b.c` を落としていた。
+		expect(extractTagRefTokens('a.b.c--line1.fast.tag')).toEqual(['a.b.c', 'line1.fast.tag']);
+		expect(extractTagRefTokens('a.b.c---line1.fast.tag')).toEqual(['a.b.c', 'line1.fast.tag']);
+		expect(extractTagRefTokens('a.b.c-d--line1.fast.tag')).toEqual(['a.b.c-d', 'line1.fast.tag']);
+		expect(extractTagRefTokens('line-1.grp.tag--other.g.t')).toEqual([
+			'line-1.grp.tag',
+			'other.g.t'
+		]);
+		// `a.b.c-1` は1トークン、`a.b.c--1` は `a.b.c` と減算×2。
+		expect(extractTagRefTokens('a.b.c--1')).toEqual(['a.b.c']);
+		expect(expressionReferencesExternalName('a.b.c--line1.fast.tag', 'a.b.c')).toBe(true);
+	});
+
 	it('識別子へ吸収された `-` の直後は別トークンにしない（#379、同上）', () => {
 		// lexer は `a-line1` を1つの識別子として最長一致で吸収するので、
 		// 参照は `a-line1.fast.tag` であって `line1.fast.tag` ではない。

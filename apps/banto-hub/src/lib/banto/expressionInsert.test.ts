@@ -87,6 +87,12 @@ describe('extractTagRefs', () => {
 		expect(extractTagRefs('a-line1.fast.tag')).toEqual(['a-line1.fast.tag']);
 		expect(extractTagRefs('a.b.c-1')).toEqual(['a.b.c-1']);
 	});
+
+	it('吸収されないハイフン連続の前後どちらの参照も落とさない（#379、同上）', () => {
+		expect(extractTagRefs('a.b.c--line1.fast.tag')).toEqual(['a.b.c', 'line1.fast.tag']);
+		expect(extractTagRefs('a.b.c-d--line1.fast.tag')).toEqual(['a.b.c-d', 'line1.fast.tag']);
+		expect(extractTagRefs('a.b.c--1')).toEqual(['a.b.c']);
+	});
 });
 
 describe('wouldCreateCycle', () => {
@@ -115,6 +121,19 @@ describe('wouldCreateCycle', () => {
 	it('新規作成（selfId = null）では循環しようがない', () => {
 		expect(wouldCreateCycle(tags, null, 4)).toBe(false);
 		expect(wouldCreateCycle(tags, null, 6)).toBe(false);
+	});
+
+	it('`self--1` の形（吸収されないハイフン連続の直前）で参照している computed も循環（#379）', () => {
+		// 後ろ側の境界も非対称（`-` の後ろに継続文字が無ければ識別子の一部
+		// ではない）。旧実装は `a.b.c--1` を1トークンとして拾い、この辺を
+		// 落としていた。
+		const selfName = `${CONN}.${GROUP}.self`;
+		const tags = [
+			tag(1, 'self', { tagKind: 'computed', expression: '1' }),
+			tag(9, 'trailing', { tagKind: 'computed', expression: `${selfName}--1` })
+		];
+		expect(wouldCreateCycle(tags, 1, 9)).toBe(true);
+		expect(insertionBlockReason(tags, 1, 9)).toBe(CYCLE_REFERENCE_REASON);
 	});
 
 	it('`1-self` の形（演算子の `-` に隣接）で参照している computed も循環（#379）', () => {
