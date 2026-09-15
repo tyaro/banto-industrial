@@ -87,7 +87,9 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
   `plc_reconnected` は「切断後、最初の読み取りが成功した時点」で 1 回だけ記録する。
   **wire 変更なし**（記録のタイミングと件数のみ変更）。詳細は
   [tag-server-design.md](tag-server-design.md) §6 項目5、
-  [banto-hub-operations.md](banto-hub-operations.md) §10。
+  [banto-hub-operations.md](banto-hub-operations.md) §10。 **ローカル確認済み（2026-09-15、alpha.13 ビルド）**: 到達不能 IP への SLMP 接続を
+  収集中に追加し 30 秒観測 → 接続イベント 0 件（修正前は `plc_disconnected` 30 + `plc_reconnected` 30）、
+  status は `reconnecting`、同居する実機接続の収集は影響なし。
 - **出荷ゲート**: T5-5（実機での 72h soak 実行 + 実機最終サインオフ）のみ残（実機必須）。
 - **banto-tagclient**: **S4a完了（2026-09-01）**。読み取り専用DTO、Endpoint/Secret境界、
   stable ID resolver、REST catalog/values transport、WS wire純粋解析、bounded publish gate、認証付き
