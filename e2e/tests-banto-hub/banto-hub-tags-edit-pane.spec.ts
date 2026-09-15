@@ -118,6 +118,14 @@ test.describe.serial('banto-hub タグ編集の非モーダル右ペイン (#375
 
 	test('1. 行クリックで右ペインが開き、覆われずに左ツリーをそのままクリックできる', async () => {
 		await page.goto('/tags');
+		// #379 CI 対応: BantoGrid は行を仮想化しており、スイート全体のタグ件数が
+		// 増えるとこの spec のタグ（後から作られる＝一覧の末尾）は DOM に無い
+		// （`banto-hub-tags-revision.spec.ts` 冒頭の doc comment 参照）。先に
+		// ツリーで対象グループへ絞る（このグループのタグは TAG_A/TAG_B の2件
+		// だけなので、後続テストの TAG_B クリックもそのまま通る）。下でこの
+		// ノードをもう一度クリックするが、既に選択中のノードの再クリックは
+		// `treeFilter` を変えないので非モーダル性の確認としては等価。
+		await groupNodeByName(page, GROUP_NAME).click();
 		await page.getByRole('gridcell', { name: TAG_A, exact: true }).click();
 
 		const pane = page.getByRole('complementary', { name: `${TAG_A} を編集` });
@@ -198,6 +206,8 @@ test.describe.serial('banto-hub タグ編集の非モーダル右ペイン (#375
 			await injectAuthToken(narrowPage, token);
 			await narrowPage.goto('/tags');
 
+			// #379 CI 対応: 仮想化されたグリッド対策（テスト1のコメント参照）。
+			await narrowPage.getByPlaceholder('名前・アドレスで検索').fill(TAG_A);
 			await narrowPage.getByRole('gridcell', { name: TAG_A, exact: true }).click();
 
 			// 狭幅では `<Drawer>`（`role="dialog"` + オーバーレイ）へフォールバック

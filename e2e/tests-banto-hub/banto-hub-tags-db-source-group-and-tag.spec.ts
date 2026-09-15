@@ -231,6 +231,10 @@ test.describe.serial('banto-hub postgres（DB Source）グループ作成・db �
 
 	test('4. 作成した db タグはグリッドの「種別」列に db と表示される', async () => {
 		await adminPage.goto('/tags');
+		// #379 CI 対応: BantoGrid は行を仮想化しており、スイート全体のタグ件数が
+		// 増えるとこの spec のタグ（後から作られる＝一覧の末尾）は DOM に無い
+		// （`banto-hub-tags-revision.spec.ts` 冒頭の doc comment 参照）。
+		await adminPage.getByPlaceholder('名前・アドレスで検索').fill(DB_TAG_NAME);
 		// `role=row`のアクセシブル名計算に依存せず、行内のテキスト内容で
 		// 絞り込む（`.filter({ hasText })`は可視テキストの部分一致で、
 		// アクセシビリティツリーの name 計算の実装差に左右されない）。

@@ -85,6 +85,10 @@ test.describe.serial('banto-hub タグ Drawer dirty 破棄確認 (TAG-UX-C)', ()
 
 	test.beforeEach(async () => {
 		await page.goto('/tags');
+		// #379 CI 対応: BantoGrid は行を仮想化しており、スイート全体のタグ件数が
+		// 増えると最終行は DOM に無い（`banto-hub-tags-revision.spec.ts` 冒頭の
+		// doc comment 参照）。名前でクリックする前に検索ボックスで絞り込む。
+		await page.getByPlaceholder('名前・アドレスで検索').fill(TAG_NAME);
 		await page.getByRole('gridcell', { name: TAG_NAME, exact: true }).click();
 		// #375: 編集・連続登録は非モーダルの右ペイン（`<aside aria-label>` =
 		// role `complementary`）になったため `role="dialog"` では取れない。
