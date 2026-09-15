@@ -9,6 +9,7 @@ import {
 	extractTagRefTokens,
 	findReferencingComputedTags,
 	formatDeleteConfirmMessage,
+	isExpressionRepresentableName,
 	type ReferencingTag
 } from './tagDeleteImpact';
 import type { CollectionGroup, PlcConnection, Tag } from './tagRegistryAdmin';
@@ -189,6 +190,29 @@ describe('extractTagRefTokens', () => {
 		expect(extractTagRefTokens('conn.group.tag')).toEqual([]);
 		expect(extractTagRefTokens('conn　.group.tag')).toEqual([]);
 		expect(expressionReferencesExternalName('conn　.group.tag', 'conn.group.tag')).toBe(false);
+	});
+});
+
+// --- isExpressionRepresentableName -------------------------------------------
+
+describe('isExpressionRepresentableName', () => {
+	/**
+	 * #379 レビュー対応: parser は `true`/`false` を真偽値リテラルとして先に
+	 * 解釈するので（`crates/banto-expr/src/parser.rs:313-318`）、第1セグメントが
+	 * それらの完全名は式に書けない。正は compile.rs の
+	 * `true_and_false_as_the_first_segment_are_not_tag_references`。
+	 */
+	it('第1セグメントが `true`/`false` の名前は式で表せない（#379）', () => {
+		expect(isExpressionRepresentableName('true.grp.tag')).toBe(false);
+		expect(isExpressionRepresentableName('false.grp.tag')).toBe(false);
+		// 前方一致や第2・第3セグメントは通常の識別子。
+		expect(isExpressionRepresentableName('trueish.grp.tag')).toBe(true);
+		expect(isExpressionRepresentableName('grp.true.tag')).toBe(true);
+		expect(isExpressionRepresentableName('grp.grp.false')).toBe(true);
+		// 関数名は予約語ではない（`(` が続くときだけ関数呼び出し）。
+		expect(isExpressionRepresentableName('if.grp.tag')).toBe(true);
+		expect(isExpressionRepresentableName('bit.grp.tag')).toBe(true);
+		expect(isExpressionRepresentableName('clamp.grp.tag')).toBe(true);
 	});
 });
 

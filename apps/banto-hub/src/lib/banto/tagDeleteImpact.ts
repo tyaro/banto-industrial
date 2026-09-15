@@ -137,14 +137,33 @@ const LEXER_SPACE_RUN = new RegExp(`${LEXER_SPACE}+`, 'g');
 const FULL_TAG_REF_PATTERN = new RegExp(`^${IDENT_SEGMENT}\\.${IDENT_SEGMENT}\\.${IDENT_SEGMENT}$`);
 
 /**
- * {@link FULL_TAG_REF_PATTERN} 参照。`abc-`（末尾ハイフン）や `a--b`
- * （連続ハイフン）が弾かれるのは、{@link IDENT_SEGMENT} が lexer の
- * 「`-` は直後に継続文字があるときだけ吸収」規則をそのまま写しているため
- * （#379 レビュー対応の2回目までは別の `DANGLING_HYPHEN_PATTERN` で後から
- * 弾いていたが、`IDENT_SEGMENT` 側を厳密にしたので不要になった）。
+ * **第1セグメントに置けない予約語**（#379 レビュー対応。正は
+ * `crates/banto-expr/tests/compile.rs` の
+ * `true_and_false_as_the_first_segment_are_not_tag_references`）:
+ * parser は識別子を見た時点で `true`/`false` を**真偽値リテラルとして先に
+ * 解釈する**（`crates/banto-expr/src/parser.rs:313-318` - `(` の判定より
+ * 前）ので、`true.grp.tag` は文字文法としては正しくても式に書けない
+ * （接続名は「空でない・最大長」しか制約が無いのでカタログ上は作れる）。
+ *
+ * **関数名（`if`/`min`/`max`/`abs`/`round`/`clamp`/`bit`）は予約語ではない**:
+ * 関数呼び出しになるのは直後が `(` のときだけで、`.` が続けばそのまま
+ * タグ参照として通る（同 parser.rs:320、上記テストで固定）。また `true`/
+ * `false` が予約なのは**第1セグメントちょうど**のときだけで、`trueish` の
+ * ような前方一致や第2・第3セグメントは通常の識別子。
+ */
+const RESERVED_FIRST_SEGMENTS = new Set(['true', 'false']);
+
+/**
+ * {@link FULL_TAG_REF_PATTERN} / {@link RESERVED_FIRST_SEGMENTS} 参照。
+ * `abc-`（末尾ハイフン）や `a--b`（連続ハイフン）が弾かれるのは、
+ * {@link IDENT_SEGMENT} が lexer の「`-` は直後に継続文字があるときだけ
+ * 吸収」規則をそのまま写しているため（#379 レビュー対応の2回目までは別の
+ * `DANGLING_HYPHEN_PATTERN` で後から弾いていたが、`IDENT_SEGMENT` 側を
+ * 厳密にしたので不要になった）。
  */
 export function isExpressionRepresentableName(externalName: string): boolean {
-	return FULL_TAG_REF_PATTERN.test(externalName);
+	if (!FULL_TAG_REF_PATTERN.test(externalName)) return false;
+	return !RESERVED_FIRST_SEGMENTS.has(externalName.slice(0, externalName.indexOf('.')));
 }
 
 /**
@@ -155,6 +174,10 @@ export function isExpressionRepresentableName(externalName: string): boolean {
  * 返す形と同じにするため（`TAG_REF_PATTERN` の doc comment「`.` の周りの
  * 空白」参照）。`isExpressionRepresentableName` は**名前**の判定なので
  * 空白を許さないままで、こちらとは非対称。
+ *
+ * {@link RESERVED_FIRST_SEGMENTS} の除外もこちらには要らない - 抽出元は
+ * 「既に compile できている式」なので `true.grp.tag` のような書けない参照は
+ * そもそも現れない（仮に現れても依存グラフに一致する id が無いだけで無害）。
  */
 export function extractTagRefTokens(expression: string): string[] {
 	return (expression.match(TAG_REF_PATTERN) ?? []).map((token) =>

@@ -522,8 +522,11 @@ issue #342 C の原案は「`ConnectionTree` でタグをクリックして挿�
 `-` は英数字・`_` の間にだけ置ける」**名前だけ（ハイフンが識別子へ吸収されるのは
 後ろに識別子継続文字が続くときだけ - `crates/banto-expr/src/lexer.rs`）。
 したがって日本語名・空白入りに加え、`abc-`（末尾ハイフン）・`a--b`（連続
-ハイフン）のような ASCII だけの名前も参照できない。判定はクライアント側の
-純関数
+ハイフン）のような ASCII だけの名前も参照できない。**第1セグメント（接続名）に
+`true` / `false` は使えない** - parser がそれらを真偽値リテラルとして先に解釈する
+ため（`crates/banto-expr/src/parser.rs`。関数名 `if`/`min`/`max`/`abs`/`round`/
+`clamp`/`bit` は直後が `(` のときだけ関数呼び出しなので、接続名として使える）。
+判定はクライアント側の純関数
 （`apps/banto-hub/src/lib/banto/expressionInsert.ts`）で、式からのタグ参照は
 パーサを複製せず既存の近似正規表現（`tagDeleteImpact.ts::extractTagRefTokens`）で
 抽出する。**この判定は UI の補助であり、正は上のサーバチェック**

@@ -594,6 +594,36 @@ fn whitespace_around_dots_is_allowed_in_a_tag_reference() {
 }
 
 #[test]
+fn true_and_false_as_the_first_segment_are_not_tag_references() {
+    // parser は識別子を見た時点で `true`/`false` を**真偽値リテラルとして先に
+    // 解釈する**（`crates/banto-expr/src/parser.rs:313-318` - `(` の判定より
+    // 前）。そのため第1セグメントが `true`/`false` の完全名は式に書けない。
+    // レジストリ側の接続名は「空でない・最大長」しか制約が無いので
+    // `true.grp.tag` というカタログ上有効な名前が作れてしまう -
+    // フロントの `isExpressionRepresentableName` はこの2語を予約扱いにする
+    // 必要がある（#379 レビュー指摘）。
+    for src in ["true.grp.tag", "false.grp.tag"] {
+        assert!(
+            matches!(assert_rejected(src), CompileError::Syntax { .. }),
+            "expected Syntax error for {src:?}"
+        );
+    }
+
+    // **関数名は予約語ではない**: `if`/`min`/`max`/`abs`/`round`/`clamp`/`bit`
+    // が関数呼び出しになるのは直後が `(` のときだけで（同 parser.rs:320）、
+    // `.` が続けばそのままタグ参照として通る。TS 側でも除外しない。
+    for src in ["if.grp.tag", "min.grp.tag", "bit.grp.tag", "clamp.grp.tag"] {
+        assert_eq!(referenced(src), vec![src.to_string()]);
+    }
+
+    // 予約なのは**第1セグメントちょうど**の `true`/`false` だけ。前方一致
+    // （`trueish`）や第2・第3セグメントは通常の識別子。
+    assert_eq!(referenced("trueish.grp.tag"), vec!["trueish.grp.tag"]);
+    assert_eq!(referenced("grp.true.tag"), vec!["grp.true.tag"]);
+    assert_eq!(referenced("grp.grp.false"), vec!["grp.grp.false"]);
+}
+
+#[test]
 fn only_space_tab_lf_cr_are_skipped_as_whitespace() {
     // lexer が読み飛ばすのは **空白・タブ・LF・CR の4種だけ**
     // （`crates/banto-expr/src/lexer.rs:89`）。垂直タブ・フォームフィード・
