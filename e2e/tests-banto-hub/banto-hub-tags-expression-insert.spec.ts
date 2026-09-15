@@ -351,6 +351,36 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 		await expect(toggle).toBeEnabled();
 	});
 
+	test('6.5. 複数選択モード中もトグルが押せず、ON のまま複数選択へ入ると OFF になる（#379 レビュー対応）', async () => {
+		const pane = page.getByRole('complementary', { name: `${COMPUTED_TAG_NAME} を編集` });
+		const toggle = pane.getByTestId('tag-expression-insert-toggle');
+		const selectionToggle = page.getByTestId('tag-selection-mode-toggle');
+
+		await toggle.click();
+		await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+
+		// ON のまま「複数選択」へ入ると、トグルは自動で OFF になり押せなくなる
+		// （`onRowClick` は `insertArmed` が最優先なので、両立させると
+		// 「複数選択を終了」と出ているのに1行も選べない不整合になる）。
+		await selectionToggle.click();
+		await expect(selectionToggle).toHaveText('複数選択を終了');
+		await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+		await expect(toggle).toBeDisabled();
+		await expect(page.getByTestId('tag-insert-armed-badge')).toHaveCount(0);
+
+		// 選択モードの既存挙動が生きている（行クリックで選択が切り替わる -
+		// 選択中の行は `rowClass` の `tag-row-selected` で強調される）。
+		await page.getByRole('gridcell', { name: COMPUTED_TAG_NAME, exact: true }).click();
+		await expect(page.locator('.row.tag-row-selected')).toHaveCount(1);
+
+		// 選択モードを勝手に終了させることはしない（選択集合を黙って捨てない
+		// ため）- 明示的に終了させれば再び押せるようになる。
+		await selectionToggle.click();
+		await expect(selectionToggle).toHaveText('複数選択');
+		await expect(page.locator('.row.tag-row-selected')).toHaveCount(0);
+		await expect(toggle).toBeEnabled();
+	});
+
 	test('7. ON のまま「新規登録」を押すと、モード遷移でトグルは OFF になる（#379 レビュー対応2）', async () => {
 		const editPane = page.getByRole('complementary', { name: `${COMPUTED_TAG_NAME} を編集` });
 		const editToggle = editPane.getByTestId('tag-expression-insert-toggle');

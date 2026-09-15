@@ -1848,6 +1848,13 @@
 	 * （未保存セル編集の破棄確認 `confirmDiscardPendingCellEdits` を迂回
 	 * させないため、`toggleSelectionMode` のような ON への巻き取りはしない）
 	 * - トグル側を `disabled` にして理由を添えるだけにする。
+	 *
+	 * #379 レビュー対応（4回目）: **複数選択モード（`selectionMode`）とも
+	 * 相互排他**。挿入 ON のまま「複数選択」を押せてしまうと、UI は
+	 * 「複数選択を終了」を出しているのに `onRowClick` の分岐は
+	 * `insertArmed` が最優先なので行を1つも選べない、という不整合になる。
+	 * 表編集モードと同じ方式で `disabled` にするだけで、**選択モードを
+	 * 勝手に終了はしない**（選択集合を黙って捨てないため）。
 	 */
 	const insertToggleAvailable = $derived(
 		canWrite &&
@@ -1855,8 +1862,8 @@
 			((drawerMode === 'create' && createForm.tagKind === 'computed') ||
 				(drawerMode === 'edit' && selected !== null && editForm.tagKind === 'computed'))
 	);
-	/** #379 レビュー対応1: 表示はするが押せない状態（表編集モード中）。 */
-	const insertToggleEnabled = $derived(insertToggleAvailable && !gridEditMode);
+	/** #379 レビュー対応: 表示はするが押せない状態（表編集モード中・複数選択モード中）。 */
+	const insertToggleEnabled = $derived(insertToggleAvailable && !gridEditMode && !selectionMode);
 
 	function toggleInsertArmed(): void {
 		if (!insertToggleEnabled) return;
@@ -1866,7 +1873,7 @@
 	/**
 	 * トグルが自動で OFF になる条件のうち「ペインを閉じた」「`tagKind` が
 	 * `computed` 以外に変わった」「別モードの Drawer を開いた」「狭幅へ
-	 * リサイズした」「表編集モードへ入った」をまとめて拾う（「編集対象が
+	 * リサイズした」「表編集モード・複数選択モードへ入った」をまとめて拾う（「編集対象が
 	 * 変わった」は下のモード遷移 `$effect`、「Esc」はその下の keydown）。
 	 */
 	$effect(() => {
@@ -4166,11 +4173,13 @@
 						（`insertToggleAvailable`）: 狭幅の `<Modal>`/`<Drawer>` では
 						オーバーレイの下のグリッドを触れないため。
 
-						#379 レビュー対応1: 表編集モード中は `disabled`
-						（`insertToggleEnabled`） - BantoGrid が `editable` 列を持つ間は
-						シングルクリックを `onRowClick` に流さないため、押せても挿入
-						できない。表編集モードを勝手に OFF にはしない（未保存セル編集の
-						破棄確認を迂回しないため）ので、理由だけ添える。
+						#379 レビュー対応: 表編集モード・複数選択モード中は `disabled`
+						（`insertToggleEnabled`） - 前者は BantoGrid が `editable` 列を
+						持つ間シングルクリックを `onRowClick` に流さないため押せても挿入
+						できず、後者は行クリックの意味が競合する（挿入が優先されて
+						1行も選べない）。**どちらのモードも勝手に OFF にはしない**
+						（未保存セル編集の破棄確認を迂回しない／選択集合を黙って捨てない）
+						ので、理由だけ添える。
 					-->
 					<div class="expr-insert-row">
 						<button
@@ -4185,7 +4194,8 @@
 						</button>
 						<span class="hint">
 							{#if !exprCheck.insertToggleEnabled}
-								表編集モード中は使えません（表編集を終了してから ON にしてください）。
+								表編集モードまたは複数選択モード中は使えません（そのモードを終了してから ON
+								にしてください）。
 							{:else if exprCheck.insertArmed}
 								一覧の行をクリックすると、この欄のキャレット位置に完全名が入ります（Esc で解除）。
 							{:else}
@@ -7339,7 +7349,8 @@
 
 	/*
 	 * #342 段階C: 「一覧から挿入」が ON の間、挿入できない行（自タグ・
-	 * 文字列型・循環になる参照）を淡色にする。`.tag-row-selected` と同じ
+	 * 式で表せない名前・文字列型・循環になる参照の4種類）を淡色にする
+	 * （`blockedInsertTargets` の判定と同じ）。`.tag-row-selected` と同じ
 	 * rowClass 仕組み（`:global` が要る理由もそちらのコメント参照）。
 	 * 色だけに頼らず、クリックすれば理由のトーストも出る。
 	 */
