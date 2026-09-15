@@ -1886,9 +1886,11 @@
 	 * `openXxxDrawer` に散らさず、必ずここ1箇所で落とす。**
 	 */
 	$effect(() => {
-		// 依存として読むのはこの2つだけ。
-		drawerMode;
-		selected?.id;
+		// 依存として読むのはこの2つだけ（`void` は値を捨てる意図の明示 -
+		// 素の式文は ESLint `@typescript-eslint/no-unused-expressions` に
+		// 引っかかる）。
+		void drawerMode;
+		void selected?.id;
 		untrack(() => {
 			insertArmed = false;
 		});
