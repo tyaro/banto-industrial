@@ -21,7 +21,7 @@
 	 * `dataType === 'string'` のときのみ表示・送信する（`MIN_STRING_LENGTH`/
 	 * `MAX_STRING_LENGTH` はヒント表示のみ - 実際の検証はバックエンド）。
 	 */
-	import { tick } from 'svelte';
+	import { tick, untrack } from 'svelte';
 	import { page } from '$app/state';
 	import { BantoGrid, type CellEdit, type GridColumn } from '@banto/grid-svelte';
 	import { isProviderError } from '@banto/admin-core';
@@ -292,6 +292,12 @@
 		 * オーバーレイの下のグリッドを触れないので、トグル自体を出さない）。
 		 */
 		insertToggleVisible: boolean;
+		/**
+		 * #379 レビュー対応1: トグルを押せるか。表編集モード（`gridEditMode`）中は
+		 * BantoGrid が行クリックを `onRowClick` へ流さないので `false`
+		 * （表示はしたまま `disabled` にして理由を出す）。
+		 */
+		insertToggleEnabled: boolean;
 		/** #342 段階C: トグルの ON/OFF（`aria-pressed`）。 */
 		insertArmed: boolean;
 		/** #342 段階C: トグルのクリック。 */
@@ -770,6 +776,7 @@
 			// も同時に1つしかマウントされないため。
 			bindTextarea: (el) => (exprTextareaEl = el),
 			insertToggleVisible: insertToggleAvailable,
+			insertToggleEnabled,
 			insertArmed,
 			onToggleInsert: toggleInsertArmed
 		};
@@ -1087,6 +1094,7 @@
 			// #342 段階C: `createExprFieldHandlers` と同じ受け口（そちらのコメント参照）。
 			bindTextarea: (el) => (exprTextareaEl = el),
 			insertToggleVisible: insertToggleAvailable,
+			insertToggleEnabled,
 			insertArmed,
 			onToggleInsert: toggleInsertArmed
 		};
@@ -1274,9 +1282,9 @@
 		// S3: 編集対象が変わるたびに「列を取得」の結果もリセットする -
 		// 前に開いていたタグと収集グループが違えば候補列も違うため。
 		editDescribeState = blankDescribeState();
-		// #342 段階C: 編集対象が変わったら「一覧から挿入」は解除する
-		// （自タグ・循環の判定基準が変わるため、暗黙に持ち越さない）。
-		insertArmed = false;
+		// #342 段階C: 「一覧から挿入」の解除はここでは行わない - `drawerMode` と
+		// `selected?.id` の変化を追う `$effect`（#379 レビュー対応2）が
+		// モード遷移・対象切替をまとめて OFF にする。
 		drawerMode = 'edit'; // T13-1: 行クリック編集はドロワーで開く
 	}
 
@@ -1829,6 +1837,16 @@
 	 * トグルを出してよいか＝「式欄が非モーダルのペインに出ている」かどうか。
 	 * 狭幅（`<Modal>`/`<Drawer>`）ではオーバーレイの下のグリッドを触れない
 	 * ので出さない。`tagKind` が `computed` でなければ式欄自体が無い。
+	 *
+	 * #379 レビュー対応1: **表編集モード（`gridEditMode`）とは相互排他**。
+	 * BantoGrid の `handleCellClick` は `if (!hasEditableColumns)
+	 * onRowClick?.(row)`（`node_modules/@banto/grid-svelte/src/BantoGrid.svelte`）
+	 * で、`editable` を持つ列が1つでもある間はシングルクリックが
+	 * `onRowClick` に届かない - 表編集中にトグルだけ ON にできると、押せる
+	 * のに何も起きない状態になる。**表編集モードを勝手に OFF にはしない**
+	 * （未保存セル編集の破棄確認 `confirmDiscardPendingCellEdits` を迂回
+	 * させないため、`toggleSelectionMode` のような ON への巻き取りはしない）
+	 * - トグル側を `disabled` にして理由を添えるだけにする。
 	 */
 	const insertToggleAvailable = $derived(
 		canWrite &&
@@ -1836,19 +1854,44 @@
 			((drawerMode === 'create' && createForm.tagKind === 'computed') ||
 				(drawerMode === 'edit' && selected !== null && editForm.tagKind === 'computed'))
 	);
+	/** #379 レビュー対応1: 表示はするが押せない状態（表編集モード中）。 */
+	const insertToggleEnabled = $derived(insertToggleAvailable && !gridEditMode);
 
 	function toggleInsertArmed(): void {
+		if (!insertToggleEnabled) return;
 		insertArmed = !insertArmed;
 	}
 
 	/**
 	 * トグルが自動で OFF になる条件のうち「ペインを閉じた」「`tagKind` が
 	 * `computed` 以外に変わった」「別モードの Drawer を開いた」「狭幅へ
-	 * リサイズした」をまとめて拾う（「編集対象が変わった」は `selectTag`、
-	 * 「Esc」は下の keydown で個別に落とす）。
+	 * リサイズした」「表編集モードへ入った」をまとめて拾う（「編集対象が
+	 * 変わった」は下のモード遷移 `$effect`、「Esc」はその下の keydown）。
 	 */
 	$effect(() => {
-		if (!insertToggleAvailable) insertArmed = false;
+		if (!insertToggleEnabled) insertArmed = false;
+	});
+
+	/**
+	 * #379 レビュー対応2: **モード遷移では必ず OFF にする**。`drawerMode` と
+	 * 編集対象（`selected?.id`）の変化だけを依存に取り、変わったら
+	 * `untrack` で `insertArmed` を落とす（`insertArmed` を依存に入れないので
+	 * トグル操作そのものでは再実行されない）。
+	 *
+	 * 上の `insertToggleEnabled` の `$effect` だけでは不足する: 編集ペインで
+	 * ON のまま「新規登録」「このタグを複製」を押すと `drawerMode` は
+	 * `'create'` へ移るが、`calc` 配下グループ由来で `tagKind` が `computed`
+	 * なら `insertToggleEnabled` は true のままで ON が残ってしまう（別タグへ
+	 * 切り替える `selectTag` も同様）。**モード遷移の OFF は個別の
+	 * `openXxxDrawer` に散らさず、必ずここ1箇所で落とす。**
+	 */
+	$effect(() => {
+		// 依存として読むのはこの2つだけ。
+		drawerMode;
+		selected?.id;
+		untrack(() => {
+			insertArmed = false;
+		});
 	});
 
 	/**
@@ -2146,9 +2189,8 @@
 
 	function closeDrawer(): void {
 		drawerMode = null;
-		// #342 段階C: ペインを閉じたら「一覧から挿入」も解除する（`$effect` でも
-		// 落ちるが、ここで明示しておく - 閉じる経路はこの1本に集約されている）。
-		insertArmed = false;
+		// #342 段階C: 「一覧から挿入」の解除はここでは行わない（#379 レビュー
+		// 対応2 のモード遷移 `$effect` が `drawerMode` の変化で落とす）。
 		// T18-1（TAG-UX-C 4点目、差分表示 UI）: Drawer を閉じたら競合パネルの
 		// 状態も破棄する（`confirmDiscardIfNeeded` 経由の破棄確認は
 		// `onRequestClose` が既に済ませている — ここは後始末のみ）。
@@ -4068,8 +4110,17 @@
 				exprCheck.preview && !exprCheck.preview.ok && exprCheck.preview.error
 					? exprCheck.preview.error.pos
 					: null}
-			<label class="field wide">
-				式（expression）<span class="required">*</span>
+			<!--
+				#379 レビュー対応4: 式欄は `<label>` で囲む暗黙の関連付けをやめ、
+				**`<div class="field wide">` + `for="tag-expression"` の明示形**に
+				した。`<label>` の中に「一覧から挿入」ボタン・エラーメッセージ
+				ボタン・プレビューまで入っていたため、それらのテキストが textarea の
+				アクセシブル名に混ざり、さらにボタンのクリックがラベル活性化
+				（textarea へのフォーカス移動）まで引き起こしていた。`.field` は
+				flex column のままなので見た目は変わらない。
+			-->
+			<div class="field wide">
+				<label for="tag-expression">式（expression）<span class="required">*</span></label>
 				<!--
 					#342 段階A: textarea の下にミラー要素（同じフォント・パディング・
 					折り返し）を重ね、`pos`（バイト = 文字オフセット、
@@ -4111,6 +4162,12 @@
 						**フォームが非モーダルのペインに出ているときしか出さない**
 						（`insertToggleAvailable`）: 狭幅の `<Modal>`/`<Drawer>` では
 						オーバーレイの下のグリッドを触れないため。
+
+						#379 レビュー対応1: 表編集モード中は `disabled`
+						（`insertToggleEnabled`） - BantoGrid が `editable` 列を持つ間は
+						シングルクリックを `onRowClick` に流さないため、押せても挿入
+						できない。表編集モードを勝手に OFF にはしない（未保存セル編集の
+						破棄確認を迂回しないため）ので、理由だけ添える。
 					-->
 					<div class="expr-insert-row">
 						<button
@@ -4118,14 +4175,19 @@
 							class="secondary expr-insert-toggle"
 							data-testid="tag-expression-insert-toggle"
 							aria-pressed={exprCheck.insertArmed}
+							disabled={!exprCheck.insertToggleEnabled}
 							onclick={exprCheck.onToggleInsert}
 						>
 							一覧から挿入
 						</button>
 						<span class="hint">
-							{exprCheck.insertArmed
-								? '一覧の行をクリックすると、この欄のキャレット位置に完全名が入ります（Esc で解除）。'
-								: 'ON にすると、一覧の行クリックでタグの完全名をこの欄へ挿入できます。'}
+							{#if !exprCheck.insertToggleEnabled}
+								表編集モード中は使えません（表編集を終了してから ON にしてください）。
+							{:else if exprCheck.insertArmed}
+								一覧の行をクリックすると、この欄のキャレット位置に完全名が入ります（Esc で解除）。
+							{:else}
+								ON にすると、一覧の行クリックでタグの完全名をこの欄へ挿入できます。
+							{/if}
 						</span>
 					</div>
 				{/if}
@@ -4187,7 +4249,7 @@
 						</p>
 					</div>
 				{/if}
-			</label>
+			</div>
 		{/if}
 		<!--
 			#325（2026-09-08 オーナー決定）: i64/u64/f64 は modbus-tcp 接続配下

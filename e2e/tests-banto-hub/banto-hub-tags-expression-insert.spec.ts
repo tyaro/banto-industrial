@@ -52,14 +52,24 @@ function waitForExpressionCheck(page: Page) {
 	);
 }
 
+/**
+ * #379 レビュー対応3: 狭幅フォールバックの確認に使うビューポート。#375 の
+ * `banto-hub-tags-edit-pane.spec.ts` と同じ 880x800（`mobileNavStore.isNarrow`
+ * = `(max-width: 900px)` の内側で、かつグリッドを操作できる幅。同 spec の
+ * `NARROW_VIEWPORT` の注記参照）。
+ */
+const NARROW_VIEWPORT = { width: 880, height: 800 };
+
 test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#342 段階C)', () => {
 	let page: Page;
+	/** #379 レビュー対応3: 狭幅テストで別タブへ流し込むため describe スコープに持つ。 */
+	let token: string;
 
 	test.beforeAll(async ({ browser }) => {
 		page = await browser.newPage();
 		await page.goto('/login');
 
-		const token = await fetchAuthToken(page.request);
+		token = await fetchAuthToken(page.request);
 		await injectAuthToken(page, token);
 		const authedHeaders = { ...CSRF_HEADERS, Authorization: `Bearer ${token}` };
 
@@ -169,9 +179,15 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 
 		const expressionField = pane.getByLabel('式');
 		await expect(expressionField).toBeVisible();
+		// #379 レビュー対応4: 式欄のラベルは `<label for="tag-expression">` の
+		// 明示形。`<label>` でフォーム全体を囲んでいた頃はトグルやエラー
+		// メッセージ・プレビューのテキストまでアクセシブル名に混ざっていた。
+		await expect(expressionField).toHaveAccessibleName(/^式（expression）/);
+		await expect(expressionField).not.toHaveAccessibleName(/一覧から挿入/);
 
 		const toggle = pane.getByTestId('tag-expression-insert-toggle');
 		await expect(toggle).toBeVisible();
+		await expect(toggle).toBeEnabled();
 		await expect(toggle).toHaveAttribute('aria-pressed', 'false');
 
 		// 挿入先の式とキャレット位置を作る（`(` の直後 = オフセット1）。
@@ -279,5 +295,75 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 		await expect(page.getByTestId('tag-insert-armed-badge')).toHaveCount(0);
 		// #375 で決めたとおり、Esc はペイン自体を閉じない。
 		await expect(pane).toBeVisible();
+	});
+
+	test('6. 表編集モード中はトグルが押せず、ON のまま表編集へ入ると OFF になる（#379 レビュー対応1）', async () => {
+		const pane = page.getByRole('complementary', { name: `${COMPUTED_TAG_NAME} を編集` });
+		const toggle = pane.getByTestId('tag-expression-insert-toggle');
+		const gridEditToggle = page.getByTestId('tag-grid-edit-mode-toggle');
+
+		// まず ON にしてから表編集モードへ入ると、トグルは自動で OFF になり
+		// 押せなくなる（BantoGrid が `editable` 列を持つ間はシングルクリックを
+		// `onRowClick` へ流さないため - 押せるのに何も起きない状態を作らない）。
+		await toggle.click();
+		await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+
+		await gridEditToggle.click();
+		await expect(gridEditToggle).toHaveText('表編集を終了');
+		await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+		await expect(toggle).toBeDisabled();
+		await expect(page.getByTestId('tag-insert-armed-badge')).toHaveCount(0);
+
+		// 表編集モードを勝手に終了させることはしない（未保存セル編集の破棄確認を
+		// 迂回しないため）- 明示的に終了させれば再び押せるようになる。
+		await gridEditToggle.click();
+		await expect(gridEditToggle).toHaveText('表編集');
+		await expect(toggle).toBeEnabled();
+	});
+
+	test('7. ON のまま「新規登録」を押すと、モード遷移でトグルは OFF になる（#379 レビュー対応2）', async () => {
+		const editPane = page.getByRole('complementary', { name: `${COMPUTED_TAG_NAME} を編集` });
+		const editToggle = editPane.getByTestId('tag-expression-insert-toggle');
+		await editToggle.click();
+		await expect(editToggle).toHaveAttribute('aria-pressed', 'true');
+
+		// `calc` グループが選択されたままなので、新規登録も `tagKind === 'computed'`
+		// ＝トグルの表示条件は満たしたまま。それでもモード遷移で OFF に戻る。
+		await page.getByRole('button', { name: '新規登録' }).click();
+
+		const createPane = page.getByRole('complementary', { name: '新規作成' });
+		await expect(createPane).toBeVisible();
+		const createToggle = createPane.getByTestId('tag-expression-insert-toggle');
+		await expect(createToggle).toBeVisible();
+		await expect(createToggle).toHaveAttribute('aria-pressed', 'false');
+		await expect(page.getByTestId('tag-insert-armed-badge')).toHaveCount(0);
+	});
+
+	test('8. 狭幅では新規作成が Modal で出て、「一覧から挿入」トグルは出ない（#379 レビュー対応3）', async ({
+		browser
+	}) => {
+		// `sessionStorage` はタブごとなので、新しいページには改めてトークンを
+		// 流し込む（`banto-hub-tags-edit-pane.spec.ts` の注記と同じ）。
+		const narrowPage = await browser.newPage({ viewport: NARROW_VIEWPORT });
+		try {
+			await narrowPage.goto('/login');
+			await injectAuthToken(narrowPage, token);
+			await narrowPage.goto('/tags');
+
+			await groupNodeByName(narrowPage, CALC_GROUP_NAME).click();
+			await narrowPage.getByRole('button', { name: '新規登録' }).click();
+
+			// 狭幅の新規作成は従来どおり中央モーダル（`role="dialog"`）。
+			const modal = narrowPage.getByRole('dialog', { name: '新規作成' });
+			await expect(modal).toBeVisible();
+			await expect(narrowPage.getByRole('complementary', { name: '新規作成' })).toHaveCount(0);
+
+			// `tagKind` は `calc` グループ由来で `computed` に確定しており式欄は
+			// 出るが、オーバーレイの下のグリッドを触れないのでトグルは出さない。
+			await expect(modal.getByLabel('式')).toBeVisible();
+			await expect(modal.getByTestId('tag-expression-insert-toggle')).toHaveCount(0);
+		} finally {
+			await narrowPage.close();
+		}
 	});
 });
