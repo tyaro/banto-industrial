@@ -8,6 +8,7 @@ import {
 	sinkGroupToForm,
 	validateSinkGroupForm
 } from './sinkGroupForm';
+import { isFormDirty } from './formDirty';
 import type { SinkGroup } from './sinkGroupsAdmin';
 
 describe('buildRecommendedDdl', () => {
@@ -187,5 +188,62 @@ describe('intervalMsLabel', () => {
 	it('changes label for on_change mode', () => {
 		expect(intervalMsLabel('interval')).toBe('発行間隔（ミリ秒）');
 		expect(intervalMsLabel('on_change')).toBe('最短発行間隔（ミリ秒）');
+	});
+});
+
+/**
+ * 2026-09-15 追補（誤爆防止、`SinkGroupDrawer.svelte::baseline`/`dirty`、
+ * #376 取りこぼしの回収）: `plcConnectionForm.test.ts`/`collectionGroupForm.
+ * test.ts` の同名 describe と同じ理由・同じパターン - `SinkGroupDrawer.svelte`
+ * 自体はユニットテスト対象外（Svelte コンポーネント）なので、実際に使う
+ * `blankSinkGroupForm`/`sinkGroupToForm`（baseline の作り方そのもの）と
+ * `isFormDirty` の組み合わせをここで固定する。`SinkGroupDrawer` に
+ * `readOnly` 相当のモードは無いため、readOnly 用のケースは無い。
+ */
+describe('SinkGroupDrawer の dirty 判定（baseline は開いた時点のフォームスナップショット）', () => {
+	it('新規作成: 開いた直後（baseline = blankSinkGroupForm 相当）は dirty ではない', () => {
+		const baseline = blankSinkGroupForm();
+		const form = { ...baseline, tagIds: [...baseline.tagIds] };
+		expect(isFormDirty(baseline, form)).toBe(false);
+	});
+
+	it('新規作成: 名前を1文字変えると dirty になる', () => {
+		const baseline = blankSinkGroupForm();
+		const form = { ...baseline, tagIds: [...baseline.tagIds], name: 'a' };
+		expect(isFormDirty(baseline, form)).toBe(true);
+	});
+
+	it('再設定: 開いた直後（baseline = sinkGroupToForm(group)）は dirty ではない', () => {
+		const group: SinkGroup = {
+			id: 7,
+			name: 'line1-log',
+			dbConnectionId: 3,
+			mode: 'on_change',
+			intervalMs: 2000,
+			tableName: 'reporting.tag_history',
+			storeBad: true,
+			enabled: false,
+			tagIds: [10, 11]
+		};
+		const baseline = sinkGroupToForm(group);
+		const form = { ...baseline, tagIds: [...baseline.tagIds] };
+		expect(isFormDirty(baseline, form)).toBe(false);
+	});
+
+	it('再設定: 対象タグを1件追加すると dirty になる', () => {
+		const group: SinkGroup = {
+			id: 7,
+			name: 'line1-log',
+			dbConnectionId: 3,
+			mode: 'on_change',
+			intervalMs: 2000,
+			tableName: 'reporting.tag_history',
+			storeBad: true,
+			enabled: false,
+			tagIds: [10, 11]
+		};
+		const baseline = sinkGroupToForm(group);
+		const form = { ...baseline, tagIds: [...baseline.tagIds, 12] };
+		expect(isFormDirty(baseline, form)).toBe(true);
 	});
 });

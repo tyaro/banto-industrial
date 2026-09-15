@@ -9,7 +9,7 @@ banto-industrial のリリースノート。日付は JST。バージョンは [
 ### 修正（2026-09-15）
 
 - **未保存のとき Esc・オーバーレイクリックで Drawer/Modal を閉じないようにした**。`Drawer.svelte`/`Modal.svelte` に `dirty` prop を追加し、`true` の間はこの2経路を無効化する - `×` ボタン経由の確認（`onRequestClose`）はそのまま塞がない。
-- **接続 Drawer・収集グループ Drawer には未保存確認そのものが無かった不具合を修正**。`ConnectionDrawer.svelte`/`CollectionGroupDrawer.svelte` の `onRequestClose` はこれまで busy 判定のみで、未保存の入力があっても Esc・オーバーレイクリック・`×` のいずれでも確認なしに即閉じていた。タグ編集画面と同じ `isFormDirty` ベースの破棄確認（`window.confirm('変更を破棄しますか？')`）を追加した。新規作成ウィザード（3ステップ）でも同様に効く。
+- **接続 Drawer・収集グループ Drawer・Sink グループ Drawer には未保存確認そのものが無かった不具合を修正**。`ConnectionDrawer.svelte`/`CollectionGroupDrawer.svelte`/`SinkGroupDrawer.svelte` の `onRequestClose` はこれまで busy 判定のみで、未保存の入力があっても Esc・オーバーレイクリック・`×` のいずれでも確認なしに即閉じていた。タグ編集画面と同じ `isFormDirty` ベースの破棄確認（`window.confirm('変更を破棄しますか？')`）を追加した。新規作成ウィザード（3ステップ）でも同様に効く。
 - タグ編集 Drawer は既存の未保存確認（`confirmDiscardIfNeeded`）に変更なし - 今回は Esc・オーバーレイクリックの誤爆防止を追加しただけ。
 - ペイン構成（右ペイン常設化）の見直しは別 issue で扱う。
 

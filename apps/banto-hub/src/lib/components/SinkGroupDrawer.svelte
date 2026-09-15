@@ -19,10 +19,21 @@
 	 * 純関数部分（検証・DDL 組み立て・フォーム⇄API入力変換）は
 	 * `$lib/banto/sinkGroupForm.ts` へ切り出し済み（そちらでユニットテスト
 	 * 済み）。
+	 *
+	 * **2026-09-15 追補（誤爆防止、#376 取りこぼしの回収）**:
+	 * `ConnectionDrawer.svelte`/`CollectionGroupDrawer.svelte` と同型の欠陥
+	 * が本コンポーネントにもあった - `onRequestClose` が `!isBusy()` のみで
+	 * 未保存確認が無く、Esc・オーバーレイクリック・`×` のどの経路でも未保存の
+	 * 入力を無確認で捨てていた。同じ方法（`baseline` を開いた時点のフォーム
+	 * スナップショットとして持ち、`isFormDirty(baseline, form)` を `dirty` と
+	 * して `Drawer.svelte` へ渡す。`onRequestClose` も `dirty` なら
+	 * `window.confirm` で確認する）で揃える。`readOnly` 相当のモードは
+	 * 存在しない（このコンポーネントに `readOnly` prop は無い）。
 	 */
 	import { isProviderError } from '@banto/admin-core';
 	import Drawer from './Drawer.svelte';
 	import { toastStore } from '$lib/toast.svelte';
+	import { isFormDirty } from '$lib/banto/formDirty';
 	import {
 		createSinkGroup,
 		deleteSinkGroup,
@@ -96,6 +107,17 @@
 	const dbConnectionOptions = $derived(connections.filter(isDbSourceConnection));
 
 	let form: SinkGroupFormState = $state(blankSinkGroupForm());
+	/**
+	 * 2026-09-15 追補: `ConnectionDrawer.svelte::baseline` と同じ役割・同じ
+	 * 流儀（通常の `let`、`$state` にしない）。`tagIds` は配列なので、
+	 * `form` と参照を共有しないよう明示的に複製する（`toggleTag` は常に
+	 * `form.tagIds = ...` で新しい配列へ差し替えるため実害は無いが、
+	 * `sinkGroupToForm` 自身が複製する方針 - 上のテスト
+	 * 「タグ id 配列は複製である」- に揃える）。
+	 */
+	let baseline: SinkGroupFormState = blankSinkGroupForm();
+	/** `dirty` の間は Esc・オーバーレイクリックで閉じない（`Drawer.svelte` の `dirty` prop）。 */
+	const dirty = $derived(isFormDirty(baseline, form));
 	let errors: Record<string, string> = $state({});
 	let saving = $state(false);
 	let deleting = $state(false);
@@ -121,6 +143,7 @@
 			}
 			form = blank;
 		}
+		baseline = { ...form, tagIds: [...form.tagIds] };
 		errors = {};
 		tagSearch = '';
 	});
@@ -238,7 +261,11 @@
 		try {
 			const updated = await updateSinkGroup(group.id, formToSinkGroupInput(form));
 			toastStore.push('success', '更新しました');
+			// 保存成功後はサーバーの正規化値を基準に取り直す（ConnectionDrawer
+			// の handleSave と同じ方針）。Drawer は閉じない。baseline も同じ値へ
+			// 揃えることで、保存直後は dirty ではない状態に戻す。
 			form = sinkGroupToForm(updated);
+			baseline = { ...form, tagIds: [...form.tagIds] };
 			onSaved(updated);
 		} catch (err) {
 			const fieldErrors = applyFieldErrors(err);
@@ -269,12 +296,32 @@
 		return saving || deleting;
 	}
 
+	/**
+	 * 2026-09-15 追補: `ConnectionDrawer.svelte::onRequestClose` と同じ理由・
+	 * 同じ実装 - 処理中は閉じさせず、未保存の変更（`dirty`）があれば
+	 * `confirmDiscardIfNeeded` と同じ文言・同じ順序で破棄確認する。
+	 */
 	function onRequestClose(): boolean {
-		return !isBusy();
+		if (isBusy()) return false;
+		if (dirty && !window.confirm('変更を破棄しますか？')) return false;
+		return true;
+	}
+
+	/** `dirty` のため Esc/オーバーレイクリックが弾かれたことを案内する。 */
+	function notifyBlockedClose(): void {
+		toastStore.push('info', '未保存の変更があります。閉じるには × を押してください。');
 	}
 </script>
 
-<Drawer {open} title={drawerTitle} {onRequestClose} onclose={onClose} width="560px">
+<Drawer
+	{open}
+	title={drawerTitle}
+	{onRequestClose}
+	onclose={onClose}
+	width="560px"
+	{dirty}
+	onBlockedClose={notifyBlockedClose}
+>
 	<p class="note">
 		変更は即時に反映されます（保留中の変更キューには載りません）。サイドカーはこの変更を
 		<code>config_refresh_secs</code>（既定30秒）以内に取り込みます。
