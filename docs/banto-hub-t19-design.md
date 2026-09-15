@@ -389,7 +389,10 @@ MIT で cargo-deny 通過）を banto-hub-core に追加して自前実装した
 `configPackageAdmin.ts::exportConfigPackageToDownload` に切り出し、設定画面とコマンドパレットの
 両方から呼べるようにした（設定画面の export ボタン挙動は不変）。(2) コマンドパレットに
 `config.export`（その場でダウンロード）と `config.import`（`/settings#config-package` へ誘導 -
-import はファイル選択が要るため）を admin 限定（`visible`）で追加。(3) 設定画面の該当 section に
+import はファイル選択が要るため。**2026-09-15 追記（#359 段階2）**: 設定画面のカテゴリ別
+ルート化により遷移先は `/settings/data#config-package` に変わった - `id="config-package"` は
+DataSection.svelte 側に残っているのでハッシュ誘導自体は無改変）を admin 限定（`visible`）で追加。
+(3) 設定画面の該当 section に
 `id="config-package"` を付け、見出しを「構成パッケージ」→「構成の保存・読み込み（バックアップ）」に
 改称（section の移動・再構成はしない）。実装中、S3-a で追加したオフキャンバス E2E の test 4 に
 潜在バグ（バックドロップ中心が aside に覆われ intercept される、負荷時に顕在化するタイミング

@@ -134,7 +134,12 @@ v0.2.0-alpha.12）: 上記で効果を失っていた T15-3 テスト出力
 （`TestOutputControl`、`POST /api/test-output/enable|disable`、status の
 `test_output`、gRPC `StreamValues.test_output`／`ValueBatch.simulation`・
 `run_id`）を機構ごと撤去した（撤去済み・経緯として保存）。詳細は §6.3・
-T15 節。
+T15 節。**2026-09-15**（#359 banto-hub 分）: 設定画面（`/settings`）を
+`/settings/{appearance,account,connectivity,data,security}` のカテゴリ別
+実ルートへ分割した（`/settings` は先頭の可視カテゴリへ 307 redirect、
+ブックマーク互換は維持）。§9.7 の route 移設マトリクスが想定する運転/設定/
+モニタ/外部連携/管理への app 全体再編とは別軸（詳細は同マトリクス直後の
+追記参照）。chronogazer・relay-wright への展開は別 PR。
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [banto-hub-t16-design.md](banto-hub-t16-design.md)、
@@ -1380,6 +1385,16 @@ flowchart LR
 | 外部連携 | REST / WS、MQTT、gRPC、API キー（旧: SIM テスト出力。#362 で撤去済み） | `/api-keys` と `/settings` の MQTT / gRPC 部分を再配置               |
 | 管理     | サービス、ユーザー、監査、ログ、診断、アプリ設定                       | `/users`、`/audit-log`、`/write-audit` と `/settings` の残りを再配置 |
 
+**2026-09-15 追記（#359）**: 上表の「外部連携」「管理」行が指す `/settings` の
+MQTT/gRPC 部分・残り部分の再配置先は、本計画（運転/設定/モニタ/外部連携/管理の
+5区分への app 全体再編）としては依然未定のまま。ただし `/settings` 自体は
+#359 で `/settings/{appearance,account,connectivity,data,security}` の
+カテゴリ別ルートに先に分割済み（MQTT/gRPC は `connectivity` へ、上表の
+「管理」に相当する残り（アカウント・データ保持・構成パッケージ・試運転
+ロックダウン）は `account`/`data`/`security` へ）。この5カテゴリは本計画の
+5区分とは無関係の別軸（`/settings` の中の内部分割）であり、本計画が実行される
+ときは `/settings/{category}` 単位でこの表の行へ再配置する形になる想定。
+
 共通運転バーは5区分の外側へ置き、どの route でも同じ位置と Tab 順序にする。
 現在区分とページ名を文字で示し、権限のない区分／項目は表示しない。直接 URL には
 `403 Forbidden` を返す。狭幅では区分を1つのメニューボタンへ畳むが、運転状態と
@@ -2369,7 +2384,12 @@ owner ACL を設定する。グループ変更、profile owner 追加、ACL 変�
   チェックリスト（§12.2）」へ再分類し、性能テストは CI では非ブロッキング
   の計測記録に留める。
 - **route 移設マトリクス（旧 URL → 新 URL → redirect 有無）を確定**（現状
-  明記は `/status → /operation` のみ、`/settings` の分割先が未定）。LAN
+  明記は `/status → /operation` のみ。`/settings` 自体は #359（2026-09-15）で
+  `/settings/{appearance,account,connectivity,data,security}` のカテゴリ別
+  ルートに分割済み（`/settings` は先頭の可視カテゴリへ redirect）だが、
+  本計画が想定する運転/設定/モニタ/外部連携/管理への再配置先は依然未定 -
+  上の移設マトリクス表の「外部連携」「管理」行が触れる `/settings` の
+  再配置とは別軸）。LAN
   ブラウザでの「管理 > サービス」は read-only 状態表示（停止操作が「できない
   理由」を示せる）とする。
 - **受入の測定プロトコルを T18-5 前に1節追加**（数値自体は妥当なので変えない）:

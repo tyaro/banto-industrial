@@ -55,7 +55,7 @@ test.describe.serial('banto-hub コマンドパレットの構成パッケージ
 		await expect(page.getByRole('dialog', { name: 'コマンドパレット' })).not.toBeVisible();
 	});
 
-	test('2. import コマンドを実行すると /settings へ遷移し、構成セクションが見える', async () => {
+	test('2. import コマンドを実行すると /settings/data へ遷移し、構成セクションが見える', async () => {
 		await page.goto('/tags');
 		// Ctrl+K は (app)/+layout.svelte のグローバル keydown リスナーで拾う
 		// ため、ハイドレーション完了前に押すとイベントが素通りしてパレットが
@@ -64,10 +64,18 @@ test.describe.serial('banto-hub コマンドパレットの構成パッケージ
 		await openPaletteAndSearch(page, '構成');
 		await page.getByRole('option', { name: /^構成パッケージを取り込む/ }).click();
 
-		await expect(page).toHaveURL(/\/settings#config-package$/);
-		await expect(
-			page.getByRole('heading', { level: 2, name: '構成の保存・読み込み（バックアップ）' })
-		).toBeVisible();
+		// #359 段階2: 構成パッケージのセクションは data カテゴリへ移設
+		// （`/settings#config-package` → `/settings/data#config-package`）。
+		await expect(page).toHaveURL(/\/settings\/data#config-package$/);
+		const heading = page.getByRole('heading', {
+			level: 2,
+			name: '構成の保存・読み込み（バックアップ）'
+		});
+		await expect(heading).toBeVisible();
+		// ハッシュ誘導が見出しだけでなく実際に viewport 内へスクロールする
+		// ことも確認する（`DataSection.svelte` の `scrollIntoView` フォール
+		// バック - SvelteKit 標準のハッシュスクロールだけに頼らない）。
+		await expect(heading).toBeInViewport();
 	});
 
 	test('3. export コマンドを実行するとダウンロードが発火し、成功トーストが出る', async () => {

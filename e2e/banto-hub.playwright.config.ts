@@ -64,8 +64,18 @@ const BASE_URL = `http://127.0.0.1:${PORT}`;
 const LOCKED_DOWN_PORT = 8802;
 const LOCKED_DOWN_BASE_URL = `http://127.0.0.1:${LOCKED_DOWN_PORT}`;
 
-/** ロックダウン済みサーバーで走らせる唯一の spec（下記 `projects` 参照）。 */
-const LOCKED_DOWN_SPEC = '**/banto-hub-status-pending-apply-cancel.spec.ts';
+/**
+ * ロックダウン済みサーバーで走らせる spec 一覧（下記 `projects` 参照）。
+ * #359（PR #371 の Copilot レビュー是正）で `banto-hub-settings-guard.
+ * spec.ts` を追加した - `guardCategory` の redirect（非可視カテゴリの
+ * `security` を再現するにはロックダウン済みが要る）と、`/settings/data`
+ * 直接遷移時の構成パッケージ import ガード回帰の固定を、この専用サーバーで
+ * 行う（同 spec の doc comment参照）。
+ */
+const LOCKED_DOWN_SPECS = [
+	'**/banto-hub-status-pending-apply-cancel.spec.ts',
+	'**/banto-hub-settings-guard.spec.ts'
+];
 
 // chronogazer の `BANTO_E2E_DB_DIR`/`dbDir` と同じ理由（SqliteConnectOptions::
 // create_if_missing はファイルは作るが親ディレクトリは作らない）で、一時
@@ -129,21 +139,21 @@ export default defineConfig({
 		screenshot: 'only-on-failure'
 	},
 	// #341: 試運転モードのサーバー（既定）と、ロックダウン済み専用サーバーの
-	// 2プロジェクト。`LOCKED_DOWN_SPEC` だけが後者で走り、他の spec は前者で
-	// 走る（`testIgnore`/`testMatch` で厳密に排他にしてあるので、どちらの
-	// プロジェクトでも二重に走る spec は無い）。`workers: 1` /
-	// `fullyParallel: false` は維持しているため、2つのプロジェクトも順番に
-	// 実行される（同時に2つのサーバーが**起動**してはいるが、テストが同時に
-	// 走ることはない）。
+	// 2プロジェクト。`LOCKED_DOWN_SPECS` に載っている spec だけが後者で走り、
+	// 他の spec は前者で走る（`testIgnore`/`testMatch` で厳密に排他にして
+	// あるので、どちらのプロジェクトでも二重に走る spec は無い）。
+	// `workers: 1` / `fullyParallel: false` は維持しているため、2つの
+	// プロジェクトも順番に実行される（同時に2つのサーバーが**起動**しては
+	// いるが、テストが同時に走ることはない）。
 	projects: [
 		{
 			name: 'chromium',
-			testIgnore: LOCKED_DOWN_SPEC,
+			testIgnore: LOCKED_DOWN_SPECS,
 			use: { ...devices['Desktop Chrome'] }
 		},
 		{
 			name: 'chromium-locked-down',
-			testMatch: LOCKED_DOWN_SPEC,
+			testMatch: LOCKED_DOWN_SPECS,
 			use: { ...devices['Desktop Chrome'], baseURL: LOCKED_DOWN_BASE_URL }
 		}
 	],
