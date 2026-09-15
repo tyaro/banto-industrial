@@ -30,6 +30,12 @@ const GROUP_NAME = 'e2e-expr-insert-group';
 const REF_TAG_NAME = 'e2e-expr-insert-ref';
 const CALC_GROUP_NAME = 'e2e-expr-insert-calc-group';
 const COMPUTED_TAG_NAME = 'e2e-expr-insert-computed';
+/**
+ * #379 再レビュー対応: レジストリのタグ名検証は banto-expr の識別子文法より
+ * 広いので、日本語名のタグは登録できるが式からは参照できない。この行は
+ * 「一覧から挿入」で挿入せず理由を出す（テスト9）。
+ */
+const JP_TAG_NAME = 'e2e温度センサ';
 
 const REF_EXTERNAL_NAME = `${CONNECTION_NAME}.${GROUP_NAME}.${REF_TAG_NAME}`;
 
@@ -117,6 +123,24 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 			}
 		});
 		expect(refTagRes.ok()).toBe(true);
+
+		// #379 再レビュー対応: 同じグループへ日本語名のタグも1件作る。
+		// レジストリの名前検証は通る（空でない・最大長のみ）が、banto-expr の
+		// 識別子文法では書けないので挿入候補から外れる（テスト9）。
+		const jpTagRes = await page.request.post('/api/tags', {
+			headers: authedHeaders,
+			data: {
+				name: JP_TAG_NAME,
+				collectionGroupId: group.id,
+				address: '40002',
+				dataType: 'i16',
+				decimals: 0,
+				enabled: true,
+				writable: false,
+				tagKind: 'plc'
+			}
+		});
+		expect(jpTagRes.ok()).toBe(true);
 
 		// 前提データ2: `calc` 予約接続（起動時に自動作成済み）配下の収集
 		// グループと、その配下の演算タグ1件（テスト4の「自タグ」役）。
@@ -365,5 +389,31 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 		} finally {
 			await narrowPage.close();
 		}
+	});
+
+	test('9. 式で表せない名前（日本語名）のタグは挿入されず、理由のトーストが出る（#379 再レビュー対応）', async () => {
+		// テスト7で開いた新規作成ペイン（`tagKind === 'computed'`、式は空）を使う。
+		const pane = page.getByRole('complementary', { name: '新規作成' });
+		await expect(pane).toBeVisible();
+		const expressionField = pane.getByLabel('式');
+		await expect(expressionField).toHaveValue('');
+
+		const toggle = pane.getByTestId('tag-expression-insert-toggle');
+		await toggle.click();
+		await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+
+		// 日本語名タグのいる PLC グループへ絞る（ペインは非モーダルなので
+		// そのまま操作できる）。
+		await groupNodeByName(page, GROUP_NAME).click();
+		await page.getByRole('gridcell', { name: JP_TAG_NAME, exact: true }).click();
+
+		// 式には何も入らず、理由がトーストで出る（編集対象も切り替わらない）。
+		await expect(page.getByText('式で表せない名前のタグです')).toBeVisible();
+		await expect(expressionField).toHaveValue('');
+		await expect(pane).toBeVisible();
+
+		// 同じグループの ASCII 名タグは従来どおり挿入できる（除外が広すぎない）。
+		await page.getByRole('gridcell', { name: REF_TAG_NAME, exact: true }).click();
+		await expect(expressionField).toHaveValue(REF_EXTERNAL_NAME);
 	});
 });

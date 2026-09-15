@@ -24,9 +24,12 @@
  * 複製しない」）: 既に `tagDeleteImpact.ts` が同じ用途の近似正規表現
  * （3セグメント・ASCII 識別子・前後の境界チェック）を持っているので、
  * {@link extractTagRefs} はその `extractTagRefTokens` をそのまま使う薄い
- * 別名にとどめる。lexer の細部（末尾ハイフンの扱い等）は追わない。
+ * 別名にとどめ、「その完全名を式に書けるか」の判定も同じ `IDENT_SEGMENT` を
+ * 使う `isExpressionRepresentableName` に委ねる（#379 再レビュー対応。
+ * 末尾ハイフンだけは近似では拾えない実害のある差なので、そちらの関数で
+ * 追加で弾いている - `tagDeleteImpact.ts` の doc comment 参照）。
  */
-import { extractTagRefTokens } from './tagDeleteImpact';
+import { extractTagRefTokens, isExpressionRepresentableName } from './tagDeleteImpact';
 
 /**
  * 挿入候補1件。`tags`（`Tag[]`）から画面側が組み立てる - `externalName` は
@@ -56,6 +59,14 @@ export const SELF_REFERENCE_REASON = '自分自身は式から参照できませ
 export const STRING_REFERENCE_REASON = '文字列型のタグは式から参照できません';
 export const CYCLE_REFERENCE_REASON =
 	'循環参照になるため挿入できません（このタグが編集中のタグを参照しています）';
+/**
+ * #379 再レビュー対応: レジストリのタグ名・接続名・グループ名の検証は
+ * 「空でない・最大長」程度で、banto-expr の識別子文法（ASCII の
+ * `[A-Za-z_][A-Za-z0-9_-]*` をドットで3つ）より広い。日本語名・空白入り・
+ * 末尾ハイフンなどのタグをそのまま挿入すると、直後の段階Aチェックと保存
+ * preflight で必ず落ちるので、押す前に止める。
+ */
+export const UNREPRESENTABLE_NAME_REASON = '式で表せない名前のタグです（英数字・_・- 以外を含む）';
 
 /**
  * 式中の3セグメントのタグ参照トークンをすべて抽出する。実体は
@@ -129,7 +140,9 @@ export function wouldCreateCycle(
 
 /**
  * `candidateId` の行をクリックしたときに挿入をブロックすべき理由。
- * ブロックしないなら `null`。判定順は「自タグ → 文字列型 → 循環」。
+ * ブロックしないなら `null`。判定順は
+ * 「自タグ → 式で表せない名前 → 文字列型 → 循環」
+ * （名前が式で表せない時点で他の理由を見る意味が無いので先に出す）。
  */
 export function insertionBlockReason(
 	tags: InsertCandidateTag[],
@@ -169,6 +182,7 @@ function reasonFor(
 	getGraph: () => RefGraph
 ): string | null {
 	if (selfId !== null && candidate.id === selfId) return SELF_REFERENCE_REASON;
+	if (!isExpressionRepresentableName(candidate.externalName)) return UNREPRESENTABLE_NAME_REASON;
 	if (candidate.dataType === STRING_DATA_TYPE) return STRING_REFERENCE_REASON;
 	if (selfId === null) return null;
 	if (candidate.tagKind !== 'computed') return null;

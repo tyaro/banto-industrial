@@ -52,6 +52,40 @@ const TAG_REF_PATTERN = new RegExp(
 	'g'
 );
 
+/**
+ * 完全外部名がそのまま式中のタグ参照として書けるか（3セグメントすべてが
+ * {@link IDENT_SEGMENT} に完全一致するか）。
+ *
+ * #342 段階C（#379 再レビュー対応）で追加: レジストリ側のタグ名・接続名・
+ * グループ名の検証は「空でない・最大長」程度しか課しておらず、banto-expr の
+ * 識別子文法より広い（日本語名・空白入り・末尾ハイフンなどが通る）。その
+ * ようなタグは式から参照できないので、「一覧から挿入」の候補から外す
+ * （`expressionInsert.ts::insertionBlockReason`）。判定は上の
+ * {@link TAG_REF_PATTERN} と**同じ `IDENT_SEGMENT` を使う**（正規表現を
+ * 二重に持たない）。`TAG_REF_PATTERN` が「文中から切り出す」ための境界
+ * チェック付きなのに対し、こちらは「名前全体が参照トークンそのものか」を
+ * 見るためアンカー（`^...$`）で完全一致させる。
+ */
+const FULL_TAG_REF_PATTERN = new RegExp(`^${IDENT_SEGMENT}\\.${IDENT_SEGMENT}\\.${IDENT_SEGMENT}$`);
+
+/**
+ * `IDENT_SEGMENT` が近似である唯一の実害ある差: **ハイフンは後ろに識別子
+ * 継続文字が続くときだけ識別子へ吸収される**（`crates/banto-expr/src/lexer.rs`
+ * の `trailing_hyphen_is_not_absorbed_into_identifier`）。`IDENT_SEGMENT` は
+ * `[A-Za-z0-9_-]*` なので `abc-` や `a--b` も通してしまうが、実 lexer は
+ * そこでハイフンを減算演算子として切り出すため、そのタグ名は式から参照
+ * できない。`extractTagRefTokens`（文中からの切り出し）ではこの差は無害
+ * （近似で拾いすぎても削除確認が1件多く出るだけ）なので `IDENT_SEGMENT`
+ * 自体は変えず、「名前全体が参照トークンそのものか」を見るこちらでだけ
+ * 追加で弾く。
+ */
+const DANGLING_HYPHEN_PATTERN = /-(?![A-Za-z0-9_])/;
+
+/** {@link FULL_TAG_REF_PATTERN} / {@link DANGLING_HYPHEN_PATTERN} 参照。 */
+export function isExpressionRepresentableName(externalName: string): boolean {
+	return FULL_TAG_REF_PATTERN.test(externalName) && !DANGLING_HYPHEN_PATTERN.test(externalName);
+}
+
 /** 式中に現れる3セグメントのタグ参照トークンをすべて抽出する（重複含む）。 */
 export function extractTagRefTokens(expression: string): string[] {
 	return expression.match(TAG_REF_PATTERN) ?? [];

@@ -4,7 +4,8 @@
  * （どちらも `$state` を含まない素の TypeScript）、`vi.mock` は不要。
  *
  * 実装指示の必須ケース: 自タグ / 文字列型 / 直接循環 / 間接循環（A→B→自）/
- * 循環しない computed / plc タグ。
+ * 循環しない computed / plc タグ。#379 再レビュー対応で「式で表せない名前」
+ * （日本語名 / 空白入り / 末尾ハイフン / 正常な ASCII 名）を追加。
  */
 import { describe, expect, it } from 'vitest';
 import {
@@ -14,6 +15,7 @@ import {
 	insertionBlockReason,
 	SELF_REFERENCE_REASON,
 	STRING_REFERENCE_REASON,
+	UNREPRESENTABLE_NAME_REASON,
 	wouldCreateCycle,
 	type InsertCandidateTag
 } from './expressionInsert';
@@ -130,6 +132,61 @@ describe('insertionBlockReason', () => {
 
 	it('一覧に無い id は判定対象外（null）', () => {
 		expect(insertionBlockReason(tags, 1, 999)).toBeNull();
+	});
+});
+
+/**
+ * #379 再レビュー対応: レジストリのタグ名検証（空でない・最大長）は
+ * banto-expr の識別子文法より広いので、式に書けない完全名を持つタグは
+ * 挿入候補から外す。判定は `tagDeleteImpact.ts` の `IDENT_SEGMENT`
+ * （`[A-Za-z_][A-Za-z0-9_-]*`）を 3 つドットで繋いだ完全一致。
+ */
+describe('insertionBlockReason: 式で表せない名前', () => {
+	function withName(externalName: string): InsertCandidateTag[] {
+		return [
+			tag(1, 'self', { tagKind: 'computed', expression: '1' }),
+			{ ...tag(2, 'x'), externalName }
+		];
+	}
+
+	it('日本語名は挿入できない', () => {
+		const tags = withName('line1.fast.温度');
+		expect(insertionBlockReason(tags, 1, 2)).toBe(UNREPRESENTABLE_NAME_REASON);
+	});
+
+	it('空白入りの名前は挿入できない', () => {
+		const tags = withName('line1.fast.tag name');
+		expect(insertionBlockReason(tags, 1, 2)).toBe(UNREPRESENTABLE_NAME_REASON);
+	});
+
+	it('末尾ハイフンは挿入できない（lexer が識別子に含めない）', () => {
+		// `crates/banto-expr/src/lexer.rs::trailing_hyphen_is_not_absorbed_into_identifier`
+		// - ハイフンは後ろに識別子継続文字が続くときだけ吸収される。
+		expect(insertionBlockReason(withName('line1.fast.abc-'), 1, 2)).toBe(
+			UNREPRESENTABLE_NAME_REASON
+		);
+		expect(insertionBlockReason(withName('line1.fast.a--b'), 1, 2)).toBe(
+			UNREPRESENTABLE_NAME_REASON
+		);
+		expect(insertionBlockReason(withName('line1.grp-.t'), 1, 2)).toBe(UNREPRESENTABLE_NAME_REASON);
+	});
+
+	it('正常な ASCII 名（内部ハイフン・アンダースコア・数字）は挿入できる', () => {
+		expect(insertionBlockReason(withName('line1.fast.abc-def_1'), 1, 2)).toBeNull();
+		expect(insertionBlockReason(withName('_line.g1.t2'), 1, 2)).toBeNull();
+	});
+
+	it('名前が表せないときは文字列型・循環より先に理由を返す（判定順）', () => {
+		const tags = [
+			tag(1, 'self', { tagKind: 'computed', expression: '1' }),
+			{ ...tag(2, 'x', { dataType: 'string' }), externalName: 'line1.fast.文字列' }
+		];
+		expect(insertionBlockReason(tags, 1, 2)).toBe(UNREPRESENTABLE_NAME_REASON);
+	});
+
+	it('自タグは名前が表せなくても自己参照の理由が優先される（判定順）', () => {
+		const tags = [{ ...tag(1, 'self', { tagKind: 'computed' }), externalName: 'line1.fast.自分' }];
+		expect(insertionBlockReason(tags, 1, 1)).toBe(SELF_REFERENCE_REASON);
 	});
 });
 

@@ -1348,7 +1348,9 @@ enqueue 後に対象行が別経路で変わっている真のコンフリクト
 >   （`Modal.svelte`、`createInModal`）へフォールバックする
 >   （`edit`/`continuous` の `<Drawer>` とは分ける） - その幅では UX-31 の
 >   判断が引き続き有効なため。#376 の `dirty`/`onBlockedClose` の誤爆ガードも
->   そのまま効く。
+>   そのまま効く。**UX-31 の台帳側（[banto-hub-t19-design.md](banto-hub-t19-design.md)
+>   §2「オーナー決定」の表と「既存決定の上書き」）も、この「狭幅は中央
+>   モーダル / 広幅は右ペイン」に合わせて上書き済み**（2026-09-16）。
 > - **E2E**: create フォームを `role="dialog"` で掴んでいた既存スペック
 >   （`banto-hub-tags-form` / `-onboarding-cta` / `-p0-2-preflight` /
 >   `-expression-check` / `-duplicate` / `-db-source-group-and-tag`）を
