@@ -635,9 +635,9 @@ pub struct CollectorManager {
     /// the full rationale and the session-sync policy `rebuild` follows.
     sessions: Arc<HubSessions>,
     /// T9-2 (docs/ux-plan.md §1): the broker session simulator registry
-    /// (`BrokerSimRegistry` - see that type's own doc comment for why its
-    /// name originally said SLMP only and was renamed by #339, even though it
-    /// has driven Modbus TCP too since #131),
+    /// (`BrokerSimRegistry`, formerly `SlmpSimRegistry` - see that type's own
+    /// doc comment for why the old name said SLMP only even though it has
+    /// driven Modbus TCP too since #131, and why #339 renamed it),
     /// owned OUTSIDE this manager for exactly the same reason `sessions` is - it must
     /// survive every `rebuild` (a simulator started for a connection stays
     /// up across rebuilds that leave it `simulation = true`, mirroring how a
