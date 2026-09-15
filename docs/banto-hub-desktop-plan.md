@@ -139,7 +139,12 @@ T15 節。**2026-09-15**（#359 banto-hub 分）: 設定画面（`/settings`）�
 実ルートへ分割した（`/settings` は先頭の可視カテゴリへ 307 redirect、
 ブックマーク互換は維持）。§9.7 の route 移設マトリクスが想定する運転/設定/
 モニタ/外部連携/管理への app 全体再編とは別軸（詳細は同マトリクス直後の
-追記参照）。chronogazer・relay-wright への展開は別 PR。
+追記参照）。chronogazer・relay-wright への展開は別 PR。**2026-09-15**
+（v0.2.0-alpha.16）: TAG-UX-C を補強し、`Drawer.svelte`/`Modal.svelte` に
+`dirty`/`onBlockedClose` を追加（未保存中は Esc・オーバーレイクリックで
+閉じない）。あわせて接続 Drawer・収集グループ Drawer に元々無かった未保存
+破棄確認（`isFormDirty` ベース）を追加した。詳細は §9.4 TAG-UX-C の
+2026-09-15 追補。
 
 関連: [tag-server-design.md](tag-server-design.md)、
 [banto-hub-t16-design.md](banto-hub-t16-design.md)、
@@ -1221,6 +1226,46 @@ enqueue 後に対象行が別経路で変わっている真のコンフリクト
 > がサーバー値になりパネルが消えること、そのまま保存し直せば成功すること、
 > 2度目の競合で「自分の内容で再保存」を押すとローカルの入力が勝って
 > revision が進むこと、の4テストに拡張した。
+>
+> **2026-09-15 追補（誤爆防止 - オーナー報告「設定中に操作ミスで閉じて
+> しまい最初からやり直しになる」、v0.2.0-alpha.16）**: 2点目「dirty 状態を
+> 持ち、Esc、背景、`×`、別行選択、画面移動で同じ破棄確認を行う」を、
+> タグ編集 Drawer 以外の Drawer/Modal（接続・収集グループ）にも揃える形で
+> 補強した。
+>
+> - `Drawer.svelte`/`Modal.svelte` に `dirty?: boolean`（既定 `false`）と
+>   `onBlockedClose?: () => void` を追加した。`dirty` が `true` の間は
+>   **Esc とオーバーレイクリックでは `requestClose()` を呼ばない**（＝
+>   `onclose`/`onRequestClose` の確認自体が起きない）。`×` ボタン経由だけは
+>   従来どおり - `onRequestClose` に確認を委ねたまま塞がない。ブロックされた
+>   ことは `onBlockedClose` で呼び出し側へ伝え、案内（トースト）は呼び出し側
+>   の責務にした（両コンポーネントとも banto-hub の型・ストアを import しない
+>   規約のため）。3経路の判定自体は純関数
+>   `apps/banto-hub/src/lib/components/drawerCloseGuard.ts::isCloseAllowed`
+>   へ切り出し、単体テスト（`drawerCloseGuard.test.ts`）で固定した。
+> - 調査で判明した事実: **`ConnectionDrawer.svelte`/
+>   `CollectionGroupDrawer.svelte` にはこれまで未保存確認そのものが無かった**
+>   （`onRequestClose` が `!isBusy()` のみ）。タグ編集 Drawer だけ
+>   `confirmDiscardIfNeeded` で確認していたのに、接続・収集グループの
+>   Drawer/Modal（新規作成ウィザード含む）は Esc・オーバーレイクリック・
+>   `×` のどの経路でも未保存の入力を無確認で捨てていた。今回、両ファイルに
+>   `tags/+page.svelte::createBaseline` と同じ流儀の `baseline`（開いた時点の
+>   フォームスナップショット）を追加し、`isFormDirty(baseline, form)` を
+>   `dirty` として `Drawer`/`Modal` へ渡すようにした。`onRequestClose` も
+>   `!isBusy()` だけでなく `dirty` なら `window.confirm` で「変更を破棄
+>   しますか？」の確認を出すよう改めた（`confirmDiscardIfNeeded` と同じ
+>   文言・同じ順序）。3ステップの作成ウィザードでも `baseline` は開いた
+>   時点のまま変わらないため、ステップを進めて入力するだけで自然に `dirty`
+>   になる。保存成功後・pending queue プリフィル反映時は `baseline` も
+>   一緒に差し替え、システム側の更新を未保存扱いにしないようにした。
+> - タグ編集 Drawer 自体の破棄確認ロジック（`confirmDiscardIfNeeded`）は
+>   変更していない - 今回追加したのは Esc・オーバーレイクリックの誤爆防止
+>   （`dirty` prop 配線）だけ。
+> - ペイン構成の見直し（右ペイン常設化）は別 issue のまま、今回は触っていない。
+> - 検証は `svelte-check`（0エラー）、`vitest run`、実 DOM は
+>   `e2e/tests-banto-hub/banto-hub-tags-drawer-accidental-close.spec.ts`
+>   （タグ編集 Drawer の Esc・オーバーレイクリック・`×` 3経路、接続 Drawer の
+>   Esc・オーバーレイクリック2経路）。
 
 受け入れ条件:
 

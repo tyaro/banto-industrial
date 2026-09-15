@@ -1794,6 +1794,16 @@
 	}
 
 	/**
+	 * 2026-09-15 追補（誤爆防止、TAG-UX-C 追補）: `Drawer`/`Modal` の
+	 * `onBlockedClose` - 未保存のまま Esc かオーバーレイクリックで閉じようと
+	 * して弾かれたときの案内。`×` を押せば従来どおり `confirmDiscardIfNeeded`
+	 * の確認が出て閉じられることを一言添える。
+	 */
+	function notifyBlockedClose(): void {
+		toastStore.push('info', '未保存の変更があります。閉じるには × を押してください。');
+	}
+
+	/**
 	 * T19 S1-c（UX-33、旧 T18-2d「ツリーで選択中の接続／グループを単票・
 	 * 連続登録へプリセットする」を置き換え）: ツールバーの「新規登録」は
 	 * `registrationTarget`（ツリー選択から決まる、依存ゼロの純関数
@@ -5254,6 +5264,8 @@
 	width="560px"
 	onclose={closeDrawer}
 	onRequestClose={confirmDiscardIfNeeded}
+	dirty={drawerMode === 'create' && isDrawerDirty()}
+	onBlockedClose={notifyBlockedClose}
 >
 	{#if drawerMode === 'create' && canWrite}
 		<form
@@ -5390,6 +5402,8 @@
 	width={drawerWidth}
 	onclose={closeDrawer}
 	onRequestClose={confirmDiscardIfNeeded}
+	dirty={drawerMode !== null && drawerMode !== 'create' && isDrawerDirty()}
+	onBlockedClose={notifyBlockedClose}
 >
 	{#if drawerMode === 'edit' && selected && canWrite}
 		<form

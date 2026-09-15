@@ -8,9 +8,19 @@
 	 * フォーカストラップは「開いたら先頭要素へフォーカス」の最低限のみ
 	 * （設計指示: 凝りすぎない範囲で）。Tab キーでのフォーカス循環制御は
 	 * 行わない — 必要になったら需要を見て追加する。
+	 *
+	 * 2026-09-15 追補（誤爆防止、TAG-UX-C 追補 - 「編集中に操作ミスで閉じて
+	 * 入力が消える」事故対策）: `dirty` prop が `true` の間は Esc・オーバー
+	 * レイクリックでは閉じない（`drawerCloseGuard.ts::isCloseAllowed`）。
+	 * **`×` ボタン経由だけは塞がない** - 未保存確認は従来どおり
+	 * `onRequestClose` に委ねたままで、`dirty` は「誤爆しやすい2経路だけを
+	 * 事前に殺す」ためのもの。ブロックされたことは `onBlockedClose` で
+	 * 呼び出し側へ伝える（トースト等の案内は呼び出し側の責務 - 本コンポーネ
+	 * ントは banto-hub の型・ストアを import しない規約のため）。
 	 */
 	import type { Snippet } from 'svelte';
 	import { fade, fly } from 'svelte/transition';
+	import { isCloseAllowed } from './drawerCloseGuard';
 
 	interface Props {
 		open: boolean;
@@ -30,6 +40,24 @@
 		 * 未指定時は従来どおり即 `onclose`（後方互換）。
 		 */
 		onRequestClose?: () => boolean;
+		/**
+		 * 2026-09-15 追補（誤爆防止、TAG-UX-C 追補）: 未保存の変更があるか。
+		 * `true` の間は **Esc とオーバーレイクリックでは閉じない**
+		 * （`drawerCloseGuard.ts::isCloseAllowed` 参照）。閉じるのは `×`
+		 * ボタン経由だけになり、そこでは従来どおり `onRequestClose` の確認が
+		 * 走る（`×` の経路自体は変えない）。既定 `false`（従来どおり全経路で
+		 * 閉じる - 後方互換）。
+		 */
+		dirty?: boolean;
+		/**
+		 * `dirty` が `true` のときに Esc またはオーバーレイクリックで閉じようと
+		 * した（＝ブロックされた）ことを呼び出し側へ知らせるコールバック。
+		 * 未保存のときに操作が「効かない」ように見えて戸惑わないよう、案内
+		 * （トースト等）を出す用途を想定するが、この部品自身は
+		 * `banto-hub` の型・ストアを一切 import しない規約（冒頭コメント）
+		 * のため、案内の実体は呼び出し側に委ねる。
+		 */
+		onBlockedClose?: () => void;
 		children?: Snippet;
 	}
 
@@ -40,6 +68,8 @@
 		closeOnOverlayClick = true,
 		onclose,
 		onRequestClose,
+		dirty = false,
+		onBlockedClose,
 		children
 	}: Props = $props();
 
@@ -52,6 +82,10 @@
 	function handleWindowKeydown(event: KeyboardEvent): void {
 		if (open && event.key === 'Escape') {
 			event.preventDefault();
+			if (!isCloseAllowed('escape', dirty)) {
+				onBlockedClose?.();
+				return;
+			}
 			requestClose();
 		}
 	}
@@ -61,7 +95,12 @@
 	// `stopPropagation` の click ハンドラを付けずに済むので、a11y 的に
 	// クリックハンドラを持つ非インタラクティブ要素が増えない。
 	function handleOverlayClick(event: MouseEvent): void {
-		if (closeOnOverlayClick && event.target === event.currentTarget) requestClose();
+		if (!closeOnOverlayClick || event.target !== event.currentTarget) return;
+		if (!isCloseAllowed('overlay', dirty)) {
+			onBlockedClose?.();
+			return;
+		}
+		requestClose();
 	}
 
 	/** 開いた直後、パネル内の最初のフォーカス可能要素へフォーカスする。 */

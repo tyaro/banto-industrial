@@ -14,6 +14,7 @@ import {
 	validateQuerySql,
 	type CollectionGroupFormState
 } from './collectionGroupForm';
+import { isFormDirty } from './formDirty';
 import type { CollectionGroup } from './tagRegistryAdmin';
 
 describe('nextGroupName', () => {
@@ -201,5 +202,75 @@ describe('validateQuerySql（S3、crates/banto-tags/src/collection_group.rs::val
 		expect(validateQuerySql({ querySql: sql }, true)).toEqual({
 			querySql: '8192文字以内で入力してください'
 		});
+	});
+});
+
+/**
+ * 2026-09-15 追補（誤爆防止、`CollectionGroupDrawer.svelte::baseline`/
+ * `dirty`）: `plcConnectionForm.test.ts` の同名 describe と同じ理由・同じ
+ * パターン - `CollectionGroupDrawer.svelte` 自体はユニットテスト対象外
+ * （Svelte コンポーネント）なので、実際に使う `blankGroupForm`/
+ * `groupToForm`（baseline の作り方そのもの）と `isFormDirty` の組み合わせを
+ * ここで固定する。実 DOM での確認は
+ * `e2e/tests-banto-hub/banto-hub-tags-drawer-accidental-close.spec.ts` に譲る。
+ */
+describe('CollectionGroupDrawer の dirty 判定（baseline は開いた時点のフォームスナップショット）', () => {
+	it('新規作成: 開いた直後（baseline = blankGroupForm 相当）は dirty ではない', () => {
+		const baseline = blankGroupForm(1000);
+		const form = { ...baseline };
+		expect(isFormDirty(baseline, form)).toBe(false);
+	});
+
+	it('新規作成: 名前を1文字変えると dirty になる', () => {
+		const baseline = blankGroupForm(1000);
+		const form = { ...baseline, name: 'a' };
+		expect(isFormDirty(baseline, form)).toBe(true);
+	});
+
+	it('再設定: 開いた直後（baseline = groupToForm(group)）は dirty ではない', () => {
+		const group: CollectionGroup = {
+			id: 7,
+			name: 'Group1',
+			plcConnectionId: 3,
+			periodMs: 5000,
+			enabled: true,
+			defaultWritable: false,
+			querySql: null
+		};
+		const baseline = groupToForm(group);
+		const form = { ...baseline };
+		expect(isFormDirty(baseline, form)).toBe(false);
+	});
+
+	it('再設定: 収集周期を変えると dirty になる', () => {
+		const group: CollectionGroup = {
+			id: 7,
+			name: 'Group1',
+			plcConnectionId: 3,
+			periodMs: 5000,
+			enabled: true,
+			defaultWritable: false,
+			querySql: null
+		};
+		const baseline = groupToForm(group);
+		const form = { ...baseline, periodMs: '1000' };
+		expect(isFormDirty(baseline, form)).toBe(true);
+	});
+
+	it('readOnly: 入力欄が disabled で form が変わらない前提なら、baseline と同一のまま dirty にならない（readOnly 専用の分岐は無く isFormDirty だけで足りる）', () => {
+		const group: CollectionGroup = {
+			id: 9,
+			name: 'ViewOnly',
+			plcConnectionId: 3,
+			periodMs: 1000,
+			enabled: true,
+			defaultWritable: false,
+			querySql: null
+		};
+		const baseline = groupToForm(group);
+		// readOnly では <input disabled>/<select disabled> によりユーザーは
+		// form を変更できない - つまり form は常に baseline と同一のまま。
+		const form = baseline;
+		expect(isFormDirty(baseline, form)).toBe(false);
 	});
 });
