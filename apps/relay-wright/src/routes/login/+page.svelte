@@ -84,7 +84,13 @@
 			}
 			const result = await setup({ username, password, displayName });
 			if (result.success) {
-				goto('/settings');
+				// #359 relay-wright 分: 設定画面のカテゴリ別ルート化に伴い、初回
+				// セットアップ成功後の着地点を先頭カテゴリへ直接指す（`/settings`
+				// 自体は redirect 専用になるため - `settings/+page.ts` 参照）。
+				// 通常ログイン（`submitLogin` 側）の `goto('/settings')` は
+				// `/settings` の 307 redirect 経由で同じ着地点に届くので、
+				// あえて変更しない。
+				goto('/settings/appearance');
 			} else {
 				error = result.error ?? 'セットアップに失敗しました';
 			}
