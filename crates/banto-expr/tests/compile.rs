@@ -578,3 +578,16 @@ fn hyphen_between_identifiers_is_absorbed_into_the_reference() {
     // 末尾セグメントの後ろに続く `-1` も同じ規則で吸収される。
     assert_eq!(referenced("a.b.c-1"), vec!["a.b.c-1"]);
 }
+
+#[test]
+fn whitespace_around_dots_is_allowed_in_a_tag_reference() {
+    // lexer は空白・タブ・改行を捨て、parser はトークン列（識別子と `.`）
+    // しか見ないので、`.` の周りに空白があっても有効な3セグメント参照。
+    // `referenced_tags()` は空白を含まない canonical 形を返す - フロント側の
+    // `extractTagRefTokens` も同じ形に正規化する必要がある（#379 レビュー
+    // 指摘。抽出を空白なしに限ると、こう書かれた参照を依存グラフから
+    // 落としてしまう）。
+    assert_eq!(referenced("conn . group . tag + 1"), vec!["conn.group.tag"]);
+    assert_eq!(referenced("conn .\n group . tag"), vec!["conn.group.tag"]);
+    assert_eq!(referenced("conn.\tgroup .tag"), vec!["conn.group.tag"]);
+}

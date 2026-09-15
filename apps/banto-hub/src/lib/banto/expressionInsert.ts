@@ -159,41 +159,85 @@ export function insertionBlockReason(
 ): string | null {
 	const candidate = tags.find((t) => t.id === candidateId);
 	if (!candidate) return null;
-	return reasonFor(candidate, selfId, () => buildRefGraph(tags));
+	return reasonFor(
+		candidate,
+		selfId,
+		(id) => selfId !== null && reaches(buildRefGraph(tags), id, selfId)
+	);
+}
+
+/**
+ * `selfId` を（推移的に）参照しているタグ id の集合 - つまり「自タグの式へ
+ * 足すと循環になる」候補の全体。依存グラフの**逆辺**を1回だけ辿って求める。
+ *
+ * #379 レビュー対応（計算量）: 以前は候補ごとに `selfId` への DFS を回して
+ * いたため O(V·(V+E)) で、1万タグ級のレジストリではトグルを ON にした瞬間に
+ * 固まりうる。逆到達集合を1回作れば全体で O(V+E)、候補ごとの判定は
+ * `Set.has` の O(1) になる（結果は同じ - 「候補 → selfId へ到達可能」と
+ * 「selfId から逆辺を辿って候補へ到達可能」は同値）。
+ */
+function reverseReachableFrom(graph: RefGraph, selfId: number): Set<number> {
+	// 逆辺（参照先 -> 参照元）を組む。
+	const reverse = new Map<number, number[]>();
+	for (const [from, targets] of graph) {
+		for (const to of targets) {
+			const sources = reverse.get(to);
+			if (sources) sources.push(from);
+			else reverse.set(to, [from]);
+		}
+	}
+
+	const reachable = new Set<number>();
+	const stack = [...(reverse.get(selfId) ?? [])];
+	while (stack.length > 0) {
+		const next = stack.pop() as number;
+		if (reachable.has(next)) continue;
+		reachable.add(next);
+		for (const source of reverse.get(next) ?? []) stack.push(source);
+	}
+	return reachable;
 }
 
 /**
  * 一覧全件について {@link insertionBlockReason} を求めた `id -> 理由` の
  * Map。グリッドの `rowClass`（淡色表示）とクリック時のトーストで同じ判定を
  * 共有するために使う - `insertionBlockReason` を行ごとに呼ぶと依存グラフを
- * 行数ぶん組み立て直すことになるため、グラフを1回だけ作る入口をこちらに
- * 用意している（結果は同じ）。
+ * 行数ぶん組み立て直すうえ、候補ごとに DFS を回すことになるため、
+ * **グラフ構築と循環判定をそれぞれ1回**にまとめた入口をこちらに用意している
+ * （結果は同じ。{@link reverseReachableFrom} の doc comment 参照）。
+ * 全体の計算量は O(V+E)。
  */
 export function blockedInsertTargets(
 	tags: InsertCandidateTag[],
 	selfId: number | null
 ): Map<number, string> {
-	let graph: RefGraph | null = null;
-	const getGraph = (): RefGraph => (graph ??= buildRefGraph(tags));
+	// 循環判定が要るのは編集時（`selfId !== null`）だけ - 新規作成では
+	// グラフも逆到達集合も作らない。
+	const cyclic =
+		selfId === null ? new Set<number>() : reverseReachableFrom(buildRefGraph(tags), selfId);
 	const blocked = new Map<number, string>();
 	for (const tag of tags) {
-		const reason = reasonFor(tag, selfId, getGraph);
+		const reason = reasonFor(tag, selfId, (id) => cyclic.has(id));
 		if (reason !== null) blocked.set(tag.id, reason);
 	}
 	return blocked;
 }
 
-/** 依存グラフの構築を遅延させた共通判定（グラフが要るのは循環チェックだけ）。 */
+/**
+ * 共通判定。循環かどうかの問い合わせ（`isCyclic`）だけ呼び出し元に委ねる -
+ * 単発の {@link insertionBlockReason} はその場でグラフを組んで DFS し、
+ * {@link blockedInsertTargets} は逆到達集合の `Set.has` で答える。
+ */
 function reasonFor(
 	candidate: InsertCandidateTag,
 	selfId: number | null,
-	getGraph: () => RefGraph
+	isCyclic: (candidateId: number) => boolean
 ): string | null {
 	if (selfId !== null && candidate.id === selfId) return SELF_REFERENCE_REASON;
 	if (!isExpressionRepresentableName(candidate.externalName)) return UNREPRESENTABLE_NAME_REASON;
 	if (candidate.dataType === STRING_DATA_TYPE) return STRING_REFERENCE_REASON;
 	if (selfId === null) return null;
 	if (candidate.tagKind !== 'computed') return null;
-	if (reaches(getGraph(), candidate.id, selfId)) return CYCLE_REFERENCE_REASON;
+	if (isCyclic(candidate.id)) return CYCLE_REFERENCE_REASON;
 	return null;
 }

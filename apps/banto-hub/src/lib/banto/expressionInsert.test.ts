@@ -93,6 +93,11 @@ describe('extractTagRefs', () => {
 		expect(extractTagRefs('a.b.c-d--line1.fast.tag')).toEqual(['a.b.c-d', 'line1.fast.tag']);
 		expect(extractTagRefs('a.b.c--1')).toEqual(['a.b.c']);
 	});
+
+	it('`.` の周りに空白がある参照も canonical 形で拾う（#379、同上）', () => {
+		expect(extractTagRefs('conn . group . tag + 1')).toEqual(['conn.group.tag']);
+		expect(extractTagRefs('conn .\n group . tag')).toEqual(['conn.group.tag']);
+	});
 });
 
 describe('wouldCreateCycle', () => {
@@ -166,6 +171,16 @@ describe('wouldCreateCycle', () => {
 		];
 		expect(wouldCreateCycle(withMinusRef, 1, 8)).toBe(true);
 		expect(insertionBlockReason(withMinusRef, 1, 8)).toBe(CYCLE_REFERENCE_REASON);
+	});
+
+	it('`.` の周りに空白を入れて参照している computed も循環（#379）', () => {
+		const spaced = [
+			tag(1, 'self', { tagKind: 'computed', expression: '1' }),
+			tag(12, 'spaced', { tagKind: 'computed', expression: `${CONN} . ${GROUP} . self + 1` })
+		];
+		expect(wouldCreateCycle(spaced, 1, 12)).toBe(true);
+		expect(insertionBlockReason(spaced, 1, 12)).toBe(CYCLE_REFERENCE_REASON);
+		expect(blockedInsertTargets(spaced, 1).get(12)).toBe(CYCLE_REFERENCE_REASON);
 	});
 });
 

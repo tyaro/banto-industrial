@@ -4192,17 +4192,24 @@
 						ので、理由だけ添える。
 					-->
 					<div class="expr-insert-row">
+						<!--
+							#379 レビュー対応: 隣の hint（ON/OFF/使えない理由）を
+							`aria-describedby` でボタンへ結びつける。`disabled` のとき
+							「なぜ押せないのか」が支援技術に届かないままだったため
+							（enabled のときも説明として有用なので常に付けたままにする）。
+						-->
 						<button
 							type="button"
 							class="secondary expr-insert-toggle"
 							data-testid="tag-expression-insert-toggle"
 							aria-pressed={exprCheck.insertArmed}
+							aria-describedby="tag-expression-insert-hint"
 							disabled={!exprCheck.insertToggleEnabled}
 							onclick={exprCheck.onToggleInsert}
 						>
 							一覧から挿入
 						</button>
-						<span class="hint">
+						<span class="hint" id="tag-expression-insert-hint">
 							{#if !exprCheck.insertToggleEnabled}
 								表編集モードまたは複数選択モード中は使えません（そのモードを終了してから ON
 								にしてください）。

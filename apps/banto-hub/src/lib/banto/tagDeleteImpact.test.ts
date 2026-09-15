@@ -159,6 +159,21 @@ describe('extractTagRefTokens', () => {
 		expect(extractTagRefTokens('a.b.c-1')).toEqual(['a.b.c-1']);
 		expect(expressionReferencesExternalName('a-line1.fast.tag', 'line1.fast.tag')).toBe(false);
 	});
+
+	/**
+	 * #379 レビュー対応: lexer は空白・タブ・改行を捨てるので、`.` の周りに
+	 * 空白があっても有効な3セグメント参照。期待値は
+	 * `crates/banto-expr/tests/compile.rs` の
+	 * `whitespace_around_dots_is_allowed_in_a_tag_reference` で実 lexer に
+	 * 対して固定してあり、`referenced_tags()` と同じ canonical 形を返す。
+	 */
+	it('`.` の周りに空白がある参照も拾い、空白を除いた形で返す（#379、正は banto-expr のテスト）', () => {
+		expect(extractTagRefTokens('conn . group . tag + 1')).toEqual(['conn.group.tag']);
+		expect(extractTagRefTokens('conn .\n group . tag')).toEqual(['conn.group.tag']);
+		expect(extractTagRefTokens('conn.\tgroup .tag')).toEqual(['conn.group.tag']);
+		// canonical 形で返すので、完全外部名との突き合わせもそのまま通る。
+		expect(expressionReferencesExternalName('conn . group . tag * 2', 'conn.group.tag')).toBe(true);
+	});
 });
 
 describe('expressionReferencesExternalName', () => {

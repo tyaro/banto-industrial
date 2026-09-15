@@ -446,6 +446,9 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 		await expect(gridEditToggle).toHaveText('表編集を終了');
 		await expect(toggle).toHaveAttribute('aria-pressed', 'false');
 		await expect(toggle).toBeDisabled();
+		// #379 レビュー対応: 押せない理由が `aria-describedby` でボタンに
+		// 結びついている（隣に文字が出ているだけにしない）。
+		await expect(toggle).toHaveAccessibleDescription(/表編集モードまたは複数選択モード中/);
 		await expect(page.getByTestId('tag-insert-armed-badge')).toHaveCount(0);
 
 		// 表編集モードを勝手に終了させることはしない（未保存セル編集の破棄確認を
@@ -470,6 +473,8 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 		await expect(selectionToggle).toHaveText('複数選択を終了');
 		await expect(toggle).toHaveAttribute('aria-pressed', 'false');
 		await expect(toggle).toBeDisabled();
+		// #379 レビュー対応: 表編集モードのときと同じ説明が読み上げに届く。
+		await expect(toggle).toHaveAccessibleDescription(/表編集モードまたは複数選択モード中/);
 		await expect(page.getByTestId('tag-insert-armed-badge')).toHaveCount(0);
 
 		// 選択モードの既存挙動が生きている（行クリックで選択が切り替わる -

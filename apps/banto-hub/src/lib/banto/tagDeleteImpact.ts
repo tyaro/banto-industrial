@@ -78,19 +78,30 @@ const IDENT_RUN_NO_HYPHEN = '[A-Za-z_][A-Za-z0-9_]*';
  * 参照しているのに見落としていた（削除影響の検出漏れと、「一覧から挿入」の
  * 循環除外が効かない不具合）。後読みを2段に分けて lexer と一致させる:
  *
- * - `(?<![A-Za-z0-9_.])` … 識別子の途中・ドット連結の途中から切り出さない
+ * - `(?<![A-Za-z0-9_])(?<!\.\s*)` … 識別子の途中・ドット連結の途中から
+ *   切り出さない
  * - `(?<!IDENT_RUN_NO_HYPHEN-)` … **識別子に吸収された `-`** の直後から
  *   切り出さない（`a-line1.fast.tag` の参照は `a-line1.fast.tag` であって
  *   `line1.fast.tag` ではない）。run にハイフンを含めない理由は
  *   {@link IDENT_RUN_NO_HYPHEN} 参照。
  *
- * 後ろ側も同じ非対称性を持つ（`(?![A-Za-z0-9_.])(?!-[A-Za-z0-9_])`）:
+ * 後ろ側も同じ非対称性を持つ（`(?![A-Za-z0-9_])(?!\s*\.)(?!-[A-Za-z0-9_])`）:
  * 続く `-` が識別子の一部なのは「その後ろに継続文字があるとき」だけなので、
  * `a.b.c--1` や `a.b.c--line1.fast.tag` の `a.b.c` はちゃんと参照として
  * 切り出される（`a.b.c-1` は1トークンのまま）。
+ *
+ * **`.` の周りの空白**（#379 レビュー対応。正は同 compile.rs の
+ * `whitespace_around_dots_is_allowed_in_a_tag_reference`）: lexer は空白・
+ * タブ・改行を捨て、parser はトークン列（識別子と `.`）しか見ないので、
+ * `conn . group . tag` や改行を挟んだ形も**有効な3セグメント参照**。
+ * セパレータを {@link DOT_WITH_SPACES} にして拾い、
+ * {@link extractTagRefTokens} が空白を除いた canonical 形
+ * （`conn.group.tag` - `referenced_tags()` が返すのと同じ形）へ正規化する。
  */
+const DOT_WITH_SPACES = '\\s*\\.\\s*';
+
 const TAG_REF_PATTERN = new RegExp(
-	`(?<![A-Za-z0-9_.])(?<!${IDENT_RUN_NO_HYPHEN}-)${IDENT_SEGMENT}\\.${IDENT_SEGMENT}\\.${IDENT_SEGMENT}(?![A-Za-z0-9_.])(?!-[A-Za-z0-9_])`,
+	`(?<![A-Za-z0-9_])(?<!\\.\\s*)(?<!${IDENT_RUN_NO_HYPHEN}-)${IDENT_SEGMENT}${DOT_WITH_SPACES}${IDENT_SEGMENT}${DOT_WITH_SPACES}${IDENT_SEGMENT}(?![A-Za-z0-9_])(?!\\s*\\.)(?!-[A-Za-z0-9_])`,
 	'g'
 );
 
@@ -121,9 +132,17 @@ export function isExpressionRepresentableName(externalName: string): boolean {
 	return FULL_TAG_REF_PATTERN.test(externalName);
 }
 
-/** 式中に現れる3セグメントのタグ参照トークンをすべて抽出する（重複含む）。 */
+/**
+ * 式中に現れる3セグメントのタグ参照トークンをすべて抽出する（重複含む）。
+ *
+ * 戻り値は**空白を除いた canonical 形**（`conn . group . tag` と書かれて
+ * いても `conn.group.tag` を返す） - `CompiledExpr::referenced_tags()` が
+ * 返す形と同じにするため（`TAG_REF_PATTERN` の doc comment「`.` の周りの
+ * 空白」参照）。`isExpressionRepresentableName` は**名前**の判定なので
+ * 空白を許さないままで、こちらとは非対称。
+ */
 export function extractTagRefTokens(expression: string): string[] {
-	return expression.match(TAG_REF_PATTERN) ?? [];
+	return (expression.match(TAG_REF_PATTERN) ?? []).map((token) => token.replace(/\s+/g, ''));
 }
 
 /** `expression` が `externalName` を（境界付きの）タグ参照として含むか。 */
