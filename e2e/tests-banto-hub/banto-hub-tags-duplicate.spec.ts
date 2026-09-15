@@ -140,7 +140,10 @@ test.describe.serial('banto-hub タグ複製 (T18-3a)', () => {
 		await page.getByPlaceholder('名前・アドレスで検索').fill(SOURCE_TAG_NAME);
 		await page.getByRole('gridcell', { name: SOURCE_TAG_NAME, exact: true }).click();
 
-		const editDrawer = page.getByRole('dialog', { name: `${SOURCE_TAG_NAME} を編集` });
+		// #375: 編集・連続登録は非モーダルの右ペイン（`<aside aria-label>` =
+		// role `complementary`）になったため `role="dialog"` では取れない。
+		// アクセシブル名（`… を編集`/`連続登録`）は Drawer 時代と同じ。
+		const editDrawer = page.getByRole('complementary', { name: `${SOURCE_TAG_NAME} を編集` });
 		await expect(editDrawer).toBeVisible();
 		await editDrawer.getByTestId('tag-duplicate-button').click();
 

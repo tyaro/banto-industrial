@@ -9,10 +9,20 @@
  * ないこと、`×` 経由の確認（`window.confirm`）は従来どおり効くことを
  * 固定する。
  *
- * - タグ編集 Drawer（`tags/+page.svelte`、`confirmDiscardIfNeeded`/
+ * - 構造体登録 Drawer（`tags/+page.svelte`、`confirmDiscardIfNeeded`/
  *   `isDrawerDirty` は T18-1 で既存 - `banto-hub-tags-dirty-confirm.spec.ts`
  *   が `×` 経由の破棄確認は既に固定しているが、Esc・オーバーレイクリックの
  *   固定はまだ無かった）。
+ *   **#375（2026-09-15）でタグ編集 Drawer から構造体登録 Drawer へ移した**:
+ *   タグの「編集」「連続登録」は非モーダルの右ペインになり、オーバーレイも
+ *   Esc クローズも持たなくなった（＝このテストの前提が消えた）ため、
+ *   **モーダルのまま残る `struct`（構造体登録）を対象に付け替えた**。
+ *   検証しているのは `tags/+page.svelte` 側の
+ *   `dirty`/`onBlockedClose`/`confirmDiscardIfNeeded` の配線で、モードが
+ *   違っても同じ1本の `<Drawer>` の同じ prop を通る（#376 の回帰ガード
+ *   としての役目は変わらない）。非モーダルになったペイン側の挙動
+ *   （Esc で閉じない・オーバーレイが無い）は
+ *   `banto-hub-tags-edit-pane.spec.ts` が固定する。
  * - 接続 Drawer（`ConnectionDrawer.svelte`）: **今回まで未保存確認自体が
  *   無く**、Esc・オーバーレイクリックはおろか `×` でも確認なしに即閉じて
  *   いた経路。誤爆防止だけでなく確認そのものが新設されたことをテスト2本
@@ -24,7 +34,7 @@
  * 後（`banto-hub-auth.ts` の注記参照）。
  */
 import { expect, test, type Dialog, type Locator, type Page } from '@playwright/test';
-import { CSRF_HEADERS, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
+import { CSRF_HEADERS, fetchAuthToken, groupNodeByName, injectAuthToken } from './banto-hub-auth';
 
 const CONNECTION_NAME = 'e2e-drawer-accidental-close-plc';
 const GROUP_NAME = 'e2e-drawer-accidental-close-group';
@@ -165,16 +175,21 @@ test.describe.serial('banto-hub Drawer/Modal 誤爆クローズ防止 (2026-09-1
 		await page.close();
 	});
 
-	test.describe('タグ編集 Drawer', () => {
+	test.describe('構造体登録 Drawer（#375 でタグ編集 Drawer から付け替え）', () => {
 		test.beforeEach(async () => {
-			await page.getByRole('gridcell', { name: TAG_NAME, exact: true }).click();
-			await expect(page.getByRole('dialog', { name: `${TAG_NAME} を編集` })).toBeVisible();
+			// 「構造体登録」ボタンはツリーで収集グループを選択している間だけ
+			// 出る（`registrationTarget`、`tags/+page.svelte`）。
+			await groupNodeByName(page, GROUP_NAME).click();
+			await page.getByTestId('struct-reg-open').click();
+			await expect(page.getByRole('dialog', { name: '構造体登録' })).toBeVisible();
 		});
 
 		test('a. 値を変更後 Esc を押しても閉じない（確認ダイアログも出ない）', async () => {
-			const drawer = page.getByRole('dialog', { name: `${TAG_NAME} を編集` });
-			const nameInput = drawer.getByLabel('名前');
-			await nameInput.fill(`${TAG_NAME}-esc`);
+			const drawer = page.getByRole('dialog', { name: '構造体登録' });
+			// ベースアドレスを入力すると `structBaseline` から外れて dirty になる
+			// （`isDrawerDirty()` の `case 'struct'`）。
+			const baseAddress = drawer.getByTestId('struct-reg-base-address');
+			await baseAddress.fill('D4100');
 
 			const dialogWatch = watchNoDialog(page);
 			await page.keyboard.press('Escape');
@@ -183,7 +198,7 @@ test.describe.serial('banto-hub Drawer/Modal 誤爆クローズ防止 (2026-09-1
 			// 保持され、window.confirm すら呼ばれない（ブロック自体は確認より
 			// 手前で起きる）。
 			await expect(drawer).toBeVisible();
-			await expect(nameInput).toHaveValue(`${TAG_NAME}-esc`);
+			await expect(baseAddress).toHaveValue('D4100');
 			expect(dialogWatch.shown()).toBe(false);
 			dialogWatch.stop();
 			await expectBlockedCloseToastAndDismiss(page);
@@ -192,15 +207,15 @@ test.describe.serial('banto-hub Drawer/Modal 誤爆クローズ防止 (2026-09-1
 		});
 
 		test('b. 値を変更後オーバーレイをクリックしても閉じない', async () => {
-			const drawer = page.getByRole('dialog', { name: `${TAG_NAME} を編集` });
-			const nameInput = drawer.getByLabel('名前');
-			await nameInput.fill(`${TAG_NAME}-overlay`);
+			const drawer = page.getByRole('dialog', { name: '構造体登録' });
+			const baseAddress = drawer.getByTestId('struct-reg-base-address');
+			await baseAddress.fill('D4200');
 
 			const dialogWatch = watchNoDialog(page);
 			await clickOverlay(drawer);
 
 			await expect(drawer).toBeVisible();
-			await expect(nameInput).toHaveValue(`${TAG_NAME}-overlay`);
+			await expect(baseAddress).toHaveValue('D4200');
 			expect(dialogWatch.shown()).toBe(false);
 			dialogWatch.stop();
 			await expectBlockedCloseToastAndDismiss(page);
@@ -209,26 +224,26 @@ test.describe.serial('banto-hub Drawer/Modal 誤爆クローズ防止 (2026-09-1
 		});
 
 		test('c. 値を変更後 × → confirm が出る。キャンセルすると開いたまま、OK で閉じる', async () => {
-			const drawer = page.getByRole('dialog', { name: `${TAG_NAME} を編集` });
-			const nameInput = drawer.getByLabel('名前');
-			await nameInput.fill(`${TAG_NAME}-close-btn`);
+			const drawer = page.getByRole('dialog', { name: '構造体登録' });
+			const baseAddress = drawer.getByTestId('struct-reg-base-address');
+			await baseAddress.fill('D4300');
 
 			let dialogMessage: string | null = null;
 			page.once('dialog', (dialog) => {
 				dialogMessage = dialog.message();
 				void dialog.dismiss();
 			});
-			await page.getByRole('button', { name: '閉じる' }).click();
+			await drawer.getByRole('button', { name: '閉じる' }).click();
 			await expect
 				.poll(() => dialogMessage, { message: 'window.confirm が呼ばれること（キャンセル）' })
 				.toBe('変更を破棄しますか？');
 			await expect(drawer).toBeVisible();
-			await expect(nameInput).toHaveValue(`${TAG_NAME}-close-btn`);
+			await expect(baseAddress).toHaveValue('D4300');
 
 			page.once('dialog', (dialog) => {
 				void dialog.accept();
 			});
-			await page.getByRole('button', { name: '閉じる' }).click();
+			await drawer.getByRole('button', { name: '閉じる' }).click();
 			await expect(drawer).toBeHidden();
 		});
 	});

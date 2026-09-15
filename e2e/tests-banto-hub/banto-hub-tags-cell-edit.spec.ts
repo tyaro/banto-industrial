@@ -139,7 +139,10 @@ test.describe.serial('banto-hub タグ表編集 (T18-3e)', () => {
 
 		// 単一クリック（アドレス列 - 編集不可列）では Drawer が開かない。
 		await page.getByRole('gridcell', { name: '40001', exact: true }).click();
-		await expect(page.getByRole('dialog', { name: `${TAG_NAME} を編集` })).toBeHidden();
+		// #375: 編集・連続登録は非モーダルの右ペイン（`<aside aria-label>` =
+		// role `complementary`）になったため `role="dialog"` では取れない。
+		// アクセシブル名（`… を編集`/`連続登録`）は Drawer 時代と同じ。
+		await expect(page.getByRole('complementary', { name: `${TAG_NAME} を編集` })).toBeHidden();
 	});
 
 	test('2. enabled チェックボックスをオフにすると保留バーが出る', async () => {
@@ -204,7 +207,7 @@ test.describe.serial('banto-hub タグ表編集 (T18-3e)', () => {
 		await expect(page.getByTestId('tag-grid-edit-mode-toggle')).toHaveText('表編集');
 
 		await page.getByRole('gridcell', { name: TAG_NAME, exact: true }).click();
-		await expect(page.getByRole('dialog', { name: `${TAG_NAME} を編集` })).toBeVisible();
+		await expect(page.getByRole('complementary', { name: `${TAG_NAME} を編集` })).toBeVisible();
 		await page.keyboard.press('Escape');
 	});
 });

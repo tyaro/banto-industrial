@@ -90,7 +90,10 @@ test.describe.serial('banto-hub 連続登録の基数/bit 連番 (T18-3c)', () =
 		await page.goto('/tags');
 		await groupNodeByName(page, GROUP_NAME).click();
 		await page.getByRole('button', { name: '連続登録' }).click();
-		await expect(page.getByRole('dialog', { name: '連続登録' })).toBeVisible();
+		// #375: 編集・連続登録は非モーダルの右ペイン（`<aside aria-label>` =
+		// role `complementary`）になったため `role="dialog"` では取れない。
+		// アクセシブル名（`… を編集`/`連続登録`）は Drawer 時代と同じ。
+		await expect(page.getByRole('complementary', { name: '連続登録' })).toBeVisible();
 	});
 
 	test.afterAll(async () => {
@@ -111,7 +114,7 @@ test.describe.serial('banto-hub 連続登録の基数/bit 連番 (T18-3c)', () =
 	}
 
 	test('1. 16進デバイス番号連番: 開始 X1E・bit・点数3 → X1E, X1F, X20', async () => {
-		const drawer = page.getByRole('dialog', { name: '連続登録' });
+		const drawer = page.getByRole('complementary', { name: '連続登録' });
 		await drawer.getByLabel('データ型').selectOption({ value: 'bit' });
 		await drawer.getByLabel('開始アドレス').fill('X1E');
 		await drawer.getByLabel('点数').fill('3');
@@ -119,7 +122,7 @@ test.describe.serial('banto-hub 連続登録の基数/bit 連番 (T18-3c)', () =
 	});
 
 	test('2. ワード内 bit 連番: 開始 D100.E・bit・点数3 → D100.E, D100.F, D101.0', async () => {
-		const drawer = page.getByRole('dialog', { name: '連続登録' });
+		const drawer = page.getByRole('complementary', { name: '連続登録' });
 		await drawer.getByLabel('データ型').selectOption({ value: 'bit' });
 		await drawer.getByLabel('開始アドレス').fill('D100.E');
 		await drawer.getByLabel('点数').fill('3');
