@@ -28,7 +28,7 @@
  * 直後に並ぶ。前提データは UI ではなく `page.request` で直接 REST を叩いて
  * 作る（`banto-hub-tags-expression-check.spec.ts` と同じパターン）。
  */
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
 import { CSRF_HEADERS, fetchAuthToken, groupNodeByName, injectAuthToken } from './banto-hub-auth';
 
 const CONNECTION_NAME = 'e2e-expr-insert-plc';
@@ -65,6 +65,58 @@ function waitForExpressionCheck(page: Page) {
 }
 
 /**
+ * この spec が使う固定名（`CONNECTION_NAME`/`GROUP_NAME`/`CALC_GROUP_NAME`）の
+ * PLC接続・収集グループ・配下タグを、存在すれば掃除する
+ * （`banto-hub-tags-revision.spec.ts::cleanupExistingFixtures` を写したもの
+ * - 流儀をそちらに揃えている）。
+ *
+ * 2つの理由で `beforeAll` の先頭と `afterAll` の両方で呼ぶ:
+ * - `plc_connections`/`collection_groups` は `name` が UNIQUE
+ *   （`crates/banto-tags/migrations/0001,0002`）なので、失敗テストのリトライで
+ *   `beforeAll` が再走すると前回の同名リソースで UNIQUE 違反になり
+ *   `beforeAll` ごと落ちる。
+ * - スイート全体で1つの DB を共有しており、残したタグが後続スペックの
+ *   一覧行数を増やす（`banto-hub-tags-revision.spec.ts` 冒頭の doc comment
+ *   にある「仮想化されたグリッドの描画窓」を押し上げる）。
+ *
+ * FK は RESTRICT なので削除順は タグ → グループ → 接続。`calc` 予約接続は
+ * 削除しない（サーバー起動時に自動作成される共有リソース）ので、その配下の
+ * グループ（`CALC_GROUP_NAME`）とタグだけを消す。
+ */
+async function cleanupExistingFixtures(
+	request: APIRequestContext,
+	headers: Record<string, string>
+): Promise<void> {
+	const groupsRes = await request.get('/api/collection-groups', { headers });
+	if (!groupsRes.ok()) return;
+	const groups = (await groupsRes.json()) as Array<{ id: number; name: string }>;
+	const targetGroups = groups.filter((g) => g.name === GROUP_NAME || g.name === CALC_GROUP_NAME);
+
+	if (targetGroups.length > 0) {
+		const tagsRes = await request.get('/api/tags', { headers });
+		if (tagsRes.ok()) {
+			const tags = (await tagsRes.json()) as Array<{ id: number; collectionGroupId: number }>;
+			const groupIds = new Set(targetGroups.map((g) => g.id));
+			for (const tag of tags.filter((t) => groupIds.has(t.collectionGroupId))) {
+				await request.delete(`/api/tags/${tag.id}`, { headers });
+			}
+		}
+		for (const group of targetGroups) {
+			await request.delete(`/api/collection-groups/${group.id}`, { headers });
+		}
+	}
+
+	const connectionsRes = await request.get('/api/plc-connections', { headers });
+	if (connectionsRes.ok()) {
+		const connections = (await connectionsRes.json()) as Array<{ id: number; name: string }>;
+		const existing = connections.find((c) => c.name === CONNECTION_NAME);
+		if (existing) {
+			await request.delete(`/api/plc-connections/${existing.id}`, { headers });
+		}
+	}
+}
+
+/**
  * #379 レビュー対応3: 狭幅フォールバックの確認に使うビューポート。#375 の
  * `banto-hub-tags-edit-pane.spec.ts` と同じ 880x800（`mobileNavStore.isNarrow`
  * = `(max-width: 900px)` の内側で、かつグリッドを操作できる幅。同 spec の
@@ -76,6 +128,8 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 	let page: Page;
 	/** #379 レビュー対応3: 狭幅テストで別タブへ流し込むため describe スコープに持つ。 */
 	let token: string;
+	/** `afterAll` の後始末でも使うため describe スコープに持つ。 */
+	let authedHeaders: Record<string, string>;
 
 	test.beforeAll(async ({ browser }) => {
 		page = await browser.newPage();
@@ -83,7 +137,11 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 
 		token = await fetchAuthToken(page.request);
 		await injectAuthToken(page, token);
-		const authedHeaders = { ...CSRF_HEADERS, Authorization: `Bearer ${token}` };
+		authedHeaders = { ...CSRF_HEADERS, Authorization: `Bearer ${token}` };
+
+		// 失敗テストのリトライで beforeAll が再走した場合に備え、前回分の
+		// 同名リソースを先に掃除しておく（初回実行では何もしない）。
+		await cleanupExistingFixtures(page.request, authedHeaders);
 
 		// 前提データ1: シミュレーションモードの PLC接続 + 収集グループ +
 		// 式から参照する PLC タグ1件（実 PLC/実ネットワークへは繋がない）。
@@ -191,6 +249,9 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 	});
 
 	test.afterAll(async () => {
+		// 後続スペックの一覧行数を増やさないよう、作ったフィクスチャは必ず
+		// 片付ける（`cleanupExistingFixtures` の doc comment 参照）。
+		await cleanupExistingFixtures(page.request, authedHeaders);
 		await page.close();
 	});
 

@@ -25,9 +25,11 @@
  * （3セグメント・ASCII 識別子・前後の境界チェック）を持っているので、
  * {@link extractTagRefs} はその `extractTagRefTokens` をそのまま使う薄い
  * 別名にとどめ、「その完全名を式に書けるか」の判定も同じ `IDENT_SEGMENT` を
- * 使う `isExpressionRepresentableName` に委ねる（#379 再レビュー対応。
- * 末尾ハイフンだけは近似では拾えない実害のある差なので、そちらの関数で
- * 追加で弾いている - `tagDeleteImpact.ts` の doc comment 参照）。
+ * 使う `isExpressionRepresentableName` に委ねる（#379 レビュー対応）。
+ * `IDENT_SEGMENT` は lexer の識別子規則をそのまま写した
+ * `[A-Za-z_][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)*` で、**`-` は英数字・`_` の
+ * 間にだけ置ける**（`a--b` のような連続ハイフンも `abc-` のような末尾
+ * ハイフンも識別子には入らない - `tagDeleteImpact.ts` の doc comment 参照）。
  */
 import { extractTagRefTokens, isExpressionRepresentableName } from './tagDeleteImpact';
 
@@ -60,18 +62,19 @@ export const STRING_REFERENCE_REASON = '文字列型のタグは式から参照�
 export const CYCLE_REFERENCE_REASON =
 	'循環参照になるため挿入できません（このタグが編集中のタグを参照しています）';
 /**
- * #379 再レビュー対応: レジストリのタグ名・接続名・グループ名の検証は
+ * #379 レビュー対応: レジストリのタグ名・接続名・グループ名の検証は
  * 「空でない・最大長」程度で、banto-expr の識別子文法（ASCII の
- * `[A-Za-z_][A-Za-z0-9_-]*` をドットで3つ）より広い。日本語名・空白入り・
- * 末尾ハイフンなどのタグをそのまま挿入すると、直後の段階Aチェックと保存
- * preflight で必ず落ちるので、押す前に止める。
+ * `[A-Za-z_][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)*` をドットで3つ）より広い。
+ * 日本語名・空白入りはもちろん、`abc-`（末尾ハイフン）や `a--b`（連続
+ * ハイフン）のような ASCII だけの名前もそのまま挿入すると直後の段階A
+ * チェックと保存 preflight で必ず落ちるので、押す前に止める。
  *
  * 文言は**制約そのもの**を書く（`英数字・_・- 以外を含む` だけだと、
  * `abc-`/`a--b` のように英数字と `-` しか含まないのに弾かれるケースで
- * 理由が嘘になる - #379 再レビュー指摘）。
+ * 理由が嘘になる - #379 レビュー指摘）。
  */
 export const UNREPRESENTABLE_NAME_REASON =
-	'式で表せない名前のタグです（各セグメントは英字か _ で始まる英数字・_・- の並びで、末尾に - は置けません）';
+	'式で表せない名前のタグです（各セグメントは英字か _ で始まり、- は英数字・_ の間にだけ置けます）';
 
 /**
  * 式中の3セグメントのタグ参照トークンをすべて抽出する。実体は

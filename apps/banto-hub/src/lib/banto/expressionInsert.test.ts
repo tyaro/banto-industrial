@@ -185,7 +185,8 @@ describe('insertionBlockReason', () => {
  * #379 再レビュー対応: レジストリのタグ名検証（空でない・最大長）は
  * banto-expr の識別子文法より広いので、式に書けない完全名を持つタグは
  * 挿入候補から外す。判定は `tagDeleteImpact.ts` の `IDENT_SEGMENT`
- * （`[A-Za-z_][A-Za-z0-9_-]*`）を 3 つドットで繋いだ完全一致。
+ * （`[A-Za-z_][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)*` = lexer の識別子規則そのまま。
+ * `-` は英数字・`_` の**間**にだけ置ける）を 3 つドットで繋いだ完全一致。
  */
 describe('insertionBlockReason: 式で表せない名前', () => {
 	function withName(externalName: string): InsertCandidateTag[] {
