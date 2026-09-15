@@ -799,18 +799,30 @@ async fn stream_values_keeps_streaming_when_all_simulation_starts() {
 /// 2026-09-15 オーナー決定（#335 追補）・#362（旧`test_output`opt-in
 /// フィールド・`TestOutputControl`連動の撤去）後も、AllSimulation 中に
 /// 開始した stream は通常どおり成功し、配信を続ける。
+///
+/// **アドレスは `D0`（#344 作業中に判明した潜り込み、2026-09-15）**:
+/// AllSimulation 中は in-process シミュレータが `banto_collect::simulation`
+/// のランプ波タスクに駆動されるが、そのタスクが値を書くのは先頭
+/// `RAMP_ADDRESS_COUNT`（= 16）番地だけで、**ウィンドウ外の番地は常に
+/// Good/0 のまま変化しない**（`crates/banto-collect/src/simulation.rs` の
+/// module doc「T15-2」節）。この購読は `SubscribeMode::OnChange` なので、
+/// 従来の `D100` では「初回スナップショットのあと値が一度も変わらない」
+/// のが正しい挙動で、2 通目が来るかどうかは収集が落ち着くまでの偶発的な
+/// Bad↔Good のちらつき次第という不安定なテストだった（#344 で接続が
+/// 安定した結果、ちらつきが消えて顕在化した）。`D0` はランプ窓の内側なので
+/// 100ms ごとに必ず値が変わり、「配信が続く」ことを本当に検証できる。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_values_succeeds_and_continues_during_all_simulation() {
     let app = test_app("stream-values-succeeds-during-all-simulation").await;
     let sim = Simulator::start().await;
-    sim.set_word(SlmpDevice::D, 100, 10);
+    sim.set_word(SlmpDevice::D, 0, 10);
 
     let (_tag_id, external_name) = make_tag(
         &app,
         "line1",
         sim.addr.port(),
         "temp01",
-        "D100",
+        "D0",
         "u16",
         false,
         true,

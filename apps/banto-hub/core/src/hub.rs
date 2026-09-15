@@ -1741,7 +1741,10 @@ impl CollectorManager {
     /// `"modbus-tcp"`, not just SLMP) - see `crate::broker_glue`'s module doc
     /// ("The two-backoff double bookkeeping") for why the broker's status,
     /// not banto-collect's own, is the one that answers "is the physical
-    /// session up".
+    /// session up". (#344, 2026-09-15: banto-collect's own status now
+    /// *follows* this one - `BrokerReadClient::connect` fails while the
+    /// broker session is down - so the two rarely disagree any more. This
+    /// method is still the authority, and `/api/v1/status` still sources it.)
     pub fn broker_status(&self, connection_id: i64) -> Option<BrokerConnectionStatus> {
         self.sessions
             .status_watch(connection_id)

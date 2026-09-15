@@ -129,6 +129,15 @@ embed-resource = "3.0"
 tokio = { workspace = true, features = ["rt", "macros", "time", "net", "test-util"] }
 tower = { workspace = true, features = ["util"] }
 tempfile = { workspace = true }
+# #344（2026-09-15）: `broker_glue::BrokerReadClient::connect` は broker の
+# `status_watch` を見て Connected/Reconnecting/Stopped を返し分けるように
+# なった。その単体テストは「セッションが Reconnecting のまま」「3 秒以内に
+# Connected へ戻る」といった遷移を、ソケットもバックオフのタイミングも
+# 介さず決定的に作れる必要がある - `test-util` の
+# `banto_broker::spawn_test_handle_with_status` がその口。**dev 限定**なので
+# 配布バイナリには入らない（[dependencies] 側の banto-broker は既定features
+# のまま）。
+banto-broker = { path = "../../../crates/banto-broker", features = ["test-util"] }
 # T1: `/api/v1/stream` の統合テスト用 WebSocket クライアント
 # (tests/stream.rs)。サーバー側は axum 自身の `ws` feature(上の
 # [dependencies] 参照)で完結するので、これは test コードのみが使う。

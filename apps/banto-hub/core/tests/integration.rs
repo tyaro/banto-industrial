@@ -1151,3 +1151,154 @@ async fn modbus_collection_uses_exactly_one_socket() {
 
     sim.stop();
 }
+
+// ---------------------------------------------------------------------------
+// #344 (2026-09-15): PLC 到達不能の間、`collect_events` はフラップしない。
+//
+// 症状（v0.2.0-alpha.7、実機で抜線して実測）: 到達不能の間、接続ごとに毎秒
+// `plc_reconnected` と `plc_disconnected` が1組ずつ積まれ続けた（2接続で
+// 60秒に220件 ≒ 13,000件/時）。原因は `broker_glue::BrokerReadClient::connect`
+// が broker セッションの実状態を見ずに常に即 `Ok` を返していたこと -
+// 収集ティックの `read_batch` が broker の `Disconnected` で落ちる →
+// `plc_disconnected` → 直後の再接続が無条件に成功 → `plc_reconnected` →
+// 次のティックでまた失敗、の繰り返し。broker 自身の再接続（12〜15秒間隔）
+// とは無関係の、収集周期ぴったりのフラップだった。
+//
+// 修正後に固定すべき事実はこの3つで、どれか1つでも欠けると回帰を見逃す:
+//   (a) 断のあいだ `plc_disconnected` はちょうど1件（継続は再記録しない）
+//   (b) 断のあいだ `plc_reconnected` は0件（復帰していないのだから）
+//   (c) 実際に復帰したら `plc_reconnected` がちょうど1件で、値が Good に戻る
+// シミュレータを**同じポートで**再起動するのが (c) の肝 - 別ポートでは
+// 「PLC が戻ってきた」ことにならない（`Simulator::start_on` はこのために
+// 追加した）。
+// ---------------------------------------------------------------------------
+
+/// `collect_events` に積まれた `kind` の件数。
+async fn count_collect_events(pool: &SqlitePool, kind: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM collect_events WHERE kind = ?")
+        .bind(kind)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plc_events_do_not_flap_while_the_plc_is_unreachable() {
+    let app = test_app("344-event-flap").await;
+    let sim = Simulator::start().await;
+    let plc_addr = sim.addr;
+    sim.set_holding_register(0, 4321); // 40001
+
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(conn_input("line1", plc_addr.port()))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("temp01", group.id, "40001", "i16"))
+        .await
+        .unwrap();
+
+    app.manager.rebuild().await.expect("rebuild after seeding");
+
+    let good = || async {
+        app.manager
+            .current_values()
+            .and_then(|c| c.get("tag:1"))
+            .map(|s| (s.value, s.quality))
+            == Some((Some(4321.0), banto_collect::Quality::Good))
+    };
+    assert!(
+        wait_until(Duration::from_secs(10), good).await,
+        "collection should be running and Good before the outage"
+    );
+
+    // --- 断: PLC を落とす（listener も既存ソケットも切る） -------------------
+    sim.stop();
+
+    assert!(
+        wait_until(Duration::from_secs(5), || async {
+            count_collect_events(&app.pool, "plc_disconnected").await >= 1
+        })
+        .await,
+        "the outage should be recorded as plc_disconnected"
+    );
+
+    // (a)/(b): 5秒以上そのまま放置しても、増えるのは「何も」であること。
+    // 修正前はこの5秒（周期100ms）で50組前後積み上がっていた。
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        count_collect_events(&app.pool, "plc_disconnected").await,
+        1,
+        "one outage must stay exactly one plc_disconnected, however many ticks \
+         fail inside it (#344)"
+    );
+    assert_eq!(
+        count_collect_events(&app.pool, "plc_reconnected").await,
+        0,
+        "nothing has reconnected - the PLC is still down (#344)"
+    );
+
+    // `/api/v1/status` は broker の答え（= 物理セッションは再接続待ち）。
+    let (status_code, status_json) = get_json(&app.router, "/api/v1/status", &app.token).await;
+    assert_eq!(status_code, StatusCode::OK);
+    let entry = status_json["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == conn.id)
+        .expect("connection should appear in /api/v1/status")
+        .clone();
+    assert_eq!(
+        entry["status"], "reconnecting",
+        "the broker should report the session as reconnecting while the PLC is down"
+    );
+
+    // --- 復帰: 同じポートで PLC を戻す -------------------------------------
+    // `stop()` が切ったソケットが短時間ポートを掴んでいることがあるので、
+    // 束の間の AddrInUse は再試行で越える（`Simulator::start_on` の doc 参照）。
+    let sim = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match Simulator::start_on(plc_addr).await {
+                Ok(sim) => break sim,
+                Err(err) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "could not re-bind the simulator on {plc_addr}: {err}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    };
+    sim.set_holding_register(0, 4321);
+
+    // (c): broker のバックオフ（1s → 30s）を待ち切ったうえで、ちょうど1件。
+    assert!(
+        wait_until(Duration::from_secs(60), || async {
+            count_collect_events(&app.pool, "plc_reconnected").await >= 1
+        })
+        .await,
+        "the collector should report exactly one plc_reconnected once the PLC is back"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), good).await,
+        "values should be Good again after the reconnect"
+    );
+    assert_eq!(
+        count_collect_events(&app.pool, "plc_reconnected").await,
+        1,
+        "the recovery must be announced exactly once (#344)"
+    );
+    assert_eq!(
+        count_collect_events(&app.pool, "plc_disconnected").await,
+        1,
+        "the whole outage was still one disconnect (#344)"
+    );
+
+    sim.stop();
+}

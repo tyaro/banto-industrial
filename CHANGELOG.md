@@ -2,6 +2,21 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
+## v0.2.0-alpha.13 — 2026-09-15（アルファ）
+
+PLC が到達不能の間、`collect_events` に `plc_reconnected` と `plc_disconnected` が収集周期ごとにフラップし続ける不具合の修正。配布物の構成・前提ランタイムは alpha.3 以降と同じ。
+
+### 修正
+
+- **PLC 到達不能中に `plc_reconnected`/`plc_disconnected` が毎秒フラップする不具合を修正**（#344）。抜線などで PLC が落ちている間、接続ごとに毎秒 1 組（1000ms 周期・2 接続で約 13,000 件/時）がイベントに積まれ続け、実際の再接続と区別できず、長時間の機器断で DB 肥大とイベント API の応答劣化を招いていた。原因は hub の `BrokerReadClient::connect()` が broker セッションの実状態を見ずに常に即 `Ok` を返していたこと - 収集ティックの読み取りが broker の `Disconnected` で失敗 → `plc_disconnected` → 直後の再接続が無条件に成功 → `plc_reconnected` → 次のティックでまた失敗、の繰り返しだった（broker 自身の再接続バックオフ 12〜15 秒とは無関係）。
+  - `BrokerReadClient::connect()` は broker の `status_watch` を見るようになった。`Connected` なら即成功、`Reconnecting` なら 3 秒まで復帰を待ち、間に合わなければ失敗を返す（`Stopped`・broker タスク終了は即失敗）。これにより収集側のバックオフ（1s → 30s）が本来の役目を果たし、断のあいだ状態が `Connected` へ戻らなくなる。
+  - **`plc_reconnected` の意味を明確化**: 「接続に成功した瞬間」ではなく **「切断後、最初の読み取りが成功した時点」** に 1 回だけ記録する。`ts` はその読み取りティックの時刻。`plc_disconnected` も同様に、既に記録済みの断が続いているあいだは再記録しない。実機・シミュレータどちらの経路でも同じ規則（`banto-collect` の接続タスク側で実装）。
+- **wire 変更なし**。`collect_events.kind` の値・REST/gRPC/WS のスキーマはいずれも変更していない。変わったのは「いつ何件記録されるか」だけで、`plc_reconnected` を監視している下流（Thermal Monitor、DB Sink 経由の集計）は、これまで毎秒届いていた偽の再接続が届かなくなる。
+
+### 既知の制限（アルファ）
+
+alpha.11 と同じ。
+
 ## v0.2.0-alpha.12 — 2026-09-15（アルファ）
 
 alpha.10（#335）で外部への読み取り出力のシミュレーションゲートを撤廃したため、どの経路からも参照されなくなっていた T15-3「テスト出力」（`test_output`）機構を撤去した。配布物の構成・前提ランタイムは alpha.3 以降と同じ。

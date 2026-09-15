@@ -10,7 +10,10 @@
 ワイヤ変更: `simulation_write_rejected` は返らない）。2026-09-14 更新:
 #341 の CRUD 契約改定を §4.3 に反映。2026-09-15 更新: #362
 （v0.2.0-alpha.12）- 旧 T15-3 テスト出力（`test_output`）機構を
-`TestOutputControl`・REST・gRPC proto ごと撤去、§4.2 に反映）**。
+`TestOutputControl`・REST・gRPC proto ごと撤去、§4.2 に反映。同日追補 #344
+（v0.2.0-alpha.13）: 二重バックオフの接続規約を §6 項目5 に是正 -
+`BrokerReadClient::connect()` は broker の実状態を返し、`plc_reconnected`
+は「切断後、最初の読み取り成功」で 1 回だけ記録する）**。
 起案時は設計先行だったが、
 apps/banto-hub として実装が進行 — T0〜T21 実装済み（T19 UX 群・T20 文字列/構造体/レシピ/ビット・T21 構成補助 MCP 管理面まで完了、詳細は下の 2026-09-06 更新）・残 T18-5c/d
 （Windows 実機往復・72h soak）と P3-b の残件（SLMP CPU 種別/アクセスルート露出、
@@ -1065,6 +1068,36 @@ relay-wright の専管）。
    これは SLMP が T2-2 以来受容してきた挙動と同じである。回帰テスト:
    `apps/banto-hub/core/tests/integration.rs` の
    `modbus_collection_uses_exactly_one_socket`。
+   **2026-09-15（issue #344、v0.2.0-alpha.13）: 二重バックオフの接続規約を
+   是正**。T2-2 で「banto-collect の接続タスク構造は変えない」を実現する
+   ため、`BrokerReadClient::connect()` は**常に即 `Ok`** を返す実装だった
+   （実セッションの生死は `read_batch` が呼び出し毎に答える、という整理）。
+   この結果、PLC が到達不能の間は「読み取り失敗 → `plc_disconnected` →
+   直後の再接続が無条件成功 → `plc_reconnected` → 次のティックでまた失敗」
+   が**収集周期ごとに**繰り返され、実測で 1000ms 周期・2 接続で約 13,000
+   件/時のイベントが積まれた（broker 自身の再接続バックオフ 12〜15 秒とは
+   無関係のフラップ）。是正後の規約は次の 2 点:
+   - `BrokerReadClient::connect()` は broker の `status_watch` を見る。
+     `Connected` なら即成功、`Reconnecting` なら 3 秒（定数
+     `BROKER_RECONNECT_GRACE`、broker のバックオフ 1s/2s の 2 段分）まで
+     復帰を待ち、間に合わなければ失敗を返す。`Stopped`・broker タスク終了は
+     即失敗。これで収集側 `ConnState` は断のあいだ `Backoff`（1s → 30s）に
+     留まり、二重バックオフは「broker = 物理セッションの再接続権威、
+     banto-collect = 再試行間隔のガバナ」という本来の役割分担に戻る。
+   - **`plc_reconnected` は「切断後、最初の読み取りが成功した時点」**に
+     1 回だけ記録する（接続成功の瞬間ではない）。`plc_disconnected` も、
+     既に記録済みの断が続いているあいだは再記録しない。これは
+     `banto-collect` 側（`task.rs`）の規約なので、broker 経由・直接
+     クライアントのどちらでも同じ。境界競合（broker がセッション断を
+     status へ反映するまでの短い窓で `connect()` が成功してしまう）も
+     これで塞がる。
+     回帰テスト: `apps/banto-hub/core/tests/integration.rs` の
+     `plc_events_do_not_flap_while_the_plc_is_unreachable`（シミュレータを
+     同一ポートで停止・再起動し、断のあいだ disconnected ちょうど 1 件・
+     reconnected 0 件、復帰で reconnected ちょうど 1 件を固定）、
+     `crates/banto-collect/src/collector.rs` の `a_connection_that_never_reads_*`
+     / `the_first_successful_read_after_an_outage_*`、
+     `apps/banto-hub/core/src/broker_glue.rs` の `connect_*` 単体テスト。
 6. **書き込み受付の既定と永続（2026-09-09 オーナー決定で撤回・変更、#340）**:
    既定は有効、再起動で永続値を復元、収集操作（start/stop/set_mode）で
    変えない。トグルは運用者が手で止める非常停止スイッチに徹する。理由:
