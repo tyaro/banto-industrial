@@ -508,3 +508,45 @@ fn source_length_one_over_max_is_rejected() {
         other => panic!("expected SourceTooLong, got {other:?}"),
     }
 }
+
+// ---------- `-` に隣接するタグ参照の切り出し（#379 レビュー対応） ----------
+//
+// フロント側（`apps/banto-hub/src/lib/banto/tagDeleteImpact.ts` の
+// `TAG_REF_PATTERN`）は、式からタグ参照を近似正規表現で抽出して「削除影響」
+// と「一覧から挿入の循環除外」に使う。その近似が lexer と食い違うと、参照を
+// 見落として UI の判定が嘘になる（#379 の Copilot 指摘）。`-` は減算演算子
+// でもあり識別子の一部にもなりうる（モジュール doc「識別子とハイフンの
+// 綱引き」）ため、ここで**実 lexer による正**を固定し、TS 側のテスト
+// （`tagDeleteImpact.test.ts` / `expressionInsert.test.ts`）は同じ期待値を
+// 写す。
+
+fn referenced(source: &str) -> Vec<String> {
+    compile(source)
+        .unwrap_or_else(|e| panic!("expected {source:?} to compile, got {e:?}"))
+        .referenced_tags()
+        .to_vec()
+}
+
+#[test]
+fn tag_ref_after_minus_operator_is_a_separate_reference() {
+    // 直前が数値・単項・閉じ括弧なら `-` は演算子なので、後ろのタグ参照は
+    // そのまま1件の参照として切り出される。
+    assert_eq!(referenced("1-line1.fast.tag"), vec!["line1.fast.tag"]);
+    assert_eq!(referenced("-line1.fast.tag"), vec!["line1.fast.tag"]);
+    assert_eq!(
+        referenced("(a.b.c)-line1.fast.tag"),
+        vec!["a.b.c", "line1.fast.tag"]
+    );
+    // 空白で区切れば当然2件。
+    assert_eq!(referenced("a.b.c - d.e.f"), vec!["a.b.c", "d.e.f"]);
+}
+
+#[test]
+fn hyphen_between_identifiers_is_absorbed_into_the_reference() {
+    // 直前が識別子なら `-` は識別子へ吸収される（最長一致） - 参照は
+    // `line1.fast.tag` では**なく** `a-line1.fast.tag` の方。
+    assert_eq!(referenced("a-line1.fast.tag"), vec!["a-line1.fast.tag"]);
+    assert_eq!(referenced("x1-line1.fast.tag"), vec!["x1-line1.fast.tag"]);
+    // 末尾セグメントの後ろに続く `-1` も同じ規則で吸収される。
+    assert_eq!(referenced("a.b.c-1"), vec!["a.b.c-1"]);
+}

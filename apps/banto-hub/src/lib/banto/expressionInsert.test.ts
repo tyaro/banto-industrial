@@ -72,6 +72,21 @@ describe('extractTagRefs', () => {
 		expect(extractTagRefs(null)).toEqual([]);
 		expect(extractTagRefs('')).toEqual([]);
 	});
+
+	/**
+	 * #379 レビュー対応: `-` に隣接する参照の切り出し。期待値は実 lexer に
+	 * 対して `crates/banto-expr/tests/compile.rs` で固定してあり
+	 * （`tag_ref_after_minus_operator_is_a_separate_reference` /
+	 * `hyphen_between_identifiers_is_absorbed_into_the_reference`）、
+	 * `tagDeleteImpact.test.ts` の同名ケースと同じ値。
+	 */
+	it('演算子としての `-` の直後の参照を拾い、識別子へ吸収された `-` の直後は拾わない', () => {
+		expect(extractTagRefs('1-line1.fast.tag')).toEqual(['line1.fast.tag']);
+		expect(extractTagRefs('-line1.fast.tag')).toEqual(['line1.fast.tag']);
+		expect(extractTagRefs('(a.b.c)-line1.fast.tag')).toEqual(['a.b.c', 'line1.fast.tag']);
+		expect(extractTagRefs('a-line1.fast.tag')).toEqual(['a-line1.fast.tag']);
+		expect(extractTagRefs('a.b.c-1')).toEqual(['a.b.c-1']);
+	});
 });
 
 describe('wouldCreateCycle', () => {
@@ -100,6 +115,18 @@ describe('wouldCreateCycle', () => {
 	it('新規作成（selfId = null）では循環しようがない', () => {
 		expect(wouldCreateCycle(tags, null, 4)).toBe(false);
 		expect(wouldCreateCycle(tags, null, 6)).toBe(false);
+	});
+
+	it('`1-self` の形（演算子の `-` に隣接）で参照している computed も循環（#379）', () => {
+		// 旧実装は「直前が `-`」を一律に除外していたため依存グラフの辺が
+		// 落ち、循環候補なのにトーストが出ず挿入できてしまっていた。
+		const selfName = `${CONN}.${GROUP}.self`;
+		const withMinusRef = [
+			tag(1, 'self', { tagKind: 'computed', expression: '1' }),
+			tag(8, 'minus-ref', { tagKind: 'computed', expression: `1-${selfName}` })
+		];
+		expect(wouldCreateCycle(withMinusRef, 1, 8)).toBe(true);
+		expect(insertionBlockReason(withMinusRef, 1, 8)).toBe(CYCLE_REFERENCE_REASON);
 	});
 });
 

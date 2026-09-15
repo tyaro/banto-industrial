@@ -119,6 +119,30 @@ describe('extractTagRefTokens', () => {
 	it('前に別の識別子が連結していると誤マッチしない（xa.b.c は a.b.c と別トークン）', () => {
 		expect(expressionReferencesExternalName('xa.b.c', 'a.b.c')).toBe(false);
 	});
+
+	/**
+	 * #379 レビュー対応: `-` は減算演算子にも識別子の一部にもなる。期待値は
+	 * 実 lexer に対して `crates/banto-expr/tests/compile.rs` の
+	 * `tag_ref_after_minus_operator_is_a_separate_reference` /
+	 * `hyphen_between_identifiers_is_absorbed_into_the_reference` で固定して
+	 * あり、ここはその写し。
+	 */
+	it('演算子としての `-` の直後の参照を見落とさない（#379、正は banto-expr のテスト）', () => {
+		expect(extractTagRefTokens('1-line1.fast.tag')).toEqual(['line1.fast.tag']);
+		expect(extractTagRefTokens('-line1.fast.tag')).toEqual(['line1.fast.tag']);
+		expect(extractTagRefTokens('(a.b.c)-line1.fast.tag')).toEqual(['a.b.c', 'line1.fast.tag']);
+		expect(extractTagRefTokens('a.b.c - d.e.f')).toEqual(['a.b.c', 'd.e.f']);
+		expect(expressionReferencesExternalName('1-line1.fast.tag', 'line1.fast.tag')).toBe(true);
+	});
+
+	it('識別子へ吸収された `-` の直後は別トークンにしない（#379、同上）', () => {
+		// lexer は `a-line1` を1つの識別子として最長一致で吸収するので、
+		// 参照は `a-line1.fast.tag` であって `line1.fast.tag` ではない。
+		expect(extractTagRefTokens('a-line1.fast.tag')).toEqual(['a-line1.fast.tag']);
+		expect(extractTagRefTokens('x1-line1.fast.tag')).toEqual(['x1-line1.fast.tag']);
+		expect(extractTagRefTokens('a.b.c-1')).toEqual(['a.b.c-1']);
+		expect(expressionReferencesExternalName('a-line1.fast.tag', 'line1.fast.tag')).toBe(false);
+	});
 });
 
 describe('expressionReferencesExternalName', () => {
@@ -147,6 +171,32 @@ describe('findReferencingComputedTags', () => {
 
 	const targetTag = makeTag({ id: 10, name: 'temp01', collectionGroupId: 1, tagKind: 'plc' });
 	const targetExternalName = buildExternalName('line1', 'fast', 'temp01');
+
+	it('`1-x.y.z` のように演算子の `-` に隣接して参照している computed タグも検出する（#379）', () => {
+		// 旧実装は「直前が `-`」を一律に除外していたため、この形の参照元を
+		// 見落としていた（削除しても壊れないと誤って案内していた）。
+		const expression = `1-${targetExternalName}`;
+		const computedTag = makeTag({
+			id: 21,
+			name: 'inv',
+			collectionGroupId: 2,
+			tagKind: 'computed',
+			expression,
+			address: ''
+		});
+
+		const result = findReferencingComputedTags(
+			targetTag.id,
+			targetExternalName,
+			[targetTag, computedTag],
+			groups,
+			connections
+		);
+
+		expect(result).toEqual<ReferencingTag[]>([
+			{ id: 21, name: 'inv', externalName: 'calc.calc-group.inv', expression }
+		]);
+	});
 
 	it('式が削除対象を参照する computed タグを見つける', () => {
 		const expression = `(${targetExternalName} + line1.fast.temp02) / 2`;

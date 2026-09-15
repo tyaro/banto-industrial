@@ -44,11 +44,27 @@ const IDENT_SEGMENT = '[A-Za-z_][A-Za-z0-9_-]*';
 
 /**
  * 式中の3セグメントのタグ参照トークン（`接続.グループ.タグ`）を検出する
- * グローバル正規表現。前後の境界チェック（識別子継続文字でないこと）で、
- * より長い識別子・より長いドット連結の一部を誤って切り出さないようにする。
+ * グローバル正規表現。前後の境界チェックで、より長い識別子・より長い
+ * ドット連結の一部を誤って切り出さないようにする。
+ *
+ * **`-` の扱い**（#379 レビュー対応。正は `crates/banto-expr/tests/compile.rs`
+ * の `tag_ref_after_minus_operator_is_a_separate_reference` /
+ * `hyphen_between_identifiers_is_absorbed_into_the_reference` で実 lexer に
+ * 対して固定してある）: 旧実装は後読みを `(?<![A-Za-z0-9_.-])` として
+ * **直前が `-` の候補を一律に拒否**していたが、lexer が `-` を識別子へ
+ * 吸収するのは「直前が識別子のときだけ」（`crates/banto-expr/src/lexer.rs`
+ * の「識別子とハイフンの綱引き」）。そのため `1-line1.fast.tag`・
+ * `-line1.fast.tag`・`(a.b.c)-line1.fast.tag` はどれも `line1.fast.tag` を
+ * 参照しているのに見落としていた（削除影響の検出漏れと、「一覧から挿入」の
+ * 循環除外が効かない不具合）。後読みを2段に分けて lexer と一致させる:
+ *
+ * - `(?<![A-Za-z0-9_.])` … 識別子の途中・ドット連結の途中から切り出さない
+ * - `(?<!IDENT-)` … **識別子に吸収された `-`** の直後から切り出さない
+ *   （`a-line1.fast.tag` の参照は `a-line1.fast.tag` であって
+ *   `line1.fast.tag` ではない）
  */
 const TAG_REF_PATTERN = new RegExp(
-	`(?<![A-Za-z0-9_.-])${IDENT_SEGMENT}\\.${IDENT_SEGMENT}\\.${IDENT_SEGMENT}(?![A-Za-z0-9_.-])`,
+	`(?<![A-Za-z0-9_.])(?<!${IDENT_SEGMENT}-)${IDENT_SEGMENT}\\.${IDENT_SEGMENT}\\.${IDENT_SEGMENT}(?![A-Za-z0-9_.-])`,
 	'g'
 );
 
