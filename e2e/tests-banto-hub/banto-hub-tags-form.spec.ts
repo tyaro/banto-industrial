@@ -232,7 +232,10 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 	test('3. edit Drawer: 変更後 Enter で送信され、タグが更新される', async () => {
 		await page.goto('/tags');
 		await page.getByRole('gridcell', { name: EDIT_TAG_NAME, exact: true }).click();
-		const drawer = page.getByRole('dialog', { name: `${EDIT_TAG_NAME} を編集` });
+		// #375: 編集・連続登録は非モーダルの右ペイン（`<aside aria-label>` =
+		// role `complementary`）になったため `role="dialog"` では取れない。
+		// アクセシブル名（`… を編集`/`連続登録`）は Drawer 時代と同じ。
+		const drawer = page.getByRole('complementary', { name: `${EDIT_TAG_NAME} を編集` });
 		await expect(drawer).toBeVisible();
 
 		const unitInput = drawer.getByLabel('単位');

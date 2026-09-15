@@ -158,7 +158,10 @@ test.describe.serial('banto-hub タグ更新の楽観的ロック + 競合時の
 	test('別経路が先に更新（revision が進む） → UI が古い revision で保存すると 409 になり、差分パネルが表示される', async () => {
 		await page.goto('/tags');
 		await page.getByRole('gridcell', { name: TAG_NAME, exact: true }).click();
-		const drawer = page.getByRole('dialog', { name: `${TAG_NAME} を編集` });
+		// #375: 編集・連続登録は非モーダルの右ペイン（`<aside aria-label>` =
+		// role `complementary`）になったため `role="dialog"` では取れない。
+		// アクセシブル名（`… を編集`/`連続登録`）は Drawer 時代と同じ。
+		const drawer = page.getByRole('complementary', { name: `${TAG_NAME} を編集` });
 		await expect(drawer).toBeVisible();
 
 		// UI の編集フォームはここで revision=1 を掴んだ状態。この後、UI を
@@ -224,7 +227,7 @@ test.describe.serial('banto-hub タグ更新の楽観的ロック + 競合時の
 	});
 
 	test('「サーバー最新を採用」を押すとフォームがサーバー値になり、差分パネルが消える', async () => {
-		const drawer = page.getByRole('dialog', { name: `${TAG_NAME} を編集` });
+		const drawer = page.getByRole('complementary', { name: `${TAG_NAME} を編集` });
 		await expect(drawer).toBeVisible();
 		await expect(drawer.getByText('他のクライアントが先に更新しています')).toBeVisible();
 
@@ -239,7 +242,7 @@ test.describe.serial('banto-hub タグ更新の楽観的ロック + 競合時の
 		// なので、そのまま何かを変更して保存すれば今度は成功する -
 		// 「検出したら即詰み」ではなく「最新を取り直せば再試行できる」
 		// ことの確認。
-		const drawer = page.getByRole('dialog', { name: `${TAG_NAME} を編集` });
+		const drawer = page.getByRole('complementary', { name: `${TAG_NAME} を編集` });
 		await expect(drawer).toBeVisible();
 
 		const unitInput = drawer.getByLabel('単位');
@@ -270,7 +273,7 @@ test.describe.serial('banto-hub タグ更新の楽観的ロック + 競合時の
 	});
 
 	test('2度目の競合で「自分の内容で再保存」を押すと、ローカルの入力が勝って revision が進む', async () => {
-		const drawer = page.getByRole('dialog', { name: `${TAG_NAME} を編集` });
+		const drawer = page.getByRole('complementary', { name: `${TAG_NAME} を編集` });
 		await expect(drawer).toBeVisible();
 
 		// 再び別経路が先に更新して revision を 3 → 4 に進める。

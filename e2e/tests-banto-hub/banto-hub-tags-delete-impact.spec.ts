@@ -154,7 +154,10 @@ test.describe.serial('banto-hub タグ削除前の参照影響表示 (TAG-UX-C)'
 
 	test('1. 参照元の演算タグがあるタグの削除確認: 完全外部名と参照元一覧が出る', async () => {
 		await page.getByRole('gridcell', { name: REFERENCED_TAG_NAME, exact: true }).click();
-		const drawer = page.getByRole('dialog', { name: `${REFERENCED_TAG_NAME} を編集` });
+		// #375: 編集・連続登録は非モーダルの右ペイン（`<aside aria-label>` =
+		// role `complementary`）になったため `role="dialog"` では取れない。
+		// アクセシブル名（`… を編集`/`連続登録`）は Drawer 時代と同じ。
+		const drawer = page.getByRole('complementary', { name: `${REFERENCED_TAG_NAME} を編集` });
 		await expect(drawer).toBeVisible();
 
 		let dialogMessage: string | null = null;
@@ -178,7 +181,7 @@ test.describe.serial('banto-hub タグ削除前の参照影響表示 (TAG-UX-C)'
 
 	test('2. 参照元が無いタグの削除確認: 完全外部名は出るが参照警告は出ない', async () => {
 		await page.getByRole('gridcell', { name: UNREFERENCED_TAG_NAME, exact: true }).click();
-		const drawer = page.getByRole('dialog', { name: `${UNREFERENCED_TAG_NAME} を編集` });
+		const drawer = page.getByRole('complementary', { name: `${UNREFERENCED_TAG_NAME} を編集` });
 		await expect(drawer).toBeVisible();
 
 		let dialogMessage: string | null = null;
@@ -200,7 +203,7 @@ test.describe.serial('banto-hub タグ削除前の参照影響表示 (TAG-UX-C)'
 
 	test('3. 削除確認で OK すれば、参照元が無いタグは従来どおり削除される', async () => {
 		await page.getByRole('gridcell', { name: UNREFERENCED_TAG_NAME, exact: true }).click();
-		const drawer = page.getByRole('dialog', { name: `${UNREFERENCED_TAG_NAME} を編集` });
+		const drawer = page.getByRole('complementary', { name: `${UNREFERENCED_TAG_NAME} を編集` });
 		await expect(drawer).toBeVisible();
 
 		page.once('dialog', (dialog) => {
@@ -241,7 +244,7 @@ test.describe.serial('banto-hub タグ削除前の参照影響表示 (TAG-UX-C)'
 
 		try {
 			await page.getByRole('gridcell', { name: REFERENCED_TAG_NAME, exact: true }).click();
-			const drawer = page.getByRole('dialog', { name: `${REFERENCED_TAG_NAME} を編集` });
+			const drawer = page.getByRole('complementary', { name: `${REFERENCED_TAG_NAME} を編集` });
 			await expect(drawer).toBeVisible();
 
 			page.once('dialog', (dialog) => {

@@ -84,7 +84,10 @@ test.describe.serial('banto-hub タグ連続登録 DOM (TAG-P0-1)', () => {
 		await page.goto('/tags');
 		await groupNodeByName(page, GROUP_NAME).click();
 		await page.getByRole('button', { name: '連続登録' }).click();
-		await expect(page.getByRole('dialog', { name: '連続登録' })).toBeVisible();
+		// #375: 編集・連続登録は非モーダルの右ペイン（`<aside aria-label>` =
+		// role `complementary`）になったため `role="dialog"` では取れない。
+		// アクセシブル名（`… を編集`/`連続登録`）は Drawer 時代と同じ。
+		await expect(page.getByRole('complementary', { name: '連続登録' })).toBeVisible();
 		await page.getByLabel('開始アドレス').fill('D100');
 		await page.getByLabel('名前パターン').fill('temp{n}');
 		await page.getByLabel('開始番号').fill('1');

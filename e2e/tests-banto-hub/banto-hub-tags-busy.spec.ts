@@ -110,7 +110,10 @@ test.describe.serial('banto-hub タグ Drawer busy 相互排他 (TAG-UX-C)', () 
 
 		await page.goto('/tags');
 		await page.getByRole('gridcell', { name: TAG_NAME, exact: true }).click();
-		const drawer = page.getByRole('dialog', { name: `${TAG_NAME} を編集` });
+		// #375: 編集・連続登録は非モーダルの右ペイン（`<aside aria-label>` =
+		// role `complementary`）になったため `role="dialog"` では取れない。
+		// アクセシブル名（`… を編集`/`連続登録`）は Drawer 時代と同じ。
+		const drawer = page.getByRole('complementary', { name: `${TAG_NAME} を編集` });
 		await expect(drawer).toBeVisible();
 
 		// 削除確認の window.confirm は自動で「OK」を押す。

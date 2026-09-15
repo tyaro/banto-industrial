@@ -12,7 +12,8 @@ v0.2.0-alpha.15: 演算タグの式チェック API（`POST /api/tags/expression
 エラー位置のインライン表示・ライブプレビューを追加（#342 段階A。MCP `check_expression`
 ツールを追加し 38 ツールに）を反映、
 v0.2.0-alpha.16: Drawer/Modal が未保存中は Esc・オーバーレイクリックで閉じないよう修正し、
-接続 Drawer・収集グループ Drawer に無かった未保存破棄確認を追加（誤爆クローズ防止）を反映）。
+接続 Drawer・収集グループ Drawer に無かった未保存破棄確認を追加（誤爆クローズ防止）を反映、
+v0.2.0-alpha.17: タグの編集・連続登録を非モーダルの右ペインへ移動（#375）を反映）。
 最終検証日(コード照合): 2026-09-15
 
 > この地図は索引に徹する。実装状況・設計判断の本体は各文書側にあり、状態の**正**は
@@ -139,6 +140,13 @@ v0.2.0-alpha.16: Drawer/Modal が未保存中は Esc・オーバーレイクリ�
   無かった」不具合も修正し、タグ編集 Drawer と同じ `isFormDirty` ベースの破棄確認を追加した。
   フロントのみ、**wire 変更なし**。詳細は
   [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §9.4 TAG-UX-C。
+- **v0.2.0-alpha.17（2026-09-15、#375）**: オーナー報告「編集中に左ツリーと中央グリッドを
+  見られない」の解消。タグ画面の「編集」「連続登録」をモーダルの Drawer から**非モーダルの
+  右ペイン**へ移した（オーバーレイを持たないので編集中も左ツリーとグリッドを操作できる。
+  Esc では閉じず、明示的な「閉じる」ボタンと登録成功後だけ閉じる）。狭幅（≤900px、サイドバーの
+  オフキャンバスと同じブレークポイント）は従来どおりオーバーレイの Drawer、構造体展開と CSV
+  取り込みは一過性のウィザードなのでモーダルのまま。フロントのみ、**wire 変更なし**。詳細は
+  [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §9.4 TAG-UX-C 2026-09-15 追補その2。
 - **出荷ゲート**: T5-5（実機での 72h soak 実行 + 実機最終サインオフ）のみ残（実機必須）。
 - **banto-tagclient**: **S4a完了（2026-09-01）**。読み取り専用DTO、Endpoint/Secret境界、
   stable ID resolver、REST catalog/values transport、WS wire純粋解析、bounded publish gate、認証付き

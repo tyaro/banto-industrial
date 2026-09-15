@@ -86,13 +86,16 @@ test.describe.serial('banto-hub タグ Drawer dirty 破棄確認 (TAG-UX-C)', ()
 	test.beforeEach(async () => {
 		await page.goto('/tags');
 		await page.getByRole('gridcell', { name: TAG_NAME, exact: true }).click();
-		await expect(page.getByRole('dialog', { name: `${TAG_NAME} を編集` })).toBeVisible();
+		// #375: 編集・連続登録は非モーダルの右ペイン（`<aside aria-label>` =
+		// role `complementary`）になったため `role="dialog"` では取れない。
+		// アクセシブル名（`… を編集`/`連続登録`）は Drawer 時代と同じ。
+		await expect(page.getByRole('complementary', { name: `${TAG_NAME} を編集` })).toBeVisible();
 	});
 
 	test('1. 名前を変更して × → confirm をキャンセル → Drawer は開いたまま', async () => {
 		// BantoGrid の列フィルターボタン（aria-label="名前の絞り込み"）と
 		// `getByLabel('名前')` が重複するため、Drawer 内に限定する。
-		const drawer = page.getByRole('dialog', { name: `${TAG_NAME} を編集` });
+		const drawer = page.getByRole('complementary', { name: `${TAG_NAME} を編集` });
 		const nameInput = drawer.getByLabel('名前');
 		await nameInput.fill(`${TAG_NAME}-changed`);
 
@@ -111,7 +114,7 @@ test.describe.serial('banto-hub タグ Drawer dirty 破棄確認 (TAG-UX-C)', ()
 			.toBe('変更を破棄しますか？');
 
 		// キャンセルしたので Drawer は閉じておらず、入力した値も保持される。
-		await expect(page.getByRole('dialog', { name: `${TAG_NAME} を編集` })).toBeVisible();
+		await expect(page.getByRole('complementary', { name: `${TAG_NAME} を編集` })).toBeVisible();
 		await expect(nameInput).toHaveValue(`${TAG_NAME}-changed`);
 	});
 
@@ -124,7 +127,7 @@ test.describe.serial('banto-hub タグ Drawer dirty 破棄確認 (TAG-UX-C)', ()
 
 		await page.getByRole('button', { name: '閉じる' }).click();
 
-		await expect(page.getByRole('dialog', { name: `${TAG_NAME} を編集` })).toBeHidden();
+		await expect(page.getByRole('complementary', { name: `${TAG_NAME} を編集` })).toBeHidden();
 		expect(dialogShown).toBe(false);
 	});
 });
