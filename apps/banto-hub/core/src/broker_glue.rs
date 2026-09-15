@@ -114,7 +114,7 @@
 //! implements. Since #344 the two agree far more often than they used to,
 //! but the broker remains the source of truth.
 //!
-//! ## T9-1/T9-2 note: SLMP simulation mode, wired via [`BrokerSimRegistry`]
+//! ## T9-1/T9-2 note: broker-managed connections' simulation mode, wired via [`BrokerSimRegistry`]
 //!
 //! docs/ux-plan.md §1 (2026-08-06, 「接続単位のシミュレーションモード」) adds
 //! `banto_tags::PlcConnection::simulation`; for connections that bypass this
@@ -617,8 +617,9 @@ pub struct BrokerSimRegistry {
 
 impl BrokerSimRegistry {
     /// 空のレジストリで開始する - `CollectorManager`の最初の`rebuild`が
-    /// SLMP 接続を見つけるたびに [`Self::resolve`] 経由で育つ
-    /// ([`HubSessions::new`]と同じ「起動時は空、後から育つ」設計)。
+    /// broker が管理する接続(SLMP / Modbus TCP)を見つけるたびに
+    /// [`Self::resolve`] 経由で育つ([`HubSessions::new`]と同じ「起動時は
+    /// 空、後から育つ」設計)。
     pub fn new() -> Self {
         Self {
             simulators: tokio::sync::Mutex::new(HashMap::new()),
@@ -725,8 +726,9 @@ impl BrokerSimRegistry {
     }
 
     /// `connection_id`用に追跡しているシミュレータ(あれば)を停止・忘却し、
-    /// `last_target`のエントリも忘れる。有効な SLMP 集合から外れた接続
-    /// (削除・無効化・プロトコル変更)の掃除ステップから呼ばれる -
+    /// `last_target`のエントリも忘れる。有効な broker 管理接続の集合
+    /// (SLMP / Modbus TCP)から外れた接続(削除・無効化・プロトコル変更)の
+    /// 掃除ステップから呼ばれる -
     /// [`HubSessions::remove`]と同じタイミング保証: **対応する収集タスクが
     /// 既に停止した後にのみ**呼び出すこと。
     pub async fn remove(&self, connection_id: i64) {

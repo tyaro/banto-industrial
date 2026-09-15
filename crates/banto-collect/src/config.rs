@@ -56,10 +56,12 @@ fn tag_key(id: i64) -> String {
 /// `D100`) for [`Protocol::Slmp`] (I8, 2026-08-05: `banto-plc`'s SLMP client
 /// wired into collection).
 ///
-/// T9-2 (apps/banto-hub/core's broker-routed SLMP path): also `pub` (not
-/// `pub(crate)`) because `banto_hub_core::broker_glue::BrokerSimRegistry` needs
-/// to pass `Protocol::Slmp` to `crate::simulation::start` when it starts an
-/// in-process SLMP simulator ahead of establishing a broker session (see
+/// T9-2 (apps/banto-hub/core's broker-routed simulation path): also `pub`
+/// (not `pub(crate)`) because `banto_hub_core::broker_glue::BrokerSimRegistry`
+/// needs to pass a `Protocol` value to `crate::simulation::start` when it
+/// starts an in-process simulator ahead of establishing a broker session -
+/// `BrokerSimRegistry::resolve` (`broker_glue.rs`) picks `Protocol::ModbusTcp`
+/// or `Protocol::Slmp` depending on the connection's own protocol (see
 /// `crate::simulation`'s module doc, "SLMP + banto-hub の broker 経路
 /// について").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

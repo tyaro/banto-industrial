@@ -396,8 +396,9 @@ impl HubRuntime {
 
         let clock = Arc::new(SystemClock);
         // T2-2 (docs/tag-server-design.md §6-5): constructed here, OUTSIDE
-        // `CollectorManager`, so an SLMP broker session survives every
-        // `CollectorManager::rebuild` - see `HubSessions`'s doc comment.
+        // `CollectorManager`, so a broker-managed session (SLMP, Modbus TCP)
+        // survives every `CollectorManager::rebuild` - see `HubSessions`'s
+        // doc comment.
         // Held as its own `Arc` (not only the clone `CollectorManager` gets)
         // so this binary can call `sessions.shutdown()` after
         // `manager.shutdown()` on the way out - see this module's doc

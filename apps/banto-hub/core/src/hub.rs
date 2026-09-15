@@ -1436,9 +1436,9 @@ impl CollectorManager {
     /// confirmed stopped - see this module's doc comment "broker
     /// セッションの削除同期").
     ///
-    /// A registry read failure here is logged and treated as "no SLMP
-    /// connections this rebuild, nothing stale either" (empty on both
-    /// counts: every SLMP connection falls back to
+    /// A registry read failure here is logged and treated as "no
+    /// broker-managed connections this rebuild, nothing stale either" (empty
+    /// on both counts: every broker-managed connection falls back to
     /// `banto_collect::default_client_factory` for this one rebuild, per
     /// `hub_client_factory`'s defensive fallback, and no session is removed
     /// on a registry hiccup) rather than failing the whole `rebuild` - this
