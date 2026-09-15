@@ -15,6 +15,16 @@
  * 作る。競合は「別経路（`page.request.put`、UI を経由しない別クライアント
  * 相当）が UI より先に同じタグを更新して revision を進める」ことで作る -
  * UI 側の編集フォームは古い revision を掴んだまま保存を試みる。
+ *
+ * **グリッドは仮想化されているので、行数が増えると最終行は DOM に無い**
+ * （#379 の CI 実測、2026-09-16）: `BantoGrid`（`@banto/grid-svelte`）は
+ * `computeWindow` で可視範囲＋オーバースキャンぶんの行しか描画しない。
+ * この spec のタグは `beforeAll` で最後に作られる＝ID 最大＝一覧の**最終行**
+ * なので、E2E スイート全体のタグ件数が描画窓（CI 実測で 20 行）を超えると
+ * `getByRole('gridcell', { name: TAG_NAME })` が解決せずタイムアウトする
+ * （main では 19 件で通っていたものが、#379 が 3 件足して 21 件になり落ちた）。
+ * サーバー・フロントの不具合ではなく「全行が DOM にある」という E2E 側の
+ * 前提が誤っていた。**必ず検索ボックスで絞り込んでからクリックする。**
  */
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
 import { CSRF_HEADERS, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
@@ -47,8 +57,26 @@ interface TagResponse {
  * 0002`）、失敗テストが `describe.serial` でリトライされて beforeAll が
  * 再走すると、前回作成済みの同名リソースが残ったまま POST して UNIQUE
  * 違反で not-ok になり beforeAll ごと落ちる - それを防ぐための冪等掃除。
- * FK は RESTRICT なので削除順は タグ → グループ → 接続。
+ * FK は RESTRICT なので削除順は タグ → グループ → 接続（この spec のタグは
+ * PLC タグ1件だけなので、`banto-hub-tags-expression-insert.spec.ts` のような
+ * 式の参照順は要らない）。
+ *
+ * #379 レビュー対応: **各 DELETE の応答を検証する**（204、または既に無い
+ * 場合の 404 だけを許容）。握りつぶすと、掃除が効いていないまま静かに
+ * 通り過ぎてしまう。
  */
+async function expectDeleted(
+	request: APIRequestContext,
+	headers: Record<string, string>,
+	path: string
+): Promise<void> {
+	const res = await request.delete(path, { headers });
+	expect(
+		[204, 404],
+		`DELETE ${path} が ${res.status()} で失敗しました: ${await res.text()}`
+	).toContain(res.status());
+}
+
 async function cleanupExistingFixtures(
 	request: APIRequestContext,
 	headers: Record<string, string>
@@ -62,10 +90,10 @@ async function cleanupExistingFixtures(
 			if (tagsRes.ok()) {
 				const tags = (await tagsRes.json()) as Array<{ id: number; collectionGroupId: number }>;
 				for (const tag of tags.filter((t) => t.collectionGroupId === existingGroup.id)) {
-					await request.delete(`/api/tags/${tag.id}`, { headers });
+					await expectDeleted(request, headers, `/api/tags/${tag.id}`);
 				}
 			}
-			await request.delete(`/api/collection-groups/${existingGroup.id}`, { headers });
+			await expectDeleted(request, headers, `/api/collection-groups/${existingGroup.id}`);
 		}
 	}
 
@@ -74,7 +102,7 @@ async function cleanupExistingFixtures(
 		const connections = (await connectionsRes.json()) as Array<{ id: number; name: string }>;
 		const existingConnection = connections.find((c) => c.name === CONNECTION_NAME);
 		if (existingConnection) {
-			await request.delete(`/api/plc-connections/${existingConnection.id}`, { headers });
+			await expectDeleted(request, headers, `/api/plc-connections/${existingConnection.id}`);
 		}
 	}
 }
@@ -157,7 +185,12 @@ test.describe.serial('banto-hub タグ更新の楽観的ロック + 競合時の
 
 	test('別経路が先に更新（revision が進む） → UI が古い revision で保存すると 409 になり、差分パネルが表示される', async () => {
 		await page.goto('/tags');
-		await page.getByRole('gridcell', { name: TAG_NAME, exact: true }).click();
+		// 仮想化されたグリッドでは最終行が DOM に無い（冒頭の doc comment
+		// 参照）。検索ボックスで対象1件へ絞ってからクリックする。
+		await page.getByPlaceholder('名前・アドレスで検索').fill(TAG_NAME);
+		const rows = page.getByRole('gridcell', { name: TAG_NAME, exact: true });
+		await expect(rows).toHaveCount(1);
+		await rows.click();
 		// #375: 編集・連続登録は非モーダルの右ペイン（`<aside aria-label>` =
 		// role `complementary`）になったため `role="dialog"` では取れない。
 		// アクセシブル名（`… を編集`/`連続登録`）は Drawer 時代と同じ。

@@ -9,6 +9,7 @@ import {
 	extractTagRefTokens,
 	findReferencingComputedTags,
 	formatDeleteConfirmMessage,
+	isExpressionRepresentableName,
 	type ReferencingTag
 } from './tagDeleteImpact';
 import type { CollectionGroup, PlcConnection, Tag } from './tagRegistryAdmin';
@@ -119,6 +120,100 @@ describe('extractTagRefTokens', () => {
 	it('前に別の識別子が連結していると誤マッチしない（xa.b.c は a.b.c と別トークン）', () => {
 		expect(expressionReferencesExternalName('xa.b.c', 'a.b.c')).toBe(false);
 	});
+
+	/**
+	 * #379 レビュー対応: `-` は減算演算子にも識別子の一部にもなる。期待値は
+	 * 実 lexer に対して `crates/banto-expr/tests/compile.rs` の
+	 * `tag_ref_after_minus_operator_is_a_separate_reference` /
+	 * `hyphen_between_identifiers_is_absorbed_into_the_reference` で固定して
+	 * あり、ここはその写し。
+	 */
+	it('演算子としての `-` の直後の参照を見落とさない（#379、正は banto-expr のテスト）', () => {
+		expect(extractTagRefTokens('1-line1.fast.tag')).toEqual(['line1.fast.tag']);
+		expect(extractTagRefTokens('-line1.fast.tag')).toEqual(['line1.fast.tag']);
+		expect(extractTagRefTokens('(a.b.c)-line1.fast.tag')).toEqual(['a.b.c', 'line1.fast.tag']);
+		expect(extractTagRefTokens('a.b.c - d.e.f')).toEqual(['a.b.c', 'd.e.f']);
+		expect(expressionReferencesExternalName('1-line1.fast.tag', 'line1.fast.tag')).toBe(true);
+	});
+
+	it('吸収されないハイフン連続の前後どちらの参照も落とさない（#379、正は banto-expr のテスト）', () => {
+		// 連続ハイフンは1つも識別子へ吸収されないので、前後とも独立した参照。
+		// 旧実装は後読みに `IDENT_SEGMENT`（`-` を含む）を使っていたため
+		// `c--` に一致し、前側の `a.b.c` を落としていた。
+		expect(extractTagRefTokens('a.b.c--line1.fast.tag')).toEqual(['a.b.c', 'line1.fast.tag']);
+		expect(extractTagRefTokens('a.b.c---line1.fast.tag')).toEqual(['a.b.c', 'line1.fast.tag']);
+		expect(extractTagRefTokens('a.b.c-d--line1.fast.tag')).toEqual(['a.b.c-d', 'line1.fast.tag']);
+		expect(extractTagRefTokens('line-1.grp.tag--other.g.t')).toEqual([
+			'line-1.grp.tag',
+			'other.g.t'
+		]);
+		// `a.b.c-1` は1トークン、`a.b.c--1` は `a.b.c` と減算×2。
+		expect(extractTagRefTokens('a.b.c--1')).toEqual(['a.b.c']);
+		expect(expressionReferencesExternalName('a.b.c--line1.fast.tag', 'a.b.c')).toBe(true);
+	});
+
+	it('識別子へ吸収された `-` の直後は別トークンにしない（#379、同上）', () => {
+		// lexer は `a-line1` を1つの識別子として最長一致で吸収するので、
+		// 参照は `a-line1.fast.tag` であって `line1.fast.tag` ではない。
+		expect(extractTagRefTokens('a-line1.fast.tag')).toEqual(['a-line1.fast.tag']);
+		expect(extractTagRefTokens('x1-line1.fast.tag')).toEqual(['x1-line1.fast.tag']);
+		expect(extractTagRefTokens('a.b.c-1')).toEqual(['a.b.c-1']);
+		expect(expressionReferencesExternalName('a-line1.fast.tag', 'line1.fast.tag')).toBe(false);
+	});
+
+	/**
+	 * #379 レビュー対応: lexer は空白・タブ・改行を捨てるので、`.` の周りに
+	 * 空白があっても有効な3セグメント参照。期待値は
+	 * `crates/banto-expr/tests/compile.rs` の
+	 * `whitespace_around_dots_is_allowed_in_a_tag_reference` で実 lexer に
+	 * 対して固定してあり、`referenced_tags()` と同じ canonical 形を返す。
+	 */
+	it('`.` の周りに空白がある参照も拾い、空白を除いた形で返す（#379、正は banto-expr のテスト）', () => {
+		expect(extractTagRefTokens('conn . group . tag + 1')).toEqual(['conn.group.tag']);
+		expect(extractTagRefTokens('conn .\n group . tag')).toEqual(['conn.group.tag']);
+		expect(extractTagRefTokens('conn.\tgroup .tag')).toEqual(['conn.group.tag']);
+		// canonical 形で返すので、完全外部名との突き合わせもそのまま通る。
+		expect(expressionReferencesExternalName('conn . group . tag * 2', 'conn.group.tag')).toBe(true);
+		// CR+LF も lexer が読み飛ばす4種のうち。
+		expect(extractTagRefTokens('conn\r\n.group.tag')).toEqual(['conn.group.tag']);
+	});
+
+	/**
+	 * #379 レビュー対応: lexer が読み飛ばすのは 空白・タブ・LF・CR の4種だけ
+	 * （`crates/banto-expr/src/lexer.rs:89`）。垂直タブ・フォームフィード・
+	 * 全角空白を挟んだ式はコンパイルできない（compile.rs の
+	 * `only_space_tab_lf_cr_are_skipped_as_whitespace`）ので、そこから参照を
+	 * 拾ってはいけない - 正規表現の `\s` のままだと拾ってしまっていた。
+	 */
+	it('lexer が空白として扱わない文字を挟んだものは参照として拾わない（#379）', () => {
+		expect(extractTagRefTokens('conn.group.tag')).toEqual([]);
+		expect(extractTagRefTokens('conn.group.tag')).toEqual([]);
+		expect(extractTagRefTokens('conn　.group.tag')).toEqual([]);
+		expect(expressionReferencesExternalName('conn　.group.tag', 'conn.group.tag')).toBe(false);
+	});
+});
+
+// --- isExpressionRepresentableName -------------------------------------------
+
+describe('isExpressionRepresentableName', () => {
+	/**
+	 * #379 レビュー対応: parser は `true`/`false` を真偽値リテラルとして先に
+	 * 解釈するので（`crates/banto-expr/src/parser.rs:313-318`）、第1セグメントが
+	 * それらの完全名は式に書けない。正は compile.rs の
+	 * `true_and_false_as_the_first_segment_are_not_tag_references`。
+	 */
+	it('第1セグメントが `true`/`false` の名前は式で表せない（#379）', () => {
+		expect(isExpressionRepresentableName('true.grp.tag')).toBe(false);
+		expect(isExpressionRepresentableName('false.grp.tag')).toBe(false);
+		// 前方一致や第2・第3セグメントは通常の識別子。
+		expect(isExpressionRepresentableName('trueish.grp.tag')).toBe(true);
+		expect(isExpressionRepresentableName('grp.true.tag')).toBe(true);
+		expect(isExpressionRepresentableName('grp.grp.false')).toBe(true);
+		// 関数名は予約語ではない（`(` が続くときだけ関数呼び出し）。
+		expect(isExpressionRepresentableName('if.grp.tag')).toBe(true);
+		expect(isExpressionRepresentableName('bit.grp.tag')).toBe(true);
+		expect(isExpressionRepresentableName('clamp.grp.tag')).toBe(true);
+	});
 });
 
 describe('expressionReferencesExternalName', () => {
@@ -147,6 +242,32 @@ describe('findReferencingComputedTags', () => {
 
 	const targetTag = makeTag({ id: 10, name: 'temp01', collectionGroupId: 1, tagKind: 'plc' });
 	const targetExternalName = buildExternalName('line1', 'fast', 'temp01');
+
+	it('`1-x.y.z` のように演算子の `-` に隣接して参照している computed タグも検出する（#379）', () => {
+		// 旧実装は「直前が `-`」を一律に除外していたため、この形の参照元を
+		// 見落としていた（削除しても壊れないと誤って案内していた）。
+		const expression = `1-${targetExternalName}`;
+		const computedTag = makeTag({
+			id: 21,
+			name: 'inv',
+			collectionGroupId: 2,
+			tagKind: 'computed',
+			expression,
+			address: ''
+		});
+
+		const result = findReferencingComputedTags(
+			targetTag.id,
+			targetExternalName,
+			[targetTag, computedTag],
+			groups,
+			connections
+		);
+
+		expect(result).toEqual<ReferencingTag[]>([
+			{ id: 21, name: 'inv', externalName: 'calc.calc-group.inv', expression }
+		]);
+	});
 
 	it('式が削除対象を参照する computed タグを見つける', () => {
 		const expression = `(${targetExternalName} + line1.fast.temp02) / 2`;

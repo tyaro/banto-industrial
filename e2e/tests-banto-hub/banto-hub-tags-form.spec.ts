@@ -94,7 +94,11 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 		// `exact: true` が成立しない）。
 		await groupNodeByName(page, GROUP_NAME).click();
 		await page.getByRole('button', { name: '新規登録' }).click();
-		const drawer = page.getByRole('dialog', { name: '新規作成' });
+		// #342 段階C: 新規作成フォームも広幅では非モーダルの右ペイン
+		// （`<aside aria-label>` = role `complementary`）へ移った（#375 の編集
+		// ペインと同じ型）ため `role="dialog"` では取れない。アクセシブル名
+		// （`新規作成`）は Modal 時代と同じ。
+		const drawer = page.getByRole('complementary', { name: '新規作成' });
 		await expect(drawer).toBeVisible();
 
 		await drawer.getByLabel('名前').fill(CREATE_TAG_NAME);
@@ -128,7 +132,7 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 		// 先に必要（`groupNodeByName` doc comment 参照）。
 		await groupNodeByName(page, GROUP_NAME).click();
 		await page.getByRole('button', { name: '新規登録' }).click();
-		const drawer = page.getByRole('dialog', { name: '新規作成' });
+		const drawer = page.getByRole('complementary', { name: '新規作成' });
 		await expect(drawer).toBeVisible();
 
 		await drawer.getByLabel('名前').fill('e2e-form-carry-1');
@@ -167,7 +171,7 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 		// 先に必要（`groupNodeByName` doc comment 参照）。
 		await groupNodeByName(page, GROUP_NAME).click();
 		await page.getByRole('button', { name: '新規登録' }).click();
-		const drawer = page.getByRole('dialog', { name: '新規作成' });
+		const drawer = page.getByRole('complementary', { name: '新規作成' });
 		await expect(drawer).toBeVisible();
 
 		await drawer.getByLabel('名前').fill('e2e-form-close-1');
@@ -195,7 +199,7 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 		// 再クリックしても treeFilter は変わらず無害）。
 		await groupNodeByName(page, GROUP_NAME).click();
 		await page.getByRole('button', { name: '新規登録' }).click();
-		const drawer = page.getByRole('dialog', { name: '新規作成' });
+		const drawer = page.getByRole('complementary', { name: '新規作成' });
 		await expect(drawer).toBeVisible();
 
 		// 名前は空のまま送信する。収集グループはツリー選択で確定済み
@@ -231,6 +235,10 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 
 	test('3. edit Drawer: 変更後 Enter で送信され、タグが更新される', async () => {
 		await page.goto('/tags');
+		// #379 CI 対応: BantoGrid は行を仮想化しており、スイート全体のタグ件数が
+		// 増えると最終行は DOM に無い（`banto-hub-tags-revision.spec.ts` 冒頭の
+		// doc comment 参照）。名前でクリックする前に検索ボックスで絞り込む。
+		await page.getByPlaceholder('名前・アドレスで検索').fill(EDIT_TAG_NAME);
 		await page.getByRole('gridcell', { name: EDIT_TAG_NAME, exact: true }).click();
 		// #375: 編集・連続登録は非モーダルの右ペイン（`<aside aria-label>` =
 		// role `complementary`）になったため `role="dialog"` では取れない。

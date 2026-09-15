@@ -74,7 +74,11 @@ test.describe.serial('banto-hub タグ preflight 失敗の可視性 (TAG-P0-2)',
 		// グループを選ぶ（`groupNodeByName` は `banto-hub-auth.ts` 参照）。
 		await groupNodeByName(page, GROUP_NAME).click();
 		await page.getByRole('button', { name: '新規登録' }).click();
-		const drawer = page.getByRole('dialog', { name: '新規作成' });
+		// #342 段階C: 新規作成フォームも広幅では非モーダルの右ペイン
+		// （`<aside aria-label>` = role `complementary`）へ移った（#375 の編集
+		// ペインと同じ型）ため `role="dialog"` では取れない。アクセシブル名
+		// （`新規作成`）は Modal 時代と同じ。
+		const drawer = page.getByRole('complementary', { name: '新規作成' });
 		await expect(drawer).toBeVisible();
 
 		await drawer.getByLabel('名前').fill(INVALID_TAG_NAME);
@@ -128,7 +132,7 @@ test.describe.serial('banto-hub タグ preflight 失敗の可視性 (TAG-P0-2)',
 		// 先に必要（`groupNodeByName` doc comment 参照）。
 		await groupNodeByName(page, GROUP_NAME).click();
 		await page.getByRole('button', { name: '新規登録' }).click();
-		const drawer = page.getByRole('dialog', { name: '新規作成' });
+		const drawer = page.getByRole('complementary', { name: '新規作成' });
 		await expect(drawer).toBeVisible();
 
 		await drawer.getByLabel('名前').fill(VALID_TAG_NAME);

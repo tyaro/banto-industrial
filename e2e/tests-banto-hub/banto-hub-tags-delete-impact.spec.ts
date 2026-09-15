@@ -33,6 +33,13 @@ const REFERENCED_TAG_NAME = 'e2e-del-src';
 const UNREFERENCED_TAG_NAME = 'e2e-del-noref';
 const CALC_GROUP_NAME = 'e2e-del-impact-calc-group';
 const COMPUTED_TAG_NAME = 'e2e-del-computed';
+/**
+ * #379 CI 対応: BantoGrid は行を仮想化しており、スイート全体のタグ件数が
+ * 増えるとこの spec のタグ（後から作られる＝一覧の末尾）は DOM に無い
+ * （`banto-hub-tags-revision.spec.ts` 冒頭の doc comment 参照）。名前で
+ * 行をクリックする前に、この共通プレフィックスで検索ボックスを絞る。
+ */
+const SEARCH_PREFIX = 'e2e-del-';
 
 const REFERENCED_EXTERNAL_NAME = `${CONNECTION_NAME}.${GROUP_NAME}.${REFERENCED_TAG_NAME}`;
 const UNREFERENCED_EXTERNAL_NAME = `${CONNECTION_NAME}.${GROUP_NAME}.${UNREFERENCED_TAG_NAME}`;
@@ -150,6 +157,8 @@ test.describe.serial('banto-hub タグ削除前の参照影響表示 (TAG-UX-C)'
 		// 演算タグ作成後も `tags` state に載るよう、削除操作の前に必ず
 		// `/tags` を（再）訪問する。
 		await page.goto('/tags');
+		// #379 CI 対応: 仮想化されたグリッド対策（`SEARCH_PREFIX` の doc 参照）。
+		await page.getByPlaceholder('名前・アドレスで検索').fill(SEARCH_PREFIX);
 	});
 
 	test('1. 参照元の演算タグがあるタグの削除確認: 完全外部名と参照元一覧が出る', async () => {
@@ -275,6 +284,9 @@ test.describe.serial('banto-hub タグ削除前の参照影響表示 (TAG-UX-C)'
 			expect(deleteRequestSeen).toBe(false);
 
 			await page.reload();
+			// reload で検索ボックスが空に戻るので、もう一度絞り込む
+			// （#379 CI 対応、`SEARCH_PREFIX` の doc 参照）。
+			await page.getByPlaceholder('名前・アドレスで検索').fill(SEARCH_PREFIX);
 			await expect(
 				page.getByRole('gridcell', { name: REFERENCED_TAG_NAME, exact: true })
 			).toBeVisible();

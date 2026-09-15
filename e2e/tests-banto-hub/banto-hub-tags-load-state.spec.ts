@@ -122,11 +122,17 @@ test.describe.serial('banto-hub タグ一覧の初期読込状態の区別 (TAG-
 		// 作成した1件が一覧に表示される。
 		await expect(page.locator('.right-pane .err')).toHaveCount(0);
 		await expect(page.getByRole('grid')).toBeVisible();
+		// #379 CI 対応: BantoGrid は行を仮想化しており、スイート全体のタグ件数が
+		// 増えるとこの spec のタグ（後から作られる＝一覧の末尾）は DOM に無い
+		// （`banto-hub-tags-revision.spec.ts` 冒頭の doc comment 参照）。
+		await page.getByPlaceholder('名前・アドレスで検索').fill(TAG_NAME);
 		await expect(page.getByRole('gridcell', { name: TAG_NAME, exact: true })).toBeVisible();
 	});
 
 	test('3. 検索0件 → 「条件に一致するタグがありません」（真の空とは違う文言）が出る', async () => {
 		await page.goto('/tags');
+		// #379 CI 対応: 仮想化されたグリッド対策（テスト2のコメント参照）。
+		await page.getByPlaceholder('名前・アドレスで検索').fill(TAG_NAME);
 		await expect(page.getByRole('gridcell', { name: TAG_NAME, exact: true })).toBeVisible();
 
 		await page.getByPlaceholder('名前・アドレスで検索').fill('該当しないはずの検索語xyz');

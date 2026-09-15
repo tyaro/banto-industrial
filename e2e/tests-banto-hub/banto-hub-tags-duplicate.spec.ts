@@ -148,7 +148,11 @@ test.describe.serial('banto-hub タグ複製 (T18-3a)', () => {
 		await editDrawer.getByTestId('tag-duplicate-button').click();
 
 		// 複製は「新規作成」（create Drawer）へ切り替わる。
-		const createDrawer = page.getByRole('dialog', { name: '新規作成' });
+		// #342 段階C: 新規作成フォームも広幅では非モーダルの右ペイン
+		// （`<aside aria-label>` = role `complementary`）へ移った（#375 の編集
+		// ペインと同じ型）ため `role="dialog"` では取れない。アクセシブル名
+		// （`新規作成`）は Modal 時代と同じ。
+		const createDrawer = page.getByRole('complementary', { name: '新規作成' });
 		await expect(createDrawer).toBeVisible();
 		// 名前は衝突しない複製名（`{元名}_copy`）、アドレスは空。
 		await expect(createDrawer.getByLabel('名前')).toHaveValue(DUPLICATE_TAG_NAME);
@@ -160,7 +164,7 @@ test.describe.serial('banto-hub タグ複製 (T18-3a)', () => {
 	});
 
 	test('2. アドレスを入れて登録すると複製タグが増え、複製元は上書きされない', async () => {
-		const createDrawer = page.getByRole('dialog', { name: '新規作成' });
+		const createDrawer = page.getByRole('complementary', { name: '新規作成' });
 		await createDrawer.getByLabel('アドレス').fill(DUPLICATE_ADDRESS);
 		await createDrawer.getByRole('button', { name: '登録して閉じる' }).click();
 

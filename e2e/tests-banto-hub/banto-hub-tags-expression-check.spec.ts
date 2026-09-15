@@ -145,7 +145,11 @@ test.describe.serial('banto-hub 演算タグの式チェック API (#342 段階A
 		await page.goto('/tags');
 		await groupNodeByName(page, CALC_GROUP_NAME).click();
 		await page.getByRole('button', { name: '新規登録' }).click();
-		const drawer = page.getByRole('dialog', { name: '新規作成' });
+		// #342 段階C: 新規作成フォームも広幅では非モーダルの右ペイン
+		// （`<aside aria-label>` = role `complementary`）へ移った（#375 の編集
+		// ペインと同じ型）ため `role="dialog"` では取れない。アクセシブル名
+		// （`新規作成`）は Modal 時代と同じ。
+		const drawer = page.getByRole('complementary', { name: '新規作成' });
 		await expect(drawer).toBeVisible();
 
 		const expressionField = drawer.getByLabel('式');
@@ -170,7 +174,7 @@ test.describe.serial('banto-hub 演算タグの式チェック API (#342 段階A
 	test('2. エラーメッセージをクリックするとキャレットが該当位置(4)へ移動する', async () => {
 		// テスト1の続き - 同じ Drawer・同じ構文エラー状態を前提にする
 		// （テスト間で `page` を共有する `describe.serial` の作法どおり）。
-		const drawer = page.getByRole('dialog', { name: '新規作成' });
+		const drawer = page.getByRole('complementary', { name: '新規作成' });
 		const expressionField = drawer.getByLabel('式');
 		await expect(expressionField).toHaveValue('1 + ');
 
@@ -186,7 +190,7 @@ test.describe.serial('banto-hub 演算タグの式チェック API (#342 段階A
 	});
 
 	test('3. 有効な式に直すと結果型・参照タグ一覧が出て、エラー表示は消える', async () => {
-		const drawer = page.getByRole('dialog', { name: '新規作成' });
+		const drawer = page.getByRole('complementary', { name: '新規作成' });
 		const expressionField = drawer.getByLabel('式');
 
 		const checkResponse = waitForExpressionCheck(page);
@@ -212,7 +216,7 @@ test.describe.serial('banto-hub 演算タグの式チェック API (#342 段階A
 	});
 
 	test('4. 参照0件の定数式は現在値なしで評価され、試算値に数値が出る', async () => {
-		const drawer = page.getByRole('dialog', { name: '新規作成' });
+		const drawer = page.getByRole('complementary', { name: '新規作成' });
 		const expressionField = drawer.getByLabel('式');
 
 		const checkResponse = waitForExpressionCheck(page);

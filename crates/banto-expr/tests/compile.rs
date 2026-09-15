@@ -508,3 +508,137 @@ fn source_length_one_over_max_is_rejected() {
         other => panic!("expected SourceTooLong, got {other:?}"),
     }
 }
+
+// ---------- `-` に隣接するタグ参照の切り出し（#379 レビュー対応） ----------
+//
+// フロント側（`apps/banto-hub/src/lib/banto/tagDeleteImpact.ts` の
+// `TAG_REF_PATTERN`）は、式からタグ参照を近似正規表現で抽出して「削除影響」
+// と「一覧から挿入の循環除外」に使う。その近似が lexer と食い違うと、参照を
+// 見落として UI の判定が嘘になる（#379 の Copilot 指摘）。`-` は減算演算子
+// でもあり識別子の一部にもなりうる（モジュール doc「識別子とハイフンの
+// 綱引き」）ため、ここで**実 lexer による正**を固定し、TS 側のテスト
+// （`tagDeleteImpact.test.ts` / `expressionInsert.test.ts`）は同じ期待値を
+// 写す。
+
+fn referenced(source: &str) -> Vec<String> {
+    compile(source)
+        .unwrap_or_else(|e| panic!("expected {source:?} to compile, got {e:?}"))
+        .referenced_tags()
+        .to_vec()
+}
+
+#[test]
+fn tag_ref_after_minus_operator_is_a_separate_reference() {
+    // 直前が数値・単項・閉じ括弧なら `-` は演算子なので、後ろのタグ参照は
+    // そのまま1件の参照として切り出される。
+    assert_eq!(referenced("1-line1.fast.tag"), vec!["line1.fast.tag"]);
+    assert_eq!(referenced("-line1.fast.tag"), vec!["line1.fast.tag"]);
+    assert_eq!(
+        referenced("(a.b.c)-line1.fast.tag"),
+        vec!["a.b.c", "line1.fast.tag"]
+    );
+    // 空白で区切れば当然2件。
+    assert_eq!(referenced("a.b.c - d.e.f"), vec!["a.b.c", "d.e.f"]);
+}
+
+#[test]
+fn hyphen_not_followed_by_ident_char_is_not_absorbed() {
+    // 連続ハイフンは1つも識別子へ吸収されない（1つ目は直後が `-` で継続
+    // 文字ではないため）。前後どちらの参照も独立して切り出される -
+    // フロント側の後読みを `IDENT_SEGMENT` で書くと `c--` に一致して
+    // `a.b.c` を落としていた（#379 レビュー指摘）。
+    assert_eq!(
+        referenced("a.b.c--line1.fast.tag"),
+        vec!["a.b.c", "line1.fast.tag"]
+    );
+    assert_eq!(
+        referenced("a.b.c---line1.fast.tag"),
+        vec!["a.b.c", "line1.fast.tag"]
+    );
+    // 直前の参照の末尾セグメントがハイフンを含んでいても同じ。
+    assert_eq!(
+        referenced("a.b.c-d--line1.fast.tag"),
+        vec!["a.b.c-d", "line1.fast.tag"]
+    );
+    assert_eq!(
+        referenced("line-1.grp.tag--other.g.t"),
+        vec!["line-1.grp.tag", "other.g.t"]
+    );
+    // 後ろが数値でも、ハイフンが2つ並べば識別子へは入らない
+    // （`a.b.c-1` は1トークン、`a.b.c--1` は `a.b.c` と減算×2）。
+    assert_eq!(referenced("a.b.c--1"), vec!["a.b.c"]);
+}
+
+#[test]
+fn hyphen_between_identifiers_is_absorbed_into_the_reference() {
+    // 直前が識別子なら `-` は識別子へ吸収される（最長一致） - 参照は
+    // `line1.fast.tag` では**なく** `a-line1.fast.tag` の方。
+    assert_eq!(referenced("a-line1.fast.tag"), vec!["a-line1.fast.tag"]);
+    assert_eq!(referenced("x1-line1.fast.tag"), vec!["x1-line1.fast.tag"]);
+    // 末尾セグメントの後ろに続く `-1` も同じ規則で吸収される。
+    assert_eq!(referenced("a.b.c-1"), vec!["a.b.c-1"]);
+}
+
+#[test]
+fn whitespace_around_dots_is_allowed_in_a_tag_reference() {
+    // lexer は空白・タブ・改行を捨て、parser はトークン列（識別子と `.`）
+    // しか見ないので、`.` の周りに空白があっても有効な3セグメント参照。
+    // `referenced_tags()` は空白を含まない canonical 形を返す - フロント側の
+    // `extractTagRefTokens` も同じ形に正規化する必要がある（#379 レビュー
+    // 指摘。抽出を空白なしに限ると、こう書かれた参照を依存グラフから
+    // 落としてしまう）。
+    assert_eq!(referenced("conn . group . tag + 1"), vec!["conn.group.tag"]);
+    assert_eq!(referenced("conn .\n group . tag"), vec!["conn.group.tag"]);
+    assert_eq!(referenced("conn.\tgroup .tag"), vec!["conn.group.tag"]);
+    assert_eq!(referenced("conn\r\n.group.tag"), vec!["conn.group.tag"]);
+}
+
+#[test]
+fn true_and_false_as_the_first_segment_are_not_tag_references() {
+    // parser は識別子を見た時点で `true`/`false` を**真偽値リテラルとして先に
+    // 解釈する**（`crates/banto-expr/src/parser.rs:313-318` - `(` の判定より
+    // 前）。そのため第1セグメントが `true`/`false` の完全名は式に書けない。
+    // レジストリ側の接続名は「空でない・最大長」しか制約が無いので
+    // `true.grp.tag` というカタログ上有効な名前が作れてしまう -
+    // フロントの `isExpressionRepresentableName` はこの2語を予約扱いにする
+    // 必要がある（#379 レビュー指摘）。
+    for src in ["true.grp.tag", "false.grp.tag"] {
+        assert!(
+            matches!(assert_rejected(src), CompileError::Syntax { .. }),
+            "expected Syntax error for {src:?}"
+        );
+    }
+
+    // **関数名は予約語ではない**: `if`/`min`/`max`/`abs`/`round`/`clamp`/`bit`
+    // が関数呼び出しになるのは直後が `(` のときだけで（同 parser.rs:320）、
+    // `.` が続けばそのままタグ参照として通る。TS 側でも除外しない。
+    for src in ["if.grp.tag", "min.grp.tag", "bit.grp.tag", "clamp.grp.tag"] {
+        assert_eq!(referenced(src), vec![src.to_string()]);
+    }
+
+    // 予約なのは**第1セグメントちょうど**の `true`/`false` だけ。前方一致
+    // （`trueish`）や第2・第3セグメントは通常の識別子。
+    assert_eq!(referenced("trueish.grp.tag"), vec!["trueish.grp.tag"]);
+    assert_eq!(referenced("grp.true.tag"), vec!["grp.true.tag"]);
+    assert_eq!(referenced("grp.grp.false"), vec!["grp.grp.false"]);
+}
+
+#[test]
+fn only_space_tab_lf_cr_are_skipped_as_whitespace() {
+    // lexer が読み飛ばすのは **空白・タブ・LF・CR の4種だけ**
+    // （`crates/banto-expr/src/lexer.rs:89`）。垂直タブ・フォームフィード・
+    // 全角空白はどれも構文エラーになる（ASCII 以外はモジュール doc のとおり
+    // そもそも `Syntax`）。フロント側の抽出正規表現が `\s`（Unicode 空白まで
+    // 一致）を使うと、ここでコンパイルできない式から偽の参照を拾うので、
+    // 同じ4種の明示集合に合わせる必要がある（#379 レビュー指摘）。
+    for src in [
+        "conn\u{0b}.group.tag",
+        "conn\u{0c}.group.tag",
+        "conn\u{3000}.group.tag",
+    ] {
+        assert!(
+            matches!(assert_rejected(src), CompileError::Syntax { .. }),
+            "expected Syntax error for {src:?}"
+        );
+    }
+}
