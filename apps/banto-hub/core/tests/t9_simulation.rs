@@ -1,5 +1,5 @@
 //! T9-2 の E2E テスト（docs/ux-plan.md §1「接続単位のシミュレーションモード」、
-//! `apps/banto-hub/core/src/broker_glue.rs`の`SlmpSimRegistry`と
+//! `apps/banto-hub/core/src/broker_glue.rs`の`BrokerSimRegistry`と
 //! `apps/banto-hub/core/src/hub.rs`の`CollectorManager::sync_broker_sessions_from`の
 //! 配線を broker 経由 SLMP 接続で確認する）。
 //!
@@ -14,7 +14,7 @@
 //! 1. `POST /api/plc-connections`（`simulation: true`）で broker 経由 SLMP
 //!    接続を作り、グループ・タグを足して rebuild すると、このテスト自身は
 //!    SLMP シミュレータを一切起動していないのに `/api/v1/values/{tag}` が
-//!    changing な good 品質の値を返す - `SlmpSimRegistry`が
+//!    changing な good 品質の値を返す - `BrokerSimRegistry`が
 //!    `ensure_connection`より前にシミュレータを起動・アドレス差し替えして
 //!    いることの証明。`GET /api/v1/status`/`GET /api/v1/tags`が
 //!    `simulation: true`/`false`を正しく報告することも合わせて確認する。
@@ -22,13 +22,13 @@
 //!    テスト自身が起動)を使う`simulation: false`接続から始め、
 //!    `PUT /api/plc-connections/{id}`で`simulation: true`へ切り替えると、
 //!    値の出所が(テスト所有の外部シミュレータから)hub 内蔵シミュレータの
-//!    ランプ波へ実際に切り替わることを確認する - `SlmpSimRegistry::resolve`
+//!    ランプ波へ実際に切り替わることを確認する - `BrokerSimRegistry::resolve`
 //!    の`changed`検出 +`HubSessions::remove`の組み合わせが正しく機能して
 //!    いないと、古いセッションを読み続けて値が変わらないままになる。
 //!    `app.sessions.connection_count()`が終始 1 のままであることも確認する
 //!    （孤立した二重セッションが増えないこと）。続けて、無関係なタグ追加
 //!    （同じグループへの2本目のタグ）で rebuild しても
-//!    `connection_count()`が変わらないこと（`SlmpSimRegistry::resolve`の
+//!    `connection_count()`が変わらないこと（`BrokerSimRegistry::resolve`の
 //!    `changed`判定がダイヤル先が実際には変わっていない限り安定して
 //!    `false`であること）も確認する - `tests/integration.rs`の
 //!    `e2e_slmp_session_survives_a_rebuild_via_broker`と同型の回帰確認。
@@ -42,7 +42,7 @@ use axum::Router;
 use banto_collect::{BackoffConfig, CollectorOptions};
 use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::audit::AuditLogService;
-use banto_hub_core::broker_glue::{HubSessions, SlmpSimRegistry};
+use banto_hub_core::broker_glue::{BrokerSimRegistry, HubSessions};
 use banto_hub_core::commissioning::CommissioningService;
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
 use banto_hub_core::db::init_db;
@@ -197,7 +197,7 @@ async fn test_app(label: &str) -> TestApp {
         .expect("admin login");
 
     let sessions = Arc::new(HubSessions::new(banto_broker::BackoffConfig::default()));
-    let sim_registry = Arc::new(SlmpSimRegistry::new());
+    let sim_registry = Arc::new(BrokerSimRegistry::new());
     let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
     let manager = Arc::new(CollectorManager::new(
         pool.clone(),
@@ -341,7 +341,7 @@ async fn broker_routed_slmp_connection_serves_synthetic_ramp_values() {
 
     // POST /api/plc-connections で simulation: true の SLMP 接続を作る - この
     // テスト自身は SLMP シミュレータを一切起動していない(host/port はダミー、
-    // どうせ SlmpSimRegistry が実際のダイヤル先を差し替える)。
+    // どうせ BrokerSimRegistry が実際のダイヤル先を差し替える)。
     let (status, created) = admin_write(
         &app.router,
         "POST",
@@ -377,7 +377,7 @@ async fn broker_routed_slmp_connection_serves_synthetic_ramp_values() {
         .unwrap();
     app.manager.rebuild().await.expect("rebuild after seeding");
 
-    // good 品質の値が返るまで待つ - SlmpSimRegistry がシミュレータを起動し、
+    // good 品質の値が返るまで待つ - BrokerSimRegistry がシミュレータを起動し、
     // ensure_connection がそのアドレスへ接続していないと、これは Bad のまま
     // タイムアウトする。
     assert!(
@@ -499,7 +499,7 @@ async fn toggling_simulation_repoints_the_broker_session_without_leaking_session
     );
     assert_eq!(app.sessions.connection_count(), 1);
 
-    // Phase 2: PUT simulation=true (same nominal host/port - SlmpSimRegistry
+    // Phase 2: PUT simulation=true (same nominal host/port - BrokerSimRegistry
     // substitutes the actual dial target). The external simulator's value
     // never changes from here on, so if the read stayed on the old session
     // it would keep reading a frozen 111.
@@ -530,7 +530,7 @@ async fn toggling_simulation_repoints_the_broker_session_without_leaking_session
     );
 
     // Exactly one broker session throughout - the toggle re-pointed the
-    // existing session (via SlmpSimRegistry::resolve's `changed` detection +
+    // existing session (via BrokerSimRegistry::resolve's `changed` detection +
     // HubSessions::remove), it did not leak a second one.
     assert_eq!(
         app.sessions.connection_count(),
@@ -570,7 +570,7 @@ async fn toggling_simulation_repoints_the_broker_session_without_leaking_session
     );
 
     // Regression: an unrelated edit (second tag on the SAME group) must not
-    // re-point/reopen the session again - `SlmpSimRegistry::resolve`'s
+    // re-point/reopen the session again - `BrokerSimRegistry::resolve`'s
     // `changed` detection must stay stable (false) when the dial target has
     // not actually changed, mirroring
     // `tests/integration.rs::e2e_slmp_session_survives_a_rebuild_via_broker`.

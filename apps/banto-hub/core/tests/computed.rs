@@ -308,7 +308,7 @@ async fn test_app(label: &str) -> TestApp {
     let sessions = Arc::new(banto_hub_core::broker_glue::HubSessions::new(
         banto_broker::BackoffConfig::default(),
     ));
-    let sim_registry = Arc::new(banto_hub_core::broker_glue::SlmpSimRegistry::new());
+    let sim_registry = Arc::new(banto_hub_core::broker_glue::BrokerSimRegistry::new());
     let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
     let manager = Arc::new(CollectorManager::new(
         pool.clone(),
@@ -859,7 +859,7 @@ async fn retain_true_restores_the_value_across_a_restart_and_retain_false_starts
     let fresh_sessions = Arc::new(banto_hub_core::broker_glue::HubSessions::new(
         banto_broker::BackoffConfig::default(),
     ));
-    let fresh_sim_registry = Arc::new(banto_hub_core::broker_glue::SlmpSimRegistry::new());
+    let fresh_sim_registry = Arc::new(banto_hub_core::broker_glue::BrokerSimRegistry::new());
     let fresh_manager = Arc::new(CollectorManager::new(
         app.pool.clone(),
         app._env.data_dir(),
@@ -1024,7 +1024,7 @@ async fn controller_test_app(label: &str) -> ControllerTestApp {
     let sessions = Arc::new(banto_hub_core::broker_glue::HubSessions::new(
         banto_broker::BackoffConfig::default(),
     ));
-    let sim_registry = Arc::new(banto_hub_core::broker_glue::SlmpSimRegistry::new());
+    let sim_registry = Arc::new(banto_hub_core::broker_glue::BrokerSimRegistry::new());
     let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
     let manager = Arc::new(CollectorManager::new(
         pool.clone(),
@@ -1111,7 +1111,7 @@ async fn controller_test_app(label: &str) -> ControllerTestApp {
 /// [`t9_simulation.rs`]の`plc_connection_payload_json`と同じ判断（接続
 /// 単位のシミュレーション、design §1）を`PlcConnectionInput`（REST を
 /// 経由せず`PlcConnectionService`へ直接投入するこのファイルの流儀）で
-/// 表したもの。`simulation: true`なら`SlmpSimRegistry`がダイヤル先を
+/// 表したもの。`simulation: true`なら`BrokerSimRegistry`がダイヤル先を
 /// hub 内蔵シミュレータへ差し替えるので、host/port はダミーでよい
 /// （このテスト自身は SLMP シミュレータを一切起動しない）。
 fn slmp_conn_input(name: &str, simulation: bool) -> PlcConnectionInput {
@@ -1153,7 +1153,7 @@ async fn api_key_catalog_and_values_follow_335_contract() {
     let app = controller_test_app("335-catalog").await;
 
     // 接続単位で simulation: true の PLC タグを1本用意する(t9_simulation.rs
-    // と同じ判断: SlmpSimRegistry がダイヤル先を差し替えるので、テスト自身
+    // と同じ判断: BrokerSimRegistry がダイヤル先を差し替えるので、テスト自身
     // は SLMP シミュレータを起動しない)。
     let conn = PlcConnectionService::new(app.pool.clone())
         .create(slmp_conn_input("line1", true))

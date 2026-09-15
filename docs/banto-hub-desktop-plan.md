@@ -366,7 +366,7 @@ queue へ保存し、明示操作でのみ適用/キャンセルする方式へ�
 
 - `Collector`
 - `HubSessions` の実効 PLC セッション
-- `SlmpSimRegistry`
+- `BrokerSimRegistry`
 - MQTT の値 publish タスク
 - computed 評価タスクの運転モード依存部分
 - 現在値 cache と実効モード

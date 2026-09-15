@@ -114,7 +114,7 @@
 //! implements. Since #344 the two agree far more often than they used to,
 //! but the broker remains the source of truth.
 //!
-//! ## T9-1/T9-2 note: SLMP simulation mode, wired via [`SlmpSimRegistry`]
+//! ## T9-1/T9-2 note: SLMP simulation mode, wired via [`BrokerSimRegistry`]
 //!
 //! docs/ux-plan.md §1 (2026-08-06, 「接続単位のシミュレーションモード」) adds
 //! `banto_tags::PlcConnection::simulation`; for connections that bypass this
@@ -157,11 +157,11 @@
 //! since every other ordering constraint this struct documents (the T7-2
 //! "Session sync policy" section, and `CollectorManager::rebuild`'s own doc
 //! comment) is built around sync-then-apply. (a) was the smaller, more
-//! surgical change and is what T9-2 implemented, as [`SlmpSimRegistry`] -
+//! surgical change and is what T9-2 implemented, as [`BrokerSimRegistry`] -
 //! see that struct's own doc comment for the concrete mechanism, and
 //! `CollectorConfig::suppress_simulation_for`
 //! (`crates/banto-collect/src/config.rs`) for how `Collector` is told to
-//! stand down for connections `SlmpSimRegistry` already handles.
+//! stand down for connections `BrokerSimRegistry` already handles.
 //!
 //! ## Value type coverage: numeric/bit only
 //!
@@ -576,20 +576,20 @@ impl HubSessions {
 /// シミュレーションモードを実現するレジストリ - この module doc の
 /// 「T9-1/T9-2 note」節で説明した設計 (a) の実体。
 ///
-/// 型名 `SlmpSimRegistry` は T9-2 当時 SLMP 専用だった名残 - #131
-/// (2026-09-01) で Modbus TCP の broker 配線が加わり、[`Self::resolve`]は
-/// broker が管理するプロトコル全般（`conn.protocol` を見て起動する
-/// シミュレータ種別を選ぶ）を扱うようになったが、多くの呼び出し元・テスト
-/// ファイルに波及するフルリネームは見送った（挙動に影響しない改名コストが
-/// このタスクの本質的な変更に見合わないため）。以降のこの struct の doc
-/// comment は「SLMP 専用」ではなく実際の挙動（任意の broker 管理対象
-/// プロトコル）を説明する。
+/// この型の名前はもともと「SLMP 専用」を示すものだった - T9-2 当時の名残。
+/// #131 (2026-09-01) で Modbus TCP の broker 配線が加わり、
+/// [`Self::resolve`]は broker が管理するプロトコル全般（`conn.protocol`を
+/// 見て起動するシミュレータ種別を選ぶ）を扱うようになったが、名前は
+/// SLMP 専用を示すまま据え置かれ、この食い違いは #337 (2026-09-08) の
+/// 誤読の一因にもなった。2026-09-15、#339 で現在の型名 `BrokerSimRegistry`
+/// へ改名した。以降のこの struct の doc comment は「SLMP 専用」ではなく
+/// 実際の挙動（任意の broker 管理対象プロトコル）を説明する。
 ///
 /// [`HubSessions`] と対の
 /// ライフサイクル(`bin/banto_hub`が構築し、`CollectorManager`の外で
 /// `rebuild`を跨いで生存させ、プロセス終了時に一度だけ [`Self::shutdown`])
 /// を持つが、責務は独立: `HubSessions`は broker セッション自体を保持し、
-/// `SlmpSimRegistry`は「その broker セッションが実際にダイヤルすべき
+/// `BrokerSimRegistry`は「その broker セッションが実際にダイヤルすべき
 /// (host, port)」を、必要ならシミュレータを起動して差し替える。
 ///
 /// ## なぜ`ensure_connection`より前に必要か
@@ -602,7 +602,7 @@ impl HubSessions {
 /// は接続ごとに [`Self::resolve`] を先に呼び、その結果(シミュレータの
 /// loopback アドレス、または実接続の host/port そのまま)を
 /// `ensure_connection`に渡す`banto_tags::PlcConnection`のコピーへ差し込む。
-pub struct SlmpSimRegistry {
+pub struct BrokerSimRegistry {
     /// `simulation = true` として現在起動中のシミュレータ - 接続 id ごとに
     /// 高々1個。[`Self::resolve`]が simulation フラグの on/off に応じて
     /// 起動・停止する。
@@ -613,7 +613,7 @@ pub struct SlmpSimRegistry {
     last_target: tokio::sync::Mutex<HashMap<i64, (String, i64)>>,
 }
 
-impl SlmpSimRegistry {
+impl BrokerSimRegistry {
     /// 空のレジストリで開始する - `CollectorManager`の最初の`rebuild`が
     /// SLMP 接続を見つけるたびに [`Self::resolve`] 経由で育つ
     /// ([`HubSessions::new`]と同じ「起動時は空、後から育つ」設計)。
@@ -746,7 +746,7 @@ impl SlmpSimRegistry {
     }
 }
 
-impl Default for SlmpSimRegistry {
+impl Default for BrokerSimRegistry {
     fn default() -> Self {
         Self::new()
     }

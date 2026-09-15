@@ -785,7 +785,7 @@ mod tests {
         let sessions = Arc::new(crate::broker_glue::HubSessions::new(
             banto_broker::BackoffConfig::default(),
         ));
-        let sim_registry = Arc::new(crate::broker_glue::SlmpSimRegistry::new());
+        let sim_registry = Arc::new(crate::broker_glue::BrokerSimRegistry::new());
         let computed = Arc::new(crate::computed::ComputedEngine::new(Arc::new(
             crate::computed::ServerTagStore::new(),
         )));

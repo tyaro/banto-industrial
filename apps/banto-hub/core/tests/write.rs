@@ -26,7 +26,7 @@ use axum::Router;
 use banto_collect::{BackoffConfig, CollectorOptions};
 use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::audit::AuditLogService;
-use banto_hub_core::broker_glue::{HubSessions, SlmpSimRegistry};
+use banto_hub_core::broker_glue::{BrokerSimRegistry, HubSessions};
 use banto_hub_core::commissioning::CommissioningService;
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
 use banto_hub_core::db::init_db;
@@ -216,7 +216,7 @@ async fn test_app(label: &str) -> TestApp {
         .expect("admin login");
 
     let sessions = Arc::new(HubSessions::new(banto_broker::BackoffConfig::default()));
-    let sim_registry = Arc::new(SlmpSimRegistry::new());
+    let sim_registry = Arc::new(BrokerSimRegistry::new());
     let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
     let manager = Arc::new(CollectorManager::new(
         pool.clone(),
@@ -610,9 +610,9 @@ async fn e2e_modbus_write_then_collection_reads_the_value_back() {
 
 // ---------------------------------------------------------------------------
 // 1c. #131 (2026-09-01) simulation-safety regression test for the Part 1 fix
-//    to `SlmpSimRegistry::resolve`: a Modbus connection with
+//    to `BrokerSimRegistry::resolve`: a Modbus connection with
 //    `simulation = true` must have its broker session dial the in-process
-//    MODBUS-speaking simulator `SlmpSimRegistry` substitutes, NOT the
+//    MODBUS-speaking simulator `BrokerSimRegistry` substitutes, NOT the
 //    connection's configured (real, unreachable in this test) host/port, and
 //    NOT (the bug that fix closed) an SLMP-speaking simulator mismatched
 //    against the Modbus wire protocol the broker's `ModbusSession` actually

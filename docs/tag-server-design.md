@@ -1354,7 +1354,7 @@ MCP からの書き込みは 503 `simulation_write_rejected`（gRPC は `UNAVAIL
   log-before-write は、シミュレーション書き込みにも**そのまま**適用される。
   収集停止中の fail-closed（`collection_not_running`）も変わらない。
 - **書いた番地はランプ更新から外れ保持される（held）**: シミュレーション接続の
-  broker セッションは `SlmpSimRegistry` がダイヤル先を in-process シミュレータ
+  broker セッションは `BrokerSimRegistry` がダイヤル先を in-process シミュレータ
   へ差し替えて張ってあるので、gate 8 の `BrokerHandle::write` がそのまま
   シミュレータに届く。`banto-plc` のシミュレータは #363 で書き込みコマンド
   （Modbus FC5/6/15/16・SLMP `0x1401`）に対応し、ワイヤ経由で書かれた番地を

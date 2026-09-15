@@ -49,7 +49,7 @@
 //! ramping - which is exactly what a real device does. The held set lives
 //! and dies with the simulator instance, so toggling a connection's
 //! `simulation` flag or stopping all-simulation mode (both of which make
-//! banto-hub's `SlmpSimRegistry` build a fresh simulator) clears it.
+//! banto-hub's `BrokerSimRegistry` build a fresh simulator) clears it.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
