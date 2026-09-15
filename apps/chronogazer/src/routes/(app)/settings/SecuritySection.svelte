@@ -17,6 +17,7 @@
 	 * `authError` 表示と同じ見た目（`authSettingsStore.svelte.ts` の doc
 	 * comment参照）。保存操作自体の失敗は従来どおりトーストのみ。
 	 */
+	import { invalidate } from '$app/navigation';
 	import { isTauri } from '$lib/banto/setup';
 	import { toastStore } from '$lib/toast.svelte';
 	import { sessionStore } from '$lib/session.svelte';
@@ -64,6 +65,14 @@
 			const next = await applyAuthSettings(disabledDraft, disabledRoleDraft);
 			authSettingsStore.apply(next);
 			sessionStore.authDisabled = next.disabled;
+			// `+layout.ts` の `canManageAuthMode()` 判定は load が再実行されるまで
+			// 古いまま残る（PR #372 Copilot レビュー指摘）。admin 未満のロールが
+			// エスケープハッチ（`authDisabled`）で見えていた `security` カテゴリを
+			// ここで OFF に戻すと `canManageAuthMode()` が false になるので、
+			// invalidate してナビを再計算させる - この画面が非可視になった場合は
+			// `security/+page.ts` の `guardCategory` が再実行されて先頭カテゴリへ
+			// redirect する（空ページに留まらせない）。
+			await invalidate('settings:categories');
 			toastStore.push('success', '認証設定を更新しました');
 		} catch (err) {
 			// 排他違反（LANアクセス有効中の有効化など）はサーバ側の日本語メッセージ

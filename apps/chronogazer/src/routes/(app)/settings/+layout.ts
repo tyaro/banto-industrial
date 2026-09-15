@@ -26,8 +26,19 @@ import { SETTINGS_CATEGORIES, type SettingsCategoryId } from './categories';
  *   （どちらか一方でも見えれば data カテゴリ自体は可視）。
  * - `security`: 元「認証」section の `tauri && canManageAuthMode`
  *   （`canManageAuthMode` は `shared.ts` 参照）。
+ *
+ * `depends('settings:categories')` を宣言し、`SecuritySection.svelte` が
+ * 認証モードの変更に成功したあと `invalidate('settings:categories')` を
+ * 呼べるようにする（PR #372 Copilot レビュー指摘）。`canManageAuthMode()`
+ * は `sessionStore.authDisabled`（エスケープハッチ、spec M11）を参照する
+ * ため、admin 未満のロールでログイン不要モードを OFF に戻すと
+ * `canManageAuthMode()` の結果が変わる - この `load` は再実行されるまで
+ * 結果を再計算しないので、依存キーで明示的に再実行できるようにしておかない
+ * とナビに `セキュリティ` が残ったまま `SecuritySection` が何も描画しない
+ * 空のページになる。
  */
-export async function load({ parent }) {
+export async function load({ parent, depends }) {
+	depends('settings:categories');
 	await parent();
 
 	const admin = isAdmin(sessionStore.role);

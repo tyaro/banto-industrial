@@ -12,8 +12,9 @@
  * （banto-hub は逆に、このメインサーバーでは全カテゴリ可視になってしまう
  * ため専用のロックダウン済みサーバーが必要だった - 対照的な事情）。
  *
- * ファイル名について: `smoke.spec.ts` の `test.beforeAll` が最初の1件目
- * として初回セットアップ（管理者アカウント作成）を実 DOM 経由で行う想定
+ * ファイル名について: `smoke.spec.ts` の `test.beforeAll` はページを作る
+ * だけで、初回セットアップ（管理者アカウント作成）は最初のテスト本体
+ * （'1. first-run setup creates the admin account ...'）が実 DOM 経由で行う
  * （`playwright.config.ts` は `workers: 1`/`fullyParallel: false` で
  * `testDir: './tests'` 配下をファイル名の辞書順に実行する）。このファイルは
  * その後にログインするだけで管理者アカウントを再利用するため、辞書順で
