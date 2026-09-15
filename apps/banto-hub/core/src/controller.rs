@@ -559,7 +559,7 @@ impl ControllerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::broker_glue::{HubSessions, SlmpSimRegistry};
+    use crate::broker_glue::{BrokerSimRegistry, HubSessions};
     use crate::computed::{ComputedEngine, ServerTagStore};
     use crate::db::init_db;
     use banto_collect::{CollectorOptions, RegistrySnapshot};
@@ -581,7 +581,7 @@ mod tests {
                 ..CollectorOptions::default()
             },
             Arc::new(HubSessions::new(banto_broker::BackoffConfig::default())),
-            Arc::new(SlmpSimRegistry::new()),
+            Arc::new(BrokerSimRegistry::new()),
             Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new()))),
         ));
         let controller = Arc::new(CollectionController::new(manager));

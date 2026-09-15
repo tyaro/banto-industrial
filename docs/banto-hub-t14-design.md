@@ -82,7 +82,7 @@
   `Option::take` で消費する一回限り（broker_glue.rs:357-369）。banto-broker のセッションタスクは
   (a) supervisor 共有 shutdown watch、(b) 全 handle drop の2条件でのみ終了（lib.rs:848-976）。
   唯一の join 経路は `BrokerSupervisor::shutdown(self)`（lib.rs:714、全接続一括・self 消費）。
-  `SlmpSimRegistry::shutdown` は drain のみで再利用可（broker_glue.rs:512）。
+  `BrokerSimRegistry::shutdown` は drain のみで再利用可（broker_glue.rs:512）。
 - 書き込みゲートは REST/gRPC 共有の `execute_write`（write_path.rs:238）。gate5 で
   `write_control.is_enabled()` を判定（fail-closed, write_path.rs:295-308）し、これは物理書き込み
   = gate8 の `write_broker_handle`→`ensure_connection`（hub.rs:1152、**セッションが無ければ spawn**）
@@ -384,7 +384,7 @@ impl SessionDirectory {
   使わない（remove すら未使用, lib.rs:158-163）。共有クレートの表面積は「1タスク1 watch + select 1分岐 +
   1メソッド」に限定。
 - `HubSessions` に `stop_and_join(connection_id)` を追加し `SessionDirectory` へ委譲。
-- `SlmpSimRegistry` は既に再利用可（drain, broker_glue.rs:512）なので変更不要。停止シーケンスでは
+- `BrokerSimRegistry` は既に再利用可（drain, broker_glue.rs:512）なので変更不要。停止シーケンスでは
   現行 `remove_stale_slmp_sessions`（sessions.remove + sim_registry.remove のペア, hub.rs:1070-1074）を
   stop-and-join ベースへ差し替える。
 - **停止 step5 の完了条件 = broker タスクの JoinHandle 解決**。テストは停止後
@@ -409,7 +409,7 @@ controller の stop / mode 切替は次の順で実行する（plan §7 を本�
    （T15 で SIM 対応時に能動終了、T14 では収集停止に伴い Bad 化）。
 4. `Collector::stop()` で収集タスク停止 + tstore flush（collector.rs:577）。
 5. broker `stop_and_join`（各接続、D8）でセッションを join。
-6. simulator 停止（`SlmpSimRegistry::remove`/stop）。
+6. simulator 停止（`BrokerSimRegistry::remove`/stop）。
 7. 現在値を `Bad`/`null` 相当へ、`Stopped` を公開、`running_revision` 前進。
 
 失敗時は `faulted` へ入り、実機収集を自動再開しない。

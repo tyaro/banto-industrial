@@ -56,10 +56,12 @@ fn tag_key(id: i64) -> String {
 /// `D100`) for [`Protocol::Slmp`] (I8, 2026-08-05: `banto-plc`'s SLMP client
 /// wired into collection).
 ///
-/// T9-2 (apps/banto-hub/core's broker-routed SLMP path): also `pub` (not
-/// `pub(crate)`) because `banto_hub_core::broker_glue::SlmpSimRegistry` needs
-/// to pass `Protocol::Slmp` to `crate::simulation::start` when it starts an
-/// in-process SLMP simulator ahead of establishing a broker session (see
+/// T9-2 (apps/banto-hub/core's broker-routed simulation path): also `pub`
+/// (not `pub(crate)`) because `banto_hub_core::broker_glue::BrokerSimRegistry`
+/// needs to pass a `Protocol` value to `crate::simulation::start` when it
+/// starts an in-process simulator ahead of establishing a broker session -
+/// `BrokerSimRegistry::resolve` (`broker_glue.rs`) picks `Protocol::ModbusTcp`
+/// or `Protocol::Slmp` depending on the connection's own protocol (see
 /// `crate::simulation`'s module doc, "SLMP + banto-hub の broker 経路
 /// について").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,8 +228,9 @@ impl CollectorConfig {
     /// false` for every connection whose key is in `connection_keys` -
     /// banto-hub's `CollectorManager` calls this after `build_config` to
     /// stop `Collector` from starting a second, unused in-process simulator
-    /// for a broker-managed SLMP connection whose dial address
-    /// `CollectorManager`'s own `SlmpSimRegistry` has already substituted
+    /// for a broker-managed connection (SLMP or, since #337, Modbus TCP)
+    /// whose dial address `CollectorManager`'s own `BrokerSimRegistry` has
+    /// already substituted
     /// before the broker session was established (`Collector`'s own
     /// simulator substitution happens too late in that path - see
     /// `crate::simulation`'s module doc). A key not present in
@@ -278,7 +281,7 @@ impl CollectorConfig {
     /// (`crate::config::slmp_config_for`/`modbus_config_for`) - neither field reflects
     /// the *actual resolved dial target* a broker-routed connection uses,
     /// which lives entirely outside this plan (`apps/banto-hub/core/src/broker_glue.rs`'s
-    /// `SlmpSimRegistry`). So toggling `simulation` on/off (or editing the
+    /// `BrokerSimRegistry`). So toggling `simulation` on/off (or editing the
     /// connection's real host/port while it stays broker-routed) can leave
     /// this plan comparing byte-for-byte equal across rebuilds even though
     /// the broker session actually moved underneath it - "unchanged" would
@@ -288,7 +291,7 @@ impl CollectorConfig {
     /// or dead session forever.
     ///
     /// banto-hub's `CollectorManager` calls this with the SAME resolved
-    /// `(host, port)` `SlmpSimRegistry::resolve` just computed for every
+    /// `(host, port)` `BrokerSimRegistry::resolve` just computed for every
     /// broker-routed connection (regardless of whether `resolve`
     /// reported `changed` - applying it unconditionally is harmless: for an
     /// unchanged target the value written back is identical to what was
@@ -299,7 +302,7 @@ impl CollectorConfig {
     /// spawning a fresh one with the freshly-built `ClientFactory`
     /// (`CollectorManager::rebuild` builds it from this same rebuild's
     /// `broker_handles`, i.e. the NEW broker session) - exactly the "this
-    /// connection's task gets stopped and respawned" path `SlmpSimRegistry::resolve`'s
+    /// connection's task gets stopped and respawned" path `BrokerSimRegistry::resolve`'s
     /// own doc comment relies on to make the swap actually observable.
     pub fn set_broker_dial_target(&mut self, key: &str, host: String, port: i64) {
         if let Some(conn) = self.connections.iter_mut().find(|c| c.key == key) {
@@ -1645,7 +1648,7 @@ mod tests {
     /// connection's `simulation` flag untouched - the mechanism
     /// `CollectorManager::rebuild` (apps/banto-hub/core) uses to prevent
     /// `Collector` from starting a redundant simulator for a broker-routed
-    /// SLMP connection that `SlmpSimRegistry` already simulates itself.
+    /// connection that `BrokerSimRegistry` already simulates itself.
     #[tokio::test]
     async fn suppress_simulation_for_forces_flag_off_only_for_matching_keys() {
         let pool = registry().await;

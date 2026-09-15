@@ -39,7 +39,7 @@ use axum::Router;
 use banto_collect::{BackoffConfig, CollectorOptions};
 use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::audit::AuditLogService;
-use banto_hub_core::broker_glue::{HubSessions, SlmpSimRegistry};
+use banto_hub_core::broker_glue::{BrokerSimRegistry, HubSessions};
 use banto_hub_core::commissioning::CommissioningService;
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
 use banto_hub_core::controller::{CollectionController, CollectionState, RunMode};
@@ -215,7 +215,7 @@ async fn test_app(label: &str) -> TestApp {
         .expect("admin login");
 
     let sessions = Arc::new(HubSessions::new(banto_broker::BackoffConfig::default()));
-    let sim_registry = Arc::new(SlmpSimRegistry::new());
+    let sim_registry = Arc::new(BrokerSimRegistry::new());
     let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
     let manager = Arc::new(CollectorManager::new(
         pool.clone(),
@@ -426,7 +426,7 @@ async fn simulated_connection_write_is_applied_and_held(
 ) {
     let app = test_app(label).await;
 
-    // host/port はダミー - `SlmpSimRegistry` が実際のダイヤル先を in-process
+    // host/port はダミー - `BrokerSimRegistry` が実際のダイヤル先を in-process
     // シミュレータへ差し替える（port 1 は誰も listen していない特権ポート
     // なので、差し替えが壊れたら即座に接続拒否で落ちる）。
     let conn = PlcConnectionService::new(app.pool.clone())
@@ -585,7 +585,7 @@ async fn all_simulation_run_applies_writes_to_the_simulator_too() {
     let app = test_app("363-all-sim").await;
 
     // `simulation: false` の「実機」接続。全シミュレーション運転中は
-    // `SlmpSimRegistry` がこの接続も in-process シミュレータへ差し替える
+    // `BrokerSimRegistry` がこの接続も in-process シミュレータへ差し替える
     // ので、port 1（誰も listen していない）でも Connected になる。
     let conn = PlcConnectionService::new(app.pool.clone())
         .create(conn_input("realline", "slmp", 1, false))

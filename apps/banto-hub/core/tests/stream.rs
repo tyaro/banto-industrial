@@ -215,7 +215,7 @@ async fn test_app_with_lock(label: &str, locked_down: bool) -> TestApp {
     let sessions = std::sync::Arc::new(banto_hub_core::broker_glue::HubSessions::new(
         banto_broker::BackoffConfig::default(),
     ));
-    let sim_registry = std::sync::Arc::new(banto_hub_core::broker_glue::SlmpSimRegistry::new());
+    let sim_registry = std::sync::Arc::new(banto_hub_core::broker_glue::BrokerSimRegistry::new());
     let computed = std::sync::Arc::new(ComputedEngine::new(std::sync::Arc::new(
         ServerTagStore::new(),
     )));

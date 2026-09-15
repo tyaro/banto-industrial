@@ -86,7 +86,7 @@
 //!   シミュレーション書き込みにもそのまま適用される。変わったのは
 //!   「シミュレーション中は拒否」の1段だけ。
 //! - **実際に書ける理由**: シミュレーション接続の broker セッションは
-//!   `crate::broker_glue::SlmpSimRegistry` がダイヤル先を in-process
+//!   `crate::broker_glue::BrokerSimRegistry` がダイヤル先を in-process
 //!   シミュレータへ差し替えて張ってあるので、gate 8 の
 //!   `write_broker_handle_peek` → `BrokerHandle::write` がそのまま
 //!   シミュレータに届く。`banto_plc::{modbus,slmp}::simulator::Simulator`

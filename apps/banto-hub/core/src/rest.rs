@@ -2555,8 +2555,8 @@ pub struct PlcConnectionPayload {
     /// this connection into an in-process simulator instead of a real PLC -
     /// see `banto_tags::PlcConnection::simulation`'s doc comment for what
     /// this actually does at collection time
-    /// (`crates/banto-collect/src/simulation.rs`) and, for broker-routed SLMP
-    /// connections specifically, `crate::broker_glue::SlmpSimRegistry`.
+    /// (`crates/banto-collect/src/simulation.rs`) and, for broker-routed
+    /// connections specifically, `crate::broker_glue::BrokerSimRegistry`.
     #[serde(default = "default_plc_simulation")]
     pub simulation: bool,
     /// P3-b（監査指摘 2026-08-12）: ワード順（32bit値 u32/f32 等、および
@@ -9642,7 +9642,7 @@ mod tests {
         let sessions = Arc::new(crate::broker_glue::HubSessions::new(
             banto_broker::BackoffConfig::default(),
         ));
-        let sim_registry = Arc::new(crate::broker_glue::SlmpSimRegistry::new());
+        let sim_registry = Arc::new(crate::broker_glue::BrokerSimRegistry::new());
         let computed = Arc::new(crate::computed::ComputedEngine::new(Arc::new(
             crate::computed::ServerTagStore::new(),
         )));

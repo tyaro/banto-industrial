@@ -66,8 +66,8 @@
 //!
 //! init_db → 各サービス構築 → `HubSessions` 構築（T2-2、設計 §6-5。
 //! `CollectorManager` の外で生存するブローカーセッション directory）→
-//! `SlmpSimRegistry` 構築（T9-2、docs/ux-plan.md §1。同じく
-//! `CollectorManager` の外で生存する SLMP シミュレータ registry）→
+//! `BrokerSimRegistry` 構築（T9-2、docs/ux-plan.md §1。同じく
+//! `CollectorManager` の外で生存する broker シミュレータ registry）→
 //! `CollectorManager::rebuild()`（起動時1回、設計 §4.3）→ tstore 剪定
 //! （起動時1回 + 24h 周期、設計 §3.3・保持既定7日）→ 監査ログ剪定
 //! （起動時1回 + tstore と同じ24h周期タスクに相乗り、
@@ -94,7 +94,7 @@
 //! `grpc_server.shutdown()`（gRPC サーバータスク停止）→
 //! `manager.shutdown()`（`Collector` 停止・tstore flush）→
 //! `sessions.shutdown()`（broker タスク停止）→
-//! `sim_registry.shutdown()`（T9-2、SLMP シミュレータ停止）の順を守る。
+//! `sim_registry.shutdown()`（T9-2、broker シミュレータ停止）の順を守る。
 //!
 //! **DB Source の位置**（S2、docs/banto-hub-external-db-design.md §4.2）:
 //! eval/prune ループの abort と同じ「消費者を先に止める」区画に置く -
@@ -115,8 +115,8 @@
 //! のモジュール doc comment参照）なので、依存する側（`mqtt`/gRPC）を先に
 //! 止める（両者間の順序自体はどちらが先でもよい - 独立した消費者）。
 //! `sessions`→`sim_registry`の順が最後に必要な理由（T9-2）: broker が
-//! ダイヤルしている先がシミュレータのことがある（`SlmpSimRegistry`が
-//! アドレスを差し替えた broker 経由 SLMP 接続）ので、シミュレータを broker
+//! ダイヤルしている先がシミュレータのことがある（`BrokerSimRegistry`が
+//! アドレスを差し替えた broker 経由接続）ので、シミュレータを broker
 //! セッションより先に止めると、まだ止まりきっていない broker タスクが
 //! 存在しない相手へ接続しようとする無駄が起きうる - シミュレータは
 //! それをダイヤルする broker セッションより長生きしなければならない。
@@ -158,7 +158,7 @@ use tokio::time::MissedTickBehavior;
 use crate::api_keys::ApiKeysService;
 use crate::assets::FrontendAssets;
 use crate::audit::AuditLogService;
-use crate::broker_glue::{HubSessions, SlmpSimRegistry};
+use crate::broker_glue::{BrokerSimRegistry, HubSessions};
 use crate::commissioning::CommissioningService;
 use crate::computed::{load_retained_values, ComputedEngine, ServerTagStore};
 use crate::controller::CollectionController;
@@ -396,8 +396,9 @@ impl HubRuntime {
 
         let clock = Arc::new(SystemClock);
         // T2-2 (docs/tag-server-design.md §6-5): constructed here, OUTSIDE
-        // `CollectorManager`, so an SLMP broker session survives every
-        // `CollectorManager::rebuild` - see `HubSessions`'s doc comment.
+        // `CollectorManager`, so a broker-managed session (SLMP, Modbus TCP)
+        // survives every `CollectorManager::rebuild` - see `HubSessions`'s
+        // doc comment.
         // Held as its own `Arc` (not only the clone `CollectorManager` gets)
         // so this binary can call `sessions.shutdown()` after
         // `manager.shutdown()` on the way out - see this module's doc
@@ -406,13 +407,13 @@ impl HubRuntime {
 
         // T9-2 (docs/ux-plan.md §1): constructed here, OUTSIDE
         // `CollectorManager`, for the same reason `sessions` is - a
-        // simulator started for a `simulation = true` broker-routed SLMP
+        // simulator started for a `simulation = true` broker-routed
         // connection must survive every `CollectorManager::rebuild` (see
-        // `SlmpSimRegistry`'s doc comment). Held as its own `Arc` so this
+        // `BrokerSimRegistry`'s doc comment). Held as its own `Arc` so this
         // binary can call `sim_registry.shutdown()` at the correct point on
         // the way out - see this module's doc comment ("シャットダウン順序")
         // for why that is AFTER `sessions.shutdown()`.
-        let sim_registry = Arc::new(SlmpSimRegistry::new());
+        let sim_registry = Arc::new(BrokerSimRegistry::new());
 
         // T6-2 (docs/tag-server-design.md §4.2): constructed here, OUTSIDE
         // `CollectorManager`, for the same reason `sessions` is - the
@@ -688,7 +689,7 @@ pub struct RunningHub {
     controller: Arc<CollectionController>,
     manager: Arc<CollectorManager>,
     sessions: Arc<HubSessions>,
-    sim_registry: Arc<SlmpSimRegistry>,
+    sim_registry: Arc<BrokerSimRegistry>,
     server: RunningServer,
     /// computed 250ms 評価ループの `JoinHandle`（T14-1 で捕捉。このモジュール
     /// doc の「T14-1 での唯一の挙動変化」節参照）。

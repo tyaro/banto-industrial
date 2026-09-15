@@ -73,9 +73,9 @@
 //! アドレスをまだ知りえない、という申し送りが残っていた。
 //!
 //! T9-2 で解消済み: `apps/banto-hub/core/src/broker_glue.rs`の
-//! `SlmpSimRegistry`が、この`start`/[`SimulatorHandle`]をそのまま再利用して
+//! `BrokerSimRegistry`が、この`start`/[`SimulatorHandle`]をそのまま再利用して
 //! `ensure_connection`より前にシミュレータを起動・アドレス解決する - 詳細は
-//! `SlmpSimRegistry`自身の doc comment（および同ファイルの module doc
+//! `BrokerSimRegistry`自身の doc comment（および同ファイルの module doc
 //! 「T9-1/T9-2 note」節）を参照。
 //!
 //! ## T15-2: all-simulation 開始前のカバレッジプリフライト(docs/banto-hub-desktop-plan.md §9.7)
@@ -119,7 +119,7 @@ pub const RAMP_ADDRESS_COUNT: u16 = 16;
 /// 起動中の1シミュレータインスタンス - 対応するランプ波生成タスクとその
 /// 停止チャネルを束ねる。`crate::collector::Collector` が接続キー
 /// (`"conn:{id}"`)ごとに1個保持する。T9-2: `apps/banto-hub/core/src/broker_glue.rs`
-/// の`SlmpSimRegistry`も、broker 経由 SLMP 接続1本ごとに1個保持する
+/// の`BrokerSimRegistry`も、broker 経由の接続1本ごとに1個保持する
 /// (`Collector`とは別の、独立したライフサイクル - このモジュールの
 /// 「SLMP + banto-hub の broker 経路について」参照)ため`pub`。
 pub struct SimulatorHandle {
@@ -137,7 +137,7 @@ enum SimulatorInner {
 impl SimulatorHandle {
     /// 接続タスクが実際に宛先とする loopback アドレス -
     /// `crate::collector::Collector`はこれで`ConnectionPlan`(のタスク用
-    /// コピー)の host/port を上書きする。T9-2: `SlmpSimRegistry`も同様に、
+    /// コピー)の host/port を上書きする。T9-2: `BrokerSimRegistry`も同様に、
     /// broker セッションの実際の宛先としてこれを使う。
     pub fn addr(&self) -> SocketAddr {
         self.addr
@@ -168,7 +168,7 @@ impl SimulatorHandle {
 /// `protocol` に応じたシミュレータを loopback の空きポートで起動し、ランプ波/
 /// トグル生成タスクを spawn する。呼び出し元は返った [`SimulatorHandle::addr`]
 /// を接続先として使う。`pub`: `crate::collector::Collector`自身に加え、T9-2の
-/// `apps/banto-hub/core/src/broker_glue.rs`の`SlmpSimRegistry`もこれを直接
+/// `apps/banto-hub/core/src/broker_glue.rs`の`BrokerSimRegistry`もこれを直接
 /// 呼ぶ(このモジュールの「SLMP + banto-hub の broker 経路について」参照)。
 pub async fn start(protocol: Protocol) -> SimulatorHandle {
     match protocol {
