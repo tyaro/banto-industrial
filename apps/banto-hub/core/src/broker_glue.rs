@@ -199,14 +199,18 @@ use tokio::sync::{watch, Mutex as AsyncMutex};
 ///
 /// Sized against `banto_broker`'s own backoff ladder
 /// (`banto_broker::BackoffConfig::default()`: 1 s, doubling, capped at 30 s):
-/// 3 s covers the first two rungs, so a session that drops and is
-/// re-established on the broker's first or second retry still looks like one
-/// slightly slow connect attempt to banto-collect - no `plc_disconnected`
-/// cycle, no backoff climb. Anything longer than that is a real outage, and
-/// the right answer is to fail this attempt and let banto-collect's own
-/// backoff (1 s → 30 s) govern how often it asks again. Deliberately **not**
-/// tied to `connect_timeout`: that one bounds a real TCP dial, which this
-/// adapter never performs.
+/// 3 s covers the first two rungs, so when the broker recovers on its own
+/// within one of those retries, banto-collect's own `ConnState` does not
+/// stack up `Backoff` (climbing attempt count) on top of it. This does
+/// **not** suppress the `plc_disconnected`/`plc_reconnected` pair -
+/// `run_connection` emits `plc_disconnected` the moment a read observes the
+/// session down, independent of this grace window, and `plc_reconnected`
+/// fires once on the first successful read afterwards (#344); the pair is
+/// the correct record of the outage and its recovery. Anything longer than
+/// the grace is a real outage, and the right answer is to fail this attempt
+/// and let banto-collect's own backoff (1 s → 30 s) govern how often it asks
+/// again. Deliberately **not** tied to `connect_timeout`: that one bounds a
+/// real TCP dial, which this adapter never performs.
 const BROKER_RECONNECT_GRACE: Duration = Duration::from_secs(3);
 
 /// A `banto_collect::PlcClient` that reads through a shared broker session
@@ -247,6 +251,12 @@ impl PlcClient for BrokerReadClient {
     /// reports the broker session's real state (#344)") for the full
     /// derivation and the event-flapping bug that forced it.
     ///
+    /// - Every `watch` sender gone (the broker task has exited) -> `Err`
+    ///   immediately, checked **before** anything else below. This matters
+    ///   even when the last value the broker published was `Connected`: a
+    ///   task that exits without ever sending `Stopped` must not be mistaken
+    ///   for a healthy session just because nobody has observed its death
+    ///   yet.
     /// - [`BrokerConnectionStatus::Connected`] -> `Ok(())` immediately (the
     ///   overwhelmingly common case: no timer, no allocation beyond the
     ///   `watch::Receiver` clone).
@@ -255,12 +265,22 @@ impl PlcClient for BrokerReadClient {
     ///   not, `Err(PlcError::Connection)` naming the broker's own attempt
     ///   counter, so banto-collect's `ConnState` stays in `Backoff` instead of
     ///   flapping back to `Connected`.
-    /// - [`BrokerConnectionStatus::Stopped`], or every `watch` sender gone
-    ///   (the broker task has exited) -> `Err` immediately; there is nothing
-    ///   left to wait for.
+    /// - [`BrokerConnectionStatus::Stopped`] -> `Err` immediately; there is
+    ///   nothing left to wait for.
     fn connect(&mut self) -> BoxFuture<'_, Result<(), PlcError>> {
         let mut status = self.handle.status_watch();
         Box::pin(async move {
+            // Checked ahead of the fast path below: `has_changed()` errors
+            // only when every sender is gone, i.e. the broker task itself
+            // has exited. Without this check, a task that publishes
+            // `Connected` and then exits (never sending `Stopped`) would
+            // pass the fast path below as if the session were still healthy.
+            if status.has_changed().is_err() {
+                return Err(PlcError::Connection(
+                    "broker セッションのタスクが終了しています".to_string(),
+                ));
+            }
+
             // Fast path, and the reason this can never regress the healthy
             // case into a timer wake-up.
             match *status.borrow_and_update() {
@@ -1019,6 +1039,30 @@ mod tests {
         assert!(
             started.elapsed() < BROKER_RECONNECT_GRACE,
             "a Connected session must not wait out the reconnect grace"
+        );
+    }
+
+    /// PR #368 review: the fast path above must not trust a stale `Connected`
+    /// value once the broker task itself is gone. Publish `Connected`, then
+    /// drop the sender (as a task exiting without ever publishing `Stopped`
+    /// would) - `connect()` must still fail, naming the broker task as gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connect_fails_when_the_broker_task_is_gone_even_if_the_last_status_was_connected() {
+        let (handle, status_tx, _task) = banto_broker::spawn_test_handle_with_status(
+            1,
+            banto_broker::BrokerConnectionStatus::Connected,
+        );
+        let mut client = BrokerReadClient::new(handle.read_only());
+
+        drop(status_tx);
+
+        let err = client.connect().await.expect_err(
+            "a session whose broker task has exited must fail even if it was last seen Connected",
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("終了"),
+            "the error should say the broker session's task has exited - got {text}"
         );
     }
 
