@@ -67,7 +67,7 @@ test.describe.serial('relay-wright smoke (mode 2: embedded server)', () => {
 		await page.close();
 	});
 
-	test('1. first-run setup creates the admin account and lands on /settings', async () => {
+	test('1. first-run setup creates the admin account and lands on /settings/appearance', async () => {
 		await page.goto('/login');
 
 		// 新規DB → AuthProvider.status() が initialized: false を返す →
@@ -83,16 +83,20 @@ test.describe.serial('relay-wright smoke (mode 2: embedded server)', () => {
 		await page.getByLabel('パスワード（確認）').fill(ADMIN_PASSWORD);
 		await page.getByRole('button', { name: 'アカウントを作成' }).click();
 
-		// login/+page.svelte's submitSetup() は成功後 /settings へ goto する
-		// （relay-wright は banto-hub と違い、常に /settings がログイン後の
-		// 着地点 - navigation.ts の doc comment 参照）。
-		await expect(page).toHaveURL(/\/settings$/);
+		// login/+page.svelte's submitSetup() は成功後 /settings/appearance へ
+		// goto する（relay-wright は banto-hub と違い、常に設定画面がログイン後の
+		// 着地点 - navigation.ts の doc comment 参照）。#359（設定画面の
+		// カテゴリ別ルート化）で `/settings` 自体は先頭の可視カテゴリへの
+		// redirect 専用になったため、着地点は `/settings/appearance` に変わった
+		// （`login/+page.svelte` の doc comment参照）。
+		await expect(page).toHaveURL(/\/settings\/appearance$/);
 		// Header.svelte の <h1>{pageTitle(...)}</h1> がページタイトルとして
-		// 「設定」を描く（navigation.ts の navItems[{path:'/settings'}]）。
+		// 「設定」を描く（navigation.ts の navItems の `活性判定`は
+		// `activeMatch: '/settings'` で `/settings` 配下すべてに前方一致する）。
 		await expect(page.getByRole('heading', { level: 1, name: '設定' })).toBeVisible();
 	});
 
-	test('2. logout returns to /login, then login restores the /settings session', async () => {
+	test('2. logout returns to /login, then login restores the /settings/appearance session', async () => {
 		await page.getByRole('button', { name: 'ログアウト' }).click();
 		await expect(page).toHaveURL(/\/login$/);
 
@@ -100,7 +104,11 @@ test.describe.serial('relay-wright smoke (mode 2: embedded server)', () => {
 		await page.getByLabel('パスワード').fill(ADMIN_PASSWORD);
 		await page.getByRole('button', { name: 'ログイン' }).click();
 
-		await expect(page).toHaveURL(/\/settings$/);
+		// submitLogin() 自体の goto('/settings') は変更していないが、
+		// `/settings` は #359 で先頭の可視カテゴリへの 307 redirect 専用に
+		// なったため、最終的な着地点は setup 成功時と同じ /settings/appearance
+		// になる。
+		await expect(page).toHaveURL(/\/settings\/appearance$/);
 		await expect(page.getByRole('heading', { level: 1, name: '設定' })).toBeVisible();
 	});
 

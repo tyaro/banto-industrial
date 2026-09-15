@@ -6,7 +6,8 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
 状態: **地図として現行**。索引に徹し、実装状況・設計判断の本体は各文書側で管理する。
 最終更新: 2026-09-15（T19（UX-30〜48）・T20（文字列/構造体/レシピ/ビット .0〜.F）・T21（構成補助 MCP 管理面）完了、MCP 31 ツール実機検証、外部 DB 連携 S0〜S2b・S4・S5 完了、S3/S6/S7 残（MCP は 37 ツールに。追加分はローカル PostgreSQL で検証）に加え、v0.2.0-alpha.8: 書き込み受付の既定を「可」に変更し、再起動・収集操作での自動無効化を撤回（#340）、v0.2.0-alpha.9: 試運転中は構成 CRUD を収集中でも即時・無停止反映（#341）、v0.2.0-alpha.10: computed タグの catalog 公開・外部読み取り出力のシミュレーションゲート撤廃（#335）、v0.2.0-alpha.11: シミュレーションデバイスへの外部書き込みをシミュレータへ反映（#363）、v0.2.0-alpha.12: T15-3 テスト出力（test_output）機構を撤去（#362）、v0.2.0-alpha.13: PLC 到達不能中の plc_reconnected / plc_disconnected フラップを修正（#344）、
 v0.2.0-alpha.14: banto-hub の設定画面をカテゴリ別ルートへ分割（#359 banto-hub 分）を反映、
-chronogazer の設定画面をカテゴリ別ルートへ分割（#359 chronogazer 分）を反映）。
+chronogazer の設定画面をカテゴリ別ルートへ分割（#359 chronogazer 分）を反映、
+relay-wright の設定画面をカテゴリ別ルートへ分割（#359 relay-wright 分、issue #359 は3アプリ分完了）を反映）。
 最終検証日(コード照合): 2026-09-15
 
 > この地図は索引に徹する。実装状況・設計判断の本体は各文書側にあり、状態の**正**は
@@ -105,6 +106,13 @@ chronogazer の設定画面をカテゴリ別ルートへ分割（#359 chronogaz
   は先頭の可視カテゴリへ 307 redirect）、`AuthSettings`（ログイン不要モード＋自動ログイン）を
   Account/Connectivity/Security の3カテゴリで共有する `authSettingsStore` を新設した。挙動・API・DB
   は無変更。relay-wright への展開は別 PR。
+- **relay-wright の設定画面カテゴリ別ルート分割（2026-09-15、#359 relay-wright 分、issue #359 完了）**:
+  banto-hub・chronogazer と同じ構成を relay-wright にも移植した。`/settings` は
+  `/settings/{appearance,account,connectivity,data,security}` の実ルートに分かれ（旧 `/settings`
+  は先頭の可視カテゴリへ 307 redirect）。relay-wright 固有のタグモニタ手動書き込み（H2）とアーム
+  時限失効（H10）は、どちらも意図しない PLC 書き込みを防ぐ安全装置なので、6番目のカテゴリを増やさず
+  認証と同じ `security` に同居させた。`AuthSettings` を Account/Connectivity/Security の3カテゴリで
+  共有する `authSettingsStore` を新設した。挙動・API・DB は無変更。
 - **出荷ゲート**: T5-5（実機での 72h soak 実行 + 実機最終サインオフ）のみ残（実機必須）。
 - **banto-tagclient**: **S4a完了（2026-09-01）**。読み取り専用DTO、Endpoint/Secret境界、
   stable ID resolver、REST catalog/values transport、WS wire純粋解析、bounded publish gate、認証付き

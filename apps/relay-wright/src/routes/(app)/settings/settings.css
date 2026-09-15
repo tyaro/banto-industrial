@@ -1,0 +1,127 @@
+/*
+ * 設定画面の section コンポーネント（AppearanceSection/AccountSection/
+ * ConnectivitySection/DataSection/SecuritySection.svelte）が2つ以上で使う
+ * 共通クラス（#359 relay-wright 分）。元 `+page.svelte` の単一 `<style>`
+ * ブロックから「複数 section で使われているルール」だけをここに出した -
+ * 1つの section にしか要らないルール（`h3`・`.options`系・`.urls`/`.qr`・
+ * `.note.warning`・`section form`・`button.secondary`系・`.backup-*`/
+ * `.pending-restore`/`.restore-upload`/`.file-input`）はその section 自身の
+ * `<style>` に残している。ファイル名・役割は banto-hub（#371）・
+ * chronogazer（#372）の settings.css と同じだが、中身は relay-wright 独自の
+ * 既存デザイン（DOM構造・見た目を変えない）をそのまま再配置したもの。
+ *
+ * `.toggle`/`.toggle.disabled` は Connectivity（LANアクセス）と Security
+ * （認証・タグモニタ手動書き込み）の複数 section で使うので shared。
+ * `.server-fields`/`.field`/`.status`/`.error`/`.note` も Account・
+ * Connectivity・Data・Security の4 section すべてで使われる。
+ *
+ * `+layout.svelte` から `import './settings.css';` するプレーン CSS であり、
+ * Svelte の per-component scoping はコンポーネントを跨いでは効かない
+ * （5つの section コンポーネント + 5つのカテゴリルートの `+page.svelte` に
+ * 分かれた card markup が、このファイルを import する +layout.svelte 自身の
+ * <style> スコープには入らない）。分割前は `section`/`h2`/`button`/`.field`/
+ * `.note`/`.error`/`.status`/`.toggle` のような裸のセレクタのまま置いて
+ * いたため、設定画面を一度でも開くとグローバルへ漏れ、engine/monitor/
+ * plc-connections/tags/write-targets など他画面の同名クラス・要素まで
+ * 上書きしうる（SPA なので一度読み込むと以後ずっと影響する - banto-hub が
+ * PR #371 の Copilot レビューで踏んだのと同じ罠）。banto-hub・chronogazer の
+ * settings.css と同じく `+layout.svelte` のルート div が持つ
+ * `.settings-layout` を祖先にして名前空間化した（`.settings-layout` は
+ * 設定画面のどのカテゴリでも共通のルートで、ナビ自体は別クラス名の scoped
+ * `<style>` を使っているため衝突しない）。
+ */
+
+.settings-layout .sections {
+	display: flex;
+	flex-direction: column;
+	gap: 1rem;
+	max-width: 560px;
+}
+
+.settings-layout section {
+	background: var(--banto-surface);
+	border: 1px solid var(--banto-border);
+	border-radius: calc(var(--banto-radius) * 2);
+	padding: 1rem 1.25rem;
+	/* Glass preset (spec M12): no-op under standard (--banto-backdrop: none). */
+	backdrop-filter: var(--banto-backdrop, none);
+	-webkit-backdrop-filter: var(--banto-backdrop, none);
+}
+
+.settings-layout h2 {
+	margin: 0 0 0.75rem;
+	font-size: 1rem;
+}
+
+.settings-layout .toggle {
+	display: flex;
+	align-items: center;
+	gap: 0.4rem;
+	font-size: 0.875rem;
+	cursor: pointer;
+}
+
+.settings-layout .toggle.disabled {
+	cursor: not-allowed;
+	color: var(--banto-text-muted);
+}
+
+.settings-layout .server-fields {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.75rem;
+	margin: 0.75rem 0;
+}
+
+.settings-layout .field {
+	display: flex;
+	flex-direction: column;
+	gap: 0.3rem;
+	font-size: 0.8rem;
+	color: var(--banto-text-muted);
+}
+
+.settings-layout .field select,
+.settings-layout .field input {
+	padding: 0.4rem 0.5rem;
+	border: 1px solid var(--banto-border);
+	border-radius: var(--banto-radius);
+	background: var(--banto-bg);
+	color: var(--banto-text);
+}
+
+.settings-layout button {
+	padding: 0.5rem 1rem;
+	border: none;
+	border-radius: var(--banto-radius);
+	background: var(--banto-primary);
+	color: var(--banto-text-inverse);
+	font-weight: 600;
+	cursor: pointer;
+}
+
+.settings-layout button:hover:not(:disabled) {
+	background: var(--banto-primary-hover);
+}
+
+.settings-layout button:disabled {
+	opacity: 0.6;
+	cursor: not-allowed;
+}
+
+.settings-layout .status {
+	margin: 0.75rem 0 0;
+	font-size: 0.875rem;
+}
+
+.settings-layout .error {
+	margin: 0.5rem 0 0;
+	color: var(--banto-danger);
+	font-size: 0.8rem;
+}
+
+.settings-layout .note {
+	margin: 0.75rem 0 0;
+	color: var(--banto-text-muted);
+	font-size: 0.8rem;
+}
