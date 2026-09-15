@@ -1936,10 +1936,20 @@
 	 * `blockedInsertTargets`（`$lib/banto/expressionInsert.ts`、**正は段階A
 	 * のサーバチェック**）。トグルが OFF の間は空 Map にして、一覧全件ぶんの
 	 * 依存グラフ構築を走らせない。
+	 *
+	 * #379 レビュー対応: 依存グラフは `visibleTags` ではなく**生の `tags`
+	 * （サーバー全件）**から組む。削除猶予中（`deferredDelete.pendingIds`）の
+	 * タグは画面から消えていても**サーバー上にはまだ存在する**ので、それを
+	 * 中継する循環を見落とすと「挿入できたのにサーバーが `cycle` で拒否する」
+	 * ことになり、UI の理由表示が嘘になる。`visibleTags` の doc「タグ一覧から
+	 * 派生する表示はすべて `visibleTags` を経由させる」は**表示**についての
+	 * 規則で、ここは表示ではなく判定なので矛盾しない - 実際に淡色化されるのは
+	 * グリッドに出ている行（= `visibleTags`）だけで、猶予中の行の id が
+	 * この Map に入っていても描画には現れない。
 	 */
 	const insertBlockedReasons = $derived.by((): Map<number, string> => {
 		if (!insertArmed) return new Map();
-		const candidates: InsertCandidateTag[] = visibleTags.map((t) => ({
+		const candidates: InsertCandidateTag[] = tags.map((t) => ({
 			id: t.id,
 			dataType: t.dataType,
 			tagKind: t.tagKind,

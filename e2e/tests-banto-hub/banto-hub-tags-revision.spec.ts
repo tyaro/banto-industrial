@@ -57,8 +57,26 @@ interface TagResponse {
  * 0002`）、失敗テストが `describe.serial` でリトライされて beforeAll が
  * 再走すると、前回作成済みの同名リソースが残ったまま POST して UNIQUE
  * 違反で not-ok になり beforeAll ごと落ちる - それを防ぐための冪等掃除。
- * FK は RESTRICT なので削除順は タグ → グループ → 接続。
+ * FK は RESTRICT なので削除順は タグ → グループ → 接続（この spec のタグは
+ * PLC タグ1件だけなので、`banto-hub-tags-expression-insert.spec.ts` のような
+ * 式の参照順は要らない）。
+ *
+ * #379 レビュー対応: **各 DELETE の応答を検証する**（204、または既に無い
+ * 場合の 404 だけを許容）。握りつぶすと、掃除が効いていないまま静かに
+ * 通り過ぎてしまう。
  */
+async function expectDeleted(
+	request: APIRequestContext,
+	headers: Record<string, string>,
+	path: string
+): Promise<void> {
+	const res = await request.delete(path, { headers });
+	expect(
+		[204, 404],
+		`DELETE ${path} が ${res.status()} で失敗しました: ${await res.text()}`
+	).toContain(res.status());
+}
+
 async function cleanupExistingFixtures(
 	request: APIRequestContext,
 	headers: Record<string, string>
@@ -72,10 +90,10 @@ async function cleanupExistingFixtures(
 			if (tagsRes.ok()) {
 				const tags = (await tagsRes.json()) as Array<{ id: number; collectionGroupId: number }>;
 				for (const tag of tags.filter((t) => t.collectionGroupId === existingGroup.id)) {
-					await request.delete(`/api/tags/${tag.id}`, { headers });
+					await expectDeleted(request, headers, `/api/tags/${tag.id}`);
 				}
 			}
-			await request.delete(`/api/collection-groups/${existingGroup.id}`, { headers });
+			await expectDeleted(request, headers, `/api/collection-groups/${existingGroup.id}`);
 		}
 	}
 
@@ -84,7 +102,7 @@ async function cleanupExistingFixtures(
 		const connections = (await connectionsRes.json()) as Array<{ id: number; name: string }>;
 		const existingConnection = connections.find((c) => c.name === CONNECTION_NAME);
 		if (existingConnection) {
-			await request.delete(`/api/plc-connections/${existingConnection.id}`, { headers });
+			await expectDeleted(request, headers, `/api/plc-connections/${existingConnection.id}`);
 		}
 	}
 }

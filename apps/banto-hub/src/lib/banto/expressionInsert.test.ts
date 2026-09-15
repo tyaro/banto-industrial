@@ -136,6 +136,26 @@ describe('wouldCreateCycle', () => {
 		expect(insertionBlockReason(tags, 1, 9)).toBe(CYCLE_REFERENCE_REASON);
 	});
 
+	it('一覧に出ていない（削除猶予中の）computed が中継する間接循環も検出する（#379）', () => {
+		// ページ側は `visibleTags`（削除猶予中を除いた表示用）ではなく生の
+		// `tags`（サーバー全件）から候補を組む - 猶予中のタグはサーバー上には
+		// まだ存在し、それを中継する循環をサーバーは `cycle` で拒否するため。
+		// ここは純関数なので「候補配列に含まれていれば辿れる」ことで表現する。
+		const selfName = `${CONN}.${GROUP}.self`;
+		const pendingName = `${CONN}.${GROUP}.pending`;
+		const tags = [
+			tag(1, 'self', { tagKind: 'computed', expression: '1' }),
+			// 削除猶予中で一覧には出ないが、サーバー上にはまだある computed。
+			tag(10, 'pending', { tagKind: 'computed', expression: `${selfName} + 1` }),
+			tag(11, 'via-pending', { tagKind: 'computed', expression: `${pendingName} * 2` })
+		];
+		expect(wouldCreateCycle(tags, 1, 11)).toBe(true);
+		expect(insertionBlockReason(tags, 1, 11)).toBe(CYCLE_REFERENCE_REASON);
+		// 中継を落とす（= `visibleTags` から組んだ場合）と見落とす、が回帰の本体。
+		const withoutPending = tags.filter((t) => t.id !== 10);
+		expect(wouldCreateCycle(withoutPending, 1, 11)).toBe(false);
+	});
+
 	it('`1-self` の形（演算子の `-` に隣接）で参照している computed も循環（#379）', () => {
 		// 旧実装は「直前が `-`」を一律に除外していたため依存グラフの辺が
 		// 落ち、循環候補なのにトーストが出ず挿入できてしまっていた。

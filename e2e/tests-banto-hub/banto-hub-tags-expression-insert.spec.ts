@@ -79,10 +79,34 @@ function waitForExpressionCheck(page: Page) {
  *   一覧行数を増やす（`banto-hub-tags-revision.spec.ts` 冒頭の doc comment
  *   にある「仮想化されたグリッドの描画窓」を押し上げる）。
  *
- * FK は RESTRICT なので削除順は タグ → グループ → 接続。`calc` 予約接続は
- * 削除しない（サーバー起動時に自動作成される共有リソース）ので、その配下の
- * グループ（`CALC_GROUP_NAME`）とタグだけを消す。
+ * 削除順は **computed タグ → それ以外のタグ → グループ → 接続**。FK
+ * （RESTRICT）だけでなく**式の参照**も順序を縛る: この spec の computed タグは
+ * PLC タグ `REF_TAG_NAME` を参照しているので、PLC タグを先に消すとサーバーの
+ * preflight（参照切れ）が 4xx で拒否し、続くグループ・接続の削除も FK で
+ * 失敗してフィクスチャが丸ごと残る（#379 レビュー指摘）。
+ *
+ * **各 DELETE の応答を検証する**（204、または既に無い場合の 404 だけを許容）。
+ * 握りつぶすと上のような失敗が静かに通り過ぎてしまう。
+ *
+ * 対象タグは**名前ではなく所属グループ**で拾うので、日本語名の
+ * `JP_TAG_NAME`（テスト9で使う。`e2e-expr-insert-` 接頭辞を持たない）も
+ * 自然に含まれる。`calc` 予約接続は削除しない（サーバー起動時に自動作成される
+ * 共有リソース）ので、その配下のグループ（`CALC_GROUP_NAME`）とタグだけを消す。
  */
+async function expectDeleted(
+	request: APIRequestContext,
+	headers: Record<string, string>,
+	path: string
+): Promise<void> {
+	const res = await request.delete(path, { headers });
+	// 204 = 削除できた / 404 = 既に無い。それ以外（preflight 拒否の 4xx 等）は
+	// 掃除が効いていない合図なので、ここで落とす。
+	expect(
+		[204, 404],
+		`DELETE ${path} が ${res.status()} で失敗しました: ${await res.text()}`
+	).toContain(res.status());
+}
+
 async function cleanupExistingFixtures(
 	request: APIRequestContext,
 	headers: Record<string, string>
@@ -95,14 +119,23 @@ async function cleanupExistingFixtures(
 	if (targetGroups.length > 0) {
 		const tagsRes = await request.get('/api/tags', { headers });
 		if (tagsRes.ok()) {
-			const tags = (await tagsRes.json()) as Array<{ id: number; collectionGroupId: number }>;
+			const tags = (await tagsRes.json()) as Array<{
+				id: number;
+				collectionGroupId: number;
+				tagKind: string;
+			}>;
 			const groupIds = new Set(targetGroups.map((g) => g.id));
-			for (const tag of tags.filter((t) => groupIds.has(t.collectionGroupId))) {
-				await request.delete(`/api/tags/${tag.id}`, { headers });
+			const targetTags = tags.filter((t) => groupIds.has(t.collectionGroupId));
+			// 参照元（computed）を先に消してから参照先（plc 等）を消す。
+			for (const tag of targetTags.filter((t) => t.tagKind === 'computed')) {
+				await expectDeleted(request, headers, `/api/tags/${tag.id}`);
+			}
+			for (const tag of targetTags.filter((t) => t.tagKind !== 'computed')) {
+				await expectDeleted(request, headers, `/api/tags/${tag.id}`);
 			}
 		}
 		for (const group of targetGroups) {
-			await request.delete(`/api/collection-groups/${group.id}`, { headers });
+			await expectDeleted(request, headers, `/api/collection-groups/${group.id}`);
 		}
 	}
 
@@ -111,7 +144,7 @@ async function cleanupExistingFixtures(
 		const connections = (await connectionsRes.json()) as Array<{ id: number; name: string }>;
 		const existing = connections.find((c) => c.name === CONNECTION_NAME);
 		if (existing) {
-			await request.delete(`/api/plc-connections/${existing.id}`, { headers });
+			await expectDeleted(request, headers, `/api/plc-connections/${existing.id}`);
 		}
 	}
 }
@@ -252,6 +285,16 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 		// 後続スペックの一覧行数を増やさないよう、作ったフィクスチャは必ず
 		// 片付ける（`cleanupExistingFixtures` の doc comment 参照）。
 		await cleanupExistingFixtures(page.request, authedHeaders);
+
+		// #379 レビュー対応: 掃除が実際に効いたことをサーバー側で確認する
+		// （削除順や preflight 拒否で残っていれば、ここで落ちる）。
+		const tagsRes = await page.request.get('/api/tags', { headers: authedHeaders });
+		expect(tagsRes.ok()).toBe(true);
+		const remaining = ((await tagsRes.json()) as Array<{ name: string }>)
+			.map((t) => t.name)
+			.filter((name) => name.startsWith('e2e-expr-insert-') || name === JP_TAG_NAME);
+		expect(remaining, 'この spec のタグが残っています').toEqual([]);
+
 		await page.close();
 	});
 
