@@ -98,12 +98,27 @@ const IDENT_RUN_NO_HYPHEN = '[A-Za-z_][A-Za-z0-9_]*';
  * {@link extractTagRefTokens} が空白を除いた canonical 形
  * （`conn.group.tag` - `referenced_tags()` が返すのと同じ形）へ正規化する。
  */
-const DOT_WITH_SPACES = '\\s*\\.\\s*';
+/**
+ * lexer が読み飛ばす空白の**明示集合**（`crates/banto-expr/src/lexer.rs:89`
+ * の `c == b' ' || c == b'\t' || c == b'\n' || c == b'\r'` と同じ4種）。
+ *
+ * #379 レビュー対応: 正規表現の `\s` は垂直タブ・フォームフィード・全角空白
+ * などにも一致するが、lexer はそれらを空白として扱わず `Syntax` エラーに
+ * する（compile.rs の `only_space_tab_lf_cr_are_skipped_as_whitespace`）。
+ * `\s` のままだと、そもそもコンパイルできない式から偽の参照を拾ってしまう
+ * ので、lexer と同じ4種に絞る。
+ */
+const LEXER_SPACE = '[ \\t\\n\\r]';
+const LEXER_SPACES = `${LEXER_SPACE}*`;
+const DOT_WITH_SPACES = `${LEXER_SPACES}\\.${LEXER_SPACES}`;
 
 const TAG_REF_PATTERN = new RegExp(
-	`(?<![A-Za-z0-9_])(?<!\\.\\s*)(?<!${IDENT_RUN_NO_HYPHEN}-)${IDENT_SEGMENT}${DOT_WITH_SPACES}${IDENT_SEGMENT}${DOT_WITH_SPACES}${IDENT_SEGMENT}(?![A-Za-z0-9_])(?!\\s*\\.)(?!-[A-Za-z0-9_])`,
+	`(?<![A-Za-z0-9_])(?<!\\.${LEXER_SPACES})(?<!${IDENT_RUN_NO_HYPHEN}-)${IDENT_SEGMENT}${DOT_WITH_SPACES}${IDENT_SEGMENT}${DOT_WITH_SPACES}${IDENT_SEGMENT}(?![A-Za-z0-9_])(?!${LEXER_SPACES}\\.)(?!-[A-Za-z0-9_])`,
 	'g'
 );
+
+/** {@link LEXER_SPACE} 参照 - 抽出したトークンを canonical 形へ正規化するのに使う。 */
+const LEXER_SPACE_RUN = new RegExp(`${LEXER_SPACE}+`, 'g');
 
 /**
  * 完全外部名がそのまま式中のタグ参照として書けるか（3セグメントすべてが
@@ -142,7 +157,9 @@ export function isExpressionRepresentableName(externalName: string): boolean {
  * 空白を許さないままで、こちらとは非対称。
  */
 export function extractTagRefTokens(expression: string): string[] {
-	return (expression.match(TAG_REF_PATTERN) ?? []).map((token) => token.replace(/\s+/g, ''));
+	return (expression.match(TAG_REF_PATTERN) ?? []).map((token) =>
+		token.replace(LEXER_SPACE_RUN, '')
+	);
 }
 
 /** `expression` が `externalName` を（境界付きの）タグ参照として含むか。 */

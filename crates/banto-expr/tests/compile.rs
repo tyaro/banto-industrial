@@ -590,4 +590,25 @@ fn whitespace_around_dots_is_allowed_in_a_tag_reference() {
     assert_eq!(referenced("conn . group . tag + 1"), vec!["conn.group.tag"]);
     assert_eq!(referenced("conn .\n group . tag"), vec!["conn.group.tag"]);
     assert_eq!(referenced("conn.\tgroup .tag"), vec!["conn.group.tag"]);
+    assert_eq!(referenced("conn\r\n.group.tag"), vec!["conn.group.tag"]);
+}
+
+#[test]
+fn only_space_tab_lf_cr_are_skipped_as_whitespace() {
+    // lexer が読み飛ばすのは **空白・タブ・LF・CR の4種だけ**
+    // （`crates/banto-expr/src/lexer.rs:89`）。垂直タブ・フォームフィード・
+    // 全角空白はどれも構文エラーになる（ASCII 以外はモジュール doc のとおり
+    // そもそも `Syntax`）。フロント側の抽出正規表現が `\s`（Unicode 空白まで
+    // 一致）を使うと、ここでコンパイルできない式から偽の参照を拾うので、
+    // 同じ4種の明示集合に合わせる必要がある（#379 レビュー指摘）。
+    for src in [
+        "conn\u{0b}.group.tag",
+        "conn\u{0c}.group.tag",
+        "conn\u{3000}.group.tag",
+    ] {
+        assert!(
+            matches!(assert_rejected(src), CompileError::Syntax { .. }),
+            "expected Syntax error for {src:?}"
+        );
+    }
 }

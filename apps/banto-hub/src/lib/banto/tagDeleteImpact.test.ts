@@ -173,6 +173,22 @@ describe('extractTagRefTokens', () => {
 		expect(extractTagRefTokens('conn.\tgroup .tag')).toEqual(['conn.group.tag']);
 		// canonical 形で返すので、完全外部名との突き合わせもそのまま通る。
 		expect(expressionReferencesExternalName('conn . group . tag * 2', 'conn.group.tag')).toBe(true);
+		// CR+LF も lexer が読み飛ばす4種のうち。
+		expect(extractTagRefTokens('conn\r\n.group.tag')).toEqual(['conn.group.tag']);
+	});
+
+	/**
+	 * #379 レビュー対応: lexer が読み飛ばすのは 空白・タブ・LF・CR の4種だけ
+	 * （`crates/banto-expr/src/lexer.rs:89`）。垂直タブ・フォームフィード・
+	 * 全角空白を挟んだ式はコンパイルできない（compile.rs の
+	 * `only_space_tab_lf_cr_are_skipped_as_whitespace`）ので、そこから参照を
+	 * 拾ってはいけない - 正規表現の `\s` のままだと拾ってしまっていた。
+	 */
+	it('lexer が空白として扱わない文字を挟んだものは参照として拾わない（#379）', () => {
+		expect(extractTagRefTokens('conn.group.tag')).toEqual([]);
+		expect(extractTagRefTokens('conn.group.tag')).toEqual([]);
+		expect(extractTagRefTokens('conn　.group.tag')).toEqual([]);
+		expect(expressionReferencesExternalName('conn　.group.tag', 'conn.group.tag')).toBe(false);
 	});
 });
 
