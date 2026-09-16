@@ -85,6 +85,25 @@ export async function deleteAllWithRetries(
 }
 
 /**
+ * カタログの GET。**失敗したら落とす**（#380 レビュー対応13）: 黙って
+ * `return` すると `beforeAll` が**古いフィクスチャが残ったまま**先へ進み、
+ * `name` の UNIQUE 違反や一覧行数の増加で後続スペックを汚染する。DELETE の
+ * 失敗を致命扱いにしているのと同じ方針に揃える。
+ */
+async function getCatalog<T>(
+	request: APIRequestContext,
+	headers: Record<string, string>,
+	path: string
+): Promise<T> {
+	const res = await request.get(path, { headers });
+	expect(
+		res.ok(),
+		`GET ${path} が ${res.status()} で失敗しました（掃除を続けられません）: ${await res.text()}`
+	).toBe(true);
+	return (await res.json()) as T;
+}
+
+/**
  * `seedTagIds` のタグを（推移的に）参照している computed タグの id を、
  * **カタログ全体**から集めて返す（`seedTagIds` 自身も含む）。
  *
@@ -139,14 +158,13 @@ export async function cleanupFixtures(
 	headers: Record<string, string>,
 	target: FixtureCleanupTarget
 ): Promise<void> {
-	const connectionsRes = await request.get('/api/plc-connections', { headers });
-	const groupsRes = await request.get('/api/collection-groups', { headers });
-	const tagsRes = await request.get('/api/tags', { headers });
-	if (!connectionsRes.ok() || !groupsRes.ok() || !tagsRes.ok()) return;
-
-	const connections = (await connectionsRes.json()) as CatalogConnection[];
-	const groups = (await groupsRes.json()) as CatalogGroup[];
-	const tags = (await tagsRes.json()) as CatalogTag[];
+	const connections = await getCatalog<CatalogConnection[]>(
+		request,
+		headers,
+		'/api/plc-connections'
+	);
+	const groups = await getCatalog<CatalogGroup[]>(request, headers, '/api/collection-groups');
+	const tags = await getCatalog<CatalogTag[]>(request, headers, '/api/tags');
 
 	// 完全外部名（`{接続}.{グループ}.{タグ}`）- 参照判定に要る。
 	const connectionNameById = new Map(connections.map((c) => [c.id, c.name]));

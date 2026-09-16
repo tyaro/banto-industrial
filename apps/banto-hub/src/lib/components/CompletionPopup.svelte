@@ -11,6 +11,13 @@
 	export function completionOptionId(index: number): string {
 		return `${COMPLETION_LISTBOX_ID}-option-${index}`;
 	}
+
+	/**
+	 * 「他 N 件」メッセージの id。listbox の `aria-describedby` から指すので
+	 * 固定値で持つ（listbox 自体が同時に高々1つなのは
+	 * {@link COMPLETION_LISTBOX_ID} と同じ理由）。
+	 */
+	const COMPLETION_MORE_ID = `${COMPLETION_LISTBOX_ID}-more`;
 </script>
 
 <script lang="ts">
@@ -216,51 +223,60 @@
 	（`a11y_click_events_have_key_events` - キーボード操作は式欄側が担うので
 	ここには付けようがない）も避けられる。
 -->
-<div
-	class="completion-popup"
-	id={COMPLETION_LISTBOX_ID}
-	role="listbox"
-	aria-label="式の補完候補"
-	data-testid="expression-completion"
-	bind:this={listEl}
->
-	{#each candidates as candidate, i (`${candidate.kind}:${candidate.label}`)}
-		<div
-			class="completion-item"
-			class:active={i === activeIndex}
-			id={completionOptionId(i)}
-			role="option"
-			aria-selected={i === activeIndex}
-			tabindex="-1"
-			bind:this={itemEls[i]}
-			onmouseenter={() => onHover(i)}
-			onmousedown={(e) => {
-				e.preventDefault();
-				onSelect(i);
-			}}
-		>
-			<!--
+<div class="completion-popup" data-testid="expression-completion" bind:this={listEl}>
+	<!--
+		#380 レビュー対応13: **`role="listbox"` の直接の子は `role="option"` だけ**に
+		する。「他 N 件」のメッセージを listbox の中に置いていたため、支援技術が
+		それを不正な子として扱う（読み上げから落とす）可能性があった。メッセージは
+		listbox の外（このポップアップのコンテナ直下）へ出し、件数自体は
+		`aria-describedby` で listbox に結び付けて読み上げに残す。見た目は変えない
+		（スクロールするのは従来どおり外側のコンテナ）。
+	-->
+	<div
+		class="completion-list"
+		id={COMPLETION_LISTBOX_ID}
+		role="listbox"
+		aria-label="式の補完候補"
+		aria-describedby={totalCount > candidates.length ? COMPLETION_MORE_ID : undefined}
+	>
+		{#each candidates as candidate, i (`${candidate.kind}:${candidate.label}`)}
+			<div
+				class="completion-item"
+				class:active={i === activeIndex}
+				id={completionOptionId(i)}
+				role="option"
+				aria-selected={i === activeIndex}
+				tabindex="-1"
+				bind:this={itemEls[i]}
+				onmouseenter={() => onHover(i)}
+				onmousedown={(e) => {
+					e.preventDefault();
+					onSelect(i);
+				}}
+			>
+				<!--
 				#380 レビュー対応1: 1行目は候補の種別を問わず同じ並び
 				（種別 / 名前 / `detail`）にして見た目を揃え、組み込み関数だけが
 				持つ `description`（1行の日本語説明）は2行目へ回す。`detail` に
 				連結すると、タグ候補の「型・単位」と同じスロットに一文が入って
 				1行目が崩れるため。
 			-->
-			<div class="completion-line">
-				<span class="completion-kind">{KIND_LABELS[candidate.kind]}</span>
-				<span class="completion-label">{candidate.label}</span>
-				{#if candidate.detail}
-					<span class="completion-detail">{candidate.detail}</span>
+				<div class="completion-line">
+					<span class="completion-kind">{KIND_LABELS[candidate.kind]}</span>
+					<span class="completion-label">{candidate.label}</span>
+					{#if candidate.detail}
+						<span class="completion-detail">{candidate.detail}</span>
+					{/if}
+				</div>
+				{#if candidate.description}
+					<span class="completion-description">{candidate.description}</span>
 				{/if}
 			</div>
-			{#if candidate.description}
-				<span class="completion-description">{candidate.description}</span>
-			{/if}
-		</div>
-	{/each}
+		{/each}
+	</div>
 	{#if totalCount > candidates.length}
-		<!-- 上限で切った残り。候補ではないので `role="option"` にはしない。 -->
-		<div class="completion-more" data-testid="expression-completion-more">
+		<!-- 上限で切った残り。候補ではないので listbox の外に置く（上のコメント参照）。 -->
+		<div class="completion-more" id={COMPLETION_MORE_ID} data-testid="expression-completion-more">
 			他 {totalCount - candidates.length} 件（絞り込んでください）
 		</div>
 	{/if}
@@ -281,6 +297,12 @@
 		border: 1px solid var(--banto-border);
 		border-radius: var(--banto-radius);
 		box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+	}
+
+	/* listbox 本体。スクロールするのは外側のコンテナなので、ここは並びだけ持つ。 */
+	.completion-list {
+		display: flex;
+		flex-direction: column;
 	}
 
 	.completion-item {
