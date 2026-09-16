@@ -4776,6 +4776,74 @@ async fn tags_expression_check(
     )))
 }
 
+// --- #342 段階B: 組み込み関数表の配布（式欄のセグメント補完用） ------------
+
+/// `GET /api/tags/expression/functions` の応答要素。`banto_expr::
+/// BuiltinFunction` をそのまま wire 形（camelCase）へ写す。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExpressionFunctionEntry {
+    name: String,
+    arity: usize,
+    /// 補完候補に出す呼び出し形の見本（例: `if(条件, 真のとき, 偽のとき)`）。
+    signature: String,
+    /// 補完候補に出す1行の日本語説明。
+    description: String,
+}
+
+/// `GET /api/tags/expression/functions` の応答。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExpressionFunctionsResponse {
+    functions: Vec<ExpressionFunctionEntry>,
+}
+
+/// `GET /api/tags/expression/functions`（#342 段階B）: 式欄のセグメント補完に
+/// 出す**組み込み関数の一覧**を返す。
+///
+/// **なぜ API で配るのか**: 関数名と引数個数の正は
+/// `banto_expr::BUILTIN_FUNCTIONS`（型検査の `check_call` が読むのと同じ表）
+/// 1箇所だけにしたい。TS からは Rust の const を import できないので、
+/// 「フロントに関数表を手書きする」（＝2つ目の表を作ってドリフトさせる）
+/// 代わりにサーバーが配る。**内容は静的**（DB も設定も読まない）なので
+/// クライアントは1回取得してキャッシュしてよい。
+///
+/// 認可は `POST /api/tags/expression/check` と同じ `require_editor` -
+/// 式欄を触れるのは編集権限のあるユーザーだけで、補完もその式欄の付属機能
+/// だから（読み取り専用の内容ではあるが、ゲートを分けて2種類にしない）。
+/// MCP へは足さない（補完は UI 専用、#342 段階B 実装指示）。
+///
+/// `plc_connections_test`/`tags_expression_check` と同じ理由で意図的に
+/// `#[utoipa::path]` を付けず `ApiDoc` にも加えない（`/api/v1/*` のみを
+/// 文書化する既存方針）。
+async fn tags_expression_functions(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+) -> Result<Json<ExpressionFunctionsResponse>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.commissioning,
+        &state.audit,
+        &headers,
+        "tags",
+        "GET",
+        "/api/tags/expression/functions",
+    )
+    .await
+    .map_err(ApiError)?;
+    Ok(Json(ExpressionFunctionsResponse {
+        functions: banto_expr::BUILTIN_FUNCTIONS
+            .iter()
+            .map(|f| ExpressionFunctionEntry {
+                name: f.name.to_string(),
+                arity: f.arity,
+                signature: f.signature.to_string(),
+                description: f.description.to_string(),
+            })
+            .collect(),
+    }))
+}
+
 async fn tags_create(
     State(state): State<TagRegistryState>,
     headers: HeaderMap,
@@ -6413,6 +6481,13 @@ fn tag_registry_router(
         // 現在値によるプレビュー試算）。同じく `/api/tags` 直下の固定セグ
         // メントで `/api/tags/{id}` (i64) とは衝突しない。
         .route("/api/tags/expression/check", post(tags_expression_check))
+        // #342 段階B: 式欄のセグメント補完に出す組み込み関数表の配布
+        // （`tags_expression_functions` の doc comment 参照）。`/api/tags`
+        // 直下の固定セグメントなので `/api/tags/{id}` (i64) と衝突しない。
+        .route(
+            "/api/tags/expression/functions",
+            get(tags_expression_functions),
+        )
         .with_state(state)
         .layer(middleware::from_fn_with_state(
             AuthGate {

@@ -27,9 +27,16 @@
  * （`banto-hub-auth.ts` の注記参照）で、段階Aの `...-expression-check` の
  * 直後に並ぶ。前提データは UI ではなく `page.request` で直接 REST を叩いて
  * 作る（`banto-hub-tags-expression-check.spec.ts` と同じパターン）。
+ *
+ * #380 レビュー対応C（2026-09-16）: 式欄の locator を `getByLabel('式')` から
+ * `getByRole('textbox', { name: /^式（expression）/ })` へ変えた。式欄を包む
+ * ラッパーが `role="combobox"` + `aria-labelledby` で同じラベルを共有する
+ * ようになり、`getByLabel` が2要素に一致するため（詳細は
+ * `banto-hub-tags-expression-completion.spec.ts` 冒頭）。
  */
-import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 import { CSRF_HEADERS, fetchAuthToken, groupNodeByName, injectAuthToken } from './banto-hub-auth';
+import { cleanupFixtures } from './banto-hub-fixture-cleanup';
 
 const CONNECTION_NAME = 'e2e-expr-insert-plc';
 const GROUP_NAME = 'e2e-expr-insert-group';
@@ -55,6 +62,17 @@ const BASE_EXPRESSION = '( ) * 2';
 const CARET_OFFSET = 1;
 const EXPECTED_EXPRESSION = `(${REF_EXTERNAL_NAME} ) * 2`;
 
+/**
+ * 掃除の対象（共有ヘルパー `banto-hub-fixture-cleanup.ts` に渡す）。`calc` 予約
+ * 接続自体は消さず、その配下のグループとタグだけを消す。**`beforeAll` の先頭と
+ * `afterAll` の両方**で呼ぶ理由、削除順が式の参照に縛られること、対象グループの
+ * 外にいる参照元まで拾う理由は、すべてヘルパー側の doc comment に書いてある。
+ */
+const CLEANUP_TARGET = {
+	groupNames: [GROUP_NAME, CALC_GROUP_NAME],
+	connectionNames: [CONNECTION_NAME]
+};
+
 function waitForExpressionCheck(page: Page) {
 	return page.waitForResponse(
 		(res) =>
@@ -62,91 +80,6 @@ function waitForExpressionCheck(page: Page) {
 			res.request().method() === 'POST' &&
 			res.status() === 200
 	);
-}
-
-/**
- * この spec が使う固定名（`CONNECTION_NAME`/`GROUP_NAME`/`CALC_GROUP_NAME`）の
- * PLC接続・収集グループ・配下タグを、存在すれば掃除する
- * （`banto-hub-tags-revision.spec.ts::cleanupExistingFixtures` を写したもの
- * - 流儀をそちらに揃えている）。
- *
- * 2つの理由で `beforeAll` の先頭と `afterAll` の両方で呼ぶ:
- * - `plc_connections`/`collection_groups` は `name` が UNIQUE
- *   （`crates/banto-tags/migrations/0001,0002`）なので、失敗テストのリトライで
- *   `beforeAll` が再走すると前回の同名リソースで UNIQUE 違反になり
- *   `beforeAll` ごと落ちる。
- * - スイート全体で1つの DB を共有しており、残したタグが後続スペックの
- *   一覧行数を増やす（`banto-hub-tags-revision.spec.ts` 冒頭の doc comment
- *   にある「仮想化されたグリッドの描画窓」を押し上げる）。
- *
- * 削除順は **computed タグ → それ以外のタグ → グループ → 接続**。FK
- * （RESTRICT）だけでなく**式の参照**も順序を縛る: この spec の computed タグは
- * PLC タグ `REF_TAG_NAME` を参照しているので、PLC タグを先に消すとサーバーの
- * preflight（参照切れ）が 4xx で拒否し、続くグループ・接続の削除も FK で
- * 失敗してフィクスチャが丸ごと残る（#379 レビュー指摘）。
- *
- * **各 DELETE の応答を検証する**（204、または既に無い場合の 404 だけを許容）。
- * 握りつぶすと上のような失敗が静かに通り過ぎてしまう。
- *
- * 対象タグは**名前ではなく所属グループ**で拾うので、日本語名の
- * `JP_TAG_NAME`（テスト9で使う。`e2e-expr-insert-` 接頭辞を持たない）も
- * 自然に含まれる。`calc` 予約接続は削除しない（サーバー起動時に自動作成される
- * 共有リソース）ので、その配下のグループ（`CALC_GROUP_NAME`）とタグだけを消す。
- */
-async function expectDeleted(
-	request: APIRequestContext,
-	headers: Record<string, string>,
-	path: string
-): Promise<void> {
-	const res = await request.delete(path, { headers });
-	// 204 = 削除できた / 404 = 既に無い。それ以外（preflight 拒否の 4xx 等）は
-	// 掃除が効いていない合図なので、ここで落とす。
-	expect(
-		[204, 404],
-		`DELETE ${path} が ${res.status()} で失敗しました: ${await res.text()}`
-	).toContain(res.status());
-}
-
-async function cleanupExistingFixtures(
-	request: APIRequestContext,
-	headers: Record<string, string>
-): Promise<void> {
-	const groupsRes = await request.get('/api/collection-groups', { headers });
-	if (!groupsRes.ok()) return;
-	const groups = (await groupsRes.json()) as Array<{ id: number; name: string }>;
-	const targetGroups = groups.filter((g) => g.name === GROUP_NAME || g.name === CALC_GROUP_NAME);
-
-	if (targetGroups.length > 0) {
-		const tagsRes = await request.get('/api/tags', { headers });
-		if (tagsRes.ok()) {
-			const tags = (await tagsRes.json()) as Array<{
-				id: number;
-				collectionGroupId: number;
-				tagKind: string;
-			}>;
-			const groupIds = new Set(targetGroups.map((g) => g.id));
-			const targetTags = tags.filter((t) => groupIds.has(t.collectionGroupId));
-			// 参照元（computed）を先に消してから参照先（plc 等）を消す。
-			for (const tag of targetTags.filter((t) => t.tagKind === 'computed')) {
-				await expectDeleted(request, headers, `/api/tags/${tag.id}`);
-			}
-			for (const tag of targetTags.filter((t) => t.tagKind !== 'computed')) {
-				await expectDeleted(request, headers, `/api/tags/${tag.id}`);
-			}
-		}
-		for (const group of targetGroups) {
-			await expectDeleted(request, headers, `/api/collection-groups/${group.id}`);
-		}
-	}
-
-	const connectionsRes = await request.get('/api/plc-connections', { headers });
-	if (connectionsRes.ok()) {
-		const connections = (await connectionsRes.json()) as Array<{ id: number; name: string }>;
-		const existing = connections.find((c) => c.name === CONNECTION_NAME);
-		if (existing) {
-			await expectDeleted(request, headers, `/api/plc-connections/${existing.id}`);
-		}
-	}
 }
 
 /**
@@ -174,7 +107,7 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 
 		// 失敗テストのリトライで beforeAll が再走した場合に備え、前回分の
 		// 同名リソースを先に掃除しておく（初回実行では何もしない）。
-		await cleanupExistingFixtures(page.request, authedHeaders);
+		await cleanupFixtures(page.request, authedHeaders, CLEANUP_TARGET);
 
 		// 前提データ1: シミュレーションモードの PLC接続 + 収集グループ +
 		// 式から参照する PLC タグ1件（実 PLC/実ネットワークへは繋がない）。
@@ -283,8 +216,8 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 
 	test.afterAll(async () => {
 		// 後続スペックの一覧行数を増やさないよう、作ったフィクスチャは必ず
-		// 片付ける（`cleanupExistingFixtures` の doc comment 参照）。
-		await cleanupExistingFixtures(page.request, authedHeaders);
+		// 片付ける（`banto-hub-fixture-cleanup.ts` の doc comment 参照）。
+		await cleanupFixtures(page.request, authedHeaders, CLEANUP_TARGET);
 
 		// #379 レビュー対応: 掃除が実際に効いたことをサーバー側で確認する
 		// （削除順や preflight 拒否で残っていれば、ここで落ちる）。
@@ -311,7 +244,7 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 		const pane = page.getByRole('complementary', { name: '新規作成' });
 		await expect(pane).toBeVisible();
 
-		const expressionField = pane.getByLabel('式');
+		const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
 		await expect(expressionField).toBeVisible();
 		// #379 レビュー対応4: 式欄のラベルは `<label for="tag-expression">` の
 		// 明示形。`<label>` でフォーム全体を囲んでいた頃はトグルやエラー
@@ -367,6 +300,13 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 
 		// 挿入が `input` イベントとして流れ、段階Aのチェックが発火している。
 		await checkResponse;
+
+		// #380 レビュー対応1（段階B の回帰防止）: 挿入で流す**合成 `input`** を
+		// 打鍵と同じに扱うと、もう完成している参照に対してセグメント補完の
+		// ポップアップが開き、続くキー操作まで奪われてしまう。段階B 側は
+		// 「自動トリガーは式欄にフォーカスがあるときだけ」で除外している
+		// （この dispatch の時点ではフォーカスはグリッド側にある）。
+		await expect(page.getByTestId('expression-completion')).toHaveCount(0);
 	});
 
 	test('2. 挿入後は段階Aのプレビューの参照タグ一覧にそのタグが出る', async () => {
@@ -403,7 +343,7 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 		const pane = page.getByRole('complementary', { name: `${COMPUTED_TAG_NAME} を編集` });
 		await expect(pane).toBeVisible();
 
-		const expressionField = pane.getByLabel('式');
+		const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
 		await expect(expressionField).toHaveValue(`${REF_EXTERNAL_NAME} * 2`);
 
 		const toggle = pane.getByTestId('tag-expression-insert-toggle');
@@ -529,7 +469,7 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 
 			// `tagKind` は `calc` グループ由来で `computed` に確定しており式欄は
 			// 出るが、オーバーレイの下のグリッドを触れないのでトグルは出さない。
-			await expect(modal.getByLabel('式')).toBeVisible();
+			await expect(modal.getByRole('textbox', { name: /^式（expression）/ })).toBeVisible();
 			await expect(modal.getByTestId('tag-expression-insert-toggle')).toHaveCount(0);
 		} finally {
 			await narrowPage.close();
@@ -540,7 +480,7 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 		// テスト7で開いた新規作成ペイン（`tagKind === 'computed'`、式は空）を使う。
 		const pane = page.getByRole('complementary', { name: '新規作成' });
 		await expect(pane).toBeVisible();
-		const expressionField = pane.getByLabel('式');
+		const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
 		await expect(expressionField).toHaveValue('');
 
 		const toggle = pane.getByTestId('tag-expression-insert-toggle');

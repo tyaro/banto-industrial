@@ -35,6 +35,12 @@
  * 「参照タグ一覧が出ること」は実タグ参照で、「試算値が出ること（評価
  * できる/できないの両方を含む「試算値」欄自体の表示）」は数値が実際に
  * 出る経路として別途 0 参照の定数式で確認する、という2段構成にした。
+ *
+ * #380 レビュー対応C（2026-09-16）: 式欄の locator を `getByLabel('式')` から
+ * `getByRole('textbox', { name: /^式（expression）/ })` へ変えた。式欄を包む
+ * ラッパーが `role="combobox"` + `aria-labelledby` で同じラベルを共有する
+ * ようになり、`getByLabel` が2要素に一致するため（詳細は
+ * `banto-hub-tags-expression-completion.spec.ts` 冒頭）。
  */
 import { expect, test, type Page } from '@playwright/test';
 import { CSRF_HEADERS, fetchAuthToken, groupNodeByName, injectAuthToken } from './banto-hub-auth';
@@ -152,7 +158,7 @@ test.describe.serial('banto-hub 演算タグの式チェック API (#342 段階A
 		const drawer = page.getByRole('complementary', { name: '新規作成' });
 		await expect(drawer).toBeVisible();
 
-		const expressionField = drawer.getByLabel('式');
+		const expressionField = drawer.getByRole('textbox', { name: /^式（expression）/ });
 		await expect(expressionField).toBeVisible();
 
 		const checkResponse = waitForExpressionCheck(page);
@@ -175,7 +181,7 @@ test.describe.serial('banto-hub 演算タグの式チェック API (#342 段階A
 		// テスト1の続き - 同じ Drawer・同じ構文エラー状態を前提にする
 		// （テスト間で `page` を共有する `describe.serial` の作法どおり）。
 		const drawer = page.getByRole('complementary', { name: '新規作成' });
-		const expressionField = drawer.getByLabel('式');
+		const expressionField = drawer.getByRole('textbox', { name: /^式（expression）/ });
 		await expect(expressionField).toHaveValue('1 + ');
 
 		const errorButton = drawer.locator('#tag-expression-err');
@@ -191,7 +197,7 @@ test.describe.serial('banto-hub 演算タグの式チェック API (#342 段階A
 
 	test('3. 有効な式に直すと結果型・参照タグ一覧が出て、エラー表示は消える', async () => {
 		const drawer = page.getByRole('complementary', { name: '新規作成' });
-		const expressionField = drawer.getByLabel('式');
+		const expressionField = drawer.getByRole('textbox', { name: /^式（expression）/ });
 
 		const checkResponse = waitForExpressionCheck(page);
 		await expressionField.fill(`${REF_EXTERNAL_NAME} + 1`);
@@ -217,7 +223,7 @@ test.describe.serial('banto-hub 演算タグの式チェック API (#342 段階A
 
 	test('4. 参照0件の定数式は現在値なしで評価され、試算値に数値が出る', async () => {
 		const drawer = page.getByRole('complementary', { name: '新規作成' });
-		const expressionField = drawer.getByLabel('式');
+		const expressionField = drawer.getByRole('textbox', { name: /^式（expression）/ });
 
 		const checkResponse = waitForExpressionCheck(page);
 		await expressionField.fill('1 + 1');

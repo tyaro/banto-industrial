@@ -22,6 +22,11 @@
 //! 6. 参照が Bad: `preview.evaluated:false` + `reason`
 //! 7. `SourceTooLong`: `pos: null`
 //! 8. MCP `check_expression` 経由でも 1・2 と同じ結果になること
+//!
+//! #342 段階B で追加:
+//! 9. `GET /api/tags/expression/functions` が `banto_expr::BUILTIN_FUNCTIONS`
+//!    （型検査の `check_call` が読むのと同じ表）を name/arity 込みで配ること
+//!    （viewer が 403 になることは `tests/rbac.rs` の `require_editor` 表が見る）
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -714,4 +719,75 @@ async fn mcp_check_expression_without_admin_scope_is_rejected() {
     assert_eq!(body["result"]["isError"], true, "{body:?}");
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("missing_admin_scope"), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// 9. #342 段階B: `GET /api/tags/expression/functions` が
+//    `banto_expr::BUILTIN_FUNCTIONS`（型検査が読むのと同じ表）をそのまま配る
+// ---------------------------------------------------------------------------
+
+async fn admin_get(router: &Router, path: &str, token: &str) -> (StatusCode, Value) {
+    let response = router
+        .clone()
+        .oneshot(
+            HttpRequest::get(path)
+                .header("Authorization", format!("Bearer {token}"))
+                .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, json)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expression_functions_endpoint_mirrors_the_builtin_function_table() {
+    let app = test_app("functions").await;
+
+    let (status, body) = admin_get(
+        &app.router,
+        "/api/tags/expression/functions",
+        &app.admin_token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+
+    let functions = body["functions"].as_array().expect("functions array");
+    // 7関数（if/min/max/abs/round/clamp/bit）。件数を直書きするのは、表が
+    // 増減したときにこのテストと docs/CHANGELOG の記述を見直させるため。
+    assert_eq!(functions.len(), 7, "{body:?}");
+    assert_eq!(functions.len(), banto_expr::BUILTIN_FUNCTIONS.len());
+
+    // name と arity は `banto_expr::BUILTIN_FUNCTIONS`（`check_call` が
+    // 名前と引数個数を引くのと同じ表）と順序込みで一致すること - 表が2つに
+    // 割れてドリフトしていないことの確認（#342 段階B の単一ソース方針）。
+    for (entry, builtin) in functions.iter().zip(banto_expr::BUILTIN_FUNCTIONS.iter()) {
+        assert_eq!(entry["name"], builtin.name, "{entry:?}");
+        assert_eq!(
+            entry["arity"].as_u64(),
+            Some(builtin.arity as u64),
+            "{entry:?}"
+        );
+        // 補完の表示用フィールドは空にしない（UI がそのまま出すため）。
+        assert!(
+            !entry["signature"].as_str().unwrap_or("").is_empty(),
+            "{entry:?}"
+        );
+        assert!(
+            !entry["description"].as_str().unwrap_or("").is_empty(),
+            "{entry:?}"
+        );
+        // `signature` は呼び出し形の見本なので、必ず関数名で始まり `(` を含む。
+        let signature = entry["signature"].as_str().unwrap();
+        assert!(
+            signature.starts_with(&format!("{}(", builtin.name)),
+            "{entry:?}"
+        );
+    }
 }

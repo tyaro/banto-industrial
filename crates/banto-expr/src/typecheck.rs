@@ -19,16 +19,75 @@ use crate::ast::{BinOp, Expr, UnaryOp};
 use crate::error::CompileError;
 use crate::types::Type;
 
+/// 組み込み関数1件のメタデータ（[`BUILTIN_FUNCTIONS`] の要素）。
+///
+/// #342 段階B（式欄のセグメント補完）で `name`/`arity` だけの
+/// `&[(&str, usize)]` から構造体へ広げた。`signature`/`description` は
+/// **UI の補完候補に添える表示用**で、型検査そのものは使わない
+/// （引数の型は [`check_call`] の `match` が個別に見る - 表を2つに割って
+/// ドリフトさせないため、名前と引数個数の正はここ1箇所のまま）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuiltinFunction {
+    /// 関数名（識別子として書ける ASCII）。
+    pub name: &'static str,
+    /// 固定引数個数（可変長引数はない、§4.2）。
+    pub arity: usize,
+    /// 補完候補に出す呼び出し形の見本（引数名は日本語）。
+    pub signature: &'static str,
+    /// 補完候補に出す1行の日本語説明。
+    pub description: &'static str,
+}
+
 /// 既知の関数と固定引数個数。`if`/`min`/`max`/`abs`/`round`/`clamp`/`bit`
 /// のみ（可変長引数・ユーザー定義関数はない、§4.2）。
-const KNOWN_FUNCTIONS: &[(&str, usize)] = &[
-    ("if", 3),
-    ("min", 2),
-    ("max", 2),
-    ("abs", 1),
-    ("round", 1),
-    ("clamp", 3),
-    ("bit", 2),
+///
+/// **この表が関数名・引数個数の単一ソース**: [`check_call`] がここから
+/// 名前と引数個数を引き、banto-hub の `GET /api/tags/expression/functions`
+/// （`apps/banto-hub/core/src/rest.rs::tags_expression_functions`）が
+/// そのまま UI へ配る（フロントに関数表を手書きしない - #342 段階B）。
+pub const BUILTIN_FUNCTIONS: &[BuiltinFunction] = &[
+    BuiltinFunction {
+        name: "if",
+        arity: 3,
+        signature: "if(条件, 真のとき, 偽のとき)",
+        description: "条件（Bool）が真なら第2引数、偽なら第3引数を返します（第2・第3は同じ型）。",
+    },
+    BuiltinFunction {
+        name: "min",
+        arity: 2,
+        signature: "min(値1, 値2)",
+        description: "2つの数値のうち小さい方を返します。",
+    },
+    BuiltinFunction {
+        name: "max",
+        arity: 2,
+        signature: "max(値1, 値2)",
+        description: "2つの数値のうち大きい方を返します。",
+    },
+    BuiltinFunction {
+        name: "abs",
+        arity: 1,
+        signature: "abs(値)",
+        description: "絶対値を返します。",
+    },
+    BuiltinFunction {
+        name: "round",
+        arity: 1,
+        signature: "round(値)",
+        description: "四捨五入します（0から遠い方向へ丸めます: round(2.5) = 3）。",
+    },
+    BuiltinFunction {
+        name: "clamp",
+        arity: 3,
+        signature: "clamp(値, 下限, 上限)",
+        description: "値を下限〜上限の範囲に収めます。",
+    },
+    BuiltinFunction {
+        name: "bit",
+        arity: 2,
+        signature: "bit(タグ, ビット番号)",
+        description: "タグ参照の下位16ビットから指定ビット（0〜15の整数リテラル）を取り出します。",
+    },
 ];
 
 /// `expr` を型検査し、結果型を返す。参照したタグ参照の外部名を出現順
@@ -111,7 +170,12 @@ fn check_call(
     pos: usize,
     refs: &mut Vec<String>,
 ) -> Result<Type, CompileError> {
-    let Some(&(fn_name, arity)) = KNOWN_FUNCTIONS.iter().find(|(n, _)| *n == name) else {
+    let Some(&BuiltinFunction {
+        name: fn_name,
+        arity,
+        ..
+    }) = BUILTIN_FUNCTIONS.iter().find(|f| f.name == name)
+    else {
         return Err(CompileError::UnknownFunction {
             pos,
             name: name.to_string(),
@@ -184,7 +248,7 @@ fn check_call(
             Ok(Type::Num)
         }
         "bit" => check_bit(&args[0], &args[1], refs),
-        _ => unreachable!("KNOWN_FUNCTIONS と match の分岐が食い違っています: {fn_name}"),
+        _ => unreachable!("BUILTIN_FUNCTIONS と match の分岐が食い違っています: {fn_name}"),
     }
 }
 

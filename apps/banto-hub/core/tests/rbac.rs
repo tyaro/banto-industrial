@@ -9,8 +9,16 @@
 //! (t12 のものをベースにした)。
 //!
 //! テスト構成:
-//! 1. `require_editor`ゲート(rest.rs 全14箇所 - #342 段階Aで
-//!    `POST /api/tags/expression/check` が加わった)- viewer は全対象で 403
+//! 1. `require_editor`ゲート - viewer は全対象で 403。**対象はタグ・PLC接続・
+//!    収集グループの CRUD 系 15 箇所**(#342 段階Aで
+//!    `POST /api/tags/expression/check`、段階Bで
+//!    `GET /api/tags/expression/functions` が加わった)。
+//!    **`rest.rs` の `require_editor` 呼び出し全体ではない** - 2026-09-16 時点で
+//!    呼び出しは 20 箇所あり、`plc_connections_test_saved` /
+//!    `collection_groups_describe` / `sink_groups_create`/`_update`/`_delete` の
+//!    5 箇所はこの表の対象外(それぞれの機能の spec で確認している)。
+//!    数え方: `grep -c "require_editor(" apps/banto-hub/core/src/rest.rs` から
+//!    定義そのもの 1 行を引く。ずれていたらこの注記ごと直すこと。
 //! 2. editor は`require_editor`ゲートを通って実際に書ける(admin も同様)
 //! 3. admin 限定ルート(`RoleGuard{min: Role::Admin}`)- editor/viewer は
 //!    403、admin は実際にそのルートへ到達し認可を通過して2xxを返す
@@ -285,9 +293,13 @@ fn valid_tag_payload(name: &str, group_id: i64) -> Value {
 }
 
 // ---------------------------------------------------------------------------
-// T1: `require_editor`ゲート - viewer は全対象で 403(rest.rs の
-// `require_editor`呼び出し全14箇所、method+path。#342 段階Aで
-// `POST /api/tags/expression/check` が13→14箇所目として加わった)
+// T1: `require_editor`ゲート - viewer は全対象で 403。**この表が対象にするのは
+// タグ・PLC接続・収集グループの CRUD 系 15 箇所**(method+path。#342 段階Aで
+// `POST /api/tags/expression/check` が13→14件目、段階Bで
+// `GET /api/tags/expression/functions` が15件目として加わった)。
+// `rest.rs` の `require_editor` 呼び出しはこれで全部ではない(2026-09-16 時点で
+// 20 箇所 - 詳細はこのファイル冒頭の doc comment)。ここへ足すときは
+// 「CRUD 系の入口が増えた」ときで、件数の記述も一緒に直すこと。
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -341,6 +353,11 @@ async fn viewer_is_forbidden_by_require_editor_on_every_gated_write_endpoint() {
             "/api/tags/expression/check",
             json!({ "expression": "1" }),
         ),
+        // #342 段階B: 補完に出す組み込み関数表の配布。読み取り専用の静的な
+        // 内容だが、式欄の付属機能なのでゲートは式チェックと同じ
+        // `require_editor` に揃えている(実装指示)。GET なので body は無視
+        // されるが、表の型を揃えるため空オブジェクトを渡す。
+        ("GET", "/api/tags/expression/functions", json!({})),
     ];
 
     for (method, path, payload) in cases {

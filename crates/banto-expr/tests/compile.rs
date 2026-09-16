@@ -642,3 +642,60 @@ fn only_space_tab_lf_cr_are_skipped_as_whitespace() {
         );
     }
 }
+
+// ---------- #342 段階B: 公開した組み込み関数表（BUILTIN_FUNCTIONS） ----------
+
+/// `BUILTIN_FUNCTIONS` は **`check_call` が名前と引数個数を引くのと同じ表**
+/// （`typecheck.rs` の doc comment 参照）。banto-hub の
+/// `GET /api/tags/expression/functions` がこれをそのまま UI の補完へ配るので、
+/// 「表に載っているのに呼べない」「引数個数が食い違う」が起きないことを
+/// **実際にコンパイルして**固定する。
+#[test]
+fn every_builtin_function_entry_compiles_with_its_declared_arity() {
+    // `bit` だけは第2引数が 0〜15 の整数リテラルに限られ、第1引数も
+    // タグ参照でなければならない（`bad_bit_target`/`bad_bit_index`）ので、
+    // 引数の作り方を関数ごとに変える。
+    fn call_with(name: &str, arity: usize) -> String {
+        let args: Vec<String> = match name {
+            // `if` の第1引数だけ Bool が要る。
+            "if" => (0..arity)
+                .map(|i| if i == 0 { "true" } else { "1" }.to_string())
+                .collect(),
+            "bit" => (0..arity)
+                .map(|i| if i == 0 { "line1.fast.a" } else { "0" }.to_string())
+                .collect(),
+            _ => (0..arity).map(|i| (i + 1).to_string()).collect(),
+        };
+        format!("{name}({})", args.join(", "))
+    }
+
+    assert_eq!(banto_expr::BUILTIN_FUNCTIONS.len(), 7);
+    for f in banto_expr::BUILTIN_FUNCTIONS {
+        assert_compiles(&call_with(f.name, f.arity));
+        // 1つ多い引数は必ず ArityMismatch（＝表の `arity` が実装と一致している）。
+        assert!(
+            matches!(
+                assert_rejected(&call_with(f.name, f.arity + 1)),
+                CompileError::ArityMismatch { .. }
+            ),
+            "{} should reject {} args",
+            f.name,
+            f.arity + 1
+        );
+        // 1つ少ない引数も同じく ArityMismatch（#380 レビュー対応: 以前は
+        // 「多い」側しか見ておらず、表の `arity` が実装より小さくてもこの
+        // テストを通り抜けられた）。`arity == 0` の関数は現状無いが、将来
+        // 足されたときに `arity - 1` が underflow しないようガードする。
+        if f.arity >= 1 {
+            assert!(
+                matches!(
+                    assert_rejected(&call_with(f.name, f.arity - 1)),
+                    CompileError::ArityMismatch { .. }
+                ),
+                "{} should reject {} args",
+                f.name,
+                f.arity - 1
+            );
+        }
+    }
+}
