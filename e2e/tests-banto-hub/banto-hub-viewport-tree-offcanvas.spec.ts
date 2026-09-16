@@ -48,9 +48,18 @@ const TAG_A = 'e2e-tree-oc-tag-a';
 const TAG_B = 'e2e-tree-oc-tag-b';
 const TAG_B_EXTERNAL = `${CONNECTION_NAME}.${GROUP_B}.${TAG_B}`;
 
+/**
+ * テスト34 用の別フィクスチャ。ここまでのテストで `TAG_A`/`TAG_B`（削除の検証）と
+ * `CONNECTION_NAME`（接続削除の検証）を消しているので、最後のテストは自前で
+ * 作り直す。
+ */
+const CONNECTION_2 = 'e2e-tree-oc-plc2';
+const GROUP_C = 'e2e-tree-oc-group-c';
+const TAG_C = 'e2e-tree-oc-tag-c';
+
 const CLEANUP_TARGET = {
-	groupNames: [GROUP_A, GROUP_B],
-	connectionNames: [CONNECTION_NAME]
+	groupNames: [GROUP_A, GROUP_B, GROUP_C],
+	connectionNames: [CONNECTION_NAME, CONNECTION_2]
 };
 
 test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378)', () => {
@@ -965,6 +974,74 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 			)
 			.toBe(true);
 
+		await page.setViewportSize(NARROW_VIEWPORT);
+	});
+
+	test('34. 開けなかったメニュー操作では戻し先を紐付けない（#381 レビュー対応17回目）', async () => {
+		// 未保存確認のキャンセルで `open*` が早期 return したのに紐付けていると、
+		// **後で別の Drawer を閉じたときに無関係なノードへフォーカスが戻る**。
+		// ここまでのテストで元のフィクスチャは消しているので、専用に作り直す。
+		const connectionRes = await page.request.post('/api/plc-connections', {
+			headers: authedHeaders,
+			data: {
+				name: CONNECTION_2,
+				protocol: 'modbus-tcp',
+				host: '127.0.0.1',
+				port: 502,
+				unitId: 1,
+				enabled: true,
+				simulation: true
+			}
+		});
+		expect(connectionRes.ok()).toBe(true);
+		const connection2 = (await connectionRes.json()) as { id: number };
+		const groupRes = await page.request.post('/api/collection-groups', {
+			headers: authedHeaders,
+			data: { name: GROUP_C, plcConnectionId: connection2.id, periodMs: 1000, enabled: true }
+		});
+		expect(groupRes.ok()).toBe(true);
+		const groupC = (await groupRes.json()) as { id: number };
+		const tagRes = await page.request.post('/api/tags', {
+			headers: authedHeaders,
+			data: {
+				name: TAG_C,
+				collectionGroupId: groupC.id,
+				address: '40401',
+				dataType: 'i16',
+				decimals: 0,
+				enabled: true,
+				writable: false,
+				tagKind: 'plc'
+			}
+		});
+		expect(tagRes.ok()).toBe(true);
+
+		await page.setViewportSize({ width: 1280, height: 800 });
+		await page.goto('/tags');
+		await page.getByPlaceholder('名前・アドレスで検索').fill(TAG_C);
+		const row = page.getByRole('gridcell', { name: TAG_C, exact: true });
+		await row.click();
+		const editPane = page.getByRole('complementary', { name: `${TAG_C} を編集` });
+		await expect(editPane).toBeVisible();
+		// 未保存にする（広幅の編集は非モーダルの右ペイン - #375）。
+		await editPane.getByLabel('単位').fill('℃');
+
+		// ツリーのノードを右クリック →「再設定」→ 破棄確認をキャンセル（開かない）。
+		const node = groupNodeByName(page, GROUP_C);
+		await node.click({ button: 'right' });
+		page.once('dialog', (dialog) => void dialog.dismiss());
+		await page.getByRole('menuitem', { name: '収集グループを再設定', exact: true }).click();
+		await expect(page.getByRole('dialog', { name: `${GROUP_C} を編集` })).toHaveCount(0);
+		await expect(editPane).toBeVisible();
+
+		// 編集ペインを閉じる（未保存なので確認を OK）。フォーカスは右クリックした
+		// ノードへは行かない（紐付いていない）。
+		page.once('dialog', (dialog) => void dialog.accept());
+		await editPane.getByRole('button', { name: '閉じる' }).click();
+		await expect(editPane).toHaveCount(0);
+		await expect(node).not.toBeFocused();
+
+		await page.getByPlaceholder('名前・アドレスで検索').fill('');
 		await page.setViewportSize(NARROW_VIEWPORT);
 	});
 });

@@ -1332,8 +1332,8 @@
 	};
 	let editConflict: EditConflict | null = $state(null);
 
-	function selectTag(t: Tag): void {
-		if (!confirmDiscardIfNeeded()) return;
+	function selectTag(t: Tag): boolean {
+		if (!confirmDiscardIfNeeded()) return false;
 		selected = t;
 		editForm = formFromTag(t);
 		editBaseline = formFromTag(t);
@@ -1349,6 +1349,7 @@
 		// モード遷移・対象切替をまとめて OFF にする。
 		lastTreeMenuNodeEl = null;
 		drawerMode = 'edit'; // T13-1: 行クリック編集はドロワーで開く
+		return true;
 	}
 
 	/**
@@ -2791,8 +2792,8 @@
 	 * 出ないため到達しない）の場合は、フォールバックとして旧来どおり空の
 	 * `tagKind: 'plc'` から始める未確定フォームを開く。
 	 */
-	function openCreateDrawer(): void {
-		if (!confirmDiscardIfNeeded()) return;
+	function openCreateDrawer(): boolean {
+		if (!confirmDiscardIfNeeded()) return false;
 		const target = registrationTarget;
 		const next = blankForm();
 		if (target !== null) {
@@ -2817,6 +2818,7 @@
 		createWritableTouched = false;
 		lastTreeMenuNodeEl = null;
 		drawerMode = 'create';
+		return true;
 	}
 
 	/**
@@ -2837,8 +2839,8 @@
 	 * 満たされる）。`duplicateSource` に複製元タグを保持し、`duplicateDiff`
 	 * （上で宣言済みの `$derived`）が保存前の差分パネルに使う。
 	 */
-	function openDuplicateDrawer(t: Tag): void {
-		if (!confirmDiscardIfNeeded()) return;
+	function openDuplicateDrawer(t: Tag): boolean {
+		if (!confirmDiscardIfNeeded()) return false;
 		// 2026-08-31 オーナー決定: タグ名の一意性は全体一意→収集グループ内一意へ
 		// 緩和された（サーバー側 `crates/banto-tags` migration 0011）。複製名が
 		// 避けるべき既存名も複製元と同じ収集グループ内のものだけでよい -
@@ -2875,6 +2877,7 @@
 		createGroupLocked = false;
 		lastTreeMenuNodeEl = null;
 		drawerMode = 'create';
+		return true;
 	}
 
 	/**
@@ -2891,8 +2894,8 @@
 	 * （`continuousNamePatternTouched` 宣言のコメント参照）は変えていない -
 	 * 上書きするのは対象グループの1フィールドのみ。
 	 */
-	function openContinuousDrawer(): void {
-		if (!confirmDiscardIfNeeded()) return;
+	function openContinuousDrawer(): boolean {
+		if (!confirmDiscardIfNeeded()) return false;
 		continuousBaseline = blankContinuousForm();
 		editConflict = null;
 		if (registrationTarget !== null && registrationTarget.supportsContinuous) {
@@ -2900,13 +2903,15 @@
 		}
 		lastTreeMenuNodeEl = null;
 		drawerMode = 'continuous';
+		return true;
 	}
 
-	function openCsvDrawer(): void {
-		if (!confirmDiscardIfNeeded()) return;
+	function openCsvDrawer(): boolean {
+		if (!confirmDiscardIfNeeded()) return false;
 		editConflict = null;
 		lastTreeMenuNodeEl = null;
 		drawerMode = 'csv';
+		return true;
 	}
 
 	function closeDrawer(): void {
@@ -3150,6 +3155,9 @@
 	 * 呼ぶので、閉じる側で同期的に消すと「ノードはまだ在るのに戻せない」になる。
 	 * 各 open 系関数が自分でクリアし、メニュー経由の
 	 * `activateTreeContextMenuAction` だけが open のあとに紐付け直す。
+	 * **紐付けるのは open 系関数が `true`（実際に開いた）を返したときだけ**
+	 * （#381 レビュー対応17回目）- 未保存確認のキャンセルや別 Drawer による拒否で
+	 * 開かなかった経路では、前の紐付けをそのまま保つ。
 	 */
 	let lastTreeMenuNodeEl: HTMLElement | null = null;
 
@@ -3256,28 +3264,30 @@
 		return true;
 	}
 
-	function openConnectionCreateDrawer(): void {
-		if (blockedByOtherResourceDrawer('connection')) return;
-		if (!confirmDiscardIfNeeded()) return;
+	function openConnectionCreateDrawer(): boolean {
+		if (blockedByOtherResourceDrawer('connection')) return false;
+		if (!confirmDiscardIfNeeded()) return false;
 		closeDrawer(); // タグ Drawer が開いていれば閉じる（同時に複数 Drawer を出さない）。
 		connectionDrawerTarget = null;
 		connectionDrawerRequestDelete = false;
 		connectionDrawerReadOnly = false;
 		lastTreeMenuNodeEl = null;
 		connectionDrawerOpen = true;
+		return true;
 	}
 
-	function openConnectionEditDrawer(connectionId: number): void {
-		if (blockedByOtherResourceDrawer('connection')) return;
+	function openConnectionEditDrawer(connectionId: number): boolean {
+		if (blockedByOtherResourceDrawer('connection')) return false;
 		const target = connections.find((c) => c.id === connectionId);
-		if (!target) return; // 通常起きない（右クリック直後は必ず存在する）が、念のため無視する。
-		if (!confirmDiscardIfNeeded()) return;
+		if (!target) return false; // 通常起きない（右クリック直後は必ず存在する）が、念のため無視する。
+		if (!confirmDiscardIfNeeded()) return false;
 		closeDrawer();
 		connectionDrawerTarget = target;
 		connectionDrawerRequestDelete = false;
 		connectionDrawerReadOnly = false;
 		lastTreeMenuNodeEl = null;
 		connectionDrawerOpen = true;
+		return true;
 	}
 
 	/**
@@ -3290,17 +3300,18 @@
 	 * する理由が無い - `resolveReadOnlyTreeContextMenuItems` の doc comment
 	 * と同じ理由）。
 	 */
-	function openConnectionViewDrawer(connectionId: number): void {
-		if (blockedByOtherResourceDrawer('connection')) return;
+	function openConnectionViewDrawer(connectionId: number): boolean {
+		if (blockedByOtherResourceDrawer('connection')) return false;
 		const target = connections.find((c) => c.id === connectionId);
-		if (!target) return;
-		if (!confirmDiscardIfNeeded()) return;
+		if (!target) return false;
+		if (!confirmDiscardIfNeeded()) return false;
 		closeDrawer();
 		connectionDrawerTarget = target;
 		connectionDrawerRequestDelete = false;
 		connectionDrawerReadOnly = true;
 		lastTreeMenuNodeEl = null;
 		connectionDrawerOpen = true;
+		return true;
 	}
 
 	/**
@@ -3310,17 +3321,18 @@
 	 * 扱いは `ConnectionDrawer.svelte::handleDelete` の実装をそのまま使い、
 	 * ここでは独自の削除処理を持たない（実装指示の制約）。
 	 */
-	function openConnectionDeleteFlow(connectionId: number): void {
-		if (blockedByOtherResourceDrawer('connection')) return;
+	function openConnectionDeleteFlow(connectionId: number): boolean {
+		if (blockedByOtherResourceDrawer('connection')) return false;
 		const target = connections.find((c) => c.id === connectionId);
-		if (!target) return;
-		if (!confirmDiscardIfNeeded()) return;
+		if (!target) return false;
+		if (!confirmDiscardIfNeeded()) return false;
 		closeDrawer();
 		connectionDrawerTarget = target;
 		connectionDrawerRequestDelete = true;
 		connectionDrawerReadOnly = false;
 		lastTreeMenuNodeEl = null;
 		connectionDrawerOpen = true;
+		return true;
 	}
 
 	function closeConnectionDrawer(): void {
@@ -3344,9 +3356,9 @@
 	 * 渡してプリセットする - 呼び出し元によって挙動を変えるため、
 	 * `presetConnectionId` は省略可能にした（既定 `null` = 未選択）。
 	 */
-	function openGroupCreateDrawer(presetConnectionId: number | null = null): void {
-		if (blockedByOtherResourceDrawer('group')) return;
-		if (!confirmDiscardIfNeeded()) return;
+	function openGroupCreateDrawer(presetConnectionId: number | null = null): boolean {
+		if (blockedByOtherResourceDrawer('group')) return false;
+		if (!confirmDiscardIfNeeded()) return false;
 		closeDrawer();
 		groupDrawerTarget = null;
 		groupDrawerPresetConnectionId = presetConnectionId;
@@ -3354,13 +3366,14 @@
 		groupDrawerReadOnly = false;
 		lastTreeMenuNodeEl = null;
 		groupDrawerOpen = true;
+		return true;
 	}
 
-	function openGroupEditDrawer(groupId: number): void {
-		if (blockedByOtherResourceDrawer('group')) return;
+	function openGroupEditDrawer(groupId: number): boolean {
+		if (blockedByOtherResourceDrawer('group')) return false;
 		const target = groups.find((g) => g.id === groupId);
-		if (!target) return;
-		if (!confirmDiscardIfNeeded()) return;
+		if (!target) return false;
+		if (!confirmDiscardIfNeeded()) return false;
 		closeDrawer();
 		groupDrawerTarget = target;
 		groupDrawerPresetConnectionId = null;
@@ -3368,6 +3381,7 @@
 		groupDrawerReadOnly = false;
 		lastTreeMenuNodeEl = null;
 		groupDrawerOpen = true;
+		return true;
 	}
 
 	/**
@@ -3375,11 +3389,11 @@
 	 * `openConnectionViewDrawer` と対になる読み取り専用版 - virtual 接続
 	 * （calc/mem）配下のグループでも制限しない。
 	 */
-	function openGroupViewDrawer(groupId: number): void {
-		if (blockedByOtherResourceDrawer('group')) return;
+	function openGroupViewDrawer(groupId: number): boolean {
+		if (blockedByOtherResourceDrawer('group')) return false;
 		const target = groups.find((g) => g.id === groupId);
-		if (!target) return;
-		if (!confirmDiscardIfNeeded()) return;
+		if (!target) return false;
+		if (!confirmDiscardIfNeeded()) return false;
 		closeDrawer();
 		groupDrawerTarget = target;
 		groupDrawerPresetConnectionId = null;
@@ -3387,6 +3401,7 @@
 		groupDrawerReadOnly = true;
 		lastTreeMenuNodeEl = null;
 		groupDrawerOpen = true;
+		return true;
 	}
 
 	/**
@@ -3395,11 +3410,11 @@
 	 * で既存の `handleDelete`（タグが参照している場合の Validation エラーを
 	 * 含む）を1回だけ呼ばせる。
 	 */
-	function openGroupDeleteFlow(groupId: number): void {
-		if (blockedByOtherResourceDrawer('group')) return;
+	function openGroupDeleteFlow(groupId: number): boolean {
+		if (blockedByOtherResourceDrawer('group')) return false;
 		const target = groups.find((g) => g.id === groupId);
-		if (!target) return;
-		if (!confirmDiscardIfNeeded()) return;
+		if (!target) return false;
+		if (!confirmDiscardIfNeeded()) return false;
 		closeDrawer();
 		groupDrawerTarget = target;
 		groupDrawerPresetConnectionId = null;
@@ -3407,6 +3422,7 @@
 		groupDrawerReadOnly = false;
 		lastTreeMenuNodeEl = null;
 		groupDrawerOpen = true;
+		return true;
 	}
 
 	function closeGroupDrawer(): void {
@@ -3440,39 +3456,46 @@
 		// 右クリックしたノードを紐付ける（下の open系関数は各自
 		// `lastTreeMenuNodeEl` をクリアするので、セットは呼び出しの後）。
 		const node = treeContextMenu?.triggerEl ?? null;
+		let opened = false;
 		switch (action.kind) {
 			case 'createTag':
-				openCreateDrawer();
+				opened = openCreateDrawer();
 				break;
 			case 'createConnection':
-				openConnectionCreateDrawer();
+				opened = openConnectionCreateDrawer();
 				break;
 			case 'createGroup':
 				// S3: postgres（DB Source）接続配下でも通常どおり Drawer を開く
 				// - S1 の disabled ガード（`action.disabled`）は撤去済み
 				// （`tagTreeContextMenu.ts`参照）。
-				openGroupCreateDrawer(action.connectionId);
+				opened = openGroupCreateDrawer(action.connectionId);
 				break;
 			case 'reconfigureConnection':
-				openConnectionEditDrawer(action.connectionId);
+				opened = openConnectionEditDrawer(action.connectionId);
 				break;
 			case 'deleteConnection':
-				openConnectionDeleteFlow(action.connectionId);
+				opened = openConnectionDeleteFlow(action.connectionId);
 				break;
 			case 'reconfigureGroup':
-				openGroupEditDrawer(action.groupId);
+				opened = openGroupEditDrawer(action.groupId);
 				break;
 			case 'deleteGroup':
-				openGroupDeleteFlow(action.groupId);
+				opened = openGroupDeleteFlow(action.groupId);
 				break;
 			case 'viewConnection':
-				openConnectionViewDrawer(action.connectionId);
+				opened = openConnectionViewDrawer(action.connectionId);
 				break;
 			case 'viewGroup':
-				openGroupViewDrawer(action.groupId);
+				opened = openGroupViewDrawer(action.groupId);
 				break;
 		}
-		lastTreeMenuNodeEl = node;
+		// #381 レビュー対応17回目: **実際に開けたときだけ**紐付ける。未保存確認の
+		// キャンセル（`confirmDiscardIfNeeded`）や、別の resource Drawer が開いて
+		// いることによる拒否（`blockedByOtherResourceDrawer`）で開かなかった場合に
+		// 紐付けると、**後で別の Drawer を閉じたときに無関係なノードへフォーカスが
+		// 戻る**。開けなかった経路では前の状態をそのまま保つ（open 系関数は自分が
+		// 開くときにだけ `lastTreeMenuNodeEl` をクリアする）。
+		if (opened) lastTreeMenuNodeEl = node;
 	}
 
 	/**
@@ -3776,8 +3799,8 @@
 	 * 構造体登録も PLC アドレスの算術前提の機能のため、対象は
 	 * `registrationTarget.supportsContinuous` なグループに限る。
 	 */
-	function openStructDrawer(): void {
-		if (!confirmDiscardIfNeeded()) return;
+	function openStructDrawer(): boolean {
+		if (!confirmDiscardIfNeeded()) return false;
 		structBaseline = blankStructForm();
 		editConflict = null;
 		if (registrationTarget !== null && registrationTarget.supportsContinuous) {
@@ -3785,6 +3808,7 @@
 		}
 		lastTreeMenuNodeEl = null;
 		drawerMode = 'struct';
+		return true;
 	}
 
 	/** 入力が変わるたびに再計算される、割付前プレビュー本体。 */
