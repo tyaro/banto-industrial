@@ -90,11 +90,35 @@
 				event.preventDefault();
 				if (selectedCommand) void executeCommand(selectedCommand);
 				break;
-			case 'Escape':
-				event.preventDefault();
-				commandPaletteStore.hide();
-				break;
+			// Escape は**window 側**（`handleWindowKeydown`）で処理する -
+			// 層の約束（`escLayering.ts` の doc、項目3）。ここ（検索 input の
+			// `onkeydown`）だけで閉じていると、フォーカスがパレットの外へ出た
+			// 状態（Shift+Tab 等。この部品はフォーカストラップを持たない）の
+			// Esc でパレットが閉じず、かつ下の層はみな「可視な上位層がある」と
+			// 見て譲るので、**Esc が何も閉じない**状態になる。
 		}
+	}
+
+	/**
+	 * #381 レビュー対応6回目: フォーカス位置に依存しない Esc（層の約束・項目3、
+	 * `escLayering.ts`）。閉じるときは `preventDefault` して下の層へ伝える
+	 * （項目1）ところは `Drawer.svelte`/`Modal.svelte` と同じ。
+	 *
+	 * **譲る相手は見ない**（`hasVisibleLayerAbove` を使わない）: パレットは
+	 * この app の**最上位層**（z-index 1000。同じ 1000 の `TreeContextMenu` は
+	 * パレットの外側クリックで閉じるため同時に開かない）なので、自分より手前の
+	 * 層が存在しない。`hasVisibleLayerAbove({ except: 自分 })` は「自分以外の
+	 * 可視な層」しか見ないので、**下にある Drawer を「手前の層」と誤認して譲り、
+	 * Esc で何も閉じなくなる**（E2E で実測）。パレットより手前に出る UI を将来
+	 * 足すなら、ここに上下関係の判定を入れること。
+	 *
+	 * この部品は `commandPaletteStore.open` のときだけマウントされるので
+	 * `open` の判定は不要。
+	 */
+	function handleWindowKeydown(event: KeyboardEvent): void {
+		if (event.key !== 'Escape' || event.defaultPrevented) return;
+		event.preventDefault();
+		commandPaletteStore.hide();
 	}
 
 	function handleWindowPointerDown(event: PointerEvent): void {
@@ -104,7 +128,7 @@
 	}
 </script>
 
-<svelte:window onpointerdown={handleWindowPointerDown} />
+<svelte:window onpointerdown={handleWindowPointerDown} onkeydown={handleWindowKeydown} />
 
 <div class="overlay">
 	<div

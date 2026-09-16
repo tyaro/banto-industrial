@@ -398,7 +398,32 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await page.getByPlaceholder('名前・アドレスで検索').fill('');
 	});
 
-	test('12. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
+	test('12. コマンドパレットはフォーカスが外に出ていても Esc で閉じる（#381 レビュー対応6回目）', async () => {
+		// `CommandPalette.svelte` はフォーカストラップを持たないので、Shift+Tab で
+		// フォーカスがパレットの外へ出る。Esc を検索 input の `onkeydown` だけで
+		// 処理していると、この状態ではパレットが閉じず、下の層（Drawer・サイドバー・
+		// 退避ツリー）は「可視な上位層がある」と見て全員譲るため **Esc が何も
+		// 閉じない**（`escLayering.ts` の層の約束・項目3）。
+		await page.keyboard.press('Control+k');
+		const palette = page.getByRole('dialog', { name: 'コマンドパレット' });
+		await expect(palette).toBeVisible();
+
+		await page.keyboard.press('Shift+Tab');
+		await expect
+			.poll(() =>
+				page.evaluate(() => {
+					const active = document.activeElement;
+					const panel = document.querySelector('[role="dialog"][aria-label="コマンドパレット"]');
+					return !!active && !!panel && !panel.contains(active);
+				})
+			)
+			.toBe(true);
+
+		await page.keyboard.press('Escape');
+		await expect(palette).toHaveCount(0);
+	});
+
+	test('13. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
 		await page.goto('/monitor');
 		await expect(page.getByRole('heading', { level: 2, name: 'タグモニタ' })).toBeVisible();
 

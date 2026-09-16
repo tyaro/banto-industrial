@@ -237,17 +237,6 @@
 		if (pruned !== treeFilter) treeFilter = pruned;
 	});
 
-	/**
-	 * #381 レビュー対応3回目: **行が0件になったら退避パネルも閉じる。**
-	 * この画面は `rows.length > 0` のときだけ `SplitPane` をマウントするため、
-	 * 開いたまま最後のタグが消える（または一時的に空のカタログが返る）と
-	 * `treeOpen === true` のままアンマウントされ、行が戻ったときに**トグル操作
-	 * なしで開いた状態で再マウント**されてしまう。
-	 */
-	$effect(() => {
-		if (rows.length === 0 && treeOpen) treeOpen = false;
-	});
-
 	/** #378: 閉じていても何で絞られているか分かるよう、トグルの隣に出す選択名。 */
 	const treeSelectionLabel = $derived.by((): string => {
 		if (treeFilter.type === 'connection') {
@@ -463,22 +452,20 @@
 
 	{#if loading && rows.length === 0}
 		<p class="note">読み込み中…</p>
-	{:else if rows.length === 0}
-		<!--
-			T18-2d（docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A「空状態を…
-			不足する前工程と移動ボタンを示す」）: タグが1件も無い（フィルタの
-			問題ではなく真の空）場合は、前工程（タグ登録）へ案内する。ツリー/
-			検索を出しても絞り込む対象が無いので、SplitPane は出さない。
-		-->
-		<p class="note">
-			登録されているタグがありません。先に タグの登録画面 からタグを作成してください。
-		</p>
-		<a class="onboarding-cta" href="/tags">タグの登録画面へ移動</a>
 	{:else}
 		<!--
 			T18-4a: タグ登録ページと同じ SplitPane + ConnectionTree + 検索
 			ボックス。左ツリーは接続/グループを選択して絞り込むだけの表示専用
 			（`oncontextmenu` は渡さない - このページに作成系 UI は無い）。
+
+			#381 レビュー対応6回目: **タグが0件でも `SplitPane` を出す**
+			（以前は「絞り込む対象が無いので SplitPane は出さない」として空状態を
+			この外に置いていた）。条件マウントだと、ツリーやトグルにフォーカスが
+			ある状態で最後の行が消えたときに**フォーカスの戻り先ごとアンマウント
+			される**（フォーカスが `<body>` に落ちる）。ツリーはタグが0件でも
+			接続・収集グループを出せるので、常時マウントして空状態の案内は右ペイン
+			の中（下の `rows.length === 0` 分岐）に置く - タグ登録ページが
+			`SplitPane` を無条件にマウントしているのと同じ形。
 		-->
 		<div class="content">
 			<!--
@@ -528,7 +515,19 @@
 							/>
 							<span class="count">{filteredRows.length} / {rows.length} 件</span>
 						</div>
-						{#if filteredRows.length === 0}
+						{#if rows.length === 0}
+							<!--
+								T18-2d（docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A「空状態を…
+								不足する前工程と移動ボタンを示す」）: タグが1件も無い（フィルタ
+								の問題ではなく真の空）場合は、前工程（タグ登録）へ案内する。
+								文言・CTA は従来のまま、置き場所だけ右ペインの中へ移した
+								（#381 レビュー対応6回目 - 上の SplitPane のコメント参照）。
+							-->
+							<p class="note">
+								登録されているタグがありません。先に タグの登録画面 からタグを作成してください。
+							</p>
+							<a class="onboarding-cta" href="/tags">タグの登録画面へ移動</a>
+						{:else if filteredRows.length === 0}
 							<p class="note">条件に一致するタグがありません。</p>
 						{:else}
 							<div class="table-wrap">
