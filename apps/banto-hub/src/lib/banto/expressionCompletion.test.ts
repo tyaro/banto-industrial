@@ -12,6 +12,7 @@ import {
 	completionContextAt,
 	completionContextMatchesCaret,
 	completionInsertion,
+	shouldOpenCompletion,
 	type CompletionCandidate,
 	type CompletionIndex
 } from './expressionCompletion';
@@ -131,6 +132,19 @@ describe('completionContextAt', () => {
 	it('空白を跨がない（`conn . group` は lexer 上は有効だが補完しない）', () => {
 		expect(contextAt('line1 .|')).toBeNull();
 		expect(contextAt('line1. |')).toMatchObject({ kind: 'segment1', prefix: '' });
+	});
+
+	it('トークンを終わらせる文字の直後は「prefix が空の segment1」になる（#380 レビュー対応1）', () => {
+		// `line1.` の後に空白や先頭ハイフンを打つと、その参照はもう続かない。
+		// `shouldOpenCompletion` はこの形を「区切り文字を打った直後」とみなして
+		// 開いたままにしない（下の describe 参照）。
+		expect(contextAt('line1. |')).toEqual({
+			kind: 'segment1',
+			prefix: '',
+			replaceFrom: 7,
+			replaceTo: 7
+		});
+		expect(contextAt('line1.-|')).toMatchObject({ kind: 'segment1', prefix: '' });
 	});
 
 	it('キャレットより後ろは置換範囲に含めない', () => {
@@ -288,6 +302,40 @@ describe('completionCandidates', () => {
 	it('関数表が空でも（取得に失敗しても）タグ候補は出る', () => {
 		const ctx = completionContextAt('', 0)!;
 		expect(labels(completionCandidates(ctx, index, [], noBlocks))).toEqual(['line1', 'calc']);
+	});
+});
+
+describe('shouldOpenCompletion', () => {
+	const at = (text: string) => completionContextAt(text, text.length)!;
+
+	it('自動トリガーはドット直後と2文字以上の前方一致', () => {
+		expect(shouldOpenCompletion(at('line1.'))).toBe(true);
+		expect(shouldOpenCompletion(at('line1.fast.'))).toBe(true);
+		expect(shouldOpenCompletion(at('li'))).toBe(true);
+		// 1文字だけ・何も打っていないときは自動では開かない。
+		expect(shouldOpenCompletion(at('l'))).toBe(false);
+		expect(shouldOpenCompletion(at(''))).toBe(false);
+	});
+
+	it('force は無条件に開く（Ctrl+Space / Ctrl+.）', () => {
+		expect(shouldOpenCompletion(at(''), { force: true })).toBe(true);
+		expect(shouldOpenCompletion(at('1 + '), { force: true })).toBe(true);
+	});
+
+	it('開いている間は、いまのトークンが続いていれば開いたまま', () => {
+		// 1文字だけに減らしても絞り込みを続けられる。
+		expect(shouldOpenCompletion(at('l'), { alreadyOpen: true })).toBe(true);
+		expect(shouldOpenCompletion(at('line1.'), { alreadyOpen: true })).toBe(true);
+		expect(shouldOpenCompletion(at('line1.f'), { alreadyOpen: true })).toBe(true);
+	});
+
+	it('トークンを終わらせる区切り文字を打つと、開いていても閉じる（#380 レビュー対応1）', () => {
+		// 以前は `alreadyOpen` だけで無条件に短絡していたため、ここで
+		// 「prefix が空の segment1」＝無関係な接続候補へ切り替わっていた。
+		expect(shouldOpenCompletion(at('line1. '), { alreadyOpen: true })).toBe(false);
+		expect(shouldOpenCompletion(at('line1.-'), { alreadyOpen: true })).toBe(false);
+		expect(shouldOpenCompletion(at('li + '), { alreadyOpen: true })).toBe(false);
+		expect(shouldOpenCompletion(at('(min('), { alreadyOpen: true })).toBe(false);
 	});
 });
 

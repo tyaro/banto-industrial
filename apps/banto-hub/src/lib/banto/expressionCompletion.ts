@@ -187,6 +187,35 @@ export function completionContextAt(text: string, caret: number): CompletionCont
 }
 
 /**
+ * いまの文脈で補完を開く（開いたままにする）べきか。`refreshCompletion` の
+ * 判断をそのまま純関数にしたもの（#380 レビュー対応1でここへ切り出した）。
+ *
+ * - `force`（`Ctrl+Space` / `Ctrl+.` / 上位セグメント確定直後の開き直し）は無条件。
+ * - **すでに開いているときの短絡は「いまのトークンがまだ続いている」ときだけ**。
+ *   以前は `alreadyOpen` だけで無条件に短絡していたため、`line1.` でグループ候補が
+ *   出ている状態から**空白**（`line1. `）や**先頭ハイフン**（`line1.-`）のように
+ *   トークンを終わらせる文字を打っても閉じず、`completionContextAt` が返す
+ *   「prefix が空の segment1」に沿って**無関係な接続候補へ切り替わって**しまった
+ *   （そのまま Enter を押すと見当違いの位置に挿入されうる）。prefix が空の
+ *   segment1 は「区切り文字を打った直後」と同義なので、短絡の対象から外して
+ *   下の自動トリガー条件に落とす＝閉じる。
+ * - 自動トリガーは「ドットを打った直後（第2・第3セグメントの前方一致が空）」と
+ *   「2文字以上の前方一致」。
+ */
+export function shouldOpenCompletion(
+	context: CompletionContext,
+	options: { force?: boolean; alreadyOpen?: boolean } = {}
+): boolean {
+	if (options.force === true) return true;
+	// 「いまのトークンがまだ続いている」= 第2・第3セグメント（ドットの後ろ）か、
+	// 第1セグメントで1文字以上打たれている状態。
+	const stillInsideToken = context.kind !== 'segment1' || context.prefix !== '';
+	if (options.alreadyOpen === true && stillInsideToken) return true;
+	if (context.kind !== 'segment1' && context.prefix === '') return true;
+	return context.prefix.length >= 2;
+}
+
+/**
  * 確定する直前に、ポップアップを開いたときの文脈が**まだキャレットと一致して
  * いるか**を確かめる（#380 レビュー対応5）。
  *

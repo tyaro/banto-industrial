@@ -191,6 +191,7 @@
 		completionContextMatchesCaret,
 		completionInsertion,
 		clampCompletionIndex,
+		shouldOpenCompletion,
 		type CompletionCandidate,
 		type CompletionContext
 	} from '$lib/banto/expressionCompletion';
@@ -2373,12 +2374,10 @@
 			closeCompletion();
 			return;
 		}
-		const shouldOpen =
-			options.force === true ||
-			completionOpen ||
-			(context.kind !== 'segment1' && context.prefix === '') ||
-			context.prefix.length >= 2;
-		if (!shouldOpen) {
+		// 開閉の判断は純関数（`shouldOpenCompletion`）。**開いている間の短絡は
+		// 「いまのトークンがまだ続いている」ときだけ**で、区切り文字（空白・
+		// 先頭ハイフン等）を打つと素直に閉じる（#380 レビュー対応1）。
+		if (!shouldOpenCompletion(context, { force: options.force, alreadyOpen: completionOpen })) {
 			closeCompletion();
 			return;
 		}
