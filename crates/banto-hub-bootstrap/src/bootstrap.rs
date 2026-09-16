@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use banto_tagclient::{Endpoint, ErrorKind as TagErrorKind, RestClient, SecretApiKey};
+use reqwest::Url;
 use zeroize::Zeroizing;
 
 use crate::admin::{base_url, keyring_account, AdminClient, IssueOutcome};
@@ -62,6 +63,11 @@ impl Bootstrapper {
     /// app does not mint a key per launch. A key is only ever issued when
     /// the Hub reports it is still in commissioning mode; a locked-down Hub
     /// yields [`HubStatus::NeedsPairing`] and nothing else is attempted.
+    ///
+    /// Pointing this at a different `endpoint` than the saved one starts from
+    /// scratch for that Hub: nothing from the old record (`key_id`,
+    /// `key_name`, tag selection) is carried over, and nothing is revoked on
+    /// either side - see [`previous_for`](Self::previous_for).
     pub async fn connect(&self, endpoint: &str) -> Result<HubConnection> {
         self.connect_with_scopes(endpoint, DEFAULT_SCOPES).await
     }
@@ -79,7 +85,10 @@ impl Bootstrapper {
         validate_issue_scopes(scopes)?;
         let admin = AdminClient::new(base_url(endpoint)?)?;
         let account = keyring_account(admin.base(), &self.installation_id);
-        let previous = self.state.load()?;
+        // Only a record for THIS endpoint may contribute a `key_id` (see
+        // `previous_for`): ids are per-Hub row ids, so carrying one across a
+        // switch would revoke an unrelated key on the new Hub.
+        let previous = self.previous_for(admin.base())?;
 
         // 1. Reuse. A stored key that still authenticates means no issue
         //    request at all.
@@ -113,8 +122,9 @@ impl Bootstrapper {
             Err(cause) => return Ok(HubConnection::failed(HubStatus::unreachable(cause))),
         }
 
-        // 3. Revoke the key this installation issued last time, if any.
-        //    Best effort, and only ever by id (see `AdminClient::revoke`).
+        // 3. Revoke the key this installation issued last time **against this
+        //    same Hub**, if any. Best effort, and only ever by id (see
+        //    `AdminClient::revoke` and `previous_for`).
         if let Some(previous_id) = previous.as_ref().and_then(|record| record.key_id) {
             if !admin.revoke(previous_id).await {
                 tracing::info!(
@@ -169,7 +179,7 @@ impl Bootstrapper {
             return Ok(connection);
         }
         self.keys.set(&account, &key)?;
-        let previous = self.state.load()?;
+        let previous = self.previous_for(admin.base())?;
         self.save_record(endpoint, &account, previous.as_ref(), None, None)?;
         Ok(connection)
     }
@@ -247,6 +257,38 @@ impl Bootstrapper {
 
     fn stored_key(&self, account: &str) -> Result<Option<Zeroizing<String>>> {
         Ok(self.keys.get(account)?.map(Zeroizing::new))
+    }
+
+    /// The saved record, but **only if it belongs to `base`**.
+    ///
+    /// `key_id`, `key_name` and `keyring_account` are properties of one
+    /// (endpoint, installation) pair, not of the installation alone: a
+    /// banto-hub `api_keys.id` is a row id in *that* Hub's database, so two
+    /// Hubs hand out the same small integers to completely unrelated keys.
+    /// Reading a `key_id` saved against Hub A and revoking it on Hub B would
+    /// take away a stranger's credential - exactly the failure mode the
+    /// "revoke only ids we issued ourselves" rule exists to prevent. The
+    /// same reasoning applies to reusing A's `key_name` in B's record.
+    ///
+    /// Endpoints are compared **normalized** (`base_url`, the same
+    /// normalization `banto_tagclient::Endpoint::new` performs), so
+    /// `http://host:3100`, `http://host:3100/` and a re-typed equivalent all
+    /// count as the same Hub. A saved endpoint that no longer parses is
+    /// treated as "not this one".
+    ///
+    /// `installation_id` is deliberately NOT endpoint-scoped: it identifies
+    /// this installation, and stays the same wherever it connects.
+    ///
+    /// v1 keeps exactly one record, so switching to another Hub **forgets**
+    /// the previous endpoint's `key_id`. Its key stays on that Hub and in the
+    /// OS keyring under that Hub's own account; coming back later reuses the
+    /// keyring entry if it still works, and otherwise issues a fresh key
+    /// under a new name. Leaving the old key alone is the same principle as
+    /// never touching another installation's key.
+    fn previous_for(&self, base: &Url) -> Result<Option<HubRecord>> {
+        Ok(self.state.load()?.filter(|record| {
+            base_url(&record.endpoint).is_ok_and(|previous_base| &previous_base == base)
+        }))
     }
 
     /// `{app_id}-{installation_id}-{unix seconds}`.
@@ -330,10 +372,11 @@ impl Bootstrapper {
         key_name: Option<String>,
     ) -> Result<()> {
         // The tag selection is the operator's, not the bootstrap's: carry it
-        // across a re-issue against the same Hub, drop it when the endpoint
-        // changes (the names would refer to a different catalog).
+        // across a re-issue against the same Hub. `previous` has already been
+        // narrowed to this endpoint by `previous_for`, so a switch to another
+        // Hub starts with an empty selection (the names would refer to a
+        // different catalog) and with no `key_id`/`key_name` carried over.
         let selected_tags = previous
-            .filter(|record| record.endpoint == endpoint)
             .map(|record| record.selected_tags.clone())
             .unwrap_or_default();
         self.state.save(&HubRecord {
@@ -585,6 +628,121 @@ mod tests {
             "a new name, not the old one"
         );
         assert_eq!(record.selected_tags, previous.selected_tags);
+    }
+
+    /// A `key_id` belongs to one Hub. Pointing the app at a different Hub
+    /// must not carry it across: ids are per-Hub row ids, so revoking "id 7"
+    /// on the new Hub would take away somebody else's key.
+    #[tokio::test]
+    async fn switching_endpoints_never_revokes_the_other_hubs_id() {
+        let hub_a = MockHub::start(routes(vec![(TAGS_ROUTE, vec![(200, catalog_body(1))])]));
+        let keys = Arc::new(MemoryKeyStore::new());
+        keys.set(&account_for(&hub_a), &key()).unwrap();
+        // As if a previous run had issued id 7 against Hub A.
+        let state = Arc::new(MemoryState::seeded(seeded_record(&hub_a, Some(7))));
+        let bootstrapper = harness(Arc::clone(&keys), Arc::clone(&state));
+
+        // Hub B: no key for it in the keyring, so it has to issue - and it
+        // happens to hand out the same id 7 (row ids are per-Hub).
+        let hub_b = MockHub::start(routes(vec![
+            (STATUS_ROUTE, vec![(200, commissioning_body(false))]),
+            (ISSUE_ROUTE, vec![(201, issued_body(7, "n", &key()))]),
+            (TAGS_ROUTE, vec![(200, catalog_body(0))]),
+            (
+                "POST /api/api-keys/7/revoke",
+                vec![(200, String::from("{}"))],
+            ),
+        ]));
+
+        let connection = bootstrapper.connect(&hub_b.endpoint()).await.unwrap();
+
+        assert_eq!(connection.status, HubStatus::Connected { tag_count: 0 });
+        assert_eq!(
+            hub_b.hit_count("POST /api/api-keys/7/revoke"),
+            0,
+            "Hub A's id must never be revoked on Hub B"
+        );
+        assert_eq!(hub_a.hit_count("POST /api/api-keys/7/revoke"), 0);
+        let record = state.load().unwrap().unwrap();
+        assert_eq!(record.endpoint, hub_b.endpoint());
+        assert_eq!(record.key_id, Some(7), "the id B itself issued");
+        assert_eq!(record.keyring_account, account_for(&hub_b));
+        assert_ne!(record.keyring_account, account_for(&hub_a));
+        assert!(
+            record.selected_tags.is_empty(),
+            "A's selection refers to A's catalog and must not follow"
+        );
+    }
+
+    /// v1 keeps exactly one record, so coming back to the first Hub reuses
+    /// its keyring entry (no issue request) but no longer knows the id it
+    /// issued there - which is safe: a forgotten id is never revoked.
+    #[tokio::test]
+    async fn returning_to_the_first_endpoint_reuses_its_key_but_has_forgotten_its_id() {
+        let hub_a = MockHub::start(routes(vec![(TAGS_ROUTE, vec![(200, catalog_body(1))])]));
+        let hub_b = MockHub::start(routes(vec![
+            (STATUS_ROUTE, vec![(200, commissioning_body(false))]),
+            (ISSUE_ROUTE, vec![(201, issued_body(5, "n", &key()))]),
+            (TAGS_ROUTE, vec![(200, catalog_body(0))]),
+        ]));
+        let keys = Arc::new(MemoryKeyStore::new());
+        keys.set(&account_for(&hub_a), &key()).unwrap();
+        let state = Arc::new(MemoryState::seeded(seeded_record(&hub_a, Some(7))));
+        let bootstrapper = harness(Arc::clone(&keys), Arc::clone(&state));
+
+        bootstrapper.connect(&hub_b.endpoint()).await.unwrap();
+        let connection = bootstrapper.connect(&hub_a.endpoint()).await.unwrap();
+
+        assert_eq!(connection.status, HubStatus::Connected { tag_count: 1 });
+        assert_eq!(
+            hub_a.hit_count(ISSUE_ROUTE),
+            0,
+            "A's keyring entry still works, so nothing is issued"
+        );
+        let record = state.load().unwrap().unwrap();
+        assert_eq!(record.endpoint, hub_a.endpoint());
+        assert_eq!(record.keyring_account, account_for(&hub_a));
+        assert_eq!(
+            record.key_id, None,
+            "the id A issued was forgotten when the record moved to B"
+        );
+    }
+
+    /// The endpoint comparison is normalized, not textual: a trailing slash
+    /// is the same Hub, so a re-typed URL must not look like a switch.
+    #[tokio::test]
+    async fn a_differently_spelled_equal_endpoint_is_the_same_hub() {
+        let hub = MockHub::start(routes(vec![
+            (STATUS_ROUTE, vec![(200, commissioning_body(false))]),
+            (ISSUE_ROUTE, vec![(201, issued_body(99, "n", &key()))]),
+            (TAGS_ROUTE, vec![(200, catalog_body(1))]),
+            (
+                "POST /api/api-keys/7/revoke",
+                vec![(200, String::from("{}"))],
+            ),
+        ]));
+        // Keyring lost, so this re-issues - which is when the previous id
+        // matters.
+        let keys = Arc::new(MemoryKeyStore::new());
+        let state = Arc::new(MemoryState::seeded(seeded_record(&hub, Some(7))));
+        let bootstrapper = harness(keys, Arc::clone(&state));
+
+        let connection = bootstrapper
+            .connect(&format!("{}/", hub.endpoint()))
+            .await
+            .unwrap();
+
+        assert_eq!(connection.status, HubStatus::Connected { tag_count: 1 });
+        assert_eq!(
+            hub.hit_count("POST /api/api-keys/7/revoke"),
+            1,
+            "a trailing slash must not read as a different Hub"
+        );
+        assert_eq!(
+            state.load().unwrap().unwrap().selected_tags,
+            vec!["line1.fast.tag0".to_owned()],
+            "the operator's selection survives a re-issue against the same Hub"
+        );
     }
 
     #[tokio::test]

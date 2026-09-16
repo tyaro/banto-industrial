@@ -122,6 +122,15 @@ impl MockHub {
 impl Drop for MockHub {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        // Setting the flag is not enough: the thread is parked inside
+        // `listener.incoming()` and only re-checks it when a connection
+        // arrives, so without this the accept loop would outlive the test and
+        // keep the test binary from exiting. One best-effort self-connect
+        // wakes it; the request is never read, and a failure here (the
+        // listener already gone) simply means there is nothing left to wake.
+        if let Some(address) = self.address.strip_prefix("http://") {
+            let _ = std::net::TcpStream::connect(address);
+        }
     }
 }
 
