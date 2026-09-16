@@ -578,6 +578,13 @@
 
 	let loading = $state(false);
 	/**
+	 * #381 レビュー対応19回目: 一覧（接続/グループ/タグ）を**一度でも読み終えたか**。
+	 * `pruneTreeFilter` へ渡す（同ファイルの doc 参照 - 一覧が空かどうかから
+	 * 「未ロード」を推測しない。最後の1件を削除した状態と区別が付かないため）。
+	 * 失敗（stale 維持）では立てない。
+	 */
+	let registryLoaded = $state(false);
+	/**
 	 * T18-1（TAG-UX-C 6点目、docs/banto-hub-desktop-plan.md §9.4）:
 	 * 初期読込失敗・再読込失敗を通信エラーとして保持する - `tags` は
 	 * 失敗時も直前の内容を残す（stale 維持、`monitor/+page.svelte` の
@@ -702,6 +709,7 @@
 			groups = nextGroups;
 			connections = nextConnections;
 			tags = nextTags;
+			registryLoaded = true;
 			loadError = null;
 			// T18-3b: 再取得で消えた（削除された等の）タグの選択を掃除する -
 			// 存在しない id を選択集合に残すと、一括操作の対象件数表示や
@@ -2987,7 +2995,7 @@
 	 * vitest 済み）で、同一参照を返してくれるので変わったときだけ書き戻す。
 	 */
 	$effect(() => {
-		const pruned = pruneTreeFilter(treeFilter, connections, groups);
+		const pruned = pruneTreeFilter(treeFilter, connections, groups, { loaded: registryLoaded });
 		if (pruned !== treeFilter) treeFilter = pruned;
 	});
 

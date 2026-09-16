@@ -166,6 +166,12 @@
 	let connections = $state<PlcConnection[]>([]);
 	let groups = $state<CollectionGroup[]>([]);
 	let adminTags = $state<Tag[]>([]);
+	/**
+	 * #381 レビュー対応19回目: 補助データ（接続/グループ/タグ）を**一度でも
+	 * 読み終えたか**。`pruneTreeFilter` へ渡す（一覧が空かどうかから「未ロード」を
+	 * 推測しない - 同ファイルの doc 参照）。失敗時は立てない。
+	 */
+	let adminLoaded = $state(false);
 
 	async function reloadAdmin(): Promise<void> {
 		try {
@@ -177,6 +183,7 @@
 			connections = nextConnections;
 			groups = nextGroups;
 			adminTags = nextTags;
+			adminLoaded = true;
 		} catch (err) {
 			toastStore.push('error', errorMessage(err));
 		}
@@ -240,7 +247,7 @@
 	 * （`subscriptionPatternsFor`）にも使うので、戻せば購読も全件へ戻る。
 	 */
 	$effect(() => {
-		const pruned = pruneTreeFilter(treeFilter, connections, groups);
+		const pruned = pruneTreeFilter(treeFilter, connections, groups, { loaded: adminLoaded });
 		if (pruned !== treeFilter) treeFilter = pruned;
 	});
 

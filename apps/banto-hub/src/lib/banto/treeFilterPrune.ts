@@ -33,18 +33,22 @@ interface HasId {
  * （呼び出し側が `!==` で「変わったときだけ書き戻す」と書けるようにするため -
  * 毎回新しいオブジェクトを返すと Svelte の `$effect` が自分で自分を起こし続ける）。
  *
- * **両方の一覧が空のときは何もしない**: 「まだ読み込めていない」のか「全部
- * 消された」のかを区別できないためで、前者で選択を消すと、ディープリンク
- * （`?group=`）や作成直後のプリセット選択が読み込み完了の前に失われる。後者の
- * 状態ではそもそもグリッドも空・ツリーも「すべて」しか無いので実害が無い。
+ * **「読み込み済みか」は呼び出し側が `loaded` で明示する**（#381 レビュー対応
+ * 19回目）: 一覧が空かどうかから推測してはいけない。当初は「両方空なら触らない」
+ * としていたが、それだと**初回ロード後に最後の接続／グループを削除した**場合も
+ * 同じ形になるので、削除済み id のフィルタが残り続けていた（ツリーで「すべて」に
+ * ならず、グリッドは無効 id で絞られたまま）。`loaded === false`（まだ読めていない）
+ * のときだけ保持する - ディープリンク（`?group=`）や作成直後のプリセット選択が
+ * 読み込み完了の前に消えるのを防ぐため。
  */
 export function pruneTreeFilter(
 	filter: TreeFilterSelection,
 	connections: readonly HasId[],
-	groups: readonly HasId[]
+	groups: readonly HasId[],
+	options: { loaded: boolean }
 ): TreeFilterSelection {
 	if (filter.type === 'all') return filter;
-	if (connections.length === 0 && groups.length === 0) return filter;
+	if (!options.loaded) return filter;
 	if (filter.type === 'connection') {
 		return connections.some((c) => c.id === filter.id) ? filter : { type: 'all' };
 	}
