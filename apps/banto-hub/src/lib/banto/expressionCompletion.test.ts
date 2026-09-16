@@ -229,6 +229,30 @@ describe('buildCompletionIndex', () => {
 		]);
 	});
 
+	it('渡さなかったタグは索引にも候補にも入らない（削除猶予中のタグを外す経路）', () => {
+		// #380 レビュー対応10: 呼び出し元（`(app)/tags/+page.svelte`）は
+		// **`visibleTags`**（削除猶予中 = 取り消し待ちのタグを除いた一覧）から
+		// 索引を組む。ここではその契約 -「渡された配列がそのまま候補の母集合に
+		// なる」- を固定する（循環判定の依存グラフだけは猶予中のタグも含む生の
+		// `tags` から組む。理由は呼び出し元の doc comment 参照）。
+		const withoutPending = buildCompletionIndex(
+			[{ id: 1, name: 'line1' }],
+			[{ id: 10, name: 'fast', plcConnectionId: 1 }],
+			[{ id: 100, name: 'alive', collectionGroupId: 10, dataType: 'f32', unit: null }]
+		);
+		expect(withoutPending.tagsByGroupPath.get('line1.fast')?.map((t) => t.name)).toEqual(['alive']);
+		expect(
+			labels(
+				completionCandidates(
+					completionContextAt('line1.fast.', 11)!,
+					withoutPending,
+					[],
+					new Map<number, string>()
+				)
+			)
+		).toEqual(['alive']);
+	});
+
 	it('親が見つからないグループ・タグは索引に入らない', () => {
 		const index = buildCompletionIndex(
 			[],

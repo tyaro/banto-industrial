@@ -2159,7 +2159,13 @@
 		if (!expressionFieldVisible) {
 			// 式欄が消えたら失敗の記録を解除する - 次に開いたときに取り直せるように
 			// （#380 レビュー対応3。`expressionFunctionsFailed` の doc comment 参照）。
-			if (expressionFunctionsFailed || expressionFunctionsRequested) {
+			//
+			// #380 レビュー対応（10回目）: **戻すのは前回が失敗したときだけ**。
+			// 成功時まで戻していたため、computed フォームを閉じて開くたびに静的な
+			// 関数表を取り直していた（「1回だけ取得してキャッシュ」という上の doc と
+			// 食い違う無駄な往復）。成功して `expressionFunctions` を保持している
+			// なら要求済みのままにして、そのまま使う。
+			if (expressionFunctionsFailed) {
 				expressionFunctionsFailed = false;
 				expressionFunctionsRequested = false;
 			}
@@ -2253,11 +2259,20 @@
 	 * （毎キーストロークでは組み直さない - `expressionCompletion.ts` の
 	 * `buildCompletionIndex` doc comment 参照）。
 	 *
-	 * 段階C の除外グラフ（`insertBlockedReasons`）と同じく**生の `tags`**
-	 * （サーバー全件）から組む: 削除猶予中のタグはまだサーバー上に存在し、
-	 * 参照すれば通ってしまうため。
+	 * **`visibleTags` から組む**（#380 レビュー対応10）。ここと
+	 * `insertBlockedReasons` で参照するタグ配列が違うのは意図的で、見ている
+	 * ものが違うため:
+	 *
+	 * - **候補に出すもの = 画面に見えているもの = `visibleTags`**。削除猶予中
+	 *   （`deferredDelete.pendingIds`、取り消し待ち）のタグは一覧から消えている
+	 *   のに補完には出る、という食い違いを避ける。挿入できてしまうと、猶予が
+	 *   明けた時点で参照切れになり保存もチェックも落ちる。
+	 * - **循環の判定（`insertBlockedReasons`）= サーバー上に存在するもの = 生の
+	 *   `tags`**。猶予中のタグもサーバー上にはまだあるので、それを中継する循環を
+	 *   見落とすと「挿入できたのにサーバーが `cycle` で拒否する」ことになる
+	 *   （#379 レビューで逆向きの指摘を受けて直した箇所 - 戻さないこと）。
 	 */
-	const completionIndex = $derived(buildCompletionIndex(connections, groups, tags));
+	const completionIndex = $derived(buildCompletionIndex(connections, groups, visibleTags));
 
 	/**
 	 * 現在の文脈に対する候補全件（上限で切る前）。

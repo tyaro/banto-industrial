@@ -633,4 +633,44 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 			if (routed) await page.unroute(FUNCTIONS_URL);
 		}
 	});
+
+	test('11. 取得に成功した関数表は、式欄を開き直しても再取得しない（#380 レビュー対応10）', async () => {
+		// 関数表は静的（サーバー側で DB も設定も読まない）なので、1回取れたら
+		// キャッシュしたまま使う。以前は式欄が消えるたびに要求済みフラグを戻して
+		// いたため、computed フォームを閉じて開くたびに取り直していた。
+		let requests = 0;
+		const countFunctionsRequest = (request: { url: () => string }): void => {
+			if (request.url().includes('/api/tags/expression/functions')) requests += 1;
+		};
+		page.on('request', countFunctionsRequest);
+		try {
+			await page.goto('/tags');
+			await groupNodeByName(page, CALC_GROUP_NAME).click();
+			await page.getByRole('button', { name: '新規登録' }).click();
+			const pane = page.getByRole('complementary', { name: '新規作成' });
+			await expect(pane).toBeVisible();
+			const popup = page.getByTestId('expression-completion');
+
+			// 関数候補が出た = 取得できた。
+			await pane.getByRole('textbox', { name: /^式（expression）/ }).fill('mi');
+			await expect(popup.getByRole('option', { name: /min/ })).toBeVisible();
+			expect(requests).toBe(1);
+
+			// 閉じて開き直しても、関数候補はキャッシュから出る（往復は増えない）。
+			page.once('dialog', (dialog) => {
+				void dialog.accept();
+			});
+			await pane.getByRole('button', { name: '閉じる', exact: true }).click();
+			await expect(pane).toHaveCount(0);
+
+			await page.getByRole('button', { name: '新規登録' }).click();
+			const reopened = page.getByRole('complementary', { name: '新規作成' });
+			await expect(reopened).toBeVisible();
+			await reopened.getByRole('textbox', { name: /^式（expression）/ }).fill('mi');
+			await expect(popup.getByRole('option', { name: /min/ })).toBeVisible();
+			expect(requests).toBe(1);
+		} finally {
+			page.off('request', countFunctionsRequest);
+		}
+	});
 });
