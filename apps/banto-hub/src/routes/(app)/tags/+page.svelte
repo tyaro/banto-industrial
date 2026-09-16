@@ -2109,6 +2109,15 @@
 		const start = el.selectionStart ?? el.value.length;
 		const end = el.selectionEnd ?? start;
 		el.setRangeText(name, start, end, 'end');
+		// #342 段階B / #380 レビュー対応12: **合成 `input` を投げる前に**補完を
+		// 「次の実打鍵まで開かない」状態にしておく。挿入した参照は既に完成して
+		// いるので補完を出す意味が無いうえ、ここで門を立てておかないと、初回の
+		// 関数表要求が後から解決したときにその `refreshCompletion()` が
+		// （もう `focus()` 済みの）完成済み参照に対してポップアップを開き、次の
+		// 打鍵を奪う。`focus()` の後に立てると `input` の処理順で漏れるので**前**。
+		// `handleExpressionInput` が門を降ろすのは「式欄にフォーカスがある実打鍵」
+		// のときだけなので、この時点（フォーカスはグリッド側）では降りない。
+		dismissCompletion();
 		// `bind:value` の更新と `oninput`（段階Aのチェック）の両方を発火させる。
 		el.dispatchEvent(new Event('input', { bubbles: true }));
 		el.focus();
@@ -2131,18 +2140,27 @@
 	 */
 	let expressionFunctions: ExpressionFunction[] = $state([]);
 	/**
-	 * 取得を1回だけにするためのフラグ。**`$state`**（#380 レビュー対応3）:
-	 * 素の変数だと、フェッチが reject する前に式欄を閉じて開き直したときに
-	 * 「effect が走った時点ではまだ `true` なので要求を出さず、その後の `catch` が
-	 * `false` へ戻しても effect は再実行されない」という取りこぼしが起きる。
+	 * 取得に**成功**したか。成功したら以後は取り直さない（内容は静的）。
+	 * `$state` なのは下の `$effect` が依存として読むため。
+	 */
+	let expressionFunctionsLoaded = $state(false);
+	/**
+	 * いまの世代で要求を出したか（成功・失敗の別を問わない）。**同じ表示状態の
+	 * まま即再要求して無限ループにならないための門**で、式欄がいったん消えた
+	 * ときに「まだ取れていなければ」戻す（＝「次に式欄を開いたら取り直す」）。
 	 */
 	let expressionFunctionsRequested = $state(false);
 	/**
-	 * 直近の取得が失敗したか。**同じ表示状態のまま即再要求して無限ループに
-	 * ならないための門**で、式欄がいったん消えたときにだけ解除する
-	 * （＝「次に式欄を開いたら取り直す」を字義どおりに実装する）。
+	 * 関数表の要求の**世代**（#380 レビュー対応12）。**式欄が消えるたびに進め、
+	 * 応答は自分の世代がいまの世代と一致するときだけ反映する**（古い応答は成功も
+	 * 失敗も捨てる）。
+	 *
+	 * これが無いと、初回の要求が**まだ飛んでいる最中に**フォームを閉じて即座に
+	 * 開き直したとき、古い要求の reject が**いま表示中のフォーム**に対する失敗
+	 * として記録され、もう一度閉じて開くまで関数候補が出なくなる。リアクティブに
+	 * 読まないので素の変数でよい。
 	 */
-	let expressionFunctionsFailed = $state(false);
+	let expressionFunctionsGeneration = 0;
 
 	/** 式欄が出ているか（＝関数表を取りに行ってよいか）。 */
 	const expressionFieldVisible = $derived(
@@ -2157,25 +2175,29 @@
 	 */
 	$effect(() => {
 		if (!expressionFieldVisible) {
-			// 式欄が消えたら失敗の記録を解除する - 次に開いたときに取り直せるように
-			// （#380 レビュー対応3。`expressionFunctionsFailed` の doc comment 参照）。
-			//
-			// #380 レビュー対応（10回目）: **戻すのは前回が失敗したときだけ**。
-			// 成功時まで戻していたため、computed フォームを閉じて開くたびに静的な
-			// 関数表を取り直していた（「1回だけ取得してキャッシュ」という上の doc と
-			// 食い違う無駄な往復）。成功して `expressionFunctions` を保持している
-			// なら要求済みのままにして、そのまま使う。
-			if (expressionFunctionsFailed) {
-				expressionFunctionsFailed = false;
+			// 式欄が消えたら**世代を進める** - 飛んでいる最中の要求の応答（成功も
+			// 失敗も）を、次に開いたフォームへ持ち込ませない（#380 レビュー対応12。
+			// `expressionFunctionsGeneration` の doc comment 参照）。素の変数なので
+			// この代入は effect を再実行させない。
+			expressionFunctionsGeneration += 1;
+			// **まだ取れていない**（失敗した／飛んでいる最中）なら門を戻して、次に
+			// 開いたときに出し直せるようにする。**取れているなら戻さない** -
+			// 戻すと computed フォームを閉じて開くたびに静的な関数表を取り直す
+			// （#380 レビュー対応10）。
+			if (expressionFunctionsRequested && !expressionFunctionsLoaded) {
 				expressionFunctionsRequested = false;
 			}
 			return;
 		}
-		if (expressionFunctionsRequested || expressionFunctionsFailed) return;
+		if (expressionFunctionsLoaded || expressionFunctionsRequested) return;
 		expressionFunctionsRequested = true;
+		const generation = expressionFunctionsGeneration;
 		void fetchExpressionFunctions()
 			.then((list) => {
+				// 古い世代（この要求の最中に式欄が閉じた）の応答は捨てる。
+				if (generation !== expressionFunctionsGeneration) return;
 				expressionFunctions = list;
+				expressionFunctionsLoaded = true;
 				// #380 レビュー対応2: 取得が補完より後に解決したときの取りこぼしを
 				// 防ぐ。2文字打った時点で関数表が空だと候補0件でポップアップが
 				// 閉じてしまい、その後フェッチが解決しても何も再計算されない
@@ -2187,11 +2209,11 @@
 			})
 			.catch(() => {
 				// 権限不足・ネットワーク断でも補完は壊さない（関数候補が出ないだけ）。
-				// 次に式欄を開いたときに取り直せるよう、要求済みフラグは戻す。
-				// **同じ表示状態のまま即再要求しない**よう失敗を記録しておき、
-				// 式欄がいったん消えたときに上の分岐が解除する。
-				expressionFunctionsRequested = false;
-				expressionFunctionsFailed = true;
+				// 古い世代の失敗は**いま表示中のフォームに影響させない**（これが
+				// 無いと、開き直した直後のフォームが前回の失敗に巻き込まれる）。
+				if (generation !== expressionFunctionsGeneration) return;
+				// `expressionFunctionsRequested` は true のまま残す - **同じ表示の
+				// まま即再要求しない**ため。式欄がいったん消えたときに上の分岐が戻す。
 			});
 	});
 
@@ -2229,6 +2251,13 @@
 	 * - 式欄のクリック・フォーカス喪失（{@link handleExpressionCaretLost}）
 	 * - 候補の確定後（{@link acceptCompletion}。次の階層は `force` で開く）
 	 * - モード遷移（`drawerMode`/`selected?.id` の変化）と式欄の消滅
+	 * - **段階C の「一覧から挿入」の挿入**（{@link insertTagRefIntoExpression}。
+	 *   合成 `input` を投げる**前**に立てる）
+	 *
+	 * **関数表フェッチとの関係**: この門とは別に、関数表の要求は**世代**
+	 * （{@link expressionFunctionsGeneration}）で管理していて、式欄が消えている
+	 * 間に解決した応答は成功も失敗も捨てる。門は「開かない」ためのもの、世代は
+	 * 「古い応答を反映しない」ためのもので、役割が違う。
 	 *
 	 * **降ろす場所（1箇所だけ）**: {@link handleExpressionInput} と
 	 * {@link handleExpressionCompositionEnd} の、**式欄にフォーカスがある

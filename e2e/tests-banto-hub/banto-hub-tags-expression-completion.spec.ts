@@ -311,6 +311,30 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 		await expect(popup).toHaveCount(0);
 	});
 
+	test('5.7. Tab でも確定でき、フォーカスは式欄に残る（#380 レビュー対応12）', async () => {
+		const pane = page.getByRole('complementary', { name: '新規作成' });
+		const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
+		const popup = page.getByTestId('expression-completion');
+
+		// 確定は Enter / Tab / クリックの3経路。Tab は「フォーカス移動に戻る」
+		// 回帰が起きても Enter のテストでは捕まらないので、別途固定する。
+		await expressionField.fill(`${CONNECTION_NAME}.${GROUP_NAME.slice(0, 6)}`);
+		await expect(popup).toBeVisible();
+		await expect(popup.getByRole('option', { name: new RegExp(GROUP_NAME) })).toBeVisible();
+
+		await page.keyboard.press('Tab');
+
+		await expect(expressionField).toHaveValue(`${CONNECTION_NAME}.${GROUP_NAME}.`);
+		// **タブ移動していない**（`preventDefault` が効いている）。
+		await expect(expressionField).toBeFocused();
+		// グループの確定なので、そのまま次の階層（タグ）が開く。
+		await expect(popup).toBeVisible();
+		await expect(popup.getByRole('option', { name: new RegExp(REF_TAG_NAME) })).toBeVisible();
+
+		await page.keyboard.press('Escape');
+		await expect(popup).toHaveCount(0);
+	});
+
 	test('6. スクロールした長い式でもポップアップが式欄の可視範囲に出る（#380 レビュー対応1）', async () => {
 		const pane = page.getByRole('complementary', { name: '新規作成' });
 		const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
