@@ -177,11 +177,25 @@
 	import { beforeNavigate } from '$app/navigation';
 	import {
 		checkExpression,
+		fetchExpressionFunctions,
 		shouldCheckExpression,
 		ExpressionCheckController,
-		type ExpressionCheckResult
+		type ExpressionCheckResult,
+		type ExpressionFunction
 	} from '$lib/banto/expressionCheck';
 	import { blockedInsertTargets, type InsertCandidateTag } from '$lib/banto/expressionInsert';
+	import {
+		buildCompletionIndex,
+		completionCandidates,
+		completionContextAt,
+		completionInsertion,
+		type CompletionCandidate,
+		type CompletionContext
+	} from '$lib/banto/expressionCompletion';
+	import CompletionPopup, {
+		COMPLETION_LISTBOX_ID,
+		completionOptionId
+	} from '$lib/components/CompletionPopup.svelte';
 
 	const dataTypeOptions: { value: TagDataType; label: string }[] = [
 		{ value: 'bit', label: 'bit（真偽値1点）' },
@@ -302,6 +316,19 @@
 		insertArmed: boolean;
 		/** #342 段階C: トグルのクリック。 */
 		onToggleInsert: () => void;
+		/**
+		 * #342 段階B: 式欄のセグメント補完。`onInput`/`onCompositionStart`/
+		 * `onCompositionEnd` は段階A のチェックと共用（下の
+		 * `createExprFieldHandlers`/`editExprFieldHandlers` が両方を呼ぶ）で、
+		 * ここに増やすのはキー操作とキャレット移動の受け口だけ。補完の状態
+		 * （開閉・選択中）はページ側の単一インスタンスが持つので、create/edit
+		 * どちらのラッパーも同じ関数を返す。
+		 */
+		onKeydown: (event: KeyboardEvent) => void;
+		/** マウスクリック・フォーカス喪失でキャレット文脈が失われたとき。 */
+		onCaretLost: () => void;
+		/** `aria-activedescendant` に入れる選択中候補の id（閉じていれば `undefined`）。 */
+		completionActiveId: string | undefined;
 	}
 
 	function blankForm(): FormState {
@@ -760,17 +787,29 @@
 	function createExprFieldHandlers(): ExpressionCheckFieldHandlers {
 		return {
 			preview: createExprPreview,
-			onInput: () =>
+			// #342 段階B: 同じイベントで段階A のチェックと補完の両方を駆動する
+			// （補完は `handleExpressionInput` 以下のページ側単一インスタンス）。
+			onInput: () => {
 				createExprController.scheduleCheck(
 					createForm.expression,
 					expressionCheckExternalName(createForm)
-				),
-			onCompositionStart: () => createExprController.onCompositionStart(),
-			onCompositionEnd: () =>
+				);
+				handleExpressionInput();
+			},
+			onCompositionStart: () => {
+				createExprController.onCompositionStart();
+				handleExpressionCompositionStart();
+			},
+			onCompositionEnd: () => {
 				createExprController.onCompositionEnd(
 					createForm.expression,
 					expressionCheckExternalName(createForm)
-				),
+				);
+				handleExpressionCompositionEnd();
+			},
+			onKeydown: handleExpressionKeydown,
+			onCaretLost: handleExpressionCaretLost,
+			completionActiveId: completionActiveDescendantId,
 			// #342 段階C（下の「一覧から挿入」節）。create/edit で同じ受け口を
 			// 共有できるのは `drawerMode` が常に高々1つで、式欄の `<textarea>`
 			// も同時に1つしかマウントされないため。
@@ -1080,17 +1119,29 @@
 	function editExprFieldHandlers(): ExpressionCheckFieldHandlers {
 		return {
 			preview: editExprPreview,
-			onInput: () =>
+			// #342 段階B: `createExprFieldHandlers` と同じく、1つのイベントで
+			// 段階A のチェックと補完の両方を駆動する。
+			onInput: () => {
 				editExprController.scheduleCheck(
 					editForm.expression,
 					expressionCheckExternalName(editForm)
-				),
-			onCompositionStart: () => editExprController.onCompositionStart(),
-			onCompositionEnd: () =>
+				);
+				handleExpressionInput();
+			},
+			onCompositionStart: () => {
+				editExprController.onCompositionStart();
+				handleExpressionCompositionStart();
+			},
+			onCompositionEnd: () => {
 				editExprController.onCompositionEnd(
 					editForm.expression,
 					expressionCheckExternalName(editForm)
-				),
+				);
+				handleExpressionCompositionEnd();
+			},
+			onKeydown: handleExpressionKeydown,
+			onCaretLost: handleExpressionCaretLost,
+			completionActiveId: completionActiveDescendantId,
 			// #342 段階C: `createExprFieldHandlers` と同じ受け口（そちらのコメント参照）。
 			bindTextarea: (el) => (exprTextareaEl = el),
 			insertToggleVisible: insertToggleAvailable,
@@ -1912,6 +1963,12 @@
 	$effect(() => {
 		if (!insertArmed) return;
 		const onKeydown = (e: KeyboardEvent): void => {
+			// #342 段階B（Esc の優先順位）: セグメント補完のポップアップが開いて
+			// いる間の Esc は**ポップアップだけ**を閉じ、このトグルは ON のまま
+			// にする。式欄側の `handleExpressionKeydown` が `stopPropagation` する
+			// のでこの window リスナーには届かないはずだが、経路（イベント委譲・
+			// 式欄外での Esc）に依存しないようここでも明示的に条件にする。
+			if (completionOpen) return;
 			if (e.key === 'Escape') insertArmed = false;
 		};
 		window.addEventListener('keydown', onKeydown);
@@ -1987,6 +2044,304 @@
 		// `bind:value` の更新と `oninput`（段階Aのチェック）の両方を発火させる。
 		el.dispatchEvent(new Event('input', { bubbles: true }));
 		el.focus();
+	}
+
+	// --- #342 段階B: 式欄のセグメント補完 -------------------------------------
+	//
+	// 判定そのもの（何を補完するか・候補・除外）は純関数
+	// `$lib/banto/expressionCompletion.ts`、描画は
+	// `$lib/components/CompletionPopup.svelte`。ここにあるのは「式欄の DOM と
+	// それらを繋ぐ配線」だけ。段階A の `.expr-mirror`（キャレット座標）、
+	// 段階C の `blockedInsertTargets`（除外）と `setRangeText` + input 再送
+	// （挿入）を**そのまま再利用する**（作り直さない）。
+
+	/**
+	 * 組み込み関数表（`GET /api/tags/expression/functions`）。**正は Rust の
+	 * `banto_expr::BUILTIN_FUNCTIONS`** で、ここは受け取って渡すだけ。
+	 * 取得に失敗しても空のままにして**タグ候補だけで補完を動かす**
+	 * （補完全体を壊さない）。
+	 */
+	let expressionFunctions: ExpressionFunction[] = $state([]);
+	/** 取得を1回だけにするためのフラグ（リアクティブに読まないので `$state` 不要）。 */
+	let expressionFunctionsRequested = false;
+
+	/** 式欄が出ているか（＝関数表を取りに行ってよいか）。 */
+	const expressionFieldVisible = $derived(
+		(drawerMode === 'create' && createForm.tagKind === 'computed') ||
+			(drawerMode === 'edit' && selected !== null && editForm.tagKind === 'computed')
+	);
+
+	/**
+	 * 関数表はページ読み込み時ではなく**式欄を最初に開いたとき**に1回だけ
+	 * 取得する（演算タグを触らないユーザーには無駄な往復になるため）。以後は
+	 * キャッシュしたまま - 内容は静的（サーバー側で DB も設定も読まない）。
+	 */
+	$effect(() => {
+		if (!expressionFieldVisible || expressionFunctionsRequested) return;
+		expressionFunctionsRequested = true;
+		void fetchExpressionFunctions()
+			.then((list) => {
+				expressionFunctions = list;
+			})
+			.catch(() => {
+				// 権限不足・ネットワーク断でも補完は壊さない（関数候補が出ないだけ）。
+				// 次に式欄を開いたときに取り直せるよう、フラグは戻す。
+				expressionFunctionsRequested = false;
+			});
+	});
+
+	/** 段階A の IME 状態のミラー（補完も変換中は開かない）。 */
+	let exprCompletionComposing = false;
+	/** ポップアップが開いているか。 */
+	let completionOpen = $state(false);
+	/** いま補完しているセグメントの情報（`completionContextAt` の結果）。 */
+	let completionContext: CompletionContext | null = $state(null);
+	/** 選択中の候補（`visibleCompletionCandidates` に対する添字）。 */
+	let completionActiveIndex = $state(0);
+	/** ポップアップの位置（キャレット行の左上とその行の高さ、クライアント座標）。 */
+	let completionAnchor = $state({ x: 0, y: 0, lineHeight: 16 });
+	/**
+	 * 候補を確定したときの `input` 再送で {@link refreshCompletion} が走って
+	 * しまうのを止める門（確定直後に開き直すかは `completionInsertion` の
+	 * `reopen` が決めるので、再入で勝手に開かせない）。
+	 */
+	let suppressCompletionRefresh = false;
+
+	/** ポップアップに一度に出す最大件数（超過分は「他 N 件」と表示する）。 */
+	const COMPLETION_LIMIT = 20;
+
+	/**
+	 * 接続名 → グループ名 → タグ の索引。**一覧が変わったときだけ**組み直す
+	 * （毎キーストロークでは組み直さない - `expressionCompletion.ts` の
+	 * `buildCompletionIndex` doc comment 参照）。
+	 *
+	 * 段階C の除外グラフ（`insertBlockedReasons`）と同じく**生の `tags`**
+	 * （サーバー全件）から組む: 削除猶予中のタグはまだサーバー上に存在し、
+	 * 参照すれば通ってしまうため。
+	 */
+	const completionIndex = $derived(buildCompletionIndex(connections, groups, tags));
+
+	/**
+	 * 補完で除外するタグ（`id -> 理由`）。段階C の `blockedInsertTargets` を
+	 * **そのまま**使う（自タグ・式で表せない名前・文字列型・循環の4種）。
+	 * 段階C の行クリックは淡色＋トーストだが、**補完では候補に出さない** -
+	 * 打鍵の続きに出るものなので、選べない候補は矢印キーで踏むだけ邪魔になる。
+	 *
+	 * `insertBlockedReasons` を流用しないのは、あちらが「トグル ON のときだけ
+	 * 計算する」ようにしてあるため（補完はトグルと独立に効く）。
+	 */
+	const completionBlockedTagIds = $derived.by((): Map<number, string> => {
+		if (!completionOpen || completionContext?.kind !== 'segment3') return new Map();
+		const candidates: InsertCandidateTag[] = tags.map((t) => ({
+			id: t.id,
+			dataType: t.dataType,
+			tagKind: t.tagKind,
+			expression: t.expression,
+			externalName: externalNameForTag(t)
+		}));
+		return blockedInsertTargets(candidates, insertSelfId);
+	});
+
+	/** 現在の文脈に対する候補全件（上限で切る前）。 */
+	const allCompletionCandidates = $derived.by((): CompletionCandidate[] => {
+		if (!completionOpen || completionContext === null) return [];
+		return completionCandidates(
+			completionContext,
+			completionIndex,
+			expressionFunctions,
+			completionBlockedTagIds
+		);
+	});
+
+	/** 実際にポップアップへ出す候補（先頭 {@link COMPLETION_LIMIT} 件）。 */
+	const visibleCompletionCandidates = $derived(allCompletionCandidates.slice(0, COMPLETION_LIMIT));
+
+	/** ポップアップを描くか（候補0件では出さない）。 */
+	const completionVisible = $derived(completionOpen && visibleCompletionCandidates.length > 0);
+
+	/**
+	 * 式欄の `aria-activedescendant`。ポップアップはフォーカスを持たない
+	 * （`CompletionPopup.svelte` の doc comment 参照）ので、選択中の候補は
+	 * この属性で支援技術へ伝える。
+	 */
+	const completionActiveDescendantId = $derived(
+		completionVisible ? completionOptionId(completionActiveIndex) : undefined
+	);
+
+	function closeCompletion(): void {
+		completionOpen = false;
+		completionContext = null;
+		completionActiveIndex = 0;
+	}
+
+	/**
+	 * キャレット位置のクライアント座標を**段階A の `.expr-mirror` から**得る。
+	 *
+	 * ミラーは textarea と box model（font/padding/border/折り返し）が完全に
+	 * 一致するよう作ってあるので、同じクラスの要素を1つ複製して
+	 * 「キャレットまでの文字列 + 0幅の目印」を入れれば、目印の矩形が
+	 * そのままキャレットの矩形になる。**新しい座標計算は発明しない**
+	 * （実装指示）。複製は測定のあと即座に取り除く。
+	 */
+	function caretAnchor(el: HTMLTextAreaElement, caret: number): DOMRect | null {
+		const wrap = el.parentElement;
+		const mirror = wrap?.querySelector('.expr-mirror');
+		if (!wrap || !mirror) return null;
+		// 属性（= `class="expr-mirror"`）だけ写した空の複製。`.expr-field-wrap`
+		// の子として挿すので CSS もそのまま効く。
+		const probe = mirror.cloneNode(false) as HTMLElement;
+		probe.style.visibility = 'hidden';
+		probe.textContent = el.value.slice(0, caret);
+		const marker = document.createElement('span');
+		// 0幅スペース: 幅を持たずに行の高さだけを持つ目印。
+		marker.textContent = '​';
+		probe.appendChild(marker);
+		wrap.appendChild(probe);
+		const rect = marker.getBoundingClientRect();
+		probe.remove();
+		return rect;
+	}
+
+	/**
+	 * 式欄の現在の状態から補完を開き直す（あるいは閉じる）。
+	 *
+	 * 開く条件（実装指示「トリガー」）は
+	 * - `force`（Ctrl+Space / Ctrl+. / 上位セグメント確定直後の開き直し）
+	 * - 既に開いている（打鍵に追従して絞り込む）
+	 * - ドットを打った直後（第2・第3セグメントの前方一致が空）
+	 * - 2文字以上の前方一致
+	 *
+	 * **IME 変換中は開かない**（段階A の `isComposing` をそのまま見る）。
+	 * 候補が0件なら開かない（空のポップアップを出さない）。
+	 */
+	function refreshCompletion(options: { force?: boolean } = {}): void {
+		if (suppressCompletionRefresh) return;
+		const el = exprTextareaEl;
+		if (!el || exprCompletionComposing) {
+			closeCompletion();
+			return;
+		}
+		const context = completionContextAt(el.value, el.selectionStart ?? el.value.length);
+		if (context === null) {
+			closeCompletion();
+			return;
+		}
+		const shouldOpen =
+			options.force === true ||
+			completionOpen ||
+			(context.kind !== 'segment1' && context.prefix === '') ||
+			context.prefix.length >= 2;
+		if (!shouldOpen) {
+			closeCompletion();
+			return;
+		}
+
+		const anchor = caretAnchor(el, context.replaceFrom);
+		completionContext = context;
+		completionOpen = true;
+		completionActiveIndex = 0;
+		if (anchor) {
+			completionAnchor = { x: anchor.left, y: anchor.top, lineHeight: anchor.height || 16 };
+		}
+		// 候補が0件なら開いたままにしない（`allCompletionCandidates` は
+		// `completionContext`/`completionOpen` から導出されるので、ここで
+		// 読めば今の文脈の件数になる）。
+		if (allCompletionCandidates.length === 0) closeCompletion();
+	}
+
+	/**
+	 * 候補を確定する。挿入は**段階C と同じ作法**（`setRangeText` + `input`
+	 * イベント再送 + フォーカスを式欄へ戻す）で、段階A のチェックがそのまま走る。
+	 * 接続・グループを確定したときは名前 + `.` を入れて**次の階層を開き直す**。
+	 */
+	function acceptCompletion(index: number): void {
+		const candidate = visibleCompletionCandidates[index];
+		const context = completionContext;
+		const el = exprTextareaEl;
+		if (!candidate || !context || !el) return;
+		const { text, reopen } = completionInsertion(candidate);
+
+		suppressCompletionRefresh = true;
+		el.setRangeText(text, context.replaceFrom, context.replaceTo, 'end');
+		el.dispatchEvent(new Event('input', { bubbles: true }));
+		suppressCompletionRefresh = false;
+
+		el.focus();
+		closeCompletion();
+		if (reopen) refreshCompletion({ force: true });
+	}
+
+	function moveCompletionActive(delta: number): void {
+		const count = visibleCompletionCandidates.length;
+		if (count === 0) return;
+		completionActiveIndex = (((completionActiveIndex + delta) % count) + count) % count;
+	}
+
+	/**
+	 * 式欄の `keydown`。**Esc の優先順位**（実装指示）: ポップアップが開いて
+	 * いる間の Esc は**ポップアップだけ**を閉じ、段階C の「一覧から挿入」
+	 * トグルは OFF にしない。トグル側の Esc は `window` の keydown リスナーな
+	 * ので、ここで `stopPropagation` すれば届かない。
+	 *
+	 * 開く操作は **Ctrl+Space と Ctrl+.** の併用: Ctrl+Space は Linux の ibus
+	 * と Windows の IME が入力ソース切り替えに取ることがあり、アプリまで
+	 * 届かない環境がある。どちらか一方だけだと「補完が開かない環境」が
+	 * 生まれるため両方に割り当てる。
+	 */
+	function handleExpressionKeydown(event: KeyboardEvent): void {
+		if ((event.ctrlKey || event.metaKey) && (event.code === 'Space' || event.key === '.')) {
+			event.preventDefault();
+			refreshCompletion({ force: true });
+			return;
+		}
+		if (!completionOpen) return;
+		switch (event.key) {
+			case 'Escape':
+				event.preventDefault();
+				// 「一覧から挿入」トグルの Esc（window リスナー）へ渡さない。
+				event.stopPropagation();
+				closeCompletion();
+				break;
+			case 'ArrowDown':
+				event.preventDefault();
+				moveCompletionActive(1);
+				break;
+			case 'ArrowUp':
+				event.preventDefault();
+				moveCompletionActive(-1);
+				break;
+			case 'Enter':
+			case 'Tab':
+				event.preventDefault();
+				acceptCompletion(completionActiveIndex);
+				break;
+			case 'ArrowLeft':
+			case 'ArrowRight':
+			case 'Home':
+			case 'End':
+				// キャレットが動くと文脈が変わる - いったん閉じる（打ち直せば開く）。
+				closeCompletion();
+				break;
+		}
+	}
+
+	/** 式欄の `input`（段階A のチェックのあとに呼ぶ）。 */
+	function handleExpressionInput(): void {
+		refreshCompletion();
+	}
+
+	function handleExpressionCompositionStart(): void {
+		exprCompletionComposing = true;
+		closeCompletion();
+	}
+
+	function handleExpressionCompositionEnd(): void {
+		exprCompletionComposing = false;
+	}
+
+	/** マウスでキャレットを動かした・式欄から離れた（候補クリックは除く）。 */
+	function handleExpressionCaretLost(): void {
+		closeCompletion();
 	}
 
 	/**
@@ -4170,9 +4525,15 @@
 							'tag-expression-hint',
 							errors.expression && 'tag-expression-err'
 						)}
+						aria-autocomplete="list"
+						aria-controls={COMPLETION_LISTBOX_ID}
+						aria-activedescendant={exprCheck.completionActiveId}
 						oninput={exprCheck.onInput}
 						oncompositionstart={exprCheck.onCompositionStart}
-						oncompositionend={exprCheck.onCompositionEnd}></textarea>
+						oncompositionend={exprCheck.onCompositionEnd}
+						onkeydown={exprCheck.onKeydown}
+						onclick={exprCheck.onCaretLost}
+						onblur={exprCheck.onCaretLost}></textarea>
 				</div>
 				{#if exprCheck.insertToggleVisible}
 					<!--
@@ -4223,7 +4584,9 @@
 				{/if}
 				<span class="hint" id="tag-expression-hint"
 					>四則・比較・論理・if(c,a,b)・min/max/abs/round/clamp/bit(tag,n)。参照する外部名は他タグ
-					（plc/computed/internal）の完全名。保存前に自動でチェックされます。</span
+					（plc/computed/internal）の完全名。保存前に自動でチェックされます。Ctrl+Space または
+					Ctrl+.（ドットの入力・2文字以上の入力でも自動）で、接続 → 収集グループ → タグ
+					の順に補完できます。</span
 				>
 				{#if errors.expression}
 					<!--
@@ -6538,6 +6901,27 @@
 		</div>
 	{/if}
 </Drawer>
+
+<!--
+	#342 段階B: 式欄のセグメント補完ポップアップ。`position: fixed` で
+	キャレット位置に浮かべるため、Drawer/ペインの中ではなく**ページ直下**に
+	置く（狭幅の `<Modal>`/`<Drawer>` で式欄を開いているときも同じように
+	出る - 補完はキーボードだけで完結しグリッドを使わないので、「一覧から
+	挿入」トグルが広幅ペイン限定なのとは違って幅の制約が無い）。
+-->
+{#if completionVisible}
+	<CompletionPopup
+		x={completionAnchor.x}
+		y={completionAnchor.y}
+		lineHeight={completionAnchor.lineHeight}
+		candidates={visibleCompletionCandidates}
+		totalCount={allCompletionCandidates.length}
+		activeIndex={completionActiveIndex}
+		onSelect={acceptCompletion}
+		onHover={(i) => (completionActiveIndex = i)}
+		onClose={closeCompletion}
+	/>
+{/if}
 
 <style>
 	.page {

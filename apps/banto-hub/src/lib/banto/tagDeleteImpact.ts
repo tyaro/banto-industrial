@@ -121,8 +121,8 @@ const TAG_REF_PATTERN = new RegExp(
 const LEXER_SPACE_RUN = new RegExp(`${LEXER_SPACE}+`, 'g');
 
 /**
- * 完全外部名がそのまま式中のタグ参照として書けるか（3セグメントすべてが
- * {@link IDENT_SEGMENT} に完全一致するか）。
+ * セグメント1つが式中の識別子としてそのまま書けるか（{@link IDENT_SEGMENT}
+ * への完全一致）。
  *
  * #342 段階C（#379 再レビュー対応）で追加: レジストリ側のタグ名・接続名・
  * グループ名の検証は「空でない・最大長」程度しか課しておらず、banto-expr の
@@ -131,10 +131,10 @@ const LEXER_SPACE_RUN = new RegExp(`${LEXER_SPACE}+`, 'g');
  * （`expressionInsert.ts::insertionBlockReason`）。判定は上の
  * {@link TAG_REF_PATTERN} と**同じ `IDENT_SEGMENT` を使う**（正規表現を
  * 二重に持たない）。`TAG_REF_PATTERN` が「文中から切り出す」ための境界
- * チェック付きなのに対し、こちらは「名前全体が参照トークンそのものか」を
+ * チェック付きなのに対し、こちらは「その名前がまるごと識別子そのものか」を
  * 見るためアンカー（`^...$`）で完全一致させる。
  */
-const FULL_TAG_REF_PATTERN = new RegExp(`^${IDENT_SEGMENT}\\.${IDENT_SEGMENT}\\.${IDENT_SEGMENT}$`);
+const FULL_IDENT_SEGMENT_PATTERN = new RegExp(`^${IDENT_SEGMENT}$`);
 
 /**
  * **第1セグメントに置けない予約語**（#379 レビュー対応。正は
@@ -154,16 +154,48 @@ const FULL_TAG_REF_PATTERN = new RegExp(`^${IDENT_SEGMENT}\\.${IDENT_SEGMENT}\\.
 const RESERVED_FIRST_SEGMENTS = new Set(['true', 'false']);
 
 /**
- * {@link FULL_TAG_REF_PATTERN} / {@link RESERVED_FIRST_SEGMENTS} 参照。
- * `abc-`（末尾ハイフン）や `a--b`（連続ハイフン）が弾かれるのは、
- * {@link IDENT_SEGMENT} が lexer の「`-` は直後に継続文字があるときだけ
- * 吸収」規則をそのまま写しているため（#379 レビュー対応の2回目までは別の
- * `DANGLING_HYPHEN_PATTERN` で後から弾いていたが、`IDENT_SEGMENT` 側を
- * 厳密にしたので不要になった）。
+ * セグメント1つが式に書けるか。{@link FULL_IDENT_SEGMENT_PATTERN} /
+ * {@link RESERVED_FIRST_SEGMENTS} 参照。`abc-`（末尾ハイフン）や `a--b`
+ * （連続ハイフン）が弾かれるのは、{@link IDENT_SEGMENT} が lexer の
+ * 「`-` は直後に継続文字があるときだけ吸収」規則をそのまま写しているため
+ * （#379 レビュー対応の2回目までは別の `DANGLING_HYPHEN_PATTERN` で後から
+ * 弾いていたが、`IDENT_SEGMENT` 側を厳密にしたので不要になった）。
+ *
+ * #342 段階B で切り出した: セグメント補完
+ * （`expressionCompletion.ts::completionCandidates`）は接続名・グループ名を
+ * **1セグメント単位で**「式に書けるか」判定する必要がある（完全名がまだ
+ * 揃っていない段階で候補を出すため）。そこで別の正規表現を起こすと判定が
+ * 2箇所に割れるので、{@link isExpressionRepresentableName} の方を
+ * **この関数を使う形に書き直してある** - 規則の追加はここ1箇所で済む。
+ *
+ * @param options.first 第1セグメント（接続名）として評価するか。`true` の
+ *   ときだけ `true`/`false` を予約語として拒否する
+ *   （{@link RESERVED_FIRST_SEGMENTS}）。
+ */
+export function isExpressionRepresentableSegment(
+	name: string,
+	options: { first?: boolean } = {}
+): boolean {
+	if (!FULL_IDENT_SEGMENT_PATTERN.test(name)) return false;
+	return !(options.first === true && RESERVED_FIRST_SEGMENTS.has(name));
+}
+
+/**
+ * 完全外部名がそのまま式中のタグ参照として書けるか（ドット区切りちょうど3
+ * セグメントで、各セグメントが {@link isExpressionRepresentableSegment} を
+ * 満たすか）。
+ *
+ * {@link IDENT_SEGMENT} は `.` を含まないので、「3セグメント連結の正規表現に
+ * 完全一致」と「`.` で割って3つ・各々が識別子」は同値 - #342 段階B で後者へ
+ * 書き直し、セグメント単位の判定と完全名の判定が**同じ関数**を通るように
+ * した（判定を2箇所に分けない）。
  */
 export function isExpressionRepresentableName(externalName: string): boolean {
-	if (!FULL_TAG_REF_PATTERN.test(externalName)) return false;
-	return !RESERVED_FIRST_SEGMENTS.has(externalName.slice(0, externalName.indexOf('.')));
+	const segments = externalName.split('.');
+	if (segments.length !== 3) return false;
+	return segments.every((segment, index) =>
+		isExpressionRepresentableSegment(segment, { first: index === 0 })
+	);
 }
 
 /**

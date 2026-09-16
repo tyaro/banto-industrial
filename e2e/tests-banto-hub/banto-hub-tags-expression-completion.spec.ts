@@ -1,0 +1,319 @@
+/**
+ * #342 段階B（docs/tag-server-design.md §4.2「セグメント補完」）: 演算タグの
+ * 式欄のセグメント補完の実 DOM 受け入れテスト。
+ *
+ * このファイルを新設した理由: 段階A の
+ * `banto-hub-tags-expression-check.spec.ts` は式欄の**チェック結果表示**、
+ * 段階C の `banto-hub-tags-expression-insert.spec.ts` は**一覧からの挿入**を
+ * 見ており、段階B の本題（打鍵に追従して候補が出る・確定すると次の階層が
+ * 開く・Ctrl+. で任意位置から開ける・**Esc はポップアップだけを閉じて
+ * 「一覧から挿入」トグルは OFF にしない**・関数候補）は誰も固定していない。
+ *
+ * ファイル名は `banto-hub-smoke.spec.ts` より辞書順で後
+ * （`banto-hub-auth.ts` の注記参照）で、段階A の `...-expression-check` と
+ * 段階C の `...-expression-insert` の**あいだ**に並ぶ（`ch` < `co` < `in`）。
+ * 3段階が並んで読めるようにするための命名。
+ *
+ * **グリッドの行は一切クリックしない**（補完はキーボードだけで完結する）ので、
+ * `BantoGrid` の行仮想化（`banto-hub-tags-revision.spec.ts` 冒頭の doc
+ * comment 参照）の影響を受けない。ツリーのノードだけを使う。
+ *
+ * 前提データは UI ではなく `page.request` で直接 REST を叩いて作る
+ * （`banto-hub-tags-expression-insert.spec.ts` と同じパターン）。接続名・
+ * グループ名・タグ名は banto-expr の識別子文法（ASCII・英字始まり）を満たし、
+ * かつ他スペックの固定名と衝突しないものにしてある（`plc_connections`/
+ * `collection_groups` の `name` は UNIQUE）。
+ */
+import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
+import { CSRF_HEADERS, fetchAuthToken, groupNodeByName, injectAuthToken } from './banto-hub-auth';
+
+const CONNECTION_NAME = 'e2ecompline1';
+const GROUP_NAME = 'e2ecompfast';
+const REF_TAG_NAME = 'e2ecomptemp';
+/** `e2ecomptemp` と前方一致で区別できる2件目（絞り込みの確認に使う）。 */
+const OTHER_TAG_NAME = 'e2ecompother';
+const CALC_GROUP_NAME = 'e2e-expr-comp-calc-group';
+
+const REF_EXTERNAL_NAME = `${CONNECTION_NAME}.${GROUP_NAME}.${REF_TAG_NAME}`;
+
+function waitForExpressionCheck(page: Page) {
+	return page.waitForResponse(
+		(res) =>
+			res.url().includes('/api/tags/expression/check') &&
+			res.request().method() === 'POST' &&
+			res.status() === 200
+	);
+}
+
+/**
+ * 各 DELETE の応答を検証する（204、または既に無い場合の 404 だけを許容）。
+ * `banto-hub-tags-expression-insert.spec.ts::expectDeleted` と同じ。
+ */
+async function expectDeleted(
+	request: APIRequestContext,
+	headers: Record<string, string>,
+	path: string
+): Promise<void> {
+	const res = await request.delete(path, { headers });
+	expect(
+		[204, 404],
+		`DELETE ${path} が ${res.status()} で失敗しました: ${await res.text()}`
+	).toContain(res.status());
+}
+
+/**
+ * この spec が使う固定名のリソースを、存在すれば掃除する
+ * （`banto-hub-tags-expression-insert.spec.ts::cleanupExistingFixtures` を
+ * 写したもの - 流儀をそちらに揃えている）。**`beforeAll` の先頭と `afterAll`
+ * の両方**で呼ぶ: `name` が UNIQUE なのでリトライで `beforeAll` が再走すると
+ * 前回分と衝突し、残したタグは後続スペックの一覧行数（＝仮想化された
+ * グリッドの描画窓）を押し上げる。
+ *
+ * 削除順は **computed タグ → それ以外のタグ → グループ → 接続**（FK だけで
+ * なく式の参照も順序を縛る）。`calc` 予約接続自体は削除しない。
+ */
+async function cleanupExistingFixtures(
+	request: APIRequestContext,
+	headers: Record<string, string>
+): Promise<void> {
+	const groupsRes = await request.get('/api/collection-groups', { headers });
+	if (!groupsRes.ok()) return;
+	const groups = (await groupsRes.json()) as Array<{ id: number; name: string }>;
+	const targetGroups = groups.filter((g) => g.name === GROUP_NAME || g.name === CALC_GROUP_NAME);
+
+	if (targetGroups.length > 0) {
+		const tagsRes = await request.get('/api/tags', { headers });
+		if (tagsRes.ok()) {
+			const tags = (await tagsRes.json()) as Array<{
+				id: number;
+				collectionGroupId: number;
+				tagKind: string;
+			}>;
+			const groupIds = new Set(targetGroups.map((g) => g.id));
+			const targetTags = tags.filter((t) => groupIds.has(t.collectionGroupId));
+			for (const tag of targetTags.filter((t) => t.tagKind === 'computed')) {
+				await expectDeleted(request, headers, `/api/tags/${tag.id}`);
+			}
+			for (const tag of targetTags.filter((t) => t.tagKind !== 'computed')) {
+				await expectDeleted(request, headers, `/api/tags/${tag.id}`);
+			}
+		}
+		for (const group of targetGroups) {
+			await expectDeleted(request, headers, `/api/collection-groups/${group.id}`);
+		}
+	}
+
+	const connectionsRes = await request.get('/api/plc-connections', { headers });
+	if (connectionsRes.ok()) {
+		const connections = (await connectionsRes.json()) as Array<{ id: number; name: string }>;
+		const existing = connections.find((c) => c.name === CONNECTION_NAME);
+		if (existing) await expectDeleted(request, headers, `/api/plc-connections/${existing.id}`);
+	}
+}
+
+test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342 段階B)', () => {
+	let page: Page;
+	let authedHeaders: Record<string, string>;
+
+	test.beforeAll(async ({ browser }) => {
+		page = await browser.newPage();
+		await page.goto('/login');
+
+		const token = await fetchAuthToken(page.request);
+		await injectAuthToken(page, token);
+		authedHeaders = { ...CSRF_HEADERS, Authorization: `Bearer ${token}` };
+
+		await cleanupExistingFixtures(page.request, authedHeaders);
+
+		// 前提データ1: シミュレーションモードの PLC接続 + 収集グループ +
+		// 補完で選ぶ PLC タグ2件（実 PLC/実ネットワークへは繋がない）。
+		const connectionRes = await page.request.post('/api/plc-connections', {
+			headers: authedHeaders,
+			data: {
+				name: CONNECTION_NAME,
+				protocol: 'modbus-tcp',
+				host: '127.0.0.1',
+				port: 502,
+				unitId: 1,
+				enabled: true,
+				simulation: true
+			}
+		});
+		expect(connectionRes.ok()).toBe(true);
+		const connection = (await connectionRes.json()) as { id: number };
+
+		const groupRes = await page.request.post('/api/collection-groups', {
+			headers: authedHeaders,
+			data: { name: GROUP_NAME, plcConnectionId: connection.id, periodMs: 1000, enabled: true }
+		});
+		expect(groupRes.ok()).toBe(true);
+		const group = (await groupRes.json()) as { id: number };
+
+		for (const [index, name] of [REF_TAG_NAME, OTHER_TAG_NAME].entries()) {
+			const tagRes = await page.request.post('/api/tags', {
+				headers: authedHeaders,
+				data: {
+					name,
+					collectionGroupId: group.id,
+					address: String(40001 + index),
+					dataType: 'i16',
+					unit: '℃',
+					decimals: 0,
+					enabled: true,
+					writable: false,
+					tagKind: 'plc'
+				}
+			});
+			expect(tagRes.ok()).toBe(true);
+		}
+
+		// 前提データ2: `calc` 予約接続（起動時に自動作成済み）配下の収集
+		// グループ - ここから「新規登録」すると `tagKind` が `computed` に
+		// 確定し、式欄が最初から出る（`tagOnboarding.ts::resolveRegistrationTarget`）。
+		const connectionsRes = await page.request.get('/api/plc-connections', {
+			headers: authedHeaders
+		});
+		expect(connectionsRes.ok()).toBe(true);
+		const connections = (await connectionsRes.json()) as { id: number; name: string }[];
+		const calcConnection = connections.find((c) => c.name === 'calc');
+		if (!calcConnection) {
+			throw new Error("予約接続 'calc' が見つかりません（サーバー起動時に自動作成される想定）");
+		}
+		const calcGroupRes = await page.request.post('/api/collection-groups', {
+			headers: authedHeaders,
+			data: {
+				name: CALC_GROUP_NAME,
+				plcConnectionId: calcConnection.id,
+				periodMs: 1000,
+				enabled: true
+			}
+		});
+		expect(calcGroupRes.ok()).toBe(true);
+	});
+
+	test.afterAll(async () => {
+		await cleanupExistingFixtures(page.request, authedHeaders);
+
+		// 掃除が実際に効いたことをサーバー側で確認する（削除順や preflight
+		// 拒否で残っていれば、ここで落ちる）。
+		const tagsRes = await page.request.get('/api/tags', { headers: authedHeaders });
+		expect(tagsRes.ok()).toBe(true);
+		const remaining = ((await tagsRes.json()) as Array<{ name: string }>)
+			.map((t) => t.name)
+			.filter((name) => name.startsWith('e2ecomp'));
+		expect(remaining, 'この spec のタグが残っています').toEqual([]);
+
+		await page.close();
+	});
+
+	test('1. 接続名 + ドットで収集グループの候補が出て、確定すると次の階層まで入る', async () => {
+		await page.goto('/tags');
+		await groupNodeByName(page, CALC_GROUP_NAME).click();
+		await page.getByRole('button', { name: '新規登録' }).click();
+
+		// 広幅では新規作成も非モーダルの右ペイン（#375 / #342 段階C）。
+		const pane = page.getByRole('complementary', { name: '新規作成' });
+		await expect(pane).toBeVisible();
+
+		const expressionField = pane.getByLabel('式');
+		await expect(expressionField).toBeVisible();
+
+		// 「接続名 + ドット」まで打つと第2セグメント（収集グループ）の候補が出る。
+		await expressionField.fill(`${CONNECTION_NAME}.`);
+		const popup = page.getByTestId('expression-completion');
+		await expect(popup).toBeVisible();
+		await expect(popup.getByRole('option', { name: new RegExp(GROUP_NAME) })).toBeVisible();
+
+		// 確定（Enter）すると **名前 + ドット**が入り、そのまま第3セグメント
+		// （タグ）の候補が開く。
+		await page.keyboard.press('Enter');
+		await expect(expressionField).toHaveValue(`${CONNECTION_NAME}.${GROUP_NAME}.`);
+		await expect(popup).toBeVisible();
+		await expect(popup.getByRole('option', { name: new RegExp(REF_TAG_NAME) })).toBeVisible();
+		await expect(popup.getByRole('option', { name: new RegExp(OTHER_TAG_NAME) })).toBeVisible();
+	});
+
+	test('2. 3セグメント目を確定すると式チェックが走り、プレビューに参照タグが出る', async () => {
+		const pane = page.getByRole('complementary', { name: '新規作成' });
+		const expressionField = pane.getByLabel('式');
+		const popup = page.getByTestId('expression-completion');
+
+		// 打鍵で候補を絞る（`e2ecomptemp` だけが残る）。
+		await expressionField.pressSequentially(REF_TAG_NAME.slice(0, 8));
+		await expect(popup.getByRole('option')).toHaveCount(1);
+
+		const checkResponse = waitForExpressionCheck(page);
+		await page.keyboard.press('Enter');
+
+		// タグを確定したらポップアップは閉じ、参照が完成する。
+		await expect(popup).toHaveCount(0);
+		await expect(expressionField).toHaveValue(REF_EXTERNAL_NAME);
+
+		// 挿入が `input` として流れ、段階A のチェックが走ってプレビューに出る。
+		await checkResponse;
+		const preview = pane.getByTestId('expression-preview');
+		await expect(preview).toBeVisible();
+		await expect(preview).toContainText(REF_EXTERNAL_NAME);
+	});
+
+	test('3. Ctrl+. で任意の位置から補完を開ける', async () => {
+		const pane = page.getByRole('complementary', { name: '新規作成' });
+		const expressionField = pane.getByLabel('式');
+		const popup = page.getByTestId('expression-completion');
+
+		// 演算子の直後（前方一致0文字）は自動では開かない位置。
+		await expressionField.fill('1 + ');
+		await expect(popup).toHaveCount(0);
+
+		await page.keyboard.press('Control+Period');
+		await expect(popup).toBeVisible();
+		// 第1セグメントの候補は接続名（関数候補も混ざるが、それはテスト5で見る -
+		// ここで関数まで見ると、他スペックが残した接続の数しだいで表示上限
+		// （20件）に押し出されて不安定になる）。
+		await expect(popup.getByRole('option', { name: new RegExp(CONNECTION_NAME) })).toBeVisible();
+	});
+
+	test('4. Esc はポップアップだけを閉じ、「一覧から挿入」トグルは ON のまま', async () => {
+		const pane = page.getByRole('complementary', { name: '新規作成' });
+		const expressionField = pane.getByLabel('式');
+		const popup = page.getByTestId('expression-completion');
+		const toggle = pane.getByTestId('tag-expression-insert-toggle');
+
+		// 段階C のトグルを ON にしてから補完を開く。
+		await toggle.click();
+		await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+
+		await expressionField.click();
+		await page.keyboard.press('Control+Period');
+		await expect(popup).toBeVisible();
+
+		// 1回目の Esc: ポップアップだけ閉じる（トグルは ON のまま）。
+		await page.keyboard.press('Escape');
+		await expect(popup).toHaveCount(0);
+		await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+		await expect(page.getByTestId('tag-insert-armed-badge')).toBeVisible();
+
+		// 2回目の Esc: 段階C の既存挙動どおりトグルが OFF になる（ペインは閉じない）。
+		await page.keyboard.press('Escape');
+		await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+		await expect(page.getByTestId('tag-insert-armed-badge')).toHaveCount(0);
+		await expect(pane).toBeVisible();
+	});
+
+	test('5. 組み込み関数の候補を確定すると `name(` が入る', async () => {
+		const pane = page.getByRole('complementary', { name: '新規作成' });
+		const expressionField = pane.getByLabel('式');
+		const popup = page.getByTestId('expression-completion');
+
+		// 2文字以上の前方一致で自動的に開く。関数表はサーバー
+		// （`GET /api/tags/expression/functions`）から配られたもの。
+		await expressionField.fill('mi');
+		await expect(popup).toBeVisible();
+		await expect(popup.getByRole('option')).toHaveCount(1);
+		await expect(popup.getByRole('option', { name: /min/ })).toBeVisible();
+
+		await page.keyboard.press('Enter');
+		await expect(popup).toHaveCount(0);
+		await expect(expressionField).toHaveValue('min(');
+	});
+});

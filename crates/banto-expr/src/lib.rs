@@ -126,6 +126,12 @@ mod types;
 
 pub use dag::validate_dag;
 pub use error::{CompileError, CycleError, EvalError};
+/// #342 段階B: 組み込み関数の表（名前・引数個数・呼び出し形・説明）。
+/// **型検査が読むのと同じ表**（`typecheck::check_call` がここから名前と
+/// 引数個数を引く）をそのまま公開し、banto-hub の
+/// `GET /api/tags/expression/functions` が UI の補完候補へ配る - フロント
+/// 側に関数表を手書きさせないための単一ソース。
+pub use typecheck::{BuiltinFunction, BUILTIN_FUNCTIONS};
 pub use types::{Type, Value};
 
 /// パース + 型検査済みの式。`compile` の唯一の戻り値であり、これ以降の

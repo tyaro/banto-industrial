@@ -139,6 +139,52 @@ export async function checkExpression(
 }
 
 /**
+ * #342 段階B: `GET /api/tags/expression/functions` の応答要素。**正は Rust の
+ * `banto_expr::BUILTIN_FUNCTIONS`**（型検査の `check_call` が名前と引数個数を
+ * 引くのと同じ表）で、フロントは受け取って表示するだけ - 関数表をここに
+ * 書き写さない（表が2つに割れてドリフトするのを避けるため、
+ * `apps/banto-hub/core/src/rest.rs::tags_expression_functions` の doc comment
+ * 参照）。
+ */
+export interface ExpressionFunction {
+	name: string;
+	arity: number;
+	/** 呼び出し形の見本（例: `if(条件, 真のとき, 偽のとき)`）。補完の `detail` に出す。 */
+	signature: string;
+	/** 1行の日本語説明。 */
+	description: string;
+}
+
+/**
+ * 組み込み関数表を取得する。内容は**静的**（サーバー側で DB も設定も読まない）
+ * なので、呼び出し側は1回取得してキャッシュしてよい。
+ *
+ * 認可は式チェックと同じ `require_editor` - 失敗（権限不足・ネットワーク断）
+ * したら**補完全体を壊さず**タグ候補だけで動かすこと（呼び出し側で握りつぶす
+ * 前提なので、ここでは素直に throw する）。
+ */
+export async function fetchExpressionFunctions(): Promise<ExpressionFunction[]> {
+	const headers: Record<string, string> = { ...CSRF_HEADER };
+	const token = currentToken();
+	if (token) headers.Authorization = `Bearer ${token}`;
+
+	let response: Response;
+	try {
+		response = await fetch('/api/tags/expression/functions', { headers });
+	} catch {
+		throw new ProviderError({ kind: 'other', message: NETWORK_ERROR_MESSAGE });
+	}
+	if (!response.ok) {
+		throw new ProviderError({
+			kind: 'other',
+			message: `${response.status} ${response.statusText}`
+		});
+	}
+	const body = (await response.json()) as { functions?: ExpressionFunction[] };
+	return body.functions ?? [];
+}
+
+/**
  * `computed` タグの式欄でだけチェックを叩く（他の `tagKind` では
  * `expression` フィールド自体が無意味）。空文字（前後空白のみを含む）は
  * 「未入力」としてチェックを叩かない - {@link ExpressionCheckController}
