@@ -190,6 +190,7 @@
 		completionContextAt,
 		completionContextMatchesCaret,
 		completionInsertion,
+		clampCompletionIndex,
 		type CompletionCandidate,
 		type CompletionContext
 	} from '$lib/banto/expressionCompletion';
@@ -1970,7 +1971,7 @@
 		void selected?.id;
 		untrack(() => {
 			insertArmed = false;
-			closeCompletion();
+			dismissCompletion();
 		});
 	});
 
@@ -1982,7 +1983,7 @@
 	 * 遅延取得と同じ条件 - その doc comment 参照）。
 	 */
 	$effect(() => {
-		if (!expressionFieldVisible) untrack(() => closeCompletion());
+		if (!expressionFieldVisible) untrack(() => dismissCompletion());
 	});
 
 	/**
@@ -2157,6 +2158,20 @@
 	 * `reopen` が決めるので、再入で勝手に開かせない）。
 	 */
 	let suppressCompletionRefresh = false;
+	/**
+	 * #380 レビュー対応A: **明示的に閉じた**（Escape / 外側クリック / 式欄から
+	 * フォーカスが外れた / 候補を確定した）ことを覚えておく門。次の `input`
+	 * （＝ユーザーが打鍵を再開した）まで、**自動トリガーでの再オープンを抑止**
+	 * する。
+	 *
+	 * これが無いと、関数表のフェッチが Escape の後に解決したときに
+	 * `refreshCompletion()` が「フォーカスがあって2文字以上」を見て**新規
+	 * トリガーとして開き直す**（通常のネットワーク遅延で Escape の約束が破れる）。
+	 *
+	 * **`Ctrl+Space` / `Ctrl+.` の明示トリガー（`force`）はこの門を無視する** -
+	 * ユーザーが明示的に求めているため。リアクティブに読まないので `$state` 不要。
+	 */
+	let completionDismissed = false;
 
 	/** ポップアップに一度に出す最大件数（超過分は「他 N 件」と表示する）。 */
 	const COMPLETION_LIMIT = 20;
@@ -2202,15 +2217,28 @@
 	const completionVisible = $derived(completionOpen && visibleCompletionCandidates.length > 0);
 
 	/**
-	 * #380 レビュー対応4: 候補が空になったら**状態も閉じる**。`refreshCompletion`
-	 * は自分が計算した直後の0件を見て閉じるが、その後に一覧が更新される
-	 * （カタログの再取得・タグの削除）と `completionOpen` が true のまま候補だけ
-	 * 0件になりうる。キー処理は `completionVisible` で守ってあるので実害は
-	 * 無くなっているが、状態として矛盾を残さない。
+	 * 開いている間に候補が変わったときの後始末（#380 レビュー対応4・B）。
+	 * `refreshCompletion` は自分が計算した直後しか見ないので、その後に一覧が
+	 * 更新される（カタログの再取得・タグの削除・関数表の到着）と状態がずれる:
+	 *
+	 * - **0件になったら閉じる**。キー処理は `completionVisible` で守ってあるが、
+	 *   状態として矛盾を残さない。
+	 * - **1件以上に減ったら `completionActiveIndex` を末尾へクランプする**。
+	 *   6件→2件で添字が5のまま残ると、`aria-activedescendant` が存在しない
+	 *   option を指し、Enter/Tab が `acceptCompletion(5)` を呼んで無反応になる。
 	 */
 	$effect(() => {
-		if (completionOpen && visibleCompletionCandidates.length === 0) {
+		if (!completionOpen) return;
+		const count = visibleCompletionCandidates.length;
+		if (count === 0) {
 			untrack(() => closeCompletion());
+			return;
+		}
+		const clamped = clampCompletionIndex(completionActiveIndex, count);
+		if (clamped !== completionActiveIndex) {
+			untrack(() => {
+				completionActiveIndex = clamped;
+			});
 		}
 	});
 
@@ -2223,10 +2251,21 @@
 		completionVisible ? completionOptionId(completionActiveIndex) : undefined
 	);
 
+	/** 状態を畳むだけ（自動トリガーの抑止はしない）。 */
 	function closeCompletion(): void {
 		completionOpen = false;
 		completionContext = null;
 		completionActiveIndex = 0;
+	}
+
+	/**
+	 * **ユーザーの意思で閉じた**ときはこちらを使う（#380 レビュー対応A）:
+	 * 次の `input` まで自動トリガーでの再オープンを抑止する
+	 * （{@link completionDismissed} の doc comment 参照）。
+	 */
+	function dismissCompletion(): void {
+		completionDismissed = true;
+		closeCompletion();
 	}
 
 	/**
@@ -2279,6 +2318,9 @@
 	 */
 	function refreshCompletion(options: { force?: boolean } = {}): void {
 		if (suppressCompletionRefresh) return;
+		// #380 レビュー対応A: 明示的に閉じた後は、次の打鍵まで自動では開かない
+		// （`force` = Ctrl+Space / Ctrl+. / 上位セグメント確定直後の開き直しは通す）。
+		if (options.force !== true && completionDismissed) return;
 		const el = exprTextareaEl;
 		if (!el || exprCompletionComposing) {
 			closeCompletion();
@@ -2343,7 +2385,9 @@
 		suppressCompletionRefresh = false;
 
 		el.focus();
-		closeCompletion();
+		// 確定も「ユーザーの意思で閉じた」扱い - 続けて次の階層を開くのは
+		// `reopen` の `force` 経由だけにする（フェッチ解決などで勝手に開かない）。
+		dismissCompletion();
 		if (reopen) refreshCompletion({ force: true });
 	}
 
@@ -2380,7 +2424,8 @@
 				event.preventDefault();
 				// 「一覧から挿入」トグルの Esc（window リスナー）へ渡さない。
 				event.stopPropagation();
-				closeCompletion();
+				// 明示的に閉じたので、次の打鍵まで自動では開き直さない。
+				dismissCompletion();
 				break;
 			case 'ArrowDown':
 				event.preventDefault();
@@ -2412,6 +2457,8 @@
 
 	/** 式欄の `input`（段階A のチェックのあとに呼ぶ）。 */
 	function handleExpressionInput(): void {
+		// 打鍵が再開したら、明示クローズの抑止を解く（#380 レビュー対応A）。
+		completionDismissed = false;
 		refreshCompletion();
 	}
 
@@ -2430,12 +2477,14 @@
 	 */
 	function handleExpressionCompositionEnd(): void {
 		exprCompletionComposing = false;
+		// IME の確定も「打鍵」なので、明示クローズの抑止を解いてから評価する。
+		completionDismissed = false;
 		refreshCompletion();
 	}
 
 	/** マウスでキャレットを動かした・式欄から離れた（候補クリックは除く）。 */
 	function handleExpressionCaretLost(): void {
-		closeCompletion();
+		dismissCompletion();
 	}
 
 	/**
@@ -4589,7 +4638,9 @@
 				flex column のままなので見た目は変わらない。
 			-->
 			<div class="field wide">
-				<label for="tag-expression">式（expression）<span class="required">*</span></label>
+				<label id="tag-expression-label" for="tag-expression"
+					>式（expression）<span class="required">*</span></label
+				>
 				<!--
 					#342 段階A: textarea の下にミラー要素（同じフォント・パディング・
 					折り返し）を重ね、`pos`（バイト = 文字オフセット、
@@ -4614,10 +4665,16 @@
 					`aria-activedescendant`/`aria-autocomplete` は**フォーカスを持つ
 					要素**に置く必要があるので textarea 側のまま。ミラーは
 					`aria-hidden="true"` なので combobox の中にあっても支障ない。
+
+					#380 レビュー対応C: combobox には**アクセシブル名**が要る。
+					`<label>` は入れ子の textarea を指しているだけでラッパーの名前には
+					ならないので、`aria-labelledby` でその `<label>` の id を指す
+					（`aria-label` を直書きすると表示ラベルと文言がずれるため）。
 				-->
 				<div
 					class="expr-field-wrap"
 					role="combobox"
+					aria-labelledby="tag-expression-label"
 					aria-expanded={exprCheck.completionOpen}
 					aria-haspopup="listbox"
 					aria-controls={COMPLETION_LISTBOX_ID}
@@ -7032,7 +7089,7 @@
 		activeIndex={completionActiveIndex}
 		onSelect={acceptCompletion}
 		onHover={(i) => (completionActiveIndex = i)}
-		onClose={closeCompletion}
+		onClose={dismissCompletion}
 	/>
 {/if}
 

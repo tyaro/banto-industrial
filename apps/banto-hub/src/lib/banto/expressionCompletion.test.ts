@@ -7,6 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import {
 	buildCompletionIndex,
+	clampCompletionIndex,
 	completionCandidates,
 	completionContextAt,
 	completionContextMatchesCaret,
@@ -306,6 +307,20 @@ describe('completionContextMatchesCaret', () => {
 	it('選択範囲があるときも一致しない', () => {
 		expect(completionContextMatchesCaret(context, 0, 13)).toBe(false);
 		expect(completionContextMatchesCaret(context, 13, 20)).toBe(false);
+	});
+});
+
+describe('clampCompletionIndex', () => {
+	it('候補が減ったら末尾へ丸める（#380 レビュー対応B）', () => {
+		// 6件で5番目を選んでいたところへ2件へ減った、という状況。
+		expect(clampCompletionIndex(5, 2)).toBe(1);
+		expect(clampCompletionIndex(1, 2)).toBe(1);
+		expect(clampCompletionIndex(0, 2)).toBe(0);
+	});
+
+	it('負の添字・0件でも 0 に落ちる', () => {
+		expect(clampCompletionIndex(-1, 3)).toBe(0);
+		expect(clampCompletionIndex(3, 0)).toBe(0);
 	});
 });
 

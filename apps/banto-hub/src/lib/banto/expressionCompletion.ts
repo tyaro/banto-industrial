@@ -412,6 +412,20 @@ export function completionCandidates(
 		.map((tag) => ({ label: tag.name, kind: 'tag', detail: tagDetail(tag), description: null }));
 }
 
+/**
+ * 選択中の候補の添字を、候補件数に収まるよう丸める（#380 レビュー対応B）。
+ *
+ * ポップアップが開いている間にも候補は変わりうる（カタログの再取得・タグの
+ * 削除・関数表の到着）。6件→2件のように**減った**ときに添字が 5 のまま残ると、
+ * `aria-activedescendant` が存在しない option を指し、Enter/Tab が「候補なし」
+ * の位置で確定を試みて無反応になる。0件のときの扱い（閉じる）は呼び出し元の
+ * 責務なので、ここは `0` を返すだけにとどめる。
+ */
+export function clampCompletionIndex(index: number, count: number): number {
+	if (count <= 0) return 0;
+	return Math.min(Math.max(index, 0), count - 1);
+}
+
 // ---------------------------------------------------------------------------
 // 4. 確定時に挿入する文字列（completionInsertion）
 // ---------------------------------------------------------------------------

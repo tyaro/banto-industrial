@@ -27,6 +27,12 @@
  * （`banto-hub-auth.ts` の注記参照）で、段階Aの `...-expression-check` の
  * 直後に並ぶ。前提データは UI ではなく `page.request` で直接 REST を叩いて
  * 作る（`banto-hub-tags-expression-check.spec.ts` と同じパターン）。
+ *
+ * #380 レビュー対応C（2026-09-16）: 式欄の locator を `getByLabel('式')` から
+ * `getByRole('textbox', { name: /^式（expression）/ })` へ変えた。式欄を包む
+ * ラッパーが `role="combobox"` + `aria-labelledby` で同じラベルを共有する
+ * ようになり、`getByLabel` が2要素に一致するため（詳細は
+ * `banto-hub-tags-expression-completion.spec.ts` 冒頭）。
  */
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
 import { CSRF_HEADERS, fetchAuthToken, groupNodeByName, injectAuthToken } from './banto-hub-auth';
@@ -311,7 +317,7 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 		const pane = page.getByRole('complementary', { name: '新規作成' });
 		await expect(pane).toBeVisible();
 
-		const expressionField = pane.getByLabel('式');
+		const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
 		await expect(expressionField).toBeVisible();
 		// #379 レビュー対応4: 式欄のラベルは `<label for="tag-expression">` の
 		// 明示形。`<label>` でフォーム全体を囲んでいた頃はトグルやエラー
@@ -403,7 +409,7 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 		const pane = page.getByRole('complementary', { name: `${COMPUTED_TAG_NAME} を編集` });
 		await expect(pane).toBeVisible();
 
-		const expressionField = pane.getByLabel('式');
+		const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
 		await expect(expressionField).toHaveValue(`${REF_EXTERNAL_NAME} * 2`);
 
 		const toggle = pane.getByTestId('tag-expression-insert-toggle');
@@ -529,7 +535,7 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 
 			// `tagKind` は `calc` グループ由来で `computed` に確定しており式欄は
 			// 出るが、オーバーレイの下のグリッドを触れないのでトグルは出さない。
-			await expect(modal.getByLabel('式')).toBeVisible();
+			await expect(modal.getByRole('textbox', { name: /^式（expression）/ })).toBeVisible();
 			await expect(modal.getByTestId('tag-expression-insert-toggle')).toHaveCount(0);
 		} finally {
 			await narrowPage.close();
@@ -540,7 +546,7 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 		// テスト7で開いた新規作成ペイン（`tagKind === 'computed'`、式は空）を使う。
 		const pane = page.getByRole('complementary', { name: '新規作成' });
 		await expect(pane).toBeVisible();
-		const expressionField = pane.getByLabel('式');
+		const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
 		await expect(expressionField).toHaveValue('');
 
 		const toggle = pane.getByTestId('tag-expression-insert-toggle');

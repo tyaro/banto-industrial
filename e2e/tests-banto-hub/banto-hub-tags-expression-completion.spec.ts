@@ -18,6 +18,13 @@
  * `BantoGrid` の行仮想化（`banto-hub-tags-revision.spec.ts` 冒頭の doc
  * comment 参照）の影響を受けない。ツリーのノードだけを使う。
  *
+ * **式欄の locator は `getByLabel('式')` ではなく
+ * `getByRole('textbox', { name: /^式（expression）/ })`**（#380 レビュー対応C）:
+ * 式欄を包むラッパーが `role="combobox"` + `aria-labelledby` で**同じラベルを
+ * 共有する**ようになったため、`getByLabel` は combobox と textbox の2つに
+ * 一致して strict mode 違反になる（これは ARIA として正しい形なので、locator
+ * 側をロールで絞る）。段階A・段階C の spec も同じ理由で揃えてある。
+ *
  * 前提データは UI ではなく `page.request` で直接 REST を叩いて作る
  * （`banto-hub-tags-expression-insert.spec.ts` と同じパターン）。接続名・
  * グループ名・タグ名は banto-expr の識別子文法（ASCII・英字始まり）を満たし、
@@ -215,7 +222,7 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 		const pane = page.getByRole('complementary', { name: '新規作成' });
 		await expect(pane).toBeVisible();
 
-		const expressionField = pane.getByLabel('式');
+		const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
 		await expect(expressionField).toBeVisible();
 
 		// 「接続名 + ドット」まで打つと第2セグメント（収集グループ）の候補が出る。
@@ -235,7 +242,7 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 
 	test('2. 3セグメント目を確定すると式チェックが走り、プレビューに参照タグが出る', async () => {
 		const pane = page.getByRole('complementary', { name: '新規作成' });
-		const expressionField = pane.getByLabel('式');
+		const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
 		const popup = page.getByTestId('expression-completion');
 
 		// 打鍵で候補を絞る（`e2ecomptemp` だけが残る）。
@@ -256,9 +263,9 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 		await expect(preview).toContainText(REF_EXTERNAL_NAME);
 	});
 
-	test('3. Ctrl+. で任意の位置から補完を開ける', async () => {
+	test('3. Ctrl+. と Ctrl+Space のどちらでも任意の位置から補完を開ける', async () => {
 		const pane = page.getByRole('complementary', { name: '新規作成' });
-		const expressionField = pane.getByLabel('式');
+		const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
 		const popup = page.getByTestId('expression-completion');
 
 		// 演算子の直後（前方一致0文字）は自動では開かない位置。
@@ -267,15 +274,29 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 
 		await page.keyboard.press('Control+Period');
 		await expect(popup).toBeVisible();
-		// 第1セグメントの候補は接続名（関数候補も混ざるが、それはテスト5で見る -
-		// ここで関数まで見ると、他スペックが残した接続の数しだいで表示上限
-		// （20件）に押し出されて不安定になる）。
+
+		// #380 レビュー対応G: **前方一致0文字のまま候補の中身を見ない**。候補は
+		// 20件で打ち切られるので、スイート全体で共有している DB に表現可能な接続が
+		// 20個あると落ちる（グリッド仮想化のときと同じ「共有 DB は増える」問題）。
+		// 開いたことを確認したうえで、この spec 固有の prefix を打って絞ってから
+		// 候補を見る。
+		await expressionField.pressSequentially(CONNECTION_NAME.slice(0, 6));
+		await expect(popup.getByRole('option', { name: new RegExp(CONNECTION_NAME) })).toBeVisible();
+
+		// #380 レビュー対応E: `Ctrl+Space`（`event.code === 'Space'` の経路）でも
+		// 開く - 受け入れ条件に両方入っている。Escape で閉じた直後でも、明示
+		// トリガーは「明示的に閉じた後は自動で開かない」抑止を無視する
+		// （#380 レビュー対応A）。
+		await page.keyboard.press('Escape');
+		await expect(popup).toHaveCount(0);
+		await page.keyboard.press('Control+Space');
+		await expect(popup).toBeVisible();
 		await expect(popup.getByRole('option', { name: new RegExp(CONNECTION_NAME) })).toBeVisible();
 	});
 
 	test('4. Esc はポップアップだけを閉じ、「一覧から挿入」トグルは ON のまま', async () => {
 		const pane = page.getByRole('complementary', { name: '新規作成' });
-		const expressionField = pane.getByLabel('式');
+		const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
 		const popup = page.getByTestId('expression-completion');
 		const toggle = pane.getByTestId('tag-expression-insert-toggle');
 
@@ -302,7 +323,7 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 
 	test('5. 組み込み関数の候補を確定すると `name(` が入る', async () => {
 		const pane = page.getByRole('complementary', { name: '新規作成' });
-		const expressionField = pane.getByLabel('式');
+		const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
 		const popup = page.getByTestId('expression-completion');
 
 		// 2文字以上の前方一致で自動的に開く。関数表はサーバー
@@ -319,7 +340,7 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 
 	test('6. スクロールした長い式でもポップアップが式欄の可視範囲に出る（#380 レビュー対応1）', async () => {
 		const pane = page.getByRole('complementary', { name: '新規作成' });
-		const expressionField = pane.getByLabel('式');
+		const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
 		const popup = page.getByTestId('expression-completion');
 
 		// 式欄は `rows="2"` なので、改行を並べれば幅に依存せず確実にスクロール
@@ -348,7 +369,7 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 
 	test('7. 補完を開いたままペインを閉じるとポップアップも消える（#380 レビュー対応2）', async () => {
 		const pane = page.getByRole('complementary', { name: '新規作成' });
-		const expressionField = pane.getByLabel('式');
+		const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
 		const popup = page.getByTestId('expression-completion');
 
 		// テスト6 が式欄をスクロールさせたままなので、まず空にしてスクロール位置を
@@ -376,7 +397,7 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 		await page.getByRole('button', { name: '新規登録' }).click();
 		const pane = page.getByRole('complementary', { name: '新規作成' });
 		await expect(pane).toBeVisible();
-		const expressionField = pane.getByLabel('式');
+		const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
 		const popup = page.getByTestId('expression-completion');
 		await expect(popup).toHaveCount(0);
 
@@ -392,10 +413,102 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 			el.value = 'mi';
 			el.setSelectionRange(2, 2);
 			el.dispatchEvent(new InputEvent('input', { bubbles: true, isComposing: true }));
+		});
+
+		// #380 レビュー対応F: **変換中は開かない**ことを先に確認する（これを見ずに
+		// 確定後だけ見ると、変換中に開く実装でもテストが通ってしまう）。
+		await expect(popup).toHaveCount(0);
+
+		await expressionField.evaluate((el: HTMLTextAreaElement) => {
 			el.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: 'mi' }));
 		});
 
 		await expect(popup).toBeVisible();
 		await expect(popup.getByRole('option', { name: /min/ })).toBeVisible();
+	});
+
+	test('9. Escape で閉じた後に関数表のフェッチが解決しても開き直さない（#380 レビュー対応A）', async () => {
+		// 関数表の応答をわざと遅らせる。ページを読み込み直すのは、この spec が
+		// 共有している `page` では関数表が既に取得済み（キャッシュ済み）だから。
+		const FUNCTIONS_URL = '**/api/tags/expression/functions';
+		await page.route(FUNCTIONS_URL, async (route) => {
+			await new Promise((resolve) => setTimeout(resolve, 1500));
+			await route.continue();
+		});
+		try {
+			const functionsResponse = page.waitForResponse((res) =>
+				res.url().includes('/api/tags/expression/functions')
+			);
+
+			await page.goto('/tags');
+			await groupNodeByName(page, CALC_GROUP_NAME).click();
+			await page.getByRole('button', { name: '新規登録' }).click();
+			const pane = page.getByRole('complementary', { name: '新規作成' });
+			await expect(pane).toBeVisible();
+			const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
+			const popup = page.getByTestId('expression-completion');
+
+			// フェッチが返る前に、タグ候補だけで補完を開く。
+			await expressionField.fill(CONNECTION_NAME.slice(0, 4));
+			await expect(popup).toBeVisible();
+
+			// ユーザーが明示的に閉じる。
+			await page.keyboard.press('Escape');
+			await expect(popup).toHaveCount(0);
+
+			// 遅れて関数表が届いても、勝手に開き直さない（Escape の約束を守る）。
+			await functionsResponse;
+			await expect(popup).toHaveCount(0);
+
+			// 次の打鍵からは通常どおり開く（抑止は「次の input まで」）。続けて
+			// 接続名の次の1文字を打つので、前方一致は保たれる。
+			await expressionField.pressSequentially(CONNECTION_NAME.charAt(4));
+			await expect(popup).toBeVisible();
+		} finally {
+			await page.unroute(FUNCTIONS_URL);
+		}
+	});
+
+	test('10. 関数表の取得に失敗してもタグ候補は動き、式欄を開き直すと取り直す（#380 レビュー対応D）', async () => {
+		const FUNCTIONS_URL = '**/api/tags/expression/functions';
+		await page.route(FUNCTIONS_URL, (route) => route.abort());
+		let routed = true;
+		try {
+			await page.goto('/tags');
+			await groupNodeByName(page, CALC_GROUP_NAME).click();
+			await page.getByRole('button', { name: '新規登録' }).click();
+			const pane = page.getByRole('complementary', { name: '新規作成' });
+			await expect(pane).toBeVisible();
+			const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
+			const popup = page.getByTestId('expression-completion');
+
+			// タグ候補（接続 → 収集グループ）は関数表と無関係に動く。
+			await expressionField.fill(`${CONNECTION_NAME}.`);
+			await expect(popup).toBeVisible();
+			await expect(popup.getByRole('option', { name: new RegExp(GROUP_NAME) })).toBeVisible();
+
+			// 関数候補だけが出ない（`mi` に前方一致する接続は無いので候補0件）。
+			await expressionField.fill('mi');
+			await expect(popup).toHaveCount(0);
+
+			// 取得できる状態に戻し、式欄を開き直すと取り直す
+			// （失敗時に `expressionFunctionsRequested` を戻しているため）。
+			await page.unroute(FUNCTIONS_URL);
+			routed = false;
+			page.once('dialog', (dialog) => {
+				void dialog.accept();
+			});
+			await pane.getByRole('button', { name: '閉じる', exact: true }).click();
+			await expect(pane).toHaveCount(0);
+
+			await page.getByRole('button', { name: '新規登録' }).click();
+			const reopened = page.getByRole('complementary', { name: '新規作成' });
+			await expect(reopened).toBeVisible();
+			await reopened.getByRole('textbox', { name: /^式（expression）/ }).fill('mi');
+			await expect(popup).toBeVisible();
+			await expect(popup.getByRole('option', { name: /min/ })).toBeVisible();
+		} finally {
+			if (routed) await page.unroute(FUNCTIONS_URL);
+		}
 	});
 });
