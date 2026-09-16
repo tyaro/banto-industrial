@@ -436,6 +436,21 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 		// 下にずれるので、この緩い範囲でも確実に落ちる。
 		expect(popupBox!.y).toBeGreaterThan(fieldBox!.y - 120);
 		expect(popupBox!.y).toBeLessThan(fieldBox!.y + fieldBox!.height + 80);
+
+		// **式欄自身のスクロールで閉じない**こと（2026-09-16 の CI 失敗で判明した
+		// 実挙動の不具合の回帰固定）。textarea は `rows="2"` なので長い式を打つと
+		// 編集のたびに自動スクロールする - それを「ページがスクロールした」と同じ
+		// 扱いで閉じていたため、長い式ほど候補が消えていた。いまは座標を取り直す
+		// だけなので開いたまま、位置も式欄の近くに保たれる。
+		await expressionField.evaluate((el: HTMLTextAreaElement) => {
+			el.scrollTop = 0;
+		});
+		// 見るのは「**閉じていない**」ことだけ。ここでは先頭までスクロールを戻して
+		// いるのでキャレット行自体が式欄の外へ出ており、取り直した座標が式欄の
+		// 矩形から離れるのは正しい（実運用の自動スクロールはキャレットを見える位置へ
+		// 動かすので、そちらでは座標も式欄の近くに保たれる）。
+		await page.waitForTimeout(100);
+		await expect(popup).toBeVisible();
 	});
 
 	test('7. 補完を開いたままペインを閉じるとポップアップも消える（#380 レビュー対応2）', async () => {

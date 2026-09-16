@@ -63,10 +63,29 @@
 		onHover: (index: number) => void;
 		/** ウィンドウ外クリックで閉じる。 */
 		onClose: () => void;
+		/**
+		 * 座標の基準になっている要素（式欄の `<textarea>`）。**この要素自身の
+		 * スクロールは「閉じる」ではなく「measure し直す」**に振り分けるために使う
+		 * （下の scroll ハンドラ参照）。
+		 */
+		anchorEl: HTMLElement | null;
+		/** `anchorEl` がスクロールしたので座標を取り直してほしい。 */
+		onReanchor: () => void;
 	}
 
-	let { x, y, lineHeight, candidates, totalCount, activeIndex, onSelect, onHover, onClose }: Props =
-		$props();
+	let {
+		x,
+		y,
+		lineHeight,
+		candidates,
+		totalCount,
+		activeIndex,
+		onSelect,
+		onHover,
+		onClose,
+		anchorEl,
+		onReanchor
+	}: Props = $props();
 
 	let listEl: HTMLDivElement | undefined = $state();
 	let itemEls: (HTMLDivElement | undefined)[] = $state([]);
@@ -133,14 +152,30 @@
 	 * ＝ポップアップが開いている間だけ張られる（`{#if}` で破棄されると
 	 * `$effect` のクリーンアップで外れる）。
 	 *
-	 * 割り切り: 式欄そのものが**編集の副作用で**スクロールした（長い式を一気に
-	 * 消した等）ときも閉じる。編集由来かユーザーのスクロール由来かは区別
-	 * できないし、どちらでも「打ち直せばまた開く」で済むため、余計な状態を
-	 * 持ってまで作り分けない。
+	 * **式欄そのもののスクロールだけは「閉じる」ではなく「座標を取り直す」**
+	 * （`onReanchor`）。textarea は `rows="2"` なので**長い式を打つと編集のたびに
+	 * 自動スクロールする**（改行や折り返しでキャレット行が見える位置へ動く）。
+	 * これで閉じてしまうと「長い式を打っている最中に候補が消える」ことになり、
+	 * ポップアップが一番役に立つ場面で使えない。座標はキャレットから測り直せば
+	 * よいだけなので、閉じる必要がない（CI で
+	 * `banto-hub-tags-expression-completion.spec.ts` のテスト6 が落ちて判明した
+	 * 実挙動の不具合 - 2026-09-16）。ページ・ペインのスクロールは従来どおり閉じる
+	 * （こちらはキャレットごと画面外へ出ていくため、追いかける意味が薄い）。
 	 */
 	$effect(() => {
 		const onScroll = (event: Event): void => {
-			if (event.target instanceof Node && listEl?.contains(event.target)) return;
+			const target = event.target;
+			if (!(target instanceof Node)) {
+				onClose();
+				return;
+			}
+			// 自分自身のスクロール（候補が多いときの選択追従）は無視。
+			if (listEl?.contains(target)) return;
+			// 式欄自身のスクロール（長い式の編集で自動的に動く）は座標を取り直すだけ。
+			if (anchorEl?.contains(target)) {
+				onReanchor();
+				return;
+			}
 			onClose();
 		};
 		const onResize = (): void => onClose();

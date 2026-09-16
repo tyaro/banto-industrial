@@ -2369,6 +2369,25 @@
 	}
 
 	/**
+	 * 開いているポップアップの座標だけ取り直す（開閉も候補も変えない）。
+	 *
+	 * 式欄は `rows="2"` なので、長い式を打っていると**編集のたびに自動スクロール
+	 * する**。そのスクロールで閉じてしまうとポップアップが一番役に立つ場面で
+	 * 使えないので、`CompletionPopup` 側は式欄由来のスクロールをこれに振り分ける
+	 * （ページ・ペインのスクロールは従来どおり閉じる）。基準はポップアップを
+	 * 開いたときのキャレット（`context.replaceTo`）。
+	 */
+	function reanchorCompletion(): void {
+		const el = exprTextareaEl;
+		const context = completionContext;
+		if (!el || !context) return;
+		const anchor = caretAnchor(el, context.replaceTo);
+		if (anchor) {
+			completionAnchor = { x: anchor.left, y: anchor.top, lineHeight: anchor.height || 16 };
+		}
+	}
+
+	/**
 	 * 式欄の現在の状態から補完を開き直す（あるいは閉じる）。
 	 *
 	 * 開く条件（実装指示「トリガー」）は
@@ -7194,6 +7213,8 @@
 		onSelect={acceptCompletion}
 		onHover={(i) => (completionActiveIndex = i)}
 		onClose={dismissCompletion}
+		anchorEl={exprTextareaEl}
+		onReanchor={reanchorCompletion}
 	/>
 {/if}
 
