@@ -72,7 +72,11 @@ TAG-P0-2 は T14-3 のバックエンド preflight（`preflight_transaction`）+
 表示・実 DOM e2e で受け入れ条件を満たした（closed、詳細は §9.3 TAG-P0-2 の
 実装メモ）。TAG-P0-3 は queue/apply/cancel 本体を実装済み・2026-08-12 に
 apply 時の per-resource フィンガープリントガードを追加（詳細は §9.3）。
-最終検証日(コード照合): 2026-08-10
+**2026-09-16（#378、v0.2.0-alpha.20）: TAG-UX-G のうち「狭幅で Tree を
+折りたたみ／オーバーレイ化」を実装済み**（タグ登録・タグモニタの左ツリーを
+≤900px でオフキャンバスへ退避。同節の 2026-09-16 追補参照。残りの
+TAG-UX-G（コントラスト・キーボード操作の網羅・axe 検査）は未了）。
+最終検証日(コード照合): 2026-09-16
 最終検証日(Windows 実機): 2026-09-01（T17-1 Session 0・SLMP 収集は 2026-08-10、
 [banto-hub-t17-design.md](banto-hub-t17-design.md) §8。切替ウィザード UI の
 Desktop↔Service 全経路は 2026-08-31/09-01 に追加検証・完了、

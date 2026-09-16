@@ -98,6 +98,27 @@
 	 * （`mobileNav.svelte.ts` の doc comment にある `effect_update_depth_exceeded`
 	 * の轍を踏まないための定石に合わせる）。
 	 */
+	/**
+	 * #378（#381 レビュー対応A）: **狭幅 → 広幅の遷移で開閉状態を閉じへ戻す。**
+	 * 広幅では退避そのものが無効なので `leftOpen` は描画に効かないが、`true` の
+	 * まま残すと (a) もう一度狭幅へ戻した瞬間にツリーが開いた状態で現れ、
+	 * (b) 呼び出し側が `leftOpen` を条件に使っている箇所（タグ登録の Esc 抑止）が
+	 * 広幅でも効き続ける。サイドバーが同じ遷移で状態をリセットしている
+	 * （`mobileNav.ts::applyNarrowChange`）のと同じ扱いにし、**部品側の1箇所で**
+	 * 両ページぶんを直す（`$bindable` なので呼び出し側の `treeOpen` へ伝わる）。
+	 *
+	 * `triggerEl` も一緒に捨てる: 残したまま狭幅へ戻ると、下のフォーカス
+	 * `$effect` の「閉じたら戻す」枝が**遷移だけで**古いボタンへフォーカスを
+	 * 奪ってしまう。
+	 */
+	$effect(() => {
+		if (narrow) return;
+		untrack(() => {
+			triggerEl = null;
+			if (leftOpen) leftOpen = false;
+		});
+	});
+
 	$effect(() => {
 		if (!narrow) return;
 		if (leftOpen) {
@@ -129,13 +150,17 @@
 	 *    （同じ window 上のリスナー同士では `stopPropagation` が効かないため、
 	 *    window 側で止めるのでは間に合わない）。
 	 * 2. 念のため window にも張る（フォーカスが左ペイン外にある場合の保険）。
-	 *    1 で処理済みのイベントは `defaultPrevented` で弾く。**開いている
-	 *    モーダル（`role="dialog"`）の中から来た Esc は譲る**: z-index の
-	 *    決定（下の CSS コメント）どおりモーダルはこの退避パネルより手前に
-	 *    出るので、手前のものから閉じるのが自然であり、かつ「モーダルと
-	 *    退避パネルが両方閉じる」というリスナー登録順しだいの挙動を避ける
-	 *    （`Drawer`/`Modal` の Esc ハンドラも window に張られており、同じ
-	 *    window 上のリスナー同士では `stopPropagation` が効かないため）。
+	 *    1 で処理済みのイベントは `defaultPrevented` で弾き、さらに
+	 *    **この退避パネルより手前に重なっている一時的な UI の中から来た Esc は
+	 *    譲る**（#381 レビュー対応B）。一般則として「上に重なっているものから
+	 *    順に Esc で閉じる」を実装したいので、判定は**その種の UI が名乗る
+	 *    role**（`dialog` = `Drawer`/`Modal`、`menu` = `TreeContextMenu`）で行う
+	 *    - どれも z-index はこの退避パネル（610）より上（900 / 1000、下の CSS
+	 *    コメント参照）。譲らないと「1回の Esc で手前の UI と退避パネルが
+	 *    両方閉じる」ことになり、しかもそれがリスナー登録順しだいで変わる
+	 *    （それらの Esc ハンドラも window 側に張られており、同じ window 上の
+	 *    リスナー同士では `stopPropagation` が効かないため）。新しく重なる UI を
+	 *    足すときは、その role をここへ加えること。
 	 */
 	$effect(() => {
 		if (!offcanvasOpen) return;
@@ -150,7 +175,7 @@
 		const onWindowKeydown = (event: KeyboardEvent): void => {
 			if (event.key !== 'Escape' || event.defaultPrevented) return;
 			const target = event.target;
-			if (target instanceof Element && target.closest('[role="dialog"]')) return;
+			if (target instanceof Element && target.closest('[role="dialog"], [role="menu"]')) return;
 			event.preventDefault();
 			closeLeft();
 		};

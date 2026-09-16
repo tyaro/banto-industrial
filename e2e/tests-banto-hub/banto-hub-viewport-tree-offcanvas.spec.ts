@@ -227,7 +227,52 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(treePane).toBeHidden();
 	});
 
-	test('5. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
+	test('5. 狭幅で開いたまま広幅へ広げて狭幅へ戻すと、ツリーは閉じている（#381 レビュー対応A）', async () => {
+		await treeToggle.click();
+		await expect(treePane).toBeVisible();
+
+		// 広幅では退避そのものが無効になる: トグルも退避パネルの id も消え、
+		// ツリーは従来どおり常時表示の左ペインへ戻る（広幅の DOM は無変更）。
+		await page.setViewportSize({ width: 1280, height: 800 });
+		await expect(treeToggle).toHaveCount(0);
+		await expect(treePane).toHaveCount(0);
+
+		// 狭幅へ戻したとき、`leftOpen` が残っていて開いた状態で現れては
+		// いけない（`SplitPane` が広幅遷移で閉じへ戻す）。
+		await page.setViewportSize(NARROW_VIEWPORT);
+		await expect(treeToggle).toBeVisible();
+		await expect(treeToggle).toHaveAttribute('aria-expanded', 'false');
+		await expect(treePane).toBeHidden();
+	});
+
+	test('6. 狭幅でノードを右クリックしてもツリーは閉じず、Esc はメニューだけを閉じる（#381 レビュー対応B/C）', async () => {
+		await treeToggle.click();
+		await expect(treePane).toBeVisible();
+
+		const node = groupNodeByName(page, GROUP_A);
+		await node.click({ button: 'right' });
+
+		const menu = page.getByRole('menu', { name: '作成メニュー' });
+		await expect(menu).toBeVisible();
+		// 右クリックでも選択は反映されるが、**退避パネルは開いたまま**
+		// （閉じるとフォーカスの戻り先が `inert` の中に取り残される）。
+		await expect(treePane).toBeVisible();
+		await expect(treeSelection).toHaveText(GROUP_A);
+
+		// メニュー（z-index 1000）の Esc はメニューだけを閉じ、退避パネルは
+		// 残る。フォーカスは右クリックしたノードへ戻る（`TreeContextMenu` の
+		// `triggerEl` が生きている）。
+		await page.keyboard.press('Escape');
+		await expect(menu).toHaveCount(0);
+		await expect(treePane).toBeVisible();
+		await expect(node).toBeFocused();
+
+		// 後片付け（メニューが無くなったので Esc は退避パネルへ届く）。
+		await page.keyboard.press('Escape');
+		await expect(treePane).toBeHidden();
+	});
+
+	test('7. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
 		await page.goto('/monitor');
 		await expect(page.getByRole('heading', { level: 2, name: 'タグモニタ' })).toBeVisible();
 

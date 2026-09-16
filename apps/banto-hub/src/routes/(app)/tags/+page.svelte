@@ -2027,7 +2027,11 @@
 			// 閉じ、このトグルは ON のままにする（`SplitPane` が左ペインの
 			// keydown で `stopPropagation` するのでここへは届かないはずだが、
 			// 補完と同じく経路に依存しないようここでも条件にする二重の担保）。
-			if (treeOpen) return;
+			// **`isNarrow` も条件にする**（#381 レビュー対応A）: 広幅では退避
+			// そのものが無いので、`treeOpen` の残留で式欄の Esc が効かなくなる
+			// ことがないようにする（`SplitPane` 側も広幅遷移で `false` へ戻すが、
+			// その書き戻しに依存しない二重の担保）。
+			if (treeOpen && mobileNavStore.isNarrow) return;
 			if (e.key === 'Escape') insertArmed = false;
 		};
 		window.addEventListener('keydown', onKeydown);
@@ -2962,13 +2966,24 @@
 		return 'すべて';
 	});
 
-	function handleTreeSelect(data: ConnectionTreeNodeData): void {
+	/**
+	 * ツリー選択（`treeFilter`）の更新だけを行う。**退避パネルの開閉には
+	 * 触れない** - 右クリック（`handleTreeContextMenu`）もノード選択を伴うが、
+	 * そちらでは閉じてはいけないため（#381 レビュー対応C、下記）。
+	 */
+	function applyTreeSelection(data: ConnectionTreeNodeData): void {
 		if (data.kind === 'all') treeFilter = { type: 'all' };
 		else if (data.kind === 'connection')
 			treeFilter = { type: 'connection', id: data.connection.id };
 		else treeFilter = { type: 'group', id: data.group.id };
+	}
+
+	/** `ConnectionTree` の `onselect`（クリック / Enter でのノード選択）。 */
+	function handleTreeSelect(data: ConnectionTreeNodeData): void {
+		applyTreeSelection(data);
 		// #378: 狭幅では選んだ時点で退避パネルを閉じる（`Sidebar.svelte` の
-		// リンククリックで `closeNav()` するのと同じ「閉じる契機」）。
+		// リンククリックで `closeNav()` するのと同じ「閉じる契機」）。**閉じるのは
+		// この経路（クリック選択）だけ** - 右クリック経路は下記参照。
 		if (mobileNavStore.isNarrow) treeOpen = false;
 	}
 
@@ -3045,7 +3060,15 @@
 		node: TreeNode<ConnectionTreeNodeData>,
 		position: { x: number; y: number }
 	): void {
-		handleTreeSelect(node.data);
+		// #381 レビュー対応C: 選択は反映するが、**狭幅でも退避パネルは閉じない**
+		// （`handleTreeSelect` ではなく `applyTreeSelection` を呼ぶ）。ここで
+		// 閉じると、直後に `TreeContextMenu` が `triggerEl` として覚える
+		// 「右クリックされたノード」が `inert`/`aria-hidden` になった左ペインの
+		// 中に取り残され、メニューを閉じたときのフォーカス復帰先が死ぬ。
+		// メニューはツリーの上に重なって出るので、開いたままで問題ない
+		// （メニューの項目を選んで Drawer 等へ進む経路では、その Drawer が
+		// パネルより手前に出る）。
+		applyTreeSelection(node.data);
 		const items = resolveTreeContextMenuItemsForRole(node.data, canWrite);
 		if (items.length === 0) {
 			treeContextMenu = null;
