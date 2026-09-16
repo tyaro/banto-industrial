@@ -11,7 +11,7 @@
 	import Header from '$lib/components/Header.svelte';
 	import Sidebar from '$lib/components/Sidebar.svelte';
 	import CommandPalette from '$lib/components/CommandPalette.svelte';
-	import { hasVisibleLayerAbove } from '$lib/components/escLayering';
+	import { hasVisibleLayerAbove, hasVisibleMenuLayer } from '$lib/components/escLayering';
 	import { listPendingChanges } from '$lib/banto/pendingChangesAdmin';
 	import { countUnappliedPendingChanges } from '$lib/banto/pendingUnappliedCount';
 	import { commandPaletteStore } from '$lib/commandPalette.svelte';
@@ -28,6 +28,15 @@
 	function handleKeydown(event: KeyboardEvent): void {
 		if (event.key.toLowerCase() === 'k' && (event.ctrlKey || event.metaKey)) {
 			event.preventDefault();
+			// #381 レビュー対応14回目（層の約束・項目5の補足、`escLayering.ts`）:
+			// **コマンドパレットとコンテキストメニューは同じ z（1000）**なので同時に
+			// 出さない。同 z は z 順の判定で区別できず、出してしまうと Esc も
+			// フォーカスの引き戻しも互いに譲り合って効かなくなる。メニューは
+			// 一過性（Esc・外クリック・フォーカスが外れるで閉じる）なので、
+			// 開いているあいだは**パレットを開かない**側に倒した - レイアウトから
+			// ページのメニューを閉じる口が無いため（閉じてから `Ctrl+K`）。
+			// 既に開いているパレットを閉じる方向のトグルは妨げない。
+			if (!commandPaletteStore.open && hasVisibleMenuLayer()) return;
 			commandPaletteStore.toggle();
 		}
 

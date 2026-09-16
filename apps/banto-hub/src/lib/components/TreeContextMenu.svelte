@@ -150,6 +150,10 @@
 	 */
 	function handleWindowKeydown(event: KeyboardEvent): void {
 		if (event.key !== 'Escape' || event.defaultPrevented) return;
+		// #381 レビュー対応14回目: 自分（z-index 1000）より**上**の層があれば譲る
+		// （下の Drawer/Modal(900) は譲る相手ではない）。判定は z 順対応の
+		// `hasVisibleLayerAbove`（`escLayering.ts`）。
+		if (hasVisibleLayerAbove({ except: menuEl })) return;
 		event.preventDefault();
 		onClose();
 	}

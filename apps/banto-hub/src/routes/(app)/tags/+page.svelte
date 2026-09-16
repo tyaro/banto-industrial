@@ -2917,6 +2917,9 @@
 		// Drawer に対して古い結果が届いても表示先が無いので無害だが、
 		// 不要な `/api/tags/batch` 呼び出し自体を止めておく。
 		if (addressPreflightTimer !== undefined) clearTimeout(addressPreflightTimer);
+		// #381 レビュー対応14回目: メニュー由来の戻し先は1回の開閉かぎり
+		// （`lastTreeMenuNodeEl` の doc 参照）。
+		lastTreeMenuNodeEl = null;
 	}
 
 	// T18-1: 画面遷移（サイドバーの他画面リンク等）でも Esc/× と同じ破棄
@@ -3119,10 +3122,6 @@
 			return;
 		}
 		const trigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-		// #381 レビュー対応11回目: メニュー経由で開く Drawer/Modal の戻し先
-		// （`resolveDrawerFocusFallback`）。メニュー自体は項目を選んだ直後に
-		// アンマウントされるので、ノードの方をページ側で覚えておく。
-		lastTreeMenuNodeEl = trigger;
 		treeContextMenu = {
 			x: position.x,
 			y: position.y,
@@ -3137,6 +3136,12 @@
 	 * 開いた Drawer/Modal が閉じるころには「開いた元」＝メニュー項目が DOM に
 	 * 居ない。その代わりの戻し先として、ページ側でノードを覚えておく
 	 * （`resolveDrawerFocusFallback`）。`$state` にしない（描画に使わない）。
+	 *
+	 * **紐付けは1回の開閉まで**（#381 レビュー対応14回目）: `activateTreeContextMenuAction`
+	 * （メニュー経由で開く唯一の経路）でセットし、**Drawer/Modal を閉じるときに
+	 * クリア**する。残したままだと、あとからグリッド行やツールバーで開いた
+	 * Drawer の戻し先が消えたとき（選択中タグの削除など）に、無関係な古いツリー
+	 * ノードへフォーカスが飛ぶ。
 	 */
 	let lastTreeMenuNodeEl: HTMLElement | null = null;
 
@@ -3303,6 +3308,7 @@
 
 	function closeConnectionDrawer(): void {
 		connectionDrawerOpen = false;
+		lastTreeMenuNodeEl = null;
 	}
 
 	async function handleConnectionDrawerSaved(): Promise<void> {
@@ -3385,6 +3391,7 @@
 
 	function closeGroupDrawer(): void {
 		groupDrawerOpen = false;
+		lastTreeMenuNodeEl = null;
 	}
 
 	async function handleGroupDrawerSaved(): Promise<void> {
@@ -3410,6 +3417,10 @@
 	 * `openGroupViewDrawer` へ振り分けるだけ - 新しい画面や別実装は持たない。
 	 */
 	function activateTreeContextMenuAction(action: TreeContextMenuItemAction): void {
+		// #381 レビュー対応14回目: **メニュー経由で開いたときだけ**、戻し先として
+		// 右クリックしたノードを紐付ける（下の open系関数は各自
+		// `lastTreeMenuNodeEl` をクリアするので、セットは呼び出しの後）。
+		const node = treeContextMenu?.triggerEl ?? null;
 		switch (action.kind) {
 			case 'createTag':
 				openCreateDrawer();
@@ -3442,6 +3453,7 @@
 				openGroupViewDrawer(action.groupId);
 				break;
 		}
+		lastTreeMenuNodeEl = node;
 	}
 
 	/**

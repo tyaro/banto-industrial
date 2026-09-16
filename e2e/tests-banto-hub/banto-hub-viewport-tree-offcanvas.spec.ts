@@ -797,4 +797,93 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		// 退避後のナビ項目はフォーカスを受けられない（`inert`）。
 		await expect(navLink).toBeHidden();
 	});
+
+	test('28. 層が重なっているとき、引き戻すのは最上位の層（#381 レビュー対応14回目）', async () => {
+		// 層の判定が「自分以外の可視な層」だった頃は、パレット(1000)と Drawer(900)
+		// が重なると互いを「上」と誤認して**双方が引き戻しを諦め**、裏のページへ
+		// フォーカスが抜けられた。判定を z 順対応にしたので、引き戻すのは
+		// 最上位のパレットだけになる。
+		await page.goto('/tags');
+		await page.getByPlaceholder('名前・アドレスで検索').fill(TAG_B);
+		await page.getByRole('gridcell', { name: TAG_B, exact: true }).click();
+		const editDrawer = page.getByRole('dialog', { name: `${TAG_B} を編集` });
+		await expect(editDrawer).toBeVisible();
+
+		await page.keyboard.press('Control+k');
+		const palette = page.getByRole('dialog', { name: 'コマンドパレット' });
+		await expect(palette).toBeVisible();
+
+		await page.evaluate(() => {
+			document.querySelector<HTMLElement>('[data-testid="tag-tree-toggle"]')?.focus();
+		});
+
+		await expect
+			.poll(() =>
+				page.evaluate(() => {
+					const panel = document.querySelector('[role="dialog"][aria-label="コマンドパレット"]');
+					const active = document.activeElement;
+					return !!panel && !!active && panel.contains(active);
+				})
+			)
+			.toBe(true);
+
+		await page.keyboard.press('Escape');
+		await expect(palette).toHaveCount(0);
+		await page.keyboard.press('Escape');
+		await expect(editDrawer).toHaveCount(0);
+	});
+
+	test('29. メニューが出ているあいだ Ctrl+K はパレットを開かない（#381 レビュー対応14回目）', async () => {
+		// パレットとメニューは同じ z（1000）なので z 順では解けない - 同時に
+		// 出さないのは呼び出し側の責務（`escLayering.ts`）。
+		await treeToggle.click();
+		await expect(treePane).toBeVisible();
+		await groupNodeByName(page, GROUP_B).click({ button: 'right' });
+		const menu = page.getByRole('menu', { name: '作成メニュー' });
+		await expect(menu).toBeVisible();
+
+		await page.keyboard.press('Control+k');
+		const palette = page.getByRole('dialog', { name: 'コマンドパレット' });
+		await expect(palette).toHaveCount(0);
+		await expect(menu).toBeVisible();
+
+		// メニューを閉じれば従来どおり開く。
+		await page.keyboard.press('Escape');
+		await expect(menu).toHaveCount(0);
+		await page.keyboard.press('Control+k');
+		await expect(palette).toBeVisible();
+		await page.keyboard.press('Escape');
+		await expect(palette).toHaveCount(0);
+
+		await page.keyboard.press('Escape');
+		await expect(treePane).toBeHidden();
+	});
+
+	test('30. メニュー由来の戻し先は次の開閉へ持ち越さない（#381 レビュー対応14回目）', async () => {
+		// メニューから開いた Drawer を閉じたあと、**別の経路（グリッド行）で開いた
+		// Drawer の戻し先が消えた**とき、古いツリーノードへ飛ばない。
+		await treeToggle.click();
+		await groupNodeByName(page, GROUP_B).click({ button: 'right' });
+		await page.getByRole('menuitem', { name: '収集グループを再設定', exact: true }).click();
+		const groupDrawer = page.getByRole('dialog', { name: `${GROUP_B} を編集` });
+		await expect(groupDrawer).toBeVisible();
+		await page.keyboard.press('Escape');
+		await expect(groupDrawer).toHaveCount(0);
+
+		// ツリーを閉じてからグリッド行 → 削除（戻し先の行は消える）。
+		await page.keyboard.press('Escape');
+		await expect(treePane).toBeHidden();
+		await page.getByPlaceholder('名前・アドレスで検索').fill(TAG_B);
+		await page.getByRole('gridcell', { name: TAG_B, exact: true }).click();
+		const editDrawer = page.getByRole('dialog', { name: `${TAG_B} を編集` });
+		await expect(editDrawer).toBeVisible();
+
+		page.once('dialog', (dialog) => void dialog.accept());
+		await editDrawer.getByRole('button', { name: '削除', exact: true }).click();
+		await expect(editDrawer).toHaveCount(0);
+
+		// 古いツリーノードではなく、ページ側の fallback（ツリーのトグル）へ。
+		await expect(treeToggle).toBeFocused();
+		await page.getByPlaceholder('名前・アドレスで検索').fill('');
+	});
 });
