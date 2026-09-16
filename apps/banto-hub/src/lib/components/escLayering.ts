@@ -41,7 +41,13 @@
  *    項目4のトラップを全部すり抜ける（閉じ残った層があれば、下の層は項目2で
  *    譲り続けるので Esc も効かなくなる）。戻し先が消えている / `inert` の中なら
  *    呼び出し側が決めた代替へ（無ければ何もしない）。
- * 6. **非モーダル層（サイドバー・退避ツリー）は、下位を開くときに上位を先に畳む**
+ * 6. **退避中・閉じ遷移中の層は「無い」ことを DOM で明示する**: `transform` で
+ *    画面外へ逃がしただけでは矩形も `visibility` も残るので、この判定にも
+ *    `focusRestore.ts` の生存判定にも**可視な層として引っかかり続ける**。退避中は
+ *    `visibility: hidden` + `inert`（`SplitPane` の退避ペイン・`Sidebar` の
+ *    オフキャンバス）、outro（fade/fly）のあいだ DOM に残る Drawer/Modal は
+ *    {@link LAYER_INACTIVE_ATTR} を付けて、どちらもここから除外する。
+ * 7. **非モーダル層（サイドバー・退避ツリー）は、下位を開くときに上位を先に畳む**
  *    （`tags`/`monitor` の `toggleTree`）。こちらはトラップを張れない（画面の
  *    一部としてそのまま操作できることが目的の UI）ので、順序は開く側が揃える。
  *
@@ -69,6 +75,15 @@
  * これで足りる。新しく重なる UI を足すときは、この表と下のセレクタを更新すること。
  */
 
+/**
+ * 閉じ始めた層に付ける印（#381 レビュー対応12回目、約束6）。`Drawer`/`Modal` は
+ * `open=false` になっても outro（fade/fly）のあいだ DOM に残り、矩形も
+ * `visibility` も「可視」のままなので、そのままだと {@link hasVisibleLayerAbove}
+ * が ~150ms のあいだ true を返し続け、その間の Esc は「上に層がある」として
+ * 下の層が全員譲るのに閉じるものが無い＝**無反応**になる。
+ */
+export const LAYER_INACTIVE_ATTR = 'data-layer-inactive';
+
 /** Esc で閉じる一時的な上位層が名乗る role（上の表を参照）。 */
 export const LAYER_ABOVE_SELECTOR = '[role="dialog"], [role="menu"]';
 
@@ -88,6 +103,8 @@ export function hasVisibleLayerAbove(options: { except?: Element | null } = {}):
 	const except = options.except ?? null;
 	for (const el of document.querySelectorAll(LAYER_ABOVE_SELECTOR)) {
 		if (except && (el === except || el.contains(except))) continue;
+		// 閉じ遷移中（outro）の層は数えない（{@link LAYER_INACTIVE_ATTR}）。
+		if (el.hasAttribute(LAYER_INACTIVE_ATTR)) continue;
 		if (el.getClientRects().length === 0) continue;
 		const style = getComputedStyle(el);
 		if (style.display === 'none' || style.visibility === 'hidden') continue;

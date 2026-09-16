@@ -8,32 +8,33 @@
  * ため）。`banto-hub-viewport-offcanvas` の先頭 `v` は `banto-hub-smoke` の
  * `s` より後なので条件を満たす。
  *
- * オフキャンバスは `position: fixed` + `transform: translateX(-100%)` で
- * 画面外へ退避させる実装（Sidebar.svelte）なので、Playwright の
- * `toBeVisible()` だけでは「画面外に置かれているだけで DOM 上は可視」な
- * 状態を検出できない（bounding box は空でないため）。そのため実際の
- * bounding box の x 座標で「画面外」かどうかを判定する。
+ * オフキャンバスは `position: fixed` + `transform: translateX(-100%)` で画面外へ
+ * 退避させる実装（Sidebar.svelte）。**当初は `transform` だけだった**ので
+ * `toBeVisible()` では「画面外に置かれているだけで DOM 上は可視」な状態を検出
+ * できず、bounding box の x 座標で判定していた。
+ *
+ * **2026-09-16（#381 レビュー対応12回目）**: 閉じたオフキャンバスに
+ * `visibility: hidden` + `inert` を足した（`escLayering.ts` の層の約束・項目6 -
+ * `transform` だけだと画面外のナビ項目がフォーカスを受けられてしまい、
+ * 閉じたあとの「フォーカスの戻し先」判定にも生きた要素として残るため）。
+ * これで「退避している」は Playwright から見て素直に **hidden** になったので、
+ * 判定を `toBeHidden()`/`toBeVisible()` に改めた（bounding box の x 座標による
+ * 判定は不要になった - `transform` のスライド中も `visibility` は最後まで
+ * `visible` のままなので、`toBeHidden()` はアニメーション完了を待つ形になる）。
  */
 import { expect, test, type Page } from '@playwright/test';
 import { ensureLoggedIn } from './banto-hub-auth';
 
 const NARROW_VIEWPORT = { width: 400, height: 800 };
 
-/** ビューポート左端より完全に外（右端も含めて左側）にあるかどうか。 */
-async function isOffscreenLeft(page: Page, locatorName: string): Promise<boolean> {
-	const box = await page.getByRole('link', { name: locatorName }).boundingBox();
-	if (!box) return true; // display:none 等で box が取れない場合も「見えていない」扱い
-	return box.x + box.width <= 0;
-}
-
 /**
- * オフキャンバスを閉じた直後は `transition: transform 0.2s` のスライド中
- * なので、bounding box を1回だけ見ると「まだ画面内」を拾ってしまう
- * ことがある。固定 sleep でアニメーション時間に依存するのではなく、
- * 画面外に収まるまでポーリングして待つ。
+ * 退避している（＝ユーザーからも支援技術からも「無い」）こと。閉じたオフキャンバスは
+ * `visibility: hidden` + `inert` なので、locator は hidden になる。閉じる
+ * アニメーション（`transition: transform/visibility 0.2s`）の完了は
+ * `toBeHidden()` のリトライが待つ。
  */
-async function expectOffscreenLeft(page: Page, locatorName: string): Promise<void> {
-	await expect.poll(() => isOffscreenLeft(page, locatorName)).toBe(true);
+async function expectNavHidden(page: Page, locatorName: string): Promise<void> {
+	await expect(page.getByRole('link', { name: locatorName })).toBeHidden();
 }
 
 test.describe.serial('banto-hub offcanvas sidebar (narrow viewport)', () => {
@@ -52,7 +53,7 @@ test.describe.serial('banto-hub offcanvas sidebar (narrow viewport)', () => {
 	});
 
 	test('1. 初期状態ではサイドバーのナビが画面外に退避している', async () => {
-		expect(await isOffscreenLeft(page, 'タグ登録')).toBe(true);
+		await expectNavHidden(page, 'タグ登録');
 		// バックドロップも出ていない（開いていないので背景オーバーレイは無い）。
 		await expect(
 			page.getByRole('button', { name: '背景をクリックしてメニューを閉じる' })
@@ -89,7 +90,7 @@ test.describe.serial('banto-hub offcanvas sidebar (narrow viewport)', () => {
 		// 遷移により afterNavigate 経由でオフキャンバスが閉じ、☰ は「開く」に
 		// 戻り、ナビは再び画面外へ退避する。
 		await expect(page.getByRole('button', { name: 'メニューを開く' })).toBeVisible();
-		await expectOffscreenLeft(page, 'タグ登録');
+		await expectNavHidden(page, 'タグ登録');
 	});
 
 	test('4. バックドロップのクリックでもオフキャンバスが閉じる', async () => {
@@ -112,7 +113,7 @@ test.describe.serial('banto-hub offcanvas sidebar (narrow viewport)', () => {
 			.click({ position: { x: NARROW_VIEWPORT.width - 10, y: NARROW_VIEWPORT.height / 2 } });
 
 		await expect(page.getByRole('button', { name: 'メニューを開く' })).toBeVisible();
-		await expectOffscreenLeft(page, 'タグ登録');
+		await expectNavHidden(page, 'タグ登録');
 	});
 
 	test('5. Escape キーでもオフキャンバスが閉じる', async () => {
@@ -124,6 +125,6 @@ test.describe.serial('banto-hub offcanvas sidebar (narrow viewport)', () => {
 		await page.keyboard.press('Escape');
 
 		await expect(page.getByRole('button', { name: 'メニューを開く' })).toBeVisible();
-		await expectOffscreenLeft(page, 'タグ登録');
+		await expectNavHidden(page, 'タグ登録');
 	});
 });

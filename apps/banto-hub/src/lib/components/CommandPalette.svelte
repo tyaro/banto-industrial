@@ -1,6 +1,6 @@
 <script lang="ts">
 	// relay-wright の同名コンポーネントから無改変で複製。
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import { isProviderError, notify, searchCommands, type PaletteCommand } from '@banto/admin-core';
 	import { buildCommands, loadRecentCommandIds, recordRecentCommand } from '$lib/commands';
 	import { commandPaletteStore } from '$lib/commandPalette.svelte';
@@ -73,7 +73,20 @@
 		return () => {
 			const previous = triggerEl;
 			triggerEl = null;
-			restoreFocus(previous);
+			// #381 レビュー対応12回目: 戻し先が死んでいる（コマンドが画面遷移して
+			// 消えた・閉じたサイドバーの中で `inert` になった等）ときは、ヘッダーの
+			// 先頭ボタン（☰ - 常設でどの画面にもある）へ逃がす。`<body>` には
+			// 落とさない（層の約束・項目5）。
+			//
+			// **`tick()` の後に判定する**: ナビ系コマンドは `goto()` のあと
+			// `afterNavigate` がサイドバーを畳む、というように**同じ流れの中で
+			// 戻し先の生死が変わる**。先に戻してしまうと、直後に `inert` が付いて
+			// フォーカスが `<body>` へ落ちる（`Drawer`/`Modal` と同じ理由）。
+			void tick().then(() =>
+				restoreFocus(previous, () =>
+					restoreFocus(document.querySelector<HTMLElement>('header button'))
+				)
+			);
 		};
 	});
 

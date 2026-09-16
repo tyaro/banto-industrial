@@ -384,6 +384,19 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		const editDrawer = page.getByRole('dialog', { name: `${TAG_A} を編集` });
 		await expect(editDrawer).toBeVisible();
 
+		await page.evaluate(() => {
+			(window as unknown as { __trace: string[] }).__trace = [];
+			document.addEventListener(
+				'focusin',
+				(e) => {
+					const t = e.target as HTMLElement;
+					(window as unknown as { __trace: string[] }).__trace.push(
+						'in:' + t.tagName + ':' + (t.textContent ?? '').trim().slice(0, 10)
+					);
+				},
+				true
+			);
+		});
 		await page.keyboard.press('Control+k');
 		const palette = page.getByRole('dialog', { name: 'コマンドパレット' });
 		await expect(palette).toBeVisible();
@@ -649,5 +662,75 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(monitorTreePane).toBeHidden();
 		await expect(page.getByTestId('monitor-tree-selection')).toHaveText(GROUP_B);
 		await expect(page.getByRole('cell', { name: TAG_B_EXTERNAL, exact: true })).toBeVisible();
+	});
+
+	test('22. モーダルを閉じた直後（outro 中）の Esc でも、次の層が閉じる（#381 レビュー対応12回目）', async () => {
+		// `Drawer`/`Modal` は `open=false` のあと outro（fade/fly）のあいだ DOM に
+		// 残り、矩形も `visibility` も可視のまま。印（`data-layer-inactive`）を
+		// 付けないと、その ~150ms は下の層が「上に層がある」と譲るのに閉じるものが
+		// 無く、**Esc が無反応**になる。
+		await page.goto('/tags');
+		await treeToggle.click();
+		await expect(treePane).toBeVisible();
+		await treePane.getByRole('button', { name: 'PLC接続を追加' }).click();
+		const createModal = page.getByRole('dialog', { name: '新規作成' });
+		await expect(createModal).toBeVisible();
+
+		// 1回目で Modal を閉じ、**待たずに**2回目を送る（outro の最中）。
+		await page.keyboard.press('Escape');
+		await page.keyboard.press('Escape');
+
+		await expect(createModal).toHaveCount(0);
+		await expect(treePane).toBeHidden();
+	});
+
+	test('23. 編集 Drawer からタグを削除してもフォーカスが body に落ちない（#381 レビュー対応12回目）', async () => {
+		// 削除は「Drawer を閉じる」のと「行が一覧から消える」のが同じ更新で起きる。
+		// DOM 更新の前に戻すと、消える直前の行へ戻してフォーカスが落ちる。
+		await page.getByPlaceholder('名前・アドレスで検索').fill(TAG_A);
+		await page.getByRole('gridcell', { name: TAG_A, exact: true }).click();
+		const editDrawer = page.getByRole('dialog', { name: `${TAG_A} を編集` });
+		await expect(editDrawer).toBeVisible();
+
+		page.once('dialog', (dialog) => void dialog.accept());
+		await editDrawer.getByRole('button', { name: '削除', exact: true }).click();
+		await expect(editDrawer).toHaveCount(0);
+
+		// 戻し先の行は消えているので、`focusFallback`（ツリーのトグル）へ。
+		await expect
+			.poll(() => page.evaluate(() => document.activeElement?.tagName ?? null))
+			.not.toBe('BODY');
+		await page.getByPlaceholder('名前・アドレスで検索').fill('');
+	});
+
+	test('24. 退避したサイドバーの中にフォーカスを残さない（#381 レビュー対応12回目）', async () => {
+		// 狭幅のサイドバーは `translateX(-100%)` で退避するだけだったので、閉じた
+		// あとも中のナビ項目がフォーカスを受けられた（`inert` + `visibility: hidden`
+		// で「無い」ことを明示した - `escLayering.ts` の層の約束・項目6）。あわせて
+		// **畳む瞬間に中にフォーカスがあればヘッダーの ☰ へ逃がす**（`SplitPane` の
+		// `focusFallback` と同じ役割。`inert` が付いた後ではブラウザが先に
+		// フォーカスを外してしまうので、判定は DOM 更新の前に行っている）。
+		await page.goto('/tags');
+		await page.getByRole('button', { name: 'メニューを開く' }).click();
+		const navLink = page.getByRole('link', { name: 'タグモニタ' });
+		await navLink.focus();
+		await expect(navLink).toBeFocused();
+
+		await page.keyboard.press('Escape');
+		await expect(page.getByRole('button', { name: 'メニューを開く' })).toBeVisible();
+
+		// 退避したサイドバーの中にも `<body>` にも残らない。
+		await expect
+			.poll(() =>
+				page.evaluate(() => {
+					const active = document.activeElement;
+					if (!active || active === document.body) return false;
+					const aside = document.querySelector('aside');
+					return !(aside && aside.contains(active));
+				})
+			)
+			.toBe(true);
+		// 退避後のナビ項目はフォーカスを受けられない（`inert`）。
+		await expect(navLink).toBeHidden();
 	});
 });

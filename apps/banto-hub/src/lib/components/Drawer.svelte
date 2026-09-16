@@ -24,10 +24,10 @@
 	 * ントは banto-hub の型・ストアを import しない規約のため）。
 	 */
 	import type { Snippet } from 'svelte';
-	import { untrack } from 'svelte';
+	import { tick, untrack } from 'svelte';
 	import { fade, fly } from 'svelte/transition';
 	import { isCloseAllowed } from './drawerCloseGuard';
-	import { hasVisibleLayerAbove } from './escLayering';
+	import { hasVisibleLayerAbove, LAYER_INACTIVE_ATTR } from './escLayering';
 	import { handleTrapKeydown } from './focusTrap';
 	import { restoreFocus } from './focusRestore';
 
@@ -95,14 +95,27 @@
 	/** 自分自身のパネル（`role="dialog"`）。層の約束の「自分以外」の判定に使う。 */
 	let panelEl: HTMLDivElement | undefined = $state();
 
+	/**
+	 * #381 レビュー対応12回目（層の約束・項目6）: **閉じる意思が固まってから実際に
+	 * DOM から消えるまで**（`open` の反映待ち + outro の fade/fly）は「もう無い層」
+	 * として扱う。この間、矩形も `visibility` も可視のままなので、印を付けないと
+	 * 下の層が譲り続けて **Esc が無反応**になる。props の反映（＝再描画）は非同期で
+	 * 直後の Esc に間に合わないため、`requestClose()` で**同期的に**属性も立てる。
+	 */
+	let closing = $state(false);
+
 	/** `onRequestClose` 経由でクローズ可否を判定し、許可された場合だけ `onclose` を呼ぶ。 */
 	function requestClose(): void {
 		if (onRequestClose && !onRequestClose()) return;
+		closing = true;
+		panelEl?.setAttribute(LAYER_INACTIVE_ATTR, 'true');
 		onclose?.();
 	}
 
 	function handleWindowKeydown(event: KeyboardEvent): void {
-		if (open && event.key === 'Escape') {
+		// 閉じる処理が走った後（`open` の反映待ち・outro 中）は、もうこの層は
+		// 無いものとして次の Esc を下の層へ渡す。
+		if (open && !closing && event.key === 'Escape') {
 			// 層の約束（`escLayering.ts` の doc が正、#381 レビュー対応5回目):
 			// 自分より手前に別の層（コマンドパレット等）が出ていれば譲る。
 			// `defaultPrevented` だけでは足りない - window リスナーは登録順に走り、
@@ -137,11 +150,15 @@
 	 * `<body>` へ落ち、そこからの Tab は**どのパネルの keydown も通らない**ので
 	 * 残っている層のトラップをすり抜ける。
 	 *
-	 * `$effect.pre`（DOM 更新の**前**）で拾うのが要点: 通常の `$effect` だと
-	 * `use:focusFirst` が先頭要素へフォーカスを移した後になり、開く前の要素が
-	 * 分からなくなる。**遷移したときだけ**動かすのは `SplitPane.svelte` と同じ
-	 * （値が同じでも通知が飛ぶことがある）。戻し先が消えている / `inert` の中なら
-	 * `restoreFocus` が何もしない（代わりの行き先は持たない）。
+	 * **捕捉は `$effect.pre`（DOM 更新の前）、戻しは `tick()` の後**（#381 レビュー
+	 * 対応12回目）。捕捉が前なのは、通常の `$effect` だと `use:focusFirst` が先頭
+	 * 要素へフォーカスを移した後になり開く前の要素が分からなくなるため。戻しを
+	 * 後にするのは、**閉じるのと同じ更新で戻し先自体が消えることがある**ため
+	 * （例: 編集 Drawer からタグを削除すると、`drawerMode` が消えるのと同じ更新で
+	 * その行が一覧から外れる）。DOM 更新前に戻すと「まだ生きて見える行」へ戻して
+	 * しまい、直後に消えてフォーカスが `<body>` へ落ちる - `restoreFocus` は
+	 * `tick()` 後の DOM に対して生存判定するので、死んでいれば `focusFallback` へ
+	 * 進める。**遷移したときだけ**動かすのは `SplitPane.svelte` と同じ。
 	 */
 	let triggerEl: HTMLElement | null = null;
 	let openHandled = false;
@@ -152,6 +169,7 @@
 			if (isOpen === openHandled) return;
 			openHandled = isOpen;
 			if (isOpen) {
+				closing = false;
 				const active = document.activeElement;
 				triggerEl = active instanceof HTMLElement ? active : null;
 			} else {
@@ -159,7 +177,9 @@
 				triggerEl = null;
 				// 開いた元が死んでいれば呼び出し側の代替へ。代替にも同じ生存判定を
 				// かけたいので `restoreFocus` を入れ子にする。
-				restoreFocus(previous, () => restoreFocus(focusFallback?.() ?? null));
+				void tick().then(() =>
+					restoreFocus(previous, () => restoreFocus(focusFallback?.() ?? null))
+				);
 			}
 		});
 	});
@@ -201,6 +221,7 @@
 			class="drawer"
 			bind:this={panelEl}
 			role="dialog"
+			data-layer-inactive={open && !closing ? undefined : 'true'}
 			aria-modal="true"
 			aria-label={title}
 			style:width

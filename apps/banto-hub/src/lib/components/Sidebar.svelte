@@ -1,5 +1,6 @@
 <script lang="ts">
 	// relay-wright の同名コンポーネントから無改変で複製。
+	import { tick, untrack } from 'svelte';
 	import { page } from '$app/state';
 	import { navItems, type NavItem } from '$lib/navigation';
 	import { settings } from '$lib/settings.svelte';
@@ -27,6 +28,35 @@
 	// 適用しない - 狭幅では常にフルラベル表示にする。
 	const collapsed = $derived(!mobileNavStore.isNarrow && settings.sidebarCollapsed);
 
+	let asideEl: HTMLElement | undefined = $state();
+
+	/**
+	 * #381 レビュー対応12回目（層の約束・項目6、`escLayering.ts`）: **退避した
+	 * 瞬間、中にフォーカスが残っていたらヘッダーの ☰ へ逃がす**（`SplitPane` の
+	 * `focusFallback` と同じ役割）。オフキャンバスは閉じると `inert` になるので、
+	 * 中の項目にフォーカスが残っていると `<body>` へ落ちる - 実際に踏むのは
+	 * 「サイドバーの項目にフォーカス → コマンドパレットのナビ系コマンド →
+	 * `goto()` は待たれないのでパレットは先に閉じてその項目へ戻し、あとから
+	 * `afterNavigate` がサイドバーを畳む」という順序（パレット側の戻しだけでは
+	 * 拾えない）。**遷移したときだけ**動かす（`mobileNavStore` は状態を
+	 * オブジェクトごと差し替えるので、値が同じでも通知が飛ぶ）。
+	 */
+	let navHiddenHandled = false;
+	$effect.pre(() => {
+		const hidden = mobileNavStore.isNarrow && !mobileNavStore.open;
+		untrack(() => {
+			if (hidden === navHiddenHandled) return;
+			navHiddenHandled = hidden;
+			if (!hidden) return;
+			// **判定は `$effect.pre`（DOM 更新の前）で**: `inert` が付いた後だと
+			// ブラウザが先にフォーカスを外して `<body>` に落としてしまい、「中に
+			// フォーカスがあった」ことがもう分からない。移すのは更新後（`tick()`）。
+			const active = document.activeElement;
+			if (!(active instanceof HTMLElement) || !asideEl?.contains(active)) return;
+			void tick().then(() => document.querySelector<HTMLElement>('header button')?.focus());
+		});
+	});
+
 	// リンクをクリックしたらオフキャンバスを閉じる（設計の「閉じる契機」の
 	// 1つ）。デスクトップ幅では isNarrow が false なので no-op。
 	function handleNavClick(): void {
@@ -34,7 +64,20 @@
 	}
 </script>
 
-<aside class:collapsed class:offcanvas={mobileNavStore.isNarrow} class:open={mobileNavStore.open}>
+<!--
+	#381 レビュー対応12回目（層の約束・項目6、`escLayering.ts`）: 狭幅で閉じている
+	オフキャンバスは `inert`。`transform: translateX(-100%)` だけだと矩形も
+	`visibility` も残り、**画面外のナビ項目がフォーカスを受けられてしまう**
+	（`focusRestore.ts::canRestoreFocusTo` も「生きている」と判定する）。CSS 側でも
+	`visibility: hidden` を併用する（`SplitPane` の退避ペインと同じ形）。
+-->
+<aside
+	bind:this={asideEl}
+	class:collapsed
+	class:offcanvas={mobileNavStore.isNarrow}
+	class:open={mobileNavStore.open}
+	inert={mobileNavStore.isNarrow && !mobileNavStore.open}
+>
 	<div class="brand">
 		<span class="brand-icon">🏮</span>
 		{#if !collapsed}
@@ -103,12 +146,20 @@
 			z-index: 710;
 			width: min(var(--banto-shell-sidebar-width), 85vw);
 			transform: translateX(-100%);
-			transition: transform 0.2s ease;
+			/* #381 レビュー対応12回目: `visibility` も落とす（上の markup の
+			   コメント参照 - transform だけだと退避中もフォーカス・判定に残る）。
+			   `visibility` は離散なので、閉じるアニメーションの間は `visible` の
+			   まま最後に切り替わる。 */
+			visibility: hidden;
+			transition:
+				transform 0.2s ease,
+				visibility 0.2s ease;
 			box-shadow: 12px 0 32px rgba(0, 0, 0, 0.25);
 		}
 
 		aside.offcanvas.open {
 			transform: translateX(0);
+			visibility: visible;
 		}
 	}
 

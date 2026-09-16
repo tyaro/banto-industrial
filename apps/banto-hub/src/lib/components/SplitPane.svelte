@@ -21,7 +21,7 @@
 	 * アプリ非依存 — banto-hub の型・ストアを import しない。
 	 */
 	import type { Snippet } from 'svelte';
-	import { untrack } from 'svelte';
+	import { tick, untrack } from 'svelte';
 	import { hasVisibleLayerAbove, LAYER_ABOVE_SELECTOR } from './escLayering';
 	import { restoreFocus } from './focusRestore';
 
@@ -182,15 +182,18 @@
 	 * `inert` + `visibility: hidden` になる。フォーカスがそこにあると
 	 * `<body>` へ落ちてキーボード操作の起点が失われる。
 	 */
-	$effect(() => {
+	$effect.pre(() => {
 		const hidden = narrow && !leftOpen;
 		untrack(() => {
 			if (hidden === paneHiddenHandled) return;
 			paneHiddenHandled = hidden;
 			if (!hidden) return;
+			// **判定は DOM 更新の前**（`$effect.pre`）: `inert` が付いた後だと
+			// ブラウザが先にフォーカスを外して `<body>` へ落とすので、「中に
+			// フォーカスがあった」ことが分からなくなる。移すのは更新後（`tick()`）。
 			const active = document.activeElement;
 			if (!(active instanceof HTMLElement) || !leftPaneEl?.contains(active)) return;
-			focusFallback?.()?.focus();
+			void tick().then(() => focusFallback?.()?.focus());
 		});
 	});
 
