@@ -144,10 +144,22 @@
 				onSelect(i);
 			}}
 		>
-			<span class="completion-kind">{KIND_LABELS[candidate.kind]}</span>
-			<span class="completion-label">{candidate.label}</span>
-			{#if candidate.detail}
-				<span class="completion-detail">{candidate.detail}</span>
+			<!--
+				#380 レビュー対応1: 1行目は候補の種別を問わず同じ並び
+				（種別 / 名前 / `detail`）にして見た目を揃え、組み込み関数だけが
+				持つ `description`（1行の日本語説明）は2行目へ回す。`detail` に
+				連結すると、タグ候補の「型・単位」と同じスロットに一文が入って
+				1行目が崩れるため。
+			-->
+			<div class="completion-line">
+				<span class="completion-kind">{KIND_LABELS[candidate.kind]}</span>
+				<span class="completion-label">{candidate.label}</span>
+				{#if candidate.detail}
+					<span class="completion-detail">{candidate.detail}</span>
+				{/if}
+			</div>
+			{#if candidate.description}
+				<span class="completion-description">{candidate.description}</span>
 			{/if}
 		</div>
 	{/each}
@@ -178,13 +190,27 @@
 
 	.completion-item {
 		display: flex;
-		gap: 0.4rem;
-		align-items: baseline;
+		flex-direction: column;
+		gap: 0.1rem;
 		padding: 0.25rem 0.4rem;
 		border-radius: var(--banto-radius);
 		color: var(--banto-text);
 		font-size: 0.85rem;
 		cursor: pointer;
+	}
+
+	/* 1行目（種別 / 名前 / detail）。候補の種別によらず同じ並び。 */
+	.completion-line {
+		display: flex;
+		gap: 0.4rem;
+		align-items: baseline;
+	}
+
+	/* 2行目（組み込み関数の説明だけ。種別ラベルのぶん字下げして揃える）。 */
+	.completion-description {
+		padding-left: calc(3.5rem + 0.4rem);
+		color: var(--banto-text-muted);
+		font-size: 0.72rem;
 	}
 
 	.completion-item.active {

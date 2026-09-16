@@ -187,7 +187,16 @@ describe('completionCandidates', () => {
 		// 式で表せない接続名（`製造ライン`）は出さない。
 		expect(labels(candidates)).toEqual(['line1', 'calc', 'min', 'max', 'abs']);
 		expect(candidates[0].kind).toBe('connection');
-		expect(candidates[2]).toEqual({ label: 'min', kind: 'function', detail: 'min(値1, 値2)' });
+		// #380 レビュー対応1: 関数候補は `signature`（detail）だけでなく
+		// `description`（API が返す1行説明）も持つ。
+		expect(candidates[2]).toEqual({
+			label: 'min',
+			kind: 'function',
+			detail: 'min(値1, 値2)',
+			description: '小さい方'
+		});
+		// 接続・グループ・タグ候補は説明を持たない（ポップアップは2行目を描かない）。
+		expect(candidates[0].description).toBeNull();
 	});
 
 	it('第1セグメントの前方一致は接続にも関数にも効く', () => {
@@ -224,7 +233,12 @@ describe('completionCandidates', () => {
 		// `温度` は式で表せない名前なので出ない。`label`（string 型）は
 		// 段階C の除外（`blockedInsertTargets`）を渡していないのでここでは残る。
 		expect(labels(candidates)).toEqual(['temp', 'temp2', 'label']);
-		expect(candidates[0]).toEqual({ label: 'temp', kind: 'tag', detail: 'f32・℃' });
+		expect(candidates[0]).toEqual({
+			label: 'temp',
+			kind: 'tag',
+			detail: 'f32・℃',
+			description: null
+		});
 		expect(candidates[1].detail).toBe('i16');
 	});
 
@@ -255,24 +269,25 @@ describe('completionCandidates', () => {
 
 describe('completionInsertion', () => {
 	it('接続・グループは名前＋ドットを入れて次の階層を開く', () => {
-		expect(completionInsertion({ label: 'line1', kind: 'connection', detail: null })).toEqual({
-			text: 'line1.',
-			reopen: true
-		});
-		expect(completionInsertion({ label: 'fast', kind: 'group', detail: null })).toEqual({
-			text: 'fast.',
-			reopen: true
-		});
+		expect(
+			completionInsertion({ label: 'line1', kind: 'connection', detail: null, description: null })
+		).toEqual({ text: 'line1.', reopen: true });
+		expect(
+			completionInsertion({ label: 'fast', kind: 'group', detail: null, description: null })
+		).toEqual({ text: 'fast.', reopen: true });
 	});
 
 	it('タグは名前だけ、関数は `name(` を入れて閉じる', () => {
-		expect(completionInsertion({ label: 'temp', kind: 'tag', detail: 'f32' })).toEqual({
-			text: 'temp',
-			reopen: false
-		});
-		expect(completionInsertion({ label: 'min', kind: 'function', detail: 'min(a, b)' })).toEqual({
-			text: 'min(',
-			reopen: false
-		});
+		expect(
+			completionInsertion({ label: 'temp', kind: 'tag', detail: 'f32', description: null })
+		).toEqual({ text: 'temp', reopen: false });
+		expect(
+			completionInsertion({
+				label: 'min',
+				kind: 'function',
+				detail: 'min(a, b)',
+				description: '小さい方'
+			})
+		).toEqual({ text: 'min(', reopen: false });
 	});
 });

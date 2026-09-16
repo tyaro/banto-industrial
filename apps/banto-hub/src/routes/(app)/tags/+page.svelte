@@ -1991,8 +1991,23 @@
 	/**
 	 * 挿入をブロックする行（`id -> 理由`）。判定は純関数
 	 * `blockedInsertTargets`（`$lib/banto/expressionInsert.ts`、**正は段階A
-	 * のサーバチェック**）。トグルが OFF の間は空 Map にして、一覧全件ぶんの
-	 * 依存グラフ構築を走らせない。
+	 * のサーバチェック**）。段階C の「一覧から挿入」（淡色行・理由トースト）と
+	 * 段階B のセグメント補完（候補から除外）が**同じ1つの derived を共有する**。
+	 *
+	 * **依存は `tags` と `insertSelfId` だけ。UI の状態（`insertArmed`・
+	 * `completionContext` 等）を依存に加えないこと**（#380 レビュー対応3）:
+	 * `$derived` は**読まれたときだけ計算され、依存が変わらなければキャッシュを
+	 * 返す**ので、
+	 *
+	 * - トグルが OFF の間は `tagRowClass` が `insertArmed &&` を先に見るため
+	 *   そもそも読まれない（＝グラフを組まない）、
+	 * - 補完は第3セグメント（タグ候補）のときだけ読むため、接続・グループの
+	 *   補完ではグラフを組まない、
+	 * - 第3セグメントで1文字ずつ打っても `tags` は変わらないのでキャッシュが
+	 *   返る（打鍵ごとに O(V+E) を回さない）、
+	 *
+	 * という性質が自動的に得られる。以前は UI 状態を依存に入れていたため、
+	 * 3セグメント目の打鍵ごとに全カタログ規模の依存グラフを組み直していた。
 	 *
 	 * #379 レビュー対応: 依存グラフは `visibleTags` ではなく**生の `tags`
 	 * （サーバー全件）**から組む。削除猶予中（`deferredDelete.pendingIds`）の
@@ -2005,7 +2020,6 @@
 	 * この Map に入っていても描画には現れない。
 	 */
 	const insertBlockedReasons = $derived.by((): Map<number, string> => {
-		if (!insertArmed) return new Map();
 		const candidates: InsertCandidateTag[] = tags.map((t) => ({
 			id: t.id,
 			dataType: t.dataType,
@@ -2082,6 +2096,13 @@
 		void fetchExpressionFunctions()
 			.then((list) => {
 				expressionFunctions = list;
+				// #380 レビュー対応2: 取得が補完より後に解決したときの取りこぼしを
+				// 防ぐ。2文字打った時点で関数表が空だと候補0件でポップアップが
+				// 閉じてしまい、その後フェッチが解決しても何も再計算されない
+				// （次の打鍵か手動トリガーまで関数候補が出ない）。式欄にフォーカスが
+				// あるときだけ組み直す - `force` を付けないので、閉じていた場合は
+				// 「2文字以上の前方一致」等の通常の開く条件を満たすときだけ開く。
+				if (exprTextareaEl && document.activeElement === exprTextareaEl) refreshCompletion();
 			})
 			.catch(() => {
 				// 権限不足・ネットワーク断でも補完は壊さない（関数候補が出ないだけ）。
@@ -2111,6 +2132,14 @@
 	const COMPLETION_LIMIT = 20;
 
 	/**
+	 * 第1・第2セグメントの補完で `completionCandidates` に渡す空の除外マップ。
+	 * 使い回しの定数にしてあるのは、ここで `new Map()` を作ると
+	 * `allCompletionCandidates` の戻り値が毎回新しい参照になるため（#380
+	 * レビュー対応3 - 除外マップを読むのは第3セグメントのときだけにする）。
+	 */
+	const NO_BLOCKED_COMPLETION_TAGS: ReadonlyMap<number, string> = new Map();
+
+	/**
 	 * 接続名 → グループ名 → タグ の索引。**一覧が変わったときだけ**組み直す
 	 * （毎キーストロークでは組み直さない - `expressionCompletion.ts` の
 	 * `buildCompletionIndex` doc comment 参照）。
@@ -2122,35 +2151,18 @@
 	const completionIndex = $derived(buildCompletionIndex(connections, groups, tags));
 
 	/**
-	 * 補完で除外するタグ（`id -> 理由`）。段階C の `blockedInsertTargets` を
-	 * **そのまま**使う（自タグ・式で表せない名前・文字列型・循環の4種）。
-	 * 段階C の行クリックは淡色＋トーストだが、**補完では候補に出さない** -
-	 * 打鍵の続きに出るものなので、選べない候補は矢印キーで踏むだけ邪魔になる。
+	 * 現在の文脈に対する候補全件（上限で切る前）。
 	 *
-	 * `insertBlockedReasons` を流用しないのは、あちらが「トグル ON のときだけ
-	 * 計算する」ようにしてあるため（補完はトグルと独立に効く）。
+	 * 除外マップ（`insertBlockedReasons`、段階C と共有）は**第3セグメント
+	 * （タグ候補）のときだけ読む** - `$derived` は読まれたときだけ計算される
+	 * ので、接続・グループの補完では全カタログ規模の依存グラフ構築が走らない
+	 * （#380 レビュー対応3。`insertBlockedReasons` の doc comment 参照）。
 	 */
-	const completionBlockedTagIds = $derived.by((): Map<number, string> => {
-		if (!completionOpen || completionContext?.kind !== 'segment3') return new Map();
-		const candidates: InsertCandidateTag[] = tags.map((t) => ({
-			id: t.id,
-			dataType: t.dataType,
-			tagKind: t.tagKind,
-			expression: t.expression,
-			externalName: externalNameForTag(t)
-		}));
-		return blockedInsertTargets(candidates, insertSelfId);
-	});
-
-	/** 現在の文脈に対する候補全件（上限で切る前）。 */
 	const allCompletionCandidates = $derived.by((): CompletionCandidate[] => {
 		if (!completionOpen || completionContext === null) return [];
-		return completionCandidates(
-			completionContext,
-			completionIndex,
-			expressionFunctions,
-			completionBlockedTagIds
-		);
+		const blocked =
+			completionContext.kind === 'segment3' ? insertBlockedReasons : NO_BLOCKED_COMPLETION_TAGS;
+		return completionCandidates(completionContext, completionIndex, expressionFunctions, blocked);
 	});
 
 	/** 実際にポップアップへ出す候補（先頭 {@link COMPLETION_LIMIT} 件）。 */
@@ -2182,6 +2194,10 @@
 	 * 「キャレットまでの文字列 + 0幅の目印」を入れれば、目印の矩形が
 	 * そのままキャレットの矩形になる。**新しい座標計算は発明しない**
 	 * （実装指示）。複製は測定のあと即座に取り除く。
+	 *
+	 * **`caret` に渡すのは現在のキャレット位置（`selectionStart`）**であって
+	 * 補完対象の prefix の先頭ではない（#380 レビュー対応4）: ポップアップは
+	 * `CompletionPopup.svelte` の契約どおり**キャレットに追従**する。
 	 */
 	function caretAnchor(el: HTMLTextAreaElement, caret: number): DOMRect | null {
 		const wrap = el.parentElement;
@@ -2221,7 +2237,8 @@
 			closeCompletion();
 			return;
 		}
-		const context = completionContextAt(el.value, el.selectionStart ?? el.value.length);
+		const caret = el.selectionStart ?? el.value.length;
+		const context = completionContextAt(el.value, caret);
 		if (context === null) {
 			closeCompletion();
 			return;
@@ -2236,7 +2253,9 @@
 			return;
 		}
 
-		const anchor = caretAnchor(el, context.replaceFrom);
+		// #380 レビュー対応4: 基準は**キャレット（`selectionStart`）**であって
+		// prefix の先頭ではない（`line1` と打ち進めるとポップアップも右へ動く）。
+		const anchor = caretAnchor(el, caret);
 		completionContext = context;
 		completionOpen = true;
 		completionActiveIndex = 0;

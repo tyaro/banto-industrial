@@ -254,8 +254,21 @@ export interface CompletionCandidate {
 	/** 挿入する文字列そのもの（登録名 / 関数名）。 */
 	label: string;
 	kind: 'connection' | 'group' | 'tag' | 'function';
-	/** 右側に薄く出す補足（タグなら型・単位、関数なら呼び出し形）。無ければ `null`。 */
+	/**
+	 * 1行目の右側に薄く出す**主**の補足（タグなら型・単位、関数なら呼び出し形）。
+	 * 無ければ `null`。タグと関数で同じスロットを使うので、行の見た目は揃う。
+	 */
 	detail: string | null;
+	/**
+	 * 2行目に薄く出す**副**の補足。現状は組み込み関数の1行説明だけが持つ
+	 * （#380 レビュー対応1: `GET /api/tags/expression/functions` が
+	 * `description` を返し docs にも「シグネチャと一緒に出す」と書いてあるのに、
+	 * 候補へ渡していなかった）。`detail` に連結せず別フィールドにしたのは、
+	 * 説明文（日本語の一文）を型・単位と同じスロットへ入れると、タグ候補の
+	 * 「`f32・℃`」と並んだときに1行目の見た目が崩れるため。持たない候補は
+	 * `null` で、そのときポップアップは2行目自体を描かない。
+	 */
+	description: string | null;
 }
 
 /**
@@ -305,10 +318,15 @@ export function completionCandidates(
 					isExpressionRepresentableSegment(name, { first: true }) &&
 					matchesPrefix(name, context.prefix)
 			)
-			.map((name) => ({ label: name, kind: 'connection', detail: null }));
+			.map((name) => ({ label: name, kind: 'connection', detail: null, description: null }));
 		const builtins: CompletionCandidate[] = functions
 			.filter((fn) => matchesPrefix(fn.name, context.prefix))
-			.map((fn) => ({ label: fn.name, kind: 'function', detail: fn.signature }));
+			.map((fn) => ({
+				label: fn.name,
+				kind: 'function',
+				detail: fn.signature,
+				description: fn.description
+			}));
 		return [...connections, ...builtins];
 	}
 
@@ -318,7 +336,7 @@ export function completionCandidates(
 			.filter(
 				(name) => isExpressionRepresentableSegment(name) && matchesPrefix(name, context.prefix)
 			)
-			.map((name) => ({ label: name, kind: 'group', detail: null }));
+			.map((name) => ({ label: name, kind: 'group', detail: null, description: null }));
 	}
 
 	const tags = index.tagsByGroupPath.get(groupPath(context.seg1 ?? '', context.seg2 ?? '')) ?? [];
@@ -329,7 +347,7 @@ export function completionCandidates(
 				!blockedTagIds.has(tag.id) &&
 				matchesPrefix(tag.name, context.prefix)
 		)
-		.map((tag) => ({ label: tag.name, kind: 'tag', detail: tagDetail(tag) }));
+		.map((tag) => ({ label: tag.name, kind: 'tag', detail: tagDetail(tag), description: null }));
 }
 
 // ---------------------------------------------------------------------------
