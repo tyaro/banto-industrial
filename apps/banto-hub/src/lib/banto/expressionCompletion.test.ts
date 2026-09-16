@@ -9,6 +9,7 @@ import {
 	buildCompletionIndex,
 	completionCandidates,
 	completionContextAt,
+	completionContextMatchesCaret,
 	completionInsertion,
 	type CompletionCandidate,
 	type CompletionIndex
@@ -102,6 +103,28 @@ describe('completionContextAt', () => {
 		expect(contextAt('line-1|')).toMatchObject({ kind: 'segment1', prefix: 'line-1' });
 		// `1-x` の `-` は演算子なので、補完対象は `x` だけ。
 		expect(contextAt('1-x|')).toMatchObject({ kind: 'segment1', prefix: 'x' });
+	});
+
+	it('ハイフンを2つ以上含む識別子も途中で切らない（#380 レビュー対応2）', () => {
+		// `IDENT_SEGMENT` = `[A-Za-z_][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)*` なので
+		// `line-1-2` / `line-1-foo` は丸ごと1つの識別子。以前は2つ目の `-` の
+		// 左ラン（`1`）が英字始まりでないとして走査が止まり、prefix が `2`/`foo`
+		// だけになっていた（確定すると末尾だけ置換して式を壊す）。
+		expect(contextAt('line-1-2|')).toMatchObject({ kind: 'segment1', prefix: 'line-1-2' });
+		expect(contextAt('line-1-foo|')).toMatchObject({ kind: 'segment1', prefix: 'line-1-foo' });
+		// セグメントを跨いでも同じ。
+		expect(contextAt('line-1-2.grp-a-b|')).toMatchObject({
+			kind: 'segment2',
+			prefix: 'grp-a-b',
+			seg1: 'line-1-2'
+		});
+		// `1-line1` の `-` は左が数値なので演算子 - 補完対象は `line1` だけ。
+		expect(contextAt('1-line1|')).toMatchObject({ kind: 'segment1', prefix: 'line1' });
+		// `a--b` は lexer でも識別子にならない（`-` の右隣が継続文字でない）ので
+		// 補完対象は `b` だけ。
+		expect(contextAt('a--b|')).toMatchObject({ kind: 'segment1', prefix: 'b' });
+		// 打鍵途中の末尾ハイフンは prefix に含める（次に継続文字を打つところ）。
+		expect(contextAt('line-|')).toMatchObject({ kind: 'segment1', prefix: 'line-' });
 	});
 
 	it('空白を跨がない（`conn . group` は lexer 上は有効だが補完しない）', () => {
@@ -264,6 +287,25 @@ describe('completionCandidates', () => {
 	it('関数表が空でも（取得に失敗しても）タグ候補は出る', () => {
 		const ctx = completionContextAt('', 0)!;
 		expect(labels(completionCandidates(ctx, index, [], noBlocks))).toEqual(['line1', 'calc']);
+	});
+});
+
+describe('completionContextMatchesCaret', () => {
+	const context = completionContextAt('line1.fast.te', 13)!;
+
+	it('キャレットが replaceTo に潰れていれば一致', () => {
+		expect(completionContextMatchesCaret(context, 13, 13)).toBe(true);
+	});
+
+	it('キャレットが動いていたら一致しない（確定して式を壊さない）', () => {
+		// `PageUp`/`Ctrl+A`/マウスクリックなど `input` を伴わない移動を想定。
+		expect(completionContextMatchesCaret(context, 0, 0)).toBe(false);
+		expect(completionContextMatchesCaret(context, 5, 5)).toBe(false);
+	});
+
+	it('選択範囲があるときも一致しない', () => {
+		expect(completionContextMatchesCaret(context, 0, 13)).toBe(false);
+		expect(completionContextMatchesCaret(context, 13, 20)).toBe(false);
 	});
 });
 

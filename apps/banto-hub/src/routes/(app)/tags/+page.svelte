@@ -188,6 +188,7 @@
 		buildCompletionIndex,
 		completionCandidates,
 		completionContextAt,
+		completionContextMatchesCaret,
 		completionInsertion,
 		type CompletionCandidate,
 		type CompletionContext
@@ -2201,6 +2202,19 @@
 	const completionVisible = $derived(completionOpen && visibleCompletionCandidates.length > 0);
 
 	/**
+	 * #380 レビュー対応4: 候補が空になったら**状態も閉じる**。`refreshCompletion`
+	 * は自分が計算した直後の0件を見て閉じるが、その後に一覧が更新される
+	 * （カタログの再取得・タグの削除）と `completionOpen` が true のまま候補だけ
+	 * 0件になりうる。キー処理は `completionVisible` で守ってあるので実害は
+	 * 無くなっているが、状態として矛盾を残さない。
+	 */
+	$effect(() => {
+		if (completionOpen && visibleCompletionCandidates.length === 0) {
+			untrack(() => closeCompletion());
+		}
+	});
+
+	/**
 	 * 式欄の `aria-activedescendant`。ポップアップはフォーカスを持たない
 	 * （`CompletionPopup.svelte` の doc comment 参照）ので、選択中の候補は
 	 * この属性で支援技術へ伝える。
@@ -2311,6 +2325,16 @@
 		const context = completionContext;
 		const el = exprTextareaEl;
 		if (!candidate || !context || !el) return;
+		// #380 レビュー対応5: **確定の直前にキャレットを検証する**。ポップアップが
+		// 開いている間に `input` を伴わずキャレット・選択範囲だけが動く経路
+		// （`PageUp`/`PageDown`・`Ctrl+A`・マウスのクリックやドラッグ・外部からの
+		// `setSelectionRange`）はいくらでもあり、閉じるキーの列挙では漏れる。
+		// ずれていたら**挿入せずに閉じる**（古い `replaceFrom`/`replaceTo` の位置へ
+		// 書き込んで式を壊さない）。
+		if (!completionContextMatchesCaret(context, el.selectionStart ?? -1, el.selectionEnd ?? -1)) {
+			closeCompletion();
+			return;
+		}
 		const { text, reopen } = completionInsertion(candidate);
 
 		suppressCompletionRefresh = true;
@@ -2346,7 +2370,11 @@
 			refreshCompletion({ force: true });
 			return;
 		}
-		if (!completionOpen) return;
+		// #380 レビュー対応4: ガードは `completionOpen` ではなく
+		// **`completionVisible`**（開いている かつ 候補が1件以上）。候補が空の
+		// まま開きっぱなしになると、ポップアップは描画されていないのに
+		// Enter/Tab/矢印キーだけ奪われる。
+		if (!completionVisible) return;
 		switch (event.key) {
 			case 'Escape':
 				event.preventDefault();
@@ -2371,7 +2399,12 @@
 			case 'ArrowRight':
 			case 'Home':
 			case 'End':
+			case 'PageUp':
+			case 'PageDown':
 				// キャレットが動くと文脈が変わる - いったん閉じる（打ち直せば開く）。
+				// **これは UX のための早期クローズにすぎない**（列挙から漏れた経路
+				// ＝`Ctrl+A`・マウス操作などは `acceptCompletion` のキャレット検証が
+				// 受け止める。#380 レビュー対応5）。
 				closeCompletion();
 				break;
 		}
@@ -2387,8 +2420,17 @@
 		closeCompletion();
 	}
 
+	/**
+	 * #380 レビュー対応1: **フラグを戻すだけでなく補完も更新する**。ブラウザに
+	 * よっては確定文字列ぶんの `input` が composition 中に発火するため、
+	 * `handleExpressionInput` が（`exprCompletionComposing` の抑止で）ポップ
+	 * アップを閉じたまま二度と開かない、という状態になりうる。段階A の
+	 * `ExpressionCheckController.onCompositionEnd` が確定直後の内容で
+	 * チェックを再スケジュールしているのと同じ扱いにする。
+	 */
 	function handleExpressionCompositionEnd(): void {
 		exprCompletionComposing = false;
+		refreshCompletion();
 	}
 
 	/** マウスでキャレットを動かした・式欄から離れた（候補クリックは除く）。 */

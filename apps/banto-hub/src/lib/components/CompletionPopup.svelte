@@ -100,9 +100,69 @@
 		}
 	});
 
-	/** 選択中の候補が見えるようスクロールを追従させる（実装指示）。 */
+	/**
+	 * 選択中の候補が見えるようスクロールを追従させる（実装指示）。
+	 *
+	 * `scrollIntoView` ではなく**この一覧の `scrollTop` を直接動かす**:
+	 * `scrollIntoView` はポップアップが画面端に掛かっていると**祖先（ページ）まで
+	 * スクロールさせる**ことがあり、下の「スクロールで閉じる」と噛み合って
+	 * 開いた瞬間に自分で閉じてしまう。
+	 */
 	$effect(() => {
-		itemEls[activeIndex]?.scrollIntoView({ block: 'nearest' });
+		const list = listEl;
+		const item = itemEls[activeIndex];
+		if (!list || !item) return;
+		const top = item.offsetTop;
+		const bottom = top + item.offsetHeight;
+		if (top < list.scrollTop) list.scrollTop = top;
+		else if (bottom > list.scrollTop + list.clientHeight)
+			list.scrollTop = bottom - list.clientHeight;
+	});
+
+	/**
+	 * #380 レビュー対応3: `position: fixed` なので、開いている間にページ・ペイン・
+	 * 式欄のどれかがスクロールしたりウィンドウがリサイズされたりすると、
+	 * ポップアップだけが古い座標に取り残される（画面外にも行く）。**再測定では
+	 * なく閉じる**: 矢印キーでキャレットが動いたときに閉じる既存方針（「打ち直せば
+	 * また開く」）と揃うし、スクロール中に追いかけ続けるより素直。
+	 *
+	 * `scroll` は**バブルしない**ので、任意の祖先のスクロールを拾うために
+	 * `capture: true` で `window` に張る。ただし**ポップアップ自身のスクロール**
+	 * （候補が多いときの選択追従）で閉じてしまわないよう、発生元が
+	 * この要素の中なら無視する。リスナーはこのコンポーネントが存在する間
+	 * ＝ポップアップが開いている間だけ張られる（`{#if}` で破棄されると
+	 * `$effect` のクリーンアップで外れる）。
+	 *
+	 * 割り切り: 式欄そのものが**編集の副作用で**スクロールした（長い式を一気に
+	 * 消した等）ときも閉じる。編集由来かユーザーのスクロール由来かは区別
+	 * できないし、どちらでも「打ち直せばまた開く」で済むため、余計な状態を
+	 * 持ってまで作り分けない。
+	 */
+	$effect(() => {
+		const onScroll = (event: Event): void => {
+			if (event.target instanceof Node && listEl?.contains(event.target)) return;
+			onClose();
+		};
+		const onResize = (): void => onClose();
+		// **次のフレームまで待ってから張る**: ポップアップを開くきっかけになった
+		// 操作（候補をクリックする前のフォーカス移動など）が既にスクロールを
+		// 発生させていると、その `scroll` イベントは次のフレームで配送される。
+		// HTML 仕様上「スクロールステップ（scroll イベントの配送）」は
+		// 「アニメーションフレームコールバック」より**前**に走るので、
+		// `requestAnimationFrame` の中で張れば、開く直前の操作に由来する
+		// スクロールで即座に閉じてしまうことがない。
+		let armed = false;
+		const frame = requestAnimationFrame(() => {
+			armed = true;
+			window.addEventListener('scroll', onScroll, true);
+			window.addEventListener('resize', onResize);
+		});
+		return () => {
+			cancelAnimationFrame(frame);
+			if (!armed) return;
+			window.removeEventListener('scroll', onScroll, true);
+			window.removeEventListener('resize', onResize);
+		};
 	});
 
 	function handleWindowPointerDown(event: PointerEvent): void {

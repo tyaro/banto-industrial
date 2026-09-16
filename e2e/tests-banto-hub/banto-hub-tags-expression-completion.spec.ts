@@ -351,6 +351,10 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 		const expressionField = pane.getByLabel('式');
 		const popup = page.getByTestId('expression-completion');
 
+		// テスト6 が式欄をスクロールさせたままなので、まず空にしてスクロール位置を
+		// 戻す（`scroll` が飛ぶと #380 レビュー対応3 の「スクロールで閉じる」が
+		// 働くため、補完を開くのはスクロールが落ち着いてから）。
+		await expressionField.fill('');
 		await expressionField.fill('mi');
 		await expect(popup).toBeVisible();
 
@@ -364,5 +368,34 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 
 		await expect(pane).toHaveCount(0);
 		await expect(popup).toHaveCount(0);
+	});
+
+	test('8. IME 変換の確定後に補完が出る（#380 レビュー対応1）', async () => {
+		// テスト7でペインを閉じたので開き直す。
+		await groupNodeByName(page, CALC_GROUP_NAME).click();
+		await page.getByRole('button', { name: '新規登録' }).click();
+		const pane = page.getByRole('complementary', { name: '新規作成' });
+		await expect(pane).toBeVisible();
+		const expressionField = pane.getByLabel('式');
+		const popup = page.getByTestId('expression-completion');
+		await expect(popup).toHaveCount(0);
+
+		// Playwright の `type`/`insertText` では IME の composition を再現できない
+		// ので、**問題になっていたブラウザ挙動そのもの**を合成イベントで再現する:
+		// 確定文字列ぶんの `input` が composition 中（`isComposing: true`）に発火し、
+		// `compositionend` の後には `input` が来ない、という順序。修正前はこの順序で
+		// 補完が閉じたまま二度と開かなかった（`compositionend` でフラグを戻すだけで
+		// 再評価していなかったため）。
+		await expressionField.evaluate((el: HTMLTextAreaElement) => {
+			el.focus();
+			el.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }));
+			el.value = 'mi';
+			el.setSelectionRange(2, 2);
+			el.dispatchEvent(new InputEvent('input', { bubbles: true, isComposing: true }));
+			el.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: 'mi' }));
+		});
+
+		await expect(popup).toBeVisible();
+		await expect(popup.getByRole('option', { name: /min/ })).toBeVisible();
 	});
 });

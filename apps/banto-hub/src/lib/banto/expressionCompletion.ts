@@ -69,13 +69,61 @@ function isIdentContinue(ch: string): boolean {
 }
 
 /**
- * 打鍵途中のセグメント（まだ確定していないので末尾ハイフンを許す）。
+ * 打鍵途中のセグメント: **`tagDeleteImpact.ts::IDENT_SEGMENT` と同じ規則**
+ * （`[A-Za-z_][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)*`）に、まだ確定していない
+ * 末尾のハイフン1個（`line-` と打って次に `1` を打つところ）だけを足したもの。
  * 確定済みのセグメントは `isExpressionRepresentableSegment` で厳密に見る。
+ *
+ * #380 レビュー対応2 で `[A-Za-z_][A-Za-z0-9_-]*` から厳密化した - 緩いままだと
+ * `a--b` のような lexer では識別子にならない形まで prefix として通ってしまい、
+ * {@link scanBack} の判定と食い違う。
  */
-const PARTIAL_SEGMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_-]*$/;
+const PARTIAL_SEGMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)*-?$/;
 
 /** 1つの参照に許される最大セグメント数（`接続.グループ.タグ`）。 */
 const MAX_SEGMENTS = 3;
+
+/**
+ * `text[hyphenIndex]`（`-`）が識別子の一部か、それとも減算演算子か。
+ * **正は `tagDeleteImpact.ts::IDENT_SEGMENT`**
+ * （`[A-Za-z_][A-Za-z0-9_]*(?:-[A-Za-z0-9_]+)*`、lexer の「識別子とハイフンの
+ * 綱引き」をそのまま写したもの）。条件は2つ:
+ *
+ * - **右隣が継続文字**であること（`a--b` の1つ目の `-` や `a-` の末尾は
+ *   識別子に入らない）。ただし `hyphenIndex + 1 === caret` の場合だけは
+ *   **打鍵途中の末尾ハイフン**（`line-` と打って次に `1` を打つところ）と
+ *   みなして許す。
+ * - **左側が識別子**であること: `-` と継続文字の連なりを左へ辿り、その先頭が
+ *   英字か `_` であること（`1-x` の `-` は左が数値なので演算子）。
+ *
+ * #380 レビュー対応2: 以前は「`-` の直前にある**英数字ラン1つ**の先頭」だけを
+ * 見ていたため、`line-1-2` / `line-1-foo` のような**ハイフンを2つ以上含む
+ * 有効な識別子**で2つ目の `-` の左ラン（`1`）が英字始まりでないとして走査が
+ * 止まり、prefix が `2`/`foo` だけになっていた（候補が消え、確定すると末尾
+ * だけを置換して式を壊す）。ハイフンを跨いで左へ辿るように直した。
+ */
+function hyphenIsPartOfIdentifier(text: string, hyphenIndex: number, caret: number): boolean {
+	const next = hyphenIndex + 1;
+	if (next !== caret && !isIdentContinue(text[next])) return false;
+
+	// 左へ: 継続文字と「右隣が継続文字である `-`」の連なりを辿る。
+	let i = hyphenIndex;
+	while (i > 0) {
+		const prev = text[i - 1];
+		if (isIdentContinue(prev)) {
+			i -= 1;
+			continue;
+		}
+		// `text[i]` は今いる位置の文字 = その `-` の右隣。継続文字でなければ
+		// （`a--b` のように `-` が続いていれば）そこで識別子は切れている。
+		if (prev === '-' && isIdentContinue(text[i])) {
+			i -= 1;
+			continue;
+		}
+		break;
+	}
+	return i < hyphenIndex && isIdentStart(text[i]);
+}
 
 /**
  * `caret` の直前から後ろ向きに「識別子文字・`.`・識別子に吸収される `-`」を
@@ -83,8 +131,7 @@ const MAX_SEGMENTS = 3;
  *
  * **`-` の扱いは lexer に合わせる**（`crates/banto-expr/src/lexer.rs`
  * 「識別子とハイフンの綱引き」、`tagDeleteImpact.ts::TAG_REF_PATTERN` の
- * 非対称な後読みと同じ規則）: `-` が識別子の一部になるのは**その直前が
- * 識別子のとき**だけ。`1-x` の `-` は減算演算子なので `x` から先だけを拾う。
+ * 非対称な後読みと同じ規則）- 判定は {@link hyphenIsPartOfIdentifier}。
  */
 function scanBack(text: string, caret: number): number {
 	let i = caret;
@@ -94,16 +141,9 @@ function scanBack(text: string, caret: number): number {
 			i -= 1;
 			continue;
 		}
-		if (ch === '-') {
-			// `-` の直前にある英数字ランが「識別子」（英字か `_` 始まり）なら
-			// 吸収、数値（`1-x`）や記号なら演算子としてここで止める。
-			let runStart = i - 1;
-			while (runStart > 0 && isIdentContinue(text[runStart - 1])) runStart -= 1;
-			if (runStart < i - 1 && isIdentStart(text[runStart])) {
-				i -= 1;
-				continue;
-			}
-			break;
+		if (ch === '-' && hyphenIsPartOfIdentifier(text, i - 1, caret)) {
+			i -= 1;
+			continue;
 		}
 		break;
 	}
@@ -144,6 +184,28 @@ export function completionContextAt(text: string, caret: number): CompletionCont
 	if (segments.length === 1) return { kind: 'segment1', ...base };
 	if (segments.length === 2) return { kind: 'segment2', ...base, seg1: segments[0] };
 	return { kind: 'segment3', ...base, seg1: segments[0], seg2: segments[1] };
+}
+
+/**
+ * 確定する直前に、ポップアップを開いたときの文脈が**まだキャレットと一致して
+ * いるか**を確かめる（#380 レビュー対応5）。
+ *
+ * ポップアップが開いている間に `input` を伴わずキャレット・選択範囲だけが動く
+ * 経路（`PageUp`/`PageDown`、`Ctrl+A`、マウスでのクリック・ドラッグ、外部から
+ * の `setSelectionRange` など）はいくらでもある。そのまま Enter/Tab を押すと
+ * 古い `replaceFrom`/`replaceTo` の位置へ挿入して**式を壊す**。閉じるキーを
+ * 列挙して塞ぐのは漏れるので、**確定の直前にこの1箇所で検証**して、ずれて
+ * いたら挿入せずに閉じる。
+ *
+ * 一致の条件は「キャレットが潰れている（選択が無い）」かつ「その位置が
+ * `replaceTo`（＝補完を計算したときのキャレット）と同じ」。
+ */
+export function completionContextMatchesCaret(
+	context: CompletionContext,
+	selectionStart: number,
+	selectionEnd: number
+): boolean {
+	return selectionStart === selectionEnd && selectionStart === context.replaceTo;
 }
 
 // ---------------------------------------------------------------------------
