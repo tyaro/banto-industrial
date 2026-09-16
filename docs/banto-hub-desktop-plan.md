@@ -1492,7 +1492,9 @@ enqueue 後に対象行が別経路で変わっている真のコンフリクト
 > - **実装箇所**: 退避は `SplitPane.svelte` に入れてタグ登録・タグモニタの
 >   2画面で共有する。同部品は**アプリ非依存の規約を維持**し、狭幅かどうかは
 >   `narrow` prop で受け取る（`mobileNavStore` を import しない）。追加 props は
->   `narrow` / `leftOpen`（`$bindable`）/ `leftLabel` / `leftId`。
+>   `narrow` / `leftOpen`（`$bindable`）/ `leftLabel` / `leftId` /
+>   `focusFallback`（ペインが退避して不活性になるとき、中にフォーカスが
+>   あれば呼び出し側が返す要素へ逃がす）。
 > - **z-index**: 退避パネル 610・バックドロップ 600 — `Drawer`/`Modal`(900)・
 >   `CommandPalette`/`ToastHost`/`TreeContextMenu`(1000)・オフキャンバス
 >   サイドバー(710/700) より**下**（`Sidebar.svelte` と同じ理由）。Esc も

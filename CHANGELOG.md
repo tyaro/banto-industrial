@@ -14,7 +14,7 @@ banto-industrial のリリースノート。日付は JST。バージョンは [
 
 ### 変更（内部、2026-09-16、#378）
 
-- 退避は汎用部品 `SplitPane.svelte` 側に実装し、タグ登録とタグモニタで共有する。**同部品はアプリ非依存の規約を維持**し、狭幅かどうかは `narrow` prop で受け取る（`mobileNavStore` を import しない）。追加した props は `narrow` / `leftOpen`（`$bindable`）/ `leftLabel` / `leftId`。
+- 退避は汎用部品 `SplitPane.svelte` 側に実装し、タグ登録とタグモニタで共有する。**同部品はアプリ非依存の規約を維持**し、狭幅かどうかは `narrow` prop で受け取る（`mobileNavStore` を import しない）。追加した props は `narrow` / `leftOpen`（`$bindable`）/ `leftLabel` / `leftId` / `focusFallback`（ペインが退避して不活性になるとき、中にフォーカスがあれば呼び出し側が返す要素へ逃がす）。
 - Esc は「開いている退避ツリーが最優先」で、左ペインの `keydown` で `stopPropagation` して他の Esc ハンドラ（「一覧から挿入」トグル・式欄の補完）へ届かせない。閉じているときは何もしない。手前に出るモーダル（`Drawer`/`Modal`、z-index 900）が開いているときはそちらに譲る（退避パネルは 610、バックドロップ 600）。
 
 ## v0.2.0-alpha.19 — 2026-09-16（アルファ）

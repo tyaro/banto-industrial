@@ -4,6 +4,8 @@
 	import { isProviderError, notify, searchCommands, type PaletteCommand } from '@banto/admin-core';
 	import { buildCommands, loadRecentCommandIds, recordRecentCommand } from '$lib/commands';
 	import { commandPaletteStore } from '$lib/commandPalette.svelte';
+	import { handleTrapKeydown } from './focusTrap';
+	import { restoreFocus } from './focusRestore';
 
 	const commands = buildCommands();
 	const recentIds = loadRecentCommandIds();
@@ -53,8 +55,39 @@
 		selectedIndex = 0;
 	});
 
+	/**
+	 * #381 レビュー対応9回目: パレットを開く前にフォーカスがあった要素。閉じる
+	 * ときにここへ戻す（層の約束・項目6、`escLayering.ts`）。`Ctrl+K` は Drawer や
+	 * コンテキストメニューの中からでも効くので、戻さないとフォーカスが
+	 * `<body>` に落ち、**次の Tab が Drawer のトラップをすり抜ける**（body 起点の
+	 * Tab はパネルの keydown を通らない）。`$state` にしない（描画に使わない）。
+	 */
+	let triggerEl: HTMLElement | null = null;
+
 	onMount(() => {
+		const active = document.activeElement;
+		triggerEl = active instanceof HTMLElement ? active : null;
 		inputEl?.focus();
+		// アンマウント時（＝閉じたとき）に開いた元へ戻す。戻り先が消えている /
+		// `inert` の中なら何もしない（`focusRestore.ts` - `<body>` へは落とさない）。
+		return () => {
+			const previous = triggerEl;
+			triggerEl = null;
+			restoreFocus(previous);
+		};
+	});
+
+	/**
+	 * #381 レビュー対応9回目: `aria-modal="true"` を名乗る層は必ずフォーカス
+	 * トラップを持つ（層の約束・項目4）。`Drawer.svelte`/`Modal.svelte` と同じ
+	 * 張り方（`focusTrap.ts`）。この部品は開いている間だけマウントされる。
+	 */
+	$effect(() => {
+		const node = paletteEl;
+		if (!node) return;
+		const onKeydown = (event: KeyboardEvent): void => handleTrapKeydown(node, event);
+		node.addEventListener('keydown', onKeydown);
+		return () => node.removeEventListener('keydown', onKeydown);
 	});
 
 	function clampIndex(next: number): number {

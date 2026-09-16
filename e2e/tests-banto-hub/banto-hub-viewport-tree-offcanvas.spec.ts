@@ -398,26 +398,25 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await page.getByPlaceholder('名前・アドレスで検索').fill('');
 	});
 
-	test('12. コマンドパレットはフォーカスが外に出ていても Esc で閉じる（#381 レビュー対応6回目）', async () => {
-		// `CommandPalette.svelte` はフォーカストラップを持たないので、Shift+Tab で
-		// フォーカスがパレットの外へ出る。Esc を検索 input の `onkeydown` だけで
-		// 処理していると、この状態ではパレットが閉じず、下の層（Drawer・サイドバー・
-		// 退避ツリー）は「可視な上位層がある」と見て全員譲るため **Esc が何も
-		// 閉じない**（`escLayering.ts` の層の約束・項目3）。
+	test('12. コマンドパレットもフォーカスを閉じ込め、Esc で閉じる（#381 レビュー対応9回目）', async () => {
+		// `aria-modal="true"` を名乗る層は必ずトラップを持つ（層の約束・項目4）。
+		// window レベルの Esc 処理（項目3、レビュー6回目で追加）は、フォーカスが
+		// 何らかの理由で外に出た場合の保険として残してある。
 		await page.keyboard.press('Control+k');
 		const palette = page.getByRole('dialog', { name: 'コマンドパレット' });
 		await expect(palette).toBeVisible();
 
+		const focusInsidePalette = () =>
+			page.evaluate(() => {
+				const panel = document.querySelector('[role="dialog"][aria-label="コマンドパレット"]');
+				const active = document.activeElement;
+				return !!panel && !!active && panel.contains(active);
+			});
+
 		await page.keyboard.press('Shift+Tab');
-		await expect
-			.poll(() =>
-				page.evaluate(() => {
-					const active = document.activeElement;
-					const panel = document.querySelector('[role="dialog"][aria-label="コマンドパレット"]');
-					return !!active && !!panel && !panel.contains(active);
-				})
-			)
-			.toBe(true);
+		expect(await focusInsidePalette()).toBe(true);
+		await page.keyboard.press('Tab');
+		expect(await focusInsidePalette()).toBe(true);
 
 		await page.keyboard.press('Escape');
 		await expect(palette).toHaveCount(0);
@@ -528,7 +527,41 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(treePane).toBeHidden();
 	});
 
-	test('17. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
+	test('17. パレットを閉じるとフォーカスは開いた元へ戻る（#381 レビュー対応9回目）', async () => {
+		// `Ctrl+K` は Drawer の中からでも効く。閉じたときにフォーカスを戻さないと
+		// `<body>` に落ち、そこからの Tab は**どのパネルの keydown も通らない**ので
+		// Drawer のトラップをすり抜ける（層の約束・項目5）。
+		await page.getByPlaceholder('名前・アドレスで検索').fill(TAG_A);
+		await page.getByRole('gridcell', { name: TAG_A, exact: true }).click();
+		const editDrawer = page.getByRole('dialog', { name: `${TAG_A} を編集` });
+		await expect(editDrawer).toBeVisible();
+
+		const nameField = editDrawer.getByLabel('名前');
+		await nameField.focus();
+		await expect(nameField).toBeFocused();
+
+		await page.keyboard.press('Control+k');
+		await expect(page.getByRole('dialog', { name: 'コマンドパレット' })).toBeVisible();
+		await page.keyboard.press('Escape');
+		await expect(page.getByRole('dialog', { name: 'コマンドパレット' })).toHaveCount(0);
+
+		// 開いた元（Drawer 内の入力欄）へ戻り、続く Tab も Drawer 内で循環する。
+		await expect(nameField).toBeFocused();
+		await page.keyboard.press('Tab');
+		expect(
+			await page.evaluate(() => {
+				const panel = document.querySelector('[role="dialog"][aria-modal="true"]');
+				const active = document.activeElement;
+				return !!panel && !!active && panel.contains(active);
+			})
+		).toBe(true);
+
+		await page.keyboard.press('Escape');
+		await expect(editDrawer).toHaveCount(0);
+		await page.getByPlaceholder('名前・アドレスで検索').fill('');
+	});
+
+	test('18. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
 		await page.goto('/monitor');
 		await expect(page.getByRole('heading', { level: 2, name: 'タグモニタ' })).toBeVisible();
 
