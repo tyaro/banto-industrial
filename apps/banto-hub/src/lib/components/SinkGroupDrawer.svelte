@@ -72,7 +72,19 @@
 		tags: Tag[];
 		onClose: () => void;
 		onSaved: (group: SinkGroup) => void;
-		onDeleted: (id: number) => void;
+		/**
+		 * 削除が成功した直後に呼ばれる。**Promise を返せば完了を待ってから閉じる**
+		 * （#381 レビュー対応20回目 - `ConnectionDrawer`/`CollectionGroupDrawer` と
+		 * 同じ理由: 呼び出し側の再読込を待たずに閉じると、`Drawer` のフォーカス
+		 * 戻しが「消える予定の行」へ戻ってしまう）。
+		 */
+		onDeleted: (id: number) => void | Promise<void>;
+		/**
+		 * #381 レビュー対応20回目: 閉じたときのフォーカスの戻し先の代替
+		 * （`Drawer.svelte` の同名 prop へそのまま渡すだけ）。削除では開いた元の行が
+		 * 消えるので、呼び出し側が常に在る要素（一覧ツールバーのボタン等）を返す。
+		 */
+		focusFallback?: () => HTMLElement | null | undefined;
 	}
 
 	let {
@@ -84,7 +96,8 @@
 		tags,
 		onClose,
 		onSaved,
-		onDeleted
+		onDeleted,
+		focusFallback
 	}: Props = $props();
 
 	const isCreate = $derived(group === null);
@@ -283,7 +296,8 @@
 		try {
 			await deleteSinkGroup(group.id);
 			toastStore.push('success', '削除しました');
-			onDeleted(group.id);
+			// 再読込（`onDeleted`）の完了を待ってから閉じる - 上の prop の doc 参照。
+			await onDeleted(group.id);
 			onClose();
 		} catch (err) {
 			toastStore.push('error', errorMessage(err));
@@ -321,6 +335,7 @@
 	width="560px"
 	{dirty}
 	onBlockedClose={notifyBlockedClose}
+	{focusFallback}
 >
 	<p class="note">
 		変更は即時に反映されます（保留中の変更キューには載りません）。サイドカーはこの変更を

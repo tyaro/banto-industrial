@@ -83,6 +83,19 @@
 	let drawerOpen = $state(false);
 	let editingGroup: SinkGroup | null = $state(null);
 
+	/**
+	 * #381 レビュー対応20回目: Drawer を閉じたときのフォーカスの戻し先の代替
+	 * （層の約束・項目5、`$lib/components/escLayering.ts`）。削除では開いた元の行
+	 * （「編集」ボタン）が一覧から消えるので、常に在るツールバーの「新規作成」
+	 * ボタンへ逃がす（`canWrite` が無い利用者には無いので、その場合は見出しへは
+	 * 行かず何もしない - 削除ボタン自体が出ないため経路も無い）。
+	 */
+	let createButtonEl: HTMLButtonElement | undefined = $state();
+
+	function resolveDrawerFocusFallback(): HTMLElement | null {
+		return createButtonEl ?? null;
+	}
+
 	function openCreate(): void {
 		editingGroup = null;
 		drawerOpen = true;
@@ -150,7 +163,7 @@
 		{/if}
 
 		{#if canWrite}
-			<button type="button" onclick={openCreate}>新規作成</button>
+			<button type="button" bind:this={createButtonEl} onclick={openCreate}>新規作成</button>
 		{/if}
 
 		{#if !loading && sinkGroups.length === 0 && !loadError}
@@ -242,6 +255,7 @@ api_key = "&lt;発行したキー&gt;"</pre>
 	onClose={closeDrawer}
 	onSaved={handleSaved}
 	onDeleted={handleDeleted}
+	focusFallback={resolveDrawerFocusFallback}
 />
 
 <style>
