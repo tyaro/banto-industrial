@@ -69,6 +69,49 @@ async function expectDeleted(
 }
 
 /**
+ * 与えられたパス群を「**進捗がある限り繰り返す**」方式で全部消す
+ * （#380 レビュー対応4）。
+ *
+ * タグの削除順は FK だけでなく**式の参照**にも縛られる: 参照されている側を
+ * 先に消すとサーバーの preflight が 4xx で拒否する。これまでは
+ * 「computed → それ以外」の2段で済ませていたが、
+ *
+ * - 別グループの computed がこのグループの PLC タグを参照している
+ * - 対象の computed 同士が依存していて、API の返す順が依存と逆
+ *
+ * のどちらでも足りない。依存の向きを解析する代わりに、**1周で1件も消せなく
+ * なるまで回す**: 1周ごとに必ず1件以上は消えるので高々 O(n²) 回の DELETE で
+ * 収束し、順序問題を構造的に解ける。最後まで残ったら `expect` で落とす
+ * （握りつぶすと、掃除漏れが後続スペックの一覧行数を押し上げてしまう）。
+ */
+async function deleteAllWithRetries(
+	request: APIRequestContext,
+	headers: Record<string, string>,
+	paths: string[]
+): Promise<void> {
+	let remaining = [...paths];
+	const failures = new Map<string, string>();
+	while (remaining.length > 0) {
+		const stillRemaining: string[] = [];
+		failures.clear();
+		for (const path of remaining) {
+			const res = await request.delete(path, { headers });
+			// 204 = 削除できた / 404 = 既に無い。それ以外（参照されていることに
+			// よる preflight 拒否など）は次の周で再試行する。
+			if (res.status() === 204 || res.status() === 404) continue;
+			stillRemaining.push(path);
+			failures.set(path, `${res.status()} ${await res.text()}`);
+		}
+		// 1周で1件も減らなければ、これ以上は進まない（本当に消せない）。
+		expect(
+			stillRemaining.length,
+			`削除が進まなくなりました: ${[...failures].map(([p, why]) => `${p} -> ${why}`).join(', ')}`
+		).toBeLessThan(remaining.length);
+		remaining = stillRemaining;
+	}
+}
+
+/**
  * この spec が使う固定名のリソースを、存在すれば掃除する
  * （`banto-hub-tags-expression-insert.spec.ts::cleanupExistingFixtures` を
  * 写したもの - 流儀をそちらに揃えている）。**`beforeAll` の先頭と `afterAll`
@@ -76,8 +119,10 @@ async function expectDeleted(
  * 前回分と衝突し、残したタグは後続スペックの一覧行数（＝仮想化された
  * グリッドの描画窓）を押し上げる。
  *
- * 削除順は **computed タグ → それ以外のタグ → グループ → 接続**（FK だけで
- * なく式の参照も順序を縛る）。`calc` 予約接続自体は削除しない。
+ * 削除は **タグ（全件まとめて、進捗がある限り繰り返す - `deleteAllWithRetries`）
+ * → グループ → 接続**の順。タグ同士の順序は式の参照に縛られるが、依存の向きを
+ * 解析せずリトライで解く（#380 レビュー対応4。`deleteAllWithRetries` の doc
+ * comment 参照）。`calc` 予約接続自体は削除しない。
  */
 async function cleanupExistingFixtures(
 	request: APIRequestContext,
@@ -97,13 +142,11 @@ async function cleanupExistingFixtures(
 				tagKind: string;
 			}>;
 			const groupIds = new Set(targetGroups.map((g) => g.id));
-			const targetTags = tags.filter((t) => groupIds.has(t.collectionGroupId));
-			for (const tag of targetTags.filter((t) => t.tagKind === 'computed')) {
-				await expectDeleted(request, headers, `/api/tags/${tag.id}`);
-			}
-			for (const tag of targetTags.filter((t) => t.tagKind !== 'computed')) {
-				await expectDeleted(request, headers, `/api/tags/${tag.id}`);
-			}
+			await deleteAllWithRetries(
+				request,
+				headers,
+				tags.filter((t) => groupIds.has(t.collectionGroupId)).map((t) => `/api/tags/${t.id}`)
+			);
 		}
 		for (const group of targetGroups) {
 			await expectDeleted(request, headers, `/api/collection-groups/${group.id}`);
@@ -492,6 +535,42 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 			// 接続名の次の1文字を打つので、前方一致は保たれる。
 			await expressionField.pressSequentially(CONNECTION_NAME.charAt(4));
 			await expect(popup).toBeVisible();
+		} finally {
+			await page.unroute(FUNCTIONS_URL);
+		}
+	});
+
+	test('9.5. カーソル移動で閉じた後も、遅れて届く関数表で開き直さない（#380 レビュー対応1）', async () => {
+		// テスト9 と同じ「応答を遅らせる」型を流用する。矢印キー等での close も
+		// `dismissCompletion` にしていないと、フェッチ解決時に同じ文脈が再評価
+		// されて開き直してしまう（「打ち直せば開く」と食い違う）。
+		const FUNCTIONS_URL = '**/api/tags/expression/functions';
+		await page.route(FUNCTIONS_URL, async (route) => {
+			await new Promise((resolve) => setTimeout(resolve, 1500));
+			await route.continue();
+		});
+		try {
+			const functionsResponse = page.waitForResponse((res) =>
+				res.url().includes('/api/tags/expression/functions')
+			);
+
+			await page.goto('/tags');
+			await groupNodeByName(page, CALC_GROUP_NAME).click();
+			await page.getByRole('button', { name: '新規登録' }).click();
+			const pane = page.getByRole('complementary', { name: '新規作成' });
+			await expect(pane).toBeVisible();
+			const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
+			const popup = page.getByTestId('expression-completion');
+
+			await expressionField.fill(CONNECTION_NAME.slice(0, 4));
+			await expect(popup).toBeVisible();
+
+			// Escape ではなく**カーソル移動**で閉じる。
+			await page.keyboard.press('Home');
+			await expect(popup).toHaveCount(0);
+
+			await functionsResponse;
+			await expect(popup).toHaveCount(0);
 		} finally {
 			await page.unroute(FUNCTIONS_URL);
 		}

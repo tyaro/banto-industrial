@@ -85,11 +85,12 @@ function waitForExpressionCheck(page: Page) {
  *   一覧行数を増やす（`banto-hub-tags-revision.spec.ts` 冒頭の doc comment
  *   にある「仮想化されたグリッドの描画窓」を押し上げる）。
  *
- * 削除順は **computed タグ → それ以外のタグ → グループ → 接続**。FK
- * （RESTRICT）だけでなく**式の参照**も順序を縛る: この spec の computed タグは
- * PLC タグ `REF_TAG_NAME` を参照しているので、PLC タグを先に消すとサーバーの
- * preflight（参照切れ）が 4xx で拒否し、続くグループ・接続の削除も FK で
- * 失敗してフィクスチャが丸ごと残る（#379 レビュー指摘）。
+ * 削除は **タグ（全件まとめて、進捗がある限り繰り返す - `deleteAllWithRetries`）
+ * → グループ → 接続**の順。FK（RESTRICT）だけでなく**式の参照**も順序を縛る:
+ * この spec の computed タグは PLC タグ `REF_TAG_NAME` を参照しているので、PLC
+ * タグを先に消すとサーバーの preflight（参照切れ）が 4xx で拒否し、続くグループ・
+ * 接続の削除も FK で失敗してフィクスチャが丸ごと残る（#379 レビュー指摘）。
+ * タグ同士の順序はリトライで解く（#380 レビュー対応4）。
  *
  * **各 DELETE の応答を検証する**（204、または既に無い場合の 404 だけを許容）。
  * 握りつぶすと上のような失敗が静かに通り過ぎてしまう。
@@ -113,6 +114,41 @@ async function expectDeleted(
 	).toContain(res.status());
 }
 
+/**
+ * タグを「**進捗がある限り繰り返す**」方式で全部消す（#380 レビュー対応4。
+ * `banto-hub-tags-expression-completion.spec.ts` と同じ形に揃えてある）。
+ *
+ * タグの削除順は FK だけでなく**式の参照**にも縛られる: 参照されている側を先に
+ * 消すとサーバーの preflight が 4xx で拒否する。「computed → それ以外」の2段では、
+ * 別グループの computed がこのグループの PLC タグを参照している場合や、対象の
+ * computed 同士が依存していて API の返す順が依存と逆の場合に足りない。依存の
+ * 向きを解析する代わりに **1周で1件も消せなくなるまで回す**ことで、順序問題を
+ * 構造的に解く。最後まで残ったら `expect` で落とす。
+ */
+async function deleteAllWithRetries(
+	request: APIRequestContext,
+	headers: Record<string, string>,
+	paths: string[]
+): Promise<void> {
+	let remaining = [...paths];
+	const failures = new Map<string, string>();
+	while (remaining.length > 0) {
+		const stillRemaining: string[] = [];
+		failures.clear();
+		for (const path of remaining) {
+			const res = await request.delete(path, { headers });
+			if (res.status() === 204 || res.status() === 404) continue;
+			stillRemaining.push(path);
+			failures.set(path, `${res.status()} ${await res.text()}`);
+		}
+		expect(
+			stillRemaining.length,
+			`削除が進まなくなりました: ${[...failures].map(([p, why]) => `${p} -> ${why}`).join(', ')}`
+		).toBeLessThan(remaining.length);
+		remaining = stillRemaining;
+	}
+}
+
 async function cleanupExistingFixtures(
 	request: APIRequestContext,
 	headers: Record<string, string>
@@ -131,14 +167,12 @@ async function cleanupExistingFixtures(
 				tagKind: string;
 			}>;
 			const groupIds = new Set(targetGroups.map((g) => g.id));
-			const targetTags = tags.filter((t) => groupIds.has(t.collectionGroupId));
-			// 参照元（computed）を先に消してから参照先（plc 等）を消す。
-			for (const tag of targetTags.filter((t) => t.tagKind === 'computed')) {
-				await expectDeleted(request, headers, `/api/tags/${tag.id}`);
-			}
-			for (const tag of targetTags.filter((t) => t.tagKind !== 'computed')) {
-				await expectDeleted(request, headers, `/api/tags/${tag.id}`);
-			}
+			// 参照の向きは解析せず、消せなくなるまで回す（`deleteAllWithRetries`）。
+			await deleteAllWithRetries(
+				request,
+				headers,
+				tags.filter((t) => groupIds.has(t.collectionGroupId)).map((t) => `/api/tags/${t.id}`)
+			);
 		}
 		for (const group of targetGroups) {
 			await expectDeleted(request, headers, `/api/collection-groups/${group.id}`);

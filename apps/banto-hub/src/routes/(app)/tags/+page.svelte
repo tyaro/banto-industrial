@@ -2160,17 +2160,34 @@
 	 */
 	let suppressCompletionRefresh = false;
 	/**
-	 * #380 レビュー対応A: **明示的に閉じた**（Escape / 外側クリック / 式欄から
-	 * フォーカスが外れた / 候補を確定した）ことを覚えておく門。次の `input`
-	 * （＝ユーザーが打鍵を再開した）まで、**自動トリガーでの再オープンを抑止**
-	 * する。
+	 * #380 レビュー対応A: **補完を「閉じたままにしておく」門**。立っている間は
+	 * 自動トリガー（`force` でない `refreshCompletion`）での再オープンを抑止する。
 	 *
 	 * これが無いと、関数表のフェッチが Escape の後に解決したときに
 	 * `refreshCompletion()` が「フォーカスがあって2文字以上」を見て**新規
 	 * トリガーとして開き直す**（通常のネットワーク遅延で Escape の約束が破れる）。
 	 *
-	 * **`Ctrl+Space` / `Ctrl+.` の明示トリガー（`force`）はこの門を無視する** -
-	 * ユーザーが明示的に求めているため。リアクティブに読まないので `$state` 不要。
+	 * **立てる場所（すべて {@link dismissCompletion} 経由。ここ以外で立てない）**:
+	 *
+	 * - `Escape`（{@link handleExpressionKeydown}）
+	 * - **カーソル移動で閉じたとき**（`ArrowLeft`/`ArrowRight`/`Home`/`End`/
+	 *   `PageUp`/`PageDown`。#380 レビュー対応1 - ここが `closeCompletion` の
+	 *   ままだと「打ち直せば開く」と言いながらフェッチ解決で勝手に開いた）
+	 * - ポップアップの `onClose`（外側クリック / スクロール / リサイズ）
+	 * - 式欄のクリック・フォーカス喪失（{@link handleExpressionCaretLost}）
+	 * - 候補の確定後（{@link acceptCompletion}。次の階層は `force` で開く）
+	 * - モード遷移（`drawerMode`/`selected?.id` の変化）と式欄の消滅
+	 *
+	 * **降ろす場所（1箇所だけ）**: {@link handleExpressionInput} と
+	 * {@link handleExpressionCompositionEnd} の、**式欄にフォーカスがある
+	 * ＝実際のユーザー打鍵**のときだけ（#380 レビュー対応2）。段階C の
+	 * 「一覧から挿入」は**未フォーカスのまま合成 `input` を dispatch する**ので、
+	 * ここを無条件に降ろすと「挿入直後は `activeElement` ガードで閉じられるのに、
+	 * 関数表の遅延取得が解決した時点ではもうフォーカスがあるので開いてしまう」
+	 * という抜け道になる。
+	 *
+	 * **`Ctrl+Space` / `Ctrl+.`（`force`）はこの門を無視して開く** - ユーザーが
+	 * 明示的に求めているため。リアクティブに読まないので `$state` 不要。
 	 */
 	let completionDismissed = false;
 
@@ -2317,6 +2334,15 @@
 	 * **IME 変換中は開かない**（段階A の `isComposing` をそのまま見る）。
 	 * 候補が0件なら開かない（空のポップアップを出さない）。
 	 */
+	/**
+	 * 式欄に実フォーカスがあるか。「自動トリガーを走らせてよいか」と
+	 * 「{@link completionDismissed} を降ろしてよいか」の**両方**がこれで決まる
+	 * （段階C の合成 `input` を打鍵と区別する唯一の手掛かり）。
+	 */
+	function isExpressionFieldFocused(): boolean {
+		return exprTextareaEl !== null && document.activeElement === exprTextareaEl;
+	}
+
 	function refreshCompletion(options: { force?: boolean } = {}): void {
 		if (suppressCompletionRefresh) return;
 		// #380 レビュー対応A: 明示的に閉じた後は、次の打鍵まで自動では開かない
@@ -2337,7 +2363,7 @@
 		// 走る。通常のタイピングと IME 確定は必ずフォーカスがあるので影響しない。
 		// `force`（Ctrl+Space / Ctrl+. / 上位セグメント確定直後の開き直し）は
 		// ユーザーの明示操作なので通す（いずれも直前に式欄へフォーカスがある）。
-		if (options.force !== true && document.activeElement !== el) {
+		if (options.force !== true && !isExpressionFieldFocused()) {
 			closeCompletion();
 			return;
 		}
@@ -2465,15 +2491,24 @@
 				// **これは UX のための早期クローズにすぎない**（列挙から漏れた経路
 				// ＝`Ctrl+A`・マウス操作などは `acceptCompletion` のキャレット検証が
 				// 受け止める。#380 レビュー対応5）。
-				closeCompletion();
+				// #380 レビュー対応1: `closeCompletion` ではなく `dismissCompletion`。
+				// ここで門を立てないと、直後に関数表のフェッチが解決したときに同じ
+				// 文脈を再評価して開き直してしまい、「打ち直せば開く」と食い違う。
+				dismissCompletion();
 				break;
 		}
 	}
 
-	/** 式欄の `input`（段階A のチェックのあとに呼ぶ）。 */
+	/**
+	 * 式欄の `input`（段階A のチェックのあとに呼ぶ）。
+	 *
+	 * #380 レビュー対応2: 抑止を解くのは**式欄にフォーカスがある実打鍵**のときだけ。
+	 * 段階C の「一覧から挿入」は未フォーカスのまま合成 `input` を dispatch する
+	 * ので、無条件に解くと抑止が漏れる（{@link completionDismissed} の doc
+	 * comment 参照）。
+	 */
 	function handleExpressionInput(): void {
-		// 打鍵が再開したら、明示クローズの抑止を解く（#380 レビュー対応A）。
-		completionDismissed = false;
+		if (isExpressionFieldFocused()) completionDismissed = false;
 		refreshCompletion();
 	}
 
@@ -2492,8 +2527,9 @@
 	 */
 	function handleExpressionCompositionEnd(): void {
 		exprCompletionComposing = false;
-		// IME の確定も「打鍵」なので、明示クローズの抑止を解いてから評価する。
-		completionDismissed = false;
+		// IME の確定も「打鍵」なので、抑止を解いてから評価する（合成 `input` と
+		// 同じ理由でフォーカスを条件にする - {@link handleExpressionInput} 参照）。
+		if (isExpressionFieldFocused()) completionDismissed = false;
 		refreshCompletion();
 	}
 
