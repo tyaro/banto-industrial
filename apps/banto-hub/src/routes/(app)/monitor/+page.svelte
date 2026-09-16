@@ -45,6 +45,7 @@
 	 */
 	import { page } from '$app/state';
 	import { toastStore } from '$lib/toast.svelte';
+	import { mobileNavStore } from '$lib/mobileNav.svelte';
 	import {
 		getCatalog,
 		connectTagStream,
@@ -215,11 +216,34 @@
 		return `group:${treeFilter.id}`;
 	});
 
+	/**
+	 * #378（2026-09-16 オーナー決定）: 狭幅（`mobileNavStore.isNarrow` =
+	 * `(max-width: 900px)`、サイドバーのオフキャンバスと同じ境界）で左ツリーを
+	 * 退避したときの開閉状態。タグ登録ページと同じ配線（`SplitPane` の
+	 * `narrow`/`leftOpen`）。
+	 */
+	let treeOpen = $state(false);
+
+	/** #378: 閉じていても何で絞られているか分かるよう、トグルの隣に出す選択名。 */
+	const treeSelectionLabel = $derived.by((): string => {
+		if (treeFilter.type === 'connection') {
+			const connectionId = treeFilter.id;
+			return connections.find((c) => c.id === connectionId)?.name ?? 'すべて';
+		}
+		if (treeFilter.type === 'group') {
+			const groupId = treeFilter.id;
+			return groups.find((g) => g.id === groupId)?.name ?? 'すべて';
+		}
+		return 'すべて';
+	});
+
 	function handleTreeSelect(data: ConnectionTreeNodeData): void {
 		if (data.kind === 'all') treeFilter = { type: 'all' };
 		else if (data.kind === 'connection')
 			treeFilter = { type: 'connection', id: data.connection.id };
 		else treeFilter = { type: 'group', id: data.group.id };
+		// #378: 狭幅では選んだ時点で退避パネルを閉じる（タグ登録ページと同じ）。
+		if (mobileNavStore.isNarrow) treeOpen = false;
 	}
 
 	// --- T18-4c: 確認導線のディープリンク受け口 -----------------------------
@@ -433,7 +457,17 @@
 			（`oncontextmenu` は渡さない - このページに作成系 UI は無い）。
 		-->
 		<div class="content">
-			<SplitPane leftWidth="280px">
+			<!--
+				#378（2026-09-16 オーナー決定）: 狭幅では左ツリーをオフキャンバスへ
+				退避する（実体は `SplitPane.svelte` - タグ登録ページと共有）。
+			-->
+			<SplitPane
+				leftWidth="280px"
+				narrow={mobileNavStore.isNarrow}
+				bind:leftOpen={treeOpen}
+				leftLabel="接続とグループ"
+				leftId="monitor-tree-pane"
+			>
 				{#snippet left()}
 					<ConnectionTree
 						{connections}
@@ -446,6 +480,22 @@
 				{#snippet right()}
 					<div class="right-pane">
 						<div class="toolbar">
+							<!-- #378: 狭幅でだけ出すツリーのトグルと現在の選択名（タグ登録ページと同じ）。 -->
+							{#if mobileNavStore.isNarrow}
+								<button
+									type="button"
+									class="tree-toggle"
+									data-testid="monitor-tree-toggle"
+									aria-expanded={treeOpen}
+									aria-controls="monitor-tree-pane"
+									onclick={() => (treeOpen = !treeOpen)}
+								>
+									📁 ツリー
+								</button>
+								<span class="tree-selection" data-testid="monitor-tree-selection">
+									{treeSelectionLabel}
+								</span>
+							{/if}
 							<input
 								type="search"
 								class="search-box"
@@ -624,6 +674,28 @@
 
 	.count {
 		flex: 0 0 auto;
+		color: var(--banto-text-muted);
+		font-size: 0.75rem;
+	}
+
+	/* #378: 狭幅でだけ出るツリーのトグルと、現在のツリー選択名。 */
+	.tree-toggle {
+		flex: 0 0 auto;
+		padding: 0.35rem 0.6rem;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+		background: var(--banto-surface);
+		color: var(--banto-text);
+		font-size: 0.78rem;
+		cursor: pointer;
+	}
+
+	.tree-selection {
+		flex: 0 1 auto;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 		color: var(--banto-text-muted);
 		font-size: 0.75rem;
 	}

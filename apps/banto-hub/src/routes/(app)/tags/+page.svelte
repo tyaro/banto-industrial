@@ -2023,6 +2023,11 @@
 			// のでこの window リスナーには届かないはずだが、経路（イベント委譲・
 			// 式欄外での Esc）に依存しないようここでも明示的に条件にする。
 			if (completionOpen) return;
+			// #378: 狭幅で退避したツリーが開いている間の Esc も**ツリーだけ**を
+			// 閉じ、このトグルは ON のままにする（`SplitPane` が左ペインの
+			// keydown で `stopPropagation` するのでここへは届かないはずだが、
+			// 補完と同じく経路に依存しないようここでも条件にする二重の担保）。
+			if (treeOpen) return;
 			if (e.key === 'Escape') insertArmed = false;
 		};
 		window.addEventListener('keydown', onKeydown);
@@ -2932,11 +2937,39 @@
 		return `group:${treeFilter.id}`;
 	});
 
+	/**
+	 * #378（2026-09-16 オーナー決定）: 狭幅（`mobileNavStore.isNarrow` =
+	 * `(max-width: 900px)`、サイドバーのオフキャンバスと同じ境界）で左ツリーを
+	 * 退避したときの開閉状態。広幅では `SplitPane` が無視するので、幅を
+	 * 行き来して値が残っても害は無い。
+	 */
+	let treeOpen = $state(false);
+
+	/**
+	 * #378: ツリーを閉じていても「何で絞り込まれているか」が分かるよう、
+	 * トグルボタンの隣に出す現在のツリー選択名（接続名 / グループ名 /
+	 * 「すべて」）。
+	 */
+	const treeSelectionLabel = $derived.by((): string => {
+		if (treeFilter.type === 'connection') {
+			const connectionId = treeFilter.id;
+			return connections.find((c) => c.id === connectionId)?.name ?? 'すべて';
+		}
+		if (treeFilter.type === 'group') {
+			const groupId = treeFilter.id;
+			return groups.find((g) => g.id === groupId)?.name ?? 'すべて';
+		}
+		return 'すべて';
+	});
+
 	function handleTreeSelect(data: ConnectionTreeNodeData): void {
 		if (data.kind === 'all') treeFilter = { type: 'all' };
 		else if (data.kind === 'connection')
 			treeFilter = { type: 'connection', id: data.connection.id };
 		else treeFilter = { type: 'group', id: data.group.id };
+		// #378: 狭幅では選んだ時点で退避パネルを閉じる（`Sidebar.svelte` の
+		// リンククリックで `closeNav()` するのと同じ「閉じる契機」）。
+		if (mobileNavStore.isNarrow) treeOpen = false;
 	}
 
 	/**
@@ -5879,7 +5912,19 @@
 	</div>
 
 	<div class="content">
-		<SplitPane leftWidth="280px">
+		<!--
+			#378（2026-09-16 オーナー決定）: 狭幅では左ツリーをオフキャンバスへ
+			退避する（退避の実体は `SplitPane.svelte` 側 - タグモニタと共有する）。
+			狭幅の判定はサイドバーのオフキャンバスと同じ `mobileNavStore.isNarrow`
+			（`(max-width: 900px)`）で、新しい境界は作らない。
+		-->
+		<SplitPane
+			leftWidth="280px"
+			narrow={mobileNavStore.isNarrow}
+			bind:leftOpen={treeOpen}
+			leftLabel="接続とグループ"
+			leftId="tags-tree-pane"
+		>
 			{#snippet left()}
 				<div class="tree-pane">
 					<!--
@@ -5923,6 +5968,28 @@
 				<div class="right-split">
 					<div class="right-pane">
 						<div class="toolbar">
+							<!--
+								#378: 狭幅でだけ出す「ツリー」トグル。`Header.svelte` の ☰
+								（サイドバーのオフキャンバス）と同じ書き方に揃える
+								（`aria-expanded` + `aria-controls`）。閉じていても何で
+								絞り込まれているかが分かるよう、現在のツリー選択名を
+								ボタンの隣に出す。
+							-->
+							{#if mobileNavStore.isNarrow}
+								<button
+									type="button"
+									class="secondary tree-toggle"
+									data-testid="tag-tree-toggle"
+									aria-expanded={treeOpen}
+									aria-controls="tags-tree-pane"
+									onclick={() => (treeOpen = !treeOpen)}
+								>
+									📁 ツリー
+								</button>
+								<span class="tree-selection" data-testid="tag-tree-selection">
+									{treeSelectionLabel}
+								</span>
+							{/if}
 							{#if canWrite}
 								<!--
 								T19 S1-c（UX-33、docs/banto-hub-t19-design.md「タグ登録の
@@ -7329,6 +7396,21 @@
 	.tree-toolbar button {
 		font-size: 0.78rem;
 		padding: 0.35rem 0.6rem;
+	}
+
+	/* #378: 狭幅でだけ出るツリーのトグルと、現在のツリー選択名。 */
+	.tree-toggle {
+		flex: 0 0 auto;
+	}
+
+	.tree-selection {
+		flex: 0 1 auto;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		color: var(--banto-text-muted);
+		font-size: 0.75rem;
 	}
 
 	/*
