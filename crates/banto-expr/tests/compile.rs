@@ -672,8 +672,7 @@ fn every_builtin_function_entry_compiles_with_its_declared_arity() {
     assert_eq!(banto_expr::BUILTIN_FUNCTIONS.len(), 7);
     for f in banto_expr::BUILTIN_FUNCTIONS {
         assert_compiles(&call_with(f.name, f.arity));
-        // 1つ多い/少ない引数は必ず ArityMismatch（＝表の `arity` が実装と
-        // 一致している）。`arity == 0` の関数は現状無いので `arity - 1` は安全。
+        // 1つ多い引数は必ず ArityMismatch（＝表の `arity` が実装と一致している）。
         assert!(
             matches!(
                 assert_rejected(&call_with(f.name, f.arity + 1)),
@@ -683,5 +682,20 @@ fn every_builtin_function_entry_compiles_with_its_declared_arity() {
             f.name,
             f.arity + 1
         );
+        // 1つ少ない引数も同じく ArityMismatch（#380 レビュー対応: 以前は
+        // 「多い」側しか見ておらず、表の `arity` が実装より小さくてもこの
+        // テストを通り抜けられた）。`arity == 0` の関数は現状無いが、将来
+        // 足されたときに `arity - 1` が underflow しないようガードする。
+        if f.arity >= 1 {
+            assert!(
+                matches!(
+                    assert_rejected(&call_with(f.name, f.arity - 1)),
+                    CompileError::ArityMismatch { .. }
+                ),
+                "{} should reject {} args",
+                f.name,
+                f.arity - 1
+            );
+        }
     }
 }

@@ -17,7 +17,8 @@
 （v0.2.0-alpha.15、#342 段階A）: 演算タグの式チェック API
 （`POST /api/tags/expression/check`）を §4.2 に追加。あわせて §4.2 の
 組み込み関数一覧から `bit()` が抜けていたドキュメントドリフトを是正
-（`typecheck.rs` の `KNOWN_FUNCTIONS` が正）。2026-09-15 追補
+（`typecheck.rs` の関数表が正 - 2026-09-16 の #342 段階B で
+`BUILTIN_FUNCTIONS` として公開した）。2026-09-15 追補
 （v0.2.0-alpha.18、#342 段階C）: 式欄の「一覧から挿入」（グリッドの行クリックで
 完全名をキャレット位置へ挿入。ツリー3階層化を採らなかった理由を含む）を
 §4.2 に追加。2026-09-16 追補（v0.2.0-alpha.19、#342 段階B）: 式欄の
@@ -436,7 +437,8 @@ real / simulation / computed / derived_simulation / internal / db。
 - **式言語は最小の宣言的文法**: 四則演算・比較・論理・条件（`if(c,a,b)`）・
   `min/max/abs/round/clamp`・`bit(tag, n)`（タグの生ワード値からのビット
   抽出、T20 で追加）程度から始める（正確な関数一覧は
-  `crates/banto-expr/src/typecheck.rs` の `KNOWN_FUNCTIONS` が正 -
+  `crates/banto-expr/src/typecheck.rs` の `BUILTIN_FUNCTIONS` が正
+  （#342 段階B で公開し、`GET /api/tags/expression/functions` が UI へ配る）-
   2026-09-15 追補: 本節がこのリストから `bit()` を落としていたドキュメント
   ドリフトを是正、#342 段階A）。外部式評価クレートではなく
   **自前の小さな AST + 純関数評価器**を推奨 — I 系の流儀（scaling / planning が

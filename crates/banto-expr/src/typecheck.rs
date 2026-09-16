@@ -248,7 +248,7 @@ fn check_call(
             Ok(Type::Num)
         }
         "bit" => check_bit(&args[0], &args[1], refs),
-        _ => unreachable!("KNOWN_FUNCTIONS と match の分岐が食い違っています: {fn_name}"),
+        _ => unreachable!("BUILTIN_FUNCTIONS と match の分岐が食い違っています: {fn_name}"),
     }
 }
 

@@ -329,6 +329,12 @@
 		onCaretLost: () => void;
 		/** `aria-activedescendant` に入れる選択中候補の id（閉じていれば `undefined`）。 */
 		completionActiveId: string | undefined;
+		/**
+		 * 補完ポップアップが開いているか。式欄を包む `.expr-field-wrap`
+		 * （`role="combobox"`）の `aria-expanded` に入れる（#380 レビュー対応3 -
+		 * マークアップ側の doc comment 参照）。
+		 */
+		completionOpen: boolean;
 	}
 
 	function blankForm(): FormState {
@@ -810,6 +816,7 @@
 			onKeydown: handleExpressionKeydown,
 			onCaretLost: handleExpressionCaretLost,
 			completionActiveId: completionActiveDescendantId,
+			completionOpen: completionVisible,
 			// #342 段階C（下の「一覧から挿入」節）。create/edit で同じ受け口を
 			// 共有できるのは `drawerMode` が常に高々1つで、式欄の `<textarea>`
 			// も同時に1つしかマウントされないため。
@@ -1142,6 +1149,7 @@
 			onKeydown: handleExpressionKeydown,
 			onCaretLost: handleExpressionCaretLost,
 			completionActiveId: completionActiveDescendantId,
+			completionOpen: completionVisible,
 			// #342 段階C: `createExprFieldHandlers` と同じ受け口（そちらのコメント参照）。
 			bindTextarea: (el) => (exprTextareaEl = el),
 			insertToggleVisible: insertToggleAvailable,
@@ -1943,6 +1951,15 @@
 	 * なら `insertToggleEnabled` は true のままで ON が残ってしまう（別タグへ
 	 * 切り替える `selectTag` も同様）。**モード遷移の OFF は個別の
 	 * `openXxxDrawer` に散らさず、必ずここ1箇所で落とす。**
+	 *
+	 * #380 レビュー対応2: **#342 段階B のセグメント補完のリセットもここに
+	 * 相乗りさせる**（新しい `$effect` を増やさない）。補完の状態
+	 * （`completionOpen`/`completionContext`）はページ直下にあるので、ペインを
+	 * 閉じる・モードが変わる・編集対象が変わるといった**プログラム的な閉じ方**
+	 * では式欄に `blur` が飛ばず、古い候補が古いキャレット位置に残って
+	 * 「もう存在しないフォームに対して確定できる」状態になりうる。
+	 * `drawerMode`/`selected?.id` はそのすべての遷移で必ず動くので、ここで
+	 * 一緒に閉じれば個別の `openXxxDrawer`/`closeDrawer` に散らさずに済む。
 	 */
 	$effect(() => {
 		// 依存として読むのはこの2つだけ（`void` は値を捨てる意図の明示 -
@@ -1952,7 +1969,19 @@
 		void selected?.id;
 		untrack(() => {
 			insertArmed = false;
+			closeCompletion();
 		});
+	});
+
+	/**
+	 * #380 レビュー対応2（もう1つの経路）: **式欄そのものが消えたら補完も閉じる**。
+	 * `tagKind` を `computed` 以外へ変えた・収集グループを非 virtual なものへ
+	 * 変えた等では `drawerMode` も `selected?.id` も動かないので、上の
+	 * モード遷移 `$effect` では拾えない（`expressionFieldVisible` は関数表の
+	 * 遅延取得と同じ条件 - その doc comment 参照）。
+	 */
+	$effect(() => {
+		if (!expressionFieldVisible) untrack(() => closeCompletion());
 	});
 
 	/**
@@ -2215,7 +2244,11 @@
 		wrap.appendChild(probe);
 		const rect = marker.getBoundingClientRect();
 		probe.remove();
-		return rect;
+		// #380 レビュー対応1: 式欄は `rows="2"` なので長い式ではスクロールするが、
+		// ミラー（`overflow: hidden`）はスクロールしない - 素の矩形は「スクロール
+		// していないときのキャレット位置」になり、2行を超えた式ではポップアップが
+		// 画面外へ出る。textarea のスクロール量を引いて可視位置へ戻す。
+		return new DOMRect(rect.left - el.scrollLeft, rect.top - el.scrollTop, rect.width, rect.height);
 	}
 
 	/**
@@ -4526,7 +4559,27 @@
 					循環エラーのように位置を持たないエラー種別）のときは下線を出さず
 					メッセージだけにする（実装指示どおり）。
 				-->
-				<div class="expr-field-wrap">
+				<!--
+					#380 レビュー対応3: **combobox のロールはこのラッパーに付け、
+					`<textarea>` には付けない。** ARIA in HTML が `<textarea>` に
+					許す role は「指定しない（暗黙の `textbox`）」だけで、
+					`role="combobox"` を直接載せるのは不正。ARIA 1.1 の
+					「combobox ラッパー + textbox の子」の形にすれば規格に沿ったまま
+					開閉状態を伝えられる。`CommandPalette.svelte` が `role="combobox"`
+					を入力要素そのものに付けているのは、あちらが `<input type="text">`
+					（role を直接付けてよい要素）だから - 属性の命名と id の作り方は
+					そちらに揃えてある。
+					`aria-activedescendant`/`aria-autocomplete` は**フォーカスを持つ
+					要素**に置く必要があるので textarea 側のまま。ミラーは
+					`aria-hidden="true"` なので combobox の中にあっても支障ない。
+				-->
+				<div
+					class="expr-field-wrap"
+					role="combobox"
+					aria-expanded={exprCheck.completionOpen}
+					aria-haspopup="listbox"
+					aria-controls={COMPLETION_LISTBOX_ID}
+				>
 					<div class="expr-mirror" aria-hidden="true">
 						{#if errPos !== null}{form.expression.slice(0, errPos)}<span class="expr-error-char"
 								>{form.expression.slice(errPos, errPos + 1) || ' '}</span
@@ -4545,7 +4598,6 @@
 							errors.expression && 'tag-expression-err'
 						)}
 						aria-autocomplete="list"
-						aria-controls={COMPLETION_LISTBOX_ID}
 						aria-activedescendant={exprCheck.completionActiveId}
 						oninput={exprCheck.onInput}
 						oncompositionstart={exprCheck.onCompositionStart}

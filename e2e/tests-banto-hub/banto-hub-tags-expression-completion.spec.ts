@@ -316,4 +316,53 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 		await expect(popup).toHaveCount(0);
 		await expect(expressionField).toHaveValue('min(');
 	});
+
+	test('6. スクロールした長い式でもポップアップが式欄の可視範囲に出る（#380 レビュー対応1）', async () => {
+		const pane = page.getByRole('complementary', { name: '新規作成' });
+		const expressionField = pane.getByLabel('式');
+		const popup = page.getByTestId('expression-completion');
+
+		// 式欄は `rows="2"` なので、改行を並べれば幅に依存せず確実にスクロール
+		// させられる（キャレット座標を測るミラーは `overflow: hidden` で
+		// スクロールしないため、textarea の `scrollTop` を引かないとポップアップが
+		// 「スクロールしていないときの行位置」＝式欄のはるか下に出てしまう）。
+		await expressionField.fill(`${'\n'.repeat(12)}mi`);
+		await expressionField.evaluate((el: HTMLTextAreaElement) => {
+			el.setSelectionRange(el.value.length, el.value.length);
+			el.scrollTop = el.scrollHeight;
+		});
+
+		await page.keyboard.press('Control+Period');
+		await expect(popup).toBeVisible();
+
+		const fieldBox = await expressionField.boundingBox();
+		const popupBox = await popup.boundingBox();
+		expect(fieldBox).not.toBeNull();
+		expect(popupBox).not.toBeNull();
+		// 厳密な座標は見ない（フォント・行高に依存する）。「式欄の矩形から大きく
+		// 外れていない」ことだけを固定する - 修正前はスクロール量（12行ぶん）だけ
+		// 下にずれるので、この緩い範囲でも確実に落ちる。
+		expect(popupBox!.y).toBeGreaterThan(fieldBox!.y - 120);
+		expect(popupBox!.y).toBeLessThan(fieldBox!.y + fieldBox!.height + 80);
+	});
+
+	test('7. 補完を開いたままペインを閉じるとポップアップも消える（#380 レビュー対応2）', async () => {
+		const pane = page.getByRole('complementary', { name: '新規作成' });
+		const expressionField = pane.getByLabel('式');
+		const popup = page.getByTestId('expression-completion');
+
+		await expressionField.fill('mi');
+		await expect(popup).toBeVisible();
+
+		// ペインを閉じる（未保存なので破棄確認が挟まる）。補完の状態はページ直下に
+		// あるので、モード遷移で明示的にリセットしないと古い候補が残る。
+		page.once('dialog', (dialog) => {
+			void dialog.accept();
+		});
+		// `exact: true` は必須 - ペインには「登録して閉じる」ボタンもあるため。
+		await pane.getByRole('button', { name: '閉じる', exact: true }).click();
+
+		await expect(pane).toHaveCount(0);
+		await expect(popup).toHaveCount(0);
+	});
 });
