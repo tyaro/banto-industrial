@@ -31,8 +31,9 @@
  * かつ他スペックの固定名と衝突しないものにしてある（`plc_connections`/
  * `collection_groups` の `name` は UNIQUE）。
  */
-import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 import { CSRF_HEADERS, fetchAuthToken, groupNodeByName, injectAuthToken } from './banto-hub-auth';
+import { cleanupFixtures } from './banto-hub-fixture-cleanup';
 
 const CONNECTION_NAME = 'e2ecompline1';
 const GROUP_NAME = 'e2ecompfast';
@@ -43,6 +44,16 @@ const CALC_GROUP_NAME = 'e2e-expr-comp-calc-group';
 
 const REF_EXTERNAL_NAME = `${CONNECTION_NAME}.${GROUP_NAME}.${REF_TAG_NAME}`;
 
+/**
+ * 掃除の対象（共有ヘルパー `banto-hub-fixture-cleanup.ts` に渡す）。`calc` 予約
+ * 接続自体は消さず、その配下のグループとタグだけを消す。**`beforeAll` の先頭と
+ * `afterAll` の両方**で呼ぶ理由と、依存元まで拾う理由はヘルパー側の doc comment 参照。
+ */
+const CLEANUP_TARGET = {
+	groupNames: [GROUP_NAME, CALC_GROUP_NAME],
+	connectionNames: [CONNECTION_NAME]
+};
+
 function waitForExpressionCheck(page: Page) {
 	return page.waitForResponse(
 		(res) =>
@@ -50,115 +61,6 @@ function waitForExpressionCheck(page: Page) {
 			res.request().method() === 'POST' &&
 			res.status() === 200
 	);
-}
-
-/**
- * 各 DELETE の応答を検証する（204、または既に無い場合の 404 だけを許容）。
- * `banto-hub-tags-expression-insert.spec.ts::expectDeleted` と同じ。
- */
-async function expectDeleted(
-	request: APIRequestContext,
-	headers: Record<string, string>,
-	path: string
-): Promise<void> {
-	const res = await request.delete(path, { headers });
-	expect(
-		[204, 404],
-		`DELETE ${path} が ${res.status()} で失敗しました: ${await res.text()}`
-	).toContain(res.status());
-}
-
-/**
- * 与えられたパス群を「**進捗がある限り繰り返す**」方式で全部消す
- * （#380 レビュー対応4）。
- *
- * タグの削除順は FK だけでなく**式の参照**にも縛られる: 参照されている側を
- * 先に消すとサーバーの preflight が 4xx で拒否する。これまでは
- * 「computed → それ以外」の2段で済ませていたが、
- *
- * - 別グループの computed がこのグループの PLC タグを参照している
- * - 対象の computed 同士が依存していて、API の返す順が依存と逆
- *
- * のどちらでも足りない。依存の向きを解析する代わりに、**1周で1件も消せなく
- * なるまで回す**: 1周ごとに必ず1件以上は消えるので高々 O(n²) 回の DELETE で
- * 収束し、順序問題を構造的に解ける。最後まで残ったら `expect` で落とす
- * （握りつぶすと、掃除漏れが後続スペックの一覧行数を押し上げてしまう）。
- */
-async function deleteAllWithRetries(
-	request: APIRequestContext,
-	headers: Record<string, string>,
-	paths: string[]
-): Promise<void> {
-	let remaining = [...paths];
-	const failures = new Map<string, string>();
-	while (remaining.length > 0) {
-		const stillRemaining: string[] = [];
-		failures.clear();
-		for (const path of remaining) {
-			const res = await request.delete(path, { headers });
-			// 204 = 削除できた / 404 = 既に無い。それ以外（参照されていることに
-			// よる preflight 拒否など）は次の周で再試行する。
-			if (res.status() === 204 || res.status() === 404) continue;
-			stillRemaining.push(path);
-			failures.set(path, `${res.status()} ${await res.text()}`);
-		}
-		// 1周で1件も減らなければ、これ以上は進まない（本当に消せない）。
-		expect(
-			stillRemaining.length,
-			`削除が進まなくなりました: ${[...failures].map(([p, why]) => `${p} -> ${why}`).join(', ')}`
-		).toBeLessThan(remaining.length);
-		remaining = stillRemaining;
-	}
-}
-
-/**
- * この spec が使う固定名のリソースを、存在すれば掃除する
- * （`banto-hub-tags-expression-insert.spec.ts::cleanupExistingFixtures` を
- * 写したもの - 流儀をそちらに揃えている）。**`beforeAll` の先頭と `afterAll`
- * の両方**で呼ぶ: `name` が UNIQUE なのでリトライで `beforeAll` が再走すると
- * 前回分と衝突し、残したタグは後続スペックの一覧行数（＝仮想化された
- * グリッドの描画窓）を押し上げる。
- *
- * 削除は **タグ（全件まとめて、進捗がある限り繰り返す - `deleteAllWithRetries`）
- * → グループ → 接続**の順。タグ同士の順序は式の参照に縛られるが、依存の向きを
- * 解析せずリトライで解く（#380 レビュー対応4。`deleteAllWithRetries` の doc
- * comment 参照）。`calc` 予約接続自体は削除しない。
- */
-async function cleanupExistingFixtures(
-	request: APIRequestContext,
-	headers: Record<string, string>
-): Promise<void> {
-	const groupsRes = await request.get('/api/collection-groups', { headers });
-	if (!groupsRes.ok()) return;
-	const groups = (await groupsRes.json()) as Array<{ id: number; name: string }>;
-	const targetGroups = groups.filter((g) => g.name === GROUP_NAME || g.name === CALC_GROUP_NAME);
-
-	if (targetGroups.length > 0) {
-		const tagsRes = await request.get('/api/tags', { headers });
-		if (tagsRes.ok()) {
-			const tags = (await tagsRes.json()) as Array<{
-				id: number;
-				collectionGroupId: number;
-				tagKind: string;
-			}>;
-			const groupIds = new Set(targetGroups.map((g) => g.id));
-			await deleteAllWithRetries(
-				request,
-				headers,
-				tags.filter((t) => groupIds.has(t.collectionGroupId)).map((t) => `/api/tags/${t.id}`)
-			);
-		}
-		for (const group of targetGroups) {
-			await expectDeleted(request, headers, `/api/collection-groups/${group.id}`);
-		}
-	}
-
-	const connectionsRes = await request.get('/api/plc-connections', { headers });
-	if (connectionsRes.ok()) {
-		const connections = (await connectionsRes.json()) as Array<{ id: number; name: string }>;
-		const existing = connections.find((c) => c.name === CONNECTION_NAME);
-		if (existing) await expectDeleted(request, headers, `/api/plc-connections/${existing.id}`);
-	}
 }
 
 test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342 段階B)', () => {
@@ -173,7 +75,7 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 		await injectAuthToken(page, token);
 		authedHeaders = { ...CSRF_HEADERS, Authorization: `Bearer ${token}` };
 
-		await cleanupExistingFixtures(page.request, authedHeaders);
+		await cleanupFixtures(page.request, authedHeaders, CLEANUP_TARGET);
 
 		// 前提データ1: シミュレーションモードの PLC接続 + 収集グループ +
 		// 補完で選ぶ PLC タグ2件（実 PLC/実ネットワークへは繋がない）。
@@ -242,7 +144,7 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 	});
 
 	test.afterAll(async () => {
-		await cleanupExistingFixtures(page.request, authedHeaders);
+		await cleanupFixtures(page.request, authedHeaders, CLEANUP_TARGET);
 
 		// 掃除が実際に効いたことをサーバー側で確認する（削除順や preflight
 		// 拒否で残っていれば、ここで落ちる）。
