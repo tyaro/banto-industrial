@@ -51,6 +51,14 @@
 		 * 広幅では属性自体を出さない（従来の DOM を変えないため）。
 		 */
 		leftId?: string;
+		/**
+		 * #381 レビュー対応7回目: **左ペインが退避して不活性になる瞬間**に、その
+		 * 中にフォーカスがあったときの逃がし先を返す（例: 呼び出し側のツリー
+		 * トグルボタン）。広幅→狭幅へ変わるとペインは閉じたまま `inert` +
+		 * `visibility: hidden` になるので、逃がさないとフォーカスが `<body>` へ
+		 * 落ちる。`null`/未指定なら何もしない（行き先は呼び出し側が決める）。
+		 */
+		focusFallback?: () => HTMLElement | null | undefined;
 		left: Snippet;
 		right: Snippet;
 	}
@@ -61,6 +69,7 @@
 		leftOpen = $bindable(false),
 		leftLabel = 'ツリー',
 		leftId,
+		focusFallback,
 		left,
 		right
 	}: Props = $props();
@@ -80,6 +89,12 @@
 	 * しない（描画に使わず、再実行のきっかけにもしたくないため）。
 	 */
 	let focusHandledOpen = false;
+
+	/**
+	 * 下の「退避したらフォーカスを逃がす」`$effect` が最後に処理した状態
+	 * （`focusHandledOpen` と同じ理由で `$state` にしない）。
+	 */
+	let paneHiddenHandled = false;
 
 	const offcanvasOpen = $derived(narrow && leftOpen);
 
@@ -154,6 +169,28 @@
 				// 安全に戻す（`focusRestore.ts`）。代わりの行き先は持たない。
 				restoreFocus(previous);
 			}
+		});
+	});
+
+	/**
+	 * #381 レビュー対応7回目: **左ペインが退避して不活性になった瞬間**、その中に
+	 * フォーカスが残っていたら `focusFallback` の返す要素へ逃がす。
+	 *
+	 * 上の開閉 `$effect` では拾えないケースがある: ツリーが**閉じたまま**
+	 * 広幅→狭幅へ変わると `open` は `false` のままなので早期 return するが、
+	 * 広幅では普通に操作できていた左ペイン（ツリーのノード等）がその瞬間
+	 * `inert` + `visibility: hidden` になる。フォーカスがそこにあると
+	 * `<body>` へ落ちてキーボード操作の起点が失われる。
+	 */
+	$effect(() => {
+		const hidden = narrow && !leftOpen;
+		untrack(() => {
+			if (hidden === paneHiddenHandled) return;
+			paneHiddenHandled = hidden;
+			if (!hidden) return;
+			const active = document.activeElement;
+			if (!(active instanceof HTMLElement) || !leftPaneEl?.contains(active)) return;
+			focusFallback?.()?.focus();
 		});
 	});
 

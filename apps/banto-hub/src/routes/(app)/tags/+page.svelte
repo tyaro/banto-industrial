@@ -3146,9 +3146,33 @@
 	/** T19 S1-a: `connectionDrawerReadOnly` と同じ役割（`CollectionGroupDrawer` 用）。 */
 	let groupDrawerReadOnly = $state(false);
 
+	/**
+	 * #381 レビュー対応7回目: **接続 Drawer と収集グループ Drawer を同時に出さない。**
+	 * どちらも `Modal`/`Drawer`（z-index 900）で**同じ層**なので、2つ開くと Esc の
+	 * 層判定（`escLayering.ts::hasVisibleLayerAbove`）が互いを「手前の層」と見なして
+	 * **どちらも閉じなくなる**（同じ z 順の2層は判定では区別できない - 同時に
+	 * 出さないのは呼び出し側の責務、と同 doc に明記した）。フォーカストラップが
+	 * 無いため、キーボードでツリーツールバーのもう一方のボタンへ到達して両方
+	 * 開ける経路が実在した。
+	 *
+	 * 元々「同時に複数 Drawer を出さない」設計（下の各 open系関数が
+	 * `closeDrawer()` でタグ Drawer を閉じている）なので、その隣で相手側も閉じる。
+	 * **相手の未保存確認は通せない**: `ConnectionDrawer`/`CollectionGroupDrawer` は
+	 * dirty 判定を内部に持っていて（`isFormDirty` + 自前の `baseline`）ページからは
+	 * 参照できず、確認を通すには両部品へ新しい口を足すことになる。ここでは
+	 * 「同時に出さない」を優先した - この経路自体がキーボードでしか踏めない
+	 * 例外的なもので、通常の導線（ツリーの右クリック・常設ボタン）では相手は
+	 * 開いていない。
+	 */
+	function closeResourceDrawers(): void {
+		connectionDrawerOpen = false;
+		groupDrawerOpen = false;
+	}
+
 	function openConnectionCreateDrawer(): void {
 		if (!confirmDiscardIfNeeded()) return;
 		closeDrawer(); // タグ Drawer が開いていれば閉じる（同時に複数 Drawer を出さない）。
+		closeResourceDrawers();
 		connectionDrawerTarget = null;
 		connectionDrawerRequestDelete = false;
 		connectionDrawerReadOnly = false;
@@ -3160,6 +3184,7 @@
 		if (!target) return; // 通常起きない（右クリック直後は必ず存在する）が、念のため無視する。
 		if (!confirmDiscardIfNeeded()) return;
 		closeDrawer();
+		closeResourceDrawers();
 		connectionDrawerTarget = target;
 		connectionDrawerRequestDelete = false;
 		connectionDrawerReadOnly = false;
@@ -3181,6 +3206,7 @@
 		if (!target) return;
 		if (!confirmDiscardIfNeeded()) return;
 		closeDrawer();
+		closeResourceDrawers();
 		connectionDrawerTarget = target;
 		connectionDrawerRequestDelete = false;
 		connectionDrawerReadOnly = true;
@@ -3199,6 +3225,7 @@
 		if (!target) return;
 		if (!confirmDiscardIfNeeded()) return;
 		closeDrawer();
+		closeResourceDrawers();
 		connectionDrawerTarget = target;
 		connectionDrawerRequestDelete = true;
 		connectionDrawerReadOnly = false;
@@ -3229,6 +3256,7 @@
 	function openGroupCreateDrawer(presetConnectionId: number | null = null): void {
 		if (!confirmDiscardIfNeeded()) return;
 		closeDrawer();
+		closeResourceDrawers();
 		groupDrawerTarget = null;
 		groupDrawerPresetConnectionId = presetConnectionId;
 		groupDrawerRequestDelete = false;
@@ -3241,6 +3269,7 @@
 		if (!target) return;
 		if (!confirmDiscardIfNeeded()) return;
 		closeDrawer();
+		closeResourceDrawers();
 		groupDrawerTarget = target;
 		groupDrawerPresetConnectionId = null;
 		groupDrawerRequestDelete = false;
@@ -3258,6 +3287,7 @@
 		if (!target) return;
 		if (!confirmDiscardIfNeeded()) return;
 		closeDrawer();
+		closeResourceDrawers();
 		groupDrawerTarget = target;
 		groupDrawerPresetConnectionId = null;
 		groupDrawerRequestDelete = false;
@@ -3276,6 +3306,7 @@
 		if (!target) return;
 		if (!confirmDiscardIfNeeded()) return;
 		closeDrawer();
+		closeResourceDrawers();
 		groupDrawerTarget = target;
 		groupDrawerPresetConnectionId = null;
 		groupDrawerRequestDelete = true;
@@ -5974,6 +6005,7 @@
 			bind:leftOpen={treeOpen}
 			leftLabel="接続とグループ"
 			leftId="tags-tree-pane"
+			focusFallback={() => treeToggleEl ?? null}
 		>
 			{#snippet left()}
 				<div class="tree-pane">

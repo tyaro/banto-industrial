@@ -226,6 +226,13 @@
 	let treeOpen = $state(false);
 
 	/**
+	 * #381 レビュー対応7回目: 狭幅のツリートグル本体。ペインが退避して不活性に
+	 * なる瞬間に中へフォーカスが残っていたときの逃がし先（`SplitPane` の
+	 * `focusFallback`）。
+	 */
+	let treeToggleEl: HTMLButtonElement | undefined = $state();
+
+	/**
 	 * #381 レビュー対応3回目: 選択中の接続・収集グループが消えたら「すべて」へ
 	 * 戻す（タグ登録ページと同じ純関数 `pruneTreeFilter`。理由は同ファイルの
 	 * doc comment 参照 - 消えた id で絞られたままだと一覧が常に空になり、
@@ -478,6 +485,7 @@
 				bind:leftOpen={treeOpen}
 				leftLabel="接続とグループ"
 				leftId="monitor-tree-pane"
+				focusFallback={() => treeToggleEl ?? null}
 			>
 				{#snippet left()}
 					<ConnectionTree
@@ -497,6 +505,7 @@
 									type="button"
 									class="tree-toggle"
 									data-testid="monitor-tree-toggle"
+									bind:this={treeToggleEl}
 									aria-expanded={treeOpen}
 									aria-controls="monitor-tree-pane"
 									onclick={() => (treeOpen = !treeOpen)}

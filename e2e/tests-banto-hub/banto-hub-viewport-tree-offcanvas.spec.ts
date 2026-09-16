@@ -423,7 +423,53 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(palette).toHaveCount(0);
 	});
 
-	test('13. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
+	test('13. 広幅でツリー内にフォーカスがある状態で狭幅へ変えると、フォーカスはトグルへ逃げる（#381 レビュー対応7回目）', async () => {
+		// 広幅ではツリーが常時表示で、ノードは普通にフォーカスできる。狭幅へ
+		// 変わるとペインは閉じたまま `inert` + `visibility: hidden` になるので、
+		// 逃がさないとフォーカスが `<body>` に落ちてキーボード操作の起点を失う。
+		await page.setViewportSize({ width: 1280, height: 800 });
+		const node = groupNodeByName(page, GROUP_B);
+		await node.focus();
+		await expect(node).toBeFocused();
+
+		await page.setViewportSize(NARROW_VIEWPORT);
+
+		await expect(treePane).toBeHidden();
+		await expect(treeToggle).toBeFocused();
+	});
+
+	test('14. 接続 Drawer とグループ Drawer は同時に開かない（#381 レビュー対応7回目）', async () => {
+		// 同じ層（z-index 900）を2つ開くと、Esc の層判定が互いを「手前の層」と
+		// 見なしてどちらも閉じなくなる（`escLayering.ts` の doc）。同時に出さない
+		// のは呼び出し側の責務なので、開く側で相手を閉じる。
+		await treeToggle.click();
+		await expect(treePane).toBeVisible();
+		await treePane.getByRole('button', { name: 'PLC接続を追加' }).click();
+
+		const createModal = page.getByRole('dialog', { name: '新規作成' });
+		await expect(createModal).toBeVisible();
+		// 接続ウィザードの手順（グループのウィザードとは2段目の文言が違う）。
+		await expect(createModal).toContainText('プロトコルと接続先');
+
+		// モーダルのオーバーレイがツリーを覆うのでクリックでは届かない -
+		// キーボードで到達してボタンを押した場合と同じことを直接の click
+		// イベントで再現する（`Drawer`/`Modal` はタブ移動を閉じ込めない）。
+		await treePane.getByRole('button', { name: '収集グループを追加' }).dispatchEvent('click');
+
+		// 接続側は閉じ、グループ側だけが開いている。
+		await expect(createModal).toHaveCount(1);
+		await expect(createModal).toContainText('接続先と周期');
+		await expect(createModal).not.toContainText('プロトコルと接続先');
+
+		// 1つしか開いていないので Esc で閉じられる。
+		await page.keyboard.press('Escape');
+		await expect(createModal).toHaveCount(0);
+
+		await page.keyboard.press('Escape');
+		await expect(treePane).toBeHidden();
+	});
+
+	test('15. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
 		await page.goto('/monitor');
 		await expect(page.getByRole('heading', { level: 2, name: 'タグモニタ' })).toBeVisible();
 

@@ -36,6 +36,12 @@
  * | オフキャンバスサイドバー（`Sidebar.svelte`、バックドロップ 700） | 710 | -（常設ナビ）    |
  * | 狭幅の退避ツリー（`SplitPane.svelte`、バックドロップ 600） | 610 | `region`         |
  *
+ * **同じ z 順の層を同時に出さないのは呼び出し側の責務**: この判定は role と可視性
+ * しか見ないので、同じ層の2つ（例: 接続 Drawer と収集グループ Drawer、どちらも
+ * 900）を同時に開くと互いを「手前の層」と見なして**どちらも Esc で閉じなくなる**。
+ * 元々同時に出さない設計なので、開く側で相手を閉じること
+ * （`tags/+page.svelte::closeResourceDrawers`）。
+ *
  * {@link LAYER_ABOVE_SELECTOR} が拾うのは **Esc で閉じる一時的な UI**
  * （`dialog` = Drawer/Modal/CommandPalette、`menu` = TreeContextMenu）だけ。
  * トーストは Esc で閉じないので入れない。サイドバーは role を名乗らない常設
