@@ -11,6 +11,11 @@
 	import Header from '$lib/components/Header.svelte';
 	import Sidebar from '$lib/components/Sidebar.svelte';
 	import CommandPalette from '$lib/components/CommandPalette.svelte';
+	import {
+		hasVisibleLayerAbove,
+		hasVisibleMenuLayer,
+		LAYER_MARKER_ATTR
+	} from '$lib/components/escLayering';
 	import { listPendingChanges } from '$lib/banto/pendingChangesAdmin';
 	import { countUnappliedPendingChanges } from '$lib/banto/pendingUnappliedCount';
 	import { commandPaletteStore } from '$lib/commandPalette.svelte';
@@ -27,12 +32,41 @@
 	function handleKeydown(event: KeyboardEvent): void {
 		if (event.key.toLowerCase() === 'k' && (event.ctrlKey || event.metaKey)) {
 			event.preventDefault();
+			// #381 レビュー対応14回目（層の約束・項目5の補足、`escLayering.ts`）:
+			// **コマンドパレットとコンテキストメニューは同じ z（1000）**なので同時に
+			// 出さない。同 z は z 順の判定で区別できず、出してしまうと Esc も
+			// フォーカスの引き戻しも互いに譲り合って効かなくなる。メニューは
+			// 一過性（Esc・外クリック・フォーカスが外れるで閉じる）なので、
+			// 開いているあいだは**パレットを開かない**側に倒した - レイアウトから
+			// ページのメニューを閉じる口が無いため（閉じてから `Ctrl+K`）。
+			// 既に開いているパレットを閉じる方向のトグルは妨げない。
+			if (!commandPaletteStore.open && hasVisibleMenuLayer()) return;
 			commandPaletteStore.toggle();
 		}
 
 		// T19 S3-a（UX-43）: オフキャンバスが開いていれば Escape で閉じる。
-		if (event.key === 'Escape' && mobileNavStore.open) {
-			mobileNavStore.closeNav();
+		//
+		// #381 レビュー対応（層の約束 - **正は `escLayering.ts` の doc**）:
+		// サイドバー（z-index 710）は、より手前の層（Drawer/Modal 900、
+		// コマンドパレット・コンテキストメニュー 1000）には譲り、自分より下の層
+		// （タグ画面の退避ツリー 610、`SplitPane.svelte`）には**閉じたことを
+		// `preventDefault` で知らせる**。サイドバーは `role="dialog"` 等を
+		// 名乗らない常設ナビで `SplitPane` 側のセレクタからは見えないため
+		// （同部品は banto-hub の DOM を知らないアプリ非依存の規約）、この約束を
+		// 守るのはこちらの責務。
+		if (event.key === 'Escape') {
+			// #381 レビュー対応15回目: オフキャンバスが開いているあいだ、サイドバー
+			// 自身も層（`data-esc-layer`、z-index 710）として数えられるので、
+			// **自分を「上位層」と誤認して永遠に譲らないよう** `except` に渡す
+			// （Drawer 900・パレット 1000 には譲り、退避ツリー 610 には譲らない）。
+			// 要素は `Sidebar` から受け渡さず、マーカーで引く（`Sidebar` は開いて
+			// いるときだけこの属性を出す）。
+			const sidebarEl = document.querySelector(`[${LAYER_MARKER_ATTR}='sidebar']`);
+			if (event.defaultPrevented || hasVisibleLayerAbove({ except: sidebarEl })) return;
+			if (mobileNavStore.open) {
+				event.preventDefault();
+				mobileNavStore.closeNav();
+			}
 		}
 	}
 

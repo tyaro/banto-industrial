@@ -165,8 +165,20 @@
 		onClose: () => void;
 		/** 作成/更新が成功した直後に呼ばれる（202キュー投入時は呼ばれない — まだ確定していないため）。 */
 		onSaved: (conn: PlcConnection) => void;
-		/** 削除が成功した直後に呼ばれる。 */
-		onDeleted: (id: number) => void;
+		/**
+		 * 削除が成功した直後に呼ばれる。**Promise を返せば完了を待ってから閉じる**
+		 * （#381 レビュー対応16回目）: 呼び出し側の再読込（`reload()`）を待たずに
+		 * 閉じると、`Drawer`/`Modal` のフォーカス戻しが「消える予定の行/ノード」へ
+		 * 戻してしまい、直後に再読込がそれを消してフォーカスが `<body>` に落ちる。
+		 */
+		onDeleted: (id: number) => void | Promise<void>;
+		/**
+		 * #381 レビュー対応11回目: 閉じたときのフォーカスの戻し先の代替
+		 * （`Drawer.svelte`/`Modal.svelte` の同名 prop へそのまま渡すだけ）。
+		 * 右クリックメニューから開かれた場合、開いた元のメニュー項目は閉じる
+		 * ころには DOM に居ないため、呼び出し側が代わりの要素を指定できる。
+		 */
+		focusFallback?: () => HTMLElement | null | undefined;
 	}
 
 	let {
@@ -179,7 +191,8 @@
 		readOnly = false,
 		onClose,
 		onSaved,
-		onDeleted
+		onDeleted,
+		focusFallback
 	}: Props = $props();
 
 	const isCreate = $derived(connection === null);
@@ -566,7 +579,8 @@
 		try {
 			await deletePlcConnection(connection.id);
 			toastStore.push('success', '削除しました');
-			onDeleted(connection.id);
+			// 再読込（`onDeleted`）の完了を待ってから閉じる - 上の prop の doc 参照。
+			await onDeleted(connection.id);
 			onClose();
 		} catch (err) {
 			if (isQueuedWhileRunningError(err)) {
@@ -836,6 +850,7 @@
 		width="560px"
 		{dirty}
 		onBlockedClose={notifyBlockedClose}
+		{focusFallback}
 	>
 		<ol class="wizard-steps" aria-label="作成手順">
 			<li class:active={step === 1} class:done={step > 1}>1. 識別</li>
@@ -878,6 +893,7 @@
 		width="480px"
 		{dirty}
 		onBlockedClose={notifyBlockedClose}
+		{focusFallback}
 	>
 		{@render nameField()}
 		{@render destinationFields()}

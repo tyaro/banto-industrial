@@ -45,6 +45,7 @@
 	 */
 	import { page } from '$app/state';
 	import { toastStore } from '$lib/toast.svelte';
+	import { mobileNavStore } from '$lib/mobileNav.svelte';
 	import {
 		getCatalog,
 		connectTagStream,
@@ -60,6 +61,7 @@
 		type Tag
 	} from '$lib/banto/tagRegistryAdmin';
 	import { filterMonitorRows, type MonitorTreeFilter } from '$lib/banto/monitorFilter';
+	import { pruneTreeFilter } from '$lib/banto/treeFilterPrune';
 	import { subscriptionPatternsFor } from '$lib/banto/monitorSubscription';
 	import { applyTagValues, mergeTagValues, type RowValue } from '$lib/banto/monitorValues';
 	import SplitPane from '$lib/components/SplitPane.svelte';
@@ -164,6 +166,12 @@
 	let connections = $state<PlcConnection[]>([]);
 	let groups = $state<CollectionGroup[]>([]);
 	let adminTags = $state<Tag[]>([]);
+	/**
+	 * #381 レビュー対応19回目: 補助データ（接続/グループ/タグ）を**一度でも
+	 * 読み終えたか**。`pruneTreeFilter` へ渡す（一覧が空かどうかから「未ロード」を
+	 * 推測しない - 同ファイルの doc 参照）。失敗時は立てない。
+	 */
+	let adminLoaded = $state(false);
 
 	async function reloadAdmin(): Promise<void> {
 		try {
@@ -175,6 +183,7 @@
 			connections = nextConnections;
 			groups = nextGroups;
 			adminTags = nextTags;
+			adminLoaded = true;
 		} catch (err) {
 			toastStore.push('error', errorMessage(err));
 		}
@@ -215,11 +224,66 @@
 		return `group:${treeFilter.id}`;
 	});
 
+	/**
+	 * #378（2026-09-16 オーナー決定）: 狭幅（`mobileNavStore.isNarrow` =
+	 * `(max-width: 900px)`、サイドバーのオフキャンバスと同じ境界）で左ツリーを
+	 * 退避したときの開閉状態。タグ登録ページと同じ配線（`SplitPane` の
+	 * `narrow`/`leftOpen`）。
+	 */
+	let treeOpen = $state(false);
+
+	/**
+	 * #381 レビュー対応7回目: 狭幅のツリートグル本体。ペインが退避して不活性に
+	 * なる瞬間に中へフォーカスが残っていたときの逃がし先（`SplitPane` の
+	 * `focusFallback`）。
+	 */
+	let treeToggleEl: HTMLButtonElement | undefined = $state();
+
+	/**
+	 * #381 レビュー対応3回目: 選択中の接続・収集グループが消えたら「すべて」へ
+	 * 戻す（タグ登録ページと同じ純関数 `pruneTreeFilter`。理由は同ファイルの
+	 * doc comment 参照 - 消えた id で絞られたままだと一覧が常に空になり、
+	 * #378 の選択中表示とも食い違う）。`treeFilter` は購読範囲
+	 * （`subscriptionPatternsFor`）にも使うので、戻せば購読も全件へ戻る。
+	 */
+	$effect(() => {
+		const pruned = pruneTreeFilter(treeFilter, connections, groups, { loaded: adminLoaded });
+		if (pruned !== treeFilter) treeFilter = pruned;
+	});
+
+	/**
+	 * #381 レビュー対応8回目（層の約束・項目6、`escLayering.ts`）: **下位の層を
+	 * 開くなら上位の層を先に畳む。** サイドバー（z-index 710）はモーダルでは
+	 * ないのでフォーカストラップで塞げず、開いたまま Tab でヘッダー経由この
+	 * トグルへ到達できる。そのままツリー（610）を開くと重なりが逆順になり、
+	 * Esc で下の層から閉じることになる。サイドバーは未保存状態を持たない常設
+	 * ナビなので、閉じて安全（`Sidebar.svelte` のリンククリックでも閉じている）。
+	 */
+	function toggleTree(): void {
+		if (!treeOpen && mobileNavStore.open) mobileNavStore.closeNav();
+		treeOpen = !treeOpen;
+	}
+
+	/** #378: 閉じていても何で絞られているか分かるよう、トグルの隣に出す選択名。 */
+	const treeSelectionLabel = $derived.by((): string => {
+		if (treeFilter.type === 'connection') {
+			const connectionId = treeFilter.id;
+			return connections.find((c) => c.id === connectionId)?.name ?? 'すべて';
+		}
+		if (treeFilter.type === 'group') {
+			const groupId = treeFilter.id;
+			return groups.find((g) => g.id === groupId)?.name ?? 'すべて';
+		}
+		return 'すべて';
+	});
+
 	function handleTreeSelect(data: ConnectionTreeNodeData): void {
 		if (data.kind === 'all') treeFilter = { type: 'all' };
 		else if (data.kind === 'connection')
 			treeFilter = { type: 'connection', id: data.connection.id };
 		else treeFilter = { type: 'group', id: data.group.id };
+		// #378: 狭幅では選んだ時点で退避パネルを閉じる（タグ登録ページと同じ）。
+		if (mobileNavStore.isNarrow) treeOpen = false;
 	}
 
 	// --- T18-4c: 確認導線のディープリンク受け口 -----------------------------
@@ -415,25 +479,34 @@
 
 	{#if loading && rows.length === 0}
 		<p class="note">読み込み中…</p>
-	{:else if rows.length === 0}
-		<!--
-			T18-2d（docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A「空状態を…
-			不足する前工程と移動ボタンを示す」）: タグが1件も無い（フィルタの
-			問題ではなく真の空）場合は、前工程（タグ登録）へ案内する。ツリー/
-			検索を出しても絞り込む対象が無いので、SplitPane は出さない。
-		-->
-		<p class="note">
-			登録されているタグがありません。先に タグの登録画面 からタグを作成してください。
-		</p>
-		<a class="onboarding-cta" href="/tags">タグの登録画面へ移動</a>
 	{:else}
 		<!--
 			T18-4a: タグ登録ページと同じ SplitPane + ConnectionTree + 検索
 			ボックス。左ツリーは接続/グループを選択して絞り込むだけの表示専用
 			（`oncontextmenu` は渡さない - このページに作成系 UI は無い）。
+
+			#381 レビュー対応6回目: **タグが0件でも `SplitPane` を出す**
+			（以前は「絞り込む対象が無いので SplitPane は出さない」として空状態を
+			この外に置いていた）。条件マウントだと、ツリーやトグルにフォーカスが
+			ある状態で最後の行が消えたときに**フォーカスの戻り先ごとアンマウント
+			される**（フォーカスが `<body>` に落ちる）。ツリーはタグが0件でも
+			接続・収集グループを出せるので、常時マウントして空状態の案内は右ペイン
+			の中（下の `rows.length === 0` 分岐）に置く - タグ登録ページが
+			`SplitPane` を無条件にマウントしているのと同じ形。
 		-->
 		<div class="content">
-			<SplitPane leftWidth="280px">
+			<!--
+				#378（2026-09-16 オーナー決定）: 狭幅では左ツリーをオフキャンバスへ
+				退避する（実体は `SplitPane.svelte` - タグ登録ページと共有）。
+			-->
+			<SplitPane
+				leftWidth="280px"
+				narrow={mobileNavStore.isNarrow}
+				bind:leftOpen={treeOpen}
+				leftLabel="接続とグループ"
+				leftId="monitor-tree-pane"
+				focusFallback={() => treeToggleEl ?? null}
+			>
 				{#snippet left()}
 					<ConnectionTree
 						{connections}
@@ -446,6 +519,23 @@
 				{#snippet right()}
 					<div class="right-pane">
 						<div class="toolbar">
+							<!-- #378: 狭幅でだけ出すツリーのトグルと現在の選択名（タグ登録ページと同じ）。 -->
+							{#if mobileNavStore.isNarrow}
+								<button
+									type="button"
+									class="tree-toggle"
+									data-testid="monitor-tree-toggle"
+									bind:this={treeToggleEl}
+									aria-expanded={treeOpen}
+									aria-controls="monitor-tree-pane"
+									onclick={toggleTree}
+								>
+									📁 ツリー
+								</button>
+								<span class="tree-selection" data-testid="monitor-tree-selection">
+									{treeSelectionLabel}
+								</span>
+							{/if}
 							<input
 								type="search"
 								class="search-box"
@@ -454,7 +544,19 @@
 							/>
 							<span class="count">{filteredRows.length} / {rows.length} 件</span>
 						</div>
-						{#if filteredRows.length === 0}
+						{#if rows.length === 0}
+							<!--
+								T18-2d（docs/banto-hub-desktop-plan.md §9.4 TAG-UX-A「空状態を…
+								不足する前工程と移動ボタンを示す」）: タグが1件も無い（フィルタ
+								の問題ではなく真の空）場合は、前工程（タグ登録）へ案内する。
+								文言・CTA は従来のまま、置き場所だけ右ペインの中へ移した
+								（#381 レビュー対応6回目 - 上の SplitPane のコメント参照）。
+							-->
+							<p class="note">
+								登録されているタグがありません。先に タグの登録画面 からタグを作成してください。
+							</p>
+							<a class="onboarding-cta" href="/tags">タグの登録画面へ移動</a>
+						{:else if filteredRows.length === 0}
 							<p class="note">条件に一致するタグがありません。</p>
 						{:else}
 							<div class="table-wrap">
@@ -624,6 +726,28 @@
 
 	.count {
 		flex: 0 0 auto;
+		color: var(--banto-text-muted);
+		font-size: 0.75rem;
+	}
+
+	/* #378: 狭幅でだけ出るツリーのトグルと、現在のツリー選択名。 */
+	.tree-toggle {
+		flex: 0 0 auto;
+		padding: 0.35rem 0.6rem;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+		background: var(--banto-surface);
+		color: var(--banto-text);
+		font-size: 0.78rem;
+		cursor: pointer;
+	}
+
+	.tree-selection {
+		flex: 0 1 auto;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
 		color: var(--banto-text-muted);
 		font-size: 0.75rem;
 	}

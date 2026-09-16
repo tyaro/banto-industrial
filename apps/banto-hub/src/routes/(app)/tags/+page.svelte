@@ -29,6 +29,10 @@
 	import { deferredDelete, UNDO_WINDOW_MS } from '$lib/banto/deferredDelete.svelte';
 	import { sessionStore } from '$lib/session.svelte';
 	import { mobileNavStore } from '$lib/mobileNav.svelte';
+	import { pruneTreeFilter } from '$lib/banto/treeFilterPrune';
+	import { canRestoreFocusTo, restoreFocus } from '$lib/components/focusRestore';
+	import { focusablesIn } from '$lib/components/focusTrap';
+	import { hasVisibleLayerAbove } from '$lib/components/escLayering';
 	import { canWriteResources } from '$lib/permissions';
 	import Drawer from '$lib/components/Drawer.svelte';
 	import Modal from '$lib/components/Modal.svelte';
@@ -574,6 +578,13 @@
 
 	let loading = $state(false);
 	/**
+	 * #381 レビュー対応19回目: 一覧（接続/グループ/タグ）を**一度でも読み終えたか**。
+	 * `pruneTreeFilter` へ渡す（同ファイルの doc 参照 - 一覧が空かどうかから
+	 * 「未ロード」を推測しない。最後の1件を削除した状態と区別が付かないため）。
+	 * 失敗（stale 維持）では立てない。
+	 */
+	let registryLoaded = $state(false);
+	/**
 	 * T18-1（TAG-UX-C 6点目、docs/banto-hub-desktop-plan.md §9.4）:
 	 * 初期読込失敗・再読込失敗を通信エラーとして保持する - `tags` は
 	 * 失敗時も直前の内容を残す（stale 維持、`monitor/+page.svelte` の
@@ -698,6 +709,7 @@
 			groups = nextGroups;
 			connections = nextConnections;
 			tags = nextTags;
+			registryLoaded = true;
 			loadError = null;
 			// T18-3b: 再取得で消えた（削除された等の）タグの選択を掃除する -
 			// 存在しない id を選択集合に残すと、一括操作の対象件数表示や
@@ -1328,8 +1340,8 @@
 	};
 	let editConflict: EditConflict | null = $state(null);
 
-	function selectTag(t: Tag): void {
-		if (!confirmDiscardIfNeeded()) return;
+	function selectTag(t: Tag): boolean {
+		if (!confirmDiscardIfNeeded()) return false;
 		selected = t;
 		editForm = formFromTag(t);
 		editBaseline = formFromTag(t);
@@ -1343,7 +1355,9 @@
 		// #342 段階C: 「一覧から挿入」の解除はここでは行わない - `drawerMode` と
 		// `selected?.id` の変化を追う `$effect`（#379 レビュー対応2）が
 		// モード遷移・対象切替をまとめて OFF にする。
+		lastTreeMenuNodeEl = null;
 		drawerMode = 'edit'; // T13-1: 行クリック編集はドロワーで開く
+		return true;
 	}
 
 	/**
@@ -2023,6 +2037,23 @@
 			// のでこの window リスナーには届かないはずだが、経路（イベント委譲・
 			// 式欄外での Esc）に依存しないようここでも明示的に条件にする。
 			if (completionOpen) return;
+			// #378: 狭幅で退避したツリーが開いている間の Esc も**ツリーだけ**を
+			// 閉じ、このトグルは ON のままにする（`SplitPane` が左ペインの
+			// keydown で `stopPropagation` するのでここへは届かないはずだが、
+			// 補完と同じく経路に依存しないようここでも条件にする二重の担保）。
+			// **`isNarrow` も条件にする**（#381 レビュー対応A）: 広幅では退避
+			// そのものが無いので、`treeOpen` の残留で式欄の Esc が効かなくなる
+			// ことがないようにする（`SplitPane` 側も広幅遷移で `false` へ戻すが、
+			// その書き戻しに依存しない二重の担保）。
+			if (treeOpen && mobileNavStore.isNarrow) return;
+			// #381 レビュー対応10回目（層の約束・項目2、`escLayering.ts`）:
+			// **ページ側の window Esc ハンドラも上位層があれば譲る。** このトグルは
+			// 広幅の右ペイン（層としては本文と同じ最下層）に属するので、Drawer/
+			// Modal・コマンドパレット・コンテキストメニューが出ているあいだの Esc を
+			// 食べてはいけない。`defaultPrevented` だけでは足りない - window
+			// リスナーは登録順に走り、**先に ON にしたこちらが後から開いた
+			// パレットより先**に実行される。
+			if (e.defaultPrevented || hasVisibleLayerAbove()) return;
 			if (e.key === 'Escape') insertArmed = false;
 		};
 		window.addEventListener('keydown', onKeydown);
@@ -2769,8 +2800,8 @@
 	 * 出ないため到達しない）の場合は、フォールバックとして旧来どおり空の
 	 * `tagKind: 'plc'` から始める未確定フォームを開く。
 	 */
-	function openCreateDrawer(): void {
-		if (!confirmDiscardIfNeeded()) return;
+	function openCreateDrawer(): boolean {
+		if (!confirmDiscardIfNeeded()) return false;
 		const target = registrationTarget;
 		const next = blankForm();
 		if (target !== null) {
@@ -2793,7 +2824,9 @@
 		// T19 S1-b（UX-34）: 新規タグは常に `writable` の自動計算から始まる
 		// （上の `createWritableTouched` 宣言のコメント参照）。
 		createWritableTouched = false;
+		lastTreeMenuNodeEl = null;
 		drawerMode = 'create';
+		return true;
 	}
 
 	/**
@@ -2814,8 +2847,8 @@
 	 * 満たされる）。`duplicateSource` に複製元タグを保持し、`duplicateDiff`
 	 * （上で宣言済みの `$derived`）が保存前の差分パネルに使う。
 	 */
-	function openDuplicateDrawer(t: Tag): void {
-		if (!confirmDiscardIfNeeded()) return;
+	function openDuplicateDrawer(t: Tag): boolean {
+		if (!confirmDiscardIfNeeded()) return false;
 		// 2026-08-31 オーナー決定: タグ名の一意性は全体一意→収集グループ内一意へ
 		// 緩和された（サーバー側 `crates/banto-tags` migration 0011）。複製名が
 		// 避けるべき既存名も複製元と同じ収集グループ内のものだけでよい -
@@ -2850,7 +2883,9 @@
 		// ツリー選択には従わない（従来どおり任意のグループへ変更できる）ため
 		// `false`（`createGroupLocked` 宣言のコメント参照）。
 		createGroupLocked = false;
+		lastTreeMenuNodeEl = null;
 		drawerMode = 'create';
+		return true;
 	}
 
 	/**
@@ -2867,20 +2902,24 @@
 	 * （`continuousNamePatternTouched` 宣言のコメント参照）は変えていない -
 	 * 上書きするのは対象グループの1フィールドのみ。
 	 */
-	function openContinuousDrawer(): void {
-		if (!confirmDiscardIfNeeded()) return;
+	function openContinuousDrawer(): boolean {
+		if (!confirmDiscardIfNeeded()) return false;
 		continuousBaseline = blankContinuousForm();
 		editConflict = null;
 		if (registrationTarget !== null && registrationTarget.supportsContinuous) {
 			continuousForm.collectionGroupId = String(registrationTarget.groupId);
 		}
+		lastTreeMenuNodeEl = null;
 		drawerMode = 'continuous';
+		return true;
 	}
 
-	function openCsvDrawer(): void {
-		if (!confirmDiscardIfNeeded()) return;
+	function openCsvDrawer(): boolean {
+		if (!confirmDiscardIfNeeded()) return false;
 		editConflict = null;
+		lastTreeMenuNodeEl = null;
 		drawerMode = 'csv';
+		return true;
 	}
 
 	function closeDrawer(): void {
@@ -2932,11 +2971,83 @@
 		return `group:${treeFilter.id}`;
 	});
 
-	function handleTreeSelect(data: ConnectionTreeNodeData): void {
+	/**
+	 * #378（2026-09-16 オーナー決定）: 狭幅（`mobileNavStore.isNarrow` =
+	 * `(max-width: 900px)`、サイドバーのオフキャンバスと同じ境界）で左ツリーを
+	 * 退避したときの開閉状態。広幅では `SplitPane` が無視するので、幅を
+	 * 行き来して値が残っても害は無い。
+	 */
+	let treeOpen = $state(false);
+
+	/**
+	 * #381 レビュー対応5回目: 狭幅のツリートグル本体。コンテキストメニューを
+	 * 閉じたときに戻り先（ツリーノード）が `inert` の中で戻せない場合の
+	 * フォーカスの受け皿にする（`closeTreeContextMenu`）。
+	 */
+	let treeToggleEl: HTMLButtonElement | undefined = $state();
+
+	/**
+	 * #381 レビュー対応3回目: **選択中の接続・収集グループが消えたら「すべて」へ
+	 * 戻す。** `reload()` はカタログを取り直すだけで `treeFilter` を見ていなかった
+	 * ため、削除された id で絞られたまま（＝グリッドが常に空）になり、#378 で
+	 * 足した選択中表示はその id の名前を引けずに「すべて」と出て食い違っていた。
+	 * 判定は依存ゼロの純関数 `pruneTreeFilter`（`$lib/banto/treeFilterPrune.ts`、
+	 * vitest 済み）で、同一参照を返してくれるので変わったときだけ書き戻す。
+	 */
+	$effect(() => {
+		const pruned = pruneTreeFilter(treeFilter, connections, groups, { loaded: registryLoaded });
+		if (pruned !== treeFilter) treeFilter = pruned;
+	});
+
+	/**
+	 * #381 レビュー対応8回目（層の約束・項目6、`escLayering.ts`）: **下位の層を
+	 * 開くなら上位の層を先に畳む。** サイドバー（z-index 710）はモーダルでは
+	 * ないのでフォーカストラップで塞げず、開いたまま Tab でヘッダー経由この
+	 * トグルへ到達できる。そのままツリー（610）を開くと重なりが逆順になり、
+	 * Esc で下の層から閉じることになる。サイドバーは未保存状態を持たない常設
+	 * ナビなので、閉じて安全（`Sidebar.svelte` のリンククリックでも閉じている）。
+	 */
+	function toggleTree(): void {
+		if (!treeOpen && mobileNavStore.open) mobileNavStore.closeNav();
+		treeOpen = !treeOpen;
+	}
+
+	/**
+	 * #378: ツリーを閉じていても「何で絞り込まれているか」が分かるよう、
+	 * トグルボタンの隣に出す現在のツリー選択名（接続名 / グループ名 /
+	 * 「すべて」）。
+	 */
+	const treeSelectionLabel = $derived.by((): string => {
+		if (treeFilter.type === 'connection') {
+			const connectionId = treeFilter.id;
+			return connections.find((c) => c.id === connectionId)?.name ?? 'すべて';
+		}
+		if (treeFilter.type === 'group') {
+			const groupId = treeFilter.id;
+			return groups.find((g) => g.id === groupId)?.name ?? 'すべて';
+		}
+		return 'すべて';
+	});
+
+	/**
+	 * ツリー選択（`treeFilter`）の更新だけを行う。**退避パネルの開閉には
+	 * 触れない** - 右クリック（`handleTreeContextMenu`）もノード選択を伴うが、
+	 * そちらでは閉じてはいけないため（#381 レビュー対応C、下記）。
+	 */
+	function applyTreeSelection(data: ConnectionTreeNodeData): void {
 		if (data.kind === 'all') treeFilter = { type: 'all' };
 		else if (data.kind === 'connection')
 			treeFilter = { type: 'connection', id: data.connection.id };
 		else treeFilter = { type: 'group', id: data.group.id };
+	}
+
+	/** `ConnectionTree` の `onselect`（クリック / Enter でのノード選択）。 */
+	function handleTreeSelect(data: ConnectionTreeNodeData): void {
+		applyTreeSelection(data);
+		// #378: 狭幅では選んだ時点で退避パネルを閉じる（`Sidebar.svelte` の
+		// リンククリックで `closeNav()` するのと同じ「閉じる契機」）。**閉じるのは
+		// この経路（クリック選択）だけ** - 右クリック経路は下記参照。
+		if (mobileNavStore.isNarrow) treeOpen = false;
 	}
 
 	/**
@@ -3012,24 +3123,82 @@
 		node: TreeNode<ConnectionTreeNodeData>,
 		position: { x: number; y: number }
 	): void {
-		handleTreeSelect(node.data);
+		// #381 レビュー対応C: 選択は反映するが、**狭幅でも退避パネルは閉じない**
+		// （`handleTreeSelect` ではなく `applyTreeSelection` を呼ぶ）。ここで
+		// 閉じると、直後に `TreeContextMenu` が `triggerEl` として覚える
+		// 「右クリックされたノード」が `inert`/`aria-hidden` になった左ペインの
+		// 中に取り残され、メニューを閉じたときのフォーカス復帰先が死ぬ。
+		// メニューはツリーの上に重なって出るので、開いたままで問題ない
+		// （メニューの項目を選んで Drawer 等へ進む経路では、その Drawer が
+		// パネルより手前に出る）。
+		applyTreeSelection(node.data);
 		const items = resolveTreeContextMenuItemsForRole(node.data, canWrite);
 		if (items.length === 0) {
 			treeContextMenu = null;
 			return;
 		}
+		const trigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
 		treeContextMenu = {
 			x: position.x,
 			y: position.y,
 			items,
-			triggerEl: document.activeElement instanceof HTMLElement ? document.activeElement : null
+			triggerEl: trigger
 		};
 	}
 
+	/**
+	 * #381 レビュー対応11回目: 直近に右クリックしたツリーノード。メニューは項目を
+	 * 選んだ直後にアンマウントされる（`TreeContextMenu.activate()`）ので、そこから
+	 * 開いた Drawer/Modal が閉じるころには「開いた元」＝メニュー項目が DOM に
+	 * 居ない。その代わりの戻し先として、ページ側でノードを覚えておく
+	 * （`resolveDrawerFocusFallback`）。`$state` にしない（描画に使わない）。
+	 *
+	 * **紐付けは1回の開閉まで**（#381 レビュー対応14回目）: `activateTreeContextMenuAction`
+	 * （メニュー経由で開く唯一の経路）でセットする。残したままだと、あとから
+	 * グリッド行やツールバーで開いた Drawer の戻し先が消えたとき（選択中タグの
+	 * 削除など）に、無関係な古いツリーノードへフォーカスが飛ぶ。
+	 *
+	 * **消すのは「次に開くとき」であって「閉じるとき」ではない**（#381 レビュー
+	 * 対応16回目）: `Drawer`/`Modal` の戻しは `tick()` の後に `focusFallback()` を
+	 * 呼ぶので、閉じる側で同期的に消すと「ノードはまだ在るのに戻せない」になる。
+	 * 各 open 系関数が自分でクリアし、メニュー経由の
+	 * `activateTreeContextMenuAction` だけが open のあとに紐付け直す。
+	 * **紐付けるのは open 系関数が `true`（実際に開いた）を返したときだけ**
+	 * （#381 レビュー対応17回目）- 未保存確認のキャンセルや別 Drawer による拒否で
+	 * 開かなかった経路では、前の紐付けをそのまま保つ。
+	 */
+	let lastTreeMenuNodeEl: HTMLElement | null = null;
+
+	/**
+	 * #381 レビュー対応11回目: Drawer/Modal の `focusFallback`。右クリックした
+	 * ノードが生きていればそれ、狭幅で退避パネルごと `inert` になっている等で
+	 * 戻せないならツリーのトグル（`closeTreeContextMenu` の fallback と同じ要素）。
+	 */
+	function resolveDrawerFocusFallback(): HTMLElement | null {
+		if (lastTreeMenuNodeEl && canRestoreFocusTo(lastTreeMenuNodeEl)) return lastTreeMenuNodeEl;
+		// 狭幅はツリーのトグル。**広幅にはトグルが無い**ので（`{#if isNarrow}`）、
+		// 常に在るツリー本体の先頭ノード（「すべて」）を返す（#381 レビュー対応
+		// 16回目 - 削除で戻し先のノードごと消えたときに `<body>` へ落ちないため）。
+		if (treeToggleEl) return treeToggleEl;
+		const tree = document.querySelector<HTMLElement>('[role="tree"]');
+		return tree ? (focusablesIn(tree)[0] ?? null) : null;
+	}
+
 	function closeTreeContextMenu(): void {
-		const trigger = treeContextMenu?.triggerEl;
+		// #381 レビュー対応13回目: **二重呼び出しでは何もしない。** メニューは
+		// 「項目を選んだ」「Esc」「フォーカスが外れた（`focusout`）」の複数経路から
+		// 閉じ、同じ操作で2回呼ばれることがある（Esc → 戻し先へフォーカスが移る →
+		// それ自体が `focusout`）。2回目は `triggerEl` を失っているので、そのまま
+		// 進むと fallback が走って**1回目に戻したフォーカスを奪う**。
+		if (!treeContextMenu) return;
+		const trigger = treeContextMenu.triggerEl;
 		treeContextMenu = null;
-		trigger?.focus();
+		// #381 レビュー対応5回目: 戻り先（右クリックしたツリーノード）が
+		// **`inert` の中に入っていることがある** - メニューを開いたまま広幅→狭幅へ
+		// 変わると、退避パネルが閉じた状態で現れてノードごと不活性になる。その
+		// ときはフォーカスを `<body>` へ落とさず、ツリーを開き直せるトグル
+		// ボタンへ送る（`focusRestore.ts`）。
+		restoreFocus(trigger, () => treeToggleEl?.focus());
 	}
 
 	/**
@@ -3063,24 +3232,70 @@
 	/** T19 S1-a: `connectionDrawerReadOnly` と同じ役割（`CollectionGroupDrawer` 用）。 */
 	let groupDrawerReadOnly = $state(false);
 
-	function openConnectionCreateDrawer(): void {
-		if (!confirmDiscardIfNeeded()) return;
+	/**
+	 * #381 レビュー対応7回目（8回目で「閉じる」→「開かせない」へ改めた）:
+	 * **接続 Drawer と収集グループ Drawer を同時に出さない。** どちらも
+	 * `Modal`/`Drawer`（z-index 900）で**同じ層**なので、2つ開くと Esc の層判定
+	 * （`escLayering.ts::hasVisibleLayerAbove`）が互いを「手前の層」と見なして
+	 * **どちらも閉じなくなる**（同じ z 順の2層は判定では区別できない - 同時に
+	 * 出さないのは呼び出し側の責務、と同 doc に明記した）。`Modal`/`Drawer` は
+	 * タブ移動を閉じ込めないため、キーボードでツリーツールバーのもう一方の
+	 * ボタンへ到達して両方開ける経路が実在する。
+	 *
+	 * **2026-09-16 追補（#381 レビュー8回目・根本対策）**: `Drawer`/`Modal` に
+	 * Tab の循環（フォーカストラップ、`focusTrap.ts`）を入れたので、**通常は
+	 * この状況に到達できない**（オーバーレイの裏の起動ボタンへ Tab で届かない）。
+	 * このガードは**トラップをすり抜けた場合の保険**として残す - 到達経路は
+	 * 起動ボタンだけとは限らず（プログラム的な `click` ディスパッチ等）、
+	 * 「同時に2つ開く」ことの影響（下記）が大きいため。
+	 *
+	 * **相手を閉じるのではなく、こちらを開かせない。** 相手の未保存確認を通せない
+	 * （`ConnectionDrawer`/`CollectionGroupDrawer` は dirty 判定を内部の `baseline`
+	 * で持っていてページからは参照できない）ので、閉じる側に倒すと**入力途中の
+	 * 内容が黙って消える** - #376 で塞いだ「未保存の誤爆クローズ」と同じ事故に
+	 * なる。既に開いている側はそのまま残し、何も起きないように見えないよう案内の
+	 * トーストを出す。タグ Drawer との関係（各 open系関数の `closeDrawer()`）は
+	 * 変えない - そちらは `confirmDiscardIfNeeded()` を先に通していて安全。
+	 *
+	 * `true` を返したら呼び出し元は**何もせず return する**こと（トーストは
+	 * ここで1回出す）。
+	 */
+	function blockedByOtherResourceDrawer(target: 'connection' | 'group'): boolean {
+		const otherOpen = target === 'connection' ? groupDrawerOpen : connectionDrawerOpen;
+		if (!otherOpen) return false;
+		toastStore.push(
+			'info',
+			target === 'connection'
+				? '先に開いている収集グループの設定を閉じてください'
+				: '先に開いている PLC 接続の設定を閉じてください'
+		);
+		return true;
+	}
+
+	function openConnectionCreateDrawer(): boolean {
+		if (blockedByOtherResourceDrawer('connection')) return false;
+		if (!confirmDiscardIfNeeded()) return false;
 		closeDrawer(); // タグ Drawer が開いていれば閉じる（同時に複数 Drawer を出さない）。
 		connectionDrawerTarget = null;
 		connectionDrawerRequestDelete = false;
 		connectionDrawerReadOnly = false;
+		lastTreeMenuNodeEl = null;
 		connectionDrawerOpen = true;
+		return true;
 	}
 
-	function openConnectionEditDrawer(connectionId: number): void {
+	function openConnectionEditDrawer(connectionId: number): boolean {
+		if (blockedByOtherResourceDrawer('connection')) return false;
 		const target = connections.find((c) => c.id === connectionId);
-		if (!target) return; // 通常起きない（右クリック直後は必ず存在する）が、念のため無視する。
-		if (!confirmDiscardIfNeeded()) return;
+		if (!target) return false; // 通常起きない（右クリック直後は必ず存在する）が、念のため無視する。
+		if (!confirmDiscardIfNeeded()) return false;
 		closeDrawer();
 		connectionDrawerTarget = target;
 		connectionDrawerRequestDelete = false;
 		connectionDrawerReadOnly = false;
+		lastTreeMenuNodeEl = null;
 		connectionDrawerOpen = true;
+		return true;
 	}
 
 	/**
@@ -3093,15 +3308,18 @@
 	 * する理由が無い - `resolveReadOnlyTreeContextMenuItems` の doc comment
 	 * と同じ理由）。
 	 */
-	function openConnectionViewDrawer(connectionId: number): void {
+	function openConnectionViewDrawer(connectionId: number): boolean {
+		if (blockedByOtherResourceDrawer('connection')) return false;
 		const target = connections.find((c) => c.id === connectionId);
-		if (!target) return;
-		if (!confirmDiscardIfNeeded()) return;
+		if (!target) return false;
+		if (!confirmDiscardIfNeeded()) return false;
 		closeDrawer();
 		connectionDrawerTarget = target;
 		connectionDrawerRequestDelete = false;
 		connectionDrawerReadOnly = true;
+		lastTreeMenuNodeEl = null;
 		connectionDrawerOpen = true;
+		return true;
 	}
 
 	/**
@@ -3111,15 +3329,18 @@
 	 * 扱いは `ConnectionDrawer.svelte::handleDelete` の実装をそのまま使い、
 	 * ここでは独自の削除処理を持たない（実装指示の制約）。
 	 */
-	function openConnectionDeleteFlow(connectionId: number): void {
+	function openConnectionDeleteFlow(connectionId: number): boolean {
+		if (blockedByOtherResourceDrawer('connection')) return false;
 		const target = connections.find((c) => c.id === connectionId);
-		if (!target) return;
-		if (!confirmDiscardIfNeeded()) return;
+		if (!target) return false;
+		if (!confirmDiscardIfNeeded()) return false;
 		closeDrawer();
 		connectionDrawerTarget = target;
 		connectionDrawerRequestDelete = true;
 		connectionDrawerReadOnly = false;
+		lastTreeMenuNodeEl = null;
 		connectionDrawerOpen = true;
+		return true;
 	}
 
 	function closeConnectionDrawer(): void {
@@ -3143,26 +3364,32 @@
 	 * 渡してプリセットする - 呼び出し元によって挙動を変えるため、
 	 * `presetConnectionId` は省略可能にした（既定 `null` = 未選択）。
 	 */
-	function openGroupCreateDrawer(presetConnectionId: number | null = null): void {
-		if (!confirmDiscardIfNeeded()) return;
+	function openGroupCreateDrawer(presetConnectionId: number | null = null): boolean {
+		if (blockedByOtherResourceDrawer('group')) return false;
+		if (!confirmDiscardIfNeeded()) return false;
 		closeDrawer();
 		groupDrawerTarget = null;
 		groupDrawerPresetConnectionId = presetConnectionId;
 		groupDrawerRequestDelete = false;
 		groupDrawerReadOnly = false;
+		lastTreeMenuNodeEl = null;
 		groupDrawerOpen = true;
+		return true;
 	}
 
-	function openGroupEditDrawer(groupId: number): void {
+	function openGroupEditDrawer(groupId: number): boolean {
+		if (blockedByOtherResourceDrawer('group')) return false;
 		const target = groups.find((g) => g.id === groupId);
-		if (!target) return;
-		if (!confirmDiscardIfNeeded()) return;
+		if (!target) return false;
+		if (!confirmDiscardIfNeeded()) return false;
 		closeDrawer();
 		groupDrawerTarget = target;
 		groupDrawerPresetConnectionId = null;
 		groupDrawerRequestDelete = false;
 		groupDrawerReadOnly = false;
+		lastTreeMenuNodeEl = null;
 		groupDrawerOpen = true;
+		return true;
 	}
 
 	/**
@@ -3170,16 +3397,19 @@
 	 * `openConnectionViewDrawer` と対になる読み取り専用版 - virtual 接続
 	 * （calc/mem）配下のグループでも制限しない。
 	 */
-	function openGroupViewDrawer(groupId: number): void {
+	function openGroupViewDrawer(groupId: number): boolean {
+		if (blockedByOtherResourceDrawer('group')) return false;
 		const target = groups.find((g) => g.id === groupId);
-		if (!target) return;
-		if (!confirmDiscardIfNeeded()) return;
+		if (!target) return false;
+		if (!confirmDiscardIfNeeded()) return false;
 		closeDrawer();
 		groupDrawerTarget = target;
 		groupDrawerPresetConnectionId = null;
 		groupDrawerRequestDelete = false;
 		groupDrawerReadOnly = true;
+		lastTreeMenuNodeEl = null;
 		groupDrawerOpen = true;
+		return true;
 	}
 
 	/**
@@ -3188,16 +3418,19 @@
 	 * で既存の `handleDelete`（タグが参照している場合の Validation エラーを
 	 * 含む）を1回だけ呼ばせる。
 	 */
-	function openGroupDeleteFlow(groupId: number): void {
+	function openGroupDeleteFlow(groupId: number): boolean {
+		if (blockedByOtherResourceDrawer('group')) return false;
 		const target = groups.find((g) => g.id === groupId);
-		if (!target) return;
-		if (!confirmDiscardIfNeeded()) return;
+		if (!target) return false;
+		if (!confirmDiscardIfNeeded()) return false;
 		closeDrawer();
 		groupDrawerTarget = target;
 		groupDrawerPresetConnectionId = null;
 		groupDrawerRequestDelete = true;
 		groupDrawerReadOnly = false;
+		lastTreeMenuNodeEl = null;
 		groupDrawerOpen = true;
+		return true;
 	}
 
 	function closeGroupDrawer(): void {
@@ -3227,38 +3460,50 @@
 	 * `openGroupViewDrawer` へ振り分けるだけ - 新しい画面や別実装は持たない。
 	 */
 	function activateTreeContextMenuAction(action: TreeContextMenuItemAction): void {
+		// #381 レビュー対応14回目: **メニュー経由で開いたときだけ**、戻し先として
+		// 右クリックしたノードを紐付ける（下の open系関数は各自
+		// `lastTreeMenuNodeEl` をクリアするので、セットは呼び出しの後）。
+		const node = treeContextMenu?.triggerEl ?? null;
+		let opened = false;
 		switch (action.kind) {
 			case 'createTag':
-				openCreateDrawer();
+				opened = openCreateDrawer();
 				break;
 			case 'createConnection':
-				openConnectionCreateDrawer();
+				opened = openConnectionCreateDrawer();
 				break;
 			case 'createGroup':
 				// S3: postgres（DB Source）接続配下でも通常どおり Drawer を開く
 				// - S1 の disabled ガード（`action.disabled`）は撤去済み
 				// （`tagTreeContextMenu.ts`参照）。
-				openGroupCreateDrawer(action.connectionId);
+				opened = openGroupCreateDrawer(action.connectionId);
 				break;
 			case 'reconfigureConnection':
-				openConnectionEditDrawer(action.connectionId);
+				opened = openConnectionEditDrawer(action.connectionId);
 				break;
 			case 'deleteConnection':
-				openConnectionDeleteFlow(action.connectionId);
+				opened = openConnectionDeleteFlow(action.connectionId);
 				break;
 			case 'reconfigureGroup':
-				openGroupEditDrawer(action.groupId);
+				opened = openGroupEditDrawer(action.groupId);
 				break;
 			case 'deleteGroup':
-				openGroupDeleteFlow(action.groupId);
+				opened = openGroupDeleteFlow(action.groupId);
 				break;
 			case 'viewConnection':
-				openConnectionViewDrawer(action.connectionId);
+				opened = openConnectionViewDrawer(action.connectionId);
 				break;
 			case 'viewGroup':
-				openGroupViewDrawer(action.groupId);
+				opened = openGroupViewDrawer(action.groupId);
 				break;
 		}
+		// #381 レビュー対応17回目: **実際に開けたときだけ**紐付ける。未保存確認の
+		// キャンセル（`confirmDiscardIfNeeded`）や、別の resource Drawer が開いて
+		// いることによる拒否（`blockedByOtherResourceDrawer`）で開かなかった場合に
+		// 紐付けると、**後で別の Drawer を閉じたときに無関係なノードへフォーカスが
+		// 戻る**。開けなかった経路では前の状態をそのまま保つ（open 系関数は自分が
+		// 開くときにだけ `lastTreeMenuNodeEl` をクリアする）。
+		if (opened) lastTreeMenuNodeEl = node;
 	}
 
 	/**
@@ -3562,14 +3807,16 @@
 	 * 構造体登録も PLC アドレスの算術前提の機能のため、対象は
 	 * `registrationTarget.supportsContinuous` なグループに限る。
 	 */
-	function openStructDrawer(): void {
-		if (!confirmDiscardIfNeeded()) return;
+	function openStructDrawer(): boolean {
+		if (!confirmDiscardIfNeeded()) return false;
 		structBaseline = blankStructForm();
 		editConflict = null;
 		if (registrationTarget !== null && registrationTarget.supportsContinuous) {
 			structForm.collectionGroupId = String(registrationTarget.groupId);
 		}
+		lastTreeMenuNodeEl = null;
 		drawerMode = 'struct';
+		return true;
 	}
 
 	/** 入力が変わるたびに再計算される、割付前プレビュー本体。 */
@@ -5879,7 +6126,20 @@
 	</div>
 
 	<div class="content">
-		<SplitPane leftWidth="280px">
+		<!--
+			#378（2026-09-16 オーナー決定）: 狭幅では左ツリーをオフキャンバスへ
+			退避する（退避の実体は `SplitPane.svelte` 側 - タグモニタと共有する）。
+			狭幅の判定はサイドバーのオフキャンバスと同じ `mobileNavStore.isNarrow`
+			（`(max-width: 900px)`）で、新しい境界は作らない。
+		-->
+		<SplitPane
+			leftWidth="280px"
+			narrow={mobileNavStore.isNarrow}
+			bind:leftOpen={treeOpen}
+			leftLabel="接続とグループ"
+			leftId="tags-tree-pane"
+			focusFallback={() => treeToggleEl ?? null}
+		>
 			{#snippet left()}
 				<div class="tree-pane">
 					<!--
@@ -5923,6 +6183,29 @@
 				<div class="right-split">
 					<div class="right-pane">
 						<div class="toolbar">
+							<!--
+								#378: 狭幅でだけ出す「ツリー」トグル。`Header.svelte` の ☰
+								（サイドバーのオフキャンバス）と同じ書き方に揃える
+								（`aria-expanded` + `aria-controls`）。閉じていても何で
+								絞り込まれているかが分かるよう、現在のツリー選択名を
+								ボタンの隣に出す。
+							-->
+							{#if mobileNavStore.isNarrow}
+								<button
+									type="button"
+									class="secondary tree-toggle"
+									data-testid="tag-tree-toggle"
+									bind:this={treeToggleEl}
+									aria-expanded={treeOpen}
+									aria-controls="tags-tree-pane"
+									onclick={toggleTree}
+								>
+									📁 ツリー
+								</button>
+								<span class="tree-selection" data-testid="tag-tree-selection">
+									{treeSelectionLabel}
+								</span>
+							{/if}
 							{#if canWrite}
 								<!--
 								T19 S1-c（UX-33、docs/banto-hub-t19-design.md「タグ登録の
@@ -6600,6 +6883,7 @@
 	onClose={closeConnectionDrawer}
 	onSaved={handleConnectionDrawerSaved}
 	onDeleted={handleConnectionDrawerDeleted}
+	focusFallback={resolveDrawerFocusFallback}
 />
 
 <CollectionGroupDrawer
@@ -6614,6 +6898,7 @@
 	onClose={closeGroupDrawer}
 	onSaved={handleGroupDrawerSaved}
 	onDeleted={handleGroupDrawerDeleted}
+	focusFallback={resolveDrawerFocusFallback}
 />
 
 <!--
@@ -6773,6 +7058,7 @@
 	onRequestClose={confirmDiscardIfNeeded}
 	dirty={drawerMode === 'create' && isDrawerDirty()}
 	onBlockedClose={notifyBlockedClose}
+	focusFallback={resolveDrawerFocusFallback}
 >
 	{#if drawerMode === 'create' && canWrite}
 		{@render createFormBody()}
@@ -6795,6 +7081,7 @@
 	onRequestClose={confirmDiscardIfNeeded}
 	dirty={drawerMode !== null && drawerMode !== 'create' && isDrawerDirty()}
 	onBlockedClose={notifyBlockedClose}
+	focusFallback={resolveDrawerFocusFallback}
 >
 	{#if drawerMode === 'edit' && selected && canWrite}
 		{@render editFormBody()}
@@ -7329,6 +7616,21 @@
 	.tree-toolbar button {
 		font-size: 0.78rem;
 		padding: 0.35rem 0.6rem;
+	}
+
+	/* #378: 狭幅でだけ出るツリーのトグルと、現在のツリー選択名。 */
+	.tree-toggle {
+		flex: 0 0 auto;
+	}
+
+	.tree-selection {
+		flex: 0 1 auto;
+		min-width: 0;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		color: var(--banto-text-muted);
+		font-size: 0.75rem;
 	}
 
 	/*

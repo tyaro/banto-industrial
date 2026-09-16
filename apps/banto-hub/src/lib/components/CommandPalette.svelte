@@ -1,9 +1,11 @@
 <script lang="ts">
 	// relay-wright の同名コンポーネントから無改変で複製。
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import { isProviderError, notify, searchCommands, type PaletteCommand } from '@banto/admin-core';
 	import { buildCommands, loadRecentCommandIds, recordRecentCommand } from '$lib/commands';
 	import { commandPaletteStore } from '$lib/commandPalette.svelte';
+	import { attachFocusTrap } from './focusTrap';
+	import { restoreFocus } from './focusRestore';
 
 	const commands = buildCommands();
 	const recentIds = loadRecentCommandIds();
@@ -53,8 +55,50 @@
 		selectedIndex = 0;
 	});
 
+	/**
+	 * #381 レビュー対応9回目: パレットを開く前にフォーカスがあった要素。閉じる
+	 * ときにここへ戻す（層の約束・項目5、`escLayering.ts`）。`Ctrl+K` は Drawer や
+	 * コンテキストメニューの中からでも効くので、戻さないとフォーカスが
+	 * `<body>` に落ち、**次の Tab が Drawer のトラップをすり抜ける**（body 起点の
+	 * Tab はパネルの keydown を通らない）。`$state` にしない（描画に使わない）。
+	 */
+	let triggerEl: HTMLElement | null = null;
+
 	onMount(() => {
+		const active = document.activeElement;
+		triggerEl = active instanceof HTMLElement ? active : null;
 		inputEl?.focus();
+		// アンマウント時（＝閉じたとき）に開いた元へ戻す。戻り先が消えている /
+		// `inert` の中なら何もしない（`focusRestore.ts` - `<body>` へは落とさない）。
+		return () => {
+			const previous = triggerEl;
+			triggerEl = null;
+			// #381 レビュー対応12回目: 戻し先が死んでいる（コマンドが画面遷移して
+			// 消えた・閉じたサイドバーの中で `inert` になった等）ときは、ヘッダーの
+			// 先頭ボタン（☰ - 常設でどの画面にもある）へ逃がす。`<body>` には
+			// 落とさない（層の約束・項目5）。
+			//
+			// **`tick()` の後に判定する**: ナビ系コマンドは `goto()` のあと
+			// `afterNavigate` がサイドバーを畳む、というように**同じ流れの中で
+			// 戻し先の生死が変わる**。先に戻してしまうと、直後に `inert` が付いて
+			// フォーカスが `<body>` へ落ちる（`Drawer`/`Modal` と同じ理由）。
+			void tick().then(() =>
+				restoreFocus(previous, () =>
+					restoreFocus(document.querySelector<HTMLElement>('header button'))
+				)
+			);
+		};
+	});
+
+	/**
+	 * #381 レビュー対応9回目: `aria-modal="true"` を名乗る層は必ずフォーカス
+	 * トラップを持つ（層の約束・項目4）。`Drawer.svelte`/`Modal.svelte` と同じ
+	 * 張り方（`focusTrap.ts`）。この部品は開いている間だけマウントされる。
+	 */
+	$effect(() => {
+		const node = paletteEl;
+		if (!node) return;
+		return attachFocusTrap(node);
 	});
 
 	function clampIndex(next: number): number {
@@ -90,11 +134,38 @@
 				event.preventDefault();
 				if (selectedCommand) void executeCommand(selectedCommand);
 				break;
-			case 'Escape':
-				event.preventDefault();
-				commandPaletteStore.hide();
-				break;
+			// Escape は**window 側**（`handleWindowKeydown`）で処理する -
+			// 層の約束（`escLayering.ts` の doc、項目3）。ここ（検索 input の
+			// `onkeydown`）だけで閉じていると、フォーカスがパレットの外にある
+			// 状態の Esc でパレットが閉じず、かつ下の層はみな「可視な上位層が
+			// ある」と見て譲るので、**Esc が何も閉じない**状態になる。Tab 移動
+			// 自体はフォーカストラップ（`focusTrap.ts`、レビュー9回目で追加）で
+			// 閉じ込めているが、外部要因（プログラム的な `focus()` 等）で外れる
+			// ことはあるので、window 側の処理は保険として要る。
 		}
+	}
+
+	/**
+	 * #381 レビュー対応6回目: フォーカス位置に依存しない Esc（層の約束・項目3、
+	 * フォーカスが外部要因でパネルの外にあっても閉じられるようにする保険 -
+	 * `escLayering.ts`）。閉じるときは `preventDefault` して下の層へ伝える
+	 * （項目1）ところは `Drawer.svelte`/`Modal.svelte` と同じ。
+	 *
+	 * **譲る相手は見ない**（`hasVisibleLayerAbove` を使わない）: パレットは
+	 * この app の**最上位層**（z-index 1000。同じ 1000 の `TreeContextMenu` は
+	 * パレットの外側クリックで閉じるため同時に開かない）なので、自分より手前の
+	 * 層が存在しない。`hasVisibleLayerAbove({ except: 自分 })` は「自分以外の
+	 * 可視な層」しか見ないので、**下にある Drawer を「手前の層」と誤認して譲り、
+	 * Esc で何も閉じなくなる**（E2E で実測）。パレットより手前に出る UI を将来
+	 * 足すなら、ここに上下関係の判定を入れること。
+	 *
+	 * この部品は `commandPaletteStore.open` のときだけマウントされるので
+	 * `open` の判定は不要。
+	 */
+	function handleWindowKeydown(event: KeyboardEvent): void {
+		if (event.key !== 'Escape' || event.defaultPrevented) return;
+		event.preventDefault();
+		commandPaletteStore.hide();
 	}
 
 	function handleWindowPointerDown(event: PointerEvent): void {
@@ -104,7 +175,7 @@
 	}
 </script>
 
-<svelte:window onpointerdown={handleWindowPointerDown} />
+<svelte:window onpointerdown={handleWindowPointerDown} onkeydown={handleWindowKeydown} />
 
 <div class="overlay">
 	<div

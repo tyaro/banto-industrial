@@ -15,6 +15,8 @@
 	 * 少ないうちはこれで十分。将来項目が増えても roving tabindex のまま
 	 * 破綻しない）。サブメニュー・アイコン等は持たない。
 	 */
+	import { hasVisibleLayerAbove } from './escLayering';
+
 	interface ContextMenuItem {
 		id: string;
 		label: string;
@@ -137,9 +139,43 @@
 			onClose();
 		}
 	}
+
+	/**
+	 * #381 レビュー対応13回目（層の約束・項目3、`escLayering.ts`）: **window
+	 * レベルでも Esc を処理する。** 下の `handleKeydown`（メニュー要素）だけだと、
+	 * フォーカスがメニューの外にあるときの Esc でメニューが閉じられず、一方で
+	 * 下の層は「可視な上位層がある」と見て全員譲るので **Esc が無反応**になる
+	 * （`CommandPalette` で塞いだのと同じ穴）。既に処理済み（`defaultPrevented`）の
+	 * イベントには反応しない。
+	 */
+	function handleWindowKeydown(event: KeyboardEvent): void {
+		if (event.key !== 'Escape' || event.defaultPrevented) return;
+		// #381 レビュー対応14回目: 自分（z-index 1000）より**上**の層があれば譲る
+		// （下の Drawer/Modal(900) は譲る相手ではない）。判定は z 順対応の
+		// `hasVisibleLayerAbove`（`escLayering.ts`）。
+		if (hasVisibleLayerAbove({ except: menuEl })) return;
+		event.preventDefault();
+		onClose();
+	}
+
+	/**
+	 * #381 レビュー対応13回目: **フォーカスがメニューの外へ出たら閉じる。**
+	 * メニューはそう振る舞うのが通例で、「メニューは見えているのにフォーカスは
+	 * 外」という状態自体を作らないのが一番の対策（上の window Esc は、それでも
+	 * 外れた場合の保険）。ただし**メニュー項目から Drawer/Modal を開いた**ときは
+	 * そちらへフォーカスが移るので、上位層が出ていれば何もしない
+	 * （閉じる処理が走ると `triggerEl` への戻しが開いたばかりの層から
+	 * フォーカスを奪ってしまう）。
+	 */
+	function handleFocusOut(event: FocusEvent): void {
+		const next = event.relatedTarget;
+		if (next instanceof Node && menuEl?.contains(next)) return;
+		if (hasVisibleLayerAbove({ except: menuEl })) return;
+		onClose();
+	}
 </script>
 
-<svelte:window onpointerdown={handleWindowPointerDown} />
+<svelte:window onpointerdown={handleWindowPointerDown} onkeydown={handleWindowKeydown} />
 
 <div
 	class="context-menu"
@@ -150,6 +186,7 @@
 	style:top={`${y}px`}
 	use:focusFirst
 	onkeydown={handleKeydown}
+	onfocusout={handleFocusOut}
 >
 	{#each items as item, i (item.id)}
 		<button

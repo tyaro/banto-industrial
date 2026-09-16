@@ -459,6 +459,11 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 			await injectAuthToken(narrowPage, token);
 			await narrowPage.goto('/tags');
 
+			// #378（2026-09-16、v0.2.0-alpha.20）: 狭幅では左ツリーがオフキャンバスへ
+			// 退避するようになったので、ノードをクリックする前にツールバーの
+			// 「ツリー」ボタンで開く（選ぶと自動で閉じる）。広幅のケース（このスペックの
+			// 他のテスト）は従来どおりツリーが常時出ているので変更不要。
+			await narrowPage.getByTestId('tag-tree-toggle').click();
 			await groupNodeByName(narrowPage, CALC_GROUP_NAME).click();
 			await narrowPage.getByRole('button', { name: '新規登録' }).click();
 
@@ -500,5 +505,28 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 		// 同じグループの ASCII 名タグは従来どおり挿入できる（除外が広すぎない）。
 		await page.getByRole('gridcell', { name: REF_TAG_NAME, exact: true }).click();
 		await expect(expressionField).toHaveValue(REF_EXTERNAL_NAME);
+	});
+
+	test('10. コマンドパレットが開いている間の Esc はトグルを OFF にしない（#381 レビュー対応10回目）', async () => {
+		// Esc の「層の約束」（`$lib/components/escLayering.ts`）: 本文と同じ最下層に
+		// 属するこのトグルの window ハンドラは、上に層（コマンドパレット）が出て
+		// いるあいだ Esc を食べてはいけない。`defaultPrevented` だけでは足りない -
+		// window リスナーは登録順に走り、**先に ON にしたトグル側が後から開いた
+		// パレットより先**に実行されるため。
+		const pane = page.getByRole('complementary', { name: '新規作成' });
+		const toggle = pane.getByTestId('tag-expression-insert-toggle');
+		await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+
+		await page.keyboard.press('Control+k');
+		const palette = page.getByRole('dialog', { name: 'コマンドパレット' });
+		await expect(palette).toBeVisible();
+
+		await page.keyboard.press('Escape');
+		await expect(palette).toHaveCount(0);
+		await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+
+		// パレットが無くなれば従来どおりトグルが OFF になる。
+		await page.keyboard.press('Escape');
+		await expect(toggle).toHaveAttribute('aria-pressed', 'false');
 	});
 });

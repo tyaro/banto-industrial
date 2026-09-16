@@ -5,9 +5,14 @@
 	 * `@banto/*` へ昇格しやすいよう banto-hub の型・ストアを一切 import
 	 * しない（呼び出し側が `open`/`title`/`children` を渡すだけの純表示部品）。
 	 *
-	 * フォーカストラップは「開いたら先頭要素へフォーカス」の最低限のみ
-	 * （設計指示: 凝りすぎない範囲で）。Tab キーでのフォーカス循環制御は
-	 * 行わない — 必要になったら需要を見て追加する。
+	 * フォーカストラップは当初「開いたら先頭要素へフォーカス」の最低限のみで、
+	 * Tab キーの循環制御は「需要を見て追加する」としていた。
+	 * **2026-09-16（#381）にその需要が出たので追加した**（実装は `focusTrap.ts`）:
+	 * フォーカスがパネルの外へ出られると、**オーバーレイの裏にある起動ボタンへ
+	 * Tab で到達して別の層を開けてしまい**（接続 Drawer を開いたまま「収集
+	 * グループを追加」に届く等）、「同じ z 順の層が2つ開いて Esc がどちらも
+	 * 効かない」「未保存の入力を捨てずにどう排他するか」という症状が連鎖して
+	 * 出ていた（#381 レビュー5〜8回目）。入口を塞ぐのが根本対策。
 	 *
 	 * 2026-09-15 追補（誤爆防止、TAG-UX-C 追補 - 「編集中に操作ミスで閉じて
 	 * 入力が消える」事故対策）: `dirty` prop が `true` の間は Esc・オーバー
@@ -19,8 +24,12 @@
 	 * ントは banto-hub の型・ストアを import しない規約のため）。
 	 */
 	import type { Snippet } from 'svelte';
+	import { tick, untrack } from 'svelte';
 	import { fade, fly } from 'svelte/transition';
 	import { isCloseAllowed } from './drawerCloseGuard';
+	import { hasVisibleLayerAbove, LAYER_INACTIVE_ATTR } from './escLayering';
+	import { attachFocusTrap } from './focusTrap';
+	import { restoreFocus } from './focusRestore';
 
 	interface Props {
 		open: boolean;
@@ -58,6 +67,15 @@
 		 * のため、案内の実体は呼び出し側に委ねる。
 		 */
 		onBlockedClose?: () => void;
+		/**
+		 * #381 レビュー対応11回目: 閉じたときの**フォーカスの戻し先の代替**を返す
+		 * （`SplitPane` の同名 prop と同じ形）。開いた元は閉じるまでに消えることが
+		 * ある - 代表例が `TreeContextMenu` の項目から開いた場合で、メニューは項目を
+		 * 選んだ直後にアンマウントされるため、閉じるころには戻し先が DOM に居ない。
+		 * そのとき呼び出し側が「右クリックしたノード」等を返せるようにする。
+		 * 未指定・`null` なら何もしない（`<body>` へは落とさない）。
+		 */
+		focusFallback?: () => HTMLElement | null | undefined;
 		children?: Snippet;
 	}
 
@@ -70,17 +88,48 @@
 		onRequestClose,
 		dirty = false,
 		onBlockedClose,
+		focusFallback,
 		children
 	}: Props = $props();
 
+	/** 自分自身のパネル（`role="dialog"`）。層の約束の「自分以外」の判定に使う。 */
+	let panelEl: HTMLDivElement | undefined = $state();
+
+	/**
+	 * #381 レビュー対応12回目（層の約束・項目6）: **閉じる意思が固まってから実際に
+	 * DOM から消えるまで**（`open` の反映待ち + outro の fade/fly）は「もう無い層」
+	 * として扱う。この間、矩形も `visibility` も可視のままなので、印を付けないと
+	 * 下の層が譲り続けて **Esc が無反応**になる。props の反映（＝再描画）は非同期で
+	 * 直後の Esc に間に合わないため、`requestClose()` で**同期的に**属性も立てる。
+	 */
+	let closing = $state(false);
+
 	/** `onRequestClose` 経由でクローズ可否を判定し、許可された場合だけ `onclose` を呼ぶ。 */
 	function requestClose(): void {
+		// #381 レビュー対応18回目: **閉じ処理は冪等**。outro（fade/fly）のあいだは
+		// パネルもオーバーレイもまだ DOM に居るので、`×` やオーバーレイをもう一度
+		// クリックするとここへ再入する。そのまま進むと `onRequestClose`（未保存の
+		// 破棄確認）が二重に出て、`onclose` の副作用も重複する。Esc・`×`・
+		// オーバーレイ・外部からの呼び出しのすべてがこの関数を通るので、
+		// ここ1箇所で塞ぐ（`closing` は `open` が再び true になったとき
+		// （下のフォーカス `$effect.pre`）に false へ戻る）。
+		if (closing) return;
 		if (onRequestClose && !onRequestClose()) return;
+		closing = true;
+		panelEl?.setAttribute(LAYER_INACTIVE_ATTR, 'true');
 		onclose?.();
 	}
 
 	function handleWindowKeydown(event: KeyboardEvent): void {
-		if (open && event.key === 'Escape') {
+		// 閉じる処理が走った後（`open` の反映待ち・outro 中）は、もうこの層は
+		// 無いものとして次の Esc を下の層へ渡す。
+		if (open && !closing && event.key === 'Escape') {
+			// 層の約束（`escLayering.ts` の doc が正、#381 レビュー対応5回目):
+			// 自分より手前に別の層（コマンドパレット等）が出ていれば譲る。
+			// `defaultPrevented` だけでは足りない - window リスナーは登録順に走り、
+			// **先に開いていたこの Drawer のリスナーが後から開いたパレットより先**
+			// に実行されるので、この時点ではまだ消費されていない。
+			if (event.defaultPrevented || hasVisibleLayerAbove({ except: panelEl })) return;
 			event.preventDefault();
 			if (!isCloseAllowed('escape', dirty)) {
 				onBlockedClose?.();
@@ -103,6 +152,59 @@
 		requestClose();
 	}
 
+	/**
+	 * #381 レビュー対応10回目（層の約束・項目5、`escLayering.ts`）: 開く前に
+	 * フォーカスがあった要素を覚えて、閉じたときに戻す。戻さないとフォーカスが
+	 * `<body>` へ落ち、そこからの Tab は**どのパネルの keydown も通らない**ので
+	 * 残っている層のトラップをすり抜ける。
+	 *
+	 * **捕捉は `$effect.pre`（DOM 更新の前）、戻しは `tick()` の後**（#381 レビュー
+	 * 対応12回目）。捕捉が前なのは、通常の `$effect` だと `use:focusFirst` が先頭
+	 * 要素へフォーカスを移した後になり開く前の要素が分からなくなるため。戻しを
+	 * 後にするのは、**閉じるのと同じ更新で戻し先自体が消えることがある**ため
+	 * （例: 編集 Drawer からタグを削除すると、`drawerMode` が消えるのと同じ更新で
+	 * その行が一覧から外れる）。DOM 更新前に戻すと「まだ生きて見える行」へ戻して
+	 * しまい、直後に消えてフォーカスが `<body>` へ落ちる - `restoreFocus` は
+	 * `tick()` 後の DOM に対して生存判定するので、死んでいれば `focusFallback` へ
+	 * 進める。**遷移したときだけ**動かすのは `SplitPane.svelte` と同じ。
+	 */
+	let triggerEl: HTMLElement | null = null;
+	let openHandled = false;
+
+	$effect.pre(() => {
+		const isOpen = open;
+		untrack(() => {
+			if (isOpen === openHandled) return;
+			openHandled = isOpen;
+			if (isOpen) {
+				closing = false;
+				const active = document.activeElement;
+				triggerEl = active instanceof HTMLElement ? active : null;
+			} else {
+				const previous = triggerEl;
+				triggerEl = null;
+				// 開いた元が死んでいれば呼び出し側の代替へ。代替にも同じ生存判定を
+				// かけたいので `restoreFocus` を入れ子にする。
+				void tick().then(() =>
+					restoreFocus(previous, () => restoreFocus(focusFallback?.() ?? null))
+				);
+			}
+		});
+	});
+
+	/**
+	 * #381 レビュー対応8回目: 開いている間、Tab / Shift+Tab をパネル内で循環させる
+	 * （`focusTrap.ts` - なぜ入れたかは同ファイルの doc）。リスナーは DOM に
+	 * 属性を足さずに済むよう `$effect` で張る（`panelEl` は `{#if open}` の中の
+	 * `bind:this` なので、開いた後にこの `$effect` が動く）。
+	 */
+	$effect(() => {
+		if (!open) return;
+		const node = panelEl;
+		if (!node) return;
+		return attachFocusTrap(node);
+	});
+
 	/** 開いた直後、パネル内の最初のフォーカス可能要素へフォーカスする。 */
 	function focusFirst(node: HTMLElement): void {
 		const focusable = node.querySelector<HTMLElement>(
@@ -123,7 +225,9 @@
 	>
 		<div
 			class="drawer"
+			bind:this={panelEl}
 			role="dialog"
+			data-layer-inactive={open && !closing ? undefined : 'true'}
 			aria-modal="true"
 			aria-label={title}
 			style:width

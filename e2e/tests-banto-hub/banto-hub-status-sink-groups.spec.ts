@@ -51,7 +51,8 @@ async function cleanupFixtures(
 	const sinkRes = await request.get('/api/sink/groups', { headers });
 	if (sinkRes.ok()) {
 		const groups = (await sinkRes.json()) as SinkGroupRow[];
-		for (const g of groups.filter((g) => g.name === SINK_GROUP_NAME)) {
+		// テスト5 が作る `${SINK_GROUP_NAME}-2` も掃除する（前方一致）。
+		for (const g of groups.filter((g) => g.name.startsWith(SINK_GROUP_NAME))) {
 			await request.delete(`/api/sink/groups/${g.id}`, { headers });
 		}
 	}
@@ -276,5 +277,58 @@ test.describe.serial('banto-hub DB Sink: sink group の作成・編集・状態�
 
 		await expect(adminPage.getByText('削除しました')).toBeVisible();
 		await expect(adminPage.locator('tr', { hasText: SINK_GROUP_NAME })).toHaveCount(0);
+	});
+
+	test('5. Drawer から削除してもフォーカスが body に落ちない（#381 レビュー対応20回目）', async () => {
+		// `Drawer.svelte` は閉じたときに「開いた元」へフォーカスを戻すが、削除では
+		// その行（「編集」ボタン）ごと消える。呼び出し側が `focusFallback`
+		// （ここではツールバーの「新規作成」ボタン）を渡していないと `<body>` へ
+		// 落ちる（層の約束・項目5、`$lib/components/escLayering.ts`）。
+		const pgListRes = await adminPage.request.get('/api/plc-connections', {
+			headers: adminHeaders
+		});
+		expect(pgListRes.ok()).toBe(true);
+		const pgConnection = ((await pgListRes.json()) as { id: number; name: string }[]).find(
+			(c) => c.name === PG_CONN
+		);
+		expect(pgConnection).toBeDefined();
+
+		// 対象タグは1件以上必要（サーバー検証）。beforeAll で作った TAG_NAME を使う。
+		const tagsRes = await adminPage.request.get('/api/tags', { headers: adminHeaders });
+		expect(tagsRes.ok()).toBe(true);
+		const seedTag = ((await tagsRes.json()) as { id: number; name: string }[]).find(
+			(t) => t.name === TAG_NAME
+		);
+		expect(seedTag).toBeDefined();
+
+		const secondName = `${SINK_GROUP_NAME}-2`;
+		const createRes = await adminPage.request.post('/api/sink/groups', {
+			headers: adminHeaders,
+			data: {
+				name: secondName,
+				dbConnectionId: pgConnection!.id,
+				mode: 'interval',
+				intervalMs: 1000,
+				tableName: TABLE_NAME,
+				storeBad: false,
+				enabled: true,
+				tagIds: [seedTag!.id]
+			}
+		});
+		expect(createRes.ok(), await createRes.text()).toBe(true);
+
+		await adminPage.goto('/sink');
+		const row = adminPage.locator('tr', { hasText: secondName });
+		await row.getByRole('button', { name: '編集', exact: true }).click();
+		const drawer = adminPage.getByRole('dialog', { name: `${secondName} を編集`, exact: true });
+		await expect(drawer).toBeVisible();
+
+		adminPage.once('dialog', (dialog) => void dialog.accept());
+		await drawer.getByRole('button', { name: '削除', exact: true }).click();
+		await expect(drawer).toHaveCount(0);
+		await expect(adminPage.locator('tr', { hasText: secondName })).toHaveCount(0);
+
+		// 消えた行でも `<body>` でもなく、ツールバーの「新規作成」へ。
+		await expect(adminPage.getByRole('button', { name: '新規作成', exact: true })).toBeFocused();
 	});
 });
