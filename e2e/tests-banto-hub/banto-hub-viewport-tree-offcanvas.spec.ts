@@ -23,8 +23,9 @@
  * `<Drawer>`/`<Modal>` へ落ち、そのオーバーレイ（z-index 900）がツールバーの
  * 「ツリー」ボタンを覆うので、トグルが ON の状態で退避ツリーを開く操作
  * そのものが存在しない。代わりに**再現できる**同種の競合 - 退避ツリーの上に
- * 開いたモーダルの Esc - をテスト4で固定する（`SplitPane.svelte` の window
- * フォールバックが `role="dialog"` 内の Esc を譲ること）。タグ登録側の
+ * 開いたモーダルの Esc - をテスト4・5で固定する（`SplitPane.svelte` の window
+ * フォールバックが、可視な上位層があるあいだ Esc を譲ること。フォーカスが
+ * モーダルの外にある場合もテスト5で見る）。タグ登録側の
  * 二重の担保（`insertArmed` の window リスナーが `treeOpen` を条件にする）は
  * 経路に依存しないための防御として実装に残してある。
  *
@@ -227,7 +228,35 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(treePane).toBeHidden();
 	});
 
-	test('5. 狭幅で開いたまま広幅へ広げて狭幅へ戻すと、ツリーは閉じている（#381 レビュー対応A）', async () => {
+	test('5. モーダルの外にフォーカスがある状態の Esc でも、閉じるのはモーダルだけ（#381 レビュー対応2回目）', async () => {
+		// `Drawer.svelte`/`Modal.svelte` はタブ移動を閉じ込めない（同ファイル冒頭
+		// doc）ので、モーダルが開いたままフォーカスがその外にある状態がありえる。
+		// 退避パネルの window フォールバックが**発生元**だけを見ていると、この
+		// 状態の Esc で「モーダルと退避パネルが両方閉じる」ことになる。
+		//
+		// モーダルは（テスト4 と同じく）ツリーペイン内の常設ボタンから開く -
+		// 退避パネルが開いている間はバックドロップがグリッド側を覆うので、
+		// 「ツリーもモーダルも開いている」状態を作れる経路はこれになる。
+		await treeToggle.click();
+		await expect(treePane).toBeVisible();
+		await treePane.getByRole('button', { name: 'PLC接続を追加' }).click();
+		const createModal = page.getByRole('dialog', { name: '新規作成' });
+		await expect(createModal).toBeVisible();
+
+		// フォーカスをモーダルの外（body）へ出す。以降の Esc の発生元は
+		// モーダルの中ではないので、判定は「可視な上位層があるか」だけが頼り。
+		await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+		await page.keyboard.press('Escape');
+
+		await expect(createModal).toBeHidden();
+		await expect(treePane).toBeVisible();
+
+		// 後片付け（上位層が無くなったので Esc は退避パネルへ届く）。
+		await page.keyboard.press('Escape');
+		await expect(treePane).toBeHidden();
+	});
+
+	test('6. 狭幅で開いたまま広幅へ広げて狭幅へ戻すと、ツリーは閉じている（#381 レビュー対応A）', async () => {
 		await treeToggle.click();
 		await expect(treePane).toBeVisible();
 
@@ -245,7 +274,7 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(treePane).toBeHidden();
 	});
 
-	test('6. 狭幅でノードを右クリックしてもツリーは閉じず、Esc はメニューだけを閉じる（#381 レビュー対応B/C）', async () => {
+	test('7. 狭幅でノードを右クリックしてもツリーは閉じず、Esc はメニューだけを閉じる（#381 レビュー対応B/C）', async () => {
 		await treeToggle.click();
 		await expect(treePane).toBeVisible();
 
@@ -272,7 +301,7 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(treePane).toBeHidden();
 	});
 
-	test('7. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
+	test('8. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
 		await page.goto('/monitor');
 		await expect(page.getByRole('heading', { level: 2, name: 'タグモニタ' })).toBeVisible();
 
