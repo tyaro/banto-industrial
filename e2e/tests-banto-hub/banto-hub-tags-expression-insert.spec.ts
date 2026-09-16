@@ -373,6 +373,13 @@ test.describe.serial('banto-hub 演算タグの式欄「一覧から挿入」 (#
 
 		// 挿入が `input` イベントとして流れ、段階Aのチェックが発火している。
 		await checkResponse;
+
+		// #380 レビュー対応1（段階B の回帰防止）: 挿入で流す**合成 `input`** を
+		// 打鍵と同じに扱うと、もう完成している参照に対してセグメント補完の
+		// ポップアップが開き、続くキー操作まで奪われてしまう。段階B 側は
+		// 「自動トリガーは式欄にフォーカスがあるときだけ」で除外している
+		// （この dispatch の時点ではフォーカスはグリッド側にある）。
+		await expect(page.getByTestId('expression-completion')).toHaveCount(0);
 	});
 
 	test('2. 挿入後は段階Aのプレビューの参照タグ一覧にそのタグが出る', async () => {

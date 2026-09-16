@@ -2130,10 +2130,11 @@
 				// #380 レビュー対応2: 取得が補完より後に解決したときの取りこぼしを
 				// 防ぐ。2文字打った時点で関数表が空だと候補0件でポップアップが
 				// 閉じてしまい、その後フェッチが解決しても何も再計算されない
-				// （次の打鍵か手動トリガーまで関数候補が出ない）。式欄にフォーカスが
-				// あるときだけ組み直す - `force` を付けないので、閉じていた場合は
-				// 「2文字以上の前方一致」等の通常の開く条件を満たすときだけ開く。
-				if (exprTextareaEl && document.activeElement === exprTextareaEl) refreshCompletion();
+				// （次の打鍵か手動トリガーまで関数候補が出ない）。`force` を付けない
+				// ので、閉じていた場合は「2文字以上の前方一致」等の通常の開く条件を
+				// 満たすときだけ開き、明示的に閉じた後（`completionDismissed`）や
+				// 式欄にフォーカスが無いときは `refreshCompletion` 側の門で止まる。
+				refreshCompletion();
 			})
 			.catch(() => {
 				// 権限不足・ネットワーク断でも補完は壊さない（関数候補が出ないだけ）。
@@ -2323,6 +2324,20 @@
 		if (options.force !== true && completionDismissed) return;
 		const el = exprTextareaEl;
 		if (!el || exprCompletionComposing) {
+			closeCompletion();
+			return;
+		}
+		// #380 レビュー対応1: **自動トリガーは式欄にフォーカスがあるときだけ**。
+		// 段階C の「一覧から挿入」（`insertTagRefIntoExpression`）は、グリッドの行を
+		// クリックした直後＝**式欄が未フォーカスのまま**合成 `input` を dispatch して
+		// から `focus()` する。ここでフォーカスを問わないと、その合成 `input` を
+		// 打鍵と同じに扱って「もう完成している参照」に対して補完を開いてしまい、
+		// 続くキー操作もポップアップに奪われる（段階B が段階C を壊す形）。
+		// **合成 `input` による段階A のライブチェックはこの判定の外**なので従来どおり
+		// 走る。通常のタイピングと IME 確定は必ずフォーカスがあるので影響しない。
+		// `force`（Ctrl+Space / Ctrl+. / 上位セグメント確定直後の開き直し）は
+		// ユーザーの明示操作なので通す（いずれも直前に式欄へフォーカスがある）。
+		if (options.force !== true && document.activeElement !== el) {
 			closeCompletion();
 			return;
 		}

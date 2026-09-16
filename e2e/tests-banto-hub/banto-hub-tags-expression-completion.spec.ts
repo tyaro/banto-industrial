@@ -338,6 +338,34 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 		await expect(expressionField).toHaveValue('min(');
 	});
 
+	test('5.5. 候補をクリックしても確定でき、フォーカスは式欄に残る（#380 レビュー対応2）', async () => {
+		const pane = page.getByRole('complementary', { name: '新規作成' });
+		const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
+		const popup = page.getByTestId('expression-completion');
+
+		// 確定経路のうち Enter/Tab は他のテストで見ているが、**クリック**は
+		// `CompletionPopup.svelte` の `onmousedown` + `preventDefault()`（式欄から
+		// フォーカスを外させず `selectionStart` を保つための肝）に依存するので、
+		// ここで別途固定する。回帰しても Enter/Tab のテストは緑のままになるため。
+		await expressionField.fill(CONNECTION_NAME.slice(0, 6));
+		await expect(popup).toBeVisible();
+		await popup.getByRole('option', { name: new RegExp(CONNECTION_NAME) }).click();
+
+		// 接続名の確定なので「名前 + ドット」が入り、次の階層が開く。
+		await expect(expressionField).toHaveValue(`${CONNECTION_NAME}.`);
+		// フォーカスが式欄に残っている（＝キャレット位置を失っていない）。
+		await expect(expressionField).toBeFocused();
+		const selectionStart = await expressionField.evaluate(
+			(el: HTMLTextAreaElement) => el.selectionStart
+		);
+		expect(selectionStart).toBe(CONNECTION_NAME.length + 1);
+		await expect(popup).toBeVisible();
+		await expect(popup.getByRole('option', { name: new RegExp(GROUP_NAME) })).toBeVisible();
+
+		await page.keyboard.press('Escape');
+		await expect(popup).toHaveCount(0);
+	});
+
 	test('6. スクロールした長い式でもポップアップが式欄の可視範囲に出る（#380 レビュー対応1）', async () => {
 		const pane = page.getByRole('complementary', { name: '新規作成' });
 		const expressionField = pane.getByRole('textbox', { name: /^式（expression）/ });
