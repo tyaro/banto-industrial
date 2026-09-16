@@ -478,7 +478,57 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(treePane).toBeHidden();
 	});
 
-	test('15. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
+	test('15. Modal の中で Tab / Shift+Tab を押してもフォーカスはパネル内に留まる（#381 レビュー対応8回目）', async () => {
+		// フォーカストラップ（`focusTrap.ts`）。これが無いと、オーバーレイの裏に
+		// ある起動ボタンへ Tab で到達して別の層を開けてしまう（このレビュー往復で
+		// 連鎖した症状の入口）。
+		await treeToggle.click();
+		await expect(treePane).toBeVisible();
+		await treePane.getByRole('button', { name: 'PLC接続を追加' }).click();
+		const createModal = page.getByRole('dialog', { name: '新規作成' });
+		await expect(createModal).toBeVisible();
+
+		const focusInsidePanel = () =>
+			page.evaluate(() => {
+				const panel = document.querySelector('[role="dialog"][aria-modal="true"]');
+				const active = document.activeElement;
+				return !!panel && !!active && panel.contains(active);
+			});
+
+		// パネル内のフォーカス可能要素の数より多く押しても外へ出ない。
+		for (let i = 0; i < 12; i += 1) {
+			await page.keyboard.press('Tab');
+			expect(await focusInsidePanel()).toBe(true);
+		}
+		for (let i = 0; i < 12; i += 1) {
+			await page.keyboard.press('Shift+Tab');
+			expect(await focusInsidePanel()).toBe(true);
+		}
+
+		await page.keyboard.press('Escape');
+		await expect(createModal).toHaveCount(0);
+		await page.keyboard.press('Escape');
+		await expect(treePane).toBeHidden();
+	});
+
+	test('16. サイドバーが開いているときにツリーを開くと、サイドバーが先に畳まれる（#381 レビュー対応8回目）', async () => {
+		await page.getByRole('button', { name: 'メニューを開く' }).click();
+		await expect(page.getByRole('button', { name: 'メニューを閉じる', exact: true })).toBeVisible();
+
+		// サイドバーのバックドロップが本文を覆うのでクリックでは届かない -
+		// Tab でヘッダー経由トグルへ到達して押した場合と同じことを直接の click
+		// イベントで再現する（サイドバーはモーダルではないので到達できる）。
+		await treeToggle.dispatchEvent('click');
+
+		// 上位のサイドバーは閉じ、ツリーだけが開いている（重なりが逆順にならない）。
+		await expect(page.getByRole('button', { name: 'メニューを開く' })).toBeVisible();
+		await expect(treePane).toBeVisible();
+
+		await page.keyboard.press('Escape');
+		await expect(treePane).toBeHidden();
+	});
+
+	test('17. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
 		await page.goto('/monitor');
 		await expect(page.getByRole('heading', { level: 2, name: 'タグモニタ' })).toBeVisible();
 

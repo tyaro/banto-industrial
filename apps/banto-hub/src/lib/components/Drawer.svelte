@@ -5,9 +5,14 @@
 	 * `@banto/*` へ昇格しやすいよう banto-hub の型・ストアを一切 import
 	 * しない（呼び出し側が `open`/`title`/`children` を渡すだけの純表示部品）。
 	 *
-	 * フォーカストラップは「開いたら先頭要素へフォーカス」の最低限のみ
-	 * （設計指示: 凝りすぎない範囲で）。Tab キーでのフォーカス循環制御は
-	 * 行わない — 必要になったら需要を見て追加する。
+	 * フォーカストラップは当初「開いたら先頭要素へフォーカス」の最低限のみで、
+	 * Tab キーの循環制御は「需要を見て追加する」としていた。
+	 * **2026-09-16（#381）にその需要が出たので追加した**（実装は `focusTrap.ts`）:
+	 * フォーカスがパネルの外へ出られると、**オーバーレイの裏にある起動ボタンへ
+	 * Tab で到達して別の層を開けてしまい**（接続 Drawer を開いたまま「収集
+	 * グループを追加」に届く等）、「同じ z 順の層が2つ開いて Esc がどちらも
+	 * 効かない」「未保存の入力を捨てずにどう排他するか」という症状が連鎖して
+	 * 出ていた（#381 レビュー5〜8回目）。入口を塞ぐのが根本対策。
 	 *
 	 * 2026-09-15 追補（誤爆防止、TAG-UX-C 追補 - 「編集中に操作ミスで閉じて
 	 * 入力が消える」事故対策）: `dirty` prop が `true` の間は Esc・オーバー
@@ -22,6 +27,7 @@
 	import { fade, fly } from 'svelte/transition';
 	import { isCloseAllowed } from './drawerCloseGuard';
 	import { hasVisibleLayerAbove } from './escLayering';
+	import { handleTrapKeydown } from './focusTrap';
 
 	interface Props {
 		open: boolean;
@@ -112,6 +118,21 @@
 		}
 		requestClose();
 	}
+
+	/**
+	 * #381 レビュー対応8回目: 開いている間、Tab / Shift+Tab をパネル内で循環させる
+	 * （`focusTrap.ts` - なぜ入れたかは同ファイルの doc）。リスナーは DOM に
+	 * 属性を足さずに済むよう `$effect` で張る（`panelEl` は `{#if open}` の中の
+	 * `bind:this` なので、開いた後にこの `$effect` が動く）。
+	 */
+	$effect(() => {
+		if (!open) return;
+		const node = panelEl;
+		if (!node) return;
+		const onKeydown = (event: KeyboardEvent): void => handleTrapKeydown(node, event);
+		node.addEventListener('keydown', onKeydown);
+		return () => node.removeEventListener('keydown', onKeydown);
+	});
 
 	/** 開いた直後、パネル内の最初のフォーカス可能要素へフォーカスする。 */
 	function focusFirst(node: HTMLElement): void {

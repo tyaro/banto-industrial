@@ -15,8 +15,9 @@
 	 * （`false` を返せば `onclose` を呼ばない - dirty フォーム破棄確認・busy
 	 * 中クローズ抑止を呼び出し側に委ねる）、Esc・オーバーレイクリック・×の
 	 * 三経路すべてが同じ `requestClose` を通る一本化、開いた直後に先頭の
-	 * フォーカス可能要素へ移すフォーカストラップ、`aria-modal="true"` +
-	 * `role="dialog"`。`Drawer.svelte` を直接再利用しなかった理由は、右固定・
+	 * フォーカス可能要素へ移すフォーカストラップ（**2026-09-16 #381 で Tab /
+	 * Shift+Tab のパネル内循環も両部品へ追加した** - 理由は `focusTrap.ts` と
+	 * `Drawer.svelte` 冒頭の doc）、`aria-modal="true"` + `role="dialog"`。`Drawer.svelte` を直接再利用しなかった理由は、右固定・
 	 * スライド・全高という見た目の性質が中央・可変高・フェード+スケールという
 	 * このコンポーネントの性質と相容れず、共通化するとプレゼンテーション用の
 	 * 分岐だらけになるため（`ConnectionDrawer.svelte`/
@@ -36,6 +37,7 @@
 	import { fade, scale } from 'svelte/transition';
 	import { isCloseAllowed } from './drawerCloseGuard';
 	import { hasVisibleLayerAbove } from './escLayering';
+	import { handleTrapKeydown } from './focusTrap';
 
 	interface Props {
 		open: boolean;
@@ -113,6 +115,21 @@
 		}
 		requestClose();
 	}
+
+	/**
+	 * #381 レビュー対応8回目: 開いている間、Tab / Shift+Tab をパネル内で循環させる
+	 * （`focusTrap.ts` - なぜ入れたかは同ファイルの doc）。リスナーは DOM に
+	 * 属性を足さずに済むよう `$effect` で張る（`panelEl` は `{#if open}` の中の
+	 * `bind:this` なので、開いた後にこの `$effect` が動く）。
+	 */
+	$effect(() => {
+		if (!open) return;
+		const node = panelEl;
+		if (!node) return;
+		const onKeydown = (event: KeyboardEvent): void => handleTrapKeydown(node, event);
+		node.addEventListener('keydown', onKeydown);
+		return () => node.removeEventListener('keydown', onKeydown);
+	});
 
 	/** 開いた直後、パネル内の最初のフォーカス可能要素へフォーカスする。 */
 	function focusFirst(node: HTMLElement): void {

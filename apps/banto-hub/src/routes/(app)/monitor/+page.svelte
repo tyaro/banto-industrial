@@ -244,6 +244,19 @@
 		if (pruned !== treeFilter) treeFilter = pruned;
 	});
 
+	/**
+	 * #381 レビュー対応8回目（層の約束・項目5、`escLayering.ts`）: **下位の層を
+	 * 開くなら上位の層を先に畳む。** サイドバー（z-index 710）はモーダルでは
+	 * ないのでフォーカストラップで塞げず、開いたまま Tab でヘッダー経由この
+	 * トグルへ到達できる。そのままツリー（610）を開くと重なりが逆順になり、
+	 * Esc で下の層から閉じることになる。サイドバーは未保存状態を持たない常設
+	 * ナビなので、閉じて安全（`Sidebar.svelte` のリンククリックでも閉じている）。
+	 */
+	function toggleTree(): void {
+		if (!treeOpen && mobileNavStore.open) mobileNavStore.closeNav();
+		treeOpen = !treeOpen;
+	}
+
 	/** #378: 閉じていても何で絞られているか分かるよう、トグルの隣に出す選択名。 */
 	const treeSelectionLabel = $derived.by((): string => {
 		if (treeFilter.type === 'connection') {
@@ -508,7 +521,7 @@
 									bind:this={treeToggleEl}
 									aria-expanded={treeOpen}
 									aria-controls="monitor-tree-pane"
-									onclick={() => (treeOpen = !treeOpen)}
+									onclick={toggleTree}
 								>
 									📁 ツリー
 								</button>
