@@ -27,6 +27,18 @@
  * 正規表現を書き起こすと、lexer 規則の写し間違いをもう1箇所抱えることになる。
  * あのモジュールは実行時 import を持たない（型 import のみ）ので、Playwright の
  * トランスパイルでもそのまま読める。
+ *
+ * ## 前提: 試運転中（未ロックダウン）または収集停止の Hub
+ *
+ * **ロックダウン済みかつ収集中の Hub には使えない**（#380 レビュー対応14）。
+ * その状態の構成 CRUD は即時反映されず**未適用キュー（pending queue）へ積まれて
+ * `202 Accepted` が返る**ので、DELETE を何周回してもカタログは減らない。
+ * `banto-hub.playwright.config.ts` の `chromium` プロジェクト（このヘルパーを使う
+ * 2つの spec が走る側）のサーバーは試運転中・収集停止なので、いまは起きない -
+ * **起きない条件のために「202 の pending id を適用して完了を待つ」経路は実装
+ * しない**。ロックダウン済みの spec（`chromium-locked-down`）でフィクスチャ掃除が
+ * 要るようになったら、そのときに足せばよい。代わりに `202` を受け取ったら
+ * **それと分かる理由を付けて即座に落とす**（{@link deleteAllWithRetries}）。
  */
 import { expect, type APIRequestContext } from '@playwright/test';
 import {
@@ -57,6 +69,12 @@ interface CatalogTag {
  * 1周ごとに必ず1件以上は消える想定なので高々 O(n²) 回の DELETE で収束する。
  * 1周で1件も減らなければ、これ以上進まない（本当に消せない）ので `expect` で
  * 落とす - 握りつぶすと掃除漏れが後続スペックへ波及する。
+ *
+ * **`202 Accepted`（未適用キュー行き）はその場で落とす**（#380 レビュー対応14）:
+ * 再試行してもカタログは減らないので「進捗ゼロ」まで待つ意味が無く、そのまま
+ * 待つと失敗理由が「削除が進まなくなりました」になって原因が読めない。
+ * このヘルパーの前提（ファイル冒頭の doc comment）を外れたことが一目で分かる
+ * メッセージにする。
  */
 export async function deleteAllWithRetries(
 	request: APIRequestContext,
@@ -73,6 +91,13 @@ export async function deleteAllWithRetries(
 			// 204 = 削除できた / 404 = 既に無い。それ以外（参照されていることによる
 			// preflight 拒否など）は次の周で再試行する。
 			if (res.status() === 204 || res.status() === 404) continue;
+			// 202 = 未適用キューへ積まれた。再試行しても減らないのでここで落とす。
+			expect(
+				res.status(),
+				`DELETE ${path} が pending queue に入った（202）。この掃除ヘルパーは` +
+					`ロックダウン済み・収集中の Hub には使えない - 収集を停止してから掃除するか、` +
+					`pending を適用する経路が要る（このファイル冒頭の doc comment 参照）。`
+			).not.toBe(202);
 			stillRemaining.push(path);
 			failures.set(path, `${res.status()} ${await res.text()}`);
 		}
