@@ -72,6 +72,13 @@
 	 */
 	let triggerEl: HTMLElement | null = null;
 
+	/**
+	 * 下のフォーカス `$effect` が最後に処理した開閉状態。**遷移したときだけ**
+	 * フォーカスを動かすために持つ（同 `$effect` のコメント参照）。`$state` に
+	 * しない（描画に使わず、再実行のきっかけにもしたくないため）。
+	 */
+	let focusHandledOpen = false;
+
 	const offcanvasOpen = $derived(narrow && leftOpen);
 
 	function closeLeft(): void {
@@ -143,20 +150,29 @@
 	});
 
 	$effect(() => {
-		if (!narrow) return;
-		if (leftOpen) {
-			untrack(() => {
+		const open = narrow && leftOpen;
+		untrack(() => {
+			// **開閉が実際に変わったときだけ**動かす（#381 レビュー対応3回目で
+			// 踏んだ罠）: この `$effect` は `narrow`（= 呼び出し側では
+			// `mobileNavStore.isNarrow`）にも依存していて、あのストアは
+			// 状態を**オブジェクトごと差し替える**（`mobileNav.svelte.ts`）ため、
+			// 値が同じでもサイドバーの開閉などで通知が飛んでくる。素直に
+			// 「いまの `open` を見て毎回フォーカスを動かす」と、ハンバーガーで
+			// サイドバーを開いた瞬間にフォーカスが左ペインへ引き戻され、
+			// `triggerEl` も ☰ ボタンで上書きされてしまう（E2E で Esc が
+			// サイドバーではなくツリーに効いて発覚）。
+			if (open === focusHandledOpen) return;
+			focusHandledOpen = open;
+			if (open) {
 				const active = document.activeElement;
 				triggerEl = active instanceof HTMLElement ? active : null;
 				focusFirstInLeftPane();
-			});
-		} else {
-			untrack(() => {
+			} else {
 				const previous = triggerEl;
 				triggerEl = null;
 				previous?.focus();
-			});
-		}
+			}
+		});
 	});
 
 	/**
@@ -166,12 +182,23 @@
 	 * タグ登録のトグルと同じ作法）。閉じているときは何もしない — 他のハンドラに
 	 * 任せる。
 	 *
+	 * **層の約束（#381 レビュー対応3回目）**: 重なりは「上から1層ずつ Esc で
+	 * 畳む」。この退避パネルより手前に出る UI は、**閉じたときに
+	 * `event.preventDefault()` してイベントを消費する**こと（`Drawer`/`Modal` は
+	 * 既にそうなっている。サイドバーのオフキャンバスは `role` を持たず
+	 * {@link LAYER_ABOVE_SELECTOR} で拾えないので、`(app)/+layout.svelte` の Esc
+	 * ハンドラ側で同じ約束を守っている）。この部品は `defaultPrevented` と
+	 * {@link hasVisibleLayerAbove} の2つでその層を尊重する。
+	 *
 	 * 2段構えなのは `stopPropagation` の効き方の都合:
 	 * 1. **左ペイン要素**の keydown（開いたらフォーカスは左ペイン内にあるので
 	 *    ここを通る）で `preventDefault` + `stopPropagation` する。window まで
 	 *    バブルさせないので、window に張られた他のハンドラは呼ばれない
 	 *    （同じ window 上のリスナー同士では `stopPropagation` が効かないため、
-	 *    window 側で止めるのでは間に合わない）。
+	 *    window 側で止めるのでは間に合わない）。**ただし可視な上位層があるあいだ
+	 *    は何もせずバブルさせる**（#381 レビュー対応3回目）: `Drawer` はタブ移動を
+	 *    閉じ込めないので、ダイアログが出たままフォーカスだけが左ペインへ戻って
+	 *    いることがあり、そこで消費すると手前のダイアログに Esc が届かない。
 	 * 2. 念のため window にも張る（フォーカスが左ペイン外にある場合の保険）。
 	 *    1 で処理済みのイベントは `defaultPrevented` で弾き、さらに
 	 *    **この退避パネルより手前に重なっている一時的な UI が出ていれば譲る**
@@ -195,6 +222,9 @@
 
 		const onPaneKeydown = (event: KeyboardEvent): void => {
 			if (event.key !== 'Escape') return;
+			// 手前に層が出ているあいだは消費せずバブルさせる（上の doc の
+			// 「層の約束」。フォーカスだけが左ペインへ戻っている場合がある）。
+			if (hasVisibleLayerAbove()) return;
 			event.preventDefault();
 			event.stopPropagation();
 			closeLeft();

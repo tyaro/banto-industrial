@@ -31,7 +31,18 @@
 		}
 
 		// T19 S3-a（UX-43）: オフキャンバスが開いていれば Escape で閉じる。
+		//
+		// #381 レビュー対応3回目（層の約束）: **閉じたときはイベントを消費する**
+		// （`event.preventDefault()`）。重なりは「上から1層ずつ Esc で畳む」もの
+		// で、サイドバー（z-index 710）はタグ画面の退避ツリー（610、
+		// `SplitPane.svelte`）より手前にある。消費しないと、同じ Esc で
+		// `SplitPane` の window フォールバックも走り、サイドバーとツリーが
+		// 一度に閉じる（`SplitPane` は `defaultPrevented` を見て譲る）。
+		// サイドバーは `role="dialog"` 等を名乗らない常設ナビなので、
+		// `SplitPane` 側のセレクタでは拾えない（同部品は banto-hub の DOM を
+		// 知らないアプリ非依存の規約）— この約束を守るのはこちらの責務。
 		if (event.key === 'Escape' && mobileNavStore.open) {
+			event.preventDefault();
 			mobileNavStore.closeNav();
 		}
 	}

@@ -301,7 +301,28 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(treePane).toBeHidden();
 	});
 
-	test('8. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
+	test('8. サイドバーと退避ツリーが両方開いていても、Esc は1層ずつ畳む（#381 レビュー対応3回目）', async () => {
+		await treeToggle.click();
+		await expect(treePane).toBeVisible();
+
+		// ☰ はヘッダーにあり、退避ツリーのバックドロップ（`.split-pane` の中
+		// だけを覆う）には隠れないので、ツリーを開いたままサイドバーも開ける。
+		// サイドバー（z-index 710）はツリー（610）より手前の層。
+		await page.getByRole('button', { name: 'メニューを開く' }).click();
+		await expect(page.getByRole('button', { name: 'メニューを閉じる', exact: true })).toBeVisible();
+
+		// 1回目の Esc: 手前のサイドバーだけが閉じる（レイアウト側の Esc ハンドラが
+		// `preventDefault` してイベントを消費し、`SplitPane` は譲る）。
+		await page.keyboard.press('Escape');
+		await expect(page.getByRole('button', { name: 'メニューを開く' })).toBeVisible();
+		await expect(treePane).toBeVisible();
+
+		// 2回目の Esc: 今度はツリーが閉じる。
+		await page.keyboard.press('Escape');
+		await expect(treePane).toBeHidden();
+	});
+
+	test('9. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
 		await page.goto('/monitor');
 		await expect(page.getByRole('heading', { level: 2, name: 'タグモニタ' })).toBeVisible();
 

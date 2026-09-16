@@ -61,6 +61,7 @@
 		type Tag
 	} from '$lib/banto/tagRegistryAdmin';
 	import { filterMonitorRows, type MonitorTreeFilter } from '$lib/banto/monitorFilter';
+	import { pruneTreeFilter } from '$lib/banto/treeFilterPrune';
 	import { subscriptionPatternsFor } from '$lib/banto/monitorSubscription';
 	import { applyTagValues, mergeTagValues, type RowValue } from '$lib/banto/monitorValues';
 	import SplitPane from '$lib/components/SplitPane.svelte';
@@ -223,6 +224,29 @@
 	 * `narrow`/`leftOpen`）。
 	 */
 	let treeOpen = $state(false);
+
+	/**
+	 * #381 レビュー対応3回目: 選択中の接続・収集グループが消えたら「すべて」へ
+	 * 戻す（タグ登録ページと同じ純関数 `pruneTreeFilter`。理由は同ファイルの
+	 * doc comment 参照 - 消えた id で絞られたままだと一覧が常に空になり、
+	 * #378 の選択中表示とも食い違う）。`treeFilter` は購読範囲
+	 * （`subscriptionPatternsFor`）にも使うので、戻せば購読も全件へ戻る。
+	 */
+	$effect(() => {
+		const pruned = pruneTreeFilter(treeFilter, connections, groups);
+		if (pruned !== treeFilter) treeFilter = pruned;
+	});
+
+	/**
+	 * #381 レビュー対応3回目: **行が0件になったら退避パネルも閉じる。**
+	 * この画面は `rows.length > 0` のときだけ `SplitPane` をマウントするため、
+	 * 開いたまま最後のタグが消える（または一時的に空のカタログが返る）と
+	 * `treeOpen === true` のままアンマウントされ、行が戻ったときに**トグル操作
+	 * なしで開いた状態で再マウント**されてしまう。
+	 */
+	$effect(() => {
+		if (rows.length === 0 && treeOpen) treeOpen = false;
+	});
 
 	/** #378: 閉じていても何で絞られているか分かるよう、トグルの隣に出す選択名。 */
 	const treeSelectionLabel = $derived.by((): string => {

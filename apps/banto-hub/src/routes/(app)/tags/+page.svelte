@@ -29,6 +29,7 @@
 	import { deferredDelete, UNDO_WINDOW_MS } from '$lib/banto/deferredDelete.svelte';
 	import { sessionStore } from '$lib/session.svelte';
 	import { mobileNavStore } from '$lib/mobileNav.svelte';
+	import { pruneTreeFilter } from '$lib/banto/treeFilterPrune';
 	import { canWriteResources } from '$lib/permissions';
 	import Drawer from '$lib/components/Drawer.svelte';
 	import Modal from '$lib/components/Modal.svelte';
@@ -2948,6 +2949,19 @@
 	 * 行き来して値が残っても害は無い。
 	 */
 	let treeOpen = $state(false);
+
+	/**
+	 * #381 レビュー対応3回目: **選択中の接続・収集グループが消えたら「すべて」へ
+	 * 戻す。** `reload()` はカタログを取り直すだけで `treeFilter` を見ていなかった
+	 * ため、削除された id で絞られたまま（＝グリッドが常に空）になり、#378 で
+	 * 足した選択中表示はその id の名前を引けずに「すべて」と出て食い違っていた。
+	 * 判定は依存ゼロの純関数 `pruneTreeFilter`（`$lib/banto/treeFilterPrune.ts`、
+	 * vitest 済み）で、同一参照を返してくれるので変わったときだけ書き戻す。
+	 */
+	$effect(() => {
+		const pruned = pruneTreeFilter(treeFilter, connections, groups);
+		if (pruned !== treeFilter) treeFilter = pruned;
+	});
 
 	/**
 	 * #378: ツリーを閉じていても「何で絞り込まれているか」が分かるよう、
