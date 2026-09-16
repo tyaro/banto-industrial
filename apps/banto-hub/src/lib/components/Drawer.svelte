@@ -21,6 +21,7 @@
 	import type { Snippet } from 'svelte';
 	import { fade, fly } from 'svelte/transition';
 	import { isCloseAllowed } from './drawerCloseGuard';
+	import { hasVisibleLayerAbove } from './escLayering';
 
 	interface Props {
 		open: boolean;
@@ -73,6 +74,9 @@
 		children
 	}: Props = $props();
 
+	/** 自分自身のパネル（`role="dialog"`）。層の約束の「自分以外」の判定に使う。 */
+	let panelEl: HTMLDivElement | undefined = $state();
+
 	/** `onRequestClose` 経由でクローズ可否を判定し、許可された場合だけ `onclose` を呼ぶ。 */
 	function requestClose(): void {
 		if (onRequestClose && !onRequestClose()) return;
@@ -81,6 +85,12 @@
 
 	function handleWindowKeydown(event: KeyboardEvent): void {
 		if (open && event.key === 'Escape') {
+			// 層の約束（`escLayering.ts` の doc が正、#381 レビュー対応5回目):
+			// 自分より手前に別の層（コマンドパレット等）が出ていれば譲る。
+			// `defaultPrevented` だけでは足りない - window リスナーは登録順に走り、
+			// **先に開いていたこの Drawer のリスナーが後から開いたパレットより先**
+			// に実行されるので、この時点ではまだ消費されていない。
+			if (event.defaultPrevented || hasVisibleLayerAbove({ except: panelEl })) return;
 			event.preventDefault();
 			if (!isCloseAllowed('escape', dirty)) {
 				onBlockedClose?.();
@@ -123,6 +133,7 @@
 	>
 		<div
 			class="drawer"
+			bind:this={panelEl}
 			role="dialog"
 			aria-modal="true"
 			aria-label={title}

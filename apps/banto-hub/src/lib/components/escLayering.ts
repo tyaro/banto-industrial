@@ -46,9 +46,16 @@ export const LAYER_ABOVE_SELECTOR = '[role="dialog"], [role="menu"]';
  * 閉じている Drawer/Modal/メニューは `{#if open}` で DOM ごと消えるが、
  * `display: none` や `visibility: hidden` で閉じるものが将来混じっても
  * 誤検出しないよう、矩形の有無と計算済みスタイルの両方で可視性を見る。
+ *
+ * `except` に**自分自身の要素**（`role="dialog"` を名乗る要素そのもの）を渡すと、
+ * それ自身と**それを包む層**は数えない＝「**自分より手前に**別の層が出ているか」に
+ * なる。自身も上位層である `Drawer`/`Modal` が使う（#381 レビュー対応5回目）。
+ * 自分の**中**に出ている層（ドロワー内のメニュー等）は手前なので数える。
  */
-export function hasVisibleLayerAbove(): boolean {
+export function hasVisibleLayerAbove(options: { except?: Element | null } = {}): boolean {
+	const except = options.except ?? null;
 	for (const el of document.querySelectorAll(LAYER_ABOVE_SELECTOR)) {
+		if (except && (el === except || el.contains(except))) continue;
 		if (el.getClientRects().length === 0) continue;
 		const style = getComputedStyle(el);
 		if (style.display === 'none' || style.visibility === 'hidden') continue;

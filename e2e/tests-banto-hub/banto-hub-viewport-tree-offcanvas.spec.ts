@@ -352,7 +352,53 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(treePane).toBeHidden();
 	});
 
-	test('10. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
+	test('10. メニューを開いたまま狭幅へ変わっても、閉じたフォーカスは生きた要素へ戻る（#381 レビュー対応5回目）', async () => {
+		// 広幅ではツリーが常時表示なので、そこでノードを右クリックしてから狭幅へ
+		// 変える。狭幅になった瞬間に退避パネルは閉じ（`inert`）、メニューが覚えて
+		// いる戻り先（ツリーノード）は不活性の中に取り残される。
+		await page.setViewportSize({ width: 1280, height: 800 });
+		await groupNodeByName(page, GROUP_A).click({ button: 'right' });
+		const menu = page.getByRole('menu', { name: '作成メニュー' });
+		await expect(menu).toBeVisible();
+
+		await page.setViewportSize(NARROW_VIEWPORT);
+		await expect(treePane).toBeHidden();
+		await expect(menu).toBeVisible();
+
+		await page.keyboard.press('Escape');
+		await expect(menu).toHaveCount(0);
+
+		// フォーカスは `<body>` へ落ちず、開き直せるトグルボタンへ送られる。
+		await expect
+			.poll(() => page.evaluate(() => document.activeElement?.getAttribute('data-testid') ?? null))
+			.toBe('tag-tree-toggle');
+	});
+
+	test('11. Drawer の上にコマンドパレットを重ねても、Esc は1層ずつ畳む（#381 レビュー対応5回目）', async () => {
+		// 狭幅の編集フォームは `<Drawer>`（z-index 900）。その上に `Ctrl+K` で
+		// コマンドパレット（1000）を重ねる。Drawer の window Esc ハンドラは
+		// **パレットより先に登録されている**（先に開いたので）ため、
+		// `defaultPrevented` だけを見ていると同じ Esc で2層とも閉じてしまう。
+		await page.getByPlaceholder('名前・アドレスで検索').fill(TAG_A);
+		await page.getByRole('gridcell', { name: TAG_A, exact: true }).click();
+		const editDrawer = page.getByRole('dialog', { name: `${TAG_A} を編集` });
+		await expect(editDrawer).toBeVisible();
+
+		await page.keyboard.press('Control+k');
+		const palette = page.getByRole('dialog', { name: 'コマンドパレット' });
+		await expect(palette).toBeVisible();
+
+		await page.keyboard.press('Escape');
+		await expect(palette).toHaveCount(0);
+		await expect(editDrawer).toBeVisible();
+
+		await page.keyboard.press('Escape');
+		await expect(editDrawer).toBeHidden();
+
+		await page.getByPlaceholder('名前・アドレスで検索').fill('');
+	});
+
+	test('12. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
 		await page.goto('/monitor');
 		await expect(page.getByRole('heading', { level: 2, name: 'タグモニタ' })).toBeVisible();
 

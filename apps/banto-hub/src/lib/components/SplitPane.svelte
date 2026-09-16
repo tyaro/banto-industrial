@@ -23,6 +23,7 @@
 	import type { Snippet } from 'svelte';
 	import { untrack } from 'svelte';
 	import { hasVisibleLayerAbove, LAYER_ABOVE_SELECTOR } from './escLayering';
+	import { restoreFocus } from './focusRestore';
 
 	interface Props {
 		/** 左ペイン幅（CSS の長さ文字列）。既定 280px。 */
@@ -148,7 +149,10 @@
 			} else {
 				const previous = triggerEl;
 				triggerEl = null;
-				previous?.focus();
+				// 戻り先が消えている / `inert` の中にいることがある（この部品ごと
+				// アンマウントされる呼び出し方もある）ので `restoreFocus` 経由で
+				// 安全に戻す（`focusRestore.ts`）。代わりの行き先は持たない。
+				restoreFocus(previous);
 			}
 		});
 	});

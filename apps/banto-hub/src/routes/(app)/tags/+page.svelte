@@ -30,6 +30,7 @@
 	import { sessionStore } from '$lib/session.svelte';
 	import { mobileNavStore } from '$lib/mobileNav.svelte';
 	import { pruneTreeFilter } from '$lib/banto/treeFilterPrune';
+	import { restoreFocus } from '$lib/components/focusRestore';
 	import { canWriteResources } from '$lib/permissions';
 	import Drawer from '$lib/components/Drawer.svelte';
 	import Modal from '$lib/components/Modal.svelte';
@@ -2951,6 +2952,13 @@
 	let treeOpen = $state(false);
 
 	/**
+	 * #381 レビュー対応5回目: 狭幅のツリートグル本体。コンテキストメニューを
+	 * 閉じたときに戻り先（ツリーノード）が `inert` の中で戻せない場合の
+	 * フォーカスの受け皿にする（`closeTreeContextMenu`）。
+	 */
+	let treeToggleEl: HTMLButtonElement | undefined = $state();
+
+	/**
 	 * #381 レビュー対応3回目: **選択中の接続・収集グループが消えたら「すべて」へ
 	 * 戻す。** `reload()` はカタログを取り直すだけで `treeFilter` を見ていなかった
 	 * ため、削除された id で絞られたまま（＝グリッドが常に空）になり、#378 で
@@ -3099,7 +3107,12 @@
 	function closeTreeContextMenu(): void {
 		const trigger = treeContextMenu?.triggerEl;
 		treeContextMenu = null;
-		trigger?.focus();
+		// #381 レビュー対応5回目: 戻り先（右クリックしたツリーノード）が
+		// **`inert` の中に入っていることがある** - メニューを開いたまま広幅→狭幅へ
+		// 変わると、退避パネルが閉じた状態で現れてノードごと不活性になる。その
+		// ときはフォーカスを `<body>` へ落とさず、ツリーを開き直せるトグル
+		// ボタンへ送る（`focusRestore.ts`）。
+		restoreFocus(trigger, () => treeToggleEl?.focus());
 	}
 
 	/**
@@ -6017,6 +6030,7 @@
 									type="button"
 									class="secondary tree-toggle"
 									data-testid="tag-tree-toggle"
+									bind:this={treeToggleEl}
 									aria-expanded={treeOpen}
 									aria-controls="tags-tree-pane"
 									onclick={() => (treeOpen = !treeOpen)}
