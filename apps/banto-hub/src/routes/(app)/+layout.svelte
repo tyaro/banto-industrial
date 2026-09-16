@@ -11,6 +11,7 @@
 	import Header from '$lib/components/Header.svelte';
 	import Sidebar from '$lib/components/Sidebar.svelte';
 	import CommandPalette from '$lib/components/CommandPalette.svelte';
+	import { hasVisibleLayerAbove } from '$lib/components/escLayering';
 	import { listPendingChanges } from '$lib/banto/pendingChangesAdmin';
 	import { countUnappliedPendingChanges } from '$lib/banto/pendingUnappliedCount';
 	import { commandPaletteStore } from '$lib/commandPalette.svelte';
@@ -32,18 +33,20 @@
 
 		// T19 S3-a（UX-43）: オフキャンバスが開いていれば Escape で閉じる。
 		//
-		// #381 レビュー対応3回目（層の約束）: **閉じたときはイベントを消費する**
-		// （`event.preventDefault()`）。重なりは「上から1層ずつ Esc で畳む」もの
-		// で、サイドバー（z-index 710）はタグ画面の退避ツリー（610、
-		// `SplitPane.svelte`）より手前にある。消費しないと、同じ Esc で
-		// `SplitPane` の window フォールバックも走り、サイドバーとツリーが
-		// 一度に閉じる（`SplitPane` は `defaultPrevented` を見て譲る）。
-		// サイドバーは `role="dialog"` 等を名乗らない常設ナビなので、
-		// `SplitPane` 側のセレクタでは拾えない（同部品は banto-hub の DOM を
-		// 知らないアプリ非依存の規約）— この約束を守るのはこちらの責務。
-		if (event.key === 'Escape' && mobileNavStore.open) {
-			event.preventDefault();
-			mobileNavStore.closeNav();
+		// #381 レビュー対応（層の約束 - **正は `escLayering.ts` の doc**）:
+		// サイドバー（z-index 710）は、より手前の層（Drawer/Modal 900、
+		// コマンドパレット・コンテキストメニュー 1000）には譲り、自分より下の層
+		// （タグ画面の退避ツリー 610、`SplitPane.svelte`）には**閉じたことを
+		// `preventDefault` で知らせる**。サイドバーは `role="dialog"` 等を
+		// 名乗らない常設ナビで `SplitPane` 側のセレクタからは見えないため
+		// （同部品は banto-hub の DOM を知らないアプリ非依存の規約）、この約束を
+		// 守るのはこちらの責務。
+		if (event.key === 'Escape') {
+			if (event.defaultPrevented || hasVisibleLayerAbove()) return;
+			if (mobileNavStore.open) {
+				event.preventDefault();
+				mobileNavStore.closeNav();
+			}
 		}
 	}
 

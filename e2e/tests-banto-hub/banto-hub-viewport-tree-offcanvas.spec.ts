@@ -322,7 +322,37 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(treePane).toBeHidden();
 	});
 
-	test('9. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
+	test('9. ツリー・サイドバー・コマンドパレットが重なっても、Esc は手前から1層ずつ畳む（#381 レビュー対応4回目）', async () => {
+		// 3層を下から順に開く（退避ツリー 610 → サイドバー 710 →
+		// コマンドパレット 1000。`escLayering.ts` の層の表）。パレットは
+		// `Ctrl+K` で開く - サイドバーのバックドロップがヘッダーの 🔍 を覆うため、
+		// この状態でパレットを開く経路はキーボードになる。
+		await treeToggle.click();
+		await expect(treePane).toBeVisible();
+		await page.getByRole('button', { name: 'メニューを開く' }).click();
+		await expect(page.getByRole('button', { name: 'メニューを閉じる', exact: true })).toBeVisible();
+		await page.keyboard.press('Control+k');
+
+		// コマンドパレットは `role="dialog"`（`CommandPalette.svelte`）なので、
+		// 下の2層はどちらもこれを「可視な上位層」として認識して譲る。
+		const palette = page.getByRole('dialog', { name: 'コマンドパレット' });
+		await expect(palette).toBeVisible();
+
+		await page.keyboard.press('Escape');
+		await expect(palette).toHaveCount(0);
+		// サイドバーもツリーも道連れにならない。
+		await expect(page.getByRole('button', { name: 'メニューを閉じる', exact: true })).toBeVisible();
+		await expect(treePane).toBeVisible();
+
+		await page.keyboard.press('Escape');
+		await expect(page.getByRole('button', { name: 'メニューを開く' })).toBeVisible();
+		await expect(treePane).toBeVisible();
+
+		await page.keyboard.press('Escape');
+		await expect(treePane).toBeHidden();
+	});
+
+	test('10. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
 		await page.goto('/monitor');
 		await expect(page.getByRole('heading', { level: 2, name: 'タグモニタ' })).toBeVisible();
 

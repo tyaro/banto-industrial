@@ -22,6 +22,7 @@
 	 */
 	import type { Snippet } from 'svelte';
 	import { untrack } from 'svelte';
+	import { hasVisibleLayerAbove, LAYER_ABOVE_SELECTOR } from './escLayering';
 
 	interface Props {
 		/** 左ペイン幅（CSS の長さ文字列）。既定 280px。 */
@@ -83,29 +84,6 @@
 
 	function closeLeft(): void {
 		leftOpen = false;
-	}
-
-	/**
-	 * #378: この退避パネル（z-index 610）より手前に重なる一時的な UI が名乗る
-	 * role。`dialog` = `Drawer`/`Modal`（900）、`menu` = `TreeContextMenu`（1000）。
-	 * 下の Esc の doc comment 参照。
-	 */
-	const LAYER_ABOVE_SELECTOR = '[role="dialog"], [role="menu"]';
-
-	/**
-	 * #381 レビュー対応（2回目）: **可視な**上位層が出ているか。閉じている
-	 * Drawer/Modal は `{#if open}` で DOM ごと消えるが、`display: none` や
-	 * `visibility: hidden` で閉じるものが将来混じっても誤検出しないよう、
-	 * 矩形の有無と計算済みスタイルの両方で可視性を見る。
-	 */
-	function hasVisibleLayerAbove(): boolean {
-		for (const el of document.querySelectorAll(LAYER_ABOVE_SELECTOR)) {
-			if (el.getClientRects().length === 0) continue;
-			const style = getComputedStyle(el);
-			if (style.display === 'none' || style.visibility === 'hidden') continue;
-			return true;
-		}
-		return false;
 	}
 
 	/** 開いた直後、左ペイン内の最初のフォーカス可能要素へフォーカスする（`Drawer.svelte` と同じ最小限）。 */
@@ -182,39 +160,21 @@
 	 * タグ登録のトグルと同じ作法）。閉じているときは何もしない — 他のハンドラに
 	 * 任せる。
 	 *
-	 * **層の約束（#381 レビュー対応3回目）**: 重なりは「上から1層ずつ Esc で
-	 * 畳む」。この退避パネルより手前に出る UI は、**閉じたときに
-	 * `event.preventDefault()` してイベントを消費する**こと（`Drawer`/`Modal` は
-	 * 既にそうなっている。サイドバーのオフキャンバスは `role` を持たず
-	 * {@link LAYER_ABOVE_SELECTOR} で拾えないので、`(app)/+layout.svelte` の Esc
-	 * ハンドラ側で同じ約束を守っている）。この部品は `defaultPrevented` と
-	 * {@link hasVisibleLayerAbove} の2つでその層を尊重する。
+	 * **層の約束（上位層があるあいだは反応しない・閉じるときは消費する）は
+	 * `escLayering.ts` の doc が正**。ここはそれを守る側で、`defaultPrevented` と
+	 * {@link hasVisibleLayerAbove} の2つで上位層（Drawer/Modal・コマンド
+	 * パレット・コンテキストメニュー）へ譲る。
 	 *
 	 * 2段構えなのは `stopPropagation` の効き方の都合:
 	 * 1. **左ペイン要素**の keydown（開いたらフォーカスは左ペイン内にあるので
 	 *    ここを通る）で `preventDefault` + `stopPropagation` する。window まで
 	 *    バブルさせないので、window に張られた他のハンドラは呼ばれない
 	 *    （同じ window 上のリスナー同士では `stopPropagation` が効かないため、
-	 *    window 側で止めるのでは間に合わない）。**ただし可視な上位層があるあいだ
-	 *    は何もせずバブルさせる**（#381 レビュー対応3回目）: `Drawer` はタブ移動を
-	 *    閉じ込めないので、ダイアログが出たままフォーカスだけが左ペインへ戻って
-	 *    いることがあり、そこで消費すると手前のダイアログに Esc が届かない。
+	 *    window 側で止めるのでは間に合わない）。
 	 * 2. 念のため window にも張る（フォーカスが左ペイン外にある場合の保険）。
-	 *    1 で処理済みのイベントは `defaultPrevented` で弾き、さらに
-	 *    **この退避パネルより手前に重なっている一時的な UI が出ていれば譲る**
-	 *    （#381 レビュー対応B・2回目）。一般則は「上に重なっているものから順に
-	 *    Esc で閉じる」なので、判定は**発生元（`event.target`）ではなく「可視な
-	 *    上位層が存在するか」**で行う（{@link hasVisibleLayerAbove}）:
-	 *    `Drawer.svelte` は**タブ移動を閉じ込めない**（同ファイル冒頭 doc）ため、
-	 *    Drawer が開いたままフォーカスがその外へ出ている状態がありえて、
-	 *    発生元だけを見る判定はそこをすり抜けて「Drawer と退避パネルが両方
-	 *    閉じる」ことになる。`target.closest(...)` は同じ結論に早く達する
-	 *    近道として併用するだけ。
-	 *
-	 *    上位層は**その種の UI が名乗る role**（`dialog` = `Drawer`/`Modal`、
-	 *    `menu` = `TreeContextMenu`）で拾う - どれも z-index はこの退避パネル
-	 *    （610）より上（900 / 1000、下の CSS コメント参照）。新しく重なる UI を
-	 *    足すときは、その role を {@link LAYER_ABOVE_SELECTOR} へ加えること。
+	 *    1 で処理済みのイベントは `defaultPrevented` で弾く。`target.closest(...)`
+	 *    は {@link hasVisibleLayerAbove} と同じ結論に早く達する近道として併用する
+	 *    だけ（発生元だけを見る判定では足りない理由は `escLayering.ts` の doc）。
 	 */
 	$effect(() => {
 		if (!offcanvasOpen) return;
