@@ -511,6 +511,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "banto-hub-bootstrap"
+version = "0.1.0"
+dependencies = [
+ "banto-tagclient",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "banto-hub-core"
 version = "0.2.0-alpha.20"
 dependencies = [
@@ -1004,6 +1017,7 @@ name = "chronogazer"
 version = "0.2.0-alpha.20"
 dependencies = [
  "banto-core",
+ "banto-hub-bootstrap",
  "banto-server",
  "chronogazer-core",
  "futures-util",
@@ -1026,13 +1040,16 @@ dependencies = [
  "axum 0.8.9",
  "banto-collect",
  "banto-core",
+ "banto-hub-bootstrap",
  "banto-plc",
  "banto-server",
  "banto-storage",
+ "banto-tagclient",
  "banto-tags",
  "banto-tsquery",
  "banto-tstore",
  "futures-util",
+ "getrandom 0.4.3",
  "password-hash",
  "rust-embed",
  "serde",

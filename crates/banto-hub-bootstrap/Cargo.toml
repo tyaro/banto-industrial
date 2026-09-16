@@ -1,0 +1,29 @@
+[package]
+name = "banto-hub-bootstrap"
+description = "Zero-config banto-hub client bootstrap: commissioning probe, self-issued API key, keyring hand-off"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The catalog check (`GET /api/v1/tags`) is delegated to this crate's
+# `RestClient::fetch_catalog` rather than re-implemented here - see the
+# `lib.rs` module doc's "境界" section.
+banto-tagclient = { path = "../banto-tagclient" }
+# The two admin endpoints (`GET /api/commissioning/status`,
+# `POST /api/api-keys[/{id}/revoke]`) plus the 401/403 disambiguation probe.
+# Same `default-features = false` (no TLS) choice as `banto-tagclient`:
+# banto-hub is plain HTTP on a closed LAN (tag-server-design.md §5.6).
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Safe, secret-free diagnostics, same redaction invariant as
+# `banto-tagclient::error` (never log the key, never log the path prefix).
+tracing = { workspace = true }
+# The plaintext key only ever exists inside a `Zeroizing<String>` between
+# the issue response and the `KeyStore`; it is never returned to callers.
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

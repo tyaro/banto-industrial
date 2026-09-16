@@ -40,10 +40,16 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 qrcode = { workspace = true }
 futures-util = { workspace = true }
-# OS keyring storage for the auto-login credential (spec M11). See the
-# workspace `Cargo.toml`'s comment on this dependency for why it lives only
-# here and not on `chronogazer-core`.
+# OS keyring storage for the auto-login credential (spec M11) and, since
+# #332, the self-issued banto-hub API key. See the workspace `Cargo.toml`'s
+# comment on this dependency for why it lives only here and not on
+# `chronogazer-core`.
 keyring = { workspace = true }
+# #332: the `KeyStore` trait `keyring_store::KeyringKeyStore` implements.
+# `chronogazer-core` owns the rest of the wiring (`chronogazer_core::hub`);
+# this crate only supplies the OS-keyring half, which is exactly why that
+# trait exists.
+banto-hub-bootstrap = { path = "../../../crates/banto-hub-bootstrap" }
 
 # `#[tokio::test]` for this crate's own unit tests (spec M14: the
 # `change_own_password` audit-recording test) - the runtime/macros features

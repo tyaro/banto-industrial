@@ -29,6 +29,7 @@ use chronogazer_core::audit::{AuditEntry, AuditLogEntry, AuditLogService};
 use chronogazer_core::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 use chronogazer_core::db::init_db;
 use chronogazer_core::events::event_channel;
+use chronogazer_core::hub::{HubService, HubView};
 use chronogazer_core::rest::{api_router, audited_credential_verifier};
 use chronogazer_core::settings::{AuditSettings, AuthSettings, ServerSettings, SettingsService};
 use chronogazer_core::users::{Role, UserIdentity, UserSummary, UsersService};
@@ -83,6 +84,13 @@ struct AppState {
     /// pool as `users`/`settings` (all three are `Clone` handles onto
     /// the one on-disk SQLite DB, see `run()`'s `setup()`).
     audit: AuditLogService,
+    /// Hub 接続（#332）: banto-hub への自動接続 bootstrap。OS キーリング
+    /// （`keyring_store::KeyringKeyStore`）と設定 KV を
+    /// `chronogazer_core::hub` が結び付けたもの。`Clone` ハンドル（内部は
+    /// `Arc`）なので、`start_embedded_server` にも同じ実体を渡して LAN
+    /// ブラウザの `/api/hub/*` とデスクトップの `hub_*` コマンドが同じ
+    /// 設定・同じキーリングを見るようにする。
+    hub: HubService,
     /// Backup/restore (spec M17): `VACUUM INTO` snapshots into `backups/`
     /// next to the DB file, plus the restore staging flow. Shares the same
     /// pool as `users`/`settings`/`audit` - only its `db_path` is
@@ -616,6 +624,7 @@ async fn start_embedded_server(
     settings: SettingsService,
     audit: AuditLogService,
     backup: BackupService,
+    hub: HubService,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
     config: ServerConfig,
@@ -624,7 +633,7 @@ async fn start_embedded_server(
     // the `auth_setup` command above (`invoke()`, no network involved), not
     // this REST endpoint. Only `banto-serve` (this repo's Tauri-free dev
     // vehicle) opts into `POST /api/auth/setup` via `BANTO_ALLOW_SETUP=1`.
-    let router = api_router(users, settings, audit, backup, auth, events, false)
+    let router = api_router(users, settings, audit, backup, hub, auth, events, false)
         .merge(static_router::<FrontendAssets>());
     start(config, router).await
 }
@@ -672,6 +681,7 @@ async fn server_apply(
                 state.settings.clone(),
                 state.audit.clone(),
                 state.backup.clone(),
+                state.hub.clone(),
                 state.rest_auth.clone(),
                 state.events.clone(),
                 ServerConfig {
@@ -1257,6 +1267,134 @@ async fn backups_cancel_restore(state: State<'_, AppState>) -> Result<(), BantoE
     backups_cancel_restore_body(&state).await
 }
 
+// --- #332: Hub 接続 ----------------------------------------------------------
+
+/// `GET`-ish command: 保存済み設定での Hub 接続状態（6 状態）とタグ一覧。
+/// `admin` 限定（他のサーバー/設定系コマンドと同じ下限）。
+///
+/// **キーの発行は行わない** - 設定画面を開いただけで banto-hub にキーが
+/// 増えないようにするため（発行は `hub_connect` だけ）。
+#[tauri::command]
+async fn hub_status(state: State<'_, AppState>) -> Result<HubView, BantoError> {
+    require_role(&state, Role::Admin, "settings").await?;
+    state.hub.status().await
+}
+
+/// 接続（保存済みキーがあれば再利用、無ければ試運転中の Hub にのみ `read`
+/// スコープのキーを自己発行）。`admin` 限定。
+#[tauri::command]
+async fn hub_connect(state: State<'_, AppState>, endpoint: String) -> Result<HubView, BantoError> {
+    let actor = require_role(&state, Role::Admin, "settings").await?;
+    let view = state.hub.connect(&endpoint).await?;
+    // 監査 detail に入れてよいのは接続先と結果の状態まで。平文キーはどの
+    // 経路にも出さない。
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "settings_change",
+            resource: "settings",
+            entity_id: None,
+            detail: Some(
+                serde_json::json!({ "hubEndpoint": endpoint, "hubStatus": view.status.as_str() }),
+            ),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(view)
+}
+
+/// タグ一覧の再取得。`admin` 限定。
+#[tauri::command]
+async fn hub_refresh_catalog(state: State<'_, AppState>) -> Result<HubView, BantoError> {
+    require_role(&state, Role::Admin, "settings").await?;
+    state.hub.refresh_catalog().await
+}
+
+/// 選択タグの保存。空配列も正当な入力。`admin` 限定。
+#[tauri::command]
+async fn hub_set_selected_tags(
+    state: State<'_, AppState>,
+    tags: Vec<String>,
+) -> Result<(), BantoError> {
+    let actor = require_role(&state, Role::Admin, "settings").await?;
+    let count = tags.len();
+    state.hub.set_selected_tags(tags).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "settings_change",
+            resource: "settings",
+            entity_id: None,
+            detail: Some(serde_json::json!({ "hubSelectedTagCount": count })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(())
+}
+
+/// ロックダウン済み Hub 向けの手動連携: 管理者が発行した API キーを採用
+/// する。`admin` 限定。
+///
+/// `key` は**ログにも監査 detail にも出さない**（`autologin_enable` が
+/// パスワードを出さないのと同じ扱い）。平文は
+/// `keyring_store::KeyringKeyStore` 経由で OS キーリングにだけ入る。
+#[tauri::command]
+async fn hub_adopt_manual_key(
+    state: State<'_, AppState>,
+    endpoint: String,
+    key: String,
+) -> Result<HubView, BantoError> {
+    let actor = require_role(&state, Role::Admin, "settings").await?;
+    let view = state.hub.adopt_manual_key(&endpoint, key).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "settings_change",
+            resource: "settings",
+            entity_id: None,
+            detail: Some(serde_json::json!({
+                "hubEndpoint": endpoint,
+                "hubKeyAdopted": true,
+                "hubStatus": view.status.as_str(),
+            })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(view)
+}
+
+/// 切断: ローカルの設定とキーリングだけを消す。**Hub 側のキーは失効させ
+/// ない**（他のインストールを巻き込まないため - crate 側 `disconnect` の
+/// doc comment参照）。`admin` 限定。
+#[tauri::command]
+async fn hub_disconnect(state: State<'_, AppState>) -> Result<HubView, BantoError> {
+    let actor = require_role(&state, Role::Admin, "settings").await?;
+    let view = state.hub.disconnect().await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "settings_change",
+            resource: "settings",
+            entity_id: None,
+            detail: Some(serde_json::json!({ "hubDisconnected": true })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(view)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -1461,6 +1599,16 @@ pub fn run() {
                 None
             };
 
+            // #332: Hub 接続。`HubService::new` は `installation_id` を設定
+            // から読む（無ければ生成して保存する）ので非同期 - 他の起動時の
+            // 読み取りと同じく `block_on` する。失敗は起動を止める（設定 DB
+            // が書けない状態であり、他のサービスも同様に `expect` している）。
+            let hub = tauri::async_runtime::block_on(HubService::new(
+                settings.clone(),
+                std::sync::Arc::new(keyring_store::KeyringKeyStore),
+            ))
+            .expect("HubService should initialize");
+
             // If LAN access was left enabled on a previous run, start the
             // server immediately (spec §11.4) - from here on, the settings
             // screen only needs to *change* state via `server_apply`.
@@ -1492,6 +1640,7 @@ pub fn run() {
                     settings.clone(),
                     audit.clone(),
                     backup.clone(),
+                    hub.clone(),
                     rest_auth.clone(),
                     events.clone(),
                     runtime_config,
@@ -1554,6 +1703,7 @@ pub fn run() {
                 server: AsyncMutex::new(initial_server),
                 audit,
                 backup,
+                hub,
             });
 
             Ok(())
@@ -1593,6 +1743,12 @@ pub fn run() {
             backups_stage_restore,
             backups_pending,
             backups_cancel_restore,
+            hub_status,
+            hub_connect,
+            hub_refresh_catalog,
+            hub_set_selected_tags,
+            hub_adopt_manual_key,
+            hub_disconnect,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1655,10 +1811,20 @@ mod tests {
             .await
             .expect("init_db_memory");
         let events = event_channel();
+        let settings = SettingsService::new(pool.clone());
+        // #332: tests never touch a real OS keyring - `UnavailableKeyStore`
+        // reads as "no entry" and refuses to write, so no test can leave a
+        // plaintext key in the developer's keychain.
+        let hub = HubService::new(
+            settings.clone(),
+            std::sync::Arc::new(chronogazer_core::hub::UnavailableKeyStore),
+        )
+        .await
+        .expect("HubService::new");
         AppState {
             auth: Mutex::new(None),
             users: UsersService::new(pool.clone()),
-            settings: SettingsService::new(pool.clone()),
+            settings,
             events,
             rest_auth: AuthState::new(|_u: String, _p: String| {
                 Box::pin(async { None::<banto_server::Identity> })
@@ -1669,6 +1835,7 @@ mod tests {
                 PathBuf::from("unused-in-tests").join("chronogazer.sqlite3"),
                 pool,
             ),
+            hub,
         }
     }
 
@@ -1694,10 +1861,17 @@ mod tests {
             .await
             .expect("init_db");
         let events = event_channel();
+        let settings = SettingsService::new(pool.clone());
+        let hub = HubService::new(
+            settings.clone(),
+            std::sync::Arc::new(chronogazer_core::hub::UnavailableKeyStore),
+        )
+        .await
+        .expect("HubService::new");
         let state = AppState {
             auth: Mutex::new(None),
             users: UsersService::new(pool.clone()),
-            settings: SettingsService::new(pool.clone()),
+            settings,
             events,
             rest_auth: AuthState::new(|_u: String, _p: String| {
                 Box::pin(async { None::<banto_server::Identity> })
@@ -1705,6 +1879,7 @@ mod tests {
             server: AsyncMutex::new(None),
             audit: AuditLogService::new(pool.clone()),
             backup: BackupService::new(db_path, pool),
+            hub,
         };
         (dir, state)
     }

@@ -107,7 +107,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use banto_core::{BantoError, ErrorBody, ListParams, ListResult};
 use banto_server::{
@@ -121,6 +121,7 @@ use tokio::sync::broadcast;
 
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::backup::{BackupInfo, BackupService, PendingRestoreInfo};
+use crate::hub::{HubService, HubView};
 use crate::settings::{AuditSettings, SettingsService};
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
 
@@ -1131,6 +1132,162 @@ fn backups_router(backup: BackupService, audit: AuditLogService, auth: AuthState
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
 
+// --- #332: Hub 接続 ----------------------------------------------------------
+
+/// `/api/hub/*` のハンドラ用 state（`BackupsState` と同じ構成）: 操作本体の
+/// [`HubService`]、監査記録用の [`AuditLogService`]、actor 解決用の
+/// [`AuthState`]。
+#[derive(Clone)]
+struct HubState {
+    hub: HubService,
+    audit: AuditLogService,
+    auth: AuthState,
+}
+
+/// `POST /api/hub/connect` の body。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HubConnectBody {
+    endpoint: String,
+}
+
+/// `POST /api/hub/adopt-key` の body。`key` は**ログにも監査 detail にも
+/// 出さない**（`src-tauri` の `hub_adopt_manual_key` と同じ扱い）。
+/// `Debug` を意図的に derive していない - うっかり `{:?}` で平文キーを
+/// 出せないようにするため。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HubAdoptBody {
+    endpoint: String,
+    key: String,
+}
+
+/// `PUT /api/hub/selected-tags` の body。空配列は正当な入力（受入条件）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HubSelectedTagsBody {
+    tags: Vec<String>,
+}
+
+/// `settings_change`/`settings` の監査エントリを 1 本記録する（Hub 操作
+/// 共通）。`detail` には接続先とキー名までしか入れない - 平文キーは
+/// どの経路にも出さない。
+async fn record_hub_change(state: &HubState, headers: &HeaderMap, detail: serde_json::Value) {
+    let identity = actor_identity(headers, &state.auth);
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: identity.as_ref().map(|i| i.id.as_str()),
+            actor_role: identity.as_ref().map(|i| i.role.as_str()),
+            action: "settings_change",
+            resource: "settings",
+            entity_id: None,
+            detail: Some(detail),
+            origin: "rest",
+            result: "ok",
+        })
+        .await;
+}
+
+/// `GET /api/hub`（`admin` 限定）: 保存済み設定での現在状態。読み取りなので
+/// 監査しない（他の read ルートと同じ規約）。**発行は行わない。**
+async fn hub_status_handler(State(state): State<HubState>) -> Result<Json<HubView>, ApiError> {
+    Ok(Json(state.hub.status().await?))
+}
+
+/// `POST /api/hub/connect`（`admin` 限定）。
+async fn hub_connect_handler(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Json(body): Json<HubConnectBody>,
+) -> Result<Json<HubView>, ApiError> {
+    let view = state.hub.connect(&body.endpoint).await?;
+    record_hub_change(
+        &state,
+        &headers,
+        json!({ "hubEndpoint": body.endpoint, "hubStatus": view.status.as_str() }),
+    )
+    .await;
+    Ok(Json(view))
+}
+
+/// `POST /api/hub/adopt-key`（`admin` 限定）: ロックダウン済み Hub 向けの
+/// 手動連携。
+async fn hub_adopt_key_handler(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Json(body): Json<HubAdoptBody>,
+) -> Result<Json<HubView>, ApiError> {
+    let endpoint = body.endpoint;
+    let view = state.hub.adopt_manual_key(&endpoint, body.key).await?;
+    record_hub_change(
+        &state,
+        &headers,
+        json!({ "hubEndpoint": endpoint, "hubKeyAdopted": true, "hubStatus": view.status.as_str() }),
+    )
+    .await;
+    Ok(Json(view))
+}
+
+/// `POST /api/hub/refresh`（`admin` 限定）: タグ一覧の再取得。
+async fn hub_refresh_handler(State(state): State<HubState>) -> Result<Json<HubView>, ApiError> {
+    Ok(Json(state.hub.refresh_catalog().await?))
+}
+
+/// `PUT /api/hub/selected-tags`（`admin` 限定）。
+async fn hub_selected_tags_handler(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Json(body): Json<HubSelectedTagsBody>,
+) -> Result<StatusCode, ApiError> {
+    let count = body.tags.len();
+    state.hub.set_selected_tags(body.tags).await?;
+    record_hub_change(&state, &headers, json!({ "hubSelectedTagCount": count })).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /api/hub`（`admin` 限定）: ローカルの設定とキーリングだけを消す。
+/// Hub 側のキーは失効させない（`banto_hub_bootstrap::Bootstrapper::disconnect`
+/// の doc comment参照）。
+async fn hub_disconnect_handler(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+) -> Result<Json<HubView>, ApiError> {
+    let view = state.hub.disconnect().await?;
+    record_hub_change(&state, &headers, json!({ "hubDisconnected": true })).await;
+    Ok(Json(view))
+}
+
+/// `/api/hub/*`（#332）: `admin` 限定、`users_router`/`backups_router` と
+/// 同じ掛け方（`require_auth` → `require_role_at_least`）。
+fn hub_router(hub: HubService, audit: AuditLogService, auth: AuthState) -> Router {
+    let state = HubState {
+        hub,
+        audit: audit.clone(),
+        auth: auth.clone(),
+    };
+    Router::new()
+        .route(
+            "/api/hub",
+            get(hub_status_handler).delete(hub_disconnect_handler),
+        )
+        .route("/api/hub/connect", post(hub_connect_handler))
+        .route("/api/hub/adopt-key", post(hub_adopt_key_handler))
+        .route("/api/hub/refresh", post(hub_refresh_handler))
+        .route("/api/hub/selected-tags", put(hub_selected_tags_handler))
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            RoleGuard {
+                auth: auth.clone(),
+                min: Role::Admin,
+                resource: "hub",
+                audit,
+            },
+            require_role_at_least,
+        ))
+        .layer(middleware::from_fn_with_state(auth, require_auth))
+}
+
 /// Compose the full `/api/*` router (spec §11.1): auth routes (login/
 /// logout/check/identity from `banto_server` - wrapped with an audit-log
 /// hook for `logout`, spec M14 - plus status/setup/change-password here
@@ -1153,6 +1310,11 @@ pub fn api_router(
     settings: SettingsService,
     audit: AuditLogService,
     backup: BackupService,
+    // #332: Hub 接続。`KeyStore` の実装ごと呼び出し元が構築して渡す
+    // （デスクトップ = OS キーリング、`banto-serve` =
+    // `crate::hub::UnavailableKeyStore`）。`HubService::new` が非同期
+    // （`installation_id` の読み書き）なのでここでは構築できない。
+    hub: HubService,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
     allow_setup: bool,
@@ -1180,7 +1342,8 @@ pub fn api_router(
             settings.clone(),
             auth.clone(),
         ))
-        .merge(backups_router(backup, audit, auth.clone()))
+        .merge(backups_router(backup, audit.clone(), auth.clone()))
+        .merge(hub_router(hub, audit, auth.clone()))
         .merge(ui_settings_router(settings, auth))
         .layer(middleware::from_fn(require_banto_client_header))
 }
@@ -1286,8 +1449,9 @@ mod tests {
             .login("viewer", "password123")
             .await
             .expect("viewer login");
+        let hub = test_hub_service(settings.clone()).await;
         (
-            api_router(users, settings, audit, backup, auth, tx, false),
+            api_router(users, settings, audit, backup, hub, auth, tx, false),
             admin_token,
             editor_token,
             viewer_token,
@@ -1306,10 +1470,26 @@ mod tests {
             .login("admin", "admin")
             .await
             .expect("login should succeed");
+        let hub = test_hub_service(settings.clone()).await;
         (
-            api_router(users, settings, audit, backup, auth, tx, false),
+            api_router(users, settings, audit, backup, hub, auth, tx, false),
             token,
         )
+    }
+
+    /// #332: a `HubService` for router tests. Backed by
+    /// [`crate::hub::UnavailableKeyStore`], so it can never write a
+    /// plaintext key anywhere during a test - these tests only exercise the
+    /// `/api/hub/*` routes' auth/role gating and the "not configured"
+    /// answer, never a real Hub handshake (that is the `banto-hub-bootstrap`
+    /// crate's own mock-server suite).
+    async fn test_hub_service(settings: SettingsService) -> crate::hub::HubService {
+        crate::hub::HubService::new(
+            settings,
+            std::sync::Arc::new(crate::hub::UnavailableKeyStore),
+        )
+        .await
+        .expect("HubService::new")
     }
 
     async fn body_json(response: axum::response::Response) -> serde_json::Value {
@@ -1357,7 +1537,8 @@ mod tests {
         let backup = unused_backup_service(pool.clone());
         let audit = AuditLogService::new(pool);
         let auth = demo_auth();
-        api_router(users, settings, audit, backup, auth, tx, allow_setup)
+        let hub = test_hub_service(settings.clone()).await;
+        api_router(users, settings, audit, backup, hub, auth, tx, allow_setup)
     }
 
     fn get(path: &str) -> HttpRequest<Body> {
@@ -1548,12 +1729,14 @@ mod tests {
         let backup = unused_backup_service(pool.clone());
         let audit = AuditLogService::new(pool);
         let auth = AuthState::new(audited_credential_verifier(users.clone(), audit.clone()));
+        let hub = test_hub_service(settings.clone()).await;
         (
             api_router(
                 users,
                 settings,
                 audit.clone(),
                 backup,
+                hub,
                 auth,
                 tx,
                 allow_setup,
@@ -1638,6 +1821,77 @@ mod tests {
             .header("Authorization", format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap()
+    }
+
+    /// #332: `/api/hub/*` は `admin` 限定（`users_router` と同じ掛け方）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hub_routes_are_admin_only() {
+        let (router, admin, editor, viewer) = router_with_role_tokens().await;
+
+        for token in [&editor, &viewer] {
+            let response = router
+                .clone()
+                .oneshot(get_auth("/api/hub", token))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let response = router
+                .clone()
+                .oneshot(post_json_auth(
+                    "/api/hub/connect",
+                    token,
+                    json!({ "endpoint": "http://127.0.0.1:1" }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+
+        let response = router
+            .clone()
+            .oneshot(get_auth("/api/hub", &admin))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// #332: 何も設定していないうちは `notConfigured`。`tags` は空配列では
+    /// なく `null`（「読めていない」と「タグ 0 件で接続済み」を取り違え
+    /// させないため - 受入条件）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hub_status_is_not_configured_before_any_connect() {
+        let (router, admin, _editor, _viewer) = router_with_role_tokens().await;
+
+        let response = router
+            .clone()
+            .oneshot(get_auth("/api/hub", &admin))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["status"]["state"], json!("notConfigured"));
+        assert_eq!(body["tags"], json!(null));
+        assert_eq!(body["selectedTags"], json!([]));
+    }
+
+    /// #332: 接続先の形式エラーはフィールド検証として返す（画面が
+    /// `endpoint` 欄にマッピングできるように）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hub_connect_rejects_a_non_http_endpoint_as_a_field_error() {
+        let (router, admin, _editor, _viewer) = router_with_role_tokens().await;
+
+        let response = router
+            .oneshot(post_json_auth(
+                "/api/hub/connect",
+                &admin,
+                json!({ "endpoint": "https://example.test" }),
+            ))
+            .await
+            .unwrap();
+        assert!(response.status().is_client_error());
+        let body = body_json(response).await;
+        assert_eq!(body["kind"], json!("validation"));
+        assert_eq!(body["field_errors"][0]["field"], json!("endpoint"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1913,7 +2167,8 @@ mod tests {
             .await
             .expect("viewer login");
 
-        let router = api_router(users, settings, audit.clone(), backup, auth, tx, false);
+        let hub = test_hub_service(settings.clone()).await;
+        let router = api_router(users, settings, audit.clone(), backup, hub, auth, tx, false);
         (router, audit, admin_token, editor_token, viewer_token)
     }
 
@@ -1984,7 +2239,8 @@ mod tests {
             .await
             .expect("viewer login");
 
-        let router = api_router(users, settings, audit, backup, auth, tx, false);
+        let hub = test_hub_service(settings.clone()).await;
+        let router = api_router(users, settings, audit, backup, hub, auth, tx, false);
         (dir, router, admin_token, editor_token, viewer_token)
     }
 
