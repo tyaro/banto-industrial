@@ -296,6 +296,63 @@ describe('completionCandidates', () => {
 		expect(tags[0].canonicalPrefix).toBe('line1.fast.');
 	});
 
+	it('大文字小文字違いの同名が併存しても、完全一致を優先して引く（#380 レビュー9回目）', () => {
+		// レジストリの UNIQUE は完全一致なので `line1` と `LINE1` は併存しうる。
+		const both = buildCompletionIndex(
+			[
+				{ id: 1, name: 'line1' },
+				{ id: 2, name: 'LINE1' }
+			],
+			[
+				{ id: 10, name: 'lower', plcConnectionId: 1 },
+				{ id: 11, name: 'upper', plcConnectionId: 2 },
+				// 3段目の曖昧さを作るため、両方の接続に大文字小文字違いの同名グループを置く。
+				{ id: 12, name: 'grp', plcConnectionId: 1 },
+				{ id: 13, name: 'GRP', plcConnectionId: 2 }
+			],
+			[
+				{ id: 100, name: 'a', collectionGroupId: 10, dataType: 'f32', unit: null },
+				{ id: 101, name: 'b', collectionGroupId: 11, dataType: 'f32', unit: null },
+				{ id: 102, name: 'x', collectionGroupId: 12, dataType: 'f32', unit: null },
+				{ id: 103, name: 'y', collectionGroupId: 13, dataType: 'f32', unit: null }
+			]
+		);
+		// 完全一致があるときは必ずそれ（別の接続のグループを出さない）。
+		expect(
+			labels(completionCandidates(completionContextAt('line1.', 6)!, both, [], noBlocks))
+		).toEqual(['lower', 'grp']);
+		expect(
+			labels(completionCandidates(completionContextAt('LINE1.', 6)!, both, [], noBlocks))
+		).toEqual(['upper', 'GRP']);
+		// どちらとも完全一致しない綴りは曖昧なので解決しない（候補を出さない）。
+		expect(completionCandidates(completionContextAt('Line1.', 6)!, both, [], noBlocks)).toEqual([]);
+
+		// 3段目は「接続.グループ」をまとめて引く。完全一致があればそれ。
+		expect(
+			labels(completionCandidates(completionContextAt('LINE1.GRP.', 10)!, both, [], noBlocks))
+		).toEqual(['y']);
+		expect(
+			labels(completionCandidates(completionContextAt('line1.grp.', 10)!, both, [], noBlocks))
+		).toEqual(['x']);
+		// `line1.GRP` は小文字化すると2つ（`line1.grp` / `LINE1.GRP`）に当たるので
+		// 解決しない（どちらの配下か決められないまま別物を挿さない）。
+		expect(
+			completionCandidates(completionContextAt('line1.GRP.', 10)!, both, [], noBlocks)
+		).toEqual([]);
+	});
+
+	it('完全一致が無くても候補が1つならフォールバックで解決する', () => {
+		// `sampleIndex()` の接続は `line1` だけなので `LINE1.` は一意に解決できる。
+		const candidates = completionCandidates(
+			completionContextAt('LINE1.', 6)!,
+			index,
+			FUNCTIONS,
+			noBlocks
+		);
+		expect(labels(candidates)).toEqual(['fast']);
+		expect(candidates[0].canonicalPrefix).toBe('line1.');
+	});
+
 	it('綴りが正式名と同じなら canonicalPrefix は null（置換範囲を広げない）', () => {
 		const groupCtx = completionContextAt('line1.', 6)!;
 		expect(

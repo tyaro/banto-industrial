@@ -305,15 +305,20 @@ export interface CompletionIndex {
 	/** `"接続名.グループ名"` → その配下のタグ（入力順）。 */
 	tagsByGroupPath: Map<string, CompletionIndexTag[]>;
 	/**
-	 * 小文字化した接続名 → 登録どおりの接続名（#380 レビュー対応1）。
+	 * 小文字化した接続名 → 登録どおりの接続名**の一覧**（#380 レビュー対応1）。
 	 * 前方一致は大文字小文字を無視する（{@link matchesPrefix}）のに親セグメントの
 	 * 引き当てが完全一致だと、`LINE1.` と打ったとき1段目では `line1` が出るのに
 	 * **2段目以降で候補が消える**。索引は一覧が変わったときしか組まないので、
 	 * 正規化キーの Map を**同時に作る**のが一番安い。
+	 *
+	 * **値が配列なのは、レジストリの UNIQUE 制約が完全一致だから**（#380 レビュー
+	 * 9回目）: `line1` と `LINE1` は同時に存在できる。先勝ちの1件に潰すと、
+	 * 後者を選んだときに前者のグループ・タグを出して**別物の正式名を挿入**して
+	 * しまう。解決は {@link resolveConnectionName} が完全一致優先で行う。
 	 */
-	connectionByLowerName: Map<string, string>;
-	/** 小文字化した `"接続名.グループ名"` → 登録どおりの `"接続名.グループ名"`。 */
-	groupPathByLowerPath: Map<string, string>;
+	connectionsByLowerName: Map<string, string[]>;
+	/** 小文字化した `"接続名.グループ名"` → 登録どおりのパス**の一覧**（同上）。 */
+	groupPathsByLowerPath: Map<string, string[]>;
 }
 
 /** {@link CompletionIndex.tagsByGroupPath} のキー。 */
@@ -336,19 +341,20 @@ export function buildCompletionIndex(
 ): CompletionIndex {
 	const connectionNameById = new Map<number, string>();
 	const connectionNames: string[] = [];
-	const connectionByLowerName = new Map<string, string>();
+	const connectionsByLowerName = new Map<string, string[]>();
 	for (const connection of connections) {
 		connectionNameById.set(connection.id, connection.name);
 		connectionNames.push(connection.name);
-		// 同名（大文字小文字違い）の接続は作れる（レジストリの UNIQUE は完全一致）
-		// ので、先勝ちにして一覧の並び順どおりの1つへ解決する。
-		if (!connectionByLowerName.has(connection.name.toLowerCase())) {
-			connectionByLowerName.set(connection.name.toLowerCase(), connection.name);
-		}
+		// 大文字小文字違いの同名（`line1` と `LINE1`）は同時に存在しうるので
+		// **潰さずに全部持つ**（`connectionsByLowerName` の doc comment 参照）。
+		const key = connection.name.toLowerCase();
+		const existing = connectionsByLowerName.get(key);
+		if (existing) existing.push(connection.name);
+		else connectionsByLowerName.set(key, [connection.name]);
 	}
 
 	const groupsByConnection = new Map<string, string[]>();
-	const groupPathByLowerPath = new Map<string, string>();
+	const groupPathsByLowerPath = new Map<string, string[]>();
 	const groupPathById = new Map<number, string>();
 	for (const group of groups) {
 		const connectionName = connectionNameById.get(group.plcConnectionId);
@@ -360,9 +366,10 @@ export function buildCompletionIndex(
 		else groupsByConnection.set(connectionName, [group.name]);
 		const path = groupPath(connectionName, group.name);
 		groupPathById.set(group.id, path);
-		if (!groupPathByLowerPath.has(path.toLowerCase())) {
-			groupPathByLowerPath.set(path.toLowerCase(), path);
-		}
+		const key = path.toLowerCase();
+		const samePath = groupPathsByLowerPath.get(key);
+		if (samePath) samePath.push(path);
+		else groupPathsByLowerPath.set(key, [path]);
 	}
 
 	const tagsByGroupPath = new Map<string, CompletionIndexTag[]>();
@@ -384,8 +391,8 @@ export function buildCompletionIndex(
 		connections: connectionNames,
 		groupsByConnection,
 		tagsByGroupPath,
-		connectionByLowerName,
-		groupPathByLowerPath
+		connectionsByLowerName,
+		groupPathsByLowerPath
 	};
 }
 
@@ -441,11 +448,36 @@ function matchesPrefix(name: string, prefix: string): boolean {
 }
 
 /**
- * 打たれた先行セグメント（接続.グループ）を登録どおりの正式名へ解決する
- * （#380 レビュー対応1）。見つからなければ `null`（＝候補なし）。
+ * 打たれた綴りを登録どおりの正式名へ解決する共通規則（#380 レビュー9回目）:
+ *
+ * 1. **完全一致があれば必ずそれ**（大文字小文字違いの同名が併存していても、
+ *    打鍵どおりのものを選ぶ）。
+ * 2. 完全一致が無く、大文字小文字を無視した候補が**ちょうど1つ**ならそれ。
+ * 3. 曖昧（2つ以上）なら **`null`**（＝候補を出さない）。どちらか分からない
+ *    まま別物の正式名を挿すより、候補が出ない方がまし。
+ *
+ * 実運用で候補が消えるのは「大文字小文字違いの同名が複数あり、かつ打鍵が
+ * どれとも完全一致していない」ときだけ。
+ */
+function resolveCanonical(typed: string, candidates: string[] | undefined): string | null {
+	if (candidates === undefined) return null;
+	if (candidates.includes(typed)) return typed;
+	return candidates.length === 1 ? candidates[0] : null;
+}
+
+/** 打たれた接続名を正式名へ解決する（{@link resolveCanonical} の規則）。 */
+function resolveConnectionName(index: CompletionIndex, typed: string): string | null {
+	return resolveCanonical(typed, index.connectionsByLowerName.get(typed.toLowerCase()));
+}
+
+/**
+ * 打たれた先行セグメント（接続.グループ）を登録どおりの正式パスへ解決する
+ * （{@link resolveCanonical} の規則）。2セグメントまとめて引くので、接続だけ
+ * 完全一致・グループだけ大文字小文字違い、といった組み合わせも1回で決まる。
  */
 function resolveGroupPath(index: CompletionIndex, seg1: string, seg2: string): string | null {
-	return index.groupPathByLowerPath.get(groupPath(seg1, seg2).toLowerCase()) ?? null;
+	const typedPath = groupPath(seg1, seg2);
+	return resolveCanonical(typedPath, index.groupPathsByLowerPath.get(typedPath.toLowerCase()));
 }
 
 /** タグ候補の `detail`（型・単位）。 */
@@ -505,12 +537,13 @@ export function completionCandidates(
 	}
 
 	const typedSeg1 = context.seg1 ?? '';
-	// #380 レビュー対応1: 親セグメントの引き当ても**大文字小文字を無視**する
-	// （1段目だけ候補が出て2段目以降で消える、を防ぐ）。
-	const connectionName = index.connectionByLowerName.get(typedSeg1.toLowerCase());
-	if (connectionName === undefined) return [];
 
 	if (context.kind === 'segment2') {
+		// #380 レビュー対応1: 親セグメントの引き当ても**大文字小文字を無視**する
+		// （1段目だけ候補が出て2段目以降で消える、を防ぐ）。完全一致優先・曖昧なら
+		// 解決しないのは `resolveCanonical` の doc comment 参照。
+		const connectionName = resolveConnectionName(index, typedSeg1);
+		if (connectionName === null) return [];
 		// 打たれた綴りが正式名と違うなら、確定時に先行セグメントごと直す。
 		const canonicalPrefix = connectionName === typedSeg1 ? null : `${connectionName}.`;
 		return (index.groupsByConnection.get(connectionName) ?? [])

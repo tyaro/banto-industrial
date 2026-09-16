@@ -653,10 +653,6 @@
 		return groups.find((g) => g.id === id)?.name ?? `#${id}`;
 	}
 
-	function connectionName(id: number): string | undefined {
-		return connections.find((c) => c.id === id)?.name;
-	}
-
 	/**
 	 * T6-2: groups の候補をタグ種別で絞り込む — `computed` は `calc` 接続
 	 * 配下、`internal` は `mem` 接続配下、`plc` はそのどちらでもない接続配下
@@ -1741,15 +1737,41 @@
 	/**
 	 * T18-1（TAG-UX-C 5点目、docs/banto-hub-desktop-plan.md §9.4「削除前に
 	 * 演算タグ等の参照影響と完全な外部名を表示する」）: `tag` の完全外部名
-	 * （`{接続}.{グループ}.{タグ}`）を組み立てる。`groupName`/`connectionName`
+	 * （`{接続}.{グループ}.{タグ}`）を組み立てる。`groupName`
 	 * は表示用のフォールバック（`#${id}`/`undefined`）を持つが、外部名は
 	 * 未解決でも `?` で埋めて必ず3セグメントの形にする（通常は起こらない -
 	 * `tags`/`groups`/`connections` は同じ `reload()` で一括取得している）。
 	 */
+	/**
+	 * `収集グループ id -> "{接続名}.{グループ名}"`（完全外部名の先頭2セグメント）。
+	 *
+	 * #380 レビュー対応2: これが無いと {@link externalNameForTag} がタグ1件ごとに
+	 * `groups.find` と `connections.find` を回すため、**タグ数 ×（グループ数 +
+	 * 接続数）**になる。段階C の除外マップ（`insertBlockedReasons`）は一覧全件に
+	 * 対してこれを呼ぶので、基準機規模（1万タグ・500グループ）では補完の3段目を
+	 * 開いた瞬間にメインスレッドが止まる（依存グラフの O(V+E) とは別の負荷）。
+	 * 一覧が変わったときだけ1回組み、以後の外部名組み立てを O(1) にする。
+	 */
+	const externalNamePrefixByGroupId = $derived.by((): Map<number, string> => {
+		const nameByConnectionId = new Map<number, string>();
+		for (const c of connections) nameByConnectionId.set(c.id, c.name);
+		const prefixes = new Map<number, string>();
+		for (const g of groups) {
+			prefixes.set(g.id, `${nameByConnectionId.get(g.plcConnectionId) ?? '?'}.${g.name}`);
+		}
+		return prefixes;
+	});
+
+	/**
+	 * 完全外部名（`{接続}.{グループ}.{タグ}`）。組み立て規則はバックエンドの
+	 * `hub.rs::build_catalog` と同じ（`tagDeleteImpact.ts::buildExternalName`）。
+	 * 引き当ては {@link externalNamePrefixByGroupId} 経由の O(1)。
+	 */
 	function externalNameForTag(tag: Tag): string {
-		const group = groups.find((g) => g.id === tag.collectionGroupId);
-		const connName = group ? connectionName(group.plcConnectionId) : undefined;
-		return buildExternalName(connName ?? '?', group?.name ?? `#${tag.collectionGroupId}`, tag.name);
+		const prefix = externalNamePrefixByGroupId.get(tag.collectionGroupId);
+		// グループが見つからない（一覧の取得タイミングのずれ）ときの表示は従来どおり。
+		if (prefix === undefined) return buildExternalName('?', `#${tag.collectionGroupId}`, tag.name);
+		return `${prefix}.${tag.name}`;
 	}
 
 	/**
@@ -2108,8 +2130,19 @@
 	 * （補完全体を壊さない）。
 	 */
 	let expressionFunctions: ExpressionFunction[] = $state([]);
-	/** 取得を1回だけにするためのフラグ（リアクティブに読まないので `$state` 不要）。 */
-	let expressionFunctionsRequested = false;
+	/**
+	 * 取得を1回だけにするためのフラグ。**`$state`**（#380 レビュー対応3）:
+	 * 素の変数だと、フェッチが reject する前に式欄を閉じて開き直したときに
+	 * 「effect が走った時点ではまだ `true` なので要求を出さず、その後の `catch` が
+	 * `false` へ戻しても effect は再実行されない」という取りこぼしが起きる。
+	 */
+	let expressionFunctionsRequested = $state(false);
+	/**
+	 * 直近の取得が失敗したか。**同じ表示状態のまま即再要求して無限ループに
+	 * ならないための門**で、式欄がいったん消えたときにだけ解除する
+	 * （＝「次に式欄を開いたら取り直す」を字義どおりに実装する）。
+	 */
+	let expressionFunctionsFailed = $state(false);
 
 	/** 式欄が出ているか（＝関数表を取りに行ってよいか）。 */
 	const expressionFieldVisible = $derived(
@@ -2123,7 +2156,16 @@
 	 * キャッシュしたまま - 内容は静的（サーバー側で DB も設定も読まない）。
 	 */
 	$effect(() => {
-		if (!expressionFieldVisible || expressionFunctionsRequested) return;
+		if (!expressionFieldVisible) {
+			// 式欄が消えたら失敗の記録を解除する - 次に開いたときに取り直せるように
+			// （#380 レビュー対応3。`expressionFunctionsFailed` の doc comment 参照）。
+			if (expressionFunctionsFailed || expressionFunctionsRequested) {
+				expressionFunctionsFailed = false;
+				expressionFunctionsRequested = false;
+			}
+			return;
+		}
+		if (expressionFunctionsRequested || expressionFunctionsFailed) return;
 		expressionFunctionsRequested = true;
 		void fetchExpressionFunctions()
 			.then((list) => {
@@ -2139,8 +2181,11 @@
 			})
 			.catch(() => {
 				// 権限不足・ネットワーク断でも補完は壊さない（関数候補が出ないだけ）。
-				// 次に式欄を開いたときに取り直せるよう、フラグは戻す。
+				// 次に式欄を開いたときに取り直せるよう、要求済みフラグは戻す。
+				// **同じ表示状態のまま即再要求しない**よう失敗を記録しておき、
+				// 式欄がいったん消えたときに上の分岐が解除する。
 				expressionFunctionsRequested = false;
+				expressionFunctionsFailed = true;
 			});
 	});
 
