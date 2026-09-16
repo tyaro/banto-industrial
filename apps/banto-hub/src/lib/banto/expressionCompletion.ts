@@ -28,6 +28,17 @@
  * - **キャレットより後ろは見ない**。`line1|abc` のようにカーソルが語の
  *   途中にあるときは、置換範囲はキャレットまで（`abc` は残る）。
  *
+ * ## 大文字小文字: 探すときだけ緩め、入るのは正式名
+ *
+ * **式言語のタグ参照は大文字小文字を区別する**（banto-hub の `TagMap` は完全
+ * 一致の `HashMap<String, _>`）。一方、補完の前方一致と親セグメントの引き当ては
+ * **大文字小文字を無視**して探す（`LINE1.` と打っても `line1` 配下の候補が出る）。
+ * 確定したときに入るのは常に登録どおりの綴りで、先行セグメントの綴りが違って
+ * いれば {@link CompletionCandidate.canonicalPrefix} でそこも正式名へ直す。
+ * それでも残る綴り誤り（補完を使わず手で打った場合など）は段階A のサーバ
+ * チェックが `unknown_tag` で捕まえる - 補完は探すのを助けるだけで、正しさの
+ * 最終判断はしない。
+ *
  * ## `calc`/`mem` を特別扱いしない
  *
  * `calc`（演算タグ）/`mem`（内部タグ）は予約された仮想接続名だが、実体は
@@ -52,6 +63,14 @@ export interface CompletionContext {
 	/** 確定時に置き換える範囲（`[replaceFrom, replaceTo)`）= `prefix` が占める範囲。 */
 	replaceFrom: number;
 	replaceTo: number;
+	/**
+	 * この参照トークン全体（先行セグメントを含む）の開始位置。先行セグメントの
+	 * 大文字小文字を正式名へ直すときの置換開始点に使う
+	 * （{@link CompletionCandidate.canonicalPrefix} 参照）。`replaceTo` は
+	 * 変えないので、確定直前のキャレット検証
+	 * （{@link completionContextMatchesCaret}）とは干渉しない。
+	 */
+	tokenStart: number;
 	/** 第1セグメント（`kind` が `segment2`/`segment3` のときだけ）。 */
 	seg1?: string;
 	/** 第2セグメント（`kind` が `segment3` のときだけ）。 */
@@ -99,30 +118,36 @@ const MAX_SEGMENTS = 3;
  * #380 レビュー対応2: 以前は「`-` の直前にある**英数字ラン1つ**の先頭」だけを
  * 見ていたため、`line-1-2` / `line-1-foo` のような**ハイフンを2つ以上含む
  * 有効な識別子**で2つ目の `-` の左ラン（`1`）が英字始まりでないとして走査が
- * 止まり、prefix が `2`/`foo` だけになっていた（候補が消え、確定すると末尾
- * だけを置換して式を壊す）。ハイフンを跨いで左へ辿るように直した。
+ * 止まり、prefix が `2`/`foo` だけになっていた。
+ *
+ * #380 レビュー対応（8回目）: さらに**判定の順序**を lexer に合わせた。ラン
+ * ごとに「**まず先頭が ident-start か**を見て、そうならそこが識別子の先頭」→
+ * 「違うなら（数字始まりなら）さらに左の `-` を跨げるか」の順で見る。以前は
+ * 先に `-` を跨いでいたため、`1-a-b`（lexer では `1` `-` `a-b`）で index 0 の
+ * `1` まで到達して false を返し、文脈が `b` だけになっていた（確定すると
+ * `a-b` ではなく末尾の `b` だけを置換して式を壊す）。
  */
 function hyphenIsPartOfIdentifier(text: string, hyphenIndex: number, caret: number): boolean {
 	const next = hyphenIndex + 1;
 	if (next !== caret && !isIdentContinue(text[next])) return false;
 
-	// 左へ: 継続文字と「右隣が継続文字である `-`」の連なりを辿る。
 	let i = hyphenIndex;
-	while (i > 0) {
-		const prev = text[i - 1];
-		if (isIdentContinue(prev)) {
+	for (;;) {
+		// いまのラン（継続文字の連なり）の先頭まで左へ。
+		const runEnd = i;
+		while (i > 0 && isIdentContinue(text[i - 1])) i -= 1;
+		// ランが空 = `-` の直前が継続文字でない（`a--b` の1つ目の `-` など）。
+		if (i === runEnd) return false;
+		// ランが英字か `_` で始まる = ここから識別子が始まっている。
+		if (isIdentStart(text[i])) return true;
+		// 数字始まりのラン: さらに左の `-` が識別子へ吸収される形
+		// （右隣が継続文字）なら跨いで続ける。そうでなければ識別子ではない。
+		if (i > 0 && text[i - 1] === '-' && isIdentContinue(text[i])) {
 			i -= 1;
 			continue;
 		}
-		// `text[i]` は今いる位置の文字 = その `-` の右隣。継続文字でなければ
-		// （`a--b` のように `-` が続いていれば）そこで識別子は切れている。
-		if (prev === '-' && isIdentContinue(text[i])) {
-			i -= 1;
-			continue;
-		}
-		break;
+		return false;
 	}
-	return i < hyphenIndex && isIdentStart(text[i]);
 }
 
 /**
@@ -179,7 +204,8 @@ export function completionContextAt(text: string, caret: number): CompletionCont
 	const base = {
 		prefix,
 		replaceFrom: position - prefix.length,
-		replaceTo: position
+		replaceTo: position,
+		tokenStart: start
 	};
 	if (segments.length === 1) return { kind: 'segment1', ...base };
 	if (segments.length === 2) return { kind: 'segment2', ...base, seg1: segments[0] };
@@ -278,6 +304,16 @@ export interface CompletionIndex {
 	groupsByConnection: Map<string, string[]>;
 	/** `"接続名.グループ名"` → その配下のタグ（入力順）。 */
 	tagsByGroupPath: Map<string, CompletionIndexTag[]>;
+	/**
+	 * 小文字化した接続名 → 登録どおりの接続名（#380 レビュー対応1）。
+	 * 前方一致は大文字小文字を無視する（{@link matchesPrefix}）のに親セグメントの
+	 * 引き当てが完全一致だと、`LINE1.` と打ったとき1段目では `line1` が出るのに
+	 * **2段目以降で候補が消える**。索引は一覧が変わったときしか組まないので、
+	 * 正規化キーの Map を**同時に作る**のが一番安い。
+	 */
+	connectionByLowerName: Map<string, string>;
+	/** 小文字化した `"接続名.グループ名"` → 登録どおりの `"接続名.グループ名"`。 */
+	groupPathByLowerPath: Map<string, string>;
 }
 
 /** {@link CompletionIndex.tagsByGroupPath} のキー。 */
@@ -300,12 +336,19 @@ export function buildCompletionIndex(
 ): CompletionIndex {
 	const connectionNameById = new Map<number, string>();
 	const connectionNames: string[] = [];
+	const connectionByLowerName = new Map<string, string>();
 	for (const connection of connections) {
 		connectionNameById.set(connection.id, connection.name);
 		connectionNames.push(connection.name);
+		// 同名（大文字小文字違い）の接続は作れる（レジストリの UNIQUE は完全一致）
+		// ので、先勝ちにして一覧の並び順どおりの1つへ解決する。
+		if (!connectionByLowerName.has(connection.name.toLowerCase())) {
+			connectionByLowerName.set(connection.name.toLowerCase(), connection.name);
+		}
 	}
 
 	const groupsByConnection = new Map<string, string[]>();
+	const groupPathByLowerPath = new Map<string, string>();
 	const groupPathById = new Map<number, string>();
 	for (const group of groups) {
 		const connectionName = connectionNameById.get(group.plcConnectionId);
@@ -315,7 +358,11 @@ export function buildCompletionIndex(
 		const existing = groupsByConnection.get(connectionName);
 		if (existing) existing.push(group.name);
 		else groupsByConnection.set(connectionName, [group.name]);
-		groupPathById.set(group.id, groupPath(connectionName, group.name));
+		const path = groupPath(connectionName, group.name);
+		groupPathById.set(group.id, path);
+		if (!groupPathByLowerPath.has(path.toLowerCase())) {
+			groupPathByLowerPath.set(path.toLowerCase(), path);
+		}
 	}
 
 	const tagsByGroupPath = new Map<string, CompletionIndexTag[]>();
@@ -333,7 +380,13 @@ export function buildCompletionIndex(
 		else tagsByGroupPath.set(path, [entry]);
 	}
 
-	return { connections: connectionNames, groupsByConnection, tagsByGroupPath };
+	return {
+		connections: connectionNames,
+		groupsByConnection,
+		tagsByGroupPath,
+		connectionByLowerName,
+		groupPathByLowerPath
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -360,6 +413,21 @@ export interface CompletionCandidate {
 	 * `null` で、そのときポップアップは2行目自体を描かない。
 	 */
 	description: string | null;
+	/**
+	 * 先行セグメントを**登録どおりの大文字小文字へ直す**ための置換テキスト
+	 * （末尾のドット込み。例: `line1.` / `line1.fast.`）。直す必要が無ければ
+	 * `null`（＝ `replaceFrom` から `label` を入れるだけ）。
+	 *
+	 * #380 レビュー対応1: 前方一致も親セグメントの引き当ても大文字小文字を
+	 * 無視するので `LINE1.` と打っても候補は出るが、**式言語のタグ参照は
+	 * 大文字小文字を区別する**（banto-hub の `TagMap` は完全一致の
+	 * `HashMap<String, _>`）。`LINE1.fast.tag` のまま保存すると段階A のチェックが
+	 * `unknown_tag` で弾くので、確定のときに先行セグメントごと正式名へ直す。
+	 * 置換は {@link CompletionContext.tokenStart} から始めればよく、`replaceTo` は
+	 * 変わらないので確定直前のキャレット検証
+	 * （{@link completionContextMatchesCaret}）とは干渉しない。
+	 */
+	canonicalPrefix: string | null;
 }
 
 /**
@@ -370,6 +438,14 @@ export interface CompletionCandidate {
 function matchesPrefix(name: string, prefix: string): boolean {
 	if (prefix === '') return true;
 	return name.toLowerCase().startsWith(prefix.toLowerCase());
+}
+
+/**
+ * 打たれた先行セグメント（接続.グループ）を登録どおりの正式名へ解決する
+ * （#380 レビュー対応1）。見つからなければ `null`（＝候補なし）。
+ */
+function resolveGroupPath(index: CompletionIndex, seg1: string, seg2: string): string | null {
+	return index.groupPathByLowerPath.get(groupPath(seg1, seg2).toLowerCase()) ?? null;
 }
 
 /** タグ候補の `detail`（型・単位）。 */
@@ -409,36 +485,65 @@ export function completionCandidates(
 					isExpressionRepresentableSegment(name, { first: true }) &&
 					matchesPrefix(name, context.prefix)
 			)
-			.map((name) => ({ label: name, kind: 'connection', detail: null, description: null }));
+			.map((name) => ({
+				label: name,
+				kind: 'connection',
+				detail: null,
+				description: null,
+				canonicalPrefix: null
+			}));
 		const builtins: CompletionCandidate[] = functions
 			.filter((fn) => matchesPrefix(fn.name, context.prefix))
 			.map((fn) => ({
 				label: fn.name,
 				kind: 'function',
 				detail: fn.signature,
-				description: fn.description
+				description: fn.description,
+				canonicalPrefix: null
 			}));
 		return [...connections, ...builtins];
 	}
 
+	const typedSeg1 = context.seg1 ?? '';
+	// #380 レビュー対応1: 親セグメントの引き当ても**大文字小文字を無視**する
+	// （1段目だけ候補が出て2段目以降で消える、を防ぐ）。
+	const connectionName = index.connectionByLowerName.get(typedSeg1.toLowerCase());
+	if (connectionName === undefined) return [];
+
 	if (context.kind === 'segment2') {
-		const groups = index.groupsByConnection.get(context.seg1 ?? '') ?? [];
-		return groups
+		// 打たれた綴りが正式名と違うなら、確定時に先行セグメントごと直す。
+		const canonicalPrefix = connectionName === typedSeg1 ? null : `${connectionName}.`;
+		return (index.groupsByConnection.get(connectionName) ?? [])
 			.filter(
 				(name) => isExpressionRepresentableSegment(name) && matchesPrefix(name, context.prefix)
 			)
-			.map((name) => ({ label: name, kind: 'group', detail: null, description: null }));
+			.map((name) => ({
+				label: name,
+				kind: 'group',
+				detail: null,
+				description: null,
+				canonicalPrefix
+			}));
 	}
 
-	const tags = index.tagsByGroupPath.get(groupPath(context.seg1 ?? '', context.seg2 ?? '')) ?? [];
-	return tags
+	const typedSeg2 = context.seg2 ?? '';
+	const path = resolveGroupPath(index, typedSeg1, typedSeg2);
+	if (path === null) return [];
+	const canonicalPrefix = path === groupPath(typedSeg1, typedSeg2) ? null : `${path}.`;
+	return (index.tagsByGroupPath.get(path) ?? [])
 		.filter(
 			(tag) =>
 				isExpressionRepresentableSegment(tag.name) &&
 				!blockedTagIds.has(tag.id) &&
 				matchesPrefix(tag.name, context.prefix)
 		)
-		.map((tag) => ({ label: tag.name, kind: 'tag', detail: tagDetail(tag), description: null }));
+		.map((tag) => ({
+			label: tag.name,
+			kind: 'tag',
+			detail: tagDetail(tag),
+			description: null,
+			canonicalPrefix
+		}));
 }
 
 /**

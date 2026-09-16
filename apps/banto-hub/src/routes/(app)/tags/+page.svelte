@@ -2418,9 +2418,18 @@
 			return;
 		}
 		const { text, reopen } = completionInsertion(candidate);
+		// #380 レビュー対応1: 先行セグメントの綴りが登録と違う（`LINE1.` と打った）
+		// ときは、**参照トークンの先頭から**置き換えてそこも正式名へ直す - 式言語の
+		// タグ参照は大文字小文字を区別するので、直さないと保存前チェックが必ず
+		// `unknown_tag` で弾く。`replaceTo` は変えないので、上のキャレット検証とは
+		// 干渉しない。
+		const replaceFrom =
+			candidate.canonicalPrefix === null ? context.replaceFrom : context.tokenStart;
+		const insertText =
+			candidate.canonicalPrefix === null ? text : `${candidate.canonicalPrefix}${text}`;
 
 		suppressCompletionRefresh = true;
-		el.setRangeText(text, context.replaceFrom, context.replaceTo, 'end');
+		el.setRangeText(insertText, replaceFrom, context.replaceTo, 'end');
 		el.dispatchEvent(new Event('input', { bubbles: true }));
 		suppressCompletionRefresh = false;
 

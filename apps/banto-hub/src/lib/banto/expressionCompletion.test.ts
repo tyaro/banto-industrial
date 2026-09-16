@@ -33,7 +33,8 @@ describe('completionContextAt', () => {
 			kind: 'segment1',
 			prefix: '',
 			replaceFrom: 0,
-			replaceTo: 0
+			replaceTo: 0,
+			tokenStart: 0
 		});
 	});
 
@@ -42,7 +43,8 @@ describe('completionContextAt', () => {
 			kind: 'segment1',
 			prefix: 'lin',
 			replaceFrom: 0,
-			replaceTo: 3
+			replaceTo: 3,
+			tokenStart: 0
 		});
 	});
 
@@ -57,6 +59,7 @@ describe('completionContextAt', () => {
 			prefix: '',
 			replaceFrom: 6,
 			replaceTo: 6,
+			tokenStart: 0,
 			seg1: 'line1'
 		});
 		expect(contextAt('line1.fast.|')).toEqual({
@@ -64,6 +67,7 @@ describe('completionContextAt', () => {
 			prefix: '',
 			replaceFrom: 11,
 			replaceTo: 11,
+			tokenStart: 0,
 			seg1: 'line1',
 			seg2: 'fast'
 		});
@@ -75,6 +79,7 @@ describe('completionContextAt', () => {
 			prefix: 'fa',
 			replaceFrom: 6,
 			replaceTo: 8,
+			tokenStart: 0,
 			seg1: 'line1'
 		});
 	});
@@ -129,6 +134,19 @@ describe('completionContextAt', () => {
 		expect(contextAt('line-|')).toMatchObject({ kind: 'segment1', prefix: 'line-' });
 	});
 
+	it('数値の後ろの `-` は跨がない（判定順を lexer に合わせる。#380 レビュー対応2）', () => {
+		// lexer は `1-a-b` を `1` `-` `a-b` と切る（`1` は ident-start でないので
+		// 直後の `-` は演算子、`a` から始まる識別子が `-b` を吸収する）。以前は
+		// 先に `-` を跨いで index 0 の `1` まで到達して false を返していたため、
+		// 文脈が `b` だけになり、確定すると末尾の `b` だけを置換して式を壊した。
+		expect(contextAt('1-a-b|')).toMatchObject({ kind: 'segment1', prefix: 'a-b' });
+		expect(contextAt('1-a|')).toMatchObject({ kind: 'segment1', prefix: 'a' });
+		// 既存の期待値が変わっていないこと。
+		expect(contextAt('line-1-2|')).toMatchObject({ kind: 'segment1', prefix: 'line-1-2' });
+		expect(contextAt('a--b|')).toMatchObject({ kind: 'segment1', prefix: 'b' });
+		expect(contextAt('1-line1|')).toMatchObject({ kind: 'segment1', prefix: 'line1' });
+	});
+
 	it('空白を跨がない（`conn . group` は lexer 上は有効だが補完しない）', () => {
 		expect(contextAt('line1 .|')).toBeNull();
 		expect(contextAt('line1. |')).toMatchObject({ kind: 'segment1', prefix: '' });
@@ -142,14 +160,21 @@ describe('completionContextAt', () => {
 			kind: 'segment1',
 			prefix: '',
 			replaceFrom: 7,
-			replaceTo: 7
+			replaceTo: 7,
+			tokenStart: 7
 		});
 		expect(contextAt('line1.-|')).toMatchObject({ kind: 'segment1', prefix: '' });
 	});
 
 	it('キャレットより後ろは置換範囲に含めない', () => {
 		const ctx = completionContextAt('line1abc', 5);
-		expect(ctx).toEqual({ kind: 'segment1', prefix: 'line1', replaceFrom: 0, replaceTo: 5 });
+		expect(ctx).toEqual({
+			kind: 'segment1',
+			prefix: 'line1',
+			replaceFrom: 0,
+			replaceTo: 5,
+			tokenStart: 0
+		});
 	});
 });
 
@@ -231,7 +256,8 @@ describe('completionCandidates', () => {
 			label: 'min',
 			kind: 'function',
 			detail: 'min(値1, 値2)',
-			description: '小さい方'
+			description: '小さい方',
+			canonicalPrefix: null
 		});
 		// 接続・グループ・タグ候補は説明を持たない（ポップアップは2行目を描かない）。
 		expect(candidates[0].description).toBeNull();
@@ -256,6 +282,29 @@ describe('completionCandidates', () => {
 		).toBe(false);
 	});
 
+	it('親セグメントの引き当ても大文字小文字を無視する（#380 レビュー対応1）', () => {
+		// 1段目が `LINE1` で出るのに2段目で消える、を防ぐ。
+		const groupCtx = completionContextAt('LINE1.', 6)!;
+		const groups = completionCandidates(groupCtx, index, FUNCTIONS, noBlocks);
+		expect(labels(groups)).toEqual(['fast']);
+		// 確定時に先行セグメントごと正式名へ直す（式言語は大文字小文字を区別する）。
+		expect(groups[0].canonicalPrefix).toBe('line1.');
+
+		const tagCtx = completionContextAt('LINE1.FAST.', 11)!;
+		const tags = completionCandidates(tagCtx, index, FUNCTIONS, noBlocks);
+		expect(labels(tags)).toEqual(['temp', 'temp2', 'label']);
+		expect(tags[0].canonicalPrefix).toBe('line1.fast.');
+	});
+
+	it('綴りが正式名と同じなら canonicalPrefix は null（置換範囲を広げない）', () => {
+		const groupCtx = completionContextAt('line1.', 6)!;
+		expect(
+			completionCandidates(groupCtx, index, FUNCTIONS, noBlocks)[0].canonicalPrefix
+		).toBeNull();
+		const tagCtx = completionContextAt('line1.fast.', 11)!;
+		expect(completionCandidates(tagCtx, index, FUNCTIONS, noBlocks)[0].canonicalPrefix).toBeNull();
+	});
+
 	it('存在しない接続・グループの配下では候補が空になる', () => {
 		expect(
 			completionCandidates(completionContextAt('nope.', 5)!, index, FUNCTIONS, noBlocks)
@@ -275,7 +324,8 @@ describe('completionCandidates', () => {
 			label: 'temp',
 			kind: 'tag',
 			detail: 'f32・℃',
-			description: null
+			description: null,
+			canonicalPrefix: null
 		});
 		expect(candidates[1].detail).toBe('i16');
 	});
@@ -375,23 +425,42 @@ describe('clampCompletionIndex', () => {
 describe('completionInsertion', () => {
 	it('接続・グループは名前＋ドットを入れて次の階層を開く', () => {
 		expect(
-			completionInsertion({ label: 'line1', kind: 'connection', detail: null, description: null })
+			completionInsertion({
+				label: 'line1',
+				kind: 'connection',
+				detail: null,
+				description: null,
+				canonicalPrefix: null
+			})
 		).toEqual({ text: 'line1.', reopen: true });
 		expect(
-			completionInsertion({ label: 'fast', kind: 'group', detail: null, description: null })
+			completionInsertion({
+				label: 'fast',
+				kind: 'group',
+				detail: null,
+				description: null,
+				canonicalPrefix: null
+			})
 		).toEqual({ text: 'fast.', reopen: true });
 	});
 
 	it('タグは名前だけ、関数は `name(` を入れて閉じる', () => {
 		expect(
-			completionInsertion({ label: 'temp', kind: 'tag', detail: 'f32', description: null })
+			completionInsertion({
+				label: 'temp',
+				kind: 'tag',
+				detail: 'f32',
+				description: null,
+				canonicalPrefix: null
+			})
 		).toEqual({ text: 'temp', reopen: false });
 		expect(
 			completionInsertion({
 				label: 'min',
 				kind: 'function',
 				detail: 'min(a, b)',
-				description: '小さい方'
+				description: '小さい方',
+				canonicalPrefix: null
 			})
 		).toEqual({ text: 'min(', reopen: false });
 	});
