@@ -431,6 +431,11 @@ test.describe.serial('banto-hub 演算タグの式欄セグメント補完 (#342
 		// 確定後だけ見ると、変換中に開く実装でもテストが通ってしまう）。
 		await expect(popup).toHaveCount(0);
 
+		// #380 レビュー対応15: 変換中は**明示トリガーでも開かない**（キーを
+		// 握りつぶさず IME に渡すため、分岐そのものに入らない）。
+		await page.keyboard.press('Control+Space');
+		await expect(popup).toHaveCount(0);
+
 		await expressionField.evaluate((el: HTMLTextAreaElement) => {
 			el.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: 'mi' }));
 		});

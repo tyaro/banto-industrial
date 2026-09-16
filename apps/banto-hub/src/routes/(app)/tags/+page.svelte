@@ -2566,7 +2566,18 @@
 	 * 生まれるため両方に割り当てる。
 	 */
 	function handleExpressionKeydown(event: KeyboardEvent): void {
-		if ((event.ctrlKey || event.metaKey) && (event.code === 'Space' || event.key === '.')) {
+		// #380 レビュー対応15: **IME 変換中は明示トリガーの分岐に入らない**
+		// （`preventDefault` もしない）。`refreshCompletion` 側で表示は抑止して
+		// いたが、キー自体をここで消費してしまうと、`Ctrl+Space` を入力ソース
+		// 切り替えに使っている IME の操作をアプリが握りつぶす。変換中に補完を
+		// 開く意味は無いので `Ctrl+.` も同じ扱いにして、そのまま IME へ渡す。
+		// 変換が終われば従来どおり両方で開ける。
+		const composing = exprCompletionComposing || event.isComposing;
+		if (
+			!composing &&
+			(event.ctrlKey || event.metaKey) &&
+			(event.code === 'Space' || event.key === '.')
+		) {
 			event.preventDefault();
 			refreshCompletion({ force: true });
 			return;
