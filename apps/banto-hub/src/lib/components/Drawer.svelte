@@ -106,6 +106,14 @@
 
 	/** `onRequestClose` 経由でクローズ可否を判定し、許可された場合だけ `onclose` を呼ぶ。 */
 	function requestClose(): void {
+		// #381 レビュー対応18回目: **閉じ処理は冪等**。outro（fade/fly）のあいだは
+		// パネルもオーバーレイもまだ DOM に居るので、`×` やオーバーレイをもう一度
+		// クリックするとここへ再入する。そのまま進むと `onRequestClose`（未保存の
+		// 破棄確認）が二重に出て、`onclose` の副作用も重複する。Esc・`×`・
+		// オーバーレイ・外部からの呼び出しのすべてがこの関数を通るので、
+		// ここ1箇所で塞ぐ（`closing` は `open` が再び true になったとき
+		// （下のフォーカス `$effect.pre`）に false へ戻る）。
+		if (closing) return;
 		if (onRequestClose && !onRequestClose()) return;
 		closing = true;
 		panelEl?.setAttribute(LAYER_INACTIVE_ATTR, 'true');

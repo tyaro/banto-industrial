@@ -34,7 +34,7 @@
  * `cleanupFixtures` を `beforeAll` の先頭と `afterAll` の両方で呼ぶ
  * （`banto-hub-fixture-cleanup.ts` 冒頭の doc comment）。
  */
-import { expect, test, type Locator, type Page } from '@playwright/test';
+import { expect, test, type Dialog, type Locator, type Page } from '@playwright/test';
 import { CSRF_HEADERS, fetchAuthToken, groupNodeByName, injectAuthToken } from './banto-hub-auth';
 import { cleanupFixtures } from './banto-hub-fixture-cleanup';
 
@@ -1043,5 +1043,41 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 
 		await page.getByPlaceholder('名前・アドレスで検索').fill('');
 		await page.setViewportSize(NARROW_VIEWPORT);
+	});
+
+	test('35. 閉じ遷移中に × を連打しても破棄確認は1回だけ（#381 レビュー対応18回目）', async () => {
+		// outro（fade/fly）のあいだパネルもオーバーレイも DOM に残るので、`×` を
+		// もう一度押すと `requestClose()` へ再入する。冪等でないと未保存の破棄確認が
+		// 二重に出て、`onclose` の副作用も重複する。
+		// 直前のテストが `/tags`（狭幅）を開いたままなので、ここでは遷移しない
+		// （フルリロードを挟まないぶん速く、認証の再解決も要らない）。
+		await expect(page.getByRole('heading', { level: 2, name: 'タグ登録' })).toBeVisible();
+		await page.getByPlaceholder('名前・アドレスで検索').fill(TAG_C);
+		await page.getByRole('gridcell', { name: TAG_C, exact: true }).click();
+		const editDrawer = page.getByRole('dialog', { name: `${TAG_C} を編集` });
+		await expect(editDrawer).toBeVisible();
+		await editDrawer.getByLabel('単位').fill('℃');
+
+		let dialogCount = 0;
+		const onDialog = (dialog: Dialog): void => {
+			dialogCount += 1;
+			void dialog.accept();
+		};
+		page.on('dialog', onDialog);
+		try {
+			const closeButton = editDrawer.getByRole('button', { name: '閉じる' });
+			await closeButton.click();
+			// outro 中（まだ DOM に居る）にもう一度押す。**座標クリックではなく
+			// 要素へ直接 click イベントを送る**: 消えかけのパネルへ `force` の座標
+			// クリックを撃つと、下にあるヘッダーのボタン（ログアウト等）を叩いて
+			// しまう（実測）。既に外れていれば例外になるので無視してよい。
+			await closeButton.dispatchEvent('click', { timeout: 2000 }).catch(() => {});
+			await expect(editDrawer).toHaveCount(0);
+			expect(dialogCount).toBe(1);
+		} finally {
+			page.off('dialog', onDialog);
+		}
+
+		await page.getByPlaceholder('名前・アドレスで検索').fill('');
 	});
 });
