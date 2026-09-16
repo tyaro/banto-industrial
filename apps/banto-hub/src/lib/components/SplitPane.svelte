@@ -22,8 +22,9 @@
 	 */
 	import type { Snippet } from 'svelte';
 	import { tick, untrack } from 'svelte';
-	import { hasVisibleLayerAbove, LAYER_ABOVE_SELECTOR } from './escLayering';
+	import { hasVisibleLayerAbove } from './escLayering';
 	import { restoreFocus } from './focusRestore';
+	import { focusablesIn } from './focusTrap';
 
 	interface Props {
 		/** 左ペイン幅（CSS の長さ文字列）。既定 280px。 */
@@ -135,11 +136,27 @@
 	 * `$effect` の「閉じたら戻す」枝が**遷移だけで**古いボタンへフォーカスを
 	 * 奪ってしまう。
 	 */
-	$effect(() => {
+	$effect.pre(() => {
 		if (narrow) return;
 		untrack(() => {
+			// #381 レビュー対応15回目: 狭幅のトグルは `{#if}` でこの更新中に
+			// アンマウントされ、`focusFallback()` も同じトグルを返すので、フォーカスが
+			// そこにあると戻し先が消えて `<body>` に落ちる。**遷移の前に**「トグル or
+			// 退避ペインの中にフォーカスがあったか」を見ておき、更新後に落ちていたら
+			// 広幅で普通に使えるようになった左ペインの先頭要素へ渡す。
+			const active = document.activeElement;
+			const hadFocusHere =
+				active instanceof HTMLElement &&
+				(active === focusFallback?.() || !!leftPaneEl?.contains(active));
 			triggerEl = null;
 			if (leftOpen) leftOpen = false;
+			if (!hadFocusHere) return;
+			void tick().then(() => {
+				if (document.activeElement !== document.body) return;
+				const node = leftPaneEl;
+				if (!node) return;
+				(focusablesIn(node)[0] ?? node).focus();
+			});
 		});
 	});
 
@@ -216,9 +233,12 @@
 	 *    （同じ window 上のリスナー同士では `stopPropagation` が効かないため、
 	 *    window 側で止めるのでは間に合わない）。
 	 * 2. 念のため window にも張る（フォーカスが左ペイン外にある場合の保険）。
-	 *    1 で処理済みのイベントは `defaultPrevented` で弾く。`target.closest(...)`
-	 *    は {@link hasVisibleLayerAbove} と同じ結論に早く達する近道として併用する
-	 *    だけ（発生元だけを見る判定では足りない理由は `escLayering.ts` の doc）。
+	 *    1 で処理済みのイベントは `defaultPrevented` で弾く。判定は
+	 *    {@link hasVisibleLayerAbove} **だけ**にする（#381 レビュー対応15回目）:
+	 *    以前は `event.target.closest(LAYER_ABOVE_SELECTOR)` を「同じ結論に早く
+	 *    達する近道」として併用していたが、**閉じ遷移中（非活性）の層の中から来た
+	 *    Esc まで捨ててしまい**、結論が変わっていた（近道の方は
+	 *    `data-layer-inactive` を見ない）。
 	 */
 	$effect(() => {
 		if (!offcanvasOpen) return;
@@ -235,10 +255,7 @@
 		};
 		const onWindowKeydown = (event: KeyboardEvent): void => {
 			if (event.key !== 'Escape' || event.defaultPrevented) return;
-			const target = event.target;
-			// 近道: 発生元が上位層の中ならそれ以上調べない。
-			if (target instanceof Element && target.closest(LAYER_ABOVE_SELECTOR)) return;
-			// 本命: 発生元がどこであれ、可視な上位層が出ていれば譲る。
+			// 発生元がどこであれ、可視で活性な上位層が出ていれば譲る。
 			if (hasVisibleLayerAbove()) return;
 			event.preventDefault();
 			closeLeft();

@@ -11,7 +11,11 @@
 	import Header from '$lib/components/Header.svelte';
 	import Sidebar from '$lib/components/Sidebar.svelte';
 	import CommandPalette from '$lib/components/CommandPalette.svelte';
-	import { hasVisibleLayerAbove, hasVisibleMenuLayer } from '$lib/components/escLayering';
+	import {
+		hasVisibleLayerAbove,
+		hasVisibleMenuLayer,
+		LAYER_MARKER_ATTR
+	} from '$lib/components/escLayering';
 	import { listPendingChanges } from '$lib/banto/pendingChangesAdmin';
 	import { countUnappliedPendingChanges } from '$lib/banto/pendingUnappliedCount';
 	import { commandPaletteStore } from '$lib/commandPalette.svelte';
@@ -51,7 +55,14 @@
 		// （同部品は banto-hub の DOM を知らないアプリ非依存の規約）、この約束を
 		// 守るのはこちらの責務。
 		if (event.key === 'Escape') {
-			if (event.defaultPrevented || hasVisibleLayerAbove()) return;
+			// #381 レビュー対応15回目: オフキャンバスが開いているあいだ、サイドバー
+			// 自身も層（`data-esc-layer`、z-index 710）として数えられるので、
+			// **自分を「上位層」と誤認して永遠に譲らないよう** `except` に渡す
+			// （Drawer 900・パレット 1000 には譲り、退避ツリー 610 には譲らない）。
+			// 要素は `Sidebar` から受け渡さず、マーカーで引く（`Sidebar` は開いて
+			// いるときだけこの属性を出す）。
+			const sidebarEl = document.querySelector(`[${LAYER_MARKER_ATTR}='sidebar']`);
+			if (event.defaultPrevented || hasVisibleLayerAbove({ except: sidebarEl })) return;
 			if (mobileNavStore.open) {
 				event.preventDefault();
 				mobileNavStore.closeNav();

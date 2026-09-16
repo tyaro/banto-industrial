@@ -11,6 +11,8 @@
 
 	let { pendingCount = 0 }: { pendingCount?: number } = $props();
 
+	let asideEl: HTMLElement | undefined = $state();
+
 	// #359 段階2: `item.activeMatch`（無ければ `item.path`）を基準に前方一致
 	// 判定する - `navigation.ts` の doc comment参照（`設定` は遷移先が
 	// `/settings/appearance` でも `/settings` 配下ならハイライトさせたい）。
@@ -28,8 +30,6 @@
 	// 適用しない - 狭幅では常にフルラベル表示にする。
 	const collapsed = $derived(!mobileNavStore.isNarrow && settings.sidebarCollapsed);
 
-	let asideEl: HTMLElement | undefined = $state();
-
 	/**
 	 * #381 レビュー対応12回目（層の約束・項目6、`escLayering.ts`）: **退避した
 	 * 瞬間、中にフォーカスが残っていたらヘッダーの ☰ へ逃がす**（`SplitPane` の
@@ -41,6 +41,19 @@
 	 * 拾えない）。**遷移したときだけ**動かす（`mobileNavStore` は状態を
 	 * オブジェクトごと差し替えるので、値が同じでも通知が飛ぶ）。
 	 */
+	/**
+	 * #381 レビュー対応15回目: 開いているオフキャンバスを**層として名乗る**
+	 * （`escLayering.ts::LAYER_MARKER_ATTR` = `data-esc-layer`）。`dialog`/`menu` を
+	 * 名乗らない常設ナビなので、これが無いと下の層（退避ツリー 610）から
+	 * 「上に層がある」と見えず、Esc が下から閉じてしまう。z-index は属性ではなく
+	 * CSS の 710 を `effectiveZIndex` が読む。**属性名は定数と同じ文字列を
+	 * マークアップへ直書きしている**（Svelte の属性名に定数を展開できないため -
+	 * 変えるときは両方直す）。広幅・閉じている間は付けない。
+	 */
+	const escLayerMarker = $derived(
+		mobileNavStore.isNarrow && mobileNavStore.open ? 'sidebar' : undefined
+	);
+
 	let navHiddenHandled = false;
 	$effect.pre(() => {
 		const hidden = mobileNavStore.isNarrow && !mobileNavStore.open;
@@ -77,6 +90,7 @@
 	class:offcanvas={mobileNavStore.isNarrow}
 	class:open={mobileNavStore.open}
 	inert={mobileNavStore.isNarrow && !mobileNavStore.open}
+	data-esc-layer={escLayerMarker}
 >
 	<div class="brand">
 		<span class="brand-icon">🏮</span>

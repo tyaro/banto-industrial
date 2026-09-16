@@ -886,4 +886,50 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(treeToggle).toBeFocused();
 		await page.getByPlaceholder('名前・アドレスで検索').fill('');
 	});
+
+	test('31. ペイン内にフォーカスがあっても、サイドバーが先に閉じる（#381 レビュー対応15回目）', async () => {
+		// サイドバー（710）は `dialog`/`menu` を名乗らないので、退避ツリー（610）から
+		// 「上の層」として見えず、ペイン内の Esc がツリーを先に閉じていた。
+		// 汎用マーカー `data-esc-layer` で層に入れたので、1層ずつ畳める。
+		await page.goto('/tags');
+		await treeToggle.click();
+		await expect(treePane).toBeVisible();
+		await page.getByRole('button', { name: 'メニューを開く' }).click();
+		await expect(page.getByRole('button', { name: 'メニューを閉じる', exact: true })).toBeVisible();
+
+		// フォーカスを**ペインの中**へ置く（ここが以前の抜け道）。
+		await treePane.getByRole('button', { name: 'PLC接続を追加' }).focus();
+
+		await page.keyboard.press('Escape');
+		await expect(page.getByRole('button', { name: 'メニューを開く' })).toBeVisible();
+		await expect(treePane).toBeVisible();
+
+		await page.keyboard.press('Escape');
+		await expect(treePane).toBeHidden();
+	});
+
+	test('32. 狭幅→広幅でトグルにフォーカスがあっても body に落ちない（#381 レビュー対応15回目）', async () => {
+		// 狭幅のトグルは広幅への更新と同時にアンマウントされ、`focusFallback()` も
+		// 同じトグルを返すので戻し先が無くなる。広幅で普通に使えるようになった
+		// 左ペインの先頭要素へ渡す。
+		await treeToggle.focus();
+		await expect(treeToggle).toBeFocused();
+
+		await page.setViewportSize({ width: 1280, height: 800 });
+		await expect(treeToggle).toHaveCount(0);
+
+		await expect
+			.poll(() =>
+				page.evaluate(() => {
+					const active = document.activeElement;
+					if (!active || active === document.body) return false;
+					// 広幅では退避パネルの id は付かないので、ツリー本体で判定する。
+					const tree = document.querySelector('[role="tree"]')?.closest('.pane-left');
+					return !!tree && tree.contains(active);
+				})
+			)
+			.toBe(true);
+
+		await page.setViewportSize(NARROW_VIEWPORT);
+	});
 });

@@ -17,7 +17,8 @@
  *    どちらも反応しない/トラップが両方とも引き戻さない、という穴があった）。
  *    `except` を渡さない呼び出し（自分は層ではない＝最下層のツリー・サイドバー）
  *    は従来どおり「可視で活性な層が1つでもあれば真」。`event.target` を見るだけ
- *    では足りない:
+ *    では足りない（**非モーダル層は role を名乗らないので
+ *    {@link LAYER_MARKER_ATTR} で層に入れる** - z は CSS の値をそのまま読む）:
  *    `Drawer.svelte` はタブ移動を閉じ込めない（同ファイル冒頭 doc）ので、
  *    ダイアログが出たままフォーカスだけが下の層に戻っていることがあり、その
  *    Esc は「発生元が上位層の中ではない」ので素通りしてしまう。
@@ -100,8 +101,16 @@
  */
 export const LAYER_INACTIVE_ATTR = 'data-layer-inactive';
 
-/** Esc で閉じる一時的な上位層が名乗る role（上の表を参照）。 */
-export const LAYER_ABOVE_SELECTOR = '[role="dialog"], [role="menu"]';
+/**
+ * role を名乗らない層のための**汎用マーカー**（#381 レビュー対応15回目）。
+ * オフキャンバスサイドバーのように `dialog`/`menu` ではない（常設ナビ）けれど
+ * 「上に重なっていて Esc で閉じる」層に、**開いているあいだだけ**付ける。
+ * z-index はマーカーではなく CSS の値を {@link effectiveZIndex} が読む。
+ */
+export const LAYER_MARKER_ATTR = 'data-esc-layer';
+
+/** Esc で閉じる一時的な上位層が名乗る role / マーカー（上の表を参照）。 */
+export const LAYER_ABOVE_SELECTOR = `[role="dialog"], [role="menu"], [${LAYER_MARKER_ATTR}]`;
 
 /** `[role="menu"]` の層（コンテキストメニュー）だけを指すセレクタ。 */
 export const MENU_LAYER_SELECTOR = '[role="menu"]';
