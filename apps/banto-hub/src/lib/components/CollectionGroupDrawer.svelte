@@ -149,6 +149,13 @@
 		onSaved: (group: CollectionGroup) => void;
 		/** 削除が成功した直後に呼ばれる。 */
 		onDeleted: (id: number) => void;
+		/**
+		 * #381 レビュー対応11回目: 閉じたときのフォーカスの戻し先の代替
+		 * （`Drawer.svelte`/`Modal.svelte` の同名 prop へそのまま渡すだけ）。
+		 * 右クリックメニューから開かれた場合、開いた元のメニュー項目は閉じる
+		 * ころには DOM に居ないため、呼び出し側が代わりの要素を指定できる。
+		 */
+		focusFallback?: () => HTMLElement | null | undefined;
 	}
 
 	let {
@@ -162,7 +169,8 @@
 		readOnly = false,
 		onClose,
 		onSaved,
-		onDeleted
+		onDeleted,
+		focusFallback
 	}: Props = $props();
 
 	/**
@@ -590,6 +598,7 @@
 		width="560px"
 		{dirty}
 		onBlockedClose={notifyBlockedClose}
+		{focusFallback}
 	>
 		<ol class="wizard-steps" aria-label="作成手順">
 			<li class:active={step === 1} class:done={step > 1}>1. 識別</li>
@@ -627,6 +636,7 @@
 		width="480px"
 		{dirty}
 		onBlockedClose={notifyBlockedClose}
+		{focusFallback}
 	>
 		{@render nameField()}
 		{@render destinationFields()}

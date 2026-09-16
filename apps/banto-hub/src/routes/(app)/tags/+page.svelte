@@ -30,7 +30,7 @@
 	import { sessionStore } from '$lib/session.svelte';
 	import { mobileNavStore } from '$lib/mobileNav.svelte';
 	import { pruneTreeFilter } from '$lib/banto/treeFilterPrune';
-	import { restoreFocus } from '$lib/components/focusRestore';
+	import { canRestoreFocusTo, restoreFocus } from '$lib/components/focusRestore';
 	import { hasVisibleLayerAbove } from '$lib/components/escLayering';
 	import { canWriteResources } from '$lib/permissions';
 	import Drawer from '$lib/components/Drawer.svelte';
@@ -3118,12 +3118,36 @@
 			treeContextMenu = null;
 			return;
 		}
+		const trigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+		// #381 レビュー対応11回目: メニュー経由で開く Drawer/Modal の戻し先
+		// （`resolveDrawerFocusFallback`）。メニュー自体は項目を選んだ直後に
+		// アンマウントされるので、ノードの方をページ側で覚えておく。
+		lastTreeMenuNodeEl = trigger;
 		treeContextMenu = {
 			x: position.x,
 			y: position.y,
 			items,
-			triggerEl: document.activeElement instanceof HTMLElement ? document.activeElement : null
+			triggerEl: trigger
 		};
+	}
+
+	/**
+	 * #381 レビュー対応11回目: 直近に右クリックしたツリーノード。メニューは項目を
+	 * 選んだ直後にアンマウントされる（`TreeContextMenu.activate()`）ので、そこから
+	 * 開いた Drawer/Modal が閉じるころには「開いた元」＝メニュー項目が DOM に
+	 * 居ない。その代わりの戻し先として、ページ側でノードを覚えておく
+	 * （`resolveDrawerFocusFallback`）。`$state` にしない（描画に使わない）。
+	 */
+	let lastTreeMenuNodeEl: HTMLElement | null = null;
+
+	/**
+	 * #381 レビュー対応11回目: Drawer/Modal の `focusFallback`。右クリックした
+	 * ノードが生きていればそれ、狭幅で退避パネルごと `inert` になっている等で
+	 * 戻せないならツリーのトグル（`closeTreeContextMenu` の fallback と同じ要素）。
+	 */
+	function resolveDrawerFocusFallback(): HTMLElement | null {
+		if (lastTreeMenuNodeEl && canRestoreFocusTo(lastTreeMenuNodeEl)) return lastTreeMenuNodeEl;
+		return treeToggleEl ?? null;
 	}
 
 	function closeTreeContextMenu(): void {
@@ -6789,6 +6813,7 @@
 	onClose={closeConnectionDrawer}
 	onSaved={handleConnectionDrawerSaved}
 	onDeleted={handleConnectionDrawerDeleted}
+	focusFallback={resolveDrawerFocusFallback}
 />
 
 <CollectionGroupDrawer
@@ -6803,6 +6828,7 @@
 	onClose={closeGroupDrawer}
 	onSaved={handleGroupDrawerSaved}
 	onDeleted={handleGroupDrawerDeleted}
+	focusFallback={resolveDrawerFocusFallback}
 />
 
 <!--
@@ -6962,6 +6988,7 @@
 	onRequestClose={confirmDiscardIfNeeded}
 	dirty={drawerMode === 'create' && isDrawerDirty()}
 	onBlockedClose={notifyBlockedClose}
+	focusFallback={resolveDrawerFocusFallback}
 >
 	{#if drawerMode === 'create' && canWrite}
 		{@render createFormBody()}
@@ -6984,6 +7011,7 @@
 	onRequestClose={confirmDiscardIfNeeded}
 	dirty={drawerMode !== null && drawerMode !== 'create' && isDrawerDirty()}
 	onBlockedClose={notifyBlockedClose}
+	focusFallback={resolveDrawerFocusFallback}
 >
 	{#if drawerMode === 'edit' && selected && canWrite}
 		{@render editFormBody()}

@@ -585,7 +585,54 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await page.getByPlaceholder('名前・アドレスで検索').fill('');
 	});
 
-	test('19. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
+	test('19. 広幅: 右クリックメニューから開いた Drawer を閉じると、フォーカスはノードへ戻る（#381 レビュー対応11回目）', async () => {
+		// メニューは項目を選んだ直後にアンマウントされる（`TreeContextMenu.activate`）
+		// ので、Drawer が覚えている「開いた元」＝メニュー項目は閉じるころには DOM に
+		// 居ない。呼び出し側が渡す `focusFallback`（右クリックしたノード）で拾う。
+		await page.setViewportSize({ width: 1280, height: 800 });
+		const node = groupNodeByName(page, GROUP_A);
+		await node.click({ button: 'right' });
+		await page.getByRole('menuitem', { name: '収集グループを再設定', exact: true }).click();
+
+		const groupDrawer = page.getByRole('dialog', { name: `${GROUP_A} を編集` });
+		await expect(groupDrawer).toBeVisible();
+
+		await page.keyboard.press('Escape');
+		await expect(groupDrawer).toHaveCount(0);
+		await expect(node).toBeFocused();
+	});
+
+	test('20. 狭幅でも同じ経路でフォーカスが生きた要素へ戻る（#381 レビュー対応11回目）', async () => {
+		await page.setViewportSize(NARROW_VIEWPORT);
+		await treeToggle.click();
+		await expect(treePane).toBeVisible();
+
+		await groupNodeByName(page, GROUP_A).click({ button: 'right' });
+		await page.getByRole('menuitem', { name: '収集グループを再設定', exact: true }).click();
+		const groupDrawer = page.getByRole('dialog', { name: `${GROUP_A} を編集` });
+		await expect(groupDrawer).toBeVisible();
+
+		await page.keyboard.press('Escape');
+		await expect(groupDrawer).toHaveCount(0);
+
+		// 戻り先は「右クリックしたノード（退避パネルは開いたままなので生きている）」
+		// か、それが `inert` 等で戻せないときのツリーのトグル。どちらにせよ
+		// `<body>` には落ちない。
+		expect(
+			await page.evaluate(() => {
+				const active = document.activeElement;
+				if (!active || active === document.body) return false;
+				const pane = document.getElementById('tags-tree-pane');
+				const toggle = document.querySelector('[data-testid="tag-tree-toggle"]');
+				return (!!pane && pane.contains(active)) || active === toggle;
+			})
+		).toBe(true);
+
+		await page.keyboard.press('Escape');
+		await expect(treePane).toBeHidden();
+	});
+
+	test('21. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
 		await page.goto('/monitor');
 		await expect(page.getByRole('heading', { level: 2, name: 'タグモニタ' })).toBeVisible();
 

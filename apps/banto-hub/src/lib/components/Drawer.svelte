@@ -67,6 +67,15 @@
 		 * のため、案内の実体は呼び出し側に委ねる。
 		 */
 		onBlockedClose?: () => void;
+		/**
+		 * #381 レビュー対応11回目: 閉じたときの**フォーカスの戻し先の代替**を返す
+		 * （`SplitPane` の同名 prop と同じ形）。開いた元は閉じるまでに消えることが
+		 * ある - 代表例が `TreeContextMenu` の項目から開いた場合で、メニューは項目を
+		 * 選んだ直後にアンマウントされるため、閉じるころには戻し先が DOM に居ない。
+		 * そのとき呼び出し側が「右クリックしたノード」等を返せるようにする。
+		 * 未指定・`null` なら何もしない（`<body>` へは落とさない）。
+		 */
+		focusFallback?: () => HTMLElement | null | undefined;
 		children?: Snippet;
 	}
 
@@ -79,6 +88,7 @@
 		onRequestClose,
 		dirty = false,
 		onBlockedClose,
+		focusFallback,
 		children
 	}: Props = $props();
 
@@ -147,7 +157,9 @@
 			} else {
 				const previous = triggerEl;
 				triggerEl = null;
-				restoreFocus(previous);
+				// 開いた元が死んでいれば呼び出し側の代替へ。代替にも同じ生存判定を
+				// かけたいので `restoreFocus` を入れ子にする。
+				restoreFocus(previous, () => restoreFocus(focusFallback?.() ?? null));
 			}
 		});
 	});
