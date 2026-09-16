@@ -31,6 +31,7 @@
 	import { mobileNavStore } from '$lib/mobileNav.svelte';
 	import { pruneTreeFilter } from '$lib/banto/treeFilterPrune';
 	import { restoreFocus } from '$lib/components/focusRestore';
+	import { hasVisibleLayerAbove } from '$lib/components/escLayering';
 	import { canWriteResources } from '$lib/permissions';
 	import Drawer from '$lib/components/Drawer.svelte';
 	import Modal from '$lib/components/Modal.svelte';
@@ -2034,6 +2035,14 @@
 			// ことがないようにする（`SplitPane` 側も広幅遷移で `false` へ戻すが、
 			// その書き戻しに依存しない二重の担保）。
 			if (treeOpen && mobileNavStore.isNarrow) return;
+			// #381 レビュー対応10回目（層の約束・項目2、`escLayering.ts`）:
+			// **ページ側の window Esc ハンドラも上位層があれば譲る。** このトグルは
+			// 広幅の右ペイン（層としては本文と同じ最下層）に属するので、Drawer/
+			// Modal・コマンドパレット・コンテキストメニューが出ているあいだの Esc を
+			// 食べてはいけない。`defaultPrevented` だけでは足りない - window
+			// リスナーは登録順に走り、**先に ON にしたこちらが後から開いた
+			// パレットより先**に実行される。
+			if (e.defaultPrevented || hasVisibleLayerAbove()) return;
 			if (e.key === 'Escape') insertArmed = false;
 		};
 		window.addEventListener('keydown', onKeydown);
@@ -2972,7 +2981,7 @@
 	});
 
 	/**
-	 * #381 レビュー対応8回目（層の約束・項目5、`escLayering.ts`）: **下位の層を
+	 * #381 レビュー対応8回目（層の約束・項目6、`escLayering.ts`）: **下位の層を
 	 * 開くなら上位の層を先に畳む。** サイドバー（z-index 710）はモーダルでは
 	 * ないのでフォーカストラップで塞げず、開いたまま Tab でヘッダー経由この
 	 * トグルへ到達できる。そのままツリー（610）を開くと重なりが逆順になり、

@@ -561,7 +561,31 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await page.getByPlaceholder('名前・アドレスで検索').fill('');
 	});
 
-	test('18. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
+	test('18. Drawer を閉じるとフォーカスは開いた元（グリッドの行）へ戻る（#381 レビュー対応10回目）', async () => {
+		// 層の約束・項目5（`escLayering.ts`）。`<body>` に落とすと、そこからの Tab は
+		// どのパネルの keydown も通らないので残りの層のトラップをすり抜ける。
+		await page.getByPlaceholder('名前・アドレスで検索').fill(TAG_A);
+		await page.getByRole('gridcell', { name: TAG_A, exact: true }).click();
+		const editDrawer = page.getByRole('dialog', { name: `${TAG_A} を編集` });
+		await expect(editDrawer).toBeVisible();
+
+		await page.keyboard.press('Escape');
+		await expect(editDrawer).toHaveCount(0);
+
+		// 行クリックでフォーカスを受けた要素（グリッド内）へ戻っている
+		// （`<body>` ではない）。
+		expect(
+			await page.evaluate(() => {
+				const grid = document.querySelector('[role="grid"]');
+				const active = document.activeElement;
+				return !!grid && !!active && grid.contains(active);
+			})
+		).toBe(true);
+
+		await page.getByPlaceholder('名前・アドレスで検索').fill('');
+	});
+
+	test('19. タグモニタでも 400px でツリーを開いて絞り込める', async () => {
 		await page.goto('/monitor');
 		await expect(page.getByRole('heading', { level: 2, name: 'タグモニタ' })).toBeVisible();
 

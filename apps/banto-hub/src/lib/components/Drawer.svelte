@@ -24,10 +24,12 @@
 	 * ントは banto-hub の型・ストアを import しない規約のため）。
 	 */
 	import type { Snippet } from 'svelte';
+	import { untrack } from 'svelte';
 	import { fade, fly } from 'svelte/transition';
 	import { isCloseAllowed } from './drawerCloseGuard';
 	import { hasVisibleLayerAbove } from './escLayering';
 	import { handleTrapKeydown } from './focusTrap';
+	import { restoreFocus } from './focusRestore';
 
 	interface Props {
 		open: boolean;
@@ -118,6 +120,37 @@
 		}
 		requestClose();
 	}
+
+	/**
+	 * #381 レビュー対応10回目（層の約束・項目5、`escLayering.ts`）: 開く前に
+	 * フォーカスがあった要素を覚えて、閉じたときに戻す。戻さないとフォーカスが
+	 * `<body>` へ落ち、そこからの Tab は**どのパネルの keydown も通らない**ので
+	 * 残っている層のトラップをすり抜ける。
+	 *
+	 * `$effect.pre`（DOM 更新の**前**）で拾うのが要点: 通常の `$effect` だと
+	 * `use:focusFirst` が先頭要素へフォーカスを移した後になり、開く前の要素が
+	 * 分からなくなる。**遷移したときだけ**動かすのは `SplitPane.svelte` と同じ
+	 * （値が同じでも通知が飛ぶことがある）。戻し先が消えている / `inert` の中なら
+	 * `restoreFocus` が何もしない（代わりの行き先は持たない）。
+	 */
+	let triggerEl: HTMLElement | null = null;
+	let openHandled = false;
+
+	$effect.pre(() => {
+		const isOpen = open;
+		untrack(() => {
+			if (isOpen === openHandled) return;
+			openHandled = isOpen;
+			if (isOpen) {
+				const active = document.activeElement;
+				triggerEl = active instanceof HTMLElement ? active : null;
+			} else {
+				const previous = triggerEl;
+				triggerEl = null;
+				restoreFocus(previous);
+			}
+		});
+	});
 
 	/**
 	 * #381 レビュー対応8回目: 開いている間、Tab / Shift+Tab をパネル内で循環させる
