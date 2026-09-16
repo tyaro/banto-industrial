@@ -31,6 +31,7 @@
 	import { mobileNavStore } from '$lib/mobileNav.svelte';
 	import { pruneTreeFilter } from '$lib/banto/treeFilterPrune';
 	import { canRestoreFocusTo, restoreFocus } from '$lib/components/focusRestore';
+	import { focusablesIn } from '$lib/components/focusTrap';
 	import { hasVisibleLayerAbove } from '$lib/components/escLayering';
 	import { canWriteResources } from '$lib/permissions';
 	import Drawer from '$lib/components/Drawer.svelte';
@@ -1346,6 +1347,7 @@
 		// #342 段階C: 「一覧から挿入」の解除はここでは行わない - `drawerMode` と
 		// `selected?.id` の変化を追う `$effect`（#379 レビュー対応2）が
 		// モード遷移・対象切替をまとめて OFF にする。
+		lastTreeMenuNodeEl = null;
 		drawerMode = 'edit'; // T13-1: 行クリック編集はドロワーで開く
 	}
 
@@ -2813,6 +2815,7 @@
 		// T19 S1-b（UX-34）: 新規タグは常に `writable` の自動計算から始まる
 		// （上の `createWritableTouched` 宣言のコメント参照）。
 		createWritableTouched = false;
+		lastTreeMenuNodeEl = null;
 		drawerMode = 'create';
 	}
 
@@ -2870,6 +2873,7 @@
 		// ツリー選択には従わない（従来どおり任意のグループへ変更できる）ため
 		// `false`（`createGroupLocked` 宣言のコメント参照）。
 		createGroupLocked = false;
+		lastTreeMenuNodeEl = null;
 		drawerMode = 'create';
 	}
 
@@ -2894,12 +2898,14 @@
 		if (registrationTarget !== null && registrationTarget.supportsContinuous) {
 			continuousForm.collectionGroupId = String(registrationTarget.groupId);
 		}
+		lastTreeMenuNodeEl = null;
 		drawerMode = 'continuous';
 	}
 
 	function openCsvDrawer(): void {
 		if (!confirmDiscardIfNeeded()) return;
 		editConflict = null;
+		lastTreeMenuNodeEl = null;
 		drawerMode = 'csv';
 	}
 
@@ -2917,9 +2923,6 @@
 		// Drawer に対して古い結果が届いても表示先が無いので無害だが、
 		// 不要な `/api/tags/batch` 呼び出し自体を止めておく。
 		if (addressPreflightTimer !== undefined) clearTimeout(addressPreflightTimer);
-		// #381 レビュー対応14回目: メニュー由来の戻し先は1回の開閉かぎり
-		// （`lastTreeMenuNodeEl` の doc 参照）。
-		lastTreeMenuNodeEl = null;
 	}
 
 	// T18-1: 画面遷移（サイドバーの他画面リンク等）でも Esc/× と同じ破棄
@@ -3138,10 +3141,15 @@
 	 * （`resolveDrawerFocusFallback`）。`$state` にしない（描画に使わない）。
 	 *
 	 * **紐付けは1回の開閉まで**（#381 レビュー対応14回目）: `activateTreeContextMenuAction`
-	 * （メニュー経由で開く唯一の経路）でセットし、**Drawer/Modal を閉じるときに
-	 * クリア**する。残したままだと、あとからグリッド行やツールバーで開いた
-	 * Drawer の戻し先が消えたとき（選択中タグの削除など）に、無関係な古いツリー
-	 * ノードへフォーカスが飛ぶ。
+	 * （メニュー経由で開く唯一の経路）でセットする。残したままだと、あとから
+	 * グリッド行やツールバーで開いた Drawer の戻し先が消えたとき（選択中タグの
+	 * 削除など）に、無関係な古いツリーノードへフォーカスが飛ぶ。
+	 *
+	 * **消すのは「次に開くとき」であって「閉じるとき」ではない**（#381 レビュー
+	 * 対応16回目）: `Drawer`/`Modal` の戻しは `tick()` の後に `focusFallback()` を
+	 * 呼ぶので、閉じる側で同期的に消すと「ノードはまだ在るのに戻せない」になる。
+	 * 各 open 系関数が自分でクリアし、メニュー経由の
+	 * `activateTreeContextMenuAction` だけが open のあとに紐付け直す。
 	 */
 	let lastTreeMenuNodeEl: HTMLElement | null = null;
 
@@ -3152,7 +3160,12 @@
 	 */
 	function resolveDrawerFocusFallback(): HTMLElement | null {
 		if (lastTreeMenuNodeEl && canRestoreFocusTo(lastTreeMenuNodeEl)) return lastTreeMenuNodeEl;
-		return treeToggleEl ?? null;
+		// 狭幅はツリーのトグル。**広幅にはトグルが無い**ので（`{#if isNarrow}`）、
+		// 常に在るツリー本体の先頭ノード（「すべて」）を返す（#381 レビュー対応
+		// 16回目 - 削除で戻し先のノードごと消えたときに `<body>` へ落ちないため）。
+		if (treeToggleEl) return treeToggleEl;
+		const tree = document.querySelector<HTMLElement>('[role="tree"]');
+		return tree ? (focusablesIn(tree)[0] ?? null) : null;
 	}
 
 	function closeTreeContextMenu(): void {
@@ -3250,6 +3263,7 @@
 		connectionDrawerTarget = null;
 		connectionDrawerRequestDelete = false;
 		connectionDrawerReadOnly = false;
+		lastTreeMenuNodeEl = null;
 		connectionDrawerOpen = true;
 	}
 
@@ -3262,6 +3276,7 @@
 		connectionDrawerTarget = target;
 		connectionDrawerRequestDelete = false;
 		connectionDrawerReadOnly = false;
+		lastTreeMenuNodeEl = null;
 		connectionDrawerOpen = true;
 	}
 
@@ -3284,6 +3299,7 @@
 		connectionDrawerTarget = target;
 		connectionDrawerRequestDelete = false;
 		connectionDrawerReadOnly = true;
+		lastTreeMenuNodeEl = null;
 		connectionDrawerOpen = true;
 	}
 
@@ -3303,12 +3319,12 @@
 		connectionDrawerTarget = target;
 		connectionDrawerRequestDelete = true;
 		connectionDrawerReadOnly = false;
+		lastTreeMenuNodeEl = null;
 		connectionDrawerOpen = true;
 	}
 
 	function closeConnectionDrawer(): void {
 		connectionDrawerOpen = false;
-		lastTreeMenuNodeEl = null;
 	}
 
 	async function handleConnectionDrawerSaved(): Promise<void> {
@@ -3336,6 +3352,7 @@
 		groupDrawerPresetConnectionId = presetConnectionId;
 		groupDrawerRequestDelete = false;
 		groupDrawerReadOnly = false;
+		lastTreeMenuNodeEl = null;
 		groupDrawerOpen = true;
 	}
 
@@ -3349,6 +3366,7 @@
 		groupDrawerPresetConnectionId = null;
 		groupDrawerRequestDelete = false;
 		groupDrawerReadOnly = false;
+		lastTreeMenuNodeEl = null;
 		groupDrawerOpen = true;
 	}
 
@@ -3367,6 +3385,7 @@
 		groupDrawerPresetConnectionId = null;
 		groupDrawerRequestDelete = false;
 		groupDrawerReadOnly = true;
+		lastTreeMenuNodeEl = null;
 		groupDrawerOpen = true;
 	}
 
@@ -3386,12 +3405,12 @@
 		groupDrawerPresetConnectionId = null;
 		groupDrawerRequestDelete = true;
 		groupDrawerReadOnly = false;
+		lastTreeMenuNodeEl = null;
 		groupDrawerOpen = true;
 	}
 
 	function closeGroupDrawer(): void {
 		groupDrawerOpen = false;
-		lastTreeMenuNodeEl = null;
 	}
 
 	async function handleGroupDrawerSaved(): Promise<void> {
@@ -3764,6 +3783,7 @@
 		if (registrationTarget !== null && registrationTarget.supportsContinuous) {
 			structForm.collectionGroupId = String(registrationTarget.groupId);
 		}
+		lastTreeMenuNodeEl = null;
 		drawerMode = 'struct';
 	}
 

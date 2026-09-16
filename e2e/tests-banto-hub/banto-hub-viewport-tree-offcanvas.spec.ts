@@ -932,4 +932,39 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 
 		await page.setViewportSize(NARROW_VIEWPORT);
 	});
+
+	test('33. 広幅で右クリックから接続を削除しても、フォーカスは body に落ちない（#381 レビュー対応16回目）', async () => {
+		// `ConnectionDrawer`/`CollectionGroupDrawer` は削除後の再読込を待たずに
+		// 閉じていたため、戻しが「消える予定のノード」へ向かい、直後の再読込で
+		// フォーカスが `<body>` に落ちていた（広幅はツリーのトグルが無いので
+		// 代替も無かった）。再読込を待ってから閉じ、広幅の fallback として
+		// ツリーの先頭ノードを返すようにした。
+		await page.setViewportSize({ width: 1280, height: 800 });
+		await page.goto('/tags');
+		await page.getByRole('tree').getByRole('button', { name: CONNECTION_NAME }).click({
+			button: 'right'
+		});
+		await page.getByRole('menuitem', { name: '接続を削除', exact: true }).click();
+
+		const connectionDrawer = page.getByRole('dialog', { name: `${CONNECTION_NAME} を編集` });
+		await expect(connectionDrawer).toBeVisible();
+
+		page.once('dialog', (dialog) => void dialog.accept());
+		await connectionDrawer.getByRole('button', { name: '削除', exact: true }).click();
+		await expect(connectionDrawer).toHaveCount(0);
+
+		// 消えたノードでも `<body>` でもなく、ツリー内の生きた要素へ。
+		await expect
+			.poll(() =>
+				page.evaluate(() => {
+					const active = document.activeElement;
+					if (!active || active === document.body) return false;
+					const tree = document.querySelector('[role="tree"]');
+					return !!tree && tree.contains(active);
+				})
+			)
+			.toBe(true);
+
+		await page.setViewportSize(NARROW_VIEWPORT);
+	});
 });

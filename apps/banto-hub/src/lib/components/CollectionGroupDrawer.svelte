@@ -147,8 +147,13 @@
 		onClose: () => void;
 		/** 作成/更新が成功した直後に呼ばれる（202キュー投入時は呼ばれない — まだ確定していないため）。 */
 		onSaved: (group: CollectionGroup) => void;
-		/** 削除が成功した直後に呼ばれる。 */
-		onDeleted: (id: number) => void;
+		/**
+		 * 削除が成功した直後に呼ばれる。**Promise を返せば完了を待ってから閉じる**
+		 * （#381 レビュー対応16回目）: 呼び出し側の再読込（`reload()`）を待たずに
+		 * 閉じると、`Drawer`/`Modal` のフォーカス戻しが「消える予定の行/ノード」へ
+		 * 戻してしまい、直後に再読込がそれを消してフォーカスが `<body>` に落ちる。
+		 */
+		onDeleted: (id: number) => void | Promise<void>;
 		/**
 		 * #381 レビュー対応11回目: 閉じたときのフォーカスの戻し先の代替
 		 * （`Drawer.svelte`/`Modal.svelte` の同名 prop へそのまま渡すだけ）。
@@ -447,7 +452,8 @@
 		try {
 			await deleteCollectionGroup(group.id);
 			toastStore.push('success', '削除しました');
-			onDeleted(group.id);
+			// 再読込（`onDeleted`）の完了を待ってから閉じる - 上の prop の doc 参照。
+			await onDeleted(group.id);
 			onClose();
 		} catch (err) {
 			if (isQueuedWhileRunningError(err)) {
