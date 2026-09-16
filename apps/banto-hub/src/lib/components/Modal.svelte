@@ -38,7 +38,7 @@
 	import { fade, scale } from 'svelte/transition';
 	import { isCloseAllowed } from './drawerCloseGuard';
 	import { hasVisibleLayerAbove, LAYER_INACTIVE_ATTR } from './escLayering';
-	import { handleTrapKeydown } from './focusTrap';
+	import { attachFocusTrap } from './focusTrap';
 	import { restoreFocus } from './focusRestore';
 
 	interface Props {
@@ -191,9 +191,7 @@
 		if (!open) return;
 		const node = panelEl;
 		if (!node) return;
-		const onKeydown = (event: KeyboardEvent): void => handleTrapKeydown(node, event);
-		node.addEventListener('keydown', onKeydown);
-		return () => node.removeEventListener('keydown', onKeydown);
+		return attachFocusTrap(node);
 	});
 
 	/** 開いた直後、パネル内の最初のフォーカス可能要素へフォーカスする。 */

@@ -703,7 +703,71 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await page.getByPlaceholder('名前・アドレスで検索').fill('');
 	});
 
-	test('24. 退避したサイドバーの中にフォーカスを残さない（#381 レビュー対応12回目）', async () => {
+	test('24. パネルの外へ飛ばされたフォーカスはトラップが引き戻す（#381 レビュー対応13回目）', async () => {
+		// トラップがパネルの `keydown` だけだと、**プログラム的な `focus()` で
+		// 一度外へ出たあとの Tab はパネルの外で起きる**ので届かない。document の
+		// `focusin` で引き戻す（`focusTrap.ts`）。
+		await page.goto('/tags');
+		await page.getByPlaceholder('名前・アドレスで検索').fill(TAG_B);
+		await page.getByRole('gridcell', { name: TAG_B, exact: true }).click();
+		const editDrawer = page.getByRole('dialog', { name: `${TAG_B} を編集` });
+		await expect(editDrawer).toBeVisible();
+
+		await page.evaluate(() => {
+			document.querySelector<HTMLElement>('[data-testid="tag-tree-toggle"]')?.focus();
+		});
+
+		await expect
+			.poll(() =>
+				page.evaluate(() => {
+					const panel = document.querySelector('[role="dialog"][aria-modal="true"]');
+					const active = document.activeElement;
+					return !!panel && !!active && panel.contains(active);
+				})
+			)
+			.toBe(true);
+
+		await page.keyboard.press('Escape');
+		await expect(editDrawer).toHaveCount(0);
+	});
+
+	test('25. 開いた時点のフォーカスが body でも、閉じたら fallback へ戻る（#381 レビュー対応13回目）', async () => {
+		// `<body>` を「生きた戻し先」と見なすと fallback が飛ばされ、閉じたあと
+		// フォーカスがどこにも無いままになる（`focusRestore.ts`）。
+		await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+		// クリックすると行にフォーカスが移ってしまうので、`<body>` にフォーカスが
+		// 無い状態のままイベントだけ送る。
+		await page.getByRole('gridcell', { name: TAG_B, exact: true }).dispatchEvent('click');
+		const editDrawer = page.getByRole('dialog', { name: `${TAG_B} を編集` });
+		await expect(editDrawer).toBeVisible();
+
+		await page.keyboard.press('Escape');
+		await expect(editDrawer).toHaveCount(0);
+		// 戻し先（body）は拒否されるので `focusFallback`（ツリーのトグル）へ。
+		await expect(treeToggle).toBeFocused();
+		await page.getByPlaceholder('名前・アドレスで検索').fill('');
+	});
+
+	test('26. メニューはフォーカスが外れたら閉じ、Esc は下の層へ届く（#381 レビュー対応13回目）', async () => {
+		await treeToggle.click();
+		await expect(treePane).toBeVisible();
+		await groupNodeByName(page, GROUP_A).click({ button: 'right' });
+		const menu = page.getByRole('menu', { name: '作成メニュー' });
+		await expect(menu).toBeVisible();
+
+		// フォーカスをメニューの外へ飛ばす（「見えているのにフォーカスは外」と
+		// いう状態を作らせない）。
+		await page.evaluate(() => {
+			document.querySelector<HTMLElement>('[data-testid="tag-tree-toggle"]')?.focus();
+		});
+		await expect(menu).toHaveCount(0);
+
+		// メニューが残っていないので、Esc は下の層（退避ツリー）へ届く。
+		await page.keyboard.press('Escape');
+		await expect(treePane).toBeHidden();
+	});
+
+	test('27. 退避したサイドバーの中にフォーカスを残さない（#381 レビュー対応12回目）', async () => {
 		// 狭幅のサイドバーは `translateX(-100%)` で退避するだけだったので、閉じた
 		// あとも中のナビ項目がフォーカスを受けられた（`inert` + `visibility: hidden`
 		// で「無い」ことを明示した - `escLayering.ts` の層の約束・項目6）。あわせて

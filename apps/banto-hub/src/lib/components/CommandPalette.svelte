@@ -4,7 +4,7 @@
 	import { isProviderError, notify, searchCommands, type PaletteCommand } from '@banto/admin-core';
 	import { buildCommands, loadRecentCommandIds, recordRecentCommand } from '$lib/commands';
 	import { commandPaletteStore } from '$lib/commandPalette.svelte';
-	import { handleTrapKeydown } from './focusTrap';
+	import { attachFocusTrap } from './focusTrap';
 	import { restoreFocus } from './focusRestore';
 
 	const commands = buildCommands();
@@ -98,9 +98,7 @@
 	$effect(() => {
 		const node = paletteEl;
 		if (!node) return;
-		const onKeydown = (event: KeyboardEvent): void => handleTrapKeydown(node, event);
-		node.addEventListener('keydown', onKeydown);
-		return () => node.removeEventListener('keydown', onKeydown);
+		return attachFocusTrap(node);
 	});
 
 	function clampIndex(next: number): number {

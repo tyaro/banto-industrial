@@ -23,6 +23,8 @@
  * 顔ぶれが変わるので、**毎回数え直す**（開いた時点でキャッシュしない）。
  */
 
+import { hasVisibleLayerAbove } from './escLayering';
+
 /** 両部品の `focusFirst` と同じ列挙。 */
 export const FOCUSABLE_SELECTOR =
 	'input, select, textarea, button, a[href], [tabindex]:not([tabindex="-1"])';
@@ -40,7 +42,7 @@ export function focusablesIn(panel: HTMLElement): HTMLElement[] {
  * フォーカス可能要素が1つも無いときは、パネルの外へ出さないことだけを担保する
  * （`preventDefault` するがフォーカスは動かさない）。
  */
-export function handleTrapKeydown(panel: HTMLElement, event: KeyboardEvent): void {
+function handleTrapKeydown(panel: HTMLElement, event: KeyboardEvent): void {
 	if (event.key !== 'Tab') return;
 	const items = focusablesIn(panel);
 	if (items.length === 0) {
@@ -50,14 +52,47 @@ export function handleTrapKeydown(panel: HTMLElement, event: KeyboardEvent): voi
 	const first = items[0];
 	const last = items[items.length - 1];
 	const active = document.activeElement;
-	const inside = active instanceof HTMLElement && panel.contains(active);
 	if (event.shiftKey) {
-		if (!inside || active === first) {
+		if (active === first) {
 			event.preventDefault();
 			last.focus();
 		}
-	} else if (!inside || active === last) {
+	} else if (active === last) {
 		event.preventDefault();
 		first.focus();
 	}
+}
+
+/**
+ * `panel` にフォーカストラップを張り、外す関数を返す（#381 レビュー対応13回目で
+ * **入口をこれ1つに統一**した - Drawer / Modal / CommandPalette で同じ2つの
+ * リスナーを書き写さない）。
+ *
+ * 2段構え:
+ * 1. **パネルの `keydown`**: Tab / Shift+Tab をパネル内で循環させる
+ *    （末尾 → 先頭 / 先頭 → 末尾）。
+ * 2. **document の `focusin`**: パネルの外へ着地したフォーカスを先頭要素へ
+ *    引き戻す。1 だけでは足りない - **プログラム的な `focus()` などで一度外へ
+ *    出てしまうと、その後の Tab はパネルの外で発生するのでパネルの keydown
+ *    リスナーには届かない**（外に出た状態からの復帰経路が無い）。
+ *
+ * ただし**自分より手前の層が出ているあいだは引き戻さない**
+ * （{@link hasVisibleLayerAbove}）: 入れ子（Drawer の上にコマンドパレット等）で
+ * 下の層が上の層からフォーカスを奪い合うのを避けるため。
+ */
+export function attachFocusTrap(panel: HTMLElement): () => void {
+	const onKeydown = (event: KeyboardEvent): void => handleTrapKeydown(panel, event);
+	const onFocusIn = (event: FocusEvent): void => {
+		const target = event.target;
+		if (target instanceof Node && panel.contains(target)) return;
+		if (hasVisibleLayerAbove({ except: panel })) return;
+		const items = focusablesIn(panel);
+		(items[0] ?? panel).focus();
+	};
+	panel.addEventListener('keydown', onKeydown);
+	document.addEventListener('focusin', onFocusIn);
+	return () => {
+		panel.removeEventListener('keydown', onKeydown);
+		document.removeEventListener('focusin', onFocusIn);
+	};
 }

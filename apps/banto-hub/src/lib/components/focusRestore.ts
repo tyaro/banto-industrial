@@ -23,6 +23,11 @@
 
 /** `el` にフォーカスを戻せるか（DOM に居る・`inert` の中でない・可視）。 */
 export function canRestoreFocusTo(el: HTMLElement): boolean {
+	// `<body>`/`<html>` は「戻し先」にならない（#381 レビュー対応13回目）:
+	// 層を開いた時点のフォーカスが `<body>`（どこもフォーカスしていない状態）
+	// だったとき、これを生きた戻し先として受け入れると fallback が飛ばされ、
+	// 閉じたあとフォーカスがどこにも無いままになる。
+	if (el === document.body || el === document.documentElement) return false;
 	if (!el.isConnected) return false;
 	if (el.closest('[inert]')) return false;
 	if (el.getClientRects().length === 0) return false;

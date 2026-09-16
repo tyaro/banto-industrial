@@ -3151,7 +3151,13 @@
 	}
 
 	function closeTreeContextMenu(): void {
-		const trigger = treeContextMenu?.triggerEl;
+		// #381 レビュー対応13回目: **二重呼び出しでは何もしない。** メニューは
+		// 「項目を選んだ」「Esc」「フォーカスが外れた（`focusout`）」の複数経路から
+		// 閉じ、同じ操作で2回呼ばれることがある（Esc → 戻し先へフォーカスが移る →
+		// それ自体が `focusout`）。2回目は `triggerEl` を失っているので、そのまま
+		// 進むと fallback が走って**1回目に戻したフォーカスを奪う**。
+		if (!treeContextMenu) return;
+		const trigger = treeContextMenu.triggerEl;
 		treeContextMenu = null;
 		// #381 レビュー対応5回目: 戻り先（右クリックしたツリーノード）が
 		// **`inert` の中に入っていることがある** - メニューを開いたまま広幅→狭幅へ
