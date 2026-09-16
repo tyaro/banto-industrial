@@ -39,8 +39,9 @@
  * **同じ z 順の層を同時に出さないのは呼び出し側の責務**: この判定は role と可視性
  * しか見ないので、同じ層の2つ（例: 接続 Drawer と収集グループ Drawer、どちらも
  * 900）を同時に開くと互いを「手前の層」と見なして**どちらも Esc で閉じなくなる**。
- * 元々同時に出さない設計なので、開く側で相手を閉じること
- * （`tags/+page.svelte::closeResourceDrawers`）。
+ * 元々同時に出さない設計なので、**相手が開いているあいだは開かないこと**
+ * （`tags/+page.svelte::blockedByOtherResourceDrawer`）。相手を閉じる側に倒すと、
+ * 相手の未保存入力を黙って捨てることになる（#376 で塞いだ事故と同じ）。
  *
  * {@link LAYER_ABOVE_SELECTOR} が拾うのは **Esc で閉じる一時的な UI**
  * （`dialog` = Drawer/Modal/CommandPalette、`menu` = TreeContextMenu）だけ。

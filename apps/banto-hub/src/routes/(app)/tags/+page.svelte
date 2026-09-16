@@ -3147,32 +3147,42 @@
 	let groupDrawerReadOnly = $state(false);
 
 	/**
-	 * #381 レビュー対応7回目: **接続 Drawer と収集グループ Drawer を同時に出さない。**
-	 * どちらも `Modal`/`Drawer`（z-index 900）で**同じ層**なので、2つ開くと Esc の
-	 * 層判定（`escLayering.ts::hasVisibleLayerAbove`）が互いを「手前の層」と見なして
+	 * #381 レビュー対応7回目（8回目で「閉じる」→「開かせない」へ改めた）:
+	 * **接続 Drawer と収集グループ Drawer を同時に出さない。** どちらも
+	 * `Modal`/`Drawer`（z-index 900）で**同じ層**なので、2つ開くと Esc の層判定
+	 * （`escLayering.ts::hasVisibleLayerAbove`）が互いを「手前の層」と見なして
 	 * **どちらも閉じなくなる**（同じ z 順の2層は判定では区別できない - 同時に
-	 * 出さないのは呼び出し側の責務、と同 doc に明記した）。フォーカストラップが
-	 * 無いため、キーボードでツリーツールバーのもう一方のボタンへ到達して両方
-	 * 開ける経路が実在した。
+	 * 出さないのは呼び出し側の責務、と同 doc に明記した）。`Modal`/`Drawer` は
+	 * タブ移動を閉じ込めないため、キーボードでツリーツールバーのもう一方の
+	 * ボタンへ到達して両方開ける経路が実在する。
 	 *
-	 * 元々「同時に複数 Drawer を出さない」設計（下の各 open系関数が
-	 * `closeDrawer()` でタグ Drawer を閉じている）なので、その隣で相手側も閉じる。
-	 * **相手の未保存確認は通せない**: `ConnectionDrawer`/`CollectionGroupDrawer` は
-	 * dirty 判定を内部に持っていて（`isFormDirty` + 自前の `baseline`）ページからは
-	 * 参照できず、確認を通すには両部品へ新しい口を足すことになる。ここでは
-	 * 「同時に出さない」を優先した - この経路自体がキーボードでしか踏めない
-	 * 例外的なもので、通常の導線（ツリーの右クリック・常設ボタン）では相手は
-	 * 開いていない。
+	 * **相手を閉じるのではなく、こちらを開かせない。** 相手の未保存確認を通せない
+	 * （`ConnectionDrawer`/`CollectionGroupDrawer` は dirty 判定を内部の `baseline`
+	 * で持っていてページからは参照できない）ので、閉じる側に倒すと**入力途中の
+	 * 内容が黙って消える** - #376 で塞いだ「未保存の誤爆クローズ」と同じ事故に
+	 * なる。既に開いている側はそのまま残し、何も起きないように見えないよう案内の
+	 * トーストを出す。タグ Drawer との関係（各 open系関数の `closeDrawer()`）は
+	 * 変えない - そちらは `confirmDiscardIfNeeded()` を先に通していて安全。
+	 *
+	 * `true` を返したら呼び出し元は**何もせず return する**こと（トーストは
+	 * ここで1回出す）。
 	 */
-	function closeResourceDrawers(): void {
-		connectionDrawerOpen = false;
-		groupDrawerOpen = false;
+	function blockedByOtherResourceDrawer(target: 'connection' | 'group'): boolean {
+		const otherOpen = target === 'connection' ? groupDrawerOpen : connectionDrawerOpen;
+		if (!otherOpen) return false;
+		toastStore.push(
+			'info',
+			target === 'connection'
+				? '先に開いている収集グループの設定を閉じてください'
+				: '先に開いている PLC 接続の設定を閉じてください'
+		);
+		return true;
 	}
 
 	function openConnectionCreateDrawer(): void {
+		if (blockedByOtherResourceDrawer('connection')) return;
 		if (!confirmDiscardIfNeeded()) return;
 		closeDrawer(); // タグ Drawer が開いていれば閉じる（同時に複数 Drawer を出さない）。
-		closeResourceDrawers();
 		connectionDrawerTarget = null;
 		connectionDrawerRequestDelete = false;
 		connectionDrawerReadOnly = false;
@@ -3180,11 +3190,11 @@
 	}
 
 	function openConnectionEditDrawer(connectionId: number): void {
+		if (blockedByOtherResourceDrawer('connection')) return;
 		const target = connections.find((c) => c.id === connectionId);
 		if (!target) return; // 通常起きない（右クリック直後は必ず存在する）が、念のため無視する。
 		if (!confirmDiscardIfNeeded()) return;
 		closeDrawer();
-		closeResourceDrawers();
 		connectionDrawerTarget = target;
 		connectionDrawerRequestDelete = false;
 		connectionDrawerReadOnly = false;
@@ -3202,11 +3212,11 @@
 	 * と同じ理由）。
 	 */
 	function openConnectionViewDrawer(connectionId: number): void {
+		if (blockedByOtherResourceDrawer('connection')) return;
 		const target = connections.find((c) => c.id === connectionId);
 		if (!target) return;
 		if (!confirmDiscardIfNeeded()) return;
 		closeDrawer();
-		closeResourceDrawers();
 		connectionDrawerTarget = target;
 		connectionDrawerRequestDelete = false;
 		connectionDrawerReadOnly = true;
@@ -3221,11 +3231,11 @@
 	 * ここでは独自の削除処理を持たない（実装指示の制約）。
 	 */
 	function openConnectionDeleteFlow(connectionId: number): void {
+		if (blockedByOtherResourceDrawer('connection')) return;
 		const target = connections.find((c) => c.id === connectionId);
 		if (!target) return;
 		if (!confirmDiscardIfNeeded()) return;
 		closeDrawer();
-		closeResourceDrawers();
 		connectionDrawerTarget = target;
 		connectionDrawerRequestDelete = true;
 		connectionDrawerReadOnly = false;
@@ -3254,9 +3264,9 @@
 	 * `presetConnectionId` は省略可能にした（既定 `null` = 未選択）。
 	 */
 	function openGroupCreateDrawer(presetConnectionId: number | null = null): void {
+		if (blockedByOtherResourceDrawer('group')) return;
 		if (!confirmDiscardIfNeeded()) return;
 		closeDrawer();
-		closeResourceDrawers();
 		groupDrawerTarget = null;
 		groupDrawerPresetConnectionId = presetConnectionId;
 		groupDrawerRequestDelete = false;
@@ -3265,11 +3275,11 @@
 	}
 
 	function openGroupEditDrawer(groupId: number): void {
+		if (blockedByOtherResourceDrawer('group')) return;
 		const target = groups.find((g) => g.id === groupId);
 		if (!target) return;
 		if (!confirmDiscardIfNeeded()) return;
 		closeDrawer();
-		closeResourceDrawers();
 		groupDrawerTarget = target;
 		groupDrawerPresetConnectionId = null;
 		groupDrawerRequestDelete = false;
@@ -3283,11 +3293,11 @@
 	 * （calc/mem）配下のグループでも制限しない。
 	 */
 	function openGroupViewDrawer(groupId: number): void {
+		if (blockedByOtherResourceDrawer('group')) return;
 		const target = groups.find((g) => g.id === groupId);
 		if (!target) return;
 		if (!confirmDiscardIfNeeded()) return;
 		closeDrawer();
-		closeResourceDrawers();
 		groupDrawerTarget = target;
 		groupDrawerPresetConnectionId = null;
 		groupDrawerRequestDelete = false;
@@ -3302,11 +3312,11 @@
 	 * 含む）を1回だけ呼ばせる。
 	 */
 	function openGroupDeleteFlow(groupId: number): void {
+		if (blockedByOtherResourceDrawer('group')) return;
 		const target = groups.find((g) => g.id === groupId);
 		if (!target) return;
 		if (!confirmDiscardIfNeeded()) return;
 		closeDrawer();
-		closeResourceDrawers();
 		groupDrawerTarget = target;
 		groupDrawerPresetConnectionId = null;
 		groupDrawerRequestDelete = true;

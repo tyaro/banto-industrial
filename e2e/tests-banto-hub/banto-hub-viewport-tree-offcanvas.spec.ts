@@ -438,10 +438,11 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(treeToggle).toBeFocused();
 	});
 
-	test('14. 接続 Drawer とグループ Drawer は同時に開かない（#381 レビュー対応7回目）', async () => {
+	test('14. 接続 Drawer が開いている間はグループ Drawer を開かない（未保存入力を捨てない、#381 レビュー対応8回目）', async () => {
 		// 同じ層（z-index 900）を2つ開くと、Esc の層判定が互いを「手前の層」と
 		// 見なしてどちらも閉じなくなる（`escLayering.ts` の doc）。同時に出さない
-		// のは呼び出し側の責務なので、開く側で相手を閉じる。
+		// のは呼び出し側の責務だが、**相手を閉じる**側に倒すと相手の未保存入力を
+		// 黙って捨てる（#376 で塞いだ事故と同じ）ので、**こちらを開かせない**。
 		await treeToggle.click();
 		await expect(treePane).toBeVisible();
 		await treePane.getByRole('button', { name: 'PLC接続を追加' }).click();
@@ -451,18 +452,26 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		// 接続ウィザードの手順（グループのウィザードとは2段目の文言が違う）。
 		await expect(createModal).toContainText('プロトコルと接続先');
 
+		// 入力途中にする（これが捨てられてはいけない）。
+		const nameField = createModal.getByLabel('名前');
+		await nameField.fill('e2e-tree-oc-wip');
+
 		// モーダルのオーバーレイがツリーを覆うのでクリックでは届かない -
 		// キーボードで到達してボタンを押した場合と同じことを直接の click
 		// イベントで再現する（`Drawer`/`Modal` はタブ移動を閉じ込めない）。
 		await treePane.getByRole('button', { name: '収集グループを追加' }).dispatchEvent('click');
 
-		// 接続側は閉じ、グループ側だけが開いている。
+		// 案内が出るだけで、接続側は開いたまま・入力も残る（グループ側は開かない）。
+		await expect(page.getByText('先に開いている PLC 接続の設定を閉じてください')).toBeVisible();
 		await expect(createModal).toHaveCount(1);
-		await expect(createModal).toContainText('接続先と周期');
-		await expect(createModal).not.toContainText('プロトコルと接続先');
+		await expect(createModal).toContainText('プロトコルと接続先');
+		await expect(createModal).not.toContainText('接続先と周期');
+		await expect(nameField).toHaveValue('e2e-tree-oc-wip');
 
-		// 1つしか開いていないので Esc で閉じられる。
-		await page.keyboard.press('Escape');
+		// 1つしか開いていないので Esc で閉じられる（未保存なので確認を挟む -
+		// `Modal` は dirty のとき Esc では閉じないので `×` から閉じる）。
+		page.once('dialog', (dialog) => void dialog.accept());
+		await createModal.getByRole('button', { name: '閉じる' }).click();
 		await expect(createModal).toHaveCount(0);
 
 		await page.keyboard.press('Escape');
