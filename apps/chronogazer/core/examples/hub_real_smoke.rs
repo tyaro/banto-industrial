@@ -253,6 +253,10 @@ fn print_catalog_table(tags: &[HubTagView]) {
     }
 }
 
+/// `t` 列は [`HubValueView::t`]（epoch ミリ秒、`format_last_value_at` の
+/// doc comment参照）をそのまま生の整数で出す - 日時に整形していないので
+/// `lastValueAt` にあった秒/ミリ秒の取り違えは起こらない
+/// （2026-09-17 オーナー実機確認: この列は問題なしと確認済み）。
 fn print_value_table(values: &[HubValueView]) {
     if values.is_empty() {
         println!("  (値なし)");
@@ -344,13 +348,18 @@ fn unix_seconds_to_utc_string(secs: i64) -> String {
     )
 }
 
-/// [`HubSubscriptionView::last_value_at`] を表示用に整形する。`None` は
-/// 「まだ受信していません」であって時刻の欠落ではないので、そのまま伝える
-/// （`0` などに丸めない - `chronogazer_core::hub` の `Option<i64>` 設計と同じ
-/// 理由）。
+/// `lastValueAt`（[`HubSubscriptionView::last_value_at`]）を表示用に整形する。
+///
+/// **単位は epoch ミリ秒**（`docs/tag-server-design.md`「タイムスタンプ:
+/// サンプル取得時刻（サーバー時計、UTC、ミリ秒）。PLC 時計は使わない」―
+/// `banto_tagclient::ValuesSnapshot::t` 由来で、値の表の `t` 列と同じ単位）。
+/// 秒として解釈すると実機で `58681-09-22 ...` のようなあり得ない年になる
+/// バグが2026-09-17の実機確認で見つかったため、ここで秒に変換してから
+/// 整形する。`None` は「まだ受信していません」であって時刻の欠落ではない
+/// ので、そのまま伝える（`0` などに丸めない）。
 fn format_last_value_at(value: Option<i64>) -> String {
     match value {
-        Some(secs) => unix_seconds_to_utc_string(secs),
+        Some(millis) => unix_seconds_to_utc_string(millis.div_euclid(1000)),
         None => "まだ受信していません".to_owned(),
     }
 }
@@ -359,6 +368,11 @@ fn format_last_value_at(value: Option<i64>) -> String {
 /// `lastValueAt` は毎ティック変わりうる（5秒粒度で進む）ので比較対象には
 /// 含めない - 含めると事実上ほぼ毎回「変化した」ことになり、オーナーが
 /// 求めている「うるさくしない」を満たせない。表示には別途載せる。
+///
+/// `last_error`（[`HubSubscriptionView::last_error`]）も比較対象に含める
+/// （2026-09-17 オーナー実機確認: `reconnecting` のまま固まる障害の原因が
+/// `BindingUnresolved` か `Transport` かの切り分けに、状態行のこの値が
+/// 決定的だった。無いとコードを読むまで分からない）。
 #[derive(Clone, PartialEq, Eq)]
 struct StatusKey {
     state: &'static str,
@@ -366,6 +380,7 @@ struct StatusKey {
     subscribed_count: usize,
     unresolved: Vec<String>,
     unsupported: Vec<String>,
+    last_error: Option<String>,
 }
 
 impl StatusKey {
@@ -380,18 +395,20 @@ impl StatusKey {
             subscribed_count: view.subscribed_count,
             unresolved,
             unsupported,
+            last_error: view.last_error.clone(),
         }
     }
 }
 
 /// 手順5のあと（[`CG_SMOKE_HOLD_SECS` 相当] の保持観測フェーズ）で記録する
 /// 1件の状態遷移。実機確認の記録としてそのまま貼れる形にするため、表示に
-/// 必要な最小限（経過秒・状態・理由・未解決の有無）だけを持つ。
+/// 必要な最小限（経過秒・状態・理由・未解決の有無・lastError）だけを持つ。
 struct TransitionRecord {
     elapsed_secs: f64,
     state: &'static str,
     reason: Option<String>,
     has_unresolved: bool,
+    last_error: Option<String>,
     notable: bool,
 }
 
@@ -451,12 +468,13 @@ impl StatusTracker {
         });
         let marker = if notable { "*" } else { " " };
         println!(
-            "{marker}[{elapsed:7.1}s] state={} reason={} subscribedCount={} unresolved=[{}] unsupported=[{}] lastValueAt={}",
+            "{marker}[{elapsed:7.1}s] state={} reason={} subscribedCount={} unresolved=[{}] unsupported=[{}] lastError={} lastValueAt={}",
             key.state,
             key.reason.as_deref().unwrap_or("-"),
             key.subscribed_count,
             key.unresolved.join(", "),
             key.unsupported.join(", "),
+            key.last_error.as_deref().unwrap_or("-"),
             format_last_value_at(view.last_value_at),
         );
         if self.logging {
@@ -465,6 +483,7 @@ impl StatusTracker {
                 state: key.state,
                 reason: key.reason.clone(),
                 has_unresolved: !key.unresolved.is_empty(),
+                last_error: key.last_error.clone(),
                 notable,
             });
         }
@@ -481,7 +500,7 @@ fn print_transition_log(log: &[TransitionRecord]) {
     for record in log {
         let marker = if record.notable { "*" } else { " " };
         println!(
-            "{marker}[{:7.1}s] state={} reason={} 未解決={}",
+            "{marker}[{:7.1}s] state={} reason={} 未解決={} lastError={}",
             record.elapsed_secs,
             record.state,
             record.reason.as_deref().unwrap_or("-"),
@@ -489,7 +508,8 @@ fn print_transition_log(log: &[TransitionRecord]) {
                 "あり"
             } else {
                 "なし"
-            }
+            },
+            record.last_error.as_deref().unwrap_or("-")
         );
     }
 }
