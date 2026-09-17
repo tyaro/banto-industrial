@@ -80,8 +80,14 @@
 //! 手順7（後片付け）は毎回、発行した `key_id`/`key_name` と失効用の
 //! `curl` コマンド例を**必ず**印字する。加えて `CG_SMOKE_REVOKE=1` を
 //! 指定したときだけ、**このインストールが手順2で発行した `key_id` だけを
-//! 対象に**（名前で他のキーを探さない）失効させる。失効に失敗しても
-//! 致命扱いにせず、同じ案内を出して終わる。
+//! 対象に**（名前で他のキーを探さない）失効させる。**サマリが嘘を
+//! つかないよう、失効を頼まれたのに失敗した場合は手順7を FAIL にし
+//! （終了コード1）、同じ手動失効の案内も出す**（2026-09-17 Copilotレビュー
+//! 指摘。以前は「致命扱いにせず案内を出して終わる」だったが、それでは
+//! サマリが実際には失敗した失効を成功に見せてしまうため撤回した）。
+//! 「今回発行したものか判定できない」（設定の読み取り失敗）場合も同様に
+//! 手順7を FAIL にし、判定材料が欠けたまま自動失効はしない
+//! （2026-09-18 Copilotレビュー指摘）。
 //!
 //! ## やらないこと
 //!
@@ -714,6 +720,38 @@ fn issued_this_run(
     }
 }
 
+/// [`issued_this_run`] を呼ぶ前に、そもそも判定材料（接続前の状態）を
+/// 読めたかどうかを見る最終判断（2026-09-18 Copilotレビュー指摘）。
+///
+/// **判定材料が欠けたら、危険な側の動作（自動失効）はしない**。接続前の
+/// 読み取りが失敗した（`pre_connect_read_error` が `Some`）状態で
+/// [`issued_this_run`] をそのまま呼ぶと、その関数の「接続前にレコードが
+/// 無かった → 今回発行した」という分岐に落ちてしまう。実際には同じ
+/// Hub の既存キーを再利用しただけでも `true` になり、
+/// `CG_SMOKE_REVOKE=1` が今回発行していない古いキーを失効させる。
+/// その分岐は「無かったことを確認できた」場合専用であって、「確認
+/// できなかった」場合に流用してはいけない - 読めなかったときは常に
+/// `false`（「今回発行したとは断定しない」）に倒す。
+fn issued_this_run_or_unknown(
+    pre_connect_read_error: Option<&str>,
+    connected: bool,
+    endpoint_before: Option<&str>,
+    key_id_before: Option<i64>,
+    endpoint_now: &str,
+    key_id_now: Option<i64>,
+) -> bool {
+    if pre_connect_read_error.is_some() {
+        return false;
+    }
+    issued_this_run(
+        connected,
+        endpoint_before,
+        key_id_before,
+        endpoint_now,
+        key_id_now,
+    )
+}
+
 /// `curl` で手動失効するときの1行を組み立てる（実行はしない）。手順7の
 /// 案内表示・失敗時のフォールバックの両方で使う。
 fn revoke_curl_hint(hub_url: &str, key_id: i64) -> String {
@@ -888,22 +926,29 @@ async fn main() {
     // 「今回発行したキー」と誤認しうる。接続先も一緒に控える理由は
     // `issued_this_run` のdoc comment参照（key_idだけの比較は接続先が
     // 変わると意味を失う）。
-    let record_before_connect = match read_hub_record(&settings1).await {
-        Ok(record) => record,
-        Err(err) => {
-            // 「今回発行した」判定（issued_this_run）の入力が欠けるだけで
-            // 致命的ではない - 最悪でも「接続前にレコードが無かった」扱いに
-            // 倒れ、この後 connect が成功すれば「今回発行した」と判定
-            // される（安全側）。手順7を左右する致命的な読み取り失敗は
-            // 接続後の読み取り（この下）で別途捕捉する。
-            println!(
-                "  警告: 接続前の設定読み取りに失敗しました({err})。レコード無しとして進めます。"
-            );
-            None
-        }
-    };
-    let key_id_before_connect = record_before_connect.as_ref().and_then(|r| r.key_id);
-    let endpoint_before_connect = record_before_connect.map(|r| r.endpoint);
+    // **判定材料が欠けたら、危険な側の動作（自動失効）はしない**
+    // （2026-09-18 Copilotレビュー指摘）: この読み取りが失敗したときに
+    // 「接続前にレコードが無かった」扱いに倒すと、`issued_this_run` の
+    // 「接続前にレコードが無かった → 今回発行した」という分岐に落ちて
+    // しまう。実際には同じ Hub の既存キーを再利用しただけでも true に
+    // なり、`CG_SMOKE_REVOKE=1` が**今回発行していない古いキー**を
+    // 失効させる（前回「致命度が低い」と判断してレコード無しに倒した
+    // 箇所だが、失効の判定材料を欠測したまま進めるのは、このツールで
+    // 一番危険な方向 - 他人のキーを消す - に倒れるため撤回した）。
+    // 読めなかった場合は「レコード無し」と混同せず、
+    // `pre_connect_read_error` としてエラーを保持したまま手順7まで
+    // 持ち越し、判定不能な状態として扱う。
+    let (key_id_before_connect, endpoint_before_connect, pre_connect_read_error) =
+        match read_hub_record(&settings1).await {
+            Ok(Some(record)) => (record.key_id, Some(record.endpoint), None),
+            Ok(None) => (None, None, None),
+            Err(err) => {
+                println!(
+                    "  警告: 接続前の設定読み取りに失敗しました({err})。このキーが今回発行されたものかどうかは判定できません(自動失効はしません)。"
+                );
+                (None, None, Some(err))
+            }
+        };
     let connect_view = hub1.connect(&hub_url).await;
     let (
         step2_ok,
@@ -957,9 +1002,13 @@ async fn main() {
                 keyring_account.as_deref().unwrap_or("-")
             );
             let ok = view.status.is_connected();
-            // 判定本体は `issued_this_run` 関数のdoc comment参照
-            // （key_idだけでなく接続先も対にして比較する）。
-            let issued_this_run = issued_this_run(
+            // 判定は `issued_this_run_or_unknown` のdoc comment参照
+            // （接続前の読み取りが失敗していれば安全側falseに倒し、
+            // 読み取れていれば `issued_this_run` の通常判定に委ねる）。
+            // 手順7はこの状態を pre_connect_read_error で別途判定不能
+            // として扱い、理由を出したうえで自動失効しない。
+            let issued_this_run = issued_this_run_or_unknown(
+                pre_connect_read_error.as_deref(),
                 ok,
                 endpoint_before_connect.as_deref(),
                 key_id_before_connect,
@@ -1394,6 +1443,27 @@ async fn main() {
                     ),
                     true,
                 )
+                } else if let Some(pre_error) = pre_connect_read_error.as_deref() {
+                    // **判定材料が欠けたら、危険な側の動作（自動失効）は
+                    // しない**（2026-09-18 Copilotレビュー指摘）。接続前の
+                    // 設定を読めていないため、このキーが今回発行された
+                    // ものか、既存キーを再利用しただけかを確定できない。
+                    // 黙って進まずFAILにする - `!issued_this_run_1` の
+                    // 「確認できて違うと分かった」場合とは区別する
+                    // （こちらは PASS のまま、こちらは判定不能で FAIL）。
+                    let hint = revoke_curl_hint(&hub_url, key_id);
+                    println!(
+                        "  接続前の設定を読めなかったため、このキー(id={key_id}, name={key_name_display})が今回発行されたものかどうか判定できません({pre_error})。"
+                    );
+                    println!("  自動失効は行いません(CG_SMOKE_REVOKE=1が指定されていても)。");
+                    println!("  必要なら手動で確認・失効してください:");
+                    println!("    {hint}");
+                    (
+                        format!(
+                            "key_id={key_id}: 接続前の設定読み取り失敗のため今回発行か判定できず、自動失効せず。手動失効: {hint}"
+                        ),
+                        false,
+                    )
                 } else if !issued_this_run_1 {
                     let hint = revoke_curl_hint(&hub_url, key_id);
                     println!(
@@ -1616,6 +1686,43 @@ mod tests {
             Some(5),
             "http://host:8722",
             None,
+        ));
+    }
+
+    #[test]
+    fn issued_this_run_or_unknown_does_not_auto_revoke_when_the_pre_connect_read_failed() {
+        // #387 レビュー（2026-09-18）で固定する本題: 接続前の読み取りが
+        // 失敗した状態では自動失効しない。connected=true かつ key_idが
+        // 変わっている（＝素の issued_this_run なら true になる条件）
+        // でも、判定材料が欠けていれば false に倒すこと。
+        assert!(!issued_this_run_or_unknown(
+            Some("db unavailable"),
+            true,
+            None,
+            None,
+            "http://host:8722",
+            Some(99),
+        ));
+    }
+
+    #[test]
+    fn issued_this_run_or_unknown_falls_back_to_the_normal_judgement_when_the_pre_connect_read_succeeded(
+    ) {
+        assert!(issued_this_run_or_unknown(
+            None,
+            true,
+            Some("http://host:8722"),
+            Some(5),
+            "http://host:8722",
+            Some(6),
+        ));
+        assert!(!issued_this_run_or_unknown(
+            None,
+            true,
+            Some("http://host:8722"),
+            Some(5),
+            "http://host:8722",
+            Some(5),
         ));
     }
 }
