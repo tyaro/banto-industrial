@@ -156,15 +156,35 @@ const HUB_RECORD_SETTINGS_KEY: &str = "hub.record";
 /// 読めなくてもこちらは読めることがある）。
 const HUB_INSTALLATION_ID_SETTINGS_KEY: &str = "hub.installation_id";
 
-/// 1段階の検証結果の状態。「実際に試して失敗した」（`Fail`）と「前段の失敗で
-/// 試せなかった」（`Skipped`）は読み手にとって全く違う情報なので区別する
-/// （`real_hub_smoke.rs` と同じ設計）。どちらも「検証できていない」という点
-/// では非成功として終了コードに反映する。
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// 1段階の検証結果の状態。「実際に試して失敗した」（`Fail`）と「試せな
+/// かった」（`Skipped*`）は読み手にとって全く違う情報なので区別する
+/// （`real_hub_smoke.rs` と同じ設計）。
+///
+/// **スキップはさらに2種類ある**（2026-09-18 Copilotレビュー指摘、
+/// オーナーが実機で再現: 既定実行 - `CG_SMOKE_HOLD_SECS=0` で手順6の
+/// HOLD がスキップされるだけ - が必ず終了コード1になっていた）:
+///
+/// * [`Self::SkippedBlocked`][]: **前段の失敗が原因で**試せなかった
+///   （接続できなかったので catalog・購読・再起動をスキップ、など）。
+///   これは「検証できていない」ので非成功のまま - PASS にすると、この
+///   ハーネスで一番大事な「サマリが嘘をつかない」が逆向きに壊れる。
+/// * [`Self::SkippedOptional`][]: **操作者が明示的に選んで**この任意
+///   フェーズを実行しなかった（`CG_SMOKE_HOLD_SECS=0` など）。これは
+///   何も壊れていない正常な既定動作なので、成功として扱ってよい。
+///
+/// **どちらに入るかを書き手が選び忘れたら失敗側に倒れる**ように、
+/// [`StepResult::skipped`]（汎用名）は `SkippedBlocked` を返す既定とし、
+/// `SkippedOptional` は専用の [`StepResult::skipped_optional`] を明示的に
+/// 呼んだときだけ得られるようにしてある。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StepStatus {
     Pass,
     Fail,
-    Skipped,
+    /// 前段の失敗が原因で試せなかった。非成功（終了コードに反映）。
+    SkippedBlocked,
+    /// 操作者が明示的に選んでこの任意フェーズを実行しなかった。成功
+    /// 扱い。
+    SkippedOptional,
 }
 
 impl StepStatus {
@@ -172,12 +192,12 @@ impl StepStatus {
         match self {
             StepStatus::Pass => "OK",
             StepStatus::Fail => "NG",
-            StepStatus::Skipped => "SKIP",
+            StepStatus::SkippedBlocked | StepStatus::SkippedOptional => "SKIP",
         }
     }
 
     fn is_pass(self) -> bool {
-        matches!(self, StepStatus::Pass)
+        matches!(self, StepStatus::Pass | StepStatus::SkippedOptional)
     }
 }
 
@@ -204,8 +224,17 @@ impl StepResult {
         Self::new(name, StepStatus::Fail, detail)
     }
 
+    /// 前段の失敗が原因で試せなかった場合（既定 - [`StepStatus`] のdoc
+    /// comment参照。「操作者が明示的に選んで実行しなかった」場合は
+    /// [`Self::skipped_optional`] を使う）。
     fn skipped(name: &'static str, detail: impl Into<String>) -> Self {
-        Self::new(name, StepStatus::Skipped, detail)
+        Self::new(name, StepStatus::SkippedBlocked, detail)
+    }
+
+    /// 操作者が明示的に選んでこの任意フェーズを実行しなかった場合
+    /// （例: `CG_SMOKE_HOLD_SECS=0`）。成功として扱う。
+    fn skipped_optional(name: &'static str, detail: impl Into<String>) -> Self {
+        Self::new(name, StepStatus::SkippedOptional, detail)
     }
 }
 
@@ -1342,9 +1371,13 @@ async fn main() {
     println!("== 6. 保持観測(HOLD) ==");
     if hold_secs == 0 {
         println!("  スキップ: CG_SMOKE_HOLD_SECS=0 のため保持観測を行いません。");
-        results.push(StepResult::skipped(
+        // 操作者が明示的に選んでこの任意フェーズを実行しなかった -
+        // 既定実行（CG_SMOKE_HOLD_SECS未指定）がこれだけで終了コード1に
+        // なっていた（2026-09-18 Copilotレビュー指摘、オーナーが実機で
+        // 再現）。前段の失敗によるスキップとは区別し、成功として扱う。
+        results.push(StepResult::skipped_optional(
             "保持観測(HOLD)",
-            "CG_SMOKE_HOLD_SECS=0のためスキップ",
+            "CG_SMOKE_HOLD_SECS=0のためスキップ(任意フェーズ)",
         ));
     } else if let Some(hub2) = hub2_for_hold.as_ref() {
         println!(
@@ -1521,14 +1554,21 @@ async fn main() {
                         }
                     }
                 } else {
-                    // 「CG_SMOKE_REVOKE=1で再実行」とだけ書くと、
-                    // CG_SMOKE_DIR を指定せずに再実行して別のキーを新規
-                    // 発行しただけになり、今回のキーは孤児のままになる
-                    // （2026-09-17 Copilotレビュー指摘）。同じ
-                    // CG_SMOKE_DIR を使うよう明示する。
+                    // 「同じCG_SMOKE_DIRでCG_SMOKE_REVOKE=1指定して再実行
+                    // すれば自動失効できる」という以前の案内は実現しない
+                    // （2026-09-18 Copilotレビュー指摘、オーナーが実機で
+                    // 確認）: 再実行するとconnect()は今保存されている
+                    // キーをそのまま使う（同じHub・同じ接続先なら
+                    // key_idが変わらない）ため、KeyOutcomeは
+                    // issued_this_run=falseの ConfirmedPresent になり、
+                    // 「今回発行したものではない」として自動失効が
+                    // スキップされる - 安全側の判定が働いた結果として
+                    // 正しい挙動だが、案内が嘘になるので削った。
+                    // 自動失効は「そのキーを発行したその実行の中」でしか
+                    // 行われない（安全のため）ので、素直に印字済みの
+                    // curlコマンドで手動失効するよう案内する。
                     println!(
-                        "  (自動で失効させたい場合は、同じ CG_SMOKE_DIR を指定して CG_SMOKE_REVOKE=1 で再実行してください: CG_SMOKE_DIR={} CG_SMOKE_REVOKE=1。またはこの curl コマンドで直接失効させてください)",
-                        smoke_dir.display()
+                        "  (自動失効は、そのキーを発行したその実行の中でのみ行います(安全のため) - 再実行しても自動では失効しません。上記の curl コマンドで手動失効してください)"
                     );
                     (format!("key_id={key_id}はHubに残存。失効: {hint}"), true)
                 }
@@ -1563,6 +1603,24 @@ async fn main() {
     }
 }
 
+/// 総合結果の文言を決める（`print_summary` から分離してテスト可能に
+/// した、2026-09-18 Copilotレビュー指摘）。**「スキップがあるだけ」
+/// （失敗は無い）と「失敗がある」を区別する** - 任意フェーズの
+/// スキップ（[`StepStatus::SkippedOptional`]）しか無いのに「失敗・
+/// 想定外」と同じ文言を出すと、既定実行が何も壊れていないのに壊れて
+/// いるように読めてしまう（これが今回の実害そのもの）。
+fn summary_verdict(statuses: &[StepStatus]) -> &'static str {
+    let has_failure = statuses
+        .iter()
+        .any(|status| matches!(status, StepStatus::Fail | StepStatus::SkippedBlocked));
+    let has_optional_skip = statuses.contains(&StepStatus::SkippedOptional);
+    match (has_failure, has_optional_skip) {
+        (true, _) => "一部項目が失敗、または前段の失敗により試せませんでした",
+        (false, true) => "全項目成功（一部は任意フェーズのため未実施）",
+        (false, false) => "全項目成功",
+    }
+}
+
 fn print_summary(results: &[StepResult]) {
     println!("=== 検証結果サマリ ===");
     for result in results {
@@ -1573,21 +1631,85 @@ fn print_summary(results: &[StepResult]) {
             result.detail
         );
     }
-    let all_pass = results.iter().all(|r| r.status.is_pass());
+    let statuses: Vec<StepStatus> = results.iter().map(|result| result.status).collect();
     println!();
-    println!(
-        "総合結果: {}",
-        if all_pass {
-            "全項目成功"
-        } else {
-            "一部項目が失敗・想定外、またはスキップ"
-        }
-    );
+    println!("総合結果: {}", summary_verdict(&statuses));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // StepStatus/summary_verdict の回帰テスト（2026-09-18 Copilotレビュー
+    // 指摘、オーナーが実機で再現: 既定実行 - CG_SMOKE_HOLD_SECS=0 で
+    // 手順6がスキップされるだけ - が必ず終了コード1になっていた）。
+
+    #[test]
+    fn skipped_optional_counts_as_pass_but_skipped_blocked_does_not() {
+        assert!(StepStatus::SkippedOptional.is_pass());
+        assert!(!StepStatus::SkippedBlocked.is_pass());
+        assert!(StepStatus::Pass.is_pass());
+        assert!(!StepStatus::Fail.is_pass());
+    }
+
+    #[test]
+    fn all_pass_when_only_an_optional_skip_is_present() {
+        // 今回の本題そのもの: 既定実行（HOLDだけが任意スキップ）は
+        // 全項目成功として終了コード0になること。
+        let statuses = [
+            StepStatus::Pass,
+            StepStatus::Pass,
+            StepStatus::Pass,
+            StepStatus::Pass,
+            StepStatus::Pass,
+            StepStatus::SkippedOptional,
+            StepStatus::Pass,
+        ];
+        assert!(statuses.iter().all(|status| status.is_pass()));
+        assert_eq!(
+            summary_verdict(&statuses),
+            "全項目成功（一部は任意フェーズのため未実施）"
+        );
+    }
+
+    #[test]
+    fn not_all_pass_when_a_blocked_skip_is_present() {
+        // 前段の失敗によるスキップは、従来どおり非成功のまま
+        // （サマリが嘘をつかないことを壊さない）。
+        let statuses = [
+            StepStatus::Pass,
+            StepStatus::Fail,
+            StepStatus::SkippedBlocked,
+            StepStatus::SkippedBlocked,
+        ];
+        assert!(!statuses.iter().all(|status| status.is_pass()));
+        assert_eq!(
+            summary_verdict(&statuses),
+            "一部項目が失敗、または前段の失敗により試せませんでした"
+        );
+    }
+
+    #[test]
+    fn summary_verdict_is_plain_success_with_no_skips_at_all() {
+        let statuses = [StepStatus::Pass, StepStatus::Pass];
+        assert_eq!(summary_verdict(&statuses), "全項目成功");
+    }
+
+    #[test]
+    fn step_result_skipped_defaults_to_blocked_not_optional() {
+        // 「どちらに入るかを選び忘れたら失敗側に倒れる」ことの固定:
+        // 汎用の StepResult::skipped は SkippedBlocked を返す。
+        // SkippedOptional を得るには専用の skipped_optional を明示的に
+        // 呼ぶ必要がある。
+        assert_eq!(
+            StepResult::skipped("x", "y").status,
+            StepStatus::SkippedBlocked
+        );
+        assert_eq!(
+            StepResult::skipped_optional("x", "y").status,
+            StepStatus::SkippedOptional
+        );
+    }
 
     // same_hub() の正規化を固定する回帰テスト（2026-09-18 Copilotレビュー
     // 指摘: `cargo test -p chronogazer-core --example hub_real_smoke` で
