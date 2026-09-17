@@ -28,7 +28,7 @@
 5. [ ] `pnpm --filter <app> check` → `pnpm --filter <app> test`
 6. [ ] `pnpm exec prettier --write <編集した md/ts/svelte 全部>` → **整形後にもう一度 test と eslint**（整形が壊すことがある）
 7. [ ] E2E の前に必ず: `pnpm --filter <app> build` → **`cargo build -p <core> --bin <bin> --features embed-ui`**（**`--features embed-ui` を落とすと smoke が全滅する**）
-8. [ ] E2E は **1 回だけ**。実行前に `Get-Process <bin>` が 0 で、ポートが空いていることを確認。**同時に 2 つ走らせない**。失敗の詳細は `e2e/test-results-*/<test>/error-context.md`
+8. [ ] E2E は **1 回だけ**。実行前に残プロセスが 0 で、ポートが空いていることを確認（Windows: `Get-Process <bin>` / POSIX: `pgrep -f <bin>`）。**同時に 2 つ走らせない**。失敗の詳細は `e2e/test-results-*/<test>/error-context.md`
 9. [ ] `cargo deny check`（CI にある）
 
 ## 3. E2E の罠（全部踏んだ）
