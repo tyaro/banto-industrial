@@ -59,6 +59,14 @@ getrandom = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 tower = { workspace = true, features = ["util"] }
 tempfile = { workspace = true }
+# examples/hub_real_smoke.rs（#383段階1実機確認、#387レビュー対応）専用:
+# 発行したAPIキーの後始末（`POST /api/api-keys/{id}/revoke`、
+# `crates/banto-tagclient/examples/real_hub_smoke.rs` の
+# `set_write_control` と同じ作法で管理RESTを直接叩く）に使う。
+# `banto-hub-bootstrap`/`banto-tagclient` が通常依存として既に使っている
+# workspace版と同じもので、依存ツリーには既に入っているので Cargo.lock に
+# ノードは増えない。
+reqwest = { workspace = true }
 # #383 段階1 の購読テスト専用。**chronogazer-core 自身は WS を話さない**
 # （WS を張るのは `banto-tagclient` の中で、こちらは `TagClientHandle` を
 # 持つだけ）。これは `crate::hub` のテストが**モック Hub 側**で WebSocket の

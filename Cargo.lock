@@ -1051,6 +1051,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "password-hash",
+ "reqwest",
  "rust-embed",
  "serde",
  "serde_json",
