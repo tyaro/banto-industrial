@@ -32,6 +32,9 @@ pub use banto_tags::{
     CollectionGroup, CollectionGroupService, PlcConnection, PlcConnectionService, Tag, TagService,
 };
 pub mod events;
+// #332: Hub 接続（`banto-hub-bootstrap` の配線）。keyring は src-tauri、
+// `relay-wright-serve` は `hub::UnavailableKeyStore` を渡す - モジュール doc 参照。
+pub mod hub;
 // Project file export/import (feature/project-file): save the whole
 // configuration registry to a versioned JSON project file and load it back.
 // Composes the existing registry services; no new dependency (invariant).

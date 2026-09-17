@@ -33,6 +33,12 @@ import { SETTINGS_CATEGORIES, type SettingsCategoryId } from './categories';
  *   手動書き込み」section の `monitorAvailable && isAdmin`、元「アーム
  *   時限失効」section の `armConfigAvailable && isAdmin`。どれか1つでも
  *   見えれば security カテゴリ自体は可視（`data` と同じ OR パターン）。
+ * - `hub`（#332、新設）: `connectivity` と同じ `isAdmin(sessionStore.role)`。
+ *   Hub への接続は `connectivity`（自アプリの LAN 公開）と同じ「サーバ
+ *   制御系 = admin」の範囲。実行形態による可用性（プレーンな `vite dev`
+ *   では backend が無い）はカテゴリの可視性ではなく `HubSection.svelte`
+ *   側の注記で扱う - `connectivity` が Tauri 以外で注記を出すのと同じ
+ *   作法。
  *
  * `depends('settings:categories')` を宣言し、`SecuritySection.svelte` が
  * 認証モードの変更に成功したあと `invalidate('settings:categories')` を
@@ -60,7 +66,8 @@ export async function load({ parent, depends }) {
 		connectivity: admin,
 		data: admin && (isAuditLogAvailable() || isBackupsAvailable()),
 		security:
-			(tauri && canManageAuthMode()) || (monitorAvailable && admin) || (armConfigAvailable && admin)
+			(tauri && canManageAuthMode()) || (monitorAvailable && admin) || (armConfigAvailable && admin),
+		hub: admin
 	};
 
 	return { categories: SETTINGS_CATEGORIES.filter((category) => visible[category.id]) };

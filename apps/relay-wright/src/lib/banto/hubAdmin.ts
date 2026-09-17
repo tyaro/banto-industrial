@@ -1,0 +1,280 @@
+/**
+ * Client for the `admin`-only banto-hub 接続 API（#332 relay-wright 分）。
+ *
+ * `usersAdmin.ts`/`auditLogAdmin.ts`/`backupsAdmin.ts` と同じ Tauri/REST
+ * 分岐: Tauri webview は `invoke()`（`hub_*` コマンド、
+ * `apps/relay-wright/src-tauri/src/lib.rs`）、組み込みサーバー配下の LAN
+ * ブラウザは `fetch()`（`/api/hub/*`、`apps/relay-wright/core/src/rest.rs`）。
+ * どちらも同じ `relay_wright_core::hub::HubService` を呼ぶので、状態も
+ * キーリングも 1 つしかない。
+ *
+ * プレーンな `vite dev`/`vite preview`（Rust backend 無し）では Hub 接続を
+ * 保持する場所そのものが無いため、すべて `DEMO_MODE_MESSAGE` で reject
+ * する（`backupsAdmin.ts` の `isBackupsAvailable()`/`demoModeError()` と
+ * 同じ作法）。
+ *
+ * **平文の API キーはこの層を一方向にしか通らない**: `adoptHubKey` の引数
+ * として送るだけで、応答型（[`HubView`]）にキーを含むフィールドは無い。
+ */
+import { invoke } from '@tauri-apps/api/core';
+import { getAuthProvider, isProviderError, ProviderError, type ErrorBody } from '@banto/admin-core';
+import { CSRF_HEADER, getBantoMode } from './setup';
+
+/**
+ * `banto_hub_bootstrap::HubStatus` の判別共用体（serde の
+ * `{"state": ...}` 形をそのまま写したもの）。6 状態は issue #332 の受入
+ * 条件で、**エラーを「タグ 0 件」に潰さない**ことがこの型の要点:
+ * `connected` の `tagCount: 0` は「接続できているがタグが 1 件も無い」と
+ * いう正常な状態で、失敗とは別物。
+ */
+export type HubStatus =
+	| { state: 'notConfigured' }
+	| { state: 'connected'; tagCount: number }
+	| { state: 'authFailed' }
+	| { state: 'forbidden' }
+	| { state: 'unreachable'; cause: HubUnreachableCause }
+	| { state: 'needsPairing' };
+
+/** `banto_hub_bootstrap::UnreachableCause`。 */
+export type HubUnreachableCause = 'transport' | 'protocol' | 'server_error' | 'invalid_endpoint';
+
+/** Mirrors `relay_wright_core::hub::HubTagView`. */
+export interface HubTag {
+	externalName: string;
+	name: string;
+	dataType: string;
+	unit: string | null;
+	tagKind: string;
+}
+
+/**
+ * Mirrors `relay_wright_core::hub::HubView`.
+ *
+ * `tags` が `null` なのは「catalog をこの往復では読めていない」という意味で、
+ * `[]`（読めた結果タグが 0 件）とは**別物**。画面はこの区別をそのまま
+ * 出す（受入条件「接続済み・利用可能なタグなし」）。
+ */
+export interface HubView {
+	status: HubStatus;
+	endpoint: string | null;
+	keyName: string | null;
+	selectedTags: string[];
+	tags: HubTag[] | null;
+}
+
+export const DEMO_MODE_MESSAGE = 'デモモードでは利用できません';
+
+function demoModeError(): ProviderError {
+	return new ProviderError({ kind: 'other', message: DEMO_MODE_MESSAGE });
+}
+
+/** Is this environment backed by a real Hub bootstrap (Tauri or the embedded server)? */
+export function isHubAvailable(): boolean {
+	return getBantoMode() !== 'demo';
+}
+
+const ERROR_KINDS = new Set([
+	'not_found',
+	'validation',
+	'unauthorized',
+	'forbidden',
+	'storage',
+	'other'
+]);
+
+/** Same type guard as usersAdmin.ts / auditLogAdmin.ts / backupsAdmin.ts. */
+function isErrorBody(value: unknown): value is ErrorBody {
+	if (typeof value !== 'object' || value === null) return false;
+	const kind = (value as { kind?: unknown }).kind;
+	return typeof kind === 'string' && ERROR_KINDS.has(kind);
+}
+
+function toProviderError(err: unknown): ProviderError {
+	if (isProviderError(err)) return err;
+	if (isErrorBody(err)) return new ProviderError(err);
+	const message = err instanceof Error ? err.message : String(err);
+	return new ProviderError({ kind: 'other', message });
+}
+
+async function invokeCommand<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+	try {
+		return (await invoke(cmd, args)) as T;
+	} catch (err) {
+		throw toProviderError(err);
+	}
+}
+
+const NETWORK_ERROR_MESSAGE = 'サーバーに接続できません';
+
+/** Same token lookup as usersAdmin.ts/auditLogAdmin.ts/backupsAdmin.ts. */
+function currentToken(): string | null {
+	const auth = getAuthProvider() as { getToken?: () => string | null };
+	return auth.getToken ? auth.getToken() : null;
+}
+
+function authHeaders(extra?: Record<string, string>): Record<string, string> {
+	const headers: Record<string, string> = { ...CSRF_HEADER, ...extra };
+	const token = currentToken();
+	if (token) headers.Authorization = `Bearer ${token}`;
+	return headers;
+}
+
+async function errorFromResponse(response: Response): Promise<ProviderError> {
+	let body: unknown;
+	try {
+		body = await response.json();
+	} catch {
+		return new ProviderError({
+			kind: 'other',
+			message: `${response.status} ${response.statusText}`
+		});
+	}
+	if (isErrorBody(body)) return new ProviderError(body);
+	return new ProviderError({ kind: 'other', message: `${response.status} ${response.statusText}` });
+}
+
+interface HttpJsonInit {
+	method: string;
+	body?: unknown;
+	expectNoContent?: boolean;
+}
+
+async function httpJson<T>(path: string, init: HttpJsonInit): Promise<T> {
+	const hasBody = init.body !== undefined;
+	const headers = authHeaders(hasBody ? { 'Content-Type': 'application/json' } : undefined);
+
+	let response: Response;
+	try {
+		response = await fetch(path, {
+			method: init.method,
+			headers,
+			body: hasBody ? JSON.stringify(init.body) : undefined
+		});
+	} catch {
+		throw new ProviderError({ kind: 'other', message: NETWORK_ERROR_MESSAGE });
+	}
+
+	if (!response.ok) throw await errorFromResponse(response);
+	if (init.expectNoContent) return undefined as T;
+	return (await response.json()) as T;
+}
+
+/** `admin`-only: 保存済み設定での現在状態。キーの発行は行わない。 */
+export async function getHubStatus(): Promise<HubView> {
+	if (!isHubAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri') return invokeCommand<HubView>('hub_status');
+	return httpJson<HubView>('/api/hub', { method: 'GET' });
+}
+
+/** `admin`-only: 接続（試運転中の Hub にのみ `read` キーを自己発行）。 */
+export async function connectHub(endpoint: string): Promise<HubView> {
+	if (!isHubAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri') return invokeCommand<HubView>('hub_connect', { endpoint });
+	return httpJson<HubView>('/api/hub/connect', { method: 'POST', body: { endpoint } });
+}
+
+/** `admin`-only: タグ一覧の再取得。 */
+export async function refreshHubCatalog(): Promise<HubView> {
+	if (!isHubAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri') return invokeCommand<HubView>('hub_refresh_catalog');
+	return httpJson<HubView>('/api/hub/refresh', { method: 'POST' });
+}
+
+/** `admin`-only: 選択タグの保存。空配列も正当な入力。 */
+export async function setHubSelectedTags(tags: string[]): Promise<void> {
+	if (!isHubAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri') {
+		await invokeCommand<void>('hub_set_selected_tags', { tags });
+		return;
+	}
+	await httpJson<void>('/api/hub/selected-tags', {
+		method: 'PUT',
+		body: { tags },
+		expectNoContent: true
+	});
+}
+
+/**
+ * `admin`-only: ロックダウン済み Hub 向けの手動連携。`key` は平文なので
+ * 画面側は `type="password"` で受け取り、ここから先は保存先（OS キーリング）
+ * まで一方通行で流れる。
+ */
+export async function adoptHubKey(endpoint: string, key: string): Promise<HubView> {
+	if (!isHubAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri')
+		return invokeCommand<HubView>('hub_adopt_manual_key', { endpoint, key });
+	return httpJson<HubView>('/api/hub/adopt-key', { method: 'POST', body: { endpoint, key } });
+}
+
+/** `admin`-only: 切断（ローカルの設定とキーリングのみ。Hub 側のキーは残る）。 */
+export async function disconnectHub(): Promise<HubView> {
+	if (!isHubAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri') return invokeCommand<HubView>('hub_disconnect');
+	return httpJson<HubView>('/api/hub', { method: 'DELETE' });
+}
+
+/**
+ * 6 状態の見出し（純関数 - `hubAdmin.test.ts` が固定する）。
+ *
+ * 「接続済み」と「接続済み・利用可能なタグなし」を別文言にするのが受入
+ * 条件の要点で、`tagCount === 0` を失敗扱いにしない。
+ */
+export function hubStatusLabel(status: HubStatus): string {
+	switch (status.state) {
+		case 'notConfigured':
+			return '未設定';
+		case 'connected':
+			return status.tagCount === 0
+				? '接続済み・利用可能なタグなし'
+				: `接続済み（タグ${status.tagCount}件）`;
+		case 'authFailed':
+			return '認証に失敗';
+		case 'forbidden':
+			return '権限が不足';
+		case 'unreachable':
+			return 'Hubに到達できません';
+		case 'needsPairing':
+			return '連携が必要';
+	}
+}
+
+/** 状態ごとの補足説明（次に何をすればよいか）。純関数。 */
+export function hubStatusDetail(status: HubStatus): string {
+	switch (status.state) {
+		case 'notConfigured':
+			return '接続先のURLを入力して「接続」を押してください。';
+		case 'connected':
+			return status.tagCount === 0
+				? 'Hubにはまだタグが登録されていません。Hub側でタグを登録すると、ここに表示されます。'
+				: '購読するタグを選んで保存できます。';
+		case 'authFailed':
+			return '保存済みのAPIキーが無効です。「接続」でキーを再発行できます（Hubがロックダウン済みの場合は連携が必要です）。';
+		case 'forbidden':
+			return '保存済みのAPIキーに読み取り権限がありません。Hubの管理画面で読み取り権限のあるキーを発行し、下の欄から採用してください。';
+		case 'unreachable':
+			return `${hubUnreachableCauseLabel(status.cause)} 接続先のURLとHubの稼働状況を確認してください。`;
+		case 'needsPairing':
+			return 'Hubはロックダウン済みのため、このアプリが自分でAPIキーを発行することはできません。Hubの管理画面で読み取り用のAPIキーを発行し、下の欄に貼り付けてください。';
+	}
+}
+
+/** `UnreachableCause` の日本語化。純関数。 */
+export function hubUnreachableCauseLabel(cause: HubUnreachableCause): string {
+	switch (cause) {
+		case 'transport':
+			return '応答がありません（接続できませんでした）。';
+		case 'protocol':
+			return '応答の形式が想定と異なります。';
+		case 'server_error':
+			return 'Hubがエラーを返しました。';
+		case 'invalid_endpoint':
+			return 'リダイレクトが返されました（接続先が別のサーバーを指している可能性があります）。';
+		default:
+			return '原因を特定できませんでした。';
+	}
+}
+
+/** 手動キーの入力欄を出すべき状態か（純関数）。 */
+export function needsManualKey(status: HubStatus): boolean {
+	return status.state === 'needsPairing' || status.state === 'forbidden';
+}

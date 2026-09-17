@@ -36,6 +36,7 @@ use relay_wright_core::backup::BackupService;
 use relay_wright_core::db::init_db;
 use relay_wright_core::engine::{Engine, EngineConfig, SharedEngineControl};
 use relay_wright_core::events::event_channel;
+use relay_wright_core::hub::{HubService, UnavailableKeyStore};
 use relay_wright_core::qr_strings::QrStringService;
 use relay_wright_core::rest::{api_router, audited_credential_verifier};
 use relay_wright_core::settings::ArmSettings;
@@ -184,11 +185,21 @@ async fn main() {
             }
         };
 
+    // #332: この開発用サーバーには OS キーリングが無い（keyring は
+    // `src-tauri` だけの依存 - ワークスペース `Cargo.toml` の注記参照）ので、
+    // 書き込みが必ず失敗する `UnavailableKeyStore` を渡す。到達確認・
+    // ロックダウン判定・未設定判定といった「キーを保存しない範囲」は
+    // そのまま動くため、E2E はこのサーバーで実施できる。
+    let hub = HubService::new(settings.clone(), Arc::new(UnavailableKeyStore))
+        .await
+        .expect("HubService should initialize");
+
     let app = api_router(
         users,
         settings,
         audit,
         backup,
+        hub,
         write_targets,
         write_rules,
         write_audit_log,

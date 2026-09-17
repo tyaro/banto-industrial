@@ -39,6 +39,13 @@ banto-plc = { path = "../../../crates/banto-plc" }
 # though the broker itself now owns the actual client/session.
 banto-broker = { path = "../../../crates/banto-broker" }
 banto-plc-write = { path = "../../../crates/banto-plc-write" }
+# #332 (Hub 接続): 自己発行 bootstrap 本体と、その接続確認に使う catalog
+# クライアント。keyring は `KeyStore` trait 経由で外から渡す（デスクトップ
+# は src-tauri の OS キーリング、`relay-wright-serve` は
+# `crate::hub::UnavailableKeyStore`）ので、この crate は keyring に依存
+# しない - ワークスペース `Cargo.toml` の keyring への注記と同じ理由。
+banto-hub-bootstrap = { path = "../../../crates/banto-hub-bootstrap" }
+banto-tagclient = { path = "../../../crates/banto-tagclient" }
 slmp = { workspace = true }
 thiserror = { workspace = true }
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
@@ -67,6 +74,11 @@ rust-embed = { workspace = true, optional = true }
 argon2 = { workspace = true }
 password-hash = { workspace = true }
 futures-util = { workspace = true }
+# #332: `crate::hub` の `installation_id`（UUID v4 相当の 128 ビット）。
+# `uuid` を新規に足す代わりに、`apps/banto-hub/core::api_keys` が API キー
+# 生成に使っているのと同じワークスペース依存を使う（Cargo.lock に新しい
+# ノードを増やさない）。
+getrandom = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "test-util", "sync"] }

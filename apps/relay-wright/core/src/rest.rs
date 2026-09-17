@@ -113,7 +113,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use banto_core::{BantoError, ErrorBody, FieldError, ListParams, ListResult};
 use banto_server::{
@@ -134,6 +134,7 @@ use crate::audit::{AuditEntry, AuditLogService};
 use crate::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 use crate::db::DbPool;
 use crate::engine::{EngineControl, EngineStatus, MonitorValue, SharedEngineControl};
+use crate::hub::{HubService, HubView};
 use crate::project::{export_project, import_project, ImportSummary, ProjectFile};
 use crate::qr_strings::{QrString, QrStringInput, QrStringService};
 use crate::registry_cascade::{
@@ -1146,6 +1147,162 @@ fn backups_router(backup: BackupService, audit: AuditLogService, auth: AuthState
                 auth: auth.clone(),
                 min: Role::Admin,
                 resource: "backups",
+                audit,
+            },
+            require_role_at_least,
+        ))
+        .layer(middleware::from_fn_with_state(auth, require_auth))
+}
+
+// --- #332: Hub 接続 ----------------------------------------------------------
+
+/// `/api/hub/*` のハンドラ用 state（`BackupsState` と同じ構成）: 操作本体の
+/// [`HubService`]、監査記録用の [`AuditLogService`]、actor 解決用の
+/// [`AuthState`]。
+#[derive(Clone)]
+struct HubState {
+    hub: HubService,
+    audit: AuditLogService,
+    auth: AuthState,
+}
+
+/// `POST /api/hub/connect` の body。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HubConnectBody {
+    endpoint: String,
+}
+
+/// `POST /api/hub/adopt-key` の body。`key` は**ログにも監査 detail にも
+/// 出さない**（`src-tauri` の `hub_adopt_manual_key` と同じ扱い）。
+/// `Debug` を意図的に derive していない - うっかり `{:?}` で平文キーを
+/// 出せないようにするため。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HubAdoptBody {
+    endpoint: String,
+    key: String,
+}
+
+/// `PUT /api/hub/selected-tags` の body。空配列は正当な入力（受入条件）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HubSelectedTagsBody {
+    tags: Vec<String>,
+}
+
+/// `settings_change`/`settings` の監査エントリを 1 本記録する（Hub 操作
+/// 共通）。`detail` には接続先とキー名までしか入れない - 平文キーは
+/// どの経路にも出さない。
+async fn record_hub_change(state: &HubState, headers: &HeaderMap, detail: serde_json::Value) {
+    let identity = actor_identity(headers, &state.auth);
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: identity.as_ref().map(|i| i.id.as_str()),
+            actor_role: identity.as_ref().map(|i| i.role.as_str()),
+            action: "settings_change",
+            resource: "settings",
+            entity_id: None,
+            detail: Some(detail),
+            origin: "rest",
+            result: "ok",
+        })
+        .await;
+}
+
+/// `GET /api/hub`（`admin` 限定）: 保存済み設定での現在状態。読み取りなので
+/// 監査しない（他の read ルートと同じ規約）。**発行は行わない。**
+async fn hub_status_handler(State(state): State<HubState>) -> Result<Json<HubView>, ApiError> {
+    Ok(Json(state.hub.status().await?))
+}
+
+/// `POST /api/hub/connect`（`admin` 限定）。
+async fn hub_connect_handler(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Json(body): Json<HubConnectBody>,
+) -> Result<Json<HubView>, ApiError> {
+    let view = state.hub.connect(&body.endpoint).await?;
+    record_hub_change(
+        &state,
+        &headers,
+        json!({ "hubEndpoint": body.endpoint, "hubStatus": view.status.as_str() }),
+    )
+    .await;
+    Ok(Json(view))
+}
+
+/// `POST /api/hub/adopt-key`（`admin` 限定）: ロックダウン済み Hub 向けの
+/// 手動連携。
+async fn hub_adopt_key_handler(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Json(body): Json<HubAdoptBody>,
+) -> Result<Json<HubView>, ApiError> {
+    let endpoint = body.endpoint;
+    let view = state.hub.adopt_manual_key(&endpoint, body.key).await?;
+    record_hub_change(
+        &state,
+        &headers,
+        json!({ "hubEndpoint": endpoint, "hubKeyAdopted": true, "hubStatus": view.status.as_str() }),
+    )
+    .await;
+    Ok(Json(view))
+}
+
+/// `POST /api/hub/refresh`（`admin` 限定）: タグ一覧の再取得。
+async fn hub_refresh_handler(State(state): State<HubState>) -> Result<Json<HubView>, ApiError> {
+    Ok(Json(state.hub.refresh_catalog().await?))
+}
+
+/// `PUT /api/hub/selected-tags`（`admin` 限定）。
+async fn hub_selected_tags_handler(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+    Json(body): Json<HubSelectedTagsBody>,
+) -> Result<StatusCode, ApiError> {
+    let count = body.tags.len();
+    state.hub.set_selected_tags(body.tags).await?;
+    record_hub_change(&state, &headers, json!({ "hubSelectedTagCount": count })).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /api/hub`（`admin` 限定）: ローカルの設定とキーリングだけを消す。
+/// Hub 側のキーは失効させない（`banto_hub_bootstrap::Bootstrapper::disconnect`
+/// の doc comment参照）。
+async fn hub_disconnect_handler(
+    State(state): State<HubState>,
+    headers: HeaderMap,
+) -> Result<Json<HubView>, ApiError> {
+    let view = state.hub.disconnect().await?;
+    record_hub_change(&state, &headers, json!({ "hubDisconnected": true })).await;
+    Ok(Json(view))
+}
+
+/// `/api/hub/*`（#332）: `admin` 限定、`users_router`/`backups_router` と
+/// 同じ掛け方（`require_auth` → `require_role_at_least`）。
+fn hub_router(hub: HubService, audit: AuditLogService, auth: AuthState) -> Router {
+    let state = HubState {
+        hub,
+        audit: audit.clone(),
+        auth: auth.clone(),
+    };
+    Router::new()
+        .route(
+            "/api/hub",
+            get(hub_status_handler).delete(hub_disconnect_handler),
+        )
+        .route("/api/hub/connect", post(hub_connect_handler))
+        .route("/api/hub/adopt-key", post(hub_adopt_key_handler))
+        .route("/api/hub/refresh", post(hub_refresh_handler))
+        .route("/api/hub/selected-tags", put(hub_selected_tags_handler))
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            RoleGuard {
+                auth: auth.clone(),
+                min: Role::Admin,
+                resource: "hub",
                 audit,
             },
             require_role_at_least,
@@ -3111,6 +3268,11 @@ pub fn api_router(
     settings: SettingsService,
     audit: AuditLogService,
     backup: BackupService,
+    // #332: Hub 接続。`KeyStore` の実装ごと呼び出し元が構築して渡す
+    // （デスクトップ = OS キーリング、`relay-wright-serve` =
+    // `crate::hub::UnavailableKeyStore`）。`HubService::new` が非同期
+    // （`installation_id` の読み書き）なのでここでは構築できない。
+    hub: HubService,
     write_targets: WriteTargetService,
     write_rules: WriteRuleService,
     write_audit_log: WriteAuditLogService,
@@ -3186,7 +3348,8 @@ pub fn api_router(
             audit.clone(),
             auth.clone(),
         ))
-        .merge(backups_router(backup, audit, auth.clone()))
+        .merge(backups_router(backup, audit.clone(), auth.clone()))
+        .merge(hub_router(hub, audit, auth.clone()))
         .merge(ui_settings_router(settings, auth))
         .layer(middleware::from_fn(require_banto_client_header))
 }
@@ -3309,12 +3472,14 @@ mod tests {
             .login("viewer", "password123")
             .await
             .expect("viewer login");
+        let hub = test_hub_service(settings.clone()).await;
         (
             api_router(
                 users,
                 settings,
                 audit,
                 backup,
+                hub,
                 write_targets,
                 write_rules,
                 write_audit_log,
@@ -3353,12 +3518,14 @@ mod tests {
             .login("admin", "admin")
             .await
             .expect("login should succeed");
+        let hub = test_hub_service(settings.clone()).await;
         (
             api_router(
                 users,
                 settings,
                 audit,
                 backup,
+                hub,
                 write_targets,
                 write_rules,
                 write_audit_log,
@@ -3374,6 +3541,21 @@ mod tests {
             ),
             token,
         )
+    }
+
+    /// #332: a `HubService` for router tests. Backed by
+    /// [`crate::hub::UnavailableKeyStore`], so it can never write a
+    /// plaintext key anywhere during a test - these tests only exercise the
+    /// `/api/hub/*` routes' auth/role gating and the "not configured"
+    /// answer, never a real Hub handshake (that is the `banto-hub-bootstrap`
+    /// crate's own mock-server suite).
+    async fn test_hub_service(settings: SettingsService) -> crate::hub::HubService {
+        crate::hub::HubService::new(
+            settings,
+            std::sync::Arc::new(crate::hub::UnavailableKeyStore),
+        )
+        .await
+        .expect("HubService::new")
     }
 
     async fn body_json(response: axum::response::Response) -> serde_json::Value {
@@ -3428,11 +3610,13 @@ mod tests {
         let qr_strings = QrStringService::new(pool.clone());
         let write_audit_log = WriteAuditLogService::new(pool.clone());
         let auth = demo_auth();
+        let hub = test_hub_service(settings.clone()).await;
         api_router(
             users,
             settings,
             audit,
             backup,
+            hub,
             write_targets,
             write_rules,
             write_audit_log,
@@ -3643,12 +3827,14 @@ mod tests {
         let qr_strings = QrStringService::new(pool.clone());
         let write_audit_log = WriteAuditLogService::new(pool.clone());
         let auth = AuthState::new(audited_credential_verifier(users.clone(), audit.clone()));
+        let hub = test_hub_service(settings.clone()).await;
         (
             api_router(
                 users,
                 settings,
                 audit.clone(),
                 backup,
+                hub,
                 write_targets,
                 write_rules,
                 write_audit_log,
@@ -4024,11 +4210,13 @@ mod tests {
             .await
             .expect("viewer login");
 
+        let hub = test_hub_service(settings.clone()).await;
         let router = api_router(
             users,
             settings,
             audit.clone(),
             backup,
+            hub,
             write_targets,
             write_rules,
             write_audit_log,
@@ -4119,11 +4307,13 @@ mod tests {
             .await
             .expect("viewer login");
 
+        let hub = test_hub_service(settings.clone()).await;
         let router = api_router(
             users,
             settings,
             audit,
             backup,
+            hub,
             write_targets,
             write_rules,
             write_audit_log,
@@ -4769,11 +4959,13 @@ mod tests {
             .await
             .expect("viewer login");
 
+        let hub = test_hub_service(settings.clone()).await;
         let router = api_router(
             users,
             settings,
             audit.clone(),
             backup,
+            hub,
             write_targets,
             write_rules,
             write_audit_log,
@@ -4906,11 +5098,13 @@ mod tests {
             .await
             .expect("viewer login");
 
+        let hub = test_hub_service(settings.clone()).await;
         let router = api_router(
             users,
             settings,
             audit.clone(),
             backup,
+            hub,
             write_targets,
             write_rules,
             write_audit_log,
@@ -5079,11 +5273,13 @@ mod tests {
             .await
             .expect("viewer login");
 
+        let hub = test_hub_service(settings.clone()).await;
         let router = api_router(
             users,
             settings,
             audit.clone(),
             backup,
+            hub,
             write_targets,
             write_rules,
             write_audit_log,
@@ -5532,11 +5728,13 @@ mod tests {
         let engine_control: SharedEngineControl =
             std::sync::Arc::new(tokio::sync::Mutex::new(Some(control)));
 
+        let hub = test_hub_service(settings.clone()).await;
         let router = api_router(
             users,
             settings,
             audit,
             backup,
+            hub,
             write_targets,
             write_rules,
             write_audit_log,
