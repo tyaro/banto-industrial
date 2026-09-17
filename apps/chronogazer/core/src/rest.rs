@@ -1890,6 +1890,7 @@ mod tests {
         assert_eq!(body["state"], json!("stopped"));
         assert_eq!(body["subscribedCount"], json!(0));
         assert_eq!(body["unresolved"], json!([]));
+        assert_eq!(body["unsupported"], json!([]));
         assert_eq!(body["values"], json!([]));
         assert!(
             body["reason"].as_str().is_some_and(|s| !s.is_empty()),

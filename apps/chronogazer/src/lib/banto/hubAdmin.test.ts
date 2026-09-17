@@ -124,6 +124,7 @@ function subscription(overrides: Partial<HubSubscription> = {}): HubSubscription
 		reason: null,
 		subscribedCount: 2,
 		unresolved: [],
+		unsupported: [],
 		lastError: null,
 		lastValueAt: 1000,
 		values: [],
@@ -183,5 +184,16 @@ describe('hubSubscriptionDetail', () => {
 		const stopped = subscription({ state: 'stopped', reason: 'r', unresolved: ['a', 'b'] });
 		expect(stopped.unresolved).toEqual(['a', 'b']);
 		expect(hubSubscriptionDetail(stopped)).toBe('r');
+	});
+
+	it('購読できない名前は未解決タグと別のバケツで保持される（理由が違うものを混ぜない）', () => {
+		const stopped = subscription({
+			state: 'stopped',
+			reason: 'r',
+			unresolved: ['gone'],
+			unsupported: ['a,b']
+		});
+		expect(stopped.unresolved).toEqual(['gone']);
+		expect(stopped.unsupported).toEqual(['a,b']);
 	});
 });

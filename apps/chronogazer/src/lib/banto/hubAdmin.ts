@@ -89,8 +89,16 @@ export interface HubSubscription {
 	state: HubSubscriptionState;
 	reason: string | null;
 	subscribedCount: number;
-	/** 選んだのに Hub のタグ一覧に無かった external name。空表示に潰さない。 */
+	/**
+	 * 選んだのに Hub のタグ一覧に無かった external name（Hub から消えた／
+	 * 権限で見えない）。空表示に潰さない。
+	 */
 	unresolved: string[];
+	/**
+	 * 購読プロトコルが受け付けない綴りの external name（カンマ入り・空白
+	 * だけ）。`unresolved` とは**理由も次の一手も違う**ので混ぜない。
+	 */
+	unsupported: string[];
 	lastError: string | null;
 	lastValueAt: number | null;
 	values: HubValue[];

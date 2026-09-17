@@ -304,6 +304,21 @@
 					</ul>
 				{/if}
 
+				<!--
+					「購読できない名前」は「Hubから消えた」とは理由も直し方も
+					違う（名前を直す vs Hubにタグを戻す）ので、同じ一覧に混ぜない。
+				-->
+				{#if subscription.unsupported.length > 0}
+					<p class="note">
+						次のタグは購読できない名前です（カンマを含むなど、購読プロトコルが受け付けません）。残りのタグだけを購読しています。
+					</p>
+					<ul class="hub-unresolved">
+						{#each subscription.unsupported as name (name)}
+							<li><span class="hub-tag-name">{name}</span></li>
+						{/each}
+					</ul>
+				{/if}
+
 				{#if subscription.values.length > 0}
 					<table class="hub-values">
 						<thead>
