@@ -352,6 +352,29 @@ export function showManualKeyEntry(
 }
 
 /**
+ * Hub の時刻（`ValuesSnapshot.t` / `ValueEntry.t`）の表示（純関数）。
+ *
+ * `t` は **epoch ミリ秒**（tag-server-design.md §5.3 のワイヤ形）。表示は
+ * 閲覧している端末のロケール・タイムゾーンに任せる（この画面には他に
+ * 揃えるべき独自の時刻書式が無く、ユーザーの環境で自然に読める形が最も
+ * 誤解が少ない）。
+ */
+export function hubTimeLabel(epochMs: number): string {
+	const at = new Date(epochMs);
+	return Number.isNaN(at.getTime()) ? String(epochMs) : at.toLocaleString();
+}
+
+/**
+ * 購読全体の最終受信時刻の表示（純関数）。
+ *
+ * **まだ一度も受信していないことを明示する** - 空欄や「0」に潰すと、
+ * 「受信していない」のか「表示できていない」のか区別が付かなくなる。
+ */
+export function hubLastValueLabel(lastValueAt: number | null): string {
+	return lastValueAt === null ? 'まだ受信していません' : hubTimeLabel(lastValueAt);
+}
+
+/**
  * 購読状態の見出し（純関数 - `hubAdmin.test.ts` が固定する）。
  *
  * `connecting` と `handshaking` は**意図的に同じ文言**にしている（運用上は
@@ -386,6 +409,11 @@ export function hubSubscriptionLabel(state: HubSubscriptionState): string {
  * `lastError` になる。このとき件数を根拠に「購読しています」と言うと
  * **状態表示（停止）と説明（購読中）が矛盾する**ので、`stopped` のうちは
  * 件数を理由にしない。
+ *
+ * 同じ理由で、**「購読しています」と言い切れるのは `live` のときだけ**。
+ * `connecting`/`handshaking`/`rebinding`/`reconnecting` は値を受けていない
+ * （`values` も空）進行中の状態なので、件数に触れるときも「購読しようと
+ * しています」と、**まだ受信していないことが分かる**言い方にする。
  */
 export function hubSubscriptionDetail(subscription: HubSubscription): string {
 	if (subscription.state === 'stopped') {
@@ -403,5 +431,17 @@ export function hubSubscriptionDetail(subscription: HubSubscription): string {
 		// 入力欄はこのブロックより上にあるので「下の欄」とは言わない。
 		return 'Hubがこのキーでの購読を拒否しました（認証が通っていません）。「接続」でキーを再発行するか、Hubの管理画面で発行したAPIキーをこの画面の入力欄から採用してください。';
 	}
-	return `${subscription.subscribedCount}件のタグを購読しています。`;
+	if (subscription.state === 'live') {
+		return `${subscription.subscribedCount}件のタグを購読しています。`;
+	}
+	// ここから下はすべて「進行中でまだ受信していない」状態。
+	switch (subscription.state) {
+		case 'connecting':
+		case 'handshaking':
+			return `Hubに接続しています（${subscription.subscribedCount}件のタグを購読しようとしています）。`;
+		case 'rebinding':
+			return `タグの対応を取り直しています（${subscription.subscribedCount}件）。Hub側でタグが変更された可能性があります。`;
+		case 'reconnecting':
+			return `再接続を待っています（${subscription.subscribedCount}件のタグを購読しようとしています）。`;
+	}
 }

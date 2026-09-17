@@ -30,10 +30,12 @@
 		disconnectHub,
 		getHubStatus,
 		getHubSubscription,
+		hubLastValueLabel,
 		hubStatusDetail,
 		hubStatusLabel,
 		hubSubscriptionDetail,
 		hubSubscriptionLabel,
+		hubTimeLabel,
 		isHubAvailable,
 		refreshHubCatalog,
 		setHubSelectedTags,
@@ -154,7 +156,17 @@
 
 	// --- #383 段階1: 購読状態のポーリング -----------------------------------
 
-	let pollTimer: ReturnType<typeof setInterval> | null = null;
+	/**
+	 * 次の読み取りの予約。`null` は「回していない」。
+	 *
+	 * `setInterval` ではなく**完了してから次を予約する自己再帰**にしている:
+	 * 一定間隔で投げると、遅れた古い応答が新しい応答のあとに着いて
+	 * `subscription` を巻き戻せる（LAN の HTTP 経路で起きやすい）。1 本ずつ
+	 * 直列に読めば、着順と発行順が入れ替わらない。
+	 */
+	let pollTimer: ReturnType<typeof setTimeout> | null = null;
+	/** 回している間だけ true。予約前に見て、停止後の予約を防ぐ。 */
+	let polling = false;
 
 	/**
 	 * 購読状態だけを読み直す。**このページを開いている間だけ**回し、失敗は
@@ -169,22 +181,35 @@
 		}
 	}
 
+	/** 1 回読んでから次を予約する。停止されていたら予約しない。 */
+	async function pollThenSchedule(): Promise<void> {
+		await pollSubscription();
+		if (!polling) return;
+		pollTimer = setTimeout(() => void pollThenSchedule(), SUBSCRIPTION_POLL_MS);
+	}
+
 	function stopPolling(): void {
+		polling = false;
 		if (pollTimer !== null) {
-			clearInterval(pollTimer);
+			clearTimeout(pollTimer);
 			pollTimer = null;
 		}
 	}
 
+	/**
+	 * 即時に 1 回読んでから回し始める。`$effect` の `getHubStatus()` が
+	 * 失敗すると `subscription` が埋まらないので、この 1 回目が無いと
+	 * 購読ブロックが最初の周期まで出ない。
+	 */
 	function startPolling(): void {
-		if (!available || pollTimer !== null) return;
-		pollTimer = setInterval(() => void pollSubscription(), SUBSCRIPTION_POLL_MS);
+		if (!available || polling) return;
+		polling = true;
+		void pollThenSchedule();
 	}
 
 	/** タブが隠れている間は止める（見ていない画面のために回し続けない）。 */
 	function onVisibilityChange(): void {
 		if (document.visibilityState === 'visible') {
-			void pollSubscription();
 			startPolling();
 		} else {
 			stopPolling();
@@ -194,13 +219,7 @@
 	onMount(() => {
 		if (!available) return;
 		document.addEventListener('visibilitychange', onVisibilityChange);
-		if (document.visibilityState === 'visible') {
-			// 即時に 1 回読む。`$effect` の `getHubStatus()` が失敗すると
-			// `subscription` が埋まらないので、これが無いと購読ブロックが
-			// 最初の周期（2 秒）まで出ない。
-			void pollSubscription();
-			startPolling();
-		}
+		if (document.visibilityState === 'visible') startPolling();
 	});
 
 	onDestroy(() => {
@@ -301,6 +320,12 @@
 					購読: <strong>{hubSubscriptionLabel(subscription.state)}</strong>
 				</p>
 				<p class="note">{hubSubscriptionDetail(subscription)}</p>
+				<!--
+					購読全体の最終受信時刻。値の表の行ごとの `t` は
+					「この行がいつの値か」であって、購読が生きているかの
+					目安にはならないので別に出す。
+				-->
+				<p class="note">最終受信: {hubLastValueLabel(subscription.lastValueAt)}</p>
 
 				<!--
 					`hubSubscriptionDetail` が「停止（エラー: …）」としてエラーを
@@ -353,7 +378,7 @@
 									<td class="hub-tag-name">{value.tag}</td>
 									<td>{value.v ?? '—'}</td>
 									<td>{value.q}</td>
-									<td>{value.t}</td>
+									<td>{hubTimeLabel(value.t)}</td>
 								</tr>
 							{/each}
 						</tbody>

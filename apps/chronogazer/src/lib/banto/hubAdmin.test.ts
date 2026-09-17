@@ -19,6 +19,8 @@ import {
 	hubStatusLabel,
 	hubSubscriptionDetail,
 	hubSubscriptionLabel,
+	hubLastValueLabel,
+	hubTimeLabel,
 	hubUnreachableCauseLabel,
 	needsManualKey,
 	showManualKeyEntry,
@@ -172,7 +174,27 @@ describe('hubSubscriptionDetail', () => {
 	it('購読中は件数を述べ、停止の理由文言とは別物になる', () => {
 		const live = hubSubscriptionDetail(subscription({ state: 'live', subscribedCount: 3 }));
 		expect(live).toContain('3');
+		expect(live).toContain('購読しています');
 		expect(live).not.toBe(hubSubscriptionDetail(subscription({ state: 'stopped', reason: 'x' })));
+	});
+
+	it('進行中の状態では「購読しています」と言い切らない（まだ受信していない）', () => {
+		// これらの状態では `current()` が値を返さない＝実際には受信していない。
+		// 「N件のタグを購読しています」と出すと状態ラベルと矛盾する。
+		for (const state of ['connecting', 'handshaking', 'rebinding', 'reconnecting'] as const) {
+			const detail = hubSubscriptionDetail(subscription({ state, subscribedCount: 3 }));
+			expect(detail, state).not.toContain('購読しています');
+			expect(detail.length, state).toBeGreaterThan(0);
+		}
+	});
+
+	it('進行中の状態の説明は互いに潰れない', () => {
+		const details = (
+			['live', 'connecting', 'handshaking', 'rebinding', 'reconnecting'] as const
+		).map((state) => hubSubscriptionDetail(subscription({ state })));
+		// connecting と handshaking は見出しと同じく意図的に同じ説明。
+		expect(details[1]).toBe(details[2]);
+		expect(new Set(details).size).toBe(details.length - 1);
 	});
 
 	it('unauthorized は接続側と同じ導線（再発行 / キーの採用）へ誘導する', () => {
@@ -253,5 +275,22 @@ describe('showManualKeyEntry', () => {
 			false
 		);
 		expect(showManualKeyEntry({ state: 'notConfigured' }, null)).toBe(false);
+	});
+});
+
+describe('hubLastValueLabel / hubTimeLabel', () => {
+	it('まだ一度も受信していないことを明示する（空欄や 0 に潰さない）', () => {
+		expect(hubLastValueLabel(null)).toBe('まだ受信していません');
+	});
+
+	it('受信済みなら epoch ミリ秒をその端末の書式で出す', () => {
+		const epochMs = 1722758400123;
+		expect(hubLastValueLabel(epochMs)).toBe(new Date(epochMs).toLocaleString());
+		// epoch ミリ秒をそのまま数字で出さない。
+		expect(hubLastValueLabel(epochMs)).not.toBe(String(epochMs));
+	});
+
+	it('解釈できない値は握りつぶさずそのまま見せる', () => {
+		expect(hubTimeLabel(Number.NaN)).toBe('NaN');
 	});
 });

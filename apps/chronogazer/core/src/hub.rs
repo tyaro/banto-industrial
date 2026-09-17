@@ -184,15 +184,23 @@ pub struct HubSubscriptionView {
     pub unsupported: Vec<String>,
     /// [`TagClientState::last_error`] の分類名（`ErrorKind::as_str`）。
     pub last_error: Option<String>,
-    /// 最後に受けた [`ValuesSnapshot::t`]。
+    /// 最後に観測した [`ValuesSnapshot::t`]。**`Live` を離れても消えない**
+    /// （`banto-tagclient` の `current()` と違い、こちらで覚えている）。
+    /// 更新の粒度は最大 30 秒 - 理由は `Subscription::observe_last_value`。
     pub last_value_at: Option<i64>,
     pub values: Vec<HubValueView>,
 }
 
 impl HubSubscriptionView {
     /// 世代を持っていないときの形。`unresolved` / `unsupported` は理由と
-    /// 独立に出す。
-    fn stopped(reason: Option<String>, unresolved: Vec<String>, unsupported: Vec<String>) -> Self {
+    /// 独立に出す。`last_value_at` も残す - 止まっていても「いつまで受けて
+    /// いたか」は有用な情報。
+    fn stopped(
+        reason: Option<String>,
+        unresolved: Vec<String>,
+        unsupported: Vec<String>,
+        last_value_at: Option<i64>,
+    ) -> Self {
         Self {
             state: "stopped",
             reason,
@@ -200,7 +208,7 @@ impl HubSubscriptionView {
             unresolved,
             unsupported,
             last_error: None,
-            last_value_at: None,
+            last_value_at,
             values: Vec::new(),
         }
     }
@@ -561,6 +569,14 @@ struct Subscription {
     unresolved: Vec<String>,
     /// 直近の突き合わせで購読プロトコルに弾かれた名前。
     unsupported: Vec<String>,
+    /// 最後に観測した [`ValuesSnapshot::t`]（「いつまで値を受けていたか」）。
+    ///
+    /// **ここに覚えておく必要がある**: `banto-tagclient` は `Live` を離れると
+    /// `current()` を捨てるので、そこから導くと再接続・再バインドに入った
+    /// 瞬間に消えてしまう。まさに「最後に受けた時刻」を知りたい場面で消える
+    /// ということなので、観測したら保持する。世代を張り直したらリセットし
+    /// （別の購読の話になるため）、止まっただけなら残す。
+    last_value_at: Option<i64>,
 }
 
 /// 起動直後（まだ一度も突き合わせていない）も「理由付きの停止」で表現する。
@@ -573,6 +589,7 @@ impl Default for Subscription {
             reason: Some(REASON_NOT_STARTED.to_owned()),
             unresolved: Vec::new(),
             unsupported: Vec::new(),
+            last_value_at: None,
         }
     }
 }
@@ -593,12 +610,33 @@ impl Subscription {
         self.reason = reason;
     }
 
-    fn view(&self) -> HubSubscriptionView {
+    /// 現世代の `watch` を覗き、live なスナップショットがあれば
+    /// [`Self::last_value_at`] を進める。
+    ///
+    /// `banto-tagclient` は `Live` のときだけ `current()` を返すので、
+    /// **見えているうちに記録しておく**しかない。世代ごとに `watch` を
+    /// 購読する専用タスクを立てれば取りこぼしは無くなるが、タスクを増やさず
+    /// にこの表示要件は満たせる: 呼ぶのは (1) 画面を開いている間の 2 秒
+    /// ポーリング（[`Self::view`]）と (2) 見張りの各周期（30 秒）なので、
+    /// **更新の粒度は最大 30 秒**。「最後に値を受けたのはいつか」という
+    /// 用途にはその精度で足りる。
+    fn observe_last_value(&mut self) {
+        let Some(generation) = self.generation.as_ref() else {
+            return;
+        };
+        let observed = generation.states.borrow().current().map(|s| s.t);
+        self.last_value_at = advance_last_value_at(self.last_value_at, observed);
+    }
+
+    fn view(&mut self) -> HubSubscriptionView {
+        self.observe_last_value();
+        let last_value_at = self.last_value_at;
         let Some(generation) = self.generation.as_ref() else {
             return HubSubscriptionView::stopped(
                 self.reason.clone(),
                 self.unresolved.clone(),
                 self.unsupported.clone(),
+                last_value_at,
             );
         };
         let state = generation.states.borrow();
@@ -609,7 +647,7 @@ impl Subscription {
             unresolved: self.unresolved.clone(),
             unsupported: self.unsupported.clone(),
             last_error: state.last_error().map(|kind| kind.as_str().to_owned()),
-            last_value_at: state.current().map(|snapshot| snapshot.t),
+            last_value_at,
             values: state.current().map(value_views).unwrap_or_default(),
         }
     }
@@ -623,6 +661,21 @@ impl Subscription {
                 failed: state.last_error().is_some(),
             }
         })
+    }
+}
+
+/// 「最後に値を受けた時刻」を観測結果で進める（純関数）。
+///
+/// `observed` が `None` なのは「今は live なスナップショットが無い」＝
+/// **`Live` を離れた**という意味で、そのときは**覚えている値をそのまま残す**
+/// （`banto-tagclient` の `current()` をそのまま出すと、まさに知りたい場面で
+/// `null` になってしまう）。進めるときは単調に - 巻き戻る `t` を受けても
+/// 「最後に受けた時刻」を過去に戻さない。
+fn advance_last_value_at(current: Option<i64>, observed: Option<i64>) -> Option<i64> {
+    match (current, observed) {
+        (last, None) => last,
+        (None, Some(t)) => Some(t),
+        (Some(last), Some(t)) => Some(last.max(t)),
     }
 }
 
@@ -843,8 +896,14 @@ impl HubService {
         if self.inner.mirror.current().is_none() {
             return;
         }
-        if !needs_retry(self.inner.subscription.lock().await.health()) {
-            return;
+        {
+            let mut slot = self.inner.subscription.lock().await;
+            // 画面を閉じていても最終受信時刻が進むように、判定より**前**に
+            // 無条件で 1 回観測する（`observe_last_value` の doc 参照）。
+            slot.observe_last_value();
+            if !needs_retry(slot.health()) {
+                return;
+            }
         }
         if let Err(err) = self.resume_inner().await {
             eprintln!("banto: Hub購読の再試行に失敗しました（次の周期で再試行します）: {err}");
@@ -1109,6 +1168,9 @@ impl HubService {
         };
         match client.start(plan.requests) {
             Ok(handle) => {
+                // 新しい世代は別の購読なので、前の世代の最終受信時刻は
+                // 引き継がない。
+                slot.last_value_at = None;
                 slot.generation = Some(Generation {
                     states: handle.state_watch(),
                     handle,
@@ -1574,6 +1636,55 @@ mod tests {
                 health
             ));
         }
+    }
+
+    /// `banto-tagclient` は `Live` を離れると `current()` を捨てるので、
+    /// そこから導くと**再接続・再バインドに入った瞬間に最終受信時刻が消える**。
+    /// 観測できないこと（`None`）を「受けていない」と読み替えない。
+    #[test]
+    fn the_last_value_time_survives_leaving_live() {
+        // Live で t=5 を観測 → 覚える。
+        assert_eq!(advance_last_value_at(None, Some(5)), Some(5));
+        // Live を離れた（`current()` が `None`）→ 消さない。
+        assert_eq!(advance_last_value_at(Some(5), None), Some(5));
+        // まだ一度も受けていなければ `None` のまま（0 に潰さない）。
+        assert_eq!(advance_last_value_at(None, None), None);
+        // 進むときは単調 - 巻き戻る `t` で過去に戻さない。
+        assert_eq!(advance_last_value_at(Some(5), Some(9)), Some(9));
+        assert_eq!(advance_last_value_at(Some(5), Some(3)), Some(5));
+    }
+
+    /// 世代が `Live` でなくても、覚えている最終受信時刻を view に出す
+    /// （世代があるとき・無いときの両方）。
+    #[tokio::test]
+    async fn the_view_reports_the_remembered_last_value_time_outside_live() {
+        let (_settings, hub) = service_with_keyring(&closed_endpoint(), &["a"]).await;
+        hub.reconcile_with(
+            &HubStatus::Connected { tag_count: 1 },
+            Some(&catalog(&["a"])),
+            Trigger::Observe,
+        )
+        .await;
+
+        // 到達不能な接続先なので世代は `Live` にならない＝`current()` は
+        // `None`。Live の間に観測したことにして覚えさせる。
+        {
+            let mut slot = hub.inner.subscription.lock().await;
+            assert!(slot.generation.is_some());
+            slot.last_value_at = Some(1_234);
+        }
+        assert_eq!(
+            hub.subscription().await.last_value_at,
+            Some(1_234),
+            "Live を離れても最終受信時刻は消えない"
+        );
+
+        // 世代を止めても「いつまで受けていたか」は残す。
+        hub.reconcile_with(&HubStatus::AuthFailed, None, Trigger::Observe)
+            .await;
+        let view = hub.subscription().await;
+        assert_eq!(view.state, "stopped");
+        assert_eq!(view.last_value_at, Some(1_234));
     }
 
     /// 見張りが 1 周期で動く条件（`spawn_supervisor` の判断表）。
