@@ -12,7 +12,7 @@ T13〜T18 の詳細と最新の全体像は
 [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) を正とする（本文 §4c 表は
 T13-1 までの粒度で、以降は同書へ移管）。Hardening（H1〜H10）は H7 の① 実機 soak
 のみ残（詳細は improvement-plan.md）。docs 全体の
-地図は [README.md](README.md)**（2026-09-06 更新。本文の T 系表は 2026-08-08 時点の
+地図は [README.md](README.md)**（2026-09-17 更新。本文の T 系表は 2026-08-08 時点の
 まま — 実装状況の正は banto-hub-remaining-plan.md/banto-hub-desktop-plan.md）
 最終検証日(コード照合): 2026-09-01
 
@@ -88,7 +88,8 @@ PLC通信 + タグデータ保存 + リアルタイム/ヒストリカル/ハイ
 
 **データ源のドライバ（2026-09-17 オーナー決定）**: ChronoGazer は**単体で動く**ことを前提とし、
 データ源のドライバを3種持つ: **SLMP**（`banto-plc::slmp`）・**Modbus TCP**（`banto-plc::modbus`）・
-**banto-hub 経由**（`banto-tagclient` の購読、#332）。banto-hub 側も今後接続ドライバが増えていく
+**banto-hub 経由**（`banto-tagclient` の購読）。Hub 経由は #332 で接続設定とタグ選択まで入って
+おり、**購読の開始は未実装**（#383 段階1）。banto-hub 側も今後接続ドライバが増えていく
 想定なので前2者は Hub と機能が被るが、**現場 PC 1 台だけでも ChronoGazer が成立すること**を
 優先し、この重複は許容する。段階（Hub 経由 → 直結 → 合流）と設計の論点は #383。
 
