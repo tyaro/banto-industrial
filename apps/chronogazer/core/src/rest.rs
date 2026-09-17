@@ -32,6 +32,21 @@
 //! | POST   | `/api/backups/{fileName}/restore` | -   | 204 (admin)             |
 //! | GET    | `/api/backups/pending-restore` | -      | `PendingRestoreInfo \| null` (admin) |
 //! | DELETE | `/api/backups/pending-restore` | -      | 204 (admin)             |
+//! | GET    | `/api/plc-connections`      | -              | `PlcConnectionResponse[]` (viewer+, #383 段階2a/R1-B) |
+//! | POST   | `/api/plc-connections`      | `PlcConnectionPayload` | `PlcConnectionResponse` (editor+) |
+//! | GET    | `/api/plc-connections/{id}` | -              | `PlcConnectionResponse` (viewer+) |
+//! | PUT    | `/api/plc-connections/{id}` | `PlcConnectionPayload` | `PlcConnectionResponse` (editor+) |
+//! | DELETE | `/api/plc-connections/{id}` | -              | 204 (editor+)           |
+//! | GET    | `/api/collection-groups`      | -            | `CollectionGroup[]` (viewer+) |
+//! | POST   | `/api/collection-groups`      | `CollectionGroupPayload` | `CollectionGroup` (editor+) |
+//! | GET    | `/api/collection-groups/{id}` | -            | `CollectionGroup` (viewer+) |
+//! | PUT    | `/api/collection-groups/{id}` | `CollectionGroupPayload` | `CollectionGroup` (editor+) |
+//! | DELETE | `/api/collection-groups/{id}` | -            | 204 (editor+)           |
+//! | GET    | `/api/tags`      | -                        | `Tag[]` (viewer+)       |
+//! | POST   | `/api/tags`      | `TagPayload`             | `Tag` (editor+)         |
+//! | GET    | `/api/tags/{id}` | -                        | `Tag` (viewer+)         |
+//! | PUT    | `/api/tags/{id}` | `TagPayload`             | `Tag` (editor+)         |
+//! | DELETE | `/api/tags/{id}` | -                        | 204 (editor+)           |
 //!
 //! `/api/ui-settings/*` (spec M12 SettingsProvider migration): per-user UI
 //! settings (theme/preset/dock layout), namespaced by the caller's own
@@ -62,10 +77,16 @@
 //! re-resolves the bearer token to an [`Identity`], parses `Identity.role`
 //! into [`Role`], and rejects with `403 { "kind": "forbidden" }`
 //! (`banto_core::ErrorBody::Forbidden`) if the caller's role is not at least
-//! the route's minimum. Only `admin` can manage other accounts. Future
-//! resources (R1-B: PLC connections/collection groups/tags/display groups)
-//! follow the same `viewer` read / `editor`+ write / `admin`-only pattern
-//! items used to demonstrate in the banto template.
+//! the route's minimum. Only `admin` can manage other accounts.
+//!
+//! `/api/plc-connections/*`, `/api/collection-groups/*` and `/api/tags/*`
+//! (#383 段階2a / R1-B, `docs/recorder-requirements.md` §3.6) instead follow
+//! `viewer`-read / `editor`+-write: unlike the `admin`-only routers above,
+//! their GET routes need only `require_auth` (any role), so read and write
+//! share a path but need different floors - [`tag_registry_router`] uses
+//! [`require_editor`] inline on each write handler rather than a
+//! single-floor `RoleGuard` layer. A future 表示グループ resource would
+//! follow the same pattern.
 //!
 //! ## Audit log (spec M14, `docs/roadmap.md`)
 //!
@@ -78,6 +99,14 @@
 //! [`audit_logout_middleware`] records `logout`; and `auth_setup_handler`
 //! records `setup`. Read routes (`list`/`get`) are never audited. The trail
 //! itself is only readable via `POST /api/audit-log/list`, `admin`-only.
+//!
+//! `/api/plc-connections/*`/`/api/collection-groups/*`/`/api/tags/*` (#383
+//! 段階2a / R1-B): [`require_editor`] records `action: "denied"` the same
+//! way [`require_role_at_least`] does above; a successful create/update/
+//! delete records via [`record_write`] with `resource` one of
+//! `"plc_connections"`/`"collection_groups"`/`"tags"` and `entity_id` the
+//! row id - same helper, same shape as every other mutating handler in this
+//! module. Reads are never audited (same convention).
 //!
 //! `/api/backups/*` (spec M17): `admin`-only, guarded the same way
 //! `/api/users/*`/`/api/audit-log/*` are. `POST /api/backups` records
@@ -109,10 +138,14 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use banto_core::{BantoError, ErrorBody, ListParams, ListResult};
+use banto_core::{BantoError, ErrorBody, FieldError, ListParams, ListResult};
 use banto_server::{
     auth_routes, require_auth, require_banto_client_header, sse_route, ApiError, AuthState,
     Identity, ServerEvent,
+};
+use banto_tags::{
+    CollectionGroup, CollectionGroupInput, CollectionGroupService, PlcConnection,
+    PlcConnectionInput, PlcConnectionService, Tag, TagInput, TagService, MODBUS_PROTOCOL,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -240,6 +273,54 @@ async fn require_role_at_least(
             }
             forbidden_response()
         }
+    }
+}
+
+/// Resolve the caller's identity and require role >= `editor` (R0 §3.6:
+/// resources are viewer-read / editor-write). Records a `denied` audit entry
+/// (mirroring [`require_role_at_least`]) when an AUTHENTICATED caller's role
+/// is too low, and returns `BantoError::Forbidden`; no valid session at all
+/// returns `BantoError::Unauthorized` (deliberately NOT audited, same
+/// reasoning as the RBAC middleware: nothing resembling a real user to
+/// attribute a denial to). Used inline by [`tag_registry_router`]'s write
+/// handlers, which - unlike the admin-only routers above - cannot use a
+/// single-floor `RoleGuard` middleware because their GET routes are only
+/// `require_auth` (viewer+), so read and write share a path but need
+/// different floors. This is the REST twin of `src-tauri`'s `require_role`,
+/// and the same helper relay-wright's `rest.rs` uses for its own R1-B
+/// registry router.
+async fn require_editor(
+    auth: &AuthState,
+    audit: &AuditLogService,
+    headers: &HeaderMap,
+    resource: &'static str,
+    method: &str,
+    path: &str,
+) -> Result<(), BantoError> {
+    match actor_identity(headers, auth) {
+        Some(identity)
+            if Role::from_str(&identity.role)
+                .map(|role| role.at_least(Role::Editor))
+                .unwrap_or(false) =>
+        {
+            Ok(())
+        }
+        Some(identity) => {
+            audit
+                .record(AuditEntry {
+                    actor_username: Some(&identity.id),
+                    actor_role: Some(&identity.role),
+                    action: "denied",
+                    resource,
+                    entity_id: None,
+                    detail: Some(json!({ "method": method, "path": path })),
+                    origin: "rest",
+                    result: "denied",
+                })
+                .await;
+            Err(BantoError::Forbidden)
+        }
+        None => Err(BantoError::Unauthorized),
     }
 }
 
@@ -1298,6 +1379,635 @@ fn hub_router(hub: HubService, audit: AuditLogService, auth: AuthState) -> Route
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
 
+// --- #383 段階2a / R1-B: レジストリ CRUD（PLC接続・収集グループ・タグ） ----
+//
+// banto-tags の3サービス（`PlcConnectionService`/`CollectionGroupService`/
+// `TagService`）を REST に配線する。手本は relay-wright の同名セクション
+// （`apps/relay-wright/core/src/rest.rs`）- viewer-read/editor-write
+// （R0 §3.6）を [`require_editor`] で掛け、成功した書き込みだけ
+// [`record_write`] で監査する（`origin: "rest"`）。
+//
+// relay-wright と違い、このアプリはカスケード削除・`/describe`・`/test`・
+// 式チェック・バッチ操作を持たない（#383 段階2a のスコープ外 - 指示書
+// 「やらないこと」）。バニラな CRUD だけ。banto-tags 自身の削除ガード
+// （「まだ N 件のグループ/タグから参照されています」）がそのまま
+// `BantoError::Validation` として返る。
+
+fn default_payload_enabled() -> bool {
+    true
+}
+
+fn default_plc_protocol() -> String {
+    MODBUS_PROTOCOL.to_string()
+}
+
+fn default_plc_unit_id() -> i64 {
+    1
+}
+
+fn default_tag_decimals() -> i64 {
+    0
+}
+
+/// chronogazer は PLC 直結アプリ（recorder-requirements.md §1「対象環境」）
+/// で、`banto_tags::ALLOWED_PROTOCOLS` の4つのうち `"virtual"`（演算/内部
+/// タグの置き場、banto-hub が calc/mem を自動発行する仕組み）と
+/// `"postgres"`（DB Source/Sink、banto-hub 固有）はどちらも banto-hub の
+/// 機能で、chronogazer には対応する画面もタグ種別も無い。指示書の指定
+/// どおり `"modbus-tcp"`/`"slmp"` だけを受け付ける - relay-wright の
+/// `reject_postgres_connection_protocol`（postgres だけを拒否）より一段
+/// 狭い許可リスト方式にしているのは、chronogazer が「PLC 直結」以外の
+/// 用途を一切持たないため（将来 `ALLOWED_PROTOCOLS` が5つ目を増やしても、
+/// ここで拒否されるのが安全側のデフォルト）。REST の create/update ハンドラ
+/// と、双方向対称の Tauri コマンド（`apps/chronogazer/src-tauri/src/lib.rs`
+/// の `plc_connections_create`/`plc_connections_update`）の両方から呼ぶ -
+/// 片方だけに書くともう片方の経路から通ってしまう。
+fn reject_disallowed_connection_protocol(protocol: &str) -> Result<(), BantoError> {
+    const ALLOWED: [&str; 2] = [MODBUS_PROTOCOL, "slmp"];
+    if ALLOWED.contains(&protocol) {
+        return Ok(());
+    }
+    Err(BantoError::Validation {
+        field_errors: vec![FieldError {
+            field: "protocol".to_string(),
+            message: format!(
+                "chronogazer が対応するプロトコルは {} のいずれかです",
+                ALLOWED.join(", ")
+            ),
+        }],
+    })
+}
+
+/// Wire-shaped (camelCase) create/update payload for `plc_connections`.
+///
+/// R1-B 指示書（#383 段階2a）どおり、banto-tags/relay-wright/banto-hub の
+/// `PlcConnectionInput`/`PlcConnectionPayload` から chronogazer に不要な
+/// フィールドを落とした最小形: `simulation`（接続単位シミュレーションは
+/// banto-hub 固有機能）と `database`/`username`/`password`（`"postgres"`
+/// 専用列 - [`reject_disallowed_connection_protocol`] が postgres 接続の
+/// 作成自体を拒否するので、この3列を持たせても常に空にしかならない）は
+/// ワイヤに出さない。`word_order` は残す（指示書の残す一覧に明記）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlcConnectionPayload {
+    pub name: String,
+    #[serde(default = "default_plc_protocol")]
+    pub protocol: String,
+    pub host: String,
+    pub port: i64,
+    #[serde(default = "default_plc_unit_id")]
+    pub unit_id: i64,
+    #[serde(default = "default_payload_enabled")]
+    pub enabled: bool,
+    /// `""` = 未指定（プロトコルの既定に従う） - `PlcConnectionInput::
+    /// word_order`のドキュメント参照。素通しするだけで chronogazer 側の
+    /// 追加ロジックは無い。
+    #[serde(default)]
+    pub word_order: String,
+}
+
+impl From<PlcConnectionPayload> for PlcConnectionInput {
+    fn from(payload: PlcConnectionPayload) -> Self {
+        Self {
+            name: payload.name,
+            protocol: payload.protocol,
+            host: payload.host,
+            port: payload.port,
+            unit_id: payload.unit_id,
+            enabled: payload.enabled,
+            // R1-B: `simulation` は banto-hub 固有機能（接続単位シミュ
+            // レーション切り替え）。chronogazer は一切設定しない - 常に
+            // 列の既定値（`false`）のまま。
+            simulation: false,
+            word_order: payload.word_order,
+            // postgres 専用列。[`reject_disallowed_connection_protocol`]
+            // が postgres 接続の作成を拒否するので常に `None` でよい。
+            database: None,
+            username: None,
+            password: None,
+        }
+    }
+}
+
+/// `plc_connections` の GET/list/create/update が返す読み取り DTO。
+/// `banto_tags::PlcConnection` をそのまま `Serialize` すると `password`
+/// 列（`banto_hub`/relay-wright と共有する平文カラム、
+/// `PlcConnection::password`の doc comment「外部呼び出し元へ決して
+/// シリアライズしない」）がそのまま応答に出てしまう。chronogazer は
+/// postgres 接続を作成できない（[`reject_disallowed_connection_protocol`]）
+/// ので通常運用でこの列が非空になることは無いはずだが、防御的に - 何らか
+/// の経路（データベースファイルの直接操作等）で非空の `password` を持つ行
+/// が紛れ込んでいても外へ出さない。`simulation`/`database`/`username` も
+/// 同じ理由（chronogazer は一切書かない列）で応答から省く - relay-wright
+/// の同名 DTO と異なり、これらの列を「常に既定値のまま」であることを
+/// 応答形から見ても分かるようにしている。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlcConnectionResponse {
+    pub id: i64,
+    pub name: String,
+    pub protocol: String,
+    pub host: String,
+    pub port: i64,
+    pub unit_id: i64,
+    pub enabled: bool,
+    pub word_order: String,
+}
+
+impl From<PlcConnection> for PlcConnectionResponse {
+    fn from(conn: PlcConnection) -> Self {
+        Self {
+            id: conn.id,
+            name: conn.name,
+            protocol: conn.protocol,
+            host: conn.host,
+            port: conn.port,
+            unit_id: conn.unit_id,
+            enabled: conn.enabled,
+            word_order: conn.word_order,
+        }
+    }
+}
+
+/// Wire-shaped (camelCase) create/update payload for `collection_groups`.
+/// `default_writable`/`query_sql`（S2 DB Source、banto-hub 固有）は
+/// [`From`] impl 側で列の既定値に固定する - chronogazer には対応する UI が
+/// 無い。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionGroupPayload {
+    pub name: String,
+    pub plc_connection_id: i64,
+    pub period_ms: i64,
+    #[serde(default = "default_payload_enabled")]
+    pub enabled: bool,
+}
+
+impl From<CollectionGroupPayload> for CollectionGroupInput {
+    fn from(payload: CollectionGroupPayload) -> Self {
+        Self {
+            name: payload.name,
+            plc_connection_id: payload.plc_connection_id,
+            period_ms: payload.period_ms,
+            enabled: payload.enabled,
+            // banto-hub 固有（新規タグ登録フォームの writable チェック
+            // ボックス初期値）。chronogazer に対応 UI は無い - 列の既定値
+            // （`true`）のまま。
+            default_writable: true,
+            // S2 DB Source（banto-hub 固有）。chronogazer は postgres 接続
+            // を作成できないので常に `None`。
+            query_sql: None,
+        }
+    }
+}
+
+/// Wire-shaped (camelCase) create/update payload for `tags`。
+///
+/// R1-B 指示書の「残すもの」（名前/接続/デバイスアドレス/データ型/
+/// スケーリング/単位/小数桁）に厳密に合わせた最小形。しきい値
+/// （`thresholdH`/`Hh`/`L`/`Ll`）と文字列タグ（`stringLength`/
+/// `stringEncoding`）は指示書の残す一覧に無い - recorder-requirements.md
+/// §6 は「タグ設定」画面（本 PR）と「グループ設定（ペン割当・表示種別・
+/// しきい値）」画面を別画面として挙げており、しきい値の編集は後者
+/// （表示グループ、R1-B の範囲外・#383 の後続段階）の役目と読める。
+/// `writable`/`tagKind`/`expression`/`retain` は指示書が明示的に落とす
+/// もの（演算タグ・書き込みは banto-hub 固有 / R0 §7 非スコープ）。
+/// [`From`] impl 側でこれらを `banto_tags::TagInput` の既定値に固定する。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagPayload {
+    pub name: String,
+    pub collection_group_id: i64,
+    pub address: String,
+    pub data_type: String,
+    #[serde(default)]
+    pub raw_lo: Option<f64>,
+    #[serde(default)]
+    pub raw_hi: Option<f64>,
+    #[serde(default)]
+    pub eng_lo: Option<f64>,
+    #[serde(default)]
+    pub eng_hi: Option<f64>,
+    #[serde(default)]
+    pub unit: Option<String>,
+    #[serde(default = "default_tag_decimals")]
+    pub decimals: i64,
+    #[serde(default = "default_payload_enabled")]
+    pub enabled: bool,
+}
+
+impl From<TagPayload> for TagInput {
+    fn from(payload: TagPayload) -> Self {
+        Self {
+            name: payload.name,
+            collection_group_id: payload.collection_group_id,
+            address: payload.address,
+            data_type: payload.data_type,
+            // 文字列タグ（"string"）は本 PR のスコープ外（この payload の
+            // doc comment参照） - chronogazer は常に非文字列タグとして
+            // 列の既定値を渡す。`data_type == "string"` を誰かが直接送って
+            // きた場合は banto-tags 側の検証（string_length 必須）が人間
+            // 可読なエラーで弾く。
+            string_length: None,
+            string_encoding: "utf8".to_string(),
+            raw_lo: payload.raw_lo,
+            raw_hi: payload.raw_hi,
+            eng_lo: payload.eng_lo,
+            eng_hi: payload.eng_hi,
+            unit: payload.unit,
+            decimals: payload.decimals,
+            // しきい値は本 PR のスコープ外（この payload の doc comment
+            // 参照）。
+            threshold_h: None,
+            threshold_hh: None,
+            threshold_l: None,
+            threshold_ll: None,
+            enabled: payload.enabled,
+            writable: false,
+            tag_kind: "plc".to_string(),
+            expression: None,
+            retain: false,
+            expected_revision: None,
+        }
+    }
+}
+
+/// State for the `/api/plc-connections/*`, `/api/collection-groups/*` and
+/// `/api/tags/*` handlers: banto-tags の3サービスと、書き込みを editor
+/// ゲート（[`require_editor`]）・監査するための `AuthState`/
+/// `AuditLogService`。
+#[derive(Clone)]
+struct TagRegistryState {
+    plc_connections: PlcConnectionService,
+    collection_groups: CollectionGroupService,
+    tags: TagService,
+    auth: AuthState,
+    audit: AuditLogService,
+}
+
+async fn plc_connections_list(
+    State(state): State<TagRegistryState>,
+) -> Result<Json<Vec<PlcConnectionResponse>>, ApiError> {
+    Ok(Json(
+        state
+            .plc_connections
+            .list(ListParams::default())
+            .await?
+            .rows
+            .into_iter()
+            .map(PlcConnectionResponse::from)
+            .collect(),
+    ))
+}
+
+async fn plc_connections_get(
+    State(state): State<TagRegistryState>,
+    Path(id): Path<i64>,
+) -> Result<Json<PlcConnectionResponse>, ApiError> {
+    Ok(Json(PlcConnectionResponse::from(
+        state.plc_connections.get(id).await?,
+    )))
+}
+
+async fn plc_connections_create(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Json(input): Json<PlcConnectionPayload>,
+) -> Result<Json<PlcConnectionResponse>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "plc_connections",
+        "POST",
+        "/api/plc-connections",
+    )
+    .await?;
+    reject_disallowed_connection_protocol(&input.protocol)?;
+    let created = state.plc_connections.create(input.into()).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "create",
+        "plc_connections",
+        &created.id.to_string(),
+        Some(json!({ "name": created.name, "enabled": created.enabled })),
+    )
+    .await;
+    Ok(Json(PlcConnectionResponse::from(created)))
+}
+
+async fn plc_connections_update(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(input): Json<PlcConnectionPayload>,
+) -> Result<Json<PlcConnectionResponse>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "plc_connections",
+        "PUT",
+        "/api/plc-connections/{id}",
+    )
+    .await?;
+    reject_disallowed_connection_protocol(&input.protocol)?;
+    let updated = state.plc_connections.update(id, input.into()).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "update",
+        "plc_connections",
+        &id.to_string(),
+        Some(json!({ "name": updated.name, "enabled": updated.enabled })),
+    )
+    .await;
+    Ok(Json(PlcConnectionResponse::from(updated)))
+}
+
+async fn plc_connections_delete(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "plc_connections",
+        "DELETE",
+        "/api/plc-connections/{id}",
+    )
+    .await?;
+    state.plc_connections.delete(id).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "delete",
+        "plc_connections",
+        &id.to_string(),
+        None,
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn collection_groups_list(
+    State(state): State<TagRegistryState>,
+) -> Result<Json<Vec<CollectionGroup>>, ApiError> {
+    Ok(Json(
+        state
+            .collection_groups
+            .list(ListParams::default())
+            .await?
+            .rows,
+    ))
+}
+
+async fn collection_groups_get(
+    State(state): State<TagRegistryState>,
+    Path(id): Path<i64>,
+) -> Result<Json<CollectionGroup>, ApiError> {
+    Ok(Json(state.collection_groups.get(id).await?))
+}
+
+async fn collection_groups_create(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Json(input): Json<CollectionGroupPayload>,
+) -> Result<Json<CollectionGroup>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "collection_groups",
+        "POST",
+        "/api/collection-groups",
+    )
+    .await?;
+    let created = state.collection_groups.create(input.into()).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "create",
+        "collection_groups",
+        &created.id.to_string(),
+        Some(json!({ "name": created.name, "enabled": created.enabled })),
+    )
+    .await;
+    Ok(Json(created))
+}
+
+async fn collection_groups_update(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(input): Json<CollectionGroupPayload>,
+) -> Result<Json<CollectionGroup>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "collection_groups",
+        "PUT",
+        "/api/collection-groups/{id}",
+    )
+    .await?;
+    let updated = state.collection_groups.update(id, input.into()).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "update",
+        "collection_groups",
+        &id.to_string(),
+        Some(json!({ "name": updated.name, "enabled": updated.enabled })),
+    )
+    .await;
+    Ok(Json(updated))
+}
+
+async fn collection_groups_delete(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "collection_groups",
+        "DELETE",
+        "/api/collection-groups/{id}",
+    )
+    .await?;
+    state.collection_groups.delete(id).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "delete",
+        "collection_groups",
+        &id.to_string(),
+        None,
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn tags_list(State(state): State<TagRegistryState>) -> Result<Json<Vec<Tag>>, ApiError> {
+    Ok(Json(state.tags.list(ListParams::default()).await?.rows))
+}
+
+async fn tags_get(
+    State(state): State<TagRegistryState>,
+    Path(id): Path<i64>,
+) -> Result<Json<Tag>, ApiError> {
+    Ok(Json(state.tags.get(id).await?))
+}
+
+async fn tags_create(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Json(input): Json<TagPayload>,
+) -> Result<Json<Tag>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "tags",
+        "POST",
+        "/api/tags",
+    )
+    .await?;
+    let created = state.tags.create(input.into()).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "create",
+        "tags",
+        &created.id.to_string(),
+        Some(json!({ "name": created.name, "enabled": created.enabled })),
+    )
+    .await;
+    Ok(Json(created))
+}
+
+async fn tags_update(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(input): Json<TagPayload>,
+) -> Result<Json<Tag>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "tags",
+        "PUT",
+        "/api/tags/{id}",
+    )
+    .await?;
+    let updated = state.tags.update(id, input.into()).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "update",
+        "tags",
+        &id.to_string(),
+        Some(json!({ "name": updated.name, "enabled": updated.enabled })),
+    )
+    .await;
+    Ok(Json(updated))
+}
+
+async fn tags_delete(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "tags",
+        "DELETE",
+        "/api/tags/{id}",
+    )
+    .await?;
+    state.tags.delete(id).await?;
+    record_write(
+        &state.audit,
+        &state.auth,
+        &headers,
+        "delete",
+        "tags",
+        &id.to_string(),
+        None,
+    )
+    .await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `/api/plc-connections/*` + `/api/collection-groups/*` + `/api/tags/*`
+/// (R0 §3.6): viewer-read / editor-write, exactly the same floor split
+/// (router-wide `require_auth` for reads, inline [`require_editor`] per
+/// write handler) as `users_router`/`hub_router` use `RoleGuard` for. The
+/// services are banto-tags' own - all input validation and delete guards
+/// ("まだ N 件の...から参照されています") live there, shared verbatim with
+/// the Tauri commands (`plc_connections_*`/`collection_groups_*`/`tags_*`
+/// in `src-tauri`) - invariant: both transport paths behave identically.
+fn tag_registry_router(
+    plc_connections: PlcConnectionService,
+    collection_groups: CollectionGroupService,
+    tags: TagService,
+    audit: AuditLogService,
+    auth: AuthState,
+) -> Router {
+    let state = TagRegistryState {
+        plc_connections,
+        collection_groups,
+        tags,
+        auth: auth.clone(),
+        audit,
+    };
+    Router::new()
+        .route(
+            "/api/plc-connections",
+            get(plc_connections_list).post(plc_connections_create),
+        )
+        .route(
+            "/api/plc-connections/{id}",
+            get(plc_connections_get)
+                .put(plc_connections_update)
+                .delete(plc_connections_delete),
+        )
+        .route(
+            "/api/collection-groups",
+            get(collection_groups_list).post(collection_groups_create),
+        )
+        .route(
+            "/api/collection-groups/{id}",
+            get(collection_groups_get)
+                .put(collection_groups_update)
+                .delete(collection_groups_delete),
+        )
+        .route("/api/tags", get(tags_list).post(tags_create))
+        .route(
+            "/api/tags/{id}",
+            get(tags_get).put(tags_update).delete(tags_delete),
+        )
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(auth, require_auth))
+}
+
 /// Compose the full `/api/*` router (spec §11.1): auth routes (login/
 /// logout/check/identity from `banto_server` - wrapped with an audit-log
 /// hook for `logout`, spec M14 - plus status/setup/change-password here
@@ -1306,10 +2016,11 @@ fn hub_router(hub: HubService, audit: AuditLogService, auth: AuthState) -> Route
 /// M14), the `admin`-only `backups` routes (spec M17), and the per-user
 /// `ui-settings` routes (spec M12), all behind the CSRF header check. Mount
 /// the result *before* `banto_server::static_files::static_router` so
-/// `/api/*` takes priority over the SPA fallback. Future resources (R1-B:
-/// PLC connections/collection groups/tags/display groups) get their own
-/// RBAC-split read/write routers merged in here the same way the banto
-/// template's `items_router` used to.
+/// `/api/*` takes priority over the SPA fallback. [`tag_registry_router`]
+/// (#383 段階2a / R1-B: PLC connections/collection groups/tags) is the first
+/// resource wired up this way; a future 表示グループ (display group)
+/// resource would get its own RBAC-split read/write router merged in here
+/// the same way.
 // Each parameter is a distinct, already-cloneable service handle threaded
 // through from `main()`/tests (no natural subset to bundle into a struct
 // without adding an indirection layer with a single call site); simpler to
@@ -1325,6 +2036,12 @@ pub fn api_router(
     // `crate::hub::UnavailableKeyStore`）。`HubService::new` が非同期
     // （`installation_id` の読み書き）なのでここでは構築できない。
     hub: HubService,
+    // #383 段階2a / R1-B: banto-tags の3サービス。呼び出し元
+    // （`bin/banto-serve.rs`/`src-tauri`）が `*Service::new(pool.clone())`
+    // で構築して渡す - このモジュールは `DbPool` を直接持たない。
+    plc_connections: PlcConnectionService,
+    collection_groups: CollectionGroupService,
+    tags: TagService,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
     allow_setup: bool,
@@ -1353,7 +2070,14 @@ pub fn api_router(
             auth.clone(),
         ))
         .merge(backups_router(backup, audit.clone(), auth.clone()))
-        .merge(hub_router(hub, audit, auth.clone()))
+        .merge(hub_router(hub, audit.clone(), auth.clone()))
+        .merge(tag_registry_router(
+            plc_connections,
+            collection_groups,
+            tags,
+            audit,
+            auth.clone(),
+        ))
         .merge(ui_settings_router(settings, auth))
         .layer(middleware::from_fn(require_banto_client_header))
 }
@@ -1417,6 +2141,7 @@ mod tests {
         let users = UsersService::new(pool.clone());
         let settings = SettingsService::new(pool.clone());
         let backup = unused_backup_service(pool.clone());
+        let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
         let audit = AuditLogService::new(pool);
 
         users
@@ -1461,7 +2186,19 @@ mod tests {
             .expect("viewer login");
         let hub = test_hub_service(settings.clone()).await;
         (
-            api_router(users, settings, audit, backup, hub, auth, tx, false),
+            api_router(
+                users,
+                settings,
+                audit,
+                backup,
+                hub,
+                plc_connections,
+                collection_groups,
+                tags,
+                auth,
+                tx,
+                false,
+            ),
             admin_token,
             editor_token,
             viewer_token,
@@ -1474,6 +2211,7 @@ mod tests {
         let users = UsersService::new(pool.clone());
         let settings = SettingsService::new(pool.clone());
         let backup = unused_backup_service(pool.clone());
+        let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
         let audit = AuditLogService::new(pool);
         let auth = demo_auth();
         let token = auth
@@ -1482,7 +2220,19 @@ mod tests {
             .expect("login should succeed");
         let hub = test_hub_service(settings.clone()).await;
         (
-            api_router(users, settings, audit, backup, hub, auth, tx, false),
+            api_router(
+                users,
+                settings,
+                audit,
+                backup,
+                hub,
+                plc_connections,
+                collection_groups,
+                tags,
+                auth,
+                tx,
+                false,
+            ),
             token,
         )
     }
@@ -1500,6 +2250,20 @@ mod tests {
         )
         .await
         .expect("HubService::new")
+    }
+
+    /// #383 段階2a / R1-B: the three banto-tags registry services, for
+    /// `api_router`'s new parameters - every router-building test helper
+    /// below needs these, so factored out rather than repeated at each call
+    /// site (mirrors `test_hub_service` just above).
+    fn tag_registry_services(
+        pool: sqlx::SqlitePool,
+    ) -> (PlcConnectionService, CollectionGroupService, TagService) {
+        (
+            PlcConnectionService::new(pool.clone()),
+            CollectionGroupService::new(pool.clone()),
+            TagService::new(pool),
+        )
     }
 
     async fn body_json(response: axum::response::Response) -> serde_json::Value {
@@ -1545,10 +2309,23 @@ mod tests {
         let users = UsersService::new(pool.clone());
         let settings = SettingsService::new(pool.clone());
         let backup = unused_backup_service(pool.clone());
+        let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
         let audit = AuditLogService::new(pool);
         let auth = demo_auth();
         let hub = test_hub_service(settings.clone()).await;
-        api_router(users, settings, audit, backup, hub, auth, tx, allow_setup)
+        api_router(
+            users,
+            settings,
+            audit,
+            backup,
+            hub,
+            plc_connections,
+            collection_groups,
+            tags,
+            auth,
+            tx,
+            allow_setup,
+        )
     }
 
     fn get(path: &str) -> HttpRequest<Body> {
@@ -1737,6 +2514,7 @@ mod tests {
         let users = UsersService::new(pool.clone());
         let settings = SettingsService::new(pool.clone());
         let backup = unused_backup_service(pool.clone());
+        let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
         let audit = AuditLogService::new(pool);
         let auth = AuthState::new(audited_credential_verifier(users.clone(), audit.clone()));
         let hub = test_hub_service(settings.clone()).await;
@@ -1747,6 +2525,9 @@ mod tests {
                 audit.clone(),
                 backup,
                 hub,
+                plc_connections,
+                collection_groups,
+                tags,
                 auth,
                 tx,
                 allow_setup,
@@ -2181,6 +2962,7 @@ mod tests {
         let users = UsersService::new(pool.clone());
         let settings = SettingsService::new(pool.clone());
         let backup = unused_backup_service(pool.clone());
+        let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
         let audit = AuditLogService::new(pool);
 
         users
@@ -2211,7 +2993,19 @@ mod tests {
             .expect("viewer login");
 
         let hub = test_hub_service(settings.clone()).await;
-        let router = api_router(users, settings, audit.clone(), backup, hub, auth, tx, false);
+        let router = api_router(
+            users,
+            settings,
+            audit.clone(),
+            backup,
+            hub,
+            plc_connections,
+            collection_groups,
+            tags,
+            auth,
+            tx,
+            false,
+        );
         (router, audit, admin_token, editor_token, viewer_token)
     }
 
@@ -2253,6 +3047,7 @@ mod tests {
         let users = UsersService::new(pool.clone());
         let settings = SettingsService::new(pool.clone());
         let backup = BackupService::new(db_path, pool.clone());
+        let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
         let audit = AuditLogService::new(pool);
 
         users
@@ -2283,7 +3078,19 @@ mod tests {
             .expect("viewer login");
 
         let hub = test_hub_service(settings.clone()).await;
-        let router = api_router(users, settings, audit, backup, hub, auth, tx, false);
+        let router = api_router(
+            users,
+            settings,
+            audit,
+            backup,
+            hub,
+            plc_connections,
+            collection_groups,
+            tags,
+            auth,
+            tx,
+            false,
+        );
         (dir, router, admin_token, editor_token, viewer_token)
     }
 
@@ -2851,5 +3658,305 @@ mod tests {
                 .any(|r| r["action"] == "restore_cancelled" && r["resource"] == "backups"),
             "expected a restore_cancelled entry, got {rows:?}"
         );
+    }
+
+    // --- #383 段階2a / R1-B: レジストリ CRUD ---------------------------------
+
+    fn plc_connection_payload(name: &str) -> serde_json::Value {
+        json!({
+            "name": name,
+            "protocol": "modbus-tcp",
+            "host": "192.168.11.200",
+            "port": 502,
+            "unitId": 1,
+            "enabled": true
+        })
+    }
+
+    /// R0 §3.6: 読み取りは viewer 以上、書き込みは editor 以上 - 3エンティティ
+    /// すべて（`plc_connections`/`collection_groups`/`tags` は FK で連なる
+    /// ので、この1テストで PLC接続→収集グループ→タグの順に作成する）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_registry_write_routes_require_editor_viewer_can_only_read() {
+        let (router, _admin, editor, viewer) = router_with_role_tokens().await;
+
+        // viewer: GET は通る、POST は 403 / forbidden kind。
+        let viewer_list = router
+            .clone()
+            .oneshot(get_auth("/api/plc-connections", &viewer))
+            .await
+            .unwrap();
+        assert_eq!(viewer_list.status(), StatusCode::OK);
+
+        let viewer_create = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/plc-connections",
+                &viewer,
+                plc_connection_payload("viewer-should-not-create"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(viewer_create.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body_json(viewer_create).await["kind"], "forbidden");
+
+        // editor: PLC接続を作成できる。
+        let create_conn = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/plc-connections",
+                &editor,
+                plc_connection_payload("plc1"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create_conn.status(), StatusCode::OK);
+        let conn = body_json(create_conn).await;
+        assert_eq!(conn["name"], "plc1");
+        assert_eq!(conn["wordOrder"], "high_low"); // #325: modbus-tcp の既定
+        let conn_id = conn["id"].as_i64().unwrap();
+
+        // editor: そのPLC接続配下に収集グループを作成できる。
+        let create_group = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/collection-groups",
+                &editor,
+                json!({
+                    "name": "group1",
+                    "plcConnectionId": conn_id,
+                    "periodMs": 1000,
+                    "enabled": true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create_group.status(), StatusCode::OK);
+        let group = body_json(create_group).await;
+        let group_id = group["id"].as_i64().unwrap();
+
+        // viewer: グループ作成は 403。
+        let viewer_group = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/collection-groups",
+                &viewer,
+                json!({
+                    "name": "viewer-group",
+                    "plcConnectionId": conn_id,
+                    "periodMs": 1000,
+                    "enabled": true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(viewer_group.status(), StatusCode::FORBIDDEN);
+
+        // editor: そのグループ配下にタグを作成できる。
+        let create_tag = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/tags",
+                &editor,
+                json!({
+                    "name": "tag1",
+                    "collectionGroupId": group_id,
+                    "address": "D3000",
+                    "dataType": "i16",
+                    "decimals": 0,
+                    "enabled": true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create_tag.status(), StatusCode::OK);
+        let tag = body_json(create_tag).await;
+        assert_eq!(tag["name"], "tag1");
+        let tag_id = tag["id"].as_i64().unwrap();
+
+        // viewer: タグ作成・削除は 403、一覧は見える。
+        let viewer_tag_list = router
+            .clone()
+            .oneshot(get_auth("/api/tags", &viewer))
+            .await
+            .unwrap();
+        assert_eq!(viewer_tag_list.status(), StatusCode::OK);
+        let viewer_tag_delete = router
+            .clone()
+            .oneshot(delete_auth(&format!("/api/tags/{tag_id}"), &viewer))
+            .await
+            .unwrap();
+        assert_eq!(viewer_tag_delete.status(), StatusCode::FORBIDDEN);
+
+        // editor: 作った順の逆（タグ→グループ→接続）で削除できる
+        // （banto-tags 自身の参照ガード - 子が残っていると親は消せない）。
+        let delete_tag = router
+            .clone()
+            .oneshot(delete_auth(&format!("/api/tags/{tag_id}"), &editor))
+            .await
+            .unwrap();
+        assert_eq!(delete_tag.status(), StatusCode::NO_CONTENT);
+        let delete_group = router
+            .clone()
+            .oneshot(delete_auth(
+                &format!("/api/collection-groups/{group_id}"),
+                &editor,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(delete_group.status(), StatusCode::NO_CONTENT);
+        let delete_conn = router
+            .oneshot(delete_auth(
+                &format!("/api/plc-connections/{conn_id}"),
+                &editor,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(delete_conn.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// [`reject_disallowed_connection_protocol`]: chronogazer は
+    /// `"virtual"`/`"postgres"` 接続の作成を拒否する（banto-hub 固有の
+    /// プロトコル）。人間可読な `field_errors` として返ることを固定する。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plc_connection_create_rejects_virtual_and_postgres_protocol_readably() {
+        let (router, _admin, editor, _viewer) = router_with_role_tokens().await;
+
+        for protocol in ["virtual", "postgres"] {
+            let mut payload = plc_connection_payload("not-allowed");
+            payload["protocol"] = json!(protocol);
+            let response = router
+                .clone()
+                .oneshot(post_json_auth("/api/plc-connections", &editor, payload))
+                .await
+                .unwrap();
+            assert!(response.status().is_client_error(), "protocol={protocol}");
+            let body = body_json(response).await;
+            assert_eq!(body["kind"], "validation", "protocol={protocol}");
+            assert_eq!(body["field_errors"][0]["field"], "protocol");
+            let message = body["field_errors"][0]["message"].as_str().unwrap();
+            assert!(!message.is_empty(), "protocol={protocol}: {message}");
+        }
+    }
+
+    /// banto-tags 自身の検証（`period_ms` は `ALLOWED_PERIOD_MS` のいずれか）
+    /// が人間可読な `field_errors` としてそのまま返ることを固定する - 画面の
+    /// 選択肢は固定値しか出さないが、REST を直接叩く経路（他クライアント・
+    /// 手動テスト）はそれをバイパスできるので、バックエンド側の検証がこの
+    /// 経路でも効くことを確認する。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collection_group_create_rejects_a_period_outside_the_allowed_list_readably() {
+        let (router, _admin, editor, _viewer) = router_with_role_tokens().await;
+
+        let conn = body_json(
+            router
+                .clone()
+                .oneshot(post_json_auth(
+                    "/api/plc-connections",
+                    &editor,
+                    plc_connection_payload("plc-for-period-test"),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let conn_id = conn["id"].as_i64().unwrap();
+
+        let response = router
+            .oneshot(post_json_auth(
+                "/api/collection-groups",
+                &editor,
+                json!({
+                    "name": "bad-period",
+                    "plcConnectionId": conn_id,
+                    "periodMs": 999,
+                    "enabled": true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(response.status().is_client_error());
+        let body = body_json(response).await;
+        assert_eq!(body["kind"], "validation");
+        assert_eq!(body["field_errors"][0]["field"], "periodMs");
+        assert!(!body["field_errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .is_empty());
+    }
+
+    /// R0 §3.6 の監査記録: PLC接続の作成・更新・削除がそれぞれ
+    /// `create`/`update`/`delete` × `resource: "plc_connections"` として
+    /// 残る（`origin: "rest"`、actor は実行した editor）。監査ログの閲覧
+    /// 自体は admin 限定（`audit_log_router`）なので、書き込みは editor、
+    /// 確認は admin のトークンで行う。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plc_connection_mutations_are_audited() {
+        let (router, _audit, admin, editor, _viewer) = router_with_role_tokens_and_audit().await;
+
+        let created = body_json(
+            router
+                .clone()
+                .oneshot(post_json_auth(
+                    "/api/plc-connections",
+                    &editor,
+                    plc_connection_payload("audited-plc"),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let conn_id = created["id"].as_i64().unwrap();
+
+        let mut updated_payload = plc_connection_payload("audited-plc-renamed");
+        updated_payload["port"] = json!(503);
+        router
+            .clone()
+            .oneshot(put_json(
+                &format!("/api/plc-connections/{conn_id}"),
+                &editor,
+                updated_payload,
+            ))
+            .await
+            .unwrap();
+
+        router
+            .clone()
+            .oneshot(delete_auth(
+                &format!("/api/plc-connections/{conn_id}"),
+                &editor,
+            ))
+            .await
+            .unwrap();
+
+        let list_response = router
+            .oneshot(post_json_auth(
+                "/api/audit-log/list",
+                &admin,
+                json!(ListParams::default()),
+            ))
+            .await
+            .unwrap();
+        let rows = body_json(list_response).await["rows"].clone();
+        let rows = rows.as_array().unwrap();
+        let conn_id_str = conn_id.to_string();
+        for action in ["create", "update", "delete"] {
+            let entry = rows
+                .iter()
+                .find(|r| {
+                    r["action"] == action
+                        && r["resource"] == "plc_connections"
+                        && r["entityId"] == conn_id_str
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "expected a {action}/plc_connections entry for id {conn_id}, got {rows:?}"
+                    )
+                });
+            assert_eq!(entry["actorUsername"], "editor");
+            assert_eq!(entry["actorRole"], "editor");
+            assert_eq!(entry["origin"], "rest");
+            assert_eq!(entry["result"], "ok");
+        }
     }
 }

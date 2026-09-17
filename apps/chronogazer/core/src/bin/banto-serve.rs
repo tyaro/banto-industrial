@@ -39,6 +39,10 @@ use chronogazer_core::hub::{HubService, UnavailableKeyStore};
 use chronogazer_core::rest::{api_router, audited_credential_verifier};
 use chronogazer_core::settings::SettingsService;
 use chronogazer_core::users::UsersService;
+// #383 段階2a / R1-B: レジストリ3サービス。`chronogazer_core::lib.rs`の
+// re-export 経由（`db::DbPool`と同じ理由 - このバイナリ自身は banto-tags を
+// 直接 depend していない）。
+use chronogazer_core::{CollectionGroupService, PlcConnectionService, TagService};
 use std::path::PathBuf;
 
 const DEFAULT_PORT: u16 = 8721;
@@ -80,6 +84,12 @@ async fn main() {
     let users = UsersService::new(pool.clone());
     let settings = SettingsService::new(pool.clone());
     let backup = BackupService::new(db_path_buf, pool.clone());
+    // #383 段階2a / R1-B: レジストリ3サービス。`*Service::new(pool.clone())`
+    // の3行（指示書どおり）- テーブルは `db::init_db` が呼ぶ
+    // `banto_tags::migrate` で既に作成済み。
+    let plc_connections = PlcConnectionService::new(pool.clone());
+    let collection_groups = CollectionGroupService::new(pool.clone());
+    let tags = TagService::new(pool.clone());
     let audit = AuditLogService::new(pool);
     // Credential verifier from `chronogazer_core::rest` (spec §8.2),
     // backed by `UsersService`'s argon2id-hashed accounts - replaces the old
@@ -152,6 +162,9 @@ async fn main() {
         audit,
         backup,
         hub,
+        plc_connections,
+        collection_groups,
+        tags,
         auth,
         events,
         allow_setup,
