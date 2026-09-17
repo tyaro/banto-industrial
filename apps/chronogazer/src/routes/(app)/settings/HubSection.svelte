@@ -5,13 +5,23 @@
 	 *
 	 * chronogazer はこれまで banto-hub に接続するコードを持っていなかった
 	 * ので、この section は既存画面の移設ではなく新規。やっていることは
-	 * 「接続先の設定」「6 状態の表示」「タグ一覧と選択の保存」までで、
-	 * **選んだタグをトレンド等のデータ源に繋ぐのは別 issue**（購読
-	 * = `banto-tagclient` の `start()` はこの PR では一切呼ばない）。
+	 * 「接続先の設定」「6 状態の表示」「タグ一覧と選択の保存」と、
+	 * #383 段階1 で足した「購読の状態と最新値」まで。トレンド表示・保存
+	 * （tstore）は段階3 なのでここには無い。
+	 *
+	 * 購読ブロックの規律（#383 段階1）:
+	 * - 購読は接続設定の 6 状態とは**別軸**。購読が張れなくても状態表示は
+	 *   汚れず、張れない理由は `reason` に出る。
+	 * - **未解決タグ**（Hub から消えた／権限で見えない）は一覧で出す。
+	 *   空表示や「タグ0件」に潰さない。
+	 * - ポーリングは**この設定ページを開いている間だけ**（`hub_subscription`
+	 *   / `GET /api/hub/subscription` はメモリを読むだけでネットワークを
+	 *   叩かない）。タブが隠れている間は止める。
 	 *
 	 * 平文の API キーは画面に出さない: 手動連携の入力欄は
 	 * `type="password"`、応答型（`HubView`）にキー欄は無い。
 	 */
+	import { onDestroy, onMount } from 'svelte';
 	import { isAdmin } from '$lib/permissions';
 	import { sessionStore } from '$lib/session.svelte';
 	import {
@@ -19,13 +29,17 @@
 		connectHub,
 		disconnectHub,
 		getHubStatus,
+		getHubSubscription,
 		hubStatusDetail,
 		hubStatusLabel,
+		hubSubscriptionDetail,
+		hubSubscriptionLabel,
 		isHubAvailable,
 		needsManualKey,
 		refreshHubCatalog,
 		setHubSelectedTags,
 		type HubStatus,
+		type HubSubscription,
 		type HubTag,
 		type HubView
 	} from '$lib/banto/hubAdmin';
@@ -33,10 +47,14 @@
 
 	const available = isHubAvailable();
 
+	/** 購読状態のポーリング間隔（ms）。ネットワークを伴わない読み取り。 */
+	const SUBSCRIPTION_POLL_MS = 2000;
+
 	let status = $state<HubStatus>({ state: 'notConfigured' });
 	let tags = $state<HubTag[] | null>(null);
 	let selected = $state<string[]>([]);
 	let keyName = $state<string | null>(null);
+	let subscription = $state<HubSubscription | null>(null);
 	/**
 	 * 保存済みの接続先があるか（= 設定 KV に `HubRecord` があるか）。入力欄の
 	 * 下書き（`endpointDraft`）とは別に持つ: 到達不能な URL で「接続」した
@@ -59,6 +77,7 @@
 		// タグ 0 件）は別物。前者では前回の一覧を残さず消す - 状態表示の
 		// 「接続済み・利用可能なタグなし」と食い違わせないため。
 		tags = view.tags;
+		subscription = view.subscription;
 		if (view.endpoint) endpointDraft = view.endpoint;
 	}
 
@@ -125,6 +144,58 @@
 			? [...selected, externalName]
 			: selected.filter((name) => name !== externalName);
 	}
+
+	// --- #383 段階1: 購読状態のポーリング -----------------------------------
+
+	let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+	/**
+	 * 購読状態だけを読み直す。**このページを開いている間だけ**回し、失敗は
+	 * 黙って捨てる（ポーリングの一時的な失敗で操作用のエラー表示を上書き
+	 * しない。恒久的な失敗は次の明示操作で出る）。
+	 */
+	async function pollSubscription(): Promise<void> {
+		try {
+			subscription = await getHubSubscription();
+		} catch {
+			// 握りつぶす（上のコメント参照）。
+		}
+	}
+
+	function stopPolling(): void {
+		if (pollTimer !== null) {
+			clearInterval(pollTimer);
+			pollTimer = null;
+		}
+	}
+
+	function startPolling(): void {
+		if (!available || pollTimer !== null) return;
+		pollTimer = setInterval(() => void pollSubscription(), SUBSCRIPTION_POLL_MS);
+	}
+
+	/** タブが隠れている間は止める（見ていない画面のために回し続けない）。 */
+	function onVisibilityChange(): void {
+		if (document.visibilityState === 'visible') {
+			void pollSubscription();
+			startPolling();
+		} else {
+			stopPolling();
+		}
+	}
+
+	onMount(() => {
+		if (!available) return;
+		document.addEventListener('visibilitychange', onVisibilityChange);
+		if (document.visibilityState === 'visible') startPolling();
+	});
+
+	onDestroy(() => {
+		stopPolling();
+		if (typeof document !== 'undefined') {
+			document.removeEventListener('visibilitychange', onVisibilityChange);
+		}
+	});
 </script>
 
 {#if isAdmin(sessionStore.role)}
@@ -211,6 +282,54 @@
 				{/if}
 			{/if}
 
+			{#if subscription}
+				<h3 class="hub-subheading">購読</h3>
+				<p class="status">
+					購読: <strong>{hubSubscriptionLabel(subscription.state)}</strong>
+				</p>
+				<p class="note">{hubSubscriptionDetail(subscription)}</p>
+
+				{#if subscription.lastError}
+					<p class="note">直近のエラー: <code>{subscription.lastError}</code></p>
+				{/if}
+
+				{#if subscription.unresolved.length > 0}
+					<p class="note">
+						次のタグは見つかりませんでした（Hubから消えたか、権限で見えないタグです）。残りのタグだけを購読しています。
+					</p>
+					<ul class="hub-unresolved">
+						{#each subscription.unresolved as name (name)}
+							<li><span class="hub-tag-name">{name}</span></li>
+						{/each}
+					</ul>
+				{/if}
+
+				{#if subscription.values.length > 0}
+					<table class="hub-values">
+						<thead>
+							<tr>
+								<th scope="col">タグ</th>
+								<th scope="col">値</th>
+								<th scope="col">品質</th>
+								<th scope="col">時刻</th>
+							</tr>
+						</thead>
+						<tbody>
+							{#each subscription.values as value (value.tag)}
+								<tr>
+									<td class="hub-tag-name">{value.tag}</td>
+									<td>{value.v ?? '—'}</td>
+									<td>{value.q}</td>
+									<td>{value.t}</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+				{:else}
+					<p class="note">値を受信していません。</p>
+				{/if}
+			{/if}
+
 			{#if configured}
 				<div class="hub-actions">
 					<button type="button" onclick={disconnect} disabled={busy}>切断</button>
@@ -270,5 +389,30 @@
 		margin-left: auto;
 		color: var(--banto-text-muted);
 		font-size: 0.75rem;
+	}
+
+	.hub-subheading {
+		margin: 1.25rem 0 0;
+		font-size: 0.95rem;
+	}
+
+	.hub-unresolved {
+		margin: 0.25rem 0 0;
+		padding-left: 1.25rem;
+	}
+
+	.hub-values {
+		margin-top: 0.5rem;
+		border-collapse: collapse;
+		width: 100%;
+		max-width: 40rem;
+	}
+
+	.hub-values th,
+	.hub-values td {
+		text-align: left;
+		padding: 0.25rem 0.5rem;
+		border-bottom: 1px solid var(--banto-border);
+		font-size: 0.8rem;
 	}
 </style>

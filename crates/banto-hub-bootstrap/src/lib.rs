@@ -31,8 +31,11 @@
 //!   itself are the two admin endpoints above and a status-only probe used
 //!   to tell `401` from `403` (see [`Bootstrapper`]'s `verify`).
 //! * **Subscribing is not this crate's job.** `TagClientHandle`/`start` is
-//!   never called here; wiring selected tags to an app's data sources is a
-//!   separate concern (and a separate issue).
+//!   never called here. [`Bootstrapper::rest_client`] hands out an
+//!   authenticated client so the app can own one subscription generation,
+//!   but the generation itself - when to start it, when it is still the same
+//!   one, when to stop it - belongs to the app (#383 段階1:
+//!   `chronogazer_core::hub`).
 //!
 //! # 固定していること
 //!

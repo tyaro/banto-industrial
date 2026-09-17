@@ -225,6 +225,39 @@ impl Bootstrapper {
         self.state.load()
     }
 
+    /// An authenticated [`RestClient`] built from the saved endpoint and the
+    /// key kept in the [`KeyStore`].
+    ///
+    /// `Ok(None)` means "no client can be built": either nothing is
+    /// configured yet, or the keyring holds no entry for the saved account
+    /// (a cleared store, a new Windows user, or a runtime with no keyring at
+    /// all such as `banto-serve`'s `UnavailableKeyStore`). It is deliberately
+    /// **not** an error and carries no verdict about the Hub: telling
+    /// `AuthFailed` apart from `Forbidden` is [`status`](Self::status)'s job,
+    /// and duplicating that classification here would give callers a second,
+    /// divergent source of truth for the six states.
+    ///
+    /// The returned client is meant to be handed to
+    /// [`RestClient::start`](banto_tagclient::RestClient::start) so the
+    /// application can own one subscription generation. The `Bootstrapper`
+    /// does **not** own that generation - starting, fingerprinting and
+    /// shutting it down is the application's work (see
+    /// `chronogazer_core::hub`'s `reconcile`).
+    ///
+    /// The plaintext key never leaves this crate: it lives in a
+    /// `Zeroizing<String>` just long enough to move into the opaque
+    /// [`SecretApiKey`], and there is deliberately no accessor that hands a
+    /// `String` back out.
+    pub fn rest_client(&self) -> Result<Option<RestClient>> {
+        let Some(record) = self.state.load()? else {
+            return Ok(None);
+        };
+        let Some(stored) = self.stored_key(&record.keyring_account)? else {
+            return Ok(None);
+        };
+        Ok(Some(rest_client_for(&record.endpoint, &stored)?))
+    }
+
     /// Persist the operator's tag selection. An empty selection is valid.
     pub fn set_selected_tags(&self, tags: Vec<String>) -> Result<()> {
         let mut record = self
@@ -350,12 +383,7 @@ impl Bootstrapper {
         endpoint: &str,
         key: &Zeroizing<String>,
     ) -> Result<HubConnection> {
-        let tag_endpoint =
-            Endpoint::new(endpoint).map_err(|_| Error::new(ErrorKind::InvalidEndpoint))?;
-        let secret =
-            SecretApiKey::new(key.to_string()).map_err(|_| Error::new(ErrorKind::InvalidKey))?;
-        let client = RestClient::new(tag_endpoint, secret)
-            .map_err(|_| Error::new(ErrorKind::InvalidEndpoint))?;
+        let client = rest_client_for(endpoint, key)?;
 
         match client.fetch_catalog().await {
             Ok(catalog) => Ok(HubConnection::connected(catalog)),
@@ -410,6 +438,17 @@ enum IssueResult {
     Issued(crate::admin::IssuedKey),
     NeedsPairing,
     Failed(UnreachableCause),
+}
+
+/// The one place a [`RestClient`] is assembled: shared by
+/// [`Bootstrapper::verify`] (which proves a key by reading the catalog) and
+/// [`Bootstrapper::rest_client`] (which hands the same client to the
+/// application for a subscription), so the two can never drift apart in how
+/// the endpoint is normalized or the key is wrapped.
+fn rest_client_for(endpoint: &str, key: &Zeroizing<String>) -> Result<RestClient> {
+    let tag_endpoint = Endpoint::new(endpoint).map_err(|_| Error::new(ErrorKind::InvalidEndpoint))?;
+    let secret = SecretApiKey::new(key.to_string()).map_err(|_| Error::new(ErrorKind::InvalidKey))?;
+    RestClient::new(tag_endpoint, secret).map_err(|_| Error::new(ErrorKind::InvalidEndpoint))
 }
 
 fn unix_seconds() -> u64 {
@@ -950,6 +989,40 @@ mod tests {
         assert_eq!(
             state.load().unwrap().unwrap().selected_tags,
             vec!["line1.fast.tag0".to_owned()]
+        );
+    }
+
+    /// `rest_client()` is the application's way into a subscription, so its
+    /// three answers have to stay distinct: nothing configured and no
+    /// keyring entry are both "cannot subscribe" (`None`, not an error, and
+    /// not a verdict about the Hub), while a record plus a stored key yields
+    /// a client. No network is involved - building the client performs no
+    /// I/O.
+    #[tokio::test]
+    async fn rest_client_is_none_until_both_a_record_and_a_stored_key_exist() {
+        let hub = MockHub::start(routes(vec![]));
+
+        // 1. Nothing configured at all.
+        let keys = Arc::new(MemoryKeyStore::new());
+        let state = Arc::new(MemoryState::new());
+        let bootstrapper = harness(Arc::clone(&keys), Arc::clone(&state));
+        assert!(bootstrapper.rest_client().unwrap().is_none());
+
+        // 2. A record survives but the keyring entry does not.
+        let state = Arc::new(MemoryState::seeded(seeded_record(&hub, Some(7))));
+        let bootstrapper = harness(Arc::clone(&keys), Arc::clone(&state));
+        assert!(
+            bootstrapper.rest_client().unwrap().is_none(),
+            "a missing keyring entry is 'cannot subscribe', not an error"
+        );
+
+        // 3. Both present.
+        keys.set(&account_for(&hub), &key()).unwrap();
+        let bootstrapper = harness(keys, state);
+        assert!(bootstrapper.rest_client().unwrap().is_some());
+        assert!(
+            hub.seen().is_empty(),
+            "building a client must not talk to the Hub"
         );
     }
 

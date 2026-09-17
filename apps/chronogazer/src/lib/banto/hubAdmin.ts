@@ -60,6 +60,40 @@ export interface HubView {
 	keyName: string | null;
 	selectedTags: string[];
 	tags: HubTag[] | null;
+	subscription: HubSubscription;
+}
+
+/** `banto_tagclient::TagClientConnectionState` の綴りそのまま。 */
+export type HubSubscriptionState =
+	'stopped' | 'connecting' | 'handshaking' | 'live' | 'rebinding' | 'reconnecting' | 'unauthorized';
+
+/** Mirrors `chronogazer_core::hub::HubValueView`. */
+export interface HubValue {
+	tag: string;
+	/** `null` は「値がまだ無い」であって 0 ではない。 */
+	v: number | null;
+	q: string;
+	t: number;
+	valueSource: string;
+}
+
+/**
+ * Mirrors `chronogazer_core::hub::HubSubscriptionView`（#383 段階1）。
+ *
+ * 接続設定の 6 状態（[`HubStatus`]）とは**別軸**: 購読が張れなくても
+ * `status` は汚れず、張れない理由は `reason` に出る。`values` が入るのは
+ * `state === 'live'` のときだけ（Live でないのに古い値を出さないという
+ * `banto-tagclient` の規約にそのまま乗る）。
+ */
+export interface HubSubscription {
+	state: HubSubscriptionState;
+	reason: string | null;
+	subscribedCount: number;
+	/** 選んだのに Hub のタグ一覧に無かった external name。空表示に潰さない。 */
+	unresolved: string[];
+	lastError: string | null;
+	lastValueAt: number | null;
+	values: HubValue[];
 }
 
 export const DEMO_MODE_MESSAGE = 'デモモードでは利用できません';
@@ -164,6 +198,19 @@ export async function getHubStatus(): Promise<HubView> {
 	if (!isHubAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<HubView>('hub_status');
 	return httpJson<HubView>('/api/hub', { method: 'GET' });
+}
+
+/**
+ * `admin`-only: 購読の状態だけ（#383 段階1）。
+ *
+ * **ネットワーク（Hub への往復）を伴わない**ので、設定画面を開いている間
+ * だけポーリングしてよい。`getHubStatus()` は catalog を毎回取り直すので
+ * ポーリングには使わない。
+ */
+export async function getHubSubscription(): Promise<HubSubscription> {
+	if (!isHubAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri') return invokeCommand<HubSubscription>('hub_subscription');
+	return httpJson<HubSubscription>('/api/hub/subscription', { method: 'GET' });
 }
 
 /** `admin`-only: 接続（試運転中の Hub にのみ `read` キーを自己発行）。 */
@@ -277,4 +324,44 @@ export function hubUnreachableCauseLabel(cause: HubUnreachableCause): string {
 /** 手動キーの入力欄を出すべき状態か（純関数）。 */
 export function needsManualKey(status: HubStatus): boolean {
 	return status.state === 'needsPairing' || status.state === 'forbidden';
+}
+
+/**
+ * 購読状態の見出し（純関数 - `hubAdmin.test.ts` が固定する）。
+ *
+ * `connecting` と `handshaking` は**意図的に同じ文言**にしている（運用上は
+ * どちらも「つなぎに行っている最中」で、区別しても次の一手が変わらない）。
+ * それ以外は互いに潰さない - 特に `live` / `reconnecting` / `unauthorized`
+ * は「値が来ている／来ていない／権限の問題」という別々の事実。
+ */
+export function hubSubscriptionLabel(state: HubSubscriptionState): string {
+	switch (state) {
+		case 'live':
+			return '受信中';
+		case 'connecting':
+		case 'handshaking':
+			return '接続中';
+		case 'rebinding':
+			return '再バインド中';
+		case 'reconnecting':
+			return '再接続中';
+		case 'unauthorized':
+			return '認証エラー';
+		case 'stopped':
+			return '停止';
+	}
+}
+
+/**
+ * 購読状態の補足説明（純関数）。`stopped` のときは Rust 側が付けた
+ * `reason` をそのまま併記する（「なぜ止まっているか」を空欄にしない）。
+ */
+export function hubSubscriptionDetail(subscription: HubSubscription): string {
+	if (subscription.state === 'stopped') {
+		return subscription.reason ?? '購読していません。';
+	}
+	if (subscription.state === 'unauthorized') {
+		return 'Hubが購読を拒否しました。APIキーの権限を確認してください（接続設定の状態は別に表示しています）。';
+	}
+	return `${subscription.subscribedCount}件のタグを購読しています。`;
 }

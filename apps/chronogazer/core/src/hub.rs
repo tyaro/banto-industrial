@@ -15,8 +15,29 @@
 //!   には [`HubRecord`] の JSON（接続先・キー ID・キー名・キーリングの
 //!   アカウント名・選択タグ）しか書かない - この型にキー欄が無いことが、
 //!   「設定 DB に平文が無い」ことの根拠になる。
-//! * 購読（`TagClientHandle`/`start`）はここでは行わない。選んだタグを
-//!   トレンド等のデータ源へ繋ぐのは別 issue の仕事。
+//! * **購読（`TagClientHandle`/`start`）はこちらの仕事**（#383 段階1）。
+//!   bootstrapper は [`Bootstrapper::rest_client`] で認証済みクライアントを
+//!   渡すだけで、世代は所有しない。
+//!
+//! # 購読の世代（#383 段階1）
+//!
+//! **1 接続 = 1 世代**。世代の同一性は「接続先 + 購読するタグ集合」
+//! （[`Generation::fingerprint`]）で決める。これが一致する限り
+//! [`HubService::reconcile`] は**何もしない** - 設定画面が
+//! [`HubService::status`] をポーリングするたびに WS を張り直すのを防ぐ、
+//! この節で一番大事な不変条件。
+//!
+//! そのほかの規律:
+//!
+//! * 選んだタグのうち catalog に無いもの（Hub から消えた／権限で見えない）
+//!   は `unresolved` に出し、**残りだけで購読する**。1 個消えただけで全部
+//!   止めない・空表示に潰さない。
+//! * **購読の失敗で [`HubStatus`] の 6 状態を変えない**。接続設定の状態と
+//!   購読の状態は別物で、購読が張れない理由は
+//!   [`HubSubscriptionView::reason`] に出す。
+//! * `banto-serve`（[`UnavailableKeyStore`]）は keyring を持てないので
+//!   [`Bootstrapper::rest_client`] が `None` を返し、購読を張れない。
+//!   これはエラーではなく、理由付きの「停止」として表示する。
 //!
 //! # 同期 trait と非同期設定ストアの橋渡し
 //!
@@ -28,15 +49,21 @@
 //! `block_on`/`block_in_place` は使わない（tauri のコマンドは既に非同期
 //! ランタイム上で走っているため、同じランタイムで待つと panic する）。
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use banto_core::BantoError;
 use banto_hub_bootstrap::{
     error::{Error as BootstrapError, ErrorKind as BootstrapErrorKind},
     BootstrapState, Bootstrapper, HubConnection, HubRecord, HubStatus, KeyStore,
 };
-use banto_tagclient::CatalogTag;
+use banto_tagclient::{
+    BindingRequest, CatalogSnapshot, CatalogTag, Endpoint, TagClientConnectionState, TagClientHandle,
+    TagClientState, ValuesSnapshot,
+};
 use serde::Serialize;
+use tokio::sync::{watch, Mutex as AsyncMutex};
 
 use crate::settings::SettingsService;
 
@@ -87,10 +114,18 @@ pub struct HubView {
     pub key_name: Option<String>,
     pub selected_tags: Vec<String>,
     pub tags: Option<Vec<HubTagView>>,
+    /// 購読の状態（#383 段階1）。`status` の 6 状態とは**別軸**で、購読が
+    /// 張れなくても 6 状態は汚れない。
+    pub subscription: HubSubscriptionView,
 }
 
 impl HubView {
-    fn new(status: HubStatus, record: Option<&HubRecord>, tags: Option<Vec<HubTagView>>) -> Self {
+    fn new(
+        status: HubStatus,
+        record: Option<&HubRecord>,
+        tags: Option<Vec<HubTagView>>,
+        subscription: HubSubscriptionView,
+    ) -> Self {
         Self {
             status,
             endpoint: record.map(|record| record.endpoint.clone()),
@@ -99,6 +134,63 @@ impl HubView {
                 .map(|record| record.selected_tags.clone())
                 .unwrap_or_default(),
             tags,
+            subscription,
+        }
+    }
+}
+
+/// 画面に出す 1 値分（`TagClientState::current()` の `ValuesSnapshot` の
+/// 1 行）。`v` が `null` なのは「値がまだ無い」であって 0 ではない。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HubValueView {
+    pub tag: String,
+    pub v: Option<f64>,
+    /// `good|stale|bad`、または Hub が送ってきた未知のラベルそのまま
+    /// （`banto-tagclient` が `Unknown(raw)` を保つのと同じで、知らない品質を
+    /// `good` に丸めない）。
+    pub q: String,
+    pub t: i64,
+    /// `real|simulation|computed|...`、または未知のラベルそのまま。
+    pub value_source: String,
+}
+
+/// 購読の状態（#383 段階1）。**ネットワークを叩かずに**組み立てられる
+/// （`watch::Receiver` を読むだけ）ので、設定画面のポーリングはこれを見る。
+///
+/// `values` が入るのは `state == "live"` のときだけ:
+/// [`TagClientState::current`] は Live 以外で `None` を返す仕様なので、
+/// その性質にそのまま乗る（**Live でないのに古い値を出さない**）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HubSubscriptionView {
+    /// `stopped|connecting|handshaking|live|rebinding|reconnecting|unauthorized`
+    /// （[`TagClientConnectionState`] の `Display` と同じ綴り）。
+    pub state: &'static str,
+    /// 停止している理由（タグ未選択 / キーリング不可 / 未接続など）。
+    /// 世代を持っているときは `None`。
+    pub reason: Option<String>,
+    pub subscribed_count: usize,
+    /// 選んだのに catalog に無かった external name。**空表示に潰さない**。
+    pub unresolved: Vec<String>,
+    /// [`TagClientState::last_error`] の分類名（`ErrorKind::as_str`）。
+    pub last_error: Option<String>,
+    /// 最後に受けた [`ValuesSnapshot::t`]。
+    pub last_value_at: Option<i64>,
+    pub values: Vec<HubValueView>,
+}
+
+impl HubSubscriptionView {
+    /// 世代を持っていないときの形。`unresolved` は理由と独立に出す。
+    fn stopped(reason: Option<String>, unresolved: Vec<String>) -> Self {
+        Self {
+            state: "stopped",
+            reason,
+            subscribed_count: 0,
+            unresolved,
+            last_error: None,
+            last_value_at: None,
+            values: Vec::new(),
         }
     }
 }
@@ -231,6 +323,188 @@ fn to_banto_error(error: BootstrapError) -> BantoError {
     }
 }
 
+// --- #383 段階1: 購読の世代 --------------------------------------------------
+
+/// 購読を張らない理由（[`HubSubscriptionView::reason`]）。接続の 6 状態と
+/// 混ざらないよう、購読側だけの語彙にしている。
+const REASON_NOT_STARTED: &str = "購読の状態をまだ確認していません。";
+const REASON_NOT_CONFIGURED: &str = "Hubへの接続が設定されていません。";
+const REASON_NOT_CONNECTED: &str = "Hubに接続できていないため購読していません。";
+const REASON_NO_TAGS: &str = "購読するタグが選ばれていません。";
+const REASON_ALL_UNRESOLVED: &str =
+    "選んだタグがHubのタグ一覧に見つからないため、購読できるタグがありません。";
+const REASON_NO_KEY: &str =
+    "保存済みのAPIキーを取り出せないため購読できません（デスクトップアプリから接続し直してください）。";
+
+/// [`plan_bindings`] の結果: 実際に購読する要求と、catalog に無かった
+/// external name。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BindingPlan {
+    requests: Vec<BindingRequest>,
+    unresolved: Vec<String>,
+}
+
+/// 選択タグ（external name）を catalog と突き合わせ、購読要求と未解決に
+/// 分ける**純関数**（ネットワークも状態も触らないので、分岐をテストで固定
+/// できる）。
+///
+/// * `binding_key` は external name をそのまま使う - 画面の一覧と 1:1 に
+///   対応させ、返ってきた値をそのまま行に載せられるようにするため。
+/// * catalog に無い external name は `unresolved` に入れ、**残りだけで
+///   購読する**。1 個消えただけで全部止めない。
+/// * 重複する external name はここで 1 つに畳む
+///   （`resolve_bindings`/`start` は重複 `binding_key` / 重複 `stable_id` を
+///   エラーにするため、通す前に潰しておく）。
+/// * `requests` が空なら購読しない（`start()` は空 requests を
+///   `InvalidTagSelection` で拒否する）。
+fn plan_bindings(selected: &[String], catalog: &CatalogSnapshot) -> BindingPlan {
+    let by_name: HashMap<&str, &CatalogTag> = catalog
+        .tags
+        .iter()
+        .map(|tag| (tag.external_name.as_str(), tag))
+        .collect();
+    let mut seen: HashSet<&str> = HashSet::with_capacity(selected.len());
+    let mut requests = Vec::with_capacity(selected.len());
+    let mut unresolved = Vec::new();
+    for name in selected {
+        if !seen.insert(name.as_str()) {
+            continue;
+        }
+        match by_name.get(name.as_str()) {
+            Some(tag) => requests.push(BindingRequest {
+                binding_key: name.clone(),
+                stable_id: tag.ids,
+            }),
+            None => unresolved.push(name.clone()),
+        }
+    }
+    BindingPlan {
+        requests,
+        unresolved,
+    }
+}
+
+/// 世代の同一性。**接続先（正規化済み）+ 購読するタグ集合（ソート済み）**
+/// で、これが一致するなら張り直さない。
+type Fingerprint = (String, Vec<String>);
+
+/// 接続先を比較可能な形に正規化する。
+///
+/// `banto_tagclient::Endpoint` が `banto-hub-bootstrap` と同じ正規化
+/// （末尾スラッシュの吸収など）を行うので、そこから導いた不変の URL を鍵に
+/// する。`Endpoint` は正規化後の文字列そのものを公開していないため、
+/// 決定的に導ける `tags_url()` を使う（値そのものに意味は無く、同じ接続先が
+/// 同じ文字列になることだけが要件）。解釈できない綴りのときは入力をそのまま
+/// 使う - 「同じなら同じ、違うなら違う」が保てればよい。
+fn fingerprint_endpoint(endpoint: &str) -> String {
+    Endpoint::new(endpoint)
+        .map(|parsed| parsed.tags_url().to_string())
+        .unwrap_or_else(|_| endpoint.trim().to_owned())
+}
+
+/// 1 つの購読世代。`TagClientHandle` を所有し、その `watch` を読むだけで
+/// 状態を出せる。
+struct Generation {
+    handle: TagClientHandle,
+    states: watch::Receiver<TagClientState>,
+    fingerprint: Fingerprint,
+    started_at: i64,
+}
+
+/// [`HubService`] が持つ購読スロット。
+///
+/// 指示書の素案は `Option<Generation>` だったが、**未解決タグと停止理由は
+/// 世代が無いときにこそ画面に出す**必要がある（選んだタグが全部 catalog から
+/// 消えると `requests` が空になり世代を持てないが、そのとき何が消えたのかを
+/// 出さないと「タグ 0 件」に潰れてしまう）。そこで世代と並べて 1 つの
+/// ミューテックスに入れ、両者が食い違わないようにしている。
+struct Subscription {
+    generation: Option<Generation>,
+    /// 世代を持っていない理由。持っているときは `None`。
+    reason: Option<String>,
+    /// 直近に catalog と突き合わせた結果の未解決タグ。
+    unresolved: Vec<String>,
+}
+
+/// 起動直後（まだ一度も突き合わせていない）も「理由付きの停止」で表現する。
+/// `reason` の無い停止は「理由を出し忘れている」ことにしたいので、初期値
+/// にも理由を入れておく。
+impl Default for Subscription {
+    fn default() -> Self {
+        Self {
+            generation: None,
+            reason: Some(REASON_NOT_STARTED.to_owned()),
+            unresolved: Vec::new(),
+        }
+    }
+}
+
+impl Subscription {
+    /// 既存の世代を止める。エラーは best effort でログのみ - 購読の後始末で
+    /// 接続の状態を壊さない。
+    async fn stop(&mut self, reason: Option<String>) {
+        if let Some(generation) = self.generation.take() {
+            let started_at = generation.started_at;
+            if let Err(err) = generation.handle.shutdown().await {
+                eprintln!(
+                    "banto: Hubの購読の停止に失敗しました（started_at={started_at}）: {}",
+                    err.kind().as_str()
+                );
+            }
+        }
+        self.reason = reason;
+    }
+
+    fn view(&self) -> HubSubscriptionView {
+        let Some(generation) = self.generation.as_ref() else {
+            return HubSubscriptionView::stopped(self.reason.clone(), self.unresolved.clone());
+        };
+        let state = generation.states.borrow();
+        HubSubscriptionView {
+            state: connection_state_str(state.connection_state()),
+            reason: None,
+            subscribed_count: generation.fingerprint.1.len(),
+            unresolved: self.unresolved.clone(),
+            last_error: state.last_error().map(|kind| kind.as_str().to_owned()),
+            last_value_at: state.current().map(|snapshot| snapshot.t),
+            values: state.current().map(value_views).unwrap_or_default(),
+        }
+    }
+}
+
+fn connection_state_str(state: TagClientConnectionState) -> &'static str {
+    match state {
+        TagClientConnectionState::Stopped => "stopped",
+        TagClientConnectionState::Connecting => "connecting",
+        TagClientConnectionState::Handshaking => "handshaking",
+        TagClientConnectionState::Live => "live",
+        TagClientConnectionState::Rebinding => "rebinding",
+        TagClientConnectionState::Reconnecting => "reconnecting",
+        TagClientConnectionState::Unauthorized => "unauthorized",
+    }
+}
+
+fn value_views(snapshot: &ValuesSnapshot) -> Vec<HubValueView> {
+    snapshot
+        .values
+        .iter()
+        .map(|entry| HubValueView {
+            tag: entry.tag.clone(),
+            v: entry.v,
+            q: entry.q.as_str().to_owned(),
+            t: entry.t,
+            value_source: entry.value_source.as_str().to_owned(),
+        })
+        .collect()
+}
+
+fn unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or_default()
+}
+
 /// Hub 接続のサービス層。`src-tauri` の `hub_*` コマンドと
 /// `crate::rest` の `/api/hub/*` ルーターが共有する（他のサービスと同じ
 /// 「service 層は tauri も axum も知らない」規約）。
@@ -239,6 +513,9 @@ pub struct HubService {
     settings: SettingsService,
     mirror: Arc<SettingsMirror>,
     bootstrapper: Arc<Bootstrapper>,
+    /// 購読世代（#383 段階1）。`Clone` したハンドル同士が**同じ世代**を
+    /// 共有する（LAN ブラウザとデスクトップで WS が 2 本張られない）。
+    subscription: Arc<AsyncMutex<Subscription>>,
 }
 
 impl HubService {
@@ -270,16 +547,20 @@ impl HubService {
             settings,
             mirror,
             bootstrapper,
+            subscription: Arc::new(AsyncMutex::new(Subscription::default())),
         })
     }
 
     /// 保存済みの設定で現在の状態を返す。**発行は絶対に行わない**
     /// （設定画面を開いただけでキーが増えないように）。
+    ///
+    /// catalog を毎回読み直すので**ポーリングには使わない**。購読状態だけ
+    /// なら [`Self::subscription`] を見る（ネットワークを叩かない）。
     pub async fn status(&self) -> Result<HubView, BantoError> {
         self.hydrate().await?;
         let record = self.mirror.current();
         if record.is_none() {
-            return Ok(HubView::new(HubStatus::NotConfigured, None, None));
+            return Ok(self.not_configured_view().await);
         }
         let connection = self
             .bootstrapper
@@ -287,7 +568,40 @@ impl HubService {
             .await
             .map_err(to_banto_error)?;
         self.flush().await?;
-        Ok(self.view(connection))
+        Ok(self.view(connection).await)
+    }
+
+    /// 購読の状態だけを返す（ポーリング用）。**メモリ上の `watch` を読む
+    /// だけ**で、Hub へのリクエストは 1 本も出さない。
+    pub async fn subscription(&self) -> HubSubscriptionView {
+        self.subscription.lock().await.view()
+    }
+
+    /// 起動時の再開（#383 段階1）。保存済みレコードがあれば catalog を
+    /// 読み直して購読を張る - 設定画面を開かなくても値が流れる、というのが
+    /// この PR の到達点。
+    ///
+    /// **失敗しても起動を止めない**。呼び出し元（`src-tauri` の `setup()`、
+    /// `banto-serve` の起動）は spawn して投げっぱなしにしてよい。
+    pub async fn resume(&self) {
+        if let Err(err) = self.resume_inner().await {
+            eprintln!("banto: 起動時のHub購読の再開に失敗しました: {err}");
+        }
+    }
+
+    async fn resume_inner(&self) -> Result<(), BantoError> {
+        self.hydrate().await?;
+        if self.mirror.current().is_none() {
+            return Ok(());
+        }
+        let connection = self
+            .bootstrapper
+            .refresh_catalog()
+            .await
+            .map_err(to_banto_error)?;
+        self.flush().await?;
+        self.reconcile(&connection).await;
+        Ok(())
     }
 
     /// 接続（保存済みキーがあれば再利用、無ければ試運転中のみ自己発行）。
@@ -299,7 +613,7 @@ impl HubService {
             .await
             .map_err(to_banto_error)?;
         self.flush().await?;
-        Ok(self.view(connection))
+        Ok(self.view(connection).await)
     }
 
     /// ロックダウン済み Hub 向けの手動連携。平文はキーリングにだけ入る。
@@ -315,7 +629,7 @@ impl HubService {
             .await
             .map_err(to_banto_error)?;
         self.flush().await?;
-        Ok(self.view(connection))
+        Ok(self.view(connection).await)
     }
 
     /// タグ一覧の再取得。
@@ -327,16 +641,32 @@ impl HubService {
             .await
             .map_err(to_banto_error)?;
         self.flush().await?;
-        Ok(self.view(connection))
+        Ok(self.view(connection).await)
     }
 
     /// 選択タグの保存。空でも保存できる（受入条件）。
+    ///
+    /// ワイヤ形（引数・戻り値）は #332 のまま。保存したあとに catalog を
+    /// 1 回読み直してから購読を張り直すだけで、**追加の 1 往復はユーザー
+    /// 操作なので許容**する（画面のポーリングはこの経路を通らない）。
+    /// 読み直しに失敗しても**保存は成功のまま返す** - 保存の成否と購読の
+    /// 張り直しは別事象で、前者を後者の失敗で覆さない。
     pub async fn set_selected_tags(&self, tags: Vec<String>) -> Result<(), BantoError> {
         self.hydrate().await?;
         self.bootstrapper
             .set_selected_tags(tags)
             .map_err(to_banto_error)?;
-        self.flush().await
+        self.flush().await?;
+        match self.bootstrapper.refresh_catalog().await {
+            Ok(connection) => {
+                self.flush().await?;
+                self.reconcile(&connection).await;
+            }
+            Err(err) => eprintln!(
+                "banto: 選択タグ保存後のHubタグ一覧の再取得に失敗しました（購読はそのままです）: {err}"
+            ),
+        }
+        Ok(())
     }
 
     /// 切断: ローカルの設定とキーリングだけを消す。Hub 側のキーは失効
@@ -346,16 +676,146 @@ impl HubService {
         self.hydrate().await?;
         self.bootstrapper.disconnect().map_err(to_banto_error)?;
         self.flush().await?;
-        Ok(HubView::new(HubStatus::NotConfigured, None, None))
+        Ok(self.not_configured_view().await)
     }
 
-    fn view(&self, connection: HubConnection) -> HubView {
+    /// 「未設定」の応答。記録が無い以上、購読も持てないので世代を落とす。
+    async fn not_configured_view(&self) -> HubView {
+        self.reconcile_with(&HubStatus::NotConfigured, None).await;
+        HubView::new(
+            HubStatus::NotConfigured,
+            None,
+            None,
+            self.subscription().await,
+        )
+    }
+
+    /// 1 回の往復の答えを組み立てる。**すべての操作の最後**にここを通り、
+    /// 購読の突き合わせ（[`Self::reconcile`]）もここで行う。
+    async fn view(&self, connection: HubConnection) -> HubView {
+        self.reconcile(&connection).await;
         let record = self.mirror.current();
         let tags = connection
             .catalog
             .as_ref()
             .map(|catalog| catalog.tags.iter().map(HubTagView::from).collect());
-        HubView::new(connection.status, record.as_ref(), tags)
+        HubView::new(
+            connection.status,
+            record.as_ref(),
+            tags,
+            self.subscription().await,
+        )
+    }
+
+    /// 接続の結果と選択タグを突き合わせ、購読世代を「あるべき姿」に寄せる
+    /// （#383 段階1）。
+    ///
+    /// | 状況                                       | 世代                                         |
+    /// | ------------------------------------------ | -------------------------------------------- |
+    /// | `Connected` 以外                           | 落とす（理由を出す）                         |
+    /// | `Connected` だが購読要求が空               | 落とす（**異常ではない**。理由と未解決を出す）|
+    /// | `Connected` で fingerprint が既存と一致    | **何もしない**                               |
+    /// | `Connected` で fingerprint が違う / 世代無 | 既存を止めてから新しく張る                   |
+    /// | `rest_client()` が `None`（keyring 不可）  | 持たない（理由を出す）                       |
+    ///
+    /// **[`HubStatus`] の 6 状態はここで一切変えない**。購読が張れないこと
+    /// は接続設定の失敗ではないので、理由は
+    /// [`HubSubscriptionView::reason`] にだけ出る。
+    async fn reconcile(&self, connection: &HubConnection) {
+        self.reconcile_with(&connection.status, connection.catalog.as_ref())
+            .await;
+    }
+
+    /// [`Self::reconcile`] の本体。`HubConnection` を組み立てられない経路
+    /// （未設定・切断直後）からも同じ判断を通せるように、状態と catalog を
+    /// 直接受ける。
+    async fn reconcile_with(&self, status: &HubStatus, catalog: Option<&CatalogSnapshot>) {
+        let record = self.mirror.current();
+        let mut slot = self.subscription.lock().await;
+
+        // 1. 接続できていない / catalog を読めていない: 世代は持てない。
+        //    未解決タグは catalog と突き合わせて初めて分かるものなので、
+        //    ここでは伏せて（空にして）理由の方を出す - 古い判定を残して
+        //    「今も消えている」と誤読させない。
+        let (Some(record), HubStatus::Connected { .. }, Some(catalog)) = (record, status, catalog)
+        else {
+            slot.unresolved.clear();
+            let reason = match status {
+                HubStatus::NotConfigured => REASON_NOT_CONFIGURED,
+                _ => REASON_NOT_CONNECTED,
+            };
+            slot.stop(Some(reason.to_owned())).await;
+            return;
+        };
+
+        // 2. 未解決タグは世代の有無に関わらず画面に出す。
+        let plan = plan_bindings(&record.selected_tags, catalog);
+        slot.unresolved = plan.unresolved;
+        if plan.requests.is_empty() {
+            let reason = if slot.unresolved.is_empty() {
+                REASON_NO_TAGS
+            } else {
+                REASON_ALL_UNRESOLVED
+            };
+            slot.stop(Some(reason.to_owned())).await;
+            return;
+        }
+
+        // 3. 同じ接続先・同じタグ集合なら張り直さない（一番大事な不変条件。
+        //    設定画面が `status()` を叩くたびに WS を再接続しない）。
+        let mut tags: Vec<String> = plan
+            .requests
+            .iter()
+            .map(|request| request.binding_key.clone())
+            .collect();
+        tags.sort();
+        let fingerprint: Fingerprint = (fingerprint_endpoint(&record.endpoint), tags);
+        if slot
+            .generation
+            .as_ref()
+            .is_some_and(|generation| generation.fingerprint == fingerprint)
+        {
+            slot.reason = None;
+            return;
+        }
+
+        // 4. 張り直し。`TagClientHandle::restart` は使わない - 消費する API
+        //    で、しかも毎回 keyring から作り直した `RestClient` を渡すため、
+        //    素直に stop -> start する方が所有関係が単純になる。
+        slot.stop(None).await;
+        let client = match self.bootstrapper.rest_client() {
+            Ok(Some(client)) => client,
+            // keyring を持てない実行形態（`banto-serve`）やエントリ喪失。
+            // エラーにして接続状態を壊さない。
+            Ok(None) => {
+                slot.reason = Some(REASON_NO_KEY.to_owned());
+                return;
+            }
+            Err(err) => {
+                slot.reason = Some(format!(
+                    "購読用のクライアントを作れませんでした: {}",
+                    err.kind().as_str()
+                ));
+                return;
+            }
+        };
+        match client.start(plan.requests) {
+            Ok(handle) => {
+                slot.generation = Some(Generation {
+                    states: handle.state_watch(),
+                    handle,
+                    fingerprint,
+                    started_at: unix_seconds(),
+                });
+                slot.reason = None;
+            }
+            Err(err) => {
+                slot.reason = Some(format!(
+                    "購読を開始できませんでした: {}",
+                    err.kind().as_str()
+                ));
+            }
+        }
     }
 
     /// 設定ストア → インメモリの写し。
@@ -424,6 +884,8 @@ fn generate_installation_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    use banto_tagclient::StableTagId;
+
     use super::*;
     use crate::db::init_db_memory;
 
@@ -571,6 +1033,242 @@ mod tests {
         let (settings, hub) = service().await;
         settings.set(KEY_HUB_RECORD, "{not json").await.unwrap();
         assert_eq!(hub.status().await.unwrap().status, HubStatus::NotConfigured);
+    }
+
+    // --- #383 段階1: 購読 ---------------------------------------------------
+
+    fn catalog_tag(name: &str, ids: StableTagId) -> CatalogTag {
+        CatalogTag {
+            external_name: name.to_owned(),
+            tag_key: format!("tag:{name}"),
+            ids,
+            connection: "line1".into(),
+            group: "fast".into(),
+            name: name.into(),
+            address: "D100".into(),
+            data_type: "f64".into(),
+            unit: None,
+            decimals: 0,
+            period_ms: 100,
+            enabled: true,
+            writable: false,
+            tag_kind: "plc".into(),
+            expression: None,
+            retain: false,
+            simulation: false,
+            configured_simulation: false,
+            effective_simulation: false,
+            value_source: banto_tagclient::ValueSource::Real,
+        }
+    }
+
+    fn catalog(names: &[&str]) -> CatalogSnapshot {
+        CatalogSnapshot {
+            revision: 1,
+            run_id: Some(1),
+            collection_mode: banto_tagclient::CollectionMode::Configured,
+            tags: names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| catalog_tag(name, StableTagId::new(1, 1, index as i64 + 1)))
+                .collect(),
+        }
+    }
+
+    fn owned(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    #[test]
+    fn plan_bindings_resolves_everything_when_the_catalog_still_has_it() {
+        let plan = plan_bindings(&owned(&["a", "b"]), &catalog(&["a", "b", "c"]));
+        assert_eq!(
+            plan.requests
+                .iter()
+                .map(|request| request.binding_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"],
+            "binding_key は external name そのまま（画面と 1:1）"
+        );
+        assert!(plan.unresolved.is_empty());
+    }
+
+    #[test]
+    fn plan_bindings_subscribes_to_the_rest_when_one_tag_vanished() {
+        let plan = plan_bindings(&owned(&["a", "gone", "b"]), &catalog(&["a", "b"]));
+        assert_eq!(plan.requests.len(), 2, "1 個消えただけで全部止めない");
+        assert_eq!(plan.unresolved, owned(&["gone"]));
+    }
+
+    #[test]
+    fn plan_bindings_reports_every_missing_tag_instead_of_an_empty_list() {
+        let plan = plan_bindings(&owned(&["gone1", "gone2"]), &catalog(&["a"]));
+        assert!(
+            plan.requests.is_empty(),
+            "購読できるものが無ければ start しない"
+        );
+        assert_eq!(
+            plan.unresolved,
+            owned(&["gone1", "gone2"]),
+            "未解決を空表示に潰さない"
+        );
+    }
+
+    #[test]
+    fn plan_bindings_folds_duplicates_so_start_is_not_rejected() {
+        // `start()` は重複 binding_key / 重複 stable_id を拒否するので、
+        // ここで畳んでおかないと購読そのものが立ち上がらない。
+        let plan = plan_bindings(&owned(&["a", "a", "gone", "gone"]), &catalog(&["a"]));
+        assert_eq!(plan.requests.len(), 1);
+        assert_eq!(plan.unresolved, owned(&["gone"]));
+    }
+
+    #[test]
+    fn plan_bindings_on_an_empty_selection_is_empty_but_not_an_error() {
+        let plan = plan_bindings(&[], &catalog(&["a"]));
+        assert!(plan.requests.is_empty());
+        assert!(plan.unresolved.is_empty());
+    }
+
+    #[test]
+    fn the_fingerprint_endpoint_ignores_spelling_differences_of_the_same_hub() {
+        assert_eq!(
+            fingerprint_endpoint("http://127.0.0.1:3100"),
+            fingerprint_endpoint("http://127.0.0.1:3100/")
+        );
+        assert_ne!(
+            fingerprint_endpoint("http://127.0.0.1:3100"),
+            fingerprint_endpoint("http://127.0.0.1:3101")
+        );
+    }
+
+    /// `banto-serve` の `UnavailableKeyStore` では keyring からキーを
+    /// 取り出せないので世代を持てない。それは**接続の 6 状態を汚さない**
+    /// 別軸の事実で、理由付きの「停止」として出る。
+    #[tokio::test]
+    async fn reconcile_without_a_keyring_keeps_the_six_states_intact() {
+        let (settings, hub) = service().await;
+        let record = HubRecord {
+            endpoint: "http://127.0.0.1:3100".to_owned(),
+            installation_id: "inst".to_owned(),
+            key_id: None,
+            key_name: None,
+            keyring_account: "hub:127.0.0.1:3100/:inst".to_owned(),
+            selected_tags: owned(&["a", "gone"]),
+        };
+        settings
+            .set(KEY_HUB_RECORD, &serde_json::to_string(&record).unwrap())
+            .await
+            .unwrap();
+        hub.hydrate().await.unwrap();
+
+        hub.reconcile_with(&HubStatus::Connected { tag_count: 1 }, Some(&catalog(&["a"])))
+            .await;
+
+        let view = hub.subscription().await;
+        assert_eq!(view.state, "stopped");
+        assert_eq!(view.subscribed_count, 0);
+        assert_eq!(
+            view.unresolved,
+            owned(&["gone"]),
+            "世代を持てなくても未解決タグは出す"
+        );
+        assert!(view.reason.is_some(), "停止している理由を必ず出す");
+        assert!(view.values.is_empty());
+        // 接続状態は購読の失敗で変わらない（記録はそのまま残っている）。
+        assert!(settings
+            .get(KEY_HUB_RECORD)
+            .await
+            .unwrap()
+            .is_some_and(|raw| !raw.is_empty()));
+    }
+
+    /// 選択が全部 catalog から消えた状態。**異常ではない**ので理由付きで
+    /// 止まり、消えたタグを一覧に出す。
+    #[tokio::test]
+    async fn reconcile_with_only_unresolved_tags_stops_with_a_reason_and_lists_them() {
+        let (_settings, hub) = service().await;
+        hub.mirror.reset(Some(HubRecord {
+            endpoint: "http://127.0.0.1:3100".to_owned(),
+            installation_id: "inst".to_owned(),
+            key_id: None,
+            key_name: None,
+            keyring_account: "hub:127.0.0.1:3100/:inst".to_owned(),
+            selected_tags: owned(&["gone1", "gone2"]),
+        }));
+
+        hub.reconcile_with(&HubStatus::Connected { tag_count: 1 }, Some(&catalog(&["a"])))
+            .await;
+
+        let view = hub.subscription().await;
+        assert_eq!(view.state, "stopped");
+        assert_eq!(view.unresolved, owned(&["gone1", "gone2"]));
+        assert_eq!(view.reason.as_deref(), Some(REASON_ALL_UNRESOLVED));
+    }
+
+    /// catalog を読めていない状態では未解決の判定ができないので、古い判定を
+    /// 残さず理由の方を出す（「今も消えている」と誤読させない）。
+    #[tokio::test]
+    async fn reconcile_when_disconnected_reports_the_reason_not_a_stale_unresolved_list() {
+        let (_settings, hub) = service().await;
+        hub.mirror.reset(Some(HubRecord {
+            endpoint: "http://127.0.0.1:3100".to_owned(),
+            installation_id: "inst".to_owned(),
+            key_id: None,
+            key_name: None,
+            keyring_account: "hub:127.0.0.1:3100/:inst".to_owned(),
+            selected_tags: owned(&["gone"]),
+        }));
+        hub.reconcile_with(&HubStatus::Connected { tag_count: 0 }, Some(&catalog(&[])))
+            .await;
+        assert_eq!(hub.subscription().await.unresolved, owned(&["gone"]));
+
+        hub.reconcile_with(&HubStatus::AuthFailed, None).await;
+
+        let view = hub.subscription().await;
+        assert_eq!(view.state, "stopped");
+        assert!(view.unresolved.is_empty());
+        assert_eq!(view.reason.as_deref(), Some(REASON_NOT_CONNECTED));
+    }
+
+    #[tokio::test]
+    async fn a_view_without_a_subscription_is_stopped_and_carries_no_key() {
+        let (_settings, hub) = service().await;
+        let view = hub.status().await.unwrap();
+        assert_eq!(view.status, HubStatus::NotConfigured);
+        assert_eq!(view.subscription.state, "stopped");
+        assert_eq!(
+            view.subscription.reason.as_deref(),
+            Some(REASON_NOT_CONFIGURED)
+        );
+        assert!(view.subscription.values.is_empty());
+
+        let json = serde_json::to_value(&view).unwrap();
+        let subscription = json
+            .get("subscription")
+            .expect("HubView に subscription が入る");
+        for field in [
+            "state",
+            "reason",
+            "subscribedCount",
+            "unresolved",
+            "lastError",
+            "lastValueAt",
+            "values",
+        ] {
+            assert!(subscription.get(field).is_some(), "{field} が camelCase で出る");
+        }
+        let raw = serde_json::to_string(&view).unwrap();
+        assert!(!raw.contains("\"key\""), "平文キーの欄は存在しない: {raw}");
+    }
+
+    /// 起動時 resume は保存済みレコードが無ければ何もせず、失敗しても
+    /// 呼び出し元へ伝播しない（起動を止めない）。
+    #[tokio::test]
+    async fn resume_is_a_no_op_without_a_record_and_never_propagates_failure() {
+        let (_settings, hub) = service().await;
+        hub.resume().await;
+        assert_eq!(hub.subscription().await.state, "stopped");
     }
 
     #[tokio::test]

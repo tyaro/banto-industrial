@@ -8,6 +8,9 @@
  *   専用の状態になること（受入条件: エラーを「タグ0件」に潰さない）。
  * - そのとき設定は**保存されない**こと（「切断」が出ず、再読込で「未設定」
  *   に戻る）。
+ * - **購読ブロック**（#383 段階1）が未設定でも「停止」を理由付きで出し、
+ *   値の表を出さないこと。到達不能な Hub でも例外を出さないこと。
+ *   `banto-serve` は OS キーリングを持てないので購読は常に張れない。
  * - 非 admin では `Hub接続` が見えず、`/settings/hub` への直接遷移が先頭の
  *   可視カテゴリへ弾かれること（`guardCategory`）。
  *
@@ -87,7 +90,33 @@ test.describe.serial('chronogazer Hub接続の設定カテゴリ', () => {
 		await expect(page.getByText('状態: 未設定')).toBeVisible();
 	});
 
-	test('4. 閲覧者アカウントを作成する（次のテストの前提）', async () => {
+	// #383 段階1: 購読ブロック。`banto-serve` は OS キーリングを持てない
+	// （`UnavailableKeyStore`）ので購読は決して張れず、常に「停止」＋理由に
+	// なる。ここで確かめたいのは「購読が張れなくても画面が壊れず、値の表を
+	// 出さない」こと - 購読の失敗が接続設定の 6 状態を汚さないという規律を
+	// 実 DOM 側から固定する。
+	test('4. 未設定でも購読ブロックは「停止」を理由付きで出し、値の表は出さない', async () => {
+		await page.goto('/settings/hub');
+		await expect(page.getByText('状態: 未設定')).toBeVisible();
+		await expect(page.getByRole('heading', { level: 3, name: '購読' })).toBeVisible();
+		await expect(page.getByText('購読: 停止')).toBeVisible();
+		await expect(page.getByText('値を受信していません。')).toBeVisible();
+		// 値の表は Live のときだけ。停止中に古い値や空の表を出さない。
+		await expect(page.getByRole('columnheader', { name: '品質' })).toHaveCount(0);
+	});
+
+	test('5. 到達不能なHubへ接続を試みても購読ブロックは例外を出さない', async () => {
+		await page.getByLabel('接続先URL').fill(UNREACHABLE_HUB);
+		await page.getByRole('button', { name: '接続' }).click();
+
+		await expect(page.getByText('状態: Hubに到達できません')).toBeVisible();
+		// 接続が失敗しても購読ブロックは「停止」のまま残る（消えない・
+		// 例外で画面が落ちない）。
+		await expect(page.getByText('購読: 停止')).toBeVisible();
+		await expect(page.getByText('値を受信していません。')).toBeVisible();
+	});
+
+	test('6. 閲覧者アカウントを作成する（次のテストの前提）', async () => {
 		await page.goto('/users');
 		// 入力欄は「新規作成」セクションに限定して取る。一覧のグリッドには
 		// 同名の列見出し（「ユーザー名の絞り込み」等）があり、ページ全体を
@@ -102,7 +131,7 @@ test.describe.serial('chronogazer Hub接続の設定カテゴリ', () => {
 		await expect(page.locator('section.list').getByText(VIEWER_USERNAME).first()).toBeVisible();
 	});
 
-	test('5. 非 admin には Hub接続 が見えず、直接遷移は先頭の可視カテゴリへ弾かれる', async ({
+	test('7. 非 admin には Hub接続 が見えず、直接遷移は先頭の可視カテゴリへ弾かれる', async ({
 		browser
 	}) => {
 		const viewerPage = await browser.newPage();

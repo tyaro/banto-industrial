@@ -8,14 +8,22 @@
  * 1. **6 状態がすべて別の文言になる**（どれか 2 つが同じ表示に潰れない）。
  * 2. **`connected` の `tagCount: 0` は失敗ではない** - 「接続済み・利用
  *    可能なタグなし」という専用の文言になる。
+ *
+ * 後半（#383 段階1）は購読状態（7 状態）→ 文言のマッピング。こちらの核心は
+ * 「`stopped` は理由を必ず併記する」「`live`/`reconnecting`/`unauthorized`
+ * のような別々の事実を同じ表示に潰さない」の 2 点。
  */
 import { describe, expect, it } from 'vitest';
 import {
 	hubStatusDetail,
 	hubStatusLabel,
+	hubSubscriptionDetail,
+	hubSubscriptionLabel,
 	hubUnreachableCauseLabel,
 	needsManualKey,
-	type HubStatus
+	type HubStatus,
+	type HubSubscription,
+	type HubSubscriptionState
 } from './hubAdmin';
 
 const ALL_STATES: HubStatus[] = [
@@ -95,5 +103,85 @@ describe('needsManualKey', () => {
 		expect(needsManualKey({ state: 'notConfigured' })).toBe(false);
 		expect(needsManualKey({ state: 'connected', tagCount: 0 })).toBe(false);
 		expect(needsManualKey({ state: 'unreachable', cause: 'transport' })).toBe(false);
+	});
+});
+
+// --- #383 段階1: 購読状態 → 画面文言 ----------------------------------------
+
+const ALL_SUBSCRIPTION_STATES: HubSubscriptionState[] = [
+	'stopped',
+	'connecting',
+	'handshaking',
+	'live',
+	'rebinding',
+	'reconnecting',
+	'unauthorized'
+];
+
+function subscription(overrides: Partial<HubSubscription> = {}): HubSubscription {
+	return {
+		state: 'live',
+		reason: null,
+		subscribedCount: 2,
+		unresolved: [],
+		lastError: null,
+		lastValueAt: 1000,
+		values: [],
+		...overrides
+	};
+}
+
+describe('hubSubscriptionLabel', () => {
+	it('7状態すべてに空でない文言が付く', () => {
+		for (const state of ALL_SUBSCRIPTION_STATES) {
+			expect(hubSubscriptionLabel(state).length).toBeGreaterThan(0);
+		}
+	});
+
+	it('connecting と handshaking だけが意図的に同じ文言で、他は互いに潰れない', () => {
+		expect(hubSubscriptionLabel('connecting')).toBe(hubSubscriptionLabel('handshaking'));
+		const distinct = new Set(ALL_SUBSCRIPTION_STATES.map(hubSubscriptionLabel));
+		expect(distinct.size).toBe(ALL_SUBSCRIPTION_STATES.length - 1);
+	});
+
+	it('受信中・再接続中・認証エラー・停止は別々の事実として区別される', () => {
+		expect(hubSubscriptionLabel('live')).toBe('受信中');
+		expect(hubSubscriptionLabel('reconnecting')).toBe('再接続中');
+		expect(hubSubscriptionLabel('rebinding')).toBe('再バインド中');
+		expect(hubSubscriptionLabel('unauthorized')).toBe('認証エラー');
+		expect(hubSubscriptionLabel('stopped')).toBe('停止');
+	});
+});
+
+describe('hubSubscriptionDetail', () => {
+	it('stopped のときは Rust 側の理由をそのまま併記する', () => {
+		expect(
+			hubSubscriptionDetail(
+				subscription({ state: 'stopped', reason: '購読するタグが選ばれていません。' })
+			)
+		).toBe('購読するタグが選ばれていません。');
+	});
+
+	it('理由が無い stopped でも説明を空欄にしない', () => {
+		const detail = hubSubscriptionDetail(subscription({ state: 'stopped', reason: null }));
+		expect(detail.length).toBeGreaterThan(0);
+	});
+
+	it('購読中は件数を述べ、停止の理由文言とは別物になる', () => {
+		const live = hubSubscriptionDetail(subscription({ state: 'live', subscribedCount: 3 }));
+		expect(live).toContain('3');
+		expect(live).not.toBe(hubSubscriptionDetail(subscription({ state: 'stopped', reason: 'x' })));
+	});
+
+	it('unauthorized は接続設定の状態とは別軸であることを述べる', () => {
+		expect(hubSubscriptionDetail(subscription({ state: 'unauthorized' }))).toContain('接続設定');
+	});
+
+	it('未解決タグは状態に関わらず保持され、空表示に潰れない', () => {
+		// 文言側は unresolved を消さない - 表示の責務は画面だが、型として
+		// 残っていることをここで固定しておく（「タグ0件」に潰さない）。
+		const stopped = subscription({ state: 'stopped', reason: 'r', unresolved: ['a', 'b'] });
+		expect(stopped.unresolved).toEqual(['a', 'b']);
+		expect(hubSubscriptionDetail(stopped)).toBe('r');
 	});
 });
