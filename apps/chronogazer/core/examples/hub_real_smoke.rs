@@ -113,6 +113,12 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// 取っている。
 const LIVE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const VALUE_TABLE_INTERVAL: Duration = Duration::from_secs(5);
+/// `revoke_api_key` の1リクエストに掛ける上限。HOLDの手順でHubを止めた
+/// まま `CG_SMOKE_REVOKE=1` を指定すると、上限が無いと `send()` で
+/// 止まったまま最後の要約に到達できない（2026-09-17 Copilotレビュー
+/// 指摘）。失効はbest effortなので、超えたら失敗として手動失効の案内を
+/// 出して先へ進む。
+const REVOKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `chronogazer_core::hub` の設定 KV キー（`hub.record`）をここでも読む理由:
 /// [`chronogazer_core::hub::HubView`] は画面が必要としない
@@ -654,6 +660,7 @@ fn revoke_curl_hint(hub_url: &str, key_id: i64) -> String {
 async fn revoke_api_key(hub_url: &str, key_id: i64) -> Result<(), String> {
     let http = reqwest::ClientBuilder::new()
         .no_proxy()
+        .timeout(REVOKE_TIMEOUT)
         .build()
         .map_err(|error| format!("reqwestクライアント構築失敗: {error}"))?;
     let base = hub_url.trim_end_matches('/');
@@ -769,52 +776,76 @@ async fn main() {
 
     // == 2. 接続 ==============================================================
     println!("== 2. 接続 ==");
+    // connect() の**前**に、同じ CG_SMOKE_DIR に残っていたかもしれない
+    // 古いレコードの key_id を控えておく（2026-09-17 Copilotレビュー
+    // 指摘）: connect() は NeedsPairing / Unreachable でも `Ok(HubView)`
+    // を返すため、接続が実際には成功していなくても、設定DBに残っていた
+    // 古い hub.record（このプロセスではなく過去の実行が発行したキー）を
+    // 「今回発行したキー」と誤認しうる。connect後のkey_idがこの値と違う
+    // （かつ状態がconnected）ときだけ、実際に今回発行されたと判断する。
+    let key_id_before_connect = read_hub_record(&settings1).await.and_then(|r| r.key_id);
     let connect_view = hub1.connect(&hub_url).await;
-    let (step2_ok, catalog_tags, key_name_1, keyring_account_1, key_id_1, record_endpoint_1) =
-        match connect_view {
-            Ok(view) => {
-                let tag_count = view.tags.as_ref().map(|t| t.len());
-                println!("  状態: {}", view.status.as_str());
-                println!(
-                    "  タグ件数: {}",
-                    tag_count
-                        .map(|n| n.to_string())
-                        .unwrap_or_else(|| "不明(catalog未取得)".to_owned())
-                );
-                println!("  キー名: {}", view.key_name.as_deref().unwrap_or("-"));
-                let record = read_hub_record(&settings1).await;
-                let keyring_account = record.as_ref().map(|r| r.keyring_account.clone());
-                // 手順7の後始末（キー失効の案内・CG_SMOKE_REVOKE）に使う
-                // key_id。自己発行なら必ず Some、手動キー採用ならこの
-                // ハーネスは使わないので気にしなくてよい（HubRecordのdoc）。
-                let key_id = record.as_ref().and_then(|r| r.key_id);
-                // レコードが「今回のHUB_URL」のものかどうかを手順7で確かめる
-                // ために、endpointも一緒に持ち出す（#382と同じ間違いをしない
-                // - same_hub のdoc comment参照）。connect()が失敗した場合、
-                // read_hub_record は同じ CG_SMOKE_DIR に残っていた**別の
-                // 実行・別のHub**のレコードを返しうる（失敗したconnectは
-                // レコードを書き換えない）ため、ここで捕まえておかないと
-                // 手順7がそれを「今回のキー」と誤認する。
-                let record_endpoint = record.as_ref().map(|r| r.endpoint.clone());
-                println!(
-                    "  keyring account: {}",
-                    keyring_account.as_deref().unwrap_or("-")
-                );
-                let ok = view.status.is_connected();
-                (
-                    ok,
-                    view.tags,
-                    view.key_name,
-                    keyring_account,
-                    key_id,
-                    record_endpoint,
-                )
-            }
-            Err(err) => {
-                println!("  接続に失敗しました: {err}");
-                (false, None, None, None, None, None)
-            }
-        };
+    let (
+        step2_ok,
+        catalog_tags,
+        key_name_1,
+        keyring_account_1,
+        key_id_1,
+        record_endpoint_1,
+        issued_this_run_1,
+    ) = match connect_view {
+        Ok(view) => {
+            let tag_count = view.tags.as_ref().map(|t| t.len());
+            println!("  状態: {}", view.status.as_str());
+            println!(
+                "  タグ件数: {}",
+                tag_count
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "不明(catalog未取得)".to_owned())
+            );
+            println!("  キー名: {}", view.key_name.as_deref().unwrap_or("-"));
+            let record = read_hub_record(&settings1).await;
+            let keyring_account = record.as_ref().map(|r| r.keyring_account.clone());
+            // 手順7の後始末（キー失効の案内・CG_SMOKE_REVOKE）に使う
+            // key_id。自己発行なら必ず Some、手動キー採用ならこの
+            // ハーネスは使わないので気にしなくてよい（HubRecordのdoc）。
+            let key_id = record.as_ref().and_then(|r| r.key_id);
+            // レコードが「今回のHUB_URL」のものかどうかを手順7で確かめる
+            // ために、endpointも一緒に持ち出す（#382と同じ間違いをしない
+            // - same_hub のdoc comment参照）。connect()が失敗した場合、
+            // read_hub_record は同じ CG_SMOKE_DIR に残っていた**別の
+            // 実行・別のHub**のレコードを返しうる（失敗したconnectは
+            // レコードを書き換えない）ため、ここで捕まえておかないと
+            // 手順7がそれを「今回のキー」と誤認する。
+            let record_endpoint = record.as_ref().map(|r| r.endpoint.clone());
+            println!(
+                "  keyring account: {}",
+                keyring_account.as_deref().unwrap_or("-")
+            );
+            let ok = view.status.is_connected();
+            // 「今回発行した」= 接続がconnectedになり、かつkey_idが
+            // connect前と変わった。接続に失敗していれば当然違うし、
+            // 仮にconnectedでも（このハーネスの MemoryKeyStore は毎回
+            // 空なので起こらないはずだが）既存キーをそのまま再利用して
+            // key_idが変わらないケースも「今回発行した」扱いにしない
+            // - 発行元を問わず「変わったときだけ」で判定する方が、
+            // Bootstrapperの内部実装に依存せず正しい。
+            let issued_this_run = ok && key_id != key_id_before_connect;
+            (
+                ok,
+                view.tags,
+                view.key_name,
+                keyring_account,
+                key_id,
+                record_endpoint,
+                issued_this_run,
+            )
+        }
+        Err(err) => {
+            println!("  接続に失敗しました: {err}");
+            (false, None, None, None, None, None, false)
+        }
+    };
     results.push(if step2_ok {
         StepResult::pass("接続", format!("状態=connected キー名={:?}", key_name_1))
     } else {
@@ -1153,12 +1184,19 @@ async fn main() {
     // readキーがHub側に発行される。disconnectはHub側を失効させない契約
     // なので、案内無しでは孤児キーが溜まり続ける。
     //
-    // **失効する前に、そのレコードが今回のHUB_URLのものかを必ず確かめる**
-    // （#382と同じ間違いをしない - same_hub のdoc comment参照）。
-    // 同じCG_SMOKE_DIRを別のHubに向けて使い、今回のconnect()が失敗した
-    // 場合、read_hub_recordは古い（別のHubの）レコードを返しうる。
-    // key_idはHubごとの連番なので、確かめずに使うと無関係な第三者の
-    // キーを失効させかねない。
+    // 失効の対象にするのは、次の**2条件がそろったとき**だけ:
+    // 1. レコードが今回のHUB_URLのものか（same_hub） - #382と同じ間違い
+    //    をしない。同じCG_SMOKE_DIRを別のHubに向けて使い、今回のconnect()
+    //    が失敗した場合、read_hub_recordは古い（別のHubの）レコードを
+    //    返しうる。key_idはHubごとの連番なので、確かめずに使うと無関係な
+    //    第三者のキーを失効させかねない。
+    // 2. そのキーを**今回のプロセスが発行したか**（issued_this_run_1）
+    //    - connect()はNeedsPairing/Unreachableでも`Ok(HubView)`を返す
+    //    ため、接続が実際には成功していなくても設定DBに残っていた古い
+    //    レコード（過去の実行が発行したキー）を読んでしまう。ロック
+    //    ダウン済みHubに同じCG_SMOKE_DIRを再利用すると、このプロセスが
+    //    発行していない永続キーを失効させかねない
+    //    （2026-09-17 Copilotレビュー指摘）。
     let (cleanup_detail, cleanup_ok) = match key_id_1 {
         Some(key_id) => {
             let key_name_display = key_name_1.as_deref().unwrap_or("-");
@@ -1182,46 +1220,67 @@ async fn main() {
                     ),
                     true,
                 )
-            } else if auto_revoke {
+            } else if !issued_this_run_1 {
                 let hint = revoke_curl_hint(&hub_url, key_id);
                 println!(
-                    "  CG_SMOKE_REVOKE=1: 手順2で発行したAPIキー(id={key_id}, name={key_name_display})を失効させます..."
+                    "  設定に残っているキー(id={key_id}, name={key_name_display})は今回のプロセスが発行したものではありません(過去の実行の記録が残っているか、接続に失敗しています)。"
                 );
-                match revoke_api_key(&hub_url, key_id).await {
-                    Ok(()) => {
-                        println!("  失効しました。Hub側にはもう残りません。");
-                        (format!("key_id={key_id}を失効させた"), true)
-                    }
-                    Err(message) => {
-                        println!("  失効に失敗しました: {message}");
-                        println!("  このキーはHubに残ります。不要なら手動で失効させてください:");
-                        println!("    {hint}");
-                        // サマリが嘘をつかないよう、失効を頼まれたのに
-                        // 失敗した場合はこの段階をFAILにする
-                        // （2026-09-17 Copilotレビュー指摘: 以前はこの
-                        // ケースでもPASSのままで、総合結果が成功に見えた）。
-                        (
-                            format!("key_id={key_id}の失効に失敗({message})。手動失効: {hint}"),
-                            false,
-                        )
-                    }
-                }
+                println!("  このハーネスはCG_SMOKE_REVOKE=1が指定されていても失効させません。");
+                println!("  片付けたい場合は手動で失効させてください:");
+                println!("    {hint}");
+                (
+                    format!(
+                        "key_id={key_id}は今回発行したキーではないため失効せず。手動失効: {hint}"
+                    ),
+                    true,
+                )
             } else {
+                // ここに来るのは「今回のHUB_URLのもの」かつ「今回の
+                // プロセスが発行した」ときだけ。契約は「毎回、残存キーと
+                // 失効コマンドを出す」ので、自動失効を試みる**前**に案内を
+                // 出してから失効し、結果を続けて表示する
+                // （2026-09-17 Copilotレビュー指摘: 以前は自動失効に
+                // 成功したときだけこの案内が出ず、契約が守れていなかった）。
                 let hint = revoke_curl_hint(&hub_url, key_id);
                 println!("  発行したAPIキー: id={key_id}, name={key_name_display}");
                 println!(
                     "  このキーはHubに残ります(disconnectはHub側を失効させない契約)。不要なら失効させてください:"
                 );
                 println!("    {hint}");
-                // 「CG_SMOKE_REVOKE=1で再実行」とだけ書くと、CG_SMOKE_DIR
-                // を指定せずに再実行して別のキーを新規発行しただけになり、
-                // 今回のキーは孤児のままになる（2026-09-17 Copilotレビュー
-                // 指摘）。同じCG_SMOKE_DIRを使うよう明示する。
-                println!(
-                    "  (自動で失効させたい場合は、同じ CG_SMOKE_DIR を指定して CG_SMOKE_REVOKE=1 で再実行してください: CG_SMOKE_DIR={} CG_SMOKE_REVOKE=1。またはこの curl コマンドで直接失効させてください)",
-                    smoke_dir.display()
-                );
-                (format!("key_id={key_id}はHubに残存。失効: {hint}"), true)
+                if auto_revoke {
+                    println!("  CG_SMOKE_REVOKE=1: 上記のキーを失効させます...");
+                    match revoke_api_key(&hub_url, key_id).await {
+                        Ok(()) => {
+                            println!(
+                                "  失効しました。上記のキーはもう失効済みです(Hub側には残っていません)。"
+                            );
+                            (format!("key_id={key_id}を失効させた"), true)
+                        }
+                        Err(message) => {
+                            println!("  失効に失敗しました: {message}");
+                            println!("  引き続き上記のcurlコマンドで手動失効してください。");
+                            // サマリが嘘をつかないよう、失効を頼まれたのに
+                            // 失敗した場合はこの段階をFAILにする
+                            // （2026-09-17 Copilotレビュー指摘: 以前はこの
+                            // ケースでもPASSのままで、総合結果が成功に見えた）。
+                            (
+                                format!("key_id={key_id}の失効に失敗({message})。手動失効: {hint}"),
+                                false,
+                            )
+                        }
+                    }
+                } else {
+                    // 「CG_SMOKE_REVOKE=1で再実行」とだけ書くと、
+                    // CG_SMOKE_DIR を指定せずに再実行して別のキーを新規
+                    // 発行しただけになり、今回のキーは孤児のままになる
+                    // （2026-09-17 Copilotレビュー指摘）。同じ
+                    // CG_SMOKE_DIR を使うよう明示する。
+                    println!(
+                        "  (自動で失効させたい場合は、同じ CG_SMOKE_DIR を指定して CG_SMOKE_REVOKE=1 で再実行してください: CG_SMOKE_DIR={} CG_SMOKE_REVOKE=1。またはこの curl コマンドで直接失効させてください)",
+                        smoke_dir.display()
+                    );
+                    (format!("key_id={key_id}はHubに残存。失効: {hint}"), true)
+                }
             }
         }
         None => {
