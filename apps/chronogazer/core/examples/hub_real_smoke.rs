@@ -199,12 +199,28 @@ fn unix_millis() -> u128 {
 /// 保存済みの `hub.record`（[`HubRecord`] の JSON）を読む。手順2・手順5の
 /// 「keyring account」「key_name が同じか」の表示・比較専用（設定 KV は
 /// [`HubService`] が書き、ここでは読むだけ）。
-async fn read_hub_record(settings: &SettingsService) -> Option<HubRecord> {
-    let raw = settings.get(HUB_RECORD_SETTINGS_KEY).await.ok()??;
+///
+/// **「レコードが無い」（`Ok(None)`）と「読み取り/パースに失敗した」
+/// （`Err`）を区別する**（2026-09-18 Copilotレビュー指摘）。以前は両方を
+/// `None` に潰していたため、キーを発行した直後にこの読み取りだけが
+/// 失敗すると、手順7が「発行済みAPIキーはありません」と表示して
+/// **PASSになってしまっていた**（実際にはキーがHubに残ったまま）。
+/// 呼び出し側（手順2・手順7）はこの区別を使い、読み取り失敗を
+/// 「レコード無し」と取り違えない。
+async fn read_hub_record(settings: &SettingsService) -> Result<Option<HubRecord>, String> {
+    let raw = match settings.get(HUB_RECORD_SETTINGS_KEY).await {
+        Ok(value) => value,
+        Err(err) => return Err(format!("設定の読み取りに失敗しました: {err}")),
+    };
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
     if raw.trim().is_empty() {
-        return None;
+        return Ok(None);
     }
-    serde_json::from_str(&raw).ok()
+    serde_json::from_str(&raw)
+        .map(Some)
+        .map_err(|err| format!("hub.recordのJSON解析に失敗しました: {err}"))
 }
 
 fn print_catalog_table(tags: &[HubTagView]) {
@@ -745,10 +761,24 @@ async fn revoke_api_key(hub_url: &str, key_id: i64) -> Result<(), String> {
         .send()
         .await
         .map_err(|error| format!("送信失敗: {error}"))?;
-    if response.status().is_success() {
+    let status = response.status();
+    if status.is_success() {
         Ok(())
+    } else if status == reqwest::StatusCode::UNAUTHORIZED
+        || status == reqwest::StatusCode::FORBIDDEN
+    {
+        // `POST /api/api-keys/{id}/revoke` はロックダウン後は管理者の
+        // bearer認証が要り、`X-Banto-Client` だけでは401/403になる
+        // （2026-09-18 Copilotレビュー指摘）。この example は資格情報を
+        // 扱わない方針（管理者トークンを受け取る環境変数・引数は作らない）
+        // なので、代替経路は提供せず理由を名指しして手動対処を案内する
+        // だけにする。自己発行キーの発行そのものが試運転モード限定
+        // （banto-hub-bootstrapのdoc参照）なのと同じ制約。
+        Err(format!(
+            "HTTPステータス={status}(認証/権限エラー)。Hubがロックダウン済みのため自動失効できません - この失効APIは試運転モード中のみ動作します。ロックダウン済みのHubで失効させるにはHubの管理画面か管理者のBearerトークンが必要です(このハーネスは資格情報を扱いません)。"
+        ))
     } else {
-        Err(format!("HTTPステータス={}", response.status()))
+        Err(format!("HTTPステータス={status}"))
     }
 }
 
@@ -858,7 +888,20 @@ async fn main() {
     // 「今回発行したキー」と誤認しうる。接続先も一緒に控える理由は
     // `issued_this_run` のdoc comment参照（key_idだけの比較は接続先が
     // 変わると意味を失う）。
-    let record_before_connect = read_hub_record(&settings1).await;
+    let record_before_connect = match read_hub_record(&settings1).await {
+        Ok(record) => record,
+        Err(err) => {
+            // 「今回発行した」判定（issued_this_run）の入力が欠けるだけで
+            // 致命的ではない - 最悪でも「接続前にレコードが無かった」扱いに
+            // 倒れ、この後 connect が成功すれば「今回発行した」と判定
+            // される（安全側）。手順7を左右する致命的な読み取り失敗は
+            // 接続後の読み取り（この下）で別途捕捉する。
+            println!(
+                "  警告: 接続前の設定読み取りに失敗しました({err})。レコード無しとして進めます。"
+            );
+            None
+        }
+    };
     let key_id_before_connect = record_before_connect.as_ref().and_then(|r| r.key_id);
     let endpoint_before_connect = record_before_connect.map(|r| r.endpoint);
     let connect_view = hub1.connect(&hub_url).await;
@@ -870,6 +913,7 @@ async fn main() {
         key_id_1,
         record_endpoint_1,
         issued_this_run_1,
+        record_read_error_1,
     ) = match connect_view {
         Ok(view) => {
             let tag_count = view.tags.as_ref().map(|t| t.len());
@@ -881,7 +925,20 @@ async fn main() {
                     .unwrap_or_else(|| "不明(catalog未取得)".to_owned())
             );
             println!("  キー名: {}", view.key_name.as_deref().unwrap_or("-"));
-            let record = read_hub_record(&settings1).await;
+            // **この読み取りの失敗は手順7の判断を左右する致命的なもの**
+            // （2026-09-18 Copilotレビュー指摘）: connect が成功して実際に
+            // キーが発行されていても、この読み取りだけが失敗すると
+            // key_id が分からず、案内も失効もできない。「レコードが無い」
+            // （Ok(None)）と混同せず、record_read_error_1 として手順7へ
+            // 持ち越す - 手順7はこれが Some なら「発行済みキーはありません」
+            // と嘘をつかず FAIL にする。
+            let (record, record_read_error) = match read_hub_record(&settings1).await {
+                Ok(record) => (record, None),
+                Err(err) => {
+                    println!("  警告: 接続後の設定読み取りに失敗しました: {err}");
+                    (None, Some(err))
+                }
+            };
             let keyring_account = record.as_ref().map(|r| r.keyring_account.clone());
             // 手順7の後始末（キー失効の案内・CG_SMOKE_REVOKE）に使う
             // key_id。自己発行なら必ず Some、手動キー採用ならこの
@@ -917,11 +974,12 @@ async fn main() {
                 key_id,
                 record_endpoint,
                 issued_this_run,
+                record_read_error,
             )
         }
         Err(err) => {
             println!("  接続に失敗しました: {err}");
-            (false, None, None, None, None, None, false)
+            (false, None, None, None, None, None, false, None)
         }
     };
     results.push(if step2_ok {
@@ -1108,7 +1166,23 @@ async fn main() {
                                 // status() は「発行は絶対に行わない」(hub.rs のdoc)
                                 // ので、ここで呼んでも新しいキーは発行されない。
                                 let view = hub2.status().await;
-                                let record_after = read_hub_record(&settings2).await;
+                                let record_after = match read_hub_record(&settings2).await {
+                                    Ok(record) => record,
+                                    Err(err) => {
+                                        // 読み取り失敗を「レコード無し」と
+                                        // 混同しない（read_hub_recordのdoc
+                                        // comment参照）。ここではNoneに
+                                        // 倒しても安全側 - key_name_same /
+                                        // account_same が意図どおりfalseに
+                                        // なり、手順5は「一致しない」として
+                                        // 正しくFAILする（黙って握り潰さない
+                                        // よう、理由だけ印字する）。
+                                        println!(
+                                            "  警告: 再起動後の設定読み取りに失敗しました: {err}"
+                                        );
+                                        None
+                                    }
+                                };
                                 let key_name_after =
                                     record_after.as_ref().and_then(|r| r.key_name.clone());
                                 let account_after =
@@ -1275,95 +1349,128 @@ async fn main() {
     //    ダウン済みHubに同じCG_SMOKE_DIRを再利用すると、このプロセスが
     //    発行していない永続キーを失効させかねない
     //    （2026-09-17 Copilotレビュー指摘）。
-    let (cleanup_detail, cleanup_ok) = match key_id_1 {
-        Some(key_id) => {
-            let key_name_display = key_name_1.as_deref().unwrap_or("-");
-            let record_endpoint_display = record_endpoint_1.as_deref().unwrap_or("-");
-            let matches_current_hub = record_endpoint_1
-                .as_deref()
-                .is_some_and(|endpoint| same_hub(endpoint, &hub_url));
-            if !matches_current_hub {
-                let hint = revoke_curl_hint(record_endpoint_display, key_id);
-                println!(
+    // 「設定を読めなかった」を「発行済みキーが無い」と取り違えない
+    // （2026-09-18 Copilotレビュー指摘）: read_hub_record は「レコードが
+    // 無い」（正常）と「読み取り/パースに失敗した」（異常）を区別して
+    // 返すようになった。手順2の接続後の読み取りが後者だった場合、
+    // key_id_1 は None のままだが「発行済みキーはありません」と表示して
+    // PASSにするのは嘘になる - 実際にはキーが発行され、Hub側に残った
+    // ままかもしれない。ここでその区別を最優先で見る。
+    let (cleanup_detail, cleanup_ok) = if let Some(read_error) = record_read_error_1.as_deref() {
+        println!("  設定を読めなかったため、発行済みキーの有無を確認できません: {read_error}");
+        println!(
+            "  手動で確認・失効してください。作業ディレクトリ: {}",
+            smoke_dir.display()
+        );
+        println!(
+            "  Hub側のキー一覧は GET {}/api/api-keys で確認できます(X-Banto-Client: banto ヘッダが必要)。",
+            hub_url.trim_end_matches('/')
+        );
+        (
+            format!("設定読み取り失敗のため発行済みキーの有無を確認できず: {read_error}"),
+            false,
+        )
+    } else {
+        match key_id_1 {
+            Some(key_id) => {
+                let key_name_display = key_name_1.as_deref().unwrap_or("-");
+                let record_endpoint_display = record_endpoint_1.as_deref().unwrap_or("-");
+                let matches_current_hub = record_endpoint_1
+                    .as_deref()
+                    .is_some_and(|endpoint| same_hub(endpoint, &hub_url));
+                if !matches_current_hub {
+                    let hint = revoke_curl_hint(record_endpoint_display, key_id);
+                    println!(
                     "  設定に残っている記録は別のHub({record_endpoint_display})のものです(今回のHUB_URL={hub_url}とは異なる接続先)。"
                 );
-                println!(
+                    println!(
                     "  別Hubのレコードなので、このハーネスはCG_SMOKE_REVOKE=1が指定されていても失効させません。"
                 );
-                println!("  片付けたい場合は、そのHub宛てに手動で失効させてください:");
-                println!("    {hint}");
-                (
+                    println!("  片付けたい場合は、そのHub宛てに手動で失効させてください:");
+                    println!("    {hint}");
+                    (
                     format!(
                         "key_id={key_id}は別Hub({record_endpoint_display})のもののため失効せず。手動失効: {hint}"
                     ),
                     true,
                 )
-            } else if !issued_this_run_1 {
-                let hint = revoke_curl_hint(&hub_url, key_id);
-                println!(
+                } else if !issued_this_run_1 {
+                    let hint = revoke_curl_hint(&hub_url, key_id);
+                    println!(
                     "  設定に残っているキー(id={key_id}, name={key_name_display})は今回のプロセスが発行したものではありません(過去の実行の記録が残っているか、接続に失敗しています)。"
                 );
-                println!("  このハーネスはCG_SMOKE_REVOKE=1が指定されていても失効させません。");
-                println!("  片付けたい場合は手動で失効させてください:");
-                println!("    {hint}");
-                (
-                    format!(
+                    println!("  このハーネスはCG_SMOKE_REVOKE=1が指定されていても失効させません。");
+                    println!("  片付けたい場合は手動で失効させてください:");
+                    println!("    {hint}");
+                    (
+                        format!(
                         "key_id={key_id}は今回発行したキーではないため失効せず。手動失効: {hint}"
                     ),
-                    true,
-                )
-            } else {
-                // ここに来るのは「今回のHUB_URLのもの」かつ「今回の
-                // プロセスが発行した」ときだけ。契約は「毎回、残存キーと
-                // 失効コマンドを出す」ので、自動失効を試みる**前**に案内を
-                // 出してから失効し、結果を続けて表示する
-                // （2026-09-17 Copilotレビュー指摘: 以前は自動失効に
-                // 成功したときだけこの案内が出ず、契約が守れていなかった）。
-                let hint = revoke_curl_hint(&hub_url, key_id);
-                println!("  発行したAPIキー: id={key_id}, name={key_name_display}");
-                println!(
+                        true,
+                    )
+                } else {
+                    // ここに来るのは「今回のHUB_URLのもの」かつ「今回の
+                    // プロセスが発行した」ときだけ。契約は「毎回、残存キーと
+                    // 失効コマンドを出す」ので、自動失効を試みる**前**に案内を
+                    // 出してから失効し、結果を続けて表示する
+                    // （2026-09-17 Copilotレビュー指摘: 以前は自動失効に
+                    // 成功したときだけこの案内が出ず、契約が守れていなかった）。
+                    let hint = revoke_curl_hint(&hub_url, key_id);
+                    println!("  発行したAPIキー: id={key_id}, name={key_name_display}");
+                    println!(
                     "  このキーはHubに残ります(disconnectはHub側を失効させない契約)。不要なら失効させてください:"
                 );
-                println!("    {hint}");
-                if auto_revoke {
-                    println!("  CG_SMOKE_REVOKE=1: 上記のキーを失効させます...");
-                    match revoke_api_key(&hub_url, key_id).await {
-                        Ok(()) => {
-                            println!(
+                    println!("    {hint}");
+                    // この形（X-Banto-Clientのみ）で失効できるのは試運転
+                    // モード中だけ - ロックダウン済みのHubではHubの管理画面か
+                    // 管理者のBearerトークンが必要（このハーネスは資格情報を
+                    // 扱わないため、その入力は作らない）（2026-09-18
+                    // Copilotレビュー指摘）。
+                    println!(
+                    "  (上記のcurlで失効できるのは試運転モード中のみです。ロックダウン済みのHubではHubの管理画面か管理者のBearerトークンで失効させてください)"
+                );
+                    if auto_revoke {
+                        println!("  CG_SMOKE_REVOKE=1: 上記のキーを失効させます...");
+                        match revoke_api_key(&hub_url, key_id).await {
+                            Ok(()) => {
+                                println!(
                                 "  失効しました。上記のキーはもう失効済みです(Hub側には残っていません)。"
                             );
-                            (format!("key_id={key_id}を失効させた"), true)
+                                (format!("key_id={key_id}を失効させた"), true)
+                            }
+                            Err(message) => {
+                                println!("  失効に失敗しました: {message}");
+                                println!("  引き続き上記のcurlコマンドで手動失効してください。");
+                                // サマリが嘘をつかないよう、失効を頼まれたのに
+                                // 失敗した場合はこの段階をFAILにする
+                                // （2026-09-17 Copilotレビュー指摘: 以前はこの
+                                // ケースでもPASSのままで、総合結果が成功に見えた）。
+                                (
+                                    format!(
+                                        "key_id={key_id}の失効に失敗({message})。手動失効: {hint}"
+                                    ),
+                                    false,
+                                )
+                            }
                         }
-                        Err(message) => {
-                            println!("  失効に失敗しました: {message}");
-                            println!("  引き続き上記のcurlコマンドで手動失効してください。");
-                            // サマリが嘘をつかないよう、失効を頼まれたのに
-                            // 失敗した場合はこの段階をFAILにする
-                            // （2026-09-17 Copilotレビュー指摘: 以前はこの
-                            // ケースでもPASSのままで、総合結果が成功に見えた）。
-                            (
-                                format!("key_id={key_id}の失効に失敗({message})。手動失効: {hint}"),
-                                false,
-                            )
-                        }
-                    }
-                } else {
-                    // 「CG_SMOKE_REVOKE=1で再実行」とだけ書くと、
-                    // CG_SMOKE_DIR を指定せずに再実行して別のキーを新規
-                    // 発行しただけになり、今回のキーは孤児のままになる
-                    // （2026-09-17 Copilotレビュー指摘）。同じ
-                    // CG_SMOKE_DIR を使うよう明示する。
-                    println!(
+                    } else {
+                        // 「CG_SMOKE_REVOKE=1で再実行」とだけ書くと、
+                        // CG_SMOKE_DIR を指定せずに再実行して別のキーを新規
+                        // 発行しただけになり、今回のキーは孤児のままになる
+                        // （2026-09-17 Copilotレビュー指摘）。同じ
+                        // CG_SMOKE_DIR を使うよう明示する。
+                        println!(
                         "  (自動で失効させたい場合は、同じ CG_SMOKE_DIR を指定して CG_SMOKE_REVOKE=1 で再実行してください: CG_SMOKE_DIR={} CG_SMOKE_REVOKE=1。またはこの curl コマンドで直接失効させてください)",
                         smoke_dir.display()
                     );
-                    (format!("key_id={key_id}はHubに残存。失効: {hint}"), true)
+                        (format!("key_id={key_id}はHubに残存。失効: {hint}"), true)
+                    }
                 }
             }
-        }
-        None => {
-            println!("  発行済みAPIキーはありません(手順2で接続できなかった、またはロックダウン済みHub)。");
-            ("発行済みキー無し".to_owned(), true)
+            None => {
+                println!("  発行済みAPIキーはありません(手順2で接続できなかった、またはロックダウン済みHub)。");
+                ("発行済みキー無し".to_owned(), true)
+            }
         }
     };
     results.push(if cleanup_ok {
