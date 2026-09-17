@@ -22,6 +22,7 @@ import {
 	hubLastValueLabel,
 	hubTimeLabel,
 	hubUnreachableCauseLabel,
+	isPollResultFresh,
 	needsManualKey,
 	showManualKeyEntry,
 	type HubStatus,
@@ -292,5 +293,16 @@ describe('hubLastValueLabel / hubTimeLabel', () => {
 
 	it('解釈できない値は握りつぶさずそのまま見せる', () => {
 		expect(hubTimeLabel(Number.NaN)).toBe('NaN');
+	});
+});
+
+describe('isPollResultFresh', () => {
+	it('明示操作が割り込んでいなければ適用する', () => {
+		expect(isPollResultFresh(3, 3)).toBe(true);
+	});
+
+	it('待っている間に明示操作の結果が入っていたら捨てる（状態を巻き戻さない）', () => {
+		// 接続の前に飛ばしたポーリングが connect() の応答より後に着く場合。
+		expect(isPollResultFresh(3, 4)).toBe(false);
 	});
 });

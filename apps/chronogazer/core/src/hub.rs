@@ -68,7 +68,7 @@ use banto_tagclient::{
     TagClientHandle, TagClientState, ValuesSnapshot,
 };
 use serde::Serialize;
-use tokio::sync::{watch, Mutex as AsyncMutex};
+use tokio::sync::{watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
 use crate::settings::SettingsService;
 
@@ -743,6 +743,28 @@ struct HubInner {
     settings: SettingsService,
     mirror: Arc<SettingsMirror>,
     bootstrapper: Arc<Bootstrapper>,
+    /// 「設定を読む → bootstrapper を呼ぶ → 書き戻す → 購読を突き合わせる」
+    /// を 1 つの操作として**直列化する**ロック。
+    ///
+    /// **なぜ要るか**: [`SettingsMirror`] は設定ストアの写しで、
+    /// [`HubService::hydrate`] が `reset()`（= `dirty` を落として DB の値で
+    /// 置き換える）、[`HubService::flush`] が変更分だけを書き戻す。ここに
+    /// 見張り（30 秒ごとに `resume_inner()` → `hydrate()`）が割り込むと、
+    /// 次の順序で**ユーザーの変更が黙って消える**:
+    ///
+    /// 1. `set_selected_tags` が写しを更新（`dirty = true`）。
+    /// 2. `flush()` の前に見張りのティックが `hydrate()` を呼ぶ → 写しが
+    ///    **古い DB の値**で置き換わり、`dirty` も落ちる。
+    /// 3. `set_selected_tags` の `flush()` は「変更なし」と見て何も書かず
+    ///    **成功を返す**。選択は保存されていないのに保存されたと見える。
+    ///
+    /// **ロック順序は一方向に固定**: この操作ロック（外）→ [`Self::subscription`]
+    /// （内）。`reconcile*` はこのロックを**取らない**前提で書いてあるので
+    /// （呼び出し元が既に持っている）、逆順で取る経路を作らないこと。
+    /// ポーリング経路（[`HubService::subscription`]）はこのロックを取らず
+    /// 購読ロックだけを取る - 2 秒ごとの読み取りが Hub 往復のある操作を
+    /// 待たされないように。
+    operation: AsyncMutex<()>,
     /// 購読世代（#383 段階1）。`Clone` したハンドル同士が**同じ世代**を
     /// 共有する（LAN ブラウザとデスクトップで WS が 2 本張られない）。
     subscription: AsyncMutex<Subscription>,
@@ -792,6 +814,7 @@ impl HubService {
                 settings,
                 mirror,
                 bootstrapper,
+                operation: AsyncMutex::new(()),
                 subscription: AsyncMutex::new(Subscription::default()),
                 supervisor_spawns: AtomicUsize::new(0),
                 generations_started: AtomicUsize::new(0),
@@ -805,7 +828,7 @@ impl HubService {
     /// catalog を毎回読み直すので**ポーリングには使わない**。購読状態だけ
     /// なら [`Self::subscription`] を見る（ネットワークを叩かない）。
     pub async fn status(&self) -> Result<HubView, BantoError> {
-        self.hydrate().await?;
+        let _operation = self.begin_operation().await?;
         let record = self.inner.mirror.current();
         if record.is_none() {
             return Ok(self.not_configured_view().await);
@@ -893,25 +916,41 @@ impl HubService {
 
     /// 見張りの 1 周期分。上の表の「動く」ときだけ catalog を読み直す。
     async fn supervise_once(&self) {
-        if self.inner.mirror.current().is_none() {
-            return;
-        }
+        // 操作ロックは**待つ**。周期が 30 秒なのでユーザー操作 1 回分の待ちは
+        // 短く、「取れなかったから次の周期まで何もしない」より素直（取れない
+        // = ちょうど誰かが設定を触っている、という一番再計画したい瞬間でも
+        // ある）。判定と再試行をこの 1 つの操作の中で続けるので、判定した
+        // 状態のまま張り直せる。
+        let _operation = self.inner.operation.lock().await;
         {
             let mut slot = self.inner.subscription.lock().await;
             // 画面を閉じていても最終受信時刻が進むように、判定より**前**に
             // 無条件で 1 回観測する（`observe_last_value` の doc 参照）。
             slot.observe_last_value();
-            if !needs_retry(slot.health()) {
+            if self.inner.mirror.current().is_none() || !needs_retry(slot.health()) {
                 return;
             }
         }
-        if let Err(err) = self.resume_inner().await {
+        if let Err(err) = self.hydrate().await {
+            eprintln!(
+                "banto: Hub接続設定の読み取りに失敗しました（次の周期で再試行します）: {err}"
+            );
+            return;
+        }
+        if let Err(err) = self.resume_locked().await {
             eprintln!("banto: Hub購読の再試行に失敗しました（次の周期で再試行します）: {err}");
         }
     }
 
     async fn resume_inner(&self) -> Result<(), BantoError> {
-        self.hydrate().await?;
+        let _operation = self.begin_operation().await?;
+        self.resume_locked().await
+    }
+
+    /// [`Self::resume_inner`] の本体。**操作ロックを呼び出し元が持っている
+    /// 前提**（見張りは判定と再試行を 1 つの操作として続けたいので、ここを
+    /// 直接呼ぶ）。`hydrate` は [`Self::begin_operation`] が済ませている。
+    async fn resume_locked(&self) -> Result<(), BantoError> {
         if self.inner.mirror.current().is_none() {
             return Ok(());
         }
@@ -931,7 +970,7 @@ impl HubService {
     /// キーが増えた／差し替わった可能性があるので、購読は
     /// [`Trigger::CredentialsChanged`] で**必ず張り直す**。
     pub async fn connect(&self, endpoint: &str) -> Result<HubView, BantoError> {
-        self.hydrate().await?;
+        let _operation = self.begin_operation().await?;
         let connection = self
             .inner
             .bootstrapper
@@ -951,7 +990,7 @@ impl HubService {
         endpoint: &str,
         key: String,
     ) -> Result<HubView, BantoError> {
-        self.hydrate().await?;
+        let _operation = self.begin_operation().await?;
         let connection = self
             .inner
             .bootstrapper
@@ -964,7 +1003,7 @@ impl HubService {
 
     /// タグ一覧の再取得。
     pub async fn refresh_catalog(&self) -> Result<HubView, BantoError> {
-        self.hydrate().await?;
+        let _operation = self.begin_operation().await?;
         let connection = self
             .inner
             .bootstrapper
@@ -990,7 +1029,7 @@ impl HubService {
     /// 世代を生かしたままだと `Live` のまま据え置かれ、見張りも動かないので
     /// 誰かが明示操作するまで古い値が流れ続けてしまう。
     pub async fn set_selected_tags(&self, tags: Vec<String>) -> Result<(), BantoError> {
-        self.hydrate().await?;
+        let _operation = self.begin_operation().await?;
         self.inner
             .bootstrapper
             .set_selected_tags(tags)
@@ -1023,7 +1062,7 @@ impl HubService {
     /// させない（他のインストールを巻き込まないため - crate 側の
     /// `disconnect` の doc comment参照）。
     pub async fn disconnect(&self) -> Result<HubView, BantoError> {
-        self.hydrate().await?;
+        let _operation = self.begin_operation().await?;
         self.inner
             .bootstrapper
             .disconnect()
@@ -1191,6 +1230,19 @@ impl HubService {
                 ));
             }
         }
+    }
+
+    /// 1 操作分の直列化を開始し、設定ストアから写しを hydrate する。
+    ///
+    /// **設定に触る公開操作はすべてここから始める**。返したガードが生きて
+    /// いる間だけ「hydrate → bootstrapper → flush → reconcile」が自分の
+    /// ものになる（`HubInner::operation` の doc にある握り潰しのシナリオ）。
+    /// ロック順序は 操作（外）→ 購読（内）で固定なので、ここから呼ぶ
+    /// `reconcile*` は操作ロックを取らない。
+    async fn begin_operation(&self) -> Result<AsyncMutexGuard<'_, ()>, BantoError> {
+        let guard = self.inner.operation.lock().await;
+        self.hydrate().await?;
+        Ok(guard)
     }
 
     /// 設定ストア → インメモリの写し。
@@ -2035,6 +2087,80 @@ mod tests {
         let stored: HubRecord =
             serde_json::from_str(&settings.get(KEY_HUB_RECORD).await.unwrap().unwrap()).unwrap();
         assert_eq!(stored.selected_tags, owned(&["b"]));
+    }
+
+    /// 見張りのティックがユーザー操作に割り込んでも、**保存した選択が
+    /// 黙って消えない**（#385 レビュー第5巡 A）。
+    ///
+    /// 直列化が無いと次の順序で消える: `set_selected_tags` が写しを更新
+    /// （`dirty`）→ `flush()` の前に見張りの `hydrate()` が**古い DB の値**で
+    /// 写しを置き換えて `dirty` を落とす → `flush()` は「変更なし」と見て
+    /// 何も書かずに成功を返す。
+    ///
+    /// 接続先は解釈できない綴りにしてあるので、どちらの経路も
+    /// `refresh_catalog()` が即 `Err` になりネットワークを触らない - 見たい
+    /// のは設定の読み書きの競合だけ。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_supervisor_tick_never_swallows_a_saved_selection() {
+        let (settings, hub) = service_with_keyring("https://example.test", &["a"]).await;
+
+        for round in 0..5 {
+            let saved = format!("tag{round}");
+            let writer = hub.clone();
+            let supervisor = hub.clone();
+            let tag = saved.clone();
+            // 見張りのティックと保存を本当に同時に走らせる。
+            let (result, _) = tokio::join!(
+                async move { writer.set_selected_tags(vec![tag]).await },
+                async move {
+                    let _ = supervisor.resume_inner().await;
+                }
+            );
+            result.expect("保存は成功する");
+
+            let stored: HubRecord =
+                serde_json::from_str(&settings.get(KEY_HUB_RECORD).await.unwrap().unwrap())
+                    .unwrap();
+            assert_eq!(
+                stored.selected_tags,
+                vec![saved],
+                "第{round}回: 見張りの hydrate が保存を上書きしてはいけない"
+            );
+        }
+    }
+
+    /// 直列化そのものを決定的に固定する: **ある操作が hydrate〜flush の
+    /// 途中である間、見張りのティックは進めない**。
+    ///
+    /// 上のテストは「同時に走らせても結果が壊れない」という利用者から見た
+    /// 保証だが、割り込みの窓が開くかどうかはタイミング次第で、失敗を必ず
+    /// 捕まえられるとは限らない。こちらは操作ロックを外から握ることで
+    /// 「操作の途中」を作り出し、見張りが待たされること自体を見る。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_operation_in_flight_blocks_the_supervisor_tick() {
+        let (_settings, hub) = service_with_keyring("https://example.test", &["a"]).await;
+
+        // 「誰かが hydrate〜flush の途中」の状態を作る。
+        let held = hub.inner.operation.lock().await;
+        let mut ticking = tokio::spawn({
+            let hub = hub.clone();
+            async move {
+                let _ = hub.resume_inner().await;
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut ticking)
+                .await
+                .is_err(),
+            "操作の途中は見張りが hydrate まで進めない（ここで進めると保存が消える）"
+        );
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(2), ticking)
+            .await
+            .expect("操作が終われば見張りは進む")
+            .unwrap();
     }
 
     /// 見張りは何度 `resume()` しても 1 本だけ（clone 越しでも増えない）。

@@ -352,6 +352,19 @@ export function showManualKeyEntry(
 }
 
 /**
+ * 飛行中だったポーリングの応答を今も適用してよいか（純関数）。
+ *
+ * ポーリング同士は直列化できても、**明示操作（接続・切断・一覧更新など）
+ * との競合は残る**: 接続の前に飛ばしたポーリングが `connect()` の応答より
+ * 後に着くと、新しい状態を古い状態で上書きしてしまう。明示操作の結果を
+ * 反映するたびに進める番号を送信前に覚えておき、**着いたときに番号が
+ * 変わっていたら捨てる**。
+ */
+export function isPollResultFresh(sentAtSeq: number, currentSeq: number): boolean {
+	return sentAtSeq === currentSeq;
+}
+
+/**
  * Hub の時刻（`ValuesSnapshot.t` / `ValueEntry.t`）の表示（純関数）。
  *
  * `t` は **epoch ミリ秒**（tag-server-design.md §5.3 のワイヤ形）。表示は

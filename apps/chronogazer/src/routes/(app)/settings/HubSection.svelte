@@ -37,6 +37,7 @@
 		hubSubscriptionLabel,
 		hubTimeLabel,
 		isHubAvailable,
+		isPollResultFresh,
 		refreshHubCatalog,
 		setHubSelectedTags,
 		showManualKeyEntry,
@@ -77,7 +78,15 @@
 	let hubError = $state<string | null>(null);
 	let savedNotice = $state<string | null>(null);
 
+	/**
+	 * 明示操作の結果を何回反映したか。飛行中のポーリングはこの番号を覚えて
+	 * おき、着いたときに変わっていたら自分の応答を捨てる
+	 * （`isPollResultFresh`）。
+	 */
+	let appliedSeq = 0;
+
 	function applyView(view: HubView): void {
+		appliedSeq += 1;
 		status = view.status;
 		configured = view.endpoint !== null;
 		keyName = view.keyName;
@@ -174,8 +183,11 @@
 	 * しない。恒久的な失敗は次の明示操作で出る）。
 	 */
 	async function pollSubscription(): Promise<void> {
+		const sentAt = appliedSeq;
 		try {
-			subscription = await getHubSubscription();
+			const polled = await getHubSubscription();
+			// 待っている間に明示操作の結果が入っていたら、こちらは古い。
+			if (isPollResultFresh(sentAt, appliedSeq)) subscription = polled;
 		} catch {
 			// 握りつぶす（上のコメント参照）。
 		}
