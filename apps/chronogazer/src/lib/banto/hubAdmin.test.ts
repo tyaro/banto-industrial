@@ -8,14 +8,28 @@
  * 1. **6 状態がすべて別の文言になる**（どれか 2 つが同じ表示に潰れない）。
  * 2. **`connected` の `tagCount: 0` は失敗ではない** - 「接続済み・利用
  *    可能なタグなし」という専用の文言になる。
+ *
+ * 後半（#383 段階1）は購読状態（7 状態）→ 文言のマッピング。こちらの核心は
+ * 「`stopped` は理由を必ず併記する」「`live`/`reconnecting`/`unauthorized`
+ * のような別々の事実を同じ表示に潰さない」の 2 点。
  */
 import { describe, expect, it } from 'vitest';
 import {
 	hubStatusDetail,
 	hubStatusLabel,
+	hubSubscriptionDetail,
+	hubSubscriptionLabel,
+	hubLastValueLabel,
+	hubTimeLabel,
+	hubRemainderNote,
 	hubUnreachableCauseLabel,
+	isPollGenerationCurrent,
+	isPollResultFresh,
 	needsManualKey,
-	type HubStatus
+	showManualKeyEntry,
+	type HubStatus,
+	type HubSubscription,
+	type HubSubscriptionState
 } from './hubAdmin';
 
 const ALL_STATES: HubStatus[] = [
@@ -95,5 +109,263 @@ describe('needsManualKey', () => {
 		expect(needsManualKey({ state: 'notConfigured' })).toBe(false);
 		expect(needsManualKey({ state: 'connected', tagCount: 0 })).toBe(false);
 		expect(needsManualKey({ state: 'unreachable', cause: 'transport' })).toBe(false);
+	});
+});
+
+// --- #383 段階1: 購読状態 → 画面文言 ----------------------------------------
+
+const ALL_SUBSCRIPTION_STATES: HubSubscriptionState[] = [
+	'stopped',
+	'connecting',
+	'handshaking',
+	'live',
+	'rebinding',
+	'reconnecting',
+	'unauthorized'
+];
+
+function subscription(overrides: Partial<HubSubscription> = {}): HubSubscription {
+	return {
+		state: 'live',
+		reason: null,
+		subscribedCount: 2,
+		unresolved: [],
+		unsupported: [],
+		lastError: null,
+		lastValueAt: 1000,
+		values: [],
+		...overrides
+	};
+}
+
+describe('hubSubscriptionLabel', () => {
+	it('7状態すべてに空でない文言が付く', () => {
+		for (const state of ALL_SUBSCRIPTION_STATES) {
+			expect(hubSubscriptionLabel(state).length).toBeGreaterThan(0);
+		}
+	});
+
+	it('connecting と handshaking だけが意図的に同じ文言で、他は互いに潰れない', () => {
+		expect(hubSubscriptionLabel('connecting')).toBe(hubSubscriptionLabel('handshaking'));
+		const distinct = new Set(ALL_SUBSCRIPTION_STATES.map(hubSubscriptionLabel));
+		expect(distinct.size).toBe(ALL_SUBSCRIPTION_STATES.length - 1);
+	});
+
+	it('受信中・再接続中・認証エラー・停止は別々の事実として区別される', () => {
+		expect(hubSubscriptionLabel('live')).toBe('受信中');
+		expect(hubSubscriptionLabel('reconnecting')).toBe('再接続中');
+		expect(hubSubscriptionLabel('rebinding')).toBe('再バインド中');
+		expect(hubSubscriptionLabel('unauthorized')).toBe('認証エラー');
+		expect(hubSubscriptionLabel('stopped')).toBe('停止');
+	});
+});
+
+describe('hubSubscriptionDetail', () => {
+	it('stopped のときは Rust 側の理由をそのまま併記する', () => {
+		expect(
+			hubSubscriptionDetail(
+				subscription({ state: 'stopped', reason: '購読するタグが選ばれていません。' })
+			)
+		).toBe('購読するタグが選ばれていません。');
+	});
+
+	it('理由が無い stopped でも説明を空欄にしない', () => {
+		const detail = hubSubscriptionDetail(subscription({ state: 'stopped', reason: null }));
+		expect(detail.length).toBeGreaterThan(0);
+	});
+
+	it('購読中は件数を述べ、停止の理由文言とは別物になる', () => {
+		const live = hubSubscriptionDetail(subscription({ state: 'live', subscribedCount: 3 }));
+		expect(live).toContain('3');
+		expect(live).toContain('購読しています');
+		expect(live).not.toBe(hubSubscriptionDetail(subscription({ state: 'stopped', reason: 'x' })));
+	});
+
+	it('進行中の状態では「購読しています」と言い切らない（まだ受信していない）', () => {
+		// これらの状態では `current()` が値を返さない＝実際には受信していない。
+		// 「N件のタグを購読しています」と出すと状態ラベルと矛盾する。
+		for (const state of ['connecting', 'handshaking', 'rebinding', 'reconnecting'] as const) {
+			const detail = hubSubscriptionDetail(subscription({ state, subscribedCount: 3 }));
+			expect(detail, state).not.toContain('購読しています');
+			expect(detail.length, state).toBeGreaterThan(0);
+		}
+	});
+
+	it('進行中の状態の説明は互いに潰れない', () => {
+		const details = (
+			['live', 'connecting', 'handshaking', 'rebinding', 'reconnecting'] as const
+		).map((state) => hubSubscriptionDetail(subscription({ state })));
+		// connecting と handshaking は見出しと同じく意図的に同じ説明。
+		expect(details[1]).toBe(details[2]);
+		expect(new Set(details).size).toBe(details.length - 1);
+	});
+
+	it('unauthorized は接続側と同じ導線（再発行 / キーの採用）へ誘導する', () => {
+		const detail = hubSubscriptionDetail(subscription({ state: 'unauthorized' }));
+		expect(detail).toContain('接続');
+		expect(detail).toContain('採用');
+		// 「接続設定の状態とは別」と言い切らない - ユーザーにとっては同じ
+		// 「認証が通っていない」であり、別軸なのは内部の話。
+		expect(detail).toContain('認証が通っていません');
+	});
+
+	it('未解決タグは状態に関わらず保持され、空表示に潰れない', () => {
+		// 文言側は unresolved を消さない - 表示の責務は画面だが、型として
+		// 残っていることをここで固定しておく（「タグ0件」に潰さない）。
+		const stopped = subscription({ state: 'stopped', reason: 'r', unresolved: ['a', 'b'] });
+		expect(stopped.unresolved).toEqual(['a', 'b']);
+		expect(hubSubscriptionDetail(stopped)).toBe('r');
+	});
+
+	it('stopped + lastError は、件数が残っていても「購読しています」にしない', () => {
+		// ワーカーが終端エラーで止まると世代は残る（subscribedCount > 0）まま
+		// state だけ stopped になる。ここで件数を根拠に「購読中」と言うと
+		// 状態表示（停止）と説明が矛盾する。
+		const detail = hubSubscriptionDetail(
+			subscription({
+				state: 'stopped',
+				reason: null,
+				lastError: 'unauthorized',
+				subscribedCount: 3
+			})
+		);
+		expect(detail).not.toContain('購読しています');
+		expect(detail).toContain('停止');
+		expect(detail).toContain('unauthorized');
+	});
+
+	it('stopped で reason も lastError も無ければ、単に購読していないと述べる', () => {
+		const detail = hubSubscriptionDetail(
+			subscription({ state: 'stopped', reason: null, lastError: null, subscribedCount: 0 })
+		);
+		expect(detail).toBe('購読していません。');
+	});
+
+	it('購読できない名前は未解決タグと別のバケツで保持される（理由が違うものを混ぜない）', () => {
+		const stopped = subscription({
+			state: 'stopped',
+			reason: 'r',
+			unresolved: ['gone'],
+			unsupported: ['a,b']
+		});
+		expect(stopped.unresolved).toEqual(['gone']);
+		expect(stopped.unsupported).toEqual(['a,b']);
+	});
+});
+
+describe('showManualKeyEntry', () => {
+	it('接続側が連携要求・権限不足のときは従来どおり出す', () => {
+		expect(showManualKeyEntry({ state: 'needsPairing' }, null)).toBe(true);
+		expect(showManualKeyEntry({ state: 'forbidden' }, null)).toBe(true);
+	});
+
+	it('接続は connected でも購読だけ unauthorized なら出す（直す手段を残す）', () => {
+		// catalog は読めていて WS のハンドシェイクだけが 401/403 の場合。
+		// 接続側の状態だけを見ていると手動キーの導線に到達できない。
+		expect(
+			showManualKeyEntry(
+				{ state: 'connected', tagCount: 3 },
+				subscription({ state: 'unauthorized' })
+			)
+		).toBe(true);
+	});
+
+	it('購読が正常なら接続側の状態にだけ従う', () => {
+		expect(
+			showManualKeyEntry({ state: 'connected', tagCount: 3 }, subscription({ state: 'live' }))
+		).toBe(false);
+		expect(showManualKeyEntry({ state: 'authFailed' }, subscription({ state: 'stopped' }))).toBe(
+			false
+		);
+		expect(showManualKeyEntry({ state: 'notConfigured' }, null)).toBe(false);
+	});
+});
+
+describe('hubLastValueLabel / hubTimeLabel', () => {
+	it('まだ一度も受信していないことを明示する（空欄や 0 に潰さない）', () => {
+		expect(hubLastValueLabel(null, 'stopped')).toBe('まだ受信していません');
+		expect(hubLastValueLabel(null, 'live')).toBe('まだ受信していません');
+	});
+
+	it('受信済みなら epoch ミリ秒をその端末の書式で出す', () => {
+		const epochMs = 1722758400123;
+		expect(hubLastValueLabel(epochMs, 'live')).toBe(new Date(epochMs).toLocaleString());
+		// epoch ミリ秒をそのまま数字で出さない。
+		expect(hubLastValueLabel(epochMs, 'live')).not.toBe(String(epochMs));
+	});
+
+	it('live でないときは同じ行から「今は受信していない」と分かる', () => {
+		// バックエンドは「同じ購読が止まっているだけ」なら時刻を残すので、
+		// 時刻だけを出すと受信し続けているように読めてしまう。
+		const epochMs = 1722758400123;
+		const at = new Date(epochMs).toLocaleString();
+		expect(hubLastValueLabel(epochMs, 'stopped')).toBe(`${at}（購読は停止しています）`);
+		for (const state of [
+			'connecting',
+			'handshaking',
+			'rebinding',
+			'reconnecting',
+			'unauthorized'
+		] as const) {
+			expect(hubLastValueLabel(epochMs, state), state).toBe(`${at}（現在は受信していません）`);
+		}
+	});
+
+	it('解釈できない値は握りつぶさずそのまま見せる', () => {
+		expect(hubTimeLabel(Number.NaN)).toBe('NaN');
+	});
+});
+
+describe('isPollResultFresh', () => {
+	it('明示操作が割り込んでいなければ適用する', () => {
+		expect(isPollResultFresh(3, 3)).toBe(true);
+	});
+
+	it('待っている間に明示操作の結果が入っていたら捨てる（状態を巻き戻さない）', () => {
+		// 接続の前に飛ばしたポーリングが connect() の応答より後に着く場合。
+		expect(isPollResultFresh(3, 4)).toBe(false);
+	});
+
+	it('view を返さない明示操作（選択の保存）でも番号を進めれば古い応答を捨てられる', () => {
+		// 保存は 204 で view を返さないが、設定も購読も変える明示操作。
+		// 番号を進めないと、保存中に飛んでいたポーリング応答が保存後に
+		// 受け入れられ、古いタグの値と「受信中」を表示してしまう。
+		let applied = 0;
+		const sentBeforeSave = applied;
+
+		applied += 1; // saveSelection() の beginExplicitChange()
+		expect(isPollResultFresh(sentBeforeSave, applied)).toBe(false);
+
+		applied += 1; // 保存後に取り直した購読状態の反映
+		expect(isPollResultFresh(sentBeforeSave, applied)).toBe(false);
+
+		// 反映後に送ったポーリングは当然受け入れる。
+		const sentAfterSave = applied;
+		expect(isPollResultFresh(sentAfterSave, applied)).toBe(true);
+	});
+});
+
+describe('isPollGenerationCurrent', () => {
+	it('停止を跨いでいなければ適用も予約もしてよい', () => {
+		expect(isPollGenerationCurrent(2, 2)).toBe(true);
+	});
+
+	it('停止（や停止→再開）を跨いだ応答は自分のものではない', () => {
+		// タブを隠した瞬間に飛んでいた要求が再表示後に解決する場合。ここで
+		// 次のタイマを張ると、再開後のループと二重に回り続ける。
+		expect(isPollGenerationCurrent(2, 3)).toBe(false);
+	});
+});
+
+describe('hubRemainderNote', () => {
+	it('購読できているタグがあれば「残りだけを購読している」と言う', () => {
+		expect(hubRemainderNote(2)).toContain('残りのタグだけ');
+	});
+
+	it('1件も購読していないのに「購読しています」と言わない', () => {
+		// 選んだ全部が未解決／購読不可のとき。
+		const note = hubRemainderNote(0);
+		expect(note).not.toContain('残りのタグだけを購読しています');
+		expect(note).toContain('購読していません');
 	});
 });

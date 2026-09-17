@@ -60,6 +60,49 @@ export interface HubView {
 	keyName: string | null;
 	selectedTags: string[];
 	tags: HubTag[] | null;
+	subscription: HubSubscription;
+}
+
+/** `banto_tagclient::TagClientConnectionState` の綴りそのまま。 */
+export type HubSubscriptionState =
+	'stopped' | 'connecting' | 'handshaking' | 'live' | 'rebinding' | 'reconnecting' | 'unauthorized';
+
+/** Mirrors `chronogazer_core::hub::HubValueView`. */
+export interface HubValue {
+	tag: string;
+	/** `null` は「値がまだ無い」であって 0 ではない。 */
+	v: number | null;
+	q: string;
+	t: number;
+	valueSource: string;
+}
+
+/**
+ * Mirrors `chronogazer_core::hub::HubSubscriptionView`（#383 段階1）。
+ *
+ * 接続設定の 6 状態（[`HubStatus`]）とは**別軸**: 購読が張れなくても
+ * `status` は汚れず、張れない理由は `reason` に出る。`values` が入るのは
+ * `state === 'live'` のときだけ（Live でないのに古い値を出さないという
+ * `banto-tagclient` の規約にそのまま乗る）。
+ */
+export interface HubSubscription {
+	state: HubSubscriptionState;
+	reason: string | null;
+	subscribedCount: number;
+	/**
+	 * 選んだのに Hub のタグ一覧に無かった external name（Hub から消えた／
+	 * 権限で見えない）。空表示に潰さない。
+	 */
+	unresolved: string[];
+	/**
+	 * そのままでは購読要求に載せられなかった external name（名前にカンマを
+	 * 含む・空白だけ、または他の名前と同じタグ（安定 ID）を指す重複）。
+	 * `unresolved` とは**理由も次の一手も違う**ので混ぜない。
+	 */
+	unsupported: string[];
+	lastError: string | null;
+	lastValueAt: number | null;
+	values: HubValue[];
 }
 
 export const DEMO_MODE_MESSAGE = 'デモモードでは利用できません';
@@ -164,6 +207,19 @@ export async function getHubStatus(): Promise<HubView> {
 	if (!isHubAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<HubView>('hub_status');
 	return httpJson<HubView>('/api/hub', { method: 'GET' });
+}
+
+/**
+ * `admin`-only: 購読の状態だけ（#383 段階1）。
+ *
+ * **ネットワーク（Hub への往復）を伴わない**ので、設定画面を開いている間
+ * だけポーリングしてよい。`getHubStatus()` は catalog を毎回取り直すので
+ * ポーリングには使わない。
+ */
+export async function getHubSubscription(): Promise<HubSubscription> {
+	if (!isHubAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri') return invokeCommand<HubSubscription>('hub_subscription');
+	return httpJson<HubSubscription>('/api/hub/subscription', { method: 'GET' });
 }
 
 /** `admin`-only: 接続（試運転中の Hub にのみ `read` キーを自己発行）。 */
@@ -274,7 +330,166 @@ export function hubUnreachableCauseLabel(cause: HubUnreachableCause): string {
 	}
 }
 
-/** 手動キーの入力欄を出すべき状態か（純関数）。 */
+/** 手動キーの入力欄を出すべき接続状態か（純関数）。 */
 export function needsManualKey(status: HubStatus): boolean {
 	return status.state === 'needsPairing' || status.state === 'forbidden';
+}
+
+/**
+ * 手動キーの入力欄を出すべきか（接続状態と購読状態の**両方**を見る純関数）。
+ *
+ * catalog は読めていて WS のハンドシェイクだけが 401/403 だと、接続状態は
+ * `connected` のまま購読だけ `unauthorized` になる。バックエンドでこの 2 つを
+ * 別軸にしておくのは正しい（購読の失敗で 6 状態を汚さない）が、**UI で合流
+ * させないとユーザーに直す手段が無くなる** - 接続側の状態だけを見ていると
+ * 手動キーの導線が出ないため。#383 段階1 の受入「`Unauthorized` は既存の
+ * 認証・手動キーの導線へ合流させる」はこれを指す。
+ */
+export function showManualKeyEntry(
+	status: HubStatus,
+	subscription: HubSubscription | null
+): boolean {
+	return needsManualKey(status) || subscription?.state === 'unauthorized';
+}
+
+/**
+ * 飛行中だったポーリングの応答を今も適用してよいか（純関数）。
+ *
+ * ポーリング同士は直列化できても、**明示操作（接続・切断・一覧更新など）
+ * との競合は残る**: 接続の前に飛ばしたポーリングが `connect()` の応答より
+ * 後に着くと、新しい状態を古い状態で上書きしてしまう。明示操作の結果を
+ * 反映するたびに進める番号を送信前に覚えておき、**着いたときに番号が
+ * 変わっていたら捨てる**。
+ */
+export function isPollResultFresh(sentAtSeq: number, currentSeq: number): boolean {
+	return sentAtSeq === currentSeq;
+}
+
+/**
+ * 停止・再開を跨いだポーリングの世代が今も現役か（純関数）。
+ *
+ * `isPollResultFresh` が潰すのは**明示操作との競合**、こちらが潰すのは
+ * **停止と再開の競合**: タブを隠した瞬間に飛んでいた要求が再表示後に解決
+ * すると、停止したはずのループが次のタイマを張り、`startPolling()` の新しい
+ * ループと**二重に回り続ける**。停止のたびに進む世代番号を送信時に覚えて
+ * おき、**応答の適用と次回の予約の両方**をこれで守る。
+ */
+export function isPollGenerationCurrent(sentAtGeneration: number, current: number): boolean {
+	return sentAtGeneration === current;
+}
+
+/**
+ * 未解決・購読不可の一覧に添える「残りはどうなっているか」の一文（純関数）。
+ *
+ * 1 件も購読できていないのに「残りのタグは購読しています」と言うと**嘘に
+ * なる**（選んだ全部が未解決／購読不可のとき）。件数で出し分ける。
+ */
+export function hubRemainderNote(subscribedCount: number): string {
+	return subscribedCount > 0
+		? '残りのタグだけを購読しています。'
+		: '購読できるタグが他にないため、購読していません。';
+}
+
+/**
+ * Hub の時刻（`ValuesSnapshot.t` / `ValueEntry.t`）の表示（純関数）。
+ *
+ * `t` は **epoch ミリ秒**（tag-server-design.md §5.3 のワイヤ形）。表示は
+ * 閲覧している端末のロケール・タイムゾーンに任せる（この画面には他に
+ * 揃えるべき独自の時刻書式が無く、ユーザーの環境で自然に読める形が最も
+ * 誤解が少ない）。
+ */
+export function hubTimeLabel(epochMs: number): string {
+	const at = new Date(epochMs);
+	return Number.isNaN(at.getTime()) ? String(epochMs) : at.toLocaleString();
+}
+
+/**
+ * 購読全体の最終受信時刻の表示（純関数）。
+ *
+ * **まだ一度も受信していないことを明示する** - 空欄や「0」に潰すと、
+ * 「受信していない」のか「表示できていない」のか区別が付かなくなる。
+ *
+ * バックエンドは「同じ購読が止まっているだけ」なら時刻を残す（いつまで
+ * データが来ていたかは診断に効く）。そのため **`live` でないときは、同じ行
+ * から今は受信していないと分かる**ようにする - 時刻だけを出すと、止まって
+ * いるのに受信し続けているように読めてしまう。
+ */
+export function hubLastValueLabel(lastValueAt: number | null, state: HubSubscriptionState): string {
+	if (lastValueAt === null) return 'まだ受信していません';
+	const at = hubTimeLabel(lastValueAt);
+	if (state === 'live') return at;
+	if (state === 'stopped') return `${at}（購読は停止しています）`;
+	return `${at}（現在は受信していません）`;
+}
+
+/**
+ * 購読状態の見出し（純関数 - `hubAdmin.test.ts` が固定する）。
+ *
+ * `connecting` と `handshaking` は**意図的に同じ文言**にしている（運用上は
+ * どちらも「つなぎに行っている最中」で、区別しても次の一手が変わらない）。
+ * それ以外は互いに潰さない - 特に `live` / `reconnecting` / `unauthorized`
+ * は「値が来ている／来ていない／権限の問題」という別々の事実。
+ */
+export function hubSubscriptionLabel(state: HubSubscriptionState): string {
+	switch (state) {
+		case 'live':
+			return '受信中';
+		case 'connecting':
+		case 'handshaking':
+			return '接続中';
+		case 'rebinding':
+			return '再バインド中';
+		case 'reconnecting':
+			return '再接続中';
+		case 'unauthorized':
+			return '認証エラー';
+		case 'stopped':
+			return '停止';
+	}
+}
+
+/**
+ * 購読状態の補足説明（純関数）。`stopped` のときは Rust 側が付けた
+ * `reason` をそのまま併記する（「なぜ止まっているか」を空欄にしない）。
+ *
+ * `stopped` で `reason` が無いこともある: ワーカーが終端エラーで止まると
+ * 世代は残ったまま（つまり `subscribedCount > 0`）`state = 'stopped'` +
+ * `lastError` になる。このとき件数を根拠に「購読しています」と言うと
+ * **状態表示（停止）と説明（購読中）が矛盾する**ので、`stopped` のうちは
+ * 件数を理由にしない。
+ *
+ * 同じ理由で、**「購読しています」と言い切れるのは `live` のときだけ**。
+ * `connecting`/`handshaking`/`rebinding`/`reconnecting` は値を受けていない
+ * （`values` も空）進行中の状態なので、件数に触れるときも「購読しようと
+ * しています」と、**まだ受信していないことが分かる**言い方にする。
+ */
+export function hubSubscriptionDetail(subscription: HubSubscription): string {
+	if (subscription.state === 'stopped') {
+		if (subscription.reason) return subscription.reason;
+		if (subscription.lastError) {
+			return `購読は停止しています（エラー: ${subscription.lastError}）。まもなく自動で再試行します。`;
+		}
+		return '購読していません。';
+	}
+	if (subscription.state === 'unauthorized') {
+		// タグ一覧は読めていても購読だけ拒否されることがある（WS のハンド
+		// シェイクだけが 401/403）。ユーザーにとっては接続の状態表示が何で
+		// あれ「認証が通っていない」なので、接続側の `authFailed` と同じ
+		// 導線（再接続で再発行 / 管理者発行のキーを採用）へ誘導する。
+		// 入力欄はこのブロックより上にあるので「下の欄」とは言わない。
+		return 'Hubがこのキーでの購読を拒否しました（認証が通っていません）。「接続」でキーを再発行するか、Hubの管理画面で発行したAPIキーをこの画面の入力欄から採用してください。';
+	}
+	if (subscription.state === 'live') {
+		return `${subscription.subscribedCount}件のタグを購読しています。`;
+	}
+	// ここから下はすべて「進行中でまだ受信していない」状態。
+	switch (subscription.state) {
+		case 'connecting':
+		case 'handshaking':
+			return `Hubに接続しています（${subscription.subscribedCount}件のタグを購読しようとしています）。`;
+		case 'rebinding':
+			return `タグの対応を取り直しています（${subscription.subscribedCount}件）。Hub側でタグが変更された可能性があります。`;
+		case 'reconnecting':
+			return `再接続を待っています（${subscription.subscribedCount}件のタグを購読しようとしています）。`;
+	}
 }

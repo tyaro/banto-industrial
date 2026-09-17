@@ -121,7 +121,7 @@ use tokio::sync::broadcast;
 
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::backup::{BackupInfo, BackupService, PendingRestoreInfo};
-use crate::hub::{HubService, HubView};
+use crate::hub::{HubService, HubSubscriptionView, HubView};
 use crate::settings::{AuditSettings, SettingsService};
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
 
@@ -1234,6 +1234,15 @@ async fn hub_refresh_handler(State(state): State<HubState>) -> Result<Json<HubVi
     Ok(Json(state.hub.refresh_catalog().await?))
 }
 
+/// `GET /api/hub/subscription`（`admin` 限定、#383 段階1）: 購読の状態だけ。
+///
+/// **ネットワークを叩かない**（メモリ上の `watch` を読むだけ）ので、設定
+/// 画面はこれをポーリングしてよい。`GET /api/hub` は catalog を毎回
+/// 取り直すので、ポーリングには使わない。読み取りなので監査しない。
+async fn hub_subscription_handler(State(state): State<HubState>) -> Json<HubSubscriptionView> {
+    Json(state.hub.subscription().await)
+}
+
 /// `PUT /api/hub/selected-tags`（`admin` 限定）。
 async fn hub_selected_tags_handler(
     State(state): State<HubState>,
@@ -1274,6 +1283,7 @@ fn hub_router(hub: HubService, audit: AuditLogService, auth: AuthState) -> Route
         .route("/api/hub/connect", post(hub_connect_handler))
         .route("/api/hub/adopt-key", post(hub_adopt_key_handler))
         .route("/api/hub/refresh", post(hub_refresh_handler))
+        .route("/api/hub/subscription", get(hub_subscription_handler))
         .route("/api/hub/selected-tags", put(hub_selected_tags_handler))
         .with_state(state)
         .layer(middleware::from_fn_with_state(
@@ -1847,12 +1857,45 @@ mod tests {
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
         }
 
+        // #383 段階1: 購読状態のポーリング口も同じ admin 限定。
+        for token in [&editor, &viewer] {
+            let response = router
+                .clone()
+                .oneshot(get_auth("/api/hub/subscription", token))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+
         let response = router
             .clone()
             .oneshot(get_auth("/api/hub", &admin))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// #383 段階1: 購読状態は未設定でも 200 で「停止（理由付き）」を返す。
+    /// 接続の 6 状態とは別軸なので、Hub が無くても例外にならない。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hub_subscription_is_stopped_with_a_reason_before_any_connect() {
+        let (router, admin, _editor, _viewer) = router_with_role_tokens().await;
+
+        let response = router
+            .oneshot(get_auth("/api/hub/subscription", &admin))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["state"], json!("stopped"));
+        assert_eq!(body["subscribedCount"], json!(0));
+        assert_eq!(body["unresolved"], json!([]));
+        assert_eq!(body["unsupported"], json!([]));
+        assert_eq!(body["values"], json!([]));
+        assert!(
+            body["reason"].as_str().is_some_and(|s| !s.is_empty()),
+            "停止している理由を必ず出す: {body}"
+        );
     }
 
     /// #332: 何も設定していないうちは `notConfigured`。`tags` は空配列では

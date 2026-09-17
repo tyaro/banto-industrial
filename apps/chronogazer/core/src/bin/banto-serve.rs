@@ -137,6 +137,15 @@ async fn main() {
         .await
         .expect("HubService should initialize");
 
+    // #383 段階1: 保存済みの接続と選択タグがあれば購読を張り直す。この
+    // サーバーは `UnavailableKeyStore` なので実際には keyring からキーを
+    // 取り出せず、購読状態は理由付きの「停止」になる - それでも呼ぶのは、
+    // 起動経路をデスクトップと同じ形にしておくため。**起動は止めない**。
+    {
+        let hub = hub.clone();
+        tokio::spawn(async move { hub.resume().await });
+    }
+
     let app = api_router(
         users,
         settings,

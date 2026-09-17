@@ -29,7 +29,7 @@ use chronogazer_core::audit::{AuditEntry, AuditLogEntry, AuditLogService};
 use chronogazer_core::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 use chronogazer_core::db::init_db;
 use chronogazer_core::events::event_channel;
-use chronogazer_core::hub::{HubService, HubView};
+use chronogazer_core::hub::{HubService, HubSubscriptionView, HubView};
 use chronogazer_core::rest::{api_router, audited_credential_verifier};
 use chronogazer_core::settings::{AuditSettings, AuthSettings, ServerSettings, SettingsService};
 use chronogazer_core::users::{Role, UserIdentity, UserSummary, UsersService};
@@ -1306,6 +1306,17 @@ async fn hub_connect(state: State<'_, AppState>, endpoint: String) -> Result<Hub
     Ok(view)
 }
 
+/// 購読の状態だけ（#383 段階1）。`admin` 限定。
+///
+/// **ネットワークを叩かない**（メモリ上の `watch` を読むだけ）ので、設定
+/// 画面はこれをポーリングしてよい。`hub_status` は catalog を毎回取り直す
+/// のでポーリングには使わない。
+#[tauri::command]
+async fn hub_subscription(state: State<'_, AppState>) -> Result<HubSubscriptionView, BantoError> {
+    require_role(&state, Role::Admin, "settings").await?;
+    Ok(state.hub.subscription().await)
+}
+
 /// タグ一覧の再取得。`admin` 限定。
 #[tauri::command]
 async fn hub_refresh_catalog(state: State<'_, AppState>) -> Result<HubView, BantoError> {
@@ -1609,6 +1620,16 @@ pub fn run() {
             ))
             .expect("HubService should initialize");
 
+            // #383 段階1: 保存済みの接続と選択タグがあれば、設定画面を
+            // 開かなくても購読を張り直す。Hub が落ちている・キーが無効に
+            // なっている等はここでは起動を止める理由にならないので、
+            // spawn して投げっぱなしにする（`resume` 自身が失敗を飲んで
+            // ログに出す）。
+            {
+                let hub = hub.clone();
+                tauri::async_runtime::spawn(async move { hub.resume().await });
+            }
+
             // If LAN access was left enabled on a previous run, start the
             // server immediately (spec §11.4) - from here on, the settings
             // screen only needs to *change* state via `server_apply`.
@@ -1744,6 +1765,7 @@ pub fn run() {
             backups_pending,
             backups_cancel_restore,
             hub_status,
+            hub_subscription,
             hub_connect,
             hub_refresh_catalog,
             hub_set_selected_tags,
