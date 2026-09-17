@@ -2135,6 +2135,201 @@ mod tests {
         assert_eq!(view.reason.as_deref(), Some(REASON_ALL_UNSUPPORTED));
     }
 
+    // --- #383 段階1: 実際に値を受ける経路（モック Hub） ---------------------
+
+    /// この節だけが `banto-tagclient` の内側まで含めて**実際に購読を成立
+    /// させる**。閉じたポートを使う他のテストは「世代を張ったか」しか見ない
+    /// ので、`state_watch` → `current()` → [`HubValueView`] の配線が壊れても
+    /// 気付けない。足場（catalog → WS → REST values の順に応答するモック）は
+    /// `crates/banto-tagclient` の `handle.rs` / `worker.rs` のテストと同じ
+    /// 作法で、**固定 sleep を使わず** `state_watch` の変化を待つ。
+    mod live_subscription {
+        use std::time::Duration;
+
+        use banto_tagclient::{ValueEntry, ValueQuality, ValueSource};
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        use super::*;
+
+        /// `TagClientHandle` が使う購読 ID（`banto-tagclient` の
+        /// `handle::SUBSCRIPTION_ID`）。data フレームの `id` がこれと一致して
+        /// いないと `ProtocolError` で捨てられる。
+        const SUBSCRIPTION_ID: i64 = 1;
+
+        async fn read_http_request(stream: &mut TcpStream) {
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let count = stream.read(&mut buffer).await.unwrap();
+                if count == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    return;
+                }
+            }
+        }
+
+        async fn write_response(stream: &mut TcpStream, body: String) {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+
+        /// 1 世代分だけ応答するモック Hub: catalog → WS（subscribe を待って
+        /// data フレームを 1 つ送る）→ REST values。ワーカーはこの順に叩く
+        /// （`worker::run_attempt`）。最後は socket を持ったまま待つ - 閉じると
+        /// `Reconnecting` へ落ちてしまうため。
+        async fn serve_one_generation(
+            listener: TcpListener,
+            catalog_body: String,
+            data_frame: String,
+            values_body: String,
+        ) {
+            let (mut catalog_stream, _) = listener.accept().await.unwrap();
+            read_http_request(&mut catalog_stream).await;
+            write_response(&mut catalog_stream, catalog_body).await;
+
+            let (ws_stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(ws_stream).await.unwrap();
+            let subscribe = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("subscribe が来る")
+                .unwrap()
+                .unwrap();
+            assert!(matches!(subscribe, Message::Text(_)));
+            socket.send(Message::Text(data_frame.into())).await.unwrap();
+
+            let (mut values_stream, _) = listener.accept().await.unwrap();
+            read_http_request(&mut values_stream).await;
+            write_response(&mut values_stream, values_body).await;
+
+            // テストが終わるまで WS を開けたままにする。
+            let _ = tokio::time::timeout(Duration::from_secs(20), socket.next()).await;
+        }
+
+        /// 購読が成立して値が画面の形まで届くこと。**未知の品質・出所ラベルを
+        /// 丸めない**ことと、WS で受けた新しい値が REST のスナップショットを
+        /// 上書きすることもここで固める。
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_live_subscription_carries_values_into_the_view() {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let catalog = catalog(&["alpha", "beta"]);
+
+            // REST の `/api/v1/values`。`value_source` はこちらにしか無い
+            // （WS の data フレームは tag/v/q/t だけ）ので、未知の出所は
+            // こちらに混ぜる。revision / run_id / collection_mode が catalog と
+            // 一致していないと `RevisionMismatch` で弾かれる。
+            let values = ValuesSnapshot {
+                revision: catalog.revision,
+                t: 1_000,
+                run_id: catalog.run_id,
+                collection_mode: catalog.collection_mode.clone(),
+                values: vec![
+                    ValueEntry {
+                        tag: "alpha".to_owned(),
+                        v: Some(1.0),
+                        q: ValueQuality::Good,
+                        t: 1_000,
+                        value_source: ValueSource::Real,
+                    },
+                    ValueEntry {
+                        tag: "beta".to_owned(),
+                        v: Some(2.0),
+                        q: ValueQuality::Good,
+                        t: 1_000,
+                        value_source: ValueSource::Unknown("future_source".to_owned()),
+                    },
+                ],
+            };
+            // WS の値は REST より新しい `t` にする = こちらが勝つ。未知の
+            // 品質ラベルもここで混ぜる。
+            let data_frame = format!(
+                concat!(
+                    r#"{{"op":"data","id":{},"t":2000,"#,
+                    r#""values":[{{"tag":"alpha","v":42.5,"q":"future_quality","t":2000}}]}}"#
+                ),
+                SUBSCRIPTION_ID
+            );
+
+            let server = tokio::spawn(serve_one_generation(
+                listener,
+                serde_json::to_string(&catalog).unwrap(),
+                data_frame,
+                serde_json::to_string(&values).unwrap(),
+            ));
+
+            let (_settings, hub) = service_with_keyring(&endpoint, &["alpha", "beta"]).await;
+            hub.reconcile_with(
+                &HubStatus::Connected { tag_count: 2 },
+                Some(&catalog),
+                Trigger::Observe,
+            )
+            .await;
+
+            // `state_watch` の変化を待つ（固定 sleep を使わない）。
+            let mut states = {
+                let slot = hub.inner.subscription.lock().await;
+                slot.generation.as_ref().expect("世代が立つ").states.clone()
+            };
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if states.borrow().connection_state() == TagClientConnectionState::Live {
+                        return;
+                    }
+                    states.changed().await.unwrap();
+                }
+            })
+            .await
+            .expect("Live になる");
+
+            let view = hub.subscription().await;
+            assert_eq!(view.state, "live");
+            assert_eq!(view.subscribed_count, 2);
+            assert_eq!(view.reason, None);
+            assert_eq!(view.last_error, None);
+            assert!(view.unresolved.is_empty());
+            assert!(view.unsupported.is_empty());
+
+            let mut received: Vec<&HubValueView> = view.values.iter().collect();
+            received.sort_by(|left, right| left.tag.cmp(&right.tag));
+            assert_eq!(received.len(), 2);
+
+            // WS で受けた新しい値が REST のスナップショットを上書きする。
+            assert_eq!(received[0].tag, "alpha");
+            assert_eq!(received[0].v, Some(42.5));
+            assert_eq!(received[0].t, 2_000);
+            assert_eq!(
+                received[0].q, "future_quality",
+                "知らない品質を good に丸めない"
+            );
+            assert_eq!(received[0].value_source, "real");
+
+            // 触られていない側は REST の値のまま。
+            assert_eq!(received[1].tag, "beta");
+            assert_eq!(received[1].v, Some(2.0));
+            assert_eq!(received[1].q, "good");
+            assert_eq!(
+                received[1].value_source, "future_source",
+                "知らない出所を real に丸めない"
+            );
+
+            // 最終受信時刻はスナップショットの `t`（REST と WS の新しい方）。
+            assert_eq!(view.last_value_at, Some(2_000));
+
+            // 後始末: 世代を止めてからモックを畳む。
+            hub.inner.subscription.lock().await.stop(None).await;
+            server.abort();
+        }
+    }
+
     // --- #385 レビュー対応: 世代の張り直し ----------------------------------
 
     /// 待ち受けの無いポート。`start()` 自体は成功して世代が立ち、ワーカーは

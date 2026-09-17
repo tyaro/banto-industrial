@@ -59,6 +59,13 @@ getrandom = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 tower = { workspace = true, features = ["util"] }
 tempfile = { workspace = true }
+# #383 段階1 の購読テスト専用。**chronogazer-core 自身は WS を話さない**
+# （WS を張るのは `banto-tagclient` の中で、こちらは `TagClientHandle` を
+# 持つだけ）。これは `crate::hub` のテストが**モック Hub 側**で WebSocket の
+# ハンドシェイクを受け、data フレームを 1 つ送るためだけの dev 依存で、
+# `banto-tagclient` が通常依存として使っている workspace 版と同じもの。
+# 依存ツリーには既に入っているので Cargo.lock にノードは増えない。
+tokio-tungstenite = { workspace = true }
 
 [[bin]]
 name = "banto-serve"
