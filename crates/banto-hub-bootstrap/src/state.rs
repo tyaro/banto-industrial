@@ -43,7 +43,7 @@ pub struct HubRecord {
     /// operator-facing display and for the Hub's audit trail only; never
     /// used to find a key to revoke.
     pub key_name: Option<String>,
-    /// `hub:{host}:{port}:{installation_id}` - the [`KeyStore`] account the
+    /// `hub:{host}:{port}{path}:{installation_id}` - the [`KeyStore`] account the
     /// plaintext key is filed under.
     pub keyring_account: String,
     /// Tags the operator picked in the app. Kept here (rather than in a

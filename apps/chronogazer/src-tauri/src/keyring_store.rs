@@ -15,7 +15,7 @@
 //!   same convention `keyring`'s own examples use. One `Entry` per username
 //!   means a future "switch which account autologs in" never collides with a
 //!   previously-configured one still sitting in the OS store.
-//! * `hub:{host}:{port}:{installation_id}` - the banto-hub API key
+//! * `hub:{host}:{port}{path}:{installation_id}` - the banto-hub API key
 //!   (#332, built by `banto_hub_bootstrap`). The `hub:` prefix cannot
 //!   collide with a username (`UsersService` never accepts a `:`), and
 //!   keying by host/port/installation means two Hubs, or two installations
