@@ -446,8 +446,10 @@ enum IssueResult {
 /// application for a subscription), so the two can never drift apart in how
 /// the endpoint is normalized or the key is wrapped.
 fn rest_client_for(endpoint: &str, key: &Zeroizing<String>) -> Result<RestClient> {
-    let tag_endpoint = Endpoint::new(endpoint).map_err(|_| Error::new(ErrorKind::InvalidEndpoint))?;
-    let secret = SecretApiKey::new(key.to_string()).map_err(|_| Error::new(ErrorKind::InvalidKey))?;
+    let tag_endpoint =
+        Endpoint::new(endpoint).map_err(|_| Error::new(ErrorKind::InvalidEndpoint))?;
+    let secret =
+        SecretApiKey::new(key.to_string()).map_err(|_| Error::new(ErrorKind::InvalidKey))?;
     RestClient::new(tag_endpoint, secret).map_err(|_| Error::new(ErrorKind::InvalidEndpoint))
 }
 

@@ -59,8 +59,8 @@ use banto_hub_bootstrap::{
     BootstrapState, Bootstrapper, HubConnection, HubRecord, HubStatus, KeyStore,
 };
 use banto_tagclient::{
-    BindingRequest, CatalogSnapshot, CatalogTag, Endpoint, TagClientConnectionState, TagClientHandle,
-    TagClientState, ValuesSnapshot,
+    BindingRequest, CatalogSnapshot, CatalogTag, Endpoint, TagClientConnectionState,
+    TagClientHandle, TagClientState, ValuesSnapshot,
 };
 use serde::Serialize;
 use tokio::sync::{watch, Mutex as AsyncMutex};
@@ -1162,8 +1162,11 @@ mod tests {
             .unwrap();
         hub.hydrate().await.unwrap();
 
-        hub.reconcile_with(&HubStatus::Connected { tag_count: 1 }, Some(&catalog(&["a"])))
-            .await;
+        hub.reconcile_with(
+            &HubStatus::Connected { tag_count: 1 },
+            Some(&catalog(&["a"])),
+        )
+        .await;
 
         let view = hub.subscription().await;
         assert_eq!(view.state, "stopped");
@@ -1197,8 +1200,11 @@ mod tests {
             selected_tags: owned(&["gone1", "gone2"]),
         }));
 
-        hub.reconcile_with(&HubStatus::Connected { tag_count: 1 }, Some(&catalog(&["a"])))
-            .await;
+        hub.reconcile_with(
+            &HubStatus::Connected { tag_count: 1 },
+            Some(&catalog(&["a"])),
+        )
+        .await;
 
         let view = hub.subscription().await;
         assert_eq!(view.state, "stopped");
@@ -1256,7 +1262,10 @@ mod tests {
             "lastValueAt",
             "values",
         ] {
-            assert!(subscription.get(field).is_some(), "{field} が camelCase で出る");
+            assert!(
+                subscription.get(field).is_some(),
+                "{field} が camelCase で出る"
+            );
         }
         let raw = serde_json::to_string(&view).unwrap();
         assert!(!raw.contains("\"key\""), "平文キーの欄は存在しない: {raw}");
