@@ -29,18 +29,29 @@
 //! | `CG_SMOKE_TAGS` | 空＝catalog の全タグ | 選択するタグの external name をカンマ区切りで指定 |
 //! | `CG_SMOKE_WATCH_SECS` | `20` | 値を観測し続ける秒数 |
 //! | `CG_SMOKE_HOLD_SECS` | `0` | 手順5(再起動の模擬)のあと、さらに観測を続ける秒数（オーナーが実機側でタグ削除・Hub停止・Hub再開を試す時間） |
+//! | `CG_SMOKE_REVOKE` | `0` | `1` を指定すると、手順7でこの実行が発行したAPIキーをHub側で失効させる（下記「発行したAPIキーの後始末」参照） |
 //!
 //! ## 購読状態の観測（オーナー指示 2026-09-17 追加）
 //!
-//! `state`/`reason` に加え `subscribedCount`/`unresolved`/`unsupported`/
-//! `lastValueAt` も毎回読むが、**そのいずれかが前回の観測から変わったときだけ
-//! 1行**印字する（毎ティック全部出すとうるさいため）。行頭には実行開始からの
-//! 経過秒を付け、`live` を離れる/戻る・未解決タグが新たに出る、といった
-//! 節目の行には `*` を付けて目立たせる。値の表（`tag`/`v`/`q`/`t`/
-//! `value_source`）は従来どおり5秒ごと。`CG_SMOKE_HOLD_SECS` に正の値を
-//! 入れると、手順5の直後にこの状態観測だけを指定秒数続け（オーナーが
-//! Hub側を操作する時間）、記録した遷移履歴を最後のPASS/FAIL表の直前に
-//! 時系列でまとめて出す。
+//! 変化検出の対象は `state` / `reason` / `subscribedCount` / `unresolved` /
+//! `unsupported` / `lastError` の6つ。**そのいずれかが前回の観測から
+//! 変わったときだけ1行**印字する（毎ティック全部出すとうるさいため）。
+//! 行頭には実行開始からの経過秒を付け、`live` を離れる/戻る・未解決/購読
+//! 不可のタグに新しい名前が増える、といった節目の行には `*` を付けて
+//! 目立たせる（節目は「前回に無かった名前が増えたか」の集合差分で見る -
+//! 単なる「空→非空」だけでは、既に未解決が1件ある状態でさらに別のタグが
+//! 消えたときに見落とす）。
+//!
+//! `lastValueAt` は変化検出には**使わない**（表示にだけ載る）。実機で値が
+//! 流れている間はほぼ毎ティック動くため、比較対象に入れると「変わった
+//! ときだけ1行」が崩れて実質ライブ中は全ティック出力になり、状態遷移を
+//! 追うというこの機能の目的が潰れる。値が実際に流れていることは、手順4・5
+//! の値の表・品質内訳・更新回数の方で確認する。
+//!
+//! 値の表（`tag`/`v`/`q`/`t`/`value_source`）は従来どおり5秒ごと。
+//! `CG_SMOKE_HOLD_SECS` に正の値を入れると、手順5の直後にこの状態観測
+//! だけを指定秒数続け（オーナーがHub側を操作する時間）、記録した遷移履歴を
+//! 最後のPASS/FAIL表の直前に時系列でまとめて出す。
 //!
 //! ## KeyStore はプロセス内メモリだけ（2026-09-17 Copilotレビュー対応）
 //!
@@ -56,6 +67,21 @@
 //! 再利用される」ことは従来どおり証明できる。**別プロセスをまたいだ
 //! 再利用を確かめたいなら、正しい経路は OS キーリング（＝デスクトップ
 //! アプリ）であって、平文ファイルではない。**
+//!
+//! ## 発行したAPIキーの後始末（2026-09-17 Copilotレビュー対応）
+//!
+//! `MemoryKeyStore` は実行のたびに空から始まるので、試運転中の Hub に
+//! 対して実行するたびに**新しい `read` キーが Hub 側に発行される**。
+//! [`Bootstrapper::disconnect`](banto_hub_bootstrap::Bootstrapper::disconnect)
+//! はローカルの設定を消すだけで Hub 側のキーは失効させない契約
+//! （他のインストールを巻き込まないため）なので、このハーネスを繰り返し
+//! 実行すると Hub 側に孤児キーが溜まる（実機で4本溜まったことを確認済み）。
+//!
+//! 手順7（後片付け）は毎回、発行した `key_id`/`key_name` と失効用の
+//! `curl` コマンド例を**必ず**印字する。加えて `CG_SMOKE_REVOKE=1` を
+//! 指定したときだけ、**このインストールが手順2で発行した `key_id` だけを
+//! 対象に**（名前で他のキーを探さない）失効させる。失効に失敗しても
+//! 致命扱いにせず、同じ案内を出して終わる。
 //!
 //! ## やらないこと
 //!
@@ -253,14 +279,6 @@ impl QualityTally {
         }
         parts.join(", ")
     }
-
-    /// 観測中に品質付きの値を1件でも見たか（[`HubSubscriptionView::values`]
-    /// が非空だったティックが1回でもあったか）。**live到達＝成功ではない**
-    /// ことの判定に使う - ハンドシェイクは通ったが値が一度も来ない、という
-    /// 実害（2026-09-17 実機確認）を PASS にしないため。
-    fn total(&self) -> u64 {
-        self.good + self.stale + self.bad + self.unknown.values().sum::<u64>()
-    }
 }
 
 /// [`unix_seconds_to_utc_string`] が使う、日数since-epoch -> `YYYY-MM-DD`。
@@ -316,11 +334,19 @@ fn format_last_value_at(value: Option<i64>) -> String {
 }
 
 /// [`StatusTracker`] が「変化」を判定する対象フィールドだけの写し。
-/// `lastValueAt` は毎ティック変わりうる（5秒粒度で進む）ので比較対象には
-/// 含めない - 含めると事実上ほぼ毎回「変化した」ことになり、オーナーが
-/// 求めている「うるさくしない」を満たせない。表示には別途載せる。
 ///
-/// `last_error`（[`HubSubscriptionView::last_error`]）も比較対象に含める
+/// 変化検出の対象は `state` / `reason` / `subscribed_count` / `unresolved` /
+/// `unsupported` / `last_error` の6つだけ。**`lastValueAt` は意図的に含め
+/// ない**（2026-09-17 Copilotレビューで「HOLD履歴が値の到着を示せない」と
+/// 指摘されたが、採らないと判断した - 理由: 実機で値が流れている間は
+/// `lastValueAt` がほぼ毎ティック動く（`banto-tagclient` が値を受けるたびに
+/// 進む）ため、比較対象に入れると「前回と変わったときだけ1行」という設計が
+/// 壊れて**実質ライブ中は全ティック出力**になり、このトラッカーの目的
+/// そのもの（状態遷移だけを読めるようにする）が潰れる。値が流れている
+/// ことそのものは手順4・5の値の表・品質内訳・更新回数で別途確認できる。
+/// `lastValueAt` は表示（[`StatusTracker::observe`] の出力行）にだけ載せる。
+///
+/// `last_error`（[`HubSubscriptionView::last_error`]）は比較対象に含める
 /// （2026-09-17 オーナー実機確認: `reconnecting` のまま固まる障害の原因が
 /// `BindingUnresolved` か `Transport` かの切り分けに、状態行のこの値が
 /// 決定的だった。無いとコードを読むまで分からない）。
@@ -349,6 +375,15 @@ impl StatusKey {
             last_error: view.last_error.clone(),
         }
     }
+}
+
+/// `next` に `prev` には無かった要素が1件でも増えたか（集合差分）。
+/// [`StatusTracker::observe`] の「節目」判定専用 - 空→非空という特殊ケース
+/// だけでなく、「1件ある状態でさらに別の名前が増えた」も同じ形で拾える。
+/// 要素数は選択タグ数程度（実運用でせいぜい数十件）で、ここは表示頻度も
+/// 低いので、集合を作らず単純な `contains` 探索で十分。
+fn has_new_entries(prev: &[String], next: &[String]) -> bool {
+    next.iter().any(|name| !prev.contains(name))
 }
 
 /// 手順5のあと（[`CG_SMOKE_HOLD_SECS` 相当] の保持観測フェーズ）で記録する
@@ -410,12 +445,18 @@ impl StatusTracker {
             return;
         }
         let elapsed = self.start.elapsed().as_secs_f64();
-        // 「節目」= live を離れた/live に戻った、または未解決タグが
-        // 新たに出た。初回の観測（`last` が無い）は基準点であって節目では
-        // ないので対象外。
+        // 「節目」= live を離れた/live に戻った、または未解決・購読不可の
+        // タグに新しい名前が増えた。初回の観測（`last` が無い）は基準点で
+        // あって節目ではないので対象外。
+        //
+        // 「新しい名前が増えたか」は**集合差分**で見る（2026-09-17
+        // Copilotレビュー指摘: 以前は「空→非空」だけを見ていたため、既に
+        // 未解決が1件ある状態でさらに別のタグが消えても `*` が付かず、
+        // HOLD観測の節目を見落としていた）。
         let notable = self.last.as_ref().is_some_and(|prev| {
             (prev.state == "live") != (key.state == "live")
-                || (prev.unresolved.is_empty() && !key.unresolved.is_empty())
+                || has_new_entries(&prev.unresolved, &key.unresolved)
+                || has_new_entries(&prev.unsupported, &key.unsupported)
         });
         let marker = if notable { "*" } else { " " };
         println!(
@@ -489,25 +530,40 @@ async fn wait_for_live(
 /// live 到達後、`watch_secs` 秒のあいだ観測を続け、5秒ごとに値の表を印字
 /// しつつ品質内訳と更新回数を集計する。購読状態の変化は [`StatusTracker`]
 /// が独立した頻度（変化したときだけ）で印字する。
+///
+/// 戻り値の `bool`（`received_any_value`）は
+/// [`HubValueView::v`] が `Some` の行を1件でも見たか。**`v` が `None` の
+/// 行（Hubの doc: 「値がまだ無い」であって0ではない）は品質・更新回数の
+/// 集計はしても、この「値を受信した」判定には数えない**
+/// （2026-09-17 Copilotレビュー指摘: 以前は `q`（品質）が付いた行なら
+/// `v` の有無を見ずに「受信した」扱いにしていたため、`v=None` の行だけが
+/// 並ぶ live スナップショットでも PASS になってしまっていた）。更新回数
+/// （`update_count`）も同じ理由で `v` が `Some` の行だけを数える - `t` の
+/// 変化それ自体は `v=None` のままでも起こりうるため。
 async fn observe_live(
     hub: &HubService,
     watch_secs: u64,
     tracker: &mut StatusTracker,
-) -> (QualityTally, u64) {
+) -> (QualityTally, u64, bool) {
     let start = Instant::now();
     let deadline = start + Duration::from_secs(watch_secs);
     let mut tally = QualityTally::default();
     let mut last_t: BTreeMap<String, i64> = BTreeMap::new();
     let mut update_count: u64 = 0;
+    let mut received_any_value = false;
     let mut last_table_print: Option<Instant> = None;
     while Instant::now() < deadline {
         let view: HubSubscriptionView = hub.subscription().await;
         tracker.observe(&view);
         for value in &view.values {
             tally.record(&value.q);
-            match last_t.get(value.tag.as_str()) {
-                Some(prev) if *prev != value.t => update_count += 1,
-                None | Some(_) => {}
+            if value.v.is_some() {
+                received_any_value = true;
+                if let Some(prev) = last_t.get(value.tag.as_str()) {
+                    if *prev != value.t {
+                        update_count += 1;
+                    }
+                }
             }
             last_t.insert(value.tag.clone(), value.t);
         }
@@ -524,7 +580,7 @@ async fn observe_live(
         }
         sleep(POLL_INTERVAL).await;
     }
-    (tally, update_count)
+    (tally, update_count, received_any_value)
 }
 
 /// 保持観測(HOLD)フェーズ本体。値の表・品質集計はしない
@@ -536,6 +592,53 @@ async fn hold_observe(hub: &HubService, hold_secs: u64, tracker: &mut StatusTrac
         let view = hub.subscription().await;
         tracker.observe(&view);
         sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// `curl` で手動失効するときの1行を組み立てる（実行はしない）。手順7の
+/// 案内表示・失敗時のフォールバックの両方で使う。
+fn revoke_curl_hint(hub_url: &str, key_id: i64) -> String {
+    format!(
+        "curl -X POST -H \"X-Banto-Client: banto\" {}/api/api-keys/{key_id}/revoke",
+        hub_url.trim_end_matches('/')
+    )
+}
+
+/// `POST /api/api-keys/{id}/revoke` を叩く（ベストエフォート、
+/// `CG_SMOKE_REVOKE=1` のときだけ手順7から呼ぶ）。
+///
+/// `banto-hub-bootstrap` の `AdminClient::revoke`
+/// （`crates/banto-hub-bootstrap/src/admin.rs`）と同じ経路・同じ
+/// リクエスト形だが、そちらは `pub(crate)` でこの crate の外から呼べない
+/// ため、`crates/banto-tagclient/examples/real_hub_smoke.rs` の
+/// `set_write_control` と同じ作法（直接 reqwest で管理 REST を叩く）で
+/// ここに複製する。試運転中の Hub は認証不要で、CSRFマーカー
+/// `X-Banto-Client: banto`（資格情報ではない）だけで通る
+/// （`admin.rs` のモジュール doc 参照）。
+///
+/// **必ずこのインストールが自分で発行した `key_id`（保存済みレコードの
+/// もの）にだけ使う** - 名前で他のキーを探して失効させない。これは
+/// `AdminClient::revoke` のdoc comment（「there is deliberately no "list
+/// keys and revoke the ones whose name looks like mine" path」）と同じ
+/// 規律で、こちらも他のインストール・他のツールが発行したキーを巻き込ま
+/// ないための不変条件。
+async fn revoke_api_key(hub_url: &str, key_id: i64) -> Result<(), String> {
+    let http = reqwest::ClientBuilder::new()
+        .no_proxy()
+        .build()
+        .map_err(|error| format!("reqwestクライアント構築失敗: {error}"))?;
+    let base = hub_url.trim_end_matches('/');
+    let url = format!("{base}/api/api-keys/{key_id}/revoke");
+    let response = http
+        .post(url)
+        .header("X-Banto-Client", "banto")
+        .send()
+        .await
+        .map_err(|error| format!("送信失敗: {error}"))?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("HTTPステータス={}", response.status()))
     }
 }
 
@@ -561,6 +664,11 @@ async fn main() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
+    // 既定は失効させない（Copilotレビュー指摘対応、2026-09-17: 実行のたび
+    // 新しい read キーが Hub 側に増え、disconnect は Hub 側を失効させない
+    // 契約なので孤児キーが溜まる。既定を「勝手に失効」にはせず、明示的に
+    // 選んだときだけ失効するようにする）。
+    let auto_revoke = env::var("CG_SMOKE_REVOKE").ok().as_deref() == Some("1");
 
     let smoke_dir = match env::var("CG_SMOKE_DIR") {
         Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
@@ -633,7 +741,7 @@ async fn main() {
     // == 2. 接続 ==============================================================
     println!("== 2. 接続 ==");
     let connect_view = hub1.connect(&hub_url).await;
-    let (step2_ok, catalog_tags, key_name_1, keyring_account_1) = match connect_view {
+    let (step2_ok, catalog_tags, key_name_1, keyring_account_1, key_id_1) = match connect_view {
         Ok(view) => {
             let tag_count = view.tags.as_ref().map(|t| t.len());
             println!("  状態: {}", view.status.as_str());
@@ -646,16 +754,20 @@ async fn main() {
             println!("  キー名: {}", view.key_name.as_deref().unwrap_or("-"));
             let record = read_hub_record(&settings1).await;
             let keyring_account = record.as_ref().map(|r| r.keyring_account.clone());
+            // 手順7の後始末（キー失効の案内・CG_SMOKE_REVOKE）に使う
+            // key_id。自己発行なら必ず Some、手動キー採用ならこの
+            // ハーネスは使わないので気にしなくてよい（HubRecordのdoc）。
+            let key_id = record.as_ref().and_then(|r| r.key_id);
             println!(
                 "  keyring account: {}",
                 keyring_account.as_deref().unwrap_or("-")
             );
             let ok = view.status.is_connected();
-            (ok, view.tags, view.key_name, keyring_account)
+            (ok, view.tags, view.key_name, keyring_account, key_id)
         }
         Err(err) => {
             println!("  接続に失敗しました: {err}");
-            (false, None, None, None)
+            (false, None, None, None, None)
         }
     };
     results.push(if step2_ok {
@@ -699,8 +811,16 @@ async fn main() {
         println!("  スキップ: catalogを取得できていないため選択できません。");
         step4_result = StepResult::skipped("選択と購読", "catalog未取得のためスキップ");
     } else if selected_tags.is_empty() {
-        println!("  スキップ: 選択できるタグがありません(catalogが0件、またはCG_SMOKE_TAGSが一致しません)。");
-        step4_result = StepResult::skipped("選択と購読", "選択可能なタグが0件");
+        // このブランチに来るのは requested_tags が空 かつ catalog のタグが
+        // 0件のときだけ（Copilotレビュー指摘、2026-09-17: 以前の文言は
+        // CG_SMOKE_TAGS が catalog に一致しない場合もここに来ると書いて
+        // いたが誤り）。requested_tags が空でなければ上の
+        // `Some(_) if !requested_tags.is_empty()` 分岐でそのまま
+        // selected_tags になる - catalog に無い名前を指定しても
+        // set_selected_tags は成功し、購読は試みられて「未解決」として
+        // 報告される（plan_bindings、下の観測ログの unresolved 列を参照）。
+        println!("  スキップ: catalogにタグが0件のため、選択できるタグがありません。");
+        step4_result = StepResult::skipped("選択と購読", "catalogのタグが0件");
     } else {
         println!(
             "  選択タグ({}件): {}",
@@ -717,16 +837,17 @@ async fn main() {
                     Some(elapsed) => {
                         reached_live = true;
                         println!("  live到達: {:.1}秒", elapsed.as_secs_f64());
-                        let (tally, update_count) =
+                        let (tally, update_count, received_any_value) =
                             observe_live(&hub1, watch_secs, &mut tracker).await;
                         println!("  品質内訳: {}", tally.summary());
                         println!("  値が更新された回数: {update_count}");
                         // live到達（ハンドシェイク成立）だけでは成功にしない
                         // （2026-09-17 Copilotレビュー指摘: ハンドシェイクは
                         // 通ったが値が一度も来ない、という実害を見逃した）。
-                        // 品質付きの値を1件でも受信した(tally.total()>0)か、
-                        // 更新（t の変化）を1回でも観測したことまで求める。
-                        let received_values = tally.total() > 0 || update_count >= 1;
+                        // v が Some の値を1件でも受信したか、更新
+                        // （t の変化、こちらも v=Some の行のみ）を1回でも
+                        // 観測したことまで求める（observe_liveのdoc参照）。
+                        let received_values = received_any_value || update_count >= 1;
                         if received_values {
                             step4_result = StepResult::pass(
                                 "選択と購読",
@@ -847,10 +968,11 @@ async fn main() {
                         );
                         println!("  keyring account 再利用: {account_same}");
                         println!("  平文キーの内容も同一(値は印字しない): {}", secret_same);
-                        let (tally, update_count) =
+                        let (tally, update_count, received_any_value) =
                             observe_live(&hub2, watch_secs.min(10), &mut tracker).await;
                         println!("  再起動後の品質内訳: {}", tally.summary());
                         println!("  再起動後に値が更新された回数: {update_count}");
+                        let received_values = received_any_value || update_count >= 1;
                         // status() は Hub への REST 接続状態（6状態）であって
                         // 購読の状態ではない - 一度 live になったあとで購読が
                         // 落ちていても status() は connected のままになりうる
@@ -869,12 +991,13 @@ async fn main() {
                             && account_same
                             && secret_same
                             && status_ok
-                            && subscription_still_live;
+                            && subscription_still_live
+                            && received_values;
                         results.push(if ok {
                             StepResult::pass(
                                 "再起動の模擬",
                                 format!(
-                                    "live再到達={:.1}s, key再利用=true, 観測後も購読live",
+                                    "live再到達={:.1}s, key再利用=true, 観測後も購読live, 値受信=true",
                                     elapsed.as_secs_f64()
                                 ),
                             )
@@ -882,7 +1005,7 @@ async fn main() {
                             StepResult::fail(
                                 "再起動の模擬",
                                 format!(
-                                    "key_name一致={key_name_same}, account一致={account_same}, 平文一致={secret_same}, status={:?}, 観測後の購読状態={}(live維持={subscription_still_live})",
+                                    "key_name一致={key_name_same}, account一致={account_same}, 平文一致={secret_same}, status={:?}, 観測後の購読状態={}(live維持={subscription_still_live}), 値受信={received_values}",
                                     view.as_ref().map(|v| v.status.as_str()),
                                     post_subscription.state
                                 ),
@@ -972,9 +1095,54 @@ async fn main() {
         smoke_dir.display()
     );
     println!("  手動で削除する場合は上記パスを rm -rf (PowerShellならRemove-Item -Recurse -Force) してください。");
+
+    // 発行したAPIキーの後始末（Copilotレビュー指摘、2026-09-17）:
+    // MemoryKeyStoreは実行のたびに空から始まるので、手順2で毎回新しい
+    // readキーがHub側に発行される。disconnectはHub側を失効させない契約
+    // なので、案内無しでは孤児キーが溜まり続ける。
+    let cleanup_detail = match key_id_1 {
+        Some(key_id) => {
+            let key_name_display = key_name_1.as_deref().unwrap_or("-");
+            let hint = revoke_curl_hint(&hub_url, key_id);
+            if auto_revoke {
+                println!(
+                    "  CG_SMOKE_REVOKE=1: 手順2で発行したAPIキー(id={key_id}, name={key_name_display})を失効させます..."
+                );
+                match revoke_api_key(&hub_url, key_id).await {
+                    Ok(()) => {
+                        println!("  失効しました。Hub側にはもう残りません。");
+                        format!("key_id={key_id}を失効させた")
+                    }
+                    Err(message) => {
+                        println!("  失効に失敗しました: {message}");
+                        println!("  このキーはHubに残ります。不要なら手動で失効させてください:");
+                        println!("    {hint}");
+                        format!("key_id={key_id}の失効に失敗({message})。手動失効: {hint}")
+                    }
+                }
+            } else {
+                println!("  発行したAPIキー: id={key_id}, name={key_name_display}");
+                println!(
+                    "  このキーはHubに残ります(disconnectはHub側を失効させない契約)。不要なら失効させてください:"
+                );
+                println!("    {hint}");
+                println!(
+                    "  (このハーネスに自動で失効させたい場合は CG_SMOKE_REVOKE=1 を指定して再実行してください)"
+                );
+                format!("key_id={key_id}はHubに残存。失効: {hint}")
+            }
+        }
+        None => {
+            println!("  発行済みAPIキーはありません(手順2で接続できなかった、またはロックダウン済みHub)。");
+            "発行済みキー無し".to_owned()
+        }
+    };
     results.push(StepResult::pass(
         "後片付け",
-        format!("作業ディレクトリを保持: {}", smoke_dir.display()),
+        format!(
+            "作業ディレクトリを保持: {}, {cleanup_detail}",
+            smoke_dir.display()
+        ),
     ));
     println!();
 
