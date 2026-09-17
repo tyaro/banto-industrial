@@ -365,6 +365,31 @@ export function isPollResultFresh(sentAtSeq: number, currentSeq: number): boolea
 }
 
 /**
+ * 停止・再開を跨いだポーリングの世代が今も現役か（純関数）。
+ *
+ * `isPollResultFresh` が潰すのは**明示操作との競合**、こちらが潰すのは
+ * **停止と再開の競合**: タブを隠した瞬間に飛んでいた要求が再表示後に解決
+ * すると、停止したはずのループが次のタイマを張り、`startPolling()` の新しい
+ * ループと**二重に回り続ける**。停止のたびに進む世代番号を送信時に覚えて
+ * おき、**応答の適用と次回の予約の両方**をこれで守る。
+ */
+export function isPollGenerationCurrent(sentAtGeneration: number, current: number): boolean {
+	return sentAtGeneration === current;
+}
+
+/**
+ * 未解決・購読不可の一覧に添える「残りはどうなっているか」の一文（純関数）。
+ *
+ * 1 件も購読できていないのに「残りのタグは購読しています」と言うと**嘘に
+ * なる**（選んだ全部が未解決／購読不可のとき）。件数で出し分ける。
+ */
+export function hubRemainderNote(subscribedCount: number): string {
+	return subscribedCount > 0
+		? '残りのタグだけを購読しています。'
+		: '購読できるタグが他にないため、購読していません。';
+}
+
+/**
  * Hub の時刻（`ValuesSnapshot.t` / `ValueEntry.t`）の表示（純関数）。
  *
  * `t` は **epoch ミリ秒**（tag-server-design.md §5.3 のワイヤ形）。表示は

@@ -21,7 +21,9 @@ import {
 	hubSubscriptionLabel,
 	hubLastValueLabel,
 	hubTimeLabel,
+	hubRemainderNote,
 	hubUnreachableCauseLabel,
+	isPollGenerationCurrent,
 	isPollResultFresh,
 	needsManualKey,
 	showManualKeyEntry,
@@ -304,5 +306,30 @@ describe('isPollResultFresh', () => {
 	it('待っている間に明示操作の結果が入っていたら捨てる（状態を巻き戻さない）', () => {
 		// 接続の前に飛ばしたポーリングが connect() の応答より後に着く場合。
 		expect(isPollResultFresh(3, 4)).toBe(false);
+	});
+});
+
+describe('isPollGenerationCurrent', () => {
+	it('停止を跨いでいなければ適用も予約もしてよい', () => {
+		expect(isPollGenerationCurrent(2, 2)).toBe(true);
+	});
+
+	it('停止（や停止→再開）を跨いだ応答は自分のものではない', () => {
+		// タブを隠した瞬間に飛んでいた要求が再表示後に解決する場合。ここで
+		// 次のタイマを張ると、再開後のループと二重に回り続ける。
+		expect(isPollGenerationCurrent(2, 3)).toBe(false);
+	});
+});
+
+describe('hubRemainderNote', () => {
+	it('購読できているタグがあれば「残りだけを購読している」と言う', () => {
+		expect(hubRemainderNote(2)).toContain('残りのタグだけ');
+	});
+
+	it('1件も購読していないのに「購読しています」と言わない', () => {
+		// 選んだ全部が未解決／購読不可のとき。
+		const note = hubRemainderNote(0);
+		expect(note).not.toContain('残りのタグだけを購読しています');
+		expect(note).toContain('購読していません');
 	});
 });

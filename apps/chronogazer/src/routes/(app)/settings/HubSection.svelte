@@ -31,12 +31,14 @@
 		getHubStatus,
 		getHubSubscription,
 		hubLastValueLabel,
+		hubRemainderNote,
 		hubStatusDetail,
 		hubStatusLabel,
 		hubSubscriptionDetail,
 		hubSubscriptionLabel,
 		hubTimeLabel,
 		isHubAvailable,
+		isPollGenerationCurrent,
 		isPollResultFresh,
 		refreshHubCatalog,
 		setHubSelectedTags,
@@ -174,18 +176,28 @@
 	 * 直列に読めば、着順と発行順が入れ替わらない。
 	 */
 	let pollTimer: ReturnType<typeof setTimeout> | null = null;
-	/** 回している間だけ true。予約前に見て、停止後の予約を防ぐ。 */
+	/** 回している間だけ true。二重に走り始めるのを防ぐ。 */
 	let polling = false;
+	/**
+	 * ポーリングの世代。`stopPolling()` のたびに進む。飛行中だった要求は
+	 * 送信時の世代を持ち、**応答の適用も次回の予約も**世代が現役のときしか
+	 * しない（`isPollGenerationCurrent`）。これが無いと、停止した瞬間に
+	 * 飛んでいた要求が解決したときに次のタイマを張ってしまい、再開後の
+	 * ループと二重に回り続ける。
+	 */
+	let pollGeneration = 0;
 
 	/**
 	 * 購読状態だけを読み直す。**このページを開いている間だけ**回し、失敗は
 	 * 黙って捨てる（ポーリングの一時的な失敗で操作用のエラー表示を上書き
 	 * しない。恒久的な失敗は次の明示操作で出る）。
 	 */
-	async function pollSubscription(): Promise<void> {
+	async function pollSubscription(generation: number): Promise<void> {
 		const sentAt = appliedSeq;
 		try {
 			const polled = await getHubSubscription();
+			// 停止（や停止→再開）を跨いだ応答は自分のものではない。
+			if (!isPollGenerationCurrent(generation, pollGeneration)) return;
 			// 待っている間に明示操作の結果が入っていたら、こちらは古い。
 			if (isPollResultFresh(sentAt, appliedSeq)) subscription = polled;
 		} catch {
@@ -194,13 +206,15 @@
 	}
 
 	/** 1 回読んでから次を予約する。停止されていたら予約しない。 */
-	async function pollThenSchedule(): Promise<void> {
-		await pollSubscription();
-		if (!polling) return;
-		pollTimer = setTimeout(() => void pollThenSchedule(), SUBSCRIPTION_POLL_MS);
+	async function pollThenSchedule(generation: number): Promise<void> {
+		await pollSubscription(generation);
+		if (!isPollGenerationCurrent(generation, pollGeneration)) return;
+		pollTimer = setTimeout(() => void pollThenSchedule(generation), SUBSCRIPTION_POLL_MS);
 	}
 
 	function stopPolling(): void {
+		// 世代を進める = 飛行中の要求はもう予約も適用もしない。
+		pollGeneration += 1;
 		polling = false;
 		if (pollTimer !== null) {
 			clearTimeout(pollTimer);
@@ -216,7 +230,7 @@
 	function startPolling(): void {
 		if (!available || polling) return;
 		polling = true;
-		void pollThenSchedule();
+		void pollThenSchedule(pollGeneration);
 	}
 
 	/** タブが隠れている間は止める（見ていない画面のために回し続けない）。 */
@@ -350,7 +364,9 @@
 
 				{#if subscription.unresolved.length > 0}
 					<p class="note">
-						次のタグは見つかりませんでした（Hubから消えたか、権限で見えないタグです）。残りのタグだけを購読しています。
+						次のタグは見つかりませんでした（Hubから消えたか、権限で見えないタグです）。{hubRemainderNote(
+							subscription.subscribedCount
+						)}
 					</p>
 					<ul class="hub-unresolved">
 						{#each subscription.unresolved as name (name)}
@@ -365,7 +381,9 @@
 				-->
 				{#if subscription.unsupported.length > 0}
 					<p class="note">
-						次のタグは購読できない名前です（カンマを含むなど、購読プロトコルが受け付けません）。残りのタグだけを購読しています。
+						次のタグは購読できない名前です（カンマを含むなど、購読プロトコルが受け付けません）。{hubRemainderNote(
+							subscription.subscribedCount
+						)}
 					</p>
 					<ul class="hub-unresolved">
 						{#each subscription.unsupported as name (name)}

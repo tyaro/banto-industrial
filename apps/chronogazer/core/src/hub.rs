@@ -522,6 +522,24 @@ fn is_terminal(health: GenerationHealth) -> bool {
     }
 }
 
+/// この世代は**張り直さないと直らない**か。
+///
+/// [`needs_retry`]（見張りが起こすか）と
+/// [`must_restart_despite_same_fingerprint`]（起こしたあと実際に張り直すか）
+/// は**必ず同じ答えでなければならない**。片方だけ真だと、見張りが catalog を
+/// 取り直しても同一性一致の早期 return に落ちて何もせず、ワーカーは壊れた
+/// ループのまま残る。1 つの述語を両方から使うことでその食い違いを構造的に
+/// 起こせなくしている。
+///
+/// * 終端（[`is_terminal`]）… 放っておくと復帰しない。
+/// * `Rebinding` … requests が catalog と合っていない。catalog が変わって
+///   いれば同一性も変わるので張り直されるが、変わらない原因
+///   （`RevisionMismatch` / `RuntimeMetadataMismatch`）だと同一性は同じまま
+///   なので、**ここで明示的に張り直さないと rebind ループから抜けられない**。
+fn needs_rebuild(health: GenerationHealth) -> bool {
+    is_terminal(health) || health.state == TagClientConnectionState::Rebinding
+}
+
 /// 同一性（[`Fingerprint`]）が一致しているのに、それでも張り直すべきか。
 ///
 /// 純関数にしてあるのは、ここが**値が二度と流れない状態を作らない**ための
@@ -530,27 +548,39 @@ fn is_terminal(health: GenerationHealth) -> bool {
 /// * [`Trigger::CredentialsChanged`] … `connect` / `adopt_manual_key` の後。
 ///   キーが増えた／差し替わったので、同じ接続先・同じタグでも新しいキーで
 ///   張り直さないと意味が無い。
-/// * 現世代が終端している（[`is_terminal`]）… 放っておくと復帰しない。
-///   同一性が同じでも張り直す（ダメならまた同じ終端状態になるだけ）。
-///   これが無いと、見張りが再試行しても同一性一致で no-op になり、止まった
-///   世代が居座り続ける。
+/// * 現世代が [`needs_rebuild`] … 同一性が同じでも張り直す（ダメならまた
+///   同じ状態になるだけ）。これが無いと、見張りが再試行しても同一性一致で
+///   no-op になり、壊れた世代が居座り続ける。
 fn must_restart_despite_same_fingerprint(
     trigger: Trigger,
     health: Option<GenerationHealth>,
 ) -> bool {
-    trigger == Trigger::CredentialsChanged || health.is_some_and(is_terminal)
+    trigger == Trigger::CredentialsChanged || health.is_some_and(needs_rebuild)
+}
+
+/// catalog を取り直しても変わらない「落ち着いた停止」か（世代が無いとき）。
+///
+/// 選択が空 / 選んだ名前が全部購読プロトコル非対応、のどちらも Hub 側で
+/// 何が起きても状況は変わらない（次に変わるのは**ユーザーが選び直したとき**
+/// で、それは明示操作の突き合わせが拾う）。ここで見張りを回すと 30 秒ごとに
+/// `GET /api/v1/tags` を撃ち続けるだけになる。
+///
+/// [`REASON_ALL_UNRESOLVED`] は**含めない** - Hub 側にタグが戻れば直るので
+/// 取り直す価値がある。[`REASON_NONE_SUBSCRIBABLE`]（未解決と購読不可の
+/// 混在）も未解決の分は戻り得るので同じ。キーリング不可・再取得失敗・
+/// 未確認も、環境が変われば直るので従来どおり再試行する。
+fn is_settled_without_a_generation(reason: Option<&str>) -> bool {
+    reason.is_some_and(|reason| reason == REASON_NO_TAGS || reason == REASON_ALL_UNSUPPORTED)
 }
 
 /// 見張り（[`HubService::spawn_supervisor`]）の 1 周期で再試行すべきか。
 /// 判断表はそちらの doc comment にある。純関数なのでテストで固定できる。
-fn needs_retry(health: Option<GenerationHealth>) -> bool {
+fn needs_retry(health: Option<GenerationHealth>, reason: Option<&str>) -> bool {
     match health {
-        // 世代が無い: まだ／もう張れていない。
-        None => true,
-        // 終端している（`Unauthorized` / エラーで終わった `Stopped`）:
-        // 放っておくと戻らない。
-        // `Rebinding`: requests が catalog と合っておらず再計画でしか直らない。
-        Some(health) => is_terminal(health) || health.state == TagClientConnectionState::Rebinding,
+        // 世代が無い: まだ／もう張れていない。ただし catalog を取り直しても
+        // 変わらない理由なら撃たない。
+        None => !is_settled_without_a_generation(reason),
+        Some(health) => needs_rebuild(health),
     }
 }
 
@@ -879,13 +909,21 @@ impl HubService {
     ///
     /// | 現世代 | 動くか | 理由 |
     /// | --- | --- | --- |
-    /// | 無い | ○ | まだ／もう張れていない。再計画で直る可能性がある |
+    /// | 無い（理由が「タグ未選択」「全部購読不可」以外） | ○ | まだ／もう張れていない。再計画で直る可能性がある |
+    /// | 無い（理由が「タグ未選択」「全部購読不可」） | × | catalog を取り直しても変わらない。次に変わるのはユーザーが選び直したときで、それは明示操作の突き合わせが拾う（[`is_settled_without_a_generation`]） |
     /// | `Unauthorized` | ○ | 終端状態。キーが差し替わっていれば直る（放っておくと戻らない） |
-    /// | `Stopped` | ○ | ワーカーが retryable でも rebindable でもない分類（`InvalidTagSelection` など）で**終了した**形。世代は残るので「無い」では拾えず、拾わないと永久に止まったまま。起動直後の一瞬も `Stopped` だが、次の評価は [`SUPERVISOR_INTERVAL`] 後なので、そのころには先へ進んでいるか本当に死んでいるかのどちらか |
+    /// | `Stopped` + `last_error` あり | ○ | ワーカーが retryable でも rebindable でもない分類（`InvalidTagSelection` など）で**終了した**形。世代は残るので「無い」では拾えず、拾わないと永久に止まったまま |
+    /// | `Stopped` + `last_error` 無し | × | 張った直後の初期状態（すぐ `Connecting` へ移る）。終端扱いにすると張った直後の `status()` で張り直してしまう |
     /// | `Rebinding` | ○ | requests が catalog と合っていない。**再計画でしか直らない** |
     /// | `Live` | × | 正常。触る理由が無い |
     /// | `Connecting` / `Handshaking` | × | 進行中。割り込むと無駄に張り直す |
     /// | `Reconnecting` | × | **`banto-tagclient` 側の backoff の仕事**。ここで `stop → start` すると backoff と喧嘩し、再接続を遅らせるか Hub を叩く回数を増やすだけ |
+    ///
+    /// 起こす（[`needs_retry`]）と実際に張り直す
+    /// （[`must_restart_despite_same_fingerprint`]）は同じ述語
+    /// [`needs_rebuild`] を使うので食い違わない - 片方だけ真だと、catalog を
+    /// 取り直しても同一性一致の早期 return に落ちて何もせず、壊れたワーカーが
+    /// 残る。
     ///
     /// タスクは [`Weak`] 越しに [`HubInner`] を掴むので、`HubService` の全
     /// clone が落ちれば次の周期で終わる。**`resume()` からしか起動しない**
@@ -927,7 +965,9 @@ impl HubService {
             // 画面を閉じていても最終受信時刻が進むように、判定より**前**に
             // 無条件で 1 回観測する（`observe_last_value` の doc 参照）。
             slot.observe_last_value();
-            if self.inner.mirror.current().is_none() || !needs_retry(slot.health()) {
+            if self.inner.mirror.current().is_none()
+                || !needs_retry(slot.health(), slot.reason.as_deref())
+            {
                 return;
             }
         }
@@ -1671,6 +1711,10 @@ mod tests {
             must_restart_despite_same_fingerprint(Trigger::Observe, failed(State::Stopped)),
             "エラーで終了した世代は残っていても張り直す"
         );
+        assert!(
+            must_restart_despite_same_fingerprint(Trigger::Observe, healthy(State::Rebinding)),
+            "catalog が変わらない原因の rebind ループは、起こすだけでは抜けられない"
+        );
         // それ以外は据え置き - `status()` のたびに WS を張り直さない。
         // **起動直後の `Stopped`（`last_error` 無し）を含む**: ここを終端
         // 扱いにすると、張った直後に `status()` が走っただけで張り直す。
@@ -1680,13 +1724,39 @@ mod tests {
             healthy(State::Live),
             healthy(State::Connecting),
             healthy(State::Handshaking),
-            healthy(State::Rebinding),
             healthy(State::Reconnecting),
         ] {
             assert!(!must_restart_despite_same_fingerprint(
                 Trigger::Observe,
                 health
             ));
+        }
+    }
+
+    /// **起こす（`needs_retry`）と張り直す（`must_restart_…`）は、世代が
+    /// あるとき必ず同じ答えでなければならない。** 片方だけ真だと、見張りが
+    /// catalog を取り直しても同一性一致の早期 return に落ちて何もせず、
+    /// 壊れたワーカーが残る（`Rebinding` で実際に起きていた）。
+    #[test]
+    fn waking_the_supervisor_and_actually_restarting_never_disagree() {
+        use TagClientConnectionState as State;
+
+        for state in [
+            State::Stopped,
+            State::Connecting,
+            State::Handshaking,
+            State::Live,
+            State::Rebinding,
+            State::Reconnecting,
+            State::Unauthorized,
+        ] {
+            for health in [healthy(state), failed(state)] {
+                assert_eq!(
+                    needs_retry(health, None),
+                    must_restart_despite_same_fingerprint(Trigger::Observe, health),
+                    "{state} ({health:?}) で食い違っている"
+                );
+            }
         }
     }
 
@@ -1749,13 +1819,13 @@ mod tests {
     fn the_supervisor_retries_only_states_that_cannot_recover_on_their_own() {
         use TagClientConnectionState as State;
 
-        assert!(needs_retry(None), "世代が無ければ張りに行く");
-        assert!(needs_retry(healthy(State::Unauthorized)));
+        assert!(needs_retry(None, None), "世代が無ければ張りに行く");
+        assert!(needs_retry(healthy(State::Unauthorized), None));
         assert!(
-            needs_retry(failed(State::Stopped)),
+            needs_retry(failed(State::Stopped), None),
             "エラーで終了した世代は自力で復帰しない"
         );
-        assert!(needs_retry(healthy(State::Rebinding)));
+        assert!(needs_retry(healthy(State::Rebinding), None));
         for health in [
             healthy(State::Stopped),
             healthy(State::Live),
@@ -1764,10 +1834,38 @@ mod tests {
             healthy(State::Reconnecting),
         ] {
             assert!(
-                !needs_retry(health),
+                !needs_retry(health, None),
                 "進行中・正常・張った直後には割り込まない（`Reconnecting` は tagclient 側の backoff の仕事）"
             );
         }
+    }
+
+    /// 世代が無いときは**理由で分ける**。catalog を取り直しても変わらない
+    /// 停止（タグ未選択 / 全部購読不可）で 30 秒ごとに `GET /api/v1/tags` を
+    /// 撃ち続けない。
+    #[test]
+    fn the_supervisor_does_not_poll_the_catalog_for_a_settled_stop() {
+        for reason in [REASON_NO_TAGS, REASON_ALL_UNSUPPORTED] {
+            assert!(
+                !needs_retry(None, Some(reason)),
+                "ユーザーが選び直すまで変わらない: {reason}"
+            );
+        }
+        for reason in [
+            REASON_ALL_UNRESOLVED,
+            REASON_NONE_SUBSCRIBABLE,
+            REASON_NO_KEY,
+            REASON_NOT_CONNECTED,
+            REASON_NOT_CONFIGURED,
+            REASON_NOT_STARTED,
+            REASON_SELECTION_CHANGED_REFRESH_FAILED,
+        ] {
+            assert!(
+                needs_retry(None, Some(reason)),
+                "Hub 側や環境が変われば直る: {reason}"
+            );
+        }
+        assert!(needs_retry(None, None), "理由が無ければ従来どおり再試行");
     }
 
     #[test]
