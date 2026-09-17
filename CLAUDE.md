@@ -2,6 +2,10 @@
 
 産業用データ収集・監視アプリ群（Rust workspace + SvelteKit/Tauri）。
 **docs 全体の地図・現状ひとめ・各文書の「正」は [docs/README.md](docs/README.md) を最初に参照。**
+
+**実装・検証・PR の手順は @docs/implementation-checklist.md（このファイルと一緒に自動で読み込まれる）。
+実際に踏んだ事故だけを載せた表なので、実装を委譲する前・検証する前・マージする前に当たること。
+新しい事故を踏んだら同じ PR で 1 行足す。**
 全体計画は [docs/plan.md](docs/plan.md)、タグサーバー banto-hub の設計は
 [docs/tag-server-design.md](docs/tag-server-design.md)。
 
