@@ -1,7 +1,8 @@
 # Banto クライアントの Hub 自動接続（#332）
 
 状態: **chronogazer 分のみ実装済み**（共有 crate `crates/banto-hub-bootstrap` + chronogazer の
-設定カテゴリ「Hub 接続」）。relay-wright への配線は別 PR、選んだタグをデータ源へ繋ぐ購読は別 issue。
+設定カテゴリ「Hub 接続」）。**relay-wright への配線は保留**（relay-wright 自体を 2026-09-17 の
+オーナー決定で凍結、plan.md §4b）。選んだタグをデータ源へ繋ぐ購読は #383。
 **banto-hub 側は変更ゼロ**（`apps/banto-hub/core/tests/client_bootstrap.rs` が前提を回帰固定）。
 最終更新: 2026-09-17
 
@@ -178,10 +179,12 @@ banto-hub は**未ロックダウンのまま非 loopback バインドで起動�
 ## 8. この PR に含まれないもの
 
 - **購読**（`banto_tagclient::RestClient::start` / `TagClientHandle`）。選んだタグをトレンド等の
-  データ源へ繋ぐのは別 issue。この PR は `start()` を一度も呼ばない（空の requests は
+  データ源へ繋ぐのは #383（ChronoGazer の3ドライバ構成、段階1 が Hub 経由）。この PR は `start()` を一度も呼ばない（空の requests は
   `ErrorKind::InvalidTagSelection` で拒否される、という理由もある）。
-- **relay-wright への配線**（別 PR）。crate は app 非依存なので、`KeyStore`/`BootstrapState` の
-  実装と設定カテゴリを足すだけで同じものが使える。
+- **relay-wright への配線**（**保留**）。crate は app 非依存なので、`KeyStore`/`BootstrapState` の
+  実装と設定カテゴリを足すだけで同じものが使える — が、relay-wright 自体が 2026-09-17 の
+  オーナー決定で凍結（構想の練り直し、plan.md §4b）。途中まで書いた配線はローカルブランチ
+  `feat/332-hub-bootstrap-relay-wright` に WIP として残してある（未 push・未完成）。
 - Named Pipe / 実行ファイル署名検証 / mTLS / LAN pairing / 独自 Trusted Client 認証。
 - **banto-hub 側の変更**。前提は `apps/banto-hub/core/tests/client_bootstrap.rs` が固定している
   （試運転中の status は未認証で読める / `X-Banto-Client` は必須 / 未認証で `read` キーを発行できる /

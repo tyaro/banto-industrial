@@ -4,7 +4,7 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
 1 画面で引くための地図。詳細は各文書へ辿る。
 
 状態: **地図として現行**。索引に徹し、実装状況・設計判断の本体は各文書側で管理する。
-最終更新: 2026-09-16（T19（UX-30〜48）・T20（文字列/構造体/レシピ/ビット .0〜.F）・T21（構成補助 MCP 管理面）完了、MCP 31 ツール実機検証、外部 DB 連携 S0〜S2b・S4・S5 完了、S3/S6/S7 残（MCP は 37 ツールに。追加分はローカル PostgreSQL で検証）に加え、v0.2.0-alpha.8: 書き込み受付の既定を「可」に変更し、再起動・収集操作での自動無効化を撤回（#340）、v0.2.0-alpha.9: 試運転中は構成 CRUD を収集中でも即時・無停止反映（#341）、v0.2.0-alpha.10: computed タグの catalog 公開・外部読み取り出力のシミュレーションゲート撤廃（#335）、v0.2.0-alpha.11: シミュレーションデバイスへの外部書き込みをシミュレータへ反映（#363）、v0.2.0-alpha.12: T15-3 テスト出力（test_output）機構を撤去（#362）、v0.2.0-alpha.13: PLC 到達不能中の plc_reconnected / plc_disconnected フラップを修正（#344）、
+最終更新: 2026-09-17（#332 Hub 自動接続・#383 ChronoGazer 3ドライバ構成・relay-wright 凍結を反映。以下は経緯。2026-09-16: T19（UX-30〜48）・T20（文字列/構造体/レシピ/ビット .0〜.F）・T21（構成補助 MCP 管理面）完了、MCP 31 ツール実機検証、外部 DB 連携 S0〜S2b・S4・S5 完了、S3/S6/S7 残（MCP は 37 ツールに。追加分はローカル PostgreSQL で検証）に加え、v0.2.0-alpha.8: 書き込み受付の既定を「可」に変更し、再起動・収集操作での自動無効化を撤回（#340）、v0.2.0-alpha.9: 試運転中は構成 CRUD を収集中でも即時・無停止反映（#341）、v0.2.0-alpha.10: computed タグの catalog 公開・外部読み取り出力のシミュレーションゲート撤廃（#335）、v0.2.0-alpha.11: シミュレーションデバイスへの外部書き込みをシミュレータへ反映（#363）、v0.2.0-alpha.12: T15-3 テスト出力（test_output）機構を撤去（#362）、v0.2.0-alpha.13: PLC 到達不能中の plc_reconnected / plc_disconnected フラップを修正（#344）、
 v0.2.0-alpha.14: banto-hub の設定画面をカテゴリ別ルートへ分割（#359 banto-hub 分）を反映、
 chronogazer の設定画面をカテゴリ別ルートへ分割（#359 chronogazer 分）を反映、
 relay-wright の設定画面をカテゴリ別ルートへ分割（#359 relay-wright 分、issue #359 は3アプリ分完了）を反映、
@@ -25,7 +25,7 @@ v0.2.0-alpha.20: 狭幅（≤900px）でタグ登録・タグモニタの左ツ�
 > この地図は索引に徹する。実装状況・設計判断の本体は各文書側にあり、状態の**正**は
 > 常にリンク先の `状態:` 行と各表とする（CLAUDE.md H8 の状態欄同期規約）。
 
-## 現状ひとめ（2026-09-16）
+## 現状ひとめ（2026-09-17）
 
 - **構成**: Rust workspace + SvelteKit/Tauri。アプリは **banto-hub**（タグサーバー）/ **chronogazer**
   （記録計）/ **relay-wright**。上流 `banto` は git tag / `@banto/*` を消費（Rust クレート・npm
@@ -33,7 +33,8 @@ v0.2.0-alpha.20: 狭幅（≤900px）でタグ登録・タグモニタの左ツ�
   Rust と npm は別マニフェストで独立に追従できるが、**上げるときは揃えて上げる運用**とする
   （2026-09-01、Issue #220 — npm 側だけ v1.2.0 に取り残されていたのを是正した教訓）。
 - **I 系（基盤 I0〜I6）**: 実装済み（I6 = banto-broker として抽出済み）。
-- **W 系（relay-wright）**: W5 まで実装済み（実機検証のみ残）。
+- **W 系（relay-wright）**: W5 まで実装済みだが **2026-09-17 に凍結**（構想の練り直し、オーナー決定）。
+  残っていた W5 実機検証も、#332 の Hub 自動接続配線も止める（plan.md §4b）。
 - **T 系（banto-hub、T0〜T21）**: T0〜T18-6 に加え、**T19（UX-30〜48 の UI/UX 群、S1〜S5）・T20（文字列
   read/write・構造体タグ登録＋オフセットコピー・レシピ一括書き込み・ワードデバイスのビット .0〜.F）・
   T21（構成補助 MCP＝管理面ツール）まで完了**（2026-09-06）。**残るは T18-5c/d（Windows 実機往復・
@@ -50,8 +51,15 @@ v0.2.0-alpha.20: 狭幅（≤900px）でタグ登録・タグモニタの左ツ�
   自己発行し OS キーリングへ保存する共有 crate `crates/banto-hub-bootstrap` を追加し、chronogazer に
   設定カテゴリ「Hub 接続」を新設（chronogazer はこれまで Hub に接続していなかったため新規実装）。
   **banto-hub 側は変更ゼロ**。`admin`/`write:` はコードでホワイトリスト拒否、失効は自分が発行した
-  id だけ。relay-wright への配線と、選んだタグをデータ源へ繋ぐ購読は別 PR / 別 issue。詳細は
+  id だけ。**relay-wright への配線は保留**（relay-wright は 2026-09-17 のオーナー決定で凍結、
+  plan.md §4b）。選んだタグをデータ源へ繋ぐ購読は #383。詳細は
   [banto-hub-client-bootstrap.md](banto-hub-client-bootstrap.md)。
+- **ChronoGazer の3ドライバ構成（#383、2026-09-17 オーナー決定）— 方針決定のみ、実装は未着手**:
+  ChronoGazer は単体で動く記録計として **SLMP / Modbus TCP / banto-hub 経由**の3ドライバを持つ、
+  という方針を決めた。banto-hub 側も接続ドライバが増えていく想定で前2者は機能が被るが、現場 PC
+  1 台での成立を優先して重複を許容する（plan.md §4、tag-server-design.md §7）。**現状の実装は
+  #332 の Hub 接続設定とタグ選択までで、購読も SLMP / Modbus TCP 直結も未実装**（段階は #383）。
+  **relay-wright は凍結**（構想の練り直し、plan.md §4b）。
 - **Hardening（H1〜H10）**: H1〜H6・H8・H10 完了。H9 は 2026-08-14 に完全完了。H5 は relay-wright の
   組み込みサーバーモード E2E を含め完了（2026-08-30、PR #193。Tauri 固有経路の E2E は WebDriver 課題と
   して別スコープに分離）。**残るは H7 の① 実機 soak のみ**（詳細は improvement-plan.md）。
@@ -209,7 +217,7 @@ v0.2.0-alpha.20: 狭幅（≤900px）でタグ登録・タグモニタの左ツ�
 | [plan.md](plan.md)                                                 | **全体計画の親**。I/R/W/T 系マイルストーンと依存の一覧。                                                                                                                                                                                                                                                                                                          |
 | [tag-server-design.md](tag-server-design.md)                       | **banto-hub 設計の一次ソース**。タグ空間モデル・外部 IF・書き込み安全。実装状況は §9（T 系）表が正。                                                                                                                                                                                                                                                              |
 | [banto-tagclient-design.md](banto-tagclient-design.md)             | **banto-tagclient の実装前設計**。読み取り専用SDKのREST/WS、binding、再接続、停止、テストゲートの正。                                                                                                                                                                                                                                                             |
-| [banto-hub-client-bootstrap.md](banto-hub-client-bootstrap.md)     | **Banto クライアントの Hub 自動接続（#332）の正**。試運転中の `read` キー自己発行 → OS キーリング → `banto-tagclient` への供給。共有 crate `crates/banto-hub-bootstrap` の trait 境界・発行規則・6 状態・同一 PC 限定である理由。chronogazer 分のみ実装済み（relay-wright は別 PR、購読は別 issue、Hub 側は変更ゼロ）。                                           |
+| [banto-hub-client-bootstrap.md](banto-hub-client-bootstrap.md)     | **Banto クライアントの Hub 自動接続（#332）の正**。試運転中の `read` キー自己発行 → OS キーリング → `banto-tagclient` への供給。共有 crate `crates/banto-hub-bootstrap` の trait 境界・発行規則・6 状態・同一 PC 限定である理由。chronogazer 分のみ実装済み（relay-wright は凍結で保留、購読は #383、Hub 側は変更ゼロ）。                                         |
 | [banto-rtsp-design.md](banto-rtsp-design.md)                       | RTSP 映像取り込み設計（Draft、Phase 1 実装済み・実機/配布確認待ち）。                                                                                                                                                                                                                                                                                             |
 | [banto-hub-desktop-plan.md](banto-hub-desktop-plan.md)             | **banto-hub 運転計画（T14〜T18）・UI/UX 決定台帳**。§9.3〜9.5 が T18 タグ登録 UX の受け入れの正。                                                                                                                                                                                                                                                                 |
 | [banto-hub-operations.md](banto-hub-operations.md)                 | **banto-hub 運用ガイド**（起動・ポート・API/MQTT/gRPC・サービス化・soak 手順）。現状の運用を引く入口。                                                                                                                                                                                                                                                            |
