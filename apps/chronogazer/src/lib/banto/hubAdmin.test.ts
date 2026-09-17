@@ -307,6 +307,24 @@ describe('isPollResultFresh', () => {
 		// 接続の前に飛ばしたポーリングが connect() の応答より後に着く場合。
 		expect(isPollResultFresh(3, 4)).toBe(false);
 	});
+
+	it('view を返さない明示操作（選択の保存）でも番号を進めれば古い応答を捨てられる', () => {
+		// 保存は 204 で view を返さないが、設定も購読も変える明示操作。
+		// 番号を進めないと、保存中に飛んでいたポーリング応答が保存後に
+		// 受け入れられ、古いタグの値と「受信中」を表示してしまう。
+		let applied = 0;
+		const sentBeforeSave = applied;
+
+		applied += 1; // saveSelection() の beginExplicitChange()
+		expect(isPollResultFresh(sentBeforeSave, applied)).toBe(false);
+
+		applied += 1; // 保存後に取り直した購読状態の反映
+		expect(isPollResultFresh(sentBeforeSave, applied)).toBe(false);
+
+		// 反映後に送ったポーリングは当然受け入れる。
+		const sentAfterSave = applied;
+		expect(isPollResultFresh(sentAfterSave, applied)).toBe(true);
+	});
 });
 
 describe('isPollGenerationCurrent', () => {

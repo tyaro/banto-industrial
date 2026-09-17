@@ -84,11 +84,25 @@
 	 * 明示操作の結果を何回反映したか。飛行中のポーリングはこの番号を覚えて
 	 * おき、着いたときに変わっていたら自分の応答を捨てる
 	 * （`isPollResultFresh`）。
+	 *
+	 * **`applyView` を通る操作だけが明示操作、ではない**: 選択の保存のように
+	 * view を返さない（204）操作も設定と購読を変えるので、番号を進めなければ
+	 * 保存中に飛んでいたポーリング応答が保存後に受け入れられ、古いタグの値と
+	 * 状態を表示してしまう。**view を返さない操作も
+	 * `beginExplicitChange()` で番号を進めること。**
 	 */
 	let appliedSeq = 0;
 
-	function applyView(view: HubView): void {
+	/**
+	 * 「今から画面の状態を明示的に変える」と宣言する。これ以前に飛ばした
+	 * ポーリング応答は以後受け入れられない。
+	 */
+	function beginExplicitChange(): void {
 		appliedSeq += 1;
+	}
+
+	function applyView(view: HubView): void {
+		beginExplicitChange();
 		status = view.status;
 		configured = view.endpoint !== null;
 		keyName = view.keyName;
@@ -145,8 +159,21 @@
 
 	async function saveSelection(): Promise<void> {
 		await run(async () => {
+			// 保存は view を返さない（204）が、設定も購読も変える明示操作。
+			// 保存中に飛んでいたポーリング応答を捨てるために番号を進める。
+			beginExplicitChange();
 			await setHubSelectedTags(selected);
 			savedNotice = `選択したタグ（${selected.length}件）を保存しました。`;
+			// バックエンドは保存時に古い世代を止めている。次のポーリング
+			// （最大 2 秒）まで停止済みの古い値を「受信中」として出し続けない
+			// よう、ここで取り直して反映する。読み直しの失敗は保存の失敗では
+			// ないので、保存の成功表示を消さずに捨てる（表示は次のポーリングで
+			// 追いつく）。
+			try {
+				applySubscription(await getHubSubscription());
+			} catch {
+				// 握りつぶす（上のコメント参照）。
+			}
 		});
 	}
 
@@ -186,6 +213,15 @@
 	 * ループと二重に回り続ける。
 	 */
 	let pollGeneration = 0;
+
+	/**
+	 * 明示操作として購読状態を反映する（`applyView` と同じくシーケンス番号を
+	 * 進める - 反映経路を 1 本にして番号の扱いを揃えるため）。
+	 */
+	function applySubscription(next: HubSubscription): void {
+		beginExplicitChange();
+		subscription = next;
+	}
 
 	/**
 	 * 購読状態だけを読み直す。**このページを開いている間だけ**回し、失敗は

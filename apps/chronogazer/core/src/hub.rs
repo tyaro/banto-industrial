@@ -358,6 +358,10 @@ const REASON_NONE_SUBSCRIBABLE: &str =
     "選んだタグはHubのタグ一覧に無いか、購読プロトコルが受け付けない名前のため、購読できるタグがありません。";
 const REASON_NO_KEY: &str =
     "保存済みのAPIキーを取り出せないため購読できません（デスクトップアプリから接続し直してください）。";
+/// キーは取り出せたが Hub に拒否された。[`REASON_NO_KEY`] とは原因も次の
+/// 一手も違うので混ぜない（こちらは再接続か手動キーの採用で直る）。
+const REASON_KEY_REJECTED: &str =
+    "保存済みのAPIキーがHubに拒否されたため購読できません（「接続」で再発行するか、APIキーを採用してください）。";
 /// 選択は保存できたが、直後の catalog 再取得に失敗した状態。**保存は成功
 /// している**ことと、**放っておいても見張りが張り直す**ことが伝わる文言に
 /// する（ユーザーに再操作を要求しない）。
@@ -1184,10 +1188,20 @@ impl HubService {
             slot.unresolved.clear();
             slot.unsupported.clear();
             let reason = match status {
-                HubStatus::NotConfigured => REASON_NOT_CONFIGURED,
-                _ => REASON_NOT_CONNECTED,
+                HubStatus::NotConfigured => REASON_NOT_CONFIGURED.to_owned(),
+                // `AuthFailed` は「キーが無い」と「キーが拒否された」の両方で
+                // 返る: `Bootstrapper::refresh_catalog()` はキーリングに
+                // エントリが無いと `rest_client()` に到達する前にこれを返す。
+                // 原因も次の一手も違うので、ここで分ける。`rest_client()` は
+                // keyring を読むだけで**ネットワークを叩かない**ので、この
+                // 確認で往復は増えない。
+                HubStatus::AuthFailed => match self.inner.bootstrapper.rest_client() {
+                    Ok(None) => REASON_NO_KEY.to_owned(),
+                    _ => REASON_KEY_REJECTED.to_owned(),
+                },
+                _ => REASON_NOT_CONNECTED.to_owned(),
             };
-            slot.stop(Some(reason.to_owned())).await;
+            slot.stop(Some(reason)).await;
             return;
         };
 
@@ -1973,13 +1987,58 @@ mod tests {
         .await;
         assert_eq!(hub.subscription().await.unresolved, owned(&["gone"]));
 
-        hub.reconcile_with(&HubStatus::AuthFailed, None, Trigger::Observe)
-            .await;
+        hub.reconcile_with(
+            &HubStatus::Unreachable {
+                cause: banto_hub_bootstrap::UnreachableCause::Transport,
+            },
+            None,
+            Trigger::Observe,
+        )
+        .await;
 
         let view = hub.subscription().await;
         assert_eq!(view.state, "stopped");
         assert!(view.unresolved.is_empty());
         assert_eq!(view.reason.as_deref(), Some(REASON_NOT_CONNECTED));
+    }
+
+    /// `AuthFailed` は「キーがそもそも無い」と「キーが拒否された」の両方で
+    /// 返る（`Bootstrapper::refresh_catalog()` はキーリングにエントリが
+    /// 無いと `rest_client()` に到達する前にこれを返す）。原因も次の一手も
+    /// 違うので、購読の理由では分ける。`UnavailableKeyStore` は前者なので、
+    /// 汎用の「接続できていない」ではなく「キーを取り出せない」が出る。
+    #[tokio::test]
+    async fn auth_failed_without_a_retrievable_key_says_the_key_is_missing() {
+        let (_settings, hub) = service().await;
+        hub.inner.mirror.reset(Some(HubRecord {
+            endpoint: "http://127.0.0.1:3100".to_owned(),
+            installation_id: "inst".to_owned(),
+            key_id: None,
+            key_name: None,
+            keyring_account: "hub:127.0.0.1:3100/:inst".to_owned(),
+            selected_tags: owned(&["a"]),
+        }));
+
+        hub.reconcile_with(&HubStatus::AuthFailed, None, Trigger::Observe)
+            .await;
+
+        let view = hub.subscription().await;
+        assert_eq!(view.state, "stopped");
+        assert_eq!(view.reason.as_deref(), Some(REASON_NO_KEY));
+    }
+
+    /// キーは取り出せたのに拒否された場合は、別の理由（再接続 / 手動キーの
+    /// 採用で直る）を出す。
+    #[tokio::test]
+    async fn auth_failed_with_a_stored_key_says_the_key_was_rejected() {
+        let (_settings, hub) = service_with_keyring("http://127.0.0.1:3100", &["a"]).await;
+
+        hub.reconcile_with(&HubStatus::AuthFailed, None, Trigger::Observe)
+            .await;
+
+        let view = hub.subscription().await;
+        assert_eq!(view.state, "stopped");
+        assert_eq!(view.reason.as_deref(), Some(REASON_KEY_REJECTED));
     }
 
     /// 選んだタグが全部「購読できない名前」だったときは、未解決とは**別の**
