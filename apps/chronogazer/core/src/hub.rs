@@ -964,22 +964,31 @@ impl HubService {
         // ある）。判定と再試行をこの 1 つの操作の中で続けるので、判定した
         // 状態のまま張り直せる。
         let _operation = self.inner.operation.lock().await;
-        {
-            let mut slot = self.inner.subscription.lock().await;
-            // 画面を閉じていても最終受信時刻が進むように、判定より**前**に
-            // 無条件で 1 回観測する（`observe_last_value` の doc 参照）。
-            slot.observe_last_value();
-            if self.inner.mirror.current().is_none()
-                || !needs_retry(slot.health(), slot.reason.as_deref())
-            {
-                return;
-            }
-        }
+
+        // 画面を閉じていても最終受信時刻が進むように、何をするか決める**前**に
+        // 無条件で 1 回観測する（`observe_last_value` の doc 参照）。
+        self.inner.subscription.lock().await.observe_last_value();
+
+        // **レコードの有無を判断する前に hydrate する。** 写しが空なのは
+        // 「本当に未設定」だけでなく「起動時の `hydrate()` が失敗した」
+        // （設定 DB の一時的な読み取り失敗など）ときもあり得る。写しだけを
+        // 見て諦めると、後者のときに毎周期ここで止まり**保存済みの購読が
+        // 二度と再開されない**。設定 DB はローカルの SQLite で、読むのは
+        // 30 秒に 1 回なので、毎周期 hydrate しても負担にならない。
         if let Err(err) = self.hydrate().await {
             eprintln!(
                 "banto: Hub接続設定の読み取りに失敗しました（次の周期で再試行します）: {err}"
             );
             return;
+        }
+        if self.inner.mirror.current().is_none() {
+            return;
+        }
+        {
+            let slot = self.inner.subscription.lock().await;
+            if !needs_retry(slot.health(), slot.reason.as_deref()) {
+                return;
+            }
         }
         if let Err(err) = self.resume_locked().await {
             eprintln!("banto: Hub購読の再試行に失敗しました（次の周期で再試行します）: {err}");
@@ -1774,6 +1783,63 @@ mod tests {
         }
     }
 
+    /// Hub から受けた 1 スナップショットを画面の形へ写す。**未知のラベルを
+    /// 丸めない**のが要点: `banto-tagclient` は知らない品質・値の出所を
+    /// `Unknown(raw)` として保つので、こちらもそのまま出す（知らない品質を
+    /// `good` に、知らない出所を `real` に見せない）。
+    #[test]
+    fn value_views_copy_a_snapshot_without_rounding_unknown_labels() {
+        use banto_tagclient::{ValueEntry, ValueQuality, ValueSource};
+
+        let snapshot = ValuesSnapshot {
+            revision: 3,
+            t: 1_722_758_400_123,
+            run_id: Some(7),
+            collection_mode: banto_tagclient::CollectionMode::Configured,
+            values: vec![
+                ValueEntry {
+                    tag: "line1.fast.temp01".to_owned(),
+                    v: Some(25.4),
+                    q: ValueQuality::Good,
+                    t: 1_722_758_400_100,
+                    value_source: ValueSource::Real,
+                },
+                ValueEntry {
+                    tag: "line1.fast.empty".to_owned(),
+                    v: None,
+                    q: ValueQuality::Unknown("future_quality".to_owned()),
+                    t: 1_722_758_400_110,
+                    value_source: ValueSource::Unknown("future_source".to_owned()),
+                },
+            ],
+        };
+
+        let views = value_views(&snapshot);
+        assert_eq!(views.len(), 2);
+
+        assert_eq!(views[0].tag, "line1.fast.temp01");
+        assert_eq!(views[0].v, Some(25.4));
+        assert_eq!(views[0].q, "good");
+        assert_eq!(views[0].t, 1_722_758_400_100);
+        assert_eq!(views[0].value_source, "real");
+
+        // 値が無いことは 0 ではない。
+        assert_eq!(views[1].v, None);
+        assert_eq!(
+            views[1].q, "future_quality",
+            "知らない品質を good に丸めない"
+        );
+        assert_eq!(
+            views[1].value_source, "future_source",
+            "知らない出所を real に丸めない"
+        );
+
+        // 画面へ出る JSON は camelCase（`valueSource`）。
+        let json = serde_json::to_value(&views[1]).unwrap();
+        assert_eq!(json["valueSource"], serde_json::json!("future_source"));
+        assert_eq!(json["v"], serde_json::json!(null));
+    }
+
     /// `banto-tagclient` は `Live` を離れると `current()` を捨てるので、
     /// そこから導くと**再接続・再バインドに入った瞬間に最終受信時刻が消える**。
     /// 観測できないこと（`None`）を「受けていない」と読み替えない。
@@ -2339,6 +2405,34 @@ mod tests {
         let (_settings, hub) = service().await;
         hub.supervise_once().await;
         assert_eq!(hub.subscription().await.state, "stopped");
+    }
+
+    /// **写しが空 = 未設定、とは限らない。** 起動時の `hydrate()` が失敗
+    /// （設定 DB の一時的な読み取り失敗など）しても写しは空のままなので、
+    /// 写しだけを見て諦めると毎周期ここで止まり、**保存済みの購読が二度と
+    /// 再開されない**。レコードの有無を判断する前に hydrate する。
+    #[tokio::test]
+    async fn the_supervisor_hydrates_before_concluding_there_is_no_record() {
+        let (_settings, hub) = service_with_keyring(&closed_endpoint(), &["a"]).await;
+        // 設定 DB にはレコードがあるのに写しは空 = 起動時 hydrate が失敗した形。
+        hub.inner.mirror.reset(None);
+        assert_eq!(
+            hub.subscription().await.reason.as_deref(),
+            Some(REASON_NOT_STARTED),
+            "まだ一度も突き合わせていない"
+        );
+
+        hub.supervise_once().await;
+
+        assert!(
+            hub.inner.mirror.current().is_some(),
+            "写しを見て諦めず、hydrate してから判断する"
+        );
+        assert_eq!(
+            hub.subscription().await.reason.as_deref(),
+            Some(REASON_NOT_CONNECTED),
+            "そのまま再開まで進む（接続先は到達不能なので未接続の理由になる）"
+        );
     }
 
     #[tokio::test]
