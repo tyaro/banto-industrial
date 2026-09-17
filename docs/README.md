@@ -54,10 +54,12 @@ v0.2.0-alpha.20: 狭幅（≤900px）でタグ登録・タグモニタの左ツ�
   id だけ。**relay-wright への配線は保留**（relay-wright は 2026-09-17 のオーナー決定で凍結、
   plan.md §4b）。選んだタグをデータ源へ繋ぐ購読は #383。詳細は
   [banto-hub-client-bootstrap.md](banto-hub-client-bootstrap.md)。
-- **ChronoGazer の3ドライバ構成（#383、2026-09-17 オーナー決定）**: ChronoGazer は単体で動く記録計
-  として **SLMP / Modbus TCP / banto-hub 経由**の3ドライバを持つ。banto-hub 側も接続ドライバが
-  増えていく想定で前2者は機能が被るが、現場 PC 1 台での成立を優先して重複を許容する
-  （plan.md §4、tag-server-design.md §7）。**relay-wright は凍結**（構想の練り直し、plan.md §4b）。
+- **ChronoGazer の3ドライバ構成（#383、2026-09-17 オーナー決定）— 方針決定のみ、実装は未着手**:
+  ChronoGazer は単体で動く記録計として **SLMP / Modbus TCP / banto-hub 経由**の3ドライバを持つ、
+  という方針を決めた。banto-hub 側も接続ドライバが増えていく想定で前2者は機能が被るが、現場 PC
+  1 台での成立を優先して重複を許容する（plan.md §4、tag-server-design.md §7）。**現状の実装は
+  #332 の Hub 接続設定とタグ選択までで、購読も SLMP / Modbus TCP 直結も未実装**（段階は #383）。
+  **relay-wright は凍結**（構想の練り直し、plan.md §4b）。
 - **Hardening（H1〜H10）**: H1〜H6・H8・H10 完了。H9 は 2026-08-14 に完全完了。H5 は relay-wright の
   組み込みサーバーモード E2E を含め完了（2026-08-30、PR #193。Tauri 固有経路の E2E は WebDriver 課題と
   して別スコープに分離）。**残るは H7 の① 実機 soak のみ**（詳細は improvement-plan.md）。
