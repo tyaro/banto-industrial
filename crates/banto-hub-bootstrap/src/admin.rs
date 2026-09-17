@@ -126,15 +126,36 @@ pub(crate) fn base_url(endpoint: &str) -> Result<Url> {
 }
 
 /// The [`KeyStore`](crate::KeyStore) account one Hub + one installation
-/// share: `hub:{host}:{port}:{installation_id}`.
+/// share: `hub:{host}:{port}{path}:{installation_id}`.
 ///
-/// The port is always spelled out (`port_or_known_default`) so
-/// `http://host` and `http://host:80` do not end up filed as two different
-/// Hubs.
+/// Every part of the origin that identifies a *different* Hub has to be in
+/// here, or two Hubs end up sharing one keyring entry and overwrite each
+/// other's key:
+///
+/// * the port is always spelled out (`port_or_known_default`), so
+///   `http://host` and `http://host:80` are one Hub, not two;
+/// * the **path prefix** is included, because [`base_url`] accepts one
+///   (`http://host/hub`) and two Hubs behind one reverse proxy differ only
+///   there. It comes from the normalized `Url`, so it always starts and ends
+///   with `/` (`/` for a root-mounted Hub, `/hub/` for a prefixed one) and a
+///   re-typed trailing slash cannot produce a second account.
+///
+/// `/` is left as-is rather than escaped: a keyring account is an opaque
+/// string on every backend this workspace targets (Windows Credential
+/// Manager target names routinely contain `/` - `git:https://...` is the
+/// canonical example - and secret-service attributes and the macOS keychain
+/// account are arbitrary UTF-8). Nothing ever parses this value back apart.
+///
+/// This spelling is only used for a Hub this installation has no record for
+/// yet: a saved [`HubRecord`](crate::HubRecord) carries the account its key
+/// was actually filed under, and that is what gets read (see
+/// `Bootstrapper::connect_with_scopes`), so entries written by an earlier
+/// version keep working.
 pub(crate) fn keyring_account(base: &Url, installation_id: &str) -> String {
     let host = base.host_str().unwrap_or_default();
     let port = base.port_or_known_default().unwrap_or(0);
-    format!("hub:{host}:{port}:{installation_id}")
+    let path = base.path();
+    format!("hub:{host}:{port}{path}:{installation_id}")
 }
 
 fn join(base: &Url, segments: &[&str]) -> Url {
@@ -433,11 +454,50 @@ mod tests {
     fn keyring_account_always_spells_out_the_port() {
         assert_eq!(
             keyring_account(&base_url("http://127.0.0.1:3100").unwrap(), "inst-1"),
-            "hub:127.0.0.1:3100:inst-1"
+            "hub:127.0.0.1:3100/:inst-1"
         );
         assert_eq!(
             keyring_account(&base_url("http://example.test").unwrap(), "inst-1"),
-            "hub:example.test:80:inst-1"
+            "hub:example.test:80/:inst-1"
+        );
+        // An implicit and an explicit default port are one Hub.
+        assert_eq!(
+            keyring_account(&base_url("http://example.test:80").unwrap(), "inst-1"),
+            keyring_account(&base_url("http://example.test").unwrap(), "inst-1")
+        );
+    }
+
+    #[test]
+    fn keyring_account_distinguishes_path_prefixes() {
+        let account = |url: &str| keyring_account(&base_url(url).unwrap(), "inst-1");
+
+        // Two Hubs behind one reverse proxy differ only in the prefix; they
+        // must not share one keyring entry.
+        assert_ne!(
+            account("http://example.test/hub"),
+            account("http://example.test/other")
+        );
+        assert_ne!(
+            account("http://example.test/hub"),
+            account("http://example.test")
+        );
+        assert_eq!(
+            account("http://example.test/hub"),
+            "hub:example.test:80/hub/:inst-1"
+        );
+
+        // A re-typed trailing slash is the same Hub, not a second account.
+        assert_eq!(
+            account("http://example.test/hub"),
+            account("http://example.test/hub/")
+        );
+        assert_eq!(
+            account("http://example.test/hub"),
+            account("http://example.test/hub///")
+        );
+        assert_eq!(
+            account("http://example.test"),
+            account("http://example.test/")
         );
     }
 

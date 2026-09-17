@@ -84,11 +84,11 @@ impl Bootstrapper {
     ) -> Result<HubConnection> {
         validate_issue_scopes(scopes)?;
         let admin = AdminClient::new(base_url(endpoint)?)?;
-        let account = keyring_account(admin.base(), &self.installation_id);
         // Only a record for THIS endpoint may contribute a `key_id` (see
         // `previous_for`): ids are per-Hub row ids, so carrying one across a
         // switch would revoke an unrelated key on the new Hub.
         let previous = self.previous_for(admin.base())?;
+        let account = self.account_for(admin.base(), previous.as_ref());
 
         // 1. Reuse. A stored key that still authenticates means no issue
         //    request at all.
@@ -172,14 +172,14 @@ impl Bootstrapper {
     /// crate refuses to go looking for one by name.
     pub async fn adopt_manual_key(&self, endpoint: &str, key: String) -> Result<HubConnection> {
         let admin = AdminClient::new(base_url(endpoint)?)?;
-        let account = keyring_account(admin.base(), &self.installation_id);
+        let previous = self.previous_for(admin.base())?;
+        let account = self.account_for(admin.base(), previous.as_ref());
         let key = Zeroizing::new(key);
         let connection = self.verify(&admin, endpoint, &key).await?;
         if !connection.status.is_connected() {
             return Ok(connection);
         }
         self.keys.set(&account, &key)?;
-        let previous = self.previous_for(admin.base())?;
         self.save_record(endpoint, &account, previous.as_ref(), None, None)?;
         Ok(connection)
     }
@@ -285,6 +285,22 @@ impl Bootstrapper {
     /// keyring entry if it still works, and otherwise issues a fresh key
     /// under a new name. Leaving the old key alone is the same principle as
     /// never touching another installation's key.
+    /// Which [`KeyStore`] account this Hub's key is filed under.
+    ///
+    /// A record for this same endpoint is authoritative: it names the account
+    /// the key was actually written to, which may have been spelled by an
+    /// earlier version of [`keyring_account`] (the path prefix was added
+    /// later). Honouring it means an upgrade does not orphan a working key
+    /// and silently re-issue. Only a Hub with no record yet gets the current
+    /// spelling.
+    ///
+    /// [`KeyStore`]: crate::KeyStore
+    fn account_for(&self, base: &Url, previous: Option<&HubRecord>) -> String {
+        previous
+            .map(|record| record.keyring_account.clone())
+            .unwrap_or_else(|| keyring_account(base, &self.installation_id))
+    }
+
     fn previous_for(&self, base: &Url) -> Result<Option<HubRecord>> {
         Ok(self.state.load()?.filter(|record| {
             base_url(&record.endpoint).is_ok_and(|previous_base| &previous_base == base)
@@ -705,6 +721,52 @@ mod tests {
         assert_eq!(
             record.key_id, None,
             "the id A issued was forgotten when the record moved to B"
+        );
+    }
+
+    /// The account spelling gained the path prefix after the first release,
+    /// so the record's own `keyring_account` has to win over a freshly
+    /// computed one - otherwise an upgrade orphans a working key and
+    /// silently issues a second one.
+    #[tokio::test]
+    async fn a_recorded_keyring_account_is_reused_even_when_its_spelling_is_older() {
+        let hub = MockHub::start(routes(vec![
+            (STATUS_ROUTE, vec![(200, commissioning_body(false))]),
+            (ISSUE_ROUTE, vec![(201, issued_body(1, "n", &key()))]),
+            (TAGS_ROUTE, vec![(200, catalog_body(1))]),
+        ]));
+        // The pre-#382 spelling: host and port only, no path prefix.
+        let base = base_url(&hub.endpoint()).unwrap();
+        let legacy_account = format!(
+            "hub:{}:{}:{INSTALLATION}",
+            base.host_str().unwrap(),
+            base.port_or_known_default().unwrap()
+        );
+        assert_ne!(
+            legacy_account,
+            account_for(&hub),
+            "the spelling really did change"
+        );
+
+        let keys = Arc::new(MemoryKeyStore::new());
+        keys.set(&legacy_account, &key()).unwrap();
+        let mut record = seeded_record(&hub, Some(7));
+        record.keyring_account = legacy_account.clone();
+        let state = Arc::new(MemoryState::seeded(record));
+        let bootstrapper = harness(Arc::clone(&keys), Arc::clone(&state));
+
+        let connection = bootstrapper.connect(&hub.endpoint()).await.unwrap();
+
+        assert_eq!(connection.status, HubStatus::Connected { tag_count: 1 });
+        assert_eq!(
+            hub.hit_count(ISSUE_ROUTE),
+            0,
+            "the key stored under the old account still works"
+        );
+        assert_eq!(keys.len(), 1, "no duplicate entry under the new spelling");
+        assert_eq!(
+            state.load().unwrap().unwrap().keyring_account,
+            legacy_account
         );
     }
 

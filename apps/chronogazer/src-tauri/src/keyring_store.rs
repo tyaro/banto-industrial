@@ -43,7 +43,7 @@ fn degrade(context: &str, err: keyring::Error) -> BantoError {
 
 fn entry(account: &str) -> Result<keyring::Entry, BantoError> {
     keyring::Entry::new(SERVICE_NAME, account)
-        .map_err(|err| degrade("OSキーリードへのアクセスに失敗しました", err))
+        .map_err(|err| degrade("OSキーリングへのアクセスに失敗しました", err))
 }
 
 /// Store `secret` under `account`, overwriting any existing entry.
