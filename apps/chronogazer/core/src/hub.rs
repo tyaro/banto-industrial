@@ -65,8 +65,8 @@ use banto_hub_bootstrap::{
     BootstrapState, Bootstrapper, HubConnection, HubRecord, HubStatus, KeyStore,
 };
 use banto_tagclient::{
-    BindingRequest, CatalogSnapshot, CatalogTag, Endpoint, StableTagId, TagClientConnectionState,
-    TagClientHandle, TagClientState, ValuesSnapshot,
+    BindingRequest, CatalogSnapshot, CatalogTag, Endpoint, ErrorKind as TagErrorKind, StableTagId,
+    TagClientConnectionState, TagClientHandle, TagClientState, ValuesSnapshot,
 };
 use serde::Serialize;
 use tokio::sync::{watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
@@ -543,9 +543,21 @@ struct Generation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GenerationHealth {
     state: TagClientConnectionState,
-    /// `last_error` があるか（**どの分類か**は判断に使わない - ここで見たい
-    /// のは「エラーで終わったのか、まだ／もう何も起きていないのか」だけ）。
-    failed: bool,
+    /// 直近の失敗の分類。
+    ///
+    /// **状態名だけでは足りない**（2026-09-17 実機で判明）: `banto-tagclient`
+    /// は同じ `Reconnecting` に「transport の backoff 中」と「**要求セットが
+    /// catalog と食い違ったまま**待ち続けている」の両方を載せる。後者を
+    /// 状態名だけで「backoff の担当だから放置」と扱うと、タグが 1 つ消えた
+    /// だけで購読全体が二度と戻らない。
+    last_error: Option<TagErrorKind>,
+}
+
+impl GenerationHealth {
+    /// 何らかの失敗を経験しているか。
+    fn failed(self) -> bool {
+        self.last_error.is_some()
+    }
 }
 
 /// 世代が**終端している**（自力では二度と復帰しない）状態か。
@@ -570,19 +582,50 @@ struct GenerationHealth {
 fn is_terminal(health: GenerationHealth) -> bool {
     match health.state {
         TagClientConnectionState::Unauthorized => true,
-        TagClientConnectionState::Stopped => health.failed,
+        TagClientConnectionState::Stopped => health.failed(),
         _ => false,
     }
+}
+
+/// 要求セットと catalog の食い違いが原因で、**待っても直らない**分類か。
+///
+/// `banto-tagclient` はこれらを rebindable として数回やり直すが
+/// （`worker.rs` の `plan_failure`）、**回数を使い切ると `FailurePlan::Backoff`
+/// に落ちる**。`Backoff` は `Reconnecting` + `last_error` を publish するだけ
+/// なので、以後は**古い（存在しないタグを含む）要求セットのまま**永久に
+/// 再試行し続ける。直すには catalog を読み直して**要求を作り直す**しかなく、
+/// それはアプリの仕事（`banto-tagclient` は変更しない）。
+fn needs_replan(kind: TagErrorKind) -> bool {
+    matches!(
+        kind,
+        TagErrorKind::BindingUnresolved
+            | TagErrorKind::RevisionMismatch
+            | TagErrorKind::RuntimeMetadataMismatch
+    )
+}
+
+/// `Reconnecting` のうち、**古い要求セットのまま待ち続けている**ものか。
+///
+/// `Reconnecting` を状態名だけで「`banto-tagclient` の backoff の担当」と
+/// 扱ってはいけない、という唯一の例外。transport 系（`Transport` /
+/// `ProtocolError` / `CatalogUnavailable`）の `Reconnecting` は従来どおり
+/// 放置する - あちらは待てば直るので、割り込むと backoff と喧嘩するだけ。
+fn waits_on_a_stale_request_set(health: GenerationHealth) -> bool {
+    health.state == TagClientConnectionState::Reconnecting
+        && health.last_error.is_some_and(needs_replan)
 }
 
 /// この世代は**張り直さないと直らない**か。
 ///
 /// [`needs_retry`]（見張りが起こすか）と
 /// [`must_restart_despite_same_fingerprint`]（起こしたあと実際に張り直すか）
-/// は**必ず同じ答えでなければならない**。片方だけ真だと、見張りが catalog を
-/// 取り直しても同一性一致の早期 return に落ちて何もせず、ワーカーは壊れた
-/// ループのまま残る。1 つの述語を両方から使うことでその食い違いを構造的に
-/// 起こせなくしている。
+/// が**理由もなく食い違わない**ように、1 つの述語を両方から使う。片方だけ
+/// 真だと、見張りが catalog を取り直しても同一性一致の早期 return に落ちて
+/// 何もせず、ワーカーは壊れたループのまま残る。
+///
+/// 例外は [`waits_on_a_stale_request_set`] の 1 つだけで、そちらは
+/// **意図的に非対称**（`needs_retry` にだけ足す）。理由はその関数と
+/// [`must_restart_despite_same_fingerprint`] の doc を参照。
 ///
 /// * 終端（[`is_terminal`]）… 放っておくと復帰しない。
 /// * `Rebinding` … requests が catalog と合っていない。catalog が変わって
@@ -604,6 +647,12 @@ fn needs_rebuild(health: GenerationHealth) -> bool {
 /// * 現世代が [`needs_rebuild`] … 同一性が同じでも張り直す（ダメならまた
 ///   同じ状態になるだけ）。これが無いと、見張りが再試行しても同一性一致で
 ///   no-op になり、壊れた世代が居座り続ける。
+///
+/// **[`waits_on_a_stale_request_set`] はここに足さない**（意図的な非対称）:
+/// あの状態で必要なのは catalog を読み直して**要求を作り直す**ことで、
+/// 作り直した結果が変われば同一性も変わって自然に張り直る（消えたタグが
+/// 要求から落ちる = まさに直したいケース）。catalog が変わっていないのに
+/// 張り直しても、同じ要求で同じところへ戻るだけのチャーンになる。
 fn must_restart_despite_same_fingerprint(
     trigger: Trigger,
     health: Option<GenerationHealth>,
@@ -633,7 +682,9 @@ fn needs_retry(health: Option<GenerationHealth>, reason: Option<&str>) -> bool {
         // 世代が無い: まだ／もう張れていない。ただし catalog を取り直しても
         // 変わらない理由なら撃たない。
         None => !is_settled_without_a_generation(reason),
-        Some(health) => needs_rebuild(health),
+        // 張り直しが要る状態か、`Reconnecting` でも古い要求セットのまま
+        // 待ち続けている状態（再計画でしか直らない）。
+        Some(health) => needs_rebuild(health) || waits_on_a_stale_request_set(health),
     }
 }
 
@@ -754,7 +805,7 @@ impl Subscription {
             let state = generation.states.borrow();
             GenerationHealth {
                 state: state.connection_state(),
-                failed: state.last_error().is_some(),
+                last_error: state.last_error(),
             }
         })
     }
@@ -983,13 +1034,16 @@ impl HubService {
     /// | `Rebinding` | ○ | requests が catalog と合っていない。**再計画でしか直らない** |
     /// | `Live` | × | 正常。触る理由が無い |
     /// | `Connecting` / `Handshaking` | × | 進行中。割り込むと無駄に張り直す |
-    /// | `Reconnecting` | × | **`banto-tagclient` 側の backoff の仕事**。ここで `stop → start` すると backoff と喧嘩し、再接続を遅らせるか Hub を叩く回数を増やすだけ |
+    /// | `Reconnecting`（`last_error` が `BindingUnresolved` / `RevisionMismatch` / `RuntimeMetadataMismatch`） | ○ | **一律放置ではない**。`banto-tagclient` は再バインドの回数を使い切ると `Backoff`（= `Reconnecting`）へ落ち、**古い要求セットのまま**永久に再試行する。catalog を読み直して要求を作り直すしかない（2026-09-17 実機: 選択中のタグを 1 つ消したら購読全体が戻らなくなった） |
+    /// | `Reconnecting`（transport 系） | × | **`banto-tagclient` 側の backoff の仕事**。ここで `stop → start` すると backoff と喧嘩し、再接続を遅らせるか Hub を叩く回数を増やすだけ |
     ///
     /// 起こす（[`needs_retry`]）と実際に張り直す
     /// （[`must_restart_despite_same_fingerprint`]）は同じ述語
-    /// [`needs_rebuild`] を使うので食い違わない - 片方だけ真だと、catalog を
-    /// 取り直しても同一性一致の早期 return に落ちて何もせず、壊れたワーカーが
-    /// 残る。
+    /// [`needs_rebuild`] を使うので、理由もなく食い違うことはない - 片方だけ
+    /// 真だと、catalog を取り直しても同一性一致の早期 return に落ちて何も
+    /// せず、壊れたワーカーが残る。**例外は
+    /// [`waits_on_a_stale_request_set`] の 1 つだけ**で、そこは起こすだけ
+    /// （張り直しは要求が実際に変わったときに同一性の比較が判断する）。
     ///
     /// タスクは [`Weak`] 越しに [`HubInner`] を掴むので、`HubService` の全
     /// clone が落ちれば次の周期で終わる。**`resume()` からしか起動しない**
@@ -1803,14 +1857,20 @@ mod tests {
     fn healthy(state: TagClientConnectionState) -> Option<GenerationHealth> {
         Some(GenerationHealth {
             state,
-            failed: false,
+            last_error: None,
         })
     }
 
+    /// 失敗を経験している世代。分類まで問わない場面では transport（待てば
+    /// 直る側）を使う。
     fn failed(state: TagClientConnectionState) -> Option<GenerationHealth> {
+        failing(state, TagErrorKind::Transport)
+    }
+
+    fn failing(state: TagClientConnectionState, kind: TagErrorKind) -> Option<GenerationHealth> {
         Some(GenerationHealth {
             state,
-            failed: true,
+            last_error: Some(kind),
         })
     }
 
@@ -1859,12 +1919,16 @@ mod tests {
         }
     }
 
-    /// **起こす（`needs_retry`）と張り直す（`must_restart_…`）は、世代が
-    /// あるとき必ず同じ答えでなければならない。** 片方だけ真だと、見張りが
-    /// catalog を取り直しても同一性一致の早期 return に落ちて何もせず、
-    /// 壊れたワーカーが残る（`Rebinding` で実際に起きていた）。
+    /// **起こす（`needs_retry`）と張り直す（`must_restart_…`）が食い違って
+    /// よいのは、意図的な 1 つの例外だけ。** 片方だけ真だと、見張りが catalog
+    /// を取り直しても同一性一致の早期 return に落ちて何もせず、壊れたワーカーが
+    /// 残る（`Rebinding` で実際に起きていた）。
+    ///
+    /// 唯一の例外が `waits_on_a_stale_request_set`: あれは**要求を作り直す**
+    /// ために起こすので、作り直した結果が同じなら張り直さないのが正しい
+    /// （catalog が変わっていれば同一性が変わって自然に張り直る）。
     #[test]
-    fn waking_the_supervisor_and_actually_restarting_never_disagree() {
+    fn waking_the_supervisor_and_actually_restarting_agree_except_for_replanning() {
         use TagClientConnectionState as State;
 
         for state in [
@@ -1876,11 +1940,26 @@ mod tests {
             State::Reconnecting,
             State::Unauthorized,
         ] {
-            for health in [healthy(state), failed(state)] {
+            let mut cases = vec![healthy(state)];
+            for kind in [
+                TagErrorKind::Transport,
+                TagErrorKind::ProtocolError,
+                TagErrorKind::CatalogUnavailable,
+                TagErrorKind::BindingUnresolved,
+                TagErrorKind::RevisionMismatch,
+                TagErrorKind::RuntimeMetadataMismatch,
+                TagErrorKind::Unauthorized,
+                TagErrorKind::InvalidTagSelection,
+            ] {
+                cases.push(failing(state, kind));
+            }
+            for health in cases {
+                let restart = must_restart_despite_same_fingerprint(Trigger::Observe, health);
+                let stale = health.is_some_and(waits_on_a_stale_request_set);
                 assert_eq!(
                     needs_retry(health, None),
-                    must_restart_despite_same_fingerprint(Trigger::Observe, health),
-                    "{state} ({health:?}) で食い違っている"
+                    restart || stale,
+                    "{state} ({health:?}) で説明の付かない食い違いがある"
                 );
             }
         }
@@ -2112,8 +2191,50 @@ mod tests {
         ] {
             assert!(
                 !needs_retry(health, None),
-                "進行中・正常・張った直後には割り込まない（`Reconnecting` は tagclient 側の backoff の仕事）"
+                "進行中・正常・張った直後には割り込まない"
             );
+        }
+    }
+
+    /// **`Reconnecting` は一律放置ではない**（2026-09-17 実機で判明）。
+    ///
+    /// `banto-tagclient` は再バインドの回数を使い切ると `Backoff`（=
+    /// `Reconnecting`）へ落ち、**古い要求セットのまま**永久に再試行する。
+    /// 選択中のタグを 1 つ消すとこれに入り、残りのタグまで流れなくなる。
+    /// 状態名が同じでも**分類で分ける**。
+    #[test]
+    fn a_reconnecting_generation_is_replanned_only_for_a_stale_request_set() {
+        use TagClientConnectionState as State;
+
+        // 要求セットと catalog の食い違い = 待っても直らない。再計画する。
+        for kind in [
+            TagErrorKind::BindingUnresolved,
+            TagErrorKind::RevisionMismatch,
+            TagErrorKind::RuntimeMetadataMismatch,
+        ] {
+            assert!(
+                needs_retry(failing(State::Reconnecting, kind), None),
+                "{} は再計画でしか直らない",
+                kind.as_str()
+            );
+        }
+        // 通信系 = 待てば直る。`banto-tagclient` の backoff に任せる。
+        for kind in [
+            TagErrorKind::Transport,
+            TagErrorKind::ProtocolError,
+            TagErrorKind::CatalogUnavailable,
+        ] {
+            assert!(
+                !needs_retry(failing(State::Reconnecting, kind), None),
+                "{} は backoff の担当。割り込むと再接続を遅らせるだけ",
+                kind.as_str()
+            );
+        }
+        // 進行中の他の状態は分類を問わず放置（そちらは前に進んでいる）。
+        for state in [State::Connecting, State::Handshaking, State::Live] {
+            for kind in [TagErrorKind::BindingUnresolved, TagErrorKind::Transport] {
+                assert!(!needs_retry(failing(state, kind), None), "{state}");
+            }
         }
     }
 
@@ -2337,10 +2458,11 @@ mod tests {
     /// この節だけが `banto-tagclient` の内側まで含めて**実際に購読を成立
     /// させる**。閉じたポートを使う他のテストは「世代を張ったか」しか見ない
     /// ので、`state_watch` → `current()` → [`HubValueView`] の配線が壊れても
-    /// 気付けない。足場（catalog → WS → REST values の順に応答するモック）は
+    /// 気付けない。足場（catalog / WS / REST values に応答するモック）は
     /// `crates/banto-tagclient` の `handle.rs` / `worker.rs` のテストと同じ
     /// 作法で、**固定 sleep を使わず** `state_watch` の変化を待つ。
     mod live_subscription {
+        use std::sync::Mutex as StdMutex;
         use std::time::Duration;
 
         use banto_tagclient::{ValueEntry, ValueQuality, ValueSource};
@@ -2356,11 +2478,28 @@ mod tests {
         /// いないと `ProtocolError` で捨てられる。
         const SUBSCRIPTION_ID: i64 = 1;
 
+        /// モック Hub が返すもの。テストの途中で差し替えられる（タグが Hub
+        /// から消える場面を作るため）。
+        #[derive(Default)]
+        struct MockHub {
+            catalog: StdMutex<String>,
+            values: StdMutex<String>,
+            frame: StdMutex<String>,
+        }
+
+        impl MockHub {
+            fn set(&self, catalog: &CatalogSnapshot, values: &ValuesSnapshot, frame: String) {
+                *self.catalog.lock().unwrap() = serde_json::to_string(catalog).unwrap();
+                *self.values.lock().unwrap() = serde_json::to_string(values).unwrap();
+                *self.frame.lock().unwrap() = frame;
+            }
+        }
+
         async fn read_http_request(stream: &mut TcpStream) {
             let mut request = Vec::new();
             let mut buffer = [0_u8; 1024];
             loop {
-                let count = stream.read(&mut buffer).await.unwrap();
+                let count = stream.read(&mut buffer).await.unwrap_or(0);
                 if count == 0 {
                     return;
                 }
@@ -2376,102 +2515,107 @@ mod tests {
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
-            stream.write_all(response.as_bytes()).await.unwrap();
+            let _ = stream.write_all(response.as_bytes()).await;
         }
 
-        /// 1 世代分だけ応答するモック Hub: catalog → WS（subscribe を待って
-        /// data フレームを 1 つ送る）→ REST values。ワーカーはこの順に叩く
-        /// （`worker::run_attempt`）。最後は socket を持ったまま待つ - 閉じると
-        /// `Reconnecting` へ落ちてしまうため。
-        async fn serve_one_generation(
-            listener: TcpListener,
-            catalog_body: String,
-            data_frame: String,
-            values_body: String,
-        ) {
-            let (mut catalog_stream, _) = listener.accept().await.unwrap();
-            read_http_request(&mut catalog_stream).await;
-            write_response(&mut catalog_stream, catalog_body).await;
-
-            let (ws_stream, _) = listener.accept().await.unwrap();
-            let mut socket = accept_async(ws_stream).await.unwrap();
-            let subscribe = tokio::time::timeout(Duration::from_secs(5), socket.next())
-                .await
-                .expect("subscribe が来る")
-                .unwrap()
-                .unwrap();
-            assert!(matches!(subscribe, Message::Text(_)));
-            socket.send(Message::Text(data_frame.into())).await.unwrap();
-
-            let (mut values_stream, _) = listener.accept().await.unwrap();
-            read_http_request(&mut values_stream).await;
-            write_response(&mut values_stream, values_body).await;
-
-            // テストが終わるまで WS を開けたままにする。
-            let _ = tokio::time::timeout(Duration::from_secs(20), socket.next()).await;
+        /// 受け取ったリクエストの見出しだけを覗く（WS のアップグレードか、
+        /// どの REST ルートかを判別するため。`accept_async` は生のストリームを
+        /// 要求するので、消費せずに `peek` する）。
+        async fn peek_head(stream: &TcpStream) -> String {
+            let mut head = [0_u8; 1024];
+            for _ in 0..50 {
+                let count = stream.peek(&mut head).await.unwrap_or(0);
+                let text = String::from_utf8_lossy(&head[..count]).to_ascii_lowercase();
+                if text.contains("\r\n\r\n") {
+                    return text;
+                }
+                tokio::task::yield_now().await;
+            }
+            String::from_utf8_lossy(&head).to_ascii_lowercase()
         }
 
-        /// 購読が成立して値が画面の形まで届くこと。**未知の品質・出所ラベルを
-        /// 丸めない**ことと、WS で受けた新しい値が REST のスナップショットを
-        /// 上書きすることもここで固める。
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn a_live_subscription_carries_values_into_the_view() {
-            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-            let endpoint = format!("http://{}", listener.local_addr().unwrap());
-            let catalog = catalog(&["alpha", "beta"]);
+        /// 要求に応じて応答し続けるモック Hub。ワーカーは 1 世代につき
+        /// catalog → WS（subscribe を待って data フレームを 1 つ）→ REST
+        /// values の順に叩き（`worker::run_attempt`）、再バインドのたびに
+        /// catalog を取り直す。何回来ても答えられるようにループにしてある。
+        async fn serve_hub(listener: TcpListener, hub: Arc<MockHub>) {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let head = peek_head(&stream).await;
+                if head.contains("upgrade: websocket") {
+                    let frame = hub.frame.lock().unwrap().clone();
+                    tokio::spawn(async move {
+                        let Ok(mut socket) = accept_async(stream).await else {
+                            return;
+                        };
+                        let subscribe =
+                            tokio::time::timeout(Duration::from_secs(5), socket.next()).await;
+                        if !matches!(subscribe, Ok(Some(Ok(Message::Text(_))))) {
+                            return;
+                        }
+                        if socket.send(Message::Text(frame.into())).await.is_err() {
+                            return;
+                        }
+                        // 閉じるまで開けたままにし、close には close で返す
+                        // （`shutdown()` が待たされないように）。
+                        while let Some(Ok(message)) = socket.next().await {
+                            if let Message::Close(reply) = message {
+                                let _ = socket.send(Message::Close(reply)).await;
+                                break;
+                            }
+                        }
+                    });
+                    continue;
+                }
+                let body = if head.contains("/api/v1/values") {
+                    hub.values.lock().unwrap().clone()
+                } else {
+                    hub.catalog.lock().unwrap().clone()
+                };
+                let mut stream = stream;
+                read_http_request(&mut stream).await;
+                write_response(&mut stream, body).await;
+            }
+        }
 
-            // REST の `/api/v1/values`。`value_source` はこちらにしか無い
-            // （WS の data フレームは tag/v/q/t だけ）ので、未知の出所は
-            // こちらに混ぜる。revision / run_id / collection_mode が catalog と
-            // 一致していないと `RevisionMismatch` で弾かれる。
-            let values = ValuesSnapshot {
+        fn entry(tag: &str, v: f64, quality: ValueQuality, source: ValueSource) -> ValueEntry {
+            ValueEntry {
+                tag: tag.to_owned(),
+                v: Some(v),
+                q: quality,
+                t: 1_000,
+                value_source: source,
+            }
+        }
+
+        fn values_of(catalog: &CatalogSnapshot, values: Vec<ValueEntry>) -> ValuesSnapshot {
+            ValuesSnapshot {
                 revision: catalog.revision,
                 t: 1_000,
                 run_id: catalog.run_id,
                 collection_mode: catalog.collection_mode.clone(),
-                values: vec![
-                    ValueEntry {
-                        tag: "alpha".to_owned(),
-                        v: Some(1.0),
-                        q: ValueQuality::Good,
-                        t: 1_000,
-                        value_source: ValueSource::Real,
-                    },
-                    ValueEntry {
-                        tag: "beta".to_owned(),
-                        v: Some(2.0),
-                        q: ValueQuality::Good,
-                        t: 1_000,
-                        value_source: ValueSource::Unknown("future_source".to_owned()),
-                    },
-                ],
-            };
-            // WS の値は REST より新しい `t` にする = こちらが勝つ。未知の
-            // 品質ラベルもここで混ぜる。
-            let data_frame = format!(
+                values,
+            }
+        }
+
+        /// `banto-tagclient` の WS は tag/v/q/t しか運ばない（`value_source` は
+        /// REST 側にしか無い）。`t` を REST より新しくして、こちらが勝つこと
+        /// を見られるようにする。
+        fn data_frame(tag: &str, v: f64, quality: &str) -> String {
+            format!(
                 concat!(
                     r#"{{"op":"data","id":{},"t":2000,"#,
-                    r#""values":[{{"tag":"alpha","v":42.5,"q":"future_quality","t":2000}}]}}"#
+                    r#""values":[{{"tag":"{}","v":{},"q":"{}","t":2000}}]}}"#
                 ),
-                SUBSCRIPTION_ID
-            );
-
-            let server = tokio::spawn(serve_one_generation(
-                listener,
-                serde_json::to_string(&catalog).unwrap(),
-                data_frame,
-                serde_json::to_string(&values).unwrap(),
-            ));
-
-            let (_settings, hub) = service_with_keyring(&endpoint, &["alpha", "beta"]).await;
-            hub.reconcile_with(
-                &HubStatus::Connected { tag_count: 2 },
-                Some(&catalog),
-                Trigger::Observe,
+                SUBSCRIPTION_ID, tag, v, quality
             )
-            .await;
+        }
 
-            // `state_watch` の変化を待つ（固定 sleep を使わない）。
+        /// 現世代が `Live` になるまで待つ（固定 sleep を使わない）。世代を
+        /// 張り直すと `watch` も別物になるので、そのたびに取り直す。
+        async fn wait_live(hub: &HubService) {
             let mut states = {
                 let slot = hub.inner.subscription.lock().await;
                 slot.generation.as_ref().expect("世代が立つ").states.clone()
@@ -2486,6 +2630,52 @@ mod tests {
             })
             .await
             .expect("Live になる");
+        }
+
+        async fn sorted_values(hub: &HubService) -> Vec<HubValueView> {
+            let mut values = hub.subscription().await.values;
+            values.sort_by(|left, right| left.tag.cmp(&right.tag));
+            values
+        }
+
+        /// 購読が成立して値が画面の形まで届くこと。**未知の品質・出所ラベルを
+        /// 丸めない**ことと、WS で受けた新しい値が REST のスナップショットを
+        /// 上書きすることもここで固める。
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_live_subscription_carries_values_into_the_view() {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let catalog = catalog(&["alpha", "beta"]);
+
+            let mock = Arc::new(MockHub::default());
+            mock.set(
+                &catalog,
+                &values_of(
+                    &catalog,
+                    vec![
+                        entry("alpha", 1.0, ValueQuality::Good, ValueSource::Real),
+                        // `value_source` は REST 側にしか無いので、未知の出所は
+                        // こちらに混ぜる。
+                        entry(
+                            "beta",
+                            2.0,
+                            ValueQuality::Good,
+                            ValueSource::Unknown("future_source".to_owned()),
+                        ),
+                    ],
+                ),
+                data_frame("alpha", 42.5, "future_quality"),
+            );
+            let server = tokio::spawn(serve_hub(listener, Arc::clone(&mock)));
+
+            let (_settings, hub) = service_with_keyring(&endpoint, &["alpha", "beta"]).await;
+            hub.reconcile_with(
+                &HubStatus::Connected { tag_count: 2 },
+                Some(&catalog),
+                Trigger::Observe,
+            )
+            .await;
+            wait_live(&hub).await;
 
             let view = hub.subscription().await;
             assert_eq!(view.state, "live");
@@ -2495,8 +2685,7 @@ mod tests {
             assert!(view.unresolved.is_empty());
             assert!(view.unsupported.is_empty());
 
-            let mut received: Vec<&HubValueView> = view.values.iter().collect();
-            received.sort_by(|left, right| left.tag.cmp(&right.tag));
+            let received = sorted_values(&hub).await;
             assert_eq!(received.len(), 2);
 
             // WS で受けた新しい値が REST のスナップショットを上書きする。
@@ -2521,7 +2710,79 @@ mod tests {
             // 最終受信時刻はスナップショットの `t`（REST と WS の新しい方）。
             assert_eq!(view.last_value_at, Some(2_000));
 
-            // 後始末: 世代を止めてからモックを畳む。
+            hub.inner.subscription.lock().await.stop(None).await;
+            server.abort();
+        }
+
+        /// **選択中のタグが Hub から消えても、残りのタグで購読し直せること**
+        /// （2026-09-17 実機で壊れていた経路の出口側）。
+        ///
+        /// 見張りが「古い要求セットのまま `Reconnecting`」を起こす判断は
+        /// `a_reconnecting_generation_is_replanned_only_for_a_stale_request_set`
+        /// が固める。こちらは起こしたあとの**再計画 → 残りのタグで live に
+        /// 戻る → 消えた名前が `unresolved` に出る**ところを、実際に値が流れる
+        /// 経路で固める。
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_deleted_tag_is_replanned_and_the_rest_keeps_flowing() {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let both = catalog(&["alpha", "beta"]);
+
+            let mock = Arc::new(MockHub::default());
+            mock.set(
+                &both,
+                &values_of(
+                    &both,
+                    vec![
+                        entry("alpha", 1.0, ValueQuality::Good, ValueSource::Real),
+                        entry("beta", 2.0, ValueQuality::Good, ValueSource::Real),
+                    ],
+                ),
+                data_frame("alpha", 10.0, "good"),
+            );
+            let server = tokio::spawn(serve_hub(listener, Arc::clone(&mock)));
+
+            let (_settings, hub) = service_with_keyring(&endpoint, &["alpha", "beta"]).await;
+            hub.reconcile_with(
+                &HubStatus::Connected { tag_count: 2 },
+                Some(&both),
+                Trigger::Observe,
+            )
+            .await;
+            wait_live(&hub).await;
+            assert_eq!(hub.subscription().await.subscribed_count, 2);
+
+            // Hub 側で `beta` を削除する。
+            let only_alpha = CatalogSnapshot {
+                tags: both.tags.iter().take(1).cloned().collect(),
+                ..both.clone()
+            };
+            mock.set(
+                &only_alpha,
+                &values_of(
+                    &only_alpha,
+                    vec![entry("alpha", 11.0, ValueQuality::Good, ValueSource::Real)],
+                ),
+                data_frame("alpha", 11.0, "good"),
+            );
+
+            // 見張りが起こしたあとにやること = catalog を読み直して突き合わせ。
+            hub.refresh_catalog().await.unwrap();
+            wait_live(&hub).await;
+
+            let view = hub.subscription().await;
+            assert_eq!(view.state, "live", "残りのタグで live に戻る");
+            assert_eq!(view.subscribed_count, 1);
+            assert_eq!(
+                view.unresolved,
+                owned(&["beta"]),
+                "消えた名前は黙って落とさず一覧に出す"
+            );
+            let received = sorted_values(&hub).await;
+            assert_eq!(received.len(), 1);
+            assert_eq!(received[0].tag, "alpha");
+            assert_eq!(received[0].v, Some(11.0), "残りのタグの値は流れ続ける");
+
             hub.inner.subscription.lock().await.stop(None).await;
             server.abort();
         }
