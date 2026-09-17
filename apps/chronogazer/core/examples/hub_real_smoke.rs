@@ -798,14 +798,28 @@ enum KeyOutcome {
 /// （`apps/chronogazer/core/src/hub.rs` の `HubService::connect`:
 /// `bootstrapper.connect(...).await.map_err(...)?; self.flush().await?;`
 /// `flush()` の `?` は `bootstrapper.connect()` の**後**にあるので、
-/// ここで失敗すると `Ok` へは決して到達しない）。逆に言えば
-/// **`connect_view` が `Ok` であることは、その呼び出しで
-/// `bootstrapper` が行った変更が実ストレージへの書き戻しまで含めて
-/// 成功したことを構造的に保証する** - つまり `after` の読み取りが真に
-/// 最新の状態を反映していると信頼してよいのは `connect_returned_ok`
-/// のときだけ。`connect()` が `Err` で終わり、かつレコードが無い
-/// （＝発行が起きたのかどうか、この観測経路からは分からない）ときは
-/// `ConfirmedAbsent` と言い切らず `Undetermined` に倒す。
+/// ここで失敗すると `Ok` へは決して到達しない）。
+///
+/// **判定規則はこの3行に集約される**（2026-09-18 Copilotレビュー
+/// 指摘2回目: 前回は「レコードが無い」経路だけ塞いだが、「レコードが
+/// 変わっていない」経路が残っていた - 置き換えのキーを発行した直後に
+/// `flush()` が失敗すると、`after` は書き戻し前の**古いレコードのまま**
+/// なので `key_id` が変わらず、取りこぼしていた）:
+///
+/// - `connect()` が **`Ok`** … 従来どおり、`before`/`after` の実際の
+///   差分だけで分類する。
+/// - `connect()` が **`Err`** かつ レコードが**変わった**
+///   （`key_id` または接続先が `before` から `after` で変わった） …
+///   `Err` になった呼び出しの中で何かが変化したと積極的に確認できる
+///   ので `ConfirmedPresent`（この実行が発行したと分かる）。
+/// - `connect()` が **`Err`** かつ レコードが**変わっていない／無い**
+///   … `Undetermined`（自動失効せず FAIL ＋ 手動案内）。
+///
+/// 言い換えると: **`connect()` が `Err` のときは、レコードが積極的に
+/// 変わっていない限り判定不能**。「`after` の読み取りが真に最新の状態を
+/// 反映していると無条件に信頼してよいのは `connect_returned_ok` の
+/// ときだけ」であり、`Err` のときは「変化が観測できた」という積極的な
+/// 証拠がある場合に限って例外的に確定させる。
 fn classify_key_outcome(
     hub_url: &str,
     connect_returned_ok: bool,
@@ -824,14 +838,42 @@ fn classify_key_outcome(
             return KeyOutcome::Undetermined(format!("接続後の設定読み取りに失敗しました: {err}"))
         }
     };
-    let Some(after_record) = after_record else {
-        return if connect_returned_ok {
-            KeyOutcome::ConfirmedAbsent
-        } else {
-            KeyOutcome::Undetermined(
-                "connect()がエラーで終わったため、レコードが無いことは発行していないことの証明になりません(発行後にflush等が失敗した可能性があります)".to_owned(),
-            )
+
+    if !connect_returned_ok {
+        // connect()がErrで終わったときは、bootstrapperがキーを発行・
+        // 保存した後でflush()（実ストレージへの書き戻し）だけが失敗した
+        // 可能性がある。その場合beforeとafterは同じ(古い)レコードを指す
+        // ので、「レコードが無い/変わっていない」ことは「発行していない」
+        // ことの証明にならない。beforeとafterを比べて積極的に変化が
+        // 確認できたときだけConfirmedPresentとし、それ以外はすべて
+        // Undeterminedに倒す。
+        let changed = match (before_record, after_record) {
+            (None, None) => false,
+            (None, Some(_)) | (Some(_), None) => true,
+            (Some(b), Some(a)) => b.key_id != a.key_id || !same_hub(&b.endpoint, &a.endpoint),
         };
+        return match (changed, after_record) {
+            (true, Some(after_record)) => match after_record.key_id {
+                Some(key_id) => KeyOutcome::ConfirmedPresent {
+                    key_id,
+                    key_name: after_record.key_name.clone(),
+                    issued_this_run: true,
+                },
+                None => KeyOutcome::Undetermined(
+                    "レコードにkey_idがありません(手動キー採用は想定していません)".to_owned(),
+                ),
+            },
+            _ => KeyOutcome::Undetermined(
+                "connect()がエラーで終わり、かつ設定の記録が変わっていない(または無い)ため、発行の有無を確認できません(発行後にflush等が失敗した可能性があります)".to_owned(),
+            ),
+        };
+    }
+
+    // ここから先は connect_returned_ok == true。flush()まで含めて成功
+    // したことが構造的に保証されているので、before/afterの実際の差分
+    // だけで判定してよい（従来どおり）。
+    let Some(after_record) = after_record else {
+        return KeyOutcome::ConfirmedAbsent;
     };
     if !same_hub(&after_record.endpoint, hub_url) {
         return KeyOutcome::ConfirmedDifferentHub {
@@ -869,6 +911,16 @@ fn classify_key_outcome(
 /// パースし、ホスト・ポート・パスだけに落とす - userinfo とクエリ文字列
 /// は常に捨てる。パースそのものに失敗する形式なら、原文を一切出さず
 /// プレースホルダのみ返す。
+///
+/// IPv6リテラル（`http://[::1]:8722`）について（2026-09-18 Copilot
+/// レビュー指摘2回目）: `Url::host_str()` は角括弧なしで返すのでは
+/// ないかという指摘があったが、本クレートが実際にピン留めしている
+/// `url` 2.5.8（`Cargo.lock`）で検証した結果、`host_str()` は
+/// IPv6アドレスを**角括弧つき**（`"[::1]"`）で返すことを確認済み
+/// （手元の再現コードで `host_str()=Some("[::1]")` を確認。角括弧を
+/// 追加で付け足すと `[[::1]]` になって二重に壊れるため、ここでは
+/// 追加加工をしない）。回帰テストで角括弧つきのまま往復することを
+/// 固定している（`sanitize_hub_url_for_display_keeps_ipv6_brackets`）。
 fn sanitize_hub_url_for_display(raw: &str) -> String {
     match reqwest::Url::parse(raw) {
         Ok(url) => {
@@ -1637,7 +1689,12 @@ async fn main() {
                 );
                 if auto_revoke {
                     println!("  CG_SMOKE_REVOKE=1: 上記のキーを失効させます...");
-                    match revoke_api_key(&hub_url_display, key_id).await {
+                    // 実際のリクエストは表示用にサニタイズした
+                    // hub_url_displayではなく、生の(トリム済み)hub_url を
+                    // 使う - サニタイズはuserinfo等を落とすためのもので、
+                    // 落とした値をそのまま実リクエストに使うと接続先が
+                    // 変わってしまう(2026-09-18 Copilotレビュー指摘)。
+                    match revoke_api_key(&hub_url, key_id).await {
                         Ok(()) => {
                             println!(
                                 "  失効しました。上記のキーはもう失効済みです(Hub側には残っていません)。"
@@ -1935,6 +1992,47 @@ mod tests {
     }
 
     #[test]
+    fn classify_key_outcome_is_undetermined_when_connect_erred_and_the_record_is_unchanged() {
+        // 今回の本題（A、2026-09-18 Copilotレビュー指摘2回目、`:854`
+        // 相当）: 前回は「レコードが無い」経路だけ塞いだが、「レコードが
+        // 変わっていない」経路が残っていた。置き換えのキーを発行した
+        // あとflush()前に失敗すると、afterは(書き戻し前の)古いレコードの
+        // ままなので、key_id・接続先とも変わらない。この場合も
+        // 「発行していないことの証明」にはならないので、
+        // ConfirmedPresent{issued_this_run: false}のようにPASSで言い切らず
+        // Undeterminedに倒す。
+        let before: Result<Option<HubRecord>, String> =
+            Ok(Some(record("http://host:8722", Some(5))));
+        let after: Result<Option<HubRecord>, String> =
+            Ok(Some(record("http://host:8722", Some(5))));
+        assert!(matches!(
+            classify_key_outcome("http://host:8722", false, &before, &after),
+            KeyOutcome::Undetermined(_)
+        ));
+    }
+
+    #[test]
+    fn classify_key_outcome_confirms_present_when_connect_erred_but_the_endpoint_changed() {
+        // 「変わった」はkey_idだけでなく接続先(endpoint)の変化も含む
+        // （3行規則の2番目の枝）。key_idの数値自体は同じでも接続先が
+        // 変われば「積極的に変化した」と言えるので、Errでも
+        // ConfirmedPresentにしてよい。
+        let before: Result<Option<HubRecord>, String> =
+            Ok(Some(record("http://host-a:8722", Some(5))));
+        let after: Result<Option<HubRecord>, String> =
+            Ok(Some(record("http://host-b:8722", Some(5))));
+        let outcome = classify_key_outcome("http://host-b:8722", false, &before, &after);
+        assert_eq!(
+            outcome,
+            KeyOutcome::ConfirmedPresent {
+                key_id: 5,
+                key_name: None,
+                issued_this_run: true,
+            }
+        );
+    }
+
+    #[test]
     fn classify_key_outcome_confirms_absent_when_no_record_exists() {
         let before: Result<Option<HubRecord>, String> = Ok(None);
         let after: Result<Option<HubRecord>, String> = Ok(None);
@@ -2053,6 +2151,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sanitize_hub_url_for_display_keeps_ipv6_brackets() {
+        // 2026-09-18 Copilotレビュー指摘(2回目、`:881`相当): 「host_str()
+        // はIPv6リテラルを角括弧なしで返すのではないか」という指摘だったが、
+        // 本クレートが実際にピン留めしているurl 2.5.8では host_str() は
+        // 角括弧つき("[::1]")で返すことを確認済み(角括弧を追加で付け足すと
+        // "[[::1]]"になって二重に壊れる)。角括弧つきのまま往復すること、
+        // IPv4・ホスト名は従来どおり(角括弧を付けない)であることを固定する。
+        assert_eq!(
+            sanitize_hub_url_for_display("http://[::1]:8722"),
+            "http://[::1]:8722/"
+        );
+        assert_eq!(
+            sanitize_hub_url_for_display("http://[::1]:8722/hub"),
+            "http://[::1]:8722/hub"
+        );
+        assert_eq!(
+            sanitize_hub_url_for_display("http://user:hunter2@[fe80::1]:8722/hub?x=1"),
+            "http://[fe80::1]:8722/hub"
+        );
+        // IPv4・ホスト名は角括弧を付けない(従来どおり)。
+        assert_eq!(
+            sanitize_hub_url_for_display("http://127.0.0.1:8722"),
+            "http://127.0.0.1:8722/"
+        );
+        assert_eq!(
+            sanitize_hub_url_for_display("http://example.com:8722"),
+            "http://example.com:8722/"
+        );
+    }
+
     // revoke_url() / classify_revoke_response() の回帰テスト（純粋な
     // ロジックだけ、ネットワーク不要）。
 
@@ -2065,6 +2194,19 @@ mod tests {
         assert_eq!(
             revoke_url("http://127.0.0.1:8722/", 42),
             "http://127.0.0.1:8722/api/api-keys/42/revoke"
+        );
+    }
+
+    #[test]
+    fn revoke_url_keeps_ipv6_brackets_intact() {
+        // revoke_url()自体は文字列を再パースせず連結するだけなので、
+        // 角括弧つきのIPv6ホストをそのまま渡せば壊れない。実際の失効
+        // リクエストは(サニタイズ済みのhub_url_displayではなく)生の
+        // hub_urlをrevoke_urlに渡すので、この経路が壊れないことを固定
+        // する(2026-09-18 Copilotレビュー指摘)。
+        assert_eq!(
+            revoke_url("http://[::1]:8722", 42),
+            "http://[::1]:8722/api/api-keys/42/revoke"
         );
     }
 
