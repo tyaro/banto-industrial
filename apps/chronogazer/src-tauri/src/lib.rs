@@ -30,9 +30,18 @@ use chronogazer_core::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 use chronogazer_core::db::init_db;
 use chronogazer_core::events::event_channel;
 use chronogazer_core::hub::{HubService, HubSubscriptionView, HubView};
-use chronogazer_core::rest::{api_router, audited_credential_verifier};
+use chronogazer_core::rest::{
+    api_router, audited_credential_verifier, CollectionGroupPayload, PlcConnectionPayload,
+    PlcConnectionResponse, TagPayload,
+};
 use chronogazer_core::settings::{AuditSettings, AuthSettings, ServerSettings, SettingsService};
 use chronogazer_core::users::{Role, UserIdentity, UserSummary, UsersService};
+// #383 段階2a / R1-B: レジストリ3サービスと行型。`chronogazer_core::lib.rs`の
+// re-export 経由（invariant: このクレートは banto-tags を直接 depend
+// しない - `db::DbPool` と同じ理由）。
+use chronogazer_core::{
+    CollectionGroup, CollectionGroupService, PlcConnectionService, Tag, TagService,
+};
 use qrcode::render::svg;
 use qrcode::QrCode;
 use serde::Serialize;
@@ -98,6 +107,15 @@ struct AppState {
     /// `restore-pending.sqlite3`'s location, see `crate::backup`'s doc
     /// comment).
     backup: BackupService,
+    /// #383 段階2a / R1-B: レジストリ3サービス（PLC接続/収集グループ/
+    /// タグ）。`users`/`settings`/`audit` と同じ pool を共有する `Clone`
+    /// ハンドル。`start_embedded_server` にも同じ実体を渡して、LAN
+    /// ブラウザの `/api/plc-connections|collection-groups|tags/*` と
+    /// デスクトップの `plc_connections_*`/`collection_groups_*`/`tags_*`
+    /// コマンドが同じレジストリを見るようにする。
+    plc_connections: PlcConnectionService,
+    collection_groups: CollectionGroupService,
+    tags: TagService,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -625,6 +643,10 @@ async fn start_embedded_server(
     audit: AuditLogService,
     backup: BackupService,
     hub: HubService,
+    // #383 段階2a / R1-B: レジストリ3サービス。
+    plc_connections: PlcConnectionService,
+    collection_groups: CollectionGroupService,
+    tags: TagService,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
     config: ServerConfig,
@@ -633,8 +655,20 @@ async fn start_embedded_server(
     // the `auth_setup` command above (`invoke()`, no network involved), not
     // this REST endpoint. Only `banto-serve` (this repo's Tauri-free dev
     // vehicle) opts into `POST /api/auth/setup` via `BANTO_ALLOW_SETUP=1`.
-    let router = api_router(users, settings, audit, backup, hub, auth, events, false)
-        .merge(static_router::<FrontendAssets>());
+    let router = api_router(
+        users,
+        settings,
+        audit,
+        backup,
+        hub,
+        plc_connections,
+        collection_groups,
+        tags,
+        auth,
+        events,
+        false,
+    )
+    .merge(static_router::<FrontendAssets>());
     start(config, router).await
 }
 
@@ -682,6 +716,9 @@ async fn server_apply(
                 state.audit.clone(),
                 state.backup.clone(),
                 state.hub.clone(),
+                state.plc_connections.clone(),
+                state.collection_groups.clone(),
+                state.tags.clone(),
                 state.rest_auth.clone(),
                 state.events.clone(),
                 ServerConfig {
@@ -1034,6 +1071,311 @@ async fn users_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoEr
             actor_role: Some(acting.role.as_str()),
             action: "delete",
             resource: "users",
+            entity_id: Some(&id.to_string()),
+            detail: None,
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(())
+}
+
+// --- #383 段階2a / R1-B: レジストリ CRUD（PLC接続・収集グループ・タグ） ----
+//
+// REST 側（`chronogazer_core::rest::tag_registry_router`）と同じ floor split
+// （R0 §3.6: viewer-read / editor-write）・同じ監査内容（`origin: "tauri"`
+// のみ異なる）。手本は relay-wright の `src-tauri/src/lib.rs` 同名セクション。
+
+/// #383 段階2a: chronogazer は `"modbus-tcp"`/`"slmp"` だけを受け付ける。
+/// `chronogazer_core::rest::reject_disallowed_connection_protocol`の doc
+/// comment と同じ理由。REST 側と Tauri 側の両方から呼ぶ - 片方だけに書くと
+/// もう片方の経路から `"virtual"`/`"postgres"` 接続を作れてしまう
+/// （invariant: 両経路対称）。
+fn reject_disallowed_connection_protocol(protocol: &str) -> Result<(), BantoError> {
+    const ALLOWED: [&str; 2] = ["modbus-tcp", "slmp"];
+    if ALLOWED.contains(&protocol) {
+        return Ok(());
+    }
+    Err(BantoError::Validation {
+        field_errors: vec![FieldError {
+            field: "protocol".to_string(),
+            message: format!(
+                "chronogazer が対応するプロトコルは {} のいずれかです",
+                ALLOWED.join(", ")
+            ),
+        }],
+    })
+}
+
+/// `viewer`+ (R0 §3.6): list PLC connections.
+#[tauri::command]
+async fn plc_connections_list(
+    state: State<'_, AppState>,
+) -> Result<Vec<PlcConnectionResponse>, BantoError> {
+    require_role(&state, Role::Viewer, "plc_connections").await?;
+    Ok(state
+        .plc_connections
+        .list(ListParams::default())
+        .await?
+        .rows
+        .into_iter()
+        .map(PlcConnectionResponse::from)
+        .collect())
+}
+
+/// `viewer`+ (R0 §3.6): fetch one PLC connection.
+#[tauri::command]
+async fn plc_connections_get(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<PlcConnectionResponse, BantoError> {
+    require_role(&state, Role::Viewer, "plc_connections").await?;
+    Ok(PlcConnectionResponse::from(
+        state.plc_connections.get(id).await?,
+    ))
+}
+
+/// `editor`+ (R0 §3.6): create a PLC connection.
+#[tauri::command]
+async fn plc_connections_create(
+    state: State<'_, AppState>,
+    input: PlcConnectionPayload,
+) -> Result<PlcConnectionResponse, BantoError> {
+    let actor = require_role(&state, Role::Editor, "plc_connections").await?;
+    reject_disallowed_connection_protocol(&input.protocol)?;
+    let created = state.plc_connections.create(input.into()).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "create",
+            resource: "plc_connections",
+            entity_id: Some(&created.id.to_string()),
+            detail: Some(serde_json::json!({ "name": created.name, "enabled": created.enabled })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(PlcConnectionResponse::from(created))
+}
+
+/// `editor`+ (R0 §3.6): update a PLC connection.
+#[tauri::command]
+async fn plc_connections_update(
+    state: State<'_, AppState>,
+    id: i64,
+    input: PlcConnectionPayload,
+) -> Result<PlcConnectionResponse, BantoError> {
+    let actor = require_role(&state, Role::Editor, "plc_connections").await?;
+    reject_disallowed_connection_protocol(&input.protocol)?;
+    let updated = state.plc_connections.update(id, input.into()).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "update",
+            resource: "plc_connections",
+            entity_id: Some(&id.to_string()),
+            detail: Some(serde_json::json!({ "name": updated.name, "enabled": updated.enabled })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(PlcConnectionResponse::from(updated))
+}
+
+/// `editor`+ (R0 §3.6): delete a PLC connection. Refuses (friendly
+/// Validation error) when a collection group still references it
+/// (`PlcConnectionService::delete`'s guard).
+#[tauri::command]
+async fn plc_connections_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoError> {
+    let actor = require_role(&state, Role::Editor, "plc_connections").await?;
+    state.plc_connections.delete(id).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "delete",
+            resource: "plc_connections",
+            entity_id: Some(&id.to_string()),
+            detail: None,
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(())
+}
+
+/// `viewer`+ (R0 §3.6): list collection groups.
+#[tauri::command]
+async fn collection_groups_list(
+    state: State<'_, AppState>,
+) -> Result<Vec<CollectionGroup>, BantoError> {
+    require_role(&state, Role::Viewer, "collection_groups").await?;
+    Ok(state
+        .collection_groups
+        .list(ListParams::default())
+        .await?
+        .rows)
+}
+
+/// `viewer`+ (R0 §3.6): fetch one collection group.
+#[tauri::command]
+async fn collection_groups_get(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<CollectionGroup, BantoError> {
+    require_role(&state, Role::Viewer, "collection_groups").await?;
+    state.collection_groups.get(id).await
+}
+
+/// `editor`+ (R0 §3.6): create a collection group.
+#[tauri::command]
+async fn collection_groups_create(
+    state: State<'_, AppState>,
+    input: CollectionGroupPayload,
+) -> Result<CollectionGroup, BantoError> {
+    let actor = require_role(&state, Role::Editor, "collection_groups").await?;
+    let created = state.collection_groups.create(input.into()).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "create",
+            resource: "collection_groups",
+            entity_id: Some(&created.id.to_string()),
+            detail: Some(serde_json::json!({ "name": created.name, "enabled": created.enabled })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(created)
+}
+
+/// `editor`+ (R0 §3.6): update a collection group.
+#[tauri::command]
+async fn collection_groups_update(
+    state: State<'_, AppState>,
+    id: i64,
+    input: CollectionGroupPayload,
+) -> Result<CollectionGroup, BantoError> {
+    let actor = require_role(&state, Role::Editor, "collection_groups").await?;
+    let updated = state.collection_groups.update(id, input.into()).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "update",
+            resource: "collection_groups",
+            entity_id: Some(&id.to_string()),
+            detail: Some(serde_json::json!({ "name": updated.name, "enabled": updated.enabled })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(updated)
+}
+
+/// `editor`+ (R0 §3.6): delete a collection group. Refuses (friendly
+/// Validation error) when a tag still references it
+/// (`CollectionGroupService::delete`'s guard).
+#[tauri::command]
+async fn collection_groups_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoError> {
+    let actor = require_role(&state, Role::Editor, "collection_groups").await?;
+    state.collection_groups.delete(id).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "delete",
+            resource: "collection_groups",
+            entity_id: Some(&id.to_string()),
+            detail: None,
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(())
+}
+
+/// `viewer`+ (R0 §3.6): list tags.
+#[tauri::command]
+async fn tags_list(state: State<'_, AppState>) -> Result<Vec<Tag>, BantoError> {
+    require_role(&state, Role::Viewer, "tags").await?;
+    Ok(state.tags.list(ListParams::default()).await?.rows)
+}
+
+/// `viewer`+ (R0 §3.6): fetch one tag.
+#[tauri::command]
+async fn tags_get(state: State<'_, AppState>, id: i64) -> Result<Tag, BantoError> {
+    require_role(&state, Role::Viewer, "tags").await?;
+    state.tags.get(id).await
+}
+
+/// `editor`+ (R0 §3.6): create a tag.
+#[tauri::command]
+async fn tags_create(state: State<'_, AppState>, input: TagPayload) -> Result<Tag, BantoError> {
+    let actor = require_role(&state, Role::Editor, "tags").await?;
+    let created = state.tags.create(input.into()).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "create",
+            resource: "tags",
+            entity_id: Some(&created.id.to_string()),
+            detail: Some(serde_json::json!({ "name": created.name, "enabled": created.enabled })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(created)
+}
+
+/// `editor`+ (R0 §3.6): update a tag.
+#[tauri::command]
+async fn tags_update(
+    state: State<'_, AppState>,
+    id: i64,
+    input: TagPayload,
+) -> Result<Tag, BantoError> {
+    let actor = require_role(&state, Role::Editor, "tags").await?;
+    let updated = state.tags.update(id, input.into()).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "update",
+            resource: "tags",
+            entity_id: Some(&id.to_string()),
+            detail: Some(serde_json::json!({ "name": updated.name, "enabled": updated.enabled })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+    Ok(updated)
+}
+
+/// `editor`+ (R0 §3.6): delete a tag.
+#[tauri::command]
+async fn tags_delete(state: State<'_, AppState>, id: i64) -> Result<(), BantoError> {
+    let actor = require_role(&state, Role::Editor, "tags").await?;
+    state.tags.delete(id).await?;
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action: "delete",
+            resource: "tags",
             entity_id: Some(&id.to_string()),
             detail: None,
             origin: "tauri",
@@ -1439,6 +1781,11 @@ pub fn run() {
             let users = UsersService::new(pool.clone());
             let settings = SettingsService::new(pool.clone());
             let backup = BackupService::new(db_path.clone(), pool.clone());
+            // #383 段階2a / R1-B: レジストリ3サービス。テーブルは
+            // `init_db` が呼ぶ `banto_tags::migrate` で既に作成済み。
+            let plc_connections = PlcConnectionService::new(pool.clone());
+            let collection_groups = CollectionGroupService::new(pool.clone());
+            let tags = TagService::new(pool.clone());
             let audit = AuditLogService::new(pool);
             // Records `login`/`login_failed` audit entries (spec M14) from
             // inside the verifier itself - see
@@ -1662,6 +2009,9 @@ pub fn run() {
                     audit.clone(),
                     backup.clone(),
                     hub.clone(),
+                    plc_connections.clone(),
+                    collection_groups.clone(),
+                    tags.clone(),
                     rest_auth.clone(),
                     events.clone(),
                     runtime_config,
@@ -1725,6 +2075,9 @@ pub fn run() {
                 audit,
                 backup,
                 hub,
+                plc_connections,
+                collection_groups,
+                tags,
             });
 
             Ok(())
@@ -1771,6 +2124,21 @@ pub fn run() {
             hub_set_selected_tags,
             hub_adopt_manual_key,
             hub_disconnect,
+            plc_connections_list,
+            plc_connections_get,
+            plc_connections_create,
+            plc_connections_update,
+            plc_connections_delete,
+            collection_groups_list,
+            collection_groups_get,
+            collection_groups_create,
+            collection_groups_update,
+            collection_groups_delete,
+            tags_list,
+            tags_get,
+            tags_create,
+            tags_update,
+            tags_delete,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1855,9 +2223,12 @@ mod tests {
             audit: AuditLogService::new(pool.clone()),
             backup: BackupService::new(
                 PathBuf::from("unused-in-tests").join("chronogazer.sqlite3"),
-                pool,
+                pool.clone(),
             ),
             hub,
+            plc_connections: PlcConnectionService::new(pool.clone()),
+            collection_groups: CollectionGroupService::new(pool.clone()),
+            tags: TagService::new(pool),
         }
     }
 
@@ -1900,8 +2271,11 @@ mod tests {
             }),
             server: AsyncMutex::new(None),
             audit: AuditLogService::new(pool.clone()),
-            backup: BackupService::new(db_path, pool),
+            backup: BackupService::new(db_path, pool.clone()),
             hub,
+            plc_connections: PlcConnectionService::new(pool.clone()),
+            collection_groups: CollectionGroupService::new(pool.clone()),
+            tags: TagService::new(pool),
         };
         (dir, state)
     }

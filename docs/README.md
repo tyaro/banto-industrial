@@ -4,7 +4,9 @@ banto-industrial のドキュメント全体の入口。「どの文書が何の
 1 画面で引くための地図。詳細は各文書へ辿る。
 
 状態: **地図として現行**。索引に徹し、実装状況・設計判断の本体は各文書側で管理する。
-最終更新: 2026-09-18（#383 段階1 の実機確認と、そこで見つかった 2 件の修正。以下は経緯。2026-09-17: #332 Hub 自動接続・#383 段階1（ChronoGazer が選んだ Hub タグを購読して値を受ける）・relay-wright 凍結を反映。以下は経緯。2026-09-16: T19（UX-30〜48）・T20（文字列/構造体/レシピ/ビット .0〜.F）・T21（構成補助 MCP 管理面）完了、MCP 31 ツール実機検証、外部 DB 連携 S0〜S2b・S4・S5 完了、S3/S6/S7 残（MCP は 37 ツールに。追加分はローカル PostgreSQL で検証）に加え、v0.2.0-alpha.8: 書き込み受付の既定を「可」に変更し、再起動・収集操作での自動無効化を撤回（#340）、v0.2.0-alpha.9: 試運転中は構成 CRUD を収集中でも即時・無停止反映（#341）、v0.2.0-alpha.10: computed タグの catalog 公開・外部読み取り出力のシミュレーションゲート撤廃（#335）、v0.2.0-alpha.11: シミュレーションデバイスへの外部書き込みをシミュレータへ反映（#363）、v0.2.0-alpha.12: T15-3 テスト出力（test_output）機構を撤去（#362）、v0.2.0-alpha.13: PLC 到達不能中の plc_reconnected / plc_disconnected フラップを修正（#344）、
+最終更新: 2026-09-18（#383 段階2a: chronogazer にタグレジストリ CRUD と
+設定画面を追加、r1-plan.md の実施状況表記をアーカイブから運用中へ訂正。
+以下は経緯。#383 段階1 の実機確認と、そこで見つかった 2 件の修正。以下は経緯。2026-09-17: #332 Hub 自動接続・#383 段階1（ChronoGazer が選んだ Hub タグを購読して値を受ける）・relay-wright 凍結を反映。以下は経緯。2026-09-16: T19（UX-30〜48）・T20（文字列/構造体/レシピ/ビット .0〜.F）・T21（構成補助 MCP 管理面）完了、MCP 31 ツール実機検証、外部 DB 連携 S0〜S2b・S4・S5 完了、S3/S6/S7 残（MCP は 37 ツールに。追加分はローカル PostgreSQL で検証）に加え、v0.2.0-alpha.8: 書き込み受付の既定を「可」に変更し、再起動・収集操作での自動無効化を撤回（#340）、v0.2.0-alpha.9: 試運転中は構成 CRUD を収集中でも即時・無停止反映（#341）、v0.2.0-alpha.10: computed タグの catalog 公開・外部読み取り出力のシミュレーションゲート撤廃（#335）、v0.2.0-alpha.11: シミュレーションデバイスへの外部書き込みをシミュレータへ反映（#363）、v0.2.0-alpha.12: T15-3 テスト出力（test_output）機構を撤去（#362）、v0.2.0-alpha.13: PLC 到達不能中の plc_reconnected / plc_disconnected フラップを修正（#344）、
 v0.2.0-alpha.14: banto-hub の設定画面をカテゴリ別ルートへ分割（#359 banto-hub 分）を反映、
 chronogazer の設定画面をカテゴリ別ルートへ分割（#359 chronogazer 分）を反映、
 relay-wright の設定画面をカテゴリ別ルートへ分割（#359 relay-wright 分、issue #359 は3アプリ分完了）を反映、
@@ -62,6 +64,12 @@ v0.2.0-alpha.20: 狭幅（≤900px）でタグ登録・タグモニタの左ツ�
   「接続先 + タグ集合」で `status()` では張り直さず、未解決タグは残りだけで購読して一覧に出し、
   購読の失敗は接続の 6 状態を汚さない（banto-hub-client-bootstrap.md §10）。**段階2（SLMP /
   Modbus TCP 直結）と段階3（3ドライバの合流・トレンド表示・保存）は未着手**。
+  **段階2a（= r1-plan.md R1-B、レジストリ CRUD）は実装済み（2026-09-18）**:
+  PLC接続/収集グループ/タグの3エンティティ CRUD を REST + Tauri 両経路・
+  `/tags` 設定画面で公開（editor 以上、監査記録）。実際の SLMP/Modbus TCP
+  直結収集（Collector のライフサイクル・現在値・イベント。r1-plan.md R1-C）は
+  **まだ含まない** - 収集エンジンは当面 Tauri プロセス内で動かす方針
+  （オーナー決定、recorder-requirements.md §4 追補）。
   **relay-wright は凍結**（構想の練り直し、plan.md §4b）。**段階1 は実機（R08ENCPU + 本物の banto-hub）で確認済み**
   （2026-09-17、banto-hub-client-bootstrap.md §11）。確認の過程で「タグが 1 つ消えると購読が二度と戻らない」など
   **モックでは出なかった欠陥 2 件**を発見し修正した（#388）。
@@ -253,16 +261,16 @@ v0.2.0-alpha.20: 狭幅（≤900px）でタグ登録・タグモニタの左ツ�
 
 各文書の冒頭に**アーカイブ・バナー**を付与済み。リンクは生きている（過去の rationale として参照可）。
 
-| 文書                                                         | 状態                                                                                                            |
-| ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
-| [ux-plan.md](ux-plan.md)                                     | UX 改善計画（T9〜T13）。T13-2/3 は desktop-plan/T18 へ移管済み。T9〜T12 の rationale として参照のみ。           |
-| [h10-3-read-scope-proposal.md](h10-3-read-scope-proposal.md) | H10③ read スコープの比較検討（案 B 採用、PR #75 で決着済み）。                                                  |
-| [t5-handoff.md](t5-handoff.md)                               | T5 セッション引き継ぎメモ（内容は operations / desktop-plan に反映済み）。                                      |
-| [banto-hub-t14-design.md](banto-hub-t14-design.md)           | T14（ランタイム状態管理・制御面分離）は実装完了。現行の設計判断は desktop-plan / tag-server-design へ吸収済み。 |
-| [r1-plan.md](r1-plan.md)                                     | 記録計 R1 実施計画。実施完了、記録として保存。                                                                  |
-| [real-machine-test-2026-09.md](real-machine-test-2026-09.md) | #130/#131/#123 の一回性実機検証記録。結果は tag-server-design.md §6.2 等に吸収済み。                            |
-| [real-machine-mcp-2026-09.md](real-machine-mcp-2026-09.md)   | T19 S5 の MCP 実機検証（2026-09-04）の一回性記録。現行 IF・実機検証索引は banto-hub-mcp-reference.md。          |
-| [r1a-readme-gaps.md](r1a-readme-gaps.md)                     | 上流 banto の README 手順の穴（外部フィードバック用チェックリスト。本リポの仕様ではない）。                     |
+| 文書                                                         | 状態                                                                                                               |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
+| [ux-plan.md](ux-plan.md)                                     | UX 改善計画（T9〜T13）。T13-2/3 は desktop-plan/T18 へ移管済み。T9〜T12 の rationale として参照のみ。              |
+| [h10-3-read-scope-proposal.md](h10-3-read-scope-proposal.md) | H10③ read スコープの比較検討（案 B 採用、PR #75 で決着済み）。                                                     |
+| [t5-handoff.md](t5-handoff.md)                               | T5 セッション引き継ぎメモ（内容は operations / desktop-plan に反映済み）。                                         |
+| [banto-hub-t14-design.md](banto-hub-t14-design.md)           | T14（ランタイム状態管理・制御面分離）は実装完了。現行の設計判断は desktop-plan / tag-server-design へ吸収済み。    |
+| [r1-plan.md](r1-plan.md)                                     | 記録計 R1 実施計画。**運用中**（R1-A 完了、R1-B は #383 段階2a で着手・レジストリ CRUD 実装済み、R1-C/D 未着手）。 |
+| [real-machine-test-2026-09.md](real-machine-test-2026-09.md) | #130/#131/#123 の一回性実機検証記録。結果は tag-server-design.md §6.2 等に吸収済み。                               |
+| [real-machine-mcp-2026-09.md](real-machine-mcp-2026-09.md)   | T19 S5 の MCP 実機検証（2026-09-04）の一回性記録。現行 IF・実機検証索引は banto-hub-mcp-reference.md。             |
+| [r1a-readme-gaps.md](r1a-readme-gaps.md)                     | 上流 banto の README 手順の穴（外部フィードバック用チェックリスト。本リポの仕様ではない）。                        |
 
 ## 補足: なぜ状態ヘッダが厚くなるか
 

@@ -14,6 +14,12 @@
  * ため、判定専用の `activeMatch`（既定は `path` 自身、他の項目は今までと
  * 同じ挙動）を導入し、`設定` だけ `/settings` を明示している
  * （banto-hub の navigation.ts と同じパターン）。
+ *
+ * #383 段階2a / R1-B: `/tags`（タグ設定）を追加。位置は
+ * recorder-requirements.md §6 の画面順（監視・ヒストリカル・タグ設定・…）に
+ * 合わせ、ヒストリカルの直後・イベントの手前に置く。`adminOnly` は付けない -
+ * viewer も閲覧できる（R0 §3.6: 読み取りは viewer 以上、書き込みは editor
+ * 以上）。
  */
 export interface NavItem {
 	path: string;
@@ -35,6 +41,7 @@ export interface NavItem {
 export const navItems: NavItem[] = [
 	{ path: '/monitor', label: '監視', icon: '📈' },
 	{ path: '/historical', label: 'ヒストリカル', icon: '🕰️' },
+	{ path: '/tags', label: 'タグ設定', icon: '🏷️' },
 	{ path: '/events', label: 'イベント', icon: '🔔' },
 	{ path: '/users', label: 'ユーザー管理', icon: '👤', adminOnly: true },
 	{ path: '/audit-log', label: '監査ログ', icon: '🧾', adminOnly: true },
