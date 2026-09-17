@@ -99,6 +99,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use banto_hub_bootstrap::state::memory::MemoryKeyStore;
 use banto_hub_bootstrap::{HubRecord, KeyStore};
+use banto_tagclient::Endpoint;
 use chronogazer_core::db::init_db;
 use chronogazer_core::hub::{HubService, HubSubscriptionView, HubTagView, HubValueView};
 use chronogazer_core::settings::SettingsService;
@@ -595,6 +596,34 @@ async fn hold_observe(hub: &HubService, hold_secs: u64, tracker: &mut StatusTrac
     }
 }
 
+/// `a` と `b` が正規化後に同じ Hub を指しているか。
+///
+/// **これは #382（製品側、`banto_hub_bootstrap`）のレビュー第1巡で一度
+/// 指摘されたのとまったく同じ間違いを、この確認ハーネスでも踏んでいた
+/// ことへの修正**（2026-09-17 Copilotレビュー指摘）。`api_keys.id` は Hub
+/// ごとの連番なので、接続先を確かめずに `key_id` を使うと、別の Hub の
+/// 無関係な（第三者の）キーを失効させうる。`Bootstrapper::previous_for`
+/// （`crates/banto-hub-bootstrap/src/bootstrap.rs`）はこれを「正規化した
+/// 接続先が一致するときだけレコードを参照する」ことで防いでおり、この
+/// 関数も同じ規律に揃える。
+///
+/// 正規化そのものは `banto_hub_bootstrap::admin::base_url` が行っている
+/// が `pub(crate)` でこの crate の外から呼べないため、**同じ検証・正規化
+/// ルールで実装されている公開 API** `banto_tagclient::Endpoint::new` で
+/// 代用する（`admin.rs` のdoc「Mirrors `banto_tagclient::Endpoint`'s
+/// contract」のとおり、スキーム・ホスト・ポート・末尾スラッシュの扱いは
+/// 完全に同じ）。`Endpoint` は正規化後の文字列を直接公開していないため、
+/// 決定的に導ける `tags_url()` を比較する - `chronogazer_core::hub` の
+/// `fingerprint_endpoint`（購読世代の同一性判定）が同じ理由で同じ手法を
+/// 使っているのと同じ考え方。どちらかが不正な形式なら「同じではない」
+/// として扱う（安全側 - 判断に迷ったら失効させない）。
+fn same_hub(a: &str, b: &str) -> bool {
+    match (Endpoint::new(a), Endpoint::new(b)) {
+        (Ok(a), Ok(b)) => a.tags_url() == b.tags_url(),
+        _ => false,
+    }
+}
+
 /// `curl` で手動失効するときの1行を組み立てる（実行はしない）。手順7の
 /// 案内表示・失敗時のフォールバックの両方で使う。
 fn revoke_curl_hint(hub_url: &str, key_id: i64) -> String {
@@ -741,35 +770,51 @@ async fn main() {
     // == 2. 接続 ==============================================================
     println!("== 2. 接続 ==");
     let connect_view = hub1.connect(&hub_url).await;
-    let (step2_ok, catalog_tags, key_name_1, keyring_account_1, key_id_1) = match connect_view {
-        Ok(view) => {
-            let tag_count = view.tags.as_ref().map(|t| t.len());
-            println!("  状態: {}", view.status.as_str());
-            println!(
-                "  タグ件数: {}",
-                tag_count
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| "不明(catalog未取得)".to_owned())
-            );
-            println!("  キー名: {}", view.key_name.as_deref().unwrap_or("-"));
-            let record = read_hub_record(&settings1).await;
-            let keyring_account = record.as_ref().map(|r| r.keyring_account.clone());
-            // 手順7の後始末（キー失効の案内・CG_SMOKE_REVOKE）に使う
-            // key_id。自己発行なら必ず Some、手動キー採用ならこの
-            // ハーネスは使わないので気にしなくてよい（HubRecordのdoc）。
-            let key_id = record.as_ref().and_then(|r| r.key_id);
-            println!(
-                "  keyring account: {}",
-                keyring_account.as_deref().unwrap_or("-")
-            );
-            let ok = view.status.is_connected();
-            (ok, view.tags, view.key_name, keyring_account, key_id)
-        }
-        Err(err) => {
-            println!("  接続に失敗しました: {err}");
-            (false, None, None, None, None)
-        }
-    };
+    let (step2_ok, catalog_tags, key_name_1, keyring_account_1, key_id_1, record_endpoint_1) =
+        match connect_view {
+            Ok(view) => {
+                let tag_count = view.tags.as_ref().map(|t| t.len());
+                println!("  状態: {}", view.status.as_str());
+                println!(
+                    "  タグ件数: {}",
+                    tag_count
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "不明(catalog未取得)".to_owned())
+                );
+                println!("  キー名: {}", view.key_name.as_deref().unwrap_or("-"));
+                let record = read_hub_record(&settings1).await;
+                let keyring_account = record.as_ref().map(|r| r.keyring_account.clone());
+                // 手順7の後始末（キー失効の案内・CG_SMOKE_REVOKE）に使う
+                // key_id。自己発行なら必ず Some、手動キー採用ならこの
+                // ハーネスは使わないので気にしなくてよい（HubRecordのdoc）。
+                let key_id = record.as_ref().and_then(|r| r.key_id);
+                // レコードが「今回のHUB_URL」のものかどうかを手順7で確かめる
+                // ために、endpointも一緒に持ち出す（#382と同じ間違いをしない
+                // - same_hub のdoc comment参照）。connect()が失敗した場合、
+                // read_hub_record は同じ CG_SMOKE_DIR に残っていた**別の
+                // 実行・別のHub**のレコードを返しうる（失敗したconnectは
+                // レコードを書き換えない）ため、ここで捕まえておかないと
+                // 手順7がそれを「今回のキー」と誤認する。
+                let record_endpoint = record.as_ref().map(|r| r.endpoint.clone());
+                println!(
+                    "  keyring account: {}",
+                    keyring_account.as_deref().unwrap_or("-")
+                );
+                let ok = view.status.is_connected();
+                (
+                    ok,
+                    view.tags,
+                    view.key_name,
+                    keyring_account,
+                    key_id,
+                    record_endpoint,
+                )
+            }
+            Err(err) => {
+                println!("  接続に失敗しました: {err}");
+                (false, None, None, None, None, None)
+            }
+        };
     results.push(if step2_ok {
         StepResult::pass("接続", format!("状態=connected キー名={:?}", key_name_1))
     } else {
@@ -928,72 +973,77 @@ async fn main() {
         drop(settings1);
         pool1.close().await;
 
-        let pool2 = match init_db(&db_path).await {
-            Ok(pool) => pool,
+        match init_db(&db_path).await {
             Err(err) => {
                 println!("  再起動後のDB初期化に失敗しました: {err}");
                 results.push(StepResult::fail(
                     "再起動の模擬",
                     format!("init_db失敗: {err}"),
                 ));
-                print_summary(&results);
-                std::process::exit(1);
+                // 手順2で既にAPIキーを発行している可能性があるため、ここ
+                // で exit(1) しない（2026-09-17 Copilotレビュー指摘）:
+                // 早期終了すると手順6・7（保持観測・後片付けと残存キーの
+                // 案内）を丸ごと飛ばし、発行済みキーの案内が一切出ない
+                // まま終わってしまう。失敗を記録して最後まで進む。
             }
-        };
-        let settings2 = SettingsService::new(pool2.clone());
-        match HubService::new(settings2.clone(), keys.clone()).await {
-            Ok(hub2) => {
-                // 指示どおり connect() は呼ばない。resume() だけで復帰する
-                // ことを確認する。
-                hub2.resume().await;
-                match wait_for_live(&hub2, LIVE_WAIT_TIMEOUT, &mut tracker).await {
-                    Some(elapsed) => {
-                        println!("  live再到達: {:.1}秒", elapsed.as_secs_f64());
-                        // status() は「発行は絶対に行わない」(hub.rs のdoc)
-                        // ので、ここで呼んでも新しいキーは発行されない。
-                        let view = hub2.status().await;
-                        let record_after = read_hub_record(&settings2).await;
-                        let key_name_after = record_after.as_ref().and_then(|r| r.key_name.clone());
-                        let account_after =
-                            record_after.as_ref().map(|r| r.keyring_account.clone());
-                        let key_name_same = key_name_after == key_name_1;
-                        let account_same = account_after == keyring_account_1;
-                        let secret_after = account_after
-                            .as_deref()
-                            .and_then(|account| keys.get(account).ok().flatten());
-                        let secret_same = secret_before.is_some() && secret_before == secret_after;
-                        println!(
-                            "  key_name 再利用: {} (手順2={:?}, 再起動後={:?})",
-                            key_name_same, key_name_1, key_name_after
-                        );
-                        println!("  keyring account 再利用: {account_same}");
-                        println!("  平文キーの内容も同一(値は印字しない): {}", secret_same);
-                        let (tally, update_count, received_any_value) =
-                            observe_live(&hub2, watch_secs.min(10), &mut tracker).await;
-                        println!("  再起動後の品質内訳: {}", tally.summary());
-                        println!("  再起動後に値が更新された回数: {update_count}");
-                        let received_values = received_any_value || update_count >= 1;
-                        // status() は Hub への REST 接続状態（6状態）であって
-                        // 購読の状態ではない - 一度 live になったあとで購読が
-                        // 落ちていても status() は connected のままになりうる
-                        // （2026-09-17 Copilotレビュー指摘、実際にこれで
-                        // 壊れた購読を見逃した）。観測後に改めて
-                        // subscription() を読み、購読自体が live のままで
-                        // あることも PASS の条件にする。
-                        let post_subscription = hub2.subscription().await;
-                        let subscription_still_live = post_subscription.state == "live";
-                        println!(
-                            "  観測後の購読状態: {} (live維持={subscription_still_live})",
-                            post_subscription.state
-                        );
-                        let status_ok = matches!(view, Ok(ref v) if v.status.is_connected());
-                        let ok = key_name_same
-                            && account_same
-                            && secret_same
-                            && status_ok
-                            && subscription_still_live
-                            && received_values;
-                        results.push(if ok {
+            Ok(pool2) => {
+                let settings2 = SettingsService::new(pool2.clone());
+                match HubService::new(settings2.clone(), keys.clone()).await {
+                    Ok(hub2) => {
+                        // 指示どおり connect() は呼ばない。resume() だけで復帰する
+                        // ことを確認する。
+                        hub2.resume().await;
+                        match wait_for_live(&hub2, LIVE_WAIT_TIMEOUT, &mut tracker).await {
+                            Some(elapsed) => {
+                                println!("  live再到達: {:.1}秒", elapsed.as_secs_f64());
+                                // status() は「発行は絶対に行わない」(hub.rs のdoc)
+                                // ので、ここで呼んでも新しいキーは発行されない。
+                                let view = hub2.status().await;
+                                let record_after = read_hub_record(&settings2).await;
+                                let key_name_after =
+                                    record_after.as_ref().and_then(|r| r.key_name.clone());
+                                let account_after =
+                                    record_after.as_ref().map(|r| r.keyring_account.clone());
+                                let key_name_same = key_name_after == key_name_1;
+                                let account_same = account_after == keyring_account_1;
+                                let secret_after = account_after
+                                    .as_deref()
+                                    .and_then(|account| keys.get(account).ok().flatten());
+                                let secret_same =
+                                    secret_before.is_some() && secret_before == secret_after;
+                                println!(
+                                    "  key_name 再利用: {} (手順2={:?}, 再起動後={:?})",
+                                    key_name_same, key_name_1, key_name_after
+                                );
+                                println!("  keyring account 再利用: {account_same}");
+                                println!("  平文キーの内容も同一(値は印字しない): {}", secret_same);
+                                let (tally, update_count, received_any_value) =
+                                    observe_live(&hub2, watch_secs.min(10), &mut tracker).await;
+                                println!("  再起動後の品質内訳: {}", tally.summary());
+                                println!("  再起動後に値が更新された回数: {update_count}");
+                                let received_values = received_any_value || update_count >= 1;
+                                // status() は Hub への REST 接続状態（6状態）であって
+                                // 購読の状態ではない - 一度 live になったあとで購読が
+                                // 落ちていても status() は connected のままになりうる
+                                // （2026-09-17 Copilotレビュー指摘、実際にこれで
+                                // 壊れた購読を見逃した）。観測後に改めて
+                                // subscription() を読み、購読自体が live のままで
+                                // あることも PASS の条件にする。
+                                let post_subscription = hub2.subscription().await;
+                                let subscription_still_live = post_subscription.state == "live";
+                                println!(
+                                    "  観測後の購読状態: {} (live維持={subscription_still_live})",
+                                    post_subscription.state
+                                );
+                                let status_ok =
+                                    matches!(view, Ok(ref v) if v.status.is_connected());
+                                let ok = key_name_same
+                                    && account_same
+                                    && secret_same
+                                    && status_ok
+                                    && subscription_still_live
+                                    && received_values;
+                                results.push(if ok {
                             StepResult::pass(
                                 "再起動の模擬",
                                 format!(
@@ -1011,36 +1061,38 @@ async fn main() {
                                 ),
                             )
                         });
-                    }
-                    None => {
-                        let view = hub2.subscription().await;
-                        println!(
+                            }
+                            None => {
+                                let view = hub2.subscription().await;
+                                println!(
                             "  失敗: {}秒以内にliveへ再到達しませんでした(現在の状態={}, 理由={})",
                             LIVE_WAIT_TIMEOUT.as_secs(),
                             view.state,
                             view.reason.as_deref().unwrap_or("-")
                         );
+                                results.push(StepResult::fail(
+                                    "再起動の模擬",
+                                    format!("live再到達タイムアウト(状態={})", view.state),
+                                ));
+                            }
+                        }
+                        // live に届いたかどうかに関わらず、手順6(保持観測)で使える
+                        // よう HubService と DB プールは生かしたまま持ち越す。
+                        hub2_for_hold = Some(hub2);
+                        pool2_for_hold = Some(pool2);
+                    }
+                    Err(err) => {
+                        println!("  再起動後のHubService初期化に失敗しました: {err}");
                         results.push(StepResult::fail(
                             "再起動の模擬",
-                            format!("live再到達タイムアウト(状態={})", view.state),
+                            format!("HubService::new失敗: {err}"),
                         ));
+                        // HubServiceを構築できなかったので手順6には持ち越さない。
+                        // このプールはもう使わないので、他の分岐と同じくここで
+                        // 明示的に閉じる。
+                        pool2.close().await;
                     }
                 }
-                // live に届いたかどうかに関わらず、手順6(保持観測)で使える
-                // よう HubService と DB プールは生かしたまま持ち越す。
-                hub2_for_hold = Some(hub2);
-                pool2_for_hold = Some(pool2);
-            }
-            Err(err) => {
-                println!("  再起動後のHubService初期化に失敗しました: {err}");
-                results.push(StepResult::fail(
-                    "再起動の模擬",
-                    format!("HubService::new失敗: {err}"),
-                ));
-                // HubServiceを構築できなかったので手順6には持ち越さない。
-                // このプールはもう使わないので、他の分岐と同じくここで
-                // 明示的に閉じる。
-                pool2.close().await;
             }
         }
     }
@@ -1100,50 +1152,100 @@ async fn main() {
     // MemoryKeyStoreは実行のたびに空から始まるので、手順2で毎回新しい
     // readキーがHub側に発行される。disconnectはHub側を失効させない契約
     // なので、案内無しでは孤児キーが溜まり続ける。
-    let cleanup_detail = match key_id_1 {
+    //
+    // **失効する前に、そのレコードが今回のHUB_URLのものかを必ず確かめる**
+    // （#382と同じ間違いをしない - same_hub のdoc comment参照）。
+    // 同じCG_SMOKE_DIRを別のHubに向けて使い、今回のconnect()が失敗した
+    // 場合、read_hub_recordは古い（別のHubの）レコードを返しうる。
+    // key_idはHubごとの連番なので、確かめずに使うと無関係な第三者の
+    // キーを失効させかねない。
+    let (cleanup_detail, cleanup_ok) = match key_id_1 {
         Some(key_id) => {
             let key_name_display = key_name_1.as_deref().unwrap_or("-");
-            let hint = revoke_curl_hint(&hub_url, key_id);
-            if auto_revoke {
+            let record_endpoint_display = record_endpoint_1.as_deref().unwrap_or("-");
+            let matches_current_hub = record_endpoint_1
+                .as_deref()
+                .is_some_and(|endpoint| same_hub(endpoint, &hub_url));
+            if !matches_current_hub {
+                let hint = revoke_curl_hint(record_endpoint_display, key_id);
+                println!(
+                    "  設定に残っている記録は別のHub({record_endpoint_display})のものです(今回のHUB_URL={hub_url}とは異なる接続先)。"
+                );
+                println!(
+                    "  別Hubのレコードなので、このハーネスはCG_SMOKE_REVOKE=1が指定されていても失効させません。"
+                );
+                println!("  片付けたい場合は、そのHub宛てに手動で失効させてください:");
+                println!("    {hint}");
+                (
+                    format!(
+                        "key_id={key_id}は別Hub({record_endpoint_display})のもののため失効せず。手動失効: {hint}"
+                    ),
+                    true,
+                )
+            } else if auto_revoke {
+                let hint = revoke_curl_hint(&hub_url, key_id);
                 println!(
                     "  CG_SMOKE_REVOKE=1: 手順2で発行したAPIキー(id={key_id}, name={key_name_display})を失効させます..."
                 );
                 match revoke_api_key(&hub_url, key_id).await {
                     Ok(()) => {
                         println!("  失効しました。Hub側にはもう残りません。");
-                        format!("key_id={key_id}を失効させた")
+                        (format!("key_id={key_id}を失効させた"), true)
                     }
                     Err(message) => {
                         println!("  失効に失敗しました: {message}");
                         println!("  このキーはHubに残ります。不要なら手動で失効させてください:");
                         println!("    {hint}");
-                        format!("key_id={key_id}の失効に失敗({message})。手動失効: {hint}")
+                        // サマリが嘘をつかないよう、失効を頼まれたのに
+                        // 失敗した場合はこの段階をFAILにする
+                        // （2026-09-17 Copilotレビュー指摘: 以前はこの
+                        // ケースでもPASSのままで、総合結果が成功に見えた）。
+                        (
+                            format!("key_id={key_id}の失効に失敗({message})。手動失効: {hint}"),
+                            false,
+                        )
                     }
                 }
             } else {
+                let hint = revoke_curl_hint(&hub_url, key_id);
                 println!("  発行したAPIキー: id={key_id}, name={key_name_display}");
                 println!(
                     "  このキーはHubに残ります(disconnectはHub側を失効させない契約)。不要なら失効させてください:"
                 );
                 println!("    {hint}");
+                // 「CG_SMOKE_REVOKE=1で再実行」とだけ書くと、CG_SMOKE_DIR
+                // を指定せずに再実行して別のキーを新規発行しただけになり、
+                // 今回のキーは孤児のままになる（2026-09-17 Copilotレビュー
+                // 指摘）。同じCG_SMOKE_DIRを使うよう明示する。
                 println!(
-                    "  (このハーネスに自動で失効させたい場合は CG_SMOKE_REVOKE=1 を指定して再実行してください)"
+                    "  (自動で失効させたい場合は、同じ CG_SMOKE_DIR を指定して CG_SMOKE_REVOKE=1 で再実行してください: CG_SMOKE_DIR={} CG_SMOKE_REVOKE=1。またはこの curl コマンドで直接失効させてください)",
+                    smoke_dir.display()
                 );
-                format!("key_id={key_id}はHubに残存。失効: {hint}")
+                (format!("key_id={key_id}はHubに残存。失効: {hint}"), true)
             }
         }
         None => {
             println!("  発行済みAPIキーはありません(手順2で接続できなかった、またはロックダウン済みHub)。");
-            "発行済みキー無し".to_owned()
+            ("発行済みキー無し".to_owned(), true)
         }
     };
-    results.push(StepResult::pass(
-        "後片付け",
-        format!(
-            "作業ディレクトリを保持: {}, {cleanup_detail}",
-            smoke_dir.display()
-        ),
-    ));
+    results.push(if cleanup_ok {
+        StepResult::pass(
+            "後片付け",
+            format!(
+                "作業ディレクトリを保持: {}, {cleanup_detail}",
+                smoke_dir.display()
+            ),
+        )
+    } else {
+        StepResult::fail(
+            "後片付け",
+            format!(
+                "作業ディレクトリを保持: {}, {cleanup_detail}",
+                smoke_dir.display()
+            ),
+        )
+    });
     println!();
 
     print_transition_log(&tracker.log);
