@@ -472,9 +472,46 @@ struct Generation {
     started_at: i64,
     /// このサービスが何本目に張った世代か（1 始まり）。ログと、テストが
     /// 「張り直したか／据え置いたか」を見るための観測点。`fingerprint` は
-    /// 同じでも張り直すことがある（資格情報の変更・`Unauthorized`）ので、
-    /// 同一性の比較ではこれを使わない。
+    /// 同じでも張り直すことがある（資格情報の変更・終端状態）ので、同一性の
+    /// 比較ではこれを使わない。
     sequence: usize,
+}
+
+/// 現世代の [`TagClientState`] のうち、張り直しの判断に使う部分だけ。
+/// 判断を純関数に保つための小さな写し。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GenerationHealth {
+    state: TagClientConnectionState,
+    /// `last_error` があるか（**どの分類か**は判断に使わない - ここで見たい
+    /// のは「エラーで終わったのか、まだ／もう何も起きていないのか」だけ）。
+    failed: bool,
+}
+
+/// 世代が**終端している**（自力では二度と復帰しない）状態か。
+///
+/// `banto-tagclient` のワーカーは 2 通りの終わり方をする:
+///
+/// * `Unauthorized` … 401/403。単発の終端失敗で、再試行しない。
+/// * `Stopped` + `last_error` あり … retryable でも rebindable でもない
+///   分類（`InvalidTagSelection` など）でワーカーが**終了した**形。
+///   **世代（と `TagClientHandle`）は残ったまま**なので、「世代が無い」条件
+///   では拾えない。
+///
+/// どちらもこちらが張り直さない限り値は二度と流れない。
+///
+/// `last_error` の有無まで見るのは、**起動直後の一瞬も `Stopped`** だから:
+/// `start()` した世代は最初の状態が `Stopped`（`last_error` 無し）で、
+/// すぐに `Connecting` へ移る。ここを終端扱いにすると、その瞬間に
+/// `status()` が走っただけで張り直してしまい、「`status()` のたびに WS を
+/// 張り直さない」という一番大事な不変条件が壊れる。正常停止
+/// （`shutdown()`）も `last_error` 無しの `Stopped` なので、同じ判定で
+/// 区別できる。
+fn is_terminal(health: GenerationHealth) -> bool {
+    match health.state {
+        TagClientConnectionState::Unauthorized => true,
+        TagClientConnectionState::Stopped => health.failed,
+        _ => false,
+    }
 }
 
 /// 同一性（[`Fingerprint`]）が一致しているのに、それでも張り直すべきか。
@@ -485,14 +522,28 @@ struct Generation {
 /// * [`Trigger::CredentialsChanged`] … `connect` / `adopt_manual_key` の後。
 ///   キーが増えた／差し替わったので、同じ接続先・同じタグでも新しいキーで
 ///   張り直さないと意味が無い。
-/// * 現世代が `Unauthorized` … `banto-tagclient` にとって終端状態で、放って
-///   おくと二度と復帰しない。キーリング側が更新されている可能性があるので
-///   張り直す（ダメならまた `Unauthorized` になるだけ）。
+/// * 現世代が終端している（[`is_terminal`]）… 放っておくと復帰しない。
+///   同一性が同じでも張り直す（ダメならまた同じ終端状態になるだけ）。
+///   これが無いと、見張りが再試行しても同一性一致で no-op になり、止まった
+///   世代が居座り続ける。
 fn must_restart_despite_same_fingerprint(
     trigger: Trigger,
-    state: Option<TagClientConnectionState>,
+    health: Option<GenerationHealth>,
 ) -> bool {
-    trigger == Trigger::CredentialsChanged || state == Some(TagClientConnectionState::Unauthorized)
+    trigger == Trigger::CredentialsChanged || health.is_some_and(is_terminal)
+}
+
+/// 見張り（[`HubService::spawn_supervisor`]）の 1 周期で再試行すべきか。
+/// 判断表はそちらの doc comment にある。純関数なのでテストで固定できる。
+fn needs_retry(health: Option<GenerationHealth>) -> bool {
+    match health {
+        // 世代が無い: まだ／もう張れていない。
+        None => true,
+        // 終端している（`Unauthorized` / エラーで終わった `Stopped`）:
+        // 放っておくと戻らない。
+        // `Rebinding`: requests が catalog と合っておらず再計画でしか直らない。
+        Some(health) => is_terminal(health) || health.state == TagClientConnectionState::Rebinding,
+    }
 }
 
 /// [`HubService`] が持つ購読スロット。
@@ -563,11 +614,15 @@ impl Subscription {
         }
     }
 
-    /// 現世代の接続状態（世代が無ければ `None`）。
-    fn connection_state(&self) -> Option<TagClientConnectionState> {
-        self.generation
-            .as_ref()
-            .map(|generation| generation.states.borrow().connection_state())
+    /// 現世代の健康状態（世代が無ければ `None`）。
+    fn health(&self) -> Option<GenerationHealth> {
+        self.generation.as_ref().map(|generation| {
+            let state = generation.states.borrow();
+            GenerationHealth {
+                state: state.connection_state(),
+                failed: state.last_error().is_some(),
+            }
+        })
     }
 }
 
@@ -749,7 +804,8 @@ impl HubService {
     /// | 現世代 | 動くか | 理由 |
     /// | --- | --- | --- |
     /// | 無い | ○ | まだ／もう張れていない。再計画で直る可能性がある |
-    /// | `Unauthorized` | ○ | キーが差し替わっていれば直る（終端状態なので放っておくと戻らない） |
+    /// | `Unauthorized` | ○ | 終端状態。キーが差し替わっていれば直る（放っておくと戻らない） |
+    /// | `Stopped` | ○ | ワーカーが retryable でも rebindable でもない分類（`InvalidTagSelection` など）で**終了した**形。世代は残るので「無い」では拾えず、拾わないと永久に止まったまま。起動直後の一瞬も `Stopped` だが、次の評価は [`SUPERVISOR_INTERVAL`] 後なので、そのころには先へ進んでいるか本当に死んでいるかのどちらか |
     /// | `Rebinding` | ○ | requests が catalog と合っていない。**再計画でしか直らない** |
     /// | `Live` | × | 正常。触る理由が無い |
     /// | `Connecting` / `Handshaking` | × | 進行中。割り込むと無駄に張り直す |
@@ -787,13 +843,7 @@ impl HubService {
         if self.inner.mirror.current().is_none() {
             return;
         }
-        let needs_retry = match self.inner.subscription.lock().await.connection_state() {
-            None => true,
-            Some(TagClientConnectionState::Unauthorized)
-            | Some(TagClientConnectionState::Rebinding) => true,
-            Some(_) => false,
-        };
-        if !needs_retry {
+        if !needs_retry(self.inner.subscription.lock().await.health()) {
             return;
         }
         if let Err(err) = self.resume_inner().await {
@@ -896,11 +946,14 @@ impl HubService {
                 eprintln!(
                     "banto: 選択タグ保存後のHubタグ一覧の再取得に失敗しました（古い購読を止めて再試行を待ちます）: {err}"
                 );
-                self.inner
-                    .subscription
-                    .lock()
-                    .await
-                    .stop(Some(REASON_SELECTION_CHANGED_REFRESH_FAILED.to_owned()))
+                let mut slot = self.inner.subscription.lock().await;
+                // 未解決・購読不可は**直前の選択**を catalog と突き合わせた
+                // 結果なので、選択が変わった今はもう何も語っていない。新しい
+                // 選択と並べて出すと理由（再取得できなかった）と中身が食い違う
+                // ため、`reconcile_with` の未接続分岐と同じく伏せる。
+                slot.unresolved.clear();
+                slot.unsupported.clear();
+                slot.stop(Some(REASON_SELECTION_CHANGED_REFRESH_FAILED.to_owned()))
                     .await;
             }
         }
@@ -1029,9 +1082,7 @@ impl HubService {
             .generation
             .as_ref()
             .is_some_and(|generation| generation.fingerprint == fingerprint);
-        if same_generation
-            && !must_restart_despite_same_fingerprint(trigger, slot.connection_state())
-        {
+        if same_generation && !must_restart_despite_same_fingerprint(trigger, slot.health()) {
             slot.reason = None;
             return;
         }
@@ -1469,37 +1520,90 @@ mod tests {
         );
     }
 
-    /// 同一性が一致していても張り直すべき 2 つの場合（Copilot F3）。
+    fn healthy(state: TagClientConnectionState) -> Option<GenerationHealth> {
+        Some(GenerationHealth {
+            state,
+            failed: false,
+        })
+    }
+
+    fn failed(state: TagClientConnectionState) -> Option<GenerationHealth> {
+        Some(GenerationHealth {
+            state,
+            failed: true,
+        })
+    }
+
+    /// 同一性が一致していても張り直すべき場合（資格情報の変更と終端状態）。
     #[test]
-    fn a_matching_fingerprint_is_still_restarted_for_new_credentials_or_unauthorized() {
+    fn a_matching_fingerprint_is_still_restarted_for_new_credentials_or_a_terminal_state() {
         use TagClientConnectionState as State;
 
         // 資格情報が変わったかもしれない経路は常に張り直す。
-        for state in [None, Some(State::Live), Some(State::Reconnecting)] {
+        for health in [None, healthy(State::Live), healthy(State::Reconnecting)] {
             assert!(must_restart_despite_same_fingerprint(
                 Trigger::CredentialsChanged,
-                state
+                health
             ));
         }
-        // 終端した `Unauthorized` は、観測のための突き合わせでも張り直す
-        // （キーリング側が更新されているかもしれない）。
+        // 終端した世代は、観測のための突き合わせでも張り直す。これが無いと
+        // 見張りが再試行しても同一性一致で no-op になり、止まった世代が
+        // 居座り続ける。
         assert!(must_restart_despite_same_fingerprint(
             Trigger::Observe,
-            Some(State::Unauthorized)
+            healthy(State::Unauthorized)
         ));
+        assert!(
+            must_restart_despite_same_fingerprint(Trigger::Observe, failed(State::Stopped)),
+            "エラーで終了した世代は残っていても張り直す"
+        );
         // それ以外は据え置き - `status()` のたびに WS を張り直さない。
-        for state in [
+        // **起動直後の `Stopped`（`last_error` 無し）を含む**: ここを終端
+        // 扱いにすると、張った直後に `status()` が走っただけで張り直す。
+        for health in [
             None,
-            Some(State::Live),
-            Some(State::Connecting),
-            Some(State::Handshaking),
-            Some(State::Rebinding),
-            Some(State::Reconnecting),
+            healthy(State::Stopped),
+            healthy(State::Live),
+            healthy(State::Connecting),
+            healthy(State::Handshaking),
+            healthy(State::Rebinding),
+            healthy(State::Reconnecting),
         ] {
             assert!(!must_restart_despite_same_fingerprint(
                 Trigger::Observe,
-                state
+                health
             ));
+        }
+    }
+
+    /// 見張りが 1 周期で動く条件（`spawn_supervisor` の判断表）。
+    ///
+    /// エラーで終了した `Stopped` が要るのは、ワーカーが retryable でも
+    /// rebindable でもない分類で終わったとき**世代が残る**から - 「世代が
+    /// 無い」条件では拾えず、拾わないと永久に止まったままになる（UI の
+    /// 「まもなく自動で再試行します」も嘘になる）。
+    #[test]
+    fn the_supervisor_retries_only_states_that_cannot_recover_on_their_own() {
+        use TagClientConnectionState as State;
+
+        assert!(needs_retry(None), "世代が無ければ張りに行く");
+        assert!(needs_retry(healthy(State::Unauthorized)));
+        assert!(
+            needs_retry(failed(State::Stopped)),
+            "エラーで終了した世代は自力で復帰しない"
+        );
+        assert!(needs_retry(healthy(State::Rebinding)));
+        for health in [
+            healthy(State::Stopped),
+            healthy(State::Live),
+            healthy(State::Connecting),
+            healthy(State::Handshaking),
+            healthy(State::Reconnecting),
+        ] {
+            assert!(
+                !needs_retry(health),
+                "進行中・正常・張った直後には割り込まない（`Reconnecting` は tagclient 側の backoff の仕事）"
+            );
         }
     }
 
@@ -1772,7 +1876,9 @@ mod tests {
     /// あとも古い選択のタグの値が流れ続けてしまう。
     #[tokio::test]
     async fn a_selection_change_whose_refresh_fails_drops_the_stale_generation() {
-        let (settings, hub) = service_with_keyring(&closed_endpoint(), &["a"]).await;
+        // 古い選択には「消えたタグ」と「購読できない名前」も混ぜておく -
+        // これらが選択変更後に残らないことまで確かめたいので。
+        let (settings, hub) = service_with_keyring(&closed_endpoint(), &["a", "gone", "x,y"]).await;
         hub.reconcile_with(
             &HubStatus::Connected { tag_count: 1 },
             Some(&catalog(&["a"])),
@@ -1783,11 +1889,14 @@ mod tests {
             generation_sequence(&hub).await.is_some(),
             "まず古い選択で世代が立っている"
         );
+        let before = hub.subscription().await;
+        assert_eq!(before.unresolved, owned(&["gone"]));
+        assert_eq!(before.unsupported, owned(&["x,y"]));
 
         // `refresh_catalog()` が `Err` になる接続先へ差し替える（到達不能な
         // 接続先は `Ok(Unreachable)` になり、そちらは通常の突き合わせで
         // 世代が落ちるため、ここでは解釈できない綴りを使う）。
-        let broken = keyring_record("https://example.test", &["a"]);
+        let broken = keyring_record("https://example.test", &["a", "gone", "x,y"]);
         settings
             .set(KEY_HUB_RECORD, &serde_json::to_string(&broken).unwrap())
             .await
@@ -1807,6 +1916,10 @@ mod tests {
             view.reason.as_deref(),
             Some(REASON_SELECTION_CHANGED_REFRESH_FAILED)
         );
+        // 未解決・購読不可は**直前の選択**の判定なので、選択が変わった今は
+        // 残さない（理由と中身が食い違う）。
+        assert!(view.unresolved.is_empty());
+        assert!(view.unsupported.is_empty());
         // 選択自体は保存されている（見張りが次の周期で張り直す材料になる）。
         let stored: HubRecord =
             serde_json::from_str(&settings.get(KEY_HUB_RECORD).await.unwrap().unwrap()).unwrap();

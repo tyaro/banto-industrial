@@ -35,9 +35,9 @@
 		hubSubscriptionDetail,
 		hubSubscriptionLabel,
 		isHubAvailable,
-		needsManualKey,
 		refreshHubCatalog,
 		setHubSelectedTags,
+		showManualKeyEntry,
 		type HubStatus,
 		type HubSubscription,
 		type HubTag,
@@ -194,7 +194,13 @@
 	onMount(() => {
 		if (!available) return;
 		document.addEventListener('visibilitychange', onVisibilityChange);
-		if (document.visibilityState === 'visible') startPolling();
+		if (document.visibilityState === 'visible') {
+			// 即時に 1 回読む。`$effect` の `getHubStatus()` が失敗すると
+			// `subscription` が埋まらないので、これが無いと購読ブロックが
+			// 最初の周期（2 秒）まで出ない。
+			void pollSubscription();
+			startPolling();
+		}
 	});
 
 	onDestroy(() => {
@@ -239,7 +245,7 @@
 				<p class="error">{hubError}</p>
 			{/if}
 
-			{#if needsManualKey(status)}
+			{#if showManualKeyEntry(status, subscription)}
 				<div class="server-fields">
 					<label class="field hub-endpoint">
 						APIキー（Hubの管理画面で発行したもの）

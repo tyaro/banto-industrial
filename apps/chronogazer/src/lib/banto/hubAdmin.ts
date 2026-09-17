@@ -329,9 +329,26 @@ export function hubUnreachableCauseLabel(cause: HubUnreachableCause): string {
 	}
 }
 
-/** 手動キーの入力欄を出すべき状態か（純関数）。 */
+/** 手動キーの入力欄を出すべき接続状態か（純関数）。 */
 export function needsManualKey(status: HubStatus): boolean {
 	return status.state === 'needsPairing' || status.state === 'forbidden';
+}
+
+/**
+ * 手動キーの入力欄を出すべきか（接続状態と購読状態の**両方**を見る純関数）。
+ *
+ * catalog は読めていて WS のハンドシェイクだけが 401/403 だと、接続状態は
+ * `connected` のまま購読だけ `unauthorized` になる。バックエンドでこの 2 つを
+ * 別軸にしておくのは正しい（購読の失敗で 6 状態を汚さない）が、**UI で合流
+ * させないとユーザーに直す手段が無くなる** - 接続側の状態だけを見ていると
+ * 手動キーの導線が出ないため。#383 段階1 の受入「`Unauthorized` は既存の
+ * 認証・手動キーの導線へ合流させる」はこれを指す。
+ */
+export function showManualKeyEntry(
+	status: HubStatus,
+	subscription: HubSubscription | null
+): boolean {
+	return needsManualKey(status) || subscription?.state === 'unauthorized';
 }
 
 /**
@@ -379,7 +396,12 @@ export function hubSubscriptionDetail(subscription: HubSubscription): string {
 		return '購読していません。';
 	}
 	if (subscription.state === 'unauthorized') {
-		return 'Hubが購読を拒否しました。APIキーの権限を確認してください（接続設定の状態は別に表示しています）。';
+		// タグ一覧は読めていても購読だけ拒否されることがある（WS のハンド
+		// シェイクだけが 401/403）。ユーザーにとっては接続の状態表示が何で
+		// あれ「認証が通っていない」なので、接続側の `authFailed` と同じ
+		// 導線（再接続で再発行 / 管理者発行のキーを採用）へ誘導する。
+		// 入力欄はこのブロックより上にあるので「下の欄」とは言わない。
+		return 'Hubがこのキーでの購読を拒否しました（認証が通っていません）。「接続」でキーを再発行するか、Hubの管理画面で発行したAPIキーをこの画面の入力欄から採用してください。';
 	}
 	return `${subscription.subscribedCount}件のタグを購読しています。`;
 }

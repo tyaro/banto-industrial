@@ -21,6 +21,7 @@ import {
 	hubSubscriptionLabel,
 	hubUnreachableCauseLabel,
 	needsManualKey,
+	showManualKeyEntry,
 	type HubStatus,
 	type HubSubscription,
 	type HubSubscriptionState
@@ -174,8 +175,13 @@ describe('hubSubscriptionDetail', () => {
 		expect(live).not.toBe(hubSubscriptionDetail(subscription({ state: 'stopped', reason: 'x' })));
 	});
 
-	it('unauthorized は接続設定の状態とは別軸であることを述べる', () => {
-		expect(hubSubscriptionDetail(subscription({ state: 'unauthorized' }))).toContain('接続設定');
+	it('unauthorized は接続側と同じ導線（再発行 / キーの採用）へ誘導する', () => {
+		const detail = hubSubscriptionDetail(subscription({ state: 'unauthorized' }));
+		expect(detail).toContain('接続');
+		expect(detail).toContain('採用');
+		// 「接続設定の状態とは別」と言い切らない - ユーザーにとっては同じ
+		// 「認証が通っていない」であり、別軸なのは内部の話。
+		expect(detail).toContain('認証が通っていません');
 	});
 
 	it('未解決タグは状態に関わらず保持され、空表示に潰れない', () => {
@@ -219,5 +225,33 @@ describe('hubSubscriptionDetail', () => {
 		});
 		expect(stopped.unresolved).toEqual(['gone']);
 		expect(stopped.unsupported).toEqual(['a,b']);
+	});
+});
+
+describe('showManualKeyEntry', () => {
+	it('接続側が連携要求・権限不足のときは従来どおり出す', () => {
+		expect(showManualKeyEntry({ state: 'needsPairing' }, null)).toBe(true);
+		expect(showManualKeyEntry({ state: 'forbidden' }, null)).toBe(true);
+	});
+
+	it('接続は connected でも購読だけ unauthorized なら出す（直す手段を残す）', () => {
+		// catalog は読めていて WS のハンドシェイクだけが 401/403 の場合。
+		// 接続側の状態だけを見ていると手動キーの導線に到達できない。
+		expect(
+			showManualKeyEntry(
+				{ state: 'connected', tagCount: 3 },
+				subscription({ state: 'unauthorized' })
+			)
+		).toBe(true);
+	});
+
+	it('購読が正常なら接続側の状態にだけ従う', () => {
+		expect(
+			showManualKeyEntry({ state: 'connected', tagCount: 3 }, subscription({ state: 'live' }))
+		).toBe(false);
+		expect(showManualKeyEntry({ state: 'authFailed' }, subscription({ state: 'stopped' }))).toBe(
+			false
+		);
+		expect(showManualKeyEntry({ state: 'notConfigured' }, null)).toBe(false);
 	});
 });
