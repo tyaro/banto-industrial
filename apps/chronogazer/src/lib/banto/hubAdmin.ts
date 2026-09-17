@@ -95,8 +95,9 @@ export interface HubSubscription {
 	 */
 	unresolved: string[];
 	/**
-	 * 購読プロトコルが受け付けない綴りの external name（カンマ入り・空白
-	 * だけ）。`unresolved` とは**理由も次の一手も違う**ので混ぜない。
+	 * そのままでは購読要求に載せられなかった external name（名前にカンマを
+	 * 含む・空白だけ、または他の名前と同じタグ（安定 ID）を指す重複）。
+	 * `unresolved` とは**理由も次の一手も違う**ので混ぜない。
 	 */
 	unsupported: string[];
 	lastError: string | null;

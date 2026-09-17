@@ -249,11 +249,20 @@ SLMP / Modbus TCP 直結は段階2 なので、ここには含まれない。
 選んだ external name を catalog と突き合わせる純関数 `plan_bindings` が、要求・`unresolved`・
 `unsupported` の 3 つに分ける。**理由が違うものは混ぜない**（次の一手が違う）。
 
-- **`unsupported`（購読プロトコルが受け付けない名前）**: 購読要求はタグ名を**カンマ区切り**で並べる
-  ため、名前自体にカンマを含められない（`stream_core::validate_tag_selection`。空白だけの名前も同様）。
-  `RestClient::start` はこの検査をしない（重複と空だけを見る）ので、1 件混ざると**ワーカーが毎回
-  `InvalidTagSelection` で失敗し、購読全体が死ぬ**（retryable でも rebindable でもない）。したがって
-  catalog を引く前にここへ落とし、**残りのタグは購読する**。直し方は「Hub 側でタグ名を変える」。
+- **`unsupported`（そのままでは購読要求に載せられない名前）**: 2 つある。
+  - **名前の綴り**: 購読要求はタグ名を**カンマ区切り**で並べるため、名前自体にカンマを含められない
+    （`stream_core::validate_tag_selection`。空白だけの名前も同様）。`RestClient::start` はこの検査を
+    しない（重複と空だけを見る）ので、1 件混ざると**ワーカーが毎回 `InvalidTagSelection` で失敗し、
+    購読全体が死ぬ**（retryable でも rebindable でもない）。catalog を引く前にここへ落とす。
+  - **同じ安定 ID を指す重複**: 別々の external name が同じ `StableTagId` を指していると（Hub 側の
+    catalog の不整合）、`start()` が `DuplicateRequestedStableId` で**購読全体を拒否する**。先勝ちで
+    1 つだけ購読し、残りをここへ落とす。
+    どちらも**残りのタグは購読する**。直し方は「Hub 側のタグ定義を直す」。
+    なお、**catalog 自体に重複した安定 ID がある場合は購読そのものが成立しない**: `resolve_bindings` は
+    catalog 全体を安定 ID で索引するときに重複を見つけると `DuplicateCatalogStableId` で fail closed
+    するので、こちらが要求を 1 つに畳んでもワーカーはそこで止まる（retryable でも rebindable でもない
+    ので終端）。**Hub の不整合はクライアント側では救えない** — ただし終端した世代は §10.5 の見張りが
+    拾い続けるので、Hub 側が直れば自動で復帰する。
 - **`unresolved`（catalog に無い名前）**: Hub から消えた／権限で見えない。**残りだけで購読する**。
   直し方は「Hub にタグを戻す／権限を足す」。
 - 重複する名前は 1 つに畳む（`resolve_bindings`/`start` は重複 `binding_key` / 重複 `stable_id` を

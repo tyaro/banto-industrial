@@ -412,12 +412,13 @@
 				{/if}
 
 				<!--
-					「購読できない名前」は「Hubから消えた」とは理由も直し方も
-					違う（名前を直す vs Hubにタグを戻す）ので、同じ一覧に混ぜない。
+					「購読できないタグ」は「Hubから消えた」とは理由も直し方も
+					違う（Hub側のタグ定義を直す vs Hubにタグを戻す）ので、同じ
+					一覧に混ぜない。
 				-->
 				{#if subscription.unsupported.length > 0}
 					<p class="note">
-						次のタグは購読できない名前です（カンマを含むなど、購読プロトコルが受け付けません）。{hubRemainderNote(
+						次のタグはそのままでは購読できません（名前にカンマを含む、他のタグと同じタグを指しているなど）。Hub側のタグ定義を確認してください。{hubRemainderNote(
 							subscription.subscribedCount
 						)}
 					</p>

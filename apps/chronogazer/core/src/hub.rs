@@ -30,8 +30,9 @@
 //! そのほかの規律:
 //!
 //! * 選んだタグのうち catalog に無いもの（Hub から消えた／権限で見えない）
-//!   は `unresolved`、購読プロトコルが受け付けない綴り（カンマ入り・空白
-//!   だけ）は `unsupported` に出し、**残りだけで購読する**。1 個の事故で
+//!   は `unresolved`、そのままでは購読要求に載せられないもの（名前にカンマを
+//!   含む・空白だけ、同じ安定 ID を指す重複）は `unsupported` に出し、
+//!   **残りだけで購読する**。1 個の事故で
 //!   購読全体を殺さない・空表示に潰さない。
 //! * **購読の失敗で [`HubStatus`] の 6 状態を変えない**。接続設定の状態と
 //!   購読の状態は別物で、購読が張れない理由は
@@ -179,8 +180,9 @@ pub struct HubSubscriptionView {
     /// 選んだのに catalog に無かった external name（Hub から消えた／権限で
     /// 見えない）。**空表示に潰さない**。
     pub unresolved: Vec<String>,
-    /// 購読プロトコルが受け付けない綴りの external name（カンマ入り・空白
-    /// だけ）。`unresolved` とは**理由が違う**ので混ぜない。
+    /// そのままでは購読要求に載せられなかった external name（名前にカンマを
+    /// 含む・空白だけ、または他の名前と同じ安定 ID を指す重複）。
+    /// `unresolved` とは**理由が違う**ので混ぜない。
     pub unsupported: Vec<String>,
     /// [`TagClientState::last_error`] の分類名（`ErrorKind::as_str`）。
     pub last_error: Option<String>,
@@ -353,9 +355,9 @@ const REASON_NO_TAGS: &str = "購読するタグが選ばれていません。";
 const REASON_ALL_UNRESOLVED: &str =
     "選んだタグがHubのタグ一覧に見つからないため、購読できるタグがありません。";
 const REASON_ALL_UNSUPPORTED: &str =
-    "選んだタグの名前を購読プロトコルが受け付けないため、購読できるタグがありません。";
+    "選んだタグをそのままでは購読できないため（名前が購読プロトコルの制約に合わない、または同じタグを重複して指している）、購読できるタグがありません。";
 const REASON_NONE_SUBSCRIBABLE: &str =
-    "選んだタグはHubのタグ一覧に無いか、購読プロトコルが受け付けない名前のため、購読できるタグがありません。";
+    "選んだタグはHubのタグ一覧に無いか、そのままでは購読できないため、購読できるタグがありません。";
 const REASON_NO_KEY: &str =
     "保存済みのAPIキーを取り出せないため購読できません（デスクトップアプリから接続し直してください）。";
 /// キーは取り出せたが Hub に拒否された。[`REASON_NO_KEY`] とは原因も次の
@@ -377,13 +379,16 @@ const REASON_SELECTION_CHANGED_REFRESH_FAILED: &str =
 /// 毎回 `InvalidTagSelection` で失敗し、購読全体が死ぬ**（retryable でも
 /// rebindable でもない）。したがってアプリ側で先に落とし、**残りのタグは
 /// 購読する**。
+///
+/// 名前の綴りだけを見る - 同じ安定 ID を指す重複は catalog を引いて初めて
+/// 分かるので [`plan_bindings`] 側で落とす。
 fn is_unsupported_tag_name(name: &str) -> bool {
     name.trim().is_empty() || name.contains(',')
 }
 
 /// [`plan_bindings`] の結果: 実際に購読する要求と、購読できなかった名前を
 /// **理由別に**分けたもの。`unresolved`（Hub から消えた／権限で見えない）と
-/// `unsupported`（購読プロトコルが受け付けない綴り）は次の一手が違うので
+/// `unsupported`（そのままでは購読要求に載せられない）は次の一手が違うので
 /// 混ぜない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BindingPlan {
@@ -401,6 +406,10 @@ struct BindingPlan {
 /// * 購読プロトコルが受け付けない綴り（[`is_unsupported_tag_name`]）は
 ///   catalog を引く前に `unsupported` へ落とす。catalog にあっても購読は
 ///   できないので、「消えた」とは別の事実として扱う。
+/// * **同じ [`StableTagId`] を指す 2 つ目以降の名前**も `unsupported` へ
+///   落とす（先勝ち）。`start()` は重複 `stable_id` を
+///   `DuplicateRequestedStableId` で拒否するので、1 件混ざると**購読全体が
+///   立たない**。ここで落とせば残りは購読できる。
 /// * catalog に無い external name は `unresolved` に入れる。
 /// * どちらも**残りだけで購読する**。1 個の事故で購読全体を殺さない。
 /// * 重複する external name はここで 1 つに畳む
@@ -415,10 +424,12 @@ fn plan_bindings(selected: &[String], catalog: &CatalogSnapshot) -> BindingPlan 
         .map(|tag| (tag.external_name.as_str(), tag))
         .collect();
     let mut seen: HashSet<&str> = HashSet::with_capacity(selected.len());
+    let mut claimed: HashSet<StableTagId> = HashSet::with_capacity(selected.len());
     let mut requests = Vec::with_capacity(selected.len());
     let mut unresolved = Vec::new();
     let mut unsupported = Vec::new();
     for name in selected {
+        // 選択リスト内の同名重複は利用者の入力の話なので、黙って 1 つに畳む。
         if !seen.insert(name.as_str()) {
             continue;
         }
@@ -427,6 +438,10 @@ fn plan_bindings(selected: &[String], catalog: &CatalogSnapshot) -> BindingPlan 
             continue;
         }
         match by_name.get(name.as_str()) {
+            // 別々の名前が同じ安定 ID を指すのは Hub 側の catalog の不整合
+            // だが、そのまま `start()` へ渡すと全体が拒否される。先勝ちで
+            // 1 つだけ購読し、残りは「購読できなかった名前」として見せる。
+            Some(tag) if !claimed.insert(tag.ids) => unsupported.push(name.clone()),
             Some(tag) => requests.push(BindingRequest {
                 binding_key: name.clone(),
                 stable_id: tag.ids,
@@ -1646,6 +1661,38 @@ mod tests {
         assert!(
             plan.unresolved.is_empty(),
             "catalog にあるのだから「消えた」ではない - 理由が違うものを混ぜない"
+        );
+    }
+
+    /// 別々の名前が同じ安定 ID を指す catalog（Hub 側の不整合）。そのまま
+    /// `start()` へ渡すと `DuplicateRequestedStableId` で**購読全体が立たない**
+    /// ので、先勝ちで 1 つだけ購読し、残りは購読できなかった名前として出す。
+    #[test]
+    fn plan_bindings_folds_names_that_point_at_the_same_stable_id() {
+        let ids = StableTagId::new(1, 1, 1);
+        let duplicated = CatalogSnapshot {
+            tags: vec![catalog_tag("alpha", ids), catalog_tag("beta", ids)],
+            ..catalog(&[])
+        };
+
+        let plan = plan_bindings(&owned(&["alpha", "beta"]), &duplicated);
+
+        assert_eq!(
+            plan.requests
+                .iter()
+                .map(|request| request.binding_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha"],
+            "先に出てきた方だけを購読する"
+        );
+        assert_eq!(
+            plan.unsupported,
+            owned(&["beta"]),
+            "落とした名前は黙って消さず一覧に出す"
+        );
+        assert!(
+            plan.unresolved.is_empty(),
+            "catalog にはあるので未解決ではない"
         );
     }
 
