@@ -661,6 +661,12 @@ async fn revoke_api_key(hub_url: &str, key_id: i64) -> Result<(), String> {
     let http = reqwest::ClientBuilder::new()
         .no_proxy()
         .timeout(REVOKE_TIMEOUT)
+        // 製品の管理クライアント（banto-hub-bootstrap の AdminClient、
+        // banto-tagclient の RestClient::new）と同じ規律: リダイレクトは
+        // 追従しない。失効は資格情報を伴う管理操作なので、Hubが3xxを
+        // 返しても想定外のホストへ飛ばしてはいけない
+        // （2026-09-18 Copilotレビュー指摘）。
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| format!("reqwestクライアント構築失敗: {error}"))?;
     let base = hub_url.trim_end_matches('/');
