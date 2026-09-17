@@ -788,8 +788,27 @@ enum KeyOutcome {
 /// `api_keys.id` は Hub ごとの連番なので、`key_id` だけの比較は接続先
 /// とセットでなければ意味がない（`same_hub` のdoc comment、
 /// `Bootstrapper::previous_for` と同じ理屈）。
+///
+/// `connect_returned_ok`（`HubService::connect()` が `Ok` を返したか）が
+/// 要る理由（2026-09-18 Copilotレビュー指摘、最重要）: **「レコードが
+/// 無い」は「キーを発行していない」の証明にならない**。
+/// `HubService::connect()` は、`Bootstrapper` がキーを発行し設定の
+/// インメモリ写しに保存した**後**、それを実ストレージへ書き戻す
+/// `flush()` が失敗すると `Err` を返す
+/// （`apps/chronogazer/core/src/hub.rs` の `HubService::connect`:
+/// `bootstrapper.connect(...).await.map_err(...)?; self.flush().await?;`
+/// `flush()` の `?` は `bootstrapper.connect()` の**後**にあるので、
+/// ここで失敗すると `Ok` へは決して到達しない）。逆に言えば
+/// **`connect_view` が `Ok` であることは、その呼び出しで
+/// `bootstrapper` が行った変更が実ストレージへの書き戻しまで含めて
+/// 成功したことを構造的に保証する** - つまり `after` の読み取りが真に
+/// 最新の状態を反映していると信頼してよいのは `connect_returned_ok`
+/// のときだけ。`connect()` が `Err` で終わり、かつレコードが無い
+/// （＝発行が起きたのかどうか、この観測経路からは分からない）ときは
+/// `ConfirmedAbsent` と言い切らず `Undetermined` に倒す。
 fn classify_key_outcome(
     hub_url: &str,
+    connect_returned_ok: bool,
     before: &Result<Option<HubRecord>, String>,
     after: &Result<Option<HubRecord>, String>,
 ) -> KeyOutcome {
@@ -806,7 +825,13 @@ fn classify_key_outcome(
         }
     };
     let Some(after_record) = after_record else {
-        return KeyOutcome::ConfirmedAbsent;
+        return if connect_returned_ok {
+            KeyOutcome::ConfirmedAbsent
+        } else {
+            KeyOutcome::Undetermined(
+                "connect()がエラーで終わったため、レコードが無いことは発行していないことの証明になりません(発行後にflush等が失敗した可能性があります)".to_owned(),
+            )
+        };
     };
     if !same_hub(&after_record.endpoint, hub_url) {
         return KeyOutcome::ConfirmedDifferentHub {
@@ -835,54 +860,61 @@ fn classify_key_outcome(
     }
 }
 
+/// 表示用に Hub の URL をサニタイズする（2026-09-18 Copilotレビュー
+/// 指摘）。
+///
+/// `Endpoint::new` は userinfo（`http://user:pass@host`）を検証で弾くが、
+/// **弾く前の生の値をログや curl 案内にそのまま出すと、誤入力に含まれた
+/// パスワードが残ってしまう**。ここでは `Endpoint::new` の検証を通す前に
+/// パースし、ホスト・ポート・パスだけに落とす - userinfo とクエリ文字列
+/// は常に捨てる。パースそのものに失敗する形式なら、原文を一切出さず
+/// プレースホルダのみ返す。
+fn sanitize_hub_url_for_display(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(url) => {
+            let scheme = url.scheme();
+            let host = url.host_str().unwrap_or("(ホスト不明)");
+            let port = url
+                .port()
+                .map(|port| format!(":{port}"))
+                .unwrap_or_default();
+            format!("{scheme}://{host}{port}{}", url.path())
+        }
+        Err(_) => "(不正な形式のHUB_URL)".to_owned(),
+    }
+}
+
 /// `curl` で手動失効するときの1行を組み立てる（実行はしない）。手順7の
-/// 案内表示・失敗時のフォールバックの両方で使う。
-fn revoke_curl_hint(hub_url: &str, key_id: i64) -> String {
+/// 案内表示・失敗時のフォールバックの両方で使う。**呼び出し側は
+/// サニタイズ済み（[`sanitize_hub_url_for_display`] を通した）URLを渡す
+/// こと** - このハーネスが表示するテキストにuserinfoを含む生の値を
+/// 混ぜないため。
+fn revoke_curl_hint(hub_url_display: &str, key_id: i64) -> String {
     format!(
-        "curl -X POST -H \"X-Banto-Client: banto\" {}/api/api-keys/{key_id}/revoke",
+        "curl -X POST -H \"X-Banto-Client: banto\" {}",
+        revoke_url(hub_url_display, key_id)
+    )
+}
+
+/// 失効リクエストの絶対URLを組み立てる（純関数・テスト可能）。
+/// [`revoke_curl_hint`]（表示用）と [`revoke_api_key_with_timeout`]
+/// （実際に叩く）の両方がここを通ることで、表示と実際のリクエストが
+/// 食い違わないようにする。
+fn revoke_url(hub_url: &str, key_id: i64) -> String {
+    format!(
+        "{}/api/api-keys/{key_id}/revoke",
         hub_url.trim_end_matches('/')
     )
 }
 
-/// `POST /api/api-keys/{id}/revoke` を叩く（ベストエフォート、
-/// `CG_SMOKE_REVOKE=1` のときだけ手順7から呼ぶ）。
-///
-/// `banto-hub-bootstrap` の `AdminClient::revoke`
-/// （`crates/banto-hub-bootstrap/src/admin.rs`）と同じ経路・同じ
-/// リクエスト形だが、そちらは `pub(crate)` でこの crate の外から呼べない
-/// ため、`crates/banto-tagclient/examples/real_hub_smoke.rs` の
-/// `set_write_control` と同じ作法（直接 reqwest で管理 REST を叩く）で
-/// ここに複製する。試運転中の Hub は認証不要で、CSRFマーカー
-/// `X-Banto-Client: banto`（資格情報ではない）だけで通る
-/// （`admin.rs` のモジュール doc 参照）。
-///
-/// **必ずこのインストールが自分で発行した `key_id`（保存済みレコードの
-/// もの）にだけ使う** - 名前で他のキーを探して失効させない。これは
-/// `AdminClient::revoke` のdoc comment（「there is deliberately no "list
-/// keys and revoke the ones whose name looks like mine" path」）と同じ
-/// 規律で、こちらも他のインストール・他のツールが発行したキーを巻き込ま
-/// ないための不変条件。
-async fn revoke_api_key(hub_url: &str, key_id: i64) -> Result<(), String> {
-    let http = reqwest::ClientBuilder::new()
-        .no_proxy()
-        .timeout(REVOKE_TIMEOUT)
-        // 製品の管理クライアント（banto-hub-bootstrap の AdminClient、
-        // banto-tagclient の RestClient::new）と同じ規律: リダイレクトは
-        // 追従しない。失効は資格情報を伴う管理操作なので、Hubが3xxを
-        // 返しても想定外のホストへ飛ばしてはいけない
-        // （2026-09-18 Copilotレビュー指摘）。
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|error| format!("reqwestクライアント構築失敗: {error}"))?;
-    let base = hub_url.trim_end_matches('/');
-    let url = format!("{base}/api/api-keys/{key_id}/revoke");
-    let response = http
-        .post(url)
-        .header("X-Banto-Client", "banto")
-        .send()
-        .await
-        .map_err(|error| format!("送信失敗: {error}"))?;
-    let status = response.status();
+/// 失効リクエストの応答（HTTPステータス）をどう扱うかを決める（純関数・
+/// テスト可能）。2026-09-18 Copilotレビュー指摘: 実際にPOSTを出す経路
+/// （URL組み立て・ヘッダ・ステータス処理・タイムアウト）がこれまで
+/// 未検証だった - ここが壊れると「失効したつもりで実は残っている」
+/// になる。ステータス判定だけをこの純関数に切り出し、
+/// [`revoke_api_key_with_timeout`] のモックサーバーテストから、
+/// またこの関数単体からも固定できるようにする。
+fn classify_revoke_response(status: reqwest::StatusCode) -> Result<(), String> {
     if status.is_success() {
         Ok(())
     } else if status == reqwest::StatusCode::UNAUTHORIZED
@@ -903,10 +935,77 @@ async fn revoke_api_key(hub_url: &str, key_id: i64) -> Result<(), String> {
     }
 }
 
+/// `POST /api/api-keys/{id}/revoke` を叩く（ベストエフォート、
+/// `CG_SMOKE_REVOKE=1` のときだけ手順7から呼ぶ）。[`REVOKE_TIMEOUT`]
+/// 固定の薄いラッパー - タイムアウトを差し替えられる本体は
+/// [`revoke_api_key_with_timeout`]（テストで短いタイムアウトを注入する
+/// ため）。
+async fn revoke_api_key(hub_url: &str, key_id: i64) -> Result<(), String> {
+    revoke_api_key_with_timeout(hub_url, key_id, REVOKE_TIMEOUT).await
+}
+
+/// `POST /api/api-keys/{id}/revoke` を叩く本体。
+///
+/// `banto-hub-bootstrap` の `AdminClient::revoke`
+/// （`crates/banto-hub-bootstrap/src/admin.rs`）と同じ経路・同じ
+/// リクエスト形だが、そちらは `pub(crate)` でこの crate の外から呼べない
+/// ため、`crates/banto-tagclient/examples/real_hub_smoke.rs` の
+/// `set_write_control` と同じ作法（直接 reqwest で管理 REST を叩く）で
+/// ここに複製する。試運転中の Hub は認証不要で、CSRFマーカー
+/// `X-Banto-Client: banto`（資格情報ではない）だけで通る
+/// （`admin.rs` のモジュール doc 参照）。
+///
+/// **必ずこのインストールが自分で発行した `key_id`（保存済みレコードの
+/// もの）にだけ使う** - 名前で他のキーを探して失効させない。これは
+/// `AdminClient::revoke` のdoc comment（「there is deliberately no "list
+/// keys and revoke the ones whose name looks like mine" path」）と同じ
+/// 規律で、こちらも他のインストール・他のツールが発行したキーを巻き込ま
+/// ないための不変条件。
+async fn revoke_api_key_with_timeout(
+    hub_url: &str,
+    key_id: i64,
+    timeout: Duration,
+) -> Result<(), String> {
+    let http = reqwest::ClientBuilder::new()
+        .no_proxy()
+        .timeout(timeout)
+        // 製品の管理クライアント（banto-hub-bootstrap の AdminClient、
+        // banto-tagclient の RestClient::new）と同じ規律: リダイレクトは
+        // 追従しない。失効は資格情報を伴う管理操作なので、Hubが3xxを
+        // 返しても想定外のホストへ飛ばしてはいけない
+        // （2026-09-18 Copilotレビュー指摘）。
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("reqwestクライアント構築失敗: {error}"))?;
+    let response = http
+        .post(revoke_url(hub_url, key_id))
+        .header("X-Banto-Client", "banto")
+        .send()
+        .await
+        .map_err(|error| format!("送信失敗: {error}"))?;
+    classify_revoke_response(response.status())
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     println!("=== chronogazer Hub 実機確認ハーネス（#383 段階1）===");
-    let hub_url = env_var("HUB_URL", DEFAULT_HUB_URL);
+    // **入口で1回だけ正規化する**（trim込み）（2026-09-18 Copilotレビュー
+    // 指摘）: HubService::connect() は渡されたURLをtrimしてから使う
+    // （crate::hub の実装）ため、前後に空白があると「接続は成功して
+    // trim済みの値で保存される」のに「このハーネスの同一性判定
+    // （same_hub）には未trimの値を渡している」というズレが起き、
+    // 自動失効がスキップされ案内のURLも未trimのまま出てしまう。ここで
+    // trimした後の1つの値だけを、以降の同一性判定・失効リクエスト・
+    // 案内表示のすべてで使う。
+    let hub_url = env_var("HUB_URL", DEFAULT_HUB_URL).trim().to_owned();
+    // 表示用にサニタイズした値も1回だけ作る（2026-09-18 Copilotレビュー
+    // 指摘）: `Endpoint` はuserinfo（`http://user:pass@host`）を検証で
+    // 弾くが、**弾く前の生の値をログやcurl案内に出すと、誤入力に含まれた
+    // パスワードがそのまま残ってしまう**。ホスト・ポート・パスだけに
+    // 落とし、userinfo・クエリ文字列は常に捨てる。curl案内にもこの
+    // 値だけを使う（`revoke_curl_hint`/手動確認コマンドの組み立て先を
+    // 参照）。
+    let hub_url_display = sanitize_hub_url_for_display(&hub_url);
     let watch_secs: u64 = env::var("CG_SMOKE_WATCH_SECS")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -946,7 +1045,7 @@ async fn main() {
     // 渡すことで「再発行されず再利用される」ことを証明する。
     let keys = Arc::new(MemoryKeyStore::new());
 
-    println!("Hub URL: {hub_url}");
+    println!("Hub URL: {hub_url_display}");
     println!("作業ディレクトリ: {}", smoke_dir.display());
     println!("観測秒数: {watch_secs}秒");
     println!(
@@ -1026,11 +1125,16 @@ async fn main() {
         println!("  警告: 接続前の設定読み取りに失敗しました({err})。");
     }
     let connect_view = hub1.connect(&hub_url).await;
+    // connect_view が Ok かどうかを、後で connect_view を消費する前に
+    // 控えておく（classify_key_outcome のdoc comment参照 - flush()の
+    // 成否が保証されるのはOkのときだけ）。
+    let connect_returned_ok = connect_view.is_ok();
     let after_record = read_hub_record(&settings1).await;
     if let Err(err) = &after_record {
         println!("  警告: 接続後の設定読み取りに失敗しました({err})。");
     }
-    let key_outcome = classify_key_outcome(&hub_url, &before_record, &after_record);
+    let key_outcome =
+        classify_key_outcome(&hub_url, connect_returned_ok, &before_record, &after_record);
 
     let (step2_ok, catalog_tags, key_name_1, keyring_account_1) = match connect_view {
         Ok(view) => {
@@ -1436,11 +1540,11 @@ async fn main() {
             println!("  自動失効は行いません(CG_SMOKE_REVOKE=1が指定されていても)。");
             let list_hint = format!(
                 "curl -H \"X-Banto-Client: banto\" {}/api/api-keys",
-                hub_url.trim_end_matches('/')
+                hub_url_display.trim_end_matches('/')
             );
             let revoke_hint = format!(
                 "curl -X POST -H \"X-Banto-Client: banto\" {}/api/api-keys/<id>/revoke",
-                hub_url.trim_end_matches('/')
+                hub_url_display.trim_end_matches('/')
             );
             match installation_id.as_deref() {
                 Some(id) => {
@@ -1466,7 +1570,7 @@ async fn main() {
             Some(key_id) => {
                 let hint = revoke_curl_hint(&endpoint, key_id);
                 println!(
-                    "  設定に残っている記録は別のHub({endpoint})のものです(今回のHUB_URL={hub_url}とは異なる接続先)。"
+                    "  設定に残っている記録は別のHub({endpoint})のものです(今回のHUB_URL={hub_url_display}とは異なる接続先)。"
                 );
                 println!(
                     "  別Hubのレコードなので、このハーネスはCG_SMOKE_REVOKE=1が指定されていても失効させません。"
@@ -1497,7 +1601,7 @@ async fn main() {
         } => {
             let key_name_display = key_name.as_deref().unwrap_or("-");
             if !issued_this_run {
-                let hint = revoke_curl_hint(&hub_url, key_id);
+                let hint = revoke_curl_hint(&hub_url_display, key_id);
                 println!(
                     "  設定に残っているキー(id={key_id}, name={key_name_display})は今回のプロセスが発行したものではありません(以前からのキーをそのまま維持しています)。"
                 );
@@ -1517,7 +1621,7 @@ async fn main() {
                 // 試みる**前**に案内を出してから失効し、結果を続けて表示
                 // する（2026-09-17 Copilotレビュー指摘: 以前は自動失効に
                 // 成功したときだけこの案内が出ず、契約が守れていなかった）。
-                let hint = revoke_curl_hint(&hub_url, key_id);
+                let hint = revoke_curl_hint(&hub_url_display, key_id);
                 println!("  発行したAPIキー: id={key_id}, name={key_name_display}");
                 println!(
                     "  このキーはHubに残ります(disconnectはHub側を失効させない契約)。不要なら失効させてください:"
@@ -1533,7 +1637,7 @@ async fn main() {
                 );
                 if auto_revoke {
                     println!("  CG_SMOKE_REVOKE=1: 上記のキーを失効させます...");
-                    match revoke_api_key(&hub_url, key_id).await {
+                    match revoke_api_key(&hub_url_display, key_id).await {
                         Ok(()) => {
                             println!(
                                 "  失効しました。上記のキーはもう失効済みです(Hub側には残っていません)。"
@@ -1773,7 +1877,7 @@ mod tests {
         let after: Result<Option<HubRecord>, String> =
             Ok(Some(record("http://host:8722", Some(99))));
         assert!(matches!(
-            classify_key_outcome("http://host:8722", &before, &after),
+            classify_key_outcome("http://host:8722", true, &before, &after),
             KeyOutcome::Undetermined(_)
         ));
     }
@@ -1783,24 +1887,23 @@ mod tests {
         let before: Result<Option<HubRecord>, String> = Ok(None);
         let after: Result<Option<HubRecord>, String> = Err("db unavailable".to_owned());
         assert!(matches!(
-            classify_key_outcome("http://host:8722", &before, &after),
+            classify_key_outcome("http://host:8722", true, &before, &after),
             KeyOutcome::Undetermined(_)
         ));
     }
 
     #[test]
-    fn classify_key_outcome_is_undetermined_even_when_connect_itself_would_have_returned_err() {
-        // 今回の本題（`:1032`相当）: connect()はbootstrapperがキーを
-        // 発行・保存した**後**にErrを返し得る。この関数はconnect_view
-        // を受け取らずbefore/afterの実際の差分だけを見るため、
-        // 「connect()がErrだった」という情報が無くても、
-        // 発行が実際に起きていれば正しくConfirmedPresent（issued_this_run
-        // =true）になる - Undeterminedへ取り違えて「発行済みキーは
-        // ありません」とPASSで言い切ってしまうことはない。
+    fn classify_key_outcome_confirms_issued_even_when_connect_itself_returned_err() {
+        // connect()はbootstrapperがキーを発行・保存した**後**にErrを
+        // 返し得る。この関数はbefore/afterの実際の差分を見るので、
+        // afterに変化が観測できていれば（＝レコードは書けている）
+        // connect_returned_ok=falseでも正しくConfirmedPresent
+        // （issued_this_run=true）になる - Undeterminedへ取り違えて
+        // 「発行済みキーはありません」とPASSで言い切ってしまうことはない。
         let before: Result<Option<HubRecord>, String> = Ok(None);
         let after: Result<Option<HubRecord>, String> =
             Ok(Some(record("http://host:8722", Some(42))));
-        let outcome = classify_key_outcome("http://host:8722", &before, &after);
+        let outcome = classify_key_outcome("http://host:8722", false, &before, &after);
         assert_eq!(
             outcome,
             KeyOutcome::ConfirmedPresent {
@@ -1812,11 +1915,31 @@ mod tests {
     }
 
     #[test]
+    fn classify_key_outcome_is_undetermined_when_connect_erred_and_no_record_exists() {
+        // 今回の本題（A、`:810`相当、最重要）: 「レコードが無い」は
+        // 「キーを発行していない」の証明にならない。
+        // HubService::connect()は、bootstrapperがキーを発行し設定の
+        // インメモリ写しに保存した後、それを実ストレージへ書き戻す
+        // flush()が失敗するとErrを返す（そのErrはbootstrapper.connect()
+        // 自体の後にあるので、flush()が失敗する限りOkには決して到達
+        // しない）。connect_returned_ok=falseで、かつafterにも変化が
+        // 観測できない（レコードが無いまま）場合、「発行が起きたのか
+        // どうかこの観測経路からは分からない」ので、ConfirmedAbsentと
+        // 言い切らずUndeterminedに倒す。
+        let before: Result<Option<HubRecord>, String> = Ok(None);
+        let after: Result<Option<HubRecord>, String> = Ok(None);
+        assert!(matches!(
+            classify_key_outcome("http://host:8722", false, &before, &after),
+            KeyOutcome::Undetermined(_)
+        ));
+    }
+
+    #[test]
     fn classify_key_outcome_confirms_absent_when_no_record_exists() {
         let before: Result<Option<HubRecord>, String> = Ok(None);
         let after: Result<Option<HubRecord>, String> = Ok(None);
         assert_eq!(
-            classify_key_outcome("http://host:8722", &before, &after),
+            classify_key_outcome("http://host:8722", true, &before, &after),
             KeyOutcome::ConfirmedAbsent
         );
     }
@@ -1827,7 +1950,7 @@ mod tests {
         let after: Result<Option<HubRecord>, String> =
             Ok(Some(record("http://host-a:8722", Some(5))));
         assert_eq!(
-            classify_key_outcome("http://host-b:8722", &before, &after),
+            classify_key_outcome("http://host-b:8722", true, &before, &after),
             KeyOutcome::ConfirmedDifferentHub {
                 key_id: Some(5),
                 endpoint: "http://host-a:8722".to_owned(),
@@ -1842,7 +1965,7 @@ mod tests {
         let after: Result<Option<HubRecord>, String> =
             Ok(Some(record("http://host:8722", Some(6))));
         assert_eq!(
-            classify_key_outcome("http://host:8722", &before, &after),
+            classify_key_outcome("http://host:8722", true, &before, &after),
             KeyOutcome::ConfirmedPresent {
                 key_id: 6,
                 key_name: None,
@@ -1858,7 +1981,7 @@ mod tests {
         let after: Result<Option<HubRecord>, String> =
             Ok(Some(record("http://host:8722", Some(5))));
         assert_eq!(
-            classify_key_outcome("http://host:8722", &before, &after),
+            classify_key_outcome("http://host:8722", true, &before, &after),
             KeyOutcome::ConfirmedPresent {
                 key_id: 5,
                 key_name: None,
@@ -1877,7 +2000,7 @@ mod tests {
         let after: Result<Option<HubRecord>, String> =
             Ok(Some(record("http://host-b:8722", Some(5))));
         assert_eq!(
-            classify_key_outcome("http://host-b:8722", &before, &after),
+            classify_key_outcome("http://host-b:8722", true, &before, &after),
             KeyOutcome::ConfirmedPresent {
                 key_id: 5,
                 key_name: None,
@@ -1894,12 +2017,175 @@ mod tests {
         let before: Result<Option<HubRecord>, String> = Ok(Some(record("http://host", Some(5))));
         let after: Result<Option<HubRecord>, String> = Ok(Some(record("http://host:80", Some(5))));
         assert_eq!(
-            classify_key_outcome("http://host:80", &before, &after),
+            classify_key_outcome("http://host:80", true, &before, &after),
             KeyOutcome::ConfirmedPresent {
                 key_id: 5,
                 key_name: None,
                 issued_this_run: false,
             }
+        );
+    }
+
+    // sanitize_hub_url_for_display() の回帰テスト（2026-09-18
+    // Copilotレビュー指摘: userinfo・クエリは常に落とす）。
+
+    #[test]
+    fn sanitize_hub_url_for_display_drops_userinfo_and_query() {
+        assert_eq!(
+            sanitize_hub_url_for_display("http://user:hunter2@host:8722/hub?x=1"),
+            "http://host:8722/hub"
+        );
+    }
+
+    #[test]
+    fn sanitize_hub_url_for_display_keeps_a_plain_url_as_is() {
+        assert_eq!(
+            sanitize_hub_url_for_display("http://127.0.0.1:8722"),
+            "http://127.0.0.1:8722/"
+        );
+    }
+
+    #[test]
+    fn sanitize_hub_url_for_display_never_echoes_unparsable_input() {
+        assert_eq!(
+            sanitize_hub_url_for_display("not a url"),
+            "(不正な形式のHUB_URL)"
+        );
+    }
+
+    // revoke_url() / classify_revoke_response() の回帰テスト（純粋な
+    // ロジックだけ、ネットワーク不要）。
+
+    #[test]
+    fn revoke_url_builds_the_expected_path() {
+        assert_eq!(
+            revoke_url("http://127.0.0.1:8722", 42),
+            "http://127.0.0.1:8722/api/api-keys/42/revoke"
+        );
+        assert_eq!(
+            revoke_url("http://127.0.0.1:8722/", 42),
+            "http://127.0.0.1:8722/api/api-keys/42/revoke"
+        );
+    }
+
+    #[test]
+    fn classify_revoke_response_succeeds_on_2xx() {
+        assert!(classify_revoke_response(reqwest::StatusCode::OK).is_ok());
+        assert!(classify_revoke_response(reqwest::StatusCode::NO_CONTENT).is_ok());
+    }
+
+    #[test]
+    fn classify_revoke_response_reports_lockdown_on_401_and_403() {
+        for status in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+        ] {
+            let message = classify_revoke_response(status).unwrap_err();
+            assert!(message.contains("ロックダウン"), "got: {message}");
+        }
+    }
+
+    #[test]
+    fn classify_revoke_response_fails_without_claiming_lockdown_on_other_statuses() {
+        let message =
+            classify_revoke_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR).unwrap_err();
+        assert!(!message.contains("ロックダウン"));
+    }
+
+    // revoke_api_key_with_timeout() の実HTTP経路のテスト（2026-09-18
+    // Copilotレビュー指摘: パス・ヘッダ・ステータス処理がこれまで
+    // 未検証だった - ここが壊れると「失効したつもりで実は残っている」
+    // になる）。ローカルのTCPモック
+    // （`crates/banto-tagclient/src/rest.rs` のテストと同じ作法:
+    // `std::net::TcpListener` で1リクエスト受けて応答を返す）を使う。
+
+    fn revoke_mock_server(status: u16) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            loop {
+                let count = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response =
+                format!("HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        (address, handle)
+    }
+
+    #[tokio::test]
+    async fn revoke_api_key_posts_the_expected_path_and_header_and_succeeds_on_2xx() {
+        let (address, handle) = revoke_mock_server(200);
+        let result = revoke_api_key_with_timeout(&address, 42, Duration::from_secs(2)).await;
+        let request = handle.join().unwrap();
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert!(
+            request.starts_with("POST /api/api-keys/42/revoke HTTP/1.1"),
+            "unexpected request line in: {request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("x-banto-client: banto"),
+            "missing X-Banto-Client header in: {request}"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoke_api_key_reports_lockdown_on_401_and_403() {
+        for status in [401, 403] {
+            let (address, handle) = revoke_mock_server(status);
+            let result = revoke_api_key_with_timeout(&address, 1, Duration::from_secs(2)).await;
+            handle.join().unwrap();
+            let message = result.unwrap_err();
+            assert!(
+                message.contains("ロックダウン"),
+                "status={status}, got: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_api_key_fails_on_other_non_2xx_without_claiming_lockdown() {
+        let (address, handle) = revoke_mock_server(500);
+        let result = revoke_api_key_with_timeout(&address, 1, Duration::from_secs(2)).await;
+        handle.join().unwrap();
+        let message = result.unwrap_err();
+        assert!(!message.contains("ロックダウン"), "got: {message}");
+    }
+
+    #[tokio::test]
+    async fn revoke_api_key_times_out_when_the_server_never_responds() {
+        // 固定sleepは使わない - 待つのはrevoke_api_key_with_timeoutに
+        // 注入した短いタイムアウト（reqwest自身の機構）で、テスト側で
+        // 「十分待ったはず」という固定時間を仮定しない。モックサーバー
+        // は接続だけ受けて何も返さず、スレッドをparkして握ったままに
+        // する（joinしない - テスト関数が戻ればプロセス終了時に片付く）。
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                loop {
+                    std::thread::park();
+                }
+            }
+        });
+        let start = std::time::Instant::now();
+        let result = revoke_api_key_with_timeout(&address, 1, Duration::from_millis(200)).await;
+        assert!(result.is_err(), "expected a timeout error, got: {result:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "revoke_api_key_with_timeout should be cut off by its own timeout, not hang; elapsed={:?}",
+            start.elapsed()
         );
     }
 }
