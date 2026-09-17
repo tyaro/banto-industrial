@@ -41,8 +41,11 @@
 //!   [`Bootstrapper::rest_client`] が `None` を返し、購読を張れない。
 //!   これはエラーではなく、理由付きの「停止」として表示する。
 //! * **値が二度と流れない状態を作らない**: 1 本の常駐タスク（supervisor）が
-//!   30 秒ごとに「世代が無い／`Unauthorized`／`Rebinding`」だけを拾って
-//!   張り直す。詳しくは [`HubService::spawn_supervisor`]。
+//!   30 秒ごとに「自力では復帰しない世代」だけを拾って張り直す - 世代が無い
+//!   ／`Unauthorized`／エラーで終了した `Stopped`／`Rebinding`／**要求セットが
+//!   catalog と食い違ったまま待っている `Reconnecting`**（状態名だけでなく
+//!   `last_error` の分類まで見る）。詳しくは
+//!   [`HubService::spawn_supervisor`]。
 //!
 //! # 同期 trait と非同期設定ストアの橋渡し
 //!
@@ -610,6 +613,10 @@ fn needs_replan(kind: TagErrorKind) -> bool {
 /// 扱ってはいけない、という唯一の例外。transport 系（`Transport` /
 /// `ProtocolError` / `CatalogUnavailable`）の `Reconnecting` は従来どおり
 /// 放置する - あちらは待てば直るので、割り込むと backoff と喧嘩するだけ。
+///
+/// この状態は**ワーカー自身が「要求セットが catalog と食い違っている」と
+/// 言っている**のだから、同じ要求のまま待たせても直らない。起こすだけでなく
+/// **張り直しても直す**必要がある（[`needs_rebuild`] に入れてある理由）。
 fn waits_on_a_stale_request_set(health: GenerationHealth) -> bool {
     health.state == TagClientConnectionState::Reconnecting
         && health.last_error.is_some_and(needs_replan)
@@ -619,13 +626,10 @@ fn waits_on_a_stale_request_set(health: GenerationHealth) -> bool {
 ///
 /// [`needs_retry`]（見張りが起こすか）と
 /// [`must_restart_despite_same_fingerprint`]（起こしたあと実際に張り直すか）
-/// が**理由もなく食い違わない**ように、1 つの述語を両方から使う。片方だけ
-/// 真だと、見張りが catalog を取り直しても同一性一致の早期 return に落ちて
-/// 何もせず、ワーカーは壊れたループのまま残る。
-///
-/// 例外は [`waits_on_a_stale_request_set`] の 1 つだけで、そちらは
-/// **意図的に非対称**（`needs_retry` にだけ足す）。理由はその関数と
-/// [`must_restart_despite_same_fingerprint`] の doc を参照。
+/// が**食い違わない**ように、1 つの述語を両方から使う。片方だけ真だと、
+/// 見張りが catalog を取り直しても同一性一致の早期 return に落ちて何もせず、
+/// ワーカーは壊れたループのまま残る（#383 実機で `Reconnecting` が、
+/// #385 で `Rebinding` が、それぞれこの形で壊れていた）。
 ///
 /// * 終端（[`is_terminal`]）… 放っておくと復帰しない。
 /// * `Rebinding` … requests が catalog と合っていない。catalog が変わって
@@ -633,7 +637,9 @@ fn waits_on_a_stale_request_set(health: GenerationHealth) -> bool {
 ///   （`RevisionMismatch` / `RuntimeMetadataMismatch`）だと同一性は同じまま
 ///   なので、**ここで明示的に張り直さないと rebind ループから抜けられない**。
 fn needs_rebuild(health: GenerationHealth) -> bool {
-    is_terminal(health) || health.state == TagClientConnectionState::Rebinding
+    is_terminal(health)
+        || health.state == TagClientConnectionState::Rebinding
+        || waits_on_a_stale_request_set(health)
 }
 
 /// 同一性（[`Fingerprint`]）が一致しているのに、それでも張り直すべきか。
@@ -648,11 +654,26 @@ fn needs_rebuild(health: GenerationHealth) -> bool {
 ///   同じ状態になるだけ）。これが無いと、見張りが再試行しても同一性一致で
 ///   no-op になり、壊れた世代が居座り続ける。
 ///
-/// **[`waits_on_a_stale_request_set`] はここに足さない**（意図的な非対称）:
-/// あの状態で必要なのは catalog を読み直して**要求を作り直す**ことで、
-/// 作り直した結果が変われば同一性も変わって自然に張り直る（消えたタグが
-/// 要求から落ちる = まさに直したいケース）。catalog が変わっていないのに
-/// 張り直しても、同じ要求で同じところへ戻るだけのチャーンになる。
+/// [`waits_on_a_stale_request_set`] も [`needs_rebuild`] に含む。当初は
+/// 「catalog が変われば同一性も変わるので自然に張り直る」と考えて外していたが、
+/// **それが成り立つのは `BindingUnresolved` だけ**だった:
+///
+/// * `BindingUnresolved`（タグが消えた）… 再計画すると要求セットが変わる →
+///   同一性が変わって張り直る（実機で確認済み）。
+/// * `RevisionMismatch` / `RuntimeMetadataMismatch` … **タグ集合は同じまま**
+///   なので同一性が変わらず、早期 return に落ちて**見張りが 30 秒ごとに
+///   catalog を読むだけ**になる。ワーカーは壊れたループのまま。
+///
+/// ワーカー自身が「要求セットが catalog と食い違っている」と言っている以上、
+/// 同じ要求のまま待たせても直らない。張り直せば catalog を読み直して要求を
+/// 作り直すので、メタデータ不一致の 2 つも回復できる。条件が続く間は
+/// [`SUPERVISOR_INTERVAL`] ごとに張り直すことになるが、**永久に止まっている
+/// よりはよい**（周期で上限が付いている）。
+///
+/// これは [`Fingerprint`] に catalog の `revision` / `run_id` /
+/// `collection_mode` を**含めない**という選択と対になっている: 含めると Hub
+/// 側の無関係な構成変更のたびに購読を切ってしまうので含めず、そのぶん
+/// 「メタデータ不一致で詰まった世代」はこちらで拾って張り直す。
 fn must_restart_despite_same_fingerprint(
     trigger: Trigger,
     health: Option<GenerationHealth>,
@@ -1039,11 +1060,11 @@ impl HubService {
     ///
     /// 起こす（[`needs_retry`]）と実際に張り直す
     /// （[`must_restart_despite_same_fingerprint`]）は同じ述語
-    /// [`needs_rebuild`] を使うので、理由もなく食い違うことはない - 片方だけ
-    /// 真だと、catalog を取り直しても同一性一致の早期 return に落ちて何も
-    /// せず、壊れたワーカーが残る。**例外は
-    /// [`waits_on_a_stale_request_set`] の 1 つだけ**で、そこは起こすだけ
-    /// （張り直しは要求が実際に変わったときに同一性の比較が判断する）。
+    /// [`needs_rebuild`] を使うので食い違わない - 片方だけ真だと、catalog を
+    /// 取り直しても同一性一致の早期 return に落ちて何もせず、壊れたワーカーが
+    /// 残る。**世代があるかぎり「起こすなら必ず張り直す」**。世代が無いときの
+    /// 再試行だけは張り直しの話にならない（張るものが無く、`reconcile_with`
+    /// が新しく張る）。
     ///
     /// タスクは [`Weak`] 越しに [`HubInner`] を掴むので、`HubService` の全
     /// clone が落ちれば次の周期で終わる。**`resume()` からしか起動しない**
@@ -1901,6 +1922,13 @@ mod tests {
             must_restart_despite_same_fingerprint(Trigger::Observe, healthy(State::Rebinding)),
             "catalog が変わらない原因の rebind ループは、起こすだけでは抜けられない"
         );
+        assert!(
+            must_restart_despite_same_fingerprint(
+                Trigger::Observe,
+                failing(State::Reconnecting, TagErrorKind::RevisionMismatch)
+            ),
+            "メタデータ不一致はタグ集合が変わらないので、張り直さないと抜けられない"
+        );
         // それ以外は据え置き - `status()` のたびに WS を張り直さない。
         // **起動直後の `Stopped`（`last_error` 無し）を含む**: ここを終端
         // 扱いにすると、張った直後に `status()` が走っただけで張り直す。
@@ -1919,16 +1947,19 @@ mod tests {
         }
     }
 
-    /// **起こす（`needs_retry`）と張り直す（`must_restart_…`）が食い違って
-    /// よいのは、意図的な 1 つの例外だけ。** 片方だけ真だと、見張りが catalog
-    /// を取り直しても同一性一致の早期 return に落ちて何もせず、壊れたワーカーが
-    /// 残る（`Rebinding` で実際に起きていた）。
+    /// **世代があるかぎり「起こすなら必ず張り直す」**（#388 レビュー対応）。
     ///
-    /// 唯一の例外が `waits_on_a_stale_request_set`: あれは**要求を作り直す**
-    /// ために起こすので、作り直した結果が同じなら張り直さないのが正しい
-    /// （catalog が変わっていれば同一性が変わって自然に張り直る）。
+    /// 片方だけ真だと、見張りが catalog を取り直しても同一性一致の早期 return
+    /// に落ちて何もせず、壊れたワーカーが残る。この形のバグは #385 で
+    /// `Rebinding`、#383 実機で `Reconnecting`（binding 系）、#388 で
+    /// `Reconnecting`（メタデータ不一致）と 3 回出た。1 つの述語
+    /// （`needs_rebuild`）を両方から使い、それを表で固定することで、
+    /// **構造的に入らないようにする**。
+    ///
+    /// 世代が無いときだけは張り直しの話にならない（張るものが無く、
+    /// `reconcile_with` が新しく張る）ので、この不変条件の対象外。
     #[test]
-    fn waking_the_supervisor_and_actually_restarting_agree_except_for_replanning() {
+    fn waking_the_supervisor_always_implies_actually_restarting() {
         use TagClientConnectionState as State;
 
         for state in [
@@ -1954,12 +1985,10 @@ mod tests {
                 cases.push(failing(state, kind));
             }
             for health in cases {
-                let restart = must_restart_despite_same_fingerprint(Trigger::Observe, health);
-                let stale = health.is_some_and(waits_on_a_stale_request_set);
                 assert_eq!(
                     needs_retry(health, None),
-                    restart || stale,
-                    "{state} ({health:?}) で説明の付かない食い違いがある"
+                    must_restart_despite_same_fingerprint(Trigger::Observe, health),
+                    "{state} ({health:?}): 起こすなら張り直す、が崩れている"
                 );
             }
         }
@@ -2206,15 +2235,24 @@ mod tests {
     fn a_reconnecting_generation_is_replanned_only_for_a_stale_request_set() {
         use TagClientConnectionState as State;
 
-        // 要求セットと catalog の食い違い = 待っても直らない。再計画する。
+        // 要求セットと catalog の食い違い = 待っても直らない。起こして、
+        // **同一性が同じでも張り直す** - `RevisionMismatch` /
+        // `RuntimeMetadataMismatch` はタグ集合が変わらないので、張り直さないと
+        // 見張りが 30 秒ごとに catalog を読むだけになる（#388）。
         for kind in [
             TagErrorKind::BindingUnresolved,
             TagErrorKind::RevisionMismatch,
             TagErrorKind::RuntimeMetadataMismatch,
         ] {
+            let health = failing(State::Reconnecting, kind);
             assert!(
-                needs_retry(failing(State::Reconnecting, kind), None),
+                needs_retry(health, None),
                 "{} は再計画でしか直らない",
+                kind.as_str()
+            );
+            assert!(
+                must_restart_despite_same_fingerprint(Trigger::Observe, health),
+                "{} は同一性が同じでも張り直す",
                 kind.as_str()
             );
         }
@@ -2224,9 +2262,15 @@ mod tests {
             TagErrorKind::ProtocolError,
             TagErrorKind::CatalogUnavailable,
         ] {
+            let health = failing(State::Reconnecting, kind);
             assert!(
-                !needs_retry(failing(State::Reconnecting, kind), None),
+                !needs_retry(health, None),
                 "{} は backoff の担当。割り込むと再接続を遅らせるだけ",
+                kind.as_str()
+            );
+            assert!(
+                !must_restart_despite_same_fingerprint(Trigger::Observe, health),
+                "{} で張り直すと backoff と喧嘩する",
                 kind.as_str()
             );
         }
