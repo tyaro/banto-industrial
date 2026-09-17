@@ -25,7 +25,7 @@
 //! | 変数 | 既定 | 意味 |
 //! | --- | --- | --- |
 //! | `HUB_URL` | `http://127.0.0.1:8722` | 接続先 Hub |
-//! | `CG_SMOKE_DIR` | OS の一時ディレクトリ配下に自動生成 | 設定 DB とキー保管ファイルを置く場所 |
+//! | `CG_SMOKE_DIR` | OS の一時ディレクトリ配下に自動生成 | 設定 DB を置く場所（APIキーはメモリ上だけに置く - 下記参照） |
 //! | `CG_SMOKE_TAGS` | 空＝catalog の全タグ | 選択するタグの external name をカンマ区切りで指定 |
 //! | `CG_SMOKE_WATCH_SECS` | `20` | 値を観測し続ける秒数 |
 //! | `CG_SMOKE_HOLD_SECS` | `0` | 手順5(再起動の模擬)のあと、さらに観測を続ける秒数（オーナーが実機側でタグ削除・Hub停止・Hub再開を試す時間） |
@@ -42,10 +42,25 @@
 //! Hub側を操作する時間）、記録した遷移履歴を最後のPASS/FAIL表の直前に
 //! 時系列でまとめて出す。
 //!
+//! ## KeyStore はプロセス内メモリだけ（2026-09-17 Copilotレビュー対応）
+//!
+//! `banto-hub-bootstrap` が提供する
+//! [`banto_hub_bootstrap::state::memory::MemoryKeyStore`] をそのまま使う。
+//! 以前はここに素朴な JSON ファイル実装を書いていたが、`KeyStore` トレイトの
+//! doc（`crates/banto-hub-bootstrap/src/state.rs`）に
+//! 「Implementations must never write the key anywhere else (log, settings
+//! row, **temp file**)」と明記されている契約に正面から違反していたため
+//! 撤回した。手順5「再起動の模擬」は同一プロセス内で `HubService` を
+//! 作り直すだけ（プロセスをまたがない）ので、**同じ `MemoryKeyStore`
+//! インスタンスを手順2・手順5の両方に渡す**ことで「キーが再発行されず
+//! 再利用される」ことは従来どおり証明できる。**別プロセスをまたいだ
+//! 再利用を確かめたいなら、正しい経路は OS キーリング（＝デスクトップ
+//! アプリ）であって、平文ファイルではない。**
+//!
 //! ## やらないこと
 //!
 //! * 製品コード（`src/`）の変更。
-//! * OS キーリングへの書き込み（[`JsonFileKeyStore`] のドキュメント参照）。
+//! * OS キーリングへの書き込み（上記参照。ディスクにも一切書かない）。
 //! * banto-hub 側の設定変更（接続・タグの作成は別途行う）。
 //! * CI への追加 - **example なので `cargo test` では走らない**。実 Hub が
 //!   要るためこの example を CI で自動実行することもしない。
@@ -53,10 +68,10 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use banto_hub_bootstrap::error::{Error as BootstrapError, ErrorKind as BootstrapErrorKind};
+use banto_hub_bootstrap::state::memory::MemoryKeyStore;
 use banto_hub_bootstrap::{HubRecord, KeyStore};
 use chronogazer_core::db::init_db;
 use chronogazer_core::hub::{HubService, HubSubscriptionView, HubTagView, HubValueView};
@@ -80,78 +95,6 @@ const VALUE_TABLE_INTERVAL: Duration = Duration::from_secs(5);
 /// **読み取り専用**でミラーする（書き込みは一切しない。値の形
 /// （[`HubRecord`] の JSON）は `banto-hub-bootstrap` の公開型そのもの）。
 const HUB_RECORD_SETTINGS_KEY: &str = "hub.record";
-
-/// #383 段階1 実機確認専用の [`KeyStore`]。JSON ファイル 1 枚に
-/// `account -> 平文キー` を保存する素朴な実装。
-///
-/// **これは確認用の平文保管であり、製品コードの経路ではない**:
-/// * デスクトップ版（`src-tauri`）は OS キーリングを使う。
-/// * `banto-serve`（Tauri を使わない実行形態）は
-///   `chronogazer_core::hub::UnavailableKeyStore` を使い、鍵を一切保存
-///   できない（書き込みは常にエラーになる）。
-///
-/// この example であえて JSON ファイルに永続化するのは、手順5「再起動の
-/// 模擬」で **プロセス内の状態をすべて作り直しても、同じ account に対して
-/// 同じ平文キーが再利用される**（＝新規発行されない）ことを確かめる必要が
-/// あるため。インメモリの `HashMap` では `HubService` を作り直した時点で
-/// 消えてしまい、確かめたいこと自体が確かめられない。
-///
-/// ファイル自体は `CG_SMOKE_DIR` 配下（既定は OS の一時ディレクトリ）に置き、
-/// OS キーリングには一切触らない。
-struct JsonFileKeyStore {
-    path: PathBuf,
-    /// この example は基本的に単一の非同期フロー上で順に呼ぶが、
-    /// `HubService::spawn_supervisor` の常駐タスクが背後で同時にキーを
-    /// 読みに来ることがあるため、read-modify-write の競合で片方の書き込みが
-    /// 消えないよう最小限の排他だけを掛ける。
-    guard: StdMutex<()>,
-}
-
-impl JsonFileKeyStore {
-    fn new(path: impl Into<PathBuf>) -> Self {
-        Self {
-            path: path.into(),
-            guard: StdMutex::new(()),
-        }
-    }
-
-    fn load(&self) -> BTreeMap<String, String> {
-        std::fs::read_to_string(&self.path)
-            .ok()
-            .and_then(|content| serde_json::from_str(&content).ok())
-            .unwrap_or_default()
-    }
-
-    fn store(&self, map: &BTreeMap<String, String>) -> banto_hub_bootstrap::error::Result<()> {
-        let json = serde_json::to_string_pretty(map).map_err(|err| {
-            BootstrapError::with_detail(BootstrapErrorKind::KeyStore, err.to_string())
-        })?;
-        std::fs::write(&self.path, json).map_err(|err| {
-            BootstrapError::with_detail(BootstrapErrorKind::KeyStore, err.to_string())
-        })
-    }
-}
-
-impl KeyStore for JsonFileKeyStore {
-    fn get(&self, account: &str) -> banto_hub_bootstrap::error::Result<Option<String>> {
-        let _guard = self.guard.lock().expect("keystore mutex poisoned");
-        Ok(self.load().get(account).cloned())
-    }
-
-    fn set(&self, account: &str, secret: &str) -> banto_hub_bootstrap::error::Result<()> {
-        let _guard = self.guard.lock().expect("keystore mutex poisoned");
-        let mut map = self.load();
-        map.insert(account.to_owned(), secret.to_owned());
-        self.store(&map)
-    }
-
-    fn delete(&self, account: &str) -> banto_hub_bootstrap::error::Result<()> {
-        let _guard = self.guard.lock().expect("keystore mutex poisoned");
-        let mut map = self.load();
-        map.remove(account);
-        self.store(&map)
-    }
-}
 
 /// 1段階の検証結果の状態。「実際に試して失敗した」（`Fail`）と「前段の失敗で
 /// 試せなかった」（`Skipped`）は読み手にとって全く違う情報なので区別する
@@ -309,6 +252,14 @@ impl QualityTally {
             parts.push(format!("未知({label})={count}"));
         }
         parts.join(", ")
+    }
+
+    /// 観測中に品質付きの値を1件でも見たか（[`HubSubscriptionView::values`]
+    /// が非空だったティックが1回でもあったか）。**live到達＝成功ではない**
+    /// ことの判定に使う - ハンドシェイクは通ったが値が一度も来ない、という
+    /// 実害（2026-09-17 実機確認）を PASS にしないため。
+    fn total(&self) -> u64 {
+        self.good + self.stale + self.bad + self.unknown.values().sum::<u64>()
     }
 }
 
@@ -620,7 +571,11 @@ async fn main() {
         std::process::exit(1);
     }
     let db_path = smoke_dir.join("chronogazer.sqlite3");
-    let keystore_path = smoke_dir.join("keystore.json");
+    // #383段階1 Copilotレビュー対応（2026-09-17）: APIキーはディスクに一切
+    // 書かない。`MemoryKeyStore` のdoc comment（上の「KeyStoreはプロセス内
+    // メモリだけ」参照）のとおり、この1インスタンスを手順2・手順5の両方に
+    // 渡すことで「再発行されず再利用される」ことを証明する。
+    let keys = Arc::new(MemoryKeyStore::new());
 
     println!("Hub URL: {hub_url}");
     println!("作業ディレクトリ: {}", smoke_dir.display());
@@ -653,8 +608,7 @@ async fn main() {
         }
     };
     let settings1 = SettingsService::new(pool1.clone());
-    let keys1 = Arc::new(JsonFileKeyStore::new(&keystore_path));
-    let hub1 = match HubService::new(settings1.clone(), keys1).await {
+    let hub1 = match HubService::new(settings1.clone(), keys.clone()).await {
         Ok(hub) => hub,
         Err(err) => {
             println!("  HubService初期化に失敗しました: {err}");
@@ -667,10 +621,12 @@ async fn main() {
         }
     };
     println!("  DB: {}", db_path.display());
-    println!("  キー保管ファイル: {}", keystore_path.display());
+    println!(
+        "  キー保管: プロセス内メモリ(MemoryKeyStore) - ディスク・OSキーリングには一切書き込まない"
+    );
     results.push(StepResult::pass(
         "準備",
-        "DB・KeyStore・HubServiceを初期化した",
+        "DB・KeyStore(インメモリ)・HubServiceを初期化した",
     ));
     println!();
 
@@ -765,14 +721,34 @@ async fn main() {
                             observe_live(&hub1, watch_secs, &mut tracker).await;
                         println!("  品質内訳: {}", tally.summary());
                         println!("  値が更新された回数: {update_count}");
-                        step4_result = StepResult::pass(
-                            "選択と購読",
-                            format!(
-                                "live到達={:.1}s, 品質内訳=[{}], 更新回数={update_count}",
-                                elapsed.as_secs_f64(),
-                                tally.summary()
-                            ),
-                        );
+                        // live到達（ハンドシェイク成立）だけでは成功にしない
+                        // （2026-09-17 Copilotレビュー指摘: ハンドシェイクは
+                        // 通ったが値が一度も来ない、という実害を見逃した）。
+                        // 品質付きの値を1件でも受信した(tally.total()>0)か、
+                        // 更新（t の変化）を1回でも観測したことまで求める。
+                        let received_values = tally.total() > 0 || update_count >= 1;
+                        if received_values {
+                            step4_result = StepResult::pass(
+                                "選択と購読",
+                                format!(
+                                    "live到達={:.1}s, 品質内訳=[{}], 更新回数={update_count}",
+                                    elapsed.as_secs_f64(),
+                                    tally.summary()
+                                ),
+                            );
+                        } else {
+                            println!(
+                                "  失敗: liveには到達しましたが、観測中に値を一度も受信できませんでした(ハンドシェイクのみ)。"
+                            );
+                            step4_result = StepResult::fail(
+                                "選択と購読",
+                                format!(
+                                    "live到達={:.1}s だが値未受信(品質内訳=[{}], 更新回数={update_count})",
+                                    elapsed.as_secs_f64(),
+                                    tally.summary()
+                                ),
+                            );
+                        }
                     }
                     None => {
                         let view = hub1.subscription().await;
@@ -815,12 +791,16 @@ async fn main() {
     } else {
         let secret_before = keyring_account_1
             .as_deref()
-            .and_then(|account| keys1_peek(&keystore_path, account));
+            .and_then(|account| keys.get(account).ok().flatten());
 
         // 「再起動」を模擬: 旧 HubService・旧 SettingsService・旧プールを
-        // すべて手放し、同じ DB ファイル・同じキー保管ファイルで一から
-        // 作り直す。TagClientHandle は明示 shutdown せずに drop する -
-        // `Drop for TagClientHandle` がワーカータスクを止める設計
+        // すべて手放し、同じ DB ファイルで一から作り直す。`keys`
+        // （`MemoryKeyStore`）は**同じインスタンスをそのまま**渡す -
+        // ファイル越しの永続化ではなく、この1インスタンスを使い回すことが
+        // 「同一プロセス内の再起動なら再発行されない」ことの証明そのもの
+        // （上のモジュールdoc「KeyStoreはプロセス内メモリだけ」参照）。
+        // TagClientHandle は明示 shutdown せずに drop する - `Drop for
+        // TagClientHandle` がワーカータスクを止める設計
         // （banto-tagclient handle.rs）なので、ここでも実際のプロセス終了と
         // 同じ経路を通る。
         drop(hub1);
@@ -840,8 +820,7 @@ async fn main() {
             }
         };
         let settings2 = SettingsService::new(pool2.clone());
-        let keys2 = Arc::new(JsonFileKeyStore::new(&keystore_path));
-        match HubService::new(settings2.clone(), keys2).await {
+        match HubService::new(settings2.clone(), keys.clone()).await {
             Ok(hub2) => {
                 // 指示どおり connect() は呼ばない。resume() だけで復帰する
                 // ことを確認する。
@@ -860,7 +839,7 @@ async fn main() {
                         let account_same = account_after == keyring_account_1;
                         let secret_after = account_after
                             .as_deref()
-                            .and_then(|account| keys1_peek(&keystore_path, account));
+                            .and_then(|account| keys.get(account).ok().flatten());
                         let secret_same = secret_before.is_some() && secret_before == secret_after;
                         println!(
                             "  key_name 再利用: {} (手順2={:?}, 再起動後={:?})",
@@ -872,13 +851,30 @@ async fn main() {
                             observe_live(&hub2, watch_secs.min(10), &mut tracker).await;
                         println!("  再起動後の品質内訳: {}", tally.summary());
                         println!("  再起動後に値が更新された回数: {update_count}");
+                        // status() は Hub への REST 接続状態（6状態）であって
+                        // 購読の状態ではない - 一度 live になったあとで購読が
+                        // 落ちていても status() は connected のままになりうる
+                        // （2026-09-17 Copilotレビュー指摘、実際にこれで
+                        // 壊れた購読を見逃した）。観測後に改めて
+                        // subscription() を読み、購読自体が live のままで
+                        // あることも PASS の条件にする。
+                        let post_subscription = hub2.subscription().await;
+                        let subscription_still_live = post_subscription.state == "live";
+                        println!(
+                            "  観測後の購読状態: {} (live維持={subscription_still_live})",
+                            post_subscription.state
+                        );
                         let status_ok = matches!(view, Ok(ref v) if v.status.is_connected());
-                        let ok = key_name_same && account_same && secret_same && status_ok;
+                        let ok = key_name_same
+                            && account_same
+                            && secret_same
+                            && status_ok
+                            && subscription_still_live;
                         results.push(if ok {
                             StepResult::pass(
                                 "再起動の模擬",
                                 format!(
-                                    "live再到達={:.1}s, key再利用=true",
+                                    "live再到達={:.1}s, key再利用=true, 観測後も購読live",
                                     elapsed.as_secs_f64()
                                 ),
                             )
@@ -886,8 +882,9 @@ async fn main() {
                             StepResult::fail(
                                 "再起動の模擬",
                                 format!(
-                                    "key_name一致={key_name_same}, account一致={account_same}, 平文一致={secret_same}, status={:?}",
-                                    view.as_ref().map(|v| v.status.as_str())
+                                    "key_name一致={key_name_same}, account一致={account_same}, 平文一致={secret_same}, status={:?}, 観測後の購読状態={}(live維持={subscription_still_live})",
+                                    view.as_ref().map(|v| v.status.as_str()),
+                                    post_subscription.state
                                 ),
                             )
                         });
@@ -988,14 +985,6 @@ async fn main() {
     if !all_pass {
         std::process::exit(1);
     }
-}
-
-/// 平文キーの値そのものは決して印字しない。手順5の同一性確認だけに使う
-/// 内部ヘルパー。`JsonFileKeyStore` の `get` を直接呼べないテスト外の文脈
-/// (drop 済みの旧インスタンス)からも呼べるよう、ファイルを都度開き直す。
-fn keys1_peek(keystore_path: &std::path::Path, account: &str) -> Option<String> {
-    let store = JsonFileKeyStore::new(keystore_path.to_path_buf());
-    store.get(account).ok().flatten()
 }
 
 fn print_summary(results: &[StepResult]) {
