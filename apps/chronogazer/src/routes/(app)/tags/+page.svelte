@@ -77,16 +77,32 @@
 		type TagInput,
 		type TagDataType
 	} from '$lib/banto/tagRegistryAdmin';
+	import {
+		runGuardedSave,
+		schemaWireFields,
+		splitServerFieldErrors,
+		joinFieldErrorMessages,
+		type SaveGuardToken
+	} from './tagsPageLogic';
 
 	const available = isTagRegistryAvailable();
 	const canWrite = $derived(canWriteResources(sessionStore.role));
 
+	/**
+	 * #391 レビュー C: `ProviderError.message` は検証エラーでは一律
+	 * `"validation failed"`（`@banto/admin-core`の`errors.ts`の
+	 * `describe()`）になり、削除拒否理由のような具体的な理由が消える
+	 * （例: 「この接続を使用している収集グループがN件あるため削除
+	 * できません」が `field_errors` にしか無い）。`joinFieldErrorMessages`
+	 * （`tagsPageLogic.ts`）で連結して返す。
+	 */
 	function errorMessage(err: unknown): string {
-		return isProviderError(err) ? err.message : String(err);
-	}
-
-	function capitalize(s: string): string {
-		return s.length === 0 ? s : s[0].toUpperCase() + s.slice(1);
+		if (isProviderError(err)) {
+			return err.body.kind === 'validation'
+				? joinFieldErrorMessages(err.body.field_errors)
+				: err.message;
+		}
+		return String(err);
 	}
 
 	/**
@@ -95,26 +111,33 @@
 	 * `"periodMs"`）をフォームのフィールドへマッピングする。このモジュール
 	 * doc comment の「フィールド名の接頭辞について」のとおり、実際の
 	 * フォームフィールド名は `${prefix}${capitalize(wireField)}`
-	 * （例: `"plcCreateName"`）なので、`prefix` を付けてから
-	 * `setServerErrors` に渡す - 素通しすると `store.errors` のキーが
-	 * `BantoForm` の `def.name` と一致せず、エラーが画面に出ない
-	 * （E2Eで実際に踏んだ）。人間可読でない失敗はトーストへ逃がす。
+	 * （例: `"plcCreateName"`）。
+	 *
+	 * #391 レビュー B: 以前はスキーマに無いフィールド（バックエンドの
+	 * `Scaling::from_parts()` が返す `field: "scaling"` など）でも
+	 * 確認せずそのまま `setServerErrors` に渡していたため、画面にもトーストにも
+	 * 何も出ずに保存できない理由が分からなくなっていた。`knownWireFields`
+	 * （呼び出し側がスキーマから渡す）と突き合わせる `splitServerFieldErrors`
+	 * （`tagsPageLogic.ts`）を通し、フォームに出せない分は必ずトーストへ
+	 * フォールバックさせる - 「エラーが無表示」を構造的に起こさない。
 	 */
 	function applyServerErrors(
 		prefix: string,
+		knownWireFields: readonly string[],
 		err: unknown,
 		store: ReturnType<typeof createFormStore>
-	): boolean {
+	): void {
 		if (isProviderError(err) && err.body.kind === 'validation') {
-			const fieldErrors = err.body.field_errors.map((fe) => ({
-				field: `${prefix}${capitalize(fe.field)}`,
-				message: fe.message
-			}));
-			store.setServerErrors(fieldErrors);
-			return true;
+			const { formErrors, toastMessages } = splitServerFieldErrors(
+				prefix,
+				knownWireFields,
+				err.body.field_errors
+			);
+			if (formErrors.length > 0) store.setServerErrors(formErrors);
+			for (const message of toastMessages) toastStore.push('error', message);
+			return;
 		}
 		toastStore.push('error', errorMessage(err));
-		return false;
 	}
 
 	// --- PLC接続 -----------------------------------------------------------
@@ -223,6 +246,12 @@
 		};
 	}
 
+	// スキーマに実在する wire フィールド名一覧（`applyServerErrors`が
+	// `scaling`のようなスキーマ外のフィールドをトーストへ振り分けられる
+	// ようにする）。CREATE/EDIT どちらのプレフィックスで計算しても剥がした
+	// 後の wire 名は同じなので、ここでは PLC_CREATE 側で一度だけ計算する。
+	const CONNECTION_WIRE_FIELDS = schemaWireFields(PLC_CREATE, connectionSchema(PLC_CREATE).fields);
+
 	let connections: PlcConnection[] = $state([]);
 	let connectionsLoading = $state(false);
 
@@ -254,7 +283,7 @@
 			createConnectionStore = createFormStore(connectionSchema(PLC_CREATE));
 			await reloadConnections();
 		} catch (err) {
-			applyServerErrors(PLC_CREATE, err, createConnectionStore);
+			applyServerErrors(PLC_CREATE, CONNECTION_WIRE_FIELDS, err, createConnectionStore);
 		} finally {
 			creatingConnection = false;
 		}
@@ -287,8 +316,13 @@
 	let editConnectionStore = $state(untrack(() => createFormStore(connectionSchema(PLC_EDIT))));
 	let savingConnection = $state(false);
 
+	/**
+	 * #391 レビュー A: 保存中は選択行を切り替えさせない。1文字だけの
+	 * ガードでは不十分な理由（応答側の照合も不変条件として持つ理由）は
+	 * `runGuardedSave`（`tagsPageLogic.ts`）のdoc comment参照。
+	 */
 	function selectConnection(conn: PlcConnection): void {
-		if (!canWrite) return;
+		if (!canWrite || savingConnection) return;
 		selectedConnection = conn;
 		editConnectionStore = createFormStore(
 			connectionSchema(PLC_EDIT),
@@ -299,24 +333,46 @@
 	async function saveConnection(): Promise<void> {
 		if (!selectedConnection) return;
 		if (!editConnectionStore.validateAll()) return;
+		const pending: SaveGuardToken<typeof editConnectionStore> = {
+			id: selectedConnection.id,
+			store: editConnectionStore
+		};
 		savingConnection = true;
 		try {
-			const updated = await updatePlcConnection(
-				selectedConnection.id,
-				toPlcConnectionInput(PLC_EDIT, editConnectionStore.values)
+			const outcome = await runGuardedSave(
+				pending,
+				updatePlcConnection(
+					selectedConnection.id,
+					toPlcConnectionInput(PLC_EDIT, editConnectionStore.values)
+				),
+				() => ({ id: selectedConnection?.id, store: editConnectionStore })
 			);
-			toastStore.push('success', '更新しました');
-			selectedConnection = updated;
-			await reloadConnections();
-		} catch (err) {
-			applyServerErrors(PLC_EDIT, err, editConnectionStore);
+			switch (outcome.kind) {
+				case 'applied':
+					toastStore.push('success', '更新しました');
+					selectedConnection = outcome.entity;
+					await reloadConnections();
+					break;
+				case 'stale-success':
+					// 応答が返ってきた時点で既に別の接続を選び直している - 一覧の
+					// 鮮度だけは保つが、今開いているフォームには適用しない。
+					await reloadConnections();
+					break;
+				case 'error':
+					applyServerErrors(PLC_EDIT, CONNECTION_WIRE_FIELDS, outcome.err, editConnectionStore);
+					break;
+				case 'stale-error':
+					// 古いエラーを今開いている別の接続のフォームには出さない
+					// （トーストも出さない - ユーザーは既に別の行を見ている）。
+					break;
+			}
 		} finally {
 			savingConnection = false;
 		}
 	}
 
 	async function handleDeleteConnection(): Promise<void> {
-		if (!selectedConnection) return;
+		if (!selectedConnection || savingConnection) return;
 		if (!window.confirm(`${selectedConnection.name} を削除しますか？`)) return;
 		try {
 			await deletePlcConnection(selectedConnection.id);
@@ -387,6 +443,11 @@
 		};
 	}
 
+	// `CONNECTION_WIRE_FIELDS`と同じ理由。`groupSchema`のフィールド名は
+	// `connectionOptions`（$derived）の中身に関わらず固定なので、ここで
+	// 一度だけ計算してよい。
+	const GROUP_WIRE_FIELDS = schemaWireFields(GROUP_CREATE, groupSchema(GROUP_CREATE).fields);
+
 	let groups: CollectionGroup[] = $state([]);
 	let groupsLoading = $state(false);
 
@@ -417,7 +478,7 @@
 			createGroupStore = createFormStore(groupSchema(GROUP_CREATE));
 			await reloadGroups();
 		} catch (err) {
-			applyServerErrors(GROUP_CREATE, err, createGroupStore);
+			applyServerErrors(GROUP_CREATE, GROUP_WIRE_FIELDS, err, createGroupStore);
 		} finally {
 			creatingGroup = false;
 		}
@@ -464,8 +525,9 @@
 	let editGroupStore = $state(untrack(() => createFormStore(groupSchema(GROUP_EDIT))));
 	let savingGroup = $state(false);
 
+	/** #391 レビュー A: 保存中は選択行を切り替えさせない（理由は `selectConnection` 参照）。 */
 	function selectGroup(group: CollectionGroup): void {
-		if (!canWrite) return;
+		if (!canWrite || savingGroup) return;
 		selectedGroup = group;
 		editGroupStore = createFormStore(groupSchema(GROUP_EDIT), groupFormValues(GROUP_EDIT, group));
 	}
@@ -473,24 +535,42 @@
 	async function saveGroup(): Promise<void> {
 		if (!selectedGroup) return;
 		if (!editGroupStore.validateAll()) return;
+		const pending: SaveGuardToken<typeof editGroupStore> = {
+			id: selectedGroup.id,
+			store: editGroupStore
+		};
 		savingGroup = true;
 		try {
-			const updated = await updateCollectionGroup(
-				selectedGroup.id,
-				toCollectionGroupInput(GROUP_EDIT, editGroupStore.values)
+			const outcome = await runGuardedSave(
+				pending,
+				updateCollectionGroup(
+					selectedGroup.id,
+					toCollectionGroupInput(GROUP_EDIT, editGroupStore.values)
+				),
+				() => ({ id: selectedGroup?.id, store: editGroupStore })
 			);
-			toastStore.push('success', '更新しました');
-			selectedGroup = updated;
-			await reloadGroups();
-		} catch (err) {
-			applyServerErrors(GROUP_EDIT, err, editGroupStore);
+			switch (outcome.kind) {
+				case 'applied':
+					toastStore.push('success', '更新しました');
+					selectedGroup = outcome.entity;
+					await reloadGroups();
+					break;
+				case 'stale-success':
+					await reloadGroups();
+					break;
+				case 'error':
+					applyServerErrors(GROUP_EDIT, GROUP_WIRE_FIELDS, outcome.err, editGroupStore);
+					break;
+				case 'stale-error':
+					break;
+			}
 		} finally {
 			savingGroup = false;
 		}
 	}
 
 	async function handleDeleteGroup(): Promise<void> {
-		if (!selectedGroup) return;
+		if (!selectedGroup || savingGroup) return;
 		if (!window.confirm(`${selectedGroup.name} を削除しますか？`)) return;
 		try {
 			await deleteCollectionGroup(selectedGroup.id);
@@ -599,6 +679,9 @@
 		};
 	}
 
+	// `CONNECTION_WIRE_FIELDS`と同じ理由。
+	const TAG_WIRE_FIELDS = schemaWireFields(TAG_CREATE, tagSchema(TAG_CREATE).fields);
+
 	let tags: Tag[] = $state([]);
 	let tagsLoading = $state(false);
 
@@ -625,7 +708,7 @@
 			createTagStore = createFormStore(tagSchema(TAG_CREATE));
 			await reloadTags();
 		} catch (err) {
-			applyServerErrors(TAG_CREATE, err, createTagStore);
+			applyServerErrors(TAG_CREATE, TAG_WIRE_FIELDS, err, createTagStore);
 		} finally {
 			creatingTag = false;
 		}
@@ -667,8 +750,9 @@
 	let editTagStore = $state(untrack(() => createFormStore(tagSchema(TAG_EDIT))));
 	let savingTag = $state(false);
 
+	/** #391 レビュー A: 保存中は選択行を切り替えさせない（理由は `selectConnection` 参照）。 */
 	function selectTag(tag: Tag): void {
-		if (!canWrite) return;
+		if (!canWrite || savingTag) return;
 		selectedTag = tag;
 		editTagStore = createFormStore(tagSchema(TAG_EDIT), tagFormValues(TAG_EDIT, tag));
 	}
@@ -676,21 +760,39 @@
 	async function saveTag(): Promise<void> {
 		if (!selectedTag) return;
 		if (!editTagStore.validateAll()) return;
+		const pending: SaveGuardToken<typeof editTagStore> = {
+			id: selectedTag.id,
+			store: editTagStore
+		};
 		savingTag = true;
 		try {
-			const updated = await updateTag(selectedTag.id, toTagInput(TAG_EDIT, editTagStore.values));
-			toastStore.push('success', '更新しました');
-			selectedTag = updated;
-			await reloadTags();
-		} catch (err) {
-			applyServerErrors(TAG_EDIT, err, editTagStore);
+			const outcome = await runGuardedSave(
+				pending,
+				updateTag(selectedTag.id, toTagInput(TAG_EDIT, editTagStore.values)),
+				() => ({ id: selectedTag?.id, store: editTagStore })
+			);
+			switch (outcome.kind) {
+				case 'applied':
+					toastStore.push('success', '更新しました');
+					selectedTag = outcome.entity;
+					await reloadTags();
+					break;
+				case 'stale-success':
+					await reloadTags();
+					break;
+				case 'error':
+					applyServerErrors(TAG_EDIT, TAG_WIRE_FIELDS, outcome.err, editTagStore);
+					break;
+				case 'stale-error':
+					break;
+			}
 		} finally {
 			savingTag = false;
 		}
 	}
 
 	async function handleDeleteTag(): Promise<void> {
-		if (!selectedTag) return;
+		if (!selectedTag || savingTag) return;
 		if (!window.confirm(`${selectedTag.name} を削除しますか？`)) return;
 		try {
 			await deleteTag(selectedTag.id);
@@ -741,7 +843,9 @@
 				{#if connectionsLoading && connections.length === 0}
 					<p class="loading">読み込み中…</p>
 				{:else}
-					<div class="grid-wrap">
+					<!-- #391 レビュー A: 保存中は行の選択を操作できないようにする
+					（`selectConnection`自体のガードに加え、見た目でも伝える）。 -->
+					<div class="grid-wrap" class:saving={savingConnection} aria-disabled={savingConnection}>
 						<BantoGrid
 							rows={connections}
 							columns={connectionColumns}
@@ -762,7 +866,14 @@
 						submitting={savingConnection}
 						submitLabel="保存"
 					>
-						<button type="button" class="danger" onclick={handleDeleteConnection}>削除</button>
+						<button
+							type="button"
+							class="danger"
+							onclick={handleDeleteConnection}
+							disabled={savingConnection}
+						>
+							削除
+						</button>
 					</BantoForm>
 				</div>
 			{/if}
@@ -796,7 +907,7 @@
 				{#if groupsLoading && groups.length === 0}
 					<p class="loading">読み込み中…</p>
 				{:else}
-					<div class="grid-wrap">
+					<div class="grid-wrap" class:saving={savingGroup} aria-disabled={savingGroup}>
 						<BantoGrid
 							rows={groups}
 							columns={groupColumns}
@@ -817,7 +928,9 @@
 						submitting={savingGroup}
 						submitLabel="保存"
 					>
-						<button type="button" class="danger" onclick={handleDeleteGroup}>削除</button>
+						<button type="button" class="danger" onclick={handleDeleteGroup} disabled={savingGroup}>
+							削除
+						</button>
 					</BantoForm>
 				</div>
 			{/if}
@@ -851,7 +964,7 @@
 				{#if tagsLoading && tags.length === 0}
 					<p class="loading">読み込み中…</p>
 				{:else}
-					<div class="grid-wrap">
+					<div class="grid-wrap" class:saving={savingTag} aria-disabled={savingTag}>
 						<BantoGrid
 							rows={tags}
 							columns={tagColumns}
@@ -872,7 +985,9 @@
 						submitting={savingTag}
 						submitLabel="保存"
 					>
-						<button type="button" class="danger" onclick={handleDeleteTag}>削除</button>
+						<button type="button" class="danger" onclick={handleDeleteTag} disabled={savingTag}>
+							削除
+						</button>
 					</BantoForm>
 				</div>
 			{/if}
@@ -948,5 +1063,18 @@
 
 	button.danger:hover {
 		background: color-mix(in srgb, var(--banto-danger) 10%, transparent);
+	}
+
+	/* #391 レビュー A: 保存中は行を操作できないようにする（既存の保存
+	ボタンの disabled 表現 - opacity + cursor - に合わせる）。 */
+	button.danger:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	.grid-wrap.saving {
+		opacity: 0.5;
+		pointer-events: none;
+		cursor: not-allowed;
 	}
 </style>

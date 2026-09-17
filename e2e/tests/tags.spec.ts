@@ -16,6 +16,19 @@
  *    「サーバー側検証がフィールドへ人間可読で返る」経路を、実際に踏める
  *    形で固定したもの。）
  * 3. viewer は閲覧のみで、新規作成フォーム・削除ボタンが一切出ないこと。
+ * 4.（#391レビュー B の回帰固定）スケーリングを部分指定（生値下限だけ）で
+ *    タグを作成しようとすると、`crates/banto-tags/src/scaling.rs`の
+ *    `Scaling::from_parts()`が返す`field: "scaling"`のエラーが、対応する
+ *    フォーム項目（生値/工学値の4項目）に人間可読な理由として出ること
+ *    （修正前は画面にもトーストにも何も出ず、保存できない理由が
+ *    分からなかった）。作成のみを固定する（編集も同じ`applyServerErrors`
+ *    経路を通るため、作成側の固定で判断ロジックの回帰は拾える - 編集は
+ *    行選択やレジストリ状態の前提が増えて重くなるため見送った）。
+ * 5.（#391レビュー C の回帰固定）収集グループが残っている PLC接続の削除は
+ *    拒否され、「この接続を使用している収集グループがN件あるため削除
+ *    できません」という具体的な理由がトーストに出ること（修正前は
+ *    `ProviderError.message`が一律`"validation failed"`になり理由が
+ *    消えていた）。データも消えていないことを一覧で確認する。
  *
  * ファイル名について: `smoke.spec.ts` が初回セットアップ（管理者アカウント
  * 作成）を実 DOM で行うため、このファイルは辞書順でそれより後でなければ
@@ -111,7 +124,50 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 		await expect(section.locator('div.list').getByText(TAG_NAME)).toBeVisible();
 	});
 
-	test('6. 閲覧者アカウントを作成する（次のテストの前提）', async () => {
+	test('6. スケーリングを部分指定（生値下限だけ）で作成しようとすると、理由が画面に見える', async () => {
+		const section = page.locator('section.registry-section').nth(2);
+		const form = section.locator('div.create');
+		const PARTIAL_SCALING_TAG_NAME = 'E2Eスケーリング欠落';
+		await form.getByLabel('名前').fill(PARTIAL_SCALING_TAG_NAME);
+		await form.getByLabel('収集グループ').selectOption({ label: GROUP_NAME });
+		await form.getByLabel('デバイスアドレス').fill('D3010');
+		await form.getByLabel('スケーリング: 生値 下限').fill('0');
+		await form.getByRole('button', { name: '作成' }).click();
+		// `Scaling::from_parts()`（crates/banto-tags/src/scaling.rs）が返す
+		// 理由がそのまま出る - `scaling`というフィールドはフォームに無いため、
+		// 4つの生値/工学値項目すべてに同じメッセージが出る（`.first()`で
+		// strict mode 違反を避ける）。
+		await expect(
+			form
+				.getByText('raw_lo/raw_hi/eng_lo/eng_hi は全て指定するか、全て未指定にしてください')
+				.first()
+		).toBeVisible();
+		// 検証エラーで弾かれ、作成は成立していない。
+		await expect(section.locator('div.list').getByText(PARTIAL_SCALING_TAG_NAME)).toHaveCount(0);
+	});
+
+	test('7. 収集グループが残っているPLC接続の削除は具体的な理由で拒否され、データは消えない', async () => {
+		const section = page.locator('section.registry-section').nth(0);
+		await section
+			.locator('div.list')
+			.getByRole('gridcell', { name: CONNECTION_NAME, exact: true })
+			.click();
+		const detail = section.locator('div.detail');
+		await expect(
+			detail.getByRole('heading', { level: 4, name: `${CONNECTION_NAME} を編集` })
+		).toBeVisible();
+		page.once('dialog', (dialog) => void dialog.accept());
+		await detail.getByRole('button', { name: '削除' }).click();
+		// 修正前は `ProviderError.message` が一律 "validation failed" になり
+		// この理由が消えていた（#391レビュー C）。
+		await expect(
+			page.getByText('この接続を使用している収集グループが1件あるため削除できません')
+		).toBeVisible();
+		// 削除は成立していない - 一覧からも消えていない。
+		await expect(section.locator('div.list').getByText(CONNECTION_NAME)).toBeVisible();
+	});
+
+	test('8. 閲覧者アカウントを作成する（次のテストの前提）', async () => {
 		await page.goto('/users');
 		// 入力欄は「新規作成」セクションに限定して取る（一覧のグリッドに
 		// 同名の列見出しがあり strict mode 違反になるため）。
@@ -124,7 +180,7 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 		await expect(page.locator('section.list').getByText(VIEWER_USERNAME).first()).toBeVisible();
 	});
 
-	test('7. viewer は /tags を閲覧のみでき、新規作成フォーム・削除ボタンは出ない', async ({
+	test('9. viewer は /tags を閲覧のみでき、新規作成フォーム・削除ボタンは出ない', async ({
 		browser
 	}) => {
 		const viewerPage = await browser.newPage();
