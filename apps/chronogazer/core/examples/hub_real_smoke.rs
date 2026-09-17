@@ -85,9 +85,20 @@
 //! （終了コード1）、同じ手動失効の案内も出す**（2026-09-17 Copilotレビュー
 //! 指摘。以前は「致命扱いにせず案内を出して終わる」だったが、それでは
 //! サマリが実際には失敗した失効を成功に見せてしまうため撤回した）。
-//! 「今回発行したものか判定できない」（設定の読み取り失敗）場合も同様に
-//! 手順7を FAIL にし、判定材料が欠けたまま自動失効はしない
-//! （2026-09-18 Copilotレビュー指摘）。
+//!
+//! 判定は `KeyOutcome`（`Undetermined` / `ConfirmedAbsent` /
+//! `ConfirmedDifferentHub` / `ConfirmedPresent`）の4分岐に整理して
+//! いる。**「発行されていない」と PASS で言い切ってよいのは、それを
+//! 積極的に確認できたときだけ**という既定を反転した原則を通すため
+//! （2026-09-18 Copilotレビュー指摘: 接続先の取り違え・判定材料の欠測・
+//! 接続前の読み取り失敗・`connect()` 自体のエラーという同型の穴が4回
+//! 見つかった）、`classify_key_outcome` は接続前後の `hub.record` の
+//! **実際の差分**だけで判定し、`connect()` が `Ok`/`Err` のどちらを
+//! 返したかには依存しない - `Bootstrapper` は設定の保存
+//! （`save_record()`）の**後**に最終確認を行うため、その確認が失敗して
+//! `connect()` 全体が `Err` になっても、実際にはキーが発行・保存されて
+//! いることがある。読み取りに失敗した経路はすべて `Undetermined` に
+//! 合流し、手順7を FAIL にして自動失効しない。
 //!
 //! ## やらないこと
 //!
@@ -134,6 +145,16 @@ const REVOKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// **読み取り専用**でミラーする（書き込みは一切しない。値の形
 /// （[`HubRecord`] の JSON）は `banto-hub-bootstrap` の公開型そのもの）。
 const HUB_RECORD_SETTINGS_KEY: &str = "hub.record";
+
+/// `chronogazer_core::hub` の設定 KV キー（`hub.installation_id`）を
+/// ここでも読む理由は [`HUB_RECORD_SETTINGS_KEY`] と同じ（private な
+/// 定数を読み取り専用でミラーする）。手順7が「判定不能」になったとき、
+/// 手動確認の案内に「このインストールが発行したキーの名前の接頭辞
+/// （`chronogazer-{installation_id}-`）」を添えるために使う。
+/// `HubService::new` がこの値を手順1の時点で既に発行・永続化して
+/// いるはず（`hub.record` とは別の設定行なので、`hub.record` 側が
+/// 読めなくてもこちらは読めることがある）。
+const HUB_INSTALLATION_ID_SETTINGS_KEY: &str = "hub.installation_id";
 
 /// 1段階の検証結果の状態。「実際に試して失敗した」（`Fail`）と「前段の失敗で
 /// 試せなかった」（`Skipped`）は読み手にとって全く違う情報なので区別する
@@ -636,7 +657,7 @@ async fn hold_observe(hub: &HubService, hold_secs: u64, tracker: &mut StatusTrac
 /// 関数も同じ規律に揃える。
 ///
 /// 正規化は [`hub_identity`] に委譲する（判定は1箇所に集約し、
-/// [`issued_this_run`] もこの関数越しに同じ規則を使う）。どちらかが
+/// [`classify_key_outcome`] もこの関数越しに同じ規則を使う）。どちらかが
 /// 不正な形式なら「同じではない」として扱う（安全側 - 判断に迷ったら
 /// 失効させない）。
 fn same_hub(a: &str, b: &str) -> bool {
@@ -655,7 +676,7 @@ fn same_hub(a: &str, b: &str) -> bool {
 /// 規律 ---「the port is always spelled out (`port_or_known_default`),
 /// so `http://host` and `http://host:80` are one Hub, not two」---
 /// にここでも揃える（2026-09-18 Copilotレビュー指摘: 既定ポートの
-/// 表記ゆれを吸収しないと、`issued_this_run` が「別Hub」と誤判定し、
+/// 表記ゆれを吸収しないと `classify_key_outcome` が「別Hub」と誤判定し、
 /// `CG_SMOKE_REVOKE=1` が今回発行していない既存キーを失効させる -
 /// 前々回直した「他人のキーを消してしまう」側の、また別の形の再発）。
 ///
@@ -684,72 +705,105 @@ fn hub_identity(raw: &str) -> Option<(String, u16, String)> {
     Some((host, port, path))
 }
 
-/// 手順2の`connect()`が**今回のプロセスで実際にキーを発行したか**を
-/// 判定する（2026-09-17/18 Copilotレビュー指摘）。
+/// 手順2の結果、発行済みAPIキーについて何が分かったかの分類
+/// （2026-09-18 Copilotレビュー指摘）。
 ///
-/// `api_keys.id` は **Hub ごとの連番**なので、ID の比較は接続先とセット
-/// でなければ意味がない（`Bootstrapper::previous_for` と同じ理屈 -
-/// `same_hub` のdoc comment参照）。接続先を無視して `key_id` だけを比べる
-/// と、別の Hub に切り替えたときに「旧レコードの key_id」と「新しい Hub
-/// が今回発行した key_id」がたまたま同じ数値になり得て、**今回発行した
-/// のに「発行していない」と誤判定し、失効をスキップして孤児キーを残す**
-/// （前回直した「他人のキーを消してしまう」側の鏡像 - 根っこは同じ）。
-///
-/// 判定は次のいずれかが成り立つときだけ真:
-/// * 接続前にレコードが無かった（`endpoint_before` が `None`）。
-/// * 接続前の接続先と今回の接続先が（正規化して）**違う**
-///   （`!same_hub`）- 数値が同じでも別Hubの連番なので無関係。
-/// * 接続先は同じで、`key_id` が**変わった**。
-///
-/// 接続が `connected` にならなかった場合は無条件に偽（何も発行されて
-/// いない）。
-fn issued_this_run(
-    connected: bool,
-    endpoint_before: Option<&str>,
-    key_id_before: Option<i64>,
-    endpoint_now: &str,
-    key_id_now: Option<i64>,
-) -> bool {
-    if !connected {
-        return false;
-    }
-    match endpoint_before {
-        None => true,
-        Some(before) if !same_hub(before, endpoint_now) => true,
-        Some(_) => key_id_now != key_id_before,
-    }
+/// **同型の「判定できないのに黙ってPASSへ倒れる」穴が4回見つかった**
+/// （接続先の取り違え・判定材料の欠測・接続前の読み取り失敗・`connect()`
+/// 自体のエラー）。1つずつ塞ぐのではなく、この種類ごと構造的に閉じる:
+/// **「発行されていない」とPASSで言い切ってよいのは、それを積極的に
+/// 確認できたときだけ**にする。[`classify_key_outcome`] はこの原則を
+/// 「早期returnで`Undetermined`を返し、確認できた場合だけ最後まで
+/// たどり着いて他のバリアントを組み立てる」という書き方で保証する -
+/// `before`/`after` の読み取りが失敗する新しい理由が将来増えても、
+/// `Result::Err` の分岐は既にすべて `Undetermined` に合流しているため、
+/// 書き手が個別対応を追加し忘れても自動的に安全側に倒れる
+/// （`unwrap_or_default` 的な握り潰しをしない、という意味でもある）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyOutcome {
+    /// 判定不能。手順7は自動失効せずFAILにする。
+    Undetermined(String),
+    /// 確認できた: 今回のHUB_URL向けの発行済みキーは無い。
+    ConfirmedAbsent,
+    /// 確認できた: レコードはあるが別のHub（今回のHUB_URLとは異なる
+    /// 接続先）のもの。このハーネスは触らない。
+    ConfirmedDifferentHub {
+        key_id: Option<i64>,
+        endpoint: String,
+    },
+    /// 確認できた: 今回のHUB_URL向けのキーがある。
+    ConfirmedPresent {
+        key_id: i64,
+        key_name: Option<String>,
+        /// 接続前後で`key_id`が変わった（＝今回このプロセスが発行した）
+        /// か、以前からのキーをそのまま維持しているだけか。
+        issued_this_run: bool,
+    },
 }
 
-/// [`issued_this_run`] を呼ぶ前に、そもそも判定材料（接続前の状態）を
-/// 読めたかどうかを見る最終判断（2026-09-18 Copilotレビュー指摘）。
+/// [`KeyOutcome`] を判定する。
 ///
-/// **判定材料が欠けたら、危険な側の動作（自動失効）はしない**。接続前の
-/// 読み取りが失敗した（`pre_connect_read_error` が `Some`）状態で
-/// [`issued_this_run`] をそのまま呼ぶと、その関数の「接続前にレコードが
-/// 無かった → 今回発行した」という分岐に落ちてしまう。実際には同じ
-/// Hub の既存キーを再利用しただけでも `true` になり、
-/// `CG_SMOKE_REVOKE=1` が今回発行していない古いキーを失効させる。
-/// その分岐は「無かったことを確認できた」場合専用であって、「確認
-/// できなかった」場合に流用してはいけない - 読めなかったときは常に
-/// `false`（「今回発行したとは断定しない」）に倒す。
-fn issued_this_run_or_unknown(
-    pre_connect_read_error: Option<&str>,
-    connected: bool,
-    endpoint_before: Option<&str>,
-    key_id_before: Option<i64>,
-    endpoint_now: &str,
-    key_id_now: Option<i64>,
-) -> bool {
-    if pre_connect_read_error.is_some() {
-        return false;
+/// 判定は**接続前後の `hub.record` の実際の差分**だけで行い、
+/// `connect()` 自体が `Ok`/`Err` のどちらを返したかには依存しない -
+/// `Bootstrapper::connect_with_scopes`
+/// （`crates/banto-hub-bootstrap/src/bootstrap.rs`）は `save_record()`
+/// （キーの永続化）の**後**に最終確認の `verify()` を呼ぶため、
+/// `verify()` が失敗して呼び出し全体が `Err`（または非 `Connected`）に
+/// なっても、実際にはキーは発行・保存されていることがある
+/// （今回のCopilotレビュー指摘の直接の原因）。「`connect()` が成功
+/// したか」ではなく「設定の記録が実際に変わったか」を見ることで、
+/// `connect()` の内部実装がどんな終わり方をしても取りこぼさない -
+/// 呼び出し側（`main`）は `connect()` の戻り値が `Ok`/`Err` どちらでも
+/// 必ずもう一度 `after` を読む。
+///
+/// `api_keys.id` は Hub ごとの連番なので、`key_id` だけの比較は接続先
+/// とセットでなければ意味がない（`same_hub` のdoc comment、
+/// `Bootstrapper::previous_for` と同じ理屈）。
+fn classify_key_outcome(
+    hub_url: &str,
+    before: &Result<Option<HubRecord>, String>,
+    after: &Result<Option<HubRecord>, String>,
+) -> KeyOutcome {
+    let before_record = match before {
+        Ok(record) => record.as_ref(),
+        Err(err) => {
+            return KeyOutcome::Undetermined(format!("接続前の設定読み取りに失敗しました: {err}"))
+        }
+    };
+    let after_record = match after {
+        Ok(record) => record.as_ref(),
+        Err(err) => {
+            return KeyOutcome::Undetermined(format!("接続後の設定読み取りに失敗しました: {err}"))
+        }
+    };
+    let Some(after_record) = after_record else {
+        return KeyOutcome::ConfirmedAbsent;
+    };
+    if !same_hub(&after_record.endpoint, hub_url) {
+        return KeyOutcome::ConfirmedDifferentHub {
+            key_id: after_record.key_id,
+            endpoint: after_record.endpoint.clone(),
+        };
     }
-    issued_this_run(
-        connected,
-        endpoint_before,
-        key_id_before,
-        endpoint_now,
-        key_id_now,
-    )
+    let Some(key_id) = after_record.key_id else {
+        // 自己発行なら必ずkey_idが付く（HubRecordのdoc）。手動キー採用
+        // （key_id: None）はこのハーネスが使わない経路なので、想定外
+        // として安全側（判定不能）に倒す - 決め打ちで「発行していない」
+        // とは言い切らない。
+        return KeyOutcome::Undetermined(
+            "レコードにkey_idがありません(手動キー採用は想定していません)".to_owned(),
+        );
+    };
+    let issued_this_run = match before_record {
+        None => true,
+        Some(before_record) if !same_hub(&before_record.endpoint, hub_url) => true,
+        Some(before_record) => before_record.key_id != Some(key_id),
+    };
+    KeyOutcome::ConfirmedPresent {
+        key_id,
+        key_name: after_record.key_name.clone(),
+        issued_this_run,
+    }
 }
 
 /// `curl` で手動失効するときの1行を組み立てる（実行はしない）。手順7の
@@ -910,6 +964,17 @@ async fn main() {
     println!(
         "  キー保管: プロセス内メモリ(MemoryKeyStore) - ディスク・OSキーリングには一切書き込まない"
     );
+    // 手順7が「判定不能」になったときの手動確認案内に使う
+    // installation_id。HubService::new（すぐ上）がここまでに発行・
+    // 永続化しているはず（HUB_INSTALLATION_ID_SETTINGS_KEYのdoc参照）。
+    // 読めなくても致命的ではない（手動案内から接頭辞が抜けるだけ）ので、
+    // 手順1自体の成否には影響させない。
+    let installation_id = settings1
+        .get(HUB_INSTALLATION_ID_SETTINGS_KEY)
+        .await
+        .ok()
+        .flatten()
+        .filter(|value| !value.trim().is_empty());
     results.push(StepResult::pass(
         "準備",
         "DB・KeyStore(インメモリ)・HubServiceを初期化した",
@@ -918,48 +983,27 @@ async fn main() {
 
     // == 2. 接続 ==============================================================
     println!("== 2. 接続 ==");
-    // connect() の**前**に、同じ CG_SMOKE_DIR に残っていたかもしれない
-    // 古いレコードの key_id と接続先を控えておく（2026-09-17 Copilotレビュー
-    // 指摘）: connect() は NeedsPairing / Unreachable でも `Ok(HubView)`
-    // を返すため、接続が実際には成功していなくても、設定DBに残っていた
-    // 古い hub.record（このプロセスではなく過去の実行が発行したキー）を
-    // 「今回発行したキー」と誤認しうる。接続先も一緒に控える理由は
-    // `issued_this_run` のdoc comment参照（key_idだけの比較は接続先が
-    // 変わると意味を失う）。
-    // **判定材料が欠けたら、危険な側の動作（自動失効）はしない**
-    // （2026-09-18 Copilotレビュー指摘）: この読み取りが失敗したときに
-    // 「接続前にレコードが無かった」扱いに倒すと、`issued_this_run` の
-    // 「接続前にレコードが無かった → 今回発行した」という分岐に落ちて
-    // しまう。実際には同じ Hub の既存キーを再利用しただけでも true に
-    // なり、`CG_SMOKE_REVOKE=1` が**今回発行していない古いキー**を
-    // 失効させる（前回「致命度が低い」と判断してレコード無しに倒した
-    // 箇所だが、失効の判定材料を欠測したまま進めるのは、このツールで
-    // 一番危険な方向 - 他人のキーを消す - に倒れるため撤回した）。
-    // 読めなかった場合は「レコード無し」と混同せず、
-    // `pre_connect_read_error` としてエラーを保持したまま手順7まで
-    // 持ち越し、判定不能な状態として扱う。
-    let (key_id_before_connect, endpoint_before_connect, pre_connect_read_error) =
-        match read_hub_record(&settings1).await {
-            Ok(Some(record)) => (record.key_id, Some(record.endpoint), None),
-            Ok(None) => (None, None, None),
-            Err(err) => {
-                println!(
-                    "  警告: 接続前の設定読み取りに失敗しました({err})。このキーが今回発行されたものかどうかは判定できません(自動失効はしません)。"
-                );
-                (None, None, Some(err))
-            }
-        };
+    // connect() の**前後**でhub.recordを読み、その差分だけで「今回発行
+    // したか」を判定する（`KeyOutcome`/`classify_key_outcome` のdoc
+    // comment参照）。**connect() 自体が Ok/Err のどちらを返しても、
+    // 必ずもう一度 after を読む** - Bootstrapper は save_record()（キー
+    // の永続化）の後に最終確認の verify() を呼ぶため、verify() が失敗
+    // して connect() 全体が Err になっても、実際にはキーが発行・保存
+    // されていることがある（2026-09-18 Copilotレビュー指摘: これで
+    // 4回目の同型の穴だったため、個別にこの経路だけ直すのではなく
+    // before/afterの差分判定に一本化して構造的に閉じた）。
+    let before_record = read_hub_record(&settings1).await;
+    if let Err(err) = &before_record {
+        println!("  警告: 接続前の設定読み取りに失敗しました({err})。");
+    }
     let connect_view = hub1.connect(&hub_url).await;
-    let (
-        step2_ok,
-        catalog_tags,
-        key_name_1,
-        keyring_account_1,
-        key_id_1,
-        record_endpoint_1,
-        issued_this_run_1,
-        record_read_error_1,
-    ) = match connect_view {
+    let after_record = read_hub_record(&settings1).await;
+    if let Err(err) = &after_record {
+        println!("  警告: 接続後の設定読み取りに失敗しました({err})。");
+    }
+    let key_outcome = classify_key_outcome(&hub_url, &before_record, &after_record);
+
+    let (step2_ok, catalog_tags, key_name_1, keyring_account_1) = match connect_view {
         Ok(view) => {
             let tag_count = view.tags.as_ref().map(|t| t.len());
             println!("  状態: {}", view.status.as_str());
@@ -970,65 +1014,25 @@ async fn main() {
                     .unwrap_or_else(|| "不明(catalog未取得)".to_owned())
             );
             println!("  キー名: {}", view.key_name.as_deref().unwrap_or("-"));
-            // **この読み取りの失敗は手順7の判断を左右する致命的なもの**
-            // （2026-09-18 Copilotレビュー指摘）: connect が成功して実際に
-            // キーが発行されていても、この読み取りだけが失敗すると
-            // key_id が分からず、案内も失効もできない。「レコードが無い」
-            // （Ok(None)）と混同せず、record_read_error_1 として手順7へ
-            // 持ち越す - 手順7はこれが Some なら「発行済みキーはありません」
-            // と嘘をつかず FAIL にする。
-            let (record, record_read_error) = match read_hub_record(&settings1).await {
-                Ok(record) => (record, None),
-                Err(err) => {
-                    println!("  警告: 接続後の設定読み取りに失敗しました: {err}");
-                    (None, Some(err))
-                }
-            };
-            let keyring_account = record.as_ref().map(|r| r.keyring_account.clone());
-            // 手順7の後始末（キー失効の案内・CG_SMOKE_REVOKE）に使う
-            // key_id。自己発行なら必ず Some、手動キー採用ならこの
-            // ハーネスは使わないので気にしなくてよい（HubRecordのdoc）。
-            let key_id = record.as_ref().and_then(|r| r.key_id);
-            // レコードが「今回のHUB_URL」のものかどうかを手順7で確かめる
-            // ために、endpointも一緒に持ち出す（#382と同じ間違いをしない
-            // - same_hub のdoc comment参照）。connect()が失敗した場合、
-            // read_hub_record は同じ CG_SMOKE_DIR に残っていた**別の
-            // 実行・別のHub**のレコードを返しうる（失敗したconnectは
-            // レコードを書き換えない）ため、ここで捕まえておかないと
-            // 手順7がそれを「今回のキー」と誤認する。
-            let record_endpoint = record.as_ref().map(|r| r.endpoint.clone());
+            // 手順5の同一性確認（secret_before）に使う keyring_account は
+            // afterの読み取りが拾えていればそこから（読めていなければ
+            // Noneのままでよい - 手順5はそれ自体が「一致しない」として
+            // 正しくFAILする）。
+            let keyring_account = after_record
+                .as_ref()
+                .ok()
+                .and_then(|record| record.as_ref())
+                .map(|r| r.keyring_account.clone());
             println!(
                 "  keyring account: {}",
                 keyring_account.as_deref().unwrap_or("-")
             );
             let ok = view.status.is_connected();
-            // 判定は `issued_this_run_or_unknown` のdoc comment参照
-            // （接続前の読み取りが失敗していれば安全側falseに倒し、
-            // 読み取れていれば `issued_this_run` の通常判定に委ねる）。
-            // 手順7はこの状態を pre_connect_read_error で別途判定不能
-            // として扱い、理由を出したうえで自動失効しない。
-            let issued_this_run = issued_this_run_or_unknown(
-                pre_connect_read_error.as_deref(),
-                ok,
-                endpoint_before_connect.as_deref(),
-                key_id_before_connect,
-                &hub_url,
-                key_id,
-            );
-            (
-                ok,
-                view.tags,
-                view.key_name,
-                keyring_account,
-                key_id,
-                record_endpoint,
-                issued_this_run,
-                record_read_error,
-            )
+            (ok, view.tags, view.key_name, keyring_account)
         }
         Err(err) => {
             println!("  接続に失敗しました: {err}");
-            (false, None, None, None, None, None, false, None)
+            (false, None, None, None)
         }
     };
     results.push(if step2_ok {
@@ -1380,166 +1384,154 @@ async fn main() {
     );
     println!("  手動で削除する場合は上記パスを rm -rf (PowerShellならRemove-Item -Recurse -Force) してください。");
 
-    // 発行したAPIキーの後始末（Copilotレビュー指摘、2026-09-17）:
+    // 発行したAPIキーの後始末（Copilotレビュー指摘、2026-09-17/18）:
     // MemoryKeyStoreは実行のたびに空から始まるので、手順2で毎回新しい
     // readキーがHub側に発行される。disconnectはHub側を失効させない契約
     // なので、案内無しでは孤児キーが溜まり続ける。
     //
-    // 失効の対象にするのは、次の**2条件がそろったとき**だけ:
-    // 1. レコードが今回のHUB_URLのものか（same_hub） - #382と同じ間違い
-    //    をしない。同じCG_SMOKE_DIRを別のHubに向けて使い、今回のconnect()
-    //    が失敗した場合、read_hub_recordは古い（別のHubの）レコードを
-    //    返しうる。key_idはHubごとの連番なので、確かめずに使うと無関係な
-    //    第三者のキーを失効させかねない。
-    // 2. そのキーを**今回のプロセスが発行したか**（issued_this_run_1）
-    //    - connect()はNeedsPairing/Unreachableでも`Ok(HubView)`を返す
-    //    ため、接続が実際には成功していなくても設定DBに残っていた古い
-    //    レコード（過去の実行が発行したキー）を読んでしまう。ロック
-    //    ダウン済みHubに同じCG_SMOKE_DIRを再利用すると、このプロセスが
-    //    発行していない永続キーを失効させかねない
-    //    （2026-09-17 Copilotレビュー指摘）。
-    // 「設定を読めなかった」を「発行済みキーが無い」と取り違えない
-    // （2026-09-18 Copilotレビュー指摘）: read_hub_record は「レコードが
-    // 無い」（正常）と「読み取り/パースに失敗した」（異常）を区別して
-    // 返すようになった。手順2の接続後の読み取りが後者だった場合、
-    // key_id_1 は None のままだが「発行済みキーはありません」と表示して
-    // PASSにするのは嘘になる - 実際にはキーが発行され、Hub側に残った
-    // ままかもしれない。ここでその区別を最優先で見る。
-    let (cleanup_detail, cleanup_ok) = if let Some(read_error) = record_read_error_1.as_deref() {
-        println!("  設定を読めなかったため、発行済みキーの有無を確認できません: {read_error}");
-        println!(
-            "  手動で確認・失効してください。作業ディレクトリ: {}",
-            smoke_dir.display()
-        );
-        println!(
-            "  Hub側のキー一覧は GET {}/api/api-keys で確認できます(X-Banto-Client: banto ヘッダが必要)。",
-            hub_url.trim_end_matches('/')
-        );
-        (
-            format!("設定読み取り失敗のため発行済みキーの有無を確認できず: {read_error}"),
-            false,
-        )
-    } else {
-        match key_id_1 {
+    // 判定は手順2で計算済みの `key_outcome`（`KeyOutcome`）に完全に
+    // 委ねる。**「発行されていない」とPASSで言い切ってよいのは、それを
+    // 積極的に確認できたときだけ** - `KeyOutcome::Undetermined` は
+    // 常に自動失効せずFAILにする、という不変条件を、ここでは
+    // `match` の各腕で個別に「安全側かどうか」を判断するのではなく、
+    // `KeyOutcome` という型そのものが保証している（構築できる場所は
+    // `classify_key_outcome` の1箇所だけで、そこが常に安全側に倒れる
+    // ように書いてある）。
+    let (cleanup_detail, cleanup_ok) = match key_outcome {
+        KeyOutcome::Undetermined(reason) => {
+            println!("  発行済みキーの有無を判定できません: {reason}");
+            println!("  自動失効は行いません(CG_SMOKE_REVOKE=1が指定されていても)。");
+            let list_hint = format!(
+                "curl -H \"X-Banto-Client: banto\" {}/api/api-keys",
+                hub_url.trim_end_matches('/')
+            );
+            let revoke_hint = format!(
+                "curl -X POST -H \"X-Banto-Client: banto\" {}/api/api-keys/<id>/revoke",
+                hub_url.trim_end_matches('/')
+            );
+            match installation_id.as_deref() {
+                Some(id) => {
+                    println!(
+                        "  手動で確認してください: 次のコマンドでキー一覧を取得し、name が \"chronogazer-{id}-\" で始まるキーが残っていれば、その id を使って個別に失効させてください:"
+                    );
+                }
+                None => {
+                    println!(
+                        "  手動で確認してください（このインストールのinstallation_idも読めなかったため、キー名の接頭辞を絞り込めません。一覧全体を確認してください）:"
+                    );
+                }
+            }
+            println!("    {list_hint}");
+            println!("    {revoke_hint}");
+            (format!("判定不能のため自動失効せず: {reason}"), false)
+        }
+        KeyOutcome::ConfirmedAbsent => {
+            println!("  発行済みAPIキーはありません(確認済み: 接続前後の設定を読めたうえで記録が無いことを確認しました)。");
+            ("発行済みキー無し(確認済み)".to_owned(), true)
+        }
+        KeyOutcome::ConfirmedDifferentHub { key_id, endpoint } => match key_id {
             Some(key_id) => {
-                let key_name_display = key_name_1.as_deref().unwrap_or("-");
-                let record_endpoint_display = record_endpoint_1.as_deref().unwrap_or("-");
-                let matches_current_hub = record_endpoint_1
-                    .as_deref()
-                    .is_some_and(|endpoint| same_hub(endpoint, &hub_url));
-                if !matches_current_hub {
-                    let hint = revoke_curl_hint(record_endpoint_display, key_id);
-                    println!(
-                    "  設定に残っている記録は別のHub({record_endpoint_display})のものです(今回のHUB_URL={hub_url}とは異なる接続先)。"
+                let hint = revoke_curl_hint(&endpoint, key_id);
+                println!(
+                    "  設定に残っている記録は別のHub({endpoint})のものです(今回のHUB_URL={hub_url}とは異なる接続先)。"
                 );
-                    println!(
+                println!(
                     "  別Hubのレコードなので、このハーネスはCG_SMOKE_REVOKE=1が指定されていても失効させません。"
                 );
-                    println!("  片付けたい場合は、そのHub宛てに手動で失効させてください:");
-                    println!("    {hint}");
-                    (
+                println!("  片付けたい場合は、そのHub宛てに手動で失効させてください:");
+                println!("    {hint}");
+                (
                     format!(
-                        "key_id={key_id}は別Hub({record_endpoint_display})のもののため失効せず。手動失効: {hint}"
+                        "key_id={key_id}は別Hub({endpoint})のもののため失効せず。手動失効: {hint}"
                     ),
                     true,
                 )
-                } else if let Some(pre_error) = pre_connect_read_error.as_deref() {
-                    // **判定材料が欠けたら、危険な側の動作（自動失効）は
-                    // しない**（2026-09-18 Copilotレビュー指摘）。接続前の
-                    // 設定を読めていないため、このキーが今回発行された
-                    // ものか、既存キーを再利用しただけかを確定できない。
-                    // 黙って進まずFAILにする - `!issued_this_run_1` の
-                    // 「確認できて違うと分かった」場合とは区別する
-                    // （こちらは PASS のまま、こちらは判定不能で FAIL）。
-                    let hint = revoke_curl_hint(&hub_url, key_id);
-                    println!(
-                        "  接続前の設定を読めなかったため、このキー(id={key_id}, name={key_name_display})が今回発行されたものかどうか判定できません({pre_error})。"
-                    );
-                    println!("  自動失効は行いません(CG_SMOKE_REVOKE=1が指定されていても)。");
-                    println!("  必要なら手動で確認・失効してください:");
-                    println!("    {hint}");
-                    (
-                        format!(
-                            "key_id={key_id}: 接続前の設定読み取り失敗のため今回発行か判定できず、自動失効せず。手動失効: {hint}"
-                        ),
-                        false,
-                    )
-                } else if !issued_this_run_1 {
-                    let hint = revoke_curl_hint(&hub_url, key_id);
-                    println!(
-                    "  設定に残っているキー(id={key_id}, name={key_name_display})は今回のプロセスが発行したものではありません(過去の実行の記録が残っているか、接続に失敗しています)。"
+            }
+            None => {
+                println!(
+                    "  設定に残っている記録は別のHub({endpoint})のものですが、key_idがありません(手動キー採用のため失効対象を特定できません)。"
                 );
-                    println!("  このハーネスはCG_SMOKE_REVOKE=1が指定されていても失効させません。");
-                    println!("  片付けたい場合は手動で失効させてください:");
-                    println!("    {hint}");
-                    (
-                        format!(
+                (
+                    format!("別Hub({endpoint})の記録だがkey_id不明のため失効対象を特定できず"),
+                    true,
+                )
+            }
+        },
+        KeyOutcome::ConfirmedPresent {
+            key_id,
+            key_name,
+            issued_this_run,
+        } => {
+            let key_name_display = key_name.as_deref().unwrap_or("-");
+            if !issued_this_run {
+                let hint = revoke_curl_hint(&hub_url, key_id);
+                println!(
+                    "  設定に残っているキー(id={key_id}, name={key_name_display})は今回のプロセスが発行したものではありません(以前からのキーをそのまま維持しています)。"
+                );
+                println!("  このハーネスはCG_SMOKE_REVOKE=1が指定されていても失効させません。");
+                println!("  片付けたい場合は手動で失効させてください:");
+                println!("    {hint}");
+                (
+                    format!(
                         "key_id={key_id}は今回発行したキーではないため失効せず。手動失効: {hint}"
                     ),
-                        true,
-                    )
-                } else {
-                    // ここに来るのは「今回のHUB_URLのもの」かつ「今回の
-                    // プロセスが発行した」ときだけ。契約は「毎回、残存キーと
-                    // 失効コマンドを出す」ので、自動失効を試みる**前**に案内を
-                    // 出してから失効し、結果を続けて表示する
-                    // （2026-09-17 Copilotレビュー指摘: 以前は自動失効に
-                    // 成功したときだけこの案内が出ず、契約が守れていなかった）。
-                    let hint = revoke_curl_hint(&hub_url, key_id);
-                    println!("  発行したAPIキー: id={key_id}, name={key_name_display}");
-                    println!(
+                    true,
+                )
+            } else {
+                // ここに来るのは「今回のHUB_URLのもの」かつ「今回の
+                // プロセスが発行した」ことを確認できたときだけ。契約は
+                // 「毎回、残存キーと失効コマンドを出す」ので、自動失効を
+                // 試みる**前**に案内を出してから失効し、結果を続けて表示
+                // する（2026-09-17 Copilotレビュー指摘: 以前は自動失効に
+                // 成功したときだけこの案内が出ず、契約が守れていなかった）。
+                let hint = revoke_curl_hint(&hub_url, key_id);
+                println!("  発行したAPIキー: id={key_id}, name={key_name_display}");
+                println!(
                     "  このキーはHubに残ります(disconnectはHub側を失効させない契約)。不要なら失効させてください:"
                 );
-                    println!("    {hint}");
-                    // この形（X-Banto-Clientのみ）で失効できるのは試運転
-                    // モード中だけ - ロックダウン済みのHubではHubの管理画面か
-                    // 管理者のBearerトークンが必要（このハーネスは資格情報を
-                    // 扱わないため、その入力は作らない）（2026-09-18
-                    // Copilotレビュー指摘）。
-                    println!(
+                println!("    {hint}");
+                // この形（X-Banto-Clientのみ）で失効できるのは試運転
+                // モード中だけ - ロックダウン済みのHubではHubの管理画面か
+                // 管理者のBearerトークンが必要（このハーネスは資格情報を
+                // 扱わないため、その入力は作らない）（2026-09-18
+                // Copilotレビュー指摘）。
+                println!(
                     "  (上記のcurlで失効できるのは試運転モード中のみです。ロックダウン済みのHubではHubの管理画面か管理者のBearerトークンで失効させてください)"
                 );
-                    if auto_revoke {
-                        println!("  CG_SMOKE_REVOKE=1: 上記のキーを失効させます...");
-                        match revoke_api_key(&hub_url, key_id).await {
-                            Ok(()) => {
-                                println!(
+                if auto_revoke {
+                    println!("  CG_SMOKE_REVOKE=1: 上記のキーを失効させます...");
+                    match revoke_api_key(&hub_url, key_id).await {
+                        Ok(()) => {
+                            println!(
                                 "  失効しました。上記のキーはもう失効済みです(Hub側には残っていません)。"
                             );
-                                (format!("key_id={key_id}を失効させた"), true)
-                            }
-                            Err(message) => {
-                                println!("  失効に失敗しました: {message}");
-                                println!("  引き続き上記のcurlコマンドで手動失効してください。");
-                                // サマリが嘘をつかないよう、失効を頼まれたのに
-                                // 失敗した場合はこの段階をFAILにする
-                                // （2026-09-17 Copilotレビュー指摘: 以前はこの
-                                // ケースでもPASSのままで、総合結果が成功に見えた）。
-                                (
-                                    format!(
-                                        "key_id={key_id}の失効に失敗({message})。手動失効: {hint}"
-                                    ),
-                                    false,
-                                )
-                            }
+                            (format!("key_id={key_id}を失効させた"), true)
                         }
-                    } else {
-                        // 「CG_SMOKE_REVOKE=1で再実行」とだけ書くと、
-                        // CG_SMOKE_DIR を指定せずに再実行して別のキーを新規
-                        // 発行しただけになり、今回のキーは孤児のままになる
-                        // （2026-09-17 Copilotレビュー指摘）。同じ
-                        // CG_SMOKE_DIR を使うよう明示する。
-                        println!(
+                        Err(message) => {
+                            println!("  失効に失敗しました: {message}");
+                            println!("  引き続き上記のcurlコマンドで手動失効してください。");
+                            // サマリが嘘をつかないよう、失効を頼まれたのに
+                            // 失敗した場合はこの段階をFAILにする
+                            // （2026-09-17 Copilotレビュー指摘: 以前はこの
+                            // ケースでもPASSのままで、総合結果が成功に見えた）。
+                            (
+                                format!("key_id={key_id}の失効に失敗({message})。手動失効: {hint}"),
+                                false,
+                            )
+                        }
+                    }
+                } else {
+                    // 「CG_SMOKE_REVOKE=1で再実行」とだけ書くと、
+                    // CG_SMOKE_DIR を指定せずに再実行して別のキーを新規
+                    // 発行しただけになり、今回のキーは孤児のままになる
+                    // （2026-09-17 Copilotレビュー指摘）。同じ
+                    // CG_SMOKE_DIR を使うよう明示する。
+                    println!(
                         "  (自動で失効させたい場合は、同じ CG_SMOKE_DIR を指定して CG_SMOKE_REVOKE=1 で再実行してください: CG_SMOKE_DIR={} CG_SMOKE_REVOKE=1。またはこの curl コマンドで直接失効させてください)",
                         smoke_dir.display()
                     );
-                        (format!("key_id={key_id}はHubに残存。失効: {hint}"), true)
-                    }
+                    (format!("key_id={key_id}はHubに残存。失効: {hint}"), true)
                 }
-            }
-            None => {
-                println!("  発行済みAPIキーはありません(手順2で接続できなかった、またはロックダウン済みHub)。");
-                ("発行済みキー無し".to_owned(), true)
             }
         }
     };
@@ -1636,93 +1628,156 @@ mod tests {
         assert!(!same_hub("http://host", "not a url"));
     }
 
+    // classify_key_outcome() の回帰テスト（2026-09-18 Copilotレビュー
+    // 指摘: 「判定できないのに黙ってPASSへ倒れる」同型の穴が4回見つかった
+    // ため、before/afterの実際の差分だけで判定する形に一本化した。この
+    // 一本化そのものが、connect()自体がErrを返す経路（save_record()の
+    // あとverify()相当が失敗するケース）でも取りこぼさないことの証明に
+    // なる - classify_key_outcomeはconnect_viewを一切受け取らず、
+    // beforeとafterのRecordだけを見るため。
+
+    fn record(endpoint: &str, key_id: Option<i64>) -> HubRecord {
+        HubRecord {
+            endpoint: endpoint.to_owned(),
+            key_id,
+            ..HubRecord::default()
+        }
+    }
+
     #[test]
-    fn issued_this_run_treats_a_same_numbered_key_id_on_a_different_hub_as_issued() {
-        // #387 レビュー（00a5ae7）で固定した挙動: api_keys.id はHubごとの
-        // 連番なので、別Hubに切り替えたとき旧レコードのkey_idと新しい
-        // Hubが今回発行したkey_idがたまたま同じ数値でも「今回発行した」
-        // と正しく判定できること。
-        assert!(issued_this_run(
-            true,
-            Some("http://host-a:8722"),
-            Some(5),
-            "http://host-b:8722",
-            Some(5),
+    fn classify_key_outcome_is_undetermined_when_the_pre_connect_read_failed() {
+        // 判定材料が欠けたら安全側（自動失効しない・PASSにならない）。
+        let before: Result<Option<HubRecord>, String> = Err("db unavailable".to_owned());
+        let after: Result<Option<HubRecord>, String> =
+            Ok(Some(record("http://host:8722", Some(99))));
+        assert!(matches!(
+            classify_key_outcome("http://host:8722", &before, &after),
+            KeyOutcome::Undetermined(_)
         ));
     }
 
     #[test]
-    fn issued_this_run_treats_an_unchanged_key_id_on_the_same_hub_as_not_issued() {
-        assert!(!issued_this_run(
-            true,
-            Some("http://host:8722"),
-            Some(5),
-            "http://host:8722",
-            Some(5),
+    fn classify_key_outcome_is_undetermined_when_the_post_connect_read_failed() {
+        let before: Result<Option<HubRecord>, String> = Ok(None);
+        let after: Result<Option<HubRecord>, String> = Err("db unavailable".to_owned());
+        assert!(matches!(
+            classify_key_outcome("http://host:8722", &before, &after),
+            KeyOutcome::Undetermined(_)
         ));
     }
 
     #[test]
-    fn issued_this_run_treats_an_unchanged_key_id_on_the_same_hub_with_default_port_spelling_as_not_issued(
-    ) {
-        // 今回の本題: 既定ポートの表記ゆれ（http://host と
-        // http://host:80）を同じHubとみなせないと、実際には同じ接続先
-        // なのに「別Hub」と誤判定して issued_this_run が true になり、
-        // CG_SMOKE_REVOKE=1 が今回発行していない既存キーを失効させる。
-        assert!(!issued_this_run(
-            true,
-            Some("http://host"),
-            Some(5),
-            "http://host:80",
-            Some(5),
-        ));
+    fn classify_key_outcome_is_undetermined_even_when_connect_itself_would_have_returned_err() {
+        // 今回の本題（`:1032`相当）: connect()はbootstrapperがキーを
+        // 発行・保存した**後**にErrを返し得る。この関数はconnect_view
+        // を受け取らずbefore/afterの実際の差分だけを見るため、
+        // 「connect()がErrだった」という情報が無くても、
+        // 発行が実際に起きていれば正しくConfirmedPresent（issued_this_run
+        // =true）になる - Undeterminedへ取り違えて「発行済みキーは
+        // ありません」とPASSで言い切ってしまうことはない。
+        let before: Result<Option<HubRecord>, String> = Ok(None);
+        let after: Result<Option<HubRecord>, String> =
+            Ok(Some(record("http://host:8722", Some(42))));
+        let outcome = classify_key_outcome("http://host:8722", &before, &after);
+        assert_eq!(
+            outcome,
+            KeyOutcome::ConfirmedPresent {
+                key_id: 42,
+                key_name: None,
+                issued_this_run: true,
+            }
+        );
     }
 
     #[test]
-    fn issued_this_run_is_false_when_not_connected() {
-        assert!(!issued_this_run(
-            false,
-            Some("http://host:8722"),
-            Some(5),
-            "http://host:8722",
-            None,
-        ));
+    fn classify_key_outcome_confirms_absent_when_no_record_exists() {
+        let before: Result<Option<HubRecord>, String> = Ok(None);
+        let after: Result<Option<HubRecord>, String> = Ok(None);
+        assert_eq!(
+            classify_key_outcome("http://host:8722", &before, &after),
+            KeyOutcome::ConfirmedAbsent
+        );
     }
 
     #[test]
-    fn issued_this_run_or_unknown_does_not_auto_revoke_when_the_pre_connect_read_failed() {
-        // #387 レビュー（2026-09-18）で固定する本題: 接続前の読み取りが
-        // 失敗した状態では自動失効しない。connected=true かつ key_idが
-        // 変わっている（＝素の issued_this_run なら true になる条件）
-        // でも、判定材料が欠けていれば false に倒すこと。
-        assert!(!issued_this_run_or_unknown(
-            Some("db unavailable"),
-            true,
-            None,
-            None,
-            "http://host:8722",
-            Some(99),
-        ));
+    fn classify_key_outcome_confirms_a_different_hub() {
+        let before: Result<Option<HubRecord>, String> = Ok(None);
+        let after: Result<Option<HubRecord>, String> =
+            Ok(Some(record("http://host-a:8722", Some(5))));
+        assert_eq!(
+            classify_key_outcome("http://host-b:8722", &before, &after),
+            KeyOutcome::ConfirmedDifferentHub {
+                key_id: Some(5),
+                endpoint: "http://host-a:8722".to_owned(),
+            }
+        );
     }
 
     #[test]
-    fn issued_this_run_or_unknown_falls_back_to_the_normal_judgement_when_the_pre_connect_read_succeeded(
-    ) {
-        assert!(issued_this_run_or_unknown(
-            None,
-            true,
-            Some("http://host:8722"),
-            Some(5),
-            "http://host:8722",
-            Some(6),
-        ));
-        assert!(!issued_this_run_or_unknown(
-            None,
-            true,
-            Some("http://host:8722"),
-            Some(5),
-            "http://host:8722",
-            Some(5),
-        ));
+    fn classify_key_outcome_confirms_issued_this_run_when_the_key_id_changed_on_the_same_hub() {
+        let before: Result<Option<HubRecord>, String> =
+            Ok(Some(record("http://host:8722", Some(5))));
+        let after: Result<Option<HubRecord>, String> =
+            Ok(Some(record("http://host:8722", Some(6))));
+        assert_eq!(
+            classify_key_outcome("http://host:8722", &before, &after),
+            KeyOutcome::ConfirmedPresent {
+                key_id: 6,
+                key_name: None,
+                issued_this_run: true,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_key_outcome_confirms_not_issued_this_run_when_the_key_id_is_unchanged() {
+        let before: Result<Option<HubRecord>, String> =
+            Ok(Some(record("http://host:8722", Some(5))));
+        let after: Result<Option<HubRecord>, String> =
+            Ok(Some(record("http://host:8722", Some(5))));
+        assert_eq!(
+            classify_key_outcome("http://host:8722", &before, &after),
+            KeyOutcome::ConfirmedPresent {
+                key_id: 5,
+                key_name: None,
+                issued_this_run: false,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_key_outcome_treats_a_same_numbered_key_id_on_a_different_hub_as_issued() {
+        // api_keys.id はHubごとの連番なので、別Hubに切り替えたとき旧
+        // レコードのkey_idと新しいHubが今回発行したkey_idがたまたま
+        // 同じ数値でも「今回発行した」と正しく判定できること。
+        let before: Result<Option<HubRecord>, String> =
+            Ok(Some(record("http://host-a:8722", Some(5))));
+        let after: Result<Option<HubRecord>, String> =
+            Ok(Some(record("http://host-b:8722", Some(5))));
+        assert_eq!(
+            classify_key_outcome("http://host-b:8722", &before, &after),
+            KeyOutcome::ConfirmedPresent {
+                key_id: 5,
+                key_name: None,
+                issued_this_run: true,
+            }
+        );
+    }
+
+    #[test]
+    fn classify_key_outcome_treats_an_unchanged_key_id_with_default_port_spelling_as_not_issued() {
+        // 既定ポートの表記ゆれ（http://host と http://host:80）を同じ
+        // Hubとみなせないと、実際には同じ接続先なのに「別Hub」と誤判定
+        // してissued_this_runがtrueになる。
+        let before: Result<Option<HubRecord>, String> = Ok(Some(record("http://host", Some(5))));
+        let after: Result<Option<HubRecord>, String> = Ok(Some(record("http://host:80", Some(5))));
+        assert_eq!(
+            classify_key_outcome("http://host:80", &before, &after),
+            KeyOutcome::ConfirmedPresent {
+                key_id: 5,
+                key_name: None,
+                issued_this_run: false,
+            }
+        );
     }
 }
