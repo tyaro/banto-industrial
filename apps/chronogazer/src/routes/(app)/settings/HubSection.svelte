@@ -56,6 +56,13 @@
 	let keyName = $state<string | null>(null);
 	let subscription = $state<HubSubscription | null>(null);
 	/**
+	 * `lastError` を独立した行で出すか。`stopped` かつ `reason` が無いときは
+	 * `hubSubscriptionDetail` がエラーを文中に入れるので、二重に出さない。
+	 */
+	const showLastErrorLine = $derived(
+		subscription !== null && !(subscription.state === 'stopped' && !subscription.reason)
+	);
+	/**
 	 * 保存済みの接続先があるか（= 設定 KV に `HubRecord` があるか）。入力欄の
 	 * 下書き（`endpointDraft`）とは別に持つ: 到達不能な URL で「接続」した
 	 * あとも下書きは残るが、設定は**保存されていない**（記録は接続に成功
@@ -289,7 +296,12 @@
 				</p>
 				<p class="note">{hubSubscriptionDetail(subscription)}</p>
 
-				{#if subscription.lastError}
+				<!--
+					`hubSubscriptionDetail` が「停止（エラー: …）」としてエラーを
+					すでに述べている場合だけ、この行を省く（同じことを 2 行続けて
+					読ませない）。それ以外では、説明文の補足として型名を出す。
+				-->
+				{#if subscription.lastError && showLastErrorLine}
 					<p class="note">直近のエラー: <code>{subscription.lastError}</code></p>
 				{/if}
 

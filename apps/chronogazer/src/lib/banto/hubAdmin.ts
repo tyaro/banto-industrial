@@ -363,10 +363,20 @@ export function hubSubscriptionLabel(state: HubSubscriptionState): string {
 /**
  * 購読状態の補足説明（純関数）。`stopped` のときは Rust 側が付けた
  * `reason` をそのまま併記する（「なぜ止まっているか」を空欄にしない）。
+ *
+ * `stopped` で `reason` が無いこともある: ワーカーが終端エラーで止まると
+ * 世代は残ったまま（つまり `subscribedCount > 0`）`state = 'stopped'` +
+ * `lastError` になる。このとき件数を根拠に「購読しています」と言うと
+ * **状態表示（停止）と説明（購読中）が矛盾する**ので、`stopped` のうちは
+ * 件数を理由にしない。
  */
 export function hubSubscriptionDetail(subscription: HubSubscription): string {
 	if (subscription.state === 'stopped') {
-		return subscription.reason ?? '購読していません。';
+		if (subscription.reason) return subscription.reason;
+		if (subscription.lastError) {
+			return `購読は停止しています（エラー: ${subscription.lastError}）。まもなく自動で再試行します。`;
+		}
+		return '購読していません。';
 	}
 	if (subscription.state === 'unauthorized') {
 		return 'Hubが購読を拒否しました。APIキーの権限を確認してください（接続設定の状態は別に表示しています）。';

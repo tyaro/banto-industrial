@@ -186,6 +186,30 @@ describe('hubSubscriptionDetail', () => {
 		expect(hubSubscriptionDetail(stopped)).toBe('r');
 	});
 
+	it('stopped + lastError は、件数が残っていても「購読しています」にしない', () => {
+		// ワーカーが終端エラーで止まると世代は残る（subscribedCount > 0）まま
+		// state だけ stopped になる。ここで件数を根拠に「購読中」と言うと
+		// 状態表示（停止）と説明が矛盾する。
+		const detail = hubSubscriptionDetail(
+			subscription({
+				state: 'stopped',
+				reason: null,
+				lastError: 'unauthorized',
+				subscribedCount: 3
+			})
+		);
+		expect(detail).not.toContain('購読しています');
+		expect(detail).toContain('停止');
+		expect(detail).toContain('unauthorized');
+	});
+
+	it('stopped で reason も lastError も無ければ、単に購読していないと述べる', () => {
+		const detail = hubSubscriptionDetail(
+			subscription({ state: 'stopped', reason: null, lastError: null, subscribedCount: 0 })
+		);
+		expect(detail).toBe('購読していません。');
+	});
+
 	it('購読できない名前は未解決タグと別のバケツで保持される（理由が違うものを混ぜない）', () => {
 		const stopped = subscription({
 			state: 'stopped',

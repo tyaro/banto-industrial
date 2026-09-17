@@ -350,6 +350,11 @@ const REASON_NONE_SUBSCRIBABLE: &str =
     "選んだタグはHubのタグ一覧に無いか、購読プロトコルが受け付けない名前のため、購読できるタグがありません。";
 const REASON_NO_KEY: &str =
     "保存済みのAPIキーを取り出せないため購読できません（デスクトップアプリから接続し直してください）。";
+/// 選択は保存できたが、直後の catalog 再取得に失敗した状態。**保存は成功
+/// している**ことと、**放っておいても見張りが張り直す**ことが伝わる文言に
+/// する（ユーザーに再操作を要求しない）。
+const REASON_SELECTION_CHANGED_REFRESH_FAILED: &str =
+    "選択を保存しましたが、Hubのタグ一覧を取り直せませんでした。まもなく自動で再試行します。";
 
 /// 購読プロトコル（`banto-tagclient` の `stream_core::validate_tag_selection`）
 /// が受け付けない external name か。
@@ -868,6 +873,13 @@ impl HubService {
     /// 操作なので許容**する（画面のポーリングはこの経路を通らない）。
     /// 読み直しに失敗しても**保存は成功のまま返す** - 保存の成否と購読の
     /// 張り直しは別事象で、前者を後者の失敗で覆さない。
+    ///
+    /// ただし読み直しに失敗したときは**古い世代を止める**。選択を変えた
+    /// 以上、古い選択のタグの値はもう誤情報であり、**一時的に何も出ない
+    /// 方が、古い選択の値を流し続けるよりまし**だから。世代が無くなれば
+    /// 見張り（[`Self::spawn_supervisor`]）が次の周期で拾って張り直す -
+    /// 世代を生かしたままだと `Live` のまま据え置かれ、見張りも動かないので
+    /// 誰かが明示操作するまで古い値が流れ続けてしまう。
     pub async fn set_selected_tags(&self, tags: Vec<String>) -> Result<(), BantoError> {
         self.hydrate().await?;
         self.inner
@@ -880,9 +892,17 @@ impl HubService {
                 self.flush().await?;
                 self.reconcile(&connection, Trigger::Observe).await;
             }
-            Err(err) => eprintln!(
-                "banto: 選択タグ保存後のHubタグ一覧の再取得に失敗しました（購読はそのままです）: {err}"
-            ),
+            Err(err) => {
+                eprintln!(
+                    "banto: 選択タグ保存後のHubタグ一覧の再取得に失敗しました（古い購読を止めて再試行を待ちます）: {err}"
+                );
+                self.inner
+                    .subscription
+                    .lock()
+                    .await
+                    .stop(Some(REASON_SELECTION_CHANGED_REFRESH_FAILED.to_owned()))
+                    .await;
+            }
         }
         Ok(())
     }
@@ -1637,29 +1657,45 @@ mod tests {
         endpoint
     }
 
-    /// keyring を持つ実行形態（デスクトップ）相当。`UnavailableKeyStore` では
-    /// `rest_client()` が常に `None` を返して世代が立たないため、張り直しの
-    /// 検証にはインメモリのキーストアを使う。
-    async fn service_with_keyring(endpoint: &str, selected: &[&str]) -> HubService {
-        use banto_hub_bootstrap::state::memory::MemoryKeyStore;
+    const KEYRING_ACCOUNT: &str = "hub:127.0.0.1:0/:inst";
 
-        const ACCOUNT: &str = "hub:127.0.0.1:0/:inst";
-        let pool = init_db_memory().await.expect("init_db_memory");
-        let settings = SettingsService::new(pool);
-        let keys = Arc::new(MemoryKeyStore::new());
-        keys.set(ACCOUNT, "bh_abcd1234_opaque-secret").unwrap();
-        let hub = HubService::new(settings, Arc::clone(&keys) as Arc<dyn KeyStore>)
-            .await
-            .expect("HubService::new");
-        hub.inner.mirror.reset(Some(HubRecord {
+    fn keyring_record(endpoint: &str, selected: &[&str]) -> HubRecord {
+        HubRecord {
             endpoint: endpoint.to_owned(),
             installation_id: "inst".to_owned(),
             key_id: None,
             key_name: None,
-            keyring_account: ACCOUNT.to_owned(),
+            keyring_account: KEYRING_ACCOUNT.to_owned(),
             selected_tags: owned(selected),
-        }));
-        hub
+        }
+    }
+
+    /// keyring を持つ実行形態（デスクトップ）相当。`UnavailableKeyStore` では
+    /// `rest_client()` が常に `None` を返して世代が立たないため、張り直しの
+    /// 検証にはインメモリのキーストアを使う。
+    ///
+    /// レコードは設定 KV にも書く（`hydrate()` を通る経路のテストのため）。
+    async fn service_with_keyring(
+        endpoint: &str,
+        selected: &[&str],
+    ) -> (SettingsService, HubService) {
+        use banto_hub_bootstrap::state::memory::MemoryKeyStore;
+
+        let pool = init_db_memory().await.expect("init_db_memory");
+        let settings = SettingsService::new(pool);
+        let keys = Arc::new(MemoryKeyStore::new());
+        keys.set(KEYRING_ACCOUNT, "bh_abcd1234_opaque-secret")
+            .unwrap();
+        let hub = HubService::new(settings.clone(), Arc::clone(&keys) as Arc<dyn KeyStore>)
+            .await
+            .expect("HubService::new");
+        let record = keyring_record(endpoint, selected);
+        settings
+            .set(KEY_HUB_RECORD, &serde_json::to_string(&record).unwrap())
+            .await
+            .unwrap();
+        hub.inner.mirror.reset(Some(record));
+        (settings, hub)
     }
 
     async fn generation_sequence(hub: &HubService) -> Option<usize> {
@@ -1676,7 +1712,7 @@ mod tests {
     /// ID が変わった）タグがあれば張り直す（Copilot F4）。
     #[tokio::test]
     async fn a_recreated_tag_replaces_the_generation_while_an_unchanged_one_does_not() {
-        let hub = service_with_keyring(&closed_endpoint(), &["a"]).await;
+        let (_settings, hub) = service_with_keyring(&closed_endpoint(), &["a"]).await;
         let connected = HubStatus::Connected { tag_count: 1 };
 
         hub.reconcile_with(&connected, Some(&catalog(&["a"])), Trigger::Observe)
@@ -1710,7 +1746,7 @@ mod tests {
     /// キーで張り直す（Copilot F3）。
     #[tokio::test]
     async fn a_credentials_change_restarts_the_generation_despite_an_identical_fingerprint() {
-        let hub = service_with_keyring(&closed_endpoint(), &["a"]).await;
+        let (_settings, hub) = service_with_keyring(&closed_endpoint(), &["a"]).await;
         let connected = HubStatus::Connected { tag_count: 1 };
 
         hub.reconcile_with(&connected, Some(&catalog(&["a"])), Trigger::Observe)
@@ -1728,6 +1764,53 @@ mod tests {
             Some(first + 1),
             "接続先もタグも同じでも、キーが変わったなら張り直す"
         );
+    }
+
+    /// 選択を変えた直後に catalog を取り直せなかったとき、**古い世代を
+    /// 生かしたままにしない**（#385 レビュー第2巡 A）。生かしたままだと
+    /// `Live` のまま据え置かれ、見張りも動かないので、ユーザーが選び直した
+    /// あとも古い選択のタグの値が流れ続けてしまう。
+    #[tokio::test]
+    async fn a_selection_change_whose_refresh_fails_drops_the_stale_generation() {
+        let (settings, hub) = service_with_keyring(&closed_endpoint(), &["a"]).await;
+        hub.reconcile_with(
+            &HubStatus::Connected { tag_count: 1 },
+            Some(&catalog(&["a"])),
+            Trigger::Observe,
+        )
+        .await;
+        assert!(
+            generation_sequence(&hub).await.is_some(),
+            "まず古い選択で世代が立っている"
+        );
+
+        // `refresh_catalog()` が `Err` になる接続先へ差し替える（到達不能な
+        // 接続先は `Ok(Unreachable)` になり、そちらは通常の突き合わせで
+        // 世代が落ちるため、ここでは解釈できない綴りを使う）。
+        let broken = keyring_record("https://example.test", &["a"]);
+        settings
+            .set(KEY_HUB_RECORD, &serde_json::to_string(&broken).unwrap())
+            .await
+            .unwrap();
+
+        hub.set_selected_tags(owned(&["b"]))
+            .await
+            .expect("保存の成否は再取得の失敗で覆さない");
+
+        assert!(
+            generation_sequence(&hub).await.is_none(),
+            "古い選択のまま値を流し続けない"
+        );
+        let view = hub.subscription().await;
+        assert_eq!(view.state, "stopped");
+        assert_eq!(
+            view.reason.as_deref(),
+            Some(REASON_SELECTION_CHANGED_REFRESH_FAILED)
+        );
+        // 選択自体は保存されている（見張りが次の周期で張り直す材料になる）。
+        let stored: HubRecord =
+            serde_json::from_str(&settings.get(KEY_HUB_RECORD).await.unwrap().unwrap()).unwrap();
+        assert_eq!(stored.selected_tags, owned(&["b"]));
     }
 
     /// 見張りは何度 `resume()` しても 1 本だけ（clone 越しでも増えない）。
