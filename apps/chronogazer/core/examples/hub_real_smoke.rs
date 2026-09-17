@@ -630,6 +630,42 @@ fn same_hub(a: &str, b: &str) -> bool {
     }
 }
 
+/// 手順2の`connect()`が**今回のプロセスで実際にキーを発行したか**を
+/// 判定する（2026-09-17/18 Copilotレビュー指摘）。
+///
+/// `api_keys.id` は **Hub ごとの連番**なので、ID の比較は接続先とセット
+/// でなければ意味がない（`Bootstrapper::previous_for` と同じ理屈 -
+/// `same_hub` のdoc comment参照）。接続先を無視して `key_id` だけを比べる
+/// と、別の Hub に切り替えたときに「旧レコードの key_id」と「新しい Hub
+/// が今回発行した key_id」がたまたま同じ数値になり得て、**今回発行した
+/// のに「発行していない」と誤判定し、失効をスキップして孤児キーを残す**
+/// （前回直した「他人のキーを消してしまう」側の鏡像 - 根っこは同じ）。
+///
+/// 判定は次のいずれかが成り立つときだけ真:
+/// * 接続前にレコードが無かった（`endpoint_before` が `None`）。
+/// * 接続前の接続先と今回の接続先が（正規化して）**違う**
+///   （`!same_hub`）- 数値が同じでも別Hubの連番なので無関係。
+/// * 接続先は同じで、`key_id` が**変わった**。
+///
+/// 接続が `connected` にならなかった場合は無条件に偽（何も発行されて
+/// いない）。
+fn issued_this_run(
+    connected: bool,
+    endpoint_before: Option<&str>,
+    key_id_before: Option<i64>,
+    endpoint_now: &str,
+    key_id_now: Option<i64>,
+) -> bool {
+    if !connected {
+        return false;
+    }
+    match endpoint_before {
+        None => true,
+        Some(before) if !same_hub(before, endpoint_now) => true,
+        Some(_) => key_id_now != key_id_before,
+    }
+}
+
 /// `curl` で手動失効するときの1行を組み立てる（実行はしない）。手順7の
 /// 案内表示・失敗時のフォールバックの両方で使う。
 fn revoke_curl_hint(hub_url: &str, key_id: i64) -> String {
@@ -783,13 +819,16 @@ async fn main() {
     // == 2. 接続 ==============================================================
     println!("== 2. 接続 ==");
     // connect() の**前**に、同じ CG_SMOKE_DIR に残っていたかもしれない
-    // 古いレコードの key_id を控えておく（2026-09-17 Copilotレビュー
+    // 古いレコードの key_id と接続先を控えておく（2026-09-17 Copilotレビュー
     // 指摘）: connect() は NeedsPairing / Unreachable でも `Ok(HubView)`
     // を返すため、接続が実際には成功していなくても、設定DBに残っていた
     // 古い hub.record（このプロセスではなく過去の実行が発行したキー）を
-    // 「今回発行したキー」と誤認しうる。connect後のkey_idがこの値と違う
-    // （かつ状態がconnected）ときだけ、実際に今回発行されたと判断する。
-    let key_id_before_connect = read_hub_record(&settings1).await.and_then(|r| r.key_id);
+    // 「今回発行したキー」と誤認しうる。接続先も一緒に控える理由は
+    // `issued_this_run` のdoc comment参照（key_idだけの比較は接続先が
+    // 変わると意味を失う）。
+    let record_before_connect = read_hub_record(&settings1).await;
+    let key_id_before_connect = record_before_connect.as_ref().and_then(|r| r.key_id);
+    let endpoint_before_connect = record_before_connect.map(|r| r.endpoint);
     let connect_view = hub1.connect(&hub_url).await;
     let (
         step2_ok,
@@ -829,14 +868,15 @@ async fn main() {
                 keyring_account.as_deref().unwrap_or("-")
             );
             let ok = view.status.is_connected();
-            // 「今回発行した」= 接続がconnectedになり、かつkey_idが
-            // connect前と変わった。接続に失敗していれば当然違うし、
-            // 仮にconnectedでも（このハーネスの MemoryKeyStore は毎回
-            // 空なので起こらないはずだが）既存キーをそのまま再利用して
-            // key_idが変わらないケースも「今回発行した」扱いにしない
-            // - 発行元を問わず「変わったときだけ」で判定する方が、
-            // Bootstrapperの内部実装に依存せず正しい。
-            let issued_this_run = ok && key_id != key_id_before_connect;
+            // 判定本体は `issued_this_run` 関数のdoc comment参照
+            // （key_idだけでなく接続先も対にして比較する）。
+            let issued_this_run = issued_this_run(
+                ok,
+                endpoint_before_connect.as_deref(),
+                key_id_before_connect,
+                &hub_url,
+                key_id,
+            );
             (
                 ok,
                 view.tags,
