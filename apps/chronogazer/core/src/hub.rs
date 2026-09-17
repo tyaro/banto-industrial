@@ -465,6 +465,40 @@ fn plan_bindings(selected: &[String], catalog: &CatalogSnapshot) -> BindingPlan 
 /// unresolved になったまま復帰しない**（Copilot F4）。
 type Fingerprint = (String, Vec<(String, StableTagId)>);
 
+/// [`Subscription::last_value_at`] が「どの購読についての事実か」を表す
+/// **粗い**同一性: 正規化した接続先 + 選択タグ（ソート済み）。
+///
+/// [`Fingerprint`] と違って stable ID を含まない。catalog を読めていないとき
+/// （切断中・認証エラー中）にも計算できる必要があるため - 「同じ購読が止まって
+/// いるだけ」かどうかは、まさに catalog を読めない場面で判断したい。
+type SubscriptionIdentity = (String, Vec<String>);
+
+fn subscription_identity(record: Option<&HubRecord>) -> Option<SubscriptionIdentity> {
+    let record = record?;
+    let mut tags = record.selected_tags.clone();
+    tags.sort();
+    tags.dedup();
+    Some((fingerprint_endpoint(&record.endpoint), tags))
+}
+
+/// 覚えている「最後に値を受けた時刻」を、これからの購読でも出してよいか。
+///
+/// * **残す** = 同じ購読が止まっているだけ（終端エラー・再試行待ち・
+///   `Unauthorized` / `Rebinding`）。**いつまでデータが来ていたかは記録計の
+///   診断に効く**ので、止まった瞬間に消してはいけない。
+/// * **消す** = その購読がもう無い（切断・未設定）か、別物になった（接続先が
+///   変わった・選択タグが変わった）。**別の Hub・別のタグ集合の時刻を出すと
+///   嘘になる。**
+fn keeps_last_value_at(
+    recorded: Option<&SubscriptionIdentity>,
+    next: Option<&SubscriptionIdentity>,
+) -> bool {
+    match (recorded, next) {
+        (Some(recorded), Some(next)) => recorded == next,
+        _ => false,
+    }
+}
+
 /// [`plan_bindings`] の要求から [`Fingerprint`] のタグ部分を作る（名前で
 /// ソートして、選択の並び替えだけで世代が入れ替わらないようにする）。
 fn fingerprint_tags(requests: &[BindingRequest]) -> Vec<(String, StableTagId)> {
@@ -623,9 +657,12 @@ struct Subscription {
     /// **ここに覚えておく必要がある**: `banto-tagclient` は `Live` を離れると
     /// `current()` を捨てるので、そこから導くと再接続・再バインドに入った
     /// 瞬間に消えてしまう。まさに「最後に受けた時刻」を知りたい場面で消える
-    /// ということなので、観測したら保持する。世代を張り直したらリセットし
-    /// （別の購読の話になるため）、止まっただけなら残す。
+    /// ということなので、観測したら保持する。**止まっただけなら残し、購読が
+    /// 別物になった／無くなったら消す**（[`keeps_last_value_at`]）。
     last_value_at: Option<i64>,
+    /// [`Self::last_value_at`] がどの購読についての事実か。世代が止まっても
+    /// 残す値なので、世代とは別に覚える。
+    last_value_from: Option<SubscriptionIdentity>,
 }
 
 /// 起動直後（まだ一度も突き合わせていない）も「理由付きの停止」で表現する。
@@ -639,6 +676,7 @@ impl Default for Subscription {
             unresolved: Vec::new(),
             unsupported: Vec::new(),
             last_value_at: None,
+            last_value_from: None,
         }
     }
 }
@@ -675,6 +713,15 @@ impl Subscription {
         };
         let observed = generation.states.borrow().current().map(|s| s.t);
         self.last_value_at = advance_last_value_at(self.last_value_at, observed);
+    }
+
+    /// これからの購読の同一性を渡し、覚えている最終受信時刻を残すか捨てるかを
+    /// 決める。**突き合わせのたびに（世代を張る前に）通す。**
+    fn retain_last_value_for(&mut self, next: Option<&SubscriptionIdentity>) {
+        if !keeps_last_value_at(self.last_value_from.as_ref(), next) {
+            self.last_value_at = None;
+            self.last_value_from = None;
+        }
     }
 
     fn view(&mut self) -> HubSubscriptionView {
@@ -1113,6 +1160,10 @@ impl HubService {
                     "banto: 選択タグ保存後のHubタグ一覧の再取得に失敗しました（古い購読を止めて再試行を待ちます）: {err}"
                 );
                 let mut slot = self.inner.subscription.lock().await;
+                // 選択が変わったなら、前の選択についての最終受信時刻はもう
+                // 別の購読の話（同じ選択で保存し直しただけなら残る）。
+                let identity = subscription_identity(self.inner.mirror.current().as_ref());
+                slot.retain_last_value_for(identity.as_ref());
                 // 未解決・購読不可は**直前の選択**を catalog と突き合わせた
                 // 結果なので、選択が変わった今はもう何も語っていない。新しい
                 // 選択と並べて出すと理由（再取得できなかった）と中身が食い違う
@@ -1199,7 +1250,11 @@ impl HubService {
         trigger: Trigger,
     ) {
         let record = self.inner.mirror.current();
+        let identity = subscription_identity(record.as_ref());
         let mut slot = self.inner.subscription.lock().await;
+        // 「同じ購読が止まっているだけ」なら最終受信時刻を残し、別物になった
+        // ／無くなったなら捨てる。世代を張る前に決める。
+        slot.retain_last_value_for(identity.as_ref());
 
         // 1. 接続できていない / catalog を読めていない: 世代は持てない。
         //    未解決タグは catalog と突き合わせて初めて分かるものなので、
@@ -1285,9 +1340,10 @@ impl HubService {
         };
         match client.start(plan.requests) {
             Ok(handle) => {
-                // 新しい世代は別の購読なので、前の世代の最終受信時刻は
-                // 引き継がない。
-                slot.last_value_at = None;
+                // 最終受信時刻がどの購読のものかを記録する（残すか捨てるかは
+                // 上の `retain_last_value_for` が既に決めている - 同じ接続先・
+                // 同じ選択のまま張り直したときは残る）。
+                slot.last_value_from = identity;
                 slot.generation = Some(Generation {
                     states: handle.state_watch(),
                     handle,
@@ -1901,6 +1957,100 @@ mod tests {
         // 進むときは単調 - 巻き戻る `t` で過去に戻さない。
         assert_eq!(advance_last_value_at(Some(5), Some(9)), Some(9));
         assert_eq!(advance_last_value_at(Some(5), Some(3)), Some(5));
+    }
+
+    /// 「最後に値を受けた時刻」を残す条件と消す条件（#385 レビュー第10巡）。
+    ///
+    /// 一律で残すと**別の Hub・別のタグ集合の時刻**を出して嘘になり、一律で
+    /// 消すと**いつまでデータが来ていたか**という記録計にとって一番効く診断が
+    /// 失われる。「同じ購読が止まっているだけか」で分ける。
+    #[test]
+    fn the_last_value_time_is_kept_only_while_it_describes_the_same_subscription() {
+        let hub_a = (
+            "http://127.0.0.1:3100/api/v1/tags".to_owned(),
+            owned(&["alpha", "beta"]),
+        );
+        let hub_b = (
+            "http://127.0.0.1:3101/api/v1/tags".to_owned(),
+            owned(&["alpha", "beta"]),
+        );
+        let fewer_tags = (hub_a.0.clone(), owned(&["alpha"]));
+
+        // 同じ購読が止まっているだけ（`Unauthorized` / `Rebinding` / 終端 /
+        // 再試行待ち）: 接続先も選択も変わらないので残す。
+        assert!(keeps_last_value_at(Some(&hub_a), Some(&hub_a)));
+        // 接続先が変わった / 選択タグが変わった: 別の購読なので消す。
+        assert!(!keeps_last_value_at(Some(&hub_a), Some(&hub_b)));
+        assert!(!keeps_last_value_at(Some(&hub_a), Some(&fewer_tags)));
+        // 購読そのものが無くなった（切断・未設定）。
+        assert!(!keeps_last_value_at(Some(&hub_a), None));
+        // まだ何も覚えていない。
+        assert!(!keeps_last_value_at(None, Some(&hub_a)));
+        assert!(!keeps_last_value_at(None, None));
+    }
+
+    /// 同一性は**接続先と選択タグだけ**で、catalog を読めていなくても計算
+    /// できる（「同じ購読が止まっているだけか」はまさに読めない場面で判断
+    /// したい）。選択の並び順や重複では変わらない。
+    #[test]
+    fn the_subscription_identity_ignores_order_and_duplicates() {
+        let base = keyring_record("http://127.0.0.1:3100", &["beta", "alpha"]);
+        let shuffled = keyring_record("http://127.0.0.1:3100/", &["alpha", "beta", "alpha"]);
+        assert_eq!(
+            subscription_identity(Some(&base)),
+            subscription_identity(Some(&shuffled))
+        );
+        assert_eq!(subscription_identity(None), None);
+    }
+
+    /// 切断すると、その Hub の受信時刻は残さない。
+    #[tokio::test]
+    async fn disconnecting_forgets_the_last_value_time() {
+        let (_settings, hub) = service_with_keyring(&closed_endpoint(), &["alpha"]).await;
+        hub.reconcile_with(
+            &HubStatus::Connected { tag_count: 1 },
+            Some(&catalog(&["alpha"])),
+            Trigger::Observe,
+        )
+        .await;
+        hub.inner.subscription.lock().await.last_value_at = Some(1_234);
+        assert_eq!(hub.subscription().await.last_value_at, Some(1_234));
+
+        hub.disconnect().await.unwrap();
+
+        assert_eq!(
+            hub.subscription().await.last_value_at,
+            None,
+            "レコードごと消えたので前の Hub の受信時刻を残さない"
+        );
+    }
+
+    /// 接続先や選択タグが変わったら、前の購読の受信時刻は残さない。
+    #[tokio::test]
+    async fn a_different_endpoint_or_selection_forgets_the_last_value_time() {
+        for changed in [
+            keyring_record("http://127.0.0.1:3101", &["alpha"]),
+            keyring_record("http://127.0.0.1:3100", &["beta"]),
+        ] {
+            let (_settings, hub) = service_with_keyring("http://127.0.0.1:3100", &["alpha"]).await;
+            hub.reconcile_with(
+                &HubStatus::Connected { tag_count: 1 },
+                Some(&catalog(&["alpha"])),
+                Trigger::Observe,
+            )
+            .await;
+            hub.inner.subscription.lock().await.last_value_at = Some(1_234);
+
+            hub.inner.mirror.reset(Some(changed));
+            hub.reconcile_with(&HubStatus::AuthFailed, None, Trigger::Observe)
+                .await;
+
+            assert_eq!(
+                hub.subscription().await.last_value_at,
+                None,
+                "別の購読の時刻を出すと嘘になる"
+            );
+        }
     }
 
     /// 世代が `Live` でなくても、覚えている最終受信時刻を view に出す

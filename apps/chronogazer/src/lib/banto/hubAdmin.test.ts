@@ -283,14 +283,32 @@ describe('showManualKeyEntry', () => {
 
 describe('hubLastValueLabel / hubTimeLabel', () => {
 	it('まだ一度も受信していないことを明示する（空欄や 0 に潰さない）', () => {
-		expect(hubLastValueLabel(null)).toBe('まだ受信していません');
+		expect(hubLastValueLabel(null, 'stopped')).toBe('まだ受信していません');
+		expect(hubLastValueLabel(null, 'live')).toBe('まだ受信していません');
 	});
 
 	it('受信済みなら epoch ミリ秒をその端末の書式で出す', () => {
 		const epochMs = 1722758400123;
-		expect(hubLastValueLabel(epochMs)).toBe(new Date(epochMs).toLocaleString());
+		expect(hubLastValueLabel(epochMs, 'live')).toBe(new Date(epochMs).toLocaleString());
 		// epoch ミリ秒をそのまま数字で出さない。
-		expect(hubLastValueLabel(epochMs)).not.toBe(String(epochMs));
+		expect(hubLastValueLabel(epochMs, 'live')).not.toBe(String(epochMs));
+	});
+
+	it('live でないときは同じ行から「今は受信していない」と分かる', () => {
+		// バックエンドは「同じ購読が止まっているだけ」なら時刻を残すので、
+		// 時刻だけを出すと受信し続けているように読めてしまう。
+		const epochMs = 1722758400123;
+		const at = new Date(epochMs).toLocaleString();
+		expect(hubLastValueLabel(epochMs, 'stopped')).toBe(`${at}（購読は停止しています）`);
+		for (const state of [
+			'connecting',
+			'handshaking',
+			'rebinding',
+			'reconnecting',
+			'unauthorized'
+		] as const) {
+			expect(hubLastValueLabel(epochMs, state), state).toBe(`${at}（現在は受信していません）`);
+		}
 	});
 
 	it('解釈できない値は握りつぶさずそのまま見せる', () => {

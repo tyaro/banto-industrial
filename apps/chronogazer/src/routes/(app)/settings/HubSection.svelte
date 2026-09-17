@@ -387,7 +387,9 @@
 					「この行がいつの値か」であって、購読が生きているかの
 					目安にはならないので別に出す。
 				-->
-				<p class="note">最終受信: {hubLastValueLabel(subscription.lastValueAt)}</p>
+				<p class="note">
+					最終受信: {hubLastValueLabel(subscription.lastValueAt, subscription.state)}
+				</p>
 
 				<!--
 					`hubSubscriptionDetail` が「停止（エラー: …）」としてエラーを

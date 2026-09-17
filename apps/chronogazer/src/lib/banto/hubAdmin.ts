@@ -408,9 +408,18 @@ export function hubTimeLabel(epochMs: number): string {
  *
  * **まだ一度も受信していないことを明示する** - 空欄や「0」に潰すと、
  * 「受信していない」のか「表示できていない」のか区別が付かなくなる。
+ *
+ * バックエンドは「同じ購読が止まっているだけ」なら時刻を残す（いつまで
+ * データが来ていたかは診断に効く）。そのため **`live` でないときは、同じ行
+ * から今は受信していないと分かる**ようにする - 時刻だけを出すと、止まって
+ * いるのに受信し続けているように読めてしまう。
  */
-export function hubLastValueLabel(lastValueAt: number | null): string {
-	return lastValueAt === null ? 'まだ受信していません' : hubTimeLabel(lastValueAt);
+export function hubLastValueLabel(lastValueAt: number | null, state: HubSubscriptionState): string {
+	if (lastValueAt === null) return 'まだ受信していません';
+	const at = hubTimeLabel(lastValueAt);
+	if (state === 'live') return at;
+	if (state === 'stopped') return `${at}（購読は停止しています）`;
+	return `${at}（現在は受信していません）`;
 }
 
 /**
