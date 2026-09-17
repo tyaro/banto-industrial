@@ -1044,6 +1044,12 @@ FA-Server との比較で最も見劣りする欠落だが、v1 から外す:
   or 証明書を設定で渡すのみ）
 - TLS: v1 では平文 + 「閉域 LAN 前提」を明記（ChronoGazer の LAN モードと
   同じ前提）。リバースプロキシ（Caddy 等）での終端を運用ガイドに記載
+- **Banto アプリ側の自動接続（#332）**: chronogazer / relay-wright は試運転中に
+  自分用の `read` キーを自己発行して OS キーリングへ保存する。Hub 側は変更ゼロで、
+  下記「試運転モードとロックダウン」の性質（status は未認証で読める／未ロック
+  ダウン中は管理 REST の bearer 認証をバイパスする／ロックダウン中は loopback
+  バインド必須）にそのまま乗っている。設計は
+  [banto-hub-client-bootstrap.md](banto-hub-client-bootstrap.md)。
 
 #### 試運転モードとロックダウン（2026-08-30 オーナー決定）
 

@@ -54,12 +54,14 @@ test.describe.serial('chronogazer 設定画面のカテゴリ別ルート', () =
 		await expect(page.getByRole('heading', { level: 2, name: 'テーマ' })).toBeVisible();
 	});
 
-	test('2. カテゴリナビには可視カテゴリ（外観/アカウント/接続/データ）だけが並び、security は無い', async () => {
+	test('2. カテゴリナビには可視カテゴリ（外観/アカウント/接続/データ/Hub接続）だけが並び、security は無い', async () => {
 		const nav = page.getByRole('navigation', { name: '設定のカテゴリ' });
 		await expect(nav.getByRole('link', { name: '外観' })).toBeVisible();
 		await expect(nav.getByRole('link', { name: 'アカウント' })).toBeVisible();
-		await expect(nav.getByRole('link', { name: '接続' })).toBeVisible();
+		await expect(nav.getByRole('link', { name: '接続', exact: true })).toBeVisible();
 		await expect(nav.getByRole('link', { name: 'データ' })).toBeVisible();
+		// #332 で追加した6番目のカテゴリ（admin 限定）。
+		await expect(nav.getByRole('link', { name: 'Hub接続' })).toBeVisible();
 		// isTauri() が常に false のこの E2E サーバーでは、認証カテゴリの
 		// ガード（`tauri && canManageAuthMode()`）が常に false になり
 		// security は非可視になる（doc comment参照）。
@@ -75,7 +77,7 @@ test.describe.serial('chronogazer 設定画面のカテゴリ別ルート', () =
 
 	test('4. 接続へ遷移すると期待する見出しが出る', async () => {
 		const nav = page.getByRole('navigation', { name: '設定のカテゴリ' });
-		await nav.getByRole('link', { name: '接続' }).click();
+		await nav.getByRole('link', { name: '接続', exact: true }).click();
 		await expect(page).toHaveURL(/\/settings\/connectivity$/);
 		await expect(
 			page.getByRole('heading', { level: 2, name: 'LANアクセス（組み込みWebサーバ）' })

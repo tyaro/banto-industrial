@@ -9,6 +9,9 @@ pub mod audit;
 pub mod backup;
 pub mod db;
 pub mod events;
+// #332: Hub 接続（`banto-hub-bootstrap` の配線）。keyring は src-tauri、
+// `banto-serve` は `hub::UnavailableKeyStore` を渡す - モジュール doc 参照。
+pub mod hub;
 pub mod rest;
 pub mod settings;
 #[cfg(test)]

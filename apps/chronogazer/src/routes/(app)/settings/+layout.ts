@@ -26,6 +26,12 @@ import { SETTINGS_CATEGORIES, type SettingsCategoryId } from './categories';
  *   （どちらか一方でも見えれば data カテゴリ自体は可視）。
  * - `security`: 元「認証」section の `tauri && canManageAuthMode`
  *   （`canManageAuthMode` は `shared.ts` 参照）。
+ * - `hub`（#332、新設）: `connectivity` と同じ `isAdmin(sessionStore.role)`。
+ *   Hub への接続は `connectivity`（自アプリの LAN 公開）と同じ「サーバ
+ *   制御系 = admin」の範囲。実行形態による可用性（プレーンな `vite dev`
+ *   では backend が無い）はカテゴリの可視性ではなく `HubSection.svelte`
+ *   側の注記で扱う - `connectivity` が Tauri 以外で注記を出すのと同じ
+ *   作法。
  *
  * `depends('settings:categories')` を宣言し、`SecuritySection.svelte` が
  * 認証モードの変更に成功したあと `invalidate('settings:categories')` を
@@ -49,7 +55,8 @@ export async function load({ parent, depends }) {
 		account: true,
 		connectivity: admin,
 		data: admin && (isAuditLogAvailable() || isBackupsAvailable()),
-		security: tauri && canManageAuthMode()
+		security: tauri && canManageAuthMode(),
+		hub: admin
 	};
 
 	return { categories: SETTINGS_CATEGORIES.filter((category) => visible[category.id]) };

@@ -32,7 +32,7 @@ fn degrade(context: &str, err: keyring::Error) -> BantoError {
 
 fn entry(username: &str) -> Result<keyring::Entry, BantoError> {
     keyring::Entry::new(SERVICE_NAME, username)
-        .map_err(|err| degrade("OSキーリードへのアクセスに失敗しました", err))
+        .map_err(|err| degrade("OSキーリングへのアクセスに失敗しました", err))
 }
 
 /// Store `password` in the OS keyring under `username`, overwriting any

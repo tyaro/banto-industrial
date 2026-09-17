@@ -35,6 +35,7 @@ use chronogazer_core::audit::{AuditEntry, AuditLogService};
 use chronogazer_core::backup::BackupService;
 use chronogazer_core::db::init_db;
 use chronogazer_core::events::event_channel;
+use chronogazer_core::hub::{HubService, UnavailableKeyStore};
 use chronogazer_core::rest::{api_router, audited_credential_verifier};
 use chronogazer_core::settings::SettingsService;
 use chronogazer_core::users::UsersService;
@@ -127,8 +128,26 @@ async fn main() {
         Err(err) => eprintln!("banto-serve: 監査ログの保持設定の読み取りに失敗しました: {err}"),
     }
 
-    let app = api_router(users, settings, audit, backup, auth, events, allow_setup)
-        .merge(static_router::<FrontendAssets>());
+    // #332: この開発用サーバーには OS キーリングが無い（keyring は
+    // `src-tauri` だけの依存 - ワークスペース `Cargo.toml` の注記参照）ので、
+    // 書き込みが必ず失敗する `UnavailableKeyStore` を渡す。到達確認・
+    // ロックダウン判定・未設定判定といった「キーを保存しない範囲」は
+    // そのまま動くため、E2E はこのサーバーで実施できる。
+    let hub = HubService::new(settings.clone(), std::sync::Arc::new(UnavailableKeyStore))
+        .await
+        .expect("HubService should initialize");
+
+    let app = api_router(
+        users,
+        settings,
+        audit,
+        backup,
+        hub,
+        auth,
+        events,
+        allow_setup,
+    )
+    .merge(static_router::<FrontendAssets>());
 
     let server = start(ServerConfig { bind, port }, app)
         .await

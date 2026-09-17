@@ -13,7 +13,8 @@
  */
 import { redirect } from '@sveltejs/kit';
 
-export type SettingsCategoryId = 'appearance' | 'account' | 'connectivity' | 'data' | 'security';
+export type SettingsCategoryId =
+	'appearance' | 'account' | 'connectivity' | 'data' | 'security' | 'hub';
 
 export interface SettingsCategory {
 	id: SettingsCategoryId;
@@ -27,7 +28,9 @@ export const SETTINGS_CATEGORIES: SettingsCategory[] = [
 	{ id: 'account', path: '/settings/account', label: 'アカウント' },
 	{ id: 'connectivity', path: '/settings/connectivity', label: '接続' },
 	{ id: 'data', path: '/settings/data', label: 'データ' },
-	{ id: 'security', path: '/settings/security', label: 'セキュリティ' }
+	{ id: 'security', path: '/settings/security', label: 'セキュリティ' },
+	// #332: banto-hub への接続。ナビの最後（既存 5 カテゴリの順序は変えない）。
+	{ id: 'hub', path: '/settings/hub', label: 'Hub接続' }
 ];
 
 /**
