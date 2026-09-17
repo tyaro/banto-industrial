@@ -613,21 +613,53 @@ async fn hold_observe(hub: &HubService, hold_secs: u64, tracker: &mut StatusTrac
 /// 接続先が一致するときだけレコードを参照する」ことで防いでおり、この
 /// 関数も同じ規律に揃える。
 ///
-/// 正規化そのものは `banto_hub_bootstrap::admin::base_url` が行っている
-/// が `pub(crate)` でこの crate の外から呼べないため、**同じ検証・正規化
-/// ルールで実装されている公開 API** `banto_tagclient::Endpoint::new` で
-/// 代用する（`admin.rs` のdoc「Mirrors `banto_tagclient::Endpoint`'s
-/// contract」のとおり、スキーム・ホスト・ポート・末尾スラッシュの扱いは
-/// 完全に同じ）。`Endpoint` は正規化後の文字列を直接公開していないため、
-/// 決定的に導ける `tags_url()` を比較する - `chronogazer_core::hub` の
-/// `fingerprint_endpoint`（購読世代の同一性判定）が同じ理由で同じ手法を
-/// 使っているのと同じ考え方。どちらかが不正な形式なら「同じではない」
-/// として扱う（安全側 - 判断に迷ったら失効させない）。
+/// 正規化は [`hub_identity`] に委譲する（判定は1箇所に集約し、
+/// [`issued_this_run`] もこの関数越しに同じ規則を使う）。どちらかが
+/// 不正な形式なら「同じではない」として扱う（安全側 - 判断に迷ったら
+/// 失効させない）。
 fn same_hub(a: &str, b: &str) -> bool {
-    match (Endpoint::new(a), Endpoint::new(b)) {
-        (Ok(a), Ok(b)) => a.tags_url() == b.tags_url(),
+    match (hub_identity(a), hub_identity(b)) {
+        (Some(a), Some(b)) => a == b,
         _ => false,
     }
+}
+
+/// `raw` が指す Hub の識別子: `(host, port, path prefix)` の3つ組。
+///
+/// `banto_hub_bootstrap::admin::keyring_account`
+/// （`crates/banto-hub-bootstrap/src/admin.rs:154-159`）が
+/// `KeyStore` のアカウント名に使っているのと**同じ3つ組**で正規化する。
+/// 同ファイルの `keyring_account` のdoc comment（135-141行）が明記する
+/// 規律 ---「the port is always spelled out (`port_or_known_default`),
+/// so `http://host` and `http://host:80` are one Hub, not two」---
+/// にここでも揃える（2026-09-18 Copilotレビュー指摘: 既定ポートの
+/// 表記ゆれを吸収しないと、`issued_this_run` が「別Hub」と誤判定し、
+/// `CG_SMOKE_REVOKE=1` が今回発行していない既存キーを失効させる -
+/// 前々回直した「他人のキーを消してしまう」側の、また別の形の再発）。
+///
+/// `admin::base_url` / `keyring_account` はどちらも `pub(crate)` で
+/// この crate の外から呼べないため、**同じ検証・正規化ルールで実装
+/// されている公開 API** `banto_tagclient::Endpoint::new` で正規化した
+/// うえで、host / `port_or_known_default()` / path を個別に取り出す
+/// （`admin.rs` のdoc「Mirrors `banto_tagclient::Endpoint`'s contract」
+/// のとおり、スキーム・ホスト・ポート・末尾スラッシュの扱いは完全に
+/// 同じ）。`Endpoint` は正規化後の base URL 自体を公開していないため、
+/// 公開されている `tags_url()`（`base` に `tags` セグメントを1つ足した
+/// もの）から `port_or_known_default()` とパスを逆算する - 末尾の
+/// `tags` セグメントを取り除けば `keyring_account` が使う `base.path()`
+/// と同じ値になる（`Endpoint::new` が末尾スラッシュを正規化してから
+/// セグメントを足すため、剥がし方が一意に定まる）。
+fn hub_identity(raw: &str) -> Option<(String, u16, String)> {
+    let endpoint = Endpoint::new(raw).ok()?;
+    let tags_url = endpoint.tags_url();
+    let host = endpoint.host()?.to_owned();
+    let port = tags_url.port_or_known_default()?;
+    let path = tags_url
+        .path()
+        .strip_suffix("tags")
+        .unwrap_or_else(|| tags_url.path())
+        .to_owned();
+    Some((host, port, path))
 }
 
 /// 手順2の`connect()`が**今回のプロセスで実際にキーを発行したか**を
@@ -1382,4 +1414,101 @@ fn print_summary(results: &[StepResult]) {
             "一部項目が失敗・想定外、またはスキップ"
         }
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // same_hub() の正規化を固定する回帰テスト（2026-09-18 Copilotレビュー
+    // 指摘: `cargo test -p chronogazer-core --example hub_real_smoke` で
+    // 走る）。実機を必要としない - 正規化はローカルの文字列処理のみ。
+
+    #[test]
+    fn same_hub_absorbs_a_trailing_slash() {
+        assert!(same_hub("http://127.0.0.1:8722", "http://127.0.0.1:8722/"));
+    }
+
+    #[test]
+    fn same_hub_absorbs_an_explicit_default_port() {
+        // crates/banto-hub-bootstrap/src/admin.rs:135-141 の
+        // keyring_account のdoc comment「the port is always spelled out
+        // (port_or_known_default), so http://host and http://host:80
+        // are one Hub, not two」と同じ規律であることの固定。
+        assert!(same_hub("http://host", "http://host:80"));
+    }
+
+    #[test]
+    fn same_hub_rejects_a_different_port() {
+        assert!(!same_hub("http://host:8722", "http://host:8723"));
+    }
+
+    #[test]
+    fn same_hub_rejects_a_different_host() {
+        assert!(!same_hub("http://host-a:8722", "http://host-b:8722"));
+    }
+
+    #[test]
+    fn same_hub_rejects_a_different_path_prefix() {
+        assert!(!same_hub("http://host/hub-a", "http://host/hub-b"));
+    }
+
+    #[test]
+    fn same_hub_treats_malformed_input_as_different() {
+        assert!(!same_hub("not a url", "http://host"));
+        assert!(!same_hub("http://host", "not a url"));
+    }
+
+    #[test]
+    fn issued_this_run_treats_a_same_numbered_key_id_on_a_different_hub_as_issued() {
+        // #387 レビュー（00a5ae7）で固定した挙動: api_keys.id はHubごとの
+        // 連番なので、別Hubに切り替えたとき旧レコードのkey_idと新しい
+        // Hubが今回発行したkey_idがたまたま同じ数値でも「今回発行した」
+        // と正しく判定できること。
+        assert!(issued_this_run(
+            true,
+            Some("http://host-a:8722"),
+            Some(5),
+            "http://host-b:8722",
+            Some(5),
+        ));
+    }
+
+    #[test]
+    fn issued_this_run_treats_an_unchanged_key_id_on_the_same_hub_as_not_issued() {
+        assert!(!issued_this_run(
+            true,
+            Some("http://host:8722"),
+            Some(5),
+            "http://host:8722",
+            Some(5),
+        ));
+    }
+
+    #[test]
+    fn issued_this_run_treats_an_unchanged_key_id_on_the_same_hub_with_default_port_spelling_as_not_issued(
+    ) {
+        // 今回の本題: 既定ポートの表記ゆれ（http://host と
+        // http://host:80）を同じHubとみなせないと、実際には同じ接続先
+        // なのに「別Hub」と誤判定して issued_this_run が true になり、
+        // CG_SMOKE_REVOKE=1 が今回発行していない既存キーを失効させる。
+        assert!(!issued_this_run(
+            true,
+            Some("http://host"),
+            Some(5),
+            "http://host:80",
+            Some(5),
+        ));
+    }
+
+    #[test]
+    fn issued_this_run_is_false_when_not_connected() {
+        assert!(!issued_this_run(
+            false,
+            Some("http://host:8722"),
+            Some(5),
+            "http://host:8722",
+            None,
+        ));
+    }
 }
