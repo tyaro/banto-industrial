@@ -1776,8 +1776,9 @@ async fn hub_disconnect(state: State<'_, AppState>) -> Result<HubView, BantoErro
 const EXIT_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The app's exit cleanup, split out of [`run`]'s `RunEvent::Exit` arm so it
-/// can be unit-tested against a synthetic [`AppState`] (the `RunEvent::Exit`
-/// path itself cannot be - see [`run`]).
+/// can be unit-tested against a synthetic [`AppState`] - see
+/// `exit_cleanup_closes_the_pool`, and [`run`] for what that test does NOT
+/// cover.
 ///
 /// **Order matters**, and it is "outermost producer first, the thing they all
 /// write to last":
@@ -2232,11 +2233,24 @@ pub fn run() {
             // `app.manage(..)` に到達する前に落ちた）なら閉じるものは無い。
             // 全体の上限は `shutdown_app_state` が持つ。
             //
-            // この経路そのものは自動テストできない（`RunEvent` を合成する
-            // 口が Tauri に無く、このクレートは CI の Linux コンテナでは
-            // そもそもビルドできない）。テストできるのは中身の
-            // `shutdown_app_state` までで、「Exit で本当に呼ばれるか」は
-            // 実機での目視確認になる - relay-wright の W3-B2 と同じ状況。
+            // **テストの範囲**（#396 のレビュー C で訂正）:
+            //
+            // * 後始末の中身は `shutdown_app_state` の単体テスト
+            //   （`exit_cleanup_closes_the_pool`）で押さえてある。
+            // * `tauri::RunEvent::Exit` **自体は構築できる**（`#[non_exhaustive]`
+            //   が付いているのは enum であって `Exit` variant ではない。
+            //   このクレートで `let e = tauri::RunEvent::Exit;` が通ることを
+            //   実際に確かめた）。したがってイベントハンドラを切り出して
+            //   `Exit` を渡すテストは**書ける**。書いていないのは費用対効果の
+            //   判断: 切り出した関数は `AppHandle` を要求し、それを作るには
+            //   `tauri::test` のモックランタイム（このクレートでは未有効）で
+            //   アプリを組み立てる必要がある一方、確かめられるのは
+            //   「`Exit` のときだけ `shutdown_app_state` を呼ぶ」という
+            //   3 行の分岐だけになる。
+            // * 「OS の終了 → Tauri のイベントループ → このコールバック」と
+            //   いう**経路全体**は、どのみち通常の unit test では再現できない
+            //   （このクレートは CI の Linux コンテナでビルドすらできない）。
+            //   そこは実機確認の領域 - relay-wright の W3-B2 と同じ状況。
             if let tauri::RunEvent::Exit = event {
                 if let Some(state) = app_handle.try_state::<AppState>() {
                     tauri::async_runtime::block_on(shutdown_app_state(&state));
@@ -2384,9 +2398,9 @@ mod tests {
     }
 
     /// #383 R1-C's prerequisite: the exit cleanup closes the pool (and does
-    /// not hang doing it). This covers the BODY of the exit hook only - that
-    /// `RunEvent::Exit` actually calls it cannot be asserted here (see
-    /// [`run`]'s comment on the same point).
+    /// not hang doing it). This covers the BODY of the exit hook only - see
+    /// [`run`]'s comment for exactly what is and is not tested around it
+    /// (corrected in #396's review C).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exit_cleanup_closes_the_pool() {
         let state = app_state().await;
