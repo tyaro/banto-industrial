@@ -397,6 +397,11 @@ const REASON_NO_KEY: &str =
 /// 一手も違うので混ぜない（こちらは再接続か手動キーの採用で直る）。
 const REASON_KEY_REJECTED: &str =
     "保存済みのAPIキーがHubに拒否されたため購読できません（「接続」で再発行するか、APIキーを採用してください）。";
+/// アプリを終了している最中（[`HubService::shutdown`]）。**この理由になった
+/// 世代は二度と張り直されない** - 見張りは停止済みで、`resume()` も
+/// 起こし直さない。ほかの停止理由（環境が直れば復帰する）と混ぜないために
+/// 独立した語彙にする。
+const REASON_SHUTTING_DOWN: &str = "アプリを終了しているため購読を停止しました。";
 /// 選択は保存できたが、直後の catalog 再取得に失敗した状態。**保存は成功
 /// している**ことと、**放っておいても見張りが張り直す**ことが伝わる文言に
 /// する（ユーザーに再操作を要求しない）。
@@ -1165,6 +1170,20 @@ struct HubInner {
     /// `compare_exchange` に勝った 1 本だけが走る（`resume()` を何度呼んでも
     /// 増えない）。
     supervisor_spawns: AtomicUsize,
+    /// **終了の合図**（[`HubService::shutdown`]）。`true` になったら、
+    /// 見張りは次の周期を待たずに抜け、`resume()` は起こし直さず、
+    /// [`HubService::reconcile_with_reason`] は新しい世代を張らない。
+    ///
+    /// `AtomicBool` ではなく `watch` にしてあるのは、**見張りの
+    /// [`SUPERVISOR_INTERVAL`] の sleep を打ち切る**ため。フラグだけだと
+    /// 「次の周期の頭で抜ける」＝最大 30 秒タスクが残り、終了処理が
+    /// それを待てなくなる（待たなければ終了は固まらないが、`Weak` が
+    /// 切れるまで回っていた従来と大差なくなる）。読み取りは
+    /// [`HubService::is_shutting_down`]。
+    ///
+    /// 送信側しか持たないので、送るときは `send`（受信者ゼロで失敗する）
+    /// ではなく `send_replace` を使う。
+    shutdown: watch::Sender<bool>,
     /// これまでに張った購読世代の本数（[`Generation::sequence`] の採番元）。
     generations_started: AtomicUsize,
 }
@@ -1211,6 +1230,7 @@ impl HubService {
                 operation: AsyncMutex::new(()),
                 subscription: AsyncMutex::new(Subscription::default()),
                 supervisor_spawns: AtomicUsize::new(0),
+                shutdown: watch::channel(false).0,
                 generations_started: AtomicUsize::new(0),
             }),
         })
@@ -1247,10 +1267,68 @@ impl HubService {
     /// `banto-serve` の起動）は spawn して投げっぱなしにしてよい。1 回目が
     /// 失敗しても見張りが拾うので、**Hub を後から起動しても値は流れ出す**。
     pub async fn resume(&self) {
+        // **終了中は起こし直さない**（[`Self::shutdown`]）。見張りの再 spawn
+        // だけでなく、その場の張り直し（`resume_inner`）も止める - 終了処理
+        // が世代を落とした直後にここが走ると、閉じたはずの WS がもう 1 本
+        // 立ったままプロセスが終わる。
+        if self.is_shutting_down() {
+            return;
+        }
         self.spawn_supervisor();
         if let Err(err) = self.resume_inner().await {
             eprintln!("banto: 起動時のHub購読の再開に失敗しました: {err}");
         }
+    }
+
+    /// アプリ終了時の後始末（#383 R1-C の前提）。**購読世代を止め、見張りを
+    /// 終わらせ、以後は誰が `resume()` を呼んでも起き上がらない**ようにする。
+    ///
+    /// 収集エンジンを同じ Tauri プロセスに置くというオーナー決定
+    /// （2026-09-18、`docs/recorder-requirements.md` §4）の下では、プロセスの
+    /// 終了が唯一の「止める場所」になる。managed state は Tauri が drop
+    /// しないので、ここを呼ばない限り WS は close を送らずに切れる。
+    ///
+    /// # 待たないもの（ここが一番大事）
+    ///
+    /// **操作ロック（[`HubInner::operation`]）を無条件には待たない。**
+    /// `connect` は [`HUB_MUTATING_TIMEOUT`]（60 秒）を持ったまま操作ロックを
+    /// 握るので、素直に `lock().await` すると**終了が最大 60 秒固まる**。
+    /// ウィンドウを閉じたのに 1 分プロセスが残る方が、購読の後始末を
+    /// 取りこぼすより悪い（取りこぼしても、OS が TCP を畳む）。そこで
+    /// `try_lock` で取れたときだけ握り、取れなければ**購読ロックだけで**
+    /// 世代を止める。ロック順序（操作 → 購読）は変えていない。
+    ///
+    /// 見張りタスクの終了も**待たない**（`JoinHandle` を持たない）。合図は
+    /// [`HubInner::shutdown`] で送ってあり、タスクは sleep を打ち切って抜ける。
+    /// 待とうとすると、まさに今 60 秒の `connect` を握っているかもしれない
+    /// 相手を待つことになる。
+    ///
+    /// # 上限
+    ///
+    /// この関数自身は上限を持たない（内側の await は `try_lock` の失敗で
+    /// 早々に抜けるか、購読ロック + `TagClientHandle::shutdown` だけ）。
+    /// **終了処理全体の上限は呼び出し側**（`src-tauri` の `RunEvent::Exit`）
+    /// が 1 本で掛ける - LAN サーバーの graceful shutdown や DB プールの
+    /// close も同じ予算の中で諦めさせたいため。
+    pub async fn shutdown(&self) {
+        // 1. 先に合図を上げる。これ以降に走る見張り・`resume()`・
+        //    `reconcile_with_reason` は新しい世代を張らないので、2. で止めた
+        //    ものが後から立ち上がり直すことがない。
+        self.inner.shutdown.send_replace(true);
+        // 2. 操作ロックは取れたら握る（取れなくても進む。doc 参照）。取れた
+        //    ときは、他の操作と同じ順序で購読ロックへ進むことになる。
+        let _operation = self.inner.operation.try_lock().ok();
+        self.inner
+            .subscription
+            .lock()
+            .await
+            .stop(Some(REASON_SHUTTING_DOWN.to_owned()))
+            .await;
+    }
+
+    /// 終了の合図が上がっているか（[`HubInner::shutdown`]）。
+    fn is_shutting_down(&self) -> bool {
+        *self.inner.shutdown.borrow()
     }
 
     /// 購読の見張りを 1 本だけ起動する（#385 レビュー対応 F1/F2）。
@@ -1291,7 +1369,16 @@ impl HubService {
     /// clone が落ちれば次の周期で終わる。**`resume()` からしか起動しない**
     /// ので、`reconcile_with` を直接叩くユニットテストが勝手にネットワーク
     /// を叩くことはない。
+    ///
+    /// **止め方**（[`Self::shutdown`]）: `Weak` が切れるのを待つのではなく、
+    /// [`HubInner::shutdown`] の合図で sleep を打ち切って抜ける。合図が
+    /// 上がった後は spawn 自体を断るので、終了中に `resume()` が来ても
+    /// 見張りは起き上がらない。
     fn spawn_supervisor(&self) {
+        // 終了中は起動しない（`resume()` 側でも見ているが、ここが最後の砦）。
+        if self.is_shutting_down() {
+            return;
+        }
         if self
             .inner
             .supervisor_spawns
@@ -1301,15 +1388,28 @@ impl HubService {
             return;
         }
         let weak: Weak<HubInner> = Arc::downgrade(&self.inner);
+        // 受信側だけをタスクへ渡す。`watch::Receiver` は watch の内部状態を
+        // 掴むだけで `HubInner` を延命しないので、`Weak` の設計は変わらない。
+        let mut stop = self.inner.shutdown.subscribe();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(SUPERVISOR_INTERVAL).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(SUPERVISOR_INTERVAL) => {}
+                    // 合図（または送信側の消滅）。周期の途中でも即座に抜ける。
+                    _ = stop.changed() => break,
+                }
                 // `service` はこのブロックの中だけで生きる - sleep を跨いで
                 // 強参照を持つと `HubService` が解放されなくなる。
                 let Some(inner) = weak.upgrade() else {
                     break;
                 };
-                HubService { inner }.supervise_once().await;
+                let service = HubService { inner };
+                // 周期の頭で合図を見る（`select!` が sleep 側を選んだ直後に
+                // 合図が上がった場合の取りこぼしをここで拾う）。
+                if service.is_shutting_down() {
+                    break;
+                }
+                service.supervise_once().await;
             }
         });
     }
@@ -1705,6 +1805,15 @@ impl HubService {
         //    で、しかも毎回 keyring から作り直した `RestClient` を渡すため、
         //    素直に stop -> start する方が所有関係が単純になる。
         slot.stop(None).await;
+        // 終了中は**張り直さない**（[`Self::shutdown`]）。見張りの 1 周期が
+        // Hub への往復の途中で終了処理と行き違ったときに、ここまで来てしまう
+        // - そのまま `start()` すると、終了処理が閉じた直後に新しい WS が
+        // 1 本立ったままプロセスが終わる。古い世代は上の `stop()` で既に
+        // 落ちているので、理由だけ差し替えて抜ける。
+        if self.is_shutting_down() {
+            slot.reason = Some(REASON_SHUTTING_DOWN.to_owned());
+            return;
+        }
         let client = match self.inner.bootstrapper.rest_client() {
             Ok(Some(client)) => client,
             // keyring を持てない実行形態（`banto-serve`）やエントリ喪失。
@@ -4029,6 +4138,94 @@ mod tests {
         let (_settings, hub) = service().await;
         hub.resume().await;
         assert_eq!(hub.subscription().await.state, "stopped");
+    }
+
+    // --- 終了時の後始末（R1-C の前提） --------------------------------------
+
+    /// 世代を持った状態で [`HubService::shutdown`] すると、**世代が落ち**、
+    /// 停止理由が「終了中」になる。
+    #[tokio::test]
+    async fn shutdown_drops_the_subscription_generation() {
+        let (_settings, hub) = service_with_keyring(&closed_endpoint(), &["a"]).await;
+        hub.reconcile_with(
+            &HubStatus::Connected { tag_count: 1 },
+            Some(&catalog(&["a"])),
+            Trigger::Observe,
+        )
+        .await;
+        assert_eq!(
+            generation_sequence(&hub).await,
+            Some(1),
+            "前提: 世代が 1 本立っている"
+        );
+
+        hub.shutdown().await;
+
+        assert_eq!(generation_sequence(&hub).await, None, "世代が落ちる");
+        let view = hub.subscription().await;
+        assert_eq!(view.state, "stopped");
+        assert_eq!(
+            view.reason.as_deref(),
+            Some(REASON_SHUTTING_DOWN),
+            "終了中であることが理由に出る（環境が直れば戻る停止と混ぜない）"
+        );
+    }
+
+    /// **操作ロックが他に握られていても、待たずに完了する**（#383 R1-C の
+    /// 前提でいちばん大事な性質）。`connect` は 60 秒の上限を持ったまま操作
+    /// ロックを握るので、ここで待つとウィンドウを閉じてから最大 1 分
+    /// プロセスが残る。
+    ///
+    /// 時計は止めてある（`pause`）ので**実時間は待たない** - `shutdown()` が
+    /// 誤って操作ロックを待つように退行すると、ランタイムが暇になって時計が
+    /// 飛び、下の `timeout` が `Err` になって落ちる。DB を触るのは
+    /// `service_with_keyring` までで、そこは pause の前に済ませてある
+    /// （`drive_until_the_hub_is_reached` の doc にある sqlx プールの罠を
+    /// 踏まないため）。
+    #[tokio::test]
+    async fn shutdown_does_not_wait_for_the_operation_lock() {
+        let (_settings, hub) = service_with_keyring(&closed_endpoint(), &["a"]).await;
+        hub.reconcile_with(
+            &HubStatus::Connected { tag_count: 1 },
+            Some(&catalog(&["a"])),
+            Trigger::Observe,
+        )
+        .await;
+        // 「いま `connect` が Hub の応答を待っている」状態を作る。
+        let held = hub.inner.operation.lock().await;
+
+        tokio::time::pause();
+        tokio::time::timeout(HUB_MUTATING_TIMEOUT, hub.shutdown())
+            .await
+            .expect("操作ロックの解放を待たずに完了する");
+
+        assert_eq!(
+            generation_sequence(&hub).await,
+            None,
+            "操作ロックを取れなくても、購読ロックだけで世代は止める"
+        );
+        drop(held);
+    }
+
+    /// [`HubService::shutdown`] の後は `resume()` が**見張りを起こさない**
+    /// （終了処理が閉じたものを、終了中に立て直さない）。
+    #[tokio::test]
+    async fn resume_after_shutdown_does_not_start_the_supervisor() {
+        let (_settings, hub) = service_with_keyring(&closed_endpoint(), &["a"]).await;
+        hub.shutdown().await;
+
+        hub.resume().await;
+
+        assert_eq!(
+            hub.inner.supervisor_spawns.load(Ordering::SeqCst),
+            0,
+            "見張りは spawn されない"
+        );
+        assert_eq!(
+            generation_sequence(&hub).await,
+            None,
+            "その場の張り直しも起きない"
+        );
     }
 
     #[tokio::test]

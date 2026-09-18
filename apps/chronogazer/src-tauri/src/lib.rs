@@ -116,6 +116,13 @@ struct AppState {
     plc_connections: PlcConnectionService,
     collection_groups: CollectionGroupService,
     tags: TagService,
+    /// The one SQLite pool every service above is a `Clone` handle onto,
+    /// kept here solely so [`shutdown_app_state`] can `close()` it when the
+    /// app exits (flushing/removing the `-wal`/`-shm` sidecar files instead
+    /// of leaving them for the next launch to recover). Named through
+    /// `chronogazer_core`'s `DbPool` alias so this crate keeps its invariant
+    /// of adding no dependencies of its own (no direct `sqlx`).
+    pool: chronogazer_core::db::DbPool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1748,6 +1755,74 @@ async fn hub_disconnect(state: State<'_, AppState>) -> Result<HubView, BantoErro
     Ok(view)
 }
 
+/// How long [`shutdown_app_state`] is allowed to take in total before the
+/// app gives up and exits anyway (#383 R1-C's prerequisite).
+///
+/// **Why a budget at all**: every step below can, in principle, wait on
+/// something outside this process - the LAN server's graceful shutdown waits
+/// for in-flight requests (a LAN browser's long-lived `GET /api/events` SSE
+/// stream is exactly such a connection), and `SqlitePool::close` waits for
+/// every checked-out connection to come back. A window closing must never
+/// leave a process the user cannot see hanging around; **freezing on exit is
+/// worse than losing some of the cleanup**, because the OS tears the sockets
+/// and the file handles down for us anyway (SQLite recovers a `-wal` on the
+/// next launch by design).
+///
+/// **Why 5 seconds**: everything here is local (a WS close frame to a Hub on
+/// the same PC/LAN, an in-process axum shutdown, an SQLite close) and
+/// normally completes in milliseconds. 5 seconds is far enough above that to
+/// never cut a healthy shutdown short, and short enough that a user who
+/// closed the window does not notice.
+const EXIT_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The app's exit cleanup, split out of [`run`]'s `RunEvent::Exit` arm so it
+/// can be unit-tested against a synthetic [`AppState`] (the `RunEvent::Exit`
+/// path itself cannot be - see [`run`]).
+///
+/// **Order matters**, and it is "outermost producer first, the thing they all
+/// write to last":
+///
+/// 1. **Hub subscriptions** - closes the WS generation and stops the
+///    supervisor, so nothing keeps waking up to touch the settings DB or the
+///    network while we are tearing the rest down.
+/// 2. **The embedded LAN server** - stops accepting new requests and lets
+///    in-flight ones finish. Its handlers use the same pool, so it has to be
+///    down before step 3.
+/// 3. **The SQLite pool** - closed last, once nothing can still use it.
+///
+/// Every step is best-effort: `HubService::shutdown` and `RunningServer::stop`
+/// swallow their own failures, and the whole sequence is capped by
+/// [`EXIT_CLEANUP_BUDGET`].
+async fn shutdown_app_state(state: &AppState) {
+    let cleanup = async {
+        // #383 段階1 の購読世代 + 見張り。`shutdown()` は操作ロックを
+        // 無条件には待たない（`connect` の 60 秒で終了が固まるため）-
+        // 理由は `chronogazer_core::hub::HubService::shutdown` の doc。
+        state.hub.shutdown().await;
+
+        // `server_apply` が停止に使っているのと同じ経路（`take()` して
+        // `RunningServer::stop()`）。`take()` しておくのは、ここで止めたものを
+        // 残しておく意味が無いのと、二重に stop されないようにするため。
+        if let Some(running) = state.server.lock().await.take() {
+            running.stop().await;
+        }
+
+        // 最後に DB。`close()` は全接続が返るのを待ってからプールを閉じる
+        // ので、`-wal`/`-shm` が畳まれた状態でプロセスが終わる。
+        state.pool.close().await;
+    };
+
+    if tokio::time::timeout(EXIT_CLEANUP_BUDGET, cleanup)
+        .await
+        .is_err()
+    {
+        eprintln!(
+            "banto: 終了時の後始末が{}秒以内に終わらなかったため、途中で切り上げて終了します。",
+            EXIT_CLEANUP_BUDGET.as_secs()
+        );
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .setup(|app| {
@@ -1786,7 +1861,7 @@ pub fn run() {
             let plc_connections = PlcConnectionService::new(pool.clone());
             let collection_groups = CollectionGroupService::new(pool.clone());
             let tags = TagService::new(pool.clone());
-            let audit = AuditLogService::new(pool);
+            let audit = AuditLogService::new(pool.clone());
             // Records `login`/`login_failed` audit entries (spec M14) from
             // inside the verifier itself - see
             // `chronogazer_core::rest::audited_credential_verifier`'s doc
@@ -2078,6 +2153,7 @@ pub fn run() {
                 plc_connections,
                 collection_groups,
                 tags,
+                pool,
             });
 
             Ok(())
@@ -2140,8 +2216,33 @@ pub fn run() {
             tags_update,
             tags_delete,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // #383 R1-C の前提: アプリの event loop が終わるときに、この
+            // プロセスが持っている外向きの資源を明示的に閉じる。`AppState`
+            // は Tauri の managed state なので**プロセス終了で Drop が
+            // 走らない** - ここを通らない限り、Hub の購読 WS は close を
+            // 送らずに切れ、LAN サーバーは graceful shutdown せず、SQLite の
+            // `-wal`/`-shm` が残る。収集エンジンを同じプロセスに載せる
+            // オーナー決定（2026-09-18、docs/recorder-requirements.md §4）の
+            // 下では、**ここが唯一の「止める場所」**になる。
+            //
+            // Best effort: `try_state` が `None`（`setup()` が
+            // `app.manage(..)` に到達する前に落ちた）なら閉じるものは無い。
+            // 全体の上限は `shutdown_app_state` が持つ。
+            //
+            // この経路そのものは自動テストできない（`RunEvent` を合成する
+            // 口が Tauri に無く、このクレートは CI の Linux コンテナでは
+            // そもそもビルドできない）。テストできるのは中身の
+            // `shutdown_app_state` までで、「Exit で本当に呼ばれるか」は
+            // 実機での目視確認になる - relay-wright の W3-B2 と同じ状況。
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app_handle.try_state::<AppState>() {
+                    tauri::async_runtime::block_on(shutdown_app_state(&state));
+                }
+            }
+        });
 }
 
 #[cfg(test)]
@@ -2228,7 +2329,8 @@ mod tests {
             hub,
             plc_connections: PlcConnectionService::new(pool.clone()),
             collection_groups: CollectionGroupService::new(pool.clone()),
-            tags: TagService::new(pool),
+            tags: TagService::new(pool.clone()),
+            pool,
         }
     }
 
@@ -2275,9 +2377,32 @@ mod tests {
             hub,
             plc_connections: PlcConnectionService::new(pool.clone()),
             collection_groups: CollectionGroupService::new(pool.clone()),
-            tags: TagService::new(pool),
+            tags: TagService::new(pool.clone()),
+            pool,
         };
         (dir, state)
+    }
+
+    /// #383 R1-C's prerequisite: the exit cleanup closes the pool (and does
+    /// not hang doing it). This covers the BODY of the exit hook only - that
+    /// `RunEvent::Exit` actually calls it cannot be asserted here (see
+    /// [`run`]'s comment on the same point).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exit_cleanup_closes_the_pool() {
+        let state = app_state().await;
+        assert!(!state.pool.is_closed(), "前提: 起動中はプールが開いている");
+
+        // The budget is the outer bound; nothing here should take anywhere
+        // near it, so a plain call is enough to catch a hang (the test would
+        // never finish) as well as the wrong end state.
+        shutdown_app_state(&state).await;
+
+        assert!(state.pool.is_closed(), "DBプールが閉じている");
+        assert_eq!(
+            state.hub.subscription().await.state,
+            "stopped",
+            "購読は止まっている"
+        );
     }
 
     /// Spec M14: the Tauri-side self-service password change must be
