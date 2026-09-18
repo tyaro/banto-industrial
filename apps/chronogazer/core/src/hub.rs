@@ -960,31 +960,90 @@ const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(30);
 /// ロックが握られ続けることはない。
 const HUB_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// [`HUB_OPERATION_TIMEOUT`] を使い切ったときに返すエラー。
+/// [`HUB_OPERATION_TIMEOUT`] を使い切ったときに載せる購読の停止理由。
 ///
-/// **新しい状態は増やさない**。`banto-hub-bootstrap` 自身、「何も答えない」
-/// を [`HubStatus::Unreachable`] の `UnreachableCause::Transport`
-/// （その doc が timeout を明示的にこの分類に入れている）として扱うので、
-/// 文言も**到達不能と同じ次の一手**（接続先と Hub の状態を確認する）に
-/// 寄せる。上限そのものを文言に入れるのは、**もう待っていない**ことが
-/// 利用者に伝わるようにするため。
-fn hub_timeout_error() -> BantoError {
-    BantoError::Other(format!(
-        "Hubが応答しません（{}秒）。接続先とHubの状態を確認してください。",
+/// 上限そのものを文言に入れるのは、**もう待っていない**ことが利用者に
+/// 伝わるようにするため。定数から作るので、上限を変えても文言とずれない。
+fn hub_timeout_reason() -> String {
+    format!(
+        "Hubが{}秒以内に応答しませんでした。接続先とHubの状態を確認してください。",
         HUB_OPERATION_TIMEOUT.as_secs()
-    ))
+    )
+}
+
+/// [`HubService::set_selected_tags`] の再取得がタイムアウトしたときの理由。
+///
+/// この経路だけは**保存そのものは成功している**（再取得は best effort）ので、
+/// それが伝わらない [`hub_timeout_reason`] は使わない。見張りが next tick で
+/// 拾い直すことも添えて、ユーザーに再操作を要求しない
+/// （[`REASON_SELECTION_CHANGED_REFRESH_FAILED`] と同じ考え方）。
+fn selection_saved_hub_timeout_reason() -> String {
+    format!(
+        "選択を保存しましたが、Hubが{}秒以内に応答しませんでした。まもなく自動で再試行します。",
+        HUB_OPERATION_TIMEOUT.as_secs()
+    )
+}
+
+/// Hub への 1 往復の結果（[`with_hub_timeout`] の戻り）。
+///
+/// `reason_override` は、この往復が**タイムアウトで打ち切られた**ことを
+/// 購読の [`HubSubscriptionView::reason`] に伝えるためだけのもの。`None` なら
+/// [`HubService::reconcile_with_reason`] が通常どおり状態から理由を決める。
+struct HubCall {
+    connection: HubConnection,
+    reason_override: Option<String>,
 }
 
 /// bootstrapper の**ネットワークを伴う**呼び出しは、操作ロックを持ったまま
 /// await するので、必ずこれで包む（[`HUB_OPERATION_TIMEOUT`] の doc 参照）。
 /// 包み忘れが 1 箇所でもあると、そこだけで全体が固まる。
-async fn with_hub_timeout<T, F>(future: F) -> Result<T, BantoError>
+///
+/// **タイムアウトはエラーではなく 6 状態の
+/// [`HubStatus::Unreachable`]（`UnreachableCause::Transport`）として返す**
+/// （#395 のレビュー対応）。エラーで返すと画面には消えるトーストが出るだけで
+/// **状態表示は「接続済み」のまま残り**、購読も `live` のまま据え置かれる -
+/// 「ポーリングが恒久的に失敗しても『受信中』と最後の値を出し続ける」という、
+/// この PR が直しているのと同じ「実態より良く見える」欠陥を新しく作ってしまう。
+/// `Ok(Unreachable)` なら状態表示が実態と一致し、[`HubService::reconcile`] が
+/// 走るので購読も止まる。`banto-hub-bootstrap` 自身、`UnreachableCause::Transport`
+/// の doc で timeout をこの分類に入れているので、**新しい状態も語彙も増えない**。
+///
+/// 「15 秒で切った」という具体性は捨てず、`reason_override`（自由文の
+/// 購読理由）に載せる。
+async fn with_hub_timeout<F>(future: F) -> Result<HubCall, BantoError>
 where
-    F: std::future::Future<Output = Result<T, BootstrapError>>,
+    F: std::future::Future<Output = Result<HubConnection, BootstrapError>>,
 {
     match tokio::time::timeout(HUB_OPERATION_TIMEOUT, future).await {
-        Ok(result) => result.map_err(to_banto_error),
-        Err(_elapsed) => Err(hub_timeout_error()),
+        Ok(result) => result.map(HubCall::answered).map_err(to_banto_error),
+        Err(_elapsed) => Ok(HubCall::timed_out()),
+    }
+}
+
+impl HubCall {
+    fn answered(connection: HubConnection) -> Self {
+        Self {
+            connection,
+            reason_override: None,
+        }
+    }
+
+    /// 打ち切った往復。`catalog` は `None` - 読めていないものを空の
+    /// スナップショットで表さないのは crate 側の `HubConnection` と同じ規律。
+    fn timed_out() -> Self {
+        Self {
+            connection: HubConnection {
+                status: HubStatus::Unreachable {
+                    cause: banto_hub_bootstrap::UnreachableCause::Transport,
+                },
+                catalog: None,
+            },
+            reason_override: Some(hub_timeout_reason()),
+        }
+    }
+
+    fn timed_out_flag(&self) -> bool {
+        self.reason_override.is_some()
     }
 }
 
@@ -1085,9 +1144,9 @@ impl HubService {
         if record.is_none() {
             return Ok(self.not_configured_view().await);
         }
-        let connection = with_hub_timeout(self.inner.bootstrapper.refresh_catalog()).await?;
+        let call = with_hub_timeout(self.inner.bootstrapper.refresh_catalog()).await?;
         let saved = self.flush().await;
-        self.finish(saved, connection, Trigger::Observe).await
+        self.finish(saved, call, Trigger::Observe).await
     }
 
     /// 購読の状態だけを返す（ポーリング用）。**メモリ上の `watch` を読む
@@ -1223,12 +1282,12 @@ impl HubService {
         if self.inner.mirror.current().is_none() {
             return Ok(());
         }
-        let connection = with_hub_timeout(self.inner.bootstrapper.refresh_catalog()).await?;
+        let call = with_hub_timeout(self.inner.bootstrapper.refresh_catalog()).await?;
         // 保存に失敗しても**突き合わせは必ず行う**（#394 のレビュー P1-2）。
         // 設定 DB が一時的に書けないことと、購読を張り直せるかどうかは別の
         // 話で、前者で後者を止めると値が流れないまま放置される。
         let saved = self.flush().await;
-        self.reconcile(&connection, Trigger::Observe).await;
+        self.reconcile(&call, Trigger::Observe).await;
         saved
     }
 
@@ -1238,10 +1297,9 @@ impl HubService {
     /// [`Trigger::CredentialsChanged`] で**必ず張り直す**。
     pub async fn connect(&self, endpoint: &str) -> Result<HubView, BantoError> {
         let _operation = self.begin_operation().await?;
-        let connection = with_hub_timeout(self.inner.bootstrapper.connect(endpoint.trim())).await?;
+        let call = with_hub_timeout(self.inner.bootstrapper.connect(endpoint.trim())).await?;
         let saved = self.flush().await;
-        self.finish(saved, connection, Trigger::CredentialsChanged)
-            .await
+        self.finish(saved, call, Trigger::CredentialsChanged).await
     }
 
     /// ロックダウン済み Hub 向けの手動連携。平文はキーリングにだけ入る。
@@ -1254,23 +1312,22 @@ impl HubService {
         key: String,
     ) -> Result<HubView, BantoError> {
         let _operation = self.begin_operation().await?;
-        let connection = with_hub_timeout(
+        let call = with_hub_timeout(
             self.inner
                 .bootstrapper
                 .adopt_manual_key(endpoint.trim(), key),
         )
         .await?;
         let saved = self.flush().await;
-        self.finish(saved, connection, Trigger::CredentialsChanged)
-            .await
+        self.finish(saved, call, Trigger::CredentialsChanged).await
     }
 
     /// タグ一覧の再取得。
     pub async fn refresh_catalog(&self) -> Result<HubView, BantoError> {
         let _operation = self.begin_operation().await?;
-        let connection = with_hub_timeout(self.inner.bootstrapper.refresh_catalog()).await?;
+        let call = with_hub_timeout(self.inner.bootstrapper.refresh_catalog()).await?;
         let saved = self.flush().await;
-        self.finish(saved, connection, Trigger::Observe).await
+        self.finish(saved, call, Trigger::Observe).await
     }
 
     /// 選択タグの保存。空でも保存できる（受入条件）。
@@ -1300,9 +1357,16 @@ impl HubService {
         // 「保存もされず、購読も直らない」という一番悪い形になる。
         let saved = self.flush().await;
         match with_hub_timeout(self.inner.bootstrapper.refresh_catalog()).await {
-            Ok(connection) => {
+            Ok(mut call) => {
+                // 打ち切ったときも**保存は成功のまま**返す（再取得は best
+                // effort）。ただし理由は「保存できている」ことが伝わる方に
+                // 差し替える（#395 のレビュー対応）。状態自体は
+                // `Unreachable` なので、突き合わせが古い世代を止める。
+                if call.timed_out_flag() {
+                    call.reason_override = Some(selection_saved_hub_timeout_reason());
+                }
                 let saved_again = self.flush().await;
-                self.reconcile(&connection, Trigger::Observe).await;
+                self.reconcile(&call, Trigger::Observe).await;
                 saved.and(saved_again)?;
             }
             Err(err) => {
@@ -1355,10 +1419,10 @@ impl HubService {
     async fn finish(
         &self,
         saved: Result<(), BantoError>,
-        connection: HubConnection,
+        call: HubCall,
         trigger: Trigger,
     ) -> Result<HubView, BantoError> {
-        let view = self.view(connection, trigger).await;
+        let view = self.view(call, trigger).await;
         saved.map(|()| view)
     }
 
@@ -1376,15 +1440,16 @@ impl HubService {
 
     /// 1 回の往復の答えを組み立てる。**すべての操作の最後**にここを通り、
     /// 購読の突き合わせ（[`Self::reconcile`]）もここで行う。
-    async fn view(&self, connection: HubConnection, trigger: Trigger) -> HubView {
-        self.reconcile(&connection, trigger).await;
+    async fn view(&self, call: HubCall, trigger: Trigger) -> HubView {
+        self.reconcile(&call, trigger).await;
         let record = self.inner.mirror.current();
-        let tags = connection
+        let tags = call
+            .connection
             .catalog
             .as_ref()
             .map(|catalog| catalog.tags.iter().map(HubTagView::from).collect());
         HubView::new(
-            connection.status,
+            call.connection.status,
             record.as_ref(),
             tags,
             self.subscription().await,
@@ -1407,9 +1472,14 @@ impl HubService {
     /// **[`HubStatus`] の 6 状態はここで一切変えない**。購読が張れないこと
     /// は接続設定の失敗ではないので、理由は
     /// [`HubSubscriptionView::reason`] にだけ出る。
-    async fn reconcile(&self, connection: &HubConnection, trigger: Trigger) {
-        self.reconcile_with(&connection.status, connection.catalog.as_ref(), trigger)
-            .await;
+    async fn reconcile(&self, call: &HubCall, trigger: Trigger) {
+        self.reconcile_with_reason(
+            &call.connection.status,
+            call.connection.catalog.as_ref(),
+            trigger,
+            call.reason_override.as_deref(),
+        )
+        .await;
     }
 
     /// [`Self::reconcile`] の本体。`HubConnection` を組み立てられない経路
@@ -1420,6 +1490,26 @@ impl HubService {
         status: &HubStatus,
         catalog: Option<&CatalogSnapshot>,
         trigger: Trigger,
+    ) {
+        self.reconcile_with_reason(status, catalog, trigger, None)
+            .await;
+    }
+
+    /// [`Self::reconcile_with`] の本体。`reason_override` は「この往復は
+    /// タイムアウトで打ち切った」のように、**状態だけでは言えない事情**を
+    /// 購読の理由に載せるためのもの（#395 のレビュー対応）。状態からの通常の
+    /// 分類（`NotConfigured` / `AuthFailed` / それ以外）より優先する -
+    /// `Unreachable` に丸めた結果「Hubに接続できていないため購読していません」
+    /// だけが出ると、**15 秒で打ち切ったという事実**が消えてしまうため。
+    ///
+    /// 世代を張れる（`Connected` + catalog あり）経路では使われない: そこは
+    /// 購読が成立しているので、打ち切りの話はもう関係ない。
+    async fn reconcile_with_reason(
+        &self,
+        status: &HubStatus,
+        catalog: Option<&CatalogSnapshot>,
+        trigger: Trigger,
+        reason_override: Option<&str>,
     ) {
         let record = self.inner.mirror.current();
         let identity = subscription_identity(record.as_ref());
@@ -1438,19 +1528,20 @@ impl HubService {
         else {
             slot.unresolved.clear();
             slot.unsupported.clear();
-            let reason = match status {
-                HubStatus::NotConfigured => REASON_NOT_CONFIGURED.to_owned(),
+            let reason = match (reason_override, status) {
+                (Some(reason), _) => reason.to_owned(),
+                (None, HubStatus::NotConfigured) => REASON_NOT_CONFIGURED.to_owned(),
                 // `AuthFailed` は「キーが無い」と「キーが拒否された」の両方で
                 // 返る: `Bootstrapper::refresh_catalog()` はキーリングに
                 // エントリが無いと `rest_client()` に到達する前にこれを返す。
                 // 原因も次の一手も違うので、ここで分ける。`rest_client()` は
                 // keyring を読むだけで**ネットワークを叩かない**ので、この
                 // 確認で往復は増えない。
-                HubStatus::AuthFailed => match self.inner.bootstrapper.rest_client() {
+                (None, HubStatus::AuthFailed) => match self.inner.bootstrapper.rest_client() {
                     Ok(None) => REASON_NO_KEY.to_owned(),
                     _ => REASON_KEY_REJECTED.to_owned(),
                 },
-                _ => REASON_NOT_CONNECTED.to_owned(),
+                (None, _) => REASON_NOT_CONNECTED.to_owned(),
             };
             slot.stop(Some(reason)).await;
             return;
@@ -1687,27 +1778,84 @@ mod tests {
     // --- #394 レビュー P1-1: 無応答の Hub で操作ロックを握り続けない -------
 
     /// 応答しない相手（`pending()` = 永久に解決しない future）でも
-    /// [`HUB_OPERATION_TIMEOUT`] で必ず打ち切る。`start_paused` なので
+    /// [`HUB_OPERATION_TIMEOUT`] で必ず打ち切り、**エラーではなく 6 状態の
+    /// `Unreachable`** として返す（#395 のレビュー対応）。`start_paused` なので
     /// **実時間は 1 秒も待たない**（時計はランタイムが進める）。
     #[tokio::test(start_paused = true)]
-    async fn a_hub_call_that_never_answers_times_out() {
+    async fn a_hub_call_that_never_answers_becomes_unreachable() {
         let started = tokio::time::Instant::now();
-        let err = with_hub_timeout(std::future::pending::<Result<(), BootstrapError>>())
-            .await
-            .expect_err("応答が返らない相手は打ち切る");
+        let call =
+            with_hub_timeout(std::future::pending::<Result<HubConnection, BootstrapError>>())
+                .await
+                .expect("打ち切りはエラーではなく状態で返す");
         assert!(
             started.elapsed() >= HUB_OPERATION_TIMEOUT,
             "上限までは待つ（短気に切らない）"
         );
-        let message = err.to_string();
-        assert!(
-            message.contains("Hubが応答しません"),
-            "到達不能と同じ次の一手を示す文言: {message}"
+        assert_eq!(
+            call.connection.status,
+            HubStatus::Unreachable {
+                cause: banto_hub_bootstrap::UnreachableCause::Transport
+            },
+            "状態表示が実態と一致する（『接続済み』のまま残さない）"
         );
         assert!(
-            message.contains(&HUB_OPERATION_TIMEOUT.as_secs().to_string()),
-            "もう待っていないことが分かるよう上限を出す: {message}"
+            call.connection.catalog.is_none(),
+            "読めていない catalog を空のスナップショットで表さない"
         );
+        let reason = call
+            .reason_override
+            .expect("打ち切ったという具体性を理由に載せる");
+        assert!(
+            reason.contains(&HUB_OPERATION_TIMEOUT.as_secs().to_string()),
+            "もう待っていないことが分かるよう上限を出す: {reason}"
+        );
+    }
+
+    /// 打ち切りが**購読まで届く**こと: 状態は `Unreachable`、購読は理由付きで
+    /// 停止、catalog は `null`（0 件ではない）。TCP は繋がるが 1 バイトも
+    /// 返さないリスナ＝この PR が直している「無応答」そのものを相手にする。
+    /// 時計は**足場を組み終えてから**止める（`start_paused` にすると、
+    /// SQLite の接続確立が blocking スレッドへ出ている間にランタイムが暇に
+    /// なって時計が飛び、`init_db_memory` のプール取得が即タイムアウトする）。
+    /// 実時間は待たない点は同じ。
+    #[tokio::test]
+    async fn a_hub_that_never_answers_stops_the_subscription_with_the_timeout_reason() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        // accept だけして**何も返さず**接続を握り続ける（drop すると
+        // 切断＝応答になってしまうので保持する）。
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let (_settings, hub) = service_with_keyring(&endpoint, &["alpha"]).await;
+
+        tokio::time::pause();
+        let view = hub.status().await.expect("打ち切りはエラーにしない");
+
+        assert_eq!(
+            view.status.as_str(),
+            "unreachable",
+            "状態表示が実態と一致する"
+        );
+        assert!(view.tags.is_none(), "読めていない一覧を 0 件にしない");
+        assert_eq!(
+            view.subscription.state, "stopped",
+            "接続できていないのに購読が live のまま残らない"
+        );
+        let reason = view.subscription.reason.expect("停止の理由を出す");
+        assert!(
+            reason.contains(&HUB_OPERATION_TIMEOUT.as_secs().to_string()),
+            "『到達不能』に丸めず、打ち切った具体性を残す: {reason}"
+        );
+
+        silent.abort();
     }
 
     /// 打ち切った**後に別の操作が進める**こと。これが直したかったもの:
@@ -1724,7 +1872,7 @@ mod tests {
         let hung = tokio::spawn(async move {
             let _guard = holder.lock().await;
             acquired_tx.send(()).expect("receiver is alive");
-            with_hub_timeout(std::future::pending::<Result<(), BootstrapError>>()).await
+            with_hub_timeout(std::future::pending::<Result<HubConnection, BootstrapError>>()).await
         });
         acquired_rx.await.expect("無応答の操作がロックを取った");
 
@@ -1732,8 +1880,11 @@ mod tests {
         let next = tokio::time::timeout(HUB_OPERATION_TIMEOUT * 4, operation.lock()).await;
         assert!(next.is_ok(), "タイムアウトでガードが落ち、次の操作が進める");
         assert!(
-            hung.await.expect("join").is_err(),
-            "打ち切られた側はエラーを返す"
+            hung.await
+                .expect("join")
+                .expect("打ち切りはエラーにしない")
+                .timed_out_flag(),
+            "打ち切られた側は『打ち切った』と分かる形で返る"
         );
     }
 
