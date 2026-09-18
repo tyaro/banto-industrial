@@ -25,6 +25,13 @@
  *    パレット等 - が選択を変えても壊れないようにするため、応答側の照合を
  *    不変条件として持つ）。
  *
+ *    #394追補: 削除にも同じ欠陥類型があった - 削除の`await`中に別の行を
+ *    選び直すと、応答が返った時点で`selectedX = null`が無条件に走り、
+ *    その行で編集中だった未保存の入力が黙って消える（#378の「未保存の
+ *    入力を黙って捨てない」方針に反する）。`runGuardedDelete`/
+ *    `isDeleteStillCurrent`（下記「A': 削除中の行切替による取り違え」）が
+ *    同じ形の対策をIDだけの照合で提供する。
+ *
  * B. **スケーリングの検証エラーの無表示**: バックエンドの
  *    `Scaling::from_parts()`（`crates/banto-tags/src/scaling.rs`）は
  *    「4項目のうち一部だけ指定」で `field: "scaling"` を返すが、フォームに
@@ -103,6 +110,63 @@ export async function runGuardedSave<TEntity, TStore>(
 			: { kind: 'stale-success' };
 	} catch (err) {
 		return isSaveStillCurrent(pending, readCurrent())
+			? { kind: 'error', err }
+			: { kind: 'stale-error' };
+	}
+}
+
+// --- A': 削除中の行切替による取り違え（#394 追補） --------------------------
+//
+// 保存側と同じ欠陥類型: 削除の`await`中に別の行を選び直すと、応答が返った
+// 時点で`selectedX = null`が無条件に走り、その行で編集中だった未保存の
+// 入力が黙って消える（#378で決めた「未保存の入力を黙って捨てない」方針との
+// 不整合）。削除はフォームストアを持たない（送信するのは対象IDだけで、
+// フォームの中身は関係ない）ため、`SaveGuardToken`のようにストア参照まで
+// 控える必要が無く、IDだけの照合で「まだ同じ行を選んでいるか」を判定できる。
+
+/** 削除開始時に控える対象ID。フォームストアが無いので保存側の`SaveGuardToken`より単純（ID のみ）。 */
+export interface DeleteGuardToken {
+	id: number;
+}
+
+/** 応答が返ってきた時点で「まだ削除開始時と同じ行を選んでいるか」を判定する。 */
+export function isDeleteStillCurrent(
+	pending: DeleteGuardToken,
+	currentId: number | null | undefined
+): boolean {
+	return currentId === pending.id;
+}
+
+export type GuardedDeleteOutcome =
+	| { kind: 'applied' }
+	| { kind: 'stale-success' }
+	| { kind: 'error'; err: unknown }
+	| { kind: 'stale-error' };
+
+/**
+ * 削除リクエスト（`request`）を送ってから、応答が返ってきた時点で
+ * `isDeleteStillCurrent`により「まだ同じ行を選んでいるか」を確認したうえで
+ * 結果を分類する（`runGuardedSave`のID版）。`readCurrentId`は応答が返った
+ * 時点の状態を読む必要があるため遅延評価の関数として渡す。
+ *
+ * - `stale-success`: 削除自体はサーバーで成立した（一覧の再読み込みは
+ *   行ってよい）が、ユーザーは既に別の行を選んでいるので、その選択を
+ *   `null`にしない（＝別の行の未保存入力を消さない）。
+ * - `stale-error`: 失敗はもう見えている行と無関係なので、トーストは
+ *   出さない（保存側の`stale-error`と同じ考え方）。
+ */
+export async function runGuardedDelete(
+	pending: DeleteGuardToken,
+	request: Promise<void>,
+	readCurrentId: () => number | null | undefined
+): Promise<GuardedDeleteOutcome> {
+	try {
+		await request;
+		return isDeleteStillCurrent(pending, readCurrentId())
+			? { kind: 'applied' }
+			: { kind: 'stale-success' };
+	} catch (err) {
+		return isDeleteStillCurrent(pending, readCurrentId())
 			? { kind: 'error', err }
 			: { kind: 'stale-error' };
 	}

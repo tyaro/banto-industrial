@@ -7,11 +7,14 @@ import { describe, expect, it } from 'vitest';
 import {
 	isSaveStillCurrent,
 	runGuardedSave,
+	isDeleteStillCurrent,
+	runGuardedDelete,
 	schemaWireFields,
 	splitServerFieldErrors,
 	joinFieldErrorMessages,
 	wireFieldName,
-	type SaveGuardToken
+	type SaveGuardToken,
+	type DeleteGuardToken
 } from './tagsPageLogic';
 
 // --- A: isSaveStillCurrent / runGuardedSave --------------------------------
@@ -150,6 +153,77 @@ describe('runGuardedSave', () => {
 		resolve({ id: 1 });
 
 		expect(await outcomePromise).toEqual({ kind: 'stale-success' });
+	});
+});
+
+// --- A': isDeleteStillCurrent / runGuardedDelete（#394 追補） ---------------
+
+describe('isDeleteStillCurrent', () => {
+	it('IDが一致すれば true', () => {
+		expect(isDeleteStillCurrent({ id: 1 }, 1)).toBe(true);
+	});
+
+	it('IDが違えば false（別の行が選ばれている）', () => {
+		expect(isDeleteStillCurrent({ id: 1 }, 2)).toBe(false);
+	});
+
+	it('現在の選択が無い（null/undefined）場合も false', () => {
+		expect(isDeleteStillCurrent({ id: 1 }, null)).toBe(false);
+		expect(isDeleteStillCurrent({ id: 1 }, undefined)).toBe(false);
+	});
+});
+
+describe('runGuardedDelete', () => {
+	it('一致していれば成功応答を適用できる（applied）', async () => {
+		const pending: DeleteGuardToken = { id: 1 };
+		const outcome = await runGuardedDelete(pending, Promise.resolve(), () => 1);
+		expect(outcome).toEqual({ kind: 'applied' });
+	});
+
+	it('一致していれば失敗応答も適用できる（error）', async () => {
+		const pending: DeleteGuardToken = { id: 1 };
+		const err = new Error('boom');
+		const outcome = await runGuardedDelete(pending, Promise.reject(err), () => 1);
+		expect(outcome).toEqual({ kind: 'error', err });
+	});
+
+	// #394追補本体: 行Aの削除中に行Bへ選択が移り、Aの削除応答が遅れて
+	// 返ってくるシナリオ。応答後もBの選択が保たれ（selectedX = null に
+	// ならない）、Bのフォーム内容（未保存の入力）が消えないことを固定する。
+	it('削除中に別行へ選択が移ると、遅れて届く成功応答は stale-success になり選択は変わらない', async () => {
+		let currentId: number | null = 1;
+
+		const pendingA: DeleteGuardToken = { id: 1 };
+		const { promise, resolve } = deferred<void>();
+
+		const outcomePromise = runGuardedDelete(pendingA, promise, () => currentId);
+
+		// Aの削除応答を待つ間にBの行を選択する。
+		currentId = 2;
+
+		// Aの削除は成立して返ってくる。
+		resolve();
+		const outcome = await outcomePromise;
+
+		expect(outcome).toEqual({ kind: 'stale-success' });
+		// Bの選択は影響を受けていない（selectedX = null にされていない）。
+		expect(currentId).toBe(2);
+	});
+
+	it('削除中に別行へ選択が移ると、遅れて届く失敗応答は stale-error になりトーストを出さない', async () => {
+		let currentId: number | null = 1;
+
+		const pendingA: DeleteGuardToken = { id: 1 };
+		const { promise, reject } = deferred<void>();
+
+		const outcomePromise = runGuardedDelete(pendingA, promise, () => currentId);
+
+		currentId = 2;
+
+		reject(new Error('この接続を使用している収集グループが1件あるため削除できません'));
+		const outcome = await outcomePromise;
+
+		expect(outcome).toEqual({ kind: 'stale-error' });
 	});
 });
 

@@ -79,10 +79,12 @@
 	} from '$lib/banto/tagRegistryAdmin';
 	import {
 		runGuardedSave,
+		runGuardedDelete,
 		schemaWireFields,
 		splitServerFieldErrors,
 		joinFieldErrorMessages,
-		type SaveGuardToken
+		type SaveGuardToken,
+		type DeleteGuardToken
 	} from './tagsPageLogic';
 
 	const available = isTagRegistryAvailable();
@@ -315,14 +317,16 @@
 	let selectedConnection: PlcConnection | null = $state(null);
 	let editConnectionStore = $state(untrack(() => createFormStore(connectionSchema(PLC_EDIT))));
 	let savingConnection = $state(false);
+	let deletingConnection = $state(false);
 
 	/**
-	 * #391 レビュー A: 保存中は選択行を切り替えさせない。1文字だけの
-	 * ガードでは不十分な理由（応答側の照合も不変条件として持つ理由）は
-	 * `runGuardedSave`（`tagsPageLogic.ts`）のdoc comment参照。
+	 * #391 レビュー A / #394 追補: 保存中・削除中は選択行を切り替えさせない。
+	 * 1文字だけのガードでは不十分な理由（応答側の照合も不変条件として持つ
+	 * 理由）は`runGuardedSave`/`runGuardedDelete`（`tagsPageLogic.ts`）の
+	 * doc comment参照。
 	 */
 	function selectConnection(conn: PlcConnection): void {
-		if (!canWrite || savingConnection) return;
+		if (!canWrite || savingConnection || deletingConnection) return;
 		selectedConnection = conn;
 		editConnectionStore = createFormStore(
 			connectionSchema(PLC_EDIT),
@@ -371,16 +375,46 @@
 		}
 	}
 
+	/**
+	 * #394 追補: 削除の`await`中に別の行を選び直すと、応答が返った時点で
+	 * `selectedConnection = null`が無条件に走り、その行で編集中だった
+	 * 未保存の入力が黙って消えていた（#378の「未保存の入力を黙って捨て
+	 * ない」方針に反する）。保存側と同じ形で「削除中は選択・削除ボタンを
+	 * 止める」+「応答時に対象IDを照合する」の両方を行う
+	 * （`runGuardedDelete`のdoc comment参照）。
+	 */
 	async function handleDeleteConnection(): Promise<void> {
-		if (!selectedConnection || savingConnection) return;
+		if (!selectedConnection || savingConnection || deletingConnection) return;
 		if (!window.confirm(`${selectedConnection.name} を削除しますか？`)) return;
+		const pending: DeleteGuardToken = { id: selectedConnection.id };
+		deletingConnection = true;
 		try {
-			await deletePlcConnection(selectedConnection.id);
-			toastStore.push('success', '削除しました');
-			selectedConnection = null;
-			await reloadConnections();
-		} catch (err) {
-			toastStore.push('error', errorMessage(err));
+			const outcome = await runGuardedDelete(
+				pending,
+				deletePlcConnection(selectedConnection.id),
+				() => selectedConnection?.id
+			);
+			switch (outcome.kind) {
+				case 'applied':
+					toastStore.push('success', '削除しました');
+					selectedConnection = null;
+					await reloadConnections();
+					break;
+				case 'stale-success':
+					// 既に別の接続を選び直している - その選択（未保存の入力）を
+					// 消さない。一覧の鮮度だけは保つ。
+					await reloadConnections();
+					break;
+				case 'error':
+					toastStore.push('error', errorMessage(outcome.err));
+					break;
+				case 'stale-error':
+					// 古いエラーを今開いている別の接続に出さない（保存側の
+					// stale-errorと同じ考え方）。
+					break;
+			}
+		} finally {
+			deletingConnection = false;
 		}
 	}
 
@@ -524,10 +558,11 @@
 	let selectedGroup: CollectionGroup | null = $state(null);
 	let editGroupStore = $state(untrack(() => createFormStore(groupSchema(GROUP_EDIT))));
 	let savingGroup = $state(false);
+	let deletingGroup = $state(false);
 
-	/** #391 レビュー A: 保存中は選択行を切り替えさせない（理由は `selectConnection` 参照）。 */
+	/** #391 レビュー A / #394 追補: 保存中・削除中は選択行を切り替えさせない（理由は `selectConnection` 参照）。 */
 	function selectGroup(group: CollectionGroup): void {
-		if (!canWrite || savingGroup) return;
+		if (!canWrite || savingGroup || deletingGroup) return;
 		selectedGroup = group;
 		editGroupStore = createFormStore(groupSchema(GROUP_EDIT), groupFormValues(GROUP_EDIT, group));
 	}
@@ -569,16 +604,35 @@
 		}
 	}
 
+	/** #394 追補: 削除中の応答取り違え対策（理由は `handleDeleteConnection` 参照）。 */
 	async function handleDeleteGroup(): Promise<void> {
-		if (!selectedGroup || savingGroup) return;
+		if (!selectedGroup || savingGroup || deletingGroup) return;
 		if (!window.confirm(`${selectedGroup.name} を削除しますか？`)) return;
+		const pending: DeleteGuardToken = { id: selectedGroup.id };
+		deletingGroup = true;
 		try {
-			await deleteCollectionGroup(selectedGroup.id);
-			toastStore.push('success', '削除しました');
-			selectedGroup = null;
-			await reloadGroups();
-		} catch (err) {
-			toastStore.push('error', errorMessage(err));
+			const outcome = await runGuardedDelete(
+				pending,
+				deleteCollectionGroup(selectedGroup.id),
+				() => selectedGroup?.id
+			);
+			switch (outcome.kind) {
+				case 'applied':
+					toastStore.push('success', '削除しました');
+					selectedGroup = null;
+					await reloadGroups();
+					break;
+				case 'stale-success':
+					await reloadGroups();
+					break;
+				case 'error':
+					toastStore.push('error', errorMessage(outcome.err));
+					break;
+				case 'stale-error':
+					break;
+			}
+		} finally {
+			deletingGroup = false;
 		}
 	}
 
@@ -749,10 +803,11 @@
 	let selectedTag: Tag | null = $state(null);
 	let editTagStore = $state(untrack(() => createFormStore(tagSchema(TAG_EDIT))));
 	let savingTag = $state(false);
+	let deletingTag = $state(false);
 
-	/** #391 レビュー A: 保存中は選択行を切り替えさせない（理由は `selectConnection` 参照）。 */
+	/** #391 レビュー A / #394 追補: 保存中・削除中は選択行を切り替えさせない（理由は `selectConnection` 参照）。 */
 	function selectTag(tag: Tag): void {
-		if (!canWrite || savingTag) return;
+		if (!canWrite || savingTag || deletingTag) return;
 		selectedTag = tag;
 		editTagStore = createFormStore(tagSchema(TAG_EDIT), tagFormValues(TAG_EDIT, tag));
 	}
@@ -791,16 +846,35 @@
 		}
 	}
 
+	/** #394 追補: 削除中の応答取り違え対策（理由は `handleDeleteConnection` 参照）。 */
 	async function handleDeleteTag(): Promise<void> {
-		if (!selectedTag || savingTag) return;
+		if (!selectedTag || savingTag || deletingTag) return;
 		if (!window.confirm(`${selectedTag.name} を削除しますか？`)) return;
+		const pending: DeleteGuardToken = { id: selectedTag.id };
+		deletingTag = true;
 		try {
-			await deleteTag(selectedTag.id);
-			toastStore.push('success', '削除しました');
-			selectedTag = null;
-			await reloadTags();
-		} catch (err) {
-			toastStore.push('error', errorMessage(err));
+			const outcome = await runGuardedDelete(
+				pending,
+				deleteTag(selectedTag.id),
+				() => selectedTag?.id
+			);
+			switch (outcome.kind) {
+				case 'applied':
+					toastStore.push('success', '削除しました');
+					selectedTag = null;
+					await reloadTags();
+					break;
+				case 'stale-success':
+					await reloadTags();
+					break;
+				case 'error':
+					toastStore.push('error', errorMessage(outcome.err));
+					break;
+				case 'stale-error':
+					break;
+			}
+		} finally {
+			deletingTag = false;
 		}
 	}
 
@@ -843,9 +917,14 @@
 				{#if connectionsLoading && connections.length === 0}
 					<p class="loading">読み込み中…</p>
 				{:else}
-					<!-- #391 レビュー A: 保存中は行の選択を操作できないようにする
-					（`selectConnection`自体のガードに加え、見た目でも伝える）。 -->
-					<div class="grid-wrap" class:saving={savingConnection} aria-disabled={savingConnection}>
+					<!-- #391 レビュー A / #394 追補: 保存中・削除中は行の選択を操作
+					できないようにする（`selectConnection`自体のガードに加え、
+					見た目でも伝える）。 -->
+					<div
+						class="grid-wrap"
+						class:saving={savingConnection || deletingConnection}
+						aria-disabled={savingConnection || deletingConnection}
+					>
 						<BantoGrid
 							rows={connections}
 							columns={connectionColumns}
@@ -870,7 +949,7 @@
 							type="button"
 							class="danger"
 							onclick={handleDeleteConnection}
-							disabled={savingConnection}
+							disabled={savingConnection || deletingConnection}
 						>
 							削除
 						</button>
@@ -907,7 +986,11 @@
 				{#if groupsLoading && groups.length === 0}
 					<p class="loading">読み込み中…</p>
 				{:else}
-					<div class="grid-wrap" class:saving={savingGroup} aria-disabled={savingGroup}>
+					<div
+						class="grid-wrap"
+						class:saving={savingGroup || deletingGroup}
+						aria-disabled={savingGroup || deletingGroup}
+					>
 						<BantoGrid
 							rows={groups}
 							columns={groupColumns}
@@ -928,7 +1011,12 @@
 						submitting={savingGroup}
 						submitLabel="保存"
 					>
-						<button type="button" class="danger" onclick={handleDeleteGroup} disabled={savingGroup}>
+						<button
+							type="button"
+							class="danger"
+							onclick={handleDeleteGroup}
+							disabled={savingGroup || deletingGroup}
+						>
 							削除
 						</button>
 					</BantoForm>
@@ -964,7 +1052,11 @@
 				{#if tagsLoading && tags.length === 0}
 					<p class="loading">読み込み中…</p>
 				{:else}
-					<div class="grid-wrap" class:saving={savingTag} aria-disabled={savingTag}>
+					<div
+						class="grid-wrap"
+						class:saving={savingTag || deletingTag}
+						aria-disabled={savingTag || deletingTag}
+					>
 						<BantoGrid
 							rows={tags}
 							columns={tagColumns}
@@ -985,7 +1077,12 @@
 						submitting={savingTag}
 						submitLabel="保存"
 					>
-						<button type="button" class="danger" onclick={handleDeleteTag} disabled={savingTag}>
+						<button
+							type="button"
+							class="danger"
+							onclick={handleDeleteTag}
+							disabled={savingTag || deletingTag}
+						>
 							削除
 						</button>
 					</BantoForm>
