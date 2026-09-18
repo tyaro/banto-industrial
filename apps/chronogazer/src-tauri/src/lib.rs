@@ -1618,6 +1618,28 @@ async fn backups_cancel_restore(state: State<'_, AppState>) -> Result<(), BantoE
 
 // --- #332: Hub 接続 ----------------------------------------------------------
 
+/// Role check shared by every `hub_*` command (`admin`-only, same floor as
+/// the other settings/server commands).
+///
+/// The DENIAL audit `resource` is **`"hub"`**, matching the REST side's
+/// `hub_router` (`RoleGuard { resource: "hub", .. }` in
+/// `chronogazer_core::rest`). Before this, the Tauri commands passed
+/// `"settings"`, so the same rejected operation was recorded under two
+/// different resources depending on which transport the caller used, and a
+/// "show me every denial against hub" filter silently missed the Tauri half
+/// (`users`/`backups`/`audit_log` have always agreed across both).
+///
+/// The SUCCESS entries below deliberately stay
+/// `action: "settings_change"` / `resource: "settings"` on BOTH transports:
+/// they already agree with each other, and the Hub endpoint/key/selection
+/// genuinely are part of this app's settings, so re-tagging them would
+/// change how existing audit logs read (a `settings` history would suddenly
+/// lose its Hub entries). The asymmetry - denials under `hub`, successes
+/// under `settings` - is therefore intentional and matches REST exactly.
+async fn require_hub_admin(state: &AppState) -> Result<UserIdentity, BantoError> {
+    require_role(state, Role::Admin, "hub").await
+}
+
 /// `GET`-ish command: 保存済み設定での Hub 接続状態（6 状態）とタグ一覧。
 /// `admin` 限定（他のサーバー/設定系コマンドと同じ下限）。
 ///
@@ -1625,7 +1647,7 @@ async fn backups_cancel_restore(state: State<'_, AppState>) -> Result<(), BantoE
 /// 増えないようにするため（発行は `hub_connect` だけ）。
 #[tauri::command]
 async fn hub_status(state: State<'_, AppState>) -> Result<HubView, BantoError> {
-    require_role(&state, Role::Admin, "settings").await?;
+    require_hub_admin(&state).await?;
     state.hub.status().await
 }
 
@@ -1633,7 +1655,7 @@ async fn hub_status(state: State<'_, AppState>) -> Result<HubView, BantoError> {
 /// スコープのキーを自己発行）。`admin` 限定。
 #[tauri::command]
 async fn hub_connect(state: State<'_, AppState>, endpoint: String) -> Result<HubView, BantoError> {
-    let actor = require_role(&state, Role::Admin, "settings").await?;
+    let actor = require_hub_admin(&state).await?;
     let view = state.hub.connect(&endpoint).await?;
     // 監査 detail に入れてよいのは接続先と結果の状態まで。平文キーはどの
     // 経路にも出さない。
@@ -1662,14 +1684,14 @@ async fn hub_connect(state: State<'_, AppState>, endpoint: String) -> Result<Hub
 /// のでポーリングには使わない。
 #[tauri::command]
 async fn hub_subscription(state: State<'_, AppState>) -> Result<HubSubscriptionView, BantoError> {
-    require_role(&state, Role::Admin, "settings").await?;
+    require_hub_admin(&state).await?;
     Ok(state.hub.subscription().await)
 }
 
 /// タグ一覧の再取得。`admin` 限定。
 #[tauri::command]
 async fn hub_refresh_catalog(state: State<'_, AppState>) -> Result<HubView, BantoError> {
-    require_role(&state, Role::Admin, "settings").await?;
+    require_hub_admin(&state).await?;
     state.hub.refresh_catalog().await
 }
 
@@ -1679,7 +1701,7 @@ async fn hub_set_selected_tags(
     state: State<'_, AppState>,
     tags: Vec<String>,
 ) -> Result<(), BantoError> {
-    let actor = require_role(&state, Role::Admin, "settings").await?;
+    let actor = require_hub_admin(&state).await?;
     let count = tags.len();
     state.hub.set_selected_tags(tags).await?;
     state
@@ -1710,7 +1732,7 @@ async fn hub_adopt_manual_key(
     endpoint: String,
     key: String,
 ) -> Result<HubView, BantoError> {
-    let actor = require_role(&state, Role::Admin, "settings").await?;
+    let actor = require_hub_admin(&state).await?;
     let view = state.hub.adopt_manual_key(&endpoint, key).await?;
     state
         .audit
@@ -1737,7 +1759,7 @@ async fn hub_adopt_manual_key(
 /// doc comment参照）。`admin` 限定。
 #[tauri::command]
 async fn hub_disconnect(state: State<'_, AppState>) -> Result<HubView, BantoError> {
-    let actor = require_role(&state, Role::Admin, "settings").await?;
+    let actor = require_hub_admin(&state).await?;
     let view = state.hub.disconnect().await?;
     state
         .audit
@@ -2601,6 +2623,80 @@ mod tests {
                 .any(|r| r.action == "restore_cancelled"),
             "expected a restore_cancelled entry, got {:?}",
             audit_after_cancel.rows
+        );
+    }
+
+    // --- #332 Hub: denial audit resource ------------------------------------
+
+    /// Review P2-D: a denied `hub_*` command must be recorded with
+    /// `resource: "hub"`, the same tag the REST side's `hub_router`
+    /// (`RoleGuard { resource: "hub", .. }`) uses - otherwise "every denial
+    /// against hub" misses whichever transport disagrees. Every `hub_*`
+    /// command goes through [`require_hub_admin`], so exercising that one
+    /// function covers all seven call sites.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn denied_hub_command_is_recorded_under_the_hub_resource() {
+        let state = app_state().await;
+        let viewer = state
+            .users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create_user");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+
+        let err = require_hub_admin(&state)
+            .await
+            .expect_err("a viewer must not pass the hub admin guard");
+        assert!(matches!(err, BantoError::Forbidden));
+
+        let audit = state
+            .audit
+            .list(ListParams::default())
+            .await
+            .expect("audit list");
+        let entry = audit
+            .rows
+            .iter()
+            .find(|r| r.action == "denied")
+            .unwrap_or_else(|| panic!("expected a denied entry, got {:?}", audit.rows));
+        assert_eq!(
+            entry.resource, "hub",
+            "denials must be tagged like REST's hub_router, not \"settings\""
+        );
+        assert_eq!(entry.actor_username.as_deref(), Some("viewer"));
+        assert_eq!(entry.actor_role.as_deref(), Some("viewer"));
+        assert_eq!(entry.origin, "tauri");
+        assert_eq!(entry.result, "denied");
+    }
+
+    /// The other half of the intentional asymmetry (review P2-D): an `admin`
+    /// passes the guard and NOTHING is recorded by it - the success entries
+    /// the `hub_*` commands write themselves stay
+    /// `action: "settings_change"` / `resource: "settings"` (unchanged, and
+    /// already identical on the REST side).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn allowed_hub_command_records_no_denial() {
+        let state = app_state().await;
+        let admin = state
+            .users
+            .create_user("admin", "password123", "管理者", Role::Admin)
+            .await
+            .expect("create_user");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(admin);
+
+        require_hub_admin(&state)
+            .await
+            .expect("an admin must pass the hub admin guard");
+
+        let audit = state
+            .audit
+            .list(ListParams::default())
+            .await
+            .expect("audit list");
+        assert!(
+            audit.rows.iter().all(|r| r.action != "denied"),
+            "a permitted call must not record a denial: {:?}",
+            audit.rows
         );
     }
 }

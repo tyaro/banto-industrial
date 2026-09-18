@@ -379,6 +379,128 @@ export function isPollGenerationCurrent(sentAtGeneration: number, current: numbe
 }
 
 /**
+ * 購読状態の取得が「恒久的に失敗している」と見なす連続失敗回数（レビュー
+ * P2-A）。`SUBSCRIPTION_POLL_MS`（2 秒）× この回数 ≒ 4 秒。
+ *
+ * **1 回では切り替えない**: 一過性の取りこぼし（スリープ復帰直後の 1 発など）
+ * で表示を揺らさないため。逆に数を増やしすぎると、サーバープロセスが落ちた
+ * あとも「受信中」と最後の値を出し続ける時間が延びる。
+ */
+export const SUBSCRIPTION_POLL_FAILURE_LIMIT = 2;
+
+/**
+ * 連続失敗回数の遷移（純関数）。**成功で 0 に戻す**のが要点 - 復帰したら
+ * 1 回の成功で通常表示に戻る。
+ */
+export function nextPollFailureCount(current: number, outcome: 'ok' | 'failed'): number {
+	return outcome === 'ok' ? 0 : current + 1;
+}
+
+/**
+ * 購読状態の表示が「今の状態ではない」（取得できていない）か（純関数）。
+ *
+ * これが true の間も**値の表は消さない**: 消すと「0 件」に潰れて別の嘘に
+ * なる。代わりに見出しで言い切らず（[`hubSubscriptionHeadline`]）、最後に
+ * 取得できた時刻を添える（[`hubPollStaleNote`]）。
+ */
+export function isSubscriptionStale(consecutiveFailures: number): boolean {
+	return consecutiveFailures >= SUBSCRIPTION_POLL_FAILURE_LIMIT;
+}
+
+/**
+ * 購読状態の見出し（純関数）。取得できていない間は**「受信中」と言い切ら
+ * ない** - 既存の状態名（[`hubSubscriptionLabel`]）はそのまま残し、
+ * 「取得できていない」ことだけを添える（状態名を増やすと 7 状態目を
+ * 作ったことになり、`banto-tagclient` の状態と 1 対 1 で無くなる）。
+ */
+export function hubSubscriptionHeadline(state: HubSubscriptionState, stale: boolean): string {
+	const label = hubSubscriptionLabel(state);
+	return stale ? `${label}（状態を取得できていません）` : label;
+}
+
+/**
+ * 取得できていない間に添える一文（純関数）。**いつの表示なのか**を出す -
+ * 時刻が無いまま古い値だけを見せると、それが今の値に見えてしまう。
+ *
+ * `lastPolledAt` はブラウザ側の epoch ミリ秒（最後に購読状態を取得できた
+ * 時刻）で、Hub 側の値の時刻（`HubValue.t`）とは別物。
+ */
+export function hubPollStaleNote(lastPolledAt: number | null): string {
+	if (lastPolledAt === null) {
+		return '購読状態を取得できていません（まだ一度も取得できていません）。下の表示は最新ではありません。';
+	}
+	return `購読状態を取得できていません。下の表示は${hubTimeLabel(lastPolledAt)}に取得したもので、最新ではありません。`;
+}
+
+// --- レビュー P2-B: 編集中（未保存）のタグ選択を黙って捨てない -------------
+//
+// `applyView()` はサーバーの `selectedTags` をそのまま `selected` に入れて
+// いたため、チェックを変えてから「選択を保存」の隣にある「一覧を更新」
+// （や「接続」）を押すと、確認も警告もなく元に戻っていた。#378 で決めた
+// 「未保存の入力を黙って捨てない」方針の対象から、ここだけ漏れていた。
+
+/** 2 つの選択が同じ集合か（純関数）。並び順は問わない - 画面のチェックは順序を持たない。 */
+export function sameSelection(a: readonly string[], b: readonly string[]): boolean {
+	if (a.length !== b.length) return false;
+	const inB = new Set(b);
+	return a.every((name) => inB.has(name));
+}
+
+/**
+ * サーバーから届いた view を反映するとき、画面に出す選択（純関数）。
+ *
+ * **未保存の変更があるときはサーバーの値で上書きしない**。`status`/`tags`/
+ * `subscription`/`keyName` など他のフィールドは従来どおり上書きしてよい -
+ * 問題になるのは編集中の `selected` だけ。
+ */
+export function applyServerSelection(
+	current: readonly string[],
+	serverSelected: readonly string[],
+	unsaved: boolean
+): string[] {
+	return unsaved ? [...current] : [...serverSelected];
+}
+
+/**
+ * 「サーバー側の選択と異なります」の注記と、明示的に捨てる導線（「サーバーの
+ * 内容に戻す」）を出すか（純関数）。
+ *
+ * 未保存でも**中身が同じに戻っている**なら出さない（触っただけで元に戻した
+ * ときに警告を出しても、直す対象が無い）。
+ */
+export function showsServerSelectionDiff(
+	current: readonly string[],
+	serverSelected: readonly string[],
+	unsaved: boolean
+): boolean {
+	return unsaved && !sameSelection(current, serverSelected);
+}
+
+/**
+ * 選択の編集状態（未保存フラグ）に何が起きたか。`applyView` は**この一覧に
+ * 無い**: サーバーからの反映は未保存フラグを動かさない（未保存なら保ち、
+ * 未保存でなければ保たれるものが無い）。
+ */
+export type SelectionEvent = 'edited' | 'saved' | 'discarded' | 'disconnected';
+
+/**
+ * 未保存フラグの遷移（純関数、総当たりでテストする）。
+ *
+ * `disconnected` で false にしてよいのは、**切断は接続レコードごと消す**
+ * から - 保存先が無くなるので、未保存の選択を残しても戻す先が無い。
+ */
+export function nextSelectionUnsaved(current: boolean, event: SelectionEvent): boolean {
+	switch (event) {
+		case 'edited':
+			return true;
+		case 'saved':
+		case 'discarded':
+		case 'disconnected':
+			return false;
+	}
+}
+
+/**
  * 未解決・購読不可の一覧に添える「残りはどうなっているか」の一文（純関数）。
  *
  * 1 件も購読できていないのに「残りのタグは購読しています」と言うと**嘘に

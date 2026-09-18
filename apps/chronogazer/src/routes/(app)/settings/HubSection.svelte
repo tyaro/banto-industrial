@@ -17,6 +17,13 @@
 	 * - ポーリングは**この設定ページを開いている間だけ**（`hub_subscription`
 	 *   / `GET /api/hub/subscription` はメモリを読むだけでネットワークを
 	 *   叩かない）。タブが隠れている間は止める。
+	 * - **ポーリングが恒久的に失敗したら、そう言う**（レビュー P2-A）。
+	 *   2 回連続で失敗したら見出しで「受信中」と言い切らず、値の表は残した
+	 *   まま「いつ取得できた表示か」を添える。トーストは出さない（明示操作の
+	 *   エラー表示を上書きしないという既存の設計どおり）。
+	 * - **未保存のタグ選択を黙って捨てない**（レビュー P2-B、#378 の方針）。
+	 *   「一覧を更新」「接続」はサーバーの選択で編集中のチェックを上書き
+	 *   しない。代わりに注記と「サーバーの内容に戻す」を出す。
 	 *
 	 * 平文の API キーは画面に出さない: 手動連携の入力欄は
 	 * `type="password"`、応答型（`HubView`）にキー欄は無い。
@@ -26,23 +33,29 @@
 	import { sessionStore } from '$lib/session.svelte';
 	import {
 		adoptHubKey,
+		applyServerSelection,
 		connectHub,
 		disconnectHub,
 		getHubStatus,
 		getHubSubscription,
 		hubLastValueLabel,
+		hubPollStaleNote,
 		hubRemainderNote,
 		hubStatusDetail,
 		hubStatusLabel,
 		hubSubscriptionDetail,
-		hubSubscriptionLabel,
+		hubSubscriptionHeadline,
 		hubTimeLabel,
 		isHubAvailable,
 		isPollGenerationCurrent,
 		isPollResultFresh,
+		isSubscriptionStale,
+		nextPollFailureCount,
+		nextSelectionUnsaved,
 		refreshHubCatalog,
 		setHubSelectedTags,
 		showManualKeyEntry,
+		showsServerSelectionDiff,
 		type HubStatus,
 		type HubSubscription,
 		type HubTag,
@@ -58,8 +71,27 @@
 	let status = $state<HubStatus>({ state: 'notConfigured' });
 	let tags = $state<HubTag[] | null>(null);
 	let selected = $state<string[]>([]);
+	/**
+	 * 最後にサーバーから届いた選択（レビュー P2-B）。編集中の `selected` と
+	 * 別に持つのは、「サーバーの内容に戻す」で戻す先と、注記を出すかどうかの
+	 * 判定（[`showsServerSelectionDiff`]）に要るため。
+	 */
+	let serverSelected = $state<string[]>([]);
+	/** 選択に未保存の変更があるか（遷移は `nextSelectionUnsaved`）。 */
+	let selectionUnsaved = $state(false);
+	const selectionDiffers = $derived(
+		showsServerSelectionDiff(selected, serverSelected, selectionUnsaved)
+	);
 	let keyName = $state<string | null>(null);
 	let subscription = $state<HubSubscription | null>(null);
+	/**
+	 * 購読状態のポーリングが連続で失敗した回数（成功で 0 に戻る）と、最後に
+	 * 取得できた時刻（レビュー P2-A）。`SUBSCRIPTION_POLL_FAILURE_LIMIT`
+	 * 回で「取得できていない」表示に切り替える。
+	 */
+	let pollFailures = $state(0);
+	let lastPolledAt = $state<number | null>(null);
+	const subscriptionStale = $derived(isSubscriptionStale(pollFailures));
 	/**
 	 * `lastError` を独立した行で出すか。`stopped` かつ `reason` が無いときは
 	 * `hubSubscriptionDetail` がエラーを文中に入れるので、二重に出さない。
@@ -101,17 +133,35 @@
 		appliedSeq += 1;
 	}
 
+	/**
+	 * 購読状態を「今この瞬間の実物として受け取れた」と記録する（レビュー
+	 * P2-A）。ポーリングだけでなく明示操作の応答も購読状態を運んでくるので、
+	 * どちらもここを通す - 通さないと、明示操作で取り直した直後に「取得でき
+	 * ていません」が残る。
+	 */
+	function markSubscriptionFresh(): void {
+		pollFailures = nextPollFailureCount(pollFailures, 'ok');
+		lastPolledAt = Date.now();
+	}
+
 	function applyView(view: HubView): void {
 		beginExplicitChange();
 		status = view.status;
 		configured = view.endpoint !== null;
 		keyName = view.keyName;
-		selected = [...view.selectedTags];
+		serverSelected = [...view.selectedTags];
+		// レビュー P2-B: 未保存の選択はサーバーの値で黙って上書きしない
+		// （#378「未保存の入力を黙って捨てない」）。上書きしなかったことは
+		// `selectionDiffers` の注記と「サーバーの内容に戻す」で伝える。
+		// `status`/`tags`/`subscription`/`keyName` は従来どおり上書きする -
+		// 編集中なのは選択だけ。
+		selected = applyServerSelection(selected, view.selectedTags, selectionUnsaved);
 		// `null`（この往復では catalog を読めていない）と `[]`（読めた結果
 		// タグ 0 件）は別物。前者では前回の一覧を残さず消す - 状態表示の
 		// 「接続済み・利用可能なタグなし」と食い違わせないため。
 		tags = view.tags;
 		subscription = view.subscription;
+		markSubscriptionFresh();
 		if (view.endpoint) endpointDraft = view.endpoint;
 	}
 
@@ -162,8 +212,12 @@
 			// 保存は view を返さない（204）が、設定も購読も変える明示操作。
 			// 保存中に飛んでいたポーリング応答を捨てるために番号を進める。
 			beginExplicitChange();
-			await setHubSelectedTags(selected);
-			savedNotice = `選択したタグ（${selected.length}件）を保存しました。`;
+			const saving = [...selected];
+			await setHubSelectedTags(saving);
+			// 保存できた内容がサーバー側の選択になり、未保存の変更は無くなる。
+			serverSelected = saving;
+			selectionUnsaved = nextSelectionUnsaved(selectionUnsaved, 'saved');
+			savedNotice = `選択したタグ（${saving.length}件）を保存しました。`;
 			// バックエンドは保存時に古い世代を止めている。次のポーリング
 			// （最大 2 秒）まで停止済みの古い値を「受信中」として出し続けない
 			// よう、ここで取り直して反映する。読み直しの失敗は保存の失敗では
@@ -179,6 +233,11 @@
 
 	async function disconnect(): Promise<void> {
 		await run(async () => {
+			// レビュー P2-B: 切断は接続レコードごと消す（選択の保存先が無く
+			// なる）ので、未保存の選択も一緒に破棄してよい - 残しても戻す先が
+			// 無い。`applyView` の前に降ろすのは、サーバーが返す空の選択を
+			// そのまま反映させるため。
+			selectionUnsaved = nextSelectionUnsaved(selectionUnsaved, 'disconnected');
 			applyView(await disconnectHub());
 			tags = null;
 			configured = false;
@@ -190,6 +249,13 @@
 		selected = checked
 			? [...selected, externalName]
 			: selected.filter((name) => name !== externalName);
+		selectionUnsaved = nextSelectionUnsaved(selectionUnsaved, 'edited');
+	}
+
+	/** レビュー P2-B: 未保存の選択を**明示的に**捨てる導線（黙って捨てない代わり）。 */
+	function discardSelection(): void {
+		selected = [...serverSelected];
+		selectionUnsaved = nextSelectionUnsaved(selectionUnsaved, 'discarded');
 	}
 
 	// --- #383 段階1: 購読状態のポーリング -----------------------------------
@@ -221,12 +287,19 @@
 	function applySubscription(next: HubSubscription): void {
 		beginExplicitChange();
 		subscription = next;
+		markSubscriptionFresh();
 	}
 
 	/**
-	 * 購読状態だけを読み直す。**このページを開いている間だけ**回し、失敗は
-	 * 黙って捨てる（ポーリングの一時的な失敗で操作用のエラー表示を上書き
-	 * しない。恒久的な失敗は次の明示操作で出る）。
+	 * 購読状態だけを読み直す。**このページを開いている間だけ**回す。
+	 *
+	 * 失敗は**トーストにしない**（ポーリングの一時的な失敗で明示操作の
+	 * エラー表示を上書きしないという既存の設計）。ただし握り潰したままに
+	 * すると、サーバープロセスが落ちる・LAN が切れるなどで**恒久的に失敗
+	 * しても「受信中」＋最後の値を出し続ける**（この画面には自動で明示操作を
+	 * 起こす経路が無いので、ユーザーがボタンを押すまで嘘が続く）。連続失敗を
+	 * 数え、`SUBSCRIPTION_POLL_FAILURE_LIMIT` 回で画面のブロック内に
+	 * 「取得できていません」を出す（レビュー P2-A）。
 	 */
 	async function pollSubscription(generation: number): Promise<void> {
 		const sentAt = appliedSeq;
@@ -234,10 +307,16 @@
 			const polled = await getHubSubscription();
 			// 停止（や停止→再開）を跨いだ応答は自分のものではない。
 			if (!isPollGenerationCurrent(generation, pollGeneration)) return;
+			// 読めた事実は、その値を採用するかどうかとは別（明示操作の結果を
+			// 優先して捨てる場合でも、購読状態は取得できている）。
+			markSubscriptionFresh();
 			// 待っている間に明示操作の結果が入っていたら、こちらは古い。
 			if (isPollResultFresh(sentAt, appliedSeq)) subscription = polled;
 		} catch {
-			// 握りつぶす（上のコメント参照）。
+			// トーストは出さない（上のコメント参照）。止まった世代の失敗まで
+			// 数えると、再開後に前回の失敗が持ち越される。
+			if (!isPollGenerationCurrent(generation, pollGeneration)) return;
+			pollFailures = nextPollFailureCount(pollFailures, 'failed');
 		}
 	}
 
@@ -348,6 +427,21 @@
 					<button type="button" onclick={saveSelection} disabled={busy}>選択を保存</button>
 				</div>
 
+				<!--
+					レビュー P2-B: 未保存の選択を黙って捨てない。「一覧を更新」や
+					「接続」でサーバーの選択に戻さなかったことをここで伝え、
+					**明示的に捨てる導線**を隣に置く。
+				-->
+				{#if selectionDiffers}
+					<p class="note selection-unsaved" role="status">
+						選択に未保存の変更があります（サーバー側の選択と異なります）。「選択を保存」で保存するか、
+						<button type="button" class="link" onclick={discardSelection} disabled={busy}>
+							サーバーの内容に戻す
+						</button>
+						を押してください。
+					</p>
+				{/if}
+
 				{#if tags && tags.length > 0}
 					<ul class="hub-tags">
 						{#each tags as tag (tag.externalName)}
@@ -379,8 +473,17 @@
 			{#if subscription}
 				<h3 class="hub-subheading">購読</h3>
 				<p class="status">
-					購読: <strong>{hubSubscriptionLabel(subscription.state)}</strong>
+					購読: <strong>{hubSubscriptionHeadline(subscription.state, subscriptionStale)}</strong>
 				</p>
+				<!--
+					レビュー P2-A: ポーリングが 2 回連続で失敗したら、この表示が
+					今の状態ではないと言う。トーストは出さない（明示操作の
+					エラー表示を上書きしない）ので、このブロックの中で示す。
+					値の表は消さない - 消すと「0 件」に潰れて別の嘘になる。
+				-->
+				{#if subscriptionStale}
+					<p class="note poll-stale" role="status">{hubPollStaleNote(lastPolledAt)}</p>
+				{/if}
 				<p class="note">{hubSubscriptionDetail(subscription)}</p>
 				<!--
 					購読全体の最終受信時刻。値の表の行ごとの `t` は
@@ -516,6 +619,42 @@
 		margin-left: auto;
 		color: var(--banto-text-muted);
 		font-size: 0.75rem;
+	}
+
+	/*
+		レビュー P2-A / P2-B の 2 つの注記。どちらも「今の表示が正しくない／
+		保存されていない」という注意喚起なので、既存の `.note`（薄いグレー）
+		より目に入る色にする。エラー（`.error`）ではないので `--banto-danger`
+		は使わない。
+	*/
+	.poll-stale,
+	.selection-unsaved {
+		color: var(--banto-text);
+	}
+
+	/*
+		`.settings-layout button` は主ボタン（塗り）なので、文中に置く
+		「サーバーの内容に戻す」はリンク風に上書きする（文章の流れを
+		主ボタンで分断しない）。
+	*/
+	.selection-unsaved button.link {
+		padding: 0;
+		background: none;
+		border: none;
+		color: var(--banto-primary);
+		font: inherit;
+		font-weight: 600;
+		text-decoration: underline;
+		cursor: pointer;
+	}
+
+	.selection-unsaved button.link:hover:not(:disabled) {
+		background: none;
+	}
+
+	.selection-unsaved button.link:disabled {
+		opacity: 0.6;
+		cursor: not-allowed;
 	}
 
 	.hub-subheading {

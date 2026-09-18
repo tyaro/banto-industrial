@@ -87,6 +87,7 @@
 		showsRetry,
 		listRows,
 		createFormGate,
+		runGuardedListLoad,
 		type SaveGuardToken,
 		type DeleteGuardToken,
 		type ListLoadState
@@ -273,21 +274,43 @@
 	const connectionsView = $derived(listSectionView(connectionsState));
 	const connectionsRetry = $derived(showsRetry(connectionsState));
 
+	/**
+	 * 一覧ごとの再取得の世代（レビュー P2-C）。`$state` にしないのは描画に
+	 * 使わないため（照合だけに使うカウンタ）。再取得のたびに進め、応答の
+	 * 適用時に `runGuardedListLoad` が照合する。
+	 */
+	let connectionsGeneration = 0;
+
 	async function reloadConnections(): Promise<void> {
 		if (!available) return;
+		// レビュー P2-C: 作成・保存の直後に `GET` が 2 本飛ぶと着順は発行順と
+		// 一致しない。この再取得の世代を控え、応答の適用時に照合する。
+		connectionsGeneration += 1;
+		const generation = connectionsGeneration;
 		connectionsLoading = true;
 		connectionsError = null;
-		try {
-			connections = await listPlcConnections();
-		} catch (err) {
-			// 失敗を「0件」に潰さない: `connections` には触らない（未読込なら
-			// `null` のまま、既に読めていたなら前回の行を残す）。トーストは
-			// 消えてしまうので、画面にも失敗と再試行の導線を残す。
-			connectionsError = errorMessage(err);
-			toastStore.push('error', connectionsError);
-		} finally {
-			connectionsLoading = false;
+		const outcome = await runGuardedListLoad(
+			generation,
+			listPlcConnections(),
+			() => connectionsGeneration
+		);
+		switch (outcome.kind) {
+			case 'applied':
+				connections = outcome.items;
+				break;
+			case 'error':
+				// 失敗を「0件」に潰さない: `connections` には触らない（未読込なら
+				// `null` のまま、既に読めていたなら前回の行を残す）。トーストは
+				// 消えてしまうので、画面にも失敗と再試行の導線を残す。
+				connectionsError = errorMessage(outcome.err);
+				toastStore.push('error', connectionsError);
+				break;
+			case 'stale':
+				// より新しい再取得が走っている。古い一覧でもエラーでも上書き
+				// しない（`connectionsLoading` も落とさない - 新しい方が落とす）。
+				return;
 		}
+		connectionsLoading = false;
 	}
 
 	// `untrack`: 初期スナップショットで十分（テンプレート側の `schema` prop は
@@ -527,18 +550,32 @@
 	// **読めた結果0件**のときだけ（#394レビュー P1-3）。
 	const groupCreateGate = $derived(createFormGate(connectionsState));
 
+	/** `connectionsGeneration` と同じ（レビュー P2-C）。 */
+	let groupsGeneration = 0;
+
 	async function reloadGroups(): Promise<void> {
 		if (!available) return;
+		groupsGeneration += 1;
+		const generation = groupsGeneration;
 		groupsLoading = true;
 		groupsError = null;
-		try {
-			groups = await listCollectionGroups();
-		} catch (err) {
-			groupsError = errorMessage(err);
-			toastStore.push('error', groupsError);
-		} finally {
-			groupsLoading = false;
+		const outcome = await runGuardedListLoad(
+			generation,
+			listCollectionGroups(),
+			() => groupsGeneration
+		);
+		switch (outcome.kind) {
+			case 'applied':
+				groups = outcome.items;
+				break;
+			case 'error':
+				groupsError = errorMessage(outcome.err);
+				toastStore.push('error', groupsError);
+				break;
+			case 'stale':
+				return;
 		}
+		groupsLoading = false;
 	}
 
 	// `untrack`: このPRのフォームstoreはoptionsの中身までは使わない（options
@@ -792,18 +829,28 @@
 	/** タグの作成フォームは収集グループの一覧に依存する（`groupCreateGate` と同じ考え方）。 */
 	const tagCreateGate = $derived(createFormGate(groupsState));
 
+	/** `connectionsGeneration` と同じ（レビュー P2-C）。 */
+	let tagsGeneration = 0;
+
 	async function reloadTags(): Promise<void> {
 		if (!available) return;
+		tagsGeneration += 1;
+		const generation = tagsGeneration;
 		tagsLoading = true;
 		tagsError = null;
-		try {
-			tags = await listTags();
-		} catch (err) {
-			tagsError = errorMessage(err);
-			toastStore.push('error', tagsError);
-		} finally {
-			tagsLoading = false;
+		const outcome = await runGuardedListLoad(generation, listTags(), () => tagsGeneration);
+		switch (outcome.kind) {
+			case 'applied':
+				tags = outcome.items;
+				break;
+			case 'error':
+				tagsError = errorMessage(outcome.err);
+				toastStore.push('error', tagsError);
+				break;
+			case 'stale':
+				return;
 		}
+		tagsLoading = false;
 	}
 
 	let createTagStore = $state(untrack(() => createFormStore(tagSchema(TAG_CREATE))));

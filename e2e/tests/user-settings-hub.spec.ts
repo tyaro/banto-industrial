@@ -13,6 +13,20 @@
  *   `banto-serve` は OS キーリングを持てないので購読は常に張れない。
  * - 非 admin では `Hub接続` が見えず、`/settings/hub` への直接遷移が先頭の
  *   可視カテゴリへ弾かれること（`guardCategory`）。
+ * -（観点別レビュー P2-B の回帰固定）**未保存のタグ選択が「一覧を更新」で
+ *   黙って消えない**こと（#378「未保存の入力を黙って捨てない」）。修正前は
+ *   `applyView()` がサーバーの `selectedTags` で無条件に上書きしており、
+ *   チェックを変えてから隣の「一覧を更新」を押すと確認も警告もなく元に
+ *   戻っていた。
+ *
+ *   この 1 本だけ `page.route` で `GET /api/hub`・`POST /api/hub/refresh` を
+ *   差し替える（作法は `e2e/tests/tags.spec.ts` の `page.route` ゲートに
+ *   倣う）。タグのチェックボックスは接続状態が `connected` のときにしか
+ *   描かれず、`banto-serve` は OS キーリングを持てない（`UnavailableKeyStore`）
+ *   ため、実サーバーだけでは `connected` に到達する手段が無い - この画面で
+ *   Hub を実際に立てる仕組みはこのリポジトリの E2E に無い（上の doc
+ *   comment 参照）。差し替えるのは一覧と選択を返す 2 本だけで、購読の
+ *   ポーリング（`GET /api/hub/subscription`）は実サーバーのまま流す。
  *
  * 「接続済み」「連携が必要」など Hub を実際に必要とする状態は
  * `crates/banto-hub-bootstrap` のモックサーバー付きテスト（27 本）が固定
@@ -148,6 +162,89 @@ test.describe.serial('chronogazer Hub接続の設定カテゴリ', () => {
 			await expect(viewerPage.getByRole('heading', { level: 2, name: 'テーマ' })).toBeVisible();
 		} finally {
 			await viewerPage.close();
+		}
+	});
+
+	// 観点別レビュー P2-B の回帰固定。差し替えの理由はこのファイルの doc
+	// comment 参照（`connected` は実サーバーだけでは作れない）。
+	test('8. 未保存のタグ選択は「一覧を更新」で黙って消えず、明示的に捨てる導線が出る', async () => {
+		const SELECTED_TAG = 'line1.temp';
+		const UNSELECTED_TAG = 'line1.press';
+		// `HubView`（`chronogazer_core::hub::HubView`）と同じ形。サーバー側の
+		// 選択は `SELECTED_TAG` だけ。
+		const hubView = {
+			status: { state: 'connected', tagCount: 2 },
+			endpoint: 'http://127.0.0.1:3100',
+			keyName: 'chronogazer-e2e',
+			selectedTags: [SELECTED_TAG],
+			tags: [
+				{
+					externalName: SELECTED_TAG,
+					name: 'temp',
+					dataType: 'f32',
+					unit: 'degC',
+					tagKind: 'plc'
+				},
+				{
+					externalName: UNSELECTED_TAG,
+					name: 'press',
+					dataType: 'f32',
+					unit: 'kPa',
+					tagKind: 'plc'
+				}
+			],
+			subscription: {
+				state: 'stopped',
+				reason: '購読していません。',
+				subscribedCount: 0,
+				unresolved: [],
+				unsupported: [],
+				lastError: null,
+				lastValueAt: null,
+				values: []
+			}
+		};
+
+		await page.route('**/api/hub', async (route) => {
+			if (route.request().method() === 'GET') {
+				await route.fulfill({ json: hubView });
+				return;
+			}
+			await route.continue();
+		});
+		await page.route('**/api/hub/refresh', async (route) => {
+			await route.fulfill({ json: hubView });
+		});
+
+		try {
+			await page.goto('/settings/hub');
+			await expect(page.getByText('状態: 接続済み（タグ2件）')).toBeVisible();
+
+			const selectedBox = page.getByRole('checkbox', { name: SELECTED_TAG });
+			const unselectedBox = page.getByRole('checkbox', { name: UNSELECTED_TAG });
+			await expect(selectedBox).toBeChecked();
+			await expect(unselectedBox).not.toBeChecked();
+
+			// 未保存の変更を作る（保存はしない）。
+			await unselectedBox.check();
+			await expect(unselectedBox).toBeChecked();
+
+			// 「選択を保存」の隣にある「一覧を更新」を押す。修正前はここで
+			// チェックがサーバーの内容（SELECTED_TAG だけ）に戻っていた。
+			await page.getByRole('button', { name: '一覧を更新' }).click();
+
+			await expect(unselectedBox).toBeChecked();
+			await expect(selectedBox).toBeChecked();
+			await expect(page.getByText('選択に未保存の変更があります')).toBeVisible();
+
+			// 捨てるときは明示的に（黙って捨てない代わりの導線）。
+			await page.getByRole('button', { name: 'サーバーの内容に戻す' }).click();
+			await expect(unselectedBox).not.toBeChecked();
+			await expect(selectedBox).toBeChecked();
+			await expect(page.getByText('選択に未保存の変更があります')).toHaveCount(0);
+		} finally {
+			await page.unroute('**/api/hub/refresh');
+			await page.unroute('**/api/hub');
 		}
 	});
 });
