@@ -83,8 +83,13 @@
 		schemaWireFields,
 		splitServerFieldErrors,
 		joinFieldErrorMessages,
+		listSectionView,
+		showsRetry,
+		listRows,
+		createFormGate,
 		type SaveGuardToken,
-		type DeleteGuardToken
+		type DeleteGuardToken,
+		type ListLoadState
 	} from './tagsPageLogic';
 
 	const available = isTagRegistryAvailable();
@@ -254,16 +259,32 @@
 	// 後の wire 名は同じなので、ここでは PLC_CREATE 側で一度だけ計算する。
 	const CONNECTION_WIRE_FIELDS = schemaWireFields(PLC_CREATE, connectionSchema(PLC_CREATE).fields);
 
-	let connections: PlcConnection[] = $state([]);
+	// `null` は「まだ読めていない」。`[]`（読めた結果0件）とは**別物**として
+	// 扱う（#394レビュー P1-3。同じアプリのHub側 `HubView.tags` と同じ規律で、
+	// 判断は `tagsPageLogic.ts` の純関数に出してある）。
+	let connections: PlcConnection[] | null = $state(null);
+	let connectionsError: string | null = $state(null);
 	let connectionsLoading = $state(false);
+	const connectionsState: ListLoadState<PlcConnection> = $derived({
+		items: connections,
+		error: connectionsError
+	});
+	const connectionRows = $derived(listRows(connectionsState));
+	const connectionsView = $derived(listSectionView(connectionsState));
+	const connectionsRetry = $derived(showsRetry(connectionsState));
 
 	async function reloadConnections(): Promise<void> {
 		if (!available) return;
 		connectionsLoading = true;
+		connectionsError = null;
 		try {
 			connections = await listPlcConnections();
 		} catch (err) {
-			toastStore.push('error', errorMessage(err));
+			// 失敗を「0件」に潰さない: `connections` には触らない（未読込なら
+			// `null` のまま、既に読めていたなら前回の行を残す）。トーストは
+			// 消えてしまうので、画面にも失敗と再試行の導線を残す。
+			connectionsError = errorMessage(err);
+			toastStore.push('error', connectionsError);
 		} finally {
 			connectionsLoading = false;
 		}
@@ -435,7 +456,7 @@
 		ALLOWED_PERIOD_MS.map((ms) => ({ value: ms, label: ms >= 1000 ? `${ms / 1000}s` : `${ms}ms` }))
 	);
 	const connectionOptions = $derived(
-		connections.map((c) => ({ value: c.id, label: `${c.name}（${c.protocol}）` }))
+		connectionRows.map((c) => ({ value: c.id, label: `${c.name}（${c.protocol}）` }))
 	);
 
 	function groupSchema(prefix: string): FormSchema {
@@ -490,16 +511,31 @@
 	// 一度だけ計算してよい。
 	const GROUP_WIRE_FIELDS = schemaWireFields(GROUP_CREATE, groupSchema(GROUP_CREATE).fields);
 
-	let groups: CollectionGroup[] = $state([]);
+	// `connections` と同じ3状態（未読込 / 失敗 / 読めた）。
+	let groups: CollectionGroup[] | null = $state(null);
+	let groupsError: string | null = $state(null);
 	let groupsLoading = $state(false);
+	const groupsState: ListLoadState<CollectionGroup> = $derived({
+		items: groups,
+		error: groupsError
+	});
+	const groupRows = $derived(listRows(groupsState));
+	const groupsView = $derived(listSectionView(groupsState));
+	const groupsRetry = $derived(showsRetry(groupsState));
+	// 収集グループの作成フォームは PLC接続 の一覧に依存する（`<select>` の
+	// 候補）。「先にPLC接続を1件以上作成してください」を出してよいのは
+	// **読めた結果0件**のときだけ（#394レビュー P1-3）。
+	const groupCreateGate = $derived(createFormGate(connectionsState));
 
 	async function reloadGroups(): Promise<void> {
 		if (!available) return;
 		groupsLoading = true;
+		groupsError = null;
 		try {
 			groups = await listCollectionGroups();
 		} catch (err) {
-			toastStore.push('error', errorMessage(err));
+			groupsError = errorMessage(err);
+			toastStore.push('error', groupsError);
 		} finally {
 			groupsLoading = false;
 		}
@@ -527,7 +563,7 @@
 	}
 
 	function connectionName(id: number): string {
-		return connections.find((c) => c.id === id)?.name ?? `#${id}`;
+		return connectionRows.find((c) => c.id === id)?.name ?? `#${id}`;
 	}
 
 	const groupColumns: GridColumn<CollectionGroup>[] = [
@@ -662,7 +698,7 @@
 		{ value: 'f64', label: '64bit実数（倍精度、Modbusのみ）' }
 	];
 
-	const groupOptions = $derived(groups.map((g) => ({ value: g.id, label: g.name })));
+	const groupOptions = $derived(groupRows.map((g) => ({ value: g.id, label: g.name })));
 
 	function tagSchema(prefix: string): FormSchema {
 		return {
@@ -745,16 +781,26 @@
 	// `CONNECTION_WIRE_FIELDS`と同じ理由。
 	const TAG_WIRE_FIELDS = schemaWireFields(TAG_CREATE, tagSchema(TAG_CREATE).fields);
 
-	let tags: Tag[] = $state([]);
+	// `connections` と同じ3状態（未読込 / 失敗 / 読めた）。
+	let tags: Tag[] | null = $state(null);
+	let tagsError: string | null = $state(null);
 	let tagsLoading = $state(false);
+	const tagsState: ListLoadState<Tag> = $derived({ items: tags, error: tagsError });
+	const tagRows = $derived(listRows(tagsState));
+	const tagsView = $derived(listSectionView(tagsState));
+	const tagsRetry = $derived(showsRetry(tagsState));
+	/** タグの作成フォームは収集グループの一覧に依存する（`groupCreateGate` と同じ考え方）。 */
+	const tagCreateGate = $derived(createFormGate(groupsState));
 
 	async function reloadTags(): Promise<void> {
 		if (!available) return;
 		tagsLoading = true;
+		tagsError = null;
 		try {
 			tags = await listTags();
 		} catch (err) {
-			toastStore.push('error', errorMessage(err));
+			tagsError = errorMessage(err);
+			toastStore.push('error', tagsError);
 		} finally {
 			tagsLoading = false;
 		}
@@ -778,7 +824,7 @@
 	}
 
 	function groupName(id: number): string {
-		return groups.find((g) => g.id === id)?.name ?? `#${id}`;
+		return groupRows.find((g) => g.id === id)?.name ?? `#${id}`;
 	}
 
 	const tagColumns: GridColumn<Tag>[] = [
@@ -924,9 +970,34 @@
 						? '行をクリックすると下に編集パネルが表示されます。'
 						: '閲覧のみ（編集には編集者以上の権限が必要です）。'}
 				</p>
-				{#if connectionsLoading && connections.length === 0}
+				<!-- #394 レビュー P1-3: 「読めていない」を「0件」として描かない。
+				失敗したら空のグリッドではなく、失敗した旨と再試行の導線を出す。 -->
+				{#if connectionsView === 'loading'}
 					<p class="loading">読み込み中…</p>
+				{:else if connectionsView === 'failed'}
+					<p class="load-error" role="alert">
+						PLC接続の一覧を読み込めませんでした（{connectionsError}）。登録が0件という意味ではありません。
+						<button
+							type="button"
+							onclick={() => void reloadConnections()}
+							disabled={connectionsLoading}
+						>
+							再試行
+						</button>
+					</p>
 				{:else}
+					{#if connectionsRetry}
+						<p class="load-error" role="alert">
+							一覧を更新できませんでした（{connectionsError}）。表示は最後に読み込めた内容です。
+							<button
+								type="button"
+								onclick={() => void reloadConnections()}
+								disabled={connectionsLoading}
+							>
+								再試行
+							</button>
+						</p>
+					{/if}
 					<!-- #391 レビュー A / #394 追補: 保存中・削除中は行の選択を操作
 					できないようにする（`selectConnection`自体のガードに加え、
 					見た目でも伝える）。 -->
@@ -936,7 +1007,7 @@
 						aria-disabled={savingConnection || deletingConnection}
 					>
 						<BantoGrid
-							rows={connections}
+							rows={connectionRows}
 							columns={connectionColumns}
 							getRowId={(c) => c.id}
 							onRowClick={canWrite ? selectConnection : undefined}
@@ -973,8 +1044,24 @@
 			{#if canWrite}
 				<div class="create">
 					<h4>新規作成</h4>
-					{#if connections.length === 0}
+					<!-- #394 レビュー P1-3: 「先に作成してください」は依存先を
+					**読めて0件**のときだけ。読めていないときにこれを出すと、
+					既にある接続を重複登録させてしまう。 -->
+					{#if groupCreateGate === 'needs-prerequisite'}
 						<p class="note">先にPLC接続を1件以上作成してください。</p>
+					{:else if groupCreateGate === 'dependency-loading'}
+						<p class="note">PLC接続の一覧を読み込んでいます…</p>
+					{:else if groupCreateGate === 'dependency-failed'}
+						<p class="load-error" role="alert">
+							PLC接続の一覧を読み込めなかったため、作成フォームを表示できません（{connectionsError}）。
+							<button
+								type="button"
+								onclick={() => void reloadConnections()}
+								disabled={connectionsLoading}
+							>
+								再試行
+							</button>
+						</p>
 					{:else}
 						<BantoForm
 							schema={groupSchema(GROUP_CREATE)}
@@ -993,16 +1080,31 @@
 						? '行をクリックすると下に編集パネルが表示されます。'
 						: '閲覧のみ（編集には編集者以上の権限が必要です）。'}
 				</p>
-				{#if groupsLoading && groups.length === 0}
+				{#if groupsView === 'loading'}
 					<p class="loading">読み込み中…</p>
+				{:else if groupsView === 'failed'}
+					<p class="load-error" role="alert">
+						収集グループの一覧を読み込めませんでした（{groupsError}）。登録が0件という意味ではありません。
+						<button type="button" onclick={() => void reloadGroups()} disabled={groupsLoading}>
+							再試行
+						</button>
+					</p>
 				{:else}
+					{#if groupsRetry}
+						<p class="load-error" role="alert">
+							一覧を更新できませんでした（{groupsError}）。表示は最後に読み込めた内容です。
+							<button type="button" onclick={() => void reloadGroups()} disabled={groupsLoading}>
+								再試行
+							</button>
+						</p>
+					{/if}
 					<div
 						class="grid-wrap"
 						class:saving={savingGroup || deletingGroup}
 						aria-disabled={savingGroup || deletingGroup}
 					>
 						<BantoGrid
-							rows={groups}
+							rows={groupRows}
 							columns={groupColumns}
 							getRowId={(g) => g.id}
 							onRowClick={canWrite ? selectGroup : undefined}
@@ -1039,8 +1141,17 @@
 			{#if canWrite}
 				<div class="create">
 					<h4>新規作成</h4>
-					{#if groups.length === 0}
+					{#if tagCreateGate === 'needs-prerequisite'}
 						<p class="note">先に収集グループを1件以上作成してください。</p>
+					{:else if tagCreateGate === 'dependency-loading'}
+						<p class="note">収集グループの一覧を読み込んでいます…</p>
+					{:else if tagCreateGate === 'dependency-failed'}
+						<p class="load-error" role="alert">
+							収集グループの一覧を読み込めなかったため、作成フォームを表示できません（{groupsError}）。
+							<button type="button" onclick={() => void reloadGroups()} disabled={groupsLoading}>
+								再試行
+							</button>
+						</p>
 					{:else}
 						<BantoForm
 							schema={tagSchema(TAG_CREATE)}
@@ -1059,16 +1170,31 @@
 						? '行をクリックすると下に編集パネルが表示されます。'
 						: '閲覧のみ（編集には編集者以上の権限が必要です）。'}
 				</p>
-				{#if tagsLoading && tags.length === 0}
+				{#if tagsView === 'loading'}
 					<p class="loading">読み込み中…</p>
+				{:else if tagsView === 'failed'}
+					<p class="load-error" role="alert">
+						タグの一覧を読み込めませんでした（{tagsError}）。登録が0件という意味ではありません。
+						<button type="button" onclick={() => void reloadTags()} disabled={tagsLoading}>
+							再試行
+						</button>
+					</p>
 				{:else}
+					{#if tagsRetry}
+						<p class="load-error" role="alert">
+							一覧を更新できませんでした（{tagsError}）。表示は最後に読み込めた内容です。
+							<button type="button" onclick={() => void reloadTags()} disabled={tagsLoading}>
+								再試行
+							</button>
+						</p>
+					{/if}
 					<div
 						class="grid-wrap"
 						class:saving={savingTag || deletingTag}
 						aria-disabled={savingTag || deletingTag}
 					>
 						<BantoGrid
-							rows={tags}
+							rows={tagRows}
 							columns={tagColumns}
 							getRowId={(t) => t.id}
 							onRowClick={canWrite ? selectTag : undefined}
@@ -1144,6 +1270,34 @@
 
 	.loading {
 		color: var(--banto-text-muted);
+	}
+
+	/* #394 レビュー P1-3: 読み込みに失敗した一覧は「0件」ではなく、
+	この行（失敗の事実 + 再試行の導線）として出す。 */
+	.load-error {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		flex-wrap: wrap;
+		margin: 0 0 0.5rem;
+		color: var(--banto-danger);
+		font-size: 0.8rem;
+	}
+
+	.load-error button {
+		height: var(--banto-control-height);
+		box-sizing: border-box;
+		padding: 0 0.75rem;
+		background: transparent;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius-md);
+		color: inherit;
+		cursor: pointer;
+	}
+
+	.load-error button:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
 	}
 
 	.grid-wrap {

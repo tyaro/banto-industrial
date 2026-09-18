@@ -40,6 +40,17 @@
  *    固定する - 収集グループ・タグの`saveX`/`submitting`は同じ3行の形
  *    （`savingX || deletingX`）で入っており、差分レビューで確認済み
  *    （理由は本テストのdoc comment参照）。
+ * 7.（#394レビュー P1-3 の回帰固定）一覧の取得に失敗したとき、0行の
+ *    グリッドとして描かれず、「先にPLC接続を1件以上作成してください」という
+ *    **誤った指示**が出ないこと。`page.route` で `GET /api/plc-connections`
+ *    だけを落とし（作法は`e2e/tests-banto-hub/banto-hub-tags-busy.spec.ts`と
+ *    `banto-hub-tags-load-state.spec.ts`に倣う）、失敗が分かる表示と再試行の
+ *    導線が出ること、route を外して再試行すれば復旧することを確認する
+ *    （修正前はトーストが消えたあと「1件も登録されていない」という永続的な
+ *    誤表示になり、利用者を重複登録へ誘導していた）。PLC接続でのみ固定する -
+ *    収集グループ・タグの3状態は同じ純関数（`tagsPageLogic.ts`の
+ *    `listSectionView`/`createFormGate`）を同じ形で通しており、その総当たりは
+ *    vitest 側で固定してある。
  *
  * ファイル名について: `smoke.spec.ts` が初回セットアップ（管理者アカウント
  * 作成）を実 DOM で行うため、このファイルは辞書順でそれより後でなければ
@@ -301,5 +312,50 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 		} finally {
 			await page.unroute('**/api/plc-connections/*');
 		}
+	});
+
+	test('11. 一覧の取得に失敗しても「0件」に潰れず、誤った案内を出さない（#394レビュー P1-3）', async () => {
+		const plcSection = page.locator('section.registry-section').nth(0);
+		const groupSection = page.locator('section.registry-section').nth(1);
+
+		// `GET /api/plc-connections` だけを落とす（POST や
+		// `/api/plc-connections/{id}` には触れない）。
+		await page.route('**/api/plc-connections', async (route) => {
+			if (route.request().method() === 'GET') {
+				await route.abort();
+				return;
+			}
+			await route.continue();
+		});
+		try {
+			await page.goto('/tags');
+
+			// 失敗が分かる表示と、再試行の導線。`tagRegistryAdmin.ts` の
+			// `httpRequest` はネットワーク層の例外を
+			// `ProviderError({ kind: 'other', message: 'サーバーに接続できません' })`
+			// に変換するので、その文言がそのまま添えられる。
+			await expect(
+				plcSection.getByText('PLC接続の一覧を読み込めませんでした', { exact: false })
+			).toBeVisible();
+			await expect(plcSection.getByRole('button', { name: '再試行' }).first()).toBeVisible();
+
+			// 0件として描かない: グリッドも、行（既存のPLC接続）も出さない。
+			await expect(plcSection.locator('div.list .grid-wrap')).toHaveCount(0);
+
+			// **誤った指示を出さない**（修正前はここが出て、利用者を重複登録へ
+			// 誘導していた）。
+			await expect(page.getByText('先にPLC接続を1件以上作成してください')).toHaveCount(0);
+			// 候補が無いように見える `<select>` も出さない。
+			await expect(groupSection.locator('div.create').getByLabel('PLC接続')).toHaveCount(0);
+		} finally {
+			await page.unroute('**/api/plc-connections');
+		}
+
+		// route を外して再試行すれば復旧する（失敗は終端状態ではない）。
+		await plcSection.getByRole('button', { name: '再試行' }).first().click();
+		await expect(plcSection.locator('div.list').getByText(CONNECTION_NAME)).toBeVisible();
+		await expect(
+			plcSection.getByText('PLC接続の一覧を読み込めませんでした', { exact: false })
+		).toHaveCount(0);
 	});
 });

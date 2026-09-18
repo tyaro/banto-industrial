@@ -230,6 +230,10 @@ struct SettingsMirror {
 struct MirrorInner {
     record: Option<HubRecord>,
     dirty: bool,
+    /// 写しが変わるたびに 1 増える版番号。[`SettingsMirror::mark_flushed`] が
+    /// 「今書き終えたのは本当に最新の版か」を判断するのに使う（`HubRecord`
+    /// は `PartialEq` を持たないので、値の比較ではなく版で見る）。
+    revision: u64,
 }
 
 impl SettingsMirror {
@@ -238,16 +242,40 @@ impl SettingsMirror {
         let mut inner = self.inner.lock().expect("hub mirror poisoned");
         inner.record = record;
         inner.dirty = false;
+        inner.revision = inner.revision.wrapping_add(1);
     }
 
-    /// 変更があれば「書き戻すべき値」を返す（`Some(None)` = 消去）。
-    fn take_dirty(&self) -> Option<Option<HubRecord>> {
-        let mut inner = self.inner.lock().expect("hub mirror poisoned");
+    /// 変更があれば「書き戻すべき値」と、その値の版番号を返す
+    /// （`Some((rev, None))` = 消去）。**dirty はここでは落とさない**
+    /// （[`SettingsMirror::mark_flushed`] の doc 参照）。
+    fn pending(&self) -> Option<(u64, Option<HubRecord>)> {
+        let inner = self.inner.lock().expect("hub mirror poisoned");
         if !inner.dirty {
             return None;
         }
-        inner.dirty = false;
-        Some(inner.record.clone())
+        Some((inner.revision, inner.record.clone()))
+    }
+
+    /// 設定ストアへの書き込みが**成功した**ことを伝え、dirty を落とす。
+    ///
+    /// **なぜ「取ってから書く」をやめたか**（#394 のレビュー P1-2）: 以前の
+    /// `take_dirty()` は書き込みの**前に** dirty を落としていたため、
+    /// `SettingsService::set` が失敗すると「変更はどこにも書かれていないのに
+    /// 写しは綺麗（dirty=false）」という状態が残った。後続の `flush()` は
+    /// 何も書かず、次の [`HubService::hydrate`] が写しを DB の値（＝古い、
+    /// あるいはレコード無し）で上書きするので、**発行済みの API キーの記録が
+    /// メモリからも消える**。Hub 側にはキーが残っているのに、こちらは
+    /// 「前のキー」を知らないので失効させられず、接続し直すたびに 1 本ずつ
+    /// 増えていく。成功してから落とせば、失敗は次の `flush()` で再試行される。
+    ///
+    /// 書き込んでいる間に写しがさらに変わっていたら（版が進んでいたら）
+    /// dirty は落とさない - 落とすと**新しい方の変更**が書かれないまま
+    /// 消えるため。
+    fn mark_flushed(&self, revision: u64) {
+        let mut inner = self.inner.lock().expect("hub mirror poisoned");
+        if inner.revision == revision {
+            inner.dirty = false;
+        }
     }
 
     fn current(&self) -> Option<HubRecord> {
@@ -268,6 +296,7 @@ impl BootstrapState for SettingsMirror {
         let mut inner = self.inner.lock().expect("hub mirror poisoned");
         inner.record = Some(record.clone());
         inner.dirty = true;
+        inner.revision = inner.revision.wrapping_add(1);
         Ok(())
     }
 
@@ -275,6 +304,7 @@ impl BootstrapState for SettingsMirror {
         let mut inner = self.inner.lock().expect("hub mirror poisoned");
         inner.record = None;
         inner.dirty = true;
+        inner.revision = inner.revision.wrapping_add(1);
         Ok(())
     }
 }
@@ -904,6 +934,60 @@ enum Trigger {
 /// こちらだけが実際のネットワーク再試行の頻度になる。
 const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Hub への 1 往復（ネットワークを伴う bootstrapper 呼び出し）に許す最大
+/// 時間（#394 のレビュー P1-1）。
+///
+/// **なぜ要るか**: `banto-hub-bootstrap` の `AdminClient` も
+/// `banto-tagclient` の `RestClient` も reqwest の既定（**タイムアウト無し**）
+/// で組み立てられている。TCP は繋がるが応答を返さない相手（accept だけして
+/// 黙るリスナ、フリーズした Hub、経路の途中で落ちた NAT）に当たると
+/// **永久に待つ**。しかもその await は [`HubService::begin_operation`] の
+/// 操作ロックを握ったまま行われるので、1 回の無応答で `status` / `connect` /
+/// `disconnect` / 選択の保存 / 見張りの 1 周期まで**すべて止まり、復旧は
+/// アプリの再起動しか無くなる**。共有 crate（他アプリと共用、変更しない
+/// 方針）ではなく、このアプリ側で上限を持つ。
+///
+/// **なぜ 15 秒か**: Hub は同一 PC ないし同じ LAN にいる前提で、catalog は
+/// v1 目標の 256 タグ - 通常の応答は 1 秒に満たない。15 秒は「遅い」では
+/// なく「明らかに応答していない」と言い切れる十分に緩い上限で、Wi-Fi の
+/// 一時的なもたつきや起動直後の Hub の重さを誤って切らない。遅い LAN や
+/// 大きな catalog が現実になったら設定値に出す余地はある（上限がこの定数
+/// 1 箇所に閉じているので、設定から与える形にしても呼び出し側は変わらない）。
+///
+/// **ロックが残らない理由**: [`tokio::time::timeout`] は期限が来ると内側の
+/// future を **drop する**ので、reqwest の要求はその場で中断され、
+/// 呼び出し元の `?` が操作ロックのガードを落とす。タイムアウトしたまま
+/// ロックが握られ続けることはない。
+const HUB_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// [`HUB_OPERATION_TIMEOUT`] を使い切ったときに返すエラー。
+///
+/// **新しい状態は増やさない**。`banto-hub-bootstrap` 自身、「何も答えない」
+/// を [`HubStatus::Unreachable`] の `UnreachableCause::Transport`
+/// （その doc が timeout を明示的にこの分類に入れている）として扱うので、
+/// 文言も**到達不能と同じ次の一手**（接続先と Hub の状態を確認する）に
+/// 寄せる。上限そのものを文言に入れるのは、**もう待っていない**ことが
+/// 利用者に伝わるようにするため。
+fn hub_timeout_error() -> BantoError {
+    BantoError::Other(format!(
+        "Hubが応答しません（{}秒）。接続先とHubの状態を確認してください。",
+        HUB_OPERATION_TIMEOUT.as_secs()
+    ))
+}
+
+/// bootstrapper の**ネットワークを伴う**呼び出しは、操作ロックを持ったまま
+/// await するので、必ずこれで包む（[`HUB_OPERATION_TIMEOUT`] の doc 参照）。
+/// 包み忘れが 1 箇所でもあると、そこだけで全体が固まる。
+async fn with_hub_timeout<T, F>(future: F) -> Result<T, BantoError>
+where
+    F: std::future::Future<Output = Result<T, BootstrapError>>,
+{
+    match tokio::time::timeout(HUB_OPERATION_TIMEOUT, future).await {
+        Ok(result) => result.map_err(to_banto_error),
+        Err(_elapsed) => Err(hub_timeout_error()),
+    }
+}
+
 /// [`HubService`] の実体。`HubService` はこれへの `Arc` 1 本だけを持つので、
 /// supervisor タスクは [`Weak`] を持てる（= 全 clone が落ちたらタスクも
 /// 終わる。ぶら下がったタスクがテストや `banto-serve` の終了を妨げない）。
@@ -1001,14 +1085,9 @@ impl HubService {
         if record.is_none() {
             return Ok(self.not_configured_view().await);
         }
-        let connection = self
-            .inner
-            .bootstrapper
-            .refresh_catalog()
-            .await
-            .map_err(to_banto_error)?;
-        self.flush().await?;
-        Ok(self.view(connection, Trigger::Observe).await)
+        let connection = with_hub_timeout(self.inner.bootstrapper.refresh_catalog()).await?;
+        let saved = self.flush().await;
+        self.finish(saved, connection, Trigger::Observe).await
     }
 
     /// 購読の状態だけを返す（ポーリング用）。**メモリ上の `watch` を読む
@@ -1144,15 +1223,13 @@ impl HubService {
         if self.inner.mirror.current().is_none() {
             return Ok(());
         }
-        let connection = self
-            .inner
-            .bootstrapper
-            .refresh_catalog()
-            .await
-            .map_err(to_banto_error)?;
-        self.flush().await?;
+        let connection = with_hub_timeout(self.inner.bootstrapper.refresh_catalog()).await?;
+        // 保存に失敗しても**突き合わせは必ず行う**（#394 のレビュー P1-2）。
+        // 設定 DB が一時的に書けないことと、購読を張り直せるかどうかは別の
+        // 話で、前者で後者を止めると値が流れないまま放置される。
+        let saved = self.flush().await;
         self.reconcile(&connection, Trigger::Observe).await;
-        Ok(())
+        saved
     }
 
     /// 接続（保存済みキーがあれば再利用、無ければ試運転中のみ自己発行）。
@@ -1161,14 +1238,10 @@ impl HubService {
     /// [`Trigger::CredentialsChanged`] で**必ず張り直す**。
     pub async fn connect(&self, endpoint: &str) -> Result<HubView, BantoError> {
         let _operation = self.begin_operation().await?;
-        let connection = self
-            .inner
-            .bootstrapper
-            .connect(endpoint.trim())
+        let connection = with_hub_timeout(self.inner.bootstrapper.connect(endpoint.trim())).await?;
+        let saved = self.flush().await;
+        self.finish(saved, connection, Trigger::CredentialsChanged)
             .await
-            .map_err(to_banto_error)?;
-        self.flush().await?;
-        Ok(self.view(connection, Trigger::CredentialsChanged).await)
     }
 
     /// ロックダウン済み Hub 向けの手動連携。平文はキーリングにだけ入る。
@@ -1181,27 +1254,23 @@ impl HubService {
         key: String,
     ) -> Result<HubView, BantoError> {
         let _operation = self.begin_operation().await?;
-        let connection = self
-            .inner
-            .bootstrapper
-            .adopt_manual_key(endpoint.trim(), key)
+        let connection = with_hub_timeout(
+            self.inner
+                .bootstrapper
+                .adopt_manual_key(endpoint.trim(), key),
+        )
+        .await?;
+        let saved = self.flush().await;
+        self.finish(saved, connection, Trigger::CredentialsChanged)
             .await
-            .map_err(to_banto_error)?;
-        self.flush().await?;
-        Ok(self.view(connection, Trigger::CredentialsChanged).await)
     }
 
     /// タグ一覧の再取得。
     pub async fn refresh_catalog(&self) -> Result<HubView, BantoError> {
         let _operation = self.begin_operation().await?;
-        let connection = self
-            .inner
-            .bootstrapper
-            .refresh_catalog()
-            .await
-            .map_err(to_banto_error)?;
-        self.flush().await?;
-        Ok(self.view(connection, Trigger::Observe).await)
+        let connection = with_hub_timeout(self.inner.bootstrapper.refresh_catalog()).await?;
+        let saved = self.flush().await;
+        self.finish(saved, connection, Trigger::Observe).await
     }
 
     /// 選択タグの保存。空でも保存できる（受入条件）。
@@ -1210,7 +1279,9 @@ impl HubService {
     /// 1 回読み直してから購読を張り直すだけで、**追加の 1 往復はユーザー
     /// 操作なので許容**する（画面のポーリングはこの経路を通らない）。
     /// 読み直しに失敗しても**保存は成功のまま返す** - 保存の成否と購読の
-    /// 張り直しは別事象で、前者を後者の失敗で覆さない。
+    /// 張り直しは別事象で、前者を後者の失敗で覆さない。逆に、設定 DB への
+    /// 保存（[`Self::flush`]）が失敗したときは**失敗を返す**が、その前に
+    /// 購読の突き合わせ・停止まで必ず済ませる（#394 のレビュー P1-2）。
     ///
     /// ただし読み直しに失敗したときは**古い世代を止める**。選択を変えた
     /// 以上、古い選択のタグの値はもう誤情報であり、**一時的に何も出ない
@@ -1224,11 +1295,15 @@ impl HubService {
             .bootstrapper
             .set_selected_tags(tags)
             .map_err(to_banto_error)?;
-        self.flush().await?;
-        match self.inner.bootstrapper.refresh_catalog().await {
+        // 保存の失敗（`saved`）は最後に返すが、**途中で抜けない**
+        // （#394 のレビュー P1-2）。抜けると購読が古い選択のまま残り、
+        // 「保存もされず、購読も直らない」という一番悪い形になる。
+        let saved = self.flush().await;
+        match with_hub_timeout(self.inner.bootstrapper.refresh_catalog()).await {
             Ok(connection) => {
-                self.flush().await?;
+                let saved_again = self.flush().await;
                 self.reconcile(&connection, Trigger::Observe).await;
+                saved.and(saved_again)?;
             }
             Err(err) => {
                 eprintln!(
@@ -1247,6 +1322,8 @@ impl HubService {
                 slot.unsupported.clear();
                 slot.stop(Some(REASON_SELECTION_CHANGED_REFRESH_FAILED.to_owned()))
                     .await;
+                // 購読を整合させた**後で**保存の失敗を返す（上と同じ理由）。
+                saved?;
             }
         }
         Ok(())
@@ -1261,8 +1338,28 @@ impl HubService {
             .bootstrapper
             .disconnect()
             .map_err(to_banto_error)?;
-        self.flush().await?;
-        Ok(self.not_configured_view().await)
+        // ここも「保存の失敗より先に購読を整合させる」（#394 のレビュー
+        // P1-2）。切断したのに購読だけ生きている、という形を作らない。
+        let saved = self.flush().await;
+        let view = self.not_configured_view().await;
+        saved.map(|()| view)
+    }
+
+    /// 設定の保存結果と、突き合わせ済みの [`HubView`] を 1 つの答えにする。
+    ///
+    /// **`saved` を先に受け取る形にしてあるのが肝**（#394 のレビュー P1-2）:
+    /// `flush()` の結果を `?` で即座に返していた頃は、保存に失敗すると
+    /// [`Self::view`] に到達せず**購読の突き合わせが丸ごと飛んだ**。呼び出し
+    /// 側が `self.flush().await` の戻り値をここへ渡す限り、突き合わせの前に
+    /// 抜ける書き方はできない。
+    async fn finish(
+        &self,
+        saved: Result<(), BantoError>,
+        connection: HubConnection,
+        trigger: Trigger,
+    ) -> Result<HubView, BantoError> {
+        let view = self.view(connection, trigger).await;
+        saved.map(|()| view)
     }
 
     /// 「未設定」の応答。記録が無い以上、購読も持てないので世代を落とす。
@@ -1448,6 +1545,11 @@ impl HubService {
     /// ものになる（`HubInner::operation` の doc にある握り潰しのシナリオ）。
     /// ロック順序は 操作（外）→ 購読（内）で固定なので、ここから呼ぶ
     /// `reconcile*` は操作ロックを取らない。
+    ///
+    /// **このガードを持ったまま外部を待つ経路は、必ず
+    /// [`with_hub_timeout`] で包むこと**（#394 のレビュー P1-1）。共有 crate
+    /// の HTTP クライアントにはタイムアウトが無く、1 箇所でも包み忘れると
+    /// 無応答の相手 1 回で Hub 機能全体が固まる。
     async fn begin_operation(&self) -> Result<AsyncMutexGuard<'_, ()>, BantoError> {
         let guard = self.inner.operation.lock().await;
         self.hydrate().await?;
@@ -1479,8 +1581,27 @@ impl HubService {
     ///
     /// `SettingsService` に削除 API は無いので、消去は空文字列の upsert で
     /// 表す（[`Self::hydrate`] が空文字列を「未設定」として読む）。
+    ///
+    /// **書けてから dirty を落とす**（[`SettingsMirror::mark_flushed`] に
+    /// 理由）。失敗しても写しは dirty のまま残るので、次の操作や見張りの
+    /// `flush()` が同じ変更を書き直せる。
+    ///
+    /// 失敗の文言は**接続の失敗と混ぜない**: ここで失敗しているのは
+    /// 「ローカルの設定 DB への保存」であって、Hub との通信ではない
+    /// （Hub 側の処理は既に終わっている）。
+    ///
+    /// **残留リスク（完全には防げない）**: `connect` は「Hub にキーを発行
+    /// させる → キーリングに保存 → 写しに保存」まで済ませてからここへ来る
+    /// ので、ここで失敗したまま**アプリが落ちれば**（あるいは設定 DB が
+    /// 壊れたままなら）、発行済みのキーが Hub 側に残り、こちらはその
+    /// `key_id` を知らないので失効させられない。自動失効は入れない -
+    /// まだ使うかもしれないキーを消す方が危険で、「自分が発行したものだけ・
+    /// 確証があるときだけ失効させる」（#387 で確立した規律）にも反する。
+    /// 運用側は Hub の APIキー一覧で名前の接頭辞
+    /// `chronogazer-{installation_id}-`（`Bootstrapper` の `key_name`）から
+    /// このインストールのキーを見つけて、不要な世代を手で失効できる。
     async fn flush(&self) -> Result<(), BantoError> {
-        let Some(change) = self.inner.mirror.take_dirty() else {
+        let Some((revision, change)) = self.inner.mirror.pending() else {
             return Ok(());
         };
         let value = match change {
@@ -1489,7 +1610,17 @@ impl HubService {
             })?,
             None => String::new(),
         };
-        self.inner.settings.set(KEY_HUB_RECORD, &value).await
+        self.inner
+            .settings
+            .set(KEY_HUB_RECORD, &value)
+            .await
+            .map_err(|err| {
+                BantoError::Storage(format!(
+                    "Hub接続設定を保存できませんでした（Hubとの通信ではなくローカル設定の保存に失敗しています。次の操作で自動的に書き直します）: {err}"
+                ))
+            })?;
+        self.inner.mirror.mark_flushed(revision);
+        Ok(())
     }
 }
 
@@ -1526,12 +1657,181 @@ mod tests {
     use crate::db::init_db_memory;
 
     async fn service() -> (SettingsService, HubService) {
+        let (_pool, settings, hub) = service_with_pool().await;
+        (settings, hub)
+    }
+
+    /// [`service`] と同じだが、設定 DB のプールも返す。**プールを閉じると
+    /// 以後の書き込みが失敗する**ので、`flush()` の失敗経路を実際に踏ませる
+    /// テスト（#394 のレビュー P1-2）に使う。
+    async fn service_with_pool() -> (sqlx::SqlitePool, SettingsService, HubService) {
         let pool = init_db_memory().await.expect("init_db_memory");
-        let settings = SettingsService::new(pool);
+        let settings = SettingsService::new(pool.clone());
         let hub = HubService::new(settings.clone(), Arc::new(UnavailableKeyStore))
             .await
             .expect("HubService::new");
-        (settings, hub)
+        (pool, settings, hub)
+    }
+
+    fn seed_record(selected: &[&str]) -> HubRecord {
+        HubRecord {
+            endpoint: "http://127.0.0.1:3100".to_owned(),
+            installation_id: "inst".to_owned(),
+            key_id: Some(3),
+            key_name: Some("chronogazer-inst-1000".to_owned()),
+            keyring_account: "hub:127.0.0.1:3100/:inst".to_owned(),
+            selected_tags: selected.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    // --- #394 レビュー P1-1: 無応答の Hub で操作ロックを握り続けない -------
+
+    /// 応答しない相手（`pending()` = 永久に解決しない future）でも
+    /// [`HUB_OPERATION_TIMEOUT`] で必ず打ち切る。`start_paused` なので
+    /// **実時間は 1 秒も待たない**（時計はランタイムが進める）。
+    #[tokio::test(start_paused = true)]
+    async fn a_hub_call_that_never_answers_times_out() {
+        let started = tokio::time::Instant::now();
+        let err = with_hub_timeout(std::future::pending::<Result<(), BootstrapError>>())
+            .await
+            .expect_err("応答が返らない相手は打ち切る");
+        assert!(
+            started.elapsed() >= HUB_OPERATION_TIMEOUT,
+            "上限までは待つ（短気に切らない）"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("Hubが応答しません"),
+            "到達不能と同じ次の一手を示す文言: {message}"
+        );
+        assert!(
+            message.contains(&HUB_OPERATION_TIMEOUT.as_secs().to_string()),
+            "もう待っていないことが分かるよう上限を出す: {message}"
+        );
+    }
+
+    /// 打ち切った**後に別の操作が進める**こと。これが直したかったもの:
+    /// 以前は無応答 1 回で操作ロックが永久に握られ、`status`/`connect`/
+    /// 見張りまで全部止まった（復旧はアプリ再起動のみ）。
+    ///
+    /// [`HubService::begin_operation`] と同じ形（操作ロックを持ったまま
+    /// 外部を待つ）を、ネットワークを使わずに最小限で再現する。
+    #[tokio::test(start_paused = true)]
+    async fn the_operation_lock_is_released_after_a_timeout() {
+        let operation = Arc::new(AsyncMutex::new(()));
+        let holder = Arc::clone(&operation);
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
+        let hung = tokio::spawn(async move {
+            let _guard = holder.lock().await;
+            acquired_tx.send(()).expect("receiver is alive");
+            with_hub_timeout(std::future::pending::<Result<(), BootstrapError>>()).await
+        });
+        acquired_rx.await.expect("無応答の操作がロックを取った");
+
+        // 上限の 4 倍を上限に待つ - 直す前はここで永久に待たされた。
+        let next = tokio::time::timeout(HUB_OPERATION_TIMEOUT * 4, operation.lock()).await;
+        assert!(next.is_ok(), "タイムアウトでガードが落ち、次の操作が進める");
+        assert!(
+            hung.await.expect("join").is_err(),
+            "打ち切られた側はエラーを返す"
+        );
+    }
+
+    // --- #394 レビュー P1-2: 書けてから dirty を落とす ---------------------
+
+    /// 書き込みが成功するまで変更を手放さない。以前は書く**前**に dirty を
+    /// 落としていたため、`SettingsService::set` が失敗すると変更が二度と
+    /// 書かれず、Hub 上の API キーが孤児になった。
+    #[test]
+    fn the_mirror_keeps_a_change_until_the_write_succeeds() {
+        let mirror = SettingsMirror::default();
+        assert!(mirror.pending().is_none(), "変更が無ければ何も書かない");
+
+        mirror.save(&seed_record(&["a"])).unwrap();
+        let (revision, change) = mirror.pending().expect("書き戻すべき変更がある");
+        assert_eq!(change.expect("消去ではない").selected_tags, owned(&["a"]));
+        // ここで書き込みが失敗したとする（= `mark_flushed` を呼ばない）。
+        assert!(
+            mirror.pending().is_some(),
+            "失敗したら次の機会に書き直せること"
+        );
+
+        // 成功したときだけ落ちる。
+        mirror.mark_flushed(revision);
+        assert!(mirror.pending().is_none());
+    }
+
+    /// 書いている最中に写しがさらに変わったら、**古い版の成功で新しい変更を
+    /// 消さない**（`hydrate` が上書きする前に書き直す機会を残す）。
+    #[test]
+    fn a_change_made_while_writing_is_not_dropped() {
+        let mirror = SettingsMirror::default();
+        mirror.save(&seed_record(&["a"])).unwrap();
+        let (revision, _) = mirror.pending().expect("変更がある");
+
+        mirror.save(&seed_record(&["b"])).unwrap();
+        mirror.mark_flushed(revision);
+
+        let (_, change) = mirror.pending().expect("新しい変更は残る");
+        assert_eq!(change.expect("消去ではない").selected_tags, owned(&["b"]));
+    }
+
+    /// 消去（`clear`）も同じ規律で扱う（`Some(None)` = 空文字列の upsert）。
+    #[test]
+    fn clearing_the_mirror_is_a_pending_erase() {
+        let mirror = SettingsMirror::default();
+        mirror.save(&seed_record(&["a"])).unwrap();
+        mirror.clear().unwrap();
+        let (revision, change) = mirror.pending().expect("消去も書き戻す変更");
+        assert!(change.is_none(), "`Some(None)` は消去");
+        mirror.mark_flushed(revision);
+        assert!(mirror.pending().is_none());
+    }
+
+    /// 設定 DB へ書けなくても、**購読の突き合わせには必ず到達する**
+    /// （以前は `flush().await?` で早期 return し、購読が古いまま残った）。
+    /// 失敗は「保存できなかった」として呼び出し元に返り、変更は写しに
+    /// 残って次の機会に書き直せる。
+    #[tokio::test]
+    async fn a_failed_flush_still_reconciles_and_keeps_the_change() {
+        let (pool, settings, hub) = service_with_pool().await;
+        settings
+            .set(
+                KEY_HUB_RECORD,
+                &serde_json::to_string(&seed_record(&["a"])).unwrap(),
+            )
+            .await
+            .unwrap();
+        hub.hydrate().await.unwrap();
+        // 写しだけを変える（= flush が書くべき変更がある状態）。
+        hub.inner.mirror.save(&seed_record(&["b"])).unwrap();
+        // 以後、設定 DB への書き込みは必ず失敗する。
+        pool.close().await;
+
+        let err = hub
+            .resume_locked()
+            .await
+            .expect_err("保存の失敗は呼び出し元に返る");
+        assert!(
+            matches!(err, BantoError::Storage(_)),
+            "接続の失敗ではなく保存の失敗として返る: {err}"
+        );
+        assert!(
+            err.to_string().contains("保存できませんでした"),
+            "文言が接続の失敗と混ざらない: {err}"
+        );
+
+        // 突き合わせには到達している（理由付きで止まっている）。
+        let view = hub.subscription().await;
+        assert_eq!(view.state, "stopped");
+        assert_eq!(
+            view.reason.as_deref(),
+            Some(REASON_NO_KEY),
+            "購読は突き合わせ済みの理由を持つ"
+        );
+        // 変更は失われていない。
+        let (_, change) = hub.inner.mirror.pending().expect("次の機会に書き直せる");
+        assert_eq!(change.expect("消去ではない").selected_tags, owned(&["b"]));
     }
 
     #[tokio::test]
