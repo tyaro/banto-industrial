@@ -962,14 +962,24 @@ const SUPERVISOR_INTERVAL: Duration = Duration::from_secs(30);
 /// **ただしこれは「こちらが待つのをやめる」だけ**（#395 のレビュー B）。
 /// drop できるのはローカルの future であって、**Hub が既に受け取って処理した
 /// 要求は取り消せない**。したがってこの上限は
-/// **副作用の無い（冪等な）往復にだけ**使う - `status` / `refresh_catalog` /
+/// **Hub 側に副作用を残さない往復に**使う - `status` / `refresh_catalog` /
 /// `set_selected_tags` の再取得 / `resume_locked` はどれも `GET` の読み取り
-/// だけで、打ち切っても Hub には何も残らない。キー発行のように外部副作用を
-/// 伴う往復は [`HUB_MUTATING_TIMEOUT`] を使う。
+/// だけ。`adopt_manual_key` も同じ側で、ネットワークに出るのは
+/// `verify()`（`GET /api/v1/tags`）だけ、成功後の保存は OS キーリングと
+/// 設定という**ローカル 2 つ**に閉じている（#395 のレビュー P2 で crate の
+/// 実装を確認: `previous_for` は保存済みの記録を**読むだけ**で、Hub 側の
+/// 発行も失効も行わない）。打ち切っても Hub には何も残らないので、
+/// 短い上限で切ってよい。**Hub 側にキーを作る** `connect` だけが
+/// [`HUB_MUTATING_TIMEOUT`] を使う。
 const HUB_OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// **外部副作用を伴う**往復（`connect` / `adopt_manual_key`）に許す最大時間
+/// **Hub 側に副作用を残す**往復（`connect` だけ）に許す最大時間
 /// （#395 のレビュー B）。
+///
+/// 対象は `connect` **のみ**: Hub にキーを発行させるのはこの経路だけで、
+/// `adopt_manual_key` は利用者が貼ったキーを検証して**ローカルに保存する
+/// だけ**なので読み取り側（[`HUB_OPERATION_TIMEOUT`]）に置く
+/// （#395 のレビュー P2）。
 ///
 /// **なぜ別にするか**: `Bootstrapper::connect()` は 1 回の呼び出しの中で
 /// 「旧キーの revoke → 新キーの issue → keyring 保存 → 記録の保存 → verify」
@@ -1016,7 +1026,8 @@ fn selection_saved_hub_timeout_reason() -> String {
     )
 }
 
-/// 副作用を伴う往復（[`HUB_MUTATING_TIMEOUT`]）を打ち切ったときの理由。
+/// Hub 側に副作用を残す往復（`connect` のみ。[`HUB_MUTATING_TIMEOUT`]）を
+/// 打ち切ったときの理由。
 ///
 /// 読み取り側（[`hub_timeout_reason`]）と違い、**Hub 側に APIキーが残って
 /// いるかもしれない**ことと、その探し方（キー名の接頭辞）まで伝える -
@@ -1044,8 +1055,11 @@ struct HubCall {
 }
 
 /// bootstrapper の**ネットワークを伴う**呼び出しは、操作ロックを持ったまま
-/// await するので、必ずこれで包む（[`HUB_OPERATION_TIMEOUT`] の doc 参照）。
-/// 包み忘れが 1 箇所でもあると、そこだけで全体が固まる。
+/// await するので、必ず上限を付ける - 包み忘れが 1 箇所でもあると、そこだけで
+/// 全体が固まる。**Hub 側に副作用を残さない経路（読み取り、および保存先が
+/// ローカルだけの `adopt_manual_key`）はこれで包む**。Hub にキーを発行させる
+/// `connect` だけは [`with_timeout`] + [`HUB_MUTATING_TIMEOUT`] を使う
+/// （どちらを使うかの根拠は [`HUB_OPERATION_TIMEOUT`] の doc 参照）。
 ///
 /// **タイムアウトはエラーではなく 6 状態の
 /// [`HubStatus::Unreachable`]（`UnreachableCause::Transport`）として返す**
@@ -1371,8 +1385,9 @@ impl HubService {
     /// [`Trigger::CredentialsChanged`] で**必ず張り直す**。
     pub async fn connect(&self, endpoint: &str) -> Result<HubView, BantoError> {
         let _operation = self.begin_operation().await?;
-        // **副作用を伴う往復**なので上限は [`HUB_MUTATING_TIMEOUT`]
-        // （#395 のレビュー B）。打ち切りは Hub 側の発行を取り消せない。
+        // **Hub 側にキーを発行させる唯一の経路**なので上限は
+        // [`HUB_MUTATING_TIMEOUT`]（#395 のレビュー B）。打ち切りは Hub 側の
+        // 発行を取り消せないので、その可能性を理由に載せる。
         let call = with_timeout(
             HUB_MUTATING_TIMEOUT,
             || hub_mutating_timeout_reason(&self.inner.installation_id),
@@ -1393,10 +1408,13 @@ impl HubService {
         key: String,
     ) -> Result<HubView, BantoError> {
         let _operation = self.begin_operation().await?;
-        // `connect` と同じく副作用を伴う（採用の前に旧キーを失効させる）。
-        let call = with_timeout(
-            HUB_MUTATING_TIMEOUT,
-            || hub_mutating_timeout_reason(&self.inner.installation_id),
+        // **Hub 側に副作用は無い**ので読み取り側の上限（#395 のレビュー P2）。
+        // この経路がネットワークに出るのは貼られたキーの検証
+        // （`verify()` = `GET /api/v1/tags`）だけで、成功後に書くのは OS
+        // キーリングと設定というローカル 2 つ。Hub 側のキーを発行も失効も
+        // しない（`previous_for` は保存済みの記録を読むだけ）ので、`connect`
+        // のような「打ち切ったら Hub にキーが残るかもしれない」窓が無い。
+        let call = with_hub_timeout(
             self.inner
                 .bootstrapper
                 .adopt_manual_key(endpoint.trim(), key),
@@ -1743,11 +1761,11 @@ impl HubService {
     /// （#394 のレビュー P1-1）。共有 crate の HTTP クライアントには
     /// タイムアウトが無く、1 箇所でも包み忘れると無応答の相手 1 回で Hub
     /// 機能全体が固まる。上限は 2 本あり、**どちらを使うかは副作用の有無で
-    /// 決める**（#395 のレビュー B）: 読み取りだけなら
-    /// [`with_hub_timeout`]（[`HUB_OPERATION_TIMEOUT`]）、キー発行のように
-    /// Hub 側に副作用が残るものは [`with_timeout`] +
-    /// [`HUB_MUTATING_TIMEOUT`]。打ち切りは**こちらが待つのをやめるだけ**で、
-    /// Hub が既に処理した要求は取り消せない。
+    /// 決める**（#395 のレビュー B / P2）: Hub 側に何も残らないなら
+    /// [`with_hub_timeout`]（[`HUB_OPERATION_TIMEOUT`]。読み取りと、保存先が
+    /// ローカルだけの `adopt_manual_key`）、Hub にキーを発行させる `connect`
+    /// だけは [`with_timeout`] + [`HUB_MUTATING_TIMEOUT`]。打ち切りは
+    /// **こちらが待つのをやめるだけ**で、Hub が既に処理した要求は取り消せない。
     async fn begin_operation(&self) -> Result<AsyncMutexGuard<'_, ()>, BantoError> {
         let guard = self.inner.operation.lock().await;
         self.hydrate_keeping_pending().await?;
@@ -1948,32 +1966,77 @@ mod tests {
         );
     }
 
-    /// 打ち切りが**購読まで届く**こと: 状態は `Unreachable`、購読は理由付きで
-    /// 停止、catalog は `null`（0 件ではない）。TCP は繋がるが 1 バイトも
-    /// 返さないリスナ＝この PR が直している「無応答」そのものを相手にする。
-    /// 時計は**足場を組み終えてから**止める（`start_paused` にすると、
-    /// SQLite の接続確立が blocking スレッドへ出ている間にランタイムが暇に
-    /// なって時計が飛び、`init_db_memory` のプール取得が即タイムアウトする）。
-    /// 実時間は待たない点は同じ。
-    #[tokio::test]
-    async fn a_hub_that_never_answers_stops_the_subscription_with_the_timeout_reason() {
+    /// 応答しないリスナ（TCP は繋がるが 1 バイトも返さない＝この PR が
+    /// 直している「無応答」そのもの）を相手に、**実際の操作経路**で打ち切りが
+    /// 起きることを確かめるための足場。
+    ///
+    /// **なぜ手で時計を進めるか**: `tokio::time::pause()` 中のランタイムは
+    /// 「暇になった瞬間」に時計を一番近い期限まで飛ばす。sqlite の問い合わせは
+    /// blocking スレッドへ出るので、`begin_operation()` の `hydrate()` の間
+    /// ランタイムは暇になり、そこで時計が飛ぶと **sqlx のプール取得（既定
+    /// 30 秒）が即タイムアウトする** - 実際に 5〜8% の頻度で
+    /// `pool timed out while waiting for an open connection` として落ちた。
+    /// そこで「常に実行可能なタスク」を 1 本置いてランタイムを暇にさせず、
+    /// **Hub へ接続が届いた（= DB の仕事が終わり、打ち切りのタイマーも
+    /// 仕掛かっている）のを確かめてから**自動進行を許す。実時間は待たない。
+    async fn drive_until_the_hub_is_reached<F>(
+        operation: F,
+        reached: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+    ) -> F::Output
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let spinner = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        let handle = tokio::spawn(operation);
+        reached
+            .recv()
+            .await
+            .expect("Hub への接続がリスナに届く（ここまでに DB の読み取りは終わっている）");
+        // ここから先は誰も DB を触らないので、時計が飛んでよい。
+        spinner.abort();
+        handle.await.expect("join")
+    }
+
+    /// accept だけして**何も返さず**接続を握り続けるリスナ（drop すると
+    /// 切断＝応答になってしまうので保持する）。接続が届くたびに通知する。
+    async fn silent_hub() -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+    ) {
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        // accept だけして**何も返さず**接続を握り続ける（drop すると
-        // 切断＝応答になってしまうので保持する）。
-        let silent = tokio::spawn(async move {
+        let (reached_tx, reached_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
             let mut held = Vec::new();
             while let Ok((stream, _)) = listener.accept().await {
                 held.push(stream);
+                let _ = reached_tx.send(());
             }
         });
+        (endpoint, server, reached_rx)
+    }
 
+    /// 打ち切りが**購読まで届く**こと: 状態は `Unreachable`、購読は理由付きで
+    /// 停止、catalog は `null`（0 件ではない）。
+    #[tokio::test]
+    async fn a_hub_that_never_answers_stops_the_subscription_with_the_timeout_reason() {
+        let (endpoint, silent, mut reached) = silent_hub().await;
         let (_settings, hub) = service_with_keyring(&endpoint, &["alpha"]).await;
 
         tokio::time::pause();
-        let view = hub.status().await.expect("打ち切りはエラーにしない");
+        let probe = hub.clone();
+        let view =
+            drive_until_the_hub_is_reached(async move { probe.status().await }, &mut reached)
+                .await
+                .expect("打ち切りはエラーにしない");
 
         assert_eq!(
             view.status.as_str(),
@@ -1989,6 +2052,74 @@ mod tests {
         assert!(
             reason.contains(&HUB_OPERATION_TIMEOUT.as_secs().to_string()),
             "『到達不能』に丸めず、打ち切った具体性を残す: {reason}"
+        );
+
+        silent.abort();
+    }
+
+    /// 打ち切りの上限と文言は**経路で変える**（#395 のレビュー P2）。
+    ///
+    /// * `adopt_manual_key` は Hub 側に副作用を持たない（ネットワークに出るのは
+    ///   貼られたキーの検証だけで、保存先は keyring と設定というローカル 2 つ。
+    ///   `previous_for` は保存済みの記録を読むだけ）。15 秒で切ってよく、
+    ///   ここで「Hub 側にAPIキーが作成されている可能性」と出すのは**誤情報**。
+    /// * `connect` は Hub にキーを発行させるので、打ち切ると本当に残り得る。
+    ///   60 秒まで待ち、残留の可能性と探し方を伝える。
+    #[tokio::test]
+    async fn only_the_key_issuing_path_warns_about_a_key_left_on_the_hub() {
+        const ORPHAN_WARNING: &str = "APIキーが作成されている可能性";
+
+        let (endpoint, silent, mut reached) = silent_hub().await;
+        let (_settings, hub) = service_with_keyring(&endpoint, &["alpha"]).await;
+
+        tokio::time::pause();
+
+        // 手動キーの採用: Hub 側には何も残らないので、孤児キーの案内は出さない。
+        let adopting = hub.clone();
+        let target = endpoint.clone();
+        let adopted = drive_until_the_hub_is_reached(
+            async move {
+                adopting
+                    .adopt_manual_key(&target, "bh_abcd1234_opaque-secret".to_owned())
+                    .await
+            },
+            &mut reached,
+        )
+        .await
+        .expect("打ち切りはエラーにしない");
+        assert_eq!(adopted.status.as_str(), "unreachable");
+        let reason = adopted.subscription.reason.expect("停止の理由を出す");
+        assert!(
+            reason.contains(&HUB_OPERATION_TIMEOUT.as_secs().to_string()),
+            "読み取り側の上限で切る: {reason}"
+        );
+        assert!(
+            !reason.contains(ORPHAN_WARNING),
+            "Hub 側にキーを作らない経路で「残っているかも」と言わない: {reason}"
+        );
+
+        // キーの発行を伴う接続: こちらは残り得るので、探し方まで伝える。
+        let connecting = hub.clone();
+        let target = endpoint.clone();
+        let connected = drive_until_the_hub_is_reached(
+            async move { connecting.connect(&target).await },
+            &mut reached,
+        )
+        .await
+        .expect("打ち切りはエラーにしない");
+        assert_eq!(connected.status.as_str(), "unreachable");
+        let reason = connected.subscription.reason.expect("停止の理由を出す");
+        assert!(
+            reason.contains(ORPHAN_WARNING),
+            "発行を伴う経路では残留の可能性を伝える: {reason}"
+        );
+        assert!(
+            reason.contains(&HUB_MUTATING_TIMEOUT.as_secs().to_string()),
+            "副作用側の上限で切る: {reason}"
+        );
+        assert!(
+            reason.contains(&format!("{APP_ID}-{}-", hub.inner.installation_id)),
+            "実際のキー名の接頭辞を出す（運用側が Hub の一覧で探せるように）: {reason}"
         );
 
         silent.abort();
