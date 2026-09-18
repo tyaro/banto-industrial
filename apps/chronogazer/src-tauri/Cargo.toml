@@ -36,8 +36,10 @@ serde_json = { workspace = true }
 # `tokio::sync::Mutex<Option<RunningServer>>` as AppState field types (spec
 # §3.5, §11.4) - tokio is already pulled in transitively via `tauri` and
 # `chronogazer-core`; this just makes a couple of its types nameable in
-# this crate's own source.
-tokio = { workspace = true, features = ["sync"] }
+# this crate's own source. `time` is for the exit cleanup's single
+# `tokio::time::timeout` (`shutdown_app_state`'s `EXIT_CLEANUP_BUDGET`) -
+# no timers are started anywhere else in this crate.
+tokio = { workspace = true, features = ["sync", "time"] }
 qrcode = { workspace = true }
 futures-util = { workspace = true }
 # OS keyring storage for the auto-login credential (spec M11) and, since
