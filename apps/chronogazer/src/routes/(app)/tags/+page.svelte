@@ -334,8 +334,16 @@
 		);
 	}
 
+	/**
+	 * #394 レビュー（追補2）: `deletingConnection`が真の間も編集フォーム
+	 * （`BantoForm`の`submitting`）が素通しだと、削除の応答待ちの間に同じIDへ
+	 * PUTを送れてしまう - `runGuardedSave`/`runGuardedDelete`の照合は「別の
+	 * 編集対象への応答混入」を防ぐだけで、同じID・同じフォームのまま始まる
+	 * 保存と削除の並走は防げない。開始条件に`savingConnection`も含めるのは
+	 * 保存ボタンの二重発火（PUTの二重送信）も一緒に塞ぐため。
+	 */
 	async function saveConnection(): Promise<void> {
-		if (!selectedConnection) return;
+		if (!selectedConnection || savingConnection || deletingConnection) return;
 		if (!editConnectionStore.validateAll()) return;
 		const pending: SaveGuardToken<typeof editConnectionStore> = {
 			id: selectedConnection.id,
@@ -567,8 +575,9 @@
 		editGroupStore = createFormStore(groupSchema(GROUP_EDIT), groupFormValues(GROUP_EDIT, group));
 	}
 
+	/** #394 レビュー（追補2）: 削除中も保存を素通しさせない（理由は `saveConnection` 参照）。 */
 	async function saveGroup(): Promise<void> {
-		if (!selectedGroup) return;
+		if (!selectedGroup || savingGroup || deletingGroup) return;
 		if (!editGroupStore.validateAll()) return;
 		const pending: SaveGuardToken<typeof editGroupStore> = {
 			id: selectedGroup.id,
@@ -812,8 +821,9 @@
 		editTagStore = createFormStore(tagSchema(TAG_EDIT), tagFormValues(TAG_EDIT, tag));
 	}
 
+	/** #394 レビュー（追補2）: 削除中も保存を素通しさせない（理由は `saveConnection` 参照）。 */
 	async function saveTag(): Promise<void> {
-		if (!selectedTag) return;
+		if (!selectedTag || savingTag || deletingTag) return;
 		if (!editTagStore.validateAll()) return;
 		const pending: SaveGuardToken<typeof editTagStore> = {
 			id: selectedTag.id,
@@ -942,7 +952,7 @@
 						schema={connectionSchema(PLC_EDIT)}
 						store={editConnectionStore}
 						onSubmit={saveConnection}
-						submitting={savingConnection}
+						submitting={savingConnection || deletingConnection}
 						submitLabel="保存"
 					>
 						<button
@@ -1008,7 +1018,7 @@
 						schema={groupSchema(GROUP_EDIT)}
 						store={editGroupStore}
 						onSubmit={saveGroup}
-						submitting={savingGroup}
+						submitting={savingGroup || deletingGroup}
 						submitLabel="保存"
 					>
 						<button
@@ -1074,7 +1084,7 @@
 						schema={tagSchema(TAG_EDIT)}
 						store={editTagStore}
 						onSubmit={saveTag}
-						submitting={savingTag}
+						submitting={savingTag || deletingTag}
 						submitLabel="保存"
 					>
 						<button

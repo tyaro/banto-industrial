@@ -29,6 +29,17 @@
  *    できません」という具体的な理由がトーストに出ること（修正前は
  *    `ProviderError.message`が一律`"validation failed"`になり理由が
  *    消えていた）。データも消えていないことを一覧で確認する。
+ * 6.（#394レビュー P2 の回帰固定）削除の応答待ち（`page.route`で`DELETE`を
+ *    保留するゲート - 作法は`e2e/tests-banto-hub/banto-hub-tags-busy.spec.ts`
+ *    に倣う）の間、編集フォームの入力欄・保存ボタン・削除ボタンが無効化
+ *    されること、保存を試みても`PUT`が送信されないこと（修正前は
+ *    `submitting`に削除中フラグが入っておらず、削除の`await`中に同じ行へ
+ *    `PUT`を送れてしまっていた）。削除が検証エラーで拒否された場合は、
+ *    具体的な理由が表示され、編集操作が再び有効に戻ることも確認する
+ *    （子を持つ PLC接続の削除を既存の拒否経路として使う）。PLC接続でのみ
+ *    固定する - 収集グループ・タグの`saveX`/`submitting`は同じ3行の形
+ *    （`savingX || deletingX`）で入っており、差分レビューで確認済み
+ *    （理由は本テストのdoc comment参照）。
  *
  * ファイル名について: `smoke.spec.ts` が初回セットアップ（管理者アカウント
  * 作成）を実 DOM で行うため、このファイルは辞書順でそれより後でなければ
@@ -202,6 +213,93 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 			await expect(viewerPage.getByRole('button', { name: '削除' })).toHaveCount(0);
 		} finally {
 			await viewerPage.close();
+		}
+	});
+
+	test('10. 削除の応答待ちの間は編集フォームが無効化され、保存を試みてもPUTは送信されない。拒否後は編集操作が再び有効に戻る', async () => {
+		// #394レビューP2: `deletingConnection`が真の間、以前は編集フォーム
+		// （`BantoForm`の`submitting`）が素通しで、削除の応答待ちの間に同じ
+		// PLC接続へ`PUT`を送れてしまっていた。CONNECTION_NAMEはGROUP_NAMEが
+		// 参照しているため、このDELETEはサーバー側の検証で拒否される
+		// （#391レビューCで固定した既存の拒否経路 - test 7と同じ理由）。
+		await page.goto('/tags');
+		const section = page.locator('section.registry-section').nth(0);
+
+		// `DELETE /api/plc-connections/:id`だけを遅延させ、無効化ウィンドウを
+		// 作る（作法は`e2e/tests-banto-hub/banto-hub-tags-busy.spec.ts`の
+		// `page.route`ゲートに倣う）。`PUT`はカウントするだけで素通しする -
+		// 「保存を試みても実際にはPUTが飛んでいない」ことをネットワークレベルで
+		// 確認するため（ボタンのdisabled表示だけでは、もし保存ハンドラの
+		// ガードが抜けていても見た目上は気づけない）。
+		let releaseDelete: (() => void) | undefined;
+		const deleteGate = new Promise<void>((resolve) => {
+			releaseDelete = resolve;
+		});
+		let putCount = 0;
+		await page.route('**/api/plc-connections/*', async (route) => {
+			const req = route.request();
+			if (req.method() === 'DELETE') {
+				await deleteGate;
+				await route.continue();
+				return;
+			}
+			if (req.method() === 'PUT') {
+				putCount += 1;
+			}
+			await route.continue();
+		});
+
+		try {
+			await section
+				.locator('div.list')
+				.getByRole('gridcell', { name: CONNECTION_NAME, exact: true })
+				.click();
+			const detail = section.locator('div.detail');
+			await expect(
+				detail.getByRole('heading', { level: 4, name: `${CONNECTION_NAME} を編集` })
+			).toBeVisible();
+
+			const nameInput = detail.getByLabel('名前');
+			const saveButton = detail.getByRole('button', { name: '保存' });
+			const deleteButton = detail.getByRole('button', { name: '削除' });
+
+			page.once('dialog', (dialog) => void dialog.accept());
+			await deleteButton.click();
+
+			// DELETEの応答待ちの間: 入力欄・保存ボタン・削除ボタンが無効。
+			await expect(nameInput).toBeDisabled();
+			await expect(saveButton).toBeDisabled();
+			await expect(deleteButton).toBeDisabled();
+
+			// 保存を試みてもPUTは送信されない（ネイティブのdisabled要素は
+			// forceクリックしてもクリックイベントを発火しない - ブラウザの
+			// 標準動作。それでも実際にネットワークへ出ていないことを
+			// `putCount`で確認する）。
+			await saveButton.click({ force: true, timeout: 2000 }).catch(() => {});
+			expect(putCount).toBe(0);
+
+			// ゲートを解放し、拒否応答を受け取る。
+			const deleteResponse = page.waitForResponse(
+				(res) =>
+					res.request().method() === 'DELETE' && /\/api\/plc-connections\/\d+$/.test(res.url())
+			);
+			releaseDelete?.();
+			await deleteResponse;
+
+			// 拒否理由が具体的に出て、データは消えていない（#391レビューC）。
+			await expect(
+				page.getByText('この接続を使用している収集グループが1件あるため削除できません')
+			).toBeVisible();
+			await expect(section.locator('div.list').getByText(CONNECTION_NAME)).toBeVisible();
+
+			// 拒否後は編集操作が再び有効に戻る。
+			await expect(nameInput).toBeEnabled();
+			await expect(saveButton).toBeEnabled();
+			await expect(deleteButton).toBeEnabled();
+
+			expect(putCount).toBe(0);
+		} finally {
+			await page.unroute('**/api/plc-connections/*');
 		}
 	});
 });
