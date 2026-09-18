@@ -13,8 +13,15 @@ import {
 	splitServerFieldErrors,
 	joinFieldErrorMessages,
 	wireFieldName,
+	listSectionView,
+	showsRetry,
+	listRows,
+	createFormGate,
 	type SaveGuardToken,
-	type DeleteGuardToken
+	type DeleteGuardToken,
+	type ListLoadState,
+	type ListSectionView,
+	type CreateFormGate
 } from './tagsPageLogic';
 
 // --- A: isSaveStillCurrent / runGuardedSave --------------------------------
@@ -356,5 +363,83 @@ describe('joinFieldErrorMessages', () => {
 
 	it('field_errors が空なら空文字列', () => {
 		expect(joinFieldErrorMessages([])).toBe('');
+	});
+});
+
+// --- D: 一覧の3状態（未読込 / 読み込み失敗 / 読み込めて0件） ---------------
+
+describe('listSectionView / showsRetry / createFormGate', () => {
+	interface Row {
+		id: number;
+	}
+	const ROW: Row = { id: 1 };
+
+	/**
+	 * 状態の総当たり表（#394レビュー P1-3）。列は「一覧セクションの見せ方」
+	 * 「再試行の導線を出すか」「その一覧に依存する作成フォームの出し方」。
+	 * ここが崩れると「読めていない」が「0件」に化けて、誤った案内が出る。
+	 */
+	const table: {
+		label: string;
+		state: ListLoadState<Row>;
+		view: ListSectionView;
+		retry: boolean;
+		gate: CreateFormGate;
+	}[] = [
+		{
+			label: '未読込（まだ読んでいない）',
+			state: { items: null, error: null },
+			view: 'loading',
+			retry: false,
+			gate: 'dependency-loading'
+		},
+		{
+			label: '読み込み失敗（一度も読めていない）',
+			state: { items: null, error: '接続できません' },
+			view: 'failed',
+			retry: true,
+			gate: 'dependency-failed'
+		},
+		{
+			label: '読めて0件',
+			state: { items: [], error: null },
+			view: 'grid',
+			retry: false,
+			gate: 'needs-prerequisite'
+		},
+		{
+			label: '読めて1件以上',
+			state: { items: [ROW], error: null },
+			view: 'grid',
+			retry: false,
+			gate: 'form'
+		},
+		{
+			label: '読めていたが再取得に失敗（前回の内容が残っている）',
+			state: { items: [ROW], error: '接続できません' },
+			view: 'grid',
+			retry: true,
+			gate: 'form'
+		}
+	];
+
+	for (const row of table) {
+		it(`${row.label}: view=${row.view} / retry=${row.retry} / gate=${row.gate}`, () => {
+			expect(listSectionView(row.state)).toBe(row.view);
+			expect(showsRetry(row.state)).toBe(row.retry);
+			expect(createFormGate(row.state)).toBe(row.gate);
+		});
+	}
+
+	it('読み込み失敗を「0件」に潰さない（グリッドを描かず、案内も出さない）', () => {
+		const failed: ListLoadState<Row> = { items: null, error: '接続できません' };
+		expect(listSectionView(failed)).not.toBe('grid');
+		// 「先に○○を作成してください」に相当するゲートは、読めて0件のときだけ。
+		expect(createFormGate(failed)).not.toBe('needs-prerequisite');
+	});
+
+	it('listRows は未読込でも空配列を返す（グリッド自体は描かない前提）', () => {
+		expect(listRows<Row>({ items: null, error: null })).toEqual([]);
+		expect(listRows<Row>({ items: [ROW], error: null })).toEqual([ROW]);
 	});
 });

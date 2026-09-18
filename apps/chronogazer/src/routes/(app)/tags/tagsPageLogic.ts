@@ -6,7 +6,7 @@
  * の別ルート）に倣い、状態を持たない判断だけをここに出して依存ゼロで
  * テストする。
  *
- * 収める理由は3件のレビュー指摘に対応する:
+ * 収める理由は4件のレビュー指摘に対応する:
  *
  * A. **保存中の行切替による取り違え**: PLC接続・収集グループ・タグの
  *    3セクションはどれも「行を選択→編集フォームを表示→保存」という同型の
@@ -48,6 +48,11 @@
  *    `field_errors`の`message`を連結し、「この接続を使用している収集
  *    グループがN件あるため削除できません」のような理由をそのまま
  *    トーストに出せるようにする。
+ *
+ * D. **一覧の取得失敗が「0件」に潰れる**（#394レビュー P1-3）:
+ *    `listSectionView`/`createFormGate`（下記「D」）が「未読込 / 読み込み
+ *    失敗 / 読み込めて0件」の3状態を分け、失敗した一覧を0行のグリッドとして
+ *    描かない・「先に○○を作成してください」を読めて0件のときだけ出す。
  */
 
 export interface FieldError {
@@ -250,4 +255,80 @@ export function splitServerFieldErrors(
  */
 export function joinFieldErrorMessages(fieldErrors: readonly FieldError[]): string {
 	return fieldErrors.map((fe) => fe.message).join(' / ');
+}
+
+// --- D: 一覧の「未読込 / 読み込み失敗 / 読み込めて0件」の区別 ---------------
+//
+// #394レビュー P1-3: 3つの一覧（PLC接続 / 収集グループ / タグ）は失敗時に
+// トーストを出すだけで、変数は初期値`[]`のままだった。トーストが消えると
+// グリッドは0行のまま残り、「1件も登録されていない」という**永続的な誤表示**
+// になる。さらに作成フォームの分岐が「先にPLC接続を1件以上作成してください」
+// という**誤った指示**まで出し、利用者を重複登録へ誘導していた。
+//
+// 同じアプリのHub側は既にこの規律を持っている（`hubAdmin.ts`の
+// `HubView.tags: HubTag[] | null`で「この往復では読めていない」と「読めた
+// 結果0件」を別物にし、`HubSection.svelte`が表示に反映する）。ここでは
+// その書き方をタグ設定画面に持ち込み、判断だけを純関数に出して総当たりで
+// テストする（チェックリスト§5「エラーを『空』に潰さない」「判断は純関数に
+// 出して状態の総当たりを表でテストする」）。
+
+/**
+ * 1つの一覧の読み込み状態。`items === null`は「まだ読めていない（未読込 or
+ * 失敗）」で、`[]`（読めた結果0件）とは**別物**。`error`は直近の読み込みが
+ * 失敗した理由（成功したら`null`に戻す）。
+ *
+ * 読み込みに失敗しても、既に読めていた`items`は捨てない - 最後に読めた
+ * 内容を残したまま「更新できなかった」と添える方が、0行に戻すより正確。
+ */
+export interface ListLoadState<T> {
+	items: T[] | null;
+	error: string | null;
+}
+
+/**
+ * 一覧セクションの見せ方:
+ * - `loading`: まだ読めていない（失敗もしていない）。読み込み中の表示。
+ * - `failed`: 一度も読めておらず、失敗した。**グリッドを0件として描かず**、
+ *   失敗した旨と再試行の導線を出す。
+ * - `grid`: 読めている（0件でもこちら）。グリッドを描く。
+ */
+export type ListSectionView = 'loading' | 'failed' | 'grid';
+
+export function listSectionView<T>(state: ListLoadState<T>): ListSectionView {
+	if (state.items !== null) return 'grid';
+	return state.error !== null ? 'failed' : 'loading';
+}
+
+/** 再試行の導線を出すか。直近の読み込みが失敗しているとき（未読込の失敗でも、読めた内容が残ったままの更新失敗でも）。 */
+export function showsRetry<T>(state: ListLoadState<T>): boolean {
+	return state.error !== null;
+}
+
+/** グリッドに渡す行。`null`（未読込）でも`[]`を渡すが、**その場合グリッド自体を描かない**（`listSectionView`が`grid`を返さない）のが前提。 */
+export function listRows<T>(state: ListLoadState<T>): T[] {
+	return state.items ?? [];
+}
+
+/**
+ * 依存する一覧（収集グループにとってのPLC接続、タグにとっての収集グループ）の
+ * 状態から決まる、作成フォームの出し方:
+ * - `form`: 依存先が読めていて1件以上ある。フォームを出す。
+ * - `needs-prerequisite`: 依存先が**読めた結果0件**。「先に○○を作成して
+ *   ください」を出してよいのはこのときだけ。
+ * - `dependency-loading` / `dependency-failed`: 依存先を読めていない。
+ *   `<select>`の候補が空のフォームを出すと「候補が無い」ように見えるので
+ *   出さず、読み込み中である／読めなかったことをそのまま伝える。
+ */
+export type CreateFormGate =
+	'form' | 'needs-prerequisite' | 'dependency-loading' | 'dependency-failed';
+
+export function createFormGate<T>(dependency: ListLoadState<T>): CreateFormGate {
+	switch (listSectionView(dependency)) {
+		case 'grid':
+			return (dependency.items as T[]).length === 0 ? 'needs-prerequisite' : 'form';
+		case 'failed':
+			return 'dependency-failed';
+		default:
+			return 'dependency-loading';
+	}
 }
