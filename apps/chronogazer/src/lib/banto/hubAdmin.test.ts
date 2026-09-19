@@ -27,6 +27,7 @@ import {
 	hubTimeLabel,
 	hubRemainderNote,
 	hubUnreachableCauseLabel,
+	HUB_UI_REREAD_TIMEOUT_MS,
 	HUB_UI_TIMEOUT_MS,
 	isPollGenerationCurrent,
 	isPollResultFresh,
@@ -781,6 +782,20 @@ describe('runWithLimit（明示操作にも使う汎用の上限）', () => {
 		expect(HUB_UI_TIMEOUT_MS).toBeGreaterThan((60 + 15) * 1000);
 		// ポーリングの上限とは別物（あちらは 1 回のメモリ読み取り）。
 		expect(HUB_UI_TIMEOUT_MS).toBeGreaterThan(SUBSCRIPTION_POLL_TIMEOUT_MS);
+	});
+
+	it('自動の読み直し専用の上限（15秒）は、明示操作の上限（90秒）より短い（#400）', () => {
+		// `rereadAfterAbandon()` に来た時点で、直前の操作は既に 90 秒応答して
+		// いない（＝固まっている）ことが確定しているので、もう一度 90 秒待つ
+		// 意味が無い。逆に「正当に遅いだけの最長」（60 + 15 ≒ 75 秒、上の
+		// テスト参照）は 90 秒の上限に届かないので、この経路には来ない -
+		// 15 秒に縮めても正常な応答を見限らない。
+		//
+		// **どちらの定数がどちらの呼び出し（`rereadAfterAbandon` /
+		// `reconfirmStatus`）に渡っているかは、この関係だけでは固定できない**
+		// - `HubSection.svelte` 側の配線であって、純関数の入出力には出ない。
+		expect(HUB_UI_REREAD_TIMEOUT_MS).toBe(15000);
+		expect(HUB_UI_REREAD_TIMEOUT_MS).toBeLessThan(HUB_UI_TIMEOUT_MS);
 	});
 });
 

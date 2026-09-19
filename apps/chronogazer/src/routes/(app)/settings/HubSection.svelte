@@ -68,6 +68,7 @@
 		hubSubscriptionDetail,
 		hubSubscriptionHeadline,
 		hubTimeLabel,
+		HUB_UI_REREAD_TIMEOUT_MS,
 		HUB_UI_TIMEOUT_MS,
 		isHubAvailable,
 		isPollGenerationCurrent,
@@ -251,15 +252,23 @@
 	 * （実は成功していたなら、正しい状態が出る）。読み直しも打ち切られたら
 	 * **新しい状態を作らない** - 前の表示を残したまま、最新ではないと書く。
 	 *
-	 * 読み直しは `getHubStatus()` で、これも `HUB_UI_TIMEOUT_MS` を持つ
-	 * （持たないと、ここで再び永久に戻らなくなり `busy` が解放されない）。
+	 * 読み直しは `getHubStatus()` で、これも上限を持つ（持たないと、ここで
+	 * 再び永久に戻らなくなり `busy` が解放されない）。ただし**ここだけは
+	 * `HUB_UI_TIMEOUT_MS` ではなく `HUB_UI_REREAD_TIMEOUT_MS`（15 秒、
+	 * #400 オーナー決定 2026-09-20）を使う**: この関数に来た時点で、直前の
+	 * 操作は 90 秒応答しなかったことが確定済み（「遅い」ではなく「固まって
+	 * いる」）なので、もう一度 90 秒待っても情報は増えず、画面の停止が
+	 * 合計 180 秒になるだけ。使い分けの詳しい根拠は
+	 * `HUB_UI_REREAD_TIMEOUT_MS` の doc を参照（`reconfirmStatus()` は任意の
+	 * タイミングで押されるため対象外 - 単に忙しいだけの往復を見限ってしまう）。
 	 *
 	 * **`busy` を降ろす前に済ませる**のは、読み直しの応答が、その間にユーザーが
 	 * 起こした新しい操作の結果を巻き戻さないようにするため。待ちは最悪でも
-	 * `HUB_UI_TIMEOUT_MS` の 2 回分で必ず終わる（無限に固まらない、が目的）。
+	 * `HUB_UI_TIMEOUT_MS` + `HUB_UI_REREAD_TIMEOUT_MS`（90 + 15 秒）で必ず
+	 * 終わる（無限に固まらない、が目的）。
 	 */
 	async function rereadAfterAbandon(): Promise<void> {
-		const reread = await runWithLimit((signal) => getHubStatus(signal), HUB_UI_TIMEOUT_MS);
+		const reread = await runWithLimit((signal) => getHubStatus(signal), HUB_UI_REREAD_TIMEOUT_MS);
 		const display = hubAbandonedDisplay(true, reread.kind === 'ok');
 		if (display.applyStatus && reread.kind === 'ok') applyView(reread.value);
 		// オーナーレビュー P2-1: 読み直せなかったときは、警告を出すだけでなく
