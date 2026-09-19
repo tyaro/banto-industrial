@@ -1,7 +1,8 @@
 # 実装チェックリスト（毎セッション読み込み）
 
 状態: **運用中**。[CLAUDE.md](../CLAUDE.md) から `@` インポートされ、セッション開始時とサブエージェントに必ず読み込まれる。
-最終更新: 2026-09-19（§6 をオーナーレビュー運用に更新。Copilot はクォータ上限で当面使えず、
+最終更新: 2026-09-20（§2 に「prettier をリポジトリ全体にかけない」を追加。CRLF の作業ツリーで整形漏れと誤認しかけた）
+2026-09-19（§6 をオーナーレビュー運用に更新。Copilot はクォータ上限で当面使えず、
 レビューはオーナーが行う。#397 のレビューで出た 3 類型を自分の監査の観点として追加）
 初版: 2026-09-17（#385 の Copilot レビュー 6 往復で繰り返し出た指摘を反映して新設。同日追記:
 #387 で「失効対象の ID が同じ接続先のものか確認する」を追加 - #382 と同じ間違いの再発）
@@ -32,6 +33,7 @@
 4. [ ] **`pnpm exec eslint <触った src と e2e>`** — **`pnpm --filter <app> check`（svelte-check）は ESLint を回さない。** CI には両方ある。
 5. [ ] `pnpm --filter <app> check` → `pnpm --filter <app> test`
 6. [ ] `pnpm exec prettier --write <編集した md/ts/svelte 全部>` → **整形後にもう一度 test と eslint**（整形が壊すことがある）
+   - [ ] **`prettier --check .` をリポジトリ全体にかけない**（**`prettier --write .` は絶対にかけない**）。Windows の作業ツリーは CRLF なので、**main が CI で緑でもローカルでは 340 件の「差分あり」が出る**（CI は Linux/LF）。これを整形漏れと誤認して `--write .` を実行すると、**全ファイルの改行を書き換えた巨大な差分**になる。対象は**編集したファイルだけ**に絞る。全体を比べたいときは **`--end-of-line auto` を付ける**（2026-09-20: prettier 3.9.8 が整形結果を変えるかを調べて 340 件に当たった。**現行版で同じコマンドを回す対照**を取ったら同じ 340 件で、原因は版ではなく改行だった。**依存を上げる前後の比較は、必ず同じ条件で対照を取る**）。
 7. [ ] E2E の前に必ず: `pnpm --filter <app> build` → **`cargo build -p <core> --bin <bin> --features embed-ui`**（**`--features embed-ui` を落とすと smoke が全滅する**）
 8. [ ] E2E は **1 回だけ**。実行前に残プロセスが 0 で、ポートが空いていることを確認（Windows: `Get-Process <bin>` / POSIX: `pgrep -f <bin>`）。**同時に 2 つ走らせない**。失敗の詳細は `e2e/test-results-*/<test>/error-context.md`
 9. [ ] `cargo deny check`（CI にある）
