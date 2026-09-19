@@ -27,6 +27,9 @@ use banto_server::{
 use chronogazer_core::assets::FrontendAssets;
 use chronogazer_core::audit::{AuditEntry, AuditLogEntry, AuditLogService};
 use chronogazer_core::backup::{BackupInfo, BackupService, PendingRestoreInfo};
+// #383 段階2b / R1-C（C-1）: 収集サービス。この PR ではコマンドを生やさず、
+// `AppState` に載せて**終了時に止める**だけ（開始は C-2）。
+use chronogazer_core::collect::{resolve_data_dir, CollectorService};
 use chronogazer_core::db::init_db;
 use chronogazer_core::events::event_channel;
 use chronogazer_core::hub::{HubService, HubSubscriptionView, HubView};
@@ -116,6 +119,13 @@ struct AppState {
     plc_connections: PlcConnectionService,
     collection_groups: CollectionGroupService,
     tags: TagService,
+    /// #383 段階2b / R1-C（C-1）: 収集ランタイム。**この PR では誰も
+    /// `start()` を呼ばない**（自動開始も操作コマンドも C-2）- ここに置いて
+    /// あるのは、[`shutdown_app_state`] が終了時に確実に止められるように
+    /// するため。収集は「PLC から読んで tstore に書く」側なので、Tauri の
+    /// managed state が drop されないこのアプリでは、終了フックが唯一の
+    /// 「止める場所」になる。
+    collect: CollectorService,
     /// The one SQLite pool every service above is a `Clone` handle onto,
     /// kept here solely so [`shutdown_app_state`] can `close()` it when the
     /// app exits (flushing/removing the `-wal`/`-shm` sidecar files instead
@@ -1802,20 +1812,43 @@ const EXIT_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 /// `exit_cleanup_closes_the_pool`, and [`run`] for what that test does NOT
 /// cover.
 ///
-/// **Order matters**, and it is "outermost producer first, the thing they all
-/// write to last":
+/// **Order matters**, and it is "消費者を先に止め、書き手はその後、みんなが
+/// 書き込む先は最後":
 ///
 /// 1. **Hub subscriptions** - closes the WS generation and stops the
 ///    supervisor, so nothing keeps waking up to touch the settings DB or the
 ///    network while we are tearing the rest down.
 /// 2. **The embedded LAN server** - stops accepting new requests and lets
 ///    in-flight ones finish. Its handlers use the same pool, so it has to be
-///    down before step 3.
-/// 3. **The SQLite pool** - closed last, once nothing can still use it.
+///    down before step 4.
+/// 3. **収集（#383 段階2b / R1-C）** - **消費者を全部止めた後、DB プールを
+///    閉じる前**。収集は PLC から読んだ値を tstore と `collect_events` に
+///    書く**書き手**なので、`banto-hub` の `RunningHub::shutdown`
+///    （`apps/banto-hub/core/src/runtime.rs`）が採っているのと同じ方針
+///    - 「read-only な消費者（LAN サーバー・Hub 購読）を先に止め、収集は
+///    依存が全部止まってから」に揃える。先に収集を止めてしまうと、まだ
+///    生きている消費者が「値が止まった収集エンジン」を観測する時間帯が
+///    できる。逆に DB プールより後ろへ回すと、最終 flush の書き込み先が
+///    もう閉じている。
+/// 4. **The SQLite pool** - closed last, once nothing can still use it.
 ///
 /// Every step is best-effort: `HubService::shutdown` and `RunningServer::stop`
-/// swallow their own failures, and the whole sequence is capped by
+/// swallow their own failures, `CollectorService::stop` の失敗（最終 flush）は
+/// ログに出すだけ、そして the whole sequence is capped by
 /// [`EXIT_CLEANUP_BUDGET`].
+///
+/// **テストの範囲**（#396 と同じ書き方）: この関数の**中身**は
+/// `exit_cleanup_closes_the_pool` が合成 [`AppState`] に対して実行して
+/// いる（#383 R1-C で収集の停止もそこに足した）が、**`tauri::RunEvent::Exit`
+/// から実際にここへ来る経路は自動テストしていない** - 理由と、それでも
+/// そこを試そうとした場合に何が要るかは [`run`] の `RunEvent::Exit` 腕の
+/// コメントに書いてある。
+///
+/// [`EXIT_CLEANUP_BUDGET`] は **5 秒のまま据え置いた**（#383 R1-C C-1）。
+/// 収集の停止は「接続タスクを join して tstore を最終 flush する」だけで、
+/// どれもローカルのディスク操作。この PR ではそもそも誰も収集を開始しない
+/// ので、現実に予算を食い始めるのは C-2 以降 - **実機で 5 秒に収まらない
+/// ことが分かったら、勝手に増やさずオーナーに報告すること。**
 async fn shutdown_app_state(state: &AppState) {
     let cleanup = async {
         // #383 段階1 の購読世代 + 見張り。`shutdown()` は操作ロックを
@@ -1828,6 +1861,15 @@ async fn shutdown_app_state(state: &AppState) {
         // 残しておく意味が無いのと、二重に stop されないようにするため。
         if let Some(running) = state.server.lock().await.take() {
             running.stop().await;
+        }
+
+        // #383 段階2b / R1-C: 収集（書き手）は消費者の後・DB の前 - 順序の
+        // 理由はこの関数の doc。走っていなければ `stop()` は何もしない
+        // （冪等）ので、この PR のように誰も `start()` を呼ばないうちは
+        // ここは実質 no-op。失敗しても終了は止めない（失われうるのは
+        // tstore の最後の未 flush 分だけで、固まる方が悪い）。
+        if let Err(err) = state.collect.stop().await {
+            eprintln!("banto: 終了時の収集の停止に失敗しました: {err}");
         }
 
         // 最後に DB。`close()` は全接続が返るのを待ってからプールを閉じる
@@ -1884,6 +1926,21 @@ pub fn run() {
             let plc_connections = PlcConnectionService::new(pool.clone());
             let collection_groups = CollectionGroupService::new(pool.clone());
             let tags = TagService::new(pool.clone());
+            // #383 段階2b / R1-C（C-1）: 収集ランタイム。`data.dir` は設定
+            // から読み、**相対パスはこのアプリのデータディレクトリ基準**で
+            // 解決する（既定 `"./data"` をそのまま使うと、プロセスの作業
+            // ディレクトリという当てにならない場所に時系列ファイルを作って
+            // しまう）。`retention.days` はここでは読まない - **この PR は
+            // ファイルを一切削除しない**（`chronogazer_core::settings::StoreSettings`
+            // の doc 参照）。
+            //
+            // ここでは**起動しない**。`start()` を呼ぶのは C-2。
+            let store_settings = tauri::async_runtime::block_on(settings.store_config())
+                .expect("store_config should succeed");
+            let collect = CollectorService::new(
+                pool.clone(),
+                resolve_data_dir(&data_dir, &store_settings.data_dir),
+            );
             let audit = AuditLogService::new(pool.clone());
             // Records `login`/`login_failed` audit entries (spec M14) from
             // inside the verifier itself - see
@@ -2176,6 +2233,7 @@ pub fn run() {
                 plc_connections,
                 collection_groups,
                 tags,
+                collect,
                 pool,
             });
 
@@ -2366,6 +2424,9 @@ mod tests {
             plc_connections: PlcConnectionService::new(pool.clone()),
             collection_groups: CollectionGroupService::new(pool.clone()),
             tags: TagService::new(pool.clone()),
+            // 収集は起動しないので `data_dir` は使われない（`backup` の
+            // `"unused-in-tests"` と同じ扱い）。
+            collect: CollectorService::new(pool.clone(), PathBuf::from("unused-in-tests")),
             pool,
         }
     }
@@ -2414,6 +2475,7 @@ mod tests {
             plc_connections: PlcConnectionService::new(pool.clone()),
             collection_groups: CollectionGroupService::new(pool.clone()),
             tags: TagService::new(pool.clone()),
+            collect: CollectorService::new(pool.clone(), dir.path().join("data")),
             pool,
         };
         (dir, state)
@@ -2438,6 +2500,14 @@ mod tests {
             state.hub.subscription().await.state,
             "stopped",
             "購読は止まっている"
+        );
+        // #383 段階2b / R1-C: 収集も止まっている（この PR では一度も
+        // 開始していないので、`stop()` が「何もしない」で通ることの確認も
+        // 兼ねている）。
+        assert_eq!(
+            state.collect.state(),
+            chronogazer_core::collect::CollectorState::Stopped,
+            "収集は止まっている"
         );
     }
 

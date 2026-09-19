@@ -1,6 +1,7 @@
 //! Database bootstrap for the chronogazer app (spec §12): connect, apply
 //! this app's own schema, then `banto_tags::migrate` (I1's PLC connection/
-//! collection group/tag registry tables) against the SAME pool -
+//! collection group/tag registry tables), then `banto_collect::migrate`
+//! (I3b's `collect_events` table, #383 段階2b) against the SAME pool -
 //! ChronoGazer shares one SQLite database across the app's own tables
 //! (settings/users/audit_log) and every I-series crate's tables (plan.md
 //! §5: "single app-data file"), so this is the one place that bootstraps
@@ -76,6 +77,18 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), BantoError> {
     // called this way, and this module's own doc comment for why THIS
     // app's half is deliberately NOT also a `sqlx::migrate!` source.
     banto_tags::migrate(pool).await?;
+    // I3b / #383 段階2b（R1-C）: `banto-collect` の `collect_events` テーブル。
+    // `crate::collect::CollectorService` が持つ `EventSink` の**永続側**の
+    // 出力先で、live broadcast と対になっている。`EventSink::emit` は
+    // insert の失敗を握り潰す（収集を止めないため）ので、ここで作っておかないと
+    // イベントは黙って消える - `banto_collect::migrate` の doc が
+    // 「consuming app が `banto_tags::migrate` の後に 1 回呼ぶ」と定めている
+    // のがまさにこの位置で、`apps/banto-hub/core/src/db.rs` も同じ順序で
+    // 呼んでいる。`sqlx::migrate!` ではなく冪等 DDL なので、このモジュールの
+    // doc が言う migrator の衝突も起こさない。
+    banto_collect::migrate(pool)
+        .await
+        .map_err(|err| BantoError::Other(err.to_string()))?;
     Ok(())
 }
 
@@ -205,6 +218,8 @@ mod tests {
             "plc_connections",
             "collection_groups",
             "tags",
+            // #383 段階2b / R1-C: `banto_collect::migrate` の分。
+            "collect_events",
         ] {
             let exists: Option<String> = sqlx::query_scalar(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",

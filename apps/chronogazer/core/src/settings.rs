@@ -20,6 +20,10 @@ const KEY_AUTOLOGIN_ENABLED: &str = "auth.autologin.enabled";
 const KEY_AUTOLOGIN_USERNAME: &str = "auth.autologin.username";
 const KEY_AUDIT_RETENTION_DAYS: &str = "audit.retention_days";
 const KEY_AUDIT_RETENTION_ROWS: &str = "audit.retention_rows";
+/// #383 段階2b / R1-C: 収集ランタイムの保存先と保持期間
+/// （`apps/banto-hub/core/src/settings.rs` の `StoreSettings` と同じキー名）。
+const KEY_DATA_DIR: &str = "data.dir";
+const KEY_RETENTION_DAYS: &str = "retention.days";
 
 /// Default audit-log retention (spec M14): 90 days / 100,000 rows. There is
 /// deliberately no "audit enabled" toggle - the audit trail is a standard
@@ -27,6 +31,20 @@ const KEY_AUDIT_RETENTION_ROWS: &str = "audit.retention_rows";
 /// is configurable.
 const DEFAULT_AUDIT_RETENTION_DAYS: i64 = 90;
 const DEFAULT_AUDIT_RETENTION_ROWS: i64 = 100_000;
+
+/// 時系列ファイルの既定の置き場（#383 段階2b / R1-C）。banto-hub の
+/// `StoreSettings` に倣った相対パス。**相対パスの解決先**は
+/// [`crate::collect::resolve_data_dir`] が決める（作業ディレクトリではなく
+/// アプリのデータディレクトリ基準 - デスクトップアプリの作業ディレクトリは
+/// 何であるか分からないため）。
+const DEFAULT_DATA_DIR: &str = "./data";
+
+/// 時系列データの既定の保持期間（日）。**90 日**
+/// （docs/recorder-requirements.md §3.4「保持期間既定 90 日（設定可）」）。
+///
+/// banto-hub の既定は 7 日だが、あれは**Hub のローカル記録**の話なので
+/// 真似しない。ChronoGazer は記録計そのものであり、要件の 90 日が正。
+const DEFAULT_RETENTION_DAYS: i64 = 90;
 
 /// `0以下は「無制限」として None 扱い` (spec M14): normalizes a parsed
 /// retention value so a non-positive number always reads back as "no
@@ -173,6 +191,39 @@ impl Default for AuditSettings {
         Self {
             retention_days: Some(DEFAULT_AUDIT_RETENTION_DAYS),
             retention_rows: Some(DEFAULT_AUDIT_RETENTION_ROWS),
+        }
+    }
+}
+
+/// 収集ランタイムの保存設定（#383 段階2b / R1-C、キーは
+/// `data.dir` / `retention.days`）。`apps/banto-hub/core/src/settings.rs` の
+/// 同名の型が手本。
+///
+/// * `data_dir`: 時系列ファイル（`banto-tstore`）の置き場。既定は banto-hub に
+///   倣って `"./data"`。**相対パスの解決先**は
+///   [`crate::collect::resolve_data_dir`]（アプリのデータディレクトリ基準）。
+/// * `retention_days`: 保持期間。既定 **90 日**
+///   （docs/recorder-requirements.md §3.4）。`None` は「無制限」
+///   （[`normalize_retention`] - [`AuditSettings`] と同じ約束）。
+///
+/// # このコードはファイルを一切削除しない
+///
+/// 期限超過ファイルの自動削除（要件 §3.4）は**この PR（C-1）では実装して
+/// いない**。`retention_days` は**設定値を持つだけ**で、chronogazer のどの
+/// コードもこれを読んで削除を行わない - 誤って削除を先取りしないための
+/// 明示的な線引きで、削除は別途実装する。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreSettings {
+    pub data_dir: String,
+    pub retention_days: Option<i64>,
+}
+
+impl Default for StoreSettings {
+    fn default() -> Self {
+        Self {
+            data_dir: DEFAULT_DATA_DIR.to_string(),
+            retention_days: Some(DEFAULT_RETENTION_DAYS),
         }
     }
 }
@@ -376,6 +427,32 @@ impl SettingsService {
         self.set(
             KEY_AUTOLOGIN_USERNAME,
             config.autologin_username.as_deref().unwrap_or(""),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// 収集ランタイムの保存設定を読む（#383 段階2b / R1-C）。未設定のキーは
+    /// [`StoreSettings::default`] にフォールバックする。`retention_days` の
+    /// 読み方は [`parse_retention`]（`0` 以下は「無制限」= `None`）。
+    pub async fn store_config(&self) -> Result<StoreSettings, BantoError> {
+        let defaults = StoreSettings::default();
+        let data_dir = self.get(KEY_DATA_DIR).await?.unwrap_or(defaults.data_dir);
+        let retention_days =
+            parse_retention(self.get(KEY_RETENTION_DAYS).await?, defaults.retention_days);
+        Ok(StoreSettings {
+            data_dir,
+            retention_days,
+        })
+    }
+
+    /// 収集ランタイムの保存設定を保存する。`None`（無制限）は `"0"` として
+    /// 書き戻す - [`SettingsService::set_audit_config`] と同じ約束。
+    pub async fn set_store_config(&self, config: &StoreSettings) -> Result<(), BantoError> {
+        self.set(KEY_DATA_DIR, &config.data_dir).await?;
+        self.set(
+            KEY_RETENTION_DAYS,
+            &config.retention_days.unwrap_or(0).to_string(),
         )
         .await?;
         Ok(())
@@ -752,6 +829,42 @@ mod tests {
         let config = svc.audit_config().await.unwrap();
         assert_eq!(config.retention_days, None);
         assert_eq!(config.retention_rows, Some(100_000)); // untouched key still defaults
+    }
+
+    // --- 収集ランタイムの保存設定（#383 段階2b / R1-C） --------------------
+
+    /// **保持期間の既定は 90 日**（docs/recorder-requirements.md §3.4）。
+    /// banto-hub の 7 日を真似していないことを固定する。
+    #[tokio::test]
+    async fn store_config_defaults_when_unset() {
+        let svc = service().await;
+        let config = svc.store_config().await.unwrap();
+        assert_eq!(config, StoreSettings::default());
+        assert_eq!(config.data_dir, "./data");
+        assert_eq!(config.retention_days, Some(90));
+    }
+
+    #[tokio::test]
+    async fn store_config_round_trips_through_set() {
+        let svc = service().await;
+        let config = StoreSettings {
+            data_dir: "D:/chronogazer-data".to_string(),
+            retention_days: Some(365),
+        };
+        svc.set_store_config(&config).await.unwrap();
+        assert_eq!(svc.store_config().await.unwrap(), config);
+    }
+
+    #[tokio::test]
+    async fn store_config_none_round_trips_as_unlimited() {
+        let svc = service().await;
+        svc.set_store_config(&StoreSettings {
+            data_dir: "./data".to_string(),
+            retention_days: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(svc.store_config().await.unwrap().retention_days, None);
     }
 
     #[tokio::test]
