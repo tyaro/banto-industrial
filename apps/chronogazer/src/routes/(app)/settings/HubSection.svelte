@@ -28,6 +28,12 @@
 	 *   たら破棄する - 破棄したことは画面に出す。
 	 * - **画面→アプリの往復にも上限を置く**（レビュー P2-3）。応答が返って
 	 *   こない相手だと、失敗を数える仕組みもポーリングのループごと止まる。
+	 *   **明示操作（接続・採用・一覧更新・保存・切断・状態取得）にも同じ形で
+	 *   上限を置く**（`HUB_UI_TIMEOUT_MS`）。上限が無いと `run()` が
+	 *   `busy = true` のまま戻らず、画面そのものが操作不能になる。ただし
+	 *   **打ち切りは「失敗した」ではない**（アプリ側の処理は止まらない）ので、
+	 *   文言は `hubAbandonedDisplay` が作る通常の失敗とは別のものを出し、
+	 *   打ち切った直後に必ず状態を読み直す。
 	 *
 	 * 平文の API キーは画面に出さない: 手動連携の入力欄は
 	 * `type="password"`、応答型（`HubView`）にキー欄は無い。
@@ -42,6 +48,7 @@
 		disconnectHub,
 		getHubStatus,
 		getHubSubscription,
+		hubAbandonedDisplay,
 		hubLastValueLabel,
 		hubPollStaleNote,
 		hubRemainderNote,
@@ -50,6 +57,7 @@
 		hubSubscriptionDetail,
 		hubSubscriptionHeadline,
 		hubTimeLabel,
+		HUB_UI_TIMEOUT_MS,
 		isHubAvailable,
 		isPollGenerationCurrent,
 		isPollResultFresh,
@@ -59,6 +67,7 @@
 		pollFailureOutcome,
 		readSubscriptionWithLimit,
 		refreshHubCatalog,
+		runWithLimit,
 		SELECTION_DISCARDED_NOTICE,
 		setHubSelectedTags,
 		showManualKeyEntry,
@@ -202,8 +211,44 @@
 		if (view.endpoint) endpointDraft = view.endpoint;
 	}
 
-	/** 各操作の共通の包み: 二重実行を防ぎ、失敗を 1 箇所で文言化する。 */
-	async function run(action: () => Promise<void>): Promise<void> {
+	/**
+	 * 明示操作を打ち切ったあとの後始末（[`hubAbandonedDisplay`] の表に従う）。
+	 *
+	 * **状態を必ず読み直す**: 打ち切ったのは待ち時間だけなので、アプリ側では
+	 * 操作が完了しているかもしれない。読み直せたらその結果で画面を更新する
+	 * （実は成功していたなら、正しい状態が出る）。読み直しも打ち切られたら
+	 * **新しい状態を作らない** - 前の表示を残したまま、最新ではないと書く。
+	 *
+	 * 読み直しは `getHubStatus()` で、これも `HUB_UI_TIMEOUT_MS` を持つ
+	 * （持たないと、ここで再び永久に戻らなくなり `busy` が解放されない）。
+	 *
+	 * **`busy` を降ろす前に済ませる**のは、読み直しの応答が、その間にユーザーが
+	 * 起こした新しい操作の結果を巻き戻さないようにするため。待ちは最悪でも
+	 * `HUB_UI_TIMEOUT_MS` の 2 回分で必ず終わる（無限に固まらない、が目的）。
+	 */
+	async function rereadAfterAbandon(): Promise<void> {
+		const reread = await runWithLimit((signal) => getHubStatus(signal), HUB_UI_TIMEOUT_MS);
+		const display = hubAbandonedDisplay(true, reread.kind === 'ok');
+		if (display.applyStatus && reread.kind === 'ok') applyView(reread.value);
+		// `applyView` は `hubError` を触らないので、反映のあとに置いてよい。
+		hubError = display.notice;
+	}
+
+	/**
+	 * 各操作の共通の包み: 二重実行を防ぎ、失敗を 1 箇所で文言化し、
+	 * **`HUB_UI_TIMEOUT_MS` で必ず有限時間に戻す**。
+	 *
+	 * 上限が無かったとき、応答しないアプリに当たると `busy` が降りず**画面が
+	 * 操作不能になった**（復旧はアプリの再起動のみ）。上限で戻るようにしたので
+	 * `finally` が必ず `busy` を降ろす。
+	 *
+	 * `action` が `signal` を受け取るのは 2 つの目的から: REST 経路に渡して
+	 * 往復を畳むためと、**打ち切ったあとに遅れて解決した応答で画面を書き換え
+	 * ないため**（Tauri の `invoke` は中断できないので、各 action は状態を
+	 * 触る前に `signal.aborted` を見る）。見ないと、打ち切りの文言を出した
+	 * あとに「保存しました」が上書きで出る。
+	 */
+	async function run(action: (signal: AbortSignal) => Promise<void>): Promise<void> {
 		busy = true;
 		hubError = null;
 		savedNotice = null;
@@ -211,9 +256,10 @@
 		// ときに畳む（`applyView` がこの後で立て直す）。
 		selectionDiscardedNotice = null;
 		try {
-			await action();
-		} catch (err) {
-			hubError = errorMessage(err);
+			const outcome = await runWithLimit(action, HUB_UI_TIMEOUT_MS);
+			// 打ち切りは**失敗ではない**ので、通常のエラー文言と混ぜない。
+			if (outcome.kind === 'failed') hubError = errorMessage(outcome.error);
+			else if (outcome.kind === 'timedOut') await rereadAfterAbandon();
 		} finally {
 			busy = false;
 		}
@@ -221,20 +267,35 @@
 
 	$effect(() => {
 		if (!available) return;
-		void run(async () => {
-			applyView(await getHubStatus());
+		void run(async (signal) => {
+			const view = await getHubStatus(signal);
+			if (signal.aborted) return;
+			applyView(view);
 		});
 	});
 
 	async function connect(): Promise<void> {
-		await run(async () => {
-			applyView(await connectHub(endpointDraft));
+		await run(async (signal) => {
+			// レビュー P2-3 の続き: `connect` は Hub 側にキーを発行・保存する
+			// **非冪等**な操作で、打ち切っても止まらない（`hub.rs` の
+			// `HUB_MUTATING_TIMEOUT` の「残留リスク」と、#395 で直した P1-2 =
+			// コード上の「#394 のレビュー P1-2」に同じ話がある）。打ち切った
+			// ときに「接続できませんでした」と言い切ると、**Hub 側に残った
+			// キーの存在が利用者に見えなくなる**ので、文言は
+			// `hubAbandonedDisplay` の「操作は続いている可能性があります」を
+			// 使う（`run()` が出す）。
+			const view = await connectHub(endpointDraft, signal);
+			if (signal.aborted) return;
+			applyView(view);
 		});
 	}
 
 	async function adopt(): Promise<void> {
-		await run(async () => {
-			const view = await adoptHubKey(endpointDraft, manualKeyDraft);
+		await run(async (signal) => {
+			// `connect` と同じく非冪等（キーリングと設定への保存まで進む）。
+			// 打ち切りの扱いは `connect` のコメント参照。
+			const view = await adoptHubKey(endpointDraft, manualKeyDraft, signal);
+			if (signal.aborted) return;
 			applyView(view);
 			// 採用できたときだけ入力欄を空にする（失敗時に貼り直させない）。
 			if (view.status.state === 'connected') manualKeyDraft = '';
@@ -242,18 +303,24 @@
 	}
 
 	async function refresh(): Promise<void> {
-		await run(async () => {
-			applyView(await refreshHubCatalog());
+		await run(async (signal) => {
+			const view = await refreshHubCatalog(signal);
+			if (signal.aborted) return;
+			applyView(view);
 		});
 	}
 
 	async function saveSelection(): Promise<void> {
-		await run(async () => {
+		await run(async (signal) => {
 			// 保存は view を返さない（204）が、設定も購読も変える明示操作。
 			// 保存中に飛んでいたポーリング応答を捨てるために番号を進める。
 			beginExplicitChange();
 			const saving = [...selected];
-			await setHubSelectedTags(saving);
+			await setHubSelectedTags(saving, signal);
+			// 打ち切ったあとに遅れて解決した保存で「保存しました」を出さない
+			// （打ち切りの文言を上書きしてしまう。保存が通ったかどうかは
+			// `rereadAfterAbandon()` の読み直しに任せる）。
+			if (signal.aborted) return;
 			// 保存できた内容がサーバー側の選択になり、未保存の変更は無くなる。
 			serverSelected = saving;
 			selectionUnsaved = nextSelectionUnsaved(selectionUnsaved, 'saved');
@@ -264,7 +331,8 @@
 			// ないので、保存の成功表示を消さずに捨てる（表示は次のポーリングで
 			// 追いつく）。
 			try {
-				applySubscription(await getHubSubscription());
+				const next = await getHubSubscription(signal);
+				if (!signal.aborted) applySubscription(next);
 			} catch {
 				// 握りつぶす（上のコメント参照）。
 			}
@@ -272,7 +340,7 @@
 	}
 
 	async function disconnect(): Promise<void> {
-		await run(async () => {
+		await run(async (signal) => {
 			// レビュー P2-B: 切断は接続レコードごと消す（選択の保存先が無く
 			// なる）ので、未保存の選択も一緒に破棄してよい - 残しても戻す先が
 			// 無い。`applyView` の前に降ろすのは、サーバーが返す空の選択を
@@ -282,7 +350,11 @@
 			// 降ろすと、切断が失敗したときに未保存の注記だけが消え（エラーは
 			// 出るが選択は編集中のまま）、次の「一覧を更新」でサーバーの選択に
 			// 黙って上書きされる - この PR で塞いだはずの穴が失敗経路に残る。
-			const view = await disconnectHub();
+			//
+			// 打ち切ったときも同じ理由で状態を落とさない（切断できたか分からない
+			// のに未保存の注記だけ消える、という同じ穴になる）。
+			const view = await disconnectHub(signal);
+			if (signal.aborted) return;
 			selectionUnsaved = nextSelectionUnsaved(selectionUnsaved, 'disconnected');
 			applyView(view);
 			tags = null;

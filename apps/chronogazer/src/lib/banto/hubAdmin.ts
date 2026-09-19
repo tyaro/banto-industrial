@@ -210,11 +210,17 @@ async function httpJson<T>(path: string, init: HttpJsonInit): Promise<T> {
 	return (await response.json()) as T;
 }
 
-/** `admin`-only: 保存済み設定での現在状態。キーの発行は行わない。 */
-export async function getHubStatus(): Promise<HubView> {
+/**
+ * `admin`-only: 保存済み設定での現在状態。キーの発行は行わない。
+ *
+ * `signal` の効き方は [`getHubSubscription`] と同じ（REST だけが実際に往復を
+ * 畳み、Tauri は呼び出し側の「打ち切り済み」フラグでしか守れない）。明示操作
+ * 全体の上限については [`HUB_UI_TIMEOUT_MS`] を参照。
+ */
+export async function getHubStatus(signal?: AbortSignal): Promise<HubView> {
 	if (!isHubAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<HubView>('hub_status');
-	return httpJson<HubView>('/api/hub', { method: 'GET' });
+	return httpJson<HubView>('/api/hub', { method: 'GET', signal });
 }
 
 /**
@@ -236,22 +242,27 @@ export async function getHubSubscription(signal?: AbortSignal): Promise<HubSubsc
 	return httpJson<HubSubscription>('/api/hub/subscription', { method: 'GET', signal });
 }
 
-/** `admin`-only: 接続（試運転中の Hub にのみ `read` キーを自己発行）。 */
-export async function connectHub(endpoint: string): Promise<HubView> {
+/**
+ * `admin`-only: 接続（試運転中の Hub にのみ `read` キーを自己発行）。
+ *
+ * **`signal` で打ち切っても Hub 側の処理は止まらない**（[`HUB_UI_TIMEOUT_MS`]）。
+ * この操作は非冪等なので、打ち切った側は「失敗した」と言ってはいけない。
+ */
+export async function connectHub(endpoint: string, signal?: AbortSignal): Promise<HubView> {
 	if (!isHubAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<HubView>('hub_connect', { endpoint });
-	return httpJson<HubView>('/api/hub/connect', { method: 'POST', body: { endpoint } });
+	return httpJson<HubView>('/api/hub/connect', { method: 'POST', body: { endpoint }, signal });
 }
 
 /** `admin`-only: タグ一覧の再取得。 */
-export async function refreshHubCatalog(): Promise<HubView> {
+export async function refreshHubCatalog(signal?: AbortSignal): Promise<HubView> {
 	if (!isHubAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<HubView>('hub_refresh_catalog');
-	return httpJson<HubView>('/api/hub/refresh', { method: 'POST' });
+	return httpJson<HubView>('/api/hub/refresh', { method: 'POST', signal });
 }
 
 /** `admin`-only: 選択タグの保存。空配列も正当な入力。 */
-export async function setHubSelectedTags(tags: string[]): Promise<void> {
+export async function setHubSelectedTags(tags: string[], signal?: AbortSignal): Promise<void> {
 	if (!isHubAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') {
 		await invokeCommand<void>('hub_set_selected_tags', { tags });
@@ -260,7 +271,8 @@ export async function setHubSelectedTags(tags: string[]): Promise<void> {
 	await httpJson<void>('/api/hub/selected-tags', {
 		method: 'PUT',
 		body: { tags },
-		expectNoContent: true
+		expectNoContent: true,
+		signal
 	});
 }
 
@@ -268,19 +280,30 @@ export async function setHubSelectedTags(tags: string[]): Promise<void> {
  * `admin`-only: ロックダウン済み Hub 向けの手動連携。`key` は平文なので
  * 画面側は `type="password"` で受け取り、ここから先は保存先（OS キーリング）
  * まで一方通行で流れる。
+ *
+ * [`connectHub`] と同じく**打ち切っても止まらない**非冪等な操作
+ * （[`HUB_UI_TIMEOUT_MS`]）。
  */
-export async function adoptHubKey(endpoint: string, key: string): Promise<HubView> {
+export async function adoptHubKey(
+	endpoint: string,
+	key: string,
+	signal?: AbortSignal
+): Promise<HubView> {
 	if (!isHubAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri')
 		return invokeCommand<HubView>('hub_adopt_manual_key', { endpoint, key });
-	return httpJson<HubView>('/api/hub/adopt-key', { method: 'POST', body: { endpoint, key } });
+	return httpJson<HubView>('/api/hub/adopt-key', {
+		method: 'POST',
+		body: { endpoint, key },
+		signal
+	});
 }
 
 /** `admin`-only: 切断（ローカルの設定とキーリングのみ。Hub 側のキーは残る）。 */
-export async function disconnectHub(): Promise<HubView> {
+export async function disconnectHub(signal?: AbortSignal): Promise<HubView> {
 	if (!isHubAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<HubView>('hub_disconnect');
-	return httpJson<HubView>('/api/hub', { method: 'DELETE' });
+	return httpJson<HubView>('/api/hub', { method: 'DELETE', signal });
 }
 
 /**
@@ -436,29 +459,50 @@ export type SubscriptionReadOutcome =
 	{ kind: 'ok'; value: HubSubscription } | { kind: 'failed' } | { kind: 'timedOut' };
 
 /**
- * 購読状態を 1 回だけ読み、**上限を過ぎたら打ち切る**（レビュー P2-3）。
+ * 上限付きで 1 回走らせた往復の結末（[`runWithLimit`]）。
  *
- * 読み取りそのものを引数に取るので、`vi.useFakeTimers()` と「解決しない
+ * `failed`（相手がエラーを返した／届かなかった）と `timedOut`（上限まで何も
+ * 返ってこなかった）を**別の値**にしているのは、呼び出し側の次の一手が違う
+ * ため: `failed` は「失敗した」と言い切ってよいが、`timedOut` は
+ * **こちらが待つのをやめただけ**で、相手の処理は続いているかもしれない。
+ *
+ * `failed` が `error` を運ぶのは、明示操作が既存のエラー文言
+ * （`errorMessage()`）をそのまま出せるようにするため。購読ポーリングは
+ * 文言を使わないので、[`readSubscriptionWithLimit`] が落として渡す。
+ */
+export type RunWithLimitOutcome<T> =
+	{ kind: 'ok'; value: T } | { kind: 'failed'; error: unknown } | { kind: 'timedOut' };
+
+/**
+ * 画面→アプリの往復を 1 回だけ走らせ、**上限を過ぎたら打ち切る**（レビュー
+ * P2-3 で購読ポーリング用に作ったものを、明示操作にも使えるよう一般化）。
+ *
+ * 往復そのものを引数に取るので、`vi.useFakeTimers()` と「解決しない
  * Promise」だけでテストできる（即座に reject するモックでは、この欠陥は
  * 再現できない）。
  *
  * 打ち切りは 2 段構え:
- * 1. `AbortSignal` を読み取りに渡す（REST 経路は実際にソケットを畳む）。
+ * 1. `AbortSignal` を往復に渡す（REST 経路は実際にソケットを畳む）。
  * 2. **試行ごとの「打ち切り済み」フラグ**。Tauri の `invoke` は中断できない
  *    ので、遅れて解決した応答が `ok` に化けないようここで止める - 通すと
  *    呼び出し側が「最新の状態を取得できた」と記録し、嘘の表示が新鮮扱いに
  *    戻る。
+ *
+ * **打ち切ってもアプリ側の処理は止まらない**: `abort` で畳めるのはこちらの
+ * `fetch` だけで、axum のハンドラも Tauri のコマンドも走り続ける。呼び出し側
+ * に渡した `signal` は「もう採用しない」という合図でもあるので、**遅れて解決
+ * した応答で画面を書き換える前に `signal.aborted` を見ること**。
  */
-export async function readSubscriptionWithLimit(
-	read: (signal: AbortSignal) => Promise<HubSubscription>,
-	timeoutMs: number = SUBSCRIPTION_POLL_TIMEOUT_MS
-): Promise<SubscriptionReadOutcome> {
+export async function runWithLimit<T>(
+	run: (signal: AbortSignal) => Promise<T>,
+	timeoutMs: number
+): Promise<RunWithLimitOutcome<T>> {
 	const controller = new AbortController();
 	/** この試行はもう打ち切った（以後の解決は採用しない）。 */
 	let abandoned = false;
 	let timer: ReturnType<typeof setTimeout> | null = null;
 
-	const expiry = new Promise<SubscriptionReadOutcome>((resolve) => {
+	const expiry = new Promise<RunWithLimitOutcome<T>>((resolve) => {
 		timer = setTimeout(() => {
 			abandoned = true;
 			controller.abort();
@@ -466,9 +510,10 @@ export async function readSubscriptionWithLimit(
 		}, timeoutMs);
 	});
 
-	const attempt = read(controller.signal).then(
-		(value): SubscriptionReadOutcome => (abandoned ? { kind: 'timedOut' } : { kind: 'ok', value }),
-		(): SubscriptionReadOutcome => (abandoned ? { kind: 'timedOut' } : { kind: 'failed' })
+	const attempt = run(controller.signal).then(
+		(value): RunWithLimitOutcome<T> => (abandoned ? { kind: 'timedOut' } : { kind: 'ok', value }),
+		(error): RunWithLimitOutcome<T> =>
+			abandoned ? { kind: 'timedOut' } : { kind: 'failed', error }
 	);
 
 	try {
@@ -476,6 +521,101 @@ export async function readSubscriptionWithLimit(
 	} finally {
 		if (timer !== null) clearTimeout(timer);
 	}
+}
+
+/**
+ * 購読状態を 1 回だけ読み、**上限を過ぎたら打ち切る**（レビュー P2-3）。
+ *
+ * 中身は [`runWithLimit`] そのもので、違いは**エラーの中身を落とす**ことだけ:
+ * ポーリングの失敗はトーストにしない（明示操作のエラー表示を上書きしない）
+ * ので、数える以上のことをしない。
+ */
+export async function readSubscriptionWithLimit(
+	read: (signal: AbortSignal) => Promise<HubSubscription>,
+	timeoutMs: number = SUBSCRIPTION_POLL_TIMEOUT_MS
+): Promise<SubscriptionReadOutcome> {
+	const outcome = await runWithLimit(read, timeoutMs);
+	return outcome.kind === 'failed' ? { kind: 'failed' } : outcome;
+}
+
+/**
+ * 画面→アプリの**明示操作**（`getHubStatus` / `connectHub` /
+ * `refreshHubCatalog` / `setHubSelectedTags` / `adoptHubKey` /
+ * `disconnectHub`）1 回に許す上限（ms）。
+ *
+ * **なぜ要るか**: この 6 つには上限が無かった。`hubAdmin.ts` の `fetch` にも
+ * Tauri の `invoke` にも上限が無いので、同じ PC のアプリ側（`banto-serve` /
+ * Tauri プロセス）が応答しなくなると `HubSection.svelte` の `run()` が
+ * `busy = true` のまま戻らず、**画面が操作不能になる（復旧はアプリの再起動
+ * のみ）**。購読ポーリング（[`SUBSCRIPTION_POLL_TIMEOUT_MS`]）より症状は重い -
+ * あちらは黙って古い値を出し続けるだけだが、こちらは操作そのものができない。
+ *
+ * **なぜ 90 秒か**: バックエンドは既に自前の上限を持っている
+ * （`apps/chronogazer/core/src/hub.rs`）。読み取りは
+ * `HUB_OPERATION_TIMEOUT` = 15 秒、Hub 側にキーを作る `connect` だけは
+ * `HUB_MUTATING_TIMEOUT` = 60 秒。さらに**全操作が `begin_operation()` の
+ * 操作ロックを取る**ので、`connect`（最大 60 秒）の後ろに読み取り（最大
+ * 15 秒）が並ぶと、**正当に遅い最長は 60 + 15 ≒ 75 秒**になり得る。90 秒は
+ * それを十分に超えるので、**発火は「遅い」ではなく「アプリが応答していない」
+ * を意味する**。
+ *
+ * **なぜ読み取り用と変更用で分けないか**: 読み取りも同じ操作ロックに並ぶので、
+ * 読み取りだけ短くすると `connect` の後ろに付いた正常な `getHubStatus()` を
+ * 見限ってしまう（バックエンド側で 15/60 に分かれているのは**ロックを取った
+ * 後の 1 往復**に対する上限で、順番待ちを含まない）。画面側は順番待ちを含む
+ * 待ち時間しか観測できないため、1 つの値にする。
+ *
+ * **打ち切りは失敗ではない**: 上限が来てもアプリ側の処理は止まらない
+ * （[`runWithLimit`] の doc 参照）。文言は [`hubAbandonedDisplay`] が作る。
+ */
+export const HUB_UI_TIMEOUT_MS = 90000;
+
+/**
+ * 明示操作を打ち切ったあと、画面に何を出して何を更新してよいか
+ * （[`hubAbandonedDisplay`] の出力）。
+ */
+export interface HubAbandonedDisplay {
+	/** 打ち切りとして出す文言。`null` = 打ち切っていないので何も足さない。 */
+	notice: string | null;
+	/** 読み直せた状態を画面に反映してよいか。 */
+	applyStatus: boolean;
+}
+
+/**
+ * 打ち切ったあとの見せ方（純関数 - `hubAdmin.test.ts` が総当たりで固定する）。
+ *
+ * 軸は 2 つ:
+ * - `abandoned`: 上限（[`HUB_UI_TIMEOUT_MS`]）で待つのをやめたか。
+ * - `statusReread`: 打ち切った直後の `getHubStatus()`（同じ上限）が読めたか。
+ *
+ * **「失敗しました」と言わないのが要点**。打ち切ったのは**待ち時間**であって
+ * 操作ではなく、`connectHub` / `adoptHubKey` は Hub 側にキーを発行・保存する
+ * 非冪等な操作なので、打ち切った後に成功していることがある。「接続できません
+ * でした」と言い切ると、Hub に残ったキーの存在が利用者に見えなくなる
+ * （`hub.rs` の `SettingsMirror::mark_flushed` と `HUB_MUTATING_TIMEOUT` の
+ * 「残留リスク」= #395 で直した P1-2 と同じ話。コード上の表記は
+ * 「#394 のレビュー P1-2」）。
+ *
+ * 読み直せたときも文言は残す（読み直しは**今の状態**を写しただけで、打ち切った
+ * 操作が完了したことの証明ではない）。読み直せなかったときは**状態を作らない** -
+ * 「不明」という状態を新設せず、前の表示を残したまま、最新ではないと書く。
+ */
+export function hubAbandonedDisplay(
+	abandoned: boolean,
+	statusReread: boolean
+): HubAbandonedDisplay {
+	if (!abandoned) return { notice: null, applyStatus: false };
+	const seconds = Math.round(HUB_UI_TIMEOUT_MS / 1000);
+	if (statusReread) {
+		return {
+			notice: `アプリが${seconds}秒以内に応答しませんでした。待つのをやめただけなので、操作は続いている可能性があります。下の表示は、そのあとに読み直した現在の状態です。`,
+			applyStatus: true
+		};
+	}
+	return {
+		notice: `アプリが${seconds}秒以内に応答しませんでした。待つのをやめただけなので、操作は続いている可能性があります。現在の状態も読み取れなかったため、下の表示は最新ではありません。`,
+		applyStatus: false
+	};
 }
 
 /**
