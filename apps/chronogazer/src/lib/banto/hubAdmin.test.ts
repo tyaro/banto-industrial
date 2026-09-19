@@ -16,6 +16,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
 	applyServerSelection,
+	hubAbandonedDisplay,
 	hubPollStaleNote,
 	hubStatusDetail,
 	hubStatusLabel,
@@ -26,14 +27,19 @@ import {
 	hubTimeLabel,
 	hubRemainderNote,
 	hubUnreachableCauseLabel,
+	HUB_UI_TIMEOUT_MS,
 	isPollGenerationCurrent,
 	isPollResultFresh,
 	isSubscriptionStale,
 	nextPollFailureCount,
 	nextSelectionUnsaved,
+	nextStatusUnconfirmed,
 	pollFailureOutcome,
 	readSubscriptionWithLimit,
+	reconfirmStatusFailureNotice,
+	runWithLimit,
 	sameSelection,
+	saveSelectionWithLimits,
 	SELECTION_DISCARDED_NOTICE,
 	showsServerSelectionDiff,
 	needsManualKey,
@@ -43,7 +49,9 @@ import {
 	type HubStatus,
 	type HubSubscription,
 	type HubSubscriptionState,
-	type SelectionEvent
+	type SelectionEvent,
+	type StatusRereadDetailedOutcome,
+	type StatusRereadOutcome
 } from './hubAdmin';
 
 const ALL_STATES: HubStatus[] = [
@@ -673,5 +681,418 @@ describe('readSubscriptionWithLimit / pollFailureOutcome', () => {
 	it('上限は 1 回の読み取りに対するもので、ポーリング間隔より長い', () => {
 		// 2 秒間隔のメモリ読み取りで、2 周期返らなければ応答していない。
 		expect(SUBSCRIPTION_POLL_TIMEOUT_MS).toBe(4000);
+	});
+});
+
+// --- 明示操作の上限（`HUB_UI_TIMEOUT_MS`）----------------------------------
+//
+// 購読ポーリングに入れた上限を明示操作にも広げたぶん。ポーリングの欠陥は
+// 「黙って古い値を出し続ける」だったが、明示操作にはもっと重い症状がある:
+// `run()` が `busy = true` のまま戻らず、**画面そのものが操作不能になる**
+// （復旧はアプリの再起動のみ）。ここでも `vi.useFakeTimers()` と「解決しない
+// Promise」で固定する。
+
+describe('runWithLimit（明示操作にも使う汎用の上限）', () => {
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	/** 解決も reject もしない往復（応答が返らないアプリ）。 */
+	function neverSettles<T>(): {
+		run: (signal: AbortSignal) => Promise<T>;
+		signal: () => AbortSignal | null;
+		resolveLate: (value: T) => void;
+	} {
+		let captured: AbortSignal | null = null;
+		let settle: ((value: T) => void) | null = null;
+		const pending = new Promise<T>((resolve) => {
+			settle = resolve;
+		});
+		return {
+			run: (signal) => {
+				captured = signal;
+				return pending;
+			},
+			signal: () => captured,
+			resolveLate: (value) => settle?.(value)
+		};
+	}
+
+	it('上限を過ぎても返ってこない操作は timedOut になる（ここで戻るから busy が降りる）', async () => {
+		vi.useFakeTimers();
+		const { run, signal } = neverSettles<void>();
+		const pending = runWithLimit(run, HUB_UI_TIMEOUT_MS);
+
+		// 上限の手前では、まだ何も決まっていない = 正当に遅い操作を見限らない。
+		await vi.advanceTimersByTimeAsync(HUB_UI_TIMEOUT_MS - 1);
+		let settled = false;
+		void pending.then(() => {
+			settled = true;
+		});
+		await Promise.resolve();
+		expect(settled).toBe(false);
+
+		await vi.advanceTimersByTimeAsync(1);
+		expect((await pending).kind).toBe('timedOut');
+		// REST 経路は実際に往復を畳む（Tauri の invoke は中断できない）。
+		expect(signal()?.aborted).toBe(true);
+	});
+
+	it('打ち切ったあとに遅れて解決しても ok にはしない（画面を書き換えさせない）', async () => {
+		vi.useFakeTimers();
+		const { run, resolveLate } = neverSettles<string>();
+		const pending = runWithLimit(run, HUB_UI_TIMEOUT_MS);
+		await vi.advanceTimersByTimeAsync(HUB_UI_TIMEOUT_MS);
+		expect((await pending).kind).toBe('timedOut');
+
+		resolveLate('遅れて届いた HubView');
+		await vi.advanceTimersByTimeAsync(1000);
+		expect((await pending).kind).toBe('timedOut');
+	});
+
+	it('上限内に解決すれば通常どおり ok、reject は失敗の中身を運ぶ failed', async () => {
+		vi.useFakeTimers();
+		const ok = await runWithLimit(async () => 'view', HUB_UI_TIMEOUT_MS);
+		expect(ok).toEqual({ kind: 'ok', value: 'view' });
+
+		const boom = new Error('boom');
+		const failed = await runWithLimit(async () => {
+			throw boom;
+		}, HUB_UI_TIMEOUT_MS);
+		// 明示操作は既存のエラー文言（`errorMessage()`）をそのまま出せること。
+		expect(failed).toEqual({ kind: 'failed', error: boom });
+	});
+
+	it('購読側は同じ上限ヘルパの薄い包みで、エラーの中身だけ落とす', async () => {
+		// 一般化で購読側の戻り値の形（`error` を持たない）を変えていないこと。
+		const failed = await readSubscriptionWithLimit(async () => {
+			throw new Error('boom');
+		}, SUBSCRIPTION_POLL_TIMEOUT_MS);
+		expect(failed).toEqual({ kind: 'failed' });
+	});
+
+	it('90秒はバックエンドの上限（60秒の connect + 順番待ちの読み取り15秒）を十分に超える', () => {
+		// `hub.rs`: HUB_MUTATING_TIMEOUT = 60s、HUB_OPERATION_TIMEOUT = 15s。
+		// 全操作が `begin_operation()` の操作ロックに並ぶので、正当に遅い最長は
+		// 60 + 15 ≒ 75 秒。発火が「遅い」ではなく「応答していない」を意味する
+		// 値であること（読み取り用と変更用に分けないのは、読み取りも同じ
+		// 操作ロックに並ぶため）。
+		expect(HUB_UI_TIMEOUT_MS).toBe(90000);
+		expect(HUB_UI_TIMEOUT_MS).toBeGreaterThan((60 + 15) * 1000);
+		// ポーリングの上限とは別物（あちらは 1 回のメモリ読み取り）。
+		expect(HUB_UI_TIMEOUT_MS).toBeGreaterThan(SUBSCRIPTION_POLL_TIMEOUT_MS);
+	});
+});
+
+describe('hubAbandonedDisplay', () => {
+	it('打ち切ったか × 状態を読み直せたか の総当たり', () => {
+		const table: {
+			abandoned: boolean;
+			statusReread: boolean;
+			notice: 'なし' | '読み直せた' | '読み直せない';
+			applyStatus: boolean;
+			blocksChanges: boolean;
+		}[] = [
+			{
+				abandoned: false,
+				statusReread: false,
+				notice: 'なし',
+				applyStatus: false,
+				blocksChanges: false
+			},
+			{
+				abandoned: false,
+				statusReread: true,
+				notice: 'なし',
+				applyStatus: false,
+				blocksChanges: false
+			},
+			{
+				abandoned: true,
+				statusReread: true,
+				notice: '読み直せた',
+				applyStatus: true,
+				blocksChanges: false
+			},
+			{
+				abandoned: true,
+				statusReread: false,
+				notice: '読み直せない',
+				applyStatus: false,
+				blocksChanges: true
+			}
+		];
+		for (const row of table) {
+			const display = hubAbandonedDisplay(row.abandoned, row.statusReread);
+			const label = `abandoned=${row.abandoned} reread=${row.statusReread}`;
+			expect(display.applyStatus, label).toBe(row.applyStatus);
+			// オーナーレビュー P2-1: 状態を反映できたかどうかが、そのまま
+			// 「変更操作を止めるか」になる（止めないと、接続先を確認できない
+			// まま「選択を保存」が別の Hub の購読設定を書き換えうる）。
+			expect(display.blocksChanges, label).toBe(row.blocksChanges);
+			expect(display.blocksChanges, label).toBe(row.abandoned && !display.applyStatus);
+			if (row.notice === 'なし') {
+				expect(display.notice, label).toBeNull();
+				continue;
+			}
+			expect(display.notice, label).not.toBeNull();
+			// 打ち切ったときは**必ず**「操作は続いている可能性があります」。
+			// これが無いと、非冪等な `connect`/`adoptHubKey` で Hub 側に残った
+			// キーの存在が利用者に見えなくなる。
+			expect(display.notice, label).toContain('操作は続いている可能性があります');
+			// 「失敗しました」と言い切らない（打ち切ったのは待ち時間だけ）。
+			expect(display.notice, label).not.toContain('失敗');
+			// 上限は定数から出す（値を変えても文言とずれない）。
+			expect(display.notice, label).toContain(`${HUB_UI_TIMEOUT_MS / 1000}秒`);
+		}
+	});
+
+	it('読み直せたときと読み直せなかったときで文言が別になる（表示の鮮度が違う）', () => {
+		const recovered = hubAbandonedDisplay(true, true).notice;
+		const unknown = hubAbandonedDisplay(true, false).notice;
+		expect(recovered).not.toBe(unknown);
+		expect(recovered).toContain('読み直した現在の状態');
+		expect(unknown).toContain('最新ではありません');
+	});
+
+	it('止めるときの文言は「何ができないか」と「何を押せばよいか」を含む', () => {
+		// オーナーレビュー P2-1: 警告だけ出して操作を止めないと、警告がこの操作を
+		// 止める役割を果たさない。止めた以上、抜け道も同じ行に書く。
+		const blocked = hubAbandonedDisplay(true, false);
+		expect(blocked.blocksChanges).toBe(true);
+		for (const stopped of ['接続', '切断', '採用', '一覧の更新', '選択の保存', 'タグの選択']) {
+			expect(blocked.notice, stopped).toContain(stopped);
+		}
+		expect(blocked.notice).toContain('状態を再取得');
+	});
+
+	it('読み直せたときは止めない（画面全体を操作不能にしない）', () => {
+		expect(hubAbandonedDisplay(true, true).blocksChanges).toBe(false);
+		expect(hubAbandonedDisplay(true, true).notice).not.toContain('止めています');
+	});
+});
+
+// --- オーナーレビュー P2-1: 状態を再確認できるまで変更操作を止める ----------
+
+describe('nextStatusUnconfirmed', () => {
+	it('立っているか × 読み直せたか の総当たり', () => {
+		const table: [boolean, StatusRereadOutcome, boolean][] = [
+			// [今のフラグ, 「状態を再取得」の結末, 次のフラグ]
+			[true, 'ok', false], // 読めた = 回復（`applyView()` で反映できた）
+			[true, 'failed', true], // 読めなければ保ったまま（何も壊さない）
+			[false, 'ok', false],
+			[false, 'failed', false] // 打ち切っていないただの失敗では立てない
+		];
+		for (const [current, reread, expected] of table) {
+			expect(nextStatusUnconfirmed(current, reread), `${current} + ${reread}`).toBe(expected);
+		}
+	});
+
+	it('回復は「読めた」ときだけ。失敗を何回重ねても勝手には降りない', () => {
+		let unconfirmed = hubAbandonedDisplay(true, false).blocksChanges;
+		expect(unconfirmed).toBe(true);
+		for (let attempt = 0; attempt < 3; attempt += 1) {
+			unconfirmed = nextStatusUnconfirmed(unconfirmed, 'failed');
+			expect(unconfirmed).toBe(true);
+		}
+		unconfirmed = nextStatusUnconfirmed(unconfirmed, 'ok');
+		expect(unconfirmed).toBe(false);
+	});
+});
+
+// --- #400 レビュー対応の仕上げ: 「状態を再取得」が失敗したら、失敗したと出す ---
+//
+// 以前は `outcome.kind !== 'ok'` を一律 `failed` として `nextStatusUnconfirmed`
+// に渡すだけで、失敗時の表示は何も変わらなかった（押しても無反応に見えた）。
+// `reconfirmStatusFailureNotice` が `timedOut`/`failed` を別の文言にする。
+
+describe('reconfirmStatusFailureNotice', () => {
+	it('ok / failed（理由あり） / timedOut の総当たり', () => {
+		const table: {
+			outcome: StatusRereadDetailedOutcome;
+			errorText: string | null;
+			expectNull: boolean;
+		}[] = [
+			{ outcome: 'ok', errorText: null, expectNull: true },
+			{ outcome: 'failed', errorText: 'サーバーに接続できません', expectNull: false },
+			{ outcome: 'timedOut', errorText: null, expectNull: false }
+		];
+		for (const row of table) {
+			const notice = reconfirmStatusFailureNotice(row.outcome, row.errorText);
+			if (row.expectNull) {
+				expect(notice, row.outcome).toBeNull();
+				continue;
+			}
+			expect(notice, row.outcome).not.toBeNull();
+			// 押しても無反応に見えないこと（#400 レビュー対応の仕上げの主眼）:
+			// 「再取得」自体に言及し、次の一手（もう一度押す）まで伝わる。
+			expect(notice, row.outcome).toContain('再取得');
+			expect(notice, row.outcome).toContain('もう一度');
+			expect(notice, row.outcome).toContain('状態を再取得');
+			// 止めている操作は引き続き列挙する（`hubAbandonedDisplay` と同じ規律）。
+			for (const stopped of ['接続', '切断', '採用', '一覧の更新', '選択の保存', 'タグの選択']) {
+				expect(notice, `${row.outcome} / ${stopped}`).toContain(stopped);
+			}
+		}
+	});
+
+	it('timedOut は「失敗」と言い切らない（打ち切りは操作の中止ではない）', () => {
+		const notice = reconfirmStatusFailureNotice('timedOut', null);
+		expect(notice).not.toBeNull();
+		expect(notice).not.toContain('失敗');
+		// 上限は定数から出す（値を変えても文言とずれない）。
+		expect(notice).toContain(`${HUB_UI_TIMEOUT_MS / 1000}秒`);
+	});
+
+	it('failed はエラーが実際に返ってきているので「失敗」と言い切ってよい。理由を含む', () => {
+		const notice = reconfirmStatusFailureNotice('failed', 'サーバーに接続できません');
+		expect(notice).not.toBeNull();
+		expect(notice).toContain('失敗');
+		expect(notice).toContain('サーバーに接続できません');
+	});
+
+	it('failed と timedOut は別の文言になる', () => {
+		const failed = reconfirmStatusFailureNotice('failed', '理由');
+		const timedOut = reconfirmStatusFailureNotice('timedOut', null);
+		expect(failed).not.toBe(timedOut);
+	});
+});
+
+// --- オーナーレビュー P2-2: 保存本体と、保存後の購読読み取りの予算を分ける ---
+//
+// 以前は保存も読み直しも 1 つの `runWithLimit(action, HUB_UI_TIMEOUT_MS)` の
+// 内側にあり、**保存が成功していても読み直しが返らないだけで操作全体が
+// `timedOut`** になっていた（「保存しました」と「操作は続いている可能性が
+// あります」が併存）。ここでも `vi.useFakeTimers()` と「解決しない Promise」で
+// 固定する - 即座に reject するモックでは再現できない。
+
+describe('saveSelectionWithLimits', () => {
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	/** 解決も reject もしない購読読み取り（応答が返らないアプリ）。 */
+	function neverSettlingSubscription(): (signal: AbortSignal) => Promise<HubSubscription> {
+		return () => new Promise<HubSubscription>(() => {});
+	}
+
+	function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+		let resolve!: (value: T) => void;
+		const promise = new Promise<T>((res) => {
+			resolve = res;
+		});
+		return { promise, resolve };
+	}
+
+	it('保存が成功すれば、購読の読み直しが返らなくても保存は ok のまま', async () => {
+		vi.useFakeTimers();
+		const save = deferred<void>();
+		const onSaved = vi.fn();
+		const pending = saveSelectionWithLimits(
+			() => save.promise,
+			neverSettlingSubscription(),
+			onSaved
+		);
+
+		save.resolve();
+		await vi.advanceTimersByTimeAsync(0);
+		// 保存本体が成功した時点で「保存しました」を出す（読み直しを待たない）。
+		expect(onSaved).toHaveBeenCalledTimes(1);
+
+		await vi.advanceTimersByTimeAsync(SUBSCRIPTION_POLL_TIMEOUT_MS);
+		const outcome = await pending;
+		expect(outcome.save.kind).toBe('ok');
+		expect(outcome.subscriptionReread).toEqual({ kind: 'timedOut' });
+		// 打ち切り通知には進めない（`run()` 側の分岐は save の結末だけを見る）。
+		expect(hubAbandonedDisplay(outcome.save.kind === 'timedOut', false).notice).toBeNull();
+	});
+
+	it('保存本体が上限直前に成功しても同じ（読み直しの 4 秒は全体の枠外）', async () => {
+		// 「読み直しに 4 秒上限を足して全体 90 秒の枠内に残す」では塞げない境界。
+		vi.useFakeTimers();
+		const save = deferred<void>();
+		const onSaved = vi.fn();
+		const pending = saveSelectionWithLimits(
+			() => save.promise,
+			neverSettlingSubscription(),
+			onSaved
+		);
+
+		await vi.advanceTimersByTimeAsync(HUB_UI_TIMEOUT_MS - 1);
+		save.resolve();
+		await vi.advanceTimersByTimeAsync(0);
+		expect(onSaved).toHaveBeenCalledTimes(1);
+
+		// ここから購読の 4 秒。合計は 90 秒を超えるが、保存の成否はもう確定済み。
+		await vi.advanceTimersByTimeAsync(SUBSCRIPTION_POLL_TIMEOUT_MS);
+		const outcome = await pending;
+		expect(outcome.save.kind).toBe('ok');
+		expect(outcome.subscriptionReread?.kind).toBe('timedOut');
+	});
+
+	it('読み直しの失敗・打ち切りは購読状態の取得失敗として数える', async () => {
+		vi.useFakeTimers();
+		const pendingTimedOut = saveSelectionWithLimits(
+			async () => {},
+			neverSettlingSubscription(),
+			() => {}
+		);
+		await vi.advanceTimersByTimeAsync(SUBSCRIPTION_POLL_TIMEOUT_MS);
+		const timedOut = await pendingTimedOut;
+		expect(timedOut.save.kind).toBe('ok');
+		expect(timedOut.subscriptionReread).toEqual({ kind: 'timedOut' });
+
+		const failed = await saveSelectionWithLimits(
+			async () => {},
+			async () => {
+				throw new Error('boom');
+			},
+			() => {}
+		);
+		expect(failed.save.kind).toBe('ok');
+		expect(failed.subscriptionReread).toEqual({ kind: 'failed' });
+
+		// 既存のポーリングと同じカウンタに合流する（別の数え方を作らない）。
+		let failures = 0;
+		for (const reread of [timedOut.subscriptionReread, failed.subscriptionReread]) {
+			if (reread === null) continue;
+			failures = nextPollFailureCount(failures, pollFailureOutcome(reread));
+		}
+		expect(failures).toBe(SUBSCRIPTION_POLL_FAILURE_LIMIT);
+		expect(isSubscriptionStale(failures)).toBe(true);
+	});
+
+	it('保存が打ち切られたら「保存しました」も出さず、読み直しにも進まない', async () => {
+		vi.useFakeTimers();
+		const onSaved = vi.fn();
+		const readSubscription = vi.fn(neverSettlingSubscription());
+		const pending = saveSelectionWithLimits(
+			() => new Promise<void>(() => {}),
+			readSubscription,
+			onSaved
+		);
+		await vi.advanceTimersByTimeAsync(HUB_UI_TIMEOUT_MS);
+		const outcome = await pending;
+		expect(outcome.save.kind).toBe('timedOut');
+		expect(outcome.subscriptionReread).toBeNull();
+		expect(onSaved).not.toHaveBeenCalled();
+		expect(readSubscription).not.toHaveBeenCalled();
+	});
+
+	it('保存が失敗したら失敗の中身を運び、読み直しには進まない', async () => {
+		const boom = new Error('boom');
+		const onSaved = vi.fn();
+		const readSubscription = vi.fn(neverSettlingSubscription());
+		const outcome = await saveSelectionWithLimits(
+			async () => {
+				throw boom;
+			},
+			readSubscription,
+			onSaved
+		);
+		expect(outcome.save).toEqual({ kind: 'failed', error: boom });
+		expect(outcome.subscriptionReread).toBeNull();
+		expect(onSaved).not.toHaveBeenCalled();
+		expect(readSubscription).not.toHaveBeenCalled();
 	});
 });
