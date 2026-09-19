@@ -23,7 +23,11 @@
 	 *   エラー表示を上書きしないという既存の設計どおり）。
 	 * - **未保存のタグ選択を黙って捨てない**（レビュー P2-B、#378 の方針）。
 	 *   「一覧を更新」「接続」はサーバーの選択で編集中のチェックを上書き
-	 *   しない。代わりに注記と「サーバーの内容に戻す」を出す。
+	 *   しない。代わりに注記と「サーバーの内容に戻す」を出す。ただし
+	 *   **下書きは接続先ごとのもの**（レビュー P2-2）で、別の Hub に繋ぎ直し
+	 *   たら破棄する - 破棄したことは画面に出す。
+	 * - **画面→アプリの往復にも上限を置く**（レビュー P2-3）。応答が返って
+	 *   こない相手だと、失敗を数える仕組みもポーリングのループごと止まる。
 	 *
 	 * 平文の API キーは画面に出さない: 手動連携の入力欄は
 	 * `type="password"`、応答型（`HubView`）にキー欄は無い。
@@ -52,7 +56,10 @@
 		isSubscriptionStale,
 		nextPollFailureCount,
 		nextSelectionUnsaved,
+		pollFailureOutcome,
+		readSubscriptionWithLimit,
 		refreshHubCatalog,
+		SELECTION_DISCARDED_NOTICE,
 		setHubSelectedTags,
 		showManualKeyEntry,
 		showsServerSelectionDiff,
@@ -79,6 +86,19 @@
 	let serverSelected = $state<string[]>([]);
 	/** 選択に未保存の変更があるか（遷移は `nextSelectionUnsaved`）。 */
 	let selectionUnsaved = $state(false);
+	/**
+	 * 今の下書き（`selected`）が**どの接続先のものか**（レビュー P2-2）。
+	 * 入るのは**サーバーが返した `HubView.endpoint`** だけで、入力欄の
+	 * `endpointDraft` は入れない - まだ接続していない入力値と比べると、URL を
+	 * 打ち込んだ瞬間に「別の Hub」と判定してしまう。
+	 */
+	let selectionEndpoint = $state<string | null>(null);
+	/**
+	 * 接続先が変わったので未保存の下書きを捨てた、という通知（レビュー P2-2）。
+	 * `savedNotice`（保存成功）とは別に持つ - 同じ変数に入れると「保存しました」
+	 * と混ざり、捨てたものが保存されたように読める。
+	 */
+	let selectionDiscardedNotice = $state<string | null>(null);
 	const selectionDiffers = $derived(
 		showsServerSelectionDiff(selected, serverSelected, selectionUnsaved)
 	);
@@ -155,7 +175,24 @@
 		// `selectionDiffers` の注記と「サーバーの内容に戻す」で伝える。
 		// `status`/`tags`/`subscription`/`keyName` は従来どおり上書きする -
 		// 編集中なのは選択だけ。
-		selected = applyServerSelection(selected, view.selectedTags, selectionUnsaved);
+		//
+		// レビュー P2-2: ただし下書きを保つのは**同じ接続先のとき**だけ。別の
+		// Hub に繋ぎ直すと `tags` は新しい Hub のものに入れ替わるので、旧 Hub
+		// のタグ名を下書きに残すと、画面に出ていない名前が保存の payload に
+		// 混入する（バックエンドは endpoint が変われば選択を引き継がない）。
+		// 判定は接続先の同一性だけ - catalog との積集合は取らない。
+		const outcome = applyServerSelection(
+			selected,
+			view.selectedTags,
+			selectionUnsaved,
+			selectionEndpoint,
+			view.endpoint
+		);
+		selected = outcome.selected;
+		selectionUnsaved = outcome.unsaved;
+		// 捨てるのが正しい場面でも、捨てたことは黙っていない（#378）。
+		if (outcome.discardedForEndpointChange) selectionDiscardedNotice = SELECTION_DISCARDED_NOTICE;
+		selectionEndpoint = view.endpoint;
 		// `null`（この往復では catalog を読めていない）と `[]`（読めた結果
 		// タグ 0 件）は別物。前者では前回の一覧を残さず消す - 状態表示の
 		// 「接続済み・利用可能なタグなし」と食い違わせないため。
@@ -170,6 +207,9 @@
 		busy = true;
 		hubError = null;
 		savedNotice = null;
+		// 破棄の通知は「直前の操作で何が起きたか」なので、次の操作を始める
+		// ときに畳む（`applyView` がこの後で立て直す）。
+		selectionDiscardedNotice = null;
 		try {
 			await action();
 		} catch (err) {
@@ -237,8 +277,14 @@
 			// なる）ので、未保存の選択も一緒に破棄してよい - 残しても戻す先が
 			// 無い。`applyView` の前に降ろすのは、サーバーが返す空の選択を
 			// そのまま反映させるため。
+			//
+			// レビュー P2-1: ただし**成功してから状態を落とす**。`await` の前に
+			// 降ろすと、切断が失敗したときに未保存の注記だけが消え（エラーは
+			// 出るが選択は編集中のまま）、次の「一覧を更新」でサーバーの選択に
+			// 黙って上書きされる - この PR で塞いだはずの穴が失敗経路に残る。
+			const view = await disconnectHub();
 			selectionUnsaved = nextSelectionUnsaved(selectionUnsaved, 'disconnected');
-			applyView(await disconnectHub());
+			applyView(view);
 			tags = null;
 			configured = false;
 			endpointDraft = '';
@@ -300,27 +346,41 @@
 	 * 起こす経路が無いので、ユーザーがボタンを押すまで嘘が続く）。連続失敗を
 	 * 数え、`SUBSCRIPTION_POLL_FAILURE_LIMIT` 回で画面のブロック内に
 	 * 「取得できていません」を出す（レビュー P2-A）。
+	 *
+	 * レビュー P2-3: 失敗を数えるだけでは**即座に失敗する障害にしか効かない**。
+	 * TCP は繋がるが応答が返らない相手だと `catch` に入らず、数も増えないまま
+	 * ここで止まる。`readSubscriptionWithLimit` で 1 回の読み取りに上限
+	 * （`SUBSCRIPTION_POLL_TIMEOUT_MS`）を置き、**必ず有限時間で戻る**ように
+	 * した（打ち切りは失敗として数える）。REST 経路は `AbortSignal` で実際に
+	 * 往復を畳むが、**Tauri の `invoke` は中断できない**ので、そちらは
+	 * 「打ち切り済み」フラグで遅れた応答を採用しないことだけを保証する。
 	 */
 	async function pollSubscription(generation: number): Promise<void> {
 		const sentAt = appliedSeq;
-		try {
-			const polled = await getHubSubscription();
-			// 停止（や停止→再開）を跨いだ応答は自分のものではない。
-			if (!isPollGenerationCurrent(generation, pollGeneration)) return;
+		const outcome = await readSubscriptionWithLimit((signal) => getHubSubscription(signal));
+		// 停止（や停止→再開）を跨いだ応答は自分のものではない。止まった世代の
+		// 失敗まで数えると、再開後に前回の失敗が持ち越される。
+		if (!isPollGenerationCurrent(generation, pollGeneration)) return;
+		if (outcome.kind === 'ok') {
 			// 読めた事実は、その値を採用するかどうかとは別（明示操作の結果を
 			// 優先して捨てる場合でも、購読状態は取得できている）。
 			markSubscriptionFresh();
 			// 待っている間に明示操作の結果が入っていたら、こちらは古い。
-			if (isPollResultFresh(sentAt, appliedSeq)) subscription = polled;
-		} catch {
-			// トーストは出さない（上のコメント参照）。止まった世代の失敗まで
-			// 数えると、再開後に前回の失敗が持ち越される。
-			if (!isPollGenerationCurrent(generation, pollGeneration)) return;
-			pollFailures = nextPollFailureCount(pollFailures, 'failed');
+			if (isPollResultFresh(sentAt, appliedSeq)) subscription = outcome.value;
+			return;
 		}
+		// 失敗・打ち切りはどちらも「今の状態を取得できていない」。トーストは
+		// 出さない（上のコメント参照）。
+		pollFailures = nextPollFailureCount(pollFailures, pollFailureOutcome(outcome));
 	}
 
-	/** 1 回読んでから次を予約する。停止されていたら予約しない。 */
+	/**
+	 * 1 回読んでから次を予約する。停止されていたら予約しない。
+	 *
+	 * 予約が `pollSubscription()` の**完了に依存している**ので、読み取りが
+	 * 戻らないとループごと止まる（レビュー P2-3 の本体）。上限で必ず戻るよう
+	 * にしたことで、タイムアウトしても次のポーリングは必ず予約される。
+	 */
 	async function pollThenSchedule(generation: number): Promise<void> {
 		await pollSubscription(generation);
 		if (!isPollGenerationCurrent(generation, pollGeneration)) return;
@@ -403,6 +463,17 @@
 
 			{#if hubError}
 				<p class="error">{hubError}</p>
+			{/if}
+
+			<!--
+				レビュー P2-2: 接続先が変わったときは未保存の下書きを捨てる（旧 Hub
+				のタグ名を新しい Hub の保存に混ぜない）が、**捨てたことは黙らない**
+				（#378）。接続に失敗して `connected` に入らない場合もあるので、
+				タグ選択のブロック（`status.state === 'connected'` の中）ではなく
+				ここに出す。保存成功の `savedNotice` とは別の行・別の文言。
+			-->
+			{#if selectionDiscardedNotice}
+				<p class="note selection-discarded" role="status">{selectionDiscardedNotice}</p>
 			{/if}
 
 			{#if showManualKeyEntry(status, subscription)}
@@ -622,13 +693,15 @@
 	}
 
 	/*
-		レビュー P2-A / P2-B の 2 つの注記。どちらも「今の表示が正しくない／
-		保存されていない」という注意喚起なので、既存の `.note`（薄いグレー）
+		レビュー P2-A / P2-B / P2-2 の 3 つの注記。いずれも「今の表示が正しく
+		ない／保存されていない／捨てた」という注意喚起なので、既存の `.note`
+		（薄いグレー）
 		より目に入る色にする。エラー（`.error`）ではないので `--banto-danger`
 		は使わない。
 	*/
 	.poll-stale,
-	.selection-unsaved {
+	.selection-unsaved,
+	.selection-discarded {
 		color: var(--banto-text);
 	}
 
