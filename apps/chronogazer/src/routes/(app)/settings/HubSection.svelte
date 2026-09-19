@@ -34,6 +34,17 @@
 	 *   **打ち切りは「失敗した」ではない**（アプリ側の処理は止まらない）ので、
 	 *   文言は `hubAbandonedDisplay` が作る通常の失敗とは別のものを出し、
 	 *   打ち切った直後に必ず状態を読み直す。
+	 * - **状態を再確認できていない間は、接続先に依存する変更操作を止める**
+	 *   （オーナーレビュー P2-1）。打ち切った操作はバックエンドで完了している
+	 *   かもしれないので、読み直しにも失敗したら「今の接続先が分からない」。
+	 *   `busy` とは別のフラグ（`statusUnconfirmed`）を立て、読み直せるまで
+	 *   降ろさない。抜け道として**読み取り専用の「状態を再取得」**を 1 つ出す
+	 *   （画面全体を操作不能にはしない）。
+	 * - **保存本体の成否は、保存後の読み直しとは別の予算で確定させる**
+	 *   （オーナーレビュー P2-2）。同じ上限の内側に置くと、保存に成功しても
+	 *   読み直しが返らないだけで操作全体が打ち切り扱いになり、「保存しました」
+	 *   と「操作は続いている可能性があります」が併存する
+	 *   （`saveSelectionWithLimits`）。
 	 *
 	 * 平文の API キーは画面に出さない: 手動連携の入力欄は
 	 * `type="password"`、応答型（`HubView`）にキー欄は無い。
@@ -64,10 +75,12 @@
 		isSubscriptionStale,
 		nextPollFailureCount,
 		nextSelectionUnsaved,
+		nextStatusUnconfirmed,
 		pollFailureOutcome,
 		readSubscriptionWithLimit,
 		refreshHubCatalog,
 		runWithLimit,
+		saveSelectionWithLimits,
 		SELECTION_DISCARDED_NOTICE,
 		setHubSelectedTags,
 		showManualKeyEntry,
@@ -140,6 +153,24 @@
 	let busy = $state(false);
 	let hubError = $state<string | null>(null);
 	let savedNotice = $state<string | null>(null);
+	/**
+	 * **接続状態を再確認できていない**（オーナーレビュー P2-1）。打ち切った操作の
+	 * あと状態も読み直せなかったときに立ち、`nextStatusUnconfirmed` が言うとおり
+	 * **状態を読めて `applyView()` で反映できたときだけ**降りる。
+	 *
+	 * `busy` と別軸にするのが要点: `busy` は `run()` の `finally` で必ず降りるので、
+	 * これが無いと**接続先を確認できないまま「選択を保存」等が再び押せる**。
+	 * `setHubSelectedTags` はタグ名しか送らないため、打ち切った `connect` が
+	 * バックエンドで完了していると、別の Hub の購読設定に前の Hub のタグ選択を
+	 * 保存してしまう（#397 で塞いだ型の再発）。
+	 */
+	let statusUnconfirmed = $state(false);
+	/**
+	 * 上のフラグに添える警告（オーナーレビュー P2-1）。**`hubError` とは別に持つ** -
+	 * `run()` は冒頭で `hubError` を消すので、そこに置くと次の操作で消えてしまい、
+	 * 警告がこの操作を止める役割を果たさない。
+	 */
+	let statusUnconfirmedNotice = $state<string | null>(null);
 
 	/**
 	 * 明示操作の結果を何回反映したか。飛行中のポーリングはこの番号を覚えて
@@ -230,8 +261,61 @@
 		const reread = await runWithLimit((signal) => getHubStatus(signal), HUB_UI_TIMEOUT_MS);
 		const display = hubAbandonedDisplay(true, reread.kind === 'ok');
 		if (display.applyStatus && reread.kind === 'ok') applyView(reread.value);
-		// `applyView` は `hubError` を触らないので、反映のあとに置いてよい。
-		hubError = display.notice;
+		// オーナーレビュー P2-1: 読み直せなかったときは、警告を出すだけでなく
+		// **接続先に依存する変更操作を止める**。警告は `hubError` ではなく専用の
+		// state に置く（`run()` が冒頭で `hubError` を消すため、次の操作を始めた
+		// 瞬間に消えてしまい、止める役割を果たさない）。
+		statusUnconfirmed = display.blocksChanges;
+		if (display.blocksChanges) {
+			statusUnconfirmedNotice = display.notice;
+			// 止めている理由はこの 1 行に集約する（同じ内容を 2 箇所に出さない）。
+			hubError = null;
+		} else {
+			statusUnconfirmedNotice = null;
+			// `applyView` は `hubError` を触らないので、反映のあとに置いてよい。
+			hubError = display.notice;
+		}
+	}
+
+	/**
+	 * 読み取り専用の回復導線（オーナーレビュー P2-1）。`statusUnconfirmed` が
+	 * 立っている間だけ出す「状態を再取得」。
+	 *
+	 * **`run()` は通さない**: `run()` は打ち切ったときに `rereadAfterAbandon()`
+	 * を呼ぶので、読み直しの読み直しになる。ここは `getHubStatus()` を
+	 * `HUB_UI_TIMEOUT_MS` 付きで 1 回だけ走らせ、**読めたときだけ**フラグと警告を
+	 * 降ろす。読めなければ**何も壊さず**そのまま（`nextStatusUnconfirmed`）。
+	 */
+	async function reconfirmStatus(): Promise<void> {
+		busy = true;
+		try {
+			const outcome = await runWithLimit((signal) => getHubStatus(signal), HUB_UI_TIMEOUT_MS);
+			if (outcome.kind === 'ok') applyView(outcome.value);
+			statusUnconfirmed = nextStatusUnconfirmed(
+				statusUnconfirmed,
+				outcome.kind === 'ok' ? 'ok' : 'failed'
+			);
+			if (!statusUnconfirmed) statusUnconfirmedNotice = null;
+		} finally {
+			busy = false;
+		}
+	}
+
+	/**
+	 * 明示操作を始めるときの共通の前準備。`run()` と、予算を 2 つに分けた
+	 * `saveSelection()` の両方から呼ぶ（同じ初期化が 2 箇所にぶら下がるのを防ぐ）。
+	 *
+	 * **`statusUnconfirmedNotice` はここで消さない**: あれは「直前の操作で何が
+	 * 起きたか」ではなく「今の接続先を確認できていない」という継続中の状態で、
+	 * 読み直せたときだけ降りる。
+	 */
+	function beginRun(): void {
+		busy = true;
+		hubError = null;
+		savedNotice = null;
+		// 破棄の通知は「直前の操作で何が起きたか」なので、次の操作を始める
+		// ときに畳む（`applyView` がこの後で立て直す）。
+		selectionDiscardedNotice = null;
 	}
 
 	/**
@@ -249,12 +333,7 @@
 	 * あとに「保存しました」が上書きで出る。
 	 */
 	async function run(action: (signal: AbortSignal) => Promise<void>): Promise<void> {
-		busy = true;
-		hubError = null;
-		savedNotice = null;
-		// 破棄の通知は「直前の操作で何が起きたか」なので、次の操作を始める
-		// ときに畳む（`applyView` がこの後で立て直す）。
-		selectionDiscardedNotice = null;
+		beginRun();
 		try {
 			const outcome = await runWithLimit(action, HUB_UI_TIMEOUT_MS);
 			// 打ち切りは**失敗ではない**ので、通常のエラー文言と混ぜない。
@@ -310,33 +389,55 @@
 		});
 	}
 
+	/**
+	 * 選択の保存（オーナーレビュー P2-2 で `run()` を通さなくなった）。
+	 *
+	 * **保存本体と、保存後の購読の読み直しで予算を分ける**。以前は両方が同じ
+	 * `runWithLimit(action, HUB_UI_TIMEOUT_MS)` の内側にあり、保存に成功しても
+	 * 読み直しだけが返らないと操作全体が `timedOut` になって
+	 * `rereadAfterAbandon()` まで進んだ - 「保存しました」と「操作は続いている
+	 * 可能性があります」が同時に出ていた。読み直しにも上限を足して全体の枠内に
+	 * 残すだけでは、保存本体が上限近くまでかかったケースで同じことが起きる。
+	 *
+	 * 読み直しの失敗・打ち切りは**購読状態の取得失敗**として数える
+	 * （ポーリングと同じカウンタに合流させる）。保存の打ち切り通知には進めない。
+	 */
 	async function saveSelection(): Promise<void> {
-		await run(async (signal) => {
-			// 保存は view を返さない（204）が、設定も購読も変える明示操作。
-			// 保存中に飛んでいたポーリング応答を捨てるために番号を進める。
-			beginExplicitChange();
-			const saving = [...selected];
-			await setHubSelectedTags(saving, signal);
-			// 打ち切ったあとに遅れて解決した保存で「保存しました」を出さない
-			// （打ち切りの文言を上書きしてしまう。保存が通ったかどうかは
-			// `rereadAfterAbandon()` の読み直しに任せる）。
-			if (signal.aborted) return;
-			// 保存できた内容がサーバー側の選択になり、未保存の変更は無くなる。
-			serverSelected = saving;
-			selectionUnsaved = nextSelectionUnsaved(selectionUnsaved, 'saved');
-			savedNotice = `選択したタグ（${saving.length}件）を保存しました。`;
+		beginRun();
+		// 保存は view を返さない（204）が、設定も購読も変える明示操作。
+		// 保存中に飛んでいたポーリング応答を捨てるために番号を進める。
+		beginExplicitChange();
+		const saving = [...selected];
+		try {
+			const outcome = await saveSelectionWithLimits(
+				(signal) => setHubSelectedTags(saving, signal),
+				(signal) => getHubSubscription(signal),
+				() => {
+					// 保存できた内容がサーバー側の選択になり、未保存の変更は無くなる。
+					// **ここで明示操作の成否は確定**（後続の読み直しは影響しない）。
+					serverSelected = saving;
+					selectionUnsaved = nextSelectionUnsaved(selectionUnsaved, 'saved');
+					savedNotice = `選択したタグ（${saving.length}件）を保存しました。`;
+				}
+			);
+			// 打ち切りは**失敗ではない**ので、通常のエラー文言と混ぜない。
+			if (outcome.save.kind === 'failed') hubError = errorMessage(outcome.save.error);
+			else if (outcome.save.kind === 'timedOut') await rereadAfterAbandon();
+
 			// バックエンドは保存時に古い世代を止めている。次のポーリング
 			// （最大 2 秒）まで停止済みの古い値を「受信中」として出し続けない
-			// よう、ここで取り直して反映する。読み直しの失敗は保存の失敗では
-			// ないので、保存の成功表示を消さずに捨てる（表示は次のポーリングで
-			// 追いつく）。
-			try {
-				const next = await getHubSubscription(signal);
-				if (!signal.aborted) applySubscription(next);
-			} catch {
-				// 握りつぶす（上のコメント参照）。
+			// よう、ここで取り直して反映する（意図は従来どおり）。
+			const reread = outcome.subscriptionReread;
+			if (reread !== null) {
+				if (reread.kind === 'ok') applySubscription(reread.value);
+				// 失敗・打ち切りは「購読状態を取得できていない」。ポーリングと同じ
+				// カウンタに合流させる（保存の成功表示は消さず、表示は次の
+				// ポーリングで追いつく）。
+				else pollFailures = nextPollFailureCount(pollFailures, pollFailureOutcome(reread));
 			}
-		});
+		} finally {
+			busy = false;
+		}
 	}
 
 	async function disconnect(): Promise<void> {
@@ -520,7 +621,16 @@
 				</label>
 			</div>
 
-			<button type="button" onclick={connect} disabled={busy || endpointDraft.trim() === ''}>
+			<!--
+				オーナーレビュー P2-1: 状態を再確認できていない間は「接続」も止める。
+				打ち切った `connect` がまだ走っているかもしれない状態で押し直せると、
+				Hub 側にキーを二重に発行しうる。
+			-->
+			<button
+				type="button"
+				onclick={connect}
+				disabled={busy || statusUnconfirmed || endpointDraft.trim() === ''}
+			>
 				接続
 			</button>
 
@@ -535,6 +645,23 @@
 
 			{#if hubError}
 				<p class="error">{hubError}</p>
+			{/if}
+
+			<!--
+				オーナーレビュー P2-1: 打ち切りのあと状態も読み直せなかったときは、
+				警告を出すだけでなく**接続先に依存する変更操作を止める**。警告は
+				`hubError` とは別に持つ（`run()` が冒頭で `hubError` を消すので、
+				次の操作を始めた瞬間に消えて止める役割を果たさない）。
+				**画面全体は操作不能にしない** - 読み取り専用の「状態を再取得」で
+				必ず抜けられる。
+			-->
+			{#if statusUnconfirmedNotice}
+				<p class="note status-unconfirmed" role="status">{statusUnconfirmedNotice}</p>
+			{/if}
+			{#if statusUnconfirmed}
+				<div class="hub-actions">
+					<button type="button" onclick={reconfirmStatus} disabled={busy}>状態を再取得</button>
+				</div>
 			{/if}
 
 			<!--
@@ -555,10 +682,17 @@
 						<input type="password" autocomplete="off" bind:value={manualKeyDraft} disabled={busy} />
 					</label>
 				</div>
+				<!--
+					「接続」と同じ理由で、状態を再確認できていない間は採用も止める
+					（打ち切った採用がまだ走っていれば、押し直しはキーの二重発行）。
+				-->
 				<button
 					type="button"
 					onclick={adopt}
-					disabled={busy || manualKeyDraft.trim() === '' || endpointDraft.trim() === ''}
+					disabled={busy ||
+						statusUnconfirmed ||
+						manualKeyDraft.trim() === '' ||
+						endpointDraft.trim() === ''}
 				>
 					このキーを採用
 				</button>
@@ -566,8 +700,12 @@
 
 			{#if status.state === 'connected'}
 				<div class="hub-actions">
-					<button type="button" onclick={refresh} disabled={busy}>一覧を更新</button>
-					<button type="button" onclick={saveSelection} disabled={busy}>選択を保存</button>
+					<button type="button" onclick={refresh} disabled={busy || statusUnconfirmed}>
+						一覧を更新
+					</button>
+					<button type="button" onclick={saveSelection} disabled={busy || statusUnconfirmed}>
+						選択を保存
+					</button>
 				</div>
 
 				<!--
@@ -590,10 +728,15 @@
 						{#each tags as tag (tag.externalName)}
 							<li>
 								<label class="toggle">
+									<!--
+										オーナーレビュー P2-1: どの接続先のタグ一覧なのか確認
+										できていない間は、下書きも触らせない（保存はこの
+										チェックから組み直さず `selected` をそのまま送る）。
+									-->
 									<input
 										type="checkbox"
 										checked={selected.includes(tag.externalName)}
-										disabled={busy}
+										disabled={busy || statusUnconfirmed}
 										onchange={(event) => toggleTag(tag.externalName, event.currentTarget.checked)}
 									/>
 									<span class="hub-tag-name">{tag.externalName}</span>
@@ -705,7 +848,9 @@
 
 			{#if configured}
 				<div class="hub-actions">
-					<button type="button" onclick={disconnect} disabled={busy}>切断</button>
+					<button type="button" onclick={disconnect} disabled={busy || statusUnconfirmed}>
+						切断
+					</button>
 				</div>
 				<p class="note">
 					「切断」はこのアプリの設定と保存済みAPIキーだけを削除します。Hub側のAPIキーは失効しません（必要ならHubの管理画面で失効させてください）。
@@ -765,15 +910,16 @@
 	}
 
 	/*
-		レビュー P2-A / P2-B / P2-2 の 3 つの注記。いずれも「今の表示が正しく
-		ない／保存されていない／捨てた」という注意喚起なので、既存の `.note`
-		（薄いグレー）
+		レビュー P2-A / P2-B / P2-2 と、オーナーレビュー P2-1 の注記。いずれも
+		「今の表示が正しくない／保存されていない／捨てた／接続先を確認できて
+		いない」という注意喚起なので、既存の `.note`（薄いグレー）
 		より目に入る色にする。エラー（`.error`）ではないので `--banto-danger`
 		は使わない。
 	*/
 	.poll-stale,
 	.selection-unsaved,
-	.selection-discarded {
+	.selection-discarded,
+	.status-unconfirmed {
 		color: var(--banto-text);
 	}
 

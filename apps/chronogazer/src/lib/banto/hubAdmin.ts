@@ -579,6 +579,24 @@ export interface HubAbandonedDisplay {
 	notice: string | null;
 	/** 読み直せた状態を画面に反映してよいか。 */
 	applyStatus: boolean;
+	/**
+	 * **現在の接続先に依存する変更操作を止めるか**（オーナーレビュー P2-1）。
+	 *
+	 * 打ち切った操作はバックエンドで**完了している可能性がある**ので、状態を
+	 * 読み直せなかった時点で、**画面が持っている接続先と、次の操作が実際に触る
+	 * 接続先が食い違いうる**。`setHubSelectedTags` は**タグ名しか送らない**ので、
+	 * バックエンドの接続先が Hub B に変わっていると **B の購読設定に A のタグ
+	 * 選択が保存される** - #397 で塞いだ「下書きが接続先の境界を越える」型が、
+	 * 打ち切り経路で再発する。
+	 *
+	 * **`connect` / `adopt` も止める**。打ち切った `connect` がまだ走っている
+	 * かもしれない状態で押し直せると、**Hub 側にキーを二重に発行**しうる
+	 * （#395 の P1-2 と同じ残留リスクを増やす）。
+	 *
+	 * 止めるのは変更操作だけで、**画面全体は操作不能にしない** - 読み取り専用の
+	 * 「状態を再取得」（[`nextStatusUnconfirmed`]）で必ず抜けられる。
+	 */
+	blocksChanges: boolean;
 }
 
 /**
@@ -599,23 +617,107 @@ export interface HubAbandonedDisplay {
  * 読み直せたときも文言は残す（読み直しは**今の状態**を写しただけで、打ち切った
  * 操作が完了したことの証明ではない）。読み直せなかったときは**状態を作らない** -
  * 「不明」という状態を新設せず、前の表示を残したまま、最新ではないと書く。
+ *
+ * オーナーレビュー P2-1 で 3 つ目の出力 `blocksChanges` が増えた。警告を出す
+ * だけでは足りない（`busy` が降りて変更操作が再び押せてしまう）ので、**同じ
+ * 判断からそのまま「止めるか」も返す**。読み直せなかったときだけ true。
  */
 export function hubAbandonedDisplay(
 	abandoned: boolean,
 	statusReread: boolean
 ): HubAbandonedDisplay {
-	if (!abandoned) return { notice: null, applyStatus: false };
+	if (!abandoned) return { notice: null, applyStatus: false, blocksChanges: false };
 	const seconds = Math.round(HUB_UI_TIMEOUT_MS / 1000);
 	if (statusReread) {
 		return {
 			notice: `アプリが${seconds}秒以内に応答しませんでした。待つのをやめただけなので、操作は続いている可能性があります。下の表示は、そのあとに読み直した現在の状態です。`,
-			applyStatus: true
+			applyStatus: true,
+			blocksChanges: false
 		};
 	}
 	return {
-		notice: `アプリが${seconds}秒以内に応答しませんでした。待つのをやめただけなので、操作は続いている可能性があります。現在の状態も読み取れなかったため、下の表示は最新ではありません。`,
-		applyStatus: false
+		// **何ができない状態か**と**何を押せばよいか**まで書く（警告だけ出して
+		// 操作を止めないと、接続先を確認できないまま保存が通ってしまう）。
+		notice: `アプリが${seconds}秒以内に応答しませんでした。待つのをやめただけなので、操作は続いている可能性があります。現在の状態も読み取れなかったため、下の表示は最新ではありません。今の接続先を確認できるまで、接続・切断・キーの採用・一覧の更新・選択の保存とタグの選択は止めています。「状態を再取得」を押して、現在の状態を読み直してください。`,
+		applyStatus: false,
+		blocksChanges: true
 	};
+}
+
+/**
+ * 「状態を再取得」1 回の結末（[`nextStatusUnconfirmed`]）。
+ */
+export type StatusRereadOutcome = 'ok' | 'failed';
+
+/**
+ * 「**接続状態を再確認できていない**」フラグの遷移（純関数、総当たりで固定する）。
+ *
+ * 立てるのは [`hubAbandonedDisplay`] の `blocksChanges`（打ち切ったうえに
+ * 読み直せなかった）、**降ろせるのは状態を読めて `applyView()` で反映できた
+ * ときだけ**。読めなかったときは `current` のまま返す - ここで降ろすと、確認
+ * できていない接続先に対して変更操作が再び通ってしまう（「成功を確かめる前に
+ * フラグを降ろさない」）。
+ *
+ * `busy` とは別軸なのが要点。`busy` は「今この操作の最中か」で、`run()` の
+ * `finally` で必ず降りる。こちらは「**画面が今の接続先を知っているか**」で、
+ * 読み直せるまで降りない。
+ */
+export function nextStatusUnconfirmed(current: boolean, reread: StatusRereadOutcome): boolean {
+	return reread === 'ok' ? false : current;
+}
+
+/**
+ * 選択の保存 1 回の結末（[`saveSelectionWithLimits`]）。
+ */
+export interface SaveSelectionOutcome {
+	/**
+	 * 保存本体（`setHubSelectedTags`）の結末。**この明示操作の成否はこれだけで
+	 * 決まる** - 後続の読み取りが返らなくても `timedOut` にはならない。
+	 */
+	save: RunWithLimitOutcome<void>;
+	/**
+	 * 保存後の購読の読み直し。保存本体が成功したときだけ走る（`null` = 走らせて
+	 * いない）。失敗・打ち切りは**購読状態の取得失敗**として数える
+	 * （[`pollFailureOutcome`] → [`nextPollFailureCount`]）。
+	 */
+	subscriptionReread: SubscriptionReadOutcome | null;
+}
+
+/**
+ * 選択の保存と、その直後の購読の読み直しを**別々の予算で**走らせる
+ * （オーナーレビュー P2-2）。
+ *
+ * **なぜ分けるか**: 以前は保存も読み直しも 1 つの `runWithLimit(action,
+ * HUB_UI_TIMEOUT_MS)` の内側にあった。保存本体が成功していても読み直しだけが
+ * 返らないと**操作全体が `timedOut`** になり、「保存しました」と「操作は続いて
+ * いる可能性があります」が同時に出る（結果が未確定であるかのような通知）。
+ * **保存本体が成功した時点で明示操作の成否を確定させる**のが直し方で、
+ * 「読み直しにも上限を足して全体の枠内に残す」のでは、保存本体が上限近くまで
+ * かかったケースで同じ問題が残る。
+ *
+ * 保存後に読み直す意図は元のまま: **バックエンドは保存時に古い世代を止めて
+ * いる**ので、次のポーリング（最大 2 秒）まで停止済みの古い値を「受信中」と
+ * して出し続けないよう、ここで取り直す。ただしこれは**ベストエフォート**で、
+ * 失敗しても保存の成功表示は消さない。
+ *
+ * `onSaved` は保存本体が `ok` のときだけ、読み直しに入る**前**に 1 回だけ
+ * 呼ぶ（画面が「保存しました」を出すのがここ）。
+ */
+export async function saveSelectionWithLimits(
+	save: (signal: AbortSignal) => Promise<void>,
+	readSubscription: (signal: AbortSignal) => Promise<HubSubscription>,
+	onSaved: () => void,
+	saveTimeoutMs: number = HUB_UI_TIMEOUT_MS,
+	subscriptionTimeoutMs: number = SUBSCRIPTION_POLL_TIMEOUT_MS
+): Promise<SaveSelectionOutcome> {
+	const saved = await runWithLimit(save, saveTimeoutMs);
+	if (saved.kind !== 'ok') return { save: saved, subscriptionReread: null };
+	onSaved();
+	const subscriptionReread = await readSubscriptionWithLimit(
+		readSubscription,
+		subscriptionTimeoutMs
+	);
+	return { save: saved, subscriptionReread };
 }
 
 /**

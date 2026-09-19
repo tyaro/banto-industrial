@@ -33,10 +33,12 @@ import {
 	isSubscriptionStale,
 	nextPollFailureCount,
 	nextSelectionUnsaved,
+	nextStatusUnconfirmed,
 	pollFailureOutcome,
 	readSubscriptionWithLimit,
 	runWithLimit,
 	sameSelection,
+	saveSelectionWithLimits,
 	SELECTION_DISCARDED_NOTICE,
 	showsServerSelectionDiff,
 	needsManualKey,
@@ -46,7 +48,8 @@ import {
 	type HubStatus,
 	type HubSubscription,
 	type HubSubscriptionState,
-	type SelectionEvent
+	type SelectionEvent,
+	type StatusRereadOutcome
 } from './hubAdmin';
 
 const ALL_STATES: HubStatus[] = [
@@ -786,16 +789,46 @@ describe('hubAbandonedDisplay', () => {
 			statusReread: boolean;
 			notice: 'なし' | '読み直せた' | '読み直せない';
 			applyStatus: boolean;
+			blocksChanges: boolean;
 		}[] = [
-			{ abandoned: false, statusReread: false, notice: 'なし', applyStatus: false },
-			{ abandoned: false, statusReread: true, notice: 'なし', applyStatus: false },
-			{ abandoned: true, statusReread: true, notice: '読み直せた', applyStatus: true },
-			{ abandoned: true, statusReread: false, notice: '読み直せない', applyStatus: false }
+			{
+				abandoned: false,
+				statusReread: false,
+				notice: 'なし',
+				applyStatus: false,
+				blocksChanges: false
+			},
+			{
+				abandoned: false,
+				statusReread: true,
+				notice: 'なし',
+				applyStatus: false,
+				blocksChanges: false
+			},
+			{
+				abandoned: true,
+				statusReread: true,
+				notice: '読み直せた',
+				applyStatus: true,
+				blocksChanges: false
+			},
+			{
+				abandoned: true,
+				statusReread: false,
+				notice: '読み直せない',
+				applyStatus: false,
+				blocksChanges: true
+			}
 		];
 		for (const row of table) {
 			const display = hubAbandonedDisplay(row.abandoned, row.statusReread);
 			const label = `abandoned=${row.abandoned} reread=${row.statusReread}`;
 			expect(display.applyStatus, label).toBe(row.applyStatus);
+			// オーナーレビュー P2-1: 状態を反映できたかどうかが、そのまま
+			// 「変更操作を止めるか」になる（止めないと、接続先を確認できない
+			// まま「選択を保存」が別の Hub の購読設定を書き換えうる）。
+			expect(display.blocksChanges, label).toBe(row.blocksChanges);
+			expect(display.blocksChanges, label).toBe(row.abandoned && !display.applyStatus);
 			if (row.notice === 'なし') {
 				expect(display.notice, label).toBeNull();
 				continue;
@@ -818,5 +851,188 @@ describe('hubAbandonedDisplay', () => {
 		expect(recovered).not.toBe(unknown);
 		expect(recovered).toContain('読み直した現在の状態');
 		expect(unknown).toContain('最新ではありません');
+	});
+
+	it('止めるときの文言は「何ができないか」と「何を押せばよいか」を含む', () => {
+		// オーナーレビュー P2-1: 警告だけ出して操作を止めないと、警告がこの操作を
+		// 止める役割を果たさない。止めた以上、抜け道も同じ行に書く。
+		const blocked = hubAbandonedDisplay(true, false);
+		expect(blocked.blocksChanges).toBe(true);
+		for (const stopped of ['接続', '切断', '採用', '一覧の更新', '選択の保存', 'タグの選択']) {
+			expect(blocked.notice, stopped).toContain(stopped);
+		}
+		expect(blocked.notice).toContain('状態を再取得');
+	});
+
+	it('読み直せたときは止めない（画面全体を操作不能にしない）', () => {
+		expect(hubAbandonedDisplay(true, true).blocksChanges).toBe(false);
+		expect(hubAbandonedDisplay(true, true).notice).not.toContain('止めています');
+	});
+});
+
+// --- オーナーレビュー P2-1: 状態を再確認できるまで変更操作を止める ----------
+
+describe('nextStatusUnconfirmed', () => {
+	it('立っているか × 読み直せたか の総当たり', () => {
+		const table: [boolean, StatusRereadOutcome, boolean][] = [
+			// [今のフラグ, 「状態を再取得」の結末, 次のフラグ]
+			[true, 'ok', false], // 読めた = 回復（`applyView()` で反映できた）
+			[true, 'failed', true], // 読めなければ保ったまま（何も壊さない）
+			[false, 'ok', false],
+			[false, 'failed', false] // 打ち切っていないただの失敗では立てない
+		];
+		for (const [current, reread, expected] of table) {
+			expect(nextStatusUnconfirmed(current, reread), `${current} + ${reread}`).toBe(expected);
+		}
+	});
+
+	it('回復は「読めた」ときだけ。失敗を何回重ねても勝手には降りない', () => {
+		let unconfirmed = hubAbandonedDisplay(true, false).blocksChanges;
+		expect(unconfirmed).toBe(true);
+		for (let attempt = 0; attempt < 3; attempt += 1) {
+			unconfirmed = nextStatusUnconfirmed(unconfirmed, 'failed');
+			expect(unconfirmed).toBe(true);
+		}
+		unconfirmed = nextStatusUnconfirmed(unconfirmed, 'ok');
+		expect(unconfirmed).toBe(false);
+	});
+});
+
+// --- オーナーレビュー P2-2: 保存本体と、保存後の購読読み取りの予算を分ける ---
+//
+// 以前は保存も読み直しも 1 つの `runWithLimit(action, HUB_UI_TIMEOUT_MS)` の
+// 内側にあり、**保存が成功していても読み直しが返らないだけで操作全体が
+// `timedOut`** になっていた（「保存しました」と「操作は続いている可能性が
+// あります」が併存）。ここでも `vi.useFakeTimers()` と「解決しない Promise」で
+// 固定する - 即座に reject するモックでは再現できない。
+
+describe('saveSelectionWithLimits', () => {
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	/** 解決も reject もしない購読読み取り（応答が返らないアプリ）。 */
+	function neverSettlingSubscription(): (signal: AbortSignal) => Promise<HubSubscription> {
+		return () => new Promise<HubSubscription>(() => {});
+	}
+
+	function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+		let resolve!: (value: T) => void;
+		const promise = new Promise<T>((res) => {
+			resolve = res;
+		});
+		return { promise, resolve };
+	}
+
+	it('保存が成功すれば、購読の読み直しが返らなくても保存は ok のまま', async () => {
+		vi.useFakeTimers();
+		const save = deferred<void>();
+		const onSaved = vi.fn();
+		const pending = saveSelectionWithLimits(
+			() => save.promise,
+			neverSettlingSubscription(),
+			onSaved
+		);
+
+		save.resolve();
+		await vi.advanceTimersByTimeAsync(0);
+		// 保存本体が成功した時点で「保存しました」を出す（読み直しを待たない）。
+		expect(onSaved).toHaveBeenCalledTimes(1);
+
+		await vi.advanceTimersByTimeAsync(SUBSCRIPTION_POLL_TIMEOUT_MS);
+		const outcome = await pending;
+		expect(outcome.save.kind).toBe('ok');
+		expect(outcome.subscriptionReread).toEqual({ kind: 'timedOut' });
+		// 打ち切り通知には進めない（`run()` 側の分岐は save の結末だけを見る）。
+		expect(hubAbandonedDisplay(outcome.save.kind === 'timedOut', false).notice).toBeNull();
+	});
+
+	it('保存本体が上限直前に成功しても同じ（読み直しの 4 秒は全体の枠外）', async () => {
+		// 「読み直しに 4 秒上限を足して全体 90 秒の枠内に残す」では塞げない境界。
+		vi.useFakeTimers();
+		const save = deferred<void>();
+		const onSaved = vi.fn();
+		const pending = saveSelectionWithLimits(
+			() => save.promise,
+			neverSettlingSubscription(),
+			onSaved
+		);
+
+		await vi.advanceTimersByTimeAsync(HUB_UI_TIMEOUT_MS - 1);
+		save.resolve();
+		await vi.advanceTimersByTimeAsync(0);
+		expect(onSaved).toHaveBeenCalledTimes(1);
+
+		// ここから購読の 4 秒。合計は 90 秒を超えるが、保存の成否はもう確定済み。
+		await vi.advanceTimersByTimeAsync(SUBSCRIPTION_POLL_TIMEOUT_MS);
+		const outcome = await pending;
+		expect(outcome.save.kind).toBe('ok');
+		expect(outcome.subscriptionReread?.kind).toBe('timedOut');
+	});
+
+	it('読み直しの失敗・打ち切りは購読状態の取得失敗として数える', async () => {
+		vi.useFakeTimers();
+		const pendingTimedOut = saveSelectionWithLimits(
+			async () => {},
+			neverSettlingSubscription(),
+			() => {}
+		);
+		await vi.advanceTimersByTimeAsync(SUBSCRIPTION_POLL_TIMEOUT_MS);
+		const timedOut = await pendingTimedOut;
+		expect(timedOut.save.kind).toBe('ok');
+		expect(timedOut.subscriptionReread).toEqual({ kind: 'timedOut' });
+
+		const failed = await saveSelectionWithLimits(
+			async () => {},
+			async () => {
+				throw new Error('boom');
+			},
+			() => {}
+		);
+		expect(failed.save.kind).toBe('ok');
+		expect(failed.subscriptionReread).toEqual({ kind: 'failed' });
+
+		// 既存のポーリングと同じカウンタに合流する（別の数え方を作らない）。
+		let failures = 0;
+		for (const reread of [timedOut.subscriptionReread, failed.subscriptionReread]) {
+			if (reread === null) continue;
+			failures = nextPollFailureCount(failures, pollFailureOutcome(reread));
+		}
+		expect(failures).toBe(SUBSCRIPTION_POLL_FAILURE_LIMIT);
+		expect(isSubscriptionStale(failures)).toBe(true);
+	});
+
+	it('保存が打ち切られたら「保存しました」も出さず、読み直しにも進まない', async () => {
+		vi.useFakeTimers();
+		const onSaved = vi.fn();
+		const readSubscription = vi.fn(neverSettlingSubscription());
+		const pending = saveSelectionWithLimits(
+			() => new Promise<void>(() => {}),
+			readSubscription,
+			onSaved
+		);
+		await vi.advanceTimersByTimeAsync(HUB_UI_TIMEOUT_MS);
+		const outcome = await pending;
+		expect(outcome.save.kind).toBe('timedOut');
+		expect(outcome.subscriptionReread).toBeNull();
+		expect(onSaved).not.toHaveBeenCalled();
+		expect(readSubscription).not.toHaveBeenCalled();
+	});
+
+	it('保存が失敗したら失敗の中身を運び、読み直しには進まない', async () => {
+		const boom = new Error('boom');
+		const onSaved = vi.fn();
+		const readSubscription = vi.fn(neverSettlingSubscription());
+		const outcome = await saveSelectionWithLimits(
+			async () => {
+				throw boom;
+			},
+			readSubscription,
+			onSaved
+		);
+		expect(outcome.save).toEqual({ kind: 'failed', error: boom });
+		expect(outcome.subscriptionReread).toBeNull();
+		expect(onSaved).not.toHaveBeenCalled();
+		expect(readSubscription).not.toHaveBeenCalled();
 	});
 });
