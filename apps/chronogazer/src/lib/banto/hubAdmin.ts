@@ -667,6 +667,51 @@ export function nextStatusUnconfirmed(current: boolean, reread: StatusRereadOutc
 }
 
 /**
+ * 「状態を再取得」を押した結末の生の種類（[`runWithLimit`] の `kind` そのもの）。
+ *
+ * [`StatusRereadOutcome`] より一段細かい - あちらは `nextStatusUnconfirmed` の
+ * 入力として `failed`/`timedOut` を「読めなかった」に畳んでよいが、
+ * [`reconfirmStatusFailureNotice`] は**文言を分ける**ために区別が要る。
+ */
+export type StatusRereadDetailedOutcome = 'ok' | 'failed' | 'timedOut';
+
+/**
+ * 「状態を再取得」を押したのに読み直せなかったときの注記（純関数、
+ * `hubAdmin.test.ts` が総当たりで固定する）。
+ *
+ * **今までは失敗しても何も変わらず、押しても無反応に見えていた**
+ * （この PR 全体が潰している「画面が本当のことを言わない」型そのもの）。
+ * ここは必ず結果を出す。
+ *
+ * `hubAbandonedDisplay` と同じ言い分けを引き継ぐ: **`timedOut`（上限で
+ * 待つのをやめただけ）を「操作が失敗した」とは言わない** - 打ち切りは
+ * 操作の中止ではなく、読み取り自体はアプリ側で続いているかもしれない。
+ * 一方 `failed` は実際にエラーが返ってきているので、失敗したと言い切って
+ * よい（`errorMessage(outcome.error)` の文字列を `errorText` として渡す -
+ * ここでは受け取るだけにして純関数のまま保つ）。
+ *
+ * `ok` は呼び出し側が `statusUnconfirmedNotice` ごと消す（`nextStatusUnconfirmed`
+ * が同時に `statusUnconfirmed` を降ろす）ので `null` を返す。
+ *
+ * 止めている操作と次の一手（もう一度「状態を再取得」を押す）は、
+ * `failed`/`timedOut` のどちらでも文中に残す。文言は `hubError` ではなく
+ * `statusUnconfirmedNotice` に置く（`run()` の `beginRun()` は `hubError` を
+ * 消すが `statusUnconfirmedNotice` には触らないため、この操作の結果が
+ * 次の操作で勝手に消えない）。
+ */
+export function reconfirmStatusFailureNotice(
+	outcome: StatusRereadDetailedOutcome,
+	errorText: string | null
+): string | null {
+	if (outcome === 'ok') return null;
+	const seconds = Math.round(HUB_UI_TIMEOUT_MS / 1000);
+	if (outcome === 'timedOut') {
+		return `状態の再取得も、アプリが${seconds}秒以内に応答しませんでした。待つのをやめただけなので、読み取りは続いている可能性があります。今の接続先を確認できるまで、接続・切断・キーの採用・一覧の更新・選択の保存とタグの選択は止めたままです。もう一度「状態を再取得」を押してください。`;
+	}
+	return `状態の再取得に失敗しました（${errorText ?? '理由不明'}）。今の接続先を確認できるまで、接続・切断・キーの採用・一覧の更新・選択の保存とタグの選択は止めたままです。もう一度「状態を再取得」を押してください。`;
+}
+
+/**
  * 選択の保存 1 回の結末（[`saveSelectionWithLimits`]）。
  */
 export interface SaveSelectionOutcome {

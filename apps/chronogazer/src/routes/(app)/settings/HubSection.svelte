@@ -78,6 +78,7 @@
 		nextStatusUnconfirmed,
 		pollFailureOutcome,
 		readSubscriptionWithLimit,
+		reconfirmStatusFailureNotice,
 		refreshHubCatalog,
 		runWithLimit,
 		saveSelectionWithLimits,
@@ -285,6 +286,16 @@
 	 * を呼ぶので、読み直しの読み直しになる。ここは `getHubStatus()` を
 	 * `HUB_UI_TIMEOUT_MS` 付きで 1 回だけ走らせ、**読めたときだけ**フラグと警告を
 	 * 降ろす。読めなければ**何も壊さず**そのまま（`nextStatusUnconfirmed`）。
+	 *
+	 * **失敗しても無反応に見せない**（#400 レビュー対応の仕上げ）。以前は
+	 * `outcome.kind !== 'ok'` を一律 `failed` に畳んで `nextStatusUnconfirmed`
+	 * に渡すだけで、失敗時の表示は何も変えていなかった - 押しても何も起きて
+	 * いないように見えた。ここでは `outcome.kind` を `timedOut`/`failed` の
+	 * ままフラグの遷移とは別に `reconfirmStatusFailureNotice()` へ渡し、
+	 * 「再取得も失敗した」と分かる文言に差し替える。文言は `hubError` では
+	 * なく `statusUnconfirmedNotice` に置く（`run()` の `beginRun()` が
+	 * `hubError` を消すのに対し、こちらは次の操作でも消えない - 消えると
+	 * 「止めている」表示ごと消える）。
 	 */
 	async function reconfirmStatus(): Promise<void> {
 		busy = true;
@@ -295,7 +306,14 @@
 				statusUnconfirmed,
 				outcome.kind === 'ok' ? 'ok' : 'failed'
 			);
-			if (!statusUnconfirmed) statusUnconfirmedNotice = null;
+			if (!statusUnconfirmed) {
+				statusUnconfirmedNotice = null;
+			} else {
+				statusUnconfirmedNotice = reconfirmStatusFailureNotice(
+					outcome.kind,
+					outcome.kind === 'failed' ? errorMessage(outcome.error) : null
+				);
+			}
 		} finally {
 			busy = false;
 		}
@@ -716,7 +734,24 @@
 				{#if selectionDiffers}
 					<p class="note selection-unsaved" role="status">
 						選択に未保存の変更があります（サーバー側の選択と異なります）。「選択を保存」で保存するか、
-						<button type="button" class="link" onclick={discardSelection} disabled={busy}>
+						<!--
+							オーナーレビュー P2-1 の留保対応: 「サーバーの内容に戻す」は
+							バックエンドを叩かないが、`selected` を `serverSelected` で
+							上書きして未保存フラグを降ろす（`discardSelection`）。
+							`statusUnconfirmed` のときは、その `serverSelected` が**今の
+							接続先のものだと確認できていない**（打ち切った `connect` が
+							裏で通っていれば、画面が持つのは旧 Hub の保存済み選択）。
+							押すと、利用者は「保存済みの状態に戻した」つもりで**別の Hub
+							の選択を下書きとして受け入れてしまう**。チェックボックス
+							（下の `disabled={busy || statusUnconfirmed}`）を止めた理由と
+							同じ - 接続先を確認できるまで、選択については何も確定させない。
+						-->
+						<button
+							type="button"
+							class="link"
+							onclick={discardSelection}
+							disabled={busy || statusUnconfirmed}
+						>
 							サーバーの内容に戻す
 						</button>
 						を押してください。

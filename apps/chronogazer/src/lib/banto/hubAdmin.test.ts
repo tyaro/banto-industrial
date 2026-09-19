@@ -36,6 +36,7 @@ import {
 	nextStatusUnconfirmed,
 	pollFailureOutcome,
 	readSubscriptionWithLimit,
+	reconfirmStatusFailureNotice,
 	runWithLimit,
 	sameSelection,
 	saveSelectionWithLimits,
@@ -49,6 +50,7 @@ import {
 	type HubSubscription,
 	type HubSubscriptionState,
 	type SelectionEvent,
+	type StatusRereadDetailedOutcome,
 	type StatusRereadOutcome
 } from './hubAdmin';
 
@@ -895,6 +897,64 @@ describe('nextStatusUnconfirmed', () => {
 		}
 		unconfirmed = nextStatusUnconfirmed(unconfirmed, 'ok');
 		expect(unconfirmed).toBe(false);
+	});
+});
+
+// --- #400 レビュー対応の仕上げ: 「状態を再取得」が失敗したら、失敗したと出す ---
+//
+// 以前は `outcome.kind !== 'ok'` を一律 `failed` として `nextStatusUnconfirmed`
+// に渡すだけで、失敗時の表示は何も変わらなかった（押しても無反応に見えた）。
+// `reconfirmStatusFailureNotice` が `timedOut`/`failed` を別の文言にする。
+
+describe('reconfirmStatusFailureNotice', () => {
+	it('ok / failed（理由あり） / timedOut の総当たり', () => {
+		const table: {
+			outcome: StatusRereadDetailedOutcome;
+			errorText: string | null;
+			expectNull: boolean;
+		}[] = [
+			{ outcome: 'ok', errorText: null, expectNull: true },
+			{ outcome: 'failed', errorText: 'サーバーに接続できません', expectNull: false },
+			{ outcome: 'timedOut', errorText: null, expectNull: false }
+		];
+		for (const row of table) {
+			const notice = reconfirmStatusFailureNotice(row.outcome, row.errorText);
+			if (row.expectNull) {
+				expect(notice, row.outcome).toBeNull();
+				continue;
+			}
+			expect(notice, row.outcome).not.toBeNull();
+			// 押しても無反応に見えないこと（#400 レビュー対応の仕上げの主眼）:
+			// 「再取得」自体に言及し、次の一手（もう一度押す）まで伝わる。
+			expect(notice, row.outcome).toContain('再取得');
+			expect(notice, row.outcome).toContain('もう一度');
+			expect(notice, row.outcome).toContain('状態を再取得');
+			// 止めている操作は引き続き列挙する（`hubAbandonedDisplay` と同じ規律）。
+			for (const stopped of ['接続', '切断', '採用', '一覧の更新', '選択の保存', 'タグの選択']) {
+				expect(notice, `${row.outcome} / ${stopped}`).toContain(stopped);
+			}
+		}
+	});
+
+	it('timedOut は「失敗」と言い切らない（打ち切りは操作の中止ではない）', () => {
+		const notice = reconfirmStatusFailureNotice('timedOut', null);
+		expect(notice).not.toBeNull();
+		expect(notice).not.toContain('失敗');
+		// 上限は定数から出す（値を変えても文言とずれない）。
+		expect(notice).toContain(`${HUB_UI_TIMEOUT_MS / 1000}秒`);
+	});
+
+	it('failed はエラーが実際に返ってきているので「失敗」と言い切ってよい。理由を含む', () => {
+		const notice = reconfirmStatusFailureNotice('failed', 'サーバーに接続できません');
+		expect(notice).not.toBeNull();
+		expect(notice).toContain('失敗');
+		expect(notice).toContain('サーバーに接続できません');
+	});
+
+	it('failed と timedOut は別の文言になる', () => {
+		const failed = reconfirmStatusFailureNotice('failed', '理由');
+		const timedOut = reconfirmStatusFailureNotice('timedOut', null);
+		expect(failed).not.toBe(timedOut);
 	});
 });
 
