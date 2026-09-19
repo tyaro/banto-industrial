@@ -49,6 +49,11 @@
  *    グループがN件あるため削除できません」のような理由をそのまま
  *    トーストに出せるようにする。
  *
+ * A''. **一覧の再取得が順不同で解決する**（観点別レビュー P2-C）:
+ *    `runGuardedListLoad`/`isListLoadCurrent`（下記「A''」）が一覧ごとの
+ *    世代番号を照合し、後から着いた古いスナップショットで新しい一覧を
+ *    上書きしないようにする。
+ *
  * D. **一覧の取得失敗が「0件」に潰れる**（#394レビュー P1-3）:
  *    `listSectionView`/`createFormGate`（下記「D」）が「未読込 / 読み込み
  *    失敗 / 読み込めて0件」の3状態を分け、失敗した一覧を0行のグリッドとして
@@ -174,6 +179,55 @@ export async function runGuardedDelete(
 		return isDeleteStillCurrent(pending, readCurrentId())
 			? { kind: 'error', err }
 			: { kind: 'stale-error' };
+	}
+}
+
+// --- A'': 一覧の再取得が順不同で解決する（レビュー P2-C） --------------------
+//
+// `reloadConnections()`/`reloadGroups()`/`reloadTags()` は `await` のあとで
+// 無条件に一覧へ書き戻していた。作成と保存を続けて行うと `GET` が 2 本飛び、
+// **着順は発行順と一致しない**ので、後から着いた古いスナップショットが
+// 新しい一覧を上書きする（ユーザーは「更新しました」の直後に更新前の一覧を
+// 見る）。#387 で潰した「飛行中の応答が新しい状態を巻き戻す」と同型で、
+// `HubSection.svelte` 側の `isPollGenerationCurrent` に対応するものが
+// こちらには無かった。
+//
+// 直し方は同じ: **一覧ごとに世代番号**を持ち、再取得の開始時に控えて、
+// 応答を適用するときに現在の世代と照合する。
+
+/** 再取得の応答を今も適用してよいか（世代照合、純関数）。`isPollGenerationCurrent`（`hubAdmin.ts`）のリスト版。 */
+export function isListLoadCurrent(startedAtGeneration: number, current: number): boolean {
+	return startedAtGeneration === current;
+}
+
+export type GuardedListLoadOutcome<T> =
+	{ kind: 'applied'; items: T[] } | { kind: 'stale' } | { kind: 'error'; err: unknown };
+
+/**
+ * 一覧の再取得（`request`）を送ってから、応答が返ってきた時点で
+ * `isListLoadCurrent` により「これがまだ最新の再取得か」を確認したうえで
+ * 結果を分類する（`runGuardedSave`/`runGuardedDelete` と同じ書き方。
+ * `readCurrentGeneration` は応答が返った時点の世代を読む必要があるため
+ * 遅延評価の関数として渡す）。
+ *
+ * `stale` は**成功・失敗のどちらからも返る**: より新しい再取得が走って
+ * いる以上、古い応答は一覧にもエラー表示にも出さない（新しい方の結果が
+ * そのどちらも決める）。
+ */
+export async function runGuardedListLoad<T>(
+	startedAtGeneration: number,
+	request: Promise<T[]>,
+	readCurrentGeneration: () => number
+): Promise<GuardedListLoadOutcome<T>> {
+	try {
+		const items = await request;
+		return isListLoadCurrent(startedAtGeneration, readCurrentGeneration())
+			? { kind: 'applied', items }
+			: { kind: 'stale' };
+	} catch (err) {
+		return isListLoadCurrent(startedAtGeneration, readCurrentGeneration())
+			? { kind: 'error', err }
+			: { kind: 'stale' };
 	}
 }
 

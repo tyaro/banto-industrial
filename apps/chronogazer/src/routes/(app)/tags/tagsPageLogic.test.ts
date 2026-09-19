@@ -9,6 +9,8 @@ import {
 	runGuardedSave,
 	isDeleteStillCurrent,
 	runGuardedDelete,
+	isListLoadCurrent,
+	runGuardedListLoad,
 	schemaWireFields,
 	splitServerFieldErrors,
 	joinFieldErrorMessages,
@@ -441,5 +443,73 @@ describe('listSectionView / showsRetry / createFormGate', () => {
 	it('listRows は未読込でも空配列を返す（グリッド自体は描かない前提）', () => {
 		expect(listRows<Row>({ items: null, error: null })).toEqual([]);
 		expect(listRows<Row>({ items: [ROW], error: null })).toEqual([ROW]);
+	});
+});
+
+// --- A'': isListLoadCurrent / runGuardedListLoad（レビュー P2-C） -----------
+
+describe('isListLoadCurrent', () => {
+	it('自分が最新の再取得なら適用してよい', () => {
+		expect(isListLoadCurrent(3, 3)).toBe(true);
+	});
+
+	it('あとから別の再取得が始まっていれば適用しない（古い一覧で巻き戻さない）', () => {
+		expect(isListLoadCurrent(3, 4)).toBe(false);
+	});
+});
+
+describe('runGuardedListLoad', () => {
+	it('世代が変わっていなければ取得した一覧を適用する', async () => {
+		const generation = 1;
+		const outcome = await runGuardedListLoad(
+			generation,
+			Promise.resolve([{ id: 1 }]),
+			() => generation
+		);
+		expect(outcome).toEqual({ kind: 'applied', items: [{ id: 1 }] });
+	});
+
+	it('遅延した応答の最中に新しい再取得が完了すると、古い応答は捨てられる', async () => {
+		// 実際の再現: 作成 → 保存 と続けて操作すると GET が 2 本飛び、
+		// 着順は発行順と一致しない。古い方が後に着いて一覧を巻き戻していた。
+		let generation = 0;
+		const slow = deferred<{ id: number }[]>();
+		const fast = deferred<{ id: number }[]>();
+
+		generation += 1;
+		const first = runGuardedListLoad(generation, slow.promise, () => generation);
+
+		generation += 1;
+		const second = runGuardedListLoad(generation, fast.promise, () => generation);
+
+		// 新しい方が先に着く（新しい一覧）。
+		fast.resolve([{ id: 1 }, { id: 2 }]);
+		expect(await second).toEqual({ kind: 'applied', items: [{ id: 1 }, { id: 2 }] });
+
+		// 古い方があとから着く（更新前のスナップショット）。適用してはいけない。
+		slow.resolve([{ id: 1 }]);
+		expect(await first).toEqual({ kind: 'stale' });
+	});
+
+	it('世代が変わっていなければ失敗はそのまま返る（失敗の表示と再試行の導線は出す）', async () => {
+		const generation = 5;
+		const boom = new Error('boom');
+		const outcome = await runGuardedListLoad<{ id: number }>(
+			generation,
+			Promise.reject(boom),
+			() => generation
+		);
+		expect(outcome).toEqual({ kind: 'error', err: boom });
+	});
+
+	it('古い再取得の失敗は表示しない（新しい再取得の結果を上書きしない）', async () => {
+		let generation = 1;
+		const slow = deferred<{ id: number }[]>();
+		const first = runGuardedListLoad(generation, slow.promise, () => generation);
+
+		generation += 1; // 新しい再取得が始まった
+		slow.reject(new Error('古い方が失敗した'));
+
+		expect(await first).toEqual({ kind: 'stale' });
 	});
 });

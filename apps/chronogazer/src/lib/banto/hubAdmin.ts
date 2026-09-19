@@ -180,6 +180,13 @@ interface HttpJsonInit {
 	method: string;
 	body?: unknown;
 	expectNoContent?: boolean;
+	/**
+	 * 呼び出し側が往復を打ち切るための signal（レビュー P2-3）。`abort` で
+	 * `fetch` が投げる例外は下の `catch` に落ち、他の通信失敗と同じ
+	 * `NETWORK_ERROR_MESSAGE` になる - 打ち切りは呼び出し側が知っていること
+	 * なので、ここで種類を分ける必要が無い。
+	 */
+	signal?: AbortSignal;
 }
 
 async function httpJson<T>(path: string, init: HttpJsonInit): Promise<T> {
@@ -191,7 +198,8 @@ async function httpJson<T>(path: string, init: HttpJsonInit): Promise<T> {
 		response = await fetch(path, {
 			method: init.method,
 			headers,
-			body: hasBody ? JSON.stringify(init.body) : undefined
+			body: hasBody ? JSON.stringify(init.body) : undefined,
+			signal: init.signal
 		});
 	} catch {
 		throw new ProviderError({ kind: 'other', message: NETWORK_ERROR_MESSAGE });
@@ -215,11 +223,17 @@ export async function getHubStatus(): Promise<HubView> {
  * **ネットワーク（Hub への往復）を伴わない**ので、設定画面を開いている間
  * だけポーリングしてよい。`getHubStatus()` は catalog を毎回取り直すので
  * ポーリングには使わない。
+ *
+ * `signal` は**REST 経路でだけ効く**（レビュー P2-3）。Tauri の `invoke` に
+ * 中断の口は無いので、そちらは呼び出し側の「打ち切り済み」フラグ
+ * （[`readSubscriptionWithLimit`]）でしか守れない。この非対称は意図的:
+ * REST は実際にソケットを畳めるので畳み、Tauri は**遅れて解決した応答を
+ * 採用しない**ことだけを保証する。
  */
-export async function getHubSubscription(): Promise<HubSubscription> {
+export async function getHubSubscription(signal?: AbortSignal): Promise<HubSubscription> {
 	if (!isHubAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri') return invokeCommand<HubSubscription>('hub_subscription');
-	return httpJson<HubSubscription>('/api/hub/subscription', { method: 'GET' });
+	return httpJson<HubSubscription>('/api/hub/subscription', { method: 'GET', signal });
 }
 
 /** `admin`-only: 接続（試運転中の Hub にのみ `read` キーを自己発行）。 */
@@ -376,6 +390,271 @@ export function isPollResultFresh(sentAtSeq: number, currentSeq: number): boolea
  */
 export function isPollGenerationCurrent(sentAtGeneration: number, current: number): boolean {
 	return sentAtGeneration === current;
+}
+
+/**
+ * 購読状態の取得が「恒久的に失敗している」と見なす連続失敗回数（レビュー
+ * P2-A）。即座に失敗する障害なら `SUBSCRIPTION_POLL_MS`（2 秒）× この回数
+ * ≒ 4 秒、**応答が返ってこない障害なら**
+ * `SUBSCRIPTION_POLL_TIMEOUT_MS`（4 秒）× この回数 ≒ 8 秒で切り替わる。
+ *
+ * **1 回では切り替えない**: 一過性の取りこぼし（スリープ復帰直後の 1 発など）
+ * で表示を揺らさないため。逆に数を増やしすぎると、サーバープロセスが落ちた
+ * あとも「受信中」と最後の値を出し続ける時間が延びる。
+ */
+export const SUBSCRIPTION_POLL_FAILURE_LIMIT = 2;
+
+/**
+ * 購読状態の読み取り 1 回に許す上限（ms、レビュー P2-3）。
+ *
+ * **なぜ 4 秒か**: この読み取りはネットワークを伴わないメモリ参照で、
+ * ポーリング間隔は `SUBSCRIPTION_POLL_MS`（2 秒）。2 周期ぶん待っても返って
+ * こない相手は、もう応答していないと見てよい。短くしすぎると混み合った
+ * LAN ブラウザで正常な往復を打ち切ってしまい、長くすると「嘘の表示」が
+ * 残る時間が延びる。
+ *
+ * これが無いと**連続失敗を数える仕組みが空振りする**: `getHubSubscription()`
+ * は Tauri の `invoke` にも `fetch` にも上限が無く、TCP は繋がるが応答が
+ * 返らない相手では `catch` に入らないまま止まる。`pollThenSchedule()` は
+ * 読み取りの完了後に次を予約するので、**ポーリングのループごと止まった**
+ * （ユーザーがボタンを押すまで永久に「受信中」＋最後の値）。上限を入れた
+ * ことで、読み取りは必ず有限時間で戻り、次の予約も必ず行われる。
+ *
+ * 失敗判定は `SUBSCRIPTION_POLL_FAILURE_LIMIT`（2 回）なので、最悪でも
+ * 4 秒 × 2 = 8 秒程度で「取得できていません」に切り替わる。
+ */
+export const SUBSCRIPTION_POLL_TIMEOUT_MS = 4000;
+
+/**
+ * 購読状態の読み取り 1 回の結末（レビュー P2-3）。
+ *
+ * `failed`（相手がエラーを返した／届かなかった）と `timedOut`（上限まで何も
+ * 返ってこなかった）を**別の値**にしているのは、連続失敗の数え方は同じでも
+ * 原因が違うため（`timedOut` は「繋がってはいるが応答しない」）。
+ */
+export type SubscriptionReadOutcome =
+	{ kind: 'ok'; value: HubSubscription } | { kind: 'failed' } | { kind: 'timedOut' };
+
+/**
+ * 購読状態を 1 回だけ読み、**上限を過ぎたら打ち切る**（レビュー P2-3）。
+ *
+ * 読み取りそのものを引数に取るので、`vi.useFakeTimers()` と「解決しない
+ * Promise」だけでテストできる（即座に reject するモックでは、この欠陥は
+ * 再現できない）。
+ *
+ * 打ち切りは 2 段構え:
+ * 1. `AbortSignal` を読み取りに渡す（REST 経路は実際にソケットを畳む）。
+ * 2. **試行ごとの「打ち切り済み」フラグ**。Tauri の `invoke` は中断できない
+ *    ので、遅れて解決した応答が `ok` に化けないようここで止める - 通すと
+ *    呼び出し側が「最新の状態を取得できた」と記録し、嘘の表示が新鮮扱いに
+ *    戻る。
+ */
+export async function readSubscriptionWithLimit(
+	read: (signal: AbortSignal) => Promise<HubSubscription>,
+	timeoutMs: number = SUBSCRIPTION_POLL_TIMEOUT_MS
+): Promise<SubscriptionReadOutcome> {
+	const controller = new AbortController();
+	/** この試行はもう打ち切った（以後の解決は採用しない）。 */
+	let abandoned = false;
+	let timer: ReturnType<typeof setTimeout> | null = null;
+
+	const expiry = new Promise<SubscriptionReadOutcome>((resolve) => {
+		timer = setTimeout(() => {
+			abandoned = true;
+			controller.abort();
+			resolve({ kind: 'timedOut' });
+		}, timeoutMs);
+	});
+
+	const attempt = read(controller.signal).then(
+		(value): SubscriptionReadOutcome => (abandoned ? { kind: 'timedOut' } : { kind: 'ok', value }),
+		(): SubscriptionReadOutcome => (abandoned ? { kind: 'timedOut' } : { kind: 'failed' })
+	);
+
+	try {
+		return await Promise.race([attempt, expiry]);
+	} finally {
+		if (timer !== null) clearTimeout(timer);
+	}
+}
+
+/**
+ * 読み取りの結末を連続失敗カウンタの入力に畳む（純関数）。
+ *
+ * **`timedOut` は失敗として数える**: 応答が返らないのだから、画面に出ている
+ * 購読状態が今の状態だとは言えない。「起こす条件」と「実際にやる条件」を
+ * 1 つの述語にしておく（呼び出し側で分岐を書き分けない）。
+ */
+export function pollFailureOutcome(outcome: SubscriptionReadOutcome): 'ok' | 'failed' {
+	return outcome.kind === 'ok' ? 'ok' : 'failed';
+}
+
+/**
+ * 連続失敗回数の遷移（純関数）。**成功で 0 に戻す**のが要点 - 復帰したら
+ * 1 回の成功で通常表示に戻る。
+ */
+export function nextPollFailureCount(current: number, outcome: 'ok' | 'failed'): number {
+	return outcome === 'ok' ? 0 : current + 1;
+}
+
+/**
+ * 購読状態の表示が「今の状態ではない」（取得できていない）か（純関数）。
+ *
+ * これが true の間も**値の表は消さない**: 消すと「0 件」に潰れて別の嘘に
+ * なる。代わりに見出しで言い切らず（[`hubSubscriptionHeadline`]）、最後に
+ * 取得できた時刻を添える（[`hubPollStaleNote`]）。
+ */
+export function isSubscriptionStale(consecutiveFailures: number): boolean {
+	return consecutiveFailures >= SUBSCRIPTION_POLL_FAILURE_LIMIT;
+}
+
+/**
+ * 購読状態の見出し（純関数）。取得できていない間は**「受信中」と言い切ら
+ * ない** - 既存の状態名（[`hubSubscriptionLabel`]）はそのまま残し、
+ * 「取得できていない」ことだけを添える（状態名を増やすと 7 状態目を
+ * 作ったことになり、`banto-tagclient` の状態と 1 対 1 で無くなる）。
+ */
+export function hubSubscriptionHeadline(state: HubSubscriptionState, stale: boolean): string {
+	const label = hubSubscriptionLabel(state);
+	return stale ? `${label}（状態を取得できていません）` : label;
+}
+
+/**
+ * 取得できていない間に添える一文（純関数）。**いつの表示なのか**を出す -
+ * 時刻が無いまま古い値だけを見せると、それが今の値に見えてしまう。
+ *
+ * `lastPolledAt` はブラウザ側の epoch ミリ秒（最後に購読状態を取得できた
+ * 時刻）で、Hub 側の値の時刻（`HubValue.t`）とは別物。
+ */
+export function hubPollStaleNote(lastPolledAt: number | null): string {
+	if (lastPolledAt === null) {
+		return '購読状態を取得できていません（まだ一度も取得できていません）。下の表示は最新ではありません。';
+	}
+	return `購読状態を取得できていません。下の表示は${hubTimeLabel(lastPolledAt)}に取得したもので、最新ではありません。`;
+}
+
+// --- レビュー P2-B: 編集中（未保存）のタグ選択を黙って捨てない -------------
+//
+// `applyView()` はサーバーの `selectedTags` をそのまま `selected` に入れて
+// いたため、チェックを変えてから「選択を保存」の隣にある「一覧を更新」
+// （や「接続」）を押すと、確認も警告もなく元に戻っていた。#378 で決めた
+// 「未保存の入力を黙って捨てない」方針の対象から、ここだけ漏れていた。
+
+/** 2 つの選択が同じ集合か（純関数）。並び順は問わない - 画面のチェックは順序を持たない。 */
+export function sameSelection(a: readonly string[], b: readonly string[]): boolean {
+	if (a.length !== b.length) return false;
+	const inB = new Set(b);
+	return a.every((name) => inB.has(name));
+}
+
+/**
+ * サーバーから届いた view を反映した結果（[`applyServerSelection`] の出力）。
+ */
+export interface ServerSelectionOutcome {
+	/** 画面に出す選択。 */
+	selected: string[];
+	/** 反映後の未保存フラグ。 */
+	unsaved: boolean;
+	/** 接続先が変わったため、未保存の下書きを捨てたか（**黙って捨てない**ための合図）。 */
+	discardedForEndpointChange: boolean;
+}
+
+/**
+ * サーバーから届いた view を反映するとき、画面に出す選択（純関数）。
+ *
+ * **未保存の変更があるときはサーバーの値で上書きしない**。`status`/`tags`/
+ * `subscription`/`keyName` など他のフィールドは従来どおり上書きしてよい -
+ * 問題になるのは編集中の `selected` だけ。
+ *
+ * ただし**未保存の下書きは接続先ごとのもの**（レビュー P2-2）。別の Hub に
+ * 繋ぎ直すと `tags` は新しい Hub のものに入れ替わるのに、下書きだけが旧 Hub
+ * のまま残り、**画面に出ていないタグ名が「選択を保存」の payload に混入した**
+ * （保存は表示中のチェックボックスから組み直さず `selected` をそのまま送る）。
+ * バックエンドは endpoint が変われば選択を引き継がない設計なので、フロント
+ * だけがその境界を越えていた。
+ *
+ * 判定に使うのは**サーバーが返した endpoint 同士**（`selectionEndpoint` と
+ * `view.endpoint`）で、入力欄の下書き（`endpointDraft`）とは比べない - まだ
+ * 接続していない入力値なので、URL を打ち込んだ瞬間に「別の Hub」と判定して
+ * しまう。`view.endpoint === null`（未設定・切断後）も「同じ Hub ではない」
+ * 側に倒す。
+ *
+ * **catalog との積集合は取らない**: 同じ Hub で一時的に見えなくなっただけの
+ * タグ（refresh が空振りした・権限が一瞬揺れた）の選択まで失う。判定は
+ * **接続先の同一性のみ**。
+ */
+export function applyServerSelection(
+	current: readonly string[],
+	serverSelected: readonly string[],
+	unsaved: boolean,
+	selectionEndpoint: string | null,
+	viewEndpoint: string | null
+): ServerSelectionOutcome {
+	const sameHub =
+		selectionEndpoint !== null && viewEndpoint !== null && selectionEndpoint === viewEndpoint;
+	if (unsaved && sameHub) {
+		return { selected: [...current], unsaved: true, discardedForEndpointChange: false };
+	}
+	return {
+		selected: [...serverSelected],
+		unsaved: false,
+		discardedForEndpointChange: unsaved
+	};
+}
+
+/**
+ * 接続先の変更で未保存の下書きを捨てたことを伝える一文。
+ *
+ * #378「未保存の入力を黙って捨てない」の対で、捨てるのが正しい場面でも
+ * **捨てたことは画面に出す**。**保存成功の文言（`savedNotice`）とは別の行に
+ * 出し、文言も混ぜない** - 「保存しました」の隣に出ると、捨てたものが保存
+ * されたように読めてしまう。
+ *
+ * 「別の Hub に接続した」と言い切らないのは、接続に失敗して記録が消えた場合
+ * （`view.endpoint === null`）も同じ経路を通るため - どちらも「この下書きの
+ * 宛先がもう無い」であって、起きたことは同じ。
+ */
+export const SELECTION_DISCARDED_NOTICE =
+	'接続先が変わったため、未保存だった選択は破棄しました。表示しているのは、今の接続先に保存されている選択です。';
+
+/**
+ * 「サーバー側の選択と異なります」の注記と、明示的に捨てる導線（「サーバーの
+ * 内容に戻す」）を出すか（純関数）。
+ *
+ * 未保存でも**中身が同じに戻っている**なら出さない（触っただけで元に戻した
+ * ときに警告を出しても、直す対象が無い）。
+ */
+export function showsServerSelectionDiff(
+	current: readonly string[],
+	serverSelected: readonly string[],
+	unsaved: boolean
+): boolean {
+	return unsaved && !sameSelection(current, serverSelected);
+}
+
+/**
+ * 選択の編集状態（未保存フラグ）に何が起きたか。**サーバーからの反映
+ * （`applyView`）はこの一覧に無い**: 同じ Hub なら未保存フラグを動かさず、
+ * 別の Hub なら [`applyServerSelection`] が反映と同時にフラグを降ろすので、
+ * 遷移の判断がこの関数と 2 箇所に分かれない。
+ */
+export type SelectionEvent = 'edited' | 'saved' | 'discarded' | 'disconnected';
+
+/**
+ * 未保存フラグの遷移（純関数、総当たりでテストする）。
+ *
+ * `disconnected` で false にしてよいのは、**切断は接続レコードごと消す**
+ * から - 保存先が無くなるので、未保存の選択を残しても戻す先が無い。
+ */
+export function nextSelectionUnsaved(current: boolean, event: SelectionEvent): boolean {
+	switch (event) {
+		case 'edited':
+			return true;
+		case 'saved':
+		case 'discarded':
+		case 'disconnected':
+			return false;
+	}
 }
 
 /**
