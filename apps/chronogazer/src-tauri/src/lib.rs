@@ -1824,9 +1824,9 @@ const EXIT_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 /// 3. **収集（#383 段階2b / R1-C）** - **消費者を全部止めた後、DB プールを
 ///    閉じる前**。収集は PLC から読んだ値を tstore と `collect_events` に
 ///    書く**書き手**なので、`banto-hub` の `RunningHub::shutdown`
-///    （`apps/banto-hub/core/src/runtime.rs`）が採っているのと同じ方針
-///    - 「read-only な消費者（LAN サーバー・Hub 購読）を先に止め、収集は
-///    依存が全部止まってから」に揃える。先に収集を止めてしまうと、まだ
+///    （`apps/banto-hub/core/src/runtime.rs`）が採っているのと同じ方針、
+///    すなわち「read-only な消費者（LAN サーバー・Hub 購読）を先に止め、
+///    収集は依存が全部止まってから」に揃える。先に収集を止めてしまうと、まだ
 ///    生きている消費者が「値が止まった収集エンジン」を観測する時間帯が
 ///    できる。逆に DB プールより後ろへ回すと、最終 flush の書き込み先が
 ///    もう閉じている。
