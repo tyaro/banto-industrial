@@ -108,6 +108,23 @@
 //! row id - same helper, same shape as every other mutating handler in this
 //! module. Reads are never audited (same convention).
 //!
+//! `/api/collect*` (#383 段階2b / R1-C): **読み取り（`GET`）は `viewer`
+//! 以上・変更（`POST`）は `editor` 以上**（`admin` ではない - [`collect_router`]
+//! の doc に両方の根拠）。**床は 2 段でも `resource` は 1 つ** - 拒否も成功も
+//! `resource: `[`COLLECT_AUDIT_RESOURCE`]（`"collect"`）で、これは
+//! `src-tauri` の `collect_*` コマンドが参照するのと**同じ定数** - 同じ操作が
+//! 経路によって別の `resource` にならないようにするため（#397 P2-D）。
+//! 成功の `action` は `"start"`/`"stop"`/`"restart"`、`detail` は結果の状態と
+//! `pending` だけ。`GET /api/collect`（読み取り）は監査しない。
+//!
+//! `GET /api/collect` が返すのは**公開用の**
+//! [`crate::collect::CollectorStateView`]（`startFailed` は返すが理由は
+//! 返さない）で、内部の `CollectorState` ではない - 床を `viewer` まで
+//! 下げた根拠を型で担保するため（#407 レビュー P2-2）。**キューに入れられ
+//! なかった変更操作は `result: "ok"` で記録されない**（`?` でエラーとして
+//! 抜けるので `record_collect_operation` に届かない）- 「受け付けた」と
+//! 監査にも嘘を書かないための形（#407 レビュー P2-1）。
+//!
 //! `/api/backups/*` (spec M17): `admin`-only, guarded the same way
 //! `/api/users/*`/`/api/audit-log/*` are. `POST /api/backups` records
 //! `action: "backup"`; either restore-staging route records
@@ -154,6 +171,10 @@ use tokio::sync::broadcast;
 
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::backup::{BackupInfo, BackupService, PendingRestoreInfo};
+use crate::collect::{
+    CollectOutcome, CollectorService, CollectorStateView, COLLECT_AUDIT_RESOURCE,
+    COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
+};
 use crate::hub::{HubService, HubSubscriptionView, HubView};
 use crate::settings::{AuditSettings, SettingsService};
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
@@ -1379,6 +1400,176 @@ fn hub_router(hub: HubService, audit: AuditLogService, auth: AuthState) -> Route
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
 
+// --- #383 段階2b / R1-C（C-2）: 収集の操作 -----------------------------------
+
+/// `/api/collect*` のハンドラ用 state（[`HubState`] と同じ構成）: 操作本体の
+/// [`CollectorService`]、監査記録用の [`AuditLogService`]、actor 解決用の
+/// [`AuthState`]。
+#[derive(Clone)]
+struct CollectState {
+    collect: CollectorService,
+    audit: AuditLogService,
+    auth: AuthState,
+}
+
+/// 収集の操作が成功したことを 1 本記録する（`start`/`stop`/`restart` 共通）。
+///
+/// `resource` は [`COLLECT_AUDIT_RESOURCE`]、つまり**Tauri 側の `collect_*`
+/// コマンドと同じ定数**（両経路で `resource` が割れないように - その定数の
+/// doc 参照）。`detail` に入れるのは**結果の状態**だけで、接続先・
+/// ファイルパス・[`crate::collect::CollectorState::StartFailed`] の理由と
+/// いった**内部の詳細は入れない**（`CollectorState::as_str` の doc）。
+/// `pending` を載せるのは、
+/// 「操作は受け付けたが、応答を待つのをやめた」を後から読み分けられるように
+/// するため - **打ち切りは失敗ではない**ので `result` は `"ok"` のまま。
+async fn record_collect_operation(
+    state: &CollectState,
+    headers: &HeaderMap,
+    action: &'static str,
+    outcome: &CollectOutcome,
+) {
+    let identity = actor_identity(headers, &state.auth);
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: identity.as_ref().map(|i| i.id.as_str()),
+            actor_role: identity.as_ref().map(|i| i.role.as_str()),
+            action,
+            resource: COLLECT_AUDIT_RESOURCE,
+            entity_id: None,
+            detail: Some(
+                json!({ "collectState": outcome.status.as_str(), "pending": outcome.pending }),
+            ),
+            origin: "rest",
+            result: "ok",
+        })
+        .await;
+}
+
+/// `GET /api/collect`（**`viewer` 以上** - [`COLLECT_READ_ROLE`]）: 収集の
+/// 現在の状態。
+///
+/// **ネットワークもディスクも DB も触らない**（メモリ上の状態を読むだけ）
+/// ので、画面はこれをポーリングしてよい。読み取りなので監査しない
+/// （他の read ルートと同じ規約）。
+///
+/// 返すのは**公開用の [`CollectorStateView`]** であって、内部の
+/// `CollectorState` ではない（#407 レビュー P2-2）。内部の型は
+/// `StartFailed { reason }` を持っていて、その `reason` には接続先のホストや
+/// `data.dir` の絶対パスが載りうる - 床を `viewer` まで下げた根拠が
+/// 「状態に機微な情報が無いこと」なので、そこは型で担保する。**変換は
+/// [`CollectorService::state_view`] の 1 箇所**で、`src-tauri` の
+/// `collect_status` も同じものを通る（経路によって公開する情報が割れない）。
+/// 起動失敗の理由が利用者へどこで伝わるかは `crate::collect` のモジュール
+/// doc「理由はどこで利用者に伝わるか」。
+async fn collect_status_handler(State(state): State<CollectState>) -> Json<CollectorStateView> {
+    Json(state.collect.state_view())
+}
+
+/// `POST /api/collect/start`（**`editor` 以上** - [`COLLECT_OPERATION_ROLE`]）。
+async fn collect_start_handler(
+    State(state): State<CollectState>,
+    headers: HeaderMap,
+) -> Result<Json<CollectOutcome>, ApiError> {
+    let outcome = state.collect.start().await?;
+    record_collect_operation(&state, &headers, "start", &outcome).await;
+    Ok(Json(outcome))
+}
+
+/// `POST /api/collect/stop`（**`editor` 以上** - [`COLLECT_OPERATION_ROLE`]）。
+async fn collect_stop_handler(
+    State(state): State<CollectState>,
+    headers: HeaderMap,
+) -> Result<Json<CollectOutcome>, ApiError> {
+    let outcome = state.collect.stop().await?;
+    record_collect_operation(&state, &headers, "stop", &outcome).await;
+    Ok(Json(outcome))
+}
+
+/// `POST /api/collect/restart`（**`editor` 以上** - [`COLLECT_OPERATION_ROLE`]）: **レジストリの変更を収集へ
+/// 反映する唯一の口**。接続・グループ・タグの CRUD が自動でこれを呼ぶことは
+/// しない（理由は `crate::collect` のモジュール doc「起動時の自動開始と、
+/// 「収集を再起動」だけが反映の口であること」）。
+async fn collect_restart_handler(
+    State(state): State<CollectState>,
+    headers: HeaderMap,
+) -> Result<Json<CollectOutcome>, ApiError> {
+    let outcome = state.collect.restart().await?;
+    record_collect_operation(&state, &headers, "restart", &outcome).await;
+    Ok(Json(outcome))
+}
+
+/// `/api/collect*`（#383 段階2b / R1-C）: **読み取りは `viewer` 以上・変更は
+/// `editor` 以上**の 2 段（`require_auth` → ルート群ごとの
+/// `require_role_at_least`）。床の値は両方とも `crate::collect` の定数
+/// （[`COLLECT_READ_ROLE`] / [`COLLECT_OPERATION_ROLE`]）から来ていて、
+/// `src-tauri` の `collect_*` コマンドが**同じ定数**を参照する - 経路によって
+/// 床が割れようがないようにするため（[`COLLECT_AUDIT_RESOURCE`] と同じ作法）。
+///
+/// **なぜ変更が `editor` であって `admin` ではないか**:
+/// docs/recorder-requirements.md §3.6「収集の開始/停止は editor 以上」と、
+/// そこに追記された **2026-09-18 のオーナー決定** - 「banto-hub は同種の制御
+/// （自動書き込みエンジンの arm/disarm 等）を admin 限定にしているが、
+/// chronogazer は別プロダクトであり R0 本文のこの決定を継承する。**banto-hub の
+/// 先例に引きずられて admin 限定へ変更しない**」。
+///
+/// **なぜ読み取りが `viewer` なのか**（2026-09-20 オーナー決定、#407 レビュー。
+/// 当初は router 全体を `editor` にしていた）: R0 §3.6 の viewer は
+/// 「**閲覧のみ**」であって「何も見えない」ではない。収集が動いているかどうかは
+/// 監視画面（C-3 / R1-D）の基本情報で、公開する [`CollectorStateView`] には
+/// 機微な情報が何も入っていない（接続先もキーもファイルパスも無い。**内部の
+/// `CollectorState` をそのまま載せないのはこのため** - #407 レビュー P2-2）
+/// ので、viewer に見せて困るものが無い。すぐ上の [`hub_router`] が
+/// 読み取りまで `admin` なのは
+/// **Hub の接続先とキーの情報**を扱うからで、**収集の稼働状態はそれとは性質が
+/// 違う** - 先例に引きずられない、という上と同じ考え方。
+///
+/// **床は分けても `resource` は分けない**: 読み取りの拒否も変更の拒否も
+/// [`COLLECT_AUDIT_RESOURCE`]（`"collect"`）で記録する。変更側は
+/// **3 ルートまとめて 1 つの `RoleGuard`** に掛けてあるので、「変更操作は
+/// editor 以上」は 1 か所で決まる（次に操作を足しても床が散らない）。
+fn collect_router(collect: CollectorService, audit: AuditLogService, auth: AuthState) -> Router {
+    let state = CollectState {
+        collect,
+        audit: audit.clone(),
+        auth: auth.clone(),
+    };
+    // 読み取りだけの床（`viewer` 以上）。ルートは 1 本だけなので、ここが
+    // 「読み取りは誰まで」の唯一の決まり場所。
+    let reads = Router::new()
+        .route("/api/collect", get(collect_status_handler))
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            RoleGuard {
+                auth: auth.clone(),
+                min: COLLECT_READ_ROLE,
+                resource: COLLECT_AUDIT_RESOURCE,
+                audit: audit.clone(),
+            },
+            require_role_at_least,
+        ));
+    // 変更操作の床（`editor` 以上）。**3 ルートまとめて 1 つの
+    // `RoleGuard`** に掛ける - 床がルートごとに散ると、次に足した操作が
+    // 黙って別の床になる。
+    let writes = Router::new()
+        .route("/api/collect/start", post(collect_start_handler))
+        .route("/api/collect/stop", post(collect_stop_handler))
+        .route("/api/collect/restart", post(collect_restart_handler))
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            RoleGuard {
+                auth: auth.clone(),
+                min: COLLECT_OPERATION_ROLE,
+                resource: COLLECT_AUDIT_RESOURCE,
+                audit,
+            },
+            require_role_at_least,
+        ));
+    reads
+        .merge(writes)
+        .layer(middleware::from_fn_with_state(auth, require_auth))
+}
+
 // --- #383 段階2a / R1-B: レジストリ CRUD（PLC接続・収集グループ・タグ） ----
 //
 // banto-tags の3サービス（`PlcConnectionService`/`CollectionGroupService`/
@@ -2020,7 +2211,9 @@ fn tag_registry_router(
 /// (#383 段階2a / R1-B: PLC connections/collection groups/tags) is the first
 /// resource wired up this way; a future 表示グループ (display group)
 /// resource would get its own RBAC-split read/write router merged in here
-/// the same way.
+/// the same way. [`collect_router`] (#383 段階2b / R1-C: 収集の開始・停止・
+/// 再起動) is `editor`-floored router-wide, like `hub_router` is
+/// `admin`-floored.
 // Each parameter is a distinct, already-cloneable service handle threaded
 // through from `main()`/tests (no natural subset to bundle into a struct
 // without adding an indirection layer with a single call site); simpler to
@@ -2042,6 +2235,12 @@ pub fn api_router(
     plc_connections: PlcConnectionService,
     collection_groups: CollectionGroupService,
     tags: TagService,
+    // #383 段階2b / R1-C（C-2）: 収集ランタイム。呼び出し元
+    // （`bin/banto-serve.rs`/`src-tauri`）が `CollectorService::new` で構築
+    // して渡す（`data.dir` の解決基準が呼び出し元ごとに違うため -
+    // `crate::collect::resolve_data_dir` 参照）。デスクトップとこの LAN
+    // サーバーが**同じ実体**を共有するのは `hub` と同じ理由。
+    collect: CollectorService,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
     allow_setup: bool,
@@ -2071,6 +2270,7 @@ pub fn api_router(
         ))
         .merge(backups_router(backup, audit.clone(), auth.clone()))
         .merge(hub_router(hub, audit.clone(), auth.clone()))
+        .merge(collect_router(collect, audit.clone(), auth.clone()))
         .merge(tag_registry_router(
             plc_connections,
             collection_groups,
@@ -2142,6 +2342,7 @@ mod tests {
         let settings = SettingsService::new(pool.clone());
         let backup = unused_backup_service(pool.clone());
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
+        let collect = test_collector_service(pool.clone());
         let audit = AuditLogService::new(pool);
 
         users
@@ -2195,6 +2396,7 @@ mod tests {
                 plc_connections,
                 collection_groups,
                 tags,
+                collect,
                 auth,
                 tx,
                 false,
@@ -2212,6 +2414,7 @@ mod tests {
         let settings = SettingsService::new(pool.clone());
         let backup = unused_backup_service(pool.clone());
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
+        let collect = test_collector_service(pool.clone());
         let audit = AuditLogService::new(pool);
         let auth = demo_auth();
         let token = auth
@@ -2229,6 +2432,7 @@ mod tests {
                 plc_connections,
                 collection_groups,
                 tags,
+                collect,
                 auth,
                 tx,
                 false,
@@ -2264,6 +2468,19 @@ mod tests {
             CollectionGroupService::new(pool.clone()),
             TagService::new(pool),
         )
+    }
+
+    /// #383 段階2b / R1-C（C-2）: [`api_router`] の新しい引数用の収集サービス。
+    ///
+    /// `data_dir` が [`unused_backup_service`] と同じプレースホルダなのは、
+    /// **どのルーターテストも実際にファイルを作らない**から: これらのテストが
+    /// 見るのは `/api/collect*` の認可・監査・ワイヤ形だけで、収集を本当に
+    /// 走らせる（= `TsWriter` を開く）のは収集対象が 1 件以上ある構成での
+    /// `start` だけ。レジストリが空のテスト DB では
+    /// `crate::collect::CollectorState::NoTargets` で止まるので、この
+    /// ディレクトリは一度も触られない。
+    fn test_collector_service(pool: sqlx::SqlitePool) -> CollectorService {
+        CollectorService::new(pool, PathBuf::from("unused-in-tests"))
     }
 
     async fn body_json(response: axum::response::Response) -> serde_json::Value {
@@ -2310,6 +2527,7 @@ mod tests {
         let settings = SettingsService::new(pool.clone());
         let backup = unused_backup_service(pool.clone());
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
+        let collect = test_collector_service(pool.clone());
         let audit = AuditLogService::new(pool);
         let auth = demo_auth();
         let hub = test_hub_service(settings.clone()).await;
@@ -2322,6 +2540,7 @@ mod tests {
             plc_connections,
             collection_groups,
             tags,
+            collect,
             auth,
             tx,
             allow_setup,
@@ -2515,6 +2734,7 @@ mod tests {
         let settings = SettingsService::new(pool.clone());
         let backup = unused_backup_service(pool.clone());
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
+        let collect = test_collector_service(pool.clone());
         let audit = AuditLogService::new(pool);
         let auth = AuthState::new(audited_credential_verifier(users.clone(), audit.clone()));
         let hub = test_hub_service(settings.clone()).await;
@@ -2528,6 +2748,7 @@ mod tests {
                 plc_connections,
                 collection_groups,
                 tags,
+                collect,
                 auth,
                 tx,
                 allow_setup,
@@ -2963,6 +3184,7 @@ mod tests {
         let settings = SettingsService::new(pool.clone());
         let backup = unused_backup_service(pool.clone());
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
+        let collect = test_collector_service(pool.clone());
         let audit = AuditLogService::new(pool);
 
         users
@@ -3002,6 +3224,7 @@ mod tests {
             plc_connections,
             collection_groups,
             tags,
+            collect,
             auth,
             tx,
             false,
@@ -3048,6 +3271,7 @@ mod tests {
         let settings = SettingsService::new(pool.clone());
         let backup = BackupService::new(db_path, pool.clone());
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
+        let collect = test_collector_service(pool.clone());
         let audit = AuditLogService::new(pool);
 
         users
@@ -3087,6 +3311,7 @@ mod tests {
             plc_connections,
             collection_groups,
             tags,
+            collect,
             auth,
             tx,
             false,
@@ -3957,6 +4182,300 @@ mod tests {
             assert_eq!(entry["actorRole"], "editor");
             assert_eq!(entry["origin"], "rest");
             assert_eq!(entry["result"], "ok");
+        }
+    }
+
+    // --- #383 段階2b / R1-C（C-2）: 収集の操作 -------------------------------
+
+    /// `/api/collect*` の全ルートを admin / editor / viewer の 3 役で叩いて、
+    /// **床が 2 段**（読み取りは `viewer` 以上・変更は `editor` 以上）である
+    /// ことを固定する（2026-09-20 オーナー決定、#407 レビュー。
+    /// [`collect_router`] の doc に根拠）。あわせて、**床を分けても拒否は
+    /// `resource: "collect"` のまま**であることも見る（#397 の
+    /// `denied_hub_command_is_recorded_under_the_hub_resource` が手本。
+    /// `src-tauri` 側に**同じ床・同じ綴り**を固定する双子のテストがある）。
+    ///
+    /// 反証（回帰の検出）: 読み取りの `RoleGuard` の `min` を
+    /// `COLLECT_OPERATION_ROLE` に戻すと viewer の `GET` が 403 になって
+    /// 落ちる。変更側の `min` を `COLLECT_READ_ROLE` に下げると viewer の
+    /// `POST` が 200 になって落ちる。`resource` を `"settings"` 等に変えると
+    /// 最後の `assert_eq!` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collect_reads_are_viewer_and_operations_are_editor_all_under_the_collect_resource() {
+        let (router, _audit, admin, editor, viewer) = router_with_role_tokens_and_audit().await;
+
+        // **viewer は状態を読める**（R0 §3.6 の「閲覧のみ」は「何も見えない」
+        // ではない）。
+        let response = router
+            .clone()
+            .oneshot(get_auth("/api/collect", &viewer))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "viewer は収集の状態を読めること"
+        );
+        assert_eq!(body_json(response).await["state"], "stopped");
+
+        // viewer は変更できない（床は 3 ルートまとめて 1 つ）。
+        for path in [
+            "/api/collect/start",
+            "/api/collect/stop",
+            "/api/collect/restart",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(post_json_auth(path, &viewer, json!({})))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+
+        // editor は変更も通る（admin へ引き上げていない）。
+        for token in [&editor, &admin] {
+            let response = router
+                .clone()
+                .oneshot(get_auth("/api/collect", token))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let response = router
+                .clone()
+                .oneshot(post_json_auth("/api/collect/stop", token, json!({})))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let rows = body_json(
+            router
+                .oneshot(post_json_auth(
+                    "/api/audit-log/list",
+                    &admin,
+                    json!(ListParams::default()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await["rows"]
+            .clone();
+        let rows = rows.as_array().unwrap().clone();
+        let denials: Vec<_> = rows.iter().filter(|r| r["action"] == "denied").collect();
+        assert_eq!(
+            denials.len(),
+            3,
+            "変更 3 件だけが拒否される（読み取りは通る）: {rows:?}"
+        );
+        for entry in denials {
+            assert_eq!(
+                entry["resource"], "collect",
+                "床を分けても resource は分けない（Tauri 側と同じ綴り）: {entry:?}"
+            );
+            assert_eq!(entry["actorUsername"], "viewer");
+            assert_eq!(entry["actorRole"], "viewer");
+            assert_eq!(entry["origin"], "rest");
+            assert_eq!(entry["result"], "denied");
+        }
+    }
+
+    /// **収集対象 0 件で開始してもエラーにならない**（`crate::collect` の
+    /// 「空とエラーを別の状態にする」規律が、ワイヤまで届いていること）。
+    /// このテストのレジストリは空なので `noTargets` が返る。
+    ///
+    /// 反証（回帰の検出）: `Lifecycle::start` の `tag_count() == 0` 分岐を
+    /// 外すと `Collector::start` の `CollectError::Config` が `Err` として
+    /// 返り、200 ではなくエラー応答になって落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collect_start_with_no_targets_is_not_an_error() {
+        let (router, _audit, _admin, editor, _viewer) = router_with_role_tokens_and_audit().await;
+
+        let response = router
+            .oneshot(post_json_auth("/api/collect/start", &editor, json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["status"]["state"], "noTargets");
+        assert_eq!(
+            body["pending"], false,
+            "上限に掛かっていないのに「まだ終わっていない」になっている: {body:?}"
+        );
+    }
+
+    /// **#407 レビュー P2-2 の受入条件（REST 側）**: 起動に失敗した後、
+    /// **viewer が状態を読んでも失敗理由が見えない**。
+    ///
+    /// 検証用の目印をタグのアドレスに埋めて `build_config` を失敗させる
+    /// （`banto-tags` はアドレスの書式を検証しないので、REST 経由でも
+    /// そのまま登録できる）。`CollectError::Config` の文言はアドレスを
+    /// そのまま含むので、**内部の `CollectorState` をワイヤに載せていれば
+    /// 目印が必ず出てくる**。
+    ///
+    /// あわせて、**理由がどこで利用者に伝わるか**も同じテストで押さえる -
+    /// 起動を実行した editor には `POST /api/collect/start` の**エラー応答**
+    /// として理由が返る（状態の読み取りから理由を落とした分の埋め合わせが
+    /// 本当に存在すること。`crate::collect` のモジュール doc
+    /// 「理由はどこで利用者に伝わるか」）。
+    ///
+    /// 反証（回帰の検出）: `collect_status_handler` を
+    /// `Json(state.collect.state())`（内部の型）に戻すと、`reason` キーと
+    /// 目印の両方が応答に出て 2 つの `assert!` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_viewer_reading_the_state_never_sees_why_the_start_failed() {
+        const MARKER: &str = "CHRONOGAZER-LEAK-CANARY";
+        let (router, _audit, _admin, editor, viewer) = router_with_role_tokens_and_audit().await;
+
+        // 収集対象を 1 件だけ作る。アドレスが解釈できないので
+        // `build_config` が失敗し、状態に理由（= 目印を含む）が焼き付く。
+        let conn = body_json(
+            router
+                .clone()
+                .oneshot(post_json_auth(
+                    "/api/plc-connections",
+                    &editor,
+                    plc_connection_payload("plc1"),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let group = body_json(
+            router
+                .clone()
+                .oneshot(post_json_auth(
+                    "/api/collection-groups",
+                    &editor,
+                    json!({
+                        "name": "group1",
+                        "plcConnectionId": conn["id"].as_i64().unwrap(),
+                        "periodMs": 1000,
+                        "enabled": true
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let create_tag = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/tags",
+                &editor,
+                json!({
+                    "name": "tag1",
+                    "collectionGroupId": group["id"].as_i64().unwrap(),
+                    "address": MARKER,
+                    "dataType": "i16",
+                    "decimals": 0,
+                    "enabled": true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create_tag.status(), StatusCode::OK);
+
+        // 起動した本人（editor）には、エラー応答として理由が返る。
+        let start = router
+            .clone()
+            .oneshot(post_json_auth("/api/collect/start", &editor, json!({})))
+            .await
+            .unwrap();
+        assert_ne!(
+            start.status(),
+            StatusCode::OK,
+            "前提が崩れている: 起動が失敗していない"
+        );
+        let start_body = body_json(start).await.to_string();
+        assert!(
+            start_body.contains(MARKER),
+            "起動を実行した本人にも理由が伝わっていない（埋め合わせが無い）: {start_body}"
+        );
+
+        // viewer が状態を読む: 状態そのものは返るが、理由は返らない。
+        let status = router
+            .oneshot(get_auth("/api/collect", &viewer))
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let body = body_json(status).await;
+        assert_eq!(
+            body["state"], "startFailed",
+            "状態そのものは返すこと（理由だけを落とす）: {body}"
+        );
+        assert!(
+            body.get("reason").is_none(),
+            "`reason` フィールドがワイヤに出ている: {body}"
+        );
+        assert!(
+            !body.to_string().contains(MARKER),
+            "起動失敗の理由が viewer に漏れている: {body}"
+        );
+    }
+
+    /// 成功した操作が監査に残る（操作者と結果の状態）。`resource` は
+    /// **拒否と同じ `"collect"`** で、`action` は `start`/`stop`/`restart`。
+    /// `detail` に入るのは状態の識別子と `pending` だけ - 接続先や
+    /// ファイルパスは入らない。
+    ///
+    /// 反証（回帰の検出）: `record_collect_operation` の呼び出しを消すと
+    /// 3 つの `expect` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collect_operations_are_audited_under_the_collect_resource() {
+        let (router, _audit, admin, editor, _viewer) = router_with_role_tokens_and_audit().await;
+
+        for path in [
+            "/api/collect/start",
+            "/api/collect/restart",
+            "/api/collect/stop",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(post_json_auth(path, &editor, json!({})))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+
+        let rows = body_json(
+            router
+                .oneshot(post_json_auth(
+                    "/api/audit-log/list",
+                    &admin,
+                    json!(ListParams::default()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await["rows"]
+            .clone();
+        let rows = rows.as_array().unwrap().clone();
+        for action in ["start", "restart", "stop"] {
+            let entry = rows
+                .iter()
+                .find(|r| r["action"] == action && r["resource"] == "collect")
+                .unwrap_or_else(|| panic!("expected a {action}/collect entry, got {rows:?}"));
+            assert_eq!(entry["actorUsername"], "editor");
+            assert_eq!(entry["actorRole"], "editor");
+            assert_eq!(entry["origin"], "rest");
+            assert_eq!(entry["result"], "ok");
+            // `detail` は JSON を**文字列として**持つ列（`AuditLogEntry` の
+            // doc）なので、ここで解いてから中身を見る。
+            let detail: serde_json::Value = serde_json::from_str(
+                entry["detail"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("detail が空: {entry:?}")),
+            )
+            .expect("detail は JSON");
+            assert_eq!(detail["pending"], false);
+            assert!(
+                detail["collectState"].is_string(),
+                "結果の状態が残っていない: {detail:?}"
+            );
+            assert!(
+                detail.get("reason").is_none(),
+                "内部の詳細（理由）が監査に漏れている: {detail:?}"
+            );
         }
     }
 }
