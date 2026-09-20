@@ -5,21 +5,31 @@
 //! chronogazer はこれまで収集エンジンを一切起動していなかった（`banto-collect`
 //! は R1-A で依存に足しただけで使用箇所 0）。ここはその**最初の配線**にあたる。
 //!
-//! # ここまでの範囲（C-1 → C-2）
+//! # ここまでの範囲（C-1 → C-2 → C-3a）
 //!
 //! C-1（#406）はサービス層の骨格（`start`/`stop`/`restart`/`state`/読み出し）
 //! までで、**誰も [`CollectorService::start`] を呼んでいなかった**。
 //!
-//! C-2（この変更）で足したのは**操作の口とその前提**だけ:
+//! C-2（#407）で足したのは**操作の口とその前提**だけ:
 //!
 //! * 起動時の自動開始（[`CollectorService::autostart`]）、
 //! * ライフサイクル操作の**待ち時間の上限**（[`COLLECT_OPERATION_TIMEOUT`]）と、
 //!   打ち切りを表す [`CollectOutcome::pending`]、
 //! * そのために要る [`CollectorState::Starting`]。
 //!
+//! C-3a（この変更）で足したのは**読み出しの口**だけ:
+//!
+//! * 現在値（[`CollectorService::values`]）、接続状態
+//!   （[`CollectorService::connections`]）、収集イベント一覧
+//!   （[`CollectorService::events`]）の 3 つ、
+//! * その 3 つが共有する**結末の型** [`Readout`] -「走っていない」「読めなかった」
+//!   「読めて 0 件」を**別の値**にするためのもの、
+//! * 現在値を**キューから外し**（[`CurrentValuesHandle`] を葉に公開）、
+//!   キューを通る読み出しに**短い上限**（[`COLLECT_READ_TIMEOUT`]）を掛けた。
+//!
 //! 残りは変わらず別枠:
 //!
-//! * 画面・現在値 API・イベント一覧は **C-3**、
+//! * 画面（収集の状態表示・現在値表示・イベント一覧ページ）は **C-3b**、
 //! * シミュレータハーネスと E2E は **C-4**、
 //! * Hub 経由で受けている値の保存・合流は **段階3**（`crate::hub` は触らない）。
 //!
@@ -131,25 +141,33 @@
 //! * タスクはコマンドを**逐次**処理するので、**新しい `start()` は前の
 //!   `stop()` が完了するまで進まない**。二重起動の防止も「呼ばれた順に
 //!   効く」も、ロックではなく**所有権と 1 本のキュー**が担保する。
-//! * 読み出し（[`CollectorService::connection_status`] /
-//!   [`CollectorService::current_values`]）も同じキューを通るので、
-//!   **ライフサイクル操作の途中の [`Collector`] を覗くことがない** -
-//!   返ってくるのは必ず「どれかの操作と操作の間」の姿で、状態と食い違わない。
-//!   代償として、**起動処理の最中は読み出しがその完了まで待つ** - ライフ
-//!   サイクル操作にだけ上限を付けた（[`COLLECT_OPERATION_TIMEOUT`]）のに対し、
-//!   [`CollectorService::connection_status`] /
-//!   [`CollectorService::current_values`] は**まだ無上限**。C-2 までは
-//!   どちらも呼び出し口が無いので害は無いが、**C-3 でこれらを画面へ出すときに
-//!   同じ上限を付けること**（付けないと、起動が固まっている間ポーリングが
-//!   返らなくなる）。
+//! * 接続状態の読み出し（[`CollectorService::connection_status`]）も**同じ
+//!   タスク**へ依頼する（**キューは別**。下の「読み取りと操作でキューを
+//!   分ける」）ので、**ライフサイクル操作の途中の [`Collector`] を覗くことが
+//!   ない** - 返ってくるのは必ず「どれかの操作と操作の間」の姿で、状態と
+//!   食い違わない。代償として、**起動処理の最中は読み出しがその完了まで
+//!   待つ**ので、画面へ出す口（[`CollectorService::connections`]）には
+//!   **短い上限** [`COLLECT_READ_TIMEOUT`] を掛けてある（下の「読み出しの
+//!   3 つの口」）。
 //! * コマンドを**送る前**に呼び出し側が消えた場合は、そもそも何も起きない
 //!   （キューに積まれていないので、タスクは知らないまま）。
 //!
-//! 残るロックは**状態ロック（葉）** [`CollectorContext::state`]
-//! （`std::sync::Mutex`）だけで、**書くのはライフサイクルタスクだけ**。
+//! **現在値だけはこのキューを通らない**（C-3a）。理由と代償は下の
+//! 「現在値はキューから外して葉に公開する」。
+//!
+//! 残るロックは**公開ロック（葉）** [`CollectorContext::published`]
+//! （`std::sync::Mutex`）**1 本だけ**で、**書くのはライフサイクルタスクだけ**。
 //! `.await` をまたいで保持しないし、ここから他のロックを取らない。
-//! ポーリング経路（[`CollectorService::state`]）は**キューを通らない**ので、
-//! 起動中（tstore を開いている最中）でも待たされない。
+//! ポーリング経路（[`CollectorService::state`] / [`CollectorService::values`]）は
+//! **キューを通らない**ので、起動中（tstore を開いている最中）でも待たされない。
+//!
+//! **状態と現在値ハンドルを 1 本のロックに同居させている**のは、ロック順序の
+//! 問題を**作らない**ため（docs/implementation-checklist.md §5「ロック順序を
+//! 一方向に固定」）: 2 本に分けると「状態 → 現在値」「現在値 → 状態」の順序を
+//! 決めて守らせる話になるが、1 本なら**そもそも 2 つ取る場面が無い**。
+//! おまけに、書き込み口を [`CollectorContext::publish`] 1 本に絞れるので
+//! **「状態は `Running` なのに現在値が取り下げられている」という食い違いが
+//! 構造上作れない**（下の「現在値はキューから外して葉に公開する」）。
 //!
 //! # 起動時の自動開始と、「収集を再起動」だけが反映の口であること
 //!
@@ -169,6 +187,239 @@
 //! 収集が止まって立ち上がり直し、そのたびに tstore がローテーションして
 //! ファイルが刻まれる。編集が一段落したところで利用者が 1 回押す方が、
 //! 欠測も断片化も少ない。
+//!
+//! # 読み出しの 3 つの口 -「走っていない」「読めなかった」「0 件」を別にする
+//!
+//! C-3a の口は 3 つ: 現在値（[`CollectorService::values`]）、接続状態
+//! （[`CollectorService::connections`]）、収集イベント一覧
+//! （[`CollectorService::events`]）。**3 つとも [`Readout`] を返す**。
+//!
+//! [`Readout`] は「読めました」と「読めませんでした」を**同じ入れ物の別の値**に
+//! する型で、これが C-3a の一番の勘所（docs/implementation-checklist.md §5
+//! 「エラーを空に潰さない」/ #332 の 6 状態 / #400 の言い分け）:
+//!
+//! | 結末 | 意味 | 画面が言うべきこと |
+//! | --- | --- | --- |
+//! | [`Readout::NotRunning`] | 収集が走っていない（停止中 / `NoTargets` / 起動失敗） | 「収集は動いていません」 |
+//! | [`Readout::Unavailable`] | 走ってはいるが**この 1 回が読めなかった**（[`COLLECT_READ_TIMEOUT`] で打ち切り / DB が読めない） | 「今は読めませんでした」（失敗とも 0 件とも言わない） |
+//! | [`Readout::Ready`] | **読めた**。中身が空でも「0 件でした」という**事実** | 「0 件」 |
+//!
+//! 空の `HashMap` を返して「走っていない」を「0 件」に潰さない、というのは
+//! C-1 から [`Option`] でやってきたこと（[`CollectorService::current_values`]）
+//! の延長で、そこに**「読めなかった」という 3 つ目**を足したのが [`Readout`]。
+//!
+//! ## それぞれの口がどの結末を返しうるか（書いた分岐が到達すること）
+//!
+//! docs/implementation-checklist.md §5「書いた分岐が実際に到達するか確かめる」
+//! に従って、**どの経路でどれが返るか**を明示しておく:
+//!
+//! * [`CollectorService::values`][] は `NotRunning`（葉に現在値ハンドルが
+//!   無い）と `Ready`（0 件を含む）。**`Unavailable` は返らない** - 葉から
+//!   読むので待つ相手がおらず、打ち切りようがない（それがキューから外した
+//!   目的）。
+//! * [`CollectorService::connections`][] は 3 つとも返る。`Unavailable` は
+//!   「ライフサイクルタスクが遅い `start`/`stop` を処理している最中に
+//!   [`COLLECT_READ_TIMEOUT`] が過ぎた」場合。
+//! * [`CollectorService::events`][] は `Unavailable`（DB が読めない / 打ち
+//!   切り）と `Ready`（0 件を含む）。**`NotRunning` は返らない** - 次項。
+//!
+//! ## イベント一覧だけ「走っていない」を返さない（意図的）
+//!
+//! `collect_events` は**過去の記録**であって、走っている収集エンジンの
+//! 覗き窓ではない。収集が止まっていても「なぜ止まったか」を調べるために
+//! 読むものなので、**停止中でも読めなければ意味が無い**
+//! （docs/r1-plan.md の R1-C が「`collect_events` のイベント一覧ページ
+//! （banto 監査ログページの流儀）」と書いているとおり、`crate::audit` の
+//! 一覧と同じ性質の口）。ここで「走っていないので返しません」と答えるのは、
+//! **読めた過去を隠す**ことになる。
+//!
+//! したがって [`CollectorService::events`] は収集の状態を一切見ない。
+//! 走っているかどうかを知りたい画面は [`CollectorService::state_view`] を
+//! 併せて読むこと（状態はそちらが唯一の口、という C-2 からの線引きのまま）。
+//!
+//! ## 上限を [`COLLECT_OPERATION_TIMEOUT`] と別に持つ理由
+//!
+//! 読み出しは**ポーリングで引かれる口**なので、ライフサイクル操作の 30 秒は
+//! 長すぎる（30 秒返らない口を 1 秒ごとに叩けば、飛行中の要求が積み上がる
+//! だけ）。値と根拠は [`COLLECT_READ_TIMEOUT`] の doc。
+//!
+//! # 現在値はキューから外して葉に公開する（C-3a）
+//!
+//! 現在値は**この後ポーリングで引かれる**（R1-D の監視画面が 1 秒前後で
+//! 回す）。C-2 までのようにライフサイクルタスクのコマンドキューを通すと、
+//! **遅い `start()` の後ろで待たされる** - #400 で潰した「画面が固まる」型が
+//! そのまま再発する。
+//!
+//! そこで [`CurrentValuesHandle`] は**葉に公開する**:
+//!
+//! * [`Collector::current_values`] は `Arc<RwLock<..>>` を包んだハンドルを
+//!   `clone` して返すだけなので、**タスクの外に持ち出して保持してよい**
+//!   （`banto_collect::current` のモジュール doc - 収集タスクが書き、表示層が
+//!   読む前提の共有ハンドル）。
+//! * ライフサイクルタスクは **start が成功したときに公開し、stop が完了した
+//!   ときに取り下げる**。公開・取り下げは**状態と同じ 1 本のロック**
+//!   （[`CollectorContext::publish`]）で行うので、
+//!   **「`Running` なのにハンドルが無い」「`Stopped` なのにハンドルが残って
+//!   いる」が構造上作れない**。
+//! * 読む側（[`CollectorService::current_values`] /
+//!   [`CollectorService::values`]）は**同期**で、キューもディスクも触らない。
+//!
+//! **接続状態は外に出せない**ので、こちらはキュー経由のまま:
+//! [`Collector::status`] は `&Collector` を要求し、その中の `StatusMap` は
+//! `banto-collect` 内で `pub(crate)`。`crates/` は変更しない方針なので、
+//! ハンドルだけ葉へ持ち出すことができない。代わりに
+//! [`COLLECT_READ_TIMEOUT`] を掛けて、**待たされ続ける代わりに「読めません
+//! でした」と答える**（[`Readout::Unavailable`]）。
+//!
+//! # 読み取りと操作でキューを分ける（#408 レビュー P2-1）
+//!
+//! 上の [`COLLECT_READ_TIMEOUT`] は、**呼び出し側が待つのをやめる**だけの
+//! ものだった。**投入済みの要求はキューに残り続ける**ので、C-3a の実装
+//! （接続状態の読み取りを操作と同じキューへ送る）には次の経路があった:
+//!
+//! 1. 応答しない共有への `open` などで `start()` が長時間止まる、
+//! 2. その間、画面が接続状態を 1 秒ごとにポーリングする。呼び出し側は
+//!    2 秒で [`Readout::Unavailable`] を受け取って次の周回へ進むが、
+//!    **要求はキューに積み上がる**、
+//! 3. [`COMMAND_QUEUE_DEPTH`] 件が**既に呼び出し元へ答えを返した読み取り**で
+//!    埋まる、
+//! 4. その後の `stop()` / `restart()` が [`COLLECT_ENQUEUE_TIMEOUT`] に
+//!    掛かり、「**混雑により未受付**」になる。
+//!
+//! つまり **`viewer` でもできる閲覧のポーリングが、`editor` の停止要求を
+//! 受け付けさせなくする**。読み取りの**待ち時間**に上限を掛けても
+//! **キュー内の要求数は減らない**ので、上限では直らない。
+//!
+//! そこで**チャネルを 2 本に分ける**:
+//!
+//! * 操作（[`Command`]）: [`COMMAND_QUEUE_DEPTH`] 件・`send_timeout`
+//!   （[`COLLECT_ENQUEUE_TIMEOUT`]）・入らなければ未受付のエラー。**C-2 の
+//!   ままで、何も変えていない。**
+//! * 読み取り（[`ReadCommand`]）: [`READ_QUEUE_DEPTH`] 件と**小さく固定**し、
+//!   **`try_send`**。枠が無ければ**待たずに即** [`Readout::Unavailable`]
+//!   （「読めなかった」は [`Readout`] に既にある正しい表現。**新しい状態は
+//!   増やさない**）。
+//!
+//! **枠が空くのは、ライフサイクルタスクがその要求を取り出したときだけ。**
+//! 呼び出し側が [`COLLECT_READ_TIMEOUT`] で待つのをやめても枠は返さない -
+//! 返す実装（打ち切りで permit を解放する等）にすると、**タスクが止まって
+//! いる間に未処理の要求がいくらでも積み上がる**ので、分けた意味が無くなる
+//! （オーナー指摘）。タスクが止まっている間に何件溜めても答えは返らないの
+//! だから、**溜めないことが正しい**。
+//!
+//! ライフサイクルタスクは `tokio::select!` で 2 本を受け、`biased` で
+//! **操作を優先**する。読み取りが後回しになっても「今は読めませんでした」で
+//! 正しく畳めるが、操作にはその逃げ道が無い（停止は実行されなければ
+//! ならない）。
+//!
+//! # タスクが居ないことを「走っていない」と答えない（#408 レビュー）
+//!
+//! [`Readout::NotRunning`] を返してよいのは「**状態を見て、走っていないと
+//! 分かった**」ときだけ - [`Lifecycle`] タスクが実際に `collector` を見て
+//! 「持っていない」と答えた場合である。**タスクが居なくなっていた**
+//! （チャネルが閉じている / 応答の送信側が drop された = タスクが panic した）
+//! ときは、C-3a では `None` に潰して `NotRunning` と答えていたが、これは
+//! **二重に嘘になりうる**（オーナー判断）:
+//!
+//! 1. **[`CollectorService::state`] と食い違う。** 状態は**葉**
+//!    （[`CollectorContext::published`]）から読むので、タスクが panic しても
+//!    **最後に公開された状態（たとえば `running`）を返し続ける**。同じ画面に
+//!    「状態: 動作中」と「接続状態: 走っていません」が並ぶことになる。
+//! 2. **実際に収集が続いている公算が大きい。** `banto-collect` の
+//!    [`Collector`] には **`Drop` 実装が無い**（`crates/banto-collect` 唯一の
+//!    `impl Drop` はテスト用の `TempDir`）。タスクが panic して [`Collector`] が
+//!    drop されても、`Collector::start` が spawn した**接続タスクは止まらない** -
+//!    保持しているのは `JoinHandle`（drop は detach であって abort ではない）
+//!    と停止合図の `watch::Sender<bool>` で、後者が drop されても値は `false`
+//!    のままなので、受信側の停止条件（`*stop_rx.borrow()` が `true`）は成立
+//!    しない。つまり「誰も収集していない」は事実とは限らない。
+//!
+//! **[`Readout::Unavailable`]（走ってはいるが、この 1 回が読めなかった）が
+//! この状況を正しく言い表している。** 判定材料が無いときに「止まっている」側へ
+//! 倒さない、というのは #387 の `KeyOutcome::Undetermined` で採った規律と同じ
+//! （docs/implementation-checklist.md §5）。
+//!
+//! **読み出しの 3 つの口のうち、この分岐があるのは接続状態だけ**である:
+//! 現在値（[`CollectorService::values`]）は葉を読むので判定が
+//! [`CollectorContext::published`] そのもの（タスクの生死に左右されない）、
+//! イベント一覧（[`CollectorService::events`]）はそもそも `NotRunning` を
+//! 返さず、読めなければ既に [`Readout::Unavailable`]。
+//!
+//! `crates/` は**変更しない** - `Drop` が無いことは**事実として参照している
+//! だけ**で、接続タスクを道連れにする設計にすべきかは `banto-collect` 側の
+//! 別の判断（このアプリが先取りしない）。
+//!
+//! # 公開用の型 - 何を載せ、何を落としたか
+//!
+//! [`CollectorStateView`] と同じ考え方（#407 レビュー P2-2）で、**`banto-collect`
+//! の内部型をそのままワイヤに載せない**。3 つの口の読み取りは
+//! [`COLLECT_READ_ROLE`]（`viewer` 以上）に開いているので、**内部パス・接続先
+//! ホスト・資格情報にあたるものを含めない**。
+//!
+//! | 公開型 | 載せるもの | 落としたもの |
+//! | --- | --- | --- |
+//! | [`CurrentSampleView`] | 値・`ptimeMs`・品質（`good`/`bad`/`stale`） | 無し（`banto_collect::CurrentSample` の全部。機微なものが無い） |
+//! | [`ConnectionStatusView`] | `connected` / `reconnecting`（`attempt`）/ `stopped` | 無し（接続先ホスト・ポートはそもそもこの型に無い） |
+//! | [`CollectEventRow`] | `id`・`tsMs`・`kind`・`connectionKey`・`tagKey`・`level`・`value` | **`detail`（自由文）** |
+//!
+//! 地図の鍵（`conn:<id>` / `tag:<id>`）は**そのまま載せる** - これは
+//! レジストリの行 id であって接続先の情報ではなく、画面がタグ名・接続名と
+//! 突き合わせるのに要る。
+//!
+//! **`collect_events.detail` を落とした理由**: あの列は自由文で、中身は
+//! `banto-collect` が**外から受け取った文言をそのまま**入れている -
+//! `plc_disconnected` は `banto_plc::PlcError` の文言（DNS 解決の失敗文など
+//! **接続先が出うる**）、`append_failure_entered` は `banto_tstore` の
+//! 書き込みエラー（**ファイルパスが出うる**）。C-2 の P2 で
+//! [`CollectorState::StartFailed`] の `reason` を viewer に見せてしまったのと
+//! **同じ類の漏れ**なので、ここは種類ごとに選り分けるのではなく
+//! **列ごと SELECT しない**（[`CollectorService::events`] の SQL に `detail` が
+//! 無い）。種類ごとの白名簿にすると、次に `detail` を足した誰かの分が黙って
+//! 漏れる - 型と SQL で落としておけば、載せようとした時点で手が止まる。
+//!
+//! **残る制約（黙って落とさないために明記する）**: 画面は切断の理由や
+//! 書き込み失敗の詳細を**見られない**。必要になったら、`banto-collect` 側で
+//! 「利用者に見せてよい理由」を分類した項目を持たせる（自由文をフィルタする
+//! のではなく、発生源で分ける）のが筋で、それは C-3a ではやらない。
+//!
+//! # 非有限の浮動小数点は公開する形で正規化する（#408 レビュー P2-2）
+//!
+//! `f64` は NaN・`+∞`・`-∞` を取りうるのに、**`serde_json` はそのどれも
+//! `null` にする**（JSON に非有限の数が無いため）。[`CurrentSampleView`] が
+//! [`banto_collect::CurrentSample`] の `value` と `quality` をそのまま写して
+//! いた C-3a の実装では、`Some(f64::NAN)` + [`Quality::Good`] が
+//!
+//! ```json
+//! {"value":null,"ptimeMs":42,"quality":"good"}
+//! ```
+//!
+//! になる。**数値として使えないのに品質は good** なので、
+//! recorder-requirements.md §3.2 が要求している「画面が Bad / Stale を
+//! 出し分ける」が成立しない - 画面は品質を見て異常を判別できず、値が
+//! 消えている理由も分からない。
+//!
+//! **実際の入力経路から到達する**: Modbus の浮動小数点デコードは非有限値を
+//! 除外しておらず、`banto-collect` の `record_group()` も `Some(value)` /
+//! `Quality::Good` のまま現在値キャッシュへ入れる。
+//!
+//! そこで**公開型への変換時に `is_finite()` を確かめ、非有限なら
+//! `value: None` / `quality: bad` に正規化する**（[`CurrentSampleView`] の
+//! [`From`]）。`number | null` と `good`/`bad`/`stale` という**現行の契約は
+//! そのまま**で、語彙は増やさない。
+//!
+//! **なぜ変換の場所で直すのか**:
+//!
+//! * `crates/` は変更禁止（この PR の方針）なので、Modbus のデコード側や
+//!   `banto-collect` のキャッシュ側では直せない。
+//! * そもそも**内部のキャッシュには元の値が残ってよい** - 直したいのは
+//!   「外に出す形が自己矛盾していること」であって、収集エンジンが何を
+//!   受け取ったかではない。**公開する形だけを揃える**のは
+//!   [`CollectorStateView`]（`reason` を落とす）や [`CollectEventRow`]
+//!   （`detail` を落とす）と同じ層の仕事で、変換が 1 箇所
+//!   （[`CurrentSampleView::from`]）しかないので**経路によって食い違わない**。
+//! * デコード側の扱い（そもそも非有限値を読み取り失敗にするか）は別の判断で、
+//!   直すならこの層ではなく発生源。ここで正規化しても**その判断を先取り
+//!   しない**（公開する形が自己矛盾しないことだけを保証する）。
 //!
 //! # 無応答への上限 - 「打ち切り」は「失敗」ではない
 //!
@@ -257,9 +508,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use banto_collect::{
     build_config, ClientFactory, CollectError, CollectEvent, Collector, CollectorOptions,
-    ConnectionStatus, CurrentValuesHandle, EventSink,
+    ConnectionStatus, CurrentSample, CurrentValuesHandle, EventSink, Quality,
 };
-use banto_core::BantoError;
+use banto_core::{BantoError, ListResult};
 use banto_tstore::{Clock, SystemClock};
 // ロールの下限（`COLLECT_OPERATION_ROLE` / `COLLECT_READ_ROLE`）だけ、この
 // service 層が名前を出す - 両経路の床を 1 か所で決めるため（transport の
@@ -493,35 +744,373 @@ impl CollectOutcome {
     }
 }
 
-/// ライフサイクルタスクへの依頼。応答はそれぞれの `oneshot` に返す。
+// --- C-3a: 読み出しの結末と、その公開用の形 ---------------------------------
+
+/// 読み出し 1 回の結末。**3 つの口（現在値・接続状態・イベント一覧）が
+/// 共有する**（このモジュールの doc「読み出しの 3 つの口」）。
+///
+/// 「**走っていない**」「**読めなかった**」「**読めて 0 件**」を
+/// **別の値**にするためだけの型で、これが C-3a の一番の勘所
+/// （docs/implementation-checklist.md §5「エラーを空に潰さない」）。空の
+/// コレクションを返して 3 つを 1 つに潰すと、画面は「0 件です」としか言えず、
+/// 利用者は**収集が止まっているのか・読めなかったのか・本当に何も無いのか**を
+/// 区別できない。
+///
+/// ワイヤ形は判別共用体（`{"state":"ready","data":…}` /
+/// `{"state":"notRunning"}` / `{"state":"unavailable"}`）で、
+/// [`CollectorStateView`] と同じ作法（`crate::hub` の `HubStatus` 以来の
+/// このアプリの流儀）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum Readout<T> {
+    /// 収集が走っていない（停止中 / [`CollectorState::NoTargets`] /
+    /// [`CollectorState::StartFailed`]）。**0 件ではない。**
+    ///
+    /// **これを返してよいのは「状態を見て、走っていないと分かった」とき
+    /// だけ**（#408 レビュー）。読み取りの仕組みが壊れていて**判定できな
+    /// かった**ときは [`Self::Unavailable`] - 「分からない」を「止まって
+    /// いる」側へ倒さない（このモジュールの doc「タスクが居ないことを
+    /// 「走っていない」と答えない」）。
+    NotRunning,
+    /// 走ってはいるが、**この 1 回が読めなかった** -
+    /// [`COLLECT_READ_TIMEOUT`] で打ち切った、または DB が読めなかった。
+    ///
+    /// **「失敗しました」とも「0 件です」とも言わないこと**（#400 で確立した
+    /// 言い分けと同じ）。次のポーリングで読めるかもしれない。
+    Unavailable,
+    /// **読めた**。`data` が空でも、それは「0 件でした」という**事実**。
+    Ready { data: T },
+}
+
+impl<T> Readout<T> {
+    /// 監査・ログ・テスト用の短い識別子。**`serde` が付けるタグと同じ綴り**
+    /// （[`CollectorState::as_str`] と同じ役割）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotRunning => "notRunning",
+            Self::Unavailable => "unavailable",
+            Self::Ready { .. } => "ready",
+        }
+    }
+
+    /// 読めたときだけ中身を借りる。**`None` が「0 件」を意味しない**ことに
+    /// 注意（0 件は `Some` の中の空）。
+    pub fn data(&self) -> Option<&T> {
+        match self {
+            Self::Ready { data } => Some(data),
+            _ => None,
+        }
+    }
+}
+
+/// [`banto_collect::Quality`] の公開用の形（`good` / `bad` / `stale`）。
+///
+/// 内部型が `Serialize` を導出していないので、**ワイヤの綴りをこちらで
+/// 決める**（画面が Stale / Bad を出し分けられること自体が
+/// recorder-requirements.md §3.2 の要求）。`Stale` は保存されず
+/// **読み取り時に導出される**品質で、
+/// [`banto_collect::CurrentValuesHandle::snapshot`] が既に導出済みの値を
+/// くれる - ここでは詰め替えるだけ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum QualityView {
+    Good,
+    Bad,
+    Stale,
+}
+
+impl From<Quality> for QualityView {
+    fn from(quality: Quality) -> Self {
+        match quality {
+            Quality::Good => Self::Good,
+            Quality::Bad => Self::Bad,
+            Quality::Stale => Self::Stale,
+        }
+    }
+}
+
+/// [`banto_collect::CurrentSample`] の公開用の形。
+///
+/// **品質と時刻を必ず載せる**: 値だけ返すと、画面は「通信エラーで古い値を
+/// 表示し続けている」のか「今読めた値」なのかを言えない
+/// （recorder-requirements.md §3.2 の Stale / Bad 表示）。落としたものは
+/// **無い** - `CurrentSample` は値・時刻・品質しか持たず、機微なものが無い
+/// （このモジュールの doc「公開用の型」）。
+///
+/// **非有限の値（NaN・±∞）はここで正規化する** - このモジュールの doc
+/// 「非有限の浮動小数点は公開する形で正規化する」（#408 レビュー P2-2）。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrentSampleView {
+    /// スケーリング済みの値。**読めなかったサンプルは `None`**（`quality` が
+    /// `bad`）- ここを 0 に潰さない。
+    ///
+    /// **常に有限**（`is_finite()`）。非有限の値は [`From`] で `None` +
+    /// `bad` に正規化されるので、`null` と `good` が同居することはない。
+    pub value: Option<f64>,
+    /// このサンプルの時刻（UTC epoch ミリ秒、収集 PC の時計）。
+    pub ptime_ms: i64,
+    pub quality: QualityView,
+}
+
+impl From<&CurrentSample> for CurrentSampleView {
+    /// **非有限の値をここで畳む**（#408 レビュー P2-2。理由はこのモジュールの
+    /// doc「非有限の浮動小数点は公開する形で正規化する」）。
+    ///
+    /// `ptime_ms` は**そのまま**残す - 「いつのサンプルか」は値が使えなくても
+    /// 正しい情報で、`Quality::Bad` の既存のサンプル（`value: None`）でも
+    /// 同じように載せている。
+    fn from(sample: &CurrentSample) -> Self {
+        match sample.value {
+            // NaN・+∞・-∞: `serde_json` はこれを `null` にするので、
+            // そのまま写すと「**値が無いのに品質は good**」になり、画面が
+            // 品質を見て異常を判別できなくなる。**数値として使えない**の
+            // だから、`value` を落とすのと同時に品質も `bad` にする。
+            Some(value) if !value.is_finite() => Self {
+                value: None,
+                ptime_ms: sample.ptime_ms,
+                quality: QualityView::Bad,
+            },
+            _ => Self {
+                value: sample.value,
+                ptime_ms: sample.ptime_ms,
+                quality: sample.quality.into(),
+            },
+        }
+    }
+}
+
+/// [`banto_collect::ConnectionStatus`] の公開用の形
+/// （`{"status":"connected"}` / `{"status":"reconnecting","attempt":2}` /
+/// `{"status":"stopped"}`）。
+///
+/// 落としたものは**無い**: この型は接続先のホストもポートも資格情報も
+/// 持っていない（持っているのは状態と再接続の試行回数だけ）。`attempt` は
+/// 残す - 「切れてから何回目か」はヘルス表示の実用情報で、機微ではない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum ConnectionStatusView {
+    Connected,
+    Reconnecting { attempt: u32 },
+    Stopped,
+}
+
+impl From<&ConnectionStatus> for ConnectionStatusView {
+    fn from(status: &ConnectionStatus) -> Self {
+        match status {
+            ConnectionStatus::Connected => Self::Connected,
+            ConnectionStatus::Reconnecting { attempt } => Self::Reconnecting { attempt: *attempt },
+            ConnectionStatus::Stopped => Self::Stopped,
+        }
+    }
+}
+
+/// `collect_events` 1 行の公開用の形（#383 段階2b / R1-C の C-3a）。
+///
+/// 列は `crates/banto-collect/migrations/0001_collect_events.sql` のとおり
+/// （`id` / `ts` / `kind` / `connection_key` / `tag_key` / `level` / `value` /
+/// `detail`）で、**`detail` だけを落としている** - 理由はこのモジュールの doc
+/// 「公開用の型 - 何を載せ、何を落としたか」（自由文で、接続先やファイルパスを
+/// 含みうる）。落とすのは型だけでなく
+/// [`CollectorService::events`] の **SQL でも**（`SELECT` に `detail` が無い）。
+///
+/// `kind` / `level` を文字列のままにしているのは、**この表の語彙を決めている
+/// のは `banto-collect` であって、このアプリではない**から
+/// （`EventKind::as_str` が権威。DDL にも `CHECK` は無く、H4 で 4 種類が
+/// スキーマ変更なしに足された）。ここで列挙型に写すと、`banto-collect` が
+/// 種類を足すたびにこのアプリが**知らない種類を落とす**か失敗するようになる。
+#[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectEventRow {
+    pub id: i64,
+    /// UTC epoch ミリ秒（`collect_events.ts`）。
+    pub ts_ms: i64,
+    /// `collection_started` / `plc_disconnected` / `threshold_entered` など
+    /// （`banto_collect::EventKind::as_str` の綴り）。
+    pub kind: String,
+    /// `conn:<id>`。収集エンジン全体のイベント（開始・停止）では `None`。
+    pub connection_key: Option<String>,
+    /// `tag:<id>`。`threshold_*` だけ `Some`。
+    pub tag_key: Option<String>,
+    /// `H` / `HH` / `L` / `LL`（`threshold_*` だけ）。
+    pub level: Option<String>,
+    /// しきい値を跨いだ値（`threshold_*` だけ）。
+    pub value: Option<f64>,
+}
+
+/// イベント一覧の 1 ページ分の要求。
+///
+/// **監査ログ一覧（`crate::audit`）の流儀に合わせる**（docs/r1-plan.md の
+/// R1-C「`collect_events` のイベント一覧ページ（banto 監査ログページの
+/// 流儀）」）:
+///
+/// * 総件数は [`ListResult::total_count`] で返す（`crate::audit` と同じ型・
+///   同じ綴り `totalCount`）、
+/// * 既定の取得件数は **50**（[`COLLECT_EVENTS_DEFAULT_LIMIT`]。
+///   `banto_core::Pagination` の既定と同じ）、
+/// * 並び順は**新しい順**で固定（監査ログ画面の既定 `ts desc` と同じ）。
+///
+/// 監査ログ一覧と**違う**のは 2 点で、どちらも `GET` にしたことの帰結:
+///
+/// * 並べ替え・絞り込みは受け取らない（`POST .../list` + `ListParams` では
+///   ないので、列名を渡す口が無い）。要るようになったら
+///   `crate::audit` と同じ `ColumnMap` + `ListParams` の形に寄せること。
+/// * **取得件数に上限を掛ける**（[`COLLECT_EVENTS_MAX_LIMIT`]）。`?limit=` は
+///   URL に誰でも書けるので、`limit` を素通しにすると 1 リクエストで表全体を
+///   読み出せてしまう。`crate::audit` の `POST` は `admin` 限定だが、この口は
+///   `viewer` にも開いている。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventPage {
+    pub offset: u64,
+    pub limit: u64,
+}
+
+impl EventPage {
+    /// 未指定・範囲外を**黙って直す**（拒否しない）。画面のページャが
+    /// 素直に使えるようにするための純関数で、単体で表テストしている。
+    ///
+    /// * `offset` 未指定 = 先頭から。**`i64` に収まるところまで**に丸める -
+    ///   SQLite の `OFFSET` は符号付きで、そのまま渡すと巨大な値が負に化けて
+    ///   **`OFFSET 0`（＝先頭ページ）として扱われる**。「行き過ぎたページ」は
+    ///   0 件で返すべきで、黙って 1 ページ目を返してはいけない。
+    /// * `limit` 未指定 = [`COLLECT_EVENTS_DEFAULT_LIMIT`]。
+    /// * `limit` は `1..=`[`COLLECT_EVENTS_MAX_LIMIT`] に丸める（`0` を
+    ///   そのまま通すと「0 件読めました」という**意味の無い `Ready`** に
+    ///   なってしまう - それは 3 状態の言い分けを濁す）。
+    pub fn new(offset: Option<u64>, limit: Option<u64>) -> Self {
+        Self {
+            offset: offset.unwrap_or(0).min(i64::MAX as u64),
+            limit: limit
+                .unwrap_or(COLLECT_EVENTS_DEFAULT_LIMIT)
+                .clamp(1, COLLECT_EVENTS_MAX_LIMIT),
+        }
+    }
+}
+
+impl Default for EventPage {
+    fn default() -> Self {
+        Self::new(None, None)
+    }
+}
+
+/// ライフサイクルタスクへの**操作**の依頼。応答はそれぞれの `oneshot` に返す。
 ///
 /// **応答の受信側が落ちても（呼び出し側のキャンセル）、タスクは処理を
 /// 最後まで続ける** - `send` が `Err` になるだけ。それがこの設計の要点
 /// （このモジュールの doc「ライフサイクルは専用タスクが所有する」）。
+///
+/// **読み取りはこの enum に入れない**（#408 レビュー P2-1）。理由は
+/// [`ReadCommand`] と、このモジュールの doc「読み取りと操作でキューを
+/// 分ける」。
 enum Command {
     Start(oneshot::Sender<Result<CollectorState, BantoError>>),
     Stop(oneshot::Sender<Result<CollectorState, BantoError>>),
     Restart(oneshot::Sender<Result<CollectorState, BantoError>>),
-    /// 読み出しも同じキューを通す（操作の途中の [`Collector`] を覗かない）。
-    ConnectionStatus(oneshot::Sender<Option<HashMap<String, ConnectionStatus>>>),
-    CurrentValues(oneshot::Sender<Option<CurrentValuesHandle>>),
 }
 
-/// コマンドキューの深さ。ライフサイクル操作は人間の操作由来で秒に何度も
-/// 来るものではなく、読み出しのポーリングもこの深さで詰まることはない。
+/// ライフサイクルタスクへの**読み取り**の依頼。**[`Command`] とは別のチャネル**
+/// を通る（#408 レビュー P2-1。このモジュールの doc「読み取りと操作でキューを
+/// 分ける」）。
 ///
-/// 満杯になったときの扱いは**送る側で分かれる**:
+/// 中身が 1 つなのは、キューを通る読み取りが接続状態しか無いため -
+/// 現在値は葉に公開してあり（[`CurrentValuesHandle`]）、イベント一覧は
+/// SQLite を直接読むので、どちらもこのタスクを経由しない。
+enum ReadCommand {
+    /// 接続状態の読み出し。`Collector::status` が `&Collector` を要求し、
+    /// その中の `StatusMap` は `banto-collect` の `pub(crate)` なので、
+    /// **ハンドルだけ葉へ持ち出すことができない**（このモジュールの doc
+    /// 「現在値はキューから外して葉に公開する」の末尾）。
+    ConnectionStatus(oneshot::Sender<Option<HashMap<String, ConnectionStatus>>>),
+}
+
+/// **操作用**キュー（[`Command`]）の深さ。ライフサイクル操作は人間の操作
+/// 由来で秒に何度も来るものではないので、この深さが埋まるのは
+/// 「タスクが 1 件の操作の中で長く止まっている」ときだけ。
 ///
-/// * ライフサイクル操作（[`CollectorService::lifecycle`]）は
-///   [`COLLECT_ENQUEUE_TIMEOUT`] 付きで投入し、入らなかったら「**混雑により
-///   未受付**」という**エラー**を返す（`pending` にしない。#407 レビュー
-///   P2-1）。
-/// * 読み出し（[`CollectorService::readout`]）は従来どおり `send().await`
-///   の背圧に乗る。こちらは**受付/未受付の言い分けを持たない**（返るか
-///   返らないかだけ）ので、嘘をつきようがない。C-3 で画面へ出すときに
-///   上限を足すこと - このモジュールの doc「ライフサイクルは専用タスクが
-///   所有する」の注記のとおり。
+/// 満杯になったら [`CollectorService::lifecycle`] が
+/// [`COLLECT_ENQUEUE_TIMEOUT`] 付きで投入を試み、入らなかったら「**混雑により
+/// 未受付**」という**エラー**を返す（`pending` にしない。#407 レビュー P2-1）。
+///
+/// **読み取りはこのキューに入らない**（#408 レビュー P2-1）- 入れていた頃は、
+/// 閲覧のポーリングがここを埋めて**操作の投入を締め出していた**。
+/// [`READ_QUEUE_DEPTH`] を参照。
 const COMMAND_QUEUE_DEPTH: usize = 32;
+
+/// **読み取り用**キュー（[`ReadCommand`]）の深さ。操作用
+/// （[`COMMAND_QUEUE_DEPTH`]）とは**別のチャネル**で、**わざと小さい**。
+///
+/// **なぜ分けるのか（#408 レビュー P2-1）**: 読み取りは `viewer` にも開いた
+/// ポーリングの口で、操作（`editor` 以上の開始・停止・再起動）とは**要求の
+/// 性質も頻度も違う**。1 本のキューを共有していた C-3a では、
+///
+/// 1. 応答しない共有への `open` などで `start()` が長時間止まる、
+/// 2. その間に画面が接続状態を 1 秒ごとにポーリングする。呼び出し側は
+///    [`COLLECT_READ_TIMEOUT`] で待つのをやめて [`Readout::Unavailable`] を
+///    受け取るが、**投入済みの要求はキューに残ったまま**、
+/// 3. [`COMMAND_QUEUE_DEPTH`] 件が読み取りで埋まる、
+/// 4. その後の `stop()` / `restart()` が [`ENQUEUE_BUSY_MESSAGE`] で
+///    **未受付**になる、
+///
+/// という経路で「**閲覧が操作を締め出す**」ことが起きた。**読み取りの
+/// 待ち時間に上限を掛けても、キューの中の要求数は減らない**（上限は
+/// 呼び出し側が待つのをやめるだけ）ので、上限では直らない - 資源そのものを
+/// 分けるしかない。
+///
+/// **枠が空くのは、タスクがその要求を取り出したときだけ**。呼び出し側が
+/// [`COLLECT_READ_TIMEOUT`] で待つのをやめても枠は返さない（返す実装、
+/// たとえば「打ち切ったら permit を解放する」にすると、**未処理の要求が
+/// 再び積み上がる**だけで、分けた意味が無くなる）。枠が無い間の読み取りは
+/// **待たずに** [`Readout::Unavailable`] で畳む - 「読めなかった」は
+/// [`Readout`] に既にある正しい表現なので、**新しい状態は増やさない**。
+///
+/// **なぜ 4 か**: タスクが健全なら要求はミリ秒で捌けるので、普段はそもそも
+/// 積まれない。積まれるのはタスクが止まっているときだけで、その間に何件
+/// 溜めても答えは返らない（どれも [`COLLECT_READ_TIMEOUT`] で打ち切られる）
+/// から、深さに価値が無い。それでも 1 にしないのは、**複数の画面・複数の
+/// 経路（REST と Tauri）が同時にポーリングしうる**ため - 1 だと、正常時でも
+/// 2 つ目の画面が毎回「読めませんでした」を見る。4 は「同時に覗く人数」の
+/// 現実的な上限として取った。
+const READ_QUEUE_DEPTH: usize = 4;
+
+/// **読み出し**（[`CollectorService::connections`] /
+/// [`CollectorService::events`]）が待つのをやめるまでの時間。
+/// [`COLLECT_OPERATION_TIMEOUT`]（ライフサイクル操作の 30 秒）とは**別の
+/// 上限**で、こちらの方がずっと短い。
+///
+/// **なぜ短いのか**: これは**ポーリングで引かれる口**（R1-D の監視画面が
+/// 1 秒前後で現在値・接続状態を回す）。30 秒返らない口を 1 秒ごとに叩けば、
+/// 飛行中の要求が積み上がるだけで画面は何も描けない - #400 で潰した
+/// 「画面が固まる」の別の顔になる。**読み出しは「待つ」より「今は読めません
+/// でしたと答える」方が正しい**（次の周回でまた聞けるので）。
+///
+/// **なぜ 2 秒か**:
+///
+/// * 健全なときの往復は**ミリ秒**。接続状態の読み出しはライフサイクルタスクが
+///   キューから 1 件取り出して `HashMap` を `clone` するだけ、イベント一覧は
+///   同居している SQLite の索引付き 1 ページ読み取り。秒を要する時点で異常。
+/// * それでも 1 桁ミリ秒〜数百ミリ秒にしないのは、**正常だが一瞬混む**場面が
+///   実際にあるため - 停止処理（接続タスクの join と最終 flush）や起動処理
+///   （tstore を開く）の最中は、キューが数百ミリ秒単位で動かないことがある。
+///   そこで毎回「読めませんでした」を出すと、画面が**正常時にちらつく**。
+/// * 上を取って 5 秒・10 秒にしないのは、1 秒周期のポーリングで**飛行中の
+///   要求が 5〜10 本重なる**から。2 秒なら最悪でも 2 本で、しかも利用者から
+///   見て「一拍置いて『今は読めませんでした』が出る」応答になる。
+///
+/// **ライフサイクル操作の 30 秒をここに使い回さないこと。** あちらが長いのは
+/// 応答しない共有への `open` を見限る値として選んだからで
+/// （[`COLLECT_OPERATION_TIMEOUT`] の doc）、待っている相手も回数も違う。
+pub const COLLECT_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// イベント一覧の既定の取得件数。`banto_core::Pagination` の既定
+/// （`limit: 50`）と同じ値 - 監査ログ一覧と体感を揃えるため
+/// （[`EventPage`] の doc）。
+pub const COLLECT_EVENTS_DEFAULT_LIMIT: u64 = 50;
+
+/// イベント一覧の取得件数の**上限**。`?limit=` は URL に誰でも書けるので、
+/// 素通しにすると 1 リクエストで `collect_events` 全体を読み出せてしまう
+/// （この口は `viewer` にも開いている）。500 は「画面 1 ページぶんとしては
+/// 十分に多く、表全体を一気に抜くには足りない」ところ。
+pub const COLLECT_EVENTS_MAX_LIMIT: u64 = 500;
 
 /// ライフサイクル操作の依頼を**キューに入れる**のを諦めるまでの時間
 /// （[`COLLECT_OPERATION_TIMEOUT`] とは**別の上限**。#407 レビュー P2-1）。
@@ -634,10 +1223,14 @@ struct CollectorContext {
     /// [`banto_collect::default_client_factory`]（SLMP / Modbus TCP の直結）。
     /// テストだけが差し替える。
     factory: ClientFactory,
-    /// **状態ロック（葉）**。**書くのは [`Lifecycle`] タスクだけ**なので、
+    /// **公開ロック（葉）**。**書くのは [`Lifecycle`] タスクだけ**なので、
     /// `Collector` の実体と食い違わない。読み取りはどこからでもよい
-    /// （[`CollectorService::state`] はキューを通らない）。
-    state: Mutex<CollectorState>,
+    /// （[`CollectorService::state`] / [`CollectorService::current_values`] は
+    /// キューを通らない）。
+    ///
+    /// 状態と現在値ハンドルを**1 本のロックに同居**させている理由は、この
+    /// モジュールの doc「ライフサイクルは専用タスクが所有する」の末尾。
+    published: Mutex<Published>,
     /// **テスト専用**（製品ビルドにはフィールドごと存在しない）: 起動処理を
     /// 「[`CollectorState::Starting`] を立てた直後・tstore を開く前」で
     /// 止められるゲート。[`COLLECT_OPERATION_TIMEOUT`] の受入条件
@@ -666,16 +1259,48 @@ struct StartGate {
     release: tokio::sync::Notify,
 }
 
+/// 葉に置いてある「**キューを通らずに読めるもの**」。**書くのは
+/// [`Lifecycle`] タスクだけ**で、書き口は [`CollectorContext::publish`] 1 本。
+///
+/// 2 つを同じ構造体（＝同じロック）に入れているのは、**食い違いを構造で
+/// 防ぐ**ため: 別々のロックに分けると「状態は `Running` に上げたが現在値の
+/// 公開を忘れた」「停止で状態だけ落として現在値が残った」が書けてしまう。
+/// 1 本にして書き口を 1 つに絞れば、**片方だけ書く**コードがそもそも書けない。
+struct Published {
+    state: CollectorState,
+    /// 走っているときだけ `Some`。[`Collector::current_values`] が返す
+    /// 共有ハンドル（`Arc<RwLock<..>>` 包み）で、**タスクの外で保持してよい**
+    /// （このモジュールの doc「現在値はキューから外して葉に公開する」）。
+    current: Option<CurrentValuesHandle>,
+}
+
 impl CollectorContext {
     fn state(&self) -> CollectorState {
-        self.state
+        self.published
             .lock()
-            .expect("collector state lock poisoned")
+            .expect("collector published lock poisoned")
+            .state
             .clone()
     }
 
-    fn set_state(&self, state: CollectorState) {
-        *self.state.lock().expect("collector state lock poisoned") = state;
+    /// 現在値ハンドルのスナップショット。**走っていなければ `None`**。
+    fn current(&self) -> Option<CurrentValuesHandle> {
+        self.published
+            .lock()
+            .expect("collector published lock poisoned")
+            .current
+            .clone()
+    }
+
+    /// **状態と現在値を必ず一緒に書く**唯一の口（[`Published`] の doc）。
+    /// `current` は「走っているなら `Some`」で、`Running` 以外は必ず `None`。
+    fn publish(&self, state: CollectorState, current: Option<CurrentValuesHandle>) {
+        let mut published = self
+            .published
+            .lock()
+            .expect("collector published lock poisoned");
+        published.state = state;
+        published.current = current;
     }
 }
 
@@ -684,11 +1309,21 @@ impl CollectorContext {
 /// コマンドと LAN の REST が別々のエンジンを立てない）。
 struct CollectorInner {
     ctx: Arc<CollectorContext>,
-    /// ライフサイクルタスクへのコマンド口。**初回の非同期操作で spawn する**
+    /// ライフサイクルタスクへの 2 本の口。**初回の非同期操作で spawn する**
     /// （[`CollectorService::new`] は `tauri` の `setup` から**ランタイムの
     /// 外**で呼ばれるので、そこで `tokio::spawn` すると panic する）。
     /// `OnceLock` なので二重には立たない。
-    commands: OnceLock<mpsc::Sender<Command>>,
+    channels: OnceLock<Channels>,
+}
+
+/// ライフサイクルタスクへの**2 本**の送信口。操作と読み取りでキューを分けて
+/// いるので、[`OnceLock`] に入れるのはこの組（片方だけ先に作られる、という
+/// 状態を作らないため）。分けた理由は [`READ_QUEUE_DEPTH`]。
+struct Channels {
+    /// 開始・停止・再起動（[`COMMAND_QUEUE_DEPTH`]・`send_timeout`）。
+    commands: mpsc::Sender<Command>,
+    /// 接続状態の読み出し（[`READ_QUEUE_DEPTH`]・`try_send`）。
+    reads: mpsc::Sender<ReadCommand>,
 }
 
 /// 収集エンジンのサービス層。`src-tauri` の `collect_*` コマンドと
@@ -733,7 +1368,10 @@ impl CollectorService {
             events,
             options,
             factory,
-            state: Mutex::new(CollectorState::Stopped),
+            published: Mutex::new(Published {
+                state: CollectorState::Stopped,
+                current: None,
+            }),
             #[cfg(test)]
             start_gate: None,
         })
@@ -743,7 +1381,7 @@ impl CollectorService {
         Self {
             inner: Arc::new(CollectorInner {
                 ctx: Arc::new(ctx),
-                commands: OnceLock::new(),
+                channels: OnceLock::new(),
             }),
         }
     }
@@ -854,20 +1492,169 @@ impl CollectorService {
         CollectorStateView::from(&self.state())
     }
 
-    /// 接続ごとの状態のスナップショット。**走っていなければ `None`** -
-    /// 空の `HashMap` を返して「接続 0 件」と混同させない
-    /// （docs/implementation-checklist.md §5）。
+    /// 接続ごとの状態のスナップショット（**内部型のまま**）。
     ///
-    /// ライフサイクルタスクに問い合わせるので、**飛行中の start/stop が
-    /// 終わってから**answer が返る（操作の途中の [`Collector`] は見えない）。
-    pub async fn connection_status(&self) -> Option<HashMap<String, ConnectionStatus>> {
-        self.readout(Command::ConnectionStatus).await
+    /// * [`Readout::NotRunning`] - **タスクが「走っていない」と答えた**場合
+    ///   だけ。空の `HashMap` を返して「接続 0 件」と混同させない
+    ///   （docs/implementation-checklist.md §5）。
+    /// * [`Readout::Unavailable`] - **読み取り用キューに枠が無かった**
+    ///   （待たずに即決）、[`COLLECT_READ_TIMEOUT`] までに答えが返らなかった、
+    ///   または**ライフサイクルタスクが居なくなっていた**（チャネルが閉じて
+    ///   いる / 応答の送信側が drop された）。最後のものを「走っていない」に
+    ///   しないのが #408 レビューの直し - 理由はこのモジュールの doc
+    ///   「タスクが居ないことを『走っていない』と答えない」。
+    /// * [`Readout::Ready`] - 答えが返った（0 件を含む）。
+    ///
+    /// ライフサイクルタスクに問い合わせるので、返るのは必ず「どれかの操作と
+    /// 操作の間」の姿（操作の途中の [`Collector`] は見えない）。
+    ///
+    /// **投入は [`READ_QUEUE_DEPTH`] の読み取り専用チャネルへ `try_send`**
+    /// （#408 レビュー P2-1）。操作用キューには**一切触らない**ので、
+    /// この口をいくらポーリングしても `stop()` / `restart()` の投入を
+    /// 締め出せない。枠が無いときに待たないのは、待てば結局
+    /// [`COLLECT_READ_TIMEOUT`] で打ち切って同じ答えになるうえ、
+    /// **待っている間に投入できてしまうと未処理の要求が積み上がる**から。
+    ///
+    /// 公開用の型に詰め替えて外へ出すのは [`Self::connections`] の側。
+    async fn connection_status(&self) -> Readout<HashMap<String, ConnectionStatus>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        match self
+            .reads()
+            .try_send(ReadCommand::ConnectionStatus(reply_tx))
+        {
+            Ok(()) => {}
+            // 枠が無い = 直前の読み取りがまだ取り出されていない
+            // （タスクが長い操作を抱えている）。**待たない。**
+            Err(mpsc::error::TrySendError::Full(_)) => return Readout::Unavailable,
+            // タスクが居ない（= panic した。通常は起こらない）。**「走って
+            // いない」とは答えない** - 収集が止まった確証が無いどころか、
+            // 接続タスクは生き残っている公算が大きい（このモジュールの doc
+            // 「タスクが居ないことを「走っていない」と答えない」）。
+            Err(mpsc::error::TrySendError::Closed(_)) => return Readout::Unavailable,
+        }
+        match tokio::time::timeout(COLLECT_READ_TIMEOUT, reply_rx).await {
+            // **`NotRunning` を返すのはここだけ** - タスクが実際に
+            // `self.collector` を見て「持っていない」と答えた場合。
+            Ok(Ok(Some(statuses))) => Readout::Ready { data: statuses },
+            Ok(Ok(None)) => Readout::NotRunning,
+            // 応答の送信側が落ちた = タスクが居なくなった（上と同じ扱い）。
+            Ok(Err(_reply_dropped)) => Readout::Unavailable,
+            // 打ち切ったのは**この 1 回の待ち**だけ。依頼はキューに残って
+            // いて、タスクが手空きになれば処理される（誰も受け取らないだけ）。
+            // **枠が空くのはそのとき**で、ここでは返さない。
+            Err(_elapsed) => Readout::Unavailable,
+        }
     }
 
     /// 現在値キャッシュのハンドル。**走っていなければ `None`**（同上 -
     /// 「値がまだ無い」キャッシュを返して「0 件」に潰さない）。
-    pub async fn current_values(&self) -> Option<CurrentValuesHandle> {
-        self.readout(Command::CurrentValues).await
+    ///
+    /// **同期**（C-3a）: 葉に公開してあるハンドルを `clone` するだけで、
+    /// コマンドキューもディスクも触らない - **遅い `start()` の後ろで
+    /// 待たされない**（このモジュールの doc「現在値はキューから外して葉に
+    /// 公開する」）。ポーリングで引いてよい。
+    pub fn current_values(&self) -> Option<CurrentValuesHandle> {
+        self.inner.ctx.current()
+    }
+
+    // --- C-3a: 外向きの 3 つの読み出し口 ---------------------------------
+
+    /// **現在値**（`GET /api/collect/values` / `collect_values`）。
+    ///
+    /// * 走っていない → [`Readout::NotRunning`]、
+    /// * 走っている → [`Readout::Ready`]（**まだ 1 度も読めていなければ空の
+    ///   `HashMap`** = 「0 件」という事実）。
+    ///
+    /// **[`Readout::Unavailable`] は返らない**（待つ相手が居ないので打ち切る
+    /// ものが無い）。キーは `tag:<id>`。
+    pub fn values(&self) -> Readout<HashMap<String, CurrentSampleView>> {
+        values_readout(self.current_values().map(|handle| handle.snapshot()))
+    }
+
+    /// **接続状態**（`GET /api/collect/connections` / `collect_connections`）。
+    ///
+    /// 3 つの結末すべてを返しうる唯一の口:
+    ///
+    /// * 走っていない → [`Readout::NotRunning`]、
+    /// * [`COLLECT_READ_TIMEOUT`] 以内にライフサイクルタスクが答えなかった →
+    ///   [`Readout::Unavailable`]（**「失敗」でも「0 件」でもない**）、
+    /// * 答えた → [`Readout::Ready`]。
+    ///
+    /// キューを通るのは、`banto-collect` が接続状態のハンドルを外に出して
+    /// いないから（このモジュールの doc「現在値はキューから外して葉に公開
+    /// する」の末尾）。ただし**通るのは読み取り専用のキュー**で、操作用の
+    /// キューには触らない（#408 レビュー P2-1。[`READ_QUEUE_DEPTH`]）。
+    /// キーは `conn:<id>`。
+    pub async fn connections(&self) -> Readout<HashMap<String, ConnectionStatusView>> {
+        match self.connection_status().await {
+            Readout::NotRunning => Readout::NotRunning,
+            Readout::Unavailable => Readout::Unavailable,
+            Readout::Ready { data } => connections_readout(Some(data)),
+        }
+    }
+
+    /// **収集イベント一覧**（`GET /api/collect/events` /
+    /// `collect_events_list`）: `collect_events` の 1 ページを**新しい順**で
+    /// 返す。総件数は [`ListResult::total_count`]（`crate::audit` の一覧と
+    /// 同じ型・同じ綴り）。
+    ///
+    /// * 読めた → [`Readout::Ready`]（**0 件でも `Ready`**）、
+    /// * 読めなかった（DB エラー / [`COLLECT_READ_TIMEOUT`] で打ち切り）→
+    ///   [`Readout::Unavailable`]。
+    ///
+    /// **[`Readout::NotRunning`] は返らない** - イベントは過去の記録なので、
+    /// 収集が止まっていても読める（このモジュールの doc「イベント一覧だけ
+    /// 「走っていない」を返さない」）。
+    ///
+    /// **読めなかった理由は返さない**（`Err` にもしない）: この口は `viewer`
+    /// にも開いていて、`sqlx` のエラー文言は DB ファイルのパスを含みうる -
+    /// C-2 の P2（`StartFailed.reason` の漏れ）と同じ類なので、理由はサーバー
+    /// 側のログにだけ出す。
+    pub async fn events(&self, page: EventPage) -> Readout<ListResult<CollectEventRow>> {
+        match tokio::time::timeout(COLLECT_READ_TIMEOUT, self.read_events(page)).await {
+            Ok(Ok(result)) => Readout::Ready { data: result },
+            Ok(Err(err)) => {
+                eprintln!("banto: 収集イベントの読み出しに失敗しました: {err}");
+                Readout::Unavailable
+            }
+            Err(_elapsed) => {
+                eprintln!(
+                    "banto: 収集イベントの読み出しが{}秒以内に終わりませんでした",
+                    COLLECT_READ_TIMEOUT.as_secs()
+                );
+                Readout::Unavailable
+            }
+        }
+    }
+
+    /// [`Self::events`] の DB 側。**`SELECT` に `detail` が無い**のは意図で、
+    /// あの列は接続先やファイルパスを含みうる自由文（このモジュールの doc
+    /// 「公開用の型 - 何を載せ、何を落としたか」）。
+    ///
+    /// 並び順は `ts DESC, id DESC` 固定 - `ts` は同じミリ秒に複数行が並びうる
+    /// ので、`id`（`AUTOINCREMENT` = 挿入順）で必ず一意に決める。ここが
+    /// 曖昧だとページ境界で行が重複・欠落する。
+    async fn read_events(
+        &self,
+        page: EventPage,
+    ) -> Result<ListResult<CollectEventRow>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, CollectEventRow>(
+            "SELECT id, ts AS ts_ms, kind, connection_key, tag_key, level, value \
+             FROM collect_events ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(page.limit as i64)
+        .bind(page.offset as i64)
+        .fetch_all(&self.inner.ctx.pool)
+        .await?;
+        // 総件数は**ページングの前**の件数（`crate::audit::AuditLogService::list`
+        // と同じ形）。画面のページャがこれを使う。
+        let total_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM collect_events")
+            .fetch_one(&self.inner.ctx.pool)
+            .await?;
+        Ok(ListResult {
+            rows,
+            total_count: total_count as u64,
+        })
     }
 
     /// 収集イベントの live 購読。
@@ -883,20 +1670,38 @@ impl CollectorService {
 
     // --- ライフサイクルタスクへの依頼 ------------------------------------
 
-    /// ライフサイクルタスクへのコマンド口。**初回の呼び出しで spawn する** -
+    /// ライフサイクルタスクへの 2 本の口。**初回の呼び出しで spawn する** -
     /// [`Self::new`] は `tauri` の `setup`（tokio ランタイムの外）から呼ばれる
     /// ので、そこで `tokio::spawn` はできない。ここへ来る経路は全部 `async fn`
     /// の中なので、必ずランタイムの上にいる。
-    fn commands(&self) -> &mpsc::Sender<Command> {
-        self.inner.commands.get_or_init(|| {
+    ///
+    /// **2 本まとめて作る**（[`Channels`]）: 操作用と読み取り用を別々に
+    /// 遅延生成すると、タスクが片方だけを受け取った状態が作れてしまう。
+    fn channels(&self) -> &Channels {
+        self.inner.channels.get_or_init(|| {
             let (tx, rx) = mpsc::channel(COMMAND_QUEUE_DEPTH);
+            let (read_tx, read_rx) = mpsc::channel(READ_QUEUE_DEPTH);
             let lifecycle = Lifecycle {
                 ctx: self.inner.ctx.clone(),
                 collector: None,
             };
-            tokio::spawn(lifecycle.run(rx));
-            tx
+            tokio::spawn(lifecycle.run(rx, read_rx));
+            Channels {
+                commands: tx,
+                reads: read_tx,
+            }
         })
+    }
+
+    /// **操作用**の送信口（[`COMMAND_QUEUE_DEPTH`]）。
+    fn commands(&self) -> &mpsc::Sender<Command> {
+        &self.channels().commands
+    }
+
+    /// **読み取り用**の送信口（[`READ_QUEUE_DEPTH`]）。閲覧のポーリングが
+    /// 操作の投入を締め出さないよう、操作用と資源を共有しない。
+    fn reads(&self) -> &mpsc::Sender<ReadCommand> {
+        &self.channels().reads
     }
 
     /// `start`/`stop`/`restart` 共通の往復。3 つとも同じ 1 本を通る
@@ -949,28 +1754,6 @@ impl CollectorService {
         }
     }
 
-    /// 読み出し共通の往復。タスクが居ないときは「走っていない」と同じ `None`
-    /// になる - 走っていないのは事実（タスクごと消えているので誰も収集して
-    /// いない）なので、ここは潰していることにならない。
-    async fn readout<T>(&self, make: fn(oneshot::Sender<Option<T>>) -> Command) -> Option<T> {
-        self.request(make).await.flatten()
-    }
-
-    /// 読み出しのコマンドを 1 つ送って応答を待つ。`None` = タスクが居ない /
-    /// 応答が返らなかった。
-    ///
-    /// **ライフサイクル操作はここを通らない**（[`Self::lifecycle`] が投入と
-    /// 完了待ちを自前で分けている）。読み出しは「受け付けた/受け付けていない」
-    /// を言い分けないので、投入は背圧のまま `send().await` でよい。
-    async fn request<T>(&self, make: fn(oneshot::Sender<T>) -> Command) -> Option<T> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        // ここでキャンセルされた場合（まだ送れていない）は、タスクは依頼を
-        // 知らないまま = 何も起きない。送れた後は、待つのをやめても処理は
-        // 最後まで進む。
-        self.commands().send(make(reply_tx)).await.ok()?;
-        reply_rx.await.ok()
-    }
-
     /// テスト専用の組み立て口: 時計・チューニング・クライアント生成口を
     /// 差し替える。本番の [`Self::new`] を 1 本に保ったまま、テストが
     /// 短いタイムアウトと偽クライアントを使えるようにするためだけのもの。
@@ -982,6 +1765,44 @@ impl CollectorService {
         factory: ClientFactory,
     ) -> Self {
         Self::build(pool, data_dir, Arc::new(SystemClock), options, factory)
+    }
+
+    /// **テスト専用**: [`Lifecycle`] タスクが**居なくなった**状態
+    /// （= タスクが panic した後）を作る。2 本のチャネルを自前で作って
+    /// **受信側だけ落とし**、送信側を [`CollectorInner::channels`] に
+    /// 入れてしまうので、以降の `try_send` / `send_timeout` は必ず
+    /// `Closed` になる。
+    ///
+    /// **タスクを spawn して本当に panic させる形は採らない**: そのためには
+    /// panic する分岐を製品コードに用意することになり、`#[cfg(test)]` の
+    /// 有無に関わらず「panic させる口」が増える。ここで再現したいのは
+    /// 「**送信口は生きているが、受け手が居ない**」という観測可能な状態
+    /// そのものなので、チャネルの形で直接作るのが最小。
+    ///
+    /// 葉（[`CollectorContext::published`]）には**何も書かない** - 呼び出し側の
+    /// テストが「タスクが消える直前の状態」を自分で公開する。
+    #[cfg(test)]
+    fn new_for_test_without_lifecycle_task(
+        pool: SqlitePool,
+        data_dir: PathBuf,
+        options: CollectorOptions,
+        factory: ClientFactory,
+    ) -> Self {
+        let svc = Self::build(pool, data_dir, Arc::new(SystemClock), options, factory);
+        let (commands, command_rx) = mpsc::channel(COMMAND_QUEUE_DEPTH);
+        let (reads, read_rx) = mpsc::channel(READ_QUEUE_DEPTH);
+        // **受け手を落とす** = タスクが消えた、と同じ観測になる。
+        drop(command_rx);
+        drop(read_rx);
+        if svc
+            .inner
+            .channels
+            .set(Channels { commands, reads })
+            .is_err()
+        {
+            panic!("組み立て直後なのにチャネルが既に入っている");
+        }
+        svc
     }
 
     /// [`Self::new_for_test`] と同じだが、起動処理を [`StartGate`] で
@@ -1002,7 +1823,10 @@ impl CollectorService {
             events,
             options,
             factory,
-            state: Mutex::new(CollectorState::Stopped),
+            published: Mutex::new(Published {
+                state: CollectorState::Stopped,
+                current: None,
+            }),
             start_gate: Some(gate),
         })
     }
@@ -1025,31 +1849,59 @@ impl Lifecycle {
     /// 受け取らない - これが「新しい `start()` が前の `stop()` の完了前に
     /// 進まない」の全てで、そのためのロックは 1 つも要らない。
     ///
+    /// **口は 2 本**（#408 レビュー P2-1）: 操作（[`Command`]）と読み取り
+    /// （[`ReadCommand`]）。逐次処理であることは変わらない - 変わったのは
+    /// 「**どちらのキューが埋まっても、もう一方の投入を妨げない**」こと
+    /// （[`READ_QUEUE_DEPTH`] の doc に、共有していた頃に起きていたことを
+    /// 書いてある）。
+    ///
+    /// `biased` で**操作を優先**する。読み取りが後回しになっても、呼び出し側は
+    /// [`COLLECT_READ_TIMEOUT`] で打ち切って [`Readout::Unavailable`]
+    /// （「今は読めませんでした」）と正しく畳めるが、操作の側には
+    /// そういう逃げ道が無い（停止は実行されなければならない）。
+    ///
     /// [`CollectorService`] が全部 drop されると `Sender` が落ち、この
-    /// ループが抜けてタスクが終わる。そのとき走っている [`Collector`] は
+    /// ループが抜けてタスクが終わる（2 本は [`Channels`] に同居しているので
+    /// 一緒に落ちる）。そのとき走っている [`Collector`] は
     /// `stop()` されずに drop される（接続タスクは切り離される）が、これは
     /// サービスごと捨てられる場面 = プロセス終了時だけで、正規の終了経路は
     /// `shutdown_app_state` が明示的に [`CollectorService::stop`] を通る。
-    async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
-        while let Some(command) = commands.recv().await {
-            match command {
-                // `send` の `Err`（呼び出し側が待つのをやめた）は捨てる。
-                // **処理そのものはもう終わっている**ので、誰も受け取らなく
-                // ても状態と実体は一致している。
-                Command::Start(reply) => {
-                    let _ = reply.send(self.start().await);
+    async fn run(
+        mut self,
+        mut commands: mpsc::Receiver<Command>,
+        mut reads: mpsc::Receiver<ReadCommand>,
+    ) {
+        loop {
+            tokio::select! {
+                // 操作を先に見る（上の doc）。
+                biased;
+                command = commands.recv() => {
+                    let Some(command) = command else { break };
+                    match command {
+                        // `send` の `Err`（呼び出し側が待つのをやめた）は捨てる。
+                        // **処理そのものはもう終わっている**ので、誰も受け取らなく
+                        // ても状態と実体は一致している。
+                        Command::Start(reply) => {
+                            let _ = reply.send(self.start().await);
+                        }
+                        Command::Stop(reply) => {
+                            let _ = reply.send(self.stop().await);
+                        }
+                        Command::Restart(reply) => {
+                            let _ = reply.send(self.restart().await);
+                        }
+                    }
                 }
-                Command::Stop(reply) => {
-                    let _ = reply.send(self.stop().await);
-                }
-                Command::Restart(reply) => {
-                    let _ = reply.send(self.restart().await);
-                }
-                Command::ConnectionStatus(reply) => {
-                    let _ = reply.send(self.collector.as_ref().map(|c| c.status()));
-                }
-                Command::CurrentValues(reply) => {
-                    let _ = reply.send(self.collector.as_ref().map(|c| c.current_values()));
+                read = reads.recv() => {
+                    let Some(read) = read else { break };
+                    match read {
+                        // **枠が空くのはここ**（要求を取り出した瞬間）。
+                        // 呼び出し側が待つのをやめても枠は返らない
+                        // （[`READ_QUEUE_DEPTH`] の doc）。
+                        ReadCommand::ConnectionStatus(reply) => {
+                            let _ = reply.send(self.collector.as_ref().map(|c| c.status()));
+                        }
+                    }
                 }
             }
         }
@@ -1067,7 +1919,11 @@ impl Lifecycle {
         // `Stopped` を返すと嘘になる（起動処理はここで続いている）ため -
         // このモジュールの doc「無応答への上限」。ここから必ず
         // `Running` / `NoTargets` / `StartFailed` のどれかへ抜ける。
-        self.ctx.set_state(CollectorState::Starting);
+        //
+        // 現在値は**まだ公開しない**（`None`）。エンジンはこれから開くので、
+        // 「起動中」に現在値が読めたら嘘になる - C-3a の読み出しはこのとき
+        // `Readout::NotRunning` と答える。
+        self.ctx.publish(CollectorState::Starting, None);
 
         // **テスト専用**の一時停止点。製品ビルドにはこのブロックごと
         // 存在しない（`CollectorContext::start_gate` の doc）。
@@ -1089,7 +1945,7 @@ impl Lifecycle {
         // `group_count()` では「有効グループ 1・有効タグ 0」を素通りさせて
         // しまう（#406 レビュー P2。このモジュール doc 参照）。
         if config.tag_count() == 0 {
-            self.ctx.set_state(CollectorState::NoTargets);
+            self.ctx.publish(CollectorState::NoTargets, None);
             return Ok(CollectorState::NoTargets);
         }
 
@@ -1112,9 +1968,14 @@ impl Lifecycle {
         // **成功を確かめてから**状態を上げる（先に Running にして失敗時に
         // 降ろす、という順序にしない - docs/implementation-checklist.md §6
         // の「失敗経路での状態の落とし方」）。
+        //
+        // 現在値ハンドルの**公開はここ**（C-3a）。`Running` と同じ
+        // `publish` 呼び出しで書くので、「走っているのに現在値が読めない」
+        // という食い違いが起こらない（[`Published`] の doc）。
+        let current = collector.current_values();
         self.collector = Some(collector);
         let state = CollectorState::Running { groups, tags };
-        self.ctx.set_state(state.clone());
+        self.ctx.publish(state.clone(), Some(current));
         Ok(state)
     }
 
@@ -1130,7 +1991,10 @@ impl Lifecycle {
         // 食い違いが残ることはない。
         let result = collector.stop().await;
         // 止まったことは確定なので、flush の成否に関わらず `Stopped` にする。
-        self.ctx.set_state(CollectorState::Stopped);
+        // **現在値ハンドルの取り下げもここ**（C-3a）- 停止が実体まで終わって
+        // から降ろすので、停止処理の最中はまだ最後の値が読める（止まったのに
+        // 読める、という逆の嘘にはならない）。
+        self.ctx.publish(CollectorState::Stopped, None);
         match result {
             Ok(()) => Ok(CollectorState::Stopped),
             Err(err) => Err(collect_error(err)),
@@ -1150,10 +2014,56 @@ impl Lifecycle {
     /// **[`CollectError`] の文言をそのまま捨てない**。
     fn fail_start(&self, err: CollectError) -> BantoError {
         let reason = err.to_string();
-        self.ctx.set_state(CollectorState::StartFailed {
-            reason: reason.clone(),
-        });
+        self.ctx.publish(
+            CollectorState::StartFailed {
+                reason: reason.clone(),
+            },
+            None,
+        );
         collect_error_with_reason(err, reason)
+    }
+}
+
+/// 現在値の「走っていない / 読めて 0 件 / 読めて N 件」の言い分け（**純関数**）。
+///
+/// [`CollectorService::values`] から切り出してあるのは、**状態の総当たりを
+/// 表で固定する**ため（docs/implementation-checklist.md §5「判断は純関数に
+/// 出して、状態の総当たりを表でテストする」）。`None` = 走っていない、
+/// `Some(空)` = 走っているがまだ 1 件も読めていない（**0 件という事実**）。
+fn values_readout(
+    snapshot: Option<HashMap<String, CurrentSample>>,
+) -> Readout<HashMap<String, CurrentSampleView>> {
+    match snapshot {
+        None => Readout::NotRunning,
+        Some(samples) => Readout::Ready {
+            data: samples
+                .iter()
+                .map(|(key, sample)| (key.clone(), CurrentSampleView::from(sample)))
+                .collect(),
+        },
+    }
+}
+
+/// 接続状態の同じ言い分け（**純関数**）。`None` = **タスクが「走っていない」と
+/// 答えた**、`Some(空)` = 走っているが接続タスクがまだ 1 件も状態を書いて
+/// いない。
+///
+/// **「読めなかった」はここには来ない** - 打ち切りも**タスクが居ない**場合も
+/// [`CollectorService::connection_status`] の側で [`Readout::Unavailable`] に
+/// なる（#408 レビュー。このモジュールの doc「タスクが居ないことを「走って
+/// いない」と答えない」）。ここは「**答えが返ってきた**」あとの言い分けだけを
+/// 担う。
+fn connections_readout(
+    status: Option<HashMap<String, ConnectionStatus>>,
+) -> Readout<HashMap<String, ConnectionStatusView>> {
+    match status {
+        None => Readout::NotRunning,
+        Some(statuses) => Readout::Ready {
+            data: statuses
+                .iter()
+                .map(|(key, status)| (key.clone(), ConnectionStatusView::from(status)))
+                .collect(),
+        },
     }
 }
 
@@ -1346,6 +2256,24 @@ mod tests {
         outcome.status
     }
 
+    /// 接続状態の読み出しから「**読めた結果**」だけを取り出す。
+    /// `None` = 走っていない、`Some` = 走っている（0 件を含む）。
+    ///
+    /// **打ち切り（[`Readout::Unavailable`]）は panic させる** - このヘルパを
+    /// 使うテストはどれも「タスクが手空きのはず」の場面で呼んでおり、そこで
+    /// 打ち切られるのは足場の前提が崩れている。素通しして `None` に潰すと、
+    /// **「走っていない」と見分けが付かなくなる**（読み取りが詰まる回帰を
+    /// 「エンジンが立っていない」と読み違える）。
+    async fn statuses(svc: &CollectorService) -> Option<HashMap<String, ConnectionStatus>> {
+        match svc.connection_status().await {
+            Readout::NotRunning => None,
+            Readout::Ready { data } => Some(data),
+            Readout::Unavailable => {
+                panic!("接続状態の読み出しが打ち切られた（手空きのはずの場面）")
+            }
+        }
+    }
+
     /// いま溜まっているイベントの種類を全部取り出す（待たない）。
     fn drain(rx: &mut broadcast::Receiver<CollectEvent>) -> Vec<banto_collect::EventKind> {
         let mut kinds = Vec::new();
@@ -1495,8 +2423,8 @@ mod tests {
         assert_eq!(state, CollectorState::NoTargets);
         assert_eq!(svc.state(), CollectorState::NoTargets);
         // 「走っていない」ことが読み出し側からも分かる（空に潰さない）。
-        assert!(svc.connection_status().await.is_none());
-        assert!(svc.current_values().await.is_none());
+        assert!(statuses(&svc).await.is_none());
+        assert!(svc.current_values().is_none());
     }
 
     /// #406 レビュー P2: **接続とグループは有効なのに、タグが 1 本も
@@ -1508,7 +2436,7 @@ mod tests {
     ///
     /// 反証（回帰の検出）: 判定を `config.group_count() == 0` に戻すと
     /// `NoTargets` ではなく `Running { groups: 1, tags: 0 }` が返り、
-    /// `connection_status()` も `Some` になるのでこのテストは落ちる。
+    /// [`statuses`] も `Some` になるのでこのテストは落ちる。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_enabled_group_with_no_tag_at_all_is_no_targets() {
         let dir = TempDir::new();
@@ -1520,10 +2448,10 @@ mod tests {
         assert_eq!(svc.state(), CollectorState::NoTargets);
         // **収集エンジンを起動していない** = PLC へ繋ぎにも行っていない。
         assert!(
-            svc.connection_status().await.is_none(),
+            statuses(&svc).await.is_none(),
             "収集対象が無いのにエンジンが立っている"
         );
-        assert!(svc.current_values().await.is_none());
+        assert!(svc.current_values().is_none());
     }
 
     /// 同上の、**タグは登録されているが全部無効**な場合。`build_config` は
@@ -1542,10 +2470,10 @@ mod tests {
         assert_eq!(state, CollectorState::NoTargets);
         assert_eq!(svc.state(), CollectorState::NoTargets);
         assert!(
-            svc.connection_status().await.is_none(),
+            statuses(&svc).await.is_none(),
             "収集対象が無いのにエンジンが立っている"
         );
-        assert!(svc.current_values().await.is_none());
+        assert!(svc.current_values().is_none());
     }
 
     /// 停止中に `stop()` を呼んでも壊れない（冪等）。あわせて、**`stop()` が
@@ -1600,7 +2528,7 @@ mod tests {
             }
             other => panic!("StartFailed を期待したが {other:?}"),
         }
-        assert!(svc.connection_status().await.is_none());
+        assert!(statuses(&svc).await.is_none());
     }
 
     /// 収集対象があるときは本当に起動し、読み出しが「走っている」形になる。
@@ -1623,10 +2551,10 @@ mod tests {
         assert_eq!(first, CollectorState::Running { groups: 1, tags: 1 });
         assert!(svc.state().is_running());
         assert!(
-            svc.connection_status().await.is_some(),
+            statuses(&svc).await.is_some(),
             "走っているので Some（`None` = 走っていない、と読み分けられる）"
         );
-        assert!(svc.current_values().await.is_some());
+        assert!(svc.current_values().is_some());
 
         let second = settled(svc.start().await.expect("2 回目の start"));
         assert_eq!(second, first, "二重起動はせず、同じ状態を返す");
@@ -1638,7 +2566,7 @@ mod tests {
 
         svc.stop().await.expect("stop");
         assert_eq!(svc.state(), CollectorState::Stopped);
-        assert!(svc.connection_status().await.is_none());
+        assert!(statuses(&svc).await.is_none());
     }
 
     /// `start` と `stop` を**同時に**投げても、ライフサイクルタスクが逐次
@@ -1666,7 +2594,7 @@ mod tests {
         stopper.await.expect("stop task").expect("stop");
 
         let state = svc.state();
-        let running = svc.connection_status().await.is_some();
+        let running = statuses(&svc).await.is_some();
         assert_eq!(
             state.is_running(),
             running,
@@ -1758,10 +2686,10 @@ mod tests {
         // 読み出しはライフサイクルタスクのキューを通るので、**飛行中の停止が
         // 終わってから**返る - sleep で待つ必要がない。
         assert!(
-            svc.connection_status().await.is_none(),
+            statuses(&svc).await.is_none(),
             "キャンセル後も停止は実体まで完了している"
         );
-        assert!(svc.current_values().await.is_none());
+        assert!(svc.current_values().is_none());
         assert_eq!(
             svc.state(),
             CollectorState::Stopped,
@@ -1943,7 +2871,7 @@ mod tests {
         // タスク側の起動処理はまだ続いている。開けてやると、状態が追いつく。
         gate.release.notify_one();
         assert!(
-            svc.connection_status().await.is_none(),
+            statuses(&svc).await.is_none(),
             "収集対象が無い構成なのでエンジンは立たない"
         );
         assert_eq!(
@@ -1975,9 +2903,10 @@ mod tests {
     /// 止めるのは足場を組み終えてから**（理由は 1 つ上のテストの doc と同じ -
     /// sqlx のプールが巻き添えになる）。
     ///
-    /// 反証（回帰の検出）: [`CollectorService::lifecycle`] を
-    /// `timeout(COLLECT_OPERATION_TIMEOUT, self.request(make))` の 1 本に
-    /// 戻すと、`stop()` が `Err` ではなく `Ok(pending: true)` を返すので
+    /// 反証（回帰の検出）: [`CollectorService::lifecycle`] の投入を
+    /// `send_timeout` から無期限の `send().await` に戻し、上限 1 本
+    /// （`timeout(COLLECT_OPERATION_TIMEOUT, ..)`）で投入ごと包むと、
+    /// `stop()` が `Err` ではなく `Ok(pending: true)` を返すので
     /// `expect_err` が落ちる。
     #[tokio::test]
     async fn an_operation_that_never_reached_the_queue_is_refused_not_called_pending() {
@@ -2000,12 +2929,16 @@ mod tests {
         };
         gate.entered.notified().await;
 
-        // 2. キューを満杯にする。**何で埋まっているかは関係ない**ので、
-        //    副作用の無い読み出しコマンドで埋める。
+        // 2. **操作用**キューを満杯にする。#408 で読み取りを別のチャネルへ
+        //    移したので、ここは操作コマンドで埋めるしかない（そしてそれが
+        //    正しい - 操作用キューを埋められるのは操作だけ、が #408 の直しの
+        //    中身そのもの）。**`Start` を使う**: ゲートが開いた後に順に
+        //    処理されるが、`start` は既に走っていれば何もしない（冪等）ので、
+        //    手順 4 の「収集が動き続けている」を汚さない。
         let mut fillers = Vec::new();
         loop {
             let (reply_tx, reply_rx) = oneshot::channel();
-            match svc.commands().try_send(Command::ConnectionStatus(reply_tx)) {
+            match svc.commands().try_send(Command::Start(reply_tx)) {
                 Ok(()) => fillers.push(reply_rx),
                 Err(mpsc::error::TrySendError::Full(_)) => break,
                 Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -2047,11 +2980,159 @@ mod tests {
             svc.state()
         );
         assert!(
-            svc.connection_status().await.is_some(),
+            statuses(&svc).await.is_some(),
             "収集は動き続けているはず（未受付の stop は実行されない）"
         );
 
         svc.stop().await.expect("後始末の stop");
+    }
+
+    // --- 閲覧のポーリングが操作の受付を塞がない（#408 レビュー P2-1） ------
+
+    /// **#408 レビュー P2-1 の受入条件**: **接続状態のポーリングを何回
+    /// 打ち切らせても、その後の `stop()` が「滞留を理由に未受付」に
+    /// ならない**。
+    ///
+    /// オーナー指定の再現手順:
+    ///
+    /// 1. 収集対象がある状態で起動を [`StartGate`] で止める（ライフサイクル
+    ///    タスクはこの 1 件を抱えたまま動かない = キュー経由の読み取りは
+    ///    1 件も捌けない）、
+    /// 2. その状態で [`CollectorService::connections`] を
+    ///    [`COMMAND_QUEUE_DEPTH`] 回（= 操作用キューを埋めるのに十分な回数）
+    ///    呼び、全部打ち切らせる、
+    /// 3. **その後の `stop()` が受け付けられる**こと。
+    ///
+    /// **確かめているのは「停止処理が即座に完了すること」ではなく、
+    /// 「停止要求を受け付けられること」**（起動はゲートの中なので、停止が
+    /// 実際に走るのはその後）。だから `Ok` であれば十分で、
+    /// [`CollectOutcome::pending`] が立っているのは正しい - 依頼はタスク側に
+    /// 確かに届いており、[`ENQUEUE_BUSY_MESSAGE`] の `Err`（＝**どこにも
+    /// 届いていない**）とは意味が違う。
+    ///
+    /// 実時間は 1 ミリ秒も待たない: ゲートは [`Notify`]、2 つの上限は
+    /// [`tokio::time::pause`] の仮想時計が自動で進めて消費する。**時計を
+    /// 止めるのは足場を組み終えてから**（理由は他の 2 本と同じ - sqlx の
+    /// プールが巻き添えになる）。
+    ///
+    /// 反証（回帰の検出）: 読み取りを操作用キューへ戻す
+    /// （[`CollectorService::connection_status`] を
+    /// `self.commands().send(..)` に書き換える）と、手順 2 で操作用キューが
+    /// [`COMMAND_QUEUE_DEPTH`] 件の**既に答えを返した読み取り**で埋まり、
+    /// 手順 3 の `stop()` が [`ENQUEUE_BUSY_MESSAGE`] の `Err` になるので
+    /// `expect` が落ちる。
+    #[tokio::test]
+    async fn polling_connections_never_keeps_a_stop_from_being_accepted() {
+        let dir = TempDir::new();
+        let pool = init_db_memory().await.expect("init_db_memory");
+        seed_one_tag(&pool, "40001").await;
+        let gate = Arc::new(StartGate::default());
+        let svc = CollectorService::new_for_test_gated(
+            pool.clone(),
+            dir.path().join("data"),
+            fast_options(),
+            offline_factory(),
+            gate.clone(),
+        );
+        let mut rx = svc.subscribe_events();
+
+        // 1. 起動を止める。タスクはこの 1 件を抱えたまま先へ進まない。
+        let starter = {
+            let svc = svc.clone();
+            tokio::spawn(async move { svc.start().await })
+        };
+        gate.entered.notified().await;
+
+        tokio::time::pause();
+
+        // 2. 閲覧（viewer でもできる）のポーリング。**全部「読めなかった」**
+        //    で畳まれる - 走っていないのでも 0 件なのでもない。
+        for round in 1..=COMMAND_QUEUE_DEPTH {
+            let connections = svc.connections().await;
+            assert_eq!(
+                connections,
+                Readout::Unavailable,
+                "{round} 回目のポーリングが「読めなかった」以外になっている: {connections:?}"
+            );
+        }
+
+        // 3. **その後の停止要求**。混雑を理由に突き返されないこと。
+        let outcome = svc
+            .stop()
+            .await
+            .expect("閲覧のポーリングが操作の受付を塞いでいる（未受付で返った）");
+        assert!(
+            outcome.pending,
+            "起動がゲートの中なので、停止はまだ終わっていないはず: {outcome:?}"
+        );
+
+        tokio::time::resume();
+
+        // 受け付けた停止は、起動の完了後に**実行される**（`pending` の約束）。
+        // 実時間は待たず、収集エンジンが出す停止イベントで待ち合わせる。
+        gate.release.notify_one();
+        starter.await.expect("start task").expect("start");
+        wait_for(&mut rx, banto_collect::EventKind::CollectionStopped).await;
+        assert_eq!(
+            svc.state(),
+            CollectorState::Stopped,
+            "受け付けた停止が実行されていない"
+        );
+    }
+
+    /// **#408 レビュー（オーナー判断）の受入条件**: ライフサイクルタスクが
+    /// 居ない（チャネルが閉じた）状態の読み取りは **「読めなかった」**
+    /// であって、**「走っていない」ではない**。
+    ///
+    /// 足場は「タスクが panic した直後」の観測を作る
+    /// （[`CollectorService::new_for_test_without_lifecycle_task`]）。葉には
+    /// **`Running` を公開したまま**にしておく - タスクが消えても葉は最後に
+    /// 公開された状態を返し続けるので、これが実際に起こる姿。
+    ///
+    /// ここで `NotRunning` と答えると**二重に嘘になる**（このモジュールの doc
+    /// 「タスクが居ないことを「走っていない」と答えない」）:
+    ///
+    /// 1. 同じ画面に「状態: 動作中」（[`CollectorService::state_view`]）と
+    ///    「接続状態: 走っていません」が並ぶ、
+    /// 2. [`Collector`] に `Drop` が無く、接続タスクは止まらないので、
+    ///    **収集は実際には続いている公算が大きい**。
+    ///
+    /// 反証（回帰の検出）: [`CollectorService::connection_status`] の
+    /// `TrySendError::Closed` 分岐を `Readout::NotRunning` に戻すと、
+    /// 2 つ目の `assert_eq!` が落ちる。
+    #[tokio::test]
+    async fn a_read_with_no_lifecycle_task_says_unreadable_not_not_running() {
+        let dir = TempDir::new();
+        let pool = init_db_memory().await.expect("init_db_memory");
+        let svc = CollectorService::new_for_test_without_lifecycle_task(
+            pool.clone(),
+            dir.path().join("data"),
+            fast_options(),
+            offline_factory(),
+        );
+        // タスクが消える直前に公開されていた状態。葉はこれを返し続ける。
+        svc.inner
+            .ctx
+            .publish(CollectorState::Running { groups: 1, tags: 1 }, None);
+
+        assert_eq!(
+            svc.state_view(),
+            CollectorStateView::Running { groups: 1, tags: 1 },
+            "葉は最後に公開された状態を返し続けるはず（前提）"
+        );
+
+        let connections = svc.connections().await;
+        assert_eq!(
+            connections,
+            Readout::Unavailable,
+            "タスクが居ないことを「走っていません」と言い切っている（状態表示と食い違い、\
+             かつ接続タスクは止まっていない）: {connections:?}"
+        );
+        assert_ne!(
+            connections.as_str(),
+            "notRunning",
+            "「判定できなかった」を「止まっている」側へ倒している"
+        );
     }
 
     /// 普段の（混んでいない）経路では、投入用の上限を足しても**何も
@@ -2148,7 +3229,7 @@ mod tests {
         svc.autostart().await;
 
         assert_eq!(svc.state(), CollectorState::Running { groups: 1, tags: 1 });
-        assert!(svc.connection_status().await.is_some());
+        assert!(statuses(&svc).await.is_some());
 
         svc.stop().await.expect("後始末の stop");
     }
@@ -2181,6 +3262,514 @@ mod tests {
             }
             other => panic!("StartFailed を期待したが {other:?}"),
         }
+    }
+
+    // --- C-3a: 読み出しの 3 つの口 ----------------------------------------
+
+    /// **C-3a の一番大事な受入条件**: 現在値の読み出しは**葉から**なので、
+    /// ライフサイクルタスクが遅い操作を抱えていても**待たされない**。
+    /// そして**同じ瞬間**、キューを通る接続状態の読み出しは
+    /// [`COLLECT_READ_TIMEOUT`] で打ち切られて「**読めなかった**」になる -
+    /// 「走っていない」でも「0 件」でもなく。
+    ///
+    /// この 1 本の中に**対照**が入っている: 同じ時点・同じサービスで、
+    /// 葉の口は即答し、キューの口は打ち切られる。現在値をキュー経由に戻すと
+    /// 前者も後者と同じ結末になる（= #400 で潰した「画面が固まる」型の再発）。
+    ///
+    /// 実時間は 1 ミリ秒も待たない: 停止は [`StopGate`]（`Notify`）で止め、
+    /// 上限は [`tokio::time::pause`] の仮想時計が自動で進めて消費する。
+    /// **時計を止めるのは足場を組み終えてから**（`start_paused = true` では
+    /// ない）- 理由は `an_unresponsive_start_is_abandoned_...` の doc と同じ
+    /// （sqlx のプールが巻き添えになる）。current-thread ランタイム
+    /// （`#[tokio::test]` の既定）なのは、仮想時計の auto-advance が
+    /// そちらでしか効かないため。
+    ///
+    /// 反証（回帰の検出）: [`CollectorService::values`] を
+    /// 「`Command::CurrentValues` をキューへ送って待つ」旧実装に戻すと、
+    /// 現在値の読み出しも停止の完了まで返らなくなり、仮想時計が進んで
+    /// `tokio::time::timeout` が `Elapsed` になるので最初の `expect` が落ちる。
+    #[tokio::test]
+    async fn reading_current_values_does_not_wait_behind_a_slow_stop_but_connections_say_unavailable(
+    ) {
+        let dir = TempDir::new();
+        let (pool, svc, gate) = gated_service(&dir).await;
+        seed_one_tag(&pool, "40001").await;
+        let mut rx = svc.subscribe_events();
+
+        svc.start().await.expect("start");
+        // 接続タスクが `Connected` になるまで待つ（そこまで行かないと
+        // graceful exit が `disconnect` を通らず、ゲートに入らない）。
+        wait_for(&mut rx, banto_collect::EventKind::PlcConnected).await;
+
+        // 停止を「実体の停止の途中」で止める。ライフサイクルタスクはこの
+        // 1 件を抱えたまま動かない = キュー経由の読み出しは返らない。
+        let stopper = {
+            let svc = svc.clone();
+            tokio::spawn(async move { svc.stop().await })
+        };
+        gate.wait_entered().await;
+
+        tokio::time::pause();
+
+        // 葉からの読み出し: **待たされない**。
+        let values = tokio::time::timeout(COLLECT_READ_TIMEOUT * 10, async { svc.values() })
+            .await
+            .expect("現在値の読み出しが（キューを通って）待たされた");
+        assert_eq!(
+            values.as_str(),
+            "ready",
+            "停止が完了するまでは現在値が読めるはず（取り下げは停止の完了後）: {values:?}"
+        );
+
+        // **同じ瞬間**のキュー経由の読み出し: 打ち切られて「読めなかった」。
+        let connections = svc.connections().await;
+        assert_eq!(
+            connections,
+            Readout::Unavailable,
+            "打ち切りを「走っていない」や「0 件」に潰している: {connections:?}"
+        );
+
+        tokio::time::resume();
+
+        gate.release();
+        stopper.await.expect("stop task").expect("stop");
+
+        // 停止が完了したら、両方とも「走っていない」。**0 件ではない。**
+        assert_eq!(
+            svc.values(),
+            Readout::NotRunning,
+            "停止後も現在値ハンドルが葉に残っている（取り下げ漏れ）"
+        );
+        assert_eq!(svc.connections().await, Readout::NotRunning);
+    }
+
+    /// 現在値の言い分けを**表で**固定する（純関数 [`values_readout`]）。
+    /// 「走っていない」「読めて 0 件」「読めて N 件」が別の値になること、
+    /// そして**品質と時刻が落ちない**こと。
+    ///
+    /// 反証（回帰の検出）: `values_readout` の `None` 分岐を
+    /// `Readout::Ready { data: HashMap::new() }` に変えると 2 番目の
+    /// `assert_ne!` が落ちる（「走っていない」が「0 件」に潰れる）。
+    /// [`CurrentSampleView`] から `quality` を外すと最後の `assert_eq!` が落ちる。
+    #[test]
+    fn the_values_readout_keeps_not_running_zero_and_real_samples_apart() {
+        let not_running = values_readout(None);
+        assert_eq!(not_running.as_str(), "notRunning");
+        assert!(
+            not_running.data().is_none(),
+            "走っていないのに中身がある: {not_running:?}"
+        );
+
+        let zero = values_readout(Some(HashMap::new()));
+        assert_eq!(zero.as_str(), "ready", "0 件は「読めた」: {zero:?}");
+        assert!(zero.data().expect("ready").is_empty());
+        assert_ne!(
+            zero.as_str(),
+            not_running.as_str(),
+            "「読めて 0 件」と「走っていない」が同じ値になっている"
+        );
+
+        let samples: HashMap<String, CurrentSample> = [
+            (
+                "tag:1".to_string(),
+                CurrentSample {
+                    value: Some(1.5),
+                    ptime_ms: 42,
+                    quality: Quality::Good,
+                },
+            ),
+            (
+                "tag:2".to_string(),
+                CurrentSample {
+                    value: None,
+                    ptime_ms: 43,
+                    quality: Quality::Bad,
+                },
+            ),
+            (
+                "tag:3".to_string(),
+                CurrentSample {
+                    value: Some(2.0),
+                    ptime_ms: 44,
+                    quality: Quality::Stale,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let json = serde_json::to_value(values_readout(Some(samples))).expect("serialize");
+        assert_eq!(json["state"], "ready");
+        assert_eq!(
+            json["data"]["tag:1"],
+            serde_json::json!({ "value": 1.5, "ptimeMs": 42, "quality": "good" })
+        );
+        assert_eq!(
+            json["data"]["tag:2"],
+            serde_json::json!({ "value": null, "ptimeMs": 43, "quality": "bad" }),
+            "読めなかったサンプルの値を 0 に潰していないか"
+        );
+        assert_eq!(
+            json["data"]["tag:3"],
+            serde_json::json!({ "value": 2.0, "ptimeMs": 44, "quality": "stale" })
+        );
+    }
+
+    /// **#408 レビュー P2-2 の受入条件**: **非有限の値（NaN・`+∞`・`-∞`）が
+    /// 「`value: null` なのに `quality: good`」で公開されない**。
+    ///
+    /// `serde_json` は非有限の `f64` を `null` にするので、内部の値をそのまま
+    /// 写すと**数値として使えないのに品質は good** という自己矛盾した形が
+    /// ワイヤに出る（このモジュールの doc「非有限の浮動小数点は公開する形で
+    /// 正規化する」）。画面は品質を見て異常を判別できなくなる。
+    ///
+    /// 3 つの非有限値を**品質 good のまま**渡し、公開型 → JSON まで通して
+    /// 確かめる。あわせて**有限値の Good / Bad / Stale と `ptimeMs` の既存の
+    /// 扱いが変わっていない**ことも同じ表で押さえる（正規化が正常な値を
+    /// 巻き込んでいないこと）。
+    ///
+    /// 反証（回帰の検出）: [`CurrentSampleView`] の [`From`] から
+    /// `is_finite()` の分岐を外して `value`/`quality` をそのまま写す実装に
+    /// 戻すと、非有限の 3 件が `{"value":null,...,"quality":"good"}` になり、
+    /// `quality` の `assert_eq!` が落ちる。
+    #[test]
+    fn a_non_finite_sample_is_never_published_as_null_with_good_quality() {
+        let non_finite = [
+            ("tag:nan", f64::NAN),
+            ("tag:inf", f64::INFINITY),
+            ("tag:neg-inf", f64::NEG_INFINITY),
+        ];
+        let samples: HashMap<String, CurrentSample> = non_finite
+            .iter()
+            .enumerate()
+            .map(|(index, (key, value))| {
+                (
+                    (*key).to_string(),
+                    CurrentSample {
+                        // **品質は good のまま**渡す（Modbus のデコードが
+                        // 非有限値を除外していないので、実際にこう来る）。
+                        value: Some(*value),
+                        ptime_ms: 100 + index as i64,
+                        quality: Quality::Good,
+                    },
+                )
+            })
+            .collect();
+
+        let json = serde_json::to_value(values_readout(Some(samples))).expect("serialize");
+        assert_eq!(json["state"], "ready");
+        for (index, (key, value)) in non_finite.iter().enumerate() {
+            let row = &json["data"][*key];
+            assert_eq!(
+                *row,
+                serde_json::json!({
+                    "value": serde_json::Value::Null,
+                    "ptimeMs": 100 + index as i64,
+                    "quality": "bad",
+                }),
+                "非有限値（{value}）が「値は null なのに品質は good」で公開されている: {row}"
+            );
+        }
+
+        // 有限値の扱いは**変わっていない** - 3 つの品質がそのまま載り、
+        // `Bad` の `value: None` も 0 に潰れない。
+        let finite: HashMap<String, CurrentSample> = [
+            (
+                "tag:good".to_string(),
+                CurrentSample {
+                    value: Some(1.5),
+                    ptime_ms: 42,
+                    quality: Quality::Good,
+                },
+            ),
+            (
+                "tag:bad".to_string(),
+                CurrentSample {
+                    value: None,
+                    ptime_ms: 43,
+                    quality: Quality::Bad,
+                },
+            ),
+            (
+                "tag:stale".to_string(),
+                CurrentSample {
+                    value: Some(-0.0),
+                    ptime_ms: 44,
+                    quality: Quality::Stale,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let json = serde_json::to_value(values_readout(Some(finite))).expect("serialize");
+        assert_eq!(
+            json["data"]["tag:good"],
+            serde_json::json!({ "value": 1.5, "ptimeMs": 42, "quality": "good" })
+        );
+        assert_eq!(
+            json["data"]["tag:bad"],
+            serde_json::json!({ "value": null, "ptimeMs": 43, "quality": "bad" }),
+            "読めなかったサンプルの品質が正規化で書き換わっている"
+        );
+        assert_eq!(
+            json["data"]["tag:stale"],
+            serde_json::json!({ "value": -0.0, "ptimeMs": 44, "quality": "stale" }),
+            "有限値（`-0.0` も有限）を非有限と取り違えている"
+        );
+    }
+
+    /// 接続状態の言い分けを**表で**固定する（純関数 [`connections_readout`]）。
+    /// 3 つ目の結末（[`Readout::Unavailable`]）は上限を掛けている
+    /// [`CollectorService::connections`] 側の担当で、
+    /// `reading_current_values_does_not_wait_behind_a_slow_stop_...` が見ている。
+    ///
+    /// 反証（回帰の検出）: `connections_readout` の `None` 分岐を空の `Ready` に
+    /// 変えると `assert_ne!` が落ちる。
+    #[test]
+    fn the_connections_readout_keeps_not_running_zero_and_real_connections_apart() {
+        let not_running = connections_readout(None);
+        assert_eq!(not_running.as_str(), "notRunning");
+        assert!(not_running.data().is_none());
+
+        let zero = connections_readout(Some(HashMap::new()));
+        assert_eq!(zero.as_str(), "ready");
+        assert!(zero.data().expect("ready").is_empty());
+        assert_ne!(
+            zero.as_str(),
+            not_running.as_str(),
+            "「接続 0 件」と「走っていない」が同じ値になっている"
+        );
+
+        let statuses: HashMap<String, ConnectionStatus> = [
+            ("conn:1".to_string(), ConnectionStatus::Connected),
+            (
+                "conn:2".to_string(),
+                ConnectionStatus::Reconnecting { attempt: 3 },
+            ),
+            ("conn:3".to_string(), ConnectionStatus::Stopped),
+        ]
+        .into_iter()
+        .collect();
+        let json = serde_json::to_value(connections_readout(Some(statuses))).expect("serialize");
+        assert_eq!(json["state"], "ready");
+        assert_eq!(
+            json["data"]["conn:1"],
+            serde_json::json!({"status": "connected"})
+        );
+        assert_eq!(
+            json["data"]["conn:2"],
+            serde_json::json!({"status": "reconnecting", "attempt": 3}),
+            "再接続の試行回数はヘルス表示の実用情報なので落とさない"
+        );
+        assert_eq!(
+            json["data"]["conn:3"],
+            serde_json::json!({"status": "stopped"})
+        );
+    }
+
+    /// `collect_events` に 1 行入れる。**`detail` を呼び出し側が決められる**
+    /// ので、漏れの検査に使える。`EventSink::emit` は `banto-collect` の
+    /// `pub(crate)` なので、ここは同じ列に直接書く。
+    async fn seed_event(pool: &SqlitePool, ts_ms: i64, kind: &str, detail: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO collect_events (ts, kind, connection_key, tag_key, level, value, detail) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(ts_ms)
+        .bind(kind)
+        .bind("conn:1")
+        .bind(None::<String>)
+        .bind(None::<String>)
+        .bind(None::<f64>)
+        .bind(detail)
+        .execute(pool)
+        .await
+        .expect("insert collect_events");
+    }
+
+    /// **イベント一覧の 3 状態**を表で固定する:
+    ///
+    /// 1. 記録が 1 件も無い → **読めて 0 件**（`notRunning` ではない）、
+    /// 2. **収集は止まったまま**記録が 3 件 → **読める**（過去の記録を
+    ///    「走っていないので」と隠さない - このモジュールの doc
+    ///    「イベント一覧だけ「走っていない」を返さない」）、
+    /// 3. DB が読めない → **読めなかった**（`Unavailable`。**0 件ではない**）。
+    ///
+    /// 3 の作り方はプールを閉じること - 実際に起こりうる「読めない」
+    /// （終了処理中のアクセス、ファイルが失われた等）と同じ経路で
+    /// `sqlx` がエラーを返す。
+    ///
+    /// 反証（回帰の検出）: [`CollectorService::events`] の
+    /// `Ok(Err(err)) => Readout::Unavailable` を
+    /// `Readout::Ready { data: ListResult { rows: vec![], total_count: 0 } }` に
+    /// 変えると 3 の `assert_eq!` が落ちる（読めなかったのに「0 件です」と
+    /// 答えている）。収集の状態を見て `NotRunning` を返す実装にすると 2 が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_events_list_tells_unreadable_apart_from_zero_rows_and_stays_readable_while_stopped(
+    ) {
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+        assert_eq!(
+            svc.state(),
+            CollectorState::Stopped,
+            "前提: 収集は動いていない"
+        );
+
+        // 1. 1 件も無い。
+        let empty = svc.events(EventPage::default()).await;
+        assert_eq!(
+            empty.as_str(),
+            "ready",
+            "記録が無いだけなのに「読めなかった」/「走っていない」と答えている: {empty:?}"
+        );
+        let page = empty.data().expect("ready");
+        assert!(page.rows.is_empty());
+        assert_eq!(page.total_count, 0);
+
+        // 2. 収集は止まったままでも、記録は読める。
+        seed_event(&pool, 100, "collection_started", None).await;
+        seed_event(&pool, 200, "plc_connected", None).await;
+        seed_event(&pool, 300, "collection_stopped", None).await;
+        let listed = svc.events(EventPage::default()).await;
+        let page = listed
+            .data()
+            .unwrap_or_else(|| panic!("停止中に過去のイベントが読めない: {listed:?}"));
+        assert_eq!(page.rows.len(), 3);
+        assert_eq!(page.total_count, 3);
+        assert_eq!(
+            page.rows[0].kind, "collection_stopped",
+            "新しい順になっていない: {:?}",
+            page.rows
+        );
+
+        // 3. 読めない。
+        pool.close().await;
+        let unreadable = svc.events(EventPage::default()).await;
+        assert_eq!(
+            unreadable.as_str(),
+            "unavailable",
+            "読めなかったのに「0 件」と答えている: {unreadable:?}"
+        );
+        assert!(unreadable.data().is_none());
+    }
+
+    /// ページングは**新しい順**で、総件数は**ページングの前**の件数
+    /// （`crate::audit::AuditLogService::list` と同じ形）。**同じ `ts` の行が
+    /// あっても**ページ境界で重複・欠落しないこと - 並び順の第 2 キーに
+    /// `id` を入れてあるのはそのため。
+    ///
+    /// 反証（回帰の検出）: `read_events` の `ORDER BY` から `, id DESC` を
+    /// 外すと、同じ `ts` の 2 行の並びが不定になり、最後の
+    /// 「全 id がちょうど 1 回ずつ」が落ちうる（SQLite は同順の行の順序を
+    /// 保証しない）。`total_count` をページ内の件数に変えると `assert_eq!` が
+    /// 落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_events_list_pages_newest_first_and_reports_the_total_before_paging() {
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+        // ts が重複する行を混ぜる（500 が 2 行）。
+        for ts in [100, 200, 300, 500, 500] {
+            seed_event(&pool, ts, "plc_connected", None).await;
+        }
+
+        let mut seen: Vec<i64> = Vec::new();
+        let mut offset = 0;
+        loop {
+            let readout = svc.events(EventPage::new(Some(offset), Some(2))).await;
+            let page = readout.data().expect("ready");
+            assert_eq!(
+                page.total_count, 5,
+                "総件数はページングの前の件数であること: {page:?}"
+            );
+            if page.rows.is_empty() {
+                break;
+            }
+            assert!(page.rows.len() <= 2, "limit を超えて返している: {page:?}");
+            seen.extend(page.rows.iter().map(|row| row.id));
+            offset += 2;
+        }
+
+        // 新しい順（ts 降順、同 ts は id 降順）= 5,4,3,2,1。
+        assert_eq!(
+            seen,
+            vec![5, 4, 3, 2, 1],
+            "ページを跨いだ並びが「新しい順」で一意になっていない"
+        );
+    }
+
+    /// **公開型が内部情報を持たないこと**（#407 レビュー P2-2 と同じ作法）:
+    /// `collect_events.detail` は自由文で、切断理由（接続先を含みうる）や
+    /// 書き込みエラー（ファイルパスを含みうる）がそのまま入る列なので、
+    /// **ワイヤに出さない**。目印を仕込んで、出てこないことを固定する。
+    ///
+    /// 落とすのは `detail` **だけ**で、種類・時刻・鍵は残る（画面が表を
+    /// 描けなくなっては本末転倒）ことも同時に見る。
+    ///
+    /// 反証（回帰の検出）: [`CollectEventRow`] に `detail` を足して
+    /// `read_events` の `SELECT` にも足すと、目印の `assert!` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_event_row_never_carries_the_free_text_detail() {
+        const MARKER: &str = "CHRONOGAZER-LEAK-CANARY";
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+        seed_event(
+            &pool,
+            100,
+            "plc_disconnected",
+            Some(&format!("接続エラー: {MARKER} への接続に失敗しました")),
+        )
+        .await;
+
+        let json = serde_json::to_value(svc.events(EventPage::default()).await).expect("serialize");
+        assert_eq!(json["state"], "ready");
+        assert!(
+            !json.to_string().contains(MARKER),
+            "自由文の detail がワイヤに漏れている: {json}"
+        );
+        let row = &json["data"]["rows"][0];
+        assert!(
+            row.get("detail").is_none(),
+            "`detail` フィールドがワイヤに出ている: {row}"
+        );
+        // 落とすのは detail だけ。
+        assert_eq!(row["kind"], "plc_disconnected");
+        assert_eq!(row["connectionKey"], "conn:1");
+        assert_eq!(row["tsMs"], 100);
+        assert_eq!(
+            json["data"]["totalCount"], 1,
+            "総件数の綴りは監査一覧と同じ"
+        );
+    }
+
+    /// [`EventPage::new`] の丸め（純関数）。`?limit=` は URL に誰でも書けるので
+    /// **上限を掛ける**（この口は `viewer` にも開いている）。`0` を素通しに
+    /// しないのは、「0 件読めました」という**意味の無い `Ready`** を作らない
+    /// ため。
+    #[test]
+    fn an_event_page_clamps_its_limit_and_defaults_to_the_audit_logs_page_size() {
+        assert_eq!(
+            EventPage::new(None, None),
+            EventPage {
+                offset: 0,
+                limit: COLLECT_EVENTS_DEFAULT_LIMIT
+            }
+        );
+        assert_eq!(EventPage::new(Some(20), Some(10)).offset, 20);
+        assert_eq!(EventPage::new(None, Some(10)).limit, 10);
+        assert_eq!(
+            EventPage::new(None, Some(0)).limit,
+            1,
+            "0 件だけ読む要求を素通しにしている"
+        );
+        assert_eq!(
+            EventPage::new(None, Some(u64::MAX)).limit,
+            COLLECT_EVENTS_MAX_LIMIT,
+            "表全体を 1 リクエストで抜ける"
+        );
+        assert_eq!(
+            EventPage::new(Some(u64::MAX), None).offset,
+            i64::MAX as u64,
+            "巨大な offset が負に化けて「先頭ページ」に戻ってしまう"
+        );
     }
 
     // --- data.dir の解決 --------------------------------------------------

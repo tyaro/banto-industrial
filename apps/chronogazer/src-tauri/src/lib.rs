@@ -28,9 +28,11 @@ use chronogazer_core::assets::FrontendAssets;
 use chronogazer_core::audit::{AuditEntry, AuditLogEntry, AuditLogService};
 use chronogazer_core::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 // #383 段階2b / R1-C: 収集サービス。C-2 で `collect_*` コマンドと起動時の
-// 自動開始を足した（監査の `resource` は REST と共有の定数）。
+// 自動開始を足し、C-3a で読み出し 3 本（現在値・接続状態・イベント一覧）を
+// 足した（監査の `resource` も床も REST と共有の定数）。
 use chronogazer_core::collect::{
-    resolve_data_dir, CollectOutcome, CollectorService, CollectorStateView, COLLECT_AUDIT_RESOURCE,
+    resolve_data_dir, CollectEventRow, CollectOutcome, CollectorService, CollectorStateView,
+    ConnectionStatusView, CurrentSampleView, EventPage, Readout, COLLECT_AUDIT_RESOURCE,
     COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
 };
 use chronogazer_core::db::init_db;
@@ -51,6 +53,7 @@ use chronogazer_core::{
 use qrcode::render::svg;
 use qrcode::QrCode;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Mutex;
 use tauri::{Emitter, Manager, State};
@@ -1970,6 +1973,98 @@ async fn collect_restart(state: State<'_, AppState>) -> Result<CollectOutcome, B
     collect_restart_body(&state).await
 }
 
+// --- #383 段階2b / R1-C（C-3a）: 収集の読み出し ------------------------------
+//
+// 3 本とも **`viewer` 以上**（[`require_collect_reader`] - 状態の読み取りと
+// 同じ床・同じ定数）で、**監査しない**（読み取りは監査しない、という全体の
+// 規約）。返す型は 3 本とも `Readout` で、「**走っていない**」「**読めな
+// かった**」「**読めて 0 件**」を別の値にする - 空のオブジェクトを返して
+// 3 つを潰さないため（`chronogazer_core::collect` のモジュール doc
+// 「読み出しの 3 つの口」）。**これらは `crate::rest` の
+// `/api/collect/values|connections|events` と同じサービスの同じメソッドを
+// 通る双子**なので、経路によって形も床も割れない。
+
+/// Body of [`collect_values`]（spec M14 split-function pattern）。
+async fn collect_values_body(
+    state: &AppState,
+) -> Result<Readout<HashMap<String, CurrentSampleView>>, BantoError> {
+    require_collect_reader(state).await?;
+    Ok(state.collect.values())
+}
+
+/// `GET`-ish command: タグごとの現在値。**`viewer` 以上**。
+///
+/// **キューもディスクも DB も触らない**（葉に公開してある現在値ハンドルの
+/// `snapshot()` だけ）ので、画面はこれをポーリングしてよい - 遅い
+/// `collect_start` の後ろで待たされない（#400 で潰した「画面が固まる」型を
+/// 再発させないための形。`chronogazer_core::collect` のモジュール doc
+/// 「現在値はキューから外して葉に公開する」）。
+///
+/// **品質（`good`/`bad`/`stale`）と時刻を必ず載せる** - 値だけでは「通信
+/// エラーで古い値を出し続けている」のか「今読めた値」なのかを画面が言えない。
+#[tauri::command]
+async fn collect_values(
+    state: State<'_, AppState>,
+) -> Result<Readout<HashMap<String, CurrentSampleView>>, BantoError> {
+    collect_values_body(&state).await
+}
+
+/// Body of [`collect_connections`]（spec M14 split-function pattern）。
+async fn collect_connections_body(
+    state: &AppState,
+) -> Result<Readout<HashMap<String, ConnectionStatusView>>, BantoError> {
+    require_collect_reader(state).await?;
+    Ok(state.collect.connections().await)
+}
+
+/// `GET`-ish command: 接続ごとの状態。**`viewer` 以上**。
+///
+/// **3 つの結末を返しうる唯一の口**（走っていない / 読めなかった / 読めて
+/// 0 件）。こちらはライフサイクルタスクのキューを通る（`banto-collect` が
+/// 状態のハンドルを外に出していない）ので、遅い操作の最中は
+/// `chronogazer_core::collect::COLLECT_READ_TIMEOUT` で打ち切って
+/// `unavailable` を返す - 画面は「失敗しました」ではなく「**今は読めません
+/// でした**」と出すこと。
+#[tauri::command]
+async fn collect_connections(
+    state: State<'_, AppState>,
+) -> Result<Readout<HashMap<String, ConnectionStatusView>>, BantoError> {
+    collect_connections_body(&state).await
+}
+
+/// Body of [`collect_events_list`]（spec M14 split-function pattern）。
+async fn collect_events_list_body(
+    state: &AppState,
+    offset: Option<u64>,
+    limit: Option<u64>,
+) -> Result<Readout<ListResult<CollectEventRow>>, BantoError> {
+    require_collect_reader(state).await?;
+    Ok(state.collect.events(EventPage::new(offset, limit)).await)
+}
+
+/// `GET`-ish command: `collect_events` の 1 ページ（**新しい順**）。
+/// **`viewer` 以上**。
+///
+/// 総件数は `ListResult::totalCount` で返す - [`audit_log_list`]（監査ログ
+/// 一覧）と同じ型・同じ綴りで、既定の取得件数も同じ 50
+/// （docs/r1-plan.md の R1-C「`collect_events` のイベント一覧ページ
+/// （banto 監査ログページの流儀）」）。
+///
+/// **`detail` 列は返さない**（`chronogazer_core::collect::CollectEventRow` の
+/// doc）: 自由文で、切断理由（接続先を含みうる）や書き込みエラー（ファイル
+/// パスを含みうる）が入っている列なので、型でも SQL でも落としてある。
+///
+/// **収集が止まっていても読める**（`notRunning` を返さない）- 過去の記録で
+/// あって、走っているエンジンの覗き窓ではないため。
+#[tauri::command]
+async fn collect_events_list(
+    state: State<'_, AppState>,
+    offset: Option<u64>,
+    limit: Option<u64>,
+) -> Result<Readout<ListResult<CollectEventRow>>, BantoError> {
+    collect_events_list_body(&state, offset, limit).await
+}
+
 /// How long [`shutdown_app_state`] is allowed to take in total before the
 /// app gives up and exits anyway (#383 R1-C's prerequisite).
 ///
@@ -2520,6 +2615,9 @@ pub fn run() {
             collect_start,
             collect_stop,
             collect_restart,
+            collect_values,
+            collect_connections,
+            collect_events_list,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -3258,5 +3356,82 @@ mod tests {
             !json.to_string().contains(MARKER),
             "起動失敗の理由が viewer に漏れている: {json}"
         );
+    }
+
+    // --- #383 段階2b / R1-C（C-3a）: 収集の読み出し ---------------------------
+
+    /// C-3a の 3 本（現在値・接続状態・イベント一覧）も**状態の読み取りと
+    /// 同じ床**（`viewer` 以上 - [`require_collect_reader`]）で、**セッションが
+    /// 無ければ拒否**。`chronogazer_core::rest` の
+    /// `collect_readouts_are_viewer_readable_and_never_collapse_not_running_into_zero`
+    /// と**対になる双子のテスト**で、両方が同じことを主張する = 両経路の床が
+    /// 一致している。
+    ///
+    /// あわせて、**収集が走っていないときの 3 本の答え**も固定する:
+    /// 現在値と接続状態は `notRunning`（**空のオブジェクトではない**）、
+    /// イベント一覧は**それでも読める** `ready` で 0 件。
+    ///
+    /// **行の中身（新しい順・`totalCount`・`detail` を返さないこと）は
+    /// `chronogazer_core` 側のテストが固定している** - 両経路とも
+    /// `CollectorService::events` という**同じ 1 つのメソッド**を通るので、
+    /// 経路によって形が割れようがない（`state_view` と同じ「変換は 1 箇所」の
+    /// 作法）。ここで同じことを繰り返さないのは、このクレートが
+    /// **依存を増やさない**invariant を持っていて、`collect_events` へ直接
+    /// 行を入れる（= `sqlx` を名指しする）ことができないため。
+    ///
+    /// 反証（回帰の検出）: `collect_values_body` などの
+    /// `require_collect_reader` を `require_collect_editor` に変えると viewer の
+    /// 呼び出しが `Forbidden` になって落ちる。ガードを外すと未認証の
+    /// `expect_err` が落ちる。走っていないときに空の `Ready` を返す実装に
+    /// すると `notRunning` の `assert_eq!` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collect_readouts_are_viewer_readable_and_never_collapse_not_running_into_zero() {
+        let state = app_state().await;
+
+        // セッションが無い = 未認証。3 本とも拒否される。
+        collect_values_body(&state)
+            .await
+            .expect_err("未認証で現在値が読めている");
+        collect_connections_body(&state)
+            .await
+            .expect_err("未認証で接続状態が読めている");
+        collect_events_list_body(&state, None, None)
+            .await
+            .expect_err("未認証でイベント一覧が読めている");
+
+        let viewer = state
+            .users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create_user");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+
+        // viewer は 3 本とも読める。走っていないときの答えは
+        // 「走っていない」であって「0 件」ではない。
+        let values = collect_values_body(&state)
+            .await
+            .expect("viewer は現在値を読めること");
+        assert_eq!(
+            values,
+            Readout::NotRunning,
+            "「走っていない」を「0 件」に潰している: {values:?}"
+        );
+        let connections = collect_connections_body(&state)
+            .await
+            .expect("viewer は接続状態を読めること");
+        assert_eq!(connections, Readout::NotRunning, "{connections:?}");
+
+        // イベント一覧は走っていなくても読める（0 件という事実が返る）。
+        let events = collect_events_list_body(&state, None, None)
+            .await
+            .expect("viewer はイベント一覧を読めること");
+        assert_eq!(
+            events.as_str(),
+            "ready",
+            "過去の記録の一覧を「走っていない」で隠している: {events:?}"
+        );
+        let page = events.data().expect("ready");
+        assert!(page.rows.is_empty());
+        assert_eq!(page.total_count, 0);
     }
 }
