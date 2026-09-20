@@ -31,6 +31,7 @@ use chronogazer_core::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 // 自動開始を足した（監査の `resource` は REST と共有の定数）。
 use chronogazer_core::collect::{
     resolve_data_dir, CollectOutcome, CollectorService, CollectorState, COLLECT_AUDIT_RESOURCE,
+    COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
 };
 use chronogazer_core::db::init_db;
 use chronogazer_core::events::event_channel;
@@ -1797,10 +1798,13 @@ async fn hub_disconnect(state: State<'_, AppState>) -> Result<HubView, BantoErro
 
 // --- #383 段階2b / R1-C（C-2）: 収集の操作 -----------------------------------
 
-/// Role check shared by every `collect_*` command. **`editor` 以上**（`admin`
-/// ではない）で、`chronogazer_core::rest` の `collect_router` に掛かっている
-/// `RoleGuard { min: Role::Editor, resource: COLLECT_AUDIT_RESOURCE, .. }` と
-/// **同じ下限・同じ resource**。
+/// Role check shared by the three **変更**コマンド
+/// （`collect_start`/`collect_stop`/`collect_restart`）。**`editor` 以上**
+/// （`admin` ではない）。読み取りだけは [`require_collect_reader`]（`viewer`
+/// 以上）で、床が 2 段に分かれているのは `chronogazer_core::rest` の
+/// `collect_router` とまったく同じ - どちらの床も**同じ定数**
+/// （[`COLLECT_OPERATION_ROLE`] / [`COLLECT_READ_ROLE`]）から来ているので、
+/// 経路によって割れようがない。
 ///
 /// **根拠**: `docs/recorder-requirements.md` §3.6「収集の開始/停止は editor
 /// 以上」と、そこに追記された **2026-09-18 のオーナー決定** - 「banto-hub は
@@ -1816,12 +1820,30 @@ async fn hub_disconnect(state: State<'_, AppState>) -> Result<HubView, BantoErro
 /// ので、ここは最初から 1 つの定数を両方から参照して割れようがなくして
 /// ある。**成功側の `resource` も同じ `"collect"`** - `hub_*` に残っている
 /// 「拒否は hub・成功は settings」という非対称を新しい資源に持ち込まない。
+/// **床を 2 段に分けても `resource` は分けない。**
 ///
-/// 7 つの `hub_*` が [`require_hub_admin`] を通るのと同じく、**4 つの
-/// `collect_*` は全部ここを通る**（読み取りの `collect_status` も含む） -
-/// 拒否の記録箇所を 1 か所に保つため。
+/// 7 つの `hub_*` が [`require_hub_admin`] を通るのと同じく、**3 つの変更
+/// コマンドは全部ここを通る** - 「変更操作は editor 以上」が 1 か所で決まり、
+/// 次に操作を足しても床が散らない。
 async fn require_collect_editor(state: &AppState) -> Result<UserIdentity, BantoError> {
-    require_role(state, Role::Editor, COLLECT_AUDIT_RESOURCE).await
+    require_role(state, COLLECT_OPERATION_ROLE, COLLECT_AUDIT_RESOURCE).await
+}
+
+/// Role check for the **読み取り**コマンド（`collect_status`）。**`viewer`
+/// 以上**（2026-09-20 オーナー決定、#407 レビュー。当初は変更と同じ `editor`
+/// にしていた）。
+///
+/// **根拠**: R0 §3.6 の viewer は「**閲覧のみ**」であって「何も見えない」では
+/// ない。収集が動いているかどうかは**監視画面（C-3 / R1-D）の基本情報**で、
+/// [`CollectorState`] には機微な情報が何も入っていない（接続先もキーも
+/// ファイルパスも無い）ので、viewer に見せて困るものが無い。
+/// [`require_hub_admin`] が読み取りまで `admin` なのは **Hub の接続先と
+/// キーの情報**を扱うからで、**収集の稼働状態はそれとは性質が違う** -
+/// 先例に引きずられない、という 2026-09-18 の決定と同じ考え方。
+///
+/// 拒否の `resource` は変更側と同じ [`COLLECT_AUDIT_RESOURCE`]。
+async fn require_collect_reader(state: &AppState) -> Result<UserIdentity, BantoError> {
+    require_role(state, COLLECT_READ_ROLE, COLLECT_AUDIT_RESOURCE).await
 }
 
 /// 成功した収集操作を監査に 1 本記録する（`collect_*` 共通）。`detail` は
@@ -1853,17 +1875,18 @@ async fn record_collect_operation(
         .await;
 }
 
-/// `GET`-ish command: 収集の現在の状態。`editor` 以上。
-///
-/// **ネットワークもディスクも DB も触らない**（メモリ上の状態を読むだけ）
-/// ので、画面はこれをポーリングしてよい。読み取りなので監査しない。
 /// Body of [`collect_status`]（spec M14 split-function pattern: コマンド本体を
 /// 合成 [`AppState`] に対して単体テストできるようにする）。
 async fn collect_status_body(state: &AppState) -> Result<CollectorState, BantoError> {
-    require_collect_editor(state).await?;
+    require_collect_reader(state).await?;
     Ok(state.collect.state())
 }
 
+/// `GET`-ish command: 収集の現在の状態。**`viewer` 以上**
+/// （[`require_collect_reader`] - 変更操作より 1 段低い床。理由はそちらの doc）。
+///
+/// **ネットワークもディスクも DB も触らない**（メモリ上の状態を読むだけ）
+/// ので、画面はこれをポーリングしてよい。読み取りなので監査しない。
 #[tauri::command]
 async fn collect_status(state: State<'_, AppState>) -> Result<CollectorState, BantoError> {
     collect_status_body(&state).await
@@ -2947,22 +2970,29 @@ mod tests {
 
     // --- #383 段階2b / R1-C（C-2）: 収集の操作 -------------------------------
 
-    /// 収集の操作は **`editor` 以上**（`admin` ではない） -
-    /// docs/recorder-requirements.md §3.6 と 2026-09-18 のオーナー決定
-    /// （[`require_collect_editor`] の doc）。viewer は拒否され、その拒否が
-    /// **`resource: "collect"`** で残る - REST の `collect_router`
-    /// （`RoleGuard { resource: COLLECT_AUDIT_RESOURCE, .. }`）と**同じ綴り**
-    /// であることを、`chronogazer_core::rest` 側の双子のテストと合わせて
-    /// 両経路で固定する（#397 P2-D の再発防止）。
+    /// 収集の床は **2 段**: 状態の**読み取りは `viewer` 以上**、
+    /// **変更（開始・停止・再起動）は `editor` 以上**（`admin` ではない）。
+    /// 2026-09-20 オーナー決定（#407 レビュー）と
+    /// docs/recorder-requirements.md §3.6 + 2026-09-18 のオーナー決定が根拠
+    /// （[`require_collect_reader`] / [`require_collect_editor`] の doc）。
     ///
-    /// 4 つの `collect_*` は全部 [`require_collect_editor`] を通るので、
-    /// ここを押さえれば全部の呼び出し口が決まる（`hub_*` と同じ構造）。
+    /// **これは `chronogazer_core::rest` 側の双子のテストと対**になっていて、
+    /// 両方が同じことを主張する = **両経路の床が一致している**ことの固定。
+    /// 床を分けても拒否は **`resource: "collect"`** のまま（#397 P2-D の
+    /// 再発防止）。
     ///
-    /// 反証（回帰の検出）: `require_collect_editor` の下限を `Role::Admin` に
-    /// すると editor の側が落ちる。`resource` を `"settings"` 等に変えると
-    /// 綴りの `assert_eq!` が落ちる。
+    /// 3 つの変更コマンドは全部 [`require_collect_editor`]、読み取りは
+    /// [`require_collect_reader`] を通るので、ここを押さえれば全部の
+    /// 呼び出し口が決まる（`hub_*` と同じ構造）。
+    ///
+    /// 反証（回帰の検出）: `require_collect_reader` を
+    /// `require_collect_editor` に戻すと viewer の `collect_status` が
+    /// `Forbidden` になって落ちる。`require_collect_editor` の床を
+    /// `COLLECT_READ_ROLE` に下げると viewer の `collect_start` が通って
+    /// 落ちる。`resource` を `"settings"` 等に変えると綴りの `assert_eq!` が
+    /// 落ちる。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn collect_commands_require_editor_and_record_denials_under_the_collect_resource() {
+    async fn collect_reads_are_viewer_and_operations_are_editor_all_under_the_collect_resource() {
         let state = app_state().await;
         let viewer = state
             .users
@@ -2976,17 +3006,25 @@ mod tests {
             .expect("create_user");
 
         *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
-        let err = collect_start_body(&state)
-            .await
-            .expect_err("a viewer must not operate collection");
-        assert!(matches!(err, BantoError::Forbidden));
-        // 読み取りも同じ下限（拒否の記録箇所を 1 つに保つため）。
-        assert!(matches!(
+        // **viewer は状態を読める**（R0 §3.6 の「閲覧のみ」は「何も見えない」
+        // ではない）。
+        assert_eq!(
             collect_status_body(&state)
                 .await
-                .expect_err("a viewer must not read the collection state either"),
-            BantoError::Forbidden
-        ));
+                .expect("a viewer must be able to read the collection state"),
+            CollectorState::Stopped
+        );
+        // が、変更はできない。
+        for outcome in [
+            collect_start_body(&state).await,
+            collect_stop_body(&state).await,
+            collect_restart_body(&state).await,
+        ] {
+            assert!(matches!(
+                outcome.expect_err("a viewer must not operate collection"),
+                BantoError::Forbidden
+            ));
+        }
 
         let audit = state
             .audit
@@ -2994,18 +3032,23 @@ mod tests {
             .await
             .expect("audit list");
         let denials: Vec<_> = audit.rows.iter().filter(|r| r.action == "denied").collect();
-        assert_eq!(denials.len(), 2, "拒否が記録されていない: {:?}", audit.rows);
+        assert_eq!(
+            denials.len(),
+            3,
+            "変更 3 件だけが拒否される（読み取りは通る）: {:?}",
+            audit.rows
+        );
         for entry in denials {
             assert_eq!(
                 entry.resource, "collect",
-                "denials must be tagged like REST's collect_router"
+                "床を分けても resource は分けない（REST 側と同じ綴り）"
             );
             assert_eq!(entry.actor_username.as_deref(), Some("viewer"));
             assert_eq!(entry.origin, "tauri");
             assert_eq!(entry.result, "denied");
         }
 
-        // editor は通る - `admin` へ引き上げていないこと。
+        // editor は変更も通る - `admin` へ引き上げていないこと。
         let editor = state
             .users
             .get_by_username("editor")
@@ -3015,7 +3058,7 @@ mod tests {
         *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
         require_collect_editor(&state)
             .await
-            .expect("an editor must pass the collect guard");
+            .expect("an editor must pass the collect operation guard");
     }
 
     /// **収集対象 0 件で `collect_start` を呼んでもエラーにならない**

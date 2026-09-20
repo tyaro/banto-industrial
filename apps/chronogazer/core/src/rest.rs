@@ -108,8 +108,9 @@
 //! row id - same helper, same shape as every other mutating handler in this
 //! module. Reads are never audited (same convention).
 //!
-//! `/api/collect*` (#383 段階2b / R1-C): **`editor` 以上**（`admin` では
-//! ない - [`collect_router`] の doc に根拠）。拒否も成功も
+//! `/api/collect*` (#383 段階2b / R1-C): **読み取り（`GET`）は `viewer`
+//! 以上・変更（`POST`）は `editor` 以上**（`admin` ではない - [`collect_router`]
+//! の doc に両方の根拠）。**床は 2 段でも `resource` は 1 つ** - 拒否も成功も
 //! `resource: `[`COLLECT_AUDIT_RESOURCE`]（`"collect"`）で、これは
 //! `src-tauri` の `collect_*` コマンドが参照するのと**同じ定数** - 同じ操作が
 //! 経路によって別の `resource` にならないようにするため（#397 P2-D）。
@@ -162,7 +163,10 @@ use tokio::sync::broadcast;
 
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::backup::{BackupInfo, BackupService, PendingRestoreInfo};
-use crate::collect::{CollectOutcome, CollectorService, CollectorState, COLLECT_AUDIT_RESOURCE};
+use crate::collect::{
+    CollectOutcome, CollectorService, CollectorState, COLLECT_AUDIT_RESOURCE,
+    COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
+};
 use crate::hub::{HubService, HubSubscriptionView, HubView};
 use crate::settings::{AuditSettings, SettingsService};
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
@@ -1433,7 +1437,8 @@ async fn record_collect_operation(
         .await;
 }
 
-/// `GET /api/collect`（`editor` 以上）: 収集の現在の状態。
+/// `GET /api/collect`（**`viewer` 以上** - [`COLLECT_READ_ROLE`]）: 収集の
+/// 現在の状態。
 ///
 /// **ネットワークもディスクも DB も触らない**（メモリ上の状態を読むだけ）
 /// ので、画面はこれをポーリングしてよい。読み取りなので監査しない
@@ -1442,7 +1447,7 @@ async fn collect_status_handler(State(state): State<CollectState>) -> Json<Colle
     Json(state.collect.state())
 }
 
-/// `POST /api/collect/start`（`editor` 以上）。
+/// `POST /api/collect/start`（**`editor` 以上** - [`COLLECT_OPERATION_ROLE`]）。
 async fn collect_start_handler(
     State(state): State<CollectState>,
     headers: HeaderMap,
@@ -1452,7 +1457,7 @@ async fn collect_start_handler(
     Ok(Json(outcome))
 }
 
-/// `POST /api/collect/stop`（`editor` 以上）。
+/// `POST /api/collect/stop`（**`editor` 以上** - [`COLLECT_OPERATION_ROLE`]）。
 async fn collect_stop_handler(
     State(state): State<CollectState>,
     headers: HeaderMap,
@@ -1462,7 +1467,7 @@ async fn collect_stop_handler(
     Ok(Json(outcome))
 }
 
-/// `POST /api/collect/restart`（`editor` 以上）: **レジストリの変更を収集へ
+/// `POST /api/collect/restart`（**`editor` 以上** - [`COLLECT_OPERATION_ROLE`]）: **レジストリの変更を収集へ
 /// 反映する唯一の口**。接続・グループ・タグの CRUD が自動でこれを呼ぶことは
 /// しない（理由は `crate::collect` のモジュール doc「起動時の自動開始と、
 /// 「収集を再起動」だけが反映の口であること」）。
@@ -1475,30 +1480,57 @@ async fn collect_restart_handler(
     Ok(Json(outcome))
 }
 
-/// `/api/collect*`（#383 段階2b / R1-C）: **`editor` 以上**、`hub_router` と
-/// まったく同じ掛け方（`require_auth` → `require_role_at_least`）。
+/// `/api/collect*`（#383 段階2b / R1-C）: **読み取りは `viewer` 以上・変更は
+/// `editor` 以上**の 2 段（`require_auth` → ルート群ごとの
+/// `require_role_at_least`）。床の値は両方とも `crate::collect` の定数
+/// （[`COLLECT_READ_ROLE`] / [`COLLECT_OPERATION_ROLE`]）から来ていて、
+/// `src-tauri` の `collect_*` コマンドが**同じ定数**を参照する - 経路によって
+/// 床が割れようがないようにするため（[`COLLECT_AUDIT_RESOURCE`] と同じ作法）。
 ///
-/// **なぜ `editor` であって `admin` ではないか**: docs/recorder-requirements.md
-/// §3.6「収集の開始/停止は editor 以上」と、そこに追記された **2026-09-18 の
-/// オーナー決定** - 「banto-hub は同種の制御（自動書き込みエンジンの
-/// arm/disarm 等）を admin 限定にしているが、chronogazer は別プロダクトで
-/// あり R0 本文のこの決定を継承する。**banto-hub の先例に引きずられて
-/// admin 限定へ変更しない**」。すぐ上の [`hub_router`] が `admin` なのは
-/// **Hub の接続設定**（キーの発行・保存）だからで、収集の起動停止とは別の話。
+/// **なぜ変更が `editor` であって `admin` ではないか**:
+/// docs/recorder-requirements.md §3.6「収集の開始/停止は editor 以上」と、
+/// そこに追記された **2026-09-18 のオーナー決定** - 「banto-hub は同種の制御
+/// （自動書き込みエンジンの arm/disarm 等）を admin 限定にしているが、
+/// chronogazer は別プロダクトであり R0 本文のこの決定を継承する。**banto-hub の
+/// 先例に引きずられて admin 限定へ変更しない**」。
 ///
-/// 下限を 1 つのミドルウェアで router 全体に掛けているのも `hub_router`
-/// どおり。`GET /api/collect`（読み取り）も同じ `editor` の下で、
-/// `tag_registry_router` のような viewer-read / editor-write の割り方は
-/// していない - 拒否の記録箇所を 1 つに保つため（Tauri 側も同じく
-/// `require_collect_editor` 1 本を全コマンドが通る）。
+/// **なぜ読み取りが `viewer` なのか**（2026-09-20 オーナー決定、#407 レビュー。
+/// 当初は router 全体を `editor` にしていた）: R0 §3.6 の viewer は
+/// 「**閲覧のみ**」であって「何も見えない」ではない。収集が動いているかどうかは
+/// 監視画面（C-3 / R1-D）の基本情報で、[`CollectorState`] には機微な情報が
+/// 何も入っていない（接続先もキーもファイルパスも無い）ので、viewer に見せて
+/// 困るものが無い。すぐ上の [`hub_router`] が読み取りまで `admin` なのは
+/// **Hub の接続先とキーの情報**を扱うからで、**収集の稼働状態はそれとは性質が
+/// 違う** - 先例に引きずられない、という上と同じ考え方。
+///
+/// **床は分けても `resource` は分けない**: 読み取りの拒否も変更の拒否も
+/// [`COLLECT_AUDIT_RESOURCE`]（`"collect"`）で記録する。変更側は
+/// **3 ルートまとめて 1 つの `RoleGuard`** に掛けてあるので、「変更操作は
+/// editor 以上」は 1 か所で決まる（次に操作を足しても床が散らない）。
 fn collect_router(collect: CollectorService, audit: AuditLogService, auth: AuthState) -> Router {
     let state = CollectState {
         collect,
         audit: audit.clone(),
         auth: auth.clone(),
     };
-    Router::new()
+    // 読み取りだけの床（`viewer` 以上）。ルートは 1 本だけなので、ここが
+    // 「読み取りは誰まで」の唯一の決まり場所。
+    let reads = Router::new()
         .route("/api/collect", get(collect_status_handler))
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            RoleGuard {
+                auth: auth.clone(),
+                min: COLLECT_READ_ROLE,
+                resource: COLLECT_AUDIT_RESOURCE,
+                audit: audit.clone(),
+            },
+            require_role_at_least,
+        ));
+    // 変更操作の床（`editor` 以上）。**3 ルートまとめて 1 つの
+    // `RoleGuard`** に掛ける - 床がルートごとに散ると、次に足した操作が
+    // 黙って別の床になる。
+    let writes = Router::new()
         .route("/api/collect/start", post(collect_start_handler))
         .route("/api/collect/stop", post(collect_stop_handler))
         .route("/api/collect/restart", post(collect_restart_handler))
@@ -1506,12 +1538,14 @@ fn collect_router(collect: CollectorService, audit: AuditLogService, auth: AuthS
         .layer(middleware::from_fn_with_state(
             RoleGuard {
                 auth: auth.clone(),
-                min: Role::Editor,
+                min: COLLECT_OPERATION_ROLE,
                 resource: COLLECT_AUDIT_RESOURCE,
                 audit,
             },
             require_role_at_least,
-        ))
+        ));
+    reads
+        .merge(writes)
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
 
@@ -4132,28 +4166,38 @@ mod tests {
 
     // --- #383 段階2b / R1-C（C-2）: 収集の操作 -------------------------------
 
-    /// `/api/collect*` の全ルートを、admin / editor / viewer の 3 役で叩いて
-    /// 下限が **`editor` 以上**であることを固定する（`admin` ではない -
-    /// docs/recorder-requirements.md §3.6 と 2026-09-18 のオーナー決定。
-    /// [`collect_router`] の doc 参照）。あわせて、**拒否が
-    /// `resource: "collect"` で記録される**ことも見る（#397 の
+    /// `/api/collect*` の全ルートを admin / editor / viewer の 3 役で叩いて、
+    /// **床が 2 段**（読み取りは `viewer` 以上・変更は `editor` 以上）である
+    /// ことを固定する（2026-09-20 オーナー決定、#407 レビュー。
+    /// [`collect_router`] の doc に根拠）。あわせて、**床を分けても拒否は
+    /// `resource: "collect"` のまま**であることも見る（#397 の
     /// `denied_hub_command_is_recorded_under_the_hub_resource` が手本。
-    /// `src-tauri` 側に同じ綴りを固定する双子のテストがある）。
+    /// `src-tauri` 側に**同じ床・同じ綴り**を固定する双子のテストがある）。
     ///
-    /// 反証（回帰の検出）: [`collect_router`] の `RoleGuard` の `min` を
-    /// `Role::Admin` に戻すと editor が 403 になって落ちる。`resource` を
-    /// `"settings"` 等に変えると、最後の `assert_eq!` が落ちる。
+    /// 反証（回帰の検出）: 読み取りの `RoleGuard` の `min` を
+    /// `COLLECT_OPERATION_ROLE` に戻すと viewer の `GET` が 403 になって
+    /// 落ちる。変更側の `min` を `COLLECT_READ_ROLE` に下げると viewer の
+    /// `POST` が 200 になって落ちる。`resource` を `"settings"` 等に変えると
+    /// 最後の `assert_eq!` が落ちる。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn collect_routes_require_editor_and_record_denials_under_the_collect_resource() {
+    async fn collect_reads_are_viewer_and_operations_are_editor_all_under_the_collect_resource() {
         let (router, _audit, admin, editor, viewer) = router_with_role_tokens_and_audit().await;
 
-        // viewer は読み取りも操作も通らない（下限は router 全体に 1 つ）。
+        // **viewer は状態を読める**（R0 §3.6 の「閲覧のみ」は「何も見えない」
+        // ではない）。
         let response = router
             .clone()
             .oneshot(get_auth("/api/collect", &viewer))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "viewer は収集の状態を読めること"
+        );
+        assert_eq!(body_json(response).await["state"], "stopped");
+
+        // viewer は変更できない（床は 3 ルートまとめて 1 つ）。
         for path in [
             "/api/collect/start",
             "/api/collect/stop",
@@ -4167,7 +4211,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
         }
 
-        // editor は通る（admin へ引き上げていない）。
+        // editor は変更も通る（admin へ引き上げていない）。
         for token in [&editor, &admin] {
             let response = router
                 .clone()
@@ -4199,13 +4243,13 @@ mod tests {
         let denials: Vec<_> = rows.iter().filter(|r| r["action"] == "denied").collect();
         assert_eq!(
             denials.len(),
-            4,
-            "読み取り 1 + 操作 3 の拒否が記録されていない: {rows:?}"
+            3,
+            "変更 3 件だけが拒否される（読み取りは通る）: {rows:?}"
         );
         for entry in denials {
             assert_eq!(
                 entry["resource"], "collect",
-                "拒否は Tauri 側と同じ resource で記録すること: {entry:?}"
+                "床を分けても resource は分けない（Tauri 側と同じ綴り）: {entry:?}"
             );
             assert_eq!(entry["actorUsername"], "viewer");
             assert_eq!(entry["actorRole"], "viewer");

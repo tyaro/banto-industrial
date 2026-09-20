@@ -186,6 +186,10 @@ use banto_collect::{
 };
 use banto_core::BantoError;
 use banto_tstore::{Clock, SystemClock};
+// ロールの下限（`COLLECT_OPERATION_ROLE` / `COLLECT_READ_ROLE`）だけ、この
+// service 層が名前を出す - 両経路の床を 1 か所で決めるため（transport の
+// 知識ではなく「この資源を触ってよいのは誰か」という資源側の性質）。
+use crate::users::Role;
 use serde::Serialize;
 use sqlx::SqlitePool;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -267,6 +271,39 @@ impl CollectorState {
 /// ガードが書く `denied`）ので、既存の語彙（`create`/`delete`/… と同じ
 /// 「小文字の動詞」）に合わせて各呼び出し側が書く。
 pub const COLLECT_AUDIT_RESOURCE: &str = "collect";
+
+/// 収集の**変更操作**（開始・停止・再起動）に要る最低ロール。
+///
+/// **`editor` 以上**（`admin` ではない）: docs/recorder-requirements.md §3.6
+/// 「収集の開始/停止は editor 以上」と、そこに追記された 2026-09-18 の
+/// オーナー決定 -「banto-hub は同種の制御を admin 限定にしているが、
+/// chronogazer は別プロダクトであり R0 本文の決定を継承する。**banto-hub の
+/// 先例に引きずられて admin 限定へ変更しない**」。
+///
+/// [`COLLECT_AUDIT_RESOURCE`] と同じく**両経路がこの 1 つの定数を参照する** -
+/// REST（`crate::rest` の `collect_router` が変更ルートに掛ける
+/// `RoleGuard`）と Tauri（`src-tauri` の `require_collect_editor`）で床が
+/// 割れようがないようにするため。
+pub const COLLECT_OPERATION_ROLE: Role = Role::Editor;
+
+/// 収集の**状態の読み取り**に要る最低ロール。
+///
+/// **`viewer` 以上**（2026-09-20 オーナー決定、#407 レビュー）。R0 §3.6 の
+/// viewer は「**閲覧のみ**」であって「何も見えない」ではない。収集が動いて
+/// いるかどうかは**監視画面（C-3 / R1-D）の基本情報**であり、
+/// [`CollectorState`] には機微な情報が何も入っていない - 接続先もキーも
+/// ファイルパスも、[`CollectorState::StartFailed`] の `reason` すら
+/// ワイヤに出る前に [`CollectorState::as_str`] へ落ちる経路（監査）があるだけ
+/// で、状態そのものは「止まっている / 起動中 / 走っている（件数）/ 対象なし /
+/// 起動失敗」しか語らない。viewer に見せて困るものが無い。
+///
+/// `crate::hub` の `hub_status` が `admin` 限定なのは **Hub の接続先と
+/// キーの情報**を扱うからで、**収集の稼働状態はそれとは性質が違う** -
+/// 先例に引きずられない、という 2026-09-18 の決定と同じ考え方をここでも採る。
+///
+/// **床は分けても [`COLLECT_AUDIT_RESOURCE`] は分けない**: 読み取りの拒否も
+/// 変更の拒否も、同じ `"collect"` で記録する。
+pub const COLLECT_READ_ROLE: Role = Role::Viewer;
 
 /// ライフサイクル操作（`start`/`stop`/`restart`）1 回の結末。
 ///
