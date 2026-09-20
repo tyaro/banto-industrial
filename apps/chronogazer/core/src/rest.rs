@@ -47,6 +47,11 @@
 //! | GET    | `/api/tags/{id}` | -                        | `Tag` (viewer+)         |
 //! | PUT    | `/api/tags/{id}` | `TagPayload`             | `Tag` (editor+)         |
 //! | DELETE | `/api/tags/{id}` | -                        | 204 (editor+)           |
+//! | GET    | `/api/collect`   | -                        | `CollectorStateView` (viewer+, #383 段階2b/R1-C) |
+//! | POST   | `/api/collect/start\|stop\|restart` | -     | `CollectOutcome` (editor+) |
+//! | GET    | `/api/collect/values` | -                   | `Readout<{[tagKey]: CurrentSampleView}>` (viewer+, C-3a) |
+//! | GET    | `/api/collect/connections` | -              | `Readout<{[connKey]: ConnectionStatusView}>` (viewer+, C-3a) |
+//! | GET    | `/api/collect/events?offset=&limit=` | -    | `Readout<ListResult<CollectEventRow>>` (viewer+, C-3a) |
 //!
 //! `/api/ui-settings/*` (spec M12 SettingsProvider migration): per-user UI
 //! settings (theme/preset/dock layout), namespaced by the caller's own
@@ -125,6 +130,16 @@
 //! 抜けるので `record_collect_operation` に届かない）- 「受け付けた」と
 //! 監査にも嘘を書かないための形（#407 レビュー P2-1）。
 //!
+//! C-3a で足した読み出し 3 本（`/api/collect/values` / `.../connections` /
+//! `.../events`）も**同じ床・同じ `resource`**で、**どれも監査しない**
+//! （読み取りは監査しない、という全体の規約）。3 本とも
+//! [`crate::collect::Readout`] を返す - 「**走っていない**」「**読めなかった**」
+//! 「**読めて 0 件**」を**別の値**にするためで、空のコレクションを返して
+//! 3 つを 1 つに潰さない（docs/implementation-checklist.md §5）。載せる情報も
+//! 3 本とも公開用の型に通してあり、とくに `collect_events.detail`（自由文。
+//! 接続先やファイルパスを含みうる）は**型でも SQL でも落としてある** -
+//! `crate::collect` のモジュール doc「公開用の型 - 何を載せ、何を落としたか」。
+//!
 //! `/api/backups/*` (spec M17): `admin`-only, guarded the same way
 //! `/api/users/*`/`/api/audit-log/*` are. `POST /api/backups` records
 //! `action: "backup"`; either restore-staging route records
@@ -166,14 +181,16 @@ use banto_tags::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::str::FromStr;
 use tokio::sync::broadcast;
 
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 use crate::collect::{
-    CollectOutcome, CollectorService, CollectorStateView, COLLECT_AUDIT_RESOURCE,
-    COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
+    CollectEventRow, CollectOutcome, CollectorService, CollectorStateView, ConnectionStatusView,
+    CurrentSampleView, EventPage, Readout, COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE,
+    COLLECT_READ_ROLE,
 };
 use crate::hub::{HubService, HubSubscriptionView, HubView};
 use crate::settings::{AuditSettings, SettingsService};
@@ -1466,6 +1483,78 @@ async fn collect_status_handler(State(state): State<CollectState>) -> Json<Colle
     Json(state.collect.state_view())
 }
 
+/// `GET /api/collect/values`（**`viewer` 以上** - [`COLLECT_READ_ROLE`]、
+/// #383 段階2b / R1-C の C-3a）: タグごとの現在値。
+///
+/// **キューもディスクも DB も触らない**（葉に公開してある現在値ハンドルから
+/// `snapshot()` を取るだけ）ので、画面はこれをポーリングしてよい - 遅い
+/// `start()` の後ろで待たされない（`crate::collect` のモジュール doc
+/// 「現在値はキューから外して葉に公開する」）。読み取りなので監査しない。
+///
+/// 返すのは [`Readout`]: **「走っていない」と「読めて 0 件」を別の値**にする
+/// （空の `{}` を返して 2 つを潰さない）。値の型は公開用の
+/// [`CurrentSampleView`] で、**品質と時刻を必ず載せる**（画面が Stale / Bad を
+/// 出し分けられること自体が R0 §3.2 の要求）。
+async fn collect_values_handler(
+    State(state): State<CollectState>,
+) -> Json<Readout<HashMap<String, CurrentSampleView>>> {
+    Json(state.collect.values())
+}
+
+/// `GET /api/collect/connections`（**`viewer` 以上**、C-3a）: 接続ごとの状態。
+///
+/// **3 つの結末を返しうる唯一の口**（走っていない / 読めなかった / 読めて
+/// 0 件）。「読めなかった」は、ライフサイクルタスクが遅い `start`/`stop` を
+/// 処理している最中に `crate::collect::COLLECT_READ_TIMEOUT` が過ぎた場合 -
+/// **「失敗しました」とも「接続 0 件」とも言わない**（#400 の言い分け）。
+async fn collect_connections_handler(
+    State(state): State<CollectState>,
+) -> Json<Readout<HashMap<String, ConnectionStatusView>>> {
+    Json(state.collect.connections().await)
+}
+
+/// `GET /api/collect/events?offset=&limit=` のクエリ（C-3a）。
+///
+/// どちらも省略可（既定は先頭から `crate::collect::COLLECT_EVENTS_DEFAULT_LIMIT`
+/// 件）。範囲外の `limit` は [`EventPage::new`] が丸める - 拒否しないのは、
+/// 画面のページャが素直に使えるようにするため。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CollectEventsQuery {
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    limit: Option<u64>,
+}
+
+/// `GET /api/collect/events`（**`viewer` 以上**、C-3a）: `collect_events` の
+/// 1 ページ（**新しい順**）。
+///
+/// **監査ログ一覧（`POST /api/audit-log/list`）の流儀に倣う** - 総件数は
+/// `ListResult::total_count`（`totalCount`）で返し、既定の取得件数も同じ 50。
+/// 違うのは `GET` + クエリ文字列にしたこと（並べ替え・絞り込みは持たない）と、
+/// **取得件数に上限を掛けた**こと（この口は `viewer` にも開いているため -
+/// `crate::collect::COLLECT_EVENTS_MAX_LIMIT`）。
+///
+/// **`detail` 列は返さない**（`crate::collect::CollectEventRow` の doc）:
+/// 自由文で、切断理由（接続先を含みうる）や書き込みエラー（ファイルパスを
+/// 含みうる）がそのまま入っている列なので、SQL と型の両方で落としてある。
+///
+/// **収集が止まっていても読める**（`Readout::NotRunning` を返さない）- 過去の
+/// 記録であって走っているエンジンの覗き窓ではないため。走っているかどうかは
+/// `GET /api/collect` を併せて読むこと。
+async fn collect_events_handler(
+    State(state): State<CollectState>,
+    Query(query): Query<CollectEventsQuery>,
+) -> Json<Readout<ListResult<CollectEventRow>>> {
+    Json(
+        state
+            .collect
+            .events(EventPage::new(query.offset, query.limit))
+            .await,
+    )
+}
+
 /// `POST /api/collect/start`（**`editor` 以上** - [`COLLECT_OPERATION_ROLE`]）。
 async fn collect_start_handler(
     State(state): State<CollectState>,
@@ -1534,10 +1623,16 @@ fn collect_router(collect: CollectorService, audit: AuditLogService, auth: AuthS
         audit: audit.clone(),
         auth: auth.clone(),
     };
-    // 読み取りだけの床（`viewer` 以上）。ルートは 1 本だけなので、ここが
-    // 「読み取りは誰まで」の唯一の決まり場所。
+    // 読み取りの床（`viewer` 以上）。**4 ルートまとめて 1 つの `RoleGuard`**
+    // で、ここが「読み取りは誰まで」の唯一の決まり場所（変更側と同じ作法 -
+    // 次に読み出しを足しても床が散らない）。
     let reads = Router::new()
         .route("/api/collect", get(collect_status_handler))
+        // C-3a の 3 つの読み出し口。状態と同じ床・同じ `resource` で、
+        // どれも監査しない（読み取りは監査しない、という全体の規約）。
+        .route("/api/collect/values", get(collect_values_handler))
+        .route("/api/collect/connections", get(collect_connections_handler))
+        .route("/api/collect/events", get(collect_events_handler))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
             RoleGuard {
@@ -3178,7 +3273,25 @@ mod tests {
     ///   events.
     async fn router_with_role_tokens_and_audit() -> (Router, AuditLogService, String, String, String)
     {
+        let (router, audit, _pool, admin, editor, viewer) =
+            router_with_role_tokens_audit_and_pool().await;
+        (router, audit, admin, editor, viewer)
+    }
+
+    /// [`router_with_role_tokens_and_audit`] と同じものを組むが、**router と
+    /// 同じプールも返す**（#383 段階2b / R1-C の C-3a）: `collect_events` の
+    /// ような「REST からは書けないが読める」表に、テストが直接 1 行入れる
+    /// ため（あの表へ書くのは収集エンジンだけで、書き込み API は無い）。
+    async fn router_with_role_tokens_audit_and_pool() -> (
+        Router,
+        AuditLogService,
+        sqlx::SqlitePool,
+        String,
+        String,
+        String,
+    ) {
         let pool = migrate_memory().await.expect("migrate_memory");
+        let pool_for_tests = pool.clone();
         let (tx, _rx) = broadcast::channel(16);
         let users = UsersService::new(pool.clone());
         let settings = SettingsService::new(pool.clone());
@@ -3229,7 +3342,14 @@ mod tests {
             tx,
             false,
         );
-        (router, audit, admin_token, editor_token, viewer_token)
+        (
+            router,
+            audit,
+            pool_for_tests,
+            admin_token,
+            editor_token,
+            viewer_token,
+        )
     }
 
     /// Like `router_with_role_tokens_and_audit`, but for the M17
@@ -4477,5 +4597,172 @@ mod tests {
                 "内部の詳細（理由）が監査に漏れている: {detail:?}"
             );
         }
+    }
+
+    // --- #383 段階2b / R1-C（C-3a）: 収集の読み出し ---------------------------
+
+    /// C-3a の 3 本（現在値・接続状態・イベント一覧）も**状態の読み取りと
+    /// 同じ床**（`viewer` 以上 - [`COLLECT_READ_ROLE`]）で、**トークンが
+    /// 無ければ 401**。`src-tauri` 側に**同じことを主張する双子のテスト**が
+    /// ある（両経路の床が一致していることの固定）。
+    ///
+    /// あわせて、**収集が走っていないときの 3 本の答え**も見る:
+    /// 現在値と接続状態は `notRunning`（**空の `{}` ではない**）、
+    /// イベント一覧は**それでも読める** `ready` で 0 件（過去の記録は
+    /// 走っているかどうかと無関係 - `crate::collect` のモジュール doc）。
+    ///
+    /// 反証（回帰の検出）: 読み取りの `RoleGuard` の `min` を
+    /// `COLLECT_OPERATION_ROLE` に戻すと viewer の 3 本が 403 になって落ちる。
+    /// `values`/`connections` が走っていないときに空の `Ready` を返す実装に
+    /// すると `state` の `assert_eq!` が落ちる。イベント一覧が収集の状態を
+    /// 見て `notRunning` を返す実装にすると最後の `assert_eq!` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collect_readouts_are_viewer_readable_and_never_collapse_not_running_into_zero() {
+        let (router, _audit, _admin, _editor, viewer) = router_with_role_tokens_and_audit().await;
+
+        for path in [
+            "/api/collect/values",
+            "/api/collect/connections",
+            "/api/collect/events",
+        ] {
+            // トークン無しは拒否（`require_auth` が最初に効く）。
+            let anonymous = router.clone().oneshot(get(path)).await.unwrap();
+            assert_eq!(
+                anonymous.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} が未認証で読めている"
+            );
+
+            // viewer は読める。
+            let response = router
+                .clone()
+                .oneshot(get_auth(path, &viewer))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "viewer が {path} を読めない"
+            );
+        }
+
+        // 走っていないときの答え（このテストのレジストリは空なので、収集は
+        // 一度も起動していない）。
+        let values = body_json(
+            router
+                .clone()
+                .oneshot(get_auth("/api/collect/values", &viewer))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            values["state"], "notRunning",
+            "「走っていない」を「0 件」に潰している: {values}"
+        );
+        let connections = body_json(
+            router
+                .clone()
+                .oneshot(get_auth("/api/collect/connections", &viewer))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(connections["state"], "notRunning", "{connections}");
+
+        // イベント一覧は走っていなくても読める（0 件という事実が返る）。
+        let events = body_json(
+            router
+                .oneshot(get_auth("/api/collect/events", &viewer))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            events["state"], "ready",
+            "過去の記録の一覧を「走っていない」で隠している: {events}"
+        );
+        assert_eq!(events["data"]["rows"].as_array().unwrap().len(), 0);
+        assert_eq!(events["data"]["totalCount"], 0);
+    }
+
+    /// イベント一覧の**ワイヤ形**（#383 段階2b / R1-C の C-3a）:
+    ///
+    /// * **`detail` 列を返さない**（自由文で、接続先やファイルパスを含みうる。
+    ///   C-2 の P2 と同じ類の漏れを繰り返さない）、
+    /// * 総件数は `totalCount`（監査ログ一覧と同じ綴り）、
+    /// * `?limit=`/`?offset=` が効き、**新しい順**。
+    ///
+    /// `collect_events` に書くのは収集エンジンだけ（REST には書き込み口が
+    /// 無い）ので、router と同じプールへ直接 1 行入れて読む。
+    ///
+    /// 反証（回帰の検出）: `crate::collect::CollectEventRow` に `detail` を
+    /// 足して `read_events` の `SELECT` にも足すと、目印の `assert!` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collect_events_are_paged_newest_first_and_never_carry_the_free_text_detail() {
+        const MARKER: &str = "CHRONOGAZER-LEAK-CANARY";
+        let (router, _audit, pool, _admin, _editor, viewer) =
+            router_with_role_tokens_audit_and_pool().await;
+
+        for (ts, kind, detail) in [
+            (100_i64, "collection_started", None),
+            (
+                200,
+                "plc_disconnected",
+                Some(format!("接続エラー: {MARKER} に繋がりません")),
+            ),
+            (300, "plc_reconnected", None),
+        ] {
+            sqlx::query(
+                "INSERT INTO collect_events (ts, kind, connection_key, detail) \
+                 VALUES (?, ?, 'conn:1', ?)",
+            )
+            .bind(ts)
+            .bind(kind)
+            .bind(detail)
+            .execute(&pool)
+            .await
+            .expect("insert collect_events");
+        }
+
+        let body = body_json(
+            router
+                .clone()
+                .oneshot(get_auth("/api/collect/events?limit=2", &viewer))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["state"], "ready");
+        assert!(
+            !body.to_string().contains(MARKER),
+            "自由文の detail がワイヤに漏れている: {body}"
+        );
+        let rows = body["data"]["rows"].as_array().unwrap().clone();
+        assert_eq!(rows.len(), 2, "?limit= が効いていない: {body}");
+        assert_eq!(
+            rows[0]["kind"], "plc_reconnected",
+            "新しい順になっていない: {body}"
+        );
+        assert!(
+            rows[0].get("detail").is_none(),
+            "`detail` フィールドがワイヤに出ている: {body}"
+        );
+        assert_eq!(
+            body["data"]["totalCount"], 3,
+            "総件数はページングの前の件数（監査ログ一覧と同じ）: {body}"
+        );
+
+        // 2 ページ目。
+        let body = body_json(
+            router
+                .oneshot(get_auth("/api/collect/events?limit=2&offset=2", &viewer))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let rows = body["data"]["rows"].as_array().unwrap().clone();
+        assert_eq!(rows.len(), 1, "?offset= が効いていない: {body}");
+        assert_eq!(rows[0]["kind"], "collection_started");
     }
 }
