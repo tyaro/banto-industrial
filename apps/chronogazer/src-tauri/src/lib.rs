@@ -1849,6 +1849,13 @@ const EXIT_CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 /// どれもローカルのディスク操作。この PR ではそもそも誰も収集を開始しない
 /// ので、現実に予算を食い始めるのは C-2 以降 - **実機で 5 秒に収まらない
 /// ことが分かったら、勝手に増やさずオーナーに報告すること。**
+///
+/// 予算が切れたときに何が起きるか（#406 レビュー P2 の後）:
+/// `CollectorService::stop` は**自分のライフサイクルタスクに依頼して待つ**
+/// だけなので、打ち切られるのは**待つ側だけ**で、タスク側の停止処理
+/// （接続タスクの join と最終 flush）は**そのまま続く**。直後にプロセスが
+/// 終わるので実害は無く、失われうるのは最後の未 flush 分だけ - 詳しくは
+/// `chronogazer_core::collect` のモジュール doc「終了フックからの停止」。
 async fn shutdown_app_state(state: &AppState) {
     let cleanup = async {
         // #383 段階1 の購読世代 + 見張り。`shutdown()` は操作ロックを

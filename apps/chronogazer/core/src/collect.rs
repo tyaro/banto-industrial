@@ -29,10 +29,21 @@
 //! [`CollectError::Config`] で拒否する。エンジンにとっては正しい（開く
 //! スキーマが無い）が、**利用者にとってはエラーではなく「まだ何も登録して
 //! いない」**。そこでこのサービスは `Collector::start` を呼ぶ**前に**
-//! [`banto_collect::CollectorConfig::group_count`] を見て、0 件なら
+//! [`banto_collect::CollectorConfig::tag_count`] を見て、0 件なら
 //! [`CollectorState::NoTargets`] という**専用の状態**を返す - #332 / #385 で
 //! 確立した「**空とエラーを別の状態にする**」規律
 //! （docs/implementation-checklist.md §5 の 1 行目）をここでも守る。
+//!
+//! **数えるのはタグ**であって、グループでも接続でもない。利用者にとっての
+//! 「収集対象」は**タグ 1 本 1 本**で、グループと接続はその入れ物にすぎない
+//! （入れ物だけ作って中身がまだ無い、は設定作業の途中として普通に起こる）。
+//! [`banto_collect::build_config`] は**タグが 1 本も無い有効グループも計画に
+//! 残す**ので、`group_count()` で数えると「有効な接続 1 件・有効なグループ
+//! 1 件・**有効タグ 0 件**」という構成が素通りし、読む物が何も無いのに PLC へ
+//! 繋ぎに行って tstore まで開いてしまう（#406 レビュー P2）。
+//! `tag_count() == 0` は**グループ 0 件・接続 0 件の場合も必ず含む**（タグは
+//! グループの中にしか居ない）ので、判定はこの 1 本で足りる - 「起こす条件」を
+//! 2 本に割らない（docs/implementation-checklist.md §5）。
 //!
 //! 状態は 4 つだけ（[`CollectorState`]）: 停止中 / 動作中 / 収集対象なし /
 //! 起動失敗（理由付き）。起動失敗の `reason` は [`CollectError`] の
@@ -48,28 +59,53 @@
 //! 「停止」や「起動失敗」に落とすことはしない（#385 の規律 =
 //! docs/implementation-checklist.md §5「状態を別軸に保つ」）。
 //!
-//! # ロック順序（一方向に固定）
+//! # ライフサイクルは専用タスクが所有する（ロックで守らない）
 //!
-//! `crate::hub::HubService` と**同じ書き方で揃える**:
+//! [`Collector`] の**所有権そのもの**と、それに対応する状態遷移は
+//! [`CollectorService`] ではなく**1 本の tokio タスク**（[`Lifecycle`]）が
+//! 持つ。`start`/`stop`/`restart` と読み出しは、**コマンド（mpsc）+ 応答
+//! （oneshot）**でそのタスクに依頼するだけで、呼び出し側は
+//! [`Collector`] に指一本触れない。
 //!
-//! 1. **操作ロック（外）** [`CollectorInner::operation`] -
-//!    `start`/`stop`/`restart` の全体を直列化する。二重起動の防止と
-//!    「start と stop が同時に来たときは呼ばれた順に効く」を、これ 1 本で
-//!    保証している。
-//! 2. **収集ロック（内）** [`CollectorInner::collector`] - 走っている
-//!    [`Collector`] 本体。[`Collector::stop`] が `self` を消費するので
-//!    `Option` に入れて `take()` できる形にしてある。
-//! 3. **状態ロック（葉）** [`CollectorInner::state`] - `std::sync::Mutex`。
-//!    **`.await` をまたいで保持しない**し、ここから他のロックを取らない。
+//! **なぜロックではなくタスクなのか（キャンセル安全性。#406 レビュー P2）**:
+//! 以前はサービス側が `AsyncMutex<Option<Collector>>` を `take()` してから
+//! `Collector::stop().await` していた。axum のハンドラは接続が切れれば
+//! future を drop するので、**`take()` の後・`stop()` の完了前に呼び出し側が
+//! 消える**ことが現実に起こる。そうなると `collector` は `None`・状態は
+//! `Running` という食い違いが**そのまま残り**、しかも次の `stop()` は
+//! 「走っていない」分岐に落ちて状態を直せない。さらに `Collector::stop()` は
+//! **接続タスクの join と writer の最終 flush** なので、状態表示だけ直しても
+//! 実体の停止は保証できない。ライフサイクル処理をタスク側に置けば、
+//! **oneshot の受信側が落ちても送信が失敗するだけで、開始済みの処理は
+//! 最後まで進む**（#400 で潰した「飛行中の操作」と同じ層の、キャンセル側）。
 //!
-//! 逆順で取る経路を作らないこと。`*_locked` の付いた private 関数は
-//! **操作ロックを呼び出し元が既に持っている前提**で書いてあり、その証拠として
-//! ガードの参照を引数で受け取る（`HubService` の `reconcile*` と同じ約束を、
-//! こちらは型で見えるようにした）。
+//! この形から**ただで**出てくる保証:
 //!
-//! ポーリング経路（[`CollectorService::state`]）は**操作ロックも収集ロックも
-//! 取らない**（状態ロックだけ）ので、起動中（tstore を開いている最中）でも
-//! 待たされない。
+//! * タスクはコマンドを**逐次**処理するので、**新しい `start()` は前の
+//!   `stop()` が完了するまで進まない**。二重起動の防止も「呼ばれた順に
+//!   効く」も、ロックではなく**所有権と 1 本のキュー**が担保する。
+//! * 読み出し（[`CollectorService::connection_status`] /
+//!   [`CollectorService::current_values`]）も同じキューを通るので、
+//!   **ライフサイクル操作の途中の [`Collector`] を覗くことがない** -
+//!   返ってくるのは必ず「どれかの操作と操作の間」の姿で、状態と食い違わない。
+//!   代償として、**起動処理の最中は読み出しがその完了まで待つ**（`start()` の
+//!   無応答に上限を付けるのは C-2 の課題として申し送り済み）。
+//! * コマンドを**送る前**に呼び出し側が消えた場合は、そもそも何も起きない
+//!   （キューに積まれていないので、タスクは知らないまま）。
+//!
+//! 残るロックは**状態ロック（葉）** [`CollectorContext::state`]
+//! （`std::sync::Mutex`）だけで、**書くのはライフサイクルタスクだけ**。
+//! `.await` をまたいで保持しないし、ここから他のロックを取らない。
+//! ポーリング経路（[`CollectorService::state`]）は**キューを通らない**ので、
+//! 起動中（tstore を開いている最中）でも待たされない。
+//!
+//! # 終了フックからの停止
+//!
+//! `src-tauri` の `shutdown_app_state` も**同じ口**（[`CollectorService::stop`]）
+//! を通る。あちらは後始末全体に 5 秒の予算があり、超えたら待つのをやめるが、
+//! **やめるのは待つ側だけで、タスク側の停止処理（join と最終 flush）は
+//! そのまま続く**。プロセスがその直後に終わるので実害は無い - 途中で
+//! 切り上げても、失われうるのは最後の未 flush 分だけ（固まる方が悪い）。
 //!
 //! # 保持期間（`retention.days`）について
 //!
@@ -80,7 +116,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use banto_collect::{
     build_config, ClientFactory, CollectError, CollectEvent, Collector, CollectorOptions,
@@ -90,7 +126,7 @@ use banto_core::BantoError;
 use banto_tstore::{Clock, SystemClock};
 use serde::Serialize;
 use sqlx::SqlitePool;
-use tokio::sync::{broadcast, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 /// 収集サービスの状態。**必要最小限の 4 つ**だけ（語彙を増やさない）。
 ///
@@ -98,8 +134,9 @@ use tokio::sync::{broadcast, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard}
 ///   停止した）。
 /// * [`Self::Running`] - 走っている。`groups`/`tags` は**起動時に実際に
 ///   採用された**収集対象の数。
-/// * [`Self::NoTargets`] - 有効な接続・グループ・タグが 1 件も無いので
-///   起動しなかった。**エラーではない**（このモジュールの doc 参照）。
+/// * [`Self::NoTargets`] - **有効なタグが 1 件も無い**ので起動しなかった
+///   （有効な接続やグループだけがあってタグが空、も含む）。**エラーでは
+///   ない**（このモジュールの doc 参照）。
 /// * [`Self::StartFailed`] - 起動を試みて失敗した。`reason` は
 ///   [`CollectError`] の文言そのまま。
 ///
@@ -123,10 +160,29 @@ impl CollectorState {
     }
 }
 
-/// [`CollectorService`] の実体。`CollectorService` はこれへの `Arc` 1 本だけを
-/// 持つので、`Clone` しても**同じ収集エンジン**を指す（デスクトップの
-/// コマンドと LAN の REST が別々のエンジンを立てない）。
-struct CollectorInner {
+/// ライフサイクルタスクへの依頼。応答はそれぞれの `oneshot` に返す。
+///
+/// **応答の受信側が落ちても（呼び出し側のキャンセル）、タスクは処理を
+/// 最後まで続ける** - `send` が `Err` になるだけ。それがこの設計の要点
+/// （このモジュールの doc「ライフサイクルは専用タスクが所有する」）。
+enum Command {
+    Start(oneshot::Sender<Result<CollectorState, BantoError>>),
+    Stop(oneshot::Sender<Result<CollectorState, BantoError>>),
+    Restart(oneshot::Sender<Result<CollectorState, BantoError>>),
+    /// 読み出しも同じキューを通す（操作の途中の [`Collector`] を覗かない）。
+    ConnectionStatus(oneshot::Sender<Option<HashMap<String, ConnectionStatus>>>),
+    CurrentValues(oneshot::Sender<Option<CurrentValuesHandle>>),
+}
+
+/// コマンドキューの深さ。ライフサイクル操作は人間の操作由来で秒に何度も
+/// 来るものではなく、読み出しのポーリングもこの深さで詰まることはない。
+/// 満杯になったら `send().await` が待つ（= 背圧）だけで、取りこぼさない。
+const COMMAND_QUEUE_DEPTH: usize = 32;
+
+/// 収集エンジンを組み立てるのに要る材料と、外から読める状態。
+/// **[`CollectorService`] とライフサイクルタスクの両方が `Arc` で持つ**
+/// （[`Collector`] 本体だけはタスクの専有）。
+struct CollectorContext {
     /// レジストリ（`plc_connections`/`collection_groups`/`tags`）と
     /// `collect_events` を同居させている、このアプリ唯一の SQLite プール。
     /// [`build_config`] の読み取り元であり、[`EventSink`] の書き込み先でもある。
@@ -148,15 +204,35 @@ struct CollectorInner {
     /// [`banto_collect::default_client_factory`]（SLMP / Modbus TCP の直結）。
     /// テストだけが差し替える。
     factory: ClientFactory,
-    /// **操作ロック（外）**。このモジュール doc の「ロック順序」参照。
-    operation: AsyncMutex<()>,
-    /// **収集ロック（内）**。`None` = 走っていない。
-    /// [`Collector::stop`] が `self` を消費するので `Option` + `take()`。
-    collector: AsyncMutex<Option<Collector>>,
-    /// **状態ロック（葉）**。書き換えるのは操作ロックを持っている最中だけ
-    /// （= `collector` の中身と食い違わない）。読み取りはロック順序の外から
-    /// でもよい。
+    /// **状態ロック（葉）**。**書くのは [`Lifecycle`] タスクだけ**なので、
+    /// `Collector` の実体と食い違わない。読み取りはどこからでもよい
+    /// （[`CollectorService::state`] はキューを通らない）。
     state: Mutex<CollectorState>,
+}
+
+impl CollectorContext {
+    fn state(&self) -> CollectorState {
+        self.state
+            .lock()
+            .expect("collector state lock poisoned")
+            .clone()
+    }
+
+    fn set_state(&self, state: CollectorState) {
+        *self.state.lock().expect("collector state lock poisoned") = state;
+    }
+}
+
+/// [`CollectorService`] の実体。`CollectorService` はこれへの `Arc` 1 本だけを
+/// 持つので、`Clone` しても**同じ収集エンジン**を指す（デスクトップの
+/// コマンドと LAN の REST が別々のエンジンを立てない）。
+struct CollectorInner {
+    ctx: Arc<CollectorContext>,
+    /// ライフサイクルタスクへのコマンド口。**初回の非同期操作で spawn する**
+    /// （[`CollectorService::new`] は `tauri` の `setup` から**ランタイムの
+    /// 外**で呼ばれるので、そこで `tokio::spawn` すると panic する）。
+    /// `OnceLock` なので二重には立たない。
+    commands: OnceLock<mpsc::Sender<Command>>,
 }
 
 /// 収集エンジンのサービス層。`src-tauri` の（C-2 で足す）コマンドと
@@ -196,15 +272,16 @@ impl CollectorService {
         let events = EventSink::new(pool.clone());
         Self {
             inner: Arc::new(CollectorInner {
-                pool,
-                data_dir,
-                clock,
-                events,
-                options,
-                factory,
-                operation: AsyncMutex::new(()),
-                collector: AsyncMutex::new(None),
-                state: Mutex::new(CollectorState::Stopped),
+                ctx: Arc::new(CollectorContext {
+                    pool,
+                    data_dir,
+                    clock,
+                    events,
+                    options,
+                    factory,
+                    state: Mutex::new(CollectorState::Stopped),
+                }),
+                commands: OnceLock::new(),
             }),
         }
     }
@@ -212,18 +289,18 @@ impl CollectorService {
     /// 収集を開始する。
     ///
     /// 1. レジストリから構成を作る（[`build_config`]）。
-    /// 2. **収集対象が 0 件なら [`CollectorState::NoTargets`]**（`Ok`）。
+    /// 2. **有効タグが 0 件なら [`CollectorState::NoTargets`]**（`Ok`）。
     ///    `Collector::start` には渡さない - このモジュール doc 参照。
     /// 3. それ以外は [`Collector`] を起動して [`CollectorState::Running`]。
     ///
     /// **既に走っているときは何もしない**（現在の状態をそのまま返す）。
-    /// 二重起動は操作ロックで防いでいる（このモジュール doc の「ロック順序」）。
+    /// 二重起動を防いでいるのはロックではなく、ライフサイクルタスクが
+    /// コマンドを**逐次**処理すること（このモジュール doc 参照）。
     ///
     /// `Err` を返すのは「起動を試みて失敗した」ときだけ。そのとき状態は
     /// [`CollectorState::StartFailed`] になり、**理由が残る**。
     pub async fn start(&self) -> Result<CollectorState, BantoError> {
-        let operation = self.inner.operation.lock().await;
-        self.start_locked(&operation).await
+        self.lifecycle(Command::Start).await
     }
 
     /// 収集を停止する。**走っていなければ何もしない**（冪等）- 状態にも
@@ -233,62 +310,48 @@ impl CollectorService {
     /// `Err` は「最終 flush に失敗した」ときだけ返る。その場合でも
     /// **エンジンは確かに止まっている**ので状態は
     /// [`CollectorState::Stopped`] にする（状態は現実を写す）。
+    ///
+    /// **この `await` を途中でやめても停止は進む**（依頼はもうタスク側にある）。
+    /// 終了フックの 5 秒予算が切れたときに起こるのがまさにこれで、待つのを
+    /// やめるだけで join と最終 flush は続く。
     pub async fn stop(&self) -> Result<CollectorState, BantoError> {
-        let operation = self.inner.operation.lock().await;
-        self.stop_locked(&operation).await
+        self.lifecycle(Command::Stop).await
     }
 
-    /// 停止してから開始する。**間に他の `start`/`stop` を割り込ませない**
-    /// ため、操作ロックを 1 回だけ取って両方をその中で行う
-    /// （`stop().await` → `start().await` と 2 回に分けると、その隙間に
-    /// 別の呼び出しが入れてしまう）。
+    /// 停止してから開始する。**間に他の `start`/`stop` を割り込ませない** -
+    /// タスク側で「停止 → 開始」を 1 つのコマンドとして処理するので、
+    /// `stop().await` → `start().await` と 2 回に分けたときのような隙間が
+    /// そもそも無い。
     ///
     /// 停止側の失敗（最終 flush）は**開始を中止する理由にしない** - ログに
     /// 出して開始へ進む。落ちるのは旧ファイルの未 flush 分だけで、それは
     /// 「新しい構成で収集を再開できるか」とは無関係だから（`banto-collect` の
     /// `apply_config` が同じ天秤で同じ側を選んでいる）。
     pub async fn restart(&self) -> Result<CollectorState, BantoError> {
-        let operation = self.inner.operation.lock().await;
-        if let Err(err) = self.stop_locked(&operation).await {
-            eprintln!(
-                "banto: 収集の再起動中、停止側の後始末に失敗しました（開始は続行します）: {err}"
-            );
-        }
-        self.start_locked(&operation).await
+        self.lifecycle(Command::Restart).await
     }
 
-    /// 現在の状態。**ネットワークもディスクも DB も触らない**し、操作ロック・
-    /// 収集ロックのどちらも取らないので、起動処理の最中でも待たされない
-    /// （ポーリングはこれを見る）。
+    /// 現在の状態。**ネットワークもディスクも DB も触らない**し、コマンド
+    /// キューも通らないので、起動処理の最中でも待たされない（ポーリングは
+    /// これを見る）。
     pub fn state(&self) -> CollectorState {
-        self.inner
-            .state
-            .lock()
-            .expect("collector state lock poisoned")
-            .clone()
+        self.inner.ctx.state()
     }
 
     /// 接続ごとの状態のスナップショット。**走っていなければ `None`** -
     /// 空の `HashMap` を返して「接続 0 件」と混同させない
     /// （docs/implementation-checklist.md §5）。
+    ///
+    /// ライフサイクルタスクに問い合わせるので、**飛行中の start/stop が
+    /// 終わってから**answer が返る（操作の途中の [`Collector`] は見えない）。
     pub async fn connection_status(&self) -> Option<HashMap<String, ConnectionStatus>> {
-        self.inner
-            .collector
-            .lock()
-            .await
-            .as_ref()
-            .map(|collector| collector.status())
+        self.readout(Command::ConnectionStatus).await
     }
 
     /// 現在値キャッシュのハンドル。**走っていなければ `None`**（同上 -
     /// 「値がまだ無い」キャッシュを返して「0 件」に潰さない）。
     pub async fn current_values(&self) -> Option<CurrentValuesHandle> {
-        self.inner
-            .collector
-            .lock()
-            .await
-            .as_ref()
-            .map(|collector| collector.current_values())
+        self.readout(Command::CurrentValues).await
     }
 
     /// 収集イベントの live 購読。
@@ -299,100 +362,58 @@ impl CollectorService {
     /// 「イベントが流れてこない」＝「走っていない」ではないので、走っているか
     /// どうかは [`Self::state`] を見ること。
     pub fn subscribe_events(&self) -> broadcast::Receiver<CollectEvent> {
-        self.inner.events.subscribe()
+        self.inner.ctx.events.subscribe()
     }
 
-    // --- 操作ロックを持っている前提の実体 --------------------------------
-    //
-    // 引数の `_operation` は使わないが、**呼び出し元が操作ロックを持っている
-    // ことの証拠**として受け取る（このモジュール doc の「ロック順序」）。
+    // --- ライフサイクルタスクへの依頼 ------------------------------------
 
-    async fn start_locked(
+    /// ライフサイクルタスクへのコマンド口。**初回の呼び出しで spawn する** -
+    /// [`Self::new`] は `tauri` の `setup`（tokio ランタイムの外）から呼ばれる
+    /// ので、そこで `tokio::spawn` はできない。ここへ来る経路は全部 `async fn`
+    /// の中なので、必ずランタイムの上にいる。
+    fn commands(&self) -> &mpsc::Sender<Command> {
+        self.inner.commands.get_or_init(|| {
+            let (tx, rx) = mpsc::channel(COMMAND_QUEUE_DEPTH);
+            let lifecycle = Lifecycle {
+                ctx: self.inner.ctx.clone(),
+                collector: None,
+            };
+            tokio::spawn(lifecycle.run(rx));
+            tx
+        })
+    }
+
+    /// `start`/`stop`/`restart` 共通の往復。タスクが居なくなっていたら
+    /// （= panic した。通常は起こらない）**黙って成功にしない**。
+    async fn lifecycle(
         &self,
-        _operation: &AsyncMutexGuard<'_, ()>,
+        make: fn(oneshot::Sender<Result<CollectorState, BantoError>>) -> Command,
     ) -> Result<CollectorState, BantoError> {
-        // 二重起動の防止。操作ロックの中で見ているので、「見た直後に誰かが
-        // 起動していた」は起こらない。
-        if self.inner.collector.lock().await.is_some() {
-            return Ok(self.state());
-        }
-
-        let config = match build_config(&self.inner.pool).await {
-            Ok(config) => config,
-            Err(err) => return Err(self.fail_start(err)),
-        };
-
-        // 「収集対象なし」は **`Collector::start` に渡す前に**分岐する。
-        // 渡すと `CollectError::Config` になり、本物の構成エラー（アドレスが
-        // 解釈できない等）と同じ入れ物に入ってしまう。`group_count() == 0` は
-        // `build_config` が「収集グループを 1 つも持たない接続は計画に入れ
-        // ない」ので、そのまま「接続 0 件」と同値。
-        if config.group_count() == 0 {
-            self.set_state(CollectorState::NoTargets);
-            return Ok(CollectorState::NoTargets);
-        }
-
-        let groups = config.group_count();
-        let tags = config.tag_count();
-        let collector = match Collector::start_with_client_factory(
-            config,
-            &self.inner.data_dir,
-            self.inner.clock.clone(),
-            self.inner.events.clone(),
-            self.inner.options,
-            self.inner.factory.clone(),
-        )
-        .await
-        {
-            Ok(collector) => collector,
-            Err(err) => return Err(self.fail_start(err)),
-        };
-
-        // **成功を確かめてから**状態を上げる（先に Running にして失敗時に
-        // 降ろす、という順序にしない - docs/implementation-checklist.md §6
-        // の「失敗経路での状態の落とし方」）。
-        *self.inner.collector.lock().await = Some(collector);
-        let state = CollectorState::Running { groups, tags };
-        self.set_state(state.clone());
-        Ok(state)
-    }
-
-    async fn stop_locked(
-        &self,
-        _operation: &AsyncMutexGuard<'_, ()>,
-    ) -> Result<CollectorState, BantoError> {
-        let running = self.inner.collector.lock().await.take();
-        let Some(collector) = running else {
-            // 走っていない: **何もしない**。状態も触らない（`NoTargets` /
-            // `StartFailed` の理由を握り潰さないため）。
-            return Ok(self.state());
-        };
-
-        // 止まったことは確定なので、flush の成否に関わらず `Stopped` にする。
-        let result = collector.stop().await;
-        self.set_state(CollectorState::Stopped);
-        match result {
-            Ok(()) => Ok(CollectorState::Stopped),
-            Err(err) => Err(collect_error(err)),
+        match self.request(make).await {
+            Some(result) => result,
+            None => Err(BantoError::Other(
+                "収集サービスの内部タスクが停止しています（アプリを再起動してください）"
+                    .to_string(),
+            )),
         }
     }
 
-    /// 起動の失敗を状態に焼き付けて、同じ理由を `Err` として返す。
-    /// **[`CollectError`] の文言をそのまま捨てない**。
-    fn fail_start(&self, err: CollectError) -> BantoError {
-        let reason = err.to_string();
-        self.set_state(CollectorState::StartFailed {
-            reason: reason.clone(),
-        });
-        collect_error_with_reason(err, reason)
+    /// 読み出し共通の往復。タスクが居ないときは「走っていない」と同じ `None`
+    /// になる - 走っていないのは事実（タスクごと消えているので誰も収集して
+    /// いない）なので、ここは潰していることにならない。
+    async fn readout<T>(&self, make: fn(oneshot::Sender<Option<T>>) -> Command) -> Option<T> {
+        self.request(make).await.flatten()
     }
 
-    fn set_state(&self, state: CollectorState) {
-        *self
-            .inner
-            .state
-            .lock()
-            .expect("collector state lock poisoned") = state;
+    /// コマンドを 1 つ送って応答を待つ。`None` = タスクが居ない / 応答が
+    /// 返らなかった。
+    async fn request<T>(&self, make: fn(oneshot::Sender<T>) -> Command) -> Option<T> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        // ここでキャンセルされた場合（まだ送れていない）は、タスクは依頼を
+        // 知らないまま = 何も起きない。送れた後は、待つのをやめても処理は
+        // 最後まで進む。
+        self.commands().send(make(reply_tx)).await.ok()?;
+        reply_rx.await.ok()
     }
 
     /// テスト専用の組み立て口: 時計・チューニング・クライアント生成口を
@@ -406,6 +427,140 @@ impl CollectorService {
         factory: ClientFactory,
     ) -> Self {
         Self::build(pool, data_dir, Arc::new(SystemClock), options, factory)
+    }
+}
+
+/// 走っている [`Collector`] を**専有する**タスクの中身。
+///
+/// [`CollectorService`] のどのメソッドもここへコマンドを送るだけなので、
+/// `Collector` はこの構造体の外に一度も出ない（`Arc` にも `Mutex` にも
+/// 入っていない）。状態を書くのもここだけ。
+struct Lifecycle {
+    ctx: Arc<CollectorContext>,
+    /// `None` = 走っていない。[`Collector::stop`] が `self` を消費するので
+    /// `Option` + `take()`。
+    collector: Option<Collector>,
+}
+
+impl Lifecycle {
+    /// コマンドを**逐次**処理する。1 つのコマンドを処理している間、次は
+    /// 受け取らない - これが「新しい `start()` が前の `stop()` の完了前に
+    /// 進まない」の全てで、そのためのロックは 1 つも要らない。
+    ///
+    /// [`CollectorService`] が全部 drop されると `Sender` が落ち、この
+    /// ループが抜けてタスクが終わる。そのとき走っている [`Collector`] は
+    /// `stop()` されずに drop される（接続タスクは切り離される）が、これは
+    /// サービスごと捨てられる場面 = プロセス終了時だけで、正規の終了経路は
+    /// `shutdown_app_state` が明示的に [`CollectorService::stop`] を通る。
+    async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
+        while let Some(command) = commands.recv().await {
+            match command {
+                // `send` の `Err`（呼び出し側が待つのをやめた）は捨てる。
+                // **処理そのものはもう終わっている**ので、誰も受け取らなく
+                // ても状態と実体は一致している。
+                Command::Start(reply) => {
+                    let _ = reply.send(self.start().await);
+                }
+                Command::Stop(reply) => {
+                    let _ = reply.send(self.stop().await);
+                }
+                Command::Restart(reply) => {
+                    let _ = reply.send(self.restart().await);
+                }
+                Command::ConnectionStatus(reply) => {
+                    let _ = reply.send(self.collector.as_ref().map(|c| c.status()));
+                }
+                Command::CurrentValues(reply) => {
+                    let _ = reply.send(self.collector.as_ref().map(|c| c.current_values()));
+                }
+            }
+        }
+    }
+
+    async fn start(&mut self) -> Result<CollectorState, BantoError> {
+        // 二重起動の防止。逐次処理なので「見た直後に誰かが起動していた」は
+        // 起こらない。
+        if self.collector.is_some() {
+            return Ok(self.ctx.state());
+        }
+
+        let config = match build_config(&self.ctx.pool).await {
+            Ok(config) => config,
+            Err(err) => return Err(self.fail_start(err)),
+        };
+
+        // 「収集対象なし」は **`Collector::start` に渡す前に**分岐する。
+        // 渡すと `CollectError::Config` になり、本物の構成エラー（アドレスが
+        // 解釈できない等）と同じ入れ物に入ってしまう。**数えるのはタグ** -
+        // `build_config` はタグが空の有効グループも計画に残すので、
+        // `group_count()` では「有効グループ 1・有効タグ 0」を素通りさせて
+        // しまう（#406 レビュー P2。このモジュール doc 参照）。
+        if config.tag_count() == 0 {
+            self.ctx.set_state(CollectorState::NoTargets);
+            return Ok(CollectorState::NoTargets);
+        }
+
+        let groups = config.group_count();
+        let tags = config.tag_count();
+        let collector = match Collector::start_with_client_factory(
+            config,
+            &self.ctx.data_dir,
+            self.ctx.clock.clone(),
+            self.ctx.events.clone(),
+            self.ctx.options,
+            self.ctx.factory.clone(),
+        )
+        .await
+        {
+            Ok(collector) => collector,
+            Err(err) => return Err(self.fail_start(err)),
+        };
+
+        // **成功を確かめてから**状態を上げる（先に Running にして失敗時に
+        // 降ろす、という順序にしない - docs/implementation-checklist.md §6
+        // の「失敗経路での状態の落とし方」）。
+        self.collector = Some(collector);
+        let state = CollectorState::Running { groups, tags };
+        self.ctx.set_state(state.clone());
+        Ok(state)
+    }
+
+    async fn stop(&mut self) -> Result<CollectorState, BantoError> {
+        let Some(collector) = self.collector.take() else {
+            // 走っていない: **何もしない**。状態も触らない（`NoTargets` /
+            // `StartFailed` の理由を握り潰さないため）。
+            return Ok(self.ctx.state());
+        };
+
+        // ここから先は誰にも中断されない（呼び出し側が消えてもこのタスクは
+        // 生きている）ので、`take()` 済み・状態は `Running` のまま、という
+        // 食い違いが残ることはない。
+        let result = collector.stop().await;
+        // 止まったことは確定なので、flush の成否に関わらず `Stopped` にする。
+        self.ctx.set_state(CollectorState::Stopped);
+        match result {
+            Ok(()) => Ok(CollectorState::Stopped),
+            Err(err) => Err(collect_error(err)),
+        }
+    }
+
+    async fn restart(&mut self) -> Result<CollectorState, BantoError> {
+        if let Err(err) = self.stop().await {
+            eprintln!(
+                "banto: 収集の再起動中、停止側の後始末に失敗しました（開始は続行します）: {err}"
+            );
+        }
+        self.start().await
+    }
+
+    /// 起動の失敗を状態に焼き付けて、同じ理由を `Err` として返す。
+    /// **[`CollectError`] の文言をそのまま捨てない**。
+    fn fail_start(&self, err: CollectError) -> BantoError {
+        let reason = err.to_string();
+        self.ctx.set_state(CollectorState::StartFailed {
+            reason: reason.clone(),
+        });
+        collect_error_with_reason(err, reason)
     }
 }
 
@@ -459,7 +614,9 @@ mod tests {
         TagInput, TagService,
     };
     use banto_tstore::WriterOptions;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+    use tokio::sync::Notify;
 
     /// 速い・決定的なチューニング。`banto-collect` の `tests/integration.rs`
     /// の `fast_options` と同じ意図（**テストの中で実時間を待たない**ための
@@ -507,6 +664,82 @@ mod tests {
         Arc::new(|_spec| Box::new(OfflineClient) as Box<dyn PlcClient>)
     }
 
+    /// 停止の途中で**確実に**止まってくれるゲート。接続タスクの graceful
+    /// exit は `client.disconnect().await` を通るので、そこを塞ぐと
+    /// [`Collector::stop`]（接続タスクの join → 最終 flush）が中で止まる。
+    ///
+    /// **1 回だけ**効く（`armed`）: 同じテストの中で立て直した 2 本目の
+    /// エンジンの後始末まで塞ぐと、テストが終われなくなるため。
+    ///
+    /// 実時間は一切待たない - 「入った」も「開けた」も [`Notify`] で
+    /// 待ち合わせる（`notify_one` は待ち手が居なければ permit を溜めるので、
+    /// どちらが先でも取りこぼさない）。
+    struct StopGate {
+        entered: Notify,
+        release: Notify,
+        armed: AtomicBool,
+    }
+
+    impl StopGate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                entered: Notify::new(),
+                release: Notify::new(),
+                armed: AtomicBool::new(true),
+            })
+        }
+
+        /// 偽クライアントの `disconnect` から呼ばれる。
+        async fn pass(&self) {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+        }
+
+        /// 停止処理が「実体の停止」の途中まで進んだことを待つ。
+        async fn wait_entered(&self) {
+            self.entered.notified().await;
+        }
+
+        fn release(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    /// [`OfflineClient`] と同じだが、切断だけ [`StopGate`] を通る。
+    struct GatedClient {
+        gate: Arc<StopGate>,
+    }
+
+    impl PlcClient for GatedClient {
+        fn connect(&mut self) -> BoxFuture<'_, Result<(), PlcError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn read_batch<'a>(
+            &'a mut self,
+            requests: &'a [ReadRequest],
+        ) -> BoxFuture<'a, Result<Vec<ReadResult>, PlcError>> {
+            Box::pin(async move {
+                Ok(requests
+                    .iter()
+                    .map(|_| ReadResult::Value(TagValue::F64(1.0)))
+                    .collect())
+            })
+        }
+
+        fn disconnect(&mut self) -> BoxFuture<'_, ()> {
+            let gate = self.gate.clone();
+            Box::pin(async move { gate.pass().await })
+        }
+    }
+
+    fn gated_factory(gate: &Arc<StopGate>) -> ClientFactory {
+        let gate = gate.clone();
+        Arc::new(move |_spec| Box::new(GatedClient { gate: gate.clone() }) as Box<dyn PlcClient>)
+    }
+
     /// いま溜まっているイベントの種類を全部取り出す（待たない）。
     fn drain(rx: &mut broadcast::Receiver<CollectEvent>) -> Vec<banto_collect::EventKind> {
         let mut kinds = Vec::new();
@@ -538,10 +771,34 @@ mod tests {
         (pool, svc)
     }
 
-    /// 有効な接続 1 / グループ 1 / タグ 1 をレジストリに入れる。
-    /// `address` を呼び出し側が決められるので、「解釈できないアドレス」で
-    /// 構成組み立ての失敗も作れる。
-    async fn seed_one_tag(pool: &SqlitePool, address: &str) {
+    /// [`service`] と同じだが、切断を [`StopGate`] で塞げるサービス。
+    async fn gated_service(dir: &TempDir) -> (SqlitePool, CollectorService, Arc<StopGate>) {
+        let pool = init_db_memory().await.expect("init_db_memory");
+        let gate = StopGate::new();
+        let svc = CollectorService::new_for_test(
+            pool.clone(),
+            dir.path().join("data"),
+            fast_options(),
+            gated_factory(&gate),
+        );
+        (pool, svc, gate)
+    }
+
+    /// 指定した種類のイベントが来るまで待つ。**実時間を待たない**
+    /// （broadcast の受信で待ち合わせるだけ）。
+    async fn wait_for(rx: &mut broadcast::Receiver<CollectEvent>, kind: banto_collect::EventKind) {
+        loop {
+            let event = rx.recv().await.expect("イベント購読が切れた");
+            if event.kind == kind {
+                return;
+            }
+        }
+    }
+
+    /// 有効な接続 1 と、その下の**有効グループ 1**をレジストリに入れる
+    /// （**タグは作らない**）。グループ id を返すので、テストが自分で
+    /// 「タグ 0 件」「無効タグだけ」といった構成を組める。
+    async fn seed_enabled_group(pool: &SqlitePool) -> i64 {
         let conn = PlcConnectionService::new(pool.clone())
             .create(PlcConnectionInput {
                 name: "PLC1".to_string(),
@@ -571,10 +828,17 @@ mod tests {
             })
             .await
             .expect("create collection group");
+        group.id
+    }
+
+    /// [`seed_enabled_group`] のグループにタグを 1 本足す。
+    /// `address` を呼び出し側が決められるので、「解釈できないアドレス」で
+    /// 構成組み立ての失敗も作れる。`enabled` で無効タグも作れる。
+    async fn seed_tag(pool: &SqlitePool, group_id: i64, address: &str, enabled: bool) {
         TagService::new(pool.clone())
             .create(TagInput {
                 name: "T1".to_string(),
-                collection_group_id: group.id,
+                collection_group_id: group_id,
                 address: address.to_string(),
                 data_type: "i16".to_string(),
                 string_length: None,
@@ -589,7 +853,7 @@ mod tests {
                 threshold_hh: None,
                 threshold_l: None,
                 threshold_ll: None,
-                enabled: true,
+                enabled,
                 writable: false,
                 tag_kind: "plc".to_string(),
                 expression: None,
@@ -600,12 +864,18 @@ mod tests {
             .expect("create tag");
     }
 
+    /// 有効な接続 1 / グループ 1 / **有効タグ 1** - 「走る」構成。
+    async fn seed_one_tag(pool: &SqlitePool, address: &str) {
+        let group_id = seed_enabled_group(pool).await;
+        seed_tag(pool, group_id, address, true).await;
+    }
+
     /// **この PR の一番大事な受入条件**: 有効な収集対象が 1 件も無いときは
     /// 「収集対象なし」であって、**エラーではない**。
     ///
-    /// 反証（回帰の検出）: `start_locked` の `group_count() == 0` 分岐を消して
-    /// `Collector::start` の `CollectError::Config` をそのまま返す実装に戻すと、
-    /// `start()` が `Err` を返すのでこのテストは `expect` で落ちる。
+    /// 反証（回帰の検出）: `Lifecycle::start` の `tag_count() == 0` 分岐を
+    /// 消して `Collector::start` の `CollectError::Config` をそのまま返す実装に
+    /// 戻すと、`start()` が `Err` を返すのでこのテストは `expect` で落ちる。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn no_enabled_targets_is_a_state_of_its_own_not_an_error() {
         let dir = TempDir::new();
@@ -619,6 +889,55 @@ mod tests {
         assert_eq!(svc.state(), CollectorState::NoTargets);
         // 「走っていない」ことが読み出し側からも分かる（空に潰さない）。
         assert!(svc.connection_status().await.is_none());
+        assert!(svc.current_values().await.is_none());
+    }
+
+    /// #406 レビュー P2: **接続とグループは有効なのに、タグが 1 本も
+    /// 登録されていない**構成。`build_config` はタグが空の有効グループも計画に
+    /// 残す（`GroupPlan` の `tags`/`requests` が空になるだけ）ので
+    /// `group_count() == 1` / `tag_count() == 0` になり、`group_count` で
+    /// 判定していた頃は **`Running { groups: 1, tags: 0 }` になって PLC へ
+    /// 繋ぎに行き、tstore まで開いていた**。収集する物は 1 つも無い。
+    ///
+    /// 反証（回帰の検出）: 判定を `config.group_count() == 0` に戻すと
+    /// `NoTargets` ではなく `Running { groups: 1, tags: 0 }` が返り、
+    /// `connection_status()` も `Some` になるのでこのテストは落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_enabled_group_with_no_tag_at_all_is_no_targets() {
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+        seed_enabled_group(&pool).await;
+
+        let state = svc.start().await.expect("有効タグ 0 件はエラーではない");
+        assert_eq!(state, CollectorState::NoTargets);
+        assert_eq!(svc.state(), CollectorState::NoTargets);
+        // **収集エンジンを起動していない** = PLC へ繋ぎにも行っていない。
+        assert!(
+            svc.connection_status().await.is_none(),
+            "収集対象が無いのにエンジンが立っている"
+        );
+        assert!(svc.current_values().await.is_none());
+    }
+
+    /// 同上の、**タグは登録されているが全部無効**な場合。`build_config` は
+    /// 無効タグを落とすので、レジストリに行はあっても計画のタグは 0 件になる。
+    ///
+    /// 反証（回帰の検出）: 上と同じ - `group_count()` 判定に戻すと
+    /// `Running { groups: 1, tags: 0 }` になって落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_enabled_group_whose_tags_are_all_disabled_is_no_targets() {
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+        let group_id = seed_enabled_group(&pool).await;
+        seed_tag(&pool, group_id, "40001", false).await;
+
+        let state = svc.start().await.expect("有効タグ 0 件はエラーではない");
+        assert_eq!(state, CollectorState::NoTargets);
+        assert_eq!(svc.state(), CollectorState::NoTargets);
+        assert!(
+            svc.connection_status().await.is_none(),
+            "収集対象が無いのにエンジンが立っている"
+        );
         assert!(svc.current_values().await.is_none());
     }
 
@@ -715,8 +1034,8 @@ mod tests {
         assert!(svc.connection_status().await.is_none());
     }
 
-    /// `start` と `stop` を**同時に**投げても、操作ロックで直列化されるので
-    /// 「半分だけ起動した」状態は残らない - 終わったあとは必ず
+    /// `start` と `stop` を**同時に**投げても、ライフサイクルタスクが逐次
+    /// 処理するので「半分だけ起動した」状態は残らない - 終わったあとは必ず
     /// 「走っている（`Running`）」か「止まっている（`Stopped`）」の
     /// どちらかで、しかも状態と読み出しが一致する。
     ///
@@ -788,6 +1107,131 @@ mod tests {
         );
 
         svc.stop().await.expect("stop");
+    }
+
+    // --- 停止の途中キャンセル（#406 レビュー P2） ------------------------
+
+    /// **この修正の一番大事な受入条件**: `stop()` の呼び出し側が
+    /// 停止処理の途中で消えても、**停止は実体まで完了し、状態と食い違わない**。
+    ///
+    /// 旧実装（サービス側で `AsyncMutex<Option<Collector>>` を `take()` して
+    /// から `collector.stop().await`）では、この瞬間にキャンセルされると
+    /// `collector = None` / 状態 = `Running` のまま**永久に**固定され、
+    /// もう一度 `stop()` を呼んでも「走っていない」分岐に落ちて直せなかった。
+    /// さらに接続タスクの join も最終 flush も行われないままだった。
+    ///
+    /// 実時間は待たない（ゲートは [`Notify`]、完了待ちは読み出しのキュー）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_stop_still_finishes_the_stop() {
+        let dir = TempDir::new();
+        let (pool, svc, gate) = gated_service(&dir).await;
+        seed_one_tag(&pool, "40001").await;
+        let mut rx = svc.subscribe_events();
+
+        svc.start().await.expect("start");
+        // 接続タスクが `Connected` になるまで待つ。そこまで行かないと
+        // graceful exit が `disconnect` を通らず、ゲートに入らない。
+        wait_for(&mut rx, banto_collect::EventKind::PlcConnected).await;
+
+        let stopper = {
+            let svc = svc.clone();
+            tokio::spawn(async move { svc.stop().await })
+        };
+        // 「停止が実体の停止の途中まで進んだ」ことを確かめてから切る
+        // （切るのが早すぎると、そもそも何も始まっていない）。
+        gate.wait_entered().await;
+        stopper.abort();
+        assert!(
+            stopper.await.unwrap_err().is_cancelled(),
+            "呼び出し側は確かにキャンセルされた"
+        );
+
+        gate.release();
+
+        // 読み出しはライフサイクルタスクのキューを通るので、**飛行中の停止が
+        // 終わってから**返る - sleep で待つ必要がない。
+        assert!(
+            svc.connection_status().await.is_none(),
+            "キャンセル後も停止は実体まで完了している"
+        );
+        assert!(svc.current_values().await.is_none());
+        assert_eq!(
+            svc.state(),
+            CollectorState::Stopped,
+            "状態と実体が一致している"
+        );
+
+        let kinds = drain(&mut rx);
+        assert!(
+            kinds.contains(&banto_collect::EventKind::CollectionStopped),
+            "最終 flush まで進んだ（`collection_stopped` は stop の最後に出る）: {kinds:?}"
+        );
+
+        // キャンセルの後にもう一度呼んでも壊れない（冪等のまま）。
+        assert_eq!(
+            svc.stop().await.expect("キャンセル後の stop"),
+            CollectorState::Stopped
+        );
+    }
+
+    /// キャンセルされた `stop()` の**後に投げた `start()` は、その停止が
+    /// 完了するまで進まない**（オーナー指定）。
+    ///
+    /// 証拠はイベントの順序: `collection_stopped` は旧エンジンの最終 flush の
+    /// **後**に出るので、2 本目の `collection_started` がその後ろに来ていれば、
+    /// 新しい起動は確かに前の停止の完了を待っている。
+    ///
+    /// `start` の依頼を**キューに積んでからゲートを開ける**ために、ここだけ
+    /// 内部の [`Command`] を直接送っている（`svc.start()` を別タスクで
+    /// 走らせる書き方だと、依頼が積まれる前にゲートを開けてしまう競争になり、
+    /// テストが「たまたま順番どおり」でも通ってしまう）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_start_queued_after_a_cancelled_stop_waits_for_it() {
+        let dir = TempDir::new();
+        let (pool, svc, gate) = gated_service(&dir).await;
+        seed_one_tag(&pool, "40001").await;
+        let mut rx = svc.subscribe_events();
+
+        svc.start().await.expect("start");
+        wait_for(&mut rx, banto_collect::EventKind::PlcConnected).await;
+
+        let stopper = {
+            let svc = svc.clone();
+            tokio::spawn(async move { svc.stop().await })
+        };
+        gate.wait_entered().await;
+        stopper.abort();
+        let _ = stopper.await;
+
+        // 停止はまだゲートの中。ここで start をキューへ積む。
+        let (reply_tx, reply_rx) = oneshot::channel();
+        svc.commands()
+            .send(Command::Start(reply_tx))
+            .await
+            .map_err(|_| ())
+            .expect("start をキューに積む");
+        gate.release();
+        let state = reply_rx
+            .await
+            .expect("start の応答")
+            .expect("キャンセル後の start");
+        assert_eq!(state, CollectorState::Running { groups: 1, tags: 1 });
+
+        let kinds = drain(&mut rx);
+        let stopped = kinds
+            .iter()
+            .position(|k| *k == banto_collect::EventKind::CollectionStopped)
+            .unwrap_or_else(|| panic!("前の停止が完了していない: {kinds:?}"));
+        let started = kinds
+            .iter()
+            .position(|k| *k == banto_collect::EventKind::CollectionStarted)
+            .unwrap_or_else(|| panic!("新しい起動が見当たらない: {kinds:?}"));
+        assert!(
+            stopped < started,
+            "新しい start が、前の stop の完了を待たずに進んだ: {kinds:?}"
+        );
+
+        svc.stop().await.expect("後始末の stop");
     }
 
     /// `subscribe_events()` は start/stop をまたいで生き続ける
