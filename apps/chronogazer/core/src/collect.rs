@@ -312,6 +312,43 @@
 //! 正しく畳めるが、操作にはその逃げ道が無い（停止は実行されなければ
 //! ならない）。
 //!
+//! # タスクが居ないことを「走っていない」と答えない（#408 レビュー）
+//!
+//! [`Readout::NotRunning`] を返してよいのは「**状態を見て、走っていないと
+//! 分かった**」ときだけ - [`Lifecycle`] タスクが実際に `collector` を見て
+//! 「持っていない」と答えた場合である。**タスクが居なくなっていた**
+//! （チャネルが閉じている / 応答の送信側が drop された = タスクが panic した）
+//! ときは、C-3a では `None` に潰して `NotRunning` と答えていたが、これは
+//! **二重に嘘になりうる**（オーナー判断）:
+//!
+//! 1. **[`CollectorService::state`] と食い違う。** 状態は**葉**
+//!    （[`CollectorContext::published`]）から読むので、タスクが panic しても
+//!    **最後に公開された状態（たとえば `running`）を返し続ける**。同じ画面に
+//!    「状態: 動作中」と「接続状態: 走っていません」が並ぶことになる。
+//! 2. **実際に収集が続いている公算が大きい。** `banto-collect` の
+//!    [`Collector`] には **`Drop` 実装が無い**（`crates/banto-collect` 唯一の
+//!    `impl Drop` はテスト用の `TempDir`）。タスクが panic して [`Collector`] が
+//!    drop されても、`Collector::start` が spawn した**接続タスクは止まらない** -
+//!    保持しているのは `JoinHandle`（drop は detach であって abort ではない）
+//!    と停止合図の `watch::Sender<bool>` で、後者が drop されても値は `false`
+//!    のままなので、受信側の停止条件（`*stop_rx.borrow()` が `true`）は成立
+//!    しない。つまり「誰も収集していない」は事実とは限らない。
+//!
+//! **[`Readout::Unavailable`]（走ってはいるが、この 1 回が読めなかった）が
+//! この状況を正しく言い表している。** 判定材料が無いときに「止まっている」側へ
+//! 倒さない、というのは #387 の `KeyOutcome::Undetermined` で採った規律と同じ
+//! （docs/implementation-checklist.md §5）。
+//!
+//! **読み出しの 3 つの口のうち、この分岐があるのは接続状態だけ**である:
+//! 現在値（[`CollectorService::values`]）は葉を読むので判定が
+//! [`CollectorContext::published`] そのもの（タスクの生死に左右されない）、
+//! イベント一覧（[`CollectorService::events`]）はそもそも `NotRunning` を
+//! 返さず、読めなければ既に [`Readout::Unavailable`]。
+//!
+//! `crates/` は**変更しない** - `Drop` が無いことは**事実として参照している
+//! だけ**で、接続タスクを道連れにする設計にすべきかは `banto-collect` 側の
+//! 別の判断（このアプリが先取りしない）。
+//!
 //! # 公開用の型 - 何を載せ、何を落としたか
 //!
 //! [`CollectorStateView`] と同じ考え方（#407 レビュー P2-2）で、**`banto-collect`
@@ -728,6 +765,12 @@ impl CollectOutcome {
 pub enum Readout<T> {
     /// 収集が走っていない（停止中 / [`CollectorState::NoTargets`] /
     /// [`CollectorState::StartFailed`]）。**0 件ではない。**
+    ///
+    /// **これを返してよいのは「状態を見て、走っていないと分かった」とき
+    /// だけ**（#408 レビュー）。読み取りの仕組みが壊れていて**判定できな
+    /// かった**ときは [`Self::Unavailable`] - 「分からない」を「止まって
+    /// いる」側へ倒さない（このモジュールの doc「タスクが居ないことを
+    /// 「走っていない」と答えない」）。
     NotRunning,
     /// 走ってはいるが、**この 1 回が読めなかった** -
     /// [`COLLECT_READ_TIMEOUT`] で打ち切った、または DB が読めなかった。
@@ -1451,12 +1494,15 @@ impl CollectorService {
 
     /// 接続ごとの状態のスナップショット（**内部型のまま**）。
     ///
-    /// * [`Readout::NotRunning`] - 走っていない（ライフサイクルタスクが居ない
-    ///   場合も含む。誰も収集していないのは事実）。空の `HashMap` を返して
-    ///   「接続 0 件」と混同させない（docs/implementation-checklist.md §5）。
+    /// * [`Readout::NotRunning`] - **タスクが「走っていない」と答えた**場合
+    ///   だけ。空の `HashMap` を返して「接続 0 件」と混同させない
+    ///   （docs/implementation-checklist.md §5）。
     /// * [`Readout::Unavailable`] - **読み取り用キューに枠が無かった**
-    ///   （待たずに即決）、または [`COLLECT_READ_TIMEOUT`] までに答えが
-    ///   返らなかった。
+    ///   （待たずに即決）、[`COLLECT_READ_TIMEOUT`] までに答えが返らなかった、
+    ///   または**ライフサイクルタスクが居なくなっていた**（チャネルが閉じて
+    ///   いる / 応答の送信側が drop された）。最後のものを「走っていない」に
+    ///   しないのが #408 レビューの直し - 理由はこのモジュールの doc
+    ///   「タスクが居ないことを『走っていない』と答えない」。
     /// * [`Readout::Ready`] - 答えが返った（0 件を含む）。
     ///
     /// ライフサイクルタスクに問い合わせるので、返るのは必ず「どれかの操作と
@@ -1480,15 +1526,19 @@ impl CollectorService {
             // 枠が無い = 直前の読み取りがまだ取り出されていない
             // （タスクが長い操作を抱えている）。**待たない。**
             Err(mpsc::error::TrySendError::Full(_)) => return Readout::Unavailable,
-            // タスクが居ない（= panic した。通常は起こらない）。誰も収集して
-            // いないのは事実なので「走っていない」でよい - ここは C-3a と同じ。
-            Err(mpsc::error::TrySendError::Closed(_)) => return Readout::NotRunning,
+            // タスクが居ない（= panic した。通常は起こらない）。**「走って
+            // いない」とは答えない** - 収集が止まった確証が無いどころか、
+            // 接続タスクは生き残っている公算が大きい（このモジュールの doc
+            // 「タスクが居ないことを「走っていない」と答えない」）。
+            Err(mpsc::error::TrySendError::Closed(_)) => return Readout::Unavailable,
         }
         match tokio::time::timeout(COLLECT_READ_TIMEOUT, reply_rx).await {
+            // **`NotRunning` を返すのはここだけ** - タスクが実際に
+            // `self.collector` を見て「持っていない」と答えた場合。
             Ok(Ok(Some(statuses))) => Readout::Ready { data: statuses },
             Ok(Ok(None)) => Readout::NotRunning,
-            // 応答の送信側が落ちた = タスクが居なくなった（上と同じ）。
-            Ok(Err(_reply_dropped)) => Readout::NotRunning,
+            // 応答の送信側が落ちた = タスクが居なくなった（上と同じ扱い）。
+            Ok(Err(_reply_dropped)) => Readout::Unavailable,
             // 打ち切ったのは**この 1 回の待ち**だけ。依頼はキューに残って
             // いて、タスクが手空きになれば処理される（誰も受け取らないだけ）。
             // **枠が空くのはそのとき**で、ここでは返さない。
@@ -1715,6 +1765,44 @@ impl CollectorService {
         factory: ClientFactory,
     ) -> Self {
         Self::build(pool, data_dir, Arc::new(SystemClock), options, factory)
+    }
+
+    /// **テスト専用**: [`Lifecycle`] タスクが**居なくなった**状態
+    /// （= タスクが panic した後）を作る。2 本のチャネルを自前で作って
+    /// **受信側だけ落とし**、送信側を [`CollectorInner::channels`] に
+    /// 入れてしまうので、以降の `try_send` / `send_timeout` は必ず
+    /// `Closed` になる。
+    ///
+    /// **タスクを spawn して本当に panic させる形は採らない**: そのためには
+    /// panic する分岐を製品コードに用意することになり、`#[cfg(test)]` の
+    /// 有無に関わらず「panic させる口」が増える。ここで再現したいのは
+    /// 「**送信口は生きているが、受け手が居ない**」という観測可能な状態
+    /// そのものなので、チャネルの形で直接作るのが最小。
+    ///
+    /// 葉（[`CollectorContext::published`]）には**何も書かない** - 呼び出し側の
+    /// テストが「タスクが消える直前の状態」を自分で公開する。
+    #[cfg(test)]
+    fn new_for_test_without_lifecycle_task(
+        pool: SqlitePool,
+        data_dir: PathBuf,
+        options: CollectorOptions,
+        factory: ClientFactory,
+    ) -> Self {
+        let svc = Self::build(pool, data_dir, Arc::new(SystemClock), options, factory);
+        let (commands, command_rx) = mpsc::channel(COMMAND_QUEUE_DEPTH);
+        let (reads, read_rx) = mpsc::channel(READ_QUEUE_DEPTH);
+        // **受け手を落とす** = タスクが消えた、と同じ観測になる。
+        drop(command_rx);
+        drop(read_rx);
+        if svc
+            .inner
+            .channels
+            .set(Channels { commands, reads })
+            .is_err()
+        {
+            panic!("組み立て直後なのにチャネルが既に入っている");
+        }
+        svc
     }
 
     /// [`Self::new_for_test`] と同じだが、起動処理を [`StartGate`] で
@@ -1956,13 +2044,15 @@ fn values_readout(
     }
 }
 
-/// 接続状態の同じ言い分け（**純関数**）。`None` = 走っていない
-/// （ライフサイクルタスクが居ない場合も含む - 誰も収集していないのは事実）、
-/// `Some(空)` = 走っているが接続タスクがまだ 1 件も状態を書いていない。
+/// 接続状態の同じ言い分け（**純関数**）。`None` = **タスクが「走っていない」と
+/// 答えた**、`Some(空)` = 走っているが接続タスクがまだ 1 件も状態を書いて
+/// いない。
 ///
-/// **打ち切り（[`Readout::Unavailable`]）はここには来ない** - 上限を掛けるのは
-/// [`CollectorService::connections`] の側で、ここは「答えが返ってきた」あとの
-/// 言い分けだけを担う。
+/// **「読めなかった」はここには来ない** - 打ち切りも**タスクが居ない**場合も
+/// [`CollectorService::connection_status`] の側で [`Readout::Unavailable`] に
+/// なる（#408 レビュー。このモジュールの doc「タスクが居ないことを「走って
+/// いない」と答えない」）。ここは「**答えが返ってきた**」あとの言い分けだけを
+/// 担う。
 fn connections_readout(
     status: Option<HashMap<String, ConnectionStatus>>,
 ) -> Readout<HashMap<String, ConnectionStatusView>> {
@@ -2987,6 +3077,61 @@ mod tests {
             svc.state(),
             CollectorState::Stopped,
             "受け付けた停止が実行されていない"
+        );
+    }
+
+    /// **#408 レビュー（オーナー判断）の受入条件**: ライフサイクルタスクが
+    /// 居ない（チャネルが閉じた）状態の読み取りは **「読めなかった」**
+    /// であって、**「走っていない」ではない**。
+    ///
+    /// 足場は「タスクが panic した直後」の観測を作る
+    /// （[`CollectorService::new_for_test_without_lifecycle_task`]）。葉には
+    /// **`Running` を公開したまま**にしておく - タスクが消えても葉は最後に
+    /// 公開された状態を返し続けるので、これが実際に起こる姿。
+    ///
+    /// ここで `NotRunning` と答えると**二重に嘘になる**（このモジュールの doc
+    /// 「タスクが居ないことを「走っていない」と答えない」）:
+    ///
+    /// 1. 同じ画面に「状態: 動作中」（[`CollectorService::state_view`]）と
+    ///    「接続状態: 走っていません」が並ぶ、
+    /// 2. [`Collector`] に `Drop` が無く、接続タスクは止まらないので、
+    ///    **収集は実際には続いている公算が大きい**。
+    ///
+    /// 反証（回帰の検出）: [`CollectorService::connection_status`] の
+    /// `TrySendError::Closed` 分岐を `Readout::NotRunning` に戻すと、
+    /// 2 つ目の `assert_eq!` が落ちる。
+    #[tokio::test]
+    async fn a_read_with_no_lifecycle_task_says_unreadable_not_not_running() {
+        let dir = TempDir::new();
+        let pool = init_db_memory().await.expect("init_db_memory");
+        let svc = CollectorService::new_for_test_without_lifecycle_task(
+            pool.clone(),
+            dir.path().join("data"),
+            fast_options(),
+            offline_factory(),
+        );
+        // タスクが消える直前に公開されていた状態。葉はこれを返し続ける。
+        svc.inner
+            .ctx
+            .publish(CollectorState::Running { groups: 1, tags: 1 }, None);
+
+        assert_eq!(
+            svc.state_view(),
+            CollectorStateView::Running { groups: 1, tags: 1 },
+            "葉は最後に公開された状態を返し続けるはず（前提）"
+        );
+
+        let connections = svc.connections().await;
+        assert_eq!(
+            connections,
+            Readout::Unavailable,
+            "タスクが居ないことを「走っていません」と言い切っている（状態表示と食い違い、\
+             かつ接続タスクは止まっていない）: {connections:?}"
+        );
+        assert_ne!(
+            connections.as_str(),
+            "notRunning",
+            "「判定できなかった」を「止まっている」側へ倒している"
         );
     }
 
