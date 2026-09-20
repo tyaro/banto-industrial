@@ -27,9 +27,11 @@ use banto_server::{
 use chronogazer_core::assets::FrontendAssets;
 use chronogazer_core::audit::{AuditEntry, AuditLogEntry, AuditLogService};
 use chronogazer_core::backup::{BackupInfo, BackupService, PendingRestoreInfo};
-// #383 段階2b / R1-C（C-1）: 収集サービス。この PR ではコマンドを生やさず、
-// `AppState` に載せて**終了時に止める**だけ（開始は C-2）。
-use chronogazer_core::collect::{resolve_data_dir, CollectorService};
+// #383 段階2b / R1-C: 収集サービス。C-2 で `collect_*` コマンドと起動時の
+// 自動開始を足した（監査の `resource` は REST と共有の定数）。
+use chronogazer_core::collect::{
+    resolve_data_dir, CollectOutcome, CollectorService, CollectorState, COLLECT_AUDIT_RESOURCE,
+};
 use chronogazer_core::db::init_db;
 use chronogazer_core::events::event_channel;
 use chronogazer_core::hub::{HubService, HubSubscriptionView, HubView};
@@ -119,12 +121,12 @@ struct AppState {
     plc_connections: PlcConnectionService,
     collection_groups: CollectionGroupService,
     tags: TagService,
-    /// #383 段階2b / R1-C（C-1）: 収集ランタイム。**この PR では誰も
-    /// `start()` を呼ばない**（自動開始も操作コマンドも C-2）- ここに置いて
-    /// あるのは、[`shutdown_app_state`] が終了時に確実に止められるように
-    /// するため。収集は「PLC から読んで tstore に書く」側なので、Tauri の
-    /// managed state が drop されないこのアプリでは、終了フックが唯一の
-    /// 「止める場所」になる。
+    /// #383 段階2b / R1-C: 収集ランタイム。**起動時に自動開始**し
+    /// （`setup()` が `CollectorService::autostart` を spawn する）、
+    /// `collect_*` コマンドと LAN ブラウザの `/api/collect*` が同じ実体を
+    /// 操作する。収集は「PLC から読んで tstore に書く」側なので、Tauri の
+    /// managed state が drop されないこのアプリでは、[`shutdown_app_state`]
+    /// が唯一の「止める場所」になる。
     collect: CollectorService,
     /// The one SQLite pool every service above is a `Clone` handle onto,
     /// kept here solely so [`shutdown_app_state`] can `close()` it when the
@@ -664,6 +666,10 @@ async fn start_embedded_server(
     plc_connections: PlcConnectionService,
     collection_groups: CollectionGroupService,
     tags: TagService,
+    // #383 段階2b / R1-C（C-2）: 収集ランタイム。デスクトップの `collect_*`
+    // コマンドと LAN ブラウザの `/api/collect*` が**同じ実体**を操作する
+    // ように、`hub` と同じく `AppState` のハンドルをそのまま渡す。
+    collect: CollectorService,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
     config: ServerConfig,
@@ -681,6 +687,7 @@ async fn start_embedded_server(
         plc_connections,
         collection_groups,
         tags,
+        collect,
         auth,
         events,
         false,
@@ -736,6 +743,7 @@ async fn server_apply(
                 state.plc_connections.clone(),
                 state.collection_groups.clone(),
                 state.tags.clone(),
+                state.collect.clone(),
                 state.rest_auth.clone(),
                 state.events.clone(),
                 ServerConfig {
@@ -1787,6 +1795,131 @@ async fn hub_disconnect(state: State<'_, AppState>) -> Result<HubView, BantoErro
     Ok(view)
 }
 
+// --- #383 段階2b / R1-C（C-2）: 収集の操作 -----------------------------------
+
+/// Role check shared by every `collect_*` command. **`editor` 以上**（`admin`
+/// ではない）で、`chronogazer_core::rest` の `collect_router` に掛かっている
+/// `RoleGuard { min: Role::Editor, resource: COLLECT_AUDIT_RESOURCE, .. }` と
+/// **同じ下限・同じ resource**。
+///
+/// **根拠**: `docs/recorder-requirements.md` §3.6「収集の開始/停止は editor
+/// 以上」と、そこに追記された **2026-09-18 のオーナー決定** - 「banto-hub は
+/// 同種の制御（自動書き込みエンジンの arm/disarm 等）を admin 限定にして
+/// いるが、chronogazer は別プロダクトであり R0 本文のこの決定を継承する。
+/// **banto-hub の先例に引きずられて admin 限定へ変更しない**」。すぐ上の
+/// [`require_hub_admin`] が `admin` なのは **Hub の接続設定**（キーの発行・
+/// 保存）だからで、収集の起動停止とは別の話。
+///
+/// 拒否の `resource` は [`COLLECT_AUDIT_RESOURCE`]、つまり **REST と同じ
+/// 定数**。`hub_*` では REST=`"hub"` / Tauri=`"settings"` と割れていて
+/// （#397 P2-D）「hub への拒否だけ抽出する」フィルタが片方を取りこぼした
+/// ので、ここは最初から 1 つの定数を両方から参照して割れようがなくして
+/// ある。**成功側の `resource` も同じ `"collect"`** - `hub_*` に残っている
+/// 「拒否は hub・成功は settings」という非対称を新しい資源に持ち込まない。
+///
+/// 7 つの `hub_*` が [`require_hub_admin`] を通るのと同じく、**4 つの
+/// `collect_*` は全部ここを通る**（読み取りの `collect_status` も含む） -
+/// 拒否の記録箇所を 1 か所に保つため。
+async fn require_collect_editor(state: &AppState) -> Result<UserIdentity, BantoError> {
+    require_role(state, Role::Editor, COLLECT_AUDIT_RESOURCE).await
+}
+
+/// 成功した収集操作を監査に 1 本記録する（`collect_*` 共通）。`detail` は
+/// **結果の状態と `pending` だけ** - 接続先・ファイルパス・
+/// `CollectorState::StartFailed` の理由といった内部の詳細は入れない
+/// （`CollectorState::as_str` の doc）。`chronogazer_core::rest` の
+/// `record_collect_operation` と対で、`origin` だけが違う。
+async fn record_collect_operation(
+    state: &AppState,
+    actor: &UserIdentity,
+    action: &'static str,
+    outcome: &CollectOutcome,
+) {
+    state
+        .audit
+        .record(AuditEntry {
+            actor_username: Some(&actor.username),
+            actor_role: Some(actor.role.as_str()),
+            action,
+            resource: COLLECT_AUDIT_RESOURCE,
+            entity_id: None,
+            detail: Some(serde_json::json!({
+                "collectState": outcome.status.as_str(),
+                "pending": outcome.pending,
+            })),
+            origin: "tauri",
+            result: "ok",
+        })
+        .await;
+}
+
+/// `GET`-ish command: 収集の現在の状態。`editor` 以上。
+///
+/// **ネットワークもディスクも DB も触らない**（メモリ上の状態を読むだけ）
+/// ので、画面はこれをポーリングしてよい。読み取りなので監査しない。
+/// Body of [`collect_status`]（spec M14 split-function pattern: コマンド本体を
+/// 合成 [`AppState`] に対して単体テストできるようにする）。
+async fn collect_status_body(state: &AppState) -> Result<CollectorState, BantoError> {
+    require_collect_editor(state).await?;
+    Ok(state.collect.state())
+}
+
+#[tauri::command]
+async fn collect_status(state: State<'_, AppState>) -> Result<CollectorState, BantoError> {
+    collect_status_body(&state).await
+}
+
+/// 収集の開始。`editor` 以上。
+///
+/// **`CollectOutcome::pending` は「失敗」ではない** - 上限
+/// （`chronogazer_core::collect::COLLECT_OPERATION_TIMEOUT`）で待つのを
+/// やめただけで、開始処理はアプリ側で続いている。画面は「失敗しました」では
+/// なく「まだ終わっていません」と出し、続きは `collect_status` で追うこと
+/// （#400 で確立した言い分けと同じ）。
+/// Body of [`collect_start`]（spec M14 split-function pattern）。
+async fn collect_start_body(state: &AppState) -> Result<CollectOutcome, BantoError> {
+    let actor = require_collect_editor(state).await?;
+    let outcome = state.collect.start().await?;
+    record_collect_operation(state, &actor, "start", &outcome).await;
+    Ok(outcome)
+}
+
+#[tauri::command]
+async fn collect_start(state: State<'_, AppState>) -> Result<CollectOutcome, BantoError> {
+    collect_start_body(&state).await
+}
+
+/// 収集の停止。`editor` 以上。走っていなければ何もしない（冪等）。
+/// Body of [`collect_stop`]（spec M14 split-function pattern）。
+async fn collect_stop_body(state: &AppState) -> Result<CollectOutcome, BantoError> {
+    let actor = require_collect_editor(state).await?;
+    let outcome = state.collect.stop().await?;
+    record_collect_operation(state, &actor, "stop", &outcome).await;
+    Ok(outcome)
+}
+
+#[tauri::command]
+async fn collect_stop(state: State<'_, AppState>) -> Result<CollectOutcome, BantoError> {
+    collect_stop_body(&state).await
+}
+
+/// 収集の再起動。`editor` 以上。**レジストリ（PLC接続・収集グループ・タグ）の
+/// 変更を収集へ反映する唯一の口**で、CRUD コマンドが自動でこれを呼ぶことは
+/// しない - 理由は `chronogazer_core::collect` のモジュール doc
+/// 「起動時の自動開始と、「収集を再起動」だけが反映の口であること」。
+/// Body of [`collect_restart`]（spec M14 split-function pattern）。
+async fn collect_restart_body(state: &AppState) -> Result<CollectOutcome, BantoError> {
+    let actor = require_collect_editor(state).await?;
+    let outcome = state.collect.restart().await?;
+    record_collect_operation(state, &actor, "restart", &outcome).await;
+    Ok(outcome)
+}
+
+#[tauri::command]
+async fn collect_restart(state: State<'_, AppState>) -> Result<CollectOutcome, BantoError> {
+    collect_restart_body(&state).await
+}
+
 /// How long [`shutdown_app_state`] is allowed to take in total before the
 /// app gives up and exits anyway (#383 R1-C's prerequisite).
 ///
@@ -1872,9 +2005,13 @@ async fn shutdown_app_state(state: &AppState) {
 
         // #383 段階2b / R1-C: 収集（書き手）は消費者の後・DB の前 - 順序の
         // 理由はこの関数の doc。走っていなければ `stop()` は何もしない
-        // （冪等）ので、この PR のように誰も `start()` を呼ばないうちは
-        // ここは実質 no-op。失敗しても終了は止めない（失われうるのは
-        // tstore の最後の未 flush 分だけで、固まる方が悪い）。
+        // （冪等）。失敗しても終了は止めない（失われうるのは tstore の
+        // 最後の未 flush 分だけで、固まる方が悪い）。
+        //
+        // `CollectOutcome::pending`（`stop()` 自身の上限
+        // `COLLECT_OPERATION_TIMEOUT` = 30 秒）は**ここでは見ない**:
+        // それより短い [`EXIT_CLEANUP_BUDGET`]（5 秒）が必ず先に切れて
+        // 上のメッセージを出すので、この経路で `pending` が立つことはない。
         if let Err(err) = state.collect.stop().await {
             eprintln!("banto: 終了時の収集の停止に失敗しました: {err}");
         }
@@ -1933,15 +2070,16 @@ pub fn run() {
             let plc_connections = PlcConnectionService::new(pool.clone());
             let collection_groups = CollectionGroupService::new(pool.clone());
             let tags = TagService::new(pool.clone());
-            // #383 段階2b / R1-C（C-1）: 収集ランタイム。`data.dir` は設定
-            // から読み、**相対パスはこのアプリのデータディレクトリ基準**で
-            // 解決する（既定 `"./data"` をそのまま使うと、プロセスの作業
-            // ディレクトリという当てにならない場所に時系列ファイルを作って
-            // しまう）。`retention.days` はここでは読まない - **この PR は
-            // ファイルを一切削除しない**（`chronogazer_core::settings::StoreSettings`
-            // の doc 参照）。
+            // #383 段階2b / R1-C: 収集ランタイム。`data.dir` は設定から読み、
+            // **相対パスはこのアプリのデータディレクトリ基準**で解決する
+            // （既定 `"./data"` をそのまま使うと、プロセスの作業ディレクトリ
+            // という当てにならない場所に時系列ファイルを作ってしまう）。
+            // `retention.days` はここでは読まない - **収集はファイルを一切
+            // 削除しない**（`chronogazer_core::settings::StoreSettings` の
+            // doc 参照）。
             //
-            // ここでは**起動しない**。`start()` を呼ぶのは C-2。
+            // 開始は下の `autostart` まで待つ（`AppState` の他の材料が
+            // 揃ってから、ランタイムの上で spawn したいため）。
             let store_settings = tauri::async_runtime::block_on(settings.store_config())
                 .expect("store_config should succeed");
             let collect = CollectorService::new(
@@ -2139,6 +2277,26 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move { hub.resume().await });
             }
 
+            // #383 段階2b / R1-C（C-2）: 収集の**起動時の自動開始**
+            // （docs/r1-plan.md の R1-C「起動時に build_config → start」）。
+            // すぐ上の `hub.resume()` と同じ形 - **spawn して投げっぱなし**に
+            // するので、tstore を開くのに手間取っても起動画面が待たされず、
+            // **失敗しても起動は止まらない**（理由は状態に残り、
+            // `collect_status` から見える。収集対象 0 件は失敗ではない）。
+            //
+            // **レジストリを後から編集しても自動では再起動しない** - 反映は
+            // 明示的な `collect_restart` だけ（理由は
+            // `chronogazer_core::collect` のモジュール doc）。
+            //
+            // **注意**: このアプリと `banto-serve` を同時に起動して同じ
+            // `data.dir` を指すと二重書き込みになる（防止機構は未実装 -
+            // 同モジュール doc「同じ `data.dir` を 2 つのプロセスで
+            // 開かないこと」）。
+            {
+                let collect = collect.clone();
+                tauri::async_runtime::spawn(async move { collect.autostart().await });
+            }
+
             // If LAN access was left enabled on a previous run, start the
             // server immediately (spec §11.4) - from here on, the settings
             // screen only needs to *change* state via `server_apply`.
@@ -2174,6 +2332,7 @@ pub fn run() {
                     plc_connections.clone(),
                     collection_groups.clone(),
                     tags.clone(),
+                    collect.clone(),
                     rest_auth.clone(),
                     events.clone(),
                     runtime_config,
@@ -2303,6 +2462,10 @@ pub fn run() {
             tags_create,
             tags_update,
             tags_delete,
+            collect_status,
+            collect_start,
+            collect_stop,
+            collect_restart,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -2775,5 +2938,131 @@ mod tests {
             "a permitted call must not record a denial: {:?}",
             audit.rows
         );
+    }
+
+    // --- #383 段階2b / R1-C（C-2）: 収集の操作 -------------------------------
+
+    /// 収集の操作は **`editor` 以上**（`admin` ではない） -
+    /// docs/recorder-requirements.md §3.6 と 2026-09-18 のオーナー決定
+    /// （[`require_collect_editor`] の doc）。viewer は拒否され、その拒否が
+    /// **`resource: "collect"`** で残る - REST の `collect_router`
+    /// （`RoleGuard { resource: COLLECT_AUDIT_RESOURCE, .. }`）と**同じ綴り**
+    /// であることを、`chronogazer_core::rest` 側の双子のテストと合わせて
+    /// 両経路で固定する（#397 P2-D の再発防止）。
+    ///
+    /// 4 つの `collect_*` は全部 [`require_collect_editor`] を通るので、
+    /// ここを押さえれば全部の呼び出し口が決まる（`hub_*` と同じ構造）。
+    ///
+    /// 反証（回帰の検出）: `require_collect_editor` の下限を `Role::Admin` に
+    /// すると editor の側が落ちる。`resource` を `"settings"` 等に変えると
+    /// 綴りの `assert_eq!` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collect_commands_require_editor_and_record_denials_under_the_collect_resource() {
+        let state = app_state().await;
+        let viewer = state
+            .users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create_user");
+        state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create_user");
+
+        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+        let err = collect_start_body(&state)
+            .await
+            .expect_err("a viewer must not operate collection");
+        assert!(matches!(err, BantoError::Forbidden));
+        // 読み取りも同じ下限（拒否の記録箇所を 1 つに保つため）。
+        assert!(matches!(
+            collect_status_body(&state)
+                .await
+                .expect_err("a viewer must not read the collection state either"),
+            BantoError::Forbidden
+        ));
+
+        let audit = state
+            .audit
+            .list(ListParams::default())
+            .await
+            .expect("audit list");
+        let denials: Vec<_> = audit.rows.iter().filter(|r| r.action == "denied").collect();
+        assert_eq!(denials.len(), 2, "拒否が記録されていない: {:?}", audit.rows);
+        for entry in denials {
+            assert_eq!(
+                entry.resource, "collect",
+                "denials must be tagged like REST's collect_router"
+            );
+            assert_eq!(entry.actor_username.as_deref(), Some("viewer"));
+            assert_eq!(entry.origin, "tauri");
+            assert_eq!(entry.result, "denied");
+        }
+
+        // editor は通る - `admin` へ引き上げていないこと。
+        let editor = state
+            .users
+            .get_by_username("editor")
+            .await
+            .expect("get_by_username")
+            .expect("editor exists");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+        require_collect_editor(&state)
+            .await
+            .expect("an editor must pass the collect guard");
+    }
+
+    /// **収集対象 0 件で `collect_start` を呼んでもエラーにならない**
+    /// （`NoTargets` が返る）。あわせて、**成功時の監査**が
+    /// 「操作者 + 結果の状態」で残ることと、`resource` が拒否と同じ
+    /// `"collect"` であることを固定する。
+    ///
+    /// 反証（回帰の検出）: `collect_start_body` の
+    /// `record_collect_operation` を消すと `expect` が落ちる。`resource` を
+    /// `"settings"`（`hub_*` の成功側と同じ非対称）に変えても落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collect_start_with_no_targets_is_ok_and_audited() {
+        let state = app_state().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create_user");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+
+        let outcome = collect_start_body(&state)
+            .await
+            .expect("収集対象 0 件は「エラー」ではない");
+        assert_eq!(outcome.status, CollectorState::NoTargets);
+        assert!(
+            !outcome.pending,
+            "上限に掛かっていないのに pending: {outcome:?}"
+        );
+        assert_eq!(
+            collect_status_body(&state).await.expect("collect_status"),
+            CollectorState::NoTargets
+        );
+
+        let audit = state
+            .audit
+            .list(ListParams::default())
+            .await
+            .expect("audit list");
+        let entry = audit
+            .rows
+            .iter()
+            .find(|r| r.action == "start")
+            .unwrap_or_else(|| panic!("expected a start entry, got {:?}", audit.rows));
+        assert_eq!(entry.resource, "collect");
+        assert_eq!(entry.actor_username.as_deref(), Some("editor"));
+        assert_eq!(entry.actor_role.as_deref(), Some("editor"));
+        assert_eq!(entry.origin, "tauri");
+        assert_eq!(entry.result, "ok");
+        let detail: serde_json::Value =
+            serde_json::from_str(entry.detail.as_deref().expect("detail が空"))
+                .expect("detail は JSON");
+        assert_eq!(detail["collectState"], "noTargets");
+        assert_eq!(detail["pending"], false);
     }
 }

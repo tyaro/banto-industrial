@@ -33,6 +33,11 @@ use banto_server::{lan_urls, start, static_router, AuthState, ServerConfig};
 use chronogazer_core::assets::FrontendAssets;
 use chronogazer_core::audit::{AuditEntry, AuditLogService};
 use chronogazer_core::backup::BackupService;
+// #383 段階2b / R1-C（C-2）: 収集ランタイム。この単体サーバーも
+// デスクトップアプリと同じく**起動時に自動開始**する（`api_router` に
+// `/api/collect*` を生やす以上、ここを配線しないと「呼べるが何も走って
+// いない」口になる）。
+use chronogazer_core::collect::{resolve_data_dir, CollectorService};
 use chronogazer_core::db::init_db;
 use chronogazer_core::events::event_channel;
 use chronogazer_core::hub::{HubService, UnavailableKeyStore};
@@ -83,7 +88,10 @@ async fn main() {
     let events = event_channel();
     let users = UsersService::new(pool.clone());
     let settings = SettingsService::new(pool.clone());
-    let backup = BackupService::new(db_path_buf, pool.clone());
+    let backup = BackupService::new(db_path_buf.clone(), pool.clone());
+    // #383 段階2b / R1-C（C-2）: 収集サービス用の pool ハンドル。`audit` が
+    // 下で `pool` を消費するので、その前に取っておく。
+    let pool_for_collect = pool.clone();
     // #383 段階2a / R1-B: レジストリ3サービス。`*Service::new(pool.clone())`
     // の3行（指示書どおり）- テーブルは `db::init_db` が呼ぶ
     // `banto_tags::migrate` で既に作成済み。
@@ -156,6 +164,41 @@ async fn main() {
         tokio::spawn(async move { hub.resume().await });
     }
 
+    // #383 段階2b / R1-C（C-2）: 収集ランタイム。`data.dir` の相対パスは
+    // **DB ファイルの置き場を基準**に解決する - デスクトップ側が
+    // 「アプリのデータディレクトリ基準」で解決しているのと同じ考え方で、
+    // そちらでも DB はそのディレクトリに置かれている。既定値 `"./data"` を
+    // そのまま使うとプロセスの作業ディレクトリに時系列ファイルを作って
+    // しまうので、ここで基準を決めておく（`resolve_data_dir` の doc）。
+    // `BANTO_DB` がファイル名だけのとき `parent()` は空になるので、
+    // そのときは作業ディレクトリ（`"."`）を基準にする。
+    let data_base = match db_path_buf.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let store_settings = settings.store_config().await.unwrap_or_else(|err| {
+        eprintln!("banto-serve: 時系列データの保存設定の読み取りに失敗しました（既定値で続行します）: {err}");
+        Default::default()
+    });
+    let collect = CollectorService::new(
+        pool_for_collect,
+        resolve_data_dir(&data_base, &store_settings.data_dir),
+    );
+
+    // 起動時の自動開始（docs/r1-plan.md の R1-C）。`hub.resume()` と同じく
+    // **spawn して投げっぱなし** - 失敗しても起動は止めず、理由は状態に残る
+    // （`CollectorService::autostart` の doc）。**レジストリを後から編集
+    // しても自動では再起動しない**（反映は `POST /api/collect/restart`）。
+    //
+    // **注意**: デスクトップアプリとこのサーバーを**同時に起動して同じ
+    // `data.dir` を指すと二重書き込みになる**（防止機構は未実装 -
+    // `chronogazer_core::collect` のモジュール doc「同じ `data.dir` を
+    // 2 つのプロセスで開かないこと」）。
+    {
+        let collect = collect.clone();
+        tokio::spawn(async move { collect.autostart().await });
+    }
+
     let app = api_router(
         users,
         settings,
@@ -165,6 +208,7 @@ async fn main() {
         plc_connections,
         collection_groups,
         tags,
+        collect.clone(),
         auth,
         events,
         allow_setup,
@@ -194,4 +238,11 @@ async fn main() {
         .expect("failed to listen for ctrl-c");
     println!("banto-serve: shutting down");
     server.stop().await;
+    // #383 段階2b / R1-C（C-2）: 収集（書き手）は**消費者を止めた後**に止める
+    // - `src-tauri` の `shutdown_app_state` と同じ順序（理由はあちらの doc）。
+    // ここを通らないと、tstore の最後の未 flush 分が落ちる。失敗しても
+    // 終了は止めない。
+    if let Err(err) = collect.stop().await {
+        eprintln!("banto-serve: 終了時の収集の停止に失敗しました: {err}");
+    }
 }
