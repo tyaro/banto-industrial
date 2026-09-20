@@ -30,7 +30,7 @@ use chronogazer_core::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 // #383 段階2b / R1-C: 収集サービス。C-2 で `collect_*` コマンドと起動時の
 // 自動開始を足した（監査の `resource` は REST と共有の定数）。
 use chronogazer_core::collect::{
-    resolve_data_dir, CollectOutcome, CollectorService, CollectorState, COLLECT_AUDIT_RESOURCE,
+    resolve_data_dir, CollectOutcome, CollectorService, CollectorStateView, COLLECT_AUDIT_RESOURCE,
     COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
 };
 use chronogazer_core::db::init_db;
@@ -1835,8 +1835,11 @@ async fn require_collect_editor(state: &AppState) -> Result<UserIdentity, BantoE
 ///
 /// **根拠**: R0 §3.6 の viewer は「**閲覧のみ**」であって「何も見えない」では
 /// ない。収集が動いているかどうかは**監視画面（C-3 / R1-D）の基本情報**で、
-/// [`CollectorState`] には機微な情報が何も入っていない（接続先もキーも
-/// ファイルパスも無い）ので、viewer に見せて困るものが無い。
+/// この床で公開する [`CollectorStateView`] には機微な情報が何も入っていない
+/// （接続先もキーもファイルパスも無い）ので、viewer に見せて困るものが無い。
+/// **内部の `CollectorState` をそのまま返さないのがその前提**（#407 レビュー
+/// P2-2）- 内部の型は `StartFailed { reason }` を持っていて、その理由には
+/// 接続先や `data.dir` の絶対パスが載りうる。
 /// [`require_hub_admin`] が読み取りまで `admin` なのは **Hub の接続先と
 /// キーの情報**を扱うからで、**収集の稼働状態はそれとは性質が違う** -
 /// 先例に引きずられない、という 2026-09-18 の決定と同じ考え方。
@@ -1851,6 +1854,11 @@ async fn require_collect_reader(state: &AppState) -> Result<UserIdentity, BantoE
 /// `CollectorState::StartFailed` の理由といった内部の詳細は入れない
 /// （`CollectorState::as_str` の doc）。`chronogazer_core::rest` の
 /// `record_collect_operation` と対で、`origin` だけが違う。
+///
+/// **ここへ来るのは「確かに受け付けた操作」だけ**（#407 レビュー P2-1）:
+/// 混雑でキューに入れられなかった依頼は `CollectorService` がエラーを返し、
+/// 呼び出し側の `?` がここへ届く前に抜けるので、**未受付が `result: "ok"` /
+/// `pending: true` で残ることはない**。
 async fn record_collect_operation(
     state: &AppState,
     actor: &UserIdentity,
@@ -1877,9 +1885,14 @@ async fn record_collect_operation(
 
 /// Body of [`collect_status`]（spec M14 split-function pattern: コマンド本体を
 /// 合成 [`AppState`] に対して単体テストできるようにする）。
-async fn collect_status_body(state: &AppState) -> Result<CollectorState, BantoError> {
+///
+/// 返すのは**公開用の [`CollectorStateView`]**（#407 レビュー P2-2）。変換は
+/// `CollectorService::state_view` の 1 箇所だけで、`chronogazer_core::rest` の
+/// `collect_status_handler` も**同じものを通る** - 経路によって公開する情報が
+/// 割れないようにするため（`COLLECT_AUDIT_RESOURCE` や床の定数と同じ作法）。
+async fn collect_status_body(state: &AppState) -> Result<CollectorStateView, BantoError> {
     require_collect_reader(state).await?;
-    Ok(state.collect.state())
+    Ok(state.collect.state_view())
 }
 
 /// `GET`-ish command: 収集の現在の状態。**`viewer` 以上**
@@ -1887,8 +1900,14 @@ async fn collect_status_body(state: &AppState) -> Result<CollectorState, BantoEr
 ///
 /// **ネットワークもディスクも DB も触らない**（メモリ上の状態を読むだけ）
 /// ので、画面はこれをポーリングしてよい。読み取りなので監査しない。
+///
+/// **起動失敗の理由はここからは見えない**（`startFailed` としか答えない）。
+/// 理由が利用者へ伝わるのは [`collect_start`] の**戻り値のエラー**で、
+/// 画面を再読み込みすると分からなくなるという制約が残る - 詳しくは
+/// `chronogazer_core::collect` のモジュール doc
+/// 「理由はどこで利用者に伝わるか」。
 #[tauri::command]
-async fn collect_status(state: State<'_, AppState>) -> Result<CollectorState, BantoError> {
+async fn collect_status(state: State<'_, AppState>) -> Result<CollectorStateView, BantoError> {
     collect_status_body(&state).await
 }
 
@@ -1899,6 +1918,14 @@ async fn collect_status(state: State<'_, AppState>) -> Result<CollectorState, Ba
 /// やめただけで、開始処理はアプリ側で続いている。画面は「失敗しました」では
 /// なく「まだ終わっていません」と出し、続きは `collect_status` で追うこと
 /// （#400 で確立した言い分けと同じ）。
+///
+/// **その裏返し**（#407 レビュー P2-1）: 依頼がライフサイクルタスクのキューに
+/// 入らなかったときは `pending` ではなく**エラー**が返る（「処理が混み合って
+/// います…この操作は実行されていません」）。`pending: true` は「後から必ず
+/// 実行される」という約束なので、混雑の言い換えに使わない。**開始に失敗した
+/// ときの理由もこの戻り値のエラーで伝わる** - `collect_status` は
+/// `startFailed` としか答えない（`chronogazer_core::collect` のモジュール doc
+/// 「理由はどこで利用者に伝わるか」）。
 /// Body of [`collect_start`]（spec M14 split-function pattern）。
 async fn collect_start_body(state: &AppState) -> Result<CollectOutcome, BantoError> {
     let actor = require_collect_editor(state).await?;
@@ -3012,7 +3039,7 @@ mod tests {
             collect_status_body(&state)
                 .await
                 .expect("a viewer must be able to read the collection state"),
-            CollectorState::Stopped
+            CollectorStateView::Stopped
         );
         // が、変更はできない。
         for outcome in [
@@ -3082,14 +3109,17 @@ mod tests {
         let outcome = collect_start_body(&state)
             .await
             .expect("収集対象 0 件は「エラー」ではない");
-        assert_eq!(outcome.status, CollectorState::NoTargets);
+        assert_eq!(
+            outcome.status,
+            chronogazer_core::collect::CollectorState::NoTargets
+        );
         assert!(
             !outcome.pending,
             "上限に掛かっていないのに pending: {outcome:?}"
         );
         assert_eq!(
             collect_status_body(&state).await.expect("collect_status"),
-            CollectorState::NoTargets
+            CollectorStateView::NoTargets
         );
 
         let audit = state
@@ -3112,5 +3142,121 @@ mod tests {
                 .expect("detail は JSON");
         assert_eq!(detail["collectState"], "noTargets");
         assert_eq!(detail["pending"], false);
+    }
+
+    /// **#407 レビュー P2-2 の受入条件（Tauri 側）**: 起動に失敗した後、
+    /// **viewer が `collect_status` を読んでも失敗理由が見えない**。
+    ///
+    /// `chronogazer_core::rest` の
+    /// `a_viewer_reading_the_state_never_sees_why_the_start_failed` と
+    /// **対になる双子のテスト**で、両方が同じことを主張する = **両経路が
+    /// 同じ公開用の形を通している**ことの固定（床の定数・`resource` と
+    /// 同じ作法）。
+    ///
+    /// 検証用の目印をタグのアドレスに埋めて `build_config` を失敗させる
+    /// （`banto-tags` はアドレスの書式を検証しない）。`CollectError::Config`
+    /// の文言はアドレスをそのまま含むので、**内部の `CollectorState` を
+    /// 返していれば目印が必ず出てくる**。
+    ///
+    /// あわせて、**理由がどこで利用者に伝わるか**も押さえる - 起動を実行した
+    /// editor には [`collect_start`] の**戻り値のエラー**として理由が届く
+    /// （状態の読み取りから落とした分の埋め合わせが本当に存在すること）。
+    ///
+    /// 反証（回帰の検出）: `collect_status_body` を
+    /// `Ok(state.collect.state())`（内部の型）に戻すと、`reason` キーと
+    /// 目印の両方が JSON に出て 2 つの `assert!` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_viewer_reading_the_state_never_sees_why_the_start_failed() {
+        const MARKER: &str = "CHRONOGAZER-LEAK-CANARY";
+        let state = app_state().await;
+
+        // 収集対象を 1 件だけ作る（アドレスが解釈できない = 起動が失敗する）。
+        let conn = state
+            .plc_connections
+            .create(
+                PlcConnectionPayload {
+                    name: "plc1".to_string(),
+                    protocol: "modbus-tcp".to_string(),
+                    host: "192.168.11.200".to_string(),
+                    port: 502,
+                    unit_id: 1,
+                    enabled: true,
+                    word_order: String::new(),
+                }
+                .into(),
+            )
+            .await
+            .expect("create plc connection");
+        let group = state
+            .collection_groups
+            .create(
+                CollectionGroupPayload {
+                    name: "group1".to_string(),
+                    plc_connection_id: conn.id,
+                    period_ms: 1000,
+                    enabled: true,
+                }
+                .into(),
+            )
+            .await
+            .expect("create collection group");
+        state
+            .tags
+            .create(
+                TagPayload {
+                    name: "tag1".to_string(),
+                    collection_group_id: group.id,
+                    address: MARKER.to_string(),
+                    data_type: "i16".to_string(),
+                    raw_lo: None,
+                    raw_hi: None,
+                    eng_lo: None,
+                    eng_hi: None,
+                    unit: None,
+                    decimals: 0,
+                    enabled: true,
+                }
+                .into(),
+            )
+            .await
+            .expect("create tag");
+
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create_user");
+        let viewer = state
+            .users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create_user");
+
+        // 起動した本人（editor）には、エラーとして理由が届く。
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+        let err = collect_start_body(&state)
+            .await
+            .expect_err("前提が崩れている: 起動が失敗していない");
+        assert!(
+            err.to_string().contains(MARKER),
+            "起動を実行した本人にも理由が伝わっていない（埋め合わせが無い）: {err}"
+        );
+
+        // viewer が状態を読む: 状態そのものは返るが、理由は返らない。
+        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+        let view = collect_status_body(&state)
+            .await
+            .expect("viewer は状態を読めること");
+        assert_eq!(view, CollectorStateView::StartFailed);
+        let json = serde_json::to_value(&view).expect("serialize");
+        assert_eq!(json["state"], "startFailed");
+        assert!(
+            json.get("reason").is_none(),
+            "`reason` フィールドがワイヤに出ている: {json}"
+        );
+        assert!(
+            !json.to_string().contains(MARKER),
+            "起動失敗の理由が viewer に漏れている: {json}"
+        );
     }
 }

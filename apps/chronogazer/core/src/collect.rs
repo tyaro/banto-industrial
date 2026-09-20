@@ -54,6 +54,48 @@
 //! 収集対象なし / 起動失敗（理由付き）。起動失敗の `reason` は
 //! [`CollectError`] の文言をそのまま載せる（分類して捨てない）。
 //!
+//! # 内部の状態と、状態取得で公開する形を分ける
+//!
+//! [`CollectorState::StartFailed`] の `reason` は [`CollectError`] の文言
+//! そのままなので、**接続先のホストや `data.dir` の絶対パスを含みうる**。
+//! 一方で状態の**読み取り**は `viewer` にも開いている
+//! （[`COLLECT_READ_ROLE`]）。その判断の根拠は「[`CollectorState`] には機微な
+//! 情報が入っていない」ことだったのに、C-2 の実装は**内部の型をそのまま
+//! ワイヤへ載せていた**（#407 レビュー P2-2）。
+//!
+//! そこで型を 2 つに分ける:
+//!
+//! * [`CollectorState`] は**内部・診断用**。`reason` を**持ったまま**変えない
+//!   （分類して捨てない、という上の規律はそのまま）。
+//! * [`CollectorStateView`] が**公開用**。`startFailed` という**状態そのものは
+//!   返すが、理由は返さない**。
+//!
+//! **変換は [`CollectorStateView::from`] の 1 箇所だけ**で、REST
+//! （`GET /api/collect`）も Tauri（`collect_status`）も
+//! [`CollectorService::state_view`] を通る - [`COLLECT_AUDIT_RESOURCE`] や
+//! 床の定数と同じ考え方で、**経路による食い違いを申し合わせではなく構造で
+//! 防ぐ**。
+//!
+//! ## 理由はどこで利用者に伝わるか（公開から落とした分の埋め合わせ）
+//!
+//! **起動を実行した本人には、操作の戻り値が理由を伝える**。
+//! [`CollectorService::start`]（`collect_start` / `POST /api/collect/start`）は
+//! 起動に失敗したとき `Err` を返し、その中身は
+//! [`CollectorState::StartFailed`] に焼き付けたのと**同じ文言**
+//! （[`Lifecycle::fail_start`]）。押した人はその場でエラーとして理由を読める。
+//!
+//! **残る制約（黙って落とさないために明記する）**: 画面を再読み込みすると、
+//! 状態取得は `startFailed` としか答えないので**理由は分からなくなる**。
+//! 知りたければ「収集を開始」をもう一度押す（同じ構成ならまた同じ理由が
+//! エラーとして返る）。**診断用の取得口（`admin` 限定で理由まで返す口）は
+//! C-2 では作らない** - 作るなら床・監査・画面の置き場まで含めて別途決める。
+//!
+//! なお [`CollectOutcome::status`] は**内部の [`CollectorState`] のまま**で、
+//! ここは意図的にそろえていない: [`CollectOutcome`] を受け取れるのは
+//! `editor` 以上（[`COLLECT_OPERATION_ROLE`]）＝**操作を実行した本人**だけで、
+//! その人には上のとおり理由が伝わってよい。公開用の型に落としているのは
+//! **`viewer` にも開いている状態取得の経路**である。
+//!
 //! # 下位の失敗で上位の状態を書き換えない
 //!
 //! [`CollectorState`] が変わるのは **[`CollectorService`] 自身の
@@ -147,6 +189,39 @@
 //! いる）ので、タスクは**tstore を開く前に**`Starting` を立て、成否が
 //! 決まってから `Running` / `NoTargets` / `StartFailed` に遷移する。
 //!
+//! # 「受け付けた」とも言い切らない - 投入と完了待ちを分ける
+//!
+//! 上の言い分けには**裏返し**がある（#407 レビュー P2-1）。「失敗したと言い
+//! 切らない」のと同じ厳密さで、「**受け付けたと言い切らない**」こと。
+//!
+//! [`CollectOutcome::pending`] は「**後から必ず実行される**」という約束で
+//! あって、「混雑で投げられなかった」の言い換えではない。C-2 の初版は上限
+//! 1 本を**キューへの投入待ちごと**包んでいたので、
+//!
+//! 1. 収集対象がある状態で起動処理が待機し、後続の操作でキュー（深さ
+//!    [`COMMAND_QUEUE_DEPTH`]）が埋まる、
+//! 2. `stop()` が満杯のキューに入れず `send().await` で待つ、
+//! 3. 上限で打ち切り、呼び出し側には `pending: true` が返る、
+//! 4. しかし**停止コマンドはどこにも送られていない**ので、起動処理が復帰しても
+//!    停止は実行されず、**収集は動き続ける**、
+//!
+//! という経路で「受付済み」と嘘をついた。しかも REST / Tauri はこの戻り値を
+//! `result: "ok"` / `pending: true` で監査に残すので、**応答も監査も受付済み
+//! 扱い**になっていた。
+//!
+//! そこで上限を**2 本に分ける**（[`CollectorService::lifecycle`]）:
+//!
+//! * **投入**: [`COLLECT_ENQUEUE_TIMEOUT`] 付きの
+//!   [`tokio::sync::mpsc::Sender::send_timeout`]。入らなかったら「**混雑により
+//!   未受付**」という**エラー**を返す（`pending` ではない）。**実際に何も
+//!   起きていない**のだから、ここは言い切ってよい。エラー経路なので
+//!   REST / Tauri の記録も走らず、`result: "ok"` では残らない。
+//! * **完了待ち**: 投入に**成功した後**だけ [`COLLECT_OPERATION_TIMEOUT`] を
+//!   掛ける。ここで打ち切ったときだけ `pending: true`（＝タスクが必ず実行する）。
+//!
+//! **無期限待機には戻さない**（それは #400 で潰した「画面が永久に固まる」
+//! そのものなので）。
+//!
 //! # 同じ `data.dir` を 2 つのプロセスで開かないこと（未防止の制約）
 //!
 //! デスクトップアプリと `banto-serve` は**どちらも**起動時に自動開始するので、
@@ -218,9 +293,14 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 /// そうはいかない - `Stopped` のままだと「もう何も動いていない」という
 /// **危険側の嘘**になるので、こちらだけ足した。
 ///
-/// `Serialize` はコマンド／REST で**そのまま**ワイヤに載せるため。
+/// `Serialize` を導出しているのは、**操作の戻り値**
+/// （[`CollectOutcome::status`]）がこの型のままワイヤに載るため -
 /// `crate::hub` が `HubStatus` を判別共用体のまま画面へ渡しているのと同じ
 /// 作法（`{"state":"running","groups":2,"tags":10}`）。
+///
+/// **状態の取得（`viewer` にも開いている経路）はこの型を載せない。**
+/// `reason` を落とした [`CollectorStateView`] を通す - 理由はこのモジュールの
+/// doc「内部の状態と、状態取得で公開する形を分ける」。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum CollectorState {
@@ -229,6 +309,61 @@ pub enum CollectorState {
     Running { groups: usize, tags: usize },
     NoTargets,
     StartFailed { reason: String },
+}
+
+/// [`CollectorState`] の**公開用**の形（#407 レビュー P2-2）。
+///
+/// [`CollectorState`] と**同じ 5 つの状態**を、**同じ綴り**
+/// （`#[serde(tag = "state", rename_all = "camelCase")]` なので
+/// `stopped`/`starting`/`running`/`noTargets`/`startFailed`。
+/// [`CollectorState::as_str`] や監査の `collectState` とも一致する）で表す。
+/// 違いは 1 つだけ - **[`Self::StartFailed`] に `reason` が無い**。
+///
+/// **なぜ型ごと分けるのか**: [`CollectorState::StartFailed`] の `reason` は
+/// [`CollectError`] の文言そのままで、接続先のホストや `data.dir` の絶対パスを
+/// 含みうる。状態の読み取りは `viewer` にも開いている
+/// （[`COLLECT_READ_ROLE`]）ので、**内部の型をそのままワイヤへ載せると、
+/// 「状態に機微な情報を含めない」という床を下げた前提が実装で満たされない**。
+/// `#[serde(skip)]` を `reason` に付けて 1 つの型で済ます手もあるが、それだと
+/// **診断（理由を見たい）と公開（見せたくない）が同じ型の同じフィールドに
+/// 同居し続ける**ので、次に誰かが `reason` を使う口を足したときに黙って漏れる。
+/// 型が違えば、公開経路に内部の型を載せようとした時点でコンパイルが止まる。
+///
+/// **変換は [`From`] の 1 実装だけ**。REST も Tauri も
+/// [`CollectorService::state_view`] を通るので、経路によって公開する情報が
+/// 割れようがない（[`COLLECT_AUDIT_RESOURCE`] と同じ作法）。
+///
+/// 起動に失敗した理由が**どこで利用者に伝わるか**（と、画面を再読み込み
+/// すると分からなくなるという残る制約）は、このモジュールの doc
+/// 「理由はどこで利用者に伝わるか」を参照。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum CollectorStateView {
+    Stopped,
+    Starting,
+    Running {
+        groups: usize,
+        tags: usize,
+    },
+    NoTargets,
+    /// 起動を試みて失敗した。**理由は載せない**（上の doc 参照）。
+    StartFailed,
+}
+
+impl From<&CollectorState> for CollectorStateView {
+    fn from(state: &CollectorState) -> Self {
+        match state {
+            CollectorState::Stopped => Self::Stopped,
+            CollectorState::Starting => Self::Starting,
+            CollectorState::Running { groups, tags } => Self::Running {
+                groups: *groups,
+                tags: *tags,
+            },
+            CollectorState::NoTargets => Self::NoTargets,
+            // **ここが全部**: 理由を落とすのはこの 1 行だけ。
+            CollectorState::StartFailed { .. } => Self::StartFailed,
+        }
+    }
 }
 
 impl CollectorState {
@@ -290,12 +425,17 @@ pub const COLLECT_OPERATION_ROLE: Role = Role::Editor;
 ///
 /// **`viewer` 以上**（2026-09-20 オーナー決定、#407 レビュー）。R0 §3.6 の
 /// viewer は「**閲覧のみ**」であって「何も見えない」ではない。収集が動いて
-/// いるかどうかは**監視画面（C-3 / R1-D）の基本情報**であり、
-/// [`CollectorState`] には機微な情報が何も入っていない - 接続先もキーも
-/// ファイルパスも、[`CollectorState::StartFailed`] の `reason` すら
-/// ワイヤに出る前に [`CollectorState::as_str`] へ落ちる経路（監査）があるだけ
-/// で、状態そのものは「止まっている / 起動中 / 走っている（件数）/ 対象なし /
-/// 起動失敗」しか語らない。viewer に見せて困るものが無い。
+/// いるかどうかは**監視画面（C-3 / R1-D）の基本情報**であり、この床で公開
+/// するのは [`CollectorStateView`] - 「止まっている / 起動中 / 走っている
+/// （件数）/ 対象なし / 起動失敗」しか語らず、接続先もキーもファイルパスも
+/// 出ない。viewer に見せて困るものが無い。
+///
+/// **その前提は型で担保する**（#407 レビュー P2-2）。内部の
+/// [`CollectorState::StartFailed`] は `reason` を持っており、そこには
+/// [`CollectError`] の文言（ホストや絶対パスを含みうる）がそのまま載る。
+/// 床をここまで下げてよい理由が「状態に機微な情報が無いこと」である以上、
+/// **公開経路には内部の型を載せない** - 必ず
+/// [`CollectorService::state_view`] を通す。
 ///
 /// `crate::hub` の `hub_status` が `admin` 限定なのは **Hub の接続先と
 /// キーの情報**を扱うからで、**収集の稼働状態はそれとは性質が違う** -
@@ -314,8 +454,20 @@ pub const COLLECT_READ_ROLE: Role = Role::Viewer;
 /// 「失敗しました」ではなく「**まだ終わっていません**」と言い、続きは
 /// [`CollectorService::state`] で追うこと。
 ///
+/// **裏返しも同じだけ厳密に**（#407 レビュー P2-1）: `pending` が返るのは
+/// **依頼がライフサイクルタスクのキューに確かに入った後**だけ。混雑で入れられ
+/// なかったときは「受け付けた」と言わず、**エラー**を返す（このモジュールの
+/// doc「「受け付けた」とも言い切らない」/ [`COLLECT_ENQUEUE_TIMEOUT`]）。
+/// `pending: true` は「**後から必ず実行される**」という約束である。
+///
 /// `status` は**打ち切った時点**の状態なので、`pending == true` のときはほぼ
 /// [`CollectorState::Starting`]（あるいは、停止の最中なら直前の状態）になる。
+///
+/// `status` が**公開用の [`CollectorStateView`] ではなく内部の
+/// [`CollectorState`]** なのは意図的 - これを受け取れるのは
+/// [`COLLECT_OPERATION_ROLE`]（`editor` 以上）＝**操作を実行した本人**だけで、
+/// その人には起動失敗の理由が伝わってよいため（モジュール doc
+/// 「理由はどこで利用者に伝わるか」）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CollectOutcome {
@@ -357,11 +509,74 @@ enum Command {
 
 /// コマンドキューの深さ。ライフサイクル操作は人間の操作由来で秒に何度も
 /// 来るものではなく、読み出しのポーリングもこの深さで詰まることはない。
-/// 満杯になったら `send().await` が待つ（= 背圧）だけで、取りこぼさない。
+///
+/// 満杯になったときの扱いは**送る側で分かれる**:
+///
+/// * ライフサイクル操作（[`CollectorService::lifecycle`]）は
+///   [`COLLECT_ENQUEUE_TIMEOUT`] 付きで投入し、入らなかったら「**混雑により
+///   未受付**」という**エラー**を返す（`pending` にしない。#407 レビュー
+///   P2-1）。
+/// * 読み出し（[`CollectorService::readout`]）は従来どおり `send().await`
+///   の背圧に乗る。こちらは**受付/未受付の言い分けを持たない**（返るか
+///   返らないかだけ）ので、嘘をつきようがない。C-3 で画面へ出すときに
+///   上限を足すこと - このモジュールの doc「ライフサイクルは専用タスクが
+///   所有する」の注記のとおり。
 const COMMAND_QUEUE_DEPTH: usize = 32;
 
-/// ライフサイクル操作（`start`/`stop`/`restart`）で**待つのをやめる**までの
-/// 時間。打ち切りの意味は [`CollectOutcome`] の doc を参照（失敗ではない）。
+/// ライフサイクル操作の依頼を**キューに入れる**のを諦めるまでの時間
+/// （[`COLLECT_OPERATION_TIMEOUT`] とは**別の上限**。#407 レビュー P2-1）。
+///
+/// **なぜ完了待ちと分けるのか**: この待ちが解けなかった場合、依頼は
+/// **どこにも届いていない**。だから「まだ終わっていない」
+/// （[`CollectOutcome::pending`]）ではなく「**受け付けられなかった**」と
+/// 言い切るべきで、言い分けが違う以上、上限も別に持つのが素直
+/// （このモジュールの doc「「受け付けた」とも言い切らない」）。
+///
+/// **なぜ 5 秒か（完了待ちの 30 秒より短い）**: ここで待っているのは
+/// **I/O ではなく、ライフサイクルタスクがキューから 1 件取り出すこと**だけ。
+/// 取り出した瞬間に空きができるので、
+///
+/// * タスクが手空きなら**即座**に入る、
+/// * 読み出しや通常の `start`/`stop` が数件詰まっているだけなら、それらは
+///   ミリ秒で捌けるので**やはりすぐ**入る、
+/// * [`COMMAND_QUEUE_DEPTH`] 件が滞留したままということは、タスクが 1 件の
+///   操作の中で長く止まっている（応答しない共有への open 等）という意味で、
+///   **その滞留は最大で完了待ちの上限ぶん続きうる**。
+///
+/// 3 番目の場合に投入を待ち続けても得るものが無い - 待った末に入っても、
+/// そこから完了待ちの 30 秒が**新たに**始まるので、呼び出し側の合計待ち時間が
+/// 倍近くになるだけで、それは「固まっている」と区別が付かない。5 秒は通常の
+/// キュー回転（ミリ秒）の 3 桁上にあって取りこぼしようがなく、かつ合計の
+/// 最悪値を 35 秒に抑えて完了待ちの予算からほとんどはみ出させない。
+///
+/// **無期限の `send().await` には戻さないこと。** それは #400 で潰した
+/// 「画面が永久に固まる」経路そのもので、しかも今度は「受付済み」と嘘を
+/// つきながら固まる。
+pub const COLLECT_ENQUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 混雑で依頼をキューに入れられなかったときの文言。
+///
+/// **定数にしているのは、テストが「未受付が明示されている」ことを
+/// 文字列の部分一致ではなく等値で固定するため** - 「タスクが居ない」
+/// （[`LIFECYCLE_GONE_MESSAGE`]）との読み分けが、テスト側でも実装側でも
+/// 曖昧にならないようにする。
+const ENQUEUE_BUSY_MESSAGE: &str =
+    "収集の操作を受け付けられませんでした（処理が混み合っています）。\
+     前の操作が終わるのを待って、もう一度お試しください（この操作は実行されていません）";
+
+/// ライフサイクルタスクが居なくなっていた（= panic した。通常は起こらない）
+/// ときの文言。**[`ENQUEUE_BUSY_MESSAGE`] と読み分けられること**が要点で、
+/// どちらも「実行されていない」が、後者は再試行で直らない。
+const LIFECYCLE_GONE_MESSAGE: &str =
+    "収集サービスの内部タスクが停止しています（アプリを再起動してください）";
+
+/// ライフサイクル操作（`start`/`stop`/`restart`）が**キューに入った後**、
+/// 完了を待つのをやめるまでの時間。打ち切りの意味は [`CollectOutcome`] の
+/// doc を参照（失敗ではない）。
+///
+/// **キューへの投入はこの上限の外**（[`COLLECT_ENQUEUE_TIMEOUT`]）。1 本で
+/// 両方を包むと、**投げられもしなかった操作が `pending: true`（＝後から必ず
+/// 実行される）で返る**ため（#407 レビュー P2-1）。
 ///
 /// **なぜ上限が要るのか**: 操作の口を生やした以上、ここは #400 で潰した
 /// 「画面が永久に固まる」経路そのものになる。往復の相手はライフサイクル
@@ -614,11 +829,29 @@ impl CollectorService {
         self.lifecycle(Command::Restart).await
     }
 
-    /// 現在の状態。**ネットワークもディスクも DB も触らない**し、コマンド
-    /// キューも通らないので、起動処理の最中でも待たされない（ポーリングは
-    /// これを見る）。
+    /// 現在の状態（**内部・診断用**）。**ネットワークもディスクも DB も
+    /// 触らない**し、コマンドキューも通らないので、起動処理の最中でも
+    /// 待たされない。
+    ///
+    /// [`CollectorState::StartFailed`] の `reason` を**持ったまま**返すので、
+    /// **これをそのまま外へ出さないこと** - 状態の取得は必ず
+    /// [`Self::state_view`] を通す（このモジュールの doc「内部の状態と、
+    /// 状態取得で公開する形を分ける」）。
     pub fn state(&self) -> CollectorState {
         self.inner.ctx.state()
+    }
+
+    /// 現在の状態の**公開用の形**（[`CollectorStateView`]）。
+    ///
+    /// **状態を外へ返す経路は、REST（`GET /api/collect`）も Tauri
+    /// （`collect_status`）も必ずここを通る** - 変換を 1 箇所に集めて、
+    /// 経路によって公開する情報が割れないようにするため（#407 レビュー
+    /// P2-2。[`COLLECT_AUDIT_RESOURCE`] や床の定数と同じ作法）。
+    ///
+    /// [`Self::state`] と同じく、ネットワークもディスクも DB もキューも
+    /// 通らないので、画面はこれをポーリングしてよい。
+    pub fn state_view(&self) -> CollectorStateView {
+        CollectorStateView::from(&self.state())
     }
 
     /// 接続ごとの状態のスナップショット。**走っていなければ `None`** -
@@ -666,32 +899,52 @@ impl CollectorService {
         })
     }
 
-    /// `start`/`stop`/`restart` 共通の往復。**[`COLLECT_OPERATION_TIMEOUT`]
-    /// で必ず打ち切る**（ここが「操作の口を生やしたのに無応答で固まる」を
-    /// 塞ぐ唯一の場所なので、3 つとも同じ 1 本を通す）。
+    /// `start`/`stop`/`restart` 共通の往復。3 つとも同じ 1 本を通る
+    /// （ここが「操作の口を生やしたのに無応答で固まる」を塞ぐ唯一の場所）。
     ///
-    /// 打ち切りは `Err` にしない - [`CollectOutcome::pending`] を立てて、
-    /// **その時点の [`Self::state`]**（キューを通らない同期読み取り）を
-    /// 載せて返す。「失敗した」と「まだ終わっていない」を別の値にしておく
-    /// ための分け方（[`CollectOutcome`] の doc）。
+    /// **2 段階で、上限も 2 本**（#407 レビュー P2-1。一本化しないこと）:
     ///
-    /// **上限は往復全体に掛かる**ので、稀に「まだキューに積めていない」
-    /// 時点で打ち切ることもある。そのとき依頼は行われていないが、キューが
-    /// 詰まるのは前の依頼が終わっていないからなので、「まだ終わっていない」
-    /// という言い分けはどちらでも正しい（状態も `Self::state` が答える）。
+    /// 1. **投入** - [`COLLECT_ENQUEUE_TIMEOUT`] 付きの `send_timeout`。
+    ///    入らなかったら [`ENQUEUE_BUSY_MESSAGE`] の **`Err`**。ここで返る
+    ///    ということは**依頼がどこにも届いていない**（タスクはこの操作を
+    ///    知らないまま）ので、「受け付けられませんでした」と**言い切ってよい** -
+    ///    `pending`（＝後から必ず実行される）にしてはいけない。
+    /// 2. **完了待ち** - 投入に**成功した後**だけ [`COLLECT_OPERATION_TIMEOUT`]。
+    ///    ここで打ち切ったときは `Err` にせず [`CollectOutcome::pending`] を
+    ///    立て、**その時点の [`Self::state`]**（キューを通らない同期読み取り）を
+    ///    載せて返す。依頼はもうタスク側にあるので、処理は最後まで進む。
+    ///
+    /// 旧実装は 1 本の上限で投入ごと包んでいたため、**キューが満杯で投げられ
+    /// なかった操作まで `pending: true` で返し**、REST / Tauri はそれを
+    /// `result: "ok"` で監査に残していた（モジュール doc「「受け付けた」とも
+    /// 言い切らない」に再現手順）。
     ///
     /// タスクが居なくなっていたら（= panic した。通常は起こらない）
-    /// **黙って成功にしない**。
+    /// **黙って成功にしない** - 投入時（`Closed`）も応答待ち中（送信側 drop）も
+    /// [`LIFECYCLE_GONE_MESSAGE`] の `Err`。ここは C-2 から変えていない。
     async fn lifecycle(
         &self,
         make: fn(oneshot::Sender<Result<CollectorState, BantoError>>) -> Command,
     ) -> Result<CollectOutcome, BantoError> {
-        match tokio::time::timeout(COLLECT_OPERATION_TIMEOUT, self.request(make)).await {
-            Ok(Some(result)) => result.map(CollectOutcome::settled),
-            Ok(None) => Err(BantoError::Other(
-                "収集サービスの内部タスクが停止しています（アプリを再起動してください）"
-                    .to_string(),
-            )),
+        let (reply_tx, reply_rx) = oneshot::channel();
+        // --- 1. 投入（ここで返る = 何も起きていない）---
+        match self
+            .commands()
+            .send_timeout(make(reply_tx), COLLECT_ENQUEUE_TIMEOUT)
+            .await
+        {
+            Ok(()) => {}
+            Err(mpsc::error::SendTimeoutError::Timeout(_)) => {
+                return Err(BantoError::Other(ENQUEUE_BUSY_MESSAGE.to_string()))
+            }
+            Err(mpsc::error::SendTimeoutError::Closed(_)) => {
+                return Err(BantoError::Other(LIFECYCLE_GONE_MESSAGE.to_string()))
+            }
+        }
+        // --- 2. 完了待ち（ここから先、依頼は必ず実行される）---
+        match tokio::time::timeout(COLLECT_OPERATION_TIMEOUT, reply_rx).await {
+            Ok(Ok(result)) => result.map(CollectOutcome::settled),
+            Ok(Err(_reply_dropped)) => Err(BantoError::Other(LIFECYCLE_GONE_MESSAGE.to_string())),
             Err(_elapsed) => Ok(CollectOutcome::still_working(self.state())),
         }
     }
@@ -703,8 +956,12 @@ impl CollectorService {
         self.request(make).await.flatten()
     }
 
-    /// コマンドを 1 つ送って応答を待つ。`None` = タスクが居ない / 応答が
-    /// 返らなかった。
+    /// 読み出しのコマンドを 1 つ送って応答を待つ。`None` = タスクが居ない /
+    /// 応答が返らなかった。
+    ///
+    /// **ライフサイクル操作はここを通らない**（[`Self::lifecycle`] が投入と
+    /// 完了待ちを自前で分けている）。読み出しは「受け付けた/受け付けていない」
+    /// を言い分けないので、投入は背圧のまま `send().await` でよい。
     async fn request<T>(&self, make: fn(oneshot::Sender<T>) -> Command) -> Option<T> {
         let (reply_tx, reply_rx) = oneshot::channel();
         // ここでキャンセルされた場合（まだ送れていない）は、タスクは依頼を
@@ -1694,6 +1951,185 @@ mod tests {
             CollectorState::NoTargets,
             "タスク側が決着した後も `Starting` のまま取り残されている"
         );
+    }
+
+    // --- 未受付を「受付済み」と言わない（#407 レビュー P2-1） --------------
+
+    /// **#407 レビュー P2-1 の受入条件**: **キューに入れられなかった操作は
+    /// 「受付済み（`pending: true`）」で返らない**。
+    ///
+    /// オーナー指定の再現手順をそのまま組む:
+    ///
+    /// 1. 収集対象がある状態で起動を [`StartGate`] で止める（ライフサイクル
+    ///    タスクはこの 1 件を処理中のまま動かない）、
+    /// 2. キューを [`COMMAND_QUEUE_DEPTH`] 件で満杯にする、
+    /// 3. その状態で `stop()` を呼び、投入を打ち切らせる。
+    ///
+    /// 旧実装（上限 1 本で投入ごと包む）は、ここで `Ok(pending: true)` を
+    /// 返していた。**停止コマンドはどこにも送られていないのに**「後から必ず
+    /// 実行される」と言い、REST / Tauri はそれを `result: "ok"` で監査に
+    /// 残していた。手順 4 がその実害（**収集が動き続ける**）を固定する。
+    ///
+    /// 実時間は 1 ミリ秒も待たない: ゲートは [`Notify`]、投入の上限は
+    /// [`tokio::time::pause`] の仮想時計が自動で進めて消費する。**時計を
+    /// 止めるのは足場を組み終えてから**（理由は 1 つ上のテストの doc と同じ -
+    /// sqlx のプールが巻き添えになる）。
+    ///
+    /// 反証（回帰の検出）: [`CollectorService::lifecycle`] を
+    /// `timeout(COLLECT_OPERATION_TIMEOUT, self.request(make))` の 1 本に
+    /// 戻すと、`stop()` が `Err` ではなく `Ok(pending: true)` を返すので
+    /// `expect_err` が落ちる。
+    #[tokio::test]
+    async fn an_operation_that_never_reached_the_queue_is_refused_not_called_pending() {
+        let dir = TempDir::new();
+        let pool = init_db_memory().await.expect("init_db_memory");
+        seed_one_tag(&pool, "40001").await;
+        let gate = Arc::new(StartGate::default());
+        let svc = CollectorService::new_for_test_gated(
+            pool.clone(),
+            dir.path().join("data"),
+            fast_options(),
+            offline_factory(),
+            gate.clone(),
+        );
+
+        // 1. 起動を止める。タスクはこの 1 件を抱えたまま先へ進まない。
+        let starter = {
+            let svc = svc.clone();
+            tokio::spawn(async move { svc.start().await })
+        };
+        gate.entered.notified().await;
+
+        // 2. キューを満杯にする。**何で埋まっているかは関係ない**ので、
+        //    副作用の無い読み出しコマンドで埋める。
+        let mut fillers = Vec::new();
+        loop {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            match svc.commands().try_send(Command::ConnectionStatus(reply_tx)) {
+                Ok(()) => fillers.push(reply_rx),
+                Err(mpsc::error::TrySendError::Full(_)) => break,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    panic!("前提が崩れている: ライフサイクルタスクが居ない")
+                }
+            }
+        }
+        assert_eq!(
+            fillers.len(),
+            COMMAND_QUEUE_DEPTH,
+            "キューが満杯になっていない（この後の stop が普通に入ってしまう）"
+        );
+
+        // 3. この状態の `stop()`。**未受付が明示される**こと。
+        tokio::time::pause();
+        let err = svc
+            .stop()
+            .await
+            .expect_err("キューに入れられなかった操作を `Ok` で返している");
+        tokio::time::resume();
+        assert_eq!(
+            err.to_string(),
+            ENQUEUE_BUSY_MESSAGE,
+            "「混雑で未受付」が「内部タスクが停止」と読み分けられない: {err}"
+        );
+
+        // 4. ゲートを開けると起動は完了する。**停止はどこにも届いていない**
+        //    ので収集は走り続けている - 「受付済み」と嘘をついていたときに
+        //    起きていた実害そのもの。
+        gate.release.notify_one();
+        let started = starter.await.expect("start task").expect("start");
+        assert_eq!(
+            started.status,
+            CollectorState::Running { groups: 1, tags: 1 }
+        );
+        assert!(
+            svc.state().is_running(),
+            "受け付けていない `stop()` が実行されたことになっている: {:?}",
+            svc.state()
+        );
+        assert!(
+            svc.connection_status().await.is_some(),
+            "収集は動き続けているはず（未受付の stop は実行されない）"
+        );
+
+        svc.stop().await.expect("後始末の stop");
+    }
+
+    /// 普段の（混んでいない）経路では、投入用の上限を足しても**何も
+    /// 変わらない** - 3 つの操作とも `pending` にならずに決着する。
+    /// 上の 1 本だけだと「常にエラーを返す実装」でも通ってしまうので、
+    /// その反対側を押さえる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_uncongested_operation_is_still_accepted_and_settles() {
+        let dir = TempDir::new();
+        let (pool, svc) = service(&dir).await;
+        seed_one_tag(&pool, "40001").await;
+
+        assert_eq!(
+            settled(svc.start().await.expect("start")),
+            CollectorState::Running { groups: 1, tags: 1 }
+        );
+        assert_eq!(
+            settled(svc.restart().await.expect("restart")),
+            CollectorState::Running { groups: 1, tags: 1 }
+        );
+        assert_eq!(
+            settled(svc.stop().await.expect("stop")),
+            CollectorState::Stopped
+        );
+    }
+
+    // --- 公開用の状態（#407 レビュー P2-2） -------------------------------
+
+    /// 公開用の型は**5 つの状態を同じ綴りで保ったまま、理由だけ落とす**。
+    ///
+    /// 綴りは [`CollectorState::as_str`]（＝監査の `collectState`）と
+    /// 一致していること - 画面で見た値と監査で見た値が食い違わないための
+    /// 前提で、公開用の型を足したことでそこが崩れていないかをここで固定する。
+    ///
+    /// 反証（回帰の検出）: [`CollectorStateView::StartFailed`] に
+    /// `reason` を持たせて [`From`] で詰め直すと、`reason` の
+    /// `assert!` が落ちる。
+    #[test]
+    fn the_public_state_view_keeps_every_state_but_drops_the_reason() {
+        let marker = "CHRONOGAZER-LEAK-CANARY";
+        let cases = [
+            CollectorState::Stopped,
+            CollectorState::Starting,
+            CollectorState::Running {
+                groups: 2,
+                tags: 10,
+            },
+            CollectorState::NoTargets,
+            CollectorState::StartFailed {
+                reason: format!("収集設定エラー: {marker} が開けません"),
+            },
+        ];
+
+        for state in cases {
+            let json = serde_json::to_value(CollectorStateView::from(&state)).expect("serialize");
+            assert_eq!(
+                json["state"],
+                state.as_str(),
+                "公開用の綴りが内部の状態（＝監査の綴り）と食い違っている: {state:?}"
+            );
+            assert!(
+                json.get("reason").is_none(),
+                "公開用の形に `reason` が残っている: {json}"
+            );
+            assert!(
+                !json.to_string().contains(marker),
+                "理由の中身が公開用の形に漏れている: {json}"
+            );
+        }
+
+        // 件数は落とさない（監視画面の基本情報）。
+        let running = serde_json::to_value(CollectorStateView::from(&CollectorState::Running {
+            groups: 2,
+            tags: 10,
+        }))
+        .expect("serialize");
+        assert_eq!(running["groups"], 2);
+        assert_eq!(running["tags"], 10);
     }
 
     // --- 起動時の自動開始（C-2） ------------------------------------------

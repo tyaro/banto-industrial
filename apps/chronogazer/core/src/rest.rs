@@ -117,6 +117,14 @@
 //! 成功の `action` は `"start"`/`"stop"`/`"restart"`、`detail` は結果の状態と
 //! `pending` だけ。`GET /api/collect`（読み取り）は監査しない。
 //!
+//! `GET /api/collect` が返すのは**公開用の**
+//! [`crate::collect::CollectorStateView`]（`startFailed` は返すが理由は
+//! 返さない）で、内部の `CollectorState` ではない - 床を `viewer` まで
+//! 下げた根拠を型で担保するため（#407 レビュー P2-2）。**キューに入れられ
+//! なかった変更操作は `result: "ok"` で記録されない**（`?` でエラーとして
+//! 抜けるので `record_collect_operation` に届かない）- 「受け付けた」と
+//! 監査にも嘘を書かないための形（#407 レビュー P2-1）。
+//!
 //! `/api/backups/*` (spec M17): `admin`-only, guarded the same way
 //! `/api/users/*`/`/api/audit-log/*` are. `POST /api/backups` records
 //! `action: "backup"`; either restore-staging route records
@@ -164,7 +172,7 @@ use tokio::sync::broadcast;
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 use crate::collect::{
-    CollectOutcome, CollectorService, CollectorState, COLLECT_AUDIT_RESOURCE,
+    CollectOutcome, CollectorService, CollectorStateView, COLLECT_AUDIT_RESOURCE,
     COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
 };
 use crate::hub::{HubService, HubSubscriptionView, HubView};
@@ -1409,8 +1417,9 @@ struct CollectState {
 /// `resource` は [`COLLECT_AUDIT_RESOURCE`]、つまり**Tauri 側の `collect_*`
 /// コマンドと同じ定数**（両経路で `resource` が割れないように - その定数の
 /// doc 参照）。`detail` に入れるのは**結果の状態**だけで、接続先・
-/// ファイルパス・[`CollectorState::StartFailed`] の理由といった**内部の詳細は
-/// 入れない**（[`CollectorState::as_str`] の doc）。`pending` を載せるのは、
+/// ファイルパス・[`crate::collect::CollectorState::StartFailed`] の理由と
+/// いった**内部の詳細は入れない**（`CollectorState::as_str` の doc）。
+/// `pending` を載せるのは、
 /// 「操作は受け付けたが、応答を待つのをやめた」を後から読み分けられるように
 /// するため - **打ち切りは失敗ではない**ので `result` は `"ok"` のまま。
 async fn record_collect_operation(
@@ -1443,8 +1452,18 @@ async fn record_collect_operation(
 /// **ネットワークもディスクも DB も触らない**（メモリ上の状態を読むだけ）
 /// ので、画面はこれをポーリングしてよい。読み取りなので監査しない
 /// （他の read ルートと同じ規約）。
-async fn collect_status_handler(State(state): State<CollectState>) -> Json<CollectorState> {
-    Json(state.collect.state())
+///
+/// 返すのは**公開用の [`CollectorStateView`]** であって、内部の
+/// `CollectorState` ではない（#407 レビュー P2-2）。内部の型は
+/// `StartFailed { reason }` を持っていて、その `reason` には接続先のホストや
+/// `data.dir` の絶対パスが載りうる - 床を `viewer` まで下げた根拠が
+/// 「状態に機微な情報が無いこと」なので、そこは型で担保する。**変換は
+/// [`CollectorService::state_view`] の 1 箇所**で、`src-tauri` の
+/// `collect_status` も同じものを通る（経路によって公開する情報が割れない）。
+/// 起動失敗の理由が利用者へどこで伝わるかは `crate::collect` のモジュール
+/// doc「理由はどこで利用者に伝わるか」。
+async fn collect_status_handler(State(state): State<CollectState>) -> Json<CollectorStateView> {
+    Json(state.collect.state_view())
 }
 
 /// `POST /api/collect/start`（**`editor` 以上** - [`COLLECT_OPERATION_ROLE`]）。
@@ -1497,9 +1516,11 @@ async fn collect_restart_handler(
 /// **なぜ読み取りが `viewer` なのか**（2026-09-20 オーナー決定、#407 レビュー。
 /// 当初は router 全体を `editor` にしていた）: R0 §3.6 の viewer は
 /// 「**閲覧のみ**」であって「何も見えない」ではない。収集が動いているかどうかは
-/// 監視画面（C-3 / R1-D）の基本情報で、[`CollectorState`] には機微な情報が
-/// 何も入っていない（接続先もキーもファイルパスも無い）ので、viewer に見せて
-/// 困るものが無い。すぐ上の [`hub_router`] が読み取りまで `admin` なのは
+/// 監視画面（C-3 / R1-D）の基本情報で、公開する [`CollectorStateView`] には
+/// 機微な情報が何も入っていない（接続先もキーもファイルパスも無い。**内部の
+/// `CollectorState` をそのまま載せないのはこのため** - #407 レビュー P2-2）
+/// ので、viewer に見せて困るものが無い。すぐ上の [`hub_router`] が
+/// 読み取りまで `admin` なのは
 /// **Hub の接続先とキーの情報**を扱うからで、**収集の稼働状態はそれとは性質が
 /// 違う** - 先例に引きずられない、という上と同じ考え方。
 ///
@@ -4279,6 +4300,116 @@ mod tests {
         assert_eq!(
             body["pending"], false,
             "上限に掛かっていないのに「まだ終わっていない」になっている: {body:?}"
+        );
+    }
+
+    /// **#407 レビュー P2-2 の受入条件（REST 側）**: 起動に失敗した後、
+    /// **viewer が状態を読んでも失敗理由が見えない**。
+    ///
+    /// 検証用の目印をタグのアドレスに埋めて `build_config` を失敗させる
+    /// （`banto-tags` はアドレスの書式を検証しないので、REST 経由でも
+    /// そのまま登録できる）。`CollectError::Config` の文言はアドレスを
+    /// そのまま含むので、**内部の `CollectorState` をワイヤに載せていれば
+    /// 目印が必ず出てくる**。
+    ///
+    /// あわせて、**理由がどこで利用者に伝わるか**も同じテストで押さえる -
+    /// 起動を実行した editor には `POST /api/collect/start` の**エラー応答**
+    /// として理由が返る（状態の読み取りから理由を落とした分の埋め合わせが
+    /// 本当に存在すること。`crate::collect` のモジュール doc
+    /// 「理由はどこで利用者に伝わるか」）。
+    ///
+    /// 反証（回帰の検出）: `collect_status_handler` を
+    /// `Json(state.collect.state())`（内部の型）に戻すと、`reason` キーと
+    /// 目印の両方が応答に出て 2 つの `assert!` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_viewer_reading_the_state_never_sees_why_the_start_failed() {
+        const MARKER: &str = "CHRONOGAZER-LEAK-CANARY";
+        let (router, _audit, _admin, editor, viewer) = router_with_role_tokens_and_audit().await;
+
+        // 収集対象を 1 件だけ作る。アドレスが解釈できないので
+        // `build_config` が失敗し、状態に理由（= 目印を含む）が焼き付く。
+        let conn = body_json(
+            router
+                .clone()
+                .oneshot(post_json_auth(
+                    "/api/plc-connections",
+                    &editor,
+                    plc_connection_payload("plc1"),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let group = body_json(
+            router
+                .clone()
+                .oneshot(post_json_auth(
+                    "/api/collection-groups",
+                    &editor,
+                    json!({
+                        "name": "group1",
+                        "plcConnectionId": conn["id"].as_i64().unwrap(),
+                        "periodMs": 1000,
+                        "enabled": true
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let create_tag = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/tags",
+                &editor,
+                json!({
+                    "name": "tag1",
+                    "collectionGroupId": group["id"].as_i64().unwrap(),
+                    "address": MARKER,
+                    "dataType": "i16",
+                    "decimals": 0,
+                    "enabled": true
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(create_tag.status(), StatusCode::OK);
+
+        // 起動した本人（editor）には、エラー応答として理由が返る。
+        let start = router
+            .clone()
+            .oneshot(post_json_auth("/api/collect/start", &editor, json!({})))
+            .await
+            .unwrap();
+        assert_ne!(
+            start.status(),
+            StatusCode::OK,
+            "前提が崩れている: 起動が失敗していない"
+        );
+        let start_body = body_json(start).await.to_string();
+        assert!(
+            start_body.contains(MARKER),
+            "起動を実行した本人にも理由が伝わっていない（埋め合わせが無い）: {start_body}"
+        );
+
+        // viewer が状態を読む: 状態そのものは返るが、理由は返らない。
+        let status = router
+            .oneshot(get_auth("/api/collect", &viewer))
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let body = body_json(status).await;
+        assert_eq!(
+            body["state"], "startFailed",
+            "状態そのものは返すこと（理由だけを落とす）: {body}"
+        );
+        assert!(
+            body.get("reason").is_none(),
+            "`reason` フィールドがワイヤに出ている: {body}"
+        );
+        assert!(
+            !body.to_string().contains(MARKER),
+            "起動失敗の理由が viewer に漏れている: {body}"
         );
     }
 
