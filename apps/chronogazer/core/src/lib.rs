@@ -7,6 +7,10 @@
 pub mod assets;
 pub mod audit;
 pub mod backup;
+// #383 段階2b / R1-C（C-1）: 収集ランタイムのサービス層。`tauri` にも `axum`
+// にも依存しない（この crate の規律 - 上の doc 参照）ので、`src-tauri` と
+// `banto-serve` の両方から同じ形で使える。
+pub mod collect;
 pub mod db;
 pub mod events;
 // #332: Hub 接続（`banto-hub-bootstrap` の配線）。keyring は src-tauri、
