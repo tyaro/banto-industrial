@@ -21,7 +21,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { isRedirect } from '@sveltejs/kit';
-import { guardCategory, type SettingsCategory } from './categories';
+import { guardCategory, SETTINGS_CATEGORIES, type SettingsCategory } from './categories';
 
 const APPEARANCE: SettingsCategory = {
 	id: 'appearance',
@@ -35,6 +35,34 @@ const SECURITY: SettingsCategory = {
 	label: 'セキュリティ'
 };
 const CATEGORIES: SettingsCategory[] = [APPEARANCE, DATA];
+
+describe('SETTINGS_CATEGORIES', () => {
+	it('id・path・ラベルが重複しない（ナビと route が1対1で対応する）', () => {
+		const ids = SETTINGS_CATEGORIES.map((category) => category.id);
+		const paths = SETTINGS_CATEGORIES.map((category) => category.path);
+		const labels = SETTINGS_CATEGORIES.map((category) => category.label);
+		expect(new Set(ids).size).toBe(SETTINGS_CATEGORIES.length);
+		expect(new Set(paths).size).toBe(SETTINGS_CATEGORIES.length);
+		expect(new Set(labels).size).toBe(SETTINGS_CATEGORIES.length);
+	});
+
+	it('#383 段階2b（C-3b）で足した「収集」カテゴリが末尾にあり、既存の並びを崩していない', () => {
+		expect(SETTINGS_CATEGORIES.map((category) => category.id)).toEqual([
+			'appearance',
+			'account',
+			'connectivity',
+			'data',
+			'security',
+			'hub',
+			'collect'
+		]);
+		expect(SETTINGS_CATEGORIES.at(-1)).toEqual({
+			id: 'collect',
+			path: '/settings/collect',
+			label: '収集'
+		});
+	});
+});
 
 describe('guardCategory', () => {
 	it('id が可視カテゴリに含まれる場合は何もしない（redirect しない）', () => {

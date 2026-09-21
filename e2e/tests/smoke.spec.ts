@@ -11,7 +11,9 @@
  *
  * Deliberately scoped to what R1-A actually ships: first-run setup / login /
  * logout, and the three nav destinations that exist today (監視/
- * ヒストリカル/イベント), all of which are still placeholders. There is no
+ * ヒストリカル/イベント). 監視 and ヒストリカル are still placeholders;
+ * イベント was replaced by the real collect-events list in R1-C's C-3b
+ * (#409), and scenario 4 was updated with it. There is no
  * items/dashboard equivalent in this app (R1-A's nav is 監視・ヒストリカル・
  * イベント, not banto admin-template's items demo), and real content behind
  * 監視/ヒストリカル/イベント lands in R1-B..R1-D - extend this suite as each
@@ -78,10 +80,21 @@ test.describe.serial('ChronoGazer R1-A smoke', () => {
 		await expect(page.getByText('この画面は R2 フェーズで実装予定です')).toBeVisible();
 	});
 
-	test('4. events nav renders its R1-C placeholder', async () => {
+	// R1-C の C-3b でプレースホルダが実装に置き換わった（このファイルの doc
+	// comment「extend this suite as each of those phases replaces a placeholder
+	// with real UI」のとおり）。ここでは一覧が描かれることだけを見る - 0 件の
+	// うちは**「読めなかった」ではなく「まだ1件も記録されていない」**と言い分け
+	// られているかを見るのが要点で、収集の状態や操作は
+	// `user-settings-collect.spec.ts` が受け持つ。
+	test('4. events nav renders the collect-events list (R1-C C-3b)', async () => {
 		await page.getByRole('link', { name: 'イベント' }).click();
 		await expect(page).toHaveURL(/\/events$/);
 		await expect(page.getByRole('heading', { level: 2, name: 'イベント' })).toBeVisible();
-		await expect(page.getByText('この画面は R1-C フェーズで実装予定です')).toBeVisible();
+		// 起動時の自動開始は収集対象 0 件で終わっているので、収集エンジンは
+		// 1 度も動いておらず `collect_events` は空。
+		await expect(page.getByText('イベントはまだ1件も記録されていません。')).toBeVisible();
+		// 0 件でも一覧そのものは描かれる（列が消えて「壊れている」ように
+		// 見えない）。
+		await expect(page.getByRole('columnheader', { name: '種類' })).toBeVisible();
 	});
 });

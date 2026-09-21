@@ -14,7 +14,7 @@
 import { redirect } from '@sveltejs/kit';
 
 export type SettingsCategoryId =
-	'appearance' | 'account' | 'connectivity' | 'data' | 'security' | 'hub';
+	'appearance' | 'account' | 'connectivity' | 'data' | 'security' | 'hub' | 'collect';
 
 export interface SettingsCategory {
 	id: SettingsCategoryId;
@@ -30,7 +30,12 @@ export const SETTINGS_CATEGORIES: SettingsCategory[] = [
 	{ id: 'data', path: '/settings/data', label: 'データ' },
 	{ id: 'security', path: '/settings/security', label: 'セキュリティ' },
 	// #332: banto-hub への接続。ナビの最後（既存 5 カテゴリの順序は変えない）。
-	{ id: 'hub', path: '/settings/hub', label: 'Hub接続' }
+	{ id: 'hub', path: '/settings/hub', label: 'Hub接続' },
+	// #383 段階2b / R1-C（C-3b）: 収集ランタイムの状態と操作。`hub` と同じく
+	// ナビの最後に足す（既存カテゴリの順序は変えない）。**admin 限定ではない** -
+	// 状態の読み取りは viewer 以上なので、操作を出さないだけで閲覧はできる
+	// （`+layout.ts` の `visible.collect` とその doc 参照）。
+	{ id: 'collect', path: '/settings/collect', label: '収集' }
 ];
 
 /**
