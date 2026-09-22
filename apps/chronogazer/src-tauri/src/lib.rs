@@ -31,7 +31,7 @@ use chronogazer_core::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 // 自動開始を足し、C-3a で読み出し 3 本（現在値・接続状態・イベント一覧）を
 // 足した（監査の `resource` も床も REST と共有の定数）。
 use chronogazer_core::collect::{
-    resolve_data_dir, CollectEventRow, CollectOutcome, CollectorService, CollectorStateView,
+    resolve_data_dir, CollectEventList, CollectOutcome, CollectorService, CollectorStateView,
     ConnectionStatusView, CurrentSampleView, EventPage, Readout, COLLECT_AUDIT_RESOURCE,
     COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
 };
@@ -2037,18 +2037,30 @@ async fn collect_events_list_body(
     state: &AppState,
     offset: Option<u64>,
     limit: Option<u64>,
-) -> Result<Readout<ListResult<CollectEventRow>>, BantoError> {
+    as_of_id: Option<i64>,
+) -> Result<Readout<CollectEventList>, BantoError> {
     require_collect_reader(state).await?;
-    Ok(state.collect.events(EventPage::new(offset, limit)).await)
+    Ok(state
+        .collect
+        .events(EventPage::new(offset, limit).as_of(as_of_id))
+        .await)
 }
 
 /// `GET`-ish command: `collect_events` の 1 ページ（**新しい順**）。
 /// **`viewer` 以上**。
 ///
-/// 総件数は `ListResult::totalCount` で返す - [`audit_log_list`]（監査ログ
-/// 一覧）と同じ型・同じ綴りで、既定の取得件数も同じ 50
+/// 総件数は `totalCount` で返す - [`audit_log_list`]（監査ログ
+/// 一覧）と同じ綴りで、既定の取得件数も同じ 50
 /// （docs/r1-plan.md の R1-C「`collect_events` のイベント一覧ページ
 /// （banto 監査ログページの流儀）」）。
+///
+/// **`asOfId` は任意のスナップショット境界**（#409 レビュー P2-2。
+/// `chronogazer_core::collect::EventPage` の doc）: 件数も行も
+/// `id <= asOfId` で絞る。省略するとその時点の最大 `id` が境界になり、
+/// 使った境界が応答の `asOfId` に入る。画面は 1 つの世代の最初の応答で
+/// これを固定し、同じ世代の後続ブロックすべてに渡す - そうしないと、
+/// ブロック取得の合間に足されたイベントで `offset` がずれ、境界で行が
+/// 重複し末尾が漏れる。
 ///
 /// **`detail` 列は返さない**（`chronogazer_core::collect::CollectEventRow` の
 /// doc）: 自由文で、切断理由（接続先を含みうる）や書き込みエラー（ファイル
@@ -2061,8 +2073,9 @@ async fn collect_events_list(
     state: State<'_, AppState>,
     offset: Option<u64>,
     limit: Option<u64>,
-) -> Result<Readout<ListResult<CollectEventRow>>, BantoError> {
-    collect_events_list_body(&state, offset, limit).await
+    as_of_id: Option<i64>,
+) -> Result<Readout<CollectEventList>, BantoError> {
+    collect_events_list_body(&state, offset, limit, as_of_id).await
 }
 
 /// How long [`shutdown_app_state`] is allowed to take in total before the
@@ -3395,7 +3408,7 @@ mod tests {
         collect_connections_body(&state)
             .await
             .expect_err("未認証で接続状態が読めている");
-        collect_events_list_body(&state, None, None)
+        collect_events_list_body(&state, None, None, None)
             .await
             .expect_err("未認証でイベント一覧が読めている");
 
@@ -3422,7 +3435,7 @@ mod tests {
         assert_eq!(connections, Readout::NotRunning, "{connections:?}");
 
         // イベント一覧は走っていなくても読める（0 件という事実が返る）。
-        let events = collect_events_list_body(&state, None, None)
+        let events = collect_events_list_body(&state, None, None, None)
             .await
             .expect("viewer はイベント一覧を読めること");
         assert_eq!(

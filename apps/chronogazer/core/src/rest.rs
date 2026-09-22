@@ -51,7 +51,7 @@
 //! | POST   | `/api/collect/start\|stop\|restart` | -     | `CollectOutcome` (editor+) |
 //! | GET    | `/api/collect/values` | -                   | `Readout<{[tagKey]: CurrentSampleView}>` (viewer+, C-3a) |
 //! | GET    | `/api/collect/connections` | -              | `Readout<{[connKey]: ConnectionStatusView}>` (viewer+, C-3a) |
-//! | GET    | `/api/collect/events?offset=&limit=` | -    | `Readout<ListResult<CollectEventRow>>` (viewer+, C-3a) |
+//! | GET    | `/api/collect/events?offset=&limit=&asOfId=` | -    | `Readout<CollectEventList>` (viewer+, C-3a / `asOfId` = #409) |
 //!
 //! `/api/ui-settings/*` (spec M12 SettingsProvider migration): per-user UI
 //! settings (theme/preset/dock layout), namespaced by the caller's own
@@ -188,7 +188,7 @@ use tokio::sync::broadcast;
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 use crate::collect::{
-    CollectEventRow, CollectOutcome, CollectorService, CollectorStateView, ConnectionStatusView,
+    CollectEventList, CollectOutcome, CollectorService, CollectorStateView, ConnectionStatusView,
     CurrentSampleView, EventPage, Readout, COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE,
     COLLECT_READ_ROLE,
 };
@@ -1513,11 +1513,14 @@ async fn collect_connections_handler(
     Json(state.collect.connections().await)
 }
 
-/// `GET /api/collect/events?offset=&limit=` のクエリ（C-3a）。
+/// `GET /api/collect/events?offset=&limit=&asOfId=` のクエリ（C-3a。
+/// `asOfId` は #409 レビュー P2-2）。
 ///
-/// どちらも省略可（既定は先頭から `crate::collect::COLLECT_EVENTS_DEFAULT_LIMIT`
-/// 件）。範囲外の `limit` は [`EventPage::new`] が丸める - 拒否しないのは、
-/// 画面のページャが素直に使えるようにするため。
+/// どれも省略可（既定は先頭から `crate::collect::COLLECT_EVENTS_DEFAULT_LIMIT`
+/// 件、境界はその時点の最大 `id`）。範囲外の `limit` は [`EventPage::new`] が
+/// 丸める - 拒否しないのは、画面のページャが素直に使えるようにするため。
+/// `asOfId` はスナップショット境界（[`EventPage`] の doc）で、画面は世代の
+/// 最初の応答で返ってきた値を後続ブロックに渡す。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CollectEventsQuery {
@@ -1525,6 +1528,8 @@ struct CollectEventsQuery {
     offset: Option<u64>,
     #[serde(default)]
     limit: Option<u64>,
+    #[serde(default)]
+    as_of_id: Option<i64>,
 }
 
 /// `GET /api/collect/events`（**`viewer` 以上**、C-3a）: `collect_events` の
@@ -1546,11 +1551,11 @@ struct CollectEventsQuery {
 async fn collect_events_handler(
     State(state): State<CollectState>,
     Query(query): Query<CollectEventsQuery>,
-) -> Json<Readout<ListResult<CollectEventRow>>> {
+) -> Json<Readout<CollectEventList>> {
     Json(
         state
             .collect
-            .events(EventPage::new(query.offset, query.limit))
+            .events(EventPage::new(query.offset, query.limit).as_of(query.as_of_id))
             .await,
     )
 }
@@ -4756,6 +4761,7 @@ mod tests {
         // 2 ページ目。
         let body = body_json(
             router
+                .clone()
                 .oneshot(get_auth("/api/collect/events?limit=2&offset=2", &viewer))
                 .await
                 .unwrap(),
@@ -4764,5 +4770,28 @@ mod tests {
         let rows = body["data"]["rows"].as_array().unwrap().clone();
         assert_eq!(rows.len(), 1, "?offset= が効いていない: {body}");
         assert_eq!(rows[0]["kind"], "collection_started");
+        assert_eq!(
+            body["data"]["asOfId"], 3,
+            "境界未指定ならその時点の最大 id を使い、応答に載せること: {body}"
+        );
+
+        // スナップショット境界（#409 レビュー P2-2）: `?asOfId=` が効き、
+        // 境界の後の行は件数にも行にも入らない。
+        let body = body_json(
+            router
+                .oneshot(get_auth("/api/collect/events?asOfId=2", &viewer))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["data"]["asOfId"], 2, "?asOfId= が効いていない: {body}");
+        assert_eq!(body["data"]["totalCount"], 2, "{body}");
+        let ids: Vec<i64> = body["data"]["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![2, 1], "境界の後の行が混ざった: {body}");
     }
 }

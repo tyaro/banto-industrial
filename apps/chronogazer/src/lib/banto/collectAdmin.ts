@@ -145,6 +145,20 @@ export interface CollectEventRow {
 	value: number | null;
 }
 
+/**
+ * `chronogazer_core::collect::CollectEventList`。イベント一覧 1 ページ分の
+ * 応答。
+ *
+ * `rows`/`totalCount` は監査ログ一覧（`ListResult`）と同じ綴りで、そこに
+ * **この応答が使ったスナップショット境界** `asOfId` が 1 つ足してある
+ * （#409 レビュー P2-2）。件数も行も `id <= asOfId` で絞られている。
+ * **表が空のときは `0`**（`collect_events.id` は 1 から振られるので、
+ * 「どの行も含まない境界」）。
+ */
+export interface CollectEventList extends ListResult<CollectEventRow> {
+	asOfId: number;
+}
+
 export const DEMO_MODE_MESSAGE = 'デモモードでは利用できません';
 
 function demoModeError(): ProviderError {
@@ -264,28 +278,34 @@ export async function getCollectConnections(
 /**
  * `collect_events` の 1 ページ（**新しい順**、`viewer` 以上）。
  *
- * 総件数は `ListResult.totalCount`（監査ログ一覧と同じ型・同じ綴り）。
+ * 総件数は `totalCount`（監査ログ一覧の `ListResult` と同じ綴り）。
  * `limit` はサーバー側で `1..=500` に丸められる（`?limit=` は URL に誰でも
  * 書けるため）。**`notRunning` は返らない** - 過去の記録なので、収集が
  * 止まっていても読めなければ意味が無い。
+ *
+ * **`asOfId` = スナップショット境界**（#409 レビュー P2-2）。`null` を渡すと
+ * サーバーが**その時点の最大 `id`** を境界にして、使った境界を
+ * [`CollectEventList.asOfId`] で返す。画面は 1 つの「世代」の最初の応答で
+ * それを固定し、同じ世代の後続ブロックにすべて渡す - 渡さないと、ブロック
+ * 取得の合間に足されたイベントで `offset` がずれ、**境界で行が重複し、末尾の
+ * 行が一覧から漏れる**（判断は `routes/(app)/events/eventBlocks.ts`）。
  */
 export async function listCollectEvents(
 	offset: number,
 	limit: number,
+	asOfId: number | null,
 	signal?: AbortSignal
-): Promise<Readout<ListResult<CollectEventRow>>> {
+): Promise<Readout<CollectEventList>> {
 	if (!isCollectAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri')
-		return invokeCommand<Readout<ListResult<CollectEventRow>>>('collect_events_list', {
+		return invokeCommand<Readout<CollectEventList>>('collect_events_list', {
 			offset,
-			limit
+			limit,
+			asOfId
 		});
 	const query = new URLSearchParams({ offset: String(offset), limit: String(limit) });
-	return httpJson<Readout<ListResult<CollectEventRow>>>(
-		`/api/collect/events?${query}`,
-		'GET',
-		signal
-	);
+	if (asOfId !== null) query.set('asOfId', String(asOfId));
+	return httpJson<Readout<CollectEventList>>(`/api/collect/events?${query}`, 'GET', signal);
 }
 
 // --- 操作（editor 以上） ----------------------------------------------------

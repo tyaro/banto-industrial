@@ -31,6 +31,12 @@
 	 *    置いていない。切断理由が画面に要ると判断したら、発生源
 	 *    （`banto-collect`）で「見せてよい理由」を分類するのが筋で、ここでは
 	 *    やらない。
+	 *
+	 * **ブロックキャッシュの判断は `./eventBlocks.ts` に出してある**（#409
+	 * オーナーレビュー P2 の 3 件: 初回失敗からの回復・ブロック境界の重複と
+	 * 欠落・別ブロックの成功が失敗を消すこと）。どのブロックを取るか、世代の
+	 * スナップショット境界（`asOfId`）、失敗の持ち方、「再読み込み」で何を
+	 * 取り直すかは全部あちらの純関数が決め、表テストで固定してある。
 	 */
 	import { untrack } from 'svelte';
 	import { BantoGrid, GridState, type GridColumn } from '@banto/grid-svelte';
@@ -43,9 +49,16 @@
 		isCollectAvailable,
 		listCollectEvents,
 		runWithLimit,
-		type CollectEventRow,
-		type ReadoutState
+		type CollectEventRow
 	} from '$lib/banto/collectAdmin';
+	import {
+		EventBlockLoader,
+		initialCache,
+		viewState,
+		type BlockOutcome,
+		type BlockRequest,
+		type EventsViewState
+	} from './eventBlocks';
 
 	/** `/audit-log` の同名関数と同じ（この画面に検証エラーは返らない）。 */
 	function errorMessage(err: unknown): string {
@@ -130,146 +143,78 @@
 
 	const gridState = new GridState<CollectEventRow>(columns);
 
-	const BLOCK_SIZE = 200;
-
 	/**
-	 * `/audit-log` の `AuditLogWindow` の縮小コピー（ブロック単位フェッチ・
-	 * 世代カウンタによる競合防止は同じ）。違いは 2 つ:
+	 * ブロックキャッシュの**判断**は `./eventBlocks.ts`（純関数 +
+	 * `EventBlockLoader`）に出してあり、この画面はそれを呼んで `$state` に
+	 * 書き戻すだけ（#409 オーナーレビュー P2 の 3 件。`tagsPageLogic.ts` と
+	 * 同じ作法で、状態遷移を表テストで固定する）。ここに残っているのは:
 	 *
-	 * - 取得が `Readout` なので、**`unavailable` を空に潰さず `readout` に
-	 *   残す**（行も総件数もそのまま残し、注記だけを足す）。
-	 * - 並べ替え・絞り込みが無いので `params`/`setParams` を持たない。
-	 *
-	 * **読み取り 1 回に上限を掛ける**（`COLLECT_READ_TIMEOUT_MS`）。backend は
-	 * 2 秒で必ず `unavailable` を返すが、**reject ではなく無応答**の相手
-	 * （TCP は繋がるが応答が返らない）だと `catch` に入らないまま `loading` が
-	 * 降りず、一覧が永久に「読み込み中」で固まる - `HubSection.svelte` の
-	 * ポーリングで踏んだのと同じ型。
+	 * - 取得 1 本の作り方（**読み取り 1 回に上限を掛ける** -
+	 *   `COLLECT_READ_TIMEOUT_MS`。backend は 2 秒で必ず `unavailable` を
+	 *   返すが、**reject ではなく無応答**の相手だと `catch` に入らないまま
+	 *   `loading` が降りず、一覧が永久に「読み込み中」で固まる。
+	 *   `HubSection.svelte` のポーリングで踏んだのと同じ型）、
+	 * - 行の配列（`$state`）への書き戻し。
 	 */
-	class CollectEventsWindow {
-		rows: (CollectEventRow | undefined)[] = $state([]);
-		totalCount = $state(0);
-		loading = $state(false);
-		/** 最後に**読めた**結末。`null` = まだ一度も読めていない。 */
-		readout = $state<ReadoutState | null>(null);
-		/** 往復そのものが失敗した（アプリに届かなかった／打ち切った）ときの文言。 */
-		error = $state<string | null>(null);
+	let rows = $state<(CollectEventRow | undefined)[]>([]);
+	let view = $state<EventsViewState>(viewState(initialCache()));
 
-		#loadedBlocks = new Set<number>();
-		#inFlightBlocks = new Map<number, Promise<void>>();
-		#generation = 0;
-		#hasTotalCountForGeneration = false;
-
-		#blocksFor(start: number, end: number): number[] {
-			if (end <= start) return [];
-			const firstBlock = Math.floor(start / BLOCK_SIZE);
-			const lastBlock = Math.floor((end - 1) / BLOCK_SIZE);
-			const blocks: number[] = [];
-			for (let b = firstBlock; b <= lastBlock; b++) blocks.push(b);
-			return blocks;
+	/** 1 ブロックの取得。**結末を返し、reject しない**（`runWithLimit` の約束）。 */
+	async function fetchBlock(request: BlockRequest): Promise<BlockOutcome> {
+		const outcome = await runWithLimit(
+			(signal) => listCollectEvents(request.offset, request.limit, request.asOfId, signal),
+			COLLECT_READ_TIMEOUT_MS
+		);
+		if (outcome.kind === 'failed') return { kind: 'error', message: errorMessage(outcome.error) };
+		if (outcome.kind === 'timedOut') {
+			// 打ち切りは**失敗ではない**（アプリ側の読み取りは続いている）。
+			// それでも画面にとっては「今は読めていない」なので、黙らない。
+			return {
+				kind: 'error',
+				message: `イベントの読み取りが${Math.round(COLLECT_READ_TIMEOUT_MS / 1000)}秒以内に返りませんでした。待つのをやめただけなので、「再読み込み」でもう一度試せます。`
+			};
 		}
-
-		async ensureRange(start: number, end: number): Promise<void> {
-			const generation = this.#generation;
-			const blocks = this.#blocksFor(start, end).filter(
-				(block) => !this.#loadedBlocks.has(block) && !this.#inFlightBlocks.has(block)
-			);
-			if (blocks.length === 0) return;
-
-			this.loading = true;
-			const fetches = blocks.map((block) => this.#fetchBlock(block, generation));
-			blocks.forEach((block, i) => this.#inFlightBlocks.set(block, fetches[i]));
-			try {
-				await Promise.all(fetches);
-			} finally {
-				if (generation === this.#generation) {
-					blocks.forEach((block) => this.#inFlightBlocks.delete(block));
-					this.loading = this.#inFlightBlocks.size > 0;
-				}
-			}
-		}
-
-		async #fetchBlock(block: number, generation: number): Promise<void> {
-			const offset = block * BLOCK_SIZE;
-			const outcome = await runWithLimit(
-				(signal) => listCollectEvents(offset, BLOCK_SIZE, signal),
-				COLLECT_READ_TIMEOUT_MS
-			);
-			if (generation !== this.#generation) return;
-
-			if (outcome.kind === 'failed') {
-				this.error = errorMessage(outcome.error);
-				return;
-			}
-			if (outcome.kind === 'timedOut') {
-				// 打ち切りは**失敗ではない**（アプリ側の読み取りは続いている）。
-				// それでも画面にとっては「今は読めていない」なので、黙らない。
-				this.error = `イベントの読み取りが${Math.round(COLLECT_READ_TIMEOUT_MS / 1000)}秒以内に返りませんでした。待つのをやめただけなので、「再読み込み」でもう一度試せます。`;
-				return;
-			}
-
-			this.error = null;
-			this.readout = outcome.value.state;
-			// 読めなかった（`unavailable`）ときは**行も件数も触らない** -
-			// 0 件に潰すと「記録がありません」という別の嘘になる。
-			if (outcome.value.state !== 'ready') return;
-
-			const result = outcome.value.data;
-			if (!this.#hasTotalCountForGeneration) {
-				this.#hasTotalCountForGeneration = true;
-				this.totalCount = result.totalCount;
-				this.rows.length = result.totalCount;
-			}
-			if (this.rows.length < offset + result.rows.length) {
-				this.rows.length = offset + result.rows.length;
-			}
-			for (let i = 0; i < result.rows.length; i++) {
-				this.rows[offset + i] = result.rows[i];
-			}
-			this.#loadedBlocks.add(block);
-		}
-
-		/**
-		 * 手で押す「再読み込み」。**自動では再試行しない**ので（「自動で再試行
-		 * します」と書いたら本当にやる、の裏返し）、読めなかったときに利用者が
-		 * 抜け出せる手段をここに 1 つだけ置く。
-		 *
-		 * **`loading` をここで降ろす**のが要点。世代を進めた時点で飛行中の取得は
-		 * もう自分のものではなく、その `ensureRange` の `finally` は世代違いで
-		 * `loading` を触らずに抜ける - 降ろさないと `loading` が true のまま
-		 * 残り、**この「再読み込み」ボタンが二度と押せなくなる**（唯一の回復
-		 * 導線が、回復したいときだけ死ぬ）。飛行中の分は `#inFlightBlocks` ごと
-		 * 捨てているので、この世代に飛んでいるものは 0 件で正しい。
-		 */
-		reload(start: number, end: number): void {
-			this.#generation++;
-			this.#loadedBlocks.clear();
-			this.#inFlightBlocks.clear();
-			this.#hasTotalCountForGeneration = false;
-			this.loading = false;
-			void this.ensureRange(start, end);
-		}
+		// 読めなかった（`unavailable`）ときは**行も件数も触らない** -
+		// 0 件に潰すと「記録がありません」という別の嘘になる。
+		if (outcome.value.state !== 'ready') return { kind: 'readout', readout: outcome.value.state };
+		return { kind: 'ready', list: outcome.value.data };
 	}
 
-	const windowed = new CollectEventsWindow();
-
-	// `untrack`: `ensureRange()` は effect の追跡スコープ内で `rows`/`loading`
-	// を読み書きするので、これが無いと自分の書き込みで再実行し続ける
-	// （`/audit-log` の同じ effect と同じ理由・同じ書き方）。
-	$effect(() => {
-		if (!available) return;
-		untrack(() => void windowed.ensureRange(0, 100));
+	const loader = new EventBlockLoader(fetchBlock, {
+		resetRows(length) {
+			// 世代の最初の応答。前の世代の行は境界がずれているので残さない。
+			rows = new Array<CollectEventRow | undefined>(length);
+		},
+		writeRows(offset, block) {
+			if (rows.length < offset + block.length) rows.length = offset + block.length;
+			for (let i = 0; i < block.length; i++) rows[offset + i] = block[i];
+		},
+		update(next) {
+			view = next;
+		}
 	});
 
-	let visibleRange = { start: 0, end: 100 };
+	// `untrack`: 取得は effect の追跡スコープ内で `rows`/`view` を読み書きする
+	// ので、これが無いと自分の書き込みで再実行し続ける（`/audit-log` の同じ
+	// effect と同じ理由・同じ書き方）。
+	$effect(() => {
+		if (!available) return;
+		untrack(() => loader.setRange(0, 100));
+	});
 
 	function handleVisibleRangeChange(range: { start: number; end: number }): void {
-		visibleRange = range;
-		void windowed.ensureRange(range.start, range.end);
+		loader.setRange(range.start, range.end);
 	}
 
+	/**
+	 * 手で押す「再読み込み」。**自動では再試行しない**ので（「自動で再試行
+	 * します」と書いたら本当にやる、の裏返し）、読めなかったときに利用者が
+	 * 抜け出せる手段をここに 1 つだけ置く。取り直す対象（失敗したブロック /
+	 * 総件数が未取得なら先頭ブロック）は `eventBlocks.ts` の
+	 * `blocksToFetch` が決める。
+	 */
 	function reload(): void {
-		windowed.reload(visibleRange.start, visibleRange.end);
+		loader.reload();
 	}
 </script>
 
@@ -288,20 +233,25 @@
 			`readout` が `null` のうちは件数を言わない（0 件と言い切らない）。
 		-->
 		<p class="note">
-			{#if windowed.readout === null}
+			{#if view.readout === null}
 				イベントを読み込んでいます。
 			{:else}
-				{collectEventsNote(windowed.readout, windowed.totalCount)}
+				{collectEventsNote(view.readout, view.totalCount)}
 			{/if}
 		</p>
 
-		{#if windowed.error}
-			<p class="error">{windowed.error}</p>
+		{#if view.errorText}
+			<p class="error">{view.errorText}</p>
 		{/if}
 
-		{#if windowed.error || windowed.readout === 'unavailable' || windowed.readout === 'notRunning'}
+		<!--
+			**失敗はブロック単位**なので、別のブロックが読めても消えない
+			（#409 レビュー P2-3）。1 つでも失敗が残っているうちは、再試行の
+			導線を出し続ける。
+		-->
+		{#if view.failedBlockCount > 0}
 			<div class="actions">
-				<button type="button" onclick={reload} disabled={windowed.loading}>再読み込み</button>
+				<button type="button" onclick={reload} disabled={view.loading}>再読み込み</button>
 			</div>
 		{/if}
 
@@ -309,8 +259,8 @@
 			<BantoGrid
 				mode="server"
 				state={gridState}
-				rows={windowed.rows}
-				totalRows={windowed.totalCount}
+				{rows}
+				totalRows={view.totalCount}
 				{columns}
 				getRowId={(row) => row.id}
 				onVisibleRangeChange={handleVisibleRangeChange}
