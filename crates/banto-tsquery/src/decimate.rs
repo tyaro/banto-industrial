@@ -125,17 +125,21 @@ pub(crate) async fn read_decimated(
     // rather than the last valid index of the requested single bin). Using
     // the +1-wide value guarantees ceil(inclusive_width / target_bins)
     // bins, evenly spaced, always cover q_to_ms inside the last bin rather
-    // than spilling into an extra one.
+    // than spilling into an extra one. (This reasoning is unchanged from
+    // before this fix - only the variable names became q_from_ms/q_to_ms
+    // for the clamp introduced above, and the ceil itself moved into
+    // `ceil_div` below.)
     //
     // `q_to_ms - q_from_ms` still cannot overflow `i64` even after
     // clamping to `SAFE_QUERY_BOUND_MS` (max magnitude `i64::MAX / 2`), but
     // `saturating_sub` is kept as defense-in-depth (this arithmetic has no
     // other guard between it and a caller).
     let inclusive_width_ms = q_to_ms.saturating_sub(q_from_ms).max(0).saturating_add(1);
-    // Ceiling division without the old `inclusive_width_ms + (target_bins -
-    // 1)` pre-padding trick: that addition itself could overflow once
-    // inclusive_width_ms is already large, which used to silently fall back
-    // to `raw_bin_ms = i64::MAX` regardless of target_bins (losing the
+    // `ceil_div`, not the old `(inclusive_width_ms + target_bins - 1) /
+    // target_bins` pre-padding trick: that addition itself could overflow
+    // once inclusive_width_ms is already large (as it now legitimately can
+    // be, post-clamp, for an extreme range), which used to silently fall
+    // back to `raw_bin_ms = i64::MAX` regardless of target_bins (losing the
     // requested granularity) rather than actually dividing.
     let raw_bin_ms = ceil_div(inclusive_width_ms, target_bins as i64).max(1);
 
