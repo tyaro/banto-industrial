@@ -45,7 +45,7 @@ use banto_tags::{
 use banto_tstore::{list_data_files, TsReader};
 use chronogazer_core::collect::{
     resolve_data_dir, CollectEventRow, CollectorService, CollectorState, ConnectionStatusView,
-    EventPage, QualityView, Readout,
+    ConnectionView, EventPage, QualityView, Readout,
 };
 use chronogazer_core::db::init_db;
 use sqlx::SqlitePool;
@@ -264,7 +264,19 @@ async fn roundtrip(protocol: Protocol, protocol_name: &str, address: &str) {
     wait_until("接続状態が connected になること", || async {
         match svc.connections().await {
             Readout::Ready { data } => match data.get(&conn_key) {
-                Some(ConnectionStatusView::Connected) => Ok(()),
+                // #417: 行は `ConnectionView`。開発用 PLC は普通の接続として
+                // 登録しているので、走っている収集から見ても simulation は false
+                // （= 値はデータファイルに記録される。下の (c) と対）。
+                Some(ConnectionView {
+                    status: ConnectionStatusView::Connected,
+                    simulation,
+                }) => {
+                    assert!(
+                        !simulation,
+                        "開発用 PLC がシミュレーション接続として走っている（記録されない）"
+                    );
+                    Ok(())
+                }
                 other => Err(format!("{conn_key} = {other:?}")),
             },
             other => Err(other.as_str().to_string()),

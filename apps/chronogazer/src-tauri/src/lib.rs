@@ -32,17 +32,18 @@ use chronogazer_core::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 // 足した（監査の `resource` も床も REST と共有の定数）。
 use chronogazer_core::collect::{
     resolve_data_dir, CollectEventList, CollectOutcome, CollectorService, CollectorStateView,
-    ConnectionStatusView, CurrentSampleView, EventPage, Readout, COLLECT_AUDIT_RESOURCE,
+    ConnectionView, CurrentSampleView, EventPage, Readout, COLLECT_AUDIT_RESOURCE,
     COLLECT_OPERATION_ROLE, COLLECT_READ_ROLE,
 };
 use chronogazer_core::db::init_db;
 use chronogazer_core::events::event_channel;
 use chronogazer_core::hub::{HubService, HubSubscriptionView, HubView};
 use chronogazer_core::rest::{
-    api_router, audited_credential_verifier, CollectionGroupPayload, PlcConnectionPayload,
-    PlcConnectionResponse, TagPayload,
+    api_router, audited_credential_verifier, plc_connection_audit_detail, update_plc_connection,
+    CollectionGroupPayload, PlcConnectionPayload, PlcConnectionResponse, TagPayload,
 };
 use chronogazer_core::settings::{AuditSettings, AuthSettings, ServerSettings, SettingsService};
+use chronogazer_core::simulation::{simulation_coverage, SimulationCoverageEntry};
 use chronogazer_core::users::{Role, UserIdentity, UserSummary, UsersService};
 // #383 段階2a / R1-B: レジストリ3サービスと行型。`chronogazer_core::lib.rs`の
 // re-export 経由（invariant: このクレートは banto-tags を直接 depend
@@ -1164,15 +1165,18 @@ async fn plc_connections_get(
     ))
 }
 
-/// `editor`+ (R0 §3.6): create a PLC connection.
-#[tauri::command]
-async fn plc_connections_create(
-    state: State<'_, AppState>,
+/// Body of [`plc_connections_create`]（spec M14 split-function pattern -
+/// `State` を組み立てずにテストから呼ぶため、#413）。
+async fn plc_connections_create_body(
+    state: &AppState,
     input: PlcConnectionPayload,
 ) -> Result<PlcConnectionResponse, BantoError> {
-    let actor = require_role(&state, Role::Editor, "plc_connections").await?;
+    let actor = require_role(state, Role::Editor, "plc_connections").await?;
     reject_disallowed_connection_protocol(&input.protocol)?;
-    let created = state.plc_connections.create(input.into()).await?;
+    let created = state
+        .plc_connections
+        .create(input.into_create_input())
+        .await?;
     state
         .audit
         .record(AuditEntry {
@@ -1181,7 +1185,8 @@ async fn plc_connections_create(
             action: "create",
             resource: "plc_connections",
             entity_id: Some(&created.id.to_string()),
-            detail: Some(serde_json::json!({ "name": created.name, "enabled": created.enabled })),
+            // REST と同じ helper（#413: `simulation` の切替も残す）。
+            detail: Some(plc_connection_audit_detail(&created)),
             origin: "tauri",
             result: "ok",
         })
@@ -1189,16 +1194,28 @@ async fn plc_connections_create(
     Ok(PlcConnectionResponse::from(created))
 }
 
-/// `editor`+ (R0 §3.6): update a PLC connection.
+/// `editor`+ (R0 §3.6): create a PLC connection. `input.simulation`
+/// （#413、作成での省略は `false`。更新での省略は既存の値を保つ -
+/// `update_plc_connection`）は `chronogazer_core::rest::PlcConnectionPayload`
+/// の doc のとおり REST と同じ扱い。
 #[tauri::command]
-async fn plc_connections_update(
+async fn plc_connections_create(
     state: State<'_, AppState>,
+    input: PlcConnectionPayload,
+) -> Result<PlcConnectionResponse, BantoError> {
+    plc_connections_create_body(&state, input).await
+}
+
+/// Body of [`plc_connections_update`]（#413、同上）。
+async fn plc_connections_update_body(
+    state: &AppState,
     id: i64,
     input: PlcConnectionPayload,
 ) -> Result<PlcConnectionResponse, BantoError> {
-    let actor = require_role(&state, Role::Editor, "plc_connections").await?;
+    let actor = require_role(state, Role::Editor, "plc_connections").await?;
     reject_disallowed_connection_protocol(&input.protocol)?;
-    let updated = state.plc_connections.update(id, input.into()).await?;
+    // #417 監査 P2: `simulation` の省略は既存行の値を保つ（REST と同じ関数）。
+    let updated = update_plc_connection(&state.plc_connections, id, input).await?;
     state
         .audit
         .record(AuditEntry {
@@ -1207,12 +1224,48 @@ async fn plc_connections_update(
             action: "update",
             resource: "plc_connections",
             entity_id: Some(&id.to_string()),
-            detail: Some(serde_json::json!({ "name": updated.name, "enabled": updated.enabled })),
+            detail: Some(plc_connection_audit_detail(&updated)),
             origin: "tauri",
             result: "ok",
         })
         .await;
     Ok(PlcConnectionResponse::from(updated))
+}
+
+/// `editor`+ (R0 §3.6): update a PLC connection. `simulation` の切替は
+/// 走っている収集には「収集を再起動」まで反映されない（C-2 の決定）。
+#[tauri::command]
+async fn plc_connections_update(
+    state: State<'_, AppState>,
+    id: i64,
+    input: PlcConnectionPayload,
+) -> Result<PlcConnectionResponse, BantoError> {
+    plc_connections_update_body(&state, id, input).await
+}
+
+/// Body of [`simulation_coverage_list`]（#413）。
+async fn simulation_coverage_list_body(
+    state: &AppState,
+) -> Result<Vec<SimulationCoverageEntry>, BantoError> {
+    require_role(state, Role::Viewer, "tags").await?;
+    simulation_coverage(
+        &state.plc_connections,
+        &state.collection_groups,
+        &state.tags,
+    )
+    .await
+}
+
+/// `viewer`+（#413）: シミュレーション接続の配下のタグごとに、シミュレータが
+/// 値を動かす番地かどうか。REST の `GET /api/simulation-coverage` と同じ
+/// `chronogazer_core::simulation::simulation_coverage` を呼ぶ（判定は
+/// `banto_collect::simulation::classify_plc_tag` の 1 か所）。読み取りなので
+/// 監査しない。
+#[tauri::command]
+async fn simulation_coverage_list(
+    state: State<'_, AppState>,
+) -> Result<Vec<SimulationCoverageEntry>, BantoError> {
+    simulation_coverage_list_body(&state).await
 }
 
 /// `editor`+ (R0 §3.6): delete a PLC connection. Refuses (friendly
@@ -2012,7 +2065,7 @@ async fn collect_values(
 /// Body of [`collect_connections`]（spec M14 split-function pattern）。
 async fn collect_connections_body(
     state: &AppState,
-) -> Result<Readout<HashMap<String, ConnectionStatusView>>, BantoError> {
+) -> Result<Readout<HashMap<String, ConnectionView>>, BantoError> {
     require_collect_reader(state).await?;
     Ok(state.collect.connections().await)
 }
@@ -2028,7 +2081,7 @@ async fn collect_connections_body(
 #[tauri::command]
 async fn collect_connections(
     state: State<'_, AppState>,
-) -> Result<Readout<HashMap<String, ConnectionStatusView>>, BantoError> {
+) -> Result<Readout<HashMap<String, ConnectionView>>, BantoError> {
     collect_connections_body(&state).await
 }
 
@@ -2624,6 +2677,7 @@ pub fn run() {
             tags_create,
             tags_update,
             tags_delete,
+            simulation_coverage_list,
             collect_status,
             collect_start,
             collect_stop,
@@ -3293,8 +3347,9 @@ mod tests {
                     unit_id: 1,
                     enabled: true,
                     word_order: String::new(),
+                    simulation: None,
                 }
-                .into(),
+                .into_create_input(),
             )
             .await
             .expect("create plc connection");
@@ -3446,5 +3501,143 @@ mod tests {
         let page = events.data().expect("ready");
         assert!(page.rows.is_empty());
         assert_eq!(page.total_count, 0);
+    }
+
+    // --- #413: 接続単位シミュレーション -------------------------------------
+
+    fn sim_payload(name: &str, simulation: Option<bool>) -> PlcConnectionPayload {
+        PlcConnectionPayload {
+            name: name.to_string(),
+            protocol: "modbus-tcp".to_string(),
+            host: "192.168.11.200".to_string(),
+            port: 502,
+            unit_id: 1,
+            enabled: true,
+            word_order: String::new(),
+            simulation,
+        }
+    }
+
+    /// **Tauri 経路**で `simulation: true` が保存・返却され、監査の `detail`
+    /// に切替が残る。viewer の変更は `Forbidden`。viewer は範囲外の判定を
+    /// 読める。`chronogazer_core::rest` の
+    /// `plc_connection_simulation_is_saved_returned_and_audited_over_rest`
+    /// と**対になる双子のテスト**（両経路が同じことを主張する）。
+    ///
+    /// **省略した更新は既存の `true` を保ち**、明示の `false` で `false` に
+    /// なる（#417 監査 P2。REST 側の双子のテストと同じ主張）。
+    ///
+    /// 反証（回帰の検出）: `plc_connections_create_body` の監査を
+    /// `json!({ "name", "enabled" })`（#413 の前）に戻すと `detail["simulation"]`
+    /// の `assert_eq!` が落ちる。`update_plc_connection` を通さず
+    /// `None` を `false` にすると「省略した更新」の `assert!` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plc_connection_simulation_is_saved_returned_and_audited_over_tauri() {
+        let state = app_state().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create_user");
+        let viewer = state
+            .users
+            .create_user("viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .expect("create_user");
+
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+        let created = plc_connections_create_body(&state, sim_payload("sim-plc", Some(true)))
+            .await
+            .expect("editor は作れる");
+        assert!(created.simulation, "作成の応答に出る");
+        assert!(
+            state
+                .plc_connections
+                .get(created.id)
+                .await
+                .expect("get")
+                .simulation,
+            "保存されている"
+        );
+
+        let kept = plc_connections_update_body(&state, created.id, sim_payload("renamed", None))
+            .await
+            .expect("editor は更新できる");
+        assert_eq!(kept.name, "renamed", "他の項目は置き換わる");
+        assert!(kept.simulation, "省略した更新で実機に戻った");
+
+        let updated =
+            plc_connections_update_body(&state, created.id, sim_payload("renamed", Some(false)))
+                .await
+                .expect("editor は切り替えられる");
+        assert!(!updated.simulation);
+
+        // 明示の切替（false）の後に届いた省略更新は、その切替を取り消さない
+        // （UPDATE の時点の値を保つ。REST 側の双子と同じ主張）。
+        let after_toggle =
+            plc_connections_update_body(&state, created.id, sim_payload("renamed", None))
+                .await
+                .expect("editor は更新できる");
+        assert!(
+            !after_toggle.simulation,
+            "省略更新が先行する明示の切替を取り消した"
+        );
+
+        let missing = plc_connections_update_body(&state, 999_999, sim_payload("x", None)).await;
+        assert!(
+            matches!(missing, Err(BantoError::NotFound { .. })),
+            "存在しない id は従来どおり NotFound: {missing:?}"
+        );
+
+        let audit = state
+            .audit
+            .list(ListParams::default())
+            .await
+            .expect("audit list");
+        // 並び順に依存しないよう、action ごとに simulation の値を集める。
+        let simulations_of = |action: &str| -> Vec<serde_json::Value> {
+            let mut values: Vec<serde_json::Value> = audit
+                .rows
+                .iter()
+                .filter(|r| r.action == action && r.resource == "plc_connections")
+                .map(|entry| {
+                    assert_eq!(entry.origin, "tauri");
+                    let detail: serde_json::Value =
+                        serde_json::from_str(entry.detail.as_deref().expect("detail"))
+                            .expect("JSON");
+                    detail["simulation"].clone()
+                })
+                .collect();
+            values.sort_by_key(|v| v.as_bool());
+            values
+        };
+        assert_eq!(simulations_of("create"), vec![serde_json::json!(true)]);
+        // 省略した更新（保たれた true）・明示の false・切替後の省略更新（false）。
+        assert_eq!(
+            simulations_of("update"),
+            vec![
+                serde_json::json!(false),
+                serde_json::json!(false),
+                serde_json::json!(true)
+            ]
+        );
+
+        *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
+        let denied =
+            plc_connections_update_body(&state, created.id, sim_payload("renamed", Some(true)))
+                .await;
+        assert!(matches!(denied, Err(BantoError::Forbidden)), "{denied:?}");
+        assert!(
+            !state
+                .plc_connections
+                .get(created.id)
+                .await
+                .expect("get")
+                .simulation,
+            "拒否された切替は保存されない"
+        );
+        simulation_coverage_list_body(&state)
+            .await
+            .expect("viewer は範囲外の判定を読める");
     }
 }

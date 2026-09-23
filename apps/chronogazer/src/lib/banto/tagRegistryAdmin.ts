@@ -50,6 +50,15 @@ export interface PlcConnection {
 	unitId: number;
 	enabled: boolean;
 	wordOrder: WordOrder;
+	/**
+	 * #413（2026-09-23 オーナー決定）: 接続単位シミュレーション（**レジストリの
+	 * 値**）。`true` の接続は実機の代わりにプロセス内シミュレータへ接続し、
+	 * 値は現在値・イベントには出るが**データファイルには記録されない**。
+	 * 切替は「収集を再起動」まで走っている収集に反映されない - 走っている
+	 * 収集が実際にシミュレータ相手かは `collectAdmin.ts` の
+	 * `ConnectionView.simulation`。
+	 */
+	simulation: boolean;
 }
 
 /** Mirrors `chronogazer_core::rest::PlcConnectionPayload`. */
@@ -61,6 +70,21 @@ export interface PlcConnectionInput {
 	unitId: number;
 	enabled: boolean;
 	wordOrder: WordOrder;
+	/** #413: サーバー側では省略可（作成なら `false`、更新なら既存の値を保つ - `PlcConnectionPayload::simulation`）。この画面は常に送る。 */
+	simulation: boolean;
+}
+
+/**
+ * Mirrors `chronogazer_core::simulation::SimulationCoverageEntry`（#413）:
+ * シミュレーション接続の配下のタグ 1 本について、シミュレータが値を動かす
+ * 番地か。**判定は Rust の `banto_collect::simulation::classify_plc_tag`
+ * だけ**が行い、画面は結果を表示するだけ（範囲をここに書き写さない）。
+ */
+export interface SimulationCoverageEntry {
+	tagId: number;
+	plcConnectionId: number;
+	supported: boolean;
+	reason: string | null;
 }
 
 /** Mirrors `banto_tags::CollectionGroup`. */
@@ -257,6 +281,20 @@ export async function deletePlcConnection(id: number): Promise<void> {
 		method: 'DELETE',
 		expectNoContent: true
 	});
+}
+
+// --- simulation coverage (#413) ----------------------------------------------
+
+/**
+ * シミュレーション接続の配下のタグの判定（`viewer` 以上）。シミュレーション
+ * 接続が無ければ空配列。
+ */
+export async function listSimulationCoverage(): Promise<SimulationCoverageEntry[]> {
+	if (!isTagRegistryAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri') {
+		return invokeCommand<SimulationCoverageEntry[]>('simulation_coverage_list');
+	}
+	return httpRequest<SimulationCoverageEntry[]>('/api/simulation-coverage', { method: 'GET' });
 }
 
 // --- collection groups ------------------------------------------------------

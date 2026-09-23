@@ -18,6 +18,9 @@ pub mod events;
 pub mod hub;
 pub mod rest;
 pub mod settings;
+// #413: 接続単位シミュレーションで値が動かないタグの判定（判定そのものは
+// `banto_collect::simulation::classify_plc_tag`）。REST と Tauri の両方が使う。
+pub mod simulation;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod users;

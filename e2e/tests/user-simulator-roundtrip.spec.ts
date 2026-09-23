@@ -9,7 +9,8 @@
  * （`simulation`）は使わない - その値は tstore に記録されない
  * （`crates/banto-collect/src/task.rs` の `if ctx.simulation { return; }`
  * 付近）ため、データファイル生成まで含む一巡はこの経路でしか確かめられない
- * （製品の `simulation` の開放は #413 で別途扱う）。
+ * （製品の `simulation` は #413 で設定できるようにしたが、記録されない約束は
+ * そのままなので、一巡はこの経路で確かめる）。
  *
  * ## 画面で操作するところ・REST を使うところ
  *
@@ -163,7 +164,11 @@ async function getList<T>(
 	return (await res.json()) as T[];
 }
 
-/** 接続の `enabled` だけを変える（PUT は全項目を送る形なので、読んだ値をそのまま返す）。 */
+/**
+ * 接続の `enabled` だけを変える（PUT は全項目を送る形なので、読んだ値をそのまま返す）。
+ * `simulation` は送らない - #417 で「更新で省略した simulation は保存値を保つ」に
+ * なったので、この PUT が接続のシミュレーション設定を変えることは無い。
+ */
 async function setConnectionEnabled(
 	request: APIRequestContext,
 	headers: ApiHeaders,

@@ -27,6 +27,7 @@ import {
 	collectStateLabel,
 	collectStaleNote,
 	collectTimeLabel,
+	connectionSimulationNote,
 	connectionStatusLabel,
 	eventKindLabel,
 	isCollectStale,
@@ -184,6 +185,23 @@ describe('connectionStatusLabel', () => {
 		const labels = statuses.map(connectionStatusLabel);
 		expect(new Set(labels).size).toBe(statuses.length);
 		expect(connectionStatusLabel({ status: 'reconnecting', attempt: 4 })).toContain('4回目');
+	});
+});
+
+describe('connectionSimulationNote（#413）', () => {
+	it('走っている収集がシミュレータ相手の接続にだけ「値は記録されません」を添える', () => {
+		const note = connectionSimulationNote({ status: 'connected', simulation: true });
+		expect(note).toContain('シミュレーション中');
+		expect(note).toContain('値は記録されません');
+		// 状態に関わらず（再接続中でも）シミュレーションなら記録されない。
+		expect(connectionSimulationNote({ status: 'reconnecting', attempt: 2, simulation: true })).toBe(
+			note
+		);
+	});
+
+	it('実機相手の接続には何も添えない', () => {
+		expect(connectionSimulationNote({ status: 'connected', simulation: false })).toBeNull();
+		expect(connectionSimulationNote({ status: 'stopped', simulation: false })).toBeNull();
 	});
 });
 

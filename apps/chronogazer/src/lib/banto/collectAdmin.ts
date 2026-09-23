@@ -125,6 +125,17 @@ export type ConnectionStatusView =
 	{ status: 'connected' } | { status: 'reconnecting'; attempt: number } | { status: 'stopped' };
 
 /**
+ * `chronogazer_core::collect::ConnectionView`（#413）: 接続の状態に
+ * `simulation` を添えた形（JSON は平たく並ぶ）。
+ *
+ * **`simulation` は走っている収集が起動時に使った値**で、レジストリ
+ * （`/tags` の接続一覧）の今の値ではない - 切替は「収集を再起動」まで
+ * 反映されないので、両者は一時的に食い違いうる。`true` の接続の値は現在値・
+ * イベントには出るが、**データファイルには記録されない**。
+ */
+export type ConnectionView = ConnectionStatusView & { simulation: boolean };
+
+/**
  * `chronogazer_core::collect::CollectEventRow`。
  *
  * **`detail` 列は無い**（C-3a が型でも SQL でも落とした。自由文で、切断理由や
@@ -264,11 +275,11 @@ export async function getCollectStatus(signal?: AbortSignal): Promise<CollectorS
  */
 export async function getCollectConnections(
 	signal?: AbortSignal
-): Promise<Readout<Record<string, ConnectionStatusView>>> {
+): Promise<Readout<Record<string, ConnectionView>>> {
 	if (!isCollectAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri')
-		return invokeCommand<Readout<Record<string, ConnectionStatusView>>>('collect_connections');
-	return httpJson<Readout<Record<string, ConnectionStatusView>>>(
+		return invokeCommand<Readout<Record<string, ConnectionView>>>('collect_connections');
+	return httpJson<Readout<Record<string, ConnectionView>>>(
 		'/api/collect/connections',
 		'GET',
 		signal
@@ -534,6 +545,19 @@ export function connectionStatusLabel(status: ConnectionStatusView): string {
 		case 'stopped':
 			return '停止';
 	}
+}
+
+/**
+ * シミュレーション接続の注記（#413）。**走っている収集が**その接続を
+ * シミュレータ相手に動かしているときだけ出す（`ConnectionView` の doc）。
+ * 「値は記録されません」は `banto-collect` の約束で、
+ * `apps/chronogazer/core/tests/simulation_not_recorded.rs` が固定している。
+ */
+export const SIMULATION_RUNNING_NOTE = 'シミュレーション中（値は記録されません）';
+
+/** 接続の行に添える注記（純関数）。実機相手なら `null`（何も添えない）。 */
+export function connectionSimulationNote(view: ConnectionView): string | null {
+	return view.simulation ? SIMULATION_RUNNING_NOTE : null;
 }
 
 /**
