@@ -139,9 +139,22 @@ impl Simulator {
     /// handled by its own spawned task), and serves Q/L and R series clients
     /// interchangeably - the CPU series is read off each request's subcommand.
     pub async fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        Self::start_on("127.0.0.1:0".parse().expect("valid loopback address"))
             .await
-            .expect("bind loopback listener");
+            .expect("bind loopback listener")
+    }
+
+    /// As [`Simulator::start`], but binds `addr` instead of letting the OS
+    /// pick - the SLMP twin of `modbus/simulator.rs`'s `start_on` (#344).
+    ///
+    /// Added for ChronoGazer's R1-C C-4 (2026-09-23): the dev PLC example
+    /// (`apps/chronogazer/core/examples/dev_plc.rs`) has to listen on a
+    /// **fixed port** so an operator - or the E2E suite's `webServer` - can
+    /// register it as an ordinary SLMP connection. Returns the bind error
+    /// rather than panicking so that example can report "port in use" and
+    /// exit non-zero instead of dumping a panic.
+    pub async fn start_on(addr: SocketAddr) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr().expect("local_addr");
         let state = Arc::new(Mutex::new(State::default()));
         let connections: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -162,12 +175,12 @@ impl Simulator {
             }
         });
 
-        Simulator {
+        Ok(Simulator {
             addr,
             state,
             accept_task,
             connections,
-        }
+        })
     }
 
     /// Set one word device (`D`/`W`/`R`/...). Panics on a bit device: writing a

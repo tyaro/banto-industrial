@@ -46,6 +46,7 @@
 		DEMO_MODE_MESSAGE,
 		collectEventsNote,
 		collectTimeLabel,
+		eventKindLabel,
 		isCollectAvailable,
 		listCollectEvents,
 		runWithLimit,
@@ -68,27 +69,6 @@
 	const available = isCollectAvailable();
 
 	/**
-	 * `banto_collect::EventKind::as_str` の綴り → 日本語。**語彙を決めている
-	 * のは `banto-collect`** なので、知らない種類が来たら**綴りをそのまま出す**
-	 * （落としも失敗もしない）。監査ログ画面の `actionLabel` と同じ作法。
-	 */
-	const kindLabels: Record<string, string> = {
-		collection_started: '収集開始',
-		collection_stopped: '収集停止',
-		plc_connected: 'PLC接続',
-		plc_disconnected: 'PLC切断',
-		plc_reconnected: 'PLC再接続',
-		threshold_entered: 'しきい値超過',
-		threshold_exited: 'しきい値復帰',
-		append_failure_entered: '書き込み失敗',
-		append_failure_exited: '書き込み復帰'
-	};
-
-	function kindLabel(kind: string): string {
-		return kindLabels[kind] ?? kind;
-	}
-
-	/**
 	 * 列は `CollectEventRow` のフィールドそのまま（`detail` は**そもそも
 	 * 返ってこない**ので列にしない）。`sortable`/`filterable` を落としてあるのは
 	 * この口が並べ替え・絞り込みを受け取らないため（上の doc comment 1.）。
@@ -108,7 +88,7 @@
 			accessor: 'kind',
 			width: 140,
 			sortable: false,
-			format: (value) => kindLabel(String(value))
+			format: (value) => eventKindLabel(String(value))
 		},
 		{
 			id: 'connectionKey',

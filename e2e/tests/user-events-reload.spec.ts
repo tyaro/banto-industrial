@@ -13,7 +13,9 @@
  * **なぜ `page.route` を使うのか**（このスイートでは例外的）:
  * `user-settings-collect.spec.ts` の doc にあるとおり、実サーバー
  * （`banto-serve`）はレジストリが空なので収集が `noTargets` で止まり、
- * **収集イベントを実際に発生させる手段が現時点で無い**（シミュレータは C-4）。
+ * **収集イベントを実際に発生させる手段が現時点で無い**（シミュレータ相手の
+ * 一巡は C-4（`tests/collect_roundtrip.rs` と
+ * `e2e/tests/user-simulator-roundtrip.spec.ts`）が確かめている）。
  * このテストが見たいのは「**正常に読めた後にイベントが増えたとき、画面から
  * 新しい世代を始められるか**」なので、`GET /api/collect/events` に**世代ごとに
  * 違う応答**を返させるしかない。応答の形（`Readout` の判別共用体 +

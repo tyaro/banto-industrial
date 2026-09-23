@@ -30,7 +30,8 @@
 //! 残りは変わらず別枠:
 //!
 //! * 画面（収集の状態表示・現在値表示・イベント一覧ページ）は **C-3b**、
-//! * シミュレータハーネスと E2E は **C-4**、
+//! * シミュレータハーネスと E2E は **C-4**（`tests/collect_roundtrip.rs` と
+//!   `e2e/tests/user-simulator-roundtrip.spec.ts`）、
 //! * Hub 経由で受けている値の保存・合流は **段階3**（`crate::hub` は触らない）。
 //!
 //! # 扱う対象（段階2b）
@@ -2301,7 +2302,9 @@ mod tests {
     }
 
     /// 接続しに行かない偽クライアント。**実 PLC を模さない**（一巡の確認は
-    /// C-4 のハーネスの仕事）が、「収集対象があるときに `Collector` が確かに
+    /// C-4（`tests/collect_roundtrip.rs` と
+    /// `e2e/tests/user-simulator-roundtrip.spec.ts`）のハーネスの仕事）が、
+    /// 「収集対象があるときに `Collector` が確かに
     /// 立ち上がる」を実ネットワーク無しで押さえるために使う。
     struct OfflineClient;
 
