@@ -2249,20 +2249,31 @@ async fn apply_config_failed_rotation_touches_nothing_and_retry_replaces_only_a(
         "B must be completely untouched by the failed apply_config"
     );
     let a_ptime_after_failure = current.get(&setup.tag_a_key).unwrap().ptime_ms;
+    // Wait for a *good read* newer than the failure - the same sample must
+    // have advanced `ptime_ms`, carry the real value and be `Quality::Good`.
+    // A bare `ptime_ms` advance is not enough: `run_connection` records a
+    // Bad/NULL sample on every tick even while unconnected, so a regression
+    // that restarted A (e.g. on its old plan) could satisfy it before the new
+    // task ever connected.
     assert!(
         wait_until(Duration::from_secs(10), || async {
-            current.get(&setup.tag_a_key).map(|s| s.ptime_ms) > Some(a_ptime_after_failure)
+            current.get(&setup.tag_a_key).is_some_and(|s| {
+                s.ptime_ms > a_ptime_after_failure
+                    && s.value == Some(11.0)
+                    && s.quality == Quality::Good
+            })
         })
         .await,
-        "A should still be collecting normally after the failed apply_config"
+        "A should still be collecting normally (a good read) after the failed apply_config"
     );
-    // Counted again *after* A has ticked: had the failed call replaced A, the
-    // new task would have had to connect (and record `plc_connected`) before
-    // it could tick, so this check cannot be won by a race.
+    // Counted again *after* that good read: had the failed call restarted A,
+    // the new task would have had to connect - recording `plc_connected` -
+    // before it could read successfully, so this check cannot be won by a
+    // race.
     assert_eq!(
         count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_a_key).await,
         a_connected_before,
-        "A must be completely untouched by the failed apply_config (after A ticked again)"
+        "A must be completely untouched by the failed apply_config (after a good read)"
     );
     assert!(
         current.get(&tag_a2_key).is_none(),
@@ -2313,21 +2324,32 @@ async fn apply_config_failed_rotation_touches_nothing_and_retry_replaces_only_a(
         .await,
         "A's replacement task should read the newly added t2 = 55"
     );
-    // ...and it is replaced exactly once: over a further window in which A
-    // keeps ticking, the count must never move past +1.
+    // ...and it is replaced exactly once: poll (up to the same 10 s bound as
+    // every other wait here) until at least 1 s has passed *and* A has
+    // ticked again, checking on every poll that the count never moved past
+    // +1. Ending on "1 s elapsed and A ticked" rather than evaluating the
+    // tick once right at 1 s keeps a slow CI runner from turning this into a
+    // "A must tick within 1 s" constraint.
     let a_ptime_after_retry = current.get(&setup.tag_a_key).unwrap().ptime_ms;
-    assert!(
-        !wait_until(Duration::from_millis(1000), || async {
-            count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_a_key).await
-                != expected_a_connected
-        })
-        .await,
-        "A must be replaced exactly once (no second plc_connected)"
-    );
-    assert!(
-        current.get(&setup.tag_a_key).map(|s| s.ptime_ms) > Some(a_ptime_after_retry),
-        "A should have kept ticking during the observation window"
-    );
+    let window_start = tokio::time::Instant::now();
+    let window_deadline = window_start + Duration::from_secs(10);
+    loop {
+        assert_eq!(
+            count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_a_key).await,
+            expected_a_connected,
+            "A must be replaced exactly once (no second plc_connected)"
+        );
+        let a_ticked =
+            current.get(&setup.tag_a_key).map(|s| s.ptime_ms) > Some(a_ptime_after_retry);
+        if a_ticked && window_start.elapsed() >= Duration::from_secs(1) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < window_deadline,
+            "A should have kept ticking during the observation window"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(
         count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_b_key).await,
         b_connected_before,
