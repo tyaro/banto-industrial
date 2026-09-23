@@ -618,3 +618,37 @@ export function collectOperationDisplay(
 		error: null
 	};
 }
+
+/**
+ * `banto_collect::EventKind::as_str`（`crates/banto-collect/src/event.rs`）の
+ * 綴り → 日本語（イベント一覧画面 `routes/(app)/events/+page.svelte` の
+ * 「種類」列。#415）。**語彙を決めているのは `banto-collect`**
+ * なので、知らない種類が来たら**綴りをそのまま出す**（落としも失敗もしない。
+ * 監査ログ画面の `actionLabel` と同じ作法）。
+ *
+ * `clock_regression_*` は H4（時計逆行の検出/復帰、
+ * docs/improvement-plan.md）で、既存の「〜超過/〜復帰」「書き込み失敗/
+ * 書き込み復帰」の命名に揃えて「時刻逆行」「時刻逆行復帰」とした。
+ *
+ * **Rust 側に `EventKind` の種類を足したらここも足す**
+ * （`collectAdmin.test.ts` の `EVENT_KINDS` が 11 種の一覧を固定しているので、
+ * 足し忘れると未知の種類として生の綴りが出るだけで気付きにくい - 表テストで
+ * 検出する）。
+ */
+const eventKindLabels: Record<string, string> = {
+	collection_started: '収集開始',
+	collection_stopped: '収集停止',
+	plc_connected: 'PLC接続',
+	plc_disconnected: 'PLC切断',
+	plc_reconnected: 'PLC再接続',
+	threshold_entered: 'しきい値超過',
+	threshold_cleared: 'しきい値復帰',
+	clock_regression_entered: '時刻逆行',
+	clock_regression_cleared: '時刻逆行復帰',
+	append_failure_entered: '書き込み失敗',
+	append_failure_cleared: '書き込み復帰'
+};
+
+export function eventKindLabel(kind: string): string {
+	return eventKindLabels[kind] ?? kind;
+}
