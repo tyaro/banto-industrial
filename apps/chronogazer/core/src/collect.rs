@@ -30,7 +30,8 @@
 //! 残りは変わらず別枠:
 //!
 //! * 画面（収集の状態表示・現在値表示・イベント一覧ページ）は **C-3b**、
-//! * シミュレータハーネスと E2E は **C-4**、
+//! * シミュレータハーネスと E2E は **C-4**（`tests/collect_roundtrip.rs` と
+//!   `e2e/tests/user-simulator-roundtrip.spec.ts`）、
 //! * Hub 経由で受けている値の保存・合流は **段階3**（`crate::hub` は触らない）。
 //!
 //! # 扱う対象（段階2b）
@@ -359,7 +360,7 @@
 //! | 公開型 | 載せるもの | 落としたもの |
 //! | --- | --- | --- |
 //! | [`CurrentSampleView`] | 値・`ptimeMs`・品質（`good`/`bad`/`stale`） | 無し（`banto_collect::CurrentSample` の全部。機微なものが無い） |
-//! | [`ConnectionStatusView`] | `connected` / `reconnecting`（`attempt`）/ `stopped` | 無し（接続先ホスト・ポートはそもそもこの型に無い） |
+//! | [`ConnectionView`]（[`ConnectionStatusView`] + `simulation`） | `connected` / `reconnecting`（`attempt`）/ `stopped`、走っている収集がその接続をシミュレータ相手に動かしているか（#413） | 無し（接続先ホスト・ポートはそもそもこの型に無い。`simulation` は真偽 1 つで、同じ値はレジストリの一覧でも viewer に読める） |
 //! | [`CollectEventRow`] | `id`・`tsMs`・`kind`・`connectionKey`・`tagKey`・`level`・`value` | **`detail`（自由文）** |
 //!
 //! 地図の鍵（`conn:<id>` / `tag:<id>`）は**そのまま載せる** - これは
@@ -502,13 +503,13 @@
 //! 自動削除は docs/recorder-requirements.md §3.4 にある機能だが、**別途
 //! 実装する**（誤って削除を先取りしない）。ここは設定値を持つだけ。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use banto_collect::{
-    build_config, ClientFactory, CollectError, CollectEvent, Collector, CollectorOptions,
-    ConnectionStatus, CurrentSample, CurrentValuesHandle, EventSink, Quality,
+    build_config_from, ClientFactory, CollectError, CollectEvent, Collector, CollectorOptions,
+    ConnectionStatus, CurrentSample, CurrentValuesHandle, EventSink, Quality, RegistrySnapshot,
 };
 use banto_core::BantoError;
 use banto_tstore::{Clock, SystemClock};
@@ -905,6 +906,60 @@ impl From<&ConnectionStatus> for ConnectionStatusView {
     }
 }
 
+/// 接続ごとの状態の公開用の形（#413）: [`ConnectionStatusView`] に
+/// **「この接続が今シミュレータ相手に走っているか」**を添えたもの。
+/// JSON は `{"status":"connected","simulation":true}` のように平たく並ぶ
+/// （`status` の綴りと `attempt` は #408 のまま - 既存の読み手は壊れない）。
+///
+/// **`simulation` はレジストリの今の値ではなく、走っている収集が起動時に
+/// 使った値**（[`Lifecycle`] が起動のたびに控える）。レジストリの変更では
+/// 自動再起動しない（C-2 の決定）ので、切替を保存しただけの接続は
+/// 「収集を再起動」まで前の姿で走っている - 画面が「シミュレーション中
+/// （値は記録されません）」と出すのを、**実際にそうなっているとき**だけに
+/// するため。
+///
+/// **viewer に見せてよいか**: 真偽 1 つで、接続先・資格情報・パスを含まない。
+/// しかも同じ真偽は `GET /api/plc-connections`（viewer 以上）で既に読める
+/// （こちらはレジストリ側の値）。載せない理由が無く、載せないと viewer が
+/// 「今の値は記録されているのか」を確かめる手段が無い。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct ConnectionView {
+    #[serde(flatten)]
+    pub status: ConnectionStatusView,
+    /// 走っている収集がこの接続をシミュレータ相手に動かしているか。
+    /// `true` の接続の値は現在値・しきい値イベントには出るが、**データ
+    /// ファイル（tstore）には記録されない**（`banto-collect` の約束。
+    /// `crates/banto-collect/src/task.rs` の `if ctx.simulation { return; }`）。
+    pub simulation: bool,
+}
+
+/// ライフサイクルタスクが接続状態の問い合わせに返すもの（内部用）。
+/// `statuses` と `simulated` を**同じ 1 回の応答**で返すのは、別々に読むと
+/// 間に停止・再起動が挟まって食い違いうるため。
+#[derive(Debug, Clone, Default)]
+struct ConnectionSnapshot {
+    statuses: HashMap<String, ConnectionStatus>,
+    /// 起動時の計画でシミュレータ相手になった接続のキー（`conn:<id>`）。
+    simulated: HashSet<String>,
+}
+
+/// 起動に使ったレジストリのスナップショットから、シミュレータ相手に
+/// なる接続のキーを取り出す（**純関数**）。
+///
+/// 述語は `banto_collect::build_config_from` が計画に `simulation` を
+/// 写す条件と同じ（**有効**で `simulation = true` の接続）。無効な接続は
+/// そもそも計画に入らず状態の地図にも出ないので、ここに入っていても
+/// 表示には影響しない。キーの綴り `conn:<id>` は `banto-collect` の
+/// 状態・イベントの地図と同じ（このモジュールの doc「地図の鍵」）。
+fn simulated_connection_keys(snapshot: &RegistrySnapshot) -> HashSet<String> {
+    snapshot
+        .connections
+        .iter()
+        .filter(|conn| conn.enabled && conn.simulation)
+        .map(|conn| format!("conn:{}", conn.id))
+        .collect()
+}
+
 /// `collect_events` 1 行の公開用の形（#383 段階2b / R1-C の C-3a）。
 ///
 /// 列は `crates/banto-collect/migrations/0001_collect_events.sql` のとおり
@@ -1061,7 +1116,7 @@ enum ReadCommand {
     /// その中の `StatusMap` は `banto-collect` の `pub(crate)` なので、
     /// **ハンドルだけ葉へ持ち出すことができない**（このモジュールの doc
     /// 「現在値はキューから外して葉に公開する」の末尾）。
-    ConnectionStatus(oneshot::Sender<Option<HashMap<String, ConnectionStatus>>>),
+    ConnectionStatus(oneshot::Sender<Option<ConnectionSnapshot>>),
 }
 
 /// **操作用**キュー（[`Command`]）の深さ。ライフサイクル操作は人間の操作
@@ -1245,7 +1300,7 @@ pub const COLLECT_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::
 struct CollectorContext {
     /// レジストリ（`plc_connections`/`collection_groups`/`tags`）と
     /// `collect_events` を同居させている、このアプリ唯一の SQLite プール。
-    /// [`build_config`] の読み取り元であり、[`EventSink`] の書き込み先でもある。
+    /// [`banto_collect::build_config`] の読み取り元であり、[`EventSink`] の書き込み先でもある。
     pool: SqlitePool,
     /// 時系列ファイル（`banto-tstore`）の置き場。設定 `data.dir` を
     /// [`resolve_data_dir`] で解決したもの。
@@ -1455,7 +1510,7 @@ impl CollectorService {
 
     /// 収集を開始する。
     ///
-    /// 1. レジストリから構成を作る（[`build_config`]）。
+    /// 1. レジストリから構成を作る（[`banto_collect::build_config`]）。
     /// 2. **有効タグが 0 件なら [`CollectorState::NoTargets`]**（`Ok`）。
     ///    `Collector::start` には渡さない - このモジュール doc 参照。
     /// 3. それ以外は [`Collector`] を起動して [`CollectorState::Running`]。
@@ -1557,7 +1612,7 @@ impl CollectorService {
     /// **待っている間に投入できてしまうと未処理の要求が積み上がる**から。
     ///
     /// 公開用の型に詰め替えて外へ出すのは [`Self::connections`] の側。
-    async fn connection_status(&self) -> Readout<HashMap<String, ConnectionStatus>> {
+    async fn connection_status(&self) -> Readout<ConnectionSnapshot> {
         let (reply_tx, reply_rx) = oneshot::channel();
         match self
             .reads()
@@ -1576,7 +1631,7 @@ impl CollectorService {
         match tokio::time::timeout(COLLECT_READ_TIMEOUT, reply_rx).await {
             // **`NotRunning` を返すのはここだけ** - タスクが実際に
             // `self.collector` を見て「持っていない」と答えた場合。
-            Ok(Ok(Some(statuses))) => Readout::Ready { data: statuses },
+            Ok(Ok(Some(snapshot))) => Readout::Ready { data: snapshot },
             Ok(Ok(None)) => Readout::NotRunning,
             // 応答の送信側が落ちた = タスクが居なくなった（上と同じ扱い）。
             Ok(Err(_reply_dropped)) => Readout::Unavailable,
@@ -1626,7 +1681,7 @@ impl CollectorService {
     /// する」の末尾）。ただし**通るのは読み取り専用のキュー**で、操作用の
     /// キューには触らない（#408 レビュー P2-1。[`READ_QUEUE_DEPTH`]）。
     /// キーは `conn:<id>`。
-    pub async fn connections(&self) -> Readout<HashMap<String, ConnectionStatusView>> {
+    pub async fn connections(&self) -> Readout<HashMap<String, ConnectionView>> {
         match self.connection_status().await {
             Readout::NotRunning => Readout::NotRunning,
             Readout::Unavailable => Readout::Unavailable,
@@ -1763,6 +1818,7 @@ impl CollectorService {
             let lifecycle = Lifecycle {
                 ctx: self.inner.ctx.clone(),
                 collector: None,
+                simulated: HashSet::new(),
             };
             tokio::spawn(lifecycle.run(rx, read_rx));
             Channels {
@@ -1921,6 +1977,11 @@ struct Lifecycle {
     /// `None` = 走っていない。[`Collector::stop`] が `self` を消費するので
     /// `Option` + `take()`。
     collector: Option<Collector>,
+    /// 走っている収集がシミュレータ相手に動かしている接続のキー（#413）。
+    /// **起動に成功したときに**その起動が使ったスナップショットから控え、
+    /// 停止で空にする。`collector` と同じくこのタスクだけが書くので、
+    /// 接続状態の応答（[`ConnectionSnapshot`]）と食い違わない。
+    simulated: HashSet<String>,
 }
 
 impl Lifecycle {
@@ -1978,7 +2039,12 @@ impl Lifecycle {
                         // 呼び出し側が待つのをやめても枠は返らない
                         // （[`READ_QUEUE_DEPTH`] の doc）。
                         ReadCommand::ConnectionStatus(reply) => {
-                            let _ = reply.send(self.collector.as_ref().map(|c| c.status()));
+                            let _ = reply.send(self.collector.as_ref().map(|c| {
+                                ConnectionSnapshot {
+                                    statuses: c.status(),
+                                    simulated: self.simulated.clone(),
+                                }
+                            }));
                         }
                     }
                 }
@@ -2012,7 +2078,16 @@ impl Lifecycle {
             gate.release.notified().await;
         }
 
-        let config = match build_config(&self.ctx.pool).await {
+        // `banto_collect::build_config(&pool)` と同じ 2 段（読み込み →
+        // 組み立て）をここで分けて呼ぶのは、**計画を組んだのと同じ
+        // スナップショット**からシミュレータ相手の接続を控えるため（#413。
+        // 別に読み直すと、間に入った編集で表示と実体が食い違う）。失敗の
+        // 扱いは `build_config` と同じ（どちらの `Err` も `fail_start` へ）。
+        let snapshot = match RegistrySnapshot::load(&self.ctx.pool).await {
+            Ok(snapshot) => snapshot,
+            Err(err) => return Err(self.fail_start(err)),
+        };
+        let config = match build_config_from(&snapshot) {
             Ok(config) => config,
             Err(err) => return Err(self.fail_start(err)),
         };
@@ -2053,6 +2128,7 @@ impl Lifecycle {
         // という食い違いが起こらない（[`Published`] の doc）。
         let current = collector.current_values();
         self.collector = Some(collector);
+        self.simulated = simulated_connection_keys(&snapshot);
         let state = CollectorState::Running { groups, tags };
         self.ctx.publish(state.clone(), Some(current));
         Ok(state)
@@ -2069,6 +2145,7 @@ impl Lifecycle {
         // 生きている）ので、`take()` 済み・状態は `Running` のまま、という
         // 食い違いが残ることはない。
         let result = collector.stop().await;
+        self.simulated.clear();
         // 止まったことは確定なので、flush の成否に関わらず `Stopped` にする。
         // **現在値ハンドルの取り下げもここ**（C-3a）- 停止が実体まで終わって
         // から降ろすので、停止処理の最中はまだ最後の値が読める（止まったのに
@@ -2133,14 +2210,23 @@ fn values_readout(
 /// いない」と答えない」）。ここは「**答えが返ってきた**」あとの言い分けだけを
 /// 担う。
 fn connections_readout(
-    status: Option<HashMap<String, ConnectionStatus>>,
-) -> Readout<HashMap<String, ConnectionStatusView>> {
+    status: Option<ConnectionSnapshot>,
+) -> Readout<HashMap<String, ConnectionView>> {
     match status {
         None => Readout::NotRunning,
-        Some(statuses) => Readout::Ready {
-            data: statuses
+        Some(snapshot) => Readout::Ready {
+            data: snapshot
+                .statuses
                 .iter()
-                .map(|(key, status)| (key.clone(), ConnectionStatusView::from(status)))
+                .map(|(key, status)| {
+                    (
+                        key.clone(),
+                        ConnectionView {
+                            status: ConnectionStatusView::from(status),
+                            simulation: snapshot.simulated.contains(key),
+                        },
+                    )
+                })
                 .collect(),
         },
     }
@@ -2216,7 +2302,9 @@ mod tests {
     }
 
     /// 接続しに行かない偽クライアント。**実 PLC を模さない**（一巡の確認は
-    /// C-4 のハーネスの仕事）が、「収集対象があるときに `Collector` が確かに
+    /// C-4（`tests/collect_roundtrip.rs` と
+    /// `e2e/tests/user-simulator-roundtrip.spec.ts`）のハーネスの仕事）が、
+    /// 「収集対象があるときに `Collector` が確かに
     /// 立ち上がる」を実ネットワーク無しで押さえるために使う。
     struct OfflineClient;
 
@@ -2346,7 +2434,7 @@ mod tests {
     async fn statuses(svc: &CollectorService) -> Option<HashMap<String, ConnectionStatus>> {
         match svc.connection_status().await {
             Readout::NotRunning => None,
-            Readout::Ready { data } => Some(data),
+            Readout::Ready { data } => Some(data.statuses),
             Readout::Unavailable => {
                 panic!("接続状態の読み出しが打ち切られた（手空きのはずの場面）")
             }
@@ -3609,7 +3697,7 @@ mod tests {
         assert_eq!(not_running.as_str(), "notRunning");
         assert!(not_running.data().is_none());
 
-        let zero = connections_readout(Some(HashMap::new()));
+        let zero = connections_readout(Some(ConnectionSnapshot::default()));
         assert_eq!(zero.as_str(), "ready");
         assert!(zero.data().expect("ready").is_empty());
         assert_ne!(
@@ -3628,21 +3716,74 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let json = serde_json::to_value(connections_readout(Some(statuses))).expect("serialize");
+        // #413: conn:2 だけがシミュレータ相手。地図に無いキー（conn:9 =
+        // 計画に入らなかった接続）が紛れていても、行は増えない。
+        let simulated: HashSet<String> = ["conn:2".to_string(), "conn:9".to_string()]
+            .into_iter()
+            .collect();
+        let json = serde_json::to_value(connections_readout(Some(ConnectionSnapshot {
+            statuses,
+            simulated,
+        })))
+        .expect("serialize");
         assert_eq!(json["state"], "ready");
         assert_eq!(
+            json["data"].as_object().expect("map").len(),
+            3,
+            "行は状態の地図の分だけ"
+        );
+        assert_eq!(
             json["data"]["conn:1"],
-            serde_json::json!({"status": "connected"})
+            serde_json::json!({"status": "connected", "simulation": false})
         );
         assert_eq!(
             json["data"]["conn:2"],
-            serde_json::json!({"status": "reconnecting", "attempt": 3}),
+            serde_json::json!({"status": "reconnecting", "attempt": 3, "simulation": true}),
             "再接続の試行回数はヘルス表示の実用情報なので落とさない"
         );
         assert_eq!(
             json["data"]["conn:3"],
-            serde_json::json!({"status": "stopped"})
+            serde_json::json!({"status": "stopped", "simulation": false})
         );
+    }
+
+    fn plc_row(id: i64, enabled: bool, simulation: bool) -> banto_tags::PlcConnection {
+        banto_tags::PlcConnection {
+            id,
+            name: format!("plc{id}"),
+            protocol: "modbus-tcp".to_string(),
+            host: "192.0.2.1".to_string(),
+            port: 502,
+            unit_id: 1,
+            enabled,
+            simulation,
+            word_order: String::new(),
+            database: None,
+            username: None,
+            password: None,
+        }
+    }
+
+    /// #413: シミュレータ相手の接続の選び方（純関数
+    /// [`simulated_connection_keys`]）を表で固定する。**有効**かつ
+    /// `simulation = true` の接続だけ、`conn:<id>` の綴りで。
+    ///
+    /// 反証（回帰の検出）: `conn.enabled &&` を消すと conn:3 が入って落ちる。
+    /// キーを `format!("{}", conn.id)` にすると状態の地図と突き合わず落ちる。
+    #[test]
+    fn only_enabled_simulation_connections_are_reported_as_simulated() {
+        let snapshot = RegistrySnapshot {
+            connections: vec![
+                plc_row(1, true, false),
+                plc_row(2, true, true),
+                plc_row(3, false, true),
+            ],
+            groups: Vec::new(),
+            tags: Vec::new(),
+        };
+        let keys = simulated_connection_keys(&snapshot);
+        let expected: HashSet<String> = ["conn:2".to_string()].into_iter().collect();
+        assert_eq!(keys, expected);
     }
 
     /// `collect_events` に 1 行入れる。**`detail` を呼び出し側が決められる**

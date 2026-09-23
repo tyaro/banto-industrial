@@ -187,6 +187,13 @@ jobs:
       - name: Build banto-serve (embed-ui)
         run: cargo build -p chronogazer-core --bin banto-serve --features embed-ui
 
+      # R1-C C-4: e2e/playwright.config.ts's second webServer is the dev PLC
+      # (apps/chronogazer/core/examples/dev_plc.rs, a Modbus TCP simulator)
+      # that user-simulator-roundtrip.spec.ts collects from. Prebuilt for the
+      # same reason as banto-serve above.
+      - name: Build dev PLC example
+        run: cargo build -p chronogazer-core --example dev_plc
+
       # e2e/banto-hub.playwright.config.ts's webServer launches this binary
       # directly, same reasoning - must exist before `pnpm e2e:banto-hub`
       # below. banto-hub itself is Windows-service-oriented (§8「常駐」) but

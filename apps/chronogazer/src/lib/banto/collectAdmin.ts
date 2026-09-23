@@ -125,6 +125,17 @@ export type ConnectionStatusView =
 	{ status: 'connected' } | { status: 'reconnecting'; attempt: number } | { status: 'stopped' };
 
 /**
+ * `chronogazer_core::collect::ConnectionView`（#413）: 接続の状態に
+ * `simulation` を添えた形（JSON は平たく並ぶ）。
+ *
+ * **`simulation` は走っている収集が起動時に使った値**で、レジストリ
+ * （`/tags` の接続一覧）の今の値ではない - 切替は「収集を再起動」まで
+ * 反映されないので、両者は一時的に食い違いうる。`true` の接続の値は現在値・
+ * イベントには出るが、**データファイルには記録されない**。
+ */
+export type ConnectionView = ConnectionStatusView & { simulation: boolean };
+
+/**
  * `chronogazer_core::collect::CollectEventRow`。
  *
  * **`detail` 列は無い**（C-3a が型でも SQL でも落とした。自由文で、切断理由や
@@ -264,11 +275,11 @@ export async function getCollectStatus(signal?: AbortSignal): Promise<CollectorS
  */
 export async function getCollectConnections(
 	signal?: AbortSignal
-): Promise<Readout<Record<string, ConnectionStatusView>>> {
+): Promise<Readout<Record<string, ConnectionView>>> {
 	if (!isCollectAvailable()) throw demoModeError();
 	if (getBantoMode() === 'tauri')
-		return invokeCommand<Readout<Record<string, ConnectionStatusView>>>('collect_connections');
-	return httpJson<Readout<Record<string, ConnectionStatusView>>>(
+		return invokeCommand<Readout<Record<string, ConnectionView>>>('collect_connections');
+	return httpJson<Readout<Record<string, ConnectionView>>>(
 		'/api/collect/connections',
 		'GET',
 		signal
@@ -537,6 +548,19 @@ export function connectionStatusLabel(status: ConnectionStatusView): string {
 }
 
 /**
+ * シミュレーション接続の注記（#413）。**走っている収集が**その接続を
+ * シミュレータ相手に動かしているときだけ出す（`ConnectionView` の doc）。
+ * 「値は記録されません」は `banto-collect` の約束で、
+ * `apps/chronogazer/core/tests/simulation_not_recorded.rs` が固定している。
+ */
+export const SIMULATION_RUNNING_NOTE = 'シミュレーション中（値は記録されません）';
+
+/** 接続の行に添える注記（純関数）。実機相手なら `null`（何も添えない）。 */
+export function connectionSimulationNote(view: ConnectionView): string | null {
+	return view.simulation ? SIMULATION_RUNNING_NOTE : null;
+}
+
+/**
  * イベント一覧の件数・状態の一文（純関数）。
  *
  * ここでも `unavailable` を**空一覧に潰さない**。`notRunning` は
@@ -617,4 +641,38 @@ export function collectOperationDisplay(
 		notice: `「${label}」が完了しました（現在の状態: ${stateLabel}）。${suffix}`,
 		error: null
 	};
+}
+
+/**
+ * `banto_collect::EventKind::as_str`（`crates/banto-collect/src/event.rs`）の
+ * 綴り → 日本語（イベント一覧画面 `routes/(app)/events/+page.svelte` の
+ * 「種類」列。#415）。**語彙を決めているのは `banto-collect`**
+ * なので、知らない種類が来たら**綴りをそのまま出す**（落としも失敗もしない。
+ * 監査ログ画面の `actionLabel` と同じ作法）。
+ *
+ * `clock_regression_*` は H4（時計逆行の検出/復帰、
+ * docs/improvement-plan.md）で、既存の「〜超過/〜復帰」「書き込み失敗/
+ * 書き込み復帰」の命名に揃えて「時刻逆行」「時刻逆行復帰」とした。
+ *
+ * **Rust 側に `EventKind` の種類を足したらここも足す**（このテストは
+ * `EVENT_KINDS` に列挙された種類のラベル漏れを検出する。Rust の種類追加は
+ * 自動では検出しないため、`EventKind` を更新したら `EVENT_KINDS` と
+ * ラベル表を両方更新する）。
+ */
+const eventKindLabels: Record<string, string> = {
+	collection_started: '収集開始',
+	collection_stopped: '収集停止',
+	plc_connected: 'PLC接続',
+	plc_disconnected: 'PLC切断',
+	plc_reconnected: 'PLC再接続',
+	threshold_entered: 'しきい値超過',
+	threshold_cleared: 'しきい値復帰',
+	clock_regression_entered: '時刻逆行',
+	clock_regression_cleared: '時刻逆行復帰',
+	append_failure_entered: '書き込み失敗',
+	append_failure_cleared: '書き込み復帰'
+};
+
+export function eventKindLabel(kind: string): string {
+	return eventKindLabels[kind] ?? kind;
 }

@@ -27,7 +27,9 @@ import {
 	collectStateLabel,
 	collectStaleNote,
 	collectTimeLabel,
+	connectionSimulationNote,
 	connectionStatusLabel,
+	eventKindLabel,
 	isCollectStale,
 	nextPollFailureCount,
 	startFailedReason,
@@ -40,6 +42,27 @@ import {
 	type ReadoutState,
 	type RunWithLimitOutcome
 } from './collectAdmin';
+
+/**
+ * `crates/banto-collect/src/event.rs` の `EventKind::as_str` が返す全 11 種を
+ * ここに列挙して固定する（#415）。このテストは `EVENT_KINDS` に列挙された
+ * 種類のラベル漏れを検出する。Rust 側（`crates/banto-collect/src/event.rs`
+ * の `EventKind`）の種類追加は自動では検出しないため、`EventKind` を更新したら
+ * `EVENT_KINDS` とラベル表を両方更新する。
+ */
+const EVENT_KINDS = [
+	'collection_started',
+	'collection_stopped',
+	'plc_connected',
+	'plc_disconnected',
+	'plc_reconnected',
+	'threshold_entered',
+	'threshold_cleared',
+	'clock_regression_entered',
+	'clock_regression_cleared',
+	'append_failure_entered',
+	'append_failure_cleared'
+] as const;
 
 const ALL_STATES: CollectorStateView[] = [
 	{ state: 'stopped' },
@@ -162,6 +185,23 @@ describe('connectionStatusLabel', () => {
 		const labels = statuses.map(connectionStatusLabel);
 		expect(new Set(labels).size).toBe(statuses.length);
 		expect(connectionStatusLabel({ status: 'reconnecting', attempt: 4 })).toContain('4回目');
+	});
+});
+
+describe('connectionSimulationNote（#413）', () => {
+	it('走っている収集がシミュレータ相手の接続にだけ「値は記録されません」を添える', () => {
+		const note = connectionSimulationNote({ status: 'connected', simulation: true });
+		expect(note).toContain('シミュレーション中');
+		expect(note).toContain('値は記録されません');
+		// 状態に関わらず（再接続中でも）シミュレーションなら記録されない。
+		expect(connectionSimulationNote({ status: 'reconnecting', attempt: 2, simulation: true })).toBe(
+			note
+		);
+	});
+
+	it('実機相手の接続には何も添えない', () => {
+		expect(connectionSimulationNote({ status: 'connected', simulation: false })).toBeNull();
+		expect(connectionSimulationNote({ status: 'stopped', simulation: false })).toBeNull();
 	});
 });
 
@@ -296,5 +336,28 @@ describe('collectOperationDisplay', () => {
 describe('collectTimeLabel', () => {
 	it('不正な時刻でも例外を投げず、そのまま数値を返す', () => {
 		expect(collectTimeLabel(Number.NaN)).toBe(String(Number.NaN));
+	});
+});
+
+describe('eventKindLabel', () => {
+	it('EventKind の全 11 種にラベルがある（空文字・原文のままは無い）', () => {
+		for (const kind of EVENT_KINDS) {
+			const label = eventKindLabel(kind);
+			expect(label.length).toBeGreaterThan(0);
+			expect(label).not.toBe(kind);
+		}
+	});
+
+	it('対になるイベントは対になる文言にする（超過/復帰、失敗/復帰、逆行/復帰）', () => {
+		expect(eventKindLabel('threshold_entered')).toBe('しきい値超過');
+		expect(eventKindLabel('threshold_cleared')).toBe('しきい値復帰');
+		expect(eventKindLabel('clock_regression_entered')).toBe('時刻逆行');
+		expect(eventKindLabel('clock_regression_cleared')).toBe('時刻逆行復帰');
+		expect(eventKindLabel('append_failure_entered')).toBe('書き込み失敗');
+		expect(eventKindLabel('append_failure_cleared')).toBe('書き込み復帰');
+	});
+
+	it('未知の種類は綴りをそのまま出す（落とさない・失敗しない）', () => {
+		expect(eventKindLabel('some_future_kind')).toBe('some_future_kind');
 	});
 });
