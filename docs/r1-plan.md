@@ -68,8 +68,10 @@ C-1〜C-4 に分割して着手中で、C-1・C-2・C-3a・C-3b が入った**�
 > ようにした。理由（オーナー）:「**実機が無いときに設定できないのは使い物に
 > ならない**」。
 >
-> - **ワイヤ**: `PlcConnectionPayload.simulation`（省略時 `false` = 送らない既存
->   クライアントの挙動は不変）、`PlcConnectionResponse.simulation`。REST と Tauri の
+> - **ワイヤ**: `PlcConnectionPayload.simulation`（省略可。**作成で省略 = `false`**
+>   = 送らない既存クライアントの挙動は不変、**更新で省略 = 既存の値を保つ** -
+>   省略しただけで黙って実機へ接続しに行かないため。他の項目の更新は全項目の
+>   置き換えのまま）、`PlcConnectionResponse.simulation`。REST と Tauri の
 >   両経路で対称、監査の `detail` に `simulation` を残す。
 > - **記録されない約束は維持**: シミュレーション接続の値は現在値・しきい値イベント
 >   には出るが、**データファイル（tstore）には記録されない**（`banto-collect` の

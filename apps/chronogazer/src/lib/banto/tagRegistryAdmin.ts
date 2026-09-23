@@ -70,7 +70,7 @@ export interface PlcConnectionInput {
 	unitId: number;
 	enabled: boolean;
 	wordOrder: WordOrder;
-	/** #413: 省略時はサーバー側で `false`（`PlcConnectionPayload::simulation`）。この画面は常に送る。 */
+	/** #413: サーバー側では省略可（作成なら `false`、更新なら既存の値を保つ - `PlcConnectionPayload::simulation`）。この画面は常に送る。 */
 	simulation: boolean;
 }
 

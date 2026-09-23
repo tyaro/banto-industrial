@@ -1748,9 +1748,13 @@ fn reject_disallowed_connection_protocol(protocol: &str) -> Result<(), BantoErro
 /// **`simulation`（接続単位シミュレーション）は 2026-09-23 のオーナー決定
 /// （#413）で開けた**。R1-B では「banto-hub 固有機能」として落とし、常に
 /// `false` を書いていたが、「実機が無いときに設定できないのは使い物に
-/// ならない」ため。`#[serde(default)]`（= `false`）なので、**このフィールドを
-/// 送らない既存のクライアントの挙動は #413 の前と同じ**（作成も更新も
-/// `false` を書く - 更新は全項目の置き換えで、他の項目と同じ扱い）。
+/// ならない」ため。**省略できる**（`Option<bool>`）: **作成で省略 = `false`**
+/// （#413 の前と同じ）、**更新で省略 = 既存行の値を保つ**
+/// （[`plc_connection_update_input`]。#417 監査 P2）。他の項目は更新でも全項目の
+/// 置き換えのままで、`simulation` だけを例外にしているのは、黙って `false` に
+/// 戻ると**登録済みのホスト（実機）へ実際に接続しに行き、記録も始まる**という
+/// 重い変化になるから - フィールドを知らない呼び出し元（スクリプト・E2E の
+/// 部分的な PUT 等）で起きても実機に触れないようにする。
 /// シミュレーション接続の値は現在値・しきい値イベントには出るが、**データ
 /// ファイル（tstore）には記録されない** - `banto-collect` の約束で、
 /// banto-hub と共有しているためこのアプリでは変えない
@@ -1773,24 +1777,32 @@ pub struct PlcConnectionPayload {
     /// 追加ロジックは無い。
     #[serde(default)]
     pub word_order: String,
-    /// #413: 接続単位シミュレーション。省略時 `false`（型の doc 参照）。
+    /// #413: 接続単位シミュレーション。`None`（省略）は作成なら `false`、
+    /// 更新なら既存行の値を保つ（型の doc 参照）。
     #[serde(default)]
-    pub simulation: bool,
+    pub simulation: Option<bool>,
 }
 
-impl From<PlcConnectionPayload> for PlcConnectionInput {
-    fn from(payload: PlcConnectionPayload) -> Self {
-        Self {
-            name: payload.name,
-            protocol: payload.protocol,
-            host: payload.host,
-            port: payload.port,
-            unit_id: payload.unit_id,
-            enabled: payload.enabled,
-            // #413（2026-09-23 オーナー決定）: 素通し。送られなければ
-            // `false`（`PlcConnectionPayload::simulation` の doc）。
-            simulation: payload.simulation,
-            word_order: payload.word_order,
+impl PlcConnectionPayload {
+    /// 作成用の `PlcConnectionInput`。`simulation` の省略は `false`。
+    ///
+    /// `From` を実装しないのは、作成と更新で省略の意味が違うため - 呼び出し側
+    /// がどちらかを必ず選ぶようにする（更新は [`plc_connection_update_input`]）。
+    pub fn into_create_input(self) -> PlcConnectionInput {
+        let simulation = self.simulation.unwrap_or(false);
+        self.into_input(simulation)
+    }
+
+    fn into_input(self, simulation: bool) -> PlcConnectionInput {
+        PlcConnectionInput {
+            name: self.name,
+            protocol: self.protocol,
+            host: self.host,
+            port: self.port,
+            unit_id: self.unit_id,
+            enabled: self.enabled,
+            simulation,
+            word_order: self.word_order,
             // postgres 専用列。[`reject_disallowed_connection_protocol`]
             // が postgres 接続の作成を拒否するので常に `None` でよい。
             database: None,
@@ -1798,6 +1810,26 @@ impl From<PlcConnectionPayload> for PlcConnectionInput {
             password: None,
         }
     }
+}
+
+/// 更新用の `PlcConnectionInput`（#417 監査 P2）。**`simulation` を省略した
+/// 更新は既存行の値を保つ**（他の項目は置き換え - [`PlcConnectionPayload`] の
+/// doc）。REST の `plc_connections_update` と Tauri の同名コマンドの**両方が
+/// これを呼ぶ** - 経路によって省略の意味が割れないように。
+///
+/// 省略時だけ既存行を読む（存在しない `id` はここで `NotFound` - 更新そのもの
+/// が返すのと同じ種類）。読んでから書くまでの間に別の更新が `simulation` を
+/// 変えた場合は、こちらが読んだ値で上書きする（他の項目の後勝ちと同じ）。
+pub async fn plc_connection_update_input(
+    plc_connections: &PlcConnectionService,
+    id: i64,
+    payload: PlcConnectionPayload,
+) -> Result<PlcConnectionInput, BantoError> {
+    let simulation = match payload.simulation {
+        Some(value) => value,
+        None => plc_connections.get(id).await?.simulation,
+    };
+    Ok(payload.into_input(simulation))
 }
 
 /// `plc_connections` の GET/list/create/update が返す読み取り DTO。
@@ -2021,7 +2053,10 @@ async fn plc_connections_create(
     )
     .await?;
     reject_disallowed_connection_protocol(&input.protocol)?;
-    let created = state.plc_connections.create(input.into()).await?;
+    let created = state
+        .plc_connections
+        .create(input.into_create_input())
+        .await?;
     record_write(
         &state.audit,
         &state.auth,
@@ -2051,7 +2086,8 @@ async fn plc_connections_update(
     )
     .await?;
     reject_disallowed_connection_protocol(&input.protocol)?;
-    let updated = state.plc_connections.update(id, input.into()).await?;
+    let input = plc_connection_update_input(&state.plc_connections, id, input).await?;
+    let updated = state.plc_connections.update(id, input).await?;
     record_write(
         &state.audit,
         &state.auth,
@@ -4376,32 +4412,38 @@ mod tests {
 
     // --- #413: 接続単位シミュレーション -------------------------------------
 
-    /// **送らない = `false`**（既存クライアントの挙動は #413 の前と同じ）。
+    /// **作成で送らない = `false`**（既存クライアントの挙動は #413 の前と同じ）。
     /// 送れば素通しで `PlcConnectionInput` に届く。
     ///
     /// 反証（回帰の検出）: `#[serde(default)]` を消すと 1 つ目の
-    /// `from_value` が「missing field」で落ちる。`From` を `simulation: false`
-    /// に戻すと 2 つ目の `assert!` が落ちる。
+    /// `from_value` が「missing field」で落ちる。`into_create_input` を
+    /// `simulation: false` 固定に戻すと最後の `assert!` が落ちる。
     #[test]
-    fn plc_connection_payload_simulation_defaults_to_false_and_passes_through() {
+    fn plc_connection_payload_simulation_defaults_to_false_on_create_and_passes_through() {
         let omitted: PlcConnectionPayload =
             serde_json::from_value(plc_connection_payload("omitted")).expect("deserialize");
-        assert!(!omitted.simulation, "送らなければ false");
-        assert!(!PlcConnectionInput::from(omitted).simulation);
+        assert_eq!(omitted.simulation, None, "送らなければ「省略」");
+        assert!(
+            !omitted.into_create_input().simulation,
+            "作成の省略は false"
+        );
 
         let mut body = plc_connection_payload("sim");
         body["simulation"] = json!(true);
         let sent: PlcConnectionPayload = serde_json::from_value(body).expect("deserialize");
-        assert!(PlcConnectionInput::from(sent).simulation, "送れば届く");
+        assert!(sent.into_create_input().simulation, "送れば届く");
     }
 
     /// REST 経路: editor が `simulation: true` で作ると保存・返却され、GET でも
-    /// 読める。**送らずに更新すると `false`**（全項目の置き換え - 型の doc）。
+    /// 読める。**送らずに更新しても `true` が保たれ**（#417 監査 P2 - 省略で
+    /// 黙って実機に戻らない）、**明示の `false` で `false` になる**。
     /// viewer の変更は 403。監査の `detail` に切替が残る。
     ///
     /// 反証（回帰の検出）: `PlcConnectionResponse` から `simulation` を消すと
-    /// 作成の応答の `assert_eq!` が落ちる。`plc_connection_audit_detail` から
-    /// `simulation` を消すと監査の `assert_eq!` が落ちる。
+    /// 作成の応答の `assert_eq!` が落ちる。`plc_connection_update_input` の
+    /// `None` 分岐を `false` にすると「省略した更新」の `assert_eq!` が落ちる。
+    /// `plc_connection_audit_detail` から `simulation` を消すと監査の
+    /// `assert_eq!` が落ちる。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn plc_connection_simulation_is_saved_returned_and_audited_over_rest() {
         let (router, _audit, admin, editor, viewer) = router_with_role_tokens_and_audit().await;
@@ -4459,20 +4501,50 @@ mod tests {
             .unwrap();
         assert_eq!(denied.status(), StatusCode::FORBIDDEN);
 
-        // 送らずに更新 = false（他の項目と同じ全置き換え）。
+        // 送らずに更新 = 既存の true を保つ（名前は置き換わる）。
+        let kept = body_json(
+            router
+                .clone()
+                .oneshot(put_json(
+                    &format!("/api/plc-connections/{conn_id}"),
+                    &editor,
+                    plc_connection_payload("sim-plc-renamed"),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(kept["name"], "sim-plc-renamed", "他の項目は置き換わる");
+        assert_eq!(kept["simulation"], true, "省略した更新で実機に戻った");
+
+        // 明示の false で false になる。
+        let mut off_body = plc_connection_payload("sim-plc-renamed");
+        off_body["simulation"] = json!(false);
         let updated = body_json(
             router
                 .clone()
                 .oneshot(put_json(
                     &format!("/api/plc-connections/{conn_id}"),
                     &editor,
-                    plc_connection_payload("sim-plc"),
+                    off_body,
                 ))
                 .await
                 .unwrap(),
         )
         .await;
         assert_eq!(updated["simulation"], false);
+
+        // 存在しない id への省略した更新は従来どおり not_found。
+        let missing = router
+            .clone()
+            .oneshot(put_json(
+                "/api/plc-connections/999999",
+                &editor,
+                plc_connection_payload("missing"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 
         let rows = body_json(
             router
@@ -4487,21 +4559,30 @@ mod tests {
         .await["rows"]
             .clone();
         let conn_id_str = conn_id.to_string();
-        let detail_of = |action: &str| -> serde_json::Value {
-            let entry = rows
+        // 並び順に依存しないよう、action ごとに simulation の値を集める。
+        let simulations_of = |action: &str| -> Vec<serde_json::Value> {
+            let mut values: Vec<serde_json::Value> = rows
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|r| {
+                .filter(|r| {
                     r["action"] == action
                         && r["resource"] == "plc_connections"
                         && r["entityId"] == conn_id_str
                 })
-                .unwrap_or_else(|| panic!("{action} の監査が無い: {rows:?}"));
-            serde_json::from_str(entry["detail"].as_str().expect("detail")).expect("detail は JSON")
+                .map(|entry| {
+                    let detail: serde_json::Value =
+                        serde_json::from_str(entry["detail"].as_str().expect("detail"))
+                            .expect("detail は JSON");
+                    detail["simulation"].clone()
+                })
+                .collect();
+            values.sort_by_key(|v| v.as_bool());
+            values
         };
-        assert_eq!(detail_of("create")["simulation"], true);
-        assert_eq!(detail_of("update")["simulation"], false);
+        assert_eq!(simulations_of("create"), vec![json!(true)]);
+        // 省略した更新（保たれた true）と明示の false の 2 件。
+        assert_eq!(simulations_of("update"), vec![json!(false), json!(true)]);
     }
 
     /// `GET /api/simulation-coverage` は viewer が読める（レジストリの読み取りと

@@ -39,8 +39,9 @@ use chronogazer_core::db::init_db;
 use chronogazer_core::events::event_channel;
 use chronogazer_core::hub::{HubService, HubSubscriptionView, HubView};
 use chronogazer_core::rest::{
-    api_router, audited_credential_verifier, plc_connection_audit_detail, CollectionGroupPayload,
-    PlcConnectionPayload, PlcConnectionResponse, TagPayload,
+    api_router, audited_credential_verifier, plc_connection_audit_detail,
+    plc_connection_update_input, CollectionGroupPayload, PlcConnectionPayload,
+    PlcConnectionResponse, TagPayload,
 };
 use chronogazer_core::settings::{AuditSettings, AuthSettings, ServerSettings, SettingsService};
 use chronogazer_core::simulation::{simulation_coverage, SimulationCoverageEntry};
@@ -1173,7 +1174,10 @@ async fn plc_connections_create_body(
 ) -> Result<PlcConnectionResponse, BantoError> {
     let actor = require_role(state, Role::Editor, "plc_connections").await?;
     reject_disallowed_connection_protocol(&input.protocol)?;
-    let created = state.plc_connections.create(input.into()).await?;
+    let created = state
+        .plc_connections
+        .create(input.into_create_input())
+        .await?;
     state
         .audit
         .record(AuditEntry {
@@ -1192,7 +1196,8 @@ async fn plc_connections_create_body(
 }
 
 /// `editor`+ (R0 §3.6): create a PLC connection. `input.simulation`
-/// （#413、省略時 `false`）は `chronogazer_core::rest::PlcConnectionPayload`
+/// （#413、作成での省略は `false`。更新での省略は既存の値を保つ -
+/// `plc_connection_update_input`）は `chronogazer_core::rest::PlcConnectionPayload`
 /// の doc のとおり REST と同じ扱い。
 #[tauri::command]
 async fn plc_connections_create(
@@ -1210,7 +1215,9 @@ async fn plc_connections_update_body(
 ) -> Result<PlcConnectionResponse, BantoError> {
     let actor = require_role(state, Role::Editor, "plc_connections").await?;
     reject_disallowed_connection_protocol(&input.protocol)?;
-    let updated = state.plc_connections.update(id, input.into()).await?;
+    // #417 監査 P2: `simulation` の省略は既存行の値を保つ（REST と同じ関数）。
+    let input = plc_connection_update_input(&state.plc_connections, id, input).await?;
+    let updated = state.plc_connections.update(id, input).await?;
     state
         .audit
         .record(AuditEntry {
@@ -3342,9 +3349,9 @@ mod tests {
                     unit_id: 1,
                     enabled: true,
                     word_order: String::new(),
-                    simulation: false,
+                    simulation: None,
                 }
-                .into(),
+                .into_create_input(),
             )
             .await
             .expect("create plc connection");
@@ -3500,7 +3507,7 @@ mod tests {
 
     // --- #413: 接続単位シミュレーション -------------------------------------
 
-    fn sim_payload(name: &str, simulation: bool) -> PlcConnectionPayload {
+    fn sim_payload(name: &str, simulation: Option<bool>) -> PlcConnectionPayload {
         PlcConnectionPayload {
             name: name.to_string(),
             protocol: "modbus-tcp".to_string(),
@@ -3519,9 +3526,13 @@ mod tests {
     /// `plc_connection_simulation_is_saved_returned_and_audited_over_rest`
     /// と**対になる双子のテスト**（両経路が同じことを主張する）。
     ///
+    /// **省略した更新は既存の `true` を保ち**、明示の `false` で `false` に
+    /// なる（#417 監査 P2。REST 側の双子のテストと同じ主張）。
+    ///
     /// 反証（回帰の検出）: `plc_connections_create_body` の監査を
     /// `json!({ "name", "enabled" })`（#413 の前）に戻すと `detail["simulation"]`
-    /// の `assert_eq!` が落ちる。
+    /// の `assert_eq!` が落ちる。`plc_connection_update_input` を通さず
+    /// `None` を `false` にすると「省略した更新」の `assert!` が落ちる。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn plc_connection_simulation_is_saved_returned_and_audited_over_tauri() {
         let state = app_state().await;
@@ -3537,7 +3548,7 @@ mod tests {
             .expect("create_user");
 
         *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
-        let created = plc_connections_create_body(&state, sim_payload("sim-plc", true))
+        let created = plc_connections_create_body(&state, sim_payload("sim-plc", Some(true)))
             .await
             .expect("editor は作れる");
         assert!(created.simulation, "作成の応答に出る");
@@ -3551,32 +3562,57 @@ mod tests {
             "保存されている"
         );
 
+        let kept = plc_connections_update_body(&state, created.id, sim_payload("renamed", None))
+            .await
+            .expect("editor は更新できる");
+        assert_eq!(kept.name, "renamed", "他の項目は置き換わる");
+        assert!(kept.simulation, "省略した更新で実機に戻った");
+
         let updated =
-            plc_connections_update_body(&state, created.id, sim_payload("sim-plc", false))
+            plc_connections_update_body(&state, created.id, sim_payload("renamed", Some(false)))
                 .await
                 .expect("editor は切り替えられる");
         assert!(!updated.simulation);
+
+        let missing = plc_connections_update_body(&state, 999_999, sim_payload("x", None)).await;
+        assert!(
+            matches!(missing, Err(BantoError::NotFound { .. })),
+            "存在しない id は従来どおり NotFound: {missing:?}"
+        );
 
         let audit = state
             .audit
             .list(ListParams::default())
             .await
             .expect("audit list");
-        let detail_of = |action: &str| -> serde_json::Value {
-            let entry = audit
+        // 並び順に依存しないよう、action ごとに simulation の値を集める。
+        let simulations_of = |action: &str| -> Vec<serde_json::Value> {
+            let mut values: Vec<serde_json::Value> = audit
                 .rows
                 .iter()
-                .find(|r| r.action == action && r.resource == "plc_connections")
-                .unwrap_or_else(|| panic!("{action} の監査が無い: {:?}", audit.rows));
-            assert_eq!(entry.origin, "tauri");
-            serde_json::from_str(entry.detail.as_deref().expect("detail")).expect("JSON")
+                .filter(|r| r.action == action && r.resource == "plc_connections")
+                .map(|entry| {
+                    assert_eq!(entry.origin, "tauri");
+                    let detail: serde_json::Value =
+                        serde_json::from_str(entry.detail.as_deref().expect("detail"))
+                            .expect("JSON");
+                    detail["simulation"].clone()
+                })
+                .collect();
+            values.sort_by_key(|v| v.as_bool());
+            values
         };
-        assert_eq!(detail_of("create")["simulation"], true);
-        assert_eq!(detail_of("update")["simulation"], false);
+        assert_eq!(simulations_of("create"), vec![serde_json::json!(true)]);
+        // 省略した更新（保たれた true）と明示の false の 2 件。
+        assert_eq!(
+            simulations_of("update"),
+            vec![serde_json::json!(false), serde_json::json!(true)]
+        );
 
         *state.auth.lock().expect("auth mutex poisoned") = Some(viewer);
         let denied =
-            plc_connections_update_body(&state, created.id, sim_payload("sim-plc", true)).await;
+            plc_connections_update_body(&state, created.id, sim_payload("renamed", Some(true)))
+                .await;
         assert!(matches!(denied, Err(BantoError::Forbidden)), "{denied:?}");
         assert!(
             !state
