@@ -2184,8 +2184,19 @@ async fn apply_config_settings_only_change_does_not_rotate_the_writer() {
 /// pre-creating a *directory* at the exact path the rotation would try to
 /// open as a SQLite file (a type mismatch that fails regardless of process
 /// privilege, unlike a permission-based sabotage).
+///
+/// 失敗した apply_config は何も触らない。再試行は、変更のあった A だけを
+/// ちょうど 1 回置き換える（B は触らない）。
+///
+/// 経緯（2026-09-23）: 以前は再試行の後も「A の `plc_connected` は増えない」
+/// と主張していたが、再試行の構成は A のグループに t2 を足しているので、
+/// A は設計どおり `replaced` になり、新しいタスクが初回接続で
+/// `plc_connected` を 1 回出す。そのアサーションが通っていたのは、
+/// `apply_config` が返った直後に数えていて、新タスクの接続と記録が
+/// まだ済んでいなかった（競争に勝っていた）だけだった。CI で 2 回、
+/// ローカルで 30 回中 1 回、競争に負けて `left: 2 right: 1` で落ちた。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn apply_config_writer_open_failure_is_all_or_nothing() {
+async fn apply_config_failed_rotation_touches_nothing_and_retry_replaces_only_a() {
     let _serial = TEST_SERIAL.lock().await;
     let mut setup = two_conn_setup("apply-writer-open-fail").await;
     let current = setup.collector.current_values();
@@ -2208,10 +2219,11 @@ async fn apply_config_writer_open_failure_is_all_or_nothing() {
 
     // A change that requires a writer rotation (a new tag on A's group).
     setup.sim_a.set_holding_register(1, 55);
-    TagService::new(setup.pool.clone())
+    let tag_a2 = TagService::new(setup.pool.clone())
         .create(tag_input("t2", setup.group_a_id, "40002", "i16"))
         .await
         .unwrap();
+    let tag_a2_key = format!("tag:{}", tag_a2.id);
     let failing_config = build_config(&setup.pool).await.unwrap();
 
     let err = setup
@@ -2237,12 +2249,35 @@ async fn apply_config_writer_open_failure_is_all_or_nothing() {
         "B must be completely untouched by the failed apply_config"
     );
     let a_ptime_after_failure = current.get(&setup.tag_a_key).unwrap().ptime_ms;
+    // Wait for a *good read* newer than the failure - the same sample must
+    // have advanced `ptime_ms`, carry the real value and be `Quality::Good`.
+    // A bare `ptime_ms` advance is not enough: `run_connection` records a
+    // Bad/NULL sample on every tick even while unconnected, so a regression
+    // that restarted A (e.g. on its old plan) could satisfy it before the new
+    // task ever connected.
     assert!(
         wait_until(Duration::from_secs(10), || async {
-            current.get(&setup.tag_a_key).map(|s| s.ptime_ms) > Some(a_ptime_after_failure)
+            current.get(&setup.tag_a_key).is_some_and(|s| {
+                s.ptime_ms > a_ptime_after_failure
+                    && s.value == Some(11.0)
+                    && s.quality == Quality::Good
+            })
         })
         .await,
-        "A should still be collecting normally after the failed apply_config"
+        "A should still be collecting normally (a good read) after the failed apply_config"
+    );
+    // Counted again *after* that good read: had the failed call restarted A,
+    // the new task would have had to connect - recording `plc_connected` -
+    // before it could read successfully, so this check cannot be won by a
+    // race.
+    assert_eq!(
+        count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_a_key).await,
+        a_connected_before,
+        "A must be completely untouched by the failed apply_config (after a good read)"
+    );
+    assert!(
+        current.get(&tag_a2_key).is_none(),
+        "the failed apply_config must not have adopted t2"
     );
 
     // Remove the sabotage and retry with a freshly built config - the
@@ -2255,10 +2290,70 @@ async fn apply_config_writer_open_failure_is_all_or_nothing() {
         .await
         .expect("retry after removing the sabotage should succeed");
     assert!(report.writer_rotated);
+    // The retry's config adds t2 to A's group, so A's plan changed and A is
+    // (by design) replaced; B's plan did not change.
     assert_eq!(
-        count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_a_key).await,
-        a_connected_before,
-        "A must still never have reconnected, even across the failed + retried apply_config"
+        report.replaced,
+        vec![setup.conn_a_key.clone()],
+        "only A (whose group gained t2) must be replaced: {report:?}"
+    );
+    assert_eq!(
+        report.unchanged,
+        vec![setup.conn_b_key.clone()],
+        "B must be classified unchanged: {report:?}"
+    );
+    assert!(
+        report.added.is_empty() && report.removed.is_empty(),
+        "{report:?}"
+    );
+
+    // A's replacement task connects once (`plc_connected` +1) and reads t2.
+    let expected_a_connected = a_connected_before + 1;
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_a_key).await
+                == expected_a_connected
+        })
+        .await,
+        "A's replacement task should record exactly one new plc_connected"
+    );
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            current.get(&tag_a2_key).map(|s| s.value) == Some(Some(55.0))
+        })
+        .await,
+        "A's replacement task should read the newly added t2 = 55"
+    );
+    // ...and it is replaced exactly once: poll (up to the same 10 s bound as
+    // every other wait here) until at least 1 s has passed *and* A has
+    // ticked again, checking on every poll that the count never moved past
+    // +1. Ending on "1 s elapsed and A ticked" rather than evaluating the
+    // tick once right at 1 s keeps a slow CI runner from turning this into a
+    // "A must tick within 1 s" constraint.
+    let a_ptime_after_retry = current.get(&setup.tag_a_key).unwrap().ptime_ms;
+    let window_start = tokio::time::Instant::now();
+    let window_deadline = window_start + Duration::from_secs(10);
+    loop {
+        assert_eq!(
+            count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_a_key).await,
+            expected_a_connected,
+            "A must be replaced exactly once (no second plc_connected)"
+        );
+        let a_ticked =
+            current.get(&setup.tag_a_key).map(|s| s.ptime_ms) > Some(a_ptime_after_retry);
+        if a_ticked && window_start.elapsed() >= Duration::from_secs(1) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < window_deadline,
+            "A should have kept ticking during the observation window"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        count_events_for_connection(&setup.pool, "plc_connected", &setup.conn_b_key).await,
+        b_connected_before,
+        "B must never have been touched, across the failed + retried apply_config"
     );
 
     setup.collector.stop().await.unwrap();
