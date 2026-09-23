@@ -767,36 +767,154 @@ fn parse_word_order(value: &str) -> WordOrder {
 /// catalog/`Collector` running (`last_config_error`), so a tag registered
 /// this way simply never reaches the live catalog until fixed.
 fn build_request(tag: &Tag, protocol: Protocol) -> Result<ReadRequest, CollectError> {
-    let address = match protocol {
-        Protocol::ModbusTcp => Address::parse(&tag.address),
-        Protocol::Slmp => Address::parse_slmp(&tag.address),
-    }
-    .map_err(|err| {
-        CollectError::Config(format!(
-            "タグ {} のアドレス {} が不正です: {err}",
-            tag.name, tag.address
-        ))
-    })?;
-    let data_type = DataType::parse(&tag.data_type).ok_or_else(|| {
-        CollectError::Config(format!(
-            "タグ {} のデータ型 {} は未対応です",
-            tag.name, tag.data_type
-        ))
-    })?;
+    // #414 段階1: the interpretation itself lives in [`parse_read_request`],
+    // shared verbatim with the save-time check [`check_tag_address`]. Only
+    // the *wording* differs - this path keeps its original messages (tag
+    // name included, since a config-build failure names no form field), so
+    // banto-hub's `last_config_error` text is unchanged.
+    parse_read_request(protocol, &tag.address, &tag.data_type).map_err(|issue| {
+        CollectError::Config(match issue {
+            TagAddressIssue::InvalidAddress { reason, .. } => format!(
+                "タグ {} のアドレス {} が不正です: {reason}",
+                tag.name, tag.address
+            ),
+            TagAddressIssue::UnknownDataType => format!(
+                "タグ {} のデータ型 {} は未対応です",
+                tag.name, tag.data_type
+            ),
+            TagAddressIssue::BitAddressOnNonBitType => format!(
+                "タグ {} のアドレス {} はビット指定アドレスです。ビット指定アドレスは \
+                 data_type=bit のタグでのみ使えます（現在のデータ型: {}）",
+                tag.name, tag.address, tag.data_type
+            ),
+        })
+    })
+}
 
-    let is_bit_qualified = match address {
+/// The single interpreter behind both [`build_request`] (config build) and
+/// [`check_tag_address`] (save-time check, #414 段階1). Keeping one function
+/// means "what a registry editor accepts on save" and "what
+/// [`build_config_from`] accepts" cannot drift apart - see
+/// [`build_request`]'s doc comment for the rules themselves.
+fn parse_read_request(
+    protocol: Protocol,
+    address: &str,
+    data_type: &str,
+) -> Result<ReadRequest, TagAddressIssue> {
+    let parsed = match protocol {
+        Protocol::ModbusTcp => Address::parse(address),
+        Protocol::Slmp => Address::parse_slmp(address),
+    }
+    .map_err(|err| TagAddressIssue::InvalidAddress {
+        protocol,
+        reason: err.to_string(),
+    })?;
+    let data_type = DataType::parse(data_type).ok_or(TagAddressIssue::UnknownDataType)?;
+
+    let is_bit_qualified = match parsed {
         Address::ModbusRef { bit, .. } => bit.is_some(),
         Address::Slmp { bit, .. } => bit.is_some(),
     };
     if is_bit_qualified && data_type != DataType::Bit {
-        return Err(CollectError::Config(format!(
-            "タグ {} のアドレス {} はビット指定アドレスです。ビット指定アドレスは \
-             data_type=bit のタグでのみ使えます（現在のデータ型: {}）",
-            tag.name, tag.address, tag.data_type
-        )));
+        return Err(TagAddressIssue::BitAddressOnNonBitType);
     }
 
-    Ok(ReadRequest { address, data_type })
+    Ok(ReadRequest {
+        address: parsed,
+        data_type,
+    })
+}
+
+/// Which input field a [`TagAddressIssue`] is about - so a registry editor
+/// (chronogazer's REST/Tauri tag handlers) can attach it to the right form
+/// field without this crate knowing any wire/field naming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagAddressField {
+    Address,
+    DataType,
+}
+
+/// Why [`check_tag_address`] rejected a tag (#414 段階1). Each variant is
+/// exactly one of the `CollectError::Config` cases [`build_request`] raises
+/// for a tag, so "rejected on save" and "would fail [`build_config_from`]"
+/// are the same predicate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagAddressIssue {
+    /// The address text does not parse under the connection protocol's
+    /// notation (e.g. MELSEC `D3000` on a Modbus TCP connection). `reason`
+    /// is `banto_plc`'s own error text.
+    InvalidAddress { protocol: Protocol, reason: String },
+    /// The data type is outside `banto_plc::DataType`'s vocabulary.
+    UnknownDataType,
+    /// A bit-in-word address (`40001.3` / `D100.5`) on a tag whose data type
+    /// is not `bit` (T8-2).
+    BitAddressOnNonBitType,
+}
+
+impl TagAddressIssue {
+    /// The input field this issue belongs to.
+    pub fn field(&self) -> TagAddressField {
+        match self {
+            TagAddressIssue::InvalidAddress { .. } | TagAddressIssue::BitAddressOnNonBitType => {
+                TagAddressField::Address
+            }
+            TagAddressIssue::UnknownDataType => TagAddressField::DataType,
+        }
+    }
+
+    /// A human-readable reason for a form field. Unlike [`build_request`]'s
+    /// messages it does not name the tag (the operator is looking at that
+    /// tag's own form), but it does name the notation the connection
+    /// expects, with an example.
+    pub fn message(&self) -> String {
+        match self {
+            TagAddressIssue::InvalidAddress { protocol, reason } => {
+                let (label, example) = match protocol {
+                    Protocol::ModbusTcp => ("Modbus TCP", "40001"),
+                    Protocol::Slmp => ("SLMP（MELSEC）", "D100"),
+                };
+                format!("{label} のアドレスとして解釈できません（例: {example}）。{reason}")
+            }
+            TagAddressIssue::UnknownDataType => "未対応のデータ型です".to_string(),
+            TagAddressIssue::BitAddressOnNonBitType => {
+                "ビット指定アドレス（例: 40001.3 / D100.5）はデータ型 bit のタグでのみ使えます"
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// #414 段階1: would a tag with this `address`/`data_type`, placed under a
+/// connection whose `plc_connections.protocol` is `protocol`, be accepted by
+/// [`build_config_from`]? `Ok(())` exactly when the tag cannot be the reason
+/// `build_config_from` fails - the same interpreter ([`parse_read_request`])
+/// and the same skips:
+///
+/// - `data_type == "string"` is skipped by `build_config_from` before any
+///   address parsing, so it is always `Ok` here.
+/// - A `protocol` other than `"modbus-tcp"`/`"slmp"` is `Ok` here:
+///   `"virtual"`/`"postgres"` connections are excluded from collection, and
+///   an unsupported protocol string is a *connection*-level error
+///   (`parse_protocol`) that no tag address could fix.
+///
+/// Whether the tag/group/connection is `enabled` is deliberately not an
+/// input - a disabled tag with an unreadable address still breaks
+/// collection the moment it is enabled, so a registry editor checks it on
+/// save regardless.
+pub fn check_tag_address(
+    protocol: &str,
+    address: &str,
+    data_type: &str,
+) -> Result<(), TagAddressIssue> {
+    if data_type == banto_tags::STRING_DATA_TYPE {
+        return Ok(());
+    }
+    let protocol = match protocol {
+        "modbus-tcp" => Protocol::ModbusTcp,
+        "slmp" => Protocol::Slmp,
+        _ => return Ok(()),
+    };
+    parse_read_request(protocol, address, data_type).map(|_| ())
 }
 
 #[cfg(test)]
@@ -1773,6 +1891,107 @@ mod tests {
                 "#337: a broker-routed Modbus plan is stamped just like an SLMP one"
             ),
             ProtocolConfig::Slmp(_) => panic!("expected ModbusTcp config"),
+        }
+    }
+
+    /// #414 段階1: the save-time check's accept/reject table.
+    /// `None` = accepted; `Some(field)` = rejected on that field.
+    const TAG_ADDRESS_TABLE: &[(&str, &str, &str, Option<TagAddressField>)] = &[
+        // Modbus TCP: reference numbers only.
+        ("modbus-tcp", "40001", "i16", None),
+        ("modbus-tcp", "00001", "bit", None),
+        ("modbus-tcp", "30010", "f32", None),
+        ("modbus-tcp", "40001.3", "bit", None),
+        ("modbus-tcp", "D3000", "i16", Some(TagAddressField::Address)),
+        (
+            "modbus-tcp",
+            "D100.5",
+            "bit",
+            Some(TagAddressField::Address),
+        ),
+        ("modbus-tcp", "99999", "i16", Some(TagAddressField::Address)),
+        (
+            "modbus-tcp",
+            "40001.3",
+            "i16",
+            Some(TagAddressField::Address),
+        ),
+        (
+            "modbus-tcp",
+            "40001",
+            "i128",
+            Some(TagAddressField::DataType),
+        ),
+        // SLMP: MELSEC device codes only.
+        ("slmp", "D100", "i16", None),
+        ("slmp", "M100", "bit", None),
+        ("slmp", "D100.5", "bit", None),
+        ("slmp", "40001", "i16", Some(TagAddressField::Address)),
+        ("slmp", "D100.5", "i16", Some(TagAddressField::Address)),
+        // `build_config_from` skips string tags before parsing anything.
+        ("modbus-tcp", "D3000", "string", None),
+        // Not collected / connection-level error: never the tag's fault.
+        ("virtual", "anything", "f64", None),
+        ("postgres", "anything", "f64", None),
+    ];
+
+    #[test]
+    fn check_tag_address_accepts_and_rejects_per_protocol() {
+        for &(protocol, address, data_type, expected) in TAG_ADDRESS_TABLE {
+            let got = check_tag_address(protocol, address, data_type)
+                .err()
+                .map(|issue| issue.field());
+            assert_eq!(got, expected, "{protocol} / {address} / {data_type}");
+        }
+    }
+
+    #[test]
+    fn an_address_issue_names_the_expected_notation() {
+        let issue = check_tag_address("modbus-tcp", "D3000", "i16").unwrap_err();
+        let message = issue.message();
+        assert!(message.contains("Modbus TCP"), "{message}");
+        assert!(message.contains("40001"), "{message}");
+        let issue = check_tag_address("slmp", "40001", "i16").unwrap_err();
+        assert!(issue.message().contains("D100"), "{}", issue.message());
+    }
+
+    /// The whole point of `check_tag_address`: it rejects exactly what
+    /// `build_config` rejects. Every table row whose protocol is a wire
+    /// protocol and whose data type the registry accepts is written to a
+    /// real registry and built - the two verdicts must agree.
+    #[tokio::test]
+    async fn check_tag_address_agrees_with_build_config() {
+        for &(protocol, address, data_type, _) in TAG_ADDRESS_TABLE {
+            if !["modbus-tcp", "slmp"].contains(&protocol)
+                || !banto_tags::ALLOWED_DATA_TYPES.contains(&data_type)
+            {
+                continue;
+            }
+            let pool = registry().await;
+            let mut conn = conn_input("PLC1", 502);
+            conn.protocol = protocol.to_string();
+            let conn = PlcConnectionService::new(pool.clone())
+                .create(conn)
+                .await
+                .unwrap();
+            let group = CollectionGroupService::new(pool.clone())
+                .create(group_input("G1", conn.id, 1_000))
+                .await
+                .unwrap();
+            let mut tag = tag_input("T", group.id, address);
+            tag.data_type = data_type.to_string();
+            if data_type == banto_tags::STRING_DATA_TYPE {
+                tag.string_length = Some(4);
+            }
+            TagService::new(pool.clone()).create(tag).await.unwrap();
+
+            let built = build_config(&pool).await;
+            let checked = check_tag_address(protocol, address, data_type);
+            assert_eq!(
+                built.is_ok(),
+                checked.is_ok(),
+                "{protocol} / {address} / {data_type}: build={built:?} check={checked:?}"
+            );
         }
     }
 }

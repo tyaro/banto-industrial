@@ -44,6 +44,10 @@ use chronogazer_core::rest::{
 };
 use chronogazer_core::settings::{AuditSettings, AuthSettings, ServerSettings, SettingsService};
 use chronogazer_core::simulation::{simulation_coverage, SimulationCoverageEntry};
+use chronogazer_core::tag_address::{
+    ensure_group_move_keeps_tags_readable, ensure_protocol_change_keeps_tags_readable,
+    ensure_tag_fits_its_connection, ensure_tag_update_fits_its_connection, TagPlacement,
+};
 use chronogazer_core::users::{Role, UserIdentity, UserSummary, UsersService};
 // #383 段階2a / R1-B: レジストリ3サービスと行型。`chronogazer_core::lib.rs`の
 // re-export 経由（invariant: このクレートは banto-tags を直接 depend
@@ -1214,6 +1218,16 @@ async fn plc_connections_update_body(
 ) -> Result<PlcConnectionResponse, BantoError> {
     let actor = require_role(state, Role::Editor, "plc_connections").await?;
     reject_disallowed_connection_protocol(&input.protocol)?;
+    // #414 段階1: REST の `plc_connections_update` と同じ検査（両経路対称）。
+    // 共通の更新（`update_plc_connection`）の**前に**呼ぶ。
+    ensure_protocol_change_keeps_tags_readable(
+        &state.plc_connections,
+        &state.collection_groups,
+        &state.tags,
+        id,
+        &input.protocol,
+    )
+    .await?;
     // #417 監査 P2: `simulation` の省略は既存行の値を保つ（REST と同じ関数）。
     let updated = update_plc_connection(&state.plc_connections, id, input).await?;
     state
@@ -1345,7 +1359,26 @@ async fn collection_groups_update(
     id: i64,
     input: CollectionGroupPayload,
 ) -> Result<CollectionGroup, BantoError> {
-    let actor = require_role(&state, Role::Editor, "collection_groups").await?;
+    collection_groups_update_body(&state, id, input).await
+}
+
+/// Body of [`collection_groups_update`]（spec M14 split-function pattern -
+/// #414 段階1 のテストがコマンドの本体を直接呼ぶため）。
+async fn collection_groups_update_body(
+    state: &AppState,
+    id: i64,
+    input: CollectionGroupPayload,
+) -> Result<CollectionGroup, BantoError> {
+    let actor = require_role(state, Role::Editor, "collection_groups").await?;
+    // #414 段階1: REST の `collection_groups_update` と同じ検査（両経路対称）。
+    ensure_group_move_keeps_tags_readable(
+        &state.plc_connections,
+        &state.collection_groups,
+        &state.tags,
+        id,
+        input.plc_connection_id,
+    )
+    .await?;
     let updated = state.collection_groups.update(id, input.into()).await?;
     state
         .audit
@@ -1403,7 +1436,22 @@ async fn tags_get(state: State<'_, AppState>, id: i64) -> Result<Tag, BantoError
 /// `editor`+ (R0 §3.6): create a tag.
 #[tauri::command]
 async fn tags_create(state: State<'_, AppState>, input: TagPayload) -> Result<Tag, BantoError> {
-    let actor = require_role(&state, Role::Editor, "tags").await?;
+    tags_create_body(&state, input).await
+}
+
+/// Body of [`tags_create`]（spec M14 split-function pattern - #414 段階1 の
+/// テストがコマンドの本体を直接呼ぶため）。
+async fn tags_create_body(state: &AppState, input: TagPayload) -> Result<Tag, BantoError> {
+    let actor = require_role(state, Role::Editor, "tags").await?;
+    // #414 段階1: REST の `tags_create` と同じ検査（両経路対称）。
+    ensure_tag_fits_its_connection(
+        &state.plc_connections,
+        &state.collection_groups,
+        input.collection_group_id,
+        &input.address,
+        &input.data_type,
+    )
+    .await?;
     let created = state.tags.create(input.into()).await?;
     state
         .audit
@@ -1428,7 +1476,29 @@ async fn tags_update(
     id: i64,
     input: TagPayload,
 ) -> Result<Tag, BantoError> {
-    let actor = require_role(&state, Role::Editor, "tags").await?;
+    tags_update_body(&state, id, input).await
+}
+
+/// Body of [`tags_update`]（spec M14 split-function pattern - #414 段階1 の
+/// テストがコマンドの本体を直接呼ぶため）。
+async fn tags_update_body(state: &AppState, id: i64, input: TagPayload) -> Result<Tag, BantoError> {
+    let actor = require_role(state, Role::Editor, "tags").await?;
+    // #414 段階1: REST の `tags_update` と同じ検査（両経路対称）。所属
+    // グループを変える更新も、入力のグループから接続を辿るので同じ検査で拾う。
+    // 読む場所を変えずに無効化するだけの更新は検査しない（#418 P2）。
+    ensure_tag_update_fits_its_connection(
+        &state.plc_connections,
+        &state.collection_groups,
+        &state.tags,
+        id,
+        TagPlacement {
+            collection_group_id: input.collection_group_id,
+            address: &input.address,
+            data_type: &input.data_type,
+            enabled: input.enabled,
+        },
+    )
+    .await?;
     let updated = state.tags.update(id, input.into()).await?;
     state
         .audit
@@ -3639,5 +3709,289 @@ mod tests {
         simulation_coverage_list_body(&state)
             .await
             .expect("viewer は範囲外の判定を読める");
+    }
+
+    // --- #414 段階1: タグのアドレス検査 -----------------------------------
+
+    fn tag_payload(name: &str, collection_group_id: i64, address: &str) -> TagPayload {
+        TagPayload {
+            name: name.to_string(),
+            collection_group_id,
+            address: address.to_string(),
+            data_type: "i16".to_string(),
+            raw_lo: None,
+            raw_hi: None,
+            eng_lo: None,
+            eng_hi: None,
+            unit: None,
+            decimals: 0,
+            enabled: true,
+        }
+    }
+
+    fn connection_payload(name: &str, protocol: &str) -> PlcConnectionPayload {
+        PlcConnectionPayload {
+            name: name.to_string(),
+            protocol: protocol.to_string(),
+            host: "192.168.11.200".to_string(),
+            port: 502,
+            unit_id: 1,
+            enabled: true,
+            word_order: String::new(),
+            // #417: 省略 = 作成では false、更新では既存の値を保つ。
+            simulation: None,
+        }
+    }
+
+    fn only_field_error(err: BantoError) -> FieldError {
+        match err {
+            BantoError::Validation { mut field_errors } => {
+                assert_eq!(field_errors.len(), 1, "{field_errors:?}");
+                field_errors.remove(0)
+            }
+            other => panic!("検証エラーではない: {other:?}"),
+        }
+    }
+
+    /// **#414 段階1（Tauri 経路）**: REST と同じ検査が、コマンドの本体にも
+    /// 入っている（片方だけに書くと、もう片方の経路から通ってしまう）。
+    /// タグの作成・更新（所属グループの変更を含む）と接続のプロトコル変更。
+    ///
+    /// 反証: 3 つの `*_body` から `ensure_*` の呼び出しを消すと、
+    /// 3 つの `expect_err` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tag_commands_refuse_an_address_the_connection_cannot_read() {
+        let state = app_state().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create_user");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+
+        let modbus = state
+            .plc_connections
+            .create(connection_payload("modbus", "modbus-tcp").into_create_input())
+            .await
+            .expect("create modbus connection");
+        let slmp = state
+            .plc_connections
+            .create(connection_payload("slmp", "slmp").into_create_input())
+            .await
+            .expect("create slmp connection");
+        let mut group_ids = Vec::new();
+        for (name, conn) in [("modbus-group", modbus.id), ("slmp-group", slmp.id)] {
+            let group = state
+                .collection_groups
+                .create(
+                    CollectionGroupPayload {
+                        name: name.to_string(),
+                        plc_connection_id: conn,
+                        period_ms: 1000,
+                        enabled: true,
+                    }
+                    .into(),
+                )
+                .await
+                .expect("create collection group");
+            group_ids.push(group.id);
+        }
+        let (modbus_group, slmp_group) = (group_ids[0], group_ids[1]);
+
+        // 作成: Modbus の下の D3000 は `address` で拒否、40001 は通る。
+        let err = tags_create_body(&state, tag_payload("melsec", modbus_group, "D3000"))
+            .await
+            .expect_err("Modbus の下の D3000 が保存できてしまった");
+        assert_eq!(only_field_error(err).field, "address");
+        let tag = tags_create_body(&state, tag_payload("modbus", modbus_group, "40001"))
+            .await
+            .expect("Modbus の下の 40001 は保存できること");
+
+        // 更新で SLMP のグループへ移す: 40001 は SLMP では読めないので拒否。
+        let err = tags_update_body(&state, tag.id, tag_payload("modbus", slmp_group, "40001"))
+            .await
+            .expect_err("SLMP のグループへ 40001 のまま移せてしまった");
+        assert_eq!(only_field_error(err).field, "address");
+        // アドレスも直して移すなら通る。
+        tags_update_body(&state, tag.id, tag_payload("modbus", slmp_group, "D100"))
+            .await
+            .expect("アドレスを直して移すのは通ること");
+
+        // 接続のプロトコル変更: SLMP の下に D100 があるので Modbus へは変えられない。
+        let err =
+            plc_connections_update_body(&state, slmp.id, connection_payload("slmp", "modbus-tcp"))
+                .await
+                .expect_err("配下のタグが読めなくなるプロトコル変更が通ってしまった");
+        let field_error = only_field_error(err);
+        assert_eq!(field_error.field, "protocol");
+        assert!(
+            field_error.message.contains("「modbus」（D100）"),
+            "どのタグが妨げているかが分からない: {}",
+            field_error.message
+        );
+        // プロトコルを変えない更新（名前の変更）は通る。
+        plc_connections_update_body(&state, slmp.id, connection_payload("slmp-renamed", "slmp"))
+            .await
+            .expect("プロトコルを変えない更新は通ること");
+    }
+
+    /// **#414 段階1（Tauri 経路、グループの接続変更）**: 配下のタグが新しい
+    /// 接続のプロトコルで読めなくなる移動は `plcConnectionId` で拒否され、
+    /// 同じプロトコルの接続への移動は通り、存在しない接続は従来どおり
+    /// `CollectionGroupService` 自身のエラー（「指定されたPLC接続が見つかり
+    /// ません」）になる。
+    ///
+    /// 反証: `collection_groups_update_body` から
+    /// `ensure_group_move_keeps_tags_readable` の呼び出しを消すと、最初の
+    /// `expect_err` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn group_update_refuses_a_move_that_leaves_tags_unreadable() {
+        let state = app_state().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create_user");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+
+        let mut ids = Vec::new();
+        for (name, protocol) in [
+            ("modbus", "modbus-tcp"),
+            ("modbus2", "modbus-tcp"),
+            ("slmp", "slmp"),
+        ] {
+            let conn = state
+                .plc_connections
+                .create(connection_payload(name, protocol).into_create_input())
+                .await
+                .expect("create connection");
+            ids.push(conn.id);
+        }
+        let (modbus, modbus2, slmp) = (ids[0], ids[1], ids[2]);
+        let group_payload = |plc_connection_id: i64| CollectionGroupPayload {
+            name: "group".to_string(),
+            plc_connection_id,
+            period_ms: 1000,
+            enabled: true,
+        };
+        let group = state
+            .collection_groups
+            .create(group_payload(modbus).into())
+            .await
+            .expect("create collection group");
+        // 無効なタグも調べる対象。
+        let mut disabled = tag_payload("modbus-tag", group.id, "40001");
+        disabled.enabled = false;
+        tags_create_body(&state, disabled)
+            .await
+            .expect("Modbus の下の 40001 は保存できること");
+
+        // SLMP の接続へ移す: 40001 が読めなくなるので拒否、保存もされない。
+        let err = collection_groups_update_body(&state, group.id, group_payload(slmp))
+            .await
+            .expect_err("タグが読めなくなるグループの移動が通ってしまった");
+        let field_error = only_field_error(err);
+        assert_eq!(field_error.field, "plcConnectionId");
+        assert!(
+            field_error.message.contains("「modbus-tag」（40001）")
+                && field_error.message.contains("slmp"),
+            "どのタグが妨げているかが分からない: {}",
+            field_error.message
+        );
+        let unchanged = state
+            .collection_groups
+            .get(group.id)
+            .await
+            .expect("get group");
+        assert_eq!(unchanged.plc_connection_id, modbus);
+
+        // 同じプロトコルの接続への移動は通る。
+        let moved = collection_groups_update_body(&state, group.id, group_payload(modbus2))
+            .await
+            .expect("同じプロトコルの接続への移動は通ること");
+        assert_eq!(moved.plc_connection_id, modbus2);
+
+        // 存在しない接続は従来どおり CollectionGroupService のエラー。
+        let field_error = only_field_error(
+            collection_groups_update_body(&state, group.id, group_payload(9999))
+                .await
+                .expect_err("存在しない接続への移動が通ってしまった"),
+        );
+        assert_eq!(field_error.field, "plcConnectionId");
+        assert_eq!(field_error.message, "指定されたPLC接続が見つかりません");
+    }
+
+    /// **#418 オーナーレビュー P2 の回帰固定（Tauri 経路）**: 検査より前に
+    /// 保存された不正タグを、読む場所を変えずに無効化するだけの更新は通り、
+    /// 保存され、その後の `build_config` が成功して正常なタグだけが残る。
+    /// アドレスを直さずに再有効化すると、引き続き拒否される。
+    ///
+    /// 反証: `tags_update_body` の `ensure_tag_update_fits_its_connection` を
+    /// 無条件の `ensure_tag_fits_its_connection` に戻すと、無効化の
+    /// `expect` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disabling_a_legacy_bad_tag_is_allowed_and_reenabling_is_refused() {
+        let state = app_state().await;
+        let editor = state
+            .users
+            .create_user("editor", "password123", "編集者", Role::Editor)
+            .await
+            .expect("create_user");
+        *state.auth.lock().expect("auth mutex poisoned") = Some(editor);
+
+        let conn = state
+            .plc_connections
+            .create(connection_payload("modbus", "modbus-tcp").into_create_input())
+            .await
+            .expect("create connection");
+        let group = state
+            .collection_groups
+            .create(
+                CollectionGroupPayload {
+                    name: "group".to_string(),
+                    plc_connection_id: conn.id,
+                    period_ms: 1000,
+                    enabled: true,
+                }
+                .into(),
+            )
+            .await
+            .expect("create collection group");
+        // 正常なタグと、検査より前に保存された不正なタグ（既存データ）。
+        state
+            .tags
+            .create(tag_payload("good", group.id, "40001").into())
+            .await
+            .expect("create good tag");
+        let legacy = state
+            .tags
+            .create(tag_payload("legacy", group.id, "D3000").into())
+            .await
+            .expect("create legacy tag");
+        assert!(
+            banto_collect::build_config(&state.pool).await.is_err(),
+            "前提が崩れている: 不正タグがあるのに build_config が通る"
+        );
+
+        // 無効化するだけの更新は通り、保存される。
+        let mut disable = tag_payload("legacy", group.id, "D3000");
+        disable.enabled = false;
+        tags_update_body(&state, legacy.id, disable)
+            .await
+            .expect("無効化だけの更新が拒否された");
+        assert!(!state.tags.get(legacy.id).await.unwrap().enabled);
+
+        // その後の build_config は成功し、正常なタグだけが収集対象に残る。
+        let config = banto_collect::build_config(&state.pool)
+            .await
+            .expect("不正タグを無効化した後は build_config が通ること");
+        assert_eq!(config.tag_count(), 1);
+
+        // アドレスを直さずに再有効化すると、引き続き拒否される。
+        let err = tags_update_body(&state, legacy.id, tag_payload("legacy", group.id, "D3000"))
+            .await
+            .expect_err("アドレスを直さない再有効化が通った");
+        assert_eq!(only_field_error(err).field, "address");
+        assert!(!state.tags.get(legacy.id).await.unwrap().enabled);
     }
 }

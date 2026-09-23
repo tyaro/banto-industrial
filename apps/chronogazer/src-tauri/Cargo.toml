@@ -63,6 +63,12 @@ tokio = { workspace = true, features = ["rt", "macros"] }
 # comment for why `:memory:` does not work), so these tests cannot reuse
 # `app_state()`'s in-memory `init_db_memory()` - see `app_state_with_tempdir`.
 tempfile = { workspace = true }
+# #418 オーナーレビュー P2 の回帰テスト専用: 不正タグを無効化した後に
+# `banto_collect::build_config` が通ることを、Tauri 経路のテストでも直接
+# 確かめるため。`chronogazer-core` が通常依存として使っている同じ path
+# crate で、依存ツリーには既に入っているので Cargo.lock にパッケージは
+# 増えない（`chronogazer` の依存一覧に 1 行増えるだけ）。
+banto-collect = { path = "../../../crates/banto-collect" }
 
 # Real window translucency for the glass theme (spec M12): Windows Acrylic
 # via `window_vibrancy::apply_acrylic`/`clear_acrylic`. Windows-only by

@@ -1016,6 +1016,7 @@ dependencies = [
 name = "chronogazer"
 version = "0.2.0-alpha.20"
 dependencies = [
+ "banto-collect",
  "banto-core",
  "banto-hub-bootstrap",
  "banto-server",
