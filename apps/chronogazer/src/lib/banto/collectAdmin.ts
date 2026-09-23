@@ -630,10 +630,10 @@ export function collectOperationDisplay(
  * docs/improvement-plan.md）で、既存の「〜超過/〜復帰」「書き込み失敗/
  * 書き込み復帰」の命名に揃えて「時刻逆行」「時刻逆行復帰」とした。
  *
- * **Rust 側に `EventKind` の種類を足したらここも足す**
- * （`collectAdmin.test.ts` の `EVENT_KINDS` が 11 種の一覧を固定しているので、
- * 足し忘れると未知の種類として生の綴りが出るだけで気付きにくい - 表テストで
- * 検出する）。
+ * **Rust 側に `EventKind` の種類を足したらここも足す**（このテストは
+ * `EVENT_KINDS` に列挙された種類のラベル漏れを検出する。Rust の種類追加は
+ * 自動では検出しないため、`EventKind` を更新したら `EVENT_KINDS` と
+ * ラベル表を両方更新する）。
  */
 const eventKindLabels: Record<string, string> = {
 	collection_started: '収集開始',

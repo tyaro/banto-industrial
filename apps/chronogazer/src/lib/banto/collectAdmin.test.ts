@@ -44,9 +44,10 @@ import {
 
 /**
  * `crates/banto-collect/src/event.rs` の `EventKind::as_str` が返す全 11 種を
- * ここに列挙して固定する（#415）。**Rust 側に種類を足したらここも足す** -
- * 足し忘れると `eventKindLabel` が未知の種類として生の綴りを返すだけで、
- * テストの失敗という形で気付ける。
+ * ここに列挙して固定する（#415）。このテストは `EVENT_KINDS` に列挙された
+ * 種類のラベル漏れを検出する。Rust 側（`crates/banto-collect/src/event.rs`
+ * の `EventKind`）の種類追加は自動では検出しないため、`EventKind` を更新したら
+ * `EVENT_KINDS` とラベル表を両方更新する。
  */
 const EVENT_KINDS = [
 	'collection_started',
