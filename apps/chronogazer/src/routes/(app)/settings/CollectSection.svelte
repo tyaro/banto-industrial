@@ -38,6 +38,11 @@
 	 *
 	 * 現在値（`collect_values`）はこの画面では扱わない - 値の表示は R1-D の
 	 * 監視画面。イベント一覧は `/events`（同じ PR）。
+	 *
+	 * #413: 接続ごとの状態の行に「シミュレーション中（値は記録されません）」を
+	 * 添える。出すのは**走っている収集が**その接続をシミュレータ相手に動かして
+	 * いるときだけ（`ConnectionView.simulation`。レジストリの今の値ではない -
+	 * 切替を保存しただけでは、再起動までこの表示は変わらない）。
 	 */
 	import { onDestroy, onMount } from 'svelte';
 	import { canWriteResources } from '$lib/permissions';
@@ -50,6 +55,7 @@
 		collectStateDetail,
 		collectStateHeadline,
 		collectStaleNote,
+		connectionSimulationNote,
 		connectionStatusLabel,
 		getCollectConnections,
 		getCollectStatus,
@@ -64,7 +70,7 @@
 		toCollectStateView,
 		type CollectAction,
 		type CollectorStateView,
-		type ConnectionStatusView,
+		type ConnectionView,
 		type Readout
 	} from '$lib/banto/collectAdmin';
 	import { errorMessage } from './shared';
@@ -84,7 +90,7 @@
 	 * 化ける（`Readout` で潰さないと決めたことを、画面の初期値で潰してしまう）。
 	 */
 	let status = $state<CollectorStateView | null>(null);
-	let connections = $state<Readout<Record<string, ConnectionStatusView>> | null>(null);
+	let connections = $state<Readout<Record<string, ConnectionView>> | null>(null);
 
 	/** 連続失敗回数（成功で 0 に戻る）と、最後に取得できた時刻。表示ごとに別。 */
 	let statusFailures = $state(0);
@@ -323,13 +329,18 @@
 						<tr>
 							<th scope="col">接続</th>
 							<th scope="col">状態</th>
+							<th scope="col">記録</th>
 						</tr>
 					</thead>
 					<tbody>
 						{#each connectionEntries as [key, value] (key)}
+							{@const simulationNote = connectionSimulationNote(value)}
 							<tr>
 								<td class="collect-key">{key}</td>
 								<td>{connectionStatusLabel(value)}</td>
+								<td class:simulation-note={simulationNote !== null}>
+									{simulationNote ?? '記録対象'}
+								</td>
 							</tr>
 						{/each}
 					</tbody>
@@ -340,7 +351,7 @@
 		{/if}
 
 		<p class="note">
-			収集の開始・停止・接続の切断などの記録は「イベント」画面で見られます。タグ設定の変更は自動では反映されません（「収集を再起動」で反映します）。
+			収集の開始・停止・接続の切断などの記録は「イベント」画面で見られます。タグ設定の変更（接続のシミュレーションの切替を含む）は自動では反映されません（「収集を再起動」で反映します）。
 		</p>
 	{:else}
 		<p class="note">
@@ -374,6 +385,13 @@
 
 	.collect-key {
 		font-family: var(--banto-font-mono, monospace);
+	}
+
+	/* #413: 値が記録されない接続は、エラーではないが見落とすと困るので
+	既存の注意喚起（`.poll-stale` と同じ）の色で出す。 */
+	.simulation-note {
+		color: var(--banto-text);
+		font-weight: 600;
 	}
 
 	.collect-connections {

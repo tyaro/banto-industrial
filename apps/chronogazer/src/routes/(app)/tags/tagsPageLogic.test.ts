@@ -19,6 +19,12 @@ import {
 	showsRetry,
 	listRows,
 	createFormGate,
+	connectionModeLabel,
+	connectionSavedMessage,
+	unmovingSimulationTags,
+	simulationCoverageView,
+	SIMULATION_CONNECTION_LABEL,
+	type SimulationCoverageView,
 	type SaveGuardToken,
 	type DeleteGuardToken,
 	type ListLoadState,
@@ -511,5 +517,99 @@ describe('runGuardedListLoad', () => {
 		slow.reject(new Error('古い方が失敗した'));
 
 		expect(await first).toEqual({ kind: 'stale' });
+	});
+});
+
+// --- E: 接続単位シミュレーション（#413） -------------------------------------
+
+describe('connectionModeLabel', () => {
+	it('シミュレーション接続は「値は記録されません」を必ず含み、実機とは別の文言', () => {
+		expect(connectionModeLabel(true)).toBe(SIMULATION_CONNECTION_LABEL);
+		expect(connectionModeLabel(true)).toContain('値は記録されません');
+		expect(connectionModeLabel(false)).not.toContain('シミュレーション');
+	});
+});
+
+describe('connectionSavedMessage', () => {
+	it('切替を含む更新は「収集を再起動」を案内する（on/off とも）', () => {
+		const on = connectionSavedMessage({ simulation: false }, { simulation: true });
+		const off = connectionSavedMessage({ simulation: true }, { simulation: false });
+		expect(on).toContain('収集を再起動');
+		expect(on).toContain('記録されません');
+		expect(off).toContain('収集を再起動');
+		expect(off).not.toContain('記録されません');
+		expect(on).not.toBe(off);
+	});
+
+	it('切替を含まない更新は案内しない', () => {
+		expect(connectionSavedMessage({ simulation: true }, { simulation: true })).toBe('更新しました');
+		expect(connectionSavedMessage({ simulation: false }, { simulation: false })).toBe(
+			'更新しました'
+		);
+	});
+
+	it('新規作成はシミュレーションなら記録されないことを添える', () => {
+		expect(connectionSavedMessage(null, { simulation: true })).toContain('記録されません');
+		expect(connectionSavedMessage(null, { simulation: false })).toBe('作成しました');
+	});
+});
+
+describe('unmovingSimulationTags', () => {
+	const tags = [
+		{ id: 1, name: '温度', address: '40001' },
+		{ id: 2, name: '圧力', address: '40100' }
+	];
+	const connections = [{ id: 9, name: 'シミュ1' }];
+
+	it('supported: false だけを、名前とアドレス・理由付きで並べる（判定はしない）', () => {
+		const rows = unmovingSimulationTags(
+			[
+				{ tagId: 1, plcConnectionId: 9, supported: true, reason: null },
+				{ tagId: 2, plcConnectionId: 9, supported: false, reason: '範囲外です' }
+			],
+			tags,
+			connections
+		);
+		expect(rows).toEqual([
+			{
+				tagId: 2,
+				tagName: '圧力',
+				address: '40100',
+				connectionName: 'シミュ1',
+				reason: '範囲外です'
+			}
+		]);
+	});
+
+	it('一覧に無い行（別の往復で消えた等）も黙って落とさず #id で出す', () => {
+		const rows = unmovingSimulationTags(
+			[{ tagId: 77, plcConnectionId: 88, supported: false, reason: null }],
+			tags,
+			connections
+		);
+		expect(rows).toHaveLength(1);
+		expect(rows[0].tagName).toBe('#77');
+		expect(rows[0].connectionName).toBe('#88');
+		expect(rows[0].reason).not.toBe('');
+	});
+});
+
+describe('simulationCoverageView', () => {
+	type Entry = { supported: boolean };
+	const cases: [boolean, ListLoadState<Entry>, SimulationCoverageView][] = [
+		// シミュレーション接続が無ければ、読めていても出さない。
+		[false, { items: [{ supported: false }], error: null }, 'hidden'],
+		[false, { items: null, error: 'x' }, 'hidden'],
+		// 読めていない / 読めなかったを「全部動く」に潰さない。
+		[true, { items: null, error: null }, 'loading'],
+		[true, { items: null, error: '失敗' }, 'failed'],
+		[true, { items: [], error: null }, 'all-moving'],
+		[true, { items: [{ supported: true }], error: null }, 'all-moving'],
+		[true, { items: [{ supported: true }, { supported: false }], error: null }, 'list'],
+		// 更新に失敗しても、前回読めた内容は残す（D と同じ）。
+		[true, { items: [{ supported: false }], error: '更新失敗' }, 'list']
+	];
+	it.each(cases)('シミュ接続あり=%s / %j → %s', (has, state, expected) => {
+		expect(simulationCoverageView(has, state)).toBe(expected);
 	});
 });

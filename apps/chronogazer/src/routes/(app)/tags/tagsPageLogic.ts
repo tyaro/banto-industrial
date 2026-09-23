@@ -58,6 +58,10 @@
  *    `listSectionView`/`createFormGate`（下記「D」）が「未読込 / 読み込み
  *    失敗 / 読み込めて0件」の3状態を分け、失敗した一覧を0行のグリッドとして
  *    描かない・「先に○○を作成してください」を読めて0件のときだけ出す。
+ *
+ * E. **接続単位シミュレーション**（#413）: 「値は記録されません」の文言、
+ *    切替を保存したときの「収集を再起動」の案内、シミュレーションで値が
+ *    動かないタグの見せ方（判定そのものは Rust 側。下記「E」）。
  */
 
 export interface FieldError {
@@ -384,5 +388,117 @@ export function createFormGate<T>(dependency: ListLoadState<T>): CreateFormGate 
 			return 'dependency-failed';
 		default:
 			return 'dependency-loading';
+	}
+}
+
+// --- E: 接続単位シミュレーション（#413、2026-09-23 オーナー決定） ------------
+//
+// R1-B では「banto-hub 固有」として閉じていた接続単位シミュレーションを
+// 開けた（「実機が無いときに設定できないのは使い物にならない」）。
+// シミュレーション接続の値は現在値・イベントには出るが**データファイルには
+// 記録されない**（`banto-collect` の約束。
+// `apps/chronogazer/core/tests/simulation_not_recorded.rs` が固定）ので、
+// 画面はそれを常に分かるようにする。ここに置くのは文言と見せ方の判断だけで、
+// **「どの番地なら値が動くか」の判定は持たない**（Rust の
+// `banto_collect::simulation::classify_plc_tag` が唯一の判定元。画面は
+// `listSimulationCoverage` の結果を表示するだけ）。
+
+/** 接続一覧の「動作」列に出す文言。 */
+export const SIMULATION_CONNECTION_LABEL = 'シミュレーション（値は記録されません）';
+export const REAL_CONNECTION_LABEL = '実機';
+
+/** 接続一覧の「動作」列（純関数）。レジストリの値を表す（走っている収集の姿は `/settings/collect`）。 */
+export function connectionModeLabel(simulation: boolean): string {
+	return simulation ? SIMULATION_CONNECTION_LABEL : REAL_CONNECTION_LABEL;
+}
+
+/**
+ * PLC接続の作成・更新に成功したときのトースト文言（純関数）。
+ *
+ * **切替は走っている収集に自動では反映されない**（レジストリの変更で自動
+ * 再起動しない C-2 の決定）ので、`simulation` が変わった保存には「収集を
+ * 再起動」が要ることを必ず添える。保存に失敗したときはこの関数を呼ばない
+ * （画面は切り替わったように見せない - 呼び出し側は応答の行を採用する）。
+ *
+ * `before === null` は新規作成。
+ */
+export function connectionSavedMessage(
+	before: { simulation: boolean } | null,
+	after: { simulation: boolean }
+): string {
+	if (before === null) {
+		return after.simulation
+			? '作成しました（シミュレーション接続です。値はデータファイルに記録されません）'
+			: '作成しました';
+	}
+	if (before.simulation === after.simulation) return '更新しました';
+	return after.simulation
+		? '更新しました。シミュレーションに切り替えました（値はデータファイルに記録されません）。収集中の場合は「収集を再起動」で反映されます'
+		: '更新しました。実機に切り替えました。収集中の場合は「収集を再起動」で反映されます';
+}
+
+/** シミュレーションで値が動かないタグ 1 本（表示用）。 */
+export interface UnmovingSimulationTag {
+	tagId: number;
+	tagName: string;
+	address: string;
+	connectionName: string;
+	reason: string;
+}
+
+/**
+ * `listSimulationCoverage` の結果から、値が動かない（`supported: false`）
+ * タグを表示用に並べる（純関数、並びは結果の順 = タグ id 昇順）。
+ *
+ * 名前は一覧から引く。一覧の再取得と判定の再取得は別の往復なので、
+ * 片方にしか無い行がありうる - そのときは `#id` を出す（行を黙って落とさない）。
+ */
+export function unmovingSimulationTags(
+	entries: readonly {
+		tagId: number;
+		plcConnectionId: number;
+		supported: boolean;
+		reason: string | null;
+	}[],
+	tags: readonly { id: number; name: string; address: string }[],
+	connections: readonly { id: number; name: string }[]
+): UnmovingSimulationTag[] {
+	return entries
+		.filter((entry) => !entry.supported)
+		.map((entry) => {
+			const tag = tags.find((t) => t.id === entry.tagId);
+			const conn = connections.find((c) => c.id === entry.plcConnectionId);
+			return {
+				tagId: entry.tagId,
+				tagName: tag?.name ?? `#${entry.tagId}`,
+				address: tag?.address ?? '',
+				connectionName: conn?.name ?? `#${entry.plcConnectionId}`,
+				reason: entry.reason ?? 'シミュレータが値を生成しない番地です'
+			};
+		});
+}
+
+/**
+ * 「値が動かないタグ」ブロックの見せ方（純関数）:
+ * - `hidden`: シミュレーション接続が 1 本も無い（出す意味が無い）。
+ * - `loading` / `failed`: 判定を**まだ読めていない / 読めなかった**。
+ *   「全部動く」と言わない（D と同じ規律 - 読めていないを 0 件に潰さない）。
+ * - `all-moving`: 読めて、動かないタグが 0 本。
+ * - `list`: 読めて、動かないタグがある。
+ */
+export type SimulationCoverageView = 'hidden' | 'loading' | 'failed' | 'all-moving' | 'list';
+
+export function simulationCoverageView<T extends { supported: boolean }>(
+	hasSimulationConnection: boolean,
+	state: ListLoadState<T>
+): SimulationCoverageView {
+	if (!hasSimulationConnection) return 'hidden';
+	switch (listSectionView(state)) {
+		case 'loading':
+			return 'loading';
+		case 'failed':
+			return 'failed';
+		default:
+			return (state.items as T[]).some((entry) => !entry.supported) ? 'list' : 'all-moving';
 	}
 }

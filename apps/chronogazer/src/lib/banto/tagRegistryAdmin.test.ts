@@ -79,6 +79,7 @@ import {
 	listTags,
 	createTag,
 	deleteTag,
+	listSimulationCoverage,
 	isTagRegistryAvailable,
 	DEMO_MODE_MESSAGE,
 	ALLOWED_PERIOD_MS,
@@ -94,7 +95,8 @@ const connectionInput: PlcConnectionInput = {
 	port: 502,
 	unitId: 1,
 	enabled: true,
-	wordOrder: ''
+	wordOrder: '',
+	simulation: false
 };
 
 const groupInput: CollectionGroupInput = {
@@ -153,6 +155,7 @@ describe('デモモード（バックエンドが無い）', () => {
 		await expect(createCollectionGroup(groupInput)).rejects.toThrow(DEMO_MODE_MESSAGE);
 		await expect(listTags()).rejects.toThrow(DEMO_MODE_MESSAGE);
 		await expect(createTag(tagInput)).rejects.toThrow(DEMO_MODE_MESSAGE);
+		await expect(listSimulationCoverage()).rejects.toThrow(DEMO_MODE_MESSAGE);
 
 		expect(invoke).not.toHaveBeenCalled();
 		expect(fetchSpy).not.toHaveBeenCalled();
@@ -206,6 +209,22 @@ describe('Tauri モード', () => {
 		expect(invoke).toHaveBeenCalledWith('tags_delete', { id: 3 });
 	});
 
+	it('#413: simulation: true は invoke の input にそのまま載る', async () => {
+		testState.bantoMode = 'tauri';
+		const input = { ...connectionInput, simulation: true };
+		vi.mocked(invoke).mockResolvedValueOnce({ id: 1, ...input });
+		const created = await createPlcConnection(input);
+		expect(invoke).toHaveBeenCalledWith('plc_connections_create', { input });
+		expect(created.simulation).toBe(true);
+	});
+
+	it('#413: listSimulationCoverage は invoke("simulation_coverage_list") を引数なしで呼ぶ', async () => {
+		testState.bantoMode = 'tauri';
+		vi.mocked(invoke).mockResolvedValueOnce([]);
+		await listSimulationCoverage();
+		expect(invoke).toHaveBeenCalledWith('simulation_coverage_list', undefined);
+	});
+
 	it('invoke が例外を投げたら field_errors を保った ProviderError として reject する', async () => {
 		testState.bantoMode = 'tauri';
 		vi.mocked(invoke).mockRejectedValueOnce({
@@ -249,6 +268,24 @@ describe('サーバーモード（REST）', () => {
 				body: JSON.stringify(connectionInput),
 				headers: expect.objectContaining({ 'Content-Type': 'application/json' })
 			})
+		);
+	});
+
+	it('#413: simulation は PUT の JSON body に載り、listSimulationCoverage は GET /api/simulation-coverage', async () => {
+		testState.bantoMode = 'server';
+		const input = { ...connectionInput, simulation: true };
+		mockFetchOnce({ status: 200, ok: true, body: { id: 4, ...input } });
+		await updatePlcConnection(4, input);
+		expect(fetch).toHaveBeenCalledWith(
+			'/api/plc-connections/4',
+			expect.objectContaining({ method: 'PUT', body: JSON.stringify(input) })
+		);
+
+		mockFetchOnce({ status: 200, ok: true, body: [] });
+		await listSimulationCoverage();
+		expect(fetch).toHaveBeenCalledWith(
+			'/api/simulation-coverage',
+			expect.objectContaining({ method: 'GET' })
 		);
 	});
 

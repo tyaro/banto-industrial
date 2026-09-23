@@ -47,10 +47,11 @@
 //! | GET    | `/api/tags/{id}` | -                        | `Tag` (viewer+)         |
 //! | PUT    | `/api/tags/{id}` | `TagPayload`             | `Tag` (editor+)         |
 //! | DELETE | `/api/tags/{id}` | -                        | 204 (editor+)           |
+//! | GET    | `/api/simulation-coverage` | -              | `SimulationCoverageEntry[]` (viewer+, #413) |
 //! | GET    | `/api/collect`   | -                        | `CollectorStateView` (viewer+, #383 段階2b/R1-C) |
 //! | POST   | `/api/collect/start\|stop\|restart` | -     | `CollectOutcome` (editor+) |
 //! | GET    | `/api/collect/values` | -                   | `Readout<{[tagKey]: CurrentSampleView}>` (viewer+, C-3a) |
-//! | GET    | `/api/collect/connections` | -              | `Readout<{[connKey]: ConnectionStatusView}>` (viewer+, C-3a) |
+//! | GET    | `/api/collect/connections` | -              | `Readout<{[connKey]: ConnectionView}>` (viewer+, C-3a / `simulation` = #413) |
 //! | GET    | `/api/collect/events?offset=&limit=&asOfId=` | -    | `Readout<CollectEventList>` (viewer+, C-3a / `asOfId` = #409) |
 //!
 //! `/api/ui-settings/*` (spec M12 SettingsProvider migration): per-user UI
@@ -188,12 +189,13 @@ use tokio::sync::broadcast;
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::backup::{BackupInfo, BackupService, PendingRestoreInfo};
 use crate::collect::{
-    CollectEventList, CollectOutcome, CollectorService, CollectorStateView, ConnectionStatusView,
+    CollectEventList, CollectOutcome, CollectorService, CollectorStateView, ConnectionView,
     CurrentSampleView, EventPage, Readout, COLLECT_AUDIT_RESOURCE, COLLECT_OPERATION_ROLE,
     COLLECT_READ_ROLE,
 };
 use crate::hub::{HubService, HubSubscriptionView, HubView};
 use crate::settings::{AuditSettings, SettingsService};
+use crate::simulation::SimulationCoverageEntry;
 use crate::users::{Role, UserIdentity, UserSummary, UsersService};
 
 /// Request-body size cap for `POST /api/backups/restore` (spec M17: "サイズ
@@ -1507,9 +1509,13 @@ async fn collect_values_handler(
 /// 0 件）。「読めなかった」は、ライフサイクルタスクが遅い `start`/`stop` を
 /// 処理している最中に `crate::collect::COLLECT_READ_TIMEOUT` が過ぎた場合 -
 /// **「失敗しました」とも「接続 0 件」とも言わない**（#400 の言い分け）。
+///
+/// 各行の `simulation`（#413）は**走っている収集が**その接続をシミュレータ
+/// 相手に動かしているか（レジストリの今の値ではない）-
+/// [`crate::collect::ConnectionView`] の doc に理由と公開範囲の判断。
 async fn collect_connections_handler(
     State(state): State<CollectState>,
-) -> Json<Readout<HashMap<String, ConnectionStatusView>>> {
+) -> Json<Readout<HashMap<String, ConnectionView>>> {
     Json(state.collect.connections().await)
 }
 
@@ -1733,11 +1739,23 @@ fn reject_disallowed_connection_protocol(protocol: &str) -> Result<(), BantoErro
 ///
 /// R1-B 指示書（#383 段階2a）どおり、banto-tags/relay-wright/banto-hub の
 /// `PlcConnectionInput`/`PlcConnectionPayload` から chronogazer に不要な
-/// フィールドを落とした最小形: `simulation`（接続単位シミュレーションは
-/// banto-hub 固有機能）と `database`/`username`/`password`（`"postgres"`
-/// 専用列 - [`reject_disallowed_connection_protocol`] が postgres 接続の
-/// 作成自体を拒否するので、この3列を持たせても常に空にしかならない）は
-/// ワイヤに出さない。`word_order` は残す（指示書の残す一覧に明記）。
+/// フィールドを落とした最小形: `database`/`username`/`password`
+/// （`"postgres"` 専用列 - [`reject_disallowed_connection_protocol`] が
+/// postgres 接続の作成自体を拒否するので、この3列を持たせても常に空に
+/// しかならない）はワイヤに出さない。`word_order` は残す（指示書の残す
+/// 一覧に明記）。
+///
+/// **`simulation`（接続単位シミュレーション）は 2026-09-23 のオーナー決定
+/// （#413）で開けた**。R1-B では「banto-hub 固有機能」として落とし、常に
+/// `false` を書いていたが、「実機が無いときに設定できないのは使い物に
+/// ならない」ため。`#[serde(default)]`（= `false`）なので、**このフィールドを
+/// 送らない既存のクライアントの挙動は #413 の前と同じ**（作成も更新も
+/// `false` を書く - 更新は全項目の置き換えで、他の項目と同じ扱い）。
+/// シミュレーション接続の値は現在値・しきい値イベントには出るが、**データ
+/// ファイル（tstore）には記録されない** - `banto-collect` の約束で、
+/// banto-hub と共有しているためこのアプリでは変えない
+/// （`crates/banto-collect/src/task.rs`）。切替はレジストリの変更なので、
+/// 走っている収集には「収集を再起動」まで反映されない（C-2 の決定）。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlcConnectionPayload {
@@ -1755,6 +1773,9 @@ pub struct PlcConnectionPayload {
     /// 追加ロジックは無い。
     #[serde(default)]
     pub word_order: String,
+    /// #413: 接続単位シミュレーション。省略時 `false`（型の doc 参照）。
+    #[serde(default)]
+    pub simulation: bool,
 }
 
 impl From<PlcConnectionPayload> for PlcConnectionInput {
@@ -1766,10 +1787,9 @@ impl From<PlcConnectionPayload> for PlcConnectionInput {
             port: payload.port,
             unit_id: payload.unit_id,
             enabled: payload.enabled,
-            // R1-B: `simulation` は banto-hub 固有機能（接続単位シミュ
-            // レーション切り替え）。chronogazer は一切設定しない - 常に
-            // 列の既定値（`false`）のまま。
-            simulation: false,
+            // #413（2026-09-23 オーナー決定）: 素通し。送られなければ
+            // `false`（`PlcConnectionPayload::simulation` の doc）。
+            simulation: payload.simulation,
             word_order: payload.word_order,
             // postgres 専用列。[`reject_disallowed_connection_protocol`]
             // が postgres 接続の作成を拒否するので常に `None` でよい。
@@ -1788,10 +1808,14 @@ impl From<PlcConnectionPayload> for PlcConnectionInput {
 /// postgres 接続を作成できない（[`reject_disallowed_connection_protocol`]）
 /// ので通常運用でこの列が非空になることは無いはずだが、防御的に - 何らか
 /// の経路（データベースファイルの直接操作等）で非空の `password` を持つ行
-/// が紛れ込んでいても外へ出さない。`simulation`/`database`/`username` も
-/// 同じ理由（chronogazer は一切書かない列）で応答から省く - relay-wright
-/// の同名 DTO と異なり、これらの列を「常に既定値のまま」であることを
-/// 応答形から見ても分かるようにしている。
+/// が紛れ込んでいても外へ出さない。`database`/`username` も同じ理由
+/// （chronogazer は一切書かない列）で応答から省く - relay-wright の同名
+/// DTO と異なり、これらの列を「常に既定値のまま」であることを応答形から
+/// 見ても分かるようにしている。
+///
+/// `simulation` は #413（2026-09-23 オーナー決定）で書けるようにしたので
+/// **返す**（R1-B では「一切書かない列」として省いていた）。真偽 1 つで、
+/// 読み取りの床（viewer 以上）に出して困る情報ではない。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlcConnectionResponse {
@@ -1803,6 +1827,11 @@ pub struct PlcConnectionResponse {
     pub unit_id: i64,
     pub enabled: bool,
     pub word_order: String,
+    /// #413: 接続単位シミュレーション（レジストリの値）。走っている収集が
+    /// 実際にシミュレータ相手かどうかは `GET /api/collect/connections` の
+    /// `simulation`（切替は「収集を再起動」まで反映されないので、両者は
+    /// 一時的に食い違いうる）。
+    pub simulation: bool,
 }
 
 impl From<PlcConnection> for PlcConnectionResponse {
@@ -1816,8 +1845,25 @@ impl From<PlcConnection> for PlcConnectionResponse {
             unit_id: conn.unit_id,
             enabled: conn.enabled,
             word_order: conn.word_order,
+            simulation: conn.simulation,
         }
     }
+}
+
+/// `plc_connections` の作成・更新の監査 `detail`。REST（このモジュール）と
+/// Tauri（`apps/chronogazer/src-tauri/src/lib.rs` の
+/// `plc_connections_create`/`plc_connections_update`）の**両方がこれを使う** -
+/// 経路によって記録の中身が割れないように。
+///
+/// #413: `simulation` を足した。切替は「値が記録されなくなる」操作なので、
+/// 誰がいつ切り替えたかを監査から辿れるようにする（`name`/`enabled` と
+/// 同じく、保存**後**の行の値を記録する）。
+pub fn plc_connection_audit_detail(conn: &PlcConnection) -> serde_json::Value {
+    json!({
+        "name": conn.name,
+        "enabled": conn.enabled,
+        "simulation": conn.simulation,
+    })
 }
 
 /// Wire-shaped (camelCase) create/update payload for `collection_groups`.
@@ -1983,7 +2029,7 @@ async fn plc_connections_create(
         "create",
         "plc_connections",
         &created.id.to_string(),
-        Some(json!({ "name": created.name, "enabled": created.enabled })),
+        Some(plc_connection_audit_detail(&created)),
     )
     .await;
     Ok(Json(PlcConnectionResponse::from(created)))
@@ -2013,7 +2059,7 @@ async fn plc_connections_update(
         "update",
         "plc_connections",
         &id.to_string(),
-        Some(json!({ "name": updated.name, "enabled": updated.enabled })),
+        Some(plc_connection_audit_detail(&updated)),
     )
     .await;
     Ok(Json(PlcConnectionResponse::from(updated)))
@@ -2045,6 +2091,23 @@ async fn plc_connections_delete(
     )
     .await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/simulation-coverage`（**`viewer` 以上**・監査しない、#413）:
+/// シミュレーション接続の配下のタグごとに、シミュレータが値を動かす番地か
+/// どうか。判定と「なぜ専用の読み取りにしたか」は [`crate::simulation`] の
+/// モジュール doc。Tauri の `simulation_coverage_list` と同じ関数を呼ぶ。
+async fn simulation_coverage_list(
+    State(state): State<TagRegistryState>,
+) -> Result<Json<Vec<SimulationCoverageEntry>>, ApiError> {
+    Ok(Json(
+        crate::simulation::simulation_coverage(
+            &state.plc_connections,
+            &state.collection_groups,
+            &state.tags,
+        )
+        .await?,
+    ))
 }
 
 async fn collection_groups_list(
@@ -2295,6 +2358,7 @@ fn tag_registry_router(
             "/api/tags/{id}",
             get(tags_get).put(tags_update).delete(tags_delete),
         )
+        .route("/api/simulation-coverage", get(simulation_coverage_list))
         .with_state(state)
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
@@ -4308,6 +4372,204 @@ mod tests {
             assert_eq!(entry["origin"], "rest");
             assert_eq!(entry["result"], "ok");
         }
+    }
+
+    // --- #413: 接続単位シミュレーション -------------------------------------
+
+    /// **送らない = `false`**（既存クライアントの挙動は #413 の前と同じ）。
+    /// 送れば素通しで `PlcConnectionInput` に届く。
+    ///
+    /// 反証（回帰の検出）: `#[serde(default)]` を消すと 1 つ目の
+    /// `from_value` が「missing field」で落ちる。`From` を `simulation: false`
+    /// に戻すと 2 つ目の `assert!` が落ちる。
+    #[test]
+    fn plc_connection_payload_simulation_defaults_to_false_and_passes_through() {
+        let omitted: PlcConnectionPayload =
+            serde_json::from_value(plc_connection_payload("omitted")).expect("deserialize");
+        assert!(!omitted.simulation, "送らなければ false");
+        assert!(!PlcConnectionInput::from(omitted).simulation);
+
+        let mut body = plc_connection_payload("sim");
+        body["simulation"] = json!(true);
+        let sent: PlcConnectionPayload = serde_json::from_value(body).expect("deserialize");
+        assert!(PlcConnectionInput::from(sent).simulation, "送れば届く");
+    }
+
+    /// REST 経路: editor が `simulation: true` で作ると保存・返却され、GET でも
+    /// 読める。**送らずに更新すると `false`**（全項目の置き換え - 型の doc）。
+    /// viewer の変更は 403。監査の `detail` に切替が残る。
+    ///
+    /// 反証（回帰の検出）: `PlcConnectionResponse` から `simulation` を消すと
+    /// 作成の応答の `assert_eq!` が落ちる。`plc_connection_audit_detail` から
+    /// `simulation` を消すと監査の `assert_eq!` が落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plc_connection_simulation_is_saved_returned_and_audited_over_rest() {
+        let (router, _audit, admin, editor, viewer) = router_with_role_tokens_and_audit().await;
+
+        let mut body = plc_connection_payload("sim-plc");
+        body["simulation"] = json!(true);
+        let created = router
+            .clone()
+            .oneshot(post_json_auth("/api/plc-connections", &editor, body))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let created = body_json(created).await;
+        assert_eq!(created["simulation"], true, "作成の応答に出る");
+        let conn_id = created["id"].as_i64().unwrap();
+
+        // 応答の形に postgres 専用列が混ざっていないこと（公開する形の確認）。
+        let keys: Vec<&str> = created
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        for secret in ["password", "username", "database"] {
+            assert!(
+                !keys.contains(&secret),
+                "{secret} が応答に出ている: {keys:?}"
+            );
+        }
+
+        let fetched = body_json(
+            router
+                .clone()
+                .oneshot(get_auth(
+                    &format!("/api/plc-connections/{conn_id}"),
+                    &viewer,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(fetched["simulation"], true, "viewer の GET でも読める");
+
+        // viewer は切り替えられない。
+        let mut viewer_body = plc_connection_payload("sim-plc");
+        viewer_body["simulation"] = json!(false);
+        let denied = router
+            .clone()
+            .oneshot(put_json(
+                &format!("/api/plc-connections/{conn_id}"),
+                &viewer,
+                viewer_body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        // 送らずに更新 = false（他の項目と同じ全置き換え）。
+        let updated = body_json(
+            router
+                .clone()
+                .oneshot(put_json(
+                    &format!("/api/plc-connections/{conn_id}"),
+                    &editor,
+                    plc_connection_payload("sim-plc"),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(updated["simulation"], false);
+
+        let rows = body_json(
+            router
+                .oneshot(post_json_auth(
+                    "/api/audit-log/list",
+                    &admin,
+                    json!(ListParams::default()),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await["rows"]
+            .clone();
+        let conn_id_str = conn_id.to_string();
+        let detail_of = |action: &str| -> serde_json::Value {
+            let entry = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| {
+                    r["action"] == action
+                        && r["resource"] == "plc_connections"
+                        && r["entityId"] == conn_id_str
+                })
+                .unwrap_or_else(|| panic!("{action} の監査が無い: {rows:?}"));
+            serde_json::from_str(entry["detail"].as_str().expect("detail")).expect("detail は JSON")
+        };
+        assert_eq!(detail_of("create")["simulation"], true);
+        assert_eq!(detail_of("update")["simulation"], false);
+    }
+
+    /// `GET /api/simulation-coverage` は viewer が読める（レジストリの読み取りと
+    /// 同じ床）。シミュレーション接続の配下のタグだけが、範囲内/範囲外に
+    /// 分かれて返る（判定の表は `crate::simulation` のテスト）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn simulation_coverage_is_viewer_readable() {
+        let (router, _admin, editor, viewer) = router_with_role_tokens().await;
+
+        let mut body = plc_connection_payload("sim-plc");
+        body["simulation"] = json!(true);
+        let conn = body_json(
+            router
+                .clone()
+                .oneshot(post_json_auth("/api/plc-connections", &editor, body))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let group = body_json(
+            router
+                .clone()
+                .oneshot(post_json_auth(
+                    "/api/collection-groups",
+                    &editor,
+                    json!({
+                        "name": "g",
+                        "plcConnectionId": conn["id"],
+                        "periodMs": 1000,
+                        "enabled": true
+                    }),
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        for (name, address) in [("in", "40001"), ("out", "40100")] {
+            let response = router
+                .clone()
+                .oneshot(post_json_auth(
+                    "/api/tags",
+                    &editor,
+                    json!({
+                        "name": name,
+                        "collectionGroupId": group["id"],
+                        "address": address,
+                        "dataType": "u16",
+                        "decimals": 0,
+                        "enabled": true
+                    }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let response = router
+            .oneshot(get_auth("/api/simulation-coverage", &viewer))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let entries = body_json(response).await;
+        let entries = entries.as_array().expect("array");
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert_eq!(entries[0]["supported"], true);
+        assert!(entries[0]["reason"].is_null());
+        assert_eq!(entries[1]["supported"], false);
+        assert!(entries[1]["reason"].as_str().is_some_and(|r| !r.is_empty()));
     }
 
     // --- #383 段階2b / R1-C（C-2）: 収集の操作 -------------------------------

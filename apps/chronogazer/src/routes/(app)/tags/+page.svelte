@@ -43,6 +43,15 @@
 	 * `groupCreate`/`groupEdit`/`tagCreate`/`tagEdit`）をスキーマのフィールド
 	 * 名自体に付け、`to*Input`/`*FormValues` 側で wire のフィールド名と
 	 * 相互変換する。
+	 *
+	 * **接続単位シミュレーション（#413、2026-09-23 オーナー決定）**: 接続の
+	 * フォームに切替、一覧に「動作」列（シミュレーション接続は「値は記録され
+	 * ません」）、タグの節に「シミュレーションで値が動かないタグ」を出す。
+	 * 範囲の判定は画面では行わない（`listSimulationCoverage` = Rust の
+	 * `classify_plc_tag` の結果を表示するだけ）。一覧・フォームはレジストリの
+	 * 値で、**走っている収集への反映は「収集を再起動」**（保存時のトーストで
+	 * 案内する）。走っている収集が実際にシミュレータ相手かは
+	 * `/settings/collect` の接続ごとの状態に出る。
 	 */
 	import { untrack } from 'svelte';
 	import { BantoGrid, type GridColumn } from '@banto/grid-svelte';
@@ -64,6 +73,7 @@
 		createTag,
 		updateTag,
 		deleteTag,
+		listSimulationCoverage,
 		isTagRegistryAvailable,
 		DEMO_MODE_MESSAGE,
 		ALLOWED_PERIOD_MS,
@@ -75,7 +85,8 @@
 		type CollectionGroupInput,
 		type Tag,
 		type TagInput,
-		type TagDataType
+		type TagDataType,
+		type SimulationCoverageEntry
 	} from '$lib/banto/tagRegistryAdmin';
 	import {
 		runGuardedSave,
@@ -88,6 +99,10 @@
 		listRows,
 		createFormGate,
 		runGuardedListLoad,
+		connectionModeLabel,
+		connectionSavedMessage,
+		unmovingSimulationTags,
+		simulationCoverageView,
 		type SaveGuardToken,
 		type DeleteGuardToken,
 		type ListLoadState
@@ -218,7 +233,16 @@
 					default: WORD_ORDER_AUTO,
 					options: wordOrderOptions
 				},
-				{ name: `${prefix}Enabled`, label: '有効', type: 'checkbox', default: true }
+				{ name: `${prefix}Enabled`, label: '有効', type: 'checkbox', default: true },
+				// #413: 接続単位シミュレーション。ラベルに「記録されない」ことを
+				// 書くのは、チェックを入れる時点で分かるようにするため。
+				{
+					name: `${prefix}Simulation`,
+					label:
+						'シミュレーション（実機の代わりに内蔵シミュレータへ接続。値はデータファイルに記録されません）',
+					type: 'checkbox',
+					default: false
+				}
 			]
 		};
 	}
@@ -237,7 +261,8 @@
 			port: typeof port === 'number' ? port : 0,
 			unitId: typeof unitId === 'number' ? unitId : 1,
 			enabled: Boolean(values[`${prefix}Enabled`]),
-			wordOrder: wordOrder === WORD_ORDER_AUTO || wordOrder == null ? '' : (wordOrder as WordOrder)
+			wordOrder: wordOrder === WORD_ORDER_AUTO || wordOrder == null ? '' : (wordOrder as WordOrder),
+			simulation: Boolean(values[`${prefix}Simulation`])
 		};
 	}
 
@@ -250,7 +275,8 @@
 			[`${prefix}Port`]: conn.port,
 			[`${prefix}UnitId`]: conn.unitId,
 			[`${prefix}WordOrder`]: conn.wordOrder === '' ? WORD_ORDER_AUTO : conn.wordOrder,
-			[`${prefix}Enabled`]: conn.enabled
+			[`${prefix}Enabled`]: conn.enabled,
+			[`${prefix}Simulation`]: conn.simulation
 		};
 	}
 
@@ -273,6 +299,8 @@
 	const connectionRows = $derived(listRows(connectionsState));
 	const connectionsView = $derived(listSectionView(connectionsState));
 	const connectionsRetry = $derived(showsRetry(connectionsState));
+	/** #413: レジストリ上にシミュレーション接続が 1 本でもあるか（注記と「値が動かないタグ」の出し分け）。 */
+	const hasSimulationConnection = $derived(connectionRows.some((c) => c.simulation));
 
 	/**
 	 * 一覧ごとの再取得の世代（レビュー P2-C）。`$state` にしないのは描画に
@@ -297,6 +325,8 @@
 		switch (outcome.kind) {
 			case 'applied':
 				connections = outcome.items;
+				// #413: 接続の simulation が変わると判定の対象が変わる。
+				void reloadSimulationCoverage();
 				break;
 			case 'error':
 				// 失敗を「0件」に潰さない: `connections` には触らない（未読込なら
@@ -324,8 +354,9 @@
 	async function handleCreateConnection(values: Record<string, unknown>): Promise<void> {
 		creatingConnection = true;
 		try {
-			await createPlcConnection(toPlcConnectionInput(PLC_CREATE, values));
-			toastStore.push('success', '作成しました');
+			const created = await createPlcConnection(toPlcConnectionInput(PLC_CREATE, values));
+			// #413: 応答の行（保存された値）で文言を決める - 送った値ではなく。
+			toastStore.push('success', connectionSavedMessage(null, created));
 			createConnectionStore = createFormStore(connectionSchema(PLC_CREATE));
 			await reloadConnections();
 		} catch (err) {
@@ -355,6 +386,13 @@
 			accessor: 'enabled',
 			width: 70,
 			format: (v) => (v ? 'はい' : 'いいえ')
+		},
+		{
+			// #413: レジストリの値。シミュレーション接続は「値は記録されません」。
+			id: 'simulation',
+			header: '動作',
+			accessor: (row) => connectionModeLabel(row.simulation),
+			width: 240
 		}
 	];
 
@@ -393,6 +431,8 @@
 			id: selectedConnection.id,
 			store: editConnectionStore
 		};
+		// #413: 保存前の行（切替が起きたかの判定用）。
+		const before = selectedConnection;
 		savingConnection = true;
 		try {
 			const outcome = await runGuardedSave(
@@ -405,7 +445,10 @@
 			);
 			switch (outcome.kind) {
 				case 'applied':
-					toastStore.push('success', '更新しました');
+					// #413: simulation を切り替えたなら「収集を再起動」を案内する。
+					// 判定は**サーバーが返した行**で行う（失敗したら `error` 分岐に
+					// 行き、ここは通らない - 画面は切り替わったように見せない）。
+					toastStore.push('success', connectionSavedMessage(before, outcome.entity));
 					selectedConnection = outcome.entity;
 					await reloadConnections();
 					break;
@@ -567,6 +610,7 @@
 		switch (outcome.kind) {
 			case 'applied':
 				groups = outcome.items;
+				void reloadSimulationCoverage();
 				break;
 			case 'error':
 				groupsError = errorMessage(outcome.err);
@@ -842,6 +886,7 @@
 		switch (outcome.kind) {
 			case 'applied':
 				tags = outcome.items;
+				void reloadSimulationCoverage();
 				break;
 			case 'error':
 				tagsError = errorMessage(outcome.err);
@@ -981,6 +1026,51 @@
 		}
 	}
 
+	// --- #413: シミュレーションで値が動かないタグ ------------------------------
+	//
+	// 判定は Rust（`classify_plc_tag`）の結果を読むだけ。一覧と同じ
+	// 「未読込 / 失敗 / 読めた」の区別と世代照合（`runGuardedListLoad`）を使う -
+	// 読めていないのに「全部動きます」と言わないため。
+
+	let coverage: SimulationCoverageEntry[] | null = $state(null);
+	let coverageError: string | null = $state(null);
+	let coverageLoading = $state(false);
+	let coverageGeneration = 0;
+	const coverageState: ListLoadState<SimulationCoverageEntry> = $derived({
+		items: coverage,
+		error: coverageError
+	});
+	const coverageView = $derived(simulationCoverageView(hasSimulationConnection, coverageState));
+	const coverageRetry = $derived(showsRetry(coverageState));
+	const unmovingTags = $derived(
+		unmovingSimulationTags(listRows(coverageState), tagRows, connectionRows)
+	);
+
+	async function reloadSimulationCoverage(): Promise<void> {
+		if (!available) return;
+		coverageGeneration += 1;
+		const generation = coverageGeneration;
+		coverageLoading = true;
+		coverageError = null;
+		const outcome = await runGuardedListLoad(
+			generation,
+			listSimulationCoverage(),
+			() => coverageGeneration
+		);
+		switch (outcome.kind) {
+			case 'applied':
+				coverage = outcome.items;
+				break;
+			case 'error':
+				// トーストは出さない（補助の情報で、画面の行に失敗と再試行を残す）。
+				coverageError = errorMessage(outcome.err);
+				break;
+			case 'stale':
+				return;
+		}
+		coverageLoading = false;
+	}
+
 	$effect(() => {
 		void reloadConnections();
 		void reloadGroups();
@@ -1017,6 +1107,13 @@
 						? '行をクリックすると下に編集パネルが表示されます。'
 						: '閲覧のみ（編集には編集者以上の権限が必要です）。'}
 				</p>
+				{#if hasSimulationConnection}
+					<!-- #413: 記録されないことを常に分かるようにする。 -->
+					<p class="note simulation-note" role="note">
+						「動作」がシミュレーションの接続は、実機の代わりに内蔵シミュレータへ接続します。値は現在値・イベントには出ますが、データファイルには記録されません。切替は「収集を再起動」で反映されます（実際の動作は「設定
+						&gt; 収集」の接続ごとの状態で確認できます）。
+					</p>
+				{/if}
 				<!-- #394 レビュー P1-3: 「読めていない」を「0件」として描かない。
 				失敗したら空のグリッドではなく、失敗した旨と再試行の導線を出す。 -->
 				{#if connectionsView === 'loading'}
@@ -1250,6 +1347,62 @@
 				{/if}
 			</div>
 
+			<!--
+				#413: シミュレーション接続の配下で値が動かないタグ。判定は Rust
+				（`classify_plc_tag`）の結果をそのまま出す。`div.list` の外に置くのは、
+				一覧の行（タグ名）と同じ文字列がこちらにも出るため。
+			-->
+			{#if coverageView !== 'hidden'}
+				<div class="simulation-coverage">
+					<h4>シミュレーションで値が動かないタグ</h4>
+					{#if coverageView === 'loading'}
+						<p class="loading">判定を読み込み中…</p>
+					{:else if coverageView === 'failed'}
+						<p class="load-error" role="alert">
+							判定を読み込めませんでした（{coverageError}）。値が動かないタグが無いという意味ではありません。
+							<button
+								type="button"
+								onclick={() => void reloadSimulationCoverage()}
+								disabled={coverageLoading}
+							>
+								再試行
+							</button>
+						</p>
+					{:else}
+						{#if coverageRetry}
+							<p class="load-error" role="alert">
+								判定を更新できませんでした（{coverageError}）。表示は最後に読み込めた内容です。
+								<button
+									type="button"
+									onclick={() => void reloadSimulationCoverage()}
+									disabled={coverageLoading}
+								>
+									再試行
+								</button>
+							</p>
+						{/if}
+						{#if coverageView === 'all-moving'}
+							<p class="note">
+								シミュレーション接続の配下のタグは、すべてシミュレータが値を動かす番地です。
+							</p>
+						{:else}
+							<p class="note">
+								内蔵シミュレータが値を動かすのは先頭の一部の番地だけです。次のタグは収集されても値が変化しません。
+							</p>
+							<ul class="unmoving-tags">
+								{#each unmovingTags as row (row.tagId)}
+									<li>
+										<strong>{row.tagName}</strong>
+										{#if row.address}（{row.address}）{/if}
+										- 接続 {row.connectionName}: {row.reason}
+									</li>
+								{/each}
+							</ul>
+						{/if}
+					{/if}
+				</div>
+			{/if}
+
 			{#if selectedTag && canWrite}
 				<div class="detail">
 					<h4>{selectedTag.name} を編集</h4>
@@ -1349,6 +1502,23 @@
 
 	.grid-wrap {
 		height: 260px;
+	}
+
+	/* #413: 「値は記録されません」は見落とすと困るので、薄いグレーの
+	`.note` より目に入る色にする（エラーではないので danger は使わない）。 */
+	.simulation-note {
+		color: var(--banto-text);
+	}
+
+	.simulation-coverage {
+		border-top: 1px solid var(--banto-border);
+		padding-top: 0.75rem;
+	}
+
+	.unmoving-tags {
+		margin: 0;
+		padding-left: 1.25rem;
+		font-size: 0.8rem;
 	}
 
 	.create,

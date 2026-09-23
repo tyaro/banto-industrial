@@ -9,6 +9,9 @@ C-1〜C-4 に分割して着手中で、C-1・C-2・C-3a・C-3b が入った**�
 内訳は [R1-C の節](#r1-c-収集ランタイム統合)）。**まだ一巡は通っていない** -
 シミュレータ相手に「設定 → 収集開始 → データファイル生成 → イベント記録」が
 通るのは C-4 で、そこまでは完了条件を満たさない。R1-D は未着手。
+**2026-09-23 オーナー決定（#413）**: R1-B で「banto-hub 固有」として閉じていた
+**接続単位シミュレーションを開けた**（実装済み。[R1-B の節](#r1-b-設定画面レジストリ-crud--表示グループ)）。
+シミュレーション接続の値が**データファイルに記録されない**約束は変えていない。
 2026-09-06 時点で一度「アーカイブ・R1 完了」と誤って記録されたが、
 `apps/chronogazer/core/Cargo.toml:21-25` のコメントが当時から一貫して
 「まだ配線されていない」と明記しており実態と食い違っていたため訂正した
@@ -57,6 +60,31 @@ C-1〜C-4 に分割して着手中で、C-1・C-2・C-3a・C-3b が入った**�
 > 監査記録、`/tags` 画面）。**表示グループ（新エンティティ・ペン割当 UI）は
 > このPRのスコープ外で未着手** - 指示書（#383 段階2a）が明示的に3エンティティ
 > の CRUD のみに絞ったため。表示グループをいつ・どの段階で実施するかは未定。
+
+> **2026-09-23 オーナー決定（#413）: 接続単位シミュレーションを開ける。**
+> R1-B の実装（#383 段階2a）は、PLC 接続の `simulation`（接続単位シミュレーション、
+> banto-tags の列）を「banto-hub 固有機能」としてワイヤから落とし、REST/Tauri の
+> 両経路で常に `false` を書いていた。これを変更し、chronogazer でも設定できる
+> ようにした。理由（オーナー）:「**実機が無いときに設定できないのは使い物に
+> ならない**」。
+>
+> - **ワイヤ**: `PlcConnectionPayload.simulation`（省略時 `false` = 送らない既存
+>   クライアントの挙動は不変）、`PlcConnectionResponse.simulation`。REST と Tauri の
+>   両経路で対称、監査の `detail` に `simulation` を残す。
+> - **記録されない約束は維持**: シミュレーション接続の値は現在値・しきい値イベント
+>   には出るが、**データファイル（tstore）には記録されない**（`banto-collect` の
+>   約束で banto-hub と共有。変えない）。`/tags` の接続一覧と `/settings/collect`
+>   の接続ごとの状態に「値は記録されません」を常に出し、統合テスト
+>   `apps/chronogazer/core/tests/simulation_not_recorded.rs` で固定した。
+> - **反映は「収集を再起動」**（レジストリの変更で自動再起動しない C-2 の決定の
+>   まま）。`/settings/collect` の表示は**走っている収集が実際に使っている値**
+>   （`GET /api/collect/connections` の `simulation`、viewer 以上）。
+> - シミュレータが値を動かすのは先頭 16 番地だけ。範囲外のタグは `/tags` の
+>   「シミュレーションで値が動かないタグ」に出る（判定は
+>   `banto_collect::simulation::classify_plc_tag` だけ。`GET /api/simulation-coverage`
+>   / Tauri `simulation_coverage_list`、viewer 以上）。
+> - やっていないこと: シミュレーション値の記録、シミュレータの番地範囲の拡張、
+>   書き込み。
 
 - banto-tags の PlcConnection / CollectionGroup / Tag CRUD を REST + Tauri
   両経路で公開（banto の users/audit ルーターの流儀。editor 以上、監査記録）
