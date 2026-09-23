@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use sqlx::Row;
 
 use crate::error::TsQueryError;
-use crate::files::candidate_files;
+use crate::files::{candidate_files, clamp_query_bounds};
 use crate::plan::plan_files;
 use crate::types::TagAggregate;
 
@@ -39,6 +39,12 @@ pub(crate) async fn aggregate(
     if tag_keys.is_empty() {
         return Ok(Vec::new());
     }
+
+    // No arithmetic here needs this (this module's SQL only ever *compares*
+    // ptime to from_ms/to_ms, never subtracts), but every query method
+    // should agree on what "the whole representable timeline" means for the
+    // same extreme input - see `files::clamp_query_bounds`'s doc comment.
+    let (from_ms, to_ms) = clamp_query_bounds(from_ms, to_ms);
 
     let files = candidate_files(data_dir, from_ms, to_ms)?;
     let paths: Vec<PathBuf> = files.into_iter().map(|f| f.path).collect();

@@ -22,6 +22,40 @@ use crate::error::TsQueryError;
 
 const MAX_OFFSET_PAD_MS: i64 = 24 * 3_600_000;
 
+/// Any real `ptime_ms` a genuine `banto-tstore` file could ever hold is
+/// vastly inside this bound - a data collector's timestamps are always a
+/// real calendar date, nowhere near the edges of what `i64` can represent.
+/// [`clamp_query_bounds`] clamps caller-supplied `from_ms`/`to_ms` to it
+/// before either reaches any query arithmetic, most importantly
+/// `decimate.rs`'s `(ptime - ?) / ?` bin-index SQL expression: without this,
+/// an extreme `from_ms` (e.g. `i64::MIN`) makes SQLite's own `ptime -
+/// from_ms` overflow `i64` and silently fall back to a `REAL`
+/// (floating-point) result, which then fails to decode as the `i64` this
+/// crate expects (`tests/range_overflow.rs` reproduces this - not a Rust
+/// panic, but a `TsQueryError::Storage` decode failure either way). Chosen
+/// as `i64::MAX / 4` so two values independently clamped to
+/// `[-SAFE_QUERY_BOUND_MS, SAFE_QUERY_BOUND_MS]` can never overflow `i64`
+/// when subtracted (worst case magnitude `i64::MAX / 2`).
+///
+/// Clamping changes nothing for a genuine file: no real `ptime_ms` is ever
+/// outside this range, so a request that already covers it (however extreme
+/// its literal `from_ms`/`to_ms`) reads exactly the same data either way -
+/// this is "round to the whole representable timeline", not an error, per
+/// the same judgement [`candidate_files`]'s own padding already applies.
+pub(crate) const SAFE_QUERY_BOUND_MS: i64 = i64::MAX / 4;
+
+/// Clamp caller-supplied `from_ms`/`to_ms` to [`SAFE_QUERY_BOUND_MS`] -
+/// applied identically by every query method that touches `from_ms`/`to_ms`
+/// (`raw`/`decimate`/`aggregate`) so all of them agree on what "the whole
+/// representable timeline" means, and none of them hands an unclamped
+/// extreme value to SQL arithmetic or this module's own date-padding.
+pub(crate) fn clamp_query_bounds(from_ms: i64, to_ms: i64) -> (i64, i64) {
+    (
+        from_ms.clamp(-SAFE_QUERY_BOUND_MS, SAFE_QUERY_BOUND_MS),
+        to_ms.clamp(-SAFE_QUERY_BOUND_MS, SAFE_QUERY_BOUND_MS),
+    )
+}
+
 /// Every recognized data file in `data_dir`, ascending by `(date, seq)`
 /// (`list_data_files`'s own order), filtered to those whose local date could
 /// possibly overlap `[from_ms, to_ms]` under any real-world UTC offset.
@@ -30,8 +64,17 @@ pub(crate) fn candidate_files(
     from_ms: i64,
     to_ms: i64,
 ) -> Result<Vec<DataFileInfo>, TsQueryError> {
-    let from_date = LocalDate::from_epoch_ms(from_ms - MAX_OFFSET_PAD_MS, 0);
-    let to_date = LocalDate::from_epoch_ms(to_ms + MAX_OFFSET_PAD_MS, 0);
+    // `from_ms`/`to_ms` can be arbitrary caller-supplied `i64` (R2 will take
+    // these from an API, not just this crate's own tests) - an unchecked `-`/
+    // `+` here panics on overflow at the extremes (`from_ms == i64::MIN`,
+    // `to_ms == i64::MAX`). Saturating is the right choice, not an error: the
+    // padding only ever widens the file-name pre-filter so real files near a
+    // genuine boundary are not missed, and saturating at `i64::MIN`/`i64::MAX`
+    // just means "the range already covers everything representable" - no
+    // real data file's date will ever be outside that, so the result is
+    // identical to what unpadded arithmetic would have found.
+    let from_date = LocalDate::from_epoch_ms(from_ms.saturating_sub(MAX_OFFSET_PAD_MS), 0);
+    let to_date = LocalDate::from_epoch_ms(to_ms.saturating_add(MAX_OFFSET_PAD_MS), 0);
     Ok(list_data_files(data_dir)?
         .into_iter()
         .filter(|f| f.date >= from_date && f.date <= to_date)

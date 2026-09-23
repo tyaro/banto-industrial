@@ -67,7 +67,7 @@ use std::path::{Path, PathBuf};
 use sqlx::Row;
 
 use crate::error::TsQueryError;
-use crate::files::candidate_files;
+use crate::files::{candidate_files, clamp_query_bounds};
 use crate::plan::{plan_files, FilePlan};
 use crate::types::{Bin, BinValue, DecimatedRange};
 
@@ -103,31 +103,47 @@ pub(crate) async fn read_decimated(
         )));
     }
 
-    let files = candidate_files(data_dir, from_ms, to_ms)?;
+    // Clamp before from_ms/to_ms reach any arithmetic or SQL, in Rust or in
+    // SQLite (see `files::clamp_query_bounds`'s doc comment - most notably,
+    // this is what keeps the `(ptime - ?) / ?` bin-index SQL expression
+    // below from overflowing `i64` inside SQLite itself, which a purely
+    // Rust-side `checked`/`saturating` fix cannot reach). `from_ms`/`to_ms`
+    // themselves are kept unclamped and only used to echo the caller's
+    // original request back in the returned `DecimatedRange` - every actual
+    // computation from here on uses `q_from_ms`/`q_to_ms`.
+    let (q_from_ms, q_to_ms) = clamp_query_bounds(from_ms, to_ms);
+
+    let files = candidate_files(data_dir, q_from_ms, q_to_ms)?;
     let paths: Vec<PathBuf> = files.into_iter().map(|f| f.path).collect();
     let plans = plan_files(&paths, group_key, tag_keys).await?;
 
-    // The *inclusive* width of [from_ms, to_ms] is (to_ms - from_ms + 1) ms,
-    // not (to_ms - from_ms): using the exclusive span here would make
-    // target_bins == 1 (say) produce *two* bins whenever to_ms - from_ms is
-    // an exact multiple of the resulting bin width (bin_idx = (to_ms -
-    // from_ms) / bin_ms would land exactly on the next bin rather than the
-    // last valid index of the requested single bin). Using the +1-wide
-    // value guarantees ceil(inclusive_width / target_bins) bins, evenly
-    // spaced, always cover to_ms inside the last bin rather than spilling
-    // into an extra one.
-    let inclusive_width_ms = (to_ms - from_ms).max(0).saturating_add(1);
-    let raw_bin_ms = inclusive_width_ms
-        .checked_add(target_bins as i64 - 1)
-        .map(|padded| padded / target_bins as i64)
-        .unwrap_or(i64::MAX)
-        .max(1);
+    // The *inclusive* width of [q_from_ms, q_to_ms] is (q_to_ms - q_from_ms
+    // + 1) ms, not (q_to_ms - q_from_ms): using the exclusive span here
+    // would make target_bins == 1 (say) produce *two* bins whenever q_to_ms
+    // - q_from_ms is an exact multiple of the resulting bin width (bin_idx
+    // = (q_to_ms - q_from_ms) / bin_ms would land exactly on the next bin
+    // rather than the last valid index of the requested single bin). Using
+    // the +1-wide value guarantees ceil(inclusive_width / target_bins)
+    // bins, evenly spaced, always cover q_to_ms inside the last bin rather
+    // than spilling into an extra one.
+    //
+    // `q_to_ms - q_from_ms` still cannot overflow `i64` even after
+    // clamping to `SAFE_QUERY_BOUND_MS` (max magnitude `i64::MAX / 2`), but
+    // `saturating_sub` is kept as defense-in-depth (this arithmetic has no
+    // other guard between it and a caller).
+    let inclusive_width_ms = q_to_ms.saturating_sub(q_from_ms).max(0).saturating_add(1);
+    // Ceiling division without the old `inclusive_width_ms + (target_bins -
+    // 1)` pre-padding trick: that addition itself could overflow once
+    // inclusive_width_ms is already large, which used to silently fall back
+    // to `raw_bin_ms = i64::MAX` regardless of target_bins (losing the
+    // requested granularity) rather than actually dividing.
+    let raw_bin_ms = ceil_div(inclusive_width_ms, target_bins as i64).max(1);
 
     if plans.is_empty() {
         // No file describes this group at all in range - every bin is a
         // gap for every requested tag; nothing left to clamp bin_ms
         // against.
-        let bins = build_gap_bins(from_ms, to_ms, raw_bin_ms, tag_keys.len())?;
+        let bins = build_gap_bins(q_from_ms, q_to_ms, raw_bin_ms, tag_keys.len())?;
         return Ok(DecimatedRange {
             tag_keys: tag_keys.to_vec(),
             bins,
@@ -141,7 +157,7 @@ pub(crate) async fn read_decimated(
     let bin_ms = raw_bin_ms.max(period_ms_used);
 
     if tag_keys.is_empty() {
-        let bins = build_gap_bins(from_ms, to_ms, bin_ms, 0)?;
+        let bins = build_gap_bins(q_from_ms, q_to_ms, bin_ms, 0)?;
         return Ok(DecimatedRange {
             tag_keys: Vec::new(),
             bins,
@@ -162,8 +178,8 @@ pub(crate) async fn read_decimated(
             // AssertSqlSafe: plan.table_name は plan.rs の「SQL-identifier
             // safety」の通り is_safe_table_name で検証済みの samples_<n> のみ。
             let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
-                .bind(from_ms)
-                .bind(to_ms)
+                .bind(q_from_ms)
+                .bind(q_to_ms)
                 .fetch_one(&plan.pool)
                 .await?;
             total_rows += count;
@@ -172,9 +188,9 @@ pub(crate) async fn read_decimated(
     }
 
     let bins = if use_raw_passthrough {
-        fetch_raw_passthrough(&plans, tag_keys.len(), from_ms, to_ms).await?
+        fetch_raw_passthrough(&plans, tag_keys.len(), q_from_ms, q_to_ms).await?
     } else {
-        fetch_binned(&plans, tag_keys.len(), from_ms, to_ms, bin_ms).await?
+        fetch_binned(&plans, tag_keys.len(), q_from_ms, q_to_ms, bin_ms).await?
     };
 
     Ok(DecimatedRange {
@@ -186,6 +202,20 @@ pub(crate) async fn read_decimated(
     })
 }
 
+/// `ceil(numerator / denominator)` for `denominator > 0`, without the
+/// overflow-prone `(numerator + denominator - 1) / denominator` pre-padding
+/// trick (that addition can itself overflow when `numerator` is already
+/// close to `i64::MAX`).
+fn ceil_div(numerator: i64, denominator: i64) -> i64 {
+    let q = numerator / denominator;
+    let r = numerator % denominator;
+    if r == 0 {
+        q
+    } else {
+        q + 1
+    }
+}
+
 fn build_gap_bins(
     from_ms: i64,
     to_ms: i64,
@@ -195,14 +225,28 @@ fn build_gap_bins(
     let num_bins = bin_count(from_ms, to_ms, bin_ms)?;
     Ok((0..num_bins)
         .map(|i| Bin {
-            ptime_ms: from_ms + (i as i64) * bin_ms,
+            // Defense-in-depth `saturating_*`, matching `fetch_binned`'s
+            // identical expression below: `from_ms`/`bin_ms` are already
+            // `clamp_query_bounds`-safe by the time this is reached in
+            // practice, but `build_gap_bins` has no way to enforce that on
+            // its own as a `pub(crate)`-internal helper.
+            ptime_ms: from_ms.saturating_add((i as i64).saturating_mul(bin_ms)),
             tags: vec![BinValue::Gap; tag_count],
         })
         .collect())
 }
 
 fn bin_count(from_ms: i64, to_ms: i64, bin_ms: i64) -> Result<usize, TsQueryError> {
-    let count = (to_ms - from_ms) / bin_ms + 1;
+    // Same overflow as `inclusive_width_ms` above (`to_ms - from_ms` can
+    // exceed `i64::MAX` even though the difference is mathematically
+    // non-negative) - `saturating_sub`/`saturating_add` round toward
+    // "everything", not an error; the `usize::try_from` below is the actual
+    // input-validation boundary (an unrepresentable *bin count* - as opposed
+    // to an unrepresentable *span*, which is harmless to saturate - really is
+    // a caller mistake worth reporting, e.g. `target_bins` far above
+    // `MAX_TARGET_BINS` combined with a `bin_ms` clamped very small).
+    let count = to_ms.saturating_sub(from_ms) / bin_ms;
+    let count = count.saturating_add(1);
     usize::try_from(count).map_err(|_| {
         TsQueryError::InvalidInput(format!(
             "計算されたビン数が不正です: {count}（from_ms/to_ms/target_bins を確認してください）"
@@ -287,7 +331,7 @@ async fn fetch_binned(
 
     Ok((0..num_bins)
         .map(|i| Bin {
-            ptime_ms: from_ms + (i as i64) * bin_ms,
+            ptime_ms: from_ms.saturating_add((i as i64).saturating_mul(bin_ms)),
             tags: acc[i]
                 .iter()
                 .map(|slot| match slot {
