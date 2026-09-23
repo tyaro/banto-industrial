@@ -171,9 +171,25 @@
 			box-shadow: 12px 0 32px rgba(0, 0, 0, 0.25);
 		}
 
+		/*
+		 * #399（2026-09-23）: **開くときは `visibility` を遷移させず即座に
+		 * `visible` にする**（遷移させるのは閉じるときだけ）。`visibility` の
+		 * 補間は「p=0 は始点の値」なので、`hidden → visible` を 0.2s で遷移
+		 * させると**開いた直後、最初のアニメーションフレームが進むまで計算値が
+		 * `hidden` のまま**になる。そのあいだ `escLayering.ts::isActiveLayer` は
+		 * 開いたサイドバー（`data-esc-layer` 付き）を「層ではない」と判定し、
+		 * 退避ツリー内にフォーカスがある Esc がツリーを先に閉じていた
+		 * （CI の遅いランナーでだけ踏む。E2E テスト31のフレーク）。
+		 * `transition-*` は変化後のスタイルの値が使われるので、`.open` 側だけ
+		 * `visibility 0s` にすれば、閉じるときは従来どおり最後に `hidden` へ
+		 * 切り替わる。
+		 */
 		aside.offcanvas.open {
 			transform: translateX(0);
 			visibility: visible;
+			transition:
+				transform 0.2s ease,
+				visibility 0s;
 		}
 	}
 

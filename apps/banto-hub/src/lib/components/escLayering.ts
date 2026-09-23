@@ -60,6 +60,10 @@
  *    `visibility: hidden` + `inert`（`SplitPane` の退避ペイン・`Sidebar` の
  *    オフキャンバス）、outro（fade/fly）のあいだ DOM に残る Drawer/Modal は
  *    {@link LAYER_INACTIVE_ATTR} を付けて、どちらもここから除外する。
+ *    **逆に、開いた層は開いた瞬間から可視でなければならない**（#399）:
+ *    `visibility` を開く側でも遷移させると、最初のアニメーションフレームが
+ *    進むまで計算値が `hidden` のままで、ここでは「層が無い」と判定される。
+ *    `visibility` の遷移は閉じる側だけに付ける（`Sidebar.svelte` の `.open`）。
  * 7. **非モーダル層（サイドバー・退避ツリー）は、下位を開くときに上位を先に畳む**
  *    （`tags`/`monitor` の `toggleTree`）。こちらはトラップを張れない（画面の
  *    一部としてそのまま操作できることが目的の UI）ので、順序は開く側が揃える。

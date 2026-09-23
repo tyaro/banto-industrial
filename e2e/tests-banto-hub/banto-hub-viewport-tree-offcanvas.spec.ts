@@ -921,6 +921,56 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await expect(treePane).toBeHidden();
 	});
 
+	test('31b. サイドバーを開いた直後（最初のフレームより前）の Esc でも、サイドバーが先に閉じる（#399）', async () => {
+		// テスト31 が CI でだけ落ちていた原因（#399）。サイドバーの `visibility` を
+		// 開くときも 0.2s で遷移させていたため、**開いてから最初のアニメーション
+		// フレームが進むまで計算値が `hidden`** のままで、`escLayering.ts` の
+		// `isActiveLayer` が開いたサイドバーを「層ではない」と判定していた。
+		// 遅い CI ランナーでは ☰ のクリックから Esc までにフレームが進まないこと
+		// があり、ペイン内の Esc がツリーを先に閉じた（失敗時の画面は「サイドバー
+		// が開いたまま・ツリーが閉じている」）。
+		//
+		// ローカルの速い環境ではフレームが先に進むので、キー入力では再現しない。
+		// ☰ のクリック・DOM の反映・Esc を**1つのタスクの中で**続けて行い、
+		// フレームが進む前の状態を決定的に作る。
+		await page.goto('/tags');
+		await treeToggle.click();
+		await expect(treePane).toBeVisible();
+
+		const result = await page.evaluate(async () => {
+			const menuButton = document.querySelector<HTMLElement>(
+				'header button[aria-label="メニューを開く"]'
+			);
+			if (!menuButton) return 'no-menu-button';
+			menuButton.click();
+			// Svelte の DOM 反映はマイクロタスク。フレーム（requestAnimationFrame）は
+			// 挟まない。
+			for (let i = 0; i < 50 && !document.querySelector('[data-esc-layer="sidebar"]'); i += 1) {
+				await Promise.resolve();
+			}
+			if (!document.querySelector('[data-esc-layer="sidebar"]')) return 'sidebar-not-open';
+
+			const paneButton = Array.from(
+				document.querySelectorAll<HTMLElement>('#tags-tree-pane button')
+			).find((el) => el.textContent?.includes('PLC接続を追加'));
+			if (!paneButton) return 'no-pane-button';
+			paneButton.focus();
+			if (document.activeElement !== paneButton) return 'focus-failed';
+			paneButton.dispatchEvent(
+				new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })
+			);
+			return 'dispatched';
+		});
+		expect(result).toBe('dispatched');
+
+		// 手前のサイドバーだけが閉じ、ツリーは開いたまま。
+		await expect(page.getByRole('button', { name: 'メニューを開く' })).toBeVisible();
+		await expect(treePane).toBeVisible();
+
+		await page.keyboard.press('Escape');
+		await expect(treePane).toBeHidden();
+	});
+
 	test('32. 狭幅→広幅でトグルにフォーカスがあっても body に落ちない（#381 レビュー対応15回目）', async () => {
 		// 狭幅のトグルは広幅への更新と同時にアンマウントされ、`focusFallback()` も
 		// 同じトグルを返すので戻し先が無くなる。広幅で普通に使えるようになった
