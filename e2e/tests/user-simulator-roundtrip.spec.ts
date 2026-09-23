@@ -5,8 +5,11 @@
  * 相手の PLC は `playwright.config.ts` の 2 つ目の `webServer` が起動する
  * **開発用 PLC**（`apps/chronogazer/core/examples/dev_plc.rs`、Modbus TCP、
  * 127.0.0.1:8803、保持レジスタ 40001-40016 にランプ波）。ChronoGazer から見ると
- * **普通の Modbus TCP 接続**で、製品の `simulation` は使わない（REST が常に
- * `false` にする R1-B の決定は変えない）。
+ * **普通の Modbus TCP 接続**で、製品の接続単位シミュレーション
+ * （`simulation`）は使わない - その値は tstore に記録されない
+ * （`crates/banto-collect/src/task.rs` の `if ctx.simulation { return; }`
+ * 付近）ため、データファイル生成まで含む一巡はこの経路でしか確かめられない
+ * （製品の `simulation` の開放は #413 で別途扱う）。
  *
  * ## 画面で操作するところ・REST を使うところ
  *

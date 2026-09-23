@@ -81,8 +81,9 @@ v0.2.0-alpha.20: 狭幅（≤900px）でタグ登録・タグモニタの左ツ�
   状態表示・接続ごとの状態・操作（操作は editor 以上にだけ出す）と、`/events` の
   イベント一覧。現在値の表示は R1-D の監視画面、#409）が入り（2026-09-21）、
   C-4 で**一巡が通った**（2026-09-23）- 別プロセスの開発用 PLC
-  （`apps/chronogazer/core/examples/dev_plc.rs`。製品の `simulation` は使わず、
-  普通の Modbus TCP / SLMP 接続として登録する）相手に「設定 → 収集開始 →
+  （`apps/chronogazer/core/examples/dev_plc.rs`。接続単位シミュレーション
+  （`simulation`）は値が tstore に記録されないため使わず、普通の Modbus TCP /
+  SLMP 接続として登録する）相手に「設定 → 収集開始 →
   データファイル生成 → イベント記録」を Rust の統合テスト（Modbus/SLMP）と
   E2E（Modbus）で固定した。収集エンジンは
   当面 Tauri プロセス内で動かす方針（オーナー決定、recorder-requirements.md §4 追補）。

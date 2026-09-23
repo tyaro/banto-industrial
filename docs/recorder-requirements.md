@@ -173,8 +173,10 @@
       「設定 → 収集開始 → データファイル生成 → イベント記録」の一巡）を満たした**。
       シミュレータは製品の中ではなく**別プロセスの開発用 PLC**
       （`apps/chronogazer/core/examples/dev_plc.rs`、`pnpm dev:plc`）として
-      起動し、ChronoGazer からは普通の Modbus TCP / SLMP 接続として登録する
-      （製品の `simulation` は R1-B の決定どおり常に `false` のまま）。一巡は
+      起動し、ChronoGazer からは普通の Modbus TCP / SLMP 接続として登録する -
+      製品の接続単位シミュレーション（`simulation`）は値が tstore に
+      記録されないため、データファイル生成まで含む一巡はこの経路でしか
+      確かめられない（製品の `simulation` の開放は #413 で別途扱う）。一巡は
       Rust の統合テスト（`apps/chronogazer/core/tests/collect_roundtrip.rs`、
       Modbus/SLMP の両方）と E2E（`e2e/tests/user-simulator-roundtrip.spec.ts`、
       Modbus）で固定した。収集エンジンが Tauri プロセス内で動く（UI と独立

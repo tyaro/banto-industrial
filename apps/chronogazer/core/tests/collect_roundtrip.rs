@@ -7,12 +7,14 @@
 //! `banto_collect::simulation` のランプ波シミュレータ（`banto-plc` の実 TCP
 //! シミュレータ）を**そこに居る PLC** として立て、ChronoGazer には**普通の
 //! Modbus TCP / SLMP 接続**（`simulation = false`・ホスト 127.0.0.1・
-//! ポート = シミュレータの待ち受け）として登録する - 製品が
-//! `simulation` を常に `false` にする R1-B の決定（`rest.rs` の
-//! `PlcConnectionPayload`）と同じ条件で、`CollectorService::new`（本番と同じ
-//! クライアント生成・同じ既定のタイムアウト）を使う。`examples/dev_plc.rs`
-//! が別プロセスで立てるものと同じシミュレータで、ここでは OS 割り当ての
-//! ポートを使う（テストを並列に走らせても衝突しない）。
+//! ポート = シミュレータの待ち受け）として登録する - 接続単位の
+//! シミュレーション（`simulation = true`）は値が tstore に記録されない
+//! （`crates/banto-collect/src/task.rs` の `if ctx.simulation { return; }`
+//! 付近）ため、データファイル生成まで含む一巡はこの経路でしか確かめられない。
+//! `CollectorService::new`（本番と同じクライアント生成・同じ既定の
+//! タイムアウト）を使う。`examples/dev_plc.rs` が別プロセスで立てるものと
+//! 同じシミュレータで、ここでは OS 割り当てのポートを使う（テストを並列に
+//! 走らせても衝突しない）。
 //!
 //! 確かめること（Modbus と SLMP の両方で）:
 //!
@@ -117,8 +119,9 @@ async fn register(pool: &SqlitePool, protocol: &str, port: u16, address: &str) -
             port: i64::from(port),
             unit_id: 1,
             enabled: true,
-            // 製品（REST / Tauri）と同じく常に false。シミュレータは
-            // 「そこに居る PLC」として外に立っている。
+            // データファイル生成まで確かめるため、接続単位のシミュレーション
+            // （tstore に記録されない）ではなく、外に立てたシミュレータを
+            // 普通の PLC として登録する。
             simulation: false,
             // "" = プロトコルの既定（u16 の 1 ワードなので結果は変わらない）。
             word_order: String::new(),

@@ -101,8 +101,11 @@ C-4 で満たしたこと（完了条件の「dev 用 PLC として起動する 
   （`pnpm dev:plc`、`--protocol modbus|slmp`・`--port`）が
   `banto_collect::simulation::start_on` でランプ波シミュレータを固定ポートに
   立てる。ChronoGazer からは**普通の Modbus TCP / SLMP 接続**
-  （`127.0.0.1:<port>`）として登録する - REST / Tauri が接続の `simulation` を
-  常に `false` にする R1-B の決定は**変えていない**。実際のワイヤ経路
+  （`127.0.0.1:<port>`）として登録する - 接続単位のシミュレーション
+  （`simulation`）は値が tstore に記録されない
+  （`crates/banto-collect/src/task.rs` の `if ctx.simulation { return; }`
+  付近）ため、データファイル生成まで含む一巡はこの経路でしか確かめられない
+  （製品の `simulation` の開放は #413 で別途扱う）。実際のワイヤ経路
   （接続・読み取り・デコード・tstore への書き込み・イベント記録）をそのまま通る。
   ポートが使用中なら panic せず、分かる文言で非ゼロ終了する。
 - **一巡の固定は 2 段**: Rust の統合テスト

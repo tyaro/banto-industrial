@@ -20,7 +20,9 @@
  * スペックと「起動時の状態」という前提を共有できなくなるうえ、実在しない PLC
  * への接続を試みて実行時間が伸びる。操作の結末（`pending`・打ち切り・未受付を
  * 混ぜない言い分け）は `collectAdmin.test.ts` が純関数として総当たりで固定して
- * いる。シミュレータ相手の一巡（開始 → ファイル生成 → イベント記録）は C-4。
+ * いる。シミュレータ相手の一巡（開始 → ファイル生成 → イベント記録）は
+ * C-4（`apps/chronogazer/core/tests/collect_roundtrip.rs` と
+ * `e2e/tests/user-simulator-roundtrip.spec.ts`）が確かめている。
  *
  * ファイル名について: `smoke.spec.ts` の最初のテストが初回セットアップ
  * （管理者アカウント作成）を実 DOM で行う（`playwright.config.ts` は
