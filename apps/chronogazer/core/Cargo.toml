@@ -92,3 +92,13 @@ tokio-tungstenite = { workspace = true }
 [[bin]]
 name = "banto-serve"
 path = "src/bin/banto-serve.rs"
+
+# R1-C C-4: 開発用 PLC（`examples/dev_plc.rs`。E2E の `webServer` と
+# `pnpm dev:plc` が起動する）。`test = true` は、この example の引数解釈の
+# 単体テストを `cargo test -p chronogazer-core` で回すため（example の
+# `#[test]` は既定では実行されない）。依存は本体の通常依存
+# （`banto-collect`・`tokio` の `signal`）だけで足りるので、
+# `[dev-dependencies]` は増やしていない。
+[[example]]
+name = "dev_plc"
+test = true

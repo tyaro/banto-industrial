@@ -3,16 +3,27 @@
  * `BANTO_DB` before each run (`fs.mkdtempSync` under `os.tmpdir()`) - without
  * this, every `pnpm e2e` invocation (locally or in CI) leaves one more
  * `chronogazer-e2e-XXXXXX` directory behind under the OS temp folder forever.
- * `BANTO_E2E_DB_DIR` is set by the config module itself (same process, main
- * config load happens before this runs) rather than passed some other way,
- * since global setup/teardown scripts have no direct handle on the config
- * object's local variables.
+ * The directory and the run's token come from the internal variables the
+ * config module sets (same process, main config load happens before this
+ * runs), since global setup/teardown scripts have no direct handle on the
+ * config object's local variables.
+ *
+ * **Deletes only a directory this run owns** (#412 owner review,
+ * 2026-09-23): the ownership marker inside it must hold this run's token
+ * (`chronogazer-e2e-run-dir.ts`). Anything else - a path that came from the
+ * caller's environment, a marker that is missing or different - is left
+ * alone with a one-line warning, because this is a recursive delete.
  */
 import fs from 'node:fs';
+import { RUN_DIR_ENV, RUN_TOKEN_ENV, ownsRunDir } from './chronogazer-e2e-run-dir';
 
 export default function globalTeardown(): void {
-	const dbDir = process.env.BANTO_E2E_DB_DIR;
+	const dbDir = process.env[RUN_DIR_ENV];
 	if (!dbDir) return;
+	if (!ownsRunDir(dbDir, process.env[RUN_TOKEN_ENV])) {
+		console.warn(`[chronogazer e2e] ${dbDir} はこの実行の所有マーカーと一致しないため削除しません`);
+		return;
+	}
 	try {
 		fs.rmSync(dbDir, { recursive: true, force: true });
 	} catch {
